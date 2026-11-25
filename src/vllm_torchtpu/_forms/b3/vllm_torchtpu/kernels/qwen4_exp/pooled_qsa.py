@@ -1,0 +1,3887 @@
+# SPDX-License-Identifier: Apache-2.0
+"""QSA over one donated pool, with independent group-native block tables."""
+
+import dataclasses
+import math
+from typing import ClassVar
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental import xla_metadata
+from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import BITS_NEG_INF
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    SparseCoreTopK,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    config as streamindex_config,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    cp_local_to_global,
+    streamindex_topk,
+)
+from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import decode_query_chunk_size
+from vllm_torchtpu.kernels.qwen4_exp.fused_kv_write import (
+    fused_layer_write,
+    fused_write_supported,
+    read_ring_and_tags_concurrent,
+)
+from vllm_torchtpu.kernels.qwen4_exp import qsa_glueb as glueb
+from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
+from vllm_torchtpu.kernels.qwen4_exp.qsa import (
+    _indexer_updates,
+    _token_metadata,
+    produce,
+)
+from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import (
+    pack_rows,
+    qsa_attention,
+    selected_tokens,
+    virtual_page_metadata,
+)
+from vllm_torchtpu.kernels.qwen4_exp.qsa_state import (
+    read_ring_and_tags,
+    write_ring_and_tags,
+)
+from vllm_torchtpu.kernels.qwen4_exp.request_types import decode_prefix
+from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
+    get_main_kv_dma_batch,
+)
+
+
+def _write_main_cache_universal(
+    pool, rows, page, logical, valid, tile=128, overlap_edges=False
+):
+    """Write contiguous prefill tiles without copying the full cache pool.
+
+    Complete page-local tiles use one large DMA. Tiles that cross a request or
+    page boundary fall back to row DMAs inside the same aliased custom call.
+    An outer ``lax.cond`` cannot be used here: XLA then copies the multi-GiB
+    cache to reconcile the two aliased branch outputs. ``tile`` rows per
+    grid step (the staged PD repack uses 64: a decode page holds 64 rows of
+    one layer's compressed keys).
+    """
+
+    if len(rows) % tile or pool.shape[1] % tile:
+        return pool.at[page, logical % pool.shape[1]].set(rows, mode="drop")
+
+    offsets = logical % pool.shape[1]
+    pages_by_tile = page.reshape(-1, tile)
+    offsets_by_tile = offsets.reshape(-1, tile)
+    valid_by_tile = valid.reshape(-1, tile)
+    bulk = (
+        jnp.all(valid_by_tile, axis=1)
+        & jnp.all(pages_by_tile == pages_by_tile[:, :1], axis=1)
+        & jnp.all(
+            offsets_by_tile
+            == offsets_by_tile[:, :1] + jnp.arange(tile, dtype=offsets.dtype),
+            axis=1,
+        )
+    )
+
+    def kernel(
+        pages_ref,
+        offsets_ref,
+        valid_ref,
+        bulk_ref,
+        source_ref,
+        _old_ref,
+        target_ref,
+        semaphore,
+    ):
+        program = pl.program_id(0)
+        first = program * tile
+
+        @pl.when(bulk_ref[program] != 0)
+        def store_tile():
+            pltpu.async_copy(
+                source_ref,
+                target_ref.at[pages_ref[first], pl.ds(offsets_ref[first], tile)],
+                semaphore,
+            ).wait()
+
+        def row_copy(lane, row):
+            return pltpu.make_async_copy(
+                source_ref.at[pl.ds(lane, 1)],
+                target_ref.at[pages_ref[row], pl.ds(offsets_ref[row], 1)],
+                semaphore,
+            )
+
+        if overlap_edges:
+            # Start every valid row's DMA, then wait them all: a serial
+            # start/wait per row paid one DMA round trip per row (the staged
+            # PD repack's scatter ran ~8 us per 64-row tile, ~8 GB/s). Rows of
+            # one tile may repeat a destination only with identical bytes
+            # (align_rows pads by repeating a row), so the order is free.
+            @pl.when(bulk_ref[program] == 0)
+            def store_edges_overlapped():
+                for lane in range(tile):
+                    row = first + lane
+
+                    @pl.when(valid_ref[row] != 0)
+                    def start_row(*, lane=lane, row=row):
+                        row_copy(lane, row).start()
+
+                for lane in range(tile):
+                    row = first + lane
+
+                    @pl.when(valid_ref[row] != 0)
+                    def wait_row(*, lane=lane, row=row):
+                        row_copy(lane, row).wait()
+
+        else:
+
+            @pl.when(bulk_ref[program] == 0)
+            def store_edges():
+                for lane in range(tile):
+                    row = first + lane
+
+                    @pl.when(valid_ref[row] != 0)
+                    def store_row(*, lane=lane, row=row):
+                        row_copy(lane, row).start()
+                        row_copy(lane, row).wait()
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            grid=(len(rows) // tile,),
+            in_specs=[
+                pl.BlockSpec(
+                    (tile, *rows.shape[1:]),
+                    lambda program, *_: (program,) + (0,) * (rows.ndim - 1),
+                ),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[pltpu.SemaphoreType.DMA],
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={5: 0},
+        name="qwen4_exp_main_kv_universal_tiled_scatter",
+    )(
+        page.astype(jnp.int32),
+        offsets.astype(jnp.int32),
+        valid.astype(jnp.int32),
+        bulk.astype(jnp.int32),
+        rows,
+        pool,
+    )
+
+
+def main_slot_rows(rows: jax.Array, slot: int) -> jax.Array:
+    """Move ``pack_rows`` output (K, V, 0, 0) to head slot ``slot``'s pair."""
+    return jnp.roll(rows, 2 * slot, axis=-2) if slot else rows
+
+
+def _main_slot_keep_mask(slot: int) -> int:
+    # The kernels unpack an FP8 32-bit word low byte first: slot s of a
+    # paired page owns bytes 2s (K) and 2s + 1 (V); see
+    # ``batched_rpa.utils.convert_to_target_bitwidth``.
+    return ~(0xFFFF << (16 * slot)) & 0xFFFFFFFF
+
+
+def pad_rows_to_tile(rows, page, offsets, valid, tile, null_page):
+    """Pads per-row write inputs to a whole number of ``tile`` rows.
+
+    Padded rows are invalid and address ``null_page``, so the tile writers
+    issue no DMA for them.
+    """
+    pad = (-len(rows)) % tile
+    if not pad:
+        return rows, page, offsets, valid
+    return (
+        jnp.pad(rows, ((0, pad),) + ((0, 0),) * (rows.ndim - 1)),
+        jnp.pad(page, (0, pad), constant_values=null_page),
+        jnp.pad(offsets, (0, pad)),
+        jnp.pad(valid, (0, pad), constant_values=False),
+    )
+
+
+def _write_main_cache_paired(pool, rows, page, logical, valid, slot):
+    """Write one layer's K/V head pair, preserving the partner layer's pair.
+
+    Paired main KV pages (``QWEN4_EXP_PACK_MAIN_KV``) hold two layers' single
+    KV heads: layer slot ``s`` stores K and V at head slots ``2s`` and
+    ``2s + 1`` of every token row. FP8 packs a lane's four head slots into
+    one 32-bit word, below DMA granularity, so each written row is read,
+    merged word-wise and written back. Reads of one 128-row tile complete
+    before any of its writes, and tiles run in order, so a token written
+    twice in one step keeps its last value while the partner bytes never
+    change.
+    """
+    packing = pool.shape[-2]
+    if (
+        pool.dtype != jnp.float8_e4m3fn
+        or pool.shape[2] != 1
+        or rows.shape[1:] != pool.shape[2:]
+        or not 0 <= slot < packing // 2
+    ):
+        raise ValueError("Paired main KV needs one FP8 head-slot row per token")
+    rows = main_slot_rows(rows, slot)
+    offsets = logical % pool.shape[1]
+    tile = 128
+    if envs.VLLM_TPU_QSA_PAIRED_MAIN_PAD_TILE and pool.shape[1] % tile == 0:
+        rows, page, offsets, valid = pad_rows_to_tile(
+            rows, page, offsets, valid, tile, len(pool)
+        )
+    if len(rows) % tile or pool.shape[1] % tile:
+        # Small steps: a gather of the touched rows feeds the in-place scatter.
+        mine = (jnp.arange(packing) // 2 == slot)[:, None]
+        old = pool[jnp.minimum(page, len(pool) - 1), offsets]
+        merged = jnp.where(mine, rows, old)
+        return pool.at[page, offsets].set(merged, mode="drop")
+
+    keep = _main_slot_keep_mask(slot)
+    width = pool.shape[-1]
+    pp, oo, vv = (
+        page.reshape(-1, tile),
+        offsets.reshape(-1, tile),
+        valid.reshape(-1, tile).astype(jnp.bool_),
+    )
+    bulk = (
+        jnp.all(vv, axis=1)
+        & jnp.all(pp == pp[:, :1], axis=1)
+        & jnp.all(oo == oo[:, :1] + jnp.arange(tile, dtype=offsets.dtype), axis=1)
+    )
+    conflict = (
+        (pp[:, :, None] == pp[:, None, :])
+        & (oo[:, :, None] == oo[:, None, :])
+        & vv[:, :, None]
+        & vv[:, None, :]
+        & ~jnp.eye(tile, dtype=jnp.bool_)[None]
+    )
+    unique = ~jnp.any(conflict, axis=(1, 2))
+
+    def kernel(
+        pages_ref,
+        offsets_ref,
+        valid_ref,
+        bulk_ref,
+        unique_ref,
+        source_ref,
+        _old_ref,
+        target_ref,
+        buffer_ref,
+        semaphore,
+    ):
+        program = pl.program_id(0)
+        first = program * tile
+
+        def merge():
+            old = buffer_ref.bitcast(jnp.uint32).reshape(-1, width)
+            new = source_ref.bitcast(jnp.uint32).reshape(-1, width)
+            old[...] = (old[...] & jnp.uint32(keep)) | new[...]
+
+        def row_copy(lane, read):
+            row = first + lane
+            stored = target_ref.at[pages_ref[row], pl.ds(offsets_ref[row], 1)]
+            staged = buffer_ref.at[pl.ds(lane, 1)]
+            source, target = (stored, staged) if read else (staged, stored)
+            return pltpu.make_async_copy(source, target, semaphore)
+
+        def each_valid(action):
+            for lane in range(tile):
+
+                @pl.when(valid_ref[first + lane] != 0)
+                def run(*, lane=lane):
+                    action(lane)
+
+        @pl.when(bulk_ref[program] != 0)
+        def store_tile():
+            stored = target_ref.at[pages_ref[first], pl.ds(offsets_ref[first], tile)]
+            pltpu.async_copy(stored, buffer_ref, semaphore).wait()
+            merge()
+            pltpu.async_copy(buffer_ref, stored, semaphore).wait()
+
+        @pl.when(bulk_ref[program] == 0)
+        def store_edges():
+            each_valid(lambda lane: row_copy(lane, True).start())
+            each_valid(lambda lane: row_copy(lane, True).wait())
+            merge()
+
+            @pl.when(unique_ref[program] != 0)
+            def store_unique():
+                each_valid(lambda lane: row_copy(lane, False).start())
+                each_valid(lambda lane: row_copy(lane, False).wait())
+
+            @pl.when(unique_ref[program] == 0)
+            def store_ordered():
+                def store(lane):
+                    copy = row_copy(lane, False)
+                    copy.start()
+                    copy.wait()
+
+                each_valid(store)
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=5,
+            grid=(len(rows) // tile,),
+            in_specs=[
+                pl.BlockSpec(
+                    (tile, *rows.shape[1:]),
+                    lambda program, *_: (program,) + (0,) * (rows.ndim - 1),
+                ),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((tile, *rows.shape[1:]), pool.dtype),
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={6: 0},
+        name="qwen4_exp_main_kv_paired_slot_scatter",
+    )(
+        page.astype(jnp.int32),
+        offsets.astype(jnp.int32),
+        valid.astype(jnp.int32),
+        bulk.astype(jnp.int32),
+        unique.astype(jnp.int32),
+        rows,
+        pool,
+    )
+
+
+def write_main_cache(
+    pool: jax.Array,
+    rows: jax.Array,
+    page: jax.Array,
+    logical: jax.Array,
+    valid: jax.Array,
+    slot: int | None = None,
+) -> jax.Array:
+    """Batch independent row DMAs while preserving duplicate write order.
+
+    ``slot`` (paired main KV pages only) writes this layer's head pair of
+    each row and keeps the other's; ``None`` writes whole rows.
+    """
+    if slot is not None:
+        return _write_main_cache_paired(pool, rows, page, logical, valid, slot)
+    tile = 128
+    batch = get_main_kv_dma_batch(pool, rows)
+    if batch == 1:
+        return _write_main_cache_universal(pool, rows, page, logical, valid)
+    if len(rows) % tile or pool.shape[1] % tile:
+        return _write_main_cache_universal(pool, rows, page, logical, valid)
+    offsets = logical % pool.shape[1]
+    pp, oo, vv = (
+        page.reshape(-1, tile),
+        offsets.reshape(-1, tile),
+        valid.reshape(-1, tile),
+    )
+    bulk = (
+        jnp.all(vv, axis=1)
+        & jnp.all(pp == pp[:, :1], axis=1)
+        & jnp.all(oo == oo[:, :1] + jnp.arange(tile, dtype=offsets.dtype), axis=1)
+    )
+    pg, off, val = (
+        page.reshape(-1, batch),
+        offsets.reshape(-1, batch),
+        valid.reshape(-1, batch).astype(jnp.bool_),
+    )
+    conflict = (
+        (pg[:, :, None] == pg[:, None, :])
+        & (off[:, :, None] == off[:, None, :])
+        & val[:, :, None]
+        & val[:, None, :]
+        & ~jnp.eye(batch, dtype=jnp.bool_)[None]
+    )
+    unique = ~jnp.any(conflict, axis=(1, 2))
+
+    def kernel(
+        pages_ref,
+        offsets_ref,
+        valid_ref,
+        bulk_ref,
+        unique_ref,
+        source_ref,
+        _old_ref,
+        target_ref,
+        semaphores,
+    ):
+        program = pl.program_id(0)
+        first = program * tile
+
+        @pl.when(bulk_ref[program] != 0)
+        def store_tile():
+            pltpu.async_copy(
+                source_ref,
+                target_ref.at[pages_ref[first], pl.ds(offsets_ref[first], tile)],
+                semaphores.at[0],
+            ).wait()
+
+        @pl.when(bulk_ref[program] == 0)
+        def store_edges():
+            for packet in range(tile // batch):
+                start = packet * batch
+                group = program * (tile // batch) + packet
+
+                @pl.when(unique_ref[group] != 0)
+                def store_unique(*, start=start):
+                    for lane in range(batch):
+                        row = first + start + lane
+
+                        @pl.when(valid_ref[row] != 0)
+                        def begin(*, lane=lane, row=row, start=start):
+                            pltpu.make_async_copy(
+                                source_ref.at[pl.ds(start + lane, 1)],
+                                target_ref.at[
+                                    pages_ref[row], pl.ds(offsets_ref[row], 1)
+                                ],
+                                semaphores.at[lane],
+                            ).start()
+
+                    for lane in range(batch):
+                        row = first + start + lane
+
+                        @pl.when(valid_ref[row] != 0)
+                        def finish(*, lane=lane, row=row, start=start):
+                            pltpu.make_async_copy(
+                                source_ref.at[pl.ds(start + lane, 1)],
+                                target_ref.at[
+                                    pages_ref[row], pl.ds(offsets_ref[row], 1)
+                                ],
+                                semaphores.at[lane],
+                            ).wait()
+
+                @pl.when(unique_ref[group] == 0)
+                def store_ordered(*, start=start):
+                    for lane in range(batch):
+                        row = first + start + lane
+
+                        @pl.when(valid_ref[row] != 0)
+                        def store(*, lane=lane, row=row, start=start):
+                            pltpu.async_copy(
+                                source_ref.at[pl.ds(start + lane, 1)],
+                                target_ref.at[
+                                    pages_ref[row], pl.ds(offsets_ref[row], 1)
+                                ],
+                                semaphores.at[0],
+                            ).wait()
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=5,
+            grid=(len(rows) // tile,),
+            in_specs=[
+                pl.BlockSpec(
+                    (tile, *rows.shape[1:]),
+                    lambda program, *_: (program,) + (0,) * (rows.ndim - 1),
+                ),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[pltpu.SemaphoreType.DMA((batch,))],
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={6: 0},
+        name="qwen4_exp_main_kv_batched_ordered_scatter",
+    )(
+        page.astype(jnp.int32),
+        offsets.astype(jnp.int32),
+        valid.astype(jnp.int32),
+        bulk.astype(jnp.int32),
+        unique.astype(jnp.int32),
+        rows,
+        pool,
+    )
+
+
+MERGED_SPAN_CODES = 8
+
+
+def merged_compressed_slot(region: int, span: int = 1) -> int:
+    """``compressed_slot`` of a merged layer: the region's first column and
+    the table entry's span in pool pages, in one negative int (static)."""
+    assert region > 0 and 1 <= span <= MERGED_SPAN_CODES, (region, span)
+    return -(region * MERGED_SPAN_CODES + span - 1)
+
+
+def compressed_region(slot: int) -> int:
+    """First compressed-key column of the merged region for ``slot`` < 0.
+
+    ``QWEN4_EXP_MERGE_COMPRESSED_K``: a layer's compressed keys live in its
+    main KV carrier, after the scheduler's ``N`` pages. One page's worth of
+    tokens has keys filling ``1 / cols`` of a page (``cols = page_bytes /
+    keys_per_page``); a main-KV table entry spans ``merged_span(slot)`` pages
+    of tokens (2 under PCP2), so entry ``c``'s keys are columns
+    ``cols * N + span * c + i`` of that region. The layer binds
+    ``merged_compressed_slot(cols * N, span)``.
+    """
+    assert slot < 0, slot
+    return -slot // MERGED_SPAN_CODES
+
+
+def merged_span(slot: int) -> int:
+    """Pool pages of tokens one main-KV table entry covers, for ``slot`` < 0."""
+    assert slot < 0, slot
+    return -slot % MERGED_SPAN_CODES + 1
+
+
+def compressed_pairs(
+    pool, keys, complete, req, logical, starts, context, table, ratio, slot=0, dcp=None,
+    prefill_rows=False,
+):
+    """Pair destinations, writers, half masks and values of ``write_compressed``.
+
+    ``dcp=(rank int32[1], D)`` (``VLLM_TPU_QSA_COMPRESSED_DCP``): a table entry
+    covers ``D`` pool blocks and this rank writes only the groups of its owned
+    blocks (owner ``(t // B) % D``), at row ``t % B`` of the entry's page.
+
+    Returns ``(pair, write, mask, values)``: ``pair`` indexes
+    ``pool.reshape(-1, packing, width)``, ``write`` marks the one writer of
+    each touched pair, ``mask[:, h]`` marks the BF16 halves it fills from
+    ``values[:, h]`` (padded to the carrier width).
+    """
+    packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
+    width = pool.shape[-1]
+    pairs_per_page = math.prod(pool.shape[1:-1]) // packing
+    group = logical // ratio
+    end = context[req] + starts[req + 1] - starts[req]
+    write = complete & ((group % 2 == 1) | (logical + ratio >= end))
+    span = pool.shape[1]
+    if dcp is not None:
+        rank, size = dcp
+        span = size * pool.shape[1]
+        owner = (logical // pool.shape[1]) % size
+        write = write & (owner == jnp.asarray(rank).reshape(()).astype(owner.dtype))
+    layer_pairs = pool.shape[1] // (2 * ratio)
+    if slot < 0:
+        # Merged keys: a page's worth of keys fills one column of the pool's
+        # compressed-key region; a table entry of `merged_span` pages owns that
+        # many consecutive columns, column ``span * table + i + region``.
+        m = merged_span(slot)
+        if dcp is not None:
+            # Split merged keys (PCP + compressed DCP): this rank keeps one
+            # column per entry, the keys of its owned page of the entry.
+            column = table[req, logical // span]
+        else:
+            entry = m * pool.shape[1]
+            column = table[req, logical // entry] * m + (logical % entry) // pool.shape[1]
+        pair = (column + compressed_region(slot)) * layer_pairs + (
+            logical % pool.shape[1]
+        ) // (2 * ratio)
+    else:
+        pair = table[req, logical // span] * pairs_per_page + (
+            logical % pool.shape[1]
+        ) // (2 * ratio)
+    if slot > 0:
+        assert (slot + 1) * layer_pairs <= pairs_per_page, (
+            "packed compressed-key slot exceeds its pool page"
+        )
+        pair = pair + slot * layer_pairs
+    first_end = (group // 2 * 2 + 1) * ratio - 1
+    local = (
+        starts[req, None]
+        + first_end[:, None]
+        + jnp.arange(2)[None] * ratio
+        - context[req, None]
+    )
+    mask = (local >= starts[req, None]) & (local < starts[req + 1, None])
+    if glueb.value_shift_applies(keys, ratio, prefill_rows):  # q38 PSTEP-GLUEB G2b (default off)
+        glueb.engaged("G2b", "compressed-key values by static shifts (%d rows)", len(keys))
+        values = glueb.value_shift(keys, starts, context)
+    else:
+        values = keys[jnp.clip(local, 0, len(keys) - 1)]
+    values = jnp.pad(values, ((0, 0), (0, 0), (0, width - keys.shape[-1])))
+    return pair, write, mask, values
+
+
+_Q38_RUN_WRITE_LOGGED: set = set()
+
+
+def _log_run_write(tokens: int, requests: int) -> None:
+    """q38 PSTEP-GLUE engagement line of the run-based compressed-key writer: one INFO line per distinct traced shape
+    and process (log only: Python at trace time, nothing enters the traced program; a compile-cache hit prints nothing)."""
+    key = (tokens, requests)
+    if key in _Q38_RUN_WRITE_LOGGED:
+        return
+    _Q38_RUN_WRITE_LOGGED.add(key)
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(
+        "q38 PGLUE compressed-key run writer ENGAGED: %d key rows, %d request slots "
+        "(VLLM_TPU_QSA_COMPRESSED_RUN_WRITE)", tokens, requests,
+    )
+
+
+def write_compressed(
+    pool,
+    keys,
+    complete,
+    req,
+    logical,
+    starts,
+    context,
+    table,
+    ratio,
+    slot=0,
+    dcp=None,
+    *,
+    decode=False,
+    prefill_rows=False,
+):
+    """One writer per BF16 pair, preserving the other half of partial pairs.
+
+    An FP8 carrier packs two BF16 rows in one 32-bit sublane. Writing a lone
+    BF16 row needs a read/modify/write; the last completion in each pair owns
+    that write and includes both new rows when both completed this step.
+
+    ``slot`` selects this layer's region of a page shared by packed layers:
+    each layer's keys for one manager page occupy ``pool.shape[1] // (2 *
+    ratio)`` consecutive pairs (see ``pool_layout.pooled_cache_specs``).
+
+    ``decode`` marks a decode/verify-sized step. With ``dcp`` a rank owns
+    about a quarter of such a step's few writers, and the run writer's
+    compaction costs more than it saves; VLLM_TPU_QSA_COMPRESSED_WRITE picks
+    the writer instead of the row count: ``scatter`` the per-pair kernel at
+    any row count, ``inflight`` compressed_write.write_pairs (one program,
+    every DMA in flight).
+    """
+    packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
+    width = pool.shape[-1]
+    view = pool.reshape(-1, packing, width)
+    pair, write, mask, values = compressed_pairs(
+        pool, keys, complete, req, logical, starts, context, table, ratio, slot,
+        **({"dcp": dcp} if dcp is not None else {}),
+        **({"prefill_rows": True} if prefill_rows else {}),
+    )
+    mode = envs.VLLM_TPU_QSA_COMPRESSED_WRITE if decode and dcp is not None else ""
+    if mode == "inflight":
+        from vllm_torchtpu.kernels.qwen4_exp.compressed_write import write_pairs
+
+        return write_pairs(view, pair, write, mask, values).reshape(pool.shape)
+    per_pair = mode == "scatter"
+    if (
+        not per_pair
+        and envs.VLLM_TPU_QSA_COMPRESSED_RUN_WRITE
+        and len(keys) >= envs.VLLM_TPU_QSA_COMPRESSED_RUN_WRITE_MIN_TOKENS
+    ):
+        from vllm_torchtpu.kernels.qwen4_exp.compressed_write import write_runs
+
+        _log_run_write(len(keys), len(context))
+        return write_runs(
+            view, pair, write, mask, values, len(context), ratio
+        ).reshape(pool.shape)
+    tile = 128
+    if not per_pair and len(keys) >= tile and len(keys) % tile == 0:
+        # A complete ratio-4 prefill page contains sixteen adjacent carrier
+        # rows. Pack them in VMEM and issue one 16 KiB DMA instead of sixteen
+        # 1 KiB writes. Only compact routing scalars live in SMEM; the full
+        # fallback metadata is block-loaded into VMEM so T8192 fits v7 SMEM.
+        pair_lanes = tuple(range(2 * ratio - 1, tile, 2 * ratio))
+        expected = jnp.zeros((tile,), jnp.bool_).at[jnp.asarray(pair_lanes)].set(True)
+        tiled_write = write.reshape(-1, tile)
+        tiled_pair = pair.reshape(-1, tile)
+        tiled_mask = mask.reshape(-1, tile, 2)
+        first_pair = tiled_pair[:, pair_lanes[0]]
+        bulk = (
+            jnp.all(tiled_write == expected[None], axis=1)
+            & jnp.all(tiled_mask[:, pair_lanes], axis=(1, 2))
+            & jnp.all(
+                tiled_pair[:, pair_lanes]
+                == first_pair[:, None]
+                + jnp.arange(len(pair_lanes), dtype=tiled_pair.dtype)[None],
+                axis=1,
+            )
+        )
+
+        def tiled_kernel(
+            first_ref,
+            bulk_ref,
+            indices_ref,
+            active_ref,
+            masks_ref,
+            values_ref,
+            _old,
+            updated,
+        ):
+            program = pl.program_id(0)
+
+            @pl.when(bulk_ref[program] != 0)
+            def store_tile():
+                def copy(rows, semaphore):
+                    bf = (
+                        rows.bitcast(jnp.bfloat16)
+                        if pool.dtype != jnp.bfloat16
+                        else rows
+                    )
+                    for output, lane in enumerate(pair_lanes):
+                        bf[output] = values_ref[lane]
+                    target = updated.at[pl.ds(first_ref[program], len(pair_lanes))]
+                    pltpu.async_copy(rows, target, semaphore).wait()
+
+                pl.run_scoped(
+                    copy,
+                    pltpu.VMEM((len(pair_lanes), packing, width), pool.dtype),
+                    pltpu.SemaphoreType.DMA,
+                )
+
+            @pl.when(bulk_ref[program] == 0)
+            def store_edges():
+                for lane in range(tile):
+
+                    @pl.when(active_ref[lane] != 0)
+                    def store_row(*, lane=lane):
+                        def copy(row, semaphore, *, lane=lane):
+                            target = updated.at[indices_ref[lane]]
+                            bf = (
+                                row.bitcast(jnp.bfloat16)
+                                if pool.dtype != jnp.bfloat16
+                                else row
+                            )
+                            pltpu.async_copy(target, row, semaphore).wait()
+                            local_row = jnp.broadcast_to(
+                                jnp.arange(2)[:, None], (2, width)
+                            )
+                            row_mask = (
+                                jnp.where(
+                                    local_row == 0,
+                                    masks_ref[lane, 0],
+                                    masks_ref[lane, 1],
+                                )
+                                != 0
+                            )
+                            bf[...] = jnp.where(row_mask, values_ref[lane], bf[...])
+                            pltpu.async_copy(row, target, semaphore).wait()
+
+                        pl.run_scoped(
+                            copy,
+                            pltpu.VMEM((packing, width), pool.dtype),
+                            pltpu.SemaphoreType.DMA,
+                        )
+
+        view = pl.pallas_call(
+            tiled_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=2,
+                grid=(len(keys) // tile,),
+                in_specs=[
+                    pl.BlockSpec((tile,), lambda program, *_: (program,)),
+                    pl.BlockSpec((tile,), lambda program, *_: (program,)),
+                    pl.BlockSpec((tile, 2), lambda program, *_: (program, 0)),
+                    pl.BlockSpec((tile, 2, width), lambda program, *_: (program, 0, 0)),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                ],
+                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            ),
+            out_shape=jax.ShapeDtypeStruct(view.shape, view.dtype),
+            input_output_aliases={6: 0},
+            name="qwen4_exp_compressed_kv_page_tiled_scatter",
+        )(
+            first_pair.astype(jnp.int32),
+            bulk.astype(jnp.int32),
+            pair.astype(jnp.int32),
+            write.astype(jnp.int32),
+            mask.astype(jnp.int32),
+            values,
+            view,
+        )
+        return view.reshape(pool.shape)
+
+    def per_pair_kernel(indices, active, row_mask, values_ref, old, updated):
+        t = pl.program_id(0)
+
+        @pl.when(active[t] != 0)
+        def store():
+            def copy(tile, semaphore):
+                target = updated.at[indices[t]]
+                bf = tile.bitcast(jnp.bfloat16) if pool.dtype != jnp.bfloat16 else tile
+                full_pair = (row_mask[t, 0] != 0) & (row_mask[t, 1] != 0)
+
+                @pl.when(full_pair)
+                def initialize_full_pair():
+                    # Both BF16 rows cover every byte in the packed carrier;
+                    # no old value is semantically observable.
+                    bf[...] = values_ref[0]
+
+                @pl.when(~full_pair)
+                def merge_partial_pair():
+                    pltpu.async_copy(target, tile, semaphore).wait()
+                    row = jnp.broadcast_to(jnp.arange(2)[:, None], (2, width))
+                    mask = jnp.where(row == 0, row_mask[t, 0], row_mask[t, 1]) != 0
+                    bf[...] = jnp.where(mask, values_ref[0], bf[...])
+
+                pltpu.async_copy(tile, target, semaphore).wait()
+
+            pl.run_scoped(
+                copy, pltpu.VMEM((packing, width), pool.dtype), pltpu.SemaphoreType.DMA
+            )
+
+    def update(view, indices, active, row_mask, rows):
+        return pl.pallas_call(
+            per_pair_kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=3,
+                grid=(len(indices),),
+                in_specs=[
+                    pl.BlockSpec((1, 2, width), lambda t, *args: (t, 0, 0)),
+                    pl.BlockSpec(memory_space=pltpu.HBM),
+                ],
+                out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            ),
+            out_shape=jax.ShapeDtypeStruct(view.shape, view.dtype),
+            input_output_aliases={4: 0},
+        )(indices, active, row_mask, rows, view)
+
+    pair = pair.astype(jnp.int32)
+    write = write.astype(jnp.int32)
+    mask = mask.astype(jnp.int32)
+    # The compiler prefetches the rows operand into SMEM. A 4K-token step
+    # makes it 2 MiB, above v7's 1 MiB limit. Bound each write to 512 KiB.
+    bytes_per_token = 2 * width * jnp.dtype(jnp.bfloat16).itemsize
+    max_rows = max(1, (512 * 1024) // bytes_per_token)
+    chunk_size = min(len(keys), 512, 1 << (max_rows.bit_length() - 1))
+    if len(keys) <= chunk_size:
+        view = update(view, pair, write, mask, values)
+    else:
+        padding = (-len(keys)) % chunk_size
+
+        def split(x):
+            x = jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1))
+            return x.reshape(-1, chunk_size, *x.shape[1:])
+
+        chunks = tuple(map(split, (pair, write, mask, values)))
+
+        def step(owner, inputs):
+            return update(owner, *inputs), None
+
+        view, _ = jax.lax.scan(step, view, chunks)
+    return view.reshape(pool.shape)
+
+
+def _request_window(t0, size, starts, context):
+    """The requests owning flat tokens ``[t0, t0 + size)``, as a ragged batch.
+
+    Returns ``(ids, seq_lens, cu_q_lens, distribution)`` over ``size`` request
+    rows. Nonempty requests overlapping the window come first in token order;
+    each owns at least one window token, so ``size`` rows always suffice. A
+    request cut by the window keeps only its window tokens, and its sequence
+    length drops by the tokens cut from its end, so every kept token keeps
+    its absolute position. Filler rows are empty and never scheduled.
+    """
+    num_requests = len(context)
+    begins, ends = starts[:-1], starts[1:]
+    overlap = (ends > begins) & (begins < t0 + size) & (ends > t0)
+    (ids,) = jnp.nonzero(overlap, size=size, fill_value=num_requests)
+    real = ids < num_requests
+    ids = jnp.minimum(ids, num_requests - 1)
+    window_end = jnp.minimum(ends[ids], t0 + size)
+    hi = jnp.where(real, window_end - t0, 0)
+    hi = jnp.where(real, hi, jnp.max(hi))
+    cu_q_lens = jnp.concatenate([jnp.zeros((1,), jnp.int32), hi.astype(jnp.int32)])
+    seq_lens = jnp.where(real, context[ids] + window_end - begins[ids], 0)
+    num_decodes = decode_prefix(cu_q_lens)
+    num_seqs = jnp.sum(real.astype(jnp.int32))
+    distribution = jnp.stack([num_decodes, num_decodes, num_seqs]).astype(jnp.int32)
+    return ids, seq_lens.astype(jnp.int32), cu_q_lens, distribution
+
+
+def _select_shared_stream(
+    query, starts, context, table, *, chunk_size, score, pool=None, after_scoring=None
+):
+    """Decode/verify selection with one KV stream per request.
+
+    The per-token decode path scores every query token as its own one-token
+    sequence, so the K+1 verify tokens of a request each re-stream its whole
+    compressed-key history. Here every ``chunk_size``-token window is scored as
+    a ragged batch of its requests: one-token requests keep the batched decode
+    pass, longer ones share one stream per query block. ``score`` returns
+    ``[window, block_topk]`` selections for one window.
+
+    ``after_scoring`` (see ``select_blocks``): returns ``(selected, pool)``.
+    """
+    if after_scoring is not None:
+        return _select_shared_stream_pipelined(
+            query, starts, context, table, chunk_size, score, pool, after_scoring
+        )
+    if len(query) <= chunk_size:
+        return score(
+            query, *_shared_stream_operands(0, len(query), starts, context, table)
+        )
+    padding = (-len(query)) % chunk_size
+    q = jnp.pad(query, ((0, padding),) + ((0, 0),) * (query.ndim - 1))
+    windows = q.reshape(-1, chunk_size, *q.shape[1:])
+    t0s = jnp.arange(len(windows), dtype=jnp.int32) * chunk_size
+
+    def window(carry, inputs):
+        q, t0 = inputs
+        return carry, score(
+            q, *_shared_stream_operands(t0, chunk_size, starts, context, table)
+        )
+
+    _, selected = jax.lax.scan(window, None, (windows, t0s))
+    return selected.reshape(-1, *selected.shape[2:])[: len(query)]
+
+
+def _select_shared_stream_pipelined(
+    query, starts, context, table, chunk_size, score, pool, after_scoring
+):
+    """``_select_shared_stream`` with the TensorCore working while the
+    SparseCore selects (VLLM_TPU_QSA_DECODE_SC_OVERLAP).
+
+    The windows are unrolled, so window g's top-k can overlap window g + 1's
+    scoring and the last top-k ``after_scoring(pool)``. Mode 1 pins both pairs
+    with XLA scheduling groups, as the chunked prefill indexer pairs its
+    chunks; mode 2 leaves them to the latency-hiding scheduler. ``pool``
+    passes through an optimization barrier with every window's scores, so the
+    in-place update follows all scoring reads of the buffer and XLA needs no
+    copy of it. The earlier windows' selections pass through each later
+    window's barrier as well: whatever consumes them then follows that
+    window's scoring, so XLA cannot fuse it with the scoring's inputs (a
+    sibling fusion that makes window g + 1's metadata wait for window g's
+    top-k and breaks the pair). Returns ``(selected, updated pool)``.
+    """
+    single = len(query) <= chunk_size
+    size = len(query) if single else chunk_size
+    padding = (-len(query)) % size
+    q = jnp.pad(query, ((0, padding),) + ((0, 0),) * (query.ndim - 1))
+    count = len(q) // size
+    # VLLM_TPU_QSA_DECODE_SC_OVERLAP=2 leaves the pairing to XLA's scheduler.
+    grouped = envs.VLLM_TPU_QSA_DECODE_SC_OVERLAP == 1
+    first = streamindex_config.reserve_scheduling_group_ids(count) if grouped else None
+
+    def group(g):
+        return None if first is None or g < 0 else first + g
+
+    selected = []
+    for g in range(count):
+        window, (pool, earlier) = score(
+            q[g * size : (g + 1) * size],
+            *_shared_stream_operands(g * size, size, starts, context, table),
+            score_scheduling_group_id=group(g - 1),
+            topk_scheduling_group_id=group(g),
+            carry=(pool, tuple(selected)),
+        )
+        selected = [*earlier, window]
+    pool = after_scoring(pool)
+    if grouped:
+        pool = xla_metadata.set_xla_metadata(
+            pool, _scheduling_group_id=group(count - 1)
+        )
+    selected = selected[0] if single else jnp.concatenate(selected)[: len(query)]
+    return selected, pool
+
+
+def _shared_stream_operands(t0, size, starts, context, table):
+    ids, seq_lens, cu_q_lens, distribution = _request_window(t0, size, starts, context)
+    return seq_lens, table[ids], cu_q_lens, distribution
+
+
+def _shard_pages(pages, shard, align):
+    """This rank's kernel pages of each row: columns ``rank, rank + size, ...``.
+
+    ``pages`` is ``[rows, pages_per_row]`` of 128-token kernel pages. Rank
+    ``r`` of ``size`` owns kernel page ``j`` of every request when
+    ``j % size == r``, which is StreamIndex's context-parallel layout with a
+    one-page interleave: local compressed index ``l`` is global
+    ``cp_local_to_global(l, r, size, page_rows)``. The local width is padded
+    to ``align`` pages (the widest KV block) with page 0; lengths mask it.
+    """
+    rank, size = shard
+    width = pages.shape[1]
+    local = -(-width // size)
+    local += (-local) % align
+    pages = jnp.pad(pages, ((0, 0), (0, local * size - width)))
+    return pages.reshape(len(pages), local, size)[:, :, rank]
+
+
+def _sharded_topk(
+    q, weights, cache, seq_lens, pages, cu, distribution, *, shard, rows, **kw
+):
+    """``streamindex_topk`` over this rank's key slice, as merge candidates.
+
+    Returns int32 ``[tokens, k, 2]``: f32 score bits and the *global*
+    compressed position of each local winner; unfilled slots are ``-1`` with
+    score ``-inf``. ``pages`` is the full ``[seqs, pages_per_seq]`` table.
+    """
+    align = max(
+        kw["num_kv_pages_per_block"]
+        if isinstance(kw["num_kv_pages_per_block"], tuple)
+        else (kw["num_kv_pages_per_block"],)
+    )
+    rank, size = shard
+    kw.pop("enable_early_exit", None)
+    idx, bits = streamindex_topk(
+        q,
+        weights,
+        cache,
+        seq_lens,
+        _shard_pages(pages, shard, align).reshape(-1),
+        cu,
+        distribution,
+        enable_early_exit=False,
+        cp_size=size,
+        cp_rank=rank,
+        interleave_size=rows * kw["compression_ratio"],
+        return_scores=True,
+        **kw,
+    )
+    filled = idx >= 0
+    position = jnp.where(filled, cp_local_to_global(idx, rank, size, rows), -1)
+    bits = jnp.where(filled, bits.astype(jnp.int32), BITS_NEG_INF)
+    return jnp.stack([bits, position.astype(jnp.int32)], axis=-1)
+
+
+# q38 IDXX keys (lane rules COMPILE-KEY FACT / AR-FIX pattern): NOT registered in envs.py;
+# raw env reads here, and tpu_compiler._tpu_compile_env_factors adds each to the compile
+# factors only when set, so unset leaves the factors unchanged.
+IDXX_ENV_KEYS = (
+    # KEYB-A (port of L11 c65fd4543): decode / verify StreamIndex copies only the first N
+    # lanes (a multiple of 128 between the index query and the pool row width) of each
+    # compressed-key row; 0 / unset copies whole rows. Prefill keeps whole rows.
+    "VLLM_TPU_QSA_INDEXER_KEY_LANES",
+    # SEL-1P(a) (port of IX-SCW IX-6 44359a5d18): the compressed-DCP owned-group decode
+    # windows' SparseCore top-k copies only each score row's live prefix. 1 / unset.
+    "VLLM_TPU_QSA_DCP_SC_BOUNDED_COPY",
+    # SEL-1P(c): the compressed-DCP pair merge's threshold / tie cut / keep in one Pallas
+    # TC kernel (dcp_merge_fused.py); needs VLLM_TPU_QSA_DCP_MERGE_SCORES=1. 1 / unset.
+    "VLLM_TPU_QSA_DCP_FUSED_MERGE",
+)
+
+
+def _idxx_raw(name: str) -> str:
+    import os
+
+    assert name in IDXX_ENV_KEYS, name
+    return os.environ.get(name, "").strip()
+
+
+def idxx_flag(name: str) -> bool:
+    """A boolean IDXX key: unset / 0 off, 1 on; anything else raises."""
+    raw = _idxx_raw(name)
+    if raw in ("", "0"):
+        return False
+    if raw == "1":
+        return True
+    raise ValueError(f"{name} must be 0 or 1, got {raw!r}")
+
+
+def idxx_key_lanes() -> int:
+    raw = _idxx_raw("VLLM_TPU_QSA_INDEXER_KEY_LANES")
+    if not raw:
+        return 0
+    if not raw.isdigit():
+        raise ValueError(f"VLLM_TPU_QSA_INDEXER_KEY_LANES must be a non-negative int, got {raw!r}")
+    return int(raw)
+
+
+# q38 IDXX: trace-time engagement lines already logged in this process.
+_IDXX_LOGGED: set = set()
+
+
+def _log_idxx_once(key, msg, *args):
+    """One INFO line per (key, process) at trace time: the IDXX members'
+    engagement marks (they print in the served decode log at compile)."""
+    if key in _IDXX_LOGGED:
+        return
+    _IDXX_LOGGED.add(key)
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(msg, *args)
+
+
+@dataclasses.dataclass(frozen=True)
+class _SequentialSparseCoreTopK(SparseCoreTopK):
+    """The SparseCore selector without the score / next-chunk overlap: the
+    DCP owned scan's chunked prefill otherwise leaves unannotated ops inside
+    an overlap group ("annotation groups with gaps", j-5830132e)."""
+
+    overlaps_scoring: ClassVar[bool] = False
+
+
+def _dcp_topk(
+    q, weights, cache, seq_lens, pages, cu, distribution, *, dcp, block_tokens,
+    bounded_copy=False, **kw
+):
+    """``streamindex_topk`` over this DCP rank's owned compressed groups.
+
+    Under ``VLLM_TPU_QSA_COMPRESSED_DCP`` a table entry covers ``D *
+    block_tokens`` tokens and the rank holds the groups of its owned
+    ``block_tokens``-token blocks (owner ``(t // block_tokens) % D``) in the
+    entry's page: ``pages`` [seqs, kernel pages] lists them in local order,
+    which is StreamIndex's context-parallel layout with a ``block_tokens``
+    interleave. Returns int32 ``[tokens, k, 2]``: f32 score bits and the global
+    group id of each local winner (``dcp_select.EMPTY`` / ``-inf`` unfilled).
+    """
+    from vllm_torchtpu.kernels.qwen4_exp.dcp_select import EMPTY
+
+    rank, size = dcp
+    rank = jnp.asarray(rank, jnp.int32).reshape(-1)[0]
+    align = max(
+        kw["num_kv_pages_per_block"]
+        if isinstance(kw["num_kv_pages_per_block"], tuple)
+        else (kw["num_kv_pages_per_block"],)
+    )
+    kw.pop("enable_early_exit", None)
+    # q38 IDXX SEL-1P(a) (VLLM_TPU_QSA_DCP_SC_BOUNDED_COPY, decode windows only;
+    # port of IX-SCW IX-6): the SparseCore copies each score row's live prefix.
+    kw["topk_backend"] = _SequentialSparseCoreTopK(bounded_copy=bool(bounded_copy))
+    if bounded_copy:
+        _log_idxx_once(
+            ("bounded", len(q)),
+            "q38 IDXX DCP_SC_BOUNDED_COPY engaged: compressed-DCP decode top-k rows %d "
+            "(sparsecore_topk takes the bounded copy with >= 32 rows whose row fits)",
+            len(q),
+        )
+    if envs.VLLM_TPU_QSA_COMPRESSED_DCP_LOCAL_MERGE:
+        # Whole int32 sublane tiles per score row: the rank's local rows
+        # (e.g. 130 x 128 positions) otherwise get a relayout copy before
+        # the SparseCore top-k.
+        kw["score_sublane_align"] = 8
+    # `pages` are kernel pages, or pool pages the KV reader expands
+    # (VLLM_TPU_QSA_DCP_POOL_PAGE_TABLE): pad to whole widest KV blocks.
+    expansion = kw["components"].table_expansion[0] if kw.get("components") else 1
+    align = -(-align // expansion)
+    pages = jnp.pad(pages, ((0, 0), (0, (-pages.shape[1]) % align)))
+    idx, bits = streamindex_topk(
+        q,
+        weights,
+        cache,
+        seq_lens,
+        pages.reshape(-1),
+        cu,
+        distribution,
+        enable_early_exit=False,
+        cp_size=size,
+        cp_rank=rank,
+        interleave_size=block_tokens,
+        return_scores=True,
+        **kw,
+    )
+    filled = idx >= 0
+    ratio = kw["compression_ratio"]
+    position = jnp.where(
+        filled, cp_local_to_global(idx, rank, size, block_tokens // ratio), EMPTY
+    )
+    if bits.dtype != jnp.int32:
+        bits = jax.lax.bitcast_convert_type(bits.astype(jnp.float32), jnp.int32)
+    bits = jnp.where(filled, bits, BITS_NEG_INF)
+    return jnp.stack([bits, position.astype(jnp.int32)], axis=-1)
+
+
+def merge_candidates(candidates, k, *, topk=None):
+    """Exact top-``k`` of all ranks' candidates, lower position first on ties.
+
+    ``candidates`` is int32 ``[tokens, n, 2]`` (f32 score bits, global
+    position; position ``-1`` is empty). Every global winner is in its owner
+    rank's local top-``k``: that rank ranks it with the same (score, lower
+    position) order, so at most ``k - 1`` of its own keys precede it. A
+    SparseCore top-``k`` over the gathered scores finds the threshold score;
+    only rows with more threshold ties than free slots are re-selected, taking
+    the lowest-position ties as the replicated indexer does. Returns int32
+    ``[tokens, k]`` positions with a ``-1`` suffix.
+    """
+    if topk is None:
+        from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
+            sparsecore_topk,
+        )
+
+        def topk(bits, k):
+            return sparsecore_topk(bits, k, write_empty_rows=True)
+
+    bits, position = candidates[..., 0], candidates[..., 1]
+    filled = position >= 0
+    bits = jnp.where(filled, bits, BITS_NEG_INF)
+    slots = topk(bits, k)
+    taken = slots >= 0
+    safe = jnp.maximum(slots, 0)
+    blocks = jnp.where(taken, jnp.take_along_axis(position, safe, axis=1), -1)
+
+    scores = jax.lax.bitcast_convert_type(bits, jnp.float32)
+    threshold = jnp.min(
+        jnp.where(taken, jnp.take_along_axis(scores, safe, axis=1), jnp.inf),
+        axis=1,
+        keepdims=True,
+    )
+    strict = filled & (scores > threshold)
+    tied = filled & (scores == threshold)
+    quota = jnp.sum(taken, axis=1) - jnp.sum(strict, axis=1)
+    ambiguous = jnp.sum(tied, axis=1) > quota
+
+    def reselect(blocks):
+        # The quota-th smallest tied position, one bit at a time.
+        def bit(i, cut):
+            trial = cut + jnp.left_shift(1, 30 - i)
+            below = jnp.sum(tied & (position < trial[:, None]), axis=1)
+            return jnp.where(below < quota, trial, cut)
+
+        cut = jax.lax.fori_loop(0, 31, bit, jnp.zeros_like(quota))
+        won = strict | (tied & (position <= cut[:, None]))
+        slot = jnp.where(won, jnp.cumsum(won, axis=1) - 1, k)
+        rows = jnp.broadcast_to(jnp.arange(len(won))[:, None], won.shape)
+        exact = (
+            jnp.full(blocks.shape, -1, jnp.int32)
+            .at[rows, slot]
+            .set(position, mode="drop")
+        )
+        return jnp.where(ambiguous[:, None], exact, blocks)
+
+    return jax.lax.cond(jnp.any(ambiguous), reselect, lambda b: b, blocks)
+
+
+def token_shard_step(starts, context, shard_index, rows):
+    """Request layout of token rows ``[s * rows, (s + 1) * rows)`` of a step.
+
+    ``shard_index``: int32 ``[1]`` (an operand, so every rank traces the same
+    program). Returns ``(base, sub_starts, sub_context)``: the shard's first
+    row, the request starts re-based to the shard and each request's context
+    advanced by its rows before the shard. A request's rows in the shard see
+    the same keys as in the whole step, so the indexer selects the same
+    blocks for them; rows past ``starts[-1]`` stay outside every request.
+    """
+    base = shard_index.reshape(()).astype(jnp.int32) * rows
+    sub_starts = jnp.clip(starts - base, 0, rows).astype(starts.dtype)
+    before = jnp.clip(base - starts[:-1], 0, starts[1:] - starts[:-1])
+    return base, sub_starts, (context + before).astype(context.dtype)
+
+
+def _compressed_expansion(logical_pages: int, physical_pages: int, slot: int):
+    """StreamIndex ``table_expansion`` for a compressed block table (see
+    ``compressed_kernel_pages``): kernel page ``k`` of column ``c`` is
+    ``c * stride + offset + k % logical_pages``."""
+    if slot < 0:
+        # `logical_pages` here is the entry's (merged_span pages of keys).
+        base = logical_pages // merged_span(slot)
+        return (logical_pages, logical_pages, compressed_region(slot) * base)
+    return (logical_pages, physical_pages, slot * logical_pages)
+
+
+def compressed_kernel_pages(pages: jax.Array, pool: jax.Array, slot: int = 0, ratio: int = 4) -> jax.Array:
+    """Flat kernel-page ids of compressed block-table columns `pages`.
+
+    Each column (a pool block of `pool.shape[1]` tokens) holds `pool.shape[1] // 128` kernel
+    pages of `128 // ratio` compressed keys for this layer, at `slot` times that within the
+    block's physical pages: column `c` -> `c * physical_pages + slot * logical_pages + j`
+    (merged keys, `slot` < 0: `(c + compressed_region(slot)) * logical_pages + j`). The
+    one addressing of compressed keys, shared by the stock selection and the whole-step
+    megakernel's page tables.
+    """
+    rows = 128 // ratio
+    physical_pages = math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * pool.shape[-1] * 2)
+    logical_pages = pool.shape[1] // 128
+    first = jnp.arange(logical_pages)
+    if slot < 0:
+        # Merged keys (``compressed_region``): entry ``c`` covers ``m`` columns,
+        # kernel pages ``(m * c + region) * logical_pages + j``, j < m * logical_pages.
+        m = merged_span(slot)
+        first = jnp.arange(m * logical_pages)
+        return (
+            (pages[..., None] * m + compressed_region(slot)) * logical_pages + first
+        ).reshape(-1)
+    scaled = pages[..., None] * physical_pages
+    if slot:
+        first = first + slot * logical_pages
+    return (scaled + first).reshape(-1)
+
+
+def prefill_indexer_chunk(tokens: int) -> int | None:
+    """Token chunk of the ragged prefill indexer, or None for one call.
+
+    Default: 512 when it divides the step. VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK
+    overrides it with any multiple of 8 that divides the step (e.g. 640 for
+    the 3200 / 6400-token buckets, which 512 does not divide).
+    """
+    override = envs.VLLM_TPU_QSA_PREFILL_INDEXER_CHUNK
+    if override and override % 8 == 0 and tokens % override == 0:
+        return override
+    return 512 if tokens % 512 == 0 else None
+
+
+# Largest expanded kernel-page table the ragged prefill indexer prefetches
+# into SMEM (64 request slots at max_model_len 262144 fit; 96 do not).
+PREFILL_PAGE_TABLE_SMEM_BYTES = 512 * 1024
+
+
+# q38 PSTEP-IDX: (tokens, chunk, engaged) already logged by _log_prefill_no_cond in this process.
+_Q38_PREFILL_NO_COND_LOGGED: set = set()
+
+
+def _log_prefill_no_cond(
+    tokens: int, chunk: int | None, engaged: bool, group_base: int | None = None
+) -> None:
+    """q38 PSTEP-IDX engagement line (rule 13): one INFO line per traced ragged prefill indexer shape, layer group
+    base and process when VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND is set. 'ENGAGED' = the early-exit cond is replaced
+    by a select; 'NOT ENGAGED' = a sharded / DCP indexer, or a call without a layer group base (an op other than
+    the layer's no-cond op), keeps the cond. Trace time only (a compile-cache hit prints nothing)."""
+    key = (tokens, chunk, engaged, group_base)
+    if key in _Q38_PREFILL_NO_COND_LOGGED:
+        return
+    _Q38_PREFILL_NO_COND_LOGGED.add(key)
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(
+        "q38 PSTEP-IDX prefill indexer no-cond %s: tokens %d, chunk %s (VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND)"
+        " group base %s",
+        "ENGAGED" if engaged else "NOT ENGAGED", tokens, chunk, group_base,
+    )
+
+
+def _traced_inline(fn):
+    """``fn`` without its ``jax.jit`` wrapper, so it traces into the caller's
+    computation (a stand-in that is not jitted is returned as is)."""
+    return getattr(fn, "__wrapped__", fn)
+
+
+def decode_sc_overlap_applies(tokens: int, requests: int, max_query_len: int) -> bool:
+    """Whether a step can take VLLM_TPU_QSA_DECODE_SC_OVERLAP's schedule: a
+    decode/verify-sized step on the shared-stream indexer, with the separate
+    cache writers (the fused writer stores main K/V with the compressed keys)."""
+    return (
+        tokens <= requests * max_query_len
+        and envs.VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0
+        and not envs.VLLM_TPU_QSA_FUSED_KV_WRITE
+    )
+
+
+def select_blocks(
+    query,
+    pool,
+    lengths,
+    table,
+    req,
+    starts,
+    context,
+    *,
+    ratio,
+    block_topk,
+    slot=0,
+    max_query_len=1,
+    shard=None,
+    dcp=None,
+    after_scoring=None,
+    indexer_group_base=None,
+):
+    """Read BF16 key tiles directly from the carrier, without a cache conversion.
+
+    ``dcp=(rank int32[1], D)`` (``VLLM_TPU_QSA_COMPRESSED_DCP``): ``table``
+    entries cover ``D`` pool blocks and hold this rank's owned groups; score
+    only those and return the local top-k as ``(vals f32 [T, k], pos int32
+    [T, k])`` with global group ids (``dcp_select.EMPTY`` unfilled) for the
+    pair merge (``dcp_select.merge_threshold``). Exclusive with ``shard``.
+
+    ``after_scoring(pool) -> pool`` (VLLM_TPU_QSA_DECODE_SC_OVERLAP, shared-stream
+    decode indexer only): an in-place pool update that must not change what the
+    indexer reads (the main K/V write). It runs after the last scoring read of
+    ``pool``, free to overlap the last SparseCore top-k (mode 1 puts both in one
+    XLA scheduling group), and the call returns ``(blocks, updated pool)``.
+
+    ``indexer_group_base`` (VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND): the layer's
+    fixed scheduling-group range (``streamindex_topk`` ``scheduling_group_base``).
+    The ragged prefill indexer drops its early-exit cond only with one.
+    """
+    if dcp is None:
+        return _select_blocks(
+            query, pool, lengths, table, req, starts, context, ratio=ratio,
+            block_topk=block_topk, slot=slot, max_query_len=max_query_len,
+            shard=shard, after_scoring=after_scoring,
+            **(
+                {"indexer_group_base": indexer_group_base}
+                if indexer_group_base is not None
+                else {}
+            ),
+        )
+    if shard is not None:
+        raise ValueError("select_blocks: shard= and dcp= are exclusive")
+    if after_scoring is not None:
+        raise ValueError("select_blocks: after_scoring= covers the replicated indexer")
+    out = _select_blocks(
+        query, pool, lengths, table, req, starts, context, ratio=ratio,
+        block_topk=block_topk, slot=slot, max_query_len=max_query_len, dcp=dcp,
+    )
+    return jax.lax.bitcast_convert_type(out[..., 0], jnp.float32), out[..., 1]
+
+
+def _select_blocks(
+    query,
+    pool,
+    lengths,
+    table,
+    req,
+    starts,
+    context,
+    *,
+    ratio,
+    block_topk,
+    slot=0,
+    max_query_len=1,
+    shard=None,
+    dcp=None,
+    after_scoring=None,
+    indexer_group_base=None,
+):
+    """``select_blocks``; under ``dcp`` the local top-k as int32 [T, k, 2]
+    (score bits, global group id).
+
+    ``max_query_len`` routes as in ``qsa_attention``: steps with at most that
+    many tokens per request row use the per-token decode indexer.
+
+    ``slot`` selects this layer's kernel pages in a packed page, as in
+    ``write_compressed``.
+
+    ``shard=(rank, size)`` scores only this rank's interleaved 1/size of every
+    request's compressed keys (``_shard_pages``) and returns merge candidates
+    ``[tokens, block_topk, 2]`` for ``merge_candidates`` instead of blocks.
+
+    ``after_scoring``: see ``select_blocks``.
+    """
+    if after_scoring is not None and not (
+        shard is None
+        and dcp is None
+        and decode_sc_overlap_applies(len(query), len(context), max_query_len)
+    ):
+        raise ValueError(
+            "after_scoring needs the replicated shared-stream decode indexer "
+            "(VLLM_TPU_QSA_DECODE_QUERY_BLOCK) on a decode/verify step"
+        )
+    width = pool.shape[-1]
+    rows = 128 // ratio
+    packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
+    # q38 IDXX KEYB-A (port of L11 c65fd4543, VLLM_TPU_QSA_INDEXER_KEY_LANES;
+    # decode / verify passes only): copy the first `key_lanes` lanes of each key
+    # row; the BF16 pool's query is then padded to that width instead of the
+    # row's (the lanes past the index query's are zero in the query, so the
+    # scores keep their terms).
+    key_lanes = idxx_key_lanes()
+    if key_lanes and (key_lanes % 128 or not query.shape[-1] <= key_lanes <= width):
+        raise ValueError(
+            "VLLM_TPU_QSA_INDEXER_KEY_LANES must be 0 or a multiple of 128 between"
+            f" the index query width ({query.shape[-1]}) and the key row width"
+            f" ({width}), got {key_lanes}"
+        )
+    decode_width = key_lanes or width
+    if key_lanes and key_lanes < width and len(query) <= len(context) * max_query_len:
+        _log_idxx_once(
+            ("key_lanes", key_lanes, len(query)),
+            "q38 IDXX INDEXER_KEY_LANES engaged: decode indexer copies %d of %d lanes per "
+            "key row (rows %d, DCP %s)",
+            key_lanes, width, len(query), dcp is not None,
+        )
+    physical_pages = (
+        math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * width * 2)
+    )
+    logical_pages = pool.shape[1] // 128
+    cache = pool.reshape(-1, rows // 2, packing, width)
+    assert slot <= 0 or (slot + 1) * logical_pages <= physical_pages, (
+        "packed compressed-key slot exceeds its pool page"
+    )
+    if slot < 0:
+        # Merged keys: one table entry expands to merged_span pages of keys.
+        logical_pages *= merged_span(slot)
+
+    def expand_pages(pages):
+        return compressed_kernel_pages(pages, pool, slot, ratio)
+
+    def topk(q, weights, cache, seq_lens, pages, cu, distribution, **kw):
+        """``pages``: [seqs, kernel pages per seq]."""
+        if dcp is not None:
+            kw.pop("topk_backend", None)
+            bounded_dcp = kw.pop("dcp_bounded_copy", False)
+            return _dcp_topk(
+                q, weights, cache, seq_lens, pages, cu, distribution, dcp=dcp,
+                block_tokens=pool.shape[1], bounded_copy=bounded_dcp, **kw,
+            )
+        if shard is None:
+            # Calls carrying scheduling groups (VLLM_TPU_QSA_DECODE_SC_OVERLAP)
+            # trace inline: XLA legalizes the groups before it inlines nested
+            # calls and drops a group whose members sit in different
+            # computations. The select backend inlines its top-k likewise.
+            select = (
+                _traced_inline(streamindex_topk) if "carry" in kw else streamindex_topk
+            )
+            return select(
+                q, weights, cache, seq_lens, pages.reshape(-1), cu, distribution, **kw
+            )
+        return _sharded_topk(
+            q,
+            weights,
+            cache,
+            seq_lens,
+            pages,
+            cu,
+            distribution,
+            shard=shard,
+            rows=rows,
+            **kw,
+        )
+
+    def select_chunk(q, lens, pages):
+        batch = len(q)
+        expanded = expand_pages(pages).reshape(batch, -1)
+        index_query = (
+            jnp.pad(q, ((0, 0), (0, 0), (0, decode_width - q.shape[-1])))
+            if pool.dtype == jnp.bfloat16
+            else q
+        )
+        return topk(
+            index_query,
+            jnp.full(q.shape[:2], q.shape[-1] ** -0.5, jnp.float32),
+            cache,
+            lens,
+            expanded,
+            jnp.arange(batch + 1, dtype=jnp.int32),
+            jnp.full((3,), batch, jnp.int32),
+            k=block_topk,
+            compression_ratio=ratio,
+            num_kv_pages_per_block=256 // rows,
+            num_queries_per_block=1,
+            decode_req_batch_size=8 if batch >= 8 else 4,
+            enable_early_exit=True,
+            components=qsa_indexing(key_lanes=key_lanes),
+        )
+
+    if len(query) > len(context) * max_query_len:
+        # Present prefill as its native ragged request batch. The previous path
+        # treated every query as a one-token decode sequence, so every row
+        # reloaded the same KV history and ran an M=1 score matmul. BQ128 reuses
+        # each KV tile across neighboring queries; chunking overlaps chunk g's
+        # SparseCore top-k with chunk g+1's TensorCore scoring.
+        query_lens = starts[1:] - starts[:-1]
+        num_seqs = jnp.max(
+            jnp.where(query_lens > 0, jnp.arange(len(context), dtype=jnp.int32) + 1, 0)
+        )
+        num_decodes = decode_prefix(starts)
+        seq_lens = context + query_lens
+        chunk_tokens = prefill_indexer_chunk(len(query))
+        # The scalar-prefetched kernel-page table holds every request slot's
+        # whole row (slots x max_model_len / 128 pages). Past the SMEM budget
+        # (e.g. 96 slots at 262144 tokens: 768 KiB) hand StreamIndex the
+        # pool-page table and let its KV reader expand each entry, as the
+        # decode path's VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE does.
+        expansion = (1, 1, 0)
+        pages = table
+        if (
+            dcp is None
+            and len(table) * table.shape[1] * logical_pages * 4
+            > PREFILL_PAGE_TABLE_SMEM_BYTES
+        ):
+            expansion = _compressed_expansion(logical_pages, physical_pages, slot)
+        else:
+            pages = expand_pages(table).reshape(len(table), -1)
+        # q38 PSTEP-IDX (VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND): the same
+        # result as the early-exit cond, taken by a select, so XLA can run the
+        # layer's selection-independent ops beside the SparseCore top-k. Only
+        # with the layer's own scheduling-group range: without the cond every
+        # layer's chunk groups share one computation (T70g j-e61e85e4).
+        no_cond = (
+            envs.VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND
+            and shard is None
+            and dcp is None
+            and indexer_group_base is not None
+        )
+        if envs.VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND:
+            _log_prefill_no_cond(len(query), chunk_tokens, no_cond, indexer_group_base)
+        return topk(
+            jnp.pad(query, ((0, 0), (0, 0), (0, width - query.shape[-1]))),
+            jnp.full(query.shape[:2], query.shape[-1] ** -0.5, jnp.float32),
+            cache,
+            seq_lens,
+            pages,
+            starts,
+            jnp.asarray([num_decodes, num_decodes, num_seqs], dtype=jnp.int32),
+            k=block_topk,
+            compression_ratio=ratio,
+            num_kv_pages_per_block=(envs.VLLM_TPU_QSA_PREFILL_INDEXER_BKV // rows,) * 3,
+            num_queries_per_block=(1,) + (envs.VLLM_TPU_QSA_PREFILL_INDEXER_BQ,) * 2,
+            decode_req_batch_size=8,
+            enable_early_exit=not no_cond,
+            **(
+                {"early_exit_select": True, "scheduling_group_base": indexer_group_base}
+                if no_cond
+                else {}
+            ),
+            chunk_tokens=chunk_tokens,
+            components=qsa_indexing(ratio - 1, table_expansion=expansion),
+            # VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: as the decode flag, for
+            # the prefill chunks' rows (short contexts early in a prompt).
+            **(
+                {"topk_backend": SparseCoreTopK(bounded_copy=True)}
+                if envs.VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY
+                and shard is None
+                and dcp is None
+                else {}
+            ),
+        )
+
+    pages_per_query = table.shape[1] * logical_pages
+    if shard is not None:
+        pages_per_query = -(-pages_per_query // shard[1])
+    chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
+    query_block = envs.VLLM_TPU_QSA_DECODE_QUERY_BLOCK
+    if query_block:
+        kv_block = envs.VLLM_TPU_QSA_DECODE_KV_BLOCK
+        # The larger single-token block only pays on steps whose requests
+        # carry one token (MTP draft rows, plain decode). On verify steps the
+        # one-token decode passes are empty and a larger block makes them
+        # slower, so they keep the 256-key block.
+        decode_kv_block = (
+            envs.VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK
+            if len(query) <= len(context)
+            else 256
+        )
+        for name, block in (
+            ("VLLM_TPU_QSA_DECODE_KV_BLOCK", kv_block),
+            ("VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK", decode_kv_block),
+        ):
+            if block < rows or block % 128 or block % rows:
+                raise ValueError(
+                    f"{name} must be a positive multiple of 128 "
+                    f"and of {rows} compressed keys per page, got {block}"
+                )
+        mixed_only = envs.VLLM_TPU_QSA_INDEXER_MIXED_ONLY
+        if shard is not None or dcp is not None:
+            # Room for the local table padded to the widest KV block.
+            pages_per_query += max(256, kv_block, decode_kv_block) // rows
+            chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
+        # VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE: hand StreamIndex the pool-page
+        # table and let its KV reader expand each entry into the page's
+        # kernel pages, so the scalar-prefetched table (and with it the query
+        # window) is not bounded by logical_pages x the table width.
+        pool_table = shard is None and (
+            envs.VLLM_TPU_QSA_DCP_POOL_PAGE_TABLE
+            if dcp is not None
+            else envs.VLLM_TPU_QSA_DECODE_POOL_PAGE_TABLE
+        )
+        expansion = (1, 1, 0)
+        if pool_table:
+            # Same headroom as the sharded table, in pool pages.
+            pool_pages = table.shape[1] + -(
+                -max(256, kv_block, decode_kv_block) // (rows * logical_pages)
+            )
+            chunk_size = min(len(query), decode_query_chunk_size(pool_pages))
+            expansion = _compressed_expansion(logical_pages, physical_pages, slot)
+        # VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: the score rows are sized for
+        # max_model_len; select from each row's live prefix only instead of
+        # copying the whole row to the SparseCore.
+        bounded = (
+            envs.VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY and shard is None and dcp is None
+        )
+
+        def score_window(q, seq_lens, pages, cu, distribution, **pinned):
+            if pinned:
+                # Scheduling groups and the pool carry (after_scoring): no
+                # early-exit cond, and the top-k traced inline (see `topk`).
+                # The early exit only skips work: the scoring path handles
+                # all-visible rows too (mixed steps send short requests there).
+                backend = {
+                    "topk_backend": SparseCoreTopK(bounded_copy=bounded, inline=True),
+                    **pinned,
+                }
+            else:
+                backend = (
+                    {"topk_backend": SparseCoreTopK(bounded_copy=True)}
+                    if bounded
+                    else {}
+                )
+            return topk(
+                jnp.pad(q, ((0, 0), (0, 0), (0, decode_width - q.shape[-1])))
+                if pool.dtype == jnp.bfloat16
+                else q,
+                jnp.full(q.shape[:2], q.shape[-1] ** -0.5, jnp.float32),
+                cache,
+                seq_lens,
+                pages if pool_table else expand_pages(pages).reshape(len(pages), -1),
+                cu,
+                # VLLM_TPU_QSA_INDEXER_MIXED_ONLY: every sequence through the
+                # mixed pass. With per-token scores it scores a 1-token request
+                # exactly as the decode passes do, and the two decode launches
+                # are empty on verify steps.
+                distribution.at[:2].set(0) if mixed_only else distribution,
+                k=block_topk,
+                compression_ratio=ratio,
+                num_kv_pages_per_block=(decode_kv_block // rows,)
+                + (kv_block // rows,) * 2,
+                num_queries_per_block=(1, query_block, query_block),
+                decode_req_batch_size=8 if len(q) >= 8 else 4,
+                enable_early_exit=not pinned,
+                components=qsa_indexing(
+                    ratio - 1,
+                    per_token_scores=True,
+                    table_expansion=expansion,
+                    # VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA: one DMA per pool
+                    # page when the KV block holds whole pool pages (e.g.
+                    # VLLM_TPU_QSA_DECODE_KV_BLOCK=3328 = 8 x 13 x 32 keys).
+                    coalesce_entries=envs.VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA,
+                    dense_step=envs.VLLM_TPU_QSA_INDEXER_DENSE_STEP,
+                    tail_skip=envs.VLLM_TPU_QSA_INDEXER_TAIL_SKIP,
+                    key_lanes=key_lanes,
+                ),
+                decode_passes=not mixed_only,
+                hoist_step_metadata=envs.VLLM_TPU_QSA_INDEXER_HOIST_META,
+                **backend,
+                # q38 IDXX SEL-1P(a) (VLLM_TPU_QSA_DCP_SC_BOUNDED_COPY): the
+                # owned-group decode windows' SparseCore copies live prefixes.
+                **(
+                    {"dcp_bounded_copy": True}
+                    if dcp is not None and idxx_flag("VLLM_TPU_QSA_DCP_SC_BOUNDED_COPY")
+                    else {}
+                ),
+            )
+
+        return _select_shared_stream(
+            query,
+            starts,
+            context,
+            table,
+            chunk_size=chunk_size,
+            score=score_window,
+            pool=pool,
+            after_scoring=after_scoring,
+        )
+    if shard is not None or dcp is not None:
+        pages_per_query += 256 // rows
+        chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
+    if len(query) <= chunk_size:
+        return select_chunk(query, lengths, table[req])
+
+    padding = (-len(query)) % chunk_size
+    q = jnp.pad(query, ((0, padding),) + ((0, 0),) * (query.ndim - 1))
+    lens = jnp.pad(lengths, (0, padding))
+    request_ids = jnp.pad(req, (0, padding))
+    chunks = (
+        q.reshape(-1, chunk_size, *q.shape[1:]),
+        lens.reshape(-1, chunk_size),
+        request_ids.reshape(-1, chunk_size),
+    )
+    _, selected = jax.lax.scan(
+        lambda carry, inputs: (
+            carry,
+            select_chunk(inputs[0], inputs[1], table[inputs[2]]),
+        ),
+        None,
+        chunks,
+    )
+    return selected.reshape(-1, *selected.shape[2:])[: len(query)]
+
+
+# q38 BLSTACK-W2: (tokens, request slots, main slot, decision) already logged by _log_fused_kv_write in this process.
+_Q38_FUSED_KV_WRITE_LOGGED: set = set()
+
+
+def _log_fused_kv_write(tokens: int, slots: int, main_slot: int, decode_rows: int, fused: bool) -> None:
+    """q38 BLSTACK-W2: one INFO line per distinct traced shape / decision and process when
+    VLLM_TPU_QSA_FUSED_KV_WRITE is set: 'ENGAGED' (fused_layer_write stores this layer's caches) or 'NOT ENGAGED'
+    (the separate writers: a prefill-sized step, or a geometry fused_write_supported refuses). Traced shapes only:
+    a compile-cache hit re-traces nothing and prints nothing."""
+    key = (tokens, slots, main_slot, fused)
+    if key in _Q38_FUSED_KV_WRITE_LOGGED:
+        return
+    _Q38_FUSED_KV_WRITE_LOGGED.add(key)
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(
+        "q38 BLSTACK fused KV write %s: tokens %d, request slots %d, main slot %d (decode-sized up to %d tokens; "
+        "VLLM_TPU_QSA_FUSED_KV_WRITE)",
+        "ENGAGED" if fused else "NOT ENGAGED", tokens, slots, main_slot, decode_rows,
+    )
+
+
+def qsa_cache_writes(
+    pool: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    raw: jax.Array,
+    positions: jax.Array,
+    nik: jax.Array,
+    trig: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    *,
+    compress_ratio: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    dcp: tuple[jax.Array, int] | None = None,
+    compressed_dcp: tuple[jax.Array, int] | None = None,
+    main_write: bool = True,
+    indexer_writes: bool = True,
+) -> tuple:
+    """One QSA layer's cache writes for a step's tokens: main K/V, the completed groups'
+    compressed keys, ring rows and tags. Returns ``(pool, req, logical, valid)``.
+
+    ``indexer_writes=False`` writes the main K/V only, for a layer that attends another
+    layer's selection: its compressed keys, ring rows and tags feed only its own indexer.
+
+    ``main_write=False`` (separate writers only) leaves the main K/V out and returns
+    ``(pool, req, logical, valid, write)``, where ``write(pool)`` stores them: the
+    indexer never reads main K/V, so the caller can run it beside the selection.
+
+    ``dcp=(rank, size)`` (VLLM_TPU_QSA_MAIN_KV_DCP; ``rank`` int32 ``[1]``): a main-KV
+    block-table entry covers ``size`` physical pages' worth of tokens and this rank stores
+    only the rows it owns: token ``t`` at page ``main_table[req, t // (size * B)]``, row
+    ``t % B``, owned iff ``(t // B) % size == rank`` (``B = pool.shape[1]``). Compressed keys
+    and rings stay replicated unless ``compressed_dcp`` (VLLM_TPU_QSA_COMPRESSED_DCP, same
+    rule): then each rank writes only its owned groups' compressed keys, at row ``t % B`` of
+    page ``compressed_table[req, t // (size * B)]``. Rings stay replicated (every rank
+    compresses).
+
+    ``k`` / ``v`` are ``produce``'s normed+roped keys and values, ``raw`` its raw indexer
+    keys; tables are the per-request rows (``ring_ids`` already column 0). Every token
+    writes, verify drafts included (later steps overwrite rejected positions). Shared by
+    ``_pooled_qsa`` and the Qwen3.8 whole-step megakernel's post-kernel scatter, so both
+    leave the same cache bytes for the same inputs.
+    """
+    # Native allocation supplies an owner for every nonempty query row;
+    # padded/idle rows have empty query ranges. Keep lengths independent of
+    # layer-specific page IDs so XLA can share RPA schedules across layers.
+    active = starts[1:] > starts[:-1]
+    slots = jnp.where(active, jnp.arange(len(ring_ids), dtype=jnp.int32), -1)
+    req, logical, valid = _token_metadata(len(k), starts, context, slots)
+    main_valid = valid
+    span = pool.shape[1]
+    main_rows = logical
+    if dcp is not None:
+        from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import dcp_interleave, dcp_owner_row
+
+        rank, size = dcp[0], dcp[1]
+        span = size * pool.shape[1]
+        owner, row = dcp_owner_row(
+            logical, pool.shape[1], size, dcp_interleave(dcp, pool.shape[1])
+        )
+        main_valid = valid & (owner == rank.reshape(()).astype(owner.dtype))
+        # The writers take the row as `logical % page`; `row` < page.
+        main_rows = row
+    page = jnp.where(main_valid, main_table[req, logical // span], len(pool))
+    fp8 = pool.dtype == jnp.float8_e4m3fn
+    rows_packed = pack_rows(k, v, fp8=fp8, k_scale=k_scale, v_scale=v_scale)
+    slot_kw = {"slot": main_slot} if main_slot >= 0 else {}
+    # Decode/verify-sized steps only; prefill keeps the bulk tile writers.
+    fused = (
+        envs.VLLM_TPU_QSA_FUSED_KV_WRITE
+        and indexer_writes
+        and len(k) <= len(context) * max_query_len
+        and fused_write_supported(
+            pool, len(k), len(ring_ids), main_slot if main_slot >= 0 else None
+        )
+    )
+    if envs.VLLM_TPU_QSA_FUSED_KV_WRITE and indexer_writes:
+        # q38 BLSTACK-W2 trace-time engagement line of the fused writer (log only: Python at trace time, nothing
+        # enters the traced program; once per distinct shape / decision and process).
+        _log_fused_kv_write(len(k), len(ring_ids), main_slot, len(context) * max_query_len, bool(fused))
+    if fused and not main_write:
+        raise ValueError("main_write=False needs the separate cache writers")
+
+    def write_main(pool):
+        return write_main_cache(
+            pool, rows_packed, page, main_rows, main_valid, **slot_kw
+        )
+
+    if not indexer_writes:
+        if not main_write:
+            return pool, req, logical, valid, write_main
+        return write_main(pool), req, logical, valid
+    if not fused and main_write:
+        pool = write_main(pool)
+    ring_rows = math.ceil(compress_ratio / 8) * 8
+    ring_elements = ring_rows * raw.shape[-1]
+    # A RING_DMA_BATCH override keeps the ring reads on the batched reader.
+    read_state = (
+        read_ring_and_tags_concurrent
+        if fused and not envs.VLLM_TPU_QSA_RING_DMA_BATCH
+        else read_ring_and_tags
+    )
+    ring, tags = read_state(pool, ring_ids, ring_elements, ring_rows * 2)
+    ring = ring.reshape(len(ring_ids), ring_rows, -1)
+    tags = tags.reshape(len(ring_ids), ring_rows, 2)
+    # The fused writer also takes the main-KV row as `offset % page`.
+    main_logical = main_rows
+    completed, complete, req, logical, ring, tags = _indexer_updates(
+        raw,
+        positions,
+        ring,
+        tags,
+        nik,
+        trig,
+        starts,
+        context,
+        slots,
+        compress_ratio,
+        norm_eps,
+        rotary_dim,
+        # Request row r reads and writes ring row r (slots is r or -1).
+        rows_are_slots=fused or envs.VLLM_TPU_QSA_RING_SELECT,
+        **({"prefill_rows": True} if glueb.prefill_step(len(k), len(ring_ids), max_query_len) else {}),
+    )
+    ids = jnp.where(active, ring_ids, 0)
+    if fused:
+        pair, write, mask, values = compressed_pairs(
+            pool,
+            completed,
+            complete,
+            req,
+            logical,
+            starts,
+            context,
+            compressed_table,
+            compress_ratio,
+            compressed_slot,
+            **({"dcp": compressed_dcp} if compressed_dcp is not None else {}),
+        )
+        pool = fused_layer_write(
+            pool,
+            main_rows=main_slot_rows(rows_packed, main_slot)
+            if main_slot > 0
+            else rows_packed,
+            main_page=page,
+            main_offset=main_logical,
+            main_valid=main_valid,
+            main_slot=main_slot if main_slot >= 0 else None,
+            comp_pair=pair,
+            comp_write=write,
+            comp_mask=mask,
+            comp_values=values,
+            ring=ring.reshape(len(ids), -1),
+            tags=tags.reshape(len(ids), -1),
+            # Stopgap: the served model hangs on its first warmup forward
+            # when this kernel also writes the rings (it serves with any one
+            # region on the separate writers; the kernel alone does not
+            # hang). Keep the rings on write_ring_and_tags until the
+            # interaction is understood.
+            ring_ids=jnp.zeros_like(ids),
+            run_starts=starts[:-1],
+            run_lengths=starts[1:] - starts[:-1],
+            run_length=max_query_len,
+        )
+        pool = write_ring_and_tags(
+            pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
+        )
+    else:
+        pool = write_compressed(
+            pool,
+            completed,
+            complete,
+            req,
+            logical,
+            starts,
+            context,
+            compressed_table,
+            compress_ratio,
+            compressed_slot,
+            **({"dcp": compressed_dcp} if compressed_dcp is not None else {}),
+            decode=len(k) <= len(context) * max_query_len,
+            **({"prefill_rows": True} if glueb.prefill_step(len(k), len(context), max_query_len) else {}),
+        )
+        pool = write_ring_and_tags(
+            pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
+        )
+    if not main_write:
+        return pool, req, logical, valid, write_main
+    return pool, req, logical, valid
+
+
+def _pooled_qsa(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    rows: jax.Array | None = None,
+    select_only: bool = False,
+    shard: tuple[int, int] | None = None,
+    token_shard: tuple[jax.Array, int] | None = None,
+    shared: jax.Array | None = None,
+    dcp: tuple[jax.Array, int] | None = None,
+    compressed_dcp: bool = False,
+    indexer_writes: bool = True,
+    token_shard_decode: bool = False,
+    indexer_group_base: int | None = None,
+) -> tuple[jax.Array, ...]:
+    """One QSA layer over the unified pool.
+
+    ``indexer_writes=False`` (``shared`` only): the main K/V is the only cache write; see
+    ``qsa_cache_writes``.
+
+    ``compressed_dcp`` (VLLM_TPU_QSA_COMPRESSED_DCP, with ``dcp``): compressed
+    keys are written and scored on their owner only. Without ``shared`` the
+    layer stops after the indexer and returns ``(pool, q, gate, lengths, req,
+    starts, vals, pos)``, this rank's local top-k for
+    ``pooled_qsa_compressed_dcp_attend_step``.
+
+    ``select_only``: stop after the indexer and return ``(pool, q, gate, pages,
+    kv_lens)`` for an attention computed elsewhere (the Qwen3.8 segment
+    megakernel): ``q`` / ``gate`` ``[T, heads, D]`` BF16 and the virtual
+    micro-page ids / visible lengths of ``virtual_page_metadata``.
+
+    ``main_slot`` >= 0 selects this layer's KV head pair in main KV pages
+    shared by two layers (``pool_layout.pooled_cache_specs``); the default -1
+    keeps the layer's whole-row pages.
+
+    ``shard=(rank, size)`` stops after this rank's slice of the indexer and
+    returns ``(pool, q, gate, lengths, req, starts, candidates)`` for
+    ``pooled_qsa_shard_attend``; ``req`` then indexes the per-request main
+    table rows and ``starts`` is the attended token layout.
+
+    ``token_shard=(index, size)`` (``index`` int32 ``[1]``) runs the indexer
+    on token rows ``[index * T / size, (index + 1) * T / size)`` only and
+    returns the same tuple with that shard's ``[T / size, k]`` blocks in place
+    of ``candidates``; all-gather them for ``pooled_qsa_shard_attend`` with
+    ``merged``.
+
+    ``token_shard_decode`` (q38 BLSTACK-IDX, VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD;
+    ``compressed_dcp`` with ``token_shard`` only): the shard's rows keep the
+    step's ``max_query_len`` routing (the decode / verify indexer) instead of the
+    ragged prefill indexer. ``token_shard_step`` re-bases each request's start
+    and context to the shard, so every row is scored with the same query, keys
+    and causal length as in the unsharded step.
+    """
+    assert indexer_writes or shared is not None, "the layer's own indexer reads its ring"
+    # Keep the Runner's flat group tables at the Torch boundary. Static JAX
+    # shapes reconstruct their per-request rows inside the operator.
+    main_table = main_table.reshape(len(context), -1)
+    compressed_table = compressed_table.reshape(len(context), -1)
+    # Native BlockTable pads this one-block ring row to token alignment.
+    # Only column zero owns storage; the remaining entries are padding.
+    ring_ids = ring_ids.reshape(len(context), -1)[:, 0]
+    q, k, v, gate, iq, raw = produce(
+        qgate, key, value, index_qk, nq, nk, niq, positions, trig, norm_eps, rotary_dim,
+        **({"prefill_rows": True} if glueb.prefill_step(len(qgate), len(context), max_query_len) else {}),
+    )
+    # VLLM_TPU_QSA_DECODE_SC_OVERLAP: the shared-stream decode indexer stores
+    # the main K/V while the SparseCore selects (select_blocks after_scoring).
+    if envs.VLLM_TPU_QSA_DECODE_SC_OVERLAP not in (0, 1, 2):
+        raise ValueError(
+            "VLLM_TPU_QSA_DECODE_SC_OVERLAP is 0, 1 (scheduling groups) or 2 "
+            f"(no groups), got {envs.VLLM_TPU_QSA_DECODE_SC_OVERLAP}"
+        )
+    overlap = (
+        envs.VLLM_TPU_QSA_DECODE_SC_OVERLAP > 0
+        and decode_sc_overlap_applies(len(q), len(context), max_query_len)
+        and rows is None
+        and shard is None
+        and token_shard is None
+        and shared is None
+        and not compressed_dcp
+        and not select_only
+    )
+    pool, req, logical, valid, *deferred = qsa_cache_writes(
+        pool,
+        k,
+        v,
+        raw,
+        positions,
+        nik,
+        trig,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio=compress_ratio,
+        norm_eps=norm_eps,
+        rotary_dim=rotary_dim,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        compressed_slot=compressed_slot,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+        dcp=dcp,
+        **({"compressed_dcp": dcp[:2]} if compressed_dcp else {}),
+        main_write=not overlap,
+        indexer_writes=indexer_writes,
+    )
+    fp8 = pool.dtype == jnp.float8_e4m3fn
+    lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
+    # Attend only the requested rows; every token above still wrote its KV,
+    # compressed key and ring state. Up to one row per request slot, the
+    # rows take the row-wise decode indexer and RPA.
+    keep = None if rows is None else rows >= 0
+    picked = None if rows is None else jnp.clip(rows, 0, len(q) - 1)
+    if rows is not None and len(rows) <= len(context):
+        q, gate, iq, req = q[picked], gate[picked], iq[picked], req[picked]
+        lengths = jnp.where(keep, lengths[picked], 0)
+        # Present the rows as their own decode batch: row i is a one-token
+        # request with its own tables and causal length. The shared-stream
+        # indexer (VLLM_TPU_QSA_DECODE_QUERY_BLOCK) maps query rows to
+        # requests through starts/context, not req/lengths; the step's token
+        # layout would hand row i the i-th token of the step's first requests.
+        main_table, compressed_table = main_table[req], compressed_table[req]
+        req_rows = req
+        req = jnp.arange(len(rows), dtype=jnp.int32)
+        starts = jnp.arange(len(rows) + 1, dtype=jnp.int32)
+        context = jnp.maximum(lengths - 1, 0)
+        keep = picked = None
+    if compressed_dcp and shared is None:
+        assert dcp is not None and rows is None and shard is None
+        own_iq, own_lengths, own_req = iq, lengths, req
+        sub_starts, sub_context, query_len = starts, context, max_query_len
+        if token_shard is not None:
+            # The pair scores one token shard together (``index`` = the pair's
+            # shard); the ragged prefill indexer as in the replicated shard.
+            index, size = token_shard
+            width = len(iq) // size
+            base, sub_starts, sub_context = token_shard_step(starts, context, index, width)
+
+            def own(x):
+                return jax.lax.dynamic_slice_in_dim(x, base, width)
+
+            own_iq, own_lengths, own_req = own(iq), own(lengths), own(req)
+            # q38 BLSTACK-IDX: a decode-shaped step's row shard keeps the decode
+            # indexer (VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD).
+            query_len = max_query_len if token_shard_decode else 1
+        vals, pos = select_blocks(
+            own_iq,
+            pool,
+            own_lengths,
+            compressed_table,
+            own_req,
+            sub_starts,
+            sub_context,
+            ratio=compress_ratio,
+            block_topk=token_topk // compress_ratio,
+            slot=compressed_slot,
+            max_query_len=query_len,
+            dcp=dcp[:2],
+        )
+        return pool, q, gate, lengths, req, starts, vals, pos
+    if token_shard is not None:
+        assert rows is None, "the token shard covers the all-token prefill path"
+        index, size = token_shard
+        width = len(iq) // size
+        base, sub_starts, sub_context = token_shard_step(starts, context, index, width)
+
+        def own(x):
+            return jax.lax.dynamic_slice_in_dim(x, base, width)
+
+        blocks = select_blocks(
+            own(iq),
+            pool,
+            own(lengths),
+            compressed_table,
+            own(req),
+            sub_starts,
+            sub_context,
+            ratio=compress_ratio,
+            block_topk=token_topk // compress_ratio,
+            slot=compressed_slot,
+            # The whole step takes the ragged prefill indexer; keep the
+            # shard on it too (it serves verify-sized requests as well).
+            max_query_len=1,
+        )
+        return pool, q, gate, lengths, req, starts, blocks
+    if shard is not None:
+        block_topk = token_topk // compress_ratio
+
+        def everything_visible(_):
+            # Every visible block wins; the merge never runs on these rows.
+            return jnp.full((len(iq), block_topk, 2), -1, jnp.int32)
+
+        def score(_):
+            return select_blocks(
+                iq,
+                pool,
+                lengths,
+                compressed_table,
+                req,
+                starts,
+                context,
+                ratio=compress_ratio,
+                block_topk=block_topk,
+                slot=compressed_slot,
+                max_query_len=max_query_len,
+                shard=shard,
+            )
+
+        candidates = jax.lax.cond(
+            jnp.max(lengths) // compress_ratio <= block_topk,
+            everything_visible,
+            score,
+            None,
+        )
+        if picked is None and rows is not None:
+            # The rows' own decode batch: row i owns main table row req[i].
+            req = req_rows
+        return pool, q, gate, lengths, req, starts, candidates
+    if shared is not None:
+        blocks = shared_blocks(shared, lengths, compress_ratio, token_topk)
+    else:
+        blocks = select_blocks(
+            iq,
+            pool,
+            lengths,
+            compressed_table,
+            req,
+            starts,
+            context,
+            ratio=compress_ratio,
+            block_topk=token_topk // compress_ratio,
+            slot=compressed_slot,
+            max_query_len=max_query_len,
+            **({"after_scoring": deferred[0]} if overlap else {}),
+            # q38 PSTEP-IDX: only pooled_qsa_nocond_step passes one.
+            **(
+                {"indexer_group_base": indexer_group_base}
+                if indexer_group_base is not None
+                else {}
+            ),
+        )
+        if overlap:
+            blocks, pool = blocks
+    if envs.VLLM_TPU_QSA_TOPK_STATS:
+        from vllm_torchtpu.kernels.qwen4_exp import topk_stats
+
+        topk_stats.record(blocks, lengths, starts, envs.VLLM_TPU_QSA_TOPK_STATS)
+    if select_only:
+        assert rows is None, "select_only covers the all-token decode/verify path"
+        pages, kv_lens, _, _ = virtual_page_metadata(
+            blocks, lengths, main_table[req], ratio=compress_ratio, page_size=pool.shape[1]
+        )
+        heads = q.shape[1]
+        return (
+            pool,
+            q.astype(jnp.bfloat16),
+            gate.reshape(len(q), heads, -1).astype(jnp.bfloat16),
+            pages.astype(jnp.int32),
+            kv_lens.astype(jnp.int32),
+        )
+    if (
+        rows is None
+        and shared is None
+        and dcp is None
+        and len(q) > len(context) * max_query_len
+        and envs.VLLM_TPU_QSA_QCHAIN
+    ):
+        from vllm_torchtpu.kernels.qwen4_exp import qsa_qchain
+
+        if qsa_qchain.engaged(3):
+            # q38 PSTEP-QCHAIN E3: the walk query / gate (and the qgate relayout feeding them) after the selection.
+            q, gate = qsa_qchain.e3_q_after_selection(
+                produce, blocks, qgate, key, value, index_qk, nq, nk, niq, positions, trig, norm_eps, rotary_dim
+            )
+        if qsa_qchain.engaged(4) and len(q) % 64 == 0 and len(q) >= 1024:
+            # q38 PSTEP-QCHAIN E4 (the union walk's row floor and group): the gate in o_proj's [rows, heads * D] layout,
+            # column slices of the 2-D qgate.
+            gate = qsa_qchain.e4_gate_2d(qgate, q.shape[1], q.shape[2])
+    return _attend(
+        pool,
+        q,
+        gate,
+        blocks,
+        lengths,
+        main_table[req],
+        starts,
+        keep,
+        picked,
+        kv_heads=k.shape[1],
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        k_scale=k_scale if fp8 else 1.0,
+        v_scale=v_scale if fp8 else 1.0,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+        dcp=dcp,
+    )
+
+
+def _attend(
+    pool,
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    starts,
+    keep,
+    picked,
+    *,
+    kv_heads,
+    compress_ratio,
+    token_topk,
+    k_scale,
+    v_scale,
+    main_slot,
+    max_query_len,
+    dcp=None,
+    union=False,
+):
+    """``dcp`` (see ``qsa_cache_writes``): returns ``(pool, out, lse, selected)``
+    with this rank's partial, ungated attention for ``dcp_combine``.
+    ``union``: see ``qsa_attention``."""
+    result = qsa_attention(
+        q,
+        gate,
+        blocks,
+        lengths,
+        table,
+        pool,
+        starts,
+        kv_heads=kv_heads,
+        ratio=compress_ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        **({"kv_head_offset": main_slot} if main_slot > 0 else {}),
+        max_query_len=max_query_len,
+        **({"dcp": dcp} if dcp is not None else {}),
+        **({"union": True} if union else {}),
+    )
+    selected = selected_tokens(blocks, lengths, token_topk, compress_ratio)
+    if dcp is not None:
+        output, lse, pool = result
+        if picked is not None:
+            # More rows than the decode path holds: attend every token, then
+            # pick; an unpicked row has no key on either rank.
+            output = jnp.where(keep[:, None, None], output[picked], 0)
+            lse = jnp.where(keep[:, None], lse[picked], -jnp.inf)
+            selected = jnp.where(keep[:, None], selected[picked], -1)
+        return pool, output, lse, selected
+    output, pool = result
+    output = output.reshape(len(q), -1)
+    if picked is not None:
+        # More rows than the decode path holds: attend every token, then pick.
+        output = jnp.where(keep[:, None], output[picked], 0)
+        selected = jnp.where(keep[:, None], selected[picked], -1)
+    return pool, output, selected
+
+
+def shared_blocks(shared, lengths, compress_ratio, token_topk):
+    """Blocks taken from another layer's selection instead of this indexer.
+
+    ``shared`` is that layer's ``selected`` (``selected_tokens`` layout,
+    ``[rows, token_topk + ratio - 1]``) for the rows attended here: block j
+    sits at columns ``[j * ratio, (j + 1) * ratio)``. Rows whose completed
+    groups all fit keep every visible block, as the indexer would; a group
+    the other layer did not cover falls back to group 0.
+    """
+    block_topk = token_topk // compress_ratio
+    groups = shared[:, :token_topk:compress_ratio]
+    groups = jnp.where(groups >= 0, groups // compress_ratio, 0).astype(jnp.int32)
+    visible = visible_blocks(lengths, compress_ratio, block_topk)
+    fits = (lengths // compress_ratio <= block_topk)[:, None]
+    return jnp.where(fits, visible, groups)
+
+
+def visible_blocks(lengths, compress_ratio, block_topk):
+    """Every completed group of each row: the selection when all fit."""
+    count = lengths // compress_ratio
+    ids = jnp.arange(block_topk, dtype=jnp.int32)
+    return jnp.where(ids < count[:, None], ids, -1)
+
+
+def pooled_qsa_shard_select_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    shard_rank: int,
+    shard_size: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Cache writes and this TP rank's indexer slice of ``pooled_qsa_step``.
+
+    Returns ``(pool, q, gate, lengths, req, starts, candidates)``; gather
+    ``candidates`` over the TP group and finish with
+    ``pooled_qsa_shard_attend_step``.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=None,
+        shard=(shard_rank, shard_size),
+    )
+
+
+def pooled_qsa_token_select_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shard_index: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    shard_size: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Cache writes and the indexer on this TP rank's token shard.
+
+    ``shard_index``: int32 ``[1]``, the rank. Returns ``(pool, q, gate,
+    lengths, req, starts, blocks)``; all-gather ``blocks`` over the TP group
+    and finish with ``pooled_qsa_shard_attend_step(merged=True)``.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        token_shard=(shard_index, shard_size),
+    )
+
+
+def pooled_qsa_shard_select_rows_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    shard_rank: int,
+    shard_size: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shard_select_step`` for ``pooled_qsa_rows_step``'s rows."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
+        shard=(shard_rank, shard_size),
+    )
+
+
+def pooled_qsa_shard_merge(
+    received: jax.Array, compress_ratio: int, token_topk: int
+) -> jax.Array:
+    """Merge ``[ranks, tokens, k, 2]`` candidates into ``[tokens, k]`` blocks."""
+    ranks, tokens, block_topk, _ = received.shape
+    candidates = jnp.moveaxis(received, 0, 1).reshape(tokens, ranks * block_topk, 2)
+    return merge_candidates(candidates, token_topk // compress_ratio)
+
+
+def _shard_attend(
+    q,
+    gate,
+    lengths,
+    req,
+    starts,
+    main_table,
+    context,
+    pool,
+    gathered,
+    rows,
+    *,
+    kv_heads,
+    compress_ratio,
+    token_topk,
+    k_scale,
+    v_scale,
+    main_slot,
+    max_query_len,
+    merged,
+    dcp=None,
+    union=False,
+):
+    """Merge the gathered candidates, attend, and pick ``rows`` if given.
+
+    ``gathered`` is ``[ranks, tokens, k, 2]`` candidates, or ``[tokens, k]``
+    already merged blocks when ``merged``. ``k_scale``/``v_scale`` are the
+    FP8 scales (1.0 for BF16 KV). ``union``: see ``qsa_attention`` (target
+    verify steps without ``rows``).
+    """
+    block_topk = token_topk // compress_ratio
+    main_table = main_table.reshape(len(context), -1)
+
+    def merge(_):
+        if merged:
+            return gathered
+        return pooled_qsa_shard_merge(gathered, compress_ratio, token_topk)
+
+    blocks = jax.lax.cond(
+        jnp.max(lengths) // compress_ratio <= block_topk,
+        lambda _: visible_blocks(lengths, compress_ratio, block_topk),
+        merge,
+        None,
+    )
+    keep = picked = None
+    if rows is not None and len(rows) > len(context):
+        keep = rows >= 0
+        picked = jnp.clip(rows, 0, len(q) - 1)
+    return _attend(
+        pool,
+        q,
+        gate,
+        blocks,
+        lengths,
+        main_table[req],
+        starts,
+        keep,
+        picked,
+        kv_heads=kv_heads,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+        dcp=dcp,
+        union=union and picked is None,
+    )
+
+
+def pooled_qsa_shard_attend_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    gathered: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    merged: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Finish ``pooled_qsa_shard_select_step``: merge, attend, select."""
+    return _shard_attend(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        gathered,
+        None,
+        kv_heads=kv_heads,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+        merged=merged,
+    )
+
+
+def pooled_qsa_shard_attend_rows_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    gathered: jax.Array,
+    rows: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    merged: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shard_attend_step`` picking ``rows`` as the rows step."""
+    return _shard_attend(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        gathered,
+        rows,
+        kv_heads=kv_heads,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+        merged=merged,
+    )
+
+
+def pooled_qsa_shard_pages_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    gathered: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    page_size: int,
+    merged: bool = False,
+) -> tuple[jax.Array, ...]:
+    """Finish ``pooled_qsa_shard_select_step`` for the segment megakernel.
+
+    Merges the gathered candidates as ``pooled_qsa_shard_attend_step`` does and
+    returns ``pooled_qsa_select_step``'s attention inputs ``(q, gate, pages,
+    kv_lens)`` instead of attending.
+    """
+    block_topk = token_topk // compress_ratio
+
+    def merge(_):
+        if merged:
+            return gathered
+        return pooled_qsa_shard_merge(gathered, compress_ratio, token_topk)
+
+    blocks = jax.lax.cond(
+        jnp.max(lengths) // compress_ratio <= block_topk,
+        lambda _: visible_blocks(lengths, compress_ratio, block_topk),
+        merge,
+        None,
+    )
+    table = main_table.reshape(len(context), -1)[req]
+    pages, kv_lens, _, _ = virtual_page_metadata(
+        blocks, lengths, table, ratio=compress_ratio, page_size=page_size
+    )
+    heads = q.shape[1]
+    return (
+        q.astype(jnp.bfloat16),
+        gate.reshape(len(q), heads, -1).astype(jnp.bfloat16),
+        pages.astype(jnp.int32),
+        kv_lens.astype(jnp.int32),
+    )
+
+
+def pooled_qsa_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """One QSA layer over the unified pool.
+
+    ``main_slot`` >= 0 selects this layer's KV head pair in main KV pages
+    shared by two layers (``pool_layout.pooled_cache_specs``); the default -1
+    keeps the layer's whole-row pages.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+    )
+
+
+def pooled_qsa_nocond_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    indexer_group_base: int = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_step`` for VLLM_TPU_QSA_PREFILL_INDEXER_NO_COND (q38 PSTEP-IDX).
+
+    ``indexer_group_base`` (> 0) is the layer's fixed scheduling-group range for
+    the ragged prefill indexer without its early-exit cond. As a static argument
+    of this op it is part of torch_tpu's kernel key and of the jit keys below, so
+    a stage's QSA layers never share one exported module and its group ids
+    (T70g j-e61e85e4: 'annotation groups with gaps' on every 2-QSA stage). 0
+    keeps the cond. The flag-off op (``pooled_qsa_step``) is unchanged.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        indexer_group_base=indexer_group_base if indexer_group_base > 0 else None,
+    )
+
+
+def pooled_qsa_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    dcp_interleave: int = 0,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_step`` with the main KV split over a DCP group
+    (VLLM_TPU_QSA_MAIN_KV_DCP): ``qgate`` holds the group's concatenated
+    heads; returns ``(pool, out [T, heads, D] f32, lse [T, heads], selected)``
+    for ``qsa_rpa.dcp_combine``."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        dcp=(dcp_rank, dcp_size, dcp_interleave),
+    )
+
+
+def pooled_qsa_token_select_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shard_index: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    shard_size: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_token_select_step`` whose main-KV writes follow the DCP
+    ownership (``qsa_cache_writes(dcp=...)``)."""
+    return _pooled_qsa(
+        qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool, starts, context,
+        ring_ids, main_table, compressed_table, compress_ratio, token_topk, norm_eps,
+        rotary_dim, k_scale, v_scale, compressed_slot, main_slot,
+        max_query_len=max_query_len, token_shard=(shard_index, shard_size),
+        dcp=(dcp_rank, dcp_size),
+    )
+
+
+def pooled_qsa_shard_attend_dcp_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    gathered: jax.Array,
+    dcp_rank: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    merged: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shard_attend_step`` over this rank's DCP main-KV rows:
+    returns ``(pool, out, lse, selected)`` for ``qsa_rpa.dcp_combine``."""
+    return _shard_attend(
+        q, gate, lengths, req, starts, main_table, context, pool, gathered, None,
+        kv_heads=kv_heads, compress_ratio=compress_ratio, token_topk=token_topk,
+        k_scale=k_scale, v_scale=v_scale, main_slot=main_slot,
+        max_query_len=max_query_len, merged=merged, dcp=(dcp_rank, dcp_size),
+    )
+
+
+def _fused_merge(rows: int, mode: str) -> bool:
+    """q38 IDXX SEL-1P(c): VLLM_TPU_QSA_DCP_FUSED_MERGE engages the fused merge
+    kernel (it implements the MERGE_SCORES threshold read, so it needs
+    VLLM_TPU_QSA_DCP_MERGE_SCORES); one engagement line per (rows, mode)."""
+    if not idxx_flag("VLLM_TPU_QSA_DCP_FUSED_MERGE"):
+        return False
+    if not envs.VLLM_TPU_QSA_DCP_MERGE_SCORES:
+        raise ValueError(
+            "VLLM_TPU_QSA_DCP_FUSED_MERGE needs VLLM_TPU_QSA_DCP_MERGE_SCORES=1 "
+            "(the kernel reads the SparseCore top-k's picked bits)"
+        )
+    _log_idxx_once(
+        ("fused_merge", rows, mode),
+        "q38 IDXX DCP_FUSED_MERGE engaged: rows %d, %s list(s)", rows, mode,
+    )
+    return True
+
+
+def compressed_dcp_blocks(vals_pair, pos_pair, block_topk, *, topk=None):
+    """The global selection ``[T, block_topk]`` (ascending group ids, -1 padded)
+    from a DCP pair's owned local top-k lists ``[2, T, k]``: the entries of
+    both lists that ``dcp_select.keep_mask`` keeps. Every rank gets the same
+    blocks; the DCP attention drops the groups another rank owns."""
+    from vllm_torchtpu.kernels.qwen4_exp import dcp_select
+
+    if _fused_merge(len(vals_pair[0]), "all"):
+        # q38 IDXX SEL-1P(c) (VLLM_TPU_QSA_DCP_FUSED_MERGE): same kept ids.
+        from vllm_torchtpu.kernels.qwen4_exp.dcp_merge_fused import fused_dcp_keep
+
+        kept = fused_dcp_keep(vals_pair, pos_pair, block_topk, topk=topk)
+    else:
+        thr_val, thr_pos = dcp_select.merge_threshold(
+            vals_pair,
+            pos_pair,
+            block_topk,
+            topk=topk,
+            from_scores=envs.VLLM_TPU_QSA_DCP_MERGE_SCORES,
+        )
+        keep = jax.vmap(dcp_select.keep_mask, in_axes=(0, 0, None, None))(
+            vals_pair, pos_pair, thr_val, thr_pos
+        )
+        kept = jnp.where(keep, pos_pair, dcp_select.EMPTY)
+    kept = jnp.moveaxis(kept, 0, 1).reshape(kept.shape[1], -1)
+    kept = _sort_rows(kept)[:, :block_topk]
+    return jnp.where(kept == dcp_select.EMPTY, -1, kept).astype(jnp.int32)
+
+
+# Row counts traced with the row-block sort (log once each).
+SORT_ROWS_TRACED: set = set()
+
+
+def _sort_rows(x):
+    """``jnp.sort(x, axis=1)``; under q38 DEC-STEP-3's VLLM_TPU_QSA_DCP_SORT_ROWS
+    = N, a step of more than N rows sorts row blocks of at most N rows (as equal
+    as possible) and concatenates them. Each row is sorted alone either way, so
+    the values are the same; the per-step sort's cost jumps between 384 and 448
+    rows (t160 traces: 113 -> 302 us)."""
+    limit = envs.VLLM_TPU_QSA_DCP_SORT_ROWS
+    rows = x.shape[0]
+    if not limit or rows <= limit:
+        return jnp.sort(x, axis=1)
+    parts = -(-rows // limit)
+    size = -(-rows // parts)
+    if rows not in SORT_ROWS_TRACED:
+        SORT_ROWS_TRACED.add(rows)
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(
+            "q38 DEC-STEP-3 DCP_SORT_ROWS traced: rows %d in %d blocks of <= %d", rows, parts, size
+        )
+    return jnp.concatenate(
+        [jnp.sort(x[i : i + size], axis=1) for i in range(0, rows, size)], axis=0
+    )
+
+
+def compressed_dcp_own_blocks(vals_pair, pos_pair, dcp_rank, block_topk, *, topk=None):
+    """This rank's part of ``compressed_dcp_blocks``: its own local list
+    ``[T, block_topk]`` (local slot order) with the entries that
+    ``dcp_select.keep_mask`` drops set to -1. Every kept entry is an owned
+    group, so the owned groups of the global selection are exactly these."""
+    from vllm_torchtpu.kernels.qwen4_exp import dcp_select
+
+    if _fused_merge(len(vals_pair[0]), "own"):
+        # q38 IDXX SEL-1P(c) (VLLM_TPU_QSA_DCP_FUSED_MERGE): same result.
+        from vllm_torchtpu.kernels.qwen4_exp.dcp_merge_fused import fused_dcp_keep
+
+        return fused_dcp_keep(
+            vals_pair, pos_pair, block_topk, jnp.asarray(dcp_rank, jnp.int32), topk=topk
+        )
+    thr_val, thr_pos = dcp_select.merge_threshold(
+        vals_pair,
+        pos_pair,
+        block_topk,
+        topk=topk,
+        from_scores=envs.VLLM_TPU_QSA_DCP_MERGE_SCORES,
+    )
+    rank = jnp.asarray(dcp_rank, jnp.int32).reshape(-1)[0]
+    vals = jax.lax.dynamic_index_in_dim(vals_pair, rank, 0, keepdims=False)
+    pos = jax.lax.dynamic_index_in_dim(pos_pair, rank, 0, keepdims=False)
+    keep = dcp_select.keep_mask(vals, pos, thr_val, thr_pos)
+    return jnp.where(keep, pos, -1).astype(jnp.int32)
+
+
+def pooled_qsa_compressed_dcp_select_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    dcp_interleave: int = 0,
+) -> tuple[
+    jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
+]:
+    """``pooled_qsa_dcp_step`` up to this rank's owned-group indexer
+    (VLLM_TPU_QSA_COMPRESSED_DCP): ``(pool, q, gate, lengths, req, starts,
+    vals, pos)``; gather ``vals`` / ``pos`` over the pair for
+    ``pooled_qsa_compressed_dcp_attend_step``."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        # ``dcp_interleave`` (PCP): main KV alternates in those units; the
+        # compressed keys keep page ownership (``compressed_pairs``).
+        dcp=(dcp_rank, dcp_size, dcp_interleave),
+        compressed_dcp=True,
+    )
+
+
+def pooled_qsa_token_select_compressed_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shard_index: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    shard_size: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    decode_rows: bool = False,
+) -> tuple[
+    jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
+]:
+    """``pooled_qsa_compressed_dcp_select_step`` on token shard
+    ``shard_index`` of ``shard_size`` (one shard per DCP pair): ``vals`` /
+    ``pos`` cover the shard's ``T / shard_size`` rows.
+
+    ``decode_rows`` (q38 BLSTACK-IDX, VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD): a
+    decode / verify step's row shard, scored with the decode indexer
+    (``_pooled_qsa`` ``token_shard_decode``)."""
+    if decode_rows:
+        # q38 BLSTACK-IDX trace-time engagement line (once per traced shape and process).
+        from vllm_torchtpu.logger import init_logger
+
+        init_logger(__name__).info(
+            "q38 BLSTACK-IDX compressed-DCP row-shard select traced: tokens %d, slots %d, "
+            "shard rows %d (%d shards), DCP %d, rows per request %d",
+            qgate.shape[0], context.shape[0], qgate.shape[0] // shard_size, shard_size,
+            dcp_size, max_query_len,
+        )
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        token_shard=(shard_index, shard_size),
+        dcp=(dcp_rank, dcp_size),
+        compressed_dcp=True,
+        token_shard_decode=decode_rows,
+    )
+
+
+def pooled_qsa_row_plain_compressed_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shard_index: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[
+    jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array
+]:
+    """q38 BLSTACK-IDX: ``pooled_qsa_compressed_dcp_select_step`` (every row
+    on every rank) for the graphs of a row-sharded module that do not take the
+    row shard (VLLM_TPU_QSA_COMPRESSED_DCP_ROW_SHARD below its min rows, or
+    steps that are not decode-shaped). ``shard_index`` is not used: it is an
+    operand in the row-shard select's position, so every compile range of the
+    module's graph takes the same inputs in the same order (``shape_variants``
+    hands compiled buckets between traces only then; q38 O1s G2 j-fa24a1ff)."""
+    del shard_index
+    return pooled_qsa_compressed_dcp_select_step(
+        qgate, key, value, index_qk, nq, nk, niq, nik, positions, trig, pool, starts, context,
+        ring_ids, main_table, compressed_table, dcp_rank, compress_ratio, token_topk,
+        norm_eps, rotary_dim, dcp_size=dcp_size, k_scale=k_scale, v_scale=v_scale,
+        compressed_slot=compressed_slot, main_slot=main_slot, max_query_len=max_query_len,
+    )
+
+
+def pooled_qsa_compressed_dcp_attend_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    vals_pair: jax.Array,
+    pos_pair: jax.Array,
+    dcp_rank: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    dcp_interleave: int = 0,
+    local_merge: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Merge the pair's local top-k (``compressed_dcp_blocks``) and attend this
+    rank's owned main KV: ``(pool, out, lse, selected)`` for
+    ``qsa_rpa.dcp_combine``; ``selected`` is the global selection.
+    ``vals_pair`` / ``pos_pair`` are ``[2, T, k]``: per pair rank, every row's
+    local list (token shards concatenated in token order).
+
+    ``local_merge`` (VLLM_TPU_QSA_COMPRESSED_DCP_LOCAL_MERGE, page ownership
+    only): attend ``compressed_dcp_own_blocks`` instead, the same owned
+    groups; ``selected`` then holds this rank's owned winners only."""
+    block_topk = token_topk // compress_ratio
+    if local_merge:
+        assert not dcp_interleave, "the local merge needs page ownership of both key kinds"
+        blocks = compressed_dcp_own_blocks(vals_pair, pos_pair, dcp_rank, block_topk)
+    else:
+        blocks = compressed_dcp_blocks(vals_pair, pos_pair, block_topk)
+    return _shard_attend(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        blocks,
+        None,
+        kv_heads=kv_heads,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+        merged=True,
+        # A fourth element marks the rank-only list for _dcp_page_metadata.
+        dcp=(dcp_rank, dcp_size, dcp_interleave, True) if local_merge
+        else (dcp_rank, dcp_size, dcp_interleave),
+        # The target layers' verify attention; the MTP draft attends through
+        # the shared-selection steps and keeps the per-row path.
+        union=True,
+    )
+
+def pooled_qsa_shared_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shared: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    indexer_writes: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_step`` attending ``shared``'s selection (``shared_blocks``)
+    instead of scoring its own: caches are written as usual, the indexer's
+    scoring and top-k are skipped."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        shared=shared,
+        indexer_writes=indexer_writes,
+    )
+
+
+def pooled_qsa_shared_rows_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    shared: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    indexer_writes: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_rows_step`` with ``pooled_qsa_shared_step``'s selection;
+    ``shared`` holds one row per entry of ``rows``."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
+        shared=shared,
+        indexer_writes=indexer_writes,
+    )
+
+
+def pooled_qsa_rows_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_rows_step`` over this rank's DCP main-KV rows (the MTP
+    draft under VLLM_TPU_QSA_MTP_KV_DCP): returns ``(pool, out, lse,
+    selected)`` for ``qsa_rpa.dcp_combine``, one row per entry of ``rows``."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
+        dcp=(dcp_rank, dcp_size),
+    )
+
+
+def pooled_qsa_shared_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shared: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    compressed_dcp: bool = False,
+    indexer_writes: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shared_step`` over this rank's DCP main-KV rows; returns
+    ``(pool, out, lse, selected)`` for ``qsa_rpa.dcp_combine``. ``compressed_dcp``:
+    compressed keys written on their owner only (VLLM_TPU_QSA_COMPRESSED_DCP)."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        shared=shared,
+        dcp=(dcp_rank, dcp_size),
+        compressed_dcp=compressed_dcp,
+        indexer_writes=indexer_writes,
+    )
+
+
+def pooled_qsa_shared_rows_dcp_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    shared: jax.Array,
+    dcp_rank: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    dcp_size: int = 2,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    compressed_dcp: bool = False,
+    indexer_writes: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shared_rows_step`` over this rank's DCP main-KV rows;
+    returns ``(pool, out, lse, selected)`` for ``qsa_rpa.dcp_combine``. ``compressed_dcp``:
+    compressed keys written on their owner only (VLLM_TPU_QSA_COMPRESSED_DCP)."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
+        shared=shared,
+        dcp=(dcp_rank, dcp_size),
+        compressed_dcp=compressed_dcp,
+        indexer_writes=indexer_writes,
+    )
+
+
+def pooled_qsa_select_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, ...]:
+    """``pooled_qsa_step`` up to the indexer: ``(pool, q, gate, pages, kv_lens)``.
+
+    One QSA layer over the unified pool.
+
+    ``main_slot`` >= 0 selects this layer's KV head pair in main KV pages
+    shared by two layers (``pool_layout.pooled_cache_specs``); the default -1
+    keeps the layer's whole-row pages.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        select_only=True,
+    )
+
+
+def pooled_qsa_rows_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_step`` that attends only token ``rows`` (-1: none).
+
+    Every token's KV, compressed key and ring state is written as in
+    ``pooled_qsa_step``; the output and selected tokens cover ``rows`` only.
+    An MTP draft's first step needs attention only at each request's last
+    token, while later draft steps read the whole step's cache entries.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
+    )

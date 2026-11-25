@@ -1,0 +1,1 @@
+"""q38 b3 LIVING form root (Q38_FORM=b3): vllm_torchtpu/ below is STKTREE L3S 7321c4e60e:src/vllm_torchtpu byte for byte (merge of QGLUE-1 B3 7fd4624a18 and SB3-1 / B3STACK fe809505ac; no PLE). Living: q38 levers land here env-keyed and default-off. Never imported by any form."""

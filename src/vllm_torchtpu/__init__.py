@@ -37,8 +37,8 @@ exactly the way ``Q38_OXPD_FORM=1`` runs the oxpd form. Each is the
 ``vllm_torchtpu`` package of the tree a q38 dash point ran, byte for byte
 (``_forms/<name>/__init__.py`` names the commit; the point table is
 ``q38_bands/merge_1124/README.md``): ``k_cut1``, ``k_pkg``, ``k_sup``, ``oxk``,
-``d1121``, ``k_sb11``; and the LIVING forms ``b1`` and ``hix``, where new q38 levers land env-keyed
-and default-off (``_forms/b1/__init__.py`` names the lineage). Any other name is refused, and so is ``Q38_FORM`` together with
+``d1121``, ``k_sb11``; and the LIVING forms ``b1``, ``hix`` and ``b3``, where new q38 levers land env-keyed
+and default-off (``_forms/<form>/__init__.py`` names the lineage). Any other name is refused, and so is ``Q38_FORM`` together with
 ``Q38_OXPD_FORM=1``.
 """
 
@@ -51,9 +51,9 @@ if _q38_form not in ("", "0", "1"):
     )
 _q38_named = _q38_os.environ.get("Q38_FORM", "").strip()
 if _q38_named:
-    if _q38_named not in ("k_cut1", "k_pkg", "k_sup", "oxk", "d1121", "k_sb11", "b1", "hix"):
+    if _q38_named not in ("k_cut1", "k_pkg", "k_sup", "oxk", "d1121", "k_sb11", "b1", "hix", "b3"):
         raise RuntimeError(
-            f"Q38_FORM must be unset or one of k_cut1, k_pkg, k_sup, oxk, d1121, k_sb11, b1, hix (got {_q38_named!r});"
+            f"Q38_FORM must be unset or one of k_cut1, k_pkg, k_sup, oxk, d1121, k_sb11, b1, hix, b3 (got {_q38_named!r});"
             " refusing to guess a form"
         )
     if _q38_form == "1":
