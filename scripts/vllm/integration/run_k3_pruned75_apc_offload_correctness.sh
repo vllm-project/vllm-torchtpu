@@ -253,7 +253,8 @@ stage apc_divergence "${script_dir}/smoke_prefix_cache_e2e_divergence.py" \
   --host 127.0.0.1 --port "${PORT}" --model "${SERVED_MODEL_NAME}" \
   --attempts 3 --line-count 120
 stage apc_state_contamination "${script_dir}/smoke_mamba_state_contamination.py" \
-  --host 127.0.0.1 --port "${PORT}" --model "${SERVED_MODEL_NAME}" --rounds 3
+  --host 127.0.0.1 --port "${PORT}" --model "${SERVED_MODEL_NAME}" \
+  --chat-template-kwargs '{"thinking":false}' --rounds 3
 stage apc_multiturn "${script_dir}/smoke_prefix_multiturn_and_eviction_recall.py" multiturn \
   --base "${BASE}" --model "${SERVED_MODEL_NAME}" \
   --hit-block-size "${HIT_BLOCK_SIZE}"

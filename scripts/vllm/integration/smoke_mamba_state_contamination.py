@@ -56,7 +56,7 @@ def complete(
     max_tokens: int,
     timeout: int,
     headers: dict | None = None,
-    logprobs: int | None = None,
+    top_logprobs: int | None = None,
     chat_template_kwargs: dict | None = None,
 ) -> dict:
     payload: dict = {
@@ -71,9 +71,9 @@ def complete(
             else chat_template_kwargs
         ),
     }
-    if logprobs is not None:
+    if top_logprobs is not None:
         payload["logprobs"] = True
-        payload["top_logprobs"] = logprobs
+        payload["top_logprobs"] = top_logprobs
     req = urllib.request.Request(
         f"{url}/v1/chat/completions",
         data=json.dumps(payload).encode(),
@@ -174,12 +174,7 @@ def main() -> int:
     headers = {}
     if a.data_parallel_rank is not None:
         headers["X-data-parallel-rank"] = str(a.data_parallel_rank)
-    chat_template_kwargs = (
-        dict(DEFAULT_CHAT_TEMPLATE_KWARGS)
-        if a.chat_template_kwargs is None
-        else a.chat_template_kwargs
-    )
-    logprobs = None if a.no_logprobs else 5
+    top_logprobs = None if a.no_logprobs else 5
 
     tags = ["ALPHA", "BRAVO"]
     prompts = {
@@ -204,8 +199,8 @@ def main() -> int:
                     a.max_tokens,
                     a.timeout,
                     headers,
-                    logprobs=logprobs,
-                    chat_template_kwargs=chat_template_kwargs,
+                    top_logprobs=top_logprobs,
+                    chat_template_kwargs=a.chat_template_kwargs,
                 )
             except urllib.error.HTTPError as exc:
                 err_body = exc.read().decode(errors="replace")[:300]
