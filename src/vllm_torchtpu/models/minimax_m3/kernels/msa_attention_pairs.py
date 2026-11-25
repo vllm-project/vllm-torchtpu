@@ -323,7 +323,10 @@ def _work(keys, local_key, local_limit, window, page_size):
     limit = jnp.where(keys == local_key[:, None], local_limit[:, None], page_size)
     # One sort operand: (key * window + token) << 8 | visible slots.
     pair = jnp.where(keys >= 0, (keys * window + tok) << _LIMIT_BITS | limit, _NO_PAIR)
-    pair = jax.lax.sort(pair.reshape(windows, -1), dimension=1)
+    # One operand of distinct keys (but for the equal empty ones) sorts to the
+    # same array either way; s32[2, 32768]: 48 us unstable, 107 stable (tpu7x,
+    # j-b9559c5d).
+    pair = jax.lax.sort(pair.reshape(windows, -1), dimension=1, is_stable=False)
     valid = pair != _NO_PAIR
     limit = jnp.where(valid, pair & ((1 << _LIMIT_BITS) - 1), 0)
     pair = pair >> _LIMIT_BITS
