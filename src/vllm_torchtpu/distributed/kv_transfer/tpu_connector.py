@@ -2803,6 +2803,9 @@ class TPURaidenConnectorWorker:
         self._raiden_telemetry_backends = dist_utils.get_raiden_telemetry_backends(
             vllm_config
         )
+        self._worker_telemetry_rank = dist_utils.get_raiden_worker_telemetry_rank(
+            vllm_config
+        )
         dist_utils.configure_raiden_telemetry(backends=self._raiden_telemetry_backends)
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
@@ -2822,9 +2825,15 @@ class TPURaidenConnectorWorker:
         if not self.owns_raiden_telemetry_drain:
             return
         backends = getattr(self, "_raiden_telemetry_backends", None)
+        if hasattr(self, "_worker_telemetry_rank"):
+            worker_rank = self._worker_telemetry_rank
+        else:
+            worker_rank = dist_utils.get_raiden_worker_telemetry_rank(
+                getattr(self, "vllm_config", None)
+            )
         for metric_name, values in dist_utils.drain_raiden_metric_samples(
             backends=backends,
-            worker_rank=self.tp_rank,
+            worker_rank=worker_rank,
         ).items():
             if metric_name not in self.transfer_stats.data:
                 self.transfer_stats.data[metric_name] = []

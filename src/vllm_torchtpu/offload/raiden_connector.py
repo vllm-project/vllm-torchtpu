@@ -457,7 +457,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         )
         dist_utils.configure_raiden_telemetry(backends=self._raiden_telemetry_backends)
         self._worker_rank: int | None = (
-            getattr(vllm_config.parallel_config, "rank", 0)
+            dist_utils.get_raiden_worker_telemetry_rank(vllm_config)
             if role == KVConnectorRole.WORKER
             else None
         )
@@ -648,7 +648,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         backends = getattr(self, "_raiden_telemetry_backends", None)
         worker_rank = (
-            getattr(self, "_worker_rank", 0)
+            getattr(self, "_worker_rank", None)
             if self.connector_worker is not None
             else None
         )

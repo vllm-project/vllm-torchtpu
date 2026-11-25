@@ -508,6 +508,117 @@ class TestRaidenBufferedTelemetryGating:
             'tpu_raiden_d2h_bytes_total{host_ip="10.0.0.1"}': [512.0],
         }
 
+    @pytest.mark.parametrize(
+        ("parallel_config", "expected"),
+        [
+            (None, None),
+            (SimpleNamespace(world_size=1, rank=0), None),
+            (
+                SimpleNamespace(
+                    tensor_parallel_size=1,
+                    pipeline_parallel_size=1,
+                    prefill_context_parallel_size=1,
+                    rank=0,
+                ),
+                None,
+            ),
+            (SimpleNamespace(world_size=2, rank=1), 1),
+            (
+                SimpleNamespace(
+                    tensor_parallel_size=1,
+                    pipeline_parallel_size=1,
+                    prefill_context_parallel_size=2,
+                    rank=1,
+                ),
+                1,
+            ),
+        ],
+    )
+    def test_get_raiden_worker_telemetry_rank(self, parallel_config, expected):
+        cfg = SimpleNamespace(parallel_config=parallel_config)
+        assert dist_utils.get_raiden_worker_telemetry_rank(cfg) == expected
+
+    def test_pcp_workers_with_same_tp_rank_emit_distinct_gauge_series(
+        self, monkeypatch
+    ):
+        # Two PCP ranks both have tp_rank=0, so tagging must use
+        # parallel_config.rank rather than tp_rank.
+        mock_telemetry = MagicMock()
+        mock_telemetry.get_metric_metadata.return_value = [
+            SimpleNamespace(
+                name="buffer_allocated_bytes",
+                type="GAUGE",
+                label_names=[],
+                description="Allocated host staging bytes",
+            )
+        ]
+        monkeypatch.setattr(
+            dist_utils, "get_raiden_telemetry_module", lambda: mock_telemetry
+        )
+
+        def make_pcp_worker(global_rank: int) -> TPURaidenConnectorWorker:
+            w = object.__new__(TPURaidenConnectorWorker)
+            w.vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    world_size=2,
+                    tensor_parallel_size=1,
+                    pipeline_parallel_size=1,
+                    prefill_context_parallel_size=2,
+                    rank=global_rank,
+                )
+            )
+            w.tp_rank = 0
+            w.owns_raiden_telemetry_drain = True
+            w._raiden_telemetry_backends = ["buffered"]
+            w._worker_telemetry_rank = dist_utils.get_raiden_worker_telemetry_rank(
+                w.vllm_config
+            )
+            w.transfer_stats = TpuKVConnectorStats()
+            return w
+
+        w0 = make_pcp_worker(0)
+        w1 = make_pcp_worker(1)
+
+        mock_telemetry.get_and_reset_metric_samples.return_value = {
+            "tpu_raiden_buffer_allocated_bytes": [1024.0]
+        }
+        w0._get_raiden_stats()
+
+        mock_telemetry.get_and_reset_metric_samples.return_value = {
+            "tpu_raiden_buffer_allocated_bytes": [2048.0]
+        }
+        w1._get_raiden_stats()
+
+        agg = w0.transfer_stats.aggregate(w1.transfer_stats)
+        registry = CollectorRegistry()
+        metric_types = {
+            Gauge: partial(Gauge, registry=registry),
+            Counter: partial(Counter, registry=registry),
+            Histogram: partial(Histogram, registry=registry),
+        }
+        with patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry"):
+            prom = TpuKVConnectorPromMetrics(
+                vllm_config=MagicMock(),
+                metric_types=metric_types,
+                labelnames=["model_name", "engine"],
+                per_engine_labelvalues={0: ["my_model", "0"]},
+            )
+        prom.observe(agg.to_dict(), engine_idx=0)
+        assert (
+            registry.get_sample_value(
+                "tpu_raiden_buffer_allocated_bytes",
+                {"model_name": "my_model", "engine": "0", "local_rank": "0"},
+            )
+            == 1024.0
+        )
+        assert (
+            registry.get_sample_value(
+                "tpu_raiden_buffer_allocated_bytes",
+                {"model_name": "my_model", "engine": "0", "local_rank": "1"},
+            )
+            == 2048.0
+        )
+
 
 class TestTPURaidenConnectorWorkerTelemetry:
     """Tests for TPURaidenConnectorWorker telemetry collection and stats reporting."""

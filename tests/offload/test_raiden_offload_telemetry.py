@@ -346,6 +346,75 @@ class TestTPURaidenOffloadingConnectorStatsFlow:
             == 4096.0
         )
 
+    @pytest.mark.parametrize("worker_first", [True, False])
+    def test_single_worker_uniproc_worker_and_scheduler_share_gauge_series(
+        self, monkeypatch: pytest.MonkeyPatch, worker_first: bool
+    ) -> None:
+        # On the uniproc executor (world_size=1), worker and scheduler share
+        # one process and one C++ sample buffer. Both roles must pass
+        # worker_rank=None so gauges always land in the same series regardless
+        # of which role drains first.
+        uniproc_cfg = SimpleNamespace(
+            parallel_config=SimpleNamespace(world_size=1, rank=0)
+        )
+        worker_rank = dist_utils.get_raiden_worker_telemetry_rank(uniproc_cfg)
+        assert worker_rank is None
+
+        mock_telemetry = MagicMock()
+        mock_telemetry.get_metric_metadata.return_value = _sample_raiden_descriptors()
+        # The single process buffer resets on read: first reader gets the
+        # sample, second reader sees an empty buffer.
+        mock_telemetry.get_and_reset_metric_samples.side_effect = [
+            {"tpu_raiden_buffer_allocated_bytes": [8192.0]},
+            {},
+        ]
+        monkeypatch.setattr(
+            dist_utils, "get_raiden_telemetry_module", lambda: mock_telemetry
+        )
+
+        worker_conn = _bare_offload_connector(worker=MagicMock(), worker_rank=None)
+        worker_conn._worker_rank = worker_rank
+        sched = MagicMock()
+        sched.get_stats.return_value = None
+        sched_conn = _bare_offload_connector(scheduler=sched)
+
+        if worker_first:
+            first_stats = worker_conn.get_kv_connector_stats()
+            second_stats = sched_conn.get_kv_connector_stats()
+        else:
+            first_stats = sched_conn.get_kv_connector_stats()
+            second_stats = worker_conn.get_kv_connector_stats()
+
+        assert isinstance(first_stats, RaidenOffloadingConnectorStats)
+        assert second_stats is None
+        assert first_stats.data["raiden_samples"] == {
+            "tpu_raiden_buffer_allocated_bytes": [8192.0]
+        }
+
+        registry = CollectorRegistry()
+        with patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry"):
+            prom = TPURaidenOffloadingConnector.build_prom_metrics(
+                _make_offload_vllm_config(),  # type: ignore[arg-type]
+                _make_metric_types(registry),  # type: ignore[arg-type]
+                ["model_name", "engine"],
+                {0: ["qwen3", "0"]},
+            )
+        prom.observe(first_stats.to_dict(), engine_idx=0)
+        assert (
+            registry.get_sample_value(
+                "tpu_raiden_buffer_allocated_bytes",
+                {"model_name": "qwen3", "engine": "0", "local_rank": ""},
+            )
+            == 8192.0
+        )
+        assert (
+            registry.get_sample_value(
+                "tpu_raiden_buffer_allocated_bytes",
+                {"model_name": "qwen3", "engine": "0", "local_rank": "0"},
+            )
+            is None
+        )
+
 
 class TestTPUMultiConnectorSharedRegistryAndDrain:
     def test_multi_connector_shares_raiden_collectors_without_duplicate_error(

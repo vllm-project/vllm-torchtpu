@@ -22,6 +22,7 @@ from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.utils import RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -353,9 +354,36 @@ def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> 
 
 
 DEFAULT_RAIDEN_TELEMETRY_BACKENDS: tuple[str, ...] = ("buffered",)
-_RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY = "raiden_telemetry_backends"
 _RAIDEN_METRIC_PREFIX = "tpu_raiden_"
 _RANK_LABEL_PATTERN = re.compile(r"(?:^|,)\s*(?:local_rank|rank)\s*=")
+
+
+def get_raiden_worker_telemetry_rank(vllm_config: "VllmConfig | None") -> int | None:
+    """Returns the worker rank for Raiden gauge tagging, or ``None``.
+
+    On single-worker engines (uniproc executor, ``world_size <= 1``), the worker
+    and scheduler connectors share one process and one C++ sample buffer;
+    returning ``None`` keeps worker and scheduler drains on the same gauge
+    series regardless of which role reads first. On multi-worker engines
+    (TP, PP, or PCP > 1), returns ``parallel_config.rank`` so each worker
+    exports a distinct ``local_rank`` series.
+    """
+    pc = getattr(vllm_config, "parallel_config", None)
+    if pc is None:
+        return None
+    world_size = getattr(pc, "world_size", None)
+    if not isinstance(world_size, int):
+        tp = getattr(pc, "tensor_parallel_size", 1)
+        pp = getattr(pc, "pipeline_parallel_size", 1)
+        pcp = getattr(pc, "prefill_context_parallel_size", 1)
+        if all(isinstance(v, int) for v in (tp, pp, pcp)):
+            world_size = tp * pp * pcp
+        else:
+            return None
+    if world_size <= 1:
+        return None
+    rank = getattr(pc, "rank", 0)
+    return rank if isinstance(rank, int) else 0
 
 
 def get_raiden_telemetry_backends(vllm_config: "VllmConfig | None") -> list[str]:
@@ -366,13 +394,13 @@ def get_raiden_telemetry_backends(vllm_config: "VllmConfig | None") -> list[str]
     Raiden telemetry backends.
     """
     config = getattr(vllm_config, "additional_config", None)
-    if isinstance(config, Mapping) and _RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY in config:
-        raw = config[_RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY]
+    if isinstance(config, Mapping) and RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY in config:
+        raw = config[RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY]
         if raw is None:
             return list(DEFAULT_RAIDEN_TELEMETRY_BACKENDS)
         if not isinstance(raw, list) or not all(isinstance(b, str) for b in raw):
             raise ValueError(
-                f"additional_config.{_RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY} "
+                f"additional_config.{RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY} "
                 "must be a list of strings"
             )
         backends: list[str] = []
@@ -380,7 +408,7 @@ def get_raiden_telemetry_backends(vllm_config: "VllmConfig | None") -> list[str]
             token = entry.strip().lower()
             if not token:
                 raise ValueError(
-                    f"additional_config.{_RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY} "
+                    f"additional_config.{RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY} "
                     "entries must be non-empty strings"
                 )
             backends.append(token)
