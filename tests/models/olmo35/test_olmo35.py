@@ -251,6 +251,10 @@ def _build_kda(monkeypatch):
     )
     monkeypatch.setattr(kda_attention, "build_kimi_dispatched_kda_op", build_op)
     monkeypatch.setattr(kda_attention, "build_kimi_pooled_kda_op", build_pooled_op)
+    # TPUOlmo35Config rejects the unified pool before any layer is built.
+    monkeypatch.setattr(
+        kda_attention, "unified_kv_layout_enabled_for_architecture", lambda a: False
+    )
     config = _small_kda_config()
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
