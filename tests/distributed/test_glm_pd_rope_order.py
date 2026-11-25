@@ -381,11 +381,11 @@ def _golden_layouts(monkeypatch):
     )
 
 
-def _register(controller, *, is_producer, model, path, layers=(0, 1)):
+def _register(controller, *, is_producer, model, path, layers=(0, 1), flags=True):
     """Runs one worker's real admission measure and work-unit registration
-    against ``controller``; returns the registered unit and payload. ``pp``
-    registers ``layers`` under per-layer tags, as both legs of a pipeline
-    pairing run."""
+    against ``controller``, with both permute flags at ``flags``; returns the
+    registered unit and payload. ``pp`` registers ``layers`` under per-layer
+    tags, as both legs of a pipeline pairing run."""
     worker = _make_raiden_worker(
         is_producer=is_producer, tp_rank=0, tp_size=1, block_size=PAGE
     )
@@ -403,11 +403,11 @@ def _register(controller, *, is_producer, model, path, layers=(0, 1)):
         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 1),
         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL", "controller"),
         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER", path == "pp"),
-        # Both permute flags on (the default) on every leg: what a leg caches
-        # is read from its layers.
-        patch(f"{_MOD}.tpu_envs.TPU_MLA_ROPE_NEOX_PERMUTE", True),
-        patch(f"{_MOD}.tpu_envs.TPU_INDEXER_ROPE_NEOX_PERMUTE", True),
-        patch(f"{_MOD}._raiden_glm_dcp_identity", return_value=path == "identity"),
+        # The leg's permute flags (both on by default); what it caches is
+        # read from its layers.
+        patch(f"{_MOD}.tpu_envs.TPU_MLA_ROPE_NEOX_PERMUTE", flags),
+        patch(f"{_MOD}.tpu_envs.TPU_INDEXER_ROPE_NEOX_PERMUTE", flags),
+        patch(f"{_MOD}._raiden_glm_dcp_identity", return_value=False),
         patch(f"{_MOD}._glm_indexer_seq_along_lane", return_value=False),
     ):
         registration = worker._register_raiden_stage3_work_unit(
@@ -421,34 +421,46 @@ def _register(controller, *, is_producer, model, path, layers=(0, 1)):
     return unit, registration["layout_fingerprint_payload"]
 
 
-# How a leg's layers ended up, and the rope order its cache holds: permuted,
-# never permuted, or flag on with a rope the permute skipped.
+# How a leg was set up, and the rope order its cache holds: its permute flags
+# (off, or a tree without the permute; on), how its layers ended up
+# (permuted; never permuted; flags on over a rope the permute skips).
 _ENGINES = {
-    "interleaved": ({}, "interleaved"),
-    "half_split": ({"permuted_mla": True, "permuted_indexer": True}, HALF),
-    "skipped": ({"rope": _OwnForwardRope}, "interleaved"),
+    "interleaved": (False, {}, "interleaved"),
+    "half_split": (True, {"permuted_mla": True, "permuted_indexer": True}, HALF),
+    "skipped": (True, {"rope": _OwnForwardRope}, "interleaved"),
 }
 
 
 @pytest.mark.usefixtures("_fake_layer_classes", "_golden_layouts")
-@pytest.mark.parametrize("path", ["tp", "identity"])
+@pytest.mark.parametrize("path", ["tp", "pp"])
 @pytest.mark.parametrize("decode", list(_ENGINES))
 @pytest.mark.parametrize("producer", list(_ENGINES))
 def test_legs_register_one_fingerprint_only_for_one_rope_order(path, producer, decode):
     # End to end on the CPU side: each leg measures its own layers and
     # registers its fingerprint, the one the service compares at transfer
     # start. The two legs register the same fingerprint exactly when their
-    # caches hold the same rope order.
+    # caches hold the same rope order. ``pp``: the producer is a pipeline
+    # stage whose one layer holds no indexer (it declares the order an indexer
+    # of its own would cache), against a decode that holds every layer, both
+    # under per-layer tags.
     controller = _RecordingController()
-    (producer_layers, producer_order), (decode_layers, decode_order) = (
-        _ENGINES[producer],
-        _ENGINES[decode],
-    )
+    producer_flags, producer_layers, producer_order = _ENGINES[producer]
+    decode_flags, decode_layers, decode_order = _ENGINES[decode]
+    stage = {"indexer": False} if path == "pp" else {}
     src, src_payload = _register(
-        controller, is_producer=True, model=_model(**producer_layers), path=path
+        controller,
+        is_producer=True,
+        model=_model(**producer_layers, **stage),
+        path=path,
+        layers=(1,) if path == "pp" else (0, 1),
+        flags=producer_flags,
     )
     dst, dst_payload = _register(
-        controller, is_producer=False, model=_model(**decode_layers), path=path
+        controller,
+        is_producer=False,
+        model=_model(**decode_layers),
+        path=path,
+        flags=decode_flags,
     )
     for kind, payload in ((producer, src_payload), (decode, dst_payload)):
         declared = {payload.get("mla_rope_order"), payload.get("indexer_rope_order")}
