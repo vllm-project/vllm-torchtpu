@@ -28,6 +28,7 @@ from typing import Literal
 
 from .constants import (
     BASE_DTYPE_BYTES,
+    BENIGN_HF_METADATA_KEYS,
     DEFAULT_HTTP_PORT,
     DEFAULT_HTTPS_PORT,
     DEFAULT_SSM_STATE_BYTES,
@@ -39,13 +40,28 @@ from .constants import (
     HTTP_OK,
     HTTP_TIMEOUT_S,
     INT8_BYTES,
+    MULTIMODAL_KEYS,
     MXFP4_BYTES,
     NVFP4_BYTES,
     SIXTEEN_BITS,
+    SUPPORTED_MODEL_TYPES,
     WEIGHT_BLOCK_DIM_LEN,
     WEIGHT_ONLY_QUANT_METHODS,
 )
-from .geometry import ModelIdentity, _first_non_none, resolve_model_identity
+from .geometry import (
+    KeyTracker,
+    LayerCounts,
+    ModelGeometry,
+    ModelIdentity,
+    UnsupportedArchitectureError,
+    _first_non_none,
+    _from_hf_config_dry_run,
+    _validate_structural_support,
+    count_layer_types,
+    from_hf_config,
+    resolve_model_identity,
+)
+from .memory import ParamBreakdown, param_counts
 from .modules import Dtypes
 
 _MIN_PRINTABLE_ASCII = 32
@@ -1065,3 +1081,241 @@ def dtypes_from_hf_config(config: Mapping[str, object]) -> Dtypes:
         w_expert_dtype=w_expert_dt,
         kv_dtype=kv_dt,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigAudit:
+    """Onboarding readiness and zero-drift key audit for an HF config mapping."""
+
+    onboarding_tier: Literal[
+        "tier0_ready", "tier1_config_needed", "tier2_primitive_needed"
+    ]
+    model_type: str
+    model_type_status: Literal["listed", "unlisted_blocked", "omitted"]
+    unmapped_structural_keys: tuple[str, ...]
+    ignored_non_text_keys: tuple[str, ...]
+    blocking_reasons: tuple[str, ...]
+    geometry: ModelGeometry | None
+    dtypes: Dtypes | None
+    layer_counts: LayerCounts | None
+    param_counts: ParamBreakdown | None
+
+
+def _collect_unmapped_structural_keys(
+    raw_cfg: Mapping[str, object],
+    consumed: frozenset[str],
+) -> tuple[str, ...]:
+    """Return sorted text-config keys omitted from both value reads and benign sets."""
+    raw_sub = _as_mapping(raw_cfg.get("text_config"))
+    unmapped: list[str] = []
+    if raw_sub:
+        unmapped.extend(
+            key
+            for key in raw_sub
+            if f"text_config.{key}" not in consumed
+            and key not in BENIGN_HF_METADATA_KEYS
+        )
+        unmapped.extend(
+            key
+            for key in raw_cfg
+            if key != "text_config"
+            and key not in MULTIMODAL_KEYS
+            and key not in raw_sub
+            and key not in consumed
+            and key not in BENIGN_HF_METADATA_KEYS
+        )
+    else:
+        unmapped.extend(
+            key
+            for key in raw_cfg
+            if key not in consumed
+            and key not in BENIGN_HF_METADATA_KEYS
+            and key not in MULTIMODAL_KEYS
+        )
+    return tuple(sorted(unmapped))
+
+
+def _resolve_model_type_status(
+    model_type: str,
+) -> Literal["listed", "unlisted_blocked", "omitted"]:
+    """Classify config model_type registry and allowlist status."""
+    if not model_type:
+        return "omitted"
+    if model_type in SUPPORTED_MODEL_TYPES:
+        return "listed"
+    return "unlisted_blocked"
+
+
+def _run_tracked_extraction(
+    raw_cfg: Mapping[str, object],
+    *,
+    dry_run: bool = False,
+    model_ref: str | None = None,
+) -> tuple[
+    ModelGeometry,
+    Dtypes,
+    LayerCounts,
+    ParamBreakdown,
+    tuple[str, ...],
+]:
+    """Extract geometry, dtypes, counts, params, and unmapped keys under KeyTracker."""
+    tracker = KeyTracker(raw_cfg)
+    geometry = (
+        _from_hf_config_dry_run(tracker)
+        if dry_run
+        else from_hf_config(tracker, model_ref=model_ref)
+    )
+    dtypes = dtypes_from_hf_config(tracker)
+    counts = count_layer_types(geometry)
+    params = param_counts(geometry)
+    unmapped = _collect_unmapped_structural_keys(raw_cfg, tracker.consumed_keys)
+    return geometry, dtypes, counts, params, unmapped
+
+
+def _blocked_audit(
+    tier: Literal["tier1_config_needed", "tier2_primitive_needed"],
+    model_type: str,
+    status: Literal["listed", "unlisted_blocked", "omitted"],
+    meta: tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]],
+) -> ConfigAudit:
+    """Build a failed ConfigAudit with null geometry, dtypes, and param counts."""
+    unmapped, ignored_non_text, reasons = meta
+    return ConfigAudit(
+        onboarding_tier=tier,
+        model_type=model_type,
+        model_type_status=status,
+        unmapped_structural_keys=unmapped,
+        ignored_non_text_keys=ignored_non_text,
+        blocking_reasons=reasons,
+        geometry=None,
+        dtypes=None,
+        layer_counts=None,
+        param_counts=None,
+    )
+
+
+def _extract_audit_scope(
+    config: Mapping[str, object],
+) -> tuple[Mapping[str, object], str, tuple[str, ...]]:
+    """Unwrap KeyTracker and return (raw_cfg, model_type, ignored_non_text)."""
+    raw_cfg: Mapping[str, object] = (
+        config.raw_data if isinstance(config, KeyTracker) else config
+    )
+    raw_sub = _as_mapping(raw_cfg.get("text_config"))
+    raw_text_cfg = raw_sub if raw_sub else raw_cfg
+    scopes = (raw_text_cfg, raw_cfg) if raw_text_cfg is not raw_cfg else (raw_text_cfg,)
+    model_type = str(_first_non_none(scopes, "model_type") or "").strip().lower()
+    ignored_non_text = tuple(sorted(k for k in raw_cfg if k in MULTIMODAL_KEYS))
+    return raw_cfg, model_type, ignored_non_text
+
+
+def _dry_run_blocked_audit(
+    raw_cfg: Mapping[str, object],
+    model_type: str,
+    ignored_non_text: tuple[str, ...],
+    gate_reason: str,
+) -> ConfigAudit:
+    """Run private dry-run key audit on a blocked config without unlocking tier0."""
+    reasons = [gate_reason]
+    unmapped: tuple[str, ...] = ()
+    tier: Literal["tier1_config_needed", "tier2_primitive_needed"] = (
+        "tier1_config_needed"
+    )
+    try:
+        _, _, _, _, unmapped = _run_tracked_extraction(raw_cfg, dry_run=True)
+    except UnsupportedArchitectureError as dry_exc:
+        reasons.append(str(dry_exc))
+        tier = "tier2_primitive_needed"
+    except (ValueError, KeyError) as dry_exc:
+        reasons.append(str(dry_exc))
+    status = _resolve_model_type_status(model_type)
+    return _blocked_audit(
+        tier, model_type, status, (unmapped, ignored_non_text, tuple(reasons))
+    )
+
+
+def _finalize_tracked_audit(
+    raw_cfg: Mapping[str, object],
+    model_type: str,
+    ignored_non_text: tuple[str, ...],
+    model_ref: str | None,
+) -> ConfigAudit:
+    """Run tracked extraction and require zero unmapped keys for tier0_ready."""
+    model_type_status = _resolve_model_type_status(model_type)
+    try:
+        geometry, dtypes, counts, params, unmapped = _run_tracked_extraction(
+            raw_cfg, model_ref=model_ref
+        )
+    except UnsupportedArchitectureError as exc:
+        return _blocked_audit(
+            "tier2_primitive_needed",
+            model_type,
+            model_type_status,
+            ((), ignored_non_text, (str(exc),)),
+        )
+    except (ValueError, KeyError) as exc:
+        reason = (
+            f"Missing required config field: {exc}"
+            if isinstance(exc, KeyError)
+            else str(exc)
+        )
+        return _blocked_audit(
+            "tier1_config_needed",
+            model_type,
+            model_type_status,
+            ((), ignored_non_text, (reason,)),
+        )
+    if unmapped:
+        return _blocked_audit(
+            "tier1_config_needed",
+            model_type,
+            model_type_status,
+            (
+                unmapped,
+                ignored_non_text,
+                (f"Unmapped structural keys require review: {list(unmapped)!r}",),
+            ),
+        )
+    return ConfigAudit(
+        onboarding_tier="tier0_ready",
+        model_type=model_type,
+        model_type_status=model_type_status,
+        unmapped_structural_keys=(),
+        ignored_non_text_keys=ignored_non_text,
+        blocking_reasons=(),
+        geometry=geometry,
+        dtypes=dtypes,
+        layer_counts=counts,
+        param_counts=params,
+    )
+
+
+def audit_hf_config(
+    config: Mapping[str, object],
+    *,
+    model_ref: str | None = None,
+) -> ConfigAudit:
+    """Audit HF config onboarding readiness, key coverage, and parameter counts."""
+    raw_cfg, model_type, ignored_non_text = _extract_audit_scope(config)
+    try:
+        _validate_structural_support(raw_cfg)
+    except UnsupportedArchitectureError as exc:
+        reasons = [str(exc)]
+        if model_type and model_type not in SUPPORTED_MODEL_TYPES:
+            reasons.insert(
+                0,
+                f"Unrecognized or unsupported model_type {model_type!r}; fails closed",
+            )
+        return _blocked_audit(
+            "tier2_primitive_needed",
+            model_type,
+            _resolve_model_type_status(model_type),
+            ((), ignored_non_text, tuple(reasons)),
+        )
+    try:
+        resolve_model_identity(raw_cfg, model_ref=model_ref)
+    except UnsupportedArchitectureError as gate_exc:
+        return _dry_run_blocked_audit(
+            raw_cfg, model_type, ignored_non_text, str(gate_exc)
+        )
+    return _finalize_tracked_audit(raw_cfg, model_type, ignored_non_text, model_ref)
