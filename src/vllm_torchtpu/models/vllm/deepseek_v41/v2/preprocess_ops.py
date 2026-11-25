@@ -33,18 +33,27 @@ _ops: dict[str, Any] = {}
 
 
 @torch.compiler.assume_constant_result
-def compressor_layout_admitted(region: str, **geometry: int) -> bool:
+def compressor_layout_admitted(
+    region: str, expected: tuple[int, ...] | None = None, **geometry: int
+) -> bool:
     """Check static cache geometry once, outside the captured tensor graph.
 
     Only cache layout scalars enter this boundary, never token dimensions or
-    tensors. Fusion policy is frozen by admit; fallback diagnostics must execute
-    here at trace time because Dynamo cannot capture logger.warning.
+    tensors. ``expected`` holds the fields of the layout the layer's kernels
+    were built for (`DEFAULT_COMPRESSOR_LAYOUT` if None). Fusion policy is
+    frozen by admit; fallback diagnostics must execute here at trace time
+    because Dynamo cannot capture logger.warning.
     """
-    layout = dataclasses.replace(
-        decode_preparation.DEFAULT_COMPRESSOR_LAYOUT, **geometry
+    kernel = (
+        decode_preparation.DEFAULT_COMPRESSOR_LAYOUT
+        if expected is None
+        else decode_preparation.CompressorLayout(*expected)
     )
+    layout = dataclasses.replace(kernel, **geometry)
     return decode_preparation.admit(
-        region, decode_preparation.compressor_layout_problem(layout), backend=False
+        region,
+        decode_preparation.compressor_layout_problem(layout, kernel),
+        backend=False,
     )
 
 

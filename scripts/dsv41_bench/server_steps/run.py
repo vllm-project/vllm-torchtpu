@@ -25,6 +25,9 @@ from bench_cached_extend import (
 )
 from server_step_worker import SCENARIOS
 
+# DeepSeek-V4.1 production serving limit (1M tokens).
+PRODUCTION_MAX_MODEL_LEN = 1048576
+
 
 def source_identity(
     root: Path, package: str, *, build_commit: str | None = None
@@ -187,10 +190,10 @@ def main() -> None:
         CHUNK=str(scenario.chunk_tokens),
         MAX_SEQS=str(scenario.local_concurrency),
     )
-    if decode:
-        env["MAX_MODEL_LEN"] = str(scenario.prefix_tokens + scenario.output_tokens)
-    else:
-        env.pop("MAX_MODEL_LEN", None)
+    # Production serves the full 1M context. Pin it for every scenario so the
+    # page-table width, indexer working set and KV budget match production
+    # instead of shrinking with the client workload.
+    env["MAX_MODEL_LEN"] = str(PRODUCTION_MAX_MODEL_LEN)
     env["USE_PHASED_PROFILER"] = "0"
     env["PYTHONPATH"] = str(here) + os.pathsep + env.get("PYTHONPATH", "")
     server_command = [

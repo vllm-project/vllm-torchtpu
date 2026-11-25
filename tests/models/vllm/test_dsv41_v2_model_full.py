@@ -1605,7 +1605,6 @@ class TestModelInitAndWeights:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
-            patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
             patch(
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_init,
@@ -1645,7 +1644,6 @@ class TestModelInitAndWeights:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
-            patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
             patch(
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_init,
@@ -1682,7 +1680,6 @@ class TestModelInitAndWeights:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
-            patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
             patch(
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_init,
@@ -1729,7 +1726,6 @@ class TestModelInitAndWeights:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
-            patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
             patch(
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_bad_sources,
@@ -1771,7 +1767,6 @@ class TestModelInitAndWeights:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
-            patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
             patch(
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_dec_engram,
@@ -1807,7 +1802,6 @@ class TestModelInitAndWeights:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
-            patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
             patch(
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_init,
@@ -1851,7 +1845,6 @@ class TestModelInitAndWeights:
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_paged_attention"
             ),
-            patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_indexer"),
             patch(
                 "vllm.models.deepseek_v41.nvidia.model.DeepseekV4Model.__init__",
                 fake_super_no_compressor,

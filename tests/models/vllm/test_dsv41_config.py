@@ -247,3 +247,17 @@ def test_legacy_placement_env_is_an_alias_and_may_not_conflict(
         verify_and_update_config(
             config(moe="fused_ep_w4a8", expert_layout="dsv41_flash_dp8_c384_perm")
         )
+
+
+def test_lm_head_defaults_to_fp32_logits():
+    cfg = config()
+    verify_and_update_config(cfg)
+    assert cfg.model_config.hf_config.head_dtype == "float32"
+
+
+@pytest.mark.parametrize("explicit", ["model", "bfloat16", "float32"])
+def test_explicit_head_dtype_override_is_kept(explicit):
+    cfg = config()
+    cfg.model_config.hf_config.head_dtype = explicit
+    verify_and_update_config(cfg)
+    assert cfg.model_config.hf_config.head_dtype == explicit

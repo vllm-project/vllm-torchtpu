@@ -124,6 +124,7 @@ def _create_mock_attention():
     attn.indexer = SimpleNamespace(
         n_head=64,
         head_dim=128,
+        softmax_scale=128**-0.5,
         weights_proj=lambda x: x[..., :64],
         wq_b=lambda x: x,
         indexer_op=SimpleNamespace(

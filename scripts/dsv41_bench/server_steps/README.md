@@ -22,7 +22,8 @@ than capped at 4 GiB. Target compile buckets are `[128,2048]`; target chunks
 larger than 128 select 2048. DSpark query forwards use a separate 40-row
 bucket (the runner's minimum eight-request bucket times K5). This pads
 query rows only; the SWA128 history window is unchanged.
-The 2048-token scheduler budget is unchanged. The server uses the model's default context limit; it does not cap
+The 2048-token scheduler budget is unchanged. `run.py` pins `MAX_MODEL_LEN` to
+the production 1048576-token limit for every scenario; it does not cap
 `max_model_len` to this benchmark's 114688-token input. The 96K prefix and 16K
 extension are client workload sizes.
 Automatic FP8 KV budgets round down to binary steps smaller than 1/32 of the
@@ -290,7 +291,9 @@ keeps 48 requests per DP rank and raises global concurrency from 384 to 768.
 Each request uses a 98304-token cached prefix and 512 output tokens, with
 DSpark K5. Local target/draft shapes remain 288/240 rows and the target
 compile buckets remain `[288,2048]`. KV sizing is automatic at memory
-utilization 0.85, with FP8 KV/indexer, block size 64 and max model length 98816.
+utilization 0.85, with FP8 KV/indexer, block size 256 (SWA pages stay 64
+tokens) and the production max model length 1048576 (`run.py` pins it for
+every scenario).
 
 Both hosts use `TPU_DEEPSEEK_V41_ENGRAM_HBM=first`, Engram `cpu_offload=true`
 and `dp_shared_memory=false`, `MOE_FUSED_EP_KERNEL_IMPL=push`,
@@ -384,7 +387,7 @@ performance harness:
 ```bash
 export MODEL_PATH=/models/DeepSeek-V4.1-Flash
 export PYTHONPATH="$PWD/scripts/dsv41_bench/server_steps${PYTHONPATH:+:$PYTHONPATH}"
-TP=1 DP=8 CHUNK=2048 MAX_SEQS=48 MAX_MODEL_LEN=98816 KV_BYTES=auto \
+TP=1 DP=8 CHUNK=2048 MAX_SEQS=48 MAX_MODEL_LEN=1048576 KV_BYTES=auto \
   bash scripts/dsv41_bench/serve_cached_prefill.sh \
   --worker-extension-cls server_step_worker.ServerStepWorker \
   --enable-log-requests --max-log-len 0 \

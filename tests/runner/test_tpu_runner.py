@@ -35,10 +35,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
@@ -312,7 +314,7 @@ def test_one_pcp_mtp_warmup_builds_prefill_without_decode():
     request = scheduler_output.scheduled_new_reqs[0]
     assert request.req_id == "__pcp_mtp_warmup__"
     assert len(request.prompt_token_ids) == 31
-    assert request.block_ids == ([98, 99], [96, 97, 98, 99])
+    assert request.block_ids == ([1, 2], [3, 4, 5, 6])
     assert scheduler_output.scheduled_cached_reqs.req_ids == []
     runner.sample_tokens.assert_called_once_with(None)
     runner.take_draft_token_ids.assert_called_once_with()
@@ -346,63 +348,174 @@ def test_spec_warmup_clamps_circular_buffer_group_blocks():
 
     assert tpu_runner._spec_warmup_group_num_blocks(runner, attn_group, 2060) == 9
     assert tpu_runner._spec_warmup_group_num_blocks(runner, ring_group, 2060) == 1
+    # Block-outer layouts wrap the ring layers in a uniform-type group spec.
+    uniform_ring = SimpleNamespace(
+        kv_cache_spec=UniformTypeKVCacheSpecs(
+            block_size=8, kv_cache_specs={"ring0": ring_spec, "ring1": ring_spec}
+        )
+    )
+    assert tpu_runner._spec_warmup_group_num_blocks(runner, uniform_ring, 2060) == 1
 
     assert TPUModelRunner._warmup_one_spec_request(runner, 2048, idx=0) is True
     first_prefill = executed[0].scheduled_new_reqs[0]
-    assert first_prefill.block_ids == (list(range(1, 10)), [1])
+    assert first_prefill.block_ids == (list(range(1, 10)), [10])
 
     executed.clear()
     TPUModelRunner._warmup_spec_batch(runner, R=2, P=2048, greedy=True)
     req0 = executed[0].scheduled_new_reqs[0]
     req1 = executed[1].scheduled_new_reqs[0]
-    assert req0.block_ids == (list(range(1, 10)), [1])
-    assert req1.block_ids == (list(range(10, 19)), [10])
+    assert req0.block_ids == (list(range(1, 10)), [10])
+    assert req1.block_ids == (list(range(11, 20)), [20])
 
 
-def test_spec_warmup_keeps_swa_pool_block_ids_in_range():
-    executed = []
-    attn_group = SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=256))
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.swa_cache import (
-        DeepseekV41SWASpec,
-    )
+_OWNERSHIP_METHODS = {
+    "single": "_warmup_one_spec_request",
+    "batch": "_warmup_spec_batch",
+    "pcp": "_warmup_one_pcp_mtp_prefill",
+}
 
-    # The SWA pool owns 5 pages (page 0 is null); its IDs are local.
-    swa_spec = DeepseekV41SWASpec(
-        block_size=256,
-        num_kv_heads=1,
-        head_size=512,
-        dtype=torch.bfloat16,
-        sliding_window=128,
-        max_num_seqs=1,
-        max_in_flight_tokens=256,
-    )
-    pages = swa_spec.pool_capacity
-    assert pages == 5
-    swa_group = SimpleNamespace(kv_cache_spec=swa_spec)
-    runner = SimpleNamespace(
-        max_model_len=8192,
-        max_num_tokens=2048,
-        speculative_config=SimpleNamespace(num_speculative_tokens=5),
-        kv_cache_config=SimpleNamespace(
-            num_blocks=100,
-            kv_cache_groups=[attn_group, swa_group],
+
+def _make_ownership_runner(num_blocks):
+    calls = []
+    cleanups = []
+    groups = [
+        SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=4)),
+        SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
+        SimpleNamespace(
+            kv_cache_spec=CircularBufferSpec(
+                block_size=8, num_kv_heads=1, head_size=512, dtype=torch.bfloat16
+            )
         ),
-        execute_model=MagicMock(side_effect=lambda so: executed.append(so) and None),
-        sample_tokens=MagicMock(),
-        take_draft_token_ids=MagicMock(return_value=None),
-        _warmup_spec_decode_cleanup=MagicMock(return_value=True),
+    ]
+    runner = SimpleNamespace(
+        max_model_len=128,
+        max_num_tokens=12,
+        speculative_config=SimpleNamespace(num_speculative_tokens=2),
+        kv_cache_config=SimpleNamespace(num_blocks=num_blocks, kv_cache_groups=groups),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=0),
+        max_num_reqs=8,
+        execute_model=lambda output: calls.append(output),
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda ids: cleanups.append(ids) or True,
     )
+    return runner, calls, cleanups
 
-    assert TPUModelRunner._warmup_one_spec_request(runner, 2048, idx=0) is True
-    shared, private = executed[0].scheduled_new_reqs[0].block_ids
-    assert shared == list(range(1, 10))
-    assert all(1 <= block < pages for block in private) and len(private) == 9
 
-    executed.clear()
-    TPUModelRunner._warmup_spec_batch(runner, R=2, P=2048, greedy=True)
-    for so in executed:
-        for request in so.scheduled_new_reqs:
-            assert all(1 <= block < pages for block in request.block_ids[1])
+def _run_ownership_warmup(mode, runner):
+    method = getattr(TPUModelRunner, _OWNERSHIP_METHODS[mode])
+    if mode == "batch":
+        return method(runner, R=3, P=6)
+    if mode == "single":
+        return method(runner, P=6, idx=0)
+    return method(runner, P=6)
+
+
+@pytest.mark.parametrize("mode", _OWNERSHIP_METHODS)
+def test_spec_warmup_ownership_disjoint_request_groups(mode):
+    runner, calls, cleanups = _make_ownership_runner(128)
+    assert _run_ownership_warmup(mode, runner) is not False
+    requests = [
+        req for call in calls for req in getattr(call, "scheduled_new_reqs", [])
+    ]
+    assert len(requests) == (3 if mode == "batch" else 1)
+    blocks = [block for req in requests for group in req.block_ids for block in group]
+    assert len(blocks) == len(set(blocks))
+    assert blocks == list(range(1, len(blocks) + 1))
+    assert all(len(req.block_ids[2]) == 1 for req in requests)
+    assert cleanups
+    assert all(isinstance(call, SchedulerOutput) for call in calls)
+    if mode == "batch":
+        # Chunked prefills remain resident together for the following decodes.
+        assert len([call for call in calls if call.scheduled_new_reqs]) == 2
+    if mode == "pcp":
+        assert len(calls) == 1
+
+
+@pytest.mark.parametrize("mode", _OWNERSHIP_METHODS)
+def test_spec_warmup_ownership_sum_capacity_and_exact_fit(mode):
+    # Existing contexts yield [4, 1, 1] for single, [6, 2, 1] per batch
+    # request, and [2, 1, 1] for PCP. Circular state stays capped at one block.
+    required = {"single": 6, "batch": 27, "pcp": 4}[mode]
+    runner, calls, _ = _make_ownership_runner(required + 1)
+    assert _run_ownership_warmup(mode, runner) is not False
+    assert calls
+
+    runner, calls, cleanups = _make_ownership_runner(required)
+    if mode == "pcp":
+        with pytest.raises(RuntimeError, match=f"required={required + 1}"):
+            _run_ownership_warmup(mode, runner)
+    else:
+        assert _run_ownership_warmup(mode, runner) is (
+            False if mode == "single" else None
+        )
+    assert not calls
+    assert not cleanups
+
+
+@pytest.mark.parametrize(
+    ("counts", "capacity", "expected"),
+    [
+        ([[2, 1], [1, 2]], 7, [([1, 2], [3]), ([4], [5, 6])]),
+        ([[2, 1], [1, 2]], 6, None),
+        ([[0, 1], [2, 0]], 4, [([], [1]), ([2, 3], [])]),
+        ([], 1, []),
+    ],
+)
+def test_spec_warmup_ownership_plan_capacity_and_empty_groups(
+    counts, capacity, expected
+):
+    assert tpu_runner._spec_warmup_block_plan(counts, capacity) == expected
+
+
+@pytest.mark.parametrize("capacity, expected_extras", [(67, 3), (66, 1), (34, 0)])
+def test_spec_warmup_ownership_mixed_variants_disjoint(
+    capacity, expected_extras, caplog
+):
+    runner, calls, cleanups = _make_ownership_runner(capacity)
+    runner.max_num_tokens = 48
+    TPUModelRunner._warmup_spec_batch(runner, R=2, P=6, mixed=True)
+    requests = [
+        req for call in calls for req in getattr(call, "scheduled_new_reqs", [])
+    ]
+    assert len(requests) == 2 + expected_extras
+    blocks = [b for req in requests for group in req.block_ids for b in group]
+    assert blocks == list(range(1, len(blocks) + 1))
+    assert max(blocks) < capacity
+    assert all(len(req.block_ids[2]) == 1 for req in requests)
+    assert set(cleanups[-1]) == {req.req_id for req in requests}
+    if expected_extras < 3:
+        assert "skip mixed spec-decode warmup" in caplog.text
+        assert f"num_blocks={capacity}" in caplog.text
+    if expected_extras == 3:
+        mixed_calls = [
+            call for call in calls if getattr(call, "finished_req_ids", set())
+        ]
+        assert len(mixed_calls) == 1
+        assert mixed_calls[0].finished_req_ids == {requests[2].req_id}
+
+
+@pytest.mark.parametrize("mode", _OWNERSHIP_METHODS)
+def test_spec_warmup_ownership_wrapped_circular_cap(mode):
+    runner, calls, _ = _make_ownership_runner(128)
+    runner.kv_cache_config.kv_cache_groups[2].kv_cache_spec = UniformTypeKVCacheSpecs(
+        block_size=8,
+        kv_cache_specs={
+            "ring": CircularBufferSpec(
+                block_size=8, num_kv_heads=1, head_size=512, dtype=torch.bfloat16
+            )
+        },
+    )
+    assert _run_ownership_warmup(mode, runner) is not False
+    for call in calls:
+        for req in getattr(call, "scheduled_new_reqs", []):
+            assert len(req.block_ids[2]) == 1
+
+
+@pytest.mark.parametrize(("counts", "capacity"), [([[1]], 0), ([[-1]], 4)])
+def test_spec_warmup_ownership_plan_rejects_invalid_capacity(counts, capacity):
+    with pytest.raises(ValueError, match="nonnegative counts and a null block"):
+        tpu_runner._spec_warmup_block_plan(counts, capacity)
 
 
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):

@@ -79,7 +79,6 @@ def _make_swa_attn(
     attn.window_size = window_size
     attn._ced_decoder = ced_decoder
     attn._ced_global_from_encoder = False
-    attn._local_q_attn = False
     attn.compressor = None
     attn.indexer = None
     attn.compress_ratio = 2
@@ -90,11 +89,6 @@ def _make_swa_attn(
     attn.head_dim = 8
     attn.scale = 0.25
     attn.attn_sink = torch.zeros(2)
-    attn._swa_max_requests = 16
-    attn._precompact_records = False
-    attn._token_parallel_attn = False
-    attn._full_attn_sink = False
-    attn._tp_rank_1d = 0
     attn.topk_indices_buffer = torch.full((16, 8), -1, dtype=torch.int32)
     attn._rotate = lambda x, p: x
     attn.wq_b = lambda qr: qr
@@ -337,87 +331,106 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         assert comp.forward(torch.ones(count, 10), positions) is None
 
 
-class TestSwaTokenAddressingAndFastOffsets:
-    def test_swa_3page_fast_path_and_offsets(self, monkeypatch):
-        """Test Swa addressing 3-page fast path and row_offset caching."""
-        count = 4
-        positions = torch.tensor([0, 32, 64, 96], dtype=torch.int32)
-        swa_table = torch.tensor([[10, 11, 12], [20, 21, 22]], dtype=torch.int32)
+@pytest.mark.parametrize("seed", range(8))
+def test_shift_swa_metadata_matches_direct_offsets(seed):
+    """Block-outer SWA layers share one cached metadata, shifted per row offset."""
+    from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import prepare_swa_metadata
 
-        swa_meta = SimpleNamespace(
-            seq_lens=torch.tensor([2, 2], dtype=torch.int32),
-            block_tables=swa_table,
-            query_start_loc=torch.tensor([0, 2, 4], dtype=torch.int32),
+    page, width = 64, 40
+    rng = np.random.default_rng(seed)
+    requests = int(rng.integers(1, 9))
+    stride = page * int(rng.choice([7, 8, 16]))
+    table = rng.permutation(np.arange(1, 1 + requests * width))
+    table = table.reshape(requests, width).astype(np.int32)
+    queries = rng.integers(0, 7, requests)
+    queries[0] = max(queries[0], 1)
+    starts = np.concatenate(([0], np.cumsum(queries))).astype(np.int32)
+    positions = np.zeros(int(starts[-1]) + int(rng.integers(0, 5)), np.int32)
+    for r in range(requests):
+        first = int(rng.integers(0, width * page - 16))
+        positions[starts[r] : starts[r + 1]] = first + np.arange(queries[r])
+        table[r, : max(first - 127, 0) // page] = 0  # freed out-of-window pages
+    minimum = np.zeros(requests, np.int32)
+
+    def direct(offset):
+        return tuple(
+            torch.from_numpy(np.asarray(x))
+            for x in prepare_swa_metadata(
+                jnp.asarray(table),
+                jnp.asarray(starts),
+                jnp.asarray(positions),
+                jnp.asarray(minimum),
+                page_size=page,
+                page_stride=stride,
+                row_offset=offset,
+            )
         )
-        metadata = {"swa_pfx": swa_meta}
-        forward_ctx = SimpleNamespace(
-            attn_metadata=metadata,
-            additional_kwargs={
-                "deepseek_v41_replay_starts": torch.tensor([0, 32], dtype=torch.int32)
-            },
+
+    base = direct(0)
+    for offset in (page, stride - page):
+        want = direct(offset)
+        metadata, records = v2_attn._shift_swa_metadata(base[0], base[2], offset, page)
+        assert torch.equal(metadata, want[0])
+        assert torch.equal(base[1], want[1])
+        assert torch.equal(records, want[2])
+
+
+@pytest.mark.parametrize("seed", range(6))
+@pytest.mark.parametrize("non_causal", [False, True])
+def test_metadata_tables_matches_per_table_metadata(seed, non_causal):
+    """One batched program equals one prepare_swa_metadata call per SWA group."""
+    from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import prepare_swa_metadata
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import csa2_adapter
+
+    page, width, groups = 64, 40, 7
+    rng = np.random.default_rng(seed)
+    requests = int(rng.integers(1, 9))
+    stride = page * 8
+    tables = np.stack(
+        [
+            rng.permutation(np.arange(1, 1 + requests * width)).reshape(requests, width)
+            for _ in range(groups)
+        ]
+    ).astype(np.int32)
+    queries = rng.integers(0, 7, requests)
+    queries[0] = max(queries[0], 1)
+    starts = np.concatenate(([0], np.cumsum(queries))).astype(np.int32)
+    positions = np.zeros(int(starts[-1]) + int(rng.integers(0, 5)), np.int32)
+    for r in range(requests):
+        first = int(rng.integers(0, width * page - 16))
+        positions[starts[r] : starts[r + 1]] = first + np.arange(queries[r])
+    minimum = rng.integers(0, 64, requests).astype(np.int32)
+    args = tuple(jnp.asarray(x) for x in (starts, positions, minimum))
+
+    metadata, bounds, records = csa2_adapter._metadata_tables(
+        tuple(jnp.asarray(t) for t in tables), *args, page, stride, non_causal
+    )
+    for g in range(groups):
+        want = prepare_swa_metadata(
+            jnp.asarray(tables[g]),
+            *args,
+            page_size=page,
+            page_stride=stride,
+            row_offset=0,
+            non_causal=non_causal,
         )
-        monkeypatch.setattr(v2_attn, "get_forward_context", lambda: forward_ctx)
+        np.testing.assert_array_equal(np.asarray(metadata[g]), np.asarray(want[0]))
+        np.testing.assert_array_equal(np.asarray(bounds), np.asarray(want[1]))
+        np.testing.assert_array_equal(np.asarray(records[g]), np.asarray(want[2]))
 
-        captured_records: list[torch.Tensor] = []
-        monkeypatch.setattr(
-            v2_attn,
-            "sparse_fp8_attention",
-            lambda q, swa_c, main_c, recs, *args, **kw: (
-                captured_records.append(recs.clone()) or torch.zeros_like(q)
-            ),
-        )
-        monkeypatch.setattr(v2_attn, "_insert", lambda *a, **kw: None)
 
-        # 1. use_3page_swa=True (window_size <= 2 * rows_per_page = 128)
-        #    has_fast_swa_offset=True (row_offset addition branch)
-        attn_3page_fast = _make_swa_attn(
-            window_size=128, ced_decoder=True, has_fast_swa_offset=True
-        )
-        with v2_attn.stage_attention_cache_scope():
-            # Miss
-            out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
-            qr = torch.ones((count, 16), dtype=torch.bfloat16)
-            kv = torch.ones((count, 8), dtype=torch.bfloat16)
-            attn_3page_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 1
-            recs1 = captured_records[0]
-
-            # Hit (same swa_meta.block_tables object -> reuses cached_swa_slots)
-            attn_3page_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 2
-            assert torch.equal(captured_records[1], recs1)
-
-            # Different swa_meta.block_tables tensor -> hits cached_swa geometry
-            # but invalidates cached_swa_slots and recomputes records for new blocks
-            swa_meta.block_tables = swa_table + 100
-            attn_3page_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 3
-            assert not torch.equal(captured_records[2], recs1)
-            swa_meta.block_tables = swa_table
-
-        # 2. use_3page_swa=True, has_fast_swa_offset=False (row_indices branch)
-        captured_records.clear()
-        attn_3page_slow = _make_swa_attn(
-            window_size=128, ced_decoder=False, has_fast_swa_offset=False
-        )
-        with v2_attn.stage_attention_cache_scope():
-            out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
-            attn_3page_slow._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 1
-
-        # 3. use_3page_swa=False (window_size > 2 * rows_per_page = 256 > 128)
-        #    Exercises swa_3page is None and swa_row_slots calculation
-        captured_records.clear()
-        attn_no_3page = _make_swa_attn(
-            window_size=256, ced_decoder=False, has_fast_swa_offset=True
-        )
-        with v2_attn.stage_attention_cache_scope():
-            out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
-            attn_no_3page._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-            assert len(captured_records) == 1
-
-        # 4. Fallback when stage_cache is None
-        captured_records.clear()
-        out = torch.zeros((count, 2, 8), dtype=torch.bfloat16)
-        attn_3page_fast._prepare_tpu(None, qr, kv, None, None, None, positions, out)
-        assert len(captured_records) == 1
+def test_swa_group_tables_dedupes_by_object_and_shape():
+    a, b = torch.zeros(12, dtype=torch.int32), torch.ones(12, dtype=torch.int32)
+    other = torch.zeros(20, dtype=torch.int32)
+    metadata = {
+        "l0.swa_cache": SimpleNamespace(block_tables=a),
+        "l0.self_attn": SimpleNamespace(block_tables=b),  # not SWA
+        "l1.swa_cache": SimpleNamespace(block_tables=b),
+        "l2.swa_cache": SimpleNamespace(block_tables=a),
+        # Equal values, distinct object: a separate table.
+        "l3.swa_cache": SimpleNamespace(block_tables=torch.zeros(12)),
+        "d0.swa_cache": SimpleNamespace(block_tables=other),  # another shape
+    }
+    tables = v2_attn._swa_group_tables(metadata, (3, 4))
+    assert len(tables) == 3
+    assert tables[0] is a and tables[1] is b

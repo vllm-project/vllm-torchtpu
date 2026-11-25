@@ -9,9 +9,7 @@ src/vllm_torchtpu/models/vllm/deepseek_v41/v2/attention_kernels.py
 from __future__ import annotations
 
 import os
-from unittest import mock
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -25,9 +23,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
     attention_kernels,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
-    compact_records,
     paged_attention_jax,
-    unpack_union_rope_words,
 )
 
 # ==============================================================================
@@ -115,56 +111,6 @@ def test_bf16_gathered_attention_matches_inline_gather(monkeypatch, banks, dim):
         np.testing.assert_array_equal(actual, expected)
 
 
-@pytest.mark.parametrize("banks", [1, 2])
-@pytest.mark.parametrize("shards,rank", [(1, 0), (2, 0), (2, 1)])
-@pytest.mark.parametrize("precompacted", [False, True])
-def test_fp8_gather_payload_matches_paged_rows(banks, shards, rank, precompacted):
-    """Check both packed payloads across banks, requests, padding and TP shards."""
-    rng = np.random.default_rng(9)
-    pool = jnp.asarray(rng.integers(-(2**30), 2**30, size=(32, 128), dtype=np.int32))
-    rope_words = jnp.asarray(
-        rng.integers(-(2**30), 2**30, size=(32, 32), dtype=np.int32)
-    )
-    rope = rope_words.reshape(-1, 128)
-    lo, hi = (pool, None) if banks == 1 else tuple(jnp.split(pool, 2))
-    rlo, rhi = (rope, None) if banks == 1 else tuple(jnp.split(rope, 2))
-    pages = jnp.array([[3, 0], [1, 2]], jnp.int32)
-    starts = jnp.array([0, 5, 11], jnp.int32)
-    records = jnp.tile(jnp.array([9, -1, 2, 5, 0], jnp.int32), (12, 1))
-    records = records.at[3].set(-1).at[11].set(-1)
-    if precompacted:
-        records = compact_records(records)
-    nope_out, rope_out = jax.jit(
-        attention_kernels.gather_fp8_kv_jax,
-        static_argnames=("page_size", "shards", "precompacted"),
-    )(
-        lo,
-        hi,
-        rlo,
-        rhi,
-        records,
-        pages,
-        starts,
-        jnp.array([rank]),
-        8,
-        shards,
-        precompacted,
-    )
-    rope_out = unpack_union_rope_words(rope_out.reshape(-1, 128), nope_out.shape[1])
-    rope_out = rope_out.reshape(nope_out.shape[0], nope_out.shape[1], 32)
-    first = rank * (12 // shards)
-    compacted = np.asarray(compact_records(records))
-    for local in range(12 // shards):
-        token = first + local
-        request = 0 if token < 5 else 1
-        valid = compacted[token] >= 0
-        logical = compacted[token, valid]
-        physical = np.asarray(pages)[request, logical // 8] * 8 + logical % 8
-        np.testing.assert_array_equal(nope_out[local, valid], pool[physical])
-        np.testing.assert_array_equal(rope_out[local, valid], rope_words[physical])
-    assert nope_out.shape[0] == (12 if shards == 1 else 8)
-
-
 def test_gather_reuse_in_compiled_twenty_layer_stage(monkeypatch):
     """The captured forward has 3 global gathers for L2..L19, reused six times."""
     ak = attention_kernels
@@ -242,91 +188,3 @@ def test_gather_reuse_in_compiled_twenty_layer_stage(monkeypatch):
             node.args[-1] is gathered for node in attends[2 + 6 * group : 8 + 6 * group]
         )
     assert ak._active_gathered_kv is None
-
-
-def test_fp8_stage_reuse_refreshes_source_indices_and_step(monkeypatch):
-    ak = attention_kernels
-    gather = mock.Mock(side_effect=lambda *args: (args[0].clone(), args[2].clone()))
-    consumed = []
-
-    def attend(*args):
-        consumed.append(args[-2:])
-        return args[0]
-
-    monkeypatch.setattr(ak, "_gather_fp8_op", gather)
-    monkeypatch.setattr(ak, "_fp8_attention_op", attend)
-    monkeypatch.setattr(ak, "_attention_tp_size", 1)
-    pool = torch.zeros((32, 128), dtype=torch.int32)
-    main = _FakeKVBuffer(pool, pool[:8].clone(), shape=(4, 8))
-    q = torch.zeros((2, 2, 512), dtype=torch.bfloat16)
-    records = torch.zeros((2, 4), dtype=torch.int32)
-    pages = torch.zeros((1, 4), dtype=torch.int32)
-    starts = torch.tensor([0, 2], dtype=torch.int32)
-
-    def run(selected):
-        return ak.sparse_fp8_attention(
-            q, main, main, records, selected, q.new_zeros(2), 0.1, pages, starts
-        )
-
-    for _ in range(2):
-        with ak.gathered_kv_cache_scope():
-            run(records)
-            for _ in range(5):
-                run(records)
-            assert all(pair[0] is consumed[-1][0] for pair in consumed[-6:])
-            run(records.clone())  # A new index source must gather again.
-            main = _FakeKVBuffer(pool.clone(), pool[:8].clone(), shape=(4, 8))
-            run(records)  # A new KV source must gather even with the same indices.
-    assert gather.call_count == 6
-    assert consumed[0][0] is not consumed[8][0]
-
-
-@pytest.mark.parametrize("tokens", [3, 136])
-def test_fp8_consumers_skip_global_gather(monkeypatch, tokens):
-    """Only the per-layer SWA gather remains when SparseMLA gets a saved payload."""
-    from jax.experimental import pallas as pl
-
-    ak = attention_kernels
-    pool = jnp.zeros((16, 128), jnp.int32)
-    rope = jnp.zeros((4, 128), jnp.int32)
-    records = jnp.tile(jnp.array([0, 7, -1], jnp.int32), (tokens, 1))
-    pages, starts = jnp.array([[0]], jnp.int32), jnp.array([0, tokens], jnp.int32)
-    nope, rope_values = ak.gather_fp8_kv_jax(
-        pool, None, rope, None, records, pages, starts, jnp.array([0]), 16, 1, False
-    )
-    chunks = []
-
-    def pallas_call(kernel, **kwargs):
-        def invoke(lens, bounds, sems, ids, sink, q, kv_nope, kv_rope, num, den, mx):
-            chunks.append((kv_nope, kv_rope))
-            return q
-
-        return invoke
-
-    monkeypatch.setattr(pl, "pallas_call", pallas_call)
-    monkeypatch.setattr(
-        ak,
-        "_csa_gather_pool",
-        mock.Mock(side_effect=AssertionError("global KV was gathered by a consumer")),
-    )
-    for _ in range(6):
-        ak.sparse_fp8_attention_jax(
-            jnp.ones((tokens, 2, 512), jnp.bfloat16),
-            pool,
-            pool,
-            rope,
-            jnp.full((tokens, 64), -1, jnp.int32),
-            records,
-            pages,
-            starts,
-            jnp.zeros(2, jnp.float32),
-            0.1,
-            16,
-            max_requests=1,
-            gathered_nope=nope,
-            gathered_rope=rope_values,
-        )
-    assert len(chunks) == 6
-    for actual_nope, actual_rope in chunks:
-        np.testing.assert_array_equal(actual_nope, nope)
-        np.testing.assert_array_equal(actual_rope, rope_values)

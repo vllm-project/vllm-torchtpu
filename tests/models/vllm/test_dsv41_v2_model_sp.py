@@ -923,7 +923,6 @@ def test_model_init_validation_and_ced_setup(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(v2_model, "initialize_mhc_post", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_flat_collapse", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_paged_attention", lambda: None)
-    monkeypatch.setattr(v2_model, "initialize_indexer", lambda: None)
     monkeypatch.setattr(v2_model, "compact_rope_caches", lambda *a: None)
 
     # 1. SP validation: compile_sizes < 2 * tp

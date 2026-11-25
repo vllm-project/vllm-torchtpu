@@ -899,6 +899,41 @@ def test_fused_moe_func_int4_packed_matches_reference():
     )
 
 
+@pytest.mark.parametrize(
+    ("rhs_dtype", "rhs_quant_dtype", "quantize_lhs"),
+    [
+        # Native fp4 and the packed uint8 carrier keep bf16 activations.
+        (jnp.float4_e2m1fn, None, False),
+        (jnp.float4_e2m1fn, jnp.float4_e2m1fn, False),
+        (jnp.uint8, jnp.float4_e2m1fn, False),
+        # fp8 and int4 weights keep the default fp8/int8 activations.
+        (jnp.float8_e4m3fn, None, True),
+        (jnp.int32, jnp.int4, True),
+    ],
+)
+def test_gmm_wrapper_lhs_quantization_follows_logical_weight_dtype(
+    monkeypatch, rhs_dtype, rhs_quant_dtype, quantize_lhs
+):
+    seen = {}
+
+    def fake_gmm_v2(**kwargs):
+        seen.update(kwargs)
+        return kwargs["lhs"]
+
+    monkeypatch.setattr(fused_moe_gmm, "gmm_v2", fake_gmm_v2)
+    fused_moe_gmm.gmm_wrapper(
+        jnp.zeros((8, 128), jnp.bfloat16),
+        jnp.zeros((2, 128, 128), rhs_dtype),
+        None,
+        None,
+        jnp.array([4, 4], jnp.int32),
+        jnp.array([0], jnp.int32),
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    assert seen["maybe_quantize_lhs"] is quantize_lhs
+    assert seen["rhs_quant_dtype"] == rhs_quant_dtype
+
+
 def _fake_tpu_info(sparse_core):
     return types.SimpleNamespace(sparse_core=sparse_core)
 

@@ -40,7 +40,6 @@ def _fixture(monkeypatch, ratio, banks, replay):
     attn.hidden_size = 16
     attn._tpu_rope_cache = torch.ones(64, 64)
     attn._rotate = lambda values, positions: values
-    attn._quantize_indexer = lambda values: values
     state = _cache(1024, torch.float32, banks=banks) if ratio == 2 else None
     main = _cache(512, torch.uint8, banks=banks, scale=True)
     index = _cache(128, torch.bfloat16, banks=banks)
@@ -207,12 +206,6 @@ def test_encoder_global_kv_uses_fused_compressor(monkeypatch):
     hidden, positions = torch.zeros(2, 16), torch.arange(2, dtype=torch.int32)
     v2_attn.DeepseekV41Attention.write_encoder_global_kv(attn, hidden, positions)
     attn._write_csa2_global_kv.assert_called_once_with(hidden, positions)
-
-
-def test_csa2_main_cache_rejects_latent_writes():
-    main = _cache(512, torch.uint8, scale=True)
-    with pytest.raises(NotImplementedError, match="fused compressor"):
-        main.write(torch.tensor([0, 1]), torch.zeros(2, 512, dtype=torch.bfloat16))
 
 
 @pytest.mark.parametrize("ratio,banks", [(1, 0), (2, 1), (2, 2)])

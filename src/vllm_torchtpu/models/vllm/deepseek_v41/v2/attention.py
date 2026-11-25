@@ -2,7 +2,7 @@
 
 import contextlib
 import dataclasses
-import os
+import math
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -22,38 +22,35 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
+from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.layers.adapter.linear_common import (
-    KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
 )
 from vllm_torchtpu.layers.core import table_lookup
 from vllm_torchtpu.utils import synchronize_tensors
 
-from . import csa2_adapter, preprocess_ops
+from . import csa2_adapter, indexer_fp8, preprocess_ops
 from .attention_kernels import (
     gathered_kv_cache_scope,
     paged_attention,
-    sparse_fp8_attention,
-    sparse_fp8_attention_qo,
 )
 from .cache import (
-    IndexCacheRows,
+    SWA_PAGE_TOKENS,
     NativeCacheView,
     PagedCacheRows,
+    block_stride_alignment,
     write_cache,
 )
 from .ced import prefix_replay_enabled
-from .indexer_cache import IndexerCache, PackedFP8IndexCacheRows, indexer_uses_fp8
+from .indexer_cache import IndexerCache, PackedFP8IndexCacheRows, indexer_uses_fp4
 from .ops import (
     device_hooks,
     quantize_fp8_activation,
     rms_norm,
     rotary,
-    round_fp8_activation,
 )
 from .projection_rope import initialize_projection_rope
-from .sparse_mqa_indexer import SparseMQAIndexer, quantize_query
-from .swa_cache import DeepseekV41SWASpec
+from .sparse_mqa_indexer import SparseMQAIndexer
 
 logger = init_logger(__name__)
 
@@ -71,49 +68,6 @@ def stage_attention_cache_scope():
             yield
     finally:
         _active_stage_attn_cache = prev
-
-
-def select_candidate_blocks(logits, lengths, topk_blocks, block_size):
-    if block_size < 1 or topk_blocks < 0:
-        raise ValueError("invalid candidate block parameters")
-    width = logits.shape[-1]
-    if width == 0:
-        return torch.zeros_like(logits, dtype=torch.bool)
-    lengths = torch.as_tensor(lengths, device=logits.device)
-    visible = torch.arange(width, device=logits.device) < lengths
-    scores = F.pad(
-        logits.masked_fill(~visible, -torch.inf),
-        (0, -width % block_size),
-        value=-torch.inf,
-    )
-    scores = scores.unflatten(-1, (-1, block_size)).amax(-1)
-    last = (lengths - 1) // block_size
-    scores = scores.masked_fill(
-        torch.arange(scores.shape[-1], device=scores.device) == last, torch.inf
-    )
-    selected = scores.topk(min(topk_blocks, scores.shape[-1]), dim=-1)
-    keep = torch.zeros_like(scores, dtype=torch.bool).scatter_(
-        -1, selected.indices, selected.values > -torch.inf
-    )
-    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
-
-
-def select_compressed_indices(scores, lengths, topk, *, candidates=None):
-    """Return logical compressed positions; unavailable picks are always -1.
-
-    Do not carry a source layer's SWA concatenation offset into reuse layers.
-    Equal scores retain PyTorch topk's unspecified tie ordering.
-    """
-    if topk < 0:
-        raise ValueError("topk must be nonnegative")
-    valid = torch.arange(scores.shape[-1], device=scores.device) < torch.as_tensor(
-        lengths, device=scores.device
-    )
-    if candidates is not None:
-        valid = valid & candidates
-    masked = scores.masked_fill(~valid, -torch.inf)
-    indices = masked.topk(min(topk, scores.shape[-1]), dim=-1).indices.sort(-1).values
-    return indices.masked_fill(masked.gather(-1, indices) == -torch.inf, -1).int()
 
 
 def sparse_attention(q, kv, sink, indices, scale):
@@ -166,6 +120,43 @@ def _token_requests(metadata, positions, out_int32=False):
 def _window_starts():
     """Per-request first position holding SWA KV, or None (SWA bounded replay)."""
     return get_forward_context().additional_kwargs.get("deepseek_v41_window_starts")
+
+
+def _shift_swa_metadata(metadata, records, shift, page_size):
+    """Move CSA2 SWA metadata and write records by ``shift`` rows.
+
+    ``prepare_swa_metadata`` adds the row offset to every visible physical
+    page (``offset // page_size``) and to every valid record; hidden pages are
+    0 and padding records -1. A visible page reads 0 only for the null block
+    at offset 0, which holds no KV for any layer.
+    """
+    if not shift:
+        return metadata, records
+    pages = metadata[:, 2:]
+    pages = torch.where(pages > 0, pages + shift // page_size, pages)
+    metadata = torch.cat((metadata[:, :2], pages), dim=1)
+    records = torch.where(records >= 0, records + shift, records)
+    return metadata, records
+
+
+def _swa_group_tables(metadata, shape):
+    """Distinct SWA block tables of this forward, in first-use order.
+
+    Block-outer packing deals SWA layers to several groups, each with its own
+    table; layers of one group share the table object. Tables of another
+    shape (another request layout) are left to their own preparation.
+    """
+    tables = []
+    for name, value in metadata.items():
+        table = getattr(value, "block_tables", None)
+        if (
+            name.endswith(".swa_cache")
+            and table is not None
+            and table.numel() == shape[0] * shape[1]
+            and not any(table is seen for seen in tables)
+        ):
+            tables.append(table)
+    return tables
 
 
 def _replayed(metadata, positions, starts, window):
@@ -243,6 +234,14 @@ class CompressorStateCache(NativeCacheView, compressor_upstream.CompressorStateC
 
     def get_attn_backend(self):
         return AttentionBackend
+
+    def get_kv_cache_spec(self, vllm_config):
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            block_stride_alignment=block_stride_alignment(
+                vllm_config.cache_config.block_size
+            ),
+        )
 
 
 def save_compress_norm(
@@ -395,10 +394,61 @@ class DeepseekCompressor(compressor_upstream.DeepseekCompressor):
         return latent
 
 
-def indexer_uses_fp4(vllm_config):
-    """Resolve the upstream format without imposing a CUDA capability check."""
-    indexer_uses_fp8(vllm_config)
-    return False
+def _sparse_mqa_indexer(
+    k_cache,
+    quant_block_size,
+    scale_fmt,
+    topk_tokens,
+    *args,
+    candidate_blocks=None,
+    candidate_block_size=0,
+    candidate_write=False,
+    **kwargs,
+):
+    """Build the TPU scorer from upstream's ``SparseAttnIndexer`` arguments.
+
+    The model writes Index-K before scoring and lengths come from the TPU
+    metadata, so the remaining arguments do not apply.
+    """
+    del quant_block_size, scale_fmt, args, kwargs
+    config = get_current_vllm_config().model_config.hf_config
+    return SparseMQAIndexer(
+        k_cache,
+        topk_tokens,
+        candidate_blocks,
+        candidate_block_size,
+        candidate_source_layer=(
+            getattr(config, "candidate_source_layer_id", -1)
+            if candidate_blocks is not None
+            else None
+        ),
+        candidate_write=candidate_write,
+    )
+
+
+class DeepseekV41Indexer(upstream.DeepseekV4Indexer):
+    """Upstream indexer modules and weights with the TPU scoring layer."""
+
+    attn_cls = staticmethod(_sparse_mqa_indexer)
+
+    def forward_q(self, qr, qr_scale, indexer_weights, positions, rotary_emb):
+        """Upstream's query build: wq_b, then fused RoPE and per-head FP8 quant.
+
+        ``rotary_emb`` may be the cos/sin table itself, so callers can pass the
+        compact serving table (`compact_rope_caches`). The head scale is folded
+        into the FP32 weights, hence no separate query scale.
+        """
+        assert qr_scale is None
+        table = (
+            rotary_emb
+            if isinstance(rotary_emb, torch.Tensor)
+            else rotary_emb.cos_sin_cache
+        )
+        q = _value(self.wq_b(qr)).reshape(-1, self.n_head, self.head_dim)
+        operation = indexer_fp8._query_op
+        assert operation is not None
+        q, weights = operation(q, positions, table, indexer_weights)
+        return q, None, weights
 
 
 class AttentionBackend(compressor_upstream.CompressorBackend):
@@ -414,61 +464,25 @@ class AttentionBackend(compressor_upstream.CompressorBackend):
 
 
 class SWACache(NativeCacheView, DeepseekV4SWACache):
-    native_pages = False
-
     def __init__(self, *args, **kwargs):
-        kwargs["block_size"] = kwargs["cache_config"].block_size
+        # SWA pages keep CSA2's 64-token word-pool geometry, independent of the
+        # compressed caches' `--block-size`: a larger compressed block then
+        # packs several SWA layers into one block-outer cache group.
+        kwargs["block_size"] = SWA_PAGE_TOKENS
         # Upstream ties bounded replay to its V2 model runner; the TPU model
         # implements the replay itself (see `prefix_replay_enabled`).
         kwargs["bounded_replay"] = prefix_replay_enabled(get_current_vllm_config())
         # FP8 applies to the compressed main KV only; SWA rows stay BF16.
         kwargs["dtype"] = torch.bfloat16
-        kwargs["backend_cls"] = AttentionBackend
         super().__init__(*args, **kwargs)
 
     def get_kv_cache_spec(self, vllm_config):
-        spec = super().get_kv_cache_spec(vllm_config)
-        if not self.native_pages:
-            return spec
-        values = {
-            field.name: getattr(spec, field.name) for field in dataclasses.fields(spec)
-        }
-        values["extra_retained_tokens"] = max(
-            0, vllm_config.num_prefill_lookahead_tokens - 1
+        return dataclasses.replace(
+            super().get_kv_cache_spec(vllm_config),
+            block_stride_alignment=block_stride_alignment(
+                vllm_config.cache_config.block_size
+            ),
         )
-        # One spec with or without prefix caching: bounded replay rebuilds the
-        # window after a hit, so pages live only while their request holds them.
-        if vllm_config.cache_config.enable_prefix_caching and not spec.bounded_replay:
-            # A main-KV hit without replay would read a window never rebuilt.
-            raise ValueError(
-                "DeepSeek-V4.1 CSA2 SWA with prefix caching requires "
-                "--swa-bounded-replay and prefill-context-parallel-size=1"
-            )
-        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        return DeepseekV41SWASpec(
-            **values,
-            max_num_seqs=max_num_seqs,
-            max_in_flight_tokens=vllm_config.max_in_flight_tokens,
-            num_lookahead_tokens=vllm_config.num_lookahead_tokens,
-            held_seqs=_swa_held_seqs(vllm_config, max_num_seqs),
-        )
-
-
-def _swa_held_seqs(vllm_config, max_num_seqs: int) -> int:
-    """Finished requests whose SWA window pages a KV connector keeps alive.
-
-    A P/D producer holds each sent request's pages until the consumer pulls
-    them, and a consumer holds pages of requests waiting for remote KV; neither
-    counts toward `max_num_seqs`. Headroom for 4x as many by default (about six
-    pages each); TPU_DSV41_SWA_HELD_SEQS overrides. Beyond it the manager
-    defers allocations rather than failing.
-    """
-    override = os.environ.get("TPU_DSV41_SWA_HELD_SEQS")
-    if override is not None:
-        return max(0, int(override))
-    if getattr(vllm_config, "kv_transfer_config", None) is None:
-        return 0
-    return 4 * max_num_seqs
 
 
 def _value(output):
@@ -506,16 +520,18 @@ def _row_slots(cache, block_table, requests, logical):
     return blocks * cache.shape[1] + safe % cache.shape[1]
 
 
-def _index_page_records(index_cache):
-    """Records per page, or zero when the physical layout breaks page alignment."""
-    if not isinstance(index_cache, IndexCacheRows):
-        return 0
-    per_page = index_cache.shape[1]
-    if index_cache.row_offset % per_page or index_cache.page_stride % per_page:
-        return 0
-    if index_cache.raw_hi is not None and index_cache.bank_records % per_page:
-        return 0
-    return per_page
+def _bound_geometry(module) -> tuple[int, int, int] | None:
+    """``(records per page, page stride, row offset)`` of a bound native cache.
+
+    Read from the allocator layout in record units, like `PagedCacheRows`, so
+    it is available before the first forward builds a cache view.
+    """
+    layout = getattr(module, "_tpu_cache_layout", None)
+    if layout is None:
+        return None
+    shape, dtype, stride_bytes, offset_bytes = layout
+    record_bytes = math.prod(shape[2:]) * dtype.itemsize
+    return shape[1], stride_bytes // record_bytes, offset_bytes // record_bytes
 
 
 def _query_split(count, ranks):
@@ -530,34 +546,6 @@ def _query_split(count, ranks):
     return (count + 2 * ranks - 1) // (2 * ranks) * 2, 2 * ranks
 
 
-def _request_row_slots(cache, block_table, width):
-    """Slots of logical rows ``0..width-1`` for every request: ``[requests, width]``.
-
-    Every token of a request scans the same capacity-wide rows, so address
-    them once per request instead of once per token.
-    """
-    rows_per_page = cache.shape[1]
-    # Logical row r lives in table column r // rows_per_page, so repeating each
-    # column rows_per_page times lines blocks up with rows 0..width-1 without
-    # a full-width gather (16-40x slower on TPU, see _row_slots).
-    blocks = (
-        block_table[:, :, None]
-        .expand(-1, -1, rows_per_page)
-        .reshape(block_table.shape[0], -1)
-        .long()
-    )
-    offsets = (
-        torch.arange(width, device=block_table.device).clamp(max=blocks.shape[1] - 1)
-        % rows_per_page
-    )
-    if width > blocks.shape[1]:
-        # Match _row_slots' clamp to the table's last row.
-        blocks = torch.cat(
-            (blocks, blocks[:, -1:].expand(-1, width - blocks.shape[1])), dim=1
-        )
-    return blocks[:, :width] * rows_per_page + offsets
-
-
 def _read_rows(cache, block_table, requests, logical):
     slots = _row_slots(cache, block_table, requests, logical)
     return cache[slots // cache.shape[1], slots % cache.shape[1]]
@@ -570,13 +558,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
     _ced_decoder = False
     _ced_global_from_encoder = False
     _sp_sharded_input = False
-    # True once `_init_local_q_weights` built the gathered weights.
-    _local_q_attn = False
     _q_projection_rope_op: Any = None
     # TP1 FP8-KV layers run the fused Q-A/KV, Q-B and compressor kernels.
     _fused_preprocess = False
     _packed_compressor_op: Any = None
     _address_compressor_op: Any = None
+    # `CompressorLayout` fields the fused compressor ops were built for, set
+    # once the KV cache is bound (`bind_compressor_layout`).
+    _compressor_layout_fields: tuple[int, ...] | None = None
     _swa_query_group_size = 1
 
     @classmethod
@@ -599,26 +588,33 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             raise NotImplementedError(
                 "TPU V4.1 supports --kv-cache-dtype auto, bfloat16 or fp8"
             )
-        # FP8 main KV uses DSV4's packed record (448 e4m3 + 64 e8m0 bytes)
-        # plus a BF16 RoPE companion; see cache.encode_fp8_kv.
+        # FP8 main KV uses CSA2 records: the whole post-RoPE latent in e4m3,
+        # with one FP32 scale per record in a companion (csa2.cache).
         self._fp8_kv = self.kv_cache_torch_dtype == torch.float8_e4m3fn
         speculative = vllm_config.speculative_config
         if speculative is not None and speculative.num_speculative_tokens is not None:
             self._swa_query_group_size = speculative.num_speculative_tokens + 1
-        csa2_supported = (
-            get_tensor_model_parallel_world_size() == 1
-            and self._fp8_kv
-            and self.head_dim == 512
+        # Every FP8 layer, at any TP size, reads and writes CSA2 records.
+        self._csa2 = self._fp8_kv
+        if self._csa2 and not (
+            self.head_dim == 512
             and self.window_size == 128
+            and self.n_local_heads % 8 == 0
+            and 8 <= self.n_local_heads <= 128
+        ):
+            raise NotImplementedError(
+                "FP8 V4.1 KV (CSA2) needs head_dim 512, window 128 and 8-128 "
+                f"local heads divisible by 8, got {self.n_local_heads}"
+            )
+        self._fused_wo_b = False
+        # The fused Q-A/KV, Q-B and compressor kernels are TP1, 64-head kernels;
+        # other TP sizes write the same CSA2 records through the unfused path.
+        self._fused_preprocess = (
+            self._csa2
+            and get_tensor_model_parallel_world_size() == 1
             and self.n_local_heads == 64
         )
-        # Compress-ratio-0 layers (SWA only, and the DSpark draft) run CSA2's
-        # SWA-only form: one attention kernel reads native pages for every layer.
-        self._csa2 = csa2_supported
-        # Set after weight loading, once wo_b's runtime layout is known.
-        self._fused_wo_b = False
-        self._fused_preprocess = csa2_supported
-        self.swa_cache_layer.native_pages = self._csa2
+        self.swa_cache_layer._tpu_swa_words = self._csa2
         if self.compress_ratio:
             logger.info_once(
                 "DeepSeek-V4.1 attention backend: %s",
@@ -640,47 +636,25 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             ),
             persistent=False,
         )
-        self.register_buffer(
-            "_tp_rank_1d",
-            self._tp_rank.reshape(1),
-            persistent=False,
-        )
-        tp_size = get_tensor_model_parallel_world_size()
-        self.register_buffer(
-            "_full_attn_sink",
-            self.attn_sink.detach().float().repeat(tp_size).contiguous(),
-            persistent=False,
-        )
         self._config = vllm_config.model_config.hf_config.to_dict()
-        if self.indexer is not None:
-            indexer = cast(Any, self.indexer)
-            op = indexer.indexer_op
-            indexer.indexer_op = SparseMQAIndexer(
-                indexer.k_cache,
-                self._config["index_topk"],
-                op.candidate_blocks,
-                self.candidate_block_size,
-                candidate_source_layer=(
-                    self.candidate_source_layer
-                    if op.candidate_blocks is not None
-                    else None
-                ),
-                candidate_write=getattr(op, "candidate_write", False),
-            )
         self._max_model_len = vllm_config.model_config.max_model_len
-        # Branch-free SWA patch (`_attend_window`) only while its static
-        # capacity, 63 tokens per extra request, stays small. Measured
-        # (tpu7x-2): max_num_seqs 1 +4.6%, 4 +1.6%, 8 -4.3% prefill.
-        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._swa_max_requests = max_num_seqs if max_num_seqs <= 4 else None
-        self._precompact_records = self._fp8_kv
-        self._token_parallel_attn = self._fp8_kv
         object.__setattr__(self, "mla_attn", self)
         self._prepare_and_attn_fn = self._prepare_tpu
 
+    def _indexer_cls(self, k_cache):
+        return DeepseekV41Indexer
+
     def get_kv_cache_spec(self, vllm_config):
         spec = super().get_kv_cache_spec(vllm_config)
-        if spec is None or not self._fp8_kv:
+        if spec is None:
+            return spec
+        spec = dataclasses.replace(
+            spec,
+            block_stride_alignment=block_stride_alignment(
+                vllm_config.cache_config.block_size
+            ),
+        )
+        if not self._fp8_kv:
             return spec
         return dataclasses.replace(spec, dtype=torch.uint8, page_size_padded=None)
 
@@ -721,18 +695,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 hidden_states
             )
             qr, qr_scale, kv = self._split_qkv_and_norm(qr_kv)
-        # This rank's SP token shard of qr, before the gather.
-        swa_kv = getattr(getattr(self, "swa_cache_layer", None), "kv_cache", None)
-        qr_local = (
-            qr
-            if self._sp_sharded_input
-            and getattr(self, "_local_q_attn", False)
-            and (
-                swa_kv is None
-                or (isinstance(swa_kv, PagedCacheRows) and self.window_size % 64 == 0)
-            )
-            else None
-        )
         if self._sp_sharded_input:
             if indexer_weights is not None:
                 assert qr.dtype == kv.dtype == indexer_weights.dtype
@@ -746,10 +708,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         dim=-1,
                     )
                 )
-            elif qr_local is not None:
-                # Non-source encoder layers with local_q do not consume
-                # full-token qr on the host; gather only kv (512 cols vs 2048).
-                kv = sp_all_gather(kv)[:num_tokens]
             else:
                 assert qr.dtype == kv.dtype
                 packed = sp_all_gather(torch.cat((qr, kv), dim=-1))[:num_tokens]
@@ -772,13 +730,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             positions,
             o_padded,
         )
-        if qr_local is not None:
-            projected = self._prepare_and_attn_fn(*args, qr_local=qr_local)
-            if projected is not None:
-                # The fused q/attention/wo_a op already produced wo_b's input.
-                return _value(self.wo_b(projected))
-        else:
-            self._prepare_and_attn_fn(*args)
+        self._prepare_and_attn_fn(*args)
         o = o_padded[:, : self.n_local_heads, :]
         return self._o_proj(o, positions)
 
@@ -801,15 +753,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         return bool(self.compress_ratio) and (
             self._max_model_len // self.compress_ratio <= self._config["index_topk"]
         )
-
-    def _quantize_indexer(self, values):
-        # Values are kept dequantized in BF16 storage, not silently changed to
-        # another quantizer. Power-of-two FP8 scales remain with Q/K, so weights
-        # must NOT fold the Q scale a second time.
-        return round_fp8_activation(values, self.indexer.head_dim)
-
-    def _project_index_q(self, qr, positions):
-        return self._quantize_indexer(self._project_index_q_unquantized(qr, positions))
 
     def _project_index_q_unquantized(self, qr, positions):
         index_q = _value(self.indexer.wq_b(qr)).reshape(
@@ -902,8 +845,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         indexer = self.indexer
         keys = indexer.k_norm(_value(indexer.wk(latent)))
         keys = self._rotate(keys, positions)
-        if not isinstance(cache, PackedFP8IndexCacheRows):
-            keys = self._quantize_indexer(keys)
         _insert(cache, slots, keys, valid)
         stage_cache = _active_stage_attn_cache
         if stage_cache is not None:
@@ -927,7 +868,41 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 main_offset=main_cache.row_offset,
                 index_capacity=index_cache.shape[1],
             )
-        return preprocess_ops.compressor_layout_admitted(region, **fields)
+        return preprocess_ops.compressor_layout_admitted(
+            region, self._compressor_layout_fields, **fields
+        )
+
+    def bind_compressor_layout(self) -> None:
+        """Rebuild the fused ratio-2 compressor ops for the bound cache geometry.
+
+        Weights load before the KV cache is bound, so the ops built in
+        `process_weights_after_loading` carry the default layout. Block-outer
+        groups give every layer its own state/main offsets, so each layer's
+        kernels are specialized for its own pages here, before any forward.
+        """
+        if self._packed_compressor_op is None or self.compressor is None:
+            return
+        state = _bound_geometry(self.compressor.state_cache)
+        main = _bound_geometry(self)
+        index = _bound_geometry(self.indexer.k_cache)
+        if state is None or main is None or index is None:
+            return
+        layout = decode_preparation.CompressorLayout(
+            state_capacity=state[0],
+            state_stride=state[1],
+            state_offset=state[2],
+            window=self.window_size,
+            main_capacity=main[0],
+            main_stride=main[1],
+            main_offset=main[2],
+            index_capacity=index[0],
+        )
+        eps = self.compressor.rms_norm_eps
+        self._packed_compressor_op = preprocess_ops.compress_rope_packed(eps, layout)
+        self._address_compressor_op = preprocess_ops.compress_rope_addresses(
+            eps, layout
+        )
+        self._compressor_layout_fields = dataclasses.astuple(layout)
 
     def _write_csa2_global_kv(self, hidden_states, positions):
         """Fused compressor: one kernel projects, pools (reading and writing the
@@ -1227,10 +1202,8 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         index_weights,
         positions,
         output,
-        qr_local=None,
     ):
-        """Attend into ``output``, or return the ``wo_b`` input when the fused
-        q/attention/``wo_a`` op (``qr_local``) ran; else ``None``.
+        """Attend into ``output``.
 
         With ``_fused_preprocess``, ``kv`` already carries its SWA RoPE."""
         metadata = get_forward_context().attn_metadata
@@ -1268,21 +1241,49 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             elif (window_starts := _window_starts()) is not None:
                 minimum = window_starts
             minimum = minimum[: swa_table.shape[0]]
+            # Block-outer groups give each SWA layer its own row offset within
+            # the block; the metadata is otherwise identical, so the key omits
+            # the offset and _shift_swa_metadata moves the cached result.
+            # Upstream deals SWA layers to groups round-robin, so consecutive
+            # layers use different block tables: keep one entry per table, or
+            # each layer evicts the previous group's entry and always misses.
             meta_key = (
                 "csa2_swa",
                 rows_per_page,
                 swa_cache.page_stride,
-                swa_cache.row_offset,
                 non_causal,
                 self._ced_decoder,
             )
-            cached = stage_cache.get(meta_key) if stage_cache is not None else None
-            if cached is None or cached[0] is not swa.block_tables:
+            entries = (
+                stage_cache.setdefault(meta_key, []) if stage_cache is not None else []
+            )
+            cached = next((e for e in entries if e[0] is swa.block_tables), None)
+            if cached is None and stage_cache is not None and not entries:
+                # First CSA2 layer of the stage: one program prepares every SWA
+                # group's table, so later layers of other groups also hit.
+                tables = _swa_group_tables(metadata, swa_table.shape)
+                if len(tables) > 1 and any(t is swa.block_tables for t in tables):
+                    batched, bounds, records = csa2_adapter.prepare_swa_tables(
+                        tuple(t.reshape(swa_table.shape) for t in tables),
+                        swa.query_start_loc,
+                        positions,
+                        minimum,
+                        swa_cache,
+                        non_causal,
+                    )
+                    entries.extend(
+                        (table, 0, batched[g], bounds, records[g])
+                        for g, table in enumerate(tables)
+                    )
+                    cached = next(e for e in entries if e[0] is swa.block_tables)
+            if cached is None:
                 if (
                     self._fused_preprocess
-                    and swa_cache.native_swa
-                    and rows_per_page == swa_cache.page_stride == 64
-                    and swa_cache.row_offset == 0
+                    and swa_cache.swa_words
+                    # Stride and offset are whole pages (`PagedCacheRows`
+                    # checks this for word-pool owners); block-outer groups
+                    # place each SWA layer at its own page of the block.
+                    and rows_per_page == SWA_PAGE_TOKENS
                     and not non_causal
                 ):
                     csa2_metadata, csa2_bounds, csa2_write_records = (
@@ -1307,15 +1308,23 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                             non_causal,
                         )
                     )
-                if stage_cache is not None:
-                    stage_cache[meta_key] = (
+                entries.append(
+                    (
                         swa.block_tables,
+                        swa_cache.row_offset,
                         csa2_metadata,
                         csa2_bounds,
                         csa2_write_records,
                     )
+                )
             else:
-                _, csa2_metadata, csa2_bounds, csa2_write_records = cached
+                _, offset, csa2_metadata, csa2_bounds, csa2_write_records = cached
+                csa2_metadata, csa2_write_records = _shift_swa_metadata(
+                    csa2_metadata,
+                    csa2_write_records,
+                    swa_cache.row_offset - offset,
+                    rows_per_page,
+                )
             swa_valid = csa2_write_records >= 0
             swa_invalid_3d = (~swa_valid)[:, None, None]
             requests = _token_requests(swa, positions).clamp(max=swa_table.shape[0] - 1)
@@ -1555,23 +1564,12 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 if swa_row_slots is not None
                 else None
             )
-        # Token-local q path: q projection, attention and
-        # wo_a run in one op that picks token-parallel vs head-sharded on
-        # concrete shapes.
-        fused_qo = (
-            qr_local is not None
-            and self._local_q_attn
-            and tiled
-            and self._fp8_kv
-            and bool(self.compress_ratio)
-        )
-        q = None
         if self._fused_preprocess:
             # Shares the step's gathered rows with the Q-A/KV kernel.
             q = preprocess_ops.qb_rope()(
                 qr, self.wq_b.weight, self.wq_b.weight_scale, self._rope_rows(positions)
             )
-        elif not fused_qo:
+        else:
             # V4.1 normalizes qr before projection; neither route renormalizes q.
             if (
                 self._q_projection_rope_op is not None
@@ -1611,7 +1609,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         if self.indexer is not None and not self._all_indices_fit:
             weights = (
                 index_weights.float()
-                * self.indexer.head_dim**-0.5
+                * self.indexer.softmax_scale
                 * self.indexer.n_head**-0.5
             )
         count = positions.shape[0]
@@ -1655,84 +1653,17 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         weights = cast(torch.Tensor, weights)
                         keys_meta = metadata[indexer.k_cache.prefix]
                         index_cache = indexer.k_cache.kv_cache
-                        index_records = None
-                        if isinstance(index_cache, PackedFP8IndexCacheRows):
-                            index_records = _block_table(keys_meta)
-                        elif tiled:
-                            # Rows are row_indices of _row_slots(..., logical),
-                            # computed per request: [requests, capacity]. The
-                            # indexer shares each request's key tiles.
-                            has_fast_idx_offset = isinstance(
-                                getattr(index_cache, "row_offset", None), int
-                            )
-                            idx_req_key = (
-                                "index_req_slots",
-                                indexer.k_cache.prefix,
-                                index_cache.shape[1] if has_fast_idx_offset else None,
-                                (
-                                    index_cache.page_stride
-                                    if has_fast_idx_offset
-                                    else None
-                                ),
-                                capacity,
-                            )
-                            cached_idx_req = (
-                                stage_cache.get(idx_req_key)
-                                if stage_cache is not None
-                                else None
-                            )
-                            if cached_idx_req is None:
-                                req_slots = _request_row_slots(
-                                    index_cache, _block_table(keys_meta), capacity
-                                )
-                                cached_idx_req = (
-                                    req_slots
-                                    // index_cache.shape[1]
-                                    * index_cache.page_stride
-                                    + req_slots % index_cache.shape[1]
-                                    if has_fast_idx_offset
-                                    else req_slots
-                                )
-                                if stage_cache is not None:
-                                    stage_cache[idx_req_key] = cached_idx_req
-                            index_records = (
-                                index_cache.row_offset + cached_idx_req
-                                if has_fast_idx_offset
-                                else index_cache.row_indices(cached_idx_req)
-                            )
-                        if tiled or isinstance(index_cache, PackedFP8IndexCacheRows):
-                            assert index_records is not None
-                            selected = self._select_paged_indices(
-                                qr,
-                                positions,
-                                index_cache,
-                                index_records,
-                                requests,
-                                weights,
-                                lengths,
-                                swa_valid,
-                                query_start_loc=keys_meta.query_start_loc,
-                            )
-                        else:
-                            index_q = self._project_index_q(qr, positions)
-                            logical_compressed = torch.arange(
-                                capacity, device=positions.device
-                            )[None, :].expand(count, -1)
-                            keys = _read_rows(
-                                index_cache,
-                                _block_table(keys_meta),
-                                requests,
-                                logical_compressed,
-                            )
-                            scores = (
-                                torch.einsum(
-                                    "thd,tcd->thc", index_q.float(), keys.float()
-                                ).relu()
-                                * weights[:, :, None]
-                            ).sum(1)[None]
-                            selected = self._select_indices(
-                                scores, lengths, logical_compressed, count
-                            )
+                        selected = self._select_paged_indices(
+                            qr,
+                            positions,
+                            index_cache,
+                            _block_table(keys_meta),
+                            requests,
+                            weights,
+                            lengths,
+                            swa_valid,
+                            query_start_loc=keys_meta.query_start_loc,
+                        )
                     if stage_cache is None or not tiled:
                         # Keep the persistent buffer's physical shape across compile
                         # buckets when not sharing stage-scoped main_records directly.
@@ -1842,71 +1773,21 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
                 output.copy_(result)
                 return None
-            assert records is not None
-            if fused_qo:
-                return sparse_fp8_attention_qo(
-                    qr,
-                    qr_local,
-                    self.wq_b.weight,
-                    self.wq_b.weight_scale,
-                    self._wq_b_full,
-                    self._wq_b_full_scale,
-                    positions,
-                    self._tpu_rope_cache,
-                    swa_cache,
-                    main_cache,
-                    records,
-                    main_records,
-                    self.attn_sink,
-                    self._full_attn_sink,
-                    self._tp_rank_1d,
-                    self.wo_a.weight,
-                    self.wo_a.weight_scale,
-                    self._wo_a_full,
-                    self._wo_a_full_scale,
-                    swa_valid,
-                    self.scale,
-                    pages,
-                    starts,
-                    self._swa_max_requests,
-                    self._precompact_records,
-                    int(self.head_dim),
-                )
-            assert q is not None
-            if self._fp8_kv and self.compress_ratio:
-                result = sparse_fp8_attention(
-                    q,
-                    swa_cache,
-                    main_cache,
-                    records,
-                    main_records,
-                    self.attn_sink,
-                    self.scale,
-                    pages,
-                    starts,
-                    self._swa_max_requests,
-                    precompacted=self._precompact_records,
-                    token_parallel=self._token_parallel_attn,
-                    full_sink=self._full_attn_sink,
-                    tp_rank=self._tp_rank_1d,
-                )
-            else:
-                # The op zeroes the invalid rows itself (in the shared DSpark
-                # draft kernel's write-back).
-                result = paged_attention(
-                    q,
-                    swa_cache,
-                    main_cache,
-                    records,
-                    main_records,
-                    self.attn_sink,
-                    self.scale,
-                    self._swa_query_group_size,
-                    row_valid=swa_valid,
-                )
-                output.copy_(result)
-                return None
-            output.copy_(result.masked_fill(swa_invalid_3d, 0))
+            assert records is not None and q is not None
+            # The op zeroes the invalid rows itself (in the shared DSpark
+            # draft kernel's write-back).
+            result = paged_attention(
+                q,
+                swa_cache,
+                main_cache,
+                records,
+                main_records,
+                self.attn_sink,
+                self.scale,
+                self._swa_query_group_size,
+                row_valid=swa_valid,
+            )
+            output.copy_(result)
             return None
         if self._fp8_kv and self.compress_ratio:
             raise NotImplementedError("FP8 V4.1 KV cache requires the tiled path")
@@ -1925,52 +1806,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )[:, 0]
         output.copy_(result.masked_fill(swa_invalid_3d, 0))
         return None
-
-    def _init_local_q_weights(self):
-        """All-gather ``wq_b`` and ``wo_a`` for the token-local q path.
-
-        Column ``r`` blocks of the gathered weights are rank ``r``'s shards, the
-        same rank-major head/group order the token-parallel ``all_to_all``
-        uses, so every per-head/per-group product is computed from identical
-        weights. FP8 tensors are gathered as bytes.
-        """
-        tp_size = get_tensor_model_parallel_world_size()
-        if (
-            not self._token_parallel_attn
-            or tp_size <= 1
-            or getattr(self, "_ced_decoder", False)
-            or not (self._fp8_kv and self.compress_ratio)
-            or self.n_local_groups != 1
-        ):
-            return
-        wq_scale = getattr(self.wq_b, "weight_scale", None)
-        wo_scale = getattr(self.wo_a, "weight_scale", None)
-        if (
-            wq_scale is None
-            or wq_scale.ndim != 1
-            or wo_scale is None
-            or getattr(self.wq_b, KEEP_VLLM_LAYOUT_ATTR, False)
-        ):
-            return
-
-        def gather_columns(weight):
-            weight = weight.contiguous()
-            gathered = tensor_model_parallel_all_gather(weight.view(torch.uint8), dim=1)
-            return gathered.view(weight.dtype).contiguous()
-
-        buffers = {
-            "_wq_b_full": gather_columns(self.wq_b.weight),
-            "_wq_b_full_scale": tensor_model_parallel_all_gather(
-                wq_scale.contiguous(), dim=0
-            ),
-            "_wo_a_full": gather_columns(self.wo_a.weight),
-            "_wo_a_full_scale": tensor_model_parallel_all_gather(
-                wo_scale.reshape(-1).contiguous(), dim=0
-            ),
-        }
-        for name, value in buffers.items():
-            self.register_buffer(name, value, persistent=False)
-        self._local_q_attn = True
 
     def _select_paged_indices(
         self,
@@ -1991,7 +1826,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         """
         indexer = self.indexer
         count = qr.shape[0]
-        packed_fp8 = isinstance(index_cache, PackedFP8IndexCacheRows)
         has_candidates = indexer.indexer_op.candidate_blocks is not None
         candidate_write = has_candidates and getattr(
             indexer.indexer_op, "candidate_write", False
@@ -2042,7 +1876,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                         (positions, 0),
                         (active_lengths, 0),
                         # FP8 candidate grouping must exclude padding requests.
-                        (requests, -1 if packed_fp8 else 0),
+                        (requests, -1),
                     )
                 )
             else:
@@ -2073,7 +1907,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 requests_part,
             ) = cached_query_split
         offsets_part = None
-        if packed_fp8 and query_start_loc is not None:
+        if query_start_loc is not None:
             # This rank's rows [rank * part, rank * part + part) of each request.
             offsets_part = query_start_loc.int()
             if split:
@@ -2089,21 +1923,16 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         else:
             qr_part, weights_part, candidates_part = qr, weights, candidates
 
-        if packed_fp8 and qr_part.device.type != "cpu":
-            projected = _value(indexer.wq_b(qr_part)).reshape(
-                -1, indexer.n_head, indexer.head_dim
+        if qr_part.device.type != "cpu":
+            q_part, _, weights_part = indexer.forward_q(
+                qr_part, None, weights_part, positions_part, self._tpu_rope_cache
             )
-            q_part, weights_part = quantize_query(
-                projected, positions_part, self._tpu_rope_cache, weights_part
-            )
-        elif packed_fp8:
+        else:
             q_part, q_scale = quantize_fp8_activation(
                 self._project_index_q_unquantized(qr_part, positions_part),
                 indexer.head_dim,
             )
             weights_part = weights_part.float() * q_scale.squeeze(-1)
-        else:
-            q_part = self._project_index_q(qr_part, positions_part)
 
         selected, published = indexer.indexer_op(
             q_part,
@@ -2114,7 +1943,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             requests_part,
             candidates=candidates_part,
             batch_max=batch_max,
-            page_records=_index_page_records(index_cache),
             unordered=self._fp8_kv,
             score_width=max(1, self._max_model_len // self.compress_ratio),
             stage_cache=stage_cache if not split else None,
@@ -2126,7 +1954,10 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 published = _gather_query_rows(published)[:count]
         if candidate_write:
             if stage_cache is not None:
-                version_key = ("candidate_publication", self.candidate_source_layer)
+                version_key = (
+                    "candidate_publication",
+                    indexer.indexer_op.candidate_source_layer,
+                )
                 stage_cache[version_key] = stage_cache.get(version_key, 0) + 1
             self.candidate_block_buffer.copy_(
                 torch.nn.functional.pad(
@@ -2136,68 +1967,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 )
             )
         return selected
-
-    def _select_indices(self, scores, lengths, logical_compressed, count):
-        indexer = self.indexer
-        candidates = None
-        # If every block fits, publication and filtering are identities. The
-        # Flash config has 2048 candidate slots but only 512 blocks at 4K.
-        capacity = logical_compressed.shape[-1]
-        if (
-            indexer.indexer_op.candidate_blocks is not None
-            and self.candidate_block_buffer.shape[-1] * self.candidate_block_size
-            < capacity
-        ):
-            if getattr(indexer.indexer_op, "candidate_write", False):
-                published = select_candidate_blocks(
-                    scores,
-                    lengths,
-                    self._config["candidate_topk_blocks"],
-                    self.candidate_block_size,
-                )
-                blocks = published[..., :: self.candidate_block_size]
-                ids = (
-                    torch.arange(blocks.shape[-1], device=blocks.device)
-                    .expand_as(blocks)
-                    .masked_fill(~blocks, -1)
-                )
-                selected = ids.topk(
-                    min(ids.shape[-1], self.candidate_block_buffer.shape[-1]), dim=-1
-                ).values
-                self.candidate_block_buffer.copy_(
-                    torch.nn.functional.pad(
-                        selected[0].int(),
-                        (
-                            0,
-                            self.candidate_block_buffer.shape[-1] - selected.shape[-1],
-                            0,
-                            self.candidate_block_buffer.shape[0] - count,
-                        ),
-                        value=-1,
-                    )
-                )
-            else:
-                ids = self.candidate_block_buffer[:count]
-                # Membership is a 2-D block table, not [tokens, context, topk].
-                # The extra column absorbs all invalid/padded candidate ids.
-                num_blocks = (
-                    capacity + self.candidate_block_size - 1
-                ) // self.candidate_block_size
-                valid_ids = (ids >= 0) & (ids < num_blocks)
-                block_mask = torch.zeros(
-                    (count, num_blocks + 1), dtype=torch.bool, device=ids.device
-                )
-                block_mask.scatter_(
-                    1, ids.masked_fill(~valid_ids, num_blocks).long(), True
-                )
-                candidates = block_mask.gather(
-                    1, logical_compressed // self.candidate_block_size
-                )[None]
-        if candidates is not None:
-            candidates = candidates | (lengths.max() <= self._config["index_topk"])
-        return select_compressed_indices(
-            scores, lengths, self._config["index_topk"], candidates=candidates
-        )[0]
 
     def forward_mqa(self, q, kv, positions, output):
         raise RuntimeError("TPU sparse attention is dispatched by _prepare_tpu")
@@ -2226,15 +1995,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         VllmDeepseekV4MLAAttention.process_weights_after_loading(self, act_dtype)
         self._assert_o_proj_supported()
         tp_size = get_tensor_model_parallel_world_size()
-        if tp_size > 1:
-            self._full_attn_sink.copy_(
-                tensor_model_parallel_all_gather(
-                    self.attn_sink.detach().float().contiguous(), dim=0
-                )
-            )
-        else:
-            self._full_attn_sink.copy_(self.attn_sink.detach().float())
-        self._init_local_q_weights()
         self._q_projection_rope_op = None
         if self._fused_preprocess:
             self._flip_compressor_weight()
