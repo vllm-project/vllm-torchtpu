@@ -118,6 +118,39 @@ def _kernel(
     pages_per_step = buf_ref.shape[1]
     ring = buf_ref.shape[0]  # prefetched groups + the running one
     num_groups = block_start_ref[pl.num_programs(0)]
+    row_width = buf_ref.shape[-1]
+
+    def page_copies(half, g, page):
+        src = kv_hbm_ref.at[
+            pl.ds(page, 1), :, :, pl.ds(head_ref[0] * row_width, row_width)
+        ]
+        copies = [pltpu.make_async_copy(src, buf_ref.at[half, g], sem_ref.at[half, g])]
+        if fp4:
+            copies.append(
+                pltpu.make_async_copy(
+                    scale_hbm_ref.at[pl.ds(page, 1)],
+                    scale_buf_ref.at[half, g],
+                    scale_sem_ref.at[half, g],
+                )
+            )
+        return copies
+
+    def start_group(group, half):
+        base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
+
+        def start(g):
+            for copy in page_copies(half, g, page_table_ref[work_page_ref[base + g]]):
+                copy.start()
+
+        _for_pages(work_count_ref[group], start)
+
+    b = pl.program_id(0)
+
+    # The first groups' pages, ahead of the group loop.
+    @pl.when(b == 0)
+    def _first():
+        for d in range(ring - 1):
+            pl.when(d < num_groups)(functools.partial(start_group, d, d))
 
     def group(
         w,
@@ -141,44 +174,11 @@ def _kernel(
         meta = work_meta_ref[w]
         count = work_count_ref[w]
         num_heads, block_q, head_dim = q_ref.shape
-        rows_per_page, packing, row_width = buf_ref.shape[3:]
+        rows_per_page, packing = buf_ref.shape[3:5]
         page_size = rows_per_page * (msa_fp4.TOKENS_PER_WORD if fp4 else packing)
         half = w % ring
         first = (meta & msa_attention._FIRST_BIT) != 0
         last = (meta & msa_attention._LAST_BIT) != 0
-
-        def page_copies(half, g, page):
-            src = kv_hbm_ref.at[
-                pl.ds(page, 1), :, :, pl.ds(head_ref[0] * row_width, row_width)
-            ]
-            copies = [
-                pltpu.make_async_copy(src, buf_ref.at[half, g], sem_ref.at[half, g])
-            ]
-            if fp4:
-                copies.append(
-                    pltpu.make_async_copy(
-                        scale_hbm_ref.at[pl.ds(page, 1)],
-                        scale_buf_ref.at[half, g],
-                        scale_sem_ref.at[half, g],
-                    )
-                )
-            return copies
-
-        def start_group(group, half):
-            base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
-
-            def start(g):
-                for copy in page_copies(
-                    half, g, page_table_ref[work_page_ref[base + g]]
-                ):
-                    copy.start()
-
-            _for_pages(work_count_ref[group], start)
-
-        @pl.when(w == 0)
-        def _first():
-            for d in range(ring - 1):
-                pl.when(d < num_groups)(functools.partial(start_group, d, d))
 
         @pl.when(w + ring - 1 < num_groups)
         def _next():
@@ -420,7 +420,6 @@ def _kernel(
         group(w)
         return carry
 
-    b = pl.program_id(0)
     jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
 
 
