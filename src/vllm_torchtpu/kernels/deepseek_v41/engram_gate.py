@@ -27,7 +27,7 @@ LANES = 128
 
 
 def _kernel(
-    x,
+    rows,
     w,
     w_scale,
     hidden,
@@ -35,7 +35,7 @@ def _kernel(
     k_weight,
     mask,
     out,
-    xb,
+    stage,
     q,
     x_scale,
     wb,
@@ -57,6 +57,7 @@ def _kernel(
     quant_rows: int,
     eps: float,
     clamp: float,
+    block_size: int | None,
 ):
     tokens = q.shape[0]
     tiles = tokens // token_tile
@@ -67,30 +68,12 @@ def _kernel(
     def at(offset, size):
         return pl.ds(pl.multiple_of(offset, size), size)
 
-    # Per-token FP8 activation quantization, as quantize_block does it.
-    def x_copy(block, slot):
-        return pltpu.make_async_copy(
-            x.at[at(block * quant_rows, quant_rows)], xb.at[slot], x_sem.at[slot]
+    if block_size is None:
+        _quantize_rows(*rows, *stage, x_sem, q, x_scale, quant_rows=quant_rows)
+    else:
+        _quantize_packed(
+            *rows, *stage, x_sem, q, x_scale, quant_rows=quant_rows, block=block_size
         )
-
-    blocks = tokens // quant_rows
-    x_copy(0, 0).start()
-
-    @pl.loop(0, blocks)
-    def _(block):
-        slot = block % 2
-
-        @pl.when(block + 1 < blocks)
-        def _():
-            x_copy(block + 1, 1 - slot).start()
-
-        x_copy(block, slot).wait()
-        a = xb[slot].astype(jnp.float32)
-        scale = jnp.max(jnp.abs(a), axis=1, keepdims=True) / FP8_MAX
-        scale = jnp.where(scale == 0, 1.0, scale)
-        rows = at(block * quant_rows, quant_rows)
-        q[rows, :] = jnp.clip(a / scale, -FP8_MAX, FP8_MAX).astype(FP8)
-        x_scale[rows, :] = scale
 
     def w_copy(i):
         return pltpu.make_async_copy(
@@ -233,6 +216,128 @@ def _kernel(
     o_copy(last - 1).wait()
 
 
+def _quantize_rows(x, xb, x_sem, q, x_scale, *, quant_rows):
+    """Per-token FP8 activation quantization, as quantize_block does it."""
+
+    def x_copy(block, slot):
+        rows = pl.ds(pl.multiple_of(block * quant_rows, quant_rows), quant_rows)
+        return pltpu.make_async_copy(x.at[rows], xb.at[slot], x_sem.at[slot])
+
+    blocks = q.shape[0] // quant_rows
+    x_copy(0, 0).start()
+
+    @pl.loop(0, blocks)
+    def _(block):
+        slot = block % 2
+
+        @pl.when(block + 1 < blocks)
+        def _():
+            x_copy(block + 1, 1 - slot).start()
+
+        x_copy(block, slot).wait()
+        _store_quantized(xb[slot].astype(jnp.float32), block, q, x_scale, quant_rows)
+
+
+def _store_quantized(a, block, q, x_scale, quant_rows):
+    scale = jnp.max(jnp.abs(a), axis=1, keepdims=True) / FP8_MAX
+    scale = jnp.where(scale == 0, 1.0, scale)
+    rows = pl.ds(pl.multiple_of(block * quant_rows, quant_rows), quant_rows)
+    q[rows, :] = jnp.clip(a / scale, -FP8_MAX, FP8_MAX).astype(FP8)
+    x_scale[rows, :] = scale
+
+
+def _quantize_packed(raw, scales, rb, sb, xt, x_sem, q, x_scale, *, quant_rows, block):
+    """``_quantize_rows`` of the BF16 rows ``dequant_fp8_rows`` builds from
+    packed staging, unpacked here instead of in XLA glue.
+
+    ``raw`` [T, K / 4] int32 holds little-endian FP8 bytes, so word i of a
+    row is K values 4i .. 4i + 3; ``scales`` [T, K / block / 4] int32 holds
+    one E8M0 byte per ``block`` values. Byte plane j of a 128-word chunk is
+    every fourth value; the quantized planes interleave back into natural K
+    order before the projection, which reads q unchanged.
+    """
+    words = raw.shape[1]
+    chunks, per_chunk = words // LANES, LANES * 4 // block // 4
+    lane = jax.lax.broadcasted_iota(jnp.int32, (1, LANES), 1)
+    # Lane l of chunk c is word 128c + l: scale word 128c + l // (block / 4) // 4
+    # of its row, byte (l // (block / 4)) % 4 of it.
+    word_of_lane = lane // (block // 4) // 4
+    shift = (lane // (block // 4)) % 4 * 8
+
+    def copies(index, slot):
+        rows = pl.ds(pl.multiple_of(index * quant_rows, quant_rows), quant_rows)
+        return (
+            pltpu.make_async_copy(raw.at[rows], rb.at[slot], x_sem.at[0, slot]),
+            pltpu.make_async_copy(scales.at[rows], sb.at[slot], x_sem.at[1, slot]),
+        )
+
+    blocks = q.shape[0] // quant_rows
+    for copy in copies(0, 0):
+        copy.start()
+
+    @pl.loop(0, blocks)
+    def _(index):
+        slot = index % 2
+
+        @pl.when(index + 1 < blocks)
+        def _():
+            for copy in copies(index + 1, 1 - slot):
+                copy.start()
+
+        for copy in copies(index, slot):
+            copy.wait()
+        # dequant_fp8_rows, plane by plane: FP8 value times the power of two
+        # built from the scale byte's exponent bits, +0 for byte 255, BF16.
+        amax = jnp.zeros((quant_rows, LANES), jnp.float32)
+        for c in range(chunks):
+            packed = sb[slot, :, pl.ds(c * per_chunk, 1)]
+            for k in range(1, per_chunk):
+                column = sb[slot, :, pl.ds(c * per_chunk + k, 1)]
+                packed = jnp.where(word_of_lane == k, column, packed)
+            byte = (packed >> shift) & 0xFF
+            power = jax.lax.bitcast_convert_type(byte << 23, jnp.float32)
+            invalid = byte == 0xFF
+            chunk_words = rb[slot, :, pl.ds(c * LANES, LANES)]
+            for plane in range(4):
+                value = pltpu.unpack_elementwise(
+                    chunk_words,
+                    index=plane,
+                    packed_dtype=jnp.uint8,
+                    unpacked_dtype=jnp.uint32,
+                )
+                value = jax.lax.bitcast_convert_type(value.astype(jnp.uint8), FP8)
+                x = jnp.where(invalid, 0.0, value.astype(jnp.float32) * power)
+                x = x.astype(jnp.bfloat16)
+                xt[plane, :, pl.ds(c * LANES, LANES)] = x
+                amax = jnp.maximum(amax, jnp.abs(x.astype(jnp.float32)))
+        # Max is order independent: lane maxima, then one row maximum.
+        scale = jnp.max(amax, axis=1, keepdims=True) / FP8_MAX
+        scale = jnp.where(scale == 0, 1.0, scale)
+        rows = pl.ds(pl.multiple_of(index * quant_rows, quant_rows), quant_rows)
+        x_scale[rows, :] = scale
+        for c in range(chunks):
+            planes = [
+                jnp.clip(
+                    xt[plane, :, pl.ds(c * LANES, LANES)].astype(jnp.float32) / scale,
+                    -FP8_MAX,
+                    FP8_MAX,
+                ).astype(FP8)
+                for plane in range(4)
+            ]
+            q[rows, pl.ds(c * LANES * 4, LANES * 4)] = _interleave(planes)
+
+
+def _interleave(planes):
+    """Byte planes [R, 128] -> [R, 512] with plane j at columns 4l + j."""
+    bytes_ = [
+        jax.lax.bitcast_convert_type(p, jnp.uint8).astype(jnp.uint32) for p in planes
+    ]
+    words = pltpu.pack_elementwise(bytes_, packed_dtype=jnp.uint8)
+    # A word's four bytes become four adjacent second-minor rows of the
+    # bitcast, so the words go second-minor and the result comes back.
+    return pltpu.bitcast(words.T, FP8).T
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -242,11 +347,12 @@ def _kernel(
         "token_tile",
         "quant_rows",
         "max_tokens",
+        "block_size",
         "interpret",
     ),
 )
 def engram_gate(
-    x: jax.Array,
+    x: jax.Array | tuple[jax.Array, jax.Array],
     w: jax.Array,
     w_scale: jax.Array,
     hidden: jax.Array,
@@ -260,6 +366,7 @@ def engram_gate(
     token_tile: int = 512,
     quant_rows: int = 64,
     max_tokens: int = 2048,
+    block_size: int | None = None,
     interpret: bool = False,
 ) -> jax.Array:
     """Engram's gated residual from rows ``x`` [T, K] and ``hidden`` [T, H, D].
@@ -267,16 +374,33 @@ def engram_gate(
     ``w`` is the canonical [K, (H + 1) * D] FP8 weight with per-column FP32
     ``w_scale``; ``mask`` [T] gates padded tokens shut. Any T: rows are
     padded to whole token tiles internally. Returns [T, H, D] BF16.
+
+    With ``block_size``, ``x`` is the packed staging instead: int32 words of
+    the FP8 bytes [T, K / 4] and of the E8M0 scale bytes, one per
+    ``block_size`` values [T, K / block_size / 4], dequantized in the kernel
+    exactly as ``dequant_fp8_rows`` would.
     """
-    tokens, k_dim = x.shape
+    tokens = jax.tree.leaves(x)[0].shape[0]
     _, heads, dim = hidden.shape
+    if block_size is None:
+        k_dim = x.shape[1]
+    else:
+        raw, scales = x
+        k_dim = raw.shape[1] * 4
+        if (
+            raw.shape[1] % LANES
+            or LANES % block_size
+            or block_size % 4
+            or scales.shape != (tokens, k_dim // block_size // 4)
+        ):
+            raise ValueError("Unsupported packed Engram rows")
     if tokens > max_tokens:
         # The quantized rows stay in VMEM (12 MiB at 2,048 tokens), so longer
         # inputs run in chunks, each re-reading the weight (~50 us).
         return jnp.concatenate(
             [
                 engram_gate(
-                    x[i : i + max_tokens],
+                    jax.tree.map(lambda a, i=i: a[i : i + max_tokens], x),
                     w,
                     w_scale,
                     hidden[i : i + max_tokens],
@@ -289,6 +413,7 @@ def engram_gate(
                     token_tile=token_tile,
                     quant_rows=quant_rows,
                     max_tokens=max_tokens,
+                    block_size=block_size,
                     interpret=interpret,
                 )
                 for i in range(0, tokens, max_tokens)
@@ -300,7 +425,8 @@ def engram_gate(
     token_tile = min(token_tile, -(-tokens // quant_rows) * quant_rows)
     padded = -(-tokens // token_tile) * token_tile
     pad = ((0, padded - tokens), (0, 0))
-    x = jnp.pad(x, pad)
+    # Zero packed bytes dequantize to the zero rows of the BF16 input.
+    x = jax.tree.map(lambda a: jnp.pad(a, pad), x)
     mask = jnp.pad(mask.astype(jnp.float32), pad[:1])
     hidden = jnp.pad(hidden.reshape(tokens, heads * dim), pad)
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
@@ -313,14 +439,27 @@ def engram_gate(
         quant_rows=quant_rows,
         eps=eps,
         clamp=clamp,
+        block_size=block_size,
     )
+    if block_size is None:
+        rows_spec = (hbm,)
+        stage = (pltpu.VMEM((2, quant_rows, k_dim), x.dtype),)
+        stage_sem = pltpu.SemaphoreType.DMA((2,))
+    else:
+        rows_spec = (hbm, hbm)
+        stage = (
+            pltpu.VMEM((2, quant_rows, k_dim // 4), raw.dtype),
+            pltpu.VMEM((2, quant_rows, scales.shape[1]), scales.dtype),
+            pltpu.VMEM((4, quant_rows, k_dim // 4), jnp.bfloat16),
+        )
+        stage_sem = pltpu.SemaphoreType.DMA((2, 2))
     flat = pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((padded, heads * dim), hidden.dtype),
-        in_specs=(hbm, hbm, vmem, hbm, vmem, vmem, vmem),
+        in_specs=(rows_spec, hbm, vmem, hbm, vmem, vmem, vmem),
         out_specs=hbm,
         scratch_shapes=(
-            pltpu.VMEM((2, quant_rows, k_dim), x.dtype),
+            stage,
             pltpu.VMEM((padded, k_dim), FP8),
             pltpu.VMEM((padded, 1), jnp.float32),
             pltpu.VMEM((2, k_dim, window), w.dtype),
@@ -330,7 +469,7 @@ def engram_gate(
             pltpu.VMEM((padded, LANES), jnp.float32),
             pltpu.VMEM((padded, LANES), jnp.float32),
             pltpu.VMEM((heads, padded, 1), jnp.float32),
-            pltpu.SemaphoreType.DMA((2,)),
+            stage_sem,
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA((2,)),
             pltpu.SemaphoreType.DMA((2,)),
@@ -339,7 +478,7 @@ def engram_gate(
         interpret=pltpu.InterpretParams() if interpret else False,
         name="engram_gate",
     )(
-        x,
+        (x,) if block_size is None else x,
         w,
         w_scale,
         hidden,

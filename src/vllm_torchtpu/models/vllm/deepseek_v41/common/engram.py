@@ -601,12 +601,14 @@ def _fused_prep_op():
 
 
 _ENGRAM_GATE_OP = None
+_ENGRAM_GATE_PACKED_OP = None
 
 
 def initialize_engram_gate() -> None:
-    """Build the torch op for ``engram_gate`` (7 arrays, then eps and clamp)
-    before tracing: dynamo cannot trace the op's construction."""
-    global _ENGRAM_GATE_OP
+    """Build the torch ops for ``engram_gate`` (7 arrays, then eps and clamp;
+    the packed one takes raw and scale words for rows, then the block size)
+    before tracing: dynamo cannot trace the ops' construction."""
+    global _ENGRAM_GATE_OP, _ENGRAM_GATE_PACKED_OP
     if _ENGRAM_GATE_OP is None:
         from torch_tpu._internal import pallas
 
@@ -646,10 +648,44 @@ def initialize_engram_gate() -> None:
                 torch._check(mask.shape[0] == hidden.shape[0])
             return torch.empty_like(hidden)
 
+        def call_packed(
+            raw: jax.Array,
+            scales: jax.Array,
+            w: jax.Array,
+            w_scale: jax.Array,
+            hidden: jax.Array,
+            q_weight: jax.Array,
+            k_weight: jax.Array,
+            mask: jax.Array | None,
+            eps: float,
+            clamp: float,
+            block_size: int,
+        ) -> jax.Array:
+            if mask is None:
+                mask = jnp.ones(raw.shape[0], jnp.float32)
+            return engram_gate(
+                (raw, scales),
+                w,
+                w_scale,
+                hidden,
+                q_weight,
+                k_weight,
+                mask,
+                eps=eps,
+                clamp=clamp,
+                block_size=block_size,
+            )
+
+        def fake_packed(raw, scales, *rest):
+            torch._check(scales.shape[0] == raw.shape[0])
+            return fake(raw, *rest[:6])
+
         # A per-rank kernel, like quantized_matmul: no mesh.
         op = pallas.jax_op("pallas::dsv41_engram_gate", call)
         op.register_fake(fake)
-        _ENGRAM_GATE_OP = op
+        packed = pallas.jax_op("pallas::dsv41_engram_gate_packed", call_packed)
+        packed.register_fake(fake_packed)
+        _ENGRAM_GATE_OP, _ENGRAM_GATE_PACKED_OP = op, packed
 
 
 def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
@@ -1299,19 +1335,52 @@ class Engram(upstream.Engram):
         num_tokens = self._active_raw.shape[0]
         _, cols, head_dim = self._host_raw.shape
         blocks = self._host_scale.shape[-1]
-        raw_words_per_tok = (cols * head_dim) // 4
-        scale_words_per_tok = -(-(cols * blocks) // 4)
         raw_bytes = num_tokens * cols * head_dim
         scale_bytes = num_tokens * cols * blocks
-        words = self._active_raw.flatten()
-        raw = _unpack_bytes(words[: num_tokens * raw_words_per_tok], raw_bytes)
-        scale_words = packed_suffix(words, num_tokens * scale_words_per_tok)
+        raw_words, scale_words = self._staged_words()
+        raw = _unpack_bytes(raw_words.flatten(), raw_bytes)
         scale = _unpack_bytes(scale_words.flatten(), scale_bytes)
         return dequant_fp8_rows(
             raw.reshape(num_tokens, cols, head_dim),
             scale.reshape(num_tokens, cols, blocks),
             self.embed_tokens.block_size,
         )[:local_num_tokens]
+
+    def _staged_words(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """This step's staging as int32 words: raw FP8 bytes, then E8M0 bytes."""
+        assert self._active_raw is not None
+        num_tokens = self._active_raw.shape[0]
+        _, cols, head_dim = self._host_raw.shape
+        blocks = self._host_scale.shape[-1]
+        raw_words_per_tok = (cols * head_dim) // 4
+        scale_words_per_tok = -(-(cols * blocks) // 4)
+        words = self._active_raw.flatten()
+        raw = words[: num_tokens * raw_words_per_tok]
+        scales = packed_suffix(words, num_tokens * scale_words_per_tok)
+        return raw, scales
+
+    def _packed_rows(self, num_tokens: int) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """``(raw [T, K / 4], scales [T, K / block / 4])`` int32 words of the
+        rows ``embed`` would dequantize, or None when the gate cannot read
+        the staging as is: HBM or SP rows, a column slice, or scale bytes
+        that do not end each token on a word."""
+        if (
+            self._staged_raw is None
+            or self.uses_hbm_lookup
+            or self.use_sequence_parallel
+            or self.embed_tokens.tp_size != 1
+        ):
+            return None
+        cols = self._host_raw.shape[1]
+        blocks = self._host_scale.shape[-1]
+        if cols != self.embed_tokens.n_hash_cols or (cols * blocks) % 4:
+            return None
+        staged = cast(torch.Tensor, self._active_raw).shape[0]
+        raw, scales = self._staged_words()
+        return (
+            raw.view(staged, -1)[:num_tokens],
+            scales.view(staged, -1)[:num_tokens],
+        )
 
     def _sp_embed(self, hash_ids):
         """Rows for this rank's SP token chunk with all hash heads.
@@ -1335,21 +1404,40 @@ class Engram(upstream.Engram):
         local = gathered[:, rank * chunk : (rank + 1) * chunk]
         return local.transpose(0, 1).flatten(1, 2)[:, :cols]
 
-    def _fused_gate(self, x: torch.Tensor) -> bool:
+    def _fused_gate(self, device: torch.device, k_dim: int) -> bool:
         """Whether ``engram_gate`` runs wkv, gate and residual in one kernel:
         a full (not column-sharded) per-channel FP8 wkv on TPU."""
         wkv = self.wkv
         scale = getattr(wkv, "weight_scale", None)
         return (
-            x.device.type == "tpu"
+            device.type == "tpu"
             and wkv.weight.dtype == torch.float8_e4m3fn
             and scale is not None
             and scale.ndim == 1
             and not getattr(wkv, KEEP_VLLM_LAYOUT_ATTR, False)
-            and tuple(wkv.weight.shape) == (x.shape[-1], (self.hc_mult + 1) * self.dim)
+            and tuple(wkv.weight.shape) == (k_dim, (self.hc_mult + 1) * self.dim)
         )
 
     def forward(self, hidden_states, hash_ids, token_mask=None):
+        packed = self._packed_rows(hash_ids.shape[0])
+        if packed is not None and self._fused_gate(
+            hidden_states.device, packed[0].shape[1] * 4
+        ):
+            # The kernel dequantizes the staged bytes itself (XLA's byte
+            # unpack and dequant cost ~0.27 ms per prefill layer).
+            assert _ENGRAM_GATE_PACKED_OP is not None, "initialize_engram_gate() first"
+            return _ENGRAM_GATE_PACKED_OP(
+                *packed,
+                self.wkv.weight,
+                self.wkv.weight_scale,
+                hidden_states,
+                self.q_weight,
+                self.k_weight,
+                token_mask,
+                self.eps,
+                self.clamp_value,
+                self.embed_tokens.block_size,
+            )
         if self.use_sequence_parallel:
             tp = self.embed_tokens.tp_size
             chunk = -(-hash_ids.shape[0] // tp)
@@ -1364,7 +1452,7 @@ class Engram(upstream.Engram):
         else:
             embedded = self.embed(hash_ids)
         x = embedded.flatten(-2)
-        if self._fused_gate(x):
+        if self._fused_gate(x.device, x.shape[-1]):
             assert _ENGRAM_GATE_OP is not None, "initialize_engram_gate() first"
             return _ENGRAM_GATE_OP(
                 x,
