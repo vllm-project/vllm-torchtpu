@@ -63,11 +63,14 @@ def applies(o_proj: nn.Module) -> bool:
     return pallas_all_reduce.armed_rank(get_tp_group().ranks) is not None
 
 
-def _all_gather_cpu(t: torch.Tensor) -> torch.Tensor:
-    tp = get_tp_group()
+def all_gather_cpu(t: torch.Tensor, group=None) -> torch.Tensor:
+    """Every rank's t stacked in group-rank order, over the group's gloo
+    group (default: TP), on the host."""
+    if group is None:
+        group = get_tp_group()
     local = t.cpu().contiguous()
-    seen = [torch.empty_like(local) for _ in range(tp.world_size)]
-    torch.distributed.all_gather(seen, local, group=tp.cpu_group)
+    seen = [torch.empty_like(local) for _ in range(group.world_size)]
+    torch.distributed.all_gather(seen, local, group=group.cpu_group)
     return torch.stack(seen)
 
 
@@ -88,12 +91,12 @@ def prepare(o_proj: nn.Module) -> None:
         return
     device = o_proj.weight.device
     scale = o_proj.weight_scale.data
-    common = _all_gather_cpu(scale.float()).amax(dim=0)
+    common = all_gather_cpu(scale.float()).amax(dim=0)
     shift = (scale.float().cpu() / common).to(device)
     w = (o_proj.weight.data.float() * shift).to(torch.float8_e4m3fn)
     if mode() == "replicate":
         # gloo carries no 8-bit float: send the bytes as int32.
-        w = _all_gather_cpu(w.cpu().view(torch.int32)).view(torch.float8_e4m3fn)
+        w = all_gather_cpu(w.cpu().view(torch.int32)).view(torch.float8_e4m3fn)
         w = torch.roll(w, -get_tp_group().rank_in_group, dims=0)
     replace_parameter(o_proj, "weight", nn.Parameter(w.to(device), requires_grad=False))
     replace_parameter(

@@ -31,6 +31,7 @@ from vllm.model_executor.utils import replace_parameter
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.minimax_m3.sp_o_proj import all_gather_cpu
 
 logger = init_logger(__name__)
 
@@ -80,17 +81,11 @@ def group_columns(
     return torch.cat(cols, dim=1), torch.cat(scales)
 
 
-def _all_gather_cpu(group, t: torch.Tensor) -> torch.Tensor:
-    local = t.cpu().contiguous()
-    seen = [torch.empty_like(local) for _ in range(group.world_size)]
-    torch.distributed.all_gather(seen, local, group=group.cpu_group)
-    return torch.stack(seen)
-
-
 def _selftest(group, old_w, old_s, new_w, new_s, nq, d, replicas) -> None:
     """The group heads' columns of the new weight against every rank's own
     k / v / index_q projection all-gathered over the DCP group (the path they
-    replace), on rows shared by all ranks. Collective over the group."""
+    replace), on rows shared by all ranks. Collective over the group; every
+    rank raises when any rank fails."""
     gen = torch.Generator().manual_seed(0)
     x = torch.randn(_SELFTEST_ROWS, old_w.shape[0], generator=gen)
     x = x.to(torch.bfloat16).to(old_w.device)
@@ -104,10 +99,13 @@ def _selftest(group, old_w, old_s, new_w, new_s, nq, d, replicas) -> None:
     got, want = got.float().cpu(), want.float().cpu()
     max_abs = float((got - want).abs().max())
     scale = float(want.abs().max()) or 1.0
-    if not (torch.isfinite(got).all() and max_abs <= _SELFTEST_REL_TOL * scale):
+    ok = bool(torch.isfinite(got).all()) and max_abs <= _SELFTEST_REL_TOL * scale
+    seen = [None] * group.world_size
+    torch.distributed.all_gather_object(seen, ok, group=group.cpu_group)
+    if not all(seen):
         raise RuntimeError(
-            f"TPU_MINIMAX_M3_DCP_LOCAL_KV self-test failed: max_abs={max_abs:.3g} "
-            f"scale={scale:.3g}"
+            f"TPU_MINIMAX_M3_DCP_LOCAL_KV self-test failed (per DCP rank {seen}); "
+            f"here max_abs={max_abs:.3g} scale={scale:.3g}"
         )
     logger.info(
         "MiniMax-M3 DCP local K/V self-test: ok, %s (max_abs=%.3g)",
@@ -142,8 +140,8 @@ def prepare(qkv_proj: nn.Module) -> None:
     kvi = slice(nq * d, (nq + 3) * d)
     w_bytes = w.cpu().view(torch.uint8)
     # gloo carries no 8-bit floats: the columns travel as int32 words.
-    ranks_kvi = _all_gather_cpu(group, w_bytes[:, kvi].contiguous().view(torch.int32))
-    ranks_kvi_scale = _all_gather_cpu(group, s[kvi].float())
+    ranks_kvi = all_gather_cpu(w_bytes[:, kvi].contiguous().view(torch.int32), group)
+    ranks_kvi_scale = all_gather_cpu(s[kvi].float(), group)
     new_w, new_s = group_columns(
         w_bytes,
         s.float().cpu(),

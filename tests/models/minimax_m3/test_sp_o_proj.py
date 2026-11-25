@@ -80,7 +80,7 @@ def _prepared(monkeypatch, mode, w8, scale):
                 torch.stack([x.view(torch.int32) for x in rescaled]),
             ]
         )
-        monkeypatch.setattr(sp_o_proj, "_all_gather_cpu", lambda t, g=gathers: next(g))
+        monkeypatch.setattr(sp_o_proj, "all_gather_cpu", lambda t, g=gathers: next(g))
         sp_o_proj.prepare(m)
         _as_rank(monkeypatch, r)
         assert sp_o_proj.applies(m)
