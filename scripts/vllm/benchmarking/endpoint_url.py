@@ -136,13 +136,10 @@ def choose_served_model(
     *,
     config_model: str,
     served_model_name: str | None = None,
-    adopt_single_listed: bool = False,
 ) -> str:
     """Return the model name to send to an endpoint that lists ``listed``.
 
-    The name is ``served_model_name`` when given. Otherwise it is the single
-    listed id when ``adopt_single_listed`` is set and the endpoint lists
-    exactly one, and ``config_model`` in every other case.
+    The name is ``served_model_name`` when given, otherwise ``config_model``.
 
     Raises:
         ModelNotServedError: The chosen name is not in ``listed``. Every
@@ -151,8 +148,6 @@ def choose_served_model(
     """
     if served_model_name:
         name, source = served_model_name, "--served-model-name"
-    elif adopt_single_listed and len(listed) == 1:
-        return listed[0]
     else:
         name, source = config_model, "the config's MODEL"
     if name not in listed:
@@ -168,7 +163,6 @@ def _resolve_model(args: list[str]) -> int:
     parser.add_argument("base_url")
     parser.add_argument("--config-model", required=True)
     parser.add_argument("--served-model-name")
-    parser.add_argument("--adopt-single-listed", action="store_true")
     parsed = parser.parse_args(args)
     try:
         listed = list_served_models(
@@ -178,7 +172,6 @@ def _resolve_model(args: list[str]) -> int:
             listed,
             config_model=parsed.config_model,
             served_model_name=parsed.served_model_name,
-            adopt_single_listed=parsed.adopt_single_listed,
         )
     except ModelLookupError as err:
         print(
@@ -206,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "Usage: endpoint_url.py normalize <url>\n"
             "       endpoint_url.py resolve-model <url> --config-model MODEL "
-            "[--served-model-name NAME] [--adopt-single-listed]",
+            "[--served-model-name NAME]",
             file=sys.stderr,
         )
         return 2

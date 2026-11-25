@@ -590,7 +590,7 @@ fi
 # A server this script starts serves the config's MODEL, so another name would
 # send every request to a model that is not there.
 if [ "$SERVED_MODEL_NAME_CLI_SET" = "1" ] && [ "$BOOT_SERVER" = "1" ]; then
-    echo "ERROR: --served-model-name needs a running server (--base-url, --host and --port, or --skip-benchmark for the one already on localhost:8000)"
+    echo "ERROR: --served-model-name needs a running server (--base-url, --host and --port, or --skip-benchmark for the one already on localhost:$PORT)"
     exit 1
 fi
 
@@ -608,17 +608,12 @@ fi
 # starts this script when the endpoint is ready), and the run stops here
 # (set -e) unless the name it would send is on that list: every request for
 # another name fails, and vllm bench serve still exits 0 with zeros. The name
-# is --served-model-name when given, else MODEL. Behind --base-url a router may
-# serve the model under another name, so there an endpoint that lists exactly
-# one model is sent that one.
+# is --served-model-name when given, else MODEL.
 SERVED_MODEL="$SERVED_MODEL_NAME_CLI"
 if [ "$BOOT_SERVER" = "0" ] && [ "$NEEDS_LIVE_SERVER" = "1" ]; then
     RESOLVE_ARGS=(--config-model "$CONFIG_MODEL")
     if [ -n "$SERVED_MODEL_NAME_CLI" ]; then
         RESOLVE_ARGS+=(--served-model-name "$SERVED_MODEL_NAME_CLI")
-    fi
-    if [ "$BASE_URL_CLI_SET" = "1" ]; then
-        RESOLVE_ARGS+=(--adopt-single-listed)
     fi
     SERVED_MODEL=$(python3 "$SCRIPT_DIR/endpoint_url.py" resolve-model "$BASE_URL" "${RESOLVE_ARGS[@]}")
     if [ "$SERVED_MODEL" = "$CONFIG_MODEL" ]; then

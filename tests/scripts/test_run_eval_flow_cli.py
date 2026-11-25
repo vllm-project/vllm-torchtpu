@@ -26,6 +26,7 @@ import importlib.util
 import json
 import pathlib
 import shutil
+import socket
 import stat
 import subprocess
 import threading
@@ -504,44 +505,40 @@ def test_list_served_models_raises_when_the_lookup_fails(
         endpoint_url.list_served_models(gateway.url)
 
 
-def test_list_served_models_raises_when_nothing_is_listening(make_gateway):
-    gateway = make_gateway("", ["unused"])
-    gateway.close()
+def test_list_served_models_raises_when_nothing_is_listening():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
 
-    with pytest.raises(endpoint_url.ModelLookupError, match="Connection refused"):
-        endpoint_url.list_served_models(gateway.url)
+        with pytest.raises(endpoint_url.ModelLookupError, match="Connection refused"):
+            endpoint_url.list_served_models(f"http://127.0.0.1:{port}")
 
 
 @pytest.mark.parametrize(
-    ("listed", "served_model_name", "adopt_single_listed", "expected"),
+    ("listed", "served_model_name", "expected"),
     [
-        pytest.param(["cfg"], None, False, "cfg", id="config_model_listed"),
-        pytest.param(["a", "cfg"], None, True, "cfg", id="several_with_config_model"),
-        pytest.param(["a"], None, True, "a", id="single_listed_adopted"),
-        pytest.param(["a", "b"], "b", True, "b", id="explicit_name_listed"),
-        pytest.param(["b"], "b", False, "b", id="explicit_name_is_the_single_one"),
+        pytest.param(["cfg"], None, "cfg", id="config_model_listed"),
+        pytest.param(["a", "cfg"], None, "cfg", id="several_with_config_model"),
+        pytest.param(["a", "b"], "b", "b", id="explicit_name_listed"),
+        pytest.param(["b"], "b", "b", id="explicit_name_is_the_single_one"),
     ],
 )
-def test_choose_served_model_returns_a_listed_name(
-    listed, served_model_name, adopt_single_listed, expected
-):
+def test_choose_served_model_returns_a_listed_name(listed, served_model_name, expected):
     name = endpoint_url.choose_served_model(
         listed,
         config_model="cfg",
         served_model_name=served_model_name,
-        adopt_single_listed=adopt_single_listed,
     )
 
     assert name == expected
 
 
 @pytest.mark.parametrize(
-    ("listed", "served_model_name", "adopt_single_listed", "message"),
+    ("listed", "served_model_name", "message"),
     [
         pytest.param(
             [],
             None,
-            True,
             "the config's MODEL 'cfg' is not a model the endpoint serves "
             "(it lists: no models)",
             id="no_ids",
@@ -549,7 +546,6 @@ def test_choose_served_model_returns_a_listed_name(
         pytest.param(
             ["a", "b"],
             None,
-            True,
             "the config's MODEL 'cfg' is not a model the endpoint serves "
             "(it lists: a, b)",
             id="several_without_config_model",
@@ -557,14 +553,12 @@ def test_choose_served_model_returns_a_listed_name(
         pytest.param(
             ["a"],
             None,
-            False,
             "the config's MODEL 'cfg' is not a model the endpoint serves (it lists: a)",
             id="single_other_name_not_adopted",
         ),
         pytest.param(
             ["a", "cfg"],
             "x",
-            True,
             "--served-model-name 'x' is not a model the endpoint serves "
             "(it lists: a, cfg)",
             id="explicit_name_not_listed",
@@ -572,14 +566,13 @@ def test_choose_served_model_returns_a_listed_name(
     ],
 )
 def test_choose_served_model_raises_for_a_name_the_endpoint_does_not_list(
-    listed, served_model_name, adopt_single_listed, message
+    listed, served_model_name, message
 ):
     with pytest.raises(endpoint_url.ModelNotServedError) as excinfo:
         endpoint_url.choose_served_model(
             listed,
             config_model="cfg",
             served_model_name=served_model_name,
-            adopt_single_listed=adopt_single_listed,
         )
 
     assert str(excinfo.value) == message
@@ -702,6 +695,8 @@ def test_base_url_path_prefix_and_served_model_reach_every_client(flow, make_gat
     flow.run(
         "--base-url",
         gateway.url,
+        "--served-model-name",
+        "router-served-name",
         "--eval-suites",
         "mmlu_pro,mmmu_pro",
         "--perf-suites",
@@ -724,7 +719,7 @@ def test_base_url_path_prefix_and_served_model_reach_every_client(flow, make_gat
 
 
 def test_openai_api_key_reaches_models_lookup_and_evalscope(flow, make_gateway):
-    gateway = make_gateway("/gw", ["authed-served-name"], required_api_key="gw-key-123")
+    gateway = make_gateway("/gw", [_CONFIG_MODEL], required_api_key="gw-key-123")
 
     flow.run(
         "--base-url",
@@ -737,7 +732,7 @@ def test_openai_api_key_reaches_models_lookup_and_evalscope(flow, make_gateway):
     )
 
     assert gateway.seen_auth_headers == ["Bearer gw-key-123"]
-    assert flow.option("evalscope", "--model") == {"authed-served-name"}
+    assert flow.option("evalscope", "--model") == {_CONFIG_MODEL}
     assert flow.option("evalscope", "--api-key") == {"gw-key-123"}
 
 
@@ -763,7 +758,7 @@ def test_explicit_served_model_among_several_and_no_env_fallback(flow, make_gate
 
 
 def test_served_model_name_env_is_ignored_without_cli_flag(flow, make_gateway):
-    gateway = make_gateway("", ["router-served-name"])
+    gateway = make_gateway("", [_CONFIG_MODEL, "ignored-env-name"])
 
     flow.run(
         "--base-url",
@@ -776,7 +771,7 @@ def test_served_model_name_env_is_ignored_without_cli_flag(flow, make_gateway):
     )
 
     assert flow.option("lm_eval", "--model_args") == {
-        f"model=router-served-name,"
+        f"model={_CONFIG_MODEL},"
         f"base_url={gateway.url}/v1/chat/completions,"
         "num_concurrent=128"
     }
@@ -872,6 +867,14 @@ def test_base_url_stops_when_the_models_lookup_fails(flow, make_gateway, models_
             f"the config's MODEL '{_CONFIG_MODEL}' is not a model the endpoint "
             "serves (it lists: no models)",
             id="base_url_lists_no_models",
+        ),
+        pytest.param(
+            "--base-url",
+            ["router-served-name"],
+            [],
+            f"the config's MODEL '{_CONFIG_MODEL}' is not a model the endpoint "
+            "serves (it lists: router-served-name)",
+            id="base_url_lists_single_other_model",
         ),
         pytest.param(
             "--base-url",
@@ -1207,7 +1210,7 @@ def test_eval_suites_all_includes_mmmu_pro_for_multimodal_config(flow):
 def test_eval_suites_all_follows_a_config_that_narrows_lm_eval_tasks(flow):
     config = flow.write_config(
         "mmlu-pro-only",
-        _FIXTURE_CONFIG_BODY + 'LM_EVAL_TASKS="mmlu_pro"\n',
+        _FIXTURE_CONFIG_BODY + 'LM_EVAL_TASKS="mmlu_pro mmlu_llama_custom"\n',
     )
 
     flow.run(
@@ -1527,6 +1530,8 @@ def test_spec_bench_config_base_url_eval_only_uses_served_model(flow, make_gatew
     flow.run(
         "--base-url",
         gateway.url,
+        "--served-model-name",
+        "router-served-name",
         "--perf-suites",
         "none",
         "--eval-suites",
