@@ -547,6 +547,10 @@ class MiniMaxM3SparseAttention(nn.Module):
                     extra["hadamard"] = self.hadamard
             if half is not None:
                 layer_metadata = half[0].metadata(layer_metadata, half[1])
+                # A half's candidates take the whole step's indexer path. Only
+                # the 4-bit DCP op needs it: the 8-bit halves (c4, c16) run
+                # with at most 16 sequences, so their halves of >= 2048 rows
+                # are prefill-sized on their own.
                 if half[1] is not None and self.scale_cache is not None:
                     extra["step_tokens"] = half[0].num_tokens
             attn_output = self.msa_op(

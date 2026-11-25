@@ -303,8 +303,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """o_proj(attention) summed over TP for this rank's block of each
         token half (the halves layout): the first half attends (and writes its
-        keys) before the second, and each half's all-to-all + o_proj starts
-        when its attention is done, under the other half's attention."""
+        keys) before the second; the first half's all-to-all + o_proj runs
+        after the second half's attention (its all-to-all crosses under it),
+        the second half's right after its own attention."""
         o_proj = self.self_attn.o_proj
         attns: list[torch.Tensor] = []
         for i, x in enumerate(rows):
