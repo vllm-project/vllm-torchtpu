@@ -328,6 +328,7 @@ def _chunk_maxima_t(
     is ``2 Bq`` rows rather than ``chunk * S / 2``. A folded 4-bit page's
     per-token scales are a lane vector (the page's last word row), applied by
     a sublane broadcast. `issue(j)` runs among the keys of page pair ``j``.
+    Columns of pages past the request's end hold garbage (callers mask them).
     """
     rows = buf.shape[1]
     half = chunk // 2
@@ -353,19 +354,27 @@ def _chunk_maxima_t(
         (((1,), (1,)), ((), ())),
         preferred_element_type=jnp.float32,
     )  # [2 Bq, half * S]
-    # Each page's maxima land in their lane by a select: reshaping the
-    # [2 Bq, half * S] scores for one max took ~6 relayout ops per page (AOT).
-    lane = jax.lax.broadcasted_iota(jnp.int32, (block_q, chunk), 1)
-    m = jnp.zeros((block_q, chunk), jnp.float32)
+    maxima = []
     for side in range(2):
         side_scores = s[side * block_q : (side + 1) * block_q]
         for j in range(half):
             page = side_scores[:, j * page_size : (j + 1) * page_size]
             if folded:
                 page = page * scale_rows[side][j]
-            mj = jnp.max(page, axis=1, keepdims=True)
-            m = jnp.where(lane == side * half + j, mj, m)
-    return m
+            maxima.append(jnp.max(page, axis=1, keepdims=True))  # [Bq, 1]
+    # Each page's maxima go to their lane by selects, in a balanced tree: a
+    # reshape of the scores for one max took ~6 relayout ops per page, and
+    # a chain of selects through every page serialized them (bench j-08540f0e).
+    lane = jax.lax.broadcasted_iota(jnp.int32, (block_q, chunk), 1)
+
+    def merge(lo, hi):
+        """The maxima of pages ``[lo, hi)``, right on those lanes."""
+        if hi - lo == 1:
+            return jnp.broadcast_to(maxima[lo], (block_q, chunk))
+        mid = (lo + hi) // 2
+        return jnp.where(lane < mid, merge(lo, mid), merge(mid, hi))
+
+    return merge(0, chunk)
 
 
 def _v3_chunk(pages_per_step: int, block_q: int, page_size: int) -> int:
