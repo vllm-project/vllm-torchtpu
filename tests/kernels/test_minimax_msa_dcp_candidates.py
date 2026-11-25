@@ -21,6 +21,9 @@ lowering.
 """
 
 import functools
+import os
+import subprocess
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -41,6 +44,33 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 
 _TOPK = 16
 _BLOCK = 128
+_NO_FMA_FLAG = "--xla_cpu_max_isa=SSE4_2"
+
+
+@pytest.fixture
+def without_fma(request):
+    """Runs the test in a host process without FMA instructions and yields
+    whether this process is it. Interpret mode does the kernel's arithmetic on
+    the host, where XLA turns ``a * b + c`` into an FMA or not by how it fuses
+    the surrounding ops; the TPU's vector unit issues them as a multiply and
+    an add (no FMA in the kernels' LLO), so a bit-exact comparison of two
+    kernel paths holds only on a host doing the same."""
+    if _NO_FMA_FLAG in os.environ.get("XLA_FLAGS", ""):
+        yield True
+        return
+    env = dict(os.environ)
+    env["XLA_FLAGS"] = f"{env.get('XLA_FLAGS', '')} {_NO_FMA_FLAG}"
+    env["JAX_PLATFORMS"] = "cpu"
+    node = f"{request.node.path}::{request.node.name}"
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+        + ["--noconftest", node],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stdout[-4000:]
+    yield False
 
 
 def _pick(scores, pos, rank, *, init_blocks=1, local_blocks=2, **kwargs):
@@ -636,10 +666,13 @@ def test_attention_of_kept_own_candidates(tokens, pages_per_seq, rank, shared):
 @pytest.mark.parametrize("tokens", [8, 24, 48])
 @pytest.mark.parametrize("rank", [0, 1])
 def test_attention_of_word_pages(tokens, rank, monkeypatch):
-    """A decode step's fp8 pages read as 32-bit words (`_words_ring`) give the
-    outputs of the packed-rows read, bit for bit. In interpret mode the host
-    computes the bf16 x fp8 products: this checks the slot order, masks and
-    hit tests, not the MXU's fp8 weights (on device: kbench j-a248f63b)."""
+    """A decode step's fp8 pages read as 32-bit words (`_words_ring`, by
+    `attend`) give the outputs of the packed-rows read, bit for bit. In
+    interpret mode the host computes the bf16 x fp8 products: this checks the
+    slot order, masks and hit tests, not the MXU's fp8 weights (on device:
+    kbench j-a248f63b)."""
+    monkeypatch.setattr(msa_attention_lse, "_ATTEND_WORDS", False)
+    jax.clear_caches()
     args, common = _attend_case(tokens, rank, True, seed=tokens + 7 * rank)
     assert msa_attention_lse._words_ring(args[1], 8, False, 256)
     got = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)
@@ -649,6 +682,52 @@ def test_attention_of_word_pages(tokens, rank, monkeypatch):
     jax.clear_caches()
     for w, g in zip(want, got):
         np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+
+
+def _poison_unwritten(kv_cache, seq_lens, block_tables, rank, dcp=2):
+    """`kv_cache` with NaN bytes in the slots past each sequence's last token
+    on its last page, where this rank holds that page: no row sees them."""
+    cache = np.array(kv_cache).view(np.uint8)
+    pages_per_seq = block_tables.shape[0] // seq_lens.shape[0]
+    for seq, length in enumerate(np.asarray(seq_lens)):
+        block = (length - 1) // _BLOCK
+        if length == 0 or block % dcp != rank:
+            continue
+        page = int(block_tables[seq * pages_per_seq + block // dcp])
+        slots = cache[page].reshape(_BLOCK, -1)  # slot r * 4 + j of [32, 4, 2D]
+        slots[(length - 1) % _BLOCK + 1 :] = 0x7F  # e4m3fn NaN
+    return jnp.asarray(cache.view(jnp.float8_e4m3fn))
+
+
+@pytest.mark.parametrize("tokens", [8, 24, 48])
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("shared", [True, False])
+def test_attend_words_matches_word_read(tokens, rank, shared, monkeypatch, without_fma):
+    """`attend_words` (head blocks, one hit matmul per group, V's unseen slots
+    zeroed by row compares, lane-replicated m and l, the lse row by a select)
+    gives `attend`'s words read's (out, lse) bit for bit: unit-normal fp8
+    values (sums that round), a tile's rows selecting mostly the same pages
+    (`shared`, a request's rows served) or each their own, and NaN bytes in
+    the local pages' unwritten slots."""
+    if not without_fma:
+        return
+    args, common = _attend_case(tokens, rank, shared, seed=tokens + shared)
+    q, kv_cache, candidates, seq_lens, block_tables, cu = args
+    values = np.random.default_rng(rank).standard_normal(kv_cache.shape)
+    kv_cache = jnp.asarray(values, jnp.float8_e4m3fn)
+    kv_cache = _poison_unwritten(kv_cache, seq_lens, block_tables, rank)
+    args = (q, kv_cache, candidates, seq_lens, block_tables, cu)
+    assert msa_attention_lse._words_ring(kv_cache, 8, False, 256)
+    got = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)
+    monkeypatch.setattr(msa_attention_lse, "_ATTEND_WORDS", False)
+    jax.clear_caches()
+    want = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)
+    jax.clear_caches()
+    assert np.isfinite(np.asarray(got[0], np.float32)).all()
+    for w, g in zip(want, got):
+        np.testing.assert_array_equal(
+            np.asarray(g).view(np.uint8), np.asarray(w).view(np.uint8)
+        )
 
 
 @pytest.mark.parametrize("tokens", [8, 24, 48])

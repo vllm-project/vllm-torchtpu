@@ -56,6 +56,12 @@ _SMALL_BATCH_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
 # `words` page ring (`_words_ring`).
 _WORD_PACKING = 4
 _WORD_ROW_LANES = 128
+# `words` group steps of at least this many pages run their rows as two
+# blocks of heads (`attend_words`).
+_WORDS_SPLIT_WIDTH = 8
+# `words` pages run `attend_words`; False runs `attend`'s words read, the
+# reference it is tested against bit for bit.
+_ATTEND_WORDS = True
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -382,6 +388,111 @@ def _kernel(
             put((acc_t * (1.0 / jnp.maximum(denom, 1.0))).T)
             lse_ref[...] = (m * _LN_2 + jnp.log(denom)).reshape(lse_ref.shape)
 
+        def attend_words(width, single):
+            """`attend` for `words` pages (`_words_ring`). From
+            `_WORDS_SPLIT_WIDTH` pages on, the tile's rows run as two blocks of
+            heads whose QK products are all issued first, so the first
+            block's max, exp2 and p @ v run while the second's products are in
+            flight (each block pushes the pages again; every row's products,
+            sums and their order are the one block's). m and l stay
+            lane-replicated in their scratch, so neither the carried max nor
+            the lse row takes a lane broadcast or transpose on the XLU."""
+            slots = msa_attention._bitcast_slots(rows_per_page, packing).T  # [1, S]
+            pages = [
+                work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
+                for g in range(width)
+            ]
+            limits = _group_lane_limits(
+                selected_ref[...],
+                local_page_ref[...],
+                local_limit_ref[...],
+                pages,
+                page_size,
+            )  # [Bq, S] each
+            # K as stored: its stale slots' scores are masked, so K's pushes
+            # do not wait on the limits.
+            k = jnp.concatenate(
+                [
+                    pltpu.bitcast(
+                        kv_ref[pl.ds(0, rows_per_page, stride=2), :], kv_hbm_dtype
+                    )
+                    for kv_ref in kv_refs[:width]
+                ],
+                axis=0,
+            )
+            mask = jnp.concatenate([slots < limit for limit in limits], axis=1)
+            # Rows are head-major (h * Bq + t): every head shares a token's mask.
+            mask = jnp.concatenate([mask] * num_heads, axis=0)
+            q = q_ref[...].reshape(num_heads * block_q, head_dim)
+            q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
+            blocks = 2 if width >= _WORDS_SPLIT_WIDTH and num_heads % 2 == 0 else 1
+            rows = num_heads * block_q // blocks
+            parts = [slice(b * rows, (b + 1) * rows) for b in range(blocks)]
+            scores = [
+                jax.lax.dot_general(
+                    q[r],
+                    k,
+                    (((1,), (1,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                for r in parts
+            ]
+            v = jnp.concatenate(
+                [
+                    _zero_unseen_slots(
+                        kv_ref[pl.ds(1, rows_per_page, stride=2), :],
+                        jnp.max(limit, axis=0, keepdims=True),
+                    )
+                    for kv_ref, limit in zip(kv_refs[:width], limits)
+                ],
+                axis=0,
+            )
+            v = pltpu.bitcast(v, kv_hbm_dtype)
+            # m, l [rows, 128] (carried) or [rows, 1] act on acc [rows, D]
+            # lane by lane: D = 128 (`_words_ring`).
+            state = []  # (rows, m, l, acc) of each block
+            for r, s in zip(parts, scores):
+                s = jnp.where(mask[r], s, -jnp.inf)
+                m_prev = msa_attention._MASK_VALUE if single else m_ref[r]
+                m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
+                p = jnp.exp2(s - _tile_lanes(m_new, s.shape[1]))
+                l_cur = jnp.sum(p, axis=1, keepdims=True)
+                pv = jax.lax.dot_general(
+                    p.astype(jnp.bfloat16),
+                    v,
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                if single:
+                    state.append((r, m_new, l_cur, pv))
+                    continue
+                alpha = jnp.exp2(m_prev - m_new)
+                state.append(
+                    (r, m_new, alpha * l_ref[r] + l_cur, alpha * acc_ref[r] + pv)
+                )
+
+            def finish_words():
+                """`finish` of the blocks' states."""
+                outs = [acc * (1.0 / jnp.maximum(d, 1.0)) for _, _, d, acc in state]
+                put(jnp.concatenate(outs, axis=0))
+                lse = [
+                    _lane_row(m * _LN_2 + jnp.log(d), r.start, num_heads * block_q)
+                    for r, m, d, _ in state
+                ]
+                lse_ref[...] = functools.reduce(jnp.maximum, lse).reshape(lse_ref.shape)
+
+            if single:
+                finish_words()
+                return
+            pl.when(last)(finish_words)
+
+            @pl.when(jnp.logical_not(last))
+            def _carry():
+                for r, m, denom, acc in state:
+                    m_ref[r] = m
+                    l_ref[r] = denom
+                    acc_ref[r] = acc
+
         def attend(width, single):
             """One softmax update over the group's first `width` slots; a
             `single` group (the tile's only one) needs no carried state."""
@@ -502,7 +613,12 @@ def _kernel(
             fits = count > (widths[i - 1] if i else 0)
             if width < pages_per_step:
                 fits = fits & (count <= width)
-            body = attend_t if transposed else attend
+            if transposed:
+                body = attend_t
+            elif words and _ATTEND_WORDS:
+                body = attend_words
+            else:
+                body = attend
             pl.when(fits & single)(functools.partial(body, width, True))
             pl.when(fits & jnp.logical_not(single))(
                 functools.partial(body, width, False)
@@ -583,6 +699,32 @@ def _words_ring(kv_cache, block_q: int, fp4: bool, row_width: int) -> bool:
     )
 
 
+def _group_lane_limits(selected, local_page, local_limit, pages, page_size):
+    """`attend_words`' visible-slot limit of each row for each of `pages`, as
+    full ``[Bq, S]`` tiles (``S`` = a vreg's lanes): the row's `local_limit`
+    on its local page, all of a page it selected, else 0. The hit tests of
+    all pages are one 0/1 matmul against ones, whose product lands on every
+    lane: a cross-lane maximum and lane broadcast per page queued on the XLU
+    behind the softmax's reductions, and a matmul per page pushed the ones
+    again for each."""
+    block_q, topk = selected.shape
+    matches = [(selected == page).astype(jnp.bfloat16) for page in pages]
+    hits = jax.lax.dot_general(
+        jnp.concatenate(matches, axis=0),
+        jnp.ones((topk, page_size), jnp.bfloat16),
+        (((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )  # [pages * Bq, S]: the row's selections equal to the page, on every lane
+    local_page = jnp.broadcast_to(local_page, (block_q, page_size))
+    local_limit = jnp.broadcast_to(local_limit, (block_q, page_size))
+    limits = []
+    for g, page in enumerate(pages):
+        hit = hits[g * block_q : (g + 1) * block_q] > 0
+        limit = jnp.where(local_page == page, local_limit, page_size)
+        limits.append(jnp.where((page >= 0) & hit, limit, 0))
+    return limits
+
+
 def _lane_limits(selected, local_page, local_limit, page_size):
     """`attend`'s visible-slot limit of each row for a page, as a full
     ``[Bq, S]`` tile (``S`` = a vreg's lanes): ``page -> limit``, the row's
@@ -606,6 +748,44 @@ def _lane_limits(selected, local_page, local_limit, page_size):
         return jnp.where((page >= 0) & (hits > 0), limit, 0)
 
     return limits
+
+
+def _zero_unseen_slots(words, seen):
+    """A `words` page's V words ``[S / 4, D]`` (word row ``r`` holds slots
+    ``4 r .. 4 r + 3``, slot ``4 r + j`` in byte ``j``) with the slots ``>=
+    seen`` zeroed, as `msa_attention._word_rows`: rows by compares of their
+    first and last slot, the row holding `seen` by a byte mask built once
+    per page (5 ops per word vreg; a mask per byte took 12)."""
+    first = jax.lax.broadcasted_iota(jnp.int32, (words.shape[0], 1), 0)
+    first = first * _WORD_PACKING
+    bits = ((seen & (_WORD_PACKING - 1)) * 8).astype(jnp.uint32)
+    partial = jnp.left_shift(jnp.uint32(1), bits) - 1  # [1, S]
+    keep = jnp.where(
+        first + _WORD_PACKING <= seen,
+        jnp.uint32(0xFFFFFFFF),
+        jnp.where(first < seen, partial, jnp.uint32(0)),
+    )
+    return words & keep
+
+
+def _tile_lanes(column, lanes):
+    """``column [R, 1]``, or lane-replicated ``[R, 128]`` copied along the
+    lanes, broadcast against ``[R, lanes]``."""
+    if column.shape[1] == 1:
+        return column
+    return jnp.concatenate([column] * (lanes // column.shape[1]), axis=1)
+
+
+def _lane_row(column, start, lanes):
+    """A lane-replicated ``column [R, 1 or 128]`` (rows ``start ..`` of a
+    tile) as a ``[1, lanes]`` row: row ``i``'s value at lane ``start + i``,
+    -inf elsewhere. A select and a sublane maximum; a transpose of the column
+    was a chain on the XLU at the end of every step."""
+    rows = column.shape[0]
+    values = jnp.broadcast_to(column[:, :1], (rows, lanes))
+    row = jax.lax.broadcasted_iota(jnp.int32, (rows, lanes), 0) + start
+    lane = jax.lax.broadcasted_iota(jnp.int32, (rows, lanes), 1)
+    return jnp.max(jnp.where(row == lane, values, -jnp.inf), axis=0, keepdims=True)
 
 
 def _any_hit(matches, axis):
@@ -847,6 +1027,7 @@ def _attention_call(
         ]
     scale_inputs = (scale_cache,) if fp4 else ()
     ring = 1 + (_FP4_PREFETCH if fp4 else _WORDS_PREFETCH if words else 1)
+    ml_lanes = _WORD_ROW_LANES if words and _ATTEND_WORDS else 1
     scale_scratch = (
         (
             pltpu.VMEM((ring, pages_per_step, 1) + scale_cache.shape[1:], jnp.float32),
@@ -871,11 +1052,12 @@ def _attention_call(
         ],
         out_specs=out_specs,
         scratch_shapes=[
-            # m, l, acc: rows on sublanes for `attend`, lanes for `attend_t`.
+            # m, l, acc: rows on sublanes for `attend` (m and l lane-replicated
+            # for `attend_words`), lanes for `attend_t`.
             *(
                 [
-                    pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
-                    pltpu.VMEM((num_heads * block_q, 1), jnp.float32),
+                    pltpu.VMEM((num_heads * block_q, ml_lanes), jnp.float32),
+                    pltpu.VMEM((num_heads * block_q, ml_lanes), jnp.float32),
                     pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
                 ]
                 if not transposed
