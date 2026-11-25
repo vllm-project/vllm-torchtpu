@@ -221,27 +221,37 @@ def test_scatter_from_history_negative_control():
         _bytes(jax.lax.bitcast_convert_type(want, jnp.uint8)))
 
 
-@pytest.mark.parametrize("cap", [48, 32])
-def test_cktab_and_conv_are_row_capped(monkeypatch, cap):
+@pytest.mark.parametrize("cap,pcap", [(48, 32), (32, 64)])
+def test_row_capped_levers(monkeypatch, cap, pcap):
     """cktab / conv switch off above VLLM_TPU_MK_IO_LEAN_MAX_ROWS rows (c32 b64 qsa_select
-    placement flip); the other levers and rows=None are not capped."""
+    placement flip), pleconv above VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS (slower stock
+    decode PLE conv); the other levers and rows=None are not capped."""
+    from vllm_torchtpu.megakernel_runtime.qwen38_io_lean import ROW_CAPPED
     from vllm_torchtpu.megakernel_runtime.qwen38_io_lean import io_lean as lean
 
+    assert ROW_CAPPED == {"cktab", "conv", "pleconv"}
     monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "all", raising=False)
     monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN_MAX_ROWS", cap, raising=False)
-    for rows in (4, 8, 16, 24, 32, 48, 64, 96):
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS", pcap, raising=False)
+    for rows in (4, 8, 16, 24, 32, 40, 48, 56, 64, 96, 128):
         for lever in ("cktab", "conv"):
             assert lean(lever, rows=rows) == (rows <= cap), (lever, rows)
-        for lever in ("ring", "rope", "ple", "pleconv"):
+        assert lean("pleconv", rows=rows) == (rows <= pcap), rows
+        for lever in ("ring", "rope", "ple"):
             assert lean(lever, rows=rows)
-    assert lean("cktab") and lean("conv")
+    assert lean("cktab") and lean("conv") and lean("pleconv")
     monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "ring", raising=False)
     assert not lean("cktab", rows=8) and not lean("conv", rows=8)
+    assert not lean("pleconv", rows=8)
 
 
 def test_max_rows_registered_default_48(monkeypatch):
     monkeypatch.delenv("VLLM_TPU_MK_IO_LEAN_MAX_ROWS", raising=False)
     assert envs.environment_variables["VLLM_TPU_MK_IO_LEAN_MAX_ROWS"]() == 48
+    monkeypatch.delenv("VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS", raising=False)
+    assert envs.environment_variables["VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS"]() == 32
+    monkeypatch.setenv("VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS", "64")
+    assert envs.environment_variables["VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS"]() == 64
 
 
 def test_self_check_line_and_once(monkeypatch, caplog):
@@ -250,25 +260,26 @@ def test_self_check_line_and_once(monkeypatch, caplog):
     from vllm_torchtpu.megakernel_runtime import qwen38_io_lean as il
 
     monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN_MAX_ROWS", 48, raising=False)
+    monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS", 32, raising=False)
     monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "", raising=False)
     monkeypatch.setattr(envs, "VLLM_TPU_MK_PLE_TRIM", False, raising=False)
     assert il.io_lean_line() is None
     monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "all", raising=False)
     monkeypatch.setattr(envs, "VLLM_TPU_MK_PLE_TRIM", True, raising=False)
     assert il.io_lean_line() == (
-        "MK_IO_LEAN levers=ring,cktab,rope,conv,ple,pleconv max_rows=48 ple_trim=1"
+        "MK_IO_LEAN levers=ring,cktab,rope,conv,ple,pleconv max_rows=48 pleconv_max_rows=32 ple_trim=1"
     )
     monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "", raising=False)
-    assert il.io_lean_line() == "MK_IO_LEAN levers=none max_rows=48 ple_trim=1"
+    assert il.io_lean_line() == "MK_IO_LEAN levers=none max_rows=48 pleconv_max_rows=32 ple_trim=1"
     monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", "rope,ring", raising=False)
     monkeypatch.setattr(envs, "VLLM_TPU_MK_PLE_TRIM", False, raising=False)
-    assert il.io_lean_line() == "MK_IO_LEAN levers=ring,rope max_rows=48 ple_trim=0"
+    assert il.io_lean_line() == "MK_IO_LEAN levers=ring,rope max_rows=48 pleconv_max_rows=32 ple_trim=0"
     monkeypatch.setattr(il, "_SELF_CHECK_LOGGED", False)
     with caplog.at_level(logging.INFO):
         il.log_io_lean_once()
         il.log_io_lean_once()
     assert [r.getMessage() for r in caplog.records if "MK_IO_LEAN levers" in r.getMessage()] == [
-        "MK_IO_LEAN levers=ring,rope max_rows=48 ple_trim=0"
+        "MK_IO_LEAN levers=ring,rope max_rows=48 pleconv_max_rows=32 ple_trim=0"
     ]
 
 
