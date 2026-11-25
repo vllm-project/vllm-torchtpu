@@ -107,21 +107,28 @@ def test_copy_blocks(debug_checks):
 def test_copy_blocks_replaces_a_pair_outside_the_pool_by_the_null_pair(mode):
     """The real copy kernel, on TPU or in Pallas's TPU interpret mode on the
     host (which raises on a block index outside the pool): each pair that
-    joins a live block to an index outside the pool copies nothing."""
-    pool = _pool()
-    before = np.asarray(pool)
-    # Each bad index is joined to a live block, as src and as dst.
-    src = jnp.asarray([2, NB, -1, 1, 2**31 - 1, 1], dtype=jnp.int32)
-    dst = jnp.asarray([3, 1, 1, NB, 1, -1], dtype=jnp.int32)
-
+    joins a live block to an index outside the pool copies nothing. The
+    interpret run is pinned to the CPU device, which it needs even where the
+    default device is a TPU."""
+    interpret = mode == "interpret"
     with (
-        pltpu.force_tpu_interpret_mode(pltpu.InterpretParams())
-        if mode == "interpret"
+        jax.default_device(jax.devices("cpu")[0])
+        if interpret
         else contextlib.nullcontext()
     ):
-        pool = pool_adapters.copy_blocks(pool, src, dst)
+        pool = _pool()
+        before = np.asarray(pool)
+        # Each bad index is joined to a live block, as src and as dst.
+        src = jnp.asarray([2, NB, -1, 1, 2**31 - 1, 1], dtype=jnp.int32)
+        dst = jnp.asarray([3, 1, 1, NB, 1, -1], dtype=jnp.int32)
+        with (
+            pltpu.force_tpu_interpret_mode(pltpu.InterpretParams())
+            if interpret
+            else contextlib.nullcontext()
+        ):
+            pool = pool_adapters.copy_blocks(pool, src, dst)
+        after = np.asarray(pool)
 
-    after = np.asarray(pool)
     np.testing.assert_array_equal(after[3], before[2])
     for block in (0, 1, 2):
         np.testing.assert_array_equal(after[block], before[block])
@@ -131,14 +138,17 @@ def test_copy_blocks_debug_check_raises_on_the_host():
     """With `pl.enable_debug_checks`, the real kernel under `jax.jit` in
     Pallas's TPU interpret mode on the host: valid pairs copy as without the
     flag, and a pair outside the pool raises. The kernel's `pl.debug_check`
-    does nothing in interpret mode; the host callback raises."""
-    pool = _pool()
-    before = np.asarray(pool)
+    does nothing in interpret mode; the host callback raises. Pinned to the
+    CPU device: on a TPU device the program would take the TPU branch, which
+    has no callback."""
     copy = jax.jit(pool_adapters.copy_blocks)
     with (
+        jax.default_device(jax.devices("cpu")[0]),
         pl.enable_debug_checks(True),
         pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()),
     ):
+        pool = _pool()
+        before = np.asarray(pool)
         after = np.asarray(
             copy(pool, jnp.asarray([2, 0], jnp.int32), jnp.asarray([3, 0], jnp.int32))
         )

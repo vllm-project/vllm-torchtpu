@@ -146,8 +146,10 @@ def test_the_debug_check_reports_a_replaced_pair(program):
         run = row_copy_program(num_pools=2, split=2, step_rows=2)
         num_blocks = POOL_ROWS * 2
         count, first = 12, r"\(-2, -2\)"  # 2 steps per marked row; the first step
-    pool = _rows_pool()
-    with numpy_copy_kernel():
+    # On a TPU device the programs would take the TPU branch, which has no
+    # callback: pin the host report to the CPU device.
+    with jax.default_device(jax.devices("cpu")[0]), numpy_copy_kernel():
+        pool = _rows_pool()
         run(pool, *_indices(PAIRS))  # debug checks off: replaced, not reported
         jax.effects_barrier()
         with pl.enable_debug_checks(True):
