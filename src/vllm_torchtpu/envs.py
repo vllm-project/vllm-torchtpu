@@ -20,7 +20,6 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_DECODE_FUSION: str = "auto"
     TPU_DEEPSEEK_V41_INDEXER_ISSUE_DEPTH: int | None = 12
     TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS: bool = True
-    TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES: bool = True
     TPU_DEEPSEEK_V41_MHC_EARLY_PREP: bool = True
     TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
     TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
@@ -504,13 +503,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default off until measured.
     "TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS": env_bool(
         "TPU_DEEPSEEK_V41_REUSE_WINDOW_STARTS", default=True
-    ),
-    # Shifted mHC: emit the next layer's gates T tokens wide (not padded to a
-    # multiple of 128) and read them as compiler-managed VMEM inputs, so the
-    # gates pass between layers without slice/transpose ops. Layout only;
-    # outputs are unchanged.
-    "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES": env_bool(
-        "TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES", default=True
     ),
     # Shifted mHC: build the first tile's gate coefficients while the first
     # activation tiles are still in flight (scheduling only; outputs unchanged).

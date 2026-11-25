@@ -130,19 +130,11 @@ def _post_pre_rms_jax(
         sinkhorn_repeat=repeats,
         norm_weight=norm_weight,
         norm_eps=norm_eps,
-        **_gate_layout(),
+        early_prep=envs.TPU_DEEPSEEK_V41_MHC_EARLY_PREP,
     )
     if padded == tokens:
         return outputs
     return cast(Any, tuple(out[:tokens] for out in outputs))
-
-
-def _gate_layout() -> dict:
-    layout: dict = {"early_prep": envs.TPU_DEEPSEEK_V41_MHC_EARLY_PREP}
-    if envs.TPU_DEEPSEEK_V41_MHC_RESIDENT_GATES:
-        layout["unpadded_gates"] = True
-        layout["gate_input_mode"] = shifted_post_pre_rms.GateInputMode.COMPILER
-    return layout
 
 
 def initialize_shifted_mhc() -> None:
