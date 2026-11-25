@@ -98,6 +98,7 @@ def _batched_fn(
     their context latents, then their control entries. Module-level so tests
     can drive it with stubs."""
     width, pages = dspark.ROWS, control.pages
+    (mla_kernel,) = kernel_modules("dspark_mla_kernel")
     count = len(names)
     R, k = len(index), rows_per
     total = R * k
@@ -128,14 +129,16 @@ def _batched_fn(
         bases = positions.reshape(R, k)[:, 0]
         vectors, latents = fused(
             weights,
-            pools,
-            aux,
-            logits[0].reshape(R, k, logits.shape[-1]),
-            previous,
-            bases,
-            decisions[:, 0],
-            decisions[:, 1],
-            tables,
+            mla_kernel.MlaDraftStepInputs(
+                pools=pools,
+                aux=aux,
+                logits=logits[0].reshape(R, k, logits.shape[-1]),
+                previous=previous,
+                position=bases,
+                forced_count=decisions[:, 0],
+                forced_anchor=decisions[:, 1],
+                tables=tables,
+            ),
         )
         row_positions = (
             bases[:, None] + jnp.arange(k, dtype=jnp.int32)[None, :]
@@ -389,7 +392,12 @@ class MlaDsparkDraft:
         dspark, rows, names = self.dspark, self.dspark.ROWS, self.names
         count, layers, pages = len(names), self.config.layers, control.pages
         fused = self.kernel.fused_draft_local(
-            self.config, requests=1, pages=pages, owner_table=self.owner_table
+            self.config,
+            self.kernel.MlaDraftLocalConfig(
+                pages=pages,
+                requests=1,
+                owner_table=self.owner_table,
+            ),
         )
 
         def body(*args):
@@ -402,14 +410,16 @@ class MlaDsparkDraft:
             table = ids[3 * rows + 1 : 3 * rows + 1 + pages]
             vector, latents = fused(
                 weights,
-                pools,
-                aux,
-                logits,
-                previous,
-                base[None],
-                decisions[:, 0],
-                decisions[:, 1],
-                table[None],
+                self.kernel.MlaDraftStepInputs(
+                    pools=pools,
+                    aux=aux,
+                    logits=logits,
+                    previous=previous,
+                    position=base[None],
+                    forced_count=decisions[:, 0],
+                    forced_anchor=decisions[:, 1],
+                    tables=table[None],
+                ),
             )
             positions = base + jnp.arange(rows, dtype=jnp.int32)
             pools = self._commit(
@@ -494,12 +504,14 @@ class MlaDsparkDraft:
         whole = index == tuple(range(verified))
         fused = self.kernel.fused_draft_local(
             self.config,
-            requests=R,
-            pages=control.pages,
-            block=min(self.config.block, k - 1),
-            rows=k,
-            owner_table=self.owner_table,
-            attention_dp=dp,
+            self.kernel.MlaDraftLocalConfig(
+                pages=control.pages,
+                requests=R,
+                block=min(self.config.block, k - 1),
+                rows=k,
+                owner_table=self.owner_table,
+                attention_dp=dp,
+            ),
         )
         body = _batched_fn(
             self.dspark, fused, self._commit, control, names, layers, index, verified, k
