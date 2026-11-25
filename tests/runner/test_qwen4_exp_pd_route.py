@@ -471,23 +471,59 @@ def test_a_consumer_built_without_init_takes_the_broadcast_path():
     assert int(s.free.sum()) == 15
 
 
-@pytest.mark.parametrize("layout", [{"merged_compressed": True}, {"main_dcp": 2}])
-def test_routed_staging_refuses_a_merged_key_or_pcp_producer(monkeypatch, layout):
-    """pd_route models a plain TP1 producer. A producer with merged compressed
-    keys or a PCP producer's split main KV (main_dcp > 1 on its layout) must
-    fail when either leg builds the route, not be mis-routed."""
+_REFUSAL = "supports a TP1 producer only"
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        {"merged_compressed": True, "merged_key_span": 2},
+        {"merged_compressed": True, "split_compressed": True},
+        {"main_dcp": 2},
+    ],
+)
+def test_routed_staging_refuses_a_spanned_or_split_key_or_pcp_producer(monkeypatch, layout):
+    """pd_route models a TP1 producer with one main-KV page per ID. Merged keys
+    spanning several columns per ID (PCP), split merged keys, or a PCP
+    producer's split main KV (main_dcp > 1 on its layout) must fail when
+    either leg builds the route, not be mis-routed."""
     monkeypatch.setenv("QWEN4_EXP_PD_ROUTED_DST", "8:4:512")
     row = ROWS * LANES
     dst = SimpleNamespace(token_bytes=row, block_size=512)
     rank = SimpleNamespace(tp_size=8, main_dcp=4)
     plain = SimpleNamespace(token_bytes=row, block_size=3200, merged_compressed=False, main_dcp=1)
-    with pytest.raises(ValueError, match="plain TP1 producer"):
+    with pytest.raises(ValueError, match=_REFUSAL):
         st.route_geometry_for(None, SimpleNamespace(**{**plain.__dict__, **layout}), dst, rank)
-    # Control: the plain producer passes this check and fails later, on the
-    # missing model config, for a different reason.
-    with pytest.raises(Exception) as other:
-        st.route_geometry_for(None, plain, dst, rank)
-    assert "plain TP1 producer" not in str(other.value)
+    # Controls: the plain producer, and a TP1 pipeline producer with merged keys
+    # of one column per ID, pass this check and fail later, on the missing model
+    # config, for a different reason.
+    merged = SimpleNamespace(**{**plain.__dict__, "merged_compressed": True, "merged_key_span": 1})
+    for ok in (plain, merged):
+        with pytest.raises(Exception) as other:
+            st.route_geometry_for(None, ok, dst, rank)
+        assert _REFUSAL not in str(other.value)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 320, 383, 1000, 2049])
+def test_merged_producer_key_blocks_route_and_land_like_unmerged_pages(num_tokens):
+    """QWEN4_EXP_MERGE_COMPRESSED_K on the producer: a QSA layer's keys for main-KV
+    ID c are one key block (the live rows of an unmerged keys page, in order) in
+    the carrier's region, listed as a pool on the main-KV IDs. The producer's
+    routed spans read each block from offset 0 exactly as they read an unmerged
+    page's live rows, so the decode lands the same bytes."""
+    rng = np.random.default_rng(7 + num_tokens)
+    prod, tables = producer_pages(num_tokens, rng), dst_tables(num_tokens, rng)
+    live = GEO.pairs_per_src_page * RB
+    merged = dict(prod)
+    for name in owners():
+        if st.owner_kind(name) == "compressed":
+            # Only the key block exists on a merged producer: the page tail is gone.
+            flat = prod[name].reshape(len(prod[name]), -1)[:, :live]
+            merged[name] = np.ascontiguousarray(flat)
+    for r in range(TP):
+        want, _ = routed_landing(num_tokens, 0, rank_slice(r), prod, tables)
+        got, _ = routed_landing(num_tokens, 0, rank_slice(r), merged, tables)
+        np.testing.assert_array_equal(got, want)
 
 
 # --- VLLM_TPU_QSA_COMPRESSED_DCP: split compressed keys, routed staging ---------

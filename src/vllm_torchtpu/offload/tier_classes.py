@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.v1.kv_offload.base import (
@@ -117,6 +117,11 @@ class TierClass:
     # Device rows a scheduler page spans in this class's registered views (1: whole-page
     # rows).
     rows_per_page: int = 1
+    # A mirror class (merged compressed keys, QWEN4_EXP_MERGE_COMPRESSED_K) holds a second
+    # copy-set of another class's groups: every key of those groups is stored, loaded and
+    # looked up in both. Its views start ``row_offset`` rows into each region.
+    mirror: bool = False
+    row_offset: int = 0
 
     @property
     def per_checkpoint(self) -> bool:
@@ -183,6 +188,7 @@ def build_tier_plan(
     key_row_bytes: int | None = None,
     main_row_bytes: int | None = None,
     gdn_row_bytes: int | None = None,
+    merged_key_row_bytes: int | None = None,
 ) -> TierPlan:
     """Splits the offloaded groups into classes and sizes them.
 
@@ -195,6 +201,11 @@ def build_tier_plan(
     page in MXFP4: the ``main`` class keeps that many bytes a region (registered as rows
     of the workers' staging buffers, not of the pool). ``gdn_row_bytes``
     (VLLM_TPU_OFFLOAD_FP4_GDN) does the same for the ``gdn`` classes.
+    ``merged_key_row_bytes``, when set (QWEN4_EXP_MERGE_COMPRESSED_K: no compressed-key
+    group, each QSA layer's keys for block ``b`` are ``merged_key_row_bytes`` at row
+    ``cols * num_blocks + b`` of its main-KV region, ``cols = page / merged_key_row_bytes``),
+    adds a ``keys`` mirror class over the ``main`` class's groups and regions that keeps
+    those rows.
     """
     if not worker_configs:
         raise ValueError("host tier classes: no per-worker KV cache configs recorded")
@@ -275,6 +286,10 @@ def build_tier_plan(
                 rows_per_page=rows_per_page,
             )
         )
+    if merged_key_row_bytes is not None:
+        classes = _with_merged_key_mirror(
+            classes, page, merged_key_row_bytes, worker_configs
+        )
     token = sum(
         len(c.groups) * c.bytes_per_entry for c in classes if not c.per_checkpoint
     )
@@ -300,6 +315,49 @@ def build_tier_plan(
             f"for {empty}: {plan.describe()}"
         )
     return plan
+
+
+def _with_merged_key_mirror(
+    classes: list[TierClass], page: int, row_bytes: int, worker_configs: Sequence[Any]
+) -> list[TierClass]:
+    """``classes`` with a ``keys`` mirror of the ``main`` class right after it."""
+    if row_bytes <= 0 or page % row_bytes:
+        raise ValueError(
+            f"host tier classes: merged compressed-key rows of {row_bytes} B do not "
+            f"tile a {page} B page"
+        )
+    if any(c.kind == "keys" for c in classes):
+        raise ValueError(
+            "host tier classes: merged compressed keys, yet a compressed-key group "
+            "is planned"
+        )
+    mains = [c for c in classes if c.kind == "main"]
+    if len(mains) != 1:
+        raise ValueError(
+            "host tier classes: merged compressed keys need exactly one main-KV class, "
+            f"got {[c.name for c in mains]}"
+        )
+    blocks = {cfg.num_blocks for cfg in worker_configs}
+    if len(blocks) != 1:
+        raise ValueError(
+            f"host tier classes: merged compressed keys need one block count, got {blocks}"
+        )
+    (num_blocks,) = blocks
+    (main,) = mains
+    mirror = TierClass(
+        name="keys",
+        index=0,
+        kind="keys",
+        groups=main.groups,
+        worker_regions=main.worker_regions,
+        row_bytes=row_bytes,
+        rows_per_page=1,
+        mirror=True,
+        row_offset=(page // row_bytes) * num_blocks,
+    )
+    at = classes.index(main) + 1
+    out = classes[:at] + [mirror] + classes[at:]
+    return [replace(c, index=i) for i, c in enumerate(out)]
 
 
 def check_served_plan(plan: TierPlan) -> None:
@@ -375,7 +433,15 @@ class TieredOffloadingManager(OffloadingManager):
         self._plan = plan
         self._classes = plan.classes
         self._managers = list(managers)
-        self._class_of_group = {g: c.index for c in plan.classes for g in c.groups}
+        self._class_of_group = {
+            g: c.index for c in plan.classes if not c.mirror for g in c.groups
+        }
+        # Mirror classes (merged compressed keys) by the groups they copy.
+        self._mirrors_of_group: dict[int, tuple[int, ...]] = {}
+        for c in plan.classes:
+            if c.mirror:
+                for g in c.groups:
+                    self._mirrors_of_group[g] = self._mirrors_of_group.get(g, ()) + (c.index,)
         self._parents: dict[int, _Parent] = {}
         self._finished: list[FinishedJob] = []
         self._load_keys = [0] * len(managers)
@@ -493,17 +559,34 @@ class TieredOffloadingManager(OffloadingManager):
                 f"host tier classes: group {group} belongs to no class"
             ) from None
 
+    def classes_of(self, key: OffloadKey) -> tuple[int, ...]:
+        """The key's class, then the mirror classes that also hold it."""
+        c = self.class_of(key)
+        if not self._mirrors_of_group:
+            return (c,)
+        return (c,) + self._mirrors_of_group.get(get_offload_group_idx(key), ())
+
     def _split(
         self, keys: Iterable[OffloadKey], device_block_ids: Sequence[int] | None = None
     ) -> dict[int, tuple[list[OffloadKey], list[int]]]:
-        """Keys (and their block IDs) by class, each class keeping the job's order."""
+        """Keys (and their block IDs) by class, each class keeping the job's order. A
+        key of a mirrored group goes to its class and to each mirror."""
         parts: dict[int, tuple[list[OffloadKey], list[int]]] = {}
         for i, key in enumerate(keys):
-            ks, ids = parts.setdefault(self.class_of(key), ([], []))
-            ks.append(key)
-            if device_block_ids is not None:
-                ids.append(device_block_ids[i])
+            for c in self.classes_of(key):
+                ks, ids = parts.setdefault(c, ([], []))
+                ks.append(key)
+                if device_block_ids is not None:
+                    ids.append(device_block_ids[i])
         return dict(sorted(parts.items()))
+
+    def _chosen_by_all(
+        self, keys: list[OffloadKey], chosen: dict[int, set[OffloadKey]]
+    ) -> list[OffloadKey]:
+        """Keys every one of their classes chose, in order."""
+        return [
+            k for k in keys if all(k in chosen.get(c, ()) for c in self.classes_of(k))
+        ]
 
     def _runs(self, keys: Sequence[OffloadKey]) -> list[tuple[int, list[OffloadKey]]]:
         """Maximal runs of consecutive keys of one class, in order."""
@@ -522,12 +605,26 @@ class TieredOffloadingManager(OffloadingManager):
         return RequestOffloadingContext()
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
-        return self._managers[self.class_of(key)].lookup(key, req_context)
+        classes = self.classes_of(key)
+        result = self._managers[classes[0]].lookup(key, req_context)
+        if len(classes) == 1 or result == LookupResult.MISS:
+            return result
+        # A mirrored key hits only where every copy does.
+        results = [result] + [
+            self._managers[c].lookup(key, req_context) for c in classes[1:]
+        ]
+        for worst in (LookupResult.MISS, LookupResult.RETRY, LookupResult.HIT_PENDING):
+            if worst in results:
+                return worst
+        return LookupResult.HIT
 
     def host_resident_prefix(self, keys: list[OffloadKey]) -> int:
         resident = 0
         for c, run in self._runs(list(keys)):
             found = self._managers[c].host_resident_prefix(run)
+            for m in self._mirrors_of_group.get(get_offload_group_idx(run[0]), ()):
+                if found:
+                    found = min(found, self._managers[m].host_resident_prefix(run[:found]))
             resident += found
             if found < len(run):
                 break
@@ -564,8 +661,15 @@ class TieredOffloadingManager(OffloadingManager):
                     )
                 return None
             outputs.append((c, output))
-        chosen = {k for _, output in outputs for k in output.keys_to_store}
-        keys_to_store = [k for k in keys if k in chosen]
+        chosen = {c: set(output.keys_to_store) for c, output in outputs}
+        keys_to_store = self._chosen_by_all(keys, chosen)
+        if self._mirrors_of_group:
+            # A mirrored key one copy took and another did not: give it back.
+            stored = set(keys_to_store)
+            for c, output in outputs:
+                extra = [k for k in output.keys_to_store if k not in stored]
+                if extra:
+                    self._managers[c].on_store_job_cancelled(extra)
         return PrepareStoreOutput(
             keys_to_store=keys_to_store,
             store_spec=RaidenLoadStoreSpec(keys_to_store),
@@ -578,10 +682,19 @@ class TieredOffloadingManager(OffloadingManager):
 
     def prepare_victim_store(self, keys) -> list[OffloadKey]:
         keys = list(keys)
-        chosen: set[OffloadKey] = set()
+        chosen: dict[int, set[OffloadKey]] = {}
         for c, (ks, _) in self._split(keys).items():
-            chosen.update(self._managers[c].prepare_victim_store(ks))
-        return [k for k in keys if k in chosen]
+            chosen[c] = set(self._managers[c].prepare_victim_store(ks))
+        if not self._mirrors_of_group:
+            picked = set().union(*chosen.values()) if chosen else set()
+            return [k for k in keys if k in picked]
+        out = self._chosen_by_all(keys, chosen)
+        kept = set(out)
+        for c, ks in chosen.items():
+            extra = [k for k in ks if k not in kept]
+            if extra:
+                self._managers[c].on_store_job_cancelled(extra)
+        return out
 
     def take_events(self) -> list[OffloadingEvent]:
         return [event for manager in self._managers for event in manager.take_events()]
@@ -845,7 +958,9 @@ class TieredOffloadingManager(OffloadingManager):
 
     def bytes_of_keys(self, keys: Sequence[OffloadKey]) -> int:
         """Host bytes behind ``keys``, each at its class's entry size."""
-        return sum(self._classes[self.class_of(k)].bytes_per_entry for k in keys)
+        return sum(
+            self._classes[c].bytes_per_entry for k in keys for c in self.classes_of(k)
+        )
 
     def telemetry_line(self, now: float | None = None) -> str:
         """One line of per-class tier state.

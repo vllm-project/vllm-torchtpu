@@ -1195,18 +1195,46 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 f"plans {expected}"
             )
 
+        # QWEN4_EXP_MERGE_COMPRESSED_K: each carrier also holds the key region after
+        # the scheduler's pages, so a storage is longer than num_blocks pages. The
+        # page is the plan's, and the view covers the whole storage (block b is
+        # still row b; the merged-key mirror class addresses the region).
+        merged_page = None
+        if is_qwen4_exp(getattr(self, "_vllm_config", None)):
+            from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import (
+                merge_compressed_k_enabled,
+            )
+
+            if merge_compressed_k_enabled():
+                merged_page = max(
+                    g.kv_cache_spec.page_size_bytes
+                    for g in self.connector_worker.kv_cache_config.kv_cache_groups
+                )
         pool_tensors: list[CanonicalKVCacheTensor] = []
         for storage, device in pool_storages.values():
             storage_bytes = storage.nbytes()
-            assert storage_bytes % num_blocks == 0, (
-                "KV pool storage must hold whole scheduler blocks: "
-                f"storage_bytes={storage_bytes}, num_blocks={num_blocks}"
-            )
-            page_size_bytes = storage_bytes // num_blocks
+            if merged_page is not None:
+                page_size_bytes = merged_page
+                assert (
+                    storage_bytes % page_size_bytes == 0
+                    and storage_bytes >= num_blocks * page_size_bytes
+                ), (
+                    "KV pool storage must hold whole pages, at least the scheduler's: "
+                    f"storage_bytes={storage_bytes}, page={page_size_bytes}, "
+                    f"num_blocks={num_blocks}"
+                )
+                rows = storage_bytes // page_size_bytes
+            else:
+                assert storage_bytes % num_blocks == 0, (
+                    "KV pool storage must hold whole scheduler blocks: "
+                    f"storage_bytes={storage_bytes}, num_blocks={num_blocks}"
+                )
+                page_size_bytes = storage_bytes // num_blocks
+                rows = num_blocks
             int8_view = (
                 torch.empty(0, dtype=torch.int8, device=device)
                 .set_(storage)
-                .view(num_blocks, page_size_bytes)
+                .view(rows, page_size_bytes)
             )
             pool_tensors.append(
                 CanonicalKVCacheTensor(
