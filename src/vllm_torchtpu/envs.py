@@ -420,8 +420,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFWD_PREP_FOLD: int = 0
     VLLM_TPU_PREFWD_PREP_FOLD_CHECK: str = ""
     VLLM_TPU_EXTRACT_DRAFTS_COMPILED: bool = False
-    VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD: bool = False
-    VLLM_TPU_WARM_SERVING_THREADS: bool = False
+    VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD: bool = True
+    VLLM_TPU_WARM_SERVING_THREADS: bool = True
     VLLM_TPU_SAMPLING_COPIES_WHOLE: bool = False
     VLLM_TPU_VERIFY_RO_INGRAPH: bool = False
     VLLM_TPU_DRAFT_SEED_EXTRAS: bool = False
@@ -2710,7 +2710,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # as execute_model serves them: dynamo guards on grad mode, so warmed with
     # grad on, every shape compiled again on its first served step.
     "VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD": env_bool(
-        "VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD"
+        "VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD", default=True
     ),
     # Run every precompile pass (_precompile_timed) at serving's torch thread
     # count. Dynamo guards on torch.get_num_threads(), and the passes run from
@@ -2718,7 +2718,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # come before compile_or_warm_up_model drops the threads to 1, so each
     # warmed shape compiled again on its first served step (c32 steady: 10
     # _substitute_placeholder_token recompiles of ~70 ms on every rank).
-    "VLLM_TPU_WARM_SERVING_THREADS": env_bool("VLLM_TPU_WARM_SERVING_THREADS"),
+    "VLLM_TPU_WARM_SERVING_THREADS": env_bool(
+        "VLLM_TPU_WARM_SERVING_THREADS", default=True
+    ),
     # Upstream InputBatch refreshes its device sampling tensors (temperature,
     # top_p, ...) with `dev[:num_reqs].copy_(cpu[:num_reqs])` on every batch
     # change. On TPU that slice write is an eager copy__as_strided_inverse
