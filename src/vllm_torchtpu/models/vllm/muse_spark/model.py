@@ -278,6 +278,8 @@ class MuseMoE(nn.Module):
         )
         # Read by moe_routing.select_experts.
         self.gate.routed_scaling_factor = config.routed_scaling_factor
+        # torch's Module.__setattr__ stub only accepts modules and tensors.
+        # pyrefly: ignore[bad-argument-type]
         self.gate.use_grouped_topk = False
         hidden = config.moe_hidden_size
         self.pre_expert_proj = ColumnParallelLinear(
@@ -334,7 +336,7 @@ class MuseMoE(nn.Module):
         """FP32 routing weights and int32 expert ids for each token."""
         # Expert selection is sensitive to logit rounding; TPU FP32 matmuls
         # otherwise run as BF16 passes.
-        logits = fp32_matmul(x, self.gate.weight)
+        logits = fp32_matmul(x, cast(torch.Tensor, self.gate.weight))
         return moe_routing.select_experts(
             x.float(),
             logits * self.multiplier,
