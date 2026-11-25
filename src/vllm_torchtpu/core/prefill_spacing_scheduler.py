@@ -77,6 +77,9 @@ warmest-first admission, each step this scheduler:
   arrived more than ``VLLM_TPU_PREFILL_CADENCE_MAX_WAIT_S`` ago (TTFT bound;
   running chunks keep the cadence); the spacing debt above still applies
   then. Both change only whether a step runs prefill; SRPT still picks which.
+* with ``VLLM_TPU_SIBLING_HOLD`` (PrefixAwareScheduler), a waiting request held
+  for a running request's shared prefix is left out of the reserve: running
+  chunks, the prefix's owner included, are not cut for it.
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.prefill_spacing_scheduler.PrefillSpacingScheduler``.
@@ -244,16 +247,19 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             queue.remove_requests(window)
             # prepend_requests() reverses its argument.
             queue.prepend_requests(reversed(ordered))
-        self._window_cold = [
-            max(r.num_tokens - warmth, 1)
+        # Requests the sibling hold keeps waiting this step reserve no budget:
+        # a running chunk cut for them would delay the prefix they wait for.
+        admissible = [
+            (warmth, r)
             for (_, warmth), r in scored
             if not self._is_blocked_waiting_status(r.status)
+            and not (self._sib_hold and self._sib_max_s > 0 and self._sibling_held(r))
         ]
+        self._window_cold = [max(r.num_tokens - warmth, 1) for warmth, r in admissible]
         if self.srpt:
             self._window_key = [
                 max(r.num_tokens - warmth, 1) - self._age_tokens(r)
-                for (_, warmth), r in scored
-                if not self._is_blocked_waiting_status(r.status)
+                for warmth, r in admissible
             ]
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
