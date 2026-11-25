@@ -1763,7 +1763,11 @@ def tag_attn_out_relayout_projections(model: torch.nn.Module) -> int:
             continue
         if hasattr(o_proj, ATTN_OUT_FENCE_OP_ATTR):
             delattr(o_proj, ATTN_OUT_FENCE_OP_ATTR)
-        if not isinstance(o_proj.quant_method, VllmFp8LinearMethodTPU):
+        if (
+            not isinstance(o_proj.quant_method, VllmFp8LinearMethodTPU)
+            or not isinstance(o_proj.weight, torch.Tensor)
+            or not o_proj.weight.dtype.is_floating_point
+        ):
             continue
         if get_chip_version() not in _FENCED_ATTN_OUT_CHIPS:
             continue

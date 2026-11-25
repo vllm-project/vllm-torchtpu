@@ -120,9 +120,15 @@ def test_tag_finds_attention_o_proj_by_type(monkeypatch, cpu_vllm_config):
     no_qkv = _AttentionBlock(qkv_heads=None)
     gated = _AttentionBlock(qkv_heads=2 * _HEADS)
     unquantized = _AttentionBlock(quantized=False)
+    with monkeypatch.context() as m:
+        m.setenv("REQUANTIZE_WEIGHT_DTYPE", "int8")
+        int8_requant = _AttentionBlock()
+        assert isinstance(int8_requant.out.quant_method, VllmFp8LinearMethodTPU)
+        int8_requant.out.quant_method.process_weights_after_loading(int8_requant.out)
+    assert int8_requant.out.weight.dtype is torch.int8
     mlp = _MlpBlock()
     two_projections = _TwoProjectionBlock()
-    untagged = (gated, unquantized, mlp, two_projections)
+    untagged = (gated, unquantized, int8_requant, mlp, two_projections)
     model = torch.nn.ModuleList([plain, no_qkv, *untagged])
     assert isinstance(plain.out.quant_method, VllmFp8LinearMethodTPU)
 
@@ -176,7 +182,7 @@ def test_patch_tags_after_load_and_logs_the_count(monkeypatch, cpu_vllm_config):
     assert hasattr(block.out, ATTN_OUT_FENCE_OP_ATTR)
     assert [args[1:] for args in logged] == [(1,)]
     assert wrapped(_MlpBlock(), None, None) == "ok"
-    assert len(logged) == 1
+    assert [args[1:] for args in logged] == [(1,), (0,)]
 
 
 def _meta_o_proj() -> RowParallelLinear:

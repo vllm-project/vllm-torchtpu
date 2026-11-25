@@ -1111,12 +1111,11 @@ def patch_attn_out_relayout_tags() -> None:
 
         result = orig_process(model, model_config, target_device)
         tagged = tag_attn_out_relayout_projections(model)
-        if tagged:
-            logger.info(
-                "Fenced the input of %d FP8 attention o_proj layers to keep "
-                "the attention-output relayout in bf16.",
-                tagged,
-            )
+        logger.info(
+            "Fenced the input of %d FP8 attention o_proj layers to keep "
+            "the attention-output relayout in bf16.",
+            tagged,
+        )
         return result
 
     typing.cast(
