@@ -97,7 +97,10 @@ def shifted_post_pre_rms(
         ``early_prep`` builds tile 0's gate coefficients while the first
         activation tiles are still in flight instead of after they land.
     """
-    t, d = x.shape
+    # x may carry padding rows past the T rows of the residual: only the T
+    # real rows are read.
+    t, d = flat.shape[0], x.shape[1]
+    assert x.ndim == 2 and x.shape[0] >= t
     # Every op is per token except the block-diagonal mix, which multiplies a
     # group's rows together: pad rows only need to be finite (masked to zero).
     ragged = t % 32 != 0 and t <= 128
@@ -164,12 +167,18 @@ def shifted_post_pre_rms(
         norm_square,
         sems,
         projection_buf,
+        gate_pads,
     ):
         if gate_input_mode == GateInputMode.HBM:
             por, cr, pr = gate_scratch
             copy_pairs = [(poh, por), (ch, cr), (ph, pr), (wh, wr)]
         else:
-            por, cr, pr = (poh, ch, ph)
+            por, cr, pr = gate_pads or (poh, ch, ph)
+            for source, padded_gate in zip((poh, ch, ph), gate_pads):
+                # T resident tokens into a zero-padded tile; an XLA pad
+                # before the call costs a launch per gate (v7, T=72: 3.8 us).
+                padded_gate[...] = jnp.zeros(padded_gate.shape, padded_gate.dtype)
+                padded_gate[..., :t] = source[...]
             copy_pairs = [(wh, wr)]
         norm_work_refs = norm_refs
         if norm_weight is not None:
@@ -435,10 +444,16 @@ def shifted_post_pre_rms(
         store_projection(projection_buf[...], num_tiles - 1)
 
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    gate_args = tuple(
-        jnp.pad(g, [(0, 0)] * (g.ndim - 1) + [(0, rows - t)])
-        for g in (post.reshape(t, m).T, comb.transpose(1, 2, 0), pre.T)
-    )
+    gate_args = (post.reshape(t, m).T, comb.transpose(1, 2, 0), pre.T)
+    gate_pad_shapes = ()
+    if gate_input_mode == GateInputMode.COMPILER and rows > t:
+        gate_pad_shapes = tuple(
+            pltpu.VMEM((*g.shape[:-1], rows), g.dtype) for g in gate_args
+        )
+    elif rows > t:
+        gate_args = tuple(
+            jnp.pad(g, [(0, 0)] * (g.ndim - 1) + [(0, rows - t)]) for g in gate_args
+        )
     if gate_input_mode == GateInputMode.HBM:
         gate_spec = hbm
         gate_args = tuple(
@@ -477,6 +492,7 @@ def shifted_post_pre_rms(
                 (len(gate_scratch_shapes) + 1 + int(norm_weight is not None),)
             ),
             pltpu.VMEM((tile, 128), jnp.float32),
+            gate_pad_shapes,
         ],
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=tuning.vmem_limit_bytes,

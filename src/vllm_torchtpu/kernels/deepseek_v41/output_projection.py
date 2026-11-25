@@ -525,7 +525,12 @@ def fused_output_projection(
     wb: jax.Array,  # [8192, 5120] fp8
     sb: jax.Array,  # [5120] f32
 ) -> jax.Array:
-    """``wo_b(wo_a(x))`` for any token count, see ``is_supported``."""
+    """``wo_b(wo_a(x))`` for any token count, see ``is_supported``.
+
+    Returns ``padded_rows(T)`` rows: the output DMA moves whole bf16 row
+    tiles, and rows past T are zeros. Slicing them off would copy the whole
+    output (v7, T=72: 2.1 us); consumers read the first T rows.
+    """
     if not is_supported(x, wa, sa, wb, sb):
         raise ValueError("Fused output projection requires qualified v7 inputs")
     total = x.shape[0]
@@ -545,8 +550,12 @@ def fused_output_projection(
         start = count * tokens
         out = _call(x, wa, sa, wb, sb, out, tokens=rest, count=1, start=start)
     assert out is not None
-    # A no-op on the serving buckets, which are STORE_ROWS multiples.
-    return out[:total] if out.shape[0] != total else out
+    return out
+
+
+def padded_rows(total: int) -> int:
+    """Rows of `fused_output_projection`'s output for ``total`` tokens."""
+    return -(-total // STORE_ROWS) * STORE_ROWS
 
 
 def token_tiles(total: int) -> tuple[int, int, int]:

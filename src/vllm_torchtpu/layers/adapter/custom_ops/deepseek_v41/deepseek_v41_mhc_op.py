@@ -87,7 +87,7 @@ def _post_pre_rms_jax(
     padded = tokens if tokens <= 128 and tokens % 8 == 0 else -(-tokens // 32) * 32
     if not supported(padded, mult, dim):
         return _unfused(
-            x,
+            x[:tokens],
             flat,
             post,
             comb,
@@ -110,8 +110,12 @@ def _post_pre_rms_jax(
         widths = [(0, padded - tokens)] + [(0, 0)] * (a.ndim - 1)
         return jnp.pad(a, widths)
 
+    # x may already carry padding rows (`project_out` pads to 16-row tiles).
+    x = x.reshape(x.shape[0], -1).astype(flat.dtype)
+    if x.shape[0] < padded:
+        x = jnp.pad(x, ((0, padded - x.shape[0]), (0, 0)))
     outputs = shifted_post_pre_rms.shifted_post_pre_rms(
-        pad(x.reshape(tokens, -1).astype(flat.dtype)),
+        x,
         pad(flat),
         pad(post),
         pad(comb),
