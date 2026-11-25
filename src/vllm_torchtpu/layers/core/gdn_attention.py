@@ -25,6 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 from vllm import envs
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
     pcp_wrapper as gdn_pcp_fused_wrapper,
 )
@@ -154,6 +155,7 @@ def run_jax_gdn_attention(
         d_v=d_v,
         kernel_size=kernel_size,
         num_spec_tokens=num_spec_tokens,
+        gdn_prefill_mode=tpu_envs.TPU_GDN_PREFILL_MODE,
     )
 
     mapped_fn = jax.shard_map(
@@ -736,6 +738,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
                 d_k=d_k,
                 d_v=d_v,
                 kernel_size=kernel_size,
+                gdn_prefill_mode=tpu_envs.TPU_GDN_PREFILL_MODE,
             )
         )
 
@@ -884,6 +887,7 @@ def run_jax_gdn_attention_pooled_local(
         recurrent_dtype=jnp.dtype(recurrent_state_dtype),
         conv_dtype=jnp.dtype(jnp.float32),
         num_spec_tokens=num_spec_tokens,
+        gdn_prefill_mode=tpu_envs.TPU_GDN_PREFILL_MODE,
         prefill_ckpt_offsets=prefill_ckpt_offsets,
         prefill_ckpt_indices=prefill_ckpt_indices,
     )

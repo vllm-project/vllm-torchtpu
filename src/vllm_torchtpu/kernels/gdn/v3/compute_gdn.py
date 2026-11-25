@@ -19,7 +19,7 @@ from typing import NamedTuple, overload
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.gdn.v3 import config, triangular_solve
+from vllm_torchtpu.kernels.gdn.v3 import block_doubling, config, triangular_solve
 
 
 def l2_norm(x: jax.Array, eps: float = 1e-6) -> jax.Array:
@@ -113,6 +113,12 @@ def chunked_gdn_per_seq(
     cfg: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform chunked GDN over input [num_heads, chunk, head_dim]."""
+    if cfg.use_block_doubling:
+        out, state = block_doubling.run_chunk_per_seq(
+            q_large, k_large, v_large, gating_log, beta, state_prev, cfg
+        )
+        assert out is not None and state is not None
+        return out, state
 
     # Compute cumulative sum of decay.
     # [1, 1, num_v_heads]
