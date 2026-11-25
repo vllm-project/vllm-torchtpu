@@ -101,6 +101,13 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
 
 ## Notes
 
+- **Exos runs under a form are not yet reproducible from this branch.** The Exos recipe (exos-infx-qwen38-flash-agentx-disagg
+  v1.2) patches the mapped tree at start-up (its exos_vllm bootstrap edits 7 files of `vllm_torchtpu`: model_loader_patches,
+  kv_block_override, the two ray executors, tpu_runner, connector_metadata, tpu_connector), but only the main package, never
+  `src/vllm_torchtpu/_forms/<form>/`. The posted Exos points ran plain trees, whose package was the main package, so it was
+  patched. Here their form would run unpatched. The record proofs of this branch show CPU-side byte identity of every form, not
+  this runtime patch. Until the q38 recipe copy also patches the selected form (in progress), no Exos run under a form starts
+  from this branch. Default-cluster points (B1, B3 / B4 cars, HIX P1 / HIX-o) are unaffected.
 - `src/sitecustomize.py` here adds the `CDK_MEMLOG` logger; it does nothing unless `CDK_MEMLOG=1`, which no point sets.
 - `src/tpu_sync/` (vendored Python sources from the c1-stack-d3600 snapshot, no `__init__.py`) is outside every form;
   see the MERGE-1124 report for how it resolves on the serving image.
