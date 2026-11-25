@@ -163,6 +163,56 @@ def _probe(interval: float, rank: int) -> None:
         )
 
 
+# q38 SERVE r0pin mechanism check (VLLM_TPU_CPU_IRQ_DUMP_S): read-only, log-only.
+IRQ_DUMP_FILES = ("/proc/interrupts", "/proc/softirqs")
+IRQ_DUMP_CHUNK = 4000
+
+
+def irq_dump_lines(
+    rank: int,
+    seq: int,
+    paths: tuple[str, ...] = IRQ_DUMP_FILES,
+    chunk: int = IRQ_DUMP_CHUNK,
+    now: float | None = None,
+) -> list[str]:
+    """'CPU IRQ DUMP' log lines for one snapshot of each file: the raw bytes,
+    gzip-compressed (mtime 0) and base64-encoded, split into parts of at most
+    ``chunk`` characters, each part tagged with seq / time / source / part i/n /
+    raw byte count / raw md5. Reads the files only; an unreadable file gives one
+    UNREADABLE line."""
+    import base64
+    import gzip
+    import hashlib
+
+    t = time.time() if now is None else now
+    out = []
+    for path in paths:
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError as exc:
+            out.append(f"CPU IRQ DUMP rank={rank} seq={seq} t={t:.3f} src={path} UNREADABLE {exc}")
+            continue
+        b64 = base64.b64encode(gzip.compress(raw, 6, mtime=0)).decode()
+        parts = [b64[i : i + chunk] for i in range(0, len(b64), chunk)] or [""]
+        md5 = hashlib.md5(raw).hexdigest()
+        for i, part in enumerate(parts):
+            out.append(
+                f"CPU IRQ DUMP rank={rank} seq={seq} t={t:.3f} src={path} part={i + 1}/{len(parts)} "
+                f"bytes={len(raw)} md5={md5} b64={part}"
+            )
+    return out
+
+
+def _irq_dump(interval: float, rank: int) -> None:
+    seq = 0
+    while True:
+        for line in irq_dump_lines(rank, seq):
+            logger.info("%s", line)
+        seq += 1
+        time.sleep(interval)
+
+
 def apply(rank: int, local_rank: int) -> None:
     from vllm_torchtpu import envs
 
@@ -172,6 +222,13 @@ def apply(rank: int, local_rank: int) -> None:
             target=_probe,
             args=(envs.VLLM_TPU_CPU_PROBE_S, rank),
             name="cpu-probe",
+            daemon=True,
+        ).start()
+    if envs.VLLM_TPU_CPU_IRQ_DUMP_S > 0 and rank == 0:  # q38 SERVE r0pin mechanism check
+        threading.Thread(
+            target=_irq_dump,
+            args=(envs.VLLM_TPU_CPU_IRQ_DUMP_S, rank),
+            name="cpu-irq-dump",
             daemon=True,
         ).start()
     if mode == "off":
@@ -220,8 +277,25 @@ def node_cpus(node: int) -> set[int]:
     return set(_cpulist(_read(f"/sys/devices/system/node/node{node}/cpulist")))
 
 
-def slice_cores(node: int, slots: int, reserve: int) -> tuple[list[tuple[int, ...]], int]:
-    """The node's physical cores and the cores per slot, checking R3 and R4."""
+def skip_cpus() -> set[int]:
+    """CPUs named by VLLM_TPU_CPU_PIN_SKIP_CPUS (q38 SERVE r0pin; empty when unset)."""
+    from vllm_torchtpu import envs
+
+    text = envs.VLLM_TPU_CPU_PIN_SKIP_CPUS.strip()
+    return set(_cpulist(text)) if text else set()
+
+
+def slice_cores(
+    node: int, slots: int, reserve: int, skip: set[int] | None = None
+) -> tuple[list[tuple[int, ...]], int]:
+    """The node's physical cores and the cores per slot, checking R3 and R4.
+
+    q38 SERVE r0pin: a physical core holding any CPU in ``skip`` (default:
+    VLLM_TPU_CPU_PIN_SKIP_CPUS) is removed AFTER the cores per slot are fixed, so
+    every slot keeps its size; the node's slices shift past the skipped core and
+    the remainder (the engine reserve) shrinks by it. No slice or reserve holds a
+    skipped core. Empty ``skip`` (the default) changes nothing.
+    """
     cores = physical_cores(node)
     inside = node_cpus(node)
     for core in cores:
@@ -237,19 +311,33 @@ def slice_cores(node: int, slots: int, reserve: int) -> tuple[list[tuple[int, ..
     per = (len(cores) - reserve) // slots
     if per < 1:  # R3
         raise SlicePinError(f"R3: node {node} gives {per} cores per slot")
+    skip = skip_cpus() if skip is None else skip
+    if skip:
+        cores = [core for core in cores if not set(core) & skip]
+        if len(cores) < slots * per:  # R3 after the skip
+            raise SlicePinError(
+                f"R3: node {node} keeps {len(cores)} physical cores after "
+                f"VLLM_TPU_CPU_PIN_SKIP_CPUS for {slots} slots of {per}"
+            )
     return cores, per
 
 
-def slice_plan(node: int, slot: int, slots: int, reserve: int) -> set[int]:
-    """The ``slot``-th worker's CPUs under the checks; equal to plan("slice", ...)."""
-    cores, per = slice_cores(node, slots, reserve)
+def slice_plan(
+    node: int, slot: int, slots: int, reserve: int, skip: set[int] | None = None
+) -> set[int]:
+    """The ``slot``-th worker's CPUs under the checks; equal to plan("slice", ...)
+    when no CPU is skipped."""
+    cores, per = slice_cores(node, slots, reserve, skip)
     mine = cores[slot * per : (slot + 1) * per]
     return {cpu for core in mine for cpu in core}
 
 
-def reserved_cpus(node: int, slots: int, reserve: int) -> set[int]:
-    """The node's CPUs that no worker slice takes (the reserve and the remainder)."""
-    cores, per = slice_cores(node, slots, reserve)
+def reserved_cpus(
+    node: int, slots: int, reserve: int, skip: set[int] | None = None
+) -> set[int]:
+    """The node's CPUs that no worker slice takes (the reserve and the remainder),
+    minus any skipped core."""
+    cores, per = slice_cores(node, slots, reserve, skip)
     return {cpu for core in cores[slots * per :] for cpu in core}
 
 
@@ -307,6 +395,15 @@ def _apply_slice(rank: int, local_rank: int, reserve: int) -> None:
             f"R5: rank {rank} plan {sorted(cpus)} is not inside the allowed CPUs {sorted(allowed)}"
         )
     n = pin_exact(cpus)
+    skipped = skip_cpus()
+    if skipped:
+        logger.info(
+            "CPU pin skip: rank %d node %d VLLM_TPU_CPU_PIN_SKIP_CPUS=%s; plan holds none of them: %s",
+            rank,
+            node,
+            sorted(skipped),
+            not (cpus & skipped),
+        )
     logger.info(
         "CPU pin: rank %d local_rank %d node %d mode slice slot %d/%d cores %d cpus %s "
         "(%d threads read back)",

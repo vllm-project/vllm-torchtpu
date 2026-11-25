@@ -222,6 +222,20 @@ _TPU_COMPILE_ENV_IGNORED = {
     # q38 SV-PAIR: EngineCore / API-server process CPU affinity only
     # (worker/cpu_pinning.py).
     "VLLM_TPU_CPU_PIN_ENGINE",
+    # q38 SERVE r0pin: worker / engine CPU affinity only; read solely by
+    # worker/cpu_pinning.py (skip_cpus -> slice_cores), never by model, kernel or
+    # compile code, so it cannot change a compiled program (proof: SERVE-LEAD-5
+    # r0pin compile-hash identity leg, key off vs on).
+    "VLLM_TPU_CPU_PIN_SKIP_CPUS",
+    # q38 SERVE r0pin: read solely by worker/cpu_pinning.py (slice_cores / plan /
+    # engine_target) to size the worker slices and the engine reserve; affinity is
+    # applied by cpu_pinning.apply() after compile_or_warm_up_model has compiled
+    # every program (worker/tpu_worker.py), so it cannot change a compiled program
+    # (proof: SERVE-LEAD-6 r0pin compile-hash identity leg, RESERVE 2 vs 24).
+    "VLLM_TPU_CPU_PIN_RESERVE",
+    # q38 SERVE r0pin mechanism check: log-only /proc/interrupts + /proc/softirqs
+    # dump thread on rank 0 (worker/cpu_pinning.py irq_dump_lines); host reads only.
+    "VLLM_TPU_CPU_IRQ_DUMP_S",
     # Raiden KV-transfer orchestration/identity only; consumed at serving time
     # by the KV connector and never affect the compiled graph.
     # TPU_RAIDEN_ADVERTISE_HOST is the pod IP in the P/D recipes, so hashing it

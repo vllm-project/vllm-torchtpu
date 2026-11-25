@@ -482,6 +482,8 @@ if TYPE_CHECKING:
     VLLM_TPU_DRAFT_SEED_FUSED: bool = False
     VLLM_TPU_CPU_PIN_RESERVE: int = 2
     VLLM_TPU_CPU_PIN_ENGINE: str = "off"
+    VLLM_TPU_CPU_PIN_SKIP_CPUS: str = ""
+    VLLM_TPU_CPU_IRQ_DUMP_S: float = 0.0
     VLLM_TPU_CPU_PROBE_S: float = 0.0
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_GLUE_FOLD: bool = False
@@ -3141,6 +3143,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # free on every node with TPU devices; "reserved:<node>" to that node's
     # free cores only. Refused when the set is empty or off its node.
     "VLLM_TPU_CPU_PIN_ENGINE": env_str("VLLM_TPU_CPU_PIN_ENGINE", "off"),
+    # q38 SERVE r0pin (worker/cpu_pinning.py slice_cores; needs VLLM_TPU_CPU_PIN=slice):
+    # a CPU list (e.g. "0", "0-23"); every physical core holding one of them is left
+    # out of the worker slices and the engine reserve, keeping each slice's size, so
+    # naming one CPU of a core drops its SMT siblings too ("0" == "0,112" on a host
+    # whose sibling is cpu + 112; recipe EXTRA_SERVER_ENV lists cannot carry commas).
+    # Unset or empty (default) changes nothing. Host affinity only.
+    "VLLM_TPU_CPU_PIN_SKIP_CPUS": env_str("VLLM_TPU_CPU_PIN_SKIP_CPUS", ""),
+    # q38 SERVE r0pin mechanism check (worker/cpu_pinning.py irq_dump_lines; read-only,
+    # log-only): rank 0 logs /proc/interrupts and /proc/softirqs (gzip + base64, chunked
+    # 'CPU IRQ DUMP' lines) when its pinning is applied and then every N seconds. 0
+    # (default) starts nothing. Never changes IRQ affinity or any other host state.
+    "VLLM_TPU_CPU_IRQ_DUMP_S": env_float("VLLM_TPU_CPU_IRQ_DUMP_S", 0.0),
     # Log each worker's thread CPU placement every N seconds (0 = off).
     "VLLM_TPU_CPU_PROBE_S": env_float("VLLM_TPU_CPU_PROBE_S", 0.0),
     # Async scheduling: wait for the previous step's sampled-token copy after
