@@ -437,9 +437,6 @@ def shifted_post_pre_rms(
             return unused
 
         jax.lax.fori_loop(0, num_tiles, body, None)
-        for index in range(num_tiles - output_buffers, num_tiles):
-            for copy in output_copies(index):
-                copy.wait()
         store_projection(projection_buf[...], num_tiles - 1)
         gates = _gate_values(
             mh[...],
@@ -459,6 +456,10 @@ def shifted_post_pre_rms(
                 pltpu.make_async_copy(scratch, target, gate_out_sems.at[index])
             )
             outs[-1].start()
+        # The last tiles drain while the gates compute.
+        for index in range(num_tiles - output_buffers, num_tiles):
+            for copy in output_copies(index):
+                copy.wait()
         for copy in outs:
             copy.wait()
 
