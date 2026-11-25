@@ -48,7 +48,7 @@ WINDOW = 1024
 # the widest, and a unit runs its blocks at the narrowest width holding its
 # widest one. The kernel takes a window's blocks narrowest width first, so a
 # unit's blocks share one.
-_WIDTHS = (8, 16, 24, 32)  # `_width`
+_WIDTHS = (8, 12, 16, 20, 24, 28, 32)  # `_width`
 # Blocks a loop step runs side by side (`unit`). Op replay, 4,096 rows x 16
 # heads, us: 1891 / 1502 / 1163 / 1022 for 1 / 2 / 4 / 8 (uniform
 # selections, j-7166bc3d, j-b5dbd63f). A unit's schedule is its MXU pushes
@@ -260,8 +260,8 @@ def _kernel(
 
 
 def _width(n):
-    """The narrowest of `_WIDTHS` (multiples of 8) holding ``n >= 1`` pairs."""
-    return (n - 1) >> 3
+    """The narrowest of `_WIDTHS` (8, then steps of 4) holding ``n >= 1`` pairs."""
+    return jnp.maximum((n - 1) >> 2, 1) - 1
 
 
 def _work(keys, local_key, local_limit, window, page_size):
