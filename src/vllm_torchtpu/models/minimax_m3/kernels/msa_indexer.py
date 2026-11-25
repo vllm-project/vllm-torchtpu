@@ -220,6 +220,9 @@ _PAGES_PER_CHUNK = 32
 _DMA_ISSUE_CHUNKS = 2
 # Page groups in `_kernel_v3`'s DMA ring.
 _RING_SLOTS = 3
+# Page descriptors per iteration of `_kernel_v3`'s step-0 issue loop (even:
+# pages alternate DMA queues).
+_PROLOGUE_UNROLL = 8
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed
 # (`_chunk_maxima_t`, maxima across lanes); larger ones score token-major
 # (maxima across sublanes), a folded page with its slot scales folded into
@@ -444,12 +447,31 @@ def _kernel_v3(
         k_base, k_live = group(jnp.minimum(k, num_steps - 1))
         return k_base, jnp.where(k < num_steps, k_live, 0)
 
+    def start_ahead(k):
+        """`start` of work item `k`'s pages into slot `k` as a loop: unrolled,
+        the first `ahead` groups' descriptors were ~1,200 bundles of code
+        that only step 0 runs. Pages alternate DMA queues as in `start`."""
+        k_base, k_live = ahead_group(k)
+        unroll = math.gcd(pages_per_step, _PROLOGUE_UNROLL)
+        # Page g = i * unroll + d takes queue d % 2 == g % 2 for an even unroll.
+        assert unroll % 2 == 0, f"pages_per_step must be even, got {pages_per_step}"
+
+        def issue(i, carry):
+            for d in range(unroll):
+                g = i * unroll + d
+                pl.when(g < k_live)(
+                    functools.partial(copy(k_base, g, k).start, priority=d % 2)
+                )
+            return carry
+
+        jax.lax.fori_loop(0, pages_per_step // unroll, issue, 0)
+
     @pl.when(step == 0)
     def _():
         if write is not None:
             write.start()
         for k in range(ahead):
-            start(*ahead_group(k), range(pages_per_step), k)
+            start_ahead(k)
         if write is not None:
             write.merge()
 
