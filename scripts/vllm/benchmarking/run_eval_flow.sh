@@ -28,6 +28,8 @@ SKIP_DB_UPLOAD_FLAG=0
 SKIP_PERF_CHECK=0
 SKIP_BENCHMARK=0
 BASELINE_CONFIG=""
+LM_EVAL_LIMIT="100"
+REQUIRE_BASELINES=0
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -43,6 +45,11 @@ while [[ $# -gt 0 ]]; do
         --run-lm-eval)
             RUN_LM_EVAL=1
             shift
+            ;;
+        --lm-eval-limit)
+            # "none" evaluates the complete split; a number limits smoke runs.
+            LM_EVAL_LIMIT="$2"
+            shift 2
             ;;
         --run-code-eval)
             RUN_CODE_EVAL=1
@@ -84,10 +91,16 @@ while [[ $# -gt 0 ]]; do
             BASELINE_CONFIG="$2"
             shift 2
             ;;
+        # A gated task or benchmark with no baseline file fails instead of
+        # being skipped with a warning.
+        --require-baselines)
+            REQUIRE_BASELINES=1
+            shift
+            ;;
 
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check] [--skip-benchmark] [--baseline-config CONFIG_NAME]"
+            echo "Usage: $0 --config CONFIG_NAME [--results-dir DIR] [--run-lm-eval] [--lm-eval-limit N|none] [--run-code-eval] [--run-mm-eval] [--host HOST] [--port PORT] [--skip-db-upload] [--skip-perf-check] [--skip-benchmark] [--baseline-config CONFIG_NAME] [--require-baselines]"
             # shellcheck disable=SC2016
             echo '  --results-dir defaults to $ARTIFACTS_DIR/$CONFIG_NAME when ARTIFACTS_DIR is set, else /tmp/perf_eval_$CONFIG_NAME'
             exit 1
@@ -101,6 +114,11 @@ fi
 
 if [ -z "$CONFIG_NAME" ]; then
     echo "ERROR: --config is required"
+    exit 1
+fi
+
+if [ "$LM_EVAL_LIMIT" != "none" ] && ! [[ "$LM_EVAL_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: --lm-eval-limit must be a positive integer or none, got '$LM_EVAL_LIMIT'"
     exit 1
 fi
 
@@ -118,6 +136,19 @@ eval_regression_failed() {
     else
         echo "::error::Eval regression check failed for $task! See logs above for details."
         fail=1
+    fi
+}
+
+# Called when a task has no baseline file: a regression under
+# --require-baselines (so EVAL_SOFT_FAIL still decides whether it fails the
+# step), a skipped check otherwise.
+eval_baseline_missing() {
+    local task="$1" baseline="$2"
+    if [ "$REQUIRE_BASELINES" = "1" ]; then
+        echo "::error::No baseline for $task at $baseline, and --require-baselines is set."
+        eval_regression_failed "$task"
+    else
+        echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
     fi
 }
 
@@ -185,8 +216,10 @@ run_lm_eval() {
             )
             ;;
         *)
+            if [ "$LM_EVAL_LIMIT" != "none" ]; then
+                lm_eval_args+=(--limit "$LM_EVAL_LIMIT")
+            fi
             lm_eval_args+=(
-                --limit 100
                 --model local-chat-completions
                 --model_args "$model_args"
                 --apply_chat_template
@@ -267,7 +300,7 @@ run_lm_eval() {
           --results-dir "$RESULTS_DIR" \
           --baseline "$baseline" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
     else
-        echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
+        eval_baseline_missing "$task" "$baseline"
     fi
 }
 
@@ -324,7 +357,7 @@ print('$task: score=' + str(report['score']) + ' (num=' + str(report['num']) + '
           --results-dir "$RESULTS_DIR" \
           --baseline "$baseline" 2>&1 | tee "$eval_log" || eval_regression_failed "$task"
     else
-        echo "WARNING: Baseline not found for $task at $baseline. Skipping regression check."
+        eval_baseline_missing "$task" "$baseline"
     fi
 }
 
@@ -378,6 +411,9 @@ if [ "$SKIP_PERF_CHECK" = "0" ] && [ -f "$PERF_BASELINE" ]; then
       --tolerance "$PERF_TOLERANCE" \
       --results-dir "$RESULTS_DIR" \
       --baseline "$PERF_BASELINE" 2>&1 | tee "$PERF_LOG" || { echo "::error::Perf regression check failed! See logs above for details."; fail=1; }
+elif [ "$SKIP_PERF_CHECK" = "0" ] && [ "$REQUIRE_BASELINES" = "1" ]; then
+    echo "::error::No perf baseline at $PERF_BASELINE, and --require-baselines is set."
+    fail=1
 fi
 
 # ========================================================

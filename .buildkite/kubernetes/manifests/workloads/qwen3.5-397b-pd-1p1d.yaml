@@ -1,0 +1,179 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# The Qwen3.5-397B C3 recipe at its correctness-gate shape: one prefill and one
+# decode engine, each a 2x2x1 host of four chips (8 chips), serving the
+# qwen3.5-397b-fp8-pd-1p1d instantiation. See .buildkite/kubernetes/qwen35_pd.sh.
+# Both roles ask for the same shape, so the workload is admitted against one
+# queue; the prefill head fronts the pair and runs the checks, so no client pod
+# rides along.
+#
+# ${WORKLOAD_NAME} and ${IMAGE} are substituted before submission, so a literal
+# dollar is $$. Every container is named `workload`: the launcher forwards step
+# environment into that name and reads its logs.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    # The fleet's pod setup - caches, tolerations, retries. See
+    # manifests/README.md.
+    tpu-ci.google.com/defaults: standard
+spec:
+  # <jobset>-<role>-0-0 under a headless service named for the JobSet, which is
+  # how prefill finds decode and each pod finds the other's status file.
+  network:
+    enableDNSHostnames: true
+  # Decode serves until told to stop, so prefill finishing - after the checks -
+  # is what finishes the run; JobSet then tears decode down.
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - prefill
+  replicatedJobs:
+    - name: prefill
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          # Indexed because enableDNSHostnames requires it.
+          completionMode: Indexed
+          # Two cold boots of this model compile for over an hour, then the
+          # whole GSM8K split runs with thinking on.
+          activeDeadlineSeconds: 36000
+          # A restarted engine would boot cold and hide what failed.
+          backoffLimit: 0
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+                - name: workload
+                  image: ${IMAGE}
+                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/qwen35_pd.sh", "prefill"]
+                  env:
+                    - name: QWEN35_PD_CONFIG
+                      value: qwen3.5-397b-fp8-pd-1p1d
+                    # Each role's pods in replica order.
+                    - name: PREFILL_HOSTS
+                      value: ${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
+                    - name: DECODE_HOSTS
+                      value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
+                    - name: PD_REPLICA_INDEX
+                      value: "0"
+                    # The downward API, so it cannot come from the script.
+                    - name: POD_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    # Both caches on the fleet's compilation bucket, mounted at
+                    # /cache/jax, as qwen3.5-397b-1p1d.yaml keeps them.
+                    - name: VLLM_XLA_CACHE_PATH
+                      value: /cache/jax/xla
+                    - name: VLLM_CACHE_ROOT
+                      value: /cache/jax/vllm
+                    # The checks and run_eval_flow.sh write their results here,
+                    # and the prefill head uploads it.
+                    - name: ARTIFACTS_DIR
+                      value: perf_eval_results
+                  # What the readiness check waits on: the engine answers.
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8000
+                    periodSeconds: 10
+                  ports:
+                    - containerPort: 8000
+                    - containerPort: 8100
+                    - containerPort: 8300
+                  # Only the chips: memory comes from the shape's profile, and a
+                  # cpu request can stop the pool scaling up at all.
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                    requests:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    # profile_cache must not persist, or a later run loads the
+                    # kv=0 graph instead of compiling it.
+                    - name: vllm-profile-cache
+                      mountPath: /cache/jax/vllm/profile_cache
+              volumes:
+                - name: vllm-profile-cache
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+
+    - name: decode
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          completionMode: Indexed
+          activeDeadlineSeconds: 36000
+          backoffLimit: 0
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x1
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+                - name: workload
+                  image: ${IMAGE}
+                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/qwen35_pd.sh", "decode"]
+                  env:
+                    - name: QWEN35_PD_CONFIG
+                      value: qwen3.5-397b-fp8-pd-1p1d
+                    - name: PREFILL_HOSTS
+                      value: ${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
+                    - name: DECODE_HOSTS
+                      value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
+                    - name: PD_REPLICA_INDEX
+                      value: "0"
+                    - name: POD_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: VLLM_XLA_CACHE_PATH
+                      value: /cache/jax/xla
+                    - name: VLLM_CACHE_ROOT
+                      value: /cache/jax/vllm
+                  # The first of the four DP ranks' API servers (7200-7203).
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 7200
+                    periodSeconds: 10
+                  ports:
+                    - containerPort: 7200
+                    - containerPort: 7201
+                    - containerPort: 7202
+                    - containerPort: 7203
+                    - containerPort: 8300
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                    requests:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: vllm-profile-cache
+                      mountPath: /cache/jax/vllm/profile_cache
+              volumes:
+                - name: vllm-profile-cache
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi

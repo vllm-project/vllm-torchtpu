@@ -63,6 +63,9 @@ RESULT_FILENAME_RE = re.compile(r"^isl(\d+)_osl(\d+)_c(\d+)\.json$")
 
 ACC_KEYS = (
     "exact_match,strict_match",
+    # lm-eval's gsm8k names its regex filter strict-match; without this key a
+    # GSM8K baseline would gate flexible-extract instead.
+    "exact_match,strict-match",
     "exact_match,custom-extract",
     "exact_match,flexible-extract",
     "acc,none",
@@ -92,6 +95,30 @@ Z_ONE_SIDED_95 = 1.645
 # Guards the exactly-at-threshold comparison against binary floating-point
 # error (e.g. 0.88 - 0.90 == -0.020000000000000018, not -0.02).
 FLOAT_EPSILON = 1e-9
+
+# Exit status for a baseline file that gates nothing: one marked pending, or
+# one with no entry once its metadata blocks are dropped. Either would
+# otherwise pass every run.
+BASELINE_REFUSED = 3
+
+# Metadata key of a baseline file committed before its numbers were measured.
+# Its value says what will produce them.
+PENDING_KEY = "_pending"
+
+
+def baseline_refusal(baseline: dict) -> str | None:
+    """Why a baseline file cannot gate a run, or None if it can.
+
+    A file marked pending has no measured numbers yet, and a file with no
+    entry besides its ``_``-prefixed metadata blocks compares nothing; both
+    would report PASS for any result.
+    """
+    pending = baseline.get(PENDING_KEY)
+    if pending is not None:
+        return f"baseline is pending, nothing is gated: {pending}"
+    if not any(not k.startswith("_") for k in baseline):
+        return "baseline has no entries besides metadata, nothing is gated"
+    return None
 
 
 def key_from_filename(name: str) -> str | None:
@@ -387,12 +414,20 @@ def check_eval(
             rows.append(EvalRow(task, "(no result)", "FAIL", **defaults))
             continue
 
-        r = primary_metric(results[task])
-        if b is None or r is None:
+        if b is None:
             rows.append(EvalRow(task, "(no acc)", "SKIP", **defaults))
             continue
+        # The run's value under the baseline's own metric: a run that reports
+        # several (gsm8k's strict-match and flexible-extract) must not be
+        # compared on another one than the baseline was calibrated on.
+        actual = results[task].get(metric_name)
+        if not isinstance(actual, (int, float)):
+            rows.append(
+                EvalRow(task, f"(no {metric_name} in result)", "FAIL", **defaults)
+            )
+            continue
 
-        delta = r.value - b.value
+        delta = actual - b.value
         # Epsilon guards the exactly-at-tolerance case against binary
         # floating-point error (e.g. 0.88 - 0.90 = -0.020000000000000018).
         status = "PASS" if delta >= -allowed_drop - FLOAT_EPSILON else "FAIL"
@@ -401,7 +436,7 @@ def check_eval(
                 task,
                 metric_name,
                 status,
-                actual=r.value,
+                actual=actual,
                 baseline=b.value,
                 delta=delta,
                 **defaults,
@@ -523,6 +558,14 @@ def main() -> int:
     if len(args.results_dir) != 1:
         parser.error("--results-dir may only be given once in check mode")
 
+    with args.baseline.open() as fh:
+        baseline = json.load(fh)
+    refusal = baseline_refusal(baseline)
+    if refusal:
+        print(f"::error::{args.baseline}: {refusal}", file=sys.stderr)
+        return BASELINE_REFUSED
+    baseline = {k: v for k, v in baseline.items() if not k.startswith("_")}
+
     if args.mode == "perf":
         results = load_perf_results(args.results_dir[0])
         if not results:
@@ -539,10 +582,6 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
-
-    with args.baseline.open() as fh:
-        baseline = json.load(fh)
-    baseline = {k: v for k, v in baseline.items() if not k.startswith("_")}
 
     if args.mode == "perf":
         failed = check_perf(results, baseline, tolerance)
