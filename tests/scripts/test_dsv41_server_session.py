@@ -223,6 +223,8 @@ def test_ci_launch_and_optional_profile_share_one_server(
     )
     for key in inherited_roots:
         monkeypatch.setenv(key, str(tmp_path / "persistent-cache"))
+    # The workbench pods export the opt-in; this test checks the default.
+    monkeypatch.delenv("DSV41_BENCH_COMPILE_CACHE_DIR", raising=False)
     if scenario == "decode_dp16":
         monkeypatch.setenv("HOST", "0.0.0.0")
         monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
