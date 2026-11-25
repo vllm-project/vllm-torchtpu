@@ -31,13 +31,14 @@ import numpy as np
 import pytest
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_attention,
     msa_attention_lse,
     msa_dcp,
-    msa_fp4,
     msa_indexer,
     msa_write,
 )
@@ -45,6 +46,36 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 _TOPK = 16
 _BLOCK = 128
 _NO_FMA_FLAG = "--xla_cpu_max_isa=SSE4_2"
+_TWO_DEVICES_FLAG = "--xla_force_host_platform_device_count=2"
+
+
+def _rerun(request, flags):
+    """Runs the test in a host process with `flags` added to XLA_FLAGS."""
+    env = dict(os.environ)
+    env["XLA_FLAGS"] = " ".join([env.get("XLA_FLAGS", ""), *flags])
+    env["JAX_PLATFORMS"] = "cpu"
+    node = f"{request.node.path}::{request.node.name}"
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+        + ["--noconftest", node],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stdout[-4000:]
+
+
+@pytest.fixture
+def on_two_devices(request):
+    """Runs the test in a host process with two devices, a DCP pair's mesh for
+    the TPU interpreter's remote copies and barrier, and yields whether this
+    process is it. (Not `without_fma`'s host: the TPU interpreter's 16-bit
+    conversions need an ISA with F16C.)"""
+    if len(jax.devices("cpu")) >= 2:
+        yield True
+        return
+    _rerun(request, [_TWO_DEVICES_FLAG])
+    yield False
 
 
 @pytest.fixture
@@ -58,18 +89,7 @@ def without_fma(request):
     if _NO_FMA_FLAG in os.environ.get("XLA_FLAGS", ""):
         yield True
         return
-    env = dict(os.environ)
-    env["XLA_FLAGS"] = f"{env.get('XLA_FLAGS', '')} {_NO_FMA_FLAG}"
-    env["JAX_PLATFORMS"] = "cpu"
-    node = f"{request.node.path}::{request.node.name}"
-    run = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
-        + ["--noconftest", node],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert run.returncode == 0, run.stdout[-4000:]
+    _rerun(request, [_NO_FMA_FLAG])
     yield False
 
 
@@ -778,10 +798,10 @@ def test_kept_own_candidates_comparison_catches_a_changed_selection():
 
 
 def _pack(out, lse, block):
-    """Reference `merge_pair` pack of head block `block` of a head-major
-    partial (``out [2 * Hl, T, D]`` 16-bit, ``lse [2 * Hl, T]`` f32): its
-    heads' bits, then a row of each token's LSE bits, high halves on lanes
-    ``[0, Hl)``, low halves on ``[Hl, 2 Hl)``, zeros after."""
+    """Reference pack (`msa_attention_lse._write_pair_packs`) of head block
+    `block` of a head-major partial (``out [2 * Hl, T, D]`` 16-bit, ``lse [2 *
+    Hl, T]`` f32): its heads' bits, then a row of each token's LSE bits, high
+    halves on lanes ``[0, Hl)``, low halves on ``[Hl, 2 Hl)``, zeros after."""
     heads, dim = out.shape[0] // 2, out.shape[2]
     rows = slice(block * heads, (block + 1) * heads)
     words = np.asarray(jax.lax.bitcast_convert_type(out[rows], jnp.uint16))
@@ -792,135 +812,165 @@ def _pack(out, lse, block):
     return np.concatenate([words, halves[None]])
 
 
+def _partials(rng, heads, tokens, dim=128):
+    """A rank's head-major partial of both ranks' heads and its LSEs, some
+    tokens attended by no slot (lse -inf, output 0)."""
+    lse = rng.standard_normal((2 * heads, tokens)).astype(np.float32) * 4
+    lse[:, ::7] = -np.inf
+    out = rng.standard_normal((2 * heads, tokens, dim)).astype(np.float32)
+    out[:, ::7] = 0
+    return jnp.asarray(out, jnp.bfloat16), jnp.asarray(lse)
+
+
 # Heads per rank 8 as served, 4 (an LSE block of fewer than 8 rows).
+@pytest.mark.parametrize("heads", [8, 4])
+@pytest.mark.parametrize("rank", [0, 1])
+def test_pair_packs_layout(heads, rank):
+    """`_write_pair_packs` of a tile writes this rank's and the other rank's
+    `_pack`, bit for bit."""
+    rng = np.random.default_rng(heads + rank)
+    rows, dim = 8, 128
+    out, lse = _partials(rng, heads, rows)
+    out_f32 = out.astype(jnp.float32).reshape(2 * heads * rows, dim)
+    lse_col = lse.reshape(-1, 1)
+
+    def kernel(rank_ref, out_ref, lse_ref, own_ref, peer_ref):
+        msa_attention_lse._write_pair_packs(
+            own_ref, peer_ref, rank_ref[0], out_ref[...], lse_ref[...], jnp.bfloat16
+        )
+
+    pack = jax.ShapeDtypeStruct((heads + 1, rows, dim), jnp.uint16)
+    got = pl.pallas_call(
+        kernel,
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(),
+            pl.BlockSpec(),
+        ],
+        out_shape=[pack, pack],
+        interpret=True,
+    )(jnp.asarray([rank], jnp.int32), out_f32, lse_col)
+    for g, block in zip(got, (rank, 1 - rank)):
+        np.testing.assert_array_equal(np.asarray(g), _pack(out, lse, block))
+
+
+# Heads per rank 8 as served, 4; 384 tokens: two merge blocks.
 @pytest.mark.parametrize("tokens, heads", [(8, 8), (48, 8), (384, 8), (24, 4)])
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("rotated", [False, True])
-def test_merge_pair_matches_merge_partials(tokens, heads, rank, rotated):
+def test_merge_pair_packs_matches_merge_partials(tokens, heads, rank, rotated):
     """A pair's merge from this rank's and the other rank's packs of this
-    rank's heads equals `merge_partials` of both ranks' blocks in rank order,
-    bit for bit, rows no rank attended included."""
+    rank's heads (`_merge_pair_packs`) equals `merge_partials` of both ranks'
+    blocks in rank order, bit for bit, rows no rank attended included."""
     rng = np.random.default_rng(tokens + rank + 2 * rotated)
     dim = 128
-    outs, lses = [], []
-    for _ in range(2):
-        lse = rng.standard_normal((2 * heads, tokens)).astype(np.float32) * 4
-        lse[:, ::7] = -np.inf  # this rank attended nothing for these tokens
-        out = rng.standard_normal((2 * heads, tokens, dim)).astype(np.float32)
-        out[:, ::7] = 0
-        outs.append(jnp.asarray(out, jnp.bfloat16))
-        lses.append(jnp.asarray(lse))
-    lses[1] = lses[1].at[:, ::14].set(-np.inf)  # neither rank: the output is 0
+    (out0, lse0), (out1, lse1) = (_partials(rng, heads, tokens) for _ in range(2))
+    lse1 = lse1.at[:, ::14].set(-np.inf)  # neither rank: the output is 0
+    outs, lses = (out0, out1), (lse0, lse1)
     hadamard = (
         jnp.asarray(rng.choice([-1.0, 1.0], (dim, dim)), jnp.bfloat16)
         if rotated
         else None
     )
     block = slice(rank * heads, (rank + 1) * heads)
-    parts = jnp.stack([o[block] for o in outs])
-    stacked = jnp.stack([x[block].T for x in lses])
-    want = msa_dcp.merge_partials(parts, stacked, hadamard, interpret=True)
-    got = msa_dcp.merge_pair(
+    want = msa_dcp.merge_partials(
+        jnp.stack([o[block] for o in outs]),
+        jnp.stack([x[block].T for x in lses]),
+        hadamard,
+        interpret=True,
+    )
+
+    def kernel(rank_ref, own_ref, peer_ref, *rest):
+        msa_attention_lse._merge_pair_packs(
+            rank_ref[0], own_ref, peer_ref, rest[-1], rest[0] if rotated else None
+        )
+
+    got = pl.pallas_call(
+        kernel,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)]
+        + [pl.BlockSpec()] * (3 if rotated else 2),
+        out_shape=jax.ShapeDtypeStruct((tokens, heads * dim), jnp.bfloat16),
+        interpret=True,
+    )(
+        jnp.asarray([rank], jnp.int32),
         jnp.asarray(_pack(outs[rank], lses[rank], rank)),
         jnp.asarray(_pack(outs[1 - rank], lses[1 - rank], rank)),
-        jnp.asarray([rank], jnp.int32),
-        hadamard,
-        dtype=jnp.bfloat16,
-        interpret=True,
+        *([hadamard] if rotated else []),
     )
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
-def _halves(q, rank):
-    half = q.shape[0] // 2
-    return q[rank * half : (rank + 1) * half], q[(1 - rank) * half :][:half]
-
-
-# One tile, 3 tiles per grid step, two steps (48: a request of 5 rows, a
-# padding tile).
-@pytest.mark.parametrize("tokens", [8, 24, 48])
-@pytest.mark.parametrize("rank", [0, 1])
-def test_attention_pair_packs_are_the_partial(tokens, rank):
-    """`pair_packs` writes this rank's and the other rank's packs (`_pack`)
-    of the partial and LSEs the plain call returns, bit for bit."""
-    args, common = _attend_case(tokens, rank, False, seed=tokens + 3 * rank)
-    q, *rest = args
-    out, lse = msa_dcp.msa_attend_dcp(*args, own_first=True, **common)
-    got = msa_dcp.msa_attend_dcp(
-        _halves(q, rank), *rest, own_first=True, pair_packs=True, **common
-    )
-    assert np.isfinite(np.asarray(lse)).any()
-    for g, block in zip(got, (rank, 1 - rank)):
-        assert g.dtype == jnp.uint16
-        np.testing.assert_array_equal(np.asarray(g), _pack(out, lse, block))
-
-
-@pytest.mark.parametrize("tokens", [8, 24])
-@pytest.mark.parametrize("rank", [0, 1])
-def test_attention_pair_packs_of_a_4bit_cache(tokens, rank):
-    """`pair_packs` over a 4-bit cache (`attend` with scale pages, not the
-    words ring) writes the packs of the plain call's partial."""
-    args, common = _attend_case(tokens, rank, True, seed=tokens + rank)
-    q, kv_cache, *meta = args
-    rng = np.random.default_rng(tokens)
-    pages, rows, packing, width = kv_cache.shape
-    kv_cache = jnp.asarray(
-        rng.integers(0, 256, (pages, rows * packing // 8, 4, width)), jnp.uint8
-    )
-    scale_cache = jnp.asarray(
-        rng.uniform(0.01, 0.1, (pages, msa_fp4.SCALE_ROWS, msa_fp4.SCALE_LANES)),
-        jnp.float32,
-    )
-    common = dict(common, scale_cache=scale_cache)
-    out, lse = msa_dcp.msa_attend_dcp(q, kv_cache, *meta, own_first=True, **common)
-    got = msa_dcp.msa_attend_dcp(
-        _halves(q, rank), kv_cache, *meta, own_first=True, pair_packs=True, **common
-    )
-    for g, block in zip(got, (rank, 1 - rank)):
-        np.testing.assert_array_equal(np.asarray(g), _pack(out, lse, block))
-
-
-@pytest.mark.parametrize("tokens", [8, 16, 24, 48])
-def test_pair_merge_of_packs_matches_merge_partials(tokens):
-    """Both ranks of a pair, the permute simulated: each rank's merge of its
-    own pack and the other rank's equals `merge_partials` of the two ranks'
-    plain partials of its heads, bit for bit."""
-    args, common = _attend_case(tokens, 0, True, seed=tokens)
+def _check_pair_merge(tokens, seed):
+    """Both ranks of a DCP pair's decode step (shared queries and metadata,
+    each rank's own cache and candidates, its own first): `msa_attend_dcp`
+    with `pair_axis` under a ``shard_map`` over two host devices (the TPU
+    interpreter runs the exchange) equals `merge_partials` of the two ranks'
+    plain partials of their heads."""
+    args, common = _attend_case(tokens, 0, True, seed=seed)
     q, kv_cache, candidates, *meta = args
-    rng = np.random.default_rng(tokens + 1)
-    caches = (
+    rng = np.random.default_rng(seed + 1)
+    caches = [
         kv_cache,
         jnp.asarray(rng.integers(-2, 3, kv_cache.shape), kv_cache.dtype),
-    )
-    plain, packs = [], []
-    for r in (0, 1):
-        rank_args = (caches[r], candidates[::-1] if r else candidates, *meta)
-        rank_common = dict(common, rank=r)
-        plain.append(
-            msa_dcp.msa_attend_dcp(q, *rank_args, own_first=True, **rank_common)
-        )
-        packs.append(
-            msa_dcp.msa_attend_dcp(
-                _halves(q, r),
-                *rank_args,
-                own_first=True,
-                pair_packs=True,
-                **rank_common,
-            )
-        )
+    ]
+    cands = [candidates, candidates[::-1]]
     heads = q.shape[0] // 2
-    for r in (0, 1):
-        block = slice(r * heads, (r + 1) * heads)
-        want = msa_dcp.merge_partials(
+    plain = [
+        msa_dcp.msa_attend_dcp(
+            q, caches[r], cands[r], *meta, **dict(common, rank=r), own_first=True
+        )
+        for r in (0, 1)
+    ]
+    want = [
+        msa_dcp.merge_partials(
             jnp.stack([out[block] for out, _ in plain]),
             jnp.stack([lse[block].T for _, lse in plain]),
             interpret=True,
         )
-        got = msa_dcp.merge_pair(
-            packs[r][0],
-            packs[1 - r][1],
-            jnp.asarray([r], jnp.int32),
-            dtype=q.dtype,
-            interpret=True,
+        for block in (slice(0, heads), slice(heads, 2 * heads))
+    ]
+
+    def body(rank, q_own, q_peer, cache, cand):
+        return msa_dcp.msa_attend_dcp(
+            (q_own, q_peer),
+            cache,
+            cand[0],
+            *meta,
+            **dict(common, rank=rank),
+            own_first=True,
+            pair_axis="dcp",
         )
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+    mesh = Mesh(np.array(jax.devices("cpu")[:2]), ("dcp",))
+    stacked = [
+        jnp.arange(2, dtype=jnp.int32),
+        q,
+        jnp.concatenate([q[heads:], q[:heads]]),
+        jnp.concatenate(caches),
+        jnp.stack(cands),
+    ]
+    got = jax.jit(
+        jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(P("dcp"),) * 5,
+            out_specs=P("dcp"),
+            check_vma=False,
+        )
+    )(*stacked)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(jnp.concatenate(want)))
+
+
+# One tile; 2 / 3 tiles in one grid step; two grid steps (48: a request of 5
+# rows, a padding tile).
+@pytest.mark.parametrize("tokens", [8, 16, 24, 48])
+def test_pair_merge_matches_merge_partials(tokens, on_two_devices, monkeypatch):
+    """A pair call exchanges and merges what `merge_partials` merges, bit for
+    bit. The TPU interpreter does not run the words ring's bitcast copies:
+    the pages are read as packed rows (`test_attention_of_word_pages` holds
+    the words read to them); nor the 4-bit pages' bitcast reads (their pack
+    writes and the unrotating merge are the same code, tested above)."""
+    if not on_two_devices:
+        return
+    monkeypatch.setattr(msa_attention_lse, "_words_ring", lambda *_: False)
+    _check_pair_merge(tokens, seed=tokens)

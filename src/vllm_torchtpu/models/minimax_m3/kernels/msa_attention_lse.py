@@ -64,6 +64,11 @@ _WORDS_SPLIT_WIDTH = 8
 _ATTEND_WORDS = True
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
+# Barrier semaphore of a DCP pair's partials exchange (`_exchange_and_merge`),
+# apart from the other remote-DMA kernels' (0, and 3 for DeepSeek's).
+_PAIR_COLLECTIVE_ID = 5
+# Tokens per block of a pair call's merge (`_merge_pair_packs`).
+_MERGE_BLOCK_TOKENS = 256
 
 
 def _kernel(
@@ -659,8 +664,8 @@ def _write_pair_packs(own_ref, peer_ref, rank, out, lse, dtype):
     `rank`'s pack of its own heads and its pack of the other rank's, ``own_ref``
     and ``peer_ref [Hl + 1, Bq, D]`` uint16: a head block's partial bits
     (`dtype`), then a row of each token's Hl LSEs, high halves then low halves
-    (`msa_dcp.merge_pair`). The other rank's pack is the operand of the pair's
-    collective permute as written: no XLA op slices or relays the partial."""
+    (`_merge_pair_packs`). The other rank's pack is what `_exchange_and_merge`
+    sends it, as written."""
     num_heads, block_q, head_dim = own_ref.shape
     num_heads -= 1
     heads = out.reshape(2 * num_heads, block_q, head_dim).astype(dtype)
@@ -690,6 +695,105 @@ def _lse_halves(bits, width):
     return jnp.where(
         lane < num_heads, jax.lax.shift_right_logical(words, 16), words & 0xFFFF
     ).astype(jnp.uint16)
+
+
+def merge_lse_rows(lse, part, dcp, o_ref, hadamard_ref):
+    """The LSE merge of ``dcp`` partials: ``lse [dcp, Bt, Hl]`` f32, ``part(r,
+    h)`` rank ``r``'s ``[Bt, D]`` partial of head ``h`` -> ``o_ref [Bt, Hl *
+    D]`` (unrotated by `hadamard_ref` if given)."""
+    num_heads = lse.shape[2]
+    head_dim = o_ref.shape[1] // num_heads
+    # torch.logsumexp over the ranks; a token no rank attended (every lse
+    # -inf) gets NaN weights, which the where below turns into zeros.
+    peak = jnp.max(lse, axis=0)
+    peak = jnp.where(jnp.isinf(peak), 0.0, peak)
+    total = peak + jnp.log(jnp.sum(jnp.exp(lse - peak[None]), axis=0))
+    weight = jnp.exp(lse - total[None])
+    weight = jnp.where(weight > 0, weight, 0.0)  # NaN (no rank attended) -> 0
+    for h in range(num_heads):
+        merged = None
+        for r in range(dcp):
+            p = part(r, h)
+            w = jnp.broadcast_to(weight[r, :, h : h + 1], p.shape)
+            # A plain product: a rank that attended nothing for a token has
+            # a zero partial (`msa_sparse_attention_lse`), never NaN, so no
+            # select guards it (a compare and a select per element, ~20% of
+            # the kernel's bundles).
+            term = p.astype(jnp.float32) * w
+            merged = term if merged is None else merged + term
+        merged = merged.astype(o_ref.dtype)
+        if hadamard_ref is not None:
+            merged = jnp.dot(
+                merged, hadamard_ref[...], preferred_element_type=jnp.float32
+            )
+            merged = (merged * (1.0 / head_dim)).astype(o_ref.dtype)
+        o_ref[:, h * head_dim : (h + 1) * head_dim] = merged
+
+
+def _merge_pair_packs(rank, own_ref, peer_ref, o_ref, hadamard_ref):
+    """`merge_lse_rows` of a pair from this rank's and the other rank's packs
+    of this rank's heads (`_write_pair_packs`), ``own_ref`` and ``peer_ref
+    [Hl + 1, T, D]`` uint16, into ``o_ref [T, Hl * D]``, the terms in rank
+    order (as `msa_dcp.merge_partials` adds them)."""
+    num_heads = own_ref.shape[0] - 1
+    num_tokens = o_ref.shape[0]
+    first = rank == 0  # this rank's terms come first
+    for start in range(0, num_tokens, _MERGE_BLOCK_TOKENS):
+        rows = pl.ds(start, min(_MERGE_BLOCK_TOKENS, num_tokens - start))
+
+        def lses(ref, rows=rows):  # [Bt, Hl] f32 from the pack's LSE halves row
+            bits = ref[num_heads, rows].astype(jnp.int32)  # [Bt, D]
+            return pltpu.bitcast(
+                (bits[:, :num_heads] << 16) | bits[:, num_heads : 2 * num_heads],
+                jnp.float32,
+            )
+
+        own_lse, peer_lse = lses(own_ref), lses(peer_ref)
+        lse = jnp.stack(
+            [jnp.where(first, own_lse, peer_lse), jnp.where(first, peer_lse, own_lse)]
+        )
+
+        def part(r, h, rows=rows):
+            own = pltpu.bitcast(own_ref[h, rows], o_ref.dtype)
+            peer = pltpu.bitcast(peer_ref[h, rows], o_ref.dtype)
+            return jnp.where(first == (r == 0), own, peer)
+
+        merge_lse_rows(lse, part, 2, o_ref.at[rows], hadamard_ref)
+
+
+def _signal_pair(rank_ref, axis):
+    """Tells the other rank of the pair this rank is in its call (its receive
+    buffer is live)."""
+    pl.semaphore_signal(
+        pltpu.get_barrier_semaphore(),
+        1,
+        device_id={axis: 1 - rank_ref[0]},
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+
+
+def _exchange_and_merge(
+    rank_ref, own_ref, peer_ref, recv_ref, sems, o_ref, hadamard_ref, axis
+):
+    """A pair call's last grid step: once the other rank is in its call
+    (`_signal_pair`), its pack of the other rank's heads goes to that rank's
+    `recv_ref` by remote DMA, and the pack the other rank sent here merges
+    with this rank's own. Each rank waits for what it receives before it
+    merges and for what it sends before it exits, so neither leaves while a
+    copy into or out of its buffers is in flight."""
+    pl.semaphore_wait(pltpu.get_barrier_semaphore(), 1)
+    copy = pltpu.make_async_remote_copy(
+        peer_ref,
+        recv_ref,
+        sems.at[0],
+        sems.at[1],
+        device_id={axis: 1 - rank_ref[0]},
+        device_id_type=pl.DeviceIdType.MESH,
+    )
+    copy.start()
+    copy.wait_recv()
+    _merge_pair_packs(rank_ref[0], own_ref, recv_ref, o_ref, hadamard_ref)
+    copy.wait_send()
 
 
 def _words_ring(kv_cache, block_q: int, fp4: bool, row_width: int) -> bool:
@@ -893,6 +997,8 @@ def _attention_call(
     scale_cache=None,
     scale_rows=None,
     pair_rank=None,
+    pair_axis=None,
+    hadamard=None,
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -913,10 +1019,15 @@ def _attention_call(
     t``): into `out` in place when given (an earlier call's
     result), else into new arrays whose other rows are unset. A 4-bit
     `kv_cache` takes its `scale_cache` and `scale_rows` (`_kernel`'s
-    `fp4_rows`). With `pair_rank` (``int32[1]``, a scalar-prefetch input), a
-    DCP pair's one call over both ranks' heads in rank order writes the
-    pair's packs ``(own, peer) [Hl + 1, T, D]`` uint16 instead
-    (`_write_pair_packs`)."""
+    `fp4_rows`).
+
+    With `pair_rank` (``int32[1]``, a scalar-prefetch input) and `pair_axis`,
+    inside a ``shard_map`` over a DCP pair's mesh axis, a pair's one call
+    over both ranks' heads in rank order returns this rank's heads merged
+    over the pair, ``[T, Hl * D]`` (unrotated by a 4-bit cache's
+    `hadamard`): its tiles write both ranks' packs (`_write_pair_packs`) to
+    VMEM, and the last grid step exchanges them with the other rank and
+    merges (`_exchange_and_merge`). Both ranks must make the call."""
     num_q_heads, num_tokens, head_dim = q.shape
     num_heads = q_per_head
     _, rows_per_page, packing, _ = kv_cache.shape
@@ -950,10 +1061,41 @@ def _attention_call(
             **kwargs,
         )
 
+    def pair_kernel(packed_ref, table_ref, head_ref, offset_ref, rank_ref, *refs, **kw):
+        *refs, own_ref, peer_ref, recv_ref, sems = refs
+        num_in = 5 + len(scale_inputs)
+        hadamard_ref = refs[num_in] if rotated else None
+        out_ref = refs[num_in + rotated]
+        b = pl.program_id(0)
+        pl.when(b == 0)(functools.partial(_signal_pair, rank_ref, pair_axis))
+        rows = pl.ds(pl.multiple_of(b * step_rows, step_rows), step_rows)
+        kernel(
+            packed_ref,
+            table_ref,
+            head_ref,
+            offset_ref,
+            *refs[:num_in],
+            own_ref.at[:, rows],
+            peer_ref.at[:, rows],
+            *refs[num_in + rotated + 1 :],
+            pair_rank_ref=rank_ref,
+            **kw,
+        )
+        pl.when(b == num_steps - 1)(
+            functools.partial(
+                _exchange_and_merge,
+                rank_ref,
+                own_ref,
+                peer_ref,
+                recv_ref,
+                sems,
+                out_ref,
+                hadamard_ref,
+                pair_axis,
+            )
+        )
+
     def kernel(packed_ref, *refs, **kwargs):
-        if pair:  # the rank is the last scalar-prefetch input
-            kwargs["pair_rank_ref"] = refs[3]
-            refs = refs[:3] + refs[4:]
         if len(packed_ref.shape) == 2:  # a caller's [1, R] row (`_chunked_call`)
             packed_ref = packed_ref.at[0]
         if not in_kernel:
@@ -998,8 +1140,10 @@ def _attention_call(
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
     words = _words_ring(kv_cache, block_q, fp4, row_width)
     pair = pair_rank is not None
+    rotated = hadamard is not None
     if pair and (
-        aliased
+        pair_axis is None
+        or aliased
         or transposed
         or num_heads != num_q_heads
         or num_heads % 2
@@ -1007,19 +1151,25 @@ def _attention_call(
         or q.dtype.itemsize != 2
     ):
         raise ValueError(
-            "a pair's packs come from one new call over both ranks' 16-bit "
-            f"heads, 2 * Hl <= D, scores not transposed; got q {q.dtype} "
-            f"{q.shape}, {num_heads} heads per call, block_q {block_q}"
+            "a pair's merge comes from one new call over both ranks' 16-bit "
+            f"heads, 2 * Hl <= D, scores not transposed, on a mesh axis; got q "
+            f"{q.dtype} {q.shape}, {num_heads} heads per call, block_q "
+            f"{block_q}, axis {pair_axis}"
         )
+    if rotated and not pair:
+        raise ValueError("hadamard unrotates a pair's merge")
+    step_rows = tiles_per_step * block_q
+    pair_inputs, pair_specs, pair_scratch = [], [], []
     if pair:
-        pack_spec = pl.BlockSpec(
-            (num_heads // 2 + 1, tiles_per_step * block_q, head_dim),
-            lambda w, *prefetch: (0, *tile_block(w, *prefetch)),
-        )
-        out_specs = [pack_spec] * 2
-        out_shape = [
-            jax.ShapeDtypeStruct((num_heads // 2 + 1, num_tokens, head_dim), jnp.uint16)
-        ] * 2
+        half = num_heads // 2
+        if rotated:
+            pair_inputs = [hadamard]
+            pair_specs = [pl.BlockSpec((head_dim, head_dim), lambda w, *_: (0, 0))]
+        # This rank's and the other rank's packs, the other rank's of ours.
+        pack = pltpu.VMEM((half + 1, num_tokens, head_dim), jnp.uint16)
+        pair_scratch = [pack, pack, pack, pltpu.SemaphoreType.DMA((2,))]
+        out_specs = pl.BlockSpec((num_tokens, half * head_dim), lambda w, *_: (0, 0))
+        out_shape = jax.ShapeDtypeStruct((num_tokens, half * head_dim), q.dtype)
     else:
         out_specs = [
             pl.BlockSpec(
@@ -1062,6 +1212,7 @@ def _attention_call(
             pl.BlockSpec((tiles_per_step * block_q, 1), tile_block),
             pl.BlockSpec(memory_space=pl.ANY),
             *(pl.BlockSpec(memory_space=pl.ANY) for _ in scale_inputs),
+            *pair_specs,
             *in_place,
         ],
         out_specs=out_specs,
@@ -1108,9 +1259,10 @@ def _attention_call(
                 else []
             ),
             *([pltpu.SMEM((words_len + 1,), jnp.int32)] if in_kernel else []),
+            *pair_scratch,
         ],
     )
-    num_inputs = 4 + pair + 5 + len(scale_inputs)
+    num_inputs = 4 + pair + 5 + len(scale_inputs) + len(pair_inputs)
     # VMEM the call holds: its page (and scale) ring, double-buffered blocks.
     rows = tiles_per_step * block_q
     held = ring * pages_per_step * rows_per_page * packing * row_width
@@ -1118,9 +1270,13 @@ def _attention_call(
     if fp4:
         held += ring * pages_per_step * math.prod(scale_cache.shape[1:]) * 4
     held += 2 * (2 * num_heads * rows * head_dim * q.dtype.itemsize + rows * topk * 4)
+    if pair:  # three packs, the merged output, the hadamard
+        held += 3 * (num_heads // 2 + 1) * num_tokens * head_dim * 2
+        held += 2 * num_tokens * num_heads // 2 * head_dim * q.dtype.itemsize
+        held += sum(2 * x.size * x.dtype.itemsize for x in pair_inputs)
     return pl.pallas_call(
         functools.partial(
-            kernel,
+            pair_kernel if pair else kernel,
             sm_scale=sm_scale,
             aliased=aliased,
             tiles_per_step=tiles_per_step,
@@ -1144,8 +1300,10 @@ def _attention_call(
             # add scalar work to each step (as the ragged paged attention).
             disable_bounds_checks=True,
             disable_semaphore_checks=True,
+            **({"collective_id": _PAIR_COLLECTIVE_ID} if pair else {}),
         ),
-        interpret=interpret,
+        # Remote copies and the barrier need the TPU interpreter.
+        interpret=pltpu.InterpretParams() if interpret and pair else interpret,
         name="minimax_m3_msa_sparse_attention_lse",
     )(
         packed,
@@ -1159,6 +1317,7 @@ def _attention_call(
         local_limit,
         kv_cache,
         *scale_inputs,
+        *pair_inputs,
         *(out if aliased else ()),
     )
 
@@ -1228,6 +1387,8 @@ def _chunked_call(
     head_major=False,
     q_head_major=False,
     pair_rank=None,
+    pair_axis=None,
+    hadamard=None,
     work=None,
     work_pages=False,
 ):
@@ -1249,8 +1410,8 @@ def _chunked_call(
     D]``, as the kernel reads it. `work` is the one call's `_packed_work` row
     ``[1, R]`` if the caller built it (`msa_dcp.pair_work`); with
     `work_pages` it goes on with its unions' physical pages and `page_table`
-    is not read. With `pair_rank`, one call's pair packs ``(own, peer)``
-    come back (`_attention_call`)."""
+    is not read. With `pair_rank`, one call's merge over the pair comes back
+    (`_attention_call`)."""
     if not q_head_major:
         q = q.transpose(1, 0, 2)
     num_q_heads, num_tokens, _ = q.shape
@@ -1269,6 +1430,8 @@ def _chunked_call(
         scale_cache=scale_cache,
         scale_rows=scale_rows,
         pair_rank=pair_rank,
+        pair_axis=pair_axis,
+        hadamard=hadamard,
     )
     limit = msa_attention.MAX_TOKENS_PER_CALL
     step = min(num_tokens, max(block_q, limit - limit % block_q))
@@ -1293,7 +1456,7 @@ def _chunked_call(
     if work_pages and work is None:
         raise ValueError("work_pages describes a caller's work row")
     if pair_rank is not None and num_heads * num_chunks != 1:
-        raise ValueError("a pair's packs come from one call")
+        raise ValueError("a pair's merge comes from one call")
     if work is None:
         packed, tiles_per_step = _packed_work(
             selected.reshape(num_heads * num_chunks, step, selected.shape[2]),
@@ -1331,11 +1494,11 @@ def _chunked_call(
         )
 
     out = head_chunk(0, None)
+    if pair_rank is not None:  # this rank's heads merged, token-major
+        return out[:num_tokens]
     if num_heads * num_chunks > 1:
         out = jax.lax.fori_loop(1, num_heads * num_chunks, head_chunk, out)
     out, lse = out
-    if pair_rank is not None:  # the pair's packs, head-major
-        return out[:, :num_tokens], lse[:, :num_tokens]
     # lse [head blocks, tiles, 1, Hg * Bq] -> [T, G * Hg] (or head-major)
     num_blocks, num_tiles = lse.shape[:2]
     if head_major:
@@ -1385,6 +1548,7 @@ def _check_rows(kv_cache, head_dim, head=None):
         "interpret",
         "head_major",
         "q_head_major",
+        "pair_axis",
         "work_pages",
     ),
 )
@@ -1407,9 +1571,11 @@ def msa_sparse_attention_lse(
     head_major: bool = False,
     q_head_major: bool = False,
     pair_rank: jax.Array | None = None,
+    pair_axis: str | None = None,
+    hadamard: jax.Array | None = None,
     work: jax.Array | None = None,
     work_pages: bool = False,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array] | jax.Array:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
     by `page_table`) returning ``(out [T, H, D], lse [T, H] f32)``.
 
@@ -1420,23 +1586,24 @@ def msa_sparse_attention_lse(
     A 4-bit cache takes its `scale_cache` (`msa_attention.msa_sparse_attention`).
     With `head_major`, the results come back head-major: ``out [H, T, D]``,
     ``lse [H, T]``; with `q_head_major`, q comes head-major, ``[H, T, D]``.
-    With `pair_rank` (``int32[1]``; q holds a DCP pair's heads in rank order,
-    ``[2 * Hl, T, D]`` 16-bit), the results are this rank's and the other
-    rank's packs ``(own, peer) [Hl + 1, T, D]`` uint16 (`_write_pair_packs`,
-    `msa_dcp.merge_pair`). `work` is the call's work list row when
-    the caller built it with the selection (`msa_dcp.pair_work`); with
-    `work_pages` the row goes on with its unions' physical pages and
-    `page_table` is not read.
+    With `pair_rank` (``int32[1]``) and `pair_axis`, inside a ``shard_map``
+    over a DCP pair's mesh axis (q holds the pair's heads in rank order,
+    ``[2 * Hl, T, D]`` 16-bit), the result is this rank's heads merged over
+    the pair, ``[T, Hl * D]``, unrotated by a 4-bit cache's `hadamard`
+    (`_attention_call`); both ranks must make the call. `work` is the call's
+    work list row when the caller built it with the selection
+    (`msa_dcp.pair_work`); with `work_pages` the row goes on with its unions'
+    physical pages and `page_table` is not read.
     """
     num_tokens, head_dim = selected.shape[0], q.shape[2]
     msa_attention.check_cache(kv_cache, scale_cache)
     _check_rows(kv_cache, head_dim, head)
     if pair_rank is not None and not (head_major and q_head_major):
-        raise ValueError("a pair's packs are head-major")
+        raise ValueError("a pair's merge reads head-major queries")
     q, selected, local_page, local_limit = _pad_tokens(
         q, selected, local_page, local_limit, block_q, q_head_major
     )
-    out, lse = _chunked_call(
+    result = _chunked_call(
         q,
         kv_cache,
         selected[:, None],
@@ -1453,9 +1620,14 @@ def msa_sparse_attention_lse(
         head_major=head_major,
         q_head_major=q_head_major,
         pair_rank=pair_rank,
+        pair_axis=pair_axis,
+        hadamard=hadamard,
         work=work,
         work_pages=work_pages,
     )
+    if pair_rank is not None:
+        return result[:num_tokens]
+    out, lse = result
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
     return out[:num_tokens], lse[:num_tokens]
