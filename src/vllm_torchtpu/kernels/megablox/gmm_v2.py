@@ -170,6 +170,9 @@ FP8_DECODE_MAX_M = 2048
 # small-m tiles (2 fp8 buckets, a third of the program) serve them.
 FP8_SMALL_DECODE_MAX_M = 512
 
+# Lanes of gmm_v2's lhs_amax rows (one lane-tile row per lhs row).
+LHS_AMAX_LANES = 128
+
 # Define data classes.
 
 
@@ -354,11 +357,16 @@ def requantize_fp8_colscale(
     return w_blocks.reshape(-1, tile_n).astype(fp8), col_scale
 
 
+def fp8_row_scale(amax: jax.Array) -> jax.Array:
+    """The e4m3 scale of rows whose largest magnitude is ``amax`` (f32)."""
+    return amax / float(jnp.finfo(jnp.float8_e4m3fn).max)
+
+
 def quantize_rows_fp8(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Per-row e4m3 quantization: returns (x8, row_scale [m, 1] f32)."""
     fp8 = jnp.float8_e4m3fn
     amax = jnp.max(jnp.abs(x), axis=1, keepdims=True).astype(jnp.float32)
-    row_scale = amax / float(jnp.finfo(fp8).max)
+    row_scale = fp8_row_scale(amax)
     inv = jnp.where(row_scale == 0, 0.0, 1.0 / row_scale).astype(x.dtype)
     return (x * inv).astype(fp8), row_scale
 
@@ -373,6 +381,9 @@ class GmmConfigs:
     acc_dtype: jnp.dtype
     zero_init: bool
     fuse_act: str | None
+    # lhs arrives as e4m3 rows plus each row's amax (see gmm_v2's lhs_amax);
+    # lhs_cfgs then describes the bf16 rows they were quantized from.
+    lhs_prequantized: bool = False
 
     @property
     def num_quant_blocks_per_tile_k(self) -> int:
@@ -396,6 +407,14 @@ class GmmConfigs:
             and pltpu.get_tpu_info().is_matmul_supported(
                 jnp.float8_e4m3fn.dtype, jnp.float8_e4m3fn.dtype
             )
+        )
+
+    def takes_prequantized_lhs(self) -> bool:
+        """Whether every bucket runs W8A8 on full-depth rows (one k tile, so a
+        row's amax is that of its single tile), so the kernel can take e4m3
+        rows with their amax in place of the bf16 rows."""
+        return self.tiles.tile_k == self.dims.size_k and all(
+            self.uses_fp8_w8a8(b) for b in self.tiles.bucket_sizes
         )
 
     @property
@@ -472,7 +491,7 @@ def _scale_buffering(tile_m: int) -> pl.Buffered:
 
 def generate_block_specs(
     metadata_ref: MetadataRef, cfgs: GmmConfigs
-) -> tuple[tuple[pl.BlockSpec, WeightsRef], pl.BlockSpec]:
+) -> tuple[tuple[Any, WeightsRef], pl.BlockSpec]:
     """Generates block specs for the given lhs, rhs, and out refs."""
 
     index_map = IndexMaps(metadata_ref, cfgs)
@@ -482,6 +501,12 @@ def generate_block_specs(
         (bounded_slice_gm, cfgs.dims.size_lhs_sublane, cfgs.tiles.tile_k),
         index_map.lhs_index_map,
     )
+    if cfgs.lhs_prequantized:
+        amax_block_spec = pl.BlockSpec(
+            (bounded_slice_gm, cfgs.dims.size_lhs_sublane, LHS_AMAX_LANES),
+            index_map.lhs_index_map,
+        )
+        lhs_block_spec = (lhs_block_spec, amax_block_spec)
 
     rhs_weight_spec = pl.BlockSpec(
         (None, cfgs.tiles.tile_k, cfgs.tiles.tile_n),
@@ -520,8 +545,9 @@ def generate_block_specs(
 
 def inner_kernel(
     # In
-    tiled_lhs_ref: jax.Array,
-    # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k]
+    tiled_lhs_ref: Any,
+    # [tile_m // size_lhs_sublane, size_lhs_sublane, tile_k], with the rows'
+    # amax [.., size_lhs_sublane, LHS_AMAX_LANES] if prequantized
     tiled_rhs_ref: RhsRef,  # [tile_k, tile_n]
     # Out
     tiled_out_ref: jax.Array,
@@ -561,6 +587,10 @@ def inner_kernel(
     m_start_local = m_start - m_offset
     m_end_local = m_end - m_offset
 
+    tiled_amax_ref = None
+    if cfgs.lhs_prequantized:
+        tiled_lhs_ref, tiled_amax_ref = tiled_lhs_ref
+
     def _matmul(is_first_k_step: bool, is_last_k_step: bool, bucket_m: int):
         tpu_info = pltpu.get_tpu_info()
         mxu_size = tpu_info.mxu_column_size
@@ -581,12 +611,16 @@ def inner_kernel(
             tiled_rhs, col_scale = requantize_fp8_colscale(
                 tiled_rhs, tiled_rhs_ref.get_scale(), rhs_qbs, cfgs.lhs_cfgs.dtype
             )
-            valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
-            if is_last_k_step and valid_k != 0:
-                # Columns past size_k are stale VMEM; keep them out of the amax.
-                col = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape, 1)
-                tiled_lhs = jnp.where(col < valid_k, tiled_lhs, 0)
-            tiled_lhs, row_scale = quantize_rows_fp8(tiled_lhs)
+            if tiled_amax_ref is not None:
+                amax = tiled_amax_ref.reshape(-1, LHS_AMAX_LANES)[:bucket_m, :1]
+                row_scale = fp8_row_scale(amax)
+            else:
+                valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
+                if is_last_k_step and valid_k != 0:
+                    # Columns past size_k are stale VMEM; keep them out of the amax.
+                    col = lax.broadcasted_iota(jnp.int32, tiled_lhs.shape, 1)
+                    tiled_lhs = jnp.where(col < valid_k, tiled_lhs, 0)
+                tiled_lhs, row_scale = quantize_rows_fp8(tiled_lhs)
             rhs_qbs = cfgs.tiles.tile_k
         elif fp8_rhs is not None:
             # Skinny m: the MXU weight push binds, and fp8 halves it.
@@ -978,7 +1012,7 @@ def kernel_main(
     lhs_group_sizes_ref: jax.Array,  # int32[size_lhs_group]
     group_offset_ref: jax.Array,  # int32[1]
     # In
-    lhs_ref: jax.Array,  # [size_m, size_k]
+    lhs_ref: Any,  # [size_m, size_k], or (e4m3 rows, their lhs_amax)
     rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
     # Out
     out_ref: jax.Array,  # [size_m, size_n]
@@ -1052,7 +1086,7 @@ def kernel_main(
 
 
 def run_gmm_pipeline(
-    lhs_ref: jax.Array,  # [size_m, size_k]
+    lhs_ref: Any,  # [size_m, size_k], or (e4m3 rows, their lhs_amax)
     rhs_ref: WeightsRef,  # [size_group, size_k, size_n]
     out_ref: jax.Array,  # [size_m, size_n]
     partial_out_ref: jax.Array,  # [size_lhs_sublane, tile_n]
@@ -1093,7 +1127,9 @@ def run_gmm_pipeline(
 
     # Bounded slice requires second last dim to be aligned to the sublane size.
     # rhs_ref uses static tiling thus reshape is not needed.
-    lhs_in = lhs_ref.reshape(-1, cfgs.dims.size_lhs_sublane, lhs_ref.shape[-1])
+    lhs_in = jax.tree.map(
+        lambda x: x.reshape(-1, cfgs.dims.size_lhs_sublane, x.shape[-1]), lhs_ref
+    )
     out_in = out_ref.reshape(-1, cfgs.dims.size_lhs_sublane, out_ref.shape[-1])
     scratches = [partial_out_ref, acc_ref, metadata_ref]
     grid = (num_n, num_gm, num_k)
@@ -1536,8 +1572,12 @@ def make_gmm_configs(
     zero_initialize: bool,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
+    lhs_prequantized: bool = False,
 ):
-    """Fills the GMM config for the GMM kernel."""
+    """Fills the GMM config for the GMM kernel.
+
+    ``lhs_prequantized``: ``lhs`` holds e4m3 rows quantized from bf16 rows
+    (gmm_v2's lhs_amax); the configs describe those bf16 rows."""
 
     packing_factor = get_packing_factor(rhs.dtype, rhs_quant_dtype)
 
@@ -1587,6 +1627,11 @@ def make_gmm_configs(
         if tpu_info.int8_ops_per_second > 0 and not is_rhs_float:
             lhs_q_dtype = jnp.int8.dtype
 
+    if lhs_prequantized:
+        assert lhs.dtype == jnp.float8_e4m3fn and lhs_q_dtype is None, lhs.dtype
+    # Prequantized lhs tiles as its bf16 rows would: the e4m3 rows' buffers
+    # are half those the estimate counts, which covers the amax blocks
+    # (LHS_AMAX_LANES f32 per row) while tile_k >= 4 * LHS_AMAX_LANES.
     lhs_cfgs = InputConfigs(
         quant_dtype=lhs_q_dtype,
         # Input quantization involves reading all elements in a block to compute
@@ -1594,11 +1639,11 @@ def make_gmm_configs(
         # block size that is small enough to minimize memory overhead but large
         # enough to minimize compute overhead of quantization.
         quant_block_size=512,
-        dtype=lhs.dtype,
+        dtype=jnp.dtype(jnp.bfloat16) if lhs_prequantized else lhs.dtype,
     )
 
     if out_dtype is None:
-        out_dtype = lhs.dtype
+        out_dtype = lhs_cfgs.dtype
 
     if acc_dtype is None:
         if lhs_cfgs.quant_dtype is None:
@@ -1623,7 +1668,38 @@ def make_gmm_configs(
         acc_dtype=jnp.dtype(acc_dtype),
         zero_init=zero_initialize,
         fuse_act=fuse_act,
+        lhs_prequantized=lhs_prequantized,
     )
+
+
+def takes_prequantized_lhs(
+    size_m: int,
+    rhs: jax.Array,
+    rhs_scale: jax.Array | None,
+    num_groups: int,
+    fuse_act: str | None = None,
+) -> bool:
+    """Whether gmm_v2 on [size_m, K] lhs against ``rhs`` accepts e4m3 rows
+    with their amax (``lhs_amax``) in place of bf16 rows."""
+    fp8 = jnp.float8_e4m3fn
+    size_m = align_to(size_m, _get_lhs_sublane_size(fp8, size_m))
+    cfgs = make_gmm_configs(
+        jax.ShapeDtypeStruct((size_m, rhs.shape[1]), fp8),
+        rhs,
+        rhs_scale,
+        None,
+        jax.ShapeDtypeStruct((num_groups,), jnp.int32),
+        jax.ShapeDtypeStruct((1,), jnp.int32),
+        tile_info=calculate_tiling,
+        vmem_limit_bytes=int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9),
+        out_dtype=None,
+        acc_dtype=None,
+        maybe_quantize_lhs=False,
+        zero_initialize=False,
+        fuse_act=fuse_act,
+        lhs_prequantized=True,
+    )
+    return cfgs.takes_prequantized_lhs()
 
 
 def get_metadata(cfgs: GmmConfigs) -> dict[str, str | int | float]:
@@ -1686,6 +1762,7 @@ def gmm_v2(
     zero_initialize: bool = True,
     fuse_act: str | None = None,
     rhs_quant_dtype: jnp.dtype | None = None,
+    lhs_amax: jax.Array | None = None,  # f32 [size_m, LHS_AMAX_LANES]
 ) -> jax.Array:
     """GMM kernel implemented with emit_pipeline.
 
@@ -1711,6 +1788,11 @@ def gmm_v2(
         fuse_act: Activation function to fuse with GMM, None if no fusion.
         rhs_quant_dtype: Quantized dtype encoded by a pre-packed RHS carrier.
             Packed along k-axis
+        lhs_amax: With e4m3 ``lhs``, each row's largest magnitude in the bf16
+            rows that ``lhs`` quantizes exactly as the W8A8 path would
+            (`quantize_rows_fp8`), broadcast over LHS_AMAX_LANES lanes so it
+            gathers like a row; the kernel then skips that quantization.
+            Requires every bucket to run W8A8 (`takes_prequantized_lhs`).
 
     Returns:
         Output of shape [size_m, size_n].
@@ -1726,6 +1808,8 @@ def gmm_v2(
     padded_size_m = align_to(size_m, size_lhs_sublane)
     if padded_size_m != size_m:
         lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+        if lhs_amax is not None:
+            lhs_amax = jnp.pad(lhs_amax, ((0, padded_size_m - size_m), (0, 0)))
 
     if group_offset is None:
         group_offset = jnp.array([0], dtype=jnp.int32)
@@ -1751,8 +1835,11 @@ def gmm_v2(
         zero_initialize=zero_initialize,
         fuse_act=fuse_act,
         rhs_quant_dtype=rhs_quant_dtype,
+        lhs_prequantized=lhs_amax is not None,
     )
     dims = cfgs.dims
+    if cfgs.lhs_prequantized and not cfgs.takes_prequantized_lhs():
+        raise ValueError(f"gmm_v2 takes no prequantized lhs at {dims}, {cfgs.tiles}")
 
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = None
@@ -1795,6 +1882,11 @@ def gmm_v2(
     aligned_n = align_to(cfgs.out_size_n, num_lanes)
     out_init = jax.ShapeDtypeStruct((dims.size_m, aligned_n), cfgs.out_dtype)
     rhs_weights = WeightsRef(weight=rhs, scale=rhs_scale, bias=rhs_bias)
+    lhs_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    if lhs_amax is not None:
+        assert lhs_amax.shape == (dims.size_m, LHS_AMAX_LANES), lhs_amax.shape
+        lhs = (lhs, lhs_amax.astype(jnp.float32))
+        lhs_spec = (lhs_spec, pl.BlockSpec(memory_space=pltpu.HBM))
 
     return pl.pallas_call(
         functools.partial(kernel_main, cfgs=cfgs),
@@ -1802,7 +1894,7 @@ def gmm_v2(
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=2,
             in_specs=[
-                pl.BlockSpec(memory_space=pltpu.HBM),
+                lhs_spec,
                 WeightsRef(
                     weight=pl.BlockSpec(memory_space=pltpu.HBM),
                     scale=rhs_scale_spec,
@@ -1903,12 +1995,15 @@ def gmm_v2_mlp(
     fuse_act: str | None = None,
     preferred_element_type: jnp.dtype | None = None,
     maybe_quantize_lhs: bool = True,
+    lhs_amax: jax.Array | None = None,
 ) -> jax.Array:
     """gmm_v2(gmm_v2(lhs, rhs1, fuse_act), rhs2) for an MoE expert MLP.
 
     For decode-sized tiles the two run in one kernel (kernel_mlp), which loads
     the second gmm's first weight block under the first gmm's compute: as two
     calls, each exposes its first block's DMA. Otherwise it is two gmm_v2 calls.
+    ``lhs_amax`` (e4m3 ``lhs``, see gmm_v2) goes to the first gmm, whose
+    prefill tiles kernel_mlp does not take.
     """
 
     def two_calls():
@@ -1921,6 +2016,7 @@ def gmm_v2_mlp(
             zero_initialize=False,
             fuse_act=fuse_act,
             maybe_quantize_lhs=maybe_quantize_lhs,
+            lhs_amax=lhs_amax,
         )
         return gmm_v2(
             h[:, : rhs2.shape[1]],
@@ -1933,6 +2029,8 @@ def gmm_v2_mlp(
             maybe_quantize_lhs=maybe_quantize_lhs,
         )
 
+    if lhs_amax is not None:
+        return two_calls()
     size_m = lhs.shape[0]
     padded_size_m = align_to(size_m, _get_lhs_sublane_size(lhs.dtype, size_m))
     if padded_size_m != size_m:

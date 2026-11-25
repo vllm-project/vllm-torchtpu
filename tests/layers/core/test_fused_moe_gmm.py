@@ -1579,3 +1579,82 @@ def test_shared_activation_e4m3_matches_dequantized_rows():
     assert got.shape == want.shape == (rows, inter)
     want, got = want.astype(np.float32), got.astype(np.float32)
     assert np.linalg.norm(got - want) <= 1e-2 * np.linalg.norm(want)
+
+
+@pytest.mark.tpu_test
+def test_fused_moe_e4m3_routed_rows_match_dequantized_rows(monkeypatch):
+    """An SP step's e4m3 row pieces, gathered as e4m3 for the routed experts'
+    W8A8 gate_up (`_e4m3_routed_rows`), give the output of the routed path on
+    their bf16 dequantization, value for value (zeros may flip sign: see
+    test_gmm_fp4_w8a8_prequantized_lhs_matches_dequantized_rows)."""
+    _require_tpu()
+    from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import SharedExpert
+    from vllm_torchtpu.models.minimax_m3.kernels import rows_join, sp_norm
+
+    monkeypatch.setenv("TPU_GMM_FP8_W8A8", "1")
+    jax.clear_caches()  # the knob is read at trace time
+    tokens, hidden, inter, shared_inter = 4096, 1024, 512, 128
+    num_experts, local_experts, topk = 128, 16, 4
+    keys = iter(jax.random.split(jax.random.key(0), 12))
+    resid = jax.random.normal(next(keys), (tokens, hidden), jnp.bfloat16)
+    upd = jax.random.normal(next(keys), (tokens, hidden), jnp.bfloat16)
+    norm_w = 1.0 + 0.1 * jax.random.normal(next(keys), (hidden,), jnp.float32)
+    pieces = []
+    for half in (slice(0, tokens // 2), slice(tokens // 2, tokens)):
+        _, q, scale = sp_norm.add_norm_quant(resid[half], upd[half], norm_w, eps=1e-6)
+        pieces.append((q, scale))
+    x = rows_join.join_pieces(tuple(pieces))
+
+    def fp4(key, shape):
+        return jax.random.normal(key, shape, jnp.float32).astype(jnp.float4_e2m1fn)
+
+    def scales(key, shape):
+        return jax.random.uniform(key, shape, jnp.float32, 0.5, 2) / 64
+
+    w1 = fp4(next(keys), (local_experts, hidden, 2 * inter))
+    w2 = fp4(next(keys), (local_experts, inter, hidden))
+    w1_scale = scales(next(keys), (local_experts, hidden // 128, 2 * inter))
+    w2_scale = scales(next(keys), (local_experts, inter // 128, hidden))
+    logits = jax.random.normal(next(keys), (tokens, num_experts), jnp.float32)
+    topk_weights, topk_ids = jax.lax.top_k(jax.nn.sigmoid(logits), topk)
+    topk_weights = (topk_weights / topk_weights.sum(-1, keepdims=True)).astype(
+        jnp.bfloat16
+    )
+    sw1 = jax.random.normal(next(keys), (hidden, 2 * shared_inter), jnp.float32)
+    sw2 = jax.random.normal(next(keys), (shared_inter, hidden), jnp.float32)
+    shared = SharedExpert(
+        sw1.astype(jnp.float8_e4m3fn),
+        jnp.full((1, 2 * shared_inter), 1 / 64, jnp.float32),
+        sw2.astype(jnp.float8_e4m3fn),
+        jnp.full((1, hidden), 1 / 64, jnp.float32),
+    )
+
+    def run():
+        return fused_moe_func(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            None,
+            None,
+            topk_weights,
+            topk_ids,
+            jnp.asarray(2 * local_experts, jnp.int32),
+            topk=topk,
+            activation="swigluoai",
+            use_ep=True,
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=2048,
+            skip_padded_tokens=True,
+            shared=shared,
+            shared_rows=tuple(pieces),
+        )
+
+    actual = run()
+    monkeypatch.setattr(fused_moe_gmm, "_e4m3_routed_rows", lambda *a, **k: None)
+    jax.clear_caches()
+    expected = run()
+    expected_f32 = np.asarray(expected.astype(jnp.float32))
+    assert np.isfinite(expected_f32).all() and np.abs(expected_f32).max() > 0
+    np.testing.assert_array_equal(np.asarray(actual.astype(jnp.float32)), expected_f32)

@@ -33,9 +33,11 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import (
 )
 from vllm_torchtpu.kernels.megablox import pair_combine, tc_combine
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    LHS_AMAX_LANES,
     get_packing_factor,
     gmm_v2,
     gmm_v2_mlp,
+    takes_prequantized_lhs,
 )
 from vllm_torchtpu.kernels.megablox.moe_onehot_bounded import (
     bounded_onehot_combine,
@@ -648,16 +650,21 @@ def moe_gmm(
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
     shared_down: SharedDown | None = None,
+    x_amax: jax.Array | None = None,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens, plus
     the shared expert's down projection when ``shared_down`` is given (the
     TensorCore combine evaluates it in the same pass).
+
+    ``x_amax``: ``x`` holds e4m3 rows of bf16 rows whose amax it gives, as
+    gmm_v2's ``lhs_amax`` takes them; the output is bf16.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
+    out_dtype = x.dtype if x_amax is None else jnp.dtype(jnp.bfloat16)
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
@@ -682,10 +689,12 @@ def moe_gmm(
             rhs2_scale=w2_scale,
             group_offset=group_offset,
             fuse_act=activation,
-            preferred_element_type=x.dtype,
+            preferred_element_type=out_dtype,
             maybe_quantize_lhs=False,
+            lhs_amax=x_amax,
         )
     else:
+        assert x_amax is None
         gmm1_res = gmm_wrapper(
             x,
             w1,
@@ -708,7 +717,7 @@ def moe_gmm(
             group_sizes,
             group_offset,
             zero_initialize=False,
-            preferred_element_type=x.dtype,
+            preferred_element_type=out_dtype,
             rhs_quant_dtype=rhs_quant_dtype,
         )
     if (
@@ -745,7 +754,7 @@ def moe_gmm(
                 topk_weights_flat,
                 valid_mask_flat,
                 topk=topk,
-            ).astype(x.dtype),
+            ).astype(out_dtype),
             shared_down,
         )
     # The destination-major kernel packs source indices into 20 bits and
@@ -792,7 +801,7 @@ def moe_gmm(
                         topk_weights_flat,
                         valid_mask_flat,
                         reduce_group_size=topk,
-                    ).astype(x.dtype),
+                    ).astype(out_dtype),
                     shared_down,
                 )
     if use_ep and use_sparse_core:
@@ -831,7 +840,7 @@ def moe_gmm(
                         topk_weights_sorted,
                         valid_count,
                         num_tokens=num_tokens,
-                    ).astype(x.dtype),
+                    ).astype(out_dtype),
                     shared_down,
                 )
             # The dense combine one-hot takes the weights' dtype; the kernel
@@ -845,7 +854,7 @@ def moe_gmm(
                         argsort_revert_indices,
                         jnp.where(valid_mask, topk_weights, 0),
                         valid_count,
-                    ).astype(x.dtype),
+                    ).astype(out_dtype),
                     shared_down,
                 )
             # Rows past the computed prefix (non-local experts under EP,
@@ -862,7 +871,7 @@ def moe_gmm(
             combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
                 axis=1
             )
-            return _add_shared_down((combine @ gmm2_res).astype(x.dtype), shared_down)
+            return _add_shared_down((combine @ gmm2_res).astype(out_dtype), shared_down)
         tc_args = (num_tokens, gmm2_res.shape[-1], topk, group_sizes.shape[0])
         if envs.TPU_MOE_TC_COMBINE and tc_combine.supported(*tc_args, gmm2_res.dtype):
             fuse = shared_down is not None and tc_combine.supported(
@@ -888,7 +897,7 @@ def moe_gmm(
                     # The routes are sorted stably by expert (above), so
                     # each expert's rows are in token order.
                     fallback=pieces == 1,
-                ).astype(x.dtype)
+                ).astype(out_dtype)
                 # Per piece, so a piece's consumer need not wait for the rest.
                 out.append(_add_shared_down(routed, None if fuse else piece_shared))
             return out[0] if pieces == 1 else jnp.concatenate(out)
@@ -899,7 +908,7 @@ def moe_gmm(
                 topk_weights_flat,
                 valid_mask_flat,
                 reduce_group_size=topk,
-            ).astype(x.dtype),
+            ).astype(out_dtype),
             shared_down,
         )
 
@@ -908,7 +917,9 @@ def moe_gmm(
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights, axis=-1)
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-    return _add_shared_down(token_topk_hidden.sum(axis=1).astype(x.dtype), shared_down)
+    return _add_shared_down(
+        token_topk_hidden.sum(axis=1).astype(out_dtype), shared_down
+    )
 
 
 # Mixed / prefill-sized steps only: decode and drafter buckets (<= 512 rows)
@@ -925,6 +936,9 @@ def _combine_pieces(num_tokens: int, args: tuple, dtype) -> int:
         return 1
     return pieces if tc_combine.supported(num_tokens // pieces, *args, dtype) else 1
 
+
+# The largest e4m3 magnitude, the amax every quantized row is scaled to.
+_E4M3_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
 
 # MiniMaxM3Mxfp8LinearMethod materializes the bf16 weight from this many rows.
 _SHARED_UPCAST_MIN_ROWS = 4096
@@ -1003,6 +1017,64 @@ def route_from_scores(
     return weights.astype(route.weight_dtype), ids
 
 
+def _e4m3_routed_rows(
+    rows: tuple[tuple[jax.Array, jax.Array], ...] | None,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    *,
+    rhs_quant_dtype: jnp.dtype | None,
+    num_tokens: int,
+    topk: int,
+    activation: str,
+    ragged_permute: bool,
+) -> tuple[jax.Array, jax.Array] | None:
+    """The tokens' e4m3 rows ``[T, H]`` and each row's amax as a bf16 row
+    (f32, broadcast over ``[T, LHS_AMAX_LANES]`` as gmm_v2's lhs_amax takes
+    it), for gate_up to take in place of the bf16 rows, or None.
+
+    The rows come from an SP step's e4m3 all-gather pieces (``rows``, e4m3
+    rows with f32 scales), which the routed path otherwise takes as
+    ``bf16(q * scale)``. Their quantizers (sp_norm, model._quantize_rows)
+    scale each row's amax to e4m3's 448 (a row with amax under their 1e-12
+    floor excepted), so the W8A8 gate_up's per-row quantization of those
+    bf16 rows returns ``q`` itself (its two bf16 roundings move a value by
+    under 2^-7, below half an e4m3 step), with the scale of their amax,
+    ``bf16(448 * scale)``: the gate_up output is unchanged, without the
+    dequantized rows. Taken where the SparseCore gathers the routed rows and
+    gate_up runs W8A8 on every row bucket.
+    """
+    if (
+        rows is None
+        or not ragged_permute
+        or w1_bias is not None
+        or w2_bias is not None
+        or not (_is_fp4_weight(w1) and _is_fp4_weight(w2))
+        or get_packing_factor(w1.dtype, rhs_quant_dtype) != 1
+        or get_packing_factor(w2.dtype, rhs_quant_dtype) != 1
+        or w1_scale is None
+        or w2_scale is None
+        or not takes_prequantized_lhs(
+            num_tokens * topk, w1, w1_scale, w1.shape[0], fuse_act=activation
+        )
+    ):
+        return None
+    q = jnp.concatenate([q for q, _ in rows])
+    scale = jnp.concatenate([s for _, s in rows]).reshape(-1)
+    # The bf16 rounding of the dequantized amax, as reduce_precision: XLA may
+    # elide a convert pair (f32 -> bf16 -> f32) inside a fusion (excess
+    # precision), which here changed 3291 of 50M outputs on tpu7x.
+    amax = jax.lax.reduce_precision(
+        jnp.float32(_E4M3_MAX) * scale.astype(jnp.float32),
+        exponent_bits=8,
+        mantissa_bits=7,
+    )
+    return q, jnp.broadcast_to(amax[:, None], (q.shape[0], LHS_AMAX_LANES))
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -1039,6 +1111,7 @@ def fused_moe_func(
     shared_down: SharedDown | None = None,
     route: Route | None = None,
     shared_rows: tuple[tuple[jax.Array, jax.Array], ...] | None = None,
+    routed_rows: tuple[tuple[jax.Array, jax.Array], ...] | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -1059,7 +1132,8 @@ def fused_moe_func(
     the step. ``shared_rows`` are the e4m3 rows (with f32 row scales) the
     tokens were gathered as, in pieces: on steps the dense fp4 kernel does not
     serve, the shared expert's gate_up then contracts them as e4m3
-    (`shared_activation_e4m3`).
+    (`shared_activation_e4m3`). With ``shared_down`` the same rows come as
+    ``routed_rows``, for the routed experts (`_e4m3_routed_rows`).
 
     For linear EP placement, ``experts_start`` is the first global expert id
     owned by this shard, passed as a 0-d int32 array (real traced data, not a
@@ -1146,6 +1220,7 @@ def fused_moe_func(
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
             shared_down=_shared_down(hidden_states, shared, shared_rows),
+            routed_rows=shared_rows,
         )
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
@@ -1260,6 +1335,22 @@ def fused_moe_func(
             shared_down,
         )
 
+    e4m3_rows = _e4m3_routed_rows(
+        routed_rows,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        rhs_quant_dtype=rhs_quant_dtype,
+        num_tokens=num_tokens,
+        topk=topk,
+        activation=activation,
+        ragged_permute=use_ep
+        and use_sparse_core
+        and num_tokens * topk > onehot_moe_permute_threshold,
+    )
     (
         x,
         group_sizes,
@@ -1268,7 +1359,7 @@ def fused_moe_func(
         valid_mask,
         token_indices_sorted,
     ) = prepare_routed_gmm_inputs(
-        hidden_states,
+        hidden_states if e4m3_rows is None else e4m3_rows[0],
         topk_ids,
         topk_weights,
         local_num_experts=w1.shape[0],
@@ -1278,6 +1369,16 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
     )
+    x_amax = None
+    if e4m3_rows is not None:
+        # The rows' amax gathered beside them: a TensorCore gather of 32-bit
+        # scalars runs at ~5 ns a row (178 us for 32768 rows, tpu7x).
+        x_amax = ragged_gather_v2(
+            e4m3_rows[1],
+            token_indices_sorted,
+            jnp.array([0], dtype=jnp.int32),
+            group_sizes.sum(dtype=jnp.int32)[None],
+        )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
@@ -1300,6 +1401,7 @@ def fused_moe_func(
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
         shared_down=shared_down if padded_hidden_size == hidden_size else None,
+        x_amax=x_amax,
     )
     if padded_hidden_size != hidden_size:
         return _add_shared_down(x[:num_tokens, :hidden_size], shared_down)

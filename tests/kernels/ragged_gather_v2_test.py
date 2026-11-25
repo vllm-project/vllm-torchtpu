@@ -35,7 +35,7 @@ class GatherTest(jtu.JaxTestCase):
         in_out_size=[(512, 400), (512, 1024)],
         start_end=[(3, 338), (10, 422)],
         hidden_size=[128, 512, 8192],
-        dtype=[jnp.int4, jnp.int8, jnp.bfloat16, jnp.float32],
+        dtype=[jnp.int4, jnp.int8, jnp.float8_e4m3fn, jnp.bfloat16, jnp.float32],
         kernel_version=[2],
     )
     def test_sc_gather(

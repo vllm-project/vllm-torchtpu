@@ -29,6 +29,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     FP8_DECODE_BUCKETS,
+    LHS_AMAX_LANES,
     Dimensions,
     InputConfigs,
     TileSizes,
@@ -38,6 +39,7 @@ from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     gmm_v2_mlp,
     interleave_lane,
     situ_and_mul,
+    takes_prequantized_lhs,
 )
 
 _GroupConfig = collections.namedtuple(
@@ -564,6 +566,74 @@ def test_gmm_fp4_fp8_w8a8_matches_reference(monkeypatch):
     # e4m3 keeps 3 mantissa bits: ~4% relative error per operand.
     assert np.abs(actual - expected).mean() < 0.1 * np.abs(expected).mean()
     np.testing.assert_allclose(actual, expected, atol=0.15 * np.abs(expected).max())
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fuse_act", ["swigluoai", None])
+def test_gmm_fp4_w8a8_prequantized_lhs_matches_dequantized_rows(monkeypatch, fuse_act):
+    """e4m3 rows with their amax (lhs_amax) give the W8A8 output of the bf16
+    rows they dequantize to, value for value, when each row's amax is 448."""
+    _require_tpu()
+    monkeypatch.setenv("TPU_GMM_FP8_W8A8", "1")
+    jax.clear_caches()  # the knob is read at trace time
+
+    in_size, out_size, num_groups, block_size = 1024, 512, 16, 128
+    group_sizes = jnp.asarray(
+        [300, 0, 17, 64, 1, 250, 0, 0, 316, 3, 0, 90, 0, 200, 0, 40], jnp.int32
+    )
+    batch_size = 4096  # above FP8_DECODE_MAX_M: the prefill tiling
+    key = jax.random.key(0)
+    lhs_key, rhs_key, scale_key, row_key = jax.random.split(key, 4)
+    x = jax.random.normal(lhs_key, (batch_size, in_size), jnp.float32)
+    x = x * jnp.exp(jax.random.normal(row_key, (batch_size, 1)))
+    # The SP quantizer's rounding (sp_norm): amax / 448 scales.
+    scale = jnp.max(jnp.abs(x), axis=1, keepdims=True) / 448.0
+    q = (x * (1.0 / scale)).astype(jnp.float8_e4m3fn)
+    q = q.at[7].set(0)  # an all-zero row
+    lhs = (q.astype(jnp.float32) * scale).astype(jnp.bfloat16)
+    amax = (448.0 * scale).astype(jnp.bfloat16).astype(jnp.float32)
+    amax = jnp.broadcast_to(amax, (batch_size, LHS_AMAX_LANES))
+    rhs_fp4 = jax.random.normal(
+        rhs_key, (num_groups, in_size, out_size), jnp.float32
+    ).astype(jnp.float4_e2m1fn)
+    rhs_scale = jax.random.uniform(
+        scale_key, (num_groups, in_size // block_size, 1, out_size), jnp.float32, 0.5, 2
+    )
+    num_rows = int(group_sizes.sum())
+    kwargs = dict(
+        rhs_scale=rhs_scale,
+        maybe_quantize_lhs=False,
+        fuse_act=fuse_act,
+        preferred_element_type=jnp.bfloat16,
+    )
+
+    expected = gmm_v2(lhs, rhs_fp4, group_sizes, **kwargs)[:num_rows]
+    actual = gmm_v2(q, rhs_fp4, group_sizes, lhs_amax=amax, **kwargs)[:num_rows]
+
+    expected_f32 = np.asarray(expected.astype(jnp.float32))
+    assert np.isfinite(expected_f32).all()
+    np.testing.assert_array_equal(np.asarray(actual.astype(jnp.float32)), expected_f32)
+    # Bits differ at most in the sign of a zero: e4m3 rows come in 32-row
+    # sublane blocks, bf16 ones in 16, so the +0 partial rows gmm adds where
+    # two groups share a block land on other rows.
+    bits_differ = np.asarray(
+        jax.lax.bitcast_convert_type(actual, jnp.uint16)
+        != jax.lax.bitcast_convert_type(expected, jnp.uint16)
+    )
+    assert (expected_f32[bits_differ] == 0).all()
+
+
+@pytest.mark.tpu_test
+def test_gmm_prequantized_lhs_needs_w8a8_buckets(monkeypatch):
+    """Only the W8A8 prefill tiling takes e4m3 rows in place of bf16 ones."""
+    _require_tpu()
+    rhs = jax.ShapeDtypeStruct((16, 6144, 6144), jnp.float4_e2m1fn)
+    scale = jax.ShapeDtypeStruct((16, 48, 1, 6144), jnp.float32)
+    for w8a8, expected in (("1", True), ("0", False)):
+        monkeypatch.setenv("TPU_GMM_FP8_W8A8", w8a8)
+        assert takes_prequantized_lhs(32768, rhs, scale, 16, "swigluoai") is expected
+    # Decode-sized buffers keep the fp8 rhs feed on bf16 rows.
+    assert not takes_prequantized_lhs(512, rhs, scale, 16, "swigluoai")
 
 
 @pytest.mark.tpu_test

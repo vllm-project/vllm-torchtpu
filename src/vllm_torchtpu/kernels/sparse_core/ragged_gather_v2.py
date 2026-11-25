@@ -225,8 +225,11 @@ def ragged_gather_v2(
         end = end[None]
 
     dtype = x.dtype
-    if dtype not in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4):
-        raise ValueError(f"dtype must be f32, bf16, int8, or int4, but got {dtype}")
+    # The kernel moves bits: e4m3 rows move as int8 ones do.
+    if dtype not in (jnp.bfloat16, jnp.float32, jnp.int8, jnp.int4, jnp.float8_e4m3fn):
+        raise ValueError(
+            f"dtype must be f32, bf16, int8, int4 or e4m3, but got {dtype}"
+        )
 
     sc_info = get_sparse_core_info()
     if sc_info is None:
