@@ -314,6 +314,18 @@ def _stage3_recycled_transfer_pages(
     )
 
 
+def _stage3_leaf_spec(group_spec: Any) -> Any:
+    """The per-layer spec of a cache group.
+
+    The block-outer DSv4.1 layout (#3045) packs same-type layers into one group
+    whose spec is a ``UniformTypeKVCacheSpecs`` wrapper (e.g. the compressor
+    ring-state layers), so type checks such as ``CircularBufferSpec`` must look
+    at a member; the members of a uniform-type group are interchangeable.
+    """
+    specs = getattr(group_spec, "kv_cache_specs", None)
+    return next(iter(specs.values())) if specs else group_spec
+
+
 def _stage3_group_window_tokens(group_spec: Any) -> int | None:
     """The sliding window of a cache group, or None if it is full attention."""
     # A UniformTypeKVCacheSpecs wrapper has no sliding_window of its own, and
@@ -348,13 +360,13 @@ def _stage3_transfer_groups(
     groups = tuple(
         _Stage3TransferGroup(
             cache_group_index=index,
-            page_tokens=int(group.kv_cache_spec.block_size),
+            page_tokens=int(_stage3_leaf_spec(group.kv_cache_spec).block_size),
             window_tokens=(
                 None
-                if isinstance(group.kv_cache_spec, CircularBufferSpec)
+                if isinstance(_stage3_leaf_spec(group.kv_cache_spec), CircularBufferSpec)
                 else _stage3_group_window_tokens(group.kv_cache_spec)
             ),
-            slot=isinstance(group.kv_cache_spec, CircularBufferSpec),
+            slot=isinstance(_stage3_leaf_spec(group.kv_cache_spec), CircularBufferSpec),
             prefix_cacheable=bool(
                 getattr(group.kv_cache_spec, "prefix_cacheable", True)
             ),
