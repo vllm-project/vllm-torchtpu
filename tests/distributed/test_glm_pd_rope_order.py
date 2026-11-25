@@ -12,6 +12,7 @@ were right. No TPU runtime or transport is involved here.
 """
 
 import functools
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,8 @@ import vllm.model_executor.custom_op as custom_op_mod
 from vllm.config.compilation import CompilationConfig, CompilationMode
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
+from tests.layers.adapter.test_indexer_rope_neox_permute import _indexer
+from tests.layers.adapter.test_mla_rope_neox_permute import _wrapper
 from vllm_torchtpu.distributed.kv_transfer import tpu_connector as tc
 from vllm_torchtpu.distributed.kv_transfer.raiden import layout_fingerprint as rlf
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
@@ -42,6 +45,8 @@ GOLDEN_GLM_FINGERPRINT = (
     "bfea2b664510bfb11f87b5092431492fddaf535f0f321f01d59a79e139c3bc2b"
 )
 HALF = rlf.GLM_ROPE_ORDER_HALF_SPLIT
+# GLM-5.2's text config builds its indexer rope GPT-J style.
+GLM_TEXT_CONFIG = SimpleNamespace(indexer_rope_interleave=True)
 
 
 def _manifest(path, layers=(0, 1)):
@@ -156,10 +161,11 @@ class _FakeMLA(torch.nn.Module):
     pass
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def _fake_layer_classes(monkeypatch):
     """The reader recognises layers by class; stand in for the indexer and the
-    MLA wrapper with bare modules carrying the attributes it reads."""
+    MLA wrapper with bare modules carrying the attributes it reads. The
+    real-layer tests below do without it."""
     monkeypatch.setattr(mla_op, "VllmTPUIndexer", _FakeIndexer)
     monkeypatch.setattr(mla_op, "VllmTPUMultiHeadLatentAttentionWrapper", _FakeMLA)
 
@@ -181,6 +187,26 @@ def _model(
     return model
 
 
+def _real_glm_layer(*, indexer, dcp=1):
+    """One GLM layer from the real classes, built with the layer tests'
+    helpers: a ``VllmTPUMultiHeadLatentAttentionWrapper`` over GLM-5.2's GPT-J
+    rope (q replicated over a DCP group of ``dcp``) and, if asked, its
+    ``VllmTPUIndexer`` (rebound from vLLM's ``Indexer``). Neither has run its
+    post-load permute yet."""
+    model = torch.nn.Module()
+    model.attn = _wrapper(heads=2, group_size=dcp, rope=_glm_rope())
+    if indexer:
+        model.attn.indexer = _indexer()
+    return model
+
+
+def _post_load_permute(model):
+    """The post-load hooks the wrapper registers under the default flags."""
+    model.attn.permute_rope_to_half_split()
+    if model.attn.indexer is not None:
+        model.attn.indexer.permute_rope_to_half_split()
+
+
 def _flags(mla, indexer):
     # The env module the reader (mla_attention_op) reads the flags from.
     return (
@@ -189,6 +215,7 @@ def _flags(mla, indexer):
     )
 
 
+@pytest.mark.usefixtures("_fake_layer_classes")
 def test_rope_order_is_read_from_the_permuted_layers():
     # The connector reads the order the layers actually cache (the flag a
     # layer sets once its post-load permute ran), not the env's intent.
@@ -206,6 +233,7 @@ def test_rope_order_is_read_from_the_permuted_layers():
         assert read(None) == (False, False)
 
 
+@pytest.mark.usefixtures("_fake_layer_classes")
 @pytest.mark.parametrize(
     ("mla_flag", "indexer_flag"), [(True, True), (True, False), (False, True)]
 )
@@ -238,6 +266,7 @@ def test_model_without_mla_layers_refuses_to_guess(mla_flag, indexer_flag):
 # otherwise. The permute reorders only a GPT-J rope into half-split; a NeoX
 # rope is cached in the checkpoint's own order on every engine, so it is never
 # declared (both legs cache the same bytes).
+@pytest.mark.usefixtures("_fake_layer_classes")
 @pytest.mark.parametrize(
     ("config", "rope", "indexer_flag", "expected"),
     [
@@ -291,6 +320,7 @@ def test_no_indexer_stage_declares_the_order_its_indexer_would_cache(
         )
 
 
+@pytest.mark.usefixtures("_fake_layer_classes")
 def test_no_indexer_stage_without_model_config_refuses_to_guess():
     stage = _model(permuted_mla=True, indexer=False)
     mla_flag, idx_flag = _flags(True, True)
@@ -306,6 +336,7 @@ def test_no_indexer_stage_without_model_config_refuses_to_guess():
         assert mla_op.glm_rope_half_split(stage) == (True, False)
 
 
+@pytest.mark.usefixtures("_fake_layer_classes")
 def test_flag_on_but_permute_skipped_declares_interleaved():
     # With the flags at their default, a rope the permute cannot reorder keeps
     # the interleaved order: the layers never set the flag, so the engine
@@ -347,13 +378,31 @@ class _ComparingController:
         return True
 
 
-def _register(controller, *, is_producer, model, path):
+@pytest.fixture
+def _golden_layouts(monkeypatch):
+    """The worker's GLM measure with the golden's layout getter and versions
+    (there are no TPU pages to measure here)."""
+    monkeypatch.setattr(
+        rlf,
+        "measured_glm_layout_fingerprint",
+        functools.partial(
+            rlf.measured_glm_layout_fingerprint,
+            layout_getter=_glm_layout_getter,
+            package_version=_glm_versions,
+        ),
+    )
+
+
+def _register(controller, *, is_producer, model, path, layers=(0, 1)):
     """Runs one worker's real admission measure and work-unit registration
-    against ``controller``; returns the registered unit."""
+    against ``controller``; returns the registered unit and payload. ``pp``
+    registers ``layers`` under per-layer tags, as both legs of a pipeline
+    pairing run."""
     worker = _make_raiden_worker(
         is_producer=is_producer, tp_rank=0, tp_size=1, block_size=PAGE
     )
     worker.runner = SimpleNamespace(model=model)
+    worker.vllm_config.model_config.hf_text_config = GLM_TEXT_CONFIG
     worker._new_raiden_controller_facade = MagicMock(return_value=controller)
     worker._new_raiden_id = MagicMock(
         side_effect=lambda fields: SimpleNamespace(**fields)
@@ -365,7 +414,7 @@ def _register(controller, *, is_producer, model, path):
         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_GLM_ADMISSION", True),
         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 1),
         patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL", "controller"),
-        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER", False),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_POOL_TAGS_PER_LAYER", path == "pp"),
         # Both permute flags on (the default) on every leg: what a leg caches
         # is read from its layers.
         patch(f"{_MOD}.tpu_envs.TPU_MLA_ROPE_NEOX_PERMUTE", True),
@@ -375,7 +424,7 @@ def _register(controller, *, is_producer, model, path):
     ):
         registration = worker._register_raiden_stage3_work_unit(
             engine=_FakeAdmissionRaidenEngine(),
-            manifest=_manifest("tp"),
+            manifest=_manifest(path, layers),
             controller_address="controller.test:27000",
         )
     unit = worker._raiden_work_unit
@@ -393,6 +442,7 @@ _ENGINES = {
 }
 
 
+@pytest.mark.usefixtures("_fake_layer_classes")
 @pytest.mark.parametrize("path", ["tp", "identity"])
 @pytest.mark.parametrize(
     ("producer", "decode", "refused"),
@@ -408,21 +458,12 @@ _ENGINES = {
     ],
 )
 def test_mixed_rope_pairing_is_refused_at_transfer_start(
-    monkeypatch, path, producer, decode, refused
+    _golden_layouts, path, producer, decode, refused
 ):
     # End to end on the CPU side: each leg measures its own layers, registers
     # its fingerprint, and the decode's transfer start goes through the same
     # retry wrapper as a real load. A mixed pairing is refused and not
     # retried; a matched pairing (either order) is accepted.
-    monkeypatch.setattr(
-        rlf,
-        "measured_glm_layout_fingerprint",
-        functools.partial(
-            rlf.measured_glm_layout_fingerprint,
-            layout_getter=_glm_layout_getter,
-            package_version=_glm_versions,
-        ),
-    )
     controller = _ComparingController()
     src, src_payload = _register(
         controller, is_producer=True, model=_model(**_ENGINES[producer]), path=path
@@ -448,6 +489,64 @@ def test_mixed_rope_pairing_is_refused_at_transfer_start(
         else:
             assert start() is True
     assert controller.start_transfer_calls == 1
+
+
+def test_rope_order_is_read_from_real_layers(monkeypatch):
+    # The real layer classes and their real permute, no stand-ins: before the
+    # post-load permute the layers cache the interleaved order, after it
+    # half-split (the wrapper first, then its indexer).
+    monkeypatch.setenv("TPU_INDEXER_QPREP_FUSED", "0")  # a TPU op at rebind
+    model = _real_glm_layer(indexer=True)
+    assert type(model.attn) is mla_op.VllmTPUMultiHeadLatentAttentionWrapper
+    assert type(model.attn.indexer) is mla_op.VllmTPUIndexer
+    mla_flag, indexer_flag = _flags(True, True)
+    with mla_flag, indexer_flag:
+        assert mla_op.glm_rope_half_split(model) == (False, False)
+        model.attn.permute_rope_to_half_split()
+        assert mla_op.glm_rope_half_split(model) == (True, False)
+        model.attn.indexer.permute_rope_to_half_split()
+        assert mla_op.glm_rope_half_split(model) == (True, True)
+
+
+def test_default_pp_stage_and_dcp_decode_payloads_agree(monkeypatch, _golden_layouts):
+    # The pairing the default flags serve: a pipeline producer stage whose
+    # layers hold no indexer (it declares the order an indexer of its own
+    # would cache, from the model config) against a DCP decode that holds
+    # one. Both legs are built from the real layers, permuted by the hooks the
+    # default flags register, and registered through the worker's real
+    # admission measure under per-layer tags (a pipeline pairing runs them on
+    # both legs). Only the page layouts and versions are the golden's. Run
+    # with -s to see the two CPU-built payloads.
+    monkeypatch.setenv("TPU_INDEXER_QPREP_FUSED", "0")  # a TPU op at rebind
+    legs = {
+        "pp_stage_without_indexer": (_real_glm_layer(indexer=False), True, (1,)),
+        "dcp8_decode": (_real_glm_layer(indexer=True, dcp=8), False, (0, 1)),
+    }
+    controller = _ComparingController()
+    registered = {}
+    for name, (model, is_producer, layers) in legs.items():
+        _post_load_permute(model)
+        unit, payload = _register(
+            controller, is_producer=is_producer, model=model, path="pp", layers=layers
+        )
+        fingerprint = controller.fingerprints[controller._key(unit)]
+        registered[name] = fingerprint, payload
+        print(
+            f"{name} layout_fingerprint={fingerprint} layout_fingerprint_payload="
+            + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        )
+    rope_fields = {
+        name: {
+            key: payload.get(key) for key in ("mla_rope_order", "indexer_rope_order")
+        }
+        for name, (_, payload) in registered.items()
+    }
+    assert rope_fields["pp_stage_without_indexer"] == rope_fields["dcp8_decode"]
+    assert rope_fields["dcp8_decode"] == {
+        "mla_rope_order": HALF,
+        "indexer_rope_order": HALF,
+    }
+    assert registered["pp_stage_without_indexer"][0] == registered["dcp8_decode"][0]
 
 
 def test_permuted_decode_misreads_interleaved_rope_bytes():
