@@ -66,3 +66,38 @@ def test_rows_match_the_dashboard_schema(tmp_path):
     assert row["input_tput_per_gpu"] == pytest.approx(770.0 / 4)
     assert row["mean_ttft"] == pytest.approx(1.434)
     assert row["p99_intvty"] == pytest.approx(25.0)
+
+
+@pytest.mark.parametrize(
+    "env, expected",
+    [
+        ({"TPU_TOPOLOGY": "2x2x1", "TPU_HOST_BOUNDS": "1,1,1"}, (4, 1)),
+        ({"TPU_TOPOLOGY": "1x1x1"}, (1, 1)),
+        ({"TPU_TOPOLOGY": "2x2x2", "TPU_HOST_BOUNDS": "1,1,2"}, (8, 2)),
+        ({"TPU_TOPOLOGY": "2x2x4", "TPU_HOST_BOUNDS": "1,1,4"}, (16, 4)),
+    ],
+)
+def test_slice_comes_from_the_gke_tpu_env(env, expected):
+    """Chips from TPU_TOPOLOGY, hosts from TPU_HOST_BOUNDS (1 when unset)."""
+    assert publish_perf_dashboard.slice_from_env(env) == expected
+
+
+def test_slice_needs_a_topology():
+    with pytest.raises(ValueError):
+        publish_perf_dashboard.slice_from_env({})
+
+
+def test_multi_host_rows_are_multinode(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps(_CONFIG))
+    (tmp_path / "isl1024_osl8192_c256.json").write_text(json.dumps(_RAW))
+
+    (single,) = publish_perf_dashboard.collect_rows(
+        tmp_path, device="tpu7x", chips=4, image="img:tag"
+    )
+    (multi,) = publish_perf_dashboard.collect_rows(
+        tmp_path, device="tpu7x", chips=8, hosts=2, image="img:tag"
+    )
+
+    assert single["is_multinode"] == "false"
+    assert multi["is_multinode"] == "true"
+    assert multi["num_chips"] == 8
