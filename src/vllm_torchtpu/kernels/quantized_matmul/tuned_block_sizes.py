@@ -622,6 +622,8 @@ BUFFERED_MATMUL_TUNING = {
     # A/B at T288, bitwise equal to xla_quantized_matmul: 48.7 -> 36.4 us;
     # windows 512 / 256 measured 40.1 / 45.7 us. About 44 MiB of scratch.
     (7, 288, 15360, 5120): (1024, 32, 60 * 1024**2),
+    # v7x-16 decode rows (12 requests x 6), bitwise: 31.4 -> 29.7 us.
+    (7, 72, 15360, 5120): (1024, 32, 60 * 1024**2),
 }
 
 # fused shared expert: (tpu_version, tokens, hidden, intermediate) ->
