@@ -458,20 +458,29 @@ class TestTpuCompilerCache:
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED
         assert not serving_only & set(_tpu_compile_env_factors())
 
-    def test_every_registry_entry_is_hashed_or_deliberately_ignored(self):
+    def test_every_registry_entry_is_hashed_or_deliberately_ignored(self, monkeypatch):
         """The two sets must partition the registry, so a new entry forces a
         deliberate hash-or-ignore choice, and a stale exemption cannot sit
         waiting for a later knob to reuse its name."""
         from vllm_torchtpu import envs
+        from vllm_torchtpu.compilation import tpu_compiler
         from vllm_torchtpu.compilation.tpu_compiler import (
             _TPU_COMPILE_ENV_IGNORED,
             _tpu_compile_env_factors,
         )
 
+        # A registered model directory's settings do not break the partition.
+        monkeypatch.setattr(
+            tpu_compiler, "_MODEL_ENV_FACTORS", {"foo": lambda: {"FOO_FLAG": 1}}
+        )
+
         registry = set(envs.environment_variables)
         stale = _TPU_COMPILE_ENV_IGNORED - registry
         assert not stale, f"ignored but no longer in envs.py: {sorted(stale)}"
-        assert set(_tpu_compile_env_factors()) | _TPU_COMPILE_ENV_IGNORED == registry
+        # Model-directory settings (register_compile_cache_key) are keyed
+        # model:<owner> and are not envs.py entries.
+        env_keys = {k for k in _tpu_compile_env_factors() if not k.startswith("model:")}
+        assert env_keys | _TPU_COMPILE_ENV_IGNORED == registry
 
     def test_aot_hash_includes_tpu_compiler_hash(self):
         from vllm.compilation import caching
@@ -1518,3 +1527,61 @@ def test_deserialize_entry_does_not_copy_the_entry():
             raise AssertionError("replay must not deepcopy the entry")
 
     assert _deserialize_entry(Entry())(2, 3, 7) == 12
+
+
+class TestModelDirectoryCacheKey:
+    def _tree(self, root):
+        for rel in (
+            "vllm_torchtpu/models/foo/README.md",
+            "vllm_torchtpu/models/foo/model.py",
+            "vllm_torchtpu/models/foo/pool_layout.py",
+            "vllm_torchtpu/models/foo/experimental/kernels/k.py",
+            "vllm_torchtpu/models/foo/experimental/ops/op.py",
+        ):
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# x\n")
+
+    def test_registered_paths_and_settings(self, tmp_path, monkeypatch):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        self._tree(tmp_path)
+        monkeypatch.setattr(tpu_compiler, "_RUNTIME_CACHE_KEY_PATHS", ())
+        monkeypatch.setattr(tpu_compiler, "_MODEL_CACHE_KEY_PATHS", {})
+        monkeypatch.setattr(tpu_compiler, "_MODEL_ENV_FACTORS", {})
+        monkeypatch.setattr(tpu_compiler, "_COMPILE_HASH_COMPUTED", False)
+        tpu_compiler.register_compile_cache_key(
+            "foo",
+            paths=("vllm_torchtpu/models/foo/pool_layout.py",),
+            env_factors=lambda: {"FOO_FLAG": 1},
+        )
+        hashed = {
+            p.relative_to(tmp_path).as_posix()
+            for p in tpu_compiler._iter_runtime_cache_key_files(tmp_path)
+        }
+        assert "vllm_torchtpu/models/foo/pool_layout.py" in hashed
+        assert "vllm_torchtpu/models/foo/model.py" not in hashed
+        assert tpu_compiler._tpu_compile_env_factors()["model:foo"] == {"FOO_FLAG": 1}
+        tpu_compiler.register_compile_cache_key("foo")
+        assert "model:foo" not in tpu_compiler._tpu_compile_env_factors()
+
+
+def test_late_compile_cache_key_registration_raises(monkeypatch):
+    """Once this process computed the compile hash, a registration that
+    changes the registry would leave the keys in use without it."""
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    def factors():
+        return {"FOO_FLAG": 1}
+
+    monkeypatch.setattr(tpu_compiler, "_MODEL_CACHE_KEY_PATHS", {})
+    monkeypatch.setattr(tpu_compiler, "_MODEL_ENV_FACTORS", {})
+    monkeypatch.setattr(tpu_compiler, "_COMPILE_HASH_COMPUTED", False)
+    tpu_compiler.register_compile_cache_key("foo", env_factors=factors)
+    monkeypatch.setattr(tpu_compiler, "_COMPILE_HASH_COMPUTED", True)
+    # Repeating the same registration is harmless.
+    tpu_compiler.register_compile_cache_key("foo", env_factors=factors)
+    with pytest.raises(RuntimeError, match="after the compile hash was computed"):
+        tpu_compiler.register_compile_cache_key("foo", paths=("x.py",))
+    with pytest.raises(RuntimeError, match="after the compile hash was computed"):
+        tpu_compiler.register_compile_cache_key("bar")
