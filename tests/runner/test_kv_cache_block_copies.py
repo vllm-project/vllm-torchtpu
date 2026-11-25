@@ -39,6 +39,8 @@ def _runner_with_raw_tensors(raw_tensors):
     runner._unified_kv_layout = bool(raw_tensors)
     runner.kv_cache_raw_tensors = raw_tensors
     runner._install_spec_token_room_guard = lambda: None
+    runner._unfenced_h2d_sources = []
+    runner._registered_h2d_sources = set()
     return runner
 
 
@@ -143,6 +145,8 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
         device="cpu",
         mamba_slot_read_offsets=None,
         bm_pool_layout=None,
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
     )
     fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
         fake
@@ -221,6 +225,8 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
         _pad_to_bucket=TPUModelRunner._pad_to_bucket,
         device="cpu",
         bm_pool_layout=None,
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
     )
     fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
         fake
@@ -241,6 +247,79 @@ def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
     assert migrated[0][0] == [3, 0, 0, 0, 0, 0, 0, 0]
     assert migrated[0][1] == [5, 0, 0, 0, 0, 0, 0, 0]
     assert offsets[5].item() == 3
+
+
+def _staged_hosts(runner):
+    return [host for host, _ in runner._unfenced_h2d_sources]
+
+
+def _is_one_of(tensor, tensors):
+    return any(tensor is t for t in tensors)
+
+
+def test_page_local_copy_stages_every_index_upload(monkeypatch):
+    """A non-blocking upload reads its host tensor after the call returns, so
+    each index upload goes through `stage_h2d_upload`, which keeps the host
+    tensor until the next input-staging fence. On CPU an upload returns the
+    host tensor itself, so the copy programs must receive staged tensors."""
+    fake = SimpleNamespace(
+        kv_cache_raw_tensors=[torch.zeros(32, 4)],
+        is_unified_pool_used=lambda: True,
+        mamba_slot_read_offsets=torch.zeros(16, dtype=torch.long),
+        _pool_block_split=2,
+        _pad_to_bucket=TPUModelRunner._pad_to_bucket,
+        device="cpu",
+        bm_pool_layout=None,
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+    )
+    fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
+        fake
+    )
+    received = []
+    monkeypatch.setattr(
+        runner_mod,
+        "_rollback_offsets_migrate",
+        lambda _o, s, d: received.extend((s, d)),
+    )
+    monkeypatch.setattr(
+        runner_mod, "copy_mamba_state_blocks", lambda _r, s, d: received.extend((s, d))
+    )
+
+    TPUModelRunner._apply_kv_cache_block_copies(
+        fake, [KVCacheBlockCopy(src_block_id=3, dst_block_id=5)]
+    )
+
+    staged = _staged_hosts(fake)
+    assert len(received) == len(staged) == 4
+    assert all(_is_one_of(t, staged) for t in received)
+    assert [t.tolist() for t in received] == [
+        [3] + [0] * 7,
+        [5] + [0] * 7,
+        [6, 7] + [0] * 6,
+        [10, 11] + [0] * 6,
+    ]
+
+
+def test_dense_copy_stages_every_index_upload(monkeypatch):
+    """The dense copy's index uploads are staged too (see
+    `test_page_local_copy_stages_every_index_upload`)."""
+    num_blocks = 8
+    latent = torch.zeros(num_blocks, 3)
+    indexer = torch.zeros(num_blocks * 2, 5, dtype=torch.uint8)
+    runner = _dense_runner(monkeypatch, [latent, indexer], num_blocks=num_blocks)
+    received = []
+    monkeypatch.setattr(
+        runner_mod, "copy_pool_blocks", lambda _p, s, d: received.extend((s, d))
+    )
+
+    TPUModelRunner._apply_dense_kv_cache_block_copies(
+        runner, [KVCacheBlockCopy(src_block_id=2, dst_block_id=5)]
+    )
+
+    staged = _staged_hosts(runner)
+    assert len(received) == len(staged) == 4
+    assert all(_is_one_of(t, staged) for t in received)
 
 
 def test_precompile_mamba_state_seed_copies_covers_all_groups_and_raw_tensors(
