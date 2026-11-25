@@ -2734,6 +2734,15 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             )
         key_row_bytes = None
         merged_key_row_bytes = self._merged_key_row_bytes(vllm_config)
+        # Debug only (QWEN4_EXP_DEBUG_NO_KEY_MIRROR=1): plan no keys mirror, so a host
+        # hit restores main KV with stale keys. Isolates startup faults; never serve with it.
+        debug_no_mirror = os.environ.get("QWEN4_EXP_DEBUG_NO_KEY_MIRROR", "0") == "1"
+        if merged_key_row_bytes is not None and debug_no_mirror:
+            logger.warning(
+                "TPURaidenOffloadingConnector: QWEN4_EXP_DEBUG_NO_KEY_MIRROR=1: merged "
+                "compressed keys are NOT carried by the host tier (debug only)"
+            )
+            merged_key_row_bytes = None
         if merged_key_row_bytes is not None:
             # QWEN4_EXP_MERGE_COMPRESSED_K: no compressed-key group; a mirror of the
             # main class carries each block's keys from the carriers' key region.
@@ -2764,7 +2773,8 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             gdn_row_bytes=gdn_row_bytes,
             merged_key_row_bytes=merged_key_row_bytes,
         )
-        check_served_plan(plan)
+        if not debug_no_mirror:
+            check_served_plan(plan)
         refuse_ephemeral_ports(
             [
                 self._controller_port_base
