@@ -612,27 +612,38 @@ def _kernel(
         # j-952e8a64), plus ~0.7 us whatever its width (j-aec3278d).
         single = first & last
         widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
-        for i, width in enumerate(widths):
-            fits = count > (widths[i - 1] if i else 0)
-            if width < pages_per_step:
-                fits = fits & (count <= width)
-            if transposed:
-                body = attend_t
-            elif words and _ATTEND_WORDS:
-                body = attend_words
-            else:
-                body = attend
-            pl.when(fits & single)(functools.partial(body, width, True))
-            pl.when(fits & jnp.logical_not(single))(
-                functools.partial(body, width, False)
+        if transposed:
+            body = attend_t
+        elif words and _ATTEND_WORDS:
+            body = attend_words
+        else:
+            body = attend
+
+        def run(lo, hi):
+            """The narrowest of ``widths[lo:hi + 1]`` holding the group's pages
+            (more than ``widths[lo - 1]``), found by halving: a group takes
+            about log2(widths) branches, not one per width and kind."""
+            if lo == hi:
+                jax.lax.cond(
+                    single,
+                    functools.partial(body, widths[lo], True),
+                    functools.partial(body, widths[lo], False),
+                )
+                return
+            mid = (lo + hi) // 2
+            jax.lax.cond(
+                count <= widths[mid],
+                functools.partial(run, lo, mid),
+                functools.partial(run, mid + 1, hi),
             )
 
-        @pl.when(count == 0)
-        def _empty():  # a tile of padding tokens: its only group holds no page
+        def empty():  # a tile of padding tokens: its only group holds no page
             write(
                 jnp.zeros((num_heads * block_q, head_dim), jnp.float32),
                 jnp.full((num_heads * block_q, 1), -jnp.inf, jnp.float32),
             )
+
+        jax.lax.cond(count == 0, empty, functools.partial(run, 0, len(widths) - 1))
 
     def loop(w, carry):
         group(w)
