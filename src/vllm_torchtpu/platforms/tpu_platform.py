@@ -282,9 +282,9 @@ def _validate_tpu_runner_features(vllm_config: VllmConfig) -> None:
             unsupported.append("diffusion models")
         if model_config.architecture in _UNSUPPORTED_ARCHITECTURES:
             unsupported.append(_UNSUPPORTED_ARCHITECTURES[model_config.architecture])
-        # vLLM's frontend loads only Model Runner V2 LogitsProcessor
-        # subclasses, while TPUModelRunner's V1 copy runs only the V1
-        # interface, so no class works until TPU moves onto Model Runner V2:
+        # On TPU the V1 runner copy loads no custom class
+        # (_load_custom_logitsprocs returns []), so they would be silently
+        # ignored; reject them until TPU moves onto Model Runner V2:
         # https://github.com/vllm-project/vllm-torchtpu/issues/3723
         if model_config.logits_processors:
             unsupported.append("custom logits processors")

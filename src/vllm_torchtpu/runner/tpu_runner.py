@@ -2936,8 +2936,9 @@ class TPUModelRunner(GPUModelRunner):
         input_batch._tpu_spec_room_guard = True
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
-        # A resumed request was reported in preempted_req_ids in the step it
-        # was preempted (the same one or earlier), so it is already dropped.
+        # A resumed request was reported in preempted_req_ids in an earlier
+        # step (vLLM schedules no waiting request in a step that preempts), so
+        # it is already dropped.
         invalidated_req_ids = scheduler_output.finished_req_ids | (
             scheduler_output.preempted_req_ids or set()
         )

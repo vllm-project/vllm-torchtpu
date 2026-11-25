@@ -1639,8 +1639,8 @@ def _attention_residual_stub(hidden: int, eps: float) -> AttentionResidual:
 
 
 def test_vllm_post_load_pass_folds_nested_attention_residual() -> None:
-    """vLLM runs every module's own post-load hook, children first, so the
-    Kimi model hook no longer folds its AttentionResidual layers itself."""
+    """vLLM runs every module's own post-load hook, so the Kimi model hook no
+    longer folds its AttentionResidual layers itself."""
     torch.manual_seed(0)
     residual = AttentionResidual.__new__(AttentionResidual)
     nn.Module.__init__(residual)

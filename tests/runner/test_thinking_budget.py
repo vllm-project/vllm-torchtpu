@@ -998,8 +998,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         settled_outputs: list[int],
     ) -> None:
         """Run real ``GPUModelRunner._update_states`` on preempt/resume with
-        unsettled ``[0]`` async placeholders in ``output_token_ids``. vLLM >=
-        0.34 drops a preempted request and re-sends it as a new request whose
+        unsettled ``[0]`` async placeholders in ``output_token_ids``. vLLM
+        drops a preempted request and re-sends it as a new request whose
         ``prefill_token_ids`` carry its settled outputs."""
         monkeypatch.setattr(
             gpu_model_runner, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)

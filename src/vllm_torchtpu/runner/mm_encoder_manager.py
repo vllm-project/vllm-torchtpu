@@ -194,10 +194,8 @@ class MMEncoderManager(EncoderCudaGraphManager):
 
     @staticmethod
     def _item_multiple_budgets(item_tokens: int, max_budget: int) -> list[int]:
-        """Power-of-2 multiples of ``item_tokens`` for a path whose items all
-        have ``item_tokens`` tokens, up to the largest multiple that fits."""
-        max_multiple = max(max_budget // item_tokens, 1) * item_tokens
-        return MMEncoderManager._generate_budgets(item_tokens, max_multiple)
+        """Keep power-of-2 XLA buckets for fixed-size encoder paths too."""
+        return MMEncoderManager._generate_budgets(item_tokens, max_budget)
 
     def _pad_to_template(
         self,
