@@ -1544,7 +1544,25 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         c_lo, c_hi = t0 * ua.GROUPS_PER_TILE // 128, jnp.minimum(
                             ((t0 + nt) * ua.GROUPS_PER_TILE + 127) // 128, c_hi)
                     jax.lax.fori_loop(c_lo, c_hi, chunk, 0)
-                    src = scr["qu_pv"]
+
+                    # Only the chunks just computed go to SMEM: the tiles read no other id.
+                    def to_smem(c: Any) -> Any:
+                        lo = pl.multiple_of(c * 128, 128)
+                        return pltpu.make_async_copy(
+                            scr["qu_pv"].at[:, pl.ds(lo, 128)],
+                            scr["qu_row"].at[pl.ds(bank, 1), pl.ds(lo, 128)],
+                            scr["qu_sem"].at[0],
+                        )
+
+                    jax.lax.fori_loop(c_lo, c_hi, lambda c, k: (to_smem(c).start(), k)[1], 0)
+                    tail = pltpu.make_async_copy(
+                        scr["qi_z"], scr["qu_row"].at[pl.ds(bank, 1), pl.ds(KU, 128)],
+                        scr["qu_sem"].at[1],
+                    )
+                    tail.start()
+                    jax.lax.fori_loop(c_lo, c_hi, lambda c, k: (to_smem(0).wait(), k)[1], 0)
+                    tail.wait()
+                    return n_u
                 cs = [
                     pltpu.make_async_copy(
                         src, scr["qu_row"].at[pl.ds(bank, 1), pl.ds(0, KU)],
