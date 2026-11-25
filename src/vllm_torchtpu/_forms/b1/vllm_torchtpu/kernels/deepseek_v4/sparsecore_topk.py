@@ -734,6 +734,7 @@ def _sc_topk_direct(
     return_scores: bool = True,
     scheduling_group_id: int | None = None,
     bounded_copy: bool = False,
+    live_rows: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
 
@@ -745,6 +746,13 @@ def _sc_topk_direct(
     compares raw bits either way.
     """
     b, n = scores.shape
+    rows = b
+    if live_rows is not None:
+        # q38 GLUEPKG IXSEL-ALIAS: `scores` already holds the padded row count
+        # (checked below); only its first `live_rows` rows are real.
+        if local_idxs is not None:
+            raise ValueError("live_rows does not combine with local_idxs")
+        b = live_rows
     if bounded_copy and (p != 1 or local_idxs is not None):
         raise ValueError("bounded_copy reads one whole row per subcore (p == 1)")
     info = pltpu.get_tpu_info()
@@ -763,7 +771,12 @@ def _sc_topk_direct(
     padded_b = num_waves * groups_per_chip
     pad_b = padded_b - b
     pad_n = slice_len * p - n
-    if pad_b > 0 or pad_n > 0:
+    if live_rows is not None:
+        if rows != padded_b:
+            raise ValueError(f"live_rows={b} needs {padded_b} score rows, got {rows}")
+        if pad_n > 0:
+            words = jnp.pad(words, ((0, 0), (0, pad_n)))
+    elif pad_b > 0 or pad_n > 0:
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
@@ -940,6 +953,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "return_scores",
         "bounded_copy",
         "idxx_tag",
+        "live_rows",
     ),
 )
 def sparsecore_topk(
@@ -952,6 +966,7 @@ def sparsecore_topk(
     return_scores: bool = False,
     bounded_copy: bool = False,
     idxx_tag: str | None = None,
+    live_rows: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -967,12 +982,21 @@ def sparsecore_topk(
 
     ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
     raw bits either way.
+
+    ``live_rows`` (q38 GLUEPKG IXSEL-ALIAS, VLLM_TPU_QSA_INDEXER_PADDED_ROWS):
+    ``scores`` holds exactly ``sc_topk_padded_rows(live_rows, n, k,
+    bounded_copy)`` rows, of which the first ``live_rows`` are real; the
+    kernel reads the buffer without padding it and returns ``live_rows`` rows.
+    Rows past ``live_rows`` are never scored (``row < b`` gates every subcore).
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
     if scores.dtype not in (jnp.float32, jnp.int32):
         raise ValueError(f"scores must be f32 or i32, got {scores.dtype}")
     b, n = scores.shape
+    rows = b
+    if live_rows is not None:
+        b = int(live_rows)
     if n % LANES != 0:
         raise ValueError(f"{n=} must be a multiple of {LANES}")
     if k % LANES != 0 or not 0 < k <= 4096:
@@ -994,6 +1018,10 @@ def sparsecore_topk(
         _note_idxx_decision(
             idxx_tag, b, n, k, return_scores, write_empty_rows, bounded, p, reason
         )
+    if live_rows is not None:
+        want = _cdiv(b, 32 // p) * (32 // p)
+        if rows != want:
+            raise ValueError(f"live_rows={b} needs {want} score rows, got {rows}")
     return _sc_topk_direct(
         scores,
         k,
@@ -1003,7 +1031,22 @@ def sparsecore_topk(
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,
         bounded_copy=bounded,
+        **({"live_rows": b} if live_rows is not None else {}),
     )
+
+
+def sc_topk_padded_rows(b: int, n: int, k: int, bounded_copy: bool = False) -> int:
+    """Score rows ``sparsecore_topk(scores[b, n], k, bounded_copy=...)`` pads
+    to: whole SparseCore waves of ``32 // p`` rows for the partition it picks.
+
+    q38 GLUEPKG IXSEL-ALIAS: a producer that allocates this many rows (and
+    passes ``live_rows=b``) lets the top-k read its buffer without a row pad;
+    the pad of a buffer whose row count is not a whole wave is what forces the
+    relayout copies before the SparseCore call.
+    """
+    bounded = bounded_copy and b >= 32 and _align_to(n, LANES) <= BOUNDED_MAX_WORDS
+    p = 1 if bounded else _pick_partition(b, n, k)
+    return _cdiv(b, 32 // p) * (32 // p)
 
 
 @functools.partial(

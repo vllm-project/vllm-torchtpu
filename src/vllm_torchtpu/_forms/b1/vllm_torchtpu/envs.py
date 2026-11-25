@@ -92,6 +92,8 @@ if TYPE_CHECKING:
     QWEN4_EXP_PD_BATCHED_ADMISSION_AB_PASSES: int = 0
     QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK: int = 0
     QWEN4_EXP_PD_FAST_ADMIT: bool = False
+    VLLM_TPU_PD_GATHER_BULK: bool = False
+    VLLM_TPU_PD_STAGING_FOLD: bool = False
     QWEN4_EXP_PP_LOGICAL_BLOCKS_FACTOR: int = 1
     TPU_KV_CACHE_GROUP_SIZE_RULE: str = "gcd"
     QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
@@ -258,6 +260,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_POOL_PAGE_DMA: bool = False
     VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_INDEX_ROPE_DERIVED: bool = False
+    VLLM_TPU_QSA_INDEXER_PADDED_ROWS: bool = False
     VLLM_TPU_QSA_DECODE_SC_OVERLAP: int = 0
     VLLM_TPU_QSA_PREFILL_SC_BOUNDED_COPY: bool = False
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
@@ -405,6 +408,9 @@ if TYPE_CHECKING:
     VLLM_TPU_GC_GEN2_THRESHOLD: int = 0
     VLLM_TPU_GC_GEN2_PERIOD_S: float = 0.0
     VLLM_TPU_GC_CENSUS: str = ""
+    VLLM_TPU_GC_WORKER: int = 0
+    VLLM_TPU_GC_WORKER_LOG: bool = False
+    VLLM_TPU_KVL_INWAIT: bool = False
     VLLM_TPU_PREPROC_IN_WAIT: int = 0
     VLLM_TPU_PREPROC_IN_WAIT_AB_MS: int = 0
     VLLM_TPU_DEFER_FIN: bool = False
@@ -1126,6 +1132,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # trig gathers into one. Strict: "" / "0" off, "1" on, anything else raises.
     "VLLM_TPU_QSA_INDEX_ROPE_DERIVED": _q38_gluepkg_flag(
         "VLLM_TPU_QSA_INDEX_ROPE_DERIVED"
+    ),
+    # q38 GLUEPKG IXSEL-ALIAS: when StreamIndex's score rows feed the SparseCore
+    # top-k in one chunk, the scoring kernel allocates its output with the
+    # top-k's padded row count (a whole SparseCore wave) and scores only the
+    # real rows, so the top-k reads the buffer as is: no row pad and no
+    # relayout copies before it. Padded rows have length 0 and are never read.
+    # Same winners. Strict: "" / "0" off, "1" on, anything else raises.
+    "VLLM_TPU_QSA_INDEXER_PADDED_ROWS": _q38_gluepkg_flag(
+        "VLLM_TPU_QSA_INDEXER_PADDED_ROWS"
     ),
     # Qwen4-exp shared-stream decode indexer (VLLM_TPU_QSA_DECODE_QUERY_BLOCK):
     # keep the TensorCore busy while the SparseCore selects. The layer's
@@ -1919,6 +1934,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # its submit" check as one int32 MIN all-reduce instead of an
     # all_gather_object. The same pages, rows, writes and decisions.
     "QWEN4_EXP_PD_FAST_ADMIT": env_bool("QWEN4_EXP_PD_FAST_ADMIT"),
+    # q38 SV-GATHER: the staged Qwen4Exp decode's landing gather reads each
+    # 64-row tile of consecutive staging rows with one DMA instead of 64 row
+    # DMAs (pd_staging.dma_row_gather(bulk=True)); the same bytes land. Exactly
+    # "1" is on; unset or any other value is off. Its repack ops carry their
+    # own names (pd_staging StagedConsumer._build_op), so the compile caches
+    # keep the two programs apart (tpu_compiler._TPU_COMPILE_ENV_IGNORED).
+    "VLLM_TPU_PD_GATHER_BULK": lambda: os.getenv("VLLM_TPU_PD_GATHER_BULK") == "1",
+    # q38 SV-GATHER PD-STAGING-FOLD: the staged Qwen4Exp decode's landing writes
+    # each gathered segment straight into the pool (pd_staging._write_u8_rows: a
+    # uint8 -> pool-dtype vreg bitcast in the kernel), with no XLA concatenation,
+    # pad or bitcast of the landed rows; the same bytes land. Exactly "1" is on.
+    # Its repack ops carry "_fold" names (tpu_compiler._TPU_COMPILE_ENV_IGNORED).
+    "VLLM_TPU_PD_STAGING_FOLD": lambda: os.getenv("VLLM_TPU_PD_STAGING_FOLD") == "1",
     # > 0: alternate the batched admission off / on every this many connector
     # passes, off first; every rank counts the same passes, so all flip
     # together (an in-job A/B on the same engines). Overrides the switch.
@@ -2842,6 +2870,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tracked heap and the length of one generation-2 pass. Also logs every
     # generation-2 pass. "" is off. Host-only.
     "VLLM_TPU_GC_CENSUS": env_str("VLLM_TPU_GC_CENSUS", ""),
+    # Workers (q38 SV-KVGC WORKER-GC, runner/gc_worker.py): the engine core's
+    # generation-2 policy in every worker process. The value is the period in
+    # worker steps of a generation-2 pass that every rank runs in the same
+    # step, inside its previous-results copy wait; with it the worker sets
+    # generation 2's threshold (VLLM_TPU_GC_GEN2_THRESHOLD, else 1000) and
+    # takes its requests' token lists out of the collector. 0 is off. Host-only.
+    "VLLM_TPU_GC_WORKER": env_nonnegative_int("VLLM_TPU_GC_WORKER", 0),
+    # Workers: count and log every collection per rank (q38 GCWORKER lines)
+    # without changing the collection policy. Implied by VLLM_TPU_GC_WORKER.
+    # Host-only, log only.
+    "VLLM_TPU_GC_WORKER_LOG": env_bool("VLLM_TPU_GC_WORKER_LOG", default=False),
+    # PD consumer workers (q38 SV-KVGC KVL-INWAIT, runner/kvl_inwait.py): a
+    # landed load's repack is planned ahead inside the worker's host waits
+    # (token copy, message queue, Stage-3 admission collective) and the
+    # step's Stage-3 submit pass runs before its deferred repacks. The
+    # programs, their order and every scheduler decision are the same.
+    # Host-only.
+    "VLLM_TPU_KVL_INWAIT": env_bool("VLLM_TPU_KVL_INWAIT", default=False),
     # Engine core: new requests are built (prompt copy + prefix-cache block
     # hashes) only while the main thread waits on the workers' tokens or an
     # empty input queue; the value caps a request's wait for that window in ms.

@@ -110,10 +110,18 @@ def prepare(
     budget_s: float,
     now: float,
     group: Any,
+    wait_hook: Callable[[], bool] | None = None,
 ) -> BatchedAdmission:
     """The pass's single collective: MIN all-reduce of the free map and of every
     candidate's not-expired flag over ``group.cpu_group`` (no collective with no
-    group, a group of one, or nothing to decide)."""
+    group, a group of one, or nothing to decide).
+
+    ``wait_hook`` (q38 SV-KVGC KVL-INWAIT): the same collective, issued
+    asynchronously; while it has not completed, ``wait_hook()`` runs one unit of
+    the caller's host work (it returns False when it has none left), then the
+    collective is waited for. Every rank issues the same collective at the same
+    point, so the collectives stay paired; the payload is not touched until it
+    completes."""
     deadlines: dict[str, float] = {}
     flags = []
     for dest, _ in candidates:
@@ -130,7 +138,15 @@ def prepare(
     if candidates and _world(group) > 1 and payload.numel():
         import torch.distributed as dist
 
-        dist.all_reduce(payload, op=dist.ReduceOp.MIN, group=group.cpu_group)
+        if wait_hook is None:
+            dist.all_reduce(payload, op=dist.ReduceOp.MIN, group=group.cpu_group)
+        else:
+            work = dist.all_reduce(
+                payload, op=dist.ReduceOp.MIN, group=group.cpu_group, async_op=True
+            )
+            while not work.is_completed() and wait_hook():
+                pass
+            work.wait()
         collectives = 1
     n_free = 0 if local_free is None else int(local_free.numel())
     reduced_free = payload[:n_free].to(local_free.dtype) if local_free is not None else None

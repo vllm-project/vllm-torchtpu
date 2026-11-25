@@ -6732,11 +6732,18 @@ class TPURaidenConnectorWorker:
             0.5 * float(dist_utils.get_p2p_wait_pull_timeout()),
             time.time(),
             tp_group,
+            wait_hook=self._stage3_admission_wait_hook(),
         )
         if reference is not None:
             admission.reference = reference
         self._stage3_last_admission = admission
         return admission
+
+    def _stage3_admission_wait_hook(self) -> Any:
+        """Host work run while the batched admission's collective is in flight
+        (``stage3_admission.prepare``); None waits as before. q38 SV-KVGC
+        KVL-INWAIT overrides it on the Qwen PD worker."""
+        return None
 
     def _stage3_admission_reference(self, candidates: list, tp_group: Any) -> list:
         """QWEN4_EXP_PD_BATCHED_ADMISSION_CHECK: today's per-load decisions for the

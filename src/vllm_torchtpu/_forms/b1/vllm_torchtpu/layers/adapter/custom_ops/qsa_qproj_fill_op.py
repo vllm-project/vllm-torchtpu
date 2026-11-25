@@ -52,6 +52,12 @@ _ALIGN = 16
 # (rows, slices, group base, precision) already logged by this process.
 _LOGGED: set = set()
 
+# q38 PSTEP-WARMTWIN: every trace of the op in this process, 0 slices included:
+# (rows, slots, max_query_len, chunk_override, group_base, precision) -> slices.
+# Python only (nothing enters the program); runner/prefill_twins.py checks its
+# warm-safe prediction against it on a cold or partly cold start.
+_TRACED: dict = {}
+
 
 def indexer_chunk(rows: int, chunk_override: int) -> int | None:
     """``pooled_qsa.prefill_indexer_chunk(rows)`` with the env read once at layer
@@ -132,6 +138,7 @@ def qproj_fill_jax(
     either way."""
     rows = hidden.shape[0]
     slices = fill_slices(rows, slots, max_query_len, chunk_override)
+    _TRACED[(int(rows), int(slots), int(max_query_len), int(chunk_override), int(group_base), str(precision))] = slices
     prec = _PRECISION[precision]
     dims = (((hidden.ndim - 1,), (weight.ndim - 1,)), ((), ()))
     if slices < 1:

@@ -34,7 +34,7 @@ from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
-from vllm_torchtpu.compilation import idxx_record, shape_variants
+from vllm_torchtpu.compilation import idxx_record, qsaf_record, shape_variants
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -294,6 +294,16 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Host-side staged admission and repack indices (same pages and rows);
     # its one-upload repack programs are keyed by their own graphs.
     "QWEN4_EXP_PD_FAST_ADMIT",
+    # The staged decode's landing gather with one DMA per tile of consecutive
+    # rows (q38 SV-GATHER): only the repack programs change, and their ops
+    # carry their own names (pd_staging StagedConsumer._build_op) and kernels,
+    # so their graphs and kernel fingerprints key them; no model program
+    # changes.
+    "VLLM_TPU_PD_GATHER_BULK",
+    # The staged decode's landing writer with each segment written straight into
+    # the pool (q38 SV-GATHER PD-STAGING-FOLD): only the repack programs change,
+    # and their ops carry "_fold" names and their own kernels.
+    "VLLM_TPU_PD_STAGING_FOLD",
     # Stage-3 load submit after the forward dispatch (same submits).
     "QWEN4_EXP_PD_DEFER_LOAD_SUBMIT",
     # When a landed load's staged repack is dispatched (after the forward
@@ -353,6 +363,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_GC_GEN2_THRESHOLD",
     "VLLM_TPU_GC_GEN2_PERIOD_S",
     "VLLM_TPU_GC_CENSUS",
+    # Worker gen2 policy and its counters, and in-wait repack planning with the
+    # submit pass first (q38 SV-KVGC; runner/gc_worker.py, runner/kvl_inwait.py):
+    # host only, every program and input is the same.
+    "VLLM_TPU_GC_WORKER",
+    "VLLM_TPU_GC_WORKER_LOG",
+    "VLLM_TPU_KVL_INWAIT",
     # New requests built in the engine core's waits (core/preproc_in_wait.py).
     "VLLM_TPU_PREPROC_IN_WAIT",
     "VLLM_TPU_PREPROC_IN_WAIT_AB_MS",
@@ -618,6 +634,12 @@ def _tpu_compile_env_factors() -> dict[str, Any]:
                  "VLLM_TPU_QSA_DCP_FUSED_MERGE"):
         if os.environ.get(name, "").strip():
             factors[name] = os.environ[name].strip()
+    # q38 QSAF (kernels/qwen4_exp/qsa_fused_union_keys.py): VLLM_TPU_QSA_DECODE_FUSED_UNION(_ISSUE) are not registered in
+    # envs.py either; they key the cache only when the lever is on, so a tree carrying QSAF with it off keeps every key.
+    if os.environ.get("VLLM_TPU_QSA_DECODE_FUSED_UNION", "") or os.environ.get("VLLM_TPU_QSA_DECODE_FUSED_UNION_ISSUE", ""):
+        from vllm_torchtpu.kernels.qwen4_exp import qsa_fused_union_keys
+
+        factors.update(qsa_fused_union_keys.compile_factors())
     return factors
 
 
@@ -666,6 +688,14 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
             else None,
         },
     }
+
+    # q38 PSTEP-WARMTWIN: the P7 twin against the native factors hashed here. Log only:
+    # it only reads `factors` and never raises (a failure is logged), so it can neither
+    # change this hash nor block a start.
+    try:
+        _p7_twin_check(factors["native_env"])
+    except Exception as e:  # noqa: BLE001 - log only
+        logger.warning("q38 P7-TWIN check error: %s: %s", type(e).__name__, e)
 
     repo_root = Path(__file__).resolve().parents[2]
     hash_obj = hashlib.sha256(
@@ -720,6 +750,77 @@ def _ensure_tuple_output(graph: fx.GraphModule) -> tuple[fx.GraphModule, bool]:
 def _single_size(compile_range: Range) -> int | None:
     """The token bucket a compile range pins, or None for a size range."""
     return compile_range.start if compile_range.is_single_size() else None
+
+
+# q38 PSTEP-WARMTWIN: per process, per single-size range, [backend runs, artifact
+# replays]. A backend run traces the graph's custom ops (a cold compile, or the
+# self-heal recompile in `load`); a replay (a cache load or a peer's artifact)
+# traces nothing. Python only; runner/prefill_twins.py reads it to tell a traced
+# bucket from a warm one.
+_RANGE_TRACES: dict[int, list[int]] = {}
+
+
+def _note_range(size: int | None, backend: bool) -> None:
+    if size is not None:
+        _RANGE_TRACES.setdefault(int(size), [0, 0])[0 if backend else 1] += 1
+
+
+def range_traces(size: int) -> tuple[int, int]:
+    """(backend runs, artifact replays) of the single-size range ``size`` in this
+    process so far."""
+    runs = _RANGE_TRACES.get(int(size), (0, 0))
+    return int(runs[0]), int(runs[1])
+
+
+def _p7_twin_check(native_env: dict[str, Any]) -> None:
+    """q38 PSTEP-WARMTWIN: compare the P7 twin's claim (worker/p7_twin.py, printed
+    at worker init) with the native compile factors this hash is built from.
+
+    Parses the hashed LIBTPU_INIT_ARGS here, independently of the twin. Prints one
+    'q38 P7-TWIN check' line per process and claim when they agree, a 'q38 P7-TWIN
+    MISMATCH' line when they differ (including a silent twin while the hashed args
+    carry a dvfs token), and nothing in a process that never reported (no worker)
+    or when neither side carries a dvfs token. Log only.
+    """
+    try:
+        from vllm_torchtpu.worker import p7_twin
+    except Exception:  # noqa: BLE001 - log only
+        return
+    claim = p7_twin.claim()
+    if claim is None:
+        return
+    args = native_env.get("LIBTPU_INIT_ARGS") or ""
+    tokens = [t for t in args.split() if t.startswith("--xla_tpu_dvfs_p_state")]
+    hashed = {
+        "p7": int("--xla_tpu_dvfs_p_state=7" in tokens),
+        "dvfs_tokens": ",".join(tokens) or "-",
+        "libtpu_args_sha": hashlib.sha256(args.encode()).hexdigest()[:16],
+        "compile_factor_sha": hashlib.sha256(
+            json.dumps(native_env, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()[:16],
+    }
+    if claim["dvfs_tokens"] == "-" and hashed["dvfs_tokens"] == "-":
+        return
+    fields = ("p7", "dvfs_tokens", "libtpu_args_sha", "compile_factor_sha")
+    seen = (tuple(claim[f] for f in fields), tuple(hashed[f] for f in fields))
+    if seen in _P7_CHECKED:
+        return
+    _P7_CHECKED.add(seen)
+    if seen[0] == seen[1]:
+        logger.info(
+            "q38 P7-TWIN check: rank=%d pid=%d p7=%d compile_factor_sha=%s match=1",
+            claim["rank"], os.getpid(), hashed["p7"], hashed["compile_factor_sha"],
+        )
+    else:
+        logger.info(
+            "q38 P7-TWIN MISMATCH: rank=%d pid=%d claimed=%s hashed=%s",
+            claim["rank"], os.getpid(),
+            ",".join(f"{f}:{claim[f]}" for f in fields),
+            ",".join(f"{f}:{hashed[f]}" for f in fields),
+        )
+
+
+_P7_CHECKED: set = set()
 
 
 class TpuCompilerAdaptor(CompilerInterface):
@@ -1068,13 +1169,17 @@ class TpuCompilerAdaptor(CompilerInterface):
             # q38 IDXXLINE: the peer artifact's IDXX trace record (no-op when no
             # IDXX key is set).
             idxx_record.on_peer(peer_path, save_path, self.cache_dir, handle is not None)
+            # q38 QSAF-INT: the peer artifact's QSAF trace record (no-op with the key off).
+            qsaf_record.on_peer(peer_path, save_path, self.cache_dir, handle is not None)
             if was_wrapped:
                 compiled_fn = self._unwrap_compiled_fn(compiled_fn)
             if size is not None:
                 shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+            _note_range(size, backend=False)  # q38 PSTEP-WARMTWIN
             return compiled_fn, handle
 
         compiled_fn, entry = self._run_backend(graph, example_inputs)
+        _note_range(size, backend=True)  # q38 PSTEP-WARMTWIN
 
         if was_wrapped:
             # Undo _ensure_tuple_output on the result side, so callers see the
@@ -1104,6 +1209,9 @@ class TpuCompilerAdaptor(CompilerInterface):
                 # q38 IDXXLINE: this process's IDXX trace record next to the
                 # artifact (no-op when no IDXX key is set).
                 idxx_record.on_saved(save_path, self.cache_dir, "compiled")
+                # q38 QSAF-INT: this process's QSAF trace record next to the artifact
+                # (no-op with the key off).
+                qsaf_record.on_saved(save_path, self.cache_dir, "compiled")
         elif caching:
             logger.info(
                 "[TpuCompilerAdaptor] No serializable artifact for range %s; "
@@ -1158,10 +1266,14 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)
+        _note_range(size, backend=compiled_fn is None)  # q38 PSTEP-WARMTWIN
         if compiled_fn is not None:
             # q38 IDXXLINE: the IDXX trace record next to the artifact this
             # process loaded (no-op when no IDXX key is set).
             idxx_record.on_loaded(path)
+            # q38 QSAF-INT: the QSAF trace record next to the loaded artifact
+            # (no-op with the key off).
+            qsaf_record.on_loaded(path)
         if compiled_fn is None:
             fingerprint = (
                 _graph_fingerprint(graph) if envs.TPU_PRECOMPILE_PEER_REPLAY else None
@@ -1177,6 +1289,8 @@ class TpuCompilerAdaptor(CompilerInterface):
                 if self._save_handle(key, path, entry, graph, was_wrapped, fingerprint):
                     # q38 IDXXLINE: rewrite the record with the recompile's trace.
                     idxx_record.on_saved(path, self.cache_dir, "recompiled")
+                    # q38 QSAF-INT: rewrite the QSAF record with the recompile's trace.
+                    qsaf_record.on_saved(path, self.cache_dir, "recompiled")
 
         if was_wrapped:
             compiled_fn = self._unwrap_compiled_fn(compiled_fn)

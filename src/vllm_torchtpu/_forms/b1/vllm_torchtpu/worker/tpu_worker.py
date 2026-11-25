@@ -158,6 +158,11 @@ class TPUWorker(WorkerBase):
             logger.info(
                 "Profiling enabled. Traces will be saved to: %s", self.profile_dir
             )
+        # q38 PSTEP-WARMTWIN: the P7 twin of this worker process (log only; silent
+        # without a --xla_tpu_dvfs_p_state token in LIBTPU_INIT_ARGS).
+        from vllm_torchtpu.worker import p7_twin
+
+        p7_twin.report(self.rank)
 
     def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
         # TPU resolves before model load because layout determines its page
@@ -805,6 +810,11 @@ class TPUWorker(WorkerBase):
         # from scanning those objects mid-step.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
+        # q38 SV-KVGC WORKER-GC (runner/gc_worker.py): the generation-2 policy
+        # and its per-rank line (inert unless VLLM_TPU_GC_WORKER[_LOG]).
+        from vllm_torchtpu.runner import gc_worker
+
+        gc_worker.start(self)
         from vllm_torchtpu.runner.compile_watch import (
             install_post_warmup_compile_log,
         )

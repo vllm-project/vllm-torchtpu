@@ -62,7 +62,11 @@ class SparseCoreTopK:
         *,
         scheduling_group_id: int | None,
         return_scores: bool,
+        live_rows: int | None = None,
     ) -> jax.Array | tuple[jax.Array, jax.Array]:
+        """``live_rows`` (q38 GLUEPKG IXSEL-ALIAS): ``score_bits`` holds
+        ``sparsecore_topk.sc_topk_padded_rows(live_rows, ...)`` rows, the first
+        ``live_rows`` real; see ``sparsecore_topk``."""
         select = sparsecore_topk.__wrapped__ if self.inline else sparsecore_topk
         return select(
             score_bits,
@@ -73,4 +77,5 @@ class SparseCoreTopK:
             return_scores=return_scores,
             bounded_copy=self.bounded_copy,
             **({} if self.idxx_tag is None else {"idxx_tag": self.idxx_tag}),
+            **({"live_rows": live_rows} if live_rows is not None else {}),
         )

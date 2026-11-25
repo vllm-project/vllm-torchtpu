@@ -29,6 +29,7 @@ byte first (``kernels/typed_ldst.py``, ``megakernel_runtime/qwen38_gdn_state``).
 import copy
 import dataclasses
 import math
+import threading
 import time
 import types
 from collections.abc import Sequence
@@ -204,6 +205,144 @@ def fast_admit() -> bool:
         value = os.environ.get("QWEN4_EXP_PD_FAST_ADMIT", "").strip().lower()
         return value in ("1", "true", "yes", "on")
     return bool(envs.QWEN4_EXP_PD_FAST_ADMIT)
+
+
+def gather_bulk_enabled() -> bool:
+    """VLLM_TPU_PD_GATHER_BULK (q38 SV-GATHER): exactly ``"1"`` turns the
+    landing's bulk-tile gather on; unset or any other value is off (envs; read
+    directly when this module is loaded by path, without the package)."""
+    try:
+        from vllm_torchtpu import envs
+    except ImportError:
+        import os
+
+        return os.environ.get("VLLM_TPU_PD_GATHER_BULK") == "1"
+    return bool(envs.VLLM_TPU_PD_GATHER_BULK)
+
+
+def staging_fold_enabled() -> bool:
+    """VLLM_TPU_PD_STAGING_FOLD (q38 SV-GATHER PD-STAGING-FOLD): exactly
+    ``"1"`` makes the landing write each gathered segment straight into the
+    pool (``_write_u8_rows``); unset or any other value is off (envs; read
+    directly when this module is loaded by path, without the package)."""
+    try:
+        from vllm_torchtpu import envs
+    except ImportError:
+        import os
+
+        return os.environ.get("VLLM_TPU_PD_STAGING_FOLD") == "1"
+    return bool(envs.VLLM_TPU_PD_STAGING_FOLD)
+
+
+# q38 SV-GATHER-2 GBULK-LINE: per-rank, warm-cache-safe engagement lines of VLLM_TPU_PD_GATHER_BULK.
+GBULK_BIND = "q38 PDGBULK bind rank=%d tp_rank=%d tp_size=%d pid=%d key=%r bulk=%d"
+GBULK_MISMATCH = (
+    "q38 PDGBULK MISMATCH rank=%d tp_rank=%d tp_size=%d pid=%d op=%s bind=%d traced=%s "
+    "rows=%d bulk=%d"
+)
+
+
+def _gbulk_rank(rank) -> tuple[int, int, int, int]:
+    """(rank, tp_rank, tp_size, pid) of the PD-GATHER-BULK lines: the torch.distributed rank when a
+    process group is initialized (-1 otherwise), the consumer's RankSlice (pd_connector builds it from
+    the worker's tp_rank and the TP size) and this process id."""
+    import os
+
+    world_rank = -1
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            world_rank = int(dist.get_rank())
+    except Exception:  # noqa: BLE001 - a log field
+        pass
+    return world_rank, int(getattr(rank, "tp_rank", -1)), int(getattr(rank, "tp_size", -1)), os.getpid()
+
+
+def gather_bulk_bind_line(rank, bulk: bool) -> str:
+    """The PD-GATHER-BULK engagement line, printed by every StagedConsumer as it is built.
+
+    pd_connector.register_runner builds one consumer on every decode TP worker at every engine start,
+    with the compile cache warm or cold, so this line never depends on a trace (the repack programs
+    trace, and print the SV-GATHER marker, only when they compile). A plain print in each process, with
+    the rank in the line (never a once-per-node log). ``key`` is the raw VLLM_TPU_PD_GATHER_BULK value
+    (None when unset) and ``bulk`` the decision the consumer's repack programs are built with. Log only:
+    nothing here enters a program."""
+    import os
+
+    line = GBULK_BIND % (
+        *_gbulk_rank(rank), os.environ.get("VLLM_TPU_PD_GATHER_BULK"), int(bool(bulk))
+    )
+    print(line, flush=True)
+    return line
+
+
+def gather_bulk_mismatch(consumer, op_name: str, before: tuple[int, int]) -> None:
+    """The GBULK-LINE MISMATCH guard, run (Python only) while a repack program traces.
+
+    Compares the DMA row gathers the trace took since ``before`` (``_gather_counts``) with the
+    consumer's bind decision (``_gather_bulk``: the value its bind line printed and its op names
+    carry). A trace without a DMA gather (the plain CPU gather, a custom gather) has nothing to
+    compare. A bulk bind whose program took a per-row gather, or a per-row bind whose program took a
+    bulk one, prints 'q38 PDGBULK MISMATCH ...' and raises: the program would not be the one its name
+    and its bind line state."""
+    rows, bulk = (now - was for now, was in zip(_gather_counts(), before))
+    if rows + bulk == 0:
+        return
+    bind = bool(getattr(consumer, "_gather_bulk", False))
+    traced = "mixed" if rows and bulk else ("1" if bulk else "0")
+    if traced == str(int(bind)):
+        return
+    line = GBULK_MISMATCH % (
+        *_gbulk_rank(getattr(consumer, "rank", None)), op_name, int(bind), traced, rows, bulk
+    )
+    print(line, flush=True)
+    raise RuntimeError(line)
+
+
+# q38 SV-GATHER-2 FOLD-LINE: the same per-rank, warm-cache-safe lines for VLLM_TPU_PD_STAGING_FOLD.
+FOLD_BIND = "q38 PDFOLD bind rank=%d tp_rank=%d tp_size=%d pid=%d key=%r fold=%d"
+FOLD_MISMATCH = (
+    "q38 PDFOLD MISMATCH rank=%d tp_rank=%d tp_size=%d pid=%d op=%s bind=%d traced=%s "
+    "concat=%d fold=%d"
+)
+
+
+def staging_fold_bind_line(rank, fold: bool) -> str:
+    """The PD-STAGING-FOLD engagement line, printed by every StagedConsumer as it is built
+    (gather_bulk_bind_line's pattern and rank fields): every decode TP worker, every engine start,
+    compile cache warm or cold, no trace needed (the 'staging fold traced' marker prints only when
+    the repack compiles). ``key`` is the raw VLLM_TPU_PD_STAGING_FOLD value (None when unset) and
+    ``fold`` the decision the consumer's repack programs are built with. Log only."""
+    import os
+
+    line = FOLD_BIND % (
+        *_gbulk_rank(rank), os.environ.get("VLLM_TPU_PD_STAGING_FOLD"), int(bool(fold))
+    )
+    print(line, flush=True)
+    return line
+
+
+def staging_fold_mismatch(consumer, op_name: str, before: tuple[int, int]) -> None:
+    """The FOLD-LINE MISMATCH guard, run (Python only) while a repack program traces.
+
+    Compares the landing writes the trace took since ``before`` (``_write_counts``: the default
+    concatenated write, or the fold writer ``_write_u8_rows``) with the consumer's bind decision
+    (``_staging_fold``: the value its bind line printed and its op names carry). A trace with
+    neither (a custom ``write``) has nothing to compare. A difference, or a mix, prints
+    'q38 PDFOLD MISMATCH ...' and raises."""
+    concat, fold = (now - was for now, was in zip(_write_counts(), before))
+    if concat + fold == 0:
+        return
+    bind = bool(getattr(consumer, "_staging_fold", False))
+    traced = "mixed" if concat and fold else ("1" if fold else "0")
+    if traced == str(int(bind)):
+        return
+    line = FOLD_MISMATCH % (
+        *_gbulk_rank(getattr(consumer, "rank", None)), op_name, int(bind), traced, concat, fold
+    )
+    print(line, flush=True)
+    raise RuntimeError(line)
 
 
 def force_gap_fraction() -> float:
@@ -1017,9 +1156,39 @@ def _untyped(elems, rows: int, itemsize: int):
 
 _GATHER_MARK: dict = {}
 
+# GBULK-LINE: the DMA row gathers this thread has traced, by kind ("rows": per-row DMAs, "bulk": one
+# DMA per consecutive tile). Python counters only, which _build_op's repack reads while it traces.
+_GATHER_TRACES = threading.local()
 
-def dma_row_gather(stage, flat, *, tile: int = REPACK_TILE, interpret: bool = False, out_dtype=None):
+
+def _count_gather(bulk: bool) -> None:
+    kind = "bulk" if bulk else "rows"
+    setattr(_GATHER_TRACES, kind, getattr(_GATHER_TRACES, kind, 0) + 1)
+
+
+def _gather_counts() -> tuple[int, int]:
+    """(per-row, bulk) DMA row gathers traced so far on this thread (gather_bulk_mismatch)."""
+    return getattr(_GATHER_TRACES, "rows", 0), getattr(_GATHER_TRACES, "bulk", 0)
+
+
+def _count_write(fold: bool) -> None:
+    kind = "write_fold" if fold else "write_concat"
+    setattr(_GATHER_TRACES, kind, getattr(_GATHER_TRACES, kind, 0) + 1)
+
+
+def _write_counts() -> tuple[int, int]:
+    """(default concatenated, fold) landing writes traced so far on this thread (staging_fold_mismatch)."""
+    return getattr(_GATHER_TRACES, "write_concat", 0), getattr(_GATHER_TRACES, "write_fold", 0)
+
+
+def dma_row_gather(
+    stage, flat, *, tile: int = REPACK_TILE, interpret: bool = False, out_dtype=None, bulk: bool = False
+):
     """``stage[flat]`` (``stage``: ``[rows, 4, 256]`` of the carrier's dtype), byte-exact.
+
+    ``bulk`` (VLLM_TPU_PD_GATHER_BULK, ``_tile_row_gather``): a tile whose ``tile`` indices are consecutive
+    rows is read with one DMA of ``tile`` rows; every other tile keeps the per-row DMAs below. The same rows
+    land in the same output rows either way. Off, the program is exactly the per-row one.
 
     ``out_dtype`` (same element width, e.g. uint8) returns the rows already reinterpreted: the rows land by DMA
     in a VMEM scratch block of the carrier dtype, and the block is stored to the ``out_dtype`` output through a
@@ -1056,6 +1225,9 @@ def dma_row_gather(stage, flat, *, tile: int = REPACK_TILE, interpret: bool = Fa
         raise ValueError("dma_row_gather reinterprets rows only between same-width dtypes")
 
     same = jnp.dtype(out_dtype) == jnp.dtype(stage.dtype)
+    _count_gather(bulk)  # GBULK-LINE: the gather this trace took (a Python counter, not a program op)
+    if bulk:
+        return _tile_row_gather(stage, idx, n, tile, out_dtype, same, interpret)
 
     def kernel(idx_ref, stage_ref, out_ref, semaphore, *scratch):
         first = pl.program_id(0) * tile
@@ -1095,6 +1267,183 @@ def dma_row_gather(stage, flat, *, tile: int = REPACK_TILE, interpret: bool = Fa
     return out[:n]
 
 
+def gather_bulk_tiles(idx, tile: int = REPACK_TILE):
+    """Per ``tile``-row tile of the padded index list ``idx``: 1 if its indices are consecutive rows
+    (``idx[first] + 0, 1, ..., tile - 1``), else 0 (int32). A tile of consecutive rows is one contiguous
+    run of the carrier, so one DMA of ``tile`` rows reads exactly the rows the per-row DMAs read. The
+    scatter's ``bulk`` flag (``pooled_qsa._write_main_cache_universal``) is the same test on the pool side.
+    """
+    import jax.numpy as jnp
+
+    tiles = idx.reshape(-1, tile)
+    run = tiles[:, :1] + jnp.arange(tile, dtype=tiles.dtype)
+    return jnp.all(tiles == run, axis=1).astype(jnp.int32)
+
+
+def _tile_row_gather(stage, idx, n: int, tile: int, out_dtype, same: bool, interpret: bool):
+    """``dma_row_gather`` with ``bulk`` (q38 SV-GATHER): one DMA per tile of consecutive rows.
+
+    The staged landing's rows come in runs (staging rows are numbered per owner in 256-row pages, segments
+    start on a tile and their padding is a run of null-page rows), so most tiles are one run; the per-row
+    gather still issued one 1 KiB DMA per row, about 20.7 ns each (TRACEAN, D-EC j-b60636b2). A tile of
+    consecutive rows (``gather_bulk_tiles``) is read by one DMA of ``tile`` rows; any other tile (a run
+    starting or ending inside it, a repeated last row) keeps the per-row DMAs. Either way output row ``i``
+    is carrier row ``idx[i]``, byte for byte, through the DMA engine only (no vector unit holds the bytes as
+    FP8 values; the u8 view goes through the same ``pltpu.bitcast`` of the landed block).
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    if not _GATHER_MARK.get("bulk"):  # engagement marker, once per process, at trace time
+        _GATHER_MARK["bulk"] = True
+        print("q38 SV-GATHER bulk gather traced: one DMA per consecutive %d-row tile (dtype %s, backend %s)"
+              % (tile, stage.dtype, jax.default_backend()), flush=True)
+    bulk = gather_bulk_tiles(idx, tile)
+
+    def kernel(idx_ref, bulk_ref, stage_ref, out_ref, semaphore, *scratch):
+        program = pl.program_id(0)
+        first = program * tile
+        dst = out_ref if same else scratch[0]
+
+        @pl.when(bulk_ref[program] != 0)
+        def tile_copy():
+            pltpu.async_copy(stage_ref.at[pl.ds(idx_ref[first], tile)], dst, semaphore).wait()
+
+        @pl.when(bulk_ref[program] == 0)
+        def row_copies():
+            def row_copy(lane):
+                return pltpu.make_async_copy(
+                    stage_ref.at[pl.ds(idx_ref[first + lane], 1)],
+                    dst.at[pl.ds(lane, 1)],
+                    semaphore,
+                )
+
+            for lane in range(tile):
+                row_copy(lane).start()
+            for lane in range(tile):
+                row_copy(lane).wait()
+
+        if not same:
+            out_ref[...] = pltpu.bitcast(scratch[0][...], out_dtype)
+
+    out = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(idx.shape[0] // tile,),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec(
+                (tile, *stage.shape[1:]),
+                lambda program, *_: (program,) + (0,) * (stage.ndim - 1),
+            ),
+            scratch_shapes=[pltpu.SemaphoreType.DMA]
+            + ([] if same else [pltpu.VMEM((tile, *stage.shape[1:]), stage.dtype)]),
+        ),
+        out_shape=jax.ShapeDtypeStruct((idx.shape[0], *stage.shape[1:]), out_dtype),
+        name="qwen4_pd_staged_row_gather_bulk",
+        **({"interpret": pltpu.InterpretParams()} if interpret else {}),
+    )(idx, bulk, stage)
+    return out[:n]
+
+
+def _write_u8_rows(pool, rows, page, logical, valid, tile: int = REPACK_TILE):
+    """``pool[page, logical % pool.shape[1]] = rows`` for uint8 ``rows`` into a pool of another dtype of the same width,
+    in place (q38 SV-GATHER PD-STAGING-FOLD): ``pooled_qsa._write_main_cache_universal`` with ``overlap_edges`` (one DMA per
+    whole page-local tile of consecutive rows, overlapped row DMAs elsewhere, ``valid`` masking), except that each tile of
+    rows lands in a VMEM block of uint8 and is reinterpreted to the pool dtype by a Mosaic vreg bitcast (``pltpu.bitcast``,
+    a register reinterpretation, the landing gather's own uint8 path in reverse) into a scratch block, which is what the
+    DMAs copy. So no XLA op ever holds the bytes as pool-dtype (FP8) values: XLA FP8 <-> uint8 conversions canonicalised NaN
+    encodings on TPU (nanprobe j-5a9f82e0; lane_xfer 11.29). ``rows``: ``[n, *pool.shape[2:]]`` uint8, ``n`` a multiple of
+    ``tile`` (the caller pads and masks), ``pool.shape[1]`` a multiple of ``tile``."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    if len(rows) % tile or pool.shape[1] % tile:
+        raise ValueError("_write_u8_rows takes whole tiles of rows into whole-tile pages")
+    if jnp.dtype(rows.dtype).itemsize != jnp.dtype(pool.dtype).itemsize or tuple(rows.shape[1:]) != tuple(pool.shape[2:]):
+        raise ValueError("_write_u8_rows needs same-width rows of the pool's row shape")
+    if not _GATHER_MARK.get("fold"):  # engagement marker, once per process, at trace time
+        _GATHER_MARK["fold"] = True
+        print("q38 SV-GATHER staging fold traced: segment rows written straight into the pool (rows %s -> pool %s, backend %s)"
+              % (rows.dtype, pool.dtype, jax.default_backend()), flush=True)
+    _count_write(True)  # FOLD-LINE: the fold writer this trace took (a Python counter, not a program op)
+    offsets = logical % pool.shape[1]
+    pages_by_tile = page.reshape(-1, tile)
+    offsets_by_tile = offsets.reshape(-1, tile)
+    valid_by_tile = valid.reshape(-1, tile)
+    bulk = (
+        jnp.all(valid_by_tile, axis=1)
+        & jnp.all(pages_by_tile == pages_by_tile[:, :1], axis=1)
+        & jnp.all(offsets_by_tile == offsets_by_tile[:, :1] + jnp.arange(tile, dtype=offsets.dtype), axis=1)
+    )
+    pool_dtype = pool.dtype
+    same = jnp.dtype(rows.dtype) == jnp.dtype(pool_dtype)
+
+    def kernel(pages_ref, offsets_ref, valid_ref, bulk_ref, source_ref, _old_ref, target_ref, semaphore, *scratch_refs):
+        program = pl.program_id(0)
+        first = program * tile
+        if same:  # nothing to reinterpret: the DMAs read the landed block itself
+            scratch = source_ref
+        else:
+            scratch = scratch_refs[0]
+            scratch[...] = pltpu.bitcast(source_ref[...], pool_dtype)
+
+        @pl.when(bulk_ref[program] != 0)
+        def store_tile():
+            pltpu.async_copy(scratch, target_ref.at[pages_ref[first], pl.ds(offsets_ref[first], tile)], semaphore).wait()
+
+        def row_copy(lane, row):
+            return pltpu.make_async_copy(
+                scratch.at[pl.ds(lane, 1)],
+                target_ref.at[pages_ref[row], pl.ds(offsets_ref[row], 1)],
+                semaphore,
+            )
+
+        @pl.when(bulk_ref[program] == 0)
+        def store_edges():
+            for lane in range(tile):
+                row = first + lane
+
+                @pl.when(valid_ref[row] != 0)
+                def start_row(*, lane=lane, row=row):
+                    row_copy(lane, row).start()
+
+            for lane in range(tile):
+                row = first + lane
+
+                @pl.when(valid_ref[row] != 0)
+                def wait_row(*, lane=lane, row=row):
+                    row_copy(lane, row).wait()
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            grid=(len(rows) // tile,),
+            in_specs=[
+                pl.BlockSpec((tile, *rows.shape[1:]), lambda program, *_: (program,) + (0,) * (rows.ndim - 1)),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[pltpu.SemaphoreType.DMA] + ([] if same else [pltpu.VMEM((tile, *rows.shape[1:]), pool_dtype)]),
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={5: 0},
+        name="qwen4_pd_landing_fold_scatter",
+    )(
+        page.astype(jnp.int32),
+        offsets.astype(jnp.int32),
+        valid.astype(jnp.int32),
+        bulk.astype(jnp.int32),
+        rows,
+        pool,
+    )
+
+
 def make_repack(
     *,
     src_block: int,
@@ -1107,6 +1456,8 @@ def make_repack(
     write=None,
     compact_gdn: tuple[int, int] | None = None,
     gather=None,
+    gather_bulk: bool = False,
+    staging_fold: bool = False,
 ):
     """``fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst)``.
 
@@ -1133,7 +1484,14 @@ def make_repack(
     ``gather(stage, flat)`` reads staging rows ``stage[flat]`` byte for byte; by
     default the DMA row gather (``dma_row_gather``) on TPU, where an XLA gather
     of the FP8-typed carrier canonicalised NaN bytes, and a plain gather
-    elsewhere (bit-exact on CPU).
+    elsewhere (bit-exact on CPU). ``gather_bulk`` (VLLM_TPU_PD_GATHER_BULK)
+    makes the TPU default the DMA gather that reads each tile of consecutive
+    rows with one DMA (``dma_row_gather(bulk=True)``); the bytes are the same.
+    ``staging_fold`` (VLLM_TPU_PD_STAGING_FOLD) writes each gathered segment (main KV,
+    copied rows, GDN) into the pool with its own call of ``_write_u8_rows``: no
+    concatenation, no whole-buffer pad and no XLA uint8 -> pool-dtype bitcast of
+    the landed rows (a custom ``write`` gets each segment bitcast to the pool
+    dtype instead, the CPU tests' stand-in); the same rows land with the same bytes.
 
     ``write(pool, rows, page, logical, valid)`` stores ``rows`` at
     ``pool[page, logical % pool.shape[1]]``; by default the forward's aliased
@@ -1155,13 +1513,18 @@ def make_repack(
         if jax.default_backend() == "tpu":
             import functools
 
-            gather = functools.partial(dma_row_gather, out_dtype=jnp.uint8)
-            gather.__name__ = "dma_row_gather_u8"
+            if gather_bulk:
+                gather = functools.partial(dma_row_gather, out_dtype=jnp.uint8, bulk=True)
+                gather.__name__ = "dma_row_gather_u8_bulk"
+            else:
+                gather = functools.partial(dma_row_gather, out_dtype=jnp.uint8)
+                gather.__name__ = "dma_row_gather_u8"
         else:
             gather = rows_of
     print("Qwen PD staged repack gather selected: %s (jax backend %s)"
           % (getattr(gather, "__name__", "custom"), jax.default_backend()), flush=True)
 
+    custom_write = write is not None
     if write is None:
         import functools
 
@@ -1172,6 +1535,21 @@ def make_repack(
         write = functools.partial(
             _write_main_cache_universal, tile=REPACK_TILE, overlap_edges=True
         )
+
+    def write_segment(pool, rows, dst):
+        """One landed segment (uint8 rows ``[n, 4, 256]``, flat pool rows ``dst``) into the pool: the fold path."""
+        dst = dst.astype(jnp.int32)
+        valid = jnp.ones(dst.shape, jnp.bool_)
+        tail = -len(dst) % REPACK_TILE
+        if tail:  # whole tiles; the tail rows are masked out
+            rows = jnp.pad(rows, ((0, tail), (0, 0), (0, 0)))
+            dst = jnp.pad(dst, (0, tail))
+            valid = jnp.pad(valid, (0, tail))
+        kernel_rows = pool.shape[1]
+        rows = rows.reshape(-1, *pool.shape[2:])
+        if custom_write:
+            return write(pool, jax.lax.bitcast_convert_type(rows, pool.dtype), dst // kernel_rows, dst, valid)
+        return _write_u8_rows(pool, rows, dst // kernel_rows, dst, valid, tile=REPACK_TILE)
 
     def gdn_page(page, s: GdnGeometry, d: GdnGeometry):
         """One producer GDN page -> this rank's page rows ``[ssm + conv]``."""
@@ -1264,6 +1642,12 @@ def make_repack(
         gdn_dst: jax.Array,
     ) -> jax.Array:
         main, copies, gdn = rows(staging, main_src, copy_src, gdn_src)
+        if staging_fold:
+            pool = write_segment(pool, main, main_dst)
+            pool = write_segment(pool, copies, copy_dst)
+            if has_gdn:
+                pool = write_segment(pool, gdn, (gdn_dst[:, None] * dst_block + jnp.arange(d_rows)).reshape(-1))
+            return pool
         values = [main, copies]
         flat = [main_dst, copy_dst]
         if has_gdn:
@@ -1281,6 +1665,8 @@ def make_repack(
         values = jax.lax.bitcast_convert_type(values, pool.dtype).reshape(
             -1, *pool.shape[2:]
         )
+        if not custom_write:
+            _count_write(False)  # FOLD-LINE: the default concatenated write this trace took (a Python counter)
         return write(pool, values, flat // kernel_rows, flat, valid)
 
     fn.rows = rows
@@ -1331,6 +1717,23 @@ class RepackPlan:
 
     passes: list
     chunks: list
+
+
+# q38 KVL-INWAIT: ``last_draft_rows`` was not set by the planning ``indices`` call.
+_ROWS_UNSET = object()
+
+
+@dataclasses.dataclass
+class PlannedRepack:
+    """One load's ``RepackPlan`` made ahead of the step that names it (q38
+    SV-KVGC KVL-INWAIT, ``plan_repack_ahead``), with what ``plan_repack``'s draft
+    counters read at that point: the load's skip, its draft-zero end and the
+    rows ``indices`` reported (``_ROWS_UNSET`` when it reported none)."""
+
+    plan: RepackPlan
+    skip: int
+    zero_end: int
+    draft_rows: object
 
 
 class SharedLanding:
@@ -1870,7 +2273,20 @@ class StagedConsumer:
         # gathers no padded GDN pages.
         self._split_gdn = 0 < len(self._gdn_names) <= self._repack_shape[2]
         self._null_rows = (stage_rows, self.dst_block)
+        # VLLM_TPU_PD_GATHER_BULK: the repack programs gather tiles of
+        # consecutive rows with one DMA each; their ops get their own names
+        # (``_build_op``), which keys every graph-keyed compile cache apart.
+        self._gather_bulk = gather_bulk_enabled()
+        # GBULK-LINE: one line per rank at every engine start, warm compile cache included.
+        gather_bulk_bind_line(rank, self._gather_bulk)
+        # VLLM_TPU_PD_STAGING_FOLD: each segment straight into the pool; its ops
+        # get "_fold" names (``_build_op``) for the same reason.
+        self._staging_fold = staging_fold_enabled()
+        # FOLD-LINE: one line per rank at every engine start, warm compile cache included.
+        staging_fold_bind_line(rank, self._staging_fold)
         repack_kwargs = dict(
+            gather_bulk=self._gather_bulk,
+            staging_fold=self._staging_fold,
             src_block=self.src_block,
             dst_block=self.dst_block,
             kv_head=rank.kv_head,
@@ -2652,6 +3068,58 @@ class StagedConsumer:
         )
         return RepackPlan(passes=passes, chunks=list(chunks))
 
+    def plan_repack_ahead(self, uuid: int, dst_tables, num_tokens: int) -> PlannedRepack:
+        """``plan_repack`` before the load's named step (q38 SV-KVGC KVL-INWAIT): the
+        same calls on the same inputs (the reservation, skips, tokens and draft-zero
+        end of a load are fixed once it is reserved), without the draft counters,
+        which ``repack_planned`` updates when the load lands. ``last_draft_rows`` is
+        left as it was. Host only, like ``plan_repack``: numpy, no device work and
+        no collective."""
+        state = self.__dict__
+        saved = state.pop("last_draft_rows", _ROWS_UNSET)
+        try:
+            pages = self.reservations[uuid]
+            skip, first = self.skips.get(uuid, (0, None))
+            zero_end = self.draft_zero_end(uuid, num_tokens)
+            idx = self.indices(pages, dst_tables, num_tokens, skip, first, draft_zero_until=zero_end)
+            rows = state.get("last_draft_rows", _ROWS_UNSET)
+            passes = (
+                self.shared_passes(pages, dst_tables, num_tokens, skip)
+                if getattr(self, "route", None) is not None
+                else []
+            )
+            main, copied, gdn = self._repack_shape
+            chunker = repack_chunks_packed if self._fast() else repack_chunks
+            chunks = chunker(
+                *idx, main, gdn, copy_size=copied, split_gdn=self._split_gdn,
+                null_rows=self._null_rows,
+            )
+            plan = RepackPlan(passes=passes, chunks=list(chunks))
+        finally:
+            state.pop("last_draft_rows", None)
+            if saved is not _ROWS_UNSET:
+                state["last_draft_rows"] = saved
+        return PlannedRepack(plan=plan, skip=skip, zero_end=zero_end, draft_rows=rows)
+
+    def repack_planned(self, uuid: int, dst_tables, num_tokens: int, planned: PlannedRepack) -> None:
+        """``repack`` with a plan ``plan_repack_ahead`` made (q38 SV-KVGC KVL-INWAIT):
+        the draft counters as ``plan_repack`` updates them, then the same run and
+        the same verify."""
+        if planned.draft_rows is not _ROWS_UNSET:
+            self.last_draft_rows = planned.draft_rows
+        self._count_draft(uuid, planned.skip, planned.zero_end)
+        self.run_repack(planned.plan)
+        skip, _ = self.skips.get(uuid, (0, None))
+        if self._verify_due(skip):
+            for check in (self.verify_split_keys, self.verify_main_pairs):
+                try:
+                    check(uuid, dst_tables, num_tokens)
+                except Exception:  # a diagnostic never fails the load
+                    logger.exception(
+                        "Qwen PD landing verify rank%d: %s failed to run",
+                        self.rank.tp_rank, check.__name__,
+                    )
+
     def run_repack(self, plan: RepackPlan) -> None:
         if plan.passes:
             if getattr(self, "landing", None) is None:
@@ -3003,6 +3471,18 @@ class StagedConsumer:
         import jax
         from torch_tpu._internal import pallas
 
+        if getattr(self, "_gather_bulk", False):
+            # VLLM_TPU_PD_GATHER_BULK changes the kernel inside the op, which
+            # the compiled graph names only by the op's name: the bulk
+            # programs get their own names, so no graph-keyed cache (torch's
+            # AOTAutogradCache, the backend's bundled entry, dynamo) can hand
+            # a per-row program to a bulk consumer or the reverse.
+            name = name + "_gbulk"
+        if getattr(self, "_staging_fold", False):
+            # VLLM_TPU_PD_STAGING_FOLD changes the landing writer inside the op:
+            # its own name, for the same reason as "_gbulk".
+            name = name + "_fold"
+
         def repack_fn(
             pool: jax.Array,
             staging: jax.Array,
@@ -3013,7 +3493,11 @@ class StagedConsumer:
             gdn_src: jax.Array,
             gdn_dst: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
+            traced = _gather_counts()
+            written = _write_counts()
             out = fn(pool, staging, main_src, main_dst, copy_src, copy_dst, gdn_src, gdn_dst)
+            gather_bulk_mismatch(self, name, traced)
+            staging_fold_mismatch(self, name, written)
             return out, main_src.reshape(-1)[0]
 
         op = pallas.jax_op(name, repack_fn, donate_argnums=(0,))

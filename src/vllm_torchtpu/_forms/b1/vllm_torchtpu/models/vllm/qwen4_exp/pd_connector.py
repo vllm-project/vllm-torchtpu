@@ -21,6 +21,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import kvl_inwait  # q38 SV-KVGC KVL-INWAIT (VLLM_TPU_KVL_INWAIT, default off)
 from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
     PoolByteSpan,
     PoolSpanRegistration,
@@ -436,6 +437,8 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
 
     def start_load_kv(self, *args, **kwargs) -> None:
         worker = self.connector_worker
+        if kvl_inwait.ACTIVE:
+            kvl_inwait.step()
         staging = getattr(worker, "_staging", None) if worker is not None else None
         advance = getattr(staging, "advance_quarantine", None)
         if advance is not None:
@@ -482,6 +485,9 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         repack are repacked here first, on every rank at the same point, so their
         programs follow this step's forward on the device.
         """
+        if kvl_inwait.ACTIVE:
+            self._submit_deferred_first()
+            return
         if self.__dict__.get("_landx_pending"):
             self._landx_run()
         pending = self._deferred_load_submit
@@ -490,6 +496,25 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         self._deferred_load_submit = None
         args, kwargs = pending
         super().start_load_kv(*args, **kwargs)
+
+    def _submit_deferred_first(self) -> None:
+        """q38 SV-KVGC KVL-INWAIT: ``submit_deferred_loads`` with the Stage-3
+        submit pass before the deferred repacks, on every rank alike. Released
+        staging pages are quarantined (required at engage), so the pass sees the
+        same free map either way, and it enqueues no device work; the repack
+        programs follow this step's forward as before."""
+        pending = self._deferred_load_submit
+        landx = bool(self.__dict__.get("_landx_pending"))
+        try:
+            if pending is not None:
+                self._deferred_load_submit = None
+                if landx:
+                    kvl_inwait.note_submit_first()
+                args, kwargs = pending
+                super().start_load_kv(*args, **kwargs)
+        finally:
+            if landx:
+                self._landx_run()
 
     # --- q38 LAND-OVERLAP, worker side -----------------------------------------
 
@@ -516,6 +541,9 @@ class Qwen4ExpRaidenConnector(TPURaidenConnector):
         meta = self._connector_metadata
         names = list(getattr(meta, "qwen_landx_repack_req_ids", None) or ())
         st["_landx_pending"] = names or None
+        if names and kvl_inwait.ACTIVE:
+            # q38 SV-KVGC KVL-INWAIT: this step's names are planned first.
+            kvl_inwait.prioritize(names)
         c["steps"] += 1
         c["presync_loads"] += len(getattr(meta, "qwen_repack_req_ids", None) or ())
         if names:
@@ -818,6 +846,9 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
         QWEN4_EXP_PD_SHARED_COMPRESSED: also compile the landing gather for the
         staging carrier's shape (read-only). Collective, like the self-test:
         every TP worker reaches the end of register_runner at the same point."""
+        if kvl_inwait.ENABLED:
+            # q38 SV-KVGC KVL-INWAIT: engage (or refuse) and print this rank's line.
+            kvl_inwait.engage(self)
         staging = getattr(self, "_staging", None)
         if staging is None:
             return
@@ -1051,6 +1082,9 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                 [list(table) for table in req_meta.group_block_ids],
                 int(req_meta.num_tokens),
             )
+            if kvl_inwait.ACTIVE:
+                # q38 SV-KVGC KVL-INWAIT: plan it in a host wait before its step.
+                kvl_inwait.enqueue(destination_req_id)
             return
         try:
             if ok:
@@ -1091,10 +1125,20 @@ class Qwen4ExpRaidenWorker(TPURaidenConnectorWorker):
                     )
                 continue
             uuid, tables, num_tokens = pending
+            planned = kvl_inwait.take(req_id, pending) if kvl_inwait.ACTIVE else None
             try:
-                staging.repack(uuid, tables, num_tokens)
+                if planned is not None:
+                    # q38 SV-KVGC KVL-INWAIT: the plan a host wait made from this entry.
+                    staging.repack_planned(uuid, tables, num_tokens, planned)
+                else:
+                    staging.repack(uuid, tables, num_tokens)
             finally:
                 staging.release(uuid)
+
+    def _stage3_admission_wait_hook(self):
+        """q38 SV-KVGC KVL-INWAIT: plan units while the batched admission's
+        collective is in flight (None without the key)."""
+        return kvl_inwait.admission_wait_hook() if kvl_inwait.ACTIVE else None
 
     def _repack_landed_shared(self, staging, names) -> None:
         """``repack_landed`` under QWEN4_EXP_PD_SHARED_COMPRESSED, whose

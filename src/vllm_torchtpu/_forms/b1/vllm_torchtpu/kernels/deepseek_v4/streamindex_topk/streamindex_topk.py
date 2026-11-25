@@ -29,8 +29,10 @@ from jax.sharding import PartitionSpec as P
 
 import contextlib
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
+    sc_topk_padded_rows,
     sparsecore_topk,
     sparsecore_topk_dcp_merge,
 )
@@ -61,6 +63,44 @@ DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 DCP_AXIS_NAME = "dcp"
 _DEFAULT_TOPK_BACKEND = SparseCoreTopK()
+
+# q38 GLUEPKG IXSEL-ALIAS: (rows, padded rows, columns, k) already logged.
+_Q38_PADDED_ROWS_LOGGED: set = set()
+
+
+def _log_padded_rows(rows: int, padded: int, cols: int, k: int) -> None:
+    """q38 GLUEPKG IXSEL-ALIAS trace-time engagement line: one INFO line per
+    distinct shape and process (log only; a compile-cache hit prints nothing,
+    see ``log_padded_rows_bind`` for the bind-time line)."""
+    key = (rows, padded, cols, k)
+    if key in _Q38_PADDED_ROWS_LOGGED:
+        return
+    _Q38_PADDED_ROWS_LOGGED.add(key)
+    logger.info(
+        "q38 GLUEPKG IXSEL padded score rows ENGAGED: %d score rows allocated as %d "
+        "(%d positions, k %d); the SparseCore top-k reads them without a row pad "
+        "(VLLM_TPU_QSA_INDEXER_PADDED_ROWS)",
+        rows, padded, cols, k,
+    )
+
+
+def log_padded_rows_bind(layer_prefix: str) -> str | None:
+    """q38 GLUEPKG IXSEL-ALIAS bind-time line: once per QSA layer bind and
+    process when VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1 (silent otherwise). Bind
+    runs at every engine start whatever the compile cache holds, so it prints
+    on a warm cache. ARMED: one-chunk StreamIndex calls whose SparseCore top-k
+    pads rows (row counts that are not a whole wave) take padded score rows.
+    Log only. Returns the decision, or None when silent."""
+    if not envs.VLLM_TPU_QSA_INDEXER_PADDED_ROWS:
+        return None
+    logger.info(
+        "q38 GLUEPKG IXSEL bound: decision=ARMED layer=%s (one-chunk StreamIndex "
+        "scores that the SparseCore top-k would pad are allocated padded; "
+        "VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1; bind time, prints on a warm compile cache)",
+        layer_prefix,
+    )
+    return "ARMED"
+
 
 cp_local_to_global = metadata.cp_local_to_global
 cp_local_length = metadata.cp_local_length
@@ -247,9 +287,16 @@ def kernel(
     interleave_c: int = 1,
     chunk_idx: int = 0,
     components: indexing.StreamIndexComponents | None = None,
+    score_rows: int | None = None,
 ):
-    """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K."""
+    """Executes the n-buffered Pallas scoring pipeline for StreamIndex Top-K.
+
+    ``score_rows`` (q38 GLUEPKG IXSEL-ALIAS): the output holds more rows than
+    the chunk (the SparseCore top-k's padded row count); the chunk is its first
+    ``score_rows`` rows, and the rows past it are never written.
+    """
     scores_hbm_ref = score_refs[-1]
+    chunk_rows = scores_hbm_ref.shape[0] if score_rows is None else score_rows
     buffer_cnt = buffer_count
     # One-token blocks already use the decode expression.
     per_token_scores = (
@@ -391,7 +438,7 @@ def kernel(
         use_lookahead=True,
         bq_sz=bq_sz,
         seq_batch_size=seq_batch_size,
-        chunk_tokens=scores_hbm_ref.shape[0],
+        chunk_tokens=chunk_rows,
         chunk_idx=chunk_idx,
     )
     weights_alloc = bref_override.StreamIndexQBufferedRef.input(
@@ -401,7 +448,7 @@ def kernel(
         use_lookahead=True,
         bq_sz=bq_sz,
         seq_batch_size=seq_batch_size,
-        chunk_tokens=scores_hbm_ref.shape[0],
+        chunk_tokens=chunk_rows,
         chunk_idx=chunk_idx,
     )
     if seq_along_lane:
@@ -1678,6 +1725,7 @@ def streamindex_topk(
         chunk_tokens=None,
         scheduling_group_id=None,
         chunk_idx=0,
+        out_rows=None,
     ):
         max_num_tokens, num_q_heads, head_dim = q.shape
         # Only support batching for decode sequences.
@@ -1750,6 +1798,8 @@ def streamindex_topk(
                     interleave_c=interleave_c,
                     chunk_idx=chunk_idx,
                     components=components,
+                    # q38 GLUEPKG IXSEL-ALIAS: only when the output is padded.
+                    **({"score_rows": chunk_tokens} if out_rows is not None else {}),
                 )),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=num_scalar_prefetch,
@@ -1764,7 +1814,11 @@ def streamindex_topk(
                     disable_bounds_checks=True,
                 ),
                 out_shape=jax.ShapeDtypeStruct(
-                    shape=(chunk_tokens, num_sublanes_total, 128),
+                    shape=(
+                        chunk_tokens if out_rows is None else out_rows,
+                        num_sublanes_total,
+                        128,
+                    ),
                     dtype=out_dtype,
                 ),
                 input_output_aliases=input_output_aliases,
@@ -1863,6 +1917,7 @@ def streamindex_topk(
         chunk_tokens,
         out_dtype,
         scheduling_group_id,
+        out_rows=None,
     ):
         """Scores for one window of the flat token axis, in a private buffer."""
         # `scores=None`: no -inf pre-fill. It would write all of HBM scores, and
@@ -1888,6 +1943,7 @@ def streamindex_topk(
                 chunk_tokens=chunk_tokens,
                 out_dtype=out_dtype,
                 scheduling_group_id=scheduling_group_id,
+                **({"out_rows": out_rows} if out_rows is not None else {}),
                 **spec,
             )
         assert scores is not None
@@ -1957,6 +2013,23 @@ def streamindex_topk(
         _passes(step_meta[0]) if step_meta is not None and num_chunks == 1 else None
     )
 
+    def _padded_score_rows(rows):
+        """q38 GLUEPKG IXSEL-ALIAS: ``(rows, padded)`` when the key is on, the
+        backend is the SparseCore top-k and it would pad ``rows`` score rows to
+        a whole wave; else None (the stock buffer)."""
+        if not envs.VLLM_TPU_QSA_INDEXER_PADDED_ROWS:
+            return None
+        if not isinstance(topk_backend, SparseCoreTopK):
+            return None
+        cols = num_sublanes_total * 128
+        if cols < k:
+            return None  # the column pad below would copy the buffer anyway
+        padded = sc_topk_padded_rows(rows, cols, k, topk_backend.bounded_copy)
+        if padded == rows:
+            return None
+        _log_padded_rows(rows, padded, cols, k)
+        return rows, padded
+
     def _common_path(_):
         decode_batch_end, eff_row_lengths = (
             step_meta if step_meta is not None else _step_metadata()
@@ -1998,6 +2071,9 @@ def streamindex_topk(
                 sc_group = topk_scheduling_group_id
 
             start = m * chunk_len
+            # q38 GLUEPKG IXSEL-ALIAS (VLLM_TPU_QSA_INDEXER_PADDED_ROWS): None
+            # unless the SparseCore top-k pads this chunk's rows.
+            live = _padded_score_rows(chunk_len) if num_chunks == 1 else None
             scores = _scores_for_chunk(
                 passes,
                 m,
@@ -2005,6 +2081,7 @@ def streamindex_topk(
                 chunk_len,
                 out_dtype,
                 tc_group,
+                **({"out_rows": live[1]} if live is not None else {}),
             )
             if carry is not None:
                 # Single chunk (checked above): these are the last scores, so
@@ -2019,7 +2096,7 @@ def streamindex_topk(
                 )
                 scores = flat.reshape(scores.shape)
                 carried.append(carry_out)
-            scores = scores.reshape(chunk_len, -1)
+            scores = scores.reshape(chunk_len if live is None else live[1], -1)
             if scores.shape[1] < k:
                 scores = jnp.pad(
                     scores,
@@ -2034,6 +2111,7 @@ def streamindex_topk(
                     row_lengths=eff_row_lengths[start : start + chunk_len],
                     scheduling_group_id=sc_group,
                     return_scores=return_scores,
+                    **({"live_rows": chunk_len} if live is not None else {}),
                 )
             if return_scores:
                 assert isinstance(selected, tuple)

@@ -21,6 +21,7 @@ NB CLASS (stated): the 256-element f32 sum of squares runs in this kernel's lane
 rsqrt is Mosaic's; q may differ from the reference by a BF16 ulp where the rounding of the norm scale moves. The gate is bitwise.
 """
 
+import collections
 import functools
 
 import jax
@@ -36,18 +37,38 @@ TOKEN_BLOCK = 128
 VMEM_LIMIT = 48 << 20  # 128-token blocks: 2 x (3.1 MB in + 3.1 MB out) buffers + ~20 MB of f32 temporaries (v7x: 64 MiB)
 _LANES = 128
 
+# q38 PSTEP-WARMTWIN: what this process decided at trace time (Python only; nothing enters the program).
+# _DECISIONS: (rows, heads, head_dim, rotary_dim) -> None (fused) or the first failing clause of `decide`, written by
+# every `applies` call (qsa.produce calls it on every traced QSA step while the key is set). _ENGAGED_ROWS: rows ->
+# traced `fused_qprep` calls (each prints the trace-time ENGAGED line). runner/prefill_twins.py reads both.
+_DECISIONS: dict = {}
+_ENGAGED_ROWS: collections.Counter = collections.Counter()
+
+
+def decide(rows: int, heads: int, head_dim: int, rotary_dim: int, token_block: int = TOKEN_BLOCK) -> str | None:
+    """Pure: None when the fused prefill q prep serves this step, else the first clause that fails."""
+    if rows < MIN_ROWS:
+        return f"rows<{MIN_ROWS}"
+    if rows % token_block != 0:
+        return f"rows%{token_block}!=0"
+    if heads % 8 != 0:
+        return "heads%8!=0"
+    if head_dim % _LANES != 0:
+        return f"head_dim%{_LANES}!=0"
+    if not 0 < rotary_dim <= _LANES:
+        return f"rotary_not_in_1..{_LANES}"
+    if rotary_dim % 2 != 0:
+        return "rotary_odd"
+    if envs.VLLM_TPU_QSA_BF16_REDUCE_PRECISION:  # the kernel replicates rounding.bf16's integer RNE only
+        return "bf16_reduce_precision"
+    return None
+
 
 def applies(rows: int, heads: int, head_dim: int, rotary_dim: int, token_block: int = TOKEN_BLOCK) -> bool:
     """Static: the fused prefill q prep serves this step (else the caller keeps the reference ops)."""
-    return (
-        rows >= MIN_ROWS
-        and rows % token_block == 0
-        and heads % 8 == 0
-        and head_dim % _LANES == 0
-        and 0 < rotary_dim <= _LANES
-        and rotary_dim % 2 == 0
-        and not envs.VLLM_TPU_QSA_BF16_REDUCE_PRECISION  # the kernel replicates rounding.bf16's integer RNE only
-    )
+    reason = decide(rows, heads, head_dim, rotary_dim, token_block)
+    _DECISIONS[(int(rows), int(heads), int(head_dim), int(rotary_dim))] = reason
+    return reason is None
 
 
 def _partner_matrix(rotary_dim: int) -> np.ndarray:
@@ -114,6 +135,7 @@ def fused_qprep(qgate, nq, positions, trig, norm_eps, rotary_dim, *, token_block
         "q38 PSTEP-QSAGLUE QPREP-FUSED ENGAGED: %d rows, %d heads, head dim %d, rotary %d (VLLM_TPU_QSA_PREFILL_QPREP_FUSED)",
         rows, heads, head_dim, int(rotary_dim),
     )
+    _ENGAGED_ROWS[int(rows)] += 1
     w = (1 + nq.astype(jnp.float32)).reshape(1, 1, head_dim)
     c, s = rope_tables(positions, trig, rotary_dim)
     p = jnp.asarray(_partner_matrix(rotary_dim), jnp.float32)

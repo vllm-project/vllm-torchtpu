@@ -15,6 +15,7 @@ from vllm.v1.outputs import (
 INVALID_TOKEN_ID = -1
 from vllm_torchtpu import envs
 from vllm_torchtpu.runner import gc_at_waits
+from vllm_torchtpu.runner import kvl_inwait
 
 
 @dataclass
@@ -172,6 +173,10 @@ class AsyncTPUCopyState:
                 self._wait()
 
     def _wait(self) -> None:
+        if kvl_inwait.ACTIVE:
+            # q38 SV-KVGC KVL-INWAIT: repack plan units while the copy is pending
+            # (main thread only).
+            kvl_inwait.at_copy_wait(self.copy_ready_event)
         if gc_at_waits.ENABLED and gc_at_waits.event_pending(self.copy_ready_event):
             gc_at_waits.collect_due()
         self.copy_ready_event.synchronize()

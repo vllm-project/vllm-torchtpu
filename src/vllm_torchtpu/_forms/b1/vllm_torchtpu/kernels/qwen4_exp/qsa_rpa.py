@@ -444,6 +444,9 @@ def union_page_slots(budget, ratio, tile, rows=4):
 # (rows, request slots) of the programs traced with VLLM_TPU_QSA_DECODE_RPA_PT_PREFIX
 # (q38 RPAD-HIGHROWS F4; log once each).
 PT_PREFIX_TRACED: dict = {}
+# (rows, request slots, covered, issue) of the programs traced with
+# VLLM_TPU_QSA_DECODE_FUSED_UNION (q38 QSAF; log once each).
+FUSED_UNION_TRACED: dict = {}
 
 
 # Diagnostics for the bench (scripts/bench_qsa_rpa_decode.py f15c): build the
@@ -558,6 +561,43 @@ def union_decode_attention(
             blocks, lengths, table, starts, rows=len(q), ratio=ratio,
             max_query_len=max_query_len, dcp=dcp,
         )
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_fused_union_keys
+
+    if qsa_fused_union_keys.enabled():
+        # q38 QSAF: one fused kernel on the same metadata instead of the RPA
+        # calls below; it reads the cache only and returns it unchanged.
+        from vllm_torchtpu.compilation import qsaf_record
+        from vllm_torchtpu.kernels.qwen4_exp.qsa_fused_union import fused_union_attention
+
+        issue = qsa_fused_union_keys.issue()
+        key = (len(q), len(starts) - 1, len(metadata[0]) - 1, issue)
+        # q38 QSAF-INT: the trace record (compilation/qsaf_record.py, IDXXLINE
+        # pattern) persisted next to the compiled artifact; the warm-safe per-rank
+        # 'engaged' line is printed from it (runner/qsaf_engagement.py).
+        qsaf_record.note(*key)
+        if key not in FUSED_UNION_TRACED:
+            FUSED_UNION_TRACED[key] = True
+            rank, tp_rank, _ = qsaf_record.process_rank_fields()
+            # q38 QSAF engagement marker on a cold trace, once per traced program
+            # and process: plain logger.info on EVERY rank (never a once-per-node form).
+            logger.info(
+                "q38 QSAF FUSED_UNION traced: rank %d tp_rank %d rows %d slots %d covered %d issue %s",
+                rank, tp_rank, *key,
+            )
+        out, lse = fused_union_attention(
+            q,
+            cache,
+            metadata,
+            ratio=ratio,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            kv_head_offset=kv_head_offset,
+            max_query_len=max_query_len,
+            issue=issue,
+            tile=tile,
+            lanes=envs.VLLM_TPU_QSA_DECODE_RPA_LANES,
+        )
+        return out, lse, cache
     starts, pages, sel, meta, live = metadata
     requests = len(starts) - 1
     per_call = union_call_requests(len(q), max_query_len)

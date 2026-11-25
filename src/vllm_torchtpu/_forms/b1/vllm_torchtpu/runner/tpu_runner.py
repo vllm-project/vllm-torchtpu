@@ -152,6 +152,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner import host_phases
+from vllm_torchtpu.runner import gc_worker  # q38 SV-KVGC WORKER-GC (VLLM_TPU_GC_WORKER, default off)
 from vllm_torchtpu.runner import pam_incr
 from vllm_torchtpu.runner import newreq_refresh
 from vllm_torchtpu.core import newreq_blkarr
@@ -3110,6 +3111,9 @@ class TPUModelRunner(GPUModelRunner):
             else scheduler_output
         )
         result = super()._update_states(base_output)
+        if gc_worker.ON:
+            # q38 SV-KVGC WORKER-GC: new requests' token lists leave the collector.
+            gc_worker.untrack_new(self.requests, scheduler_output)
         # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
@@ -3134,6 +3138,10 @@ class TPUModelRunner(GPUModelRunner):
         # Wait even when there is nothing to roll back: both callers drop these
         # results afterwards, and on non-output TP ranks they can be the only
         # owner of the in-flight D2H copy (#985).
+        if gc_worker.LOG:
+            # q38 SV-KVGC WORKER-GC: the step count every rank shares, and the
+            # scheduled generation-2 pass in this wait when due.
+            gc_worker.step_wait()
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
         assert pre_next_tokens_cpu is not None
 
@@ -8219,6 +8227,11 @@ class TPUModelRunner(GPUModelRunner):
         # q38 G1LINE: the (rows, request slots) of every dummy run, for the
         # per-rank, warm-cache-safe G1 D1 engagement lines below.
         g1_buckets: list[tuple[int, int, str]] = []
+        from vllm_torchtpu.runner import prefill_twins
+
+        # q38 PSTEP-WARMTWIN: per-rank, warm-cache-safe QPF / QPREP engagement
+        # lines after every dummy run (log only; None and silent with both keys off).
+        twins = prefill_twins.start(self)
         with shape_variants.warmup() as buckets:
             for num_tokens in self.num_tokens_paddings:
                 logger.info("  -- num_tokens: %d", num_tokens)
@@ -8233,6 +8246,9 @@ class TPUModelRunner(GPUModelRunner):
                 g1_buckets.append(
                     (num_tokens, self.num_reqs_max_model_len, "max_model_len")
                 )
+                prefill_twins.bucket(
+                    twins, num_tokens, self.num_reqs_max_model_len, "max_model_len"
+                )
                 if self.most_model_len is not None:
                     assert self.num_reqs_most_model_len is not None
                     assert self.num_blocks_per_most_len_req is not None
@@ -8244,6 +8260,9 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     g1_buckets.append(
                         (num_tokens, self.num_reqs_most_model_len, "most_model_len")
+                    )
+                    prefill_twins.bucket(
+                        twins, num_tokens, self.num_reqs_most_model_len, "most_model_len"
                     )
             if buckets.refused:
                 # A refusal that no trace picked up leaves a raising closure in
@@ -8261,6 +8280,12 @@ class TPUModelRunner(GPUModelRunner):
         # q38 IDXXLINE: per-rank IDXX lines from the trace records next to the
         # artifacts this start used. Log only; silent unless an IDXX key is set.
         idxx_engagement.report(self, [rows for rows, _, _ in g1_buckets])
+        from vllm_torchtpu.runner import qsaf_engagement
+
+        # q38 QSAF-INT: per-rank QSAF fused-union lines from the trace records next
+        # to the artifacts this start used. Log only; silent with the key off.
+        qsaf_engagement.report(self)
+        prefill_twins.finish(twins)
         if self._pp_wave is not None:
             self._warmup_handoff_forwards()
 

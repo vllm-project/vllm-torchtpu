@@ -599,6 +599,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         from vllm_torchtpu.kernels.qwen4_exp.qsa import log_rope_derived_bind
 
         log_rope_derived_bind(self.prefix)
+        # q38 GLUEPKG IXSEL-ALIAS: bind-time engagement line (log only; silent
+        # unless VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1; prints on a warm cache).
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+            log_padded_rows_bind,
+        )
+
+        log_padded_rows_bind(self.prefix)
         self.cache_owners = (pool,)
         self.compressed_cache_name = name
         self.main_cache_name = main_name
