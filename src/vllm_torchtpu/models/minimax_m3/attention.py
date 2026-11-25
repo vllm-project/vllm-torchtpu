@@ -547,6 +547,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                     extra["hadamard"] = self.hadamard
             if half is not None:
                 layer_metadata = half[0].metadata(layer_metadata, half[1])
+                if half[1] is not None and self.scale_cache is not None:
+                    extra["step_tokens"] = half[0].num_tokens
             attn_output = self.msa_op(
                 q,
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),

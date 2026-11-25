@@ -1731,6 +1731,7 @@ def msa_write_and_candidates_dcp(
     scale_cache: jax.Array | None = None,
     index_q_rotated: bool = False,
     after_write: Callable[[jax.Array, jax.Array | None], Any] | None = None,
+    prefill: bool | None = None,
     interpret: bool = False,
 ) -> tuple[jax.Array, ...]:
     """First half of the DCP forward: write this rank's tokens, score its
@@ -1740,6 +1741,11 @@ def msa_write_and_candidates_dcp(
     the indexer) starts work on the written caches that is to run under the
     indexer (`msa_dcp_heads.start_first_round_exchange`); its result is
     returned last, ordered after the indexer.
+
+    `prefill` overrides the choice of the prefill (tile class) candidate path
+    by this call's rows (`msa_indexer.is_prefill_step`): one token half of a
+    prefill-sized step takes the whole step's path (StepHalves), not the
+    decode path's conditional, which waits for neighbouring collectives.
 
     With 4-bit caches (`msa_fp4`, one KV head per rank) pass `scale_cache`;
     it is returned updated after `index_cache`. `index_q` is then rotated
@@ -1788,9 +1794,11 @@ def msa_write_and_candidates_dcp(
     max_runs = msa.write_runs_bound(num_tokens, max_num_seqs, block_size)
     # A folded write keeps every run's pages in VMEM, in and out.
     run_bytes = 2 * sum(t.cache[0].size * t.cache.dtype.itemsize for t in targets)
+    if prefill is None:
+        prefill = msa_indexer.is_prefill_step(num_heads * num_tokens, max_num_seqs)
     fold_write = (
         num_heads == 1
-        and not msa_indexer.is_prefill_step(num_tokens, max_num_seqs)
+        and not prefill
         and decodes_in_one_kernel(
             num_tokens,
             index_cache,
@@ -1834,7 +1842,6 @@ def msa_write_and_candidates_dcp(
         dcp=dcp,
         interpret=interpret,
     )
-    prefill = msa_indexer.is_prefill_step(num_heads * num_tokens, max_num_seqs)
     if rotate and not prefill:
         index_q = msa_fp4.rotate_queries(index_q)
     if prefill:

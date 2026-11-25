@@ -18,6 +18,8 @@ the caches donated, equal the whole step's per token (fp8 and 4-bit caches,
 prefill-sized steps). Interpret mode on 2 host devices:
 ``XLA_FLAGS=--xla_force_host_platform_device_count=2 pytest ...``."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -66,11 +68,12 @@ def _program(fp4, split, halves):
     mesh = Mesh(np.asarray(jax.devices()[:DCP]), ("dcp",))
     hadamard = jnp.asarray(msa_fp4.hadamard(HEAD_DIM), jnp.bfloat16)
 
-    def attend(rank, x, kv, index, scales, q, meta):
+    def attend(rank, x, kv, index, scales, q, meta, prefill=None):
         k, v, iq, ik = x
         res = msa_dcp.msa_write_and_candidates_dcp(
             k, v, iq, ik, kv, index, *meta, topk=TOPK, init_blocks=1, local_blocks=1,
-            rank=rank, dcp=DCP, scale_cache=scales if fp4 else None, interpret=True,
+            rank=rank, dcp=DCP, scale_cache=scales if fp4 else None, prefill=prefill,
+            interpret=True,
         )  # fmt: skip
         kv, index, *scales_out, cand = res
         scales = scales_out[0] if fp4 else scales
@@ -87,13 +90,16 @@ def _program(fp4, split, halves):
             out, kv, index, scales = attend(rank, x, kv, index, scales, q, meta)
             return out, kv, index, scales
         first, second = _split(meta, split)
-        out_a, kv, index, scales = attend(
+        # Each half takes the whole step's candidate path (ops/msa.py
+        # `step_tokens`), here the prefill one, whatever its own rows.
+        half = functools.partial(attend, prefill=True)
+        out_a, kv, index, scales = half(
             rank, tuple(t[:split] for t in x), kv, index, scales, q[:, :split], first
         )
         # The second half's writes follow the first half's reads (model.py).
         edge = jnp.nan_to_num(out_a[:1, :1].astype(jnp.float32)) * 0
         x = (x[0][split:] + edge.astype(x[0].dtype),) + tuple(t[split:] for t in x[1:])
-        out_b, kv, index, scales = attend(
+        out_b, kv, index, scales = half(
             rank, x, kv, index, scales, q[:, split:], second
         )
         return jnp.concatenate([out_a, out_b]), kv, index, scales
@@ -111,7 +117,9 @@ def _program(fp4, split, halves):
     "q_lens,ctx_lens",
     [
         ([512], [2900]),  # one chunk straddling the split
-        ([8, 8, 496], [3000, 5000, 2900]),  # decode rows in the first half only
+        # decode rows in the first half only; a half's 256 rows alone would
+        # take the decode candidate path (256 <= 4 x 64)
+        ([8, 8, 496], [3000, 5000, 2900]),
     ],
 )
 def test_halves_match_whole_step(q_lens, ctx_lens, fp4):

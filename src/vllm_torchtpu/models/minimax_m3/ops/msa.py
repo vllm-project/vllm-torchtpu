@@ -749,8 +749,11 @@ def _get_msa_dcp_fp4_op(
             dcp_rank: torch.Tensor,
             scale_cache: torch.Tensor,
             hadamard: torch.Tensor,
+            step_tokens: int | None = None,
         ) -> torch.Tensor:
-            del hadamard  # the step op rotates its own query heads
+            # The step op rotates its own query heads; it picks its indexer
+            # path itself (no StepHalves on this path).
+            del hadamard, step_tokens
             new_kv_cache, new_index_cache, new_scale_cache, out = step_op(
                 dcp_rank,
                 q.contiguous(),
@@ -775,49 +778,60 @@ def _get_msa_dcp_fp4_op(
 
     # One KV head per rank: the norm + rope kernel rotates the queries
     # (`fp4_dcp_rotates_queries`).
-    def _write_and_score(
-        k: jax.Array,
-        v: jax.Array,
-        index_q: jax.Array,
-        index_k: jax.Array,
-        kv_cache: jax.Array,
-        index_cache: jax.Array,
-        scale_cache: jax.Array,
-        seq_lens: jax.Array,
-        block_tables: jax.Array,
-        query_start_loc: jax.Array,
-        request_distribution: jax.Array,
-        dcp_rank: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        return msa_dcp.msa_write_and_candidates_dcp(
-            k,
-            v,
-            index_q,
-            index_k,
-            kv_cache,
-            index_cache,
-            seq_lens,
-            block_tables,
-            query_start_loc,
-            request_distribution,
-            topk=topk,
-            init_blocks=init_blocks,
-            local_blocks=local_blocks,
-            rank=dcp_rank,
-            dcp=dcp,
-            scale_cache=scale_cache,
-            index_q_rotated=True,
+    def _scorer(prefill: bool | None) -> Callable[..., Any]:
+        """The score op's JAX function; `prefill` overrides the indexer's
+        prefill-vs-decode choice by row count (`msa_write_and_candidates_dcp`)."""
+
+        def _write_and_score(
+            k: jax.Array,
+            v: jax.Array,
+            index_q: jax.Array,
+            index_k: jax.Array,
+            kv_cache: jax.Array,
+            index_cache: jax.Array,
+            scale_cache: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+            dcp_rank: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+            return msa_dcp.msa_write_and_candidates_dcp(
+                k,
+                v,
+                index_q,
+                index_k,
+                kv_cache,
+                index_cache,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                topk=topk,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                rank=dcp_rank,
+                dcp=dcp,
+                scale_cache=scale_cache,
+                index_q_rotated=True,
+                prefill=prefill,
+            )
+
+        return _write_and_score
+
+    def _score_op(prefill: bool | None):
+        return pallas.jax_op(
+            f"pallas::minimax_m3_msa_dcp_fp4_score_rot_{'pf_' if prefill else ''}"
+            f"{suffix}",
+            _scorer(prefill),
+            donate_argnums=(
+                _SHARD_KV_CACHE_ARG,
+                _SHARD_INDEX_CACHE_ARG,
+                _DCP_SCALE_CACHE_ARG,
+            ),
         )
 
-    score_op = pallas.jax_op(
-        f"pallas::minimax_m3_msa_dcp_fp4_score_rot_{suffix}",
-        _write_and_score,
-        donate_argnums=(
-            _SHARD_KV_CACHE_ARG,
-            _SHARD_INDEX_CACHE_ARG,
-            _DCP_SCALE_CACHE_ARG,
-        ),
-    )
+    score_op, prefill_score_op = _score_op(None), _score_op(True)
 
     def _score_fake(k, v, index_q, index_k, kv_cache, index_cache, scale_cache, *args):
         return (
@@ -832,6 +846,7 @@ def _get_msa_dcp_fp4_op(
         )
 
     score_op.register_fake(_score_fake)
+    prefill_score_op.register_fake(_score_fake)
     attend_merge_op = _get_msa_dcp_attend_merge_op(sm_scale, topk, dcp, True, suffix)
 
     def op(
@@ -847,8 +862,17 @@ def _get_msa_dcp_fp4_op(
         dcp_rank: torch.Tensor,
         scale_cache: torch.Tensor,
         hadamard: torch.Tensor,
+        step_tokens: int | None = None,
     ) -> torch.Tensor:
-        new_kv_cache, new_index_cache, new_scale_cache, candidates = score_op(
+        """``step_tokens``: the whole step's token count when this call
+        attends one token half of it (StepHalves): the half's candidates then
+        take the indexer path the whole step would take."""
+        score = score_op
+        if step_tokens is not None and msa_indexer.is_prefill_step(
+            k.shape[1] * step_tokens, metadata.seq_lens.shape[0]
+        ):
+            score = prefill_score_op
+        new_kv_cache, new_index_cache, new_scale_cache, candidates = score(
             k,
             v,
             index_q,
