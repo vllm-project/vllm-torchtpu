@@ -27,6 +27,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     _topk_rows,
     _topk_rows_update_jax,
 )
+from vllm_torchtpu.platforms.tpu_platform import _configure_torchtpu_eager_mode
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -153,6 +154,8 @@ _ROWS, _WIDTH = 64, 32  # the table: max_num_batched_tokens x index_topk
 def _mtp_table(compiled):
     """A table the two-layer forward has written (donating it twice), the
     forward, a stand-in proposer holding the table, and the table's contents."""
+    # Serving runs torch_tpu's eager ops in this mode; prove the snapshot in it.
+    _configure_torchtpu_eager_mode()
     stale, topk_a, topk_b = _inputs(_ROWS, _WIDTH, _WIDTH, _ROWS, _ROWS, n=2)
     layers, fwd = _check_two_layers(
         stale, _WIDTH, _ROWS, topk_a, topk_b, compiled=compiled
