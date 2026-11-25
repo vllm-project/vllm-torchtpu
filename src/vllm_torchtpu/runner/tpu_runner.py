@@ -764,6 +764,9 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_target_bucket: int | None = None
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
+        # Spec-decode warmup only: a DP-wide request count every rank claims,
+        # so a rank warms its local bucket under a larger peer's draft bucket.
+        self._warmup_dp_reqs_floor: int = 0
         self._draft_proposals_needed: bool = True
         self._draft_context_needed: bool = True
         self._dp_step_has_encoder_inputs = False
@@ -3670,7 +3673,7 @@ class TPUModelRunner(GPUModelRunner):
         # max per-chunk request count (see DFlashProposer), riding this same
         # agreement instead of paying the theoretical max bucket or a
         # second collective.
-        self._dp_step_max_reqs = agreed.reqs
+        self._dp_step_max_reqs = max(agreed.reqs, self._warmup_dp_reqs_floor)
         self._dp_step_has_encoder_inputs = agreed.encoder
         self._draft_proposals_needed = agreed.proposals
         self._draft_context_needed = agreed.context
@@ -6769,6 +6772,34 @@ class TPUModelRunner(GPUModelRunner):
                     self._warmup_spec_batch(
                         int(R), P_small, greedy=False, short=True, mixed=True
                     )
+                # Under EP-DP lockstep the draft bucket follows the DP-wide
+                # request count while the local programs follow this rank's:
+                # a rank down to 8 requests beside a peer at 12 otherwise
+                # compiles the DFlash input builder and the spec next-inputs
+                # program mid-serving (~140 ms, every rank waiting).
+                if self._dp_lockstep_enabled():
+                    max_reqs = int(self.max_num_reqs)
+                    peers = sorted(
+                        {
+                            _get_padded_num_reqs_with_upper_limit(n, max_reqs)
+                            for n in self.num_reqs_paddings
+                        }
+                    )
+                    try:
+                        for R in sweep:
+                            local = _get_padded_num_reqs_with_upper_limit(
+                                int(R), max_reqs
+                            )
+                            for peer in (p for p in peers if p > local):
+                                self._warmup_dp_reqs_floor = peer
+                                self._warmup_spec_batch(
+                                    int(R), P_small, greedy=True, short=True
+                                )
+                                self._warmup_spec_batch(
+                                    int(R), P_small, greedy=False, short=True
+                                )
+                    finally:
+                        self._warmup_dp_reqs_floor = 0
             elif self.scheduler_config.max_num_seqs > 1:
                 P_small = int(self.num_tokens_paddings[0])
                 for R in self.num_reqs_paddings:
