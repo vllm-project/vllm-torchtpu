@@ -606,10 +606,7 @@ class MuseSparkForCausalLM(nn.Module):
             raise ValueError(
                 f"Muse TPU supports BF16 and NVFP4 checkpoints, got {quant}"
             )
-        load_format = vllm_config.load_config.load_format
-        self._dummy_load = (
-            str(getattr(load_format, "value", load_format)).lower() == "dummy"
-        )
+        self._dummy_load = vllm_config.load_config.load_format == "dummy"
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.ep_rank = get_ep_group().rank_in_group if self.use_ep else 0
