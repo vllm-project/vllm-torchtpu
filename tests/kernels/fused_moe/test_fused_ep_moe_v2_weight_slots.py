@@ -11,10 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.experimental.push_fused_moe import layer as push_layer
 from vllm_torchtpu.kernels.fused_moe.v2 import host, kernel
+from vllm_torchtpu.kernels.fused_moe.v2 import layer as v2_layer
+from vllm_torchtpu.kernels.fused_moe.v2.layer import density_build_kwargs
 
 BIG = dict(g_local=8, capacity=128, hidden=7168, inter=2048)
 SMALL = dict(g_local=32, capacity=128, hidden=512, inter=256)
@@ -495,18 +500,18 @@ def test_the_1024_token_bucket_differed_when_staging_slots_counted():
 
 
 def test_density_inputs_never_exceed_the_build():
+    """Each case would flip the push choice if its input were not clamped:
+    99 slots would put 49,664 rows under the bound, and 10**6 rows would put
+    a build sitting on the bound (49,152) past it."""
     assert kernel.density_choices(
         DENSITY_TILE_M, 49664, 48, DENSITY_EP, occupied_slots=99
     ) == kernel.density_choices(DENSITY_TILE_M, 49664, 48, DENSITY_EP)
     assert kernel.density_choices(
-        DENSITY_TILE_M, 49664, 48, DENSITY_EP, density_rows_alloc=10**6
-    ) == kernel.density_choices(DENSITY_TILE_M, 49664, 48, DENSITY_EP)
+        DENSITY_TILE_M, 49152, 48, DENSITY_EP, density_rows_alloc=10**6
+    ) == kernel.density_choices(DENSITY_TILE_M, 49152, 48, DENSITY_EP)
 
 
-def test_layers_pass_the_unplaced_density_inputs_for_a_layout():
-    """fused_ep_moe_v2 and the push layer build with these kwargs."""
-    from vllm_torchtpu.kernels.fused_moe.v2.layer import density_build_kwargs
-
+def test_density_build_kwargs_give_a_layout_the_unplaced_choices():
     tokens = 8 * 1024
     kw = density_build_kwargs(448, 384, 8, tokens, 6, 128)
     assert kw == {
@@ -521,7 +526,79 @@ def test_layers_pass_the_unplaced_density_inputs_for_a_layout():
     )
 
 
-def test_layers_pass_nothing_without_extra_slots():
-    from vllm_torchtpu.kernels.fused_moe.v2.layer import density_build_kwargs
-
+def test_density_build_kwargs_are_empty_without_extra_slots():
     assert density_build_kwargs(384, 384, 8, 8 * 1024, 6, 128) == {}
+
+
+class _BuilderReached(Exception):
+    pass
+
+
+# One shard, 48 logical experts in 56 slots. At 56 tokens the slabs differ:
+# 512 rows for 48 experts, 640 for 56 slots.
+CALL_LOGICAL, CALL_SLOTS, CALL_TOKENS, CALL_TOPK = 48, 56, 56, 6
+LAYER_BUILDERS = [
+    pytest.param(v2_layer, "build_fused_ep_moe_kernel", "fused_ep_moe_v2", id="v2"),
+    pytest.param(push_layer, "build_push_moe_kernel", "fused_ep_moe_push", id="push"),
+]
+
+
+def _builder_kwargs(monkeypatch, module, builder, entry, *, placed):
+    """Call a layer entry point up to its kernel build; return the build's
+    kwargs."""
+    seen = {}
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+        raise _BuilderReached
+
+    monkeypatch.setattr(module, builder, spy)
+    hidden, inter = 256, 128
+    slots = CALL_SLOTS if placed else CALL_LOGICAL
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("ep",))
+    layout = (
+        dict(expert_slot=jnp.arange(CALL_LOGICAL, dtype=jnp.int32)[:, None])
+        if placed
+        else {}
+    )
+    with pytest.raises(_BuilderReached):
+        getattr(module, entry)(
+            jnp.zeros((CALL_TOKENS, hidden), jnp.bfloat16),
+            jnp.zeros((slots, hidden, 2 * inter), jnp.float8_e4m3fn),
+            jnp.zeros((slots, inter, hidden), jnp.float8_e4m3fn),
+            jnp.zeros((slots, 2 * inter), jnp.float32),
+            jnp.zeros((slots, hidden), jnp.float32),
+            jnp.zeros((CALL_TOKENS, CALL_LOGICAL), jnp.float32),
+            topk=CALL_TOPK,
+            renormalize=True,
+            mesh=mesh,
+            capacity=128,
+            **layout,
+        )
+    return seen
+
+
+@pytest.mark.parametrize("module, builder, entry", LAYER_BUILDERS)
+def test_layers_build_a_layout_with_the_unplaced_density_inputs(
+    monkeypatch, module, builder, entry
+):
+    seen = _builder_kwargs(monkeypatch, module, builder, entry, placed=True)
+    assert seen["g_local"] == CALL_SLOTS
+    assert seen["ragged_rows_alloc"] == host.ragged_stride_bound(
+        CALL_TOKENS, CALL_TOPK, CALL_SLOTS, 128
+    )
+    assert seen["occupied_slots"] == CALL_LOGICAL
+    assert seen["density_rows_alloc"] == host.ragged_stride_bound(
+        CALL_TOKENS, CALL_TOPK, CALL_LOGICAL, 128
+    )
+    assert seen["density_rows_alloc"] < seen["ragged_rows_alloc"]
+
+
+@pytest.mark.parametrize("module, builder, entry", LAYER_BUILDERS)
+def test_layers_pass_no_density_inputs_without_a_layout(
+    monkeypatch, module, builder, entry
+):
+    seen = _builder_kwargs(monkeypatch, module, builder, entry, placed=False)
+    assert seen["g_local"] == CALL_LOGICAL
+    assert "occupied_slots" not in seen
+    assert "density_rows_alloc" not in seen

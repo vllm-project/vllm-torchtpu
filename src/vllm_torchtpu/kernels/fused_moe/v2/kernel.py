@@ -901,8 +901,8 @@ def _build_fused_ep_moe_kernel(
     # enqueues, for a buffer nothing else reads. Where a build's experts are
     # expected to fit inside one tile -- `push_from_vmem`, which
     # density_choices makes above with the height ladder -- the tile can be
-    # shipped from `out_vm` itself,
-    # deleting the commits, the drain that gates them and the slab's traffic.
+    # shipped from `out_vm` itself, deleting the commits, the drain that
+    # gates them and the slab's traffic.
     # It costs a staging buffer that stays live until the wire has read it,
     # which is why a build whose visits carry several tiles keeps the slab:
     # there the wire is the busy resource and the round trip is what keeps
