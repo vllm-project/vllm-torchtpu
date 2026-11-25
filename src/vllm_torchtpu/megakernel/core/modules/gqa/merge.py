@@ -26,6 +26,10 @@ from ...ops import I32, round_bf16
 from ...pool.config import cache_exec
 from .context import GQAEmit
 
+# Within the 128-lane `(m | l)` tail (`[HD, PW)` of `pso`/`pri`), lanes
+# `[0, _SLAB_L_LANE_OFFSET)` carry `m` and `[_SLAB_L_LANE_OFFSET, 128)` carry `l`.
+_SLAB_L_LANE_OFFSET = 64
+
 
 def gq_merge_start(cx: GQAEmit) -> list[Any]:
     """Send packed-query (`GQ`) partial outputs and `(m | l)` to the group."""
@@ -47,6 +51,8 @@ def gq_merge_start(cx: GQAEmit) -> list[Any]:
                 xl = jnp.where(hi, al[s_, rs], xl)
             psend[g_idx, NS] = jnp.concatenate((xm, xl), axis=-1)
         pri[gi] = psend[gi]
+        if "comm" in cx.skip:
+            return []
         mx = comm.group_copies(
             lambda off: psend.at[gi ^ off],
             pri.at[gi],
@@ -77,9 +83,11 @@ def slab_merge_start(cx: GQAEmit) -> list[Any]:
                 r0 = g_idx * nh
                 pso[g_idx, t_, o_ : o_ + nh, 0:HD] = ab[r0 : r0 + nh]
                 pso[g_idx, t_, o_ : o_ + nh, HD:PW] = jnp.where(
-                    lane_pw < 64, mb[r0 : r0 + nh], lb[r0 : r0 + nh]
+                    lane_pw < _SLAB_L_LANE_OFFSET, mb[r0 : r0 + nh], lb[r0 : r0 + nh]
                 )
         pri[gi] = pso[gi]
+        if "comm" in cx.skip:
+            return []
         mx = comm.group_copies(
             lambda off: pso.at[gi ^ off],
             pri.at[gi],
@@ -111,6 +119,7 @@ def split_merge(cx: GQAEmit) -> None:
             d.wait_recv()
         for d in mx:
             d.wait_send()
+        l_col = HD + _SLAB_L_LANE_OFFSET
         for t in range(NBP if not GQ else 0):
             parts = [pri[g_idx, t] for g_idx in range(G)]
             mg = [x[:, HD : HD + 1] for x in parts]
@@ -118,7 +127,7 @@ def split_merge(cx: GQAEmit) -> None:
             for x in mg[1:]:
                 m = jnp.maximum(m, x)
             wg = [jnp.exp(x - m) for x in mg]
-            lsum: Any = sum(w * x[:, HD + 64 : HD + 65] for w, x in zip(wg, parts))
+            lsum: Any = sum(w * x[:, l_col : l_col + 1] for w, x in zip(wg, parts))
             asum: Any = sum(w * x[:, :HD] for w, x in zip(wg, parts))
             if not PACK:
                 sq, q0 = t // T, (t % T) * QR

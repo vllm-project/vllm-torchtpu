@@ -110,7 +110,7 @@ def q_exchange_start(cx: GQAEmit) -> list[Any]:
     ap, scr, sc, comm, gi = cx.ap, cx.scr, cx.sc, cx.comm, cx.gi
     G, SPLIT, GQ = ap.G, ap.SPLIT, ap.GQ
     qx = []
-    if SPLIT:
+    if SPLIT and "comm" not in cx.skip:
         with sc("att_qgather"):
             qgb = scr["qxb"] if GQ else scr["qg"]
             qx = comm.group_copies(

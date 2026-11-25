@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 from jax import lax
 
@@ -111,6 +113,14 @@ class GQAModule(Module):
         return resolve_gqa_binding(
             cls, binding, super()._resolve_binding(binding, hf_config)
         )
+
+    def with_cache_layout(self, layout: Any) -> GQAModule:
+        """Return a shallow copy bound to `layout` when `pool_layout` differs."""
+        if self.pool_layout is layout:
+            return self
+        cloned = copy.copy(self)
+        cloned.pool_layout = layout
+        return cloned
 
     def kv_page_shape(self, g: Any, ex: ExecSpec) -> tuple[int, ...]:
         """Shape of one pool page, from `pool_layout` when the model sets one.
@@ -244,6 +254,12 @@ class GQAModule(Module):
             scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
         if ap.PACK or ap.QV:
             scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
+        if ap.SPLIT and "comm" in ctx.skip:
+            scr["pri"][...] = jnp.zeros(scr["pri"].shape, F32)
+            if ap.GQ:
+                scr["qxb"][...] = jnp.zeros(scr["qxb"].shape, BF16)
+            elif not (ap.PACK or ap.QV):
+                scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
         if ap.QV:
             half_ = ap.ROT // 2
             inv_ = 1.0 / (
@@ -300,7 +316,11 @@ class GQAModule(Module):
         states: dict[str, Any],
         raw_outputs: dict[str, Any],
     ) -> dict[str, Any]:
-        """Scatter `knew` and `vnew` into `kc` and `vc` inside `shard_map`."""
+        """Scatter `knew` and `vnew` into `kc` and `vc` inside `shard_map`.
+
+        In non-paged mode, `pos[:ex.B]` must hold in-bounds `[0, ex.ctx)` positions
+        that are strictly increasing within each sequence's `T` tokens.
+        """
         if cache_exec(ex).FUSED:
             if POOL_STATE_NAME in raw_outputs:
                 return {POOL_STATE_NAME: raw_outputs[POOL_STATE_NAME]}
@@ -311,11 +331,12 @@ class GQAModule(Module):
         kc, vc = states["kc"], states["vc"]
         if self.tunables(ex).kv_scatter_vec_ns < ex.NS:
             bi = jnp.arange(ex.B) if ex.T == 1 else jnp.arange(ex.B) // ex.T
+            pos_b = pos[: ex.B]
             kw = dict(
                 indices_are_sorted=True, unique_indices=True, mode="promise_in_bounds"
             )
-            kc = kc.at[:, bi, pos].set(knew[:, : ex.B].astype(BF16), **kw)
-            vc = vc.at[:, bi, pos].set(vnew[:, : ex.B].astype(BF16), **kw)
+            kc = kc.at[:, bi, pos_b].set(knew[:, : ex.B].astype(BF16), **kw)
+            vc = vc.at[:, bi, pos_b].set(vnew[:, : ex.B].astype(BF16), **kw)
             return {"kc": kc, "vc": vc}
         for s_idx in range(ex.NS):
             b0 = s_idx * ex.T
@@ -347,11 +368,14 @@ class GQAModule(Module):
     def init_logical_states(
         self, key: Any, g: Any, ex: ExecSpec, n_layers: int
     ) -> dict[str, Any]:
-        import jax
-
         geom = self._require_geometry(g)
         cdecl = self.cache_decl(geom)
         nkv = int(geom.NKV)
+        if nkv <= 0 or ex.R <= 0 or nkv > ex.R or ex.R % nkv != 0:
+            raise MegakernelConfigError(
+                f"GQAModule.init_logical_states requires 1 <= NKV={nkv} <= R={ex.R} "
+                f"with R % NKV == 0"
+            )
         g_rep = ex.R // nkv
         k_kc, k_vc = jax.random.split(key)
         sh = (nkv, n_layers, ex.NS, ex.ctx, cdecl.hd)
