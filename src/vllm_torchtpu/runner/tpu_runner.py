@@ -2836,10 +2836,11 @@ class TPUModelRunner(GPUModelRunner):
         This step then reads none of their outputs: the previous step's
         requests committed no tokens (partial prefill chunks) or left the batch
         (finished, preempted or not scheduled), as on every step of one-token
-        requests. Their rollback records go too: rolling back a request outside
-        the batch only rewrites its req_state.output_token_ids, which nothing
-        reads while it is out, and vLLM's _update_states() rebuilds that list
-        from the scheduler's tokens if the request returns.
+        requests. Their rollback records stay: a request that was not scheduled
+        can return in a later step, and vLLM v0.34 no longer resends its tokens
+        (`CachedRequestData.all_token_ids` is gone), so _modify_prev_results()
+        must still settle its req_state.output_token_ids. Requests outside the
+        batch skip the input_batch write there.
 
         Their D2H copy may still be in flight. Keep the results instead of
         waiting on it here, which would stall the host before this step's
@@ -2859,7 +2860,6 @@ class TPUModelRunner(GPUModelRunner):
         # With nothing mapped, _prepare_inputs substitutes no tokens and skips
         # the rejected-token subtraction.
         pre.req_id_to_index_copy.clear()
-        pre.request_seq_lens = []
 
     def _install_spec_token_room_guard(self) -> None:
         """Wrap InputBatch.update_req_spec_token_ids to clamp its *write*.

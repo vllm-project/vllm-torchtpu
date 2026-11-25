@@ -3533,9 +3533,10 @@ def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
     [
         # A partial prefill chunk: nothing committed, nothing to roll back.
         ("req-prefill", "req-prefill", False, {}, [-1], [0, 0, 0, 0]),
-        # The previous request left: unmapped, not rolled back (vLLM rebuilds
-        # its outputs if it returns), and the new request's row is untouched.
-        ("req-done", "req-new", True, {}, [-1], [0, 0, 0, 0]),
+        # The previous request left: unmapped, but its req_state is still rolled
+        # back (vLLM v0.34 does not resend its tokens if it returns), and the
+        # new request's row is untouched.
+        ("req-done", "req-new", True, {}, [7], [0, 0, 0, 0]),
         # Continued: stays mapped and is rolled back, row included.
         ("req-a", "req-a", True, {"req-a": 0}, [7], [7, 0, 0, 0]),
     ],
@@ -3550,8 +3551,8 @@ def test_unmap_keeps_async_results_until_sample_tokens_waits(
     AsyncTPUModelRunnerOutput when the RPC returns, so _pre_async_results is
     the copy's only owner. execute_model() must neither free it before the
     copy is waited on nor block on it ahead of the forward; only a request this
-    step continues stays mapped and keeps its rollback. sample_tokens() waits
-    on the copy in _modify_prev_results() and rolls back what is left.
+    step continues stays mapped. sample_tokens() waits on the copy in
+    _modify_prev_results() and rolls back every committed request.
     """
     events = []
 
