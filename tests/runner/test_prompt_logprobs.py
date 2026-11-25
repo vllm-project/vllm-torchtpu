@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Prompt logprobs through TPUModelRunner._prompt_logprobs_chunk and emit.
+"""Prompt logprobs through TPUModelRunner._prompt_logprobs_chunk, prepare and
+PendingPromptLogprobs.fill.
 
 The runner's own compute_selected_logits and gather_logprobs run eagerly on
 CPU over a linear LM head, and every step's result is checked against a
@@ -24,7 +25,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from runner_output_test_utils import _sample_tokens_runner, run_sample_tokens
 from vllm.distributed import parallel_state
+from vllm.v1.outputs import LogprobsTensors
 
 from vllm_torchtpu.runner import prompt_logprobs
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -86,11 +89,14 @@ def _runner(max_logprobs=3, **overrides):
     return runner
 
 
-def _run_steps(runner, schedule, num_tokens_padded=None):
+def _run_steps(runner, schedule, num_tokens_padded=None, fill_late=False):
     """Plan each step's chunks (each a dict req_id -> scheduled tokens, in batch
-    order), score them and emit; return what each step completed."""
+    order), score them, prepare and fill their output; return what each step
+    completed. With `fill_late`, every step is filled, in order, after the last
+    one is prepared: the output thread can fall behind the runner's thread that
+    far under async scheduling."""
     computed = dict.fromkeys(PROMPTS, 0)
-    completed_per_step = []
+    pending_per_step, completed_per_step = [], []
     for step in schedule:
         runner.input_batch.req_ids = [r for chunk in step for r in chunk]
         runner.input_batch.num_computed_tokens_cpu = np.array(
@@ -121,17 +127,24 @@ def _run_steps(runner, schedule, num_tokens_padded=None):
             start_index += len(req_ids)
         with torch.compiler.set_stance("force_eager"):
             TPUModelRunner._score_prompt_logprobs(runner, chunks)
-        completed_per_step.append(
-            prompt_logprobs.emit(
-                [chunk for chunk, _ in chunks],
-                runner.requests,
-                runner.num_prompt_logprobs,
-            )
+        pending = prompt_logprobs.prepare(
+            [chunk for chunk, _ in chunks], runner.requests, runner.num_prompt_logprobs
         )
+        if pending is not None:
+            pending.copy_to_host()
+        pending_per_step.append(pending)
+        if not fill_late:
+            completed_per_step.append(_fill(pending))
         for chunk_tokens in step:
             for req_id, num_tokens in chunk_tokens.items():
                 computed[req_id] += num_tokens
+    if fill_late:
+        completed_per_step = [_fill(p) for p in pending_per_step]
     return completed_per_step
+
+
+def _fill(pending):
+    return {} if pending is None else pending.fill()
 
 
 def _expected(req_id, num_logprobs):
@@ -164,12 +177,16 @@ def _expected(req_id, num_logprobs):
         ),
     ],
 )
-def test_prompt_logprobs_match_log_softmax(schedule, completing_step, max_logprobs):
+@pytest.mark.parametrize("fill_late", [False, True])
+def test_prompt_logprobs_match_log_softmax(
+    schedule, completing_step, max_logprobs, fill_late
+):
     """Row i holds the logprob of prompt token i + 1 from hidden state i, the
-    top-k and the rank; returned once, when the prompt completes."""
+    top-k and the rank; returned once, when the prompt completes, however far
+    the fills lag the steps."""
     runner = _runner(max_logprobs)
 
-    completed_per_step = _run_steps(runner, schedule)
+    completed_per_step = _run_steps(runner, schedule, fill_late=fill_late)
 
     for step, completed in enumerate(completed_per_step):
         expected = set(NUM_PROMPT_LOGPROBS) if step == completing_step else set()
@@ -345,3 +362,50 @@ def test_last_logits_call_pads_to_its_own_bucket_outside_lockstep():
     runner.compute_selected_logits = compute_selected_logits
     _run_steps(runner, [[{"d": 19, "a": 7}]], 32)
     assert sizes == [16, 8]
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_sample_tokens_returns_prompt_logprobs_through_the_async_copy(
+    async_scheduling,
+):
+    """sample_tokens hands the step's prompt rows to the async output copy,
+    and the output carries them once read, under either scheduling."""
+    runner = _sample_tokens_runner(
+        [torch.tensor([[0.0, 1.0]])],
+        [1],
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+    )
+    request = runner.requests["r0"]
+    request.prompt_token_ids = [5, 6, 7]
+    request.in_progress_prompt_logprobs_cpu = None
+    runner.num_prompt_logprobs = {"r0": 1}
+    rows = LogprobsTensors(
+        logprob_token_ids=torch.tensor([[6, 1], [7, 2]], dtype=torch.int32),
+        logprobs=torch.tensor([[-0.5, -0.1], [-0.25, -0.2]]),
+        selected_token_ranks=torch.tensor([3, 4], dtype=torch.int32),
+    )
+    span = prompt_logprobs.PromptLogprobsSpan(
+        "r0", hidden_start=0, prompt_row_start=0, num_rows=2, completes_prompt=True
+    )
+    runner.execute_model_state.prompt_logprobs_chunks = [
+        prompt_logprobs.PromptLogprobsChunk([span], [(rows, 2)])
+    ]
+
+    output = run_sample_tokens(runner)
+    if async_scheduling:
+        output = output.get_output()
+
+    result = output.prompt_logprobs_dict["r0"]
+    assert torch.equal(result.logprob_token_ids, rows.logprob_token_ids)
+    assert torch.equal(result.logprobs, rows.logprobs)
+    assert torch.equal(result.selected_token_ranks, rows.selected_token_ranks)
+    assert runner.num_prompt_logprobs == {}
+
+
+def test_prepare_fails_on_planned_rows_that_were_not_scored():
+    """Caught on the runner thread, not later in fill() on the output thread."""
+    span = prompt_logprobs.PromptLogprobsSpan("a", 0, 0, 2, False)
+    with pytest.raises(AssertionError):
+        prompt_logprobs.prepare(
+            [prompt_logprobs.PromptLogprobsChunk([span])], _runner().requests, {"a": 1}
+        )

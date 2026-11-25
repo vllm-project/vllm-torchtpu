@@ -19,7 +19,10 @@ prompt of ``P`` tokens scores prompt token ``i + 1`` from the hidden state of
 token ``i``, so a prompt has ``P - 1`` rows. Under chunked prefill they are
 filled chunk by chunk into a per-request CPU buffer, which is returned once
 the prompt is computed: the semantics of vLLM's
-``GPUModelRunner._get_prompt_logprobs_dict``.
+``GPUModelRunner._get_prompt_logprobs_dict``. The step does not wait for
+their copy to the host: it lands with the step's sampled tokens
+(``AsyncTPUCopyState``), and the buffers are filled when the step's output is
+read.
 
 The rows are scored with the runner's fixed top-k (``max_logprobs``), so a
 request for more prompt logprobs than that gets ``max_logprobs`` of them.
@@ -154,33 +157,102 @@ def rows_and_targets(
     )
 
 
-def emit(
+@dataclass
+class _Write:
+    """Rows `src` of a chunk's host rows go to rows `dst` of a request's
+    buffer, `width` columns wide."""
+
+    buffer: LogprobsTensors
+    src: slice
+    dst: slice
+    width: int
+
+
+@dataclass
+class PendingPromptLogprobs:
+    """A step's prompt logprobs, from the end of the step until their copy to
+    the host lands.
+
+    `prepare` builds it on the runner's thread and does all the bookkeeping
+    there. `fill` reads the values once the copy has landed. Under async
+    scheduling it runs on the worker's output thread, concurrently with the
+    next step, so it writes only to the buffers listed here.
+    """
+
+    # Per chunk: its slices (device tensors until `copy_to_host`, then their
+    # host copies) and the buffer writes they feed.
+    chunks: list[tuple[list[tuple[LogprobsTensors, int]], list[_Write]]]
+    # The buffers of the requests whose prompt the step completes.
+    completed: dict[str, LogprobsTensors]
+
+    def copy_to_host(self) -> list[LogprobsTensors]:
+        """Start copying the slices to the host without waiting. Returns their
+        device tensors, which must stay alive until the copy lands."""
+        sources = [t for slices, _ in self.chunks for t, _ in slices]
+        self.chunks = [
+            ([(t.to_cpu_nonblocking(), n) for t, n in slices], writes)
+            for slices, writes in self.chunks
+        ]
+        return sources
+
+    def fill(self) -> dict[str, LogprobsTensors | None]:
+        """Write the copied rows into the requests' buffers, once the copy has
+        landed, and return the completed requests' buffers."""
+        for slices, writes in self.chunks:
+            if not writes:
+                continue
+            host = LogprobsTensors.cat(
+                [
+                    LogprobsTensors(
+                        t.logprob_token_ids[:n],
+                        t.logprobs[:n],
+                        t.selected_token_ranks[:n],
+                    )
+                    for t, n in slices
+                ]
+            )
+            for w in writes:
+                w.buffer.logprob_token_ids[w.dst] = host.logprob_token_ids[
+                    w.src, : w.width
+                ]
+                w.buffer.logprobs[w.dst] = host.logprobs[w.src, : w.width]
+                w.buffer.selected_token_ranks[w.dst] = host.selected_token_ranks[w.src]
+        return dict(self.completed)
+
+
+def prepare(
     chunks: Sequence[PromptLogprobsChunk],
     requests: Mapping[str, CachedRequestState],
     num_prompt_logprobs: MutableMapping[str, int],
-) -> dict[str, LogprobsTensors | None]:
-    """Copy a step's prompt logprobs to the requests' CPU buffers.
+) -> PendingPromptLogprobs | None:
+    """Plan where a step's prompt logprobs go, without reading them.
 
-    Returns the buffers of the requests whose prompt this step completed, and
-    removes those requests from `num_prompt_logprobs`.
+    Creates a request's CPU buffer at its first chunk. A request whose prompt
+    this step completes leaves `num_prompt_logprobs` and its request state,
+    and its buffer moves to the result. None for a step without prompt
+    logprobs.
     """
-    completed: dict[str, LogprobsTensors | None] = {}
+    if not chunks:
+        return None
+    pending = PendingPromptLogprobs(chunks=[], completed={})
     for chunk in chunks:
-        host = _host_rows(chunk.slices) if chunk.slices else None
+        # The rows' top-k width, known from their shape before their values.
+        num_columns = chunk.slices[0][0].logprobs.shape[1] if chunk.slices else None
+        writes = []
         offset = 0
         for span in chunk.spans:
             request = requests[span.req_id]
             # The prompt token's logprob, then the top-k.
             width = num_prompt_logprobs[span.req_id] + 1
-            if host is not None and host.logprobs.shape[1] < width:
+            if num_columns is not None and num_columns < width:
                 logger.warning_once(
                     "prompt_logprobs=%d exceeds the TPU runner's top-k of %d "
                     "(--max-logprobs); returning that many. Set a finite "
                     "--max-logprobs of at least the requested number.",
                     width - 1,
-                    host.logprobs.shape[1] - 1,
+                    num_columns - 1,
                 )
-                width = host.logprobs.shape[1]
+                width = num_columns
             buffer = request.in_progress_prompt_logprobs_cpu
             if buffer is None:
                 assert request.prompt_token_ids is not None
@@ -189,31 +261,24 @@ def emit(
                 )
                 request.in_progress_prompt_logprobs_cpu = buffer
             if span.num_rows:
-                assert host is not None
-                rows = slice(offset, offset + span.num_rows)
-                dst = slice(
-                    span.prompt_row_start, span.prompt_row_start + span.num_rows
+                # Planned rows were scored (_score_prompt_logprobs); fail here,
+                # not in fill() on the output thread.
+                assert chunk.slices, span
+                writes.append(
+                    _Write(
+                        buffer=buffer,
+                        src=slice(offset, offset + span.num_rows),
+                        dst=slice(
+                            span.prompt_row_start,
+                            span.prompt_row_start + span.num_rows,
+                        ),
+                        width=width,
+                    )
                 )
-                buffer.logprob_token_ids[dst] = host.logprob_token_ids[rows, :width]
-                buffer.logprobs[dst] = host.logprobs[rows, :width]
-                buffer.selected_token_ranks[dst] = host.selected_token_ranks[rows]
                 offset += span.num_rows
             if span.completes_prompt:
-                completed[span.req_id] = buffer
+                pending.completed[span.req_id] = buffer
                 request.in_progress_prompt_logprobs_cpu = None
                 del num_prompt_logprobs[span.req_id]
-    return completed
-
-
-def _host_rows(slices: Sequence[tuple[LogprobsTensors, int]]) -> LogprobsTensors:
-    """The real rows of a chunk's padded device slices, on the host, in order."""
-    return LogprobsTensors.cat(
-        [
-            LogprobsTensors(
-                t.logprob_token_ids.cpu()[:n],
-                t.logprobs.cpu()[:n],
-                t.selected_token_ranks.cpu()[:n],
-            )
-            for t, n in slices
-        ]
-    )
+        pending.chunks.append((chunk.slices, writes))
+    return pending
