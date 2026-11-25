@@ -1448,7 +1448,7 @@ def test_upstream_forward_signature_canary():
         return hidden_states
 
     for bad_fn in (swapped, renamed, extra):
-        with pytest.raises(AssertionError, match="MoERunner.forward signature changed"):
+        with pytest.raises(RuntimeError, match="MoERunner.forward signature changed"):
             _check_upstream_forward_signature(bad_fn)
 
 

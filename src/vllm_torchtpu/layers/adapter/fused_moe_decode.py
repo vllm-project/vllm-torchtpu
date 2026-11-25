@@ -786,8 +786,8 @@ def _anchor_tensors_for_trace(
     1. Dynamo lifts parameter/buffer placeholders in FX first-read order.
     2. No FX pass before ``split_module`` simplifies ``torch.where(c, x, x)``
        (which would drop the anchored placeholders from the subgraph).
-    3. XLA folds the dead ``select(c, out, out) -> out`` before codegen so
-       anchoring adds zero runtime cost.
+    3. The dead ``select(c, out, out) -> out`` is folded at lowering (or by
+       XLA) before codegen so anchoring adds zero runtime cost.
 
     Breaking (1) or (2) fails loudly at startup with
     ``ShapeSpecializationError`` (subgraph inputs differ across traces).

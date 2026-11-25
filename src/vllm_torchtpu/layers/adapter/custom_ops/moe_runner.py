@@ -61,10 +61,11 @@ _EXPECTED_MOE_RUNNER_FORWARD_PARAMS = (
 
 def _check_upstream_forward_signature(forward_fn: Callable) -> None:
     params = tuple(inspect.signature(forward_fn).parameters)
-    assert params == _EXPECTED_MOE_RUNNER_FORWARD_PARAMS, (
-        f"MoERunner.forward signature changed: expected "
-        f"{_EXPECTED_MOE_RUNNER_FORWARD_PARAMS}, got {params}"
-    )
+    if params != _EXPECTED_MOE_RUNNER_FORWARD_PARAMS:
+        raise RuntimeError(
+            f"MoERunner.forward signature changed: expected "
+            f"{_EXPECTED_MOE_RUNNER_FORWARD_PARAMS}, got {params}"
+        )
 
 
 _check_upstream_forward_signature(MoERunner.forward)
