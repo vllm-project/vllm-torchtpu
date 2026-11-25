@@ -83,6 +83,9 @@ _INTERLEAVE_TOKENS = 64
 # of 64 pages (65, ratio 4.1) 685 -> 779; local selections (26, ratio 1.6)
 # 344 -> 844; tiles cost ~8.7 us per union page.
 PAGE_MAJOR = "auto"
+# The ratio is estimated over a 1,024-bit bitmap per tile, and the head's
+# exchanged page keys span dcp * num_pages: far pages alias and the estimate
+# comes out low (uniform selections over a 253K context: 39 for a true 48).
 _PAGE_MAJOR_MIN_RATIO = 7.0
 # Decode steps of a DCP group of 4 over 2 KV heads attend each KV head in its
 # own call so the cross-chip merge overlaps the second (`_pair_first_merge_by_head`).
@@ -902,9 +905,8 @@ def _head_parallel_attend(
             interpret=interpret,
         )
         if not merge:
-            # One call over every row: the kernel chunks the rows and writes
-            # its output in place; rows outside the round see no page and
-            # come back zero (cheap empty tiles).
+            # One call over every row: rows outside the round see no page
+            # and come back zero (cheap empty tiles, or no pairs).
             return attend(q, kv, keys, local, limit, page_table)
 
         def window_body(i, acc):

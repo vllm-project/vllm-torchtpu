@@ -238,12 +238,23 @@ def _work(keys, local_key, local_limit, window, num_heads, page_size):
     return packed, jnp.sum(valid, axis=1, dtype=jnp.int32)
 
 
+def _max_window(num_heads, head_dim, window=WINDOW) -> int:
+    """`window`, or fewer tokens (a multiple of 8) where its accumulator and
+    double-buffered query and output blocks would not fit the VMEM limit."""
+    row_bytes = num_heads * head_dim * (2 * 4 + 2 * 2 + 2 * 2)
+    budget = msa_attention._VMEM_LIMIT_BYTES * 3 // 4
+    return min(window, budget // row_bytes // 8 * 8)
+
+
 def supports(num_heads, head_dim, page_size, num_keys, window=WINDOW) -> bool:
     """Whether `msa_sparse_attention_pairs` takes calls of this shape: whole
     sublane tiles of query rows per token, a page's slots and a block's
-    tokens within the D mask columns, and the pair and block words' fields."""
+    tokens within the D mask columns, the pair and block words' fields, and
+    a window of tokens in VMEM."""
+    window = _max_window(num_heads, head_dim, window)
     return (
-        num_heads % 8 == 0
+        window >= 8
+        and num_heads % 8 == 0
         and page_size <= head_dim
         and _WIDTHS[-1] <= head_dim
         and num_keys * window < _NO_PAIR
@@ -288,7 +299,7 @@ def msa_sparse_attention_pairs(
     msa_attention.check_cache(kv_cache, scale_cache)
     num_tokens, num_heads, head_dim = q.shape
     page_size = msa_attention.page_tokens(kv_cache)
-    window = min(window, -(-num_tokens // 8) * 8)
+    window = min(_max_window(num_heads, head_dim, window), -(-num_tokens // 8) * 8)
     if not supports(num_heads, head_dim, page_size, page_table.shape[0], window):
         raise ValueError(
             f"{num_heads} heads, D {head_dim}, {page_size}-slot pages, "
