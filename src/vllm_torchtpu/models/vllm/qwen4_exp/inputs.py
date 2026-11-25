@@ -9,6 +9,7 @@ import torch
 from vllm.forward_context import set_forward_context
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation.direct_dispatch import tpu_compile
 from vllm_torchtpu.kv_cache_materializer import LayerKVCache
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -649,9 +650,7 @@ class Qwen4ExpAdapter:
     def _fused_fn(self):
         fn = getattr(self, "_fused", None)
         if fn is None:
-            fn = self._fused = torch.compile(
-                fused_step_inputs, backend="tpu", fullgraph=True, dynamic=False
-            )
+            fn = self._fused = tpu_compile(fused_step_inputs)
         return fn
 
     def precompile_fused_inputs(

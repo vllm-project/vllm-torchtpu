@@ -19,6 +19,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import bucket_filter
+from vllm_torchtpu.compilation.direct_dispatch import tpu_compile
 from vllm_torchtpu.spec_decode.shard_argmax import attach_fp8_head, greedy_draft_token
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError, MegakernelSetupError
 from vllm_torchtpu.layers.adapter import token_padding
@@ -171,9 +172,7 @@ def _async_draft_seed_impl(
     return last_token_indices, next_token_ids, num_rejected
 
 
-_async_draft_seed_compiled = _static_shape_args(
-    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(_async_draft_seed_impl)
-)
+_async_draft_seed_compiled = _static_shape_args(tpu_compile(_async_draft_seed_impl))
 
 
 def _async_seed_inputs_impl(
@@ -214,9 +213,7 @@ def _async_seed_inputs_impl(
 
 # The chunk's input_ids carry the draft forward's dynamic-dim marks; see
 # _static_shape_args.
-_async_seed_inputs_compiled = _static_shape_args(
-    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(_async_seed_inputs_impl)
-)
+_async_seed_inputs_compiled = _static_shape_args(tpu_compile(_async_seed_inputs_impl))
 
 
 def _async_draft_seed(*args: torch.Tensor | None):

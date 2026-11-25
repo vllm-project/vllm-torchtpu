@@ -85,7 +85,8 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm_torchtpu import envs, stall_watchdog, utils
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError, MegakernelSetupError
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
-from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation import direct_dispatch, shape_variants
+from vllm_torchtpu.compilation.direct_dispatch import tpu_compile
 from vllm_torchtpu.core.mamba_tail_fold import (
     WORKER_COUNTER,
     fold_unit,
@@ -395,7 +396,7 @@ def _spec_boundary_pairs_impl(
     return torch.where(copy, src, null), torch.where(copy, dst, null)
 
 
-_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+_tpu_compile = tpu_compile
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _update_read_offsets_compiled = _tpu_compile(_update_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
@@ -883,7 +884,7 @@ def _spec_logprob_row_tokens(
     return out[:num_rows, None]
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@tpu_compile
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
     token_in_tpu_cur_input_indices: torch.Tensor,
@@ -982,12 +983,7 @@ def _subtract_num_rejected_tokens_compiled(*args):
         )
 
         _subtract_num_rejected_tokens_fn = _static_shape_args(
-            torch.compile(
-                subtract_num_rejected_tokens,
-                backend="tpu",
-                fullgraph=True,
-                dynamic=False,
-            )
+            tpu_compile(subtract_num_rejected_tokens)
         )
     return _subtract_num_rejected_tokens_fn(*args)
 
@@ -1152,9 +1148,7 @@ def _pad_rejected_rows(num_rejected: torch.Tensor, rows: int) -> torch.Tensor:
 # deferred fusion merges it with per-step-varying neighbours, so warmup's eager
 # pad never matched serving's and it compiled mid-serve (j-07c68dc0: 109
 # compiles, ~30 ms each).
-_pad_rejected_rows_compiled = _static_shape_args(
-    torch.compile(_pad_rejected_rows, backend="tpu", fullgraph=True, dynamic=False)
-)
+_pad_rejected_rows_compiled = _static_shape_args(tpu_compile(_pad_rejected_rows))
 
 
 def _spec_tail(next_tokens, drafts, draft_lengths, rows, num_reqs, bound):
@@ -1174,9 +1168,7 @@ def _spec_tail(next_tokens, drafts, draft_lengths, rows, num_reqs, bound):
     return src, num_rejected
 
 
-_spec_tail_compiled = _static_shape_args(
-    torch.compile(_spec_tail, backend="tpu", fullgraph=True, dynamic=False)
-)
+_spec_tail_compiled = _static_shape_args(tpu_compile(_spec_tail))
 
 
 logger = init_logger(__name__)
@@ -10280,6 +10272,7 @@ class TPUModelRunner(GPUModelRunner):
             cc.cache_dir, cc.local_cache_dir = saved_cache
             cc.compile_sizes = saved_sizes
             torch._dynamo.reset()
+            direct_dispatch.reset()
             synchronize_device()
 
             # Sampling subgraphs (Phase A) — uses the restored cache_dir.
@@ -10862,14 +10855,14 @@ class TPUModelRunner(GPUModelRunner):
         assert head is not None
         return head.quant_method.apply(head, hidden_states, bias=None)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def compute_selected_local_logits(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
     ) -> torch.Tensor:
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self._local_logits(selected)
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    @tpu_compile
     def compute_local_logits_from_hidden_states(
         self, hidden_states: torch.Tensor
     ) -> torch.Tensor:

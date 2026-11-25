@@ -320,6 +320,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Host-side step bookkeeping and host timers: no compiled program reads them.
     "VLLM_TPU_HOST_PHASES_CPU",
     "VLLM_TPU_STEADY_METADATA_REUSE",
+    # Calls compiled graphs without Dynamo's entry; the graphs are the same.
+    "VLLM_TPU_DIRECT_DISPATCH",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

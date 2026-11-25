@@ -439,6 +439,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STEADY_DECODE_METADATA: bool = False
     VLLM_TPU_STEADY_METADATA_REUSE: bool = False
     VLLM_TPU_AOT_SKIP_GUARD_CHECK: bool = False
+    VLLM_TPU_DIRECT_DISPATCH: bool = False
     VLLM_TPU_ENVS_FREEZE: bool = False
     VLLM_TPU_HOST_TOKEN_LISTS: bool = False
     VLLM_TPU_PREFILL_CKPT_DECODE_SKIP: bool = False
@@ -2794,6 +2795,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Freshly AOT-compiled models skip the per-call Dynamo guard check when
     # vLLM does not evaluate guards (as it already does for cached artifacts).
     "VLLM_TPU_AOT_SKIP_GUARD_CHECK": env_bool("VLLM_TPU_AOT_SKIP_GUARD_CHECK"),
+    # The step-path glue regions built with compilation.direct_dispatch's
+    # tpu_compile call their compiled graph directly, without Dynamo's entry,
+    # for inputs they have already seen (compilation/direct_dispatch.py).
+    "VLLM_TPU_DIRECT_DISPATCH": env_bool("VLLM_TPU_DIRECT_DISPATCH"),
     # After warmup, each worker keeps the first value it reads of every
     # variable in this module as a module attribute (freeze_reads), so a read
     # on the step path is a dict hit instead of os.getenv plus parsing
