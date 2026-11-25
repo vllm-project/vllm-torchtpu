@@ -1335,6 +1335,9 @@ def fused_moe_func(
             shared_down,
         )
 
+    ragged_permute = (
+        use_ep and use_sparse_core and num_tokens * topk > onehot_moe_permute_threshold
+    )
     e4m3_rows = _e4m3_routed_rows(
         routed_rows,
         w1,
@@ -1347,9 +1350,7 @@ def fused_moe_func(
         num_tokens=num_tokens,
         topk=topk,
         activation=activation,
-        ragged_permute=use_ep
-        and use_sparse_core
-        and num_tokens * topk > onehot_moe_permute_threshold,
+        ragged_permute=ragged_permute,
     )
     (
         x,
@@ -1379,6 +1380,11 @@ def fused_moe_func(
             jnp.array([0], dtype=jnp.int32),
             group_sizes.sum(dtype=jnp.int32)[None],
         )
+    if shared_down is not None and ragged_permute:
+        # The whole shared activation before gate_up: it fills the wait on
+        # the SparseCore gather instead of running between combine pieces.
+        x, act = jax.lax.optimization_barrier((x, shared_down[0]))
+        shared_down = (act, *shared_down[1:])
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(
         x,
