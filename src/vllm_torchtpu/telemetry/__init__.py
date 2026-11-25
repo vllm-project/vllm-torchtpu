@@ -20,6 +20,11 @@ from vllm_torchtpu.telemetry.eviction_tracker import (
     compute_tpu_bucket_padding_tokens,
     extract_hardware_span_attributes,
 )
+from vllm_torchtpu.telemetry.padding_metrics import (
+    finish_tpu_padding_warmup,
+    record_tpu_round_padding,
+    register_tpu_padding_collector,
+)
 from vllm_torchtpu.telemetry.token_breakdown import (
     CATEGORIES,
     BoundedLRU,
@@ -59,11 +64,14 @@ __all__ = [
     "compute_tpu_bucket_padding_tokens",
     "extract_agent_headers",
     "extract_hardware_span_attributes",
+    "finish_tpu_padding_warmup",
     "get_telemetry_service",
     "install_agentic_telemetry_patches",
     "patch_block_pool",
     "patch_output_processor",
     "patch_trace_headers",
+    "record_tpu_round_padding",
+    "register_tpu_padding_collector",
     "reset_telemetry_service",
     "resolve_turn_markers_from_tokenizer",
     "sync_block_size_from_config",

@@ -22,6 +22,7 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -31,8 +32,10 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.telemetry.eviction_tracker import (
     BlockEvictionTracker,
+    TpuPaddingCounterTracker,
     extract_hardware_span_attributes,
 )
+from vllm_torchtpu.telemetry.padding_metrics import register_tpu_padding_collector
 from vllm_torchtpu.telemetry.token_breakdown import (
     CATEGORIES,
     BoundedLRU,
@@ -121,8 +124,92 @@ def _resolve_default_dp_rank() -> int:
         return 0
 
 
+def _proc_stat_fields(pid: int) -> tuple[str, str, int, int] | None:
+    """Return `(comm, state, ppid, starttime_ticks)` from `/proc/<pid>/stat`."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            raw = f.read()
+        rparen = raw.rfind(")")
+        if rparen < 0:
+            return None
+        comm = raw[raw.find("(") + 1 : rparen]
+        rest = raw[rparen + 2 :].split()
+        return comm, rest[0], int(rest[1]), int(rest[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+_LINEAGE_CACHE: tuple[int, int, list[int]] | None = None
+
+
+def _current_process_lineage() -> tuple[int, int, list[int]]:
+    """Return `(pid, proc_start_ticks, ancestor_pids)` cached per PID."""
+    global _LINEAGE_CACHE
+    pid = os.getpid()
+    if _LINEAGE_CACHE is not None and _LINEAGE_CACHE[0] == pid:
+        return _LINEAGE_CACHE
+    stat = _proc_stat_fields(pid)
+    proc_start = stat[3] if stat is not None else 0
+    ancestors: list[int] = [pid]
+    cur = stat[2] if stat is not None else os.getppid()
+    for _ in range(16):
+        if cur <= 1 or cur in ancestors:
+            break
+        ancestors.append(cur)
+        cur_stat = _proc_stat_fields(cur)
+        if cur_stat is None:
+            break
+        cur = cur_stat[2]
+    _LINEAGE_CACHE = (pid, proc_start, ancestors)
+    return _LINEAGE_CACHE
+
+
+def _is_writer_alive(pid: int, expected_start: int = 0) -> bool:
+    if pid <= 0:
+        return False
+    stat = _proc_stat_fields(pid)
+    if stat is not None:
+        _, state, _, start_ticks = stat
+        if state == "Z":
+            return False
+        return not (expected_start > 0 and start_ticks != expected_start)
+    if not os.path.isdir("/proc"):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    return False
+
+
+def _belongs_to_current_server(ancestors: Sequence[int]) -> bool:
+    if not ancestors:
+        return True
+    my_pid = os.getpid()
+    if my_pid in ancestors:
+        return True
+    my_ppid = os.getppid()
+    if my_ppid > 1 and my_ppid in ancestors:
+        parent_stat = _proc_stat_fields(my_ppid)
+        if parent_stat is not None and parent_stat[0].startswith(("python", "vllm")):
+            return True
+    return False
+
+
+_PADDING_COUNTER_KEYS: tuple[str, ...] = (
+    "prompt_rounds",
+    "prompt_real_tokens",
+    "prompt_filler_tokens",
+    "reply_rounds",
+    "reply_real_tokens",
+    "reply_filler_tokens",
+)
 _IPC_UID_PREFIX = f"{_ipc_base_dir()}/.vllm_tpu_agentic_{os.getuid()}"
 _EVICTION_SYNC_PATH = f"{_IPC_UID_PREFIX}_eviction_state"
+_PADDING_SYNC_PATH = f"{_IPC_UID_PREFIX}_padding_state"
+_PADDING_SYNC_MIN_INTERVAL_S = 0.25
 _MAX_EVICTION_SYNC_BYTES = 524_288
 _COMPACT_RECENT_SESSIONS = 1024
 _INFLIGHT_REQUESTS_MAXSIZE = 16384
@@ -226,6 +313,7 @@ class AgenticTelemetryService:
         span_log_path: str | None = None,
         session_tracker: SessionTurnTracker | None = None,
         eviction_tracker: BlockEvictionTracker | None = None,
+        padding_tracker: TpuPaddingCounterTracker | None = None,
         inflight_maxsize: int = _INFLIGHT_REQUESTS_MAXSIZE,
     ) -> None:
         self.replica_id = replica_id or envs.VLLM_TPU_REPLICA_ID or socket.gethostname()
@@ -249,6 +337,7 @@ class AgenticTelemetryService:
             block_size=resolved_block_size
         )
         self.eviction_tracker = eviction_tracker or BlockEvictionTracker()
+        self.padding_tracker = padding_tracker or TpuPaddingCounterTracker()
         self.category_totals: dict[str, int] = {cat: 0 for cat in CATEGORIES}
         self._inflight: BoundedLRU[str, _InFlightRequestState] = BoundedLRU(
             inflight_maxsize
@@ -256,6 +345,13 @@ class AgenticTelemetryService:
         self._eviction_sync_dirty: bool = False
         self._eviction_writer_initialized: bool = False
         self._eviction_sync_cursors: dict[str, tuple[int, int]] = {}
+        self._padding_lock = threading.RLock()
+        self._padding_writer_started_at: float = time.monotonic()
+        self._padding_dp_size: int | None = None
+        self._padding_sync_dirty: bool = False
+        self._padding_dirty_dp_rank: int | None = None
+        self._padding_sync_timer: threading.Timer | None = None
+        self._last_padding_sync_ts: float = 0.0
 
     def _safe_replica_id(self) -> str:
         return _sanitize_replica_id(self.replica_id)
@@ -271,6 +367,213 @@ class AgenticTelemetryService:
     def _eviction_sync_path(self, dp_rank: int | None = None) -> str:
         rank = self._resolved_dp_rank() if dp_rank is None else int(dp_rank)
         return f"{self._eviction_sync_prefix()}_dp{rank}"
+
+    def _padding_sync_prefix(self) -> str:
+        return f"{_PADDING_SYNC_PATH}_{self._safe_replica_id()}"
+
+    def _padding_sync_path(self, dp_rank: int | None = None) -> str:
+        rank = self._resolved_dp_rank() if dp_rank is None else int(dp_rank)
+        return f"{self._padding_sync_prefix()}_dp{rank}_{os.getpid()}"
+
+    def _write_padding_snapshot_locked(self, rank: int, now: float) -> None:
+        pid, proc_start, ancestors = _current_process_lineage()
+        payload: dict[str, Any] = {
+            **self.padding_tracker.as_dict(),
+            "dp_rank": rank,
+            "pid": pid,
+            "proc_start": proc_start,
+            "ancestors": ancestors,
+            "started_at": self._padding_writer_started_at,
+        }
+        if self._padding_dp_size is not None:
+            payload["dp_size"] = self._padding_dp_size
+        self._last_padding_sync_ts = now
+        self._padding_sync_dirty = False
+        _atomic_write_text(
+            self._padding_sync_path(rank),
+            json.dumps(payload, separators=(",", ":")),
+        )
+
+    def _prune_stale_padding_files_locked(self) -> None:
+        prefix = f"{self._padding_sync_prefix()}_dp"
+        for sync_path in glob.glob(f"{prefix}*"):
+            if ".tmp." in sync_path:
+                continue
+            try:
+                with open(sync_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, Mapping):
+                    continue
+                pid = data.get("pid")
+                proc_start = int(data.get("proc_start", 0) or 0)
+                if isinstance(pid, int) and not _is_writer_alive(pid, proc_start):
+                    with contextlib.suppress(OSError):
+                        os.unlink(sync_path)
+                    continue
+                ancestors = data.get("ancestors")
+                if isinstance(ancestors, list) and not _belongs_to_current_server(
+                    ancestors
+                ):
+                    continue
+                file_rank = int(data.get("dp_rank", -1))
+                file_started = float(data.get("started_at", 0.0) or 0.0)
+                if (
+                    self._padding_dp_size is not None
+                    and file_rank >= self._padding_dp_size
+                    and file_started < self._padding_writer_started_at
+                ):
+                    with contextlib.suppress(OSError):
+                        os.unlink(sync_path)
+            except (OSError, ValueError, TypeError):
+                pass
+
+    def init_padding_sync_writer(
+        self, dp_rank: int | None = None, dp_size: int | None = None
+    ) -> None:
+        """Initialize or replace this DP engine's `/dev/shm` padding snapshot."""
+        if not envs.VLLM_TPU_AGENTIC_TELEMETRY:
+            return
+        with self._padding_lock:
+            if dp_size is not None:
+                self._padding_dp_size = max(1, int(dp_size))
+            rank = self._resolved_dp_rank() if dp_rank is None else int(dp_rank)
+            if rank == 0:
+                self._prune_stale_padding_files_locked()
+            self._write_padding_snapshot_locked(rank, time.monotonic())
+            # Allow the first live round after warmup to flush immediately.
+            self._last_padding_sync_ts = 0.0
+
+    def _flush_deferred_padding_sync(self) -> None:
+        with self._padding_lock:
+            self._padding_sync_timer = None
+            if not self._padding_sync_dirty or not envs.VLLM_TPU_AGENTIC_TELEMETRY:
+                return
+            rank = (
+                self._resolved_dp_rank()
+                if self._padding_dirty_dp_rank is None
+                else self._padding_dirty_dp_rank
+            )
+            self._write_padding_snapshot_locked(rank, time.monotonic())
+
+    def flush_padding_sync(self, dp_rank: int | None = None) -> None:
+        """Immediately write any rate-limited pending padding counters to IPC."""
+        with self._padding_lock:
+            if self._padding_sync_timer is not None:
+                self._padding_sync_timer.cancel()
+                self._padding_sync_timer = None
+            if not self._padding_sync_dirty or not envs.VLLM_TPU_AGENTIC_TELEMETRY:
+                return
+            rank = (
+                int(dp_rank)
+                if dp_rank is not None
+                else (
+                    self._resolved_dp_rank()
+                    if self._padding_dirty_dp_rank is None
+                    else self._padding_dirty_dp_rank
+                )
+            )
+            self._write_padding_snapshot_locked(rank, time.monotonic())
+
+    def on_tpu_round_padded(
+        self,
+        scheduled_tokens: int,
+        padded_tokens: int,
+        *,
+        is_prompt_round: bool,
+        sync_ipc: bool = True,
+        dp_rank: int | None = None,
+        dp_size: int | None = None,
+    ) -> None:
+        """Record one TPU round's real vs filler tokens and rate-limit IPC sync."""
+        with self._padding_lock:
+            self.padding_tracker.record_round(
+                scheduled_tokens,
+                padded_tokens,
+                is_prompt_round=is_prompt_round,
+            )
+            if dp_size is not None:
+                self._padding_dp_size = max(1, int(dp_size))
+            if not sync_ipc or not envs.VLLM_TPU_AGENTIC_TELEMETRY:
+                return
+            rank = self._resolved_dp_rank() if dp_rank is None else int(dp_rank)
+            now = time.monotonic()
+            elapsed = now - self._last_padding_sync_ts
+            if self._last_padding_sync_ts == 0.0 or (
+                elapsed >= _PADDING_SYNC_MIN_INTERVAL_S
+            ):
+                if self._padding_sync_timer is not None:
+                    self._padding_sync_timer.cancel()
+                    self._padding_sync_timer = None
+                self._write_padding_snapshot_locked(rank, now)
+                return
+            self._padding_sync_dirty = True
+            self._padding_dirty_dp_rank = rank
+            if self._padding_sync_timer is None:
+                delay = max(0.001, _PADDING_SYNC_MIN_INTERVAL_S - elapsed)
+                timer = threading.Timer(delay, self._flush_deferred_padding_sync)
+                timer.daemon = True
+                self._padding_sync_timer = timer
+                timer.start()
+
+    def sync_padding_state(self) -> dict[str, int]:
+        """Sum TPU round padding counters across live DP engine shared-memory files."""
+        if not envs.VLLM_TPU_AGENTIC_TELEMETRY:
+            return self.padding_tracker.as_dict()
+        prefix = f"{self._padding_sync_prefix()}_dp"
+        paths = [p for p in sorted(glob.glob(f"{prefix}*")) if ".tmp." not in p]
+        if not paths:
+            return self.padding_tracker.as_dict()
+        best_by_rank: dict[int, tuple[float, int | None, dict[str, int]]] = {}
+        for sync_path in paths:
+            try:
+                with open(sync_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, Mapping):
+                    continue
+                pid = data.get("pid")
+                proc_start = int(data.get("proc_start", 0) or 0)
+                if isinstance(pid, int) and not _is_writer_alive(pid, proc_start):
+                    with contextlib.suppress(OSError):
+                        os.unlink(sync_path)
+                    continue
+                ancestors = data.get("ancestors")
+                if isinstance(ancestors, list) and not _belongs_to_current_server(
+                    ancestors
+                ):
+                    continue
+                raw_rank = data.get("dp_rank")
+                if raw_rank is None:
+                    suffix = sync_path[len(prefix) :].split("_", 1)[0]
+                    rank = int(suffix)
+                else:
+                    rank = int(raw_rank)
+                started_at = float(data.get("started_at", 0.0) or 0.0)
+                raw_dp_size = data.get("dp_size")
+                dp_size = int(raw_dp_size) if raw_dp_size is not None else None
+                counts = {
+                    k: max(0, int(data.get(k, 0) or 0)) for k in _PADDING_COUNTER_KEYS
+                }
+                prev = best_by_rank.get(rank)
+                if prev is None or started_at >= prev[0]:
+                    best_by_rank[rank] = (started_at, dp_size, counts)
+            except (OSError, ValueError, TypeError):
+                pass
+        if not best_by_rank:
+            return self.padding_tracker.as_dict()
+        newest_started, newest_dp_size, _ = max(
+            best_by_rank.values(), key=lambda item: item[0]
+        )
+        totals: dict[str, int] = {k: 0 for k in _PADDING_COUNTER_KEYS}
+        for rank, (started_at, _, counts) in best_by_rank.items():
+            if (
+                newest_dp_size is not None
+                and rank >= newest_dp_size
+                and started_at < newest_started
+            ):
+                continue
+            for key, val in counts.items():
+                totals[key] += val
+        return totals
 
     def flush_eviction_sync(self) -> None:
         """Flush changed per-session eviction deltas after each eviction batch."""
@@ -718,6 +1021,9 @@ def reset_telemetry_service(
 ) -> AgenticTelemetryService:
     """Reset or replace the process-local telemetry service (for testing)."""
     global _SERVICE
+    if _SERVICE is not None and _SERVICE._padding_sync_timer is not None:
+        _SERVICE._padding_sync_timer.cancel()
+        _SERVICE._padding_sync_timer = None
     _SERVICE = service if service is not None else AgenticTelemetryService()
     return _SERVICE
 
@@ -1283,6 +1589,7 @@ def install_agentic_telemetry_patches() -> None:
         return
 
     patch_trace_headers()
+    register_tpu_padding_collector()
     try:
         patch_block_pool()
     except ImportError as exc:

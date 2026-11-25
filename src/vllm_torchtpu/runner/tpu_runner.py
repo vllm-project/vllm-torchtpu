@@ -937,6 +937,7 @@ class TPUModelRunner(GPUModelRunner):
         # Layout plan of the most recent prepared batch; None before the
         # first execute_model.
         self._last_sequence_layout_plan = None
+        self._agentic_padding_recorder: Any = None
 
         # Block-major KV cache (opt-in via VLLM_TPU_BLOCK_MAJOR_KV). When
         # enabled, `_initialize_kv_cache_states` allocates a single bundled tensor
@@ -3912,6 +3913,17 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         self._collect_mamba_state_seed_copies(scheduler_output, start_index, num_reqs)
+
+        record_padding = getattr(self, "_agentic_padding_recorder", None)
+        if record_padding is not None:
+            record_padding(
+                self,
+                end_index=end_index,
+                num_decode_reqs=num_decode_reqs,
+                num_windowed_reqs=num_windowed_reqs,
+                real_tokens=global_num_tokens,
+                padded_tokens=padded_total_num_scheduled_tokens,
+            )
 
         return (
             per_layer_attn_metadata,
@@ -7484,6 +7496,7 @@ class TPUModelRunner(GPUModelRunner):
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
+        self._agentic_padding_recorder = None
         self._add_pipeline_chunk_buckets()
         if self.parallel_config.pipeline_parallel_size > 1 and self._pp_handoff is None:
             self._pp_intermediate_tensors(1, zeros=True)
@@ -7505,6 +7518,7 @@ class TPUModelRunner(GPUModelRunner):
             )
             self._pp_handoff.warmup()
         if self.enforce_eager:
+            self._enable_agentic_padding_telemetry()
             return
         if self.lora_config is not None:
             lora_manager = self.lora_manager
@@ -7556,6 +7570,20 @@ class TPUModelRunner(GPUModelRunner):
                 self._warmup_spec_decode()
                 if self._adaptive_verification is not None:
                     self._init_adaptive_verification()
+
+        self._enable_agentic_padding_telemetry()
+
+    def _enable_agentic_padding_telemetry(self) -> None:
+        """Enable host-side bucket padding counters once warmup completes."""
+        if not envs.VLLM_TPU_AGENTIC_TELEMETRY:
+            return
+        from vllm_torchtpu.telemetry.padding_metrics import (
+            finish_tpu_padding_warmup,
+            record_tpu_round_padding,
+        )
+
+        finish_tpu_padding_warmup(self)
+        self._agentic_padding_recorder = record_tpu_round_padding
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
