@@ -805,7 +805,10 @@ class DeviceDecodeController:
         if inputs.positions.dim() == 1:
             checks = [("position", host(inputs.positions), num_computed)]
         else:
-            # The M-RoPE positions the stock path stages for the step.
+            # The M-RoPE positions the stock path stages for the step. Writing
+            # them into the runner's host staging buffer is safe: `try_execute`
+            # has waited on the input-staging fence, and a device step uploads
+            # nothing from that buffer.
             r._calc_mrope_positions(scheduler_output)
             device = inputs.positions.cpu().numpy()
             checks = [
