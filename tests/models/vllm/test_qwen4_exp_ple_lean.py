@@ -458,3 +458,28 @@ def test_short_conv_pleconv_bitwise(monkeypatch, T, R, fast):
     for owned in (False, True):
         for a, b in zip(outs[("", owned)], outs[("pleconv", owned)], strict=True):
             assert np.array_equal(np.asarray(a).view(np.uint16), np.asarray(b).view(np.uint16))
+
+
+@pytest.mark.parametrize("fast", [False, True], ids=["plain", "hist_fast"])
+@pytest.mark.parametrize("T,R", [(16, 4), (32, 8), (40, 10), (96, 24), (128, 32)])
+def test_short_conv_pleconv_row_cap(monkeypatch, T, R, fast):
+    """pleconv traces the lean conv only up to VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS
+    step rows (the traced program is the stock one above it), and every arm gives the
+    stock bytes."""
+    monkeypatch.setattr(envs, "VLLM_TPU_PLE_CONV_HISTORY_FAST", fast)
+    gen = np.random.default_rng(T * 7 + R)
+    x, w, hist, qsl, ids, initial, dil = _conv_inputs(gen, T, R, slots=max(40, R + 2))
+    args = (x, w, hist, qsl, ids, initial)
+
+    def trace(lean, cap):
+        monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN", lean)
+        monkeypatch.setattr(envs, "VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS", cap)
+        fn = lambda *a: kple.short_conv(*a, dilation=dil, request_owned_history=True)  # noqa: E731
+        return jax.jit(fn).lower(*args).as_text(), fn(*args)
+
+    stock_hlo, stock = trace("", 32)
+    for cap in (32, 256):
+        hlo, out = trace("all", cap)
+        assert (hlo == stock_hlo) == (T > cap), (T, cap)
+        for a, b in zip(stock, out, strict=True):
+            assert np.array_equal(np.asarray(a).view(np.uint16), np.asarray(b).view(np.uint16))
