@@ -477,6 +477,10 @@ class TpuPlatform(Platform):
         "deepseek_v4_fp8",
     ]
 
+    # Knobs every rank must see the same way: forwarded to vLLM's Ray
+    # data-parallel engine actors (`_forward_knobs_to_ray_dp_actors`), except
+    # the host topology in `_HOST_ENV_VARS` and the names this package writes
+    # itself (`PACKAGE_WRITTEN_ENV_VARS`).
     additional_env_vars: list[str] = [
         "TPU_CHIPS_PER_HOST_BOUNDS",
         "TPU_HOST_BOUNDS",
@@ -513,7 +517,19 @@ class TpuPlatform(Platform):
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
+        "USE_MOE_FUSED_EP_KERNEL",
+        "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE",
+        "RAGGED_GATHER_REDUCE_VERSION",
+        "TPU_MOE_HASH_TABLE_ROW_MAJOR",
+        "TPU_MOE_SKIP_PADDED_TOKENS",
+        "TPU_ROPE_CACHE_ROW_MAJOR",
+        "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE",
     ]
+    # Topology each TPU host or pod is given for itself (device plugins, GKE):
+    # the driver's values would override another host's own. The backend
+    # selectors (TPU_MULTIHOST_BACKEND, TPU_BACKEND_TYPE) are the same on every
+    # host and are forwarded.
+    _HOST_ENV_VARS = frozenset({"TPU_CHIPS_PER_HOST_BOUNDS", "TPU_HOST_BOUNDS"})
 
     @classmethod
     def pre_register_and_update(
@@ -816,6 +832,36 @@ class TpuPlatform(Platform):
         return ()
 
     @classmethod
+    def _forward_knobs_to_ray_dp_actors(cls, vllm_config: VllmConfig) -> None:
+        """Add this package's set knobs to the env vars vLLM copies to its Ray
+        data-parallel engine actors.
+
+        Those actors get only vLLM's own names and the ones listed in
+        VLLM_RAY_EXTRA_ENV_VARS_TO_COPY (vllm/ray/ray_env.py), so they would
+        otherwise build with this package's defaults. The front end reads the
+        list when it starts the actors, after this runs. Names this package
+        writes itself are derived again in every process, and the host
+        topology is each host's own; both stay out.
+        """
+        from vllm_torchtpu.env_validation import PACKAGE_WRITTEN_ENV_VARS
+
+        if vllm_config.parallel_config.data_parallel_backend != "ray":
+            return
+        listed = vllm_envs.VLLM_RAY_EXTRA_ENV_VARS_TO_COPY
+        names = [name.strip() for name in listed.split(",") if name.strip()]
+        # Copies the names that are set; reads no values.
+        added = [
+            name
+            for name in cls.additional_env_vars
+            if name in os.environ
+            and name not in PACKAGE_WRITTEN_ENV_VARS
+            and name not in cls._HOST_ENV_VARS
+            and name not in names
+        ]
+        if added:
+            os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(names + added)
+
+    @classmethod
     def known_env_var_names(cls) -> set[str]:
         """Names this package reads or writes. Subclasses may extend it."""
         from vllm_torchtpu.env_validation import PACKAGE_WRITTEN_ENV_VARS
@@ -882,6 +928,7 @@ class TpuPlatform(Platform):
         # Apply before VllmConfig is pickled so EngineCore and all workers see
         # the same setting.
         apply_eagle_block_drop_override(vllm_config)
+        cls._forward_knobs_to_ray_dp_actors(vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(

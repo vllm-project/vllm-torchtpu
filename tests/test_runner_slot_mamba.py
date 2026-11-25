@@ -246,9 +246,10 @@ class TestRegistration:
         assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
         assert name not in tpu_compiler._tpu_compile_env_factors()
 
-    def test_flag_reaches_ray_workers(self):
-        # The flag is read by the runner on every host; Ray copies only VLLM_*
-        # and the platform's additional_env_vars to remote workers.
+    def test_flag_reaches_ray_dp_engine_actors(self):
+        # The flag is read by the runner on every host; vLLM's Ray data-parallel
+        # engine actors get only VLLM_* names and the ones the platform forwards
+        # from additional_env_vars.
         assert "TPU_SKIP_MAMBA_SCHEDULER_BLOCKS" in TpuPlatform.additional_env_vars
 
     def test_grouping_keeps_spec_class(self):
