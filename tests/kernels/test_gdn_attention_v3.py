@@ -881,7 +881,7 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
     """CPU checks for single-token decode [k, q] projection fusion."""
 
     def test_recurrent_gdn_fused_qk_decode_contraction(self):
-        """Decode recurrence fuses [k, q] state contractions into one dot_general."""
+        """Decode recurrence fuses [k, q] state contractions per streamed head pair."""
         seq_tile = 4
         n_kq, n_v, d_k, d_v = 2, 8, 128, 128
         dim = 2 * n_kq * d_k + n_v * d_v
@@ -951,11 +951,12 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
             dot_eqns = [
                 eqn for eqn in jaxpr.jaxpr.eqns if eqn.primitive.name == "dot_general"
             ]
-            self.assertLen(dot_eqns, 1)
-            self.assertEqual(dot_eqns[0].invars[0].aval.shape, (seq_tile * n_v, 2, d_k))
-            self.assertEqual(
-                dot_eqns[0].invars[1].aval.shape, (seq_tile * n_v, d_k, d_v)
-            )
+            # Default sub_block_heads=2 streams value heads in pairs per sequence,
+            # issuing one fused [k, q] contraction per head pair.
+            self.assertLen(dot_eqns, seq_tile * (n_v // 2))
+            for eqn in dot_eqns:
+                self.assertEqual(eqn.invars[0].aval.shape, (2, 2, d_k))
+                self.assertEqual(eqn.invars[1].aval.shape, (2, d_k, d_v))
 
             out_fused, state_fused = compute_gdn.recurrent_gdn(*args)
 
@@ -1003,6 +1004,267 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
             np.testing.assert_allclose(
                 state_fused[2, 0], state_prev[2], rtol=0.0, atol=0.0
             )
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name="decode_ratio_1",
+            n_kq=4,
+            n_v=4,
+            window_size=1,
+            real_sizes=(1, 0),
+        ),
+        dict(
+            testcase_name="decode_ratio_2",
+            n_kq=2,
+            n_v=4,
+            window_size=1,
+            real_sizes=(1, 1),
+        ),
+        dict(
+            testcase_name="decode_ratio_4",
+            n_kq=1,
+            n_v=4,
+            window_size=1,
+            real_sizes=(1, 0),
+        ),
+        dict(
+            testcase_name="decode_ratio_8",
+            n_kq=1,
+            n_v=8,
+            window_size=1,
+            real_sizes=(1, 1),
+        ),
+        dict(
+            testcase_name="decode_odd_v_heads_tail_sub_block",
+            n_kq=1,
+            n_v=5,
+            window_size=1,
+            real_sizes=(1, 1),
+        ),
+        dict(
+            testcase_name="verify_window_4_ragged",
+            n_kq=2,
+            n_v=8,
+            window_size=4,
+            real_sizes=(4, 2),
+        ),
+        dict(
+            testcase_name="verify_window_4_bf16",
+            n_kq=2,
+            n_v=8,
+            window_size=4,
+            real_sizes=(4, 2),
+            compute_dtype=jnp.bfloat16,
+        ),
+    )
+    def test_recurrent_gdn_streamed_callbacks_bit_identical_to_in_memory(
+        self, n_kq, n_v, window_size, real_sizes, compute_dtype=jnp.float32
+    ):
+        """Callback streaming matches in-memory state_prev and two-dot reference."""
+        seq_tile = len(real_sizes)
+        d_k, d_v = 32, 32
+        f32 = jnp.dtype(jnp.float32)
+        comp = jnp.dtype(compute_dtype)
+        cfg = config.GDNConfig(
+            mode=config.GDNMode.BATCHED,
+            dtypes=config.Dtypes(f32, jnp.dtype(jnp.bfloat16), comp, f32, f32),
+            batch_size=seq_tile * window_size,
+            dim_size=2 * n_kq * d_k + n_v * d_v,
+            kernel_size=4,
+            tile_size=seq_tile,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=d_k,
+            v_head_dim=d_v,
+            window_size=window_size,
+        )
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            aligned_v = cfg.aligned_num_v_heads
+            rngs = iter(jax.random.split(jax.random.key(19 + n_v + window_size), 8))
+            rs_arr = jnp.array(real_sizes, dtype=jnp.int32)
+            q_c = jax.random.normal(
+                next(rngs), (seq_tile, n_kq, window_size, 1, d_k), dtype=jnp.float32
+            )
+            k_c = jax.random.normal(
+                next(rngs), (seq_tile, n_kq, window_size, 1, d_k), dtype=jnp.float32
+            )
+            v_c = jax.random.normal(
+                next(rngs), (seq_tile, n_v, window_size, 1, d_v), dtype=jnp.float32
+            )
+            b_c = jax.random.normal(
+                next(rngs), (seq_tile, 1, window_size, 1, aligned_v), dtype=jnp.float32
+            )
+            a_c = jax.random.normal(
+                next(rngs), (seq_tile, 1, window_size, 1, aligned_v), dtype=jnp.float32
+            )
+            state_prev = jax.random.normal(
+                next(rngs), (seq_tile, n_v, d_k, d_v), dtype=jnp.float32
+            )
+            a_log = jax.random.normal(next(rngs), (aligned_v,), dtype=jnp.float32)
+            dt_bias = jax.random.normal(next(rngs), (aligned_v,), dtype=jnp.float32)
+
+            out_mem, states_mem = compute_gdn.recurrent_gdn(
+                rs_arr, q_c, k_c, v_c, b_c, a_c, state_prev, a_log, dt_bias, cfg
+            )
+
+            stored: dict[tuple[int, int, int], jax.Array] = {}
+            visit_order: list[tuple[int, int, int]] = []
+
+            def _store(s: int, v: int, w: int, val: jax.Array) -> None:
+                visit_order.append((s, w, v))
+                stored[s, w, v] = val
+
+            out_cb, states_none = compute_gdn.recurrent_gdn(
+                rs_arr,
+                q_c,
+                k_c,
+                v_c,
+                b_c,
+                a_c,
+                None,
+                a_log,
+                dt_bias,
+                cfg,
+                load_head_fn=lambda s, v: state_prev[s, v],
+                store_ckpt_head_fn=_store,
+            )
+            self.assertIsNone(states_none)
+            states_cb = jnp.stack(
+                [
+                    jnp.stack(
+                        [
+                            jnp.stack([stored[s, w, v] for v in range(n_v)], axis=0)
+                            for w in range(window_size)
+                        ],
+                        axis=0,
+                    )
+                    for s in range(seq_tile)
+                ],
+                axis=0,
+            )
+            np.testing.assert_array_equal(np.asarray(out_cb), np.asarray(out_mem))
+            np.testing.assert_array_equal(np.asarray(states_cb), np.asarray(states_mem))
+            # Heads are written in ascending order within each (seq, window).
+            for s in range(seq_tile):
+                for w in range(window_size):
+                    heads_sw = [v for (si, wi, v) in visit_order if si == s and wi == w]
+                    self.assertEqual(heads_sw, list(range(n_v)))
+
+            # Also verify against the independent two-dot recurrent_gdn_per_seq.
+            mask_dtype = compute_gdn.get_mask_dtype(comp)
+            iota = jax.lax.broadcasted_iota(
+                mask_dtype, (seq_tile, 1, window_size, 1, 1), 2
+            )
+            mask = iota < rs_arr.reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
+            q_m = compute_gdn.l2_norm(jnp.where(mask, q_c.astype(comp), 0)) * (
+                d_k**-0.5
+            )
+            k_m = compute_gdn.l2_norm(jnp.where(mask, k_c.astype(comp), 0))
+            v_m = jnp.where(mask, v_c.astype(comp), 0)
+            k_t = compute_gdn.fused_transpose_broadcast(k_m, src_dim=4, dst_dim=3)
+            beta_ref = compute_gdn.fused_transpose_broadcast(
+                jnp.where(mask, jax.nn.sigmoid(b_c.astype(comp)), 0),
+                src_dim=4,
+                dst_dim=1,
+            )[:, :n_v]
+            glog_ref = compute_gdn.fused_transpose_broadcast(
+                jnp.exp(
+                    jnp.where(
+                        mask,
+                        -jnp.exp(a_log.reshape(1, 1, 1, 1, -1).astype(comp))
+                        * jax.nn.softplus(
+                            a_c.astype(comp)
+                            + dt_bias.reshape(1, 1, 1, 1, -1).astype(comp)
+                        ),
+                        0,
+                    )
+                ),
+                src_dim=4,
+                dst_dim=1,
+            )[:, :n_v]
+            ref_outs, ref_states = [], []
+            for s in range(seq_tile):
+                o_s, st_s = compute_gdn.recurrent_gdn_per_seq(
+                    q_m[s],
+                    k_m[s],
+                    k_t[s],
+                    v_m[s],
+                    glog_ref[s],
+                    beta_ref[s],
+                    state_prev[s],
+                    cfg,
+                )
+                ref_outs.append(o_s)
+                ref_states.append(st_s)
+            tol = 1e-5 if comp == f32 else 2e-2
+            np.testing.assert_allclose(
+                np.asarray(out_mem, dtype=np.float32),
+                np.asarray(jnp.stack(ref_outs, axis=0), dtype=np.float32),
+                rtol=tol,
+                atol=tol,
+            )
+            np.testing.assert_allclose(
+                np.asarray(states_mem, dtype=np.float32),
+                np.asarray(jnp.stack(ref_states, axis=0), dtype=np.float32),
+                rtol=tol,
+                atol=tol,
+            )
+
+    def test_recurrent_gdn_callback_validation_errors(self):
+        f32 = jnp.dtype(jnp.float32)
+        cfg = config.GDNConfig(
+            mode=config.GDNMode.BATCHED,
+            dtypes=config.Dtypes(f32, f32, f32, f32, f32),
+            batch_size=1,
+            dim_size=384,
+            kernel_size=4,
+            tile_size=1,
+            num_kq_heads=1,
+            num_v_heads=1,
+            kq_head_dim=128,
+            v_head_dim=128,
+        )
+        z = jnp.zeros((1, 1, 1, 1, 128), dtype=jnp.float32)
+        rs_arr = jnp.ones((1,), dtype=jnp.int32)
+        st = jnp.zeros((1, 1, 128, 128), dtype=jnp.float32)
+        w = jnp.zeros((128,), dtype=jnp.float32)
+        for bad_sub in (0, -1):
+            with self.assertRaisesRegex(ValueError, "sub_block_heads"):
+                compute_gdn.recurrent_gdn(
+                    rs_arr, z, z, z, z, z, st, w, w, cfg, sub_block_heads=bad_sub
+                )
+        with self.assertRaisesRegex(ValueError, "load_head_fn"):
+            compute_gdn.recurrent_gdn(rs_arr, z, z, z, z, z, None, w, w, cfg)
+
+        def loader(s, v):
+            return st[s, v]
+
+        with self.assertRaisesRegex(ValueError, "load_head_fn"):
+            compute_gdn.recurrent_gdn(  # pyrefly: ignore[no-matching-overload]
+                rs_arr, z, z, z, z, z, None, w, w, cfg, load_head_fn=loader
+            )
+        with self.assertRaisesRegex(ValueError, "cannot be combined with state_prev"):
+            compute_gdn.recurrent_gdn(  # pyrefly: ignore[no-matching-overload]
+                rs_arr, z, z, z, z, z, st, w, w, cfg, load_head_fn=loader
+            )
+        cfg_bad_win = config.GDNConfig(
+            mode=config.GDNMode.PER_SEQ,
+            dtypes=config.Dtypes(f32, f32, f32, f32, f32),
+            batch_size=1,
+            dim_size=384,
+            kernel_size=4,
+            tile_size=1,
+            num_kq_heads=1,
+            num_v_heads=1,
+            kq_head_dim=128,
+            v_head_dim=128,
+            window_size=2,
+        )
+        with self.assertRaisesRegex(ValueError, "window_size"):
+            compute_gdn.recurrent_gdn(rs_arr, z, z, z, z, z, st, w, w, cfg_bad_win)
 
 
 _CHUNKED_IMPLS = (
@@ -2415,3 +2677,69 @@ class GDNAttentionTest(parameterized.TestCase):
         np.testing.assert_allclose(out, out_ref, rtol=2e-2, atol=2e-2)
         np.testing.assert_allclose(conv_out[1], conv_ref[1], rtol=2e-2, atol=2e-2)
         np.testing.assert_allclose(rec_out[1], rec_ref[1], rtol=3e-2, atol=3e-2)
+
+    def test_streamed_recurrent_gdn_nan_init_carry_and_odd_heads(self):
+        """Tests live-VMEM NaN masking, tile carry, and odd n_v in streamed GDN."""
+        rng = np.random.default_rng(113)
+        n_kq, n_v, d_k, d_v, kernel_size = 1, 5, 128, 128, 4
+        dim = (2 * n_kq + n_v) * d_k
+        # With decode_tile_size=1 and 2-slot double buffering:
+        # - Seq 0 (tile 0, VMEM slot 0): has_initial_state=True reads NaNs from HBM
+        #   into VMEM slot 0 so live NaN bits sit in VMEM.
+        # - Seq 1 (tile 1, VMEM slot 1): has_initial_state=True reads finite state.
+        # - Seq 2 (tile 2, VMEM slot 0): has_initial_state=False skips DMA and
+        #   reuses VMEM slot 0, so the kernel must mask the live NaNs in VMEM.
+        # - Seq 3 (PER_SEQ, 3 tokens at mixed_tile_size=1): exercises carry_ref.
+        lengths = [1, 1, 1, 3]
+        tok = sum(lengths)
+        qkv = jnp.asarray(rng.standard_normal((tok, dim)), jnp.bfloat16)
+        b = jnp.asarray(rng.standard_normal((tok, n_v)), jnp.bfloat16)
+        a = jnp.asarray(rng.standard_normal((tok, n_v)), jnp.bfloat16)
+        conv_init = jnp.zeros((5, kernel_size - 1, dim), jnp.float32)
+        finite_state = jnp.asarray(rng.standard_normal((n_v, d_k, d_v)), jnp.float32)
+        rec_ref_init = (
+            jnp.zeros((5, n_v, d_k, d_v), jnp.float32).at[2].set(finite_state)
+        )
+        # Slot 1 holds NaNs (DMA'd into VMEM slot 0 by Seq 0); slots 3 & 4 also
+        # hold NaNs as stale HBM slots for fresh Seqs 2 & 3.
+        rec_poison = (
+            jnp.full((5, n_v, d_k, d_v), jnp.nan, jnp.float32).at[2].set(finite_state)
+        )
+        conv_w = jnp.asarray(rng.standard_normal((dim, 1, kernel_size)), jnp.float32)
+        conv_b = jnp.asarray(rng.standard_normal((dim,)), jnp.float32)
+        a_log = jnp.asarray(rng.uniform(0.0, 1.0, (n_v,)), jnp.float32)
+        dt_bias = jnp.asarray(rng.uniform(-3.0, -1.0, (n_v,)), jnp.float32)
+        common = dict(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_weight=conv_w,
+            conv_bias=conv_b,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=jnp.array([0, 1, 2, 3, tok], dtype=jnp.int32),
+            state_indices=jnp.array([1, 2, 3, 4], dtype=jnp.int32),
+            distribution=jnp.array([3, 4, 4], dtype=jnp.int32),
+            seq_lens=jnp.array([5, 5, 1, 3], dtype=jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        (conv_ref, rec_ref), out_ref = gdn_attention_ref(
+            states=(conv_init, rec_ref_init), **common
+        )
+        (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
+            states=(conv_init.copy(), rec_poison.copy()),
+            decode_tile_size=1,
+            mixed_tile_size=1,
+            **common,
+        )
+        # Seq 0 intentionally consumed NaN initial state; Seqs 1, 2, 3 must be
+        # finite and match reference (proving Seq 2 masked VMEM slot 0's NaNs).
+        self.assertTrue(bool(jnp.all(jnp.isfinite(out[1:]))))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(rec_out[2:]))))
+        np.testing.assert_allclose(out[1:], out_ref[1:], rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(conv_out[2:], conv_ref[2:], rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(rec_out[2:], rec_ref[2:], rtol=3e-2, atol=3e-2)

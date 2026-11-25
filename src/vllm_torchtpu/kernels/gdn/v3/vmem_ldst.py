@@ -145,6 +145,78 @@ def load_and_select_conv_state(
     return real_sizes, prev_conv_state
 
 
+def _select_recurrent_state(
+    raw_hbm: jax.Array,
+    carry: jax.Array | None,
+    has_initial_state: jax.Array,
+    is_first_tile: jax.Array | None,
+    recurrent_state_dtype: jnp.dtype,
+) -> jax.Array:
+    """Unpacks and selects recurrent state from HBM, zeros, or tile carry."""
+    # Mask raw uint32 bits before bitcast so uninitialized VMEM/HBM NaN bit
+    # patterns cannot leak when has_initial_state is False.
+    raw = jnp.where(has_initial_state, raw_hbm, jnp.uint32(0))
+    selected = pltpu.bitcast(raw, recurrent_state_dtype).astype(jnp.float32)
+    if carry is not None and is_first_tile is not None:
+        return jnp.where(is_first_tile, selected, carry)
+    return selected
+
+
+def load_and_select_recurrent_head(
+    recurrent_in_slot_ref: jax.Ref,
+    carry_recurrent_scratch_ref: jax.Ref | None,
+    s: int,
+    v: int,
+    has_initial_state: jax.Array,
+    is_first_tile: jax.Array | None,
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """Loads and selects one value head's recurrent state from HBM or carry."""
+    carry = (
+        carry_recurrent_scratch_ref[s, v]
+        if carry_recurrent_scratch_ref is not None
+        else None
+    )
+    return _select_recurrent_state(
+        recurrent_in_slot_ref[s, 0, v],
+        carry,
+        has_initial_state,
+        is_first_tile,
+        cfg.dtypes.recurrent_state,
+    )
+
+
+def store_recurrent_head(
+    recurrent_out_slot_ref: jax.Ref,
+    carry_recurrent_scratch_ref: jax.Ref | None,
+    s: int,
+    v: int,
+    w_idx: int,
+    state: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    """Stores one value head's updated recurrent state to VMEM and carry."""
+    if carry_recurrent_scratch_ref is not None and w_idx == cfg.window_size - 1:
+        carry_recurrent_scratch_ref[s, v] = state
+    recurrent_out_slot_ref[s, w_idx, v] = pltpu.bitcast(
+        state.astype(cfg.dtypes.recurrent_state), jnp.uint32
+    )
+
+
+def store_recurrent_state(
+    recurrent_out_slot_ref: jax.Ref,
+    carry_recurrent_scratch_ref: jax.Ref | None,
+    new_recurrent_state: jax.Array,
+    cfg: config.GDNConfig,
+) -> None:
+    """Stores full updated recurrent state to VMEM and the carry scratchpad."""
+    recurrent_out_slot_ref[...] = pltpu.bitcast(
+        new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
+    )
+    if carry_recurrent_scratch_ref is not None:
+        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+
+
 def load_and_select_recurrent_state(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
@@ -177,23 +249,26 @@ def load_and_select_recurrent_state(
 
     for idx in range(cfg.seq_tile_size):
         s_idx = metadata_ref.p_id_to_s_idx[p_id, idx]
-        is_first_tile = metadata_ref.p_id_is_first_tile[p_id, idx]
+        is_first_tile = (
+            metadata_ref.p_id_is_first_tile[p_id, idx]
+            if carry_recurrent_scratch_ref is not None
+            else None
+        )
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
-
-        # Unpack the uint32 words to the state dtype, then upcast because
-        # compute runs in fp32.
-        hbm_recurrent_state = pltpu.bitcast(
-            recurrent_in_slot_ref[idx, 0], cfg.dtypes.recurrent_state
-        ).astype(jnp.float32)
-        prev_recurrent_state = jnp.where(has_initial_state, hbm_recurrent_state, 0)
-
-        if carry_recurrent_scratch_ref is not None:
-            prev_tile_recurrent_scratch = carry_recurrent_scratch_ref[idx]
-            prev_recurrent_state = jnp.where(
-                is_first_tile, prev_recurrent_state, prev_tile_recurrent_scratch
+        carry = (
+            carry_recurrent_scratch_ref[idx]
+            if carry_recurrent_scratch_ref is not None
+            else None
+        )
+        prev_recurrent_state_list.append(
+            _select_recurrent_state(
+                recurrent_in_slot_ref[idx, 0],
+                carry,
+                has_initial_state,
+                is_first_tile,
+                cfg.dtypes.recurrent_state,
             )
-
-        prev_recurrent_state_list.append(prev_recurrent_state)
+        )
 
     return jnp.stack(prev_recurrent_state_list, axis=0)
 

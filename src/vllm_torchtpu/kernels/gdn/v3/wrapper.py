@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import functools
 
 import jax
@@ -33,6 +34,165 @@ from vllm_torchtpu.kernels.gdn.v3 import (
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclasses.dataclass(frozen=True)
+class _TileContext:
+    """Tile VMEM refs and post-Conv1D tensors passed to an attention stage."""
+
+    p_id: jax.Array
+    real_sizes: jax.Array
+    qkv_out_compact: jax.Array
+    qkv_slot_ref: jax.Ref
+    b_slot_ref: jax.Ref
+    a_slot_ref: jax.Ref
+    recurrent_in_slot_ref: jax.Ref
+    out_slot_ref: jax.Ref
+    recurrent_out_slot_ref: jax.Ref
+    metadata_ref: memory_ref.MetadataRef
+    carry_recurrent_scratch_ref: jax.Ref | None
+    qkv_pad_scratch_ref: jax.Ref | None
+    a_log: jax.Array
+    dt_bias: jax.Array
+    cfg: config.GDNConfig
+
+
+def _run_streamed_recurrent_gdn(ctx: _TileContext) -> None:
+    """Runs recurrent GDN via VMEM callbacks (head pairs on 1-token decode)."""
+    cfg = ctx.cfg
+    q_compact, k_compact, v_compact, b_compact, a_compact = (
+        vmem_ldst.load_activation_as_compact(
+            qkv_vreg=ctx.qkv_out_compact,
+            qkv_vmem_ref=ctx.qkv_slot_ref,
+            b_vmem_ref=ctx.b_slot_ref,
+            a_vmem_ref=ctx.a_slot_ref,
+            cfgs=cfg,
+        )
+    )
+    seq_s_idx = [
+        ctx.metadata_ref.p_id_to_s_idx[ctx.p_id, s] for s in range(cfg.seq_tile_size)
+    ]
+    seq_has_init = [
+        ctx.metadata_ref.s_idx_has_initial_state[s_idx] for s_idx in seq_s_idx
+    ]
+    seq_is_first_tile = (
+        [
+            ctx.metadata_ref.p_id_is_first_tile[ctx.p_id, s]
+            for s in range(cfg.seq_tile_size)
+        ]
+        if ctx.carry_recurrent_scratch_ref is not None
+        else None
+    )
+
+    def _load_rec_head(s: int, v: int) -> jax.Array:
+        return vmem_ldst.load_and_select_recurrent_head(
+            recurrent_in_slot_ref=ctx.recurrent_in_slot_ref,
+            carry_recurrent_scratch_ref=ctx.carry_recurrent_scratch_ref,
+            s=s,
+            v=v,
+            has_initial_state=seq_has_init[s],
+            is_first_tile=(
+                seq_is_first_tile[s] if seq_is_first_tile is not None else None
+            ),
+            cfg=cfg,
+        )
+
+    def _store_ckpt_head(s: int, v: int, w_idx: int, state_j: jax.Array) -> None:
+        vmem_ldst.store_recurrent_head(
+            recurrent_out_slot_ref=ctx.recurrent_out_slot_ref,
+            carry_recurrent_scratch_ref=ctx.carry_recurrent_scratch_ref,
+            s=s,
+            v=v,
+            w_idx=w_idx,
+            state=state_j,
+            cfg=cfg,
+        )
+
+    out, _ = compute_gdn.recurrent_gdn(
+        real_sizes=ctx.real_sizes,
+        q_compact=q_compact,
+        k_compact=k_compact,
+        v_compact=v_compact,
+        b_compact=b_compact,
+        a_compact=a_compact,
+        state_prev=None,
+        a_log=ctx.a_log,
+        dt_bias=ctx.dt_bias,
+        cfg=cfg,
+        load_head_fn=_load_rec_head,
+        store_ckpt_head_fn=_store_ckpt_head,
+    )
+    ctx.out_slot_ref[...] = out.astype(ctx.out_slot_ref.dtype)
+
+
+def _run_bulk_attention(ctx: _TileContext) -> None:
+    """Runs full-state attention (KDA or sequential chunked GDN)."""
+    cfg = ctx.cfg
+    prev_recurrent = vmem_ldst.load_and_select_recurrent_state(
+        metadata_ref=ctx.metadata_ref,
+        p_id=ctx.p_id,
+        recurrent_in_slot_ref=ctx.recurrent_in_slot_ref,
+        carry_recurrent_scratch_ref=ctx.carry_recurrent_scratch_ref,
+        cfg=cfg,
+    )
+    # Non-KDA recurrent GDN is dispatched to _run_streamed_recurrent_gdn.
+    if cfg.use_recurrent:
+        assert cfg.is_kda, (
+            "Non-KDA recurrent GDN must route to _run_streamed_recurrent_gdn."
+        )
+        q_compact, k_compact, v_compact, b_compact, a_compact = (
+            vmem_ldst.load_activation_as_compact(
+                qkv_vreg=ctx.qkv_out_compact,
+                qkv_vmem_ref=ctx.qkv_slot_ref,
+                b_vmem_ref=ctx.b_slot_ref,
+                a_vmem_ref=ctx.a_slot_ref,
+                cfgs=cfg,
+            )
+        )
+        out, new_recurrent_state = compute_kda.recurrent_kda(
+            q_compact=q_compact,
+            k_compact=k_compact,
+            v_compact=v_compact,
+            b_compact=b_compact,
+            a_compact=a_compact,
+            state_prev=prev_recurrent,
+            a_log=ctx.a_log,
+            dt_bias=ctx.dt_bias,
+            cfg=cfg,
+            real_sizes=ctx.real_sizes,
+        )
+    else:
+        chunked_fn = compute_kda.chunked_kda if cfg.is_kda else compute_gdn.chunked_gdn
+        q_large, k_large, v_large, b_large, a_large = (
+            vmem_ldst.load_activation_as_large(
+                qkv_vreg=ctx.qkv_out_compact,
+                qkv_vmem_ref=ctx.qkv_slot_ref,
+                b_vmem_ref=ctx.b_slot_ref,
+                a_vmem_ref=ctx.a_slot_ref,
+                cfgs=cfg,
+                qkv_pad_vmem_ref=ctx.qkv_pad_scratch_ref,
+            )
+        )
+        out, new_recurrent_state = chunked_fn(
+            q_large=q_large,
+            k_large=k_large,
+            v_large=v_large,
+            b_large=b_large,
+            a_large=a_large,
+            state_prev=prev_recurrent,
+            a_log=ctx.a_log,
+            dt_bias=ctx.dt_bias,
+            cfg=cfg,
+            real_sizes=ctx.real_sizes,
+        )
+
+    ctx.out_slot_ref[...] = out.astype(ctx.out_slot_ref.dtype)
+    vmem_ldst.store_recurrent_state(
+        recurrent_out_slot_ref=ctx.recurrent_out_slot_ref,
+        carry_recurrent_scratch_ref=ctx.carry_recurrent_scratch_ref,
+        new_recurrent_state=new_recurrent_state,
+        cfg=cfg,
+    )
 
 
 def inner_kernel(
@@ -100,13 +260,6 @@ def inner_kernel(
         carry_conv_scratch_ref=carry_conv_scratch_ref,
         cfg=cfg,
     )
-    prev_recurrent = vmem_ldst.load_and_select_recurrent_state(
-        metadata_ref=metadata_ref,
-        p_id=p_id,
-        recurrent_in_slot_ref=recurrent_in_slot_ref,
-        carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
-        cfg=cfg,
-    )
 
     # Step 1: Conv1D.
     # NOTE: Conv1D requires performing sliding window where inputs are slided
@@ -140,9 +293,7 @@ def inner_kernel(
     # Apply activation function.
     qkv_out_compact = jax.nn.silu(qkv_out_compact)
 
-    # Step 2: GDN.
-
-    # Prepare gdn weights.
+    # Step 2: GDN / KDA.
     if cfg.is_kda:
         # KDA reshapes these per (head, channel) rather than padding out to
         # a lane multiple over heads.
@@ -153,71 +304,27 @@ def inner_kernel(
         a_log = jnp.pad(weights_ref.gdn.a_log[...], ((0, padding_size)))
         dt_bias = jnp.pad(weights_ref.gdn.dt_bias[...], ((0, padding_size)))
 
-    # NOTE: Ideally, we want to move this branching logic into gdn.py. However,
-    # load_activation_as_compact and load_activation_as_large leverages vmem ldst.
-    # Passing refs into gdn.py breaks strict separation of concerns.
-    if cfg.use_recurrent:
-        recurrent_fn = (
-            compute_kda.recurrent_kda if cfg.is_kda else compute_gdn.recurrent_gdn
-        )
-        q_compact, k_compact, v_compact, b_compact, a_compact = (
-            vmem_ldst.load_activation_as_compact(
-                qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
-                b_vmem_ref=b_slot_ref,
-                a_vmem_ref=a_slot_ref,
-                cfgs=cfg,
-            )
-        )
-
-        out, new_recurrent_state = recurrent_fn(
-            q_compact=q_compact,
-            k_compact=k_compact,
-            v_compact=v_compact,
-            b_compact=b_compact,
-            a_compact=a_compact,
-            state_prev=prev_recurrent,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            cfg=cfg,
-            real_sizes=real_sizes,
-        )
-
-    else:
-        chunked_fn = compute_kda.chunked_kda if cfg.is_kda else compute_gdn.chunked_gdn
-        q_large, k_large, v_large, b_large, a_large = (
-            vmem_ldst.load_activation_as_large(
-                qkv_vreg=qkv_out_compact,
-                qkv_vmem_ref=qkv_slot_ref,
-                b_vmem_ref=b_slot_ref,
-                a_vmem_ref=a_slot_ref,
-                cfgs=cfg,
-                qkv_pad_vmem_ref=qkv_pad_scratch_ref,
-            )
-        )
-
-        out, new_recurrent_state = chunked_fn(
-            q_large=q_large,
-            k_large=k_large,
-            v_large=v_large,
-            b_large=b_large,
-            a_large=a_large,
-            state_prev=prev_recurrent,
-            a_log=a_log,
-            dt_bias=dt_bias,
-            cfg=cfg,
-            real_sizes=real_sizes,
-        )
-
-    # Store output and recurrent to vmem.
-    out_slot_ref[...] = out.astype(out_slot_ref.dtype)
-    # Round to the state dtype, then pack into the uint32 window.
-    recurrent_out_slot_ref[...] = pltpu.bitcast(
-        new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
+    ctx = _TileContext(
+        p_id=p_id,
+        real_sizes=real_sizes,
+        qkv_out_compact=qkv_out_compact,
+        qkv_slot_ref=qkv_slot_ref,
+        b_slot_ref=b_slot_ref,
+        a_slot_ref=a_slot_ref,
+        recurrent_in_slot_ref=recurrent_in_slot_ref,
+        out_slot_ref=out_slot_ref,
+        recurrent_out_slot_ref=recurrent_out_slot_ref,
+        metadata_ref=metadata_ref,
+        carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
+        qkv_pad_scratch_ref=qkv_pad_scratch_ref,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        cfg=cfg,
     )
-
-    if carry_recurrent_scratch_ref is not None:
-        carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
+    if cfg.use_recurrent and not cfg.is_kda:
+        _run_streamed_recurrent_gdn(ctx)
+    else:
+        _run_bulk_attention(ctx)
 
 
 def outer_kernel(
