@@ -859,13 +859,6 @@ def fused_conv1d_gdn(
         d_k=d_k,
         d_v=d_v,
     )
-    gdn_prefill_mode = _resolve_gdn_prefill_mode(
-        gdn_prefill_mode,
-        attention_mode=attention_mode,
-        state_fmt=state_fmt,
-        d_k=d_k,
-        d_v=d_v,
-    )
 
     qkv = qkv.astype(kernel_act_dtype)
     b = b.astype(kernel_act_dtype)
@@ -927,6 +920,13 @@ def fused_conv1d_gdn(
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
+    gdn_prefill_mode = _resolve_gdn_prefill_mode(
+        gdn_prefill_mode,
+        attention_mode=attention_mode,
+        state_fmt=state_fmt,
+        d_k=d_k,
+        d_v=d_v,
+    )
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
