@@ -130,9 +130,6 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_rows,
     copy_pool_blocks,
 )
-from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
-    enable_pipelined_collective_and_compute,
-)
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
 from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
@@ -8136,7 +8133,6 @@ class TPUModelRunner(GPUModelRunner):
         return moe_skip_policy.resolve_bf16_moe_skip_policy(
             skip_flag=bool(envs.TPU_MOE_SKIP_PADDED_TOKENS),
             parallel_config=self.parallel_config,
-            pipelined_collective=enable_pipelined_collective_and_compute(),
             fused_decode_kernel=bool(
                 envs.USE_MOE_TP_DECODE_KERNEL or envs.FUSED_MOE_DECODE_KERNEL
             ),
