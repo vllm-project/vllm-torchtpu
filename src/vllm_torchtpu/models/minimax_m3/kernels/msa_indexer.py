@@ -1320,9 +1320,8 @@ def _select_call(
             select=select,
             writes=None if writes is None else writes.layout_only(),
             table_width=table_width,
-            # Above one 8-token tile: -0.2 .. -0.42 us per layer at 24 / 48
-            # tokens (kbench j-4c8cb3c1), slower at 8 (j-ad8a21e1).
-            pair_issue=num_tokens > 8,
+            # -0.2 .. -0.42 us per layer at 24 / 48 tokens (kbench j-4c8cb3c1).
+            pair_issue=True,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(prefetch) + 1,
