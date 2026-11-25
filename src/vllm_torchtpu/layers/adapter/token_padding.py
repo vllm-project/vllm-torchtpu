@@ -68,13 +68,6 @@ def set_padding_state(state: "TokenPaddingState | None") -> None:
     _padding_state = state
 
 
-def get_local_valid_tokens() -> torch.Tensor | None:
-    """Return this rank's 1-element int32 valid-row count tensor, or None."""
-    if _padding_state is None:
-        return None
-    return _padding_state.local_valid_tokens
-
-
 def get_valid_tokens_for_padding(
     *, is_local_tensor: bool = False
 ) -> torch.Tensor | None:

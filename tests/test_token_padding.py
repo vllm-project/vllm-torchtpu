@@ -220,7 +220,7 @@ def test_valid_tokens_allocation_is_gated_by_track_valid_tokens():
     try:
         state_off.update(3, 8)
         assert state_off.local_valid_tokens is None
-        assert token_padding.get_local_valid_tokens() is None
+        assert token_padding.get_valid_tokens_for_padding(is_local_tensor=True) is None
     finally:
         token_padding.set_padding_state(None)
 
@@ -231,14 +231,14 @@ def test_valid_tokens_allocation_is_gated_by_track_valid_tokens():
     token_padding.set_padding_state(state_on)
     try:
         state_on.update(5, 8)
-        count = token_padding.get_local_valid_tokens()
+        count = token_padding.get_valid_tokens_for_padding(is_local_tensor=True)
         assert count is state_on.local_valid_tokens
         assert count is not None and count.tolist() == [5]
         state_on.update(0, 8)
         assert count.tolist() == [0]
     finally:
         token_padding.set_padding_state(None)
-    assert token_padding.get_local_valid_tokens() is None
+    assert token_padding.get_valid_tokens_for_padding(is_local_tensor=True) is None
 
 
 def test_get_valid_tokens_for_padding_local_and_single_rank(monkeypatch):

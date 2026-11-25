@@ -186,18 +186,23 @@ def test_ep_non_pipelined_gathers_valid_tokens_and_pipelined_passes_local(
     assert capture_forward.pipelined_calls[0]["row_info"] is state.local_valid_tokens
 
 
-def test_tp_ep_sequence_parallel_uses_single_step_count(capture_forward):
-    """Under TPU_MOE_SEQUENCE_PARALLEL=1 (TP+EP, dp_size=1), EP-rank all-gather
-    rebuilds the original [B] row order, so the 1-element count applies."""
+def test_sequence_parallel_forward_rejects_pipelined_mode(capture_forward, monkeypatch):
+    """Non-pipelined sequence-parallel TP+EP passes the 1-element count;
+    combining sequence-parallel MoE with pipelined chunking must fail loudly
+    rather than applying the full-batch count to a TP-sharded tensor."""
     state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=True)
     state.update(2, 4)
     token_padding.set_padding_state(state)
+    sp_layer = _dummy_layer(use_ep=True, dp_size=1, is_sequence_parallel=True)
     try:
         method = _method(skip_padded_tokens=True)
-        _run_forward(
-            method,
-            layer=_dummy_layer(use_ep=True, dp_size=1, is_sequence_parallel=True),
+        _run_forward(method, layer=sp_layer)
+
+        monkeypatch.setattr(
+            module, "enable_pipelined_collective_and_compute", lambda: True
         )
+        with pytest.raises(AssertionError, match="TPU_MOE_SEQUENCE_PARALLEL"):
+            _run_forward(method, layer=sp_layer)
     finally:
         token_padding.set_padding_state(None)
 
@@ -416,7 +421,9 @@ def test_one_compiled_forward_reads_each_steps_row_count(monkeypatch):
         _experts_start=None,
         moe_config=SimpleNamespace(
             experts_per_token=topk,
-            moe_parallel_config=SimpleNamespace(use_ep=False, dp_size=1),
+            moe_parallel_config=SimpleNamespace(
+                use_ep=False, dp_size=1, is_sequence_parallel=False
+            ),
         ),
         custom_routing_function=_top_logits,
         renormalize=False,

@@ -419,24 +419,29 @@ def test_adapter_row_count_through_custom_op_matches_stock(num_tokens, num_valid
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize(
-    "t_per_rank, counts",
+    "t_per_rank, counts, experts_start_val",
     [
         # One-hot permute / unpermute path (<= onehot_moe_permute_threshold)
-        (16, [0]),
-        (16, [9]),
-        (16, [16]),
-        (8, [6, 0, 8, 3]),
-        (8, [0, 0, 0, 0]),
+        (16, [0], 0),
+        (16, [9], 0),
+        (16, [16], 0),
+        (8, [6, 0, 8, 3], 0),
+        (8, [6, 0, 8, 3], 8),
+        (8, [0, 0, 0, 0], 0),
         # SparseCore ragged_gather_v2 permute gate (> 511 routed rows on v5p/7x)
-        (64, [50, 0, 64, 7]),
+        (64, [50, 0, 64, 7], 0),
+        (64, [50, 0, 64, 7], 8),
         # SparseCore ragged_gather_reduce_v2 VMEM gate (~4,900 rows at H=2048 bf16)
-        (320, [300, 0, 320, 7]),
+        (320, [300, 0, 320, 7], 0),
+        (320, [0, 0, 0, 0], 0),
     ],
 )
-def test_adapter_ep_segmented_row_count_through_custom_op(t_per_rank, counts):
+def test_adapter_ep_segmented_row_count_through_custom_op(
+    t_per_rank, counts, experts_start_val
+):
     """fused_moe_gmm with use_ep=True and single- or multi-segment row_info:
-    active rows match the stock EP op and padded rows across every rank segment
-    are exact zero."""
+    active rows match the stock EP op bit for bit and padded rows across every
+    rank segment are exact zero (while non-zero in the stock reference)."""
     local_experts, global_experts, hidden, inter, topk = 8, 16, 2048, 768, 4
     num_tokens = t_per_rank * len(counts)
     dev = torch.device("tpu")
@@ -456,7 +461,7 @@ def test_adapter_ep_segmented_row_count_through_custom_op(t_per_rank, counts):
     rows = torch.arange(num_tokens)[:, None]
     ids = ((rows + 2 * torch.arange(topk)[None, :]) % global_experts).to(torch.int32)
     weights = torch.rand(num_tokens, topk, generator=gen) * 0.25 + 0.05
-    experts_start = torch.tensor(0, dtype=torch.int32)
+    experts_start = torch.tensor(experts_start_val, dtype=torch.int32)
     row_info = torch.tensor(counts, dtype=torch.int32)
 
     w1, w2, x, ids, weights, experts_start, row_info = (
@@ -525,6 +530,7 @@ def test_adapter_ep_segmented_row_count_through_custom_op(t_per_rank, counts):
     ).cpu()
     assert torch.isfinite(out).all()
     if (~pad).any():
-        torch.testing.assert_close(out[~pad], ref[~pad], rtol=1e-2, atol=1e-2)
+        assert torch.equal(out[~pad], ref[~pad])
     if pad.any():
         assert torch.equal(out[pad], torch.zeros_like(out[pad]))
+        assert ref[pad].float().abs().max() > 0

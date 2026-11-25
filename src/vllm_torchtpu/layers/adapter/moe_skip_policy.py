@@ -73,6 +73,8 @@ def resolve_bf16_moe_skip_policy(
     *,
     skip_flag: bool,
     parallel_config: ParallelConfig,
+    pipelined_collective: bool,
+    sequence_parallel: bool,
     fused_decode_kernel: bool,
     has_speculative: bool,
     has_lora: bool,
@@ -82,24 +84,29 @@ def resolve_bf16_moe_skip_policy(
     if not skip_flag:
         return Bf16MoeSkipPolicy(enabled=False)
 
-    # Read every gated ParallelConfig field upfront so a missing attribute
-    # fails loudly instead of silently admitting an unsupported topology.
-    pp_size = parallel_config.pipeline_parallel_size
-    pcp_size = parallel_config.prefill_context_parallel_size
-    dcp_size = parallel_config.decode_context_parallel_size
-
     fallback_reason: str | None = None
     if not is_unquantized_model:
         fallback_reason = "quantized model"
     else:
         for name, size in (
-            ("pipeline_parallel_size", pp_size),
-            ("prefill_context_parallel_size", pcp_size),
-            ("decode_context_parallel_size", dcp_size),
+            ("pipeline_parallel_size", parallel_config.pipeline_parallel_size),
+            (
+                "prefill_context_parallel_size",
+                parallel_config.prefill_context_parallel_size,
+            ),
+            (
+                "decode_context_parallel_size",
+                parallel_config.decode_context_parallel_size,
+            ),
         ):
             if size > 1:
                 fallback_reason = f"{name} > 1"
                 break
+    if fallback_reason is None and sequence_parallel and pipelined_collective:
+        fallback_reason = (
+            "sequence-parallel MoE with pipelined collective "
+            "(TPU_MOE_COLLECTION_CHUNK_SIZE)"
+        )
     if fallback_reason is None and fused_decode_kernel:
         fallback_reason = "fused MoE decode kernels"
     if fallback_reason is None and has_speculative:

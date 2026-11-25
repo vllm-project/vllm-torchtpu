@@ -513,7 +513,7 @@ class TestMoEForwardPrecisionBranches:
             f"and pipelined_fused_moe_gmm ({list(sig_pipelined.parameters.keys())})."
         )
 
-    def test_pipelined_fused_moe_rejects_non_scalar_row_info(self):
+    def test_pipelined_fused_moe_rejects_multi_element_row_info(self):
         """row_info passed to pipelined_fused_moe_gmm must be a 1-element
         rank-local valid-token count."""
         with pytest.raises(ValueError, match="1-element local row_info"):
@@ -604,11 +604,24 @@ class TestMoEForwardPrecisionBranches:
         ]
         assert len(row_info_gathers) == 1
 
-    @pytest.mark.parametrize("world_size", [1, 4])
-    def test_pipelined_fused_moe_single_chunk_row_info(self, world_size):
-        """Single-chunk (or single-rank) pipelined MoE forwards gathered or
-        local row_info straight to fused_moe_gmm."""
-        dp_group = _MockCollectiveGroup(world_size=world_size, rank=0)
+    @pytest.mark.parametrize(
+        "world_size, expected_counts",
+        [(1, [5]), (4, [5, 0, 8, 2])],
+    )
+    def test_pipelined_fused_moe_single_chunk_row_info(
+        self, world_size, expected_counts
+    ):
+        """Single-rank pipelined MoE skips all_gather and forwards the local
+        count; single-chunk multi-rank gathers distinct per-rank counts."""
+
+        class _SingleChunkGroup(_MockCollectiveGroup):
+            def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+                self.call_log.append(("all_gather", tensor.shape, tensor.dtype))
+                if tensor.shape == (1,) and tensor.dtype == torch.int32:
+                    return torch.tensor(expected_counts, dtype=torch.int32)
+                return torch.cat([tensor] * self.world_size, dim=dim)
+
+        dp_group = _SingleChunkGroup(world_size=world_size, rank=0)
         seq_len, hidden_dim, topk = 8, 16, 2
         seen_row_infos: list[list[int]] = []
 
@@ -645,10 +658,18 @@ class TestMoEForwardPrecisionBranches:
                 topk=topk,
                 activation="silu",
                 skip_padded_tokens=True,
-                row_info=torch.tensor([5], dtype=torch.int32),
+                row_info=torch.tensor([expected_counts[0]], dtype=torch.int32),
             )
 
-        assert seen_row_infos == [[5] * world_size]
+        assert seen_row_infos == [expected_counts]
+        ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
+        if world_size == 1:
+            assert ag_calls == []
+        else:
+            row_info_gathers = [
+                c for c in ag_calls if c[1] == (1,) and c[2] == torch.int32
+            ]
+            assert len(row_info_gathers) == 1
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_fp8_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):

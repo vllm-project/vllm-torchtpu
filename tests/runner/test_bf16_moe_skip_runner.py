@@ -48,6 +48,7 @@ def _step(runner, valid: int, padded: int) -> None:
 def _supported_runner(monkeypatch):
     monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
     monkeypatch.delenv("TPU_MOE_COLLECTION_CHUNK_SIZE", raising=False)
+    monkeypatch.delenv("TPU_MOE_SEQUENCE_PARALLEL", raising=False)
     monkeypatch.delenv("USE_MOE_TP_DECODE_KERNEL", raising=False)
     monkeypatch.delenv("FUSED_MOE_DECODE_KERNEL", raising=False)
 
@@ -127,6 +128,13 @@ def test_resolve_bf16_policy_supported_enables_skipping(monkeypatch, mutate):
         (
             lambda r, mp: setattr(r.parallel_config, "decode_context_parallel_size", 2),
             "decode_context_parallel_size",
+        ),
+        (
+            lambda r, mp: (
+                mp.setenv("TPU_MOE_SEQUENCE_PARALLEL", "1"),
+                mp.setenv("TPU_MOE_COLLECTION_CHUNK_SIZE", "16"),
+            ),
+            "sequence-parallel",
         ),
         (lambda r, mp: mp.setenv("USE_MOE_TP_DECODE_KERNEL", "1"), "fused MoE decode"),
         (lambda r, mp: mp.setenv("FUSED_MOE_DECODE_KERNEL", "1"), "fused MoE decode"),

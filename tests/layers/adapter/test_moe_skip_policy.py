@@ -36,6 +36,8 @@ def _resolve(**overrides):
     kwargs = {
         "skip_flag": True,
         "parallel_config": _supported_parallel_config(),
+        "pipelined_collective": False,
+        "sequence_parallel": False,
         "fused_decode_kernel": False,
         "has_speculative": False,
         "has_lora": False,
@@ -46,16 +48,24 @@ def _resolve(**overrides):
 
 
 @pytest.mark.parametrize(
-    "parallel_overrides",
+    "parallel_overrides, extra_overrides",
     [
-        {},
-        {"enable_expert_parallel": True},
-        {"enable_expert_parallel": True, "data_parallel_size": 4},
+        ({}, {}),
+        ({"enable_expert_parallel": True}, {}),
+        ({"enable_expert_parallel": True}, {"sequence_parallel": True}),
+        ({"enable_expert_parallel": True, "data_parallel_size": 4}, {}),
+        (
+            {"enable_expert_parallel": True, "data_parallel_size": 4},
+            {"pipelined_collective": True},
+        ),
     ],
-    ids=["tp_only", "tp_ep", "dp_ep"],
+    ids=["tp_only", "tp_ep", "tp_ep_seq_parallel", "dp_ep", "dp_ep_pipelined"],
 )
-def test_resolve_policy_supported_enables_skipping(parallel_overrides):
-    policy = _resolve(parallel_config=_supported_parallel_config(**parallel_overrides))
+def test_resolve_policy_supported_enables_skipping(parallel_overrides, extra_overrides):
+    policy = _resolve(
+        parallel_config=_supported_parallel_config(**parallel_overrides),
+        **extra_overrides,
+    )
     assert policy.enabled is True
     assert policy.fallback_reason is None
 
@@ -106,6 +116,10 @@ def test_resolve_policy_fails_loudly_on_missing_parallel_field(missing):
                 )
             },
             "decode_context_parallel_size",
+        ),
+        (
+            {"sequence_parallel": True, "pipelined_collective": True},
+            "sequence-parallel",
         ),
         ({"fused_decode_kernel": True}, "fused MoE decode"),
         ({"has_speculative": True}, "speculative"),

@@ -344,7 +344,7 @@ def prepare_routed_gmm_inputs(
     With ``skip_padded_tokens=True`` the valid mask also drops the padded rows'
     routes. With ``row_info`` (BF16 MoE: a 1-D int32 array of valid prefix row
     counts — length 1 for a single contiguous batch, or length ``num_segments``
-    for equal-sized rank segments gathered across DP/PCP), rows at local segment
+    for equal-sized rank segments gathered across DP), rows at local segment
     index ``>= row_info[segment]`` are padding, and real rows keep stock
     dispatch even if a routing weight is zero. Without ``row_info`` (FP8 / MXFP4
     MoE), the caller zeroed the padded rows' routing weights and routes whose
