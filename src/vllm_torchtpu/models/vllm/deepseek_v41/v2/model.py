@@ -7,6 +7,7 @@ from functools import cached_property, partial
 from itertools import islice
 from typing import TYPE_CHECKING, cast
 
+import time
 import torch
 from torch.utils._pytree import tree_leaves
 from vllm.compilation.backends import set_model_tag
@@ -17,6 +18,7 @@ from vllm.models.deepseek_v41.nvidia import model as upstream
 from vllm.models.deepseek_v41.nvidia import vl_model as upstream_vl
 from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphConfig
 
+from vllm_torchtpu.models.vllm.deepseek_v41.common import engram_timing as _et
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental import decode_preparation
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
@@ -671,12 +673,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     def _gather_host_hashes(self, engram_hashes: torch.Tensor) -> torch.Tensor:
         """The host Engram path's hashes: downloaded and node-gathered."""
         if self._has_cpu_offloaded_engram():
-            engram_hashes = self._hash_download.copy_to_host(engram_hashes)
-        return gather_host_engram_hashes(
-            engram_hashes,
-            dp_shared_memory=self.engram_dp_shared_memory,
-            gather_fn=upstream.gather_engram_hashes,
-        )
+            with _et.timed("hash_download_total"):
+                engram_hashes = self._hash_download.copy_to_host(engram_hashes)
+        with _et.timed("hash_dp_gather"):
+            return gather_host_engram_hashes(
+                engram_hashes,
+                dp_shared_memory=self.engram_dp_shared_memory,
+                gather_fn=upstream.gather_engram_hashes,
+            )
 
     def _defers_hash_download(self, engram_hashes: torch.Tensor, stage: str) -> bool:
         """Whether the split encoder head may dispatch before the hash download.
@@ -722,18 +726,45 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                             else None
                         )
                         if upload is None:
-                            upload = engram.start_prepared_embeddings(
+                            with _et.timed(f"L{engram.layer_hash_index}_gather_start_upload"):
+                                upload = engram.start_prepared_embeddings(
+                                    gathered_hashes[:, engram.layer_hash_index]
+                                )
+                        else:
+                            _et.record(f"L{engram.layer_hash_index}_prefetched", 0.0)
+                        with _et.timed(f"L{engram.layer_hash_index}_activate"):
+                            engram.activate_prepared_embeddings(
+                                gathered_hashes.shape[0], upload
+                            )
+                    else:
+                        with _et.timed(f"L{engram.layer_hash_index}_prepare_embeddings"):
+                            engram.prepare_embeddings(
                                 gathered_hashes[:, engram.layer_hash_index]
                             )
-                        engram.activate_prepared_embeddings(
-                            gathered_hashes.shape[0], upload
-                        )
-                    else:
-                        engram.prepare_embeddings(
-                            gathered_hashes[:, engram.layer_hash_index]
-                        )
 
     def forward(
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        lookback_token_ids=None,
+    ):
+        if _et.ENABLED:
+            _t0 = time.perf_counter()
+            try:
+                return self._forward_timed(
+                    input_ids, positions, intermediate_tensors, inputs_embeds,
+                    lookback_token_ids,
+                )
+            finally:
+                _et.record("forward_host_total", time.perf_counter() - _t0)
+                _et.forward_done()
+        return self._forward_timed(
+            input_ids, positions, intermediate_tensors, inputs_embeds, lookback_token_ids
+        )
+
+    def _forward_timed(
         self,
         input_ids,
         positions,

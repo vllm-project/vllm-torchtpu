@@ -12,10 +12,18 @@ import torch
 from numba import njit
 
 
+# Copy threads per gather, the caller included (TPU_ENGRAM_GATHER_THREADS,
+# default 2: the caller and one persistent worker). The first Engram layer's
+# gather sits between the device hash download and the layer's dispatch, with
+# the device idle, so on hosts with spare cores more threads shorten that gap.
+_GATHER_THREADS = max(1, int(os.environ.get("TPU_ENGRAM_GATHER_THREADS", "2")))
+
+
 @cache
 def _gather_pool() -> ThreadPoolExecutor:
-    # The caller copies one half; one persistent worker copies the other.
-    return ThreadPoolExecutor(max_workers=1, thread_name_prefix="engram-gather")
+    return ThreadPoolExecutor(
+        max_workers=max(1, _GATHER_THREADS - 1), thread_name_prefix="engram-gather"
+    )
 
 
 os.register_at_fork(after_in_child=_gather_pool.cache_clear)
@@ -84,27 +92,32 @@ def gather_weight_scale(
                 weight_array, scale_array, index_array, raw_array, scale_out_array
             )
             return
-        middle = tokens // 2
+        parts = min(_GATHER_THREADS, tokens)
+        bounds = [tokens * k // parts for k in range(parts + 1)]
         pool = _gather_pool()
-        future = pool.submit(
-            _gather_weight_scale,
-            weight_array,
-            scale_array,
-            index_array[:middle],
-            raw_array[: middle * heads],
-            scale_out_array[: middle * heads],
-        )
+        futures = [
+            pool.submit(
+                _gather_weight_scale,
+                weight_array,
+                scale_array,
+                index_array[lo:hi],
+                raw_array[lo * heads : hi * heads],
+                scale_out_array[lo * heads : hi * heads],
+            )
+            for lo, hi in zip(bounds[1:-1], bounds[2:])
+        ]
         try:
             _gather_weight_scale(
                 weight_array,
                 scale_array,
-                index_array[middle:],
-                raw_array[middle * heads :],
-                scale_out_array[middle * heads :],
+                index_array[: bounds[1]],
+                raw_array[: bounds[1] * heads],
+                scale_out_array[: bounds[1] * heads],
             )
         finally:
             # Even on failure, no writer may outlive the borrowed tensor storage.
-            future.result()
+            for future in futures:
+                future.result()
 
 
 def _host_array(tensor: torch.Tensor, dtype: np.dtype) -> np.ndarray:

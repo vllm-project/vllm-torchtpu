@@ -1695,6 +1695,52 @@ def _align_raiden_num_blocks(
     return configs
 
 
+def _patch_vllm_new_request_prompt_ndarray() -> None:
+    """Ship long prompts to the workers as int32 ndarrays, not Python lists.
+
+    A new request's ``prompt_token_ids`` travels EngineCore -> worker inside
+    the pickled SchedulerOutput. As a list of several hundred thousand Python
+    ints it is slow to pickle and unpickle, and the worker's
+    ``InputBatch.add_request`` then converts it element by element into
+    ``token_ids_cpu`` (~4 ms per 150k tokens, ~25 ms at 800k). That runs on the
+    worker's main thread, so under DP/EP lockstep every rank waits for the one
+    admitting a long request (seen on DSv4.1 1P1D decode under AgentX). An
+    ndarray pickles as one buffer and the worker copy is a memcpy. Only the
+    worker-bound NewRequestData is changed; the scheduler's Request keeps its
+    list. Worker-side users only take len(), index, slice or bulk-assign it.
+    TPU_NEW_REQ_PROMPT_NDARRAY_MIN (default 8192, 0 = off) is the minimum
+    prompt length converted. Read from the environment, not envs, so it does
+    not enter the compile-cache hash.
+    """
+    import functools
+    import os
+
+    import numpy as np
+    from vllm.v1.core.sched.output import NewRequestData
+
+    threshold = int(os.environ.get("TPU_NEW_REQ_PROMPT_NDARRAY_MIN", "8192"))
+    original = NewRequestData.from_request
+    if threshold <= 0 or getattr(original, "_tpu_prompt_ndarray", False):
+        return
+    original_fn = original.__func__
+
+    @functools.wraps(original_fn)
+    def from_request(cls, request, *args, **kwargs):
+        data = original_fn(cls, request, *args, **kwargs)
+        ids = data.prompt_token_ids
+        if isinstance(ids, list) and len(ids) >= threshold:
+            data.prompt_token_ids = np.asarray(ids, dtype=np.int32)
+        return data
+
+    from_request._tpu_prompt_ndarray = True  # type: ignore[attr-defined]
+    NewRequestData.from_request = classmethod(from_request)  # type: ignore[method-assign]
+    logger.info(
+        "Applied TPU patch: NewRequestData ships prompts >= %d tokens as int32 "
+        "ndarrays.",
+        threshold,
+    )
+
+
 def _patch_vllm_merge_dsv41_swa_groups() -> None:
     """Give identical DeepSeek-V4.1 SWA layers one KV cache group.
 
