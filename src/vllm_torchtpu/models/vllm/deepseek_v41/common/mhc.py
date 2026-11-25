@@ -861,6 +861,7 @@ def shifted_post_pre(
         if pre_mix is None:
             pre_mix = _default_pre_mix(residual, hc_scale.dtype)
         if fuse_rms and norm_weight is not None:
+            # The kernel reads only the residual's rows of a padded x.
             op = get_shifted_post_pre_rms_op()
             flat_new, post_mix, comb_mix, value, next_pre = op(
                 x,
@@ -882,7 +883,7 @@ def shifted_post_pre(
             residual = flat_new.view_as(residual)
         else:
             residual, post_mix, comb_mix, value, next_pre = delayed_post_pre(
-                x,
+                x[: residual.shape[0]],
                 residual,
                 post_layer_mix,
                 comb_res_mix,
@@ -900,7 +901,7 @@ def shifted_post_pre(
                 value = rms_norm(value, norm_weight, norm_eps)
         aux = _residual_mean(residual) if capture_aux else x.new_empty(0, x.shape[-1])
         return residual, post_mix, comb_mix, value, next_pre, aux
-    residual = post(x, residual, post_layer_mix, comb_res_mix)
+    residual = post(x[: residual.shape[0]], residual, post_layer_mix, comb_res_mix)
     aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])
     return (
         residual,

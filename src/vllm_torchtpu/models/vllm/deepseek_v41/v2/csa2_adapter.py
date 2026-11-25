@@ -569,7 +569,10 @@ def _project_out(
     sa = sa.reshape(-1)
     if output_projection.is_supported(output, wa, sa, wb, sb):
         return output_projection.fused_output_projection(output, wa, sa, wb, sb)
-    return _quantized_matmul_jax(wo_a_projection(output, wa, sa, None), wb, sb)
+    projected = _quantized_matmul_jax(wo_a_projection(output, wa, sa, None), wb, sb)
+    # Every path returns the fused kernel's padded row count.
+    rows = output_projection.padded_rows(output.shape[0]) - output.shape[0]
+    return jnp.pad(projected, ((0, rows), (0, 0)))
 
 
 def _manual_bridge(function, mesh, tensor_args, out_specs):
@@ -680,7 +683,9 @@ def initialize_csa2_ops() -> None:
             "project_out",
             _project_out,
             (P(),) * 5,
-            lambda x, wa, sa, wb, sb: x.new_empty((x.shape[0], wb.shape[1])),
+            lambda x, wa, sa, wb, sb: x.new_empty(
+                (output_projection.padded_rows(x.shape[0]), wb.shape[1])
+            ),
         ),
     )
     output_counts = {
@@ -973,7 +978,8 @@ def project_out(
     sb: torch.Tensor,
 ) -> torch.Tensor:
     """``wo_b(wo_a(output))``; ``wb`` is the canonical ``[k, n]`` FP8 weight
-    with a per-channel ``[n]`` scale."""
+    with a per-channel ``[n]`` scale. Rows past ``output``'s are zero
+    padding (`output_projection.padded_rows`)."""
     return _ops["project_out"](output, wa, sa, wb, sb)
 
 
