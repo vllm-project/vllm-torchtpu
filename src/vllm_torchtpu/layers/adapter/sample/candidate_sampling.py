@@ -143,6 +143,13 @@ def _get_op(vocab_size: int, synthetic: bool):
     return op
 
 
+def candidate_verify_op(vocab_size: int, synthetic: bool):
+    """The candidate verify torch op, callable inside a compiled region: takes
+    the `candidate_verify_decisions` operands in its order, each as this
+    rank's [1, ...] block, and returns the six results the same way."""
+    return _get_op(vocab_size, synthetic)
+
+
 def candidate_width(tp_size: int) -> int:
     return CANDIDATES_PER_SHARD * tp_size
 

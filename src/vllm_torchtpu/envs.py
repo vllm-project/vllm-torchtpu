@@ -481,6 +481,8 @@ if TYPE_CHECKING:
     VLLM_TPU_GDN_V3_SINGLE_LAUNCH: bool = False
     VLLM_TPU_GDN_STEP_KERNEL_METADATA: bool = False
     VLLM_TPU_CANDIDATE_SAMPLING: bool = False
+    VLLM_TPU_CANDIDATE_VERIFY_PROGRAM: bool = False
+    VLLM_TPU_CANDIDATE_VERIFY_RO: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -3075,6 +3077,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_SAMPLER_TOPK_CANDIDATES on the steps it serves; logprob, grammar
     # and all-greedy steps keep their paths.
     "VLLM_TPU_CANDIDATE_SAMPLING": env_bool("VLLM_TPU_CANDIDATE_SAMPLING"),
+    # With VLLM_TPU_CANDIDATE_SAMPLING: a candidate verify chunk is one
+    # compiled program fed by one flat float32 uniform draw (the draw split,
+    # the logits row gathers, the per-slot sampling-parameter gathers, the
+    # candidate op and the rejection output), instead of four eager draws and
+    # about a dozen separate programs. Also memoizes the chunk's padded
+    # sampling params (VLLM_TPU_SAMPLING_PARAMS_MEMO) and reads the step
+    # eligibility from numpy. Same distributions, different draws; warmed
+    # at every verify bucket, an unwarmed shape keeps the separate path.
+    "VLLM_TPU_CANDIDATE_VERIFY_PROGRAM": env_bool(
+        "VLLM_TPU_CANDIDATE_VERIFY_PROGRAM"
+    ),
+    # With VLLM_TPU_CANDIDATE_VERIFY_PROGRAM: the post-verify mamba
+    # read-offset scatter runs inside the candidate verify program (one
+    # program instead of two per verify chunk), at the slot-group layouts
+    # warmup compiled; any other layout keeps the separate scatter. Same
+    # values.
+    "VLLM_TPU_CANDIDATE_VERIFY_RO": env_bool("VLLM_TPU_CANDIDATE_VERIFY_RO"),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
