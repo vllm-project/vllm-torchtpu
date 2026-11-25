@@ -46,10 +46,9 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_attention
 WINDOW = 1024
 # Token block widths: a page's run of pairs is cut into blocks of at most
 # the widest, and a unit runs its blocks at the narrowest width holding its
-# widest one. Ordering a window's blocks by width (so a unit's blocks share
-# one) was -5 % at uniform selections, -18 % at moderately local ones and
-# +2-7 % on hot page sets, the extra sort included (j-2dbcc496).
-_WIDTHS = (8, 16, 24, 32)
+# widest one. The kernel takes a window's blocks narrowest width first, so a
+# unit's blocks share one.
+_WIDTHS = (8, 16, 24, 32)  # `_width`
 # Blocks a loop step runs side by side (`unit`). Op replay, 4,096 rows x 16
 # heads, us: 1891 / 1502 / 1163 / 1022 for 1 / 2 / 4 / 8 (uniform
 # selections, j-7166bc3d, j-b5dbd63f). A unit's schedule is its MXU pushes
@@ -59,6 +58,9 @@ _UNIT = 16
 # A unit's blocks whose values `_max_window` reserves VMEM for: 16-block
 # units at a 1,024-token window of 16 heads compile within 30 MiB.
 _LIVE_BLOCKS = 8
+# Blocks the width ordering places per loop step (a chain of dependent
+# scalar loads, which the unrolled steps fill).
+_PLACE_UNROLL = 4
 # Slots of a block whose accumulator rows are loaded before any is stored.
 _RMW_GROUP = 8
 # Blocks whose page (and scale page) copies are in flight, the running ones
@@ -77,6 +79,7 @@ def _kernel(
     # Scalar prefetch
     page_table_ref,  # page key -> physical page
     num_pairs_ref,  # [windows] valid pairs of each window
+    width_blocks_ref,  # [windows * widths] blocks of each width (`_width`)
     # In
     blocks_ref,  # SMEM [P]: page key | block size << 24
     tokens_ref,  # SMEM [P]: each pair's token
@@ -92,6 +95,8 @@ def _kernel(
     kv_buf,  # [ring, 1, S / 8, 4, 2D] uint8
     scale_buf,  # [ring, 1, R, S] f32
     sem_ref,  # DMA [2, ring]
+    order_ref,  # SMEM [P]: the window's blocks' first pairs, by width
+    place_ref,  # SMEM [widths]: each width's next place in order_ref
     *,
     num_heads: int,
     head: int,
@@ -103,6 +108,29 @@ def _kernel(
     row_width = kv_buf.shape[-1]
     page_size = kv_buf.shape[2] * 8
     num_pairs = num_pairs_ref[pl.program_id(0)]
+    counts = [
+        width_blocks_ref[pl.program_id(0) * len(_WIDTHS) + w]
+        for w in range(len(_WIDTHS))
+    ]
+    num_blocks = functools.reduce(jnp.add, counts)
+
+    def place(i):
+        """The blocks at pair ``i`` and the next few go to their widths' next
+        places in `order_ref`; any past the last pair, to its last word."""
+        for _ in range(_PLACE_UNROLL):
+            real = i < num_pairs
+            n = jnp.where(real, blocks_ref[i] >> _KEY_BITS, 0)
+            width = jnp.where(real, _width(n), 0)
+            at = place_ref[width]
+            place_ref[width] = at + real.astype(jnp.int32)
+            order_ref[jnp.where(real, at, order_ref.shape[0] - 1)] = i
+            i = i + n
+        return i
+
+    place_ref[0] = 0
+    for w in range(1, len(_WIDTHS)):
+        place_ref[w] = place_ref[w - 1] + counts[w - 1]
+    jax.lax.while_loop(lambda i: i < num_pairs, place, jnp.int32(0))
 
     def copies(slot, word):
         page = page_table_ref[word & _KEY_MASK]
@@ -116,12 +144,10 @@ def _kernel(
             ),
         )
 
-    def issue(state):
-        i, k = state
-        word = blocks_ref[i]
-        for copy in copies(k % _RING, word):
+    def issue(k):
+        for copy in copies(k % _RING, blocks_ref[order_ref[k]]):
             copy.start()
-        return i + (word >> _KEY_BITS), k + 1
+        return k + 1
 
     acc_ref[...] = jnp.zeros_like(acc_ref)
     l_ref[...] = jnp.zeros_like(l_ref)
@@ -185,17 +211,19 @@ def _kernel(
                     acc_ref[a] = acc[j - g] + rows[:, :head_dim]
                     l_ref[a] = ls[j - g] + rows[:, head_dim:]
 
-    def body(state):
-        i, k, issued = state
+    def body(u, issued):
+        k = u * _UNIT
         issued = jax.lax.while_loop(
-            lambda s: (s[1] < k + _RING) & (s[0] < num_pairs), issue, issued
+            lambda b: (b < k + _RING) & (b < num_blocks), issue, issued
         )
-        # The unit's blocks; past the last pair, blocks of no pair: they see
+        # The unit's blocks; past the last one, blocks of no pair: they see
         # no slot of the page their ring slot holds (zeros or a copied page)
         # and add zeros.
-        blocks, at, real = [], i, 0
+        blocks = []
         for b in range(_UNIT):
-            n = jnp.where(at < num_pairs, blocks_ref[at] >> _KEY_BITS, 0)
+            real = k + b < num_blocks
+            at = jnp.where(real, order_ref[k + b], 0)
+            n = jnp.where(real, blocks_ref[at] >> _KEY_BITS, 0)
             slot = (k + b) % _RING
 
             @pl.when(n > 0)
@@ -204,17 +232,15 @@ def _kernel(
                     copy.wait()
 
             blocks.append((at, n, slot))
-            at, real = at + n, real + jnp.minimum(n, 1)
         widest = functools.reduce(jnp.maximum, [n for _, n, _ in blocks])
         for w, width in enumerate(_WIDTHS):
             fits = widest <= width
             if w:
                 fits &= widest > _WIDTHS[w - 1]
             pl.when(fits)(functools.partial(unit, width, blocks))
-        return at, k + real, issued
+        return issued
 
-    zero = jnp.int32(0)
-    jax.lax.while_loop(lambda s: s[0] < num_pairs, body, (zero, zero, (zero, zero)))
+    jax.lax.fori_loop(0, -(-num_blocks // _UNIT), body, jnp.int32(0))
 
     # Head-major output: each head's rows are every H-th accumulator row.
     tokens = math.gcd(window, 256)
@@ -233,11 +259,17 @@ def _kernel(
     jax.lax.fori_loop(0, window // tokens, finish, 0)
 
 
+def _width(n):
+    """The narrowest of `_WIDTHS` (multiples of 8) holding ``n >= 1`` pairs."""
+    return (n - 1) >> 3
+
+
 def _work(keys, local_key, local_limit, window, page_size):
     """Per window of `window` tokens: its (page key, token) pairs in key order,
     as three ``[windows * P]`` arrays: the page key with the size of the
     block starting there (the rest of its page's run, at most the widest
-    width), the token and its visible slots; and the valid pairs per window.
+    width), the token and its visible slots; the valid pairs per window; and
+    each window's blocks of each width (``[windows * widths]``).
     A page a token lists twice is one pair."""
     num_tokens, topk = keys.shape
     windows = num_tokens // window
@@ -261,6 +293,15 @@ def _work(keys, local_key, local_limit, window, page_size):
     last = jnp.pad(change, ((0, 0), (0, 1)), constant_values=True)
     run_end = jax.lax.cummin(jnp.where(last, idx + 1, length), axis=1, reverse=True)
     size = jnp.minimum(run_end - idx, _WIDTHS[-1])
+    first = jnp.pad(key[:, 1:] != key[:, :-1], ((0, 0), (1, 0)), constant_values=True)
+    run_start = jax.lax.cummax(jnp.where(first, idx, 0), axis=1)
+    start = valid & ((idx - run_start) % _WIDTHS[-1] == 0)
+    width = _width(size)
+    width_blocks = jnp.sum(
+        start[:, :, None] & (width[:, :, None] == jnp.arange(len(_WIDTHS))),
+        axis=1,
+        dtype=jnp.int32,
+    )
     # Room for the widest block past the last pair, in whole 1,024-word SMEM blocks.
     pad = ((0, 0), (0, -(length + _WIDTHS[-1]) % 1024 + _WIDTHS[-1]))
 
@@ -272,6 +313,7 @@ def _work(keys, local_key, local_limit, window, page_size):
         flat(token),
         flat(limit),
         jnp.sum(valid, axis=1, dtype=jnp.int32),
+        width_blocks.reshape(-1),
     )
 
 
@@ -350,7 +392,7 @@ def msa_sparse_attention_pairs(
     q, selected, local_page, local_limit = msa_attention_lse._pad_tokens(
         q, selected, local_page, local_limit, window
     )
-    blocks, tokens, limits, num_pairs = _work(
+    blocks, tokens, limits, num_pairs, width_blocks = _work(
         selected, local_page, local_limit, window, page_size
     )
     windows = q.shape[0] // window
@@ -368,7 +410,7 @@ def msa_sparse_attention_pairs(
             sm_scale=sm_scale,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=2,
+            num_scalar_prefetch=3,
             grid=(windows,),
             in_specs=[
                 smem,
@@ -389,6 +431,8 @@ def msa_sparse_attention_pairs(
                 ),
                 pltpu.VMEM((_RING, 1) + scale_cache.shape[1:], jnp.float32),
                 pltpu.SemaphoreType.DMA((2, _RING)),
+                pltpu.SMEM((blocks.shape[0] // windows,), jnp.int32),
+                pltpu.SMEM((len(_WIDTHS),), jnp.int32),
             ],
         ),
         out_shape=jax.ShapeDtypeStruct(
@@ -404,6 +448,7 @@ def msa_sparse_attention_pairs(
     )(
         page_table,
         num_pairs,
+        width_blocks,
         blocks,
         tokens,
         limits,
