@@ -11,8 +11,6 @@ a latent mixture of experts.
 
 - **Support tier**: `Experimental`
 - **Owners**: `@sierraisland`
-- **Tracking issue**:
-  [#TRACKING_ISSUE](https://github.com/vllm-project/vllm-torchtpu/issues/TRACKING_ISSUE)
 
 ## Directory Layout
 
@@ -32,4 +30,13 @@ Prefix caching off (turned off automatically), no unified KV pool, no P/D or
 offload connector, no speculative decoding, no context parallelism, and TP
 must divide the 8 KDA heads. The KDA state takes about 150 MB per
 `--max-num-seqs` slot summed over the TP ranks (35 layers of 8x256x512 fp32).
-Open follow-ups are listed in the tracking issue.
+
+## Follow-ups
+
+- Unified KV pool for KDA with value heads wider than 128 (needs granules
+  wider than one lane row), and with it prefix caching.
+- Speculative decoding, P/D and offload connectors, context parallelism.
+- Upstream `beta_scale` and the wide-row granule to tokamax's
+  `causal_conv1d_gated_delta_rule`, then switch to it.
+- A dummy-weight benchmark config under `scripts/vllm/benchmarking/configs/`
+  once a public checkpoint and tokenizer exist.
