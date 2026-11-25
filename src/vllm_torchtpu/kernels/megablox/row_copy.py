@@ -191,7 +191,11 @@ def gather_rows(src, index, sizes, filled, *, tile: int = _GATHER_TILE):
     src = pltpu.with_memory_space_constraint(src, pltpu.HBM)
     return pl.pallas_call(
         functools.partial(_gather_kernel, tile=tile, num_rows=num_rows),
-        out_shape=jax.ShapeDtypeStruct((num_rows, hidden), src.dtype),
+        # In HBM, where the expert kernel reads it. Left to XLA, the result
+        # lands in VMEM and is copied to HBM after the kernel (a whole [P, H]
+        # copy, 3.8 us at P = 640, H = 8192), though only the routed rows are
+        # written.
+        out_shape=pltpu.HBM((num_rows, hidden), src.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             in_specs=[hbm],
