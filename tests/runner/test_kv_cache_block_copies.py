@@ -253,8 +253,8 @@ def _staged_hosts(runner):
     return [host for host, _ in runner._unfenced_h2d_sources]
 
 
-def _is_one_of(tensor, tensors):
-    return any(tensor is t for t in tensors)
+def _ids(tensors):
+    return {id(t) for t in tensors}
 
 
 def test_page_local_copy_stages_every_index_upload(monkeypatch):
@@ -292,7 +292,7 @@ def test_page_local_copy_stages_every_index_upload(monkeypatch):
 
     staged = _staged_hosts(fake)
     assert len(received) == len(staged) == 4
-    assert all(_is_one_of(t, staged) for t in received)
+    assert _ids(received) == _ids(staged)  # each staged tensor, none twice
     assert [t.tolist() for t in received] == [
         [3] + [0] * 7,
         [5] + [0] * 7,
@@ -319,7 +319,7 @@ def test_dense_copy_stages_every_index_upload(monkeypatch):
 
     staged = _staged_hosts(runner)
     assert len(received) == len(staged) == 4
-    assert all(_is_one_of(t, staged) for t in received)
+    assert _ids(received) == _ids(staged)  # each staged tensor, none twice
 
 
 def test_precompile_mamba_state_seed_copies_covers_all_groups_and_raw_tensors(
