@@ -526,8 +526,9 @@ class MiniMaxM3SparseAttention(nn.Module):
         of them), attended with the step's derived metadata (StepHalves)."""
         if half is not None:
             positions = half[0].positions_of(half[1])
-        # dcp_local_kv: decode-sized steps also project the group's other KV
-        # heads; larger ones gather them.
+        # dcp_local_kv: decode-sized steps of plain bf16 rows also project the
+        # group's other KV heads; larger steps, e4m3 row tuples and a qkv
+        # precomputed by residual_ar gather them.
         local = False
         if self.local_kv_heads > 1:
             order = dcp_local_kv.group_order(
