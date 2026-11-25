@@ -160,8 +160,22 @@ def test_specs_add_mtp_qsa_owner_and_state_checkpoints():
     assert {base, base + ".compressed_k", base + ".raw_ring"} <= specs.keys()
     assert specs[base] == specs["model.layers.3.self_attn"]
     assert specs[base + ".raw_ring"] == specs["model.layers.3.self_attn.raw_ring"]
+    # Default profile keeps per-token GDN checkpoints (3 blocks at K=3);
+    # opt-in agentx-mixed-256k-two-slot halves GDN checkpoints to 1 write block
+    # while keeping 3 blocks for lightweight PLE caches.
     assert specs["model.layers.0.linear_attn"].num_speculative_blocks == 3
     assert specs["model.layers.1.ple"].num_speculative_blocks == 3
+
+    cfg.additional_config = {"model_plan": {"profile": "agentx-mixed-256k-two-slot"}}
+    two_slot_specs = native_cache_specs(cfg)
+    assert two_slot_specs["model.layers.0.linear_attn"].num_speculative_blocks == 1
+    assert two_slot_specs["model.layers.1.ple"].num_speculative_blocks == 3
+
+    cfg.additional_config = {"qwen4_exp": {"mtp_gdn_two_slot": True}}
+    override_specs = native_cache_specs(cfg)
+    assert override_specs["model.layers.0.linear_attn"].num_speculative_blocks == 1
+    assert override_specs["model.layers.1.ple"].num_speculative_blocks == 3
+    cfg.additional_config = {}
 
     assert not any(name.startswith("mtp.") for name in plain_specs)
     assert plain_specs["model.layers.0.linear_attn"].num_speculative_blocks == 0
@@ -188,9 +202,23 @@ def test_pool_plan_covers_mtp_layers_with_uniform_pages(prefix):
     groups = get_kv_cache_groups(cfg, specs)
     names = {name for group in groups for name in group.layer_names}
     assert names == specs.keys()
+    from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+
     for group in groups:
         if isinstance(group.kv_cache_spec, MambaSpec):
             assert group.kv_cache_spec.num_speculative_blocks == 3
+
+    cfg.additional_config = {"model_plan": {"profile": "agentx-mixed-256k-two-slot"}}
+    _, two_slot_specs = pooled_cache_specs(cfg)
+    two_slot_groups = get_kv_cache_groups(cfg, two_slot_specs)
+    for group in two_slot_groups:
+        if isinstance(group.kv_cache_spec, MambaSpec):
+            expected = (
+                1
+                if group.kv_cache_spec.mamba_type == MambaAttentionBackendEnum.GDN_ATTN
+                else 3
+            )
+            assert group.kv_cache_spec.num_speculative_blocks == expected
 
 
 def test_checkpoint_names_map_onto_draft_modules():

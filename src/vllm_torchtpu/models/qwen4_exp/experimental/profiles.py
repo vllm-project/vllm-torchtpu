@@ -26,6 +26,7 @@ _MIXED = {
     "decode_batch": ("large", "small"),
     "c48_stack": ("off",),
     "pool_budget": ("fixed_61g", "auto"),
+    "gdn_spec_slots": ("per_token",),
 }
 
 PROFILES: dict[str, dict[str, tuple[str, ...]]] = {
@@ -34,4 +35,7 @@ PROFILES: dict[str, dict[str, tuple[str, ...]]] = {
     # overlap) on top of the large-batch stack; nothing in the config tells
     # c48 from c32 (both max_num_seqs 32), so it is a profile.
     "agentx-c48": {**_MIXED, "c48_stack": ("on",)},
+    # Opt-in mixed recipe with two ping-pong GDN state blocks per request
+    # (-50% GDN speculative state memory on the unified pool with MTP).
+    "agentx-mixed-256k-two-slot": {**_MIXED, "gdn_spec_slots": ("two_slot",)},
 }

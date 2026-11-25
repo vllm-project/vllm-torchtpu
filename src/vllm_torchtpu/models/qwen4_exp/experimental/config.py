@@ -45,6 +45,38 @@ def num_speculative_tokens(cfg) -> int:
     return 0 if spec is None else int(spec.num_speculative_tokens)
 
 
+def mtp_gdn_two_slot_enabled(cfg) -> bool:
+    """Whether pooled Qwen4Exp MTP uses 2-slot ping-pong GDN checkpoints.
+
+    Opt-in via the ``agentx-mixed-256k-two-slot`` model plan profile (or an
+    explicit ``plan.mtp_gdn_two_slot_override(cfg)`` bool override) when
+    speculative decoding runs on the unified block pool.
+    Raises ``ValueError`` if two-slot is explicitly requested while the
+    unified pool or MTP speculative decoding is disabled.
+    """
+    if cfg is None:
+        return False
+    requested = bool(plan.feature_for_config(cfg, "QWEN4_EXP_GDN_TWO_SLOT"))
+    if not requested:
+        return False
+    if not use_unified_pool():
+        raise ValueError("Qwen4Exp two-slot GDN requires the unified block pool")
+    if num_speculative_tokens(cfg) <= 0:
+        raise ValueError(
+            "Qwen4Exp two-slot GDN requires speculative decoding (MTP) "
+            "with num_speculative_tokens > 0"
+        )
+    return True
+
+
+def gdn_num_speculative_blocks(cfg) -> int:
+    """Speculative state blocks per request for Qwen4Exp GDN layers."""
+    spec = num_speculative_tokens(cfg)
+    if spec == 0:
+        return 0
+    return 1 if mtp_gdn_two_slot_enabled(cfg) else spec
+
+
 def mtp_layer_prefixes(cfg) -> list[str]:
     """Module prefixes of the checkpoint MTP layers the draft model owns.
 
@@ -107,8 +139,9 @@ def gdn_cache_spec(cfg):
         # FP32; SSM storage follows the resolved upstream cache configuration.
         dtypes=(torch.float32, ssm_dtype),
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
-        # Rollback keeps one whole-state checkpoint block per verify position.
-        num_speculative_blocks=num_speculative_tokens(cfg),
+        # 2-slot ping-pong keeps 1 speculative block alongside the base block;
+        # fallback modes keep one block per verify position.
+        num_speculative_blocks=gdn_num_speculative_blocks(cfg),
     )
 
 
@@ -552,6 +585,9 @@ def validate_config(cfg):
         )
     if cfg.speculative_config is not None:
         validate_mtp_config(cfg)
+    # Validate two-slot GDN override type and unified-pool/MTP requirements at
+    # startup even when speculative_config is absent.
+    mtp_gdn_two_slot_enabled(cfg)
     if cfg.kv_transfer_config is not None:
         raise ValueError(
             "Qwen4Exp TPU takes no KV connector (no PD transfer, no KV offload)"
@@ -640,3 +676,5 @@ def validate_mtp_config(cfg):
         raise ValueError("Qwen4Exp TPU MTP currently requires data_parallel_size=1")
     if getattr(cfg.cache_config, "mamba_cache_mode", "none") not in ("none", "align"):
         raise ValueError("Qwen4Exp MTP requires mamba_cache_mode 'none' or 'align'")
+    # Validate two-slot GDN override type and prerequisites for direct callers.
+    mtp_gdn_two_slot_enabled(cfg)

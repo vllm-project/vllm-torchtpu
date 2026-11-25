@@ -28,6 +28,7 @@ def causal_conv1d(
     conv_weight: jax.Array,  # [prev_kernel_size, 1, dim_size]
     conv_bias: jax.Array | None,  # [dim_size]
     cfg: config.GDNConfig,
+    commit_sizes: jax.Array | None = None,  # [seq]
 ) -> tuple[jax.Array, jax.Array]:
     """Perform causal Conv1D. Returns Conv1D output and convolution states.
 
@@ -62,6 +63,20 @@ def causal_conv1d(
     # NOTE: lhs[:, : prev_kernel_size] can be skipped since they were loaded from
     # previous conv states.
     real_sizes = real_sizes.reshape(-1, 1, 1, 1)
+    if cfg.single_checkpoint:
+        target_c = (
+            real_sizes
+            if commit_sizes is None
+            else jnp.clip(commit_sizes.reshape(-1, 1, 1, 1), 0, real_sizes)
+        )
+        new_conv_state = lhs[:, : cfg.prev_kernel_size]
+        for c_idx in range(1, cfg.chunk_size + 1):
+            new_conv_state = jnp.where(
+                c_idx == target_c,
+                lhs[:, c_idx : c_idx + cfg.prev_kernel_size],
+                new_conv_state,
+            )
+        return jnp.stack(out_list, axis=1), new_conv_state[:, jnp.newaxis]
     state_list = []
     # NOTE: Even though for loop is invoked multiple times, since they are
     # static loops, compiler will perform loop fusion.

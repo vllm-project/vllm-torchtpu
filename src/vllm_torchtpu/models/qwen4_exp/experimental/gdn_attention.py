@@ -21,6 +21,7 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 """
 
 import functools
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -888,6 +889,9 @@ def run_jax_gdn_attention_pooled_local(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    single_checkpoint: bool = False,
+    batched_only: bool = False,
+    commit_lens: jnp.ndarray | None = None,
     prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
@@ -934,6 +938,7 @@ def run_jax_gdn_attention_pooled_local(
         seq_lens,
         read_offsets,
         ckpt_indices,
+        commit_lens,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -943,6 +948,8 @@ def run_jax_gdn_attention_pooled_local(
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
+        single_checkpoint=single_checkpoint,
+        batched_only=batched_only,
         per_seq_inputs=per_seq_inputs,
         prefill_ckpt=prefill_ckpt,
         # Checkpoint offsets are whole manager blocks.
@@ -1008,10 +1015,14 @@ def run_jax_gdn_attention_pooled(
     kernel_size: int,
     pool_block_tokens: int,
     mesh: jax.sharding.Mesh,
-    recurrent_state_dtype: jnp.dtype = jnp.float32,
-    conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    recurrent_state_dtype: Any = jnp.float32,
+    conv_state_dtype: Any = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    single_checkpoint: bool = False,
+    batched_only: bool = False,
+    commit_lens: jnp.ndarray | None = None,
+    read_offset_indices: jnp.ndarray | None = None,
     step_metadata: tuple[jnp.ndarray, ...] | None = None,
     prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -1124,17 +1135,32 @@ def run_jax_gdn_attention_pooled(
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
         conv_weight_kmajor=conv_weight_kmajor,
+        single_checkpoint=single_checkpoint,
+        batched_only=batched_only,
     )
     local_fn = p_run_jax_gdn_attention_pooled_local
-    if prefill_ckpt is not None:
+    has_commit = commit_lens is not None
+    has_prefill_ckpt = prefill_ckpt is not None
+    if has_commit:
+        in_specs = in_specs + (P(None),)
+    if has_prefill_ckpt:
         # Two more replicated per-sequence inputs, appended after whichever
         # optional inputs precede them.
         in_specs = in_specs + (P(None), P(None))
+    if has_commit or has_prefill_ckpt:
 
         def local_fn(*args):
-            *rest, ckpt_offsets, ckpt_blocks = args
+            rest = list(args)
+            ckpt_pair = None
+            if has_prefill_ckpt:
+                ckpt_blocks = rest.pop()
+                ckpt_offsets = rest.pop()
+                ckpt_pair = (ckpt_offsets, ckpt_blocks)
+            cl = rest.pop() if has_commit else None
             return p_run_jax_gdn_attention_pooled_local(
-                *rest, prefill_ckpt=(ckpt_offsets, ckpt_blocks)
+                *rest,
+                commit_lens=cl,
+                prefill_ckpt=ckpt_pair,
             )
 
     mapped_fn = jax.shard_map(
@@ -1146,24 +1172,31 @@ def run_jax_gdn_attention_pooled(
     )
 
     # `slot_read_offsets` is the per-slot offset buffer indexed by manager
-    # block id: `slot_read_offsets[block]` holds `num_accepted - 1` for the
-    # request whose state block is `block`. Index it by `state_indices`
-    # (each sequence's state block) to get the per-sequence read offsets
-    # the kernel expects (shape (num_seqs,)); it then reads each request's
-    # initial state from checkpoint `read_offsets[s]` of block
-    # `state_indices[s]`. Both operands are replicated, so gather here,
-    # outside the shard_map (mirrors run_jax_gdn_attention).
+    # block id: `slot_read_offsets[block]` holds `num_accepted - 1` (or ping-pong
+    # slot index `0`/`1`) for the request whose state block is `block`. Under
+    # block-major unified pools, `read_offset_indices` holds the unscaled
+    # manager block IDs while `state_indices` holds physical flat pool IDs.
     if step_metadata is not None:
         read_offsets, step_ckpt_indices, *per_seq_inputs = step_metadata
-        extra_args = (read_offsets, step_ckpt_indices, tuple(per_seq_inputs))
+        extra_args: tuple[Any, ...] = (
+            read_offsets,
+            step_ckpt_indices,
+            tuple(per_seq_inputs),
+        )
     elif slot_read_offsets is not None:
-        extra_args = (slot_read_offsets[state_indices],)
+        if read_offset_indices is None:
+            extra_args = (slot_read_offsets[state_indices],)
+        else:
+            ro_max = max(0, int(slot_read_offsets.shape[0]) - 1)
+            extra_args = (slot_read_offsets[jnp.clip(read_offset_indices, 0, ro_max)],)
     else:
         extra_args = ()
     if ckpt_indices is not None:
         # Already per-sequence (row s names sequence s's checkpoint blocks),
         # so it needs no gather by state_indices.
         extra_args = extra_args + (ckpt_indices,)
+    if commit_lens is not None:
+        extra_args = extra_args + (commit_lens,)
     if prefill_ckpt is not None:
         extra_args = extra_args + tuple(prefill_ckpt)
     outputs = mapped_fn(

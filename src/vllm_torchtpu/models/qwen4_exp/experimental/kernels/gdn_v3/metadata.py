@@ -34,6 +34,7 @@ def compute_batched_seq_metadata(
     read_offsets: jax.Array,
     end_seq: jax.Array,
     ckpt_indices: jax.Array | None = None,
+    commit_lens: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing multiple sequences per tile.
 
@@ -41,32 +42,50 @@ def compute_batched_seq_metadata(
     a single decoded token, or a speculative verify window of up to
     `cfg.window_size` of them. The initial state is read from
     `state_indices[s] + read_offsets[s]` and one state checkpoint per window
-    position is written back to `state_indices[s] + t`.
+    position is written back to `state_indices[s] + t` (or a single checkpoint
+    when `cfg.single_checkpoint` is enabled).
     """
 
     max_seqs = seq_lens.size
-    all_seqs = jnp.arange(max_seqs)
+    all_seqs = jnp.arange(max_seqs, dtype=jnp.int32)
 
     # NOTE: Only supports use case where query_lens[i] <= cfg.window_size where
     # i < end_seq. This must be guaranteed by the function caller.
-    # TODO(kyuyeunk): Add error handling when above condition is not met.
-    query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    is_valid_seqs = jnp.where(all_seqs < end_seq, True, False)
+    query_lens = (query_start_loc[1:] - query_start_loc[:-1]).astype(jnp.int32)
+    is_valid_seqs = all_seqs < end_seq
     has_initial_state = (seq_lens - query_lens) > 0
     all_valid_seqs = jnp.where(is_valid_seqs, all_seqs, 0)
+    r_base = query_start_loc[all_valid_seqs].astype(jnp.int32)
+    r_size = jnp.where(is_valid_seqs, query_lens, 0)
+
+    # Pad per-slot SMEM tables up to a full multiple of `cfg.tile_size` so a
+    # partial trailing tile never reads past the end under bounds-checked
+    # Pallas interpretation (`detect_races=True`).
+    padded_seqs = pl.cdiv(max_seqs, cfg.tile_size) * cfg.tile_size
+    pad = padded_seqs - max_seqs
+    if pad > 0:
+        all_valid_seqs = jnp.pad(all_valid_seqs, (0, pad))
+        r_base = jnp.pad(r_base, (0, pad))
+        r_size = jnp.pad(r_size, (0, pad))
+        is_first = jnp.pad(is_valid_seqs, (0, pad), constant_values=False)
+        is_last = jnp.pad(is_valid_seqs, (0, pad), constant_values=False)
+    else:
+        is_first = is_valid_seqs
+        is_last = is_valid_seqs
 
     return memory_ref.MetadataRef.create(
         cfgs=cfg,
         num_tiles=pl.cdiv(end_seq, cfg.tile_size),
         p_id_to_s_idx=all_valid_seqs,
-        p_id_to_r_base=query_start_loc[all_valid_seqs],
-        p_id_to_r_size=jnp.where(is_valid_seqs, query_lens, 0),
-        p_id_is_first_tile=is_valid_seqs,
-        p_id_is_last_tile=is_valid_seqs,
+        p_id_to_r_base=r_base,
+        p_id_to_r_size=r_size,
+        p_id_is_first_tile=is_first,
+        p_id_is_last_tile=is_last,
         s_idx_has_initial_state=has_initial_state,
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
         s_idx_to_ckpt_indices=ckpt_indices,
+        s_idx_to_commit_len=commit_lens,
     )
 
 

@@ -32,14 +32,37 @@ MIXED_TILE_SIZES = (128, 64, 32, 16, 8, 4, 2, 1)
 # overhead across (num_seqs / T) steps, while the unoverlapped first state
 # fetch and last write-back scale with T * n_v. Balancing those terms gives
 # T^2 * n_v <= K * num_seqs, where K is the step overhead in per-head state
-# transfers.
+# transfers. Under single_checkpoint (2-slot ping-pong), non-power-of-two n_v
+# (e.g. 48 heads across TP=4 -> n_v=12) rounds down to its power-of-two floor
+# eff_n_v and scales the budget by 4 // rec_state_bytes for bf16 states.
 _DECODE_STEP_COST_IN_HEAD_TRANSFERS = 16
 
 
-def decode_tile_target(num_seqs: int, n_v: int) -> int:
-    """Returns the largest candidate T with T^2 * n_v <= K * num_seqs, else 1."""
-    budget = _DECODE_STEP_COST_IN_HEAD_TRANSFERS * num_seqs
-    return next((t for t in DECODE_TILE_SIZES if t * t * n_v <= budget), 1)
+def decode_tile_target(
+    num_seqs: int,
+    n_v: int,
+    window_size: int = 1,
+    rec_state_bytes: int = 4,
+    *,
+    single_checkpoint: bool = False,
+) -> int:
+    """Returns the largest candidate T fitting the decode tile budget, else 1.
+
+    Default (``single_checkpoint=False``) preserves ``T^2 * n_v <= K * num_seqs``.
+    Under ``single_checkpoint=True``, non-power-of-two ``n_v`` uses its
+    power-of-two floor ``eff_n_v`` and scales the budget by
+    ``4 // rec_state_bytes`` (2x for bf16) when ``window_size == 1``.
+    """
+    if not single_checkpoint:
+        budget = _DECODE_STEP_COST_IN_HEAD_TRANSFERS * num_seqs
+        return next((t for t in DECODE_TILE_SIZES if t * t * n_v <= budget), 1)
+    eff_n_v = 1 << (max(1, n_v).bit_length() - 1)
+    if (n_v & (n_v - 1)) != 0 and window_size == 1:
+        dtype_scale = max(1, 4 // max(1, rec_state_bytes))
+        budget = _DECODE_STEP_COST_IN_HEAD_TRANSFERS * dtype_scale * num_seqs
+    else:
+        budget = _DECODE_STEP_COST_IN_HEAD_TRANSFERS * num_seqs
+    return next((t for t in DECODE_TILE_SIZES if t * t * eff_n_v <= budget), 1)
 
 
 def align_to(x: int, alignment: int) -> int:
@@ -62,6 +85,7 @@ def get_vmem_estimate_bytes(
     is_decode: bool = False,
     carry_scratch_bytes: int = 4,
     window_size: int = 1,
+    single_checkpoint: bool = False,
 ) -> int:
     """Estimates total on-chip VMEM footprint in bytes for a GDN tile."""
     aligned_num_v_heads = align_to(n_v, num_lanes)
@@ -77,9 +101,9 @@ def get_vmem_estimate_bytes(
 
     # 2. Double-buffered state cache buffers (convolution and recurrent states).
     # Input state windows hold 1 state per sequence; output state windows hold
-    # `window_size` checkpoints per sequence, giving `1 + window_size` state
-    # slots per sequence per buffer.
-    state_slots_per_seq = 1 + window_size
+    # `window_size` checkpoints per sequence (`1` under `single_checkpoint`).
+    num_ckpts = 1 if single_checkpoint else window_size
+    state_slots_per_seq = 1 + num_ckpts
     conv_state_buffer_bytes = 2 * (
         tile_b
         * state_slots_per_seq
@@ -150,6 +174,7 @@ def calculate_decode_tile_size(
     vmem_capacity_limit_bytes: int,
     kernel_size: int = 4,
     window_size: int = 1,
+    single_checkpoint: bool = False,
 ) -> int:
     """Largest decode tile whose VMEM estimate fits the limit.
 
@@ -199,6 +224,7 @@ def calculate_decode_tile_size(
             conv_state_dim_size=conv_state_dim_size,
             is_decode=True,
             window_size=window_size,
+            single_checkpoint=single_checkpoint,
         )
         if vmem_est <= vmem_capacity_limit_bytes:
             return cand
@@ -299,6 +325,7 @@ def get_tile_sizes(
     window_size: int = 1,
     decode_tile_size: int | None = None,
     mixed_tile_size: int | None = None,
+    single_checkpoint: bool = False,
 ) -> tuple[int, int]:
     """Derives decode and mixed tile sizes within each kernel's VMEM limit.
 
@@ -331,6 +358,7 @@ def get_tile_sizes(
     # A batch of padded_batch_size tokens spans at most padded_batch_size
     # active sequences even when num_seqs reflects a larger static slot table.
     active_num_seqs = max(1, min(padded_batch_size, num_seqs))
+    rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
     if decode_tile_size is None or decode_tile_size <= 0:
         vmem_fit = calculate_decode_tile_size(
             batch_size=active_num_seqs,
@@ -345,8 +373,19 @@ def get_tile_sizes(
             vmem_capacity_limit_bytes=decode_vmem_limit_bytes,
             kernel_size=kernel_size,
             window_size=window_size,
+            single_checkpoint=single_checkpoint,
         )
-        decode_tile_size = min(decode_tile_target(active_num_seqs, n_v), vmem_fit)
+        if single_checkpoint:
+            target = decode_tile_target(
+                active_num_seqs,
+                n_v,
+                window_size=1,
+                rec_state_bytes=rec_state_bytes,
+                single_checkpoint=True,
+            )
+        else:
+            target = decode_tile_target(active_num_seqs, n_v)
+        decode_tile_size = min(target, vmem_fit)
 
     if mixed_tile_size is None or mixed_tile_size <= 0:
         # Size the prefill/mixed chunk from batch_size rather than comparing
@@ -368,6 +407,7 @@ def get_tile_sizes(
         mixed_tile_size = vmem_fit
 
     # Guarantee strictly positive tile sizes (>= 1) for Pallas grid compilation.
-    decode_tile_size = max(1, min(decode_tile_size, padded_batch_size))
+    decode_bound = active_num_seqs if single_checkpoint else padded_batch_size
+    decode_tile_size = max(1, min(decode_tile_size, decode_bound))
     mixed_tile_size = max(1, min(mixed_tile_size, batch_size))
     return decode_tile_size, mixed_tile_size
