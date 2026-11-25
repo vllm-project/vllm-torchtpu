@@ -525,7 +525,9 @@ class _LeanMixin(_ProbeMixin):
                 scr["qu_cd"][q, :, pl.ds(r * KU + j0, w)] = codes
 
         if not self.union_bounded:
-            ids, codes, nu = ua.compact_union(code, KU, consts)
+            ids, codes, nu = ua.compact_union(
+                code, KU, consts, t1=(ctx.ex.T == 1), fast=self.fast_thr
+            )
             put(0, KU, ids, codes)
             scr["qu_n"][q, r] = jnp.sum(nu)
             return
@@ -589,7 +591,7 @@ class _LeanMixin(_ProbeMixin):
             sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0, n)].reshape(n, S, 128), I32)
             bits = jnp.where(ids < nv, sc, -1)
             with ctx.stream.sc("qsa_thr", 2):
-                thr, tmax = ix.thresholds(bits, ids, nv, K, G)
+                thr, tmax = ix.thresholds(bits, ids, nv, K, G, fast=self.fast_thr)
             scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
             scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
             scr["qi_nv"][pl.ds(lo, n)] = jnp.broadcast_to(nv, (n, 1, 128))
@@ -610,7 +612,7 @@ class _LeanMixin(_ProbeMixin):
                 kept = jnp.sum((sel & (lid < ga)).astype(I32))
                 # Row bit r - lo of every pool-path group it selects.
                 scr["qu_code"][...] = scr["qu_code"][...] | jnp.where(sel & (lid < ga), jnp.left_shift(1, r - lo), 0)
-                if not lean:  # MM: the row's compacted ids (read only by the per-row path and the debug output)
+                if not lean and self._need_ids():  # MM: the row's compacted ids (read only by the per-row path and the debug output)
                     bp = jnp.where(lid < ga, b, -1)
                     b2 = jnp.where(sel & (lid < ga), bp, -1)
                     pos = ix.compact_row(
@@ -618,18 +620,19 @@ class _LeanMixin(_ProbeMixin):
                         jnp.zeros((1, 1), I32) + kept, K, consts,
                     )
                     scr["qi_id"][r] = pos
-                    cs = [
-                        pltpu.make_async_copy(
-                            scr["qi_id"].at[r], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)], scr["qi_sem"].at[1]
-                        ),
-                        pltpu.make_async_copy(
-                            scr["qi_z"], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)], scr["qi_sem"].at[2]
-                        ),
-                    ]
-                    for c in cs:
-                        c.start()
-                    for c in cs:
-                        c.wait()
+                    if not self._skip_qi_ids():
+                        cs = [
+                            pltpu.make_async_copy(
+                                scr["qi_id"].at[r], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)], scr["qi_sem"].at[1]
+                            ),
+                            pltpu.make_async_copy(
+                                scr["qi_z"], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)], scr["qi_sem"].at[2]
+                            ),
+                        ]
+                        for c in cs:
+                            c.start()
+                        for c in cs:
+                            c.wait()
                 scr["qi_kvl"][r] = 4 * kept
                 return carry
 

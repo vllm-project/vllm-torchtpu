@@ -28,8 +28,9 @@ from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
 from .ops import BF16, F32, FP8, rup
 from .planner import Plan, extra_inputs, plan
+from .pool.config import cache_exec
 from .profiles.default import chip_budget
-from .spec import ModelSpec, ScratchReq
+from .spec import ModelSpec, ScratchReq, SwitchSlot
 
 U8 = jnp.uint8
 
@@ -140,6 +141,17 @@ class CommParams:
     AR_ROUNDS: tuple[int, ...]
     AR_PEERS: int
     N_HIER3: int = 3
+    AR2D_SINGLE_SLOT: bool = False
+
+
+AR2D_TILE_ROWS: int = 16  # bf16 packed tile height required by Mosaic TPU v7x DMA
+
+
+def ar2d_row_dims(ar_r: int) -> tuple[int, int, int, int]:
+    """Return `(rh, ar_r_p, rq, rh_p)` row-split sizes aligned to `AR2D_TILE_ROWS`."""
+    rh = rup((ar_r + 1) // 2, AR2D_TILE_ROWS)
+    rq = rup((rh + 1) // 2, AR2D_TILE_ROWS)
+    return rh, 2 * rh, rq, 2 * rq
 
 
 @dataclass(frozen=True)
@@ -159,6 +171,9 @@ class CorePlan:
     NMIX: int
     smem_bytes: int = 0
     smem_shapes: dict[str, tuple[tuple[int, ...], Any]] | None = None
+    scratch_aliases: tuple[
+        tuple[str, str, int, int, tuple[int, ...], Any], ...
+    ] = ()
 
     def block(self, name: str) -> Any:
         return self.blocks[name]
@@ -259,20 +274,54 @@ def build_scratch(
     core_ar = any(i is not None for i in p.slot_ar_index)
     if not core_ar:
         AR_R, AR_C = min(AR_R, 8), 128 * max(R, 2)
-    CW = AR_C // R
+        if HIER in (4, 5):
+            HIER = 0
+    ar2d_any16 = bool(tiles.ar2d_any16)
+    ar2d_single_slot = bool(tiles.ar2d_single_slot)
+    if HIER == 4:
+        # E7 2D-torus AR2D: R=8, AR_C%512==0 (part=AR_C/4 multiple of 128).
+        ar2d_rows_ok = (
+            (AR_R >= 32 and AR_R % 16 == 0) if ar2d_any16 else (AR_R % 64 == 0)
+        )
+        if not (R == 8 and AR_C % 512 == 0 and ar2d_rows_ok):
+            HIER = 2 if (R == 8 and (AR_C // 2) % 128 == 0) else 0
+    ar2d_single = HIER == 4 and ar2d_single_slot
+    ar2d_slots = 1 if ar2d_single else 2
+    _, ar2d_arp, _, _ = ar2d_row_dims(AR_R) if HIER == 4 else (0, AR_R, 0, 0)
+    if HIER == 5:
+        # E7 exact-width 2-round RS+AG: uneven 128-lane tile ownership, zero padding.
+        if not (R >= 2 and AR_C % 128 == 0 and AR_C // 128 >= R):
+            HIER = 2 if (R == 8 and (AR_C // 2) % 128 == 0) else 0
+    if HIER == 5:
+        _base, _extra = divmod(AR_C // 128, R)
+        CW = 128 * (_base + int(_extra > 0))
+    else:
+        CW = AR_C // R
     HC2 = AR_C // 2
     N_HIER3 = max(1, R.bit_length() - 1)
     assert not RSAG or CW % 128 == 0
-    assert HIER in (0, 1, 2, 3) and (
-        HIER == 0 or R == 8 or (HIER == 3 and R >= 2 and (R & (R - 1)) == 0)
+    assert HIER in (0, 1, 2, 3, 4, 5) and (
+        HIER in (0, 5)
+        or R == 8
+        or (HIER == 3 and R >= 2 and (R & (R - 1)) == 0)
     )
     assert HIER != 2 or HC2 % 128 == 0
     AR_ROUNDS = (
-        tuple(range(N_HIER3))
+        tuple(range(10))
+        if HIER == 4
+        else (0, 1)
+        if HIER == 5
+        else tuple(range(N_HIER3))
         if HIER == 3
         else ((0, 1, 2) if HIER == 2 else ((0, 1) if (RSAG or HIER == 1) else (0,)))
     )
-    AR_PEERS = 1 if HIER == 3 else (3 if HIER in (1, 2) else max(R - 1, 1))
+    AR_PEERS = (
+        1
+        if HIER in (3, 4)
+        else R
+        if HIER == 5
+        else (3 if HIER in (1, 2) else max(R - 1, 1))
+    )
 
     vshape = {k: (tk[k], kinds[k][1]) for k in kinds}
     vdtype = {k: kinds[k][2] for k in kinds}
@@ -297,8 +346,12 @@ def build_scratch(
         "send": pltpu.VMEM(
             (N_HIER3, 2, AR_R, AR_C)
             if HIER == 3
+            else (ar2d_slots, 2, ar2d_arp, HC2)
+            if HIER == 4
             else (2, 2, AR_R, HC2)
             if HIER == 2
+            else (2, AR_R, AR_C)
+            if HIER == 5
             else (2, R, AR_R, CW)
             if RSAG
             else (2, AR_R, AR_C),
@@ -307,6 +360,10 @@ def build_scratch(
         "recv": pltpu.VMEM(
             (N_HIER3, 2, 2, AR_R, AR_C)
             if HIER == 3
+            else (ar2d_slots, AR_R, HC2)
+            if HIER == 4
+            else (2, R, AR_R, CW)
+            if HIER == 5
             else (2, 2, AR_R, HC2)
             if HIER == 2
             else (2, 2, AR_R, AR_C)
@@ -316,8 +373,8 @@ def build_scratch(
             else (2, R, AR_R, AR_C),
             BF16,
         ),
-        "ar_ssem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), 2, AR_PEERS)),
-        "ar_rsem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), 2, AR_PEERS)),
+        "ar_ssem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), ar2d_slots, AR_PEERS)),
+        "ar_rsem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), ar2d_slots, AR_PEERS)),
         "fn": pltpu.VMEM((1, H), F32),
         "fn_sem": pltpu.SemaphoreType.DMA(()),
     }
@@ -327,6 +384,17 @@ def build_scratch(
     if RSAG:
         scratch["ag_send"] = pltpu.VMEM((2, AR_R, CW), BF16)
         scratch["ag_recv"] = pltpu.VMEM((2, R, AR_R, CW), BF16)
+    elif HIER == 5:
+        scratch["ag_send"] = pltpu.VMEM((2, AR_R, CW), BF16)
+        scratch["ag_recv"] = pltpu.VMEM((2, AR_R, AR_C), BF16)
+    elif HIER == 4:
+        part = AR_C // 4
+        rh, ar_r_p, rq, rh_p = ar2d_row_dims(AR_R)
+        scratch["ag_send"] = pltpu.VMEM((ar2d_slots, ar_r_p, HC2), BF16)
+        scratch["ag_recv"] = pltpu.VMEM((ar2d_slots, 2, AR_R, HC2), BF16)
+        scratch["s2_send"] = pltpu.VMEM((ar2d_slots, 4, rh_p, part), BF16)
+        scratch["s2_recv"] = pltpu.VMEM((ar2d_slots, 2, rq, part), BF16)
+        scratch["ar2d_bf"] = pltpu.VMEM((ar2d_slots, 2, rh_p, part), BF16)
     elif HIER == 1:
         scratch["ag_send"] = pltpu.VMEM((2, AR_R, AR_C), BF16)
         scratch["ag_recv"] = pltpu.VMEM((2, 4, AR_R, AR_C), BF16)
@@ -362,6 +430,14 @@ def build_scratch(
         if p.dynamic_kinds:
             scratch["epool"] = pltpu.VMEM((NBE * EBROWS, 128), U8)
             phase_map["epool"] = "persistent"
+
+    scratch_aliases: tuple[
+        tuple[str, str, int, int, tuple[int, ...], Any], ...
+    ] = ()
+    if (not typed) and bool(tiles.scratch_alias):
+        scratch_aliases = _pack_gdn_qsa_scratch_alias(
+            model_spec, g, ex, p, scratch, phase_map
+        )
 
     vmem_bytes = 0
     vmem_shapes: dict[str, tuple[tuple[int, ...], Any]] = {}
@@ -465,6 +541,7 @@ def build_scratch(
         AR_ROUNDS=AR_ROUNDS,
         AR_PEERS=AR_PEERS,
         N_HIER3=N_HIER3,
+        AR2D_SINGLE_SLOT=ar2d_single,
     )
     core_plan = CorePlan(
         plan=p,
@@ -480,6 +557,7 @@ def build_scratch(
         NMIX=NMIX,
         smem_bytes=smem_bytes,
         smem_shapes=smem_shapes,
+        scratch_aliases=scratch_aliases,
     )
     return core_plan, scratch
 
@@ -540,6 +618,153 @@ def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
                 f"{need:.2f} MiB with ring depths nbd={t.nbd}, nbe={t.nbe}; "
                 "pass explicit tiles or a named profile"
             )
+
+
+# Strictly dead-on-exit, local (non-RDMA) scratch keys eligible for disjoint
+# SwitchSlot (GDN vs QSA) VMEM pool aliasing with zero extra DMA waits.
+# Excludes async-writeback buffers (`convb`, `logb`, `recb` stay alive across
+# GDN layers until drained) and remote-RDMA targets (`qgu_recv`, `qg_recv`,
+# `qd_q`, `qd_or`, `qd_lr`).
+_GDN_TIER1_ALIAS_KEYS: tuple[str, ...] = ("pg_conv", "pg_log", "sbuf")
+_QSA_TIER1_ALIAS_KEYS: tuple[str, ...] = (
+    "qi_s",
+    "qu_code",
+    "qi_q",
+    "qc_rk",
+    "qc_rv",
+    "qf_kv",
+    "qf_rope",
+    "qf_kr",
+)
+
+
+def _is_exact_pool_alias_vmem(spec: Any) -> bool:
+    """True when `spec` is a VMEM array whose tiled storage has zero padding."""
+    if not hasattr(spec, "shape") or "VMEM" not in str(getattr(spec, "memory_space", "")).upper():
+        return False
+    shape = tuple(spec.shape)
+    if len(shape) < 2:
+        return False
+    dtype = jnp.dtype(spec.dtype)
+    nbytes = math.prod(shape) * dtype.itemsize
+    if nbytes <= 0 or nbytes % 4096 != 0:
+        return False
+    return pool_alias.storage_size(shape, dtype) == nbytes
+
+
+def _pack_gdn_qsa_scratch_alias(
+    model_spec: ModelSpec,
+    g: Any,
+    ex: ExecSpec,
+    p: Plan,
+    scratch: dict[str, Any],
+    phase_map: dict[str, str],
+) -> tuple[tuple[str, str, int, int, tuple[int, ...], Any], ...]:
+    """Alias mutually-exclusive SwitchSlot GDN/QSA Tier-1 VMEM onto `gq_pool`.
+
+    Only activates on real TPU (`not typed`) models whose `layer_type.slots`
+    contains a 2-branch `SwitchSlot` separating the two candidate owners, and
+    only re-aliases buffers that pass exact `(8*packing, 128)` tiling and belong
+    exclusively to one branch.
+    """
+    if cache_exec(ex).FUSED:
+        return ()
+
+    # Build owner counts across all blocks so we never alias a shared key.
+    block_key_sets: dict[int, set[str]] = {}
+    key_owner_count: dict[str, int] = {}
+    for b in model_spec.all_blocks():
+        reqs = _normalize_scratch_reqs(b.scratch(g, ex, p))
+        ks = {r.name for r in reqs}
+        block_key_sets[id(b)] = ks
+        for k in ks:
+            key_owner_count[k] = key_owner_count.get(k, 0) + 1
+
+    gdn_set = set(_GDN_TIER1_ALIAS_KEYS)
+    qsa_set = set(_QSA_TIER1_ALIAS_KEYS)
+    pair: tuple[set[str], set[str]] | None = None
+    for slot_entry in model_spec.layer_type.slots:
+        if not isinstance(slot_entry, SwitchSlot):
+            continue
+        active = slot_entry.active_branches
+        if len(active) != 2:
+            continue
+        k0 = block_key_sets.get(id(active[0]), set())
+        k1 = block_key_sets.get(id(active[1]), set())
+        if (k0 & gdn_set) and (k1 & qsa_set) and not (k0 & qsa_set) and not (k1 & gdn_set):
+            pair = (k0, k1)
+            break
+        if (k1 & gdn_set) and (k0 & qsa_set) and not (k1 & qsa_set) and not (k0 & gdn_set):
+            pair = (k1, k0)
+            break
+    if pair is None:
+        return ()
+
+    own_gdn, own_qsa = pair
+
+    def _eligible(
+        order: tuple[str, ...], owner_keys: set[str]
+    ) -> list[tuple[str, int, tuple[int, ...], Any]]:
+        out: list[tuple[str, int, tuple[int, ...], Any]] = []
+        for k in order:
+            if k not in owner_keys or key_owner_count.get(k, 0) != 1:
+                continue
+            spec = scratch.get(k)
+            if spec is None or not _is_exact_pool_alias_vmem(spec):
+                continue
+            sh = tuple(spec.shape)
+            dt = jnp.dtype(spec.dtype)
+            nbytes = math.prod(sh) * dt.itemsize
+            out.append((k, nbytes // 128, sh, dt))
+        return out
+
+    g_items = _eligible(_GDN_TIER1_ALIAS_KEYS, own_gdn)
+    q_items = _eligible(_QSA_TIER1_ALIAS_KEYS, own_qsa)
+    if not g_items or not q_items:
+        return ()
+
+    tot_g = sum(r for _, r, _, _ in g_items)
+    tot_q = sum(r for _, r, _, _ in q_items)
+    overlap_cap = min(tot_g, tot_q)
+
+    # Keep any tail buffers on the larger side standalone typed so we only wrap
+    # the minimum prefix needed to save all `overlap_cap` rows.
+    def _trim(items: list[tuple[str, int, tuple[int, ...], Any]], cap: int):
+        kept: list[tuple[str, int, tuple[int, ...], Any]] = []
+        acc = 0
+        for it in items:
+            if acc >= cap:
+                break
+            kept.append(it)
+            acc += it[1]
+        return kept, acc
+
+    g_pack, g_rows = _trim(g_items, overlap_cap)
+    q_pack, q_rows = _trim(q_items, overlap_cap)
+    pool_rows = max(g_rows, q_rows)
+    if (g_rows + q_rows) <= pool_rows:
+        return ()
+
+    pool_key = "gq_pool"
+    if pool_key in scratch:
+        return ()
+
+    aliases: list[tuple[str, str, int, int, tuple[int, ...], Any]] = []
+    off = 0
+    for k, nr, sh, dt in g_pack:
+        scratch.pop(k)
+        phase_map.pop(k, None)
+        aliases.append((k, pool_key, off, nr, sh, dt))
+        off += nr
+    off = 0
+    for k, nr, sh, dt in q_pack:
+        scratch.pop(k)
+        phase_map.pop(k, None)
+        aliases.append((k, pool_key, off, nr, sh, dt))
+        off += nr
+    scratch[pool_key] = pltpu.VMEM((pool_rows, 128), U8)
+    phase_map[pool_key] = "gdn|qsa"
+    return tuple(aliases)
 
 
 def _all_own_part(model_spec: Any) -> bool:

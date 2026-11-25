@@ -86,6 +86,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         loop_requests: bool = False,
         dcp: int = 1,
         compressed_dcp: bool = False,
+        skip_rowcompact: bool = False,
+        fast_thr: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -170,6 +172,16 @@ class QSAFullIndexedBlock(QSAFullBlock):
         )
         self.union_attn = union_attn
         assert not union_attn or per_request_scores, "the union is built per request"
+        # `skip_rowcompact` (VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT, `union_attn=True`):
+        # skip SMEM `qi_ids` DMAs and (when not `debug`) drop VMEM `qi_id`, skip
+        # per-row `compact_row`, and shrink the sharded selection exchange row width
+        # 5x (`W = 640 -> 128`). For `compressed_dcp=False`, `union_lean=True`
+        # strictly supersedes this by folding `qsa_selx` into the union exchange.
+        self.skip_rowcompact = bool(skip_rowcompact) and bool(union_attn)
+        # `fast_thr` (VLLM_TPU_MK_INDEXER_FAST_THR, exact): radix-4 packed thresholds
+        # (`indexer.thresholds(..., fast=True)`, 16 S-reductions via 10-bit counters)
+        # and T=1 / bounded `compact_union`.
+        self.fast_thr = bool(fast_thr)
         self.dcp = max(int(dcp), 1)
         assert self.dcp in (1, 2), dcp
         assert self.dcp == 1 or union_attn, "main-KV DCP is implemented on the union path"
@@ -280,22 +292,39 @@ class QSAFullIndexedBlock(QSAFullBlock):
             return ctx.scr["qi_ckw"], ctx.scr["qi_mtw"]
         return (ctx.extra[CKTAB] if self.carrier else None), ctx.extra[MTAB]
 
+    def _table_copies(self, ctx: Any, l: Any) -> list[Any]:  # noqa: E741
+        """Async copies staging layer `l`'s table rows into SMEM windows (`hbm_tables`)."""
+        # HBM tables are [layers, requests, cols]: a layer is one whole leading-dim
+        # block (a row offset `o * requests` into a 2-D table is not tile-aligned for 12
+        # requests).
+        o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
+        scr = ctx.scr
+        return [
+            pltpu.make_async_copy(ctx.extra[src].at[o], scr[dst], scr["qi_tsem"].at[i])
+            for i, (src, dst) in enumerate(((CKTAB, "qi_ckw"), (MTAB, "qi_mtw")))
+        ]
+
+    def prefetch_next(self, ctx: Any, l: Any) -> None:  # noqa: E741
+        if not self.hbm_tables:
+            return
+        for c in self._table_copies(ctx, l):
+            c.start()
+
     def load_tables(self, ctx: Any, l: Any) -> None:  # noqa: E741
         """Copy this layer's table rows into the SMEM windows (`hbm_tables` only)."""
         if not self.hbm_tables:
             return
-        # HBM tables are [layers, requests, cols]: a layer is one whole leading-dim
-        # block (a
-        # row offset `o * requests` into a 2-D table is not tile-aligned for 12
-        # requests).
-        o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
-        scr = ctx.scr
-        cps = [
-            pltpu.make_async_copy(ctx.extra[src].at[o], scr[dst], scr["qi_tsem"].at[i])
-            for i, (src, dst) in enumerate(((CKTAB, "qi_ckw"), (MTAB, "qi_mtw")))
-        ]
-        for c in cps:
-            c.start()
+        cps = self._table_copies(ctx, l)
+        if ctx.xlayer_prefetch is not None:
+
+            @pl.when(l == 0)
+            def _():
+                for c in cps:
+                    c.start()
+
+        else:
+            for c in cps:
+                c.start()
         for c in cps:
             c.wait()
 
@@ -557,7 +586,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         bits = jnp.where(
             ids < nv, pltpu.bitcast(scr["qi_s"][...].reshape(MB, S, 128), I32), -1
         )
-        thr, tmax = ix.thresholds(bits, ids, nv, K, G)
+        thr, tmax = ix.thresholds(bits, ids, nv, K, G, fast=self.fast_thr)
         scr["qi_th"][...] = jnp.broadcast_to(thr, (MB, 1, 128))
         scr["qi_tm"][...] = jnp.broadcast_to(tmax, (MB, 1, 128))
         scr["qi_nv"][...] = jnp.broadcast_to(nv, (MB, 1, 128))

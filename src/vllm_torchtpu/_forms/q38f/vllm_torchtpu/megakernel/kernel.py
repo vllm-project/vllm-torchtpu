@@ -26,6 +26,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
+from . import pool_alias
 from .comm import AllReduceRing
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
@@ -68,6 +69,7 @@ class KernelContext:
     sc: Any
     norm_x: Any = None
     raw_refs: Any = None
+    xlayer_prefetch: Any = None
 
     def block_params(self, name: str) -> Any:
         """Return the build-time parameters computed by `Block.plan_params`."""
@@ -143,6 +145,10 @@ def build(
         O = dict(zip(o_names, refs[k_ : k_ + len(o_names)]))  # noqa: E741
         out_ref = O["hidden"]
         scr = dict(zip(s_names, refs[k_ + len(o_names) :]))
+        for _aname, _pkey, _roff, _nr, _ash, _adt in core_plan.scratch_aliases:
+            scr[_aname] = pool_alias.view(
+                scr[_pkey].at[pl.ds(_roff, _nr)], _ash, _adt
+            )
         pool_key = POOL_STATE_NAME
         raw_refs = (
             (O[pool_key] if bool(ex.interpret) else ST[pool_key])
@@ -156,6 +162,64 @@ def build(
 
         stream = TwoRing(sp, W, scr, me, interpret=bool(ex.interpret), skip=skip, sc=sc)
         comm = AllReduceRing(cp, scr, me, skip=skip, sc=sc)
+        xlayer_on = (
+            bool(tiles.xlayer_prefetch)
+            and g.L > 1
+            and not skip
+            and any(
+                getattr(sl, "ar_slot", None) == 1
+                and getattr(getattr(sl, "inner", sl), "_emits_xlayer_prefetch", False)
+                for sl in model_spec.layer_type.slots
+            )
+        )
+
+        def _xlayer_prefetch(_caller_ctx: Any, l: Any) -> None:  # noqa: E741
+            slot0 = model_spec.layer_type.slots[0]
+
+            @pl.when(l + 1 < g.L)
+            def _():
+                nl = l + 1
+                with sc("xlayer_prefetch", 2):
+                    if isinstance(slot0, SwitchSlot):
+                        active = slot0.active_branches
+                        if len(active) == 1:
+                            b = active[0]
+                            b_ctx = (
+                                b._inner_ctx(ctx)
+                                if hasattr(b, "_inner_ctx")
+                                else ctx
+                            )
+                            getattr(b, "inner", b).prefetch_next(b_ctx, nl)
+                        elif len(active) == 2:
+                            c0 = slot0.active_counts[0]
+                            is_b1 = (nl % slot0.period) >= c0
+                            b0, b1 = active[0], active[1]
+
+                            @pl.when(is_b1)
+                            def _():
+                                b1_ctx = (
+                                    b1._inner_ctx(ctx)
+                                    if hasattr(b1, "_inner_ctx")
+                                    else ctx
+                                )
+                                getattr(b1, "inner", b1).prefetch_next(b1_ctx, nl)
+
+                            @pl.when(jnp.logical_not(is_b1))
+                            def _():
+                                b0_ctx = (
+                                    b0._inner_ctx(ctx)
+                                    if hasattr(b0, "_inner_ctx")
+                                    else ctx
+                                )
+                                getattr(b0, "inner", b0).prefetch_next(b0_ctx, nl)
+                    else:
+                        b_ctx = (
+                            slot0._inner_ctx(ctx)
+                            if hasattr(slot0, "_inner_ctx")
+                            else ctx
+                        )
+                        getattr(slot0, "inner", slot0).prefetch_next(b_ctx, nl)
+
         ctx = KernelContext(
             g=g,
             ex=ex,
@@ -175,6 +239,7 @@ def build(
             skip=skip,
             sc=sc,
             raw_refs=raw_refs,
+            xlayer_prefetch=_xlayer_prefetch if xlayer_on else None,
         )
 
         # ------------------------------ layer loop ------------------------------

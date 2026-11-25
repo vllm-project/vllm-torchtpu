@@ -38,6 +38,7 @@ from jax.sharding import PartitionSpec as P
 import os
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.megakernel.blocks.moe.params import MoETunables
 from vllm_torchtpu.megakernel.exec_spec import DebugOptions, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.ops import F32, REC
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
@@ -46,7 +47,14 @@ from vllm_torchtpu.megakernel.wholestep.qsa_full_c import IR_NEW, KR_NEW, UNION_
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
 
 from .qwen38_scatter import scatter_gdn_ckpts_fast
-from .qwen38_segment_call import GDN_META, T_VERIFY, gdn_blocks, ring_depths, segment_tiles
+from .qwen38_segment_call import (
+    GDN_META,
+    T_VERIFY,
+    _safe_valid_rows,
+    gdn_blocks,
+    ring_depths,
+    segment_tiles,
+)
 from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import main_kv_dcp
 
 from .qwen38_wholestep_cache import QSALayerCache, wholestep_qsa_writes
@@ -100,7 +108,10 @@ def indexed_options() -> dict:
     return dict(
         LONG_CONTEXT, shard_index=SHARD_INDEX, union_attn=UNION_ATTN, union_stats=union_stats_on(),
         loop_requests=LOOP_REQUESTS, union_phys=UNION_ATTN and UNION_PHYS, dcp=main_kv_dcp(),
-        compressed_dcp=compressed_dcp(), **_d08s1_options(), **_idx_options(), **_selloop_options(), **_union_pipe_options(),  # q38 L1-D08S1 / L1-IDX / L1-SELLOOP, q38 L2-UAPIPE
+        compressed_dcp=compressed_dcp(),
+        **({"skip_rowcompact": True} if UNION_ATTN and envs.VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT else {}),
+        **({"fast_thr": True} if envs.VLLM_TPU_MK_INDEXER_FAST_THR else {}),
+        **_d08s1_options(), **_idx_options(), **_selloop_options(), **_union_pipe_options(),  # q38 L1-D08S1 / L1-IDX / L1-SELLOOP, q38 L2-UAPIPE
     )
 
 
@@ -121,16 +132,117 @@ def wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
     # VLLM_TPU_MK_GDN_HM=0 restores the whole-state update.
     if os.environ.get("VLLM_TPU_MK_GDN_HM", "1") not in ("", "0"):
         t = t.with_blocks({"gdn": {"gdn_head_major": True}})
+    # VLLM_TPU_MK_AR_HIER_SMALL: hier=1 up to 8 rows (exact vs hier=2; envs.py).
+    # Preserve hier=1 even when E7 / EXACT_WIDTH picks default hier=5 on small rows.
+    if envs.VLLM_TPU_MK_AR_HIER_SMALL and B <= 8 and t.hier in (2, 5):
+        t = dataclasses.replace(t, hier=1)
     # VLLM_TPU_MK_HIER=N (bench sweeps): override the all-reduce hierarchy.
     hier = os.environ.get("VLLM_TPU_MK_HIER", "")
     if hier:
         t = dataclasses.replace(t, hier=int(hier))
+    # VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE: 128+ rows under main-KV DCP-2 drop one more
+    # expert ring slot (2 MiB) unless AR2D single-slot already saves that margin.
+    if (
+        envs.VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE
+        and main_kv_dcp() > 1
+        and B >= 128
+        and not (t.hier == 4 and t.ar2d_single_slot)
+    ):
+        t = dataclasses.replace(t, nbe=max(2, t.nbe - 1))
+    # VLLM_TPU_MK_ROW_BUCKET: each expert's e13 / e2 on its gathered routed rows (PIPE_EP;
+    # bitwise vs the dense loop, aligned [8, 128] tile loads). No-op up to 16 rows.
+    if envs.VLLM_TPU_MK_ROW_BUCKET:
+        t = t.with_blocks({"moe": {"row_bucket": True}})
+    if envs.VLLM_TPU_MK_HC_MOE_FUSED:
+        t = t.with_blocks({"moe": {"rb_hoist": True}})
+    # VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC: vectorized routed-expert dedup (exact; envs.py),
+    # from 8 rows up.
+    if envs.VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC and B >= 8:
+        t = t.with_blocks({"moe": {"dedup_vec": True}})
+    t = _vmem_cuts(t, B)
     # VLLM_TPU_MK_RINGS=nbe:nbd (bench sweeps): override the ring depths.
     rings = os.environ.get("VLLM_TPU_MK_RINGS", "") or _ring_s1(B)  # q38 L1-IDX RING-S1 (per bucket, S1 on)
     if rings:
         nbe, nbd = (int(x) for x in rings.split(":"))
         t = dataclasses.replace(t, nbe=nbe, nbd=nbd)
+    if envs.VLLM_TPU_MK_REL_FETCH_LARGE and B >= 48:
+        t = dataclasses.replace(t, rel_fetch=True)
     return t if not _gdnink_rel_fetch(B) else dataclasses.replace(t, rel_fetch=True)  # q38 L1-GDNINK (GDN-REL-FETCH), same line
+
+
+_SUPPORTED_VMEM_CUTS = frozenset({"alias", "vmem64", "ring"})
+
+
+def _vmem_cuts(t: Tiles, B: int) -> Tiles:
+    """Apply opt-in `VLLM_TPU_MK_SCRATCH_ALIAS` and `VLLM_TPU_MK_VMEM_CUTS`.
+
+    `VLLM_TPU_MK_VMEM_CUTS` runs for `B >= VLLM_TPU_MK_VMEM_CUT_ROWS` and
+    supports `alias` (`Tiles.scratch_alias`), `vmem64` (scoped limit 62 -> 64 MiB),
+    and `ring` (`VMEM_CUT_RINGS` / `VMEM_CUT_RINGS_AR2D_SS`). Unported core-cut
+    tokens (`io`, `chunk`, `acc`, `lean`) raise `ValueError` rather than silently
+    enabling oversized ring depths. `VLLM_TPU_MK_RINGS` and `VLLM_TPU_MK_RING_S1`
+    still override after this helper.
+    """
+    raw = str(envs.VLLM_TPU_MK_VMEM_CUTS or "")
+    cuts = {x.strip() for x in raw.split(",") if x.strip()}
+    unknown = sorted(cuts - _SUPPORTED_VMEM_CUTS)
+    if unknown:
+        raise ValueError(
+            f"VLLM_TPU_MK_VMEM_CUTS={raw!r} contains unsupported tokens {unknown}; "
+            f"supported in oxpd: {sorted(_SUPPORTED_VMEM_CUTS)}"
+        )
+    if envs.VLLM_TPU_MK_SCRATCH_ALIAS and not t.scratch_alias:
+        t = dataclasses.replace(t, scratch_alias=True)
+    if not cuts or B < int(envs.VLLM_TPU_MK_VMEM_CUT_ROWS):
+        return t
+    upd: dict[str, Any] = {}
+    if "alias" in cuts:
+        upd["scratch_alias"] = True
+    if "vmem64" in cuts:
+        upd["vmem_mib"] = 64
+    if "ring" in cuts and not (main_kv_dcp() > 1 and B <= 32):
+        # Keep deeper AR2D_SS rings gated off under main_kv_dcp > 1: with dcp=2,
+        # B=96 (12,3) and B=128 (9,3) exceed scoped VMEM, while B=128 (6,3) fits.
+        if (
+            t.hier == 4
+            and t.ar2d_single_slot
+            and main_kv_dcp() <= 1
+            and B in VMEM_CUT_RINGS_AR2D_SS
+        ):
+            upd["nbe"], upd["nbd"] = VMEM_CUT_RINGS_AR2D_SS[B]
+        elif B in VMEM_CUT_RINGS:
+            upd["nbe"], upd["nbd"] = VMEM_CUT_RINGS[B]
+        if (
+            "nbe" in upd
+            and envs.VLLM_TPU_MK_HC_MOE_FUSED
+            and main_kv_dcp() > 1
+            and B >= 96
+        ):
+            upd["nbe"] = min(upd["nbe"], 8)
+    return dataclasses.replace(t, **upd) if upd else t
+
+
+# (expert, dense) ring slots per bucket under opt-in `ring` cut (`VLLM_TPU_MK_VMEM_CUTS`).
+# Note: in `oxpd`, verify scoped VMEM headroom before setting `ring` at large `B` when
+# `io`/`chunk`/`acc`/`lean` cuts are not present (see also `VLLM_TPU_MK_RING_S1`).
+VMEM_CUT_RINGS: dict[int, tuple[int, int]] = {
+    24: (12, 8),
+    32: (12, 7),
+    48: (12, 4),
+    64: (12, 4),
+    80: (12, 3),
+    96: (9, 3),
+    128: (6, 3),
+}
+
+# Opt-in extra ring depths unlocked ONLY when `hier == 4` (AR2D_ANY16) AND
+# `VLLM_TPU_MK_AR2D_SINGLE_SLOT=1` and `main_kv_dcp() <= 1`.
+VMEM_CUT_RINGS_AR2D_SS: dict[int, tuple[int, int]] = {
+    64: (12, 5),
+    80: (12, 4),
+    96: (12, 3),
+    128: (9, 3),
+}
 
 
 def _wholestep_tiles(B: int, max_groups: int = 0) -> Tiles:
@@ -205,8 +317,11 @@ def build_wholestep_call(
             n_layers=n_att, **_l47f_options(L, g.att_every),  # q38 L1-L47F: the sink export ({} when off)
             **indexed_options(),
         ),
+        hc_fp8=envs.VLLM_TPU_MK_HC_FP8,
+        hc_fused=envs.VLLM_TPU_MK_HC_MOE_FUSED,
     )
     stats = union_stats_on() or _l47f_sink_out(L, g.att_every)  # q38 L1-L47F: outs[6] = the sink export (not with stats)
+    skip_pad = bool(ex.resolved_tiles.block("moe", MoETunables).skip_pad)
     fn, k_specs, _, n_w = make_flat_segment_step(
         mesh,
         spec,
@@ -349,6 +464,8 @@ def build_wholestep_call(
         rb, wb, hi = gdn_blocks(meta, NS, write)
         xs = dict(zip(names, inputs(pool, tables, positions, starts, context, trig)))
         xs.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32)); xs.update(_live_xs(ex, meta[3], NS, T)); xs.update(_ink_xs(fn, wb))  # noqa: E702  q38 X-GLUE-1
+        if skip_pad:
+            xs["moe_valid_rows"] = _safe_valid_rows(starts, B)
         outs = fn(pos0, x, *(xs[k] for k in fn.extra_names), *w); outs = _ink_outs(fn, outs, pool, interpret)  # noqa: E702  q38 X-GLUE-1
         res, conv_ck, rec_ck, kv, kr, ir = outs[:6]
         pool = writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables, positions, starts, context,
@@ -388,6 +505,8 @@ def build_wholestep_call(
         rb, wb, hi = gdn_blocks_shared(off, qsl, seq, sts, cks, NS, write)
         xs = dict(zip(names, inputs(pool, tables, positions, starts, context, trig)))
         xs.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32)); xs.update(_live_xs(ex, qsl, NS, T)); xs.update(_ink_xs(fn, wb))  # noqa: E702  q38 X-GLUE-1
+        if skip_pad:
+            xs["moe_valid_rows"] = _safe_valid_rows(starts, B)
         outs = fn(pos0, x, *(xs[k] for k in fn.extra_names), *w); outs = _ink_outs(fn, outs, pool, interpret)  # noqa: E702  q38 X-GLUE-1 (call_shared)
         res, conv_ck, rec_ck, kv, kr, ir = outs[:6]
         pool = writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables, positions, starts, context,

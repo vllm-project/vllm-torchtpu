@@ -120,6 +120,15 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
     outputs).
     """
 
+    def _skip_qi_ids(self) -> bool:
+        """SMEM `qi_ids` is read only by non-union `attend_row`."""
+        return self.skip_rowcompact and self.union_attn
+
+    def _need_ids(self) -> bool:
+        """Whether row-level `qi_id` / `compact_row` is consumed anywhere."""
+        skip = self.skip_rowcompact and self.union_attn
+        return (not skip) or self.debug
+
     @_scoped("qsa_score")
     def _score_request(self, ctx: Any, *a: Any, **k: Any) -> Any:
         return super()._score_request(ctx, *a, **k)
@@ -163,7 +172,15 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> list[ScratchReq]:
         nreq, f8 = ex.MB // ex.T, jnp.float8_e4m3fn
-        return super().scratch(g, ex, plan) + [
+        drop: set[str] = set()
+        if self._skip_qi_ids():
+            drop.add("qi_ids")
+        if not self._need_ids():
+            drop.add("qi_id")
+        base_scratch = [
+            req for req in super().scratch(g, ex, plan) if req.name not in drop
+        ]
+        return base_scratch + [
             ScratchReq("qc_ring", pltpu.VMEM((8, ix.IDX_DIM), BF16)),
             ScratchReq("qc_rope", pltpu.VMEM((1, 128), F32)),
             ScratchReq("qc_ck", pltpu.VMEM((1, ix.IDX_DIM), BF16)),
@@ -245,7 +262,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         indexer."""
         nreq = ex.MB // ex.T
         npr = -(-nreq // self._runs(ex))
-        return npr, npr * ex.T, -(-(self.budget + 2) // 128) * 128
+        width = (self.budget + 2) if self._need_ids() else 2
+        return npr, npr * ex.T, -(-width // 128) * 128
 
     def _runs(self, ex: ExecSpec) -> int:
         """Request runs of the sharded indexer: one per rank, or per pair (`compressed_dcp`:
@@ -516,7 +534,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 ids_h = ids[:h]
                 sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32)
                 with ctx.stream.sc("qsa_thr", 2):
-                    thr, tmax = ix.thresholds(jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G)
+                    thr, tmax = ix.thresholds(
+                        jnp.where(ids_h < nv_h, sc, -1),
+                        ids_h,
+                        nv_h,
+                        K,
+                        G,
+                        fast=self.fast_thr,
+                    )
                 scr["qi_th"][pl.ds(lo + o, h)] = jnp.broadcast_to(thr, (h, 1, 128))
                 scr["qi_tm"][pl.ds(lo + o, h)] = jnp.broadcast_to(tmax, (h, 1, 128))
                 with ctx.stream.sc("qsa_cdcp_thx", 2):
@@ -533,12 +558,21 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0, n)].reshape(n, S, 128), I32)
                 bits = jnp.where(ids < nv, sc, -1)
                 with ctx.stream.sc("qsa_thr", 2):
-                    thr, tmax = ix.thresholds(bits, ids, nv, K, G)
+                    thr, tmax = ix.thresholds(bits, ids, nv, K, G, fast=self.fast_thr)
                 scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
                 scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
             scr["qi_nv"][pl.ds(lo, n)] = jnp.broadcast_to(nv, (n, 1, 128))
-            consts = ix.compact_consts(S, K)
-            lid = consts[-1]
+            need_ids = self._need_ids()
+            skip_qi_ids = self._skip_qi_ids()
+            if need_ids:
+                consts: Any = ix.compact_consts(S, K)
+                lid = consts[-1]
+            else:
+                consts = None
+                lid = (
+                    jax.lax.broadcasted_iota(I32, (S, 128), 0) * 128
+                    + jax.lax.broadcasted_iota(I32, (S, 128), 1)
+                )
             if cdcp:  # selection masks by group id; compaction yields positions (mapped below)
                 lid = self._cdcp_gid(ctx, lid)
             scr["qi_z"][...] = jnp.zeros((1, 128), I32)
@@ -559,40 +593,39 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 # Recent groups (>= g_a) leave the pool path; remember whether g_a was
                 # selected.
                 scr["qc_sga"][r] = jnp.sum((sel & (lid == ga)).astype(I32))
-                bp = jnp.where(lid < ga, b, -1)
-                # Selection of the pool path: the same set restricted to ids < g_a. With
-                # `n_vis`
-                # clamped to g_a the compaction sees exactly those ids (select-all of
-                # the kept).
-                kept = jnp.sum((sel & (lid < ga)).astype(I32))
-                b2 = jnp.where(sel & (lid < ga), bp, -1)
+                s2 = sel & (lid < ga)
+                kept = jnp.sum(s2.astype(I32))
                 if (
                     self.union_attn
                 ):  # row bit r - lo of every pool-path group it selects
                     scr["qu_code"][...] = scr["qu_code"][...] | jnp.where(
-                        sel & (lid < ga), jnp.left_shift(1, r - lo), 0
+                        s2, jnp.left_shift(1, r - lo), 0
                     )
-                pos = ix.compact_row(
-                    b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
-                    jnp.zeros((1, 1), I32) + kept, K, consts,
-                )
-                scr["qi_id"][r] = self._cdcp_gid(ctx, pos) if cdcp else pos
-                cs = [
-                    pltpu.make_async_copy(
-                        scr["qi_id"].at[r],
-                        scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
-                        scr["qi_sem"].at[1],
-                    ),
-                    pltpu.make_async_copy(
-                        scr["qi_z"],
-                        scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)],
-                        scr["qi_sem"].at[2],
-                    ),
-                ]
-                for c in cs:
-                    c.start()
-                for c in cs:
-                    c.wait()
+                if need_ids:
+                    bp = jnp.where(lid < ga, b, -1)
+                    b2 = jnp.where(s2, bp, -1)
+                    pos = ix.compact_row(
+                        b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
+                        jnp.zeros((1, 1), I32) + kept, K, consts,
+                    )
+                    scr["qi_id"][r] = self._cdcp_gid(ctx, pos) if cdcp else pos
+                    if not skip_qi_ids:
+                        cs = [
+                            pltpu.make_async_copy(
+                                scr["qi_id"].at[r],
+                                scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
+                                scr["qi_sem"].at[1],
+                            ),
+                            pltpu.make_async_copy(
+                                scr["qi_z"],
+                                scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)],
+                                scr["qi_sem"].at[2],
+                            ),
+                        ]
+                        for c in cs:
+                            c.start()
+                        for c in cs:
+                            c.wait()
                 scr["qi_kvl"][r] = 4 * kept
                 return carry
 
@@ -618,7 +651,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         code = code_all if D == 1 else jnp.where(
                             jax.lax.rem(gidx // gpp, D) == r, code_all, 0
                         )
-                        ids, codes, nu = ua.compact_union(code, KU, ua.union_consts(S, KU))
+                        ids, codes, nu = ua.compact_union(
+                            code, KU, ua.union_consts(S, KU), t1=(T == 1), fast=self.fast_thr
+                        )
                         if cdcp:
                             ids = self._cdcp_gid(ctx, ids)
                         at = pl.multiple_of(r * KU, 128) if cdcp else r * KU
@@ -753,15 +788,25 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         lo = self._run(ctx) * rows
         scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
 
+        need_ids = self._need_ids()
+        skip_qi_ids = self._skip_qi_ids()
+
         def pack(i: Any, carry: Any) -> Any:
             r = jnp.minimum(lo + i, MB - 1)  # past the last request: never read
-            scr["qg_send"][i, :, pl.ds(0, K)] = scr["qi_id"][r]
-            head = jnp.where(lane == K, scr["qi_kvl"][r], 0)
-            scr["qg_send"][i] = jnp.where(
-                lane < K,
-                scr["qg_send"][i],
-                jnp.where(lane == K + 1, scr["qc_sga"][r], head),
-            )
+            if need_ids:
+                scr["qg_send"][i, :, pl.ds(0, K)] = scr["qi_id"][r]
+                head = jnp.where(lane == K, scr["qi_kvl"][r], 0)
+                scr["qg_send"][i] = jnp.where(
+                    lane < K,
+                    scr["qg_send"][i],
+                    jnp.where(lane == K + 1, scr["qc_sga"][r], head),
+                )
+            else:
+                scr["qg_send"][i] = jnp.where(
+                    lane == 0,
+                    scr["qi_kvl"][r],
+                    jnp.where(lane == 1, scr["qc_sga"][r], 0),
+                )
             return carry
 
         jax.lax.fori_loop(0, rows, pack, 0)
@@ -770,25 +815,30 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         def unpack(r: Any, carry: Any) -> Any:
             o = r // T // npr
             row = scr["qg_recv"][o, r - o * rows]
-            scr["qi_id"][r] = row[:, :K]
-            scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K, row, 0))
-            scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K + 1, row, 0))
-            cs = [
-                pltpu.make_async_copy(
-                    scr["qi_id"].at[r],
-                    scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
-                    scr["qi_sem"].at[1],
-                ),
-                pltpu.make_async_copy(
-                    scr["qi_z"],
-                    scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)],
-                    scr["qi_sem"].at[2],
-                ),
-            ]
-            for c in cs:
-                c.start()
-            for c in cs:
-                c.wait()
+            if need_ids:
+                scr["qi_id"][r] = row[:, :K]
+                scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K, row, 0))
+                scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K + 1, row, 0))
+                if not skip_qi_ids:
+                    cs = [
+                        pltpu.make_async_copy(
+                            scr["qi_id"].at[r],
+                            scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)],
+                            scr["qi_sem"].at[1],
+                        ),
+                        pltpu.make_async_copy(
+                            scr["qi_z"],
+                            scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)],
+                            scr["qi_sem"].at[2],
+                        ),
+                    ]
+                    for c in cs:
+                        c.start()
+                    for c in cs:
+                        c.wait()
+            else:
+                scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == 0, row, 0))
+                scr["qc_sga"][r] = jnp.sum(jnp.where(lane == 1, row, 0))
             return carry
 
         jax.lax.fori_loop(0, MB, unpack, 0)

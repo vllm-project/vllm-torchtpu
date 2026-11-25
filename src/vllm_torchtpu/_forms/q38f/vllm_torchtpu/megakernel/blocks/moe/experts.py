@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -27,6 +29,21 @@ from .context import MoEEmit
 from .ring import egive, egive_group, es_wait, etake
 
 
+def _wcol(m: MoEEmit, e: Any) -> Any:
+    """Extract expert `e`'s normalized routing-weight column `[MR, 1]`."""
+    if m.mp.local_wn:
+        return jnp.sum(
+            jnp.where(m.lane128 == lax.bitwise_and(e, 127), m.scr["wn"][...], 0.0),
+            axis=1,
+            keepdims=True,
+        )
+    return jnp.sum(
+        jnp.where(m.lane_e8 == e, m.scr["wn"][...], 0.0),
+        axis=1,
+        keepdims=True,
+    )
+
+
 def gate_up(m: MoEEmit, i, w13):
     mp, scr, stream = m.mp, m.scr, m.stream
     IR, NSS = mp.IR, mp.NSS
@@ -35,11 +52,11 @@ def gate_up(m: MoEEmit, i, w13):
 
 
 def down(m: MoEEmit, i, mid, w2):
-    ex, lane_e8, mp, scr, stream = m.ex, m.lane_e8, m.mp, m.scr, m.stream
+    ex, mp, scr, stream = m.ex, m.mp, m.scr, m.stream
     MR = ex.MR
     CH, H, IR, NSS = mp.CH, mp.H, mp.IR, mp.NSS
     e, s, part = scr["elist"][i], i % NSS, scr["part"]
-    wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
+    wcol = _wcol(m, e)
     for j in range(H // CH):
         lo = 2 * IR + j * CH
         y = stream.mm(mid, w2[:, j * CH : (j + 1) * CH])[0:MR]
@@ -48,7 +65,7 @@ def down(m: MoEEmit, i, mid, w2):
 
 
 def expert(m: MoEEmit, l_idx, i, carry):
-    ex, lane_e8, mp, scr, stream, tk = m.ex, m.lane_e8, m.mp, m.scr, m.stream, m.tk
+    ex, mp, scr, stream, tk = m.ex, m.mp, m.scr, m.stream, m.tk
     MB, MR = ex.MB, ex.MR
     CH, H, IR, NSS, T13, T2, TE = mp.CH, mp.H, mp.IR, mp.NSS, mp.T13, mp.T2, mp.TE
     e = scr["elist"][i]
@@ -97,7 +114,7 @@ def expert(m: MoEEmit, l_idx, i, carry):
     h = h * scr["es"][s, :, : 2 * IR]
     mid_ = rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:]))
     xb2[:, :IR] = mid_.astype(BF16)
-    wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
+    wcol = _wcol(m, e)
     u2 = base + T13
     if T2 == 1:
         w2 = etake(m, "e2", u2)[...]
@@ -192,8 +209,9 @@ def _mm(stream, x, w):
 
 
 def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
-    ex, lane_e8, mp, scr, stream, tk = m.ex, m.lane_e8, m.mp, m.scr, m.stream, m.tk
+    ex, mp, scr, stream, tk = m.ex, m.mp, m.scr, m.stream, m.tk
     MB, MR = ex.MB, ex.MR
+    R_ACT = MR if (mp.exact_width and MR < MB) else MB
     H, IR, NSS, T13, T2, TE = mp.H, mp.IR, mp.NSS, mp.T13, mp.T2, mp.TE
 
     @pl.when(n_hit > 0)
@@ -205,15 +223,15 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
         DIRECT0 = mp.r2_direct_store
 
         if not DIRECT0:
-            acc13[...] = jnp.zeros((MB, BN), F32)
+            acc13[0:R_ACT, :BN] = jnp.zeros((R_ACT, BN), F32)
         for t in range(T13):
             w13 = etake(m, "e13", t)
             k0 = t * TK13
-            mm13 = _mm(stream, xb[:, k0 : k0 + TK13], w13[...])
+            mm13 = _mm(stream, xb[0:R_ACT, k0 : k0 + TK13], w13[...])
             if DIRECT0 and t == 0:
-                acc13[:, :BN] = mm13
+                acc13[0:R_ACT, :BN] = mm13
             else:
-                acc13[:, :BN] += mm13
+                acc13[0:R_ACT, :BN] += mm13
             if mp.group_rel:
                 if t % 2 == 1:
                     egive_group(m, [(t - 1, t - 1), (t, t)], l_idx)
@@ -223,9 +241,9 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 egive(m, t, l_idx, t)
         es_wait(m, 0)
         if "mid" not in _ABLATE:
-            h0 = acc13[:, :BN] * scr["es"][0, :, :BN]
+            h0 = acc13[0:R_ACT, :BN] * scr["es"][0, :, :BN]
             mid0 = rnd(rnd(jax.nn.silu(rnd(h0[:, :IR]))) * rnd(h0[:, IR:]))
-            xb2[:, :IR] = mid0.astype(BF16)
+            xb2[0:R_ACT, :IR] = mid0.astype(BF16)
 
         def body_ep(i, _):
             e = scr["elist"][i]
@@ -235,8 +253,8 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
             base_nxt13 = (i + 1) * TE
 
             if not DIRECT0:
-                acc[:, :H] = jnp.zeros((MB, H), F32)
-                acc13[...] = jnp.zeros((MB, BN), F32)
+                acc[0:R_ACT, :H] = jnp.zeros((R_ACT, H), F32)
+                acc13[0:R_ACT, :BN] = jnp.zeros((R_ACT, BN), F32)
 
             for s_step in range(T2):
                 u2 = base_w2 + s_step
@@ -249,14 +267,14 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 w13_0 = etake(m, "e13", u13_0)
                 k2 = s_step * TK2
                 k13_0 = t0 * TK13
-                mm2 = _mm(stream, xb2[:, k2 : k2 + TK2], w2[...])
-                mm13_0 = _mm(stream, xb[:, k13_0 : k13_0 + TK13], w13_0[...])
+                mm2 = _mm(stream, xb2[0:R_ACT, k2 : k2 + TK2], w2[...])
+                mm13_0 = _mm(stream, xb[0:R_ACT, k13_0 : k13_0 + TK13], w13_0[...])
                 if DIRECT0 and s_step == 0:
-                    acc[:, :H] = mm2
-                    acc13[:, :BN] = mm13_0
+                    acc[0:R_ACT, :H] = mm2
+                    acc13[0:R_ACT, :BN] = mm13_0
                 else:
-                    acc[:, :H] += mm2
-                    acc13[:, :BN] += mm13_0
+                    acc[0:R_ACT, :H] += mm2
+                    acc13[0:R_ACT, :BN] += mm13_0
                 if mp.group_rel:
                     egive_group(m, [(u2, T13 + s_step), (u13_0, t0)], l_idx)
                 else:
@@ -265,23 +283,21 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
 
                 w13_1 = etake(m, "e13", u13_1)
                 k13_1 = t1 * TK13
-                acc13[:, :BN] += _mm(stream, xb[:, k13_1 : k13_1 + TK13], w13_1[...])
+                acc13[0:R_ACT, :BN] += _mm(
+                    stream, xb[0:R_ACT, k13_1 : k13_1 + TK13], w13_1[...]
+                )
                 egive(m, u13_1, l_idx, t1)
 
-            wcol = jnp.sum(
-                jnp.where(lane_e8 == e, scr["wn"][...], 0.0),
-                axis=1,
-                keepdims=True,
-            )
+            wcol = _wcol(m, e)
             y = rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
             if "acc" not in _ABLATE:
                 part[0:MR, :] += wcol * y
 
             es_wait(m, i + 1)
             if "mid" not in _ABLATE:
-                h_nxt = acc13[:, :BN] * scr["es"][s_nxt, :, :BN]
+                h_nxt = acc13[0:R_ACT, :BN] * scr["es"][s_nxt, :, :BN]
                 mid_nxt = rnd(rnd(jax.nn.silu(rnd(h_nxt[:, :IR]))) * rnd(h_nxt[:, IR:]))
-                xb2[:, :IR] = mid_nxt.astype(BF16)
+                xb2[0:R_ACT, :IR] = mid_nxt.astype(BF16)
             return 0
 
         lax.fori_loop(0, n_hit - 1, body_ep, 0)
@@ -291,16 +307,16 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
         s_last = i_last % NSS
         base_last_w2 = i_last * TE + T13
         if not DIRECT0:
-            acc[:, :H] = jnp.zeros((MB, H), F32)
+            acc[0:R_ACT, :H] = jnp.zeros((R_ACT, H), F32)
         for s_step in range(T2):
             u2 = base_last_w2 + s_step
             w2 = etake(m, "e2", u2)
             k2 = s_step * TK2
-            mm2 = _mm(stream, xb2[:, k2 : k2 + TK2], w2[...])
+            mm2 = _mm(stream, xb2[0:R_ACT, k2 : k2 + TK2], w2[...])
             if DIRECT0 and s_step == 0:
-                acc[:, :H] = mm2
+                acc[0:R_ACT, :H] = mm2
             else:
-                acc[:, :H] += mm2
+                acc[0:R_ACT, :H] += mm2
             if mp.group_rel:
                 if s_step % 2 == 1:
                     egive_group(
@@ -312,11 +328,7 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                     egive(m, u2, l_idx, T13 + s_step)
             else:
                 egive(m, u2, l_idx, T13 + s_step)
-        wcol_last = jnp.sum(
-            jnp.where(lane_e8 == e_last, scr["wn"][...], 0.0),
-            axis=1,
-            keepdims=True,
-        )
+        wcol_last = _wcol(m, e_last)
         y_last = rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
         if "acc" not in _ABLATE:
             part[0:MR, :] += wcol_last * y_last

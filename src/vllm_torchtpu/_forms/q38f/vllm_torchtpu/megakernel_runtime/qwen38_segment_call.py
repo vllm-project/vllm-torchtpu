@@ -30,9 +30,12 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.megakernel.blocks.moe.params import MoETunables
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models import qwen38
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
+from vllm_torchtpu.megakernel.ops import rup
 
 from .qwen38_gdn_state import gather_gdn_states, scatter_gdn_ckpts
 from .qwen38_scatter import scatter_gdn_ckpts_fast
@@ -66,6 +69,37 @@ def ring_depths(B: int) -> tuple[int, int]:
     return (6, 4) if B <= 64 else (2, 3)
 
 
+def _safe_valid_rows(qsl: Any, B: int) -> Any:
+    """Return active row count `[1] int32` from `query_start_loc`, or `[B]` if empty.
+
+    Warmup dummy tensors (e.g. `c32 DCP=2 mns=12`) may pass an empty 0-element
+    `query_start_loc` (`shape == (0,)`), where indexing `qsl[-1]` would raise
+    `IndexError`.
+    """
+    shape = getattr(qsl, "shape", ())
+    if shape and shape[0] > 0:
+        return jnp.clip(qsl[-1], 0, B).reshape(1).astype(jnp.int32)
+    return jnp.asarray([B], jnp.int32)
+
+
+def moe_e7_hier(B: int, default_hier: int) -> int:
+    """Resolve E7 MoE collective hierarchy: HIER=4 (AR2D) >= min_tokens, else HIER=5 (exact_width)."""
+    ar2d_on = bool(envs.VLLM_TPU_MK_MOE_E7 or envs.VLLM_TPU_MK_MOE_AR2D)
+    exact_on = bool(envs.VLLM_TPU_MK_MOE_E7 or envs.VLLM_TPU_MK_MOE_EXACT_WIDTH)
+    min_tok = int(envs.VLLM_TPU_MK_MOE_AR2D_MIN_TOKENS)
+    mr = rup(B, 8)
+    ar2d_rows_ok = (
+        (mr >= 32 and mr % 16 == 0)
+        if envs.VLLM_TPU_MK_MOE_AR2D_ANY16
+        else (mr % 64 == 0)
+    )
+    if ar2d_on and min_tok > 0 and B >= min_tok and ar2d_rows_ok:
+        return 4
+    if exact_on:
+        return 5
+    return default_hier
+
+
 def segment_tiles(
     B: int, hier: int | None = None, rings: tuple[int, int] | None = None
 ) -> Tiles:
@@ -76,10 +110,34 @@ def segment_tiles(
     all-reduce growth per row, frees VMEM for the expert ring).
     """
     nbe, nbd = rings or DEFAULT_RINGS or ring_depths(B)
-    h = DEFAULT_HIER if hier is None else hier
-    return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=h).with_blocks(
-        {"moe": {"pipe_ep": PIPE_EP, "moe_unroll": True}}
-    )
+    h = moe_e7_hier(B, DEFAULT_HIER) if hier is None else hier
+    skip_pad = bool(envs.VLLM_TPU_MK_MOE_E7 or envs.VLLM_TPU_MK_MOE_SKIP_PAD)
+    exact_width = bool(envs.VLLM_TPU_MK_MOE_E7 or envs.VLLM_TPU_MK_MOE_EXACT_WIDTH)
+    moe_cfg: dict[str, Any] = {
+        "pipe_ep": PIPE_EP,
+        "moe_unroll": True,
+        "skip_pad": skip_pad,
+        "exact_width": exact_width,
+    }
+    if envs.VLLM_TPU_MK_MOE_DIRECT_STORE:
+        moe_cfg["r2_direct_store"] = True
+    if envs.VLLM_TPU_MK_MOE_TOPK_LANES:
+        moe_cfg["topk_lanes"] = True
+    if envs.VLLM_TPU_MK_MOE_LOCAL_WN:
+        moe_cfg["local_wn"] = True
+    blocks: dict[str, dict[str, Any]] = {"moe": moe_cfg}
+    if envs.VLLM_TPU_MK_GDN_VEC_REC:
+        blocks["gdn"] = {"vec_rec": True}
+    return Tiles(
+        ebank=2 << 20,
+        nbe=nbe,
+        nbd=nbd,
+        vmem_mib=62,
+        hier=h,
+        ar2d_any16=bool(envs.VLLM_TPU_MK_MOE_AR2D_ANY16),
+        ar2d_single_slot=bool(envs.VLLM_TPU_MK_AR2D_SINGLE_SLOT),
+        xlayer_prefetch=bool(envs.VLLM_TPU_MK_XLAYER_PREFETCH),
+    ).with_blocks(blocks)
 
 
 # Per GDN layer: state ids, slot read offsets, ckpt ids, query start loc, seq lens
@@ -161,6 +219,7 @@ def build_segment_call(
         interpret=interpret,
     )
     pool_gdn = pool_gdn and has_gdn
+    skip_pad = bool(ex.resolved_tiles.block("moe", MoETunables).skip_pad)
     spec = qwen38.segment_spec(g, R, L=L, head=head, pool_gdn=pool_gdn)
     fn, _, _, n_w = make_flat_segment_step(mesh, spec, ex, extra_outs=_ink_extra_outs(spec, interpret, layout))  # q38 X-GLUE-1
     # `flat_smalls`: the packer passed "smalls" as `[L * S / 128, 128]` (no
@@ -225,6 +284,12 @@ def build_segment_call(
         wb: Any = None
         if has_gdn:
             pool, meta = args[n_lead + n_w], args[n_lead + n_w + 1 :]
+            if skip_pad:
+                named["moe_valid_rows"] = (
+                    _safe_valid_rows(meta[3], B)
+                    if len(meta) > 3
+                    else jnp.asarray([B], jnp.int32)
+                )
             rb, wb, hi = gdn_blocks(
                 meta,
                 NS,
@@ -235,6 +300,8 @@ def build_segment_call(
                 named.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32)); named.update(_ink_xs(fn, wb))  # noqa: E702  q38 X-GLUE-1
             else:
                 states = gather(pool, rb, hi)
+        elif skip_pad:
+            named["moe_valid_rows"] = jnp.asarray([B], jnp.int32)
         xs = tuple(named[k] for k in fn.extra_names)
         outs = fn(pos, x, *xs, *w, *states); outs = _ink_outs(fn, outs, pool, interpret)  # noqa: E702  q38 X-GLUE-1
         if not has_gdn:

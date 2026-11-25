@@ -630,6 +630,29 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_SELECT_OWNED: str = "0"
     VLLM_TPU_MK_QSA_WRITE_ALL: bool = False
     VLLM_TPU_MK_QSA_WRITE_KVAL: bool = False
+    # Megakernel MoE row-bucketing (default off; aligned [8, 128] tile loads)
+    VLLM_TPU_MK_ROW_BUCKET: bool = False
+    VLLM_TPU_MK_HC_FP8: bool = False
+    VLLM_TPU_MK_HC_MOE_FUSED: bool = False
+    # Megakernel all-reduce / MoE E7 collectives & dedup (all default off)
+    VLLM_TPU_MK_AR_HIER_SMALL: bool = False
+    VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC: bool = False
+    VLLM_TPU_MK_MOE_E7: bool = False
+    VLLM_TPU_MK_MOE_AR2D: bool = False
+    VLLM_TPU_MK_MOE_AR2D_MIN_TOKENS: int = 64
+    VLLM_TPU_MK_MOE_AR2D_ANY16: bool = False
+    VLLM_TPU_MK_AR2D_SINGLE_SLOT: bool = False
+    VLLM_TPU_MK_MOE_EXACT_WIDTH: bool = False
+    VLLM_TPU_MK_MOE_SKIP_PAD: bool = False
+    VLLM_TPU_MK_MOE_DIRECT_STORE: bool = False
+    VLLM_TPU_MK_MOE_TOPK_LANES: bool = False
+    VLLM_TPU_MK_MOE_LOCAL_WN: bool = False
+    VLLM_TPU_MK_SCRATCH_ALIAS: bool = False
+    VLLM_TPU_MK_WHOLE_MAX_ROWS: int = 96
+    VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE: bool = False
+    VLLM_TPU_MK_DRAFT_CLEAN_OPERANDS: bool = False
+    VLLM_TPU_MK_VMEM_CUTS: str = ""
+    VLLM_TPU_MK_VMEM_CUT_ROWS: int = 33
     # q38 PORT-BL GDN (begin)
     VLLM_TPU_GDN_LEAN_GLUE3: bool = False
     VLLM_TPU_GDN_LEAN_GLUE3_COUNT: int = 0
@@ -637,6 +660,13 @@ if TYPE_CHECKING:
     # q38 PORT-BL UNION (ported from Benliang Wang, 2ce02bb1a)
     VLLM_TPU_QSA_DECODE_RPA_UNION_O1S: int = 0
     VLLM_TPU_RPA_SCHEDULE_HBM_O1S: bool = False
+    # q38 internal-v3 GDN/QSA ports (begin)
+    VLLM_TPU_MK_REL_FETCH_LARGE: bool = False
+    VLLM_TPU_MK_GDN_VEC_REC: bool = False
+    VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT: bool = False
+    VLLM_TPU_MK_INDEXER_FAST_THR: bool = False
+    VLLM_TPU_MK_XLAYER_PREFETCH: bool = False
+    # q38 internal-v3 GDN/QSA ports (end)
 
 
 def env_with_choices(
@@ -3618,6 +3648,77 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whole-step kernel's own QSA cache values (KV_NEW keys, CK_NEW, RING_NEW) instead of recomputing them in XLA.
     # Read when the whole-step call is built (extra kernel outputs, writer operands), so hashed.
     "VLLM_TPU_MK_QSA_WRITE_KVAL": env_bool("VLLM_TPU_MK_QSA_WRITE_KVAL", False),
+    # Whole-step megakernel MoE routed-row bucketing (PIPE_EP, >16 rows): each expert runs
+    # its matmuls on its gathered routed rows via aligned [8, 128] `rbpreT` tile loads.
+    "VLLM_TPU_MK_ROW_BUCKET": env_bool("VLLM_TPU_MK_ROW_BUCKET", False),
+    # Whole-step megakernel target layers: stream HC mix weights (hdn / hup) as FP8
+    # E4M3 with per-output-column f32 scales (`HCSublayer.fp8_weights`). Default off.
+    "VLLM_TPU_MK_HC_FP8": env_bool("VLLM_TPU_MK_HC_FP8", False),
+    # Whole-step megakernel HC + MoE sublayer pipeline fusion (default off): packs
+    # FP8 HC up-projections into 2 bank-filling [384, 5120] streams (-180 static
+    # ring DMAs at L=45), fuses 4-branch HC up-mix in 512-col registers with zero
+    # scr['acc'] round-trips, and hoists MoE row-bucket gather matrices once per expert.
+    "VLLM_TPU_MK_HC_MOE_FUSED": env_bool("VLLM_TPU_MK_HC_MOE_FUSED", False),
+    # Whole-step megakernel small-bucket all-reduce: hier=1 (2-round flat over
+    # chips) up to B<=8, even when E7 / EXACT_WIDTH picks default hier=5.
+    "VLLM_TPU_MK_AR_HIER_SMALL": env_bool("VLLM_TPU_MK_AR_HIER_SMALL", False),
+    # Megakernel MoE: vectorized first-appearance dedup of routed experts instead of
+    # the scalar SMEM dedup loop (`MoETunables.dedup_vec`). Exact on EP.
+    "VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC": env_bool(
+        "VLLM_TPU_MK_MOE_ROUTE_DEDUP_VEC", False
+    ),
+    # Whole-step / segment megakernel: umbrella flag enabling all E7 decode MoE wins
+    # (VLLM_TPU_MK_MOE_AR2D + VLLM_TPU_MK_MOE_EXACT_WIDTH + VLLM_TPU_MK_MOE_SKIP_PAD).
+    "VLLM_TPU_MK_MOE_E7": env_bool("VLLM_TPU_MK_MOE_E7", False),
+    # Megakernel MoE / HC collective: 2D torus AR2D all-reduce (HIER=4, matching
+    # FUSED_MOE_DECODE_KERNEL_AR2D_MIN_TOKENS) for R=8, H%512==0, MR%64==0, B>=min_tokens.
+    "VLLM_TPU_MK_MOE_AR2D": env_bool("VLLM_TPU_MK_MOE_AR2D", False),
+    "VLLM_TPU_MK_MOE_AR2D_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_MK_MOE_AR2D_MIN_TOKENS", 64
+    ),
+    # Lift HIER=4 AR2D row-divisibility gate from MR%64==0 to MR>=32 and MR%16==0
+    # (covers B=32,48,64,80,96,112,128 instead of falling back to HIER=5/2).
+    "VLLM_TPU_MK_MOE_AR2D_ANY16": env_bool("VLLM_TPU_MK_MOE_AR2D_ANY16", False),
+    # Synchronous HIER=4 AR2D: use 1 scratch/semaphore slot instead of 2 (saves
+    # 1.82 MiB VMEM at B=96, 2.42 MiB at B=128).
+    "VLLM_TPU_MK_AR2D_SINGLE_SLOT": env_bool("VLLM_TPU_MK_AR2D_SINGLE_SLOT", False),
+    # Megakernel MoE: E7 exact-width uneven 2-round RS+AG (HIER=5, [384x4, 256x4] for
+    # H=2560, R=8, zero padding) + MR-row active slicing in PIPE_EP for B<=8.
+    "VLLM_TPU_MK_MOE_EXACT_WIDTH": env_bool("VLLM_TPU_MK_MOE_EXACT_WIDTH", False),
+    # Megakernel MoE: skip padded rows (row >= query_start_loc[-1]) in router weights,
+    # shared gate, expert dedup, and row-bucket counts (matching TPU_MOE_SKIP_PADDED_TOKENS).
+    "VLLM_TPU_MK_MOE_SKIP_PAD": env_bool("VLLM_TPU_MK_MOE_SKIP_PAD", False),
+    # Direct VMEM store on MoE expert tile 0 (skips zero-fill + +=).
+    "VLLM_TPU_MK_MOE_DIRECT_STORE": env_bool("VLLM_TPU_MK_MOE_DIRECT_STORE", False),
+    # Batcher odd-even lane top-k for E >= 128 router gating.
+    "VLLM_TPU_MK_MOE_TOPK_LANES": env_bool("VLLM_TPU_MK_MOE_TOPK_LANES", False),
+    # Rank-local 128-lane `wn` scratch & wcol scan on EP (E % 128 == 0, E > 128).
+    "VLLM_TPU_MK_MOE_LOCAL_WN": env_bool("VLLM_TPU_MK_MOE_LOCAL_WN", False),
+    # Share disjoint SwitchSlot (GDN vs QSA) exact-tiled local VMEM scratch
+    # onto a single uint8 slab via pool_alias.view (zero extra DMA waits).
+    "VLLM_TPU_MK_SCRATCH_ALIAS": env_bool("VLLM_TPU_MK_SCRATCH_ALIAS", False),
+    # Largest whole-step bucket (rows): default 96, at most 128 (the megakernel's
+    # row limit); 0 = default. Above 96 rows may require VMEM cuts and, under
+    # main-KV DCP-2, VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE.
+    "VLLM_TPU_MK_WHOLE_MAX_ROWS": env_nonnegative_int(
+        "VLLM_TPU_MK_WHOLE_MAX_ROWS", 96
+    ),
+    # Main-KV DCP-2 whole-step buckets of 128+ rows: drop one expert ring slot
+    # (nbe - 1, 2 MiB VMEM) when not using single-slot AR2D (`hier == 4`).
+    "VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE": env_bool("VLLM_TPU_MK_WHOLE_DCP_TRIM_NBE", False),
+    # Qwen3.8 draft attention megakernel (`DraftAttn`): hold packed operands as
+    # non-grad nn.Parameter instead of buffers to avoid per-step execute_as_strided.
+    "VLLM_TPU_MK_DRAFT_CLEAN_OPERANDS": env_bool(
+        "VLLM_TPU_MK_DRAFT_CLEAN_OPERANDS", False
+    ),
+    # Whole-step megakernel VMEM cut tokens (comma-separated, applied for rows >=
+    # VLLM_TPU_MK_VMEM_CUT_ROWS): supports `alias` (`Tiles.scratch_alias`), `vmem64`
+    # (scoped limit 62 -> 64 MiB), and `ring` (`VMEM_CUT_RINGS` /
+    # `VMEM_CUT_RINGS_AR2D_SS`). Default "" = off.
+    "VLLM_TPU_MK_VMEM_CUTS": env_str("VLLM_TPU_MK_VMEM_CUTS", ""),
+    "VLLM_TPU_MK_VMEM_CUT_ROWS": env_nonnegative_int(
+        "VLLM_TPU_MK_VMEM_CUT_ROWS", 33
+    ),
     # q38 PORT-BL GDN (begin): Benliang Wang's GDN lean glue (aa8e6b237, VLLM_TPU_GDN_LEAN_GLUE) less its
     # window-log piece ("no_ckpt", which needs VLLM_TPU_GDN_WINDOW_LOG and so refuses D14). On the per-region unified
     # pool, every pooled GDN call with read offsets (speculative decoding) reads the step's stacked slot rows (one
@@ -3647,6 +3748,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every QSA decode RPA call; this one leaves the MTP draft, D14 and prefill programs alone (PORT-BL rule 3).
     # Changes the traced program, so hashed. Default off.
     "VLLM_TPU_RPA_SCHEDULE_HBM_O1S": env_bool("VLLM_TPU_RPA_SCHEDULE_HBM_O1S"),
+    # q38 internal-v3 GDN/QSA ports (begin)
+    # Default-off: enable exact `Tiles.rel_fetch=True` (trace-time-decoded dense
+    # ring refills) on whole-step buckets B >= 48 (48..128; bit-exact). Note:
+    # incompatible with VLLM_TPU_MK_L47_FOLD=1 (L=45 partial last cycle asserts
+    # rel_fetch off in planner.py). Preserves VLLM_TPU_MK_GDN_INK bit 2 (all B).
+    "VLLM_TPU_MK_REL_FETCH_LARGE": env_bool("VLLM_TPU_MK_REL_FETCH_LARGE"),
+    # Whole-step / segment megakernel: vectorize GDN conv_step across sequence
+    # chunks and gdn_rec / gdn_rec_chunked L2-norm, beta, decay, and output
+    # norm/gate writes (wired via GDNTunables.vec_rec). Default off.
+    "VLLM_TPU_MK_GDN_VEC_REC": env_bool("VLLM_TPU_MK_GDN_VEC_REC"),
+    # Whole-step QSA with union_attn=True (plain / compressed_dcp path): skip dead
+    # per-row compact_row, qi_id/qi_ids scratch, and shrink sharded selection exchange
+    # width 5x (W=640->128). Note: for non-compressed_dcp configs, VLLM_TPU_MK_UNION_LEAN=1
+    # strictly supersedes this by also eliminating qsa_selx completely. Default off.
+    "VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT": env_bool(
+        "VLLM_TPU_MK_UNION_SKIP_ROWCOMPACT"
+    ),
+    # Whole-step QSA indexer thresholds & union compaction (default off; exact):
+    # radix-4 packed 2-bit/step threshold bisection (three 10-bit int32 counters,
+    # 16 S-reductions vs 31 plain / 46 un-packed VLLM_TPU_MK_SELECT_RADIX=2 for
+    # S <= 1023 -> up to 523K tokens), fused (bits > thr) + (bits == thr) tail,
+    # lax.cond tie-skip + radix-4 tie search, plus T=1 / bounded fori_loop
+    # compact_union when union_bounded=False.
+    "VLLM_TPU_MK_INDEXER_FAST_THR": env_bool("VLLM_TPU_MK_INDEXER_FAST_THR"),
+    # Cross-layer megakernel prefetch (`Tiles.xlayer_prefetch`, default off; exact):
+    # issue layer `l + 1` GDN pool-state DMAs (`pg_raw`/`pg_craw` and idle `epool`
+    # slots) or QSA HBM table DMAs during layer `l`'s MoE AR2D tail. Honors
+    # VLLM_TPU_MK_LIVE_ROWS, VLLM_TPU_MK_GDN_CKPT_INK (drains pending writes first),
+    # and skips duplicate table prefetch when VLLM_TPU_MK_TABLE_SLIM=2 is active.
+    "VLLM_TPU_MK_XLAYER_PREFETCH": env_bool("VLLM_TPU_MK_XLAYER_PREFETCH"),
+    # q38 internal-v3 GDN/QSA ports (end)
 }
 
 

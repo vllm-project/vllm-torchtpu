@@ -87,6 +87,7 @@ class GDNParams:
     GCONV_ROWS: int = 0
     conv_stage: bool = False
     head_major: bool = False
+    vec_rec: bool = False
     # Pool layout of the model's pool backend (set only for pool I/O: GPR or
     # fused); the slot geometry above and `page_base` come from it.
     pool_layout: Any = None
@@ -102,6 +103,8 @@ class GDNTunables:
     conv_stage: bool = False  # Stage fused-path conv taps through VMEM `sb`
     # Head-major recurrence (per-head state update; reassociates the sums)
     gdn_head_major: bool = False
+    # Vectorized conv_step and recurrence across GDN heads (VLLM_TPU_MK_GDN_VEC_REC)
+    vec_rec: bool = False
 
     # `exact`: moving the field keeps hidden states and caches bit-identical
     # (scheduling only); `approx`: changes or may change the arithmetic.
@@ -110,6 +113,7 @@ class GDNTunables:
         "gdn_bufs": "exact",  # state ring depth (scheduling)
         "conv_stage": "approx",  # fused-path conv staging
         "gdn_head_major": "approx",  # head-major state update (reassociates)
+        "vec_rec": "approx",  # vectorized conv_step and recurrence
     }
 
 
@@ -263,6 +267,7 @@ def derive_params(
         GCONV_ROWS=GCONV_ROWS,
         conv_stage=bool(tt.conv_stage),
         head_major=bool(tt.gdn_head_major),
+        vec_rec=bool(tt.vec_rec),
         pool_layout=pool_layout,
     )
 

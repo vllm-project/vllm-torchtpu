@@ -459,6 +459,78 @@ class TwoRing:
             lax.fori_loop(1, n_s, body_pair, 0)
         return acc[:, :N]
 
+    def consume_single_tile(
+        self,
+        kind: str,
+        *,
+        lazy: bool | None = None,
+    ) -> tuple[Any, Any]:
+        """Advance `cursor` for 1-tile `kind`, returning `(w_ref, give_fn)` without touching `acc`."""
+        sp = self.sp
+        n_t = sp.nt[kind]
+        assert n_t == 1, (kind, n_t)
+        dmm_ctx = None
+        if self._branch_offsets is not None:
+            if self.sp.rel_fetch and self._cur_layer is not None:
+                blk = (
+                    self._cur_layer
+                    if sp.period == 1
+                    else self._cur_layer // sp.period
+                )
+                if len(self._active_branches) == 1:
+                    b_idx = self._active_branches[0]
+                    r0 = self._branch_offsets[b_idx]
+                    l_start = sum(sp.branch_counts[:b_idx])
+                    c_b = sp.branch_counts[b_idx]
+                    lt = l_start if c_b == 1 else (self._cur_layer % sp.period)
+                    lts = tuple(range(l_start, l_start + c_b))
+                    dmm_ctx = (blk, lt, r0, lts)
+                else:
+                    r0_map = {
+                        lt_s: self._branch_offsets[b]
+                        for b in self._active_branches
+                        for lt_s in range(
+                            sum(sp.branch_counts[:b]),
+                            sum(sp.branch_counts[: b + 1]),
+                        )
+                    }
+                    r0_vals = set(r0_map.values())
+                    lt = self._cur_layer % sp.period
+                    lts = tuple(r0_map.keys())
+                    r0_arg: Any = (
+                        next(iter(r0_vals)) if len(r0_vals) == 1 else r0_map
+                    )
+                    dmm_ctx = (blk, lt, r0_arg, lts)
+            for b_idx in self._active_branches:
+                cur_off = self._branch_offsets[b_idx]
+                matched = [
+                    (s_kind, s_lo, s_hi)
+                    for s_kind, s_lo, s_hi, _ in sp.branch_segs[b_idx]
+                    if s_lo == cur_off
+                ]
+                assert (
+                    len(matched) == 1
+                    and matched[0][0] == kind
+                    and matched[0][2] == cur_off + 1
+                ), (
+                    f"Stream consumption order mismatch on branch {b_idx}: "
+                    f"consume_single_tile({kind!r}) at offset {cur_off}, "
+                    f"expected {matched} in {sp.branch_segs[b_idx]}"
+                )
+                self._branch_offsets[b_idx] = cur_off + 1
+        g0 = self.cursor
+        self.cursor = g0 + 1
+        self._seg_tiles += 1
+        self._cursor_delta += 1
+        use_lazy = self._lazy if lazy is None else lazy
+        w = self.dtake(kind, g0)
+
+        def give() -> None:
+            if not use_lazy:
+                self._give_tile(g0, 0, 0, (), dmm_ctx)
+
+        return w, give
+
     def dmatmul(
         self,
         kind: str,

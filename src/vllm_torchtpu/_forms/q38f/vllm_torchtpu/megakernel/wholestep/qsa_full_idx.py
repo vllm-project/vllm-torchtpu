@@ -156,6 +156,8 @@ class _IdxMixin:
 
     # ------------------------------------------------------------ S2P radix-2
     def _idx_thresholds(self, bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int):
+        if self.fast_thr and bits.shape[1] <= 1023:
+            return ix.thresholds(bits, ids, nv, K, G, fast=True)
         if self.radix_bits == 2:
             return thresholds_radix2(bits, ids, nv, K, G)
         return ix.thresholds(bits, ids, nv, K, G)
@@ -234,6 +236,13 @@ class _IdxMixin:
             return super().tables(ctx)
         b = ctx._idx_tslot
         return ctx.scr["qi_ckw"].at[b], ctx.scr["qi_mtw"].at[b]
+
+    def prefetch_next(self, ctx: Any, l: Any) -> None:  # noqa: E741
+        """Skip `QSAFullIndexedBlock.prefetch_next` when TSLIM double-buffered table
+        prefetch (`table_prefetch=True`) already manages layer-to-layer SMEM table DMAs."""
+        if self.table_prefetch:
+            return
+        super().prefetch_next(ctx, l)
 
     def load_tables(self, ctx: Any, l: Any) -> None:  # noqa: E741
         """Prefetch: QSA layer o's window rows are in slot o % 2; layer 0 copies and waits its own, every layer waits
@@ -336,7 +345,7 @@ class _IdxMixin:
                 kept = jnp.sum((sel & (lid < ga)).astype(I32))
                 # Row bit r - lo of every pool-path group it selects.
                 scr["qu_code"][...] = scr["qu_code"][...] | jnp.where(sel & (lid < ga), jnp.left_shift(1, r - lo), 0)
-                if not lean:  # MM: the row's compacted ids (read only by the per-row path and the debug output)
+                if not lean and self._need_ids():  # MM: the row's compacted ids (read only by the per-row path and the debug output)
                     bp = jnp.where(lid < ga, b, -1)
                     b2 = jnp.where(sel & (lid < ga), bp, -1)
                     pos = ix.compact_row(
@@ -344,18 +353,19 @@ class _IdxMixin:
                         jnp.zeros((1, 1), I32) + kept, K, consts,
                     )
                     scr["qi_id"][r] = pos
-                    cs = [
-                        pltpu.make_async_copy(
-                            scr["qi_id"].at[r], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)], scr["qi_sem"].at[1]
-                        ),
-                        pltpu.make_async_copy(
-                            scr["qi_z"], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)], scr["qi_sem"].at[2]
-                        ),
-                    ]
-                    for c in cs:
-                        c.start()
-                    for c in cs:
-                        c.wait()
+                    if not self._skip_qi_ids():
+                        cs = [
+                            pltpu.make_async_copy(
+                                scr["qi_id"].at[r], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(0, K)], scr["qi_sem"].at[1]
+                            ),
+                            pltpu.make_async_copy(
+                                scr["qi_z"], scr["qi_ids"].at[pl.ds(r, 1), pl.ds(K, 128)], scr["qi_sem"].at[2]
+                            ),
+                        ]
+                        for c in cs:
+                            c.start()
+                        for c in cs:
+                            c.wait()
                 scr["qi_kvl"][r] = 4 * kept
                 return carry
 

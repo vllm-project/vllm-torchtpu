@@ -50,6 +50,7 @@ from .experts import expert, experts_piped, experts_piped_ep
 from .params import MoEDebug, MoEParams, MoETunables, derive_moe_params
 from .reference import moe_reference
 from .routing import route
+from .rowbucket import experts_piped_ep_rb, rb_scratch
 
 
 class MoEBlock(Block):
@@ -147,14 +148,18 @@ class MoEBlock(Block):
         )
 
     def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
-        """Debug routing inputs: `rbias` (HBM, `forced_routing`) and `moe_rows`
-        (SMEM `[B]` int32 row mask, `row_mask`)."""
+        """Routing inputs: `rbias` (HBM, `forced_routing`), `moe_rows`
+        (SMEM `[B]` int32 row mask, `row_mask`), and `moe_valid_rows`
+        (SMEM `[1]` int32 active token count, `skip_pad`)."""
         dbg: MoEDebug = self.debug_flags(ex)
+        tt: MoETunables = self.tunables(ex)
         out = []
         if dbg.forced_routing:
             out.append(ExtraInput("rbias", "hbm"))
         if dbg.row_mask:
             out.append(ExtraInput("moe_rows", "smem", (ex.B,), I32))
+        if tt.skip_pad:
+            out.append(ExtraInput("moe_valid_rows", "smem", (1,), I32))
         return out
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
@@ -231,8 +236,9 @@ class MoEBlock(Block):
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         mp: MoEParams = plan.block_params[self.name]
         nb_picks = rup(ex.B * mp.TOPK, 128)
+        wn_cols = 128 if mp.local_wn else mp.E
         scr: dict[str, Any] = {
-            "wn": pltpu.VMEM((ex.MR, mp.E), F32),
+            "wn": pltpu.VMEM((ex.MR, wn_cols), F32),
             "sg": pltpu.VMEM((ex.MB, 128), F32),
             "hitv": pltpu.VMEM((ex.MR, 128), I32),
             "hits": pltpu.SMEM((ex.MR, 128), I32),
@@ -245,6 +251,8 @@ class MoEBlock(Block):
         }
         if mp.PIPE_EP:
             scr["acc13"] = pltpu.VMEM((ex.MB, 2 * mp.IR), F32)
+        if mp.RB:
+            scr.update(rb_scratch(ex, mp))
         if mp.ECOPY:
             scr.update(
                 {
@@ -328,7 +336,12 @@ class MoEBlock(Block):
                 x = ctx.norm_x
                 logits = stream.dmatmul("router", scr["xb"], E)[0:MR]
                 glog = jnp.sum(x * ctx.sm(slot, "sh_gate"), axis=-1, keepdims=True)
-                scr["sg"][...] = jnp.broadcast_to(jax.nn.sigmoid(glog), (MB, 128))
+                sg_val = jax.nn.sigmoid(glog)
+                if mp.skip_pad:
+                    n_valid = jnp.clip(ctx.extra["moe_valid_rows"][0], 0, ex.B)
+                    row_mb = lax.broadcasted_iota(I32, (MB, 1), 0)
+                    sg_val = jnp.where(row_mb < n_valid, sg_val, 0.0)
+                scr["sg"][...] = jnp.broadcast_to(sg_val, (MB, 128))
                 mx = jnp.max(logits, axis=-1, keepdims=True)
                 pexp = jnp.exp(logits - mx)
             with sc("moe_route"):
@@ -343,6 +356,8 @@ class MoEBlock(Block):
             with sc("moe_experts"):
                 if PIPE:
                     experts_piped(m, l, n_hit)
+                elif PIPE_EP and mp.RB:
+                    experts_piped_ep_rb(m, l, n_hit)
                 elif PIPE_EP:
                     experts_piped_ep(m, l, n_hit)
                 else:
