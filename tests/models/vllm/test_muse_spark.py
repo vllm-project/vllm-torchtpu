@@ -607,6 +607,46 @@ def test_tpu_grouped_experts_match_reference_decoder(dist_ctx, packed, use_ep):
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"USE_MOE_FUSED_EP_KERNEL": "1", "MOE_FUSED_EP_ENABLE_W4A8": "1"},
+        {"MOE_FUSED_EP_KERNEL_IMPL": "adaptive"},
+    ],
+    ids=["w4a8", "adaptive"],
+)
+@torch.inference_mode()
+def test_tpu_experts_keep_block16_scales_under_fused_ep_settings(
+    dist_ctx, monkeypatch, settings
+):
+    """An admitted fused EP op would requantize the experts to its block
+    (64 by default) and never run: _expert_rows calls only gmm_v2. Admission
+    itself must be skipped, whatever the op's shape checks would decide."""
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import FUSED_MOE_EP_OP_ATTR
+    from vllm_torchtpu.layers.adapter.quantization import nvfp4
+
+    def admission(*args, **kwargs):
+        raise AssertionError("fused EP admission ran for Muse's experts")
+
+    monkeypatch.setattr(nvfp4, "_prebuild_w4a8", admission)
+    monkeypatch.setattr(nvfp4.adaptive_moe, "prebuild_adaptive_nvfp4", admission)
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+    hidden, intermediate, num_experts = 4096, 512, 8
+    experts = _make_experts(
+        num_experts, hidden, intermediate, packed=True, ep=2, ep_rank=1
+    )
+    _prepare(experts, _packed_weights(num_experts, hidden, intermediate, seed=105))
+    _lay_out_on_tpu(experts)
+
+    method = experts.quant_method
+    assert getattr(method, FUSED_MOE_EP_OP_ATTR) is None
+    assert method._adaptive_fused_moe_op is None
+    assert experts.w13_weight_scale.shape[1] == hidden // 16
+    assert experts.w2_weight_scale.shape[1] == intermediate // 16
+
+
+@pytest.mark.tpu_test
 @torch.inference_mode()
 def test_tpu_one_hot_ep_permute_keeps_non_finite_row_local(dist_ctx, monkeypatch):
     """A NaN row must not reach other tokens through the one-hot EP permute."""

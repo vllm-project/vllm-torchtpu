@@ -134,6 +134,10 @@ class MuseRoutedExperts(RoutedExperts):
                 f"uses {type(self.quant_method).__name__}; QUANTIZE_ON_LOAD_PREFIXES "
                 "must not select the experts"
             )
+        if isinstance(self.quant_method, VllmNvfp4MoEMethod):
+            # _expert_rows runs gmm_v2 rows mode, never a fused EP op, so keep
+            # the experts' block-16 scales instead of requantizing for one.
+            self.quant_method.allow_fused_ep = False
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded: set[str] = set()
