@@ -1,0 +1,2539 @@
+// cdk.agentx — the AgentX trace-replay benchmark client, as a function.
+//
+// The two recipes under recipes/inferencex/ serve different models on different topologies,
+// but they measure them with the same client: source benchmark_lib.sh, wait for /health,
+// then sweep a list of concurrencies calling run_agentic_replay_and_write_outputs and
+// publishing each level to the CDK result store as "<BENCH_NAME>-c<conc>".
+//
+// That client is ~500 lines, and it was in both files. Most of it is the Python that
+// flattens AgentX's nested aggregate JSON into the flat, millisecond keys `cdk dash` charts:
+// two copies of a metric mapping that must agree exactly or a number silently stops being
+// comparable between the two models. This file is where it lives once.
+//
+//     local agentx = import 'cdk.agentx';
+//     agentx.benchJob(host=cdk.host('vllm-server'), port=8000, concurrencies=[64, 16])
+//
+// The server side stays in the recipes: one is a single vllm serve, the other a four-node
+// Ray cluster, and they have nothing in common but the environment variables below.
+
+local cdk = import 'cdk.common';
+local eval = import 'cdk.eval';
+
+{
+  // The InferenceX client image, which carries benchmark_lib.sh, aiperf and result-updater.
+  defaultClientImage:: 'us-central1-docker.pkg.dev/cloud-tpu-inference-test/inferencex/inferencex-agentx:latest',
+
+  parserPath:: '/tmp/agentx_metrics.py',
+
+  // ---------------------------------------------------------------------------
+  // fill — @NAME@ substitution for the shell blocks below.
+  //
+  // Jsonnet's own `%` operator would mean escaping every printf, every `$(( ))` and every
+  // ${var%suffix} in ~400 lines of bash as `%%`. Missing one produces a rendered script that
+  // is still valid bash and quietly wrong, which is the failure mode this module exists to
+  // stop, so the blocks use placeholders and stay copy-pasteable into a shell.
+  // ---------------------------------------------------------------------------
+  fill(text, subs)::
+    std.foldl(
+      function(acc, key) std.strReplace(acc, '@' + key + '@', std.toString(subs[key])),
+      std.objectFields(subs),
+      text
+    ),
+
+  // indent shifts a whole block so that a multi-line substitution lands at the depth of the
+  // placeholder it replaces. fill() substitutes text verbatim, which puts every line after
+  // the first at column 0; bash does not care, but a script nobody can read is a script
+  // nobody will fix. Blank lines stay blank rather than becoming trailing whitespace.
+  indent(text, spaces)::
+    std.join('\n', [
+      if line == '' then '' else std.repeat(' ', spaces) + line
+      for line in std.split(std.rstripChars(text, '\n'), '\n')
+    ]),
+
+  // ---------------------------------------------------------------------------
+  // Environment and volumes shared by the two servers
+  // ---------------------------------------------------------------------------
+
+  // Re-exported from cdk.common, where it moved once cdk.vllm-torchtpu turned out to need it
+  // too. Kept under this name because both AgentX recipes spell it agentx.megascaleOff.
+  megascaleOff:: cdk.megascaleOff,
+
+  // The HuggingFace token, mounted as a file rather than passed as an env var. optional so a
+  // pod still starts when the secret is absent and the weights are local anyway.
+  hfTokenVolume(name='hf-token-volume', secretName='vllm-hf-token', key='token'):: {
+    name: name,
+    secret: {
+      secretName: secretName,
+      defaultMode: 420,
+      optional: true,
+      items: [{ key: key, path: 'token' }],
+    },
+  },
+
+  hfTokenMount(name='hf-token-volume'):: {
+    name: name,
+    mountPath: '/root/.cache/huggingface/token',
+    subPath: 'token',
+    readOnly: true,
+  },
+
+  // The read-only-many PVC holding a pre-staged checkpoint. Its node affinity excludes the
+  // cpu-only pool, so a pod that mounts it cannot land there — which is why the benchmark
+  // pod does not mount it and fetches its tokenizer at runtime instead.
+  sharedCacheVolume(claimName, name='vllm-shared-cache'):: {
+    name: name,
+    persistentVolumeClaim: { claimName: claimName, readOnly: true },
+  },
+
+  sharedCacheMount(name='vllm-shared-cache', mountPath='/vllm-cache'):: {
+    name: name,
+    mountPath: mountPath,
+    readOnly: true,
+  },
+
+  // A tmpfs. Everything these servers write to disk during a run is scratch that must not
+  // land on the node's boot disk, where it competes with the checkpoint for ephemeral
+  // storage and gets the pod evicted.
+  memoryVolume(name, size=null):: {
+    name: name,
+    emptyDir: { medium: 'Memory' } + (if size != null then { sizeLimit: size } else {}),
+  },
+
+  mount(name, mountPath):: { name: name, mountPath: mountPath },
+
+  // The vLLM flags that turn on torch profiling. Both servers take them; the traces land
+  // where `cdk job xprof` looks.
+  profilerArgs(dir, maxIterations=0):: [
+    '--profiler-config.profiler=torch',
+    '--profiler-config.torch_profiler_dir=%s' % dir,
+    '--profiler-config.ignore_frontend=true',
+  ] + (if maxIterations > 0 then ['--profiler-config.max_iterations=%d' % maxIterations] else []),
+
+  // ---------------------------------------------------------------------------
+  // Optional Server & Client Startup Helpers
+  // ---------------------------------------------------------------------------
+
+  hasAnyVar(names):: std.any([
+    std.objectHas(cdk.vars, k) && std.toString(cdk.vars[k]) != ''
+    for k in names
+  ]),
+
+  // Returns true when FAST_STARTUP is enabled (defaulting to defaultFastStartup) or when any
+  // individual startup-acceleration variable is explicitly supplied. When false, recipes
+  // preserve their exact baseline JobSet manifest without injecting startup-acceleration scripts.
+  startupOptActive(extraVars=[], excludeVars=[], defaultFastStartup=false)::
+    local defaultOptVars = [
+      'MODEL_SOURCE',
+      'COMPILE_CACHE_ENABLED',
+      'COMPILE_CACHE_GCS',
+      'COMPILE_CACHE_TAG',
+      'COMPILE_CACHE_REFRESH',
+      'COMPILE_CACHE_NAMESPACE',
+      'PARALLEL_PRECOMPILE_SUITE',
+      'DEV_SINGLE_BUCKET',
+      'COMPILE_SIZES',
+      'ENABLE_RUNTIME_GUARDRAILS',
+      'CLIENT_PARALLEL_DATASET',
+      'USE_GCS_TOKENIZER',
+      'USE_GCS_DATASET',
+      'WEIGHT_PREFETCH',
+      'SMART_COOLDOWN',
+      'ADAPTIVE_SWEEP_WARMUP',
+      'AIPERF_MMAP_CACHE_GCS',
+      'AIPERF_MMAP_CACHE_REFRESH',
+      'EVAL_ONCE_PER_SWEEP',
+      'EVAL_MIN_CONCURRENCY',
+      'ASYNC_PUBLISH_RESULTS',
+    ];
+    cdk.boolVar('FAST_STARTUP', defaultFastStartup)
+    || $.hasAnyVar([
+      k
+      for k in (defaultOptVars + extraVars)
+      if !std.member(excludeVars, k)
+    ]),
+
+  compileCacheDefault(fastStartup)::
+    fastStartup || $.hasAnyVar([
+      'COMPILE_CACHE_GCS',
+      'COMPILE_CACHE_TAG',
+      'COMPILE_CACHE_REFRESH',
+      'COMPILE_CACHE_NAMESPACE',
+    ]),
+
+  // Strip blank lines and full-line comments from cdk_gcs.py before base64-encoding so container
+  // scripts stay compact without altering Python semantics or docstrings.
+  compactPy(src)::
+    std.join('\n', [
+      line
+      for line in std.split(src, '\n')
+      if std.stripChars(line, ' \t') != ''
+         && (!std.startsWith(std.stripChars(line, ' \t'), '#') || std.startsWith(line, '#!'))
+    ]) + '\n',
+
+  cdkGcsPy:: $.compactPy(importstr 'cdk_gcs.py'),
+  cdkGcsB64:: std.base64($.cdkGcsPy),
+
+  ensureGcsHelperScript:: $.fill(
+    |||
+      if [ ! -s /tmp/cdk_gcs.py ]; then
+        python3 -c 'import base64, os, pathlib; b = os.environ.get("_CDK_GCS_B64") or "@CDK_GCS_B64@"; pathlib.Path("/tmp/cdk_gcs.py").write_bytes(base64.b64decode(b))'
+      fi
+    |||,
+    { CDK_GCS_B64: $.cdkGcsB64 }
+  ),
+
+  // Deduplicates multiple embedded copies of cdk_gcs.py inside a single container script so
+  // bash -c argv[2] stays far below Linux MAX_ARG_STRLEN (131,072 bytes). When viaEnv=true,
+  // _CDK_GCS_B64 is passed via container env, decoded to /tmp/cdk_gcs.py at shell startup, and
+  // immediately unset so neither argv[2] nor child process envp carries the base64 payload.
+  // No-op when cdkGcsB64 is absent and viaEnv=false (preserving 0-byte baseline YAML diffs).
+  dedupGcsHelper(script, viaEnv=false)::
+    local parts = std.split(script, $.cdkGcsB64);
+    if std.length(parts) <= 1 && !viaEnv then script
+    else
+      local bootstrap =
+        if viaEnv then
+          'python3 -c \'import base64, os, pathlib; b = os.environ.get("_CDK_GCS_B64", ""); b and pathlib.Path("/tmp/cdk_gcs.py").write_bytes(base64.b64decode(b))\'; unset _CDK_GCS_B64\n'
+        else
+          '_CDK_GCS_B64="' + $.cdkGcsB64 + '"; python3 -c \'import base64, pathlib, sys; pathlib.Path("/tmp/cdk_gcs.py").write_bytes(base64.b64decode(sys.argv[1]))\' "$_CDK_GCS_B64"; unset _CDK_GCS_B64\n';
+      if std.startsWith(script, '#!') then
+        local nl = std.findSubstr('\n', parts[0]);
+        if std.length(nl) > 0 then
+          local idx = nl[0] + 1;
+          std.substr(parts[0], 0, idx)
+          + bootstrap
+          + std.substr(parts[0], idx, std.length(parts[0]) - idx)
+          + std.join('', parts[1:])
+        else
+          bootstrap + std.join('', parts)
+      else
+        bootstrap + std.join('', parts),
+
+  // Executes PREWARM_CMD in its own session/process group, watches /tmp/aiperf_mmap_prewarm.log
+  // until the mmap dataset cache entry is committed (or warmup hits 127.0.0.1:19999 and begins
+  // shutdown), and explicitly reaps any hung aiperf SystemController ZMQ processes plus transient
+  // /tmp/aiperf_mmap_<hex> scratch directories while preserving AIPERF_DATASET_MMAP_CACHE_DIR.
+  runPrewarmCmdScript:: |||
+    : > /tmp/aiperf_mmap_prewarm.log
+    if command -v setsid >/dev/null 2>&1; then
+      setsid bash -c "${PREWARM_CMD}" >/tmp/aiperf_mmap_prewarm.log 2>&1 < /dev/null &
+      _pw_leader=$!
+      _pw_setsid=1
+    else
+      bash -c "${PREWARM_CMD}" >/tmp/aiperf_mmap_prewarm.log 2>&1 < /dev/null &
+      _pw_leader=$!
+      _pw_setsid=0
+    fi
+    _pw_deadline=$(( SECONDS + 600 ))
+    while kill -0 "${_pw_leader}" 2>/dev/null; do
+      if grep -qE "Populated mmap cache entry|Restored mmap cache entry|All results received, initiating shutdown|\(state=stopping\)|warmup_failure" /tmp/aiperf_mmap_prewarm.log 2>/dev/null; then
+        sleep 2
+        break
+      fi
+      if [ "${SECONDS}" -ge "${_pw_deadline}" ]; then
+        echo "[DatasetPrewarm] Timed out after 600s; terminating prewarm process..." >>/tmp/aiperf_mmap_prewarm.log
+        break
+      fi
+      sleep 1
+    done
+    if kill -0 "${_pw_leader}" 2>/dev/null; then
+      if [ "${_pw_setsid}" = "1" ]; then
+        kill -TERM -- "-${_pw_leader}" 2>/dev/null || kill -TERM "${_pw_leader}" 2>/dev/null || true
+      else
+        pkill -TERM -P "${_pw_leader}" 2>/dev/null || true
+        kill -TERM "${_pw_leader}" 2>/dev/null || true
+      fi
+      sleep 1
+      if [ "${_pw_setsid}" = "1" ]; then
+        kill -KILL -- "-${_pw_leader}" 2>/dev/null || kill -KILL "${_pw_leader}" 2>/dev/null || true
+      else
+        pkill -KILL -P "${_pw_leader}" 2>/dev/null || true
+        kill -KILL "${_pw_leader}" 2>/dev/null || true
+      fi
+    fi
+    wait "${_pw_leader}" 2>/dev/null || true
+    rm -rf /tmp/aiperf_mmap_prewarm
+    find /tmp -maxdepth 1 -mindepth 1 -name 'aiperf_mmap_*' ! -path "${AIPERF_DATASET_MMAP_CACHE_DIR}" ! -name 'aiperf_mmap_cache*' ! -name 'aiperf_mmap_prewarm.log' -exec rm -rf {} + 2>/dev/null || true
+  |||,
+
+  // Default GCS mirrors for model checkpoints/tokenizers, AgentX Weka traces, and pre-tokenized mmap datasets.
+  defaultGcsCkptPrefix:: 'gs://cloud-devkit/ckpt/hf',
+  defaultGcsDatasetCache:: 'gs://cloud-devkit/datasets/hf_cache/semianalysisai/cc-traces-weka-062126-256k',
+  defaultCompileCacheGcs:: 'cloud-devkit/compile-cache',
+  defaultAiperfMmapCacheGcs:: 'cloud-devkit/aiperf-mmap-cache',
+
+  // Log a concise startup banner when startup acceleration is enabled.
+  startupNoticeScript(recipe, fastStartup=false)::
+    if fastStartup then
+      'echo "[StartupConfig] FAST_STARTUP=true enabled for %s (MODEL_SOURCE=${MODEL_SOURCE:-pvc}, COMPILE_CACHE_ENABLED=${COMPILE_CACHE_ENABLED:-true})."' % recipe
+    else
+      std.join('\n', [
+        'echo "[StartupTip] %s is running with custom startup flags (FAST_STARTUP=false)."' % recipe,
+        'echo "[StartupTip] Pass FAST_STARTUP=true to enable pre-staged ROX PVC weights, per-user /dev/shm + GCS compile cache, parallel precompile & client dataset prewarm (or DEV_SINGLE_BUCKET=true for fast dev iteration)."',
+      ]),
+
+  // Resolve model weights from a read-only shared PVC (/vllm-cache) into canonical symlink
+  // /root/.cache/huggingface/$MODEL_NAME (keeping VllmConfig.compute_hash() identical across
+  // PVC and GCS runs), or sync weights from GCS / HuggingFace Hub. Never writes to /vllm-cache.
+  resolveCheckpointScript(modelSource='pvc', gcsPrefix=$.defaultGcsCkptPrefix, fallbackHf=false, allowPvcRoot=true)::
+    $.ensureGcsHelperScript + '\n' + $.fill(
+      |||
+        echo "trace-start-event: name=copy-ckpt ts=$(date +'%s.%N') pid=vllm tid=vllm"
+        CANONICAL_MODEL_DIR="/root/.cache/huggingface/${MODEL_NAME}"
+        mkdir -p "$(dirname "${CANONICAL_MODEL_DIR}")"
+        _model_src="${MODEL_SOURCE:-@MODEL_SOURCE@}"
+        _found_pvc_dir=""
+        if [ "${_model_src}" != "gcs" ]; then
+          _hf_slug="models--$(echo "${MODEL_NAME}" | sed 's|/|--|g')"
+          for _cand in "/vllm-cache/${MODEL_NAME}" "/vllm-cache/$(basename "${MODEL_NAME}")" /vllm-cache/hub/${_hf_slug}/snapshots/* $([ "@ALLOW_PVC_ROOT@" = "true" ] && echo "/vllm-cache"); do
+            if [ -f "${_cand}/config.json" ]; then
+              _found_pvc_dir="${_cand}"
+              break
+            fi
+          done
+        fi
+        if [ -n "${_found_pvc_dir}" ]; then
+          if [ "${_found_pvc_dir}" != "${CANONICAL_MODEL_DIR}" ]; then
+            rm -rf "${CANONICAL_MODEL_DIR}"
+            ln -sfn "${_found_pvc_dir}" "${CANONICAL_MODEL_DIR}"
+          fi
+          export MODEL_DIR="${CANONICAL_MODEL_DIR}"
+          echo "[Checkpoint] Linked ROX PVC ${_found_pvc_dir} -> ${MODEL_DIR} ($(ls "${_found_pvc_dir}" | wc -l) files)"
+          for _ra in /sys/block/*/queue/read_ahead_kb; do
+            [ -w "${_ra}" ] && echo 4096 > "${_ra}" 2>/dev/null || true
+          done
+          if [ "${WEIGHT_PREFETCH:-false}" = "true" ]; then
+            python3 /tmp/cdk_gcs.py prefetch_weights "${_found_pvc_dir}" "${WEIGHT_PREFETCH_WORKERS:-8}" &
+            export CDK_WEIGHT_PREFETCH_PID=$!
+          fi
+        else
+          if [ "${_model_src}" = "pvc" ]; then
+            echo "WARNING: [Checkpoint] MODEL_SOURCE=pvc requested, but ${MODEL_NAME} not found under /vllm-cache; falling back to GCS/HF..."
+          fi
+          rm -f "${CANONICAL_MODEL_DIR}" 2>/dev/null || true
+          mkdir -p "${CANONICAL_MODEL_DIR}"
+          export MODEL_DIR="${CANONICAL_MODEL_DIR}"
+          _gcs_src="${GCS_MODEL_SRC:-@GCS_PREFIX@/${MODEL_NAME}}"
+          if python3 /tmp/cdk_gcs.py exists "${_gcs_src}/config.json"; then
+            echo "[Checkpoint] Syncing checkpoint from ${_gcs_src} -> ${MODEL_DIR}..."
+            python3 /tmp/cdk_gcs.py sync_dir "${_gcs_src}" "${MODEL_DIR}" 24 || exit 1
+          elif [ "@FALLBACK_HF@" = "true" ]; then
+            echo "[Checkpoint] GCS mirror ${_gcs_src} not found; downloading ${MODEL_NAME} from HuggingFace Hub..."
+            if [ -f /root/.cache/huggingface/token ]; then
+              export HF_TOKEN="$(cat /root/.cache/huggingface/token | tr -d '\r\n')"
+              export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+            fi
+            if python3 -c "import hf_transfer" >/dev/null 2>&1; then
+              export HF_HUB_ENABLE_HF_TRANSFER=1
+            fi
+            HF_HUB_OFFLINE=0 hf download "${MODEL_NAME}" --local-dir "${MODEL_DIR}" || exit 1
+          else
+            echo "ERROR: [Checkpoint] ${_gcs_src}/config.json not found in GCS and HF fallback disabled." >&2
+            exit 1
+          fi
+        fi
+        echo "trace-end-event: name=copy-ckpt ts=$(date +'%s.%N') pid=vllm tid=vllm"
+      |||,
+      {
+        MODEL_SOURCE: modelSource,
+        GCS_PREFIX: gcsPrefix,
+        FALLBACK_HF: if fallbackHf then 'true' else 'false',
+        ALLOW_PVC_ROOT: if allowPvcRoot then 'true' else 'false',
+      }
+    ),
+
+  // Stage tokenizer + config.json on the CPU client pod without mounting TPU-zonal PVCs or
+  // mutating $MODEL (preserving callers that export $MODEL to result-updater). When MODEL is a
+  // canonical HuggingFace <org>/<repo>, populates $HF_HOME/hub/models--<org>--<repo>/snapshots/<sha1>
+  // + refs/main so aiperf resolves --model locally with zero Hub latency while keeping canonical
+  // tokenizer identity in its dataset_mmap cache key across all CLIENT_IMAGE versions.
+  fastTokenizerSyncScript(gcsPrefix=$.defaultGcsCkptPrefix, enabled=true)::
+    $.ensureGcsHelperScript + '\n' + $.fill(
+      |||
+        _tok_dir="/tmp/cdk_tokenizer_cache"
+        rm -rf "${_tok_dir}" && mkdir -p "${_tok_dir}"
+        export CDK_TOK_HUB_READY=0
+        _gcs_tok_src="${GCS_MODEL_SRC:-@GCS_PREFIX@/${MODEL}}"
+        if [[ "${MODEL}" == gs://* ]]; then _gcs_tok_src="${MODEL}"; fi
+        if [ "${USE_GCS_TOKENIZER:-@ENABLED@}" = "true" ] && python3 /tmp/cdk_gcs.py exists "${_gcs_tok_src}/config.json"; then
+          echo "[Tokenizer] Fast-copying tokenizer and config from ${_gcs_tok_src}..."
+          python3 /tmp/cdk_gcs.py cp "${_gcs_tok_src}/config.json" "${_tok_dir}/config.json" || true
+          python3 /tmp/cdk_gcs.py sync_dir "${_gcs_tok_src}" "${_tok_dir}" 8 "tokenizer*" || true
+          for _opt_f in generation_config.json merges.txt vocab.json special_tokens_map.json chat_template.jinja; do
+            python3 /tmp/cdk_gcs.py exists "${_gcs_tok_src}/${_opt_f}" && python3 /tmp/cdk_gcs.py cp "${_gcs_tok_src}/${_opt_f}" "${_tok_dir}/${_opt_f}" || true
+          done
+        fi
+        if [ -f "${_tok_dir}/config.json" ] && ls "${_tok_dir}"/tokenizer* >/dev/null 2>&1; then
+          if [[ "${MODEL}" =~ ^[^/.][^/]*/[^/]+$ ]] && [[ "${MODEL}" != gs://* ]]; then
+            _tok_rev="$(python3 -c 'import hashlib,pathlib,sys; print(hashlib.sha1(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "${_tok_dir}/config.json")"
+            _tok_slug="models--${MODEL//\//--}"
+            _hub_primary="${HF_HUB_CACHE:-${HUGGINGFACE_HUB_CACHE:-${HF_HOME:-/root/.cache/huggingface}/hub}}"
+            mkdir -p "${_hub_primary}/${_tok_slug}/snapshots/${_tok_rev}" "${_hub_primary}/${_tok_slug}/refs"
+            cp -f "${_tok_dir}"/* "${_hub_primary}/${_tok_slug}/snapshots/${_tok_rev}/"
+            printf '%s' "${_tok_rev}" > "${_hub_primary}/${_tok_slug}/refs/main"
+            if [ "${_hub_primary}" != "/root/.cache/huggingface/hub" ]; then
+              mkdir -p "/root/.cache/huggingface/hub/${_tok_slug}/snapshots/${_tok_rev}" "/root/.cache/huggingface/hub/${_tok_slug}/refs"
+              cp -f "${_tok_dir}"/* "/root/.cache/huggingface/hub/${_tok_slug}/snapshots/${_tok_rev}/"
+              printf '%s' "${_tok_rev}" > "/root/.cache/huggingface/hub/${_tok_slug}/refs/main"
+            fi
+            export CDK_TOK_HUB_READY=1
+            unset AIPERF_LOCAL_TOKENIZER
+            echo "[Tokenizer] Staged HF Hub snapshot ${_tok_slug}@${_tok_rev:0:12} ($(ls "${_tok_dir}" | tr '\n' ' '))"
+          else
+            export AIPERF_LOCAL_TOKENIZER="${_tok_dir}"
+            echo "[Tokenizer] Ready at ${AIPERF_LOCAL_TOKENIZER} ($(ls "${_tok_dir}" | tr '\n' ' '))"
+          fi
+        else
+          echo "[Tokenizer] Pre-downloading tokenizer for ${MODEL} from HuggingFace..."
+          ${AIPERF_HF_CLI:-hf} download "${MODEL}" --include "tokenizer*" || true
+          ${AIPERF_HF_CLI:-hf} download "${MODEL}" config.json || true
+        fi
+      |||,
+      {
+        GCS_PREFIX: gcsPrefix,
+        ENABLED: if enabled then 'true' else 'false',
+      }
+    ),
+
+  // Pre-stage AgentX Weka trace shards from GCS into $HF_HOME when enabled (copying only
+  // hub/datasets--*/refs + snapshots, ~544 MiB, and skipping duplicate blobs/). When
+  // CDK_DEFER_DATASET_SYNC=1, defers raw parquet sync until after checking the shared GCS
+  // pre-tokenized aiperf-mmap-cache so cache hits skip downloading 544 MiB of raw traces.
+  fastDatasetSyncScript(defaultGcsDataset=$.defaultGcsDatasetCache, enabled=true)::
+    $.ensureGcsHelperScript + '\n' + $.fill(
+      |||
+        _cdk_sync_gcs_dataset() {
+          local _gcs_ds="${1:-}"
+          if [ -n "${_gcs_ds}" ] && [ "${_gcs_ds}" != "none" ] && [ "${_gcs_ds}" != "false" ]; then
+            local _hf_dst="${HF_HOME:-/root/.cache/huggingface}"
+            echo "[Dataset] Fast-syncing AgentX Weka dataset cache from ${_gcs_ds} -> ${_hf_dst}..."
+            emit_trace_event start "dataset-sync"
+            mkdir -p "${_hf_dst}" /root/.cache/huggingface
+            local _ds_arrow_dir _ds_hub_dir
+            _ds_arrow_dir="$(python3 /tmp/cdk_gcs.py ls_subdirs "${_gcs_ds}/datasets/" 2>/dev/null | head -n 1 || true)"
+            _ds_hub_dir="$(python3 /tmp/cdk_gcs.py ls_subdirs "${_gcs_ds}/hub/" 2>/dev/null | grep 'datasets--' | head -n 1 || true)"
+            if [ -n "${_ds_arrow_dir}" ]; then
+              mkdir -p "${_hf_dst}/datasets"
+              python3 /tmp/cdk_gcs.py sync_dir "${_gcs_ds}/datasets" "${_hf_dst}/datasets" 16 || true
+              if [ -n "${_ds_hub_dir}" ]; then
+                local _ds_slug
+                _ds_slug="$(basename "${_ds_hub_dir}")"
+                mkdir -p "${_hf_dst}/hub/${_ds_slug}/refs"
+                python3 /tmp/cdk_gcs.py sync_dir "${_ds_hub_dir}/refs" "${_hf_dst}/hub/${_ds_slug}/refs" 4 || true
+              fi
+            elif [ -n "${_ds_hub_dir}" ]; then
+              local _ds_slug
+              _ds_slug="$(basename "${_ds_hub_dir}")"
+              mkdir -p "${_hf_dst}/hub/${_ds_slug}/refs" "${_hf_dst}/hub/${_ds_slug}/snapshots"
+              python3 /tmp/cdk_gcs.py sync_dir "${_ds_hub_dir}/refs" "${_hf_dst}/hub/${_ds_slug}/refs" 8 || true
+              python3 /tmp/cdk_gcs.py sync_dir "${_ds_hub_dir}/snapshots" "${_hf_dst}/hub/${_ds_slug}/snapshots" 16 || true
+            else
+              python3 /tmp/cdk_gcs.py sync_dir "${_gcs_ds}" "${_hf_dst}" 16 || true
+            fi
+            if [ "${_hf_dst}" != "/root/.cache/huggingface" ]; then
+              local _sub
+              for _sub in "${_hf_dst}"/*; do
+                [ -e "${_sub}" ] || continue
+                ln -sfn "${_sub}" "/root/.cache/huggingface/$(basename "${_sub}")" 2>/dev/null || true
+              done
+            fi
+            emit_trace_event end "dataset-sync"
+          fi
+        }
+        _gcs_ds="${GCS_DATASET_CACHE:-@DEFAULT_GCS_DS@}"
+        if [ "${CDK_DEFER_DATASET_SYNC:-0}" = "1" ]; then
+          export _CDK_DEFERRED_GCS_DS="${_gcs_ds}"
+        else
+          _cdk_sync_gcs_dataset "${_gcs_ds}"
+        fi
+      |||,
+      { DEFAULT_GCS_DS: if enabled then defaultGcsDataset else '' }
+    ),
+
+  // Stage vLLM / Torch-TPU / XLA compilation caches in host RAM (/dev/shm/compile-cache) and
+  // persist verified, manifest-signed archives per user in GCS (v2/users/<user>/<recipe>/<key>/host<rank>.<ext>)
+  // plus shared content-addressed archives (v2/shared/<recipe>/<key>/host<rank>.<ext>, disabled on code overlays)
+  // with atomic create-once uploads (--if-generation-match=0) so concurrent jobs cannot collide.
+  compileCacheEnv(cacheDir='/dev/shm/compile-cache', enabled=true):: {
+    CACHE_DIR: cacheDir,
+    COMPILE_CACHE_ENABLED: if enabled then 'true' else 'false',
+    VLLM_DISABLE_COMPILE_CACHE: if enabled then '0' else cdk.var('VLLM_DISABLE_COMPILE_CACHE', '0'),
+    [if cdk.rawVar('COMPILE_CACHE_NAMESPACE', '') != '' then 'COMPILE_CACHE_NAMESPACE']: cdk.var('COMPILE_CACHE_NAMESPACE', ''),
+    [if cdk.rawVar('COMPILE_CACHE_TAG', '') != '' then 'COMPILE_CACHE_TAG']: cdk.var('COMPILE_CACHE_TAG', ''),
+    [if cdk.rawVar('COMPILE_CACHE_READ_SHARED', '') != '' then 'COMPILE_CACHE_READ_SHARED']: cdk.var('COMPILE_CACHE_READ_SHARED', ''),
+    VLLM_CACHE_ROOT: cdk.var('VLLM_CACHE_ROOT', cacheDir + '/vllm'),
+    VLLM_CONFIG_ROOT: cacheDir + '/vllm_config',
+    VLLM_XLA_CACHE_PATH: cacheDir + '/vllm/xla_cache',
+    TRITON_CACHE_DIR: cacheDir + '/triton',
+    TORCH_TPU_CACHE_DIR: cacheDir + '/torch_tpu_cache',
+    TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE: cacheDir + '/torch_tpu_cache',
+    JAX_COMPILER_CACHE_DIR: cacheDir + '/jax_cache',
+    JAX_COMPILATION_CACHE_DIR: cacheDir + '/jax_cache',
+    [if cdk.rawVar('TMPDIR', '') != '' then 'TMPDIR']: cdk.var('TMPDIR', ''),
+    TPU_LOG_DIR: cacheDir + '/tpu_logs',
+  } + (if enabled then {
+         TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: cacheDir + '/tier3_cache',
+         TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT: cacheDir + '/tier3_cache',
+         TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK: '0',
+         TORCHINDUCTOR_CACHE_DIR: cacheDir + '/inductor_cache',
+         TORCHINDUCTOR_FX_GRAPH_CACHE: '1',
+       } else {}),
+
+  // q38 BLSTACK (2026-11-17): RAIDEN_WHEEL=<file name under gs://cloud-devkit/wheels/> installs that tpu_sync_torch wheel on every
+  // server leg before the compile cache and the server start (Benliang Wang's recipe form, j-89325357; his tree d523c2ce0's tier classes /
+  // KEY_ROWS need tier_rows_9d19c961). Unset (default ''): '' (renders unchanged byte for byte).
+  q38RaidenWheelScript::
+    local w = cdk.var('RAIDEN_WHEEL', '');
+    assert w == '' || std.length(std.findSubstr('/', w)) == 0 : 'RAIDEN_WHEEL is a file name under gs://cloud-devkit/wheels/, got "%s"' % w;
+    if w == '' then '' else std.strReplace(|||
+      RAIDEN_WHL="/root/wheels/@WHL@"
+      mkdir -p /root/wheels
+      python3 /tmp/cdk_gcs.py cp "gs://cloud-devkit/wheels/@WHL@" "$RAIDEN_WHL" \
+        || { echo "RAIDEN_WHEEL: cannot download gs://cloud-devkit/wheels/@WHL@"; exit 1; }
+      # tpu_raiden_torch and tpu_sync_torch both unpack into tpu_sync/, so the image's copy goes
+      # first under either name.
+      if command -v uv >/dev/null 2>&1; then
+        uv pip uninstall --system tpu-raiden-torch tpu-sync-torch >/dev/null 2>&1 || true
+        uv pip install --system --no-deps "$RAIDEN_WHL" || { echo "RAIDEN_WHEEL: install failed"; exit 1; }
+      else
+        python3 -m pip uninstall -y tpu-raiden-torch tpu-sync-torch >/dev/null 2>&1 || true
+        python3 -m pip install --no-deps "$RAIDEN_WHL" || { echo "RAIDEN_WHEEL: install failed"; exit 1; }
+      fi
+      python3 -c "from tpu_sync.api.torch.kv_cache_manager import _torch_impl; _torch_impl()" \
+        || { echo "RAIDEN_WHEEL: $RAIDEN_WHL does not import against the image's torch_tpu"; exit 1; }
+      echo "RAIDEN_WHEEL: installed @WHL@ as tpu-sync-torch $(pip show tpu-sync-torch 2>/dev/null | awk '/^Version:/{print $2}')"
+    |||, '@WHL@', w),
+
+  compileCacheInitScript(recipe, image, role='unified', keySpec='', cacheUser=cdk.user)::
+    $.ensureGcsHelperScript + '\n' + $.q38RaidenWheelScript + $.fill(
+      |||
+        mkdir -p "${CACHE_DIR}" "${TMPDIR:-/tmp}" "${TRITON_CACHE_DIR}" "${VLLM_CACHE_ROOT}" \
+                 "${VLLM_CONFIG_ROOT}" "${VLLM_XLA_CACHE_PATH}" "${TORCH_TPU_CACHE_DIR}" \
+                 "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:-${CACHE_DIR}/tier3_cache}" \
+                 "${TORCHINDUCTOR_CACHE_DIR:-${CACHE_DIR}/inductor_cache}" \
+                 "${JAX_COMPILER_CACHE_DIR}" "${TPU_LOG_DIR}" || exit 1
+        find "${CACHE_DIR}" -maxdepth 10 \( -type f -size 0 -o -name "*.tmp*" \) -delete 2>/dev/null || true
+
+        export CDK_COMPILE_CACHE_HIT=0
+        export CDK_COMPILE_CACHE_INITIAL_FILES=0
+        export CDK_COMPILE_CACHE_PULL_SRC=""
+        if [ "${COMPILE_CACHE_ENABLED:-true}" = "true" ]; then
+          if command -v zstd >/dev/null 2>&1; then
+            export CDK_CC_EXT="tar.zst"
+          else
+            export CDK_CC_EXT="tar.gz"
+          fi
+          if [ "${JOBSET_JOB_INDEX:-0}" != "0" ]; then
+            export CDK_COMPILE_CACHE_HOST_RANK="${JOBSET_JOB_INDEX}"
+          else
+            export CDK_COMPILE_CACHE_HOST_RANK="${JOB_COMPLETION_INDEX:-0}"
+          fi
+          export CDK_COMPILE_CACHE_KEY="$(python3 /tmp/cdk_gcs.py cache_key "@RECIPE@" "@IMAGE@" "@ROLE@" "@KEY_SPEC_B64@")"
+          export CDK_COMPILE_CACHE_OVERLAY_SHA="$(python3 /tmp/cdk_gcs.py overlay_sha)"
+
+          _cc_bucket="${COMPILE_CACHE_GCS:-@DEFAULT_CC_GCS@}"
+          _cc_bucket="${_cc_bucket#gs://}"
+          _cc_bucket="${_cc_bucket%/}"
+          _cc_ns_raw="${COMPILE_CACHE_NAMESPACE:-@CACHE_USER@}"
+          _cc_ns="$(printf '%s' "${_cc_ns_raw:-default}" | tr -cs 'A-Za-z0-9._-' '_' | sed 's/^_//;s/_$//')"
+          [ -n "${_cc_ns}" ] || _cc_ns="default"
+          export CDK_COMPILE_CACHE_NAMESPACE="${_cc_ns}"
+          export CDK_COMPILE_CACHE_GCS_DIR="gs://${_cc_bucket}/v2/users/${_cc_ns}/@RECIPE@/${CDK_COMPILE_CACHE_KEY}"
+          export CDK_COMPILE_CACHE_GCS_OBJ="${CDK_COMPILE_CACHE_GCS_DIR}/host${CDK_COMPILE_CACHE_HOST_RANK}.${CDK_CC_EXT}"
+          _cc_fallback_obj="${CDK_COMPILE_CACHE_GCS_DIR}/host0.${CDK_CC_EXT}"
+          if [ -z "${CDK_COMPILE_CACHE_OVERLAY_SHA}" ] && [ "${DEV_SINGLE_BUCKET:-false}" != "true" ]; then
+            _cc_shared_dir="gs://${_cc_bucket}/v2/shared/@RECIPE@/${CDK_COMPILE_CACHE_KEY}"
+            _cc_shared_obj="${_cc_shared_dir}/host${CDK_COMPILE_CACHE_HOST_RANK}.${CDK_CC_EXT}"
+            _cc_shared_fallback_obj="${_cc_shared_dir}/host0.${CDK_CC_EXT}"
+          else
+            _cc_shared_dir=""
+            _cc_shared_obj=""
+            _cc_shared_fallback_obj=""
+          fi
+          export CDK_COMPILE_CACHE_SHARED_OBJ="${_cc_shared_obj}"
+          echo "[CompileCache] Namespace=${CDK_COMPILE_CACHE_NAMESPACE} Key=${CDK_COMPILE_CACHE_KEY} HostRank=${CDK_COMPILE_CACHE_HOST_RANK} Overlay=${CDK_COMPILE_CACHE_OVERLAY_SHA:-none} Target=${CDK_COMPILE_CACHE_GCS_OBJ}"
+
+          _cdk_reset_compile_cache_dirs() {
+            find "${CACHE_DIR}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+            mkdir -p "${CACHE_DIR}" "${TMPDIR:-/tmp}" "${TRITON_CACHE_DIR}" "${VLLM_CACHE_ROOT}" \
+                     "${VLLM_CONFIG_ROOT}" "${VLLM_XLA_CACHE_PATH}" "${TORCH_TPU_CACHE_DIR}" \
+                     "${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:-${CACHE_DIR}/tier3_cache}" \
+                     "${TORCHINDUCTOR_CACHE_DIR:-${CACHE_DIR}/inductor_cache}" \
+                     "${JAX_COMPILER_CACHE_DIR}" "${TPU_LOG_DIR}" || true
+          }
+
+          if [ "${COMPILE_CACHE_REFRESH:-false}" != "true" ]; then
+            _pull_obj=""
+            if python3 /tmp/cdk_gcs.py exists "${CDK_COMPILE_CACHE_GCS_OBJ}"; then
+              _pull_obj="${CDK_COMPILE_CACHE_GCS_OBJ}"
+            elif [ "${CDK_COMPILE_CACHE_HOST_RANK}" != "0" ] && python3 /tmp/cdk_gcs.py exists "${_cc_fallback_obj}"; then
+              _pull_obj="${_cc_fallback_obj}"
+            elif [ -n "${_cc_shared_obj}" ] && [ "${COMPILE_CACHE_READ_SHARED:-true}" != "false" ] && python3 /tmp/cdk_gcs.py exists "${_cc_shared_obj}"; then
+              _pull_obj="${_cc_shared_obj}"
+            elif [ -n "${_cc_shared_fallback_obj}" ] && [ "${COMPILE_CACHE_READ_SHARED:-true}" != "false" ] && [ "${CDK_COMPILE_CACHE_HOST_RANK}" != "0" ] && python3 /tmp/cdk_gcs.py exists "${_cc_shared_fallback_obj}"; then
+              _pull_obj="${_cc_shared_fallback_obj}"
+            fi
+            if [ -n "${_pull_obj}" ]; then
+              echo "trace-start-event: name=compile-cache-pull ts=$(date +'%s.%N') pid=vllm tid=vllm"
+              _t0=$(date +%s)
+              if [ "${CDK_CC_EXT}" = "tar.zst" ]; then
+                _cc_decomp="zstd -d -c"
+              else
+                _cc_decomp="python3 /tmp/cdk_gcs.py pgunzip ${COMPILE_CACHE_PULL_WORKERS:-16}"
+              fi
+              if ( set -o pipefail; python3 /tmp/cdk_gcs.py stream_get "${_pull_obj}" "${COMPILE_CACHE_PULL_WORKERS:-16}" | ${_cc_decomp} | tar -xf - -C "${CACHE_DIR}" ) \
+                 && python3 /tmp/cdk_gcs.py verify_cache "${CACHE_DIR}" >/dev/null; then
+                export CDK_COMPILE_CACHE_HIT=1
+                export CDK_COMPILE_CACHE_PULL_SRC="${_pull_obj}"
+              else
+                _cdk_reset_compile_cache_dirs
+                if python3 /tmp/cdk_gcs.py cp "${_pull_obj}" "/tmp/cc_pull.${CDK_CC_EXT}"; then
+                  if ( set -o pipefail; ${_cc_decomp} < "/tmp/cc_pull.${CDK_CC_EXT}" | tar -xf - -C "${CACHE_DIR}" ) \
+                     && python3 /tmp/cdk_gcs.py verify_cache "${CACHE_DIR}" >/dev/null; then
+                    export CDK_COMPILE_CACHE_HIT=1
+                    export CDK_COMPILE_CACHE_PULL_SRC="${_pull_obj}"
+                  else
+                    _cdk_reset_compile_cache_dirs
+                  fi
+                  rm -f "/tmp/cc_pull.${CDK_CC_EXT}"
+                fi
+                if [ "${CDK_COMPILE_CACHE_HIT}" != "1" ]; then
+                  echo "[CompileCache] WARNING: archive verification failed for ${_pull_obj}; wiped ${CACHE_DIR} and falling back to cold compile."
+                fi
+              fi
+              export CDK_COMPILE_CACHE_INITIAL_FILES="$( (find "${CACHE_DIR}" -maxdepth 10 -type f ! -path "${CACHE_DIR}/tmp/*" ! -path "${TMPDIR:-/nonexistent_tmpdir}/*" ! -path "${TPU_LOG_DIR}/*" ! -name '.cdk_cache_manifest.json' 2>/dev/null || true) | wc -l | tr -d ' ' )"
+              echo "[CompileCache] HIT=${CDK_COMPILE_CACHE_HIT} from ${_pull_obj} in $(( $(date +%s) - _t0 ))s (${CDK_COMPILE_CACHE_INITIAL_FILES} files restored to ${CACHE_DIR})"
+              echo "trace-end-event: name=compile-cache-pull ts=$(date +'%s.%N') pid=vllm tid=vllm"
+            else
+              echo "[CompileCache] MISS (cold start): no archive yet at ${CDK_COMPILE_CACHE_GCS_OBJ}"
+            fi
+          else
+            echo "[CompileCache] COMPILE_CACHE_REFRESH=true: skipping pull to rebuild user-scoped cache."
+          fi
+        else
+          echo "[CompileCache] Disabled (COMPILE_CACHE_ENABLED=${COMPILE_CACHE_ENABLED:-false})."
+        fi
+      |||,
+      {
+        RECIPE: recipe,
+        IMAGE: image,
+        ROLE: role,
+        KEY_SPEC_B64: std.base64(std.strReplace(keySpec, '"', "'")),
+        DEFAULT_CC_GCS: $.defaultCompileCacheGcs,
+        CACHE_USER: cacheUser,
+      }
+    ) + $.q38ccBlock(recipe, image, role, keySpec),
+
+  // q38 INT-CACHE (2026-11-15): the Q38CC opt-in (reports/int_cache_design.md; installer q38_intcache_q38cc_install.sh).
+  // Q38CC unset / 'off' returns '' (renders byte-identical). 'keyonly' prints the q38cc config-key line; 'pull' restores a
+  // pinned populate job's archive for the same key and fails closed to a cold compile. 'populate' is deferred until the
+  // user rules on its GCS write, so it is refused here. Only the q38 disagg recipe's server legs opt in.
+  q38ccToolSha16:: '1d397328aa32522d',
+  // v3: real CDK job ids are j-<8>-<4>-<4>-<4> (23 chars after 'j-'); the 5-group UUID form stays accepted.
+  q38ccSrcOk(src)::
+    local pre = 'gs://cloud-devkit/jobs/j-';
+    local post = '/q38cc';
+    local n = std.length(src) - std.length(pre) - std.length(post);
+    local mid = if (n == 23 || n == 36) && std.startsWith(src, pre) && std.endsWith(src, post) then std.substr(src, std.length(pre), n) else '';
+    std.length(mid) > 0
+    && std.all([std.length(std.findSubstr(c, '0123456789abcdef-')) > 0 for c in std.stringChars(mid)])
+    && std.length(std.findSubstr('-', mid)) == (if n == 23 then 3 else 4)
+    && std.all([std.substr(mid, i, 1) == '-' for i in (if n == 23 then [8, 13, 18] else [8, 13, 18, 23])]),
+  // Bench side of Q38CC=populate (benchJob's EXIT_ON_READY branch): wait for every selected leg's publish marker before
+  // the existing exit, so the JobSet cannot end mid-publish; '' unless Q38CC=populate on the q38 disagg recipe.
+  q38ccPopulateWait::
+    local mode = cdk.var('Q38CC', 'off');
+    if mode != 'populate' || cdk.recipeName != 'infx-qwen38-flash-agentx-disagg' then ''
+    else
+      local roles = std.split(cdk.var('Q38CC_ROLES', 'decode,prefill'), ',');
+      local waitS = cdk.var('Q38CC_POPULATE_WAIT_S', '10800');
+      std.join('\n', [
+        '# >>> q38cc v1 bench wait (populate) >>>',
+        '_q38cc_bad=0',
+        'for _q38cc_r in %s; do' % std.join(' ', ['q38cc_%s_host0' % r for r in roles]),
+        '  _q38cc_t=0',
+        '  until compgen -G "/cdk-outputs/outputs/${JS_NAME}-*/*/*/${_q38cc_r}.published" >/dev/null 2>&1 || compgen -G "/cdk-outputs/outputs/${JS_NAME}-*/*/*/${_q38cc_r}.failed" >/dev/null 2>&1 || compgen -G "/cdk-outputs/outputs/${JS_NAME}-*/*/*/${_q38cc_r}.skipped" >/dev/null 2>&1; do',
+        '    if [ "$_q38cc_t" -ge %s ]; then echo "[Q38CC] bench: no publish marker for ${_q38cc_r} after %s s"; _q38cc_bad=1; break; fi' % [waitS, waitS],
+        '    sleep 20; _q38cc_t=$(( _q38cc_t + 20 ))',
+        '  done',
+        '  compgen -G "/cdk-outputs/outputs/${JS_NAME}-*/*/*/${_q38cc_r}.published" >/dev/null 2>&1 || _q38cc_bad=1',
+        '  echo "[Q38CC] bench: ${_q38cc_r} markers: $(ls /cdk-outputs/outputs/${JS_NAME}-*/*/*/${_q38cc_r}.* 2>/dev/null | xargs -n1 basename 2>/dev/null | tr -s \'\\n\' \' \')"',
+        'done',
+        'if [ "$_q38cc_bad" != 0 ]; then echo "RESULT: FAIL (q38cc populate: a selected leg did not publish)"; exit 1; fi',
+        'echo "RESULT: PASS (q38cc populate car: every selected leg published; no traffic was sent)"',
+        '# <<< q38cc v1 <<<',
+      ]) + '\n',
+  q38ccBlock(recipe, image, role, keySpec)::
+    local mode = cdk.var('Q38CC', 'off');
+    local roles = std.split(cdk.var('Q38CC_ROLES', 'decode,prefill'), ',');
+    if mode == 'off' || recipe != 'infx-qwen38-flash-agentx-disagg' || !std.member(roles, role) then ''
+    else
+      local tool = importstr 'q38cc.py';
+      local sha = $.q38ccToolSha16;
+      local tree = cdk.var('Q38CC_TREE', '/root/cloud-devkit/vllm-torchtpu');
+      local expect = cdk.var('Q38CC_EXPECT_SRC', '');
+      local src = cdk.var('Q38CC_SRC', '');
+      local spec = std.parseJson(keySpec);
+      local common = "--role %s --image '%s' --env-names /tmp/q38cc/envnames_%s.txt --args /tmp/q38cc/args_%s.json --tree %s --check-import --tool-sha %s" % [role, image, role, role, tree, sha];
+      local ports = [std.split(a, ' ')[1] for a in spec.args if std.startsWith(a, '--port ')]
+                    + [std.split(a, '=')[1] for a in spec.args if std.startsWith(a, '--port=')];
+      local port = if std.length(ports) == 1 then ports[0] else '';
+      local cmd =
+        if mode == 'keyonly' then 'python3 -s /tmp/q38cc/q38cc.py keyline %s || true' % common
+        else if mode == 'populate' then std.join('\n', [
+          'python3 -s /tmp/q38cc/q38cc.py keyline %s || true' % common,
+          '(',
+          '  { set +x; } 2>/dev/null',
+          '  until curl -sf "http://127.0.0.1:%s/health" >/dev/null 2>&1; do sleep 5; done' % port,
+          '  Q38CC_MODE=populate nice -n 10 python3 -s /tmp/q38cc/q38cc.py publish --mode populate %s --cache-dir "${CACHE_DIR}" --dst "gs://cloud-devkit/jobs/${CDK_JOB_ID}/q38cc"' % common,
+          '  _q38cc_rc=$?',
+          '  case "$_q38cc_rc" in 0) _q38cc_m=published ;; 4|5) _q38cc_m=skipped ;; *) _q38cc_m=failed ;; esac',
+          '  echo "$_q38cc_rc" > "${CDK_OUTPUT_DIR:-/tmp}/q38cc_%s_host0.${_q38cc_m}"' % role,
+          ') &',
+        ])
+        else "python3 -s /tmp/q38cc/q38cc.py pull %s --cache-dir \"${CACHE_DIR}\" --src '%s' --expect-src '%s' --status \"${CDK_OUTPUT_DIR:-/tmp}/q38cc_%s_host0.status.json\" || echo \"[Q38CC] WARNING COLD reason=tool-rc -> COLD COMPILE (fail-closed)\"" % [common, src, expect, role];
+      local block = std.join('\n', [
+        '# >>> q38cc v1 mode=%s role=%s tool_sha=%s >>>' % [mode, role, sha],
+        'mkdir -p /tmp/q38cc',
+        "cat > /tmp/q38cc/q38cc.py <<'Q38CC_PY_EOF'",
+        std.rstripChars(tool, '\n'),
+        'Q38CC_PY_EOF',
+        "cat > /tmp/q38cc/envnames_%s.txt <<'Q38CC_ENV_EOF'" % role,
+      ] + std.objectFields(spec.env) + [
+        'Q38CC_ENV_EOF',
+        "cat > /tmp/q38cc/args_%s.json <<'Q38CC_ARGS_EOF'" % role,
+        std.manifestJsonMinified(spec.args),
+        'Q38CC_ARGS_EOF',
+        'echo "[Q38CC] tool sha256=$(sha256sum /tmp/q38cc/q38cc.py | cut -c1-16) expect=%s"' % sha,
+        cmd,
+        '# <<< q38cc v1 <<<',
+      ]) + '\n';
+      if mode != 'keyonly' && mode != 'pull' && mode != 'populate' then
+        error 'Q38CC must be off, keyonly, pull or populate, got %s' % mode
+      else if mode == 'populate' && !cdk.boolVar('EXIT_ON_READY', false) then
+        error 'Q38CC=populate needs EXIT_ON_READY=true (a populate car serves no traffic and runs no benchmark)'
+      else if mode == 'populate' && port == '' then
+        error 'Q38CC=populate: the %s leg has no single --port serve arg for its /health wait' % role
+      else if cdk.boolVar('COMPILE_CACHE_ENABLED', true) then
+        error 'Q38CC=%s needs COMPILE_CACHE_ENABLED=false (the CDK compile-cache pull and upload must stay inert)' % mode
+      else if mode == 'pull' && !$.q38ccSrcOk(src) then
+        error 'Q38CC=pull needs Q38CC_SRC=gs://cloud-devkit/jobs/j-<uuid>/q38cc (a pinned populate job), got %s' % src
+      else if mode == 'pull' && std.length(expect) != 10 then
+        error 'Q38CC=pull needs Q38CC_EXPECT_SRC=<the car tree SRC hash, 10 hex>, got %s' % expect
+      else block,
+
+  compileCacheUploadScript(healthUrl='http://127.0.0.1:8000/health')::
+    $.ensureGcsHelperScript + '\n' + $.fill(
+      |||
+        if [ "${COMPILE_CACHE_ENABLED:-true}" = "true" ] && [ -n "${CDK_COMPILE_CACHE_GCS_OBJ:-}" ]; then
+          _cc_status_dir="${CDK_OUTPUT_DIR:-/tmp}"
+          mkdir -p "${_cc_status_dir}"
+          rm -f /tmp/cdk_cc_server_healthy
+          case "${_cc_status_dir}" in
+            /cdk-outputs/outputs/*/*/*) _cc_job_dir="$(dirname "$(dirname "${_cc_status_dir}")")" ;;
+            *) _cc_job_dir="" ;;
+          esac
+          if [ -n "${_cc_job_dir}" ]; then
+            rm -f "${_cc_job_dir}"/*/*/compile_cache_sync_host${CDK_COMPILE_CACHE_HOST_RANK:-0}.pending 2>/dev/null || true
+          fi
+          if [ "${CDK_COMPILE_CACHE_HIT:-0}" = "0" ] || [ "${COMPILE_CACHE_REFRESH:-false}" = "true" ]; then
+            echo "pending" > "${_cc_status_dir}/compile_cache_sync_host${CDK_COMPILE_CACHE_HOST_RANK:-0}.pending" 2>/dev/null || true
+            if [ -d /tmp/signal ]; then
+              echo "pending" > "/tmp/signal/compile_cache_sync_host${CDK_COMPILE_CACHE_HOST_RANK:-0}.pending" 2>/dev/null || true
+            fi
+          fi
+          # Use BASHPID (kubelet collapses double-dollar into a literal $ inside container args[]).
+          _cc_parent_pid="${BASHPID:-}"
+          (
+            { set +x; set +e; set +o pipefail; } 2>/dev/null
+            trap '' TERM INT
+            until curl -sf "@HEALTH_URL@" >/dev/null 2>&1; do
+              if [ -n "${_cc_parent_pid}" ] && ! kill -0 "${_cc_parent_pid}" 2>/dev/null; then
+                rm -f "${_cc_status_dir}/compile_cache_sync_host${CDK_COMPILE_CACHE_HOST_RANK:-0}.pending" "/tmp/signal/compile_cache_sync_host${CDK_COMPILE_CACHE_HOST_RANK:-0}.pending" 2>/dev/null || true
+                exit 0
+              fi
+              sleep 2
+            done
+            touch /tmp/cdk_cc_server_healthy
+            if [ -n "${CDK_WEIGHT_PREFETCH_PID:-}" ] && kill -0 "${CDK_WEIGHT_PREFETCH_PID}" 2>/dev/null; then
+              kill "${CDK_WEIGHT_PREFETCH_PID}" 2>/dev/null || true
+            fi
+            _user_obj_ready=0
+            if [ "${CDK_COMPILE_CACHE_PULL_SRC:-}" = "${CDK_COMPILE_CACHE_GCS_OBJ}" ]; then
+              _user_obj_ready=1
+            fi
+            _cur_files="$( (find "${CACHE_DIR}" -maxdepth 10 -type f ! -path "${CACHE_DIR}/tmp/*" ! -path "${TMPDIR:-/nonexistent_tmpdir}/*" ! -path "${TPU_LOG_DIR}/*" ! -name '*.tmp*' ! -name '.cdk_cache_manifest.json' 2>/dev/null || true) | wc -l | tr -d ' ' )"
+            if [ "${CDK_COMPILE_CACHE_HIT:-0}" = "0" ] || [ "${COMPILE_CACHE_REFRESH:-false}" = "true" ] || [ "${_cur_files:-0}" -gt $(( ${CDK_COMPILE_CACHE_INITIAL_FILES:-0} + 2 )) ]; then
+              _t0=$(date +%s)
+              _up_flags=""
+              if [ "${COMPILE_CACHE_REFRESH:-false}" != "true" ]; then
+                _up_flags="--if-generation-match=0"
+              fi
+              _stage_arc="/tmp/cdk_cc_stage_host${CDK_COMPILE_CACHE_HOST_RANK:-0}.${BASHPID:-0}.${CDK_CC_EXT:-tar.gz}"
+              rm -f "${_stage_arc}"
+              # q38 FASTSTART fix (INT-4 2026-11-12): settle after healthy (file count quiet CDK_CC_SETTLE_QUIET_S, bounded by
+              # CDK_CC_SETTLE_MAX_S), then retry the pack every CDK_CC_PACK_RETRY_S until it lands, the server exits, or CDK_CC_PACK_TRIES.
+              _s0=$(date +%s); _last_n=-1; _quiet=0
+              while [ $(( $(date +%s) - _s0 )) -lt "${CDK_CC_SETTLE_MAX_S:-300}" ] && [ "${_quiet}" -lt "${CDK_CC_SETTLE_QUIET_S:-120}" ]; do
+                _n="$( (find "${CACHE_DIR}" -type f ! -name '*.tmp*' 2>/dev/null || true) | wc -l | tr -d ' ' )"
+                if [ "${_n}" = "${_last_n}" ]; then _quiet=$(( _quiet + 10 )); else _quiet=0; _last_n="${_n}"; fi
+                sleep 10
+              done
+              _pk_try=0
+              while :; do
+                _pack_rc=0
+                nice -n 10 python3 /tmp/cdk_gcs.py pack_cache "${CACHE_DIR}" "${_stage_arc}" "${CDK_CC_EXT:-tar.gz}" >/dev/null || _pack_rc=$?
+                if [ "${_pack_rc}" = "0" ] || [ "${_pack_rc}" = "3" ]; then break; fi
+                _pk_try=$(( _pk_try + 1 ))
+                if [ "${_pk_try}" -ge "${CDK_CC_PACK_TRIES:-10}" ]; then break; fi
+                if [ -n "${_cc_parent_pid}" ] && ! kill -0 "${_cc_parent_pid}" 2>/dev/null; then break; fi
+                echo "[CompileCache] pack attempt ${_pk_try} failed (pack_rc=${_pack_rc}); retrying in ${CDK_CC_PACK_RETRY_S:-120}s"
+                sleep "${CDK_CC_PACK_RETRY_S:-120}"
+              done
+              if [ "${_pack_rc}" = "0" ] && [ -s "${_stage_arc}" ]; then
+                _up_rc=0
+                nice -n 10 python3 /tmp/cdk_gcs.py cp ${_up_flags} "${_stage_arc}" "${CDK_COMPILE_CACHE_GCS_OBJ}" || _up_rc=$?
+                if [ "${_up_rc}" = "2" ]; then
+                  _user_obj_ready=1
+                  echo "[CompileCache] Archive ${CDK_COMPILE_CACHE_GCS_OBJ} already populated by concurrent job; skipped overwrite."
+                elif [ "${_up_rc}" = "0" ]; then
+                  _user_obj_ready=1
+                  echo "[CompileCache] Uploaded verified user cache ${CDK_COMPILE_CACHE_GCS_OBJ} (${_cur_files} files, $(( $(date +%s) - _t0 ))s)"
+                else
+                  echo "[CompileCache] WARNING: upload failed (up_rc=${_up_rc}) for ${CDK_COMPILE_CACHE_GCS_OBJ}"
+                fi
+              elif [ "${_pack_rc}" = "3" ]; then
+                echo "[CompileCache] Cache directory empty; skipping upload."
+              else
+                echo "[CompileCache] WARNING: archive staging/verification failed (pack_rc=${_pack_rc}); skipped GCS upload for ${CDK_COMPILE_CACHE_GCS_OBJ}"
+              fi
+              rm -f "${_stage_arc}"
+            fi
+            if [ "${_user_obj_ready}" = "1" ] && [ -n "${CDK_COMPILE_CACHE_SHARED_OBJ:-}" ] && [ "${COMPILE_CACHE_WRITE_SHARED:-true}" != "false" ]; then
+              if [ "${COMPILE_CACHE_REFRESH_SHARED:-false}" = "true" ]; then
+                python3 /tmp/cdk_gcs.py copy_obj "${CDK_COMPILE_CACHE_GCS_OBJ}" "${CDK_COMPILE_CACHE_SHARED_OBJ}" >/dev/null 2>&1 \
+                  && echo "[CompileCache] Refreshed shared cache ${CDK_COMPILE_CACHE_SHARED_OBJ} (server-side rewrite)" || true
+              elif ! python3 /tmp/cdk_gcs.py exists "${CDK_COMPILE_CACHE_SHARED_OBJ}"; then
+                _sh_rc=0
+                python3 /tmp/cdk_gcs.py copy_obj --if-generation-match=0 "${CDK_COMPILE_CACHE_GCS_OBJ}" "${CDK_COMPILE_CACHE_SHARED_OBJ}" >/dev/null 2>&1 || _sh_rc=$?
+                if [ "${_sh_rc}" = "0" ]; then
+                  echo "[CompileCache] Published shared cache ${CDK_COMPILE_CACHE_SHARED_OBJ} (server-side rewrite)"
+                fi
+              fi
+            fi
+            rm -f "${_cc_status_dir}/compile_cache_sync_host${CDK_COMPILE_CACHE_HOST_RANK:-0}.pending" "/tmp/signal/compile_cache_sync_host${CDK_COMPILE_CACHE_HOST_RANK:-0}.pending" 2>/dev/null || true
+            if [ -n "${_cc_job_dir}" ]; then
+              rm -f "${_cc_job_dir}"/*/*/compile_cache_sync_host${CDK_COMPILE_CACHE_HOST_RANK:-0}.pending 2>/dev/null || true
+            fi
+            echo "done" > "${_cc_status_dir}/compile_cache_sync_host${CDK_COMPILE_CACHE_HOST_RANK:-0}.done" 2>/dev/null || true
+          ) &
+          export CDK_COMPILE_CACHE_UPLOAD_PID=$!
+          _cdk_drain_compile_cache_upload() {
+            local _rc=$?
+            if [ -f /tmp/cdk_cc_server_healthy ] && [ -n "${CDK_COMPILE_CACHE_UPLOAD_PID:-}" ] && kill -0 "${CDK_COMPILE_CACHE_UPLOAD_PID}" 2>/dev/null; then
+              echo "[CompileCache] Server exiting after reaching healthy state; draining in-flight cache upload (pid=${CDK_COMPILE_CACHE_UPLOAD_PID}, max 300s)..."
+              local _w=0
+              while kill -0 "${CDK_COMPILE_CACHE_UPLOAD_PID}" 2>/dev/null && [ "${_w}" -lt 300 ]; do   # q38 FASTSTART fix: 140 -> 300 s (one pack ~140 s + upload)
+                sleep 1
+                _w=$(( _w + 1 ))
+              done
+            fi
+            return "${_rc}"
+          }
+          trap '_cdk_drain_compile_cache_upload' EXIT
+        fi
+      |||,
+      { HEALTH_URL: healthUrl }
+    ),
+
+  snapshotFatalOnExit(exitVar='VLLM_EXIT_CODE', logPath='/tmp/cdk_server.log', fatalOutPath='${CDK_OUTPUT_DIR:-/tmp/cdk_output}/server.log.fatal')::
+    $.fill(
+      |||
+        [ -n "${CDK_WEIGHT_PREFETCH_PID:-}" ] && kill -TERM "${CDK_WEIGHT_PREFETCH_PID}" 2>/dev/null || true
+        if [ "${ENABLE_RUNTIME_GUARDRAILS:-true}" != "false" ]; then
+          if [ -s "@FATAL_OUT@" ] && [ "${@EXIT_VAR@:-0}" -eq 0 ]; then
+            @EXIT_VAR@=1
+          elif [ "${@EXIT_VAR@:-0}" -ne 0 ] && [ ! -s "@FATAL_OUT@" ]; then
+            sleep 1
+            mkdir -p "$(dirname "@FATAL_OUT@")" 2>/dev/null || true
+            { cat "@LOG_PATH@.1" "@LOG_PATH@" 2>/dev/null | tail -c 1048576 | tr -d '\000'; printf '\nEngine core initialization failed: vllm serve exited with code %s\n' "${@EXIT_VAR@}"; } > "@FATAL_OUT@" 2>/dev/null || true
+          fi
+        fi
+      |||,
+      {
+        EXIT_VAR: exitVar,
+        LOG_PATH: logPath,
+        FATAL_OUT: fatalOutPath,
+      }
+    ),
+
+  // Multi-worker TPU precompilation flags and optional minimal compile_sizes bucket list for dev runs.
+  // When fullSuite=false (baseline FAST_STARTUP=false), leave BIGGEST_FIRST / PEER_REPLAY / TRACE_FIRST
+  // unset unless explicitly overridden so the container image's built-in defaults apply untouched.
+  parallelPrecompileEnv(enabled=true, fullSuite=true)::
+    local bf = cdk.rawVar('TPU_PRECOMPILE_BIGGEST_FIRST', if enabled && fullSuite then '1' else '');
+    local pr = cdk.rawVar('TPU_PRECOMPILE_PEER_REPLAY', if enabled && fullSuite then '1' else '');
+    local tf = cdk.rawVar('TPU_PRECOMPILE_TRACE_FIRST', if enabled && fullSuite then '1' else '');
+    {
+      TPU_PARALLEL_PRECOMPILE: if enabled then '1' else '0',
+      [if bf != '' then 'TPU_PRECOMPILE_BIGGEST_FIRST']: bf,
+      [if pr != '' then 'TPU_PRECOMPILE_PEER_REPLAY']: pr,
+      [if tf != '' then 'TPU_PRECOMPILE_TRACE_FIRST']: tf,
+    },
+
+  compileSizesList(devSingleBucket=false, compileSizesStr='', maxBatchedTokens=4096, smallBucket=256)::
+    if compileSizesStr != '' then [
+      if cdk.isNumeric(w) then std.parseJson(w)
+      else error 'COMPILE_SIZES entries must be integers, got %s' % w
+      for w in std.filter(function(x) x != '', std.split(std.strReplace(compileSizesStr, ',', ' '), ' '))
+    ]
+    else if devSingleBucket then
+      (if smallBucket != null && smallBucket > 0 && smallBucket < maxBatchedTokens then [smallBucket, maxBatchedTokens] else [maxBatchedTokens])
+    else null,
+
+  compilationConfigArg(devSingleBucket=false, compileSizesStr='', maxBatchedTokens=4096, smallBucket=256)::
+    local sizes = $.compileSizesList(devSingleBucket, compileSizesStr, maxBatchedTokens, smallBucket);
+    if sizes != null then
+      ["--compilation-config '%s'" % std.manifestJsonMinified({ compile_sizes: sizes })]
+    else [],
+
+  // Provenance publication (always runs on rank 0) plus optional pre-Ray Python package, commit,
+  // scheduler, and C++ ABI sanity checks (<0.5s fail-fast before weight sync or TPU worker init).
+  runtimeGuardrailScript(requireTpuSync=false, checkPaw=false, extraPythonChecks='')::
+    $.ensureGcsHelperScript + '\n' + $.fill(
+    |||
+      PROV_SRC="$(python3 -c 'import importlib.util, pathlib; s = importlib.util.find_spec("vllm_torchtpu"); print(pathlib.Path(s.origin).resolve().parents[2] if s and s.origin else "")' 2>/dev/null || true)"
+      if [ -z "$PROV_SRC" ] || [ ! -d "$PROV_SRC" ]; then
+        for _cand_src in /workspace/vllm-torchtpu /root/cloud-devkit/vllm-torchtpu /root/torchtpu-vllm; do
+          if [ -d "${_cand_src}" ]; then
+            PROV_SRC="${_cand_src}"
+            break
+          fi
+        done
+      fi
+      export PROV_VLLM="$( (pip show vllm 2>/dev/null || true) | awk '/^Version:/{print $2}' )"
+      export PROV_RAIDEN="$( (pip show tpu-sync-torch 2>/dev/null || true) | awk '/^Version:/{print $2}' )"
+      export PROV_TORCH_TPU="$( (pip show torch_tpu 2>/dev/null || true) | awk '/^Version:/{print $2}' )"
+      export PROV_COMMIT="$(git -C "$PROV_SRC" rev-parse HEAD 2>/dev/null || true)"
+      PROV_PENDING="$( (git -C "$PROV_SRC" status --porcelain 2>/dev/null || true) | wc -l | tr -d ' ' )"
+      export PROV_DIRTY_SHA=""
+      if [ -n "${PROV_COMMIT}" ] && [ "${PROV_PENDING:-0}" -gt 0 ]; then
+        export PROV_DIRTY_SHA="$(python3 /tmp/cdk_gcs.py git_dirty_sha "$PROV_SRC" 2>/dev/null || true)"
+      fi
+      PROV_BRANCH="$(git -C "$PROV_SRC" symbolic-ref --short -q HEAD 2>/dev/null || true)"
+      PROV_TAGS="$(git -C "$PROV_SRC" tag --points-at HEAD 2>/dev/null || true)"
+      PROV_MESSAGE="$(git -C "$PROV_SRC" log -1 --format=%s 2>/dev/null || true)"
+      PROV_AUTHOR="$(git -C "$PROV_SRC" log -1 --format=%an 2>/dev/null || true)"
+      PROV_DATE="$(git -C "$PROV_SRC" log -1 --format=%cI 2>/dev/null || true)"
+      PROV_JSON="$(python3 -c '
+      import json, sys
+      c, v, r, tt, n, b, t, msg, auth, dt, dirty = sys.argv[1:12]
+      p = {
+          "vllm_version": v or "unknown",
+          "raiden_version": r or "unknown",
+          "torch_tpu_version": tt or "unknown",
+          "vllm_torchtpu_commit": c or "unknown",
+          "vllm_torchtpu_dirty": (int(n or 0) > 0) if c else None,
+          "vllm_torchtpu_dirty_sha": dirty or None,
+          "vllm_torchtpu_pending_changes": int(n or 0) if c else None,
+          "vllm_torchtpu_commit_message": msg.strip() or None if c else None,
+          "vllm_torchtpu_commit_author": auth or None if c else None,
+          "vllm_torchtpu_commit_date": dt or None if c else None,
+      }
+      if b:
+          p["vllm_torchtpu_branch"] = b
+      if t.split():
+          p["vllm_torchtpu_tags"] = t.split()
+      print(json.dumps({"provenance": p}))
+      ' "$PROV_COMMIT" "$PROV_VLLM" "$PROV_RAIDEN" "$PROV_TORCH_TPU" "$PROV_PENDING" "$PROV_BRANCH" "$PROV_TAGS" "$PROV_MESSAGE" "$PROV_AUTHOR" "$PROV_DATE" "$PROV_DIRTY_SHA" || echo '{"provenance":{}}')"
+      echo "Provenance: ${PROV_JSON}"
+      if command -v result-updater >/dev/null 2>&1 && [ "${JOBSET_JOB_INDEX:-0}" = "0" ] && [ "${JOB_COMPLETION_INDEX:-0}" = "0" ]; then
+        result-updater -a "${PROV_JSON}" || echo "WARNING: result-updater failed for provenance"
+      fi
+
+      if [ "${ENABLE_RUNTIME_GUARDRAILS:-true}" != "false" ]; then
+        echo "trace-start-event: name=runtime-guardrail ts=$(date +'%s.%N') pid=vllm tid=vllm"
+        _rg_rc=0
+        VLLM_PLUGINS="" VLLM_TARGET_DEVICE="empty" JAX_PLATFORMS="cpu" python3 - <<'CDK_RUNTIME_GUARDRAIL_EOF' || _rg_rc=$?
+      import importlib.metadata, importlib.util, os, pathlib, sys
+      errors = []
+      vllm_spec = importlib.util.find_spec("vllm")
+      ttpu_spec = importlib.util.find_spec("vllm_torchtpu")
+      if vllm_spec is None or vllm_spec.origin is None:
+          errors.append("Failed locating vllm package")
+      if ttpu_spec is None or ttpu_spec.origin is None:
+          errors.append("Failed locating vllm_torchtpu package")
+      else:
+          try:
+              vllm_ver = importlib.metadata.version("vllm")
+          except Exception:
+              vllm_ver = os.environ.get("PROV_VLLM", "?") or "?"
+          print(f"[RuntimeGuardrail] vllm={vllm_ver} ({vllm_spec.origin if vllm_spec else '?'})")
+          print(f"[RuntimeGuardrail] vllm_torchtpu={ttpu_spec.origin}")
+
+      exp_commit = os.environ.get("EXPECTED_TORCHTPU_COMMIT", "").strip()
+      act_commit = os.environ.get("PROV_COMMIT", "").strip()
+      if exp_commit and not act_commit.startswith(exp_commit):
+          errors.append(f"EXPECTED_TORCHTPU_COMMIT={exp_commit!r} mismatch with actual PROV_COMMIT={act_commit!r}")
+
+      if "@CHECK_PAW@" == "true" and ttpu_spec is not None and ttpu_spec.origin is not None:
+          paw_file = pathlib.Path(ttpu_spec.origin).resolve().parent / "core" / "prefix_aware_scheduler.py"
+          if not paw_file.is_file():
+              errors.append(f"ENABLE_PAW=true requires PrefixAwareScheduler, missing {paw_file}")
+          else:
+              try:
+                  if "PrefixAwareScheduler" not in paw_file.read_text(encoding="utf-8", errors="ignore"):
+                      errors.append(f"PrefixAwareScheduler class missing in {paw_file}")
+              except Exception as exc:
+                  errors.append(f"Failed inspecting {paw_file}: {exc}")
+
+      if "@REQUIRE_TPU_SYNC@" == "true":
+          try:
+              from tpu_sync.api.torch.kv_cache_manager import _torch_impl
+              _torch_impl()
+              print("[RuntimeGuardrail] tpu_sync C++ ABI check passed.")
+          except Exception as exc:
+              errors.append(f"tpu_sync C++ ABI check failed: {exc}")
+
+      @EXTRA_PYTHON_CHECKS@
+
+      if errors:
+          for err in errors:
+              print(f"[RuntimeGuardrail] FATAL: {err}", file=sys.stderr)
+          sys.exit(1)
+      print("[RuntimeGuardrail] All pre-startup checks passed.")
+      CDK_RUNTIME_GUARDRAIL_EOF
+        echo "trace-end-event: name=runtime-guardrail ts=$(date +'%s.%N') pid=vllm tid=vllm"
+        if [ "${_rg_rc}" -ne 0 ]; then
+          if [ -n "${CDK_OUTPUT_DIR:-}" ]; then
+            mkdir -p "${CDK_OUTPUT_DIR}"
+            echo "Engine core initialization failed: RuntimeGuardrail check failed (rc=${_rg_rc})" > "${CDK_OUTPUT_DIR}/server.log.fatal" 2>/dev/null || true
+          fi
+          exit "${_rg_rc}"
+        fi
+      fi
+    |||,
+    {
+      REQUIRE_TPU_SYNC: if requireTpuSync then 'true' else 'false',
+      CHECK_PAW: if checkPaw then 'true' else 'false',
+      EXTRA_PYTHON_CHECKS: extraPythonChecks,
+    }
+  ),
+
+  // ---------------------------------------------------------------------------
+  // The metrics parser
+  //
+  // run_agentic_replay_and_write_outputs writes a nested aggregate
+  // (request_metrics.latency.ttft.p50, ...) with latencies in seconds. The CDK result store
+  // charts flat, millisecond-based keys. This is the translation, and it is the reason this
+  // module exists: two copies of it cannot be kept in step by hand, and a divergence shows
+  // up as one model's TTFT quietly not meaning the same thing as the other's.
+  // ---------------------------------------------------------------------------
+  metricsParser:: |||
+    """Flatten an AgentX aggregate JSON into flat metrics for result-updater."""
+    import json
+    import math
+    import os
+    import sys
+
+
+    def load(path):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+
+    def dig(d, *keys):
+        cur = d
+        for k in keys:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(k)
+        return cur
+
+
+    def num(v):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return v if math.isfinite(v) else None
+
+
+    def put(out, key, value, scale=None):
+        v = num(value)
+        if v is None:
+            return
+        out[key] = round(v * scale, 4) if scale else v
+
+
+    def resolve_aiperf(artifact_dir):
+        """aiperf sometimes nests its export one directory deeper."""
+        direct = os.path.join(artifact_dir, "profile_export_aiperf.json")
+        if os.path.isfile(direct):
+            return direct
+        try:
+            for child in sorted(os.listdir(artifact_dir)):
+                nested = os.path.join(artifact_dir, child, "profile_export_aiperf.json")
+                if os.path.isfile(nested):
+                    return nested
+        except OSError:
+            pass
+        return direct
+
+
+    agg = load(sys.argv[1])
+    aiperf = load(resolve_aiperf(sys.argv[2])) if len(sys.argv) > 2 else {}
+    out = {}
+
+    # Run shape. `conc` is what the aggregate calls the sweep level; `max_concurrency`
+    # is the name `cdk dash` orders a sweep by.
+    for key in ("conc", "num_requests_total", "num_requests_successful",
+                "kv_cache_pool_tokens", "tp", "ep",
+                "score", "score_se", "em_strict", "em_strict_se", "em_flexible", "em_flexible_se", "n_eff",
+                "lb2_accuracy", "lb2_accuracy_pct", "lb2_compensated_accuracy", "lb2_compensated_accuracy_pct",
+                "lb2_easy_accuracy_pct", "lb2_hard_accuracy_pct",
+                "lb2_short_accuracy_pct", "lb2_medium_accuracy_pct", "lb2_long_accuracy_pct",
+                "lb2_easy_compensated_pct", "lb2_hard_compensated_pct",
+                "lb2_short_compensated_pct", "lb2_medium_compensated_pct", "lb2_long_compensated_pct",
+                "lb2_total_questions", "lb2_evaluated", "lb2_correct", "lb2_unparsed",
+                "lb2_truncated_count", "lb2_skipped_overlen", "lb2_errors",
+                "lb2_wall_time_s", "lb2_mean_latency_s", "lb2_p50_latency_s", "lb2_p90_latency_s",
+                "lb2_mean_prompt_tokens", "lb2_max_prompt_tokens", "lb2_mean_completion_tokens"):
+        put(out, key, agg.get(key))
+    put(out, "records_dropped_total", dig(agg, "request_accounting", "records_dropped_total"))
+    put(out, "records_error_dropped", dig(agg, "request_accounting", "records_error_dropped"))
+
+    # Latency: the aggregate stores seconds, publish milliseconds. "median" rather
+    # than "p50" so these line up with the vLLM benchmark_serving keys the other
+    # recipes publish and the dashboards already chart.
+    for src, dst in (("mean", "mean"), ("p50", "median"), ("p90", "p90"), ("p95", "p95")):
+        for metric in ("ttft", "tpot", "itl", "e2el"):
+            put(out, dst + "_" + metric + "_ms",
+                dig(agg, "request_metrics", "latency", metric, src), 1000.0)
+        # Interactivity: output tokens/s as seen by a single user (1 / ITL).
+        put(out, dst + "_interactivity_tok_s",
+            dig(agg, "request_metrics", "latency", "intvty", src))
+        put(out, dst + "_qps", dig(agg, "request_metrics", "qps", src))
+
+    # E2E normalized interactivity, the x-axis InferenceX uses for AgentX Pareto
+    # frontiers: 1 / pXX(per-request E2EL / OSL), in output tok/s/user. The aggregate
+    # already carries it (process_agentic_result.py takes the percentile over requests,
+    # then inverts), so this only publishes it. Not a ratio of separately aggregated
+    # percentiles: mean_output_tokens / p90_e2el_ms is not a substitute. p75 too,
+    # because the InferenceX dashboard offers P75 alongside P90.
+    for src, dst in (("mean", "mean"), ("p50", "median"), ("p75", "p75"),
+                     ("p90", "p90"), ("p95", "p95")):
+        put(out, dst + "_e2e_norm_interactivity_tok_s",
+            dig(agg, "request_metrics", "latency", "e2e_norm_intvty", src))
+
+    # Throughput. total_token_throughput and mean_ttft_ms are the two headline
+    # metrics: they are the default x/y of a cdk dash chart, so they are backfilled
+    # below if the aggregate did not carry them.
+    tput = dig(agg, "request_metrics", "throughput") or {}
+    put(out, "input_throughput", dig(tput, "input", "tokens_per_second"))
+    put(out, "output_throughput", dig(tput, "output", "tokens_per_second"))
+    put(out, "total_token_throughput", dig(tput, "total", "tokens_per_second"))
+    put(out, "benchmark_duration_s", tput.get("duration_seconds"))
+    put(out, "request_throughput", dig(agg, "request_metrics", "qps", "mean"))
+
+    # Workload shape and prefix-cache behaviour
+    put(out, "mean_input_tokens", dig(agg, "request_metrics", "tokens", "input", "mean"))
+    put(out, "mean_output_tokens", dig(agg, "request_metrics", "tokens", "output_actual", "mean"))
+    put(out, "theoretical_cache_hit_rate",
+        dig(agg, "request_metrics", "cache", "theoretical_cache_hit_rate"))
+
+    # KV cache hit rates and usage, as the aggregate saw them.
+    kv_hit_rate = (
+        dig(agg, "server_metrics", "cache", "overall_cache_hit_rate")
+        if dig(agg, "server_metrics", "cache", "overall_cache_hit_rate") is not None
+        else dig(agg, "server_metrics", "cache", "gpu_cache_hit_rate")
+    )
+    if kv_hit_rate is None:
+        hits = num(dig(agg, "server_metrics", "cache", "prefix_cache_hits"))
+        queries = num(dig(agg, "server_metrics", "cache", "prefix_cache_queries"))
+        if hits is not None and queries:
+            kv_hit_rate = hits / queries
+
+    put(out, "kv_cache_hit_rate", kv_hit_rate)
+    put(out, "gpu_cache_hit_rate", dig(agg, "server_metrics", "cache", "gpu_cache_hit_rate"))
+    put(out, "cpu_cache_hit_rate", dig(agg, "server_metrics", "cache", "cpu_cache_hit_rate"))
+    put(out, "external_cache_hit_rate", dig(agg, "server_metrics", "cache", "external_cache_hit_rate"))
+    put(out, "prefix_cache_hit_rate", kv_hit_rate)
+    put(out, "prefix_cache_hits", dig(agg, "server_metrics", "cache", "prefix_cache_hits"))
+    put(out, "prefix_cache_queries", dig(agg, "server_metrics", "cache", "prefix_cache_queries"))
+    put(out, "gpu_kv_cache_usage_pct", dig(agg, "server_metrics", "kv_cache", "gpu_usage_pct"))
+
+    # Actual prefix-cache behaviour, as counted by the server rather than inferred
+    # from the trace or read out of the aggregate. When the sweep loop scrapes
+    # vllm:*_total around each concurrency level it passes the deltas in here, and
+    # they take precedence over the block above: the aggregate's figures are the
+    # server's running totals over the whole sweep, so a late level inherits every
+    # earlier level's hits. Published as a 0..1 fraction to match the others.
+    def env_int(name):
+        try:
+            return int(os.environ.get(name, "") or 0)
+        except ValueError:
+            return 0
+
+    for key, env_prefix in (("prefix_cache", "PREFIX_CACHE"),
+                            ("external_prefix_cache", "EXT_PREFIX_CACHE")):
+        hits = env_int(env_prefix + "_HITS_DELTA")
+        queries = env_int(env_prefix + "_QUERIES_DELTA")
+        # queries==0 means the counter never moved (offloading disabled, the scrape
+        # failed, or this recipe does not scrape at all); leave whatever the
+        # aggregate reported rather than charting a false 0%.
+        if queries <= 0:
+            continue
+        put(out, key + "_hits", hits)
+        put(out, key + "_queries", queries)
+        put(out, key + "_hit_rate", round(hits / queries, 4))
+
+    # Opt-in (PREFIX_CACHE_EXCLUDE_WARMUP=1): publish the hit rate the way official
+    # InferenceX does, over the profiling window only (aiperf server metrics,
+    # infx/results/agentic/backends/vllm.py). The scrape above opens before the
+    # replay's cold warmup, and older aiperf images fold the warmup into the
+    # export's totals too, so subtract its warmup_metrics. The warmup-inclusive
+    # figures stay as *_incl_warmup.
+    def series_total(metrics, name):
+        return sum((s.get("stats") or {}).get("total") or 0.0
+                   for s in (metrics or {}).get(name, {}).get("series", []))
+
+    if os.environ.get("PREFIX_CACHE_EXCLUDE_WARMUP") == "1" and len(sys.argv) > 2:
+        sm = load(os.path.join(os.path.dirname(resolve_aiperf(sys.argv[2])),
+                               "server_metrics_export.json"))
+        pm, wm = sm.get("metrics"), sm.get("warmup_metrics") or {}
+        if pm:
+            hits = (series_total(pm, "vllm:prefix_cache_hits")
+                    - series_total(wm, "vllm:prefix_cache_hits"))
+            queries = (series_total(pm, "vllm:prefix_cache_queries")
+                       - series_total(wm, "vllm:prefix_cache_queries"))
+            if queries > 0:
+                for key in ("prefix_cache_hits", "prefix_cache_queries",
+                            "prefix_cache_hit_rate", "kv_cache_hit_rate"):
+                    if key in out:
+                        out[key + "_incl_warmup"] = out[key]
+                put(out, "prefix_cache_hits", hits)
+                put(out, "prefix_cache_queries", queries)
+                rate = round(min(hits, queries) / queries, 5)
+                for key in ("prefix_cache_hit_rate", "kv_cache_hit_rate", "gpu_cache_hit_rate"):
+                    put(out, key, rate)
+
+    # Speculative decoding, same delta treatment as the cache counters above. Only
+    # emitted when a proposer is configured; without one vLLM never increments these
+    # and drafts stays 0, which is why the whole block is skipped rather than
+    # publishing a 0% acceptance rate for every non-speculative run.
+    #
+    # The two rates answer different questions and both are worth having: acceptance
+    # rate is how often a drafted token survives verification (quality of the draft
+    # head), while mean acceptance length is tokens emitted per engine step and is the
+    # one that predicts speedup -- its ceiling is num_speculative_tokens + 1, and a run
+    # can post a high acceptance rate while still losing throughput.
+    drafts = env_int("SPEC_DECODE_DRAFTS_DELTA")
+    draft_tokens = env_int("SPEC_DECODE_DRAFT_TOKENS_DELTA")
+    accepted_tokens = env_int("SPEC_DECODE_ACCEPTED_TOKENS_DELTA")
+    if drafts > 0:
+        put(out, "spec_decode_drafts", drafts)
+        put(out, "spec_decode_draft_tokens", draft_tokens)
+        put(out, "spec_decode_accepted_tokens", accepted_tokens)
+        # Conventionally the bonus token counts toward the length, hence the 1 +.
+        put(out, "spec_decode_mean_acceptance_length",
+            round(1 + accepted_tokens / drafts, 4))
+        if draft_tokens > 0:
+            put(out, "spec_decode_acceptance_rate",
+                round(accepted_tokens / draft_tokens, 4))
+
+    # Where the server thinks the latency went, same delta treatment as the counters
+    # above. vLLM records these three as histograms, so the scrape hands over _sum
+    # (already converted to ms) and _count per level and the mean is the ratio -- a
+    # percentile would mean parsing the buckets, which these keys deliberately do not
+    # claim to be.
+    #
+    # Worth having because the client-side latencies cannot separate them: mean_ttft_ms
+    # is queue wait plus prefill, and at the top of a sweep, where the scheduler admits
+    # MAX_NUM_SEQS of a much larger offered concurrency, nearly all of it is the wait.
+    # mean_queue_time_ms is what says so. The counterpart reading: when mean_ttft_ms runs
+    # well above mean_queue_time_ms + mean_prefill_time_ms, the difference is client or
+    # network time and not the engine at all.
+    timing_samples = 0
+    for key, env_prefix in (("queue", "QUEUE_TIME"),
+                            ("prefill", "PREFILL_TIME"),
+                            ("inference", "INFERENCE_TIME")):
+        # As with the cache counters, count==0 means the counter never moved -- the
+        # scrape failed, the recipe does not scrape timing, or the image predates the
+        # histogram. Publishing nothing beats charting a 0 ms wait, which reads as a
+        # measured result rather than a missing one.
+        count = env_int(env_prefix + "_COUNT_DELTA")
+        if count <= 0:
+            continue
+        put(out, "mean_" + key + "_time_ms",
+            round(env_int(env_prefix + "_SUM_MS_DELTA") / count, 4))
+        timing_samples = max(timing_samples, count)
+    # The denominator, published once: it is the requests that *finished* inside the
+    # level's window, so it runs a little below num_requests_successful, and a large gap
+    # means the window closed on a lot of still-running requests.
+    if timing_samples:
+        out["request_timing_samples"] = timing_samples
+
+    # Backfill from aiperf's own export (already ms / tok-s) for anything the
+    # aggregation step failed to produce, so a partial sweep still reports TTFT and
+    # throughput instead of charting as a gap.
+    backfilled = []
+    for key, path in (
+        ("mean_ttft_ms", ("time_to_first_token", "avg")),
+        ("median_ttft_ms", ("time_to_first_token", "p50")),
+        ("p90_ttft_ms", ("time_to_first_token", "p90")),
+        ("p95_ttft_ms", ("time_to_first_token", "p95")),
+        ("mean_itl_ms", ("inter_token_latency", "avg")),
+        ("median_itl_ms", ("inter_token_latency", "p50")),
+        ("mean_tpot_ms", ("inter_token_latency", "avg")),
+        ("median_tpot_ms", ("inter_token_latency", "p50")),
+        ("mean_e2el_ms", ("request_latency", "avg")),
+        ("median_e2el_ms", ("request_latency", "p50")),
+        ("output_throughput", ("output_token_throughput", "avg")),
+        ("request_throughput", ("request_throughput", "avg")),
+        ("benchmark_duration_s", ("benchmark_duration", "avg")),
+    ):
+        if key in out:
+            continue
+        put(out, key, dig(aiperf, *path))
+        if key in out:
+            backfilled.append(key)
+
+    if "theoretical_cache_hit_rate" not in out:
+        th_hit = dig(aiperf, "theoretical_prefix_cache_hit", "avg")
+        if th_hit is not None:
+            put(out, "theoretical_cache_hit_rate", th_hit / 100.0)
+            backfilled.append("theoretical_cache_hit_rate")
+
+    # aiperf reports the two token counts but no combined throughput; derive it so
+    # total_token_throughput is never the missing one.
+    if "total_token_throughput" not in out:
+        duration = num(out.get("benchmark_duration_s"))
+        isl = num(dig(aiperf, "input_sequence_length", "avg"))
+        osl = num(dig(aiperf, "output_sequence_length", "avg"))
+        requests = num(dig(aiperf, "request_count", "avg"))
+        if duration and requests and isl is not None and osl is not None:
+            out["total_token_throughput"] = round(requests * (isl + osl) / duration, 4)
+            backfilled.append("total_token_throughput")
+    if backfilled:
+        out["metrics_backfilled_from_aiperf"] = ",".join(backfilled)
+
+    # Derived: per-chip throughput, per-user output rate, and the sweep key.
+    try:
+        chips = int(os.environ.get("TPU_CHIPS", "0") or 0)
+    except ValueError:
+        chips = 0
+    total = num(out.get("total_token_throughput"))
+    output = num(out.get("output_throughput"))
+    if chips > 0 and (total is not None or output is not None):
+        out["num_chips"] = chips
+        if total is not None:
+            out["token_throughput_per_chip"] = round(total / chips, 4)
+        if output is not None:
+            out["output_throughput_per_chip"] = round(output / chips, 4)
+
+    # `interactivity` is defined the way the vLLM recipes define it: 1000 / median TPOT.
+    median_tpot = num(out.get("median_tpot_ms"))
+    if median_tpot:
+        out["interactivity"] = round(1000.0 / median_tpot, 4)
+
+    conc_env = os.environ.get("CONC", "")
+    if "conc" not in out and conc_env.isdigit():
+        out["conc"] = int(conc_env)
+    if "conc" in out:
+        out["max_concurrency"] = out["conc"]
+
+    json.dump(out, sys.stdout, separators=(",", ":"))
+  |||,
+
+  // Written to disk rather than piped, because publish_result runs it once per concurrency
+  // level and the sweep should not depend on a heredoc surviving the loop.
+  installParser:: $.installParserFor(false),
+
+  installParserFor(startupOpt=false):: $.fill(
+    |||
+      cat > @PATH@ <<'AGENTX_PARSER_EOF'
+      @PARSER@
+      AGENTX_PARSER_EOF
+    |||,
+    {
+      PATH: $.parserPath,
+      PARSER: std.rstripChars(if startupOpt then $.compactPy($.metricsParser) else $.metricsParser, '\n'),
+    }
+  ),
+
+  // ---------------------------------------------------------------------------
+  // Shell helpers
+  // ---------------------------------------------------------------------------
+
+  // Sum one vllm Prometheus counter across all of its label sets (data parallel exposes one
+  // series per engine). Never aborts the sweep: an unreachable server or an absent metric
+  // reports 0, because a missing cache stat must not cost us the benchmark it was measured on.
+  vllmMetricFn:: |||
+    vllm_metric() {
+      local v
+      v=$(curl -sf "${VLLM_URL}/metrics" 2>/dev/null | awk -v n="vllm:$1" \
+        '{k=$1; sub(/\{.*/, "", k); if (k==n) s+=$NF} END {printf "%.0f", s+0}') || v=""
+      case "$v" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo "$v" ;;
+      esac
+    }
+    # Speculative-decoding counters live on the server that verifies drafts. In a P/D
+    # recipe that is the decode, not $VLLM_URL (the prefill, which only drafts to fill the
+    # draft layer's KV); such a recipe points SPEC_DECODE_METRICS_URL at it.
+    spec_metric() {
+      local VLLM_URL="${SPEC_DECODE_METRICS_URL:-$VLLM_URL}"
+      vllm_metric "$1"
+    }
+  |||,
+
+  // The same scrape for a metric that carries seconds rather than a count — vLLM's latency
+  // histograms expose `_sum` in seconds — returning integer milliseconds.
+  //
+  // Milliseconds rather than seconds because vllm_metric rounds to a whole unit, and a level
+  // that is not queueing waits well under a second per request: rounded to seconds its whole
+  // _sum collapses to 0 and the mean reads as "no queueing at all" whether or not that is
+  // true. Integer ms keeps the value usable in the shell's own arithmetic, which is what the
+  // per-level deltas below are built out of.
+  vllmMetricMsFn:: |||
+    vllm_metric_ms() {
+      local v
+      v=$(curl -sf "${VLLM_URL}/metrics" 2>/dev/null | awk -v n="vllm:$1" \
+        '{k=$1; sub(/\{.*/, "", k); if (k==n) s+=$NF} END {printf "%.0f", (s+0)*1000}') || v=""
+      case "$v" in
+        ''|*[!0-9]*) echo 0 ;;
+        *) echo "$v" ;;
+      esac
+    }
+  |||,
+
+  // Parse one level's aggregate and hand it to the CDK result store. Echoes the headline
+  // metrics on their own line first, so a sweep can be read off `cdk job log` without
+  // unpacking the whole blob, and so a level that failed to report them says so loudly.
+  publishResultFn:: $.publishResultFnFor(false),
+
+  publishResultFnFor(startupOpt=false)::
+    if !startupOpt then $.fill(
+      |||
+        publish_result() {
+          local conc="$1" res_dir="$2" exit_code="$3"
+          local metrics
+          if ! command -v result-updater >/dev/null 2>&1; then
+            echo "WARNING: result-updater not found; skipping upload for c${conc}"
+            return 0
+          fi
+          metrics=$(python3 @PATH@ \
+            "${AGENTIC_OUTPUT_DIR}/${RESULT_FILENAME}.json" \
+            "${res_dir}/aiperf_artifacts" 2>/dev/null || echo '{}')
+          [ -n "${metrics}" ] || metrics="{}"
+          local headline
+          if [ "${EVAL_ONLY:-false}" = "true" ]; then
+            if [ "${EVAL_TASK:-gsm8k}" = "longbench_v2" ]; then
+              headline=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1] or "{}"); print(m.get("score"), m.get("lb2_accuracy_pct"), m.get("lb2_compensated_accuracy_pct"), m.get("lb2_easy_accuracy_pct"), m.get("lb2_hard_accuracy_pct"), m.get("lb2_short_accuracy_pct"), m.get("lb2_medium_accuracy_pct"), m.get("lb2_long_accuracy_pct"), m.get("n_eff"))' "${metrics}" 2>/dev/null || echo "None None None None None None None None None")
+              local h_score h_acc h_comp h_easy h_hard h_short h_med h_long h_neff
+              read -r h_score h_acc h_comp h_easy h_hard h_short h_med h_long h_neff <<< "${headline}"
+              echo "RESULT c${conc} [LongBench-v2]: score=${h_score} accuracy=${h_acc}% compensated=${h_comp}% easy=${h_easy}% hard=${h_hard}% short=${h_short}% medium=${h_med}% long=${h_long}% n_eff=${h_neff}"
+              case "${h_score}" in
+                None) echo "WARNING: c${conc} produced no LongBench v2 score; check ${res_dir}/longbench_v2.log" ;;
+              esac
+            else
+              headline=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1] or "{}"); print(m.get("score"), m.get("em_strict"), m.get("em_flexible"), m.get("n_eff"))' "${metrics}" 2>/dev/null || echo "None None None None")
+              local h_score h_strict h_flex h_neff
+              read -r h_score h_strict h_flex h_neff <<< "${headline}"
+              echo "RESULT c${conc}: score=${h_score} em_strict=${h_strict} em_flexible=${h_flex} n_eff=${h_neff}"
+              case "${h_score}" in
+                None) echo "WARNING: c${conc} produced no eval score; check ${res_dir} for staged results*.json" ;;
+              esac
+            fi
+          else
+            local h_ttft h_tput h_hit
+            headline=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1] or "{}"); print(m.get("mean_ttft_ms"), m.get("total_token_throughput"), m.get("kv_cache_hit_rate"))' "${metrics}" 2>/dev/null || echo "None None None")
+            read -r h_ttft h_tput h_hit <<< "${headline}"
+            echo "RESULT c${conc}: mean_ttft_ms=${h_ttft} total_token_throughput=${h_tput} tok/s kv_cache_hit_rate=${h_hit}"
+            case "${h_ttft} ${h_tput}" in
+              *None*) echo "WARNING: c${conc} is missing a headline metric (ttft/throughput above); check ${res_dir}/benchmark.log" ;;
+            esac
+          fi
+          echo "Publishing c${conc} to CDK (exit=${exit_code}): ${metrics}"
+          # --append, because the bench is no longer the only writer: vllm-server publishes
+          # its provenance before it starts, and a plain write would replace the whole
+          # document and drop it.
+          #
+          # It does not make the concurrency levels accumulate. Every level writes the same
+          # three top-level keys, so each still replaces the last and only the final level's
+          # metrics survive — as before. Keying them per level (metrics_c12, or a
+          # by_concurrency map) is the change that would fix that, and it moves the paths
+          # `cdk dash --chart` reads, so it is not one to make quietly.
+          result-updater -a "{\"exit_code\": ${exit_code}, \"bench\": \"${BENCH_NAME}-c${conc}\", \"metrics\": ${metrics}}" \
+            || result-updater "{\"exit_code\": ${exit_code}, \"bench\": \"${BENCH_NAME}-c${conc}\", \"metrics\": ${metrics}}" \
+            || echo "WARNING: result-updater failed for c${conc}"
+        }
+      |||,
+      { PATH: $.parserPath }
+    ) else $.fill(
+      |||
+        publish_result() {
+          local conc="$1" res_dir="$2" exit_code="$3"
+          local metrics _ru="result-updater"
+          if [ -x /tmp/cdk-bin/result-updater ]; then
+            _ru="/tmp/cdk-bin/result-updater"
+          elif ! command -v result-updater >/dev/null 2>&1 || ! result-updater --help 2>&1 | grep -q -- '--append'; then
+            mkdir -p /tmp/cdk-bin 2>/dev/null || true
+            if command -v gcloud >/dev/null 2>&1 && gcloud storage cp -q gs://cloud-devkit/tools/result-updater /tmp/cdk-bin/result-updater >/dev/null 2>&1; then
+              chmod +x /tmp/cdk-bin/result-updater
+              _ru="/tmp/cdk-bin/result-updater"
+            elif ! command -v result-updater >/dev/null 2>&1; then
+              echo "WARNING: result-updater not found; skipping upload for c${conc}"
+              return 0
+            fi
+          fi
+          metrics=$(python3 @PATH@ \
+            "${AGENTIC_OUTPUT_DIR}/${RESULT_FILENAME}.json" \
+            "${res_dir}/aiperf_artifacts" 2>/dev/null || echo '{}')
+          [ -n "${metrics}" ] || metrics="{}"
+          local headline
+          if [ "${EVAL_ONLY:-false}" = "true" ]; then
+            if [ "${EVAL_TASK:-gsm8k}" = "longbench_v2" ]; then
+              headline=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1] or "{}"); print(m.get("score"), m.get("lb2_accuracy_pct"), m.get("lb2_compensated_accuracy_pct"), m.get("lb2_easy_accuracy_pct"), m.get("lb2_hard_accuracy_pct"), m.get("lb2_short_accuracy_pct"), m.get("lb2_medium_accuracy_pct"), m.get("lb2_long_accuracy_pct"), m.get("n_eff"))' "${metrics}" 2>/dev/null || echo "None None None None None None None None None")
+              local h_score h_acc h_comp h_easy h_hard h_short h_med h_long h_neff
+              read -r h_score h_acc h_comp h_easy h_hard h_short h_med h_long h_neff <<< "${headline}"
+              echo "RESULT c${conc} [LongBench-v2]: score=${h_score} accuracy=${h_acc}% compensated=${h_comp}% easy=${h_easy}% hard=${h_hard}% short=${h_short}% medium=${h_med}% long=${h_long}% n_eff=${h_neff}"
+              case "${h_score}" in
+                None) echo "WARNING: c${conc} produced no LongBench v2 score; check ${res_dir}/longbench_v2.log" ;;
+              esac
+            else
+              headline=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1] or "{}"); print(m.get("score"), m.get("em_strict"), m.get("em_flexible"), m.get("n_eff"))' "${metrics}" 2>/dev/null || echo "None None None None")
+              local h_score h_strict h_flex h_neff
+              read -r h_score h_strict h_flex h_neff <<< "${headline}"
+              echo "RESULT c${conc}: score=${h_score} em_strict=${h_strict} em_flexible=${h_flex} n_eff=${h_neff}"
+              case "${h_score}" in
+                None) echo "WARNING: c${conc} produced no eval score; check ${res_dir} for staged results*.json" ;;
+              esac
+            fi
+          else
+            local h_ttft h_tput h_hit
+            headline=$(python3 -c 'import json,sys; m=json.loads(sys.argv[1] or "{}"); print(m.get("mean_ttft_ms"), m.get("total_token_throughput"), m.get("kv_cache_hit_rate"))' "${metrics}" 2>/dev/null || echo "None None None")
+            read -r h_ttft h_tput h_hit <<< "${headline}"
+            echo "RESULT c${conc}: mean_ttft_ms=${h_ttft} total_token_throughput=${h_tput} tok/s kv_cache_hit_rate=${h_hit}"
+            case "${h_ttft} ${h_tput}" in
+              *None*) echo "WARNING: c${conc} is missing a headline metric (ttft/throughput above); check ${res_dir}/benchmark.log" ;;
+            esac
+          fi
+          echo "Publishing c${conc} to CDK (exit=${exit_code}): ${metrics}"
+          local _payload _is_multi=0
+          [ "${#CONC_SWEEP[@]}" -gt 1 ] 2>/dev/null && _is_multi=1
+          _payload=$(python3 -c 'import json,pathlib,sys; c,rc,b,m,multi,p=sys.argv[1],int(sys.argv[2]),sys.argv[3],json.loads(sys.argv[4] or "{}"),sys.argv[5]=="1",pathlib.Path(sys.argv[6]); entry={"exit_code":rc,"bench":b,"metrics":m}; d=dict(entry); bc=(json.loads(p.read_text()) if (multi and p.is_file() and p.stat().st_size>0) else {}); bc.update({f"c{c}":entry}) if multi else None; p.write_text(json.dumps(bc)) if multi else None; d.update({"by_concurrency":bc} if multi else {}); print(json.dumps(d))' "${conc}" "${exit_code}" "${BENCH_NAME}-c${conc}" "${metrics}" "${_is_multi}" "${CDK_BY_CONC_ACC_FILE:-/tmp/cdk_by_concurrency.json}")
+          "${_ru}" -a "${_payload}" \
+            || "${_ru}" "${_payload}" \
+            || echo "WARNING: result-updater failed for c${conc}"
+        }
+      |||,
+      { PATH: $.parserPath }
+    ),
+
+  // The trace markers `cdk job trace` parses. set -x is suspended around the echo so the
+  // marker is not preceded by its own xtrace line, which would be parsed as a second event.
+  traceEventFn:: |||
+    emit_trace_event() {
+      local action="$1" name="$2"
+      { set +x; } 2>/dev/null
+      echo "trace-${action}-event: name=${name} ts=$(date +%s.%N) pid=bench tid=bench"
+      set -x
+    }
+  |||,
+
+  // Turn aiperf's own phase logging into trace slices, by tailing the benchmark log for the
+  // lines it prints when it moves between warmup and steady state. There is no API for this;
+  // the log lines are the interface.
+  perfettoMonitorFns:: |||
+    start_phase_monitor() {
+      local conc="$1" res_dir="$2"
+      (
+        local log="${res_dir}/benchmark.log"
+        for _ in {1..30}; do [ -f "$log" ] && break; sleep 1; done
+        [ -f "$log" ] || exit 0
+        stdbuf -oL tail -F -n +1 "$log" 2>/dev/null | while read -r line; do
+          if [ ! -f "${res_dir}/.warmup_started" ] && [[ "$line" =~ "Phase warmup (warmup) started" ]]; then
+            touch "${res_dir}/.warmup_started"
+            emit_trace_event start "warmup-c${conc}"
+          elif [ -f "${res_dir}/.warmup_started" ] && [ ! -f "${res_dir}/.warmup_ended" ] && [[ "$line" =~ "Phase warmup (warmup) complete" || "$line" =~ "Phase profiling (profiling) started" ]]; then
+            touch "${res_dir}/.warmup_ended"
+            emit_trace_event end "warmup-c${conc}"
+          fi
+
+          # Matched on the full phase name: "complete" alone also appears at the end of
+          # warmup, and closing the steady slice there ends the trace half a run early.
+          if [ ! -f "${res_dir}/.steady_started" ] && [[ "$line" =~ "Phase profiling (profiling) started" ]]; then
+            touch "${res_dir}/.steady_started"
+            emit_trace_event start "steady-eval-c${conc}"
+          elif [ -f "${res_dir}/.steady_started" ] && [ ! -f "${res_dir}/.steady_ended" ] && [[ "$line" =~ "Phase profiling (profiling) complete" || "$line" =~ "Phase profiling (profiling) ended" ]]; then
+            touch "${res_dir}/.steady_ended"
+            emit_trace_event end "steady-eval-c${conc}"
+            break
+          fi
+        done
+      ) &
+      MONITOR_PID=$!
+    }
+
+    stop_phase_monitor() {
+      local conc="$1" res_dir="$2"
+      sleep 2
+      [ -n "${MONITOR_PID:-}" ] && kill "$MONITOR_PID" 2>/dev/null || true
+      MONITOR_PID=""
+      # Close only slices that were opened and never closed: an unbalanced slice makes the
+      # whole trace unreadable, not just its own row.
+      if [ -f "${res_dir}/.warmup_started" ] && [ ! -f "${res_dir}/.warmup_ended" ]; then
+        touch "${res_dir}/.warmup_ended"
+        emit_trace_event end "warmup-c${conc}"
+      fi
+      if [ -f "${res_dir}/.steady_started" ] && [ ! -f "${res_dir}/.steady_ended" ]; then
+        touch "${res_dir}/.steady_ended"
+        emit_trace_event end "steady-eval-c${conc}"
+      fi
+    }
+  |||,
+
+  // Staged xprof capture. Profiling the whole run would produce traces too large to open, so
+  // the profiler takes short samples at fixed offsets into steady state — after warmup,
+  // which is when the numbers stop being about compilation.
+  xprofFns(profileDirs=['${CDK_OUTPUT_DIR:-/tmp/cdk_output}/xprof'])::
+    $.fill(
+      |||
+        # Keep only the ranks asked for: one .xplane.pb per rank per sample, and a 16-chip
+        # run at three samples is more trace than the viewer will load.
+        filter_profile_ranks() {
+          local ranks="${PROFILE_RANKS:-0,1,2,3}"
+          [ -n "$ranks" ] || return 0
+          sleep 5
+          local -a keep_args=()
+          local r
+          IFS=',' read -ra r_arr <<< "$ranks"
+          for r in "${r_arr[@]}"; do
+            r=$(echo "$r" | tr -d ' ')
+            [ -n "$r" ] && keep_args+=( ! -name "rank${r}_*" )
+          done
+          [ ${#keep_args[@]} -gt 0 ] || return 0
+          local d
+          for d in @DIRS@; do
+            find "$d" -type f -name "rank*.xplane.pb" "${keep_args[@]}" -delete 2>/dev/null || true
+          done
+        }
+
+        capture_xprof_sample() {
+          local sample_name="$1"
+          local prof_dur="${PROFILE_DURATION_SECONDS:-10}"
+          echo "=== [${sample_name}] Starting xprof sampling (${prof_dur}s) ==="
+          emit_trace_event start "${sample_name}"
+          # XPROF_URLS lets a recipe profile a server other than, or besides, $VLLM_URL
+          # (a P/D recipe's decode leg). Space-separated; unset means $VLLM_URL, as before.
+          local u
+          for u in ${XPROF_URLS:-$VLLM_URL}; do curl -sf -X POST "${u}/start_profile" || true; done
+          sleep "$prof_dur"
+          for u in ${XPROF_URLS:-$VLLM_URL}; do curl -sf -X POST "${u}/stop_profile" || true; done
+          emit_trace_event end "${sample_name}"
+          echo "=== [${sample_name}] Stopped xprof sampling ==="
+          filter_profile_ranks
+        }
+
+        start_xprof_profiler() {
+          local conc="$1" res_dir="$2"
+          local log="${res_dir}/benchmark.log"
+          (
+            echo "Staged Profiler: waiting for warmup to complete (watching for 'Phase profiling (profiling) started')..."
+            while true; do
+              if [ -f "${res_dir}/.steady_started" ] || { [ -f "$log" ] && grep -q "Phase profiling (profiling) started" "$log" 2>/dev/null; }; then
+                echo "Staged Profiler: warmup completed; starting steady-state profiling timer..."
+                break
+              fi
+              sleep 2
+            done
+
+            if [ "${DURATION:-1800}" -lt 600 ]; then
+              # Short mode (< 10 min): capture at ~40s (steady state) and ~120s.
+              sleep 40
+              capture_xprof_sample "xprof-sample-c${conc}-s1"
+              sleep 80
+              capture_xprof_sample "xprof-sample-c${conc}-s2"
+            else
+              # Canonical long mode (>= 600s): capture across 180s, 510s, 630s.
+              sleep 180
+              capture_xprof_sample "xprof-sample-c${conc}-s1"
+              sleep 330
+              capture_xprof_sample "xprof-sample-c${conc}-s2"
+              sleep 120
+              capture_xprof_sample "xprof-sample-c${conc}-s3"
+            fi
+            echo "Staged Profiler: staged captures completed for c${conc}."
+          ) &
+          PROFILER_PID=$!
+        }
+
+        stop_xprof_profiler() {
+          [ -n "${PROFILER_PID:-}" ] && kill "$PROFILER_PID" 2>/dev/null || true
+          PROFILER_PID=""
+          local u
+          for u in ${XPROF_URLS:-$VLLM_URL}; do curl -sf -X POST "${u}/stop_profile" || true; done
+          sleep 10
+          filter_profile_ranks
+          echo "=== [CDK XProf] Profiler stopped. Traces captured under \$CDK_OUTPUT_DIR/xprof ==="
+          echo "=== Run 'cdk job xprof \${CDK_JOB_ID:-\$JS_NAME}' to view the interactive XProf links ==="
+        }
+      |||,
+      { DIRS: std.join(' ', ['"%s"' % d for d in profileDirs]) }
+    ),
+
+  // Log the phase durations aiperf recorded. Cheap, and it is the fastest way to see that a
+  // "slow" run spent forty minutes in warmup.
+  //
+  // Installed as a file rather than inlined as `python3 -c`, because the sweep loop indents
+  // its body and Python does not forgive a leading space on its first statement.
+  phaseSummaryPath:: '/tmp/agentx_phase_summary.py',
+
+  phaseSummaryScript:: |||
+    """Print the warmup and steady-state durations aiperf recorded for one level."""
+    import json
+    import os
+    import sys
+
+    p = os.path.join(sys.argv[1], "aiperf_artifacts", "profile_export_aiperf.json")
+    if os.path.exists(p):
+        with open(p) as f:
+            d = json.load(f)
+        w_dur = d.get("warmup_metrics", {}).get("benchmark_duration", {}).get("avg", 0)
+        w_reqs = d.get("warmup_metrics", {}).get("request_count", {}).get("avg", 0)
+        m_dur = d.get("benchmark_duration", {}).get("avg", 0)
+        print("=== [Phase Log] Warmup: duration=%.1fs (%.1fmin), requests=%s ==="
+              % (w_dur, w_dur / 60, w_reqs))
+        print("=== [Phase Log] Steady profiling: duration=%.1fs (%.1fmin) ==="
+              % (m_dur, m_dur / 60))
+  |||,
+
+  installPhaseSummary:: $.fill(
+    |||
+      cat > @PATH@ <<'AGENTX_PHASE_EOF'
+      @SCRIPT@
+      AGENTX_PHASE_EOF
+    |||,
+    { PATH: $.phaseSummaryPath, SCRIPT: std.rstripChars($.phaseSummaryScript, '\n') }
+  ),
+
+  // ---------------------------------------------------------------------------
+  // The sweep
+  // ---------------------------------------------------------------------------
+
+  // parseConcurrencies accepts both spellings the two recipes used — "256 128 64" and
+  // "16,8" — so a variable copied from either one keeps working.
+  parseConcurrencies(s)::
+    local raw =
+      if eval.enabled && cdk.rawVar('CLIENT_CONCURRENCIES', '') == ''
+      then (if eval.isLongBench then std.toString(eval.lb2DefaultConcurrency) else '64')
+      else s;
+    local words = std.filter(function(w) w != '', std.split(std.strReplace(raw, ',', ' '), ' '));
+    [
+      if cdk.isNumeric(w) then std.parseJson(w)
+      else error 'CLIENT_CONCURRENCIES must be a list of numbers, got %s' % w
+      for w in words
+    ],
+
+  // sweepLoop is the body of the benchmark: one replay per concurrency level, published as
+  // it finishes rather than at the end, so a sweep killed at level five still reported four.
+  //
+  // evalOnly picks cdk.eval's eval-only body over the replay. null follows EVAL_ONLY, as
+  // every recipe always has; a recipe that only ever evaluates (infx-qwen35-mtp-accuracy)
+  // passes true so it does not depend on its users remembering EVAL_ONLY=true.
+  sweepLoop(
+    concurrencies,
+    resultFilePrefix,
+    scrapePrefixCache=false,
+    scrapeSpecDecode=false,
+    scrapeRequestTiming=false,
+    enableXprof=false,
+    phaseTrace=true,
+    replayRewrites=[],
+    cooldownSeconds=60,
+    evalOnly=null,
+    useLocalTokenizer=false,
+    startupOpt=false,
+  )::
+    local indent = $.indent;
+    local evalOn = if evalOnly == null then eval.enabled else evalOnly;
+    local defaultEvalMinConc = if eval.isLongBench then 8 else 32;
+
+    // Same cumulative-counter problem as the cache scrape below: these are totals over
+    // the server's life, so without a per-level diff every level after the first
+    // inherits the earlier levels' drafts and the acceptance rate flattens out.
+    local specOpen = |||
+      sd_d0=$(spec_metric spec_decode_num_drafts_total)
+      sd_dt0=$(spec_metric spec_decode_num_draft_tokens_total)
+      sd_at0=$(spec_metric spec_decode_num_accepted_tokens_total)
+    |||;
+
+    local specClose = |||
+      export SPEC_DECODE_DRAFTS_DELTA=$(( $(spec_metric spec_decode_num_drafts_total) - sd_d0 ))
+      export SPEC_DECODE_DRAFT_TOKENS_DELTA=$(( $(spec_metric spec_decode_num_draft_tokens_total) - sd_dt0 ))
+      export SPEC_DECODE_ACCEPTED_TOKENS_DELTA=$(( $(spec_metric spec_decode_num_accepted_tokens_total) - sd_at0 ))
+      echo "SPEC c${conc}: drafts=${SPEC_DECODE_DRAFTS_DELTA} drafted=${SPEC_DECODE_DRAFT_TOKENS_DELTA} accepted=${SPEC_DECODE_ACCEPTED_TOKENS_DELTA}"
+    |||;
+
+    // Histograms, so each metric is two cumulative series and both need the diff. The
+    // sums are scraped in ms (vllm_metric_ms); the counts are plain integers.
+    local timingOpen = |||
+      qt_s0=$(vllm_metric_ms request_queue_time_seconds_sum)
+      qt_c0=$(vllm_metric request_queue_time_seconds_count)
+      pt_s0=$(vllm_metric_ms request_prefill_time_seconds_sum)
+      pt_c0=$(vllm_metric request_prefill_time_seconds_count)
+      it_s0=$(vllm_metric_ms request_inference_time_seconds_sum)
+      it_c0=$(vllm_metric request_inference_time_seconds_count)
+    |||;
+
+    // A request contributes to these only when it finishes, so the window is closed here,
+    // before the cooldown: a request still decoding when the level ends is counted in
+    // neither this level nor the next.
+    local timingClose = |||
+      export QUEUE_TIME_SUM_MS_DELTA=$(( $(vllm_metric_ms request_queue_time_seconds_sum) - qt_s0 ))
+      export QUEUE_TIME_COUNT_DELTA=$(( $(vllm_metric request_queue_time_seconds_count) - qt_c0 ))
+      export PREFILL_TIME_SUM_MS_DELTA=$(( $(vllm_metric_ms request_prefill_time_seconds_sum) - pt_s0 ))
+      export PREFILL_TIME_COUNT_DELTA=$(( $(vllm_metric request_prefill_time_seconds_count) - pt_c0 ))
+      export INFERENCE_TIME_SUM_MS_DELTA=$(( $(vllm_metric_ms request_inference_time_seconds_sum) - it_s0 ))
+      export INFERENCE_TIME_COUNT_DELTA=$(( $(vllm_metric request_inference_time_seconds_count) - it_c0 ))
+      echo "TIMING c${conc}: requests=${QUEUE_TIME_COUNT_DELTA} queue=${QUEUE_TIME_SUM_MS_DELTA}ms prefill=${PREFILL_TIME_SUM_MS_DELTA}ms inference=${INFERENCE_TIME_SUM_MS_DELTA}ms (sums, not means)"
+    |||;
+
+    local scrapeOpen = |||
+      # Prefix-cache counters are cumulative over the server's life, so snapshot them
+      # here and diff after the replay to get this level's own rate. The window
+      # includes the replay's warmup, which is cold, so the reported rate is a slight
+      # underestimate of steady state.
+      pc_h0=$(vllm_metric prefix_cache_hits_total)
+      pc_q0=$(vllm_metric prefix_cache_queries_total)
+      ext_h0=$(vllm_metric external_prefix_cache_hits_total)
+      ext_q0=$(vllm_metric external_prefix_cache_queries_total)
+    |||;
+
+    local scrapeClose = |||
+      # Close the window before profiler teardown so the deltas cover the replay only.
+      # Read by the parser through the environment.
+      export PREFIX_CACHE_HITS_DELTA=$(( $(vllm_metric prefix_cache_hits_total) - pc_h0 ))
+      export PREFIX_CACHE_QUERIES_DELTA=$(( $(vllm_metric prefix_cache_queries_total) - pc_q0 ))
+      export EXT_PREFIX_CACHE_HITS_DELTA=$(( $(vllm_metric external_prefix_cache_hits_total) - ext_h0 ))
+      export EXT_PREFIX_CACHE_QUERIES_DELTA=$(( $(vllm_metric external_prefix_cache_queries_total) - ext_q0 ))
+      echo "CACHE c${conc}: prefix_cache=${PREFIX_CACHE_HITS_DELTA}/${PREFIX_CACHE_QUERIES_DELTA} external=${EXT_PREFIX_CACHE_HITS_DELTA}/${EXT_PREFIX_CACHE_QUERIES_DELTA}"
+    |||;
+
+    local fastRunEvalBlock = $.fill(
+      |||
+        if [ "${_USER_EVAL_CONC_PINNED:-0}" = "1" ]; then
+          export _CDK_EVAL_CONC="${EVAL_CONCURRENT_REQUESTS}"
+        else
+          _CDK_EVAL_CONC="${conc}"
+          [ "${_MAX_SWEEP_CONC:-1}" -gt "${_CDK_EVAL_CONC}" ] 2>/dev/null && _CDK_EVAL_CONC="${_MAX_SWEEP_CONC}" || true
+          _eval_min="${EVAL_MIN_CONCURRENCY:-@DEFAULT_EVAL_MIN@}"
+          [ "${_eval_min}" -gt "${_CDK_EVAL_CONC}" ] 2>/dev/null && _CDK_EVAL_CONC="${_eval_min}" || true
+          export _CDK_EVAL_CONC
+        fi
+        if [ "${EVAL_ONCE_PER_SWEEP:-true}" != "false" ] && [ "${bench_exit:-0}" -eq 0 ] && [ -s "${PARENT_RESULT_DIR}/.cached_eval_metrics.json" ] && curl -sf "${VLLM_URL}/health" >/dev/null 2>&1; then
+          echo "[EvalCache] Reusing same-server sweep eval metrics from ${PARENT_RESULT_DIR}/.cached_eval_metrics.json (EVAL_ONCE_PER_SWEEP=true)"
+          python3 -c 'import json,pathlib,sys; s,d=map(pathlib.Path,sys.argv[1:3]); c=json.loads(s.read_text() or "{}"); a=json.loads(d.read_text() or "{}") if d.exists() else {}; a.update({k:v for k,v in c.items() if k not in a}); d.write_text(json.dumps(a))' "${PARENT_RESULT_DIR}/.cached_eval_metrics.json" "${AGENTIC_OUTPUT_DIR}/${RESULT_FILENAME}.json" || true
+          eval_exit="${_CACHED_EVAL_EXIT:-0}"
+        else
+          python3 -c 'import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); k=list(json.loads(p.read_text() or "{}").keys()) if p.exists() else []; pathlib.Path(sys.argv[2]).write_text(json.dumps(k))' "${AGENTIC_OUTPUT_DIR}/${RESULT_FILENAME}.json" "${RESULT_DIR}/.pre_eval_keys.json" 2>/dev/null || echo "[]" > "${RESULT_DIR}/.pre_eval_keys.json"
+          echo "[Eval] Running post-replay evaluation at concurrency=${_CDK_EVAL_CONC}..."
+          @EVAL_RUN_FAST@
+          if [ "${eval_exit:-1}" -eq 0 ] && [ "${EVAL_ONCE_PER_SWEEP:-true}" != "false" ]; then
+            python3 -c 'import json,pathlib,sys; a_p,p_p,o_p=map(pathlib.Path,sys.argv[1:4]); pre=set(json.loads(p_p.read_text() or "[]")) if p_p.exists() else set(); agg=json.loads(a_p.read_text() or "{}") if a_p.exists() else {}; diff={k:v for k,v in agg.items() if k not in pre}; (o_p.write_text(json.dumps(diff)) if diff else None)' "${AGENTIC_OUTPUT_DIR}/${RESULT_FILENAME}.json" "${RESULT_DIR}/.pre_eval_keys.json" "${PARENT_RESULT_DIR}/.cached_eval_metrics.json" 2>/dev/null || true
+            _CACHED_EVAL_EXIT="${eval_exit}"
+          fi
+        fi
+        if [ "$eval_exit" -ne 0 ]; then
+          echo "WARNING: eval c${conc} exited with ${eval_exit}"
+          overall_exit=$eval_exit
+        fi
+      |||,
+      {
+        DEFAULT_EVAL_MIN: defaultEvalMinConc,
+        EVAL_RUN_FAST: std.lstripChars(std.rstripChars($.indent(eval.runBlockFor(true), 2), '\n'), ' '),
+      }
+    );
+
+    local fastPublishAndCooldown = $.fill(
+      |||
+        python3 @PHASE_SUMMARY_PATH@ "${RESULT_DIR}" 2>/dev/null || true
+        [ -n "${_LAST_PUB_PID:-}" ] && wait "${_LAST_PUB_PID}" 2>/dev/null || true
+        _LAST_PUB_PID=""
+        if [ "$i" -lt $(( ${#CONC_SWEEP[@]} - 1 )) ] && [ "${ASYNC_PUBLISH_RESULTS:-true}" != "false" ]; then
+          publish_result "$conc" "${RESULT_DIR}" "$bench_exit" &
+          _LAST_PUB_PID=$!
+        else
+          publish_result "$conc" "${RESULT_DIR}" "$bench_exit"
+        fi
+        echo "Completed concurrency level: ${conc}"
+        if [ "$i" -lt $(( ${#CONC_SWEEP[@]} - 1 )) ]; then
+          if [ "${SMART_COOLDOWN:-true}" != "false" ] && [ "@COOLDOWN@" -gt 4 ] 2>/dev/null; then
+            echo "[SmartCooldown] Polling vLLM engine drain (max @COOLDOWN@s)..."
+            _cd_start=$SECONDS
+            _cd_idle=0
+            _cd_ok=0
+            while [ $(( SECONDS - _cd_start )) -lt @COOLDOWN@ ]; do
+              _cd_state=$(python3 -c 'import sys,urllib.request; res=[(lambda t:[float(l.rsplit(None,1)[-1]) for l in t.splitlines() if l.startswith(("vllm:num_requests_running","vllm:num_requests_waiting"))])(urllib.request.urlopen(u.rstrip("/")+"/metrics",timeout=2).read().decode("utf-8","ignore")) for u in sys.argv[1].split()]; print("UNAVAIL" if (not res or any(not r for r in res)) else ("IDLE" if sum(sum(r) for r in res)<=0.0 else "BUSY"))' "${XPROF_URLS:-${VLLM_URL}}" 2>/dev/null || echo "UNAVAIL")
+              if [ "${_cd_state}" = "UNAVAIL" ]; then
+                break
+              elif [ "${_cd_state}" = "IDLE" ]; then
+                _cd_idle=$(( _cd_idle + 1 ))
+                if [ "${_cd_idle}" -ge 2 ]; then
+                  _cd_ok=1
+                  echo "[SmartCooldown] Engine drained (running=0, waiting=0 for 2 polls) in $(( SECONDS - _cd_start ))s (saved $(( @COOLDOWN@ - (SECONDS - _cd_start) ))s)."
+                  break
+                fi
+              else
+                _cd_idle=0
+              fi
+              sleep 2
+            done
+            if [ "${_cd_ok}" -eq 0 ]; then
+              _cd_rem=$(( @COOLDOWN@ - (SECONDS - _cd_start) ))
+              if [ "${_cd_rem}" -gt 0 ]; then
+                echo "Pausing ${_cd_rem} seconds between sweeps..."
+                sleep "${_cd_rem}"
+              fi
+            fi
+          else
+            echo "Pausing @COOLDOWN@ seconds between sweeps..."
+            sleep @COOLDOWN@
+          fi
+          [ -n "${_LAST_PUB_PID:-}" ] && wait "${_LAST_PUB_PID}" 2>/dev/null || true
+          _LAST_PUB_PID=""
+        fi
+      |||,
+      { PHASE_SUMMARY_PATH: $.phaseSummaryPath, COOLDOWN: cooldownSeconds }
+    );
+
+    local body = std.join('\n', std.prune([
+      $.fill(
+        |||
+          echo "============================================================"
+          echo "=== AgentX concurrency ${conc}, duration ${DURATION}s"
+          echo "============================================================"
+
+          export CONC="${conc}"
+          export RESULT_DIR="${PARENT_RESULT_DIR}/conc_${conc}"
+          export RESULT_FILENAME="@PREFIX@${conc}"
+          mkdir -p "${RESULT_DIR}"
+        |||,
+        { PREFIX: resultFilePrefix }
+      ),
+      if scrapePrefixCache then scrapeOpen else null,
+      if scrapeSpecDecode then specOpen else null,
+      if scrapeRequestTiming then timingOpen else null,
+      if phaseTrace then 'start_phase_monitor "$conc" "${RESULT_DIR}"\n' else null,
+      if enableXprof then 'start_xprof_profiler "$conc" "${RESULT_DIR}"\n' else null,
+      if phaseTrace then 'emit_trace_event start "benchmark-agentx-c${conc}"\n' else null,
+      if evalOn then (
+        if startupOpt then (
+          'if [ "${_USER_EVAL_CONC_PINNED:-0}" = "1" ]; then export _CDK_EVAL_CONC="${EVAL_CONCURRENT_REQUESTS}"; else export _CDK_EVAL_CONC="${conc}"; fi\n'
+          + eval.runBlockFor(true)
+        ) else eval.runBlock
+      )
+      else |||
+        # benchmark_lib.sh builds the command, including the duration and warmup counts
+        # implied by AIPERF_EXPERIMENTAL_FAST and DURATION.
+        build_replay_cmd "${RESULT_DIR}"
+
+        # build_replay_cmd points at the loopback address, which in a JobSet is this pod
+        # rather than the server's.
+        for _addr in localhost 127.0.0.1 0.0.0.0; do
+          REPLAY_CMD="${REPLAY_CMD//$_addr:$PORT/$VLLM_HOST:$PORT}"
+          REPLAY_CMD="${REPLAY_CMD//$_addr:8000/$VLLM_HOST:8000}"
+        done
+      |||,
+      if !evalOn && std.length(replayRewrites) > 0 then std.join('\n', replayRewrites) + '\n' else null,
+      if !evalOn && useLocalTokenizer then |||
+        if [ -n "${AIPERF_LOCAL_TOKENIZER:-}" ] && [[ "${REPLAY_CMD}" != *"--tokenizer"* ]]; then
+          REPLAY_CMD="${REPLAY_CMD} --tokenizer ${AIPERF_LOCAL_TOKENIZER}"
+        fi
+      ||| else null,
+      if !evalOn && startupOpt then $.fill(
+        |||
+          _eff_warmup="${_CDK_USER_WARMUP:-@EXPLICIT_WARMUP@}"
+          if [ -n "${_eff_warmup}" ]; then
+            REPLAY_CMD="$(printf '%s' "$REPLAY_CMD" | sed -E "s/--warmup-requests-per-lane[= ][0-9]+/--warmup-requests-per-lane ${_eff_warmup}/")"
+          elif [ "${DURATION:-3600}" -lt 900 ] 2>/dev/null; then
+            REPLAY_CMD="$(printf '%s' "$REPLAY_CMD" | sed -E 's/--warmup-requests-per-lane[= ]([2-9]|[1-9][0-9]+)/--warmup-requests-per-lane 1/')"
+          elif [ "${i:-0}" -ge 1 ] 2>/dev/null && [ "${ADAPTIVE_SWEEP_WARMUP:-true}" != "false" ]; then
+            echo "[AdaptiveWarmup] Sweep level $(( i + 1 ))/${#CONC_SWEEP[@]} (c${conc}): server already warm; reducing --warmup-requests-per-lane to 1 (ADAPTIVE_SWEEP_WARMUP=true)."
+            REPLAY_CMD="$(printf '%s' "$REPLAY_CMD" | sed -E 's/--warmup-requests-per-lane[= ]([2-9]|[1-9][0-9]+)/--warmup-requests-per-lane 1/')"
+          fi
+          if [ "${CDK_TOK_HUB_READY:-0}" = "1" ] && [ -f "${AIPERF_DATASET_MMAP_CACHE_DIR:-/nonexistent}/.cdk_mmap_ready" ] && [[ "${REPLAY_CMD}" != env\ HF_HUB_OFFLINE=* ]]; then
+            REPLAY_CMD="env HF_HUB_OFFLINE=1 ${REPLAY_CMD}"
+          fi
+        |||,
+        { EXPLICIT_WARMUP: cdk.var('AIPERF_WARMUP_REQUESTS_PER_LANE', cdk.var('WARMUP_REQUESTS_PER_LANE', '')) }
+      ) else null,
+      (if !evalOn then |||
+        # Don't let a failed level abort the sweep: the remaining concurrencies still
+        # carry signal, and the failure is reported to CDK as this level's exit_code and
+        # again as the job's.
+        set +e
+        run_agentic_replay_and_write_outputs "${RESULT_DIR}"
+        bench_exit=$?
+        set -e
+      ||| else '') + |||
+        if [ "$bench_exit" -ne 0 ]; then
+          echo "WARNING: sweep c${conc} exited with ${bench_exit}"
+          overall_exit=$bench_exit
+        fi
+      |||,
+      if scrapePrefixCache then scrapeClose else null,
+      if scrapeSpecDecode then specClose else null,
+      if scrapeRequestTiming then timingClose else null,
+      if enableXprof then 'stop_xprof_profiler\n' else null,
+      if phaseTrace then 'stop_phase_monitor "$conc" "${RESULT_DIR}"\n' else null,
+      if phaseTrace then 'emit_trace_event end "benchmark-agentx-c${conc}"\n' else null,
+      // RUN_EVAL=true: eval against the same server once throughput is done. Placed after
+      // the scrapers close so eval traffic stays out of this level's perf metrics.
+      if eval.runEval && !evalOn then (
+        if startupOpt then fastRunEvalBlock
+        else eval.runBlock + |||
+          if [ "$eval_exit" -ne 0 ]; then
+            echo "WARNING: eval c${conc} exited with ${eval_exit}"
+            overall_exit=$eval_exit
+          fi
+        |||
+      ) else null,
+      if !startupOpt then $.fill('python3 @PATH@ "${RESULT_DIR}" 2>/dev/null || true\n', { PATH: $.phaseSummaryPath }) else null,
+      if !startupOpt then $.fill(
+        |||
+          publish_result "$conc" "${RESULT_DIR}" "$bench_exit"
+          echo "Completed concurrency level: ${conc}"
+
+          # Let the engine settle before the next level, so one level's tail latency is
+          # not the next level's warmup. Skipped after the last.
+          if [ "$i" -lt $(( ${#CONC_SWEEP[@]} - 1 )) ]; then
+            echo "Pausing @COOLDOWN@ seconds between sweeps..."
+            sleep @COOLDOWN@
+          fi
+        |||,
+        { COOLDOWN: cooldownSeconds }
+      ) else fastPublishAndCooldown,
+    ]));
+
+    if !startupOpt then
+      $.fill(
+        |||
+          CONC_SWEEP=(@LEVELS@)
+          overall_exit=0
+
+          for i in "${!CONC_SWEEP[@]}"; do
+            conc="${CONC_SWEEP[$i]}"
+          @BODY@
+          done
+        |||,
+        { LEVELS: std.join(' ', [std.toString(c) for c in concurrencies]), BODY: indent(body, 2) }
+      )
+    else
+      $.fill(
+        |||
+          CONC_SWEEP=(@LEVELS@)
+          overall_exit=0
+          _USER_EVAL_CONC_PINNED=0
+          [ -n "${EVAL_CONCURRENT_REQUESTS:-}" ] && _USER_EVAL_CONC_PINNED=1
+          _MAX_SWEEP_CONC=1
+          for _c in "${CONC_SWEEP[@]}"; do
+            [ "$_c" -gt "$_MAX_SWEEP_CONC" ] 2>/dev/null && _MAX_SWEEP_CONC="$_c" || true
+          done
+          _LAST_PUB_PID=""
+
+          for i in "${!CONC_SWEEP[@]}"; do
+            conc="${CONC_SWEEP[$i]}"
+          @BODY@
+          done
+          if [ -n "${_LAST_PUB_PID:-}" ]; then
+            wait "${_LAST_PUB_PID}" 2>/dev/null || true
+          fi
+        |||,
+        { LEVELS: std.join(' ', [std.toString(c) for c in concurrencies]), BODY: indent(body, 2) }
+      ),
+
+  // benchmark_lib.sh unconditionally points AIPERF_VENV/AIPERF_CLI/AIPERF_PYTHON at an ephemeral
+  // /tmp/inferencex-agentic-$$/venv directory that does not exist until install_agentic_deps runs
+  // (~30s uv venv + PyPI pip install). Standard InferenceX client images already ship a pre-baked
+  // editable venv on PATH (/root/aiperf-venv/bin/aiperf); bind AIPERF_* directly to it when present
+  // and fall back to install_agentic_deps on custom images without a pre-baked venv.
+  ensureAiperfVenvScript:: |||
+    if [ ! -x "${AIPERF_CLI:-/nonexistent}" ]; then
+      _prebaked_aiperf="$(command -v aiperf 2>/dev/null || true)"
+      _prebaked_dir="$(dirname "${_prebaked_aiperf:-/nonexistent}")"
+      if [ -n "${_prebaked_aiperf}" ] && { [ -x "${_prebaked_dir}/python" ] || [ -x "${_prebaked_dir}/python3" ]; }; then
+        AIPERF_VENV="$(cd "${_prebaked_dir}/.." && pwd)"
+        if [ -x "${_prebaked_dir}/python" ]; then AIPERF_PYTHON="${_prebaked_dir}/python"; else AIPERF_PYTHON="${_prebaked_dir}/python3"; fi
+        AIPERF_CLI="${_prebaked_aiperf}"
+        if [ -x "${_prebaked_dir}/hf" ]; then AIPERF_HF_CLI="${_prebaked_dir}/hf"; fi
+        AIPERF_DEPS_READY=1
+        export AIPERF_VENV AIPERF_PYTHON AIPERF_CLI AIPERF_HF_CLI AIPERF_DEPS_READY
+      elif declare -f install_agentic_deps >/dev/null 2>&1; then
+        install_agentic_deps
+      fi
+    fi
+  |||,
+
+  // Restores a pre-tokenized aiperf dataset_mmap cache entry (<key>/{dataset.dat,index.dat,manifest.json})
+  // from shared GCS (gs://$AIPERF_MMAP_CACHE_GCS/v2/mv<ver>/<32-hex>.<ext>) in ~2s when available,
+  // verifying every restored file against .cdk_cache_manifest.json (SHA-256 + size) and skipping both
+  // the 544 MiB raw Weka trace sync and 35-45s 16-CPU tokenization. On miss, runs the deferred raw
+  // dataset sync + PREWARM_CMD, stages & verifies a local archive via pack_cache, and atomically uploads
+  // with --if-generation-match=0.
+  aiperfMmapCacheExecScript:: $.fill(
+    |||
+      _mmap_probe="$("${AIPERF_PYTHON:-python3}" /tmp/cdk_gcs.py aiperf_mmap_key "${REPLAY_CMD}" 2>/tmp/aiperf_mmap_key.err || true)"
+      _mmap_mv="${_mmap_probe%% *}"
+      _mmap_key="${_mmap_probe#* }"
+      if [ "${_mmap_mv}" = "${_mmap_key}" ]; then _mmap_mv=""; _mmap_key=""; fi
+      _mmap_bucket="${AIPERF_MMAP_CACHE_GCS:-@DEFAULT_MMAP_GCS@}"
+      _mmap_bucket="${_mmap_bucket#gs://}"
+      _mmap_bucket="${_mmap_bucket%/}"
+      _mmap_hit=0
+      if [ -n "${_mmap_mv}" ] && [ -n "${_mmap_key}" ] && [ -n "${_mmap_bucket}" ] && [ "${_mmap_bucket}" != "none" ] && [ "${_mmap_bucket}" != "false" ] && [ "${AIPERF_MMAP_CACHE_REFRESH:-false}" != "true" ]; then
+        for _mext in tar.zst tar.gz; do
+          [ "${_mext}" = "tar.zst" ] && ! command -v zstd >/dev/null 2>&1 && continue
+          _cand_obj="gs://${_mmap_bucket}/v2/${_mmap_mv}/${_mmap_key}.${_mext}"
+          if python3 /tmp/cdk_gcs.py exists "${_cand_obj}"; then
+            _mt0=$(date +%s)
+            rm -rf "${AIPERF_DATASET_MMAP_CACHE_DIR:?}/${_mmap_key}" 2>/dev/null || true
+            mkdir -p "${AIPERF_DATASET_MMAP_CACHE_DIR}/${_mmap_key}"
+            if [ "${_mext}" = "tar.zst" ]; then _mdec="zstd -d -c"; else _mdec="python3 /tmp/cdk_gcs.py pgunzip 8"; fi
+            if ( set -o pipefail; python3 /tmp/cdk_gcs.py stream_get "${_cand_obj}" 8 | ${_mdec} | tar -xf - -C "${AIPERF_DATASET_MMAP_CACHE_DIR}/${_mmap_key}" ) \
+               && python3 /tmp/cdk_gcs.py verify_cache "${AIPERF_DATASET_MMAP_CACHE_DIR}/${_mmap_key}" >/dev/null; then
+              rm -f "${AIPERF_DATASET_MMAP_CACHE_DIR}/${_mmap_key}/.cdk_cache_manifest.json" 2>/dev/null || true
+              if [ -s "${AIPERF_DATASET_MMAP_CACHE_DIR}/${_mmap_key}/manifest.json" ] && { [ -s "${AIPERF_DATASET_MMAP_CACHE_DIR}/${_mmap_key}/dataset.dat" ] || [ -s "${AIPERF_DATASET_MMAP_CACHE_DIR}/${_mmap_key}/dataset.dat.zst" ]; }; then
+                _mmap_hit=1
+                touch "${AIPERF_DATASET_MMAP_CACHE_DIR}/.cdk_mmap_ready"
+                echo "[DatasetPrewarm] HIT=1 restored & verified pre-tokenized mmap cache ${_mmap_mv}/${_mmap_key} from ${_cand_obj} in $(( $(date +%s) - _mt0 ))s" | tee -a /tmp/aiperf_mmap_prewarm.log
+                break
+              fi
+            fi
+            rm -rf "${AIPERF_DATASET_MMAP_CACHE_DIR:?}/${_mmap_key}" 2>/dev/null || true
+          fi
+        done
+      fi
+      if [ "${_mmap_hit}" != "1" ]; then
+        if declare -f _cdk_sync_gcs_dataset >/dev/null 2>&1 && [ -n "${_CDK_DEFERRED_GCS_DS:-}" ]; then
+          _cdk_sync_gcs_dataset "${_CDK_DEFERRED_GCS_DS}"
+        fi
+        _hf_root="${HF_HOME:-/root/.cache/huggingface}"
+        _hf_hub_check="${HF_HUB_CACHE:-${HUGGINGFACE_HUB_CACHE:-${_hf_root}/hub}}"
+        _hf_ds_cache="${HF_DATASETS_CACHE:-${_hf_root}/datasets}"
+        if ! ls "${_hf_ds_cache}"/*/*/*/*/*.arrow >/dev/null 2>&1 && ! ls "${_hf_hub_check}"/datasets--*/snapshots/* >/dev/null 2>&1 && declare -f _cdk_orig_resolve_trace_source >/dev/null 2>&1; then
+          _cdk_orig_resolve_trace_source 2>/dev/null || true
+        fi
+        PREWARM_CMD="$(python3 /tmp/cdk_gcs.py prewarm_cmd "${REPLAY_CMD}")"
+        if [ "${CDK_TOK_HUB_READY:-0}" = "1" ] && ls "${_hf_ds_cache}"/*/*/*/*/*.arrow >/dev/null 2>&1; then
+          PREWARM_CMD="env HF_HUB_OFFLINE=1 ${PREWARM_CMD}"
+        fi
+        @RUN_PREWARM@
+        _pop_key=""
+        if [ -n "${_mmap_key}" ] && [ -s "${AIPERF_DATASET_MMAP_CACHE_DIR}/${_mmap_key}/manifest.json" ]; then
+          _pop_key="${_mmap_key}"
+        else
+          for _mf in "${AIPERF_DATASET_MMAP_CACHE_DIR}"/*/manifest.json; do
+            [ -s "${_mf}" ] && _pop_key="$(basename "$(dirname "${_mf}")")" && break
+          done
+        fi
+        if [ -n "${_pop_key}" ]; then
+          touch "${AIPERF_DATASET_MMAP_CACHE_DIR}/.cdk_mmap_ready"
+          if [ -n "${_mmap_mv}" ] && [ -n "${_mmap_bucket}" ] && [ "${_mmap_bucket}" != "none" ] && [ "${_mmap_bucket}" != "false" ]; then
+            _mt0=$(date +%s)
+            if command -v zstd >/dev/null 2>&1; then
+              _mup_ext="tar.zst"
+            else
+              _mup_ext="tar.gz"
+            fi
+            _mup_flags="--if-generation-match=0"
+            [ "${AIPERF_MMAP_CACHE_REFRESH:-false}" = "true" ] && _mup_flags=""
+            _mup_obj="gs://${_mmap_bucket}/v2/${_mmap_mv}/${_pop_key}.${_mup_ext}"
+            _mup_stage="/tmp/cdk_mmap_stage_${_pop_key}_${BASHPID:-0}.${_mup_ext}"
+            rm -f "${_mup_stage}"
+            _pack_rc=0
+            python3 /tmp/cdk_gcs.py pack_cache "${AIPERF_DATASET_MMAP_CACHE_DIR}/${_pop_key}" "${_mup_stage}" "${_mup_ext}" >/dev/null || _pack_rc=$?
+            rm -f "${AIPERF_DATASET_MMAP_CACHE_DIR}/${_pop_key}/.cdk_cache_manifest.json" 2>/dev/null || true
+            if [ "${_pack_rc}" -eq 0 ] && [ -s "${_mup_stage}" ]; then
+              _mup_rc=0
+              python3 /tmp/cdk_gcs.py cp ${_mup_flags} "${_mup_stage}" "${_mup_obj}" || _mup_rc=$?
+              rm -f "${_mup_stage}"
+              if [ "${_mup_rc}" -eq 0 ]; then
+                echo "[DatasetPrewarm] Uploaded verified pre-tokenized mmap cache ${_mup_obj} in $(( $(date +%s) - _mt0 ))s" | tee -a /tmp/aiperf_mmap_prewarm.log
+              elif [ "${_mup_rc}" -eq 2 ]; then
+                echo "[DatasetPrewarm] Shared mmap cache ${_mup_obj} already populated by concurrent job." | tee -a /tmp/aiperf_mmap_prewarm.log
+              fi
+            else
+              rm -f "${_mup_stage}"
+            fi
+          fi
+        fi
+      fi
+    |||,
+    {
+      DEFAULT_MMAP_GCS: $.defaultAiperfMmapCacheGcs,
+      RUN_PREWARM: std.lstripChars($.indent(std.rstripChars($.runPrewarmCmdScript, '\n'), 2), ' '),
+    }
+  ),
+
+  // benchScript assembles the whole client: helpers, health check, sweep.
+  //
+  // prelude runs first and is where the recipe sources benchmark_lib.sh and settles on a
+  // tokenizer; datasetInit runs once the server answers (or in parallel while waiting for the
+  // server when preinitDataset=true), and is where the trace dataset is resolved.
+  benchScript(
+    host,
+    port,
+    concurrencies,
+    resultFilePrefix,
+    prelude='',
+    datasetInit='',
+    exports={},
+    scrapePrefixCache=false,
+    scrapeSpecDecode=false,
+    scrapeRequestTiming=false,
+    enableXprof=false,
+    phaseTrace=true,
+    profileDirs=['${CDK_OUTPUT_DIR:-/tmp/cdk_output}/xprof'],
+    replayRewrites=[],
+    cooldownSeconds=60,
+    waitTimeoutSeconds=3600,
+    epilogue='',
+    evalOnly=null,
+    startupOpt=false,
+    enableGuardrails=false,
+    preinitDataset=false,
+    exitOnReady=false,
+    viaEnv=false,
+  )::
+    local block(text) = if std.stripChars(text, ' \n\t') == '' then null else std.rstripChars(text, '\n') + '\n';
+    local evalOn = if evalOnly == null then eval.enabled else evalOnly;
+    local evalActive = evalOn || eval.runEval;
+    local isExitOnReady = startupOpt && (exitOnReady || cdk.boolVar('EXIT_ON_READY', false));
+    local doPreinit = startupOpt && preinitDataset && !isExitOnReady && !evalOn;
+    local doLmevalPreinstall = startupOpt && evalActive && !eval.isLongBench && !isExitOnReady;
+    local firstConc = if std.length(concurrencies) > 0 then concurrencies[0] else 1;
+    local exportsBlock =
+      if std.length(exports) > 0 then
+        std.join('\n', [
+          'export %s="%s"' % [k, std.strReplace(std.toString(exports[k]), '"', '\\"')]
+          for k in std.objectFields(exports)
+        ]) + '\n'
+      else null;
+    local prewarmRewrites =
+      (if std.length(replayRewrites) > 0 then std.join('\n', replayRewrites) + '\n' else '')
+      + |||
+        if [ -n "${AIPERF_LOCAL_TOKENIZER:-}" ] && [[ "${REPLAY_CMD}" != *"--tokenizer"* ]]; then
+          REPLAY_CMD="${REPLAY_CMD} --tokenizer ${AIPERF_LOCAL_TOKENIZER}"
+        fi
+      |||;
+
+    $.dedupGcsHelper(std.join('\n', std.prune([
+      $.fill(
+        |||
+          set -ueo pipefail
+
+          # This pod does no TPU work; loading the plugin would have it try.
+          export VLLM_PLUGINS=""
+          export VLLM_TARGET_DEVICE="empty"
+          export JAX_PLATFORMS="cpu"
+          rm -f /tmp/libtpu_lockfile* /dev/shm/libtpu_lockfile* 2>/dev/null || true
+        ||| + (if startupOpt && viaEnv && evalActive then
+          'if [ -n "${_CDK_LB2_PY:-}" ]; then python3 -c \'import os, pathlib; p = pathlib.Path("/tmp/run_longbench_v2.py"); p.write_text(os.environ["_CDK_LB2_PY"], encoding="utf-8"); p.chmod(0o755)\'; unset _CDK_LB2_PY; fi\n'
+        else '') + |||
+          set -x
+
+          # The server runs in a sibling job, reachable over the JobSet headless service:
+          # <jobset>-<replicatedJob>-<job>-<pod>.<jobset>
+          export PORT=@PORT@
+          VLLM_HOST="@HOST@"
+          VLLM_URL="http://${VLLM_HOST}:${PORT}"
+          echo "vLLM server endpoint: ${VLLM_URL}"
+
+          PARENT_RESULT_DIR="${CDK_OUTPUT_DIR:-/tmp/bench_results}"
+          mkdir -p "${PARENT_RESULT_DIR}"
+        |||,
+        { PORT: port, HOST: host }
+      ),
+      if startupOpt then $.fill(
+        '_CDK_USER_WARMUP="${AIPERF_WARMUP_REQUESTS_PER_LANE:-${WARMUP_REQUESTS_PER_LANE:-@EXPLICIT_WARMUP@}}"\n',
+        { EXPLICIT_WARMUP: cdk.var('AIPERF_WARMUP_REQUESTS_PER_LANE', cdk.var('WARMUP_REQUESTS_PER_LANE', '')) }
+      ) else null,
+      block(prelude),
+      // Restore PORT and VLLM_URL in case runtime_settings.sh / benchmark_lib.sh in prelude overwrote PORT=8888.
+      if startupOpt then $.fill(
+        |||
+          export PORT=@PORT@
+          VLLM_URL="http://${VLLM_HOST}:${PORT}"
+        |||,
+        { PORT: port }
+      ) else null,
+      if startupOpt && !evalOn then $.ensureAiperfVenvScript else null,
+      $.installParserFor(startupOpt),
+      if startupOpt then $.compactPy($.installPhaseSummary) else $.installPhaseSummary,
+      if evalActive then (
+        if startupOpt && viaEnv then null
+        else if startupOpt then $.compactPy(eval.installScripts)
+        else eval.installScripts
+      ) else null,
+      if scrapePrefixCache || scrapeSpecDecode || scrapeRequestTiming then (if startupOpt then $.compactPy($.vllmMetricFn) else $.vllmMetricFn) else null,
+      if scrapeRequestTiming then (if startupOpt then $.compactPy($.vllmMetricMsFn) else $.vllmMetricMsFn) else null,
+      $.publishResultFnFor(startupOpt),
+      // Defined unconditionally: prelude and datasetInit are recipe-supplied and routinely
+      // mark their own slices, and a helper that exists only when profiling is on is a
+      // recipe that breaks the first time someone turns profiling off.
+      $.traceEventFn,
+      if phaseTrace then (if startupOpt then $.compactPy($.perfettoMonitorFns) else $.perfettoMonitorFns) else null,
+      if enableXprof then (if startupOpt then $.compactPy($.xprofFns(profileDirs)) else $.xprofFns(profileDirs)) else null,
+      if doPreinit then exportsBlock else null,
+      if doPreinit then |||
+        export AIPERF_DATASET_WEKA_PARALLEL_WORKERS="${AIPERF_DATASET_WEKA_PARALLEL_WORKERS:-16}"
+        export AIPERF_DATASET_MMAP_CACHE_DIR="${AIPERF_DATASET_MMAP_CACHE_DIR:-/tmp/aiperf_mmap_cache}"
+        export AGENTIC_OUTPUT_DIR="${PARENT_RESULT_DIR}"
+        export CDK_DEFER_DATASET_SYNC=1
+        if declare -f resolve_trace_source >/dev/null 2>&1; then
+          eval "_cdk_orig_$(declare -f resolve_trace_source)"
+          resolve_trace_source() {
+            local _saved_hf="${AIPERF_HF_CLI:-}"
+            if [ "${AIPERF_DEPS_READY:-0}" = "1" ]; then ensure_hf_cli() { :; }; fi
+            AIPERF_HF_CLI="true" _cdk_orig_resolve_trace_source "$@"
+            if [ -n "${_saved_hf}" ]; then AIPERF_HF_CLI="${_saved_hf}"; else unset AIPERF_HF_CLI; fi
+          }
+        fi
+      ||| else null,
+      if doPreinit then block(datasetInit) else null,
+      if doPreinit then $.fill(
+        |||
+          unset CDK_DEFER_DATASET_SYNC
+          if [ "${CLIENT_PARALLEL_DATASET:-true}" != "false" ] && [ "${EVAL_ONLY:-false}" != "true" ] && [ "${EXIT_ON_READY:-false}" != "true" ] && command -v build_replay_cmd >/dev/null 2>&1; then
+            mkdir -p "${AIPERF_DATASET_MMAP_CACHE_DIR}"
+            : > /tmp/aiperf_mmap_prewarm.log
+            echo "[DatasetPrewarm] Resolving aiperf dataset_mmap cache (shared GCS + background 16-worker fallback) while waiting for server..."
+            (
+              { set +e; } 2>/dev/null
+              emit_trace_event start "dataset-mmap-prewarm"
+              export CONC="@FIRST_CONC@"
+              rm -rf /tmp/aiperf_mmap_prewarm && mkdir -p /tmp/aiperf_mmap_prewarm
+              build_replay_cmd /tmp/aiperf_mmap_prewarm
+              for _addr in localhost 127.0.0.1 0.0.0.0; do
+                REPLAY_CMD="${REPLAY_CMD//$_addr:$PORT/$VLLM_HOST:$PORT}"
+                REPLAY_CMD="${REPLAY_CMD//$_addr:8000/$VLLM_HOST:8000}"
+              done
+              @PREWARM_REWRITES@
+              @MMAP_CACHE_EXEC@
+              emit_trace_event end "dataset-mmap-prewarm"
+            ) &
+            AIPERF_MMAP_PREWARM_PID=$!
+          elif [ -n "${_CDK_DEFERRED_GCS_DS:-}" ] && declare -f _cdk_sync_gcs_dataset >/dev/null 2>&1; then
+            _cdk_sync_gcs_dataset "${_CDK_DEFERRED_GCS_DS}"
+          fi
+        |||,
+        {
+          FIRST_CONC: firstConc,
+          PREWARM_REWRITES: $.indent(prewarmRewrites, 4),
+          MMAP_CACHE_EXEC: std.lstripChars($.indent(std.rstripChars($.aiperfMmapCacheExecScript, '\n'), 4), ' '),
+        }
+      ) else null,
+      if doLmevalPreinstall then |||
+        if [ ! -f /tmp/.cdk_lmeval_api_installed ]; then
+          (
+            { set +e; } 2>/dev/null
+            emit_trace_event start "lmeval-preinstall"
+            if uv pip install --python "$(command -v python3)" "lm-eval[api]" >/tmp/cdk_lmeval_preinstall.log 2>&1; then
+              touch /tmp/.cdk_lmeval_api_installed
+            fi
+            emit_trace_event end "lmeval-preinstall"
+          ) &
+          CDK_LMEVAL_PREINSTALL_PID=$!
+        fi
+      ||| else null,
+      cdk.waitForHttp('${VLLM_URL}/health', waitTimeoutSeconds, enableGuardrails=startupOpt && enableGuardrails),
+      if isExitOnReady then $.q38ccPopulateWait + |||
+        emit_trace_event start "server-ready"
+        emit_trace_event end "server-ready"
+        echo "Bench: ${VLLM_URL}/health answered ${SECONDS}s after the client started; EXIT_ON_READY=true"
+        if [ -n "${JS_NAME:-}" ]; then
+          for _w in $(seq 1 150); do
+            _pending=""
+            for _pf in /cdk-outputs/outputs/${JS_NAME}-*/*/*/compile_cache_sync_host*.pending; do
+              [ -f "$_pf" ] || continue
+              _pf_base="$(basename "$_pf" .pending)"
+              _pf_job_dir="$(dirname "$(dirname "$_pf")")"
+              if compgen -G "${_pf_job_dir}/*/*/${_pf_base}.done" >/dev/null 2>&1; then
+                rm -f "$_pf" 2>/dev/null || true
+                continue
+              fi
+              _pending="$_pf"
+              break
+            done
+            [ -z "$_pending" ] && break
+            echo "Bench: waiting for cold compile-cache upload ($_pending) before exiting..."
+            sleep 2
+          done
+        fi
+        exit 0
+      ||| else null,
+      if doLmevalPreinstall then |||
+        if [ -n "${CDK_LMEVAL_PREINSTALL_PID:-}" ]; then
+          wait "${CDK_LMEVAL_PREINSTALL_PID}" 2>/dev/null || true
+        fi
+      ||| else null,
+      if doPreinit then |||
+        if [ -n "${AIPERF_MMAP_PREWARM_PID:-}" ]; then
+          echo "[DatasetPrewarm] Waiting for background dataset_mmap pre-build (pid=${AIPERF_MMAP_PREWARM_PID})..."
+          wait "${AIPERF_MMAP_PREWARM_PID}" || true
+          echo "[DatasetPrewarm] Prewarm finished; cache files: $(ls -lh "${AIPERF_DATASET_MMAP_CACHE_DIR}"/*/* 2>/dev/null | wc -l | tr -d ' ')"
+          grep -E "HIT=1|Uploaded pre-tokenized|Populated mmap cache|Restored mmap cache|mmap_cache|ERROR" /tmp/aiperf_mmap_prewarm.log 2>/dev/null | tail -n 10 || true
+        fi
+      ||| else null,
+      if !doPreinit && evalOn && eval.isLongBench then 'resolve_trace_source() { echo "Bench: EVAL_ONLY=true with EVAL_TASK=longbench_v2; skipping Weka trace download."; }\n' else null,
+      if !doPreinit then block(datasetInit) else null,
+      // Double quotes rather than single, because several of these are defaults that defer
+      // to an env var already on the container ("${X:-0}"); an embedded quote is escaped so
+      // a JSON-valued export still arrives as one word.
+      if !doPreinit then exportsBlock else null,
+      'export AGENTIC_OUTPUT_DIR="${PARENT_RESULT_DIR}"\n',
+      $.sweepLoop(
+        concurrencies=concurrencies,
+        resultFilePrefix=resultFilePrefix,
+        scrapePrefixCache=scrapePrefixCache,
+        scrapeSpecDecode=scrapeSpecDecode,
+        scrapeRequestTiming=scrapeRequestTiming,
+        enableXprof=enableXprof,
+        phaseTrace=phaseTrace,
+        replayRewrites=replayRewrites,
+        cooldownSeconds=cooldownSeconds,
+        evalOnly=evalOnly,
+        useLocalTokenizer=startupOpt,
+        startupOpt=startupOpt,
+      ),
+      'echo "AgentX sweeps completed (overall_exit=${overall_exit})."\n',
+      if eval.isLongBench && std.findSubstr('GSM8K_GATE_EOF', epilogue) != [] then null else block(epilogue),
+      if startupOpt then |||
+        if [ "${overall_exit:-0}" -eq 0 ] && [ -n "${JS_NAME:-}" ]; then
+          for _w in $(seq 1 150); do
+            _pending=""
+            for _pf in /cdk-outputs/outputs/${JS_NAME}-*/*/*/compile_cache_sync_host*.pending; do
+              [ -f "$_pf" ] || continue
+              _pf_base="$(basename "$_pf" .pending)"
+              _pf_job_dir="$(dirname "$(dirname "$_pf")")"
+              if compgen -G "${_pf_job_dir}/*/*/${_pf_base}.done" >/dev/null 2>&1; then
+                rm -f "$_pf" 2>/dev/null || true
+                continue
+              fi
+              _pending="$_pf"
+              break
+            done
+            [ -z "$_pending" ] && break
+            echo "Bench: waiting for cold compile-cache upload ($_pending) before exiting..."
+            sleep 2
+          done
+        fi
+      ||| else null,
+      'exit ${overall_exit}\n',
+    ])), viaEnv=viaEnv),
+
+  // benchJob wraps benchScript in a replicated job. It carries no nodeSelector on purpose:
+  // the client has to be free to land on the cpu-only pool, and mounting anything with node
+  // affinity (the shared-cache PVC in particular) takes that away and leaves it queueing for
+  // a TPU host it does not need.
+  benchJob(
+    host,
+    port,
+    concurrencies,
+    resultFilePrefix,
+    name='bench',
+    // The container is named after the job unless a recipe says otherwise. Worth overriding
+    // only to keep a ported recipe's `cdk job logs -c <name>` working the way it used to.
+    containerName=null,
+    image=self.defaultClientImage,
+    benchName=null,
+    tpuChips=null,
+    env={},
+    volumes=[],
+    volumeMounts=[],
+    resources=null,
+    // Job-level TTL, which garbage-collects this Job and its pod that many seconds after it
+    // finishes. Pass null to leave the pod around until the JobSet's own TTL takes it.
+    ttlSeconds=900,
+    prelude='',
+    datasetInit='',
+    exports={},
+    scrapePrefixCache=false,
+    scrapeSpecDecode=false,
+    scrapeRequestTiming=false,
+    enableXprof=false,
+    phaseTrace=true,
+    profileDirs=['${CDK_OUTPUT_DIR:-/tmp/cdk_output}/xprof'],
+    replayRewrites=[],
+    cooldownSeconds=60,
+    waitTimeoutSeconds=3600,
+    epilogue='',
+    evalOnly=null,
+    startupOpt=false,
+    enableGuardrails=false,
+    preinitDataset=false,
+    exitOnReady=false,
+  )::
+    local evalOn = if evalOnly == null then eval.enabled else evalOnly;
+    local evalActive = evalOn || eval.runEval;
+    assert !evalActive || eval.check;
+    cdk.job(
+      name=name,
+      ttlSeconds=ttlSeconds,
+      volumes=volumes,
+      containers=[
+        cdk.container(
+          name=if containerName != null then containerName else name,
+          image=image,
+          script=$.benchScript(
+            host=host,
+            port=port,
+            concurrencies=concurrencies,
+            resultFilePrefix=resultFilePrefix,
+            prelude=prelude,
+            datasetInit=datasetInit,
+            exports=exports,
+            scrapePrefixCache=scrapePrefixCache,
+            scrapeSpecDecode=scrapeSpecDecode,
+            scrapeRequestTiming=scrapeRequestTiming,
+            enableXprof=enableXprof,
+            phaseTrace=phaseTrace,
+            profileDirs=profileDirs,
+            replayRewrites=replayRewrites,
+            cooldownSeconds=cooldownSeconds,
+            waitTimeoutSeconds=waitTimeoutSeconds,
+            epilogue=epilogue,
+            evalOnly=evalOnly,
+            startupOpt=startupOpt,
+            enableGuardrails=enableGuardrails,
+            preinitDataset=preinitDataset,
+            exitOnReady=exitOnReady,
+            viaEnv=startupOpt,
+          ),
+          // JS_NAME is how the script builds the server's DNS name; BENCH_NAME is how each
+          // level names itself in the result store; TPU_CHIPS is what per-chip throughput
+          // is divided by, and is the serving host's chip count, not this pod's.
+          env=cdk.jobSetNameEnv
+              + { PORT: port }
+              + (if benchName != null then { BENCH_NAME: benchName } else {})
+              + (if tpuChips != null then { TPU_CHIPS: tpuChips } else {})
+              + (if evalActive then eval.env else {})
+              + (if startupOpt then {
+                   _CDK_GCS_B64: $.cdkGcsB64,
+                   [if evalActive then '_CDK_LB2_PY']: $.compactPy(eval.longbenchScript),
+                   [if cdk.rawVar('ADAPTIVE_SWEEP_WARMUP', '') != '' then 'ADAPTIVE_SWEEP_WARMUP']: cdk.var('ADAPTIVE_SWEEP_WARMUP', ''),
+                   [if cdk.rawVar('AIPERF_MMAP_CACHE_GCS', '') != '' then 'AIPERF_MMAP_CACHE_GCS']: cdk.var('AIPERF_MMAP_CACHE_GCS', ''),
+                   [if cdk.rawVar('AIPERF_MMAP_CACHE_REFRESH', '') != '' then 'AIPERF_MMAP_CACHE_REFRESH']: cdk.var('AIPERF_MMAP_CACHE_REFRESH', ''),
+                 } else {})
+              + env
+              + (if evalOn then { EVAL_ONLY: 'true' } else {}),
+          resources=resources,
+          volumeMounts=volumeMounts,
+        ),
+      ],
+    ),
+}

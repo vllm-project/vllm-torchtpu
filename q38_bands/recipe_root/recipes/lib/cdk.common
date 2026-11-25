@@ -1,0 +1,311 @@
+// cdk.common — the shared half of every jsonnet recipe.
+//
+// YAML recipes cannot import each other, so the TPU node selector, the resource block, the
+// wait-for-the-server loop and the trace-event echoes are copy-pasted into every recipe that
+// needs them, and each copy then drifts. This file is where those live once.
+//
+// Every recipe starts with:
+//
+//     local cdk = import 'cdk.common';
+//
+// which resolves from anywhere in the tree — cdk puts recipes/lib on the import path. The
+// recipe's last expression is the JobSet.
+//
+// Everything here is a hidden field (`::`), so nothing in this file can leak into the JobSet
+// by accident; only what a recipe explicitly calls shows up in the output.
+
+// What cdk hands the recipe. See `cdk job create --help` for how vars are supplied.
+local ctx = std.extVar('cdk');
+local exos = import 'cdk.exos';
+
+{
+  // ---------------------------------------------------------------------------
+  // Recipe variables
+  //
+  // Supplied as trailing KEY=VALUE arguments: `cdk job create hello-jsonnet SLEEPTIME=120`.
+  // They always arrive as strings from the CLI, so the typed accessors below coerce.
+  // ---------------------------------------------------------------------------
+
+  // The raw map, for recipes that want to iterate it or test for a key themselves.
+  vars:: ctx.vars,
+
+  // The recipe name, user creating the job, and active CDK profile.
+  recipeName:: ctx.recipe,
+  user:: ctx.user,
+  profile:: std.get(ctx, 'profile', ''),
+  isTpuExos:: $.profile == 'cdk-tpu-exos',
+
+  // rawVar returns a variable without coercing it. An unset variable and one set to the
+  // empty string are the same thing, which is what the YAML recipes' `| default` did, so a
+  // recipe converted from YAML keeps behaving the way its users expect.
+  //
+  // With no default, a missing variable is an error naming itself — better than a JobSet
+  // that submits with an empty image and fails in the cluster ten seconds later.
+  rawVar(name, default=null)::
+    local value = std.get(ctx.vars, name, null);
+    if value == null || value == '' then
+      if default == null then
+        error 'recipe variable %s is required: pass %s=<value> to cdk job create' % [name, name]
+      else default
+    else value,
+
+  // var is rawVar as a string, which is what most of a JobSet wants.
+  var(name, default=null):: std.toString($.rawVar(name, default)),
+
+  numVar(name, default=null)::
+    local value = $.rawVar(name, default);
+    if std.isNumber(value) then value
+    else if std.isString(value) && $.isNumeric(value) then std.parseJson(value)
+    else error 'recipe variable %s must be a number, got %s' % [name, std.manifestJson(value)],
+
+  boolVar(name, default=null)::
+    local value = $.rawVar(name, default);
+    if std.isBoolean(value) then value
+    else if std.isString(value) then
+      local lowered = std.asciiLower(value);
+      if std.member(['true', '1', 'yes', 'on'], lowered) then true
+      else if std.member(['false', '0', 'no', 'off'], lowered) then false
+      else error 'recipe variable %s must be true or false, got %s' % [name, value]
+    else error 'recipe variable %s must be true or false, got %s' % [name, std.manifestJson(value)],
+
+  // Checked before std.parseJson so that a typo reports itself as a bad variable rather
+  // than as a JSON syntax error somewhere in the library.
+  isNumeric(s)::
+    local allowed = std.set(std.stringChars('0123456789.+-eE'));
+    std.length(s) > 0 && std.all([std.setMember(c, allowed) for c in std.stringChars(s)]),
+
+  // ---------------------------------------------------------------------------
+  // JobSet structure
+  // ---------------------------------------------------------------------------
+
+  // jobSet is the top-level object a recipe returns.
+  //
+  // failurePolicy is JobSet's own, not the Job's backoffLimit: `{ maxRestarts: 0 }` stops
+  // JobSet recreating the whole set after one job fails. network is for the rare recipe that
+  // has an opinion about the headless service, e.g. `{ enableDNSHostnames: true }`.
+  jobSet(name, jobs, successPolicy=null, failurePolicy=null, network=null):: {
+    apiVersion: 'jobset.x-k8s.io/v1alpha2',
+    kind: 'JobSet',
+    metadata: { name: name },
+    spec: {
+      replicatedJobs: jobs,
+      [if successPolicy != null then 'successPolicy']: successPolicy,
+      [if failurePolicy != null then 'failurePolicy']: failurePolicy,
+      [if network != null then 'network']: network,
+    },
+  },
+
+  // neverRestart is the failurePolicy every benchmark wants: one job failing ends the run
+  // rather than restarting a multi-hour sweep from the top.
+  neverRestart:: { maxRestarts: 0 },
+
+  // succeedWhen names the jobs whose completion completes the whole JobSet — the benchmark
+  // that ran, not the server it ran against, which never exits on its own.
+  succeedWhen(jobNames):: { operator: 'All', targetReplicatedJobs: jobNames },
+
+  // job is one entry in replicatedJobs.
+  //
+  // restartPolicy is pinned to Never last, so it cannot be overridden through podSpec: cdk
+  // rejects anything else, and finding that out at submit time is a wasted round trip.
+  //
+  // backoffLimit defaults to 0 because that is what cdk injects at submit anyway, unless the
+  // caller passes --backoff-limit-override=false. Saying it here means the rendered JobSet is
+  // what actually runs in both cases, rather than only in the default one.
+  job(name, containers, replicas=1, parallelism=1, completions=1, ttlSeconds=null, backoffLimit=0, podSpec={}, volumes=[]):: {
+    name: name,
+    replicas: replicas,
+    template: {
+      spec: {
+        parallelism: parallelism,
+        completions: completions,
+        [if backoffLimit != null then 'backoffLimit']: backoffLimit,
+        [if ttlSeconds != null then 'ttlSecondsAfterFinished']: ttlSeconds,
+        template: {
+          [if $.isTpuExos then 'metadata']: exos.podMetadata(),
+          spec: {
+            containers: if $.isTpuExos then exos.rewriteContainers(containers) else containers,
+            [if std.length(volumes) > 0 then 'volumes']: volumes,
+          } + (if $.isTpuExos then exos.podSpec() else {}) + podSpec + { restartPolicy: 'Never' },
+        },
+      },
+    },
+  },
+
+  // container runs a shell script. Recipes overwhelmingly want a heredoc of shell rather
+  // than an argv, so that is what this takes; pass `command`/`args` yourself for the rest.
+  container(name, image, script, env={}, resources=null, volumeMounts=[], shell='/bin/bash', pullPolicy='Always'):: {
+    name: name,
+    image: image,
+    imagePullPolicy: pullPolicy,
+    command: [shell, '-c'],
+    args: [script],
+    [if std.length(env) > 0 then 'env']: $.envList(env),
+    [if resources != null then 'resources']: resources,
+    [if std.length(volumeMounts) > 0 then 'volumeMounts']: volumeMounts,
+  },
+
+  // envList turns { KEY: 'value' } into the list of {name, value} Kubernetes wants. A value
+  // that is itself an object is spliced in whole, which is how valueFrom entries are written:
+  //
+  //     cdk.envList({ RANK: { valueFrom: { fieldRef: { fieldPath: '...' } } } })
+  envList(env):: [$.envEntry(name, env[name]) for name in std.objectFields(env)],
+
+  envEntry(name, value)::
+    if std.isObject(value) then { name: name } + value
+    else { name: name, value: std.toString(value) },
+
+  // ---------------------------------------------------------------------------
+  // TPU
+  // ---------------------------------------------------------------------------
+
+  // tpuNodeSelector goes in a job's podSpec, tpuResources on the container. They are
+  // separate because Kubernetes puts them in different places, but they have to agree:
+  // chips is the per-host chip count implied by the topology.
+  tpuNodeSelector(accelerator, topology)::
+    if $.isTpuExos then {}
+    else {
+      nodeSelector+: {
+        'cloud.google.com/gke-tpu-accelerator': accelerator,
+        'cloud.google.com/gke-tpu-topology': topology,
+      },
+    },
+
+  // ephemeralStorage is the one resource a TPU pod routinely wants to burst on: the request
+  // has to fit the node's free disk or the pod never schedules, while the limit is what an
+  // unpacked checkpoint actually needs. Passing only ephemeralStorage sets both.
+  tpuResources(chips, cpu='16', memory='256Gi', ephemeralStorage=null, ephemeralStorageLimit=null)::
+    if $.isTpuExos then null
+    else
+      local quota = { cpu: cpu, memory: memory, 'google.com/tpu': chips };
+      local disk(value) = if value != null then { 'ephemeral-storage': value } else {};
+      {
+        limits: quota + disk(if ephemeralStorageLimit != null then ephemeralStorageLimit else ephemeralStorage),
+        requests: quota + disk(ephemeralStorage),
+      },
+
+  // GKE's TPU webhook derives MEGASCALE_NUM_SLICES from the number of Jobs in the JobSet, so
+  // the moment a benchmark is added as a second replicatedJob the server pod starts getting
+  // --megascale_num_slices=2. libtpu then runs multi-slice DiscoverSlices() against a single
+  // physical slice and aborts in tpu::System::DmaMap() (absl raw_hash_map<>::at out of range)
+  // about 40 seconds in, which the client only ever sees as its wait timeout expiring.
+  // Blanking the four vars puts it back into single-slice mode.
+  //
+  // Any recipe that serves on one TPU slice and drives it from a sibling job needs this, so
+  // it lives here rather than in one workload module.
+  megascaleOff:: {
+    MEGASCALE_NUM_SLICES: '',
+    MEGASCALE_SLICE_ID: '',
+    MEGASCALE_PORT: '',
+    MEGASCALE_COORDINATOR_ADDRESS: '',
+  },
+
+  // ---------------------------------------------------------------------------
+  // Addressing other jobs in the same JobSet
+  // ---------------------------------------------------------------------------
+
+  // The JobSet's name is generated per job, so a container can only learn it at runtime.
+  // Put jobSetNameEnv in a container's env and its scripts can use host() below.
+  jobSetNameEnv:: {
+    JS_NAME: { valueFrom: { fieldRef: { fieldPath: "metadata.labels['jobset.sigs.k8s.io/jobset-name']" } } },
+  },
+
+  // host is the DNS name of one pod of another replicated job, for use in a shell script in
+  // a container carrying jobSetNameEnv.
+  host(jobName, replica=0, index=0):: '${JS_NAME}-%s-%d-%d.${JS_NAME}' % [jobName, replica, index],
+
+  // ---------------------------------------------------------------------------
+  // Shell snippets
+  // ---------------------------------------------------------------------------
+
+  // outputDir is where a job's dumps, profiles and checkpoints belong. cdk sets it, and
+  // backs it with GCS when the recipe is registered with require_gcs_mount.
+  outputDir:: '$CDK_OUTPUT_DIR',
+
+  // traced wraps a script in the markers `cdk job trace` parses into a timeline. Written
+  // once here because the marker format is exact and a typo produces no trace and no
+  // complaint — the failure mode that most deserves to live in a library.
+  traced(name, script, pid='main', tid='0'):: |||
+    echo "trace-start-event: name=%(name)s ts=$(date +'%%s.%%N') pid=%(pid)s tid=%(tid)s"
+    %(script)s
+    echo "trace-end-event: name=%(name)s ts=$(date +'%%s.%%N') pid=%(pid)s tid=%(tid)s"
+  ||| % { name: name, script: std.rstripChars(script, '\n'), pid: pid, tid: tid },
+
+  // serverFatalWatchdog monitors a local ring-buffered server log inside the server
+  // container (zero GCSFuse polling during healthy operation) and terminates the server
+  // process immediately if a fatal TPU/EngineCore startup error appears. Writes a closed
+  // snapshot to fatalOutPath so GCSFuse flushes it once for sibling benchmark pods.
+  serverFatalWatchdog(pidVar='VLLM_PID', logPath='/tmp/cdk_server.log', fatalOutPath='${CDK_OUTPUT_DIR:-/tmp/cdk_output}/server.log.fatal'):: |||
+    if [ "${ENABLE_RUNTIME_GUARDRAILS:-true}" != "false" ]; then
+      (
+        { set +x; set +e; } 2>/dev/null
+        _wd_fatal_re='MaybeInitializeSliceBuilder failed|START_SESSION failed|Max # of tries\(=3\) exhausted|EngineCore encountered a fatal error|Engine core initialization failed|PjRtClient is not initialized|RuntimeUnexpectedCoreHalt|\(final_attempt: true\).*RuntimeProgramAllocationFailure|RuntimeError:.*RuntimeProgramAllocationFailure|RuntimeError: Worker failed with error|RuntimeError: TPU backend out of memory|closed its address pipe without reporting|vllm serve: error:'
+        while kill -0 "$%(pidVar)s" 2>/dev/null; do
+          if ( [ -f "%(logPath)s" ] || [ -f "%(logPath)s.1" ] ) && cat "%(logPath)s.1" "%(logPath)s" 2>/dev/null | tail -c 1048576 | grep -a -q -E "$_wd_fatal_re" 2>/dev/null; then
+            mkdir -p "$(dirname "%(fatalOutPath)s")" 2>/dev/null || true
+            cat "%(logPath)s.1" "%(logPath)s" 2>/dev/null | tail -c 1048576 | tr -d '\000' > "%(fatalOutPath)s" 2>/dev/null || true
+            echo "Watchdog: fatal server error detected in %(logPath)s; terminating pid $%(pidVar)s" >&2
+            pkill -TERM -P "$%(pidVar)s" 2>/dev/null || true
+            kill -TERM "$%(pidVar)s" 2>/dev/null || true
+            sleep 5
+            pkill -KILL -P "$%(pidVar)s" 2>/dev/null || true
+            kill -KILL "$%(pidVar)s" 2>/dev/null || true
+            break
+          fi
+          sleep 5
+        done
+      ) &
+    fi
+  ||| % { pidVar: pidVar, logPath: logPath, fatalOutPath: fatalOutPath },
+
+  // waitForHttp blocks until an endpoint answers, and gives up rather than hanging until
+  // the job's deadline. The copies of this loop in the YAML recipes have no timeout, so a
+  // server that never comes up burns the full TPU reservation before anyone notices.
+  // When enableGuardrails=true, also watches sibling server logs under /cdk-outputs for
+  // fatal startup errors so a crashed server fails the client immediately.
+  waitForHttp(url, timeoutSeconds=1800, enableGuardrails=false)::
+    if !enableGuardrails then |||
+      echo "Waiting for %(url)s ..."
+      deadline=$(( $(date +%%s) + %(timeout)d ))
+      until curl -sf "%(url)s" > /dev/null; do
+        if [ "$(date +%%s)" -ge "$deadline" ]; then
+          echo "Gave up after %(timeout)d s waiting for %(url)s" >&2
+          exit 1
+        fi
+        sleep 5
+      done
+      echo "%(url)s is up"
+    ||| % { url: url, timeout: timeoutSeconds }
+    else |||
+      echo "Waiting for %(url)s ..."
+      _wait_fatal_re='MaybeInitializeSliceBuilder failed|START_SESSION failed|EngineCore encountered a fatal error|Engine core initialization failed|PjRtClient is not initialized|RuntimeUnexpectedCoreHalt|\(final_attempt: true\).*RuntimeProgramAllocationFailure|RuntimeError:.*RuntimeProgramAllocationFailure|RuntimeError: Worker failed with error|RuntimeError: TPU backend out of memory|closed its address pipe without reporting|Max # of tries\(=3\) exhausted|vllm serve: error:'
+      _stale_fatal_logs=""
+      if [ "${ENABLE_RUNTIME_GUARDRAILS:-true}" != "false" ] && [ -n "${JS_NAME:-}" ]; then
+        for _log in /cdk-outputs/outputs/${JS_NAME}-*/*/*/server.log.fatal /cdk-outputs/outputs/${JS_NAME}-*/*/*/vllm.log.fatal /cdk-outputs/outputs/${JS_NAME}-*/*/*/server.log /cdk-outputs/outputs/${JS_NAME}-*/*/*/vllm.log; do
+          [ -f "$_log" ] && tail -c 1048576 "$_log" 2>/dev/null | grep -a -q -E "$_wait_fatal_re" 2>/dev/null && _stale_fatal_logs="$_stale_fatal_logs $_log"
+        done
+      fi
+      deadline=$(( $(date +%%s) + %(timeout)d ))
+      _wait_polls=0
+      until curl -sf "%(url)s" > /dev/null; do
+        _wait_polls=$(( _wait_polls + 1 ))
+        if [ $(( _wait_polls %% 3 )) -eq 1 ] && [ "${ENABLE_RUNTIME_GUARDRAILS:-true}" != "false" ] && [ -n "${JS_NAME:-}" ]; then
+          for _log in /cdk-outputs/outputs/${JS_NAME}-*/*/*/server.log.fatal /cdk-outputs/outputs/${JS_NAME}-*/*/*/vllm.log.fatal /cdk-outputs/outputs/${JS_NAME}-*/*/*/server.log /cdk-outputs/outputs/${JS_NAME}-*/*/*/vllm.log; do
+            ls "$(dirname "$_log")" >/dev/null 2>&1 || true
+            [ -f "$_log" ] || continue
+            case " $_stale_fatal_logs " in *" $_log "*) continue ;; esac
+            if tail -c 1048576 "$_log" 2>/dev/null | grep -a -q -E "$_wait_fatal_re" 2>/dev/null; then
+              echo "Fatal server error detected in $_log while waiting for %(url)s:" >&2
+              tail -40 "$_log" 2>/dev/null >&2 || true
+              exit 1
+            fi
+          done
+        fi
+        if [ "$(date +%%s)" -ge "$deadline" ]; then
+          echo "Gave up after %(timeout)d s waiting for %(url)s" >&2
+          exit 1
+        fi
+        sleep 2
+      done
+      echo "%(url)s is up"
+    ||| % { url: url, timeout: timeoutSeconds },
+}

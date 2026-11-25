@@ -1,0 +1,145 @@
+// cdk.exos — Exos Ti-VM & Borg linked runner helpers.
+//
+// Imported by `cdk.common` so standard `cdk.job()` and `cdk.container()` automatically
+// configure Borg linked runner podSpec, metadata, volumes, and log/output shipping env vars
+// when running under the `cdk-tpu-exos` profile.
+//
+// Exos Ti-VM recipe requirements & best practices (`cdk-tpu-exos` profile):
+//   1. Ports must be >= 15000:
+//      Exos Ti-VM runs with `hostNetwork: true` inside a Borg task where ports < 15000 are
+//      outside the allocated container port range and fail `bind()` with EACCES.
+//      - HTTP / serving ports: use >= 15000 (e.g. `--port 18000` instead of `8000`).
+//      - libtpu coordination port: libtpu defaults to 8471, so TPU containers must explicitly
+//        set `TPU_PROCESS_PORT: '18471'` and `TPU_PROCESS_ADDRESSES: 'localhost:18471'`
+//        (or `<host>:18471` for multi-host).
+//      - Other distributed ports (`MASTER_PORT`, Ray ports, etc.) must also be >= 15000.
+//   2. IPv6-only networking (`::`, `::1`, `localhost`):
+//      Exos Ti-VM has no IPv4 interfaces (`0.0.0.0` and `127.0.0.1` are unavailable).
+//      - Bind servers to `::` (all interfaces) or `::1` (loopback), never `0.0.0.0` or `127.0.0.1`.
+//      - In client / health-check URLs (e.g. `curl http://localhost:18000/health`), prefer
+//        `localhost` (which resolves to `::1`) or bracketed `[::1]` so URL parsers do not fail
+//        on bare IPv6 colons.
+//   3. No external DNS / internet access (`pypi.org`, `huggingface.co`, `github.com`):
+//      Exos Ti-VM runs inside a Borg task (`*.borgtask.google.com`) where external DNS and
+//      public internet endpoints are not reachable (`pip install` / `uv pip install` from PyPI
+//      will fail with DNS resolution errors).
+//      - Best practice for installing `.whl` files or local code changes:
+//        Pre-bake dependencies into the container image, or download/build the `.whl` files
+//        (or local checkout) on your workstation and upload them with `--map-dir`:
+//          cdk job create <recipe> --map-dir /local/wheels:<job-name>:/tmp/wheels ...
+//        Then install offline inside the recipe script:
+//          uv pip install --system --no-index --find-links=/tmp/wheels <pkg>
+//          # or: pip install --no-index --find-links=/tmp/wheels <pkg>
+//          # or for editable source trees: pip install --no-build-isolation --no-deps -e /mapped/dir
+//        Keep `--map-dir` bundles small and incremental: `stageMappedDir` runs synchronously
+//        inside `runc create` (`StartContainer`), so uploading huge (>300 MB) wheel bundles
+//        alongside a cold image pull can hit the CRI `StartContainer` deadline. Only include
+//        incremental wheels or source files not already pre-installed in the container image
+//        (for example, skip `jax`, `jaxlib`, `libtpu`, `numpy`, and `scipy` when already in
+//        `/usr/local`) so `--map-dir` staging finishes in 1–2 seconds.
+//      - Load model weights from GCS (`gs://...` / `runai_model_streamer`) rather than
+//        downloading from `huggingface.co` at runtime.
+//   4. Rootless user namespace & `tar` ownership:
+//      Exos Ti-VM containers run as `root` (`uid=0`) inside an unprivileged user namespace
+//      where only UID 0 / GID 0 are mapped.
+//      - Use `--map-dir` to upload local directories or files (`--map-dir` is supported on
+//        `cdk-tpu-exos` via `EXOS_MAP_DIRS` and handles extraction/ownership automatically).
+//      - If a recipe script extracts a `.tar` archive as `root`, always pass
+//        `tar --no-same-owner` so `tar` does not call `chown()` with unmapped UIDs/GIDs
+//        (which fails with `Invalid argument`).
+//   5. No GKE PersistentVolumeClaims (`premium-rwo`) or GCSFuse CSI volumes:
+//      Borg linked runners do not run GKE PD or GCSFuse CSI drivers. Guard GKE-only volumes
+//      and mounts with `if !cdk.isTpuExos`, and write job artifacts/profiles to `cdk.outputDir`
+//      (`$CDK_OUTPUT_DIR`), which the Exos runner automatically syncs back to GCS.
+
+local ctx = std.extVar('cdk');
+
+local rawVar(name, default) =
+  local value = std.get(ctx.vars, name, null);
+  if value == null || value == '' then default else std.toString(value);
+
+{
+  gcsBucket:: rawVar('GCS_BUCKET', 'cloud-devkit'),
+
+  podSpec(group=rawVar('RUNNER_GROUP', 'cdk-tpu-group'))::
+    local nodeName = rawVar('NODE_NAME', '');
+    {
+      runtimeClassName: 'confidential-linked-runner',
+      hostNetwork: true,
+      imagePullSecrets: [{ name: 'ar-cred' }],
+      [if nodeName != '' then 'nodeName']: nodeName,
+      nodeSelector+: {
+        'sandbox.gke.io/runtime': 'confidential-linked-runner',
+        [if group != '' then 'sandbox.gke.io/runner-group-id']: group,
+      },
+      tolerations+: [
+        {
+          key: 'sandbox.gke.io/runtime',
+          operator: 'Equal',
+          value: 'confidential-linked-runner',
+          effect: 'NoSchedule',
+        },
+      ],
+    },
+
+  podMetadata(group=rawVar('RUNNER_GROUP', 'cdk-tpu-group')):: {
+    annotations+: {
+      [if group != '' then 'sandbox.gke.io/runner-group-id']: group,
+    },
+  },
+
+  // containerEnv is ordered: Kubernetes only expands $(VAR) references to variables defined
+  // earlier in the list. The EXOS_* variables tell the Exos runner's log shipper where to back
+  // up this container's logs and outputs in Bigstore.
+  containerEnv(name, bucket=$.gcsBucket):: [
+    {
+      name: 'CDK_JOB_ID',
+      valueFrom: { fieldRef: { fieldPath: "metadata.labels['jobset.sigs.k8s.io/jobset-name']" } },
+    },
+    {
+      name: 'CDK_JOB_NAME',
+      valueFrom: { fieldRef: { fieldPath: "metadata.labels['job-name']" } },
+    },
+    {
+      name: 'CDK_POD_NAME',
+      valueFrom: { fieldRef: { fieldPath: 'metadata.name' } },
+    },
+    {
+      name: 'CDK_CONTAINER_NAME',
+      value: name,
+    },
+    {
+      name: 'EXOS_BUCKET',
+      value: bucket,
+    },
+    {
+      name: 'EXOS_LOG_URI',
+      value: 'jobs/$(CDK_JOB_ID)/logs/$(CDK_JOB_NAME)/$(CDK_POD_NAME)/%s' % name,
+    },
+    {
+      name: 'EXOS_OUTPUT_DIR',
+      value: '/exos-outputs/outputs/$(CDK_JOB_NAME)/$(CDK_POD_NAME)/%s' % name,
+    },
+    {
+      name: 'EXOS_OUTPUT_URI',
+      value: 'jobs/$(CDK_JOB_ID)/outputs/$(CDK_JOB_NAME)/$(CDK_POD_NAME)/%s' % name,
+    },
+    {
+      name: 'CDK_OUTPUT_DIR',
+      value: '$(EXOS_OUTPUT_DIR)',
+    },
+  ],
+
+  rewriteContainer(c)::
+    local base = { [k]: c[k] for k in std.objectFields(c) if k != 'resources' };
+    local existingEnv = std.get(c, 'env', []);
+    local existingEnvNames = std.set([e.name for e in existingEnv]);
+    local defaultEnv = [e for e in $.containerEnv(c.name) if !std.setMember(e.name, existingEnvNames)];
+    base + {
+      imagePullPolicy: 'Always',
+      terminationMessagePath: '/tmp/termination-msg.json',
+      env: defaultEnv + existingEnv,
+    },
+
+  rewriteContainers(containers):: [$.rewriteContainer(c) for c in containers],
+}

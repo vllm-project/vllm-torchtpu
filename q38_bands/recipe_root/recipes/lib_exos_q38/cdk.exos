@@ -1,0 +1,1029 @@
+// cdk.exos — Exos Ti-VM & Borg linked runner helpers.
+//
+// Imported by `cdk.common` so standard `cdk.job()` and `cdk.container()` automatically
+// configure Borg linked runner podSpec, metadata, and volumes when the job targets the
+// `cdk-tpu-exos` cluster. (`EXOS_BUCKET` and `EXOS_LOG_URI` are injected by `cdk job create`.)
+//
+// Exos Ti-VM recipe requirements & best practices (`cdk-tpu-exos` cluster):
+//   1. Networking, ports, and `hostNetwork: true`:
+//      - Exos Borg TPU runners execute with `ns_params.net.mode = 'MODE_ENABLED'` (a dedicated
+//        per-task network namespace), so libtpu's default coordination port (`8471`) works
+//        directly without remapping.
+//      - Keep multi-chip port ranges such as `TORCH_TPU_SLICEBUILDER_PORT_BASE` inside Ti-VM's
+//        reserved workload port range (`46000..55999`, e.g. `51000`) or below Linux's ephemeral
+//        range (`32768..60999`, e.g. `29000` on bare-metal runners) so background gRPC/HTTP
+//        sockets cannot grab a port mid-range before later TPU ranks bind.
+//      - Because linked runners set `hostNetwork: true`, `rewriteContainer` strips K8s container
+//        `ports` (`containerPort`) entries alongside `google.com/tpu` `resources` so pods pass
+//        K8s `hostPort == containerPort` admission and CRI checks cleanly.
+//      - TPU worker identity, slice peer addresses, and runtime environment
+//        (`TPU_WORKER_ID`, `CLOUD_TPU_TASK_ID`, `TPU_WORKER_HOSTNAMES`,
+//        `TPU_PROCESS_ADDRESSES`, `TPU_CHIPS_PER_HOST_BOUNDS`, `TPU_HOST_BOUNDS`,
+//        `TPU_PROCESS_BOUNDS`, `TPU_TOPOLOGY_WRAP`, `TPU_TOPOLOGY_ALT`,
+//        `TPU_ACCELERATOR_TYPE`, `TPU_NAME`, `BARE_METAL_MODE`, `TPU_SKIP_MDS_QUERY`,
+//        `JAX_PLATFORMS`, `PJRT_DEVICE`, `ENABLE_TPUNETD_CLIENT`) are automatically
+//        injected into container processes by `tpu_runner` on the runner host.
+//   2. IPv6-only networking (`::`, `::1`, `localhost`):
+//      Exos Ti-VM has no IPv4 interfaces (`0.0.0.0` and `127.0.0.1` are unavailable).
+//      - Bind servers to `::` (all interfaces) or `::1` (loopback), never `0.0.0.0` or `127.0.0.1`.
+//      - In client / health-check URLs (e.g. `curl http://localhost:18000/health`), prefer
+//        `localhost` (which resolves to `::1`) or bracketed `[::1]` so URL parsers do not fail
+//        on bare IPv6 colons.
+//   3. No external DNS / internet access (`pypi.org`, `huggingface.co`, `github.com`):
+//      Exos Ti-VM runs inside a Borg task (`*.borgtask.google.com`) where external DNS and
+//      public internet endpoints are not reachable (`pip install` / `uv pip install` from PyPI
+//      will fail with DNS resolution errors).
+//      - Best practice for installing `.whl` files or local code changes:
+//        Pre-bake dependencies into the container image, or download/build the `.whl` files
+//        (or local checkout) on your workstation and upload them with `--map-dir`:
+//          cdk job create <recipe> --map-dir /local/wheels:<job-name>:/tmp/wheels ...
+//        Then install offline inside the recipe script:
+//          uv pip install --system --no-index --find-links=/tmp/wheels <pkg>
+//          # or: pip install --no-index --find-links=/tmp/wheels <pkg>
+//          # or for editable source trees: pip install --no-build-isolation --no-deps -e /mapped/dir
+//        Keep `--map-dir` bundles small and incremental: as on GKE, the `cdk-map-dir` init
+//        container reads each tarball back from GCS (here through the runner's gcsfuse mount)
+//        and unpacks it before the job's containers start, so a huge (>300 MB) wheel bundle
+//        delays every pod. Only include incremental wheels or source files not already
+//        pre-installed in the container image (for example, skip `jax`, `jaxlib`, `libtpu`,
+//        `numpy`, and `scipy` when already in `/usr/local`).
+//      - Load model weights from GCS (`gs://...` / `runai_model_streamer`) rather than
+//        downloading from `huggingface.co` at runtime.
+//   4. Rootless user namespace & `tar` ownership:
+//      Exos Ti-VM containers run as `root` (`uid=0`) inside an unprivileged user namespace
+//      where only UID 0 / GID 0 are mapped.
+//      - Use `--map-dir` to upload local directories or files (`--map-dir` works on
+//        `cdk-tpu-exos` the same way as on GKE, and cdk packs the files as owned by root, so
+//        its init container can unpack them here).
+//      - If a recipe script extracts a `.tar` archive as `root`, always pass
+//        `tar --no-same-owner` so `tar` does not call `chown()` with unmapped UIDs/GIDs
+//        (which fails with `Invalid argument`).
+//   5. Cloud Storage (GCS) volumes are supported via `cdk.gcsVolume()` / `cdk.mountGcs()`;
+//      GKE PersistentVolumeClaims (`premium-rwo`) are not:
+//      Borg linked runners do not run the GKE PD or GCSFuse CSI drivers. Each runner instead
+//      serves one gcsfuse mount of every bucket its service account can access at
+//      `/exos/gcs/<bucket>/<only-dir>`. Calling `cdk.gcsVolume(name, bucket, onlyDir=...)` /
+//      `cdk.mountGcs(...)` emits a GCSFuse CSI volume on standard GKE clusters and an untyped
+//      `hostPath` volume under `/exos/gcs` on `cdk-tpu-exos`. That mount is shared by every
+//      volume on the runner, so per volume only `onlyDir` and `readOnly` (via `cdk.gcsMount` /
+//      `cdk.mountGcs`) apply; the shared mount always has `implicit-dirs` on. Guard PVCs and
+//      other GKE-only volumes and mounts with `if !cdk.isTpuExos`.
+//      Write job artifacts/profiles to `cdk.outputDir` (`$CDK_OUTPUT_DIR`), backed directly by
+//      the runner's `/exos/gcs/<bucket>` gcsfuse mount.
+
+local ctx = std.extVar('cdk');
+
+local rawVar(name, default) =
+  local value = std.get(ctx.vars, name, null);
+  if value == null || value == '' then default else std.toString(value);
+
+{
+  // Prefix for Exos linked-runner Kueue node labels, BYO taint, and extended TPU resource.
+  kueueKeyPrefix:: 'exos.google.com',
+
+  gcsBucket:: rawVar('GCS_BUCKET', 'cloud-devkit'),
+  // Runner-side dynamic gcsfuse mount point (all buckets the runner service
+  // account can access at /exos/gcs/<bucket>/<prefix>).
+  gcsHostPathPrefix:: '/exos/gcs',
+
+  // Pod volume name for the runner's /exos/gcs/<bucket> mount.
+  gcsVolumeName:: 'exos-gcs',
+
+  // gcsHostPath returns the runner path where the dynamic gcsfuse mount at /exos/gcs
+  // exposes `bucket`, optionally narrowed to `onlyDir`. Mounting `/exos/gcs` directly
+  // (`bucket == '_'`) is rejected by tpu_runner and disallowed here.
+  gcsHostPath(bucket=$.gcsBucket, onlyDir='')::
+    local b = std.stripChars(std.toString(bucket), ' \t\n');
+    local d = std.stripChars(std.toString(onlyDir), '/ \t\n');
+    local parts = std.filter(function(p) p != '', std.split(d, '/'));
+    assert b != '' : 'gcsVolume bucket must not be empty';
+    assert b != '_' && b != '.' && b != '..' && std.length(std.findSubstr('/', b)) == 0
+           : 'gcsVolume bucket=%s must be a bucket name without "/"' % [bucket];
+    assert !std.member(parts, '..') : 'gcsVolume onlyDir=%s must not contain ".."' % [onlyDir];
+    $.gcsHostPathPrefix + '/' + b + (if std.length(parts) > 0 then '/' + std.join('/', parts) else ''),
+
+  // gcsVolume builds an untyped hostPath volume under /exos/gcs/<bucket>[/<onlyDir>].
+  // Untyped (`type` omitted) so the GKE control-node kubelet does not stat the runner path
+  // on the control node's local filesystem.
+  gcsVolume(name, bucket=$.gcsBucket, onlyDir=''):: {
+    name: name,
+    hostPath: {
+      path: $.gcsHostPath(bucket, onlyDir),
+    },
+  },
+
+  withGcsOutputsVolume(volumes=[], bucket=$.gcsBucket)::
+    if std.any([v.name == $.gcsVolumeName for v in volumes]) then volumes
+    else volumes + [$.gcsVolume($.gcsVolumeName, bucket)],
+
+  withGcsOutputsMount(volumeMounts=[], bucket=$.gcsBucket)::
+    local mountPath = $.gcsHostPath(bucket);
+    if std.any([m.name == $.gcsVolumeName || m.mountPath == mountPath for m in volumeMounts]) then volumeMounts
+    else volumeMounts + [{ name: $.gcsVolumeName, mountPath: mountPath }],
+
+  // orderContainerEnv places downward-API valueFrom entries ahead of literal
+  // value entries so Kubernetes expands $(JS_NAME) inside peer hostname
+  // variables regardless of caller env merge order. CDK_JOB_ID, CDK_POD_NAME,
+  // CDK_JOB_NAME, CDK_CONTAINER_NAME, CDK_OUTPUT_DIR, CDK_LOG_DIR, EXOS_BUCKET,
+  // and EXOS_LOG_URI are injected at submission time by CreateCdkJob
+  // (EnableGcsFuseMount, ApplyCdkContainerIdentity, ApplyExosLogEnv) and must
+  // not be emitted here, because JobSet's OpenAPI map-list schema rejects
+  // duplicate env names.
+  orderContainerEnv(envList)::
+    [e for e in envList if std.objectHas(e, 'valueFrom')]
+    + [e for e in envList if !std.objectHas(e, 'valueFrom')],
+
+  // stageResultUpdaterSh copies the latest result-updater from the runner's GCS
+  // mount (/exos/gcs/<bucket>/tools/result-updater, or tools/arm64/result-updater
+  // on aarch64 hosts such as Sunfish) to /tmp/cdk-bin, ahead of any older copy
+  // baked into the image on PATH, and creates $CDK_OUTPUT_DIR, where
+  // result-updater writes results.json for offline result update.
+  stageResultUpdaterSh:: |||
+    if [ ! -x /tmp/cdk-bin/result-updater ]; then
+      mkdir -p /tmp/cdk-bin
+      _ru_subdir=""
+      case "$(uname -m)" in aarch64|arm64) _ru_subdir="arm64/" ;; esac
+      cp "/exos/gcs/${EXOS_BUCKET:-cloud-devkit}/tools/${_ru_subdir}result-updater" "/tmp/cdk-bin/result-updater.$$" \
+        && chmod 0755 "/tmp/cdk-bin/result-updater.$$" \
+        && mv -f "/tmp/cdk-bin/result-updater.$$" /tmp/cdk-bin/result-updater \
+        || echo "WARN: failed to stage result-updater from GCS" >&2
+    fi
+    export PATH="/tmp/cdk-bin:${PATH}"
+    if [ -n "${CDK_OUTPUT_DIR:-}" ]; then
+      mkdir -p "${CDK_OUTPUT_DIR}" || echo "WARN: failed to create ${CDK_OUTPUT_DIR}" >&2
+    fi
+  |||,
+
+  // stageResultPyHelper defines publish_cdk_result(payload, append=True) at 0
+  // indentation for splicing into embedded Python heredocs. publish_cdk_result
+  // hands the result to the result-updater staged by stageResultUpdaterSh,
+  // which writes $CDK_OUTPUT_DIR/results.json for job-manager to ingest during
+  // JobStateOfflineResultUpdate.
+  stageResultPyHelper:: |||
+    import json, os, subprocess, sys
+
+    def publish_cdk_result(payload, append=True):
+      cmd = ['result-updater'] + (['-a'] if append else []) + [json.dumps(payload)]
+      try:
+        subprocess.run(cmd, check=True)
+      except (OSError, subprocess.CalledProcessError) as exc:
+        print(f'WARN: result-updater failed: {exc}', file=sys.stderr)
+  |||,
+
+  podSpec(
+    group=rawVar('RUNNER_GROUP_ID', rawVar('RUNNER_GROUP', '')),
+    runnerName=rawVar('RUNNER_NAME', ''),
+  )::
+    local nodeName = rawVar('NODE_NAME', '');
+    {
+      runtimeClassName: 'confidential-linked-runner',
+      hostNetwork: true,
+      [if nodeName != '' then 'nodeName']: nodeName,
+      nodeSelector+: {
+        'sandbox.gke.io/runtime': 'confidential-linked-runner',
+        [if group != '' then 'sandbox.gke.io/runner-group-id']: group,
+        [if runnerName != '' then 'linked-runner.gke.io/runner-name']: runnerName,
+      },
+      tolerations+: [
+        {
+          key: 'sandbox.gke.io/runtime',
+          operator: 'Equal',
+          value: 'confidential-linked-runner',
+          effect: 'NoSchedule',
+        },
+      ],
+    },
+
+  podMetadata(
+    group=rawVar('RUNNER_GROUP_ID', rawVar('RUNNER_GROUP', '')),
+    runnerName=rawVar('RUNNER_NAME', ''),
+  ):: {
+    annotations+: {
+      [if group != '' then 'sandbox.gke.io/runner-group-id']: group,
+      [if runnerName != '' then 'linked-runner.gke.io/runner-name']: runnerName,
+    },
+  },
+
+  rewriteContainer(c, bucket=$.gcsBucket)::
+    local base = { [k]: c[k] for k in std.objectFields(c) if k != 'resources' && k != 'ports' };
+    // Keep only Kueue extended resources (<kueueKeyPrefix>/*); GKE TPU, CPU, and memory
+    // requests do not apply to linked runners.
+    local kueueOnly(section) = {
+      [k]: section[k]
+      for k in std.objectFields(section)
+      if std.startsWith(k, $.kueueKeyPrefix + '/')
+    };
+    local res = std.get(c, 'resources', null);
+    local keptRes =
+      if res == null then {}
+      else { [k]: kueueOnly(res[k]) for k in std.objectFields(res) if std.isObject(res[k]) && std.length(kueueOnly(res[k])) > 0 };
+    local existingEnv = std.get(c, 'env', []);
+    base + (if std.length(keptRes) > 0 then { resources: keptRes } else {}) + {
+      imagePullPolicy: std.get(base, 'imagePullPolicy', 'Always'),
+      volumeMounts: $.withGcsOutputsMount(std.get(c, 'volumeMounts', []), bucket),
+      env: $.orderContainerEnv(existingEnv),
+    },
+
+  rewriteContainers(containers, bucket=$.gcsBucket):: [$.rewriteContainer(c, bucket) for c in containers],
+
+  // ipv6Env points torch, Ray, gRPC, and aiperf at IPv6. Borg task networks are
+  // IPv6-only: AF_INET sockets fail with EAFNOSUPPORT.
+  ipv6Env:: {
+    // Use torch's non-libuv TCPStore backend (torch 2.13 defaults to libuv).
+    USE_LIBUV: '0',
+    RAY_ENABLE_IPV6: '1',
+    GRPC_IPV6_LOOPBACK_AVAILABLE: '1',
+    AIPERF_HTTP_IP_VERSION: 'auto',
+  },
+
+  // singleHostIpv6Env pins vLLM's and torch's loopback defaults (127.0.0.1)
+  // to ::1 when every process runs on one host.
+  singleHostIpv6Env:: {
+    MASTER_ADDR: '::1',
+    VLLM_HOST_IP: '::1',
+    VLLM_LOOPBACK_IP: '::1',
+    VLLM_DP_MASTER_IP: '::1',
+    TORCH_TPU_DP_MASTER_ADDR: '::1',
+  },
+
+  // ipv6BuildSnippet compiles /var/tmp/exos_ipv6_preload.so when gcc is
+  // installed and publishes a copy to /tmp/workspace/.exos_ipv6_preload.so for
+  // sibling containers that lack gcc.
+  //
+  // The LD_PRELOAD shim handles:
+  //   1. getifaddrs(): hides non-loopback AF_INET and ULA AF_INET6 (fc00::/7)
+  //      entries when a routable global IPv6 address (2000::/3) is present.
+  //   2. socket(AF_INET, ...): upgrades to AF_INET6 when IPv4 is unavailable.
+  //   3. bind() / connect() / getsockname(): translates 0.0.0.0 and 127.0.0.0/8
+  //      to :: and ::1, allocates bind(0) SOCK_STREAM ports from 48000-50799 on
+  //      Ti-VM (avoiding SliceBuilder collisions at 56000+), and falls back on
+  //      EPERM/EACCES local fixed-port binds (Borg port enforcement) to an
+  //      allowed ephemeral/reserved port recorded in
+  //      ${EXOS_PORT_REMAP_DIR:-/tmp}/.exos_port_<port>.
+  //   4. setsockopt(IPV6_V6ONLY=0): suppresses EAFNOSUPPORT on IPv4-less Ti-VM.
+  ipv6BuildSnippet:: |||
+    if [ ! -f /var/tmp/exos_ipv6_preload.so ] && command -v gcc >/dev/null 2>&1; then
+      _exos_c="/var/tmp/exos_ipv6_preload.$$.c"
+      _exos_so="/var/tmp/exos_ipv6_preload.$$.so"
+      cat > "${_exos_c}" <<'EXOS_IPV6_C'
+    #define _GNU_SOURCE
+    #include <arpa/inet.h>
+    #include <dlfcn.h>
+    #include <errno.h>
+    #include <fcntl.h>
+    #include <ifaddrs.h>
+    #include <limits.h>
+    #include <netinet/in.h>
+    #include <signal.h>
+    #include <stdint.h>
+    #include <stdio.h>
+    #include <stdlib.h>
+    #include <string.h>
+    #include <sys/mman.h>
+    #include <sys/socket.h>
+    #include <sys/syscall.h>
+    #include <unistd.h>
+
+    static int (*real_socket)(int, int, int) = NULL;
+    static int (*real_bind)(int, const struct sockaddr *, socklen_t) = NULL;
+    static int (*real_connect)(int, const struct sockaddr *, socklen_t) = NULL;
+    static int (*real_getsockname)(int, struct sockaddr *, socklen_t *) = NULL;
+    static int (*real_setsockopt)(int, int, int, const void *, socklen_t) = NULL;
+    static int (*real_getifaddrs)(struct ifaddrs **) = NULL;
+    static uint32_t *port_seq_ptr = NULL;
+
+    // dlsym(RTLD_NEXT, ...) can return NULL in some processes; fall back to
+    // raw syscalls instead of jumping to address 0.
+    static int sys_socket(int d, int t, int p) { return (int)syscall(SYS_socket, d, t, p); }
+    static int sys_bind(int fd, const struct sockaddr *a, socklen_t l) { return (int)syscall(SYS_bind, fd, a, l); }
+    static int sys_connect(int fd, const struct sockaddr *a, socklen_t l) { return (int)syscall(SYS_connect, fd, a, l); }
+    static int sys_getsockname(int fd, struct sockaddr *a, socklen_t *l) { return (int)syscall(SYS_getsockname, fd, a, l); }
+    static int sys_setsockopt(int fd, int l, int o, const void *v, socklen_t n) { return (int)syscall(SYS_setsockopt, fd, l, o, v, n); }
+    #define INIT_REAL(fn) do { if (!real_##fn) real_##fn = dlsym(RTLD_NEXT, #fn); if (!real_##fn) real_##fn = sys_##fn; } while (0)
+
+    // On Janus Ti-VM and Borg hosts that have both a routable global unicast
+    // IPv6 address (2000::/3, e.g. 2002:a05:...) and host-local IPv4 or ULA
+    // IPv6 addresses (fc00::/7, e.g. fd14:988a:50ee:...), hide non-loopback
+    // AF_INET and ULA AF_INET6 entries from getifaddrs() so TPU Raiden, Ray,
+    // and Gloo select only the routable global IPv6 address.
+    int getifaddrs(struct ifaddrs **ifap) {
+        if (!real_getifaddrs) real_getifaddrs = dlsym(RTLD_NEXT, "getifaddrs");
+        if (!real_getifaddrs) return -1;
+        int rc = real_getifaddrs(ifap);
+        if (rc != 0 || !ifap || !*ifap) return rc;
+        int has_global_v6 = 0;
+        for (struct ifaddrs *ifa = *ifap; ifa != NULL; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_addr || !ifa->ifa_name || strcmp(ifa->ifa_name, "lo") == 0) continue;
+            if (ifa->ifa_addr->sa_family == AF_INET6) {
+                const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)ifa->ifa_addr;
+                if ((s6->sin6_addr.s6_addr[0] & 0xe0) == 0x20) {
+                    has_global_v6 = 1;
+                    break;
+                }
+            }
+        }
+        if (has_global_v6) {
+            for (struct ifaddrs *ifa = *ifap; ifa != NULL; ifa = ifa->ifa_next) {
+                if (!ifa->ifa_addr || !ifa->ifa_name || strcmp(ifa->ifa_name, "lo") == 0) continue;
+                if (ifa->ifa_addr->sa_family == AF_INET) {
+                    ifa->ifa_addr->sa_family = AF_UNSPEC;
+                } else if (ifa->ifa_addr->sa_family == AF_INET6) {
+                    const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)ifa->ifa_addr;
+                    if ((s6->sin6_addr.s6_addr[0] & 0xfe) == 0xfc) {
+                        ifa->ifa_addr->sa_family = AF_UNSPEC;
+                    }
+                }
+            }
+        }
+        return rc;
+    }
+
+    static uint16_t *sockaddr_port_ptr(struct sockaddr *sa, socklen_t len) {
+        if (!sa) return NULL;
+        if (sa->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6))
+            return &((struct sockaddr_in6 *)sa)->sin6_port;
+        if (sa->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in))
+            return &((struct sockaddr_in *)sa)->sin_port;
+        return NULL;
+    }
+
+    static int is_local_addr(const struct sockaddr *sa, socklen_t len) {
+        if (!sa) return 0;
+        if (sa->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
+            const struct in6_addr *a = &((const struct sockaddr_in6 *)sa)->sin6_addr;
+            return IN6_IS_ADDR_LOOPBACK(a) || IN6_IS_ADDR_UNSPECIFIED(a) ||
+                   (IN6_IS_ADDR_V4MAPPED(a) && a->s6_addr[12] == 127);
+        }
+        if (sa->sa_family == AF_INET && len >= (socklen_t)sizeof(struct sockaddr_in)) {
+            uint32_t ip = ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr);
+            return ip == INADDR_ANY || (ip & 0xff000000) == 0x7f000000;
+        }
+        return 0;
+    }
+
+    static int remap_path(const char *tag, uint16_t key, char *buf, size_t sz) {
+        const char *dir = getenv("EXOS_PORT_REMAP_DIR");
+        if (!dir || !*dir) dir = "/tmp";
+        int n = snprintf(buf, sz, "%s/.exos_%s_%u", dir, tag, (unsigned)key);
+        return n > 0 && (size_t)n < sz;
+    }
+
+    static uint16_t read_port_file(const char *tag, uint16_t key) {
+        int saved = errno;
+        char p[PATH_MAX], val[64];
+        if (!remap_path(tag, key, p, sizeof(p))) { errno = saved; return 0; }
+        int fd = open(p, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) { errno = saved; return 0; }
+        ssize_t n = read(fd, val, sizeof(val) - 1);
+        close(fd);
+        if (n <= 0) { errno = saved; return 0; }
+        val[n] = '\0';
+        char *end = NULL;
+        long port = strtol(val, &end, 10);
+        long owner = end ? strtol(end, NULL, 10) : 0;
+        int alive = (owner <= 0 || kill((pid_t)owner, 0) == 0 || errno == EPERM);
+        errno = saved;
+        return (alive && port > 0 && port <= 65535) ? (uint16_t)port : 0;
+    }
+
+    static void write_port_file(const char *tag, uint16_t key, uint16_t val) {
+        int saved = errno;
+        char p[PATH_MAX], tmp[PATH_MAX], buf[64];
+        if (remap_path(tag, key, p, sizeof(p))) {
+            int tn = snprintf(tmp, sizeof(tmp), "%s.%d", p, (int)getpid());
+            if (tn > 0 && (size_t)tn < sizeof(tmp)) {
+                int fd = open(tmp, O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+                if (fd >= 0) {
+                    int len = snprintf(buf, sizeof(buf), "%u %d\n", (unsigned)val, (int)getpid());
+                    if (len > 0 && write(fd, buf, (size_t)len) == len) {
+                        close(fd);
+                        rename(tmp, p);
+                    } else {
+                        close(fd);
+                        unlink(tmp);
+                    }
+                }
+            }
+        }
+        errno = saved;
+    }
+
+    int socket(int domain, int type, int protocol) {
+        INIT_REAL(socket);
+        int fd = real_socket(domain, type, protocol);
+        if (fd < 0 && domain == AF_INET && (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT || errno == EPERM || errno == EACCES)) {
+            fd = real_socket(AF_INET6, type, protocol);
+            if (fd >= 0) {
+                int off = 0;
+                setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+            }
+        }
+        return fd;
+    }
+
+    static int rewrite_v4_to_v6(int sockfd, const struct sockaddr *addr, socklen_t addrlen, struct sockaddr_in6 *v6) {
+        if (!addr || addrlen < (socklen_t)sizeof(struct sockaddr_in) || addr->sa_family != AF_INET) return 0;
+        int dom = 0;
+        socklen_t dlen = sizeof(dom);
+        if (getsockopt(sockfd, SOL_SOCKET, SO_DOMAIN, &dom, &dlen) == 0 && dom != AF_INET6) return 0;
+        const struct sockaddr_in *v4 = (const struct sockaddr_in *)addr;
+        memset(v6, 0, sizeof(*v6));
+        v6->sin6_family = AF_INET6;
+        v6->sin6_port = v4->sin_port;
+        uint32_t ip = ntohl(v4->sin_addr.s_addr);
+        if (ip == INADDR_ANY) {
+            v6->sin6_addr = in6addr_any;
+        } else if ((ip & 0xff000000) == 0x7f000000) {
+            v6->sin6_addr = in6addr_loopback;
+        } else {
+            return 0;
+        }
+        return 1;
+    }
+
+    static uint32_t next_reserved_port_seq(void) {
+        if (!port_seq_ptr) {
+            int fd = open("/tmp/workspace/.exos_port_seq", O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+            if (fd < 0) fd = open("/tmp/.exos_port_seq", O_RDWR | O_CREAT | O_CLOEXEC, 0666);
+            if (fd >= 0) {
+                if (ftruncate(fd, 4) == 0) {
+                    void *m = mmap(NULL, 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                    if (m != MAP_FAILED) port_seq_ptr = (uint32_t *)m;
+                }
+                close(fd);
+            }
+        }
+        if (port_seq_ptr) return __sync_fetch_and_add(port_seq_ptr, 1);
+        static uint32_t local_seq = 0;
+        return __sync_fetch_and_add(&local_seq, 1);
+    }
+
+    // When ip_local_reserved_ports reserves 46000-55999, kernel bind(0)
+    // funnels any random starting port in 46000-55999 onto the boundary port
+    // 56000/56001 and only checks loopback on bind(::1, 0), colliding when
+    // libtpu SliceBuilder later binds wildcard [::]:port. Allocate bind(0)
+    // SOCK_STREAM ports sequentially from 48000-50799 (inside the reserved
+    // range, away from 46379 Ray, 47903 serve, 51000+ SliceBuilder, and
+    // 53000+ Ray workers) and verify [::]:port is free before binding.
+    static int bind_from_reserved_range(int sockfd, struct sockaddr_in6 *v6) {
+        int stype = 0;
+        socklen_t slen = sizeof(stype);
+        if (getsockopt(sockfd, SOL_SOCKET, SO_TYPE, &stype, &slen) == 0 && stype != SOCK_STREAM) {
+            return real_bind(sockfd, (const struct sockaddr *)v6, sizeof(*v6));
+        }
+        for (int i = 0; i < 256; i++) {
+            uint16_t p = (uint16_t)(48000 + (next_reserved_port_seq() % 2800));
+            int probe = real_socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+            if (probe >= 0) {
+                struct sockaddr_in6 wild;
+                memset(&wild, 0, sizeof(wild));
+                wild.sin6_family = AF_INET6;
+                wild.sin6_addr = in6addr_any;
+                wild.sin6_port = htons(p);
+                int prc = real_bind(probe, (const struct sockaddr *)&wild, sizeof(wild));
+                int perr = errno;
+                close(probe);
+                if (prc != 0) {
+                    if (perr == EPERM || perr == EACCES) break;
+                    continue;
+                }
+            }
+            v6->sin6_port = htons(p);
+            int rc = real_bind(sockfd, (const struct sockaddr *)v6, sizeof(*v6));
+            if (rc == 0) return 0;
+            if (errno != EADDRINUSE) {
+                v6->sin6_port = 0;
+                break;
+            }
+        }
+        v6->sin6_port = 0;
+        return real_bind(sockfd, (const struct sockaddr *)v6, sizeof(*v6));
+    }
+
+    static int bind_dynamic_port(int sockfd, struct sockaddr *sa, socklen_t len) {
+        if (sa->sa_family == AF_INET6 && len >= (socklen_t)sizeof(struct sockaddr_in6)) {
+            ((struct sockaddr_in6 *)sa)->sin6_port = 0;
+            return bind_from_reserved_range(sockfd, (struct sockaddr_in6 *)sa);
+        }
+        uint16_t *pp = sockaddr_port_ptr(sa, len);
+        if (pp) *pp = 0;
+        return real_bind(sockfd, sa, len);
+    }
+
+    int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+        INIT_REAL(bind);
+        INIT_REAL(socket);
+        struct sockaddr_storage buf;
+        if (rewrite_v4_to_v6(sockfd, addr, addrlen, (struct sockaddr_in6 *)&buf)) {
+            int off = 0;
+            setsockopt(sockfd, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+            addr = (const struct sockaddr *)&buf;
+            addrlen = sizeof(struct sockaddr_in6);
+        }
+        if (addr && addrlen >= (socklen_t)sizeof(struct sockaddr_in6) &&
+            addr->sa_family == AF_INET6 && ((const struct sockaddr_in6 *)addr)->sin6_port == 0) {
+            if (addr != (const struct sockaddr *)&buf) memcpy(&buf, addr, sizeof(struct sockaddr_in6));
+            return bind_dynamic_port(sockfd, (struct sockaddr *)&buf, sizeof(struct sockaddr_in6));
+        }
+        int rc = real_bind(sockfd, addr, addrlen);
+        // Borg port enforcement rejects bind() on unowned ports with EPERM while
+        // allowing kernel-assigned ephemeral ports (port=0) or Ti-VM reserved
+        // ports. For local binds, fall back to a permitted dynamic port and
+        // record the mapping in ${EXOS_PORT_REMAP_DIR:-/tmp}.
+        if (rc < 0 && (errno == EPERM || errno == EACCES) &&
+            addr && addrlen <= sizeof(buf) && is_local_addr(addr, addrlen)) {
+            int orig_err = errno;
+            if (addr != (const struct sockaddr *)&buf) memcpy(&buf, addr, addrlen);
+            uint16_t *pp = sockaddr_port_ptr((struct sockaddr *)&buf, addrlen);
+            uint16_t req = pp ? ntohs(*pp) : 0;
+            if (req > 0) {
+                uint16_t prev = read_port_file("port", req);
+                if (prev > 0) {
+                    *pp = htons(prev);
+                    if (real_bind(sockfd, (const struct sockaddr *)&buf, addrlen) == 0) return 0;
+                    if (errno == EADDRINUSE) return -1;
+                }
+                if (bind_dynamic_port(sockfd, (struct sockaddr *)&buf, addrlen) == 0) {
+                    INIT_REAL(getsockname);
+                    struct sockaddr_storage bound;
+                    socklen_t blen = sizeof(bound);
+                    if (real_getsockname(sockfd, (struct sockaddr *)&bound, &blen) == 0) {
+                        uint16_t *bpp = sockaddr_port_ptr((struct sockaddr *)&bound, blen);
+                        uint16_t actual = bpp ? ntohs(*bpp) : 0;
+                        if (actual > 0) {
+                            write_port_file("port", req, actual);
+                            write_port_file("rport", actual, req);
+                        }
+                    }
+                    return 0;
+                }
+                errno = orig_err;
+            }
+        }
+        return rc;
+    }
+
+    int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+        INIT_REAL(getsockname);
+        if (!addr || !addrlen) return real_getsockname(sockfd, addr, addrlen);
+        socklen_t cap = *addrlen;
+        struct sockaddr_storage tmp;
+        socklen_t tlen = sizeof(tmp);
+        int rc = real_getsockname(sockfd, (struct sockaddr *)&tmp, &tlen);
+        if (rc != 0) return rc;
+        if (is_local_addr((const struct sockaddr *)&tmp, tlen)) {
+            uint16_t *pp = sockaddr_port_ptr((struct sockaddr *)&tmp, tlen);
+            uint16_t actual = pp ? ntohs(*pp) : 0;
+            if (actual > 0) {
+                uint16_t orig = read_port_file("rport", actual);
+                if (orig > 0) *pp = htons(orig);
+            }
+            if (tmp.ss_family == AF_INET6 && cap == (socklen_t)sizeof(struct sockaddr_in)) {
+                const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)&tmp;
+                struct sockaddr_in v4;
+                memset(&v4, 0, sizeof(v4));
+                v4.sin_family = AF_INET;
+                v4.sin_port = v6->sin6_port;
+                v4.sin_addr.s_addr = IN6_IS_ADDR_UNSPECIFIED(&v6->sin6_addr)
+                    ? htonl(INADDR_ANY) : htonl(INADDR_LOOPBACK);
+                memcpy(addr, &v4, sizeof(v4));
+                *addrlen = sizeof(v4);
+                return 0;
+            }
+        }
+        memcpy(addr, &tmp, cap < tlen ? cap : tlen);
+        *addrlen = tlen;
+        return 0;
+    }
+
+    int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+        INIT_REAL(connect);
+        struct sockaddr_storage buf;
+        if (rewrite_v4_to_v6(sockfd, addr, addrlen, (struct sockaddr_in6 *)&buf)) {
+            addr = (const struct sockaddr *)&buf;
+            addrlen = sizeof(struct sockaddr_in6);
+        }
+        if (addr && addrlen <= sizeof(buf) && is_local_addr(addr, addrlen)) {
+            if (addr != (const struct sockaddr *)&buf) memcpy(&buf, addr, addrlen);
+            uint16_t *pp = sockaddr_port_ptr((struct sockaddr *)&buf, addrlen);
+            uint16_t req = pp ? ntohs(*pp) : 0;
+            if (req > 0) {
+                uint16_t mapped = read_port_file("port", req);
+                if (mapped > 0) {
+                    *pp = htons(mapped);
+                    return real_connect(sockfd, (const struct sockaddr *)&buf, addrlen);
+                }
+            }
+        }
+        return real_connect(sockfd, addr, addrlen);
+    }
+
+    // IPv4-less Ti-VM guests reject IPV6_V6ONLY=0 with EAFNOSUPPORT, and
+    // libzmq errno_asserts on it (enable_ipv4_mapping) when binding a tcp://
+    // IPv6 endpoint. Dual-stack mapping is meaningless without IPv4, so report
+    // success.
+    int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+        INIT_REAL(setsockopt);
+        int rc = real_setsockopt(sockfd, level, optname, optval, optlen);
+        if (rc != 0 && errno == EAFNOSUPPORT && level == IPPROTO_IPV6 && optname == IPV6_V6ONLY &&
+            optval && optlen >= (socklen_t)sizeof(int) && *(const int *)optval == 0) {
+            errno = 0;
+            return 0;
+        }
+        return rc;
+    }
+    EXOS_IPV6_C
+      if gcc -shared -fPIC -O2 -o "${_exos_so}" "${_exos_c}" -ldl 2>/dev/null; then
+        chmod 0755 "${_exos_so}" 2>/dev/null || true
+        mv -f "${_exos_so}" /var/tmp/exos_ipv6_preload.so 2>/dev/null || true
+      fi
+      rm -f "${_exos_c}" "${_exos_so}" 2>/dev/null || true
+    fi
+    if [ -f /var/tmp/exos_ipv6_preload.so ] && [ -d /tmp/workspace ]; then
+      cp -f /var/tmp/exos_ipv6_preload.so "/tmp/workspace/.exos_ipv6_preload.so.$$" 2>/dev/null \
+        && mv -f "/tmp/workspace/.exos_ipv6_preload.so.$$" /tmp/workspace/.exos_ipv6_preload.so 2>/dev/null || true
+    fi
+  |||,
+
+  // ipv6PreloadSnippet adds /var/tmp/exos_ipv6_preload.so to LD_PRELOAD,
+  // falling back to the copy another container in the pod published to
+  // /tmp/workspace.
+  ipv6PreloadSnippet:: |||
+    if [ ! -f /var/tmp/exos_ipv6_preload.so ] && [ -f /tmp/workspace/.exos_ipv6_preload.so ]; then
+      cp -f /tmp/workspace/.exos_ipv6_preload.so /var/tmp/exos_ipv6_preload.so 2>/dev/null || true
+    fi
+    if [ -f /var/tmp/exos_ipv6_preload.so ]; then
+      export LD_PRELOAD="/var/tmp/exos_ipv6_preload.so${LD_PRELOAD:+:${LD_PRELOAD}}"
+      if [ -n "${EXOS_RECIPE:-}" ]; then echo "=== ${EXOS_RECIPE}: LD_PRELOAD=${LD_PRELOAD} ==="; fi
+    else
+      echo "=== ${EXOS_RECIPE:-exos-tpu}: WARNING: /var/tmp/exos_ipv6_preload.so missing (no gcc?) ===" >&2
+    fi
+  |||,
+
+  // defaultSliceBuilderPortBase is the TORCH_TPU_SLICEBUILDER_PORT_BASE that
+  // sliceBuilderPortEnv uses when SLICEBUILDER_PORT_BASE is unset. libtpu's
+  // SliceBuilder listens on [base, base + chips per host) on every host; 29000
+  // is below Linux's ephemeral range (32768-60999), so on hostNetwork runners
+  // it cannot collide with a kernel-assigned port ("Address already in use"),
+  // and it is allowed on Ti-VM as well (see the port notes at the top).
+  defaultSliceBuilderPortBase:: '29000',
+
+  // sliceBuilderPortEnv sets torch_tpu's SliceBuilder port base from
+  // SLICEBUILDER_PORT_BASE, defaulting to defaultSliceBuilderPortBase.
+  sliceBuilderPortEnv(default=self.defaultSliceBuilderPortBase)::
+    local cdk = import 'cdk.common';
+    local base = cdk.var('SLICEBUILDER_PORT_BASE', default);
+    { TORCH_TPU_SLICEBUILDER_PORT_BASE: base, TORCH_TPU_BASE_PORT: base },
+
+  // sharedKueueFields is the JobSet overlay a linked-runner JobSet needs to be
+  // admitted by the shared Kueue pool: the queue and priority labels, and
+  // suspend=true so Kueue (not the JobSet controller) starts it. cdk-tpu-exos
+  // refuses a JobSet without them unless it pins a runner group ("linked-runner
+  // JobSet bypassing Kueue must pin RUNNER_GROUP"), so with runnerGroupId set
+  // it returns {}. Add it to the JobSet: `cdk.jobSet(...) +
+  // exos.sharedKueueFields(runnerGroupId)`.
+  sharedKueueFields(runnerGroupId)::
+    local cdk = import 'cdk.common';
+    if runnerGroupId != '' then {} else {
+      metadata+: {
+        labels+: {
+          'kueue.x-k8s.io/queue-name': cdk.var('KUEUE_QUEUE_NAME', 'cdk-local-queue'),
+          'kueue.x-k8s.io/priority-class': cdk.var('KUEUE_PRIORITY_CLASS', 'cdk-p5'),
+        },
+      },
+      spec+: { suspend: true },
+    },
+
+  // resolveTopology maps (platform, slice) to
+  // { hosts, chipsPerHost, totalChips, cphBounds, hostBounds, topologyWrap }.
+  //
+  // The table in exos_topology.libsonnet is generated from topology.Resolve in
+  // //cloud/ai/platform/prediction/exos/tpu_runner/topology; its header has
+  // the regeneration command. Do not edit bounds here.
+  resolveTopology(platform='ghostfish_sampling', slice='2x2')::
+    local table = import 'exos_topology.libsonnet';
+    if !std.objectHas(table, platform) then
+      error ('unsupported Exos TPU platform %s (supported: %s)' % [platform, std.join(', ', std.objectFields(table))])
+    else if platform == 'viperlite' && slice == '2x4' then
+      error 'viperlite tops out at a single-host 2x2; use PLATFORM=viperlite_pod for 2x4'
+    else if !std.objectHas(table[platform], slice) then
+      error ('unsupported Exos TPU slice %s for platform %s (supported: %s)' %
+             [slice, platform, std.join(', ', std.objectFields(table[platform]))])
+    else
+      local entry = table[platform][slice];
+      entry {
+        platform: platform,
+        slice: slice,
+        totalChips: entry.hosts * entry.chipsPerHost,
+      },
+
+  // kueueResources returns the extended-resource request and limit for chips TPU chips on
+  // shared Kueue-managed linked runners, or null when a private BYO runnerGroupId is pinned
+  // (so clusters without control-node-labeler need no extended-resource capacity).
+  kueueResources(chips, runnerGroupId)::
+    if runnerGroupId == '' then {
+      requests: { [$.kueueKeyPrefix + '/tpu']: chips },
+      limits: { [$.kueueKeyPrefix + '/tpu']: chips },
+    } else null,
+
+  // kueueNodeSelector returns the shared Kueue topology-aware nodeSelector labels when no
+  // private BYO runnerGroupId is pinned.
+  kueueNodeSelector(accelerator, topology, runnerGroupId)::
+    if runnerGroupId == '' then {
+      [$.kueueKeyPrefix + '/tpu-accelerator']: accelerator,
+      [$.kueueKeyPrefix + '/tpu-topology']: topology,
+      [$.kueueKeyPrefix + '/scheduling-mode']: 'kueue',
+    } else {},
+
+  // cloudTopology maps a Borg (platform, slice) pair to its canonical GKE TPU
+  // accelerator and topology values, matching topology.Spec.CloudAccelerator()
+  // and topology.Spec.CloudSlice() in Go.
+  cloudTopology(platform='ghostfish_sampling', slice='2x2')::
+    local topo = $.resolveTopology(platform, slice);
+    local effectiveSlice =
+      if platform == 'ghostfish_sampling' then
+        if slice == '2x2' then '4x1x1'
+        else if slice == '2x4' then '4x2x1'
+        else if slice == '4x4' then '4x4x1'
+        else slice
+      else if platform == 'ghostfish' then
+        if slice == '2x2' then '2x2x1'
+        else if slice == '2x4' then '2x2x2'
+        else if slice == '4x4' then '2x2x4'
+        else slice
+      else slice;
+    local cloudSlice =
+      if platform == 'ghostfish_sampling' then
+        if effectiveSlice == '4x1x1' then '2x2x1'
+        else if effectiveSlice == '4x2x1' then '2x2x2'
+        else if effectiveSlice == '4x4x1' then '2x2x4'
+        else effectiveSlice
+      else effectiveSlice;
+    local accelerator =
+      if platform == 'ghostfish' || platform == 'ghostfish_sampling' then 'tpu7x'
+      else if platform == 'ghostlite_pod' then 'tpu-v6e-slice'
+      else if platform == 'viperfish' then 'tpu-v5p-slice'
+      else if platform == 'viperlite' || platform == 'viperlite_pod' then 'tpu-v5-lite-podslice'
+      else platform;
+    if topo.hosts > 0 then {
+      accelerator: accelerator,
+      topology: cloudSlice,
+    } else error 'unreachable',
+
+  // workerHostnames computes headless Pod DNS hostnames across all replicas of
+  // a replicatedJob in the JobSet (used for cross-job coordination such as
+  // two-slice Prefill/Decode disaggregation).
+  workerHostnames(jobName, numHosts, splitPerHost=false)::
+    if numHosts <= 1 then
+      'localhost'
+    else
+      local fmt = if splitPerHost then '$(JS_NAME)-%s-%d-0-0.$(JS_NAME)' else '$(JS_NAME)-%s-%d-0.$(JS_NAME)';
+      std.join(',', [
+        fmt % [jobName, idx]
+        for idx in std.range(0, numHosts - 1)
+      ]),
+
+  // tpuPodSpec returns the PodSpec fields required to schedule onto an Exos Borg TPU slice.
+  // When runnerGroupId is empty, the pod targets shared Kueue-managed linked runners matching
+  // (accelerator, topology), and Kueue injects the scheduling-mode=kueue toleration at admission.
+  // When runnerGroupId is non-empty, the pod pins a private BYO runner group and tolerates
+  // scheduling-mode=byo:NoSchedule (CDK stamps nodeSelector[scheduling-mode]=byo at submission,
+  // while raw kubectl rendering omits that nodeSelector so clusters without control-node-labeler
+  // remain compatible).
+  // imagePullSecret names an optional docker-registry Secret in the job namespace; linked runners
+  // have no GCE metadata credentials, so private registries need one.
+  tpuPodSpec(runnerGroupId='', accelerator='', topology='', imagePullSecret=''):: {
+    hostNetwork: true,
+    runtimeClassName: 'confidential-linked-runner',
+    nodeSelector:
+      if runnerGroupId == '' then {
+        'sandbox.gke.io/runtime': 'confidential-linked-runner',
+      } + (if accelerator != '' && topology != '' then $.kueueNodeSelector(accelerator, topology, runnerGroupId) else {})
+      else {
+        'sandbox.gke.io/runtime': 'confidential-linked-runner',
+        'sandbox.gke.io/runner-group-id': runnerGroupId,
+      },
+    tolerations: [
+      {
+        key: 'sandbox.gke.io/runtime',
+        operator: 'Equal',
+        value: 'confidential-linked-runner',
+        effect: 'NoSchedule',
+      },
+    ] + (
+      if runnerGroupId != '' then [
+        {
+          key: $.kueueKeyPrefix + '/scheduling-mode',
+          operator: 'Equal',
+          value: 'byo',
+          effect: 'NoSchedule',
+        },
+      ] else []
+    ) + [
+      {
+        key: 'node.kubernetes.io/not-ready',
+        operator: 'Exists',
+        effect: 'NoExecute',
+        tolerationSeconds: 300,
+      },
+    ],
+  } + (if imagePullSecret != '' then { imagePullSecrets: [{ name: imagePullSecret }] } else {}),
+
+  // tpuJob builds a replicatedJob entry for an Exos TPU workload.
+  tpuJob(
+    name='worker',
+    containerName='tpu-worker',
+    image,
+    script,
+    platform='ghostfish_sampling',
+    slice='2x2',
+    runnerGroupId='',
+    // Always, because kubelet checks the image cache of the shared GKE control
+    // node, not the runner. With IfNotPresent, once any earlier runner on that
+    // node has pulled the image, kubelet skips PullImage and a fresh runner
+    // fails CreateContainer with "failed to resolve image ... not found".
+    pullPolicy=rawVar('PULL_POLICY', 'Always'),
+    extraEnv={},
+    volumes=[],
+    volumeMounts=[],
+    runnerIndexOffset=0,
+    expectedPoolHosts=0,
+    extraContainers=[],
+    ipv6Preload=false,
+    imagePullSecret='',
+    runnerName='',
+    terminationMessagePath='',
+  )::
+    local cdk = import 'cdk.common';
+    local topo = $.resolveTopology(platform, slice);
+    local ct = $.cloudTopology(platform, slice);
+    local bucket = cdk.var('GCS_BUCKET', 'cloud-devkit');
+    local baseEnv = cdk.jobSetNameEnv + {
+      EXPECTED_TPU_DEVICES: std.toString(topo.totalChips),
+    } + (
+      if ipv6Preload then
+        $.ipv6Env + (if topo.hosts <= 1 then $.singleHostIpv6Env else {})
+      else {}
+    ) + extraEnv;
+    local poolHostsGuard =
+      if expectedPoolHosts > 0 then
+        |||
+          if [ -n "${EXOS_POOL_HOSTS:-}" ] && [ "$EXOS_POOL_HOSTS" != "%d" ]; then
+            echo "FATAL: Pool/recipe topology mismatch: runner pool has EXOS_POOL_HOSTS=${EXOS_POOL_HOSTS} hosts (platform=${EXOS_POOL_PLATFORM:-unknown}, slice=${EXOS_POOL_SLICE:-unknown}), but recipe expected %d pool hosts for SLICE=%s (%d sub-slice hosts)." >&2
+            exit 1
+          fi
+        ||| % [expectedPoolHosts, expectedPoolHosts, slice, topo.hosts]
+      else if runnerIndexOffset > 0 then
+        |||
+          if [ -n "${EXOS_POOL_HOSTS:-}" ] && [ "$EXOS_POOL_HOSTS" -lt "%d" ]; then
+            echo "FATAL: Pool/recipe topology mismatch: runner pool has EXOS_POOL_HOSTS=${EXOS_POOL_HOSTS} hosts (platform=${EXOS_POOL_PLATFORM:-unknown}, slice=${EXOS_POOL_SLICE:-unknown}), which is fewer than the %d hosts required for SLICE=%s (%d hosts at offset %d)." >&2
+            exit 1
+          fi
+        ||| % [topo.hosts + runnerIndexOffset, topo.hosts + runnerIndexOffset, slice, topo.hosts, runnerIndexOffset]
+      else
+        |||
+          if [ -n "${EXOS_POOL_HOSTS:-}" ] && [ "$EXOS_POOL_HOSTS" != "%d" ]; then
+            echo "FATAL: Pool/recipe topology mismatch: runner pool has EXOS_POOL_HOSTS=${EXOS_POOL_HOSTS} hosts (platform=${EXOS_POOL_PLATFORM:-unknown}, slice=${EXOS_POOL_SLICE:-unknown}), but recipe requested SLICE=%s (%d hosts)." >&2
+            exit 1
+          fi
+        ||| % [topo.hosts, slice, topo.hosts];
+    // tpu_runner's runc-proxy injects /tmp/exos/tpu_env and single-slice TPU
+    // worker identity/bounds into the container env (preserving any explicit
+    // Pod env overrides) and holds container creation for up to 60s until the
+    // slice peers in TPU_PROCESS_ADDRESSES / TPU_WORKER_HOSTNAMES resolve via
+    // /etc/hosts (best effort). Reconcile explicit TPU_*_BOUNDS if Kueue
+    // schedules a tpu7x job across fungible ghostfish (2,2,1) vs
+    // ghostfish_sampling (4,1,1) pools sharing lr-tpu7x-*-tas.
+    local poolPlatformBoundsAlign = |||
+      if [ "${EXOS_POOL_PLATFORM:-}" = "ghostfish" ] && [ "${TPU_CHIPS_PER_HOST_BOUNDS:-}" = "4,1,1" ]; then
+        export TPU_CHIPS_PER_HOST_BOUNDS="2,2,1"
+        case "${TPU_HOST_BOUNDS:-}" in
+          1,2,1) export TPU_HOST_BOUNDS="1,1,2" TPU_PROCESS_BOUNDS="1,1,2" ;;
+          1,4,1) export TPU_HOST_BOUNDS="1,1,4" TPU_PROCESS_BOUNDS="1,1,4" ;;
+          1,8,1) export TPU_HOST_BOUNDS="1,2,4" TPU_PROCESS_BOUNDS="1,2,4" ;;
+        esac
+      elif [ "${EXOS_POOL_PLATFORM:-}" = "ghostfish_sampling" ] && [ "${TPU_CHIPS_PER_HOST_BOUNDS:-}" = "2,2,1" ]; then
+        case "${TPU_HOST_BOUNDS:-}" in
+          1,1,1) export TPU_CHIPS_PER_HOST_BOUNDS="4,1,1" ;;
+          1,1,2) export TPU_CHIPS_PER_HOST_BOUNDS="4,1,1" TPU_HOST_BOUNDS="1,2,1" TPU_PROCESS_BOUNDS="1,2,1" ;;
+          1,1,4) export TPU_CHIPS_PER_HOST_BOUNDS="4,1,1" TPU_HOST_BOUNDS="1,4,1" TPU_PROCESS_BOUNDS="1,4,1" ;;
+          1,2,4) export TPU_CHIPS_PER_HOST_BOUNDS="4,1,1" TPU_HOST_BOUNDS="1,8,1" TPU_PROCESS_BOUNDS="1,8,1" ;;
+        esac
+      fi
+    |||;
+    local envPreamble =
+      poolHostsGuard + poolPlatformBoundsAlign + (if ipv6Preload then $.ipv6BuildSnippet + $.ipv6PreloadSnippet else '');
+    local baseContainer = cdk.container(
+      name=containerName,
+      image=image,
+      script=envPreamble + script,
+      env=baseEnv,
+      volumeMounts=volumeMounts,
+      pullPolicy=pullPolicy,
+      resources=$.kueueResources(topo.chipsPerHost, runnerGroupId),
+    ) + {
+      workingDir: '/',
+      [if terminationMessagePath != '' then 'terminationMessagePath']: terminationMessagePath,
+      [if terminationMessagePath != '' then 'terminationMessagePolicy']: 'File',
+    };
+    local podAnnotations =
+      (if runnerGroupId != '' then { 'sandbox.gke.io/runner-group-id': runnerGroupId } else {}) +
+      (if runnerName != '' then { 'linked-runner.gke.io/runner-name': runnerName } else {}) +
+      (if runnerName == '' && runnerIndexOffset > 0 then { 'exos.google.com/runner-index-offset': std.toString(runnerIndexOffset) } else {});
+    local jobVolumes =
+      if std.get(cdk, 'isTpuExos', false) then $.withGcsOutputsVolume(volumes, bucket) else volumes;
+    cdk.job(
+      name=name,
+      replicas=if runnerName != '' then 1 else topo.hosts,
+      parallelism=1,
+      completions=1,
+      containers=[baseContainer] + extraContainers,
+      volumes=jobVolumes,
+      podSpec=$.tpuPodSpec(runnerGroupId, ct.accelerator, ct.topology, imagePullSecret=imagePullSecret),
+      podMetadata={
+        labels: {
+          'exos.google.com/linked-runner': 'true',
+        },
+        [if std.length(podAnnotations) > 0 then 'annotations']: podAnnotations,
+      },
+    ),
+
+  // tpuJobs returns the list of replicatedJob entries for an Exos TPU workload.
+  // By default (pinRunners=false), a single replicatedJob with replicas=topo.hosts
+  // is emitted and the cluster MutatingAdmissionPolicy (exos-runner-ordinal-pinning)
+  // pins pod i to "<runnerGroupId>-<i + runnerIndexOffset>" on both BYO (CREATE) and
+  // Kueue (UPDATE when Kueue TAS injects sandbox.gke.io/runner-group-id). When
+  // pinRunners is true (used for custom runnerNamePrefix values), it emits one
+  // 1-replica replicatedJob per host with explicit linked-runner.gke.io/runner-name.
+  tpuJobs(
+    name='worker',
+    containerName='tpu-worker',
+    image,
+    script,
+    platform='ghostfish_sampling',
+    slice='2x2',
+    runnerGroupId='',
+    pullPolicy=rawVar('PULL_POLICY', 'Always'),
+    extraEnv={},
+    volumes=[],
+    volumeMounts=[],
+    runnerIndexOffset=0,
+    expectedPoolHosts=0,
+    headExtraContainers=[],
+    ipv6Preload=false,
+    imagePullSecret='',
+    pinRunners=false,
+    runnerNamePrefix='',
+    terminationMessagePath='',
+  )::
+    local topo = $.resolveTopology(platform, slice);
+    local effPrefix = if runnerNamePrefix != '' then runnerNamePrefix else runnerGroupId;
+    local effectivePinRunners = pinRunners || (runnerNamePrefix != '' && runnerNamePrefix != runnerGroupId);
+    if effectivePinRunners && effPrefix == '' then
+      error 'PIN_RUNNERS=true requires RUNNER_GROUP_ID (or RUNNER_NAME_PREFIX)'
+    else if !effectivePinRunners then
+      [
+        $.tpuJob(
+          name=name,
+          containerName=containerName,
+          image=image,
+          script=script,
+          platform=platform,
+          slice=slice,
+          runnerGroupId=runnerGroupId,
+          pullPolicy=pullPolicy,
+          extraEnv=extraEnv,
+          volumes=volumes,
+          volumeMounts=volumeMounts,
+          runnerIndexOffset=runnerIndexOffset,
+          expectedPoolHosts=expectedPoolHosts,
+          extraContainers=headExtraContainers,
+          ipv6Preload=ipv6Preload,
+          imagePullSecret=imagePullSecret,
+          terminationMessagePath=terminationMessagePath,
+        ),
+      ]
+    else
+      [
+        $.tpuJob(
+          name=if topo.hosts == 1 then name else '%s-%d' % [name, idx],
+          containerName=containerName,
+          image=image,
+          script=script,
+          platform=platform,
+          slice=slice,
+          runnerGroupId=runnerGroupId,
+          pullPolicy=pullPolicy,
+          extraEnv=extraEnv,
+          volumes=volumes,
+          volumeMounts=volumeMounts,
+          runnerName='%s-%d' % [effPrefix, idx + runnerIndexOffset],
+          expectedPoolHosts=expectedPoolHosts,
+          extraContainers=if idx == 0 then headExtraContainers else [],
+          ipv6Preload=ipv6Preload,
+          imagePullSecret=imagePullSecret,
+          terminationMessagePath=terminationMessagePath,
+        )
+        for idx in std.range(0, topo.hosts - 1)
+      ],
+}

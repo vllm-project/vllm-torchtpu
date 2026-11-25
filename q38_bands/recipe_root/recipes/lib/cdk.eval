@@ -1,0 +1,280 @@
+// Shared InferenceX & LongBench v2 evaluation library for CDK recipes.
+// Usage: local eval = import 'cdk.eval';
+
+local cdk = import 'cdk.common';
+local longbenchPy = importstr 'longbench_v2.py';
+local syntheticAcceptance =
+  local v = cdk.rawVar('SYNTHETIC_ACCEPTANCE_LENGTH', '');
+  if v == '0' then '' else v;
+
+local evalOnly = cdk.boolVar('EVAL_ONLY', false);
+local runEval = cdk.boolVar('RUN_EVAL', false);
+local evalActive = evalOnly || runEval;
+
+// Default evaluation task is 'gsm8k' (SemiAnalysis InferenceX quality check).
+// Pass EVAL_TASK=longbench_v2 (or lb2) to run the LongBench v2 evaluation suite.
+local evalTaskRaw = std.asciiLower(cdk.var('EVAL_TASK', 'gsm8k'));
+local evalTask =
+  if std.member(['longbench_v2', 'longbench-v2', 'longbench2', 'lb2'], evalTaskRaw) then 'longbench_v2'
+  else if std.member(['gsm8k', 'lm-eval', 'lm_eval'], evalTaskRaw) then 'gsm8k'
+  else evalTaskRaw;
+local isLongBench = evalTask == 'longbench_v2';
+
+// --- LongBench v2 configurable parameters (active when EVAL_TASK=longbench_v2) ---
+local lb2Dataset = cdk.var('LB2_DATASET', 'THUDM/LongBench-v2');
+local lb2DatasetSplit = cdk.var('LB2_DATASET_SPLIT', 'train');
+local lb2DatasetPath = cdk.var('LB2_DATASET_PATH', '');
+local lb2Model = cdk.var('LB2_MODEL', '');
+
+// Subset filtering options (defaults to LB2_LENGTH=all)
+local lb2Length = std.asciiLower(cdk.var('LB2_LENGTH', cdk.var('EVAL_LENGTH', 'all')));
+local lb2Difficulty = std.asciiLower(cdk.var('LB2_DIFFICULTY', cdk.var('EVAL_DIFFICULTY', 'all')));
+local lb2Domain = cdk.var('LB2_DOMAIN', cdk.var('EVAL_DOMAIN', 'all'));
+local lb2SubDomain = cdk.var('LB2_SUB_DOMAIN', 'all');
+local lb2Ids = cdk.var('LB2_IDS', '');
+local lb2MinWords = cdk.numVar('LB2_MIN_WORDS', 0);
+local lb2MaxWords = cdk.numVar('LB2_MAX_WORDS', 0);
+local lb2MaxSamples = cdk.numVar('LB2_MAX_SAMPLES', cdk.numVar('EVAL_LIMIT', 0));
+local lb2Shuffle = cdk.boolVar('LB2_SHUFFLE', false);
+local lb2Seed = cdk.numVar('LB2_SEED', 42);
+
+// Prompting & reasoning options (defaults to LB2_ENABLE_THINKING=true)
+local lb2Cot = cdk.boolVar('LB2_COT', false);
+local lb2NoContext = cdk.boolVar('LB2_NO_CONTEXT', false);
+local lb2EnableThinking = cdk.boolVar('LB2_ENABLE_THINKING', cdk.boolVar('ENABLE_THINKING', true));
+local lb2SystemPrompt = cdk.var('LB2_SYSTEM_PROMPT', '');
+local lb2StrictExtract = cdk.boolVar('LB2_STRICT_EXTRACT', false);
+
+// Generation & context truncation options (defaults to 32768 when thinking is enabled, 8192 when disabled)
+local defaultMaxNewTokens = if lb2EnableThinking then 32768 else 8192;
+local lb2MaxNewTokens = cdk.numVar('LB2_MAX_NEW_TOKENS', cdk.numVar('EVAL_MAX_TOKENS', defaultMaxNewTokens));
+local lb2CotMaxNewTokens = cdk.numVar('LB2_COT_MAX_NEW_TOKENS', defaultMaxNewTokens);
+// 0 = auto-derive from the running vLLM server's max_model_len minus completion headroom.
+local lb2MaxContextLen = cdk.numVar('LB2_MAX_CONTEXT_LEN', cdk.numVar('EVAL_MAX_CONTEXT_LEN', 0));
+local lb2TruncateMode = std.asciiLower(cdk.var('LB2_TRUNCATE_MODE', cdk.var('LB2_OVERLEN_POLICY', 'middle')));
+local lb2UseTokenizer = cdk.boolVar('LB2_USE_TOKENIZER', true);
+local lb2Tokenizer = cdk.var('LB2_TOKENIZER', '');
+local lb2WordMult = cdk.var('LB2_WORD_MULT', '3.5');
+
+// Sampling parameters
+local lb2Temperature = cdk.var('LB2_TEMPERATURE', '0.1');
+local lb2TopP = cdk.var('LB2_TOP_P', '');
+local lb2TopK = cdk.var('LB2_TOP_K', '');
+local lb2PresencePenalty = cdk.var('LB2_PRESENCE_PENALTY', '');
+local lb2RepetitionPenalty = cdk.var('LB2_REPETITION_PENALTY', '');
+
+// Execution, concurrency & scoring options
+// Automatically inherit CLIENT_CONCURRENCIES into LB2_CONCURRENCY when LB2_CONCURRENCY is not explicitly set.
+local customLb2Concurrency =
+  cdk.rawVar('LB2_CONCURRENCY', '') != ''
+  || cdk.rawVar('LB2_N_PROC', '') != ''
+  || cdk.rawVar('EVAL_CONCURRENT_REQUESTS', '') != '';
+local rawClientConcs = cdk.rawVar('CLIENT_CONCURRENCIES', '');
+local clientConcWords = std.filter(function(w) w != '', std.split(std.strReplace(rawClientConcs, ',', ' '), ' '));
+local firstClientConc =
+  if std.length(clientConcWords) > 0 && cdk.isNumeric(clientConcWords[0])
+  then std.parseJson(clientConcWords[0])
+  else 16;
+local lb2DefaultConcurrency = cdk.numVar(
+  'LB2_CONCURRENCY',
+  cdk.numVar('LB2_N_PROC', cdk.numVar('EVAL_CONCURRENT_REQUESTS', firstClientConc))
+);
+local lb2ClientTimeout = cdk.numVar('LB2_CLIENT_TIMEOUT', 3600);
+local lb2MaxRetries = cdk.numVar('LB2_MAX_RETRIES', 3);
+local lb2Compensated = cdk.boolVar('LB2_COMPENSATED', false);
+local lb2Resume = cdk.boolVar('LB2_RESUME', true);
+local lb2MinScore = cdk.var('LB2_MIN_SCORE', '0');
+local lb2ExtraArgs = cdk.var('LB2_EXTRA_ARGS', '');
+
+local validLengths = ['all', 'full', '*', 'any', 'short', 'medium', 'long'];
+local lb2LengthTokens = [std.stripChars(x, ' ') for x in std.split(lb2Length, ',') if std.stripChars(x, ' ') != ''];
+local invalidLengths = [x for x in lb2LengthTokens if !std.member(validLengths, x)];
+
+local validDifficulties = ['all', 'full', '*', 'any', 'easy', 'hard'];
+local lb2DiffTokens = [std.stripChars(x, ' ') for x in std.split(lb2Difficulty, ',') if std.stripChars(x, ' ') != ''];
+local invalidDifficulties = [x for x in lb2DiffTokens if !std.member(validDifficulties, x)];
+
+local validTruncateModes = ['middle', 'head', 'tail', 'skip', 'none'];
+
+local lb2Check =
+  if !(evalActive && isLongBench) then true
+  else if std.length(invalidLengths) > 0 then
+    error 'LB2_LENGTH must be all, short, medium, long (or comma-separated combination), got "%s"' % lb2Length
+  else if std.length(invalidDifficulties) > 0 then
+    error 'LB2_DIFFICULTY must be all, easy, hard (or comma-separated combination), got "%s"' % lb2Difficulty
+  else if !std.member(validTruncateModes, lb2TruncateMode) then
+    error 'LB2_TRUNCATE_MODE must be one of middle, head, tail, skip, none, got "%s"' % lb2TruncateMode
+  else if lb2DefaultConcurrency < 1 then
+    error 'LB2_CONCURRENCY must be >= 1, got %d' % lb2DefaultConcurrency
+  else true;
+
+{
+  // Upstream's modes (inferencex-e2e/docs/eval-agentx-procedures.md):
+  //   EVAL_ONLY=true -> eval only;  RUN_EVAL=true -> throughput, then eval.
+  enabled:: evalOnly,
+  runEval:: runEval,
+  active:: evalActive,
+  task:: evalTask,
+  isLongBench:: isLongBench,
+  lb2DefaultConcurrency:: lb2DefaultConcurrency,
+  check:: lb2Check,
+
+  // LongBench v2 standalone script content, available to any recipe importing cdk.eval.
+  longbenchScript:: longbenchPy,
+
+  // To align with SemiAnalysis setup, synthetic acceptance skips verification and invalidates eval scores.
+  assert !((self.enabled || self.runEval) && syntheticAcceptance != '') :
+    'To align with SemiAnalysis setup, SYNTHETIC_ACCEPTANCE_LENGTH cannot be combined with EVAL_ONLY or RUN_EVAL. Synthetic acceptance bypasses token verification, which invalidates eval accuracy. Drop SYNTHETIC_ACCEPTANCE_LENGTH (or pass SYNTHETIC_ACCEPTANCE_LENGTH=0) to evaluate MTP with real verification.',
+  assert lb2Check,
+
+  // Environment variables injected automatically into agentx.benchJob when eval is active.
+  env::
+    if !evalActive then {}
+    else {
+      EVAL_TASK: evalTask,
+    } + (if !isLongBench then {} else {
+      LB2_DATASET: lb2Dataset,
+      LB2_DATASET_SPLIT: lb2DatasetSplit,
+      [if lb2DatasetPath != '' then 'LB2_DATASET_PATH']: lb2DatasetPath,
+      [if lb2Model != '' then 'LB2_MODEL']: lb2Model,
+      LB2_LENGTH: lb2Length,
+      LB2_DIFFICULTY: lb2Difficulty,
+      LB2_DOMAIN: lb2Domain,
+      LB2_SUB_DOMAIN: lb2SubDomain,
+      [if lb2Ids != '' then 'LB2_IDS']: lb2Ids,
+      LB2_MIN_WORDS: lb2MinWords,
+      LB2_MAX_WORDS: lb2MaxWords,
+      LB2_MAX_SAMPLES: lb2MaxSamples,
+      LB2_SHUFFLE: if lb2Shuffle then '1' else '0',
+      LB2_SEED: lb2Seed,
+      LB2_COT: if lb2Cot then '1' else '0',
+      LB2_NO_CONTEXT: if lb2NoContext then '1' else '0',
+      LB2_ENABLE_THINKING: if lb2EnableThinking then '1' else '0',
+      [if lb2SystemPrompt != '' then 'LB2_SYSTEM_PROMPT']: lb2SystemPrompt,
+      LB2_STRICT_EXTRACT: if lb2StrictExtract then '1' else '0',
+      LB2_MAX_NEW_TOKENS: lb2MaxNewTokens,
+      LB2_COT_MAX_NEW_TOKENS: lb2CotMaxNewTokens,
+      LB2_MAX_CONTEXT_LEN: lb2MaxContextLen,
+      LB2_TRUNCATE_MODE: lb2TruncateMode,
+      LB2_USE_TOKENIZER: if lb2UseTokenizer then '1' else '0',
+      [if lb2Tokenizer != '' then 'LB2_TOKENIZER']: lb2Tokenizer,
+      LB2_WORD_MULT: lb2WordMult,
+      LB2_TEMPERATURE: lb2Temperature,
+      [if lb2TopP != '' then 'LB2_TOP_P']: lb2TopP,
+      [if lb2TopK != '' then 'LB2_TOP_K']: lb2TopK,
+      [if lb2PresencePenalty != '' then 'LB2_PRESENCE_PENALTY']: lb2PresencePenalty,
+      [if lb2RepetitionPenalty != '' then 'LB2_REPETITION_PENALTY']: lb2RepetitionPenalty,
+      LB2_CONCURRENCY: lb2DefaultConcurrency,
+      [if customLb2Concurrency then 'LB2_CONCURRENCY_PINNED']: '1',
+      LB2_CLIENT_TIMEOUT: lb2ClientTimeout,
+      LB2_MAX_RETRIES: lb2MaxRetries,
+      LB2_COMPENSATED: if lb2Compensated then '1' else '0',
+      LB2_RESUME: if lb2Resume then '1' else '0',
+      LB2_MIN_SCORE: lb2MinScore,
+      [if lb2ExtraArgs != '' then 'LB2_EXTRA_ARGS']: lb2ExtraArgs,
+    }),
+
+  // Installed at top-level of benchScript (outside sweepLoop's indent(body, 2)) so the
+  // heredoc delimiter and Python source remain at column 0.
+  installScripts::
+    "cat > /tmp/run_longbench_v2.py <<'LONGBENCH_V2_EOF'\n"
+    + std.rstripChars(longbenchPy, '\n')
+    + '\nLONGBENCH_V2_EOF\nchmod +x /tmp/run_longbench_v2.py\n',
+
+  runBlockFor(startupOpt=false)::
+    local concExpr = if startupOpt then '${_CDK_EVAL_CONC:-${conc}}' else '${conc}';
+    local lmEvalInstall =
+      if !startupOpt then
+        'uv pip install --python "$(command -v python3)" "lm-eval[api]"'
+      else
+        'if [ ! -f /tmp/.cdk_lmeval_api_installed ]; then\n'
+        + '      uv pip install --python "$(command -v python3)" "lm-eval[api]"\n'
+        + '      touch /tmp/.cdk_lmeval_api_installed\n'
+        + '    fi';
+    std.join('\n', [
+      std.strReplace(
+        std.strReplace(
+          |||
+        if [ "${EVAL_TASK:-gsm8k}" = "longbench_v2" ] || [ "${EVAL_TASK:-}" = "longbench-v2" ] || [ "${EVAL_TASK:-}" = "longbench2" ] || [ "${EVAL_TASK:-}" = "lb2" ] || [ "${EVAL_FRAMEWORK:-}" = "longbench_v2" ]; then
+          if [ "${LB2_CONCURRENCY_PINNED:-0}" != "1" ]; then
+            export LB2_CONCURRENCY="@CONC_EXPR@"
+          fi
+          export EVAL_ONLY="${EVAL_ONLY:-false}" EVAL_TASK="longbench_v2" EVAL_CONCURRENT_REQUESTS="${LB2_CONCURRENCY:-${conc}}"
+          export LB2_LENGTH="${LB2_LENGTH:-all}" LB2_ENABLE_THINKING="${LB2_ENABLE_THINKING:-1}"
+          if [ "${LB2_ENABLE_THINKING}" = "1" ] || [ "${LB2_ENABLE_THINKING}" = "true" ]; then
+            export LB2_MAX_NEW_TOKENS="${LB2_MAX_NEW_TOKENS:-32768}" LB2_COT_MAX_NEW_TOKENS="${LB2_COT_MAX_NEW_TOKENS:-32768}"
+          else
+            export LB2_MAX_NEW_TOKENS="${LB2_MAX_NEW_TOKENS:-8192}" LB2_COT_MAX_NEW_TOKENS="${LB2_COT_MAX_NEW_TOKENS:-8192}"
+          fi
+          set +e
+          LB2_BASE_URL="http://${VLLM_HOST}:${PORT}/v1" \
+          LB2_MODEL="${LB2_MODEL:-${SERVED_MODEL_NAME:-${MODEL_NAME:-${MODEL}}}}" \
+          LB2_TOKENIZER="${LB2_TOKENIZER:-${MODEL:-${MODEL_NAME:-}}}" \
+          LB2_AGGREGATE_FILE="${AGENTIC_OUTPUT_DIR}/${RESULT_FILENAME}.json" \
+          python3 /tmp/run_longbench_v2.py \
+            --base_url "http://${VLLM_HOST}:${PORT}/v1" \
+            --model "${LB2_MODEL:-${SERVED_MODEL_NAME:-${MODEL_NAME:-${MODEL}}}}" \
+            --n_proc "${LB2_CONCURRENCY:-${conc}}" \
+            --output_dir "${RESULT_DIR}" \
+            --aggregate_output_file "${AGENTIC_OUTPUT_DIR}/${RESULT_FILENAME}.json" \
+            ${LB2_EXTRA_ARGS:-} 2>&1 | tee "${RESULT_DIR}/longbench_v2.log"
+          eval_exit=${PIPESTATUS[0]}
+          set -e
+          if [ "${EVAL_ONLY}" = "true" ] || [ "${bench_exit:-0}" -eq 0 ]; then bench_exit=$eval_exit; fi
+        else
+          export EVAL_ONLY="${EVAL_ONLY:-false}" EVAL_FRAMEWORK="${EVAL_FRAMEWORK:-lm-eval}" IS_AGENTIC="1" EVAL_CONCURRENT_REQUESTS="@CONC_EXPR@"
+          unset EVAL_RESULT_DIR
+          if [ "${INFERENCEX_LM_EVAL_RUNTIME_READY:-false}" != "true" ]; then
+            @LMEVAL_INSTALL@
+            _patch_lm_eval
+            export INFERENCEX_LM_EVAL_RUNTIME_READY=true
+          fi
+          eval "$(declare -f run_lm_eval | sed "s|0.0.0.0|\${VLLM_HOST}|g")"
+          # lm-eval writes results to <output_path>/<model_sanitized>/results_<ts>.json,
+          # but benchmark_lib.sh's stage_eval_artifacts globs only "$src"/results*.json
+          # and append_lm_eval_summary deletes the temp dir straight after, so the scores
+          # are lost. Recurse the way its own _stage_lm_eval_artifacts already does.
+          stage_eval_artifacts() {
+            local destination="$1"; shift
+            mkdir -p "$destination" || return $?
+            local copied=0 src f
+            for src in "$@"; do
+              [ -d "$src" ] || continue
+              while IFS= read -r -d '' f; do
+                cp -f "$f" "$destination/" && copied=$((copied + 1))
+              done < <(find "$src" -type f \( -name 'meta_env.json' -o -name 'results*.json' \
+                                              -o -name '*_report.json' -o -name '*.jsonl' \) -print0)
+            done
+            [ "$copied" -gt 0 ] || { echo "ERROR: no eval artifacts found to stage" >&2; return 1; }
+          }
+          set +e
+          (
+            cd "${RESULT_DIR}" && run_eval --port "${PORT}"
+            eval_rc=$?
+            # run_eval stages its own results only when EVAL_ONLY=true; otherwise the
+            # caller must, as upstream's llm-d/server.sh does.
+            if [ "${EVAL_ONLY}" != "true" ]; then
+              append_lm_eval_summary || { [ "$eval_rc" -ne 0 ] || eval_rc=1; }
+            fi
+            PYTHONPATH="${INFMAX_CONTAINER_WORKSPACE}:${INFMAX_CONTAINER_WORKSPACE}/utils" python3 "${INFMAX_CONTAINER_WORKSPACE}/utils/collect_eval_results.py" "${RESULT_DIR}" "eval"
+            # Fold the eval row into the level's result file. Keys already there -- the
+            # throughput aggregate, in RUN_EVAL mode -- win; eval-only writes the row as-is.
+            python3 -c 'import json,pathlib,sys; src,dst=map(pathlib.Path,sys.argv[1:3]); rows=json.loads(src.read_text() or "[]"); agg=json.loads(dst.read_text() or "{}") if dst.exists() else {}; agg.update({k:v for k,v in (rows[0] if rows else {}).items() if k not in agg}); dst.write_text(json.dumps(agg))' "${RESULT_DIR}/agg_eval_eval.json" "${AGENTIC_OUTPUT_DIR}/${RESULT_FILENAME}.json" || [ -f "${AGENTIC_OUTPUT_DIR}/${RESULT_FILENAME}.json" ] || echo "{}" > "${AGENTIC_OUTPUT_DIR}/${RESULT_FILENAME}.json"
+            exit $eval_rc
+          )
+          eval_exit=$?
+          set -e
+          # In RUN_EVAL mode a throughput failure outranks the eval result.
+          if [ "${EVAL_ONLY}" = "true" ] || [ "${bench_exit:-0}" -eq 0 ]; then bench_exit=$eval_exit; fi
+        fi
+    |||,
+          '@CONC_EXPR@',
+          concExpr
+        ),
+        '@LMEVAL_INSTALL@',
+        lmEvalInstall
+      ),
+    ]),
+
+  runBlock:: self.runBlockFor(false),
+}
