@@ -163,6 +163,63 @@ HOST_SPANS = (
 )
 
 
+def host_placement() -> dict:
+    """Where this worker's threads run: per thread its CPU time, context
+    switches and last CPU; the process's allowed CPUs and thread pools; and
+    the NUMA nodes of its CPUs and of the TPU devices it opened."""
+    import glob
+
+    import torch
+
+    def numa_of_cpu(cpu: int) -> int:
+        nodes = glob.glob(f"/sys/devices/system/cpu/cpu{cpu}/node*")
+        return int(nodes[0].rsplit("node", 1)[1]) if nodes else -1
+
+    threads = {}
+    for task in glob.glob("/proc/self/task/*"):
+        try:
+            stat = Path(task, "stat").read_text()
+            status = Path(task, "status").read_text()
+        except OSError:
+            continue
+        name = stat[stat.index("(") + 1 : stat.rindex(")")]
+        fields = stat[stat.rindex(")") + 2 :].split()
+        switches = {
+            k: int(v)
+            for k, v in (line.split(":") for line in status.splitlines())
+            if k in ("voluntary_ctxt_switches", "nonvoluntary_ctxt_switches")
+        }
+        cpu = int(fields[36])
+        threads[task.rsplit("/", 1)[1]] = {
+            "name": name,
+            "cpu_ticks": int(fields[11]) + int(fields[12]),
+            "last_cpu": cpu,
+            "last_numa": numa_of_cpu(cpu),
+            **switches,
+        }
+    devices = set()
+    for fd in glob.glob("/proc/self/fd/*"):
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target.startswith("/dev/vfio/") and target[10:].isdigit():
+            for node in glob.glob(f"/sys/kernel/iommu_groups/{target[10:]}/devices/*"):
+                devices.add(
+                    (Path(node).name, Path(node, "numa_node").read_text().strip())
+                )
+    allowed = sorted(os.sched_getaffinity(0))
+    return {
+        "pid": os.getpid(),
+        "allowed_cpus": len(allowed),
+        "allowed_numa": sorted({numa_of_cpu(c) for c in allowed}),
+        "torch_threads": torch.get_num_threads(),
+        "torch_interop_threads": torch.get_num_interop_threads(),
+        "tpu_devices": sorted(devices),
+        "threads": threads,
+    }
+
+
 def _stage_wrapper(original: Any, stage: str) -> Any:
     @functools.wraps(original)
     def call(module: Any, *args: Any, **kwargs: Any) -> Any:
@@ -241,6 +298,7 @@ class Recorder:
         self.scenario = scenario
         self.rank = rank
         self.provenance = {}
+        self.placement = None
         self.forward_id = 0
         self.decoder_snapshot = None
         self.stages = []
@@ -595,6 +653,9 @@ class ServerStepWorker:
         recorder.in_flight = 0
         recorder.enabled = True
         recorder.audit_start_wall_ns = time.time_ns()
+        recorder.placement = (
+            host_placement() if os.environ.get("DSV41_HOST_SPANS") == "1" else None
+        )
         _ACTIVE = recorder
         cache = self.model_runner.kv_cache_config
         if cache is None:
@@ -634,6 +695,9 @@ class ServerStepWorker:
                 ],
                 "steps": recorder.steps,
                 "stages": recorder.stages,
+                # At the round's start and end: the deltas are the round's.
+                "host_placement": recorder.placement
+                and [recorder.placement, host_placement()],
                 "scenario": recorder.scenario.to_dict(),
                 "provenance": recorder.provenance,
             }
