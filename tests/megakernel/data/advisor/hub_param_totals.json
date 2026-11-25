@@ -1,0 +1,44 @@
+{
+  "schema": "advisor.hub_param_totals.v1",
+  "models": {
+    "qwen3.5-397b": {
+      "repo_id": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "hub_sha": "ea5b4f81096f3901c91dea97f81324302495781d",
+      "snapshot_revision": "ea5b4f81096f3901c91dea97f81324302495781d",
+      "safetensors_total": 403397928944,
+      "out_of_scope_components": [
+        "embed_tokens",
+        "lm_head",
+        "vision_encoder",
+        "mtp_head",
+        "rmsnorm"
+      ],
+      "out_of_scope_note": "Decoder-only advisor excludes embed+lm_head, vision tower, MTP layer, and 1D norms."
+    },
+    "kimi-k3": {
+      "repo_id": "moonshotai/Kimi-K3",
+      "hub_sha": "c7945ea0e737dcaddd22c68ddb7639b1407c081c",
+      "snapshot_revision": "c7945ea0e737dcaddd22c68ddb7639b1407c081c",
+      "safetensors_total": 2779931837184,
+      "out_of_scope_components": [
+        "embed_tokens",
+        "lm_head",
+        "rmsnorm"
+      ],
+      "out_of_scope_note": "Decoder-only advisor excludes embed+lm_head and 1D norms; includes 92 MoE latent projections and 24 MLA output gates."
+    },
+    "glm-5.2": {
+      "repo_id": "zai-org/GLM-5.2-FP8",
+      "hub_sha": "f33c6dc501ee5a2c7e35155653b1b1abbc320951",
+      "snapshot_revision": "f33c6dc501ee5a2c7e35155653b1b1abbc320951",
+      "safetensors_total": 753329940480,
+      "out_of_scope_components": [
+        "embed_tokens",
+        "lm_head",
+        "mtp_layer_78",
+        "rmsnorm"
+      ],
+      "out_of_scope_note": "Decoder-only advisor excludes embed+lm_head, MTP layer 78, and 1D norms; indexer.wk is F8_E4M3 on disk and upcast to BF16 by vLLM DeepSeek-V2 loader (fused wk_weights_proj with quant_config=None, disable_tp=True)."
+    }
+  }
+}
