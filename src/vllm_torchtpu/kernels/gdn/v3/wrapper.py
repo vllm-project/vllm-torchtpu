@@ -85,28 +85,27 @@ def _run_streamed_recurrent_gdn(ctx: _TileContext) -> None:
     )
 
     def _load_rec_head(s: int, v: int) -> jax.Array:
-        # Mask raw uint32 bits before bitcast so uninitialized HBM NaN bit
-        # patterns cannot leak when has_initial_state is False.
-        raw_v = jnp.where(
-            seq_has_init[s], ctx.recurrent_in_slot_ref[s, 0, v], jnp.uint32(0)
+        return vmem_ldst.load_and_select_recurrent_head(
+            recurrent_in_slot_ref=ctx.recurrent_in_slot_ref,
+            carry_recurrent_scratch_ref=ctx.carry_recurrent_scratch_ref,
+            s=s,
+            v=v,
+            has_initial_state=seq_has_init[s],
+            is_first_tile=(
+                seq_is_first_tile[s] if seq_is_first_tile is not None else None
+            ),
+            cfg=cfg,
         )
-        hbm_v = pltpu.bitcast(raw_v, cfg.dtypes.recurrent_state).astype(jnp.float32)
-        if (
-            ctx.carry_recurrent_scratch_ref is not None
-            and seq_is_first_tile is not None
-        ):
-            return jnp.where(
-                seq_is_first_tile[s],
-                hbm_v,
-                ctx.carry_recurrent_scratch_ref[s, v],
-            )
-        return hbm_v
 
     def _store_ckpt_head(s: int, v: int, w_idx: int, state_j: jax.Array) -> None:
-        if ctx.carry_recurrent_scratch_ref is not None and w_idx == cfg.window_size - 1:
-            ctx.carry_recurrent_scratch_ref[s, v] = state_j
-        ctx.recurrent_out_slot_ref[s, w_idx, v] = pltpu.bitcast(
-            state_j.astype(cfg.dtypes.recurrent_state), jnp.uint32
+        vmem_ldst.store_recurrent_head(
+            recurrent_out_slot_ref=ctx.recurrent_out_slot_ref,
+            carry_recurrent_scratch_ref=ctx.carry_recurrent_scratch_ref,
+            s=s,
+            v=v,
+            w_idx=w_idx,
+            state=state_j,
+            cfg=cfg,
         )
 
     out, _ = compute_gdn.recurrent_gdn(
@@ -188,12 +187,12 @@ def _run_bulk_attention(ctx: _TileContext) -> None:
         )
 
     ctx.out_slot_ref[...] = out.astype(ctx.out_slot_ref.dtype)
-    # Round to the state dtype, then pack into the uint32 window.
-    ctx.recurrent_out_slot_ref[...] = pltpu.bitcast(
-        new_recurrent_state.astype(cfg.dtypes.recurrent_state), jnp.uint32
+    vmem_ldst.store_recurrent_state(
+        recurrent_out_slot_ref=ctx.recurrent_out_slot_ref,
+        carry_recurrent_scratch_ref=ctx.carry_recurrent_scratch_ref,
+        new_recurrent_state=new_recurrent_state,
+        cfg=cfg,
     )
-    if ctx.carry_recurrent_scratch_ref is not None:
-        ctx.carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
 
 
 def inner_kernel(

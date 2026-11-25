@@ -380,9 +380,8 @@ def recurrent_gdn_per_seq(
 class _RecurrentStep(NamedTuple):
     """Precomputed per-token inputs for one recurrent GDN step."""
 
+    q: jax.Array
     k: jax.Array
-    kq: jax.Array
-    qk_dot: jax.Array
     v: jax.Array
     beta: jax.Array
     gating: jax.Array
@@ -405,7 +404,10 @@ def _make_in_memory_state_io(
         return state_prev[s, v]
 
     def store_ckpt(s: int, v: int, w_idx: int, state_j: jax.Array) -> None:
-        del v
+        assert v == len(ckpts[s][w_idx]), (
+            f"store_ckpt requires ascending head order; expected head "
+            f"{len(ckpts[s][w_idx])}, got {v}."
+        )
         ckpts[s][w_idx].append(state_j)
 
     def collect_states() -> jax.Array:
@@ -468,15 +470,10 @@ def _prepare_recurrent_steps(
         gating_curr = fused_transpose_broadcast(gating_c, src_dim=3, dst_dim=1)[
             :, : cfg.num_v_heads
         ]
-        # Concatenate [k, q] along axis=2 so each token step issues one MXU dot
-        # instead of two dependent contractions against the recurrent state.
-        kq_c = jnp.concat([k_c, q_c], axis=2)
-        qk_dot_c = jnp.sum(q_c * k_c, axis=-1, keepdims=True, dtype=jnp.float32)
         steps.append(
             _RecurrentStep(
+                q=q_c,
                 k=k_c,
-                kq=kq_c,
-                qk_dot=qk_dot_c,
                 v=v_c,
                 beta=beta_curr,
                 gating=gating_curr,
@@ -499,6 +496,14 @@ def _run_single_token_recurrent(
     register spills when packed state formats unpack heads on the fly.
     """
     dot_dims = (((2,), (1,)), ((0,), (0,)))
+    # Concatenate [k, q] along axis=2 so each head pair issues one MXU dot
+    # instead of two dependent contractions against the recurrent state.
+    kq = jnp.concat([step.k, step.q], axis=2)
+    qk_dot = jnp.sum(
+        step.q.astype(jnp.float32) * step.k.astype(jnp.float32),
+        axis=-1,
+        keepdims=True,
+    )
     seq_outs: list[jax.Array] = []
     for s in range(cfg.seq_tile_size):
         k_t_per_kq = [
@@ -515,7 +520,7 @@ def _run_single_token_recurrent(
                 for j in range(sub_blk)
             ]
             kq_sub = jnp.stack(
-                [step.kq[s, (sub0 + j) // cfg.v_per_kq_head] for j in range(sub_blk)],
+                [kq[s, (sub0 + j) // cfg.v_per_kq_head] for j in range(sub_blk)],
                 axis=0,
             )
             kq_proj = jax.lax.dot_general(
@@ -533,7 +538,7 @@ def _run_single_token_recurrent(
                 v_new_j = step.beta[s, v] * (step.v[s, v] - v_updated_j)
                 out_j = (
                     out_decayed_j.astype(jnp.float32)
-                    + step.qk_dot[s, kq_idx] * v_new_j.astype(jnp.float32)
+                    + qk_dot[s, kq_idx] * v_new_j.astype(jnp.float32)
                 ).astype(cfg.dtypes.compute)
                 head_outs.append(out_j)
                 state_j = state_upd_list[j] + k_t_per_kq[kq_idx] * v_new_j
@@ -550,13 +555,12 @@ def _run_multi_token_recurrent(
     store_ckpt: Callable[[int, int, int, jax.Array], None],
     cfg: config.GDNConfig,
 ) -> jax.Array:
-    """Runs multi-token recurrent steps token-outer across all value heads.
+    """Runs multi-token recurrent steps per sequence across all value heads.
 
-    Running tokens on the outer loop lets all `(seq, head)` contractions
-    execute independently within each token step, hiding MXU latency that
-    otherwise stalls head-outer streaming across consecutive tokens, while
-    still loading and storing through the per-head callbacks so packed state
-    formats can plug in without changing this loop.
+    Uses the two-dot `recurrent_gdn_per_seq` update (`k @ S_updated`, rank-1
+    state update, then `q @ S`) one sequence at a time so peak live state stays
+    O(num_v_heads) instead of O(seq_tile_size * num_v_heads) while keeping
+    verify outputs numerically identical to `recurrent_gdn_per_seq`.
 
     Args:
         steps: Precomputed per-token recurrent inputs.
@@ -570,48 +574,46 @@ def _run_multi_token_recurrent(
     Returns:
         Stacked outputs `[seq, chunk_size, num_v_heads, v_head_dim]`.
     """
-    if state_prev is not None:
-        state = state_prev
-    else:
-        state = jnp.stack(
-            [
-                jnp.stack([load_head(s, v) for v in range(cfg.num_v_heads)], axis=0)
-                for s in range(cfg.seq_tile_size)
-            ],
-            axis=0,
-        )
-    batch_dot_dims = (((3,), (2,)), ((0, 1), (0, 1)))
+    seq_dot_dims = (((2,), (1,)), ((0,), (0,)))
     ckpt_base = cfg.chunk_size - cfg.window_size
-    out_list: list[jax.Array] = []
-    for c_idx, step in enumerate(steps):
-        state_updated = state * step.gating
-        kq_merged = jnp.repeat(step.kq, cfg.v_per_kq_head, axis=1)
-        kq_proj = jax.lax.dot_general(
-            kq_merged,
-            state_updated,
-            dimension_numbers=batch_dot_dims,
-            preferred_element_type=jnp.float32,
-        ).astype(cfg.dtypes.compute)
-        v_updated = kq_proj[:, :, :1, :]
-        out_decayed = kq_proj[:, :, 1:, :]
-        v_new = step.beta * (step.v - v_updated)
-        qk_dot = jnp.repeat(step.qk_dot, cfg.v_per_kq_head, axis=1)
-        out = (
-            out_decayed.astype(jnp.float32) + qk_dot * v_new.astype(jnp.float32)
-        ).astype(cfg.dtypes.compute)
-        k_curr_t = jnp.repeat(
-            fused_transpose_broadcast(step.k, src_dim=3, dst_dim=2),
-            cfg.v_per_kq_head,
-            axis=1,
+    out_per_seq: list[jax.Array] = []
+    for s in range(cfg.seq_tile_size):
+        state_s = (
+            state_prev[s]
+            if state_prev is not None
+            else jnp.stack([load_head(s, v) for v in range(cfg.num_v_heads)], axis=0)
         )
-        state = state_updated + k_curr_t * v_new
-        out_list.append(out[:, :, 0, :])
-        if c_idx >= ckpt_base:
-            w_idx = c_idx - ckpt_base
-            for s in range(cfg.seq_tile_size):
+        seq_out_list: list[jax.Array] = []
+        for c_idx, step in enumerate(steps):
+            state_updated = state_s * step.gating[s]
+            k_curr = jnp.repeat(step.k[s], cfg.v_per_kq_head, axis=0)
+            v_updated = jax.lax.dot_general(
+                k_curr,
+                state_updated,
+                dimension_numbers=seq_dot_dims,
+                preferred_element_type=jnp.float32,
+            ).astype(cfg.dtypes.compute)
+            v_new = step.beta[s] * (step.v[s] - v_updated)
+            k_curr_t = jnp.repeat(
+                fused_transpose_broadcast(step.k[s : s + 1], src_dim=3, dst_dim=2)[0],
+                cfg.v_per_kq_head,
+                axis=0,
+            )
+            state_s = state_updated + k_curr_t * v_new
+            q_curr = jnp.repeat(step.q[s], cfg.v_per_kq_head, axis=0)
+            out_s = jax.lax.dot_general(
+                q_curr,
+                state_s,
+                dimension_numbers=seq_dot_dims,
+                preferred_element_type=jnp.float32,
+            ).astype(cfg.dtypes.compute)
+            seq_out_list.append(out_s[:, 0, :])
+            if c_idx >= ckpt_base:
+                w_idx = c_idx - ckpt_base
                 for v in range(cfg.num_v_heads):
-                    store_ckpt(s, v, w_idx, state[s, v])
-    return jnp.stack(out_list, axis=1)
+                    store_ckpt(s, v, w_idx, state_s[v])
+        out_per_seq.append(jnp.stack(seq_out_list, axis=0))
+    return jnp.stack(out_per_seq, axis=0)
 
 
 @overload
@@ -699,8 +701,9 @@ def recurrent_gdn(
 
     Returns:
         `(out, states)` when `state_prev` is provided (with `states` shaped
-        `[seq, window_size, num_v_heads, kq_head_dim, v_head_dim]`), or
-        `(out, None)` when streaming via callbacks.
+        `[seq, window_size, num_v_heads, kq_head_dim, v_head_dim]`; positions
+        `>= real_sizes` repeat the last valid state and are never written back
+        to HBM), or `(out, None)` when streaming via callbacks.
     """
     if sub_block_heads <= 0:
         raise ValueError(f"sub_block_heads must be positive; got {sub_block_heads}")

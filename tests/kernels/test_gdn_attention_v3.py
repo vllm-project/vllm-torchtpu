@@ -881,7 +881,7 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
     """CPU checks for single-token decode [k, q] projection fusion."""
 
     def test_recurrent_gdn_fused_qk_decode_contraction(self):
-        """Decode recurrence fuses [k, q] state contractions into one dot_general."""
+        """Decode recurrence fuses [k, q] state contractions per streamed head pair."""
         seq_tile = 4
         n_kq, n_v, d_k, d_v = 2, 8, 128, 128
         dim = 2 * n_kq * d_k + n_v * d_v
@@ -1238,37 +1238,17 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
                 )
         with self.assertRaisesRegex(ValueError, "load_head_fn"):
             compute_gdn.recurrent_gdn(rs_arr, z, z, z, z, z, None, w, w, cfg)
+
+        def loader(s, v):
+            return st[s, v]
+
         with self.assertRaisesRegex(ValueError, "load_head_fn"):
-            compute_gdn.recurrent_gdn(
-                rs_arr,
-                z,
-                z,
-                z,
-                z,
-                z,
-                None,
-                w,
-                w,
-                cfg,
-                load_head_fn=lambda s, v: st[
-                    s, v
-                ],  # pyrefly: ignore[no-matching-overload]
+            compute_gdn.recurrent_gdn(  # pyrefly: ignore[no-matching-overload]
+                rs_arr, z, z, z, z, z, None, w, w, cfg, load_head_fn=loader
             )
         with self.assertRaisesRegex(ValueError, "cannot be combined with state_prev"):
-            compute_gdn.recurrent_gdn(
-                rs_arr,
-                z,
-                z,
-                z,
-                z,
-                z,
-                st,
-                w,
-                w,
-                cfg,
-                load_head_fn=lambda s, v: st[
-                    s, v
-                ],  # pyrefly: ignore[no-matching-overload]
+            compute_gdn.recurrent_gdn(  # pyrefly: ignore[no-matching-overload]
+                rs_arr, z, z, z, z, z, st, w, w, cfg, load_head_fn=loader
             )
         cfg_bad_win = config.GDNConfig(
             mode=config.GDNMode.PER_SEQ,
@@ -2699,22 +2679,32 @@ class GDNAttentionTest(parameterized.TestCase):
         np.testing.assert_allclose(rec_out[1], rec_ref[1], rtol=3e-2, atol=3e-2)
 
     def test_streamed_recurrent_gdn_nan_init_carry_and_odd_heads(self):
-        """Tests NaN stale masking, tile carry, and odd n_v in streamed GDN."""
+        """Tests live-VMEM NaN masking, tile carry, and odd n_v in streamed GDN."""
         rng = np.random.default_rng(113)
         n_kq, n_v, d_k, d_v, kernel_size = 1, 5, 128, 128, 4
         dim = (2 * n_kq + n_v) * d_k
-        # Seq 0: 1-token fresh decode (NaN-poisoned stale slot).
-        # Seq 1: 3-token fresh prefill at mixed_tile_size=1 (exercises carry_ref).
-        lengths = [1, 3]
+        # With decode_tile_size=1 and 2-slot double buffering:
+        # - Seq 0 (tile 0, VMEM slot 0): has_initial_state=True reads NaNs from HBM
+        #   into VMEM slot 0 so live NaN bits sit in VMEM.
+        # - Seq 1 (tile 1, VMEM slot 1): has_initial_state=True reads finite state.
+        # - Seq 2 (tile 2, VMEM slot 0): has_initial_state=False skips DMA and
+        #   reuses VMEM slot 0, so the kernel must mask the live NaNs in VMEM.
+        # - Seq 3 (PER_SEQ, 3 tokens at mixed_tile_size=1): exercises carry_ref.
+        lengths = [1, 1, 1, 3]
         tok = sum(lengths)
         qkv = jnp.asarray(rng.standard_normal((tok, dim)), jnp.bfloat16)
         b = jnp.asarray(rng.standard_normal((tok, n_v)), jnp.bfloat16)
         a = jnp.asarray(rng.standard_normal((tok, n_v)), jnp.bfloat16)
-        conv_init = jnp.zeros((3, kernel_size - 1, dim), jnp.float32)
-        rec_ref_init = jnp.zeros((3, n_v, d_k, d_v), jnp.float32)
-        # Poison stale slots 1 and 2 with NaN; seq_lens == query_lens so
-        # has_initial_state is False for both sequences.
-        rec_poison = jnp.full((3, n_v, d_k, d_v), jnp.nan, jnp.float32)
+        conv_init = jnp.zeros((5, kernel_size - 1, dim), jnp.float32)
+        finite_state = jnp.asarray(rng.standard_normal((n_v, d_k, d_v)), jnp.float32)
+        rec_ref_init = (
+            jnp.zeros((5, n_v, d_k, d_v), jnp.float32).at[2].set(finite_state)
+        )
+        # Slot 1 holds NaNs (DMA'd into VMEM slot 0 by Seq 0); slots 3 & 4 also
+        # hold NaNs as stale HBM slots for fresh Seqs 2 & 3.
+        rec_poison = (
+            jnp.full((5, n_v, d_k, d_v), jnp.nan, jnp.float32).at[2].set(finite_state)
+        )
         conv_w = jnp.asarray(rng.standard_normal((dim, 1, kernel_size)), jnp.float32)
         conv_b = jnp.asarray(rng.standard_normal((dim,)), jnp.float32)
         a_log = jnp.asarray(rng.uniform(0.0, 1.0, (n_v,)), jnp.float32)
@@ -2727,10 +2717,10 @@ class GDNAttentionTest(parameterized.TestCase):
             conv_bias=conv_b,
             a_log=a_log,
             dt_bias=dt_bias,
-            query_start_loc=jnp.array([0, 1, tok], dtype=jnp.int32),
-            state_indices=jnp.array([1, 2], dtype=jnp.int32),
-            distribution=jnp.array([1, 2, 2], dtype=jnp.int32),
-            seq_lens=jnp.array(lengths, dtype=jnp.int32),
+            query_start_loc=jnp.array([0, 1, 2, 3, tok], dtype=jnp.int32),
+            state_indices=jnp.array([1, 2, 3, 4], dtype=jnp.int32),
+            distribution=jnp.array([3, 4, 4], dtype=jnp.int32),
+            seq_lens=jnp.array([5, 5, 1, 3], dtype=jnp.int32),
             n_kq=n_kq,
             n_v=n_v,
             d_k=d_k,
@@ -2742,11 +2732,14 @@ class GDNAttentionTest(parameterized.TestCase):
         )
         (conv_out, rec_out), out = wrapper.fused_conv1d_gdn(
             states=(conv_init.copy(), rec_poison.copy()),
+            decode_tile_size=1,
             mixed_tile_size=1,
             **common,
         )
-        self.assertTrue(bool(jnp.all(jnp.isfinite(out))))
-        self.assertTrue(bool(jnp.all(jnp.isfinite(rec_out[1:]))))
-        np.testing.assert_allclose(out, out_ref, rtol=2e-2, atol=2e-2)
-        np.testing.assert_allclose(conv_out[1:], conv_ref[1:], rtol=2e-2, atol=2e-2)
-        np.testing.assert_allclose(rec_out[1:], rec_ref[1:], rtol=3e-2, atol=3e-2)
+        # Seq 0 intentionally consumed NaN initial state; Seqs 1, 2, 3 must be
+        # finite and match reference (proving Seq 2 masked VMEM slot 0's NaNs).
+        self.assertTrue(bool(jnp.all(jnp.isfinite(out[1:]))))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(rec_out[2:]))))
+        np.testing.assert_allclose(out[1:], out_ref[1:], rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(conv_out[2:], conv_ref[2:], rtol=2e-2, atol=2e-2)
+        np.testing.assert_allclose(rec_out[2:], rec_ref[2:], rtol=3e-2, atol=3e-2)
