@@ -474,11 +474,14 @@ def _kernel(
             def finish_words():
                 """`finish` of the blocks' states."""
                 outs = [acc * (1.0 / jnp.maximum(d, 1.0)) for _, _, d, acc in state]
-                put(jnp.concatenate(outs, axis=0))
-                lse = [
-                    _lane_row(m * _LN_2 + jnp.log(d), r.start, num_heads * block_q)
-                    for r, m, d, _ in state
-                ]
+                out = jnp.concatenate(outs, axis=0)
+                lses = [(r, m * _LN_2 + jnp.log(d)) for r, m, d, _ in state]
+                if pair_rank_ref is not None:
+                    # m and l may be lane-replicated: lane 0 is each row's lse.
+                    write(out, jnp.concatenate([x[:, :1] for _, x in lses], axis=0))
+                    return
+                put(out)
+                lse = [_lane_row(x, r.start, num_heads * block_q) for r, x in lses]
                 lse_ref[...] = functools.reduce(jnp.maximum, lse).reshape(lse_ref.shape)
 
             if single:
