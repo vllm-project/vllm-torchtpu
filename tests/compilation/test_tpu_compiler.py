@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import importlib
+import importlib.util
 import os
 import re
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -31,6 +34,53 @@ from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
 @pytest.fixture
 def group_stand_ins(monkeypatch):
     return install_group_stand_ins(monkeypatch)
+
+
+def _install_fake_backend(monkeypatch):
+    """Swap `_tpu_backend` and `_deserialize_entry` as a matched pair."""
+    import threading
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    compiled = []
+    replayed = []
+    state = {"serializable": True}
+    local_tag = threading.local()
+
+    class Compiled:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def __call__(self, *args):
+            return (self.tag,)
+
+        def serialize(self):
+            return f"entry-from-rank-{self.tag}"
+
+    def set_tag(tag):
+        local_tag.value = tag
+
+    def backend(graph, example_inputs):
+        tag = getattr(local_tag, "value", 0)
+        compiled.append(tag)
+        if not state["serializable"]:
+            return lambda *args: (tag,)
+        return Compiled(tag)
+
+    def deserialize(entry):
+        replayed.append(entry)
+        return lambda *args: (entry,)
+
+    monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", deserialize)
+    return SimpleNamespace(
+        compiled=compiled, replayed=replayed, state=state, set_tag=set_tag
+    )
+
+
+@pytest.fixture
+def fake_backend(monkeypatch):
+    return _install_fake_backend(monkeypatch)
 
 
 class TestTpuCompilerCache:
@@ -308,6 +358,7 @@ class TestTpuCompilerCache:
         }
         assert {
             "vllm_torchtpu/gdn_pool_layout.py",
+            "vllm_torchtpu/kv_cache_spec_normalizer.py",
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
@@ -648,6 +699,190 @@ class TestTpuCompilerCache:
             is None
         )
 
+    @staticmethod
+    @contextlib.contextmanager
+    def _capture_vllm_info():
+        import logging
+
+        import vllm.logger  # noqa: F401
+
+        messages: list[str] = []
+        handler = logging.Handler(logging.INFO)
+        handler.emit = lambda record: messages.append(record.getMessage())
+        vllm_logger = logging.getLogger("vllm")
+        old_level = vllm_logger.level
+        old_disable = logging.root.manager.disable
+        vllm_logger.addHandler(handler)
+        if vllm_logger.level == logging.NOTSET or vllm_logger.level > logging.INFO:
+            vllm_logger.setLevel(logging.INFO)
+        logging.disable(logging.NOTSET)
+        try:
+            yield messages
+        finally:
+            vllm_logger.removeHandler(handler)
+            vllm_logger.setLevel(old_level)
+            logging.disable(old_disable)
+
+    @pytest.mark.parametrize(
+        ("init_cache", "disable_cache", "key"),
+        [
+            (False, False, "bucket_1"),
+            (True, False, None),
+            (True, True, "bucket_1"),
+        ],
+    )
+    def test_compile_without_cache_skips_saving(
+        self, tmp_path, fake_backend, init_cache, disable_cache, key
+    ):
+        """`compile` returns a runnable and `handle=None` without writing to disk
+        before `initialize_cache`, when `key=None`, and when `disable_cache=True`."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        fake_backend.set_tag("compiled")
+        graph = torch.fx.symbolic_trace(lambda x: x + 1)
+        cache_dir = tmp_path / "cache"
+
+        c = TpuCompilerAdaptor()
+        if init_cache:
+            c.initialize_cache(cache_dir=str(cache_dir), disable_cache=disable_cache)
+        fn, handle = c.compile(graph, [], {}, Range(start=1, end=1), key=key)
+
+        assert handle is None
+        assert fn() == "compiled"
+        assert not cache_dir.exists()
+        assert fake_backend.compiled == ["compiled"]
+
+    def test_compile_logs_and_skips_saving_when_unserializable(
+        self, tmp_path, fake_backend
+    ):
+        """When `compile` has an active cache and the backend output has no
+        `serialize`, `handle` is `None`, no artifact is written, and the log
+        names the artifact path."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        fake_backend.set_tag("compiled")
+        fake_backend.state["serializable"] = False
+        cache_dir = tmp_path / "cache"
+        artifact = cache_dir / "bucket_1"
+        c = TpuCompilerAdaptor()
+        c.initialize_cache(cache_dir=str(cache_dir))
+        graph = torch.fx.symbolic_trace(lambda x: x + 1)
+
+        with self._capture_vllm_info() as messages:
+            fn, handle = c.compile(graph, [], {}, Range(start=1, end=1), key="bucket_1")
+
+        assert handle is None
+        assert fn() == "compiled"
+        assert not artifact.exists()
+        assert any(
+            f"[TpuCompilerAdaptor] No serializable artifact for {artifact}; it "
+            "will be recompiled on the next start" in m
+            for m in messages
+        )
+
+    def test_load_self_heal_overwrites_stale_artifact(self, tmp_path, fake_backend):
+        """When `load` encounters an unreadable artifact, it recompiles,
+        overwrites the file so the next `load` replays from disk, and runs the
+        artifact it just saved rather than the in-process result."""
+        import pickle
+
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            TpuCompilationHandle,
+            TpuCompilerAdaptor,
+        )
+
+        fake_backend.set_tag("compiled")
+        c = TpuCompilerAdaptor()
+        c.initialize_cache(cache_dir=str(tmp_path / "cache"))
+        stale = tmp_path / "cache" / "stale_bucket"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"corrupt")
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+
+        healed = c.load(
+            ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
+        )
+        assert fake_backend.compiled == ["compiled"]
+        assert fake_backend.replayed == ["entry-from-rank-compiled"]
+        assert healed() == "entry-from-rank-compiled"
+        with open(stale, "rb") as f:
+            saved = pickle.load(f)
+        assert isinstance(saved, TpuCompilationHandle)
+        assert saved.entry == "entry-from-rank-compiled"
+
+        warm = c.load(
+            ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
+        )
+        assert fake_backend.compiled == ["compiled"]
+        assert fake_backend.replayed == ["entry-from-rank-compiled"] * 2
+        assert warm() == "entry-from-rank-compiled"
+
+    def test_load_with_disabled_cache_keeps_stale_file(self, tmp_path, fake_backend):
+        """When `disable_cache=True`, `load` recompiles an unreadable artifact
+        without overwriting the stale file."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        fake_backend.set_tag("compiled")
+        c = TpuCompilerAdaptor()
+        c.initialize_cache(cache_dir=str(tmp_path / "cache"), disable_cache=True)
+        stale = tmp_path / "cache" / "stale_bucket"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"corrupt")
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+
+        fn = c.load(
+            ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
+        )
+
+        assert fake_backend.compiled == ["compiled"]
+        assert fake_backend.replayed == []
+        assert fn() == "compiled"
+        assert stale.read_bytes() == b"corrupt"
+
+    def test_load_self_heal_logs_and_keeps_stale_file_when_unserializable(
+        self, tmp_path, fake_backend
+    ):
+        """When `load` recompiles a stale artifact whose backend output has no
+        `serialize`, it leaves the stale file untouched and logs the path."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        fake_backend.set_tag("compiled")
+        fake_backend.state["serializable"] = False
+        c = TpuCompilerAdaptor()
+        c.initialize_cache(cache_dir=str(tmp_path / "cache"))
+        stale = tmp_path / "cache" / "stale_bucket"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"corrupt")
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+
+        with self._capture_vllm_info() as messages:
+            fn = c.load(
+                ("stale_bucket", str(stale), True), graph, [], 0, Range(start=2, end=2)
+            )
+
+        assert fn() == "compiled"
+        assert stale.read_bytes() == b"corrupt"
+        assert any(
+            f"[TpuCompilerAdaptor] No serializable artifact for {stale}; it "
+            "will be recompiled on the next start" in m
+            for m in messages
+        )
+
     def test_compiler_initialize_cache(self):
         """Verify that TpuCompilerAdaptor sets cache_dir accurately."""
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
@@ -668,24 +903,198 @@ class TestTpuCompilerCache:
         )
         assert "vllm_torchtpu/omni/rope.py" in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
 
-    def test_run_backend_restarts_scheduling_group_ids(self, monkeypatch):
-        """A bucket's HLO, and so its cache key, must not depend on what the
-        rank compiled before it."""
+    @staticmethod
+    def _first_ids_per_compile(monkeypatch, *reservers, compiles=2, count=3):
+        """Compile `compiles` programs with a stub backend; in each, every
+        reserver asks for `count` scheduling group ids. Returns, per program,
+        the first id each reserver got."""
         from vllm_torchtpu.compilation import tpu_compiler
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
-        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
 
         firsts = []
 
         def fake_backend(graph, example_inputs):
-            firsts.append(config.reserve_scheduling_group_ids(3))
+            firsts.append(tuple(reserve(count) for reserve in reservers))
             return lambda *args: args
 
         monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
         compiler = TpuCompilerAdaptor()
-        compiler._run_backend(None, [])
-        compiler._run_backend(None, [])
-        assert firsts == [1, 1]
+        for _ in range(compiles):
+            compiler._run_backend(None, [])
+        return firsts
+
+    def test_run_backend_restarts_scheduling_group_ids(self, monkeypatch):
+        """A bucket's HLO, and so its cache key, must not depend on what the
+        rank compiled before it."""
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        # As if this process had already traced other programs.
+        config.reserve_scheduling_group_ids(5)
+        firsts = self._first_ids_per_compile(
+            monkeypatch, config.reserve_scheduling_group_ids
+        )
+        assert firsts == [(1,), (1,)]
+
+    def test_kernels_share_one_scheduling_group_counter(self, monkeypatch):
+        """Two kernels in one program (say the reference kernel and a
+        per-model copy) get disjoint ids, and every program starts at 1."""
+        from vllm_torchtpu.kernels import scheduling_groups
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        scheduling_groups.reserve_scheduling_group_ids(5)
+        firsts = self._first_ids_per_compile(
+            monkeypatch,
+            config.reserve_scheduling_group_ids,
+            scheduling_groups.reserve_scheduling_group_ids,
+        )
+        assert firsts == [(1, 4), (1, 4)]
+
+    def test_streamindex_config_reexports_shared_scheduling_groups(self, monkeypatch):
+        """The reference config hands out ids, slots included, from the shared
+        module, so a copy importing either gets one fallback slot table."""
+        from vllm_torchtpu.kernels import scheduling_groups
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        for name in (
+            "reserve_scheduling_group_ids",
+            "reset_scheduling_group_ids",
+            "slot_scheduling_group_ids",
+            "layer_scheduling_group_slot",
+            "SLOT_ID_BASE",
+            "MAX_IDS_PER_SLOT",
+            "MAX_SCHEDULING_GROUP_SLOT",
+        ):
+            assert getattr(config, name) is getattr(scheduling_groups, name), name
+        assert not hasattr(config, "_fallback_slots")
+
+        monkeypatch.setattr(scheduling_groups, "_fallback_slots", {})
+        first = config.layer_scheduling_group_slot("model.mtp.indexer")
+        second = scheduling_groups.layer_scheduling_group_slot("model.norm.indexer")
+        assert second == first + 1
+        assert scheduling_groups._fallback_slots == {
+            "model.mtp.indexer": first,
+            "model.norm.indexer": second,
+        }
+
+    def test_only_scheduling_groups_defines_id_allocators(self):
+        """Every kernel takes scheduling-group ids from `scheduling_groups`.
+
+        A module that defines its own allocator (say a per-model copy of
+        `streamindex_topk/config.py`) keeps a counter or slot table the
+        compiler never resets, so its ids collide with the shared ones and
+        depend on compile order again. Re-exporting the shared names is fine.
+        """
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        source_root = Path(tpu_compiler.__file__).resolve().parents[2]
+        allocator_def = re.compile(
+            r"^\s*def\s+(reserve_scheduling_group_ids|reset_scheduling_group_ids"
+            r"|slot_scheduling_group_ids|layer_scheduling_group_slot)\b",
+            re.MULTILINE,
+        )
+        definers = {
+            path.relative_to(source_root).as_posix(): sorted(
+                set(allocator_def.findall(path.read_text()))
+            )
+            for path in (source_root / "vllm_torchtpu").rglob("*.py")
+            if allocator_def.search(path.read_text())
+        }
+        assert definers == {
+            "vllm_torchtpu/kernels/scheduling_groups.py": [
+                "layer_scheduling_group_slot",
+                "reserve_scheduling_group_ids",
+                "reset_scheduling_group_ids",
+                "slot_scheduling_group_ids",
+            ]
+        }
+
+    def test_runtime_hash_covers_model_kernel_dirs(self, tmp_path, monkeypatch):
+        """Adding or editing a file in any `models/**/kernels/` or
+        `models/**/ops/` directory changes the compile cache key; a model
+        without one is a no-op. In kernel-iteration mode only the hot-reloaded
+        module drops out."""
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        repo_root = tmp_path.resolve()
+        package = repo_root / "vllm_torchtpu"
+        (package / "compilation").mkdir(parents=True)
+        (package / "kernels").mkdir()
+        (package / "kernels" / "reference.py").write_text("REF = 1\n")
+        (package / "models" / "plain_model").mkdir(parents=True)
+        (package / "models" / "plain_model" / "model.py").write_text("M = 1\n")
+        # A plain file named like a discovered directory is not a package.
+        (package / "models" / "plain_model" / "ops").write_text("not python\n")
+        # compute_tpu_compilation_hash finds the source root from __file__.
+        monkeypatch.setattr(
+            tpu_compiler,
+            "__file__",
+            str(package / "compilation" / "tpu_compiler.py"),
+        )
+
+        def hashed_relpaths():
+            return [
+                path.relative_to(repo_root).as_posix()
+                for path in tpu_compiler._iter_runtime_cache_key_files(repo_root)
+            ]
+
+        def cache_key():
+            return tpu_compiler.compute_tpu_compilation_hash(self._config())
+
+        keys = [cache_key()]
+        assert not [p for p in hashed_relpaths() if "/models/" in p]
+
+        nested = package / "models" / "vllm" / "fake_model" / "kernels" / "topk"
+        nested.mkdir(parents=True)
+        (nested / "config.py").write_text("TOP_K = 512\n")
+        keys.append(cache_key())
+
+        (nested / "config.py").write_text("TOP_K = 256\n")
+        keys.append(cache_key())
+
+        flat = package / "models" / "flat_model" / "kernels"
+        flat.mkdir(parents=True)
+        (flat / "kernel.py").write_text("K = 1\n")
+        keys.append(cache_key())
+
+        ops = package / "models" / "vllm" / "fake_model" / "ops"
+        ops.mkdir(parents=True)
+        (ops / "topk_op.py").write_text("OP = 1\n")
+        keys.append(cache_key())
+
+        assert len(set(keys)) == len(keys)
+        relpaths = hashed_relpaths()
+        assert relpaths == sorted(relpaths)
+        model_files = {
+            "vllm_torchtpu/models/flat_model/kernels/kernel.py",
+            "vllm_torchtpu/models/vllm/fake_model/kernels/topk/config.py",
+            "vllm_torchtpu/models/vllm/fake_model/ops/topk_op.py",
+        }
+        assert model_files <= set(relpaths)
+        assert "vllm_torchtpu/models/plain_model/model.py" not in relpaths
+        assert "vllm_torchtpu/models/plain_model/ops" not in relpaths
+
+        # Kernel-iteration mode: the module listed for hot reload leaves the
+        # key, every other discovered file stays.
+        reloaded = "vllm_torchtpu.models.vllm.fake_model.kernels.topk.config"
+        monkeypatch.setenv("TPU_KERNEL_ITER_MODE", "1")
+        monkeypatch.setenv("TPU_KERNEL_RELOAD_MODULES", reloaded)
+        real_find_spec = importlib.util.find_spec
+
+        def find_spec(name, *args, **kwargs):
+            if name != reloaded:
+                return real_find_spec(name, *args, **kwargs)
+            return SimpleNamespace(
+                origin=str(repo_root / (name.replace(".", "/") + ".py"))
+            )
+
+        monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+        iter_relpaths = hashed_relpaths()
+        assert set(relpaths) - set(iter_relpaths) == {
+            "vllm_torchtpu/models/vllm/fake_model/kernels/topk/config.py"
+        }
+        assert model_files - set(iter_relpaths) == {
+            "vllm_torchtpu/models/vllm/fake_model/kernels/topk/config.py"
+        }
 
     @staticmethod
     def _peer_compilers(tmp_path, monkeypatch, n=2, peer_replay="1"):
@@ -702,17 +1111,7 @@ class TestTpuCompilerCache:
             monkeypatch.delenv("TPU_PRECOMPILE_PEER_REPLAY", raising=False)
         else:
             monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", peer_replay)
-        compiled, replayed = [], []
-
-        class Compiled:
-            def __init__(self, rank):
-                self.rank = rank
-
-            def __call__(self, *args):
-                return (self.rank,)
-
-            def serialize(self):
-                return f"entry-from-rank-{self.rank}"
+        fb = _install_fake_backend(monkeypatch)
 
         def compilers():
             for rank in range(n):
@@ -723,29 +1122,17 @@ class TestTpuCompilerCache:
                 compiler.rank = rank
                 yield compiler
 
-        current = {}
-
-        def fake_backend(graph, example_inputs):
-            compiled.append(current["rank"])
-            return Compiled(current["rank"])
-
-        def fake_deserialize(entry):
-            replayed.append(entry)
-            return lambda *args: (entry,)
-
-        monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
-        monkeypatch.setattr(tpu_compiler, "_deserialize_entry", fake_deserialize)
         monkeypatch.setattr(tpu_compiler, "_PEER_POLL_S", 0.01)
 
         def compile(compiler, graph=None):
-            current["rank"] = compiler.rank
+            fb.set_tag(compiler.rank)
             if graph is None:
                 graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
             return compiler.compile(
                 graph, [], {}, Range(start=1, end=4096), key="artifact_bucket"
             )
 
-        return list(compilers()), compile, compiled, replayed
+        return list(compilers()), compile, fb.compiled, fb.replayed
 
     def test_a_peer_artifact_is_replayed_instead_of_compiled(
         self, tmp_path, monkeypatch
@@ -759,13 +1146,112 @@ class TestTpuCompilerCache:
         fn, handle = compile(b)
 
         assert compiled == [0]
-        assert replayed == ["entry-from-rank-0"]
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-0"]
         assert fn() == "entry-from-rank-0"
         key, path, _ = handle
         assert path == os.path.join(b.cache_dir, key)
         assert os.path.samefile(path, os.path.join(a.cache_dir, key))
         assert sorted(os.listdir(tmp_path / "hash")) == ["rank_0_0", "rank_1_0"]
         assert os.listdir(b.cache_dir) == [key]
+
+    def test_a_compiled_bucket_runs_from_its_saved_artifact(
+        self, tmp_path, monkeypatch
+    ):
+        """The compiling rank runs the runnable rebuilt from the artifact it
+        saved, as replaying ranks and warm starts do, and drops the in-process
+        compile result, whose device tensors would otherwise count against
+        the KV budget."""
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        built = []
+        real_backend = tpu_compiler._tpu_backend
+
+        def backend(graph, example_inputs):
+            result = real_backend(graph, example_inputs)
+            built.append(weakref.ref(result))
+            return result
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
+        assert handle is not None
+        assert built[0]() is None
+
+    def test_a_stale_artifact_recompiled_in_load_runs_from_the_new_one(
+        self, tmp_path, monkeypatch
+    ):
+        """`load`'s self-heal path also runs the artifact it re-saved, not the
+        in-process result, so a warm start that recompiles a stale artifact
+        holds no extra HBM either."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        _, handle = compile(a)
+        with open(handle[1], "wb") as f:
+            f.write(b"stale")
+
+        built = []
+        real_backend = tpu_compiler._tpu_backend
+
+        def backend(graph, example_inputs):
+            result = real_backend(graph, example_inputs)
+            built.append(weakref.ref(result))
+            return result
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+        fn = a.load(
+            handle,
+            torch.fx.symbolic_trace(lambda x: x * 2 + 1),
+            [],
+            0,
+            Range(start=1, end=4096),
+        )
+
+        assert compiled == [0, 0]
+        assert fn() == "entry-from-rank-0"
+        assert replayed[-1] == "entry-from-rank-0"
+        assert built[0]() is None
+
+    def test_the_in_process_result_is_kept_when_the_reload_fails(
+        self, tmp_path, monkeypatch
+    ):
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        monkeypatch.setattr(TpuCompilerAdaptor, "_replay", lambda *args, **kw: None)
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert fn() == 0
+        assert handle is not None
+
+    def test_nothing_is_reloaded_without_a_saved_artifact(self, tmp_path, monkeypatch):
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        monkeypatch.setattr(TpuCompilerAdaptor, "_save_handle", lambda *a, **k: False)
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert replayed == []
+        assert fn() == 0
+        assert handle is None
 
     def test_a_peer_artifact_of_another_graph_is_not_replayed(
         self, tmp_path, monkeypatch
@@ -781,7 +1267,8 @@ class TestTpuCompilerCache:
         compile(b, torch.fx.symbolic_trace(lambda x: x * 2 + 2))
 
         assert compiled == [0, 1]
-        assert replayed == []
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-1"]
         assert not os.path.samefile(
             os.path.join(a.cache_dir, "artifact_bucket"),
             os.path.join(b.cache_dir, "artifact_bucket"),
@@ -825,7 +1312,8 @@ class TestTpuCompilerCache:
         with wait_for_peer_artifact(0.05):
             compile(b)
         assert compiled == [1]
-        assert replayed == []
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-1"]
 
     def test_a_rank_stops_waiting_when_the_owner_cannot_save(
         self, tmp_path, monkeypatch
@@ -985,7 +1473,8 @@ class TestTpuCompilerCache:
             _, handle = compile(b)
 
         assert compiled == [0, 1]
-        assert replayed == []
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-1"]
         key, path, _ = handle
         assert not os.path.samefile(path, os.path.join(a.cache_dir, key))
         with open(path, "rb") as f:
@@ -1004,7 +1493,8 @@ class TestTpuCompilerCache:
         fn, handle = compile(b, _trace_all_reduce_graph("7"))
 
         assert compiled == [0]
-        assert replayed == ["entry-from-rank-0"]
+        # Each compiling rank also reloads the artifact it saved.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-0"]
         assert fn() == "entry-from-rank-0"
         key, path, _ = handle
         assert a.cache_dir is not None

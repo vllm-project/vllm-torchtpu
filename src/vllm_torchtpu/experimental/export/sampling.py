@@ -21,6 +21,7 @@ from typing import Any
 import torch
 
 from vllm_torchtpu.experimental.export import api, random_sample, tpu_lowering
+from vllm_torchtpu.layers.adapter.sample.repetition_penalty import scale_seen_logits
 
 
 def greedy_tokens(logits: torch.Tensor) -> torch.Tensor:
@@ -138,9 +139,9 @@ def penalized_tokens(
     seen = seen_acc.scatter_add(1, ids, valid.to(torch.float32)) > 0
     counts_acc = torch.zeros((rows, vocab), dtype=torch.float32, device=logits.device)
     counts = counts_acc.scatter_add(1, ids, generated.to(torch.float32))
-    rep = repetition_penalty.to(torch.float32).unsqueeze(-1)
-    repeated = torch.where(logits > 0, logits / rep, logits * rep)
-    logits = torch.where(seen, repeated, logits)
+    logits = scale_seen_logits(
+        logits, seen, repetition_penalty.to(torch.float32).unsqueeze(-1)
+    )
     logits = (
         logits
         - presence_penalty.to(torch.float32).unsqueeze(-1)

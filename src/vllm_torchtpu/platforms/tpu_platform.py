@@ -34,6 +34,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -108,10 +110,11 @@ TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
     256: "4,8,8,2",
 }
 
-# Multi-host TPU slice mesh topologies for TPU v7x / Ironwood, which exposes
-# both cores of a chip as separate devices (8 devices per host). Same meshes
-# as above, addressed by twice as many devices.
+# TPU slice mesh topologies for TPU v7x / Ironwood, which exposes both cores
+# of a chip as separate devices (two devices per chip): one 2x2x1 host
+# (8 devices) plus the multi-host meshes above at twice their device counts.
 TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP = {
+    8: "2,2,1,2",
     16: "2,2,2,2",
     32: "2,2,4,2",
     64: "2,4,4,2",
@@ -217,9 +220,9 @@ _tpu_kv_connectors_registered = False
 
 
 def _configure_torchtpu_eager_mode() -> None:
-    from torch_tpu._internal import execution_mode
+    from torch import tpu
 
-    previous_mode = execution_mode.eager_mode
+    previous_mode = tpu.eager_mode
     # Kernel-iteration mode keeps DEFER_NEVER: DEFER_AND_FUSE fuses the eager
     # region around the split-out Pallas ops into per-context device programs,
     # each of which recompiles after a kernel hot-swap. With DEFER_NEVER the
@@ -229,10 +232,10 @@ def _configure_torchtpu_eager_mode() -> None:
             "TorchTPU eager mode left at %s (TPU_KERNEL_ITER_MODE).", previous_mode.name
         )
         return
-    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
+    tpu.eager_mode = tpu.EagerMode.DEFER_AND_FUSE
     logger.info(
         "TorchTPU eager mode configured: %s (previous=%s)",
-        execution_mode.eager_mode.name,
+        tpu.eager_mode.name,
         previous_mode.name,
     )
 
@@ -470,6 +473,7 @@ class TpuPlatform(Platform):
         "fp8",
         "mxfp4",
         "modelopt_fp4",
+        "modelopt_mixed",
         "deepseek_v4_fp8",
     ]
 
@@ -495,6 +499,7 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
+        "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS",
         "TPU_DP_VOCAB_PARALLEL",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
@@ -509,6 +514,18 @@ class TpuPlatform(Platform):
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
     ]
+
+    @classmethod
+    def pre_register_and_update(
+        cls, parser: "FlexibleArgumentParser | None" = None
+    ) -> None:
+        if parser is not None:
+            # Default EP weight filtering on for CLI entry points (`vllm serve`).
+            # Both model loaders gate on MoE + EP (+ non-EPLB for Run:AI), so
+            # this is a no-op for dense or non-EP runs while letting
+            # --disable-ep-weight-filter / --config YAML opt-outs travel cleanly
+            # through EngineArgs and pickled VllmConfig into spawned children.
+            parser.set_defaults(enable_ep_weight_filter=True)
 
     # The "Platform" base class has import_kernels() that tries to import
     # vllm._C, which is not available in the TPU Platform setup.
@@ -850,6 +867,14 @@ class TpuPlatform(Platform):
                 "nothing. Unset it; the fused expert-parallel MoE kernel is "
                 "USE_MOE_FUSED_EP_KERNEL=1."
             )
+        if "TPU_MOE_TOPK_WEIGHTS_FLOAT32" in os.environ:
+            raise ValueError(
+                "TPU_MOE_TOPK_WEIGHTS_FLOAT32 is no longer supported. Unset it "
+                "and pass --additional-config "
+                "'{\"tpu_moe_topk_weights_float32\": true}' instead."
+            )
+        # Rejects non-bool MoE reference-parity values before any worker starts.
+        get_moe_reference_parity(vllm_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
@@ -908,16 +933,20 @@ class TpuPlatform(Platform):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
         # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
-        if (
-            layout is VllmKVCacheLayout.LBHNC
-            and vllm_config.model_config is not None
-            and vllm_config.model_config.get_head_size() == 64
-        ):
-            raise NotImplementedError(
-                "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
-                "layout, which the head_dim==64 RPA kernel does not "
-                "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
+        # ModelConfig.get_head_size() collapses differing layers with max(), so
+        # also check each layer's typed ModelArchitectureConfig view.
+        if layout is VllmKVCacheLayout.LBHNC and vllm_config.model_config is not None:
+            arch_config = vllm_config.model_config.model_arch_config
+            has_hd64_layer = vllm_config.model_config.get_head_size() == 64 or any(
+                arch_config[i].head_size == 64
+                for i in range(arch_config.total_num_hidden_layers)
             )
+            if has_hd64_layer:
+                raise NotImplementedError(
+                    "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
+                    "layout, which the head_dim==64 RPA kernel does not "
+                    "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
+                )
         kv_cache_layout = get_flashinfer_layout_string(layout)
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
@@ -950,8 +979,11 @@ class TpuPlatform(Platform):
         else:
             compilation_config.mode = CompilationMode.VLLM_COMPILE
 
-        # No graph splitting — TPU handles the full graph including
-        compilation_config.splitting_ops = []
+        # Compile whole graphs by default (TPU handles the full graph), but
+        # keep explicit boundaries a model config hook or the caller declared:
+        # model hooks run before this, in VllmConfig.try_verify_and_update_config.
+        if compilation_config.splitting_ops is None:
+            compilation_config.splitting_ops = []
 
         # Kernel-iteration mode splits the compiled graph at the Pallas RPA
         # custom ops so they execute eagerly outside the compiled pieces.
@@ -961,11 +993,30 @@ class TpuPlatform(Platform):
         # are allocated at model build, so list every id the registry could
         # plausibly allocate (should_split does exact name matching).
         if envs.TPU_KERNEL_ITER_MODE:
-            compilation_config.splitting_ops = [
+            rpa_ops = [
                 f"pallas::{prefix}_{i}"
                 for prefix in ("rpa_kernel", "rpa_kernel_batched")
                 for i in range(64)
             ]
+            declared = set(compilation_config.splitting_ops)
+            compilation_config.splitting_ops.extend(
+                rpa_op for rpa_op in rpa_ops if rpa_op not in declared
+            )
+        else:
+            # The RPA ops donate kv_cache unless TPU_KERNEL_ITER_MODE is set
+            # (layers/adapter/attention.py); run eagerly at a graph boundary,
+            # the donation would kill the buffer the next piece still reads.
+            rpa_boundaries = [
+                op
+                for op in compilation_config.splitting_ops
+                if op.startswith("pallas::rpa_kernel")
+            ]
+            if rpa_boundaries:
+                raise ValueError(
+                    f"compilation_config.splitting_ops splits at RPA kernels "
+                    f"({rpa_boundaries[:2]}...) without TPU_KERNEL_ITER_MODE; "
+                    "set TPU_KERNEL_ITER_MODE=1 or drop those boundaries."
+                )
 
         # Disable inductor-specific fusion passes (only available on CUDA).
         compilation_config.pass_config.fuse_norm_quant = False
@@ -1117,7 +1168,8 @@ class TpuPlatform(Platform):
             )
 
         parallel_config = vllm_config.parallel_config
-        parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
+        if parallel_config.worker_cls == "auto":
+            parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if multihost_backend != "ray" and parallel_config.nnodes > 1:
@@ -1156,8 +1208,9 @@ class TpuPlatform(Platform):
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
                 # single-host DP size for TorchTPU rank/env setup.
-                # TODO: Remove TORCH_TPU_DP_SIZE once TorchTPU physical
-                # chip/PjRt binding no longer depends on torchrun-style
+                # TODO(https://github.com/google-pytorch/torch_tpu/issues/6757):
+                # Remove TORCH_TPU_DP_SIZE once TorchTPU physical chip/PjRt
+                # binding no longer depends on torchrun-style
                 # RANK/LOCAL_RANK/WORLD_SIZE before vLLM distributed init.
                 os.environ["TORCH_TPU_DP_SIZE"] = str(dp_size)
                 os.environ.setdefault(
@@ -1305,6 +1358,32 @@ class TpuPlatform(Platform):
         """
         backends = cls._find_non_ssm_backends(vllm_config)
         return backends[0] if backends else None
+
+    @classmethod
+    def _find_dense_attention_backend(
+        cls, vllm_config: VllmConfig
+    ) -> "type[AttentionBackend] | None":
+        """Backend that lays out the plain `Attention` caches, or None.
+
+        `_find_non_ssm_backend` returns the first backend in layer order. When
+        the target's layers declare an MLA-family backend (e.g. caches that
+        the model owns) and a drafter adds plain `Attention` layers, the
+        drafter's pages would take the MLA geometry. With an fp8 cache, a
+        128-token block becomes a 32-token page, so the RPA kernel indexes the
+        block table at 4x the block count and, past a quarter of
+        max_model_len, beyond the table. A bf16 cache packs two tokens per
+        word, so the page is 64 tokens and the factor is 2x.
+
+        Returns the backend of the first plain `Attention` layer. Without one
+        (e.g. pure MLA, or caches that the model owns), returns
+        `_find_non_ssm_backend`.
+        """
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention import Attention
+
+        for layer in get_layers_from_vllm_config(vllm_config, Attention).values():
+            return layer.get_attn_backend()
+        return cls._find_non_ssm_backend(vllm_config)
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:

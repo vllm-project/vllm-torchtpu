@@ -29,6 +29,35 @@ os.environ.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "fals
 os.environ.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
 
 
+def maybe_run_experimental_rust() -> bool:
+    """Runs rvllm for `serve` when VLLM_TPU_EXPERIMENTAL_USE_RUST is set."""
+    if len(sys.argv) <= 1 or sys.argv[1] != "serve":
+        return False
+    prog = os.path.basename(sys.argv[0])
+    if prog.endswith("-omni"):
+        return False
+
+    from vllm_torchtpu import envs
+
+    if not envs.VLLM_TPU_EXPERIMENTAL_USE_RUST:
+        return False
+
+    import vllm.envs as vllm_envs
+
+    # vLLM's Rust frontend keeps the Python engine; rvllm replaces both.
+    if vllm_envs.VLLM_USE_RUST_FRONTEND:
+        sys.stderr.write(
+            "rvllm: error: VLLM_TPU_EXPERIMENTAL_USE_RUST and "
+            "VLLM_USE_RUST_FRONTEND are both set; set only one\n"
+        )
+        raise SystemExit(2)
+
+    from vllm_torchtpu.experimental.rust.launcher import main as rust_main
+
+    rust_main(sys.argv[1:])
+    return True
+
+
 class _PostExecLoader(importlib.abc.Loader):
     """Wraps a module loader to attach compatibility aliases after execution."""
 
@@ -159,6 +188,60 @@ class _VllmOmniCompatFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
             launchers_pkg_any.cli_args = target
 
 
+class _ExperimentalRustFinder(importlib.abc.MetaPathFinder):
+    """Hooks vLLM CLI startup to delegate `vllm serve` to the Rust runtime.
+
+    Upstream vLLM does not provide a plugin hook or entrypoint for CLI
+    subcommand delegation before argument parsing (R-3.4). We wrap
+    `vllm.entrypoints.common.startup.cli_env_setup`, which is called at the
+    beginning of `vllm.entrypoints.cli.main.main()` before subcommands and
+    arguments are parsed.
+    """
+
+    _STARTUP_MODULE = "vllm.entrypoints.common.startup"
+
+    @classmethod
+    def patch_startup(cls, module: types.ModuleType) -> None:
+        orig = getattr(module, "cli_env_setup", None)
+        if orig is None or getattr(orig, "_experimental_rust_wrapped", False):
+            return
+
+        def _wrapped_cli_env_setup(*args: Any, **kwargs: Any) -> Any:
+            res = orig(*args, **kwargs)
+            if maybe_run_experimental_rust():
+                # The launcher replaces this process. Returning here would
+                # serve with the Python engine instead of rvllm.
+                raise SystemExit("rvllm: error: the launcher returned without exec")
+            return res
+
+        _wrapped_cli_env_setup._experimental_rust_wrapped = True  # type: ignore[attr-defined]
+        module_any: Any = module
+        module_any.cli_env_setup = _wrapped_cli_env_setup
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: Sequence[str] | None,
+        target: types.ModuleType | None = None,
+    ) -> importlib.machinery.ModuleSpec | None:
+        if fullname == self._STARTUP_MODULE:
+            spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+            if spec is not None and spec.loader is not None:
+                spec.loader = _PostExecLoader(spec.loader, self.patch_startup)
+            return spec
+        return None
+
+    @classmethod
+    def apply_to_loaded_modules(cls) -> None:
+        startup = sys.modules.get(cls._STARTUP_MODULE)
+        if startup is not None:
+            cls.patch_startup(startup)
+
+
 if not any(type(f).__name__ == "_VllmOmniCompatFinder" for f in sys.meta_path):
     sys.meta_path.insert(0, _VllmOmniCompatFinder())
 _VllmOmniCompatFinder.apply_to_loaded_modules()
+
+if not any(type(f).__name__ == "_ExperimentalRustFinder" for f in sys.meta_path):
+    sys.meta_path.insert(0, _ExperimentalRustFinder())
+_ExperimentalRustFinder.apply_to_loaded_modules()

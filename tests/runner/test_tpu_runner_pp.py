@@ -23,7 +23,10 @@ from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 
 from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
 from vllm_torchtpu.core.pp_chunks import chunk_buckets, chunk_granularity
-from vllm_torchtpu.distributed.pp_buffered import PPBuffered, hbm_reserve_bytes
+from vllm_torchtpu.distributed.pp_buffered import PPBuffered, _flush, hbm_reserve_bytes
+from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+    _TOPK_ROWS_UPDATE_OP,
+)
 from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -136,6 +139,60 @@ class TestTopkHandoff:
         assert torch.equal(buffer[:16], received)
         # rows this forward does not cover are untouched
         assert torch.equal(buffer[16:], torch.zeros(48, 4, dtype=torch.int32))
+
+    @pytest.mark.parametrize("rows", [64, 16])
+    def test_handed_on_indices_survive_the_next_forward_writing_the_table(
+        self, monkeypatch, rows
+    ):
+        # torch_tpu may satisfy a clone of a view by aliasing the source's
+        # buffer, which the TPU test below shows for a full-table view; CPU
+        # torch always copies, so mimic that for a view that covers its whole
+        # base, and replace fresh_buffer by its TPU branch (`+ 0`). The
+        # handed-on indices must still hold this step's rows after the next
+        # forward rewrites (on TPU: donates) the table.
+        real_clone = torch.Tensor.clone
+
+        def aliasing_clone(self, *args, **kwargs):
+            base = self._base if self._base is not None else self
+            if self.is_contiguous() and self.numel() == base.numel():
+                return self.view(self.shape)
+            return real_clone(self, *args, **kwargs)
+
+        runner, buffer = self._runner_with_buffer()
+        buffer.copy_(torch.arange(buffer.numel(), dtype=torch.int32).view_as(buffer))
+        want = real_clone(buffer[:rows])
+        monkeypatch.setattr(torch.Tensor, "clone", aliasing_clone)
+        monkeypatch.setattr(tpu_runner, "fresh_buffer", lambda t: t + 0)
+
+        out = runner._pp_outgoing_tensors({"hidden_states": torch.zeros(rows, 8)}, rows)
+        buffer.fill_(-1)
+
+        handed = out["topk_indices"]
+        assert (
+            handed.untyped_storage().data_ptr() != buffer.untyped_storage().data_ptr()
+        )
+        assert torch.equal(handed, want)
+
+    @pytest.mark.tpu_test
+    def test_handed_on_indices_survive_the_table_being_donated_on_tpu(self):
+        # The hazard on real hardware: a full-table step hands on the whole
+        # table, and the next forward's row update donates the table's buffer
+        # before the queued send reads the handed-on indices.
+
+        rows, width = 256, 128
+        table = torch.full((rows, width), 3, dtype=torch.int32, device="tpu")
+        runner = _runner(_pp_topk_buffer=table)
+        hidden = torch.zeros(rows, 8, device="tpu")
+
+        out = runner._pp_outgoing_tensors({"hidden_states": hidden}, rows)
+        handed = out["topk_indices"]
+        _flush((handed,))  # as PPBuffered.end_forward does before queueing
+        update = torch.full((rows, width), 9, dtype=torch.int32, device="tpu")
+        table.copy_(_TOPK_ROWS_UPDATE_OP(table, update))
+
+        assert torch.equal(
+            handed.cpu(), torch.full((rows, width), 3, dtype=torch.int32)
+        )
 
     def test_a_stage_handed_no_indices_is_refused(self):
         runner, _ = self._runner_with_buffer()
@@ -354,6 +411,7 @@ class TestBufferedStepPosting:
             _reorder_batch_for_rpa=lambda _so: (0, 0),
             _count_input_chunks=lambda _so: (2, 1),
             _any_decode=lambda _so: False,
+            _dp_local_prompt_logprob_rows=lambda _so: 0,
             _dp_coordinated_step=lambda *_a, **_kw: (None, 2),
             _adaptive_verification=None,
             _readmit_trimmed_drafts=lambda *_a: None,

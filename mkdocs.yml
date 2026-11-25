@@ -73,6 +73,7 @@ nav:
     - 'Disaggregated Serving (P/D)': user_guide/disaggregated_serving.md
     - 'Quantization': user_guide/quantization.md
     - 'Speculative Decoding': user_guide/speculative_decoding.md
+    - 'Thinking Token Budget': user_guide/thinking_budget.md
     - 'Compilation & Warmup Cache': user_guide/compilation_cache.md
     - 'Code Examples':
       - 'Offline Inference': api_and_code_examples/offline_inference.md
@@ -101,6 +102,7 @@ nav:
       - 'Troubleshooting': developers_guide/profiling/troubleshooting.md
   - 'Reference':
     - 'Environment Variables': reference/env_vars.md
+    - 'KV Cache Offloading Metrics': reference/kv_offload_metrics.md
   - 'Roadmap': roadmap.md
 
 validation:

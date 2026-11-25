@@ -35,7 +35,8 @@ upstream class name, so each upstream class that needs the fix gets one entry:
   walking the class hierarchy): ``forward_static`` calls
   ``ApplyRotaryEmb.forward_static`` directly, so the instance flag does not
   reach it. The TPU subclass replays ``forward_static`` with
-  ``enable_fp32_compute=True``.
+  ``enable_fp32_compute=True`` and strips trailing identity ``(cos=1, sin=0)``
+  pairs from NeoX ``cos_sin_cache`` buffers.
 
 ``forward_native`` is overridden as well as ``forward_oot``/``forward_tpu`` so
 the numerics do not depend on ``CompilationConfig.custom_ops`` enabling the op:
@@ -82,6 +83,78 @@ class TpuApplyRotaryEmb(ApplyRotaryEmb):
     forward_tpu = forward_oot  # pyrefly: ignore[bad-override]
 
 
+def _maybe_compact_neox_rope_cache(self: RotaryEmbedding) -> None:
+    """Strip trailing identity ``(cos=1, sin=0)`` angle pairs on NeoX caches."""
+    if not self.is_neox_style or self.rotary_dim <= 0 or self.rotary_dim % 2 != 0:
+        return
+    cache = self._buffers.get("cos_sin_cache")
+    if (
+        cache is None
+        or cache.is_meta
+        or cache.ndim != 2
+        or cache.shape[0] == 0
+        or cache.shape[1] != self.rotary_dim
+    ):
+        return
+
+    half = self.rotary_dim // 2
+    cos_full, sin_full = cache[:, :half], cache[:, half:]
+    # Standard RoPE rotates every pair up to half - 1; exit early without
+    # scanning the full cache when the last angle pair is not identity.
+    if bool((cos_full[:, -1] != 1).any() or (sin_full[:, -1] != 0).any()):
+        return
+
+    active = ((cos_full != 1) | (sin_full != 0)).any(dim=0).nonzero(as_tuple=False)
+    if active.numel() == 0:
+        return
+    rot_angles = int(active[-1].item()) + 1
+
+    compact = torch.cat(
+        (cos_full[:, :rot_angles], sin_full[:, :rot_angles]), dim=-1
+    ).contiguous()
+    self.register_buffer("cos_sin_cache", compact, persistent=False)
+    logger.info_once(
+        "Compacted %s NeoX cos_sin_cache width %d -> %d (active_angles=%d).",
+        type(self).__name__,
+        self.rotary_dim,
+        2 * rot_angles,
+        rot_angles,
+    )
+
+
+def _apply_compact_neox_rope_fp32(
+    x_3d: torch.Tensor,
+    rotary_dim: int,
+    cos_f32: torch.Tensor,
+    sin_f32: torch.Tensor,
+) -> torch.Tensor:
+    """Rotate active leading pairs of each NeoX rotary half-block in FP32.
+
+    Args:
+        x_3d: Input of shape ``[num_tokens, num_heads, head_size]`` with
+            ``rotary_dim <= head_size``.
+        rotary_dim: Width of the NeoX rotary prefix within ``head_size``.
+        cos_f32: FP32 cosines of shape ``[num_tokens, 1, rot_angles]``.
+        sin_f32: FP32 sines of shape ``[num_tokens, 1, rot_angles]``.
+
+    Returns:
+        Tensor matching ``x_3d`` shape and dtype with ``[..., :rot_angles]``
+        and ``[..., half : half + rot_angles]`` (``half = rotary_dim // 2``)
+        rotated in FP32 and ``[..., rot_angles:half]`` /
+        ``[..., half + rot_angles:]`` passed through unchanged.
+    """
+    orig_dtype = x_3d.dtype
+    half = rotary_dim // 2
+    rot_angles = cos_f32.shape[-1]
+    x1_rot = x_3d[..., :rot_angles].to(torch.float32)
+    x1_pass = x_3d[..., rot_angles:half]
+    x2_rot = x_3d[..., half : half + rot_angles].to(torch.float32)
+    x2_pass = x_3d[..., half + rot_angles :]
+    o1_rot = (x1_rot * cos_f32 - x2_rot * sin_f32).to(orig_dtype)
+    o2_rot = (x2_rot * cos_f32 + x1_rot * sin_f32).to(orig_dtype)
+    return torch.cat((o1_rot, x1_pass, o2_rot, x2_pass), dim=-1)
+
+
 def _rotary_forward_fp32(
     self: RotaryEmbedding,
     positions: torch.Tensor,
@@ -99,6 +172,26 @@ def _rotary_forward_fp32(
     num_tokens = positions.shape[0]
     cos_sin = cos_sin_cache.index_select(0, positions)
     cos, sin = cos_sin.chunk(2, dim=-1)
+
+    # `_maybe_compact_neox_rope_cache` narrows `cos_sin_cache` below `rotary_dim`
+    # when trailing NeoX angle pairs are exact `(cos=1, sin=0)`.
+    if self.is_neox_style and cos.shape[-1] < self.rotary_dim // 2:
+        cos_f32 = cos.unsqueeze(1).to(torch.float32)
+        sin_f32 = sin.unsqueeze(1).to(torch.float32)
+        query = _apply_compact_neox_rope_fp32(
+            query.view(num_tokens, -1, self.head_size),
+            self.rotary_dim,
+            cos_f32,
+            sin_f32,
+        ).reshape(query.shape)
+        if key is not None:
+            key = _apply_compact_neox_rope_fp32(
+                key.view(num_tokens, -1, self.head_size),
+                self.rotary_dim,
+                cos_f32,
+                sin_f32,
+            ).reshape(key.shape)
+        return query, key
 
     query_shape = query.shape
     query = query.view(num_tokens, -1, self.head_size)
@@ -168,12 +261,21 @@ def _make_tpu_rope_class(base: type[RotaryEmbedding]) -> type[RotaryEmbedding]:
         f"{base.__name__} defines its own forward_native; it needs its own TPU "
         "override instead of the shared RotaryEmbedding.forward_static replay."
     )
+
+    def _tpu_rope_init(self: RotaryEmbedding, *args, **kwargs) -> None:
+        base.__init__(self, *args, **kwargs)
+        _maybe_compact_neox_rope_cache(self)
+
     tpu_cls = type(
         f"Tpu{base.__name__}",
         (base,),
         {
             "__module__": __name__,
-            "__doc__": f"``{base.__name__}`` rotating in FP32 (CUDA numerics).",
+            "__doc__": (
+                f"``{base.__name__}`` rotating in FP32 (CUDA numerics), "
+                "stripping trailing identity NeoX cos/sin pairs."
+            ),
+            "__init__": _tpu_rope_init,
             "forward_native": _rotary_forward_fp32,
             "forward_oot": _rotary_forward_fp32,
             "forward_tpu": _rotary_forward_fp32,

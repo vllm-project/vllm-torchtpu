@@ -32,9 +32,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from vllm.v1.outputs import LogprobsTensors
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import CachedRequestState
 
 logger = init_logger(__name__)
 
@@ -67,13 +67,10 @@ class PromptLogprobsChunk:
 
 
 def unsupported_reason(
-    *, dp_vocab_logits: bool, selected_logits_hidden_states: bool, lora: bool
+    *, selected_logits_hidden_states: bool, lora: bool
 ) -> str | None:
     """Why the runner cannot compute prompt logprobs, with the fix; None if it
     can."""
-    if dp_vocab_logits:
-        # Every DP engine would have to run the same logits programs.
-        return "TPU_DP_VOCAB_PARALLEL=1 (unset it)"
     if selected_logits_hidden_states:
         # Each rank selects its own logits rows; the prompt rows are not local.
         return (
@@ -83,6 +80,21 @@ def unsupported_reason(
         # The LoRA logits mapping has one adapter slot per request, not per row.
         return "LoRA (serve without --enable-lora)"
     return None
+
+
+def max_logits_calls(num_rows: int, rows_per_call: int, num_chunks: int) -> int:
+    """Upper bound on the logits calls needed to score `num_rows` prompt rows.
+
+    A call scores up to `rows_per_call` rows, all from the same forward chunk,
+    so each chunk's rows are scored separately and each chunk can leave one
+    call partly filled. However the rows split across the `num_chunks`
+    chunks, the count is at most ceil(num_rows / rows_per_call) +
+    num_chunks - 1. For example, 16 rows at 8 per call take 2 calls in one
+    chunk, but 3 if split 9 + 7 across two chunks.
+    """
+    if num_rows == 0:
+        return 0
+    return -(-num_rows // rows_per_call) + num_chunks - 1
 
 
 def plan_chunk(

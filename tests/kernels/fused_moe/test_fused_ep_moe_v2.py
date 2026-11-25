@@ -32,6 +32,8 @@ test's choosing; ``test_the_mesh_axis_name_is_the_one_the_kernel_reads`` pins
 that constraint, which the layer's own signature does not state.
 """
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -215,6 +217,29 @@ def _make_inputs(mesh, seed, *, tokens, hidden, e_total):
         )
 
     return build()
+
+
+def _routed_gating(mesh, seed, *, tokens, e_total, topk, expert_rows):
+    """Gating whose top-k routes `expert_rows[e]` rows to each listed expert
+    and spreads the rest of the tokens * topk routes evenly over the others.
+
+    The routes are laid out column-major over the [tokens, topk] choices, so
+    an expert's contiguous run of at most `tokens` of them lands on distinct
+    tokens. A chosen expert scores ~6 and every other ~0, with noise in both
+    so the router weights still differ.
+    """
+    (axis,) = mesh.axis_names
+    others = [e for e in range(e_total) if e not in expert_rows]
+    rest, extra = divmod(tokens * topk - sum(expert_rows.values()), len(others))
+    counts = dict(expert_rows) | {e: rest + (i < extra) for i, e in enumerate(others)}
+    assert max(counts.values()) <= tokens, counts
+    seq = np.repeat(np.asarray(list(counts)), list(counts.values()))
+    ids = seq.reshape(topk, tokens).T
+    gating = np.random.default_rng(seed).normal(0.0, 0.5, (tokens, e_total))
+    gating[np.arange(tokens)[:, None], ids] += 6.0
+    return jax.device_put(
+        jnp.asarray(gating, jnp.float32), NamedSharding(mesh, P(axis))
+    )
 
 
 def _dense_reference(
@@ -600,6 +625,450 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
     np.testing.assert_array_equal(np.asarray(sharded), np.asarray(replicated))
 
 
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
+@pytest.mark.parametrize(
+    "shape,shared_weights",
+    [
+        pytest.param(dict(SMALL), None, id="small"),
+        # Uniform routing gives every expert a few dozen rows, so each tile of
+        # the 256-row build runs its shortest rung (or, at prod_t16384, the
+        # build has the full height only). These loads put experts on the
+        # 128-, 192- and 256-row rungs too (checked below).
+        pytest.param(
+            dict(SMALL, expert_rows={1: 96, 10: 160, 19: 224}),
+            None,
+            id="small_every_rung",
+        ),
+        # The production weights are 6.4GB, so these shapes run against the
+        # module's one build of them rather than making their own.
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[0]), "production_weights", id="prod_t2048"
+        ),
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[1]), "production_weights", id="prod_t16384"
+        ),
+    ],
+)
+def test_256_row_tiles_track_the_128_row_build(
+    request, sharded_plan, shape, shared_weights
+):
+    """A taller tile changes how rows are grouped, not what each row computes.
+
+    Tiles above 128 rows need the scale mirrors stored at 128 lanes
+    (host.mirror_rows_per_tile); without that no such build compiles. Every
+    row's two matmuls, its scales and its wire quantization are its own, so the layer
+    has to stay inside the fp8 bands of the dense reference at both heights
+    and match the 128-row build exactly. The lowered programs
+    are checked to carry each height's kernel, so the comparison is real.
+
+    A tile shorter than 256 rows stages its scales as whole 128-lane rows and
+    part of the next one, so small_every_rung puts experts on each rung of the
+    256-row build's ladder, and the test checks its loads still do.
+    """
+    mesh = _mesh()
+    if shared_weights is not None:
+        w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
+    else:
+        w1, w2, w1_scale, w2_scale = _make_weights(
+            mesh,
+            80,
+            hidden=shape["hidden"],
+            inter=shape["inter"],
+            e_total=shape["e_total"],
+            weight_format=WeightFormat.FP8,
+        )
+    x, gating = _make_inputs(
+        mesh,
+        81,
+        tokens=shape["tokens"],
+        hidden=shape["hidden"],
+        e_total=shape["e_total"],
+    )
+    if "expert_rows" in shape:
+        gating = _routed_gating(
+            mesh,
+            82,
+            tokens=shape["tokens"],
+            e_total=shape["e_total"],
+            topk=shape["topk"],
+            expert_rows=shape["expert_rows"],
+        )
+        # The 256-row build has its whole ladder at this shape, and some
+        # expert's slab rows (each source's run rounded up to ROWBLK) end on
+        # each rung.
+        rungs = kernel.tile_height_rungs(
+            256,
+            host.ragged_stride_bound(
+                shape["tokens"], shape["topk"], shape["e_total"], 256
+            ),
+            shape["e_total"] // EP,
+            EP,
+        )
+        assert rungs == (64, 128, 192, 256), rungs
+        ids = np.argsort(-np.asarray(gating), axis=1)[:, : shape["topk"]]
+        runs = np.stack(
+            [
+                np.bincount(i.ravel(), minlength=shape["e_total"])
+                for i in np.split(ids, EP)
+            ]
+        )
+        rows = (-(-runs // host.ROWBLK) * host.ROWBLK).sum(axis=0)
+        assert {min(r for r in rungs if r >= n) for n in rows} == set(rungs), rows
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, names = {}, {}
+    for capacity in (128, 256):
+
+        def run(*a, capacity=capacity):
+            return fused_ep_moe_v2(
+                *a,
+                topk=shape["topk"],
+                renormalize=True,
+                mesh=mesh,
+                capacity=capacity,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=sharded_plan,
+            )
+
+        names[capacity] = set(
+            re.findall(
+                r"fused_ep_moe_v2[A-Za-z0-9_]*?_c(\d+)_nb\d+",
+                jax.jit(run).lower(*args).as_text(),
+            )
+        )
+        outs[capacity] = run(*args)
+    assert names == {128: {"128"}, 256: {"256"}}, names
+    want = _dense_reference(
+        mesh, x, w1, w2, w1_scale, w2_scale, gating, topk=shape["topk"]
+    )
+    for capacity, out in outs.items():
+        assert _relative_l2(out, want) < FP8_RELATIVE_BOUND, capacity
+        assert _worst_token_relative_l2(out, want) < FP8_TOKEN_BOUND, capacity
+    # Each row's matmuls accumulate in the same order at both heights, so the
+    # taller tile reproduces the 128-row build bit for bit (measured on v7x at
+    # every shape and plan above).
+    np.testing.assert_array_equal(np.asarray(outs[256]), np.asarray(outs[128]))
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
+@pytest.mark.parametrize(
+    "shape,shared_weights",
+    [
+        pytest.param(dict(SMALL), None, id="small"),
+        # The production weights are 6.4GB, so this shape runs against the
+        # module's one build of them rather than making its own.
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[0]), "production_weights", id="prod_t2048"
+        ),
+    ],
+)
+def test_slab_scatter_set_and_add_are_bit_exact(
+    request, monkeypatch, sharded_plan, shape, shared_weights
+):
+    """The slab tables' scatter form changes how they are built, not the layer.
+
+    The chip picks the form (host.slab_tables_on_tensorcore); forcing each one
+    here runs both on whatever chip this is, so the form this chip does NOT
+    pick is checked as well. Both tables are held on their scatter paths, where
+    the form applies, rather than the sort and the lookup the layer prefers.
+    The two forced builds must lower to different programs, so the agreement is
+    not vacuous: were the form ever dropped from the layer's shard_map cache
+    key, the second build would reuse the first one's body and fail here.
+    """
+    monkeypatch.setattr(layer, "scale_slab_fits", lambda _n: False)
+    monkeypatch.setattr(layer, "token_gather_sort_fits", lambda *_a, **_k: False)
+    mesh = _mesh()
+    if shared_weights is not None:
+        w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
+    else:
+        w1, w2, w1_scale, w2_scale = _make_weights(
+            mesh,
+            40,
+            hidden=shape["hidden"],
+            inter=shape["inter"],
+            e_total=shape["e_total"],
+            weight_format=WeightFormat.FP8,
+        )
+    x, gating = _make_inputs(
+        mesh,
+        41,
+        tokens=shape["tokens"],
+        hidden=shape["hidden"],
+        e_total=shape["e_total"],
+    )
+
+    def make_run():
+        # A fresh function per build: jax.jit caches the trace by function, and
+        # the form is read while tracing, so reusing one `run` would lower the
+        # first build's program again.
+        def run(*args):
+            return fused_ep_moe_v2(
+                *args,
+                topk=shape["topk"],
+                renormalize=True,
+                mesh=mesh,
+                capacity=CAPACITY,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=sharded_plan,
+            )
+
+        return run
+
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, programs = {}, {}
+    for by_set in (False, True):
+        monkeypatch.setattr(
+            layer, "slab_tables_on_tensorcore", lambda by_set=by_set: by_set
+        )
+        run = make_run()
+        programs[by_set] = jax.jit(run).lower(*args).as_text()
+        outs[by_set] = np.asarray(run(*args))
+    assert programs[True] != programs[False]
+    np.testing.assert_array_equal(outs[True], outs[False])
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
+@pytest.mark.parametrize(
+    "shape,shared_weights",
+    [
+        pytest.param(dict(SMALL), None, id="small"),
+        # The production weights are 6.4GB, so these shapes run against the
+        # module's one build of them rather than making their own.
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[0]), "production_weights", id="prod_t2048"
+        ),
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[1]), "production_weights", id="prod_t16384"
+        ),
+    ],
+)
+def test_scale_slab_lookup_and_scatter_are_bit_exact(
+    request, monkeypatch, sharded_plan, shape, shared_weights
+):
+    """The scale slab built by lookup gives the layer the scatter's output.
+
+    The lookup leaves token 0's scale on the ROWBLK padding rows where the
+    scatter leaves zero; the kernel commits neither, so the output is the
+    same bits. The scatter form is forced by declaring the scales too large
+    for SMEM; the TensorCore builds are forced on, so the lookup runs on a
+    chip whose SparseCore would otherwise keep the scatter-add. The lowered
+    programs must hold the lookup kernel exactly where it is forced on, so
+    the agreement is not vacuous: were the choice ever dropped from the
+    layer's shard_map cache key, the second build would reuse the first one's
+    body and fail here.
+    """
+    monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
+    # At prefill sizes the run copy builds both tables instead; it is held off
+    # so the lookup and the scatter are what is compared.
+    monkeypatch.setattr(layer, "slab_run_copy_pays", lambda *_a, **_k: False)
+    mesh = _mesh()
+    if shared_weights is not None:
+        w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
+    else:
+        w1, w2, w1_scale, w2_scale = _make_weights(
+            mesh,
+            50,
+            hidden=shape["hidden"],
+            inter=shape["inter"],
+            e_total=shape["e_total"],
+            weight_format=WeightFormat.FP8,
+        )
+    x, gating = _make_inputs(
+        mesh,
+        51,
+        tokens=shape["tokens"],
+        hidden=shape["hidden"],
+        e_total=shape["e_total"],
+    )
+
+    def make_run():
+        # A fresh function per build: jax.jit caches the trace by function, and
+        # the form is read while tracing, so reusing one `run` would lower the
+        # first build's program again.
+        def run(*args):
+            return fused_ep_moe_v2(
+                *args,
+                topk=shape["topk"],
+                renormalize=True,
+                mesh=mesh,
+                capacity=CAPACITY,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=sharded_plan,
+            )
+
+        return run
+
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, has_lookup = {}, {}
+    for fits in (True, False):
+        monkeypatch.setattr(layer, "scale_slab_fits", lambda _n, fits=fits: fits)
+        run = make_run()
+        program = jax.jit(run).lower(*args).as_text()
+        has_lookup[fits] = "fused_ep_moe_v2_scale_slab" in program
+        outs[fits] = np.asarray(run(*args))
+    assert has_lookup == {True: True, False: False}, has_lookup
+    np.testing.assert_array_equal(outs[True], outs[False])
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
+@pytest.mark.parametrize(
+    "shape,shared_weights",
+    [
+        pytest.param(dict(SMALL), None, id="small"),
+        # The production weights are 6.4GB, so these shapes run against the
+        # module's one build of them rather than making their own.
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[0]), "production_weights", id="prod_t2048"
+        ),
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[1]), "production_weights", id="prod_t16384"
+        ),
+    ],
+)
+def test_token_gather_sort_and_scatter_are_bit_exact(
+    request, monkeypatch, sharded_plan, shape, shared_weights
+):
+    """The token-gather table built by sort gives the layer the scatter's output.
+
+    The scatter form is forced by declaring the sort keys too wide for int32;
+    the TensorCore builds are forced on, as in the lookup test, and the run
+    copy is held off, so the sort and the scatter are what is compared. The
+    two forced builds must lower to different programs, so the agreement is not
+    vacuous: were the choice ever dropped from the layer's shard_map cache key,
+    the second build would reuse the first one's body and fail here.
+    """
+    monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
+    monkeypatch.setattr(layer, "slab_run_copy_pays", lambda *_a, **_k: False)
+    mesh = _mesh()
+    if shared_weights is not None:
+        w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
+    else:
+        w1, w2, w1_scale, w2_scale = _make_weights(
+            mesh,
+            60,
+            hidden=shape["hidden"],
+            inter=shape["inter"],
+            e_total=shape["e_total"],
+            weight_format=WeightFormat.FP8,
+        )
+    x, gating = _make_inputs(
+        mesh,
+        61,
+        tokens=shape["tokens"],
+        hidden=shape["hidden"],
+        e_total=shape["e_total"],
+    )
+
+    def make_run():
+        # A fresh function per build: jax.jit caches the trace by function, and
+        # the form is read while tracing, so reusing one `run` would lower the
+        # first build's program again.
+        def run(*args):
+            return fused_ep_moe_v2(
+                *args,
+                topk=shape["topk"],
+                renormalize=True,
+                mesh=mesh,
+                capacity=CAPACITY,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=sharded_plan,
+            )
+
+        return run
+
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, programs = {}, {}
+    for fits in (True, False):
+        monkeypatch.setattr(
+            layer, "token_gather_sort_fits", lambda *_a, fits=fits, **_k: fits
+        )
+        run = make_run()
+        programs[fits] = jax.jit(run).lower(*args).as_text()
+        outs[fits] = np.asarray(run(*args))
+    assert programs[True] != programs[False]
+    np.testing.assert_array_equal(outs[True], outs[False])
+
+
+@pytest.mark.parametrize(
+    "shape,shared_weights",
+    [
+        pytest.param(dict(SMALL), None, id="small"),
+        # The production weights are 6.4GB, so these shapes run against the
+        # module's one build of them rather than making their own.
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[0]), "production_weights", id="prod_t2048"
+        ),
+        pytest.param(
+            dict(PROD, tokens=PROD_TOKENS[1]), "production_weights", id="prod_t16384"
+        ),
+    ],
+)
+def test_slab_run_copy_and_sort_lookup_are_bit_exact(
+    request, monkeypatch, shape, shared_weights
+):
+    """Both slab tables by run copy give the layer the sort + lookup's output.
+
+    The run copy changes the routing payload (expert-sorted token numbers and a
+    scale per pair) and builds both tables from it; the tables differ from the
+    lookup's only on the ROWBLK padding rows, which the kernel never commits.
+    The TensorCore builds are forced on and the run copy's gate is forced each
+    way so each shape runs both forms; the lowered programs are checked to
+    really differ, so the agreement is not vacuous.
+    """
+    monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
+    mesh = _mesh()
+    if shared_weights is not None:
+        w1, w2, w1_scale, w2_scale = request.getfixturevalue(shared_weights)
+    else:
+        w1, w2, w1_scale, w2_scale = _make_weights(
+            mesh,
+            70,
+            hidden=shape["hidden"],
+            inter=shape["inter"],
+            e_total=shape["e_total"],
+            weight_format=WeightFormat.FP8,
+        )
+    x, gating = _make_inputs(
+        mesh,
+        71,
+        tokens=shape["tokens"],
+        hidden=shape["hidden"],
+        e_total=shape["e_total"],
+    )
+
+    def make_run():
+        # A fresh function per build: jax.jit caches the trace by function, and
+        # the threshold is read while tracing, so reusing one `run` would lower
+        # the first build's program again.
+        def run(*args):
+            return fused_ep_moe_v2(
+                *args,
+                topk=shape["topk"],
+                renormalize=True,
+                mesh=mesh,
+                capacity=CAPACITY,
+                weight_format=WeightFormat.FP8,
+                sharded_plan=True,
+            )
+
+        return run
+
+    args = (x, w1, w2, w1_scale, w2_scale, gating)
+    outs, has_copy = {}, {}
+    for on in (False, True):
+        monkeypatch.setattr(layer, "slab_run_copy_pays", lambda *_a, on=on, **_k: on)
+        layer._LAYER_SM_CACHE.clear()
+        jax.clear_caches()
+        run = make_run()
+        has_copy[on] = (
+            "fused_ep_moe_v2_slab_runs" in jax.jit(run).lower(*args).as_text()
+        )
+        outs[on] = np.asarray(run(*args))
+    layer._LAYER_SM_CACHE.clear()
+    jax.clear_caches()
+    assert has_copy == {False: False, True: True}, has_copy
+    np.testing.assert_array_equal(outs[True], outs[False])
+
+
 @pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
 def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
     wire_dtype,
@@ -788,14 +1257,25 @@ def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     np.testing.assert_array_equal(np.asarray(remapped), np.asarray(identity))
 
 
+@pytest.mark.parametrize(
+    "tensorcore_tables", [False, True], ids=["chip_tables", "tensorcore_tables"]
+)
 @pytest.mark.parametrize("sharded_plan", [False, True])
-def test_split_stages_with_a_reordered_gather_are_bit_exact(sharded_plan):
+def test_split_stages_with_a_reordered_gather_are_bit_exact(
+    monkeypatch, sharded_plan, tensorcore_tables
+):
     """route, a caller-side gather in another order, compute == fused.
 
     The caller gathers the wire rows in an order of its own -- block i of q_g
     holds mesh index order[i]'s rows -- and tells compute where each mesh
     index's block landed. Nothing else about the layer may change.
+
+    With the TensorCore table builds forced on, the scale slab is a lookup
+    through the token-gather table, and it has to read the table in mesh
+    order -- the order the scales were gathered in -- not in q_g's order.
     """
+    if tensorcore_tables:
+        monkeypatch.setattr(layer, "slab_tables_on_tensorcore", lambda: True)
     mesh = _mesh()
     w1, w2, w1_scale, w2_scale = _make_weights(
         mesh,
@@ -979,6 +1459,111 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
     assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
 
 
+# 4 / 2 blocks over 4 local experts, and DeepSeek-V4's 14 / 6 blocks over 8:
+# the served 14-row table is one full sublane tile and a partial one.
+SECOND_MINOR_SHAPES = [
+    dict(hidden=2048, inter=1024, rhs_qb=512, e_total=32),
+    dict(hidden=896, inter=384, rhs_qb=64, e_total=64),
+]
+
+
+@pytest.mark.parametrize("shape", SECOND_MINOR_SHAPES)
+@pytest.mark.parametrize(
+    "w1_minor,w2_minor", [(True, False), (False, True), (True, True)]
+)
+def test_fp4_expert_second_minor_scale_reads_are_bit_exact(shape, w1_minor, w2_minor):
+    """Reading either scale table expert-second-minor changes only its
+    addressing."""
+    mesh = _mesh()
+    weights, scales, _ = _make_fp4_weights(
+        mesh,
+        44,
+        hidden=shape["hidden"],
+        inter=shape["inter"],
+        e_total=shape["e_total"],
+        rhs_qb=shape["rhs_qb"],
+    )
+    x, gating = _make_inputs(
+        mesh, 45, tokens=256, hidden=shape["hidden"], e_total=shape["e_total"]
+    )
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=shape["rhs_qb"],
+        sharded_plan=True,
+    )
+    default_layout = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    second_minor = fused_ep_moe_v2(
+        x,
+        *weights,
+        *scales,
+        gating,
+        w1_scales_expert_second_minor=w1_minor,
+        w2_scales_expert_second_minor=w2_minor,
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(second_minor), np.asarray(default_layout))
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_fp4_expert_second_minor_scales_reach_the_kernel_uncopied(flag):
+    """Scale tables staged {2,0,1} reach the kernel with no copy when the
+    flags say so. Without them XLA copies both into the default layout, which
+    shows the check can see a copy."""
+    from jax._src.layout import Format, Layout
+
+    shape = SECOND_MINOR_SHAPES[1]
+    hidden, inter, qb, e_total = (
+        shape[k] for k in ("hidden", "inter", "rhs_qb", "e_total")
+    )
+    mesh = _mesh()
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 46, hidden=hidden, inter=inter, e_total=e_total, rhs_qb=qb
+    )
+    x, gating = _make_inputs(mesh, 47, tokens=256, hidden=hidden, e_total=e_total)
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=qb,
+        sharded_plan=True,
+        w1_scales_expert_second_minor=flag,
+        w2_scales_expert_second_minor=flag,
+    )
+    # [E, blocks, N] with minor-to-major {2,0,1}, as torch_tpu stages it.
+    second_minor = Format(
+        Layout(major_to_minor=(1, 0, 2)), NamedSharding(mesh, P(AXIS))
+    )
+    fn = jax.jit(
+        lambda x, w1, w2, s1, s2, g: fused_ep_moe_v2(x, w1, w2, s1, s2, g, **common),
+        in_shardings=(None, None, None, second_minor, second_minor, None),
+    )
+    hlo = fn.lower(x, *weights, *scales, gating).compile().as_text()
+    # Each shard's tables, in either order of their two major dimensions.
+    local = e_total // EP
+    tables = [
+        (local, hidden // qb, 2 * inter),
+        (local, inter // qb, hidden),
+    ]
+    shapes = "|".join(
+        ",".join(map(str, dims))
+        for e, b, n in tables
+        for dims in ((e, b, n), (b, e, n))
+    )
+    producers = [
+        line.strip()
+        for line in hlo.splitlines()
+        if re.search(rf"= f32\[({shapes})\]", line)
+        and not re.search(r"\b(parameter|bitcast|get-tuple-element)\(", line)
+    ]
+    assert (producers == []) is flag, producers
+
+
 # --------------------------------------------------------------------------- #
 # The weight-DMA schedule.
 #
@@ -1104,6 +1689,166 @@ def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
             deepest,
             err_msg=f"depth {depth} disagrees with the deepest schedule",
         )
+
+
+# The single-slot schedule at a batch whose experts each fit one tile, where
+# the slabs stream in column chunks: 256 * 4 / 32 = 32 rows an expert, and
+# at least two chunks per slab on each matmul.
+CHUNKED = dict(hidden=3584, inter=1024, e_total=32, topk=4, tokens=256)
+
+
+def test_fp4_chunked_stream_agrees_with_the_prefetch_schedule(at_prefetch_depth):
+    """Column-chunk refills compute what whole-slab prefetch computes, bit for
+    bit: they move only where each DMA starts and is waited."""
+    assert kernel.stream_chunk(2 * CHUNKED["inter"]) > 0
+    assert CHUNKED["hidden"] // kernel.stream_chunk(CHUNKED["hidden"]) == 2
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        46,
+        hidden=CHUNKED["hidden"],
+        inter=CHUNKED["inter"],
+        e_total=CHUNKED["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        47,
+        tokens=CHUNKED["tokens"],
+        hidden=CHUNKED["hidden"],
+        e_total=CHUNKED["e_total"],
+    )
+    common = dict(
+        topk=CHUNKED["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+        sharded_plan=True,
+    )
+    outs = {}
+    for depth in (2, 0):
+        at_prefetch_depth(depth)
+        outs[depth] = np.asarray(
+            fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+        )
+    ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=CHUNKED["topk"])
+    assert _relative_l2(outs[0], ref) < FP8_RELATIVE_BOUND
+    np.testing.assert_array_equal(outs[0], outs[2])
+
+
+# The chunk-streamed path is chosen on the EXPECTED rows per expert, so one
+# skewed expert can still run several tiles on it. Two chunks per slab on
+# both matmuls, and MIXED_EXPERT_ROWS puts a two-tile expert between one-tile
+# ones on every shard. Hidden 3584 streams in 1792-column chunks, 4096 in
+# 2048-column ones.
+CHUNKED_MIXED = dict(inter=2048, e_total=32, topk=4)
+
+
+@pytest.mark.parametrize(
+    "width,chunk",
+    [
+        (6144, 2048),  # DeepSeek-V4 gate/up
+        (7168, 1792),  # DeepSeek-V4 down
+        (8192, 2048),  # Qwen3.8 down
+        (5120, 1280),
+        (1024, 1024),
+        (256 * 13, 0),  # no whole chunk from 1024 to 2048 columns
+        (768, 0),  # narrower than any chunk
+    ],
+)
+def test_stream_chunk_is_the_widest_dividing_width(width, chunk):
+    """The stream chunk is the widest whole number of the reader's output
+    chunk that divides the slab, within the chunk bounds, or 0 for none."""
+    assert kernel.stream_chunk(width) == chunk
+
+
+@pytest.mark.parametrize("hidden", [3584, 4096])
+@pytest.mark.parametrize("second_scale_slot", [True, False])
+def test_fp4_chunked_stream_holds_a_multi_tile_expert(
+    at_prefetch_depth, monkeypatch, second_scale_slot, hidden
+):
+    """A multi-tile expert on the chunk-streamed path reads its slab on every
+    tile: chunks are waited on its first tile and refilled after its last, so
+    the outputs match whole-slab prefetch bit for bit.
+
+    Without room for a second scale slot, the scales start after the tile
+    loop instead of at the visit's head; that schedule must match too.
+    """
+    assert (2 * CHUNKED_MIXED["inter"]) // kernel.stream_chunk(
+        2 * CHUNKED_MIXED["inter"]
+    ) == 2
+    assert hidden // kernel.stream_chunk(hidden) == 2
+    assert max(MIXED_EXPERT_ROWS) > CAPACITY
+    # Only the chunk-streamed build sizes a second scale slot, so a call for
+    # one shows the depth-zero build took that path rather than the old one.
+    scale_slots = []
+    real_estimate = host.vmem_estimate_bytes
+
+    def estimate(*args, **kwargs):
+        scale_slots.append(kwargs.get("scale_slots"))
+        if kwargs.get("scale_slots") == 2 and not second_scale_slot:
+            # Over any budget, so the build keeps a single scale slot. Only
+            # production shapes run out of room; this small one always fits.
+            return float("inf")
+        return real_estimate(*args, **kwargs)
+
+    monkeypatch.setattr(host, "vmem_estimate_bytes", estimate)
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        49,
+        hidden=hidden,
+        inter=CHUNKED_MIXED["inter"],
+        e_total=CHUNKED_MIXED["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        50,
+        tokens=MIXED_TOKENS,
+        hidden=hidden,
+        e_total=CHUNKED_MIXED["e_total"],
+    )
+    hash_ids = _make_ids_with_expert_rows(
+        mesh,
+        51,
+        rows_per_local=MIXED_EXPERT_ROWS,
+        tokens=MIXED_TOKENS,
+        topk=CHUNKED_MIXED["topk"],
+        e_total=CHUNKED_MIXED["e_total"],
+    )
+    common = dict(
+        hash_topk_ids=hash_ids,
+        topk=CHUNKED_MIXED["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+        sharded_plan=True,
+    )
+    outs = {}
+    for depth in (2, 0):
+        at_prefetch_depth(depth)
+        scale_slots.clear()
+        outs[depth] = np.asarray(
+            fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+        )
+        assert (2 in scale_slots) == (depth == 0), (depth, scale_slots)
+    ref = _dense_reference(
+        mesh,
+        x,
+        *decoded,
+        None,
+        None,
+        gating,
+        topk=CHUNKED_MIXED["topk"],
+        hash_ids=hash_ids,
+    )
+    assert _relative_l2(outs[0], ref) < FP8_RELATIVE_BOUND
+    np.testing.assert_array_equal(outs[0], outs[2])
 
 
 # --------------------------------------------------------------------------- #

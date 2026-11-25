@@ -13,14 +13,19 @@
 # limitations under the License.
 """Tests for TPUWorker"""
 
+import gc
 import multiprocessing
 import os
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from functorch.compile import make_boxed_func
+from torch._dynamo.backends.common import aot_autograd
+from torch._dynamo.utils import counters as dynamo_counters
 from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
@@ -28,7 +33,11 @@ from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
+from vllm_torchtpu.worker.tpu_worker import (
+    TPUWorker,
+    _configure_tpu_process_env,
+    _drop_traced_module_refs,
+)
 
 
 def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(monkeypatch):
@@ -279,6 +288,128 @@ class TestProfileCaptureAndMerge:
 
         assert not list(tmp_path.iterdir())
 
+    def test_stop_frees_capture_results_left_in_cycles(self, tmp_path):
+        """Stopping collects, so a capture's cyclic garbage does not wait for
+        the next full collection."""
+        worker = self._make_worker(tmp_path, rank=0, world_size=1)
+        results_refs = []
+
+        class _Results:
+            pass
+
+        def exit_leaving_a_cycle(*args):
+            results = _Results()
+            results.self_ref = results
+            results_refs.append(weakref.ref(results))
+
+        # With automatic collection off, only an explicit collection can free
+        # the cycle; assert before turning it back on.
+        gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            with patch("vllm_torchtpu.worker.tpu_worker.torch.profiler") as profiler:
+                profiler.profile.return_value.__exit__.side_effect = (
+                    exit_leaving_a_cycle
+                )
+                worker.profile(is_start=True)
+                self._stage_capture(worker, "t1v-n-host-w-0.xplane.pb", "trace")
+                worker.profile(is_start=False)
+
+            assert len(results_refs) == 1
+            assert results_refs[0]() is None
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+
+
+def test_drop_traced_module_refs_frees_compile_time_graphs(monkeypatch):
+    """aot_autograd's convenience methods keep the traced graph alive; dropping
+    only those three attributes frees it while preserving other attributes."""
+    monkeypatch.setitem(dynamo_counters["aot_autograd"], "ok", 0)
+
+    class _Affine(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.randn(4, 4), requires_grad=False)
+
+        def forward(self, x):
+            return (x @ self.w + 1,)
+
+    graph = torch.fx.symbolic_trace(_Affine())
+    graph_ref = weakref.ref(graph)
+    x = torch.randn(2, 4)
+    with torch.no_grad():
+        compiled = aot_autograd(fw_compiler=lambda gm, _: make_boxed_func(gm.forward))(
+            graph, [x]
+        )
+    assert dynamo_counters["aot_autograd"]["ok"] > 0
+    expected = compiled(x)[0]
+    del graph
+    gc.collect()
+    # Nothing but aot_autograd's convenience methods holds the graph now.
+    assert graph_ref() is not None
+
+    # Unrelated nn.Module-holding attributes on the compiled forwards and
+    # matching attribute names on non-aot_module_simplified functions must stay.
+    unrelated = torch.nn.Linear(2, 2)
+    compiled.extra_module = unrelated
+    compiled.extra_method = unrelated.forward
+    compiled.__wrapped__.extra_method = unrelated.forward
+
+    def _decoy() -> None:
+        return None
+
+    for attr in ("zero_grad", "named_parameters", "named_buffers"):
+        _decoy.__dict__[attr] = getattr(unrelated, attr)
+
+    _drop_traced_module_refs()
+    gc.collect()
+
+    assert graph_ref() is None
+    for fn in (compiled, compiled.__wrapped__):
+        for attr in ("zero_grad", "named_parameters", "named_buffers"):
+            assert attr not in fn.__dict__
+    for attr in ("zero_grad", "named_parameters", "named_buffers"):
+        assert _decoy.__dict__[attr] == getattr(unrelated, attr)
+    assert compiled.extra_module is unrelated
+    assert compiled.extra_method == unrelated.forward
+    assert compiled.__wrapped__.extra_method == unrelated.forward
+    assert torch.equal(compiled(x)[0], expected)
+
+
+def test_drop_traced_module_refs_skips_heap_scan_without_aot_compiles(monkeypatch):
+    """Skip gc.get_objects() when no fresh aot_autograd compiles ran."""
+    monkeypatch.setitem(dynamo_counters["aot_autograd"], "ok", 0)
+
+    with patch("vllm_torchtpu.worker.tpu_worker.gc.get_objects") as get_objects:
+        _drop_traced_module_refs()
+
+    get_objects.assert_not_called()
+
+
+def test_compile_or_warm_up_drops_traced_modules_before_freezing_the_heap():
+    """The dropped graphs must still be collectable when the heap is frozen."""
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(capture_model=lambda: None),
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+    )
+    calls = []
+
+    with (
+        patch(
+            "vllm_torchtpu.worker.tpu_worker._drop_traced_module_refs",
+            side_effect=lambda: calls.append("drop"),
+        ),
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.freeze_gc_heap",
+            side_effect=lambda: calls.append("freeze"),
+        ),
+        patch("vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"),
+    ):
+        TPUWorker.compile_or_warm_up_model(worker)
+
+    assert calls == ["drop", "freeze"]
+
 
 def test_reset_encoder_cache_delegates_to_model_runner():
     worker = TPUWorker.__new__(TPUWorker)
@@ -303,9 +434,9 @@ def test_initialize_from_config_updates_num_gpu_blocks():
     worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cache_config)
 
 
-def test_reset_encoder_cache_clears_the_runner_caches():
+def _worker_with_late_interaction_entries():
+    """A worker whose runner holds one query in each late-interaction cache."""
     runner = TPUModelRunner.__new__(TPUModelRunner)
-    runner.encoder_cache = {"mm_hash": torch.zeros(1)}
     runner.late_interaction_runner = LateInteractionRunner(enable_flash=False)
     late = runner.late_interaction_runner
     late._query_cache["query"] = torch.zeros(1)
@@ -313,11 +444,41 @@ def test_reset_encoder_cache_clears_the_runner_caches():
     late._doc_query_keys["doc"] = "query"
     worker = TPUWorker.__new__(TPUWorker)
     worker.model_runner = runner
+    return worker, runner, late
+
+
+def test_reset_encoder_cache_clears_the_runner_caches():
+    worker, runner, late = _worker_with_late_interaction_entries()
+    runner.encoder_cache = {"mm_hash": torch.zeros(1)}
 
     worker.reset_encoder_cache()
 
     assert runner.encoder_cache == {}
     assert (late._query_cache, late._query_uses, late._doc_query_keys) == ({}, {}, {})
+
+
+def test_reset_mm_cache_clears_the_runner_caches():
+    # WorkerBase.reset_mm_cache finds the runner method by name and skips it
+    # silently when it is missing, so call through the worker.
+    worker, runner, late = _worker_with_late_interaction_entries()
+    runner.mm_budget = MagicMock()
+
+    worker.reset_mm_cache()
+
+    runner.mm_budget.reset_cache.assert_called_once_with()
+    assert (late._query_cache, late._query_uses, late._doc_query_keys) == ({}, {}, {})
+
+
+def test_release_late_interaction_query_cache_reaches_the_runner():
+    # Also found by name in WorkerBase.
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.late_interaction_runner = MagicMock()
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.model_runner = runner
+
+    worker.release_late_interaction_query_cache(["query"])
+
+    runner.late_interaction_runner.release_queries.assert_called_once_with(["query"])
 
 
 def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
@@ -589,29 +750,12 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
     assert worker.get_kv_connector_handshake_metadata() == {(2, 3): metadata}
 
 
-def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
-    events = []
-    config = object()
-    monkeypatch.setattr(
-        patch_registry, "apply", lambda stage, **kwargs: events.append((stage, kwargs))
-    )
-    monkeypatch.setattr(
-        "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
-        lambda: events.append("release"),
-    )
-    worker = SimpleNamespace(
-        model_config=config,
-        model_runner=SimpleNamespace(load_model=lambda: events.append("load")),
-    )
-    TPUWorker.load_model(worker)
-    assert events == [("model_load", {"model_config": config}), "load", "release"]
-
-
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
-@pytest.mark.parametrize("speculative", [False, True])
-def test_warmup_restores_runtime_threads_without_overriding_user_choice(
-    monkeypatch, managed_by_vllm, runtime_threads, speculative
+def test_load_model_patches_loads_releases_then_sets_runtime_threads(
+    monkeypatch, managed_by_vllm, runtime_threads
 ):
+    """Weights load at the startup thread count. The serving count is set
+    after that, and a user's own OMP_NUM_THREADS is left as it is."""
     from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 
     monkeypatch.setenv("OMP_NUM_THREADS", "2")
@@ -619,37 +763,87 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
         monkeypatch.setenv(OMP_NUM_THREADS_SET_BY_VLLM, "1")
     else:
         monkeypatch.delenv(OMP_NUM_THREADS_SET_BY_VLLM, raising=False)
-
-    warmup_threads = []
-
-    def capture_model():
-        warmup_threads.append(torch.get_num_threads())
-
+    events = []
+    config = object()
+    monkeypatch.setattr(
+        patch_registry, "apply", lambda stage, **kwargs: events.append((stage, kwargs))
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
+        lambda: events.append(("release", torch.get_num_threads())),
+    )
     worker = SimpleNamespace(
-        model_runner=SimpleNamespace(capture_model=capture_model),
-        compilation_config=SimpleNamespace(compilation_time=0.0),
-        speculative_config=object() if speculative else None,
+        model_config=config,
+        model_runner=SimpleNamespace(
+            load_model=lambda: events.append(("load", torch.get_num_threads()))
+        ),
     )
     previous_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(2)
-        with (
-            patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
-            patch(
-                "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
-            ) as gc_debug,
-        ):
-            result = TPUWorker.compile_or_warm_up_model(worker)
-        freeze.assert_called_once_with()
-        gc_debug.assert_called_once_with()
-        # Speculative decoding warms up at the serving thread count; other
-        # models keep the startup count during warm-up.
-        assert warmup_threads == [runtime_threads if speculative else 2]
+        TPUWorker.load_model(worker)
+        assert events == [
+            ("model_load", {"model_config": config}),
+            ("load", 2),
+            ("release", 2),
+        ]
         assert torch.get_num_threads() == runtime_threads
-        assert result.language_model == worker.compilation_config.compilation_time
-        assert result.encoder == 0.0
     finally:
         torch.set_num_threads(previous_threads)
+
+
+def test_warmup_freezes_heap_and_reports_compilation_time():
+    capture_model = MagicMock()
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(capture_model=capture_model),
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+    )
+    with (
+        patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
+        patch("vllm_torchtpu.worker.tpu_worker._drop_traced_module_refs") as drop,
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
+        ) as gc_debug,
+    ):
+        result = TPUWorker.compile_or_warm_up_model(worker)
+    capture_model.assert_called_once_with()
+    drop.assert_called_once_with()
+    freeze.assert_called_once_with()
+    gc_debug.assert_called_once_with()
+    assert result.language_model == worker.compilation_config.compilation_time
+    assert result.encoder == 0.0
+
+
+def test_precompile_timed_and_execute_dummy_batch_share_dynamo_trace():
+    """A graph traced inside _precompile_timed is reused by an idle DP step.
+
+    Both run under no_grad even when the caller has grad enabled, so Dynamo's
+    grad mode guard matches and the graph is not traced again.
+    """
+    from torch._dynamo.testing import CompileCounter
+
+    counter = CompileCounter()
+    compiled_add = torch.compile(lambda x: x + 1, backend=counter, fullgraph=True)
+    x = torch.zeros(4)
+    grad_states = []
+
+    def _run_dp_idle_pairing(_bucket, _num_chunks):
+        grad_states.append(torch.is_grad_enabled())
+        compiled_add(x)
+
+    runner = SimpleNamespace(
+        _dp_coordinated_step=lambda *_args: (16, 1),
+        _run_dp_idle_pairing=_run_dp_idle_pairing,
+        _update_num_xla_graphs=lambda _name: None,
+    )
+    with torch.enable_grad():
+        with TPUModelRunner._precompile_timed(runner, "test_pass"):
+            assert not torch.is_grad_enabled()
+            compiled_add(x)
+        TPUWorker.execute_dummy_batch(SimpleNamespace(model_runner=runner))
+        assert torch.is_grad_enabled()
+    assert grad_states == [False]
+    assert counter.frame_count == 1
 
 
 def test_real_patch_entrypoints_in_spawned_processes():

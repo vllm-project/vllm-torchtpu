@@ -194,6 +194,9 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         return f"quant method {type(qm).__name__} is not VllmFp8MoEMethodTPU"
     if qm._tpu_activation_str != "silu":
         return f"activation {qm._tpu_activation_str!r} is not silu"
+    if qm._tpu_topk_weights_float32:
+        # The kernel's routing rounds the top-k weights to bfloat16.
+        return "tpu_moe_topk_weights_float32 is set"
     if qm._use_adaptive_fused_moe or fused_moe_ep_supported(qm):
         return "a fused EP MoE kernel serves this layer"
     if envs.FUSED_MOE_DECODE_KERNEL:

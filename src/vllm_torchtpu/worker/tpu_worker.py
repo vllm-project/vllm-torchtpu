@@ -17,14 +17,17 @@
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import ctypes
+import gc
 import os
 import time
+import types
 from typing import Any, cast
 from urllib.parse import urlparse
 
 import torch
 import torch.profiler
 import torch_tpu  # noqa: F401
+from torch._dynamo.utils import counters as dynamo_counters
 from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -94,7 +97,53 @@ def _release_free_host_heap() -> None:
         logger.info("Released free host heap via glibc malloc_trim.")
 
 
+# TODO(https://github.com/pytorch/pytorch/issues/206390): Remove this constant,
+# _drop_traced_module_refs(), and its call in compile_or_warm_up_model() once
+# torch's aot_module_simplified stops attaching the traced module's zero_grad,
+# named_parameters and named_buffers to the forward it returns; the
+# graph-liveness check in test_drop_traced_module_refs_frees_compile_time_graphs
+# then fails.
+_AOT_TRACED_MODULE_ATTRS = ("zero_grad", "named_parameters", "named_buffers")
+
+
+def _drop_traced_module_refs() -> None:
+    """Drop the traced modules that aot_autograd leaves on compiled forwards.
+
+    `aot_module_simplified` hangs the traced GraphModule's `zero_grad`,
+    `named_parameters` and `named_buffers` on the forward it returns, and
+    Dynamo's `disable()` wrapper copies them along with the forward's
+    `__qualname__`. Inference never calls them, but they keep every
+    compile-time graph, with its fake tensors and stack traces, in host memory
+    for the life of the worker.
+    """
+    # Every compile path that reaches `aot_module_simplified` increments
+    # `counters["aot_autograd"]["ok"]` in `AotAutograd.__call__`, while cached
+    # artifact replays (`deserialize_bundled_cache_entry`) do not. Skip the
+    # full-heap scan when no fresh AOTAutograd compiles ran in this worker
+    # (including profile_run).
+    if not dynamo_counters["aot_autograd"]["ok"]:
+        return
+    dropped = 0
+    for obj in gc.get_objects():
+        # type(), not isinstance(): isinstance() reads __class__, which some
+        # deprecated torch objects turn into a warning.
+        if type(obj) is not types.FunctionType or not obj.__qualname__.endswith(
+            "aot_module_simplified.<locals>.forward"
+        ):
+            continue
+        attrs = obj.__dict__
+        for name in _AOT_TRACED_MODULE_ATTRS:
+            if name in attrs:
+                del attrs[name]
+                dropped += 1
+    logger.info("Dropped %d traced-module references from compiled forwards.", dropped)
+
+
 class TPUWorker(WorkerBase):
+    # Runner class to build in init_device(); Omni workers override it with a
+    # runner that adds the stage-specific hooks.
+    model_runner_cls: type[TPUModelRunner] = TPUModelRunner
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -482,7 +531,7 @@ class TPUWorker(WorkerBase):
         # WorkerBase declares `nn.Module | None`; this worker always holds a
         # TPUModelRunner from here on.
         # pyrefly: ignore[bad-override-mutable-attribute]
-        self.model_runner: TPUModelRunner = TPUModelRunner(
+        self.model_runner: TPUModelRunner = self.model_runner_cls(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,
@@ -693,6 +742,7 @@ class TPUWorker(WorkerBase):
     def take_draft_token_ids(self):
         return self.model_runner.take_draft_token_ids()
 
+    @torch.no_grad()
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
         runner = self.model_runner
@@ -816,6 +866,11 @@ class TPUWorker(WorkerBase):
             self.profile_capture_dir = None
             self.profile_canonical_ts = None
             self.profile_session_key = None
+            # Some of the capture's results are left in reference cycles, which
+            # only the cyclic collector frees, and on a serving worker its next
+            # full pass can be far off. Collect now so the capture does not
+            # keep several GiB of host memory on a rank until then.
+            gc.collect()
 
     def _next_profile_session_key(self) -> str:
         """Marker key for the start/stop cycle that is beginning.
@@ -837,20 +892,21 @@ class TPUWorker(WorkerBase):
         # allocator keeps their pages. Return them before initialize_from_config,
         # where a KV connector may allocate its host store.
         _release_free_host_heap()
+        # Switch to the serving thread count right after weight loading so
+        # profile_run(), initialize_kv_cache(), and capture_model() all trace
+        # under the runtime GLOBAL_STATE guard.
+        set_torch_threads_for_runtime()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
-        if getattr(self, "speculative_config", None) is not None:
-            # Record the warm-up traces under the serving thread count. Other
-            # models keep upstream's warm-up at the startup count.
-            set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
-        set_torch_threads_for_runtime()
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()
+        # Before freeze_gc_heap(), whose collection then frees the graphs.
+        _drop_traced_module_refs()
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.

@@ -212,8 +212,11 @@ class BucketExecutables:
                 f"{key} was compiled by another trace of this model whose "
                 f"inputs differ ({signature} vs {_signature(graph)}). The "
                 "graph is split, so its subgraph boundaries move with the "
-                "specialization and a bucket cannot be handed between traces; "
-                "unset TPU_KERNEL_ITER_MODE to serve this model."
+                "specialization and a bucket cannot be handed between traces. "
+                "The split comes from compilation_config.splitting_ops "
+                "(boundaries declared by the model's config hook or the "
+                "caller, or the RPA boundaries TPU_KERNEL_ITER_MODE adds); "
+                "drop those boundaries to serve this model."
             )
         return runnable
 

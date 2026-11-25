@@ -19,6 +19,7 @@ from unittest import mock
 import numpy as np
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -531,7 +532,141 @@ def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monke
     )
     assert positions is chunk.position_ids
     assert gather_indices.cpu()[:2].tolist() == [1, 4]
-    assert gather_indices.cpu()[2:].eq(0).all()
+    # Padded to the loop bucket by repeating the last request, as the sync
+    # path does.
+    assert gather_indices.cpu()[2:].eq(4).all()
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("discard", [[], [1]])
+def test_prepare_draft_inputs_device_seed_pads_to_loop_bucket(device, discard):
+    """The bootstrap seed scatter runs at the loop bucket, like the
+    host-seeded path's: padded rows repeat the last request, and a request in
+    partial prefill seeds from its next prompt token, not its sample."""
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
+        device=device,
+        requests={
+            "r1": SimpleNamespace(num_computed_tokens=0, get_token_id=lambda i: 300 + i)
+        },
+        num_tokens_paddings=[16, 32],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    chunk = _make_chunk(
+        input_ids=torch.arange(16, dtype=torch.int32, device=device),
+        position_ids=torch.arange(16, dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 2, 5], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        device=device,
+    )
+    seeds = []
+    seed_input_ids = proposer._draft_seed_input_ids
+
+    def recorded(input_ids, last_token_indices, next_token_ids):
+        seeds.append(next_token_ids.cpu().tolist())
+        return seed_input_ids(input_ids, last_token_indices, next_token_ids)
+
+    proposer._draft_seed_input_ids = recorded
+    draft_input_ids, _, _, _ = proposer._prepare_draft_inputs(
+        chunk,
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=discard,
+        num_rejected_tokens_np=None,
+        # r1's next prompt token is the one at 0 computed + 3 scheduled.
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={"r1": 3}),
+        device_seed=torch.tensor([101, 999], dtype=torch.int32, device=device),
+    )
+    r1_seed = 303 if discard else 999
+    assert seeds == [[101] + [r1_seed] * 15]
+    # [0..15] left shift, then the seeds at the last slots [1, 4].
+    expected = list(range(1, 16)) + [15]
+    expected[1], expected[4] = 101, r1_seed
+    assert draft_input_ids.cpu().tolist() == expected
+
+
+class _RecordOpShapes(TorchDispatchMode):
+    """Records every aten op dispatched while active, with the shapes and
+    dtypes of its tensor inputs and outputs."""
+
+    def __init__(self):
+        super().__init__()
+        self.ops = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **(kwargs or {}))
+        tensors = [
+            (tuple(t.shape), t.dtype)
+            for t in torch.utils._pytree.tree_leaves((args, kwargs, out))
+            if isinstance(t, torch.Tensor)
+        ]
+        self.ops.append((str(func.overloadpacket), tensors))
+        return out
+
+
+@pytest.mark.parametrize("seed_source", ["device_seed", "next_tokens_device"])
+def test_draft_seed_ops_ignore_request_count_and_partial_prefill(seed_source):
+    """torch-tpu compiles its deferred eager ops per op sequence and shapes,
+    so on the device-seeded paths the seed ops are the same for any request
+    count within a bucket and whether or not a request is in partial
+    prefill; the compiled scatter itself is precompiled per bucket."""
+    device = torch.device("cpu")
+    req_ids = [f"r{i}" for i in range(8)]
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=req_ids),
+        device=device,
+        requests={
+            rid: SimpleNamespace(num_computed_tokens=0, get_token_id=lambda i: 300 + i)
+            for rid in req_ids
+        },
+        num_tokens_paddings=[16, 32],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    proposer._draft_seed_input_ids = lambda input_ids, *_: input_ids
+
+    def seed_ops(num_reqs, discard):
+        # Requests 1.. of the batch, two tokens each: start_index offsets
+        # every host lookup.
+        qsl = np.arange(0, 2 * num_reqs + 1, 2, dtype=np.int32)
+        chunk = _make_chunk(
+            input_ids=torch.arange(32, dtype=torch.int32),
+            position_ids=torch.arange(32, dtype=torch.int32),
+            query_start_loc_np=qsl,
+            start_index=1,
+            num_reqs=num_reqs,
+            device=device,
+            # Padded to the sampler width + 1 by repeating the last end, as
+            # the runner uploads it.
+            attn_ctx=SimpleNamespace(
+                query_start_loc=torch.from_numpy(np.pad(qsl, (0, 8 - num_reqs), "edge"))
+            ),
+        )
+        kwargs = (
+            {"device_seed": torch.arange(100, 108, dtype=torch.int32)}
+            if seed_source == "device_seed"
+            else {"next_tokens_device": torch.full((8, 4), 7, dtype=torch.int32)}
+        )
+        with _RecordOpShapes() as rec:
+            proposer._prepare_draft_inputs(
+                chunk,
+                sampled_token_ids=None,
+                discard_sampled_tokens_req_indices=discard,
+                num_rejected_tokens_np=None,
+                scheduler_output=SimpleNamespace(
+                    num_scheduled_tokens=dict.fromkeys(req_ids, 2),
+                    scheduled_spec_decode_tokens={},
+                ),
+                **kwargs,
+            )
+        return rec.ops
+
+    # The first call also imports modules that build tensors at import time.
+    seed_ops(5, [])
+    baseline = seed_ops(5, [])
+    assert seed_ops(6, []) == baseline
+    assert seed_ops(6, [6]) == baseline
 
 
 def test_propose_delegates_carry_aggregation_after_gather():
@@ -1726,6 +1861,71 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
 
     assert proposer.draft_vllm_config is loaded["vllm_config"]
     assert wrapper_configs == [proposer.draft_vllm_config]
+
+
+@pytest.mark.parametrize(
+    "draft_tp, target_tp, draft_filter",
+    [
+        (1, 8, False),
+        (8, 8, True),
+        (1, 1, True),
+    ],
+)
+def test_replicated_draft_load_disables_ep_weight_filter(
+    monkeypatch, draft_tp, target_tp, draft_filter
+):
+    """A draft replicated below target TP (draft_tp=1, target_tp>1) forces tp=1
+    while parallel_config stays at target TP, so loading must disable
+    enable_ep_weight_filter on the active draft config without mutating the
+    target config. Sharded drafts and target_tp=1 drafts keep the filter."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp, method="mtp")
+    proposer.vllm_config.parallel_config.enable_ep_weight_filter = True
+    proposer.runner = SimpleNamespace(mesh=object())
+    proposer.vllm_config.load_config = object()
+    proposer.vllm_config.compilation_config = SimpleNamespace(
+        inductor_compile_config={}
+    )
+    proposer.speculative_config.draft_model_config = SimpleNamespace(runner_type=None)
+    active_config = [None]
+    observed = {}
+
+    @contextlib.contextmanager
+    def _fake_set_current_vllm_config(cfg):
+        prev = active_config[0]
+        active_config[0] = cfg
+        try:
+            yield
+        finally:
+            active_config[0] = prev
+
+    class _Loader:
+        def load_model(self, *, vllm_config, model_config):
+            observed["current_vllm_config"] = active_config[0]
+            observed["arg_vllm_config"] = vllm_config
+            return object()
+
+    monkeypatch.setattr(e3, "get_model_loader", lambda _cfg: _Loader())
+    monkeypatch.setattr(e3, "set_model_tag", lambda _tag: contextlib.nullcontext())
+    monkeypatch.setattr(e3, "set_current_vllm_config", _fake_set_current_vllm_config)
+    monkeypatch.setattr(
+        e3,
+        "set_vllm_model_wrapper_context",
+        lambda **_kw: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(e3, "_force_draft_tp1", lambda: contextlib.nullcontext())
+
+    proposer._load_draft_model()
+
+    # Both model loaders read enable_ep_weight_filter via get_current_vllm_config().
+    assert observed["current_vllm_config"] is not None
+    assert observed["current_vllm_config"] is observed["arg_vllm_config"]
+    assert (
+        observed["current_vllm_config"].parallel_config.enable_ep_weight_filter
+        is draft_filter
+    )
+    assert proposer.vllm_config.parallel_config.enable_ep_weight_filter is True
 
 
 @pytest.mark.tpu_test

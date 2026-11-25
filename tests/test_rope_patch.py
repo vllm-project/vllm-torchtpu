@@ -22,6 +22,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests.test_fresh_buffer import _RecordOps
 from vllm_torchtpu import rope_patch
 
 _HEAD_SIZE = 64
@@ -407,3 +408,16 @@ def test_a_table_that_is_not_rope_stays_a_buffer() -> None:
     module.register_buffer("sin", torch.rand(16, 4))
     assert rope_patch.patch_cos_sin_table_pairs(module) == 0
     assert "cos" in module._buffers
+
+
+def test_patched_forward_embeds_inv_freq_without_pow() -> None:
+    """The patched forward must not recompute `inv_freq` as `base ** (2i / d)`."""
+    rope = _SyntheticRotaryEmbedding()
+    assert rope_patch.patch_in_graph_rotary_embedding(rope) == 1
+    positions = torch.tensor([0, 1, 13, 127, 511], dtype=torch.int32)
+    q, k = _qk(positions.numel())
+
+    with _RecordOps() as rec:
+        rope(positions, q, k)
+    assert "aten.cos" in rec.ops, rec.ops
+    assert "aten.pow" not in rec.ops, rec.ops

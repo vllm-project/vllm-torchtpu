@@ -171,16 +171,6 @@
       "concise_description": "No attribute `tpu` in module `torch`"
     },
     {
-      "path": "src/vllm_torchtpu/distributed/sharded_jax_op.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `tuple[P, ...]` is not assignable to parameter `input_partition_specs` with type `tuple[tuple[str, ...], ...] | None` in function `torch_tpu._internal.pallas.pallas.JaxCallable.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/sharded_jax_op.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Sequence[int] | None` is not assignable to parameter `donate_argnums` with type `list[int] | None` in function `torch_tpu._internal.pallas.pallas.JaxCallable.__init__`"
-    },
-    {
       "path": "src/vllm_torchtpu/env_override.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `_torchtpu_fori_patch_applied` in module `jax._src.pallas.mosaic.lowering`"
@@ -813,7 +803,7 @@
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/deepseek_v4_indexer.py",
       "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (q: Array, positions: Array, cos_sin_cache: Array, indexer_weights: Array, cache_kv: Array, seq_lens: Array, page_indices: Array, cu_q_lens: Array, distribution: Array, *, k: int = ..., compression_ratio: int = ..., softmax_scale: float = ..., n_head: int = ..., verify_q_len: int | None = ...) -> Array, mesh=Mesh | None, input_partition_specs=tuple[P, P, P, P, P, P, P, P, P])"
+      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, (q: Array, positions: Array, cos_sin_cache: Array, indexer_weights: Array, cache_kv: Array, seq_lens: Array, page_indices: Array, cu_q_lens: Array, distribution: Array, *, k: int = ..., compression_ratio: int = ..., softmax_scale: float = ..., n_head: int = ..., verify_q_len: int | None = ..., chunk_tokens: int | None = ..., scheduling_group_slot: int | None = ...) -> Array, mesh=Mesh | None, input_partition_specs=tuple[P, P, P, P, P, P, P, P, P])"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/deepseek_v4_indexer.py",
@@ -1277,21 +1267,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-assignment",
-      "concise_description": "`(batch: Unknown) -> PoolingMetadata` is not assignable to attribute `get_pooling_metadata` with type `(self: InputBatch) -> PoolingMetadata`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPUModelRunner.kv_cache_config` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPUModelRunner.execute_model_state` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `None` is not assignable to parameter `forward_context` with type `ForwardContext` in function `vllm.distributed.kv_transfer.kv_connector.v1.base.KVConnectorBase_V1.start_load_kv`"
     },
@@ -1312,26 +1287,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TPUModelRunner._build_attention_metadata` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TPUModelRunner.initialize_kv_cache` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `InputBatch` has no attribute `_tpu_spec_room_guard`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TPUModelRunner._prepare_inputs` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `tpu` in module `torch`"
     },
@@ -1339,26 +1294,6 @@
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "not-callable",
       "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPUModelRunner.sample_tokens` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `LogprobsLists | list[Unknown]` is not assignable to parameter `logprobs` with type `LogprobsLists | None` in function `vllm.v1.outputs.ModelRunnerOutput.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPUModelRunner.load_model` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TPUModelRunner._dummy_run` overrides parent class `GPUModelRunner` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -1374,16 +1309,6 @@
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `schedule_capacity` in module `vllm_torchtpu.kernels.experimental.batched_rpa.wrapper`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPUModelRunner.capture_model` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TPUModelRunner.profile_run` overrides parent class `GPUModelRunner` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",

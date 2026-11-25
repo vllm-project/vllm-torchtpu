@@ -23,13 +23,17 @@ No hardware: `get_pallas_mesh` is faked out, because the question is what it
 gets called with.
 """
 
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import jax
 import pytest
 import torch
 
 from vllm_torchtpu.distributed import dcp, mesh_utils, pcp
+
+# The real function, captured before any test patches it, so the fakes below
+# reject a call that its signature would reject.
+_REAL_GET_PALLAS_MESH = torch.tpu.pallas.get_pallas_mesh
 
 
 @pytest.fixture(autouse=True)
@@ -58,10 +62,10 @@ def _dcp_mesh_environment(monkeypatch, group, world_size, rank):
         "devices",
         Mock(side_effect=AssertionError("the DCP mesh must not read jax.devices()")),
     )
-    from torch_tpu._internal import pallas as pallas_module
-
-    get_pallas_mesh = Mock(side_effect=lambda **kwargs: object())
-    monkeypatch.setattr(pallas_module, "get_pallas_mesh", get_pallas_mesh)
+    get_pallas_mesh = create_autospec(
+        _REAL_GET_PALLAS_MESH, side_effect=lambda **kwargs: object()
+    )
+    monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", get_pallas_mesh)
     return get_pallas_mesh
 
 

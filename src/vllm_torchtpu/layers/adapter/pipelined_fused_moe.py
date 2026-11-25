@@ -27,6 +27,7 @@ import torch
 from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.hier_reduce_scatter import moe_combine_reduce_scatter
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
@@ -204,6 +205,8 @@ def pipelined_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    topk_weights_float32: bool = False,
+    row_info: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 
@@ -237,10 +240,18 @@ def pipelined_fused_moe_gmm(
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.
         skip_padded_tokens: Optional flag to skip padded tokens.
+        row_info: Unsupported in pipelined mode; must be None.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
+    if row_info is not None:
+        # Each chunk holds rows gathered from several ranks, so one local
+        # valid-row count would drop real rows of the other ranks.
+        raise NotImplementedError(
+            "pipelined_fused_moe_gmm does not support row_info (chunked DP/PCP "
+            "layouts cannot reuse a single local valid-row count)."
+        )
     collective_group, _ = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]
@@ -294,11 +305,12 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            topk_weights_float32=topk_weights_float32,
         )
 
         if parallel_size > 1:
             assert collective_group is not None
-            return collective_group.reduce_scatter(out, dim=0)
+            return moe_combine_reduce_scatter(collective_group, out)
         return out
 
     _log_active_chunk_pipeline()
@@ -381,9 +393,12 @@ def pipelined_fused_moe_gmm(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
+            topk_weights_float32=topk_weights_float32,
         )
 
-        # Reduce-scatter partial output for current chunk
+        # Reduce-scatter partial output for current chunk. The group's
+        # collective overlaps the next chunk's MoE compute; a TensorCore
+        # kernel (TPU_MOE_EP_HIER_RS) would not.
         rs_i = collective_group.reduce_scatter(out_i, dim=0)
         rs_outputs.append(rs_i)
 

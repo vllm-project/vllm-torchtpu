@@ -39,8 +39,11 @@ SLOTS = {"slots3": 3, "slots1": 1}
 _TINY_TILES = Tiles(bank=512 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32)
 
 
-def _unfold(x: jax.Array, R: int) -> jax.Array:
-    return x.reshape((R, x.shape[0] // R) + x.shape[1:])
+def _unfold(x: jax.Array, R: int) -> tuple[jax.Array, ...]:
+    if R == 1:
+        return (x,)
+    u8 = np.asarray(x).view(np.uint8).reshape((R, x.shape[0] // R) + x.shape[1:])
+    return tuple(jnp.asarray(u8[r].view(jnp.dtype(FP8))) for r in range(R))
 
 
 @pytest.fixture(autouse=True)

@@ -56,6 +56,9 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
     streamindex_topk_dcp,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    config as streamidx_config,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
@@ -426,6 +429,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             if envs.is_indexer_kv_cache_mode_explicit()
             else None
         )
+        op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
+        # Each layer calls the same jitted kernel with the same shapes, so
+        # without its own slot every layer after the first would reuse the
+        # first one's cached trace -- and its chunked-pipeline scheduling group
+        # ids. The DCP twin of a layer shares its slot: only one of the two
+        # runs in a forward.
+        scheduling_group_slot = streamidx_config.layer_scheduling_group_slot(
+            self.k_cache.prefix
+        )
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -498,10 +510,12 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                scheduling_group_slot=streamidx_config.chunked_scheduling_group_slot(
+                    scheduling_group_slot, q.shape[0], chunk_tokens
+                ),
             )
             return cache_kv, topk_indices
 
-        op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
         jax_op = pallas.jax_op(op_name, _streamidx_topk_jax, donate_argnums=(2,))
 
         def _fake(q_bytes, weights, cache_kv, *args, **kwargs):
@@ -543,6 +557,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
             if envs.is_indexer_kv_cache_mode_explicit()
             else None
+        )
+        op_name = f"pallas::streamidx_topk_dcp_{self.k_cache.prefix.replace('.', '_')}"
+        scheduling_group_slot = streamidx_config.layer_scheduling_group_slot(
+            self.k_cache.prefix
         )
 
         def _streamidx_topk_dcp_jax(
@@ -598,12 +616,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 a2a_merge=_dcp_indexer_a2a_for_bucket(
                     q.shape[0], a2a_merge, a2a_min_tokens
                 ),
+                scheduling_group_slot=streamidx_config.chunked_scheduling_group_slot(
+                    scheduling_group_slot, q.shape[0], chunk_tokens
+                ),
             )
             return cache_kv, local_topk
 
         replicated = jax.sharding.PartitionSpec()
         sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
-        op_name = f"pallas::streamidx_topk_dcp_{self.k_cache.prefix.replace('.', '_')}"
         # Reuses the PCP export wrapper verbatim: nothing in it is PCP-specific
         # once the mesh and the specs are arguments, and the reason it exists --
         # `jax_placeholders` specializing the dynamic token dim while scaling

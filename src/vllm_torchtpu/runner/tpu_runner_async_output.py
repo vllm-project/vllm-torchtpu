@@ -28,15 +28,16 @@ INVALID_TOKEN_ID = -1
 
 
 @dataclass
-class SpecLogprobsChunk:
-    """One chunk's logprobs in a spec-decode step, one row per logits row.
+class LogprobsChunk:
+    """One chunk's logprobs, one row per logits row.
 
     A verify chunk's logits hold, per request, one row per draft token and
     then its bonus row, so request `i`'s verify slots are rows
     `row_starts[i]`, `row_starts[i] + 1`, ... in slot order, and its accepted
-    tokens are a prefix of them. A chunk without drafts has one row per
-    request (`row_starts[i] == i`). Rows are computed for every slot, accepted
-    or not, and filtered on the host once the accepted counts are known.
+    tokens are a prefix of them. A chunk without drafts, which includes every
+    chunk of a step without speculative decoding, has one row per request
+    (`row_starts[i] == i`). Rows are computed for every slot, accepted or
+    not, and filtered on the host once the accepted counts are known.
     """
 
     # Device tensors until the async copy is issued, CPU tensors after.
@@ -45,35 +46,44 @@ class SpecLogprobsChunk:
     row_starts: np.ndarray
 
 
-def spec_logprobs_lists(
-    chunks: list[SpecLogprobsChunk], gen_lens: list[int]
+def logprobs_lists(
+    chunks: list[LogprobsChunk], gen_lens: list[int] | None
 ) -> LogprobsLists:
-    """Keep each request's accepted rows, in request order.
+    """Keep each request's generated rows, in request order.
 
     `gen_lens[i]` is request `i`'s number of generated tokens this step,
     counted across all chunks before any discard, as vLLM's rejection
-    sampler does.
+    sampler does. `gen_lens=None` means each request generated one token:
+    request `i` keeps row `row_starts[i]`, so a chunk without drafts keeps
+    the first `n` of its bucketed rows (`n` = its number of requests), in
+    chunk order, and `cu_num_generated_tokens` stays None.
     """
-    ids, lps, ranks = [], [], []
+    parts = []
     offset = 0
     for chunk in chunks:
         n = len(chunk.row_starts)
-        take = [
-            np.arange(start, start + g, dtype=np.int64)
-            for start, g in zip(chunk.row_starts, gen_lens[offset : offset + n])
-        ]
-        rows = np.concatenate(take) if take else np.zeros(0, dtype=np.int64)
-        ids.append(chunk.tensors.logprob_token_ids.numpy()[rows])
-        lps.append(chunk.tensors.logprobs.numpy()[rows])
-        ranks.append(chunk.tensors.selected_token_ranks.numpy()[rows])
+        if gen_lens is None:
+            rows = chunk.row_starts
+        else:
+            take = [
+                np.arange(start, start + g, dtype=np.int64)
+                for start, g in zip(chunk.row_starts, gen_lens[offset : offset + n])
+            ]
+            rows = np.concatenate(take) if take else np.zeros(0, dtype=np.int64)
+        index = torch.as_tensor(rows, dtype=torch.int64)
+        parts.append(
+            LogprobsTensors(
+                logprob_token_ids=chunk.tensors.logprob_token_ids[index],
+                logprobs=chunk.tensors.logprobs[index],
+                selected_token_ranks=chunk.tensors.selected_token_ranks[index],
+            )
+        )
         offset += n
-    assert offset == len(gen_lens), (offset, len(gen_lens))
-    return LogprobsLists(
-        logprob_token_ids=np.concatenate(ids),
-        logprobs=np.concatenate(lps),
-        sampled_token_ranks=np.concatenate(ranks),
-        cu_num_generated_tokens=np.concatenate(([0], np.cumsum(gen_lens))).tolist(),
-    )
+    cu_num_generated_tokens = None
+    if gen_lens is not None:
+        assert offset == len(gen_lens), (offset, len(gen_lens))
+        cu_num_generated_tokens = np.concatenate(([0], np.cumsum(gen_lens))).tolist()
+    return LogprobsTensors.cat(parts).tolists(cu_num_generated_tokens)
 
 
 @dataclass
@@ -92,27 +102,33 @@ class AsyncTPUCopyState:
     chunks_tpu: list[torch.Tensor] | None = None
     completed: bool = False
     _sampled_token_ids_cpu: torch.Tensor | None = None
-    # Spec-decode step with logprobs requested: per-chunk logprobs, copied
-    # with the tokens and filtered to the accepted rows in `get_output`.
-    spec_logprobs: list[SpecLogprobsChunk] | None = None
-    # Device sources of `spec_logprobs`, kept alive until the copy lands.
-    _spec_logprobs_tpu: list[LogprobsTensors] | None = None
+    # Step with logprobs requested: per-chunk logprobs, copied with the
+    # tokens and cut to each request's rows in `get_output` (the accepted
+    # rows in a spec-decode step).
+    logprobs: list[LogprobsChunk] | None = None
+    # Device sources of `logprobs`, kept alive until the copy lands.
+    _logprobs_tpu: list[LogprobsTensors] | None = None
 
     @classmethod
     def from_device_chunks(
         cls,
         chunks_tpu: list[torch.Tensor],
         chunk_real_lens: list[int],
-        spec_logprobs: list[SpecLogprobsChunk] | None = None,
+        logprobs: list[LogprobsChunk] | None = None,
     ) -> "AsyncTPUCopyState":
         assert len(chunks_tpu) == len(chunk_real_lens) and len(chunks_tpu) > 0
         chunks_cpu = [t.to("cpu", non_blocking=True) for t in chunks_tpu]
-        spec_logprobs_tpu = None
-        if spec_logprobs:
-            spec_logprobs_tpu = [c.tensors for c in spec_logprobs]
-            spec_logprobs = [
-                SpecLogprobsChunk(c.tensors.to_cpu_nonblocking(), c.row_starts)
-                for c in spec_logprobs
+        logprobs_tpu = None
+        if logprobs:
+            # get_output takes request i's logprobs rows from the chunk that
+            # sampled it: one logprobs chunk per token chunk, with one row
+            # start per real request.
+            num_rows = [len(c.row_starts) for c in logprobs]
+            assert num_rows == chunk_real_lens, (num_rows, chunk_real_lens)
+            logprobs_tpu = [c.tensors for c in logprobs]
+            logprobs = [
+                LogprobsChunk(c.tensors.to_cpu_nonblocking(), c.row_starts)
+                for c in logprobs
             ]
         copy_ready_event = torch.tpu.Event()
         copy_ready_event.record()
@@ -121,8 +137,8 @@ class AsyncTPUCopyState:
             chunk_real_lens=chunk_real_lens,
             copy_ready_event=copy_ready_event,
             chunks_tpu=chunks_tpu,
-            spec_logprobs=spec_logprobs or None,
-            _spec_logprobs_tpu=spec_logprobs_tpu,
+            logprobs=logprobs or None,
+            _logprobs_tpu=logprobs_tpu,
         )
 
     def fence_pending_device_work(self) -> None:
@@ -139,7 +155,7 @@ class AsyncTPUCopyState:
             return
         self.copy_ready_event.synchronize()
         self.chunks_tpu = None
-        self._spec_logprobs_tpu = None
+        self._logprobs_tpu = None
         self.completed = True
 
     @property
@@ -210,22 +226,21 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             selected_token_ids = selected_token_ids.unsqueeze(-1)
 
         max_gen_len = selected_token_ids.shape[-1]
+        gen_lens = None
         if max_gen_len == 1:
             valid_sampled_token_ids = selected_token_ids.tolist()
-            for i in self.discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[i].clear()
         else:
             valid_mask = selected_token_ids != INVALID_TOKEN_ID
             gen_lens = valid_mask.sum(dim=1).tolist()
             valid_sampled_token_ids = [
                 seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)
             ]
-            if self.copy_state.spec_logprobs:
-                self._model_runner_output.logprobs = spec_logprobs_lists(
-                    self.copy_state.spec_logprobs, gen_lens
-                )
-            for i in self.discard_sampled_tokens_req_indices:
-                valid_sampled_token_ids[i].clear()
+        if self.copy_state.logprobs:
+            self._model_runner_output.logprobs = logprobs_lists(
+                self.copy_state.logprobs, gen_lens
+            )
+        for i in self.discard_sampled_tokens_req_indices:
+            valid_sampled_token_ids[i].clear()
 
         self._model_runner_output.sampled_token_ids = valid_sampled_token_ids
         return self._model_runner_output

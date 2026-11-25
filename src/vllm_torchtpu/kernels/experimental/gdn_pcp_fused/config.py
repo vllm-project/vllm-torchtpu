@@ -13,7 +13,8 @@
 # limitations under the License.
 
 # Forked from vllm_torchtpu/kernels/gdn/v3/config.py.
-# Upstream V3 changes ported by hand through #1422.
+# Upstream V3 changes ported by hand through #1422, plus #2438's power-of-two
+# triangular_block_size selection.
 # This copy is owned by the PCP workstream and must not import from
 # kernels/gdn/v3. Upstream V3 changes are not picked up automatically;
 # see README.md in this directory.
@@ -138,13 +139,13 @@ class GDNConfig:
 
     @property
     def triangular_block_size(self) -> int:
-        """Sub-block size of the chunked KDA intra-chunk solve.
+        """Sub-block size of the chunked GDN and KDA intra-chunk solves.
 
-        The diagonal sub-blocks are evaluated on the VPU/XLU with exact
-        pairwise gate differences and the off-diagonal ones as MXU GEMMs,
-        so this trades the two units off against each other: raising it
-        moves work from MXU to XLU. More value heads already means more
-        XLU work, hence the smaller blocks there.
+        The diagonal sub-blocks are evaluated on the VPU/XLU (forward
+        substitution, plus KDA's exact pairwise gate differences) and the
+        off-diagonal ones as MXU GEMMs, so this trades the two units off
+        against each other: raising it moves work from MXU to XLU. More value
+        heads already means more XLU work, hence the smaller blocks there.
         """
         # Within-block forward substitution issues head_groups * B / 2 broadcasts
         # per token. At 1 head group (<= 8 heads), B = 16 is optimal.
@@ -152,6 +153,13 @@ class GDNConfig:
         #   B inversely with head_groups (head_groups * B <= 16).
         # - KDA also tiles Aqk and L into O(1 / B^2) sub-block matmuls per token,
         #   so scale B^2 inversely with head_groups (head_groups * B**2 <= 16**2).
+        #
+        # B must divide the chunk: the intra-chunk solve walks the chunk in
+        # whole sub-blocks and `invert_triangular_matrix` rejects a non-dividing
+        # B (e.g. 24 local value heads, Qwen3.5/3.6-27B at TP=2, would get
+        # B = 16 // 3 = 5, which does not divide a 128-row chunk).
+        # Chunk sizes are powers of two, so pick the largest power of two
+        # that satisfies the budget instead of the exact quotient.
         head_groups = pl.cdiv(self.num_v_heads, 8)
         if self.is_kda:
             for b in (16, 8, 4):
@@ -159,7 +167,10 @@ class GDNConfig:
                     return b
             return 2
         # GDN: between-block updates scale as 1 / B.
-        return max(2, min(16, 16 // head_groups))
+        for b in (16, 8, 4):
+            if head_groups * b <= 16:
+                return b
+        return 2
 
     @property
     def use_recurrent(self) -> bool:

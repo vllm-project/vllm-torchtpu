@@ -23,6 +23,10 @@ megakernel code base:
   source path and commit hash in its header).
 - `settings.py`: model-scoped settings.
 
+The compile cache key covers the paths in `_RUNTIME_CACHE_KEY_PATHS` plus
+every `kernels/` and `ops/` directory under `vllm_torchtpu/models/`, so keep
+custom-op bridges and kernel copies in those directories.
+
 The native Kimi-K3 model still lives in `models/vllm/kimi_k3/`.
 
 ## Coordination

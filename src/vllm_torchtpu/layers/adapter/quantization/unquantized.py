@@ -54,7 +54,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.utils import replace_parameter
 
-from vllm_torchtpu.layers.adapter import moe_routing
+from vllm_torchtpu.layers.adapter import moe_routing, moe_skip_policy, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -257,6 +257,17 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         # Parent sets _is_monolithic=False on TPU and skips wiring
         # apply_monolithic.  Override both after super().__init__().
         self.apply_monolithic = self._select_monolithic()
+        # TPUModelRunner publishes its padded-token skipping policy while it
+        # builds the target and draft models. A layer built outside that scope
+        # (only unit tests do) runs the stock path.
+        policy = moe_skip_policy.get_active_bf16_policy()
+        self._skip_padded_tokens = policy is not None and policy.enabled
+        if policy is not None and policy.fallback_reason is not None:
+            logger.warning_once(
+                "TPU_MOE_SKIP_PADDED_TOKENS is not applied to the bf16 MoE "
+                "(%s); falling back to the stock path.",
+                policy.fallback_reason,
+            )
 
     @property
     def is_monolithic(self) -> bool:
@@ -351,9 +362,13 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             moe_routing.validate_linear_ep_placement(layer)
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         prebuild_fused_moe_kernel(
+            topk_weights_float32=self._tpu_topk_weights_float32,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            skip_padded_tokens=self._skip_padded_tokens,
+            # Skipping filters by the valid-row count, passed as row_info.
+            has_row_info=self._skip_padded_tokens,
         )
 
     def _forward_monolithic_tpu(
@@ -373,9 +388,21 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
         # methods so the routing-simulation hook lives in exactly one place.
-        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        topk_weights, topk_ids = moe_routing.route(
+            layer,
+            x,
+            router_logits,
+            topk_weights_float32=self._tpu_topk_weights_float32,
+        )
 
-        kwargs = {
+        row_info = None
+        if self._skip_padded_tokens:
+            # Rows at index >= the local valid-token count are padding. The
+            # runner allocates the count whenever it turns skipping on.
+            row_info = token_padding.get_local_valid_tokens()
+            assert row_info is not None, "TokenPaddingState tracks no valid tokens"
+        kwargs: dict[str, Any] = {
+            "topk_weights_float32": self._tpu_topk_weights_float32,
             "hidden_states": x,
             "w1": layer.w13_weight,
             "w2": layer.w2_weight,
@@ -388,6 +415,8 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             "experts_start": layer._experts_start,
             "topk": layer.moe_config.experts_per_token,
             "activation": activation_str,
+            "skip_padded_tokens": self._skip_padded_tokens,
+            "row_info": row_info,
         }
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)

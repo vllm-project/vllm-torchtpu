@@ -14,8 +14,29 @@
 """StreamIndex Top-K Configuration."""
 
 import enum
-import itertools
-import threading
+
+# Scheduling-group ids (the counter and the per-call-site slots) are
+# process-wide and shared by every kernel, including per-model copies of this
+# one. Re-exported so existing callers keep working.
+from vllm_torchtpu.kernels.scheduling_groups import (
+    MAX_IDS_PER_SLOT as MAX_IDS_PER_SLOT,
+)
+from vllm_torchtpu.kernels.scheduling_groups import (
+    MAX_SCHEDULING_GROUP_SLOT as MAX_SCHEDULING_GROUP_SLOT,
+)
+from vllm_torchtpu.kernels.scheduling_groups import SLOT_ID_BASE as SLOT_ID_BASE
+from vllm_torchtpu.kernels.scheduling_groups import (
+    layer_scheduling_group_slot as layer_scheduling_group_slot,
+)
+from vllm_torchtpu.kernels.scheduling_groups import (
+    reserve_scheduling_group_ids as reserve_scheduling_group_ids,
+)
+from vllm_torchtpu.kernels.scheduling_groups import (
+    reset_scheduling_group_ids as reset_scheduling_group_ids,
+)
+from vllm_torchtpu.kernels.scheduling_groups import (
+    slot_scheduling_group_ids as slot_scheduling_group_ids,
+)
 
 
 class MlaCase(enum.Enum):
@@ -91,48 +112,25 @@ class KVLayout(enum.Enum):
 DEFAULT_BUFFER_COUNT: tuple[int, int, int] = (4, 3, 3)
 
 
-# Source of `_scheduling_group_id`s for the chunked TensorCore/SparseCore
-# pipeline. One counter for the process, because the ids are global to a
-# compiled program and a model traces this kernel once per layer: two layers
-# sharing an id would be ONE group to XLA, and the legalizer would either
-# annotate everything on the path between them or fail the compile.
-#
-# The ids end up in the HLO, so they are part of the compile cache key. The
-# compiler restarts the counter for every program it builds (see
-# `reset_scheduling_group_ids`): otherwise the ids, and with them the key,
-# depend on which programs this process traced before, and two ranks building
-# the same bucket in a different order miss each other's cached executable.
-_scheduling_group_ids = itertools.count(1)
-_scheduling_group_ids_lock = threading.Lock()
+def num_chunks(num_tokens: int, chunk_tokens: int | None) -> int:
+    """How many chunks the top-k pipeline cuts a `num_tokens` bucket into.
 
-
-def reserve_scheduling_group_ids(count: int) -> int:
-    """Reserves `count` scheduling group ids nobody else in this process gets.
-
-    Args:
-      count: Number of ids wanted; a pipeline over `n` chunks uses `n - 1` of them
-        (chunk 0's TensorCore compute and the last chunk's SparseCore compute are
-        not annotated).
-
-    Returns:
-      The first id; the caller owns `[first, first + count)`.
+    One (an unpipelined pass) unless `chunk_tokens` divides `num_tokens` into
+    at least two.
     """
-    if count < 1:
-        raise ValueError(f"count ({count}) must be positive.")
-    with _scheduling_group_ids_lock:
-        first = next(_scheduling_group_ids)
-        for _ in range(count - 1):
-            next(_scheduling_group_ids)
-    return first
+    if chunk_tokens is None or num_tokens % chunk_tokens:
+        return 1
+    return num_tokens // chunk_tokens
 
 
-def reset_scheduling_group_ids() -> None:
-    """Restarts the ids at 1, for the start of a new compiled program.
+def chunked_scheduling_group_slot(
+    slot: int | None, num_tokens: int, chunk_tokens: int | None
+) -> int | None:
+    """`slot` if a `num_tokens` call is pipelined, else None.
 
-    Ids only need to be unique within one program, so the next program can
-    reuse them; resetting makes a program's ids, and so its cache key, the same
-    whatever this process compiled before.
+    Only a pipelined call has scheduling groups, so only it needs its own
+    slot. The slot is a static argument of the jitted kernel: passing one to
+    an unpipelined call would split `jax.jit`'s trace cache by call site for
+    nothing, and every layer would trace every unchunked bucket again.
     """
-    global _scheduling_group_ids
-    with _scheduling_group_ids_lock:
-        _scheduling_group_ids = itertools.count(1)
+    return slot if num_chunks(num_tokens, chunk_tokens) > 1 else None

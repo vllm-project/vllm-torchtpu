@@ -25,7 +25,6 @@ import torch
 import torch._dynamo.utils
 import vllm.lora.layers
 from torch import nn
-from torch_tpu._internal import execution_mode
 from vllm.config.lora import LoRAConfig
 from vllm.lora.layers import (
     BaseClassificationHeadWithLoRA,
@@ -575,7 +574,7 @@ def _large_logits_layer():
 
 def _tpu_managers(make_layers=_tpu_layers):
     # The engine runs eager ops in this mode.
-    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
+    torch.tpu.eager_mode = torch.tpu.EagerMode.DEFER_AND_FUSE
     torch.default_generator.manual_seed(0)
     return _managers(make_layers, torch.device(TPU))
 

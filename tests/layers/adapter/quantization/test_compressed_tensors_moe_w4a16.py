@@ -159,6 +159,8 @@ class FakeRoutedExperts(RoutedExperts):
         self.scoring_func = "softmax"
         self.e_score_correction_bias = None
         self.routed_scaling_factor = 1.0
+        # Set by VllmMoERunner; moe_routing.route reads it.
+        self.capture_fn = None
 
 
 class TestW4MoEUpstreamHooks:
