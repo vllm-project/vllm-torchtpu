@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
+import weakref
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -131,6 +133,42 @@ def test_phased_profiler_finish_stops_a_phase_mid_capture(profiler_fixture):
     # Otherwise a reused profiler never starts a new phase: step() only calls
     # _start_profiling when profiling_n_steps_left <= 0.
     assert profiler.profiling_n_steps_left == 0
+
+
+def test_phased_profiler_finishing_a_phase_frees_results_left_in_cycles(
+    profiler_fixture,
+):
+    """Closing a phase collects, so its cyclic garbage does not wait for the
+    next full collection."""
+    profiler = profiler_fixture["profiler"]
+    mock_context = profiler_fixture["mock_context"]
+    mock_determine_phase = profiler_fixture["mock_determine_phase"]
+    results_refs = []
+
+    class _Results:
+        pass
+
+    def exit_leaving_a_cycle(*args):
+        results = _Results()
+        results.self_ref = results
+        results_refs.append(weakref.ref(results))
+
+    mock_context.__exit__.side_effect = exit_leaving_a_cycle
+    mock_determine_phase.return_value = InferencePhase.PREFILL_HEAVY
+    profiler.step({"num_reqs": 2, "total_num_scheduled_tokens": 100})
+
+    # With automatic collection off, only an explicit collection can free the
+    # cycle; assert before turning it back on.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        profiler.finish()
+
+        assert len(results_refs) == 1
+        assert results_refs[0]() is None
+    finally:
+        if gc_was_enabled:
+            gc.enable()
 
 
 def test_phased_profiler_finish_when_idle_is_a_noop(profiler_fixture):

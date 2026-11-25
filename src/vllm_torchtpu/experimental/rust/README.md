@@ -9,7 +9,24 @@ python -m vllm_torchtpu.experimental.rust serve Qwen/Qwen3-0.6B \
   --max-model-len 2048 --port 8000 --rvllm-binary /path/to/rvllm
 ```
 
-`--rvllm-binary` is the launcher's only option of its own (see
+Alternatively, `vllm serve` can be run directly with `VLLM_TPU_EXPERIMENTAL_USE_RUST=1` (analogous to `VLLM_USE_RUST_FRONTEND=1`):
+
+```bash
+export VLLM_TPU_EXPERIMENTAL_USE_RUST=1
+export VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY=/path/to/rvllm
+
+vllm serve Qwen/Qwen3-0.6B --max-model-len 2048 --port 8000
+```
+
+Only the `vllm serve` command is handed to rvllm. Other entry points ignore
+`VLLM_TPU_EXPERIMENTAL_USE_RUST` and serve with the Python engine, without an
+error. `python -m vllm.entrypoints.openai.api_server --model ...` is one of them:
+its first argument is not `serve`. The same happens with a vLLM version that has
+no `vllm.entrypoints.common.startup.cli_env_setup`, the function the hook wraps.
+When rvllm serves, the launcher prints `rvllm: serve command: ...` before it
+starts; without that line, the Python engine is serving.
+
+`--rvllm-binary` (or environment variable `VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY`) points to the rvllm binary (see
 [The rvllm binary](#the-rvllm-binary)); everything else is the `vllm serve`
 command line.
 
@@ -101,5 +118,7 @@ Downloading from `gs://` uses `gcloud storage` with the caller's credentials.
 Downloaded binaries and exports are cached under `~/.cache/rvllm`.
 
 `--rvllm-binary` can appear anywhere on the command line, as
-`--rvllm-binary VALUE` or `--rvllm-binary=VALUE`. `vllm serve` has no `--rvllm-*`
+`--rvllm-binary VALUE` or `--rvllm-binary=VALUE`. Alternatively, set
+`VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY` in the environment or place `rvllm`
+on `PATH`. `vllm serve` has no `--rvllm-*`
 options, and any other one fails.

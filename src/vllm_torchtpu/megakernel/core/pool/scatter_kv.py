@@ -24,6 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..ops import FP8, I32
 from .backend import kernel_debug_check
+from .checks import safe_kv_page
 from .config import cache_exec
 from .scatter_ctx import ScatterKernel, batch_to_i32_cols, is_active
 
@@ -50,14 +51,23 @@ def scatter_single_token_across_att(
     ex, interpret, NATT, NS = sg.ex, sg.interpret, sg.NATT, sg.NS
     page_size, h4 = sg.page_size, sg.h4
     p = pos_ref[b_idx]
+    p_pos = jnp.maximum(p, jnp.int32(0))
+    p_ok = jnp.logical_and(p >= 0, lax.div(p_pos, page_size) < sg.pt_cols)
     kernel_debug_check(
-        jnp.logical_and(p >= 0, lax.div(p, page_size) < sg.pt_cols),
+        p_ok,
         "KV scatter pos outside [0, page_table.shape[1] * page_size)",
         interpret=bool(interpret),
     )
-    ln = lax.rem(p, page_size)
-    kp = jnp.clip(kv_pages_ref[s_idx, t_idx], 0, cache_exec(ex).num_pages - 1)
-    mask_ln = lane_iota == ln
+    ln = lax.rem(p_pos, page_size)
+    raw_kp = kv_pages_ref[s_idx, t_idx]
+    num_pages = cache_exec(ex).num_pages
+    kernel_debug_check(
+        jnp.logical_and(raw_kp >= 0, raw_kp < num_pages),
+        "KV scatter page index outside [0, num_pages)",
+        interpret=bool(interpret),
+    )
+    kp = jnp.where(p_ok, safe_kv_page(raw_kp, num_pages), jnp.int32(0))
+    mask_ln = jnp.logical_and(p_ok, lane_iota == ln)
     sh_b = lax.rem(ln + (page_size - lax.rem(b_idx, page_size)), page_size)
 
     pltpu.make_async_copy(
@@ -142,30 +152,52 @@ def scatter_kv(kc: ScatterKernel) -> None:
             @pl.when(is_active(kc, s))
             def _():
                 b0 = s * T
-                kp0 = jnp.clip(kv_pages_ref[s, 0], 0, cache_exec(ex).num_pages - 1)
+                num_pages = cache_exec(ex).num_pages
+                raw_kp0 = kv_pages_ref[s, 0]
+                kernel_debug_check(
+                    jnp.logical_and(raw_kp0 >= 0, raw_kp0 < num_pages),
+                    "KV scatter page index outside [0, num_pages)",
+                    interpret=bool(interpret),
+                )
+                kp0 = safe_kv_page(raw_kp0, num_pages)
                 same_page = jnp.bool_(True)
                 for t in range(1, T):
+                    raw_kpt = kv_pages_ref[s, t]
+                    kernel_debug_check(
+                        jnp.logical_and(raw_kpt >= 0, raw_kpt < num_pages),
+                        "KV scatter page index outside [0, num_pages)",
+                        interpret=bool(interpret),
+                    )
                     same_page = jnp.logical_and(
                         same_page,
-                        jnp.clip(kv_pages_ref[s, t], 0, cache_exec(ex).num_pages - 1)
-                        == kp0,
+                        safe_kv_page(raw_kpt, num_pages) == kp0,
                     )
 
                 @pl.when(same_page)
                 def _():
                     kp = kp0
+                    p_ok_list = []
                     for t in range(T):
                         p_t = pos_ref[b0 + t]
+                        p_t_pos = jnp.maximum(p_t, jnp.int32(0))
+                        p_ok_t = jnp.logical_and(
+                            p_t >= 0, lax.div(p_t_pos, page_size) < sg.pt_cols
+                        )
+                        p_ok_list.append(p_ok_t)
                         kernel_debug_check(
-                            jnp.logical_and(
-                                p_t >= 0, lax.div(p_t, page_size) < sg.pt_cols
-                            ),
+                            p_ok_t,
                             "KV scatter pos outside "
                             "[0, page_table.shape[1] * page_size)",
                             interpret=bool(interpret),
                         )
-                    ln_list = [lax.rem(pos_ref[b0 + t], page_size) for t in range(T)]
-                    mask_ln_list = [lane_iota == ln_list[t] for t in range(T)]
+                    ln_list = [
+                        lax.rem(jnp.maximum(pos_ref[b0 + t], jnp.int32(0)), page_size)
+                        for t in range(T)
+                    ]
+                    mask_ln_list = [
+                        jnp.logical_and(p_ok_list[t], lane_iota == ln_list[t])
+                        for t in range(T)
+                    ]
                     sh_list = [
                         lax.rem(
                             ln_list[t] + (page_size - lax.rem(b0 + t, page_size)),

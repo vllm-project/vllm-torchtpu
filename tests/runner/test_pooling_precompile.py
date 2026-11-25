@@ -13,6 +13,7 @@
 # limitations under the License.
 """CPU tests for the AOT-bucketed static pooler and pooling KV cap (PR2)."""
 
+import functools
 import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -730,6 +731,11 @@ def test_runner_precompile_pooler_grid(monkeypatch):
     monkeypatch.setattr(runner_mod, "static_pool", fake_static_pool)
     monkeypatch.setattr(runner_mod, "synchronize_tensors", lambda *a, **k: None)
     runner = _fake_precompile_runner(_spec("LAST"))
+    # The real context manager, so this pass is shown to run under no_grad.
+    runner._update_num_xla_graphs = lambda _name: None
+    runner._precompile_timed = functools.partial(
+        runner_mod.TPUModelRunner._precompile_timed, runner
+    )
     runner_mod.TPUModelRunner._precompile_pooler_subgraphs(runner)
 
     assert [(t, r) for t, r, _ in calls] == [
@@ -756,23 +762,26 @@ def test_runner_precompile_pooler_noop_cases(monkeypatch, overrides):
 
 
 @pytest.mark.parametrize("is_pooling", [True, False])
-def test_runner_sampling_precompile_bypassed_for_pooling(monkeypatch, is_pooling):
+def test_runner_sampling_precompile_bypassed_for_pooling(is_pooling):
     runner_mod = _import_runner()
-    monkeypatch.setattr(
-        runner_mod,
-        "_get_sequence_layout_planner_for_runner",
-        lambda runner: SimpleNamespace(uses_selected_logits_hidden_states=True),
-    )
     names = (
         "_precompile_compute_selected_logits",
         "_precompile_compute_logits_from_hidden_states",
         "_precompile_compute_top_tokens",
         "_precompile_structured_decoding",
         "_precompile_min_tokens_mask",
+        "_precompile_thinking_budget",
+        "_precompile_repetition_penalty",
         "_precompile_sample_from_logits",
         "_precompile_gather_logprobs",
     )
-    runner = SimpleNamespace(is_pooling_model=is_pooling, _pp_is_last=True)
+    runner = SimpleNamespace(
+        is_pooling_model=is_pooling,
+        _pp_is_last=True,
+        get_pcp_planner=lambda: SimpleNamespace(
+            uses_selected_logits_hidden_states=True
+        ),
+    )
     for name in names:
         setattr(runner, name, MagicMock())
     runner_mod.TPUModelRunner._precompile_sampling_subgraphs(runner)
@@ -819,6 +828,7 @@ def _fake_pool_chunk_runner(runner_mod, spec, pooler, prompt_lens, computed):
         _static_pooler_spec=spec,
         model=SimpleNamespace(pooler=pooler),
         device=torch.device("cpu"),
+        pcp_manager=None,
     )
 
 

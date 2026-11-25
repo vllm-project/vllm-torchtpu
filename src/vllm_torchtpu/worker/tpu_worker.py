@@ -17,6 +17,7 @@
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import ctypes
+import gc
 import os
 import time
 from typing import Any, cast
@@ -135,6 +136,10 @@ def _release_free_host_heap() -> None:
 
 
 class TPUWorker(WorkerBase):
+    # Runner class to build in init_device(); Omni workers override it with a
+    # runner that adds the stage-specific hooks.
+    model_runner_cls: type[TPUModelRunner] = TPUModelRunner
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -149,7 +154,7 @@ class TPUWorker(WorkerBase):
 
         patch_registry.apply("worker_init")
         # This process creates the worker's reply ring to the engine.
-        from vllm_torchtpu.distributed.pp_push import widen_message_rings
+        from vllm_torchtpu.distributed.pp_engine import widen_message_rings
 
         widen_message_rings(vllm_config)
 
@@ -527,7 +532,7 @@ class TPUWorker(WorkerBase):
         # WorkerBase declares `nn.Module | None`; this worker always holds a
         # TPUModelRunner from here on.
         # pyrefly: ignore[bad-override-mutable-attribute]
-        self.model_runner: TPUModelRunner = TPUModelRunner(
+        self.model_runner: TPUModelRunner = self.model_runner_cls(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,
@@ -624,7 +629,7 @@ class TPUWorker(WorkerBase):
         # Some KV connectors allocate HBM AFTER profile_run completes — e.g.,
         # an offload spec with a host<->device transfer staging buffer, or a
         # P/D disagg connector with NCCL receive buffers. An adapter swap
-        # holds HBM only while it runs, and the pipeline ring hand-off
+        # holds HBM only while it runs, and the buffered pipeline hand-off
         # allocates its buffers after profile_run too. vLLM's normal
         # accounting misses those bytes, so subtract them from the KV-cache
         # budget.
@@ -729,24 +734,16 @@ class TPUWorker(WorkerBase):
     def sample_tokens(self, grammar_output):
         return self.model_runner.sample_tokens(grammar_output)
 
-    def pp_push(self):
-        return self.model_runner.pp_push()
-
-    def pp_settle(self):
-        return self.model_runner.pp_settle()
-
-    def pp_drains_before_handoff(self) -> bool:
-        """Whether this worker's stage drains the slice before each hand-off
-        launch."""
-        wave = self.model_runner._pp_wave
-        return bool(getattr(wave, "drain_before_handoff", False))
-
     def profile_pipeline_chunks(self) -> dict:
         return self.model_runner.profile_pipeline_chunks()
+
+    def pipeline_chunk_limits(self) -> dict:
+        return self.model_runner.pipeline_chunk_limits()
 
     def take_draft_token_ids(self):
         return self.model_runner.take_draft_token_ids()
 
+    @torch.no_grad()
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
         runner = self.model_runner
@@ -870,6 +867,11 @@ class TPUWorker(WorkerBase):
             self.profile_capture_dir = None
             self.profile_canonical_ts = None
             self.profile_session_key = None
+            # Some of the capture's results are left in reference cycles, which
+            # only the cyclic collector frees, and on a serving worker its next
+            # full pass can be far off. Collect now so the capture does not
+            # keep several GiB of host memory on a rank until then.
+            gc.collect()
 
     def _next_profile_session_key(self) -> str:
         """Marker key for the start/stop cycle that is beginning.
@@ -891,17 +893,16 @@ class TPUWorker(WorkerBase):
         # allocator keeps their pages. Return them before initialize_from_config,
         # where a KV connector may allocate its host store.
         _release_free_host_heap()
+        # Switch to the serving thread count right after weight loading so
+        # profile_run(), initialize_kv_cache(), and capture_model() all trace
+        # under the runtime GLOBAL_STATE guard.
+        set_torch_threads_for_runtime()
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
-        if getattr(self, "speculative_config", None) is not None:
-            # Record the warm-up traces under the serving thread count. Other
-            # models keep upstream's warm-up at the startup count.
-            set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
-        set_torch_threads_for_runtime()
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()

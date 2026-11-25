@@ -27,14 +27,17 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request, RequestStatus
-from vllm.v1.worker import gpu_model_runner
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
     AsyncTPUCopyState,
+)
+from vllm_torchtpu.runner.vllm_v1.worker import gpu_model_runner
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
+    CachedRequestState,
+    InputBatch,
 )
 
 pytestmark = pytest.mark.tpu_test
@@ -86,6 +89,7 @@ def make_runner(device, monkeypatch, k):
     runner._mamba_offset_seeded = set()
     runner._read_offset_scratch = {}
     runner._last_sequence_layout_plan = None
+    runner.pcp_manager = None
     runner._fast_token_substitution = False
     # Real upstream batch operations and CPU token buffers. The kernels being
     # checked (offset reset / source assembly / substitution / D2H) use TPU.
@@ -340,6 +344,7 @@ def substitution_runner(device, k):
     runner.device = device
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
     runner._last_sequence_layout_plan = None
+    runner.pcp_manager = None
     runner._fast_token_substitution = False
     return runner
 

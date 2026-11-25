@@ -291,7 +291,7 @@ def test_rename_transforms_validation_and_reference_lookup():
         _ToyAttn.bind("self_attn", transforms={"nonexistent": {"shard_axis": 0}})
     with pytest.raises(ValueError, match="unknown fields"):
         _ToyAttn.bind("self_attn", transforms={"q_proj": {"bad_field": 1}})
-    with pytest.raises(TypeError, match="invalid type"):
+    with pytest.raises(TypeError, match="invalid type int"):
         _ToyAttn.bind("self_attn", transforms={"q_proj": 123})
 
     # Valid rename + transforms override (both dict and ParamTransform).

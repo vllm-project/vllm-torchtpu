@@ -21,11 +21,11 @@ from vllm_torchtpu.core import pp_chunk_scheduler
 from vllm_torchtpu.core.pp_chunk_scheduler import (
     SCHEDULER_CLS,
     TpuPipelineChunkScheduler,
+    install_chunk_limits_from_workers,
     patch_engine_core_for_pp_chunks,
-    profile_and_install_cost_model,
     uses_dynamic_chunks,
 )
-from vllm_torchtpu.core.pp_chunks import StepCostModel
+from vllm_torchtpu.core.pp_chunks import StepCostModel, chunk_pairs
 
 BUCKETS = [4096, 8192, 12288, 16384]
 _EMPTY_STEP = SimpleNamespace(total_num_scheduled_tokens=0)
@@ -44,15 +44,27 @@ def _scheduler(
     waiting=(),
     step_limit=None,
     kv_holding_waiting=(),
+    granularity=None,
+    schedule=None,
+    lone_prompt=True,
+    equal_cost=True,
 ) -> TpuPipelineChunkScheduler:
+    """A scheduler as the engine hook leaves it: with ``cost``, after
+    ``install_cost_model``; with only ``granularity``, after
+    ``install_chunk_limits``."""
     scheduler = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
+    scheduler._lone_prompt = lone_prompt
+    scheduler._equal_cost = equal_cost
     scheduler._cost = cost
+    scheduler._granularity = cost.granularity if cost is not None else granularity
+    scheduler._schedule = cost.schedule if cost is not None else schedule
     scheduler._step_limit = step_limit
     scheduler._pp_size = 8
     scheduler.waiting = list(waiting)
     scheduler.kv_holding_waiting = list(kv_holding_waiting)
+    scheduler.scheduler_config = SimpleNamespace(max_num_batched_tokens=16384)
     scheduler.vllm_config = SimpleNamespace(
-        scheduler_config=SimpleNamespace(max_num_batched_tokens=16384),
+        scheduler_config=scheduler.scheduler_config,
         parallel_config=SimpleNamespace(pipeline_parallel_size=8),
     )
     scheduler._mamba_split = mamba_split
@@ -251,6 +263,69 @@ def test_the_step_limit_spreads_the_pending_prefill_over_the_stages():
     assert scheduler._step_limit is None
 
 
+def test_lone_prompt_chunks_off_leaves_steps_unlimited():
+    lone = [_request(0, 32768)]
+    scheduler = _scheduler(cost=_model(granularity=2048), running=lone)
+    scheduler._lone_prompt = False
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._step_limit is None
+    # Equal-cost sizing still clips a chunk behind a prefix.
+    got = scheduler._mamba_block_aligned_split(_request(16384, 65536), 16384)
+    assert 0 < got < 16384
+
+
+def test_without_a_cost_model_a_lone_prompt_spreads_over_every_stage():
+    lone = [_request(0, 32768)]
+    scheduler = _scheduler(granularity=2048, running=lone, equal_cost=False)
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    # 32K over 8 stages: 4K steps.
+    assert scheduler._step_limit == 4096
+    # 8K left of a prompt: a granule per stage, with no cost model to say
+    # that fewer, larger steps would finish sooner.
+    scheduler = _scheduler(
+        granularity=2048, running=[_request(24576, 32768)], equal_cost=False
+    )
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._step_limit == 2048
+    # Five prompts fill a full step on every stage: no limit.
+    waiting = [_request(0, 32768, f"w{i}") for i in range(5)]
+    scheduler = _scheduler(granularity=2048, waiting=waiting, equal_cost=False)
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._step_limit is None
+    assert scheduler._mamba_block_aligned_split(waiting[0], 16384) == 16384
+    assert scheduler._clips == 0 and scheduler._waits == 0
+
+
+def test_without_a_cost_model_a_limited_step_fills_with_one_chunk():
+    scheduler = _scheduler(granularity=2048, step_limit=4096, equal_cost=False)
+    assert scheduler._mamba_block_aligned_split(_request(0, 65536), 16384) == 4096
+    assert scheduler._clips == 1
+    # The step is full: the next request waits for the next step.
+    assert scheduler._mamba_block_aligned_split(_request(0, 65536, "s"), 16384) == 0
+    assert scheduler._waits == 1
+
+
+def test_without_a_cost_model_the_pair_capacity_backs_a_deep_chunk_off():
+    schedule = (10000, 256, 256)
+    scheduler = _scheduler(granularity=2048, schedule=schedule, equal_cost=False)
+    # 16K behind 48K needs 64 * 192 + 2080 pairs: over 10000.
+    got = scheduler._mamba_block_aligned_split(_request(49152, 131072), 16384)
+    assert got == 10240 and scheduler._clips == 1
+    assert chunk_pairs(schedule, got, 49152) <= 10000
+    assert chunk_pairs(schedule, got + 2048, 49152) > 10000
+    assert scheduler._step_schedule == chunk_pairs(schedule, got, 49152)
+    # Pairs already in the step leave less room, and the step total stays
+    # on a granule multiple.
+    got = scheduler._mamba_block_aligned_split(_request(0, 65536, "s"), 16384)
+    assert got == 12288
+    assert scheduler._step_tokens % 2048 == 0
+    assert scheduler._step_schedule <= 10000
+
+
 def test_kv_holding_queue_does_not_shrink_the_pending_work_budget():
     pending = [_request(0, 65536, f"w{i}") for i in range(4)]
     scheduler = _scheduler(cost=_model(granularity=2048), waiting=pending)
@@ -344,22 +419,43 @@ def _report(offset: float, granularity=4096):
     }
 
 
-def test_profile_and_install_merges_every_stage(monkeypatch):
+def test_equal_cost_chunks_install_a_model_merged_from_every_stage(monkeypatch):
     monkeypatch.setattr(pp_chunk_scheduler.envs, "TPU_PP_CHUNK_SLACK", 0.1)
     executor = _Executor([_report(10.0), _report(20.0)])
     scheduler = _scheduler()
-    profile_and_install_cost_model(scheduler, executor)
+    install_chunk_limits_from_workers(scheduler, executor)
     assert executor.calls == ["profile_pipeline_chunks"]
     assert scheduler._cost.linear_ms[16384] == pytest.approx(20.0 + 163.84)
     assert scheduler._cost.target_ms == pytest.approx(1.1 * (20.0 + 163.84))
     assert scheduler._cost.granularity == 4096
     # The smallest stage capacity is kept.
     assert scheduler._cost.schedule == (13980, 256, 256)
+    assert scheduler._granularity == 4096
+    assert scheduler._schedule == (13980, 256, 256)
 
 
-def test_profile_and_install_skips_other_schedulers(monkeypatch):
+def test_without_equal_cost_chunks_the_stages_report_limits_untimed():
+    executor = _Executor(
+        [
+            {"granularity": 4096, "schedule": (14000, 256, 256)},
+            {"granularity": 4352, "schedule": (13980, 256, 256)},
+            {"granularity": 4096, "schedule": None},
+        ]
+    )
+    scheduler = _scheduler(equal_cost=False)
+    scheduler._pp_size = 1
+    install_chunk_limits_from_workers(scheduler, executor)
+    assert executor.calls == ["pipeline_chunk_limits"]
+    assert scheduler._cost is None
+    # The largest granule and the smallest stage capacity are kept.
+    assert scheduler._granularity == 4352
+    assert scheduler._schedule == (13980, 256, 256)
+    assert scheduler._pp_size == 8
+
+
+def test_install_chunk_limits_skips_other_schedulers(monkeypatch):
     executor = _Executor([])
-    profile_and_install_cost_model(object(), executor)
+    install_chunk_limits_from_workers(object(), executor)
     assert executor.calls == []
 
 

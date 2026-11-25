@@ -64,6 +64,8 @@
 
 # Distributed: Core Collectives (TP/PP/DP/EP/DCP)
 /src/vllm_torchtpu/distributed/ @sixiang-google @yinlin09 @benliangw @jcc-google @Nanfang-Li @mrjunwan-lang @wenxindongwork @weiyu0824
+/src/vllm_torchtpu/distributed/dcp.py @sixiang-google @yinlin09 @benliangw @jcc-google @Nanfang-Li @mrjunwan-lang @wenxindongwork @weiyu0824 @pritha90 @m-liu @aaronndx
+/src/vllm_torchtpu/distributed/dcp_comm.py @sixiang-google @yinlin09 @benliangw @jcc-google @Nanfang-Li @mrjunwan-lang @wenxindongwork @weiyu0824 @pritha90 @m-liu @aaronndx
 /tests/distributed/ @sixiang-google @yinlin09 @benliangw @jcc-google @Nanfang-Li @mrjunwan-lang @wenxindongwork @weiyu0824
 
 # Distributed: Disaggregated KV Transfer
@@ -75,8 +77,10 @@
 /tests/distributed/test_zmq_*.py @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
 
 # Model Layers
-/src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen
-/tests/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen
+/src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @wenxindongwork
+/src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @pritha90 @m-liu @aaronndx
+/src/vllm_torchtpu/layers/core/dcp_indexer_cache.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @pritha90 @m-liu @aaronndx
+/tests/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @wenxindongwork
 
 # Model Implementations & Model Loader
 /src/vllm_torchtpu/models/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin
@@ -92,13 +96,13 @@
 /tests/kernels/test_rpa_*.py @kyuyeunk @qizzzh @bigeye @jrplatin @kwang3939
 
 # Kernels: Multi-Head Latent Attention (MLA)
-/src/vllm_torchtpu/kernels/mla/ @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth
-/tests/kernels/test_*mla*.py @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth
-/tests/kernels/test_dsa_gather.py @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth
+/src/vllm_torchtpu/kernels/mla/ @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth @pritha90 @m-liu @aaronndx
+/tests/kernels/test_*mla*.py @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth @pritha90 @m-liu @aaronndx
+/tests/kernels/test_dsa_gather.py @kyuyeunk @qizzzh @bigeye @annyan09023 @lenscloth @pritha90 @m-liu @aaronndx
 
 # Kernels: Fused MoE
-/src/vllm_torchtpu/kernels/fused_moe/ @kyuyeunk @qizzzh @bigeye @gxd3 @annyan09023 @helloworld1
-/tests/kernels/fused_moe/ @kyuyeunk @qizzzh @bigeye @gxd3 @annyan09023 @helloworld1
+/src/vllm_torchtpu/kernels/fused_moe/ @kyuyeunk @qizzzh @bigeye @gxd3 @annyan09023 @helloworld1 @vanbasten23
+/tests/kernels/fused_moe/ @kyuyeunk @qizzzh @bigeye @gxd3 @annyan09023 @helloworld1 @vanbasten23
 
 # Kernels: SparseCore Offload & Gather
 /src/vllm_torchtpu/kernels/sparse_core/ @kyuyeunk @qizzzh @bigeye @guowei-dev
@@ -154,6 +158,8 @@
 /src/vllm_torchtpu/models/vllm/deepseek_v4/ @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin
 /tests/kernels/deepseek_v4/ @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin
 /tests/**/test_dsv4_*.py @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin
+/src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/ @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin @pritha90 @m-liu @aaronndx
+/tests/kernels/test_dsv4_streamindex_topk*.py @gxd3 @patemotter @annyan09023 @gpolovets1 @jrplatin @pritha90 @m-liu @aaronndx
 
 # Kernels & Models: DeepSeek v4.1
 /src/vllm_torchtpu/kernels/experimental/deepseek_v41/ @yuyanpeng-google @fro11o @wenqini
@@ -171,21 +177,32 @@
 /src/vllm_torchtpu/models/kimi_k3/ @yiw-wang @QiliangCui @qizzzh
 /tests/models/kimi_k3/ @yiw-wang @QiliangCui @qizzzh
 
-# Models: Qwen3.8 Flash
-/src/vllm_torchtpu/models/qwen38_flash/ @DRZDONG @caojx-google
-/tests/models/qwen38_flash/ @DRZDONG @caojx-google
+# Models: Qwen3.5 MoE
+/src/vllm_torchtpu/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
+/tests/models/qwen3_5/ @mshrihari3 @benliangw @caojx-google @kyuyeunk
+
+# Models: Qwen4 Experimental
+/src/vllm_torchtpu/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
+
+# Models: Qwen4 Experimental (experimental tier)
+/src/vllm_torchtpu/models/qwen4_exp/experimental/ @caojx-google @DRZDONG @benliangw @mshrihari3
+/tests/models/qwen4_exp/experimental/ @caojx-google @DRZDONG @benliangw @mshrihari3
+
+# Models: Qwen4 Experimental (Alibaba)
+/src/vllm_torchtpu/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
+/tests/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 
 # Megakernel (root package and shared test setup)
-/src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
-/tests/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
+/src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
+/tests/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
 
 # Megakernel core (framework-free JAX/Pallas)
-/src/vllm_torchtpu/megakernel/core/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
-/tests/megakernel/core/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google
+/src/vllm_torchtpu/megakernel/core/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
+/tests/megakernel/core/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3
 
 # Megakernel adapter (PyTorch/vLLM bridge)
-/src/vllm_torchtpu/megakernel/adapter/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
-/tests/megakernel/adapter/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li
+/src/vllm_torchtpu/megakernel/adapter/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li @mshrihari3
+/tests/megakernel/adapter/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @qizzzh @Nanfang-Li @mshrihari3
 
 # Speculative Decoding
 /src/vllm_torchtpu/spec_decode/ @Lumosis @junyanxu @gxd3 @jyj0w0 @maxwillzq
@@ -215,6 +232,7 @@
 /src/vllm_torchtpu/tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /scripts/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
+/scripts/vllm/benchmarking/agentic_benchmark/ @wenxindongwork @pv97 @sierraisland @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tests/tools/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /tests/scripts/ @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
 /.pre-commit-config.yaml @theminghuang @yunyao-gg @yiw-wang @maxwillzq @QiliangCui @Nanfang-Li
@@ -223,3 +241,7 @@
 # Entrypoints & E2E Tests
 /tests/entrypoints/ @Lumosis @theminghuang @maxwillzq @Nanfang-Li @QiliangCui
 /tests/e2e/ @Lumosis @theminghuang @maxwillzq @Nanfang-Li @QiliangCui
+
+# Serving Roofline Planner
+/src/vllm_torchtpu/roofline/ @brianseung-google @annyan09023 @bigeye @guowei-dev @benliangw
+/tests/roofline/ @brianseung-google @annyan09023 @bigeye @guowei-dev @benliangw

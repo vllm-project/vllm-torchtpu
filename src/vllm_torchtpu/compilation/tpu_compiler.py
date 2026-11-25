@@ -21,6 +21,7 @@ pipeline. Each shape bucket gets its own compiled executable.
 import contextlib
 import copy
 import dataclasses
+import gc
 import glob
 import hashlib
 import importlib.util
@@ -153,6 +154,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
     "VLLM_TPU_SRPT_ATTN_WORK_CAP",
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS",
+    # Rust native runtime launcher and binary path; intercepted at CLI startup
+    # before runtime and compilation.
+    "VLLM_TPU_EXPERIMENTAL_USE_RUST",
+    "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
@@ -215,15 +220,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_USE_RAIDEN_CONNECTOR",
     # Pipeline chunk sizing: scheduling and the extra token buckets, which
     # are keyed by shape inside the same cache.
-    "TPU_PP_DYNAMIC_CHUNKS",
+    "TPU_PP_LONE_PROMPT_CHUNKS",
+    "TPU_PP_EQUAL_COST_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
-    # Engine-side timing of the pipeline pushes; the workers' programs are
-    # the same either way.
-    "TPU_PP_LAZY_PUSH",
-    # The hand-off between pipeline stages and its depth: it runs outside
-    # the compiled forwards, which take the same inputs either way.
-    "TPU_PP_HANDOFF",
-    "TPU_PP_RING_DEPTH",
+    # The depth of the hand-off between pipeline stages: it runs outside the
+    # compiled forwards, which take the same inputs at any depth.
+    "TPU_PP_HANDOFF_DEPTH",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
@@ -285,6 +287,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/core",
     "vllm_torchtpu/layers/adapter/attention.py",
     "vllm_torchtpu/layers/adapter/cp_attention.py",
+    "vllm_torchtpu/layers/adapter/pcp_kv_gather.py",
     "vllm_torchtpu/layers/adapter/custom_ops",
     "vllm_torchtpu/layers/adapter/fused_moe.py",
     # The fused EP MoE op and the helper that registers it. Both sit behind a
@@ -294,9 +297,6 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
     # Same for the TP decode MoE op, whose body this module builds.
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
-    # Still listed: on this base `pp_shift.py` is a second caller, so the
-    # module stays even though the fused EP op no longer needs it.
-    "vllm_torchtpu/distributed/sharded_jax_op.py",
     # And the mesh they export with: `build_ep_mesh` decides the axis, the
     # shape and the device order (the DeviceAssignment) the kernel runs on.
     "vllm_torchtpu/distributed/ep_mesh.py",
@@ -304,9 +304,15 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
+    # Builds the hierrs_tc reduce-scatter op for the EP MoE combine.
+    "vllm_torchtpu/distributed/hier_reduce_scatter.py",
     # `prefill_checkpoint_enabled` decides whether the GDN op traces with
     # prefill checkpoint operands or with constant None inputs.
     "vllm_torchtpu/gdn_pool_layout.py",
+    # `resolve_subpage_packing_block_size` decides whether the RPA op is built
+    # with a `subpage_split`, which scales its block tables. The packed and
+    # padded layouts can share pool and block-table shapes.
+    "vllm_torchtpu/kv_cache_spec_normalizer.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
@@ -333,12 +339,41 @@ _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
     "vllm_torchtpu/omni/rope.py",
 )
 
+# Model directories may hold copy-on-write specializations of the reference
+# kernels (`kernels/`) and the custom-op bridges that call them (`ops/`), e.g.
+# `models/<model>/kernels/` or `models/vllm/<model>/ops/`. Both sit behind the
+# same custom-op boundaries as `vllm_torchtpu/kernels`, so they are hashed the
+# same way. They are discovered rather than listed, so a model that adds one is
+# covered without editing this file. Only directories with one of these names
+# are discovered: a custom-op wrapper anywhere else in a model directory is
+# hashed only if it is listed in _RUNTIME_CACHE_KEY_PATHS.
+_MODEL_KERNELS_ROOT = "vllm_torchtpu/models"
+_MODEL_CACHE_KEY_DIRNAMES = ("kernels", "ops")
+
+
+def _model_cache_key_relpaths(repo_root: Path) -> list[str]:
+    """Repo-relative paths of every `kernels/` and `ops/` dir under models."""
+    # TODO: (1) Hash only the served model's directories once a vllm_config ->
+    # model-directory mapping exists; today every model's dirs share one key.
+    # (2) Keep megakernel folders (e.g. `models/kimi_k3/megakernel/kernels/`,
+    # planned in #2595) out of the key: megakernel steps compile with
+    # `serializable=False` outside this cache, so hashing them only forces
+    # recompiles.
+    models_root = repo_root / _MODEL_KERNELS_ROOT
+    return [
+        path.relative_to(repo_root).as_posix()
+        for dirname in _MODEL_CACHE_KEY_DIRNAMES
+        for path in models_root.rglob(dirname)
+        # A plain file named `ops` or `kernels` is not a package directory.
+        if path.is_dir()
+    ]
+
 
 def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
     """Return runtime source files that affect TPU custom-op lowering."""
     files_by_relpath: dict[str, Path] = {}
 
-    for rel_path in _RUNTIME_CACHE_KEY_PATHS:
+    for rel_path in (*_RUNTIME_CACHE_KEY_PATHS, *_model_cache_key_relpaths(repo_root)):
         path = repo_root / rel_path
         if path.is_file():
             files_by_relpath[rel_path] = path
@@ -375,7 +410,8 @@ def _reloadable_kernel_relpaths(repo_root: Path) -> list[str]:
     pieces (splitting_ops in tpu_platform.py) and are re-lowered from source
     per process / per reload, so their bytes no longer affect the cached
     executables and are dropped from the cache key. Everything else in
-    _RUNTIME_CACHE_KEY_PATHS stays hashed.
+    _RUNTIME_CACHE_KEY_PATHS and in the discovered `models/**/kernels/` and
+    `models/**/ops/` directories (_model_cache_key_relpaths) stays hashed.
     """
     from vllm_torchtpu.compilation import kernel_reload
 
@@ -595,10 +631,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         # from 1 within it, so the HLO, and with it torch_tpu's cache key, does
         # not depend on what this process compiled before: every rank then
         # builds the same key for a bucket and can hit an executable another
-        # rank already put in the Tier-2 cache.
-        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+        # rank already put in the Tier-2 cache. Every kernel, reference or
+        # per-model copy, takes its ids from the one process-wide counter.
+        from vllm_torchtpu.kernels import scheduling_groups
 
-        config.reset_scheduling_group_ids()
+        scheduling_groups.reset_scheduling_group_ids()
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 
@@ -622,16 +659,24 @@ class TpuCompilerAdaptor(CompilerInterface):
         self,
         key: str,
         path: str,
-        entry: Any,
+        entry: Any | None,
         graph: fx.GraphModule,
         was_wrapped: bool,
         fingerprint: str | None,
     ) -> bool:
         """Write the bundled entry for `graph` to `path`. True if it landed.
 
-        `fingerprint` is `_graph_fingerprint(graph)` taken before the backend
-        ran, as a peer replaying this artifact computes it.
+        With no entry, logs and returns `False`. `fingerprint` is
+        `_graph_fingerprint(graph)` taken before the backend ran, as a peer
+        replaying this artifact computes it.
         """
+        if entry is None:
+            logger.info(
+                "[TpuCompilerAdaptor] No serializable artifact for %s; it "
+                "will be recompiled on the next start",
+                path,
+            )
+            return False
         tmp_path = f"{path}.{os.getpid()}.tmp"
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -881,8 +926,12 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
-        caching = (
-            key is not None and self.cache_dir is not None and not self._disable_cache
+        save_path = (
+            os.path.join(self.cache_dir, key)
+            if key is not None
+            and self.cache_dir is not None
+            and not self._disable_cache
+            else None
         )
 
         # Another rank of this host compiled, or is compiling, this bucket:
@@ -895,21 +944,20 @@ class TpuCompilerAdaptor(CompilerInterface):
         peer = None
         fingerprint = (
             _graph_fingerprint(graph)
-            if caching and envs.TPU_PRECOMPILE_PEER_REPLAY
+            if save_path is not None and envs.TPU_PRECOMPILE_PEER_REPLAY
             else None
         )
         if fingerprint is not None:
             assert key is not None
             peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
         if peer is not None:
-            assert key is not None and self.cache_dir is not None
+            assert key is not None and save_path is not None
             compiled_fn, peer_path = peer
             logger.info(
                 "[TpuCompilerAdaptor] Replayed range %s from %s",
                 compile_range,
                 peer_path,
             )
-            save_path = os.path.join(self.cache_dir, key)
             handle = (
                 (key, save_path, was_wrapped)
                 if self._link_artifact(peer_path, save_path)
@@ -941,19 +989,13 @@ class TpuCompilerAdaptor(CompilerInterface):
         # the PJRT binary itself (torch_tpu_tier3/*.bin); that covers the
         # recompile path in `load`, not this one.
         handle = None
-        if caching and entry is not None:
-            assert self.cache_dir is not None
-            save_path = os.path.join(self.cache_dir, key)
+        if save_path is not None:
+            assert key is not None
             if self._save_handle(
                 key, save_path, entry, graph, was_wrapped, fingerprint
             ):
                 handle = (key, save_path, was_wrapped)
-        elif caching:
-            logger.info(
-                "[TpuCompilerAdaptor] No serializable artifact for range %s; "
-                "it will be recompiled on the next start",
-                compile_range,
-            )
+        del entry
         # Under peer replay, other ranks of the host may be waiting for this
         # artifact: say so when it will not come, so they compile it now.
         if fingerprint is not None:
@@ -962,6 +1004,25 @@ class TpuCompilerAdaptor(CompilerInterface):
                 self._mark_failed(key, fingerprint)
             else:
                 self._clear_failed(key)
+
+        # Run the artifact just saved, not the in-process compile result: the
+        # latter keeps device tensors alive once it has run, which a runnable
+        # rebuilt from the artifact does not. That HBM would otherwise count
+        # against the KV budget measured after the profile run, so a rank that
+        # compiled the profile bucket sizes a smaller KV cache than one that
+        # replayed or loaded it -- across the ranks of one start under peer
+        # replay, and between a cold start and the warm start after it, whose
+        # different block counts then give the backbone a different
+        # compile-cache key. The rebuilt runnable is what replaying ranks and
+        # warm starts run.
+        if handle is not None:
+            reloaded = self._replay(handle[1], graph, was_wrapped, fingerprint)
+            if reloaded is not None:
+                compiled_fn = (
+                    self._unwrap_compiled_fn(reloaded) if was_wrapped else reloaded
+                )
+                # The in-process result holds reference cycles.
+                gc.collect()
 
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second
@@ -1017,12 +1078,20 @@ class TpuCompilerAdaptor(CompilerInterface):
             compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
-            if (
-                entry is not None
-                and self.cache_dir is not None
+            saved = (
+                self.cache_dir is not None
                 and not self._disable_cache
-            ):
-                self._save_handle(key, path, entry, graph, was_wrapped, fingerprint)
+                and self._save_handle(key, path, entry, graph, was_wrapped, fingerprint)
+            )
+            del entry
+            if saved:
+                # As in `compile`: run the artifact just saved, not the
+                # in-process result, so a start that recompiled a stale
+                # artifact holds no extra HBM either.
+                reloaded = self._replay(path, graph, was_wrapped, fingerprint)
+                if reloaded is not None:
+                    compiled_fn = reloaded
+                    gc.collect()
 
         if was_wrapped:
             compiled_fn = self._unwrap_compiled_fn(compiled_fn)

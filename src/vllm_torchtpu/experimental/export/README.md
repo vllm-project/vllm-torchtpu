@@ -106,12 +106,26 @@ tokens; the artifact keeps its own draft count). Each window slot costs one more
 recurrent state per request. Whenever these windows span more than one token
 (`--speculative-config`, or `--max-verify-tokens` above 1), `req_dist` grows
 from 3 to 6 int32 elements: the first three are the attention kernel's request
-distribution, as without windows, and the last three are the recurrent kernels'
-distribution, in which a request's verify window counts as one windowed
-segment rather than as a mixed sequence. Without windows `req_dist` keeps its 3
-elements. These layers keep this per-layer layout rather than vLLM's unified KV
+distribution (see [Attention request distribution](#attention-request-distribution)),
+and the last three are the recurrent kernels' distribution, in which a
+request's verify window counts as one windowed segment. Without windows
+`req_dist` keeps its 3 elements. These layers keep this per-layer layout rather than vLLM's unified KV
 block pool, and the export runs with prefix caching off. The recurrent state
 bytes come off the KV budget before it is divided among KV blocks.
+
+### Attention request distribution
+
+The first three `req_dist` elements are the attention kernel's request
+distribution. Its decode segment takes every leading request whose query is at
+most `serving_config.attention_decode_query_size` tokens, single-token decodes
+and verify windows alike; longer queries and prefill chunks fall in the mixed
+segment. `attention_decode_query_size` is the width the TPU runner gives
+`reorder_batch_threshold`: the narrowest decode stage of the model's Pallas
+attention layers, target and draft. With `--attention-backend CUSTOM` and
+`--speculative-config` of `K` tokens the batched kernel decodes `K + 1` tokens
+(for head sizes other than 64), so it is `K + 1` unless a draft layer runs the
+1-token local kernel of a tp=1 draft. Otherwise, and for models without Pallas
+attention layers, it is 1.
 
 ### MTP drafting
 
@@ -127,10 +141,71 @@ and drafts the first token at each request's `last_token_indices` row; each
 further token comes from one more pass over one row per request, as vLLM's MTP
 proposer chains them.
 
+An MTP draft from a separate checkpoint takes `"model": "<draft checkpoint>"`
+(and optionally `draft_tensor_parallel_size`, which must equal the target's).
+Gemma 4's assistant (`google/gemma-4-31B-it-assistant`, `Gemma4MTP`) is such a
+draft: it is fed the target's last hidden state like an MTP layer, keeps its
+own LM head, and its Q-only attention reads the target's KV (each draft layer
+the last target layer of its attention type, as the TPU runner wires it). Its
+`draft` therefore takes those target KV states, under their forward names and
+indices, instead of KV of its own, writes none, and keeps every further pass at
+the first pass's last position and KV length (`advance_draft_positions` is
+false for it in the runner). The record stays `method: mtp`.
+
 A model outside vLLM lists its MTP layer's weights among `abstract_params()`
 under `mtp.` names and implements `mtp_abstract_states()` and `mtp_draft()`.
 The export finds the target weights the draft shares by lowering it once, as
 for the forward.
+
+### DSpark and DFlash drafting
+
+With `--speculative-config '{"method": "dspark", "num_speculative_tokens": K,
+"model": "<draft checkpoint>"}'` the export loads the separate DSpark draft model
+vLLM builds for it (e.g. `Qwen3DSparkForCausalLM`) and exports it as the same
+drafter function `draft` / `draft_bucket{B}`. `draft_tensor_parallel_size`, if
+given, must equal `--tensor-parallel-size`. The artifact's
+`speculative_config` records only `method` and `num_speculative_tokens`; the
+draft checkpoint is how vLLM loads it, not something the runtime reads.
+
+- `forward` returns one more intermediate after `hidden_states`:
+  `aux_hidden_states` `[B, n * hidden_size]`, the residual stream entering
+  each of the draft's `n` target layers (after layer `target_layer_ids[i]`),
+  concatenated per row, as vLLM's `set_aux_hidden_state_layers` returns it.
+- `draft_bucket{B}` takes the drafter controls, the draft's weights (`draft.`
+  for its `model.`; an embedding or LM head the checkpoint does not carry binds
+  the target's slot), one paged KV state per draft layer (numbered after the
+  target's, paged like it: `num_blocks` of `block_size`, through the step's
+  `block_tables`) and `aux_hidden_states` in place of `hidden_states`.
+- Every row of the step writes its context keys and values, projected from its
+  `aux_hidden_states`, to the draft KV at its position. Then each request runs
+  one non-causal block: its anchor `input_ids[last_token_indices[r]]` at
+  `positions[last_token_indices[r]] + 1` followed by mask tokens (`K` tokens for
+  dense DSpark checkpoints, `1 + K` with `sample_from_anchor: false`), and the
+  Markov head picks the `K` drafts left to right. The block's own keys and
+  values land past the accepted tokens, where the next step's context rows
+  overwrite them.
+
+Each `draft_bucket{B}` drafts only for the step's live requests. The drafter
+(MTP or DSpark/DFlash) is lowered once per request count `N` in
+`exporter.draft_slot_counts(B, max_num_seqs)` (powers of two below
+`min(B, max_num_seqs)`, then that count), and `case_compose` merges the
+variants into one module whose `@main` runs, through `stablehlo.case`, the
+smallest `N` holding the step's request count (`req_dist[2]`). Every row still
+writes its context KV; only the per-request work (a DSpark block, an MTP
+draft's logits and further passes) covers `N` requests. The module keeps the
+largest variant's signature, so the artifact contract does not change, and
+`draft_tokens` rows past `N` are 0.
+
+A DFlash draft (`"method": "dflash"` with its `model`) is driven exactly like
+a DSpark one, so the artifact declares the runtime protocol, `dspark`: the same
+`aux_hidden_states`, paged KV and block per step. Its block is the anchor and
+`K` mask slots (`1 + K` tokens, `K` fixed by the checkpoint's block size), each
+mask slot's draft is its argmax over the target vocabulary, and it always uses
+the target's embedding and LM head.
+
+These steps are copies of the TPU runner's DFlash / DSpark proposer
+(`draft_model.py`), checked against it by `test_draft_model_parity.py`. The
+checkpoint's confidence head (adaptive verification) is not exported.
 
 ### Example: match a `vllm serve` run
 

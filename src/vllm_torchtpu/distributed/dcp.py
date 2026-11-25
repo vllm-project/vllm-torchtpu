@@ -52,6 +52,16 @@ def get_dcp_group() -> Any | None:
         return None
 
 
+def get_tp_group_or_none() -> Any | None:
+    """Return vLLM's TP GroupCoordinator, or None if not initialized."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group as _get_group
+
+        return _get_group()
+    except (AssertionError, ImportError):
+        return None
+
+
 def get_dcp_rank() -> int:
     group = get_dcp_group()
     return 0 if group is None else int(group.rank_in_group)
@@ -139,7 +149,7 @@ def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
     if cached is not None:
         return cached
 
-    from torch_tpu._internal.pallas import get_pallas_mesh
+    from torch.tpu.pallas import get_pallas_mesh
 
     # No device array: get_pallas_mesh numbers mesh positions by PyTorch rank,
     # which is the binding torch_tpu#3522 guarantees.

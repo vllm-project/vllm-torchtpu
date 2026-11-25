@@ -20,10 +20,10 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_model_runner import GPUModelRunner
 
 
 @pytest.mark.parametrize("transition", ["preempt", "resume", "finish", "continue"])
@@ -47,6 +47,7 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
         token_ids_cpu=np.zeros((2, 256), dtype=np.int32),
     )
     runner._last_sequence_layout_plan = None
+    runner.pcp_manager = None
     runner.speculative_config = (
         SimpleNamespace(num_speculative_tokens=num_drafts) if num_drafts else None
     )

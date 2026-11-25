@@ -19,10 +19,10 @@ from typing import Any
 import jax
 import torch
 from jax.sharding import PartitionSpec as P
+from torch_tpu._internal import pallas
 from vllm.distributed import get_tp_group
 
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_rank_order, get_ep_group
-from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_op
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 
 from vllm_torchtpu.kernels.kimi_k3.collectives import (  # isort: skip
@@ -35,6 +35,14 @@ from vllm_torchtpu.kernels.kimi_k3.collectives import (  # isort: skip
     ring_collective,
     ring_tables,
 )
+
+SP_AXIS_NAME = "k3_sp"
+# torch_tpu 0.2.0 types partition specs as tuple[tuple[str, ...], ...] and its
+# _normalize_output_partition_specs leaves a bare PartitionSpec unwrapped,
+# indexing multi-char axis names per character; drop the Any annotations and
+# 1-tuple wrappers once torch_tpu accepts PartitionSpec and normalizes bare specs.
+_REPLICATED: Any = P()
+_ROW_SHARDED: Any = P(SP_AXIS_NAME, None)
 
 _OPS: dict[tuple, Any] = {}
 
@@ -54,12 +62,12 @@ def _build_mla_ops(mesh, owners, layer, eps):
     def pack(weight: jax.Array) -> jax.Array:
         return pack_mla_gate(weight, mesh, pairs)
 
-    pack_op = sharded_jax_op(
+    pack_op = pallas.jax_op(
         f"pallas::kimi_mla_pack_gate_{layer}",
         pack,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None),),
-        output_partition_specs=P("k3_sp", None),
+        input_partition_specs=(_ROW_SHARDED,),
+        output_partition_specs=(_ROW_SHARDED,),
     )
     pack_op.register_fake(lambda weight: weight.new_empty((7168, 6144)))
 
@@ -83,12 +91,12 @@ def _build_mla_ops(mesh, owners, layer, eps):
             eps=eps,
         )
 
-    op = sharded_jax_op(
+    op = pallas.jax_op(
         f"pallas::kimi_mla_preprocess_{layer}",
         preprocess,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None),) * 3 + (P(), P(), P()),
-        output_partition_specs=(P("k3_sp", None),) * 4,
+        input_partition_specs=(_ROW_SHARDED,) * 3 + (_REPLICATED,) * 3,
+        output_partition_specs=(_ROW_SHARDED,) * 4,
     )
 
     def fake(x, weight, packed_gate, qnorm, kvnorm, sequence_parallel):
@@ -117,12 +125,12 @@ def _build_moe_gather_op(mesh, tables, collective_id):
             x, weights, ids, mesh, tables, collective_id=collective_id
         )
 
-    op = sharded_jax_op(
+    op = pallas.jax_op(
         f"pallas::kimi_moe_ag_{collective_id}",
         gather,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None),) * 3,
-        output_partition_specs=(P(),) * 3,
+        input_partition_specs=(_ROW_SHARDED,) * 3,
+        output_partition_specs=(_REPLICATED,) * 3,
     )
 
     def fake(x, weights, ids):
@@ -155,12 +163,12 @@ def _build_op(mesh, tables, gather, collective_id):
         )
 
     name = f"pallas::kimi_ring_{'ag' if gather else 'rs'}_{collective_id}"
-    op = sharded_jax_op(
+    op = pallas.jax_op(
         name,
         collective,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None),),
-        output_partition_specs=P() if gather else P("k3_sp", None),
+        input_partition_specs=(_ROW_SHARDED,),
+        output_partition_specs=(_REPLICATED if gather else _ROW_SHARDED,),
     )
 
     def fake(x):
@@ -191,12 +199,12 @@ def _build_project_op(mesh, tables, collective_id):
             collective_id=collective_id,
         )
 
-    op = sharded_jax_op(
+    op = pallas.jax_op(
         f"pallas::kimi_project_rs_{collective_id}",
         project,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None), P("k3_sp", None)),
-        output_partition_specs=P("k3_sp", None),
+        input_partition_specs=(_ROW_SHARDED, _ROW_SHARDED),
+        output_partition_specs=(_ROW_SHARDED,),
     )
 
     def fake(x, w):
@@ -225,12 +233,12 @@ def _build_gather_project_op(mesh, tables, collective_id):
         )
         return result.reshape(-1, 1792)
 
-    op = sharded_jax_op(
+    op = pallas.jax_op(
         f"pallas::kimi_gather_project_{collective_id}",
         project,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None), P("k3_sp", None)),
-        output_partition_specs=P("k3_sp", None),
+        input_partition_specs=(_ROW_SHARDED, _ROW_SHARDED),
+        output_partition_specs=(_ROW_SHARDED,),
     )
 
     def fake(x, w):
@@ -249,7 +257,7 @@ def _mesh_and_tables():
     base = get_tp_group()
     if ep is None or list(ep.ranks) != list(base.ranks):
         raise ValueError("K3 rings require identical TP32 and EP32 rank order")
-    mesh = build_ep_mesh(axis_name="k3_sp")
+    mesh = build_ep_mesh(axis_name=SP_AXIS_NAME)
     assert mesh is not None
     owners = ep_rank_order()
     return mesh, ring_tables(list(mesh.devices.flat), owners)
@@ -270,26 +278,30 @@ def _build_token_op(world_size, gather):
         def local(part):
             if gather:
                 return jax.lax.all_gather(
-                    part, "k3_sp", axis=0, tiled=True, axis_index_groups=groups
+                    part, SP_AXIS_NAME, axis=0, tiled=True, axis_index_groups=groups
                 )
             return jax.lax.psum_scatter(
-                part, "k3_sp", scatter_dimension=0, tiled=True, axis_index_groups=groups
+                part,
+                SP_AXIS_NAME,
+                scatter_dimension=0,
+                tiled=True,
+                axis_index_groups=groups,
             )
 
         return jax.shard_map(
             local,
             mesh=mesh,
-            in_specs=P("k3_sp", None),
-            out_specs=P("k3_sp", None),
+            in_specs=P(SP_AXIS_NAME, None),
+            out_specs=P(SP_AXIS_NAME, None),
             check_vma=False,
         )(x)
 
-    op = sharded_jax_op(
+    op = pallas.jax_op(
         f"pallas::kimi_token_{world_size}_{'ag' if gather else 'rs'}",
         collective,
         mesh=mesh,
-        input_partition_specs=(P("k3_sp", None),),
-        output_partition_specs=P("k3_sp", None),
+        input_partition_specs=(_ROW_SHARDED,),
+        output_partition_specs=(_ROW_SHARDED,),
     )
 
     def fake(x):

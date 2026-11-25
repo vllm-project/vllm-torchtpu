@@ -24,9 +24,19 @@ from jax._src.state import indexing
 from jax._src.state import types as state_types
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
+from kernels.gdn.v3.vmem_test_utils import (
+    get_vmem_declared_bytes,
+    weight_refs_vmem_bytes,
+)
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, tiling, wrapper
+from vllm_torchtpu.kernels.gdn.v3 import (
+    compute_gdn,
+    config,
+    memory_ref,
+    tiling,
+    wrapper,
+)
 
 
 def _l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
@@ -312,6 +322,9 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                 ("tp8_padded_n512_b64", 2, 8, 64, 512, 1, bf16, (8, 64)),
                 # PCP8 + TP1 disagg prefill (n_kq=2, n_v=8, W=1)
                 ("pcp8_prefill_b4096", 2, 8, 4096, 16, 1, f32, (4, 128)),
+                # Qwen3.5/3.6-27B + TP2 (n_kq=8, n_v=24): 3 head groups
+                ("qwen27b_tp2_c32_b32", 8, 24, 32, 32, 1, f32, (4, 32)),
+                ("qwen27b_tp2_c32_b2048", 8, 24, 2048, 32, 1, f32, (4, 128)),
                 # DP4 + TP2 + EP8 (n_kq=8, n_v=32, W=1 and W=4)
                 ("dp4tp2_c64_b8", 8, 32, 8, 32, 1, f32, (2, 8)),
                 ("dp4tp2_c64_b32", 8, 32, 32, 32, 1, f32, (4, 32)),
@@ -349,6 +362,243 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                         window_size=w,
                     )
                     self.assertEqual(got, expected, msg=label)
+                    _, mixed_tile = got
+                    cfg = self._gdn_config(n_v, mixed_tile)
+                    tri_b = min(cfg.triangular_block_size, mixed_tile)
+                    self.assertEqual(mixed_tile % tri_b, 0, msg=label)
+
+    def _gdn_config(self, n_v, chunk_size, attention_mode=None, cfg_mod=config):
+        if attention_mode is None:
+            attention_mode = cfg_mod.AttentionMode.GDN
+        n_kq = max(1, n_v // 4)
+        return cfg_mod.GDNConfig(
+            mode=cfg_mod.GDNMode.PER_SEQ,
+            dtypes=cfg_mod.Dtypes(
+                act_in=jnp.dtype(jnp.bfloat16),
+                act_out=jnp.dtype(jnp.bfloat16),
+                compute=jnp.dtype(jnp.float32),
+                recurrent_state=jnp.dtype(jnp.float32),
+                conv_state=jnp.dtype(jnp.bfloat16),
+            ),
+            batch_size=chunk_size,
+            dim_size=2 * n_kq * 128 + n_v * 128,
+            kernel_size=4,
+            tile_size=chunk_size,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=128,
+            v_head_dim=128,
+            attention_mode=attention_mode,
+        )
+
+    def test_triangular_block_size_divides_every_chunk(self):
+        """B is a power of two dividing every mixed tile size, for any head count.
+
+        Regression for Qwen3.5/3.6-27B at TP=2 (24 local value heads): the
+        exact quotient 16 // 3 = 5 does not divide 128 (or PCP's 64), truncating
+        the intra-chunk inverse and failing startup with
+        "array split does not result in an equal division: rest is 1".
+        Covers both `kernels/gdn/v3` and its `kernels/experimental/gdn_pcp_fused`
+        fork.
+        """
+        from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
+            config as pcp_config,
+        )
+
+        expected_gdn = {8: 16, 16: 8, 24: 4, 32: 4, 40: 2, 48: 2, 64: 2}
+        for fork_name, cfg_mod in (("v3", config), ("gdn_pcp_fused", pcp_config)):
+            for n_v in (1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 96, 128):
+                for attention_mode in cfg_mod.AttentionMode:
+                    for chunk_size in tiling.MIXED_TILE_SIZES:
+                        with self.subTest(
+                            fork=fork_name,
+                            n_v=n_v,
+                            mode=attention_mode,
+                            chunk_size=chunk_size,
+                        ):
+                            cfg = self._gdn_config(
+                                n_v, chunk_size, attention_mode, cfg_mod=cfg_mod
+                            )
+                            b = cfg.triangular_block_size
+                            self.assertGreaterEqual(b, 2)
+                            self.assertEqual(b & (b - 1), 0, f"B={b} not a power of 2")
+                            effective = min(b, cfg.chunk_size)
+                            self.assertEqual(cfg.chunk_size % effective, 0)
+                if n_v in expected_gdn:
+                    with self.subTest(
+                        fork=fork_name, n_v=n_v, expected_b=expected_gdn[n_v]
+                    ):
+                        cfg = self._gdn_config(n_v, 128, cfg_mod=cfg_mod)
+                        self.assertEqual(
+                            cfg.triangular_block_size,
+                            expected_gdn[n_v],
+                            (fork_name, n_v),
+                        )
+
+    def test_invert_triangular_matrix_rejects_non_dividing_block(self):
+        """Negative control: a block size that does not divide the chunk
+        fails at the solve instead of returning a truncated inverse."""
+        from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
+            compute_gdn as pcp_compute_gdn,
+        )
+        from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, compute_kda
+
+        t = jnp.tril(jnp.ones((2, 128, 128), dtype=jnp.float32))
+        for fork_name, mod in (
+            ("v3", compute_gdn),
+            ("gdn_pcp_fused", pcp_compute_gdn),
+        ):
+            with self.subTest(fork=fork_name):
+                with self.assertRaisesRegex(AssertionError, "divisible"):
+                    mod.invert_triangular_matrix(t, block_size=5)
+                # Divisors still work and the inverse keeps the full chunk.
+                for block_size in (16, 8, 4, 2):
+                    inv = mod.invert_triangular_matrix(t, block_size=block_size)
+                    self.assertEqual(inv.shape, t.shape)
+
+        with self.subTest(fork="v3_kda"):
+            kda_bad_cfg = self._gdn_config(
+                8, 24, attention_mode=config.AttentionMode.KDA
+            )
+            self.assertEqual(kda_bad_cfg.triangular_block_size, 16)
+            with self.assertRaisesRegex(AssertionError, "divisible"):
+                compute_kda.chunked_kda_per_seq(
+                    q_large=jnp.zeros((2, 24, 128), dtype=jnp.float32),
+                    k_large=jnp.zeros((2, 24, 128), dtype=jnp.float32),
+                    v_large=jnp.zeros((8, 24, 128), dtype=jnp.float32),
+                    gating_log=jnp.zeros((8, 24, 128), dtype=jnp.float32),
+                    beta=jnp.zeros((1, 24, 8), dtype=jnp.float32),
+                    state_prev=jnp.zeros((8, 128, 128), dtype=jnp.float32),
+                    cfg=kda_bad_cfg,
+                )
+            kda_ok_cfg = self._gdn_config(
+                8, 32, attention_mode=config.AttentionMode.KDA
+            )
+            out, state = compute_kda.chunked_kda_per_seq(
+                q_large=jnp.zeros((2, 32, 128), dtype=jnp.float32),
+                k_large=jnp.zeros((2, 32, 128), dtype=jnp.float32),
+                v_large=jnp.zeros((8, 32, 128), dtype=jnp.float32),
+                gating_log=jnp.zeros((8, 32, 128), dtype=jnp.float32),
+                beta=jnp.zeros((1, 32, 8), dtype=jnp.float32),
+                state_prev=jnp.zeros((8, 128, 128), dtype=jnp.float32),
+                cfg=kda_ok_cfg,
+            )
+            self.assertEqual(out.shape, (8, 32, 128))
+            self.assertEqual(state.shape, (8, 128, 128))
+
+    def test_mixed_tile_clip_rounds_down_to_power_of_two(self):
+        """Small non-power-of-two token buckets round mixed_tile_size down to a
+        power of two so triangular_block_size divides the chunk on static/KDA
+        paths and under explicit overrides."""
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        d_k, d_v, kernel_size = 128, 128, 4
+        n_kq, n_v = 2, 8
+        dim = 2 * n_kq * d_k + n_v * d_v
+
+        with use_abstract_mesh(mesh):
+            limit = config.GDNConfig.get_vmem_limit_bytes(1)
+            _, mixed_override = tiling.get_tile_sizes(
+                batch_size=24,
+                num_seqs=1,
+                padded_batch_size=24,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                conv_state_dim_size=dim,
+                act_out_dtype=jnp.dtype(jnp.bfloat16),
+                recurrent_state_dtype=jnp.dtype(jnp.float32),
+                num_lanes=128,
+                decode_vmem_limit_bytes=limit,
+                mixed_vmem_limit_bytes=limit,
+                mixed_tile_size=64,
+            )
+            self.assertEqual(mixed_override, 16)
+
+            seen_cfgs = []
+
+            def _fake_pallas_call(kernel_fn, *, out_shape, **_kwargs):
+                seen_cfgs.append(kernel_fn.keywords["cfg"])
+                out_spec, states_spec = out_shape
+                return lambda *_args: (
+                    jnp.zeros(out_spec.shape, dtype=out_spec.dtype),
+                    states_spec,
+                )
+
+            for batch_size, expected_chunk in (
+                (1, 1),
+                (3, 2),
+                (5, 4),
+                (12, 8),
+                (24, 16),
+                (48, 32),
+            ):
+                with self.subTest(batch_size=batch_size):
+                    seen_cfgs.clear()
+
+                    with (
+                        mock.patch.object(envs, "TPU_ENABLE_GDN_DYNAMIC_TILING", False),
+                        mock.patch.object(wrapper.pl, "pallas_call", _fake_pallas_call),
+                    ):
+                        wrapper.fused_conv1d_gdn.__wrapped__(
+                            qkv=jnp.zeros((batch_size, dim), dtype=jnp.bfloat16),
+                            b=jnp.zeros((batch_size, n_v), dtype=jnp.bfloat16),
+                            a=jnp.zeros((batch_size, n_v), dtype=jnp.bfloat16),
+                            states=(
+                                jnp.zeros((2, kernel_size - 1, dim), dtype=jnp.float32),
+                                jnp.zeros((2, n_v, d_k, d_v), dtype=jnp.float32),
+                            ),
+                            conv_weight=jnp.zeros(
+                                (dim, 1, kernel_size), dtype=jnp.bfloat16
+                            ),
+                            conv_bias=None,
+                            a_log=jnp.zeros((n_v,), dtype=jnp.float32),
+                            dt_bias=jnp.zeros((n_v,), dtype=jnp.float32),
+                            query_start_loc=jnp.array([0, batch_size], dtype=jnp.int32),
+                            state_indices=jnp.array([1], dtype=jnp.int32),
+                            distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+                            seq_lens=jnp.array([batch_size], dtype=jnp.int32),
+                            n_kq=n_kq,
+                            n_v=n_v,
+                            d_k=d_k,
+                            d_v=d_v,
+                            kernel_size=kernel_size,
+                            prefill_only=True,
+                        )
+                    self.assertEqual(len(seen_cfgs), 1)
+                    per_seq_cfg = seen_cfgs[0]
+                    self.assertEqual(per_seq_cfg.chunk_size, expected_chunk)
+                    effective_b = min(
+                        per_seq_cfg.triangular_block_size, per_seq_cfg.chunk_size
+                    )
+                    self.assertEqual(per_seq_cfg.chunk_size % effective_b, 0)
+
+    def test_invert_triangular_matrix_block_sizes_agree(self):
+        """Every power-of-two block size inverts the same matrix identically,
+        so moving 24 heads from B=5 to B=4 only changes the schedule."""
+        from vllm_torchtpu.kernels.gdn.v3 import compute_gdn
+
+        rng = jax.random.key(7)
+        # Unit lower-triangular, as the chunked solve produces.
+        strict = jnp.tril(jax.random.normal(rng, (3, 128, 128)) * 0.1, k=-1)
+        t = strict + jnp.eye(128)[None]
+        # The off-diagonal blocks are f32 dots; TPU's default matmul precision
+        # rounds their inputs to bf16, which is below this test's resolution.
+        with jax.default_matmul_precision("highest"):
+            reference = jnp.linalg.inv(t)
+            for block_size in (16, 8, 4, 2):
+                with self.subTest(block_size=block_size):
+                    inv = compute_gdn.invert_triangular_matrix(t, block_size=block_size)
+                    np.testing.assert_allclose(inv, reference, rtol=1e-4, atol=1e-4)
+                    np.testing.assert_allclose(
+                        jnp.einsum("bij,bjk->bik", t, inv),
+                        jnp.broadcast_to(jnp.eye(128), t.shape),
+                        rtol=1e-4,
+                        atol=1e-4,
+                    )
 
     def test_tile_sizes_with_split_state_slots_at_w1(self):
         """W=1 decode tiles count 1 input and 1 output state slot per sequence."""
@@ -385,6 +635,94 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                         window_size=1,
                     )
                     self.assertEqual(got, expected, msg=label)
+
+    def test_gdn_vmem_declared_bytes_matches_create_allocs(self) -> None:
+        """Verify 0 B delta between declared VMEM bytes and create_allocs."""
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        with use_abstract_mesh(mesh):
+            d_k = d_v = 128
+            kernel_size = 4
+            tpu_info = pltpu.get_tpu_info()
+            num_lanes = tpu_info.num_lanes
+            num_sublanes = tpu_info.num_sublanes
+            f32 = jnp.dtype(jnp.float32)
+            bf16 = jnp.dtype(jnp.bfloat16)
+            dummy_meta = memory_ref.MetadataRef(
+                num_tiles=None,
+                p_id_to_s_idx=None,
+                p_id_to_r_base=None,
+                p_id_to_r_size=None,
+                p_id_is_first_tile=None,
+                p_id_is_last_tile=None,
+                s_idx_has_initial_state=None,
+                s_idx_to_state_indices=None,
+                s_idx_to_read_offset=None,
+                s_idx_to_ckpt_indices=None,
+            )
+            cases = [
+                (mode, n_kq, n_v, tile_size, window_size)
+                for mode in (config.GDNMode.BATCHED, config.GDNMode.PER_SEQ)
+                for n_kq, n_v, tile_size, window_size in (
+                    (2, 8, 8, 1),
+                    (2, 8, 8, 4),
+                    (8, 32, 4, 1),
+                    (16, 64, 32, 1),
+                )
+                if not (mode == config.GDNMode.PER_SEQ and window_size > 1)
+            ]
+            for mode, n_kq, n_v, tile_size, window_size in cases:
+                dim_size = 2 * n_kq * d_k + n_v * d_v
+                cfg = config.GDNConfig(
+                    mode=mode,
+                    dtypes=config.Dtypes(
+                        act_in=f32,
+                        act_out=bf16,
+                        compute=f32,
+                        recurrent_state=f32,
+                        conv_state=f32,
+                    ),
+                    batch_size=512,
+                    dim_size=dim_size,
+                    kernel_size=kernel_size,
+                    tile_size=tile_size,
+                    num_kq_heads=n_kq,
+                    num_v_heads=n_v,
+                    kq_head_dim=d_k,
+                    v_head_dim=d_v,
+                    attention_mode=config.AttentionMode.GDN,
+                    window_size=window_size,
+                )
+                allocs = memory_ref.create_allocs(
+                    metadata_ref=dummy_meta,
+                    qkv_ref=f32,
+                    b_ref=f32,
+                    a_ref=f32,
+                    out_ref=bf16,
+                    conv_state_ref=f32,
+                    recurrent_state_ref=f32,
+                    cfg=cfg,
+                )
+                alloc_bytes = sum(
+                    int(np.prod(a.window_ref.shape))
+                    * jnp.dtype(a.window_ref.dtype).itemsize
+                    for a in allocs
+                    if a.window_ref is not None
+                )
+                scratch_bytes = sum(
+                    int(np.prod(s.shape)) * jnp.dtype(s.dtype).itemsize
+                    for s in cfg.get_scratch_shape_dict().values()
+                    if s is not None
+                )
+                weights_bytes = weight_refs_vmem_bytes(cfg, num_lanes, num_sublanes)
+                declared = get_vmem_declared_bytes(
+                    cfg,
+                    conv_state_dim_size=dim_size,
+                    num_lanes=num_lanes,
+                    num_sublanes=num_sublanes,
+                )
+                self.assertEqual(declared, alloc_bytes + scratch_bytes + weights_bytes)
 
 
 class GDNStatePipelineRaceTest(parameterized.TestCase):
@@ -541,7 +879,104 @@ class GDNL2NormTest(parameterized.TestCase):
 
 
 class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
-    """CPU checks for single-token decode [k, q] projection fusion."""
+    """CPU checks for fused [k, q] recurrent GDN contractions."""
+
+    @staticmethod
+    def _per_seq_token_loop_oracle(
+        qkv: tuple[jax.Array, jax.Array, jax.Array],
+        gates: tuple[jax.Array, jax.Array],
+        state: jax.Array,
+        cfgs: config.GDNConfig,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Run un-fused per-sequence 2-dot reference recurrence."""
+        q_seq, k_seq, v_seq = qkv
+        gating_seq, beta_seq = gates
+        out_list = []
+        state_list = []
+        for c_idx in range(cfgs.chunk_size):
+            q_curr = jnp.repeat(q_seq[:, c_idx], cfgs.v_per_kq_head, axis=0)
+            k_curr = jnp.repeat(k_seq[:, c_idx], cfgs.v_per_kq_head, axis=0)
+            v_curr = v_seq[:, c_idx]
+            k_curr_t = compute_gdn.fused_transpose_broadcast(
+                k_curr, src_dim=2, dst_dim=1
+            )
+            beta_curr = beta_seq[:, c_idx]
+            gating_curr = gating_seq[:, c_idx]
+
+            state_updated = state * gating_curr
+            v_updated = jax.lax.dot(
+                k_curr,
+                state_updated,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            ).astype(cfgs.dtypes.compute)
+            v_new = beta_curr * (v_curr - v_updated)
+            state = state_updated + k_curr_t * v_new
+            out = jax.lax.dot(
+                q_curr,
+                state,
+                dimension_numbers=(((2,), (1,)), ((0,), (0,))),
+                preferred_element_type=jnp.float32,
+            ).astype(cfgs.dtypes.compute)
+            out_list.append(out[:, 0, :])
+            if c_idx >= cfgs.chunk_size - cfgs.window_size:
+                state_list.append(state)
+        return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
+
+    @classmethod
+    def _run_per_seq_reference(
+        cls,
+        inputs: dict[str, jax.Array],
+        cfg: config.GDNConfig,
+    ) -> tuple[jax.Array, jax.Array]:
+        """Compute per-sequence 2-dot reference outputs and checkpoints."""
+        compute_dtype = cfg.dtypes.compute
+        mask_dtype = compute_gdn.get_mask_dtype(compute_dtype)
+        iota = jax.lax.broadcasted_iota(
+            mask_dtype, (cfg.seq_tile_size, 1, cfg.chunk_size, 1, 1), 2
+        )
+        mask = iota < inputs["real_sizes"].reshape(-1, 1, 1, 1, 1).astype(mask_dtype)
+        q_masked = compute_gdn.l2_norm(
+            jnp.where(mask, inputs["q_compact"].astype(compute_dtype), 0)
+        ) * (cfg.kq_head_dim**-0.5)
+        k_masked = compute_gdn.l2_norm(
+            jnp.where(mask, inputs["k_compact"].astype(compute_dtype), 0)
+        )
+        v_masked = jnp.where(mask, inputs["v_compact"].astype(compute_dtype), 0)
+        beta_ref = compute_gdn.fused_transpose_broadcast(
+            jnp.where(
+                mask, jax.nn.sigmoid(inputs["b_compact"].astype(compute_dtype)), 0
+            ),
+            src_dim=4,
+            dst_dim=1,
+        )[:, : cfg.num_v_heads]
+        a_log_view = inputs["a_log"].reshape(1, 1, 1, 1, -1).astype(compute_dtype)
+        dt_bias_view = inputs["dt_bias"].reshape(1, 1, 1, 1, -1).astype(compute_dtype)
+        gating_ref = compute_gdn.fused_transpose_broadcast(
+            jnp.exp(
+                jnp.where(
+                    mask,
+                    -jnp.exp(a_log_view)
+                    * jax.nn.softplus(
+                        inputs["a_compact"].astype(compute_dtype) + dt_bias_view
+                    ),
+                    0,
+                )
+            ),
+            src_dim=4,
+            dst_dim=1,
+        )[:, : cfg.num_v_heads]
+        ref_outs, ref_states = [], []
+        for seq_idx in range(cfg.seq_tile_size):
+            out_seq, state_seq = cls._per_seq_token_loop_oracle(
+                (q_masked[seq_idx], k_masked[seq_idx], v_masked[seq_idx]),
+                (gating_ref[seq_idx], beta_ref[seq_idx]),
+                inputs["state_prev"][seq_idx],
+                cfg,
+            )
+            ref_outs.append(out_seq)
+            ref_states.append(state_seq)
+        return jnp.stack(ref_outs, axis=0), jnp.stack(ref_states, axis=0)
 
     def test_recurrent_gdn_fused_qk_decode_contraction(self):
         """Decode recurrence fuses [k, q] state contractions into one dot_general."""
@@ -571,7 +1006,7 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
         mesh = AbstractMesh(
             (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
         )
-        with use_abstract_mesh(mesh):
+        with use_abstract_mesh(mesh), jax.default_matmul_precision("highest"):
             aligned_v = cfg.aligned_num_v_heads
             rngs = iter(jax.random.split(jax.random.key(7), 8))
             real_sizes = jnp.array([1, 1, 0, 1], dtype=jnp.int32)
@@ -625,7 +1060,6 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
             mask = (real_sizes > 0).reshape(seq_tile, 1, 1, 1, 1)
             q_m = compute_gdn.l2_norm(jnp.where(mask, q_compact, 0.0)) * (d_k**-0.5)
             k_m = compute_gdn.l2_norm(jnp.where(mask, k_compact, 0.0))
-            k_t = compute_gdn.fused_transpose_broadcast(k_m, src_dim=4, dst_dim=3)
             v_m = jnp.where(mask, v_compact, 0.0)
             beta = jnp.where(mask, jax.nn.sigmoid(b_compact), 0.0)
             gating_log = jnp.exp(
@@ -645,13 +1079,9 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
 
             ref_outs, ref_states = [], []
             for idx in range(seq_tile):
-                o_i, s_i = compute_gdn.recurrent_gdn_per_seq(
-                    q_m[idx],
-                    k_m[idx],
-                    k_t[idx],
-                    v_m[idx],
-                    gating_log[idx],
-                    beta[idx],
+                o_i, s_i = self._per_seq_token_loop_oracle(
+                    (q_m[idx], k_m[idx], v_m[idx]),
+                    (gating_log[idx], beta[idx]),
                     state_prev[idx],
                     cfg,
                 )
@@ -666,6 +1096,171 @@ class GDNRecurrentDecodeFusionTest(parameterized.TestCase):
             np.testing.assert_allclose(
                 state_fused[2, 0], state_prev[2], rtol=0.0, atol=0.0
             )
+
+    def test_recurrent_gdn_batched_multi_token_window_with_ragged_masks(self) -> None:
+        """Batched recurrent_gdn matches 2-dot reference and emits rank-3 dots."""
+        spec_window_size = 4
+        kq_head_dim = v_head_dim = 128
+        seq_tile_size = 8
+        mesh = AbstractMesh(
+            (), (), (), abstract_device=AbstractDevice("TPU7x", 1, "tpu")
+        )
+        # Tolerances bound rounding differences between two sequential matmuls
+        # and the fused [k, q] matmul plus rank-1 output correction (1e-4 in f32,
+        # 2e-2 in bf16 with 7-bit mantissa across 4 sequential steps).
+        cases = [
+            (1, 2, 8, jnp.float32, 1e-4),
+            (1, 2, 8, jnp.bfloat16, 2e-2),
+            (spec_window_size, 2, 6, jnp.float32, 1e-4),
+            (spec_window_size, 2, 8, jnp.float32, 1e-4),
+            (spec_window_size, 2, 8, jnp.bfloat16, 2e-2),
+        ]
+        with use_abstract_mesh(mesh), jax.default_matmul_precision("highest"):
+            for window_size, num_kq_heads, num_v_heads, compute_dtype, tol in cases:
+                dim_size = 2 * num_kq_heads * kq_head_dim + num_v_heads * v_head_dim
+                cfg = config.GDNConfig(
+                    mode=config.GDNMode.BATCHED,
+                    dtypes=config.Dtypes(
+                        act_in=jnp.dtype(compute_dtype),
+                        act_out=jnp.dtype(compute_dtype),
+                        compute=jnp.dtype(compute_dtype),
+                        recurrent_state=jnp.dtype(jnp.float32),
+                        conv_state=jnp.dtype(jnp.float32),
+                    ),
+                    batch_size=seq_tile_size * window_size,
+                    dim_size=dim_size,
+                    kernel_size=4,
+                    tile_size=seq_tile_size,
+                    num_kq_heads=num_kq_heads,
+                    num_v_heads=num_v_heads,
+                    kq_head_dim=kq_head_dim,
+                    v_head_dim=v_head_dim,
+                    num_buffers=2,
+                    window_size=window_size,
+                    attention_mode=config.AttentionMode.GDN,
+                )
+                aligned_v_heads = cfg.aligned_num_v_heads
+                real_sizes = jnp.array(
+                    [
+                        window_size,
+                        max(1, window_size - 1),
+                        window_size,
+                        1,
+                        window_size,
+                        window_size,
+                        0,
+                        window_size,
+                    ],
+                    dtype=jnp.int32,
+                )
+                inputs = {
+                    "real_sizes": real_sizes,
+                    "q_compact": jax.random.normal(
+                        jax.random.key(42),
+                        (seq_tile_size, num_kq_heads, window_size, 1, kq_head_dim),
+                        dtype=compute_dtype,
+                    ),
+                    "k_compact": jax.random.normal(
+                        jax.random.key(43),
+                        (seq_tile_size, num_kq_heads, window_size, 1, kq_head_dim),
+                        dtype=compute_dtype,
+                    ),
+                    "v_compact": jax.random.normal(
+                        jax.random.key(44),
+                        (seq_tile_size, num_v_heads, window_size, 1, v_head_dim),
+                        dtype=compute_dtype,
+                    ),
+                    "b_compact": jax.random.normal(
+                        jax.random.key(45),
+                        (seq_tile_size, 1, window_size, 1, aligned_v_heads),
+                        dtype=compute_dtype,
+                    ),
+                    "a_compact": jax.random.normal(
+                        jax.random.key(46),
+                        (seq_tile_size, 1, window_size, 1, aligned_v_heads),
+                        dtype=compute_dtype,
+                    ),
+                    "state_prev": jax.random.normal(
+                        jax.random.key(47),
+                        (seq_tile_size, num_v_heads, kq_head_dim, v_head_dim),
+                        dtype=jnp.float32,
+                    ),
+                    "a_log": jax.random.normal(
+                        jax.random.key(48), (aligned_v_heads,), dtype=jnp.float32
+                    ),
+                    "dt_bias": jax.random.normal(
+                        jax.random.key(49), (aligned_v_heads,), dtype=jnp.float32
+                    ),
+                }
+                call_args = (
+                    inputs["real_sizes"],
+                    inputs["q_compact"],
+                    inputs["k_compact"],
+                    inputs["v_compact"],
+                    inputs["b_compact"],
+                    inputs["a_compact"],
+                    inputs["state_prev"],
+                    inputs["a_log"],
+                    inputs["dt_bias"],
+                    cfg,
+                )
+                jaxpr = jax.make_jaxpr(compute_gdn.recurrent_gdn, static_argnums=(9,))(
+                    *call_args
+                )
+                dot_eqns = [
+                    eqn
+                    for eqn in jaxpr.jaxpr.eqns
+                    if eqn.primitive.name == "dot_general"
+                ]
+                self.assertLen(dot_eqns, window_size)
+                for eqn in dot_eqns:
+                    self.assertEqual(
+                        eqn.invars[0].aval.shape,
+                        (seq_tile_size * num_v_heads, 2, kq_head_dim),
+                    )
+                    self.assertEqual(
+                        eqn.invars[1].aval.shape,
+                        (seq_tile_size * num_v_heads, kq_head_dim, v_head_dim),
+                    )
+
+                out, state = compute_gdn.recurrent_gdn(*call_args)
+                ref_out, ref_state = self._run_per_seq_reference(inputs, cfg)
+
+                np.testing.assert_allclose(
+                    np.asarray(out, np.float32),
+                    np.asarray(ref_out, np.float32),
+                    rtol=tol,
+                    atol=tol,
+                )
+                np.testing.assert_allclose(
+                    np.asarray(state, np.float32),
+                    np.asarray(ref_state, np.float32),
+                    rtol=tol,
+                    atol=tol,
+                )
+                # Masked-out rows and trailing checkpoints are bit-exact.
+                np.testing.assert_allclose(
+                    np.asarray(out[6], np.float32), 0.0, rtol=0.0, atol=0.0
+                )
+                np.testing.assert_allclose(
+                    np.asarray(state[6, -1], np.float32),
+                    np.asarray(inputs["state_prev"][6], np.float32),
+                    rtol=0.0,
+                    atol=0.0,
+                )
+                if window_size == spec_window_size:
+                    np.testing.assert_allclose(
+                        np.asarray(state[1, 3], np.float32),
+                        np.asarray(state[1, 2], np.float32),
+                        rtol=0.0,
+                        atol=0.0,
+                    )
+                    np.testing.assert_allclose(
+                        np.asarray(state[3, 3], np.float32),
+                        np.asarray(state[3, 0], np.float32),
+                        rtol=0.0,
+                        atol=0.0,
+                    )
 
 
 @pytest.mark.tpu_test
@@ -1311,7 +1906,8 @@ class GDNAttentionTest(parameterized.TestCase):
         distribution = jnp.array([32, num_reqs, num_reqs], dtype=jnp.int32)
         seq_lens = jnp.array([64] * 32 + [128, 224], dtype=jnp.int32)
 
-        for n_kq, n_v in [(2, 8), (8, 32), (16, 64)]:
+        # (8, 24) is Qwen3.5/3.6-27B at TP=2: 3 head groups, B must divide C.
+        for n_kq, n_v in [(2, 8), (8, 24), (8, 32), (16, 64)]:
             rngs = iter(jax.random.split(jax.random.key(99), 16))
             conv_dim = 2 * n_kq * d_k + n_v * d_v
             qkv = jax.random.normal(
@@ -1779,6 +2375,8 @@ class GDNAttentionTest(parameterized.TestCase):
 
         for n_kq, n_v, num_seqs, num_spec_tokens, prefill_len, num_decodes in [
             (2, 8, 16, 3, 16, 0),  # TP8 DCP=4 c=16 MTP=3: 16-tok prefill in B=16
+            (2, 8, 16, 3, 0, 16),  # TP8 DCP=4 c=16 MTP=3 warmup: 16 decodes, B=16
+            (8, 24, 16, 0, 12, 4),  # 27B TP2: 24 heads -> B=4 (was 5, truncated C)
             (8, 32, 16, 0, 12, 4),  # DP4TP2: 4 decodes + 12-tok prefill in B=16
             (16, 64, 16, 0, 12, 4),  # DP8: 4 decodes + 12-tok prefill in B=16
         ]:
@@ -1794,7 +2392,7 @@ class GDNAttentionTest(parameterized.TestCase):
                 init_rec = jax.random.normal(
                     k9, (num_blocks, n_v, d_k, d_v), dtype=jnp.float32
                 )
-                active_seqs = num_decodes + 1
+                active_seqs = num_decodes + (1 if prefill_len > 0 else 0)
                 state_indices = jnp.arange(num_seqs, dtype=jnp.int32) * window
                 common_kwargs = dict(
                     qkv=jax.random.normal(k1, (batch_size, dim), dtype=jnp.bfloat16),
@@ -1817,7 +2415,7 @@ class GDNAttentionTest(parameterized.TestCase):
                     ),
                     seq_lens=jnp.array(
                         [10] * num_decodes
-                        + [prefill_len + 10]
+                        + ([prefill_len + 10] if prefill_len > 0 else [])
                         + [0] * (num_seqs - active_seqs),
                         dtype=jnp.int32,
                     ),

@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
+    USE_TPU_PCP_MANAGER: bool = False
+    TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
+    TPU_PCP_KV_CHUNK_TOKENS: int = 65536
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -52,6 +55,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
+    TPU_MOE_REQUANT_CHUNK_BYTES: int = 1 << 30
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_SKIP_MAMBA_SCHEDULER_BLOCKS: bool = True
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
@@ -105,7 +109,8 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
-    TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
+    TPU_MOE_EP_HIER_RS: str = "off"
+    TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE: float | None = None
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -113,16 +118,16 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS: int = 1024
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
-    TPU_PP_DYNAMIC_CHUNKS: bool = True
+    TPU_PP_LONE_PROMPT_CHUNKS: bool = True
+    TPU_PP_EQUAL_COST_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
-    TPU_PP_LAZY_PUSH: bool = False
-    TPU_PP_HANDOFF: str = "wave"
-    TPU_PP_RING_DEPTH: int = 2
+    TPU_PP_HANDOFF_DEPTH: int = 2
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -173,6 +178,8 @@ if TYPE_CHECKING:
     TPU_USE_RAIDEN_CONNECTOR: bool = False
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
+    TPU_RAIDEN_POOL_STAGING_BUDGET_MB: int = 0
+    TPU_RAIDEN_POOL_STAGING_WINDOW_BLOCKS: int = 0
     TPU_RAIDEN_INLINE_LOAD: bool = False
     QUANTIZE_ON_LOAD_PREFIXES: list[str] = []
     KDA_MANUAL_STATE_DMA: bool | None = None
@@ -214,6 +221,9 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_MEGAKERNEL: str = ""
+    VLLM_TPU_EXPERIMENTAL_USE_RUST: bool = False
+    VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY: str = ""
 
 
 def env_with_choices(
@@ -490,6 +500,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
+    # Run PCP through `runner/pcp/manager.py` (PCP x DCP KV gather).
+    "USE_TPU_PCP_MANAGER": env_bool("USE_TPU_PCP_MANAGER", default=False),
+    # PCP manager: max context tokens one forward's prefills may gather.
+    "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
+    # PCP manager: context tokens gathered per all-gather chunk.
+    "TPU_PCP_KV_CHUNK_TOKENS": env_int("TPU_PCP_KV_CHUNK_TOKENS", 65536),
     # QK pair-blocked GDN conv layout for Raiden transfers.  Not supported
     # with the unified GDN state pool: its kernel reads segment-major
     # [Q | K | V] conv rows, so the pool manifest rejects this flag.  Must
@@ -620,6 +636,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
     if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
     else None,
+    # Float32 bytes one load-time MoE requantization chunk materializes on
+    # the device. The quantized chunk, its scales and the formatting
+    # temporaries come on top. A chunk always holds at least one expert.
+    # Unset or empty keeps 1 GiB; a value <= 0 raises.
+    "TPU_MOE_REQUANT_CHUNK_BYTES": lambda: (
+        env_positive_int_or_none("TPU_MOE_REQUANT_CHUNK_BYTES")() or 1 << 30
+    ),
     # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
     # wins; unset defers to
     # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects
@@ -858,11 +881,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
-    # Keep FusedMoE top-k routing weights in float32 precision instead of casting
-    # to the activation dtype (e.g. bfloat16) in fused_moe_gmm. Improves numerical
-    # parity with training frameworks (e.g. MaxText) in RL and distillation workloads.
-    "TPU_MOE_TOPK_WEIGHTS_FLOAT32": env_bool(
-        "TPU_MOE_TOPK_WEIGHTS_FLOAT32", default=False
+    # Runs the EP MoE combine's reduce-scatter on the hierrs_tc TensorCore
+    # kernels instead of the group's, with this wire dtype between chips
+    # (accumulation stays bf16). Remove once that is the default or the
+    # kernels are retired.
+    "TPU_MOE_EP_HIER_RS": env_with_choices(
+        "TPU_MOE_EP_HIER_RS", "off", ["off", "bf16", "fp8"]
+    ),
+    # Required with fp8; see docs/reference/env_vars.md.
+    "TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE": lambda: (
+        float(v) if (v := os.getenv("TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE")) else None
     ),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
@@ -912,6 +940,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
     ),
+    # Local tokens per EP rank at or above which fused EP MoE v2 enqueues the
+    # activation all-gather ahead of the slab scatters (see the comment where
+    # kernels/fused_moe/v2/layer.py reads it).
+    "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS": env_nonnegative_int(
+        "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS", 1024
+    ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
     # [3584, 7168] matmuls run at full HBM bandwidth, ~22% of decode device
@@ -937,24 +971,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Add linear token buckets above a quarter of the token budget, for
     # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
     "TPU_TOKEN_BUCKET_LINEAR": env_bool("TPU_TOKEN_BUCKET_LINEAR"),
+    # Pipeline parallelism: while the pending prefill work cannot fill every
+    # stage with a full step, spread it over the stages in smaller steps
+    # (core/pp_chunks.py).
+    "TPU_PP_LONE_PROMPT_CHUNKS": env_bool("TPU_PP_LONE_PROMPT_CHUNKS", default=True),
     # Pipeline parallelism: size prefill chunks by a per-step time budget
-    # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
-    "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
-    # Fraction above the time of a full prefix-free step that a step may
-    # take before its chunks are shortened.
+    # fit to forwards each stage times at startup, instead of a token budget
+    # (core/pp_chunks.py).
+    "TPU_PP_EQUAL_COST_CHUNKS": env_bool("TPU_PP_EQUAL_COST_CHUNKS", default=True),
+    # With TPU_PP_EQUAL_COST_CHUNKS: fraction above the time of a full
+    # prefix-free step that a step may take before its chunks are shortened.
     "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
-    # Pipeline parallelism over more than two stages: the engine core pushes
-    # the pipeline only when stage 0 would otherwise idle and drops empty
-    # steps, so requests share the pipeline (core/pp_lazy_step.py).
-    "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
-    # How pipeline stages hand activations on: "wave" runs one collective
-    # launch on every stage per forward (distributed/pp_wave.py), "ring"
-    # sends each forward's output point to point (distributed/pp_ring.py).
-    # Goes once the ring replaces the wave.
-    "TPU_PP_HANDOFF": env_with_choices("TPU_PP_HANDOFF", "wave", ["wave", "ring"]),
-    # With TPU_PP_HANDOFF=ring: the forwards a stage may queue for sending
-    # to the next stage before end_forward waits for room.
-    "TPU_PP_RING_DEPTH": env_int("TPU_PP_RING_DEPTH", 2),
+    # Pipeline parallelism: the forwards a stage may queue for sending to the
+    # next stage before end_forward waits for room (distributed/pp_buffered.py).
+    "TPU_PP_HANDOFF_DEPTH": env_int("TPU_PP_HANDOFF_DEPTH", 2),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,
@@ -1158,6 +1188,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_POOL_STAGING_LEASES": env_nonnegative_int(
         "TPU_RAIDEN_POOL_STAGING_LEASES", 8
     ),
+    # Consumer-side host staging budget (MiB per rank) for the pool-reshard
+    # arena: a request larger than the budget allows is pulled as a chain of
+    # sub-transfers. 0 = size the arena for whole max-length requests. Both
+    # peers need a tpu-sync with sub-transfer chains (tpu-sync-torch from the
+    # 2026-10-26 nightlies on): the source controller slices the request, and
+    # a producer without them plans it whole, which the window-sized arena
+    # refuses. Not honoured under TPU_RAIDEN_POOL_TAGS_PER_LAYER=1.
+    "TPU_RAIDEN_POOL_STAGING_BUDGET_MB": env_nonnegative_int(
+        "TPU_RAIDEN_POOL_STAGING_BUDGET_MB", 0
+    ),
+    # Explicit consumer-side sub-transfer window (full-attention destination
+    # pages per sub-transfer); overrides the budget-derived window. 0 = none.
+    "TPU_RAIDEN_POOL_STAGING_WINDOW_BLOCKS": env_nonnegative_int(
+        "TPU_RAIDEN_POOL_STAGING_WINDOW_BLOCKS", 0
+    ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
     # Comma-separated dot-bounded module prefix names to quantize to FP8 on load.
@@ -1318,6 +1363,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Enable and configure the fused Pallas megakernel ("1"/"true" for defaults,
+    # "ep"/"tp" for mode, or "mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1").
+    "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", ""),
+    # Opt in to serving models with the native Rust runtime (rvllm) behind `vllm serve`.
+    # Encompasses both HTTP frontend and engine backend.
+    # Experimental, off by default until rvllm reaches feature parity.
+    "VLLM_TPU_EXPERIMENTAL_USE_RUST": env_bool(
+        "VLLM_TPU_EXPERIMENTAL_USE_RUST", default=False
+    ),
+    # The rvllm binary; takes the same values as the launcher's --rvllm-binary.
+    # When unset, rvllm is looked up on PATH.
+    "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(
+        "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
     ),
 }
 

@@ -41,6 +41,7 @@ For what is supported **today**, see [Supported Models & Features](user_guide/su
 | :--- | :--- | :--- |
 | **DeepSeek V4 Readiness** | Frontier Model Expansion | Deliver Day-0 functional support, kernel performance optimization, and official AgentX benchmark submissions for DeepSeek V4. |
 | **Smart Caching, Routing & Memory Tiers** | Advanced Serving | Roll out prefix-aware, cache-aware, and session-aware routing alongside dynamic length bucketing, llm-d TPU memory-tier routing, and ecosystem-driven KV-cache backends. |
+| **RL Rollout Engine** | Reinforcement Learning | Make `vllm-torchtpu` an efficient RL rollout engine with end-to-end verl, TorchTitan, and Tunix integration, FP8/FP4 rollouts, trainer/sampler numerical parity, and a shared KV-cache pool (tracked in [#3497](https://github.com/vllm-project/vllm-torchtpu/issues/3497)). |
 
 ---
 

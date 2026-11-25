@@ -162,6 +162,16 @@ def test_fp4_invalid_block_is_an_error(context):
         prebuild(layer(True), rhs_qb=16)
 
 
+def test_silu_bf16_is_an_error(context):
+    """The kernel fuses float32 SiLU; "silu_bf16" must refuse at startup."""
+    _, op = context
+    with pytest.raises(ValueError, match="'silu_bf16' is not wired"):
+        bridge.prebuild_adaptive_fused_moe(
+            layer(), topk=2, renormalize=True, activation="silu_bf16"
+        )
+    op.assert_not_called()
+
+
 def test_forward_without_prebuilt_op_raises():
     with pytest.raises(RuntimeError, match="not prebuilt"):
         bridge.run_adaptive_fused_moe(SimpleNamespace(), *([None] * 6))
