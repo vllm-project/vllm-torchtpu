@@ -20,14 +20,21 @@
 #   - Set once by preflight.sh in Buildkite meta-data (release-version), or
 #     resolved on the spot from RELEASE_VERSION / BUILDKITE_BRANCH
 #     (RELEASE_BRANCH_REGEX in .buildkite/release/lib.sh).
-#   - In a test wheel build (TEST_WHEELS=1, .buildkite/pipeline_build_wheels.yml),
-#     0.0.0+g<commit>, which PyPI rejects; the PyPI check is skipped.
+#   - In the wheel lane (.buildkite/pipeline_build_wheels.yml),
+#     release/set_test_wheel_version.sh sets it first: 0.0.0+g<commit>, which
+#     PyPI rejects.
 #   - Forced onto setuptools-scm, so a shallow CI checkout without tags still
 #     gets it.
 #
 # Output:
 #   dist/<core>-<version>-py3-none-any.whl, uploaded as a Buildkite artifact.
 #   Build meta-data CORE_WHEEL_NAME for later steps.
+#
+# Usage:
+#   build_core_wheel.sh [--skip-pypi-check]
+#
+#   --skip-pypi-check  Do not check that the version is absent from PyPI: for a
+#                      build that publishes nothing (the wheel lane).
 #
 # Buildkite only: runs inside a release build, or a CI build's build_wheels lane.
 # ------------------------------------------------------
@@ -42,6 +49,14 @@ WHEEL_UTILS="${SCRIPT_DIR}/wheel_utils.py"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/../release/lib.sh"
 
+CHECK_PYPI=1
+for arg in "$@"; do
+    case "${arg}" in
+        --skip-pypi-check) CHECK_PYPI=0 ;;
+        *) die "unknown argument '${arg}' (usage: build_core_wheel.sh [--skip-pypi-check])." ;;
+    esac
+done
+
 command -v buildkite-agent >/dev/null 2>&1 \
     || die "buildkite-agent not found: this script only runs in Buildkite."
 
@@ -52,8 +67,8 @@ echo "Version: ${VERSION}"
 
 # Stop before building if this version is already on PyPI (versions can't be
 # reused). PUBLISH_PYPI comes from the step's env in .buildkite/release/pipeline.yml.
-# A test wheel build (TEST_WHEELS=1) publishes nothing, so it has nothing to check.
-if [[ "${TEST_WHEELS:-}" != "1" ]]; then
+# A build that publishes nothing passes --skip-pypi-check.
+if [[ "${CHECK_PYPI}" == "1" ]]; then
     [[ -n "${PUBLISH_PYPI:-}" ]] || die "PyPI project (PUBLISH_PYPI) is not set."
     check_not_published "${PUBLISH_PYPI}" "${VERSION}"
 fi

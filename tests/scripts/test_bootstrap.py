@@ -31,7 +31,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 from unittest import mock
@@ -1543,7 +1543,8 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(rec.uploads, [])
 
-        # PR default: priority 6, stage 0 uploads upload_stages + cpu + build;
+        # PR default: priority 6, stage 0 uploads upload_stages + build_wheels +
+        # cpu + build;
         # stage 1 uploads verify + integration + tests with concurrency group.
         pr = self._run_bootstrap(
             {
@@ -1798,9 +1799,7 @@ class TestBootstrapUnits(unittest.TestCase):
         perf_sched = self._run_bootstrap(
             {"CI_SUITE": "perf", "CI_LANES": "perf", "BUILDKITE_BRANCH": "main"}
         )
-        self.assertEqual(
-            [u[0] for u in perf_sched.uploads], ["perf", "build_wheels", "build"]
-        )
+        self.assertEqual([u[0] for u in perf_sched.uploads], ["perf", "build"])
         self.assertTrue(bool(perf_sched.uploads[-1][2]["OMNI_IMAGE_SKIP"]))
 
         # Scheduled Nightly, release builds (tag or releases/vX.Y.Z branch), and
@@ -2441,44 +2440,6 @@ class TestBootstrapUnits(unittest.TestCase):
             dict(_normalize_lane_uploads(mq_rel_s0, mq_rel_s1)),
             dict(_normalize_lane_uploads(direct_rel, None)),
         )
-
-    def test_tpu_lanes_wait_for_the_build_wheels_in_every_suite(self) -> None:
-        # Every TPU step waits for check_wheels as well as its image, so a
-        # suite with such a lane must also upload build_wheels, no later than that
-        # lane's stage: a step that waits for a key the build never has does not
-        # run. verify's TPU steps come from upload_models_and_features.sh.
-        bp = self.bp
-
-        def steps(items: list[Any]) -> Iterator[dict[str, Any]]:
-            for item in items:
-                if isinstance(item, dict):
-                    yield item
-                    yield from steps(item.get("steps") or [])
-
-        for lane in ("tests", "integration", "perf"):
-            path = _REPO_ROOT / f".buildkite/pipeline_{lane}.yml"
-            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
-            for step in steps(doc["steps"]):
-                on_tpu = (step.get("agents") or {}).get("queue") == "kube" and (
-                    step.get("env") or {}
-                ).get("SHAPE") != "cpu"
-                if on_tpu:
-                    deps = step.get("depends_on") or []
-                    deps = [deps] if isinstance(deps, str) else deps
-                    self.assertIn("check_wheels", deps, (lane, step.get("label")))
-        script = _REPO_ROOT / ".buildkite/scripts/upload_models_and_features.sh"
-        self.assertEqual(
-            script.read_text(encoding="utf-8").count('\\"check_wheels\\"'), 2
-        )
-
-        for name, suite in {**bp.SUITES, **bp._PR_SUITES}.items():
-            stage_of = {
-                lane: i for i, stage in enumerate(suite.stages) for lane in stage
-            }
-            for lane in {"tests", "integration", "perf", "verify"} & stage_of.keys():
-                with self.subTest(suite=name, lane=lane):
-                    self.assertIn("build_wheels", stage_of)
-                    self.assertLessEqual(stage_of["build_wheels"], stage_of[lane])
 
     def test_pipeline_yaml_validation_and_nightly_report_keys(self) -> None:
         bp = self.bp

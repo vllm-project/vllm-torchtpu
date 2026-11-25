@@ -18,11 +18,29 @@
 # resolve the combined wheel against the local core wheel plus pypi.org, for
 # the platform the wheels support (CPython 3.12, x86_64 Linux, glibc >= 2.31,
 # the floor torch-tpu and tpu-sync-torch set). Run by the release, and by the
-# test wheel build (TEST_WHEELS=1, .buildkite/pipeline_build_wheels.yml).
+# wheel lane (.buildkite/pipeline_build_wheels.yml).
+#
+# Usage:
+#   check_wheels.sh [--annotation-context <name>]
+#
+#   --annotation-context <name>  Context of the build annotation (default:
+#                                release-wheels); the wheel lane has its own.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/lib.sh"
+
+CONTEXT="release-wheels"
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --annotation-context)
+            [[ -n "${2:-}" ]] || die "--annotation-context needs a name."
+            CONTEXT="$2"
+            shift 2
+            ;;
+        *) die "unknown argument '$1' (usage: check_wheels.sh [--annotation-context <name>])." ;;
+    esac
+done
 
 VERSION="$(release_version)"
 WORK="$(mktemp -d)"
@@ -45,8 +63,6 @@ grep -qx "vllm-torchtpu-core==${VERSION}" "${WORK}/pins.txt" \
 
 NAMES=""
 for f in "${WORK}"/dist/*; do NAMES+="\`$(basename "${f}")\` "; done
-CONTEXT="release-wheels"
-[[ "${TEST_WHEELS:-}" == "1" ]] && CONTEXT="test-wheels"
 buildkite-agent annotate --style info --context "${CONTEXT}" <<EOF
 Wheels: ${NAMES}\`vllm-torchtpu==${VERSION}\` resolves from them plus pypi.org ($(grep -c '==' "${WORK}/resolved.txt") packages):
 

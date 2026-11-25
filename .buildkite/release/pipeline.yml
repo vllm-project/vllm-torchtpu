@@ -78,12 +78,7 @@ steps:
     agents:
       queue: release-vllm-torchtpu
     commands:
-      - |
-        set -euo pipefail
-        VERSION="$$(buildkite-agent meta-data get release-version)"
-        bash .buildkite/scripts/build_vllm_torchtpu.sh "$$VERSION"
-        buildkite-agent artifact upload "dist/vllm_torchtpu-*.whl"
-        buildkite-agent artifact upload "dist/vllm_torchtpu-*.tar.gz"
+      - bash .buildkite/release/build_vllm_torchtpu_wheel.sh
 
   - label: ":mag: Check the wheels install from PyPI"
     key: check_wheels
