@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from vllm_torchtpu.kernels.gdn.v3 import config
+from vllm_torchtpu.kernels.gdn.v3 import recurrent_state as recurrent_state_lib
 
 # Cap decode tiles at 16 sequences: larger tiles increase per-slot state DMA
 # descriptors and register spills without reducing per-slot compute.
@@ -163,6 +164,7 @@ def get_vmem_estimate_bytes(
     is_decode: bool = False,
     carry_scratch_bytes: int = 4,
     window_size: int = 1,
+    recurrent_state_slot_bytes: int | None = None,
 ) -> int:
     """Estimates total on-chip VMEM footprint in bytes for a GDN tile."""
     aligned_num_v_heads = align_to(n_v, num_lanes)
@@ -188,8 +190,10 @@ def get_vmem_estimate_bytes(
         * conv_state_dim_size
         * carry_scratch_bytes
     )
+    if recurrent_state_slot_bytes is None:
+        recurrent_state_slot_bytes = n_v * d_v * d_k * rec_state_bytes
     recurrent_state_buffer_bytes = 2 * (
-        tile_b * state_slots_per_seq * n_v * d_v * d_k * rec_state_bytes
+        tile_b * state_slots_per_seq * recurrent_state_slot_bytes
     )
 
     # 3. Double-buffered output activation buffer.
@@ -268,6 +272,9 @@ def fits_qkv_pad_scratch(
         conv_state_dim_size=cfg.dim_size,
         is_decode=False,
         window_size=cfg.window_size,
+        recurrent_state_slot_bytes=recurrent_state_lib.slot_bytes(
+            cfg.state_format, cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim
+        ),
     )
     # Sequential chunked prefill keeps one f32 working state live alongside
     # `carry_recurrent_scratch_ref`; block doubling streams heads instead of
@@ -278,6 +285,19 @@ def fits_qkv_pad_scratch(
         else cfg.seq_tile_size * cfg.num_v_heads * cfg.kq_head_dim * cfg.v_head_dim * 4
     )
     return vmem_est + working_state_bytes + qpad_bytes <= vmem_limit_bytes
+
+
+def _resolve_slot_bytes(
+    recurrent_state_format: config.RecurrentStateFormat | str | None,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+) -> int | None:
+    """Returns stored bytes per sequence slot when a state format is set."""
+    if recurrent_state_format is None:
+        return None
+    fmt = recurrent_state_lib.resolve_format(recurrent_state_format)
+    return recurrent_state_lib.slot_bytes(fmt, n_v, d_k, d_v)
 
 
 def calculate_decode_tile_size(
@@ -293,6 +313,7 @@ def calculate_decode_tile_size(
     vmem_capacity_limit_bytes: int,
     kernel_size: int = 4,
     window_size: int = 1,
+    recurrent_state_format: config.RecurrentStateFormat | str | None = None,
 ) -> int:
     """Largest decode tile whose VMEM estimate fits the limit.
 
@@ -311,6 +332,8 @@ def calculate_decode_tile_size(
       vmem_capacity_limit_bytes: Maximum allowed VMEM capacity in bytes.
       kernel_size: 1D convolution kernel window size.
       window_size: Number of state checkpoints per sequence in decode.
+      recurrent_state_format: Optional packed recurrent-state format (`"f32"`,
+        `"bf16"`, or `"fp8"`); overrides `recurrent_state_dtype` sizing when set.
 
     Returns:
       Derived batch tile size fitting within VMEM capacity limits.
@@ -321,6 +344,7 @@ def calculate_decode_tile_size(
 
     act_out_bytes = jnp.dtype(act_out_dtype).itemsize
     rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
+    rec_slot_bytes = _resolve_slot_bytes(recurrent_state_format, n_v, d_k, d_v)
 
     # Search descending power-of-2 tile candidates (up to 16) bounded by
     # batch size.
@@ -342,6 +366,7 @@ def calculate_decode_tile_size(
             conv_state_dim_size=conv_state_dim_size,
             is_decode=True,
             window_size=window_size,
+            recurrent_state_slot_bytes=rec_slot_bytes,
         )
         if vmem_est <= vmem_capacity_limit_bytes:
             return cand
@@ -361,6 +386,7 @@ def calculate_mixed_tile_size(
     num_lanes: int,
     vmem_capacity_limit_bytes: int,
     kernel_size: int = 4,
+    recurrent_state_format: config.RecurrentStateFormat | str | None = None,
 ) -> int:
     """Largest prefill chunk whose VMEM estimate fits the limit.
 
@@ -378,6 +404,8 @@ def calculate_mixed_tile_size(
       num_lanes: Number of lanes for TPU vector layout alignment.
       vmem_capacity_limit_bytes: Maximum allowed VMEM capacity in bytes.
       kernel_size: 1D convolution kernel window size.
+      recurrent_state_format: Optional packed recurrent-state format (`"f32"`,
+        `"bf16"`, or `"fp8"`); overrides `recurrent_state_dtype` sizing when set.
 
     Returns:
       Derived chunk tile size fitting within VMEM capacity limits.
@@ -388,6 +416,7 @@ def calculate_mixed_tile_size(
 
     act_out_bytes = jnp.dtype(act_out_dtype).itemsize
     rec_state_bytes = jnp.dtype(recurrent_state_dtype).itemsize
+    rec_slot_bytes = _resolve_slot_bytes(recurrent_state_format, n_v, d_k, d_v)
 
     # Select the largest candidate chunk (up to 128 tokens) that fits in VMEM.
     prefill_candidates = [c for c in MIXED_TILE_SIZES if c <= seq_len]
@@ -406,6 +435,7 @@ def calculate_mixed_tile_size(
             num_lanes=num_lanes,
             conv_state_dim_size=conv_state_dim_size,
             is_decode=False,
+            recurrent_state_slot_bytes=rec_slot_bytes,
         )
         if vmem_est <= vmem_capacity_limit_bytes:
             return candidate
@@ -442,6 +472,7 @@ def get_tile_sizes(
     window_size: int = 1,
     decode_tile_size: int | None = None,
     mixed_tile_size: int | None = None,
+    recurrent_state_format: config.RecurrentStateFormat | str | None = None,
 ) -> tuple[int, int]:
     """Derives decode and mixed tile sizes within each kernel's VMEM limit.
 
@@ -467,6 +498,9 @@ def get_tile_sizes(
         window_size: Number of state checkpoints per sequence in decode.
         decode_tile_size: Explicit decode sequence tile size override, if provided.
         mixed_tile_size: Explicit prefill/mixed chunk size override, if provided.
+        recurrent_state_format: Optional packed recurrent-state format (`"f32"`,
+            `"bf16"`, or `"fp8"`); overrides `recurrent_state_dtype` sizing
+            when set.
 
     Returns:
         Tuple of (decode_tile_size, mixed_tile_size).
@@ -488,6 +522,7 @@ def get_tile_sizes(
             vmem_capacity_limit_bytes=decode_vmem_limit_bytes,
             kernel_size=kernel_size,
             window_size=window_size,
+            recurrent_state_format=recurrent_state_format,
         )
         decode_tile_size = min(decode_tile_target(active_num_seqs, n_v), vmem_fit)
 
@@ -507,6 +542,7 @@ def get_tile_sizes(
             num_lanes=num_lanes,
             vmem_capacity_limit_bytes=mixed_vmem_limit_bytes,
             kernel_size=kernel_size,
+            recurrent_state_format=recurrent_state_format,
         )
         mixed_tile_size = min(
             mixed_tile_target(

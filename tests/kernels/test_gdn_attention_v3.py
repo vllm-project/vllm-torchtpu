@@ -39,6 +39,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     triangular_solve,
     wrapper,
 )
+from vllm_torchtpu.kernels.gdn.v3 import recurrent_state as recurrent_state_lib
 
 
 def _l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
@@ -2940,3 +2941,300 @@ class GDNAttentionTest(parameterized.TestCase):
         self.assertLess(self._rel_l2(o_ref, o_db), 1.5e-2)
         self.assertLess(self._rel_l2(r_ref[1], r_db[1]), 1.5e-2)
         self.assertLess(self._rel_l2(r_ref[2], r_db[2]), 1.5e-2)
+
+    def test_fp8_recurrent_state_decode_prefill_and_restrictions(self):
+        """Packed FP8 state matches independent reference on decode & prefill."""
+        rng = np.random.default_rng(91)
+        n_kq, n_v, d_k, d_v, kernel_size = 2, 8, 128, 128, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        lengths = [1, 1, 150]
+        tok = sum(lengths)
+        qkv = jnp.asarray(rng.standard_normal((tok, dim)), jnp.float32)
+        b = jnp.asarray(0.1 * rng.standard_normal((tok, n_v)), jnp.float32)
+        a = jnp.asarray(0.1 * rng.standard_normal((tok, n_v)), jnp.float32)
+        conv_init = jnp.asarray(
+            rng.standard_normal((5, kernel_size - 1, dim)), jnp.float32
+        )
+        rec_init = jnp.asarray(rng.standard_normal((5, n_v, d_k, d_v)), jnp.float32)
+        rec_packed = recurrent_state_lib.pack_state(rec_init, "fp8")
+        rec_ref_init = recurrent_state_lib.unpack_state(
+            rec_packed, "fp8", n_v=n_v, d_k=d_k
+        )
+        conv_w = jnp.asarray(rng.standard_normal((dim, 1, kernel_size)), jnp.float32)
+        conv_b = jnp.asarray(rng.standard_normal((dim,)), jnp.float32)
+        a_log = jnp.asarray(rng.uniform(0.0, 1.0, (n_v,)), jnp.float32)
+        dt_bias = jnp.asarray(rng.uniform(-3.0, -1.0, (n_v,)), jnp.float32)
+        qsl = jnp.array([0, 1, 2, tok], dtype=jnp.int32)
+        sidx = jnp.array([1, 2, 3], dtype=jnp.int32)
+        dist = jnp.array([2, 3, 3], dtype=jnp.int32)
+        slens = jnp.array([65, 65, 214], dtype=jnp.int32)
+        ckpt_offsets = jnp.array([0, 0, 64], dtype=jnp.int32)
+        ckpt_indices = jnp.array([-1, -1, 4], dtype=jnp.int32)
+
+        common = dict(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_weight=conv_w,
+            conv_bias=conv_b,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=qsl,
+            state_indices=sidx,
+            distribution=dist,
+            seq_lens=slens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "not supported for KDA"):
+            wrapper.fused_conv1d_gdn(
+                **common,
+                states=(conv_init, rec_packed),
+                attention_mode=config.AttentionMode.KDA,
+                recurrent_state_format="fp8",
+            )
+
+        with self.assertRaisesRegex(NotImplementedError, "block-doubling"):
+            wrapper.fused_conv1d_gdn(
+                **common,
+                states=(conv_init, rec_packed),
+                gdn_prefill_mode="sequential",
+                recurrent_state_format="fp8",
+            )
+
+        # Independent float32 reference for full batch and 64-token checkpoint.
+        (c_ref, r_ref), o_ref_flat = gdn_attention_ref(
+            **common, states=(conv_init, rec_ref_init)
+        )
+        o_ref = o_ref_flat.reshape(tok, n_v, d_v)
+        (c_ckpt_ref, r_ckpt_ref), _ = gdn_attention_ref(
+            qkv=qkv[2 : 2 + 64],
+            b=b[2 : 2 + 64],
+            a=a[2 : 2 + 64],
+            states=(conv_init, rec_ref_init),
+            conv_weight=conv_w,
+            conv_bias=conv_b,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=jnp.array([0, 64], dtype=jnp.int32),
+            state_indices=jnp.array([3], dtype=jnp.int32),
+            distribution=jnp.array([0, 1, 1], dtype=jnp.int32),
+            seq_lens=jnp.array([64 + 64], dtype=jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+
+        (c_fp8, r_fp8), o_fp8 = jax.jit(
+            lambda cs, rs: wrapper.fused_conv1d_gdn(
+                **common,
+                states=(cs, rs),
+                prefill_ckpt_offsets=ckpt_offsets,
+                prefill_ckpt_indices=ckpt_indices,
+                recurrent_state_format="fp8",
+            )
+        )(conv_init, rec_packed)
+
+        r_fp8_unpacked = recurrent_state_lib.unpack_state(
+            r_fp8, "fp8", n_v=n_v, d_k=d_k
+        )
+        # Check decode, prefill, final states, and checkpoint separately.
+        np.testing.assert_allclose(c_fp8[1:4], c_ref[1:4], rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(c_fp8[4], c_ckpt_ref[3], rtol=1e-4, atol=1e-4)
+        self.assertLess(self._rel_l2(o_ref[:2], o_fp8[:2]), 1.5e-2)
+        self.assertLess(self._rel_l2(o_ref[2:], o_fp8[2:]), 1.5e-2)
+        self.assertLess(self._rel_l2(r_ref[1:3], r_fp8_unpacked[1:3]), 5e-2)
+        self.assertLess(self._rel_l2(r_ref[3], r_fp8_unpacked[3]), 5e-2)
+        self.assertLess(self._rel_l2(r_ckpt_ref[3], r_fp8_unpacked[4]), 5e-2)
+
+        # Multi-tile small prefill (24 tokens at mixed_tile_size=8 -> 3 tiles)
+        # routes through the streamed recurrent scan with carry_ref & flush_cond.
+        small_tok = 24
+        small_common = {
+            **common,
+            "qkv": qkv[:small_tok],
+            "b": b[:small_tok],
+            "a": a[:small_tok],
+            "query_start_loc": jnp.array([0, small_tok], dtype=jnp.int32),
+            "state_indices": jnp.array([1], dtype=jnp.int32),
+            "distribution": jnp.array([0, 1, 1], dtype=jnp.int32),
+            "seq_lens": jnp.array([small_tok + 64], dtype=jnp.int32),
+        }
+        (_, r_sm_ref), o_sm_ref_flat = gdn_attention_ref(
+            **small_common, states=(conv_init, rec_ref_init)
+        )
+        (_, r_sm_fp8), o_sm_fp8 = jax.jit(
+            lambda cs, rs: wrapper.fused_conv1d_gdn(
+                **small_common,
+                states=(cs, rs),
+                mixed_tile_size=8,
+                recurrent_state_format="fp8",
+            )
+        )(conv_init, rec_packed)
+        r_sm_unpacked = recurrent_state_lib.unpack_state(
+            r_sm_fp8, "fp8", n_v=n_v, d_k=d_k
+        )
+        self.assertLess(
+            self._rel_l2(o_sm_ref_flat.reshape(small_tok, n_v, d_v), o_sm_fp8), 1.5e-2
+        )
+        self.assertLess(self._rel_l2(r_sm_ref[1], r_sm_unpacked[1]), 5e-2)
+
+    def test_fp8_recurrent_state_edge_paths(self):
+        """Tests FP8 state with NaN uninit, n_v=6, bf16, spec verify, and FP8 MXU."""
+        rng = np.random.default_rng(97)
+        n_kq, n_v, d_k, d_v, kernel_size = 2, 6, 128, 128, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+
+        # 1) Uninitialized (has_init=False) with 0xFFFFFFFF NaN poison, non-8
+        #    multiple n_v=6, and bfloat16 activations.
+        lengths = [1, 70]
+        tok = sum(lengths)
+        qkv = jnp.asarray(rng.standard_normal((tok, dim)), jnp.bfloat16)
+        b = jnp.asarray(0.1 * rng.standard_normal((tok, n_v)), jnp.bfloat16)
+        a = jnp.asarray(0.1 * rng.standard_normal((tok, n_v)), jnp.bfloat16)
+        conv_init = jnp.asarray(
+            rng.standard_normal((3, kernel_size - 1, dim)), jnp.float32
+        )
+        rec_ref_init = jnp.zeros((3, n_v, d_k, d_v), jnp.float32)
+        packed_rows = recurrent_state_lib.packed_rows(
+            config.RecurrentStateFormat.FP8, n_v, d_k
+        )
+        rec_poison = jnp.full((3, packed_rows, d_v), 0xFFFFFFFF, dtype=jnp.uint32)
+        conv_w = jnp.asarray(rng.standard_normal((dim, 1, kernel_size)), jnp.float32)
+        conv_b = jnp.asarray(rng.standard_normal((dim,)), jnp.float32)
+        a_log = jnp.asarray(rng.uniform(0.0, 1.0, (n_v,)), jnp.float32)
+        dt_bias = jnp.asarray(rng.uniform(-3.0, -1.0, (n_v,)), jnp.bfloat16)
+        common = dict(
+            qkv=qkv,
+            b=b,
+            a=a,
+            conv_weight=conv_w,
+            conv_bias=conv_b,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=jnp.array([0, 1, tok], dtype=jnp.int32),
+            state_indices=jnp.array([1, 2], dtype=jnp.int32),
+            distribution=jnp.array([1, 2, 2], dtype=jnp.int32),
+            # seq_lens == query_lens -> has_init=False for both sequences.
+            seq_lens=jnp.array([1, 70], dtype=jnp.int32),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        (_, r_ref), o_ref_flat = gdn_attention_ref(
+            **common, states=(conv_init, rec_ref_init)
+        )
+        o_ref = o_ref_flat.reshape(tok, n_v, d_v)
+        (_, r_fp8), o_fp8 = wrapper.fused_conv1d_gdn(
+            **common,
+            states=(conv_init.copy(), rec_poison.copy()),
+            mixed_tile_size=64,
+            recurrent_state_format="fp8",
+        )
+        r_fp8_unpacked = recurrent_state_lib.unpack_state(
+            r_fp8, "fp8", n_v=n_v, d_k=d_k
+        )
+        self.assertTrue(bool(jnp.all(jnp.isfinite(o_fp8))))
+        self.assertTrue(bool(jnp.all(jnp.isfinite(r_fp8_unpacked[1:]))))
+        self.assertLess(self._rel_l2(o_ref[:1], o_fp8[:1]), 2e-2)
+        self.assertLess(self._rel_l2(o_ref[1:], o_fp8[1:]), 2e-2)
+        self.assertLess(self._rel_l2(r_ref[1], r_fp8_unpacked[1]), 6e-2)
+        self.assertLess(self._rel_l2(r_ref[2], r_fp8_unpacked[2]), 6e-2)
+
+        # 2) Speculative verify (window_size=4) with packed FP8 state.
+        spec_len = 4
+        spec_qkv = qkv[:spec_len]
+        spec_b = b[:spec_len]
+        spec_a = a[:spec_len]
+        spec_conv = jnp.asarray(
+            rng.standard_normal((6, kernel_size - 1, dim)), jnp.float32
+        )
+        spec_rec_init = jnp.asarray(
+            rng.standard_normal((6, n_v, d_k, d_v)), jnp.float32
+        )
+        spec_rec_packed = recurrent_state_lib.pack_state(spec_rec_init, "fp8")
+        spec_rec_ref_init = recurrent_state_lib.unpack_state(
+            spec_rec_packed, "fp8", n_v=n_v, d_k=d_k
+        )
+        spec_qsl = jnp.array([0, spec_len], dtype=jnp.int32)
+        spec_sidx = jnp.array([1], dtype=jnp.int32)
+        spec_read_off = jnp.array([1], dtype=jnp.int32)
+        spec_slens = jnp.array([spec_len + 32], dtype=jnp.int32)
+        (_, r_spec_ref), o_spec_ref_flat = gdn_attention_spec_ref(
+            qkv=spec_qkv,
+            b=spec_b,
+            a=spec_a,
+            states=(spec_conv, spec_rec_ref_init),
+            conv_weight=conv_w,
+            conv_bias=conv_b,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=spec_qsl,
+            state_indices=spec_sidx,
+            read_offsets=spec_read_off,
+            num_spec_seqs=1,
+            seq_lens=spec_slens,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        (_, r_spec_fp8), o_spec_fp8 = wrapper.fused_conv1d_gdn(
+            qkv=spec_qkv,
+            b=spec_b,
+            a=spec_a,
+            states=(spec_conv.copy(), spec_rec_packed.copy()),
+            conv_weight=conv_w,
+            conv_bias=conv_b,
+            a_log=a_log,
+            dt_bias=dt_bias,
+            query_start_loc=spec_qsl,
+            state_indices=spec_sidx,
+            distribution=jnp.array([1, 1, 1], dtype=jnp.int32),
+            seq_lens=spec_slens,
+            read_offsets=spec_read_off,
+            num_spec_tokens=spec_len - 1,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            recurrent_state_format="fp8",
+        )
+        r_spec_unpacked = recurrent_state_lib.unpack_state(
+            r_spec_fp8, "fp8", n_v=n_v, d_k=d_k
+        )
+        self.assertLess(
+            self._rel_l2(o_spec_ref_flat.reshape(spec_len, n_v, d_v), o_spec_fp8), 2e-2
+        )
+        self.assertLess(
+            self._rel_l2(
+                r_spec_ref[1 : 1 + spec_len], r_spec_unpacked[1 : 1 + spec_len]
+            ),
+            6e-2,
+        )
+
+        # 3) block_doubling_fp8 + packed FP8 state on chips with FP8 MXU.
+        e4m3 = jnp.dtype(jnp.float8_e4m3fn)
+        if pltpu.get_tpu_info().is_matmul_supported(e4m3, e4m3):
+            (_, r_f8_fp8), o_f8_fp8 = wrapper.fused_conv1d_gdn(
+                **common,
+                states=(conv_init.copy(), rec_poison.copy()),
+                mixed_tile_size=64,
+                gdn_prefill_mode="block_doubling_fp8",
+                recurrent_state_format="fp8",
+            )
+            r_f8_unpacked = recurrent_state_lib.unpack_state(
+                r_f8_fp8, "fp8", n_v=n_v, d_k=d_k
+            )
+            self.assertLess(self._rel_l2(o_ref[1:], o_f8_fp8[1:]), 4e-2)
+            self.assertLess(self._rel_l2(r_ref[2], r_f8_unpacked[2]), 8e-2)

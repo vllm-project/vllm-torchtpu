@@ -22,6 +22,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.gdn.v3 import config
+from vllm_torchtpu.kernels.gdn.v3 import recurrent_state as recurrent_state_lib
 
 
 def granule_view(ref: jax.Ref, leading_shape: tuple[int, ...]) -> jax.Ref:
@@ -530,13 +531,8 @@ def create_allocs(
     # Initial state needs only 1 slot per sequence; output holds one
     # checkpoint per window position (1 without speculative decoding).
     conv_shape = (cfg.prev_kernel_size, 1, cfg.dim_size)
-    # The window stores the recurrent state as uint32 words; `packing`
-    # state values share one word, so it has kq_head_dim // packing rows.
-    packing = 4 // jnp.dtype(cfg.dtypes.recurrent_state).itemsize
-    recurrent_shape = (
-        cfg.num_v_heads,
-        cfg.kq_head_dim // packing,
-        cfg.v_head_dim,
+    recurrent_shape = recurrent_state_lib.slot_window_shape(
+        cfg.state_format, cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim
     )
     state_in_partial = functools.partial(
         StateInBufferedRef.input,

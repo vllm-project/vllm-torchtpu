@@ -25,6 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
 from vllm_torchtpu.kernels.gdn.v3 import recurrent_state as rs
+from vllm_torchtpu.kernels.gdn.v3 import tiling
 
 _SCALED_FORMATS = (rs.RecurrentStateFormat.FP8,)
 
@@ -555,6 +556,47 @@ class RecurrentStateTest(parameterized.TestCase):
             )
         self.assertIn("pallas_call", stream_jaxpr)
         self.assertIn("pallas_call", carry_jaxpr)
+
+    def test_tiling_vmem_footprint_with_fp8_state(self):
+        n_kq, n_v, d_k, d_v = 8, 64, 128, 128
+        vmem_limit = 64 * 1024 * 1024
+        dec_f32, _ = tiling.get_tile_sizes(
+            batch_size=16,
+            num_seqs=16,
+            padded_batch_size=16,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=4,
+            conv_state_dim_size=2 * n_kq * d_k + n_v * d_v,
+            act_out_dtype=jnp.dtype(jnp.bfloat16),
+            recurrent_state_dtype=jnp.dtype(jnp.float32),
+            num_lanes=128,
+            decode_vmem_limit_bytes=vmem_limit,
+            mixed_vmem_limit_bytes=vmem_limit,
+            window_size=4,
+            recurrent_state_format=rs.RecurrentStateFormat.F32,
+        )
+        dec_fp8, _ = tiling.get_tile_sizes(
+            batch_size=16,
+            num_seqs=16,
+            padded_batch_size=16,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=4,
+            conv_state_dim_size=2 * n_kq * d_k + n_v * d_v,
+            act_out_dtype=jnp.dtype(jnp.bfloat16),
+            recurrent_state_dtype=jnp.dtype(jnp.uint32),
+            num_lanes=128,
+            decode_vmem_limit_bytes=vmem_limit,
+            mixed_vmem_limit_bytes=vmem_limit,
+            window_size=4,
+            recurrent_state_format=rs.RecurrentStateFormat.FP8,
+        )
+        self.assertGreater(dec_fp8, dec_f32)
 
     @parameterized.parameters(1, 4, 6, 8)
     def test_max_abs_8_heads_butterfly_matches_per_head_max(self, blk):

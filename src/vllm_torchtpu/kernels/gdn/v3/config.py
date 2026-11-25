@@ -21,7 +21,10 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.gdn.v3 import recurrent_state as recurrent_state_lib
 from vllm_torchtpu.kernels.gdn.v3 import triangular_solve
+
+RecurrentStateFormat = recurrent_state_lib.RecurrentStateFormat
 
 
 class AttentionMode(enum.StrEnum):
@@ -108,18 +111,27 @@ class GDNConfig:
     is_shared: bool = False
     # Solver of the chunked GDN prefill recurrence.
     gdn_prefill_mode: GDNPrefillMode = GDNPrefillMode.SEQUENTIAL
+    # Optional packed recurrent state format (`f32`, `bf16`, `fp8`); `None`
+    # infers `f32`/`bf16` from `dtypes.recurrent_state`.
+    recurrent_state_format: RecurrentStateFormat | None = None
+
+    @property
+    def state_format(self) -> RecurrentStateFormat:
+        return recurrent_state_lib.resolve_format(
+            self.recurrent_state_format, self.dtypes.recurrent_state
+        )
 
     @property
     def conv_hbm_offset(self) -> int:
         if self.is_shared:
-            # In Unified pool. Conv state is stored after recurrent state.
-            # Offset is calculated via recurrent state size.
-            lane_bytes = pltpu.get_tpu_info().num_lanes * 4
-            lane_elements = (
-                lane_bytes // jnp.dtype(self.dtypes.recurrent_state).itemsize
+            num_lanes = pltpu.get_tpu_info().num_lanes
+            return recurrent_state_lib.slot_granules(
+                self.state_format,
+                self.num_v_heads,
+                self.kq_head_dim,
+                self.v_head_dim,
+                num_lanes,
             )
-            num_elements = self.v_dim_size * self.kq_head_dim
-            return num_elements // lane_elements
         return 0
 
     @property
@@ -192,9 +204,18 @@ class GDNConfig:
         """Whether GDN runs the token-recurrent scan instead of the chunked one.
 
         Keeping more than one state checkpoint mandates the recurrent scan,
-        since the chunked path only ever produces the final state.
+        since the chunked path only ever produces the final state. Packed
+        scaled states also route chunks unsupported by block doubling through
+        the streamed recurrent path because sequential bulk prefill does not
+        support packed state.
         """
-        return self.chunk_size == 1 or self.window_size > 1
+        if self.chunk_size == 1 or self.window_size > 1:
+            return True
+        return (
+            recurrent_state_lib.is_scaled(self.state_format)
+            and not self.is_kda
+            and not triangular_solve.supports_block_doubling_chunk(self.chunk_size)
+        )
 
     @property
     def use_block_doubling(self) -> bool:
@@ -232,6 +253,8 @@ class GDNConfig:
             suffix += "_bounded"
         if self.use_block_doubling:
             suffix += f"_{self.gdn_prefill_mode.value}"
+        if recurrent_state_lib.is_scaled(self.state_format):
+            suffix += f"_s{self.state_format.value}"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
