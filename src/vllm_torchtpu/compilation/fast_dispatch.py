@@ -31,8 +31,8 @@ decorated at import, before the options are known, is covered:
   value guards. Off, the filter keeps every guard.
 
 TODO: Remove this module once PyTorch has a public guarded call path for
-``fullgraph`` compiled functions (an upstream issue is to be filed). Until
-then it relies on Dynamo internals, checked against torch 2.13.0 (git
+``fullgraph`` compiled functions (https://github.com/pytorch/pytorch/issues/206560).
+Until then it relies on Dynamo internals, checked against torch 2.13.0 (git
 cf30153c4c13): ``torch._C._dynamo.eval_frame._get_cache_entries_for_region``
 and ``_get_total_cache_entry_count``, each cache entry's ``code`` and
 ``guard_manager.check``, the compiled wrapper's ``_isolate_recompiles_id``,
