@@ -41,8 +41,12 @@ from tests.megakernel.core.megakernel_fakes import (
 )
 from vllm_torchtpu.megakernel.core import modules, planner
 from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
-from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
-from vllm_torchtpu.megakernel.core.modules import MoEModule
+from vllm_torchtpu.megakernel.core.exec_spec import DebugOptions, ExecSpec
+from vllm_torchtpu.megakernel.core.modules import MoEDebug, MoEModule
+from vllm_torchtpu.megakernel.core.modules.moe.params import (
+    MoETunables,
+    derive_moe_params,
+)
 from vllm_torchtpu.megakernel.core.ops import (
     BF16,
     F32,
@@ -52,7 +56,7 @@ from vllm_torchtpu.megakernel.core.ops import (
     round_bf16,
     round_up,
 )
-from vllm_torchtpu.megakernel.core.spec import LayerType, ModelSpec
+from vllm_torchtpu.megakernel.core.spec import ExtraInput, LayerType, ModelSpec, Spec
 
 
 def _build_moe_test_scratch(
@@ -334,9 +338,11 @@ def _run_moe_numerical_parity_case(
     nbe: int = 4,
     e_slots: int = 0,
     L: int = 1,
+    stack_e: bool = True,
+    weight_dtypes: dict[str, str] | None = None,
     interpret: bool = True,
 ) -> None:
-    """Compare `MoEModule.emit` in Pallas against a pure-JAX reference."""
+    """Compare `MoEModule.emit` in Pallas against `MoEModule.reference` / EPLB ref."""
     devs = jax.devices("cpu") if interpret else jax.devices("tpu")
     assert len(devs) >= R
 
@@ -358,7 +364,7 @@ def _run_moe_numerical_parity_case(
         }
     )
     ex = ExecSpec(
-        B=2, T=1, R=R, ctx=128, stack_e=True, tiles=tiles, interpret=interpret
+        B=2, T=1, R=R, ctx=128, stack_e=stack_e, tiles=tiles, interpret=interpret
     )
     g = FakeGeometry(
         L=L,
@@ -374,13 +380,17 @@ def _run_moe_numerical_parity_case(
         moe_tp=moe_tp,
         e_slots=e_slots,
     )
-    moe = MoEModule()
+    moe = MoEModule(weight_dtypes=weight_dtypes)
+    sh13_fp8 = moe.weight_dtypes["sh13"] == "fp8"
+    sh2_fp8 = moe.weight_dtypes["sh2"] == "fp8"
+    e_fp8 = moe.weight_dtypes["e13"] == "fp8"
     ms = ModelSpec("moe_num", config=g, layer_type=LayerType("lt", slots=(moe,)))
     cp, scratch = _build_moe_test_scratch(ms, ex)
     mp = cp.module("moe")
     assert mp.PIPE is pipe
     assert mp.PIPE_EP is pipe_ep
     assert mp.ECOPY is ecopy
+    assert mp.stack_e is stack_e
     assert mp.unroll is bool(moe_unroll or pipe_ep)
     assert mp.group_rel is (moe_group_rows >= ex.B)
     if H == 512 and IR == 256 and ebank == (64 << 10):
@@ -388,6 +398,10 @@ def _run_moe_numerical_parity_case(
     if pipe_ep:
         assert mp.T13 == 2 * mp.T2
     p = cp.plan
+    w_decls = {w.name: w for w in moe.weights(g, ex)}
+    assert w_decls["e13"].layout == ("stacked" if stack_e else "per_layer")
+    if not e_fp8:
+        assert "es" not in p.w_names and "es" not in scratch
     wsh = planner.weight_shapes(ms, ex, p)
     s_names = list(scratch.keys())
 
@@ -399,25 +413,31 @@ def _run_moe_numerical_parity_case(
         )
         router_noise = jax.random.normal(keys[2], (L, H, E), dtype=F32) * 0.02
         sh_gate = jax.random.normal(keys[3], (L, H), dtype=F32) * 0.2
-        sh13 = (jax.random.normal(keys[4], (R, L, H, 2 * ISR), dtype=F32) * 0.4).astype(
-            FP8
-        )
+        sh13 = (
+            jax.random.normal(keys[4], (R, L, H, 2 * ISR), dtype=F32)
+            * (0.4 if sh13_fp8 else 0.12)
+        ).astype(FP8 if sh13_fp8 else BF16)
         sh13_s = jax.random.uniform(
             keys[5], (R, L, 2 * ISR), dtype=F32, minval=0.05, maxval=0.15
         )
-        sh2 = (jax.random.normal(keys[6], (R, L, ISR, H), dtype=F32) * 0.4).astype(FP8)
+        sh2 = (
+            jax.random.normal(keys[6], (R, L, ISR, H), dtype=F32)
+            * (0.4 if sh2_fp8 else 0.12)
+        ).astype(FP8 if sh2_fp8 else BF16)
         sh2_s = jax.random.uniform(
             keys[7], (R, L, H), dtype=F32, minval=0.05, maxval=0.15
         )
         e13 = (
-            jax.random.normal(keys[8], (R, L, EW, H, 2 * IR), dtype=F32) * 0.4
-        ).astype(FP8)
+            jax.random.normal(keys[8], (R, L, EW, H, 2 * IR), dtype=F32)
+            * (0.4 if e_fp8 else 0.15)
+        ).astype(FP8 if e_fp8 else BF16)
         e13_s = jax.random.uniform(
             keys[9], (R, L, EW, 2 * IR), dtype=F32, minval=0.15, maxval=0.35
         )
-        e2 = (jax.random.normal(keys[10], (R, L, EW, IR, H), dtype=F32) * 0.4).astype(
-            FP8
-        )
+        e2 = (
+            jax.random.normal(keys[10], (R, L, EW, IR, H), dtype=F32)
+            * (0.4 if e_fp8 else 0.15)
+        ).astype(FP8 if e_fp8 else BF16)
         e2_s = jax.random.uniform(
             keys[11], (R, L, EW, H), dtype=F32, minval=0.15, maxval=0.35
         )
@@ -434,6 +454,7 @@ def _run_moe_numerical_parity_case(
         ecopy_tbl = jnp.zeros((R, L, E), dtype=F32)
         partials_by_layer: list[list[jax.Array]] = []
         ref_outs_by_layer: list[jax.Array] = []
+        mod_ref_deltas: list[jax.Array | None] = []
 
         for lyr in range(L):
             x_moe = rmsnorm(
@@ -488,7 +509,9 @@ def _run_moe_numerical_parity_case(
             )
             partials_l: list[jax.Array] = []
             for r in range(R):
-                g13 = (xb_moe @ sh13[r, lyr].astype(F32)) * sh13_s[r, lyr]
+                g13 = xb_moe @ sh13[r, lyr].astype(F32)
+                if sh13_fp8:
+                    g13 = g13 * sh13_s[r, lyr]
                 mid_sh = (
                     round_bf16(
                         round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
@@ -497,7 +520,10 @@ def _run_moe_numerical_parity_case(
                     .astype(BF16)
                     .astype(F32)
                 )
-                part_r = (mid_sh @ sh2[r, lyr].astype(F32)) * sh2_s[r, lyr] * sg
+                ysh = mid_sh @ sh2[r, lyr].astype(F32)
+                if sh2_fp8:
+                    ysh = ysh * sh2_s[r, lyr]
+                part_r = ysh * sg
                 for b in range(ex.B):
                     for k in range(TOPK):
                         e = int(top_idx[b, k])
@@ -508,9 +534,9 @@ def _run_moe_numerical_parity_case(
                             w_slot = e if moe_tp else (e - owner_r * ER)
                         if owner_r != r:
                             continue
-                        h_e = (
-                            xb_moe[b : b + 1] @ e13[r, lyr, w_slot].astype(F32)
-                        ) * e13_s[r, lyr, w_slot]
+                        h_e = xb_moe[b : b + 1] @ e13[r, lyr, w_slot].astype(F32)
+                        if e_fp8:
+                            h_e = h_e * e13_s[r, lyr, w_slot]
                         mid_e = (
                             round_bf16(
                                 round_bf16(jax.nn.silu(round_bf16(h_e[:, :IR])))
@@ -519,9 +545,9 @@ def _run_moe_numerical_parity_case(
                             .astype(BF16)
                             .astype(F32)
                         )
+                        y_raw = mid_e @ e2[r, lyr, w_slot].astype(F32)
                         y_e = round_bf16(
-                            (mid_e @ e2[r, lyr, w_slot].astype(F32))
-                            * e2_s[r, lyr, w_slot]
+                            y_raw * e2_s[r, lyr, w_slot] if e_fp8 else y_raw
                         )
                         part_r = part_r.at[b : b + 1].add(top_w[b, k] * y_e)
                 partials_l.append(part_r.astype(BF16).astype(F32))
@@ -529,34 +555,72 @@ def _run_moe_numerical_parity_case(
             ref_outs_by_layer.append(
                 (res + jnp.sum(jnp.stack(partials_l, axis=0), axis=0)).astype(BF16)
             )
+            if not ecopy:
+                ref_params: dict[str, Any] = {
+                    "router": router_l,
+                    "sh_gate": jnp.broadcast_to(sh_gate[lyr][None, :], (R, H)),
+                    "sh13": sh13[:, lyr],
+                    "sh2": sh2[:, lyr],
+                    "e13": e13[:, lyr],
+                    "e2": e2[:, lyr],
+                }
+                if sh13_fp8:
+                    ref_params["sh13_s"] = sh13_s[:, lyr]
+                if sh2_fp8:
+                    ref_params["sh2_s"] = sh2_s[:, lyr]
+                if e_fp8:
+                    ref_params["e13_s"] = e13_s[:, lyr]
+                    ref_params["e2_s"] = e2_s[:, lyr]
+                ref_delta, ref_st = moe.reference(ref_params, x_moe, g=g, ex=ex)
+                assert ref_st is None
+                mod_ref_deltas.append(ref_delta)
+            else:
+                mod_ref_deltas.append(None)
 
         router = jnp.stack(routers, axis=0)
         lay = p.smalls_layout
         sm = jnp.zeros((R, L, 1, p.smalls_width), dtype=F32)
         sm_items = [
             ("post_norm", jnp.broadcast_to(post_norm[None, ...], (R, L, H))),
-            ("sh13_s", sh13_s),
-            ("sh2_s", sh2_s),
             ("sh_gate", jnp.broadcast_to(sh_gate[None, ...], (R, L, H))),
         ]
+        if sh13_fp8:
+            sm_items.append(("sh13_s", sh13_s))
+        if sh2_fp8:
+            sm_items.append(("sh2_s", sh2_s))
         if ecopy:
             sm_items.append(("ecopy", ecopy_tbl))
         for name, val in sm_items:
             o, w = lay[name]
             sm = sm.at[:, :, 0, o : o + w].set(val)
 
-        w_by_name = {
+        w_by_name: dict[str, Any] = {
             "router": jnp.broadcast_to(router[None, ...], (R, L, H, E)).reshape(
                 R, *wsh["router"][0]
             ),
             "sh13": sh13.reshape(R, *wsh["sh13"][0]),
             "sh2": sh2.reshape(R, *wsh["sh2"][0]),
-            "e13": e13.reshape(R, *wsh["e13"][0]),
-            "e2": e2.reshape(R, *wsh["e2"][0]),
-            "es": jnp.concatenate([e13_s, e2_s], axis=-1).reshape(R, *wsh["es"][0]),
+            "e13": (
+                e13.reshape(R, *wsh["e13"][0])
+                if stack_e
+                else tuple(
+                    e13[:, lyr].reshape(R, *wsh["e13"][lyr].shape) for lyr in range(L)
+                )
+            ),
+            "e2": (
+                e2.reshape(R, *wsh["e2"][0])
+                if stack_e
+                else tuple(
+                    e2[:, lyr].reshape(R, *wsh["e2"][lyr].shape) for lyr in range(L)
+                )
+            ),
             "smalls": sm,
             "final_norm": jnp.zeros((R, *wsh["final_norm"][0]), dtype=F32),
         }
+        if e_fp8:
+            w_by_name["es"] = jnp.concatenate([e13_s, e2_s], axis=-1).reshape(
+                R, *wsh["es"][0]
+            )
 
     def pallas_body(pos_ref, hid_ref, *rest):
         n_w, n_o = len(p.w_names), len(p.o_names)
@@ -608,10 +672,18 @@ def _run_moe_numerical_parity_case(
             if ex.MB < ex.M:
                 out_refs["hidden"][lyr, ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
 
+    def _is_tupled(v: Any) -> bool:
+        return isinstance(v, tuple) and bool(v) and isinstance(v[0], Spec)
+
     in_specs = [
         pl.BlockSpec(memory_space=pltpu.SMEM),
         pl.BlockSpec(memory_space=pltpu.VMEM),
-    ] + [pl.BlockSpec(memory_space=pltpu.HBM) for _ in p.w_names]
+    ] + [
+        tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in wsh[k])
+        if _is_tupled(wsh[k])
+        else pl.BlockSpec(memory_space=pltpu.HBM)
+        for k in p.w_names
+    ]
     out_specs = [pl.BlockSpec(memory_space=pltpu.VMEM) for _ in p.o_names]
     out_shape = [jax.ShapeDtypeStruct((L, ex.M, H), BF16)]
 
@@ -627,17 +699,27 @@ def _run_moe_numerical_parity_case(
     pos = jnp.array([4, 8], dtype=I32)
     w_all = [w_by_name[k] for k in p.w_names]
     if R == 1:
-        (part_out,) = jax.jit(call)(pos, hid, *[w[0] for w in w_all])
+        w_r0 = [tuple(t[0] for t in w) if isinstance(w, tuple) else w[0] for w in w_all]
+        (part_out,) = jax.jit(call)(pos, hid, *w_r0)
         part_ranks = part_out[None, :, : ex.B]
     else:
         mesh = Mesh(devs[:R], ("tp",))
+        w_part = tuple(
+            tuple(P("tp") for _ in wsh[k]) if _is_tupled(wsh[k]) else P("tp")
+            for k in p.w_names
+        )
         step = jax.jit(
             jax.shard_map(
                 lambda pos_in, hid_in, *ws: call(
-                    pos_in, hid_in[0], *[w[0] for w in ws]
+                    pos_in,
+                    hid_in[0],
+                    *[
+                        tuple(t[0] for t in w) if isinstance(w, tuple) else w[0]
+                        for w in ws
+                    ],
                 )[0][None],
                 mesh=mesh,
-                in_specs=(P(), P("tp"), *(P("tp") for _ in p.w_names)),
+                in_specs=(P(), P("tp"), *w_part),
                 out_specs=P("tp"),
                 check_vma=False,
             )
@@ -656,9 +738,15 @@ def _run_moe_numerical_parity_case(
                     atol=2e-2,
                     rtol=2e-2,
                 )
-            actual_out = (res + jnp.sum(part_ranks[:, lyr].astype(F32), axis=0)).astype(
-                BF16
-            )
+            summed_delta = jnp.sum(part_ranks[:, lyr].astype(F32), axis=0)
+            if mod_ref_deltas[lyr] is not None:
+                np.testing.assert_allclose(
+                    summed_delta,
+                    mod_ref_deltas[lyr].astype(F32),
+                    atol=2e-2,
+                    rtol=2e-2,
+                )
+            actual_out = (res + summed_delta).astype(BF16)
             assert jnp.allclose(
                 actual_out.astype(F32),
                 ref_outs_by_layer[lyr].astype(F32),
@@ -1075,6 +1163,41 @@ def test_moe_module_option_consistency_precedence_and_decls():
     assert dict(m_def.options) == {"shared_gate": True}
     assert m_def.cache_decl() is None
 
+    hf_cfg = {
+        "hidden_size": 128,
+        "num_experts": 128,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 128,
+        "shared_expert_intermediate_size": 128,
+    }
+    g_def = FakeGeometry(
+        L=1,
+        att_every=1,
+        H=128,
+        NH=2,
+        NKV=1,
+        HD=128,
+        E=128,
+        TOPK=2,
+        I=128,
+        IS=128,
+        moe_tp=True,
+        e_slots=0,
+    )
+    b_def = MoEModule.bind("mlp")
+    assert (
+        m_def.options
+        == MoEModule(geometry=g_def).options
+        == b_def.resolve(hf_cfg).options
+        == b_def.to_module(hf_cfg).options
+    )
+    b_wd = MoEModule.bind("mlp", weight_dtypes={"sh13": "bf16"})
+    assert (
+        MoEModule(weight_dtypes={"sh13": "bf16"}).options
+        == b_wd.resolve(hf_cfg).options
+        == b_wd.to_module(hf_cfg).options
+    )
+
     # Geometry precedence when explicit values are omitted (`None`).
     g_ep = FakeGeometry(
         L=1,
@@ -1102,6 +1225,13 @@ def test_moe_module_option_consistency_precedence_and_decls():
     assert m_agree.moe_tp is False
     assert m_agree.e_slots == 70
     assert m_agree._check_option_consistency(g_ep) == (False, 70)
+    b_ep = MoEModule.bind("mlp", moe_tp=False, e_slots=70)
+    assert (
+        m_geom.options
+        == m_agree.options
+        == b_ep.resolve(hf_cfg).options
+        == b_ep.to_module(hf_cfg).options
+    )
 
     # Explicit values take precedence when geometry lacks `moe_tp` / `e_slots`.
     g_plain = SimpleNamespace(
@@ -1112,21 +1242,68 @@ def test_moe_module_option_consistency_precedence_and_decls():
     assert m_exp._check_option_consistency(g_plain) == (False, 70)
     assert m_def._check_option_consistency(g_plain) == (True, 0)
 
-    # Conflicting explicit vs geometry values raise `MegakernelConfigError`.
+    # Invalid option types / negative `e_slots` / conflicting values fail closed.
+    for bad_kw in (
+        {"e_slots": True},
+        {"e_slots": -1},
+        {"moe_tp": "yes"},
+        {"shared_gate": "yes"},
+    ):
+        with pytest.raises(MegakernelConfigError):
+            MoEModule(**bad_kw)  # type: ignore[arg-type]
+        with pytest.raises(MegakernelConfigError):
+            MoEModule.bind("mlp", **bad_kw)
     with pytest.raises(MegakernelConfigError, match="moe_tp=True.*moe_tp=False"):
         MoEModule(moe_tp=True, geometry=g_ep)
     with pytest.raises(MegakernelConfigError, match="e_slots=64.*e_slots=70"):
         MoEModule(e_slots=64, geometry=g_ep)
 
-    ex = ExecSpec(B=2, T=1, R=1, ctx=128, stack_e=True, tiles=TINY_TILES)
+    ex = ExecSpec(B=2, T=1, R=2, ctx=128, stack_e=True, tiles=TINY_TILES)
     m_tp_only = MoEModule(moe_tp=True)
     with pytest.raises(MegakernelConfigError, match="moe_tp=True.*moe_tp=False"):
         m_tp_only.hf_params(g=g_ep)
     m_slots_only = MoEModule(e_slots=64)
     with pytest.raises(MegakernelConfigError, match="e_slots=64.*e_slots=70"):
         m_slots_only.weights(g_ep, ex)
+    g_bad_div = dataclasses.replace(g_def, E=127)
+    with pytest.raises(MegakernelConfigError, match="multiple of R=2"):
+        m_def.weights(g_bad_div, ex)
+    with pytest.raises(MegakernelConfigError, match="multiple of R=2"):
+        m_def.smalls(g_bad_div, ex)
+    with pytest.raises(MegakernelConfigError, match="multiple of R=2"):
+        m_def.shared_widths(g_bad_div, ex)
+    with pytest.raises(MegakernelConfigError, match="redundant expert slots"):
+        m_def.weights(dataclasses.replace(g_def, e_slots=70), ex)
+
+    # `E % 128 == 0` and `E <= 1024` seen-table envelope checks in `derive_moe_params`.
+    ex_r1 = ExecSpec(B=2, T=1, R=1, ctx=128, stack_e=True, tiles=TINY_TILES)
+    ms_r1 = ModelSpec(
+        "moe_env", config=g_def, layer_type=LayerType("lt", slots=(m_def,))
+    )
+    p_r1 = planner.plan(ms_r1, ex_r1)
+    with pytest.raises(MegakernelConfigError, match="E=64 must be a multiple of 128"):
+        derive_moe_params(
+            dataclasses.replace(g_def, E=64),
+            ex_r1,
+            p_r1,
+            MoETunables(topk=False),
+            MoEDebug(),
+            moe_tp=True,
+            e_slots=0,
+        )
+    with pytest.raises(MegakernelConfigError, match="E=2048 exceeds seen-table"):
+        derive_moe_params(
+            dataclasses.replace(g_def, E=2048),
+            ex_r1,
+            p_r1,
+            MoETunables(topk=False),
+            MoEDebug(),
+            moe_tp=True,
+            e_slots=0,
+        )
 
     # `hf_params()` and `reference()` through `MoEModule`.
+    ex_ref = ExecSpec(B=2, T=1, R=1, ctx=128, stack_e=True, tiles=TINY_TILES)
     decls = {d.name: d for d in m_agree.hf_params()}
     assert {
         "router",
@@ -1141,23 +1318,10 @@ def test_moe_module_option_consistency_precedence_and_decls():
     assert decls["e_gate_proj"].transform.shard_axis == 0
     assert decls["e2"].transform.shard_axis == 0
 
-    g_ref = FakeGeometry(
-        L=1,
-        att_every=1,
-        H=128,
-        NH=2,
-        NKV=1,
-        HD=128,
-        E=128,
-        TOPK=2,
-        I=128,
-        IS=128,
-        moe_tp=True,
-        e_slots=0,
-    )
+    g_ref = g_def
     m_ref = MoEModule(moe_tp=True, e_slots=0, geometry=g_ref)
     keys = jax.random.split(jax.random.PRNGKey(303), 8)
-    x_in = jax.random.normal(keys[0], (ex.B, g_ref.H), dtype=BF16) * 0.5
+    x_in = jax.random.normal(keys[0], (ex_ref.B, g_ref.H), dtype=BF16) * 0.5
     params = {
         "post_norm": jnp.full((1, g_ref.H), 0.2, dtype=F32),
         "router": jax.random.normal(keys[1], (1, g_ref.H, g_ref.E), dtype=BF16) * 0.2,
@@ -1180,9 +1344,234 @@ def test_moe_module_option_consistency_precedence_and_decls():
         ).astype(FP8),
         "e2_s": jnp.full((1, g_ref.E, g_ref.H), 0.3, dtype=F32),
     }
-    ref_out, ref_st = m_ref.reference(params, x_in, ex=ex)
+    ref_out, ref_st = m_ref.reference(params, x_in, ex=ex_ref)
     assert ref_st is None
-    assert ref_out.shape == (ex.B, g_ref.H)
+    assert ref_out.shape == (ex_ref.B, g_ref.H)
     assert float(jnp.max(jnp.abs(ref_out.astype(F32)))) >= 0.05
     with pytest.raises(MegakernelConfigError, match="moe_tp=True.*moe_tp=False"):
-        m_ref.reference(params, x_in, g=g_ep, ex=ex)
+        m_ref.reference(params, x_in, g=g_ep, ex=ex_ref)
+
+
+@pytest.mark.parametrize(
+    ("case_id", "kw"),
+    [
+        (
+            "bf16_weights_pipe",
+            dict(
+                moe_tp=True,
+                R=1,
+                pipe=True,
+                weight_dtypes={
+                    "sh13": "bf16",
+                    "sh2": "bf16",
+                    "e13": "bf16",
+                    "e2": "bf16",
+                },
+            ),
+        ),
+        (
+            "bf16_weights_multitile_unroll",
+            dict(
+                moe_tp=False,
+                R=1,
+                pipe=False,
+                moe_unroll=True,
+                H=512,
+                IR=256,
+                ebank=128 << 10,
+                nbe=8,
+                weight_dtypes={
+                    "sh13": "bf16",
+                    "sh2": "bf16",
+                    "e13": "bf16",
+                    "e2": "bf16",
+                },
+            ),
+        ),
+        (
+            "ep_r1_unstacked_multitile_group_rel",
+            dict(
+                moe_tp=False,
+                R=1,
+                pipe=False,
+                moe_unroll=True,
+                moe_group_rows=40,
+                H=512,
+                IR=256,
+                ebank=64 << 10,
+                nbe=8,
+                L=2,
+                stack_e=False,
+            ),
+        ),
+    ],
+    ids=[
+        "bf16_weights_pipe",
+        "bf16_weights_multitile_unroll",
+        "ep_r1_unstacked_multitile_group_rel",
+    ],
+)
+def test_moe_module_bf16_weights_and_unstacked_parity(case_id: str, kw: dict[str, Any]):
+    """Verify `weight_dtypes='bf16'` (no `es`) and `stack_e=False` (`per_layer`)."""
+    del case_id
+    _run_moe_numerical_parity_case(**kw, interpret=True)
+
+
+def test_moe_module_debug_forced_routing_and_row_mask_in_pallas():
+    """Verify `MoEDebug(forced_routing=True, row_mask=True)` hooks on `MoEModule`."""
+    L, H, E, TOPK, IR, ISR = 2, 128, 128, 2, 128, 128
+    tiles = dataclasses.replace(TINY_TILES, bank=512 << 10, ebank=256 << 10, nbe=4)
+    ex = ExecSpec(
+        B=2,
+        T=1,
+        R=1,
+        ctx=128,
+        stack_e=True,
+        tiles=tiles,
+        debug=DebugOptions(
+            modules={"moe": MoEDebug(forced_routing=True, row_mask=True)}
+        ),
+        interpret=True,
+    )
+    g = FakeGeometry(
+        L=L,
+        att_every=1,
+        H=H,
+        NH=2,
+        NKV=1,
+        HD=128,
+        E=E,
+        TOPK=TOPK,
+        I=IR,
+        IS=ISR,
+        moe_tp=True,
+    )
+    moe = MoEModule()
+    assert moe.extra_inputs(g, ex) == [
+        ExtraInput("rbias", "hbm"),
+        ExtraInput("moe_rows", "smem", (2,), I32),
+    ]
+    ms = ModelSpec("moe_dbg", config=g, layer_type=LayerType("lt", slots=(moe,)))
+    cp, scratch = _build_moe_test_scratch(ms, ex)
+    assert "rb" in scratch and "rb_sem" in scratch
+    p = cp.plan
+    wsh = planner.weight_shapes(ms, ex, p)
+    s_names = list(scratch.keys())
+
+    keys = jax.random.split(jax.random.PRNGKey(909), 6)
+    hid = jax.random.normal(keys[0], (ex.M, H), dtype=BF16) * 0.5
+    # Router logits are uniform (0.0 -> equal pexp -> normalized top-2 weight 0.5 each),
+    # while `rbias` forces row 0 -> (5, 9) and row 1 -> (20, 21) on layer 0, and
+    # row 0 -> (12, 15) and row 1 -> (30, 31) on layer 1. `moe_rows = [1, 0]`
+    # suppresses row 1's experts from `elist`, so only row 0's forced experts run.
+    e13 = (jax.random.normal(keys[1], (L, E, H, 2 * IR), dtype=F32) * 0.35).astype(FP8)
+    e13_s = jnp.full((L, E, 2 * IR), 0.25, dtype=F32)
+    e2 = (jax.random.normal(keys[2], (L, E, IR, H), dtype=F32) * 0.35).astype(FP8)
+    e2_s = jnp.full((L, E, H), 0.25, dtype=F32)
+    sm = jnp.zeros(wsh["smalls"][0], dtype=F32)
+    o_pn, w_pn = p.smalls_layout["post_norm"]
+    sm = sm.at[:, 0, o_pn : o_pn + w_pn].set(0.2)
+
+    rbias = jnp.zeros((L, ex.M, E), dtype=F32)
+    rbias = rbias.at[0, 0, 5].set(10.0).at[0, 0, 9].set(8.0)
+    rbias = rbias.at[0, 1, 20].set(10.0).at[0, 1, 21].set(8.0)
+    rbias = rbias.at[1, 0, 12].set(10.0).at[1, 0, 15].set(8.0)
+    rbias = rbias.at[1, 1, 30].set(10.0).at[1, 1, 31].set(8.0)
+    moe_rows = jnp.array([1, 0], dtype=I32)
+
+    w_in = {k: jnp.zeros(wsh[k][0], dtype=wsh[k][1]) for k in p.w_names}
+    w_in["e13"] = e13.reshape(wsh["e13"][0])
+    w_in["e2"] = e2.reshape(wsh["e2"][0])
+    w_in["es"] = jnp.concatenate([e13_s, e2_s], axis=-1).reshape(wsh["es"][0])
+    w_in["smalls"] = sm
+
+    def pallas_body(pos_ref, hid_ref, rbias_ref, moe_rows_ref, *rest):
+        n_w, n_o = len(p.w_names), len(p.o_names)
+        W = dict(zip(p.w_names, rest[:n_w]))
+        out_refs = dict(zip(p.o_names, rest[n_w : n_w + n_o]))
+        scr = dict(zip(s_names, rest[n_w + n_o :]))
+        ring = _FakeMoEStream(cp.stream, W, scr)
+        ctx = MiniCtx(
+            g=g,
+            ex=ex,
+            core_plan=cp,
+            pos_ref=pos_ref,
+            W=W,
+            ST={},
+            O=out_refs,
+            scr=scr,
+            me=jnp.int32(0),
+            stream=ring,
+            comm=None,
+            extra={"rbias": rbias_ref, "moe_rows": moe_rows_ref},
+        )
+        pltpu.make_async_copy(
+            W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
+        ).start()
+        moe.prologue(ctx)
+        scr["res"][...] = hid_ref[: ex.MB].astype(F32)
+        scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
+        moe.init_buffers(ctx)
+        for lyr in range(L):
+            slot = lyr % 2
+            ring.cur_layer = jnp.int32(lyr)
+            pltpu.make_async_copy(
+                W["smalls"].at[lyr], scr["sm"].at[slot], scr["sm_sem"].at[slot]
+            ).wait()
+            if lyr + 1 < L:
+                pltpu.make_async_copy(
+                    W["smalls"].at[lyr + 1],
+                    scr["sm"].at[1 - slot],
+                    scr["sm_sem"].at[1 - slot],
+                ).start()
+            moe.on_layer_start(ctx, jnp.int32(lyr), jnp.int32(slot))
+            ctx.apply_input_norm(moe.input_norm, jnp.int32(slot))
+            part_moe = moe.emit(ctx, jnp.int32(lyr), jnp.int32(slot))
+            out_refs["hidden"][lyr, : ex.MB] = part_moe.astype(BF16)
+            if ex.MB < ex.M:
+                out_refs["hidden"][lyr, ex.MB :] = jnp.zeros((ex.M - ex.MB, H), BF16)
+
+    call = pl.pallas_call(
+        pallas_body,
+        out_shape=[jax.ShapeDtypeStruct((L, ex.M, H), BF16)],
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.HBM),
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+        ]
+        + [pl.BlockSpec(memory_space=pltpu.HBM) for _ in p.w_names],
+        out_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)],
+        scratch_shapes=[scratch[k] for k in s_names],
+        interpret=pltpu.InterpretParams(),
+    )
+    pos = jnp.array([1, 2], dtype=I32)
+    (out_part,) = jax.jit(call)(
+        pos, hid, rbias, moe_rows, *[w_in[k] for k in p.w_names]
+    )
+
+    x_moe = rmsnorm(
+        hid[: ex.B].astype(F32), jnp.full((H,), 0.2, F32), g.eps, zero_centered=True
+    )
+    xb0 = x_moe[0:1].astype(BF16).astype(F32)
+    for lyr, forced_pair in ((0, (5, 9)), (1, (12, 15))):
+        exp_row0 = jnp.zeros((1, H), dtype=F32)
+        for e_id in forced_pair:
+            h_e = (xb0 @ e13[lyr, e_id].astype(F32)) * e13_s[lyr, e_id]
+            mid_e = (
+                round_bf16(
+                    round_bf16(jax.nn.silu(round_bf16(h_e[:, :IR])))
+                    * round_bf16(h_e[:, IR:])
+                )
+                .astype(BF16)
+                .astype(F32)
+            )
+            y_e = round_bf16((mid_e @ e2[lyr, e_id].astype(F32)) * e2_s[lyr, e_id])
+            exp_row0 = exp_row0 + 0.5 * y_e
+        assert float(jnp.max(jnp.abs(exp_row0))) >= 0.05
+        np.testing.assert_allclose(
+            out_part[lyr, 0:1].astype(F32), exp_row0, atol=2e-2, rtol=2e-2
+        )
+        # Row 1's forced experts were masked out of `elist` by `moe_rows = [1, 0]`
+        # (and `sh13`/`sh2` are zero), so row 1 receives 0 contribution!
+        np.testing.assert_allclose(out_part[lyr, 1].astype(F32), 0.0, atol=1e-6)

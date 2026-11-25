@@ -113,10 +113,23 @@ MOE_GEOMETRY_METHODS: dict[str, Any] = {
 
 
 def validate_moe_options(options: Mapping[str, Any]) -> None:
-    if not bool(options.get("shared_gate", True)):
+    shared_gate = options.get("shared_gate", True)
+    if not isinstance(shared_gate, bool) or not shared_gate:
         raise MegakernelConfigError(
             "MoEModule requires shared_gate=True (the kernel always gates the "
             "shared expert with sh_gate)"
+        )
+    moe_tp = options.get("moe_tp")
+    if moe_tp is not None and not isinstance(moe_tp, bool):
+        raise MegakernelConfigError(
+            f"MoEModule moe_tp must be a bool or None, got {moe_tp!r}"
+        )
+    e_slots = options.get("e_slots")
+    if e_slots is not None and (
+        isinstance(e_slots, bool) or not isinstance(e_slots, int) or e_slots < 0
+    ):
+        raise MegakernelConfigError(
+            f"MoEModule e_slots must be a non-negative int or None, got {e_slots!r}"
         )
     w_dt = normalize_weight_dtypes(
         options.get("weight_dtypes"),
@@ -135,7 +148,20 @@ def resolve_moe_binding(
     cls: Any, binding: ModuleBinding, resolved: ResolvedModuleGeometry
 ) -> ResolvedModuleGeometry:
     vals = dict(resolved.values)
+    validate_moe_options(binding.options)
     opts = {k: v for k, v in binding.options.items() if v is not None}
+    opts["shared_gate"] = bool(opts.get("shared_gate", True))
+    if "moe_tp" in opts:
+        opts["moe_tp"] = bool(opts["moe_tp"])
+    if "e_slots" in opts:
+        opts["e_slots"] = int(opts["e_slots"])
+    if "weight_dtypes" in opts:
+        opts["weight_dtypes"] = normalize_weight_dtypes(
+            opts["weight_dtypes"],
+            MOE_WEIGHT_NAMES,
+            "MoEModule",
+            MegakernelConfigError,
+        )
     vals.update(
         {
             "H": int(vals["hidden"]),
