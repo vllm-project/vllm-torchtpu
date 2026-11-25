@@ -84,7 +84,6 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time linear weight requantization. |
 | `REQUANTIZE_BLOCK_SIZE` | `None` | Target subchannel block size for load-time linear weight requantization. |
 | `TPU_FP8_LINEAR_W8A16_MAX_ROWS` | `0` | Opt-in. FP8 dense-linear steps whose padded token bucket has at most this many rows keep bf16 activations (W8A16) instead of quantizing them to FP8. Per-channel path with FP8 weights only; measured on v7x. |
-| `TPU_FUSED_ATTN_OUT_FP8` | `False` | Opt-in. Fuses the batched-RPA head-major attention-output relayout with dynamic per-row FP8 activation quantization in a Pallas kernel (`kernels/quantized_matmul/attn_out_fp8.py`) ahead of eligible per-channel FP8 `o_proj` layers; unsupported token buckets fall back to the unfused path. Validated on Gemma 4 31B FP8 on TPU v7x. |
 | `TPU_GDN_QKVZ_KERNEL_LAYOUT` | `False` | Opt-in. Stores the GDN `in_proj_qkvz` weight in the matmul's (k, n) layout instead of vLLM's [n_out, n_in], removing a per-step weight copy on the per-block FP8 path. Ignored with prefill context parallelism; the experimental AOT export rejects it at TP > 1. |
 | `MOE_REQUANTIZE_WEIGHT_DTYPE` | `"float8_e4m3fn"` | Target weight dtype for load-time MoE expert weight requantization (e.g., `"fp4"`). |
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size for load-time MoE expert weight requantization. |
@@ -99,6 +98,10 @@ RL and distillation workloads that compare TPU rollouts with an unfused `bfloat1
 - `"tpu_moe_silu_bf16": true` rounds the `gmm_v2`-fused SwiGLU `gate`, `up`, and `silu(gate)` to `bfloat16`, as upstream `SiluAndMul` does. It applies only to the `silu` activation: other activations, and the clamped SiLU of DeepSeek-V4 MXFP4 layers (`silu_and_mul_with_clamp`), keep `float32` intermediates. SiLU layers then run on `gmm_v2`, so the v2 fused EP (`USE_MOE_FUSED_EP_KERNEL`), `FUSED_MOE_DECODE_KERNEL`, `USE_MOE_TP_DECODE_KERNEL`, and `TPU_MOE_DENSE_EXPERT_THRESHOLD` paths are not used for them, and `MOE_FUSED_EP_KERNEL_IMPL=adaptive` fails at startup.
 
 Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_float32": true, "tpu_moe_silu_bf16": true}'`) to reproduce the unfused `bfloat16` MoE's rounding.
+
+### Fused attention-output FP8 quantization
+
+- `"tpu_fused_attn_out_fp8": true` (off by default, via `--additional-config '{"tpu_fused_attn_out_fp8": true}'`) fuses the batched-RPA head-major attention-output relayout with dynamic per-row FP8 activation quantization in a Pallas kernel (`kernels/quantized_matmul/attn_out_fp8.py`) ahead of eligible per-channel FP8 `o_proj` layers on allowlisted direct-output attention classes; unsupported token buckets fall back to the unfused path. Validated on Gemma 4 31B FP8 on TPU v7x and enabled in `scripts/vllm/benchmarking/configs/gemma-4-31b-fp8-dp4-tp2-multimodal.sh`.
 
 ---
 

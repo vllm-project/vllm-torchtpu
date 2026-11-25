@@ -6412,7 +6412,6 @@ class TPUModelRunner(GPUModelRunner):
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (
-            _get_attn_out_quantized_matmul_op,
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,
         )
@@ -6422,8 +6421,6 @@ class TPUModelRunner(GPUModelRunner):
             _get_quantized_matmul_op()
             # Same for the NVFP4 W4A16 matmul op.
             _get_quantized_matmul_fp4_op()
-            if envs.TPU_FUSED_ATTN_OUT_FP8:
-                _get_attn_out_quantized_matmul_op()
 
     def _initialize_attention_kernels(self, force: bool = False) -> None:
         """Pre-build Pallas RPA and custom attention kernels before torch.compile."""
@@ -6561,30 +6558,11 @@ class TPUModelRunner(GPUModelRunner):
             self.reorder_batch_threshold,
         )
         self._attention_kernels_initialized = True
-        self._tag_attn_out_projections()
-
-    def _tag_attn_out_projections(self) -> int:
-        if not envs.TPU_FUSED_ATTN_OUT_FP8:
-            return 0
-        from vllm_torchtpu.layers.adapter.linear_common import (
-            tag_attn_out_projections,
+        from vllm_torchtpu.layers.adapter.attn_out_fp8 import (
+            arm_runner_models as arm_attn_out_fp8_models,
         )
 
-        roots: list[torch.nn.Module] = []
-        model = getattr(self, "model", None)
-        if isinstance(model, torch.nn.Module):
-            roots.append(model)
-        draft_model = getattr(self.drafter, "draft_model", None)
-        if isinstance(draft_model, torch.nn.Module):
-            roots.append(draft_model)
-        tagged = tag_attn_out_projections(*roots)
-        if tagged:
-            logger.info(
-                "Tagged %d attention o_proj layers for the fused "
-                "attention-output FP8 quantization.",
-                tagged,
-            )
-        return tagged
+        arm_attn_out_fp8_models(self)
 
     @torch.no_grad()
     def _dummy_run(

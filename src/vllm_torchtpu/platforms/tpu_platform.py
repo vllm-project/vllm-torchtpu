@@ -486,7 +486,6 @@ class TpuPlatform(Platform):
         "MIXED_NUM_QUERIES_PER_BLOCK",
         "MIXED_NUM_KV_PAGES_PER_BLOCK",
         "ENABLE_QUANTIZED_MATMUL_KERNEL",
-        "TPU_FUSED_ATTN_OUT_FP8",
         "REQUANTIZE_BLOCK_SIZE",
         "REQUANTIZE_WEIGHT_DTYPE",
         "MOE_REQUANTIZE_BLOCK_SIZE",
@@ -863,6 +862,12 @@ class TpuPlatform(Platform):
             )
         # Rejects non-bool MoE reference-parity values before any worker starts.
         get_moe_reference_parity(vllm_config)
+        from vllm_torchtpu.layers.adapter.attn_out_fp8 import (
+            fused_attn_out_fp8_enabled,
+        )
+
+        # Rejects non-bool fused attention-output FP8 values before workers start.
+        fused_attn_out_fp8_enabled(vllm_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )

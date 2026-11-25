@@ -50,7 +50,6 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
-    TPU_FUSED_ATTN_OUT_FP8: bool = False
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_MOE_REQUANT_CHUNK_BYTES: int = 1 << 30
@@ -603,12 +602,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
         "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
     ),
-    # Opt-in Pallas kernel fusing the batched-RPA head-major attention-output
-    # relayout with dynamic per-row FP8 activation quantization ahead of
-    # eligible per-channel FP8 `o_proj` layers
-    # (`kernels/quantized_matmul/attn_out_fp8.py`).
-    # Default off while end-to-end validation covers Gemma 4 31B FP8 on TPU v7x.
-    "TPU_FUSED_ATTN_OUT_FP8": env_bool("TPU_FUSED_ATTN_OUT_FP8", default=False),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"

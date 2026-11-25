@@ -82,6 +82,7 @@ def xla_quantized_matmul(
     w_q: jax.Array,
     w_scale: jax.Array,
     quantize_activation=True,
+    quantize_activation_fn=None,
 ) -> jax.Array:
     """
     Reference (pure JAX) implementation of the quantized matmul kernel.
@@ -92,20 +93,28 @@ def xla_quantized_matmul(
     their tests) transpose at the call site.
 
     Args:
-        x:  Activation.
         x: Activation. [num_tokens, n_input_features]
         w_q: Weight quantized array. [n_input_features, n_output_features]
         w_scale: Weight quantization scale. [n_output_features]
+        quantize_activation: Whether to dynamically quantize `x`.
+        quantize_activation_fn: Optional `(x, target_dtype) -> (x_q, x_scale)`
+            quantizer replacing `quantize_tensor` when `quantize_activation` is
+            True.
 
     Returns:
         Output of the quantized matmul.
     """
     if quantize_activation:
         acc_dtype = jnp.float32
-        if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
+        if jnp.issubdtype(w_q.dtype, jnp.integer):
             acc_dtype = jnp.int32
 
-        x_q, x_scale = quantize_tensor(x, w_q.dtype)
+        quantizer = (
+            quantize_tensor
+            if quantize_activation_fn is None
+            else quantize_activation_fn
+        )
+        x_q, x_scale = quantizer(x, w_q.dtype)
         out = jax.lax.dot_general(
             x_q,
             w_q,
