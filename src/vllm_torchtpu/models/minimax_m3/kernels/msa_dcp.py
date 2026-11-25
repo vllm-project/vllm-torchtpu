@@ -242,20 +242,18 @@ def _ahead(xs, xi, ys, yi):
     return (xs > ys) | ((xs == ys) & (xi < yi))
 
 
-def _choose(cond, a, b):
-    """``where(cond, a, b)`` of masks, by logic ops (a select of masks fails
-    Mosaic's layout pass); `cond` may be a Python bool."""
-    if isinstance(cond, bool):
-        return a if cond else b
-    return (cond & a) | (~cond & b)
+def _ahead_by_selects(xs, xi, ys, yi):
+    """`_ahead` as one compare of selected values (scores, or the ids on a
+    tie): vector-ALU work in place of `_ahead`'s two mask-logic ops."""
+    tie = xs == ys
+    return jnp.where(tie, yi, xs) > jnp.where(tie, xi, ys)
 
 
 def _bitonic_sort(s, i, ascending):
-    """Each lane's bitonic sequence of ``8 * len(s)`` candidates (position
-    ``p`` at sublane ``p % 8`` of vreg ``p // 8`` of the scores `s` and column
-    ids `i`, lists of ``[8, L]``) in order: best first, or last on the lanes
-    where `ascending` holds. Candidates the order ties (repeated non-real
-    ones) may swap."""
+    """Each lane's bitonic sequence of ``8 * len(s)`` distinct candidates
+    (position ``p`` at sublane ``p % 8`` of vreg ``p // 8`` of the scores `s`
+    and column ids `i`, lists of ``[8, L]``) in order: best first, or last if
+    `ascending`."""
     s, i = list(s), list(i)
     n = 8 * len(s)
     sublane = jax.lax.broadcasted_iota(jnp.int32, s[0].shape, 0)
@@ -265,113 +263,240 @@ def _bitonic_sort(s, i, ascending):
             hi = lo + d // 8
             if lo % (2 * d // 8) >= d // 8:
                 continue
-            keep = _choose(
-                ascending,
-                _ahead(s[hi], i[hi], s[lo], i[lo]),
-                _ahead(s[lo], i[lo], s[hi], i[hi]),
-            )
+            keep = _ahead(s[lo], i[lo], s[hi], i[hi])
+            keep = ~keep if ascending else keep
             s[lo], s[hi] = jnp.where(keep, s[lo], s[hi]), jnp.where(keep, s[hi], s[lo])
             i[lo], i[hi] = jnp.where(keep, i[lo], i[hi]), jnp.where(keep, i[hi], i[lo])
         d //= 2
     while d >= 1:  # pairs within a vreg: sublanes p and p + d
         lower = (sublane & d) == 0
+        # The lower candidate stays iff it ranks ahead (behind, ascending); the
+        # pair's candidates are distinct, so the upper one stays iff it does not.
+        flip = lower if ascending else ~lower
         for v in range(len(s)):
             ps = jnp.where(lower, pltpu.roll(s[v], 8 - d, 0), pltpu.roll(s[v], d, 0))
             pi = jnp.where(lower, pltpu.roll(i[v], 8 - d, 0), pltpu.roll(i[v], d, 0))
-            # The pair keeps its order iff its lower candidate ranks ahead
-            # (behind, ascending).
-            self_first = _ahead(s[v], i[v], ps, pi)
-            other_first = _ahead(ps, pi, s[v], i[v])
-            keep = _choose(
-                lower,
-                _choose(ascending, other_first, self_first),
-                _choose(ascending, self_first, other_first),
-            )
+            keep = _ahead(s[v], i[v], ps, pi) ^ flip
             s[v], i[v] = jnp.where(keep, s[v], ps), jnp.where(keep, i[v], pi)
         d //= 2
     return s, i
 
 
-def _pick_t_folded(
-    s, num_visible, rank, *, folds, topk, init_blocks, local_blocks, dcp
-):
-    """`_pick` of row-major scores ``s [rows, width]`` (``num_visible [rows,
-    1]``, ``folds * rows <= 128``, ``width % (8 * folds) == 0``, `folds` and
-    ``topk / 8`` powers of two) as `folds` `_pick_t`s side by side on the
-    vreg lanes the transposed rows leave idle, then bitonic merges of their
-    ordered lists.
+def _sort_pairs(n):
+    """Batcher's odd-even merge sort of `n` places: its compare-exchanges
+    ``(i, j)``, ``i < j``, in order."""
+    pairs = []
+    p = 1
+    while p < n:
+        k = p
+        while k >= 1:
+            for j in range(k % p, n - k, 2 * k):
+                for i in range(min(k, n - j - k)):
+                    if (i + j) // (2 * p) == (i + j + k) // (2 * p):
+                        pairs.append((i + j, i + j + k))
+            k //= 2
+        p *= 2
+    return pairs
 
-    The transposed pick takes rows on lanes: at decode sizes (8 to 64 rows)
-    most of each vreg's 128 lanes were idle, and each of its dependent picks
-    ran over ``width / 8`` vregs. Here column block ``f`` of ``width /
-    folds`` runs on lanes ``[f * rows, (f + 1) * rows)``, so each pick runs
-    over ``folds`` times fewer vregs. Each pick goes to its place in the
-    block's list, best first, and in its reverse; a merge level pairs block
-    ``f`` with block ``f + d`` (rolled onto its lanes), keeps the better of
-    each place against the other's reversed list (the pair's top-k, bitonic)
-    and sorts it, the second of the next level's pairs reversed. Rank
-    comparisons and selects only: the lists' column ids are distinct, so the
-    result is `_pick`'s."""
-    rows, width = s.shape
-    part = width // folds
-    cols = jax.lax.broadcasted_iota(jnp.int32, s.shape, 1)
-    blocks = cols * dcp + rank
-    visible = blocks < num_visible
-    s = jnp.where(visible, s, _NEG_INF)
+
+class _Network:
+    """Compare-exchanges of whole vregs of candidates ``(scores, ids)``, each
+    vreg element on its own; None is a candidate behind every other.
+
+    A compare-exchange is ~7 vector-ALU ops and `_ahead`'s 2 mask-logic ops;
+    the AOT schedule packs up to 4 of the first and 1 of the second per bundle,
+    so every `_SELECT_FORM_PERIOD`-th compare takes `_ahead_by_selects` (8 ALU
+    ops, no mask op) to share the load."""
+
+    def __init__(self):
+        self.compares = 0
+
+    def ahead(self, a, b):
+        self.compares += 1
+        if self.compares % _SELECT_FORM_PERIOD == 0:
+            return _ahead_by_selects(*a, *b)
+        return _ahead(*a, *b)
+
+    def exchange(self, a, b, k=None):
+        """``(ahead, behind)`` of `a` and `b` (`k`: whether `a` is ahead)."""
+        if a is None or b is None:
+            return (b, None) if a is None else (a, None)
+        k = self.ahead(a, b) if k is None else k
+        return (
+            (jnp.where(k, a[0], b[0]), jnp.where(k, a[1], b[1])),
+            (jnp.where(k, b[0], a[0]), jnp.where(k, b[1], a[1])),
+        )
+
+    def sort(self, xs, in_column_order=False):
+        """`xs` best first. `in_column_order`: their ids ascend, so the first
+        stage's neighbours tie to the first."""
+        xs = list(xs)
+        for n, (i, j) in enumerate(_sort_pairs(len(xs))):
+            first_stage = n < len(xs) // 2
+            k = xs[i][0] >= xs[j][0] if in_column_order and first_stage else None
+            xs[i], xs[j] = self.exchange(xs[i], xs[j], k)
+        return xs
+
+    def merge(self, a, b, k):
+        """The first `k` of the ordered lists `a` and `b` (disjoint), in order:
+        the better of each place of `a` and of reversed `b` (a bitonic list
+        holding the first k), then a bitonic merge."""
+        n = 1 << (min(k, len(a) + len(b)) - 1).bit_length()
+        a = a[:n] + [None] * (n - len(a[:n]))
+        b = b[:n] + [None] * (n - len(b[:n]))
+        c = [self.exchange(a[p], b[n - 1 - p])[0] for p in range(n)]
+        d = n // 2
+        while d >= 1:
+            for p in range(n):
+                if p & d == 0:
+                    c[p], c[p + d] = self.exchange(c[p], c[p + d])
+            d //= 2
+        return [x for x in c[:k] if x is not None]
+
+
+def _lane_lists(st, ids, topk):
+    """Each lane's first `topk` candidates of the transposed scores ``st
+    [8 * V, 128]`` at column ids `ids`, in order and reversed: two lists of
+    ``topk / 8`` vregs each for the scores and the ids (place ``p`` at sublane
+    ``p % 8`` of vreg ``p // 8``).
+
+    Each of a vreg's slots (sublane, lane) orders its V candidates (the same
+    slot of every vreg) by a sorting network of whole-vreg compare-exchanges,
+    in chunks of `_SORT_CHUNK` merged; then the 8 slots of a lane merge in
+    three levels, each against its lists rolled 4 / 2 / 1 sublanes."""
+    net = _Network()
+    slots = [
+        (st[8 * v : 8 * v + 8], ids[8 * v : 8 * v + 8]) for v in range(st.shape[0] // 8)
+    ]
+    lists = []
+    for c in range(0, len(slots), _SORT_CHUNK):
+        chunk = net.sort(slots[c : c + _SORT_CHUNK], in_column_order=True)[:topk]
+        lists = net.merge(lists, chunk, topk) if lists else chunk
+    for d in (4, 2, 1):
+        rolled = [(pltpu.roll(s, d, 0), pltpu.roll(i, d, 0)) for s, i in lists]
+        lists = net.merge(lists, rolled, topk)
+    sublane = jax.lax.broadcasted_iota(jnp.int32, st[:8].shape, 0)
+
+    def gather(order):  # place p from sublane p % 8 of its own vreg
+        out = []
+        for v in range(topk // 8):
+            s, i = order[8 * v]
+            for j in range(1, 8):
+                s = jnp.where(sublane == j, order[8 * v + j][0], s)
+                i = jnp.where(sublane == j, order[8 * v + j][1], i)
+            out.append((s, i))
+        return [x for x, _ in out], [y for _, y in out]
+
+    return gather(lists), gather(lists[::-1])
+
+
+def _mask_columns(s, ids, num_visible, rank, *, init_blocks, local_blocks, dcp):
+    """`_pick`'s masking of the scores `s` at column ids `ids` (f32), by
+    thresholds on the column: block ``c * dcp + rank`` is below ``n`` iff
+    ``c`` is below ``ceil((n - rank) / dcp)``."""
+
+    def first_column_at(n):
+        return (-((rank - n) // dcp)).astype(jnp.float32)
+
     s = jnp.where(
-        visible & (blocks >= num_visible - local_blocks),
+        ids >= first_column_at(num_visible - local_blocks),
         msa_select._FORCED_LOCAL_SCORE,
         s,
     )
-    s = jnp.where(visible & (blocks < init_blocks), msa_select._FORCED_INIT_SCORE, s)
-    # Blocks of columns stacked on rows, padded to a vreg's lanes, transposed.
+    if init_blocks:
+        s = jnp.where(
+            ids < first_column_at(jnp.int32(init_blocks)),
+            msa_select._FORCED_INIT_SCORE,
+            s,
+        )
+    return jnp.where(ids < first_column_at(num_visible), s, _NEG_INF)
+
+
+def _pick_t_folded(
+    s, num_visible, rank, *, folds, topk, init_blocks, local_blocks, dcp
+):
+    """`pack_candidates` of `_pick` of row-major scores ``s [rows, width]``
+    (``num_visible [rows, 1]``, ``folds * rows <= 128``, ``width % (8 *
+    folds) == 0``, ``width / folds >= topk``, `folds` and ``topk / 8`` powers
+    of two), by sorting networks: compare-exchanges and selects of whole
+    vregs, no dependent chain of reductions.
+
+    The scores are transposed with column block ``f`` of ``width / folds``
+    on lanes ``[f * rows, (f + 1) * rows)`` (the lanes transposed rows leave
+    idle), so that each lane holds one block of a row on its sublanes and
+    vregs. `_lane_lists` orders each lane's candidates; then each block's
+    list is rolled onto block 0's lanes (all rolls at once, one latency) and
+    the blocks merge in a tree: the better of each place of a list and of its
+    pair's reversed list (the pair's top-k, bitonic), sorted. The real
+    candidates are distinct (column ids), so the result is `_pick`'s."""
+    rows, width = s.shape
+    part = width // folds
     spare = _LANES - folds * rows
-    pad = [jnp.full((spare, part), _NEG_INF, s.dtype)] if spare else []
     st = jnp.concatenate(
-        [s[:, f * part : (f + 1) * part] for f in range(folds)] + pad, axis=0
+        [s[:, f * part : (f + 1) * part] for f in range(folds)]
+        + ([jnp.full((spare, part), _NEG_INF, s.dtype)] if spare else []),
+        axis=0,
     ).T  # [part, 128]
+    # Masked transposed: the rows' limits come over the lanes by a transpose
+    # that overlaps the scores', not by a lane broadcast before it.
+    num_visible = jnp.concatenate(
+        [num_visible] * folds + ([jnp.zeros((spare, 1), jnp.int32)] if spare else []),
+        axis=0,
+    ).T  # [1, 128]
     lane = jax.lax.broadcasted_iota(jnp.int32, (1, _LANES), 1)
     ids = (
         jax.lax.broadcasted_iota(jnp.int32, st.shape, 0) + lane // rows * part
     ).astype(jnp.float32)
-    vregs = topk // 8
-    shape = (8, _LANES)
-    sublane = jax.lax.broadcasted_iota(jnp.int32, shape, 0)
-    fill = jnp.full(shape, _NEG_INF, jnp.float32)
-    fwd_s, fwd_i, rev_s, rev_i = ([fill] * vregs for _ in range(4))
+    st = _mask_columns(
+        st,
+        ids,
+        num_visible,
+        rank,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        dcp=dcp,
+    )
+    best_first, reversed_ = _lane_lists(st, ids, topk)
 
-    def place(lists, p, x):  # x [1, 128] to place p of every lane's list
-        lists[p // 8] = jnp.where(sublane == p % 8, x, lists[p // 8])
+    def on_block0(f):  # even blocks best first, odd ones reversed
+        return [
+            [pltpu.roll(x, _LANES - f * rows, 1) if f else x for x in xs]
+            for xs in (best_first if f % 2 == 0 else reversed_)
+        ]
 
-    for p in range(topk):
-        best_score = jnp.max(st, axis=0, keepdims=True)
-        best = jnp.min(
-            jnp.where(st == best_score, ids, float(width)), axis=0, keepdims=True
-        )
-        place(fwd_s, p, best_score)
-        place(fwd_i, p, best)
-        place(rev_s, topk - 1 - p, best_score)
-        place(rev_i, topk - 1 - p, best)
-        st = jnp.where(ids == best, _NEG_INF, st)
-    fold = jax.lax.broadcasted_iota(jnp.int32, shape, 1) // rows
-    cur_s, cur_i = fwd_s, fwd_i
-    other_s, other_i = rev_s, rev_i  # reversed: a pair's second list
-    d = 1
-    while d < folds:
-        shift = _LANES - d * rows  # block f + d onto block f's lanes
-        b_s = [pltpu.roll(x, shift, 1) for x in other_s]
-        b_i = [pltpu.roll(x, shift, 1) for x in other_i]
-        keep = [_ahead(*a, *b) for a, b in zip(zip(cur_s, cur_i), zip(b_s, b_i))]
-        top_s = [jnp.where(k, a, b) for k, a, b in zip(keep, cur_s, b_s)]
-        top_i = [jnp.where(k, a, b) for k, a, b in zip(keep, cur_i, b_i)]
-        ascending = (fold // (2 * d)) % 2 == 1 if 2 * d < folds else False
-        cur_s, cur_i = _bitonic_sort(top_s, top_i, ascending)
-        other_s, other_i = cur_s, cur_i
-        d *= 2
-    out_s = jnp.concatenate(cur_s, axis=0)[:, :rows]  # [topk, rows]
-    out_i = jnp.concatenate(cur_i, axis=0)[:, :rows]
-    out_b = jnp.where(out_s > _NEG_INF, out_i.astype(jnp.int32) * dcp + rank, -1)
-    return out_s.T, out_b.T
+    level = [on_block0(f) for f in range(folds)]
+    while len(level) > 1:
+        merged = []
+        for j in range(0, len(level), 2):
+            (a_s, a_i), (b_s, b_i) = level[j], level[j + 1]
+            keep = [_ahead(*a, *b) for a, b in zip(zip(a_s, a_i), zip(b_s, b_i))]
+            top_s = [jnp.where(k, a, b) for k, a, b in zip(keep, a_s, b_s)]
+            top_i = [jnp.where(k, a, b) for k, a, b in zip(keep, a_i, b_i)]
+            # The second of the next level's pairs reversed.
+            merged.append(_bitonic_sort(top_s, top_i, ascending=j // 2 % 2 == 1))
+        level = merged
+    out_s, out_i = level[0]
+    rank = jnp.asarray(rank).astype(jnp.float32)
+    out_b = [
+        jnp.where(x > _NEG_INF, i * dcp + rank, -1.0) for x, i in zip(out_s, out_i)
+    ]
+    # Both halves of the packed rows in one transpose.
+    return jnp.concatenate(out_s + out_b, axis=0).T[:rows]
+
+
+def _pick_folds(rows: int, width: int, topk: int) -> int:
+    """Column blocks `_pick_t_folded` lays side by side (1: none)."""
+    return next(
+        (
+            f
+            for f in (8, 4, 2)
+            if f * rows <= _LANES
+            and width % (8 * f) == 0
+            and width // f >= topk
+            and (f < 8 or width >= _EIGHT_FOLD_WIDTH)
+        ),
+        1,
+    )
 
 
 class _PackedPick(NamedTuple):
@@ -397,18 +522,9 @@ class _PackedPick(NamedTuple):
         # The bitonic merges sort lists of whole vregs, a power of two of them.
         folds = 1
         if self.topk % 8 == 0 and vregs & (vregs - 1) == 0:
-            folds = next(
-                (
-                    f
-                    for f in (_PICK_FOLDS, 2)
-                    if f * rows <= _LANES and width % (8 * f) == 0
-                ),
-                1,
-            )
+            folds = _pick_folds(rows, width, self.topk)
         if folds > 1 and width <= _FOLDED_PICK_WIDTH:
-            return pack_candidates(
-                *_pick_t_folded(s, num_visible, rank, folds=folds, **options)
-            )
+            return _pick_t_folded(s, num_visible, rank, folds=folds, **options)
         if width > _TRANSPOSED_PICK_WIDTH:
             return pack_candidates(*_pick(s, num_visible, rank, **options))
         scores, blocks = _pick_t(s.T, num_visible.T, rank, **options)
@@ -418,15 +534,21 @@ class _PackedPick(NamedTuple):
 # A decode pick scans this many columns at most transposed, unfolded
 # (`_pick_t`, whose cost grows with the width: ~7,800 cycles at 1,024 against
 # the row-major picks' ~7,600 at any width, AOT), and folded (the served
-# 1,024-entry rows: 2,389 bundles at 8 rows, AOT); its widths step by
-# `_PICK_WIDTH_STEP`, one unrolled body each.
+# 1,024-entry rows); its widths step by `_PICK_WIDTH_STEP`, one unrolled body
+# each.
 _TRANSPOSED_PICK_WIDTH = 768
 _FOLDED_PICK_WIDTH = 1024
 _LANES = 128
-# Column blocks `_pick_t_folded` lays side by side, if their rows fit the lanes
-# (else 2): AOT at 512 / 768 / 1,024 columns, 8 rows: 1,976 / 2,315 / 2,389
-# bundles at 4 folds, 2,077 / 2,221 / 2,213 at 8.
-_PICK_FOLDS = 4
+# Eight column blocks (if their rows fit the lanes) from this width: AOT at 8
+# rows, 512 / 768 / 1,024 columns: 980 / 1,182 / 1,233 bundles at four
+# blocks, 1,061 / 1,126 / 1,078 at eight.
+_EIGHT_FOLD_WIDTH = 768
+# AOT at 8 / 48 rows x 1,024 columns, every compare by selects / every 4th /
+# none: 1,108 / 1,723, 1,073 / 1,664, 1,125 / 1,802 bundles.
+_SELECT_FORM_PERIOD = 4
+# Candidates a slot sorts at once before merging into its list (8 or 32: within
+# +-2% at 8 to 48 rows, AOT).
+_SORT_CHUNK = 16
 _PICK_WIDTH_STEP = 256
 
 

@@ -119,24 +119,91 @@ def test_packed_pick_matches_local_candidates(width, rank, tokens, ties) -> None
 
 def _run_pick(pick, scores, pos, rank):
     """`pick` in an interpret-mode kernel, as the select kernel runs it."""
-
-    def kernel(rank_ref, s_ref, pos_ref, o_ref):
-        o_ref[...] = pick(s_ref[...], pos_ref[...], rank_ref[0])
-
-    return pl.pallas_call(
-        kernel,
-        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)] + [pl.BlockSpec()] * 2,
-        out_shape=jax.ShapeDtypeStruct((scores.shape[0], 2 * pick.topk), jnp.float32),
-        interpret=True,
-    )(jnp.asarray([rank], jnp.int32), scores, pos[:, None])
+    run = _compiled_pick(pick, *scores.shape)
+    return run(jnp.asarray([rank], jnp.int32), scores, pos[:, None])
 
 
-# One vreg of picks (folded), three (not a power of two: unfolded), four.
-@pytest.mark.parametrize("topk", [8, 24, 32])
+@functools.cache
+def _compiled_pick(pick, rows, width):
+    def call(rank, scores, pos):
+        def kernel(rank_ref, s_ref, pos_ref, o_ref):
+            o_ref[...] = pick(s_ref[...], pos_ref[...], rank_ref[0])
+
+        return pl.pallas_call(
+            kernel,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)] + [pl.BlockSpec()] * 2,
+            out_shape=jax.ShapeDtypeStruct((rows, 2 * pick.topk), jnp.float32),
+            interpret=True,
+        )(rank, scores, pos)
+
+    args = (
+        jax.ShapeDtypeStruct((1,), jnp.int32),
+        jax.ShapeDtypeStruct((rows, width), jnp.float32),
+        jax.ShapeDtypeStruct((rows, 1), jnp.int32),
+    )
+    # XLA:CPU's fusion copies the sorting networks' shared operands into each
+    # consumer: ~10x the ops and minutes of compile per shape.
+    return (
+        jax.jit(call)
+        .lower(*args)
+        .compile(compiler_options={"xla_disable_hlo_passes": "fusion"})
+    )
+
+
+# Served options (no forced initial block, one local block) at the decode
+# buckets' rows and more, with signed zeros (equal scores of other bits) and
+# rows that see nothing, one block, or every block.
+@pytest.mark.parametrize("width", [256, 512, 768, 1024])
+@pytest.mark.parametrize("tokens", [4, 8, 16, 24, 40, 48, 64, 72])
+@pytest.mark.parametrize("values", ["ties", "zeros", "normal"])
+def test_packed_pick_matches_row_major_pick(width, tokens, values) -> None:
+    kinds = ["ties", "zeros", "normal"]
+    rng = np.random.default_rng(3 * width * tokens + kinds.index(values))
+    shape = (tokens, width)
+    scores = {
+        "ties": lambda: rng.integers(-3, 4, shape).astype(np.float32),
+        "zeros": lambda: np.where(
+            rng.random(shape) < 0.3,
+            np.float32(-1),
+            np.where(rng.random(shape) < 0.5, np.float32(-0.0), np.float32(0.0)),
+        ),
+        "normal": lambda: rng.normal(size=shape).astype(np.float32),
+    }[values]()
+    assert values != "zeros" or np.signbit(scores[scores == 0]).any()
+    scores = jnp.asarray(scores)
+    pos = rng.integers(0, 2 * _BLOCK * width, tokens)
+    pos[:3] = 0, 2 * _BLOCK * 5, 2 * _BLOCK * width - 1
+    pos = jnp.asarray(pos, jnp.int32)
+    for rank in (0, 1):
+        want = msa_dcp.pack_candidates(
+            *msa_dcp._pick(
+                scores,
+                pos[:, None] // _BLOCK + 1,
+                rank,
+                topk=_TOPK,
+                init_blocks=0,
+                local_blocks=1,
+                dcp=2,
+            )
+        )
+        pick = msa_dcp._PackedPick(_BLOCK, _TOPK, 0, 1, 2)
+        got = np.asarray(_run_pick(pick, scores, pos, rank))
+        want = np.asarray(want)
+        # Scores as values (the pick returns a candidate's own zero, `_pick`
+        # its reduction's), the blocks bit for bit.
+        np.testing.assert_array_equal(got[:, :_TOPK], want[:, :_TOPK])
+        np.testing.assert_array_equal(
+            got[:, _TOPK:].view(np.uint32), want[:, _TOPK:].view(np.uint32)
+        )
+
+
+# One vreg of picks (folded), three (not a power of two: unfolded), four, and
+# eight in a row narrower than four blocks of them (two blocks).
+@pytest.mark.parametrize("topk, width", [(8, 512), (24, 512), (32, 512), (64, 128)])
 @pytest.mark.parametrize("rank", [0, 1])
-def test_packed_pick_other_topk(topk, rank) -> None:
+def test_packed_pick_other_topk(topk, width, rank) -> None:
     rng = np.random.default_rng(topk + rank)
-    tokens, width = 8, 512
+    tokens = 8
     scores = jnp.asarray(rng.integers(-3, 4, (tokens, width)), jnp.float32)
     pos = jnp.asarray(rng.integers(0, 2 * _BLOCK * width, tokens), jnp.int32)
     want = msa_dcp.pack_candidates(
