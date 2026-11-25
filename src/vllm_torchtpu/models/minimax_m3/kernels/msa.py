@@ -215,24 +215,33 @@ def fp4_targets(
     """`write_fp4`'s rotated, quantized write targets: K/V nibbles, index-key
     nibbles with their folded scales, then the K/V scales. `k` may come
     quantized (`QuantizedKV`, `v` None)."""
-    if isinstance(k, QuantizedKV):
-        kv_rows, scales = k
-    elif (
-        k.shape[1] > 1
+    lanes = None
+    kernel = (
+        not isinstance(k, QuantizedKV)
         and k.shape[0] >= msa_quantize.MIN_TOKENS
         and k.dtype == jnp.bfloat16
-    ):
+    )
+    if isinstance(k, QuantizedKV):
+        kv_rows, scales = k
+    elif kernel and index_k.dtype == jnp.bfloat16:
+        # One pass for the index keys too, which also lays out the write's
+        # lanes (the index scales are the only folded ones: the last lane).
+        kv_rows, scales, i_nib, i_scale, lanes = msa_quantize.quantize_kv_rows(
+            k, v, index_k, interpret=interpret
+        )
+    elif kernel:
         kv_rows, scales = msa_quantize.quantize_kv_rows(k, v, interpret=interpret)
     else:
         k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
         v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
         kv_rows = jnp.concatenate([k_nib, v_nib], axis=-1).reshape(k.shape[0], -1)
         scales = jnp.stack([k_scale, v_scale], axis=-1).reshape(k.shape[0], -1)
-    i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
+    if lanes is None:
+        i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
     return [
         msa_write.Rows(kv_cache, kv_rows, 4),
         msa_write.Rows(index_cache, i_nib, 4, i_scale),
-        msa_write.SlotValues(scale_cache, scales),
+        msa_write.SlotValues(scale_cache, scales, lanes),
     ]
 
 

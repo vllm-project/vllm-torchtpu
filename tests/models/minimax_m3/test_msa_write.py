@@ -314,11 +314,21 @@ def test_small_pages_match_xla_scatter():
     )
 
 
-@pytest.mark.parametrize("num_tokens,heads", [(512, 4), (1000, 4), (512, 2)])
-def test_quantize_kv_rows_matches_xla(num_tokens, heads):
+@pytest.mark.parametrize(
+    "num_tokens,heads,index",
+    [
+        (512, 4, False),
+        (1000, 4, False),
+        (512, 2, True),
+        (1000, 1, True),
+        (2500, 1, True),  # a partial last token block
+    ],
+)
+def test_quantize_kv_rows_matches_xla(num_tokens, heads, index):
     """`msa_quantize.quantize_kv_rows` equals the XLA rotate + quantize +
     interleave of `msa.write_fp4`, bit for bit (interpret mode), all-zero
-    rows included."""
+    rows included; so do the index keys' nibbles and scales it makes in the
+    same pass."""
     rng = np.random.default_rng(num_tokens)
     shape = (num_tokens, heads, 128)
     k = (
@@ -330,10 +340,73 @@ def test_quantize_kv_rows_matches_xla(num_tokens, heads):
         .set(0)
     )
     v = jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
-    rows, scales = msa_quantize.quantize_kv_rows(k, v, interpret=True)
+    index_k = jnp.asarray(rng.standard_normal((num_tokens, 128)), jnp.bfloat16)
+    index_k = index_k.at[5].set(0)
+    got = msa_quantize.quantize_kv_rows(
+        k, v, index_k if index else None, interpret=True
+    )
     k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
     v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
-    want_rows = jnp.concatenate([k_nib, v_nib], -1).reshape(num_tokens, -1)
-    want_scales = jnp.stack([k_scale, v_scale], -1).reshape(num_tokens, -1)
-    np.testing.assert_array_equal(np.asarray(rows), np.asarray(want_rows))
-    np.testing.assert_array_equal(np.asarray(scales), np.asarray(want_scales))
+    want = [
+        jnp.concatenate([k_nib, v_nib], -1).reshape(num_tokens, -1),
+        jnp.stack([k_scale, v_scale], -1).reshape(num_tokens, -1),
+    ]
+    if index:
+        want += list(msa_fp4.quantize(msa_fp4.rotate_keys(index_k)))
+        lanes = np.asarray(got[-1]).view(np.float32)
+        got = got[:-1]
+        middle = lanes[:, 2 * heads : -1]
+        np.testing.assert_array_equal(middle, np.zeros_like(middle))
+        np.testing.assert_array_equal(lanes[:, : 2 * heads], np.asarray(want[1]))
+        np.testing.assert_array_equal(lanes[:, -1], np.asarray(want[3]))
+    assert len(got) == len(want)
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+
+
+@pytest.mark.parametrize("heads", [1, 2])
+def test_fp4_targets_quantize_kernel_matches_xla(heads):
+    """A long step's write targets (`msa.fp4_targets`, quantized by
+    `msa_quantize.quantize_kv_rows`, index keys included) equal the XLA
+    rotate + quantize of every row, bit for bit."""
+    rng = np.random.default_rng(heads)
+    num_tokens, pages = msa_quantize.MIN_TOKENS, 4
+    k, v = (
+        jnp.asarray(rng.standard_normal((num_tokens, heads, 128)), jnp.bfloat16)
+        for _ in range(2)
+    )
+    index_k = jnp.asarray(rng.standard_normal((num_tokens, 128)), jnp.bfloat16)
+    caches = (
+        jnp.zeros((pages, 16, 4, heads * 2 * 128), jnp.uint8),
+        jnp.zeros((pages, 17, 4, 128), jnp.uint8),
+        jnp.zeros((pages, 8, 128), jnp.float32),
+    )
+    got = msa.fp4_targets(*caches, k, v, index_k, interpret=True)
+    k_nib, k_scale = msa_fp4.quantize(msa_fp4.rotate_keys(k))
+    v_nib, v_scale = msa_fp4.quantize(msa_fp4.rotate_keys(v))
+    i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
+    want = [
+        msa_write.Rows(
+            caches[0], jnp.concatenate([k_nib, v_nib], -1).reshape(num_tokens, -1), 4
+        ),
+        msa_write.Rows(caches[1], i_nib, 4, i_scale),
+        msa_write.SlotValues(
+            caches[2], jnp.stack([k_scale, v_scale], -1).reshape(num_tokens, -1)
+        ),
+    ]
+    assert got[2].lanes is not None
+    fields = [(0, "rows"), (1, "rows"), (1, "scales"), (2, "values")]
+    for i, name in fields:
+        np.testing.assert_array_equal(
+            np.asarray(getattr(got[i], name)), np.asarray(getattr(want[i], name))
+        )
+    # The kernel's lanes are the ones the write would build from the scales.
+    pages = jnp.arange(num_tokens, dtype=jnp.int32) // 128 % pages
+    slots = jnp.arange(num_tokens, dtype=jnp.int32) % 128
+    operands = [
+        msa_write.write_operands(t, pages, slots, max_runs=64).inputs
+        for t in (got, want)
+    ]
+    assert len(operands[0]) == len(operands[1]) == 3
+    for g, w in zip(*operands):
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))

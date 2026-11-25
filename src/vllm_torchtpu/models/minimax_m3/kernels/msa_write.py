@@ -64,10 +64,17 @@ class Rows(NamedTuple):
 
 class SlotValues(NamedTuple):
     """Per-slot f32 ``values [T, n]`` into rows ``[0, n)`` of an f32 ``[pages,
-    rows, S]`` cache, lane = slot."""
+    rows, S]`` cache, lane = slot.
+
+    `lanes` (uint32 ``[T, 128]``), when the producer of the values made it,
+    is the write's whole per-slot lane block as `write_operands` lays it
+    out: the bits of ``values`` in lanes ``[0, n)``, of the folded scales of
+    the `Rows` targets from the last lane down, zeros elsewhere. It is then
+    read as is."""
 
     cache: jax.Array
     values: jax.Array
+    lanes: jax.Array | None = None
 
 
 class _RowsSpec(NamedTuple):
@@ -345,6 +352,7 @@ def write_operands(
     )
     words, specs, scale_lanes = [], [], []
     lane_values = None
+    built_lanes = None
     page_size = None
     for target in targets:
         if isinstance(target, SlotValues):
@@ -355,6 +363,8 @@ def write_operands(
             lane_values = jax.lax.bitcast_convert_type(
                 target.values.astype(jnp.float32), jnp.uint32
             )
+            if target.lanes is not None:
+                built_lanes = target.lanes
             size = target.cache.shape[2]
         else:
             w, spec, size = _slot_words(target)
@@ -377,7 +387,17 @@ def write_operands(
     padded = max(-(-num_tokens // _ROW_ALIGN) * _ROW_ALIGN, window)
     pad = ((0, padded - num_tokens), (0, 0))
     inputs = [jnp.pad(w, pad) for w in words]
-    if has_lanes:  # one elementwise fusion: no column concatenates
+    if built_lanes is not None:
+        # A producer's lanes place one folded-scale target's in the last lane.
+        if len(scale_lanes) != 1:
+            raise ValueError("built lanes hold one target's folded scales")
+        if built_lanes.shape != (num_tokens, _LANES) or built_lanes.dtype != jnp.uint32:
+            raise ValueError(
+                f"uint32 lanes [{num_tokens}, {_LANES}], got {built_lanes.dtype} "
+                f"{built_lanes.shape}"
+            )
+        inputs.append(jnp.pad(built_lanes, pad))
+    elif has_lanes:  # one elementwise fusion: no column concatenates
         if lane_values is None:
             lanes = jnp.zeros((num_tokens, _LANES), jnp.uint32)
         else:
