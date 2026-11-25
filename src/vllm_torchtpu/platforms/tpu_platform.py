@@ -31,7 +31,7 @@ from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
-from vllm_torchtpu import envs, patch_registry
+from vllm_torchtpu import envs, frontend_options, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
@@ -861,6 +861,10 @@ class TpuPlatform(Platform):
         )
         _validate_phased_profiling_config(vllm_config)
         _validate_peer_replay_config()
+        # Reject a bad tpu_frontend section here, where the config is first
+        # known, rather than at a patch's install. Its patches install from
+        # patch_registry below.
+        frontend_options.get(vllm_config)
         if "USE_MOE_EP_KERNEL" in os.environ:
             raise ValueError(
                 "USE_MOE_EP_KERNEL is no longer supported and enables "
@@ -876,7 +880,9 @@ class TpuPlatform(Platform):
         # Rejects non-bool MoE reference-parity values before any worker starts.
         get_moe_reference_parity(vllm_config)
         patch_registry.apply(
-            "platform_activation", model_config=vllm_config.model_config
+            "platform_activation",
+            model_config=vllm_config.model_config,
+            vllm_config=vllm_config,
         )
         _register_tpu_kv_connectors()
         # Apply before VllmConfig is pickled so EngineCore and all workers see
