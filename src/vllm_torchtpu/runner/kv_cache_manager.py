@@ -1403,6 +1403,10 @@ class KVCacheManager:
                     kv_cache_config, layer_name_to_spec.__getitem__
                 )
             kv_caches = materialized.kv_caches
+            # The Raiden KV connector builds its Stage-3 pool manifest from
+            # these (tpu_connector._admit_raiden_dsv4_kv_cache).
+            self.runner.kv_cache_raw_tensors = list(materialized.raw_tensors)
+            self.runner.dsv41_materialized_kv = materialized
             # Match the shared pool path: donation must start only after
             # allocation/view initialization has finished on the device.
             synchronize_tensors(materialized.raw_tensors)
