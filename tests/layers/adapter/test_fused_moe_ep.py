@@ -19,7 +19,6 @@ it still refuses. None of this needs a TPU: the refusals are decided before any
 op is built, and the one path that does build stops at `_build_op`.
 """
 
-import contextlib
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -385,7 +384,7 @@ def test_qwen_4096_bucket_is_not_refused_by_smem():
 @pytest.mark.parametrize(
     "taller,gather_bytes",
     [
-        (None, 2048),  # the real gate, on a CPU host: no chip, so _TILE_M's
+        (None, 2048),  # the real gate with no chip record: _TILE_M's
         (False, 2048),
         (True, 3072),  # a layer whose prefill steps take 256-row tiles
     ],
@@ -402,10 +401,12 @@ def test_fixed_smem_working_set_is_still_checked(taller, gather_bytes):
     tile = bridge._PREFILL_TILE_M if taller else bridge._TILE_M
     assert token_gather_smem_bytes(tile) == gather_bytes
     needed = bridge._SMEM_OVERHEAD_BYTES + gather_bytes
+    # taller=None runs the real gate with no chip record, as on a CPU host,
+    # whatever host this runs on.
     gate = (
         patch.object(bridge, "taller_tile_applies", side_effect=applies)
         if taller is not None
-        else contextlib.nullcontext()
+        else patch.object(bridge, "_tpu_info", return_value=None)
     )
     with gate:
         assert _prebuild(_layer(), smem_bytes=needed) == "op"
@@ -1326,17 +1327,17 @@ _TP_PAIRS = tuple((2 * i, 2 * i + 1) for i in range(16))
     [
         # Qwen3.8 (topk 10 of 512 experts) on DP16 x TP2 + EP32: every TP pair
         # holds its engine's tokens twice, so the layer's step is half the
-        # input rows, and 8192 tokens fill each expert to 160 rows.
+        # input rows, and 16384 tokens fill each expert to 320 rows.
         (32 * 1024, _TP_PAIRS, 10, 512, 256),  # 16384 tokens, 320 per expert
-        (32 * 512, _TP_PAIRS, 10, 512, 256),  # 8192 tokens, 160 per expert
+        (32 * 512, _TP_PAIRS, 10, 512, 128),  # 8192 tokens, 160 per expert
         (32 * 256, _TP_PAIRS, 10, 512, 128),  # 4096 tokens, 80 per expert
         (32 * 93, _TP_PAIRS, 10, 512, 128),  # decode
         # No replica groups: the input rows are the step.
-        (8192, None, 10, 512, 256),
-        (8184, None, 10, 512, 128),
+        (16384, None, 10, 512, 256),
+        (16376, None, 10, 512, 128),
         # What counts is how full the experts are, not the token count: fewer,
         # fuller experts get there sooner, and many small ones not at 16384.
-        (2560, None, 8, 128, 256),  # 160 per expert
+        (5120, None, 8, 128, 256),  # 320 per expert
         (16384, None, 4, 1024, 128),  # 64 per expert
     ],
 )
@@ -1356,6 +1357,9 @@ def test_prefill_steps_take_the_taller_tile(x_rows, groups, topk, e_total, want)
         ("TPU_8I", (16, 8192, 2048), "fp8", True),
         # A wider expert drops to two slots at 256 rows.
         ("TPU_8I", (16, 8192, 2304), "fp8", False),
+        # Fits at 128 rows only with no prefetch (one slot), and not at all at
+        # 256: the same schedule on paper, but the taller build overflows VMEM.
+        ("TPU_8I", (16, 8192, 6656), "fp8", False),
         # Fits at the same schedule, but the 256-row tile is not validated
         # on FP4 weights.
         ("TPU_8I", (48, 4096, 2048), "fp4", False),
@@ -1379,6 +1383,23 @@ def test_taller_tile_only_where_validated_and_the_weight_schedule_holds(
     assert bridge.tile_rows_for_step(16384, None, 10, 512, lambda: got) == want
 
 
+def test_no_device_record_on_a_tpu_is_logged(monkeypatch):
+    """Without a device record the layer stays at _TILE_M; on a TPU, where the
+    record should exist, that is logged rather than silent."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    def no_record():
+        raise ValueError("unknown device kind")
+
+    monkeypatch.setattr(pltpu, "get_tpu_info", no_record)
+    for backend, logged in (("cpu", False), ("tpu", True)):
+        monkeypatch.setattr(bridge.jax, "default_backend", lambda b=backend: b)
+        with patch.object(bridge.logger, "warning_once") as warn:
+            assert bridge._tpu_info() is None
+        assert warn.called is logged
+    assert not bridge.taller_tile_applies(16, 8192, 2048, "fp8")
+
+
 def test_decode_steps_never_ask_whether_the_taller_tile_fits():
     def unexpected():
         raise AssertionError("asked for a decode-sized step")
@@ -1389,9 +1410,9 @@ def test_decode_steps_never_ask_whether_the_taller_tile_fits():
 @pytest.mark.parametrize(
     "x_rows,taller,want",
     [
-        (32 * 512, True, 256),  # 160 rows per expert, and the gate agrees
-        (32 * 512, False, 128),  # the gate refuses this expert
-        (32 * 256, True, 128),  # 80 rows per expert: the gate is not asked
+        (32 * 1024, True, 256),  # 320 rows per expert, and the gate agrees
+        (32 * 1024, False, 128),  # the gate refuses this expert
+        (32 * 512, True, 128),  # 160 rows per expert: the gate is not asked
     ],
 )
 def test_the_built_op_hands_the_kernel_the_step_tile(monkeypatch, x_rows, taller, want):
@@ -1429,4 +1450,4 @@ def test_the_built_op_hands_the_kernel_the_step_tile(monkeypatch, x_rows, taller
     rank = jnp.zeros((1, 1), dtype=jnp.int32)
     closures[0](x, w1, None, None, None, jnp.zeros((1, 1)), rank)
     assert kernel.call_args.kwargs["capacity"] == want
-    assert asked == ([(16, 8192, 2048, "fp8", None)] if x_rows == 32 * 512 else [])
+    assert asked == ([(16, 8192, 2048, "fp8", None)] if x_rows == 32 * 1024 else [])

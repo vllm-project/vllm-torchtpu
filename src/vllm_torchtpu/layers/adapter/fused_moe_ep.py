@@ -64,6 +64,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     PACK4,
     U32_SUBLANE_TILE,
+    WeightFormat,
+    fit_weight_slots,
     token_gather_smem_bytes,
 )
 from vllm_torchtpu.layers.adapter import token_padding
@@ -84,19 +86,23 @@ _TILE_M = 128
 # for. What decides it is how full the experts are: a step takes the taller
 # tile from _PREFILL_TILE_MIN_ROWS_PER_EXPERT routed rows per expert on
 # average (tokens * topk / experts, the tokens counted after the replica
-# split). That is Qwen3.8's 8192-token step (topk 10 of 512 experts), the
-# smallest step the taller tile is measured at. Decode stays at _TILE_M: an
-# expert holds a few dozen rows there and the step is bound by streaming the
-# weights. A prefill step stays at _TILE_M too off the chips and weight
-# formats below, or where its taller build would lose weight slots or not
-# fit VMEM (taller_tile_applies).
+# split). Measured on TPU8i with Qwen3.8 (topk 10 of 512 experts): at 320
+# rows per expert (its 16384-token step) the taller tile takes the step from
+# 249.5 to 242.6 ms; at 160 (its 8192-token step) it makes it slower, 151.8
+# to 164.7 ms, with the MoE kernel itself +29%. So the cutoff is the measured
+# win; between the two is unmeasured. The rule is per step, not per phase: a
+# decode step whose experts are as full takes the taller tile too. A
+# full-batch decode step holds a few dozen rows per expert and is bound by
+# streaming the weights, so it stays at _TILE_M. A step stays at _TILE_M too
+# off the chips and weight formats below, or where its taller build would
+# lose weight slots or not fit VMEM (taller_tile_applies).
 _PREFILL_TILE_M = 256
-_PREFILL_TILE_MIN_ROWS_PER_EXPERT = 160
+_PREFILL_TILE_MIN_ROWS_PER_EXPERT = 320
 # Where the taller tile is validated: its speed is measured on TPU8i (Qwen3.8's
 # FP8 expert), and the kernel's 256-row tests use FP8 weights. Other chips and
 # formats keep _TILE_M until it is measured there; enabling one is an entry here.
 _PREFILL_TILE_CHIPS = frozenset({pltpu.ChipVersion.TPU_8I})
-_PREFILL_TILE_FORMATS = frozenset({"fp8"})
+_PREFILL_TILE_FORMATS = frozenset({WeightFormat.FP8})
 
 # SMEM used by the resident routing tables and Mosaic's scalar working set,
 # excluding the two fixed token-gather windows. Measured by subtracting the
@@ -104,7 +110,8 @@ _PREFILL_TILE_FORMATS = frozenset({"fp8"})
 _SMEM_OVERHEAD_BYTES = 236 * 1024
 
 # One op for every shape: `fused_ep_moe_v2` derives its routing block and ragged
-# stride from the operands when they are not given, so nothing here has to vary
+# stride from the operands when they are not given, and the tile height comes
+# from the operand shapes too (tile_rows_for_step), so nothing here has to vary
 # with the token count -- which is what keeps the token count out of the traced
 # graph.
 FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
@@ -205,10 +212,21 @@ def tile_rows_for_step(x_rows, token_replica_groups, topk, e_total, taller_appli
 
 
 def _tpu_info():
-    """This chip's record, or None outside a device process (a CPU host)."""
+    """This chip's record, or None outside a device process (a CPU host).
+
+    On a TPU the record should always be there; without it the layer keeps
+    128-row tiles and assumes 1 MiB of SMEM, so that is logged.
+    """
     try:
         return pltpu.get_tpu_info()
-    except Exception:  # noqa: BLE001 - CPU host, or an unknown device kind
+    except Exception as e:  # noqa: BLE001 - CPU host, or an unknown device kind
+        if jax.default_backend() == "tpu":
+            logger.warning_once(
+                "Fused EP MoE: no device record for this TPU (%s), so it keeps "
+                "%d-row tiles and assumes 1 MiB of SMEM.",
+                e,
+                _TILE_M,
+            )
         return None
 
 
@@ -225,12 +243,10 @@ def taller_tile_applies(
     overhead. On TPU8i (192 MiB) Qwen3.8's FP8 expert fits at both heights
     with the same three slots.
     """
-    from vllm_torchtpu.kernels.fused_moe.v2.host import WeightFormat, fit_weight_slots
-
     weight_format = WeightFormat(weight_format)
     info = info if info is not None else _tpu_info()
     if (
-        weight_format.value not in _PREFILL_TILE_FORMATS
+        weight_format not in _PREFILL_TILE_FORMATS
         or info is None
         or info.chip_version not in _PREFILL_TILE_CHIPS
     ):
@@ -1347,7 +1363,7 @@ def _max_node_tokens(ep: int, pcp: int = 1) -> int:
 
 
 def _smem_capacity_bytes() -> int:
-    """This chip's scalar memory, or tpu7x's outside a device process."""
+    """This chip's scalar memory, or 1 MiB when no chip record is available."""
     info = _tpu_info()
     return 1024 * 1024 if info is None else int(info.smem_capacity_bytes)
 
