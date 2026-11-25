@@ -47,19 +47,63 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+class _LogitsProbe(torch.nn.Module):
+    """Sentinel logits_processor used to verify passthrough ``compute_logits``."""
+
+    def __init__(self, expected_head: torch.nn.Module) -> None:
+        super().__init__()
+        self.expected_head = expected_head
+        self.sentinel_in = object()
+        self.sentinel_out = object()
+        self.calls = 0
+        self.matched = False
+
+    def forward(
+        self,
+        lm_head: torch.nn.Module,
+        hidden_states: object,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> object:
+        expected_bias = getattr(self.expected_head, "bias", None)
+        self.calls += 1
+        self.matched = (
+            lm_head is self.expected_head
+            and hidden_states is self.sentinel_in
+            and embedding_bias is expected_bias
+        )
+        return self.sentinel_out
+
+
+def _verify_passthrough_compute_logits(
+    model: torch.nn.Module, owner: torch.nn.Module
+) -> bool:
+    """True when ``model.compute_logits`` is absent or passes straight through
+    ``owner.logits_processor(owner.lm_head, hidden_states, lm_head.bias)``."""
+    compute_logits = getattr(model, "compute_logits", None)
+    if not callable(compute_logits):
+        return True
+    probe = _LogitsProbe(cast(torch.nn.Module, owner.lm_head))
+    orig_processor = owner.logits_processor
+    owner.logits_processor = probe
+    try:
+        out = compute_logits(probe.sentinel_in)
+    except Exception:
+        # Non-passthrough compute_logits inspect tensor attrs/ops on the
+        # object() sentinels and raise; fail closed to NotImplementedError.
+        out = None
+    finally:
+        owner.logits_processor = orig_processor
+    return probe.calls == 1 and probe.matched and out is probe.sentinel_out
+
+
 def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Module:
     """The module holding ``lm_head`` and its ``logits_processor``.
 
     Qwen3.5's wrapper keeps both on ``language_model``. Raises when the model
-    cannot be served by the vocabulary-parallel argmax.
+    cannot be served by the vocabulary-parallel argmax, including when
+    ``compute_logits`` performs pre- or post-processing beyond
+    ``logits_processor(lm_head, hidden_states, lm_head.bias)``.
     """
-    compute_logits = getattr(type(model), "compute_logits", None)
-    if getattr(compute_logits, "__module__", "").startswith("vllm_torchtpu."):
-        raise NotImplementedError(
-            f"TPU_GREEDY_TOP_TOKENS: {type(model).__name__} computes its logits "
-            "in a TPU-specific compute_logits that get_top_tokens does not "
-            "reproduce; unset TPU_GREEDY_TOP_TOKENS for this model."
-        )
     for module in model.modules():
         processor = getattr(module, "logits_processor", None)
         head = getattr(module, "lm_head", None)
@@ -85,6 +129,13 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
             "TPU_GREEDY_TOP_TOKENS: the argmax reduction needs a positive "
             f"logit scale, got {processor.scale}; unset TPU_GREEDY_TOP_TOKENS."
         )
+    if not _verify_passthrough_compute_logits(model, module):
+        raise NotImplementedError(
+            f"TPU_GREEDY_TOP_TOKENS: {type(model).__name__}.compute_logits "
+            "performs custom pre- or post-processing beyond "
+            "logits_processor(lm_head, hidden_states, lm_head.bias); "
+            "unset TPU_GREEDY_TOP_TOKENS for this model."
+        )
     if dp_lockstep and head.tp_size > 1:
         # An idle engine issues the full-logits collective in lockstep with
         # its busy peers, which would be waiting in the pair exchange.
@@ -103,12 +154,13 @@ def top_tokens(owner: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Ten
         "LogitsProcessor | LogitsProcessorWithLoRA", owner.logits_processor
     )
     head = cast("VocabParallelEmbedding", owner.lm_head)
+    bias = getattr(head, "bias", None)
     if isinstance(processor, LogitsProcessorWithLoRA):
         # The LoRA wrapper has no get_top_tokens, so the call would reach the
         # base layer and drop the lm_head LoRA delta. Take the argmax of the
         # wrapper's logits, which include the delta.
-        return torch.argmax(processor(head, hidden_states), dim=-1, keepdim=True)
-    tokens = processor.get_top_tokens(head, hidden_states)
+        return torch.argmax(processor(head, hidden_states, bias), dim=-1, keepdim=True)
+    tokens = processor.get_top_tokens(head, hidden_states, bias)
     return tokens.to(torch.int64).view(-1, 1)
 
 
