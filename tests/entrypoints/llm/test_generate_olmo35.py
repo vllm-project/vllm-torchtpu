@@ -26,7 +26,10 @@ No checkpoint or tokenizer is needed: the config is saved locally, the
 weights are random and the prompts are token ids, so only that the model
 runs is checked, not what it says.
 
-Run with: pytest tests/models/olmo35/test_olmo35_generate.py -v
+Run with: pytest tests/entrypoints/llm/test_generate_olmo35.py -v
+
+It lives under tests/entrypoints so that it runs before the in-process TPU tests:
+the engine runs in a subprocess and needs the TPU free (tests/conftest.py).
 """
 
 import pytest
