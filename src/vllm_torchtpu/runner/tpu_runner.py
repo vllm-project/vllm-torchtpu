@@ -9779,3 +9779,9 @@ def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int) -> int:
     if num_slices_per_block > 64:
         num_slices_per_block = 64
     return num_slices_per_block
+
+
+# VLLM_TPU_STARTUP_TRACE=1: Perfetto slices for the startup path (see startup_trace).
+from vllm_torchtpu import startup_trace as _startup_trace  # noqa: E402
+
+_startup_trace.install_runner(TPUModelRunner)
