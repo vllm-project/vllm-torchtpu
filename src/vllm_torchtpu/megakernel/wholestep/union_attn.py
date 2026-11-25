@@ -100,6 +100,8 @@ def compact_union(
     16 rows, j-c89e9978; 512 per pass still 62.4, j-bfd3a7f8); each slot's code is
     gathered from its group's sublane row by the
     same one-hot matmul (codes <= 15 are exact in BF16).
+
+    Kept as a pure-array reference and test oracle for `compact_union_into`.
     """
     U, Us, jcol0, srow, lane = consts
     S, W = code.shape[0], jcol0.shape[0]
@@ -134,6 +136,60 @@ def compact_union(
         )
     cat = lambda xs: xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=1)  # noqa: E731
     return cat(ids_out), cat(codes_out), n
+
+
+def compact_union_into(
+    code: jax.Array,
+    KU: int,
+    consts: tuple,
+    id_ref: Any,
+    cd_ref: Any,
+    req_idx: Any,
+    base_col: Any,
+    map_id: Any = None,
+) -> jax.Array:
+    """Looped `compact_union` writing `[1, W]` chunks directly into VMEM refs."""
+    U, Us, jcol0, srow, lane = consts
+    S, W = code.shape[0], jcol0.shape[0]
+    assert KU % W == 0, (
+        f"union window {W} must divide KU={KU} "
+        "(a partial last window overruns the store)"
+    )
+    nchunks = KU // W
+    sel = code > 0
+    P = jnp.dot(sel.astype(F32).astype(BF16), U, preferred_element_type=F32)
+    c_row = jnp.transpose(jnp.broadcast_to(P[:, 127:128], (S, 128)))[0:1, :]
+    O_row = exclusive_prefix(c_row, Us)
+    E_row = O_row + c_row
+    Pb, codeb = P.astype(BF16), code.astype(F32).astype(BF16)
+    n = jnp.sum(sel.astype(I32), axis=(0, 1), keepdims=True)
+
+    def body(c: Any, carry: Any) -> Any:
+        j0 = c * W
+        jcol = jcol0 + j0
+        jf = jcol.astype(F32)
+        r_j = jnp.sum((E_row <= jf).astype(I32), axis=1, keepdims=True)
+        hit = srow == r_j
+        oh = hit.astype(F32).astype(BF16)
+        Pg = jnp.dot(oh, Pb, preferred_element_type=F32)
+        O_rj = jnp.sum(jnp.where(hit, O_row, 0.0), axis=1, keepdims=True)
+        lane_j = jnp.sum((Pg <= jf - O_rj).astype(I32), axis=1, keepdims=True)
+        Cg = jnp.dot(oh, codeb, preferred_element_type=F32)
+        code_j = jnp.sum(jnp.where(lane == lane_j, Cg, 0.0), axis=1, keepdims=True)
+        live = jcol < n
+        ids = jnp.where(live, r_j * 128 + lane_j, 0).astype(F32)
+        codes = jnp.where(live, code_j, 0.0)
+        ids_row = jnp.transpose(jnp.broadcast_to(ids, (W, 128)))[0:1, :].astype(I32)
+        if map_id is not None:
+            ids_row = map_id(ids_row)
+        codes_row = jnp.transpose(jnp.broadcast_to(codes, (W, 128)))[0:1, :].astype(I32)
+        col_off = pl.multiple_of(base_col + c * W, 128)
+        id_ref[req_idx, :, pl.ds(col_off, W)] = ids_row
+        cd_ref[req_idx, :, pl.ds(col_off, W)] = codes_row
+        return carry
+
+    jax.lax.fori_loop(0, nchunks, body, 0)
+    return n
 
 
 def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts: tuple,
