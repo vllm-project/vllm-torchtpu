@@ -89,10 +89,13 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
 
 | Form | Lineage | Package tree (git) | Lever keys (all default off) |
 |---|---|---|---|
-| `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` + SB1-2 no-GDN `00f9aa3066` (clean merges) | `642cc21931` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above; SB1-2: `VLLM_TPU_QSA_DECODE_FUSED_UNION=1`, `VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1`, `VLLM_TPU_PD_GATHER_BULK=1`, `VLLM_TPU_PD_STAGING_FOLD=1`, `VLLM_TPU_GC_WORKER=2600`, `VLLM_TPU_GC_WORKER_LOG=1`, `VLLM_TPU_KVL_INWAIT=1` (the PD / GC / KVL keys are deliberately outside the compile key: their runs prove a cold compile) |
+| `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` + SB1-2 no-GDN `00f9aa3066` + SERVE HD rider `3d12a2ccb6` (clean merges) | `862b8e0254` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above; SB1-2: `VLLM_TPU_QSA_DECODE_FUSED_UNION=1`, `VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1`, `VLLM_TPU_PD_GATHER_BULK=1`, `VLLM_TPU_PD_STAGING_FOLD=1`, `VLLM_TPU_GC_WORKER=2600`, `VLLM_TPU_GC_WORKER_LOG=1`, `VLLM_TPU_KVL_INWAIT=1` (the PD / GC / KVL keys are deliberately outside the compile key: their runs prove a cold compile); HD rider: `VLLM_TPU_HD_STAGE_CPU=1`, `VLLM_TPU_HD_REQVEC=1` only (`VLLM_TPU_HD_MARKS` and `VLLM_TPU_HD_AB` unset; host-only, compile-ignored) |
 
 - QGLUE-1 in `b1`: a device STEP cut of record; no served gain shown at B1 c212 (within the measured A/A noise floor:
   span 2.34 ms, Mtok/$ ~1.5 %).
+- HD rider disclosure (SERVE car 1, DEV, 1200 s): KEEP-FOR-BUILD on the host cycle only (max-over-ranks p50 non-wait cycle
+  15.821 -> 14.563 ms, d -1.258 ms); a served step-time or Mtok/$ gain is NOT shown. "dp_loop +0.16 ms with ON at >= 48
+  running; cause U; no HD code in dp_loop (C); relocated-wait not supported (M, natvar_g2 with shuffle / plant mutants)".
 - `b1` is a merge that has not yet run on a device: no served car stacks QGLUE-1 with SB1-1 on `b1` before one device
   bitwise check on `b1`.
 - To work on a lineage: branch from `caojx/qwen38-flash-1124`, edit `src/vllm_torchtpu/_forms/<form>/vllm_torchtpu/`,

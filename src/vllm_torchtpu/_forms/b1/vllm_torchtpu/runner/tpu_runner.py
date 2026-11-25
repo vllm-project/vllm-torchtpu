@@ -129,6 +129,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind,
+    SequenceLayoutPlan,
     create_sequence_layout_planner,
 )
 from vllm_torchtpu.logger import init_logger
@@ -153,6 +154,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
 from vllm_torchtpu.runner import host_phases
 from vllm_torchtpu.runner import gc_worker  # q38 SV-KVGC WORKER-GC (VLLM_TPU_GC_WORKER, default off)
+from vllm_torchtpu.runner import hostdiet  # q38 SV-HOSTDIET (VLLM_TPU_HD_*, default off)
 from vllm_torchtpu.runner import pam_incr
 from vllm_torchtpu.runner import newreq_refresh
 from vllm_torchtpu.core import newreq_blkarr
@@ -1437,6 +1439,7 @@ class TPUModelRunner(GPUModelRunner):
         self._init_phased_profiling()
         self._stage_timing = RunnerStageTiming(profiler_rank)
         host_phases.set_rank(profiler_rank)
+        hostdiet.set_rank(profiler_rank)
         stall_watchdog.start(profiler_rank)
 
     def _init_phased_profiling(self) -> None:
@@ -2753,11 +2756,114 @@ class TPUModelRunner(GPUModelRunner):
                     n *= 4
                 synchronize_tensors(pools)
 
+    def _hd_rejected_index(
+        self,
+        seq_idx_np: np.ndarray,
+        pos_idx_np: np.ndarray,
+        start_index: int,
+        num_reqs: int,
+        num_scheduled_tokens_per_req: np.ndarray,
+    ) -> bool:
+        """q38 SV-HOSTDIET HD-1 REQVEC: the rejected-count seq / pos index
+        arrays of `_prepare_inputs` with numpy (bitwise-identical). False
+        leaves the arrays untouched for the stock loop."""
+        if num_reqs > seq_idx_np.shape[0] or num_reqs < hostdiet.REQVEC_MIN_REQS:
+            return False
+        ids = self.input_batch.req_ids[start_index : start_index + num_reqs]
+        if len(ids) != num_reqs:
+            return False
+        n = np.asarray(num_scheduled_tokens_per_req[:num_reqs], dtype=np.int64)
+        if n.shape[0] != num_reqs:
+            return False
+        copy_map = self._pre_async_results.req_id_to_index_copy
+        try:
+            pos = np.fromiter(
+                (copy_map.get(r, -1) for r in ids), dtype=np.int64, count=num_reqs
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if pos.size and (pos.min() < -1 or pos.max() > np.iinfo(np.int32).max):
+            return False
+        hostdiet.count("reqvec_reject")
+        seq_idx_np[:num_reqs] = pos
+        rep = np.repeat(pos, n)
+        m = min(rep.shape[0], pos_idx_np.shape[0])
+        pos_idx_np[:m] = rep[:m]
+        return True
+
+    def _hd_substitution_indices(
+        self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """q38 SV-HOSTDIET HD-1 REQVEC: `_prepare_async_token_substitution_indices`
+        with numpy over the chunk's requests (bitwise-identical arrays).
+        Returns None to run the stock loop."""
+        pre = self._pre_async_results
+        if pre is None or num_reqs < hostdiet.REQVEC_MIN_REQS:
+            return None
+        layout_plan = self._last_sequence_layout_plan
+        lo = hi = 0
+        remap = None
+        if layout_plan is not None:
+            if type(layout_plan) is not SequenceLayoutPlan:
+                return None
+            token_slice = layout_plan.token_slice
+            if token_slice.step not in (None, 1) or token_slice.stop is None:
+                return None
+            lo = int(token_slice.start or 0)
+            hi = int(token_slice.stop)
+            remap = layout_plan._request_major_to_packed_token_indices
+        ids = self.input_batch.req_ids[start_index : start_index + num_reqs]
+        if len(ids) != num_reqs or None in ids:
+            return None
+        stride = 1
+        if (
+            self.speculative_config is not None
+            and pre.spec_decode_num_rejected_tokens is not None
+        ):
+            stride = 1 + self.speculative_config.num_speculative_tokens
+        copy_map = pre.req_id_to_index_copy
+        n = np.asarray(num_scheduled_tokens_per_req[:num_reqs], dtype=np.int64)
+        if n.shape[0] != num_reqs:
+            return None
+        keep = np.fromiter((r in copy_map for r in ids), dtype=bool, count=num_reqs)
+        try:
+            src_pos = np.fromiter(
+                (copy_map.get(r, 0) for r in ids), dtype=np.int64, count=num_reqs
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        hostdiet.count("reqvec_subst")
+        starts = np.cumsum(n) - n
+        rep_n = n[keep]
+        total = int(rep_n.sum())
+        empty = (np.array([], dtype=np.int32), np.array([], dtype=np.int32))
+        if total == 0:
+            return empty
+        offs = np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(rep_n) - rep_n, rep_n)
+        request_major = np.repeat(starts[keep], rep_n) + offs
+        src = np.repeat(src_pos[keep] * stride, rep_n) + offs
+        if layout_plan is None:
+            cur = request_major
+        else:
+            packed = request_major if remap is None else np.asarray(remap)[request_major].astype(np.int64)
+            inside = (packed >= lo) & (packed < hi)
+            cur = packed[inside] - lo
+            src = src[inside]
+            if cur.shape[0] == 0:
+                return empty
+        return cur.astype(np.int32), src.astype(np.int32)
+
     def _prepare_async_token_substitution_indices(
         self, start_index: int, num_reqs: int, num_scheduled_tokens_per_req: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
         if self._pre_async_results is None:
             return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+        if hostdiet.REQVEC and hostdiet.on("reqvec"):
+            fast = self._hd_substitution_indices(
+                start_index, num_reqs, num_scheduled_tokens_per_req
+            )
+            if fast is not None:
+                return fast
 
         token_in_tpu_cur_input_indices_list = []
         token_in_tpu_pre_next_tokens_indices_list = []
@@ -3110,7 +3216,11 @@ class TPUModelRunner(GPUModelRunner):
             if use_page_local_copy or use_dense_copy
             else scheduler_output
         )
+        if hostdiet.MARKS:
+            host_phases.mark("us_pre")
         result = super()._update_states(base_output)
+        if hostdiet.MARKS:
+            host_phases.mark("us_base")
         if gc_worker.ON:
             # q38 SV-KVGC WORKER-GC: new requests' token lists leave the collector.
             gc_worker.untrack_new(self.requests, scheduler_output)
@@ -3144,11 +3254,39 @@ class TPUModelRunner(GPUModelRunner):
             gc_worker.step_wait()
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
         assert pre_next_tokens_cpu is not None
+        if hostdiet.MARKS:
+            host_phases.mark("prev_copy_wait")
 
         pre_next_tokens_cpu = pre_next_tokens_cpu[: len(pre_req_ids)]
         max_gen_len = pre_next_tokens_cpu.shape[-1]
 
-        if max_gen_len == 1:
+        hd_commit = (
+            hostdiet.REQVEC
+            and hostdiet.on("reqvec")
+            and max_gen_len > 1
+            and len(pre_request_seq_lens) >= hostdiet.REQVEC_MIN_REQS
+            and pre_next_tokens_cpu.device.type == "cpu"
+            and pre_next_tokens_cpu.dtype in (torch.int32, torch.int64)
+            and not pre_next_tokens_cpu.requires_grad
+        )
+        if hd_commit:
+            # q38 SV-HOSTDIET HD-1 REQVEC: the same per-request token lists from
+            # one numpy mask and one list (no per-request tensor split / tolist),
+            # and one batched token_ids_cpu write after the loop.
+            hostdiet.count("reqvec_commit")
+            arr = pre_next_tokens_cpu.numpy()
+            valid_np = arr != INVALID_TOKEN_ID
+            gen_lens = valid_np.sum(axis=1).tolist()
+            flat = arr[valid_np].tolist()
+            valid_sampled_token_ids = []
+            off = 0
+            for n_ in gen_lens:
+                valid_sampled_token_ids.append(flat[off : off + n_])
+                off += n_
+            hd_rows: list[int] = []
+            hd_cols: list[int] = []
+            hd_vals: list[int] = []
+        elif max_gen_len == 1:
             valid_sampled_token_ids = pre_next_tokens_cpu.tolist()
         else:
             valid_mask = pre_next_tokens_cpu != INVALID_TOKEN_ID
@@ -3205,7 +3343,15 @@ class TPUModelRunner(GPUModelRunner):
                 f"req {req_id}: write end {end_tok_idx} exceeds max_model_len "
                 f"{self.input_batch.token_ids_cpu.shape[1]}"
             )
+            if hd_commit and start_idx >= 0:
+                n_s = end_tok_idx - start_idx
+                hd_rows.extend([req_idx] * n_s)
+                hd_cols.extend(range(start_idx, end_tok_idx))
+                hd_vals.extend(sampled_ids)
+                continue
             self.input_batch.token_ids_cpu[req_idx, target_slice] = sampled_ids
+        if hd_commit and hd_rows:
+            self.input_batch.token_ids_cpu[hd_rows, hd_cols] = hd_vals
 
     def _update_placeholder(
         self,
@@ -3509,6 +3655,8 @@ class TPUModelRunner(GPUModelRunner):
         assert max_num_scheduled_tokens_all_reqs > 0
 
         num_reqs = len(num_scheduled_tokens_per_req)
+        if hostdiet.MARKS:
+            host_phases.mark("php_sched")
 
         sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
         sequence_layout_planner.reserve_host_token_capacity(
@@ -3551,9 +3699,22 @@ class TPUModelRunner(GPUModelRunner):
 
             # Get batched arange.
             # E.g., [2, 5, 3] -> [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
-            arange = np.concatenate(
-                [self.arange_np[:n] for n in num_scheduled_tokens_per_req]
-            )
+            if (
+                hostdiet.REQVEC
+                and num_reqs >= hostdiet.REQVEC_MIN_REQS
+                and hostdiet.on("reqvec")
+            ):
+                # q38 SV-HOSTDIET HD-1 REQVEC: the same int64 array without the
+                # per-request slice list.
+                hostdiet.count("reqvec_arange")
+                n64 = num_scheduled_tokens_per_req.astype(np.int64)
+                arange = np.arange(int(n64.sum()), dtype=self.arange_np.dtype) - np.repeat(
+                    np.cumsum(n64) - n64, n64
+                ).astype(self.arange_np.dtype)
+            else:
+                arange = np.concatenate(
+                    [self.arange_np[:n] for n in num_scheduled_tokens_per_req]
+                )
 
             # Get positions.
             positions_np = self.positions_np[:total_num_scheduled_tokens]
@@ -3626,6 +3787,8 @@ class TPUModelRunner(GPUModelRunner):
         )
         self._last_sequence_layout_plan = layout_plan
         padded_total_num_scheduled_tokens = layout_plan.global_padded_num_tokens
+        if hostdiet.MARKS:
+            host_phases.mark("php_layout")
         request_major_input_ids = None
         if self._pcp_enabled and self._mtp_enabled:
             assert request_major_input_ids_cpu is not None
@@ -3673,6 +3836,8 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, non_blocking=True
             )
             target_num_reqs = self.num_reqs_most_model_len
+        if hostdiet.MARKS:
+            host_phases.mark("php_h2d")
 
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
@@ -3695,7 +3860,18 @@ class TPUModelRunner(GPUModelRunner):
             seq_idx_np = np.full(target_num_reqs, -1, dtype=np.int32)
             pos_idx_np = np.full(padded_total_num_scheduled_tokens, -1, dtype=np.int32)
             acc = 0
-            for i in range(num_reqs):
+            if (
+                hostdiet.REQVEC
+                and hostdiet.on("reqvec")
+                and self._hd_rejected_index(
+                    seq_idx_np, pos_idx_np, start_index, num_reqs, num_scheduled_tokens_per_req
+                )
+            ):
+                # q38 SV-HOSTDIET HD-1 REQVEC: both arrays filled as the loop would.
+                num_reqs_loop = 0
+            else:
+                num_reqs_loop = num_reqs
+            for i in range(num_reqs_loop):
                 req_id = self.input_batch.req_ids[start_index + i]
                 n_sched = int(num_scheduled_tokens_per_req[i])
                 pos = self._pre_async_results.req_id_to_index_copy.get(req_id)
@@ -3718,6 +3894,8 @@ class TPUModelRunner(GPUModelRunner):
                 ),
             )
 
+        if hostdiet.MARKS:
+            host_phases.mark("php_reject")
         # For decode-only case, cache constant device tensors to skip H2D.
         # query_start_loc, logits_indices, and request_distribution don't
         # change between decode steps for a given (num_reqs, padded_num_reqs).
@@ -3755,6 +3933,8 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
 
+        if hostdiet.MARKS:
+            host_phases.mark("php_spec")
         # Default decode layouts keep logits_indices stable for a fixed
         # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
         # explicit rank-major logits indices that can change as q_start crosses
@@ -3829,11 +4009,15 @@ class TPUModelRunner(GPUModelRunner):
         # built for hybrid models (slot pool initialized in
         # initialize_kv_cache); None otherwise so non-mamba models are
         # unaffected.
+        if hostdiet.MARKS:
+            host_phases.mark("php_qsl")
         mamba_state_indices = (
             self._build_mamba_state_indices(start_index, num_reqs, target_num_reqs)
             if self._has_mamba_state
             else None
         )
+        if hostdiet.MARKS:
+            host_phases.mark("php_mamba_idx")
 
         # Spec decode with mamba layers: the GDN kernel's windowed segment
         # covers 1-token decodes AND speculative verify windows (the batch is
@@ -3921,6 +4105,8 @@ class TPUModelRunner(GPUModelRunner):
                 start_index, num_reqs, num_scheduled_tokens_per_req
             )
         )
+        if hostdiet.MARKS:
+            host_phases.mark("pi_subst_idx")
 
         self._collect_mamba_state_seed_copies(scheduler_output, start_index, num_reqs)
 
@@ -4321,6 +4507,8 @@ class TPUModelRunner(GPUModelRunner):
                 "after execute_model() returns None."
             )
         host_phases.begin_step()
+        if hostdiet.ANY:
+            hostdiet.step()  # q38 SV-HOSTDIET: the step count every rank shares
         if _host_knobs.ENABLED:
             _host_knobs.on_step("worker")
         if host_admit_probe.ENABLED:
@@ -4509,10 +4697,14 @@ class TPUModelRunner(GPUModelRunner):
             # Seed newly-advanced mamba state blocks before the forward reads
             # them (chunk boundaries, decode crossings, prefix-cache resumes).
             self._flush_mamba_state_seed_copies()
+            if hostdiet.MARKS:
+                host_phases.mark("ssr_flush")
 
             # A recycled slot/block still carries the previous request's read
             # offset; clear it before this chunk's forward gathers it.
             self._reset_read_offsets_for_new_requests(start_index, num_reqs)
+            if hostdiet.MARKS:
+                host_phases.mark("ssr_reset")
 
             if envs.VLLM_TPU_GLUE_FOLD:
                 # q38 DEC-STEP-3 GLUE_FOLD: the substitution folds with the
@@ -4635,6 +4827,8 @@ class TPUModelRunner(GPUModelRunner):
                         src_key, "UNKNOWN" if src_key == "phase" else 0
                     )
 
+            if hostdiet.MARKS:
+                host_phases.mark("ap_misc")
             model_kwargs = None
             if self.model_adapter is not None:
                 from vllm_torchtpu.runner.model_adapters import ModelInputSnapshot
@@ -4682,6 +4876,8 @@ class TPUModelRunner(GPUModelRunner):
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
+                if hostdiet.MARKS:
+                    host_phases.mark("fd_enter")
                 hidden_states, aux_hidden_states = self.forward_model(
                     input_ids=input_ids,
                     positions=self.position_ids,
@@ -4689,6 +4885,8 @@ class TPUModelRunner(GPUModelRunner):
                     intermediate_tensors=intermediate_tensors,
                     model_kwargs=model_kwargs,
                 )
+                if hostdiet.MARKS:
+                    host_phases.mark("fd_model")
             host_phases.mark("forward_dispatch")
             if envs.VLLM_TPU_QSA_SEL_DUMP:
                 from vllm_torchtpu.models.vllm.qwen4_exp import selection_dump

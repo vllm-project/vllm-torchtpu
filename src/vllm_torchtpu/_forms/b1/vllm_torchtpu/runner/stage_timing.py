@@ -14,6 +14,7 @@ from torch_tpu._internal.stream.streams import TpuEvent
 from vllm.distributed.kv_transfer import has_kv_transfer_group
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.runner import hostdiet
 
 
 @dataclass
@@ -81,6 +82,11 @@ class RunnerStageTiming:
     def stage(self, stage: str) -> Iterator[None]:
         if not self._has_sink():
             yield
+            return
+        if hostdiet.STAGE_CPU and hostdiet.on("stage_cpu"):
+            # q38 SV-HOSTDIET HD-5: CPU sample only, no TpuEvent pair.
+            with self.host_stage(stage):
+                yield
             return
         if not self._slots.acquire(blocking=False):
             with self.host_stage(stage):

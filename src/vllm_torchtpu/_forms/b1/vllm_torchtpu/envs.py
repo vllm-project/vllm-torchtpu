@@ -411,6 +411,10 @@ if TYPE_CHECKING:
     VLLM_TPU_GC_WORKER: int = 0
     VLLM_TPU_GC_WORKER_LOG: bool = False
     VLLM_TPU_KVL_INWAIT: bool = False
+    VLLM_TPU_HD_MARKS: bool = False
+    VLLM_TPU_HD_STAGE_CPU: bool = False
+    VLLM_TPU_HD_REQVEC: bool = False
+    VLLM_TPU_HD_AB: int = 0
     VLLM_TPU_PREPROC_IN_WAIT: int = 0
     VLLM_TPU_PREPROC_IN_WAIT_AB_MS: int = 0
     VLLM_TPU_DEFER_FIN: bool = False
@@ -2888,6 +2892,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # programs, their order and every scheduler decision are the same.
     # Host-only.
     "VLLM_TPU_KVL_INWAIT": env_bool("VLLM_TPU_KVL_INWAIT", default=False),
+    # Decode host-cycle diet (q38 SV-HOSTDIET, runner/hostdiet.py). MARKS: extra
+    # host_phases marks splitting existing phases (log only; needs
+    # VLLM_TPU_HOST_PHASES). STAGE_CPU: runner stage timings keep CPU samples
+    # only (no TpuEvent pair per stage on the serving thread). REQVEC: numpy
+    # over the step's requests replaces per-request loops of the input
+    # preparation (bitwise-identical results). AB=<N>: STAGE_CPU / REQVEC act
+    # only in odd windows of N worker steps (0 = always). Host-only.
+    "VLLM_TPU_HD_MARKS": env_bool("VLLM_TPU_HD_MARKS", default=False),
+    "VLLM_TPU_HD_STAGE_CPU": env_bool("VLLM_TPU_HD_STAGE_CPU", default=False),
+    "VLLM_TPU_HD_REQVEC": env_bool("VLLM_TPU_HD_REQVEC", default=False),
+    "VLLM_TPU_HD_AB": env_nonnegative_int("VLLM_TPU_HD_AB", 0),
     # Engine core: new requests are built (prompt copy + prefix-cache block
     # hashes) only while the main thread waits on the workers' tokens or an
     # empty input queue; the value caps a request's wait for that window in ms.

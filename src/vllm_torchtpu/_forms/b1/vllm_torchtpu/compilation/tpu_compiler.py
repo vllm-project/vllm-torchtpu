@@ -369,6 +369,12 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_GC_WORKER",
     "VLLM_TPU_GC_WORKER_LOG",
     "VLLM_TPU_KVL_INWAIT",
+    # Decode host-cycle diet (q38 SV-HOSTDIET, runner/hostdiet.py): host only,
+    # every program and input is the same.
+    "VLLM_TPU_HD_MARKS",
+    "VLLM_TPU_HD_STAGE_CPU",
+    "VLLM_TPU_HD_REQVEC",
+    "VLLM_TPU_HD_AB",
     # New requests built in the engine core's waits (core/preproc_in_wait.py).
     "VLLM_TPU_PREPROC_IN_WAIT",
     "VLLM_TPU_PREPROC_IN_WAIT_AB_MS",
