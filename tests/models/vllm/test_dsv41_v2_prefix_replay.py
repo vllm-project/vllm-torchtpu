@@ -46,7 +46,7 @@ def test_dp_decoder_bucket_preserves_empty_local_plan(
         tuple(range(local_rows)), (0, local_rows), (65536,), local_rows
     )
     coordinated = ced.coordinate_decoder_replay(plan, 8192, agreed)
-    # Rows the runner agreed one step ahead need no collective of their own.
+    # Rows the runner agreed ahead need no collective of their own.
     assert len(reduced) == (agreed is None)
     assert coordinated.padded_num_tokens == (
         max(local_rows, peer_rows) if agreed is None else agreed

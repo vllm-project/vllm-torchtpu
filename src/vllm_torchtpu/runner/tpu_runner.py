@@ -770,10 +770,10 @@ class TPUModelRunner(GPUModelRunner):
         self._draft_proposals_needed: bool = True
         self._draft_context_needed: bool = True
         self._dp_step_has_encoder_inputs = False
-        # The one-step-ahead agreement (dp_step.py), created at the first
-        # lockstep step; the bound this rank published for its next step; and
-        # whether a step is open (between _dp_coordinated_step and
-        # _dp_end_step) and was agreed one step ahead.
+        # The agreement ahead of each step (dp_step.py), created at the first
+        # lockstep step; the bound this rank publishes after the open step's
+        # launches; and whether a step is open (between _dp_coordinated_step
+        # and _dp_end_step) and was agreed ahead.
         self._dp_agreement: dp_step.StepAgreement | None = None
         self._dp_next_bound: dp_step.StepShape | None = None
         self._dp_step_open = False
@@ -3646,8 +3646,9 @@ class TPUModelRunner(GPUModelRunner):
         )
         if not agreement.synchronous:
             logger.info_once(
-                "DP lockstep: steps are agreed one step ahead, after the "
-                "previous step's launches"
+                "DP lockstep: steps are agreed %d steps ahead, by an all-reduce "
+                "that runs behind the launches",
+                dp_step.AHEAD,
             )
         self._dp_step_agreed_ahead = not agreement.synchronous
         self._dp_step_index += 1
@@ -3655,7 +3656,7 @@ class TPUModelRunner(GPUModelRunner):
         controller = self._expert_relayout
         if controller is not None:
             # The dynamic expert re-layout's fields (expert_relayout.py) ride
-            # the previous step's closing all-reduce.
+            # the closing all-reduce of the step dp_step.AHEAD steps back.
             controller.on_step(
                 self._dp_step_index,
                 agreement.relayout,
@@ -3698,8 +3699,8 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _publish_dp_agreed_rows(self, num_tokens: int) -> None:
-        """Tell the model, in a step agreed one step ahead, that every DP
-        rank runs each of this forward's stages at `num_tokens` rows."""
+        """Tell the model, in a step agreed ahead, that every DP rank runs
+        each of this forward's stages at `num_tokens` rows."""
         if self._dp_step_agreed_ahead:
             get_forward_context().additional_kwargs[dp_step.AGREED_ROWS] = num_tokens
 
@@ -3714,8 +3715,9 @@ class TPUModelRunner(GPUModelRunner):
     def _dp_bound_next_step(
         self, scheduler_output: "SchedulerOutput"
     ) -> dp_step.StepShape | None:
-        """This rank's bound on its next lockstep step (dp_step.py), from its
-        scheduler; one without the admission gate leaves it unbounded."""
+        """This rank's bound on the lockstep step dp_step.AHEAD steps on
+        (dp_step.py), from its scheduler; one without the admission gate
+        leaves it unbounded."""
         if not self._dp_lockstep_enabled():
             return None
         return dp_step.next_step_bound(

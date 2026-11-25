@@ -175,6 +175,7 @@ def _lockstep_runner(**kwargs):
             "_dp_step_index": 0,
             "_dp_step_open": False,
             "max_num_reqs": 12,
+            "_warmup_dp_reqs_floor": 0,
             **kwargs,
         }
     )
@@ -192,6 +193,7 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
         tensor.copy_(
             torch.tensor([2048, 2, 1, 0] + [int(peer_needs_draft)] * 2 + [0, 0])
         )
+        return SimpleNamespace(wait=lambda: None)
 
     with patch.object(
         torch.distributed, "all_reduce", side_effect=reduce
@@ -205,10 +207,10 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
     collective.assert_called_once()
 
 
-def test_dp_step_agrees_the_next_step_after_its_launches():
+def test_dp_step_agrees_two_steps_on_after_its_launches():
     """A decoding rank publishes its bound and the re-layout fields after a
-    step's launches; the next step launches at that bound with no collective
-    of its own."""
+    step's launches; two steps on, that step launches at the bound with no
+    collective of its own."""
     seen = []
 
     class Controller:
@@ -229,23 +231,29 @@ def test_dp_step_agrees_the_next_step_after_its_launches():
     # The scheduler bounds twelve decoding requests, 1 + 5 tokens each.
     output = SimpleNamespace(**{dp_step.NEXT_STEP_TOKENS: [6] * 12})
     runner._dp_next_bound = TPUModelRunner._dp_bound_next_step(runner, output)
-    runner._dp_step_open = True
     operands = []
 
     def reduce(tensor, **kwargs):
+        # Asynchronous: the step goes on without waiting.
+        assert kwargs["async_op"]
         operands.append(tensor.tolist())
+        return SimpleNamespace(wait=lambda: None)
 
+    closing = [0, 72, 1, 12, 0, 1, 1, -72, -12, 0x5A5A, -0x5A5A, -3]
     with (
         patch.object(torch.distributed, "all_reduce", side_effect=reduce),
         patch.object(tpu_runner.gc_policy, "on_coordinated_step") as collect,
     ):
-        TPUModelRunner._dp_end_step(runner)
-        assert operands == [[0, 72, 1, 12, 0, 1, 1, -72, -12, 0x5A5A, -0x5A5A, -3]]
+        # Two steps close; the first one's reduction agrees the next step.
+        for _ in range(2):
+            runner._dp_step_open = True
+            TPUModelRunner._dp_end_step(runner)
+        assert operands == [closing, closing]
         bucket, chunks = TPUModelRunner._dp_coordinated_step(
             runner, 66, 1, local_num_reqs=11
         )
-    collect.assert_called_once()
-    assert len(operands) == 1
+    assert collect.call_count == 2
+    assert len(operands) == 2
     assert (bucket, chunks, runner._dp_step_max_reqs) == (72, 1, 12)
     assert runner._dp_step_agreed_ahead
     assert seen == [(42, (0x5A5A, -0x5A5A, -3), "decode")]

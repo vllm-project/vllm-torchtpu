@@ -229,8 +229,8 @@ class Recorder:
         coordinate = runner._dp_coordinated_step
 
         def dp_coordinated_step(*args: Any, **kwargs: Any) -> Any:
-            # Before the step's launches: a local check of the shape agreed one
-            # step ahead, or the DP-wide all-reduce of a step that changes it.
+            # Before the step's launches: a local check of the shape agreed
+            # ahead, or the DP-wide all-reduce of a step that changes it.
             started = time.perf_counter_ns()
             result = coordinate(*args, **kwargs)
             if self.enabled and self.pending is not None:
@@ -241,7 +241,8 @@ class Recorder:
         end_step = runner._dp_end_step
 
         def dp_end_step() -> None:
-            # After the step's launches: the all-reduce agreeing the next step.
+            # After the step's launches: starts the all-reduce agreeing a later
+            # step (dp_step.AHEAD).
             started = time.perf_counter_ns()
             end_step()
             if self.enabled and self.pending is not None:
