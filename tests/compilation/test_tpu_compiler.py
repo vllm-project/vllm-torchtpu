@@ -1638,6 +1638,45 @@ class TestTpuArtifactStore:
         assert replayed == []
         assert not store.exists()
 
+    def test_a_dynamic_shape_graph_does_not_use_the_store(self, tmp_path, monkeypatch):
+        """Symbolic input sizes cannot be keyed (int() on a SymInt fails or
+        specializes), so such a graph gets no store path."""
+        import torch
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.symbolic_shapes import (
+            DimDynamic,
+            ShapeEnv,
+            StatelessSymbolicContext,
+        )
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        monkeypatch.setenv("TPU_ARTIFACT_STORE", "1")
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(
+            cache_dir=str(
+                tmp_path / "torch_compile_cache" / "hashA" / "rank_0_0" / "backbone"
+            )
+        )
+        compiler._tpu_hash = "tpu1"
+        compiler._config_hash = "cfg1"
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+        mode = FakeTensorMode(shape_env=ShapeEnv())
+        dynamic = mode.from_tensor(
+            torch.zeros(8, 4),
+            symbolic_context=StatelessSymbolicContext(
+                dynamic_sizes=[DimDynamic.DYNAMIC, DimDynamic.STATIC]
+            ),
+        )
+        assert isinstance(dynamic.shape[0], torch.SymInt)
+
+        def store_path(inputs):
+            return compiler._store_path("bucket", graph, inputs, False, "fp")
+
+        assert store_path([torch.zeros(8, 4)]) is not None
+        assert store_path([dynamic]) is None
+        assert store_path([dynamic.shape[0]]) is None
+
     def test_no_store_without_the_tpu_hash(self, tmp_path, monkeypatch):
         """compute_hash has not run, so the key would miss what lies behind
         custom ops: do not use the store at all."""

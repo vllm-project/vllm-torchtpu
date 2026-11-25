@@ -636,6 +636,22 @@ class TpuCompilerAdaptor(CompilerInterface):
             return None
         root = os.path.join(os.path.dirname(torch_compile_cache), "tpu_artifact_store")
 
+        # A dynamic-shape graph's inputs carry symbolic sizes: int() on them
+        # would fail or specialize, and the key would not describe one
+        # program. Such graphs do not use the store.
+        symbolic = (torch.SymInt, torch.SymFloat, torch.SymBool)
+
+        def is_symbolic(value: Any) -> bool:
+            if isinstance(value, torch.Tensor):
+                return any(
+                    isinstance(d, symbolic)
+                    for d in (*value.shape, *value.stride(), value.storage_offset())
+                )
+            return isinstance(value, symbolic)
+
+        if any(is_symbolic(value) for value in example_inputs):
+            return None
+
         def meta(value: Any) -> Any:
             if isinstance(value, torch.Tensor):
                 return (
