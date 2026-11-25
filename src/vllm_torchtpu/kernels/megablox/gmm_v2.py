@@ -1060,8 +1060,8 @@ def calculate_tiling(
         rhs_scale_vmem = 0
         if rhs_cfgs.has_scale and rhs_cfgs.quant_block_size is not None:
             num_quant_blocks_per_tile_k = pl.cdiv(tk, rhs_cfgs.quant_block_size)
-            # E4M3 block scales stay one byte in VMEM with a global scale.
-            scale_bytes = 1 if rhs_cfgs.has_global_scale else 4
+            # Compact E4M3 block scales stay one byte in VMEM.
+            scale_bytes = 1 if rhs_cfgs.has_compact_scale else 4
             rhs_scale_vmem = num_quant_blocks_per_tile_k * tn * scale_bytes
         # FP32 per-channel inputs of shape [1, tn]: the bias and the global scale.
         num_per_channel = int(rhs_cfgs.has_bias) + int(rhs_cfgs.has_global_scale)
@@ -1222,7 +1222,7 @@ def get_cost_estimate(cfgs: GmmConfigs):
     rhs_bytes = rhs_size * rhs_bits // 8
     if cfgs.rhs_cfgs.has_scale:
         num_quant_blocks = pl.cdiv(dims.size_k, cfgs.rhs_cfgs.quant_block_size)
-        scale_bytes = 1 if cfgs.rhs_cfgs.has_global_scale else fp32_bytes
+        scale_bytes = 1 if cfgs.rhs_cfgs.has_compact_scale else fp32_bytes
         rhs_bytes += dims.size_group * num_quant_blocks * dims.size_n * scale_bytes
     if cfgs.rhs_cfgs.has_global_scale:
         rhs_bytes += dims.size_group * dims.size_n * fp32_bytes
@@ -1417,7 +1417,9 @@ def gmm_v2(
             packed -> [size_group, size_k/8, size_n]
         group_sizes: The group sizes of lhs rows of shape [size_lhs_group,].
         rhs_scale: [size_group, num_blocks, 1, out_size], or compact uint8
-            E4M3 bits [size_group, num_blocks, out_size] with rhs_global_scale.
+            E4M3 bits [size_group, num_blocks, out_size]. Compact scales stay
+            one byte in HBM, and each tile is dequantized with them in BF16
+            (E2M1 x E4M3 products are exact in BF16).
         rhs_bias: The rhs bias of shape [size_group, 1, out_size].
         group_offset: Optional. The group offset of shape [1,].
         tile_info: The tile sizes or tile function to use.
@@ -1430,11 +1432,9 @@ def gmm_v2(
         fuse_act: Activation function to fuse with GMM, None if no fusion.
         rhs_quant_dtype: Quantized dtype encoded by a pre-packed RHS carrier.
             Packed along k-axis
-        rhs_global_scale: Optional FP32 [size_group, 1, out_size] multiplier
-            for E4M3 block scales. With this input, block scales stay in FP8
-            in HBM, each tile is dequantized with the block scales alone
-            (E2M1 x E4M3 products are exact in BF16), and the global scale
-            multiplies the FP32 accumulator once per output tile.
+        rhs_global_scale: Optional FP32 [size_group, 1, out_size]
+            per-output-channel multiplier, applied to the FP32 accumulator once
+            per output tile.
 
     Returns:
         Output of shape [size_m, size_n].
@@ -1482,12 +1482,6 @@ def gmm_v2(
 
     # Prepare block specs.
     rhs_scale_spec = rhs_bias_spec = rhs_global_scale_spec = None
-    if cfgs.rhs_cfgs.has_compact_scale and rhs_global_scale is None:
-        assert rhs_scale is not None
-        raise ValueError(
-            f"Compact E4M3 scales (dtype {rhs_scale.dtype}, shape {rhs_scale.shape}) "
-            "require rhs_global_scale"
-        )
     if tiles.tile_m != tiles.bucket_base and pl.cdiv(dims.size_k, tiles.tile_k) > 1:
         raise NotImplementedError(
             f"Partial-M buckets (tile_m={tiles.tile_m}, bucket_base="
@@ -1503,33 +1497,28 @@ def gmm_v2(
             f"quant blocks; got tile_k={tiles.tile_k}, quant block size "
             f"{cfgs.rhs_cfgs.quant_block_size}"
         )
+    if (
+        cfgs.rhs_cfgs.has_compact_scale
+        and not cfgs.rhs_cfgs.should_dequantize_before_matmul
+    ):
+        raise NotImplementedError(
+            "Compact E4M3 scales need the weights dequantized before the matmul, "
+            f"but quant block size {cfgs.rhs_cfgs.quant_block_size} is not below "
+            f"the MXU column size {pltpu.get_tpu_info().mxu_column_size}"
+        )
     if rhs_global_scale is not None:
+        global_shape = (dims.size_group, 1, dims.size_n)
         if (
-            rhs_scale is None
-            or not cfgs.rhs_cfgs.has_compact_scale
-            or rhs_global_scale.dtype != jnp.float32
-            or rhs_global_scale.shape != (dims.size_group, 1, dims.size_n)
+            rhs_global_scale.dtype != jnp.float32
+            or rhs_global_scale.shape != global_shape
         ):
-            scale_desc = (
-                "none"
-                if rhs_scale is None
-                else f"dtype {rhs_scale.dtype}, shape {rhs_scale.shape}"
-            )
             raise ValueError(
-                "Global scales require E4M3 block scales (compact uint8) and "
-                f"FP32 [{dims.size_group}, 1, {dims.size_n}] global scales; got block "
-                f"scales {scale_desc}, global scales dtype {rhs_global_scale.dtype}, "
-                f"shape {rhs_global_scale.shape}"
-            )
-        if not cfgs.rhs_cfgs.should_dequantize_before_matmul:
-            raise NotImplementedError(
-                "Global scales need the weights dequantized before the matmul, but "
-                f"quant block size {cfgs.rhs_cfgs.quant_block_size} is not below the "
-                f"MXU column size {pltpu.get_tpu_info().mxu_column_size}"
+                f"rhs_global_scale must be FP32 {list(global_shape)}; got dtype "
+                f"{rhs_global_scale.dtype}, shape {rhs_global_scale.shape}"
             )
         rhs_global_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_scale is not None:
-        if rhs_global_scale is None:
+        if not cfgs.rhs_cfgs.has_compact_scale:
             rhs_scale = rhs_scale.astype(jnp.float32)
         rhs_scale_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     if rhs_bias is not None:

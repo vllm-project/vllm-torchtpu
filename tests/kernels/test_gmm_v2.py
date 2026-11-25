@@ -840,31 +840,21 @@ def test_calculate_tiling_splits_k_when_tile_n_stops_at_its_limit(monkeypatch):
     assert tiles.tile_n == 512 and tiles.tile_k < 65536, tiles
 
 
-def test_gmm_v2_rejects_compact_scales_without_global_scale(monkeypatch):
-    _validation_tpu_info(monkeypatch)
-    _, scale = make_nvfp4_rhs(jax.random.key(7), 2, 512, 256)
-    with pytest.raises(ValueError, match="require rhs_global_scale"):
-        _nvfp4_validation_call(jax.lax.bitcast_convert_type(scale, jnp.uint8), None)
-
-
 def test_gmm_v2_rejects_malformed_global_scale(monkeypatch):
     _validation_tpu_info(monkeypatch)
     _, scale = make_nvfp4_rhs(jax.random.key(8), 2, 512, 256)
-    with pytest.raises(ValueError, match="Global scales require E4M3 block scales"):
+    with pytest.raises(ValueError, match="rhs_global_scale must be FP32"):
         _nvfp4_validation_call(
             jax.lax.bitcast_convert_type(scale, jnp.uint8),
             jnp.ones((2, 1, 256), jnp.bfloat16),
         )
 
 
-def test_gmm_v2_rejects_global_scale_on_dequant_after_matmul(monkeypatch):
+def test_gmm_v2_rejects_compact_scales_on_dequant_after_matmul(monkeypatch):
     _validation_tpu_info(monkeypatch, mxu_column_size=16)
     _, scale = make_nvfp4_rhs(jax.random.key(9), 2, 512, 256)
     with pytest.raises(NotImplementedError, match="not below the MXU column size 16"):
-        _nvfp4_validation_call(
-            jax.lax.bitcast_convert_type(scale, jnp.uint8),
-            make_global_scale(jax.random.key(10), 2, 256),
-        )
+        _nvfp4_validation_call(jax.lax.bitcast_convert_type(scale, jnp.uint8), None)
 
 
 def test_gmm_v2_rejects_partial_m_buckets_with_split_k(monkeypatch):
