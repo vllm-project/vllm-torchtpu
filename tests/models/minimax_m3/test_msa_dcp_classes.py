@@ -45,28 +45,34 @@ def _caches(dtype, num_pages, rng, heads=1):
 
 
 @pytest.mark.parametrize(
-    "dtype,rank,dcp,heads",
+    "dtype,rank,dcp,heads,pages_per_seq",
     [
-        (jnp.bfloat16, 0, 2, 1),
-        (jnp.bfloat16, 1, 2, 1),
-        (jnp.float8_e4m3fn, 0, 2, 1),
-        (jnp.float8_e4m3fn, 1, 2, 1),
-        ("int4", 0, 2, 1),
-        ("int4", 1, 2, 1),
+        (jnp.bfloat16, 0, 2, 1, 16),
+        (jnp.bfloat16, 1, 2, 1, 16),
+        (jnp.float8_e4m3fn, 0, 2, 1, 16),
+        (jnp.float8_e4m3fn, 1, 2, 1, 16),
+        ("int4", 0, 2, 1, 16),
+        ("int4", 1, 2, 1, 16),
         # DCP 8 at 4 KV heads: the heads fold into the query rows.
-        (jnp.float8_e4m3fn, 5, 8, 4),
-        ("int4", 3, 8, 4),
+        (jnp.float8_e4m3fn, 5, 8, 4, 16),
+        ("int4", 3, 8, 4, 16),
+        # Over 256 pages per request: the decode rows score 256-page groups
+        # (`msa.wide_page_groups`), the first request in two of them.
+        (jnp.float8_e4m3fn, 1, 2, 1, 264),
+        ("int4", 0, 2, 1, 264),
     ],
 )
-def test_class_candidates_match_token_order(dtype, rank, dcp, heads, monkeypatch):
+def test_class_candidates_match_token_order(
+    dtype, rank, dcp, heads, pages_per_seq, monkeypatch
+):
     rng = np.random.default_rng(rank)
-    q_lens, ctx_lens = [8, 9, 300], [3000, 700, 2100]
+    q_lens = [8, 9, 300]
+    ctx_lens = [3000 if pages_per_seq <= 256 else 2 * PAGE * 260, 700, 2100]
     num_seqs = len(q_lens)
     max_num_seqs = num_seqs + 1
     num_real = sum(q_lens)
     num_tokens = num_real + 13
     assert msa_indexer.is_prefill_step(num_tokens * heads, max_num_seqs)
-    pages_per_seq = 16
     num_pages = max_num_seqs * pages_per_seq + 1
     perm = rng.permutation(np.arange(1, num_pages))
     block_tables = perm[: max_num_seqs * pages_per_seq].astype(np.int32)
