@@ -28,8 +28,8 @@ runs is checked, not what it says.
 
 Run with: pytest tests/entrypoints/llm/test_generate_olmo35.py -v
 
-It lives under tests/entrypoints so that it runs before the in-process TPU tests:
-the engine runs in a subprocess and needs the TPU free (tests/conftest.py).
+The engine runs in a spawned process and needs the TPU free, so the module is
+marked to run before the in-process TPU tests (tests/conftest.py).
 """
 
 import pytest
@@ -38,7 +38,10 @@ from vllm.distributed import cleanup_dist_env_and_memory
 
 from vllm_torchtpu.models.olmo35.config import Olmo35Config
 
-pytestmark = pytest.mark.tpu_test
+# LLM(...) starts the engine core in a spawned child that needs the chip, so
+# this module is marked spawns_tpu_workers to run before in-process TPU tests
+# (see tests/conftest.py::pytest_collection_modifyitems).
+pytestmark = [pytest.mark.tpu_test, pytest.mark.spawns_tpu_workers]
 
 NUM_PROMPTS = 4
 MAX_TOKENS = 8
