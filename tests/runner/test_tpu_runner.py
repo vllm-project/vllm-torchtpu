@@ -46,7 +46,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -158,6 +161,99 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
     # 40960 tokens in 40 entries of 1024, and the ids must fit that row.
     assert block_ids == list(range(1, 1 + expected_blocks))
     assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
+
+
+def _make_circular_warmup_groups():
+    full_spec = FullAttentionSpec(
+        block_size=1024, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    circular_spec = CircularBufferSpec(
+        block_size=64, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    uniform_circular = UniformTypeKVCacheSpecs.from_specs(
+        {
+            "indexer.0": circular_spec,
+            "indexer.1": CircularBufferSpec(
+                block_size=64, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+            ),
+        }
+    )
+    return [
+        KVCacheGroupSpec(layer_names=["attn.0"], kv_cache_spec=full_spec),
+        KVCacheGroupSpec(layer_names=["indexer.0"], kv_cache_spec=circular_spec),
+        KVCacheGroupSpec(
+            layer_names=["indexer.0", "indexer.1"], kv_cache_spec=uniform_circular
+        ),
+    ]
+
+
+def _make_circular_warmup_runner(
+    *, num_blocks: int, max_num_tokens: int = 512, groups=None
+):
+    recorded = []
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+    )
+    runner = SimpleNamespace(
+        max_model_len=4096,
+        max_num_tokens=max_num_tokens,
+        vllm_config=config,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        scheduler_config=SimpleNamespace(async_scheduling=False, max_num_seqs=4),
+        kv_cache_config=KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[],
+            kv_cache_groups=groups
+            if groups is not None
+            else _make_circular_warmup_groups(),
+        ),
+        execute_model=lambda so: recorded.append(so),
+        sample_tokens=lambda *_args: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=MagicMock(return_value=True),
+        requests=_warmup_requests(),
+    )
+    return runner, recorded
+
+
+def test_mtp_prefill_warmup_caps_circular_buffer_group_blocks():
+    # A 6-block pool fits 3 full-attention blocks (P=2048, block_size=1024)
+    # plus 1 ring block per circular group; any sizing not capped at the ring
+    # width fails the pool check.
+    runner, recorded = _make_circular_warmup_runner(num_blocks=6)
+
+    assert TPUModelRunner._warmup_one_mtp_prefill(runner, P=2048, quiet=True) is True
+    assert len(recorded) == 1
+    new_req = recorded[0].scheduled_new_reqs[0]
+    assert len(new_req.block_ids[0]) == 3
+    assert len(new_req.block_ids[1]) == 1
+    assert len(new_req.block_ids[2]) == 1
+
+
+def test_mtp_prefill_warmup_raises_when_kv_pool_cannot_fit_widest_group():
+    runner, _ = _make_circular_warmup_runner(num_blocks=4)
+
+    with pytest.raises(
+        RuntimeError, match="MTP prefill warmup has not enough KV blocks"
+    ):
+        TPUModelRunner._warmup_one_mtp_prefill(runner, P=2048, quiet=True)
+
+
+def test_mixed_spec_warmup_caps_circular_buffer_group_blocks():
+    # max_num_tokens=2560 gives P_mix=2552 (mix_max_pos=2556), requiring 3
+    # blocks for the full-attention group while circular groups stay capped at
+    # 1 block across both the single-request and split-request mixed variants.
+    runner, recorded = _make_circular_warmup_runner(num_blocks=24, max_num_tokens=2560)
+
+    TPUModelRunner._warmup_spec_batch(runner, R=2, P=64, greedy=True, mixed=True)
+    mix_new_reqs = [
+        req for so in recorded for req in so.scheduled_new_reqs if "mix" in req.req_id
+    ]
+    assert len(mix_new_reqs) == 3
+    for req in mix_new_reqs:
+        assert len(req.block_ids[0]) == 3
+        assert len(req.block_ids[1]) == 1
+        assert len(req.block_ids[2]) == 1
 
 
 def test_spec_warmup_request_verifies_k_drafts_under_dynamic_schedule():
@@ -859,13 +955,31 @@ def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
 
 def test_one_mtp_prefill_warmup_builds_prefill_without_decode():
     executed = []
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+    )
     runner = SimpleNamespace(
         max_model_len=64,
+        vllm_config=config,
         kv_cache_config=SimpleNamespace(
             num_blocks=100,
             kv_cache_groups=[
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16)),
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=8)),
+                SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(
+                        block_size=16,
+                        num_kv_heads=1,
+                        head_size=128,
+                        dtype=torch.bfloat16,
+                    )
+                ),
+                SimpleNamespace(
+                    kv_cache_spec=FullAttentionSpec(
+                        block_size=8,
+                        num_kv_heads=1,
+                        head_size=128,
+                        dtype=torch.bfloat16,
+                    )
+                ),
             ],
         ),
         execute_model=MagicMock(side_effect=lambda so: executed.append(so)),
