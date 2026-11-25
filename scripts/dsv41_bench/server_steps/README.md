@@ -291,7 +291,8 @@ Each request uses a 98304-token cached prefix and 512 output tokens, with
 DSpark K5. Local target/draft shapes remain 288/240 rows and the target
 compile buckets remain `[288,2048]`. KV sizing is automatic at memory
 utilization 0.85, with FP8 KV/indexer, block size 256 (SWA pages stay 64
-tokens) and max model length 98816.
+tokens) and max model length 98834: prefix plus output plus 18 tokens
+(3 x (1 + K)) of speculation room, so the last tokens keep full verify windows.
 
 Both hosts use `TPU_DEEPSEEK_V41_ENGRAM_HBM=first`, Engram `cpu_offload=true`
 and `dp_shared_memory=false`, `MOE_FUSED_EP_KERNEL_IMPL=push`,
@@ -385,7 +386,7 @@ performance harness:
 ```bash
 export MODEL_PATH=/models/DeepSeek-V4.1-Flash
 export PYTHONPATH="$PWD/scripts/dsv41_bench/server_steps${PYTHONPATH:+:$PYTHONPATH}"
-TP=1 DP=8 CHUNK=2048 MAX_SEQS=48 MAX_MODEL_LEN=98816 KV_BYTES=auto \
+TP=1 DP=8 CHUNK=2048 MAX_SEQS=48 MAX_MODEL_LEN=98834 KV_BYTES=auto \
   bash scripts/dsv41_bench/serve_cached_prefill.sh \
   --worker-extension-cls server_step_worker.ServerStepWorker \
   --enable-log-requests --max-log-len 0 \

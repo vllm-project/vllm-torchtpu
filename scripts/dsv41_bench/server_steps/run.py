@@ -228,7 +228,15 @@ def main() -> None:
         MAX_SEQS=str(scenario.max_seqs),
     )
     if decode:
-        env["MAX_MODEL_LEN"] = str(scenario.prefix_tokens + scenario.output_tokens)
+        # Room for speculation past the last output token: the async step in
+        # flight (1 + K placeholders), its verify window (1 + K) and the DSpark
+        # block (<= 1 + K). At exactly prefix + output the scheduler trims the
+        # last windows, their drafts are never accepted and the requests drop
+        # out of the batch every other step (decode p90 29.2 -> 21.6 ms).
+        spec_room = 3 * (1 + scenario.dspark_tokens)
+        env["MAX_MODEL_LEN"] = str(
+            scenario.prefix_tokens + scenario.output_tokens + spec_room
+        )
     else:
         env.pop("MAX_MODEL_LEN", None)
     env["USE_PHASED_PROFILER"] = "0"
