@@ -3686,9 +3686,10 @@ class TPUModelRunner(GPUModelRunner):
             return
         self._dp_step_open = False
         self._dp_step_agreed_ahead = False
-        # Every rank reaches this point once per step, which is what makes a
-        # step-cadenced collection land on all of them at once instead of 32
-        # independent pauses, while the device runs the step just launched.
+        # Every rank reaches this point once per step, so a step-cadenced
+        # collection lands on all of them at the same step index (at most
+        # dp_step.AHEAD steps apart in time) instead of 32 independent pauses,
+        # while the device runs the step just launched.
         gc_policy.on_coordinated_step()
         if not self._dp_lockstep_enabled():
             return

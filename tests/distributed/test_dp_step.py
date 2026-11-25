@@ -22,7 +22,7 @@ _SPEC.loader.exec_module(dp_step)
 
 RANKS = 16
 STEPS = 160
-DRAFTS = 2  # A decoding request runs 1 + DRAFTS tokens a step.
+DRAFTS = 2  # A decoding request runs 1 + at most DRAFTS tokens a step.
 BUDGET = 1024
 CHUNK_REQS = 4
 LONG_TOKENS = 16  # A chunk holding a longer request takes CHUNK_REQS // 2.
@@ -40,12 +40,13 @@ class _Request:
         self.num_output_placeholders = 0
         self.image = image
         self.status = RequestStatus.WAITING
+        self.drafts = DRAFTS  # The drafter's proposals for its next step.
 
     @property
     def num_tokens_with_spec(self) -> int:
         if self.num_computed_tokens < self.prompt:
             return self.prompt
-        return self.num_computed_tokens + 1 + DRAFTS
+        return self.num_computed_tokens + 1 + self.drafts
 
 
 class _Scheduler:
@@ -184,6 +185,10 @@ def _run(rank: int) -> None:
             done = scheduler.running.pop(rng.randrange(len(scheduler.running)))
             scheduler.finished.add(done.request_id)
 
+        for request in scheduler.running:
+            # Draft counts vary step to step, so a bound from two schedules
+            # back must cover any count, not the one current then.
+            request.drafts = rng.randrange(DRAFTS + 1)
         output = dp_step.gated_schedule(scheduler, _schedule)
         for request in output.new:
             admitted[request.request_id] = step
@@ -198,9 +203,11 @@ def _run(rank: int) -> None:
         agreement.end(runner.bound, fields)
 
     every = [None] * RANKS
-    dist.all_gather_object(every, (log, published), group=dist.group.WORLD)
+    dist.all_gather_object(
+        every, (log, published, len(arrivals)), group=dist.group.WORLD
+    )
     # (a) Every rank ran the same collectives at the same shapes.
-    assert all(other == log for other, _ in every)
+    assert all(other == log for other, _, _ in every)
     for step, (synchronous, _, relayout) in enumerate(log):
         # Quiet steps launch without a collective before them: the last
         # burst step's arrival enters by step % 10 == 4 and its prompt chunk
@@ -211,7 +218,7 @@ def _run(rank: int) -> None:
             (0, 0, 0)
             if step < 2
             else tuple(
-                max(fields[step - 2][i] for _, fields in every) for i in range(3)
+                max(fields[step - 2][i] for _, fields, _ in every) for i in range(3)
             )
         )
         assert relayout == expected, step
@@ -219,7 +226,8 @@ def _run(rank: int) -> None:
     # before it bounded: its arrival step, one later if only the older one
     # bounded, two later if the newer one did (its arrival schedule publishes
     # no bound); and that step agrees its shape before launch.
-    assert len(admitted) == len(arrivals) > 5
+    assert len(admitted) == len(arrivals)
+    assert sum(count for _, _, count in every) > 5 * RANKS
     for request_id, (step, (older, newer)) in arrivals.items():
         delay = 2 if newer else 1 if older else 0
         assert admitted[request_id] == step + delay, request_id

@@ -213,9 +213,11 @@ def test_dp_step_agrees_two_steps_on_after_its_launches():
     collective of its own."""
     seen = []
 
+    published = iter([(0x5A5A, -0x5A5A, -3), (0x7B7B, -0x7B7B, -4)])
+
     class Controller:
         def fields(self):
-            return (0x5A5A, -0x5A5A, -3)
+            return next(published)
 
         def on_step(self, step, reduced, phase):
             seen.append((step, reduced, phase))
@@ -239,16 +241,19 @@ def test_dp_step_agrees_two_steps_on_after_its_launches():
         operands.append(tensor.tolist())
         return SimpleNamespace(wait=lambda: None)
 
-    closing = [0, 72, 1, 12, 0, 1, 1, -72, -12, 0x5A5A, -0x5A5A, -3]
+    bound = [0, 72, 1, 12, 0, 1, 1, -72, -12]
     with (
         patch.object(torch.distributed, "all_reduce", side_effect=reduce),
         patch.object(tpu_runner.gc_policy, "on_coordinated_step") as collect,
     ):
-        # Two steps close; the first one's reduction agrees the next step.
+        # Two steps close; the older reduction agrees the next step.
         for _ in range(2):
             runner._dp_step_open = True
             TPUModelRunner._dp_end_step(runner)
-        assert operands == [closing, closing]
+        assert operands == [
+            bound + [0x5A5A, -0x5A5A, -3],
+            bound + [0x7B7B, -0x7B7B, -4],
+        ]
         bucket, chunks = TPUModelRunner._dp_coordinated_step(
             runner, 66, 1, local_num_reqs=11
         )

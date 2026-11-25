@@ -28,8 +28,10 @@ all-reduce to confirm that and to learn when every rank has staged:
 
 A generation: trigger at step T0 (every `window_steps`): snapshot the tap,
 form the window, solve (policy + rank matching + move budget + hysteresis)
--> a Plan with a 62-bit hash. Step T0 + 1: the hashes agree on every rank
-(else the generation is dropped, identically everywhere); the mover starts
+-> a Plan with a 62-bit hash. The step that reads the reduction carrying the
+hashes (dp_step.AHEAD steps after they ride the DP agreement): the hashes
+agree on every rank (else the generation is dropped, identically
+everywhere); the mover starts
 copying the moved experts' slabs into the destinations' staging slots in the
 background. When the reduced staged generation reaches the plan's on every
 rank -- the same step for all of them -- each rank writes its layers' new

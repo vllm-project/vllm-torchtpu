@@ -27,6 +27,13 @@ a step that neither of the two previous schedules bounded, and holds a running
 request rolled back to a prefill between schedules (a failed KV load) on a
 bounded step as well. A new request therefore enters at most two steps after
 it becomes admissible, on a step whose shape is agreed before its launch.
+
+Two premises of vLLM's DP engine loop carry the bound. Each step's bound is
+the rank's latest schedule's (`_dp_next_bound`): a step that schedules
+nothing, or an idle engine iteration that runs no schedule, publishes the
+bound of the schedule before it, whose admissions the gate history still
+holds. And an engine that empties its last request schedules once more with
+nothing running, so the bound an idle rank publishes is the empty one.
 """
 
 import collections
