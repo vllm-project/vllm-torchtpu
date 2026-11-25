@@ -121,9 +121,13 @@ def _row_copy_fn(num_pools: int, split: int, step_rows: int):
         pool: jax.Array, src: jax.Array, dst: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
         assert pool.shape[1] == rows, (pool.shape, rows)
-        # Here as well as in copy_blocks: `src * steps` can wrap in int32 and
-        # land back inside the pool, where copy_blocks cannot tell it apart.
-        src, dst = pool_adapters.null_out_of_range_pairs(src, dst, pool.shape[0])
+        # Before the expansion: `src * steps` can wrap in int32 back into the
+        # pool, where copy_blocks could not tell it from a valid kernel block.
+        # A pair with a row outside the pool becomes (-1, -1), whose steps all
+        # stay below zero, so copy_blocks replaces (and reports) each of them.
+        in_pool = pool_adapters.copy_pairs_in_pool(src, dst, pool.shape[0])
+        src = jnp.where(in_pool, src, -1)
+        dst = jnp.where(in_pool, dst, -1)
         view = pool.reshape(pool.shape[0] * steps, step_rows, *pool.shape[2:])
         offsets = jnp.arange(steps, dtype=src.dtype)
         src_steps = (src[:, None] * steps + offsets).reshape(-1)
@@ -153,10 +157,10 @@ def copy_mamba_state_rows(
 
     Each `(src[i], dst[i])` pair moves `num_pools * split` kernel blocks.
     `src` and `dst` are manager rows, valid in `[0, pool.shape[0])`. A pair
-    with either index outside that range is replaced by the `(0, 0)` padding
-    pair before the rows expand into kernel blocks, so it copies the null
-    block's row onto itself and changes no row
-    (`pool_adapters.null_out_of_range_pairs`).
+    with either index outside that range changes no row: it is marked before
+    the rows expand into kernel blocks, so `pool_adapters.copy_blocks`
+    replaces each of its kernel-block pairs by the `(0, 0)` padding pair,
+    and reports them as `copy_blocks` describes.
     """
     kernel_block_bytes = pool[0, 0].numel() * pool.element_size()
     step_rows = _row_copy_step_rows(

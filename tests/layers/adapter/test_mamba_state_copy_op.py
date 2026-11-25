@@ -20,6 +20,8 @@ the pool's bytes: each valid pair copies its row and every other row keeps its
 bytes.
 """
 
+import base64
+import re
 from unittest.mock import patch
 
 import jax
@@ -112,7 +114,7 @@ def test_valid_pairs_reach_the_copy_kernel_unchanged():
     programs copy exactly what they copied without it."""
     seen = []
 
-    def kernel(pool, src, dst):
+    def kernel(pool, src, dst, in_pool=None):
         seen.append((src, dst))
         return numpy_copy_blocks(pool, src, dst)
 
@@ -132,10 +134,17 @@ def test_valid_pairs_reach_the_copy_kernel_unchanged():
 
 @pytest.mark.parametrize("program", ["block", "row"])
 def test_the_debug_check_reports_a_replaced_pair(program):
+    """On the host the report is a host callback raising `RuntimeError` that
+    names the pairs as passed in. The row copy's bad pairs are reported by
+    `copy_blocks` on the expanded pool of `POOL_ROWS * steps` kernel-block
+    steps, as the marked steps (-1 * steps + offset)."""
     if program == "block":
-        run = mamba_state_copy_op._copy_fn
+        run, num_blocks = mamba_state_copy_op._copy_fn, POOL_ROWS
+        count, first = 6, r"\(10, 3\)"  # the first pair outside, as passed in
     else:
         run = row_copy_program(num_pools=2, split=2, step_rows=2)
+        num_blocks = POOL_ROWS * 2
+        count, first = 12, r"\(-2, -2\)"  # 2 steps per marked row; the first step
     pool = _rows_pool()
     with numpy_copy_kernel():
         run(pool, *_indices(PAIRS))  # debug checks off: replaced, not reported
@@ -145,7 +154,44 @@ def test_the_debug_check_reports_a_replaced_pair(program):
             jax.effects_barrier()
             with pytest.raises(
                 (RuntimeError, jax.errors.JaxRuntimeError),
-                match=r"outside \[0, 10\) replaced by the \(0, 0\) padding pair",
+                match=re.escape(pool_adapters._replaced_pair_message(num_blocks))
+                + rf": {count} pair\(s\), first ones: \[{first}, ",
             ):
                 run(pool, *_indices(PAIRS))
                 jax.effects_barrier()
+
+
+def _tpu_kernels(program, pool):
+    """Lower `program` for TPU from this host; return the text and each
+    Pallas kernel's name and serialized body."""
+    idx = jax.ShapeDtypeStruct((8,), jnp.int32)
+    lowered = jax.jit(program).trace(pool, idx, idx).lower(lowering_platforms=("tpu",))
+    text = lowered.as_text()
+    kernels = []
+    for config, name in re.findall(
+        r'backend_config = "(.*?)", kernel_name = "(\w+)"', text
+    ):
+        body = re.search(r"body\\22: \\22([A-Za-z0-9+/=]+)", config).group(1)
+        kernels.append((name, base64.b64decode(body)))
+    return text, kernels
+
+
+@pytest.mark.parametrize("program", ["block", "row"])
+def test_on_tpu_the_debug_check_is_in_the_copy_kernel(program):
+    """A host callback made the copy programs fail to compile on TPU. Lowered
+    for TPU, the programs hold only the copy kernel and no callback; with the
+    flag the copy kernel holds the debug check's message, without it not."""
+    if program == "block":
+        run, num_blocks = mamba_state_copy_op._copy_fn, POOL_ROWS
+        pool = jax.ShapeDtypeStruct((POOL_ROWS, 16, 2, 2, 128), jnp.bfloat16)
+    else:
+        run = row_copy_program(num_pools=2, split=2, step_rows=2)
+        num_blocks = POOL_ROWS * 2  # the copy runs on the expanded pool
+        pool = jax.ShapeDtypeStruct((POOL_ROWS, 4, 16, 2, 2, 128), jnp.bfloat16)
+    message = pool_adapters._replaced_pair_message(num_blocks).encode()
+    for flag in (False, True):
+        with pl.enable_debug_checks(flag):
+            text, kernels = _tpu_kernels(run, pool)
+        assert "callback" not in text
+        assert [name for name, _ in kernels] == ["_copy_kernel"]
+        assert (message in kernels[0][1]) == flag

@@ -15,9 +15,11 @@
 
 import contextlib
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import pool_adapters
@@ -114,6 +116,31 @@ def test_copy_blocks_replaces_a_pair_outside_the_pool_by_the_null_pair(mode):
     np.testing.assert_array_equal(after[3], before[2])
     for block in (0, 1, 2):
         np.testing.assert_array_equal(after[block], before[block])
+
+
+def test_copy_blocks_debug_check_raises_on_the_host():
+    """With `pl.enable_debug_checks`, the real kernel under `jax.jit` in
+    Pallas's TPU interpret mode on the host: valid pairs copy as without the
+    flag, and a pair outside the pool raises. The kernel's `pl.debug_check`
+    does nothing in interpret mode; the host callback raises."""
+    pool = _pool()
+    before = np.asarray(pool)
+    copy = jax.jit(pool_adapters.copy_blocks)
+    with (
+        pl.enable_debug_checks(True),
+        pltpu.force_tpu_interpret_mode(pltpu.InterpretParams()),
+    ):
+        after = np.asarray(
+            copy(pool, jnp.asarray([2, 0], jnp.int32), jnp.asarray([3, 0], jnp.int32))
+        )
+        jax.effects_barrier()
+        np.testing.assert_array_equal(after[3], before[2])
+        with pytest.raises(
+            (RuntimeError, jax.errors.JaxRuntimeError),
+            match=r"outside \[0, 4\) replaced by the \(0, 0\) padding pair",
+        ):
+            copy(pool, jnp.asarray([2, NB], jnp.int32), jnp.asarray([3, 1], jnp.int32))
+            jax.effects_barrier()
 
 
 @pytest.mark.tpu_test

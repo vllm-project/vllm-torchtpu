@@ -39,12 +39,14 @@ def row_copy_program(num_pools, split, step_rows):
     return captured["fn"]
 
 
-def numpy_copy_blocks(pool, src, dst):
+def numpy_copy_blocks(pool, src, dst, in_pool=None):
     """`pool[dst[i]] = pool[src[i]]` in NumPy, for indices inside the pool.
 
-    Pair by pair in order, as the kernel's grid runs them, so a later pair
-    reads what an earlier one wrote (a padding pair after a bad write keeps
-    it, instead of restoring the row)."""
+    One pair at a time, in order, each reading the pool as the pairs before
+    it left it. A later padding pair therefore cannot restore a row that a
+    pair the guard let through overwrote, as copying all pairs from the
+    original pool at once could. `in_pool` (the kernel's debug-check input)
+    is ignored."""
     out = np.array(pool)
     for s, d in zip(np.asarray(src).tolist(), np.asarray(dst).tolist()):
         out[d] = out[s]
