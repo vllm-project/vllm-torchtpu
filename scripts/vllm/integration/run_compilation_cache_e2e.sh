@@ -30,13 +30,23 @@
 #            heavy compiled binary payloads.
 #   [Test 3] Warm Start Cache Hit Verification:
 #            Verifies that subsequent inference runs load compiled executables from
-#            cache, significantly reducing total compilation time (WARM < COLD).
+#            cache: after model load the warm run compiles nothing (every
+#            recompilation report shows 0.000s) and its total compilation time
+#            drops (WARM < COLD).
 #   [Test 4] Inference Output Correctness Check (Cold vs Warm):
 #            Verifies that generated prompt text matches 100% between Cold and Warm runs
 #            (deterministic generation with temperature=0).
 #   [Test 5] Tier-3 Binary & MD5 Checksum Consistency Check (Cold vs Warm):
-#            Verifies that Tier-3 binary artifacts exist and maintain 100% identical
-#            MD5 checksums between Cold and Warm runs.
+#            Verifies that Tier-3 binary artifacts exist and that the Warm run
+#            leaves each of them unchanged. The Warm run may add one file for
+#            each program that its model load compiled.
+#
+# Model load is treated apart: there the runtime, not the compilation cache,
+# decides which programs it builds, and its choice differs from run to run.
+#
+# Tests 3 to 5 all run once both runs have finished, so one run reports every
+# failed check. When ARTIFACTS_DIR is set, the verdicts and the Tier-3 file
+# manifests are also written to ${ARTIFACTS_DIR}/compilation_cache_e2e.
 #
 # Usage: ./scripts/vllm/integration/run_compilation_cache_e2e.sh [model_name]
 # Example: ./scripts/vllm/integration/run_compilation_cache_e2e.sh Qwen/Qwen3-0.6B
@@ -44,28 +54,58 @@
 
 set -euo pipefail
 
+# The CI wrapper (.buildkite/kubernetes/run.sh) uploads what it finds under
+# ARTIFACTS_DIR, which it resolves from its own working directory, so resolve
+# the output directory before the cd below.
+ARTIFACTS_OUT=""
+if [[ -n "${ARTIFACTS_DIR:-}" ]]; then
+  ARTIFACTS_OUT="${ARTIFACTS_DIR}/compilation_cache_e2e"
+  [[ "${ARTIFACTS_OUT}" == /* ]] || ARTIFACTS_OUT="${PWD}/${ARTIFACTS_OUT}"
+fi
+
 cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
 
 CACHE_DIR="$(mktemp -d /tmp/compilation_cache_e2e_XXXXXX)"
 mkdir -p "${CACHE_DIR}"
+SUMMARY="${CACHE_DIR}/summary.txt"
+FAILED_CHECKS=0
 
-# Ensure all temporary cache files are deleted when the script finishes or errors out
-cleanup() {
+# Print a verdict and keep it for the summary.
+pass() { echo "✅ $*" | tee -a "${SUMMARY}"; }
+fail() {
+  echo "❌ $*" | tee -a "${SUMMARY}"
+  FAILED_CHECKS=$((FAILED_CHECKS + 1))
+}
+
+# Runs on every exit path. Pod output reaches the Buildkite log in batches about
+# 30 s apart, and what is printed after the last batch is lost. So keep the
+# verdicts as artifacts, and wait for one batch interval before exiting.
+on_exit() {
+  local status=$? name
+  set +e # Nothing below may replace the exit status.
+  echo "Exit status: ${status}" >> "${SUMMARY}"
+  if [[ -n "${ARTIFACTS_OUT}" ]]; then
+    mkdir -p "${ARTIFACTS_OUT}"
+    # A manifest exists only once its run has finished.
+    for name in summary.txt tier3_cold.txt tier3_warm.txt; do
+      [[ -f "${CACHE_DIR}/${name}" ]] && cp "${CACHE_DIR}/${name}" "${ARTIFACTS_OUT}/"
+    done
+  fi
   echo "=== 🧹 Cleaning up temporary compilation cache artifacts... ==="
   rm -rf "${CACHE_DIR}" 2>/dev/null || true
+  sleep 30
 }
-trap cleanup EXIT
+trap on_exit EXIT
 
 # Export public TorchTPU compilation cache configuration
 export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="${CACHE_DIR}/torch_tpu_tier3"
 export VLLM_CACHE_ROOT="${CACHE_DIR}/vllm_cache"
 export VLLM_TARGET_DEVICE="tpu"
 export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
-# Log which graphs each run compiled, so the warm-run log of Test 3 names
-# anything that was recompiled instead of loaded. The flag is in the compiler's
-# _TPU_COMPILE_ENV_IGNORED set, so it does not perturb the Tier-3 binaries that
-# Test 5 checksums.
-export VLLM_XLA_CHECK_RECOMPILATION="${VLLM_XLA_CHECK_RECOMPILATION:-1}"
+# Test 3 reads the recompilation report the runner logs after each precompile
+# case and each step. The flag is in the compiler's _TPU_COMPILE_ENV_IGNORED
+# set, so it does not perturb the Tier-3 binaries that Test 5 checksums.
+export VLLM_XLA_CHECK_RECOMPILATION=1
 
 MODEL="${1:-${MODEL:-Qwen/Qwen3-0.6B}}"
 TIER3_DIR="${TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT}"
@@ -105,14 +145,18 @@ TEST_PROMPT="The capital of France is"
 
 python3 examples/offline_inference.py --model "${MODEL}" \
   --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 \
-  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/cold_run.log"
+  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/cold_run.log" || {
+  status=$?
+  fail "[Test 1 FAILED] Cold run exited with status ${status}!"
+  exit "${status}"
+}
 
 sync && sleep 10
 
 if grep -q "Compiling FX graph" "${CACHE_DIR}/cold_run.log"; then
-  echo "✅ [Test 1 PASSED] Cold run triggered FX graph compilation as expected."
+  pass "[Test 1 PASSED] Cold run triggered FX graph compilation as expected."
 else
-  echo "❌ [Test 1 FAILED] Cold run did not trigger FX graph compilation!"
+  fail "[Test 1 FAILED] Cold run did not trigger FX graph compilation!"
   exit 1
 fi
 
@@ -160,9 +204,9 @@ Category 3 (PyTorch Upstream Dynamo / AOTAutograd Tracing Cache): ${CAT3_SIZE} B
 EOF
 
 if [ "${CAT2_SIZE}" -lt 50000 ]; then
-  echo "✅ [Test 2 PASSED] Optimization verified! Category 2 pickle files total ${CAT2_SIZE} Bytes (< 50KB total, ~100B per graph), eliminating binary duplication!"
+  pass "[Test 2 PASSED] Optimization verified! Category 2 pickle files total ${CAT2_SIZE} Bytes (< 50KB total, ~100B per graph), eliminating binary duplication!"
 else
-  echo "⚠️ [Test 2 WARNING] Category 2 pickle files total ${CAT2_SIZE} Bytes. Binary payload may still be duplicated."
+  echo "⚠️ [Test 2 WARNING] Category 2 pickle files total ${CAT2_SIZE} Bytes. Binary payload may still be duplicated." | tee -a "${SUMMARY}"
 fi
 
 # ==============================================================================
@@ -177,7 +221,11 @@ clean_tpu_processes
 
 python3 examples/offline_inference.py --model "${MODEL}" \
   --max-model-len 256 --max-num-batched-tokens 256 --max-tokens 8 \
-  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/warm_run.log"
+  --prompt "${TEST_PROMPT}" 2>&1 | tee "${CACHE_DIR}/warm_run.log" || {
+  status=$?
+  fail "[Test 3 FAILED] Warm run exited with status ${status}!"
+  exit "${status}"
+}
 
 sync && sleep 10
 
@@ -196,8 +244,8 @@ with open('${CACHE_DIR}/warm_run.log') as f:
 print(f'{sum(times):.2f}' if times else '0.0')
 ")
 
-echo "📊 Total Cold Compilation Time: ${COLD_COMP_TIME}s"
-echo "📊 Total Warm Compilation Time: ${WARM_COMP_TIME}s"
+echo "📊 Total Cold Compilation Time: ${COLD_COMP_TIME}s" | tee -a "${SUMMARY}"
+echo "📊 Total Warm Compilation Time: ${WARM_COMP_TIME}s" | tee -a "${SUMMARY}"
 
 # Assert that warm start compilation completed significantly faster than cold compilation
 IS_FAST=$(python3 -c "
@@ -206,11 +254,45 @@ warm = float('${WARM_COMP_TIME}')
 print(1 if (warm < 15.0 or (warm < cold and warm < cold * 0.75)) else 0)
 " 2>/dev/null || echo "0")
 
-if [ "${IS_FAST}" -eq 1 ]; then
-  echo "✅ [Test 3 PASSED] Warm start confirmed cache hit! (Warm: ${WARM_COMP_TIME}s vs Cold: ${COLD_COMP_TIME}s)"
+# The times above include tracing, so they drop by less than half on a full
+# cache hit and cannot show a single recompiled graph. The runner's reports can:
+# after model load, each precompile case and each step it logs the programs
+# first read since the previous report and the seconds spent compiling them,
+# and a program loaded from a cache costs 0.000s.
+awk '
+  /Total number of cached graphs:/ { case_name = $0; sub(/.*, case: /, "", case_name) }
+  match($0, /[0-9]+ first read since the last check, [0-9.]+s compiling/) {
+    print "   " case_name ": " substr($0, RSTART, RLENGTH)
+  }
+' "${CACHE_DIR}/warm_run.log" > "${CACHE_DIR}/warm_reports.txt"
+
+# Compile time in the load_model report is accepted. The runtime fuses the
+# operations of weight loading into programs of its own, and which ones it
+# builds differs from run to run, so the warm run can need one that the cold
+# run never built. Count these programs: Test 5 accepts one new Tier-3 file for
+# each of them.
+LOAD_COMPILED=$(awk '
+  /Total number of cached graphs:/ { in_load = /, case: load_model$/ }
+  in_load && /graph [0-9]+\/[0-9]+: compilation_duration=/ && !/compilation_duration=0:00:00( |$)/ { compiled++ }
+  END { print compiled + 0 }
+' "${CACHE_DIR}/warm_run.log")
+WARM_REPORTS=$(grep -vc "^   load_model: " "${CACHE_DIR}/warm_reports.txt" || true)
+grep -v -e "^   load_model: " -e " 0\.000s compiling$" "${CACHE_DIR}/warm_reports.txt" > "${CACHE_DIR}/warm_compiles.txt" || true
+
+if grep "^   load_model: " "${CACHE_DIR}/warm_reports.txt" | grep -v " 0\.000s compiling$" > "${CACHE_DIR}/load_compiles.txt"; then
+  echo "ℹ️ Model load of the warm run compiled ${LOAD_COMPILED} program(s), which is accepted:" | tee -a "${SUMMARY}"
+  tee -a "${SUMMARY}" < "${CACHE_DIR}/load_compiles.txt"
+fi
+
+if ! grep -q "case: load_model" "${CACHE_DIR}/warm_run.log" || [ "${WARM_REPORTS}" -eq 0 ]; then
+  fail "[Test 3 FAILED] Warm run logged no recompilation report for model load or after it, so its cache hits cannot be verified!"
+elif [ -s "${CACHE_DIR}/warm_compiles.txt" ]; then
+  fail "[Test 3 FAILED] Warm start compiled instead of loading from the cache:"
+  tee -a "${SUMMARY}" < "${CACHE_DIR}/warm_compiles.txt"
+elif [ "${IS_FAST}" -ne 1 ]; then
+  fail "[Test 3 FAILED] Warm start took too long (${WARM_COMP_TIME}s), indicating cache miss or recompilation!"
 else
-  echo "❌ [Test 3 FAILED] Warm start took too long (${WARM_COMP_TIME}s), indicating cache miss or recompilation!"
-  exit 1
+  pass "[Test 3 PASSED] Warm start confirmed cache hit! (Warm: ${WARM_COMP_TIME}s vs Cold: ${COLD_COMP_TIME}s, ${WARM_REPORTS} recompilation reports at 0.000s)"
 fi
 
 # ==============================================================================
@@ -226,15 +308,11 @@ grep -E "^(Prompt:|Generated text:)" "${CACHE_DIR}/cold_run.log" > "${CACHE_DIR}
 grep -E "^(Prompt:|Generated text:)" "${CACHE_DIR}/warm_run.log" > "${CACHE_DIR}/warm_output.txt" || true
 
 if [ ! -s "${CACHE_DIR}/cold_output.txt" ]; then
-  echo "❌ [Test 4 FAILED] Cold run did not generate any prompt output!"
-  exit 1
-fi
-
-if diff -u "${CACHE_DIR}/cold_output.txt" "${CACHE_DIR}/warm_output.txt"; then
-  echo "✅ [Test 4 PASSED] Warm run generation output 100% matches Cold run (deterministic at temperature=0)!"
+  fail "[Test 4 FAILED] Cold run did not generate any prompt output!"
+elif diff -u "${CACHE_DIR}/cold_output.txt" "${CACHE_DIR}/warm_output.txt" | tee -a "${SUMMARY}"; then
+  pass "[Test 4 PASSED] Warm run generation output 100% matches Cold run (deterministic at temperature=0)!"
 else
-  echo "❌ [Test 4 FAILED] Warm run generation output differs from Cold run!"
-  exit 1
+  fail "[Test 4 FAILED] Warm run generation output differs from Cold run!"
 fi
 
 if [[ -d "${TIER3_DIR}" ]]; then
@@ -251,15 +329,24 @@ fi
 echo "================================================================="
 echo "=== 🔍 [Test 5] Cache File & MD5 Consistency Check (Cold vs Warm)"
 echo "================================================================="
+# The files of the cold run that the warm run changed or removed, and how many
+# files it added. Both manifests are sorted.
+comm -23 "${CACHE_DIR}/tier3_cold.txt" "${CACHE_DIR}/tier3_warm.txt" > "${CACHE_DIR}/tier3_lost.txt"
+TIER3_ADDED=$(comm -13 "${CACHE_DIR}/tier3_cold.txt" "${CACHE_DIR}/tier3_warm.txt" | wc -l)
+
 if [ ! -s "${CACHE_DIR}/tier3_cold.txt" ]; then
-  echo "❌ [Test 5 FAILED] No Tier-3 binary cache files were generated!"
-  exit 1
+  fail "[Test 5 FAILED] No Tier-3 binary cache files were generated!"
+elif diff -u "${CACHE_DIR}/tier3_cold.txt" "${CACHE_DIR}/tier3_warm.txt" | tee -a "${SUMMARY}"; then
+  pass "[Test 5 PASSED] Tier-3 cache files and MD5sums are 100% identical between Cold and Warm runs!"
+elif [ -s "${CACHE_DIR}/tier3_lost.txt" ]; then
+  fail "[Test 5 FAILED] Tier-3 cache files or MD5sums changed between Cold and Warm runs!"
+elif [ "${TIER3_ADDED}" -gt "${LOAD_COMPILED}" ]; then
+  fail "[Test 5 FAILED] Warm run added ${TIER3_ADDED} Tier-3 cache file(s), but its model load compiled ${LOAD_COMPILED} program(s)!"
+else
+  pass "[Test 5 PASSED] Warm run left the Tier-3 cache files of the Cold run unchanged and added ${TIER3_ADDED} for the program(s) that its model load compiled."
 fi
 
-if diff -u "${CACHE_DIR}/tier3_cold.txt" "${CACHE_DIR}/tier3_warm.txt"; then
-  echo "✅ [Test 5 PASSED] Tier-3 cache files and MD5sums are 100% identical between Cold and Warm runs!"
-else
-  echo "❌ [Test 5 FAILED] Tier-3 cache files or MD5sums changed between Cold and Warm runs!"
+if [ "${FAILED_CHECKS}" -ne 0 ]; then
   exit 1
 fi
 
