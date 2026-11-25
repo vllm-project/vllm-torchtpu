@@ -1830,3 +1830,24 @@ def test_check_and_update_config_preserves_programmatic_ep_weight_filter(
     vllm_config = _make_ep_filter_vllm_config(enable_ep_weight_filter=initial_filter)
     TpuPlatform.check_and_update_config(vllm_config)
     assert vllm_config.parallel_config.enable_ep_weight_filter is initial_filter
+
+
+def test_model_directory_kv_connector_is_registered_by_name(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+
+    from vllm_torchtpu.platforms import tpu_platform
+
+    monkeypatch.setattr(tpu_platform, "_MODEL_KV_CONNECTORS", {})
+    monkeypatch.setattr(tpu_platform, "_tpu_kv_connectors_registered", False)
+    calls = []
+    monkeypatch.setattr(
+        KVConnectorFactory,
+        "register_connector",
+        classmethod(lambda cls, name, path, cname: calls.append((name, path))),
+    )
+    tpu_platform.register_tpu_kv_connector("FooConnector", "pkg.foo")
+    tpu_platform.register_tpu_kv_connector("FooConnector", "pkg.foo")  # same: ok
+    with pytest.raises(ValueError):
+        tpu_platform.register_tpu_kv_connector("FooConnector", "pkg.other")
+    tpu_platform._register_tpu_kv_connectors()
+    assert ("FooConnector", "pkg.foo") in calls
