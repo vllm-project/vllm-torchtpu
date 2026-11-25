@@ -16,8 +16,9 @@ BigQuery. Exits nonzero if any insert fails; --dry-run prints the SQL
 without executing it.
 
 --prefill-chips and --decode-chips state the physical chips of the two
-engine pools. With them the row carries throughput per chip, over their sum,
-and both counts in its config."""
+engine pools. With them the row carries both counts in its config and
+per-chip throughput (output over decode chips, input over prefill chips,
+and total over their sum)."""
 
 import argparse
 import json
@@ -119,7 +120,9 @@ def parse_and_upload(
                 config_dict["decode_chips"] = decode_chips
 
             metrics = [("vllm_bench", bq_utils.extract_bench_metrics(data))]
-            derived = bench_metrics.bench_derived_metrics(data, chips)
+            derived = bench_metrics.bench_derived_metrics(
+                data, prefill_chips=prefill_chips, decode_chips=decode_chips
+            )
             if derived:
                 metrics.append(("derived", derived))
 

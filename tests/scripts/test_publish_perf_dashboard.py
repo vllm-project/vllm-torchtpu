@@ -28,7 +28,7 @@ _SCRIPT = (
     / "publish_perf_dashboard.py"
 )
 # The script is run as a script, so it imports its sibling bench_metrics.
-# Scope sys.path mutation to module load so later test files are unaffected.
+# Restore sys.path after module load.
 _BENCHMARKING_STR = str(_SCRIPT.parent)
 _added_path = _BENCHMARKING_STR not in sys.path
 if _added_path:

@@ -336,12 +336,12 @@ def test_gke_row_counts_both_pools_of_the_disaggregated_fleet(tmp_path, capsys):
             "metrics": {
                 "vllm_bench": _GKE_ROW["metrics"]["vllm_bench"],
                 "derived": {
-                    # The output and total tok/s above on 6 + 2 chips; input
-                    # is their difference.
+                    # Output over decode chips (2), input over prefill chips
+                    # (6), and total over both pools (6 + 2 = 8).
                     "num_chips": 8,
-                    "output_tput_per_chip": 76.49350026437416,
+                    "output_tput_per_chip": 305.97400105749665,
                     "total_tput_per_chip": 4972.07751718432,
-                    "input_tput_per_chip": 4895.5840169199455,
+                    "input_tput_per_chip": 6527.445355893261,
                     **_GKE_ROW["metrics"]["derived"],
                 },
             },
@@ -466,13 +466,14 @@ def test_gke_ttft_cell_with_the_manifest_chips_derives_only_per_chip_throughput(
             **_GKE_TTFT_ROW,
             "metrics": {
                 "vllm_bench": _GKE_TTFT_BENCH,
-                # The output and total tok/s above on 4 + 4 chips; input is
-                # their difference. No *_intvty: the cell has no TPOT.
+                # Output over decode chips (4), input over prefill chips (4),
+                # and total over both pools (4 + 4 = 8). No *_intvty: the cell
+                # has no TPOT.
                 "derived": {
                     "num_chips": 8,
-                    "output_tput_per_chip": 0.0578502992006932,
+                    "output_tput_per_chip": 0.1157005984013864,
                     "total_tput_per_chip": 3791.33505871583,
-                    "input_tput_per_chip": 3791.2772084166295,
+                    "input_tput_per_chip": 7582.554416833259,
                 },
             },
             "config": {
@@ -523,6 +524,28 @@ def test_derived_metrics_ignores_non_finite_values_and_invalid_chips():
     )
     assert (
         bench_metrics.derived_metrics(chips=True, output_tput=100.0, total_tput=200.0)
+        == {}
+    )
+    assert (
+        bench_metrics.derived_metrics(
+            prefill_chips=4, output_tput=100.0, total_tput=200.0
+        )
+        == {}
+    )
+    assert (
+        bench_metrics.derived_metrics(
+            prefill_chips=4, decode_chips=0, output_tput=100.0, total_tput=200.0
+        )
+        == {}
+    )
+    assert (
+        bench_metrics.derived_metrics(
+            chips=10,
+            prefill_chips=4,
+            decode_chips=4,
+            output_tput=100.0,
+            total_tput=200.0,
+        )
         == {}
     )
 

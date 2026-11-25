@@ -31,6 +31,13 @@ def _number(value) -> float | None:
     return value
 
 
+def _positive_int(value) -> int | None:
+    """`value` when it is a positive integer (excluding bool), else None."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
 def physical_chips(chips=None, prefill_chips=None, decode_chips=None) -> int | None:
     """Physical accelerator chips serving a run, or None when not stated.
 
@@ -43,9 +50,7 @@ def physical_chips(chips=None, prefill_chips=None, decode_chips=None) -> int | N
         ("prefill_chips", prefill_chips),
         ("decode_chips", decode_chips),
     ):
-        if value is not None and (
-            isinstance(value, bool) or not isinstance(value, int) or value <= 0
-        ):
+        if value is not None and _positive_int(value) is None:
             raise ValueError(f"{name} must be a positive integer, got {value!r}")
     if (prefill_chips is None) != (decode_chips is None):
         raise ValueError(
@@ -67,9 +72,21 @@ def interactivity(tpot_ms) -> float | None:
 
 
 def derived_metrics(
-    *, chips=None, output_tput=None, total_tput=None, tpot_ms=None
+    *,
+    chips=None,
+    prefill_chips=None,
+    decode_chips=None,
+    output_tput=None,
+    total_tput=None,
+    tpot_ms=None,
 ) -> dict:
     """The `derived` element: throughput per physical chip and interactivity.
+
+    For an aggregated run (`chips` only), all three throughputs divide by
+    `chips`. For a disaggregated run (`prefill_chips` and `decode_chips`),
+    output throughput divides by `decode_chips`, input throughput divides by
+    `prefill_chips`, and total throughput divides by their sum, matching
+    InferenceX's per-GPU formulas.
 
     `tpot_ms` maps a statistic name (median, p90, p99) to that statistic of
     the time per output token; each becomes "<stat>_intvty", so p90_intvty is
@@ -80,15 +97,34 @@ def derived_metrics(
     out = {}
     output_tput = _number(output_tput)
     total_tput = _number(total_tput)
-    if isinstance(chips, int) and not isinstance(chips, bool) and chips > 0:
+    total_chips = None
+    prefill_denom = None
+    decode_denom = None
+    if prefill_chips is not None or decode_chips is not None:
+        p = _positive_int(prefill_chips)
+        d = _positive_int(decode_chips)
+        if (
+            p is not None
+            and d is not None
+            and (chips is None or _positive_int(chips) == p + d)
+        ):
+            total_chips = p + d
+            prefill_denom = p
+            decode_denom = d
+    else:
+        total_chips = _positive_int(chips)
+        prefill_denom = total_chips
+        decode_denom = total_chips
+
+    if total_chips is not None:
         if output_tput is not None:
-            out["output_tput_per_chip"] = output_tput / chips
+            out["output_tput_per_chip"] = output_tput / decode_denom
         if total_tput is not None:
-            out["total_tput_per_chip"] = total_tput / chips
+            out["total_tput_per_chip"] = total_tput / total_chips
         if output_tput is not None and total_tput is not None:
-            out["input_tput_per_chip"] = (total_tput - output_tput) / chips
+            out["input_tput_per_chip"] = (total_tput - output_tput) / prefill_denom
         if out:
-            out = {"num_chips": chips, **out}
+            out = {"num_chips": total_chips, **out}
     for stat, value in (tpot_ms or {}).items():
         intvty = interactivity(value)
         if intvty is not None:
@@ -96,10 +132,14 @@ def derived_metrics(
     return out
 
 
-def bench_derived_metrics(data: dict, chips=None) -> dict:
+def bench_derived_metrics(
+    data: dict, chips=None, *, prefill_chips=None, decode_chips=None
+) -> dict:
     """derived_metrics for a `vllm bench serve` payload."""
     return derived_metrics(
         chips=chips,
+        prefill_chips=prefill_chips,
+        decode_chips=decode_chips,
         output_tput=data.get("output_throughput"),
         total_tput=data.get("total_token_throughput"),
         tpot_ms={

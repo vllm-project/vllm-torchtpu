@@ -63,6 +63,7 @@ def _check_args(tmp_path, *args) -> tuple[int, str]:
 def test_chip_flags_are_both_absent_or_both_positive_integers(
     tmp_path, args, forwarded
 ):
+    """Checks --check-args flag validation and formatted chip_args output."""
     assert _check_args(tmp_path, *args) == (
         0,
         f"Arguments are valid; parse_gke_results.py gets: {forwarded}\n",
