@@ -45,7 +45,10 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_attention
 # better; the accumulators are two WINDOW * H x D f32 arrays in VMEM.
 WINDOW = 1024
 # Token block widths: a page's run of pairs is cut into blocks of at most
-# the widest, and each block runs at the narrowest width holding it.
+# the widest, and a unit runs its blocks at the narrowest width holding its
+# widest one. Ordering a window's blocks by width (so a unit's blocks share
+# one) was -5 % at uniform selections, -18 % at moderately local ones and
+# +2-7 % on hot page sets, the extra sort included (j-2dbcc496).
 _WIDTHS = (8, 16, 24, 32)
 # Blocks a loop step runs side by side (`unit`). Op replay, 4,096 rows x 16
 # heads, us: 1891 / 1502 / 1163 / 1022 for 1 / 2 / 4 / 8 (uniform
