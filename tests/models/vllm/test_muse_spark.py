@@ -1272,6 +1272,21 @@ def test_causal_lm_rejects_unsupported_setups(text_stack, overrides, message):
         text_stack.MuseSparkForCausalLM(vllm_config=vllm_config)
 
 
+def test_causal_lm_rejects_silu_bf16_reference_parity(text_stack, monkeypatch):
+    """The expert rows run SiLU outside gmm_v2, so they cannot round it the
+    way additional_config["tpu_moe_silu_bf16"] asks."""
+    from vllm_torchtpu.moe_reference_parity import MoEReferenceParity
+
+    monkeypatch.setattr(
+        text_stack,
+        "get_moe_reference_parity",
+        lambda _: MoEReferenceParity(silu_bf16=True),
+    )
+    vllm_config = _text_vllm_config(_text_config())
+    with pytest.raises(ValueError, match="tpu_moe_silu_bf16"):
+        text_stack.MuseSparkForCausalLM(vllm_config=vllm_config)
+
+
 def test_causal_lm_rejects_expert_count_not_divisible_by_ep(text_stack, monkeypatch):
     monkeypatch.setattr(
         text_stack,

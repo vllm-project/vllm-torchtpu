@@ -48,7 +48,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_dp_group,
     get_ep_group,
@@ -84,11 +84,16 @@ from vllm_torchtpu.layers.adapter.custom_ops.fp32_matmul_op import (
     prebuild_fp32_matmul_op,
 )
 from vllm_torchtpu.layers.adapter.fused_moe import (
+    TpuMoEActivationMixin,
     fused_moe_gmm,
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
+from vllm_torchtpu.moe_reference_parity import (
+    SILU_BF16_KEY,
+    get_moe_reference_parity,
+)
 
 from .layers import (
     MuseRMSNorm,
@@ -177,6 +182,7 @@ def _expert_rows(
     """Unweighted rows [tokens, top_k, hidden] from this rank's experts."""
     layer = cast("TpuRoutedExperts", experts)
     if x.device.type == "tpu":
+        method = cast(TpuMoEActivationMixin, layer.quant_method)
         # NVFP4 experts are native FP4 with FP32 block scales; BF16 has none.
         scaled = layer.w13_weight.dtype == torch.float4_e2m1fn_x2
         return fused_moe_gmm(
@@ -192,6 +198,7 @@ def _expert_rows(
             layer._experts_start,
             topk=ids.shape[-1],
             activation="silu",
+            topk_weights_float32=method._tpu_topk_weights_float32,
             return_rows=True,
         )
     # The CPU reference reads the checkpoint layout: packed uint8 rows with
@@ -286,8 +293,18 @@ class MuseMoE(nn.Module):
         )
         # Build the router and rows ops outside torch.compile tracing.
         prebuild_fp32_matmul_op()
+        parity = get_moe_reference_parity(get_current_vllm_config_or_none())
+        if parity.silu_bf16:
+            raise ValueError(
+                "Muse TPU expert rows run SiLU in FP32 between the two GEMMs; "
+                f"additional_config[{SILU_BF16_KEY!r}] is not supported"
+            )
         prebuild_fused_moe_kernel(
-            topk=self.top_k, activation="silu", use_ep=use_ep, return_rows=True
+            topk=self.top_k,
+            activation="silu",
+            use_ep=use_ep,
+            topk_weights_float32=parity.topk_weights_float32,
+            return_rows=True,
         )
 
     def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
