@@ -9337,7 +9337,11 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("compute_logits_from_hidden_states"):
+        # Served from execute_model's no_grad; dynamo guards on grad mode.
+        with (
+            self._precompile_timed("compute_logits_from_hidden_states"),
+            torch.no_grad(),
+        ):
             for num_reqs in self.num_reqs_paddings:
                 dummy_hidden = torch.zeros(
                     (num_reqs, hsize),
@@ -9354,7 +9358,9 @@ class TPUModelRunner(GPUModelRunner):
         if self._greedy_head_owner is None:
             return
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("compute_selected_top_tokens"):
+        # Both programs are served from execute_model's no_grad, and dynamo
+        # guards on grad mode: warmed outside it, every entry would miss.
+        with self._precompile_timed("compute_selected_top_tokens"), torch.no_grad():
             for num_tokens in self.num_tokens_paddings:
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
@@ -9370,7 +9376,10 @@ class TPUModelRunner(GPUModelRunner):
             self
         ).uses_selected_logits_hidden_states:
             return
-        with self._precompile_timed("compute_top_tokens_from_hidden_states"):
+        with (
+            self._precompile_timed("compute_top_tokens_from_hidden_states"),
+            torch.no_grad(),
+        ):
             for num_reqs in self.num_reqs_paddings:
                 dummy_hidden = torch.zeros(
                     (num_reqs, hsize),
@@ -10963,6 +10972,9 @@ class TPUModelRunner(GPUModelRunner):
             min(self._bucket_len(n), max(n, self.max_num_reqs))
             for n in range(1, self.max_num_reqs + 1)
         }
+        # Not under no_grad: the one caller (`_copy_spec_boundary_states`)
+        # runs in sample_tokens, which keeps grad mode on, and dynamo guards
+        # on grad mode.
         with self._precompile_timed("mamba boundary-state pairs"):
             for n in sorted(sizes):
                 entries = torch.zeros((n, num_cols), dtype=torch.int32).to(self.device)
