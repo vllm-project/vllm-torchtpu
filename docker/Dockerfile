@@ -191,8 +191,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       -r pyproject.toml \
       --group vllm \
       --group test \
-      --extra benchmarking \
-      --extra multimodal
+      --extra benchmarking
 
 COPY . .
 
