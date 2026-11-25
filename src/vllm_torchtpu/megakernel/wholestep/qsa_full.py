@@ -167,6 +167,8 @@ class QSAFullBlock(Block):
             ):  # head-major -> [MB, nh, HD] by static single-row stores
                 scr["qf_q"][r, h : h + 1, :] = q[r : r + 1]
                 scr["qf_g"][r, h : h + 1, :] = gt[r : r + 1]
+            if "qf_gh" in scr:  # head-major gates (`_dcp_combine`)
+                scr["qf_gh"][h] = gt
         k0 = 2 * nh * hd
         k = rmsnorm(y[:, k0 : k0 + hd], kn, g.eps, zero_centered=True)
         scr["qf_kv"][:, :hd] = main_rope(k, cos, sin, rot).astype(BF16)
