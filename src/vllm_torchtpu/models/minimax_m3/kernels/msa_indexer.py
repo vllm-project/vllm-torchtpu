@@ -1275,5 +1275,9 @@ def block_scores_and_write(
         write=(write, run_seq, run_block, target)
     )
     pages = max(small.shape[1], plan.large_pages)
-    rows = small[small_col]
+    num_tokens = index_q.shape[0]
+    if num_tokens * small.shape[0] <= _SELECT_ROWS_MAX:
+        rows = _select_rows(small, small_col)
+    else:
+        rows = small[small_col]
     return jnp.pad(rows, ((0, 0), (0, pages - rows.shape[1])))[:, None, :], caches
