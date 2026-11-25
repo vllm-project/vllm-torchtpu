@@ -801,6 +801,141 @@ def test_fused_moe_global_id_remap_masks_out_of_range():
     )
 
 
+def _row_count_inputs(num_tokens, num_valid, seed=0):
+    """Local MoE inputs (16 experts, hidden 2048, top-8) with padded rows.
+
+    Rows ``[num_valid, num_tokens)`` are padding: their hidden states are
+    perturbed and their routing weights stay non-zero, so only the row count
+    can exclude them. Real row 0 carries a zero gate, which stock dispatch
+    keeps.
+    """
+    num_experts, hidden_size, intermediate_size, topk = 16, 2048, 768, 8
+    hk, pk, w1k, w2k, gk = jax.random.split(jax.random.key(seed), 5)
+    real = jax.random.normal(hk, (num_tokens, hidden_size), dtype=jnp.float32) / 10
+    perturbed = jax.random.normal(pk, (num_tokens, hidden_size), dtype=jnp.float32) * 5
+    is_padding = jnp.arange(num_tokens)[:, None] >= num_valid
+    hidden_states = jnp.where(is_padding, perturbed, real).astype(jnp.bfloat16)
+    w1 = (
+        jax.random.normal(
+            w1k, (num_experts, hidden_size, intermediate_size * 2), dtype=jnp.float32
+        )
+        / 10
+    ).astype(jnp.bfloat16)
+    w2 = (
+        jax.random.normal(
+            w2k, (num_experts, intermediate_size, hidden_size), dtype=jnp.float32
+        )
+        / 10
+    ).astype(jnp.bfloat16)
+    # Distinct experts per row: (row + 2 * slot) % 16 over the 8 slots.
+    rows = jnp.arange(num_tokens, dtype=jnp.int32)[:, None]
+    topk_ids = (rows + 2 * jnp.arange(topk, dtype=jnp.int32)[None, :]) % num_experts
+    topk_weights = jax.random.uniform(gk, (num_tokens, topk), minval=0.05, maxval=0.3)
+    if num_valid > 0:
+        topk_weights = topk_weights.at[0, 0].set(0.0)
+    return hidden_states, w1, w2, topk_weights, topk_ids, topk
+
+
+def _run_row_count(hidden_states, w1, w2, topk_weights, topk_ids, topk, num_valid):
+    # row_info goes in positionally after experts_start, as the custom op
+    # passes it.
+    return fused_moe_func(
+        hidden_states,
+        w1,
+        w2,
+        None,
+        None,
+        None,
+        None,
+        topk_weights,
+        topk_ids,
+        None,
+        jnp.array([num_valid], dtype=jnp.int32),
+        topk=topk,
+        activation="silu",
+        skip_padded_tokens=True,
+    )
+
+
+def _check_row_count_output(row_count, stock, num_valid):
+    row_count, stock = np.asarray(row_count), np.asarray(stock)
+    np.testing.assert_array_equal(row_count[:num_valid], stock[:num_valid])
+    np.testing.assert_array_equal(
+        row_count[num_valid:], np.zeros_like(row_count[num_valid:])
+    )
+    if num_valid < stock.shape[0]:
+        # The padded rows produce output on the stock path, so a filter that
+        # kept them would fail the check above.
+        assert np.abs(stock[num_valid:].astype(np.float32)).max() > 0
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "num_tokens,num_valid", [(16, 0), (16, 1), (16, 9), (16, 16), (32, 17)]
+)
+def test_fused_moe_row_count_matches_stock_on_real_rows(num_tokens, num_valid):
+    """The row-count filter leaves real rows bit-identical to stock and drops
+    the padded rows, whose gates are non-zero."""
+    _require_tpu()
+    hidden_states, w1, w2, topk_weights, topk_ids, topk = _row_count_inputs(
+        num_tokens, num_valid
+    )
+    stock = fused_moe_func(
+        hidden_states,
+        w1,
+        w2,
+        None,
+        None,
+        None,
+        None,
+        topk_weights,
+        topk_ids,
+        topk=topk,
+        activation="silu",
+    )
+    row_count = _run_row_count(
+        hidden_states, w1, w2, topk_weights, topk_ids, topk, num_valid
+    )
+    _check_row_count_output(row_count, stock, num_valid)
+
+
+@pytest.mark.tpu_test
+def test_fused_moe_row_count_skips_dense_expert_path(monkeypatch):
+    """With the dense-expert decode path admitted, the row-count filter still
+    takes the routed path, the only one that applies it."""
+    _require_tpu()
+    num_tokens, num_valid = 8, 5
+    hidden_states, w1, w2, topk_weights, topk_ids, topk = _row_count_inputs(
+        num_tokens, num_valid
+    )
+    stock = fused_moe_func(
+        hidden_states,
+        w1,
+        w2,
+        None,
+        None,
+        None,
+        None,
+        topk_weights,
+        topk_ids,
+        topk=topk,
+        activation="silu",
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("the row-count filter took the dense-expert path")
+
+    monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 1024)
+    monkeypatch.setattr(fused_moe_gmm, "can_use_dense_expert", lambda *a, **k: True)
+    monkeypatch.setattr(fused_moe_gmm, "dense_expert_moe", forbidden)
+    # The path is chosen at trace time; drop traces cached without the patch.
+    jax.clear_caches()
+    row_count = _run_row_count(
+        hidden_states, w1, w2, topk_weights, topk_ids, topk, num_valid
+    )
+    _check_row_count_output(row_count, stock, num_valid)
+
+
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("owner_output_mode", ["off", "on"])
 def test_fused_moe_onehot_path_keeps_nan_token_local(owner_output_mode):
