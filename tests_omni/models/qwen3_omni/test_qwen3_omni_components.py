@@ -27,6 +27,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder as HfQwen3OmniMoeAudioEncoder,
 )
+from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3Omni_VisionTransformer,
     Qwen3OmniMoeAudioEncoder,
@@ -36,6 +37,7 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
 from tests_omni.omni_test_utils import (
     assert_all_loaded,
     assert_parity,
+    build_qwen3_omni_thinker_stub,
     init_test_weights,
     isolate_thinker_patch_targets,
     native_ops_on_cpu,
@@ -44,8 +46,10 @@ from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _padded_audio_forward,
     maybe_patch_qwen3_omni_thinker,
 )
+from vllm_torchtpu.omni.worker.tpu_ar_model_runner import TPUARModelRunner
 
 pytestmark = [pytest.mark.omni]
+
 
 AUDIO_CONFIG = Qwen3OmniMoeAudioEncoderConfig(
     num_mel_bins=128,
@@ -298,3 +302,103 @@ def test_vision_encoder_matches_cpu_reference(encoders, grid: list[list[int]]) -
         max_rel_l2=VISION_LIMITS[0],
         max_abs=VISION_LIMITS[1],
     )
+
+
+@pytest.mark.parametrize(
+    ("input_ids_list", "vis_positions", "aud_positions", "vis_modality"),
+    [
+        pytest.param(
+            [1, 10, 10, 11, 10, 11, 2, 3],
+            [1, 2, 4],
+            [3, 5],
+            "video",
+            id="interleaved_video_audio",
+        ),
+        pytest.param(
+            [1, 12, 12, 2, 11, 11, 3, 4],
+            [1, 2],
+            [4, 5],
+            "image",
+            id="non_interleaved_image_audio",
+        ),
+    ],
+)
+@torch.no_grad()
+def test_multimodal_merge_and_embed_input_ids_on_tpu(
+    encoders,
+    input_ids_list: list[int],
+    vis_positions: list[int],
+    aud_positions: list[int],
+    vis_modality: str,
+) -> None:
+    """Verify runner mixed-dim slicing, embed_input_ids, and DeepStack clear on TPU."""
+    del encoders
+    tpu_dev = torch.device("tpu")
+    hidden_size, deepstack_layers = 16, 2
+    num_tokens = len(input_ids_list)
+    vis_width = hidden_size * (1 + deepstack_layers)
+
+    input_ids_cpu = torch.tensor(input_ids_list, dtype=torch.long)
+    is_mm_cpu = torch.zeros(num_tokens, dtype=torch.bool)
+    is_mm_cpu[vis_positions + aud_positions] = True
+    vis_cpu = torch.arange(len(vis_positions) * vis_width, dtype=torch.float32).reshape(
+        len(vis_positions), vis_width
+    )
+    aud_cpu = torch.arange(
+        100, 100 + len(aud_positions) * hidden_size, dtype=torch.float32
+    ).reshape(len(aud_positions), hidden_size)
+
+    thinker = build_qwen3_omni_thinker_stub(
+        hidden_size=hidden_size,
+        deepstack_layers=deepstack_layers,
+        max_tokens=num_tokens,
+        device=tpu_dev,
+    )
+    for buf in thinker.deepstack_input_embeds:
+        buf.fill_(99.0)
+    thinker.deepstack_input_embeds_num_tokens = num_tokens
+
+    runner = TPUARModelRunner.__new__(TPUARModelRunner)
+    runner.supports_mm_inputs = True
+    runner.model = thinker
+    runner._omni_mm_embeds_list = [
+        set_mm_embedding_modality(vis_cpu.to(tpu_dev), vis_modality),
+        set_mm_embedding_modality(aud_cpu.to(tpu_dev), "audio"),
+    ]
+    row_indices = torch.arange(len(vis_positions) + len(aud_positions))
+    out_ids, merged_tpu = runner._get_model_inputs(
+        input_ids_cpu.to(tpu_dev), ([row_indices], is_mm_cpu[:-2])
+    )
+
+    expected_main = input_ids_cpu.float().unsqueeze(-1).expand(-1, hidden_size) * 0.1
+    expected_main = expected_main.clone()
+    expected_main[vis_positions] = vis_cpu[:, :hidden_size]
+    expected_main[aud_positions] = aud_cpu
+    assert (
+        out_ids is None and merged_tpu is not None and merged_tpu.device.type == "tpu"
+    )
+    assert torch.allclose(merged_tpu.cpu(), expected_main)
+    assert thinker.deepstack_input_embeds_num_tokens == num_tokens
+    for layer_idx in range(deepstack_layers):
+        expected_ds = torch.zeros((num_tokens, hidden_size))
+        c = (layer_idx + 1) * hidden_size
+        expected_ds[vis_positions] = vis_cpu[:, c : c + hidden_size]
+        assert torch.allclose(
+            thinker.deepstack_input_embeds[layer_idx][:num_tokens].cpu(), expected_ds
+        )
+
+    # Follow-up text-only step clears stale DeepStack buffers.
+    runner._omni_mm_embeds_list = None
+    text_ids = torch.arange(1, num_tokens + 1, dtype=torch.long)
+    _, text_out = runner._get_model_inputs(
+        text_ids.to(tpu_dev), ([], torch.zeros(num_tokens, dtype=torch.bool))
+    )
+    assert text_out is not None
+    assert torch.allclose(
+        text_out.cpu(), text_ids.float().unsqueeze(-1).expand(-1, hidden_size) * 0.1
+    )
+    assert thinker.deepstack_input_embeds_num_tokens == 0
+    for buf in thinker.deepstack_input_embeds:
+        assert torch.equal(
+            buf[:num_tokens].cpu(), torch.zeros((num_tokens, hidden_size))
+        )

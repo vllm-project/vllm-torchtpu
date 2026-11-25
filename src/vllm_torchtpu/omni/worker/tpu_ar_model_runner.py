@@ -13,9 +13,11 @@
 # limitations under the License.
 """TPU model runner for autoregressive vLLM-Omni stages."""
 
+from collections.abc import Sequence
 from typing import Any
 
 import torch
+from vllm.multimodal.utils import copy_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
@@ -27,12 +29,59 @@ from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     maybe_patch_qwen3_omni_thinker,
 )
 from vllm_torchtpu.omni.worker.tpu_model_runner import OmniTPUModelRunner
+from vllm_torchtpu.utils import synchronize_tensors
 
 # Model capability flags that ``GPUARModelRunner`` reads (through
 # ``_model_omni_flag``) to drive the per-step preprocess / postprocess hooks.
 # vLLM-Omni models set them in ``__init__``: the Qwen3-Omni thinker sets both
 # to False, the talker sets both to True.
 _UNSUPPORTED_HOOK_FLAGS = ("has_preprocess", "has_postprocess")
+
+
+def _slice_mm_embeds_by_row_indices(
+    mm_embeds: Sequence[torch.Tensor],
+    row_indices: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Slice ``mm_embeds`` across a contiguous 1D range of concatenated rows.
+
+    Preserves each item's feature width and ``.modality`` attribute across
+    chunk boundaries without concatenating mixed-dimension tensors.
+    """
+    if row_indices.ndim != 1:
+        raise ValueError(
+            f"Expected 1D row_indices, got shape {tuple(row_indices.shape)}."
+        )
+    if row_indices.numel() == 0:
+        return []
+
+    total_rows = sum(int(emb.shape[0]) for emb in mm_embeds)
+    start = int(row_indices[0].item())
+    end = int(row_indices[-1].item()) + 1
+    if start < 0 or end > total_rows or end - start != row_indices.numel():
+        raise ValueError(
+            f"row_indices span [{start}, {end}) (len={row_indices.numel()}) "
+            f"is invalid for {total_rows} cached multimodal embedding rows."
+        )
+    expected = torch.arange(
+        start, end, dtype=row_indices.dtype, device=row_indices.device
+    )
+    if not torch.equal(row_indices, expected):
+        raise ValueError(
+            f"row_indices must be a contiguous ascending range [{start}, {end})."
+        )
+
+    result: list[torch.Tensor] = []
+    offset = 0
+    for emb in mm_embeds:
+        n = int(emb.shape[0])
+        item_start, item_end = offset, offset + n
+        offset = item_end
+        if item_end <= start or item_start >= end:
+            continue
+        sliced = emb[max(0, start - item_start) : min(n, end - item_start)]
+        copy_mm_embedding_modality(emb, sliced)
+        result.append(sliced)
+    return result
 
 
 class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
@@ -59,6 +108,7 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._omni_mm_embeds_list: list[torch.Tensor] | None = None
         if needs_omni_connector(self.model_config):
             raise NotImplementedError(
                 f"Stage {self.stage_id} ({self.model_stage!r}) needs inter-stage Omni "
@@ -93,6 +143,86 @@ class TPUARModelRunner(OmniTPUModelRunner, OmniConnectorModelRunnerMixin):
                 "talker's multi-token prediction), which TPUARModelRunner does not "
                 "run yet."
             )
+
+    # TODO: retire the row-index proxy (_gather_mm_embeddings / _get_model_inputs /
+    # execute_model cleanup) once core TPUModelRunner.execute_model slices
+    # list[torch.Tensor] per chunk without concatenating via torch.cat.
+    def execute_model(
+        self,
+        scheduler_output: Any,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> Any:
+        """Run one step and always release cached per-item multimodal embeddings."""
+        try:
+            return super().execute_model(
+                scheduler_output, intermediate_tensors=intermediate_tensors
+            )
+        finally:
+            self._omni_mm_embeds_list = None
+
+    def _gather_mm_embeddings(
+        self,
+        scheduler_output: Any,
+        shift_computed_tokens: int = 0,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Gather multimodal embeddings without concatenating mixed feature widths.
+
+        Upstream: ``GPUModelRunner._gather_mm_embeddings`` (called from
+        ``TPUModelRunner.execute_model``).
+        Stayed the same: delegates encoder lookup, caching, and placeholder
+        masking (``mm_embeds``, ``is_mm_embed``) to ``super()._gather_mm_embeddings``.
+        Adapted for TPU: caches ``mm_embeds`` (which mix DeepStack vision
+        tensors and audio tensors of different widths) in
+        ``self._omni_mm_embeds_list`` and returns a 1D row-index range
+        ``[torch.arange(total_rows)]`` so ``TPUModelRunner.execute_model``'s
+        ``torch.cat`` and per-chunk slicing operate on uniform 1D indices while
+        ``_get_model_inputs`` reconstructs each item with its ``.modality`` tag.
+        """
+        mm_embeds, is_mm_embed = super()._gather_mm_embeddings(
+            scheduler_output, shift_computed_tokens
+        )
+        if not mm_embeds:
+            self._omni_mm_embeds_list = None
+            return [], is_mm_embed
+        self._omni_mm_embeds_list = list(mm_embeds)
+        total_rows = sum(int(e.shape[0]) for e in mm_embeds)
+        return [torch.arange(total_rows, dtype=torch.long)], is_mm_embed
+
+    def _get_model_inputs(
+        self,
+        input_ids: torch.Tensor,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Resolve 1D row-index ranges and guard DeepStack buffers across steps."""
+        if mm_embed_inputs is not None and self._omni_mm_embeds_list is not None:
+            chunk_embeds, is_mm_embed = mm_embed_inputs
+            if len(chunk_embeds) == 1 and chunk_embeds[0].ndim == 1:
+                mm_embed_inputs = (
+                    _slice_mm_embeds_by_row_indices(
+                        self._omni_mm_embeds_list, chunk_embeds[0]
+                    ),
+                    is_mm_embed,
+                )
+
+        use_deepstack = bool(
+            self.supports_mm_inputs and getattr(self.model, "use_deepstack", False)
+        )
+        cleared_deepstack = (
+            use_deepstack and self.model.deepstack_input_embeds_num_tokens > 0
+        )
+        if cleared_deepstack:
+            self.model._clear_deepstack_input_embeds(
+                self.model.deepstack_input_embeds_num_tokens
+            )
+        out_ids, inputs_embeds = super()._get_model_inputs(input_ids, mm_embed_inputs)
+        if (
+            use_deepstack
+            and (cleared_deepstack or self.model.deepstack_input_embeds_num_tokens > 0)
+            and inputs_embeds is not None
+            and inputs_embeds.device.type == "tpu"
+        ):
+            synchronize_tensors(self.model.deepstack_input_embeds, wait=False)
+        return out_ids, inputs_embeds
 
     def forward_model(
         self,

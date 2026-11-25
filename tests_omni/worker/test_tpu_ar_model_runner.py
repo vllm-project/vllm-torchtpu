@@ -18,11 +18,16 @@ from typing import Any
 
 import pytest
 import torch
+from vllm.multimodal.utils import set_mm_embedding_modality
 from vllm.sequence import IntermediateTensors
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
-from vllm_torchtpu.omni.worker.tpu_ar_model_runner import TPUARModelRunner
+from tests_omni.omni_test_utils import build_qwen3_omni_thinker_stub
+from vllm_torchtpu.omni.worker.tpu_ar_model_runner import (
+    TPUARModelRunner,
+    _slice_mm_embeds_by_row_indices,
+)
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 pytestmark = pytest.mark.omni
@@ -52,6 +57,8 @@ def _stub_tpu_model_runner(monkeypatch: pytest.MonkeyPatch) -> None:
         self.model_config = vllm_config.model_config
         self.speculative_config = vllm_config.speculative_config
         self.enforce_eager = bool(getattr(self.model_config, "enforce_eager", False))
+        self.supports_mm_inputs = True
+        self.model: Any = SimpleNamespace(use_deepstack=False)
 
     monkeypatch.setattr(TPUModelRunner, "__init__", _fake_init)
     monkeypatch.setattr(
@@ -299,3 +306,213 @@ def test_forward_model_supports_plain_vllm_models(
     out, aux = tpu_ar_model_runner.forward_model(ids, pos)
     assert out is expected_out
     assert aux is expected_aux
+
+
+@pytest.mark.parametrize(
+    ("row_indices", "match"),
+    [
+        pytest.param(torch.zeros((2, 2), dtype=torch.long), "1D", id="non_1d"),
+        pytest.param(torch.tensor([0, 2]), "invalid", id="gap"),
+        pytest.param(torch.tensor([2, 1]), "invalid", id="descending"),
+        pytest.param(torch.tensor([1, 1]), "invalid", id="duplicate"),
+        pytest.param(torch.tensor([0, 2, 1, 3]), "contiguous", id="permuted"),
+        pytest.param(torch.tensor([-1, 0]), "invalid", id="negative"),
+        pytest.param(torch.tensor([5, 6, 7]), "invalid", id="out_of_bounds"),
+    ],
+)
+def test_slice_mm_embeds_by_row_indices_rejects_invalid_indices(
+    row_indices: torch.Tensor, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _slice_mm_embeds_by_row_indices(
+            [torch.zeros(4, 32), torch.zeros(3, 8)], row_indices
+        )
+
+
+def test_tpu_ar_model_runner_mixed_dim_mm_slicing(
+    monkeypatch: pytest.MonkeyPatch,
+    tpu_ar_model_runner: TPUARModelRunner,
+) -> None:
+    """Verify gather + multi-chunk slicing preserves rows, widths, and modalities."""
+    vid = set_mm_embedding_modality(torch.arange(4 * 32.0).reshape(4, 32), "video")
+    aud = set_mm_embedding_modality(
+        torch.arange(1000.0, 1000.0 + 3 * 8).reshape(3, 8), "audio"
+    )
+    img = set_mm_embedding_modality(
+        torch.arange(2000.0, 2000.0 + 2 * 32).reshape(2, 32), "image"
+    )
+    mask = torch.ones(10, dtype=torch.bool)
+    seen_shifts: list[int] = []
+
+    monkeypatch.setattr(
+        TPUModelRunner,
+        "_gather_mm_embeddings",
+        lambda self, sched, shift=0: (
+            seen_shifts.append(shift),
+            ([vid, aud, img], mask),
+        )[1],
+    )
+    idx_list, out_mask = tpu_ar_model_runner._gather_mm_embeddings(
+        SimpleNamespace(), shift_computed_tokens=3
+    )
+    assert seen_shifts == [3]
+    assert out_mask is mask
+    assert len(idx_list) == 1 and torch.equal(idx_list[0], torch.arange(9))
+
+    captured_mm: list[Any] = []
+    monkeypatch.setattr(
+        TPUModelRunner,
+        "_get_model_inputs",
+        lambda self, ids, mm: (captured_mm.append(mm), (None, ids))[1],
+    )
+    for start, end in ((0, 0), (0, 2), (2, 6), (6, 9)):
+        tpu_ar_model_runner._get_model_inputs(
+            torch.zeros(10, dtype=torch.long), ([idx_list[0][start:end]], mask)
+        )
+
+    assert captured_mm[0] == ([], mask)
+    expected_chunks = [
+        [(vid[0:2], "video")],
+        [(vid[2:4], "video"), (aud[0:2], "audio")],
+        [(aud[2:3], "audio"), (img[0:2], "image")],
+    ]
+    for (embeds, chunk_mask), exp in zip(captured_mm[1:], expected_chunks, strict=True):
+        assert chunk_mask is mask
+        assert len(embeds) == len(exp)
+        for got, (exp_t, exp_mod) in zip(embeds, exp, strict=True):
+            assert torch.equal(got, exp_t) and got.modality == exp_mod
+
+    monkeypatch.setattr(
+        TPUModelRunner, "_gather_mm_embeddings", lambda self, sched, shift=0: ([], mask)
+    )
+    assert tpu_ar_model_runner._gather_mm_embeddings(SimpleNamespace()) == ([], mask)
+    assert tpu_ar_model_runner._omni_mm_embeds_list is None
+
+
+@pytest.mark.parametrize(
+    ("mm_embed_inputs", "cached"),
+    [
+        pytest.param(None, None, id="none"),
+        pytest.param(
+            ([], torch.zeros(4, dtype=torch.bool)), [torch.ones(2, 8)], id="empty"
+        ),
+        pytest.param(
+            ([torch.ones(2, 8)], torch.ones(4, dtype=torch.bool)),
+            [torch.ones(2, 8)],
+            id="2d",
+        ),
+        pytest.param(
+            ([torch.arange(2)], torch.ones(4, dtype=torch.bool)), None, id="uncached"
+        ),
+    ],
+)
+def test_get_model_inputs_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+    tpu_ar_model_runner: TPUARModelRunner,
+    mm_embed_inputs: Any,
+    cached: list[torch.Tensor] | None,
+) -> None:
+    tpu_ar_model_runner._omni_mm_embeds_list = cached
+    captured: list[Any] = []
+    monkeypatch.setattr(
+        TPUModelRunner,
+        "_get_model_inputs",
+        lambda self, ids, mm: (captured.append(mm), (None, ids))[1],
+    )
+    tpu_ar_model_runner._get_model_inputs(
+        torch.zeros(4, dtype=torch.long), mm_embed_inputs
+    )
+    assert captured == [mm_embed_inputs]
+
+
+@pytest.mark.parametrize("should_raise", [False, True], ids=["normal", "exception"])
+def test_execute_model_always_clears_mm_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tpu_ar_model_runner: TPUARModelRunner,
+    should_raise: bool,
+) -> None:
+    sentinel = SimpleNamespace(req_ids=[], kv_connector_output=None)
+
+    def _fake_execute_model(
+        self: Any,
+        scheduler_output: Any,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> Any:
+        self._omni_mm_embeds_list = [torch.ones(2, 8)]
+        if should_raise:
+            raise RuntimeError("boom")
+        return sentinel
+
+    monkeypatch.setattr(TPUModelRunner, "execute_model", _fake_execute_model)
+    if should_raise:
+        with pytest.raises(RuntimeError, match="boom"):
+            tpu_ar_model_runner.execute_model(SimpleNamespace())
+    else:
+        assert tpu_ar_model_runner.execute_model(SimpleNamespace()) is sentinel
+    assert tpu_ar_model_runner._omni_mm_embeds_list is None
+
+
+@pytest.mark.parametrize(
+    ("step_kind", "stale_tokens", "expect_ds_sync"),
+    [
+        pytest.param("vision", 4, True, id="vision_updates_and_syncs"),
+        pytest.param("text_only", 4, True, id="text_clears_stale_and_syncs"),
+        pytest.param("text_only", 0, False, id="text_clean_no_sync"),
+    ],
+)
+def test_get_model_inputs_deepstack_clear_and_sync(
+    monkeypatch: pytest.MonkeyPatch,
+    tpu_ar_model_runner: TPUARModelRunner,
+    step_kind: str,
+    stale_tokens: int,
+    expect_ds_sync: bool,
+) -> None:
+    """Verify stale DeepStack clearing on entry and TPU buffer flush gating."""
+    hidden_size = 8
+    thinker = build_qwen3_omni_thinker_stub(hidden_size=hidden_size, max_tokens=8)
+    if stale_tokens:
+        for buf in thinker.deepstack_input_embeds:
+            buf[:stale_tokens].fill_(7.0)
+    thinker.deepstack_input_embeds_num_tokens = stale_tokens
+    tpu_ar_model_runner.model = thinker
+
+    orig_embed = thinker.embed_input_ids
+    monkeypatch.setattr(
+        TPUModelRunner,
+        "_get_model_inputs",
+        lambda self, ids, mm_in: (
+            orig_embed(
+                ids,
+                multimodal_embeddings=(mm_in[0] if mm_in else None),
+                is_multimodal=(mm_in[1] if mm_in else None),
+            ),
+            (None, SimpleNamespace(device=SimpleNamespace(type="tpu"))),
+        )[1],
+    )
+    sync_calls: list[tuple[Any, bool]] = []
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.worker.tpu_ar_model_runner.synchronize_tensors",
+        lambda tensors, wait=True: sync_calls.append((tensors, wait)),
+    )
+
+    if step_kind == "vision":
+        ids = torch.tensor([1, 12, 12, 2], dtype=torch.long)
+        mm_in: Any = (
+            [set_mm_embedding_modality(torch.ones(2, hidden_size * 3), "image")],
+            torch.tensor([False, True, True, False]),
+        )
+    else:
+        ids = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        mm_in = None
+
+    tpu_ar_model_runner._get_model_inputs(ids, mm_in)
+    if step_kind == "text_only":
+        assert thinker.deepstack_input_embeds_num_tokens == 0
+        for buf in thinker.deepstack_input_embeds:
+            assert torch.equal(buf[:4], torch.zeros(4, hidden_size))
+    else:
+        for buf in thinker.deepstack_input_embeds:
+            assert torch.equal(buf[[0, 3]], torch.zeros(2, hidden_size))
+    assert sync_calls == (
+        [(thinker.deepstack_input_embeds, False)] if expect_ds_sync else []
+    )
