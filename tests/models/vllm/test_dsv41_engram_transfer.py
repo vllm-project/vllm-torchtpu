@@ -335,6 +335,7 @@ def staging(transport, monkeypatch):
         "start_prepared_embeddings",
         "activate_prepared_embeddings",
         "_staged_views",
+        "_staged_words",
         "_ready_rows",
         "prepare_embeddings",
     }
