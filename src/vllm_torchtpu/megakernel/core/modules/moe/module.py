@@ -35,7 +35,7 @@ from ...decls import (
 from ...errors import MegakernelConfigError
 from ...exec_spec import ExecSpec
 from ...module import Module
-from ...ops import BF16, F32, FP8, I32, round_bf16, round_up
+from ...ops import BF16, F32, FP8, I32, round_up
 from ...spec import ExtraInput, SmallField, WeightDecl
 from .context import MoEEmit
 from .decls import (
@@ -49,10 +49,29 @@ from .decls import (
     resolve_moe_binding,
     validate_moe_options,
 )
-from .experts import expert, experts_piped, experts_piped_ep
-from .params import MoEDebug, MoEParams, MoETunables, derive_moe_params
+from .experts import expert, experts_piped, experts_piped_ep, swiglu_bf16
+from .params import (
+    MAX_SEEN_EXPERTS,
+    MoEDebug,
+    MoEParams,
+    MoETunables,
+    derive_moe_params,
+    validate_moe_geometry,
+)
 from .reference import moe_reference
 from .routing import route
+
+_SEEN_ROWS = MAX_SEEN_EXPERTS // 128
+
+
+def _check_geom_e_slots(g_slots: Any) -> int:
+    if g_slots is None:
+        return 0
+    if isinstance(g_slots, bool) or not isinstance(g_slots, int) or g_slots < 0:
+        raise MegakernelConfigError(
+            f"MoEModule geometry e_slots must be a non-negative int, got {g_slots!r}"
+        )
+    return int(g_slots)
 
 
 class MoEModule(Module):
@@ -79,11 +98,22 @@ class MoEModule(Module):
         e_slots: int | None = None,
         weight_dtypes: Mapping[str, str] | None = None,
     ) -> None:
+        self._validate_options(
+            {
+                "shared_gate": shared_gate,
+                "moe_tp": moe_tp,
+                "e_slots": e_slots,
+                "weight_dtypes": weight_dtypes,
+            }
+        )
         self.geometry = geometry
         self.prefix = prefix
         self.shared_gate = bool(shared_gate)
         self._explicit_moe_tp = None if moe_tp is None else bool(moe_tp)
         self._explicit_e_slots = None if e_slots is None else int(e_slots)
+        g_slots_val = _check_geom_e_slots(
+            None if geometry is None else getattr(geometry, "e_slots", None)
+        )
         self.moe_tp = (
             self._explicit_moe_tp
             if self._explicit_moe_tp is not None
@@ -92,20 +122,17 @@ class MoEModule(Module):
         self.e_slots = (
             self._explicit_e_slots
             if self._explicit_e_slots is not None
-            else int(getattr(geometry, "e_slots", 0))
+            else g_slots_val
         )
         self.weight_dtypes = normalize_weight_dtypes(
             weight_dtypes, MOE_WEIGHT_NAMES, "MoEModule", MegakernelConfigError
         )
-        self._validate_options(
-            {"shared_gate": self.shared_gate, "weight_dtypes": weight_dtypes}
-        )
         if geometry is not None:
             self._check_option_consistency(geometry)
         opts: dict[str, Any] = {"shared_gate": self.shared_gate}
-        if self._explicit_moe_tp is not None or geometry is not None:
+        if self._explicit_moe_tp is not None or not self.moe_tp:
             opts["moe_tp"] = self.moe_tp
-        if self._explicit_e_slots is not None or geometry is not None:
+        if self._explicit_e_slots is not None or self.e_slots != 0:
             opts["e_slots"] = self.e_slots
         if weight_dtypes is not None:
             opts["weight_dtypes"] = self.weight_dtypes
@@ -123,10 +150,11 @@ class MoEModule(Module):
                 f"geometry moe_tp={g_tp}"
             )
         g_slots = getattr(g, "e_slots", None)
+        g_slots_val = _check_geom_e_slots(g_slots)
         if (
             self._explicit_e_slots is not None
             and g_slots is not None
-            and int(g_slots) != self._explicit_e_slots
+            and g_slots_val != self._explicit_e_slots
         ):
             raise MegakernelConfigError(
                 f"MoEModule(e_slots={self._explicit_e_slots}) disagrees with "
@@ -140,9 +168,22 @@ class MoEModule(Module):
         e_slots = (
             self._explicit_e_slots
             if self._explicit_e_slots is not None
-            else (int(g_slots) if g_slots is not None else self.e_slots)
+            else (g_slots_val if g_slots is not None else self.e_slots)
         )
         return moe_tp, e_slots
+
+    def _validated_dims(self, g: Any, ex: ExecSpec) -> tuple[bool, int, int, int, int]:
+        moe_tp, e_slots = self._check_option_consistency(g)
+        er, isr, ir, ew = validate_moe_geometry(
+            E=int(g.E),
+            R=ex.R,
+            TOPK=int(g.TOPK),
+            IS=int(g.IS),
+            I=int(g.I),
+            moe_tp=moe_tp,
+            e_slots=e_slots,
+        )
+        return moe_tp, er, isr, ir, ew
 
     @classmethod
     def _validate_options(cls, options: Mapping[str, Any]) -> None:
@@ -168,11 +209,7 @@ class MoEModule(Module):
         return out
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
-        moe_tp, e_slots = self._check_option_consistency(g)
-        er = g.E // ex.R
-        isr = g.IS // ex.R
-        ir = g.I // ex.R if moe_tp else g.I
-        ew = e_slots if e_slots > 0 else (g.E if moe_tp else er)
+        _, _, isr, ir, ew = self._validated_dims(g, ex)
         layout_e = "stacked" if ex.stack_e else "per_layer"
         sh13_dt = FP8 if self.weight_dtypes["sh13"] == "fp8" else BF16
         sh2_dt = FP8 if self.weight_dtypes["sh2"] == "fp8" else BF16
@@ -216,23 +253,19 @@ class MoEModule(Module):
         return w_list
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
-        moe_tp, e_slots = self._check_option_consistency(g)
-        er = g.E // ex.R
-        isr = g.IS // ex.R
+        moe_tp, er, isr, _, ew = self._validated_dims(g, ex)
         fields = [SmallField("post_norm", g.H)]
         if self.weight_dtypes["sh13"] == "fp8":
             fields.append(SmallField("sh13_s", 2 * isr))
         if self.weight_dtypes["sh2"] == "fp8":
             fields.append(SmallField("sh2_s", g.H))
         fields.append(SmallField("sh_gate", g.H))
-        if not moe_tp and e_slots > er:
+        if not moe_tp and ew > er:
             fields.append(SmallField("ecopy", g.E))
         return fields
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
-        moe_tp, _ = self._check_option_consistency(g)
-        isr = g.IS // ex.R
-        ir = g.I // ex.R if moe_tp else g.I
+        _, _, isr, ir, _ = self._validated_dims(g, ex)
         return {"acc": max(g.H, g.E, 2 * isr, 2 * ir), "xb2": max(isr, ir)}
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> MoEParams:
@@ -259,7 +292,7 @@ class MoEModule(Module):
             "hitv": pltpu.VMEM((ex.MR, 128), I32),
             "hits": pltpu.SMEM((ex.MR, 128), I32),
             "elist": pltpu.SMEM((nb_picks,), I32),
-            "seen": pltpu.SMEM((8, 128), I32),
+            "seen": pltpu.SMEM((_SEEN_ROWS, 128), I32),
             "misc_sem": pltpu.SemaphoreType.DMA(()),
             "st": pltpu.SMEM((1,), I32),
         }
@@ -293,7 +326,7 @@ class MoEModule(Module):
         scr, W = ctx.scr, ctx.W
         scr["hitv"][...] = jnp.zeros((ex.MR, 128), I32)
         pltpu.make_async_copy(
-            scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"]
+            scr["hitv"].at[pl.ds(0, _SEEN_ROWS)], scr["seen"], scr["misc_sem"]
         ).start()
         if mp.ECOPY:
             o_ec = ctx.stream.sp.lay["ecopy"][0]
@@ -311,7 +344,7 @@ class MoEModule(Module):
         """Wait for initial `seen` zeroing DMA to complete."""
         scr = ctx.scr
         pltpu.make_async_copy(
-            scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"]
+            scr["hitv"].at[pl.ds(0, _SEEN_ROWS)], scr["seen"], scr["misc_sem"]
         ).wait()
 
     def on_layer_start(self, ctx: Any, lyr: Any, slot: Any) -> None:
@@ -360,11 +393,7 @@ class MoEModule(Module):
                 g13 = stream.dmatmul("sh13", scr["xb"], 2 * ISR)
                 if mp.sh13_scaled:
                     g13 = g13 * ctx.sm(slot, "sh13_s")
-                mid = round_bf16(
-                    round_bf16(jax.nn.silu(round_bf16(g13[:, :ISR])))
-                    * round_bf16(g13[:, ISR:])
-                )
-                scr["xb2"][:, :ISR] = mid.astype(BF16)
+                scr["xb2"][:, :ISR] = swiglu_bf16(g13, ISR).astype(BF16)
                 ysh = stream.dmatmul("sh2", scr["xb2"], H)
                 if mp.sh2_scaled:
                     ysh = ysh * ctx.sm(slot, "sh2_s")
@@ -388,9 +417,6 @@ class MoEModule(Module):
             moe_tp=moe_tp,
             weight_dtypes=self.weight_dtypes,
         )
-
-    def cache_decl(self, g: Any = None) -> None:
-        return None
 
     def reference(
         self,

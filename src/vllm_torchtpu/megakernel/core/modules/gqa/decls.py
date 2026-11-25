@@ -145,11 +145,16 @@ def resolve_gqa_binding(
             "theta": float(vals["theta"]),
         }
     )
+    opts = {k: v for k, v in binding.options.items() if v is not None}
+    if "weight_dtypes" in opts:
+        opts["weight_dtypes"] = normalize_weight_dtypes(
+            opts["weight_dtypes"], GQA_WEIGHT_NAMES, "GQAModule", MegakernelConfigError
+        )
     return ResolvedModuleGeometry(
         module_cls=cls,
         prefix=binding.prefix,
         values=vals,
-        options=binding.options,
+        options=opts,
         rename=binding.rename,
         transforms=binding.transforms,
     )

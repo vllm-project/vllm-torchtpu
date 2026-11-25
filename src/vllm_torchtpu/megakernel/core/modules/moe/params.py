@@ -122,6 +122,9 @@ class MoEDebug:
 register_tunables("moe", MoETunables)
 register_debug("moe", MoEDebug)
 
+# `scr["seen"]` is `[8, 128]` int32 SMEM (zeroed from 8 VMEM rows of `hitv`).
+MAX_SEEN_EXPERTS = 8 * 128
+
 _ROUTE_VEC_FALLBACK_LOGGED: set[tuple[Any, ...]] = set()
 
 
@@ -209,6 +212,12 @@ def derive_moe_params(
         e_slots=e_slots,
     )
     extra = ew - er
+    if g.E % 128 != 0:
+        raise MegakernelConfigError(f"Dimension E={g.E} must be a multiple of 128")
+    if g.E > MAX_SEEN_EXPERTS:
+        raise MegakernelConfigError(
+            f"MoE E={g.E} exceeds seen-table capacity {MAX_SEEN_EXPERTS}"
+        )
     if g.H <= 0 or g.H % 128 != 0:
         raise MegakernelConfigError(f"Dimension H={g.H} must be a multiple of 128")
     if isr % 128 != 0:

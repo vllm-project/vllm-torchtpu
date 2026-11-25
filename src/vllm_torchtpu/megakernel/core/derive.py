@@ -66,7 +66,7 @@ def instantiate_spec_module(
                     **m_kw,
                     moe_tp=m._explicit_moe_tp,
                     e_slots=m._explicit_e_slots,
-                    weight_dtypes=m.weight_dtypes,
+                    weight_dtypes=m.options.get("weight_dtypes"),
                 )
         return m
     opts = {k: v for k, v in m.options.items() if v is not None}

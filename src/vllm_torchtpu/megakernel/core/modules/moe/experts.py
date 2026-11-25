@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -25,24 +27,48 @@ from .context import MoEEmit
 from .ring import egive, egive_group, es_wait, etake
 
 
+def swiglu_bf16(h: Any, dim: int) -> jax.Array:
+    """BF16-rounded SwiGLU activation matching `moe_reference`."""
+    return round_bf16(
+        round_bf16(jax.nn.silu(round_bf16(h[:, :dim]))) * round_bf16(h[:, dim:])
+    )
+
+
+def _expert_wcol(m: MoEEmit, e: Any) -> jax.Array:
+    return jnp.sum(
+        jnp.where(m.lane_e8 == e, m.scr["wn"][...], 0.0), axis=1, keepdims=True
+    )
+
+
+def _release_tile(
+    m: MoEEmit, u: Any, l_idx: Any, step: int, total: int, t_off: int = 0
+) -> None:
+    t_cur = t_off + step
+    if m.mp.group_rel:
+        if step % 2 == 1:
+            egive_group(m, [(u - 1, t_cur - 1), (u, t_cur)], l_idx)
+        elif step == total - 1:
+            egive(m, u, l_idx, t_cur)
+    else:
+        egive(m, u, l_idx, t_cur)
+
+
 def gate_up(m: MoEEmit, i, w13):
     mp, scr, stream = m.mp, m.scr, m.stream
     IR, NSS = mp.IR, mp.NSS
     h = stream.mm(scr["xb"][...], w13[...])
     if "es" in m.W:
         h = h * scr["es"][i % NSS, :, : 2 * IR]
-    return round_bf16(
-        round_bf16(jax.nn.silu(round_bf16(h[:, :IR]))) * round_bf16(h[:, IR:])
-    ).astype(BF16)
+    return swiglu_bf16(h, IR).astype(BF16)
 
 
 def down(m: MoEEmit, i, mid, w2):
-    ex, lane_e8, mp, scr, stream = m.ex, m.lane_e8, m.mp, m.scr, m.stream
+    ex, mp, scr, stream = m.ex, m.mp, m.scr, m.stream
     MR = ex.MR
     CH, H, IR, NSS = mp.CH, mp.H, mp.IR, mp.NSS
     e, s, part = scr["elist"][i], i % NSS, scr["part"]
     has_es = "es" in m.W
-    wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
+    wcol = _expert_wcol(m, e)
     for j in range(H // CH):
         lo = 2 * IR + j * CH
         y = stream.mm(mid, w2[:, j * CH : (j + 1) * CH])[0:MR]
@@ -51,7 +77,7 @@ def down(m: MoEEmit, i, mid, w2):
 
 
 def expert(m: MoEEmit, l_idx, i, carry):
-    ex, lane_e8, mp, scr, stream, tk = m.ex, m.lane_e8, m.mp, m.scr, m.stream, m.tk
+    ex, mp, scr, stream, tk = m.ex, m.mp, m.scr, m.stream, m.tk
     MB, MR = ex.MB, ex.MR
     CH, H, IR, NSS, T13, T2, TE = mp.CH, mp.H, mp.IR, mp.NSS, mp.T13, mp.T2, mp.TE
     e = scr["elist"][i]
@@ -88,23 +114,14 @@ def expert(m: MoEEmit, l_idx, i, carry):
                 acc[:, : 2 * IR] = m13
             else:
                 acc[:, : 2 * IR] += m13
-            if mp.group_rel:
-                if t % 2 == 1:
-                    egive_group(m, [(u - 1, t - 1), (u, t)], l_idx)
-                elif t == T13 - 1:
-                    egive(m, u, l_idx, t)
-            else:
-                egive(m, u, l_idx, t)
+            _release_tile(m, u, l_idx, t, T13)
         h = acc[:, : 2 * IR]
     es_wait(m, i)
     has_es = "es" in m.W
     if has_es:
         h = h * scr["es"][s, :, : 2 * IR]
-    mid_ = round_bf16(
-        round_bf16(jax.nn.silu(round_bf16(h[:, :IR]))) * round_bf16(h[:, IR:])
-    )
-    xb2[:, :IR] = mid_.astype(BF16)
-    wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
+    xb2[:, :IR] = swiglu_bf16(h, IR).astype(BF16)
+    wcol = _expert_wcol(m, e)
     u2 = base + T13
     if T2 == 1:
         w2 = etake(m, "e2", u2)[...]
@@ -149,13 +166,7 @@ def expert(m: MoEEmit, l_idx, i, carry):
                 acc[:, :H] = m2
             else:
                 acc[:, :H] += m2
-            if mp.group_rel:
-                if t % 2 == 1:
-                    egive_group(m, [(u - 1, T13 + t - 1), (u, T13 + t)], l_idx)
-                elif t == T2 - 1:
-                    egive(m, u, l_idx, T13 + t)
-            else:
-                egive(m, u, l_idx, T13 + t)
+            _release_tile(m, u, l_idx, t, T2, T13)
         y = (
             round_bf16(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
             if has_es
@@ -198,7 +209,7 @@ def experts_piped(m: MoEEmit, l_idx, n_hit):
 
 
 def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
-    ex, lane_e8, mp, scr, stream, tk = m.ex, m.lane_e8, m.mp, m.scr, m.stream, m.tk
+    ex, mp, scr, stream, tk = m.ex, m.mp, m.scr, m.stream, m.tk
     MB, MR = ex.MB, ex.MR
     H, IR, NSS, T13, T2, TE = mp.H, mp.IR, mp.NSS, mp.T13, mp.T2, mp.TE
 
@@ -220,20 +231,11 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 acc13[:, :BN] = mm13
             else:
                 acc13[:, :BN] += mm13
-            if mp.group_rel:
-                if t % 2 == 1:
-                    egive_group(m, [(t - 1, t - 1), (t, t)], l_idx)
-                elif t == T13 - 1:
-                    egive(m, t, l_idx, t)
-            else:
-                egive(m, t, l_idx, t)
+            _release_tile(m, t, l_idx, t, T13)
         es_wait(m, 0)
         has_es = "es" in m.W
         h0 = acc13[:, :BN] * scr["es"][0, :, :BN] if has_es else acc13[:, :BN]
-        mid0 = round_bf16(
-            round_bf16(jax.nn.silu(round_bf16(h0[:, :IR]))) * round_bf16(h0[:, IR:])
-        )
-        xb2[:, :IR] = mid0.astype(BF16)
+        xb2[:, :IR] = swiglu_bf16(h0, IR).astype(BF16)
 
         def body_ep(i, _):
             e = scr["elist"][i]
@@ -276,11 +278,7 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 acc13[:, :BN] += stream.mm(xb[:, k13_1 : k13_1 + TK13], w13_1[...])
                 egive(m, u13_1, l_idx, t1)
 
-            wcol = jnp.sum(
-                jnp.where(lane_e8 == e, scr["wn"][...], 0.0),
-                axis=1,
-                keepdims=True,
-            )
+            wcol = _expert_wcol(m, e)
             y = (
                 round_bf16(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
                 if has_es
@@ -292,11 +290,7 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
             h_nxt = (
                 acc13[:, :BN] * scr["es"][s_nxt, :, :BN] if has_es else acc13[:, :BN]
             )
-            mid_nxt = round_bf16(
-                round_bf16(jax.nn.silu(round_bf16(h_nxt[:, :IR])))
-                * round_bf16(h_nxt[:, IR:])
-            )
-            xb2[:, :IR] = mid_nxt.astype(BF16)
+            xb2[:, :IR] = swiglu_bf16(h_nxt, IR).astype(BF16)
             return 0
 
         lax.fori_loop(0, n_hit - 1, body_ep, 0)
@@ -316,22 +310,8 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 acc[:, :H] = mm2
             else:
                 acc[:, :H] += mm2
-            if mp.group_rel:
-                if s_step % 2 == 1:
-                    egive_group(
-                        m,
-                        [(u2 - 1, T13 + s_step - 1), (u2, T13 + s_step)],
-                        l_idx,
-                    )
-                elif s_step == T2 - 1:
-                    egive(m, u2, l_idx, T13 + s_step)
-            else:
-                egive(m, u2, l_idx, T13 + s_step)
-        wcol_last = jnp.sum(
-            jnp.where(lane_e8 == e_last, scr["wn"][...], 0.0),
-            axis=1,
-            keepdims=True,
-        )
+            _release_tile(m, u2, l_idx, s_step, T2, T13)
+        wcol_last = _expert_wcol(m, e_last)
         y_last = (
             round_bf16(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
             if has_es
