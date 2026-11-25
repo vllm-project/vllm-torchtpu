@@ -979,6 +979,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
                 return self._by_tier(ctx.extra[NVIS][r], ctiers, scan)
 
+            need_row_ids = (not self.union_attn) or self.debug or self.export_ids
+
             def scan_row(r: Any, Sx: int, consts: Any, lid: Any) -> Any:
                 """Row `r`'s selection and compaction over score rows [0, Sx) (Sx < S: a
                 row tier holding all its visible groups)."""
@@ -1007,26 +1009,30 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     scr["qu_code"][rows] = scr["qu_code"][rows] | jnp.where(
                         sel & (lid < ga), jnp.left_shift(1, r - lo), 0
                     )
-                pos = ix.compact_row(
-                    b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
-                    jnp.zeros((1, 1), I32) + kept, K, consts,
-                )
+                if need_row_ids:
+                    pos = ix.compact_row(
+                        b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
+                        jnp.zeros((1, 1), I32) + kept, K, consts,
+                    )
+                else:
+                    pos = jnp.zeros((1, K), I32)
                 return pos, kept
 
             def tail(r: Any, pos: Any, kept: Any, carry: Any) -> Any:
-                scr["qi_id"][r] = self._cdcp_gid(ctx, pos) if cdcp else pos
-                cs = self._ids_copies(ctx, r)
-                for c in cs:
-                    c.start()
-                if not self.async_dma:
+                if need_row_ids:
+                    scr["qi_id"][r] = self._cdcp_gid(ctx, pos) if cdcp else pos
+                    cs = self._ids_copies(ctx, r)
                     for c in cs:
-                        c.wait()
+                        c.start()
+                    if not self.async_dma:
+                        for c in cs:
+                            c.wait()
                 scr["qi_kvl"][r] = 4 * kept
                 return carry
 
             with ctx.stream.sc("qsa_rowsel", 2):
                 jax.lax.fori_loop(lo, lo + n, row, 0)
-                if self.async_dma:
+                if self.async_dma and need_row_ids:
                     self._wait_ids_copies(ctx, n)
             if self.union_attn:  # per-request call: rows [lo, lo + T) are request lo // T
                 KU, D = self._union_width(ex), max(self.dcp, 1)
@@ -1048,12 +1054,17 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         code = code_all if D == 1 else jnp.where(
                             jax.lax.rem(gidx // gpp, D) == r, code_all, 0
                         )
-                        ids, codes, nu = ua.compact_union(code, KU, ua.union_consts(S, KU))
-                        if cdcp:
-                            ids = self._cdcp_gid(ctx, ids)
                         at = pl.multiple_of(r * KU, 128) if cdcp else r * KU
-                        scr["qu_id"][lo // T, :, pl.ds(at, KU)] = ids
-                        scr["qu_cd"][lo // T, :, pl.ds(at, KU)] = codes
+                        nu = ua.compact_union_into(
+                            code,
+                            KU,
+                            ua.union_consts(S, KU),
+                            scr["qu_id"],
+                            scr["qu_cd"],
+                            lo // T,
+                            at,
+                            map_id=(lambda x: self._cdcp_gid(ctx, x)) if cdcp else None,
+                        )
                         scr["qu_n"][lo // T, r] = jnp.sum(nu)
 
                     for r in [jax.lax.rem(ctx.me, D)] if cdcp else range(D):
@@ -1258,21 +1269,26 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             self._exchange_merged(ctx)
             return
         ex, scr, K, T, MB = ctx.ex, ctx.scr, self.budget, ctx.ex.T, ctx.ex.MB
+        need_row_ids = (not self.union_attn) or self.debug or self.export_ids
         npr, rows, W = self._shard_rows(ex)
         me = ctx.me
         lane = jax.lax.broadcasted_iota(I32, (1, W), 1)
         lo = self._run(ctx) * rows
-        scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
+        if need_row_ids:
+            scr["qi_z"][...] = jnp.zeros((1, 128), I32)
 
         def pack(i: Any, carry: Any) -> Any:
             r = jnp.minimum(lo + i, MB - 1)  # past the last request: never read
-            scr["qg_send"][i, :, pl.ds(0, K)] = scr["qi_id"][r]
             head = jnp.where(lane == K, scr["qi_kvl"][r], 0)
-            scr["qg_send"][i] = jnp.where(
-                lane < K,
-                scr["qg_send"][i],
-                jnp.where(lane == K + 1, scr["qc_sga"][r], head),
-            )
+            if need_row_ids:
+                scr["qg_send"][i, :, pl.ds(0, K)] = scr["qi_id"][r]
+                scr["qg_send"][i] = jnp.where(
+                    lane < K,
+                    scr["qg_send"][i],
+                    jnp.where(lane == K + 1, scr["qc_sga"][r], head),
+                )
+            else:
+                scr["qg_send"][i] = jnp.where(lane == K + 1, scr["qc_sga"][r], head)
             return carry
 
         jax.lax.fori_loop(0, rows, pack, 0)
@@ -1281,19 +1297,20 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         def unpack(r: Any, carry: Any) -> Any:
             o = r // T // npr
             row = scr["qg_recv"][o, r - o * rows]
-            scr["qi_id"][r] = row[:, :K]
             scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K, row, 0))
             scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K + 1, row, 0))
-            cs = self._ids_copies(ctx, r)
-            for c in cs:
-                c.start()
-            if not self.async_dma:
+            if need_row_ids:
+                scr["qi_id"][r] = row[:, :K]
+                cs = self._ids_copies(ctx, r)
                 for c in cs:
-                    c.wait()
+                    c.start()
+                if not self.async_dma:
+                    for c in cs:
+                        c.wait()
             return carry
 
         jax.lax.fori_loop(0, MB, unpack, 0)
-        if self.async_dma:
+        if self.async_dma and need_row_ids:
             self._wait_ids_copies(ctx, MB)
         if self.union_attn:
             self._exchange_unions(ctx)
@@ -1304,6 +1321,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         same lanes as `qg_send`) and its union (the same lanes as `qgu_send`, offset `u0`);
         unpacked into the same scratch as the two exchanges. int32 copies only."""
         ex, scr, K, T, MB = ctx.ex, ctx.scr, self.budget, ctx.ex.T, ctx.ex.MB
+        need_row_ids = (not self.union_attn) or self.debug or self.export_ids
         nreq = MB // T
         npr, rows, WS = self._shard_rows(ex)
         u0, _ = self._xmerge_width(ex)
@@ -1313,7 +1331,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         ulane = jax.lax.broadcasted_iota(I32, (1, 2 * W + 128), 1)
         run = self._run(ctx)
         send, recv = scr["qm_send"], scr["qm_recv"]
-        scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
+        if need_row_ids:
+            scr["qi_z"][...] = jnp.zeros((1, 128), I32)
 
         bal = self._balanced(ex)
 
@@ -1326,13 +1345,18 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     else jnp.minimum(run * rows + i * T + t, MB - 1)  # past the last request: never read
                 )
                 at = t * WS
-                send[i, :, pl.ds(at, K)] = scr["qi_id"][r]
                 head = jnp.where(lane == K, scr["qi_kvl"][r], 0)
-                send[i, :, pl.ds(at, WS)] = jnp.where(
-                    lane < K,
-                    send[i, :, pl.ds(at, WS)],
-                    jnp.where(lane == K + 1, scr["qc_sga"][r], head),
-                )
+                if need_row_ids:
+                    send[i, :, pl.ds(at, K)] = scr["qi_id"][r]
+                    send[i, :, pl.ds(at, WS)] = jnp.where(
+                        lane < K,
+                        send[i, :, pl.ds(at, WS)],
+                        jnp.where(lane == K + 1, scr["qc_sga"][r], head),
+                    )
+                else:
+                    send[i, :, pl.ds(at, WS)] = jnp.where(
+                        lane == K + 1, scr["qc_sga"][r], head
+                    )
             q = qb if bal else jnp.minimum(run * npr + i, nreq - 1)  # past the last: never read
             send[i, :, pl.ds(u0, W)] = scr["qu_id"][q]
             send[i, :, pl.ds(u0 + W, W)] = scr["qu_cd"][q]
@@ -1349,15 +1373,16 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             for t in range(T):
                 r = q * T + t
                 row = recv[o, j, :, pl.ds(t * WS, WS)]
-                scr["qi_id"][r] = row[:, :K]
                 scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K, row, 0))
                 scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K + 1, row, 0))
-                cs = self._ids_copies(ctx, r)
-                for c in cs:
-                    c.start()
-                if not self.async_dma:
+                if need_row_ids:
+                    scr["qi_id"][r] = row[:, :K]
+                    cs = self._ids_copies(ctx, r)
                     for c in cs:
-                        c.wait()
+                        c.start()
+                    if not self.async_dma:
+                        for c in cs:
+                            c.wait()
             urow = recv[o, j, :, pl.ds(u0, 2 * W + 128)]
             scr["qu_id"][q] = urow[:, :W]
             scr["qu_cd"][q] = urow[:, W : 2 * W]
@@ -1379,7 +1404,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             jax.lax.fori_loop(0, self._runs(ex) * npr, unpack_bal, 0)
         else:
             jax.lax.fori_loop(0, nreq, unpack, 0)
-        if self.async_dma:
+        if self.async_dma and need_row_ids:
             self._wait_ids_copies(ctx, MB)
 
     @_scoped("qsa_ux")
