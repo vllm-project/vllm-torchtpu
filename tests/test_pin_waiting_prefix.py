@@ -117,3 +117,29 @@ def test_a_request_gone_from_the_scheduler_releases():
     free_before = pool.get_num_free_blocks()
     pw.release_done(pins, {}, pool)
     assert pool.get_num_free_blocks() == free_before + 2
+
+
+def test_reserve_releases_latest_queued_pins_first():
+    """Pins never squeeze scheduling: below the free reserve, the last-queued pins go first."""
+    from vllm.v1.request import RequestStatus
+
+    pool, manager = _setup(n_blocks=13)  # 12 usable
+    a, b = _request("a", 3 * BS + 1, seed=1), _request("b", 3 * BS + 1, seed=2)
+    _cache_and_free(pool, a, 3)
+    _cache_and_free(pool, b, 3)
+    for r in (a, b):
+        r.status = RequestStatus.WAITING
+    pins = pw._Pins(1.0)
+    pw.pin_new(pins, [a, b], manager)
+    assert set(pins.by_req) == {"a", "b"} and pool.get_num_free_blocks() == 6
+    taken = pool.get_new_blocks(4)  # running work leaves 2 free
+    pw.keep_reserve(pins, [a, b], pool, reserve_frac=4 / 13)  # need 4 free
+    assert list(pins.by_req) == ["a"] and pool.get_num_free_blocks() == 5
+    pool.free_blocks(taken)
+    # With the reserve not met, nothing new is pinned.
+    c = _request("c", 2 * BS + 1, seed=5)
+    _cache_and_free(pool, c, 2)
+    c.status = RequestStatus.WAITING
+    pool.get_new_blocks(pool.get_num_free_blocks() - 1)
+    pw.pin_new(pins, [c], manager, reserve_frac=0.5)
+    assert "c" not in pins.by_req

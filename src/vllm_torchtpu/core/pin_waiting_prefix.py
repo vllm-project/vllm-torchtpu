@@ -85,7 +85,29 @@ def release_done(pins: _Pins, requests: dict, block_pool) -> None:
         pins.tried &= set(requests)
 
 
-def pin_new(pins: _Pins, waiting, manager) -> None:
+def keep_reserve(pins: _Pins, waiting, block_pool, reserve_frac: float) -> None:
+    """Release pins, latest-queued first, until the pool has ``reserve_frac`` of its blocks free.
+
+    Pins must never squeeze the requests being scheduled: a short pool preempts running
+    requests, and a preempted P/D producer request that replays after its transfer was
+    registered is fatal (j-20064e16-a87b-4171-85c2: "Conflicting replay after terminal
+    Stage-3 producer registration" with half the pool pinned).
+    """
+    need = int(reserve_frac * block_pool.num_gpu_blocks)
+    if block_pool.get_num_free_blocks() >= need or not pins.by_req:
+        return
+    order = [r.request_id for r in waiting if r.request_id in pins.by_req]
+    rest = [rid for rid in pins.by_req if rid not in set(order)]
+    for rid in reversed(rest + order):
+        if block_pool.get_num_free_blocks() >= need:
+            break
+        blocks = pins.by_req.pop(rid)
+        pins.blocks -= len(blocks)
+        block_pool.free_blocks(blocks)
+        pins.counts["reserve_released"] = pins.counts.get("reserve_released", 0) + 1
+
+
+def pin_new(pins: _Pins, waiting, manager, reserve_frac: float = 0.0) -> None:
     """Pin the cached prefix of waiting requests not tried yet, in queue order, within budget."""
     pool = manager.block_pool
     budget = int(pins.max_frac * pool.num_gpu_blocks)
@@ -93,7 +115,9 @@ def pin_new(pins: _Pins, waiting, manager) -> None:
         rid = request.request_id
         if rid in pins.tried:
             continue
-        if pins.blocks >= budget:
+        if pins.blocks >= budget or pool.get_num_free_blocks() < int(
+            reserve_frac * pool.num_gpu_blocks
+        ):
             pins.counts["over_budget"] += 1
             return
         pins.tried.add(rid)
@@ -123,7 +147,9 @@ def patch_pin_waiting_prefix() -> None:
 
     if Scheduler.__dict__.get("_tpu_pin_waiting_patch", False):
         return
-    max_frac = float(os.environ.get("VLLM_TPU_PIN_WAITING_MAX_FRAC", "0.5"))
+    max_frac = float(os.environ.get("VLLM_TPU_PIN_WAITING_MAX_FRAC", "0.35"))
+    # Free blocks (incl. evictable cached ones) kept for the requests being scheduled.
+    reserve_frac = float(os.environ.get("VLLM_TPU_PIN_WAITING_RESERVE_FRAC", "0.25"))
     orig_schedule = Scheduler.schedule
 
     def schedule(self, *args, **kwargs):
@@ -132,7 +158,8 @@ def patch_pin_waiting_prefix() -> None:
             pins = self.__dict__["_tpu_pin_waiting"] = _Pins(max_frac)
         manager = self.kv_cache_manager
         release_done(pins, self.requests, manager.block_pool)
-        pin_new(pins, self.waiting, manager)
+        keep_reserve(pins, self.waiting, manager.block_pool, reserve_frac)
+        pin_new(pins, self.waiting, manager, reserve_frac)
         pins.maybe_log()
         return orig_schedule(self, *args, **kwargs)
 
@@ -142,4 +169,8 @@ def patch_pin_waiting_prefix() -> None:
         schedule._tpu_same_step_prefix_hit_patch = True
     Scheduler.schedule = schedule
     Scheduler._tpu_pin_waiting_patch = True
-    logger.info("pin-waiting: on (max %.0f%% of the pool)", 100 * max_frac)
+    logger.info(
+        "pin-waiting: on (max %.0f%% of the pool, keep %.0f%% free)",
+        100 * max_frac,
+        100 * reserve_frac,
+    )
