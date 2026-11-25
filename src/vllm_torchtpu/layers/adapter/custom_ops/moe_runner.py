@@ -13,7 +13,9 @@
 # limitations under the License.
 """Out-of-tree (OOT) MoE runner: the TPU side of vLLM's MoE forward path."""
 
+import inspect
 from collections.abc import Callable
+from typing import Any
 
 import torch
 from vllm.model_executor.layers.fused_moe.router.routing_simulator_router import (
@@ -23,10 +25,18 @@ from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runne
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
     adaptive_fused_moe_supported,
 )
 from vllm_torchtpu.layers.adapter import expert_placement
+from vllm_torchtpu.layers.adapter.fused_moe_decode import (
+    RUNNER_ARMED_ATTR,
+    RUNNER_MAX_TOKENS_ATTR,
+    RUNNER_STATIC_DISPATCH_ATTR,
+    anchor_rank_buffer_for_trace,
+    fused_moe_decode_runner_forward,
+)
 from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 
@@ -36,6 +46,29 @@ from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 # _fused_output_is_reduced).
 _upstream_fused_output_is_reduced = MoERunner._fused_output_is_reduced.fget
 assert _upstream_fused_output_is_reduced is not None
+
+# Canary for VllmMoERunner.forward's positional/keyword indexing: args[3] is
+# shared_experts_input and the static fast path drops input_ids (stock FP8
+# ignores it and _admit declines hash-routed layers).
+_EXPECTED_MOE_RUNNER_FORWARD_PARAMS = (
+    "self",
+    "hidden_states",
+    "router_logits",
+    "input_ids",
+    "shared_experts_input",
+)
+
+
+def check_upstream_forward_signature(forward_fn: Callable | None = None) -> None:
+    """Verify upstream MoERunner.forward still matches the signature static
+    dispatch relies on (called when arming static dispatch, not at import)."""
+    fn = MoERunner.forward if forward_fn is None else forward_fn
+    params = tuple(inspect.signature(fn).parameters)
+    if params != _EXPECTED_MOE_RUNNER_FORWARD_PARAMS:
+        raise RuntimeError(
+            f"MoERunner.forward signature changed: expected "
+            f"{_EXPECTED_MOE_RUNNER_FORWARD_PARAMS}, got {params}"
+        )
 
 
 @MoERunner.register_oot
@@ -127,9 +160,14 @@ class VllmMoERunner(MoERunner):
         # Not super()._fused_output_is_reduced: under torch.compile dynamo
         # reads that as truthy, and the routed output then skips its TP
         # all-reduce.
-        # A layer armed by fused_moe_decode reduces shared + routed itself.
-        if getattr(self, "_fused_moe_decode_armed", False) and not getattr(
-            self.moe_config, "skip_final_all_reduce", False
+        # A layer armed by fused_moe_decode reduces shared + routed itself,
+        # unless static bucket dispatch is active (where m <= max_tokens returns
+        # directly from fused_moe_decode_runner_forward and m > max_tokens falls
+        # through to super().forward() unreduced).
+        if (
+            getattr(self, RUNNER_ARMED_ATTR, False)
+            and not getattr(self, RUNNER_STATIC_DISPATCH_ATTR, False)
+            and not getattr(self.moe_config, "skip_final_all_reduce", False)
         ):
             return True
         # A layer armed by moe_tp_decode reduces shared + routed in its op.
@@ -150,6 +188,31 @@ class VllmMoERunner(MoERunner):
             or adaptive_fused_moe_supported(owner)
             or _upstream_fused_output_is_reduced(self)
         )
+
+    def forward(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if not getattr(self, RUNNER_STATIC_DISPATCH_ATTR, False):
+            return super().forward(*args, **kwargs)
+        hidden_states = args[0] if args else kwargs["hidden_states"]
+        router_logits = args[1] if len(args) > 1 else kwargs["router_logits"]
+        shared_experts_input = (
+            args[3] if len(args) > 3 else kwargs.get("shared_experts_input")
+        )
+        if shared_experts_input is not None:
+            return super().forward(*args, **kwargs)
+        max_tokens = getattr(self, RUNNER_MAX_TOKENS_ATTR)
+        # Only backbone warmup traces each side of the token-count branch;
+        # modules compiled outside warmup (e.g. MTP drafters) skip the guard.
+        # `in_warmup()` is a Python-value branch invisible to ShapeEnv whose
+        # guard vLLM drops (see `shape_variants` module docstring). That is
+        # safe because every Dynamo trace executes entirely inside or entirely
+        # outside `shape_variants.warmup()`; if the backbone were ever
+        # re-traced outside warmup it falls back to kernel + in-op GMM
+        # (correct, not wrong).
+        can_branch = not torch.compiler.is_compiling() or shape_variants.in_warmup()
+        if not can_branch or hidden_states.shape[0] <= max_tokens:
+            return fused_moe_decode_runner_forward(self, hidden_states, router_logits)
+        out = super().forward(*args, **kwargs)
+        return anchor_rank_buffer_for_trace(out)
 
     def _fused_ep_owns_pcp_collectives(self) -> bool:
         # The fused EP kernel is armed per layer after checking that layer's

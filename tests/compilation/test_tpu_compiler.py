@@ -338,7 +338,7 @@ class TestTpuCompilerCache:
         custom_op_boundaries = {
             path.relative_to(source_root).as_posix()
             for path in (source_root / "vllm_torchtpu").rglob("*.py")
-            if "pallas.jax_op" in path.read_text()
+            if re.search(r"\bjax_op\s*\(", path.read_text())
         }
         excluded_files = set(tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
         excluded_dirs = tuple(
@@ -361,6 +361,7 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/kv_cache_spec_normalizer.py",
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
+            "vllm_torchtpu/layers/adapter/fused_moe_decode.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
