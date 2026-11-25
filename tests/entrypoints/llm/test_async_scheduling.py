@@ -219,21 +219,25 @@ def test_async_scheduling_preserves_output_when_batch_is_split_into_multiple_for
 
 
 @pytest.mark.timeout(1200)
-def test_sync_scheduling_applies_repetition_penalty():
+def test_repetition_penalty_is_applied_with_sync_and_async_scheduling():
     """
     A penalized request goes through `execute_model` and `sample_tokens` on the
     TPU, in one batch with the same prompt without a penalty. The penalty only
     scales the logits; at 100 a seen token cannot stay the greedy choice in a
-    short output. `repetition_penalty` is applied with sync scheduling only.
+    short output. Async scheduling gives the tokens of sync scheduling.
     """
     prompt = "Repeat the word banana ten times: banana banana banana"
-    plain_tokens, penalized_tokens = run_llm_generation_in_isolated_process(
-        async_scheduling=False,
-        prompts=[prompt, prompt],
-        max_tokens=16,
-        max_num_seqs=2,
-        repetition_penalties=[1.0, 100.0],
+    sync_tokens, async_tokens = (
+        run_llm_generation_in_isolated_process(
+            async_scheduling=async_scheduling,
+            prompts=[prompt, prompt],
+            max_tokens=16,
+            max_num_seqs=2,
+            repetition_penalties=[1.0, 100.0],
+        )
+        for async_scheduling in (False, True)
     )
+    plain_tokens, penalized_tokens = sync_tokens
     prompt_tokens = set(AutoTokenizer.from_pretrained(MODEL_NAME)(prompt).input_ids)
 
     # Control: without the penalty, the greedy output repeats tokens.
@@ -243,4 +247,7 @@ def test_sync_scheduling_applies_repetition_penalty():
     )
     assert prompt_tokens.isdisjoint(penalized_tokens), (
         "A penalized request repeated a prompt token."
+    )
+    assert async_tokens == sync_tokens, (
+        "Async scheduling changed the output of a penalized request."
     )
