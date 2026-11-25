@@ -54,8 +54,10 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.model_runner_registry import select_model_runner
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import cpu_pinning
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -483,16 +485,10 @@ class TPUWorker(WorkerBase):
         is_first_rank = pp_group.is_first_rank
         is_last_rank = pp_group.is_last_rank
 
-        # TODO: Fix device assignment
         # WorkerBase declares `nn.Module | None`; this worker always holds a
         # TPUModelRunner from here on.
         # pyrefly: ignore[bad-override-mutable-attribute]
-        self.model_runner: TPUModelRunner = self.model_runner_cls(
-            self.vllm_config,
-            self.devices[0],
-            profiler_rank=self.profile_rank,
-            profiler_world_size=self.profile_world_size,
-        )
+        self.model_runner: TPUModelRunner = self._build_model_runner()
         logger.info(
             "Init worker | "
             "rank=%s | "
@@ -508,6 +504,21 @@ class TPUWorker(WorkerBase):
         )
         # f"hbm={utils.hbm_usage_gb(self.devices)}GiB")
         vllm_utils.report_usage_stats(self.vllm_config)
+
+    def _build_model_runner(self) -> TPUModelRunner:
+        """The runner for this worker: the class a model directory registered
+        for its architecture (runner/model_runner_registry.py), else
+        `model_runner_cls`."""
+        runner_cls = select_model_runner(
+            self.model_config.architecture, self.model_runner_cls
+        )
+        # TODO: Fix device assignment
+        return runner_cls(
+            self.vllm_config,
+            self.devices[0],
+            profiler_rank=self.profile_rank,
+            profiler_world_size=self.profile_world_size,
+        )
 
     def _kv_cache_size_pinned(self) -> bool:
         """Whether every rank's KV block count is already fixed by
@@ -589,9 +600,21 @@ class TPUWorker(WorkerBase):
         # accounting misses those bytes, so subtract them from the KV-cache
         # budget.
         reserves = self.model_runner.post_profile_hbm_reserves()
-        available = utils.min_across_ep_dp(
-            self.parallel_config, budget.available - sum(reserves)
-        )
+        local_available = budget.available - sum(reserves)
+        # A model adapter that owns its cache can report the bytes that cache
+        # takes (e.g. sized by profiling on a scratch pool). That number is
+        # the adapter's whole KV budget: it already accounts for what the
+        # adapter's configuration needs, so it replaces the measured one.
+        adapter = self.model_runner.model_adapter
+        sized = adapter.kv_cache_memory_budget() if adapter is not None else None
+        if sized is not None:
+            logger.info(
+                "KV cache budget from the model adapter: %.2f GiB (measured %.2f GiB)",
+                sized / utils.GBYTES,
+                local_available / utils.GBYTES,
+            )
+            local_available = sized
+        available = utils.min_across_ep_dp(self.parallel_config, local_available)
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
@@ -867,6 +890,13 @@ class TPUWorker(WorkerBase):
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
         _release_free_host_heap()
+        mode = cpu_pinning.policy_for(self.model_config.architecture)
+        if mode is not None:
+            if self.parallel_config.numa_bind:
+                # The user bound the worker with --numa-bind; keep that.
+                logger.info("CPU pin skipped: --numa-bind is set")
+            else:
+                cpu_pinning.apply(self.rank, self.local_rank, mode)
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:

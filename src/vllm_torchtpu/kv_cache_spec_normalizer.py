@@ -14,7 +14,7 @@
 import math
 from collections.abc import Sequence
 from dataclasses import replace
-from typing import Any
+from typing import Any, cast
 
 import torch
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -351,6 +351,36 @@ def _is_deepseek_v32_indexer_spec(spec: KVCacheSpec) -> bool:
     )
 
 
+def compresses_rows(spec: KVCacheSpec) -> bool:
+    """Whether ``spec``'s page stores ``block_size // tokens_per_state`` rows.
+
+    True for a non-MLA full-attention spec with an int ``tokens_per_state``
+    above 1, whatever packs several tokens into one stored row (a KV split
+    over rank pairs, or a compressed cache). MLA specs are left out: their
+    page geometry comes from the MLA backend.
+    """
+    return (
+        isinstance(spec, FullAttentionSpec)
+        and not isinstance(spec, MLAAttentionSpec)
+        and isinstance(spec.tokens_per_state, int)
+        and spec.tokens_per_state > 1
+    )
+
+
+def stored_rows(spec: AttentionSpec) -> int:
+    """Rows a page of ``spec`` stores: ``block_size``, or ``block_size //
+    tokens_per_state`` when :func:`compresses_rows`."""
+    if not compresses_rows(spec):
+        return spec.block_size
+    tokens_per_state = cast(int, spec.tokens_per_state)
+    if spec.block_size % tokens_per_state:
+        raise ValueError(
+            f"block_size {spec.block_size} is not a multiple of "
+            f"tokens_per_state {tokens_per_state}"
+        )
+    return spec.block_size // tokens_per_state
+
+
 def _normalize_one_spec(
     spec: KVCacheSpec,
     kv_cache_dtype: torch.dtype,
@@ -378,7 +408,7 @@ def _normalize_one_spec(
         assert attention_backend is not None
         backend = attention_backend
     page_size = backend.get_kv_cache_page_size_bytes(
-        spec.block_size,
+        stored_rows(spec),
         spec.num_kv_heads,
         spec.head_size,
         kv_cache_dtype,
