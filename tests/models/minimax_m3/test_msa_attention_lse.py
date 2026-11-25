@@ -27,6 +27,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 )
 from vllm_torchtpu.models.minimax_m3.kernels.msa_attention_lse import (
     msa_sparse_attention_lse,
+    msa_sparse_attention_lse_head_calls,
     msa_sparse_attention_lse_heads,
 )
 
@@ -591,3 +592,49 @@ def test_adaptive_tiles_match_reference(fp4, mode, max_union, monkeypatch):
         0,
     )
     _check(got, want)
+
+
+@pytest.mark.parametrize("num_tokens,num_real", [(32, 29), (384, 368)])
+def test_head_calls_kernel_work_lists_match_xla(num_tokens, num_real, monkeypatch):
+    """The per-KV-head 4-bit calls with their work lists built in a kernel
+    (`_head_work_lists`) are the calls with XLA's work lists, bit for bit:
+    a padded tail, and c64's 384-row decode step."""
+    monkeypatch.setitem(globals(), "PAGES", 96)
+    monkeypatch.setitem(globals(), "TOPK", 16)
+    num_kv_heads = 2
+    rng = np.random.default_rng(num_tokens)
+    q, _, _, table, keys, local_key, local_limit = _inputs(
+        rng, num_tokens, num_real, num_kv_heads, jnp.bfloat16
+    )
+    kv, scales, _ = _fp4_cache(rng, num_kv_heads)
+    args = (
+        q,
+        kv,
+        jnp.asarray(keys),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        jnp.asarray([1, 0], jnp.int32),
+    )
+    common = dict(
+        sm_scale=SCALE,
+        block_q=8,
+        pages_per_step=32,
+        scale_cache=jnp.asarray(scales),
+        interpret=True,
+    )
+
+    def run():
+        calls = msa_sparse_attention_lse_head_calls(*args, **common)
+        outs = []
+        for call, head in zip(calls, (1, 0), strict=True):
+            out, lse = call()  # only the call's own query heads are written
+            rows = slice(head * Q_PER_KV, (head + 1) * Q_PER_KV)
+            outs += [np.asarray(out[rows].astype(jnp.float32)), np.asarray(lse[rows])]
+        return outs
+
+    assert num_tokens <= msa_attention_lse.HEAD_PLAN_MAX_TOKENS
+    planned = run()
+    monkeypatch.setattr(msa_attention_lse, "HEAD_PLAN_MAX_TOKENS", 0)
+    for got, want in zip(planned, run(), strict=True):
+        np.testing.assert_array_equal(got, want)

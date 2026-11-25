@@ -914,6 +914,7 @@ def _attention_call(
     calls=1,
     inline_issue=False,
     packed_stores=False,
+    aligned_work=False,
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -932,6 +933,9 @@ def _attention_call(
     `kv_cache` takes its `scale_cache` and `scale_rows` (`_kernel`'s
     `fp4_rows`).
 
+    With `aligned_work`, ``packed``'s sections start on 128-lane boundaries
+    (`store_work_list`, a work list built in a kernel).
+
     ``calls > 1`` runs that many such calls in one grid, back to back:
     ``head`` then holds each call's pair (``int32[2 * calls]``) and
     ``packed`` each call's work list, end to end; `out` must be None."""
@@ -947,7 +951,7 @@ def _attention_call(
     groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
     num_steps = tiles // tiles_per_step
     sections, length = _work_layout(
-        tiles, groups_per_tile, pages_per_step, num_steps, aligned=False
+        tiles, groups_per_tile, pages_per_step, num_steps, aligned=aligned_work
     )
     if calls > 1 and out is not None:
         raise ValueError("calls run in one grid write new outputs")
@@ -1557,7 +1561,7 @@ def _tile_unions(tile_keys):
             [ones << 16, ones << 8, ones] + limbs(shifted) + [zeros, zeros]
         )
         diffs.append(
-            jnp.dot(lhs.T.astype(bf16), rhs.astype(bf16), preferred_element_type=f32)
+            jnp.dot(lhs.astype(bf16).T, rhs.astype(bf16), preferred_element_type=f32)
         )
     firsts, places = [], []
     all_ones = jnp.ones((_LANES, _LANES), bf16)
@@ -1601,6 +1605,20 @@ def store_work_list(
     per tile, -1 for no page): the same values as `msa_attention._work_list`
     (dense unions) and the step starts. Per-tile values are rows of one
     value in every lane, so no step reduces across lanes."""
+    _store_work(
+        _tile_unions(tile_keys),
+        out_ref,
+        pages_per_step=pages_per_step,
+        groups_per_tile=groups_per_tile,
+        tiles_per_step=tiles_per_step,
+        sections=sections,
+    )
+
+
+def _store_work(
+    unions, out_ref, *, pages_per_step, groups_per_tile, tiles_per_step, sections
+):
+    """`store_work_list` of the tiles' `_tile_unions`."""
     (unions_at, _), (meta_at, max_groups), (counts_at, _), (steps_at, bounds) = sections
     width = -(-max_groups // _LANES) * _LANES
     steps = -(-bounds // _LANES) * _LANES
@@ -1616,7 +1634,7 @@ def store_work_list(
     step_starts = jnp.zeros((1, steps), jnp.int32)
     ends = []
     end_at = jnp.zeros((1, _LANES), jnp.int32)
-    for i, (union, pages) in enumerate(_tile_unions(tile_keys)):
+    for i, (union, pages) in enumerate(unions):
         out_ref[:, unions_at + i * _LANES : unions_at + (i + 1) * _LANES] = union
         groups = jnp.maximum(-(-pages // pages_per_step), 1)
         first_at = end_at
@@ -2155,6 +2173,74 @@ def msa_sparse_attention_lse_heads(
     return out[:num_tokens], lse[:num_tokens]
 
 
+# Decode steps of up to this many rows build the per-KV-head calls' work
+# lists in a kernel (`_head_work_lists`) instead of XLA (two sorts and their
+# glue, `_chunk_work`). The kernel keeps every tile's [128, 128] f32 key
+# differences live at once: ~6 MiB of VMEM for 2 heads at 384 rows, growing
+# with both.
+HEAD_PLAN_MAX_TOKENS = 384
+
+
+def _tile_key_rows(keys, block_q):
+    """Each ``block_q``-token tile's keys of ``keys [T, K]`` as one
+    ``[1, block_q * K]`` row (token ``t``'s at lanes ``[t * K, (t + 1) *
+    K)``): two transposes repeat every token's keys across the lanes, then a
+    select per token."""
+    num_tokens, topk = keys.shape
+    width = block_q * topk
+    repeated = jnp.concatenate([keys.T] * block_q).T  # [T, width]
+    token = jax.lax.broadcasted_iota(jnp.int32, (1, width), 1) // topk
+    rows = []
+    for i in range(num_tokens // block_q):
+        row = jnp.full((1, width), -1, jnp.int32)
+        for t in range(block_q):
+            j = i * block_q + t
+            row = jnp.where(token == t, repeated[j : j + 1], row)
+        rows.append(row)
+    return rows
+
+
+def _head_work_lists(
+    selected, *, block_q, pages_per_step, tiles_per_step, interpret=False
+):
+    """`_packed_work` of each KV head's ``selected [G, T, K]`` (page keys, -1
+    for none, below `MAX_PLAN_KEYS`) built in one kernel, in
+    `store_work_list`'s aligned layout: ``[G, length]``."""
+    num_heads, num_tokens, topk = selected.shape
+    num_tiles = num_tokens // block_q
+    groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    sections, length = _work_layout(
+        num_tiles,
+        groups_per_tile,
+        pages_per_step,
+        num_tiles // tiles_per_step,
+        aligned=True,
+    )
+
+    def kernel(keys_ref, work_ref):
+        # Every head's tiles a stage at a time (`_tile_unions`), then each
+        # head's work list.
+        rows = [_tile_key_rows(keys_ref[h], block_q) for h in range(num_heads)]
+        unions = _tile_unions(sum(rows, []))
+        for h in range(num_heads):
+            _store_work(
+                unions[h * num_tiles : (h + 1) * num_tiles],
+                work_ref.at[h],
+                pages_per_step=pages_per_step,
+                groups_per_tile=groups_per_tile,
+                tiles_per_step=tiles_per_step,
+                sections=sections,
+            )
+
+    work = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((num_heads, 1, length), jnp.int32),
+        interpret=interpret,
+        name="minimax_m3_msa_head_work_lists",
+    )(selected)
+    return work.reshape(num_heads, length)
+
+
 def msa_sparse_attention_lse_head_calls(
     q: jax.Array,
     kv_cache: jax.Array,
@@ -2192,9 +2278,33 @@ def msa_sparse_attention_lse_head_calls(
         q, selected, local_page, local_limit, max(block_q, store_rows)
     )
     q = q.transpose(1, 0, 2)
-    step, num_chunks, pad, selected, (packed, tiles_per_step) = _chunk_work(
-        selected, num_q_heads, q.dtype, block_q, pages_per_step, True, packed=True
+    planned = (
+        selected.shape[0] <= HEAD_PLAN_MAX_TOKENS
+        and fits_work_row(block_q, selected.shape[2], pages_per_step)
+        and page_table.size <= MAX_PLAN_KEYS
     )
+    if planned:  # the work lists from a kernel, no XLA sorts
+        step, num_chunks, pad = selected.shape[0], 1, 0
+        # `_chunk_work`'s tiles per step for these calls (several heads,
+        # packed stores, decode-sized): keep the two in step.
+        tiles_per_step = _tiles_per_step(
+            step // block_q,
+            block_q,
+            store_rows,
+            _decode_tiles_per_step(block_q, True, num_q_heads // num_heads, False),
+        )
+        selected = selected.transpose(1, 0, 2)
+        packed = _head_work_lists(
+            selected,
+            block_q=block_q,
+            pages_per_step=pages_per_step,
+            tiles_per_step=tiles_per_step,
+            interpret=interpret,
+        )
+    else:
+        step, num_chunks, pad, selected, (packed, tiles_per_step) = _chunk_work(
+            selected, num_q_heads, q.dtype, block_q, pages_per_step, True, packed=True
+        )
     if num_chunks != 1:
         raise ValueError(f"one chunk per head, got {num_chunks} of {step} tokens")
     q = jnp.pad(q, ((0, 0), (0, pad), (0, 0)))
@@ -2228,6 +2338,7 @@ def msa_sparse_attention_lse_head_calls(
             scale_rows="head",
             # The caller's selects lay the output out in 16-row tiles.
             packed_stores=True,
+            aligned_work=planned,
         )
         num_blocks, num_tiles = lse.shape[:2]
         lse = lse.reshape(num_blocks, num_tiles, -1, block_q).transpose(0, 2, 1, 3)
