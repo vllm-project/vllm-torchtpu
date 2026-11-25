@@ -694,64 +694,6 @@ def _raiden_glm_dcp_identity() -> bool:
     return _use_raiden_glm_admission() and bool(tpu_envs.TPU_RAIDEN_GLM_DCP_IDENTITY)
 
 
-def _glm_rope_half_split(model: Any, hf_config: Any = None) -> tuple[bool, bool]:
-    """``(mla, indexer)``: whether this engine caches k_pe / the indexer key's
-    rope channels in half-split order (TPU_MLA_ROPE_NEOX_PERMUTE /
-    TPU_INDEXER_ROPE_NEOX_PERMUTE).
-
-    Read from the layers, never from the env alone: a layer sets
-    ``_rope_neox_permuted`` once its post-load permute ran, and a flag left at
-    its default skips the permute for a rope it cannot reorder. A pipeline
-    stage whose layers all reuse an earlier layer's top-k holds no indexer and
-    ships no indexer key; it declares what an indexer layer of its own would
-    cache. vLLM builds the indexer rope GPT-J style only when the model config
-    sets ``indexer_rope_interleave``, NeoX otherwise; the permute never
-    reorders a NeoX rope, so every engine caches those keys in the
-    checkpoint's own order and none declares it. Such a stage declares
-    half-split for the indexer only with the flag on, ``indexer_rope_interleave``
-    set, and a rope class the permute supports (its MLA layers'). Without the
-    model config to read, it refuses to guess."""
-    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
-        VllmTPUIndexer,
-        VllmTPUMultiHeadLatentAttentionWrapper,
-        rope_half_split_supported,
-    )
-
-    if model is None:
-        if tpu_envs.TPU_MLA_ROPE_NEOX_PERMUTE or tpu_envs.TPU_INDEXER_ROPE_NEOX_PERMUTE:
-            raise RuntimeError(
-                "Raiden GLM admission reads the cached rope order from the "
-                "loaded model's layers (TPU_MLA_ROPE_NEOX_PERMUTE / "
-                "TPU_INDEXER_ROPE_NEOX_PERMUTE are on), but the runner has none"
-            )
-        return False, False
-    mla = indexer = has_indexer = rope_supported = False
-    for module in model.modules():
-        if isinstance(module, VllmTPUIndexer):
-            has_indexer = True
-            indexer = indexer or bool(getattr(module, "_rope_neox_permuted", False))
-        elif isinstance(module, VllmTPUMultiHeadLatentAttentionWrapper):
-            # An MLA layer: it holds the flag from construction on.
-            mla = mla or bool(module._rope_neox_permuted)
-            rope_supported = rope_supported or rope_half_split_supported(
-                module.rotary_emb, int(module.qk_rope_head_dim)
-            )
-    if not has_indexer and tpu_envs.TPU_INDEXER_ROPE_NEOX_PERMUTE:
-        if hf_config is None:
-            raise RuntimeError(
-                "Raiden GLM admission: this pipeline stage holds no indexer "
-                "layer, so the indexer's rope order follows the model config's "
-                "indexer_rope_interleave, but no model config was given"
-            )
-        # The rule vLLM builds the indexer rope by (DeepSeek-V2 / GLM:
-        # is_neox_style = not getattr(config, "indexer_rope_interleave",
-        # False)): a config without the key gets a NeoX indexer rope, which
-        # the permute never reorders. Same truthiness as vLLM's.
-        interleaved_rope = getattr(hf_config, "indexer_rope_interleave", False)
-        indexer = bool(interleaved_rope) and rope_supported
-    return mla, indexer
-
-
 def _glm_indexer_seq_along_lane(vllm_config: VllmConfig) -> bool:
     """Whether the GLM indexer K cache was allocated SEQ_ALONG_LANE, which
     only the DCP identity transfer admits."""
@@ -3592,12 +3534,16 @@ class TPURaidenConnectorWorker:
             )
             return fingerprint, payload, page_tokens
         if _use_raiden_glm_admission():
+            from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+                glm_rope_half_split,
+            )
+
             page_tokens = int(self.vllm_config.cache_config.block_size)
             fingerprint, payload = self._measure_raiden_glm_layout(
                 manifest,
                 page_tokens,
                 indexer_seq_along_lane=_glm_indexer_seq_along_lane(self.vllm_config),
-                rope_half_split=_glm_rope_half_split(
+                rope_half_split=glm_rope_half_split(
                     getattr(self.runner, "model", None),
                     self.vllm_config.model_config.hf_text_config,
                 ),

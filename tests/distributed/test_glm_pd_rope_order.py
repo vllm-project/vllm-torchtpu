@@ -183,16 +183,17 @@ def _model(
 
 
 def _flags(mla, indexer):
+    # The env module the reader (mla_attention_op) reads the flags from.
     return (
-        patch(f"{_MOD}.tpu_envs.TPU_MLA_ROPE_NEOX_PERMUTE", mla),
-        patch(f"{_MOD}.tpu_envs.TPU_INDEXER_ROPE_NEOX_PERMUTE", indexer),
+        patch.object(mla_op.envs, "TPU_MLA_ROPE_NEOX_PERMUTE", mla),
+        patch.object(mla_op.envs, "TPU_INDEXER_ROPE_NEOX_PERMUTE", indexer),
     )
 
 
 def test_rope_order_is_read_from_the_permuted_layers():
     # The connector reads the order the layers actually cache (the flag a
     # layer sets once its post-load permute ran), not the env's intent.
-    read = tc._glm_rope_half_split
+    read = mla_op.glm_rope_half_split
     mla_flag, indexer_flag = _flags(True, True)
     with mla_flag, indexer_flag:
         assert read(_model()) == (False, False)
@@ -259,7 +260,7 @@ def test_no_indexer_stage_declares_the_order_its_indexer_would_cache(
     stage = _model(permuted_mla=permuted_mla, indexer=False, rope=rope)
     mla_flag, idx_flag = _flags(True, indexer_flag)
     with mla_flag, idx_flag:
-        assert tc._glm_rope_half_split(stage, SimpleNamespace(**config)) == (
+        assert mla_op.glm_rope_half_split(stage, SimpleNamespace(**config)) == (
             permuted_mla,
             expected,
         )
@@ -273,11 +274,11 @@ def test_no_indexer_stage_without_model_config_refuses_to_guess():
         idx_flag,
         pytest.raises(RuntimeError, match="indexer_rope_interleave"),
     ):
-        tc._glm_rope_half_split(stage)
+        mla_op.glm_rope_half_split(stage)
     # With the indexer flag off there is nothing to read.
     mla_flag, idx_flag = _flags(True, False)
     with mla_flag, idx_flag:
-        assert tc._glm_rope_half_split(stage) == (True, False)
+        assert mla_op.glm_rope_half_split(stage) == (True, False)
 
 
 def test_flag_on_but_permute_skipped_declares_interleaved():
@@ -291,7 +292,7 @@ def test_flag_on_but_permute_skipped_declares_interleaved():
         glm = SimpleNamespace(indexer_rope_interleave=True)
         for indexer in (True, False):
             model = _model(indexer=indexer, rope=_OwnForwardRope)
-            assert tc._glm_rope_half_split(model, glm) == (False, False)
+            assert mla_op.glm_rope_half_split(model, glm) == (False, False)
 
 
 class _ComparingController:
