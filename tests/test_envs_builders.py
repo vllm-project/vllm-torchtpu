@@ -33,7 +33,6 @@ from vllm_torchtpu.envs import (
     env_nonnegative_int,
     env_nonnegative_int_or_auto,
     env_optional_nonnegative_int,
-    env_positive_int,
     env_str,
 )
 
@@ -56,7 +55,6 @@ def _clear(monkeypatch):
         (env_bool, True),
         (env_int, 7),
         (env_nonnegative_int, 7),
-        (env_positive_int, 7),
         (env_float, 1.5),
         (env_nonnegative_float, 1.5),
     ],
@@ -71,7 +69,6 @@ def test_unset_reads_as_the_default(builder, default):
         (env_bool, True),
         (env_int, 7),
         (env_nonnegative_int, 7),
-        (env_positive_int, 7),
         (env_float, 1.5),
         (env_nonnegative_float, 1.5),
     ],
@@ -270,7 +267,6 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
         ("SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES", None),
         ("TPU_VISIBLE_DEVICE_PATHS", ""),
         ("LWS_WORKER_INDEX", None),
-        ("LWS_GROUP_SIZE", 1),
         ("LWS_LEADER_ADDRESS", ""),
     ],
 )
@@ -290,15 +286,6 @@ def test_spec_warmup_off_spellings(monkeypatch):
     monkeypatch.setenv("SPEC_WARMUP", "nope")
     with pytest.raises(ValueError, match="SPEC_WARMUP"):
         _ = envs.SPEC_WARMUP
-
-
-@pytest.mark.parametrize("bad_value", ["not-an-int", "-1", "0"])
-def test_lws_group_size_env_rejects_invalid_and_nonpositive_values(
-    monkeypatch, bad_value
-):
-    monkeypatch.setenv("LWS_GROUP_SIZE", bad_value)
-    with pytest.raises(ValueError, match="LWS_GROUP_SIZE"):
-        _ = envs.LWS_GROUP_SIZE
 
 
 def test_optional_nonnegative_int_unset_and_empty_read_none(monkeypatch):

@@ -84,3 +84,19 @@ During `VllmConfig` initialization, `vllm-torchtpu` automatically runs a `TCPSto
 Set `TPU_MULTIHOST_BACKEND=ray` to use the Ray distributed executor across multiple TPU VMs. The instructions below are included from `examples/multihost/README.md`:
 
 ---8<--- "examples/multihost/README.md:5"
+
+---
+
+## Option 3: Kubernetes LeaderWorkerSet (LWS) and Bare-Metal IPv6 Clusters
+
+On bare-metal or on-prem Kubernetes clusters managed by [LeaderWorkerSet (LWS)](https://lws.sigs.k8s.io/), GCE instance metadata is unavailable and pods may communicate over IPv6. Both the `mp` and `ray` multi-host backends support LWS deployments using the orchestrator-injected `LWS_LEADER_ADDRESS` and `LWS_WORKER_INDEX` environment variables:
+
+- **Worker identity without GCE metadata**: When `TPU_WORKER_ID` / `CLOUD_TPU_TASK_ID` and GCE metadata are absent, `tpu_info.get_node_worker_id()` falls back to `LWS_WORKER_INDEX` and `tpu_info.get_node_name()` falls back to the LWS pod DNS name (or local hostname).
+- **IPv6 slicebuilder hostnames**: Because TorchTPU currently parses `TORCH_TPU_SLICEBUILDER_ADDRESSES` on `:` (tracked in `google-pytorch/torch_tpu#7040`), each IPv6 host resolves and publishes its own colon-free, forward-resolvable, non-loopback hostname (LWS pod DNS from `LWS_LEADER_ADDRESS` + `LWS_WORKER_INDEX`, local FQDN/hostname, or reverse DNS PTR). With `mp`, each peer publishes its hostname alongside its IP in the `TCPStore` rendezvous; with `ray`, the executor reads each node's hostname once and rejects duplicate hostnames.
+- **Kubernetes device-plugin `TPU_VISIBLE_DEVICE_PATHS`**: `libtpu` prioritizes `TPU_VISIBLE_DEVICE_PATHS` over `TPU_VISIBLE_CHIPS` and opens every listed path in each worker process. `TPUWorker` clears `TPU_VISIBLE_DEVICE_PATHS` whenever multiple slice ranks share a host, more than one path is listed, or `VLLM_TPU_DEVICE_ORDER`, `TPU_LOCAL_RANK_OFFSET`, or `DEBUG_TPU_LOCAL_RANK_OFFSET` is set.
+
+### Known Limitations
+
+- **Ray resource over-counting on privileged SR-IOV pods**: On privileged bare-metal pods where `/dev/vfio` exposes SR-IOV management functions alongside compute VFs, Ray's automatic TPU resource detection can over-report device counts (tracked in `ray-project/ray#68548`). Start Ray on every host with an explicit TPU count, for example `ray start --resources '{"TPU": <usable_chips_per_host>}' ...`.
+- **No sub-host partitioning via multi-path `TPU_VISIBLE_DEVICE_PATHS` with `TP > 1`**: Because `TPUWorker` clears pod-wide `TPU_VISIBLE_DEVICE_PATHS` when more than one rank shares a host or multiple paths are present, do not rely on a multi-path `TPU_VISIBLE_DEVICE_PATHS` list to partition a single host across concurrent `TP > 1` servers. Use separate pods or explicit `TPU_LOCAL_RANK_OFFSET` instead.
+- **Unique forward-resolvable hostnames required on IPv6 slices**: Every host in an IPv6 slice must resolve to a distinct, non-loopback, colon-free hostname reachable by all peers; duplicate or loopback hostnames are rejected at startup.

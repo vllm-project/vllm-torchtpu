@@ -84,27 +84,42 @@ def _configure_tpu_process_env(
 
 
 def _reconcile_tpu_visible_device_paths(local_world_size: int) -> None:
-    """Clear an inherited ``TPU_VISIBLE_DEVICE_PATHS`` for multi-rank workers.
+    """Clear an inherited ``TPU_VISIBLE_DEVICE_PATHS`` when per-rank binding applies.
 
     ``libtpu`` prioritizes ``TPU_VISIBLE_DEVICE_PATHS`` over ``TPU_VISIBLE_CHIPS``
     and opens every listed path inside each process, so a pod-wide list breaks
-    per-rank device binding (and multi-rank sub-host partitioning must use
-    ``TPU_LOCAL_RANK_OFFSET`` via ``TPU_VISIBLE_CHIPS`` instead). Device plugins
-    list one path per chip while a rank binds one device (tpu7x has two per
-    chip), so clear the list for multi-rank hosts and let ``TPU_VISIBLE_CHIPS``
-    select the device.
+    per-rank device binding, device-order overrides, and rank offsets. Clear the
+    list when multiple ranks share the host, when more than one path is listed,
+    or when ``VLLM_TPU_DEVICE_ORDER``, ``TPU_LOCAL_RANK_OFFSET``, or
+    ``DEBUG_TPU_LOCAL_RANK_OFFSET`` is set so ``TPU_VISIBLE_CHIPS`` selects the
+    device.
     """
     raw_paths = envs.TPU_VISIBLE_DEVICE_PATHS
-    if not raw_paths or local_world_size <= 1:
+    if not raw_paths:
+        return
+    paths = [p.strip() for p in raw_paths.split(",") if p.strip()]
+    reasons: list[str] = []
+    if local_world_size > 1:
+        reasons.append(f"local_world_size={local_world_size}")
+    if len(paths) > 1:
+        reasons.append(f"multiple device paths ({len(paths)})")
+    if envs.VLLM_TPU_DEVICE_ORDER:
+        reasons.append(f"VLLM_TPU_DEVICE_ORDER={envs.VLLM_TPU_DEVICE_ORDER!r}")
+    if envs.TPU_LOCAL_RANK_OFFSET:
+        reasons.append(f"TPU_LOCAL_RANK_OFFSET={envs.TPU_LOCAL_RANK_OFFSET}")
+    if envs.DEBUG_TPU_LOCAL_RANK_OFFSET:
+        reasons.append(
+            f"DEBUG_TPU_LOCAL_RANK_OFFSET={envs.DEBUG_TPU_LOCAL_RANK_OFFSET}"
+        )
+    if not reasons:
         return
     os.environ.pop("TPU_VISIBLE_DEVICE_PATHS", None)
     logger.warning_once(
-        "TPUWorker | Clearing TPU_VISIBLE_DEVICE_PATHS=%r because "
-        "local_world_size=%d; each rank binds its device through "
-        "TPU_VISIBLE_CHIPS, which needs every TPU device node of the host to "
-        "be visible to this process.",
+        "TPUWorker | Clearing TPU_VISIBLE_DEVICE_PATHS=%r (%s); each rank "
+        "binds its device through TPU_VISIBLE_CHIPS, which needs every TPU "
+        "device node of the host to be visible to this process.",
         raw_paths,
-        local_world_size,
+        ", ".join(reasons),
     )
 
 
@@ -252,14 +267,6 @@ class TPUWorker(WorkerBase):
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
-            # Capture before the dense-DP branch below collapses
-            # pc.data_parallel_size_local to 1; None means run_engine_core
-            # already collapsed pc.data_parallel_size to 1 for non-MoE DP.
-            uncollapsed_dp_local = (
-                (pc.data_parallel_size_local or dp_size)
-                if pc.data_parallel_size > 1
-                else None
-            )
 
             # TorchTPU uses independent per-engine tpu_dist worlds unless EP
             # needs a unified DP*TP world for expert collectives.
@@ -318,7 +325,6 @@ class TPUWorker(WorkerBase):
                 init_rank = binding.rank - dp_rank * per_engine_world
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
-                tpu_device_local_world = binding.local_world_size
             else:
                 # Dense DP has no cross-rank collective, so each replica
                 # should bootstrap its own isolated torch_tpu slice instead
@@ -370,22 +376,7 @@ class TPUWorker(WorkerBase):
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
-                if uncollapsed_dp_local is not None:
-                    local_dp_world = uncollapsed_dp_local * per_engine_world
-                elif my_sb_addresses:
-                    # Each local slice slot shares this host's resolved entry in
-                    # the full slicebuilder list (1 entry per chip on the host).
-                    my_sb_host = my_sb_addresses[0].rsplit(":", 1)[0]
-                    local_dp_world = sum(
-                        1
-                        for addr in sb_addresses
-                        if addr.rsplit(":", 1)[0] == my_sb_host
-                    )
-                else:
-                    # Single-host fallback when no slicebuilder list is set;
-                    # errs toward clearing on multi-host if unset.
-                    local_dp_world = dp_size * per_engine_world
-                tpu_device_local_world = max(binding.local_world_size, local_dp_world)
+            tpu_device_local_world = binding.slice_local_world_size
             local_rank_for_init = binding.init_local_rank
             dist_world_size = binding.world_size
             logger.info(

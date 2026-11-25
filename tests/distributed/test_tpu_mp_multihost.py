@@ -21,7 +21,6 @@ from unittest.mock import Mock, call
 import pytest
 
 from vllm_torchtpu.distributed import tpu_mp_multihost as mp
-from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.platforms import tpu_platform
 
 
@@ -39,7 +38,6 @@ def isolated_environment(monkeypatch):
         "NODE_RANK",
         "LWS_LEADER_ADDRESS",
         "LWS_WORKER_INDEX",
-        "LWS_GROUP_SIZE",
         mp._DONE_SENTINEL,
         mp._DP_DONE_SENTINEL,
     ):
@@ -61,6 +59,8 @@ def test_rendezvous_orders_peers_and_shares_session(monkeypatch, rank):
     values = {
         "test_ip_0": b"10.0.0.1",
         "test_ip_1": b"10.0.0.2",
+        "test_sb_host_0": b"10.0.0.1",
+        "test_sb_host_1": b"10.0.0.2",
         "test_xprof_session_id": b"12345",
     }
     store = Mock()
@@ -69,13 +69,13 @@ def test_rendezvous_orders_peers_and_shares_session(monkeypatch, rank):
     monkeypatch.setattr(mp.dist, "TCPStore", create_store)
     monkeypatch.setattr(mp, "get_ip", lambda: f"10.0.0.{rank + 1}")
     monkeypatch.setattr(mp.time, "time_ns", lambda: 12345)
-    assert mp._rendezvous_host_ips(
+    assert mp._rendezvous_hosts(
         num_peers=2,
         peer_index=rank,
         master_addr="10.0.0.1",
         port=9001,
         key_prefix="test",
-    ) == (["10.0.0.1", "10.0.0.2"], "12345")
+    ) == (["10.0.0.1", "10.0.0.2"], ["10.0.0.1", "10.0.0.2"], "12345")
     create_store.assert_called_once_with(
         host_name="10.0.0.1",
         port=9001,
@@ -83,7 +83,10 @@ def test_rendezvous_orders_peers_and_shares_session(monkeypatch, rank):
         is_master=rank == 0,
         timeout=timedelta(seconds=300),
     )
-    expected_sets = [call(f"test_ip_{rank}", f"10.0.0.{rank + 1}")]
+    expected_sets = [
+        call(f"test_ip_{rank}", f"10.0.0.{rank + 1}"),
+        call(f"test_sb_host_{rank}", f"10.0.0.{rank + 1}"),
+    ]
     if rank == 0:
         expected_sets.append(call("test_xprof_session_id", "12345"))
     assert store.set.call_args_list == expected_sets
@@ -91,11 +94,38 @@ def test_rendezvous_orders_peers_and_shares_session(monkeypatch, rank):
     assert mp._keepalive_stores == ([store] if rank == 0 else [])
 
 
+def test_rendezvous_rejects_duplicate_slicebuilder_hosts(monkeypatch):
+    values = {
+        "test_ip_0": b"2001:db8::1",
+        "test_ip_1": b"2001:db8::2",
+        "test_sb_host_0": b"shared-host.internal",
+        "test_sb_host_1": b"shared-host.internal",
+        "test_xprof_session_id": b"12345",
+    }
+    store = Mock()
+    store.get.side_effect = values.__getitem__
+    monkeypatch.setattr(mp.dist, "TCPStore", Mock(return_value=store))
+    monkeypatch.setattr(mp, "get_ip", lambda: "2001:db8::1")
+    monkeypatch.setattr(
+        mp, "resolve_local_slicebuilder_host", lambda _ip: "shared-host.internal"
+    )
+    with pytest.raises(ValueError, match="same slicebuilder host"):
+        mp._rendezvous_hosts(
+            num_peers=2,
+            peer_index=0,
+            master_addr="2001:db8::1",
+            port=9001,
+            key_prefix="test",
+        )
+
+
 @pytest.fixture
 def bootstrap(monkeypatch):
-    rendezvous = Mock(return_value=(["10.0.0.1", "10.0.0.2"], "session"))
+    rendezvous = Mock(
+        return_value=(["10.0.0.1", "10.0.0.2"], ["10.0.0.1", "10.0.0.2"], "session")
+    )
     topology = Mock(return_value="1,2,2,2")
-    monkeypatch.setattr(mp, "_rendezvous_host_ips", rendezvous)
+    monkeypatch.setattr(mp, "_rendezvous_hosts", rendezvous)
     monkeypatch.setattr(tpu_platform, "get_tpu_multihost_topology", topology)
     return rendezvous, topology
 
@@ -215,84 +245,15 @@ def test_failed_bootstrap_can_retry(bootstrap):
     assert os.environ[mp._DONE_SENTINEL] == "2"
 
 
-def test_mp_lws_worker_index_mismatch_raises_only_on_ipv6(monkeypatch, bootstrap):
-    rendezvous, _ = bootstrap
-    monkeypatch.setenv("LWS_LEADER_ADDRESS", "leader.svc.cluster.local")
-    monkeypatch.setenv("LWS_GROUP_SIZE", "2")
-    monkeypatch.setenv("LWS_WORKER_INDEX", "1")
-    nnodes_cfg = SimpleNamespace(
-        nnodes=2,
-        node_rank=0,
-        local_world_size=4,
-        master_addr="10.0.0.1",
-        master_port=9000,
-    )
-    dp_cfg = SimpleNamespace(
-        data_parallel_size=4,
-        data_parallel_size_local=2,
-        data_parallel_rank=0,
-        data_parallel_rpc_port=9000,
-        data_parallel_master_ip="10.0.0.1",
-        world_size=2,
-    )
-    # IPv4 LWS deployments never use LWS DNS host substitution, so custom
-    # node_rank != LWS_WORKER_INDEX continues to work without raising.
-    mp.prepare_mp_multihost_env(nnodes_cfg)
-    assert mp.prepare_mp_multihost_dp_env(dp_cfg, 8)
-
-    monkeypatch.delenv(mp._DONE_SENTINEL)
-    monkeypatch.delenv(mp._DP_DONE_SENTINEL)
-    rendezvous.return_value = (["2001:db8::9", "2001:db8::a"], "session")
-    with pytest.raises(ValueError, match="LWS_WORKER_INDEX"):
-        mp.prepare_mp_multihost_env(nnodes_cfg)
-    with pytest.raises(ValueError, match="LWS_WORKER_INDEX"):
-        mp.prepare_mp_multihost_dp_env(dp_cfg, 8)
-
-
-def test_mp_lws_subgroup_disables_worker_index_fallback(monkeypatch, bootstrap):
-    bootstrap[0].return_value = (["2001:db8::9", "2001:db8::a"], "session")
-    monkeypatch.setenv("LWS_LEADER_ADDRESS", "leader.svc.cluster.local")
-    monkeypatch.setenv("LWS_GROUP_SIZE", "4")
-    monkeypatch.setenv("LWS_WORKER_INDEX", "2")
-    seen_flags: list[bool] = []
-
-    def _fake_resolve(host_ips, *, ordered_by_worker_id=False, hostnames_by_ip=None):
-        seen_flags.append(ordered_by_worker_id)
-        return {ip: f"host-{i}" for i, ip in enumerate(host_ips)}
-
-    monkeypatch.setattr(mp, "resolve_slicebuilder_hosts", _fake_resolve)
-    config = SimpleNamespace(
-        nnodes=2,
-        node_rank=0,
-        local_world_size=4,
-        master_addr="leader.svc.cluster.local",
-        master_port=9000,
-    )
-    mp.prepare_mp_multihost_env(config)
-    assert seen_flags == [False]
-
-
 @pytest.mark.parametrize("mode", ["nnodes", "dp"])
-def test_mp_ipv6_slicebuilder_substitutes_lws_hostnames(monkeypatch, bootstrap, mode):
+def test_mp_ipv6_slicebuilder_uses_self_published_hosts(monkeypatch, bootstrap, mode):
     rendezvous, topology = bootstrap
-    rendezvous.return_value = (["2001:db8::9", "2001:db8::a"], "session")
     leader_dns = "vllm-lws-0.vllm-lws.default.svc.cluster.local"
     worker1_dns = "vllm-lws-0-1.vllm-lws.default.svc.cluster.local"
-    dns_to_ip = {
-        leader_dns: "2001:db8::9",
-        worker1_dns: "2001:db8::a",
-    }
-    monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
-    monkeypatch.setenv("LWS_GROUP_SIZE", "2")
-    monkeypatch.setenv("LWS_WORKER_INDEX", "0")
-    monkeypatch.setattr(
-        dist_utils.socket,
-        "getaddrinfo",
-        lambda host, *a, **kw: (
-            [(socket.AF_INET6, 0, 0, "", (dns_to_ip[host], 0, 0, 0))]
-            if host in dns_to_ip
-            else (_ for _ in ()).throw(socket.gaierror(f"unknown {host}"))
-        ),
+    rendezvous.return_value = (
+        ["2001:db8::9", "2001:db8::a"],
+        [leader_dns, worker1_dns],
+        "session",
     )
 
     if mode == "nnodes":
@@ -325,3 +286,40 @@ def test_mp_ipv6_slicebuilder_substitutes_lws_hostnames(monkeypatch, bootstrap, 
         for slot in range(4)
     )
     assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == expected
+
+
+def test_rendezvous_publishes_local_lws_ipv6_hostname(monkeypatch):
+    leader_dns = "vllm-lws-0.vllm-lws.default.svc.cluster.local"
+    worker1_dns = "vllm-lws-0-1.vllm-lws.default.svc.cluster.local"
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
+    monkeypatch.setenv("LWS_WORKER_INDEX", "1")
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, *a, **kw: (
+            [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::a", 0, 0, 0))]
+            if host == worker1_dns
+            else (_ for _ in ()).throw(socket.gaierror(f"unknown {host}"))
+        ),
+    )
+    stored: dict[str, bytes] = {
+        "test_ip_0": b"2001:db8::9",
+        "test_sb_host_0": leader_dns.encode(),
+        "test_xprof_session_id": b"99",
+    }
+    store = Mock()
+    store.set.side_effect = lambda k, v: stored.__setitem__(k, v.encode())
+    store.get.side_effect = stored.__getitem__
+    monkeypatch.setattr(mp.dist, "TCPStore", Mock(return_value=store))
+    monkeypatch.setattr(mp, "get_ip", lambda: "fd00:1::a")
+
+    host_ips, sb_hosts, session = mp._rendezvous_hosts(
+        num_peers=2,
+        peer_index=1,
+        master_addr=leader_dns,
+        port=9001,
+        key_prefix="test",
+    )
+    assert host_ips == ["2001:db8::9", "fd00:1::a"]
+    assert sb_hosts == [leader_dns, worker1_dns]
+    assert session == "99"

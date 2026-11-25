@@ -75,34 +75,81 @@ def test_reconcile_tpu_visible_device_paths_clears_for_multi_rank(
     assert "TPU_VISIBLE_DEVICE_PATHS" not in os.environ
 
 
-def test_reconcile_tpu_visible_device_paths_keeps_single_rank(monkeypatch):
-    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", _POD_DEVICE_PATHS)
+def test_reconcile_tpu_visible_device_paths_keeps_single_rank_single_path(monkeypatch):
+    for key in (
+        "VLLM_TPU_DEVICE_ORDER",
+        "TPU_LOCAL_RANK_OFFSET",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", "/dev/vfio/0")
     _reconcile_tpu_visible_device_paths(1)
-    assert os.environ["TPU_VISIBLE_DEVICE_PATHS"] == _POD_DEVICE_PATHS
+    assert os.environ["TPU_VISIBLE_DEVICE_PATHS"] == "/dev/vfio/0"
+
+
+def test_reconcile_tpu_visible_device_paths_clears_tp1_with_multiple_paths(monkeypatch):
+    for key in (
+        "VLLM_TPU_DEVICE_ORDER",
+        "TPU_LOCAL_RANK_OFFSET",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", _POD_DEVICE_PATHS)
+    with patch.object(tpu_worker.logger, "warning_once") as warn_mock:
+        _reconcile_tpu_visible_device_paths(1)
+        warn_mock.assert_called_once()
+    assert "TPU_VISIBLE_DEVICE_PATHS" not in os.environ
 
 
 @pytest.mark.parametrize(
-    "case,expect_cleared",
+    "env_key,env_val",
     [
-        ("plain_single_rank", False),
-        ("plain_multi_rank", True),
-        ("pcp_multi_rank", True),
-        ("ep_dp_multi_rank", True),
-        ("dense_dp_tp1_multi_replica", True),
-        ("dense_dp_tp1_collapsed_by_engine_core", True),
-        ("dense_dp_tp1_single_local_replica", False),
-        ("dense_dp_tp1_collapsed_single_local_replica", False),
+        ("VLLM_TPU_DEVICE_ORDER", "1,0"),
+        ("TPU_LOCAL_RANK_OFFSET", "2"),
+        ("DEBUG_TPU_LOCAL_RANK_OFFSET", "1"),
+    ],
+)
+def test_reconcile_tpu_visible_device_paths_clears_when_override_set(
+    monkeypatch, env_key, env_val
+):
+    for key in (
+        "VLLM_TPU_DEVICE_ORDER",
+        "TPU_LOCAL_RANK_OFFSET",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", "/dev/vfio/0")
+    monkeypatch.setenv(env_key, env_val)
+    with patch.object(tpu_worker.logger, "warning_once") as warn_mock:
+        _reconcile_tpu_visible_device_paths(1)
+        warn_mock.assert_called_once()
+    assert "TPU_VISIBLE_DEVICE_PATHS" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "case,device_paths,expect_cleared",
+    [
+        ("plain_single_rank", "/dev/vfio/0", False),
+        ("plain_single_rank", _POD_DEVICE_PATHS, True),
+        ("plain_multi_rank", _POD_DEVICE_PATHS, True),
+        ("pcp_multi_rank", _POD_DEVICE_PATHS, True),
+        ("ep_dp_multi_rank", _POD_DEVICE_PATHS, True),
+        ("dense_dp_tp1_multi_replica", _POD_DEVICE_PATHS, True),
+        ("dense_dp_tp1_single_local_replica", "/dev/vfio/0", False),
     ],
 )
 def test_init_device_reconciles_tpu_visible_device_paths_per_branch(
-    monkeypatch, case, expect_cleared
+    monkeypatch, case, device_paths, expect_cleared
 ):
-    """Verify init_device clears TPU_VISIBLE_DEVICE_PATHS iff local ranks > 1."""
-    for key in _INIT_DEVICE_ENV_KEYS:
+    """Verify init_device passes binding.slice_local_world_size to reconciliation."""
+    for key in _INIT_DEVICE_ENV_KEYS + (
+        "VLLM_TPU_DEVICE_ORDER",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    ):
         monkeypatch.setenv(key, os.environ.get(key, ""))
         monkeypatch.delenv(key)
 
-    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", _POD_DEVICE_PATHS)
+    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", device_paths)
 
     if case == "plain_single_rank":
         pc = ParallelConfig(tensor_parallel_size=1, numa_bind=False)
@@ -138,22 +185,6 @@ def test_init_device_reconciles_tpu_visible_device_paths_per_branch(
             "TORCH_TPU_SLICEBUILDER_ADDRESSES",
             ",".join(f"localhost:{8070 + i}" for i in range(8)),
         )
-    elif case == "dense_dp_tp1_collapsed_by_engine_core":
-        pc = ParallelConfig(
-            tensor_parallel_size=1,
-            data_parallel_size=8,
-            data_parallel_size_local=8,
-            enable_expert_parallel=False,
-            numa_bind=False,
-        )
-        pc.data_parallel_index = 2
-        pc.reconfigure_for_independent_dp_rank()
-        monkeypatch.setenv("TORCH_TPU_DP_SIZE", "8")
-        monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29600")
-        monkeypatch.setenv(
-            "TORCH_TPU_SLICEBUILDER_ADDRESSES",
-            ",".join(f"localhost:{8070 + i}" for i in range(8)),
-        )
     elif case == "dense_dp_tp1_single_local_replica":
         pc = ParallelConfig(
             tensor_parallel_size=1,
@@ -163,19 +194,6 @@ def test_init_device_reconciles_tpu_visible_device_paths_per_branch(
             numa_bind=False,
         )
         pc.data_parallel_index = 0
-        monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29600")
-        monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "host0:8070,host1:8070")
-    elif case == "dense_dp_tp1_collapsed_single_local_replica":
-        pc = ParallelConfig(
-            tensor_parallel_size=1,
-            data_parallel_size=2,
-            data_parallel_size_local=1,
-            enable_expert_parallel=False,
-            numa_bind=False,
-        )
-        pc.data_parallel_index = 0
-        pc.reconfigure_for_independent_dp_rank()
-        monkeypatch.setenv("TORCH_TPU_DP_SIZE", "2")
         monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29600")
         monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "host0:8070,host1:8070")
     else:
@@ -189,6 +207,8 @@ def test_init_device_reconciles_tpu_visible_device_paths_per_branch(
     worker.distributed_init_method = "tcp://127.0.0.1:29500"
     worker.devices = [torch.device("cpu")]
     worker.is_driver_worker = True
+    # Newer vLLM-TorchTPU builds the runner via `model_runner_cls`; stub both.
+    worker.model_runner_cls = MagicMock()
 
     with (
         patch(
@@ -225,7 +245,7 @@ def test_init_device_reconciles_tpu_visible_device_paths_per_branch(
     if expect_cleared:
         assert "TPU_VISIBLE_DEVICE_PATHS" not in os.environ
     else:
-        assert os.environ["TPU_VISIBLE_DEVICE_PATHS"] == _POD_DEVICE_PATHS
+        assert os.environ["TPU_VISIBLE_DEVICE_PATHS"] == device_paths
 
 
 def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(monkeypatch):

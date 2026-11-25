@@ -17,7 +17,6 @@ import hashlib
 import importlib.util
 import os
 import socket
-import stat
 from importlib import metadata as importlib_metadata
 
 import requests
@@ -58,8 +57,6 @@ def get_tpu_metadata(key: str = "") -> str:
 
 def get_tpu_type() -> str:
     tpu_type = envs.TPU_ACCELERATOR_TYPE
-    if tpu_type is None:
-        tpu_type = _detect_vfio_tpu_type()
     if tpu_type is None:
         tpu_type = get_tpu_metadata(key="accelerator-type")
     return tpu_type
@@ -182,36 +179,6 @@ def get_node_name() -> str:
     return tpu_name or socket.gethostname()
 
 
-TPU_PCI_VENDOR_ID = "0x1ae0"
-# Supported Google TPU PCI device IDs mapped to canonical accelerator prefixes
-# (matching jax/_src/hardware_utils.py and torch_tpu's TpuSpec). Checking
-# vendor, device, and SR-IOV application VF index excludes bare-metal
-# physical/management functions (e.g. 0x0075/0x0077/0x0078 and virtfn2 ICI
-# management VFs on v7x) and non-TPU Google PCI devices (e.g. NVMe/gVNIC).
-TPU_PCI_DEVICE_ID_TO_TYPE: dict[str, str] = {
-    "0x0027": "v3",
-    "0x005e": "v4",
-    "0x0062": "v5p",
-    "0x0063": "v5litepod",
-    "0x006f": "v6e",
-    "0x0076": "tpu7x",
-    "0x007c": "tpu8t",
-    "0x0083": "tpu8i",
-}
-# Maximum SR-IOV application VFs per physical function (virtfn0 .. virtfn{k-1},
-# matching per-chip TensorCore device counts) when bare-metal sysfs exposes
-# `physfn` alongside ICI management VFs. GCE/GKE guest VMs pass through VFs
-# without `physfn` in guest sysfs, so _is_application_pci_function returns True.
-TPU_VFIO_MAX_APP_VFS_PER_PF: dict[str, int] = {
-    "0x0062": 1,
-    "0x0063": 1,
-    "0x006f": 1,
-    "0x0076": 2,
-    "0x007c": 1,
-    "0x0083": 2,
-}
-
-
 def get_node_worker_id() -> int:
     """For multi-host TPU VM, this returns the worker id for the current node."""
     worker_id = envs.TPU_WORKER_ID
@@ -226,106 +193,20 @@ def get_node_worker_id() -> int:
 
 
 def get_num_cores_per_chip() -> int:
-    tpu_type = get_tpu_type() or ""
+    tpu_type = get_tpu_type()
     if tpu_type.startswith(("v5litepod", "v6e")):
         return 1
     return 2
 
 
-def _is_application_pci_function(dev_dir: str, bdf: str, device_id: str) -> bool:
-    """Exclude SR-IOV physical functions and bare-metal ICI management VFs."""
-    if os.path.exists(os.path.join(dev_dir, "virtfn0")):
-        return False
-    physfn_dir = os.path.join(dev_dir, "physfn")
-    max_app_vfs = TPU_VFIO_MAX_APP_VFS_PER_PF.get(device_id)
-    if max_app_vfs is None or not os.path.exists(physfn_dir):
-        return True
-    for vf_idx in range(max_app_vfs):
-        try:
-            target = os.readlink(os.path.join(physfn_dir, f"virtfn{vf_idx}"))
-        except OSError:
-            continue
-        if os.path.basename(target) == bdf:
-            return True
-    return False
-
-
-def _inspect_vfio_tpu_group(group: int) -> tuple[str | None, bool]:
-    """Inspect ``/dev/vfio/<group>`` and return ``(tpu_device_id, sysfs_readable)``."""
-    vfio_path = f"/dev/vfio/{group}"
-    try:
-        if not stat.S_ISCHR(os.stat(vfio_path).st_mode):
-            return None, False
-    except OSError:
-        return None, False
-    if not os.access(vfio_path, os.R_OK | os.W_OK):
-        return None, False
-
-    sysfs_root = f"/sys/kernel/iommu_groups/{group}/devices"
-    try:
-        devices = os.listdir(sysfs_root)
-    except OSError:
-        return None, False
-    sysfs_readable = False
-    for bdf in devices:
-        dev_dir = os.path.join(sysfs_root, bdf)
-        try:
-            with open(os.path.join(dev_dir, "vendor"), encoding="ascii") as vf:
-                vendor = vf.read().strip().lower()
-            sysfs_readable = True
-            if vendor != TPU_PCI_VENDOR_ID:
-                continue
-            with open(os.path.join(dev_dir, "device"), encoding="ascii") as df:
-                device_id = df.read().strip().lower()
-            if device_id in TPU_PCI_DEVICE_ID_TO_TYPE and _is_application_pci_function(
-                dev_dir, bdf, device_id
-            ):
-                return device_id, True
-        except (OSError, UnicodeDecodeError):
-            continue
-    return None, sysfs_readable
-
-
-def _detect_vfio_tpu_type() -> str | None:
-    """Infer accelerator type prefix from accessible local VFIO TPU devices."""
-    try:
-        vfio_entries = os.listdir("/dev/vfio")
-    except OSError:
-        return None
-    for entry in sorted(vfio_entries):
-        if not entry.isdigit():
-            continue
-        device_id, _ = _inspect_vfio_tpu_group(int(entry))
-        if device_id is not None:
-            return TPU_PCI_DEVICE_ID_TO_TYPE.get(device_id)
-    return None
-
-
 def get_num_chips() -> int:
-    # Linux DRM accel / NVIDIA >= 570.x drivers expose /dev/accel as a
-    # directory (/dev/accel/accel0), whereas TPU nodes expose char devices
-    # (/dev/accel0, ...).
-    accel_files = [p for p in glob.glob("/dev/accel*") if not os.path.isdir(p)]
+    accel_files = glob.glob("/dev/accel*")
     if accel_files:
         return len(accel_files)
     try:
         vfio_entries = os.listdir("/dev/vfio")
         numeric_entries = [int(entry) for entry in vfio_entries if entry.isdigit()]
-        if not numeric_entries:
-            return 0
-        tpu_count = 0
-        any_sysfs_readable = False
-        for group in numeric_entries:
-            device_id, sysfs_readable = _inspect_vfio_tpu_group(group)
-            if sysfs_readable:
-                any_sysfs_readable = True
-            if device_id is not None:
-                tpu_count += 1
-        if not any_sysfs_readable:
-            # Preserve legacy numeric /dev/vfio count when IOMMU sysfs metadata
-            # is hidden or unreadable (e.g. restricted GKE/VM containers).
-            return len(numeric_entries)
-        return tpu_count
+        return len(numeric_entries)
     except FileNotFoundError as e:
         logger.warning("Failed to detect number of TPUs: %s", e)
         return 0

@@ -42,19 +42,17 @@ from vllm.v1.executor.ray_utils import (
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.distributed.utils import (
-    lws_pod_hostname,
-    normalize_ip,
-    resolve_lws_hosts_by_ip,
-    resolve_slicebuilder_hosts,
-    set_node_kv_ip_port,
+from vllm_torchtpu.distributed.slicebuilder_hosts import (
+    make_node_identity_probe,
+    resolve_local_slicebuilder_host,
+    validate_slicebuilder_hosts,
 )
+from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.executors.kv_block_override import (
     adopt_worker_num_gpu_blocks_override,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
-from vllm_torchtpu.tpu_info import get_num_chips
 from vllm_torchtpu.utils import get_dp_size
 from vllm_torchtpu.worker.tpu_rank_binding import slice_binding_env
 
@@ -99,17 +97,14 @@ _TPU_WORKER_SPECIFIC_ENV_VARS: frozenset[str] = frozenset(
 )
 
 
-def _read_node_lws_worker_index() -> int | None:
-    """Return this Ray node's LWS_WORKER_INDEX (executed as a remote probe)."""
-    return tpu_envs.LWS_WORKER_INDEX
+_RAY_NODE_PROBE_TIMEOUT_S = 30.0
 
 
 @dataclass(frozen=True)
 class _SliceHostLayout:
     host_order: list[str]
     chips_per_host: dict[str, int]
-    ordered_by_worker_id: bool
-    hostnames_by_ip: dict[str, str]
+    sb_host_by_ip: dict[str, str]
 
 
 class RayDistributedExecutorV2(RayExecutorV2):
@@ -147,90 +142,78 @@ class RayDistributedExecutorV2(RayExecutorV2):
             )
         return dp_size, int(dp_rank), world_size * dp_size
 
-    def _verify_lws_worker_indices(
+    def _probe_ray_nodes(
         self,
-        hosts: list[tuple[int, str, int, str]],
-        hostnames_by_ip: dict[str, str],
-        leader_address: str,
+        nodes: list[tuple[str, str]],
         current_node_id: str | None,
-    ) -> bool:
-        """Verify every Ray node's ``ray.io/tpu-worker-id`` matches its LWS index."""
-        if len(hosts) != tpu_envs.LWS_GROUP_SIZE:
-            return False
-        try:
-            expected_short_names = [
-                lws_pod_hostname(leader_address, w_id).partition(".")[0]
-                for w_id, _, _, _ in hosts
-            ]
-        except ValueError:
-            return False
-        if all(
-            hostnames_by_ip.get(ip, "").partition(".")[0] == expected_name
-            for (_, ip, _, _), expected_name in zip(hosts, expected_short_names)
-        ):
-            return True
+    ) -> dict[str, tuple[int | None, str | None]] | None:
+        """Read ``(LWS_WORKER_INDEX, local_sb_host)`` once per Ray node.
 
-        if not any(":" in ip for _, ip, _, _ in hosts):
-            return False
-
-        lws_by_ip = resolve_lws_hosts_by_ip(leader_address, len(hosts))
-        if all(normalize_ip(ip) in lws_by_ip for _, ip, _, _ in hosts):
-            return all(
-                lws_by_ip[normalize_ip(ip)][0] == w_id for w_id, ip, _, _ in hosts
-            )
-
-        lws_worker_index = tpu_envs.LWS_WORKER_INDEX
-        remote_hosts: list[tuple[int, str, str]] = []
-        for w_id, ip, _, node_id in hosts:
+        Defines a local stdlib-only task so Ray pickles it by value and remote
+        probe workers never import ``vllm``, ``torch``, or ``libtpu``.
+        """
+        probed: dict[str, tuple[int | None, str | None]] = {}
+        remote_nodes: list[tuple[str, str]] = []
+        for node_id, node_ip in nodes:
             if current_node_id is not None and node_id == current_node_id:
-                if lws_worker_index is None or lws_worker_index != w_id:
-                    return False
+                try:
+                    local_sb_host: str | None = resolve_local_slicebuilder_host(node_ip)
+                except RuntimeError as exc:
+                    logger.warning(
+                        "RayDistributedExecutorV2 | Failed to resolve local "
+                        "slicebuilder host for %s: %s",
+                        node_ip,
+                        exc,
+                    )
+                    local_sb_host = None
+                probed[node_ip] = (tpu_envs.LWS_WORKER_INDEX, local_sb_host)
             else:
                 if not node_id:
-                    return False
-                remote_hosts.append((w_id, ip, node_id))
+                    return None
+                remote_nodes.append((node_id, node_ip))
 
-        if not remote_hosts:
-            return True
+        if not remote_nodes:
+            return probed
         if not ray.is_initialized():
-            return False
+            return None
 
+        leader_address = tpu_envs.LWS_LEADER_ADDRESS
         try:
-            probe_fn = ray.remote(_read_node_lws_worker_index)
+            probe_fn = ray.remote(make_node_identity_probe())
             refs = [
                 probe_fn.options(
                     num_cpus=0,
                     scheduling_strategy=NodeAffinitySchedulingStrategy(
                         node_id=node_id, soft=False
                     ),
-                ).remote()
-                for _, _, node_id in remote_hosts
+                ).remote(node_ip, leader_address)
+                for node_id, node_ip in remote_nodes
             ]
-            reported_indices = ray.get(refs)
+            reported = ray.get(refs, timeout=_RAY_NODE_PROBE_TIMEOUT_S)
         except Exception as exc:
             logger.warning(
-                "RayDistributedExecutorV2 | Failed to verify LWS_WORKER_INDEX on "
-                "remote Ray nodes (%s); disabling multi-NIC LWS worker-index "
-                "fallback.",
+                "RayDistributedExecutorV2 | Remote node identity probe failed "
+                "or timed out after %.1fs (%s).",
+                _RAY_NODE_PROBE_TIMEOUT_S,
                 exc,
             )
-            return False
+            return None
 
-        for (w_id, ip, _), reported in zip(remote_hosts, reported_indices):
-            if reported != w_id:
-                logger.warning(
-                    "RayDistributedExecutorV2 | Ray node %s has "
-                    "ray.io/tpu-worker-id=%d but LWS_WORKER_INDEX=%r; disabling "
-                    "multi-NIC LWS worker-index fallback.",
-                    ip,
-                    w_id,
-                    reported,
-                )
-                return False
-        return True
+        for (_, node_ip), result in zip(remote_nodes, reported):
+            probed[node_ip] = result
+        return probed
 
     def _resolve_slice_host_layout(self, device_str: str) -> _SliceHostLayout:
-        """Resolve slice host order, device counts, ordering source, and hostnames."""
+        """Resolve and cache slice host order, device counts, and slicebuilder hosts."""
+        cache: dict[str, _SliceHostLayout] | None = getattr(
+            self, "_slice_host_layout_cache", None
+        )
+        if cache is None:
+            cache = {}
+            self._slice_host_layout_cache = cache
+        if device_str in cache:
+            return cache[device_str]
+
         hosts: list[tuple[int, str, int, str]] = []
         hostnames_by_ip: dict[str, str] = {}
         has_worker_id = True
@@ -275,8 +258,19 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
             hosts.append((w_id, node_ip, int(resources[device_str]), node_id))
 
+        needs_sb_host = any(":" in ip for _, ip, _, _ in hosts)
+        needs_lws_order = (
+            len(hosts) > 1 and not has_worker_id and bool(tpu_envs.LWS_LEADER_ADDRESS)
+        )
+        probed = (
+            self._probe_ray_nodes(
+                [(node_id, ip) for _, ip, _, node_id in hosts], current_node_id
+            )
+            if (needs_sb_host or needs_lws_order)
+            else None
+        )
+
         ordered_by = "IP"
-        ordered_by_worker_id = False
         if has_worker_id and len(hosts) > 0:
             hosts.sort(key=lambda x: (x[0], x[1]))
             actual_w_ids = [w_id for w_id, _, _, _ in hosts]
@@ -292,53 +286,41 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 hosts.sort(key=lambda x: x[1])
             else:
                 ordered_by = "ray.io/tpu-worker-id"
-                # Ray populates ray.io/tpu-worker-id from TPU_WORKER_ID at
-                # `ray start`. Under LWS, verify every node's label agrees with
-                # its LWS pod index before trusting position for DNS fallback.
-                leader_address = tpu_envs.LWS_LEADER_ADDRESS
-                ordered_by_worker_id = not leader_address or (
-                    self._verify_lws_worker_indices(
-                        hosts, hostnames_by_ip, leader_address, current_node_id
-                    )
-                )
         else:
             lws_ordered = False
-            if len(hosts) > 1 and tpu_envs.LWS_LEADER_ADDRESS:
-                lws_by_ip = resolve_lws_hosts_by_ip(
-                    tpu_envs.LWS_LEADER_ADDRESS, len(hosts)
-                )
-                if all(normalize_ip(ip) in lws_by_ip for _, ip, _, _ in hosts):
-                    lws_hosts = [
-                        (lws_by_ip[normalize_ip(ip)][0], ip, count, node_id)
-                        for _, ip, count, node_id in hosts
-                    ]
+            if needs_lws_order and probed is not None:
+                lws_hosts = [
+                    (w_id, ip, count, node_id)
+                    for _, ip, count, node_id in hosts
+                    if (w_id := probed[ip][0]) is not None
+                ]
+                if len(lws_hosts) == len(hosts):
                     lws_hosts.sort(key=lambda x: (x[0], x[1]))
                     if [w_id for w_id, _, _, _ in lws_hosts] == list(range(len(hosts))):
                         hosts = lws_hosts
-                        ordered_by = "LWS_LEADER_ADDRESS DNS"
-                        ordered_by_worker_id = True
+                        ordered_by = "LWS_WORKER_INDEX"
                         lws_ordered = True
             if not lws_ordered:
                 if len(hosts) > 1:
-                    if tpu_envs.LWS_LEADER_ADDRESS:
-                        logger.warning(
-                            "RayDistributedExecutorV2 | Multi-host TPU detected "
-                            "(%d hosts): 'ray.io/tpu-worker-id' label is missing "
-                            "and LWS_LEADER_ADDRESS (%s) DNS did not match Ray "
-                            "node IPs. Falling back to IP sorting, which may "
-                            "mismatch ICI hardware topology.",
-                            len(hosts),
-                            tpu_envs.LWS_LEADER_ADDRESS,
-                        )
-                    else:
-                        logger.warning(
-                            "RayDistributedExecutorV2 | Multi-host TPU detected (%d "
-                            "hosts) but 'ray.io/tpu-worker-id' label is missing on "
-                            "one or more nodes. Falling back to IP sorting, which may "
-                            "mismatch ICI hardware topology.",
-                            len(hosts),
-                        )
+                    logger.warning(
+                        "RayDistributedExecutorV2 | Multi-host TPU detected (%d "
+                        "hosts) but 'ray.io/tpu-worker-id' label is missing on "
+                        "one or more nodes. Falling back to IP sorting, which may "
+                        "mismatch ICI hardware topology.",
+                        len(hosts),
+                    )
                 hosts.sort(key=lambda x: x[1])
+
+        host_order = [ip for _, ip, _, _ in hosts]
+        if needs_sb_host:
+            if probed is not None:
+                raw_sb_hosts = [probed[ip][1] or "" for ip in host_order]
+            else:
+                raw_sb_hosts = [hostnames_by_ip.get(ip, "") for ip in host_order]
+            validated_sb_hosts = validate_slicebuilder_hosts(host_order, raw_sb_hosts)
+            sb_host_by_ip = dict(zip(host_order, validated_sb_hosts))
+        else:
+            sb_host_by_ip = {ip: ip for ip in host_order}
 
         logger.info(
             "RayDistributedExecutorV2 | Resolved %d TPU slice hosts "
@@ -347,12 +329,13 @@ class RayDistributedExecutorV2(RayExecutorV2):
             ordered_by,
             [(w_id, ip) for w_id, ip, _, _ in hosts],
         )
-        return _SliceHostLayout(
-            host_order=[ip for _, ip, _, _ in hosts],
+        layout = _SliceHostLayout(
+            host_order=host_order,
             chips_per_host={ip: count for _, ip, count, _ in hosts},
-            ordered_by_worker_id=ordered_by_worker_id,
-            hostnames_by_ip=hostnames_by_ip,
+            sb_host_by_ip=sb_host_by_ip,
         )
+        cache[device_str] = layout
+        return layout
 
     def _slice_host_layout(self, device_str: str) -> tuple[list[str], dict[str, int]]:
         """Return the slice's hosts in rank order and their device counts.
@@ -567,13 +550,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
             offset += chips_per_host[ip]
 
         base_port = tpu_envs.TORCH_TPU_BASE_PORT
-        sb_host_by_ip = resolve_slicebuilder_hosts(
-            host_order,
-            ordered_by_worker_id=slice_layout.ordered_by_worker_id,
-            hostnames_by_ip=slice_layout.hostnames_by_ip,
-        )
         sb_addresses = [
-            f"{sb_host_by_ip[ip]}:{base_port + chip}"
+            f"{slice_layout.sb_host_by_ip[ip]}:{base_port + chip}"
             for ip in host_order
             for chip in range(chips_per_host[ip])
         ]
@@ -836,27 +814,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
             len(nodes_with_device),
             len(ray_nodes),
         )
-
-        # Ray counts every numeric /dev/vfio group. A privileged bare-metal pod
-        # also sees SR-IOV management functions there, so Ray over-reports and
-        # the slice layout would be built with too many devices per host.
-        current_node_id = ray.get_runtime_context().get_node_id()
-        ray_devices = next(
-            (
-                int(n["Resources"][device_str])
-                for n in nodes_with_device
-                if n.get("NodeID") == current_node_id
-            ),
-            0,
-        )
-        usable_devices = get_num_chips()
-        if 0 < usable_devices < ray_devices:
-            raise ValueError(
-                f"Ray reports {ray_devices} {device_str} on this node but only "
-                f"{usable_devices} TPU compute devices are usable here. Restart "
-                "Ray on every host with "
-                f"`ray start --resources '{{\"{device_str}\": {usable_devices}}}'`."
-            )
 
         dp_size, dp_rank, _ = self._get_dp_geometry()
         if pp_size == 1 and dp_size > 1:

@@ -69,7 +69,10 @@ import torch.distributed as dist
 from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.utils import resolve_slicebuilder_hosts
+from vllm_torchtpu.distributed.slicebuilder_hosts import (
+    resolve_local_slicebuilder_host,
+    validate_slicebuilder_hosts,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -95,12 +98,12 @@ def _rendezvous_port(base_port: int) -> int:
     return int(base_port) + 1
 
 
-def _rendezvous_host_ips(
+def _rendezvous_hosts(
     *, num_peers: int, peer_index: int, master_addr: str, port: int, key_prefix: str
-) -> tuple[list[str], str]:
-    """Exchange every peer's IP (and a shared xprof session id) via TCPStore.
+) -> tuple[list[str], list[str], str]:
+    """Exchange each peer's IP, slicebuilder host, and xprof session id via TCPStore.
 
-    Returns (host_ips ordered by peer_index, xprof_session_id).
+    Returns (host_ips, sb_hosts, xprof_session_id) ordered by peer_index.
     """
     is_master = peer_index == 0
     store = dist.TCPStore(
@@ -114,35 +117,23 @@ def _rendezvous_host_ips(
         # Keep the server thread alive; see module-level comment.
         _keepalive_stores.append(store)
 
-    store.set(f"{key_prefix}_ip_{peer_index}", get_ip())
+    local_ip = get_ip()
+    local_sb_host = resolve_local_slicebuilder_host(local_ip)
+    store.set(f"{key_prefix}_ip_{peer_index}", local_ip)
+    store.set(f"{key_prefix}_sb_host_{peer_index}", local_sb_host)
     if is_master:
         store.set(f"{key_prefix}_xprof_session_id", str(time.time_ns()))
 
     ip_keys = [f"{key_prefix}_ip_{i}" for i in range(num_peers)]
-    wait_keys = ip_keys + [f"{key_prefix}_xprof_session_id"]
+    sb_host_keys = [f"{key_prefix}_sb_host_{i}" for i in range(num_peers)]
+    wait_keys = ip_keys + sb_host_keys + [f"{key_prefix}_xprof_session_id"]
     store.wait(wait_keys, timedelta(seconds=_RENDEZVOUS_TIMEOUT_S))
     host_ips = [store.get(key).decode() for key in ip_keys]
+    sb_hosts = validate_slicebuilder_hosts(
+        host_ips, [store.get(key).decode() for key in sb_host_keys]
+    )
     xprof_session_id = store.get(f"{key_prefix}_xprof_session_id").decode()
-    return host_ips, xprof_session_id
-
-
-def _lws_ordered_by_worker_id(
-    host_ips: list[str], peer_index: int, rank_name: str
-) -> bool:
-    """Validate and return whether ``peer_index`` maps 1:1 to ``LWS_WORKER_INDEX``."""
-    if not any(":" in ip for ip in host_ips) or not envs.LWS_LEADER_ADDRESS:
-        return False
-    num_hosts = len(host_ips)
-    if num_hosts != envs.LWS_GROUP_SIZE:
-        return False
-    lws_worker_index = envs.LWS_WORKER_INDEX
-    if lws_worker_index is not None and lws_worker_index != peer_index:
-        raise ValueError(
-            f"{rank_name} ({peer_index}) must match LWS_WORKER_INDEX "
-            f"({lws_worker_index}) for IPv6 LWS slicebuilder resolution "
-            f"when LWS_GROUP_SIZE == {num_hosts}."
-        )
-    return True
+    return host_ips, sb_hosts, xprof_session_id
 
 
 def prepare_mp_multihost_env(parallel_config) -> None:
@@ -180,24 +171,20 @@ def prepare_mp_multihost_env(parallel_config) -> None:
         rendezvous_port,
     )
 
-    host_ips, xprof_session_id = _rendezvous_host_ips(
+    host_ips, sb_hosts, xprof_session_id = _rendezvous_hosts(
         num_peers=nnodes,
         peer_index=node_rank,
         master_addr=master_addr,
         port=rendezvous_port,
         key_prefix="tpu_mp_nnodes",
     )
-    ordered_by_worker_id = _lws_ordered_by_worker_id(host_ips, node_rank, "node_rank")
 
     # Same construction as ray_distributed_executor_v2.py: one address per chip,
     # ordered by (host, local_rank), spanning every host in the slice.
     base_port = envs.TORCH_TPU_BASE_PORT
-    sb_host_by_ip = resolve_slicebuilder_hosts(
-        host_ips, ordered_by_worker_id=ordered_by_worker_id
-    )
     sb_addresses = [
-        f"{sb_host_by_ip[ip]}:{base_port + local_rank}"
-        for ip in host_ips
+        f"{sb_host}:{base_port + local_rank}"
+        for sb_host in sb_hosts
         for local_rank in range(local_world_size)
     ]
     os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
@@ -285,15 +272,12 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
         rendezvous_port,
     )
 
-    host_ips, xprof_session_id = _rendezvous_host_ips(
+    host_ips, sb_hosts, xprof_session_id = _rendezvous_hosts(
         num_peers=num_hosts,
         peer_index=node_index,
         master_addr=master_addr,
         port=rendezvous_port,
         key_prefix="tpu_mp_dp",
-    )
-    ordered_by_worker_id = _lws_ordered_by_worker_id(
-        host_ips, node_index, "data_parallel node_index"
     )
 
     # One address per local chip on each host (world_size per DP replica x
@@ -304,12 +288,9 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     world_size = parallel_config.world_size
     local_chip_count = world_size * dp_size_local
     base_port = envs.TORCH_TPU_BASE_PORT
-    sb_host_by_ip = resolve_slicebuilder_hosts(
-        host_ips, ordered_by_worker_id=ordered_by_worker_id
-    )
     sb_addresses = [
-        f"{sb_host_by_ip[ip]}:{base_port + local_slot}"
-        for ip in host_ips
+        f"{sb_host}:{base_port + local_slot}"
+        for sb_host in sb_hosts
         for local_slot in range(local_chip_count)
     ]
     os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(sb_addresses)
