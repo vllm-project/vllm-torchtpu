@@ -31,7 +31,7 @@ This branch is `caojx/qwen38-flash-1124-2` plus the code behind every q38 dash p
 | `Q38_FORM=k_sup` | B3 supersede `cc23d50903` | `15bc882819` |
 | `Q38_FORM=oxk` | K3-ox.1 `1ea5a165a7` overlay (= `859e11f16e`) | `033a46e02a` |
 | `Q38_FORM=d1121` | `d8f139fa` (= `caojx/qwen38-flash-1121`), default form | `47ed2c5504` (= `9cd151fab5` without `_forms/`, `__init__.py` = its `_bl_init.py`) |
-| `Q38_FORM=k_sb11` | SB1-1 served head `17739744d1` (B1 record candidate, see below) | `577f761fba` |
+| `Q38_FORM=k_sb11` | SB1-1 served head `17739744d1` (B1, posted 2026-11-25 03:08Z) | `577f761fba` |
 
 | Proxy form | Blob | Source |
 |---|---|---|
@@ -71,16 +71,33 @@ one is file-for-file identical to the commit). Env delta = what to add to the po
 | B6 | HIX-o p4c56m | 43.91 @ 426.27 (2.55 s) | j-64d5ef35 | `859e11f16e` | same | drop `Q38_OXPD_FORM=1`; `Q38_FORM=oxk Q38_PROXY_FORM=opener` |
 | B6 | HIX-o p4c40m | 31.45 @ 437.66 (1.45 s) | j-52573012 | `859e11f16e` | same | drop `Q38_OXPD_FORM=1`; `Q38_FORM=oxk Q38_PROXY_FORM=opener` |
 
-**Record candidate, not yet on the sheet (BRANCH-KEEPER, 2026-11-25).** Its form is stored now, before its post, so that the code exists
-on this branch first. Until the sheet tags it, B1 is the T58x c212 row above (`k_cut1`).
+**Posted 2026-11-25 03:08Z on `q38-pd-ixc-frontier-1118`** (it untagged B1 T58x c212 `k_cut1`, j-1070e35b, as dominated; that row stays
+here so its point remains reproducible).
 
 | Band | Point | Mtok/$ @ x (TTFT p90) | Job | Commit | SRC / TREE / N | Env delta |
 |---|---|---|---|---|---|---|
-| B1 | SB1-1 c212 (record candidate) | 307.30 @ 83.28 (5.75 s) | j-4be755be | `17739744d1` | 0d6c7d50a3 / e7753a66e8750121 / 1709 | `Q38_FORM=k_sb11 Q38_PROXY_FORM=k` |
+| B1 | SB1-1 c212 (posted 2026-11-25 03:08Z) | 307.30 @ 83.28 (5.75 s) | j-4be755be | `17739744d1` | 0d6c7d50a3 / e7753a66e8750121 / 1709 | `Q38_FORM=k_sb11 Q38_PROXY_FORM=k` |
 
 Bands are by p90 interactivity: B1 ≤ 110, B2 110-140, B3 140-160, B4 160-205, B5 205-275, B6 ≥ 275 tok/s/user.
 The 1P1D sheet is performance of record with accuracy uncertified. Routing disclosures (sticky decode routing on the
 B3/B4 and HIX points, header-free `opener` key on the cache cars and HIX-o) are as recorded in each point's env.
+
+## Living forms (where new q38 work lands)
+
+The forms above are frozen: each is exactly what one dash point ran, and none is ever edited. New q38 work lands in a
+living form, one per lineage, env-keyed and default-off, so the team builds on one branch:
+
+| Form | Lineage | Package tree (git) | Lever keys (all default off) |
+|---|---|---|---|
+| `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` (clean merge) | `5140ebd562` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above |
+
+- `b1` is a merge that has not yet run on a device: no served car stacks QGLUE-1 with SB1-1 on `b1` before one device
+  bitwise check on `b1`.
+- To work on a lineage: branch from `caojx/qwen38-flash-1124`, edit `src/vllm_torchtpu/_forms/<form>/vllm_torchtpu/`,
+  and run with `Q38_FORM=<form>`. Register every new key in that form's `envs.py`, so it enters the compile key.
+- Dash-bound full runs run from a pushed commit of `caojx/qwen38-flash-1124` only.
+- A living form runs its own package: it does not get changes made to the main package (for example
+  `VLLM_TPU_SHARED_BACKEND_CACHE`). Folding the living forms into the main package is the planned convergence step.
 
 ## Notes
 

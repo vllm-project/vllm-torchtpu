@@ -1,0 +1,1483 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Connector wiring for the store-backed Raiden KV offload path.
+
+`TPURaidenOffloadingConnector` subclasses vLLM's `OffloadingConnector` and
+orchestrates controller-driven KV offloading via Raiden's C++ `KVCacheStore`.
+Enable it via:
+
+    --kv-transfer-config '{
+        "kv_connector": "TPURaidenOffloadingConnector",
+        "kv_connector_module_path": "vllm_torchtpu.offload.raiden_connector",
+        "kv_role": "kv_both",
+        "kv_connector_extra_config": {"cpu_bytes_to_use": ...}
+    }'
+
+Core mechanisms:
+
+- Save fence: Guarantees background store jobs read HBM only after the forward
+  pass writing those KV blocks completes, without inducing device idle bubbles.
+  Store jobs ship as `fence_job_ids`. Each rank enqueues KV pool writes
+  asynchronously, records a TPU event covering them, and polls for device
+  retirement across engine steps before acknowledging via `fenced_jobs`.
+  The scheduler launches `save()` only after all ranks have acknowledged.
+
+- Completion echoes: Terminal jobs discovered by the scheduler manager ship
+  down to workers, which echo them back as `completed_jobs` / `finished_recving`
+  to unblock waiting requests and maintain reference counting. Failed loads
+  report their destination blocks for automatic recomputation.
+
+- Memory reuse (jobs_to_flush): Handled entirely scheduler-side. Fence-pending
+  stores are cancelled before launching, while active transfers are drained
+  synchronously before shipping metadata, preventing torn reads upon block reuse.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from collections import Counter
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+import torch
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    KVConnectorMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+    config as offloading_config_module,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingConnectorMetadata,
+    OffloadingWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+    OffloadingConnectorScheduler,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
+    OffloadingConnectorWorker,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
+    OffloadingConnector,
+)
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCacheRef,
+    CanonicalKVCaches,
+    CanonicalKVCacheTensor,
+    GPULoadStoreSpec,
+    OffloadKey,
+    get_offload_group_idx,
+    make_offload_key,
+)
+from vllm.v1.outputs import KVConnectorOutput
+
+from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.offload import lookup_log, victim
+from vllm_torchtpu.offload.raiden_store import (
+    AdmissionOp,
+    RaidenLoadStoreSpec,
+    RaidenOffloadingManager,
+    TPURaidenStoreOffloadingSpec,
+)
+from vllm_torchtpu.offload.tier_check import CHECK_FIELDS, TierCheck
+from vllm_torchtpu.offload.tier_classes import TieredOffloadingManager
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_events import KVCacheEvent
+    from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+
+
+def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
+    """Asynchronously dispatches graph execution for KV pool buffers without blocking.
+
+    Triggers compilation and submission of any deferred operations targeting the
+    pool buffers so that subsequent stream events order behind them. Performs a
+    non-blocking device synchronization (`wait=False`), which dispatches no new
+    work when the writes are already enqueued.
+    """
+    from torch_tpu._internal import sync
+
+    sync.synchronize(pool_tensors, wait=False)
+
+
+def _record_fence_event() -> torch.Event:
+    """Records a TPU stream event to track completion of enqueued device operations.
+
+    The event orders after work already submitted to the stream, so callers
+    enqueue the writes they need fenced (via `_enqueue_pool_writes`) before
+    recording.
+    """
+    event = torch.tpu.Event()
+    event.record()
+    return event
+
+
+def _event_is_retired(event: torch.Event) -> bool:
+    """Non-blockingly verifies fence event completion and surfaces deferred errors.
+
+    `event.query()` polls device status without blocking the host thread. Once
+    execution terminates, calling `event.synchronize()` returns immediately and
+    raises any deferred asynchronous runtime errors before acknowledging the fence.
+    """
+    if not event.query():
+        return False
+    event.synchronize()
+    return True
+
+
+@dataclass
+class RaidenOffloadingConnectorMetadata(OffloadingConnectorMetadata):
+    """Scheduler -> worker metadata.
+
+    Transfers are controller-driven (load_jobs and store_jobs are empty);
+    extra fields carry fence requests and completion echoes.
+    """
+
+    # Store jobs awaiting device fence from all ranks before launching save.
+    fence_job_ids: set[int] = field(default_factory=set)
+    # Completed store jobs to echo back to the scheduler state machine.
+    finished_store_job_ids: list[int] = field(default_factory=list)
+    # Completed load jobs (job_id -> req_id) to echo back and unblock requests.
+    finished_load_jobs: dict[int, str] = field(default_factory=dict)
+    # Destination device blocks of failed loads, reported for scheduler recompute.
+    failed_load_device_block_ids: list[int] = field(default_factory=list)
+    # Tier check mode (offload/tier_check.py): (class, key, block) of entries
+    # saved and of keys restored, for every worker to hash before the forward.
+    tier_check_stores: list[tuple[str, bytes, int]] = field(default_factory=list)
+    tier_check_loads: list[tuple[str, bytes, int]] = field(default_factory=list)
+
+
+@dataclass
+class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
+    """Worker -> scheduler metadata: contains completed-job echoes and
+    per-rank fence acks."""
+
+    fenced_jobs: dict[int, int] = field(default_factory=dict)
+    # Tier check mode: per class, counts in tier_check.CHECK_FIELDS order.
+    tier_check: dict[str, list[int]] = field(default_factory=dict)
+
+    def aggregate(self, other):
+        assert isinstance(other, RaidenOffloadingWorkerMetadata)
+        merged_completed = dict(self.completed_jobs)
+        for job_id, v in other.completed_jobs.items():
+            merged_completed[job_id] = merged_completed.get(job_id, 0) + v
+        merged_fenced = dict(self.fenced_jobs)
+        for job_id, v in other.fenced_jobs.items():
+            merged_fenced[job_id] = merged_fenced.get(job_id, 0) + v
+        merged_check = {name: list(v) for name, v in self.tier_check.items()}
+        for name, v in other.tier_check.items():
+            mine = merged_check.setdefault(name, [0] * len(v))
+            merged_check[name] = [a + b for a, b in zip(mine, v)]
+        # completed_jobs and transfer_stats are inherited from vLLM base dataclass.
+        return RaidenOffloadingWorkerMetadata(
+            # pyrefly: ignore[unexpected-keyword]
+            completed_jobs=merged_completed,
+            # pyrefly: ignore[unexpected-keyword]
+            transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
+            fenced_jobs=merged_fenced,
+            tier_check=merged_check,
+        )
+
+
+_V1_UNLIMITED = 1 << 62   # cgroup v1 reports "no limit" as a page-rounded 2**63 - 1
+
+
+def _own_cgroup_paths(proc_cgroup: str) -> tuple[str | None, str | None]:
+    """This process's cgroup path for v2 (``0::<path>``) and for the v1 memory controller (``N:...memory...:<path>``)."""
+    v2 = v1 = None
+    try:
+        with open(proc_cgroup) as f:
+            for line in f:
+                parts = line.rstrip("\n").split(":", 2)
+                if len(parts) != 3:
+                    continue
+                hier, controllers, path = parts
+                if hier == "0" and controllers == "":
+                    v2 = path
+                elif "memory" in controllers.split(","):
+                    v1 = path
+    except OSError:
+        pass
+    return v2, v1
+
+
+def _cgroup_memory(
+    root: str = "/sys/fs/cgroup", proc_cgroup: str = "/proc/self/cgroup"
+) -> dict[str, int | str | None]:
+    """The container's memory: current, peak and limit bytes, and the files they came from (``source``).
+
+    Tried in order, first readable usage wins:
+      v2 at this process's own cgroup (``<root><path>/memory.{current,peak,max}``; a container that sees the host
+      hierarchy, as CP3's serving container appears to, has no ``memory.*`` files at the root), then v2 at the root
+      (a namespaced container), then v1 at the own path and at the root
+      (``<root>/memory[<path>]/memory.{usage_in_bytes,max_usage_in_bytes,limit_in_bytes}``).
+    "No limit" (v2 ``max``, v1 >= 2**62) reads as None. Nothing readable: all None, ``source`` = "none".
+    """
+
+    def read(path: str) -> int | None:
+        try:
+            with open(path) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    v2, v1 = _own_cgroup_paths(proc_cgroup)
+    cands: list[tuple[str, str, tuple[str, str, str]]] = []
+    v2_files = ("memory.current", "memory.peak", "memory.max")
+    v1_files = ("memory.usage_in_bytes", "memory.max_usage_in_bytes", "memory.limit_in_bytes")
+    if v2 and v2 != "/":
+        cands.append(("v2:own", root + v2, v2_files))
+    cands.append(("v2:root", root, v2_files))
+    if v1 and v1 != "/":
+        cands.append(("v1:own", f"{root}/memory{v1}", v1_files))
+    cands.append(("v1:root", f"{root}/memory", v1_files))
+    for source, base, (cur_f, peak_f, max_f) in cands:
+        current = read(f"{base}/{cur_f}")
+        if current is None:
+            continue
+        limit = read(f"{base}/{max_f}")
+        if limit is not None and source.startswith("v1") and limit >= _V1_UNLIMITED:
+            limit = None
+        return {"current": current, "peak": read(f"{base}/{peak_f}"), "max": limit, "source": source}
+    return {"current": None, "peak": None, "max": None, "source": "none"}
+
+
+def _planned_region_storages(
+    kv_cache_config: KVCacheConfig,
+    kv_caches: Mapping[str, torch.Tensor | list[torch.Tensor]],
+) -> tuple[dict[int, tuple[torch.UntypedStorage, torch.device]], list[set[int]]]:
+    """The pool storages keyed by the region the model's plan gives their
+    layers (``layer_to_pool_index``), in region order, and each group's region
+    set. Fails when a layer's tensors sit outside its planned region's storage
+    or two regions share one."""
+    from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
+
+    index = layer_to_pool_index(kv_cache_config)
+    by_region: dict[int, tuple[torch.UntypedStorage, torch.device]] = {}
+    unplanned: list[tuple[str, torch.UntypedStorage]] = []
+    for name, layer_kv_cache in kv_caches.items():
+        state_tensors = (
+            [layer_kv_cache]
+            if isinstance(layer_kv_cache, torch.Tensor)
+            else layer_kv_cache
+        )
+        for tensor in state_tensors:
+            storage = tensor.untyped_storage()
+            if name not in index:
+                unplanned.append((name, storage))
+                continue
+            region = index[name]
+            seen = by_region.setdefault(region, (storage, tensor.device))
+            assert seen[0].data_ptr() == storage.data_ptr(), (
+                f"host tier classes: layer {name} is planned in pool region "
+                f"{region} but its tensor sits in another storage"
+            )
+    ptrs = [storage.data_ptr() for storage, _ in by_region.values()]
+    assert len(set(ptrs)) == len(ptrs), (
+        "host tier classes: two planned pool regions share one storage"
+    )
+    assert sorted(by_region) == list(range(len(by_region))), sorted(by_region)
+    for name, storage in unplanned:
+        # A layer that shares another's cache: it must sit in a region.
+        assert storage.data_ptr() in ptrs, (
+            f"host tier classes: layer {name} is outside every planned region"
+        )
+    group_regions = [
+        {index[name] for name in group.layer_names}
+        for group in kv_cache_config.kv_cache_groups
+    ]
+    return {r: by_region[r] for r in sorted(by_region)}, group_regions
+
+
+def _build_tier_check(connector_worker, kv_caches, group_regions) -> TierCheck:
+    """The worker's check: per class, the raw region tensors it registers here (the
+    tensors the model allocated, ``[num_blocks, *page]``, not reinterpreted views)."""
+    from vllm.distributed import parallel_state
+
+    from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
+
+    kv_cache_config = connector_worker.kv_cache_config
+    plan = connector_worker.spec.tier_plan
+    assert plan is not None
+    index = layer_to_pool_index(kv_cache_config)
+    raw: dict[int, torch.Tensor] = {}
+    for name, layer_kv_cache in kv_caches.items():
+        if name not in index:
+            continue
+        for tensor in (
+            [layer_kv_cache]
+            if isinstance(layer_kv_cache, torch.Tensor)
+            else layer_kv_cache
+        ):
+            storage = tensor.untyped_storage()
+            if (
+                tensor.storage_offset() == 0
+                and tensor.is_contiguous()
+                and tensor.shape[0] == kv_cache_config.num_blocks
+                and tensor.numel() * tensor.element_size() == storage.nbytes()
+            ):
+                raw.setdefault(index[name], tensor)
+    regions: dict[str, list[torch.Tensor]] = {}
+    live: dict[str, int] = {}
+    rank = parallel_state.get_world_group().rank_in_group
+    for tier_class in plan.classes:
+        if tier_class.shard_of is not None and not tier_class.worker_regions[rank]:
+            # TIER-X2: another shard of the class moves this rank's rows.
+            regions[tier_class.name] = []
+            live[tier_class.name] = tier_class.row_bytes
+            continue
+        own = sorted({r for g in tier_class.groups for r in group_regions[g]})
+        missing = [r for r in own if r not in raw]
+        if missing:
+            raise ValueError(
+                "VLLM_TPU_OFFLOAD_TIER_CHECK: no tensor spans pool regions "
+                f"{missing} whole, so the {tier_class.name} rows cannot be read"
+            )
+        regions[tier_class.name] = [raw[r] for r in own]
+        live[tier_class.name] = tier_class.row_bytes
+    logger.info(
+        "TPURaidenOffloadingConnector: tier check mode on, rank %d hashes classes %s",
+        rank,
+        {name: len(r) for name, r in regions.items() if r},
+    )
+    return TierCheck(regions, live, rank)
+
+
+def divergent_hits_restore_state(
+    kv_cache_config: KVCacheConfig, offloaded_group_ids: Iterable[int]
+) -> bool:
+    """Whether every load from this host tier restores the recurrent state at the
+    boundary it ends on, so a local hit that adopted no state is complete once the
+    load lands (VLLM_TPU_OFFLOAD_DIVERGENT_HITS).
+
+    True when the model has prefix-cacheable state (Mamba-kind: GDN, PLE) groups
+    and the tier offloads every one of them: the connector looks a state group up
+    as a one-chunk window that ends exactly at the hit
+    (``OffloadingConnectorScheduler._lookup_complete_chunks``), so no tier hit
+    exists without each state group's checkpoint at that boundary, and the load
+    writes it. A model with no state group gains nothing from a divergent hit, and
+    a state group the tier does not hold could never be restored.
+    """
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    state = {
+        gid
+        for gid, group in enumerate(kv_cache_config.kv_cache_groups)
+        if group.kv_cache_spec.prefix_cacheable
+        and isinstance(group.kv_cache_spec, MambaSpec)
+    }
+    return bool(state) and state <= set(offloaded_group_ids)
+
+
+@dataclass
+class _ParkedStore:
+    """A store job parked until every worker rank acknowledges the device fence."""
+
+    keys: list[OffloadKey]
+    device_block_ids: list[int]
+    acks: int = 0
+
+
+# -- q38 PSTEP-VASYNC (VLLM_TPU_OFFLOAD_VICTIM_ASYNC; default 0 = off) ----------
+#
+# The victim policy stores a block when BlockPool.get_new_blocks evicts it, and
+# get_new_blocks hands that block to its new owner in the same schedule pass, so
+# the store must drain before the pass's metadata ships (_store_victims). With
+# the key set to N > 0 the scheduler also evicts ahead: after the pass's own
+# victims drained, it takes up to N cached blocks from the head of each pool's
+# free queue (the blocks the next allocations would evict), removes them from
+# the free queue and from the prefix cache, submits their store job and does not
+# wait. The blocks are held out of the free queue ("parked") until the manager
+# reports the job terminal (a FinishedJob record, read by a non-blocking poll at
+# the next pass's first allocation and at build_connector_meta); only then do
+# they go back to the head of the free queue, hashless, so the next allocations
+# take them without evicting (and without a synchronous store). The pool still
+# counts parked blocks as free; an allocation that needs more blocks than the
+# free queue holds drains this pool's parked jobs first, oldest first, with
+# today's synchronous drain. Device programs are unchanged.
+
+_VASYNC: _VictimAsync | None = None
+
+
+def _patch_block_pool_victim_async() -> None:
+    """Wraps ``BlockPool.get_new_blocks`` and ``BlockPool.get_num_free_blocks``
+    at class level; inert unless a ``_VictimAsync`` is active. Installed after
+    ``victim.patch_block_pool_victims`` (its allocation window and victim record
+    stay inside this wrapper). Idempotent."""
+    from vllm.v1.core.block_pool import BlockPool
+
+    if BlockPool.__dict__.get("_q38_vasync_patch", False):
+        return
+    orig_get = BlockPool.get_new_blocks
+    orig_free = BlockPool.get_num_free_blocks
+
+    def get_new_blocks(self, num_blocks):
+        vasync = _VASYNC
+        if vasync is None:
+            return orig_get(self, num_blocks)
+        vasync.before_alloc(self, num_blocks)
+        seen = len(vasync.tap.pending)
+        out = orig_get(self, num_blocks)
+        if len(vasync.tap.pending) > seen:
+            # This pool evicts blocks the policy stores: evict ahead on it.
+            vasync.pools.setdefault(id(self), self)
+        return out
+
+    def get_num_free_blocks(self):
+        vasync = _VASYNC
+        n = orig_free(self)
+        return n if vasync is None else n + vasync.parked_blocks(self)
+
+    BlockPool.get_new_blocks = get_new_blocks
+    BlockPool.get_num_free_blocks = get_num_free_blocks
+    BlockPool._q38_vasync_patch = True
+
+
+@dataclass
+class _ParkedVictims:
+    """The source blocks of one asynchronous victim store job, held out of the
+    free queue and out of the prefix cache until the job is terminal."""
+
+    pool: object
+    blocks: list
+    queued_at: float
+
+
+class _VictimAsync:
+    """VLLM_TPU_OFFLOAD_VICTIM_ASYNC state of one scheduler connector (the
+    EngineCore process; the scheduler thread is the only caller)."""
+
+    def __init__(self, sched: TPURaidenOffloadingScheduler, reserve: int):
+        self.sched = sched
+        self.reserve = reserve
+        self.tap = sched._victim_tap
+        self.fatal = bool(sched.__dict__.get("_fatal_drain", False))
+        # Pools whose allocations evicted a block the policy stores.
+        self.pools: dict[int, object] = {}
+        # job_id -> parked blocks, in submission order.
+        self.parked: dict[int, _ParkedVictims] = {}
+        self.count: dict[int, int] = {}
+        # Records of other jobs a reclaim polled before build_connector_meta;
+        # the next poll_finished_jobs returns them first.
+        self.stash: list = []
+        # Jobs a timed-out drain gave up (single store only): their late
+        # records are dropped, never echoed.
+        self.abandoned: set[int] = set()
+        self.reclaimed_at: int | None = None
+        manager = sched._raiden_manager
+        # The manager's own chain (lookup_log's wrappers, then the class).
+        self._poll = manager.poll_finished_jobs
+        self._drain = manager.drain_jobs
+        # Every poll of the manager's jobs goes through _route: a parked job's
+        # record releases its blocks and never reaches the workers' echo (vLLM's
+        # update_connector_output knows no victim job ids).
+        manager.poll_finished_jobs = self.poll_finished_jobs
+
+    def parked_blocks(self, pool) -> int:
+        return self.count.get(id(pool), 0)
+
+    def _tel(self, name: str, n: int = 1) -> None:
+        tel = self.sched.telemetry
+        tel[name] = tel.get(name, 0) + n
+
+    def _release(self, rec: _ParkedVictims, success: bool) -> None:
+        pool = rec.pool
+        self.count[id(pool)] -= len(rec.blocks)
+        pool.free_block_queue.prepend_n(rec.blocks)
+        self._tel("victim_async_done" if success else "victim_async_failed")
+        self._tel("victim_async_released_blocks", len(rec.blocks))
+        self._tel("victim_async_park_us", int((time.perf_counter() - rec.queued_at) * 1e6))
+
+    def _route(self, finished: list) -> list:
+        """Releases the blocks of every parked job whose terminal record is in
+        ``finished`` (each job only its own blocks); returns the other records."""
+        rest = []
+        for f in finished:
+            rec = self.parked.pop(f.job_id, None)
+            if rec is not None:
+                self._release(rec, f.success)
+            elif f.job_id in self.abandoned:
+                self.abandoned.discard(f.job_id)
+            else:
+                rest.append(f)
+        return rest
+
+    def poll_finished_jobs(self) -> list:
+        out = self.stash + self._route(self._poll())
+        self.stash = []
+        return out
+
+    def reclaim(self) -> None:
+        """Non-blocking: frees the blocks of parked jobs the manager reports terminal."""
+        if self.parked:
+            self.stash.extend(self._route(self._poll()))
+
+    def before_alloc(self, pool, num_blocks: int) -> None:
+        if self.parked and self.reclaimed_at != self.tap.step:
+            # Once per pass, before its first allocation.
+            self.reclaimed_at = self.tap.step
+            self.reclaim()
+        queue = pool.free_block_queue
+        if num_blocks <= queue.num_free_blocks or not self.count.get(id(pool), 0):
+            return
+        # The free queue would run dry: today's synchronous drain, on this
+        # pool's parked jobs, oldest first, until the queue holds the request.
+        self.reclaim()
+        t0 = time.perf_counter()
+        for job_id in [j for j, r in self.parked.items() if r.pool is pool]:
+            if num_blocks <= queue.num_free_blocks:
+                break
+            if job_id not in self.parked:
+                continue
+            done = self._drain({job_id})
+            finished = [f for f in done if f.job_id == job_id]
+            if not finished and self.fatal:
+                # The blocks stay parked: the engine stops.
+                raise RuntimeError(
+                    "TPURaidenOffloadingConnector: parked victim store job "
+                    f"{job_id} ({len(self.parked[job_id].blocks)} blocks) did not finish within the "
+                    "drain timeout; its source blocks are about to be reused under a "
+                    "live transfer, so the engine stops before they return to the "
+                    "free queue (VLLM_TPU_OFFLOAD_VICTIM_ASYNC). Rerun."
+                )
+            rec = self.parked.pop(job_id)
+            if not finished:
+                # Without the tier classes a timed-out drain poisons the job
+                # (it finalizes as a failure and publishes nothing), as today.
+                self.abandoned.add(job_id)
+            self._release(rec, bool(finished) and finished[0].success)
+            self._tel("victim_async_fallback_jobs")
+        self._tel("victim_async_fallbacks")
+        self._tel("victim_async_fallback_us", int((time.perf_counter() - t0) * 1e6))
+
+    def top_up(self, step: int) -> None:
+        """Evicts ahead: parks eligible cached blocks from the head of each pool's
+        free queue and stores them without waiting, until N blocks at the head
+        (or parked) need no store when allocated."""
+        from vllm.v1.core.kv_cache_utils import get_block_hash, get_group_id
+
+        t0 = time.perf_counter()
+        sched = self.sched
+        manager = sched._raiden_manager
+        min_age, groups = sched._victim_min_age, sched._victim_groups
+        freed_at = self.tap.freed_at
+        for pool in list(self.pools.values()):
+            queue = pool.free_block_queue
+            watched = getattr(pool, "_reuse_watchers", None) or {}
+            have = self.count.get(id(pool), 0)
+            take: list = []
+            keys: list[OffloadKey] = []
+            seen: set[OffloadKey] = set()
+            tail = queue.fake_free_list_tail
+            block = queue.fake_free_list_head.next_free_block
+            # Every block walked needs no store when allocated: it stays (as
+            # it needs none) or it is parked and comes back hashless.
+            while block is not None and block is not tail and have < self.reserve:
+                have += 1
+                block_hash = block.block_hash
+                if block_hash is None or block.is_null or block.block_id in watched:
+                    # Hashless (nothing to store), or readable until reused
+                    # (unpin_blocks): left where it is.
+                    block = block.next_free_block
+                    continue
+                group = get_group_id(block_hash)
+                freed = freed_at.get(block.block_id)
+                if group not in groups or freed is None or step - freed < min_age:
+                    # Not stored when an allocation evicts it either
+                    # (victim.select_victims): left where it is.
+                    block = block.next_free_block
+                    continue
+                key = make_offload_key(get_block_hash(block_hash), group)
+                if key not in seen:
+                    seen.add(key)
+                    take.append(block)
+                    keys.append(key)
+                block = block.next_free_block
+            if not take:
+                continue
+            for block in take:
+                queue.remove(block)
+                # Outside an allocation the victim hook records nothing.
+                pool._maybe_evict_cached_block(block)
+            self._tel("victim_async_seen", len(take))
+            want = set(manager.prepare_victim_store(keys))
+            store = [(k, b) for k, b in zip(keys, take) if k in want]
+            idle = [b for k, b in zip(keys, take) if k not in want]
+            if idle:
+                # Already on the host (or being stored): nothing to wait for.
+                queue.prepend_n(idle)
+                self._tel("victim_async_resident", len(idle))
+            if store:
+                job_id = sched._generate_job_id()
+                manager.submit_store_job(
+                    job_id, [k for k, _ in store], [b.block_id for _, b in store]
+                )
+                self.parked[job_id] = _ParkedVictims(
+                    pool, [b for _, b in store], time.perf_counter()
+                )
+                self.count[id(pool)] = self.count.get(id(pool), 0) + len(store)
+                self._tel("victim_async_stores")
+                self._tel("victim_async_store_keys", len(store))
+        self._tel("victim_async_topup_us", int((time.perf_counter() - t0) * 1e6))
+
+    def telemetry(self) -> str:
+        return (
+            f"victim_async_parked={sum(self.count.values())} "
+            f"victim_async_jobs={len(self.parked)} victim_async_reserve={self.reserve}"
+        )
+
+    def deactivate(self) -> None:
+        global _VASYNC
+        if _VASYNC is self:
+            _VASYNC = None
+
+
+class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
+    """Scheduler for the store-backed offload path.
+
+    Strips per-rank transfer jobs and orchestrates the store engine directly
+    via RaidenOffloadingManager.
+    """
+
+    def __init__(
+        self,
+        spec: TPURaidenStoreOffloadingSpec,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+    ):
+        super().__init__(spec, vllm_config, kv_cache_config)
+        assert isinstance(
+            self.manager, (RaidenOffloadingManager, TieredOffloadingManager)
+        )
+        self._raiden_manager: RaidenOffloadingManager | TieredOffloadingManager = (
+            self.manager
+        )
+        self._fence_pending: dict[int, _ParkedStore] = {}
+        # VLLM_TPU_OFFLOAD_DIVERGENT_HITS: every load restores the state groups
+        # at its boundary (read by the connector's
+        # supports_divergent_local_hybrid_hits).
+        self._restores_state = divergent_hits_restore_state(
+            kv_cache_config, [g.group_idx for g in self.config.kv_group_configs]
+        )
+        # With the tier classes a drain that times out stops the engine: the
+        # source blocks are about to be reused under a live DMA, and a save
+        # that lands later would publish their new bytes under the old hash.
+        self._fatal_drain = isinstance(self.manager, TieredOffloadingManager)
+        lookup_log.install_restore_log(
+            self._raiden_manager,
+            self.manager.bytes_of_keys
+            if isinstance(self.manager, TieredOffloadingManager)
+            else spec.bytes_per_block_all_ranks,
+        )
+        if victim.host_tier_policy() == "victim":
+            self._enable_victim_policy(spec, vllm_config)
+        if tpu_envs.VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE:
+            self._enable_exclusive_restore()
+        if tpu_envs.VLLM_TPU_OFFLOAD_VICTIM_ASYNC:
+            self._enable_victim_async(tpu_envs.VLLM_TPU_OFFLOAD_VICTIM_ASYNC)
+
+    @property
+    def restores_state_with_every_load(self) -> bool:
+        """Every tier load restores each state group at its boundary
+        (``divergent_hits_restore_state``)."""
+        return bool(self.__dict__.get("_restores_state", False))
+
+    def host_resident_tokens(self, request: Request, num_local_tokens: int) -> int:
+        """Prompt tokens past ``num_local_tokens`` that every offloaded group
+        holds in the host pool, as a load lookup would find them.
+
+        An estimate that changes nothing: no pins, no lookup events, no
+        request state. A full-attention group counts its run of resident
+        chunks from the chunk the local hit ends in. A group that keeps a
+        window (sliding window, Mamba state) needs the window of chunks that
+        ends at the boundary, and the boundary moves down until every such
+        group has it. The trailing chunk of an EAGLE/MTP group does not count,
+        and no partial tail is looked up.
+        """
+        manager = self._raiden_manager
+        hashes = request.block_hashes
+        groups = self.config.kv_group_configs
+        # The last prompt token is always computed.
+        end = request.num_tokens - 1
+        if self._sliding_window_groups and self._mamba_align_size is not None:
+            end -= end % self._mamba_align_size
+
+        def keys(group, first: int, stop: int) -> list[OffloadKey]:
+            step = group.hashes_per_chunk
+            return [
+                make_offload_key(hashes[(chunk + 1) * step - 1], group.group_idx)
+                for chunk in range(first, stop)
+            ]
+
+        for group in groups:
+            if group.sliding_window_size_in_chunks is not None:
+                continue
+            tpc = group.tokens_per_chunk
+            first = num_local_tokens // tpc
+            stop = min(end // tpc, len(hashes) // group.hashes_per_chunk)
+            run = manager.host_resident_prefix(keys(group, first, stop))
+            if group.is_eagle_group:
+                run = max(run - 1, 0)
+            end = min(end, (first + run) * tpc)
+            if end <= num_local_tokens:
+                return 0
+        windowed = [g for g in groups if g.sliding_window_size_in_chunks is not None]
+        moved = True
+        while moved:
+            moved = False
+            for group in windowed:
+                tpc = group.tokens_per_chunk
+                window = group.sliding_window_size_in_chunks
+                stop = end // tpc
+                while stop * tpc > num_local_tokens:
+                    want = keys(group, max(stop - window, 0), stop)
+                    if manager.host_resident_prefix(want) == len(want):
+                        break
+                    stop -= 1
+                if stop * tpc < end:
+                    end = stop * tpc
+                    moved = True
+                if end <= num_local_tokens:
+                    return 0
+        return end - num_local_tokens
+
+    def touch_load_keys(self, request: Request, start: int, end: int) -> int:
+        """Refreshes the host-tier entries a load of ``request``'s tokens
+        ``[start, end)`` would read (VLLM_TPU_ARRIVAL_TOUCH): every
+        full-attention group's chunks from the one ``start`` falls in, and each
+        windowed group's window ending at ``end``, the keys
+        ``host_resident_tokens`` probed. Moves them to the store's Most Recently
+        Used end; loads nothing and keeps no pin. Returns the keys asked."""
+        hashes = request.block_hashes
+        keys: list[OffloadKey] = []
+        for group in self.config.kv_group_configs:
+            tpc, step = group.tokens_per_chunk, group.hashes_per_chunk
+            stop = min(end // tpc, len(hashes) // step)
+            window = group.sliding_window_size_in_chunks
+            first = start // tpc if window is None else max(stop - window, 0)
+            keys.extend(
+                make_offload_key(hashes[(chunk + 1) * step - 1], group.group_idx)
+                for chunk in range(first, stop)
+            )
+        if keys:
+            self._raiden_manager.touch_run(keys)
+        return len(keys)
+
+    # -- victim policy (QWEN4_EXP_HOST_TIER_POLICY=victim; offload/victim.py) --
+
+    def _enable_victim_policy(self, spec, vllm_config) -> None:
+        if int(getattr(spec, "blocks_per_chunk", 1)) != 1:
+            raise ValueError(
+                f"{victim.POLICY_ENV}=victim stores evicted blocks one key per "
+                f"block; blocks_per_chunk={spec.blocks_per_chunk} is not supported"
+            )
+        pp = int(getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) or 1)
+        # Young-block guard: the scheduler keeps at most PP batches in flight
+        # (plus one under async scheduling), so a block freed this many steps
+        # ago has no write pending on any stage.
+        self._victim_min_age = pp + 2
+        self._victim_groups = {g.group_idx for g in self.config.kv_group_configs}
+        self._victim_tap = victim.VictimTap()
+        victim.patch_block_pool_victims()
+        victim.activate(self._victim_tap)
+        self._raiden_manager.set_victim_mode(True)
+        self._victim = True
+        logger.info(
+            "TPURaidenOffloadingConnector: host-tier policy victim (store on HBM "
+            "eviction, keep on load); groups %s, young-block guard %d steps",
+            sorted(self._victim_groups),
+            self._victim_min_age,
+        )
+
+    def _enable_exclusive_restore(self) -> None:
+        """VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE: a landed load's host copy is
+        evicted. Only with the victim policy, which stores the block again
+        when HBM evicts it; write-through would never store it back."""
+        if not self.__dict__.get("_victim", False):
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE "
+                f"needs {victim.POLICY_ENV}=victim (the host tier stores a block "
+                "again only when HBM evicts it)"
+            )
+        manager = self._raiden_manager
+        manager.set_exclusive_restore(True)
+        self._excl = True
+        logger.info(
+            "TPURaidenOffloadingConnector: host-tier exclusive restore on (a "
+            "landed load's host copy is evicted with KVCacheStore.evict; HBM "
+            "eviction stores it again); %s",
+            "classes " + ",".join(c.name for c in manager.classes)
+            if isinstance(manager, TieredOffloadingManager)
+            else "single store",
+        )
+
+    def _enable_victim_async(self, reserve: int) -> None:
+        """VLLM_TPU_OFFLOAD_VICTIM_ASYNC=N: evict ahead up to N blocks a pool and
+        store them without waiting (see _VictimAsync). Only with the victim
+        policy, whose evictions it moves ahead of the allocations."""
+        global _VASYNC
+        if not self.__dict__.get("_victim", False):
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_VICTIM_ASYNC needs "
+                f"{victim.POLICY_ENV}=victim (it stores the blocks HBM evicts)"
+            )
+        if _VASYNC is not None and _VASYNC.sched is not self:
+            raise RuntimeError("a VLLM_TPU_OFFLOAD_VICTIM_ASYNC scheduler is already active")
+        _patch_block_pool_victim_async()
+        self._vasync = _VictimAsync(self, reserve)
+        _VASYNC = self._vasync
+        logger.info(
+            "TPURaidenOffloadingConnector: victim stores asynchronous (evict ahead up "
+            "to %d blocks a pool, held out of the free queue until each store job is "
+            "terminal; an allocation the free queue cannot hold drains them first); %s",
+            reserve,
+            "drain timeout fatal" if self._vasync.fatal else "drain timeout poisons",
+        )
+
+    def _store_victims(self) -> None:
+        """Store this step's evicted blocks and drain them before the step's
+        metadata ships, so the new owners' forward passes cannot overwrite a
+        block before its bytes reach the host."""
+        tap = self._victim_tap
+        keep, counts = victim.select_victims(
+            tap.take(), tap.step, self._victim_min_age, self._victim_groups
+        )
+        tel = self.telemetry
+        for name, n in counts.items():
+            tel[name] = tel.get(name, 0) + n
+        if keep:
+            manager = self._raiden_manager
+            source = dict(keep)
+            keys = manager.prepare_victim_store([k for k, _ in keep])
+            tel["victim_resident"] = tel.get("victim_resident", 0) + len(keep) - len(keys)
+            if keys:
+                job_id = self._generate_job_id()
+                t0 = time.perf_counter()
+                manager.submit_store_job(job_id, keys, [source[k] for k in keys])
+                done = manager.drain_jobs({job_id})
+                if self.__dict__.get("_fatal_drain", False) and not any(
+                    f.job_id == job_id for f in done
+                ):
+                    raise RuntimeError(
+                        f"TPURaidenOffloadingConnector: victim store job {job_id} "
+                        f"({len(keys)} keys) did not finish within the drain timeout; "
+                        "its source blocks are about to be reused under a live "
+                        "transfer, so the engine stops before this step's metadata "
+                        "ships (VLLM_TPU_OFFLOAD_TIER_CLASSES). Rerun."
+                    )
+                tel["victim_drain_us"] = tel.get("victim_drain_us", 0) + int(
+                    (time.perf_counter() - t0) * 1e6
+                )
+                ok = any(f.job_id == job_id and f.success for f in done)
+                tel["victim_stores" if ok else "victim_store_failed"] = (
+                    tel.get("victim_stores" if ok else "victim_store_failed", 0) + 1
+                )
+                if ok:
+                    tel["victim_store_keys"] = tel.get("victim_store_keys", 0) + len(keys)
+                    # Per KV cache group, so the telemetry line shows which
+                    # groups (attention blocks or recurrent checkpoints) fill
+                    # the tier.
+                    for group, n in sorted(
+                        Counter(get_offload_group_idx(k) for k in keys).items()
+                    ):
+                        name = f"victim_store_keys_g{group}"
+                        tel[name] = tel.get(name, 0) + n
+        vasync = self.__dict__.get("_vasync")
+        if vasync is not None:
+            # After this pass's own victims drained, before its metadata ships.
+            vasync.top_up(tap.step)
+        tap.advance()
+
+    # Cumulative host-tier counters, logged every VLLM_TPU_OFFLOAD_TELEMETRY_S
+    # seconds (60 by default; <= 0 turns the line off) with the container's
+    # memory, so a serving log shows the tier working and its host footprint.
+    # Created lazily: tests build this scheduler without __init__.
+    _TELEMETRY_KEYS = (
+        "loads", "load_keys", "loads_done", "failed_load_blocks",
+        "stores", "store_keys", "stores_done", "stores_cancelled",
+    )
+
+    @property
+    def telemetry(self) -> dict[str, int]:
+        return self.__dict__.setdefault(
+            "_telemetry", dict.fromkeys(self._TELEMETRY_KEYS, 0)
+        )
+
+    def telemetry_line(self) -> str:
+        mem = _cgroup_memory()
+        gib = lambda v: "n/a" if v is None else f"{v / 1024**3:.1f}GiB"
+        counters = " ".join(f"{k}={v}" for k, v in self.telemetry.items())
+        line = (
+            f"offload-tier telemetry: {counters} fence_pending={len(self._fence_pending)} "
+            f"mem_current={gib(mem['current'])} mem_peak={gib(mem['peak'])} "
+            f"mem_max={gib(mem['max'])} mem_src={mem['source']}"
+        )
+        manager = self.__dict__.get("_raiden_manager")
+        if isinstance(manager, TieredOffloadingManager):
+            line += " " + manager.telemetry_line()
+        if self.__dict__.get("_excl", False):
+            stats = manager.excl_stats()
+            if isinstance(stats, dict):
+                stats = [stats]
+            totals = {
+                k: sum(s[k] for s in stats)
+                for k in ("calls", "asked", "evicted", "abandoned", "discarded")
+            }
+            line += " excl_restore=" + ",".join(f"{k}:{v}" for k, v in totals.items())
+        if isinstance(manager, TieredOffloadingManager):
+            x2 = manager.x2_stats()
+            if x2 is not None:
+                line += " tier_x2=" + ",".join(f"{k}:{v}" for k, v in x2.items())
+        unhashed = self.__dict__.get("_tier_check_unhashed", {})
+        for name, counts in sorted(self.__dict__.get("_tier_check_totals", {}).items()):
+            fields = " ".join(f"{k}={v}" for k, v in zip(CHECK_FIELDS, counts))
+            line += f" tier_check[{name}] {fields} unhashed={unhashed.get(name, 0)}"
+        vasync = self.__dict__.get("_vasync")
+        if vasync is not None:
+            line += " " + vasync.telemetry()
+        return line
+
+    def _maybe_log_telemetry(self) -> None:
+        period = float(os.environ.get("VLLM_TPU_OFFLOAD_TELEMETRY_S", "60"))
+        if period <= 0:
+            return
+        now = time.monotonic()
+        next_at = self.__dict__.setdefault("_telemetry_next", now + period)
+        if now >= next_at:
+            self.__dict__["_telemetry_next"] = now + period
+            logger.info("%s", self.telemetry_line())
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens, *args, **kwargs):
+        out = super().get_num_new_matched_tokens(request, num_computed_tokens, *args, **kwargs)
+        if lookup_log.enabled():
+            try:
+                lookup_log.log_lookup(self, request, num_computed_tokens, out[0])
+            except Exception:  # a diagnostic must never fail a schedule pass
+                logger.exception("prefix-lookup: line failed for %s", request.request_id)
+        return out
+
+    def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorMetadata:
+        meta = super().build_connector_meta(scheduler_output)
+        assert isinstance(meta, OffloadingConnectorMetadata)
+        if self.__dict__.get("_victim", False):
+            # Before anything else ships: this step's allocations may reuse
+            # the victims' blocks.
+            self._store_victims()
+
+        manager = self._raiden_manager
+
+        # Park new store jobs: wait for all ranks to complete device fence.
+        new_fence_ids: set[int] = set()
+        for job_id, job in meta.store_jobs.items():
+            src_spec, dst_spec = job.src_spec, job.dst_spec
+            assert isinstance(src_spec, GPULoadStoreSpec)
+            assert isinstance(dst_spec, RaidenLoadStoreSpec)
+            device_block_ids = src_spec.block_ids.tolist()
+            assert len(device_block_ids) == len(dst_spec.keys), (
+                len(device_block_ids),
+                len(dst_spec.keys),
+            )
+            self._fence_pending[job_id] = _ParkedStore(
+                keys=dst_spec.keys, device_block_ids=device_block_ids
+            )
+            new_fence_ids.add(job_id)
+
+        load_destinations: set[int] = set()
+        finished_store_ids: list[int] = []
+        finished_loads: dict[int, str] = {}
+        failed_load_block_ids: list[int] = []
+        drained: list = []
+
+        def submit_loads() -> None:
+            # Submit load jobs immediately: destination HBM blocks are freshly
+            # allocated and safe to write into.
+            for job_id, job in meta.load_jobs.items():
+                src_spec, dst_spec = job.src_spec, job.dst_spec
+                assert isinstance(src_spec, RaidenLoadStoreSpec)
+                assert isinstance(dst_spec, GPULoadStoreSpec)
+                device_block_ids = dst_spec.block_ids.tolist()
+                load_destinations.update(device_block_ids)
+                assert len(device_block_ids) == len(src_spec.keys), (
+                    len(device_block_ids),
+                    len(src_spec.keys),
+                )
+                manager.submit_load_job(
+                    job_id,
+                    src_spec.keys,
+                    device_block_ids,
+                    job.req_id,
+                    pinned=src_spec.pinned,
+                )
+                self.telemetry["loads"] += 1
+                self.telemetry["load_keys"] += len(src_spec.keys)
+
+        def flush() -> None:
+            nonlocal drained
+            # Handle jobs_to_flush (source blocks are about to be recycled):
+            # - Cancel fence-pending stores before they start.
+            # - Synchronously drain launched stores so DMA finishes before blocks
+            #   are overwritten.
+            flush_ids = meta.jobs_to_flush or set()
+            launched_flush_ids: set[int] = set()
+            for job_id in flush_ids:
+                parked = self._fence_pending.pop(job_id, None)
+                if parked is not None:
+                    manager.on_store_job_cancelled(parked.keys)
+                    self.telemetry["stores_cancelled"] += 1
+                    finished_store_ids.append(job_id)
+                    # Avoid useless TPU sync if created and cancelled in the
+                    # same step.
+                    new_fence_ids.discard(job_id)
+                    logger.debug(
+                        "TPURaidenOffloadingConnector: cancelled fence-pending "
+                        "store job %d (source blocks reused)",
+                        job_id,
+                    )
+                elif manager.is_job_launched(job_id):
+                    launched_flush_ids.add(job_id)
+            if launched_flush_ids:
+                drained = manager.drain_jobs(launched_flush_ids)
+            if self.__dict__.get("_fatal_drain", False):
+                stuck = launched_flush_ids - {f.job_id for f in drained}
+                if stuck:
+                    raise RuntimeError(
+                        "TPURaidenOffloadingConnector: store jobs "
+                        f"{sorted(stuck)} did not finish within the drain timeout; "
+                        "their source blocks are about to be reused under a live "
+                        "transfer, so the engine stops before this step's metadata "
+                        "ships (VLLM_TPU_OFFLOAD_TIER_CLASSES). Rerun."
+                    )
+
+        if self.__dict__.get("_fatal_drain", False):
+            # Tier classes: a launched store whose source block this step
+            # reallocates finishes before any load is submitted, so a load
+            # into that block cannot land under the save's read.
+            flush()
+            submit_loads()
+        else:
+            submit_loads()
+            flush()
+
+        # Collect completed/drained jobs for the worker echo channel.
+        for finished_job in list(drained) + manager.poll_finished_jobs():
+            if finished_job.op == AdmissionOp.STORE:
+                finished_store_ids.append(finished_job.job_id)
+                self.telemetry["stores_done"] += 1
+            else:
+                assert finished_job.req_id is not None
+                finished_loads[finished_job.job_id] = finished_job.req_id
+                failed_load_block_ids.extend(finished_job.failed_device_block_ids)
+                self.telemetry["loads_done"] += 1
+                self.telemetry["failed_load_blocks"] += len(
+                    finished_job.failed_device_block_ids
+                )
+        check_stores, check_loads = (
+            manager.take_check_requests()
+            if isinstance(manager, TieredOffloadingManager)
+            else ([], [])
+        )
+        if check_stores and load_destinations:
+            check_stores = self._unhashable_as_forget(check_stores, load_destinations)
+        self._maybe_log_telemetry()
+
+        # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
+        return RaidenOffloadingConnectorMetadata(
+            load_jobs={},  # pyrefly: ignore[unexpected-keyword]
+            store_jobs={},  # pyrefly: ignore[unexpected-keyword]
+            # pyrefly: ignore[unexpected-keyword]
+            jobs_to_flush=meta.jobs_to_flush,
+            fence_job_ids=new_fence_ids,
+            finished_store_job_ids=finished_store_ids,
+            finished_load_jobs=finished_loads,
+            failed_load_device_block_ids=failed_load_block_ids,
+            tier_check_stores=check_stores,
+            tier_check_loads=check_loads,
+        )
+
+    def _unhashable_as_forget(
+        self, stores: list[tuple[str, bytes, int]], load_destinations: set[int]
+    ) -> list[tuple[str, bytes, int]]:
+        """Check mode: a saved entry whose source block a load of this same step
+        writes cannot be hashed at the workers, which read it before the step's
+        forward but after that load may have landed (the save itself drained
+        before the load was submitted). Those entries go out as block -1: the
+        workers forget the key's digest, and a later load of it counts as
+        missing instead of comparing against bytes that were never saved."""
+        skipped = self.__dict__.setdefault("_tier_check_unhashed", {})
+        out = []
+        for name, key, block in stores:
+            if block in load_destinations:
+                skipped[name] = skipped.get(name, 0) + 1
+                block = -1
+            out.append((name, key, block))
+        return out
+
+    def update_connector_output(self, connector_output: KVConnectorOutput):
+        meta = connector_output.kv_connector_worker_meta
+        if isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.tier_check:
+            totals = self.__dict__.setdefault("_tier_check_totals", {})
+            for name, counts in meta.tier_check.items():
+                mine = totals.setdefault(name, [0] * len(counts))
+                totals[name] = [a + b for a, b in zip(mine, counts)]
+        if isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fenced_jobs:
+            for job_id, count in meta.fenced_jobs.items():
+                parked = self._fence_pending.get(job_id)
+                if parked is None:
+                    # Cancelled while the acks were in flight.
+                    continue
+                parked.acks += count
+                assert parked.acks <= self.config.num_workers
+                if parked.acks == self.config.num_workers:
+                    del self._fence_pending[job_id]
+                    self._raiden_manager.submit_store_job(
+                        job_id, parked.keys, parked.device_block_ids
+                    )
+                    self.telemetry["stores"] += 1
+                    self.telemetry["store_keys"] += len(parked.keys)
+        super().update_connector_output(connector_output)
+
+    def shutdown(self) -> None:
+        vasync = self.__dict__.get("_vasync")
+        if vasync is not None:
+            vasync.deactivate()
+        tap = self.__dict__.get("_victim_tap")
+        if tap is not None:
+            victim.deactivate(tap)
+        super().shutdown()
+
+
+class TPURaidenOffloadingConnector(OffloadingConnector):
+    """Top-level facade connector for the store-backed (V2) raiden KV offload path."""
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
+        """No layout preference, unlike the `OffloadingConnector` this extends.
+
+        Upstream hardcodes "HND" for NIXL on CUDA. On TPU "HND" names
+        SEQ_ALONG_LANE, so inheriting it would select a layout nobody asked
+        for; these pages are opaque bytes to this connector.
+        """
+        return None
+
+    @property
+    def supports_divergent_local_hybrid_hits(self) -> bool:
+        """VLLM_TPU_OFFLOAD_DIVERGENT_HITS on a scheduler whose every load
+        restores the state groups (``divergent_hits_restore_state``).
+
+        The scheduler then takes the local hit as the attention groups' cached
+        run (``core/divergent_hybrid_hits.divergent_local_hit``), adopting no
+        state block unless every state group holds one exactly there, and asks
+        this connector for the rest: a tier hit from that boundary brings the
+        attention blocks past it and every state group's checkpoint at its end.
+        When the tier finds nothing, vLLM's scheduler falls back to the hit every
+        group agrees on (``get_computed_blocks``). Off (the default) reports
+        False, the upstream value.
+        """
+        if not tpu_envs.VLLM_TPU_OFFLOAD_DIVERGENT_HITS:
+            return False
+        scheduler = self.__dict__.get("connector_scheduler")
+        return bool(
+            scheduler is not None and scheduler.restores_state_with_every_load
+        )
+
+    @property
+    def prefer_cross_layer_blocks(self) -> bool:
+        # Opt in to uniform cross-layer KV cache allocation when block-major layout is
+        # enabled. Satisfies `KVConnectorModelRunnerMixin.use_uniform_kv_cache()`
+        # preconditions to enable bundled tensor allocation in the TPU model runner.
+        return bool(tpu_envs.VLLM_TPU_BLOCK_MAJOR_KV)
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        role: KVConnectorRole,
+        kv_cache_config: KVCacheConfig,
+    ):
+        # Skip OffloadingConnector.__init__: default factory cannot carry
+        # vllm_config / kv_cache_config directly into the spec.
+        KVConnectorBase_V1.__init__(self, vllm_config, role, kv_cache_config)
+
+        # The raiden singleton worker cannot coexist with this connector: the
+        # disagg stack runs its own control plane in the same process and the
+        # two collide on ports.
+        if not tpu_envs.RAIDEN_DISABLE_SINGLETON_WORKER:
+            raise ValueError(
+                "TPURaidenOffloadingConnector requires the raiden singleton "
+                "worker to be disabled (it collides with the in-process "
+                "control plane's ports), but RAIDEN_DISABLE_SINGLETON_WORKER "
+                "was explicitly set to off. Unset it or set it to '1'."
+            )
+        os.environ["RAIDEN_DISABLE_SINGLETON_WORKER"] = "1"
+
+        # Call through module to preserve PCP-aware patch on build_offloading_config.
+        offloading_config = offloading_config_module.build_offloading_config(
+            vllm_config, kv_cache_config
+        )
+        spec = TPURaidenStoreOffloadingSpec(
+            offloading_config, vllm_config, kv_cache_config
+        )
+
+        # pyrefly: ignore[bad-override-mutable-attribute]
+        self.connector_scheduler: TPURaidenOffloadingScheduler | None = None
+        self.connector_worker: OffloadingConnectorWorker | None = None
+        if role == KVConnectorRole.SCHEDULER:
+            self.connector_scheduler = TPURaidenOffloadingScheduler(
+                spec, vllm_config, kv_cache_config
+            )
+        elif role == KVConnectorRole.WORKER:
+            # Worker wrapper is only used for KV buffer registration; job dicts
+            # remain empty.
+            self.connector_worker = OffloadingConnectorWorker(
+                spec, vllm_config, kv_cache_config
+            )
+            # Track per-step fence acknowledgments and completion echoes for
+            # worker metadata.
+            self._fenced_jobs: dict[int, int] = {}
+            self._completed_jobs: dict[int, int] = {}
+            self._load_error_block_ids: set[int] = set()
+            # Registered KV pool byte views whose deferred writes are dispatched before
+            # recording fence events.
+            self._pool_sync_tensors: list[torch.Tensor] = []
+            # In-flight fence events awaiting device retirement before acknowledging
+            # store jobs, recorded as pairs of (fence_job_ids, event).
+            self._pending_fences: list[tuple[set[int], torch.Event]] = []
+
+    # -- scheduler-side hooks ----------------------------------------------
+    def host_tier_hit_tokens(self, request: Request, num_local_tokens: int) -> int:
+        """Prompt tokens past ``num_local_tokens`` a load from the host pool
+        would give ``request`` now, estimated without touching connector or
+        store state (``TPURaidenOffloadingScheduler.host_resident_tokens``)
+        and held to the bound of the groups this connector does not offload.
+        """
+        scheduler = self.connector_scheduler
+        assert scheduler is not None
+        if request.skip_reading_prefix_cache:
+            return 0
+        hit = scheduler.host_resident_tokens(request, num_local_tokens)
+        if hit == 0:
+            return 0
+        bound = self._max_loadable_tokens(request, num_local_tokens)
+        return hit if bound is None else min(hit, bound)
+
+    def arrival_touch(self, request: Request, num_local_tokens: int) -> int:
+        """VLLM_TPU_ARRIVAL_TOUCH: when ``request`` enters the waiting queue,
+        refresh the host-tier entries a load past ``num_local_tokens`` would
+        read for it now (``host_tier_hit_tokens``), so its wait does not age
+        them. Nothing is loaded and no pin is kept. Returns the keys refreshed
+        (0 when the tier holds nothing past the local hit)."""
+        hit = self.host_tier_hit_tokens(request, num_local_tokens)
+        if hit <= 0:
+            return 0
+        scheduler = self.connector_scheduler
+        assert scheduler is not None
+        return scheduler.touch_load_keys(request, num_local_tokens, num_local_tokens + hit)
+
+    def reset_cache(self) -> bool | None:
+        # External cache reset is unsupported by the Raiden store. Report
+        # failure through the endpoint's documented channel instead of raising an
+        # exception here
+        logger.warning(
+            "TPURaidenOffloadingConnector: external cache reset is not "
+            "supported by the Raiden offload store; reporting failure."
+        )
+        return False
+
+    def take_events(self) -> Iterable[KVCacheEvent]:
+        if self.connector_scheduler is not None:
+            return self.connector_scheduler.take_events()
+        return []
+
+    # -- worker-side hooks -------------------------------------------------
+    def register_kv_caches(
+        self, kv_caches: Mapping[str, torch.Tensor | list[torch.Tensor]]
+    ):
+        """Register the TPU UBP as zero-copy canonical offload tensors.
+
+        vLLM's generic per-layer registration does not support the TPU
+        unified block pool layout or Mamba tensor lists, so this
+        implementation deduplicates the UBP backing storages and exposes
+        each as an `int8` byte view.
+        """
+        assert self.connector_worker is not None
+        num_blocks = self.connector_worker.kv_cache_config.num_blocks
+
+        pool_storages: dict[int, tuple[torch.UntypedStorage, torch.device]] = {}
+        for layer_kv_cache in kv_caches.values():
+            state_tensors = (
+                [layer_kv_cache]
+                if isinstance(layer_kv_cache, torch.Tensor)
+                else layer_kv_cache
+            )
+            for tensor in state_tensors:
+                storage = tensor.untyped_storage()
+                pool_storages.setdefault(storage.data_ptr(), (storage, tensor.device))
+
+        from vllm_torchtpu.models.vllm.qwen4_exp.offload import is_qwen4_exp, pool_regions
+
+        group_regions = None
+        if tpu_envs.VLLM_TPU_OFFLOAD_TIER_CLASSES:
+            # Host tier classes: each group refers to the regions its own
+            # layers occupy, by the model's plan, and the tensors are in
+            # region order (TPURaidenStoreOffloadingSpec._tier_worker).
+            pool_storages, group_regions = _planned_region_storages(
+                self.connector_worker.kv_cache_config, kv_caches
+            )
+
+        if is_qwen4_exp(getattr(self, "_vllm_config", None)):
+            # A worker's unified pool is several raw regions under the gcd
+            # group rule (2 per PP8 stage); every one must be registered.
+            expected = pool_regions(self.connector_worker.kv_cache_config)
+            assert len(pool_storages) == expected, (
+                "Qwen4Exp offload registers every pool region: found "
+                f"{len(pool_storages)} distinct storages, the KV cache config "
+                f"plans {expected}"
+            )
+
+        pool_tensors: list[CanonicalKVCacheTensor] = []
+        for storage, device in pool_storages.values():
+            storage_bytes = storage.nbytes()
+            assert storage_bytes % num_blocks == 0, (
+                "KV pool storage must hold whole scheduler blocks: "
+                f"storage_bytes={storage_bytes}, num_blocks={num_blocks}"
+            )
+            page_size_bytes = storage_bytes // num_blocks
+            int8_view = (
+                torch.empty(0, dtype=torch.int8, device=device)
+                .set_(storage)
+                .view(num_blocks, page_size_bytes)
+            )
+            pool_tensors.append(
+                CanonicalKVCacheTensor(
+                    tensor=int8_view, page_size_bytes=page_size_bytes
+                )
+            )
+
+        # Retain pool tensor references to dispatch their writes during save fences.
+        self._pool_sync_tensors = [pool_tensor.tensor for pool_tensor in pool_tensors]
+
+        group_data_refs = [
+            [
+                CanonicalKVCacheRef(
+                    tensor_idx=idx, page_size_bytes=pool_tensor.page_size_bytes
+                )
+                for idx, pool_tensor in enumerate(pool_tensors)
+                if group_regions is None or idx in group_regions[group_id]
+            ]
+            for group_id in range(
+                len(self.connector_worker.kv_cache_config.kv_cache_groups)
+            )
+        ]
+
+        self.connector_worker._init_worker(
+            CanonicalKVCaches(tensors=pool_tensors, group_data_refs=group_data_refs)
+        )
+        if tpu_envs.VLLM_TPU_OFFLOAD_TIER_CHECK:
+            assert group_regions is not None
+            self._tier_check = _build_tier_check(
+                self.connector_worker, kv_caches, group_regions
+            )
+
+    def start_load_kv(self, forward_context, **kwargs) -> None:
+        super().start_load_kv(forward_context, **kwargs)
+        self._run_tier_check()
+
+    def _run_tier_check(self) -> None:
+        """Check mode: hashes this step's saved and restored entries. Runs before
+        the step's forward, which may write a saved block's new owner into it
+        (tier_check.py, timing)."""
+        check = self.__dict__.get("_tier_check")
+        if check is not None:
+            meta = self._get_connector_metadata()
+            assert isinstance(meta, RaidenOffloadingConnectorMetadata)
+            check.run(meta.tier_check_stores, meta.tier_check_loads)
+
+    def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+        assert self.connector_worker is not None
+        meta = self._get_connector_metadata()
+        assert isinstance(meta, RaidenOffloadingConnectorMetadata)
+
+        if meta.fence_job_ids:
+            # Establish an asynchronous device fence before acknowledging store jobs:
+            # 1. Dispatch any deferred pool writes so they precede the fence event.
+            # 2. Record a stream event to track completion without host-side blocking.
+            assert self._pool_sync_tensors, (
+                "KV pool tensors must be registered before the save fence"
+            )
+            _enqueue_pool_writes(self._pool_sync_tensors)
+            self._pending_fences.append(
+                (set(meta.fence_job_ids), _record_fence_event())
+            )
+
+        if self._pending_fences:
+            # Non-blockingly drain retired events and acknowledge completed fences.
+            still_pending: list[tuple[set[int], torch.Event]] = []
+            for job_ids, event in self._pending_fences:
+                if _event_is_retired(event):
+                    for job_id in job_ids:
+                        self._fenced_jobs[job_id] = 1
+                else:
+                    still_pending.append((job_ids, event))
+            self._pending_fences = still_pending
+
+        finished_recving: set[str] = set()
+        for job_id in meta.finished_store_job_ids:
+            self._completed_jobs[job_id] = 1
+        for job_id, req_id in meta.finished_load_jobs.items():
+            self._completed_jobs[job_id] = 1
+            finished_recving.add(req_id)
+        self._load_error_block_ids.update(meta.failed_load_device_block_ids)
+
+        return set(), finished_recving
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        block_ids = self._load_error_block_ids
+        self._load_error_block_ids = set()
+        return block_ids
+
+    def get_block_ids_with_load_errors_group_index(self) -> int | None:
+        """Returns None: offload load errors are not scoped to one KV group.
+
+        The runner reads this whenever ``get_block_ids_with_load_errors``
+        returns a non-empty set. Failed device block ids come from the
+        scheduler-side block table and resolve against every cache group,
+        so there is no single group index to report.
+        """
+        return None
+
+    def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
+        check = self.__dict__.get("_tier_check")
+        check_counts = check.take_counts() if check is not None else {}
+        if not (self._fenced_jobs or self._completed_jobs or check_counts):
+            return None
+        # completed_jobs is inherited from vLLM base dataclass.
+        meta = RaidenOffloadingWorkerMetadata(
+            # pyrefly: ignore[unexpected-keyword]
+            completed_jobs=self._completed_jobs,
+            fenced_jobs=self._fenced_jobs,
+            tier_check=check_counts,
+        )
+        self._completed_jobs = {}
+        self._fenced_jobs = {}
+        return meta

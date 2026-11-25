@@ -1,0 +1,1 @@
+"""q38 b1 LIVING form root (Q38_FORM=b1): vllm_torchtpu/ below is the package of the local q38 build lineage q38-team-b1 (7fb1e611cf = SB1-1 17739744d1 merged with QGLUE-1 B1 10f346d259). Living: q38 levers land here env-keyed and default-off. Never imported by any form."""
