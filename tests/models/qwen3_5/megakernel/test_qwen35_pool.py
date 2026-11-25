@@ -72,7 +72,7 @@ def test_gqa_pool_layout_must_match_the_pool_backend_layout():
     lay = spec.cache_backend.layout
     mk.planner.plan(spec, ex)
     wrong = replace(spec, cache_backend=mk.make_pool_backend(replace(lay, kvh=2)))
-    with pytest.raises(mk.MegakernelConfigError, match="pool backend layout"):
+    with pytest.raises(mk.MegakernelConfigError, match="but the pool layout has"):
         mk.planner.plan(wrong, mk.with_cache(ex, pool_gather=False))
 
 
