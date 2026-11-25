@@ -44,18 +44,20 @@ def complete(
     max_tokens: int,
     timeout: int,
     headers: dict | None = None,
+    logprobs: int | None = None,
 ) -> dict:
+    payload: dict = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "return_token_ids": True,
+    }
+    if logprobs is not None:
+        payload["logprobs"] = logprobs
     req = urllib.request.Request(
         f"{url}/v1/completions",
-        data=json.dumps(
-            {
-                "model": model,
-                "prompt": prompt,
-                "max_tokens": max_tokens,
-                "temperature": 0,
-                "return_token_ids": True,
-            }
-        ).encode(),
+        data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", **(headers or {})},
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -63,12 +65,50 @@ def complete(
     choice = body["choices"][0]
     usage = body.get("usage") or {}
     details = usage.get("prompt_tokens_details") or {}
+    lp = choice.get("logprobs") or {}
     return {
         "tokens": choice.get("token_ids") or [],
         "text": choice.get("text", ""),
         "prompt_tokens": usage.get("prompt_tokens"),
         "cached_tokens": details.get("cached_tokens") or 0,
+        "token_logprobs": lp.get("token_logprobs") or [],
+        "logprob_tokens": lp.get("tokens") or [],
+        "top_logprobs": lp.get("top_logprobs") or [],
     }
+
+
+def _divergence_diag(ref: dict, cur: dict) -> dict:
+    ref_ids, cur_ids = ref["tokens"], cur["tokens"]
+    first = next(
+        (i for i, (a, b) in enumerate(zip(ref_ids, cur_ids)) if a != b),
+        None,
+    )
+    ref_lps, cur_lps = ref["token_logprobs"], cur["token_logprobs"]
+    prior_end = len(ref_ids) if first is None else first
+    prior_diffs = [
+        abs(a - b)
+        for a, b in zip(ref_lps[:prior_end], cur_lps[:prior_end])
+        if a is not None and b is not None
+    ]
+    diag: dict = {
+        "first_idx": first,
+        "len_ref": len(ref_ids),
+        "len_cur": len(cur_ids),
+        "has_logprobs": bool(ref_lps) and bool(cur_lps),
+        "max_prior_lp_diff": round(max(prior_diffs), 6) if prior_diffs else None,
+        "ref_text": ref["text"],
+        "cur_text": cur["text"],
+    }
+    if first is not None:
+        diag["ref_id"] = ref_ids[first]
+        diag["cur_id"] = cur_ids[first]
+        if first < len(ref["logprob_tokens"]) and first < len(cur["logprob_tokens"]):
+            diag["ref_tok"] = ref["logprob_tokens"][first]
+            diag["cur_tok"] = cur["logprob_tokens"][first]
+        if first < len(ref["top_logprobs"]) and first < len(cur["top_logprobs"]):
+            diag["ref_top"] = ref["top_logprobs"][first]
+            diag["cur_top"] = cur["top_logprobs"][first]
+    return diag
 
 
 def main() -> int:
@@ -109,12 +149,19 @@ def main() -> int:
         for tag in tags:  # interleaved: the slot last held the other prefix
             try:
                 r = complete(
-                    url, a.model, prompts[tag], a.max_tokens, a.timeout, headers
+                    url,
+                    a.model,
+                    prompts[tag],
+                    a.max_tokens,
+                    a.timeout,
+                    headers,
+                    logprobs=5,
                 )
             except (urllib.error.URLError, TimeoutError) as exc:
                 print(f"STATE_CONTAMINATION_REQUEST_FAILED {tag} r{rnd}: {exc}")
                 return 1
 
+            diag = None
             if tag not in reference:
                 # Round 1 is uncached: this is the ground truth.
                 reference[tag] = r
@@ -126,19 +173,19 @@ def main() -> int:
                     if not same:
                         failures += 1
                 verdict = "match" if same else "DIVERGED"
-            print(
-                json.dumps(
-                    {
-                        "round": rnd,
-                        "prefix": tag,
-                        "prompt_tokens": r["prompt_tokens"],
-                        "cached_tokens": r["cached_tokens"],
-                        "verdict": verdict,
-                        "text": r["text"][:80],
-                    }
-                ),
-                flush=True,
-            )
+                if not same:
+                    diag = _divergence_diag(reference[tag], r)
+            record: dict = {
+                "round": rnd,
+                "prefix": tag,
+                "prompt_tokens": r["prompt_tokens"],
+                "cached_tokens": r["cached_tokens"],
+                "verdict": verdict,
+                "text": r["text"][:80],
+            }
+            if diag is not None:
+                record["diag"] = diag
+            print(json.dumps(record), flush=True)
 
     print(f"STATE_CONTAMINATION_CACHED_ROUNDS {hit_rounds}")
     print(f"STATE_CONTAMINATION_DIVERGENCES {failures}")

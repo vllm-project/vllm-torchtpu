@@ -397,11 +397,8 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
         Covers both `kernels/gdn/v3` and its `kernels/experimental/gdn_pcp_fused`
         fork.
         """
-        from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
-            config as pcp_config,
-        )
-
-        expected_gdn = {8: 16, 16: 8, 24: 4, 32: 4, 40: 2, 48: 2, 64: 2}
+        expected_gdn = {8: 16, 16: 8, 24: 8, 32: 8, 40: 8, 48: 8, 64: 8, 128: 8}
+        expected_kda = {8: 16, 16: 8, 24: 8, 32: 8, 40: 4, 64: 4, 128: 4}
         for fork_name, cfg_mod in (("v3", config), ("gdn_pcp_fused", pcp_config)):
             for n_v in (1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64, 96, 128):
                 for attention_mode in cfg_mod.AttentionMode:
@@ -430,27 +427,40 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                             expected_gdn[n_v],
                             (fork_name, n_v),
                         )
+                if n_v in expected_kda:
+                    with self.subTest(
+                        fork=fork_name,
+                        mode="kda",
+                        n_v=n_v,
+                        expected_b=expected_kda[n_v],
+                    ):
+                        cfg = self._gdn_config(
+                            n_v, 128, cfg_mod.AttentionMode.KDA, cfg_mod=cfg_mod
+                        )
+                        self.assertEqual(
+                            cfg.triangular_block_size,
+                            expected_kda[n_v],
+                            (fork_name, n_v),
+                        )
 
-    def test_invert_triangular_matrix_rejects_non_dividing_block(self):
-        """Negative control: a block size that does not divide the chunk
-        fails at the solve instead of returning a truncated inverse."""
-        from vllm_torchtpu.kernels.experimental.gdn_pcp_fused import (
-            compute_gdn as pcp_compute_gdn,
-        )
-        from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, compute_kda
+    def test_triangular_solve_non_dividing_block(self):
+        """GDN solve_triangular_rhs handles non-dividing blocks without truncating;
+        KDA still rejects a block size that does not divide the chunk."""
+        from vllm_torchtpu.kernels.gdn.v3 import compute_kda
 
-        t = jnp.tril(jnp.ones((2, 128, 128), dtype=jnp.float32))
+        strict = jnp.tril(jnp.ones((2, 128, 128), dtype=jnp.float32), k=-1)
+        rhs = jnp.ones((2, 128, 128), dtype=jnp.float32)
+
         for fork_name, mod in (
             ("v3", compute_gdn),
             ("gdn_pcp_fused", pcp_compute_gdn),
         ):
             with self.subTest(fork=fork_name):
-                with self.assertRaisesRegex(AssertionError, "divisible"):
-                    mod.invert_triangular_matrix(t, block_size=5)
-                # Divisors still work and the inverse keeps the full chunk.
-                for block_size in (16, 8, 4, 2):
-                    inv = mod.invert_triangular_matrix(t, block_size=block_size)
-                    self.assertEqual(inv.shape, t.shape)
+                for block_size in (16, 8, 5, 4, 2):
+                    solved = mod.solve_triangular_rhs(
+                        strict, rhs, block_size=block_size
+                    )
+                    self.assertEqual(solved.shape, rhs.shape)
 
         with self.subTest(fork="v3_kda"):
             kda_bad_cfg = self._gdn_config(
@@ -572,29 +582,31 @@ class GDNAttentionTileSelectionTest(parameterized.TestCase):
                     )
                     self.assertEqual(per_seq_cfg.chunk_size % effective_b, 0)
 
-    def test_invert_triangular_matrix_block_sizes_agree(self):
-        """Every power-of-two block size inverts the same matrix identically,
-        so moving 24 heads from B=5 to B=4 only changes the schedule."""
-        from vllm_torchtpu.kernels.gdn.v3 import compute_gdn
-
+    def test_solve_triangular_rhs_block_sizes_agree(self):
+        """Every block size solves the same triangular system identically,
+        so changing 24 heads from B=4 to B=8 only changes the schedule."""
         rng = jax.random.key(7)
         # Unit lower-triangular, as the chunked solve produces.
         strict = jnp.tril(jax.random.normal(rng, (3, 128, 128)) * 0.1, k=-1)
-        t = strict + jnp.eye(128)[None]
+        eye = jnp.broadcast_to(jnp.eye(128), strict.shape)
+        t = strict + eye
         # The off-diagonal blocks are f32 dots; TPU's default matmul precision
         # rounds their inputs to bf16, which is below this test's resolution.
         with jax.default_matmul_precision("highest"):
             reference = jnp.linalg.inv(t)
-            for block_size in (16, 8, 4, 2):
-                with self.subTest(block_size=block_size):
-                    inv = compute_gdn.invert_triangular_matrix(t, block_size=block_size)
-                    np.testing.assert_allclose(inv, reference, rtol=1e-4, atol=1e-4)
-                    np.testing.assert_allclose(
-                        jnp.einsum("bij,bjk->bik", t, inv),
-                        jnp.broadcast_to(jnp.eye(128), t.shape),
-                        rtol=1e-4,
-                        atol=1e-4,
-                    )
+            for fork_name, compute_mod, _ in _CHUNKED_IMPLS:
+                for block_size in (16, 8, 5, 4, 2):
+                    with self.subTest(fork=fork_name, block_size=block_size):
+                        inv = compute_mod.solve_triangular_rhs(
+                            strict, eye, block_size=block_size
+                        )
+                        np.testing.assert_allclose(inv, reference, rtol=1e-4, atol=1e-4)
+                        np.testing.assert_allclose(
+                            jnp.einsum("bij,bjk->bik", t, inv),
+                            eye,
+                            rtol=1e-4,
+                            atol=1e-4,
+                        )
 
     def test_tile_sizes_with_split_state_slots_at_w1(self):
         """W=1 decode tiles count 1 input and 1 output state slot per sequence."""
@@ -997,6 +1009,51 @@ class GDNChunkedComputeTest(parameterized.TestCase):
         unpacked = compute_gdn._unpack_v_head_pairs(packed, v_per_kq)
         self.assertEqual(unpacked.shape, x.shape)
         self.assertEqual(float(jnp.max(jnp.abs(unpacked - x))), 0.0)
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name=f"{impl_name}_{case_name}",
+            compute_mod=compute_mod,
+            chunk=chunk,
+            block_size=block_size,
+            strict_dtype=strict_dtype,
+        )
+        for impl_name, compute_mod, _ in _CHUNKED_IMPLS
+        for case_name, chunk, block_size, strict_dtype in (
+            ("b2", 32, 2, jnp.float32),
+            ("b4", 32, 4, jnp.float32),
+            ("b8", 32, 8, jnp.float32),
+            ("b16", 32, 16, jnp.float32),
+            ("non_multiple_b8", 23, 8, jnp.float32),
+            ("non_multiple_b16", 23, 16, jnp.float32),
+            ("remainder_one_b8", 17, 8, jnp.float32),
+            ("bf16_b8", 32, 8, jnp.bfloat16),
+        )
+    )
+    def test_solve_triangular_rhs_matches_linalg_solve(
+        self, compute_mod, chunk: int, block_size: int, strict_dtype
+    ):
+        """solve_triangular_rhs on L matches the exact solve of (I + L) x = rhs."""
+        k0, k1 = jax.random.split(jax.random.key(67))
+        num_heads, d_v = 8, 128
+        raw = jax.random.normal(k0, (num_heads, chunk, chunk), dtype=jnp.float32)
+        strict_lower = jnp.tril(raw * 0.05, k=-1).astype(strict_dtype)
+        t = (
+            strict_lower.astype(jnp.float32)
+            + jnp.eye(chunk, dtype=jnp.float32)[None, :, :]
+        )
+        rhs = jax.random.normal(k1, (num_heads, chunk, d_v), dtype=jnp.float32)
+
+        with jax.default_matmul_precision("float32"):
+            solved = compute_mod.solve_triangular_rhs(
+                strict_lower, rhs, block_size=block_size
+            )
+            ref = jnp.linalg.solve(t, rhs)
+
+        self.assertEqual(solved.shape, rhs.shape)
+        self.assertEqual(solved.dtype, jnp.dtype(strict_dtype))
+        tol = 2e-2 if strict_dtype == jnp.bfloat16 else 1e-5
+        self.assertLess(float(jnp.max(jnp.abs(solved.astype(jnp.float32) - ref))), tol)
 
 
 @pytest.mark.tpu_test
@@ -2111,7 +2168,7 @@ class GDNAttentionTest(parameterized.TestCase):
 
         for n_kq, n_v, num_seqs, num_spec_tokens, prefill_len, num_decodes in [
             (2, 8, 16, 3, 16, 0),  # TP8 DCP=4 c=16 MTP=3: 16-tok prefill in B=16
-            (8, 24, 16, 0, 12, 4),  # 27B TP2: 24 heads -> B=4 (was 5, truncated C)
+            (8, 24, 16, 0, 12, 4),  # 27B TP2: 24 heads -> B=8 (was 5, truncated C)
             (8, 32, 16, 0, 12, 4),  # DP4TP2: 4 decodes + 12-tok prefill in B=16
             (16, 64, 16, 0, 12, 4),  # DP8: 4 decodes + 12-tok prefill in B=16
         ]:

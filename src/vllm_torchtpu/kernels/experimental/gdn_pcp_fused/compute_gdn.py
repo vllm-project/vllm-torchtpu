@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # Forked from vllm_torchtpu/kernels/gdn/v3/compute_gdn.py.
-# Upstream V3 changes ported by hand through #1422, plus #2438's chunk
-# divisibility check in invert_triangular_matrix.
+# Upstream V3 changes ported by hand through #1422, plus direct
+# solve_triangular_rhs (superseding #2438's invert_triangular_matrix check).
 # This copy is owned by the PCP workstream and must not import from
 # kernels/gdn/v3. Upstream V3 changes are not picked up automatically;
 # see README.md in this directory.
@@ -40,62 +40,60 @@ def get_mask_dtype(dtype: jnp.dtype) -> jnp.dtype:
             raise ValueError(f"Unsupported dtype: {dtype}")
 
 
-# NOTE: Fork of recurrent_scan_v2.py but applied various optimizations.
-def invert_triangular_matrix(t: jax.Array, block_size=16) -> jax.Array:
-    """Compute invert matrix of a given triauglar matrix."""
+def solve_triangular_rhs(
+    strict_lower: jax.Array, rhs: jax.Array, block_size: int
+) -> jax.Array:
+    """Solves the unit lower-triangular system (I + L) @ x = rhs in blocks.
 
-    # NOTE: if chunk_size=1, compiler will perform DCE.
-    out_dtype = t.dtype
-    chunk = t.shape[-1]
+    Args:
+        strict_lower: L, the strictly lower-triangular part of the system
+            matrix, [num_heads, chunk, chunk]. Its diagonal and upper triangle
+            must be zero; the unit diagonal is implicit.
+        rhs: Right-hand side [num_heads, chunk, n].
+        block_size: Diagonal block size B. Blocks are solved in order; each
+            block first removes the coupling to the already-solved rows with
+            one matmul and then runs a dense in-block forward substitution.
+
+    Returns:
+        x with the dtype of `strict_lower`.
+    """
+    out_dtype = strict_lower.dtype
+    chunk = strict_lower.shape[-1]
     block_size = min(block_size, chunk)
-    # The blocked solve covers exactly num_blocks * block_size rows. A
-    # remainder would be dropped and the output would no longer be
-    # (..., chunk, chunk), which downstream surfaces as an unrelated shape
-    # error (e.g. "array split does not result in an equal division").
-    assert chunk % block_size == 0, (
-        f"chunk ({chunk}) must be divisible by block_size ({block_size})"
-    )
-    num_blocks = chunk // block_size
+    num_blocks = (chunk + block_size - 1) // block_size
+    rhs_f32 = rhs.astype(jnp.float32)
 
-    def local_forward_sub(t_mat, b_mat):
-        x_list = []
-        for i in range(block_size):
-            b_i = b_mat[:, i, :]
-            if i == 0:
-                x_i = b_i
-            else:
-                stacked_x = jnp.stack(x_list, axis=1)
-                all_prev_t = t_mat[:, i, :i]
-                prev_sum = jnp.sum(all_prev_t[..., None] * stacked_x, axis=1)
-                x_i = b_i - prev_sum
-            x_list.append(x_i)
-        return jnp.stack(x_list, axis=1)
+    def local_forward_sub(l_block: jax.Array, b_block: jax.Array) -> jax.Array:
+        # Column-oriented (right-looking) substitution over the whole dense
+        # [num_heads, B, n] block: after step j, row j is final and the rows
+        # below it have column j's contribution removed. Rows <= j are
+        # untouched because their coefficient in the strictly lower block is
+        # zero, so each step is one multiply-subtract over B rows held densely
+        # in sublanes. A row-by-row chain costs one vreg op per head per
+        # (row, column) pair instead, making the solve VALU-bound at 8- and
+        # 16-row blocks (few V heads per core).
+        x = b_block
+        for j in range(l_block.shape[1] - 1):
+            x = x - l_block[:, :, j : j + 1] * x[:, j : j + 1, :]
+        return x
 
     x_blocks = []
-    iota_r = jax.lax.broadcasted_iota(jnp.int32, t.shape, 1)
-    iota_c = jax.lax.broadcasted_iota(jnp.int32, t.shape, 2)
-    identity_mask = jnp.where(iota_r == iota_c, 1.0, 0.0)
     for i in range(num_blocks):
-        start, end = i * block_size, (i + 1) * block_size
-        e_block = identity_mask[:, start:end, :]
-
-        if i == 0:
-            target_b = e_block
-        else:
-            interaction_t = t[:, start:end, :start]
+        start = i * block_size
+        end = min((i + 1) * block_size, chunk)
+        target_b = rhs_f32[:, start:end, :]
+        if i > 0:
             solved_x = jnp.concatenate(x_blocks, axis=1)
             prev_sum = jax.lax.dot(
-                interaction_t,
+                strict_lower[:, start:end, :start],
                 solved_x,
                 dimension_numbers=(((2,), (1,)), ((0,), (0,))),
                 preferred_element_type=jnp.float32,
             )
-            target_b = e_block - prev_sum
+            target_b = target_b - prev_sum
 
-        # NOTE: Utilize fp32 to minimize cost of sublane rolling.
-        local_t = t[:, start:end, start:end].astype(jnp.float32)
-        x_block = local_forward_sub(local_t, target_b)
-        x_blocks.append(x_block.astype(out_dtype))
+        l_block = strict_lower[:, start:end, start:end].astype(jnp.float32)
+        x_blocks.append(local_forward_sub(l_block, target_b).astype(out_dtype))
 
     return jnp.concatenate(x_blocks, axis=1)
 
@@ -205,7 +203,6 @@ def chunked_gdn_per_seq(
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
     iota_r = jax.lax.broadcasted_iota(mask_dtype, gating_map.shape, 1)
     iota_c = jax.lax.broadcasted_iota(mask_dtype, gating_map.shape, 2)
-    identity_mask = iota_r == iota_c
     strictly_lower_mask = iota_r > iota_c
     lower_mask = iota_r >= iota_c
     # [num_v_heads, chunk, chunk]
@@ -222,11 +219,9 @@ def chunked_gdn_per_seq(
 
     # [num_v_heads, chunk, chunk]
     beta_k_k_t = jnp.repeat(k_k_t, cfg.v_per_kq_head, axis=0) * beta_t
+    # Strictly lower-triangular part L of the column-scaled system T = I + L;
+    # the solve below takes L directly, so T is never materialized.
     gating_beta_k_k_t = gating_map_masked * beta_k_k_t
-    t = jnp.where(identity_mask, 1, gating_beta_k_k_t)
-
-    # [num_v_heads, chunk, chunk]
-    t_inv = invert_triangular_matrix(t, block_size=cfg.triangular_block_size)
 
     # Contract unscaled [K; Q] against state_prev before the triangular solve so
     # the solve operates on the single v_head_dim-wide residual v_diff.
@@ -239,17 +234,15 @@ def chunked_gdn_per_seq(
     k_state, q_state = jnp.split(kq_state, 2, axis=1)
     out_updated = q_state * gating_forward
 
-    # Form unscaled innovation residual v_diff = V - gf * (K @ S_prev), apply
-    # the column-scaled T^-1, and post-multiply by beta_large.
+    # Form unscaled innovation residual v_diff = V - gf * (K @ S_prev) in fp32,
+    # solve the column-scaled system (I + L) @ x = v_diff directly without
+    # materializing T^-1, and post-multiply by beta_large.
     # [num_v_heads, chunk, v_head_dim]
-    v_diff = (v_large - k_state * gating_forward).astype(cfg.dtypes.compute)
+    v_diff = v_large - k_state * gating_forward
     u_ws = (
-        jax.lax.dot(
-            t_inv,
-            v_diff,
-            dimension_numbers=(((2,), (1,)), ((0,), (0,))),
-            preferred_element_type=jnp.float32,
-        ).astype(cfg.dtypes.compute)
+        solve_triangular_rhs(
+            gating_beta_k_k_t, v_diff, block_size=cfg.triangular_block_size
+        )
         * beta_large
     )
 
