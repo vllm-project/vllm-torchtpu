@@ -119,11 +119,13 @@ from vllm_torchtpu.layers.adapter.sample.candidate_sampling import (
     MAX_TOP_K,
     VocabShardLogits,
     candidate_verify_decisions,
+    candidate_verify_op,
     candidate_width,
 )
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     RejectionSampler,
     _random_rejection_sample_impl,
+    assemble_rejection_output,
     candidate_rejection_output,
     candidate_target_dist_pre,
 )
@@ -907,6 +909,210 @@ def _verify_one_draw_ro_lb_impl(
 _verify_one_draw_ro_lb_compiled = _static_shape_args(
     _tpu_compile(_verify_one_draw_ro_lb_impl)
 )
+
+
+# --- VLLM_TPU_CANDIDATE_VERIFY_PROGRAM: a candidate verify chunk as one program
+
+
+def _candidate_uniforms_count(
+    num_bonus: int, num_drafts: int, num_targets: int, width: int
+) -> int:
+    """Length of a candidate verify chunk's flat float32 draw: bonus [B, W],
+    accept [drafts] and recover [T, W] uniforms, then the two words of the
+    in-program full-vocabulary fallback key."""
+    return (num_bonus + num_targets) * width + num_drafts + 2
+
+
+def _split_candidate_uniforms(
+    u: torch.Tensor,
+    num_bonus: int,
+    accept_shape: tuple[int, ...],
+    num_targets: int,
+    width: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bonus [B, W], accept, recover [T, W] float32 uniforms and the int32
+    [2] fallback key, cut in that order from `u`."""
+    end_bonus = num_bonus * width
+    end_accept = end_bonus + math.prod(accept_shape)
+    end_recover = end_accept + num_targets * width
+    bonus_u = u[:end_bonus].reshape(num_bonus, width)
+    accept_u = u[end_bonus:end_accept].reshape(accept_shape)
+    recover_u = u[end_accept:end_recover].reshape(num_targets, width)
+    key = (u[end_recover:] * (1 << 24)).to(torch.int32)
+    return bonus_u, accept_u, recover_u, key
+
+
+def _candidate_op_operands(
+    local_logits: torch.Tensor,
+    bonus_logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+    bounds: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    u: torch.Tensor,
+    width: int,
+) -> tuple[torch.Tensor, ...]:
+    """The candidate op's operands in `candidate_verify_decisions` order,
+    each as this rank's [1, ...] block, built from the logits shard, the
+    padded per-request sampling params and one flat draw `u`. The bonus
+    draws are rounded to the logits dtype, the dtype the op's bonus sampler
+    reproduces `sample_from_logits` in. Without a synthetic rate table the
+    accept draws fill the (unread) rates slot."""
+    bonus_u, accept_u, recover_u, key = _split_candidate_uniforms(
+        u,
+        bonus_logits_indices.shape[0],
+        tuple(draft_token_ids.shape),
+        target_logits_indices.shape[0],
+        width,
+    )
+    if synthetic_conditional_rates is None:
+        rates = accept_u
+    else:
+        rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
+    per_slot = segment_ids.to(torch.int64)
+    operands = (
+        local_logits.index_select(0, bonus_logits_indices),
+        local_logits.index_select(0, target_logits_indices),
+        bounds,
+        draft_token_ids,
+        temperatures,
+        top_k,
+        top_p,
+        temperatures[per_slot],
+        top_k[per_slot],
+        top_p[per_slot],
+        bonus_u.to(local_logits.dtype),
+        accept_u,
+        recover_u,
+        rates,
+        key,
+    )
+    return tuple(t.unsqueeze(0) for t in operands)
+
+
+def _candidate_op_tokens(
+    decisions: tuple[torch.Tensor, ...],
+    draft_token_ids: torch.Tensor,
+    draft_lengths: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+) -> torch.Tensor:
+    """The rejection sampler's [num_reqs, 1 + K] output from the candidate
+    op's [1, ...] results (bonus ids, accepted, recovered ids, ...)."""
+    bonus_token_ids = decisions[0][0]
+    accepted = decisions[1][0] != 0
+    recovered_token_ids = decisions[2][0]
+    return assemble_rejection_output(
+        accepted,
+        recovered_token_ids,
+        draft_token_ids,
+        draft_lengths,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )
+
+
+def _candidate_verify_body(op, *args) -> torch.Tensor:
+    """One candidate verify chunk: `args` are the `_candidate_op_operands`
+    inputs followed by draft_lengths and max_draft_tokens."""
+    (
+        local_logits,
+        bonus_logits_indices,
+        target_logits_indices,
+        bounds,
+        draft_token_ids,
+        temperatures,
+        top_k,
+        top_p,
+        segment_ids,
+        group_indices,
+        synthetic_conditional_rates,
+        u,
+        width,
+        draft_lengths,
+        max_draft_tokens,
+    ) = args
+    decisions = op(
+        *_candidate_op_operands(
+            local_logits,
+            bonus_logits_indices,
+            target_logits_indices,
+            bounds,
+            draft_token_ids,
+            temperatures,
+            top_k,
+            top_p,
+            segment_ids,
+            group_indices,
+            synthetic_conditional_rates,
+            u,
+            width,
+        )
+    )
+    return _candidate_op_tokens(
+        decisions,
+        draft_token_ids,
+        draft_lengths,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+    )
+
+
+@functools.cache
+def _candidate_verify_program(vocab_size: int, synthetic: bool, fold_ro: bool):
+    """The compiled candidate verify chunk for (vocab, synthetic). With
+    `fold_ro` (VLLM_TPU_CANDIDATE_VERIFY_RO) it takes the read-offset
+    buffer, slot groups and 0-d row count first and runs the post-verify
+    `_update_read_offsets_impl` scatter in the same program."""
+    op = candidate_verify_op(vocab_size, synthetic)
+    if not fold_ro:
+
+        def candidate_verify(*args):
+            return _candidate_verify_body(op, *args)
+
+    else:
+
+        def candidate_verify(read_offsets, groups, ro_num_reqs, *args):
+            out = _candidate_verify_body(op, *args)
+            _update_read_offsets_impl(read_offsets, groups, out, ro_num_reqs)
+            return out
+
+    return _static_shape_args(_tpu_compile(candidate_verify))
+
+
+def _candidate_program_key(
+    local_logits: torch.Tensor,
+    md: "SpecDecodeMetadata",
+    synthetic: bool,
+    ro_groups: list[torch.Tensor] | None,
+) -> tuple:
+    """Identifies one compiled candidate verify program: the shapes that vary
+    by verify bucket, and with the read-offset fold the slot-group layout and
+    width."""
+    assert md.draft_token_ids is not None
+    ro = (
+        None
+        if ro_groups is None
+        else (_ro_ingraph_structure(ro_groups), int(ro_groups[0].shape[-1]))
+    )
+    return (
+        tuple(local_logits.shape),
+        local_logits.dtype,
+        md.bonus_logits_indices.shape[0],
+        md.target_logits_indices.shape[0],
+        tuple(md.draft_token_ids.shape),
+        synthetic,
+        ro,
+    )
 
 
 def _on_tpu(t: torch.Tensor) -> bool:
@@ -7992,6 +8198,8 @@ class TPUModelRunner(GPUModelRunner):
                     host_phases.mark("sample_setup")
                     self._fused_read_offsets = (mamba_indices, num_reqs)
                     self._fused_read_offsets_applied = False
+                    if envs.VLLM_TPU_CANDIDATE_VERIFY_RO and mamba_indices:
+                        self._record_candidate_ro_layout(mamba_indices)
 
                     with self._stage_timing.stage("sample"):
                         next_tokens = self._sample_spec_verify_chunk(
@@ -9911,10 +10119,147 @@ class TPUModelRunner(GPUModelRunner):
             (num_tokens, head.num_embeddings_per_partition),
             dtype=self._hidden_states_dtype,
         ).to(self.device)
-        out = self._sample_spec_verify_candidates(
-            warm_local, warm_md, 0, 0, self._get_sampling_generator()
+        if not envs.VLLM_TPU_CANDIDATE_VERIFY_PROGRAM:
+            out = self._sample_spec_verify_candidates(
+                warm_local, warm_md, 0, 0, self._get_sampling_generator()
+            )
+            synchronize_tensors(out)
+            return
+        # The one-program verify at this bucket; serving runs it only at the
+        # keys compiled here. The read-offset fold needs the slot-group
+        # layouts of the real spec-decode warmup, so remember the bucket
+        # (shapes only) for `_precompile_candidate_verify_ro`.
+        self._cvp_compiling = True
+        try:
+            out = self._sample_spec_verify_candidates(
+                warm_local, warm_md, 0, 0, self._get_sampling_generator(), False
+            )
+            synchronize_tensors(out)
+        finally:
+            self._cvp_compiling = False
+        if (
+            envs.VLLM_TPU_CANDIDATE_VERIFY_RO
+            and self.mamba_slot_read_offsets is not None
+        ):
+            self.__dict__.setdefault("_cvro_buckets", []).append(
+                (num_tokens, num_reqs)
+                + tuple(
+                    (tuple(t.shape), t.dtype)
+                    for t in (
+                        draft_token_ids,
+                        draft_lengths,
+                        target_logits_indices,
+                        bonus_logits_indices,
+                        segment_ids,
+                        group_indices,
+                    )
+                )
+            )
+
+    def _precompile_candidate_verify_ro(self) -> None:
+        """VLLM_TPU_CANDIDATE_VERIFY_RO: compile the candidate verify +
+        read-offset scatter program at every bucket
+        `_precompile_candidate_verify` warmed, for every slot-group layout the
+        real spec-decode warmup produced, at every width a chunk can have
+        (num_reqs_max_model_len, num_reqs_most_model_len and the recorded
+        ones). Runs after `_warmup_spec_decode`; the scatter writes a scratch
+        copy, so the live offsets are untouched. A chunk at any other key
+        keeps the separate scatter (`_candidate_verify_one_program`)."""
+        if not (
+            envs.VLLM_TPU_CANDIDATE_VERIFY_PROGRAM
+            and envs.VLLM_TPU_CANDIDATE_VERIFY_RO
+            and envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
+            and self._candidate_bounds is not None
+            and self.mamba_slot_read_offsets is not None
+            and _on_tpu(self.mamba_slot_read_offsets)
+        ):
+            return
+        head = self._candidate_head
+        assert head is not None
+        structures = sorted(self.__dict__.get("_cvro_structures", set()), key=repr)
+        widths = sorted(
+            {
+                w
+                for w in (self.num_reqs_max_model_len, self.num_reqs_most_model_len)
+                if w
+            }
+            | self.__dict__.get("_cvro_widths", set())
         )
-        synchronize_tensors(out)
+        buckets = list(dict.fromkeys(self.__dict__.get("_cvro_buckets", [])))
+        self._cvro_warmed = True  # stop recording layouts
+        if not structures or not buckets:
+            logger.warning(
+                "CANDIDATE_VERIFY_RO: no %s seen during warmup; every candidate "
+                "verify chunk keeps the separate read-offset scatter",
+                "read-offset slot groups" if not structures else "verify buckets",
+            )
+            return
+        start = time.perf_counter()
+        count = 0
+        with self._precompile_timed("candidate verify + read-offset scatter"):
+            scratch = self.mamba_slot_read_offsets.clone()
+            self._cvp_compiling = True
+            try:
+                for num_tokens, num_reqs, *shapes in buckets:
+                    (
+                        draft_token_ids,
+                        draft_lengths,
+                        target_logits_indices,
+                        bonus_logits_indices,
+                        segment_ids,
+                        group_indices,
+                    ) = (
+                        torch.zeros(shape, dtype=dtype).to(self.device)
+                        for shape, dtype in shapes
+                    )
+                    warm_md = SpecDecodeMetadata(
+                        draft_token_ids=draft_token_ids,
+                        draft_lengths=draft_lengths,
+                        draft_lengths_cpu=np.zeros(num_reqs, dtype=np.int32),
+                        target_logits_indices=target_logits_indices,
+                        bonus_logits_indices=bonus_logits_indices,
+                        final_logits_indices=target_logits_indices,
+                        segment_ids=segment_ids,
+                        group_indices=group_indices,
+                    )
+                    warm_local = torch.zeros(
+                        (num_tokens, head.num_embeddings_per_partition),
+                        dtype=self._hidden_states_dtype,
+                    ).to(self.device)
+                    for (dtype, leads, alias), width in itertools.product(
+                        structures, widths
+                    ):
+                        groups: list[torch.Tensor] = []
+                        for i, lead in enumerate(leads):
+                            groups.append(
+                                groups[alias[i]]
+                                if alias[i] != i
+                                else torch.zeros((*lead, width), dtype=dtype).to(
+                                    self.device
+                                )
+                            )
+                        out = self._sample_spec_verify_candidates(
+                            warm_local,
+                            warm_md,
+                            0,
+                            0,
+                            self._get_sampling_generator(),
+                            (scratch, groups, 1),
+                        )
+                        synchronize_tensors(out)
+                        count += 1
+            finally:
+                self._cvp_compiling = False
+        logger.info(
+            "CANDIDATE_VERIFY_RO warmup: %d candidate verify + scatter programs "
+            "in %.1f s (%d buckets x widths %s x %d slot-group layouts %s)",
+            count,
+            time.perf_counter() - start,
+            len(buckets),
+            widths,
+            len(structures),
+            [(len(leads), leads[0] if leads else ()) for _, leads, _ in structures],
+        )
 
     def _precompile_verify_fused(
         self,
@@ -10408,6 +10753,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._warmup_spec_decode()
                 # Needs the slot-group layout the real warmup above produced.
                 self._precompile_verify_ro_ingraph()
+                self._precompile_candidate_verify_ro()
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.
@@ -12185,9 +12531,10 @@ class TPUModelRunner(GPUModelRunner):
         device: torch.device,
         pad_top_k: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if pad_top_k:
+        if pad_top_k and not envs.VLLM_TPU_CANDIDATE_VERIFY_PROGRAM:
             # Candidate verify: padding rows keep top_k = pad_top_k so every
-            # row has a top-k cutoff. Not memoized (rare, off by default).
+            # row has a top-k cutoff. Memoized only with
+            # VLLM_TPU_CANDIDATE_VERIFY_PROGRAM (pad_top_k is in the key).
             return TPUModelRunner._padded_sampling_params_uncached(
                 self,
                 cur_start_idx,
@@ -12204,7 +12551,7 @@ class TPUModelRunner(GPUModelRunner):
             # the ~10 CPU tensor ops and three uploads below.
             ib = self.input_batch
             s, e = cur_start_idx, cur_end_idx
-            slot = (s, e, padded_num_reqs, dtype, str(device))
+            slot = (s, e, padded_num_reqs, dtype, str(device), pad_top_k)
             values = (
                 ib.temperature_cpu[s:e].tobytes(),
                 ib.top_k_cpu[s:e].tobytes(),
@@ -12215,14 +12562,26 @@ class TPUModelRunner(GPUModelRunner):
             if hit is not None and hit[0] == values:
                 return hit[1]
             out = TPUModelRunner._padded_sampling_params_uncached(
-                self, cur_start_idx, cur_end_idx, padded_num_reqs, dtype, device
+                self,
+                cur_start_idx,
+                cur_end_idx,
+                padded_num_reqs,
+                dtype,
+                device,
+                pad_top_k=pad_top_k,
             )
             if len(memo) > 16:
                 memo.clear()
             memo[slot] = (values, out)
             return out
         return TPUModelRunner._padded_sampling_params_uncached(
-            self, cur_start_idx, cur_end_idx, padded_num_reqs, dtype, device
+            self,
+            cur_start_idx,
+            cur_end_idx,
+            padded_num_reqs,
+            dtype,
+            device,
+            pad_top_k=pad_top_k,
         )
 
     def _padded_sampling_params_uncached(
@@ -12460,8 +12819,14 @@ class TPUModelRunner(GPUModelRunner):
         ):
             return False
         n = self.input_batch.num_reqs
-        temps = self.input_batch.temperature_cpu_tensor[:n]
-        top_k = self.input_batch.top_k_cpu_tensor[:n]
+        if envs.VLLM_TPU_CANDIDATE_VERIFY_PROGRAM:
+            # The batch's numpy views: same values, without the per-step CPU
+            # tensor ops.
+            temps = self.input_batch.temperature_cpu[:n]
+            top_k = self.input_batch.top_k_cpu[:n]
+        else:
+            temps = self.input_batch.temperature_cpu_tensor[:n]
+            top_k = self.input_batch.top_k_cpu_tensor[:n]
         ok = bool(((temps == 0) | ((top_k >= 1) & (top_k <= MAX_TOP_K))).all())
         if ok:
             logger.info_once(
@@ -12499,11 +12864,14 @@ class TPUModelRunner(GPUModelRunner):
         cur_start_idx: int,
         cur_end_idx: int,
         sampling_generator: torch.Generator | None,
+        ro_fold: tuple | bool = True,
     ) -> torch.Tensor:
         """`_sample_spec_verify_chunk` for a non-greedy step from this rank's
         logits shard: the same distributions, drawn over per-shard top-64
         candidates (layers/core/candidate_sampling.py); the draws differ
-        from the gathered-logits path."""
+        from the gathered-logits path. `ro_fold` (warmup only) replaces the
+        chunk's read-offset fold operands (`_candidate_ro_fold`): a
+        (buffer, groups, rows) tuple, or False for none."""
         assert self.rejection_sampler is not None
         assert self.speculative_config is not None
         assert self._candidate_bounds is not None
@@ -12524,6 +12892,19 @@ class TPUModelRunner(GPUModelRunner):
         )
         host_phases.mark("vfy_params")
         width = candidate_width(head.tp_size)
+        if envs.VLLM_TPU_CANDIDATE_VERIFY_PROGRAM:
+            out = self._candidate_verify_one_program(
+                local_logits,
+                md,
+                temps,
+                top_k,
+                top_p,
+                width,
+                sampling_generator,
+                self._candidate_ro_fold() if ro_fold is True else ro_fold or None,
+            )
+            if out is not None:
+                return out
         bonus_u = torch.rand(
             (num_bonus, width),
             dtype=local_logits.dtype,
@@ -12588,6 +12969,138 @@ class TPUModelRunner(GPUModelRunner):
             md.group_indices,
             self.speculative_config.num_speculative_tokens,
         )
+
+    def _candidate_verify_one_program(
+        self,
+        local_logits: torch.Tensor,
+        md: SpecDecodeMetadata,
+        temps: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        width: int,
+        sampling_generator: torch.Generator | None,
+        ro_fold: tuple | None,
+    ) -> torch.Tensor | None:
+        """VLLM_TPU_CANDIDATE_VERIFY_PROGRAM: the candidate verify chunk as
+        one flat uniform draw and one compiled program; with `ro_fold`
+        (buffer, slot groups, rows) the program also scatters the chunk's
+        read offsets and marks them applied. Outside warmup it runs only at
+        a key warmup compiled: a fold key that was not warmed drops the fold,
+        and a plain key that was not warmed returns None (the caller keeps
+        the separate programs), each with one WARNING per key."""
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        assert md.draft_token_ids is not None
+        head = self._candidate_head
+        assert head is not None
+        synthetic = self.rejection_sampler.synthetic_mode
+        compiling = self.__dict__.get("_cvp_compiling", False)
+        warmed = self.__dict__.setdefault("_cvp_warmed", set())
+        missed = self.__dict__.setdefault("_cvp_missed", set())
+        groups = None if ro_fold is None else list(ro_fold[1])
+        key = _candidate_program_key(local_logits, md, synthetic, groups)
+        if not compiling and key not in warmed:
+            if key not in missed:
+                missed.add(key)
+                logger.warning(
+                    "CANDIDATE_VERIFY_PROGRAM: key %s was not warmed; it keeps "
+                    "the %s (%d unwarmed keys so far)",
+                    key,
+                    "separate read-offset scatter"
+                    if groups is not None
+                    else "separate candidate verify programs",
+                    len(missed),
+                )
+            if groups is None:
+                return None
+            return self._candidate_verify_one_program(
+                local_logits,
+                md,
+                temps,
+                top_k,
+                top_p,
+                width,
+                sampling_generator,
+                None,
+            )
+        num_bonus = md.bonus_logits_indices.shape[0]
+        num_targets = md.target_logits_indices.shape[0]
+        u = torch.rand(
+            (
+                _candidate_uniforms_count(
+                    num_bonus, md.draft_token_ids.numel(), num_targets, width
+                ),
+            ),
+            dtype=torch.float32,
+            device=local_logits.device,
+            generator=sampling_generator,
+        )
+        host_phases.mark("vfy_rand")
+        args = (
+            local_logits,
+            md.bonus_logits_indices,
+            md.target_logits_indices,
+            self._candidate_bounds,
+            md.draft_token_ids,
+            temps,
+            top_k,
+            top_p,
+            md.segment_ids,
+            md.group_indices,
+            self.rejection_sampler.synthetic_conditional_rates if synthetic else None,
+            u,
+            width,
+            md.draft_lengths,
+            self.speculative_config.num_speculative_tokens,
+        )
+        program = _candidate_verify_program(
+            head.org_vocab_size, synthetic, groups is not None
+        )
+        if groups is None:
+            out = program(*args)
+        else:
+            buffer, _, rows = ro_fold
+            out = program(buffer, groups, self._num_reqs_tensor(rows), *args)
+            self._fused_read_offsets_applied = True
+        if compiling:
+            warmed.add(key)
+        elif not self.__dict__.get("_cvp_logged"):
+            self._cvp_logged = True
+            logger.info(
+                "CANDIDATE_VERIFY_PROGRAM: candidate verify as one program%s",
+                ""
+                if groups is None
+                else f" with the read-offset scatter ({len(groups)} slot groups "
+                f"of shape {sorted({tuple(g.shape) for g in groups})})",
+            )
+        return out
+
+    def _candidate_ro_fold(self) -> tuple | None:
+        """VLLM_TPU_CANDIDATE_VERIFY_RO: (read-offset buffer, slot groups,
+        rows) of this verify chunk for the in-program scatter, or None to
+        scatter after it (`_update_mamba_slot_read_offsets`, whose compiled
+        path the fold replaces)."""
+        groups, rows = self._fused_read_offsets
+        if (
+            not envs.VLLM_TPU_CANDIDATE_VERIFY_RO
+            or not envs.VLLM_TPU_FUSED_READ_OFFSET_UPDATE
+            or self.mamba_slot_read_offsets is None
+            or not groups
+            or not _on_tpu(self.mamba_slot_read_offsets)
+        ):
+            return None
+        return self.mamba_slot_read_offsets, list(groups), rows
+
+    def _record_candidate_ro_layout(self, groups: list[torch.Tensor]) -> None:
+        """VLLM_TPU_CANDIDATE_VERIFY_RO: until the fold is warmed, remember the
+        slot-group layout and width of each verify chunk (the real spec-decode
+        warmup walks them); `_precompile_candidate_verify_ro` compiles those."""
+        if "_cvro_warmed" in self.__dict__ or not groups:
+            return
+        self.__dict__.setdefault("_cvro_structures", set()).add(
+            _ro_ingraph_structure(list(groups))
+        )
+        self.__dict__.setdefault("_cvro_widths", set()).add(int(groups[0].shape[-1]))
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_top_tokens(
