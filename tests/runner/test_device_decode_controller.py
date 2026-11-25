@@ -101,7 +101,6 @@ EXCLUDED = {
     "decode context parallelism": lambda r: setattr(
         r.parallel_config, "decode_context_parallel_size", 2
     ),
-    "M-RoPE": lambda r: setattr(r, "uses_mrope", True),
     "multimodal": lambda r: setattr(r, "supports_mm_inputs", True),
     "LoRA": lambda r: setattr(r, "lora_config", object()),
     "KV transfer": lambda r: setattr(r.vllm_config, "kv_transfer_config", object()),

@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Device decode on an M-RoPE model: every slot keeps its request's position
-delta, and a device step builds the positions the stock
-`_calc_mrope_positions` stages, bit for bit."""
+delta, a device step builds the positions the stock `_calc_mrope_positions`
+stages, bit for bit, and a step runs on the device only when every token in
+it is a generated one."""
 
 from types import SimpleNamespace
 
@@ -22,10 +23,15 @@ import pytest
 import torch
 from device_decode_test_utils import (
     BLOCK,
+    FLAG,
     HIDDEN,
     MAX_MODEL_LEN,
+    MAX_NUM_REQS,
     VOCAB,
     FakeModel,
+    SimEngine,
+    SimScheduler,
+    enable_device_decode,
     make_runner,
 )
 from transformers import Qwen3_5MoeTextConfig
@@ -34,8 +40,10 @@ from vllm.transformers_utils.config import mrope_num_dims, uses_mrope
 from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
+from vllm_torchtpu.runner.device_decode import controller as controller_mod
 from vllm_torchtpu.runner.device_decode import inputs as inputs_mod
 from vllm_torchtpu.runner.device_decode import slots as slots_mod
+from vllm_torchtpu.runner.device_decode.controller import DeviceDecodeController
 from vllm_torchtpu.runner.device_decode.inputs import (
     DecodeShape,
     WalkGeometry,
@@ -48,6 +56,8 @@ from vllm_torchtpu.runner.device_decode.slots import (
     num_reqs_padding,
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+VERIFY_FLAG = "VLLM_TPU_DEVICE_DECODE_VERIFY"
 
 # A tiny Qwen3.5 text config. Like the published one, it declares an M-RoPE
 # section, so vLLM gives the runner M-RoPE positions for a text-only model.
@@ -382,3 +392,194 @@ def test_the_mrope_prepare_program_traces_as_one_graph(monkeypatch):
     inputs_mod.precompile_prepare(runner, slots, walk, [shape])
     assert len(calls) == 1
     assert calls[0][0] is slots.mrope_delta and calls[0][1] == 3
+
+
+class MRopeEngine(SimEngine):
+    """A SimEngine over `make_mrope_runner`, given explicit prompts."""
+
+    def __init__(self, monkeypatch, *, async_scheduling: bool = False):
+        self.runner = make_mrope_runner(monkeypatch, async_scheduling=async_scheduling)
+        self.sched = SimScheduler()
+        self.controller = enable_device_decode(monkeypatch, self.runner)
+        self.tokens: dict[str, list[list[int]]] = {}
+        self.logprobs: dict[str, list[list[tuple]]] = {}
+
+    def add_prompt(self, req_id: str, prompt: list[int], **params) -> None:
+        params.setdefault("max_tokens", 10)
+        self.sched.add(req_id, list(prompt), SamplingParams(**params))
+        self.tokens.setdefault(req_id, []).append([])
+        self.logprobs.setdefault(req_id, []).append([])
+
+
+def mrope_engines(monkeypatch, *, async_scheduling=False):
+    """A device engine, and a reference that takes the stock path every step
+    with the keyed noise."""
+    device = MRopeEngine(monkeypatch, async_scheduling=async_scheduling)
+    stock = MRopeEngine(monkeypatch, async_scheduling=async_scheduling)
+    monkeypatch.setattr(stock.controller, "try_execute", lambda *_args: False)
+    return device, stock
+
+
+def test_text_mrope_models_pass_the_startup_gate(monkeypatch):
+    """M-RoPE alone no longer keeps every step on the stock path, so a
+    Qwen3.5 text config decodes on the device. Multimodal models still stay
+    on the stock path."""
+    runner = make_mrope_runner(monkeypatch)
+    monkeypatch.setenv(FLAG, "1")
+    controller = DeviceDecodeController.maybe_create(runner)
+    assert controller.static_gate_failures() == []
+    runner.supports_mm_inputs = True
+    assert controller.static_gate_failures() == ["multimodal"]
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True], ids=["sync", "async"])
+def test_device_steps_feed_the_backbone_the_stock_positions(
+    monkeypatch, async_scheduling
+):
+    """Through execute_model and sample_tokens, every forward of the device
+    engine gets the positions the reference's gets, bit for bit, so both
+    sample the same tokens. Text-only and multimodal-delta requests decode
+    on the device together; one is preempted and resumes, and one is
+    resubmitted under its id with a prompt of another delta."""
+    device, stock = mrope_engines(monkeypatch, async_scheduling=async_scheduling)
+    engines = (device, stock)
+    batches = []
+    try_execute = device.controller.try_execute
+
+    def recording(scheduler_output, target_num_chunks):
+        ran = try_execute(scheduler_output, target_num_chunks)
+        if ran:
+            runner = device.runner
+            req_ids = runner.input_batch.req_ids
+            batches.append({runner.requests[r].mrope_position_delta for r in req_ids})
+        return ran
+
+    monkeypatch.setattr(device.controller, "try_execute", recording)
+
+    def run(steps):
+        for _ in range(steps):
+            for engine in engines:
+                engine.step()
+
+    for engine in engines:
+        engine.add_prompt("t", TEXT, temperature=0.8, max_tokens=14)
+        engine.add_prompt("i", IMAGE_PROMPT, temperature=0.8, max_tokens=14)
+        engine.add_prompt("v", VIDEO_PROMPT, temperature=0.0, max_tokens=12)
+    run(4)
+    slots = device.controller.slots
+    assert int(slots.mrope_delta[slots.slot_of("i")]) == DELTAS["image"]
+    for engine in engines:
+        engine.sched.preempt("v")
+    run(3)
+    for engine in engines:
+        engine.sched.abort("i")
+        engine.add_prompt("i", VIDEO_PROMPT, temperature=0.8, max_tokens=8)
+    run(2)
+    assert int(slots.mrope_delta[slots.slot_of("i")]) == DELTAS["video"]
+    for _ in range(60):
+        if not any(engine.sched.reqs for engine in engines):
+            break
+        run(1)
+    else:
+        raise AssertionError("requests left after 60 steps")
+
+    assert device.tokens == stock.tokens
+    got, want = device.runner.model.positions, stock.runner.model.positions
+    assert len(got) == len(want)
+    for step, (a, b) in enumerate(zip(got, want)):
+        assert a.dtype == b.dtype == torch.int32, step
+        assert a.shape == b.shape and a.shape[0] == 3, step
+        assert torch.equal(a, b), step
+    counters = device.controller.counters()
+    assert counters["device_steps"] >= 10, counters
+    assert "mrope_prompt_token" not in counters, counters
+    assert device.controller.enabled
+    # Device steps ran with every kind of delta in the batch.
+    assert {0, DELTAS["image"], DELTAS["video"]} <= set().union(*batches)
+    assert any(len(deltas) == 3 for deltas in batches), batches
+
+
+def _decode_ready_step(engine, prompt):
+    """`engine` after one device step of a request, and its next pure-decode
+    step after the state update."""
+    engine.add_prompt("a", prompt, temperature=0.8)
+    engine.run(2)
+    assert engine.controller.counters()["device_steps"] == 1
+    output = engine.sched.schedule()
+    engine.runner._update_states(output)
+    engine.controller.on_states_updated(output)
+    assert not isinstance(engine.controller._plan_step(output, 1), str)
+    return output
+
+
+def test_a_prompt_token_keeps_the_step_on_the_stock_path(monkeypatch):
+    """Only generated tokens qualify. A row whose token is still a prompt
+    token sends the step to the stock path, which reads that token's
+    position from the request's precomputed table. A decode-ready slot never
+    has such a row, so the test makes one: the request's prompt runs one
+    token past the step."""
+    engine = MRopeEngine(monkeypatch)
+    output = _decode_ready_step(engine, IMAGE_PROMPT)
+    batch = engine.runner.input_batch
+    row = batch.req_id_to_index["a"]
+    batch.num_prompt_tokens[row] = batch.num_computed_tokens_cpu[row] + 1
+    assert engine.controller.try_execute(output, 1) is False
+    assert engine.controller.counters()["mrope_prompt_token"] == 1
+    # 1D positions do not depend on the prompt: the same row decodes on the
+    # device in a model without M-RoPE.
+    flat = SimEngine(monkeypatch, async_scheduling=False, device=True)
+    flat.sched.add("a", IMAGE_PROMPT, SamplingParams(temperature=0.8))
+    flat.tokens["a"], flat.logprobs["a"] = [[]], [[]]
+    flat.run(2)
+    output = flat.sched.schedule()
+    flat.runner._update_states(output)
+    flat.controller.on_states_updated(output)
+    batch = flat.runner.input_batch
+    row = batch.req_id_to_index["a"]
+    batch.num_prompt_tokens[row] = batch.num_computed_tokens_cpu[row] + 1
+    assert not isinstance(flat.controller._plan_step(output, 1), str)
+
+
+def test_the_hbm_reserve_counts_the_mrope_delta(monkeypatch):
+    """For an M-RoPE model the reserve counts one more int32 per slot, and
+    still holds the slots `initialize_and_precompile` builds."""
+    monkeypatch.setattr(controller_mod, "_PROGRAM_SCRATCH_BYTES", 3 << 30)
+    layers = {f"layer.{i}": object() for i in range(3)}
+    monkeypatch.setattr(
+        controller_mod, "get_layers_from_vllm_config", lambda *_args: layers
+    )
+    runner = make_mrope_runner(monkeypatch)
+    monkeypatch.setenv(FLAG, "1")
+    runner._device_decode = DeviceDecodeController.maybe_create(runner)
+    width = runner.max_num_blocks_per_req
+    slot_bytes = 4 * (MAX_NUM_REQS + 1) * (9 + 3 * width)
+    assert runner.post_profile_hbm_reserves().device_decode == slot_bytes + (3 << 30)
+    controller = enable_device_decode(monkeypatch, runner)
+    assert controller.slots.config.mrope_rows == 3
+    reserved = controller._reserve_slot_config()
+    assert reserved.device_bytes >= controller.slots.config.device_bytes
+
+
+def test_verify_mode_checks_the_mrope_positions(monkeypatch):
+    """VLLM_TPU_DEVICE_DECODE_VERIFY compares a device step's positions with
+    those `_calc_mrope_positions` stages, and they agree. A slot whose delta
+    is off is caught before the forward: the step runs on the stock path and
+    device steps turn off."""
+    monkeypatch.setenv(VERIFY_FLAG, "1")
+    device, stock = mrope_engines(monkeypatch)
+    for engine in (device, stock):
+        engine.add_prompt("t", TEXT, temperature=0.8)
+        engine.add_prompt("i", IMAGE_PROMPT, temperature=0.8)
+        engine.add_prompt("v", VIDEO_PROMPT, temperature=0.8)
+        engine.run(3)
+    counters = device.controller.counters()
+    assert counters["verify_steps"] == counters["device_steps"] == 2, counters
+    assert counters.get("verify_mismatches", 0) == 0, counters
+    slots = device.controller.slots
+    slots.mrope_delta[slots.slot_of("v")] += 1
+    for engine in (device, stock):
+        engine.run_until_done()
+    assert device.tokens == stock.tokens
+    assert not device.controller.enabled
+    assert "M-RoPE position" in device.controller.disabled_reason
+    assert device.controller.counters()["verify_input_mismatch"] == 1

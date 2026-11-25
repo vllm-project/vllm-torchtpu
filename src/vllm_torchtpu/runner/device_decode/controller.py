@@ -68,6 +68,7 @@ from vllm_torchtpu.runner.device_decode.slots import (
     DecodeSlots,
     SlotConfig,
     StockChunkPlan,
+    mrope_position_rows,
 )
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
@@ -82,7 +83,7 @@ logger = init_logger(__name__)
 
 # Why a step runs on the stock path, in the order they are checked; the
 # slot checks (`slots.SLOT_NOT_READY`, `slots.MIRROR_MISMATCH`) come between
-# ENCODER_OR_KV and UNREGISTERED_SHAPE.
+# ENCODER_OR_KV and MROPE_PROMPT_TOKEN.
 NOT_PURE_DECODE = "not_pure_decode"
 MULTI_CHUNK = "multi_chunk"
 STRUCTURED_OUTPUT = "structured_output"
@@ -90,6 +91,9 @@ MIN_TOKENS = "min_tokens"
 PROMPT_LOGPROBS = "prompt_logprobs"
 UNSUPPORTED_SAMPLING = "unsupported_sampling"
 ENCODER_OR_KV = "encoder_or_kv"
+# An M-RoPE model's row whose token is a prompt token: the stock path reads
+# its position from the request's precomputed table, which no slot holds.
+MROPE_PROMPT_TOKEN = "mrope_prompt_token"
 UNREGISTERED_SHAPE = "unregistered_shape"
 # Last, on a verified step: its inputs built on the device disagree with the
 # stock ones, so it runs on the stock path and device steps turn off.
@@ -231,7 +235,6 @@ class DeviceDecodeController:
                 or not isinstance(r.sequence_layout_planner, AllSequenceLayoutPlanner),
             ),
             ("decode context parallelism", parallel.decode_context_parallel_size > 1),
-            ("M-RoPE", r.uses_mrope),
             ("multimodal", r.supports_mm_inputs),
             ("LoRA", r.lora_config is not None),
             ("KV transfer", r.vllm_config.kv_transfer_config is not None),
@@ -279,6 +282,7 @@ class DeviceDecodeController:
             group_widths=(r.max_num_blocks_per_req,) * len(layers),
             vocab_size=r.vocab_size,
             model_seed=int(r.model_config.seed or 0),
+            mrope_rows=mrope_position_rows(r),
         )
 
     def initialize_and_precompile(self) -> None:
@@ -369,7 +373,7 @@ class DeviceDecodeController:
         )
         if verify:
             self._counters[VERIFY_STEPS] += 1
-            mismatch = self._input_mismatch(inputs, shape)
+            mismatch = self._input_mismatch(inputs, shape, scheduler_output)
             if mismatch is not None:
                 self._counters[VERIFY_MISMATCHES] += 1
                 self._count_stock_step(VERIFY_INPUT_MISMATCH)
@@ -516,6 +520,16 @@ class DeviceDecodeController:
             input_batch.num_computed_tokens_cpu[:num_reqs] + 1,
         ):
             return SLOT_NOT_READY
+        # A generated token's M-RoPE position is its index plus the request's
+        # delta in every section, which the slots hold; a prompt token's comes
+        # from the request's precomputed table. A decode-ready slot became
+        # ready on a step that produced a token, so its next token is a
+        # generated one and this check only guards the rule.
+        if self.slots.config.mrope_rows and np.any(
+            input_batch.num_computed_tokens_cpu[:num_reqs]
+            < input_batch.num_prompt_tokens[:num_reqs]
+        ):
+            return MROPE_PROMPT_TOKEN
         shape = DecodeShape.for_batch(r, num_reqs)
         variant = SamplerVariant.for_batch(r, num_reqs)
         if (
@@ -771,7 +785,9 @@ class DeviceDecodeController:
             req_state.output_token_ids.extend(valid_tokens)
         return output
 
-    def _input_mismatch(self, inputs: DecodeInputs, shape: DecodeShape) -> str | None:
+    def _input_mismatch(
+        self, inputs: DecodeInputs, shape: DecodeShape, scheduler_output: Any
+    ) -> str | None:
         """How the live part of the device-built inputs differs from what the
         stock path stages for the step, or None. Syncs the host."""
         r = self.runner
@@ -785,8 +801,18 @@ class DeviceDecodeController:
             # would compile a program per request count.
             return tensor.cpu().numpy()[:num_reqs]
 
-        checks = [
-            ("position", host(inputs.positions), num_computed),
+        checks: list[tuple[str, Any, Any]]
+        if inputs.positions.dim() == 1:
+            checks = [("position", host(inputs.positions), num_computed)]
+        else:
+            # The M-RoPE positions the stock path stages for the step.
+            r._calc_mrope_positions(scheduler_output)
+            device = inputs.positions.cpu().numpy()
+            checks = [
+                (f"section {i} M-RoPE position", got[:num_reqs], want[:num_reqs])
+                for i, (got, want) in enumerate(zip(device, r.mrope_positions.np))
+            ]
+        checks += [
             ("sequence length", host(inputs.seq_lens), num_computed + 1),
             ("input token", host(inputs.input_ids), self._input_tokens(num_reqs)),
         ]
