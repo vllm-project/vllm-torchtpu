@@ -78,6 +78,8 @@ UNION_STATS = (
 # ShapeSpecializationError 's72 <= 4' at bucket 32).
 UNION_STATS_REQS = 16
 IR_NEW = "qsa_ir_new"
+# `xreq_prefetch`: SMEM banks of staged union ids (this request, the next, the one after).
+XREQ_BANKS = 3
 FP8_MAX = 448.0
 
 
@@ -256,8 +258,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qu_id", pltpu.VMEM((nreq, 1, D * KU), I32)),
             ScratchReq("qu_cd", pltpu.VMEM((nreq, 1, D * KU), I32)),
             ScratchReq("qu_n", pltpu.SMEM((nreq, D), I32)),
-            # `xreq_prefetch`: two banks (request q's ids, request q+1's staged).
-            ScratchReq("qu_row", pltpu.SMEM((2 if self.xreq_prefetch else 1, KU + 128), I32)),
+            # `xreq_prefetch`: request q's ids, request q+1's, request q+2's being staged.
+            ScratchReq(
+                "qu_row", pltpu.SMEM((XREQ_BANKS if self.xreq_prefetch else 1, KU + 128), I32)
+            ),
             ScratchReq("qu_sem", pltpu.SemaphoreType.DMA((3,))),
             ScratchReq("qu_st", pltpu.VMEM((1, 128), I32)),
         ]
@@ -1503,13 +1507,49 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         def tab_copy(q: Any) -> Any:
             return self._tab_copy(ctx, l, q)
 
-        def stage_ids(q: Any, bank: Any) -> None:
-            """Request `q`'s union ids (physical with `union_phys`) into `qu_row[bank]`."""
+        def chunk_range(q: Any) -> tuple[Any, Any]:
+            """`union_phys`: the 128-id chunks of request `q`'s union this rank's tiles
+            read."""
+            n_u = scr["qu_n"][q, rk]
+            c_lo, c_hi = 0, (n_u + 127) // 128
+            if self.union_split:  # only the 128-id chunks of this rank's tiles
+                t0, nt = ua.split_tiles(n_u, jax.lax.rem(ctx.me, self.split), self.split)
+                c_lo, c_hi = t0 * ua.GROUPS_PER_TILE // 128, jnp.minimum(
+                    ((t0 + nt) * ua.GROUPS_PER_TILE + 127) // 128, c_hi)
+            return c_lo, c_hi
+
+        def stage_copies(q: Any, bank: Any) -> tuple[Any, list]:
+            """Request `q`'s id copies into `qu_row[bank]`: `(per-chunk copy, whole copies)`.
+            With `union_phys` only the chunks `chunk_range` computed go to SMEM (the tiles
+            read no other id), each a 128-id copy on `qu_sem[0]`: equal sizes, so one wait
+            per chunk retires them."""
+            tail = pltpu.make_async_copy(
+                scr["qi_z"], scr["qu_row"].at[pl.ds(bank, 1), pl.ds(KU, 128)],
+                scr["qu_sem"].at[1],
+            )
+            if not self.union_phys:
+                src = scr["qu_id"].at[q, :, pl.ds(uoff, KU)]
+                return None, [pltpu.make_async_copy(
+                    src, scr["qu_row"].at[pl.ds(bank, 1), pl.ds(0, KU)], scr["qu_sem"].at[0],
+                ), tail]
+
+            def to_smem(c: Any) -> Any:
+                lo = pl.multiple_of(c * 128, 128)
+                return pltpu.make_async_copy(
+                    scr["qu_pv"].at[:, pl.ds(lo, 128)],
+                    scr["qu_row"].at[pl.ds(bank, 1), pl.ds(lo, 128)],
+                    scr["qu_sem"].at[0],
+                )
+
+            return to_smem, [tail]
+
+        def stage_start(q: Any, bank: Any) -> None:
+            """Request `q`'s union ids (physical with `union_phys`) toward `qu_row[bank]`."""
             # This rank's union: under DCP only the groups it owns (the pair rank's rows are
             # neither streamed nor scored here).
             src = scr["qu_id"].at[q, :, pl.ds(uoff, KU)]
-            n_u = scr["qu_n"][q, rk]
             with sc("qsa_u_ids", 2):
+                per_chunk, whole = stage_copies(q, bank)
                 if self.union_phys:
                     # The request's main-table row (`tab_copy`, in flight since the loop
                     # began), then its union ids -> physical micro-page ids for every slot a
@@ -1538,62 +1578,44 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         )
                         return carry
 
-                    c_lo, c_hi = 0, (n_u + 127) // 128
-                    if self.union_split:  # only the 128-id chunks of this rank's tiles
-                        t0, nt = ua.split_tiles(n_u, jax.lax.rem(ctx.me, self.split), self.split)
-                        c_lo, c_hi = t0 * ua.GROUPS_PER_TILE // 128, jnp.minimum(
-                            ((t0 + nt) * ua.GROUPS_PER_TILE + 127) // 128, c_hi)
+                    c_lo, c_hi = chunk_range(q)
                     jax.lax.fori_loop(c_lo, c_hi, chunk, 0)
-
-                    # Only the chunks just computed go to SMEM: the tiles read no other id.
-                    def to_smem(c: Any) -> Any:
-                        lo = pl.multiple_of(c * 128, 128)
-                        return pltpu.make_async_copy(
-                            scr["qu_pv"].at[:, pl.ds(lo, 128)],
-                            scr["qu_row"].at[pl.ds(bank, 1), pl.ds(lo, 128)],
-                            scr["qu_sem"].at[0],
-                        )
-
-                    jax.lax.fori_loop(c_lo, c_hi, lambda c, k: (to_smem(c).start(), k)[1], 0)
-                    tail = pltpu.make_async_copy(
-                        scr["qi_z"], scr["qu_row"].at[pl.ds(bank, 1), pl.ds(KU, 128)],
-                        scr["qu_sem"].at[1],
-                    )
-                    tail.start()
-                    jax.lax.fori_loop(c_lo, c_hi, lambda c, k: (to_smem(0).wait(), k)[1], 0)
-                    tail.wait()
-                    return n_u
-                cs = [
-                    pltpu.make_async_copy(
-                        src, scr["qu_row"].at[pl.ds(bank, 1), pl.ds(0, KU)],
-                        scr["qu_sem"].at[0],
-                    ),
-                    pltpu.make_async_copy(
-                        scr["qi_z"], scr["qu_row"].at[pl.ds(bank, 1), pl.ds(KU, 128)],
-                        scr["qu_sem"].at[1],
-                    ),
-                ]
-                for c in cs:
+                    jax.lax.fori_loop(c_lo, c_hi, lambda c, k: (per_chunk(c).start(), k)[1], 0)
+                for c in whole:
                     c.start()
-                for c in cs:
+
+        def stage_wait(q: Any, bank: Any) -> None:
+            """Wait for `stage_start(q, bank)`'s copies."""
+            with sc("qsa_u_ids", 2):
+                per_chunk, whole = stage_copies(q, bank)
+                if self.union_phys:
+                    c_lo, c_hi = chunk_range(q)
+                    jax.lax.fori_loop(c_lo, c_hi, lambda c, k: (per_chunk(0).wait(), k)[1], 0)
+                for c in whole:
                     c.wait()
-            return n_u
+
+        def stage_ids(q: Any, bank: Any) -> Any:
+            stage_start(q, bank)
+            stage_wait(q, bank)
+            return scr["qu_n"][q, rk]
 
         def req(q: Any, carry: Any) -> Any:
             if xreq:
                 outs, sbase = carry
-                bank = jax.lax.rem(q, 2)
+                bank, nbank = jax.lax.rem(q, XREQ_BANKS), jax.lax.rem(q + 1, XREQ_BANKS)
                 qn = jnp.minimum(q + 1, nreq - 1)
                 nlive = q + 1 < n_loop
-                # The next request's ids, staged while this request's first tiles (issued by
-                # the previous request) are in flight.
-                @pl.when(nlive)
-                def _():
-                    stage_ids(qn, 1 - bank)
+                # The next request's ids (copies started one request earlier: their latency
+                # hides behind that request's attention) land before this request's stream
+                # issues its tiles; the one after next starts staging (only one staging is
+                # in flight, so the copies share `qu_sem`).
+                pl.when(nlive)(lambda: stage_wait(qn, nbank))
+                pl.when(q + 2 < n_loop)(lambda: stage_start(
+                    jnp.minimum(q + 2, nreq - 1), jax.lax.rem(q + 2, XREQ_BANKS)))
 
                 stream = (
                     sbase, q == 0,
-                    (nlive, 1 - bank, self.tab_base(ctx, l) + qn, scr["qu_n"][qn, rk]),
+                    (nlive, nbank, self.tab_base(ctx, l) + qn, scr["qu_n"][qn, rk]),
                 )
                 n_u = scr["qu_n"][q, rk]
             else:
@@ -1693,6 +1715,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         @pl.when(n_loop > 0)
         def _():
             stage_ids(0, 0)
+
+        pl.when(n_loop > 1)(lambda: stage_start(min(1, nreq - 1), 1))
 
         outs, _ = jax.lax.fori_loop(0, n_loop, req, (zeros, jnp.int32(0)))
         return list(outs)
