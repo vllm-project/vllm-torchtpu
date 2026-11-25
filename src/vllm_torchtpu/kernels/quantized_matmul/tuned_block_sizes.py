@@ -629,4 +629,10 @@ BUFFERED_MATMUL_TUNING = {
 #  vmem bytes)
 SHARED_EXPERT_TUNING = {
     (7, 288, 5120, 2304): (256, 1024, 3, 2, 32, 56 * 1024**2),
+    # DeepSeek-V4.1 prefill buckets (DP8, one chunk of 512/1024 tokens). v7
+    # single-core sweep against the unfused XLA ops: T1024 73.6 -> 60.6 us,
+    # T512 41.3 -> 34.0 us; 128-wide gate/up or 256-wide down windows were
+    # slower than unfused (84-110 / 77 us at T1024).
+    (7, 512, 5120, 2304): (256, 1024, 3, 2, 32, 56 * 1024**2),
+    (7, 1024, 5120, 2304): (256, 512, 3, 2, 64, 60 * 1024**2),
 }

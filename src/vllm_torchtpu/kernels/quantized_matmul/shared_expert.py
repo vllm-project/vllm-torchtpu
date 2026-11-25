@@ -19,7 +19,9 @@ both projections (full-row FP32 activation quantization, f32 accumulation,
 row scale then column scale, bf16 output) and ``SiluAndMulWithClamp`` as torch
 lowers it (bf16 clamps, f32 ``1 / (1 + exp(-x))`` rounded to bf16, bf16
 products). Both weights stream through VMEM in column windows; the
-intermediate never leaves VMEM.
+intermediate never leaves VMEM. The output is bitwise equal to the unfused
+path at the decode shape (T=288); at the prefill buckets (T=512, 1024) the
+GEMMs accumulate in another order, so it agrees within FP8 quantization noise.
 """
 
 import functools
@@ -271,7 +273,7 @@ def fused_shared_expert(
     vmem_bytes) overrides the table (for measurement only).
     """
     if not is_supported(x, w13, s13, w2, s2):
-        raise ValueError("Fused shared expert requires qualified v7 decode inputs")
+        raise ValueError("Fused shared expert requires qualified v7 inputs")
     t, k = x.shape
     inter = w2.shape[0]
     if tuning is None:
