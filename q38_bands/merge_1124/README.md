@@ -115,7 +115,7 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
 
 | Form | Lineage | Package tree (git) | Lever keys (all default off) |
 |---|---|---|---|
-| `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` + SB1-2 no-GDN `00f9aa3066` + SERVE HD rider `3d12a2ccb6` (clean merges) | `862b8e0254` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above; SB1-2: `VLLM_TPU_QSA_DECODE_FUSED_UNION=1`, `VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1`, `VLLM_TPU_PD_GATHER_BULK=1`, `VLLM_TPU_PD_STAGING_FOLD=1`, `VLLM_TPU_GC_WORKER=2600`, `VLLM_TPU_GC_WORKER_LOG=1`, `VLLM_TPU_KVL_INWAIT=1` (the PD / GC / KVL keys are deliberately outside the compile key: their runs prove a cold compile); HD rider: `VLLM_TPU_HD_STAGE_CPU=1`, `VLLM_TPU_HD_REQVEC=1` only (`VLLM_TPU_HD_MARKS` and `VLLM_TPU_HD_AB` unset; host-only, compile-ignored) |
+| `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` + SB1-2 no-GDN `00f9aa3066` + SERVE HD rider `3d12a2ccb6` + R4XB walk ring `70664cdd56` (port `fec8a2526a`) (clean merges) | `b00a4e8bf6` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above; SB1-2: `VLLM_TPU_QSA_DECODE_FUSED_UNION=1`, `VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1`, `VLLM_TPU_PD_GATHER_BULK=1`, `VLLM_TPU_PD_STAGING_FOLD=1`, `VLLM_TPU_GC_WORKER=2600`, `VLLM_TPU_GC_WORKER_LOG=1`, `VLLM_TPU_KVL_INWAIT=1` (the PD / GC / KVL keys are deliberately outside the compile key: their runs prove a cold compile); HD rider: `VLLM_TPU_HD_STAGE_CPU=1`, `VLLM_TPU_HD_REQVEC=1` only (`VLLM_TPU_HD_MARKS` and `VLLM_TPU_HD_AB` unset; host-only, compile-ignored); R4XB: `VLLM_TPU_QSA_PREFILL_UNION_WALK_RING=3` or `4` (0 = off; registered and in the compile key, so `b1` compile caches miss once after this lands) |
 | `Q38_FORM=hix` | HIX H `cfbd1689c1` (`q38-hix700-s3a-h`: S3a = S2 stack + PREGATE (flag off) + MKH + H2 + KV-SCALE-GUARD v2, then MESHGUARD, SIDE-FIX, T1 fix, D-b, PLE-WINMASK), its `_forms/oxpd` package byte for byte | `a559582f70` | H's served decode env (194 items, with `Q38_FORM=hix` in place of `Q38_OXPD_FORM=1`); proxy `Q38_PROXY_FORM=opener` (the served proxy map holds blob `0532c97577`) |
 
 - `hix` disclosures:
@@ -149,6 +149,13 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
 - HD rider disclosure (SERVE car 1, DEV, 1200 s): KEEP-FOR-BUILD on the host cycle only (max-over-ranks p50 non-wait cycle
   15.821 -> 14.563 ms, d -1.258 ms); a served step-time or Mtok/$ gain is NOT shown. "dp_loop +0.16 ms with ON at >= 48
   running; cause U; no HD code in dp_loop (C); relocated-wait not supported (M, natvar_g2 with shuffle / plant mutants)".
+- R4XB disclosure (DEV; no served gain claimed): with `VLLM_TPU_QSA_PREFILL_UNION_WALK_RING` = 3 or 4 the gathered prefill
+  walk streams its tiles through an R-slot VMEM ring that continues across grid blocks; same tiles, order and per-tile
+  compute (bitwise the double-buffered walk). CPU proofs ran on the port before SB1-2 (`fec8a2526a`, `b1` package
+  `9800ecd085`): r4xkh2 j-83579d68, r4xbb1f j-cd5289b0 and r4xrj j-de6b3d3e PASS; r4xsc j-111f15ef FAIL (a gate-design
+  defect in its JID leg, re-judged by r4xrj) and r4xkh j-d8a0970a FAIL (superseded by r4xkh2) stand of record. Served:
+  SERVED-CARRY NOT-SHOWN (T45o). It is re-applied here onto SB1-2 + HD by offsets only (SB1-2 touched `envs.py` and
+  `qsa_rpa.py` in other hunks; `qsa_union_dense.py` is untouched by SB1-2).
 - `b1` is a merge that has not yet run on a device: no served car stacks QGLUE-1 with SB1-1 on `b1` before one device
   bitwise check on `b1`.
 - To work on a lineage: branch from `caojx/qwen38-flash-1124`, edit `src/vllm_torchtpu/_forms/<form>/vllm_torchtpu/`,
