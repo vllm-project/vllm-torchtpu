@@ -22,7 +22,8 @@ kernel. The kernels themselves are tested in their own files under
 * writing new tokens into the KV cache (`update_cache`), which is ordinary
   array reshaping and scattering with no kernel involved;
 * the SMEM-overflow guard around paged attention, which decides whether to
-  call the kernel once or split the batch into smaller pieces; and
+  call the kernel once or split the batch into smaller pieces;
+* the request rows the RPA entries hand their kernel; and
 * the up-front argument checks that raise a clear error before any kernel
   is ever called.
 
@@ -30,6 +31,7 @@ Because none of these tests dispatch a kernel, they run the same way on any
 TPU generation and on CPU.
 """
 
+import contextlib
 from unittest import mock
 
 import jax
@@ -45,6 +47,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 )
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.core import attention_interface
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 # Sparse-MLA head dimensions. These are the only sizes the fp8 gather kernel
 # accepts (see the assert in `sparse_mla_attention`), so the layout test below
@@ -249,6 +252,102 @@ class ShardedRaggedPagedAttentionValidationTest(parameterized.TestCase):
                 attention_sink,
                 sm_scale=1.0,
             )
+
+
+class LiveRowsReachTheKernelTest(parameterized.TestCase):
+    """An 8-token step out of 16 request rows: the kernels that scalar-prefetch
+    the page table (RPA v3, hd64, bundled) get 8 rows and a distribution
+    clamped to them; the batched kernel gets all 16."""
+
+    max_num_seqs, num_tokens, pages_per_seq = 16, 8, 4
+
+    def _metadata(self):
+        n = self.max_num_seqs
+        return (
+            jnp.zeros((n,), jnp.int32),
+            jnp.zeros((n * self.pages_per_seq,), jnp.int32),
+            jnp.zeros((n + 1,), jnp.int32),
+            jnp.array([n, n, n], jnp.int32),
+        )
+
+    @staticmethod
+    def _fake_kernel(seen):
+        def fake(q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, dist, *_, **__):
+            seen.update(rows=kv_lens.shape[0], pages=page_indices.shape[0])
+            seen.update(cu=cu_q_lens.shape[0])
+            if not isinstance(dist, jax.core.Tracer):
+                seen.update(dist=dist.tolist())
+            return q, kv_cache
+
+        return fake
+
+    def _expect(self, seen, rows, dist=True):
+        expected = {"rows": rows, "pages": rows * self.pages_per_seq, "cu": rows + 1}
+        if dist:
+            expected["dist"] = [rows] * 3
+        self.assertEqual(seen, expected)
+
+    @parameterized.named_parameters(
+        ("v3", 128, "ragged_paged_attention", 8),
+        ("hd64", 64, "ragged_paged_attention_hd64", 8),
+        ("batched", 128, None, 16),
+    )
+    def test_sharded_entry(self, head_dim, kernel_name, rows):
+        seen = {}
+        fake = self._fake_kernel(seen)
+        q = jnp.zeros((self.num_tokens, 2, head_dim))
+        patch = (
+            mock.patch.object(attention_interface, kernel_name, fake)
+            if kernel_name
+            else contextlib.nullcontext()
+        )
+        with patch:
+            attention_interface.sharded_ragged_paged_attention(
+                None,
+                q,
+                q,
+                q,
+                jnp.zeros((1,)),
+                *self._metadata(),
+                None,
+                sm_scale=1.0,
+                rpa_func=fake,
+                shard=False,
+            )
+        self._expect(seen, rows)
+
+    def test_bundled(self):
+        seen = {}
+        fake = self._fake_kernel(seen)
+
+        def fake_bundled(q, k, v, bundle, layer_idx, *meta, **kwargs):
+            return fake(q, k, v, bundle, *meta)
+
+        kv_lens, page_indices, cu_q_lens, dist = self._metadata()
+        q = jnp.zeros((self.num_tokens, 2, 128))
+        mesh = jax.sharding.Mesh(np.array(jax.local_devices()[:1]), ("model",))
+        with mock.patch(
+            "vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel."
+            "ragged_paged_attention_bundled",
+            fake_bundled,
+        ):
+            attention_interface.attention_bundled(
+                jnp.zeros((1, 1, 1, 1, 1, 1)),
+                jnp.int32(0),
+                q,
+                q,
+                q,
+                AttentionMetadata(
+                    input_positions=None,
+                    block_tables=page_indices,
+                    seq_lens=kv_lens,
+                    query_start_loc=cu_q_lens,
+                    request_distribution=dist,
+                ),
+                mesh,
+            )
+        # The kernel runs under shard_map, so only shapes are concrete here.
+        self._expect(seen, self.num_tokens, dist=False)
 
 
 class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):

@@ -800,8 +800,10 @@ class DFlashProposer:
         )
         query_start_loc[1:] = num_tokens
 
+        # One request, row 0, holds every token: RPA requires each request
+        # the distribution names to hold one.
         request_distribution = torch.tensor(
-            [0, 0, num_reqs], dtype=torch.int32, device=runner.device
+            [0, 0, 1], dtype=torch.int32, device=runner.device
         )
 
         dummy_attn_metadata = AttentionMetadata(

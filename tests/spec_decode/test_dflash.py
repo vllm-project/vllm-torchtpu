@@ -938,6 +938,21 @@ def test_dummy_draft_forward_marks_all_rows_padding(monkeypatch):
     assert mask == [True] * 8
 
 
+def test_dummy_kv_update_names_its_one_request():
+    """Row 0 holds every dummy token, so the distribution names one request;
+    naming `num_reqs` would point RPA at rows past the ones a small token
+    bucket keeps."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.vllm_config.model_config.get_hidden_size = lambda: 4
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=SimpleNamespace(weight=torch.empty(1, 1)))
+    )
+
+    _, md = proposer._dummy_kv_update_inputs(num_tokens=8, num_reqs=16, num_blocks=4)
+
+    assert md.request_distribution.tolist() == [0, 0, 1]
+
+
 def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
     """An unnamed draft layer must raise, not borrow another group's metadata.
 
