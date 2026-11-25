@@ -278,8 +278,9 @@ def g1_factored_tile(
             act_t = jax.nn.silu(y)
             act[pl.ds((t * nc + cb) * 8, 8), :] = act_t
             # The served body (vmem_ldst.load_activation_as_large) stores the SiLU output back into the compact qkv slot. A
-            # masked row of a later tile that reuses the slot is not refilled, so served logs those bytes as its conv input
-            # (qkv_rows[idx, 1:]): store the same bytes here (the xin rows above are already loaded).
+            # masked row of a later tile that reuses the slot is not refilled. q38 GDN-FIX: both bodies now zero the conv log
+            # of window rows t >= real_size (below; wrapper._log_conv_inputs), so these bytes no longer reach the pool and
+            # this store-back is dead; it is kept unchanged (removing it is a separate change).
             qflat[pl.ds(t * nc + cb, nb, stride=w * nc), :] = act_t
         # Conv checkpoint 0 = rows 1..kprev of [history, window]; conv log = window rows 1..K.
         for j in range(g.kprev):
@@ -287,7 +288,10 @@ def g1_factored_tile(
             cso.at[hv][pl.ds(v * 8, 8), :] = lhs_rows[1 + j]
         for j in range(k):
             v, hv = g.view_pos(j, cb)
-            cso.at[hv][pl.ds((g.conv_pad + v) * 8, 8), :] = xin[1 + j]
+            # q38 GDN-FIX: window row 1 + j of a sequence with real_size <= 1 + j was never filled by the act-in DMA (stale
+            # VMEM: the slot's previous occupant, or uninitialized memory for the first tiles); store zero there, as the
+            # served body does (wrapper._log_conv_inputs).
+            cso.at[hv][pl.ds((g.conv_pad + v) * 8, 8), :] = jnp.where(1 + j < rs_v, xin[1 + j], 0.0)
     for i in seqs:
         cs = jnp.concatenate([_seq_rows(cso.at[hv], i, g.conv_rows) for hv in range(g.halves)], axis=1)
         vmem_ldst.store_state_region(conv_out_ref.at[i, 0], plan.conv, cs)

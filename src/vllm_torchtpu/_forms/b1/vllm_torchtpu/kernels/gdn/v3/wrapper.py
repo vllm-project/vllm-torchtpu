@@ -80,6 +80,26 @@ def _unpack_qkv_2d(
     return act_scratch_ref.at[:, : cfg.chunk_size]
 
 
+def _log_conv_inputs(qkv_rows, metadata_ref, p_id, idx):
+    """q38 GDN-FIX: the conv inputs a LOG-mode tile logs for sequence `idx`.
+
+    Log position j holds window row 1 + j. The act-in DMAs fill only the rows
+    t < real_size of a partial window; the other slot rows hold stale VMEM
+    (the slot's previous occupant, or uninitialized memory for the first
+    tiles). Those rows are stored as zero, so the pool bytes do not depend on
+    stale VMEM.
+    """
+    rows = qkv_rows[idx, 1:]
+    real_size = metadata_ref.p_id_to_r_size[p_id, idx]
+    return jnp.concatenate(
+        [
+            jnp.where(1 + t < real_size, rows[t : t + 1], 0.0)
+            for t in range(rows.shape[0])
+        ],
+        axis=0,
+    )
+
+
 def inner_kernel(
     # Inputs.
     qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]; 2D bf16: [seq, rows, dim]
@@ -318,7 +338,7 @@ def inner_kernel(
                 log_out_slot_refs[0].at[idx, 0],
                 log_out_slot_refs[1].at[idx, 0],
                 log_list[idx],
-                qkv_rows[idx, 1:],
+                _log_conv_inputs(qkv_rows, metadata_ref, p_id, idx),
                 cfg,
             )
     elif cfg.use_recurrent:
@@ -357,7 +377,7 @@ def inner_kernel(
                     gates[idx],
                     keys[idx],
                     updates[idx],
-                    qkv_rows[idx, 1:],
+                    _log_conv_inputs(qkv_rows, metadata_ref, p_id, idx),
                     cfg,
                 )
 

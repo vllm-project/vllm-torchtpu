@@ -119,7 +119,7 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
 
 | Form | Lineage | Package tree (git) | Lever keys (all default off) |
 |---|---|---|---|
-| `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` + SB1-2 no-GDN `00f9aa3066` + SERVE HD rider `3d12a2ccb6` + R4XB walk ring `70664cdd56` (port `fec8a2526a`) + SERVE r0pin `37da395355` (clean merges) | `29771d08a2` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above; SB1-2: `VLLM_TPU_QSA_DECODE_FUSED_UNION=1`, `VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1`, `VLLM_TPU_PD_GATHER_BULK=1`, `VLLM_TPU_PD_STAGING_FOLD=1`, `VLLM_TPU_GC_WORKER=2600`, `VLLM_TPU_GC_WORKER_LOG=1`, `VLLM_TPU_KVL_INWAIT=1` (the PD / GC / KVL keys are deliberately outside the compile key: their runs prove a cold compile); HD rider: `VLLM_TPU_HD_STAGE_CPU=1`, `VLLM_TPU_HD_REQVEC=1` only (`VLLM_TPU_HD_MARKS` and `VLLM_TPU_HD_AB` unset; host-only, compile-ignored); R4XB: `VLLM_TPU_QSA_PREFILL_UNION_WALK_RING=3` or `4` (0 = off; registered and in the compile key, so `b1` compile caches miss once after this lands) ; r0pin arm c (decode only): `VLLM_TPU_CPU_PIN_RESERVE=24`, `VLLM_TPU_CPU_PIN_SKIP_CPUS=0-23` with `VLLM_TPU_CPU_PIN=slice` (RESERVE, SKIP_CPUS and `VLLM_TPU_CPU_IRQ_DUMP_S` are compile-ignored) |
+| `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` + SB1-2 no-GDN `00f9aa3066` + SERVE HD rider `3d12a2ccb6` + R4XB walk ring `70664cdd56` (port `fec8a2526a`) + SERVE r0pin `37da395355` (clean merges) + the GDN LOG-conv fix (CORE `b35a4bc3c2` + F1 hand-port; no key) | `a5ef57de53` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above; SB1-2: `VLLM_TPU_QSA_DECODE_FUSED_UNION=1`, `VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1`, `VLLM_TPU_PD_GATHER_BULK=1`, `VLLM_TPU_PD_STAGING_FOLD=1`, `VLLM_TPU_GC_WORKER=2600`, `VLLM_TPU_GC_WORKER_LOG=1`, `VLLM_TPU_KVL_INWAIT=1` (the PD / GC / KVL keys are deliberately outside the compile key: their runs prove a cold compile); HD rider: `VLLM_TPU_HD_STAGE_CPU=1`, `VLLM_TPU_HD_REQVEC=1` only (`VLLM_TPU_HD_MARKS` and `VLLM_TPU_HD_AB` unset; host-only, compile-ignored); R4XB: `VLLM_TPU_QSA_PREFILL_UNION_WALK_RING=3` or `4` (0 = off; registered and in the compile key, so `b1` compile caches miss once after this lands) ; r0pin arm c (decode only): `VLLM_TPU_CPU_PIN_RESERVE=24`, `VLLM_TPU_CPU_PIN_SKIP_CPUS=0-23` with `VLLM_TPU_CPU_PIN=slice` (RESERVE, SKIP_CPUS and `VLLM_TPU_CPU_IRQ_DUMP_S` are compile-ignored) |
 | `Q38_FORM=hix` | HIX H `cfbd1689c1` (`q38-hix700-s3a-h`: S3a = S2 stack + PREGATE (flag off) + MKH + H2 + KV-SCALE-GUARD v2, then MESHGUARD, SIDE-FIX, T1 fix, D-b, PLE-WINMASK), its `_forms/oxpd` package byte for byte | `a559582f70` | H's served decode env (194 items, with `Q38_FORM=hix` in place of `Q38_OXPD_FORM=1`); proxy `Q38_PROXY_FORM=opener` (the served proxy map holds blob `0532c97577`) |
 
 - `hix` disclosures:
@@ -179,6 +179,13 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
     only by `cpu_pinning.py`, after compile), so every `b1` car after this lands has a new TPU compile hash, keys set or
     not, and the first one compiles cold under a shared cache tag (on the pre-SB1-2 base: `d526f005fe` ->
     `d05d2b3d81`, CPU job ab2 j-cc9c93cd).
+- GDN (a) disclosure (no key): the `b1` form carries the GDN v3 LOG-conv / BATCHED-metadata correctness fix (GDN-FIX CORE
+  `b35a4bc3c2` in `compute_g1.py` + `wrapper.py`, F1 `d4f63efc18` hand-ported to `metadata.py`; the same fix as the main
+  package's `aae3e349b3`, plus the factored-tile conv-log store in `compute_g1.py`). Every `b1` car after this runs it:
+  the `b1` compile files hash changes, so `b1` compile caches miss once, and a dash-bound `b1` car on this package needs
+  its own exact-form cold gates. The frozen forms keep the defect exactly as their points ran it, so no posted point
+  changes. TPU coverage: tpucov-b1 COV-PASS (fix `1d0b2e5a06` vs base `2c7b97818b`; the `b1` `kernels/gdn/v3` files here
+  are byte-identical to the ones it tested).
 - `b1` is a merge that has not yet run on a device: no served car stacks QGLUE-1 with SB1-1 on `b1` before one device
   bitwise check on `b1`.
 - To work on a lineage: branch from `shriharim/qwen38-flash-1125` (the q38 team branch; `caojx/qwen38-flash-1124`
