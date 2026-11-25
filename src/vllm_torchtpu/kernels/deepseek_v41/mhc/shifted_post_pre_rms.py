@@ -379,10 +379,11 @@ def shifted_post_pre_rms(
             if early_output:
                 output_copy(tile_index, 0).start()
                 output_copy(tile_index, 1).start()
-            prepare(
-                jnp.minimum(tile_index + 1, num_tiles - 1),
-                (tile_index + 1) % 2,
-            )
+            if num_tiles > 1:  # one tile has no next tile to prepare
+                prepare(
+                    jnp.minimum(tile_index + 1, num_tiles - 1),
+                    (tile_index + 1) % 2,
+                )
 
             @pl.when(tile_index == 0)
             def wait_weight():
