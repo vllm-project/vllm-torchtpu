@@ -1,0 +1,35 @@
+# OLMo 3.5 (`olmo35`)
+
+TPU model directory for Ai2's OLMo 3.5 hybrid models
+(`Olmo35ForCausalLM`, `model_type: olmo35`): Kimi Delta Attention on seven of
+every eight layers, NoPE full attention with scalable softmax on the rest, and
+a latent mixture of experts.
+
+- OLMo 3.5 Small (72.6B total, 4.1B active). No public checkpoint yet; the
+  weights are converted from the MaxText training checkpoint
+  (`decoder_block: olmoe3`).
+
+- **Support tier**: `Experimental`
+- **Owners**: `@sierraisland`
+- **Tracking issue**:
+  [#TRACKING_ISSUE](https://github.com/vllm-project/vllm-torchtpu/issues/TRACKING_ISSUE)
+
+## Directory Layout
+
+- `config.py`: the HF config class (transformers has none for this
+  architecture yet), its `AutoConfig` registration, and `TPUOlmo35Config`,
+  the vLLM config hook that turns prefix caching off and rejects the features
+  the model does not support.
+- `model.py`: the model and its checkpoint loader.
+
+The compile cache key covers the paths in `_RUNTIME_CACHE_KEY_PATHS` plus
+every `kernels/` and `ops/` directory under `vllm_torchtpu/models/`, so keep
+custom-op bridges and kernel copies in those directories.
+
+## Limits
+
+Prefix caching off (turned off automatically), no unified KV pool, no P/D or
+offload connector, no speculative decoding, no context parallelism, and TP
+must divide the 8 KDA heads. The KDA state takes about 150 MB per
+`--max-num-seqs` slot summed over the TP ranks (35 layers of 8x256x512 fp32).
+Open follow-ups are listed in the tracking issue.

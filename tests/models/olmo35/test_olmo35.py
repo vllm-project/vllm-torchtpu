@@ -22,16 +22,17 @@ import torch
 from torch import nn
 from transformers import AutoConfig
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.models import ModelRegistry
+from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.model_executor.utils import set_weight_attrs
 
 import vllm_torchtpu.gdn_pool_layout as gdn_pool_layout
+import vllm_torchtpu.models.olmo35.config as config_mod
+import vllm_torchtpu.models.olmo35.model as model_mod
 import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
-import vllm_torchtpu.models.vllm.olmo35.config as config_mod
-import vllm_torchtpu.models.vllm.olmo35.model as model_mod
+from vllm_torchtpu.models.olmo35.config import Olmo35Config
 from vllm_torchtpu.models.vllm import register_models
-from vllm_torchtpu.models.vllm.olmo35.config import Olmo35Config
 
 
 def test_olmo35_is_registered():
@@ -42,6 +43,8 @@ def test_olmo35_is_registered():
     assert entry is not None, "Olmo35ForCausalLM is not registered"
     assert entry.load_model_cls() is model_mod.Olmo35ForCausalLM
     assert isinstance(AutoConfig.for_model("olmo35"), Olmo35Config)
+    # Without this entry the default flags fail in the platform check again.
+    assert MODELS_CONFIG_MAP["Olmo35ForCausalLM"] is config_mod.TPUOlmo35Config
     # Registering twice in one process is a no-op, not an error.
     register_models()
 
@@ -227,7 +230,7 @@ def _small_kda_config():
     )
 
 
-def _build_kda(monkeypatch, *, speculative_config=None):
+def _build_kda(monkeypatch):
     built = {}
 
     def build_op(prefix, **kwargs):
@@ -245,25 +248,22 @@ def _build_kda(monkeypatch, *, speculative_config=None):
         kimi_attention, "get_tensor_model_parallel_world_size", lambda: 1
     )
     monkeypatch.setattr(model_mod, "build_kimi_dispatched_kda_op", build_op)
-    monkeypatch.setattr(
-        model_mod, "unified_kv_layout_enabled_for_architecture", lambda a: False
-    )
     config = _small_kda_config()
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
             architecture="Olmo35ForCausalLM", hf_text_config=config
         ),
-        speculative_config=speculative_config,
+        speculative_config=None,
         quant_config=None,
         compilation_config=SimpleNamespace(static_forward_context={}),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
     )
-    with set_current_vllm_config(VllmConfig()):
+    # Pinned to CPU: the default device detection can fail on CPU CI.
+    with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
         layer = model_mod.Olmo35KimiDeltaAttention(vllm_config, "model.layers.0.mixer")
     return layer, vllm_config, built
 
 
-@pytest.mark.tpu_test
 def test_kda_construction_wires_wide_value_heads_and_state(monkeypatch):
     """The real constructor: projections sized for d_v != d_k, the op built
     with the config's beta scale, the layer registered under its prefix, and
@@ -286,12 +286,6 @@ def test_kda_construction_wires_wide_value_heads_and_state(monkeypatch):
     )
 
 
-@pytest.mark.tpu_test
-def test_kda_construction_rejects_speculative_decoding(monkeypatch):
-    with pytest.raises(NotImplementedError, match="speculative"):
-        _build_kda(monkeypatch, speculative_config=SimpleNamespace())
-
-
 class _Fn(nn.Module):
     """A projection stand-in returning `(fn(x), None)` like vLLM's linears."""
 
@@ -303,7 +297,6 @@ class _Fn(nn.Module):
         return self.fn(x), None
 
 
-@pytest.mark.tpu_test
 def test_kda_forward_feeds_the_op_wide_value_shapes(monkeypatch):
     """forward splits the projections into the op's inputs at d_v != d_k
     widths, hands it both caches, and reshapes its [T, heads, d_v] output."""
@@ -352,20 +345,6 @@ def test_kda_forward_feeds_the_op_wide_value_shapes(monkeypatch):
 def test_tied_word_embeddings_are_rejected():
     with pytest.raises(ValueError, match="tie_word_embeddings"):
         Olmo35Config(tie_word_embeddings=True)
-
-
-def test_unified_pool_is_rejected_at_construction(monkeypatch):
-    """The unsupported unified KV pool fails when the layer is built, before
-    weights load, not at the first forward."""
-    monkeypatch.setattr(
-        model_mod, "unified_kv_layout_enabled_for_architecture", lambda arch: True
-    )
-    vllm_config = SimpleNamespace(
-        model_config=SimpleNamespace(architecture="Olmo35ForCausalLM"),
-        speculative_config=None,
-    )
-    with pytest.raises(NotImplementedError, match="unified-pool"):
-        model_mod.Olmo35KimiDeltaAttention(vllm_config, "model.layers.0.mixer")
 
 
 def _recording_parameter(calls, *shape):

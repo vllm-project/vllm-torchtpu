@@ -25,7 +25,7 @@ _DSV4_DSPARK_MODEL = (
 _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
 _QWEN4_EXP_MODEL = "vllm_torchtpu.models.qwen4_exp.model:Qwen4ExpForCausalLM"
-_OLMO35_MODEL = "vllm_torchtpu.models.vllm.olmo35.model:Olmo35ForCausalLM"
+_OLMO35_MODEL = "vllm_torchtpu.models.olmo35.model:Olmo35ForCausalLM"
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -47,11 +47,11 @@ def register_models() -> None:
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
-    from vllm_torchtpu.models.qwen4_exp.config import TPUQwen4ExpConfig
-    from vllm_torchtpu.models.vllm.olmo35.config import (
+    from vllm_torchtpu.models.olmo35.config import (
         TPUOlmo35Config,
         register_olmo35_config,
     )
+    from vllm_torchtpu.models.qwen4_exp.config import TPUQwen4ExpConfig
 
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
     ModelRegistry.register_model("KimiK3ForConditionalGeneration", _KIMI_K3_MODEL)

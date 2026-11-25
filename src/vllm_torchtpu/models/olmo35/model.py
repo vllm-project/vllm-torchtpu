@@ -112,7 +112,6 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architecture
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
 )
@@ -170,17 +169,8 @@ class Olmo35KimiDeltaAttention(nn.Module, MambaBase):
 
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
-        # Reject unsupported cache layouts and features before any weights or
-        # KV pools are allocated.
-        if unified_kv_layout_enabled_for_architecture(
-            vllm_config.model_config.architecture
-        ):
-            raise NotImplementedError(
-                "OLMo 3.5 KDA has no unified-pool path yet; run with "
-                "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0"
-            )
-        if vllm_config.speculative_config is not None:
-            raise NotImplementedError("OLMo 3.5 on TPU has no speculative decoding")
+        # TPUOlmo35Config rejects the unified pool and speculative decoding
+        # when vLLM builds the config, before any layer is constructed.
         config = _config(vllm_config)
         self.prefix = prefix
         self.vllm_config = vllm_config
