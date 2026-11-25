@@ -372,9 +372,7 @@ class IndexMaps:
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         return (group_id, k_id, n_id)
 
-    def rhs_per_channel_index_map(
-        self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array
-    ):
+    def rhs_bias_index_map(self, n_id: jax.Array, gm_id: jax.Array, _: jax.Array):
         group_id = self.metadata_ref.gm_id_to_group_id[gm_id]
         return (group_id, 0, n_id)
 
@@ -425,7 +423,7 @@ def generate_block_specs(
     if cfgs.rhs_cfgs.has_bias:
         rhs_bias_block_spec = pl.BlockSpec(
             (None, 1, cfgs.tiles.tile_n),
-            index_map.rhs_per_channel_index_map,
+            index_map.rhs_bias_index_map,
         )
     if cfgs.rhs_cfgs.has_scale:
         scale_shape = (None, cfgs.num_quant_blocks_per_tile_k, cfgs.tiles.tile_n)
@@ -437,7 +435,7 @@ def generate_block_specs(
         )
     if cfgs.rhs_cfgs.has_global_scale:
         rhs_global_scale_spec = pl.BlockSpec(
-            (None, 1, cfgs.tiles.tile_n), index_map.rhs_per_channel_index_map
+            (None, 1, cfgs.tiles.tile_n), index_map.rhs_bias_index_map
         )
 
     rhs_block_spec = WeightsRef(
