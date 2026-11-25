@@ -3891,6 +3891,17 @@ class Eagle3Proposer:
                     full = torch.zeros(
                         (cap, hidden_size), dtype=runner._hidden_states_dtype
                     ).to(runner.device)
+                    # The hidden carry is the draft's aux output, at the target
+                    # width (the loop's `loop_hidden`) for drafts that return
+                    # one, else the lm-head width: warm every width it can be.
+                    carries = [
+                        torch.zeros(
+                            (cap, w), dtype=runner._hidden_states_dtype
+                        ).to(runner.device)
+                        for w in sorted(
+                            {hidden_size, self._draft_target_hidden_size()}
+                        )
+                    ]
                     for T in runner.num_tokens_paddings:
                         for p in idx_sizes:
                             if p > T or p >= cap:
@@ -3899,11 +3910,12 @@ class Eagle3Proposer:
                                 runner.device
                             )
                             idx = torch.zeros(p, dtype=torch.int64).to(runner.device)
-                            synchronize_tensors(
-                                self._draft_rows_carry_token_fresh(
-                                    positions, idx, full, full
+                            for full_carry in carries:
+                                synchronize_tensors(
+                                    self._draft_rows_carry_token_fresh(
+                                        positions, idx, full, full_carry
+                                    )
                                 )
-                            )
 
     def _precompile_compute_logits(self) -> None:
         from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
@@ -3951,11 +3963,22 @@ class Eagle3Proposer:
                     full = torch.zeros(
                         (cap, hidden_size), dtype=runner._hidden_states_dtype
                     ).to(runner.device)
+                    carries = [
+                        torch.zeros(
+                            (cap, w), dtype=runner._hidden_states_dtype
+                        ).to(runner.device)
+                        for w in sorted(
+                            {hidden_size, self._draft_target_hidden_size()}
+                        )
+                    ]
                     for rows in runner.num_reqs_paddings:
                         if rows < cap:
-                            synchronize_tensors(
-                                self._draft_token_and_rows(full, full, rows)
-                            )
+                            for full_carry in carries:
+                                synchronize_tensors(
+                                    self._draft_token_and_rows(
+                                        full, full_carry, rows
+                                    )
+                                )
 
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
         """Replay a busy rank's DRAFT collective trace on an idle/padding rank,

@@ -3109,3 +3109,57 @@ def test_fused_draft_seed_partial_matches_eager(monkeypatch, order, seed_fused, 
         clean, caught = on_p._seed_mismatches.tolist()
         assert on_p._seed_checks_done == 1
         assert clean == 0 and caught == 0
+
+
+def test_rows_fresh_warmup_covers_carry_width(monkeypatch):
+    """CARRY_ROWS_FRESH / DRAFT_ROWS_FRESH warmup must warm the hidden carry at
+    the width it has at runtime (the draft's target-width aux output), not only
+    at the lm-head width; otherwise every (T, p) recompiles after warmup."""
+    import contextlib
+    from types import SimpleNamespace
+
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    monkeypatch.setenv("VLLM_TPU_DRAFT_CARRY_ROWS_FRESH", "1")
+    monkeypatch.setenv("VLLM_TPU_DRAFT_ROWS_FRESH", "1")
+    H, W, cap = 64, 256, 16
+    proposer = e3.Eagle3Proposer.__new__(e3.Eagle3Proposer)
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=H), target_hidden_size=W
+    )
+    proposer._draft_rows = True
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=[16, 32, 64],
+        num_reqs_paddings=[4, 8, 16],
+        max_num_reqs=16,
+        _hidden_states_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        num_reqs_max_model_len=cap,
+        num_reqs_most_model_len=None,
+        _precompile_timed=lambda *_a, **_k: contextlib.nullcontext(),
+    )
+    seen = {"fresh": set(), "rows": set()}
+    monkeypatch.setattr(
+        e3.Eagle3Proposer, "_draft_rows_carry_and_token",
+        lambda self, *a: (a[0], a[1]),
+    )
+    monkeypatch.setattr(
+        e3.Eagle3Proposer, "_draft_rows_carry_token_fresh",
+        lambda self, pos, idx, lh, h: seen["fresh"].add((lh.shape[1], h.shape[1]))
+        or (pos, idx, h),
+    )
+    monkeypatch.setattr(
+        e3.Eagle3Proposer, "_draft_propose_token", lambda self, x: x[:, 0]
+    )
+    monkeypatch.setattr(
+        e3.Eagle3Proposer, "_draft_token_and_rows",
+        lambda self, lh, h, rows: seen["rows"].add((lh.shape[1], h.shape[1]))
+        or (lh[:rows, 0], h[:rows]),
+    )
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *_a, **_k: None)
+    proposer._precompile_draft_rows_carry_and_token()
+    proposer._precompile_compute_logits()
+    # lm-head input stays at H; the carry is warmed at the runtime width W
+    # (and at H for drafts whose aux output is the lm-head input itself).
+    assert seen["fresh"] == {(H, H), (H, W)}
+    assert seen["rows"] == {(H, H), (H, W)}
