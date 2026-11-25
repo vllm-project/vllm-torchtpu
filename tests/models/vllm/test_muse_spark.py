@@ -626,6 +626,18 @@ def _tp8_rank_packed_weights(num_experts: int, hidden: int, intermediate: int):
     )
 
 
+def _laid_out_scales(parts):
+    """Block x global scales as the TPU reads them: the NVFP4 MoE method fuses
+    them into FP32 block scales, and gmm_v2 rounds those to BF16 in each tile."""
+    gate, up = parts["gate_up_proj_weight_scale"].float().chunk(2, dim=1)
+    g13 = parts["gate_up_proj_weight_scale_2"]
+    w13 = torch.cat((gate * g13[:, :1, None], up * g13[:, 1:, None]), dim=1)
+    w2 = parts["down_proj_weight_scale"].float() * parts[
+        "down_proj_weight_scale_2"
+    ].reshape(-1, 1, 1)
+    return w13.bfloat16().float(), w2.bfloat16().float()
+
+
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("use_ep", [False, True], ids=["tp", "ep"])
 @torch.inference_mode()
@@ -652,14 +664,7 @@ def test_tpu_grouped_experts_match_packed_reference_decoder(dist_ctx, use_ep):
     ids = torch.rand(tokens, num_experts, generator=rng).argsort(-1)[:, :top_k].int()
     weights = torch.rand(tokens, top_k, generator=rng) + 0.1
     expected = selected_packed_expert_outputs(
-        x,
-        ids,
-        parts["gate_up_proj"],
-        parts["down_proj"],
-        parts["gate_up_proj_weight_scale"].view(torch.uint8),
-        parts["down_proj_weight_scale"].view(torch.uint8),
-        parts["gate_up_proj_weight_scale_2"],
-        parts["down_proj_weight_scale_2"],
+        x, ids, parts["gate_up_proj"], parts["down_proj"], *_laid_out_scales(parts)
     )
     if use_ep:
         owned = ids // (num_experts // ep_size) == ep_rank
@@ -670,8 +675,8 @@ def test_tpu_grouped_experts_match_packed_reference_decoder(dist_ctx, use_ep):
         experts, x.to("tpu"), weights.to("tpu"), ids.to("tpu")
     ).cpu()
 
-    # Each tile rounds its FP32 block scales and dequantized weights to BF16,
-    # and FP32 summation order changes BF16 rows.
+    # The reference rounds the scales as the kernel does; only FP32 summation
+    # order changes BF16 rows.
     torch.testing.assert_close(actual, expected, rtol=1.6e-2, atol=2**-5)
     assert actual[-1].count_nonzero() == 0
 
@@ -753,10 +758,7 @@ def test_tpu_one_hot_ep_permute_keeps_non_finite_row_local(dist_ctx, monkeypatch
         ids,
         parts["gate_up_proj"],
         parts["down_proj"],
-        parts["gate_up_proj_weight_scale"].view(torch.uint8),
-        parts["down_proj_weight_scale"].view(torch.uint8),
-        parts["gate_up_proj_weight_scale_2"],
-        parts["down_proj_weight_scale_2"],
+        *_laid_out_scales(parts),
     )
     owned = ids // (num_experts // ep_size) == ep_rank
     expected = expected.masked_fill(~owned[..., None], 0)
