@@ -115,7 +115,7 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
 
 | Form | Lineage | Package tree (git) | Lever keys (all default off) |
 |---|---|---|---|
-| `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` + SB1-2 no-GDN `00f9aa3066` + SERVE HD rider `3d12a2ccb6` + R4XB walk ring `70664cdd56` (port `fec8a2526a`) (clean merges) | `b00a4e8bf6` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above; SB1-2: `VLLM_TPU_QSA_DECODE_FUSED_UNION=1`, `VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1`, `VLLM_TPU_PD_GATHER_BULK=1`, `VLLM_TPU_PD_STAGING_FOLD=1`, `VLLM_TPU_GC_WORKER=2600`, `VLLM_TPU_GC_WORKER_LOG=1`, `VLLM_TPU_KVL_INWAIT=1` (the PD / GC / KVL keys are deliberately outside the compile key: their runs prove a cold compile); HD rider: `VLLM_TPU_HD_STAGE_CPU=1`, `VLLM_TPU_HD_REQVEC=1` only (`VLLM_TPU_HD_MARKS` and `VLLM_TPU_HD_AB` unset; host-only, compile-ignored); R4XB: `VLLM_TPU_QSA_PREFILL_UNION_WALK_RING=3` or `4` (0 = off; registered and in the compile key, so `b1` compile caches miss once after this lands) |
+| `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` + SB1-2 no-GDN `00f9aa3066` + SERVE HD rider `3d12a2ccb6` + R4XB walk ring `70664cdd56` (port `fec8a2526a`) + SERVE r0pin `37da395355` (clean merges) | `29771d08a2` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above; SB1-2: `VLLM_TPU_QSA_DECODE_FUSED_UNION=1`, `VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1`, `VLLM_TPU_PD_GATHER_BULK=1`, `VLLM_TPU_PD_STAGING_FOLD=1`, `VLLM_TPU_GC_WORKER=2600`, `VLLM_TPU_GC_WORKER_LOG=1`, `VLLM_TPU_KVL_INWAIT=1` (the PD / GC / KVL keys are deliberately outside the compile key: their runs prove a cold compile); HD rider: `VLLM_TPU_HD_STAGE_CPU=1`, `VLLM_TPU_HD_REQVEC=1` only (`VLLM_TPU_HD_MARKS` and `VLLM_TPU_HD_AB` unset; host-only, compile-ignored); R4XB: `VLLM_TPU_QSA_PREFILL_UNION_WALK_RING=3` or `4` (0 = off; registered and in the compile key, so `b1` compile caches miss once after this lands) ; r0pin arm c (decode only): `VLLM_TPU_CPU_PIN_RESERVE=24`, `VLLM_TPU_CPU_PIN_SKIP_CPUS=0-23` with `VLLM_TPU_CPU_PIN=slice` (RESERVE, SKIP_CPUS and `VLLM_TPU_CPU_IRQ_DUMP_S` are compile-ignored) |
 | `Q38_FORM=hix` | HIX H `cfbd1689c1` (`q38-hix700-s3a-h`: S3a = S2 stack + PREGATE (flag off) + MKH + H2 + KV-SCALE-GUARD v2, then MESHGUARD, SIDE-FIX, T1 fix, D-b, PLE-WINMASK), its `_forms/oxpd` package byte for byte | `a559582f70` | H's served decode env (194 items, with `Q38_FORM=hix` in place of `Q38_OXPD_FORM=1`); proxy `Q38_PROXY_FORM=opener` (the served proxy map holds blob `0532c97577`) |
 
 - `hix` disclosures:
@@ -156,6 +156,25 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
   defect in its JID leg, re-judged by r4xrj) and r4xkh j-d8a0970a FAIL (superseded by r4xkh2) stand of record. Served:
   SERVED-CARRY NOT-SHOWN (T45o). It is re-applied here onto SB1-2 + HD by offsets only (SB1-2 touched `envs.py` and
   `qsa_rpa.py` in other hunks; `qsa_union_dense.py` is untouched by SB1-2).
+- r0pin arm c disclosure (DEV, 1200 s; decode only): with `VLLM_TPU_CPU_PIN=slice`, `VLLM_TPU_CPU_PIN_RESERVE=24` and
+  `VLLM_TPU_CPU_PIN_SKIP_CPUS=0-23` the decode slices skip node-0 CPUs 0-23 (the NIC IRQ cores) and their SMT siblings;
+  `VLLM_TPU_CPU_PIN_ENGINE` must stay unset (node 0 keeps no reserve cores, so `reserved` raises SlicePinError) and
+  `VLLM_TPU_CPU_IRQ_DUMP_S` (a log-only probe) stays unset. Served (r0sw t1 T45z, one window, arms a j-d6d3e68a,
+  c j-b6b9524c, a2 j-2eb52d6e): decode period -1.322 ms vs the control mean (A/A spread 0.155), Mtok/$ 279.19 vs
+  271.91 / 273.81 (+2.3 %, A/A 1.90).
+  - Measured on the SB1-1 stack (r0pin tree `37da395355` = b1 with SB1-1 record keys, QGLUE-1 off), NOT on b1 + SB1-2 +
+    HD rider. The interaction with SB1-2's GC_WORKER / KVL_INWAIT and the HD rider's host-side REQVEC is U. A 3600 s
+    canonical confirmation A/B (A = pushed b1 form, B = A + arm c, A/A arm) is ruled and is built by SERVE; it runs
+    after the SB1-2 FINAL reads.
+  - 1200 s DEV only: Mtok/$ +2.3 % is not comparable to 3600 s points (DUR-COMPARE).
+  - Residual: node-0 decode ranks still do about 0.60 ms more host work per step than node-1 ranks after arm c (X47
+    0.600, NODE 0.608; descriptive; cause under a 0-chip SERVE lane).
+  - Default GKE TPU host layout only (224 CPUs, 2 NUMA nodes x 56 cores, SMT sibling = cpu + 112); on any other layout
+    the strict slice checks fail closed (SlicePinError), they do not pin wrongly. Exos hosts: U.
+  - One-time `b1` compile-hash change: `VLLM_TPU_CPU_PIN_RESERVE` moves into `_TPU_COMPILE_ENV_IGNORED` (it is read
+    only by `cpu_pinning.py`, after compile), so every `b1` car after this lands has a new TPU compile hash, keys set or
+    not, and the first one compiles cold under a shared cache tag (on the pre-SB1-2 base: `d526f005fe` ->
+    `d05d2b3d81`, CPU job ab2 j-cc9c93cd).
 - `b1` is a merge that has not yet run on a device: no served car stacks QGLUE-1 with SB1-1 on `b1` before one device
   bitwise check on `b1`.
 - To work on a lineage: branch from `caojx/qwen38-flash-1124`, edit `src/vllm_torchtpu/_forms/<form>/vllm_torchtpu/`,
