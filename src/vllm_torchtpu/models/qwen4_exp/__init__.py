@@ -16,3 +16,26 @@
 Kept import-free: plugin registration imports ``config`` at startup, and the
 registry imports ``model`` lazily by its module path.
 """
+
+_MODEL = "vllm_torchtpu.models.qwen4_exp.model:Qwen4ExpForCausalLM"
+
+
+def register() -> None:
+    """Register the Qwen4Exp architectures and their config hook, then hand
+    off to the experimental tier, which overrides them only when its
+    migration selector is set."""
+    from vllm.model_executor.models import ModelRegistry
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+    from vllm_torchtpu.models.qwen4_exp.config import TPUQwen4ExpConfig
+
+    ModelRegistry.register_model("Qwen4ExpForCausalLM", _MODEL)
+    # The released checkpoint declares the vision-language arch; serve it with
+    # the text-only model.
+    ModelRegistry.register_model("Qwen4ExpForConditionalGeneration", _MODEL)
+    MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
+    MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
+
+    from vllm_torchtpu.models.qwen4_exp.experimental import hooks
+
+    hooks.register()
