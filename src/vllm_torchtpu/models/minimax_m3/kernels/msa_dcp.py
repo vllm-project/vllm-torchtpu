@@ -712,7 +712,12 @@ def _class_candidates(
         block_tables,
         folded_cu,
         num_seqs,
-        **msa.block_score_options(num_heads),
+        # The decode rows of a prefill step take the decode step's 256-page
+        # groups too (mixed c4k/c8k twin: 46 requests' small class 75.7 us
+        # per layer at 128-page groups, 59.2 in decode steps; j-8b2aa6c0).
+        **msa.block_score_options(
+            num_heads, msa.wide_page_groups(index_cache, local_lens, block_tables)
+        ),
         scale_cache=scale_cache,
         scale_row=scale_row,
         interpret=interpret,
