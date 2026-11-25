@@ -524,6 +524,23 @@ def _dry(args):
     print("DRY OK")
 
 
+def _prepare_tpu_environment(world_size):
+    """Single-host launch env for `world_size` ranks (as
+    tests/distributed/tpu_test_utils.py, without its pytest import)."""
+    import torch
+    import torch_tpu  # noqa: F401
+
+    tpu_dist = getattr(getattr(torch, "tpu", None), "distributed", None)
+    if tpu_dist is not None and hasattr(tpu_dist, "set_tpu_launch_env"):
+        tpu_dist.set_tpu_launch_env(nproc_per_node=world_size)
+        return
+    from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
+        prepare_tpu_environment,
+    )
+
+    prepare_tpu_environment(world_size=world_size)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--rows", default="4,8,16,32")
@@ -539,10 +556,7 @@ def main():
         return _dry(args)
     if args.worker:
         return _worker(args)
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from tests.distributed.tpu_test_utils import prepare_tpu_environment
-
-    prepare_tpu_environment(world_size=WORLD)
+    _prepare_tpu_environment(WORLD)
     env = os.environ.copy()
     env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
     env.setdefault("VLLM_USE_AOT_COMPILE", "0")
