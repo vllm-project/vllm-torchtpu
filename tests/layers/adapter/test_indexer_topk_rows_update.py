@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from vllm.model_executor.models.deepseek_mtp import DeepSeekMultiTokenPredictor
 
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmTPUSparseAttnIndexer,
@@ -133,14 +134,17 @@ def test_reuse_layers_read_the_donated_rows(rows, width, topk, num_tokens, compi
 
 
 class _FakeMtpModel:
-    """The draft's `compact_topk_indices` over one table, written as vLLM's
-    `DeepSeekMultiTokenPredictor` writes it."""
+    """Stands in for vLLM's `DeepSeekMultiTokenPredictor`: one MTP layer whose
+    attention holds the table, compacted by vLLM's own method."""
+
+    compact_topk_indices = DeepSeekMultiTokenPredictor.compact_topk_indices
 
     def __init__(self, buf: torch.Tensor):
-        self.buf = buf
-
-    def compact_topk_indices(self, slot_ids: torch.Tensor) -> None:
-        self.buf[: slot_ids.numel()] = self.buf[slot_ids]
+        mla_attn = types.SimpleNamespace(topk_indices_buffer=buf)
+        mtp_block = types.SimpleNamespace(
+            self_attn=types.SimpleNamespace(mla_attn=mla_attn)
+        )
+        self.layers = {"78": types.SimpleNamespace(mtp_block=mtp_block)}
 
 
 _ROWS, _WIDTH = 64, 32  # the table: max_num_batched_tokens x index_topk

@@ -19,6 +19,7 @@ from unittest import mock
 import numpy as np
 import pytest
 import torch
+from vllm.model_executor.models.deepseek_mtp import DeepSeekMultiTokenPredictor
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
 from vllm_torchtpu.layers.core.sequence_layout import (
@@ -1833,8 +1834,10 @@ class _FakeMtpLayer:
 
 
 class _FakeMtpModel:
-    """Stands in for DeepSeekMultiTokenPredictor: one shared buffer, front
-    anchored compaction, and a runtime skip_topk toggle."""
+    """Stands in for DeepSeekMultiTokenPredictor: one shared buffer, vLLM's own
+    front-anchored compaction, and a runtime skip_topk toggle."""
+
+    compact_topk_indices = DeepSeekMultiTokenPredictor.compact_topk_indices
 
     def __init__(self, buf, num_layers: int = 1):
         self.layers = {str(78 + i): _FakeMtpLayer(buf) for i in range(num_layers)}
@@ -1842,12 +1845,6 @@ class _FakeMtpModel:
 
     def set_skip_topk(self, skip: bool):
         self.skip_topk = skip
-
-    def compact_topk_indices(self, slot_ids):
-        num_slots = slot_ids.numel()
-        for layer in self.layers.values():
-            buf = layer.mtp_block.self_attn.mla_attn.topk_indices_buffer
-            buf[:num_slots] = buf[slot_ids]
 
 
 def _mtp_proposer_with_buffer(
