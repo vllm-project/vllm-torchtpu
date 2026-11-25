@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch.tpu.pallas as pallas_mod
 
 from vllm_torchtpu.compilation.tpu_compiler import _RUNTIME_CACHE_KEY_PATHS
 from vllm_torchtpu.distributed import dp_tp_mesh
@@ -26,84 +27,129 @@ def _groups(rank: int, dp: int, tp: int) -> tuple[list[int], list[int]]:
     return [x * tp + t for x in range(dp)], list(range(d * tp, (d + 1) * tp))
 
 
-@pytest.mark.parametrize(("dp", "tp"), [(2, 4), (1, 8), (8, 1), (8, 16)])
-def test_validate_accepts_rank_ordered_grid(dp: int, tp: int) -> None:
-    world = dp * tp
-    for rank in sorted({0, 5 % world, world // 2, world - 1}):
-        dp_ranks, tp_ranks = _groups(rank, dp, tp)
-        got = dp_tp_mesh.validate_dp_tp_group_ranks(
-            dp,
-            tp,
-            dp_ranks=dp_ranks,
-            tp_ranks=tp_ranks,
-            global_rank=rank,
-            world_size=world,
-        )
-        assert got == divmod(rank, tp)
-
-
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"dp_ranks": [4, 5], "tp_ranks": [4, 5, 6, 7]},  # dp column scrambled
-        {"dp_ranks": [1, 5], "tp_ranks": [5, 4, 6, 7]},  # tp row permuted
-        {"dp_ranks": [1, 5], "tp_ranks": [4, 5, 6]},  # tp row short
-    ],
-)
-def test_validate_rejects_mismatched_groups(kwargs: dict) -> None:
-    with pytest.raises(ValueError):
-        dp_tp_mesh.validate_dp_tp_group_ranks(
-            2, 4, global_rank=5, world_size=8, **kwargs
-        )
-
-
-@pytest.mark.parametrize(
-    ("dp", "tp", "rank", "world"),
-    [(2, 4, 5, 16), (2, 4, 8, 8), (2, 4, -1, 8), (0, 4, 0, 0), (2, 0, 0, 0)],
-)
-def test_validate_rejects_bad_sizes(dp: int, tp: int, rank: int, world: int) -> None:
-    with pytest.raises(ValueError):
-        dp_tp_mesh.validate_dp_tp_group_ranks(
-            dp, tp, global_rank=rank, world_size=world
-        )
-
-
-def test_validate_reads_torch_distributed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(dp_tp_mesh.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dp_tp_mesh.dist, "get_rank", lambda: 37)
-    monkeypatch.setattr(dp_tp_mesh.dist, "get_world_size", lambda: 128)
-    assert dp_tp_mesh.validate_dp_tp_group_ranks(8, 16) == (2, 5)
-
-
-def test_validate_needs_torch_distributed_without_explicit_rank(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(dp_tp_mesh.dist, "is_initialized", lambda: False)
-    with pytest.raises(RuntimeError):
-        dp_tp_mesh.validate_dp_tp_group_ranks(2, 4, global_rank=1)
-
-
 def _fake_2d_mesh(ids, shape, axis_names=("dp", "tp")) -> SimpleNamespace:
     devs = np.array([SimpleNamespace(id=d) for d in ids], dtype=object).reshape(shape)
     return SimpleNamespace(axis_names=axis_names, devices=devs)
 
 
+def _patch_dist_and_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    global_rank: int,
+    world_size: int,
+    dp_ranks: list[int],
+    tp_ranks: list[int],
+) -> None:
+    monkeypatch.setattr(dp_tp_mesh, "_MESH_2D_CACHE", {})
+    monkeypatch.setattr(dp_tp_mesh.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dp_tp_mesh.dist, "get_rank", lambda: global_rank)
+    monkeypatch.setattr(dp_tp_mesh.dist, "get_world_size", lambda: world_size)
+    monkeypatch.setattr(
+        dp_tp_mesh.parallel_state, "model_parallel_is_initialized", lambda: True
+    )
+    monkeypatch.setattr(
+        dp_tp_mesh.parallel_state,
+        "get_dp_group",
+        lambda: SimpleNamespace(ranks=dp_ranks),
+    )
+    monkeypatch.setattr(
+        dp_tp_mesh.parallel_state,
+        "get_tp_group",
+        lambda: SimpleNamespace(ranks=tp_ranks),
+    )
+
+
+@pytest.mark.parametrize(("dp", "tp"), [(2, 4), (1, 8), (8, 1), (8, 16)])
+def test_validate_accepts_rank_ordered_grid(
+    monkeypatch: pytest.MonkeyPatch, dp: int, tp: int
+) -> None:
+    world = dp * tp
+    ranks = {0, 5 % world, world // 2, world - 1}
+    if world == 128:
+        ranks.add(37)
+    for rank in sorted(ranks):
+        dp_ranks, tp_ranks = _groups(rank, dp, tp)
+        _patch_dist_and_groups(
+            monkeypatch,
+            global_rank=rank,
+            world_size=world,
+            dp_ranks=dp_ranks,
+            tp_ranks=tp_ranks,
+        )
+        assert dp_tp_mesh._validate_dp_tp_group_ranks(
+            dp, tp, dp_ranks, tp_ranks
+        ) == divmod(rank, tp)
+
+
+@pytest.mark.parametrize(
+    ("dp_ranks", "tp_ranks"),
+    [
+        ([4, 5], [4, 5, 6, 7]),  # dp column scrambled
+        ([1, 5], [5, 4, 6, 7]),  # tp row permuted
+        ([1, 5], [4, 5, 6]),  # tp row short
+    ],
+)
+def test_build_rejects_mismatched_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    dp_ranks: list[int],
+    tp_ranks: list[int],
+) -> None:
+    _patch_dist_and_groups(
+        monkeypatch,
+        global_rank=5,
+        world_size=8,
+        dp_ranks=dp_ranks,
+        tp_ranks=tp_ranks,
+    )
+    with pytest.raises(ValueError):
+        dp_tp_mesh.build_dp_tp_mesh()
+
+
+def test_build_rejects_world_size_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    dp_ranks, tp_ranks = _groups(5, 2, 4)
+    _patch_dist_and_groups(
+        monkeypatch,
+        global_rank=5,
+        world_size=16,
+        dp_ranks=dp_ranks,
+        tp_ranks=tp_ranks,
+    )
+    with pytest.raises(ValueError, match="world_size == dp_size \\* tp_size"):
+        dp_tp_mesh.build_dp_tp_mesh()
+
+
+def test_build_requires_initialized_parallel_state_and_dp_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(dp_tp_mesh, "_MESH_2D_CACHE", {})
+    monkeypatch.setattr(
+        dp_tp_mesh.parallel_state, "model_parallel_is_initialized", lambda: False
+    )
+    with pytest.raises(RuntimeError, match="parallel_state is not initialized"):
+        dp_tp_mesh.build_dp_tp_mesh()
+
+    monkeypatch.setattr(
+        dp_tp_mesh.parallel_state, "model_parallel_is_initialized", lambda: True
+    )
+    monkeypatch.setattr(
+        dp_tp_mesh.parallel_state,
+        "get_dp_group",
+        lambda: (_ for _ in ()).throw(AssertionError("dp group is not initialized")),
+    )
+    with pytest.raises(RuntimeError, match="DP/TP process groups are not initialized"):
+        dp_tp_mesh.build_dp_tp_mesh()
+
+
 def test_build_dp_tp_mesh_validates_groups_and_caches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from torch_tpu._internal import pallas as pallas_mod
-
-    monkeypatch.setattr(dp_tp_mesh, "_MESH_2D_CACHE", {})
-    monkeypatch.setattr(dp_tp_mesh.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dp_tp_mesh.dist, "get_rank", lambda: 1)
-    monkeypatch.setattr(dp_tp_mesh.dist, "get_world_size", lambda: 4)
     dp_ranks, tp_ranks = _groups(1, 2, 2)
-    monkeypatch.setattr(dp_tp_mesh.ps, "model_parallel_is_initialized", lambda: True)
-    monkeypatch.setattr(
-        dp_tp_mesh.ps, "get_dp_group", lambda: SimpleNamespace(ranks=dp_ranks)
-    )
-    monkeypatch.setattr(
-        dp_tp_mesh.ps, "get_tp_group", lambda: SimpleNamespace(ranks=tp_ranks)
+    _patch_dist_and_groups(
+        monkeypatch,
+        global_rank=1,
+        world_size=4,
+        dp_ranks=dp_ranks,
+        tp_ranks=tp_ranks,
     )
     rank_ids = (40, 20, 10, 30)
     calls = []
@@ -120,50 +166,24 @@ def test_build_dp_tp_mesh_validates_groups_and_caches(
     assert len(calls) == 1
 
 
-def test_build_dp_tp_mesh_rejects_duplicate_device_ids_or_bad_axes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from torch_tpu._internal import pallas as pallas_mod
-
-    monkeypatch.setattr(dp_tp_mesh, "_MESH_2D_CACHE", {})
-    monkeypatch.setattr(dp_tp_mesh.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(dp_tp_mesh.dist, "get_rank", lambda: 0)
-    monkeypatch.setattr(dp_tp_mesh.dist, "get_world_size", lambda: 4)
-    monkeypatch.setattr(dp_tp_mesh.ps, "model_parallel_is_initialized", lambda: False)
-
-    monkeypatch.setattr(
-        pallas_mod,
-        "get_pallas_mesh",
-        lambda *, axis_names, mesh_shape: _fake_2d_mesh(
-            (10, 10, 20, 30), mesh_shape, axis_names
-        ),
-    )
-    with pytest.raises(RuntimeError, match="Duplicate TPU device IDs"):
-        dp_tp_mesh.build_dp_tp_mesh(2, 2)
-
-    monkeypatch.setattr(
-        pallas_mod,
-        "get_pallas_mesh",
-        lambda *, axis_names, mesh_shape: _fake_2d_mesh(
-            (10, 20, 30, 40), mesh_shape, ("x", "y")
-        ),
-    )
-    with pytest.raises(RuntimeError, match="axis_names"):
-        dp_tp_mesh.build_dp_tp_mesh(2, 2)
-
-
 def test_build_dp_tp_mesh_inside_compile_requires_cached_entry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(dp_tp_mesh, "_MESH_2D_CACHE", {})
-    monkeypatch.setattr(dp_tp_mesh.ps, "model_parallel_is_initialized", lambda: False)
+    dp_ranks, tp_ranks = _groups(0, 2, 2)
+    _patch_dist_and_groups(
+        monkeypatch,
+        global_rank=0,
+        world_size=4,
+        dp_ranks=dp_ranks,
+        tp_ranks=tp_ranks,
+    )
     monkeypatch.setattr(dp_tp_mesh.torch.compiler, "is_compiling", lambda: True)
 
     with pytest.raises(RuntimeError, match="before torch.compile tracing"):
-        dp_tp_mesh.build_dp_tp_mesh(2, 2)
+        dp_tp_mesh.build_dp_tp_mesh()
     cached = _fake_2d_mesh((0, 1, 2, 3), (2, 2))
-    dp_tp_mesh._MESH_2D_CACHE[(2, 2, (0, 1, 2, 3))] = cached
-    assert dp_tp_mesh.build_dp_tp_mesh(2, 2) is cached
+    dp_tp_mesh._MESH_2D_CACHE[(2, 2)] = cached
+    assert dp_tp_mesh.build_dp_tp_mesh() is cached
 
 
 def test_dp_tp_mesh_is_covered_by_runtime_cache_key_paths() -> None:
