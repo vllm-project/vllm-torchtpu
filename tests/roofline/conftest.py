@@ -1,0 +1,95 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Shared locked-checkpoint fixture loaders for roofline unit tests."""
+
+from __future__ import annotations
+
+import copy
+import json
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+
+import pytest
+
+from vllm_torchtpu.roofline import (
+    ModelGeometry,
+    ModelIdentity,
+    from_hf_config,
+    resolve_model_identity,
+)
+
+FIXTURES_DIR: Path = Path(__file__).resolve().parent / "fixtures"
+LOCKED_FIXTURE_FILES: tuple[str, ...] = (
+    "qwen3_5_397b_fp8.json",
+    "qwen3_5_397b_nvfp4.json",
+    "glm_5_2_fp8.json",
+    "glm_5_2_nvfp4.json",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class LockedBundle:
+    """Bundled config, identity, geometry, and optional dtypes for a locked fixture."""
+
+    config: dict[str, object]
+    identity: ModelIdentity
+    geometry: ModelGeometry
+    dtypes: object = None
+
+
+@lru_cache(maxsize=16)
+def _read_fixture_json(fixture_name: str) -> dict[str, object]:
+    """Read and cache one locked HuggingFace config JSON from fixtures/."""
+    return json.loads((FIXTURES_DIR / fixture_name).read_text(encoding="utf-8"))
+
+
+def load_locked_config(
+    fixture_name: str = "qwen3_5_397b_fp8.json",
+) -> dict[str, object]:
+    """Return a fresh copy of one of the 4 locked basis HF checkpoint configs."""
+    return copy.deepcopy(_read_fixture_json(fixture_name))
+
+
+def load_locked_geometry(
+    fixture_name: str = "qwen3_5_397b_fp8.json",
+) -> ModelGeometry:
+    """Parse one of the 4 locked basis HF checkpoint configs into ModelGeometry."""
+    return from_hf_config(_read_fixture_json(fixture_name))
+
+
+def load_locked_bundle(
+    fixture_name: str = "qwen3_5_397b_fp8.json",
+) -> LockedBundle:
+    """Load config copy, canonical identity, and geometry for one locked fixture."""
+    config = load_locked_config(fixture_name)
+    identity = resolve_model_identity(config)
+    geometry = from_hf_config(config)
+    return LockedBundle(config=config, identity=identity, geometry=geometry)
+
+
+@pytest.fixture
+def locked_config_path(tmp_path: Path) -> Callable[[str], Path]:
+    """Return a helper writing a locked fixture config JSON into tmp_path."""
+
+    def _write(fixture_name: str = "qwen3_5_397b_fp8.json") -> Path:
+        target = tmp_path / fixture_name
+        target.write_text(
+            (FIXTURES_DIR / fixture_name).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return target
+
+    return _write
