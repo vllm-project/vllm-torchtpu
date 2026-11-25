@@ -215,6 +215,10 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    VLLM_TPU_AGENTIC_TELEMETRY: bool = False
+    VLLM_TPU_AGENTIC_SPAN_LOG: str = ""
+    VLLM_TPU_REPLICA_ID: str = ""
+    VLLM_TPU_AGENTIC_BLOCK_SIZE: int = 0
 
 
 def env_with_choices(
@@ -1317,6 +1321,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # Host-side agentic serving telemetry (7-category prefill token breakdown,
+    # HBM eviction age, and KV transfer/padding span attributes). Off by default.
+    "VLLM_TPU_AGENTIC_TELEMETRY": env_bool("VLLM_TPU_AGENTIC_TELEMETRY", default=False),
+    # Optional JSONL file path where each completed request's span attributes
+    # are appended (for local inspection without an OTel collector).
+    "VLLM_TPU_AGENTIC_SPAN_LOG": env_str("VLLM_TPU_AGENTIC_SPAN_LOG", default=""),
+    # Optional logical replica identifier tagging telemetry spans and IPC files.
+    "VLLM_TPU_REPLICA_ID": env_str("VLLM_TPU_REPLICA_ID", default=""),
+    # Optional explicit KV block size override in tokens per block for host-side
+    # session tracking (0 means auto-detect from cache_config.block_size).
+    "VLLM_TPU_AGENTIC_BLOCK_SIZE": env_nonnegative_int(
+        "VLLM_TPU_AGENTIC_BLOCK_SIZE", 0
     ),
 }
 
