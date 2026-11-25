@@ -788,6 +788,10 @@ def _build_fused_ep_moe_kernel(
     # kernel converts between them with a shift.
     tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
     tile_shift = host.pow2_shift(tile_m, "tile_m")
+    # A tile's sublane of the scale mirrors is this many rows of mirror_lanes
+    # (host.mirror_rows_per_tile): one row at up to a lane block.
+    mirror_rows = host.mirror_rows_per_tile(tile_m)
+    mirror_lanes = tile_m // mirror_rows
     height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
     # The contribution slab exists for one reason: to give the push an HBM
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
@@ -916,7 +920,7 @@ def _build_fused_ep_moe_kernel(
         w2b_vm = next(it) if has_w2_bias else None
         ls_vm = next(it) if has_act_scale else None
         out_vm = next(it)
-        oscl_vm = next(it)  # [parities, tile blocks, ROWBLK] f32
+        oscl_vm = next(it)  # [parities, mirror rows, tile_m / mirror rows] f32
         token_gather_sem0, token_gather_sem1 = (next(it) for _ in range(2))
         lhs_sems, w1_sems, w2_sems = (next(it) for _ in range(3))
         w1s_sems = next(it) if has_scales else None
@@ -1325,6 +1329,16 @@ def _build_fused_ep_moe_kernel(
             """
             return jnp.right_shift(expert_base_sm[e], tile_shift) + 2 * e
 
+        def _mirror_at(ref, sub, n):
+            """`n` tiles' sublanes of a scale mirror from tile `sub`, as rows."""
+            if mirror_rows == 1:
+                return ref.at[pl.ds(sub, n)]
+            return ref.at[pl.ds(sub * mirror_rows, n * mirror_rows)]
+
+        def _mirror_count(sublanes):
+            """A sublane count of a scale mirror in its rows."""
+            return sublanes if mirror_rows == 1 else sublanes * mirror_rows
+
         def _run_tiles(e, d, region_blocks):
             """A run's mirror sublanes: (source, destination, count).
 
@@ -1346,7 +1360,7 @@ def _build_fused_ep_moe_kernel(
             assert commit_sems is not None and commit_scl_sems is not None
             _rows_wait(commit_sems.at[parity], contrib_hbm, live_blocks * ROWBLK)
             # One tile committed one mirror sublane, whatever its row count.
-            _rows_wait(commit_scl_sems.at[parity], cscl_hbm, 1)
+            _rows_wait(commit_scl_sems.at[parity], cscl_hbm, mirror_rows)
 
         def wait_shipped(parity, rows, subs):
             """Wait until the wire has read `parity`'s staging slot.
@@ -1365,7 +1379,7 @@ def _build_fused_ep_moe_kernel(
 
             @pl.when(subs > 0)
             def _():
-                _rows_wait(send_scl_sems.at[parity], cscl_hbm, subs)
+                _rows_wait(send_scl_sems.at[parity], cscl_hbm, _mirror_count(subs))
 
         def n_groups_of(e):
             """Index-window groups expert ``e``'s routed rows span."""
@@ -1522,7 +1536,7 @@ def _build_fused_ep_moe_kernel(
                 # went, so they commit once, outside the per-dest loop.
                 pltpu.make_async_copy(
                     oscl_vm.at[parity],
-                    cscl_hbm.at[pl.ds(_mirror_base(e) + t, 1)],
+                    _mirror_at(cscl_hbm, _mirror_base(e) + t, 1),
                     commit_scl_sems.at[parity],
                 ).start()
 
@@ -1604,7 +1618,7 @@ def _build_fused_ep_moe_kernel(
                     def _(dst_sub=dst_sub, parity=parity, d=d):
                         pltpu.make_async_remote_copy(
                             src_ref=oscl_vm.at[parity],
-                            dst_ref=rscl_hbm.at[pl.ds(dst_sub, 1)],
+                            dst_ref=_mirror_at(rscl_hbm, dst_sub, 1),
                             send_sem=send_scl_sems.at[parity],
                             recv_sem=recv_scl_sem,
                             device_id=(jnp.int32(d),),
@@ -1615,7 +1629,7 @@ def _build_fused_ep_moe_kernel(
                     def _(dst_sub=dst_sub, parity=parity):
                         pltpu.make_async_copy(
                             oscl_vm.at[parity],
-                            rscl_hbm.at[pl.ds(dst_sub, 1)],
+                            _mirror_at(rscl_hbm, dst_sub, 1),
                             send_scl_sems.at[parity],
                         ).start()
 
@@ -1842,12 +1856,28 @@ def _build_fused_ep_moe_kernel(
                         slot."""
                         if full:
                             out_vm[static_parity] = wire_rows_staged
-                            oscl_vm[static_parity] = wire_scales_staged
                         else:
                             out_vm[static_parity, pl.ds(0, height)] = wire_rows_staged
+                        if mirror_rows == 1 and full:
+                            oscl_vm[static_parity] = wire_scales_staged
+                        elif mirror_rows == 1:
                             oscl_vm[static_parity, :, pl.ds(0, height)] = (
                                 wire_scales_staged
                             )
+                        else:
+                            # The sublane as rows of mirror_lanes: whole rows,
+                            # then the part of the next one the height covers.
+                            whole, part = divmod(height, mirror_lanes)
+                            for r in range(whole):
+                                oscl_vm[static_parity, r : r + 1, :] = (
+                                    wire_scales_staged[
+                                        :, r * mirror_lanes : (r + 1) * mirror_lanes
+                                    ]
+                                )
+                            if part:
+                                oscl_vm[
+                                    static_parity, whole : whole + 1, pl.ds(0, part)
+                                ] = wire_scales_staged[:, whole * mirror_lanes :]
 
                     # Store slots must be static, so these branches stay
                     # static.
@@ -1981,8 +2011,8 @@ def _build_fused_ep_moe_kernel(
                     # plan gave the run.
                     src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
                     pltpu.make_async_remote_copy(
-                        src_ref=cscl_hbm.at[pl.ds(src_sub, n_sub)],
-                        dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                        src_ref=_mirror_at(cscl_hbm, src_sub, n_sub),
+                        dst_ref=_mirror_at(rscl_hbm, dst_sub, n_sub),
                         send_sem=send_scl_sem,
                         recv_sem=recv_scl_sem,
                         device_id=(jnp.int32(d),),
@@ -2001,8 +2031,8 @@ def _build_fused_ep_moe_kernel(
                     ).start()
                     src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
                     pltpu.make_async_copy(
-                        cscl_hbm.at[pl.ds(src_sub, n_sub)],
-                        rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                        _mirror_at(cscl_hbm, src_sub, n_sub),
+                        _mirror_at(rscl_hbm, dst_sub, n_sub),
                         mehop_scl_sem,
                     ).start()
 
@@ -2028,7 +2058,9 @@ def _build_fused_ep_moe_kernel(
                 # because a peer signals them whatever parity it sent from.
                 drain_shipped(carry_end)
                 _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ROWS))
-                _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
+                _rows_wait(
+                    recv_scl_sem, rscl_hbm, _mirror_count(count(host.COUNT_RECV_MIRROR))
+                )
                 return
             # The per-tile head waits consume every commit but the last one
             # per parity; the drains below consume those.
@@ -2037,15 +2069,21 @@ def _build_fused_ep_moe_kernel(
             # The mirror moves whole sublanes, one per tile a run spans,
             # so its counts are their own rows of the count table rather
             # than a division of the row counts.
-            _rows_wait(send_scl_sem, cscl_hbm, count(host.COUNT_SEND_MIRROR))
-            _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
+            _rows_wait(
+                send_scl_sem, cscl_hbm, _mirror_count(count(host.COUNT_SEND_MIRROR))
+            )
+            _rows_wait(
+                recv_scl_sem, rscl_hbm, _mirror_count(count(host.COUNT_RECV_MIRROR))
+            )
             # Deferred own-destination drain: the total sums my own-dest
             # region lengths, and a skipped pair owes exactly zero rows.
             self_blocks = commit_len_sm[0, me]
             for g in range(1, g_local):
                 self_blocks = self_blocks + commit_len_sm[g, me]
             _rows_wait(mehop_sem, recv_hbm, self_blocks * ROWBLK)
-            _rows_wait(mehop_scl_sem, rscl_hbm, count(host.COUNT_SELF_MIRROR))
+            _rows_wait(
+                mehop_scl_sem, rscl_hbm, _mirror_count(count(host.COUNT_SELF_MIRROR))
+            )
 
         drain_transport()
         _all_pairs_barrier(ep)
@@ -2158,12 +2196,20 @@ def _build_fused_ep_moe_kernel(
         out_shape = [
             jax.ShapeDtypeStruct((recv_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
             jax.ShapeDtypeStruct(
-                (host.arrival_mirror_rows(recv_rows, ep * g_local, tile_m), tile_m),
+                (
+                    host.arrival_mirror_rows(recv_rows, ep * g_local, tile_m)
+                    * mirror_rows,
+                    mirror_lanes,
+                ),
                 jnp.float32,
             ),
             jax.ShapeDtypeStruct((contrib_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
             jax.ShapeDtypeStruct(
-                (host.contrib_mirror_rows(contrib_rows, g_local, tile_m), tile_m),
+                (
+                    host.contrib_mirror_rows(contrib_rows, g_local, tile_m)
+                    * mirror_rows,
+                    mirror_lanes,
+                ),
                 jnp.float32,
             ),
         ]
@@ -2298,6 +2344,11 @@ def _build_fused_ep_moe_kernel(
             *biases,
         )
         recv, rscl, _contrib, _contrib_scl = res
+        # The arrival mirror goes out as stored, rows of mirror_lanes. Its
+        # reader takes a flat position (sublane * tile_m + offset), which picks
+        # the same f32 at either grouping, whereas regrouping it to
+        # [sublanes, tile_m] would be a relayout in HBM on every call: the
+        # (8, 128) tiles of a 256-lane array hold different elements.
         return recv, rscl
 
     return fn
@@ -2707,4 +2758,171 @@ def build_act_scale_slab(**kwargs):
             if fn is None:
                 fn = _build_act_scale_slab(**kwargs)
                 _SCALE_SLAB_CACHE[key] = fn
+    return fn
+
+
+# --------------------------------------------------------------------------- #
+# Both slab tables by one run copy. Where every shard sends its routed pairs
+# already sorted by expert (host.sender_sorted_pairs), each (local expert,
+# source) run of the slab is a contiguous stretch of that source's gathered
+# pairs, so the token-gather table and the activation-scale slab are the same
+# copy of runs out of two gathered streams -- token numbers and scale bits --
+# instead of a sort over every routed pair and a lookup per row.
+# --------------------------------------------------------------------------- #
+
+# Routed pairs per expert, T * topk / e_total, at or above which the layer
+# builds the tables by run copy. The copy visits every (local expert, source)
+# run of a shard -- g_local * ep = e_total of them -- one at a time, each in at
+# least one 128-lane chunk, so its cost follows e_total. The sort + lookup it
+# replaces sorts all T * topk pairs on every shard, so theirs follows T * topk.
+# Measured on TPU8i 4x4x1 at Qwen3.8's shape (top-10 of 512, 32 shards)
+# against the sort + lookup: -102 us per layer at 320 pairs per expert (16384
+# tokens), -14 us at 160 (8192), +33 us at 80 (4096) and below. Only that
+# shape has been measured; the lookup and the copy's sender sort work on a
+# shard's own pairs, so ep moves the break-even a little too.
+SLAB_RUN_COPY_MIN_PAIRS_PER_EXPERT = 160
+
+
+def slab_run_copy_pays(n_tokens, topk, *, e_total):
+    """Whether a step routes enough pairs per expert for the run copy to pay."""
+    return n_tokens * topk >= SLAB_RUN_COPY_MIN_PAIRS_PER_EXPERT * e_total
+
+
+def _build_slab_run_copy(*, n_streams, src_rows, out_rows, n_runs):
+    """Copy `n_runs` runs of int32 out of `n_streams` flat streams at once.
+
+    Operands: per run its source offset, destination offset and length
+    (scalar prefetch, [n_runs] each), then the streams as [n_streams,
+    src_rows, 128] lane rows. The result is [n_streams, out_rows, 128], zero
+    wherever no run lands -- the run padding and everything past the last
+    run, exactly what the scatter forms leave. Runs must not overlap at the
+    destination; the layer's are disjoint by construction.
+
+    Everything stays in VMEM. A run is copied 128 elements at a time: the
+    chunk's elements sit in at most two source lane rows, which one select
+    merges into a single row holding them rotated by the source lane; one
+    lane rotation then moves them to the destination lane, and a masked
+    store writes the one or two destination rows the chunk covers.
+    """
+    lanes = HIDDEN_LANE_BLOCK
+    shift = host.pow2_shift(lanes, "the lane count")
+    if src_rows % host.U32_SUBLANE_TILE or out_rows % host.U32_SUBLANE_TILE:
+        raise ValueError(
+            f"the source ({src_rows}) and destination ({out_rows}) row counts "
+            f"must be whole {host.U32_SUBLANE_TILE}-row tiles"
+        )
+
+    def kernel(src_off_sm, dst_off_sm, count_sm, src_ref, out_ref):
+        sub = host.U32_SUBLANE_TILE
+        zero = jnp.zeros((sub, lanes), jnp.int32)
+
+        def clear(i, carry):
+            row = pl.multiple_of(i * sub, sub)
+            for s in range(n_streams):
+                out_ref[s, pl.ds(row, sub), :] = zero
+            return carry
+
+        lax.fori_loop(0, out_rows // sub, clear, jnp.int32(0))
+        lane = lax.broadcasted_iota(jnp.int32, (1, lanes), 1)
+
+        def copy_run(r, carry):
+            length = count_sm[r]
+            src0 = src_off_sm[r]
+            dst0 = dst_off_sm[r]
+
+            def copy_chunk(c, carry):
+                done = c * lanes
+                n = jnp.minimum(length - done, lanes)
+                src = src0 + done
+                dst = dst0 + done
+                src_row = jnp.right_shift(src, shift)
+                src_lane = src & (lanes - 1)
+                dst_row = jnp.right_shift(dst, shift)
+                dst_lane = dst & (lanes - 1)
+                # The chunk's tail wraps into the next source row only where
+                # src_lane > 0, and then only lanes below src_lane are read
+                # from it; clamping keeps the last row's read in bounds.
+                next_row = jnp.minimum(src_row + 1, src_rows - 1)
+                from_next = lane < src_lane
+                rotate = (dst_lane - src_lane) & (lanes - 1)
+                spill = dst_lane + n - lanes
+                in_first = (lane >= dst_lane) & (lane < dst_lane + n)
+                in_second = lane < spill
+                for s in range(n_streams):
+                    merged = jnp.where(
+                        from_next,
+                        src_ref[s, pl.ds(next_row, 1), :],
+                        src_ref[s, pl.ds(src_row, 1), :],
+                    )
+                    moved = pltpu.roll(merged, rotate, 1)
+                    out_ref[s, pl.ds(dst_row, 1), :] = jnp.where(
+                        in_first, moved, out_ref[s, pl.ds(dst_row, 1), :]
+                    )
+
+                    @pl.when(spill > 0)
+                    def _(s=s, moved=moved):
+                        out_ref[s, pl.ds(dst_row + 1, 1), :] = jnp.where(
+                            in_second, moved, out_ref[s, pl.ds(dst_row + 1, 1), :]
+                        )
+
+                return carry
+
+            lax.fori_loop(
+                0, jnp.right_shift(length + lanes - 1, shift), copy_chunk, carry
+            )
+            return carry
+
+        lax.fori_loop(0, n_runs, copy_run, jnp.int32(0))
+
+    vmem = pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)
+    call = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            in_specs=[vmem],
+            out_specs=vmem,
+            grid=(),
+        ),
+        out_shape=jax.ShapeDtypeStruct((n_streams, out_rows, lanes), jnp.int32),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=host.vmem_limit(), disable_bounds_checks=True
+        ),
+        name=f"fused_ep_moe_v2_slab_runs_r{n_runs}_s{src_rows}_o{out_rows}",
+    )
+
+    def fn(src_off, dst_off, count, streams):
+        # Bounds checks are off in this kernel, so the operands are checked
+        # here rather than cast: the run tables are read as n_runs int32 words
+        # and the streams as int32 lane rows, and a cast would hide a caller
+        # passing f32 scales rather than their bits.
+        for name, arr, shape in (
+            ("src_off", src_off, (n_runs,)),
+            ("dst_off", dst_off, (n_runs,)),
+            ("count", count, (n_runs,)),
+            ("streams", streams, (n_streams, src_rows, lanes)),
+        ):
+            if arr.dtype != jnp.int32 or tuple(arr.shape) != shape:
+                raise ValueError(
+                    f"{name} must be int32{list(shape)}, "
+                    f"got {arr.dtype}{list(arr.shape)}"
+                )
+        return call(src_off, dst_off, count, streams)
+
+    return fn
+
+
+_SLAB_RUN_COPY_CACHE = {}
+_SLAB_RUN_COPY_CACHE_LOCK = threading.Lock()
+
+
+def build_slab_run_copy(**kwargs):
+    """Memoizing front door; see build_fused_ep_moe_kernel for why."""
+    key = tuple(sorted((k, str(v)) for k, v in kwargs.items()))
+    fn = _SLAB_RUN_COPY_CACHE.get(key)
+    if fn is None:
+        with _SLAB_RUN_COPY_CACHE_LOCK:
+            fn = _SLAB_RUN_COPY_CACHE.get(key)
+            if fn is None:
+                fn = _build_slab_run_copy(**kwargs)
+                _SLAB_RUN_COPY_CACHE[key] = fn
     return fn

@@ -368,6 +368,15 @@ def sharded_splash_attention(
     )
 
 
+def uses_seq_along_lane_kv_page(
+    kv_layout: batched_rpa_configs.KVLayout | None,
+    head_size: int,
+) -> bool:
+    """Return whether `head_size` uses `SEQ_ALONG_LANE` KV cache pages."""
+    # The hd64 RPA kernel only supports HEAD_ALONG_SUBLANE pages.
+    return head_size != 64 and kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+
+
 def sharded_ragged_paged_attention(
     mesh: Mesh,
     q: jax.Array,
@@ -401,7 +410,7 @@ def sharded_ragged_paged_attention(
     page_size_axis = 1
     if kv_layout is not None and not use_hd64:
         layout_kwargs["kv_layout"] = rpa_batched.configs.KVLayout(kv_layout)
-        if kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+        if uses_seq_along_lane_kv_page(kv_layout, q.shape[-1]):
             kv_cache_spec = P(None, "model", None, None, None)
             page_size_axis = 4
     in_specs = (

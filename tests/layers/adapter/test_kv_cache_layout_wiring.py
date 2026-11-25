@@ -27,15 +27,18 @@ import math
 import pytest
 import torch
 from vllm.config import get_current_vllm_config
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
+from vllm_torchtpu.kv_cache_materializer import materialize_shared_attention_cache
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     PallasAttentionBackend,
     PallasBatchedRPAAttentionBackend,
 )
+from vllm_torchtpu.layers.core.attention_interface import uses_seq_along_lane_kv_page
 
 BF16 = torch.bfloat16
 FP8 = torch.float8_e4m3fn
@@ -153,7 +156,7 @@ KERNEL_BLOCK_SIZES = [128, 256]
 
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 @pytest.mark.parametrize("dtype", [BF16, FP8])
-@pytest.mark.parametrize("head_dim", [64, 256, 512])
+@pytest.mark.parametrize("head_dim", [64, 80, 256, 512])
 def test_shared_pool_traces_without_vllm_config(monkeypatch, layout, dtype, head_dim):
     import jax
     import jax.numpy as jnp
@@ -162,15 +165,17 @@ def test_shared_pool_traces_without_vllm_config(monkeypatch, layout, dtype, head
 
     from vllm_torchtpu.layers.adapter import attention as adapter
 
+    packing = 4 // dtype.itemsize
     with _layout_env(monkeypatch, layout):
         native_shape = BATCHED.get_kv_cache_shape(8, 128, 2, head_dim, dtype)
+        words_per_token = 2 * math.prod(native_shape[1:]) // (128 * packing)
+        pool_shape = BATCHED.get_shared_pool_shape(
+            4, 128, packing, words_per_token, [head_dim]
+        )
         kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[
             get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
         ]
     assert get_current_vllm_config_or_none() is None
-
-    packing = 4 // dtype.itemsize
-    pool_shape = (4, 128, packing, 2 * math.prod(native_shape[1:]) // (128 * packing))
 
     def attention(kv_cache, query, key, value, metadata, mesh, **kwargs):
         assert kv_cache.shape == native_shape
@@ -610,3 +615,270 @@ def test_default_layout_accepts_a_layout_blind_kernel_entry(nhd, monkeypatch):
     impl._kernel_op_prefix = "pallas::rpa_kernel_local"
     bound = _build_rpa_kernel(impl, monkeypatch)
     assert "kv_layout" not in bound.keywords
+
+
+def _build_mixed_shared_pool(
+    *,
+    num_blocks: int,
+    block_size: int,
+    swa_heads: int,
+    swa_hd: int,
+    glob_heads: int,
+    glob_hd: int,
+    dtype: torch.dtype,
+    sliding_window: int,
+) -> tuple[torch.Tensor, tuple[int, ...], tuple[int, ...], int, int, int]:
+    swa_b = page_bytes(BATCHED, swa_heads, swa_hd, dtype, block_size=block_size)
+    glob_b = page_bytes(BATCHED, glob_heads, glob_hd, dtype, block_size=block_size)
+    pool_b = max(swa_b, glob_b)
+    swa_split, glob_split = pool_b // swa_b, pool_b // glob_b
+    swa_native = BATCHED.get_kv_cache_shape(
+        num_blocks * swa_split, block_size, swa_heads, swa_hd, dtype
+    )
+    glob_native = BATCHED.get_kv_cache_shape(
+        num_blocks * glob_split, block_size, glob_heads, glob_hd, dtype
+    )
+    pool = materialize_shared_attention_cache(
+        layer_specs=[
+            (
+                "swa",
+                SlidingWindowSpec(
+                    block_size=block_size,
+                    num_kv_heads=swa_heads,
+                    head_size=swa_hd,
+                    dtype=dtype,
+                    sliding_window=sliding_window,
+                    page_size_padded=pool_b,
+                ),
+            ),
+            (
+                "glob",
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=glob_heads,
+                    head_size=glob_hd,
+                    dtype=dtype,
+                    page_size_padded=pool_b,
+                ),
+            ),
+        ],
+        tensor_size=num_blocks * pool_b,
+        num_blocks=num_blocks,
+        kernel_block_size=block_size,
+        attn_backend=BATCHED,
+        device=torch.device("cpu"),
+    )
+    return pool, swa_native, glob_native, swa_split, glob_split, pool_b
+
+
+@pytest.mark.parametrize("block_size", [128, 256])
+@pytest.mark.parametrize(
+    "swa_heads,swa_hd,glob_heads,glob_hd",
+    [(2, 256, 1, 512), (2, 80, 1, 192), (2, 128, 2, 256)],
+)
+def test_shared_pool_seq_along_lane_traces_kernel_without_transpose(
+    monkeypatch, block_size, swa_heads, swa_hd, glob_heads, glob_hd
+):
+    """Mixed-head-dim shared pools under SEQ_ALONG_LANE keep
+    `(packing, block_size)` trailing so `_pallas_rpa_kernel_batched` reshapes
+    without emitting a 5D `transpose`, including unequal (2x) native pages."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from vllm.config import get_current_vllm_config_or_none
+
+    from vllm_torchtpu.layers.adapter import attention as adapter
+
+    num_blocks = 8
+    with _layout_env(monkeypatch, "HND"):
+        pool, swa_native, glob_native, swa_split, glob_split, pool_b = (
+            _build_mixed_shared_pool(
+                num_blocks=num_blocks,
+                block_size=block_size,
+                swa_heads=swa_heads,
+                swa_hd=swa_hd,
+                glob_heads=glob_heads,
+                glob_hd=glob_hd,
+                dtype=FP8,
+                sliding_window=1024,
+            )
+        )
+        kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[
+            get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
+        ]
+    assert get_current_vllm_config_or_none() is None
+    assert pool.shape == (num_blocks, pool_b // (4 * block_size), 4, block_size)
+
+    mesh = jax.sharding.Mesh(np.array(jax.devices("cpu")[:1]), ("model",))
+    seen: list[tuple[int, ...]] = []
+
+    def stub_attn(kv_cache, query, key, value, metadata, mesh, **kwargs):
+        seen.append(kv_cache.shape)
+        assert kwargs["kv_layout"] == kv_layout
+        return kv_cache, query + metadata.block_tables.sum().astype(query.dtype)
+
+    monkeypatch.setattr(adapter, "attention", stub_attn)
+    for kv_h, hd, expected_native, split in (
+        (swa_heads, swa_hd, swa_native, swa_split),
+        (glob_heads, glob_hd, glob_native, glob_split),
+    ):
+        seen.clear()
+        run = functools.partial(
+            adapter._pallas_rpa_kernel_batched,
+            sinks=None,
+            q_scale=None,
+            k_scale=1.0,
+            v_scale=1.0,
+            mesh=mesh,
+            sliding_window=None,
+            skip_kv_update=False,
+            kv_layout=kv_layout,
+        )
+        jaxpr = jax.make_jaxpr(run)(
+            jax.ShapeDtypeStruct(pool.shape, jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, kv_h * 2, hd), jnp.bfloat16),
+            jax.ShapeDtypeStruct((1, kv_h, hd), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1, kv_h, hd), jnp.float8_e4m3fn),
+            jax.ShapeDtypeStruct((1,), jnp.int32),
+            jax.ShapeDtypeStruct((2,), jnp.int32),
+            jax.ShapeDtypeStruct((2,), jnp.int32),
+            jax.ShapeDtypeStruct((3,), jnp.int32),
+        )
+        assert seen == [expected_native]
+        primitives = [eqn.primitive.name for eqn in jaxpr.jaxpr.eqns]
+        assert "transpose" not in primitives, primitives
+        assert ("mul" in primitives) == (split > 1), primitives
+
+
+def test_get_shared_pool_shape_and_seq_along_lane_predicate(monkeypatch):
+    assert uses_seq_along_lane_kv_page(KVLayout.SEQ_ALONG_LANE, 128)
+    assert not uses_seq_along_lane_kv_page(KVLayout.SEQ_ALONG_LANE, 64)
+    assert not uses_seq_along_lane_kv_page(KVLayout.HEAD_ALONG_SUBLANE, 128)
+    assert not uses_seq_along_lane_kv_page(None, 128)
+    assert BATCHED.get_shared_pool_shape(8, 128, 4, 256, [64]) == (8, 128, 4, 256)
+    assert BATCHED.get_shared_pool_shape(8, 128, 4, 256, []) == (8, 128, 4, 256)
+
+    with _layout_env(monkeypatch, "HND"):
+        assert BATCHED.get_shared_pool_shape(8, 128, 4, 256, [256, 512]) == (
+            8,
+            256,
+            4,
+            128,
+        )
+        assert BASE.get_shared_pool_shape(8, 128, 4, 256, [256, 512]) == (
+            8,
+            128,
+            4,
+            256,
+        )
+        with pytest.raises(NotImplementedError, match="head_dim==64"):
+            BATCHED.get_shared_pool_shape(8, 128, 4, 256, [64, 128])
+
+    with _layout_env(monkeypatch, "NHD"):
+        assert BATCHED.get_shared_pool_shape(8, 128, 4, 256, [64, 128]) == (
+            8,
+            128,
+            4,
+            256,
+        )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "swa_heads,swa_hd,glob_heads,glob_hd",
+    [(2, 256, 1, 512), (2, 80, 1, 160), (2, 128, 2, 256)],
+)
+def test_shared_pool_seq_along_lane_matches_separate_caches_on_tpu(
+    hnd, swa_heads, swa_hd, glob_heads, glob_hd
+):
+    """Run `_pallas_rpa_kernel_batched` on TPU across equal and unequal (2x)
+    4D `SEQ_ALONG_LANE` shared pools and verify bit-exact output parity."""
+    _require_tpu()
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    from vllm_torchtpu.layers.adapter import attention as adapter
+
+    bs, nblk = 128, 8
+    pool_t, swa_native, glob_native, swa_s, glob_s, _ = _build_mixed_shared_pool(
+        num_blocks=nblk,
+        block_size=bs,
+        swa_heads=swa_heads,
+        swa_hd=swa_hd,
+        glob_heads=glob_heads,
+        glob_hd=glob_hd,
+        dtype=BF16,
+        sliding_window=192,
+    )
+    shared = jnp.zeros(tuple(pool_t.shape), dtype=jnp.bfloat16)
+    sep_swa = jnp.zeros(swa_native, dtype=jnp.bfloat16)
+    sep_glob = jnp.zeros(glob_native, dtype=jnp.bfloat16)
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices("tpu")[:1]), ("model",))
+    rng = np.random.default_rng(0)
+    pre_len, tot_len = bs + 16, bs + 17
+
+    def mk(h: int, d: int):
+        return tuple(
+            jnp.asarray(rng.standard_normal(s) * 0.5, jnp.bfloat16)
+            for s in ((tot_len, h * 2, d), (tot_len, h, d), (tot_len, h, d))
+        )
+
+    swa_qkv, glob_qkv = mk(swa_heads, swa_hd), mk(glob_heads, glob_hd)
+    swa_bt, glob_bt = jnp.asarray([1, 4], jnp.int32), jnp.asarray([2, 5], jnp.int32)
+
+    def step(cache, qkv, bt, sl: slice, seq_l: int, dec: bool, sw):
+        q, k, v = (a[sl] for a in qkv)
+        dist = jnp.asarray((1, 1, 1) if dec else (0, 0, 1), jnp.int32)
+        return adapter._pallas_rpa_kernel_batched(
+            cache,
+            q,
+            k,
+            v,
+            jnp.asarray([seq_l], jnp.int32),
+            bt,
+            jnp.asarray([0, q.shape[0]], jnp.int32),
+            dist,
+            None,
+            None,
+            None,
+            None,
+            mesh=mesh,
+            sliding_window=sw,
+            sm_scale=q.shape[-1] ** -0.5,
+            skip_kv_update=False,
+            kv_layout=KVLayout.SEQ_ALONG_LANE,
+        )
+
+    shared, o1 = step(shared, swa_qkv, swa_bt, slice(0, pre_len), pre_len, False, 192)
+    shared, o2 = step(
+        shared, glob_qkv, glob_bt, slice(0, pre_len), pre_len, False, None
+    )
+    shared, o3 = step(
+        shared, swa_qkv, swa_bt, slice(pre_len, tot_len), tot_len, True, 192
+    )
+    shared, o4 = step(
+        shared, glob_qkv, glob_bt, slice(pre_len, tot_len), tot_len, True, None
+    )
+    sep_swa, r1 = step(
+        sep_swa, swa_qkv, swa_bt * swa_s, slice(0, pre_len), pre_len, False, 192
+    )
+    sep_swa, r3 = step(
+        sep_swa, swa_qkv, swa_bt * swa_s, slice(pre_len, tot_len), tot_len, True, 192
+    )
+    sep_glob, r2 = step(
+        sep_glob, glob_qkv, glob_bt * glob_s, slice(0, pre_len), pre_len, False, None
+    )
+    sep_glob, r4 = step(
+        sep_glob,
+        glob_qkv,
+        glob_bt * glob_s,
+        slice(pre_len, tot_len),
+        tot_len,
+        True,
+        None,
+    )
+    for got, ref in ((o1, r1), (o2, r2), (o3, r3), (o4, r4)):
+        np.testing.assert_array_equal(
+            np.asarray(got.astype(jnp.float32)), np.asarray(ref.astype(jnp.float32))
+        )

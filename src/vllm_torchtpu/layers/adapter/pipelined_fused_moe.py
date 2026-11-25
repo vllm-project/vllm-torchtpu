@@ -206,6 +206,7 @@ def pipelined_fused_moe_gmm(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     topk_weights_float32: bool = False,
+    row_info: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 
@@ -239,10 +240,18 @@ def pipelined_fused_moe_gmm(
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.
         skip_padded_tokens: Optional flag to skip padded tokens.
+        row_info: Unsupported in pipelined mode; must be None.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
+    if row_info is not None:
+        # Each chunk holds rows gathered from several ranks, so one local
+        # valid-row count would drop real rows of the other ranks.
+        raise NotImplementedError(
+            "pipelined_fused_moe_gmm does not support row_info (chunked DP/PCP "
+            "layouts cannot reuse a single local valid-row count)."
+        )
     collective_group, _ = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]

@@ -150,21 +150,13 @@ def _apply_rotary_emb(
 def _build_device_vector_f32(
     values: tuple[float, ...],
     device: torch.device,
-    *,
-    base: float | None = None,
-    rotary_dim: int | None = None,
 ) -> torch.Tensor:
-    """Materializes a 1-D float32 frequency vector as pure in-graph HLO ops."""
-    if base is not None and rotary_dim is not None and rotary_dim == len(values) * 2:
-        dim_idx = torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device)
-        std_inv = 1.0 / (float(base) ** (dim_idx / float(rotary_dim)))
-        if device.type != "cpu":
-            return std_inv
-        ref = torch.tensor(values, dtype=torch.float32, device="cpu")
-        if torch.allclose(std_inv, ref, rtol=1e-5, atol=1e-6):
-            return std_inv
-    if device.type == "cpu":
-        return torch.tensor(values, dtype=torch.float32, device=device)
+    """Materializes host-computed fp32 `inv_freq` values as in-graph constants.
+
+    Each value is emitted as an fp32 scalar constant and stacked so the exact
+    host-computed values reach the compiled graph unchanged rather than being
+    recomputed on the device.
+    """
     return torch.stack(
         [torch.full((), float(v), dtype=torch.float32, device=device) for v in values]
     )
@@ -197,17 +189,9 @@ def _in_graph_cos_sin(
     inv_freq: tuple[float, ...],
     cache_dtype: torch.dtype,
     dtype: torch.dtype,
-    *,
-    base: float | None = None,
-    rotary_dim: int | None = None,
 ) -> torch.Tensor:
     """Returns `[cos | sin]` rows in `dtype` for `[N]` or `[N, D/2]` positions."""
-    inv = _build_device_vector_f32(
-        inv_freq,
-        pos_for_freq.device,
-        base=base,
-        rotary_dim=rotary_dim,
-    )
+    inv = _build_device_vector_f32(inv_freq, pos_for_freq.device)
     freqs = (
         torch.outer(pos_for_freq.to(torch.float32), inv)
         if pos_for_freq.ndim == 1
@@ -241,8 +225,6 @@ def _in_graph_rope_forward(
         self._in_graph_rope_inv_freq,
         self._in_graph_rope_cache_dtype,
         query.dtype,
-        base=float(getattr(self, "base", 10000.0)),
-        rotary_dim=int(getattr(self, "rotary_dim", 0)),
     )
     cos, sin = cos_sin.chunk(2, dim=-1)
 

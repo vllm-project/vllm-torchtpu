@@ -54,7 +54,7 @@ dependencies = [
     # qwen4_exp/ accepts only indexed_attention, hence the floor. vLLM 0.33.0
     # takes transformers>=5.16.1,<5.21.0 and vllm-omni 0.32.0rc1 takes
     # >=5.16.1,<5.20.0. No upper bound in base dependencies, so upstream vLLM
-    # HEAD canary builds (vllm-torchtpu-integration) can resolve. Monitored for
+    # HEAD canary builds (vllm-torchtpu-canary-vllm) can resolve. Monitored for
     # potential structured-output spec-decode divergence (#1093) on
     # transformers>=5.17.
     "transformers>=5.18.0",
@@ -243,6 +243,12 @@ plugins.md007.enabled = false
 
 [tool.pyrefly]
 project-includes = ["src"]
+# Copies of vLLM v0.33.0 Model Runner V1 code (see vllm_torchtpu.runner.vllm_v1
+# and R-3.1). They keep upstream's typing, which pyrefly rejects in places;
+# retyping them would rewrite upstream code that moving to Model Runner V2
+# retires. Code that imports them is still checked. pyrefly keeps its default
+# excludes on top of this list.
+project-excludes = ["src/vllm_torchtpu/runner/vllm_v1/**"]
 
 # Errors listed in the baseline file do not fail the check; any error not
 # listed does. To retire an entry, fix the code and delete the entry, or

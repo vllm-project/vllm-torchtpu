@@ -62,20 +62,7 @@ VOCAB = 32
 LAYER_TYPES = ["linear_attention", "full_attention"]
 
 
-@pytest.fixture(autouse=True)
-def _cpu_model_tests(monkeypatch):
-    # Same guard as the Kimi model tests: keep Dynamo from querying a TPU
-    # device while these CPU-only tests run.
-    tpu = getattr(torch, "tpu", None)
-    if tpu is not None:
-        monkeypatch.setattr(tpu, "is_available", lambda: False)
-        monkeypatch.setattr(tpu, "current_device", lambda: 0)
-        monkeypatch.setattr(tpu, "device_count", lambda: 0)
-        monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
-    if hasattr(torch, "accelerator"):
-        monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
-        monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
-        monkeypatch.setattr(torch.accelerator, "device_count", lambda: 0)
+pytestmark = pytest.mark.usefixtures("cpu_model_tests")
 
 
 def _text_config(**overrides) -> Qwen4ExpTextConfig:
@@ -139,10 +126,12 @@ def _vllm_config_for_checks(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         model_config=SimpleNamespace(
+            architecture="Qwen4ExpForCausalLM",
             hf_config=text_config,
             hf_text_config=text_config,
             multimodal_config=None,
             max_model_len=max_model_len,
+            is_hybrid=True,
         ),
         cache_config=SimpleNamespace(mamba_ssm_cache_dtype="auto"),
         parallel_config=SimpleNamespace(
@@ -181,8 +170,11 @@ _QSA = dict(
 )
 
 
-def test_config_accepts_qsa_within_indexer_budget() -> None:
-    vllm_config = _vllm_config_for_checks(_text_config(**_QSA), max_model_len=2048)
+@pytest.mark.parametrize("max_model_len", [2048, 262144])
+def test_config_accepts_qsa_at_any_length(max_model_len: int) -> None:
+    vllm_config = _vllm_config_for_checks(
+        _text_config(**_QSA), max_model_len=max_model_len
+    )
     TPUQwen4ExpConfig.verify_and_update_config(vllm_config)
 
 
@@ -196,8 +188,6 @@ def test_config_rejects_unknown_layer_type() -> None:
 @pytest.mark.parametrize(
     "text_overrides,config_overrides,match",
     [
-        ({"ple_layer_ids": [1], "eos_token_id": 3}, {}, "PLE"),
-        (_QSA, {"max_model_len": 4096}, "indexer_budget=2048"),
         (
             {},
             {"speculative_config": SimpleNamespace(method="mtp")},
@@ -208,7 +198,7 @@ def test_config_rejects_unknown_layer_type() -> None:
         ({}, {"prefill_context_parallel_size": 2}, "context parallelism"),
         ({}, {"decode_context_parallel_size": 2}, "context parallelism"),
     ],
-    ids=["ple", "long_context_qsa", "mtp", "pp", "sp_moe", "pcp", "dcp"],
+    ids=["mtp", "pp", "sp_moe", "pcp", "dcp"],
 )
 def test_config_rejects_unsupported_features(
     text_overrides, config_overrides, match
@@ -220,22 +210,36 @@ def test_config_rejects_unsupported_features(
         TPUQwen4ExpConfig.verify_and_update_config(vllm_config)
 
 
-@pytest.mark.parametrize(
-    "nested,override",
-    [
-        (False, '{"ple_layer_ids": []}'),
-        (True, '{"text_config": {"ple_layer_ids": []}}'),
-    ],
-    ids=["text_only", "vision_language"],
-)
-def test_config_ple_error_names_override(nested, override) -> None:
+def test_config_accepts_ple_on_a_gdn_layer() -> None:
     text_config = _text_config(ple_layer_ids=[1], eos_token_id=3)
-    vllm_config = _vllm_config_for_checks(text_config)
-    if nested:
-        vllm_config.model_config.hf_config = SimpleNamespace(text_config=text_config)
-    with pytest.raises(NotImplementedError) as excinfo:
+    TPUQwen4ExpConfig.verify_and_update_config(_vllm_config_for_checks(text_config))
+
+
+def test_config_rejects_ple_without_the_unified_pool(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "vllm_torchtpu.envs.TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", False, raising=False
+    )
+    text_config = _text_config(ple_layer_ids=[1], eos_token_id=3)
+    with pytest.raises(NotImplementedError, match="unified KV pool"):
+        TPUQwen4ExpConfig.verify_and_update_config(_vllm_config_for_checks(text_config))
+
+
+@pytest.mark.parametrize(
+    "text_overrides,max_model_len",
+    [({"ple_layer_ids": [1], "eos_token_id": 3}, 2048), (_QSA, 4096)],
+    ids=["ple", "sparse_qsa"],
+)
+def test_config_rejects_block_major_pool(
+    monkeypatch, text_overrides, max_model_len: int
+) -> None:
+    monkeypatch.setattr(
+        "vllm_torchtpu.envs.VLLM_TPU_BLOCK_MAJOR_KV", True, raising=False
+    )
+    vllm_config = _vllm_config_for_checks(
+        _text_config(**text_overrides), max_model_len=max_model_len
+    )
+    with pytest.raises(NotImplementedError, match="block-major"):
         TPUQwen4ExpConfig.verify_and_update_config(vllm_config)
-    assert f"--hf-overrides '{override}'" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +278,7 @@ class _FakeLMHead(nn.Module):
 def fake_sublayers(monkeypatch):
     for name in (
         "QwenGatedDeltaNetAttention",
-        "Qwen3NextAttention",
+        "Qwen4ExpQSAAttention",
         "Qwen3NextSparseMoeBlock",
     ):
         monkeypatch.setattr(qwen4_model, name, _FakeSublayer)
@@ -286,9 +290,11 @@ def fake_sublayers(monkeypatch):
 def _model_vllm_config(text_config: Qwen4ExpTextConfig) -> SimpleNamespace:
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=text_config),
-        cache_config=None,
+        cache_config=SimpleNamespace(block_size=16),
         quant_config=None,
-        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+        compilation_config=SimpleNamespace(
+            mode=CompilationMode.NONE, static_forward_context={}
+        ),
     )
 
 
@@ -352,7 +358,7 @@ def test_model_matches_hyper_connection_reference(fake_sublayers) -> None:
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
 
 
-def test_layer_types_select_gdn_or_dense_gated_attention(fake_sublayers) -> None:
+def test_layer_types_select_gdn_or_qsa_attention(fake_sublayers) -> None:
     text_config = _text_config()
     model = qwen4_model.Qwen4ExpModel(
         vllm_config=_model_vllm_config(text_config), prefix="model"
@@ -468,7 +474,10 @@ _LM = "model.language_model"
             f"{_LM}.layers.0.mlp.experts.7.down_proj.weight_scale_inv",
             ("model.layers.0.mlp.experts.7.down_proj.weight_scale_inv", None),
         ),
-        (f"{_LM}.layers.3.self_attn.indexer.index_qk_proj.weight", None),
+        (
+            f"{_LM}.layers.3.self_attn.indexer.index_qk_proj.weight",
+            ("model.layers.3.self_attn.indexer.index_qk_proj.weight", None),
+        ),
         (
             f"{_LM}.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight",
             ("model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight", None),
@@ -832,7 +841,7 @@ def test_ple_layer_matches_reference_for_any_chunking(monkeypatch, chunks) -> No
             slots = torch.tensor([r + 1 for r, _, _ in step] + [0])
             has_history = torch.tensor([s > 0 for _, s, _ in step] + [False])
             windows = torch.where(has_history.view(-1, 1, 1), conv_state[slots], 0)
-            output, new_windows = ple(
+            output, new_windows, _ = ple(
                 hidden, PLEInputs(input_ids, query_start_loc, context), windows
             )
             conv_state[slots] = new_windows
@@ -937,13 +946,42 @@ def test_load_weights_loads_ple_or_drops_it_when_disabled(
     torch.testing.assert_close(state[f"{table}.weight"][last_shard_start:], last_shard)
 
 
-def test_model_rejects_ple_without_runner_inputs(fake_sublayers, monkeypatch) -> None:
+def test_ple_cache_shares_the_gdn_state_spec(fake_sublayers, monkeypatch) -> None:
+    """PLEStateCache registers as a mamba layer whose spec is its GDN layer's,
+    so vLLM puts it in the GDN cache groups instead of a group of its own."""
     _set_tp(monkeypatch, 0, 1)
-    model = qwen4_model.Qwen4ExpModel(
-        vllm_config=_model_vllm_config(_text_config(**_PLE)), prefix="model"
-    )
-    with pytest.raises(NotImplementedError, match="PLE"):
-        model(torch.tensor([1, 2, 3]), torch.arange(3))
+    vllm_config = _model_vllm_config(_text_config(**_PLE))
+    model = qwen4_model.Qwen4ExpModel(vllm_config=vllm_config, prefix="model")
+    ple_cache = model.layers[0].ple_cache
+    gdn = model.layers[0].linear_attn
+    gdn.get_kv_cache_spec = lambda config: ("gdn spec", config)
+    gdn.get_prefill_checkpoint_alignment = lambda: 1
+    assert vllm_config.compilation_config.static_forward_context == {
+        "model.layers.0.ple": ple_cache
+    }
+    assert ple_cache.get_kv_cache_spec(vllm_config) == ("gdn spec", vllm_config)
+    assert ple_cache.get_prefill_checkpoint_alignment() == 1
+    assert "linear_attn" not in dict(ple_cache.named_modules())
+
+
+def test_model_runs_ple_before_the_kv_cache_exists(fake_sublayers, monkeypatch) -> None:
+    """Memory profiling runs the model before any KV cache is bound: PLE
+    treats the batch as one request without history."""
+    _set_tp(monkeypatch, 0, 1)
+    torch.manual_seed(0)
+    vllm_config = _model_vllm_config(_text_config(**_PLE))
+    model = qwen4_model.Qwen4ExpModel(vllm_config=vllm_config, prefix="model")
+    ple = model.layers[0].ple
+    ple_cache = model.layers[0].ple_cache
+    _randomize_ple(ple)
+    tokens = torch.tensor([1, 2, 3, 4, 5])
+    hidden = torch.randn(tokens.numel(), HC * HIDDEN)
+    with torch.no_grad():
+        inputs, windows = ple_cache.read(hidden, tokens)
+        ple_out = ple(hidden, inputs, windows)
+        ple_cache.write(inputs, windows, ple_out)
+        torch.testing.assert_close(ple_out.output, _ref_ple(ple, hidden, tokens))
+        assert model(tokens, torch.arange(5)).shape == (5, HIDDEN)
 
 
 @pytest.mark.parametrize(
@@ -1012,3 +1050,48 @@ def test_ple_layer_rejects_kernel_size_one(monkeypatch) -> None:
     config = _text_config(**{**_PLE, "ple_conv_kernel_size": 1})
     with pytest.raises(NotImplementedError, match="ple_conv_kernel_size"):
         Qwen4ExpPLELayer(config, 0, None, prefix="model.layers.0.ple")
+
+
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("tp_size", [1, 2], ids=["tp1", "tp2"])
+def test_ple_table_finalize_weights_chunks_large_table(
+    monkeypatch, fp8: bool, tp_size: int
+) -> None:
+    """Chunked lookup matches unchunked lookup bit-exact across FP8 and TP ranks."""
+    from vllm.models.qwen4_exp.common.ngram_embedding import (
+        Qwen4ExpPLEEmbeddingMethod,
+    )
+
+    from vllm_torchtpu.models.qwen4_exp.ple import Qwen4ExpPLETable
+
+    quant_config = (
+        VllmFp8Config.from_config(
+            {
+                "quant_method": "fp8",
+                "activation_scheme": "dynamic",
+                "weight_block_size": [128, 128],
+            }
+        )
+        if fp8
+        else None
+    )
+    torch.manual_seed(0)
+    ids = torch.tensor([[0, 7, 8, 15, 16, 23, 31]])
+    for rank in range(tp_size):
+        _set_tp(monkeypatch, rank, tp_size)
+        method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(quant_config, "ple", None)
+        table = Qwen4ExpPLETable(
+            32, 8, embedding_method=method, padding_size=8, prefix="ple"
+        )
+        with torch.no_grad():
+            raw = torch.randn(table.weight.shape)
+            table.weight.copy_(raw.to(table.weight.dtype))
+            if fp8:
+                table.weight_scale.fill_(0.25)
+        expected = table.local_rows(ids)
+
+        table.finalize_weights(max_elements=40)  # 5 rows per chunk
+        assert table.weight is None
+        assert table._weight_chunks is not None
+        assert len(table._weight_chunks) > 1
+        torch.testing.assert_close(table.local_rows(ids), expected, rtol=0, atol=0)
