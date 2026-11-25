@@ -8,6 +8,8 @@ common/host_transfer.py. Downloads rebind each producer's PJRT buffer.
 
 import ctypes
 import math
+
+from vllm_torchtpu.models.vllm.deepseek_v41.common import engram_timing as _et
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Any
@@ -154,7 +156,8 @@ class EngramHashDownload:
             return torch.empty(hashes.shape, dtype=hashes.dtype, device="cpu")
         if hashes.dtype != torch.int32:
             raise TypeError("Engram raw hash download requires int32 hashes")
-        sync.synchronize(tensors=[hashes], wait=True)
+        with _et.timed("hash_sync_wait"):
+            sync.synchronize(tensors=[hashes], wait=True)
         layout = tpu_torch_compile.get_device_layout_if_materialized(hashes)
         if layout is None:
             raise RuntimeError(

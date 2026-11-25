@@ -51,6 +51,9 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
+    _noop_release,
+    stage_h2d_upload,
+    zeros_h2d_source,
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
@@ -330,6 +333,7 @@ def test_spec_warmup_clamps_circular_buffer_group_blocks():
         max_model_len=8192,
         max_num_tokens=2048,
         speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        vllm_config=SimpleNamespace(num_lookahead_tokens=5),
         kv_cache_config=SimpleNamespace(
             num_blocks=100,
             kv_cache_groups=[attn_group, ring_group],
@@ -1016,6 +1020,9 @@ class TestAttentionMetadataBuilder:
         runner.most_model_len = most_model_len
         runner._unified_kv_layout = False
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
+        runner._unfenced_h2d_sources = []
+        runner._free_h2d_sources = {}
+        runner._registered_h2d_sources = set()
 
         block_tables = []
         for gid in range(num_groups):
@@ -1244,7 +1251,9 @@ class TestCompactMambaSlotPool:
         # Slots per request: 1 without spec decode, num_spec + 1 with it.
         runner._mamba_slot_stride = slot_stride
         runner._mamba_offset_seeded = set()
-        runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
+        runner._unfenced_h2d_sources = []
+        runner._free_h2d_sources = {}
+        runner._registered_h2d_sources = set()
         runner.input_batch = MagicMock()
         # Bind the real methods.
         runner._init_mamba_slot_pool = TPUModelRunner._init_mamba_slot_pool.__get__(
@@ -1338,14 +1347,13 @@ class TestCompactMambaSlotPool:
 
     def test_chunked_build_allocates_all(self):
         """Two chunks in one step: each chunk allocates its own requests; all
-        get distinct slots."""
+        get distinct slots, uploaded from distinct host buffers."""
         runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
         runner._init_mamba_slot_pool(5)
         self._set_batch(runner, ["a", "b", "c", "d"])
 
-        # clone: the result aliases a reused staging buffer (no copy on CPU).
-        idx_chunk0 = runner._build_mamba_state_indices(0, 2, 4).clone()
-        idx_chunk1 = runner._build_mamba_state_indices(2, 2, 4).clone()
+        idx_chunk0 = runner._build_mamba_state_indices(0, 2, 4)
+        idx_chunk1 = runner._build_mamba_state_indices(2, 2, 4)
         slots = {
             int(idx_chunk0[0]),
             int(idx_chunk0[1]),
@@ -1353,6 +1361,11 @@ class TestCompactMambaSlotPool:
             int(idx_chunk1[1]),
         }
         assert slots == {1, 2, 3, 4}
+        # No shared staging buffer: the second chunk must not overwrite the
+        # first chunk's in-flight upload, and both stay alive until the fence.
+        assert idx_chunk0.data_ptr() != idx_chunk1.data_ptr()
+        assert runner._unfenced_h2d_sources[0][0] is idx_chunk0
+        assert runner._unfenced_h2d_sources[1][0] is idx_chunk1
 
     def test_spec_decode_stride_allocates_group_bases(self):
         """With speculative decoding each request owns a group of `stride`
@@ -1896,6 +1909,8 @@ class TestUnifiedReadOffsetMigration:
         runner._mamba_state_pos = {}
         runner._pool_block_split = 1
         runner._pending_mamba_state_copies = []
+        runner._unfenced_h2d_sources = []
+        runner._registered_h2d_sources = set()
         raw = torch.zeros(16, 2)
         runner._mamba_copy_plan = [(0, [raw])]
         runner.input_batch = MagicMock()
@@ -1931,6 +1946,12 @@ class TestUnifiedReadOffsetMigration:
         assert len(runner._pending_mamba_state_copies) == 1
         _, src_t, dst_t = runner._pending_mamba_state_copies[0]
         assert int(src_t[0]) == 5 and int(dst_t[0]) == 9
+        # Both offset migration and seed copy tensors were staged via stage_h2d_upload.
+        assert len(runner._unfenced_h2d_sources) == 4
+        assert runner._unfenced_h2d_sources[-2][0] is src_t
+        assert runner._unfenced_h2d_sources[-1][0] is dst_t
+        assert runner._unfenced_h2d_sources[-2][1] is _noop_release
+        assert runner._unfenced_h2d_sources[-1][1] is _noop_release
 
     def test_no_crossing_leaves_offsets_alone(self):
         runner, scheduler_output = self._make_runner(
@@ -2200,7 +2221,13 @@ class TestInputStagingFence:
         monkeypatch.setattr(
             torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
         )
-        runner = SimpleNamespace(_input_staging_fence=None)
+        runner = SimpleNamespace(
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+        )
         TPUModelRunner._record_input_staging_fence(runner)
         fence = runner._input_staging_fence
         assert fence is _FakeTpuEvent.instances[-1]
@@ -2218,6 +2245,270 @@ class TestInputStagingFence:
         runner = SimpleNamespace(_input_staging_fence=None)
         TPUModelRunner._wait_input_staging_fence(runner)
         assert runner._input_staging_fence is None
+
+    def test_staged_h2d_sources_live_until_their_fence_is_waited(self, monkeypatch):
+        """A host source uploaded before a record is released by the wait on
+        that fence via its tuple callback (recycling registered `zeros_h2d_source`
+        buffers into `_free_h2d_sources` and using a no-op callback for one-off
+        tensors); one uploaded after it (a draft walk) must survive that wait
+        and only go with the next fence cycle."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+        )
+        target_buf = zeros_h2d_source(runner, 4).fill_(1)
+        assert id(target_buf) in runner._registered_h2d_sources
+        target = stage_h2d_upload(runner, target_buf)
+        target_ptr = target.data_ptr()
+
+        one_off_buf = torch.tensor([1, 2, 3], dtype=torch.long)
+        assert id(one_off_buf) not in runner._registered_h2d_sources
+        one_off = stage_h2d_upload(runner, one_off_buf)
+
+        TPUModelRunner._record_input_staging_fence(runner)
+        draft_buf = zeros_h2d_source(runner, 4).fill_(2)
+        draft = stage_h2d_upload(runner, draft_buf)
+
+        assert len(runner._fenced_h2d_sources) == 2
+        assert runner._fenced_h2d_sources[0][0] is target
+        assert runner._fenced_h2d_sources[0][1] is not _noop_release
+        assert runner._fenced_h2d_sources[1] == (one_off, _noop_release)
+        assert runner._unfenced_h2d_sources[0][0] is draft
+
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._fenced_h2d_sources == []
+        # Only the registered `zeros_h2d_source` buffer is recycled into
+        # `_free_h2d_sources`; the one-off tensor's dummy callback is a no-op.
+        assert runner._free_h2d_sources == {(4, torch.int32): [target]}
+        assert runner._unfenced_h2d_sources[0][0] is draft
+
+        reused = zeros_h2d_source(runner, 4, torch.int32)
+        assert reused.data_ptr() == target_ptr
+        assert reused.tolist() == [0, 0, 0, 0]
+        assert runner._free_h2d_sources[(4, torch.int32)] == []
+
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._fenced_h2d_sources == []
+        assert runner._unfenced_h2d_sources == []
+        assert runner._free_h2d_sources[(4, torch.int32)] == [draft]
+
+    def test_wait_input_staging_fence_executes_tuple_callbacks_directly(
+        self, monkeypatch
+    ):
+        """`_wait_input_staging_fence` only invokes each fenced entry's callback
+        and clears `_fenced_h2d_sources`, without inspecting the buffer."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        called: list[str] = []
+        buf_a = torch.zeros(2, dtype=torch.int32)
+        buf_b = torch.zeros(3, dtype=torch.int64)
+        runner = SimpleNamespace(
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[
+                (buf_a, lambda: called.append("a")),
+                (buf_b, lambda: called.append("b")),
+            ],
+            _fenced_h2d_sources=[],
+        )
+        TPUModelRunner._record_input_staging_fence(runner)
+        assert runner._unfenced_h2d_sources == []
+        assert len(runner._fenced_h2d_sources) == 2
+
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert called == ["a", "b"]
+        assert runner._fenced_h2d_sources == []
+
+    def test_zeros_h2d_source_max_buffers_evicts_lru_and_unregisters(self, monkeypatch):
+        """When `max_buffers` is reached, `zeros_h2d_source` pops the
+        least-recently-used buffer from `_free_h2d_sources`, removes its
+        registration from `_registered_h2d_sources`, and registers the new
+        buffer."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+        )
+        # Step 1: allocate and recycle 2 buffers (reaching max_buffers=2).
+        b1 = zeros_h2d_source(runner, 4, max_buffers=2)
+        b2 = zeros_h2d_source(runner, 8, max_buffers=2)
+        stage_h2d_upload(runner, b1)
+        stage_h2d_upload(runner, b2)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._registered_h2d_sources == {id(b1), id(b2)}
+        assert list(runner._free_h2d_sources.keys()) == [
+            (4, torch.int32),
+            (8, torch.int32),
+        ]
+
+        # Step 2: reuse b1 (shape 4) so b2 (shape 8) becomes the oldest free
+        # buffer after the fence wait.
+        reused_b1 = zeros_h2d_source(runner, 4, max_buffers=2)
+        assert reused_b1 is b1
+        stage_h2d_upload(runner, reused_b1)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert list(runner._free_h2d_sources.keys()) == [
+            (8, torch.int32),
+            (4, torch.int32),
+        ]
+
+        # Step 3: allocate a new shape (16) with max_buffers=2 -> evicts and
+        # unregisters b2 (the LRU buffer in _free_h2d_sources), and registers b3.
+        b3 = zeros_h2d_source(runner, 16, max_buffers=2)
+        assert id(b2) not in runner._registered_h2d_sources
+        assert (8, torch.int32) not in runner._free_h2d_sources
+        assert runner._registered_h2d_sources == {id(b1), id(b3)}
+
+        stage_h2d_upload(runner, b3)
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._free_h2d_sources == {
+            (4, torch.int32): [b1],
+            (16, torch.int32): [b3],
+        }
+
+    def test_dummy_run_fences_its_uploads_before_the_forward(self, monkeypatch):
+        """Warmup and idle-DP dummy runs stage block tables too: each run must
+        release the previous run's host sources and fence its own before the
+        forward, so repeated runs neither accumulate buffers nor make the next
+        wait block on a dummy forward."""
+        _FakeTpuEvent.instances.clear()
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **kw: None)
+        for name in ("set_forward_context", "set_vllm_model_wrapper_context"):
+            monkeypatch.setattr(
+                tpu_runner, name, lambda *a, **kw: contextlib.nullcontext()
+            )
+        from vllm_torchtpu.layers.core.sequence_layout import (
+            DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+        )
+
+        def forward_model(**kw):
+            # The fence must already cover this run's uploads.
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+            assert runner._unfenced_h2d_sources == []
+            return torch.zeros((4, 8), dtype=torch.float32), None
+
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            max_model_len=64,
+            max_num_tokens=64,
+            max_num_reqs=4,
+            max_num_blocks_per_req=4,
+            most_model_len=None,
+            block_size=16,
+            uses_mrope=False,
+            supports_mm_inputs=False,
+            _pp_is_first=True,
+            _pp_wave=None,
+            _pp_topk_buffer=None,
+            _kv_cache_bundle=None,
+            lora_config=None,
+            vllm_config=MagicMock(),
+            mesh=MagicMock(),
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+            _has_mamba_state=False,
+            mamba_slot_read_offsets=None,
+            _mamba_ckpt_window=1,
+            _unified_kv_layout=False,
+            empty_slot_mappings={},
+            position_ids=torch.zeros(64, dtype=torch.int32),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _free_h2d_sources={},
+            _registered_h2d_sources=set(),
+            _token_padding_state=None,
+            sequence_layout_planner=SimpleNamespace(
+                prepare_dummy=lambda **kw: SimpleNamespace(
+                    descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+                )
+            ),
+            maybe_select_dummy_loras=lambda *a, **kw: contextlib.nullcontext(),
+            _dp_num_tokens_across_dp=lambda n: None,
+            # a0567106's _dummy_run also asks whether DP lockstep is on.
+            _dp_lockstep_enabled=lambda: False,
+            forward_model=forward_model,
+            compute_selected_logits=lambda out, idx: out,
+        )
+        for name in (
+            "_build_attention_metadata",
+            "_record_input_staging_fence",
+            "_wait_input_staging_fence",
+            "_pp_take_topk_indices",
+        ):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+        bt = MagicMock()
+        bt.max_num_blocks_per_req = 4
+        bt.get_cpu_tensor.return_value = torch.zeros((4, 4), dtype=torch.int32)
+        runner.input_batch = SimpleNamespace(block_table=[bt])
+        builder = AttentionMetadataBuilder(
+            kv_cache_spec=FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=128,
+                dtype=torch.bfloat16,
+                page_size_padded=16384,
+            ),
+            layer_names=["attn.0"],
+            vllm_config=MagicMock(),
+            device=runner.device,
+            runner=runner,
+            kv_cache_group_id=0,
+        )
+        group = MagicMock()
+        group.metadata_builders = [builder]
+        group.layer_names = ["attn.0"]
+        runner.attn_groups = [[group]]
+
+        for dp_lockstep in (False, True, False):
+            TPUModelRunner._dummy_run(
+                runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=dp_lockstep
+            )
+            # Only this run's staged table is still held, by its own fence.
+            assert runner._unfenced_h2d_sources == []
+            assert len(runner._fenced_h2d_sources) == 1
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+        assert len(_FakeTpuEvent.instances) == 3
+        assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
+
+        # With through_handoff=True, the fence must be recorded before
+        # _pp_wave.start_forward so the next wait never blocks on the receive.
+        handoff_checked = []
+
+        def start_forward(n):
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+            assert runner._unfenced_h2d_sources == []
+            handoff_checked.append(n)
+            return None
+
+        runner._pp_wave = SimpleNamespace(
+            step=contextlib.nullcontext,
+            start_forward=start_forward,
+            end_forward=lambda *a: None,
+        )
+        TPUModelRunner._dummy_run(
+            runner, num_tokens=16, num_reqs=4, num_blocks=4, through_handoff=True
+        )
+        assert handoff_checked == [16]
 
 
 class TestAsyncSpecDecodeTokenAccounting:
@@ -2844,3 +3135,225 @@ def test_multimodal_model_inputs_keep_raw_token_ids_when_required(raw_tokens):
 
     assert inputs_embeds is embeds
     assert ids is (input_ids if raw_tokens else None)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("max_logprobs", [0, 3])
+def test_gather_logprobs_preserves_normalization_precision(dtype, max_logprobs):
+    """Covers bf16 and fp32 inputs, large-offset logits, a sampled token outside
+    the top-k, and a row with a single finite logit."""
+    runner = SimpleNamespace(model_config=SimpleNamespace(max_logprobs=max_logprobs))
+    logits = torch.tensor(
+        [
+            [20, 16, 15, 13, 12],
+            [84, 80, 79, 77, 76],
+            [20, -float("inf"), -float("inf"), -float("inf"), -float("inf")],
+        ],
+        dtype=dtype,
+    )
+    original_logits = logits.clone()
+    sampled_tokens = torch.tensor([[0], [4], [0]])
+
+    with torch.compiler.set_stance("force_eager"):
+        result = TPUModelRunner.gather_logprobs(runner, logits, sampled_tokens)
+
+    # log(1 + exp(-4) + exp(-5) + exp(-7) + exp(-8)), independently in FP64.
+    log_normalizer = 0.02596100830585109
+    expected = torch.tensor(
+        [
+            [-log_normalizer - gap for gap in [0, 4, 5, 7, 8]],
+            [-log_normalizer - gap for gap in [0, 4, 5, 7, 8]],
+            [0, -float("inf"), -float("inf"), -float("inf"), -float("inf")],
+        ],
+        dtype=torch.float64,
+    )
+    assert result.logprobs.dtype == torch.float32
+    assert result.logprobs.shape == (3, max_logprobs + 1)
+    assert result.logprob_token_ids[:, 0].tolist() == [0, 4, 0]
+    assert result.selected_token_ranks.tolist() == [1, 5, 1]
+    if max_logprobs:
+        assert result.logprob_token_ids[:2, 1:].tolist() == [[0, 1, 2], [0, 1, 2]]
+    torch.testing.assert_close(
+        result.logprobs.double(),
+        expected.gather(-1, result.logprob_token_ids.long()),
+        rtol=1e-6,
+        atol=1e-5,
+    )
+    torch.testing.assert_close(logits, original_logits, rtol=0, atol=0)
+
+
+def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
+    """Uniform noise `u` in float32 preserves the upper Gumbel tail above the
+    bfloat16 ceiling (-log(-log(1 - 2^-7)) ~= 4.85) when logits are bfloat16."""
+    runner = SimpleNamespace()
+    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+    sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
+
+    logits = torch.tensor([[6.0, 0.0]], dtype=torch.bfloat16)
+    temperatures = torch.tensor([[1.0]], dtype=torch.bfloat16)
+    top_k = torch.tensor([[0]], dtype=torch.int32)
+    top_p = torch.tensor([[1.0]], dtype=torch.float32)
+
+    # With float32 u = 0.9995, -log(-log(0.9995)) ~= 7.60 > 6.0 + 0.37, so
+    # token 1 is sampled. In bfloat16, 1 - eps = 0.9921875 clamps Gumbel noise
+    # to <= 4.85, making token 1 impossible to sample.
+    u_fp32 = torch.tensor([[0.5, 0.9995]], dtype=torch.float32)
+    out_fp32 = sample_fn(runner, logits, temperatures, u_fp32, top_k, top_p)
+    assert int(out_fp32.item()) == 1
+
+    u_bf16 = u_fp32.to(torch.bfloat16)
+    out_bf16 = sample_fn(runner, logits, temperatures, u_bf16, top_k, top_p)
+    assert int(out_bf16.item()) == 0
+
+
+def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
+    """All TPUModelRunner call sites into sample_from_logits_func must draw
+    uniform random noise `u` in float32 even when logits are bfloat16."""
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    monkeypatch.setattr(
+        tpu_runner, "has_kv_transfer_group", lambda: False, raising=False
+    )
+
+    seen_u_dtypes: list[torch.dtype] = []
+
+    def fake_sample_from_logits(
+        logits,
+        temperatures,
+        u,
+        top_k,
+        top_p,
+        all_greedy=False,
+        topk_candidates=0,
+    ):
+        seen_u_dtypes.append(u.dtype)
+        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
+
+    bf16_logits = torch.zeros((2, 16), dtype=torch.bfloat16)
+    sampling_params = (
+        torch.ones((2, 1), dtype=torch.bfloat16),
+        torch.zeros((2, 1), dtype=torch.int32),
+        torch.ones((2, 1), dtype=torch.float32),
+    )
+
+    # 1. _precompile_sample_from_logits
+    precompile_runner = SimpleNamespace(
+        num_reqs_paddings=[2],
+        _hidden_states_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+        _topk_candidate_blocks=lambda: 0,
+        _precompile_timed=lambda _name: contextlib.nullcontext(),
+        sample_from_logits_func=fake_sample_from_logits,
+    )
+    TPUModelRunner._precompile_sample_from_logits(precompile_runner)
+    assert seen_u_dtypes == [torch.float32, torch.float32]
+    seen_u_dtypes.clear()
+
+    # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
+    seen_recover_dtypes: list[torch.dtype] = []
+
+    def fake_rejection_sampler(**kwargs):
+        seen_recover_dtypes.append(kwargs["recover_u"].dtype)
+        return torch.zeros((2, 2), dtype=torch.int32)
+
+    spec_runner = SimpleNamespace(
+        spec_gather_bonus_and_target_logits=lambda logits, b_idx, t_idx: (
+            bf16_logits,
+            bf16_logits,
+        ),
+        _build_padded_sampling_params=lambda start, end, logits: sampling_params,
+        _sampler_topk_candidates=lambda start, end, grammar: 0,
+        sample_from_logits_func=fake_sample_from_logits,
+        speculative_config=SimpleNamespace(num_speculative_tokens=1),
+    )
+    spec_runner.rejection_sampler = MagicMock(side_effect=fake_rejection_sampler)
+    spec_runner.rejection_sampler.synthetic_mode = False
+    md = SimpleNamespace(
+        bonus_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+        draft_token_ids=torch.zeros((2,), dtype=torch.int32),
+        draft_lengths=torch.ones((2,), dtype=torch.int32),
+        segment_ids=torch.tensor([0, 1], dtype=torch.int32),
+        group_indices=torch.tensor([[0], [1]], dtype=torch.int32),
+    )
+    TPUModelRunner._sample_spec_verify_chunk(
+        spec_runner,
+        bf16_logits,
+        md,
+        cur_start_idx=0,
+        cur_end_idx=2,
+        all_greedy=False,
+        grammar_output=None,
+        scheduler_output=SimpleNamespace(),
+        sampling_generator=None,
+    )
+    assert seen_u_dtypes == [torch.float32]
+    assert seen_recover_dtypes == [torch.float32]
+    seen_u_dtypes.clear()
+
+    # 3 & 4. sample_tokens (both non-speculative and speculative non-verify chunk)
+    for spec_method in (None, "ngram"):
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={"r0": 1, "r1": 1},
+            finished_req_ids=set(),
+            has_structured_output_requests=False,
+        )
+        runner = SimpleNamespace(
+            execute_model_state=SimpleNamespace(
+                scheduler_output=scheduler_output,
+                draft_chunks=[],
+                logits_list=[bf16_logits],
+                num_reqs_list=[2],
+                spec_decode_metadata_list=[None],
+                mamba_state_indices_list=None,
+                pooler_output_list=[],
+                top_tokens=False,
+            ),
+            input_batch=SimpleNamespace(
+                max_num_logprobs=None,
+                num_reqs=2,
+                req_ids=["r0", "r1"],
+                req_id_to_index={"r0": 0, "r1": 1},
+                all_greedy=False,
+                num_tokens_no_spec=[1, 1],
+                token_ids_cpu=np.zeros((2, 8), dtype=np.int32),
+            ),
+            requests={
+                "r0": SimpleNamespace(
+                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
+                ),
+                "r1": SimpleNamespace(
+                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
+                ),
+            },
+            speculative_config=(
+                None
+                if spec_method is None
+                else SimpleNamespace(method=spec_method, num_speculative_tokens=1)
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            _is_async_drafter=False,
+            is_pooling_model=False,
+            drafter=SimpleNamespace(),
+            spec_decode_manager=SimpleNamespace(
+                propose_draft_token_ids=lambda **kw: None
+            ),
+            _min_tokens_batch_state=lambda: {},
+            _get_sampling_generator=lambda: None,
+            _build_padded_sampling_params=lambda start, end, logits: sampling_params,
+            _sampler_topk_candidates=lambda start, end, grammar: 0,
+            sample_from_logits_func=fake_sample_from_logits,
+            _update_mamba_slot_read_offsets=lambda *_args: None,
+            _update_num_xla_graphs=lambda *_args: None,
+            _stage_timing=MagicMock(),
+        )
+        runner._stage_timing.take_samples.return_value = ([], [])
+        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+
+        TPUModelRunner.sample_tokens(runner, None)
+
+    assert seen_u_dtypes == [torch.float32, torch.float32]

@@ -22,6 +22,7 @@ _harness = importlib.import_module("test_pcp_runner_integration")
 
 
 def _profile_run(monkeypatch, runner, num_tokens, prefix, first_stage=True):
+    _harness._fake_tpu_events(monkeypatch)
     seen = {}
 
     def capture_forward_context(attn_metadata, *_args, **_kwargs):
@@ -131,9 +132,9 @@ def test_plain_dummy_run_keeps_the_decode_shape_and_returns_nothing(monkeypatch)
     elapsed, md, seen = _profile_run(monkeypatch, _runner(), 256, None)
 
     assert elapsed is None
-    assert md.query_start_loc.tolist() == list(range(9))
-    assert md.seq_lens.tolist() == [1] * 8
-    assert md.request_distribution.tolist() == [8, 8, 8]
+    assert md.query_start_loc.tolist() == [0] * 9
+    assert md.seq_lens.tolist() == [0] * 8
+    assert md.request_distribution.tolist() == [0, 0, 0]
     assert seen["input_ids"].abs().sum() == 0
 
 

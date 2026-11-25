@@ -91,6 +91,7 @@ PATCHES = (
         _ENGINE,
         refresh="vllm_torchtpu:_patch_vllm_merge_dsv41_swa_groups",
     ),
+    Patch("vllm_torchtpu:_patch_vllm_new_request_prompt_ndarray", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),

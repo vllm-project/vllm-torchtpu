@@ -1647,6 +1647,105 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     )
 
 
+def _align_raiden_num_blocks(
+    original, configs, vllm_config, kv_cache_specs, available_memory
+):
+    """Round KV num_blocks down to a multiple of TPU_KV_NUM_BLOCKS_ALIGN (16).
+
+    tpu-sync's KVCacheManager checks that every registered storage's on-device
+    size is a whole number of rows at its major dimension. DSv4.1 has a 1-D
+    INT32 storage of num_blocks * 64 words, and the device pads 1-D INT32
+    arrays to 1024-element tiles, so the check only passes when num_blocks is
+    a multiple of 16. Any other num_blocks (e.g. after Engram's HBM table takes
+    part of the KV budget) fails the D/P startup with "Layer N on-device size
+    ... is not a whole number of blocks at major dimension ...". When the
+    Raiden KV cache manager is in use and the user did not pin the block count,
+    resolve the configs again with the rounded-down count, so every tensor
+    size follows it.
+    """
+    import os
+
+    from vllm_torchtpu import envs
+
+    align = int(os.environ.get("TPU_KV_NUM_BLOCKS_ALIGN", "16"))
+    cache_config = vllm_config.cache_config
+    if (
+        align <= 1
+        or not envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER
+        or cache_config.num_gpu_blocks_override is not None
+        or not configs
+    ):
+        return configs
+    num_blocks = min(int(c.num_blocks) for c in configs)
+    if num_blocks % align == 0 or num_blocks < align:
+        return configs
+    aligned = num_blocks - num_blocks % align
+    cache_config.num_gpu_blocks_override = aligned
+    try:
+        configs = original(vllm_config, kv_cache_specs, available_memory)
+    finally:
+        cache_config.num_gpu_blocks_override = None
+    logger.info(
+        "Raiden KV cache: num_blocks %d -> %d (multiple of %d for tpu-sync "
+        "storage row alignment)",
+        num_blocks,
+        aligned,
+        align,
+    )
+    return configs
+
+
+def _patch_vllm_new_request_prompt_ndarray() -> None:
+    """Ship long prompts to the workers as int32 array.array, not Python lists.
+
+    A new request's ``prompt_token_ids`` travels EngineCore -> worker inside
+    the pickled SchedulerOutput. As a list of several hundred thousand Python
+    ints it is slow to pickle and unpickle, and the worker's
+    ``InputBatch.add_request`` then converts it element by element into
+    ``token_ids_cpu`` (~4 ms per 150k tokens, ~25 ms at 800k). That runs on the
+    worker's main thread, so under DP/EP lockstep every rank waits for the one
+    admitting a long request (seen on DSv4.1 1P1D decode under AgentX). An
+    ``array.array('i')`` pickles as one in-band bytes object and the worker's
+    numpy bulk-assign reads it through the buffer protocol (800k tokens:
+    ~1.6 ms instead of ~25 ms). Not an ndarray: shm_broadcast sends pickle
+    buffers >= 1 MiB out of band as views into its ring buffer, so an ndarray
+    prompt over ~262k tokens aliased a reused slot and the worker later read
+    garbage token ids. Only the worker-bound NewRequestData is changed; the
+    scheduler's Request keeps its list. Worker-side users only take len(),
+    index, slice or bulk-assign it (list concatenation would raise TypeError).
+    TPU_NEW_REQ_PROMPT_NDARRAY_MIN (default 8192, 0 = off) is the minimum
+    prompt length converted. Read from the environment, not envs, so it does
+    not enter the compile-cache hash.
+    """
+    import array
+    import functools
+    import os
+
+    from vllm.v1.core.sched.output import NewRequestData
+
+    threshold = int(os.environ.get("TPU_NEW_REQ_PROMPT_NDARRAY_MIN", "8192"))
+    original = NewRequestData.from_request
+    if threshold <= 0 or getattr(original, "_tpu_prompt_ndarray", False):
+        return
+    original_fn = original.__func__
+
+    @functools.wraps(original_fn)
+    def from_request(cls, request, *args, **kwargs):
+        data = original_fn(cls, request, *args, **kwargs)
+        ids = data.prompt_token_ids
+        if isinstance(ids, list) and len(ids) >= threshold:
+            data.prompt_token_ids = array.array("i", ids)
+        return data
+
+    from_request._tpu_prompt_ndarray = True  # type: ignore[attr-defined]
+    NewRequestData.from_request = classmethod(from_request)  # type: ignore[method-assign]
+    logger.info(
+        "Applied TPU patch: NewRequestData ships prompts >= %d tokens as "
+        "array('i').",
+        threshold,
+    )
+
+
 def _patch_vllm_merge_dsv41_swa_groups() -> None:
     """Give identical DeepSeek-V4.1 SWA layers one KV cache group.
 
@@ -1671,6 +1770,9 @@ def _patch_vllm_merge_dsv41_swa_groups() -> None:
         @functools.wraps(original)
         def patched(vllm_config, kv_cache_specs, available_memory):
             configs = original(vllm_config, kv_cache_specs, available_memory)
+            configs = _align_raiden_num_blocks(
+                original, configs, vllm_config, kv_cache_specs, available_memory
+            )
             return [merge_swa_groups(config) for config in configs]
 
         # pyrefly: ignore[missing-attribute]

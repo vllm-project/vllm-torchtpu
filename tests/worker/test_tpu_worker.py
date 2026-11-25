@@ -25,7 +25,7 @@ from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
-from vllm_torchtpu import patch_registry
+from vllm_torchtpu import patch_registry, utils
 from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
 
 
@@ -292,6 +292,65 @@ def test_initialize_from_config_updates_num_gpu_blocks():
     worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cache_config)
 
 
+def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
+    """Build a TPUWorker whose MIN reduce across DP engines returns at most peer."""
+    budget = utils.HbmBudget(total_limit=0, total_used=0, cap=0, available=local)
+    monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
+    monkeypatch.setenv("TORCH_TPU_DP_SIZE", str(dp_size))
+    cpu_group = object()
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group",
+        lambda: SimpleNamespace(cpu_group=cpu_group),
+    )
+
+    def all_reduce(t, op, group):
+        assert (op, group) == (torch.distributed.ReduceOp.MIN, cpu_group)
+        t.clamp_(max=peer)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
+    )
+    worker.parallel_config = SimpleNamespace(
+        data_parallel_size=1, enable_expert_parallel=expert_parallel
+    )
+    # A non-DeepSeek-V4.1 model, so the CSA2 scale-companion reserve that
+    # determine_available_memory applies last returns the budget unchanged.
+    worker.vllm_config = SimpleNamespace(
+        kv_transfer_config=None,
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=[])),
+    )
+    worker.devices = []
+    worker.model_runner = MagicMock(is_pooling_model=False)
+    return worker
+
+
+@pytest.mark.parametrize(
+    "dp_size, expert_parallel, coupled",
+    [(2, True, True), (1, True, False), (2, False, False)],
+)
+def test_determine_available_memory_is_min_across_ep_dp(
+    monkeypatch, dp_size, expert_parallel, coupled
+):
+    """EP-coupled DP engines bake their KV extent into the compiled programs,
+    so they must all size the cache from the smallest per-engine budget."""
+    local, peer = 7 * utils.GBYTES, 6 * utils.GBYTES
+    worker = _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer)
+
+    assert worker.determine_available_memory() == (peer if coupled else local)
+
+
+def test_determine_available_memory_fails_on_every_ep_dp_engine(monkeypatch):
+    """An engine whose own budget fits still fails when a coupled peer's does not."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=2, expert_parallel=True, local=utils.GBYTES, peer=0
+    )
+
+    with pytest.raises(ValueError, match="gpu-memory-utilization"):
+        worker.determine_available_memory()
+
+
 @patch("vllm_torchtpu.worker.tpu_worker.get_pp_group")
 @patch("vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank", return_value=3)
 @patch("vllm_torchtpu.worker.tpu_worker.get_kv_transfer_group")
@@ -307,18 +366,22 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
     assert worker.get_kv_connector_handshake_metadata() == {(2, 3): metadata}
 
 
-def test_model_load_stage_precedes_runner(monkeypatch):
+def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
     events = []
     config = object()
     monkeypatch.setattr(
         patch_registry, "apply", lambda stage, **kwargs: events.append((stage, kwargs))
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
+        lambda: events.append("release"),
     )
     worker = SimpleNamespace(
         model_config=config,
         model_runner=SimpleNamespace(load_model=lambda: events.append("load")),
     )
     TPUWorker.load_model(worker)
-    assert events == [("model_load", {"model_config": config}), "load"]
+    assert events == [("model_load", {"model_config": config}), "load", "release"]
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
@@ -438,6 +501,37 @@ def _worker_entry(connection):
             rank=0,
             distributed_init_method="tcp://127.0.0.1:29500",
         )
+
+
+def test_release_free_host_heap_prefers_tcmalloc(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    class FakeProcess:
+        def MallocExtension_ReleaseFreeMemory(self):  # noqa: N802
+            calls.append("tcmalloc")
+
+        def malloc_trim(self, pad):
+            calls.append("glibc")
+
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
+    tpu_worker._release_free_host_heap()
+    assert calls == ["tcmalloc"]
+
+
+def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    class FakeProcess:
+        def malloc_trim(self, pad):
+            calls.append(pad)
+
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
+    tpu_worker._release_free_host_heap()
+    assert calls == [0]
 
 
 if __name__ == "__mp_main__":

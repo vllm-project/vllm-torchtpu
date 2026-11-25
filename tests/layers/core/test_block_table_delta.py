@@ -58,7 +58,9 @@ def _make_runner(builders):
     groups = [[SimpleNamespace(metadata_builders=[b])] for b in builders]
     return SimpleNamespace(
         attn_groups=groups,
-        _block_table_stage_cpu=None,
+        _unfenced_h2d_sources=[],
+        _free_h2d_sources={},
+        _registered_h2d_sources=set(),
         device=torch.device("cpu"),
         _unified_kv_layout=False,
     )
