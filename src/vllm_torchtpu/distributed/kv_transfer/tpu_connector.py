@@ -2800,7 +2800,10 @@ class TPURaidenConnectorWorker:
             and not dist_utils.get_raiden_inline_load()
         )
         self.transfer_stats = TpuKVConnectorStats()
-        dist_utils.configure_raiden_telemetry()
+        self._raiden_telemetry_backends = dist_utils.get_raiden_telemetry_backends(
+            vllm_config
+        )
+        dist_utils.configure_raiden_telemetry(backends=self._raiden_telemetry_backends)
         logger.info(
             "TPURaidenConnectorWorker --> init | ip=%s | base_port=%s | "
             "is_producer=%s | node_id=%s | tp_rank=%d | tp_size=%d | dp_rank=%d",
@@ -2818,7 +2821,11 @@ class TPURaidenConnectorWorker:
         # telemetry is active and this worker owns the drain.
         if not self.owns_raiden_telemetry_drain:
             return
-        for metric_name, values in dist_utils.drain_raiden_metric_samples().items():
+        backends = getattr(self, "_raiden_telemetry_backends", None)
+        for metric_name, values in dist_utils.drain_raiden_metric_samples(
+            backends=backends,
+            worker_rank=self.tp_rank,
+        ).items():
             if metric_name not in self.transfer_stats.data:
                 self.transfer_stats.data[metric_name] = []
             self.transfer_stats.data[metric_name].extend(values)

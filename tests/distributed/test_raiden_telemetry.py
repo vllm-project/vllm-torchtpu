@@ -17,6 +17,7 @@ from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -325,7 +326,9 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
         assert counter._value.get() == 30.0
 
         # Verify gauge observation (last value wins: set(4) then set(7))
-        gauge = metrics.dynamic_metrics["tpu_raiden_buffer_allocated_bytes"][1][0]
+        gauge = metrics.dynamic_metrics["tpu_raiden_buffer_allocated_bytes"][1].labels(
+            model_name="my_model", engine="0", local_rank=""
+        )
         assert gauge._value.get() == 7.0
 
     def test_dynamic_metric_telemetry_exception_handled(self):
@@ -385,27 +388,118 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
             )
         assert metrics.dynamic_metrics == {}
 
-    def test_prometheus_only_mode_skips_dynamic_collector_registration(
-        self, monkeypatch
-    ):
-        monkeypatch.setenv("TPU_RAIDEN_TELEMETRY_BACKENDS", "prometheus")
+    def test_prometheus_only_mode_skips_dynamic_collector_registration(self):
         registry = CollectorRegistry()
         metric_types = {
             Gauge: partial(Gauge, registry=registry),
             Counter: partial(Counter, registry=registry),
             Histogram: partial(Histogram, registry=registry),
         }
+        vllm_config = MagicMock()
+        vllm_config.additional_config = {"raiden_telemetry_backends": ["prometheus"]}
         with patch(
             "vllm_torchtpu.distributed.utils.configure_raiden_telemetry"
         ) as mock_conf:
             metrics = TpuKVConnectorPromMetrics(
-                vllm_config=MagicMock(),
+                vllm_config=vllm_config,
                 metric_types=metric_types,
                 labelnames=["model_name", "engine"],
                 per_engine_labelvalues={0: ["my_model", "0"]},
             )
             mock_conf.assert_not_called()
         assert metrics.dynamic_metrics == {}
+
+
+class TestRaidenBufferedTelemetryGating:
+    """Tests for additional_config Raiden telemetry gating and worker rank tagging."""
+
+    @pytest.mark.parametrize(
+        ("additional_config", "expected"),
+        [
+            (None, ["buffered"]),
+            ({}, ["buffered"]),
+            ({"raiden_telemetry_backends": None}, ["buffered"]),
+            ({"raiden_telemetry_backends": ["buffered"]}, ["buffered"]),
+            ({"raiden_telemetry_backends": [" BUFFERED "]}, ["buffered"]),
+            (
+                {"raiden_telemetry_backends": ["prometheus", "buffered"]},
+                ["prometheus", "buffered"],
+            ),
+            ({"raiden_telemetry_backends": []}, []),
+        ],
+    )
+    def test_get_raiden_telemetry_backends(self, additional_config, expected):
+        cfg = MagicMock()
+        cfg.additional_config = additional_config
+        assert dist_utils.get_raiden_telemetry_backends(cfg) == expected
+
+    @pytest.mark.parametrize("bad_value", ["buffered", [123], [""], ["  "]])
+    def test_get_raiden_telemetry_backends_rejects_invalid_values(self, bad_value):
+        cfg = MagicMock()
+        cfg.additional_config = {"raiden_telemetry_backends": bad_value}
+        with pytest.raises(ValueError, match="raiden_telemetry_backends"):
+            dist_utils.get_raiden_telemetry_backends(cfg)
+
+    @pytest.mark.parametrize(
+        ("backends", "expected"),
+        [
+            (None, True),
+            (["buffered"], True),
+            (["BUFFERED"], True),
+            (["prometheus", "buffered"], True),
+            ([], False),
+            (["prometheus"], False),
+            (["cloud_logging"], False),
+            # cloud_logging drains the same C++ buffer, so vLLM must not.
+            (["buffered", "cloud_logging"], False),
+        ],
+    )
+    def test_is_raiden_buffered_telemetry_enabled(self, backends, expected):
+        assert dist_utils.is_raiden_buffered_telemetry_enabled(backends) is expected
+
+    def test_drain_skips_non_buffered_modes(self, monkeypatch):
+        mock_telemetry = MagicMock()
+        monkeypatch.setattr(
+            dist_utils, "get_raiden_telemetry_module", lambda: mock_telemetry
+        )
+        for backends in (
+            ["prometheus"],
+            ["cloud_logging"],
+            ["buffered", "cloud_logging"],
+        ):
+            assert dist_utils.drain_raiden_metric_samples(backends=backends) == {}
+        mock_telemetry.get_and_reset_metric_samples.assert_not_called()
+
+    def test_drain_tags_worker_gauges_without_rank_label(self, monkeypatch):
+        mock_telemetry = MagicMock()
+        mock_telemetry.get_metric_metadata.return_value = [
+            SimpleNamespace(name="buffer_allocated_bytes", type="GAUGE"),
+            SimpleNamespace(name="host_memory_breakdown_bytes", type="GAUGE"),
+            SimpleNamespace(name="host_numa_memory_bytes", type="GAUGE"),
+            SimpleNamespace(name="d2h_bytes_total", type="COUNTER"),
+        ]
+        mock_telemetry.get_and_reset_metric_samples.return_value = {
+            "tpu_raiden_buffer_allocated_bytes": [2048.0],
+            'tpu_raiden_host_memory_breakdown_bytes{component="kv_pool"}': [4096.0],
+            'tpu_raiden_host_numa_memory_bytes{local_rank="1",numa_node="0"}': [8192.0],
+            'tpu_raiden_d2h_bytes_total{host_ip="10.0.0.1"}': [512.0],
+        }
+        monkeypatch.setattr(
+            dist_utils, "get_raiden_telemetry_module", lambda: mock_telemetry
+        )
+
+        samples = dist_utils.drain_raiden_metric_samples(
+            backends=["buffered"], worker_rank=1
+        )
+        breakdown_key = (
+            'tpu_raiden_host_memory_breakdown_bytes{component="kv_pool",local_rank="1"}'
+        )
+        assert samples == {
+            'tpu_raiden_buffer_allocated_bytes{local_rank="1"}': [2048.0],
+            breakdown_key: [4096.0],
+            'tpu_raiden_host_numa_memory_bytes{local_rank="1",numa_node="0"}': [8192.0],
+            'tpu_raiden_d2h_bytes_total{host_ip="10.0.0.1"}': [512.0],
+        }
 
 
 class TestTPURaidenConnectorWorkerTelemetry:

@@ -127,7 +127,6 @@ Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_
 | `TPU_RAIDEN_ENGINE_ID` | `"0"` | Engine replica identifier for Raiden KV transfer. |
 | `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of parallel DMA transfer streams in `TpuRaidenConnector`. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | Selects `"controller"` or `"host"` KV cache resharding when Prefill and Decode topologies differ. |
-| `TPU_RAIDEN_TELEMETRY_BACKENDS` | unset (`"buffered"`) | Comma-separated Raiden C++ telemetry backends (`buffered`, `prometheus`, `cloud_logging`). `tpu_raiden_*` metrics appear on vLLM's `/metrics` when unset or when `buffered` is set without `cloud_logging` and with no unknown names. `""` disables Raiden telemetry. See [KV offload metrics](kv_offload_metrics.md). |
 | `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport protocol (`"zmq"` or `"tcp"`) for host-side KV resharding. |
 | `TPU_KV_TRANSFER_PORT` | `"9100"` | Port used by `TPUConnector` for KV cache transfer. |
 | `TPU_SIDE_CHANNEL_PORT` | `"9600"` | Port used by `TPUConnector` for side-channel handshake metadata. |

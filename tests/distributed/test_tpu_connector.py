@@ -6988,7 +6988,10 @@ class TestTPUConnectorStats(unittest.TestCase):
 
             gauge_obj = metrics.dynamic_metrics["tpu_raiden_buffer_allocated_bytes"][1]
             host_gauge = gauge_obj.labels(
-                model_name="my_model", engine="0", buffer_type="host_dram"
+                model_name="my_model",
+                engine="0",
+                buffer_type="host_dram",
+                local_rank="",
             )
             assert host_gauge._value.get() == 4096.0
 
@@ -7051,7 +7054,7 @@ class TestTPUConnectorStats(unittest.TestCase):
             assert isinstance(defs["tpu_raiden_unlabeled_metric"][1], dict)
             assert 0 in defs["tpu_raiden_unlabeled_metric"][1]
             assert defs["tpu_raiden_unlabeled_metric"][2] == []
-            assert defs["tpu_raiden_labeled_metric"][2] == ["dim"]
+            assert defs["tpu_raiden_labeled_metric"][2] == ["dim", "local_rank"]
             assert defs["tpu_raiden_hist_metric"][2] == []
 
 

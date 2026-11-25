@@ -191,7 +191,6 @@ if TYPE_CHECKING:
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: int | None = None
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
-    TPU_RAIDEN_TELEMETRY_BACKENDS: str | None = None
     RAIDEN_SHM_KEY: str = ""
     RAIDEN_STORAGE_PATH: str = ""
     RAIDEN_STORAGE_TYPE: str = ""
@@ -1212,12 +1211,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "RAIDEN_DISABLE_SINGLETON_WORKER": env_bool(
         "RAIDEN_DISABLE_SINGLETON_WORKER", default=True
     ),
-    # Comma-separated Raiden C++ telemetry backends (e.g. "buffered",
-    # "prometheus", "cloud_logging"). Kept as Optional[str] so None ("unset",
-    # which defaults to "buffered" in tpu-sync) stays distinct from ""
-    # ("explicitly disabled"). Adding "cloud_logging" or any unknown token keeps
-    # samples off /metrics; see `is_raiden_buffered_telemetry_enabled`.
-    "TPU_RAIDEN_TELEMETRY_BACKENDS": lambda: os.getenv("TPU_RAIDEN_TELEMETRY_BACKENDS"),
     # The raiden library's shared-memory key, a string naming the segment
     # behind its shm-backed host pools. The TPU offloading connector cannot
     # serve those pools, so it refuses to start when the key is set at all.

@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
 import torch.distributed.distributed_c10d as c10d
 from vllm.distributed import parallel_state
@@ -20,6 +21,9 @@ from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
 
@@ -347,61 +351,123 @@ def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> 
         logger.warning("Failed to configure TPU Raiden C++ telemetry: %s", e)
 
 
-# Backend names accepted by tpu_sync's
-# `RaidenMetricStore::InitializeFromBackendNames`. It rejects the whole list
-# (configuring no backends) if any token is unknown.
-_RAIDEN_TELEMETRY_BACKEND_NAMES = frozenset({"buffered", "cloud_logging", "prometheus"})
+DEFAULT_RAIDEN_TELEMETRY_BACKENDS: tuple[str, ...] = ("buffered",)
+_RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY = "raiden_telemetry_backends"
+_RAIDEN_METRIC_PREFIX = "tpu_raiden_"
+_RANK_LABEL_KEYS = ("local_rank", "rank")
 
 
-def is_raiden_buffered_telemetry_enabled() -> bool:
+def get_raiden_telemetry_backends(vllm_config: "VllmConfig | None") -> list[str]:
+    """Returns the configured Raiden C++ telemetry backend list.
+
+    Reads ``additional_config['raiden_telemetry_backends']`` when present,
+    defaulting to ``['buffered']``. An explicit empty list ``[]`` disables all
+    Raiden telemetry backends.
+    """
+    config = getattr(vllm_config, "additional_config", None)
+    if isinstance(config, Mapping) and _RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY in config:
+        raw = config[_RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY]
+        if raw is None:
+            return list(DEFAULT_RAIDEN_TELEMETRY_BACKENDS)
+        if not isinstance(raw, list) or not all(isinstance(b, str) for b in raw):
+            raise ValueError(
+                f"additional_config.{_RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY} "
+                "must be a list of strings"
+            )
+        backends: list[str] = []
+        for entry in raw:
+            token = entry.strip().lower()
+            if not token:
+                raise ValueError(
+                    f"additional_config.{_RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY} "
+                    "entries must be non-empty strings"
+                )
+            backends.append(token)
+        return backends
+    return list(DEFAULT_RAIDEN_TELEMETRY_BACKENDS)
+
+
+def is_raiden_buffered_telemetry_enabled(
+    backends: Sequence[str] | None = None,
+) -> bool:
     """Whether vLLM should drain the Raiden C++ buffered exporter.
 
-    Mirrors how tpu_sync parses `TPU_RAIDEN_TELEMETRY_BACKENDS`:
-
-    - Unset (`None`) defaults to `"buffered"`.
-    - An empty or whitespace-only string disables all backends.
-    - A list with any unknown token configures no backends at all.
-
-    `"cloud_logging"` shares the single C++ `BufferedMetricsExporter` with
-    `"buffered"`, and `FlushToCloudLogging` drains the same buffer. vLLM
-    therefore drains only when `"buffered"` is set without `"cloud_logging"`;
-    otherwise the per-step drain would take the samples meant for Cloud
-    Logging.
+    ``"cloud_logging"`` shares the single C++ ``BufferedMetricsExporter`` with
+    ``"buffered"``, and ``FlushToCloudLogging`` drains the same buffer. vLLM
+    therefore drains only when ``"buffered"`` is configured without
+    ``"cloud_logging"``.
     """
-    raw = envs.TPU_RAIDEN_TELEMETRY_BACKENDS
-    if raw is None:
-        return True
-    tokens = {part.strip().lower() for part in raw.split(",") if part.strip()}
-    unknown = tuple(sorted(tokens - _RAIDEN_TELEMETRY_BACKEND_NAMES))
-    if unknown:
-        # Tuple arguments so `warning_once` can hash them; per-step drains call
-        # this check repeatedly.
-        logger.warning_once(
-            "Unknown TPU_RAIDEN_TELEMETRY_BACKENDS token(s) %s in %r; "
-            "tpu_sync rejects the whole list, so Raiden telemetry is disabled. "
-            "Valid backends: %s",
-            unknown,
-            raw,
-            tuple(sorted(_RAIDEN_TELEMETRY_BACKEND_NAMES)),
-        )
-        return False
+    resolved = DEFAULT_RAIDEN_TELEMETRY_BACKENDS if backends is None else backends
+    tokens = {b.strip().lower() for b in resolved if b.strip()}
     return "buffered" in tokens and "cloud_logging" not in tokens
 
 
-def drain_raiden_metric_samples() -> dict[str, list[float]]:
-    """Drains buffered C++ Raiden telemetry samples for the current process."""
-    if not is_raiden_buffered_telemetry_enabled():
+def _get_raiden_gauge_names(telemetry: Any) -> set[str]:
+    """Returns normalized gauge metric names from Raiden metadata."""
+    if not hasattr(telemetry, "get_metric_metadata"):
+        return set()
+    gauges: set[str] = set()
+    try:
+        for desc in telemetry.get_metric_metadata() or ():
+            mtype = getattr(desc, "type", None)
+            mtype_str = getattr(mtype, "name", str(mtype)).split(".")[-1].lower()
+            if mtype_str == "gauge":
+                name = str(desc.name)
+                gauges.add(name)
+                if not name.startswith(_RAIDEN_METRIC_PREFIX):
+                    gauges.add(f"{_RAIDEN_METRIC_PREFIX}{name}")
+    except Exception as e:
+        logger.warning("Failed to inspect TPU Raiden metric metadata: %s", e)
+    return gauges
+
+
+def _add_worker_rank_to_gauge_key(raw_key: str, worker_rank: int) -> str:
+    """Appends ``local_rank="<worker_rank>"`` if no rank label is present."""
+    key = raw_key.strip()
+    if key.endswith("}") and "{" in key:
+        base, rest = key.split("{", 1)
+        inner = rest[:-1].strip()
+        if any(f"{rk}=" in inner for rk in _RANK_LABEL_KEYS):
+            return key
+        rank_pair = f'local_rank="{worker_rank}"'
+        return f"{base}{{{inner},{rank_pair}}}" if inner else f"{base}{{{rank_pair}}}"
+    return f'{key}{{local_rank="{worker_rank}"}}'
+
+
+def drain_raiden_metric_samples(
+    backends: Sequence[str] | None = None,
+    worker_rank: int | None = None,
+) -> dict[str, list[float]]:
+    """Drains buffered C++ Raiden telemetry samples for the current process.
+
+    When ``worker_rank`` is provided, worker-side gauge samples that do not
+    already carry a ``local_rank`` or ``rank`` label are tagged with
+    ``local_rank="<worker_rank>"`` so gauges from multiple TP ranks do not
+    overwrite each other during Prometheus observation.
+    """
+    if not is_raiden_buffered_telemetry_enabled(backends):
         return {}
     try:
         telemetry = get_raiden_telemetry_module()
         if telemetry is not None and hasattr(telemetry, "get_and_reset_metric_samples"):
             raiden_samples = telemetry.get_and_reset_metric_samples()
             if raiden_samples:
-                return {
-                    str(name): list(values)
-                    for name, values in raiden_samples.items()
-                    if values
-                }
+                gauge_names = (
+                    _get_raiden_gauge_names(telemetry)
+                    if worker_rank is not None
+                    else set()
+                )
+                result: dict[str, list[float]] = {}
+                for raw_name, values in raiden_samples.items():
+                    if not values:
+                        continue
+                    key = str(raw_name)
+                    if worker_rank is not None and gauge_names:
+                        base_name = key.split("{", 1)[0].strip()
+                        if base_name in gauge_names:
+                            key = _add_worker_rank_to_gauge_key(key, worker_rank)
+                    result.setdefault(key, []).extend(values)
+                return result
     except Exception as e:
         logger.warning("Failed to collect TPU Raiden C++ telemetry: %s", e)
     return {}

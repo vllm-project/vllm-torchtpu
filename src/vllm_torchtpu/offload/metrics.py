@@ -21,14 +21,119 @@ vLLM's `vllm:prompt_tokens_cached_by_source` counter.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
 
+from vllm.config import VllmConfig
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
+    OffloadingConnectorStats,
+    OffloadPromMetrics,
+)
 from vllm.v1.kv_offload.base import OffloadKey, get_offload_group_idx
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
+from vllm_torchtpu.distributed import utils as dist_utils
+from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
+    RaidenDynamicPromMetrics,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+_RAIDEN_SAMPLES_KEY = "raiden_samples"
+
+
+@dataclass
+class RaidenOffloadingConnectorStats(OffloadingConnectorStats):
+    """OffloadingConnectorStats extended with buffered C++ Raiden metric samples.
+
+    Carries upstream `OffloadingConnectorStats` sections (`types`, `data`, `info`)
+    unchanged alongside `"raiden_samples": dict[str, list[float]]` drained from
+    the scheduler (`KVCacheStore`) process, and from worker (`KVCacheManager`)
+    processes when this connector owns the worker-side drain.
+    Fresh instances enter `reset()` via upstream `__post_init__`, while
+    `record_raiden_samples`, `is_empty`, and `aggregate` also accept pre-built
+    upstream `data` dicts that omit `"raiden_samples"`.
+    """
+
+    def reset(self) -> None:
+        super().reset()
+        self.data[_RAIDEN_SAMPLES_KEY] = {}
+
+    def record_raiden_samples(
+        self, samples: Mapping[str, Sequence[float | int]]
+    ) -> None:
+        raiden_data: dict[str, list[float]] = self.data.setdefault(
+            _RAIDEN_SAMPLES_KEY, {}
+        )
+        for metric_name, values in samples.items():
+            if not values:
+                continue
+            raiden_data.setdefault(str(metric_name), []).extend(
+                float(v) for v in values
+            )
+
+    @classmethod
+    def from_base_stats(
+        cls,
+        base: OffloadingConnectorStats | None,
+        raiden_samples: Mapping[str, Sequence[float | int]] | None = None,
+    ) -> RaidenOffloadingConnectorStats | None:
+        stats = cls()
+        if base is not None and not base.is_empty():
+            stats.aggregate(base)
+        if raiden_samples:
+            stats.record_raiden_samples(raiden_samples)
+        return None if stats.is_empty() else stats
+
+    def is_empty(self) -> bool:
+        return super().is_empty() and not any(
+            self.data.get(_RAIDEN_SAMPLES_KEY, {}).values()
+        )
+
+    def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        if other.is_empty():
+            return self
+        super().aggregate(other)
+        other_samples = other.data.get(_RAIDEN_SAMPLES_KEY)
+        if isinstance(other_samples, Mapping):
+            self.record_raiden_samples(other_samples)
+        return self
+
+
+class TPURaidenOffloadingPromMetrics(OffloadPromMetrics):
+    """OffloadPromMetrics extended with dynamic `tpu_raiden_*` collectors."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> None:
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        self._raiden_metrics = RaidenDynamicPromMetrics(
+            metric_types=metric_types,
+            labelnames=labelnames,
+            per_engine_labelvalues=self.per_engine_labelvalues,
+            backends=dist_utils.get_raiden_telemetry_backends(vllm_config),
+        )
+
+    @property
+    def dynamic_metrics(self) -> dict[str, tuple[str, Any, list[str]]]:
+        return self._raiden_metrics.dynamic_metrics
+
+    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0) -> None:
+        super().observe(transfer_stats_data, engine_idx=engine_idx)
+        raiden_samples = transfer_stats_data.get(_RAIDEN_SAMPLES_KEY)
+        if isinstance(raiden_samples, Mapping) and raiden_samples:
+            self._raiden_metrics.observe(raiden_samples, engine_idx=engine_idx)
 
 
 # Tier of each sub-block of one `OffloadKey`, as `(source, count)` runs of

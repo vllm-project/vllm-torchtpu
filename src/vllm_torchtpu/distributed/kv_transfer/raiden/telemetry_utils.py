@@ -106,37 +106,6 @@ def _resolve_collector_registry(metric_cls: Any) -> CollectorRegistry | None:
     return None
 
 
-def _lookup_existing_collector(registry: CollectorRegistry, name: str) -> Any | None:
-    """Looks up an existing collector by metric name (including Counter base name).
-
-    Reached only when constructing a collector raised `ValueError`, i.e. the
-    name was registered on `registry` outside `_COLLECTOR_CACHE` (for example
-    by another library sharing the registry). `prometheus_client` has no public
-    lookup API, so this reads the private `_names_to_collectors` map and
-    returns `None` if a future version drops it.
-    """
-    names_map = getattr(registry, "_names_to_collectors", None)
-    if not isinstance(names_map, Mapping):
-        return None
-    collector = names_map.get(name)
-    if collector is None and name.endswith("_total"):
-        collector = names_map.get(name.removesuffix("_total"))
-    return collector
-
-
-def _is_registered(registry: CollectorRegistry, collector: Any) -> bool:
-    """Whether `collector` is still registered on `registry`.
-
-    A cached collector that was unregistered (for example when the stat logger
-    is rebuilt in the same process) must not be reused, or its samples would
-    never reach `/metrics`.
-    """
-    collector_to_names = getattr(registry, "_collector_to_names", None)
-    if not isinstance(collector_to_names, Mapping):
-        return True
-    return collector in collector_to_names
-
-
 def _get_or_create_collector(
     *,
     metric_cls: Any,
@@ -153,9 +122,6 @@ def _get_or_create_collector(
     if registry is not None:
         reg_cache = _COLLECTOR_CACHE.setdefault(registry, {})
         cached = reg_cache.get(name)
-        if cached is not None and not _is_registered(registry, cached[1]):
-            del reg_cache[name]
-            cached = None
         if cached is not None:
             cached_type, cached_obj, cached_labels = cached
             if cached_type == mtype_str and cached_labels == label_tuple:
@@ -176,33 +142,12 @@ def _get_or_create_collector(
         "documentation": documentation,
         "labelnames": labelnames,
     }
+    if mtype_str == METRIC_TYPE_GAUGE:
+        kwargs["multiprocess_mode"] = "mostrecent"
     if buckets is not None:
         kwargs["buckets"] = buckets
 
-    try:
-        collector = metric_cls(**kwargs)
-    except ValueError:
-        if registry is None:
-            raise
-        existing = _lookup_existing_collector(registry, name)
-        if existing is None:
-            # Not a duplicate registration (e.g. an invalid metric or label
-            # name, or bad buckets): surface the original error.
-            raise
-        existing_labels = tuple(getattr(existing, "_labelnames", ()) or ())
-        existing_type = getattr(existing, "_type", None)
-        if existing_type != mtype_str or existing_labels != label_tuple:
-            logger.warning(
-                "Skipping Raiden collector %s: name already registered with "
-                "type=%s labels=%s, requested type=%s labels=%s",
-                name,
-                existing_type,
-                existing_labels,
-                mtype_str,
-                label_tuple,
-            )
-            return None
-        collector = existing
+    collector = metric_cls(**kwargs)
 
     if reg_cache is not None:
         reg_cache[name] = (mtype_str, collector, label_tuple)
@@ -217,6 +162,7 @@ class RaidenDynamicPromMetrics:
         metric_types: Mapping[type[Any], Any],
         labelnames: Sequence[str] | None,
         per_engine_labelvalues: dict[int, list[object]] | None,
+        backends: Sequence[str] | None = None,
     ) -> None:
         self._gauge_cls = metric_types[Gauge]
         self._counter_cls = metric_types[Counter]
@@ -225,6 +171,11 @@ class RaidenDynamicPromMetrics:
         self.per_engine_labelvalues: dict[int, list[object]] = (
             per_engine_labelvalues or {}
         )
+        self._backends: list[str] = (
+            list(dist_utils.DEFAULT_RAIDEN_TELEMETRY_BACKENDS)
+            if backends is None
+            else list(backends)
+        )
         self.dynamic_metrics: dict[str, tuple[str, Any, list[str]]] = (
             self._build_metric_definitions()
         )
@@ -232,7 +183,7 @@ class RaidenDynamicPromMetrics:
     def _build_metric_definitions(
         self,
     ) -> dict[str, tuple[str, Any, list[str]]]:
-        if not dist_utils.is_raiden_buffered_telemetry_enabled():
+        if not dist_utils.is_raiden_buffered_telemetry_enabled(self._backends):
             return {}
 
         metric_defs: dict[str, tuple[str, Any, list[str]]] = {}
@@ -240,7 +191,7 @@ class RaidenDynamicPromMetrics:
         try:
             # Ensure C++ telemetry metadata is initialized before reading
             # descriptors.
-            dist_utils.configure_raiden_telemetry()
+            dist_utils.configure_raiden_telemetry(backends=self._backends)
             telemetry = dist_utils.get_raiden_telemetry_module()
             if telemetry is not None and hasattr(telemetry, "get_metric_metadata"):
                 descriptors = list(telemetry.get_metric_metadata() or [])
@@ -256,6 +207,17 @@ class RaidenDynamicPromMetrics:
             metric_label_names = [
                 lbl for lbl in raw_metric_labels if lbl not in self.base_labels
             ]
+            # Worker-side gauges without a rank label receive `local_rank` at
+            # drain time so TP > 1 workers export distinct series instead of
+            # overwriting one another.
+            if (
+                mtype_str == METRIC_TYPE_GAUGE
+                and "local_rank" not in metric_label_names
+                and "rank" not in metric_label_names
+                and "local_rank" not in self.base_labels
+                and "rank" not in self.base_labels
+            ):
+                metric_label_names.append("local_rank")
             combined_labels = self.base_labels + metric_label_names
 
             buckets_val: Sequence[float] | None = None

@@ -28,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
 
+from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
     RaidenDynamicPromMetrics,
 )
@@ -316,6 +317,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             metric_types=metric_types,
             labelnames=labelnames,
             per_engine_labelvalues=self.per_engine_labelvalues,
+            backends=dist_utils.get_raiden_telemetry_backends(vllm_config),
         )
 
     @property
