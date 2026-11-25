@@ -545,6 +545,19 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         scheduler = peer_replay_scheduler(pairs[0][0].vllm_config if pairs else None)
         if scheduler == "claims":
+            cc = (
+                getattr(pairs[0][0].vllm_config, "compilation_config", None)
+                if pairs
+                else None
+            )
+            cache_dir = getattr(cc, "cache_dir", None)
+            if (
+                cache_dir
+                and os.path.basename(os.path.dirname(cache_dir)) == "profile_cache"
+            ):
+                compile_rotated(pairs, local_rank)
+                return
+
             from vllm_torchtpu.compilation.peer_replay import compile_claimed
 
             # Without claims, fall back to the rotated order, which never waits

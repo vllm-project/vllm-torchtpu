@@ -859,3 +859,59 @@ def test_peer_replay_prunes_each_cache_root_once_per_process(
     assert not (
         tmp_path / "torch_compile_cache" / "hash1" / "peer_claims" / "old_run"
     ).exists()
+
+
+def test_claims_profile_cache_compiles_without_peer_claims(
+    compile_all_ranges, tmp_path, monkeypatch
+):
+    """Profile-run buckets under profile_cache must compile in every engine."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.compilation import peer_replay
+    from vllm_torchtpu.runner.utils import PEER_REPLAY_RUN_ID_KEY
+
+    monkeypatch.setattr(envs, "TPU_PARALLEL_PRECOMPILE", True)
+    monkeypatch.setattr(envs, "TPU_PRECOMPILE_PEER_REPLAY", True)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    claimed_calls = []
+    monkeypatch.setattr(
+        peer_replay,
+        "compile_claimed",
+        lambda *args, **kwargs: claimed_calls.append(args) or True,
+    )
+
+    compiled_ranges = []
+    profile_dir = tmp_path / "profile_cache" / "hash1"
+    vllm_config = SimpleNamespace(
+        additional_config={
+            "peer_replay_scheduler": "claims",
+            PEER_REPLAY_RUN_ID_KEY: "run1",
+        },
+        compilation_config=SimpleNamespace(cache_dir=str(profile_dir)),
+    )
+    backend = SimpleNamespace(
+        graph=object(),
+        vllm_config=vllm_config,
+        range_entries={
+            Range(16, 16): piecewise_backend.RangeEntry(compile_range=Range(16, 16))
+        },
+        vllm_backend=SimpleNamespace(
+            compiler_manager=SimpleNamespace(
+                compile=lambda *a, **k: (compiled_ranges.append(a) or (lambda *x: x)),
+                disable_cache=False,
+                compiler=SimpleNamespace(
+                    cache_dir=str(profile_dir / "rank_0_0" / "backbone")
+                ),
+            ),
+            inductor_config={},
+            is_encoder=False,
+        ),
+        compilation_config=None,
+        piecewise_compile_index=0,
+        total_piecewise_compiles=1,
+        _log_compile_start=lambda compile_range: None,
+    )
+    compile_all_ranges(backend)
+
+    assert claimed_calls == []
+    assert len(compiled_ranges) == 1
