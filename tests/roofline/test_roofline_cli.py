@@ -739,4 +739,17 @@ def test_cli_solve_and_ceiling_support_chip_spec_and_dtype_overrides(
             "binding_unit": cand["binding"],
             "slo_met": cand["slo_met"],
             "is_pareto": cand["is_pareto"],
+            "decode_topology": cand["decode_pool"]["topology"],
+            "decode_parallelism": row["decode_parallelism"],
+            "prefill_topology": (
+                cand["prefill_pool"]["topology"]
+                if cand["prefill_pool"] is not None
+                else None
+            ),
+            "prefill_parallelism": row["prefill_parallelism"],
         }
+        assert row["decode_parallelism"]
+        if cand["prefill_pool"] is None:
+            assert row["prefill_parallelism"] is None
+        else:
+            assert row["prefill_parallelism"]

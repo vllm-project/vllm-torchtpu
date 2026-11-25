@@ -18,7 +18,7 @@ from __future__ import annotations
 import copy
 import json
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -77,13 +77,6 @@ def load_locked_geometry(
     return from_hf_config(_read_fixture_json(fixture_name))
 
 
-def load_locked_dtypes(
-    fixture_name: str = "qwen3_5_397b_fp8.json",
-) -> Dtypes:
-    """Derive Dtypes from one of the 4 locked basis HF checkpoint configs."""
-    return dtypes_from_hf_config(_read_fixture_json(fixture_name))
-
-
 def load_locked_bundle(
     fixture_name: str = "qwen3_5_397b_fp8.json",
 ) -> LockedBundle:
@@ -115,31 +108,6 @@ def modules_by_name(
     return {
         module.name: module for module in pass_costs(geometry, parallel, shape, dtypes)
     }
-
-
-def make_dense_from_locked(
-    fixture_name: str = "qwen3_5_397b_fp8.json",
-    *,
-    num_layers: int = 4,
-    dense_inter: int = 8192,
-) -> ModelGeometry:
-    """Derive a pure dense full-attention geometry from a locked fixture."""
-    base = load_locked_geometry(fixture_name)
-    return replace(
-        base,
-        num_layers=num_layers,
-        layer_types=("full_attention",) * num_layers,
-        num_experts=0,
-        top_k=0,
-        moe_inter=0,
-        shared_inter=0,
-        dense_inter=dense_inter,
-        first_k_dense_replace=0,
-        ffn_kinds=("dense",) * num_layers,
-        n_moe_layers=0,
-        n_dense_layers=num_layers,
-        mtp_layers=0,
-    )
 
 
 @pytest.fixture

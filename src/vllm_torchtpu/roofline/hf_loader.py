@@ -293,8 +293,8 @@ def _extract_base_and_ssm_dtypes(
     config: Mapping[str, object],
     *,
     has_qcfg: bool = False,
-) -> tuple[float, float, str]:
-    """Extract standard base model and SSM state byte sizes from config."""
+) -> tuple[float, float, str, str, Literal["config", "default"]]:
+    """Extract base model and SSM state byte widths, dtype labels, and source."""
     scopes = (text_config, config) if text_config is not config else (text_config,)
     raw_dtype = _first_non_none(scopes, "dtype", "torch_dtype") or (
         "bfloat16" if has_qcfg else None
@@ -316,9 +316,13 @@ def _extract_base_and_ssm_dtypes(
             msg = f"Unknown mamba_ssm_dtype: {ssm_dtype_raw!r}"
             raise ValueError(msg)
         state_b = BASE_DTYPE_BYTES[ssm_name]
+        state_name = ssm_name
+        state_src: Literal["config", "default"] = "config"
     else:
         state_b = DEFAULT_SSM_STATE_BYTES
-    return base_b, state_b, base_name
+        state_name = "float32"
+        state_src = "default"
+    return base_b, state_b, base_name, state_name, state_src
 
 
 def _to_int(value: object, default: int = 0) -> int:
@@ -998,7 +1002,7 @@ def dtypes_from_hf_config(config: Mapping[str, object]) -> Dtypes:
         qcfg = {**qcfg, "expert_dtype": raw_expert_dt}
     has_qcfg = len(qcfg) > 0
 
-    base_b, state_b, base_name = _extract_base_and_ssm_dtypes(
+    base_b, state_b, base_name, state_name, state_src = _extract_base_and_ssm_dtypes(
         text_config, config, has_qcfg=has_qcfg
     )
     if not has_qcfg:
@@ -1016,9 +1020,11 @@ def dtypes_from_hf_config(config: Mapping[str, object]) -> Dtypes:
             w_dense_source="default",
             w_expert_source="default",
             kv_source="default",
+            state_source=state_src,
             w_dense_dtype=base_name,
             w_expert_dtype=base_name,
             kv_dtype=base_name,
+            state_dtype=state_name,
         )
 
     dense_qp, expert_qp = _extract_role_quant_params(qcfg)
@@ -1077,9 +1083,11 @@ def dtypes_from_hf_config(config: Mapping[str, object]) -> Dtypes:
         w_dense_source=w_dense_src,
         w_expert_source=w_expert_src,
         kv_source=kv_src,
+        state_source=state_src,
         w_dense_dtype=w_dense_dt,
         w_expert_dtype=w_expert_dt,
         kv_dtype=kv_dt,
+        state_dtype=state_name,
     )
 
 

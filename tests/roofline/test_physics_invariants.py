@@ -25,6 +25,7 @@ from vllm_torchtpu.roofline import (
     CHIPS,
     TOPOLOGIES,
     TrafficScenario,
+    build_solve_payload,
     solve_serving_plan,
 )
 from vllm_torchtpu.roofline.memory import (
@@ -339,6 +340,7 @@ def test_basis_models_physics_legality_and_ordering_invariants(
         assert point.decode_pool.hbm_used_gb <= point.decode_pool.hbm_limit_gb + 1e-6
         assert point.est_ttft_ms > 0.0
         assert point.est_tpot_ms > 0.0
+    payload_inter = build_solve_payload(splan_inter, chip=chip, top_k=3)
     for concurrency in scenario.concurrencies:
         at_c_tput = [
             point_item
@@ -350,7 +352,13 @@ def test_basis_models_physics_legality_and_ordering_invariants(
             for point_item in splan_inter.candidates
             if point_item.concurrency == concurrency
         ]
-        assert len(at_c_inter) == min(len(at_c_tput), 3)
+        payload_at_c_inter = [
+            point_item
+            for point_item in payload_inter["candidates"]
+            if point_item["concurrency"] == concurrency
+        ]
+        assert len(at_c_inter) == len(at_c_tput)
+        assert len(payload_at_c_inter) == min(len(at_c_tput), 3)
         if at_c_tput:
             assert any(point_item.is_pareto for point_item in at_c_tput)
             assert [
