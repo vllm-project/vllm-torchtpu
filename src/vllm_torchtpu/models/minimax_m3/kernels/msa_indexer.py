@@ -909,9 +909,13 @@ class _ClassPlan(NamedTuple):
 
 
 def is_prefill_step(num_tokens: int, max_num_seqs: int) -> bool:
-    """More rows than a batch of decode requests: `block_scores` scores both
-    tile classes unconditionally."""
-    return num_tokens > max_num_seqs * _SMALL_TILE_Q
+    """At least `max_num_seqs` full small tiles of rows (decode requests of
+    1 + 7 MTP tokens fill an eighth of a tile per folded head): `block_scores`
+    scores both tile classes unconditionally. The bound is inclusive: a
+    2048-token step of two folded heads at 64 requests (4,096 rows) is a
+    mixed step, and the token-order path gathered all its block scores back
+    to token order (~76 us per layer, twin j-8b2aa6c0)."""
+    return num_tokens >= max_num_seqs * _SMALL_TILE_Q
 
 
 def class_plan(
