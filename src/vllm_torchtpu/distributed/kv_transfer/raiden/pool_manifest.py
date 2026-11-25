@@ -1827,8 +1827,16 @@ def _build_dsv41_pool_manifest(
                             base_offset_bytes=plane_offset,
                             block_stride_bytes=stride_bytes,
                             num_blocks=num_blocks,
+                            # Each half-page travels whole. Since #2970 the
+                            # shared word pool packs SWA as token pairs (four
+                            # 128-word rows per pair, even/odd token in the
+                            # low/high 16 bits), so a row prefix of a partial
+                            # tail page is not a token prefix: shipping n rows
+                            # for n tokens left part of the last pair unwritten
+                            # on the receiver (NaN logits on some prompts).
+                            # Whole pages are exact whatever the packing.
                             regions=_dsv4_row_region(
-                                row_bytes=plane_row_bytes, num_rows=plane_rows
+                                row_bytes=plane_rows * plane_row_bytes, num_rows=1
                             ),
                             dtype_tag=_dtype_tag(raw),
                         )
@@ -1871,7 +1879,10 @@ def _build_dsv41_pool_manifest(
                 layer_name,
             )
             unit_rows, unit_bytes = rows, row_bytes
-            if packed_fp8_index:
+            if packed_fp8_index or tag_base == TAG_DSV4_SWA:
+                # Whole pages: packed Index-K is transposed, and SWA pages share
+                # the token-pair word packing (see the plane-major branch), so
+                # neither has a row prefix that equals a token prefix.
                 unit_rows, unit_bytes = 1, live_bytes
             elif layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX):
                 # Halfplane Index-K packs two records into each int32[128]

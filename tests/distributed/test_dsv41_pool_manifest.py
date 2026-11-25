@@ -147,19 +147,22 @@ def test_swa_pages_are_two_plane_pools_under_csa2():
     assert p0.block_stride_bytes == p1.block_stride_bytes == PAGE_BYTES
     assert p0.live_bytes_per_block == p1.live_bytes_per_block == 32 * 512
 
-    # A partial page: every byte the kernel wrote for the live tokens must be
-    # inside the transferred ranges, and no byte of a dead token may be.
+    # Each half-page is one unit, so even a partial tail page travels whole:
+    # the word pool packs SWA tokens in pairs, and a row prefix of a partial
+    # page would miss bytes of the last pair.
+    assert p0.regions[0].num_units == p1.regions[0].num_units == 1
+    assert p0.regions[0].unit_bytes == p1.regions[0].unit_bytes == 32 * 512
     block, live = 3, 5
     ranges = _live_byte_ranges(p0, block, live, 32) + _live_byte_ranges(p1, block, live, 32)
     for token in range(32):
         for start, size in swa_token_bytes(block, token):
-            assert _covered(ranges, start, size) == (token < live), (token, start)
+            assert _covered(ranges, start, size), (token, start)
 
 
-def test_swa_without_csa2_keeps_the_view_rows():
+def test_swa_without_csa2_travels_whole_pages():
     manifest = _build(csa2=False)
     swa = _pool(manifest, "dsv4.swa.g0")
-    assert swa.regions[0].unit_bytes == 1024 and swa.regions[0].num_units == 32
+    assert swa.regions[0].unit_bytes == 32 * 1024 and swa.regions[0].num_units == 1
 
 
 def test_compressor_ring_pool_is_one_whole_block():
@@ -196,13 +199,14 @@ def _build_with(materialized_overrides):
         dsv41_materialized_kv=materialized)
 
 
-def test_layer_without_csa2_keeps_token_rows():
+def test_layer_without_csa2_keeps_one_pool():
     """A layer whose attention does not run CSA2 (`_csa2=False`, e.g. the two
-    compressor-less layers 0..1 of V4.1 Flash) keeps token-major 1024-byte
-    SWA rows even while CSA2 layers write plane-major."""
+    compressor-less layers 0..1 of V4.1 Flash) keeps a single SWA pool (no
+    plane split) even while CSA2 layers write plane-major; its pages travel
+    whole like every SWA page."""
     manifest = _build_with({"csa2_layers": frozenset({"model.layers.9.attn"})})
     swa = _pool(manifest, "dsv4.swa.g0")
-    assert swa.regions[0].unit_bytes == 1024 and swa.regions[0].num_units == 32
+    assert swa.regions[0].unit_bytes == 32 * 1024 and swa.regions[0].num_units == 1
 
 
 def test_exact_swa_word_flag_wins_over_owner_heuristic():
@@ -210,7 +214,7 @@ def test_exact_swa_word_flag_wins_over_owner_heuristic():
     assert {p.tag for p in planes.pools} >= {"dsv4.swa.p0.g0", "dsv4.swa.p1.g0"}
     rows = _build_with({"csa2_layers": frozenset({ATTN}),
                         "swa_word_layers": frozenset({"model.layers.9.attn.swa_cache"})})
-    assert _pool(rows, "dsv4.swa.g0").regions[0].unit_bytes == 1024
+    assert _pool(rows, "dsv4.swa.g0").regions[0].num_units == 1
 
 
 def test_ring_groups_are_slot_groups_in_the_transfer_plan():

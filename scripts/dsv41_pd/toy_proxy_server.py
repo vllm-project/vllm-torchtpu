@@ -177,6 +177,12 @@ async def _post_with_retries(
             response = await client_info["client"].post(
                 endpoint, **_json_body(req_data, headers)
             )
+            if response.status_code >= 400:
+                print(
+                    f"PROXY {phase} {request_id} -> HTTP {response.status_code}: "
+                    f"{response.text[:2000]}",
+                    flush=True,
+                )
             response.raise_for_status()
             return response
         except _PRE_SEND_ERRORS as e:
@@ -613,6 +619,11 @@ async def stream_from_decode(
                     # Streaming responses are not read on entry, so pull the
                     # body first or the raised error carries no vLLM detail.
                     await response.aread()
+                    print(
+                        f"PROXY decode {request_id} -> HTTP "
+                        f"{response.status_code}: {response.text[:2000]}",
+                        flush=True,
+                    )
                 response.raise_for_status()
                 encoder = _AsciiSafeStreamEncoder()
                 async for chunk in response.aiter_bytes():

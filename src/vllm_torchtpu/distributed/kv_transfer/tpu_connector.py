@@ -3348,6 +3348,35 @@ class TPURaidenConnectorWorker:
         self._raiden_transfer_engine = engine
         self._raiden_manifest = manifest
         self._stage3_dsv4_plan = self._measure_dsv4_pool_plan(manifest, kv_cache_groups)
+        if self.dp_rank == 0:
+            # One line per KV cache group: what it is and which plan tags move
+            # it, so a group the transfer never covers is visible at startup.
+            plan_tags_by_group: dict[int, list[str]] = {}
+            for pool in self._stage3_dsv4_plan:
+                plan_tags_by_group.setdefault(int(pool.plan_position), []).append(
+                    str(pool.tag)
+                )
+            for index, group in enumerate(kv_cache_groups):
+                leaf = _stage3_leaf_spec(group.kv_cache_spec)
+                logger.info(
+                    "Stage-3 DSv4 group g%d: spec=%s/%s block=%s prefix_cacheable=%s "
+                    "layers=%d first=%s plan_tags=%s",
+                    index,
+                    type(group.kv_cache_spec).__name__,
+                    type(leaf).__name__,
+                    getattr(leaf, "block_size", None),
+                    getattr(group.kv_cache_spec, "prefix_cacheable", None),
+                    len(group.layer_names),
+                    group.layer_names[0] if group.layer_names else None,
+                    sorted(
+                        {
+                            tag
+                            for pos, tags in plan_tags_by_group.items()
+                            for tag in tags
+                            if tag.endswith(f".g{index}")
+                        }
+                    ),
+                )
 
         counts = manifest.tag_counts()
         geometry = manifest.geometry_by_tag()
