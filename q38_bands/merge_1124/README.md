@@ -91,6 +91,8 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
 |---|---|---|---|
 | `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` (clean merge) | `5140ebd562` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above |
 
+- QGLUE-1 in `b1`: a device STEP cut of record; no served gain shown at B1 c212 (within the measured A/A noise floor:
+  span 2.34 ms, Mtok/$ ~1.5 %).
 - `b1` is a merge that has not yet run on a device: no served car stacks QGLUE-1 with SB1-1 on `b1` before one device
   bitwise check on `b1`.
 - To work on a lineage: branch from `caojx/qwen38-flash-1124`, edit `src/vllm_torchtpu/_forms/<form>/vllm_torchtpu/`,
