@@ -21,7 +21,7 @@ attention classes whose ``forward`` feeds ``self.attn(...)`` directly to
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import jax.numpy as jnp
 import torch
@@ -82,7 +82,9 @@ def fused_attn_out_fp8_enabled(vllm_config: VllmConfig | None) -> bool:
     """Parse ``additional_config['tpu_fused_attn_out_fp8']``; non-bool raises."""
     if vllm_config is None:
         return False
-    additional_config = cast("dict[str, Any]", vllm_config.additional_config)
+    additional_config = vllm_config.additional_config
+    if not isinstance(additional_config, dict):
+        return False
     value = additional_config.get(FUSED_ATTN_OUT_FP8_KEY, False)
     if not isinstance(value, bool):
         raise ValueError(
@@ -116,13 +118,15 @@ def _attn_out_head_layout(
         return None
     if getattr(o_proj, KEEP_VLLM_LAYOUT_ATTR, False):
         return None
+    weight = o_proj.weight
+    assert isinstance(weight, torch.Tensor)
     if (
-        not o_proj.weight.dtype.is_floating_point
-        or o_proj.weight.dtype.itemsize != 1
+        not weight.dtype.is_floating_point
+        or weight.dtype.itemsize != 1
         or o_proj.weight_scale.ndim != 1
     ):
         return None
-    quant_dtype = _torch_to_jax_dtype(o_proj.weight.dtype)
+    quant_dtype = _torch_to_jax_dtype(weight.dtype)
     if quant_dtype is None:
         return None
     q_per_kv, remainder = divmod(attn.num_heads, attn.num_kv_heads)

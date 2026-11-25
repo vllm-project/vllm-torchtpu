@@ -141,6 +141,8 @@ def test_quantize_attn_out_validation_errors(
     "vllm_config,expected",
     [
         (None, False),
+        (SimpleNamespace(additional_config=None), False),
+        (MagicMock(), False),
         (SimpleNamespace(additional_config={}), False),
         (SimpleNamespace(additional_config={FUSED_ATTN_OUT_FP8_KEY: False}), False),
         (SimpleNamespace(additional_config={FUSED_ATTN_OUT_FP8_KEY: True}), True),
