@@ -184,9 +184,10 @@ def host_placement() -> dict:
             continue
         name = stat[stat.index("(") + 1 : stat.rindex(")")]
         fields = stat[stat.rindex(")") + 2 :].split()
+        # Other status lines may hold any number of colons (thread names).
         switches = {
             k: int(v)
-            for k, v in (line.split(":") for line in status.splitlines())
+            for k, _, v in (line.partition(":") for line in status.splitlines())
             if k in ("voluntary_ctxt_switches", "nonvoluntary_ctxt_switches")
         }
         cpu = int(fields[36])
