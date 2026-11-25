@@ -213,14 +213,9 @@ class WeightsRef(RhsRef):
 
     def get_scale(self, replicate_size: int | None = None) -> jax.Array:
         assert self.scale is not None
-        if self.global_scale is not None:
-            # E4M3 block scales only: the global scale multiplies the
-            # accumulator. Convert the dense [blocks, tn] block first.
-            if self.scale.dtype == jnp.uint8:
-                scale = lax.bitcast_convert_type(self.scale[...], jnp.float8_e4m3fn)
-            else:
-                scale = self.scale[:, 0, :]
-            scale = scale.astype(jnp.float32)[:, None, :]
+        if self.scale.dtype == jnp.float8_e4m3fn:
+            # Compact E4M3 scales: convert the dense [blocks, tn] block first.
+            scale = self.scale[...].astype(jnp.float32)[:, None, :]
             if replicate_size is not None:
                 scale = jnp.broadcast_to(
                     scale, (scale.shape[0], replicate_size, scale.shape[-1])
@@ -943,6 +938,10 @@ def kernel_main(
     if cfgs.rhs_cfgs.should_unpack:
         rhs_weight = rhs_ref.weight.bitcast(cfgs.rhs_cfgs.quant_dtype)
         rhs_ref = dataclasses.replace(rhs_ref, weight=rhs_weight)
+    if cfgs.rhs_cfgs.has_compact_scale:
+        assert rhs_ref.scale is not None
+        rhs_scale = rhs_ref.scale.bitcast(jnp.float8_e4m3fn)
+        rhs_ref = dataclasses.replace(rhs_ref, scale=rhs_scale)
 
     # Fill metadata buffer and return number of group & m interations.
     num_gm = fill_metadata(
@@ -1507,9 +1506,7 @@ def gmm_v2(
     if rhs_global_scale is not None:
         if (
             rhs_scale is None
-            or not (
-                rhs_scale.dtype == jnp.float8_e4m3fn or cfgs.rhs_cfgs.has_compact_scale
-            )
+            or not cfgs.rhs_cfgs.has_compact_scale
             or rhs_global_scale.dtype != jnp.float32
             or rhs_global_scale.shape != (dims.size_group, 1, dims.size_n)
         ):
@@ -1519,7 +1516,7 @@ def gmm_v2(
                 else f"dtype {rhs_scale.dtype}, shape {rhs_scale.shape}"
             )
             raise ValueError(
-                "Global scales require E4M3 block scales (FP8 or compact uint8) and "
+                "Global scales require E4M3 block scales (compact uint8) and "
                 f"FP32 [{dims.size_group}, 1, {dims.size_n}] global scales; got block "
                 f"scales {scale_desc}, global scales dtype {rhs_global_scale.dtype}, "
                 f"shape {rhs_global_scale.shape}"

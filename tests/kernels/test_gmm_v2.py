@@ -627,7 +627,6 @@ def _assert_bitwise_equal(actual, expected) -> None:
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("compact_scale", [True, False], ids=["uint8_3d", "fp8_4d"])
 @pytest.mark.parametrize(
     "tile_info",
     [
@@ -636,17 +635,14 @@ def _assert_bitwise_equal(actual, expected) -> None:
     ],
     ids=["auto_tiles", "split_k_and_n"],
 )
-def test_gmm_v2_nvfp4_global_scale_decodes_every_weight(compact_scale, tile_info):
+def test_gmm_v2_nvfp4_global_scale_decodes_every_weight(tile_info):
     _require_tpu()
 
     num_groups, size_k, size_n = 4, 1024, 512
     packed, scale = make_nvfp4_rhs(jax.random.key(0), num_groups, size_k, size_n)
     global_scale = make_global_scale(jax.random.key(1), num_groups, size_n)
     expected = dequantize_nvfp4_kmajor(packed, scale, global_scale, jnp.bfloat16)
-    if compact_scale:
-        rhs_scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
-    else:
-        rhs_scale = scale[:, :, None, :]
+    rhs_scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
 
     actual = read_back_nvfp4_rhs(
         packed,
@@ -659,8 +655,7 @@ def test_gmm_v2_nvfp4_global_scale_decodes_every_weight(compact_scale, tile_info
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("compact_scale", [True, False], ids=["uint8_3d", "fp8_4d"])
-def test_gmm_v2_nvfp4_global_scale_matches_dequantized_reference(compact_scale):
+def test_gmm_v2_nvfp4_global_scale_matches_dequantized_reference():
     _require_tpu()
 
     batch_size, num_groups, size_k, size_n = 512, 8, 1024, 512
@@ -672,10 +667,7 @@ def test_gmm_v2_nvfp4_global_scale_matches_dequantized_reference(compact_scale):
     group_sizes = get_group_sizes(batch_size, num_groups)
     with jax.default_matmul_precision("highest"):
         expected = reference_gmm(lhs, rhs, group_sizes)
-    if compact_scale:
-        rhs_scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
-    else:
-        rhs_scale = scale[:, :, None, :]
+    rhs_scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
 
     actual = gmm_v2(
         lhs,
@@ -722,8 +714,7 @@ def test_gmm_v2_compact_scales_with_k_off_512(size_k, tile_info):
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("compact_scale", [True, False], ids=["uint8_3d", "fp8_4d"])
-def test_gmm_v2_nvfp4_global_scale_fused_silu_matches_reference(compact_scale):
+def test_gmm_v2_nvfp4_global_scale_fused_silu_matches_reference():
     """The fused gate/up path slices a per-lane global scale for each half."""
     _require_tpu()
 
@@ -738,10 +729,7 @@ def test_gmm_v2_nvfp4_global_scale_fused_silu_matches_reference(compact_scale):
         reference = reference_gmm(lhs.astype(jnp.float32), rhs, group_sizes)
     gate, up = jnp.split(reference, 2, axis=-1)
     expected = apply_act_fn(interleave_lane(gate, up), "silu").astype(jnp.bfloat16)
-    if compact_scale:
-        rhs_scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
-    else:
-        rhs_scale = scale[:, :, None, :]
+    rhs_scale = jax.lax.bitcast_convert_type(scale, jnp.uint8)
 
     actual = gmm_v2(
         lhs,
