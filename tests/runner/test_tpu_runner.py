@@ -3596,6 +3596,32 @@ def test_unmap_keeps_async_results_until_sample_tokens_waits(
     assert runner.input_batch.token_ids_cpu[0].tolist() == row
 
 
+def test_zero_token_step_keeps_async_results_mapped():
+    """A zero-token step runs no forward, so the previous step's results stay
+    mapped: a request it left out can return in the next step, where vLLM does
+    not resend its tokens, and its placeholders are substituted then."""
+    pre = SimpleNamespace(req_id_to_index_copy={"req-a": 0})
+    runner = SimpleNamespace(
+        execute_model_state=None,
+        _adaptive_verification=None,
+        _update_states=lambda _so: None,
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        input_batch=SimpleNamespace(num_reqs=0, req_ids=[]),
+        _pre_async_results=pre,
+    )
+    runner._unmap_disjoint_async_results = (
+        lambda: TPUModelRunner._unmap_disjoint_async_results(runner)
+    )
+
+    with patch.object(tpu_runner, "has_kv_transfer_group", return_value=False):
+        output = TPUModelRunner.execute_model(
+            runner, SimpleNamespace(total_num_scheduled_tokens=0)
+        )
+
+    assert output is tpu_runner.EMPTY_MODEL_RUNNER_OUTPUT
+    assert pre.req_id_to_index_copy == {"req-a": 0}
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("max_logprobs", [0, 3])
 def test_gather_logprobs_preserves_normalization_precision(dtype, max_logprobs):

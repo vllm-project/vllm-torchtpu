@@ -518,10 +518,10 @@ def _make_kv_connector_output(
 ) -> KVConnectorOutput:
     """Build the runner's KVConnectorOutput.
 
-    ``failed_recving`` needs vLLM >= 0.31 (the pin is v0.33.0).
+    ``failed_recving`` needs vLLM >= 0.31.
     ``invalid_block_group_index`` is passed only when ``KVConnectorOutput``
-    has it. v0.33.0 does not, so it rejects block-level load failures on
-    multi-group KV layouts; connectors for those layouts must report failed
+    has it. The pinned vLLM's does not, so it rejects block-level load failures
+    on multi-group KV layouts; connectors for those layouts must report failed
     requests through ``failed_recving``.
     """
     kwargs: dict[str, Any] = {
@@ -2837,8 +2837,8 @@ class TPUModelRunner(GPUModelRunner):
         requests committed no tokens (partial prefill chunks) or left the batch
         (finished, preempted or not scheduled), as on every step of one-token
         requests. Their rollback records stay: a request that was not scheduled
-        can return in a later step, and vLLM v0.34 no longer resends its tokens
-        (`CachedRequestData.all_token_ids` is gone), so _modify_prev_results()
+        can return in a later step, and vLLM does not resend its tokens then
+        (CachedRequestData carries no token history), so _modify_prev_results()
         must still settle its req_state.output_token_ids. Requests outside the
         batch skip the input_batch write there.
 
@@ -4373,9 +4373,11 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
-        if self.scheduler_config.async_scheduling:
-            self._unmap_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
+            # No forward reads the previous step's results here, so they stay
+            # mapped: a request this step left out can return in the next one,
+            # where vLLM does not resend its tokens, and its unsettled
+            # placeholders are substituted then.
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
             # Even for a zero-token step and if DP lockstep is enabled, we must
@@ -4384,6 +4386,8 @@ class TPUModelRunner(GPUModelRunner):
             # safe to do for a zero-token step since no collectives are
             # triggered.
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+        if self.scheduler_config.async_scheduling:
+            self._unmap_disjoint_async_results()
         if self._mtp_prefill_only:
             # Validate the actual scheduled span before any forward/collective.
             # Ending exactly at the prompt boundary produces the first output;
@@ -9171,7 +9175,7 @@ class TPUModelRunner(GPUModelRunner):
         Groups whose kernel block is smaller than their manager block get a
         `KernelBlockTable`, so the block tables hold the kernel block ids TPU
         attention reads. `kernel_block_sizes` is required; its `None` default
-        only matches the vLLM 0.33.0 base signature.
+        only matches the base `GPUModelRunner` signature.
         """
         if kernel_block_sizes is None:
             raise ValueError("kernel_block_sizes is required on TPU")

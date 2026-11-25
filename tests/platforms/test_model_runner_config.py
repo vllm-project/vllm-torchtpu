@@ -89,6 +89,7 @@ def test_tpu_allows_dspark_adaptive_verification():
         ("lm_head_quantization", "draft lm_head quantization"),
         ("diffusion", "diffusion models"),
         ("step5", "Step5"),
+        ("logits_processors", "custom logits processors"),
         ("batch_sharded", "batch-sharded sampling"),
     ],
 )
@@ -107,15 +108,30 @@ def test_tpu_rejects_what_tpu_model_runner_lacks(feature, reason):
     elif feature == "lm_head_quantization":
         spec.draft_lm_head_quantization = "fp8"
     elif feature == "diffusion":
-        config.model_config = SimpleNamespace(is_diffusion=True, architecture="")
+        config.model_config = SimpleNamespace(
+            is_diffusion=True, architecture="", logits_processors=None
+        )
     elif feature == "step5":
         config.model_config = SimpleNamespace(
-            is_diffusion=False, architecture="Step5ForCausalLM"
+            is_diffusion=False, architecture="Step5ForCausalLM", logits_processors=None
+        )
+    elif feature == "logits_processors":
+        # vLLM's frontend accepts only Model Runner V2 logits processors.
+        config.model_config = SimpleNamespace(
+            is_diffusion=False, architecture="", logits_processors=["pkg.mod:Proc"]
         )
     else:
         config.parallel_config.enable_batch_sharded_sampling = True
     with pytest.raises(ValueError, match=reason):
         _validate_tpu_runner_features(config)
+
+
+@pytest.mark.parametrize("arch", ["DFlash2DraftModel", "Qwen3XPressModel"])
+def test_tpu_allows_dflash_only_draft_architectures_under_other_methods(arch):
+    # XPress refiners and DFlash candidate heads are rejected only under dflash.
+    config = _config(method="eagle3")
+    config.speculative_config.draft_model_config.architectures = [arch]
+    _validate_tpu_runner_features(config)
 
 
 def test_tpu_validate_model_runner_runs_the_tpu_runner_check():

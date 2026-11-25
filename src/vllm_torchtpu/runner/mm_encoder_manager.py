@@ -175,10 +175,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
     ) -> list[int]:
         """Generate power-of-2 token budgets for static XLA compilation.
 
-        Upstream subdivides into 1/4- and 1/8-octave steps because CUDA graphs
-        share one buffer set and capture cheaply. On TPU, every budget holds its
-        own template buffer and runs a full XLA compile (plus an encoder-DP
-        all-gather compile), so keep power-of-2 buckets.
+        vLLM v0.33.0's ``_generate_budgets`` with v0.34.0's ``cap``. Upstream
+        now uses a fine grid (quarter-octave, then 128-token, then 1/8-octave
+        steps) because its CUDA graph captures share one buffer set. On TPU,
+        every budget holds its own template buffer and runs a full XLA compile
+        (plus an encoder-DP all-gather compile), so keep power-of-2 buckets.
         """
         if cap is not None:
             max_budget = min(max_budget, max(cap, min_budget))
@@ -193,8 +194,10 @@ class MMEncoderManager(EncoderCudaGraphManager):
 
     @staticmethod
     def _item_multiple_budgets(item_tokens: int, max_budget: int) -> list[int]:
-        """Keep power-of-2 XLA buckets for fixed-size encoder paths too."""
-        return MMEncoderManager._generate_budgets(item_tokens, max_budget)
+        """Power-of-2 multiples of ``item_tokens`` for a path whose items all
+        have ``item_tokens`` tokens, up to the largest multiple that fits."""
+        max_multiple = max(max_budget // item_tokens, 1) * item_tokens
+        return MMEncoderManager._generate_budgets(item_tokens, max_multiple)
 
     def _pad_to_template(
         self,

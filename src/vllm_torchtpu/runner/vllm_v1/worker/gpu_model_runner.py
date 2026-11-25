@@ -589,9 +589,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        # Remove finished and preempted requests from the cached states. vLLM
-        # >= 0.34 drops a preempted request's worker state and re-sends it in
-        # full in scheduled_new_reqs when it resumes, as Model Runner V2 does.
+        # Remove finished and preempted requests from the cached states. The
+        # scheduler drops a preempted request's worker state and re-sends it
+        # in full in scheduled_new_reqs when it resumes, as Model Runner V2
+        # does.
         removed_req_ids = scheduler_output.finished_req_ids | (
             scheduler_output.preempted_req_ids or set()
         )
@@ -811,9 +812,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             if req_index is None:
                 # The request was not scheduled in the previous step and needs
-                # to be added again. Its cached state is current: TPU settles
-                # async placeholders in req_state (_modify_prev_results) before
-                # the request can be re-added.
+                # to be added again. Under async scheduling TPU has either
+                # settled its placeholders in req_state (_modify_prev_results,
+                # after the forward step it left) or still maps them for
+                # substitution (after zero-token steps).
                 reqs_to_add.append(req_state)
                 continue
 

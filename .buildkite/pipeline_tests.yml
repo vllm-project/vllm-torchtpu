@@ -137,7 +137,7 @@ steps:
       # first run that needs them.
       - label: "Unit Tests - Omni (PR)"
         key: "unit_tests_omni_pr"
-        skip: "Omni is not built on vLLM 0.34 (moving to vllm-omni-torchtpu)"
+        skip: "Omni not built: pinned vllm-omni does not install with pinned vLLM"
         <<: *tpu_step
         depends_on: "build_docker_omni"
         if: 'build.env("NIGHTLY") != "1"'
@@ -227,7 +227,7 @@ steps:
 
       - label: "Unit Tests - Omni (Nightly)"
         key: "unit_tests_omni_nightly"
-        skip: "Omni is not built on vLLM 0.34 (moving to vllm-omni-torchtpu)"
+        skip: "Omni not built: pinned vllm-omni does not install with pinned vLLM"
         <<: *tpu_step
         depends_on: "build_docker_omni"
         if: 'build.env("NIGHTLY") == "1"'
@@ -246,7 +246,7 @@ steps:
 
       - label: "Unit Tests - Omni Multichip (Nightly)"
         key: "unit_tests_omni_multichip_nightly"
-        skip: "Omni is not built on vLLM 0.34 (moving to vllm-omni-torchtpu)"
+        skip: "Omni not built: pinned vllm-omni does not install with pinned vLLM"
         <<: *tpu_step
         depends_on: "build_docker_omni"
         if: 'build.env("NIGHTLY") == "1"'

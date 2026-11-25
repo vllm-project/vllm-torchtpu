@@ -101,8 +101,8 @@ benchmarking = [
 ]
 
 # vLLM-Omni optional dependency. vllm-omni keeps major.minor aligned with vLLM.
-# 0.32.0rc1 is not on PyPI yet; until it is, add the `omni-git` dependency
-# group below, which supplies it from its git tag.
+# Does not install with the pinned vLLM (0.34); kept until the omni code is
+# removed, as omni support moves to vllm-omni-torchtpu.
 omni = [
     "vllm-omni==0.32.0rc1",
     # vllm-omni pulls torchaudio through s3tokenizer. The PyPI torchaudio is a
@@ -137,9 +137,9 @@ vllm = [
     "vllm @ git+https://github.com/vllm-project/vllm.git@v0.34.0",
 ]
 
-# Source for the `omni` extra's vllm-omni==0.32.0rc1 while that release is not
-# on PyPI: install `--extra omni --group omni-git`. Drop this group, and the
-# flag, once it is.
+# Git source for the `omni` extra's vllm-omni==0.32.0rc1, which is not on PyPI.
+# Like the extra, it does not install with the pinned vLLM and goes away with
+# the omni code.
 omni-git = [
     "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.32.0rc1",
 ]

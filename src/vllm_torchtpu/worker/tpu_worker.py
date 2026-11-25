@@ -578,8 +578,8 @@ class TPUWorker(WorkerBase):
             self.model_runner.profile_run(self.model_runner.max_num_tokens)
 
         # VLLM directive of the percentage of HBM memory the model executor can use.
-        # vLLM >= 0.34 leaves gpu_memory_utilization None when unset; the
-        # resolved value applies its default.
+        # gpu_memory_utilization is None when unset; the resolved value applies
+        # its default.
         gpu_memory_utilization = self.cache_config.resolved_gpu_memory_utilization
         budget = utils.compute_hbm_budget(self.devices, gpu_memory_utilization)
 

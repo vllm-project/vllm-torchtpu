@@ -27,6 +27,7 @@ from runner_output_test_utils import (
 )
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.runner import min_tokens
@@ -36,6 +37,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
 )
 from vllm_torchtpu.runner.vllm_v1.sample.logits_processor import LogitsProcessors
+from vllm_torchtpu.runner.vllm_v1.worker import gpu_model_runner
 from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
     CachedRequestState,
     InputBatch,
@@ -444,44 +446,94 @@ def test_update_states_tracks_new_requests_and_forgets_finished_ones():
     assert list(runner._min_tokens.requests) == ["new"]
 
 
-def test_update_states_tracks_preempted_requests_again_on_resume():
-    """vLLM drops a preempted request's worker state and re-sends it as a new
-    request when it resumes: batch_state forgets it once it leaves the runner's
-    requests, `add` registers it again, and its count continues from the output
-    rebuilt from prefill_token_ids."""
+def test_update_states_tracks_preempted_requests_again_on_resume(monkeypatch):
+    """Through the copied GPUModelRunner._update_states: vLLM drops a preempted
+    request's worker state and re-sends it as a new request whose
+    prefill_token_ids carry its settled outputs. The tracker forgets it once it
+    leaves the runner, tracks it again on resume, and counts the rebuilt
+    outputs. A resumed request with outputs computes no prompt logprobs."""
+    monkeypatch.setattr(
+        gpu_model_runner, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
     runner = object.__new__(TPUModelRunner)
-    runner._min_tokens = min_tokens.MinTokensTracker()
-    params = SamplingParams(min_tokens=10, stop_token_ids=[9])
-    runner._min_tokens.add("p", params)
+    runner.device = torch.device("cpu")
+    runner.speculative_config = None
+    runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+    runner.parallel_config = SimpleNamespace(
+        data_parallel_size=1, enable_expert_parallel=False
+    )
+    runner.use_async_scheduling = True
+    runner.use_async_spec_decode = False
+    runner.requests, runner.num_prompt_logprobs = {}, {}
+    runner._pre_async_results = None
+    runner._last_sequence_layout_plan = None
     runner._mamba_state_pos, runner._mamba_slot_by_req_id = {}, {}
     runner._free_mamba_slots, runner._mamba_offset_seeded = [], set()
-    runner._pre_async_results = None
-    runner.requests = {}
     runner._install_spec_token_room_guard = lambda: None
-    resumed = SimpleNamespace(req_id="p", sampling_params=params)
+    runner._min_tokens = min_tokens.MinTokensTracker()
+    runner.input_batch = InputBatch(
+        max_num_reqs=4,
+        max_model_len=128,
+        max_num_batched_tokens=32,
+        device=torch.device("cpu"),
+        vocab_size=160000,
+        block_sizes=[16],
+        max_num_blocks_per_req=[8],
+        logitsprocs=LogitsProcessors(),
+        logitsprocs_need_output_token_ids=False,
+    )
+    runner.late_interaction_runner = SimpleNamespace(
+        on_requests_finished=lambda _ids: None,
+        register_request=lambda _rid, _params: None,
+    )
+    runner.encoder_cache = {}
+    runner.is_pooling_model = runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    runner._may_reorder_batch = lambda _output: None
 
-    def step(preempted, new_reqs):
-        scheduler_output = SimpleNamespace(
-            finished_req_ids=set(),
-            preempted_req_ids=preempted,
-            kv_cache_block_copies=None,
-            scheduled_new_reqs=new_reqs,
-        )
-        with patch.object(GPUModelRunner, "_update_states", return_value=None):
-            TPUModelRunner._update_states(runner, scheduler_output)
+    prompt = [1, 2, 3, 4]
+    params = SamplingParams(min_tokens=10, stop_token_ids=[9], prompt_logprobs=1)
 
-    # Preempted: gone from the runner's requests, so batch_state drops it.
-    step({"p"}, [])
-    assert runner._min_tokens.batch_state({}, lambda _: None) == {}
+    def schedule_new(block_id, prefill_token_ids):
+        output = SchedulerOutput.make_empty()
+        output.num_scheduled_tokens = {"p": len(prefill_token_ids)}
+        output.total_num_scheduled_tokens = len(prefill_token_ids)
+        output.scheduled_new_reqs = [
+            NewRequestData(
+                req_id="p",
+                prompt_token_ids=list(prompt),
+                mm_features=[],
+                sampling_params=params,
+                pooling_params=None,
+                block_ids=([block_id],),
+                num_computed_tokens=0,
+                lora_request=None,
+                prefill_token_ids=list(prefill_token_ids),
+            )
+        ]
+        runner._update_states(output)
+
+    schedule_new(1, prompt)
+    assert "p" in runner.num_prompt_logprobs
+    index = runner.input_batch.req_id_to_index["p"]
+    assert runner._min_tokens_batch_state() == {index: (10, 0, (9,), False)}
+
+    # Preempted: gone from the runner's requests, so the tracker drops it.
+    preempt = SchedulerOutput.make_empty()
+    preempt.preempted_req_ids = {"p"}
+    runner._update_states(preempt)
+    assert "p" not in runner.requests
+    assert "p" not in runner.num_prompt_logprobs
+    assert runner._min_tokens_batch_state() == {}
     assert not runner._min_tokens.requests
 
-    # Resumed as a new request: tracked again, and 3 rebuilt outputs of
+    # Resumed as a new request: tracked again, and its 3 rebuilt outputs of
     # min_tokens=10 still mask the stop token.
-    step(None, [resumed])
-    assert list(runner._min_tokens.requests) == ["p"]
-    assert runner._min_tokens.batch_state({"p": 0}, lambda _: 3) == {
-        0: (10, 3, (9,), False)
-    }
+    schedule_new(2, [*prompt, 20, 21, 22])
+    assert runner.requests["p"].output_token_ids == [20, 21, 22]
+    assert "p" not in runner.num_prompt_logprobs
+    index = runner.input_batch.req_id_to_index["p"]
+    assert runner._min_tokens_batch_state() == {index: (10, 3, (9,), False)}
 
 
 def _precompile_runner(speculative_config, mtp_prefill_only):

@@ -216,10 +216,10 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
 
 _dynamic_compile_unwrapped = False
 
-# Draft architectures TPUModelRunner does not implement, with the method they
-# need (None: any). XPress refiners and DFlash candidate heads exist only in
-# vLLM's GPU speculator, so TPU's DFlashProposer would serve them as plain
-# DFlash.
+# Draft architectures TPUModelRunner does not implement: their feature name and
+# the speculative method under which they are rejected (None: any method).
+# XPress refiners and DFlash candidate heads exist only in vLLM's GPU
+# speculator, so TPU's DFlashProposer would serve them as plain DFlash.
 _UNSUPPORTED_DRAFT_ARCHITECTURES: dict[str, tuple[str, str | None]] = {
     "Qwen3XPressModel": ("xpress speculative decoding", "dflash"),
     "DFlashQwen3XPressModel": ("xpress speculative decoding", "dflash"),
@@ -238,11 +238,12 @@ _UNSUPPORTED_ARCHITECTURES = {
 def _tpu_async_scheduling_incompatibility(vllm_config: VllmConfig) -> str | None:
     """Feature incompatible with TPUModelRunner's async scheduling, or None.
 
-    vLLM v0.33.0 disabled unrequested async scheduling (``async_scheduling is
-    None``) for these on the V1 model runner before ``check_and_update_config``;
-    v0.34.0 removed V1 and enables async scheduling unconditionally there.
-    Explicit ``async_scheduling=True`` is left alone so the platform and runner
-    validators still reject it.
+    These are what ``check_and_update_config`` and the PP validation reject
+    under async scheduling: speculative methods other than the EAGLE-style ones,
+    and pipeline parallelism. vLLM v0.34.0 turns unrequested async scheduling
+    (``async_scheduling is None``) on for them, so TPU turns it off first.
+    Explicit ``async_scheduling=True`` is left alone so those validators still
+    reject it.
     """
     spec = vllm_config.speculative_config
     if spec is not None and not spec.use_eagle():
@@ -272,15 +273,21 @@ def _validate_tpu_runner_features(vllm_config: VllmConfig) -> None:
             unsupported.append("draft lm_head quantization")
         draft_config = spec.draft_model_config
         for arch in (draft_config.architectures or []) if draft_config else []:
-            feature, method = _UNSUPPORTED_DRAFT_ARCHITECTURES.get(arch, ("", ""))
-            if feature and method in (None, spec.method):
-                unsupported.append(feature)
+            entry = _UNSUPPORTED_DRAFT_ARCHITECTURES.get(arch)
+            if entry is not None and entry[1] in (None, spec.method):
+                unsupported.append(entry[0])
     model_config = vllm_config.model_config
     if model_config is not None:
         if model_config.is_diffusion:
             unsupported.append("diffusion models")
         if model_config.architecture in _UNSUPPORTED_ARCHITECTURES:
             unsupported.append(_UNSUPPORTED_ARCHITECTURES[model_config.architecture])
+        # vLLM's frontend loads only Model Runner V2 LogitsProcessor
+        # subclasses, while TPUModelRunner's V1 copy runs only the V1
+        # interface, so no class works until TPU moves onto Model Runner V2:
+        # https://github.com/vllm-project/vllm-torchtpu/issues/3723
+        if model_config.logits_processors:
+            unsupported.append("custom logits processors")
     if vllm_config.parallel_config.enable_batch_sharded_sampling:
         unsupported.append("batch-sharded sampling")
     if unsupported:

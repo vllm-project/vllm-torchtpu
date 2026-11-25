@@ -1049,8 +1049,8 @@ def upload_stages(
     """Upload `stages[0]`'s lane files and, if more stages remain, `wait` + uploader.
 
     The `wait` step gates `rest` on every step uploaded in `stages[0]` (including
-    both Docker image builds in `pipeline_build.yml`, such as `-omni`, and all
-    `pipeline_cpu.yml` checks); a retried uploader skips lanes it already uploaded.
+    the Docker image builds in `pipeline_build.yml` and all `pipeline_cpu.yml`
+    checks); a retried uploader skips lanes it already uploaded.
     A file in TPU_GENERATION_FILES goes up once per generation the build's
     CI_EXTRAS picks (see upload_generations).
     """
@@ -1362,8 +1362,10 @@ def run_bootstrap(
     # from CI_EXTRAS, so it gets the extras resolved above: a merge-queue
     # build's come from its /ci merge marker, never from CI_EXTRAS.
     child_env["CI_EXTRAS"] = ",".join(sorted(ctx.extras & _VALID_CI_EXTRAS))
-    # pipeline_build.yml skips the -omni image build when this is non-empty.
-    # Buildkite rejects the upload if a skip reason is over 70 characters.
+    # pipeline_build.yml used this as the -omni image build's skip reason. It
+    # now skips that build outright (the pinned vllm-omni does not install
+    # with the pinned vLLM), so nothing reads this until it goes with the omni
+    # code. Buildkite rejects the upload if a skip reason is over 70 characters.
     has_tests = any("tests" in stage for stage in suite.stages)
     child_env["OMNI_IMAGE_SKIP"] = (
         ""

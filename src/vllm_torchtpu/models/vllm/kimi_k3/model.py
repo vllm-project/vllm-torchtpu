@@ -400,7 +400,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def process_weights_after_loading(self) -> None:
         """Finish the MoE routers and the SP-MLA gates after loading.
 
-        vLLM >= 0.34 runs every module's own hook, children first, so each
+        vLLM runs every module's own hook, children first, so each
         AttentionResidual folds its weights in its own hook before this one.
         """
         for module in self.modules():

@@ -29,9 +29,11 @@ v0.34.0 scheduler, which drops a preempted request and re-sends it as a new
 request when it resumes. worker/ec_connector_model_runner_mixin.py keeps only
 maybe_save_ec_to_connector.
 
-Custom logits processors must subclass the copied
-sample/logits_processor/interface.py LogitsProcessor; classes written for
-Model Runner V2's interface are rejected. Rules for edits are in
+Custom logits processors are rejected on TPU at config time
+(platforms/tpu_platform.py _validate_tpu_runner_features): vLLM's frontend
+accepts only Model Runner V2 LogitsProcessor subclasses, while the copied
+sample/logits_processor/interface.py runs only the V1 interface. Rules for
+edits are in
 docs/developers_guide/coding_guidance.md (R-3.1). Moving TPUModelRunner onto
 Model Runner V2 retires this package:
 https://github.com/vllm-project/vllm-torchtpu/issues/3723

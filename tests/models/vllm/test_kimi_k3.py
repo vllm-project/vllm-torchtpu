@@ -33,6 +33,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv, statically_known_tru
 from torch_tpu._internal.pallas import pallas as pallas_impl
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import CompilationMode, VllmConfig, set_current_vllm_config
+from vllm.model_executor.model_loader.weight_utils import finalize_model_weights
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.model_executor.models.interfaces import supports_pp
@@ -1635,6 +1636,32 @@ def _attention_residual_stub(hidden: int, eps: float) -> AttentionResidual:
     )
     module.process_weights_after_loading()
     return module
+
+
+def test_vllm_post_load_pass_folds_nested_attention_residual() -> None:
+    """vLLM runs every module's own post-load hook, children first, so the
+    Kimi model hook no longer folds its AttentionResidual layers itself."""
+    torch.manual_seed(0)
+    residual = AttentionResidual.__new__(AttentionResidual)
+    nn.Module.__init__(residual)
+    residual.eps = 1e-5
+    residual.norm = SimpleNamespace(
+        weight=nn.Parameter(torch.randn(64, dtype=torch.bfloat16) * 0.5 + 1)
+    )
+    residual.proj = SimpleNamespace(
+        weight=nn.Parameter(torch.randn(1, 64, dtype=torch.bfloat16) * 0.1)
+    )
+    layer = nn.Module()
+    layer.attn_res = residual
+    model = nn.Module()
+    model.layers = nn.ModuleList([layer])
+
+    finalize_model_weights(model)
+
+    torch.testing.assert_close(
+        residual.folded_weight,
+        residual.norm.weight.float() * residual.proj.weight[0].float(),
+    )
 
 
 def test_attention_residual_single_token_matches_batched_rows() -> None:

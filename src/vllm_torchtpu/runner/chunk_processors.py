@@ -19,7 +19,8 @@ of speculative steps); ``TPUModelRunner._sample_spec_verify_chunk`` runs
 ``SpecChunkProcessor`` hooks on a verify chunk. The thinking-token budget
 (``runner/thinking_budget_tracker.py``) implements both.
 
-Why not upstream ``LogitsProcessor`` (``vllm.v1.sample.logits_processor``):
+Why not the V1 ``LogitsProcessor``
+(``vllm_torchtpu.runner.vllm_v1.sample.logits_processor``, copied from vLLM):
 it is applied once per step to the full batch's logits and keeps its state on
 the host, updated through ``update_state``. The TPU runner samples each chunk
 separately, on bucket-padded device tensors inside compiled graphs, so a
