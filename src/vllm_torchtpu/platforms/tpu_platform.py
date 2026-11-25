@@ -933,16 +933,20 @@ class TpuPlatform(Platform):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
         # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
-        if (
-            layout is VllmKVCacheLayout.LBHNC
-            and vllm_config.model_config is not None
-            and vllm_config.model_config.get_head_size() == 64
-        ):
-            raise NotImplementedError(
-                "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
-                "layout, which the head_dim==64 RPA kernel does not "
-                "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
+        # ModelConfig.get_head_size() collapses differing layers with max(), so
+        # also check each layer's typed ModelArchitectureConfig view.
+        if layout is VllmKVCacheLayout.LBHNC and vllm_config.model_config is not None:
+            arch_config = vllm_config.model_config.model_arch_config
+            has_hd64_layer = vllm_config.model_config.get_head_size() == 64 or any(
+                arch_config[i].head_size == 64
+                for i in range(arch_config.total_num_hidden_layers)
             )
+            if has_hd64_layer:
+                raise NotImplementedError(
+                    "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
+                    "layout, which the head_dim==64 RPA kernel does not "
+                    "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
+                )
         kv_cache_layout = get_flashinfer_layout_string(layout)
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
