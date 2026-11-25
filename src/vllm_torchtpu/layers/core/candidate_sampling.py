@@ -200,21 +200,27 @@ def _bonus_scale(x, temps):
     return _rounded(x / safe, x.dtype)
 
 
+def _bonus_vals(x, f32):
+    """x upcast to float32 with VLLM_TPU_SAMPLER_BONUS_F32, else x."""
+    return x.astype(jnp.float32) if f32 else x
+
+
 def _target_scale(x, temps):
     return x.astype(jnp.float32) / (temps.astype(jnp.float32) + TEMPERATURE_EPS)
 
 
-def sample_bonus(vals, ids, greedy, temps, top_k, top_p, u, pairwise=False):
+def sample_bonus(vals, ids, greedy, temps, top_k, top_p, u, pairwise=False, f32=False):
     """``TPUModelRunner.sample_from_logits(all_greedy=False)`` over (vals, ids).
 
     vals: [B, W] logits, ids: [B, W] their token ids, greedy: [B] first argmax
     of the full rows, temps (logits dtype) / top_k / top_p: [B, 1], u: [B, W]
     uniforms. Returns the token ids [B], the top-k cutoffs [B] and whether
-    each row's top-p threshold is one of its values [B].
+    each row's top-p threshold is one of its values [B]. ``f32``
+    (VLLM_TPU_SAMPLER_BONUS_F32): scale and mask the float32 upcast of vals.
     """
     is_greedy = temps <= SAMPLING_EPS
     masked, cutoff, topp_ok = apply_top_k_top_p(
-        _bonus_scale(vals, temps), top_k, top_p, pairwise
+        _bonus_scale(_bonus_vals(vals, f32), temps), top_k, top_p, pairwise
     )
     log_u = _rounded(jnp.log(_clamp_uniform(u)), u.dtype)
     gumbel = -_rounded(jnp.log(-log_u), u.dtype)
@@ -409,6 +415,7 @@ def verify_local(
     synthetic: bool,
     force_full: bool = False,
     full_uniforms=None,
+    bonus_f32: bool = False,
 ):
     """Per-rank body. In: this rank's shard of the bonus rows [B, Vl] and of
     the verified rows [T, Vl]. Out (replicated over the TP group): bonus ids
@@ -444,7 +451,15 @@ def verify_local(
     (vb, vt), (ib, it) = split(c_vals), split(c_ids)
     (bb, bt), (greedy_b, greedy_t) = split(c_bound), split(greedy)
     bonus, cut_b, ok_b = sample_bonus(
-        vb, ib, greedy_b, temps_b, top_k_b, top_p_b, bonus_u, pairwise=True
+        vb,
+        ib,
+        greedy_b,
+        temps_b,
+        top_k_b,
+        top_p_b,
+        bonus_u,
+        pairwise=True,
+        f32=bonus_f32,
     )
     accepted, recovered, cut_t, ok_t = verify_targets(
         vt,
@@ -461,7 +476,11 @@ def verify_local(
         pairwise=True,
     )
     exact_b = rows_exact(
-        _bonus_scale(bb, temps_b), temps_b[:, 0] <= SAMPLING_EPS, top_k_b, cut_b, ok_b
+        _bonus_scale(_bonus_vals(bb, bonus_f32), temps_b),
+        temps_b[:, 0] <= SAMPLING_EPS,
+        top_k_b,
+        cut_b,
+        ok_b,
     )
     exact_t = rows_exact(
         _target_scale(bt, temps_t), temps_t[:, 0] == 0, top_k_t, cut_t, ok_t
@@ -484,7 +503,7 @@ def verify_local(
                 seed, num_bonus, rows_t.shape[0], vocab_size, bonus_u.dtype
             )
         f_bonus, _, _ = sample_bonus(
-            rows_b, full_ids, greedy_b, temps_b, top_k_b, top_p_b, u_b
+            rows_b, full_ids, greedy_b, temps_b, top_k_b, top_p_b, u_b, f32=bonus_f32
         )
         f_acc, f_rec, _, _ = verify_targets(
             rows_t,
@@ -514,12 +533,17 @@ def full_vocab_uniforms(seed, num_bonus, num_targets, vocab_size, bonus_dtype):
     return u_b, u_r
 
 
-def candidate_verify(*operands, mesh, axis, kc, vocab_size, synthetic):
+def candidate_verify(*operands, mesh, axis, kc, vocab_size, synthetic, bonus_f32=False):
     """Global-view entry: every operand is the ranks' local arrays stacked on
     one leading axis [tp, ...], and so are the six results."""
     spec = P(axis)
     local = functools.partial(
-        verify_local, axis=axis, kc=kc, vocab_size=vocab_size, synthetic=synthetic
+        verify_local,
+        axis=axis,
+        kc=kc,
+        vocab_size=vocab_size,
+        synthetic=synthetic,
+        bonus_f32=bonus_f32,
     )
 
     def body(*args):

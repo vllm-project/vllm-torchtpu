@@ -70,6 +70,8 @@ def _case(
     ties=0,
     synthetic=False,
     force_full=False,
+    bonus_f32=False,
+    head=None,
 ):
     rng = np.random.default_rng(seed)
     vocab = tp * shard
@@ -80,6 +82,11 @@ def _case(
     if ties:
         logits[:, :ties] = float(logits.max()) - 0.5
     bonus_idx = torch.arange(num_reqs, dtype=torch.int32) * (K + 1) + K
+    if head is not None:  # plant `head` at scattered ids of every bonus row
+        for r in bonus_idx.tolist():
+            ids = torch.from_numpy(rng.choice(vocab, len(head), replace=False))
+            logits[r] = (logits[r].float() / 3).to(torch.bfloat16)  # tail < head
+            logits[r, ids] = torch.tensor(head, dtype=torch.bfloat16)
     target_idx = torch.arange(rows, dtype=torch.int32)
     draft = torch.from_numpy(rng.integers(0, vocab, rows).astype(np.int32))
     greedy_ids = logits.argmax(-1).to(torch.int32)
@@ -104,7 +111,9 @@ def _case(
     )
     num_draft = torch.full((num_reqs,), K, dtype=torch.int32)
     gen = torch.Generator().manual_seed(seed)
-    u_b = torch.rand((num_reqs, vocab), generator=gen).to(torch.bfloat16)
+    u_b = torch.rand((num_reqs, vocab), generator=gen)
+    if not bonus_f32:
+        u_b = u_b.to(torch.bfloat16)
     u_r = torch.rand((rows, vocab), generator=gen)
     accept_u = torch.rand((rows,), generator=gen)
     rates = torch.tensor([0.832, 0.692 / 0.832, 0.576 / 0.692])
@@ -143,6 +152,7 @@ def _case(
         synthetic=synthetic,
         force_full=force_full,
         full_uniforms=(_to_jax(u_b), _to_jax(u_r)),
+        bonus_f32=bonus_f32,
     )
     run = jax.jit(jax.vmap(local, axis_name="tp"))
 
@@ -170,7 +180,7 @@ def _case(
     # The candidate ids come first; then every candidate gets the uniform the
     # full-vocabulary path draws for its token.
     *_, ids_b, ids_t = call(
-        torch.zeros((num_reqs, width), dtype=torch.bfloat16), torch.zeros((rows, width))
+        torch.zeros((num_reqs, width), dtype=u_b.dtype), torch.zeros((rows, width))
     )
     ids_b = torch.from_numpy(np.asarray(ids_b[0]).astype(np.int64))
     ids_t = torch.from_numpy(np.asarray(ids_t[0]).astype(np.int64))
@@ -216,6 +226,42 @@ def _case(
 )
 def test_candidates_match_full_vocabulary_sampler(seed, kwargs, exact):
     ref_bonus, ref_out, bonus, out, got_exact = _case(seed, **kwargs)
+    assert got_exact == exact
+    torch.testing.assert_close(bonus.long(), ref_bonus.long(), rtol=0, atol=0)
+    torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
+
+
+# A top_k 8 row whose top-3 mass (0.9496) is within bf16 rounding of top_p 0.95.
+BF16_TOPP_HEAD = [10.0, 9.5, 8.625, 6.90625, 6.34375, 5.59375, 5.5, 4.53125]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("seed", [0, 1])
+@pytest.mark.parametrize(
+    "kwargs,exact",
+    [
+        (dict(), 1),
+        (dict(temp=0.6, top_p=0.95), 1),
+        (dict(temp=1.0, top_k=8, top_p=0.95, head=BF16_TOPP_HEAD), 1),
+        (dict(greedy_frac=0.5), 1),
+        (dict(ties=70), 0),
+        (dict(top_k=0), 0),
+        (dict(force_full=True, temp=1.0, top_k=8, top_p=0.95, head=BF16_TOPP_HEAD), 0),
+    ],
+)
+@pytest.mark.parametrize("bonus_f32", [False, True])
+def test_candidates_match_full_vocabulary_sampler_bonus_f32(
+    monkeypatch, seed, kwargs, exact, bonus_f32
+):
+    """VLLM_TPU_SAMPLER_BONUS_F32: the op's float32 bonus sampler (candidates
+    and in-program full path) is bitwise the runner's float32 sampler on the
+    same float32 draws; off, both stay bf16."""
+    from vllm_torchtpu.runner import tpu_runner as tr
+
+    monkeypatch.setattr(tr, "_SAMPLER_BONUS_F32", bonus_f32)
+    ref_bonus, ref_out, bonus, out, got_exact = _case(
+        seed, bonus_f32=bonus_f32, **kwargs
+    )
     assert got_exact == exact
     torch.testing.assert_close(bonus.long(), ref_bonus.long(), rtol=0, atol=0)
     torch.testing.assert_close(out, ref_out, rtol=0, atol=0)
@@ -686,6 +732,42 @@ def test_program_operands_are_the_separate_draws(synthetic):
         segment, group, K,
     )  # fmt: skip
     assert torch.equal(out, ref)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("bonus_f32", [False, True])
+def test_program_bonus_draws_dtype_follows_bonus_f32(monkeypatch, bonus_f32):
+    """The bonus draws reach the op rounded to the logits dtype, or as
+    float32 with VLLM_TPU_SAMPLER_BONUS_F32; every other operand is the
+    same."""
+    from vllm_torchtpu.runner import tpu_runner as tr
+
+    g = torch.Generator().manual_seed(5)
+    num_reqs, shard, width = 2, 64, 128
+    logits = torch.randn(num_reqs * (K + 1), shard, generator=g).to(torch.bfloat16)
+    bonus_idx = torch.arange(num_reqs, dtype=torch.int32) * (K + 1) + K
+    target_idx = (torch.arange(num_reqs)[:, None] * (K + 1) + torch.arange(K)).view(-1)
+    draft = torch.zeros(num_reqs * K, dtype=torch.int32)
+    segment = torch.arange(num_reqs).repeat_interleave(K)
+    group = torch.arange(K, dtype=torch.int32).repeat(num_reqs)
+    temps = torch.ones(num_reqs, 1, dtype=torch.bfloat16)
+    top_k = torch.full((num_reqs, 1), 8, dtype=torch.int32)
+    top_p = torch.full((num_reqs, 1), 0.95)
+    bounds = torch.tensor([0, shard], dtype=torch.int32)
+    n = tr._candidate_uniforms_count(num_reqs, draft.numel(), target_idx.numel(), width)
+    u = torch.rand(n, generator=g)
+    args = (logits, bonus_idx, target_idx, bounds, draft, temps, top_k, top_p,
+            segment, group, None, u, width)  # fmt: skip
+    monkeypatch.setattr(tr, "_SAMPLER_BONUS_F32", False)
+    off = tr._candidate_op_operands(*args)
+    monkeypatch.setattr(tr, "_SAMPLER_BONUS_F32", bonus_f32)
+    got = tr._candidate_op_operands(*args)
+    want_u = u[: num_reqs * width].view(1, num_reqs, width)
+    want_u = want_u if bonus_f32 else want_u.to(torch.bfloat16)
+    assert got[10].dtype == want_u.dtype and torch.equal(got[10], want_u)
+    for i, (a, b) in enumerate(zip(got, off)):
+        if i != 10:
+            assert torch.equal(a, b)
 
 
 def _fake_runner(monkeypatch, *, program, compiling=False, warmed=(), fold=None):

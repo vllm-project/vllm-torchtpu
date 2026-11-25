@@ -562,6 +562,20 @@ def _apply_temperature_impl(
     return logits / safe_temperatures
 
 
+# VLLM_TPU_SAMPLER_BONUS_F32, read once (a process constant the compiled
+# samplers guard on).
+_SAMPLER_BONUS_F32 = envs.VLLM_TPU_SAMPLER_BONUS_F32
+
+
+def _sampling_logits(logits: torch.Tensor) -> torch.Tensor:
+    """The logits the non-greedy sampler scales and masks: upcast to float32
+    with VLLM_TPU_SAMPLER_BONUS_F32 (the softmax and top-p mass sums then run
+    in float32; in bf16 a top-p cut within rounding keeps or drops a token),
+    else `logits` as is. The upcast is exact, so the block maxima and the
+    candidates of the upcast row are the upcast ones."""
+    return logits.float() if _SAMPLER_BONUS_F32 else logits
+
+
 def _sample_from_logits_impl(
     logits: torch.Tensor,
     temperatures: torch.Tensor,
@@ -573,7 +587,7 @@ def _sample_from_logits_impl(
     """Non-greedy body of `TPUModelRunner.sample_from_logits`: temperature,
     top-k/top-p, then the Gumbel-max draw on the caller's uniforms `u`."""
     is_greedy = temperatures <= SAMPLING_EPS
-    scaled_logits = _apply_temperature_impl(logits, temperatures)
+    scaled_logits = _apply_temperature_impl(_sampling_logits(logits), temperatures)
     masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, topk_candidates)
     u_clamped = torch.clamp(
         u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
@@ -601,14 +615,16 @@ def _sample_from_logits_pre(
     temperature division is monotone non-decreasing, so the block maxima of
     the scaled row are the scaled block maxima bit for bit."""
     is_greedy = temperatures <= SAMPLING_EPS
-    scaled_logits = _apply_temperature_impl(logits, temperatures)
+    scaled_logits = _apply_temperature_impl(_sampling_logits(logits), temperatures)
     masked_logits = apply_top_k_top_p_candidates_pre(
         scaled_logits,
         top_k,
         top_p,
         topk_candidates,
-        _apply_temperature_impl(raw_block_max, temperatures),
-        lambda ids: _apply_temperature_impl(raw_candidates_of(ids), temperatures),
+        _apply_temperature_impl(_sampling_logits(raw_block_max), temperatures),
+        lambda ids: _apply_temperature_impl(
+            _sampling_logits(raw_candidates_of(ids)), temperatures
+        ),
         kmax,
         topp_narrow,
     )
@@ -961,8 +977,10 @@ def _candidate_op_operands(
     each as this rank's [1, ...] block, built from the logits shard, the
     padded per-request sampling params and one flat draw `u`. The bonus
     draws are rounded to the logits dtype, the dtype the op's bonus sampler
-    reproduces `sample_from_logits` in. Without a synthetic rate table the
-    accept draws fill the (unread) rates slot."""
+    reproduces `sample_from_logits` in (kept float32 with
+    VLLM_TPU_SAMPLER_BONUS_F32, whose op samples the bonus in float32).
+    Without a synthetic rate table the accept draws fill the (unread) rates
+    slot."""
     bonus_u, accept_u, recover_u, key = _split_candidate_uniforms(
         u,
         bonus_logits_indices.shape[0],
@@ -986,7 +1004,7 @@ def _candidate_op_operands(
         temperatures[per_slot],
         top_k[per_slot],
         top_p[per_slot],
-        bonus_u.to(local_logits.dtype),
+        bonus_u if _SAMPLER_BONUS_F32 else bonus_u.to(local_logits.dtype),
         accept_u,
         recover_u,
         rates,
@@ -1073,7 +1091,7 @@ def _candidate_verify_program(vocab_size: int, synthetic: bool, fold_ro: bool):
     `fold_ro` (VLLM_TPU_CANDIDATE_VERIFY_RO) it takes the read-offset
     buffer, slot groups and 0-d row count first and runs the post-verify
     `_update_read_offsets_impl` scatter in the same program."""
-    op = candidate_verify_op(vocab_size, synthetic)
+    op = candidate_verify_op(vocab_size, synthetic, _SAMPLER_BONUS_F32)
     if not fold_ro:
 
         def candidate_verify(*args):
@@ -12768,7 +12786,7 @@ class TPUModelRunner(GPUModelRunner):
                 return out
         bonus_u = torch.rand(
             (num_bonus, width),
-            dtype=local_logits.dtype,
+            dtype=torch.float32 if _SAMPLER_BONUS_F32 else local_logits.dtype,
             device=device,
             generator=sampling_generator,
         )
@@ -12819,6 +12837,7 @@ class TPUModelRunner(GPUModelRunner):
             seed,
             vocab_size=head.org_vocab_size,
             synthetic=synthetic,
+            bonus_f32=_SAMPLER_BONUS_F32,
         )
         return candidate_rejection_output(
             accepted,

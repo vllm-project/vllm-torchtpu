@@ -474,6 +474,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SAMPLER_CANDIDATES_ONLY: bool = False
     VLLM_TPU_SAMPLER_LOGITS_BLOCKS: int = 0
     VLLM_TPU_SAMPLER_TOPP_NARROW: bool = False
+    VLLM_TPU_SAMPLER_BONUS_F32: bool = False
     VLLM_TPU_DRAFT_LOOP_MAX_COMPILE_T: int = 0
     VLLM_TPU_GDN_MIXED_TILE_POW2: bool = False
     VLLM_TPU_SPEC_BOUNDARY_STATE_COPY: bool = False
@@ -3022,6 +3023,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of the 32-step float bisection; each step evaluates the same
     # mass sum, so the threshold and the kept set are the same.
     "VLLM_TPU_SAMPLER_TOPP_NARROW": env_bool("VLLM_TPU_SAMPLER_TOPP_NARROW"),
+    # Scale and top-k/top-p mask the logits in float32 when sampling from
+    # them (the bonus token of a spec verify, and non-spec sampling): the
+    # logits are upcast before the temperature divide, so the softmax and the
+    # top-p mass sums run in float32 instead of the logits dtype. In bf16 a
+    # top-p cut within rounding (~0.4% mass) keeps or drops one token. Covers
+    # the gathered path, the candidate paths (TPU_SAMPLER_TOPK_CANDIDATES,
+    # VLLM_TPU_SAMPLER_CANDIDATES_ONLY / LOGITS_BLOCKS / TOPP_NARROW) and
+    # VLLM_TPU_CANDIDATE_SAMPLING (bonus draws in float32 too). Greedy rows are
+    # unchanged. The accept/recover math already runs in float32.
+    "VLLM_TPU_SAMPLER_BONUS_F32": env_bool("VLLM_TPU_SAMPLER_BONUS_F32"),
     # Compile the fused MTP draft loop (VLLM_TPU_FUSED_DRAFT_LOOP) only at
     # token buckets <= max(this, the bucket of max_num_seqs). The loop runs one
     # row per request, so larger buckets are never executed; dropping them

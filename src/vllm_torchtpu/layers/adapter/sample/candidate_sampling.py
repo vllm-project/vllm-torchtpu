@@ -76,7 +76,7 @@ def get_tp_mesh():
 
 
 @functools.cache
-def _get_op(vocab_size: int, synthetic: bool):
+def _get_op(vocab_size: int, synthetic: bool, bonus_f32: bool = False):
     mesh = get_tp_mesh()
     run = functools.partial(
         candidate_verify,
@@ -85,6 +85,7 @@ def _get_op(vocab_size: int, synthetic: bool):
         kc=CANDIDATES_PER_SHARD,
         vocab_size=vocab_size,
         synthetic=synthetic,
+        bonus_f32=bonus_f32,
     )
 
     # torch_tpu infers static argnums from annotations: every operand is jax.Array.
@@ -124,8 +125,11 @@ def _get_op(vocab_size: int, synthetic: bool):
         )
 
     spec = PartitionSpec(TP_AXIS)
+    name = f"pallas::candidate_verify_v{vocab_size}_tp{mesh.size}_s{int(synthetic)}"
+    if bonus_f32:
+        name += "_bf32"
     op = pallas.jax_op(
-        f"pallas::candidate_verify_v{vocab_size}_tp{mesh.size}_s{int(synthetic)}",
+        name,
         fn,
         mesh=mesh,
         input_partition_specs=(spec,) * NUM_OPERANDS,
@@ -133,21 +137,24 @@ def _get_op(vocab_size: int, synthetic: bool):
     )
     logger.info(
         "Candidate sampling armed | vocab=%d tp=%d candidates per shard=%d "
-        "max top_k=%d synthetic=%s",
+        "max top_k=%d synthetic=%s bonus_f32=%s",
         vocab_size,
         mesh.size,
         CANDIDATES_PER_SHARD,
         MAX_TOP_K,
         synthetic,
+        bonus_f32,
     )
     return op
 
 
-def candidate_verify_op(vocab_size: int, synthetic: bool):
+def candidate_verify_op(vocab_size: int, synthetic: bool, bonus_f32: bool = False):
     """The candidate verify torch op, callable inside a compiled region: takes
     the `candidate_verify_decisions` operands in its order, each as this
-    rank's [1, ...] block, and returns the six results the same way."""
-    return _get_op(vocab_size, synthetic)
+    rank's [1, ...] block, and returns the six results the same way.
+    `bonus_f32` (VLLM_TPU_SAMPLER_BONUS_F32): sample the bonus tokens from
+    float32 logits; bonus_u is then float32."""
+    return _get_op(vocab_size, synthetic, bonus_f32)
 
 
 def candidate_width(tp_size: int) -> int:
@@ -173,11 +180,12 @@ def candidate_verify_decisions(
     *,
     vocab_size: int,
     synthetic: bool,
+    bonus_f32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bonus ids [B], accepted [T] (int32), recovered ids [T] and the
     candidates-exact flag [] for one verify chunk, from this rank's shard of
     the bonus rows [B, Vl] and verified rows [T, Vl]."""
-    op = _get_op(vocab_size, synthetic)
+    op = _get_op(vocab_size, synthetic, bonus_f32)
     operands = (
         bonus_logits,
         target_logits,
