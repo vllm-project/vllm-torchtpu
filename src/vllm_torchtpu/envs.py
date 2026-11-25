@@ -199,6 +199,7 @@ if TYPE_CHECKING:
     EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK: bool = False
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
+    VLLM_TPU_COMPILE_CACHE_MAX_BYTES: int = 0
     VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
@@ -1252,6 +1253,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # How many times an offload save whose transfer failed is retried.
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES": env_int("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
+    # Size cap, in bytes, for the on-disk compile caches under VLLM_CACHE_ROOT
+    # (torch_compile_cache, profile_cache, tpu_artifact_store) and torch_tpu's
+    # Tier-3 cache. After warm-up, the least recently used entries are deleted
+    # until they fit; entries this process used are kept. 0 (default): no cap.
+    "VLLM_TPU_COMPILE_CACHE_MAX_BYTES": env_nonnegative_int(
+        "VLLM_TPU_COMPILE_CACHE_MAX_BYTES", 0
+    ),
     # Keep the trailing prefix-cache block that EAGLE/MTP normally drops
     # (sets SpeculativeConfig.disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(

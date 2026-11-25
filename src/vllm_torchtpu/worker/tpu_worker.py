@@ -861,6 +861,7 @@ class TPUWorker(WorkerBase):
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()
+        self._evict_compile_caches()
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
@@ -868,6 +869,34 @@ class TPUWorker(WorkerBase):
         maybe_attach_gc_debug_callback()
         _release_free_host_heap()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
+
+    def _evict_compile_caches(self) -> None:
+        """Cap the on-disk compile caches (VLLM_TPU_COMPILE_CACHE_MAX_BYTES).
+
+        Runs after warm-up, when every cache entry this start needs has been
+        read or written. One worker per host does the work; a second engine
+        on the host finds the lock held and skips. Never fatal.
+        """
+        max_bytes = envs.VLLM_TPU_COMPILE_CACHE_MAX_BYTES
+        if max_bytes <= 0 or self.local_rank != 0:
+            return
+        import vllm.envs as vllm_envs
+
+        from vllm_torchtpu.compilation import cache_eviction
+
+        # This start's vLLM cache dir may have been only read; stamp it so it
+        # counts as in use.
+        cache_eviction.mark_used(self.compilation_config.cache_dir)
+        try:
+            cache_eviction.evict(
+                cache_eviction.default_regions(
+                    vllm_envs.VLLM_CACHE_ROOT,
+                    envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT or None,
+                ),
+                max_bytes,
+            )
+        except Exception as e:  # noqa: BLE001 - a cache cap must not fail start-up
+            logger.warning("Compile cache eviction failed: %s", e)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
         """Kernel-iteration hot-reload: re-import the reloadable kernel

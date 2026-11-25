@@ -9084,6 +9084,10 @@ class TPUModelRunner(GPUModelRunner):
         saved_cache_dir = cc.cache_dir
         cc.cache_dir = os.path.join(base_cache_dir, "profile_cache", hash_key)
         os.makedirs(cc.cache_dir, exist_ok=True)
+        # A warm start only reads it; stamp it so eviction counts it as in use.
+        from vllm_torchtpu.compilation.cache_eviction import mark_used
+
+        mark_used(cc.cache_dir)
         try:
             yield
         finally:
