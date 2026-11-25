@@ -353,28 +353,27 @@ _DECODE_ROWS = 8
 _CONDITIONAL_PAGES_PER_STEP = 32
 
 
-def block_score_options(index_heads: int = 1, wide: bool = False) -> dict[str, int]:
+def block_score_options(index_heads: int = 1, wide: int = 1) -> dict[str, int]:
     """The tile sizes the MSA forward scores blocks with, for query rows that
     fold `index_heads` heads per token. A transposed (folded 4-bit or fp8)
     decode tile holds one request's rows: its scoring costs per tile row, and 32-row
     tiles for one head's 8 rows ran the c48 / c64 DCP 2 decode indexer 7%
     slower, bit-identical results (bench j-74f8b992).
 
-    `wide` (`_wide_decode_scores`) scores 256 pages per small-class step:
-    half the grid steps, ~0.4 us each."""
+    `wide` (`_wide_decode_scores`) scores that many times 128 pages per
+    small-class step: fewer grid steps, ~0.3-0.4 us each."""
     return dict(
         block_q=msa_indexer.DEFAULT_BLOCK_Q,
         large_block_q=msa_indexer.DEFAULT_LARGE_BLOCK_Q,
         pages_per_step=msa_indexer.DEFAULT_PAGES_PER_STEP,
-        small_pages_per_step=2 * msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP
-        if wide
-        else msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
+        small_pages_per_step=wide * msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
         transposed_tile_q=min(_DECODE_ROWS * index_heads, msa_indexer.DEFAULT_BLOCK_Q),
     )
 
 
 def _wide_decode_scores(index_q, index_cache, seq_lens, block_tables, index_heads):
-    """Whether a step's block scores take 256-page groups: a decode step
+    """How many 128-page groups a step's small-class block score steps take:
+    2 (256 pages) for a decode step
     (`msa_indexer.is_prefill_step`) of more query rows per index head than
     one request's `_DECODE_ROWS` (e.g. a verify step of 2+ requests), whose
     requests may hold more than 256 pages (a shard of up to 256 pages fits
@@ -383,15 +382,30 @@ def _wide_decode_scores(index_q, index_cache, seq_lens, block_tables, index_head
     pages (a 256-page ring of bf16 pages is twice the VMEM). Standalone
     decode calls (j-83e37332): int4 folded 23 x 450 pages 94.7 -> 77.9 us,
     36 x 366 pages 110.6 -> 105.7, fp8 5 x 450 pages 24.0 -> 21.5; one
-    request of 313 pages 8.7 -> 9.1 (so a single request keeps 128)."""
+    request of 313 pages 8.7 -> 9.1 (so a single request keeps 128).
+
+    4 (512 pages) over 4-bit pages when a request may hold 1024 or more:
+    c48's 22-request decode (~430 pages each) took 83.3 -> 77.6 us per
+    fused decode-candidates call (anvil, standalone); fp8 c16 steps of 3 / 6
+    requests gained nothing (25.7 -> 25.9, 34.2 -> 33.7 us), and c64's
+    DCP 4 requests hold at most 512 pages (~192 served), where 512-page
+    groups idled most of a group (+22 % on its decode indexer)."""
     rows = index_q.shape[0]
     pages_per_seq = block_tables.shape[0] // seq_lens.shape[0]
-    return (
+    wide = (
         rows > _DECODE_ROWS * index_heads
         and pages_per_seq > 2 * msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP
         and not msa_indexer.is_prefill_step(rows, seq_lens.shape[0])
         and jnp.dtype(index_cache.dtype).itemsize == 1
     )
+    if not wide:
+        return 1
+    if (
+        msa_fp4.is_fp4(index_cache)
+        and pages_per_seq >= 8 * msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP
+    ):
+        return 4
+    return 2
 
 
 def _block_scores(
@@ -409,10 +423,12 @@ def _block_scores(
 ):
     """`index_q` must already be rotated for a 4-bit cache; its rows fold
     `index_heads` heads per token (`block_score_options`)."""
-    options = block_score_options(
-        index_heads,
-        _wide_decode_scores(index_q, index_cache, seq_lens, block_tables, index_heads),
+    # 512-page groups (`_wide_decode_scores` 4) were measured in the fused
+    # decode kernel (`msa_dcp.decode_candidates`) only; this path keeps 256.
+    wide = _wide_decode_scores(
+        index_q, index_cache, seq_lens, block_tables, index_heads
     )
+    options = block_score_options(index_heads, min(wide, 2))
     # Decode steps take the large class in a conditional, whose cost grows
     # with the code it holds (c48 b22 conditional 1.3 -> 7.1 us per 5-layer
     # twin step with 64-page steps, 34 with 128): its tiles keep 32 pages.

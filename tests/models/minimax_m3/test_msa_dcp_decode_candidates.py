@@ -142,6 +142,37 @@ def test_long_request_in_decode_step_scores_bf16_queries(cache_kind):
     )
 
 
+def test_wide_4bit_groups_match_256_page_groups():
+    """4-bit decode steps over 1024-page tables score 512-page groups
+    (`msa._wide_decode_scores`): the same candidates as 256-page groups."""
+    rank, dcp = 1, 2
+    index_q, cache, seq_lens, tables, cu_q, num_seqs, num_real = _case(
+        [8, 8, 8], [140_000, 9_000, 300], 1024, "fp4", 0, 11
+    )
+    assert msa._wide_decode_scores(index_q, cache, seq_lens, tables, 1) == 4
+    num_tokens = index_q.shape[0]
+    seq_id, pos, _ = msa.token_positions(num_tokens, seq_lens, cu_q)
+    local_lens = msa_dcp.local_seq_lens(seq_lens, block_size=PAGE, rank=rank, dcp=dcp)
+    picks = dict(topk=TOPK, init_blocks=0, local_blocks=1, rank=rank, dcp=dcp)
+    got = msa_dcp.decode_candidates(
+        index_q, cache, local_lens, tables, cu_q, num_seqs, seq_id, pos, **picks,
+        interpret=True,
+    )  # fmt: skip
+    options = msa.block_score_options(1, 2)
+    scores = msa_indexer.block_scores(
+        index_q, cache, local_lens, tables, cu_q, num_seqs,
+        small_pages_per_step=options["small_pages_per_step"],
+        transposed_tile_q=options["transposed_tile_q"],
+        interpret=True,
+    )  # fmt: skip
+    want = msa_dcp.pack_candidates(
+        *msa_dcp.local_candidates(scores, pos, block_size=PAGE, **picks, interpret=True)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got)[:num_real], np.asarray(want)[:num_real]
+    )
+
+
 def _write_caches(cache_kind, num_pages, rng):
     if cache_kind == "fp4":
         nibbles = rng.integers(0, 16, (num_pages, PAGE, 3 * HEAD_DIM))
