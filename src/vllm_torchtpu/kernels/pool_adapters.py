@@ -418,7 +418,14 @@ def null_out_of_range_pairs(src_indices, dst_indices, num_blocks: int):
     nothing outside the pool and changes no block in it. A pair with both
     indices in range is returned unchanged.
     """
-    in_pool = copy_pairs_in_pool(src_indices, dst_indices, num_blocks)
+    return _null_pairs_not_in_pool(
+        src_indices,
+        dst_indices,
+        copy_pairs_in_pool(src_indices, dst_indices, num_blocks),
+    )
+
+
+def _null_pairs_not_in_pool(src_indices, dst_indices, in_pool):
     return (
         jnp.where(in_pool, src_indices, jnp.zeros_like(src_indices)),
         jnp.where(in_pool, dst_indices, jnp.zeros_like(dst_indices)),
@@ -475,10 +482,10 @@ def copy_blocks(pool, src_indices, dst_indices):
       naming the first replaced pairs.
     """
     num_blocks = pool.shape[0]
-    src, dst = null_out_of_range_pairs(src_indices, dst_indices, num_blocks)
+    in_pool = copy_pairs_in_pool(src_indices, dst_indices, num_blocks)
+    src, dst = _null_pairs_not_in_pool(src_indices, dst_indices, in_pool)
     if not pl.enable_debug_checks.value:
         return _copy_blocks_unchecked(pool, src, dst)
-    in_pool = copy_pairs_in_pool(src_indices, dst_indices, num_blocks)
     # The callback only where it can run: a TPU program holds none.
     checked = lax.platform_dependent(
         in_pool,
@@ -487,6 +494,8 @@ def copy_blocks(pool, src_indices, dst_indices):
         cpu=functools.partial(_report_on_host, num_blocks),
         default=lambda *_: jnp.zeros((), jnp.int32),
     )
+    # `checked` is always 0. Adding it makes the copy depend on the report, so
+    # the report runs before the kernel; do not drop it as a no-op.
     return _copy_blocks_unchecked(
         pool, src + checked.astype(src.dtype), dst, in_pool=in_pool
     )

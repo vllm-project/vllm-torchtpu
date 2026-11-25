@@ -30,6 +30,7 @@ import numpy as np
 import pytest
 from jax.experimental import pallas as pl
 
+from tests.distributed.tpu_test_utils import run_in_isolated_process
 from tests.layers.adapter.mamba_state_copy_test_utils import (
     numpy_copy_blocks,
     numpy_copy_kernel,
@@ -195,3 +196,55 @@ def test_on_tpu_the_debug_check_is_in_the_copy_kernel(program):
         assert "callback" not in text
         assert [name for name, _ in kernels] == ["_copy_kernel"]
         assert (message in kernels[0][1]) == flag
+
+
+def _copies_with_debug_checks_on_tpu():
+    # Set before anything is traced, so both programs compile the copy kernel
+    # with its debug check.
+    jax.config.update("jax_pallas_enable_debug_checks", True)
+    import torch
+
+    gen = torch.Generator().manual_seed(0)
+
+    def host_pool(shape):
+        return torch.randn(shape, generator=gen).to(torch.bfloat16)
+
+    def indices(pairs):
+        pairs = pairs + [(0, 0)] * (8 - len(pairs))
+        return (
+            torch.tensor([s for s, _ in pairs], dtype=torch.int32).to("tpu"),
+            torch.tensor([d for _, d in pairs], dtype=torch.int32).to("tpu"),
+        )
+
+    def expected(host, pairs):
+        out = host.clone()
+        for s, d in pairs:
+            out[d] = host[s]
+        return out
+
+    block_pairs = [(5, 7), (9, 12), (63, 3), (20, 21)]
+    hosts = [host_pool((64, 16, 2, 2, 128)) for _ in range(2)]
+    pools = [host.to("tpu") for host in hosts]
+    row_pairs = [(5, 7), (63, 2), (11, 40)]
+    host_rows = host_pool((64, 6, 16, 2, 2, 128))
+    rows = host_rows.to("tpu")
+    with torch.no_grad():
+        mamba_state_copy_op.copy_mamba_state_blocks(pools, *indices(block_pairs))
+        mamba_state_copy_op.copy_mamba_state_rows(
+            rows, *indices(row_pairs), num_pools=3, split=2
+        )
+    torch.accelerator.synchronize()
+    for pool, host in zip(pools, hosts):
+        assert torch.equal(pool.cpu(), expected(host, block_pairs))
+    assert torch.equal(rows.cpu(), expected(host_rows, row_pairs))
+
+
+@pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
+def test_with_debug_checks_both_programs_copy_valid_pairs_on_tpu():
+    """With `pl.enable_debug_checks`, both programs compile the copy kernel
+    with its `pl.debug_check` and run it on TPU. Only valid pairs run: a check
+    that fired on them would halt the core and leave the pools uncopied, so
+    the test fails. A pair outside the pool is not run here, because the halt
+    would fail every later program in the session."""
+    run_in_isolated_process(_copies_with_debug_checks_on_tpu)

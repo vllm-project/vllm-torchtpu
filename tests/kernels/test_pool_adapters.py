@@ -78,13 +78,21 @@ def test_same_dtype_region_roundtrip():
 
 
 @pytest.mark.tpu_test
-def test_copy_blocks():
+@pytest.mark.parametrize(
+    "debug_checks", [False, True], ids=["debug-checks-off", "debug-checks-on"]
+)
+def test_copy_blocks(debug_checks):
+    """With `pl.enable_debug_checks`, the copy kernel also runs `pl.debug_check`
+    on every pair. On TPU a check that fires halts the core, so only valid
+    pairs run here: a check that fired on them would leave the pool uncopied
+    and fail the test."""
     pool = _pool()
     before = np.asarray(pool)
     src = jnp.asarray([0, 2], dtype=jnp.int32)
     dst = jnp.asarray([3, 1], dtype=jnp.int32)
 
-    pool = pool_adapters.copy_blocks(pool, src, dst)
+    with pl.enable_debug_checks(debug_checks):
+        pool = pool_adapters.copy_blocks(pool, src, dst)
 
     after = np.asarray(pool)
     np.testing.assert_array_equal(after[3], before[0])
@@ -102,8 +110,9 @@ def test_copy_blocks_replaces_a_pair_outside_the_pool_by_the_null_pair(mode):
     joins a live block to an index outside the pool copies nothing."""
     pool = _pool()
     before = np.asarray(pool)
-    src = jnp.asarray([2, NB, -1, 1, 2**31 - 1], dtype=jnp.int32)
-    dst = jnp.asarray([3, 1, 1, NB, 1], dtype=jnp.int32)
+    # Each bad index is joined to a live block, as src and as dst.
+    src = jnp.asarray([2, NB, -1, 1, 2**31 - 1, 1], dtype=jnp.int32)
+    dst = jnp.asarray([3, 1, 1, NB, 1, -1], dtype=jnp.int32)
 
     with (
         pltpu.force_tpu_interpret_mode(pltpu.InterpretParams())
