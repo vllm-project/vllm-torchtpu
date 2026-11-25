@@ -216,10 +216,11 @@ def test_dp_step_agrees_the_next_step_after_its_launches():
         def on_step(self, step, reduced, phase):
             seen.append((step, reduced, phase))
 
-    # Twelve decoding requests, one of them not scheduled this step.
+    # Thirteen cached decoding requests: one preempted, one not scheduled this
+    # step. The scheduler runs at most twelve.
     requests = {
         str(i): SimpleNamespace(num_computed_tokens=4096 + i, num_prompt_tokens=4096)
-        for i in range(12)
+        for i in range(13)
     }
     runner = _lockstep_runner(
         _expert_relayout=Controller(),
@@ -228,6 +229,7 @@ def test_dp_step_agrees_the_next_step_after_its_launches():
         speculative_config=SimpleNamespace(num_speculative_tokens=5),
         most_model_len=None,
         num_reqs_max_model_len=12,
+        scheduler_config=SimpleNamespace(max_num_seqs=12),
     )
     runner._count_input_chunks = TPUModelRunner._count_input_chunks.__get__(runner)
     output = SimpleNamespace(
@@ -246,7 +248,7 @@ def test_dp_step_agrees_the_next_step_after_its_launches():
         patch.object(tpu_runner.gc_policy, "on_coordinated_step") as collect,
     ):
         TPUModelRunner._dp_end_step(runner)
-        # The bound covers the unscheduled request too: 12 x (1 + 5) rows.
+        # Twelve requests of 1 + 5 rows, the unscheduled ones included.
         assert operands == [[0, 72, 1, 12, 0, 1, 1, -72, -12, 0x5A5A, -0x5A5A, -3]]
         bucket, chunks = TPUModelRunner._dp_coordinated_step(
             runner, 66, 1, local_num_reqs=11

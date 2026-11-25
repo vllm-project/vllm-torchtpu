@@ -3731,6 +3731,7 @@ class TPUModelRunner(GPUModelRunner):
                 for req_id, state in self.requests.items()
             ),
             1 + (spec.num_speculative_tokens if spec is not None else 0),
+            self.scheduler_config.max_num_seqs,
             self._count_input_chunks,
         )
 

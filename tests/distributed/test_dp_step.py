@@ -27,6 +27,7 @@ BUDGET = 1024
 CHUNK_REQS = 4
 LONG_TOKENS = 16  # A chunk holding a longer request takes CHUNK_REQS // 2.
 WINDOW = 32  # Draft context window.
+MAX_REQS = 64
 
 
 class _Request:
@@ -51,7 +52,7 @@ class _Scheduler:
     def __init__(self) -> None:
         self._pause_state = PauseState.UNPAUSED
         self.num_spec_tokens = DRAFTS
-        self.max_num_active_reqs = 64
+        self.max_num_active_reqs = MAX_REQS
         self.num_waiting_for_streaming_input = 0
         self.finished_recving_kv_req_ids: set[str] = set()
         self.kv_holding_waiting: list[_Request] = []
@@ -129,6 +130,7 @@ class _Runner:
                     for request_id, (computed, prompt, _) in self.requests.items()
                 ),
                 1 + DRAFTS,
+                MAX_REQS,
                 _count_chunks,
             )
         )

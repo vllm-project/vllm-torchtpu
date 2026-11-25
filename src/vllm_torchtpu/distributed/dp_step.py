@@ -177,15 +177,18 @@ class StepAgreement:
 def decode_bound(
     spans: Iterable[tuple[int, int]],
     step_tokens: int,
+    max_reqs: int,
     count_chunks: Callable[[Sequence[int]], tuple[int, int]],
 ) -> StepShape | None:
     """Bound a rank's next step from the requests it holds.
 
     Args:
         spans: per request, its tokens computed once this step completes and
-            its prompt length.
+            its prompt length. Preempted requests are among them, so they can
+            outnumber what the scheduler runs at once.
         step_tokens: the most tokens a decoding request is scheduled in a step
             (1 + the number of draft tokens).
+        max_reqs: the most requests the scheduler runs in a step.
         count_chunks: (forward chunks, largest chunk's request count) for a
             batch of per-request token counts.
 
@@ -198,6 +201,7 @@ def decode_bound(
         if computed < prompt:
             return None
         num_reqs += 1
+    num_reqs = min(num_reqs, max_reqs)
     chunks, reqs = count_chunks([step_tokens] * num_reqs)
     busy = num_reqs > 0
     return StepShape.local(
