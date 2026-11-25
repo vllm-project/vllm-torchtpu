@@ -150,7 +150,7 @@ LADDER_ARGS = (TILE_M, ROWS_ALLOC, 8, 8)
 @pytest.mark.parametrize(
     "override,want",
     [
-        (None, tuple(range(128, 513, 128))),
+        (None, (256, 512)),  # MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE defaults to 2
         ("0", tuple(range(128, 513, 128))),
         ("2", (256, 512)),
         ("8", tuple(range(64, 513, 64))),
@@ -163,7 +163,8 @@ LADDER_ARGS = (TILE_M, ROWS_ALLOC, 8, 8)
 def test_the_height_ladder_override(monkeypatch, override, want):
     """The override is a request the ladder still has to be able to honour.
 
-    Unset and zero leave the built-in count. One is the ladder off, by the same
+    Unset is the env default (two rungs); zero leaves the built-in count. One
+    is the ladder off, by the same
     path a count that cannot be built takes: a step that is not whole row
     blocks, or that does not divide the tile height into equal rungs, or a
     nonsense count. All of them fall back to the single full height rather than

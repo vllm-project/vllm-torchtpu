@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
-    MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
+    MOE_REQUANTIZE_BLOCK_SIZE: int | None = 256
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
@@ -78,7 +78,7 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
-    TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_MOE_SKIP_PADDED_TOKENS: bool = True
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_PACKED_DISPATCH: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -86,8 +86,8 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
-    MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
-    MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_SHARDED_PLAN: bool = True
+    MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 2
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_MTP_PREFILL_ONLY: bool = False
@@ -101,9 +101,9 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
-    TPU_MOE_RAGGED_A2A: bool = False
-    TPU_MOE_A2A_CAPACITY: float = 2.5
-    TPU_MOE_A2A_ROUTE_CAPACITY: float = 3.0
+    TPU_MOE_RAGGED_A2A: bool = True
+    TPU_MOE_A2A_CAPACITY: float | None = None
+    TPU_MOE_A2A_ROUTE_CAPACITY: float | None = None
     TPU_DECODE_FAST_PATHS_OFF: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
     PCP_GDN_COMM_CHUNK_SIZE: int | None = None
@@ -278,6 +278,23 @@ def env_nonnegative_int(env_name: str, default: int) -> Callable[[], int]:
         return value
 
     return _get_nonnegative_int_env
+
+
+def env_optional_float(env_name: str) -> Callable[[], float | None]:
+    """Float knob that is None when unset or empty. An unparseable value raises."""
+
+    def _get_optional_float_env() -> float | None:
+        value = os.getenv(env_name)
+        if value is None or value.strip() == "":
+            return None
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid value '{value}' for {env_name}: must be a number."
+            ) from exc
+
+    return _get_optional_float_env
 
 
 def env_float(env_name: str, default: float) -> Callable[[], float]:
@@ -463,14 +480,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
     ),
-    # Specify requantization block size for MoE weights. When unset, NVFP4
+    # Specify requantization block size for MoE weights. Defaults to 256 (one
+    # fp32 scale per 256 K elements), as in the qwen38 decode repro job
+    # j-d5d7d9f8-b761-4b12-b8b9. "none" or empty unsets it: NVFP4
     # expert-parallel layers admitted with USE_MOE_FUSED_EP_KERNEL and
-    # MOE_FUSED_EP_ENABLE_W4A8 use the kernel's smallest supported block.
-    # Selecting MOE_FUSED_EP_KERNEL_IMPL=adaptive also does this automatically.
-    # Other MoE paths retain their default, including explicit requantization.
-    "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
-    if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
-    else None,
+    # MOE_FUSED_EP_ENABLE_W4A8 then use the kernel's smallest supported block
+    # (MOE_FUSED_EP_KERNEL_IMPL=adaptive also does this automatically), and the
+    # other MoE paths keep their own default.
+    "MOE_REQUANTIZE_BLOCK_SIZE": lambda: None
+    if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE", "256").strip().lower())
+    in ("", "none")
+    else int(block_size),
     # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
     # wins; unset defers to
     # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects
@@ -637,10 +657,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     else None,
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away. On by
-    # default with TPU_MOE_RAGGED_A2A, whose exchange would otherwise carry the
-    # padded tokens; an explicit 0 or 1 is honored with or without it.
+    # default with TPU_MOE_RAGGED_A2A (itself on by default), whose exchange
+    # would otherwise carry the padded tokens; an explicit 0 or 1 is honored
+    # with or without it.
     "TPU_MOE_SKIP_PADDED_TOKENS": lambda: env_bool(
-        "TPU_MOE_SKIP_PADDED_TOKENS", default=env_bool("TPU_MOE_RAGGED_A2A")()
+        "TPU_MOE_SKIP_PADDED_TOKENS",
+        default=env_bool("TPU_MOE_RAGGED_A2A", default=True)(),
     )(),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
@@ -685,13 +707,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
-    "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
+    # On by default (as in the qwen38 decode repro recipe).
+    "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool(
+        "MOE_FUSED_EP_V2_SHARDED_PLAN", default=True
+    ),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
-    # live rows, so one is the ladder off. Zero leaves the choice to the
-    # kernel.
+    # live rows, so one is the ladder off. Zero (or empty) leaves the choice
+    # to the kernel. Defaults to 2 (as in the qwen38 decode repro recipe).
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
-        os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
+        os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "2") or 0
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
@@ -746,15 +771,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rank sums the expert and shared-expert outputs in f32 and the engine
     # all-gathers the sums, so the MoE output needs no TP all-reduce; the
     # expert kernel's tail can do that sum itself (a2a_owner_tail).
-    "TPU_MOE_RAGGED_A2A": env_bool("TPU_MOE_RAGGED_A2A"),
+    # On by default; set 0 to restore the all-gather + reduce-scatter exchange.
+    # decode_switches.RAGGED_A2A_DEFAULT must match this default.
+    "TPU_MOE_RAGGED_A2A": env_bool("TPU_MOE_RAGGED_A2A", default=True),
     # Ragged all-to-all exchange: size the per-rank token rows and local routes
     # at this many times their uniform-routing mean (exact: a step that does
-    # not fit runs the full-size exchange). 0 = always full size.
-    "TPU_MOE_A2A_CAPACITY": env_float("TPU_MOE_A2A_CAPACITY", 2.5),
+    # not fit runs the full-size exchange). 0 = always full size. Unset = by the
+    # DP group size: 2.5 up to 8 members, 4 up to 16, 7 above
+    # (layers.adapter.ragged_a2a_moe.capacity_factors).
+    "TPU_MOE_A2A_CAPACITY": env_optional_float("TPU_MOE_A2A_CAPACITY"),
     # The local routes' factor (0 = TPU_MOE_A2A_CAPACITY): real routing skews
     # routes more than rows. Both factors are capped at 2 where the full-size
-    # exchange stays on the one-hot path (its rerun is cheap there).
-    "TPU_MOE_A2A_ROUTE_CAPACITY": env_float("TPU_MOE_A2A_ROUTE_CAPACITY", 3.0),
+    # exchange stays on the one-hot path (its rerun is cheap there). Unset = by
+    # the DP group size: 3 up to 8 members, 5 up to 16, 8.5 above.
+    "TPU_MOE_A2A_ROUTE_CAPACITY": env_optional_float("TPU_MOE_A2A_ROUTE_CAPACITY"),
     # Comma-separated paths of decode_switches.PATHS to leave off although their
     # parent switch is on. Unknown names refuse to start.
     "TPU_DECODE_FAST_PATHS_OFF": env_str("TPU_DECODE_FAST_PATHS_OFF", ""),

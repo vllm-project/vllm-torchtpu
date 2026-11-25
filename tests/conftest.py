@@ -30,6 +30,13 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 
+# The serving defaults turn on the ragged all-to-all MoE exchange and block-256
+# MoE weight requantization (envs.py). Unit tests build MoE layers without EP
+# or on other MoE paths, so they keep the component defaults; a test that
+# covers the exchange or a block size sets its variable itself.
+os.environ.setdefault("TPU_MOE_RAGGED_A2A", "0")
+os.environ.setdefault("MOE_REQUANTIZE_BLOCK_SIZE", "none")
+
 import pytest
 import torch
 

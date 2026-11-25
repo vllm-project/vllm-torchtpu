@@ -25,6 +25,7 @@ NEW_LINE = {
     "TPU_MOE_RAGGED_A2A": "1",
 }
 ALL_PATHS = {p.name for p in ds.PATHS}
+A2A_PATHS = {p.name for p in ds.PATHS if p.parent == ds.RAGGED_A2A}
 EXCHANGE_OF_THE_NEW_LINE = {
     "capacity_row_tile": 32,
     "row_gather": True,
@@ -55,23 +56,9 @@ def test_the_launch_line_turns_every_path_on():
 @pytest.mark.parametrize(
     "env,paths",
     [
-        ({}, set()),
-        # The exchange alone: its own paths, none of the others.
-        (
-            {"TPU_MOE_RAGGED_A2A": "1"},
-            {
-                "a2a_streamed_combine",
-                "a2a_sorted_plan",
-                "a2a_row_gather",
-                "a2a_row_scatter",
-                "a2a_send_rows_minor",
-                "a2a_routing_dma",
-                "a2a_plan_kernel",
-                "a2a_unquantized",
-                "a2a_owner_combine",
-                "a2a_owner_tail",
-            },
-        ),
+        # The exchange is on by default: its own paths, none of the others.
+        ({}, A2A_PATHS),
+        ({"TPU_MOE_RAGGED_A2A": "1"}, A2A_PATHS),
         ({"TPU_MOE_RAGGED_A2A": "0"}, set()),
     ],
 )
@@ -156,7 +143,7 @@ def test_without_the_owner_combine_path_the_streamed_combine_serves_the_layer():
 
 
 def test_the_owner_combine_needs_the_exchange():
-    env = {k: v for k, v in NEW_LINE.items() if k != "TPU_MOE_RAGGED_A2A"}
+    env = {**NEW_LINE, "TPU_MOE_RAGGED_A2A": "0"}
     sw = ds.resolve(env)
     assert not sw.owner_combine and not sw.path("a2a_owner_combine")
     assert ds.resolve({"TPU_MOE_RAGGED_A2A": "1"}).owner_combine
@@ -165,7 +152,8 @@ def test_the_owner_combine_needs_the_exchange():
 @pytest.mark.parametrize(
     "env,skip",
     [
-        ({}, False),
+        ({}, True),  # the exchange is on by default
+        ({"TPU_MOE_RAGGED_A2A": "0"}, False),
         ({"TPU_MOE_RAGGED_A2A": "1"}, True),
         ({"TPU_MOE_SKIP_PADDED_TOKENS": "1"}, True),
         ({"TPU_MOE_RAGGED_A2A": "1", "TPU_MOE_SKIP_PADDED_TOKENS": "0"}, False),
@@ -220,7 +208,7 @@ def test_the_owner_combine_of_a_layer_needs_the_switches_and_the_facts():
         {"TPU_MOE_RAGGED_A2A": "1", "TPU_DECODE_FAST_PATHS_OFF": "a2a_owner_combine"}
     )
     assert not ds.owner_combine_layer(no_owner, _facts())
-    assert not ds.owner_combine_layer(ds.resolve({}), _facts())
+    assert not ds.owner_combine_layer(ds.resolve({"TPU_MOE_RAGGED_A2A": "0"}), _facts())
 
 
 @pytest.mark.parametrize("scaling", [1.0, 2.5])

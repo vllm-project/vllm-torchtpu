@@ -28,6 +28,8 @@ from collections.abc import Mapping
 from vllm_torchtpu import envs
 
 RAGGED_A2A = "TPU_MOE_RAGGED_A2A"
+# Unset TPU_MOE_RAGGED_A2A reads as on; must match envs.TPU_MOE_RAGGED_A2A.
+RAGGED_A2A_DEFAULT = True
 FAST_PATHS_OFF = "TPU_DECODE_FAST_PATHS_OFF"
 
 # Rows per capacity tile of the ragged exchange.
@@ -111,10 +113,11 @@ PATH_NAMES = tuple(p.name for p in PATHS)
 
 
 def _flag(environ: Mapping[str, str], name: str) -> bool:
-    """The boolean value of ``name``; false when unset or empty."""
+    """The boolean value of ``name``; its default when unset or empty (true
+    for ``RAGGED_A2A``, false otherwise)."""
     value = environ.get(name)
     if value is None or value.strip() == "":
-        return False
+        return RAGGED_A2A_DEFAULT if name == RAGGED_A2A else False
     lowered = value.strip().lower()
     if lowered in envs._TRUE_STRINGS:
         return True

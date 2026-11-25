@@ -94,7 +94,7 @@ def test_runner_and_op_agree_for_every_layer(
 
 
 def test_a_layer_without_the_exchange_is_never_armed(monkeypatch):
-    monkeypatch.delenv("TPU_MOE_RAGGED_A2A", raising=False)
+    monkeypatch.setenv("TPU_MOE_RAGGED_A2A", "0")
     runner = _runner(monkeypatch)
     assert decode_switches.arm_owner_combine(runner.routed_experts) is False
     assert runner._owner_combine_armed() is False
