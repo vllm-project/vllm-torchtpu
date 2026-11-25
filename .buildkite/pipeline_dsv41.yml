@@ -180,6 +180,8 @@ steps:
             tests/models/vllm/test_dsv41_v2_prefix_replay.py
             tests/layers/adapter/test_fused_moe_ep.py
             tests/kernels/fused_moe/test_fused_ep_moe_v2_weight_slots.py
+            tests/test_expert_relayout.py
+            tests/kernels/fused_moe/test_fused_ep_moe_v2_plan_kernel.py
             tests/kernels/test_decode_preparation.py
             tests/kernels/test_decode_bridge.py
             tests/models/vllm/test_csa2_chunk_cache.py
@@ -187,6 +189,27 @@ steps:
             tests/compilation/test_moe_schedule.py
             tests/kernels/deepseek_v41/test_csa2_prefill.py
             -q --junitxml=perf_eval_results/dsv41-kernel-config.xml
+
+      # The opt-in serving features: SRPT prefill ordering, API-server segment
+      # tokenization and the data-parallel request routers. The scheduler
+      # tests read facebook/opt-125m's config from the Hugging Face Hub.
+      - label: "DeepSeek-V4.1 serving scheduler and front end: CPU tests"
+        key: "dsv41_serving_cpu"
+        <<: *cpu_step
+        env:
+          SHAPE: "cpu"
+          JAX_PLATFORMS: "cpu"
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh python -m pytest
+            tests/test_srpt_prefill_scheduler.py
+            tests/entrypoints/test_segment_tokenize.py
+            tests/entrypoints/test_detok_prime_suffix.py
+            tests/core/test_dp_prompt_backlog.py
+            tests/core/test_dp_prefix_affinity.py
+            -q --junitxml=perf_eval_results/dsv41-serving-cpu.xml
 
   - group: "DeepSeek-V4.1-Flash on TPU"
     depends_on: "build_docker"

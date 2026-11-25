@@ -66,6 +66,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     token_gather_smem_bytes,
 )
 from vllm_torchtpu.layers.adapter import expert_load as expert_load_tap
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -227,7 +228,8 @@ def _build_op(
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
     moe_layer = fused_ep_moe_v2
-    impl_kw = {}
+    # v2's own knob, read here like the push build's below.
+    impl_kw: dict[str, Any] = {"plan_kernel": envs.MOE_FUSED_EP_V2_PLAN_KERNEL}
     if envs.MOE_FUSED_EP_KERNEL_IMPL == "push":
         # Same operands and admission as v2; only the dispatch differs. The
         # push build's own knobs are read here, never inside kernels/.
@@ -659,6 +661,16 @@ def _operand_fn(call, names, outputs=1):
     return fn
 
 
+def _route_padded_rows_nowhere(router_logits: torch.Tensor) -> torch.Tensor:
+    """Padded rows get -inf logits, which the kernel's router reads as an
+    invalid row (`_row_routes`): no expert computes or returns it. Real rows
+    keep their logits, so their routing and output do not change."""
+    padded = token_padding.local_padding_rows(router_logits.shape[0])
+    if padded is None:
+        return router_logits
+    return router_logits.masked_fill(padded[:, None], float("-inf"))
+
+
 def fused_moe_ep(
     owner: Any,
     hidden_states: torch.Tensor,
@@ -694,6 +706,7 @@ def fused_moe_ep(
     with an op built with a shared limit, which then returns (routed, shared).
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
+    router_logits = _route_padded_rows_nowhere(router_logits)
     if w1.dtype == torch.float4_e2m1fn_x2:
         # FP4 scales are already [E, K/block, N] (or the kernel's row-padded
         # flat [E * rows, N]). Even a single block must retain its axis; the
@@ -1058,17 +1071,14 @@ def prebuild_fused_moe_ep(
         token_replica_groups,
         None if placed is None else tuple(placed.shape),
     )
-    # Two knobs stop applying the moment this arms, and neither would say so on
-    # its own: the fused call returns before `apply_monolithic` reaches either
-    # the padding mask or the chunked path. Padding costs expert work and
-    # transport rather than correctness -- and it is not free at warmup, where
-    # `_dummy_run` marks the whole batch as padding.
-    if envs.TPU_MOE_SKIP_PADDED_TOKENS or envs.TPU_MOE_COLLECTION_CHUNK_SIZE:
+    # The chunked path stops applying the moment this arms, and would not say
+    # so on its own: the fused call returns before `apply_monolithic` reaches
+    # it.
+    if envs.TPU_MOE_COLLECTION_CHUNK_SIZE:
         logger.warning_once(
-            "Fused EP MoE armed, so TPU_MOE_SKIP_PADDED_TOKENS=%s and "
-            "TPU_MOE_COLLECTION_CHUNK_SIZE=%s are not in effect for this "
-            "layer: the kernel routes and exchanges inside its own program.",
-            envs.TPU_MOE_SKIP_PADDED_TOKENS,
+            "Fused EP MoE armed, so TPU_MOE_COLLECTION_CHUNK_SIZE=%s is not in "
+            "effect for this layer: the kernel exchanges inside its own "
+            "program.",
             envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
         )
     return op

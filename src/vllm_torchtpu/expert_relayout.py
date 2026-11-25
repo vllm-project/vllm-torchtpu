@@ -40,7 +40,10 @@ installs between the same two steps.
 
 Load windows are taken only over clean steps (`step_phase`): a padded or
 mixed step's routing is not the serving mix, so it pauses the window, and a
-change between prefill and decode starts it over.
+change between prefill and decode starts it over. Where padded rows are
+routed and counted, a clean step must also be nearly full, since its padded
+rows all hold one hidden state and pick the same experts; where they route
+to no expert, a partly filled step counts only real rows and is clean.
 """
 
 from __future__ import annotations
@@ -69,8 +72,9 @@ HASH_BITS = 62
 FREE = -1
 # A step is "decode" when its padded token bucket is at most this.
 DECODE_MAX_TOKENS = 512
-# A clean step: every rank's tokens (and, in decode, requests) fill at least
-# this fraction of the bucket (of the request slots).
+# Where padded rows are counted, a clean step's tokens (and, in decode,
+# requests) fill at least this fraction of the bucket (of the request slots)
+# on every rank.
 CLEAN_FILL = 0.8
 # The first decode window after a phase change is this many steps (or the
 # window, if shorter), so a layout for the decode mix lands early.
@@ -660,21 +664,38 @@ def step_phase(
     max_reqs: int,
     min_reqs: int,
     max_num_reqs: int,
+    max_prefill_reqs: int = 0,
+    padded_rows_counted: bool = True,
 ) -> str:
     """The coordinated step's phase from the DP all-reduce's fields (the same
     on every rank): "prefill" or "decode" for a clean step, "padded" for one
-    whose load does not represent the serving mix (an idle or partly filled
-    rank, a multi-chunk step, a request batch far from full in decode)."""
-    is_decode = bucket <= DECODE_MAX_TOKENS
+    whose load does not represent the serving mix (no tokens, a multi-chunk
+    step).
+
+    `padded_rows_counted` says whether the step's padded rows reach the
+    expert-load counts. When they do, an idle or partly filled rank, or a
+    request batch far from full in decode, is also "padded": its padded rows
+    all pick the same experts and would dominate the window. When none of
+    them reaches the counts (TPUModelRunner.padded_rows_reach_expert_load),
+    the counts hold real rows only, so a partly filled step is clean -- the
+    load at the concurrency being served. A small step that carries prefill
+    rows (`max_prefill_reqs`, the most prefill or mixed requests on any rank)
+    then counts as "prefill": its routing is not the decode mix, and without
+    the fill rule nothing else keeps it out of a decode window. Where padded
+    rows are counted, the fill rule already keeps most such steps out, so
+    they keep the bucket test."""
+    is_decode = bucket <= DECODE_MAX_TOKENS and (
+        padded_rows_counted or max_prefill_reqs == 0
+    )
     req_target = max(int(max_num_reqs), max_reqs)
+    filled = min_tokens >= int(CLEAN_FILL * bucket) and (
+        not is_decode or (max_reqs > 0 and min_reqs >= int(CLEAN_FILL * req_target))
+    )
     clean = (
         max_tokens > 0
         and bucket > 0
         and num_chunks == 1
-        and min_tokens >= int(CLEAN_FILL * bucket)
-        and (
-            not is_decode or (max_reqs > 0 and min_reqs >= int(CLEAN_FILL * req_target))
-        )
+        and (filled or not padded_rows_counted)
     )
     if not clean:
         return "padded"
@@ -857,11 +878,15 @@ class Controller:
         move_bytes: dict[str, int] | None = None,
         step_budget_bytes: int = 0,
         mode: EplbMode = EplbMode.DECODE_ONLY,
+        padded_rows_counted: bool = True,
     ) -> None:
         """groups: name -> dict(experts, active, staging, replica_cap).
         snapshot(): (group, layer) -> cumulative counts [P]. install(module,
-        table): writes a layer's table. layouts: the live layouts at arm."""
+        table): writes a layer's table. layouts: the live layouts at arm.
+        padded_rows_counted: whether padded rows reach the counts, which the
+        runner passes to `step_phase` each step."""
         self.mode = EplbMode(mode)
+        self.padded_rows_counted = bool(padded_rows_counted)
         self._sample_phase = {
             EplbMode.PREFILL_ONLY: "prefill",
             EplbMode.DECODE_ONLY: "decode",
@@ -1385,6 +1410,7 @@ def arm(
     lockstep: bool = True,
     vllm_config=None,
     transport=None,
+    padded_rows_counted: bool = True,
 ) -> Controller | None:
     """Build this rank's controller, or return None with the reason logged.
 
@@ -1485,9 +1511,14 @@ def arm(
         min_gain=envs.TPU_MOE_EPLB_MIN_GAIN,
         move_bytes=move_bytes,
         step_budget_bytes=mover.step_budget_bytes,
+        padded_rows_counted=padded_rows_counted,
         mode=mode,
     )
-    logger.info("expert relayout policy | mode=%s", controller.mode)
+    logger.info(
+        "expert relayout policy | mode=%s padded_rows_counted=%s",
+        controller.mode,
+        controller.padded_rows_counted,
+    )
     first = next(iter(kept_modules.values()))
     try:
         parts = expert_mover.describe_parts(first, transport)
@@ -1527,6 +1558,7 @@ def arm_for_runner(runner) -> Controller | None:
             ep_global_ranks=[int(r) for r in group.ranks],
             lockstep=bool(runner._dp_lockstep_enabled()),
             vllm_config=getattr(runner, "vllm_config", None),
+            padded_rows_counted=runner.padded_rows_reach_expert_load(),
         )
     except ImportError:
         raise

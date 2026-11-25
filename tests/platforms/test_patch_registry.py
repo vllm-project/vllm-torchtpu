@@ -219,12 +219,20 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_dsv41_page_order",
         "_patch_vllm_merge_multimodal_embeddings",
         "install_engine_core",
+        "install_if_enabled",
     ]
     assert stages["platform_activation"] == (
         stages["worker_init"] + stages["model_load"]
     )
     assert stages["model_load"] == ["maybe_patch_qwen3_vl"]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
+    backlog = "vllm_torchtpu.core.dp_prompt_backlog:install_if_enabled"
+    assert {"platform_activation", "engine_core"} <= set(
+        next(p.stages for p in reg.PATCHES if p.target == backlog)
+    )
+    affinity = "vllm_torchtpu.core.dp_prefix_affinity:install_if_enabled"
+    front_end = [p.target for p in reg.PATCHES if "platform_activation" in p.stages]
+    assert front_end.index(backlog) < front_end.index(affinity)
     for names in (stages["platform_activation"], stages["worker_init"]):
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
             "_patch_vllm_config_triton_tpu"

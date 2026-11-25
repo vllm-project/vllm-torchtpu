@@ -14,13 +14,24 @@
 """The dynamic re-layout controller, on the host, with fakes for the tap, the
 mover and the per-step all-reduce (expert_relayout.py)."""
 
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 import torch
+from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 from vllm_torchtpu import eplb_policy
 from vllm_torchtpu import expert_mover as mv
 from vllm_torchtpu import expert_relayout as rl
+from vllm_torchtpu.layers.adapter import expert_load, fused_moe_ep
+from vllm_torchtpu.layers.core.pcp_sequence_layout import PcpSequenceLayoutPlanner
+from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
+from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.dspark import DSparkProposer
+from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 pytestmark = pytest.mark.cpu_test
 
@@ -771,3 +782,266 @@ def test_window_deltas_wrap_cleanly_across_int32_overflow():
         10.0,
         10.0,
     ]
+
+
+# A c64 decode step over DP8 with DSpark K=5: 7 to 9 requests per rank of 64
+# request slots, 6 tokens each, in a 96-token bucket.
+C64_DECODE = dict(
+    bucket=96,
+    max_tokens=54,
+    min_tokens=42,
+    num_chunks=1,
+    max_reqs=9,
+    min_reqs=7,
+    max_num_reqs=64,
+)
+# Every rank's tokens and requests at least 80% full.
+FULL_DECODE = C64_DECODE | dict(
+    bucket=384, max_tokens=384, min_tokens=360, max_reqs=64, min_reqs=60
+)
+# One rank's 2,048-token chunk beside another's 900-token prompt tail.
+PARTIAL_PREFILL = C64_DECODE | dict(
+    bucket=2048, max_tokens=2048, min_tokens=900, max_reqs=2, min_reqs=1
+)
+# One rank serving the c64 batch's requests while another runs a dummy step.
+IDLE_RANK = C64_DECODE | dict(min_tokens=0, min_reqs=0)
+# One rank's single 400-token prompt tail in a 512-token bucket, beside
+# decoding or idle ranks.
+SMALL_PREFILL = C64_DECODE | dict(
+    bucket=512, max_tokens=400, min_tokens=0, max_reqs=1, min_reqs=0, max_prefill_reqs=1
+)
+# A full decode batch with one prompt tail on some rank.
+FULL_MIXED = FULL_DECODE | dict(max_prefill_reqs=1)
+
+
+@pytest.mark.parametrize(
+    ("fields", "counted", "want"),
+    [
+        pytest.param(C64_DECODE, True, "padded", id="c64-counted"),
+        pytest.param(C64_DECODE, False, "decode", id="c64-not-counted"),
+        pytest.param(IDLE_RANK, True, "padded", id="idle-rank-counted"),
+        pytest.param(IDLE_RANK, False, "decode", id="idle-rank-not-counted"),
+        pytest.param(PARTIAL_PREFILL, True, "padded", id="partial-prefill-counted"),
+        pytest.param(
+            PARTIAL_PREFILL, False, "prefill", id="partial-prefill-not-counted"
+        ),
+        pytest.param(FULL_DECODE, True, "decode", id="full-counted"),
+        pytest.param(FULL_DECODE, False, "decode", id="full-not-counted"),
+        pytest.param(SMALL_PREFILL, True, "padded", id="small-prefill-counted"),
+        pytest.param(SMALL_PREFILL, False, "prefill", id="small-prefill-not-counted"),
+        pytest.param(FULL_MIXED, True, "decode", id="full-mixed-counted"),
+        pytest.param(FULL_MIXED, False, "prefill", id="full-mixed-not-counted"),
+        pytest.param(C64_DECODE, None, "padded", id="c64-default"),
+    ],
+)
+def test_a_partly_filled_step_is_clean_only_where_padded_rows_are_not_counted(
+    fields, counted, want
+):
+    kwargs = {} if counted is None else dict(padded_rows_counted=counted)
+    assert rl.step_phase(**fields, **kwargs) == want
+
+
+@pytest.mark.parametrize("counted", [True, False])
+@pytest.mark.parametrize(
+    "fields",
+    [
+        pytest.param(FULL_DECODE | dict(max_tokens=0, min_tokens=0), id="no_tokens"),
+        pytest.param(FULL_DECODE | dict(num_chunks=2), id="multi_chunk"),
+    ],
+)
+def test_steps_without_tokens_or_with_several_chunks_are_never_clean(fields, counted):
+    assert rl.step_phase(**fields, padded_rows_counted=counted) == "padded"
+
+
+@pytest.mark.parametrize(("counted", "solves"), [(True, False), (False, True)])
+def test_c64_decode_steps_fill_a_load_window_only_where_padded_rows_are_not_counted(
+    counted, solves
+):
+    tap = _Tap()
+    c = _controller(0, tap, _Mover(), [])
+    phase = rl.step_phase(**C64_DECODE, padded_rows_counted=counted)
+    # Eight of the controller's 4-step windows.
+    for step in range(1, 8 * c.window_steps + 1):
+        c.on_step(step, c.fields(), phase=phase)
+        c.after_dispatch()
+        tap.advance()
+    assert (c.stats["triggers"] > 0) is solves
+
+
+def test_arm_hands_the_controller_the_runner_padding_answer(monkeypatch):
+    _arm_env(monkeypatch)
+    _fake_placed_world(monkeypatch)
+    for counted in (True, False):
+        c = rl.arm(
+            ep_rank=1,
+            ep_world=2,
+            ep_global_ranks=[4, 5],
+            transport=_CPU,
+            padded_rows_counted=counted,
+        )
+        assert c is not None and c.padded_rows_counted is counted
+
+
+class _QuantMethod:
+    """A layer's quant method, armed for the fused EP op or not."""
+
+    def __init__(self, fused):
+        if fused:
+            setattr(self, fused_moe_ep.FUSED_MOE_EP_OP_ATTR, object())
+
+
+@pytest.mark.parametrize(
+    ("fused", "want"),
+    [
+        pytest.param((True, True), True, id="all-fused"),
+        pytest.param((True, False), False, id="one-not-fused"),
+        pytest.param((), False, id="no-layers"),
+    ],
+)
+def test_counts_leave_out_masked_rows_only_when_every_layer_is_fused(
+    monkeypatch, fused, want
+):
+    layers = [
+        (f"layer{i}", SimpleNamespace(quant_method=_QuantMethod(f)))
+        for i, f in enumerate(fused)
+    ]
+    monkeypatch.setattr(expert_load, "_REGISTERED", layers)
+    assert expert_load.counts_leave_out_masked_rows() is want
+
+
+def _padding_runner(**over):
+    """The fields `padded_rows_reach_expert_load` reads, all set so that no
+    padded row reaches the counts; `over` replaces some."""
+    fields = dict(
+        _token_padding_state=object(),
+        sequence_layout_planner=AllSequenceLayoutPlanner.__new__(
+            AllSequenceLayoutPlanner
+        ),
+        drafter=DSparkProposer.__new__(DSparkProposer),
+    )
+    return SimpleNamespace(**(fields | over))
+
+
+@pytest.mark.parametrize(
+    ("over", "reach"),
+    [
+        pytest.param({}, False, id="dspark-drafter"),
+        pytest.param(dict(drafter=None), False, id="no-drafter"),
+        pytest.param(
+            dict(drafter=DFlashProposer.__new__(DFlashProposer)), False, id="dflash"
+        ),
+        pytest.param(
+            dict(drafter=NgramProposer.__new__(NgramProposer)), False, id="ngram"
+        ),
+        pytest.param(dict(_token_padding_state=None), True, id="no-padding-mask"),
+        pytest.param(
+            dict(
+                sequence_layout_planner=PcpSequenceLayoutPlanner.__new__(
+                    PcpSequenceLayoutPlanner
+                )
+            ),
+            True,
+            id="partial-layout",
+        ),
+        pytest.param(
+            dict(drafter=Eagle3Proposer.__new__(Eagle3Proposer)), True, id="eagle3"
+        ),
+    ],
+)
+def test_runner_says_padded_rows_reach_the_counts_unless_all_conditions_hold(
+    monkeypatch, over, reach
+):
+    monkeypatch.setattr(expert_load, "counts_leave_out_masked_rows", lambda: True)
+    runner = _padding_runner(**over)
+    assert TPUModelRunner.padded_rows_reach_expert_load(runner) is reach
+
+
+def test_runner_says_padded_rows_reach_the_counts_from_a_non_fused_layer(
+    monkeypatch,
+):
+    monkeypatch.setattr(expert_load, "counts_leave_out_masked_rows", lambda: False)
+    assert TPUModelRunner.padded_rows_reach_expert_load(_padding_runner()) is True
+
+
+@pytest.mark.parametrize(
+    ("counted", "prefill_reqs", "phase"),
+    [(True, 0, "padded"), (False, 0, "decode"), (False, 1, "prefill")],
+)
+def test_runner_passes_the_padding_answer_and_prefill_requests_to_step_phase(
+    counted, prefill_reqs, phase
+):
+    """A c64 decode step over DP8 through the runner's coordinated step: the
+    all-reduce returns C64_DECODE's fields, and the most prefill requests on
+    any rank in its last field."""
+    seen = []
+
+    class Controller:
+        padded_rows_counted = counted
+
+        def fields(self):
+            return (0, 0, 0)
+
+        def on_step(self, step, reduced, phase):
+            seen.append(phase)
+
+    runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: True,
+        num_tokens_paddings=[96, 2048],
+        _expert_relayout=Controller(),
+        _dp_step_index=0,
+        max_num_reqs=64,
+    )
+
+    def reduce(tensor, **kwargs):
+        assert tensor.tolist()[10] == 1
+        tensor.copy_(torch.tensor([54, 1, 9, 0, 1, 0, 0, 0, -42, -7, prefill_reqs]))
+
+    with (
+        patch("vllm.distributed.parallel_state.get_dp_group") as group,
+        patch.object(torch.distributed, "all_reduce", side_effect=reduce),
+    ):
+        group.return_value.cpu_group = "cpu-group"
+        TPUModelRunner._dp_coordinated_step(runner, 48, 1, 8, local_prefill_reqs=1)
+    assert seen == [phase]
+
+
+@pytest.mark.parametrize("reach", [True, False])
+def test_arm_for_runner_passes_the_runner_padding_answer(monkeypatch, reach):
+    seen = {}
+    monkeypatch.setattr(rl, "arm", lambda **kwargs: seen.update(kwargs))
+    runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: True,
+        padded_rows_reach_expert_load=lambda: reach,
+    )
+    with patch("vllm.distributed.parallel_state.get_ep_group") as group:
+        group.return_value = SimpleNamespace(
+            rank_in_group=0, world_size=2, ranks=[0, 1]
+        )
+        rl.arm_for_runner(runner)
+    assert seen["padded_rows_counted"] is reach
+
+
+def test_the_step_reports_requests_past_the_decode_and_verify_windows():
+    """`execute_model`'s DP step tells the all-reduce how many of this rank's
+    requests carry prefill rows: those after the 1-token decodes and
+    speculative verify windows."""
+    seen = {}
+
+    def coordinated_step(tokens, chunks, **kwargs):
+        seen.update(kwargs, tokens=tokens, chunks=chunks)
+        return 512, 1
+
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=9),
+        _reorder_batch_for_rpa=lambda output: (6, 8),
+        _count_input_chunks=lambda output: (1, 9),
+        _dp_coordinated_step=coordinated_step,
+        _needs_draft_proposals=lambda output: True,
+    )
+    output = SimpleNamespace(
+        total_num_scheduled_tokens=448, scheduled_encoder_inputs={}
+    )
+    assert TPUModelRunner._coordinate_dp_step(runner, output) == (6, 8, 1)
+    assert seen["local_prefill_reqs"] == 1
+    assert (seen["tokens"], seen["chunks"], seen["local_num_reqs"]) == (448, 1, 9)
+    assert runner._dp_target_bucket == 512 and runner._dp_step_num_chunks == 1

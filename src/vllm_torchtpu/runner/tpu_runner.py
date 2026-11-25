@@ -90,7 +90,7 @@ from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter import expert_load, token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -118,6 +118,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     zeros_h2d_source,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
+    AllSequenceLayoutPlanner,
     SequenceLayoutKind,
     create_sequence_layout_planner,
 )
@@ -3570,6 +3571,31 @@ class TPUModelRunner(GPUModelRunner):
                 return True
         return False
 
+    def _coordinate_dp_step(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> tuple[int, int, int]:
+        """Order the batch for RPA, count its chunks and run the DP step's
+        all-reduce. Returns (num_decode_reqs, num_windowed_reqs,
+        target_num_chunks) and records the DP-wide bucket and chunk count."""
+        num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
+            scheduler_output
+        )
+        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
+            scheduler_output
+        )
+        self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
+            scheduler_output.total_num_scheduled_tokens,
+            local_num_chunks,
+            local_num_reqs=local_max_chunk_reqs,
+            has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
+            needs_draft_proposals=self._needs_draft_proposals(scheduler_output),
+            # Requests past the 1-token decodes and speculative verify
+            # windows (`_reorder_batch_for_rpa`) carry prefill rows.
+            local_prefill_reqs=self.input_batch.num_reqs - num_windowed_reqs,
+        )
+        self._dp_step_num_chunks = target_num_chunks
+        return num_decode_reqs, num_windowed_reqs, target_num_chunks
+
     def _dp_coordinated_step(
         self,
         local_num_tokens: int,
@@ -3577,6 +3603,7 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         needs_draft_proposals: bool = True,
+        local_prefill_reqs: int = 0,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._draft_proposals_needed = needs_draft_proposals
@@ -3592,11 +3619,12 @@ class TPUModelRunner(GPUModelRunner):
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
-        # The last five fields belong to the dynamic expert re-layout
+        # The last six fields belong to the dynamic expert re-layout
         # (expert_relayout.py): its plan hash twice (max and -min say whether
         # every rank solved the same plan), -staged generation (the max is
-        # -the slowest rank's), and -tokens and -requests (the min over ranks,
-        # for `step_phase`). The vector's length is the same on every rank.
+        # -the slowest rank's), -tokens and -requests (the min over ranks),
+        # and prefill requests (the max over ranks), the last three for
+        # `step_phase`. The vector's length is the same on every rank.
         controller = self._expert_relayout
         relayout = controller.fields() if controller is not None else (0, 0, 0)
         t = torch.tensor(
@@ -3609,6 +3637,7 @@ class TPUModelRunner(GPUModelRunner):
                 *(int(v) for v in relayout),
                 -int(local_num_tokens),
                 -int(local_num_reqs),
+                int(local_prefill_reqs),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3630,6 +3659,8 @@ class TPUModelRunner(GPUModelRunner):
                     max_reqs=int(t[2].item()),
                     min_reqs=-int(t[9].item()),
                     max_num_reqs=int(self.max_num_reqs),
+                    max_prefill_reqs=int(t[10].item()),
+                    padded_rows_counted=controller.padded_rows_counted,
                 ),
             )
         # Spec-decode draft forwards size themselves off the step's DP-wide
@@ -3773,20 +3804,9 @@ class TPUModelRunner(GPUModelRunner):
                         f"num_prompt_tokens={num_prompt}. "
                         "Set SamplingParams(max_tokens=1) at the service entry."
                     )
-        num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
-            scheduler_output
+        num_decode_reqs, num_windowed_reqs, target_num_chunks = (
+            self._coordinate_dp_step(scheduler_output)
         )
-        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
-            scheduler_output
-        )
-        self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens,
-            local_num_chunks,
-            local_num_reqs=local_max_chunk_reqs,
-            has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
-            needs_draft_proposals=self._needs_draft_proposals(scheduler_output),
-        )
-        self._dp_step_num_chunks = target_num_chunks
 
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it
@@ -7209,6 +7229,32 @@ class TPUModelRunner(GPUModelRunner):
                     )
             except (IndexError, TypeError, AttributeError, KeyError):
                 pass
+
+    def padded_rows_reach_expert_load(self) -> bool:
+        """Whether a step's padded rows can reach the expert-load counts the
+        dynamic expert re-layout samples (expert_relayout.step_phase). They
+        stay out only when all of these hold, each fixed for the process and
+        so the same on every DP rank:
+
+        - the runner keeps a padding mask (`_token_padding_state`);
+        - every step uses the ALL sequence layout, the only one the mask
+          describes (`_token_padding_update` checks the same per plan; the
+          ALL planner makes only ALL plans);
+        - every counted layer runs the fused EP op, which sends masked rows
+          to no expert (expert_load.counts_leave_out_masked_rows);
+        - the drafter, if any, runs no MoE forward of its own (n-gram) or
+          marks its own padded rows before each forward (DFlash, DSpark);
+          another drafter's forwards would read the target's mask.
+        """
+        return not (
+            self._token_padding_state is not None
+            and isinstance(self.sequence_layout_planner, AllSequenceLayoutPlanner)
+            and expert_load.counts_leave_out_masked_rows()
+            and (
+                self.drafter is None
+                or isinstance(self.drafter, (NgramProposer, DFlashProposer))
+            )
+        )
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""
