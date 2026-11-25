@@ -428,6 +428,7 @@ def test_fp4_lse_wide_groups(
     _check(got, want)
 
 
+@pytest.mark.parametrize("ordered", [False, True])
 @pytest.mark.parametrize("dtype", [*CACHE_DTYPES, "int4"])
 @pytest.mark.parametrize(
     "num_tokens,num_real,pages_per_step,most_tiles",
@@ -441,13 +442,16 @@ def test_fp4_lse_wide_groups(
     ],
 )
 def test_decode_units_match_reference(
-    num_tokens, num_real, pages_per_step, most_tiles, dtype, monkeypatch
+    num_tokens, num_real, pages_per_step, most_tiles, dtype, ordered, monkeypatch
 ):
     """8-token tiles of calls over several KV heads run in units of
-    `DECODE_UNIT_GROUPS` groups: group counts per step that are not
-    multiples of it, steps shorter than a unit and its remainder, units
-    holding padding tiles and tiles of several groups, and page copies
-    issued across steps and calls (`run_unit`'s count)."""
+    `DECODE_UNIT_GROUPS` groups (`ordered`: their tile pairs in width order,
+    `_width_order`): group counts per step that are not multiples of it,
+    steps shorter than a unit and its remainder, units holding padding tiles
+    and tiles of several groups, paired and unpaired finishes, and page
+    copies issued across steps and calls (`run_unit`'s count)."""
+    if ordered:
+        monkeypatch.setattr(msa_attention_lse, "WIDTH_ORDER_MIN_TILES", 2)
     monkeypatch.setitem(globals(), "PAGES", 96)
     monkeypatch.setitem(globals(), "TOPK", 16)
     monkeypatch.setattr(msa_attention_lse, "UNIT_TILES_PER_STEP", most_tiles)
