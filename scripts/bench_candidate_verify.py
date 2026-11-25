@@ -95,6 +95,7 @@ class Bench:
             for i in range(RO_GROUPS)
         ]
         self.runner = self._runner()
+        self.gather_mode = "dry"
         self._build_logits_fns()
 
     def _build_logits_fns(self):
@@ -111,13 +112,36 @@ class Bench:
             if dry:
                 full = part.repeat(1, tp)
             else:
-                from vllm.distributed.parallel_state import get_world_group
+                # The world group has no vLLM device communicator; the
+                # functional all-gather lowers the same collective.
+                import torch.distributed as dist
+                import torch.distributed._functional_collectives as funcol
 
-                full = get_world_group().all_gather(part, dim=-1)
+                full = funcol.all_gather_tensor(part, 1, dist.group.WORLD)
             return full[:, :VOCAB]
 
         self.local_logits = tr._tpu_compile(local)
         self.gathered_logits = tr._tpu_compile(gathered)
+        if not dry:
+            self.gather_mode = "compiled functional all-gather"
+            try:
+                x = torch.zeros(4, HIDDEN, dtype=torch.bfloat16).to(self.device)
+                i = torch.arange(4, dtype=torch.int32).to(self.device)
+                tr.synchronize_tensors(self.gathered_logits(x, i))
+            except Exception as e:  # noqa: BLE001 - recorded in the results
+                print("compiled all-gather failed, eager fallback:", repr(e)[:300])
+                compiled_local = self.local_logits
+
+                def eager_gathered(hidden, indices):
+                    import torch.distributed as dist
+
+                    part = compiled_local(hidden, indices)
+                    out = [torch.empty_like(part) for _ in range(tp)]
+                    dist.all_gather(out, part)
+                    return torch.cat(out, dim=1)[:, :VOCAB]
+
+                self.gathered_logits = eager_gathered
+                self.gather_mode = "eager all_gather after compiled GEMM"
 
     def _runner(self):
         torch, tr = self.torch, self.tr
@@ -392,7 +416,9 @@ def dist_report(c, outs):
 def run(rank, tp, device, dry, args):
     bench = Bench(rank, tp, device, dry)
     rows = [int(x) for x in args.rows.split(",")]
-    result = {"timing": {}, "env": BASE_ENV}
+    result = {"timing": {}, "env": BASE_ENV, "gather_mode": bench.gather_mode}
+    if rank == 0:
+        print("B logits:", bench.gather_mode, flush=True)
     for n in rows:
         result["timing"][n] = bench.time_rows(n, args.iters)
         if rank == 0:
