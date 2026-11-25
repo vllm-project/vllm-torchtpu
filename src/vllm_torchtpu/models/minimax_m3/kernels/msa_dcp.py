@@ -299,13 +299,16 @@ def _pick_t(
     col_bits,
     real_cols,
     pretransposed=False,
+    insert=False,
 ):
     """`_candidates_kernel_t`'s picks of one row block: ``(scores, blocks)``
     ``[topk, rows]`` for positions ``pos [1, rows]``.
 
     The block keys and scans only the columns its rows can see (the scores
     span max-model-len, mostly past every row's context): a loop bound read
-    from its positions, one body for every width."""
+    from its positions, one body for every width. With `insert` the keys
+    are `_float_keys` (an f32 `key_ref`) picked in one pass
+    (`_insert_picks`)."""
     num_cols = scores_ref.shape[0 if pretransposed else 1]
     rows = pos.shape[1]
     chunk = _KEY_CHUNK[pretransposed]
@@ -321,7 +324,7 @@ def _pick_t(
         else:
             s = scores_ref[:, pl.ds(start, chunk)].T
         cols = start + jax.lax.broadcasted_iota(jnp.int32, (chunk, rows), 0)
-        key_ref[pl.ds(start, chunk), :] = _column_keys(
+        keys = _column_keys(
             s,
             cols,
             num_visible,
@@ -332,10 +335,19 @@ def _pick_t(
             col_bits=col_bits,
             real_cols=real_cols,
         )
+        key_ref[pl.ds(start, chunk), :] = (
+            _float_keys(keys, col_bits) if insert else keys
+        )
         return carry
 
     jax.lax.fori_loop(0, chunks, build, 0)
-    picks = _scan_picks(key_ref, chunks * chunk, topk)
+    if not insert:
+        picks = _scan_picks(key_ref, chunks * chunk, topk)
+    elif chunk % (8 * _INSERT_UNROLL):
+        raise NotImplementedError(f"{chunk}-column key chunks: no whole insert steps")
+    else:
+        keys = _insert_picks(key_ref, chunks * chunk, topk, col_bits)
+        picks = [keys[i : i + 1] for i in range(topk)]
     return _picked(picks, rank, col_bits=col_bits, dcp=dcp)
 
 
@@ -708,7 +720,7 @@ def _decode_candidates_kernel(
     inputs and caches, or the index cache; out: ``[R, 2 * topk]``
     `pack_candidates` of each row (row = token), then the written caches;
     scratch: the ring and its semaphores, scores ``[R, P]`` f32, keys ``[P,
-    128]`` int32, then the run flags (SMEM) and the write's scratch."""
+    128]`` f32 (`_float_keys`), then the run flags (SMEM) and the write's scratch."""
     it = iter(refs)
     if write is not None:
         num_runs_ref, *run_tables = (next(it) for _ in range(5))
@@ -814,7 +826,12 @@ def _decode_candidates_kernel(
         for b in range(out_ref.shape[0] // _TRANSPOSED_ROWS):
             r = pl.ds(b * _TRANSPOSED_ROWS, _TRANSPOSED_ROWS)
             score, block = _pick_t(
-                rank_ref[0], scores_ref.at[r], pos_ref[:, r], key_ref, **pick
+                rank_ref[0],
+                scores_ref.at[r],
+                pos_ref[:, r],
+                key_ref,
+                **pick,
+                insert=True,
             )
             out_ref[r, :] = jnp.concatenate([score, block.astype(jnp.float32)]).T
         if write is not None:
@@ -959,7 +976,7 @@ def decode_candidates(
         ),
         pltpu.SemaphoreType.DMA((msa_indexer._RING_SLOTS,)),
         pltpu.VMEM((score_rows, num_cols), jnp.float32),
-        pltpu.VMEM((num_cols, _TRANSPOSED_ROWS), jnp.int32),
+        pltpu.VMEM((num_cols, _TRANSPOSED_ROWS), jnp.float32),
     ]
     vmem_bytes = 4 * (
         msa_indexer._RING_SLOTS * pages_per_step * rows_per_page * head_dim
