@@ -20,6 +20,11 @@ program gathers every batch row's slot through `idx_mapping` and returns what
 the stock `_prepare_inputs` uploads for a pure-decode step, with the same
 dtypes and shapes and the same values on live rows, so the precompiled backbone
 and the attention metadata builders run unchanged.
+
+For an M-RoPE model the positions are the decode case of MRV2's
+`RopeState.prepare_positions` (`mm/rope.py`): each slot keeps its request's
+delta, and a generated token's position is its index plus the delta in every
+section.
 """
 
 from __future__ import annotations
@@ -127,6 +132,7 @@ class WalkGeometry:
 @dataclass
 class DecodeInputs:
     input_ids: torch.Tensor
+    # [num_tokens_padded], or [mrope_rows, num_tokens_padded] with M-RoPE.
     positions: torch.Tensor
     seq_lens: torch.Tensor
     query_start_loc: torch.Tensor
@@ -156,13 +162,16 @@ def _prepare_decode_impl(
     mamba_geom: tuple[tuple[int, int, int, int | None], ...],
     ckpt_window: int,
     single_table: bool,
+    mrope_delta: torch.Tensor | None = None,
+    mrope_rows: int = 0,
 ) -> tuple[torch.Tensor, ...]:
     """Returns input_ids, positions, seq_lens, query_start_loc,
     logits_indices, request_distribution, then the compact-mamba slot ids if
     `mamba_slot` is given, then the flat table (`single_table`) or the
     `_staged_walk_products` outputs. Rows past the batch are zero, except
     the query_start_loc tail and logits_indices, which repeat the last live
-    entry as the stock path's do."""
+    entry as the stock path's do. With `mrope_delta`, the positions have
+    `mrope_rows` rows."""
     device = idx_mapping.device
     rows = idx_mapping[:target_rows]
     valid = rows != null_slot
@@ -172,7 +181,15 @@ def _prepare_decode_impl(
     token_rows = rows[tokens.clamp(max=target_rows - 1)]
     token_live = tokens < num_live
     input_ids = torch.where(token_live, last_token[token_rows], 0)
-    positions = torch.where(token_live, num_computed[token_rows], 0)
+    positions = num_computed[token_rows]
+    if mrope_delta is not None:
+        # A generated token's M-RoPE position is its index plus its request's
+        # delta in every section, as the stock `_calc_mrope_positions` stages
+        # it (vLLM's `MRotaryEmbedding.get_next_input_positions_tensor`).
+        positions = positions + mrope_delta[token_rows]
+    positions = torch.where(token_live, positions, 0)
+    if mrope_delta is not None:
+        positions = positions.repeat(mrope_rows, 1)
     seq_lens = torch.where(valid, num_computed[rows] + 1, 0)
     query_start_loc = torch.cat(
         (
@@ -257,6 +274,8 @@ def prepare_decode_inputs(
             geometry.mamba_geom,
             geometry.ckpt_window,
             geometry.single_table,
+            slots.mrope_delta,
+            slots.config.mrope_rows,
         )
     rest = list(outs[6:])
     mamba_state_indices = rest.pop(0) if geometry.compact_mamba else None
