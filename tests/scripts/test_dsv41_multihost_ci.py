@@ -352,6 +352,9 @@ if failure == "stuck":
 while not stopped:
     time.sleep(0.02)
 (out / "shutdown_requested").touch()
+if failure == "slow-results":
+    # A profile's traces: packing and uploading them outlasts the stop timeout.
+    (out / "trace.bin").write_bytes(os.urandom(48 << 20))
 """
 
 
@@ -361,7 +364,9 @@ def _free_port():
         return sock.getsockname()[1]
 
 
-@pytest.mark.parametrize("failure", ["", "head", "worker", "stuck", "audit", "lost"])
+@pytest.mark.parametrize(
+    "failure", ["", "slow-results", "head", "worker", "stuck", "audit", "lost"]
+)
 def test_coordinator_fails_closed_and_collects_the_worker(tmp_path, failure):
     results = tmp_path / "results"
     bench = tmp_path / "bench.py"
@@ -377,7 +382,8 @@ def test_coordinator_fails_closed_and_collects_the_worker(tmp_path, failure):
     common = ["--results", str(results), "--port", port, "--poll", "0.05"]
     head = subprocess.Popen(
         [sys.executable, script, "head", *common, "--bind", "127.0.0.1",
-         "--worker-stop-timeout", "6", "--collect-timeout", "10",
+         "--worker-stop-timeout", "1" if failure == "slow-results" else "6",
+         "--collect-timeout", "10",
          "--worker-lost-after", "2", "--audit", str(audit_stub),
          "--", sys.executable, str(bench), "head", str(results), failure],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -414,13 +420,14 @@ def test_coordinator_fails_closed_and_collects_the_worker(tmp_path, failure):
                 os.killpg(process.pid, signal.SIGKILL)
             process.wait()
     log = head_out + (worker_out or "")
-    assert (head.returncode == 0) == (failure == ""), log
+    passes = failure in ("", "slow-results")
+    assert (head.returncode == 0) == passes, log
     if failure != "lost":
         # The worker never fails the Job; the head owns the verdict.
         assert worker.returncode == 0, log
         assert (results / "worker/benchmark/server.log").read_text() == "worker log"
-    assert (results / "audited").exists() == (failure in ("", "audit")), log
-    if failure in ("", "audit"):
+    assert (results / "audited").exists() == (passes or failure == "audit"), log
+    if passes or failure == "audit":
         assert (results / "worker/benchmark/shutdown_requested").exists()
         assert (results / "benchmark/shutdown-permitted").exists()
     else:

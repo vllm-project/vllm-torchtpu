@@ -90,6 +90,10 @@ if [[ "$scenario" == decode_dp16 ]]; then
   done
 fi
 
+# DSV41_ROUNDS=<n> records n formal rounds (run.py's default: one for decode).
+if [[ -n "${DSV41_ROUNDS:-}" ]]; then
+  launch_args+=(--rounds "$DSV41_ROUNDS")
+fi
 # DSV41_PROFILE=1 adds the harness's separate profile wave.
 if [[ "${DSV41_PROFILE:-0}" == 1 ]]; then
   launch_args+=(--profile)
