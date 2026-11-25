@@ -110,6 +110,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.pcp_sharding_plan import PcpShardingPlanName
 from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -906,6 +907,9 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
 
 
 class PallasAttentionBackendImpl(AttentionImpl):
+    supported_pcp_sharding_plans: ClassVar[frozenset[PcpShardingPlanName]] = frozenset(
+        {PcpShardingPlanName.INTERLEAVED}
+    )
     layer_idx: int
     _kernel_instance_counter = 0
     # Registry of shared custom ops keyed to avoid registering duplicate Pallas
@@ -1311,6 +1315,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 unsupported_features.append(
                     "VLLM_KV_CACHE_LAYOUT=HND without an FP8 KV cache"
                 )
+        if self.head_size == 64:
+            unsupported_features.append("head_size == 64")
+        if self.sliding_window is not None:
+            unsupported_features.append("sliding window")
         if self.sinks is not None:
             unsupported_features.append("attention sinks")
         if self.logits_soft_cap is not None:

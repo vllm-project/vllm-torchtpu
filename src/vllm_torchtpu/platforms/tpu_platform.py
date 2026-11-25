@@ -35,7 +35,14 @@ from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
-from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.platforms.pcp_validation import (
+    PcpStaticSupportValidator,
+    effective_step_token_budget,
+    interleaved_max_local_tokens,
+    is_interleaved_pcp_manager_enabled,
+    pcp_rank0_token_count,
+    pcp_streaming_local_token_multiple,
+)
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
     unified_kv_layout_enabled,
@@ -513,6 +520,9 @@ class TpuPlatform(Platform):
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
+        "USE_TPU_PCP_MANAGER",
+        "TPU_PCP_KV_WORKSPACE_TOKENS",
+        "TPU_PCP_KV_CHUNK_TOKENS",
     ]
 
     @classmethod
@@ -1037,11 +1047,16 @@ class TpuPlatform(Platform):
                     vllm_config.model_config.max_model_len
                     + scheduler_config.max_num_seqs,
                 )
+            max_token_size = budget
+            if is_interleaved_pcp_manager_enabled(vllm_config):
+                max_token_size = max(
+                    max_token_size, pcp_streaming_local_token_multiple()
+                )
             compilation_config.compile_sizes = cast(
                 list[int | str],
                 _get_token_paddings(
                     min_token_size=16,
-                    max_token_size=budget,
+                    max_token_size=max_token_size,
                     extra_bucket_sizes=extra_bucket_sizes,
                 ),
             )
@@ -1732,21 +1747,31 @@ def _validate_token_budget_fits_compile_sizes(vllm_config: VllmConfig) -> None:
     sc = vllm_config.scheduler_config
     if not cc.compile_sizes:
         return
+    compile_sizes = [int(s) for s in cc.compile_sizes]
     pc = vllm_config.parallel_config
     pcp = max(1, int(pc.prefill_context_parallel_size))
     interleave = max(1, int(pc.cp_kv_cache_interleave_size)) if pcp > 1 else 1
+    interleaved_manager = is_interleaved_pcp_manager_enabled(vllm_config)
+    budget_flag, budget = effective_step_token_budget(sc)
+    if interleaved_manager:
+        multiple = pcp_streaming_local_token_multiple()
+        compile_sizes = [s for s in compile_sizes if s % multiple == 0]
+        min_compile_size = interleaved_max_local_tokens(budget, pcp, interleave)
+        if not compile_sizes:
+            raise ValueError(
+                f"Interleaved PCP requires a compile_sizes entry divisible by "
+                f"{multiple} and >= {min_compile_size} (got {list(cc.compile_sizes)}); "
+                f"add a {min_compile_size} bucket to "
+                "--compilation-config compile_sizes."
+            )
+    else:
+        min_compile_size = pcp_rank0_token_count(budget, pcp, interleave)
     cycle = pcp * interleave
-    largest = max(int(s) for s in cc.compile_sizes)
+    largest = max(compile_sizes)
     # The largest step whose rank-0 rows fit `largest`.
     limit = (largest // interleave) * cycle + largest % interleave
-    budget_flag, budget = "--max-num-batched-tokens", sc.max_num_batched_tokens
-    scheduled = sc.max_num_scheduled_tokens
-    if scheduled is not None and scheduled < budget:
-        budget_flag, budget = "--max-num-scheduled-tokens", scheduled
     if budget <= limit:
         return
-    # Rank-0 rows of a full-budget step: the smallest compile size that fits.
-    min_compile_size = (budget // cycle) * interleave + min(budget % cycle, interleave)
     layout = (
         f", {pcp} prefill context parallel ranks, interleave {interleave}"
         if pcp > 1

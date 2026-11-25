@@ -26,12 +26,13 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
-from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import HeadTailPcpShardingPlan
-from vllm_torchtpu.runner.pcp.manager import (
+from vllm_torchtpu.pcp_sharding_plan import PcpShardingPlanName
+from vllm_torchtpu.platforms.pcp_validation import validate_pcp_manager_config
+from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import (
+    HeadTailPcpShardingPlan,
     mla_kv_page_size,
-    validate_pcp_manager_config,
-    validate_pcp_manager_layers,
 )
+from vllm_torchtpu.runner.pcp.manager import validate_pcp_manager_layers
 
 
 def _manager(page_size, workspace_tokens=262144, dcp_size=8):
@@ -159,18 +160,22 @@ def test_pcp_manager_config_rejects(section, field, value, match):
 
 
 def test_pcp_manager_layers_must_opt_in():
-    """An attention layer without `supports_tpu_pcp_manager` (e.g. DeepSeek V4's)
-    would ignore `pcp_metadata`; any such layer fails the check."""
+    """An attention layer without `HEADTAIL` in `supported_pcp_sharding_plans`
+    (e.g. DeepSeek V4's) would ignore `pcp_metadata`; any such layer fails."""
 
     class _Supported:
-        supports_tpu_pcp_manager = True
+        supported_pcp_sharding_plans = frozenset({PcpShardingPlanName.HEADTAIL})
 
     class _Unsupported:
         pass
 
-    validate_pcp_manager_layers({"a": _Supported(), "b": _Supported()})
+    validate_pcp_manager_layers(
+        {"a": _Supported(), "b": _Supported()}, PcpShardingPlanName.HEADTAIL
+    )
     with pytest.raises(NotImplementedError, match="_Unsupported"):
-        validate_pcp_manager_layers({"a": _Supported(), "b": _Unsupported()})
+        validate_pcp_manager_layers(
+            {"a": _Supported(), "b": _Unsupported()}, PcpShardingPlanName.HEADTAIL
+        )
 
 
 def test_glm_attention_layers_support_the_pcp_manager():
@@ -179,8 +184,12 @@ def test_glm_attention_layers_support_the_pcp_manager():
         VllmTPUMLAAttention,
     )
 
-    assert VllmTPUMLAAttention.supports_tpu_pcp_manager
-    assert VllmTPUIndexerCache.supports_tpu_pcp_manager
+    assert PcpShardingPlanName.HEADTAIL in (
+        VllmTPUMLAAttention.supported_pcp_sharding_plans
+    )
+    assert PcpShardingPlanName.HEADTAIL in (
+        VllmTPUIndexerCache.supported_pcp_sharding_plans
+    )
 
 
 def test_pcp_manager_config_rejects_pcp_size_one():

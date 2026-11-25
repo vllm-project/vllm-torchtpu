@@ -78,6 +78,7 @@ from vllm_torchtpu.layers.core.pcp_workspace import (
 )
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.pcp_sharding_plan import PcpShardingPlanName
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
@@ -924,7 +925,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):
     """Indexer K cache retyped onto the TPU backend. See `VllmTPUIndexer`."""
 
-    supports_tpu_pcp_manager: ClassVar[bool] = True
+    supported_pcp_sharding_plans: ClassVar[frozenset[PcpShardingPlanName]] = frozenset(
+        {PcpShardingPlanName.HEADTAIL}
+    )
 
     def get_attn_backend(self) -> type[DeepseekV32IndexerBackend]:
         return VllmTPUDeepseekV32IndexerBackend
@@ -1024,7 +1027,9 @@ class VllmTPUMLAAttention(MLAAttention):
     # Read by vLLM's `MLAAttention.__init__`, which rejects PCP + DCP unless
     # the subclass opts in; the PCP manager handles that combination.
     supports_pcp_dcp: ClassVar[bool] = True
-    supports_tpu_pcp_manager: ClassVar[bool] = True
+    supported_pcp_sharding_plans: ClassVar[frozenset[PcpShardingPlanName]] = frozenset(
+        {PcpShardingPlanName.HEADTAIL}
+    )
 
     def __init__(
         self,

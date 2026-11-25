@@ -14,7 +14,7 @@
 
 import dataclasses
 import functools
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, cast
 
 import jax
 import jax.numpy as jnp
@@ -72,6 +72,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.pcp_sharding_plan import PcpShardingPlanName
 from vllm_torchtpu.utils import fresh_buffer
 
 _GDN_PCP_AXIS_NAME = "pcp"
@@ -352,6 +353,9 @@ def _localize_gdn_mamba_spec_for_pcp(
 
 @QwenGatedDeltaNetAttention.register_oot
 class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+    supported_pcp_sharding_plans: ClassVar[frozenset[PcpShardingPlanName]] = frozenset(
+        {PcpShardingPlanName.INTERLEAVED}
+    )
     # Whether pooled ops consume the merged block-major unified pool, along
     # with `(pool_index, layout)` once bound by `set_block_major_pool()`.
     # Class-level defaults support test/mock instances constructed without `__init__`.

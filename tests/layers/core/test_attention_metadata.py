@@ -701,6 +701,81 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, ctx_preinit, 4)
         assert ctx_preinit.staged_block_tables is None
 
+    @pytest.mark.parametrize("staged", [True, False])
+    def test_pcp_manager_block_tables_depend_on_uses_pcp_metadata(self, staged):
+        """Interleaved PCP reads `attn_metadata.block_tables` (and unified-pool
+        Mamba gathers state indices from it), whereas head-tail PCP reads
+        `pcp_metadata` and leaves `attn_metadata.block_tables` zero-filled."""
+        from vllm_torchtpu.runner.pcp import PcpManager
+        from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import (
+            HeadTailPcpShardingPlan,
+        )
+        from vllm_torchtpu.runner.pcp.interleaved_sharding_plan import (
+            InterleavedPcpShardingPlan,
+        )
+
+        def run_walk(pcp_manager):
+            runner = self._make_runner_mock(num_groups=2, max_num_blocks_per_req=4)
+            runner._unified_kv_layout = True
+            runner.pcp_manager = pcp_manager
+            attn = self._make_builder(runner, kv_cache_group_id=0)
+            mamba = self._make_mamba_builder(runner, kv_cache_group_id=1)
+            self._make_attn_groups(runner, [attn, mamba])
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=2,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.tensor([1, 17, 0, 0], dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            )
+            runner._attn_metadata_builder_ctx = ctx
+            if staged:
+                stage_block_table_uploads(runner, ctx, 4)
+            return runner, [
+                b.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
+                for b in (attn, mamba)
+            ]
+
+        interleaved_mgr = PcpManager(
+            InterleavedPcpShardingPlan(
+                pcp_size=4,
+                pcp_rank=0,
+                interleave_size=4,
+                max_num_batched_tokens=16384,
+            )
+        )
+        runner_ilv, (attn_ilv, mamba_ilv) = run_walk(interleaved_mgr)
+        expected_bt0 = torch.zeros((4, 4), dtype=torch.int32)
+        expected_bt0[:2] = runner_ilv.input_batch.block_table[
+            0
+        ].get_cpu_tensor.return_value[:2]
+        assert attn_ilv.pcp_metadata is None
+        assert mamba_ilv.pcp_metadata is None
+        assert torch.equal(attn_ilv.block_tables.view(4, 4), expected_bt0)
+        # Group 1 block table starts at 100: row 0 col 0 -> 100, row 1 col 1 -> 105.
+        assert torch.equal(
+            mamba_ilv.mamba_state_indices,
+            torch.tensor([100, 105, 0, 0], dtype=torch.int32),
+        )
+
+        headtail_plan = HeadTailPcpShardingPlan(
+            pcp_size=2,
+            pcp_rank=0,
+            dcp_size=8,
+            page_size=16,
+            workspace_tokens=4096,
+            max_num_batched_tokens=4096,
+            max_num_seqs=4,
+        )
+        headtail_plan.prepare_dummy(num_tokens=16, num_reqs=2, max_num_tokens=64)
+        _, (attn_ht, mamba_ht) = run_walk(PcpManager(headtail_plan))
+        assert attn_ht.pcp_metadata is not None
+        assert torch.equal(attn_ht.block_tables, torch.zeros_like(attn_ht.block_tables))
+        assert torch.equal(
+            mamba_ht.block_tables, torch.zeros_like(mamba_ht.block_tables)
+        )
+
 
 class TestPrefillCheckpointIds:
     """Tests for per-group internal prefill checkpoint block ID gathering."""

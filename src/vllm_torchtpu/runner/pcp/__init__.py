@@ -15,14 +15,10 @@
 
 from vllm_torchtpu.runner.pcp.manager import (
     PcpManager,
-    mla_kv_page_size,
-    validate_pcp_manager_config,
     validate_pcp_manager_layers,
 )
 
 __all__ = [
     "PcpManager",
-    "mla_kv_page_size",
-    "validate_pcp_manager_config",
     "validate_pcp_manager_layers",
 ]
