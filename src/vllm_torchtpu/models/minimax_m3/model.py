@@ -536,14 +536,21 @@ class MiniMaxM3Model(nn.Module):
         self.norm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.tp_size = get_tensor_model_parallel_world_size()
         self.sp_mode = _sp_mode() if self.tp_size > 1 else "off"
-        # Per-half attention (StepHalves) is checked with one KV head per DCP
-        # group (head-major queries), on 8-bit and 4-bit caches; a DCP group
-        # over several KV heads (c64's DCP4) halted the TPU.
+        # Per-half attention (StepHalves) is checked on 8-bit caches with one
+        # KV head per rank (head-major queries). On 4-bit caches the second
+        # half's attention reads NaN once its cache writes are ordered after
+        # the first half's reads (and XLA copies the caches when they are
+        # not); a DCP group over several KV heads (c64's DCP4) halted the TPU.
         attn = self.layers[0].self_attn
-        self.step_halves = bool(envs.TPU_MINIMAX_M3_SP_HALVES and attn.q_head_major)
+        self.step_halves = bool(
+            envs.TPU_MINIMAX_M3_SP_HALVES
+            and attn.q_head_major
+            and attn.scale_cache is None
+        )
         if envs.TPU_MINIMAX_M3_SP_HALVES and not self.step_halves:
             logger.warning(
-                "TPU_MINIMAX_M3_SP_HALVES needs DCP over one KV head per rank: off"
+                "TPU_MINIMAX_M3_SP_HALVES needs 8-bit KV caches and DCP over one "
+                "KV head per rank: off"
             )
         # Residual-stream entries of these layers (k = output of layer k-1,
         # residual added, before the next norm) are also returned; set by
