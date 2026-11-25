@@ -1819,7 +1819,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                 )
                 row_tensors.append(
                     torch.empty(0, dtype=kv_dtype, device=int8_view.device)
-                    .set_(int8_view.untyped_storage(), 0, (storage_bytes // itemsize,))
+                    .set_(int8_view.untyped_storage(), 0, (storage_bytes // itemsize,), (1,))
                     .view(storage_bytes // row_bytes, row_bytes // itemsize)
                 )
             self._init_registration(
@@ -1922,6 +1922,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                     int8_view.untyped_storage(),
                     0,
                     (storage_bytes // torch.empty(0, dtype=kv_dtype).element_size(),),
+                    (1,),
                 )
                 .view((num_kernel_blocks,) + per_block_shape)
             )
