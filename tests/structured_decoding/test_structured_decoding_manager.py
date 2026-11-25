@@ -57,12 +57,10 @@ def make_manager(
 def make_grammar_output(
     req_ids: list[str],
     rows: list[list[int]],
-    num_acceptable_drafts: list[int] | None = None,
 ):
     return SimpleNamespace(
         structured_output_request_ids=req_ids,
         grammar_bitmask=np.array(rows, dtype=np.int32),
-        num_acceptable_drafts=num_acceptable_drafts,
     )
 
 
@@ -765,122 +763,3 @@ class TestMaskLogitsWithTrace:
             in name
             for name in events_none
         ), f"SD:PrepareSpecInput (target=None) not found in {events_none}"
-
-
-class TestMaskInvalidDraftTokens:
-    @pytest.fixture(autouse=True)
-    def _run_pinning_eagerly(self):
-        with torch.compiler.set_stance("force_eager"):
-            yield
-
-    def test_fast_path_when_all_drafts_acceptable(self):
-        manager = make_manager(
-            num_spec_tokens=3, req_id_to_index={"req0": 0, "req1": 1}
-        )
-        grammar_output = make_grammar_output(
-            ["req0"],
-            [[ALLOW_ALL, ALLOW_ALL]] * 4,
-            num_acceptable_drafts=[3],
-        )
-        draft_token_ids = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
-        draft_lengths_cpu = np.array([3, 2], dtype=np.int32)
-
-        out = manager.mask_invalid_draft_tokens(
-            draft_token_ids,
-            grammar_output,
-            cur_start_idx=0,
-            cur_end_idx=2,
-            draft_lengths_cpu=draft_lengths_cpu,
-        )
-        assert out is draft_token_ids
-
-    def test_masks_drafts_beyond_num_acceptable_with_draft_lengths_cpu(self):
-        manager = make_manager(
-            num_spec_tokens=3, req_id_to_index={"req0": 0, "req1": 1}
-        )
-        grammar_output = make_grammar_output(
-            ["req0"],
-            [[ALLOW_ALL, ALLOW_ALL]] * 4,
-            num_acceptable_drafts=[1],
-        )
-        # req0 has 3 drafts [10, 11, 12] (only 1 acceptable -> [10, -1, -1]);
-        # req1 is unstructured with 2 drafts [20, 21] (unchanged);
-        # the trailing 3 slots are padding past the drafts (unchanged).
-        draft_token_ids = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
-        draft_lengths_cpu = np.array([3, 2], dtype=np.int32)
-
-        out = manager.mask_invalid_draft_tokens(
-            draft_token_ids,
-            grammar_output,
-            cur_start_idx=0,
-            cur_end_idx=2,
-            draft_lengths_cpu=draft_lengths_cpu,
-        )
-        assert out.tolist() == [10, -1, -1, 20, 21, 0, 0, 0]
-
-    def test_masks_every_structured_request_and_leaves_padding(self):
-        manager = make_manager(
-            num_spec_tokens=3, req_id_to_index={"req0": 0, "req1": 1}
-        )
-        grammar_output = make_grammar_output(
-            ["req0", "req1"],
-            [[ALLOW_ALL, ALLOW_ALL]] * 8,
-            num_acceptable_drafts=[2, 0],
-        )
-        # The trailing 3 slots are padding past the drafts and stay untouched.
-        draft_token_ids = torch.tensor([10, 11, 12, 20, 21, 0, 0, 0], dtype=torch.int32)
-        draft_lengths_cpu = np.array([3, 2], dtype=np.int32)
-
-        out = manager.mask_invalid_draft_tokens(
-            draft_token_ids,
-            grammar_output,
-            cur_start_idx=0,
-            cur_end_idx=2,
-            draft_lengths_cpu=draft_lengths_cpu,
-        )
-        assert out.tolist() == [10, 11, -1, -1, -1, 0, 0, 0]
-
-    def test_none_num_acceptable_drafts_invalidates_all_structured_drafts(self):
-        manager = make_manager(
-            num_spec_tokens=2, req_id_to_index={"req0": 0, "req1": 1}
-        )
-        grammar_output = make_grammar_output(
-            ["req1"],
-            [[ALLOW_ALL, ALLOW_ALL]] * 3,
-            num_acceptable_drafts=None,
-        )
-        draft_token_ids = torch.tensor([10, 11, 20, 21], dtype=torch.int32)
-        draft_lengths_cpu = np.array([2, 2], dtype=np.int32)
-
-        out = manager.mask_invalid_draft_tokens(
-            draft_token_ids,
-            grammar_output,
-            cur_start_idx=0,
-            cur_end_idx=2,
-            draft_lengths_cpu=draft_lengths_cpu,
-        )
-        assert out.tolist() == [10, 11, -1, -1]
-
-    def test_chunk_offset_filters_requests_to_current_chunk(self):
-        manager = make_manager(
-            num_spec_tokens=2,
-            req_id_to_index={"req0": 0, "req1": 1, "req2": 2, "req3": 3},
-        )
-        grammar_output = make_grammar_output(
-            ["req0", "req3"],
-            [[ALLOW_ALL, ALLOW_ALL]] * 6,
-            num_acceptable_drafts=[0, 1],
-        )
-        # Chunk covers [2, 4) -> local 0 is req2 (unstructured, 1 draft),
-        # local 1 is req3 (structured, 2 drafts, 1 acceptable).
-        draft_token_ids = torch.tensor([20, 30, 31, 0], dtype=torch.int32)
-        draft_lengths_cpu = np.array([1, 2], dtype=np.int32)
-
-        out = manager.mask_invalid_draft_tokens(
-            draft_token_ids,
-            grammar_output,
-            cur_start_idx=2,
-            cur_end_idx=4,
-            draft_lengths_cpu=draft_lengths_cpu,
-        )
-        assert out.tolist() == [20, 30, -1, 0]

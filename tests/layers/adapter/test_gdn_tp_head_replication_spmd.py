@@ -159,7 +159,7 @@ def _load_weights(
             )
     layer.A_log.weight_loader(layer.A_log, a_log)
     layer.dt_bias.weight_loader(layer.dt_bias, dt_bias)
-    layer.process_weights_after_loading(torch.bfloat16)
+    layer.process_weights_after_loading()
     params = dict(
         qkvz=proj.weight,
         conv=layer.conv1d.weight,

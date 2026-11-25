@@ -2020,13 +2020,13 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
             self._stop_registration.wait(delay)
             delay = min(delay * 2, 5.0)
 
-    def submit_store(self, job_id, src_spec, dst_spec) -> bool:
+    def submit_store(self, job_id, device_ptrs, dst_spec) -> bool:
         raise AssertionError(
             "TPURaidenOffloadingConnector: submit_store reached a worker; "
             "transfers are controller-driven and jobs must be stripped scheduler-side"
         )
 
-    def submit_load(self, job_id, src_spec, dst_spec, expedited=False) -> bool:
+    def submit_load(self, job_id, src_spec, device_ptrs, expedited=False) -> bool:
         raise AssertionError(
             "TPURaidenOffloadingConnector: submit_load reached a worker; transfers are "
             "controller-driven and jobs must be stripped scheduler-side"

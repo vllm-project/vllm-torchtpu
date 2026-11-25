@@ -228,7 +228,6 @@ def test_get_output_attaches_spec_logprobs():
     out = AsyncTPUModelRunnerOutput(
         model_runner_output=ModelRunnerOutput(
             req_ids=["a", "b", "c"],
-            req_id_to_index={"a": 0, "b": 1, "c": 2},
             sampled_token_ids=[],
             logprobs=None,
         ),
@@ -291,7 +290,6 @@ def test_get_output_attaches_plain_logprobs():
     out = AsyncTPUModelRunnerOutput(
         model_runner_output=ModelRunnerOutput(
             req_ids=["a", "b", "c"],
-            req_id_to_index={"a": 0, "b": 1, "c": 2},
             sampled_token_ids=[],
             logprobs=None,
         ),
@@ -323,7 +321,6 @@ def test_get_output_leaves_logprobs_none(num_rows, logprobs):
     out = AsyncTPUModelRunnerOutput(
         model_runner_output=ModelRunnerOutput(
             req_ids=req_ids,
-            req_id_to_index={r: i for i, r in enumerate(req_ids)},
             sampled_token_ids=[],
             logprobs=None,
         ),
@@ -411,7 +408,6 @@ def test_deferred_logprobs_from_device_match_a_blocking_cpu_copy(
     out = AsyncTPUModelRunnerOutput(
         model_runner_output=ModelRunnerOutput(
             req_ids=req_ids,
-            req_id_to_index={r: i for i, r in enumerate(req_ids)},
             sampled_token_ids=[],
             logprobs=None,
         ),

@@ -229,9 +229,6 @@ def test_spec_verify_chunk_applies_grammar_then_min_tokens(all_greedy: bool) -> 
 
     runner.structured_decoding_manager = SimpleNamespace(
         mask_spec_logits=mask_spec_logits,
-        mask_invalid_draft_tokens=lambda draft_token_ids, *_args, **_kwargs: (
-            draft_token_ids
-        ),
     )
     # The bonus row prefers token 32 (grammar-blocked), then the stop token 12
     # (below min_tokens), then token 33.
@@ -276,9 +273,6 @@ def _grammar_blocking(token: int) -> SimpleNamespace:
     return SimpleNamespace(
         mask_logits=mask_logits,
         mask_spec_logits=mask_spec_logits,
-        mask_invalid_draft_tokens=lambda draft_token_ids, *_args, **_kwargs: (
-            draft_token_ids
-        ),
     )
 
 

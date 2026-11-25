@@ -364,6 +364,7 @@ def test_pcp_1m_hybrid_capacity_admission_and_autofit():
         lambda available: kv_cache_planning._estimate_max_model_len_from_groups(
             builder, config, groups, available
         ),
+        hint="",
     )
     assert (
         kv_cache_planning._estimate_max_model_len_from_groups(

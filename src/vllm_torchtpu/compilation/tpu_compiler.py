@@ -44,7 +44,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
 from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
-from vllm.config.utils import Range
+from vllm.config.utils import CompileFactors, Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
@@ -473,7 +473,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         # aligns the value actually used to min()); hashing it would split
         # ranks into separate cache dirs and force asymmetric recompiles.
         "kv_cache": {
-            "gpu_memory_utilization": cache_config.gpu_memory_utilization,
+            "gpu_memory_utilization": cache_config.resolved_gpu_memory_utilization,
             "num_gpu_blocks": cache_config.num_gpu_blocks,
         },
         # The GDN op traces with prefill checkpoint operands or with constant
@@ -573,9 +573,9 @@ class TpuCompilerAdaptor(CompilerInterface):
         self.cache_dir = cache_dir
         self._disable_cache = disable_cache
 
-    def compute_hash(self, vllm_config: VllmConfig) -> str:
+    def compile_factors(self, vllm_config: VllmConfig) -> CompileFactors:
         """Hash TPU runtime sources that sit behind custom-op boundaries."""
-        return compute_tpu_compilation_hash(vllm_config)
+        return {"tpu": compute_tpu_compilation_hash(vllm_config)}
 
     @staticmethod
     def _unwrap_compiled_fn(compiled_fn):

@@ -345,68 +345,6 @@ class StructuredDecodingManager:
             )
             return target_logits, bonus_logits
 
-    def mask_invalid_draft_tokens(
-        self,
-        draft_token_ids: torch.Tensor,
-        grammar_output: GrammarOutput,
-        cur_start_idx: int,
-        cur_end_idx: int,
-        draft_lengths_cpu: np.ndarray,
-    ) -> torch.Tensor:
-        """Pins draft tokens beyond `grammar_output.num_acceptable_drafts` to -1.
-
-        `StructuredOutputManager.grammar_bitmask` fills every row after the first
-        `-1` placeholder with the all-permissive `_full_mask`, so a request's
-        drafts at positions `>= num_acceptable_drafts` must be invalidated (-1)
-        before rejection sampling. `draft_lengths_cpu` holds each chunk-local
-        request's draft count, in the order of `draft_token_ids`.
-        """
-        req_ids = grammar_output.structured_output_request_ids
-        if not req_ids or draft_token_ids.numel() == 0:
-            return draft_token_ids
-
-        chunk_num_reqs = cur_end_idx - cur_start_idx
-        if chunk_num_reqs <= 0:
-            return draft_token_ids
-
-        req_id_to_index = self.runner.input_batch.req_id_to_index
-        num_acceptable = grammar_output.num_acceptable_drafts
-        # Requests without a grammar stay unconstrained (INT32_MAX).
-        limits = np.full(chunk_num_reqs, np.iinfo(np.int32).max, dtype=np.int32)
-        has_structured = False
-        for grammar_idx, req_id in enumerate(req_ids):
-            batch_index = req_id_to_index.get(req_id)
-            if batch_index is not None and cur_start_idx <= batch_index < cur_end_idx:
-                local_idx = batch_index - cur_start_idx
-                limits[local_idx] = (
-                    num_acceptable[grammar_idx] if num_acceptable is not None else 0
-                )
-                has_structured = True
-
-        if not has_structured:
-            return draft_token_ids
-
-        if np.all(limits[: len(draft_lengths_cpu)] >= draft_lengths_cpu):
-            return draft_token_ids
-        invalid_mask_np = np.zeros(draft_token_ids.shape[0], dtype=np.bool_)
-        row = 0
-        for local_idx, num_drafts in enumerate(draft_lengths_cpu):
-            n = int(num_drafts)
-            limit = max(0, int(limits[local_idx]))
-            if limit < n:
-                invalid_mask_np[row + limit : row + n] = True
-            row += n
-        invalid_mask = torch.from_numpy(invalid_mask_np).to(
-            device=draft_token_ids.device
-        )
-        return self.pin_invalid_draft_tokens(invalid_mask, draft_token_ids)
-
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-    def pin_invalid_draft_tokens(
-        self, invalid_mask: torch.Tensor, draft_token_ids: torch.Tensor
-    ) -> torch.Tensor:
-        return torch.where(invalid_mask, -1, draft_token_ids)
-
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def structured_decode(
         self,

@@ -1134,7 +1134,7 @@ class VllmTPUMLAAttention(MLAAttention):
                 requires_grad=False,
             )
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
+    def process_weights_after_loading(self) -> None:
         # Upstream `MLAAttention.process_weights_after_loading` reads this
         # weight raw -- `get_and_maybe_dequant_weights(kv_b_proj).T` -- and
         # asserts the [n_out, n_in] shape. The TPU linear method has already
@@ -1153,7 +1153,7 @@ class VllmTPUMLAAttention(MLAAttention):
         # does it once, on device.
         dcp_q_replicate, self.dcp_q_replicate = self.dcp_q_replicate, False
         try:
-            super().process_weights_after_loading(act_dtype)
+            super().process_weights_after_loading()
         finally:
             self.dcp_q_replicate = dcp_q_replicate
             if flipped:
@@ -1172,10 +1172,12 @@ class VllmTPUMLAAttention(MLAAttention):
             self.W_UK_T = Parameter(W_UK_T, requires_grad=False)
             self.W_UV = Parameter(W_UV, requires_grad=False)
             self.W_UK_T_scale = Parameter(
-                fresh_buffer(w_uk_scale.to(act_dtype)).to(device), requires_grad=False
+                fresh_buffer(w_uk_scale.to(self.act_dtype)).to(device),
+                requires_grad=False,
             )
             self.W_UV_scale = Parameter(
-                fresh_buffer(w_uv_scale.to(act_dtype)).to(device), requires_grad=False
+                fresh_buffer(w_uv_scale.to(self.act_dtype)).to(device),
+                requires_grad=False,
             )
 
         # move W_UK_T and W_UV into fresh contiguous buffers
@@ -1357,15 +1359,6 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
     def _q_proj_layer(self):
         """The projection that produces `q`, whichever of the two is wired."""
         return self.q_b_proj if self.q_lora_rank is not None else self.q_proj
-
-    def process_weights_after_loading(self, act_dtype: torch.dtype):
-        if hasattr(super(), "process_weights_after_loading"):
-            # torch's stubs resolve this hasattr-guarded method as a Tensor.
-            # pyrefly: ignore[not-callable]
-            super().process_weights_after_loading(act_dtype)
-        if self.rotary_emb is not None and hasattr(self.rotary_emb, "cos_sin_cache"):
-            device = torch.device("tpu")
-            self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache.to(device)
 
     def forward(
         self,

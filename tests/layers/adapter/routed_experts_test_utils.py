@@ -21,6 +21,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed.aux_output_connector import worker as aux_output_worker
 from vllm.forward_context import set_forward_context
+from vllm.v1.kv_cache_interface import KVCacheConfig
 
 from vllm_torchtpu.distributed import aux_output_connector
 from vllm_torchtpu.layers.adapter import routed_experts_capturer
@@ -148,7 +149,9 @@ def make_vllm_connector(monkeypatch, capturer, model=None):
     connector = aux_output_worker.AuxOutputWorkerConnector(
         vllm_config=make_vllm_config(),
         model=model,
-        kv_cache_config=SimpleNamespace(num_blocks=1024, kv_cache_groups=[]),
+    )
+    connector.initialize_output_storage(
+        cast(KVCacheConfig, SimpleNamespace(num_blocks=1024, kv_cache_groups=[]))
     )
     if capturer is not None:
         aux_output_connector.use_capturer(connector, model, capturer)

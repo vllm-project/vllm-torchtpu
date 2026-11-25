@@ -211,11 +211,95 @@ _DYNAMIC_COMPILE_TARGETS: list[tuple[str, str]] = [
         "get_masked_input_and_mask",
     ),
     ("vllm.model_executor.layers.fused_moe.router.grouped_topk_router", "grouped_topk"),
-    ("vllm.v1.sample.ops.logprobs", "batched_count_greater_than"),
     ("vllm.utils.deep_gemm", "per_block_cast_to_fp8"),
 ]
 
 _dynamic_compile_unwrapped = False
+
+# Draft architectures TPUModelRunner does not implement: their feature name and
+# the speculative method under which they are rejected (None: any method).
+# XPress refiners and DFlash candidate heads exist only in vLLM's GPU
+# speculator, so TPU's DFlashProposer would serve them as plain DFlash.
+_UNSUPPORTED_DRAFT_ARCHITECTURES: dict[str, tuple[str, str | None]] = {
+    "Qwen3XPressModel": ("xpress speculative decoding", "dflash"),
+    "DFlashQwen3XPressModel": ("xpress speculative decoding", "dflash"),
+    "DFlash2DraftModel": ("DFlash candidate-head drafts", "dflash"),
+    "DFlash2BeamDraftModel": ("DFlash candidate-head drafts", "dflash"),
+    "DFlash2RicursiveDraftModel": ("DFlash candidate-head drafts", "dflash"),
+    "LiLiCorrDraftModel": ("DFlash candidate-head drafts", "dflash"),
+    "ParseAuxMTPModel": ("Parse 3.5 MTP", None),
+}
+_UNSUPPORTED_ARCHITECTURES = {
+    "Step5ForCausalLM": "Step5",
+    "Step5ForConditionalGeneration": "Step5",
+}
+
+
+def _tpu_async_scheduling_incompatibility(vllm_config: VllmConfig) -> str | None:
+    """Feature incompatible with TPUModelRunner's async scheduling, or None.
+
+    The single list of what TPU's async scheduling does not support:
+    speculative methods other than the EAGLE-style ones (ngram needs the
+    sampled tokens on the host, which async scheduling defers), and pipeline
+    parallelism. ``VllmConfig.__post_init__``
+    (``_patch_vllm_tpu_runner_validation``) turns unrequested async scheduling
+    (``async_scheduling is None``) off for them; under explicit
+    ``async_scheduling=True``, ``check_and_update_config`` raises with the
+    returned name. ``validate_pipeline_parallel_config`` runs first and rejects
+    pipeline parallelism under async scheduling with a PP-specific remedy.
+    """
+    spec = vllm_config.speculative_config
+    if spec is not None and not spec.use_eagle():
+        return f"{spec.method}-based speculative decoding"
+    if vllm_config.parallel_config.pipeline_parallel_size > 1:
+        return "pipeline parallelism"
+    return None
+
+
+def _validate_tpu_runner_features(vllm_config: VllmConfig) -> None:
+    """Reject features TPUModelRunner does not implement.
+
+    vLLM v0.33.0 rejected these for its V1 model runner
+    (``VllmConfig._get_v1_model_runner_unsupported_features``), which TPU relied
+    on; v0.34.0 removed V1 and that check with it. On TPU this runs from
+    ``VllmConfig._validate_model_runner`` (``_patch_vllm_tpu_runner_validation``),
+    where the V1 check ran. Prefill context parallelism, DSpark (with adaptive
+    verification) and mixed sliding/full DFlash drafts are implemented by
+    TPUModelRunner and stay allowed.
+    """
+    unsupported: list[str] = []
+    spec = vllm_config.speculative_config
+    if spec is not None:
+        if spec.enable_adaptive_verification and spec.method != "dspark":
+            unsupported.append("adaptive draft verification outside DSpark")
+        if spec.draft_lm_head_quantization is not None:
+            unsupported.append("draft lm_head quantization")
+        draft_config = spec.draft_model_config
+        for arch in (draft_config.architectures or []) if draft_config else []:
+            entry = _UNSUPPORTED_DRAFT_ARCHITECTURES.get(arch)
+            if entry is not None and entry[1] in (None, spec.method):
+                unsupported.append(entry[0])
+    model_config = vllm_config.model_config
+    if model_config is not None:
+        if model_config.is_diffusion:
+            unsupported.append("diffusion models")
+        if model_config.architecture in _UNSUPPORTED_ARCHITECTURES:
+            unsupported.append(_UNSUPPORTED_ARCHITECTURES[model_config.architecture])
+        # TPUModelRunner applies no custom logits processors: the copied
+        # runner/vllm_v1 loader (_load_custom_logitsprocs) loads none, neither
+        # these nor installed vllm.logits_processors plugins. Reject them
+        # rather than ignore them silently, until TPU moves onto Model Runner
+        # V2: https://github.com/vllm-project/vllm-torchtpu/issues/3723
+        if model_config.logits_processors:
+            unsupported.append("custom logits processors")
+    if vllm_config.parallel_config.enable_batch_sharded_sampling:
+        unsupported.append("batch-sharded sampling")
+    if unsupported:
+        raise ValueError(
+            f"TPU does not support: {', '.join(dict.fromkeys(unsupported))}"
+        )
+
+
 _tpu_kv_connectors_registered = False
 
 
@@ -519,6 +603,9 @@ class TpuPlatform(Platform):
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
+        # vLLM calls this before EngineArgs builds the first VllmConfig, so the
+        # pre_register patches see that config's __post_init__.
+        patch_registry.apply("pre_register")
         if parser is not None:
             # Default EP weight filtering on for CLI entry points (`vllm serve`).
             # Both model loaders gate on MoE + EP (+ non-EPLB for Run:AI), so
@@ -1124,16 +1211,16 @@ class TpuPlatform(Platform):
             model_config.is_attention_free if model_config is not None else False
         )
         if (
-            vllm_config.speculative_config is not None
-            and scheduler_config.async_scheduling
+            scheduler_config.async_scheduling
+            and (incompat := _tpu_async_scheduling_incompatibility(vllm_config))
+            is not None
         ):
-            method = vllm_config.speculative_config.method
-            if not vllm_config.speculative_config.use_eagle():
-                # Ngram needs the sampled tokens on the host, which async defers.
-                raise NotImplementedError(
-                    f"Async scheduling with speculative method '{method}' is "
-                    "not supported on TPU; Run with async_scheduling=False."
-                )
+            # Pipeline parallelism under async scheduling is rejected earlier,
+            # by validate_pipeline_parallel_config with its own remedy.
+            raise NotImplementedError(
+                f"Async scheduling with {incompat} is not supported on TPU; "
+                "Run with async_scheduling=False."
+            )
         # Real hybrid prefix hits need pooled Mamba state seed copies.
         # DecodeBench installs synthetic state for each request instead.
         transfer_config = vllm_config.kv_transfer_config

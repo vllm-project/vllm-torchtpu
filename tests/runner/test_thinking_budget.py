@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 import torch
 from runner_input_test_utils import _make_sample_runner
+from upstream_thinking_budget_state import ThinkingBudgetStateHolder
 from vllm import SamplingParams
 from vllm.config.reasoning import ReasoningConfig
 from vllm.sampling_params import StructuredOutputsParams
@@ -33,9 +34,6 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.sample.logits_processor.interface import BatchUpdate
-from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder
 
 from vllm_torchtpu.layers.adapter.sample import (
     thinking_budget as tb_kernels,
@@ -78,6 +76,8 @@ from vllm_torchtpu.runner.thinking_budget_tracker import (
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
+from vllm_torchtpu.runner.vllm_v1.sample.logits_processor import LogitsProcessors
+from vllm_torchtpu.runner.vllm_v1.sample.logits_processor.interface import BatchUpdate
 from vllm_torchtpu.runner.vllm_v1.worker import gpu_model_runner
 from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
     CachedRequestState,
@@ -208,11 +208,7 @@ def _set_exec_state(
     )
 
 
-def _make_input_batch(
-    max_model_len: int = 128,
-    max_num_reqs: int = 4,
-    reasoning_config: ReasoningConfig | None = None,
-) -> InputBatch:
+def _make_input_batch(max_model_len: int = 128, max_num_reqs: int = 4) -> InputBatch:
     return InputBatch(
         max_num_reqs=max_num_reqs,
         max_model_len=max_model_len,
@@ -223,7 +219,6 @@ def _make_input_batch(
         max_num_blocks_per_req=[max_model_len // 16],
         logitsprocs=LogitsProcessors(),
         logitsprocs_need_output_token_ids=False,
-        reasoning_config=reasoning_config,
     )
 
 
@@ -832,30 +827,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         allocated = tracker.slots.allocator.allocated_req_ids()
         assert "r0" not in allocated and "r2" in allocated
 
-        # InputBatch swap_states + upstream thinking_budget_state_holder cleanup.
-        batch = _make_input_batch(64, reasoning_config=cfg)
-        assert batch.thinking_budget_state_holder is not None
-        reinit_runner = object.__new__(TPUModelRunner)
-        reinit_runner.input_batch = batch
-        reinit_runner.max_num_reqs = 4
-        reinit_runner.max_num_blocks_per_req = 4
-        reinit_runner.block_table_cpu = torch.zeros((4, 4), dtype=torch.int32)
-        reinit_runner._refresh_smem_request_caps = lambda _cfg: None
-        with (
-            patch.object(
-                gpu_model_runner.GPUModelRunner,
-                "may_reinitialize_input_batch",
-                lambda self, _kv: None,
-            ),
-            patch(
-                "vllm_torchtpu.runner.tpu_runner.install_kernel_block_tables",
-                lambda *_a: None,
-            ),
-        ):
-            reinit_runner.may_reinitialize_input_batch(
-                MagicMock(), kernel_block_sizes=[16]
-            )
-        assert batch.thinking_budget_state_holder is None
+        # InputBatch swap_states moves the slots with their requests.
+        batch = _make_input_batch(64)
 
         tb_swap = ThinkingBudgetTracker(cfg, max_num_reqs=4, device=torch.device("cpu"))
         pa = SamplingParams(thinking_token_budget=1)
@@ -939,24 +912,15 @@ class TestLifecyclePreemptionAndChunkedPrefill:
                     block_ids=([1],),
                     num_computed_tokens=0,
                     lora_request=None,
+                    prefill_token_ids=list(prompt),
                 )
                 for rid in new_ids
             ]
             cached = [rid for rid in wave_ids if rid not in new_ids]
             if cached:
-                reentering = {
-                    rid
-                    for rid in cached
-                    if rid not in runner.input_batch.req_id_to_index
-                }
                 so.scheduled_cached_reqs = CachedRequestData(
                     req_ids=cached,
-                    resumed_req_ids=set(),
                     new_token_ids=[],
-                    all_token_ids={
-                        rid: [*prompt, *runner.requests[rid].output_token_ids]
-                        for rid in reentering
-                    },
                     new_block_ids=[None] * len(cached),
                     num_computed_tokens=[
                         len(prompt) + len(runner.requests[rid].output_token_ids)
@@ -998,18 +962,16 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         assert decode_wave(["r4", "r0"], [61, 22]) == [GEMMA4_END[0], GEMMA4_END[0]]
         assert decode_wave(["r4", "r0"], [62, 23]) == [GEMMA4_END[1], GEMMA4_END[1]]
 
-    @pytest.mark.parametrize(
-        ("explicit_preempt", "settled_outputs"),
-        [(True, [20, 21]), (False, [20, 21]), (True, [])],
-    )
+    @pytest.mark.parametrize("settled_outputs", [[20, 21], []])
     def test_preemption_and_resume_with_real_gpu_model_runner(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        explicit_preempt: bool,
         settled_outputs: list[int],
     ) -> None:
         """Run real ``GPUModelRunner._update_states`` on preempt/resume with
-        unsettled ``[0]`` async placeholders in ``output_token_ids``."""
+        unsettled ``[0]`` async placeholders in ``output_token_ids``. vLLM
+        drops a preempted request and re-sends it as a new request whose
+        ``prefill_token_ids`` carry its settled outputs."""
         monkeypatch.setattr(
             gpu_model_runner, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
         )
@@ -1036,6 +998,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
                 block_ids=([1],),
                 num_computed_tokens=0,
                 lora_request=None,
+                prefill_token_ids=list(prompt),
             )
         ]
         runner._update_states(so_new)
@@ -1054,8 +1017,9 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         runner.requests["p"].output_token_ids = [20, 0, 0, 0]
 
         so_preempt = SchedulerOutput.make_empty()
-        so_preempt.preempted_req_ids = {"p"} if explicit_preempt else None
+        so_preempt.preempted_req_ids = {"p"}
         runner._update_states(so_preempt)
+        assert "p" not in runner.requests
         assert "p" not in runner.input_batch.req_id_to_index
         assert "p" not in tracker.slots.allocator.allocated_req_ids()
 
@@ -1063,15 +1027,19 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         so_resume = SchedulerOutput.make_empty()
         so_resume.num_scheduled_tokens = {"p": len(all_toks)}
         so_resume.total_num_scheduled_tokens = len(all_toks)
-        so_resume.scheduled_cached_reqs = CachedRequestData(
-            req_ids=["p"],
-            resumed_req_ids={"p"},
-            new_token_ids=[],
-            all_token_ids={"p": all_toks},
-            new_block_ids=[([2],)],
-            num_computed_tokens=[0],
-            num_output_tokens=[len(settled_outputs)],
-        )
+        so_resume.scheduled_new_reqs = [
+            NewRequestData(
+                req_id="p",
+                prompt_token_ids=list(prompt),
+                mm_features=[],
+                sampling_params=params,
+                pooling_params=None,
+                block_ids=([2],),
+                num_computed_tokens=0,
+                lora_request=None,
+                prefill_token_ids=all_toks,
+            )
+        ]
         runner._update_states(so_resume)
         assert runner.requests["p"].output_token_ids == settled_outputs
 
@@ -1105,6 +1073,7 @@ class TestLifecyclePreemptionAndChunkedPrefill:
                 block_ids=([3],),
                 num_computed_tokens=0,
                 lora_request=None,
+                prefill_token_ids=list(prompt),
             )
         ]
         runner._update_states(so_resub)
@@ -1566,15 +1535,14 @@ class TestSampleTokens:
                 runner,
                 [logits],
                 {"r0": 4},
-                md_list=[_verify_md([[30, 31, 32]])],
-                spec_tokens={"r0": [30, 31, 32]},
+                md_list=[_verify_md([[30, -1, -1]])],
+                spec_tokens={"r0": [30, -1, -1]},
                 has_structured=True,
             )
             all_toks = list(range(256))
             grammar_out = GrammarOutput(
                 structured_output_request_ids=["r0"],
                 grammar_bitmask=_pack_grammar_bitmask(256, [all_toks] * 4),
-                num_acceptable_drafts=[1],
             )
             assert _run_sample_tokens(runner, grammar_out).sampled_token_ids == [
                 [30, 31]

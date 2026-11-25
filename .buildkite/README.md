@@ -56,8 +56,8 @@ include them. Both use the CI image built by `pipeline_build.yml`. On PR builds,
 `bootstrap.py` uploads stage 0 (`pipeline_build.yml` and `pipeline_cpu.yml`)
 followed by a `wait` and an `upload-stages` step that uploads the TPU lanes
 (`tests`, `integration`, `verify`, plus `perf` with `run-perf-eval` or
-`run-full-ci`) only after every stage-0 step (both image builds, including
-`-omni`, and the CPU checks) passes. Retrying a failed stage-0 step in Buildkite
+`run-full-ci`) only after every stage-0 step (the image builds and the CPU
+checks) passes. Retrying a failed stage-0 step in Buildkite
 releases the `wait` once the retry passes and runs the uploader step. The
 `oncall-fix` label raises job and Kueue workload priority without changing the
 suite.

@@ -51,8 +51,8 @@ dependencies = [
     # * before v5.18: qwen_sparse_attention
     # * from v5.18 on: indexed_attention
     #   (https://github.com/huggingface/transformers/pull/48974)
-    # qwen4_exp/ accepts only indexed_attention, hence the floor. vLLM 0.33.0
-    # takes transformers>=5.16.1,<5.21.0 and vllm-omni 0.32.0rc1 takes
+    # qwen4_exp/ accepts only indexed_attention, hence the floor. vLLM 0.34.0
+    # takes transformers>=5.16.1,<5.23.0 and vllm-omni 0.32.0rc1 takes
     # >=5.16.1,<5.20.0. No upper bound in base dependencies, so upstream vLLM
     # HEAD canary builds (vllm-torchtpu-canary-vllm) can resolve. Monitored for
     # potential structured-output spec-decode divergence (#1093) on
@@ -101,8 +101,8 @@ benchmarking = [
 ]
 
 # vLLM-Omni optional dependency. vllm-omni keeps major.minor aligned with vLLM.
-# 0.32.0rc1 is not on PyPI yet; until it is, add the `omni-git` dependency
-# group below, which supplies it from its git tag.
+# Does not install with the pinned vLLM (0.34); kept until the omni code is
+# removed, as omni support moves to vllm-omni-torchtpu.
 omni = [
     "vllm-omni==0.32.0rc1",
     # vllm-omni pulls torchaudio through s3tokenizer. The PyPI torchaudio is a
@@ -120,9 +120,6 @@ omni = [
 # https://docs.vllm.ai/en/latest/design/plugin_system/
 torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
 
-[project.entry-points."vllm_omni.platform_plugins"]
-torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
-
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 
@@ -137,12 +134,12 @@ torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 vllm = [
     # Note: we **intentionally** build vllm from source, see README.
     # Keep vllm_test_utils on the same upstream tag below.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.33.0",
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.34.0",
 ]
 
-# Source for the `omni` extra's vllm-omni==0.32.0rc1 while that release is not
-# on PyPI: install `--extra omni --group omni-git`. Drop this group, and the
-# flag, once it is.
+# Git source for the `omni` extra's vllm-omni==0.32.0rc1, which is not on PyPI.
+# Like the extra, it does not install with the pinned vLLM and goes away with
+# the omni code.
 omni-git = [
     "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.32.0rc1",
 ]
@@ -157,7 +154,7 @@ test = [
     "pytest-cov",
     "parameterized",
     # Not published on PyPI; lives in vLLM's tests/ directory.
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.33.0#subdirectory=tests/vllm_test_utils",
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.34.0#subdirectory=tests/vllm_test_utils",
 ]
 
 [tool.pytest.ini_options]

@@ -47,7 +47,7 @@ class _FakeBaseAttention:
     def __init__(self, *args, **kwargs):
         pass
 
-    def process_weights_after_loading(self, act_dtype):
+    def process_weights_after_loading(self):
         self.seen_counts = (self.n_local_heads, self.n_local_groups)
 
 
@@ -299,7 +299,7 @@ def test_process_weights_sees_half_counts(monkeypatch):
     layer._use_fused_o_fetch = False
     layer.wo_b = types.SimpleNamespace(weight=torch.zeros(1))
     layer.mla_attn = types.SimpleNamespace(eps=1e-6, head_dim=HEAD_DIM)
-    layer.process_weights_after_loading(torch.bfloat16)
+    layer.process_weights_after_loading()
     assert layer.seen_counts == (NUM_HEADS // 2, NUM_GROUPS // 2)
     assert (layer.n_local_heads, layer.n_local_groups) == (NUM_HEADS, NUM_GROUPS)
 
@@ -401,7 +401,7 @@ def test_q_send_rope_built_at_weight_load(monkeypatch):
     layer = _half_count_layer(aic)
     layer.wo_b = types.SimpleNamespace(weight=torch.zeros(1))
     layer.mla_attn = types.SimpleNamespace(eps=1e-6, head_dim=HEAD_DIM)
-    layer.process_weights_after_loading(torch.bfloat16)
+    layer.process_weights_after_loading()
     built = layer.__dict__["_q_send_rope"]
     assert built[1:] == (torch.zeros(1).device, HEAD_DIM, 1e-6)
 

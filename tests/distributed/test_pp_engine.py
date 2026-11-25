@@ -134,7 +134,6 @@ def _engine_config(pp, async_scheduling):
     return SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
-        use_v2_model_runner=False,
     )
 
 
@@ -146,9 +145,9 @@ def test_a_pipeline_engine_keeps_extra_steps_in_flight(monkeypatch, queue):
     pp_engine.patch_executor_for_pp_buffered(_config(8))
     steps = VllmConfig.max_concurrent_batches.fget
     assert steps(_engine_config(8, async_scheduling=False)) == 8 + 4
-    # async scheduling sizes the queue for its own overlap
+    # async scheduling keeps vLLM's count, one step past the stages to overlap
     overlapped = _engine_config(8, async_scheduling=True)
-    assert steps(overlapped) == vllm_steps(overlapped) == 8
+    assert steps(overlapped) == vllm_steps(overlapped) == 8 + 1
     # an engine of one stage keeps vLLM's count
     single = _engine_config(1, async_scheduling=False)
     assert steps(single) == vllm_steps(single) == 1

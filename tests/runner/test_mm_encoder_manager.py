@@ -30,6 +30,8 @@ def _make_manager(
     paths=None,
     budgets=(8, 4),
     forward=None,
+    max_token_budget=None,
+    budget_range=(64, 4096),
 ):
     model = Mock()
     model.use_data_parallel = False
@@ -45,6 +47,8 @@ def _make_manager(
         lambda budget, *args, path: SimpleNamespace(values=capture_values(budget))
     )
     model.get_encoder_cudagraph_item_specs.return_value = [Mock(), Mock()]
+    # Only read on the auto-budget path (budgets=None).
+    model.get_encoder_cudagraph_budget_range.return_value = budget_range
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             dtype=torch.float32,
@@ -56,7 +60,8 @@ def _make_manager(
         ),
         compilation_config=SimpleNamespace(
             cudagraph_mm_encoder=True,
-            encoder_cudagraph_token_budgets=list(budgets),
+            encoder_cudagraph_token_budgets=None if budgets is None else list(budgets),
+            encoder_cudagraph_max_token_budget=max_token_budget,
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=0,
         ),
@@ -95,6 +100,47 @@ def test_initialization_compiles_encoder_forward(manager, compile_mock):
         fullgraph=True,
         dynamic=False,
     )
+
+
+def test_auto_budgets_initialize_power_of_two_xla_buckets(compile_mock):
+    # With no user budgets, upstream's init builds them through the
+    # manager's _generate_budgets / _item_multiple_budgets: power-of-2 buckets
+    # instead of the subdivided CUDA-graph grid (34 budgets up to 4096).
+    mgr = _make_manager(
+        lambda budget: {"pixels": torch.zeros(budget, 2)},
+        paths={
+            "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
+            "fixed": SimpleNamespace(min_token_budget=256, allow_zero_tokens=False),
+        },
+        budgets=None,
+    )
+    powers = [64, 128, 256, 512, 1024, 2048, 4096]
+    assert mgr.token_budgets == powers
+    assert mgr.path_token_budgets == {"default": powers, "fixed": powers[2:]}
+    assert {path: list(t) for path, t in mgr.budget_templates.items()} == {
+        "default": powers,
+        "fixed": powers[2:],
+    }
+    # TPU ignores upstream's cap (see test below).
+    assert mm.MMEncoderManager._generate_budgets(64, 4096, cap=1500) == powers
+
+
+def test_auto_budgets_ignore_default_max_token_budget_cap(compile_mock):
+    # vLLM v0.34.0 caps auto budgets at encoder_cudagraph_max_token_budget
+    # (5120 by default) and runs larger batches eagerly. On TPU that would
+    # leave items above 5120 tokens without a compiled bucket, so the
+    # buckets must still reach the model's max budget.
+    mgr = _make_manager(
+        lambda budget: {"pixels": torch.zeros(budget, 2)},
+        budgets=None,
+        max_token_budget=5120,
+        budget_range=(64, 16384),
+    )
+    powers = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+    assert mgr.token_budgets == powers
+    assert mgr.path_token_budgets == {"default": powers}
+    assert list(mgr.budget_templates["default"]) == powers
+    assert mgr._find_smallest_fitting_budget_given_tokens(6000) == 8192
 
 
 def test_initialization_builds_positive_budgets_per_path(manager):
@@ -677,3 +723,26 @@ def test_execute_local_chunks_oversized_video_into_compiled_budgets(compile_mock
     assert mgr.graph_hits == 3
     assert mgr.graph_misses == 0
     model.encoder_eager_forward.assert_not_called()
+
+
+def test_execute_local_splits_batch_into_compiled_budgets(coordinated_manager):
+    """Upstream replays one budget per batch; split oversized batches first."""
+    manager = coordinated_manager
+    # Budgets [4, 8], max_batch_size 2: 26 tokens in 6 items exceeds both, so
+    # upstream alone would encode the whole batch eagerly.
+    counts = [3, 6, 9, 2, 5, 1]
+    outputs = manager._execute_local({"tokens": counts})
+    assert [o.shape[0] for o in outputs] == counts
+    for count, output in zip(counts, outputs, strict=True):
+        assert (output == count).all()
+    # Fewest tokens first: {1, 2} -> 4, {3, 5} -> 8, {6} -> 8; upstream
+    # orders each group's items largest first.
+    assert manager._run_budget_graph.call_args_list == [
+        call({"tokens": [2, 1]}, 4, path="default", axis_keys=()),
+        call({"tokens": [5, 3]}, 8, path="default", axis_keys=()),
+        call({"tokens": [6]}, 8, path="default", axis_keys=()),
+    ]
+    # Only the item above the largest budget runs eagerly, as in v0.33.0.
+    manager.model.encoder_eager_forward.assert_called_once_with(
+        {"tokens": [9]}, path="default"
+    )

@@ -166,8 +166,10 @@ class VllmMoERunner(MoERunner):
         if self._fused_ep_owns_pcp_collectives():
             # An armed fused method also reports supports_internal_mk, so
             # upstream's generic DP/EP dispatch is a no-op. The only work
-            # being bypassed here is its explicit PCP all-gather pair.
-            return hidden_states, router_logits
+            # being bypassed here is its explicit PCP all-gather pair. Without
+            # that gather nothing is quantized up front, so there is no
+            # hidden_states scale.
+            return hidden_states, router_logits, None
         return super()._maybe_dispatch(hidden_states, router_logits)
 
     def _maybe_combine(self, shared_output, hidden_states):

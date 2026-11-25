@@ -1,9 +1,11 @@
 # Omni (vLLM-Omni on TPU)
 
 This package is the TPU platform plugin for
-[vLLM-Omni](https://github.com/vllm-project/vllm-omni). vLLM-Omni loads it
-through the `vllm_omni.platform_plugins` entry point `torchtpu`
-(`vllm_torchtpu.omni:register_omni_tpu_platform`), which returns
+[vLLM-Omni](https://github.com/vllm-project/vllm-omni). It does not load with
+the pinned vLLM: the pinned vllm-omni does not install with it, so
+`pyproject.toml` no longer registers the `vllm_omni.platform_plugins` entry
+point, and omni support is moving to vllm-omni-torchtpu.
+`vllm_torchtpu.omni:register_omni_tpu_platform` returns
 `vllm_torchtpu.omni.platform.OmniTpuPlatform` when TPU chips are present.
 Model code comes from vLLM-Omni; TPU fixes are applied as runtime patches.
 

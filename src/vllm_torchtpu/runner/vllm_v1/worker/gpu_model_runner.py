@@ -37,7 +37,6 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.cache import CacheConfig
-from vllm.config.ec_manager_config import EncoderCacheManagerMetadata
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.parallel_state import (
     get_dcp_group,
@@ -46,7 +45,6 @@ from vllm.distributed.parallel_state import (
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
-from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.models.interfaces import (
     MixtureOfExperts,
     MultiModalEmbeddings,
@@ -98,10 +96,7 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
 )
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
-from vllm.v1.sample.logits_processor import build_logitsprocs
-from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -111,7 +106,12 @@ from vllm.v1.worker.utils import (
 )
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.vllm_v1.sample.logits_processor import build_logitsprocs
+from vllm_torchtpu.runner.vllm_v1.sample.logits_processor.interface import (
+    LogitsProcessor,
+)
 from vllm_torchtpu.runner.vllm_v1.utils import (
+    get_next_input_positions_tensor,
     reorder_batch_to_split_decodes_and_prefills,
 )
 from vllm_torchtpu.runner.vllm_v1.worker.block_table import SlotMappingMode
@@ -308,13 +308,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 custom_logitsprocs,
             ),
             # We currently don't know whether a particular custom logits processor
-            # uses output token ids so we set this conservatively. Thinking-budget
-            # tracking is requested dynamically when a budgeted request is in the
-            # batch.
+            # uses output token ids so we set this conservatively.
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-            reasoning_config=self.vllm_config.reasoning_config,
             use_replayssm=self.cache_config.use_replayssm,
         )
 
@@ -500,7 +497,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
-        self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
         self.layerwise_nvtx_hooks_registered = False
 
@@ -590,11 +586,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        # Remove finished requests from the cached states.
-        for req_id in scheduler_output.finished_req_ids:
+        # Remove finished and preempted requests from the cached states. The
+        # scheduler drops a preempted request's worker state and re-sends it
+        # in full in scheduled_new_reqs when it resumes, as Model Runner V2
+        # does.
+        removed_req_ids = scheduler_output.finished_req_ids | (
+            scheduler_output.preempted_req_ids or set()
+        )
+        for req_id in removed_req_ids:
             req_state = self.requests.pop(req_id, None)
             self._on_request_state_removed(req_id, req_state)
             self.num_prompt_logprobs.pop(req_id, None)
+        # Preempted requests keep their late-interaction query reservation
+        # until they resume, as in Model Runner V2.
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -604,7 +608,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # then resubmitted with the same ID. In this case, we treat them as two
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
-        for req_id in scheduler_output.finished_req_ids:
+        for req_id in removed_req_ids:
             self.input_batch.remove_request(req_id)
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
@@ -622,20 +626,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self._process_encoder_cache_scheduler_output(scheduler_output)
 
         # Remove the unscheduled requests from the persistent batch.
-        # NOTE(woosuk): The unscheduled requests are either preempted requests
-        # or running requests that are not scheduled in this step. We remove
-        # them from the persistent batch but keep their cached states since
-        # they will be scheduled again sometime in the future.
+        # The unscheduled requests are running requests that are not scheduled
+        # in this step (preempted ones were removed above). We remove them from
+        # the persistent batch but keep their cached states since they will be
+        # scheduled again sometime in the future.
         scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
         cached_req_ids = self.input_batch.req_id_to_index.keys()
-        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
-        # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
-        # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
-        # apart from the forced-preemption case in reset_prefix_cache. And in
-        # that case we include the resumed_req_ids in the unscheduled set so
-        # that they get cleared from the persistent batch before being re-scheduled
-        # in the normal resumed request path.
-        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+        unscheduled_req_ids = cached_req_ids - scheduled_req_ids
         # NOTE(woosuk): The persistent batch optimization assumes that
         # consecutive batches contain mostly the same requests. If batches
         # have low request overlap (e.g., alternating between two distinct
@@ -657,6 +654,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
+            # A request resumed after preemption is re-sent with its generated
+            # tokens after the prompt in prefill_token_ids. Copied: in-process
+            # engines share the scheduler's list.
+            output_token_ids = list(
+                new_req_data.prefill_token_ids[new_req_data.prompt_len :]
+            )
 
             if (
                 sampling_params
@@ -687,13 +690,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 generator=generator,
                 block_ids=new_req_data.block_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
+                output_token_ids=output_token_ids,
                 lora_request=new_req_data.lora_request,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
 
-            if sampling_params and sampling_params.prompt_logprobs is not None:
+            if (
+                sampling_params
+                and sampling_params.prompt_logprobs is not None
+                and not output_token_ids
+            ):
                 self.num_prompt_logprobs[req_id] = (
                     self.input_batch.vocab_size
                     if sampling_params.prompt_logprobs == -1
@@ -706,7 +713,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             reqs_to_add.append(req_state)
 
-        # Update the states of the running/resumed requests.
+        # Update the states of the running requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -718,7 +725,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
-            resumed_from_preemption = req_id in req_data.resumed_req_ids
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
@@ -796,29 +802,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
             # Update the block IDs.
-            if not resumed_from_preemption:
-                if new_block_ids is not None:
-                    # Append the new blocks to the existing block IDs.
-                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
-                        block_ids.extend(new_ids)
-            else:
-                assert req_index is None
-                assert new_block_ids is not None
-                # The request is resumed from preemption.
-                # Replace the existing block IDs with the new ones.
-                req_state.block_ids = new_block_ids
+            if new_block_ids is not None:
+                # Append the new blocks to the existing block IDs.
+                for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
+                    block_ids.extend(new_ids)
 
             if req_index is None:
-                # The request is not in the persistent batch.
-                # The request was either preempted and resumed later, or was not
-                # scheduled in the previous step and needs to be added again.
-
-                if self.use_async_scheduling and num_output_tokens > 0:
-                    # We must recover the output token ids for resumed requests in the
-                    # async scheduling case, so that correct input_ids are obtained.
-                    resumed_token_ids = req_data.all_token_ids[req_id]
-                    req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
-
+                # The request was not scheduled in the previous step and needs
+                # to be added again. Under async scheduling TPU has already
+                # settled its placeholders in req_state (_modify_prev_results,
+                # run by sample_tokens or by a zero-token execute_model).
                 reqs_to_add.append(req_state)
                 continue
 
@@ -1005,7 +998,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 dst_end = mrope_pos_ptr + completion_part_len
 
                 assert req.mrope_position_delta is not None
-                MRotaryEmbedding.get_next_input_positions_tensor(
+                get_next_input_positions_tensor(
                     out=self.mrope_positions.np,
                     out_offset=dst_start,
                     mrope_position_delta=req.mrope_position_delta,
@@ -1070,11 +1063,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         self,
         mm_hash: str,
         output: torch.Tensor,
-        ec_manager_metadata: "EncoderCacheManagerMetadata | None",
         free_encoder_mm_hashes: list[str],
     ) -> None:
         """Store an encoder output for later multimodal embedding gather."""
-        del ec_manager_metadata, free_encoder_mm_hashes
+        del free_encoder_mm_hashes
         self.encoder_cache[mm_hash] = output
         self.maybe_save_ec_to_connector(self.encoder_cache, mm_hash)
 
@@ -1106,7 +1098,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self._cache_encoder_output(
                     mm_hashes[i],
                     async_tensor_h2d(pe_tensor, device=self.device),
-                    scheduler_output.ec_manager_metadata,
                     scheduler_output.free_encoder_mm_hashes,
                 )
             # Filter out `prompt_embeds` items from mm_kwargs/mm_hashes/mm_lora_refs
@@ -1280,7 +1271,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
             self._cache_encoder_output(
                 mm_hash,
                 output,
-                scheduler_output.ec_manager_metadata,
                 scheduler_output.free_encoder_mm_hashes,
             )
             logger.debug("Finish execute for mm hash %s", mm_hash)
@@ -1517,7 +1507,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                     is_pooling_model=self.is_pooling_model,
                     cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-                    reasoning_config=self.vllm_config.reasoning_config,
                     use_replayssm=self.cache_config.use_replayssm,
                     slot_mapping_modes=slot_mapping_modes,
                 )

@@ -15,6 +15,7 @@
 
 import json
 from typing import Any
+from unittest import mock
 
 import pytest
 import torch
@@ -203,14 +204,15 @@ def _build_decode_scheduler(
     vllm_config.cache_config.num_gpu_blocks = num_blocks
     register_all_kvcache_specs(vllm_config)
     monkey_init = getattr(Scheduler.__init__, "__wrapped__", Scheduler.__init__)
-    scheduler = scheduler_cls.__new__(scheduler_cls)
-    monkey_init(
-        scheduler,
-        vllm_config=vllm_config,
-        kv_cache_config=kv_cache_config,
-        structured_output_manager=StructuredOutputManager(vllm_config),
-        block_size=BLOCK_SIZE,
-    )
+    # Unwrap only the base init: AsyncScheduler.__init__ must still run, since
+    # its decode cadence state is read on every scheduled decode.
+    with mock.patch.object(Scheduler, "__init__", monkey_init):
+        scheduler = scheduler_cls(
+            vllm_config=vllm_config,
+            kv_cache_config=kv_cache_config,
+            structured_output_manager=StructuredOutputManager(vllm_config),
+            block_size=BLOCK_SIZE,
+        )
     scheduler.connector = _FakeConsumerConnector()
     init_none_hash(sha256)
     hasher = get_request_block_hasher(BLOCK_SIZE, sha256)
@@ -237,7 +239,6 @@ def _admit_remote_kv_requests(scheduler: Scheduler, hasher, *req_ids: str):
 def _no_forward_runner_output(kv_output: KVConnectorOutput) -> ModelRunnerOutput:
     return ModelRunnerOutput(
         req_ids=[],
-        req_id_to_index={},
         sampled_token_ids=[],
         logprobs=None,
         prompt_logprobs_dict={},

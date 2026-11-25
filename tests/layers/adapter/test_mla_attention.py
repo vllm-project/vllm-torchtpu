@@ -728,7 +728,7 @@ def test_mla_weight_layout_is_restored_on_error(layout):
     if layout == "flipped":
         setattr(attention.kv_b_proj, WEIGHT_FLIPPED_ATTR, True)
 
-    def upstream_process(act_dtype):
+    def upstream_process():
         observed = getattr(attention.kv_b_proj, parameter_name)
         expected = weight.T if layout == "flipped" else weight
         torch.testing.assert_close(observed, expected)
@@ -741,7 +741,7 @@ def test_mla_weight_layout_is_restored_on_error(layout):
         ),
         pytest.raises(RuntimeError, match="upstream weight processing failed"),
     ):
-        attention.process_weights_after_loading(torch.float32)
+        attention.process_weights_after_loading()
     torch.testing.assert_close(getattr(attention.kv_b_proj, parameter_name), weight)
 
 
@@ -803,7 +803,7 @@ def test_upstream_weight_processing_runs_without_qrep():
     attention.dcp_q_replicate = True
     seen = []
 
-    def upstream_process(act_dtype):
+    def upstream_process():
         seen.append(attention.dcp_q_replicate)
         raise RuntimeError("stop after upstream")
 
@@ -814,7 +814,7 @@ def test_upstream_weight_processing_runs_without_qrep():
         ),
         pytest.raises(RuntimeError, match="stop after upstream"),
     ):
-        attention.process_weights_after_loading(torch.float32)
+        attention.process_weights_after_loading()
     assert seen == [False]
     assert attention.dcp_q_replicate is True
 
@@ -825,7 +825,7 @@ def test_mla_flipped_projection_requires_weight():
     attention.kv_b_proj = torch.nn.Module()
     setattr(attention.kv_b_proj, WEIGHT_FLIPPED_ATTR, True)
     with pytest.raises(AttributeError, match="weight"):
-        attention.process_weights_after_loading(torch.float32)
+        attention.process_weights_after_loading()
 
 
 @pytest.mark.parametrize(

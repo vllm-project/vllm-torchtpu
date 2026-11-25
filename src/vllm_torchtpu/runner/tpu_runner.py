@@ -494,22 +494,6 @@ def _spec_warmup_num_output_tokens(requests: Any, req_ids: list[str]) -> list[in
     return [len(requests[req_id].output_token_ids) for req_id in req_ids]
 
 
-def _spec_warmup_all_token_ids(
-    req_ids: list[str], num_computed_tokens: list[int]
-) -> dict[str, list[int]]:
-    """Build complete synthetic token histories for async cached requests."""
-    assert len(req_ids) == len(num_computed_tokens), (
-        "spec-decode warmup request IDs and computed-token counts must align: "
-        f"requests={len(req_ids)}, counts={len(num_computed_tokens)}"
-    )
-    # The current sampled token is not computed yet, so the complete sequence
-    # contains num_computed + 1 tokens at scheduler handoff.
-    return {
-        req_id: [0] * (num_computed + 1)
-        for req_id, num_computed in zip(req_ids, num_computed_tokens)
-    }
-
-
 @contextmanager
 def _suspend_kv_transfer_group() -> Iterator[None]:
     """Hide the process-global connector during worker-local warmup."""
@@ -539,10 +523,10 @@ def _make_kv_connector_output(
 ) -> KVConnectorOutput:
     """Build the runner's KVConnectorOutput.
 
-    ``failed_recving`` needs vLLM >= 0.31 (the pin is v0.33.0).
+    ``failed_recving`` needs vLLM >= 0.31.
     ``invalid_block_group_index`` is passed only when ``KVConnectorOutput``
-    has it. v0.33.0 does not, so it rejects block-level load failures on
-    multi-group KV layouts; connectors for those layouts must report failed
+    has it. The pinned vLLM's does not, so it rejects block-level load failures
+    on multi-group KV layouts; connectors for those layouts must report failed
     requests through ``failed_recving``.
     """
     kwargs: dict[str, Any] = {
@@ -1150,10 +1134,6 @@ class TPUModelRunner(GPUModelRunner):
         self.execute_model_state: ExecuteModelState | None = None
         self._pre_async_results: AsyncPreResults | None = None
         self._min_tokens = min_tokens_mask.MinTokensTracker()
-        # ThinkingBudgetTracker enforces thinking_token_budget; upstream's holder
-        # would make InputBatch.refresh_metadata run holder.sync_batch (prompt
-        # scans, unused per-row state) on every batch update.
-        self.input_batch.thinking_budget_state_holder = None
         self._thinking_budget = thinking_budget_tracker.ThinkingBudgetTracker(
             self.vllm_config.reasoning_config,
             max_num_reqs=self.max_num_reqs,
@@ -2860,19 +2840,20 @@ class TPUModelRunner(GPUModelRunner):
         This step then reads none of their outputs: the previous step's
         requests committed no tokens (partial prefill chunks) or left the batch
         (finished, preempted or not scheduled), as on every step of one-token
-        requests. Their rollback records go too: rolling back a request outside
-        the batch only rewrites its req_state.output_token_ids, which nothing
-        reads while it is out, and vLLM's _update_states() rebuilds that list
-        from the scheduler's tokens if the request returns.
+        requests. Their rollback records stay: a request that was not scheduled
+        can return in a later step, and vLLM does not resend its tokens then
+        (CachedRequestData carries no token history), so _modify_prev_results()
+        must still settle its req_state.output_token_ids. Requests outside the
+        batch skip the input_batch write there.
 
         Their D2H copy may still be in flight. Keep the results instead of
         waiting on it here, which would stall the host before this step's
         forward: sample_tokens() waits on them in _modify_prev_results() and
-        replaces them, after any number of zero-token steps. Never drop them
-        unsynchronized: on TP ranks other than the executor's output rank, vLLM
-        may discard the AsyncTPUModelRunnerOutput when the RPC returns, leaving
-        these results the only owner of the copy, whose buffers would be freed
-        mid-transfer.
+        replaces them, or execute_model() does on a zero-token step. Never drop
+        them unsynchronized: on TP ranks other than the executor's output rank,
+        vLLM may discard the AsyncTPUModelRunnerOutput when the RPC returns,
+        leaving these results the only owner of the copy, whose buffers would
+        be freed mid-transfer.
         """
         pre = self._pre_async_results
         if pre is None or not pre.req_id_to_index_copy:
@@ -2883,7 +2864,6 @@ class TPUModelRunner(GPUModelRunner):
         # With nothing mapped, _prepare_inputs substitutes no tokens and skips
         # the rejected-token subtraction.
         pre.req_id_to_index_copy.clear()
-        pre.request_seq_lens = []
 
     def _install_spec_token_room_guard(self) -> None:
         """Wrap InputBatch.update_req_spec_token_ids to clamp its *write*.
@@ -2960,10 +2940,11 @@ class TPUModelRunner(GPUModelRunner):
         input_batch._tpu_spec_room_guard = True
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
-        invalidated_req_ids = (
-            scheduler_output.finished_req_ids
-            | (scheduler_output.preempted_req_ids or set())
-            | scheduler_output.scheduled_cached_reqs.resumed_req_ids
+        # A resumed request was reported in preempted_req_ids in an earlier
+        # step (vLLM schedules no waiting request in a step that preempts), so
+        # it is already dropped.
+        invalidated_req_ids = scheduler_output.finished_req_ids | (
+            scheduler_output.preempted_req_ids or set()
         )
         for req_id in invalidated_req_ids:
             self._mamba_state_pos.pop(req_id, None)
@@ -4332,7 +4313,6 @@ class TPUModelRunner(GPUModelRunner):
                 self._cache_encoder_output(
                     mm_hash,
                     output,
-                    scheduler_output.ec_manager_metadata,
                     scheduler_output.free_encoder_mm_hashes,
                 )
 
@@ -4401,6 +4381,18 @@ class TPUModelRunner(GPUModelRunner):
         if self.scheduler_config.async_scheduling:
             self._unmap_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
+            if (
+                self.scheduler_config.async_scheduling
+                and self._pre_async_results is not None
+            ):
+                # No sample_tokens() follows a zero-token step, so settle the
+                # previous step's results now. A request this step left out can
+                # return later, after vLLM has rolled its rejected drafts out of
+                # num_computed_tokens and num_output_tokens; results still
+                # pending then would subtract them again. No forward overlaps
+                # the wait here.
+                self._modify_prev_results()
+                self._pre_async_results = None
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
             # Even for a zero-token step and if DP lockstep is enabled, we must
@@ -5596,15 +5588,6 @@ class TPUModelRunner(GPUModelRunner):
                         )
                     )
                     assert target_logits is not None
-                    draft_token_ids = (
-                        self.structured_decoding_manager.mask_invalid_draft_tokens(
-                            draft_token_ids,
-                            grammar_output,
-                            cur_start_idx,
-                            cur_end_idx,
-                            draft_lengths_cpu=md.draft_lengths_cpu,
-                        )
-                    )
                 if min_tokens_rows is not None:
                     target_rows, bonus_rows = min_tokens_rows
                     target_logits = self._mask_min_tokens(
@@ -6199,8 +6182,6 @@ class TPUModelRunner(GPUModelRunner):
         with self._stage_timing.host_stage("output_assembly"):
             model_runner_output = ModelRunnerOutput(
                 req_ids=req_ids,
-                # Snapshot of the req_id_to_index for the VLLM scheduler.
-                req_id_to_index=dict(self.input_batch.req_id_to_index),
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
                 logprobs=None,  # Filled in AsyncTPUModelRunnerOutput get_output
                 prompt_logprobs_dict=prompt_logprobs.emit(
@@ -7326,11 +7307,6 @@ class TPUModelRunner(GPUModelRunner):
                     arange,
                 )
                 synchronize_tensors(out)
-                out = self.structured_decoding_manager.pin_invalid_draft_tokens(
-                    torch.zeros((num_tokens,), dtype=torch.bool).to(self.device),
-                    torch.zeros((num_tokens,), dtype=torch.int32).to(self.device),
-                )
-                synchronize_tensors(out)
                 logger.info("  -- target_logits_length: %d", num_tokens)
 
     def _verify_logits_paddings(self) -> list[int]:
@@ -8028,6 +8004,7 @@ class TPUModelRunner(GPUModelRunner):
                 block_ids=tuple(block_ids_per_group),
                 num_computed_tokens=0,
                 lora_request=None,
+                prefill_token_ids=[0] * P,
             )
             scheduler_output = SchedulerOutput.make_empty()
             scheduler_output.scheduled_new_reqs = [request]
@@ -8743,6 +8720,7 @@ class TPUModelRunner(GPUModelRunner):
                         ),
                         num_computed_tokens=0,
                         lora_request=None,
+                        prefill_token_ids=[0] * P,
                     )
                 )
             # Prefill in chunks that respect the pre-allocated host token buffers.
@@ -8762,12 +8740,9 @@ class TPUModelRunner(GPUModelRunner):
             # ---- decode all R together: real nr=R propose + verify + sample ---
             nct = [P] * R
             for t in range(n_decode):
-                all_token_ids = _spec_warmup_all_token_ids(rids, nct)
                 creq = CachedRequestData(
                     req_ids=list(rids),
-                    resumed_req_ids=set(),
                     new_token_ids=[],
-                    all_token_ids=all_token_ids,
                     new_block_ids=[None] * R,
                     num_computed_tokens=list(nct),
                     num_output_tokens=_spec_warmup_num_output_tokens(
@@ -8826,15 +8801,13 @@ class TPUModelRunner(GPUModelRunner):
                                 ),
                                 num_computed_tokens=0,
                                 lora_request=None,
+                                prefill_token_ids=[0] * Pk,
                             )
                         )
                     mix_ids.extend(e.req_id for e in extras)
-                    all_token_ids = _spec_warmup_all_token_ids(rids, nct)
                     creq = CachedRequestData(
                         req_ids=list(rids),
-                        resumed_req_ids=set(),
                         new_token_ids=[],
-                        all_token_ids=all_token_ids,
                         new_block_ids=[None] * R,
                         num_computed_tokens=list(nct),
                         num_output_tokens=_spec_warmup_num_output_tokens(
@@ -8925,6 +8898,7 @@ class TPUModelRunner(GPUModelRunner):
                 block_ids=block_ids,
                 num_computed_tokens=0,
                 lora_request=None,
+                prefill_token_ids=[0] * P,
             )
             # The drafts each step proposes are verified by the next one, so
             # every step asks for K of them (a dynamic speculative decoding
@@ -8940,12 +8914,9 @@ class TPUModelRunner(GPUModelRunner):
             cur = d.draft_token_ids[0] if d and d.draft_token_ids else [0] * K
             # ---- decode steps (real propose + verify + sampling) ----
             for t, nct in enumerate(decode_ncts):
-                all_token_ids = _spec_warmup_all_token_ids([rid], [nct])
                 creq = CachedRequestData(
                     req_ids=[rid],
-                    resumed_req_ids=set(),
                     new_token_ids=[],
-                    all_token_ids=all_token_ids,
                     new_block_ids=[None],
                     num_computed_tokens=[nct],
                     num_output_tokens=_spec_warmup_num_output_tokens(
@@ -9256,15 +9227,11 @@ class TPUModelRunner(GPUModelRunner):
         Groups whose kernel block is smaller than their manager block get a
         `KernelBlockTable`, so the block tables hold the kernel block ids TPU
         attention reads. `kernel_block_sizes` is required; its `None` default
-        only matches the vLLM 0.33.0 base signature.
+        only matches the base `GPUModelRunner` signature.
         """
         if kernel_block_sizes is None:
             raise ValueError("kernel_block_sizes is required on TPU")
         super().may_reinitialize_input_batch(kv_cache_config)
-        # ThinkingBudgetTracker enforces thinking_token_budget; upstream's holder
-        # would make InputBatch.refresh_metadata run holder.sync_batch (prompt
-        # scans, unused per-row state) on every batch update.
-        self.input_batch.thinking_budget_state_holder = None
         install_kernel_block_tables(self.input_batch.block_table, kernel_block_sizes)
         if self.input_batch.block_table:
             self.max_num_blocks_per_req = self.input_batch.block_table[

@@ -16,7 +16,6 @@
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
@@ -25,6 +24,16 @@ if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
 
 logger = init_logger(__name__)
+
+
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Copied from vLLM v0.33.0 vllm/v1/spec_decode/utils.py, which v0.34.0 deletes;
+# its successor lives in Model Runner V2's GPU rejection sampler.
+def unconditional_to_conditional_rates(rates: list[float]) -> list[float]:
+    """Convert per-position unconditional rates to per-position conditional
+    rates for the early-terminating rejection loop (c_i = p_i / p_{i-1})."""
+    return [p / q if q > 0.0 else 0.0 for p, q in zip(rates, [1.0, *rates[:-1]])]
+
 
 # Placeholder token ID for rejected tokens
 PLACEHOLDER_TOKEN_ID = -1

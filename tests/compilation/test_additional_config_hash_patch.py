@@ -13,10 +13,11 @@
 # limitations under the License.
 """The diagnostics-only additional_config carve-out for compile cache keys.
 
-``VllmConfig.compute_hash()`` folds the whole ``additional_config`` dict in,
-and that hash feeds both the AOT compile cache key and the piecewise cache dir.
-The phased profiler's remaining ``additional_config`` knobs only steer
-profiling, so letting them into the hash would force needless recompiles.
+``VllmConfig.compile_factors()`` folds a dict ``additional_config`` in whole,
+and the hash of those factors feeds both the AOT compile cache key and the
+piecewise cache dir. The phased profiler's remaining ``additional_config``
+knobs only steer profiling, so letting them into the hash would force
+needless recompiles.
 """
 
 from types import SimpleNamespace
@@ -36,10 +37,13 @@ PREFILL_KEY = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY
 
 # Class attributes the patch stamps onto VllmConfig, which monkeypatch cannot
 # roll back on its own because they did not exist beforehand.
-_PATCH_STAMPS = ("_tpu_additional_config_hash_patch", "_tpu_upstream_compute_hash")
+_PATCH_STAMPS = (
+    "_tpu_additional_config_hash_patch",
+    "_tpu_upstream_compile_factors",
+)
 
 
-def _upstream_compute_hash():
+def _upstream_compile_factors():
     """The genuine implementation, whether or not the patch already ran.
 
     Another test may have built a VllmConfig, which runs
@@ -47,30 +51,23 @@ def _upstream_compute_hash():
     ``patch_registry.apply("platform_activation")``.
     """
     return (
-        getattr(VllmConfig, "_tpu_upstream_compute_hash", None)
-        or VllmConfig.__dict__["compute_hash"]
+        getattr(VllmConfig, "_tpu_upstream_compile_factors", None)
+        or VllmConfig.__dict__["compile_factors"]
     )
 
 
 class _StubVllmConfig:
-    """Minimal stand-in for what ``compute_hash()`` reads off a VllmConfig.
+    """Minimal stand-in for what ``compile_factors()`` reads off a VllmConfig.
 
     A real VllmConfig needs a fully materialized ModelConfig to construct.
-    ``compute_hash()`` guards every sub-config with ``if self.x:``, so ``None``
-    sends them all down the "absent" branch -- except ``observability_config``
-    and ``aux_output_config``, which are dereferenced unconditionally.
+    ``compile_factors()`` maps a ``None`` sub-config to ``{}`` and skips the
+    multimodal factors when ``model_config`` is ``None``.
     """
 
     def __init__(self, additional_config=None):
         self.additional_config = additional_config
-        self.observability_config = SimpleNamespace(
-            compute_hash=lambda: "observability"
-        )
-        self.aux_output_config = SimpleNamespace(compute_hash=lambda: "aux_output")
 
     def __getattr__(self, name):
-        # Let dunders (``__setstate__``/``__deepcopy__``/...) miss normally so
-        # copy.copy() -- which the patch uses -- falls back to its defaults.
         if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
         return None
@@ -81,13 +78,13 @@ def apply_patch_over(monkeypatch):
     """Re-apply the patch on top of a chosen trunk, then undo it."""
 
     def _apply(trunk):
-        monkeypatch.setattr(VllmConfig, "compute_hash", trunk)
+        monkeypatch.setattr(VllmConfig, "compile_factors", trunk)
         # Platform activation may already have run in this process; the patch
         # is idempotent by design, so clear its stamps to re-wrap the trunk.
         for stamp in _PATCH_STAMPS:
             monkeypatch.delattr(VllmConfig, stamp, raising=False)
         _patch_vllm_config_hash_ignore_diagnostics()
-        return VllmConfig.compute_hash
+        return VllmConfig.compile_factors
 
     yield _apply
 
@@ -97,106 +94,88 @@ def apply_patch_over(monkeypatch):
 
 
 @pytest.fixture
-def patched_compute_hash(apply_patch_over):
-    return apply_patch_over(_upstream_compute_hash())
+def patched_compile_factors(apply_patch_over):
+    return apply_patch_over(_upstream_compile_factors())
 
 
-def test_unpatched_hash_changes_with_the_threshold():
+def test_unpatched_factors_change_with_the_threshold():
     """Guards the premise: without the carve-out this busts the cache."""
-    assert _upstream_compute_hash()(
-        _StubVllmConfig({KEY: 128})
-    ) != _upstream_compute_hash()(_StubVllmConfig({KEY: 256}))
+    upstream = _upstream_compile_factors()
 
-
-def test_threshold_no_longer_changes_the_hash(patched_compute_hash):
-    """Retuning a profiling threshold must not force a recompile."""
-    assert patched_compute_hash(_StubVllmConfig({KEY: 128})) == patched_compute_hash(
+    assert upstream(_StubVllmConfig({KEY: 128})) != upstream(
         _StubVllmConfig({KEY: 256})
     )
 
 
-def test_setting_the_threshold_reuses_the_unprofiled_cache(patched_compute_hash):
+def test_threshold_no_longer_changes_the_factors(patched_compile_factors):
+    """Retuning a profiling threshold must not force a recompile."""
+    assert patched_compile_factors(
+        _StubVllmConfig({KEY: 128})
+    ) == patched_compile_factors(_StubVllmConfig({KEY: 256}))
+
+
+def test_setting_the_threshold_reuses_the_unprofiled_cache(patched_compile_factors):
     """Adding the knob at all must not invalidate a cache built without it."""
-    baseline = patched_compute_hash(_StubVllmConfig())
+    baseline = patched_compile_factors(_StubVllmConfig())
 
-    assert patched_compute_hash(_StubVllmConfig({KEY: 128})) == baseline
+    assert patched_compile_factors(_StubVllmConfig({KEY: 128})) == baseline
 
 
-def test_non_diagnostic_keys_still_change_the_hash(patched_compute_hash):
+def test_non_diagnostic_keys_still_change_the_factors(patched_compile_factors):
     """Only the profiling knob is carved out; the rest still count."""
-    assert patched_compute_hash(
-        _StubVllmConfig(
-            {
-                "some_plugin_knob": 1,
-                KEY: 128,
-            }
-        )
-    ) != patched_compute_hash(
-        _StubVllmConfig(
-            {
-                "some_plugin_knob": 2,
-                KEY: 128,
-            }
-        )
-    )
+    assert patched_compile_factors(
+        _StubVllmConfig({"some_plugin_knob": 1, KEY: 128})
+    ) != patched_compile_factors(_StubVllmConfig({"some_plugin_knob": 2, KEY: 128}))
 
 
-def test_untouched_configs_keep_their_upstream_hash(patched_compute_hash):
+def test_diagnostic_key_is_dropped_next_to_live_keys(patched_compile_factors):
+    assert patched_compile_factors(
+        _StubVllmConfig({"some_plugin_knob": 1, KEY: 128})
+    ) == patched_compile_factors(_StubVllmConfig({"some_plugin_knob": 1}))
+
+
+def test_untouched_configs_keep_their_upstream_factors(patched_compile_factors):
     config = _StubVllmConfig({"some_plugin_knob": 1})
 
-    assert patched_compute_hash(config) == _upstream_compute_hash()(config)
+    assert patched_compile_factors(config) == _upstream_compile_factors()(config)
 
 
 @pytest.mark.parametrize("additional_config", [None, {"option": 1}, {KEY: 128}])
 @pytest.mark.parametrize("include_version", [False, True])
-def test_hash_forwards_include_version(
-    patched_compute_hash, additional_config, include_version
+def test_factors_forward_include_version(
+    patched_compile_factors, additional_config, include_version
 ):
     config = _StubVllmConfig(additional_config)
     filtered = _StubVllmConfig(
-        {} if additional_config == {KEY: 128} else additional_config
+        None if additional_config == {KEY: 128} else additional_config
     )
-    expected = _upstream_compute_hash()(filtered, include_version=include_version)
-    assert patched_compute_hash(config, include_version=include_version) == expected
-    assert patched_compute_hash(config, include_version) == expected
+    expected = _upstream_compile_factors()(filtered, include_version=include_version)
+    assert patched_compile_factors(config, include_version=include_version) == expected
+    assert patched_compile_factors(config, include_version) == expected
 
 
-def test_additional_config_is_restored_after_hashing(patched_compute_hash):
-    additional_config = {KEY: 128}
+def test_additional_config_is_left_unchanged(patched_compile_factors):
+    additional_config = {"some_plugin_knob": 1, KEY: 128}
     config = _StubVllmConfig(additional_config)
 
-    patched_compute_hash(config)
+    patched_compile_factors(config)
 
     assert config.additional_config is additional_config
+    assert additional_config == {"some_plugin_knob": 1, KEY: 128}
 
 
-def test_additional_config_is_restored_when_hashing_raises(apply_patch_over):
-    def exploding_compute_hash(self, include_version=True):
-        raise RuntimeError("boom")
-
-    compute_hash = apply_patch_over(exploding_compute_hash)
-    additional_config = {KEY: 128}
+def test_compile_factors_additional_config_is_left_alone(patched_compile_factors):
+    """``additional_config`` may be a SupportsCompileFactors object."""
+    additional_config = SimpleNamespace(compile_factors=lambda: {KEY: "custom"})
     config = _StubVllmConfig(additional_config)
 
-    with pytest.raises(RuntimeError):
-        compute_hash(config)
-
-    assert config.additional_config is additional_config
+    assert patched_compile_factors(config) == _upstream_compile_factors()(config)
 
 
-def test_supports_hash_additional_config_is_left_alone(patched_compute_hash):
-    """``additional_config`` may be a SupportsHash object rather than a dict."""
-    additional_config = SimpleNamespace(compute_hash=lambda: "custom")
-    config = _StubVllmConfig(additional_config)
-
-    assert patched_compute_hash(config) == _upstream_compute_hash()(config)
-    assert config.additional_config is additional_config
-
-
-def test_patch_is_idempotent(patched_compute_hash):
+def test_patch_is_idempotent(patched_compile_factors):
     _patch_vllm_config_hash_ignore_diagnostics()
 
-    assert VllmConfig.compute_hash is patched_compute_hash
+    assert VllmConfig.compile_factors is patched_compile_factors
 
 
 def test_ignored_keys_match_the_keys_the_runner_reads():

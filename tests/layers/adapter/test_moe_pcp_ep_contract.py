@@ -33,6 +33,9 @@ class _LocalExpertQuantMethod:
     skip_forward_padding = True
     has_unpadded_output = False
     moe_kernel = None
+    # FusedMoEMethodBase defaults, read before the PCP all-gather.
+    accepts_quantized_input = False
+    moe_quant_config = None
 
 
 class _RankZeroExperts:
@@ -50,8 +53,9 @@ class _RankZeroExperts:
     def _ensure_moe_quant_config_init(self):
         pass
 
-    def forward_monolithic(self, *, x, router_logits, input_ids=None):
+    def forward_monolithic(self, *, x, router_logits, input_ids=None, x_scale=None):
         del input_ids
+        assert x_scale is None
         expert_weights = torch.softmax(router_logits, dim=-1)
         return x * expert_weights[:, 0:1] * 2.0
 
@@ -67,8 +71,9 @@ class _FusedPcpExperts:
     def _ensure_moe_quant_config_init(self):
         pass
 
-    def forward_monolithic(self, *, x, router_logits, input_ids=None):
+    def forward_monolithic(self, *, x, router_logits, input_ids=None, x_scale=None):
         del input_ids
+        assert x_scale is None
         expert_weights = torch.softmax(router_logits, dim=-1)
         return x * (expert_weights[:, 0:1] * 2.0 + expert_weights[:, 1:2] * 3.0)
 

@@ -46,13 +46,13 @@ import queue as queue_lib
 import traceback
 import uuid
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pytest
 from PIL import Image
-from vllm import LLM, EngineArgs, SamplingParams
+from vllm import LLM, SamplingParams
 from vllm.assets.video import VideoAsset
 
 from vllm_torchtpu import tpu_info
@@ -269,7 +269,7 @@ def _build_llm(
         # the 8192 // 64 = 128 template shape when max_num_batched_tokens=2048.
         compilation_config["encoder_cudagraph_max_vision_items_per_batch"] = 128
 
-    engine_args = EngineArgs(
+    return LLM(
         model=MODEL_NAME,
         max_model_len=MAX_MODEL_LEN,
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
@@ -281,14 +281,6 @@ def _build_llm(
         enforce_eager=False,
         disable_log_stats=True,
     )
-
-    args_dict = asdict(engine_args)
-    args_dict.pop("fault_tolerance_config", None)
-    pass_config = args_dict.get("compilation_config", {}).get("pass_config") or {}
-    args_dict["compilation_config"]["pass_config"] = {
-        k: v for k, v in pass_config.items() if v is not None
-    }
-    return LLM(**args_dict)
 
 
 def _run_with_chunk_budget(

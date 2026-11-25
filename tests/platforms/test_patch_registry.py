@@ -21,6 +21,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import get_args
 from unittest.mock import Mock
 
 import pytest
@@ -209,21 +210,26 @@ def test_invalid_stage_is_rejected(registry):
         reg.apply("worker")
 
 
+def test_every_declared_stage_is_accepted(registry):
+    reg, callbacks = registry
+    seen = []
+    for stage in get_args(reg.Stage):
+        setattr(callbacks, stage, lambda stage=stage: seen.append(stage))
+        _patch(reg, callbacks, stage, (stage,))
+        reg.apply(stage)
+    assert seen == list(get_args(reg.Stage))
+
+
 def test_manifest_preserves_lifecycle_dependencies():
     reg = _load_registry()
     targets = [p.target for p in reg.PATCHES]
     assert len(targets) == len(set(targets))
     stages = {
         stage: [p.target.split(":")[-1] for p in reg.PATCHES if stage in p.stages]
-        for stage in (
-            "import",
-            "platform_activation",
-            "engine_core",
-            "worker_init",
-            "model_load",
-        )
+        for stage in get_args(reg.Stage)
     }
     assert stages["import"] == ["_patch_jax_pallas_fori_lowering"]
+    assert stages["pre_register"] == ["_patch_vllm_tpu_runner_validation"]
     assert stages["engine_core"] == [
         "_patch_vllm_hybrid_pcp_block_sizes",
         "_patch_vllm_dcp_fine_prefix_hits",

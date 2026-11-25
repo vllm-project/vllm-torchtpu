@@ -231,7 +231,9 @@ def test_adaptive_runner_owns_reduction_and_pcp(monkeypatch, armed):
     # Stand-ins for upstream's outer PCP collectives, so the test can see
     # whether VllmMoERunner deferred to them.
     monkeypatch.setattr(
-        mr.MoERunner, "_maybe_dispatch", lambda self, x, gate: ("outer_dispatch", gate)
+        mr.MoERunner,
+        "_maybe_dispatch",
+        lambda self, x, gate: ("outer_dispatch", gate, None),
     )
     monkeypatch.setattr(
         mr.MoERunner,
@@ -252,7 +254,7 @@ def test_adaptive_runner_owns_reduction_and_pcp(monkeypatch, armed):
     runner.moe_config = SimpleNamespace(pcp_size=8, skip_final_all_reduce=False)
     assert runner._fused_output_is_reduced is armed
     assert runner._maybe_dispatch("x", "gate") == (
-        ("x", "gate") if armed else ("outer_dispatch", "gate")
+        ("x", "gate", None) if armed else ("outer_dispatch", "gate", None)
     )
     assert runner._maybe_combine("shared", "x") == (
         ("shared", "x") if armed else ("shared", "outer_combine")

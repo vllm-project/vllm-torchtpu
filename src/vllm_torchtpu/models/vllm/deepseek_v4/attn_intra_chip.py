@@ -464,6 +464,9 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
             tp_rank=rank,
             tp_size=size,
         )
+        # Upstream declares wo_a as its grouped layer; the chip pair shards it
+        # as a plain column-parallel linear instead.
+        # pyrefly: ignore[bad-assignment]
         self.wo_a = ColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
@@ -501,14 +504,14 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
             "ATTN_INTRA_CHIP_TP: wq_b/wo_a/wo_b sharded across the chip pair"
         )
 
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+    def process_weights_after_loading(self) -> None:
         # The base reshapes wo_a by the local head and group counts, which are
         # halved for these weights but not for attention, so swap them in here.
         size = self._chip_pair.world_size
         heads, groups = self.n_local_heads, self.n_local_groups
         self.n_local_heads, self.n_local_groups = heads // size, groups // size
         try:
-            super().process_weights_after_loading(act_dtype)
+            super().process_weights_after_loading()
         finally:
             self.n_local_heads, self.n_local_groups = heads, groups
         if self._use_fused_o_fetch:

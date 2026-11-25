@@ -33,6 +33,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv, statically_known_tru
 from torch_tpu._internal.pallas import pallas as pallas_impl
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.config import CompilationMode, VllmConfig, set_current_vllm_config
+from vllm.model_executor.model_loader.weight_utils import finalize_model_weights
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.model_executor.models.interfaces import supports_pp
@@ -851,7 +852,7 @@ def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
+    KimiDeltaAttention.process_weights_after_loading(layer)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
@@ -910,7 +911,7 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
+    KimiDeltaAttention.process_weights_after_loading(layer)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
@@ -1227,7 +1228,7 @@ def _make_bare_kda_layer(use_full_rank_gate: bool = False):
     layer.q_conv1d = _ConvWeight()
     layer.k_conv1d = _ConvWeight()
     layer.v_conv1d = _ConvWeight()
-    KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
+    KimiDeltaAttention.process_weights_after_loading(layer)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
@@ -1517,7 +1518,7 @@ def test_kda_custom_ops_compile_as_one_full_graph(
     layer.v_conv1d = _ConvWeight()
     # The ops take the fused conv weight, built once at load time.
     layer.conv_size, layer.num_heads, layer.head_dim = 3, 2, 2
-    KimiDeltaAttention.process_weights_after_loading(layer, act_dtype=torch.bfloat16)
+    KimiDeltaAttention.process_weights_after_loading(layer)
     layer.o_norm = SimpleNamespace(weight=torch.ones(2))
     layer.A_log = nn.Parameter(torch.zeros(2))
     layer.dt_bias = nn.Parameter(torch.zeros(4))
@@ -1621,7 +1622,9 @@ def test_attention_residual_matches_reference(num_blocks: int) -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 
-def _attention_residual_stub(hidden: int, eps: float) -> AttentionResidual:
+def _attention_residual_stub(
+    hidden: int, eps: float, fold: bool = True
+) -> AttentionResidual:
     # Same stubbing as test_attention_residual_matches_reference: the fold
     # only reads the two weights.
     module = AttentionResidual.__new__(AttentionResidual)
@@ -1633,8 +1636,27 @@ def _attention_residual_stub(hidden: int, eps: float) -> AttentionResidual:
     module.proj = SimpleNamespace(
         weight=nn.Parameter(torch.randn(1, hidden, dtype=torch.bfloat16) * 0.1)
     )
-    module.process_weights_after_loading()
+    if fold:
+        module.process_weights_after_loading()
     return module
+
+
+def test_vllm_post_load_pass_folds_nested_attention_residual() -> None:
+    """vLLM runs every module's own post-load hook, so the Kimi model hook no
+    longer folds its AttentionResidual layers itself."""
+    torch.manual_seed(0)
+    residual = _attention_residual_stub(hidden=64, eps=1e-5, fold=False)
+    layer = nn.Module()
+    layer.attn_res = residual
+    model = nn.Module()
+    model.layers = nn.ModuleList([layer])
+
+    finalize_model_weights(model)
+
+    torch.testing.assert_close(
+        residual.folded_weight,
+        residual.norm.weight.float() * residual.proj.weight[0].float(),
+    )
 
 
 def test_attention_residual_single_token_matches_batched_rows() -> None:

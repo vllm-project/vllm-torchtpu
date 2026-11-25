@@ -137,3 +137,20 @@ def reorder_batch_to_split_decodes_and_prefills(
             dst = next_dst
 
     return True
+
+
+# vllm/model_executor/layers/rotary_embedding/mrope.py
+# (MRotaryEmbedding.get_next_input_positions_tensor, a staticmethod there)
+def get_next_input_positions_tensor(
+    out: np.ndarray,
+    out_offset: int,
+    mrope_position_delta: int,
+    context_len: int,
+    num_new_tokens: int,
+):
+    values = np.arange(
+        mrope_position_delta + context_len,
+        mrope_position_delta + context_len + num_new_tokens,
+        dtype=out.dtype,
+    )
+    out[:, out_offset : out_offset + num_new_tokens] = values

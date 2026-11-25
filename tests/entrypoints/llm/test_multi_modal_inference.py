@@ -28,10 +28,10 @@ import multiprocessing
 import os
 import queue as queue_lib
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 
 import pytest
-from vllm import LLM, EngineArgs, SamplingParams
+from vllm import LLM, SamplingParams
 from vllm.assets.image import ImageAsset
 from vllm.multimodal.image import convert_image_mode
 
@@ -116,7 +116,7 @@ def _run_mm_generation_worker(
         # (keyed on max_model_len) stay identical between eager and compiled.
         max_tokens_budget = 2048 if max_num_seqs == 1 else MAX_MODEL_LEN
 
-        engine_args = EngineArgs(
+        llm = LLM(
             model=MODEL_NAME,
             max_model_len=MAX_MODEL_LEN,
             max_num_batched_tokens=max_tokens_budget,
@@ -132,16 +132,6 @@ def _run_mm_generation_worker(
             enforce_eager=False,
             disable_log_stats=True,
         )
-
-        args_dict = asdict(engine_args)
-        args_dict.pop("fault_tolerance_config", None)
-
-        pass_config = args_dict.get("compilation_config", {}).get("pass_config") or {}
-        args_dict["compilation_config"]["pass_config"] = {
-            k: v for k, v in pass_config.items() if v is not None
-        }
-
-        llm = LLM(**args_dict)
 
         all_results: list[BatchOutcome] = []
         for idx, (prompts, images, max_tokens) in enumerate(batches):

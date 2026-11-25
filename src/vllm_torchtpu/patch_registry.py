@@ -26,13 +26,18 @@ import logging
 import os
 from dataclasses import dataclass
 from threading import RLock
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, get_args
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 Stage = Literal[
-    "import", "platform_activation", "engine_core", "worker_init", "model_load"
+    "import",
+    "pre_register",
+    "platform_activation",
+    "engine_core",
+    "worker_init",
+    "model_load",
 ]
 
 
@@ -110,10 +115,12 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_raiden_pd_completion", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
-    # Process setup and runner selection.
+    # Process setup and runner validation.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_dflash_bypass_v2_runner_check", _ACTIVE),
+    Patch(
+        "vllm_torchtpu:_patch_vllm_tpu_runner_validation",
+        ("pre_register", *_ACTIVE),
+    ),
     # Weight loading and embeddings.
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_loader_ep_weight_filter",
@@ -211,13 +218,7 @@ def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
     outer invocation already owns that ordered pass. Failures propagate and
     leave the failing patch eligible for retry, retaining completed patches.
     """
-    if stage not in (
-        "import",
-        "platform_activation",
-        "engine_core",
-        "worker_init",
-        "model_load",
-    ):
+    if stage not in get_args(Stage):
         raise ValueError(f"Unknown TPU patch stage: {stage}")
     with _lock:
         if stage in _active_stages:

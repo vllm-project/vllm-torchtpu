@@ -126,13 +126,7 @@ def cached_step(runner, req_ids, *, num_scheduled=4):
     output.total_num_scheduled_tokens = num_scheduled * len(req_ids)
     output.scheduled_cached_reqs = CachedRequestData(
         req_ids=list(req_ids),
-        resumed_req_ids=set(),
         new_token_ids=[],
-        all_token_ids={
-            rid: runner.requests[rid].prompt_token_ids
-            + runner.requests[rid].output_token_ids
-            for rid in req_ids
-        },
         new_block_ids=[None] * len(req_ids),
         num_computed_tokens=[
             runner.requests[rid].num_computed_tokens for rid in req_ids
@@ -244,6 +238,7 @@ def test_mamba_read_offset_follows_storage_owner(
                 block_ids=a.block_ids,
                 num_computed_tokens=0,
                 lora_request=None,
+                prefill_token_ids=list(range(10)),
             )
         ]
         enter("A", output)
@@ -255,18 +250,16 @@ def test_mamba_read_offset_follows_storage_owner(
     assert actual == expected, "same live KV owner must retain its accepted checkpoint"
 
 
-def scheduler_for(request, k):
+def scheduler_for(request):
     scheduler = object.__new__(AsyncScheduler)
     scheduler.requests = {request.request_id: request}
     scheduler.defer_block_free = False
     scheduler._inflight_prefills = set()
-    scheduler.enable_return_routed_experts = False
     scheduler.num_sampled_tokens_per_step = 1
-    scheduler.use_v2_model_runner = False
+    scheduler.current_step = 0
+    scheduler.decode_stagger = 1
     scheduler.use_pp = False
     scheduler.scheduler_config = SimpleNamespace(async_scheduling=True)
-    scheduler.prev_step_scheduled_req_ids = {request.request_id}
-    scheduler._spec_token_placeholders = [-1] * k
     return scheduler
 
 
@@ -279,7 +272,7 @@ def test_bootstrap_commits_once_after_upstream_update(device, monkeypatch, k):
     runner.input_batch.refresh_metadata()
     request = Request("A", list(range(10)), state.sampling_params, None)
     request.status = RequestStatus.RUNNING
-    scheduler = scheduler_for(request, k)
+    scheduler = scheduler_for(request)
     prefill = SchedulerOutput.make_empty()
     prefill.num_scheduled_tokens = {"A": 10}
     prefill.total_num_scheduled_tokens = 10
@@ -320,7 +313,6 @@ def test_bootstrap_commits_once_after_upstream_update(device, monkeypatch, k):
     decode.scheduled_spec_decode_tokens = {"A": [-1] * k} if k else {}
     decode.scheduled_cached_reqs = scheduler._make_cached_request_data(
         [request],
-        [],
         decode.num_scheduled_tokens,
         decode.scheduled_spec_decode_tokens,
         {"A": KVCacheBlocks(([],))},
@@ -427,7 +419,7 @@ def test_dynamic_schedule_verifies_leading_drafts(device, num_spec_tokens_to_sch
         "A", list(range(10)), SamplingParams(temperature=0, max_tokens=32), None
     )
     request.status = RequestStatus.RUNNING
-    scheduler = scheduler_for(request, k)
+    scheduler = scheduler_for(request)
     prefill = SchedulerOutput.make_empty()
     prefill.num_scheduled_tokens = {"A": 10}
     prefill.total_num_scheduled_tokens = 10

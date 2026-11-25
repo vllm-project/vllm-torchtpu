@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU contracts for TPU's runner selection and native vLLM validation."""
+"""CPU contracts for TPU's runner validation and native vLLM validation."""
 
 from types import SimpleNamespace
 
@@ -20,10 +20,11 @@ from vllm.config import CacheConfig, CompilationConfig, VllmConfig
 from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
 import vllm_torchtpu as plugin
+from vllm_torchtpu.platforms.tpu_platform import _validate_tpu_runner_features
 
 
 def _config(device="tpu", method=None, pcp=1):
-    # Exercise the native validator/property without loading a model or devices.
+    # Exercise the validators without loading a model or devices.
     config = object.__new__(VllmConfig)
     config.device_config = SimpleNamespace(device_type=device)
     config.model_config = None
@@ -39,6 +40,7 @@ def _config(device="tpu", method=None, pcp=1):
         use_ubatching=False,
     )
     config.cache_config = CacheConfig()
+    config.scheduler_config = SimpleNamespace(async_scheduling=None)
     config.compilation_config = CompilationConfig(mode=CompilationMode.NONE)
     config.speculative_config = (
         None
@@ -47,8 +49,8 @@ def _config(device="tpu", method=None, pcp=1):
             method=method,
             enable_adaptive_verification=False,
             parallel_drafting=method in ("dflash", "dspark"),
+            use_eagle=lambda: method in ("eagle", "eagle3", "mtp", "dflash", "dspark"),
             draft_lm_head_quantization=None,
-            is_xpress=lambda: False,
             draft_model_config=SimpleNamespace(
                 architectures=["DFlashDraftModel"],
                 hf_config=SimpleNamespace(
@@ -61,55 +63,149 @@ def _config(device="tpu", method=None, pcp=1):
 
 
 @pytest.fixture(autouse=True)
-def _install_patch(monkeypatch):
-    monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
-    plugin._patch_vllm_force_v1_runner_tpu()
+def _install_patch():
+    plugin._patch_vllm_tpu_runner_validation()
 
 
-@pytest.mark.parametrize("device", ["tpu", "cuda"])
-@pytest.mark.parametrize(
-    "method,pcp,reason",
-    [
-        (None, 2, "prefill context parallel"),
-        ("dspark", 1, "dspark speculative decoding"),
-        ("dflash", 1, "mixed sliding/full dflash drafts"),
-    ],
-)
-def test_native_v1_validation_uses_tpu_capabilities(device, method, pcp, reason):
-    config = _config(device=device, method=method, pcp=pcp)
-    if device == "tpu":
-        config._validate_v1_model_runner()
-    else:
-        with pytest.raises(ValueError, match=reason):
-            config._validate_v1_model_runner()
+@pytest.mark.parametrize("method,pcp", [(None, 2), ("dspark", 1), ("dflash", 1)])
+def test_tpu_allows_what_tpu_model_runner_implements(method, pcp):
+    # Prefill context parallelism, DSpark and mixed sliding/full DFlash drafts.
+    _validate_tpu_runner_features(_config(method=method, pcp=pcp))
+
+
+def test_tpu_allows_dspark_adaptive_verification():
+    config = _config(method="dspark")
+    config.speculative_config.enable_adaptive_verification = True
+    _validate_tpu_runner_features(config)
 
 
 @pytest.mark.parametrize(
     "feature,reason",
     [
-        ("adaptive", "adaptive draft verification"),
+        ("adaptive", "adaptive draft verification outside DSpark"),
         ("xpress", "xpress speculative decoding"),
-        ("dflash2", r"(?:DFlash candidate-head drafts|dflash2 drafts)"),
+        ("dflash2", "DFlash candidate-head drafts"),
+        ("parse_mtp", "Parse 3.5 MTP"),
+        ("lm_head_quantization", "draft lm_head quantization"),
         ("diffusion", "diffusion models"),
+        ("step5", "Step5"),
+        ("logits_processors", "custom logits processors"),
         ("batch_sharded", "batch-sharded sampling"),
     ],
 )
-def test_tpu_preserves_native_v1_rejections(feature, reason):
+def test_tpu_rejects_what_tpu_model_runner_lacks(feature, reason):
+    # vLLM v0.33.0's V1 runner rejected these; v0.34.0 dropped that check.
     config = _config(method="dflash", pcp=2)
+    spec = config.speculative_config
     if feature == "adaptive":
-        config.speculative_config.enable_adaptive_verification = True
+        spec.enable_adaptive_verification = True
     elif feature == "xpress":
-        config.speculative_config.is_xpress = lambda: True
+        spec.draft_model_config.architectures = ["DFlashQwen3XPressModel"]
     elif feature == "dflash2":
-        config.speculative_config.draft_model_config.architectures = [
-            "DFlash2DraftModel"
-        ]
+        spec.draft_model_config.architectures = ["DFlash2DraftModel"]
+    elif feature == "parse_mtp":
+        spec.draft_model_config.architectures = ["ParseAuxMTPModel"]
+    elif feature == "lm_head_quantization":
+        spec.draft_lm_head_quantization = "fp8"
     elif feature == "diffusion":
-        config.model_config = SimpleNamespace(is_diffusion=True, architecture="")
+        config.model_config = SimpleNamespace(
+            is_diffusion=True, architecture="", logits_processors=None
+        )
+    elif feature == "step5":
+        config.model_config = SimpleNamespace(
+            is_diffusion=False, architecture="Step5ForCausalLM", logits_processors=None
+        )
+    elif feature == "logits_processors":
+        # vLLM's frontend accepts only Model Runner V2 logits processors.
+        config.model_config = SimpleNamespace(
+            is_diffusion=False, architecture="", logits_processors=["pkg.mod:Proc"]
+        )
     else:
         config.parallel_config.enable_batch_sharded_sampling = True
     with pytest.raises(ValueError, match=reason):
-        config._validate_v1_model_runner()
+        _validate_tpu_runner_features(config)
+
+
+@pytest.mark.parametrize("arch", ["DFlash2DraftModel", "Qwen3XPressModel"])
+def test_tpu_allows_dflash_only_draft_architectures_under_other_methods(arch):
+    # XPress refiners and DFlash candidate heads are rejected only under dflash.
+    config = _config(method="eagle3")
+    config.speculative_config.draft_model_config.architectures = [arch]
+    _validate_tpu_runner_features(config)
+
+
+def test_tpu_validate_model_runner_runs_the_tpu_runner_check():
+    # vLLM's own runner check is where v0.33.0 ran the V1 one.
+    config = _config()
+    config.parallel_config.enable_batch_sharded_sampling = True
+    with pytest.raises(ValueError, match="batch-sharded sampling"):
+        config._validate_model_runner()
+
+
+def test_non_tpu_validate_model_runner_skips_the_tpu_runner_check():
+    config = _config(device="cuda")
+    config.parallel_config.enable_batch_sharded_sampling = True
+    config._validate_model_runner()
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [
+        ("ngram", False),
+        ("draft_model", False),
+        ("pp", False),
+        ("dflash", None),
+        ("plain", None),
+    ],
+)
+def test_tpu_post_init_disables_default_async_scheduling_where_unsupported(
+    monkeypatch, mode, expected
+):
+    seen_before_upstream = []
+    monkeypatch.setattr(VllmConfig, "_tpu_runner_validation_patch", False)
+    # Re-installing wraps these again; restore them after the test.
+    for name in ("_validate_model_runner", "_validate_adaptive_verification"):
+        monkeypatch.setattr(VllmConfig, name, getattr(VllmConfig, name))
+    monkeypatch.setattr(
+        VllmConfig,
+        "__post_init__",
+        lambda self: seen_before_upstream.append(
+            self.scheduler_config.async_scheduling
+        ),
+    )
+    plugin._patch_vllm_tpu_runner_validation()
+
+    method = mode if mode in ("ngram", "draft_model", "dflash") else None
+    config = _config(method=method)
+    if mode == "pp":
+        config.parallel_config.pipeline_parallel_size = 2
+
+    config.__post_init__()
+    assert seen_before_upstream == [expected]
+
+    # Explicit async_scheduling=True stays True so platform validators reject it.
+    explicit = _config(method="ngram")
+    explicit.scheduler_config.async_scheduling = True
+    explicit.__post_init__()
+    assert seen_before_upstream[-1] is True
+
+    # Non-TPU configs keep vLLM's own default handling.
+    non_tpu = _config(device="cuda", method="ngram")
+    non_tpu.__post_init__()
+    assert seen_before_upstream[-1] is None
+
+
+@pytest.mark.parametrize("parser", [None, "cli"])
+def test_pre_register_installs_patches_before_the_first_config(monkeypatch, parser):
+    # vLLM calls pre_register_and_update before EngineArgs builds a VllmConfig.
+    from vllm_torchtpu import patch_registry
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    stages = []
+    monkeypatch.setattr(patch_registry, "apply", stages.append)
+    cli = SimpleNamespace(set_defaults=lambda **_: None) if parser else None
+    TpuPlatform.pre_register_and_update(cli)
+    assert stages == ["pre_register"]
 
 
 def _adaptive_dspark_config(device):
@@ -124,10 +220,8 @@ def _adaptive_dspark_config(device):
 
 
 def test_tpu_runs_dspark_adaptive_verification():
-    config = _adaptive_dspark_config("tpu")
-    config._validate_v1_model_runner()
     # TPU has no CUDA graphs; its own checks replace the native one.
-    config._validate_adaptive_verification()
+    _adaptive_dspark_config("tpu")._validate_adaptive_verification()
 
 
 def test_non_tpu_keeps_native_adaptive_verification_checks():
@@ -143,72 +237,22 @@ def test_tpu_adaptive_verification_keeps_the_lora_check():
         config._validate_adaptive_verification()
 
 
-@pytest.mark.parametrize("has_triton", [False, True])
-@pytest.mark.parametrize("method", [None, "dflash", "dspark"])
-def test_tpu_defaults_to_v1_even_when_triton_is_available(
-    monkeypatch, has_triton, method
-):
-    monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", has_triton)
-    config = _config(method=method)
-    assert config.use_v2_model_runner is False
-
-
-@pytest.mark.parametrize("value,expected", [("0", False), ("1", True)])
-@pytest.mark.parametrize("device", ["tpu", "cuda"])
-def test_explicit_runner_selection_keeps_native_precedence(
-    monkeypatch, value, expected, device
-):
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", value)
-    assert _config(device=device).use_v2_model_runner is expected
-
-
-@pytest.mark.parametrize("has_triton", [False, True])
-def test_non_tpu_default_runner_selection_is_unchanged(monkeypatch, has_triton):
-    monkeypatch.setattr("vllm.config.vllm.HAS_TRITON", has_triton)
-    assert _config(device="cuda").use_v2_model_runner is has_triton
-
-
-def test_tpu_preserves_future_native_rejection(monkeypatch):
-    class FutureVllmConfig(VllmConfig):
-        _tpu_force_v1_runner_patch = False
-
-        def _get_v1_model_runner_unsupported_features(self):
-            return [
-                *super()._get_v1_model_runner_unsupported_features(),
-                "future unsupported feature",
-            ]
-
-    monkeypatch.setattr("vllm.config.vllm.VllmConfig", FutureVllmConfig)
-    plugin._patch_vllm_force_v1_runner_tpu()
-    config = _config(method="dflash")
-    config.__class__ = FutureVllmConfig
-    with pytest.raises(ValueError, match="future unsupported feature"):
-        config._validate_v1_model_runner()
-
-
 @pytest.mark.parametrize("window", [128, None])
-def test_tpu_mixed_dflash_keeps_layer_attention_contract(window):
+def test_mixed_dflash_layer_attention_needs_no_tpu_patch(window):
+    """vLLM v0.34.0 no longer limits mixed sliding/full DFlash drafts to Model
+    Runner V2, so TPU resolves their layer attention with the upstream code."""
     from transformers import Qwen3Config
-    from vllm.config import set_current_vllm_config
     from vllm.model_executor.models import qwen3_dflash
 
-    plugin._patch_dflash_bypass_v2_runner_check()
-    config = _config(method="dflash")
     draft = Qwen3Config(
         num_hidden_layers=2,
         layer_types=["sliding_attention", "full_attention"],
         use_sliding_window=True,
         sliding_window=window,
     )
-    with set_current_vllm_config(config):
-        config._validate_v1_model_runner()
-        assert config.use_v2_model_runner is False
-        if window is None:
-            with pytest.raises(ValueError, match="requires a window size"):
-                qwen3_dflash._resolve_layer_attention(draft, 0)
-        else:
-            assert qwen3_dflash._resolve_layer_attention(draft, 0) == (128, True)
-        assert qwen3_dflash._resolve_layer_attention(draft, 1) == (None, False)
-        # The existing model-level capability shim must restore the selector
-        # on both its successful and its exceptional paths.
-        assert config.use_v2_model_runner is False
+    if window is None:
+        with pytest.raises(ValueError, match="requires a window size"):
+            qwen3_dflash._resolve_layer_attention(draft, 0)
+    else:
+        assert qwen3_dflash._resolve_layer_attention(draft, 0) == (128, True)
+    assert qwen3_dflash._resolve_layer_attention(draft, 1) == (None, False)

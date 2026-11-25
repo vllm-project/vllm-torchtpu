@@ -23,6 +23,7 @@ from vllm.v1.worker.encoder_cudagraph import (
     CaptureAxisKeys,
     EncoderCudaGraphManager,
 )
+from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.mm_video_chunking import (
@@ -34,27 +35,52 @@ from vllm_torchtpu.utils import align_to, synchronize_tensors
 logger = init_logger(__name__)
 
 
+def _group_encoder_items(
+    tokens: list[tuple[int, ...]], limits: tuple[int, ...], max_items: int
+) -> list[list[int]]:
+    """Greedily group item indices, fewest tokens first, into batches.
+
+    Each batch holds at most ``max_items`` items whose per-path token sums
+    (``tokens[i][p]`` for path ``p``) stay within ``limits[p]``. An item that
+    alone exceeds a limit gets its own batch.
+    """
+    groups: list[list[int]] = []
+    group: list[int] = []
+    totals = [0] * len(limits)
+    for index in sorted(range(len(tokens)), key=lambda i: sum(tokens[i])):
+        counts = tokens[index]
+        if group and (
+            len(group) == max_items
+            or any(
+                total + count > limit
+                for total, count, limit in zip(totals, counts, limits, strict=True)
+            )
+        ):
+            groups.append(group)
+            group, totals = [], [0] * len(limits)
+        group.append(index)
+        totals = [total + count for total, count in zip(totals, counts, strict=True)]
+    if group:
+        groups.append(group)
+    return groups
+
+
 def _pack_encoder_items(
     tokens: list[int], budgets: list[int], max_items: int
 ) -> list[tuple[list[int], int]]:
-    batches: list[tuple[list[int], int]] = []
-    indices: list[int] = []
-    total = 0
-    for index in sorted(range(len(tokens)), key=tokens.__getitem__):
-        count = tokens[index]
+    for count in tokens:
         if not 0 < count <= budgets[-1]:
             raise ValueError(
                 f"Coordinated encoding requires each image to fit "
                 f"an encoder graph bucket; got {count} tokens, maximum {budgets[-1]}"
             )
-        if indices and (len(indices) == max_items or total + count > budgets[-1]):
-            batches.append((indices, next(b for b in budgets if b >= total)))
-            indices, total = [], 0
-        indices.append(index)
-        total += count
-    if indices:
-        batches.append((indices, next(b for b in budgets if b >= total)))
-    return batches
+    groups = _group_encoder_items(
+        [(count,) for count in tokens], (budgets[-1],), max_items
+    )
+    return [
+        (group, next(b for b in budgets if b >= sum(tokens[i] for i in group)))
+        for group in groups
+    ]
 
 
 class MMEncoderManager(EncoderCudaGraphManager):
@@ -166,6 +192,41 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.path_token_budgets,
             self.max_batch_size,
         )
+
+    @staticmethod
+    def _generate_budgets(
+        min_budget: int,
+        max_budget: int,
+        cap: int | None = None,
+    ) -> list[int]:
+        """Generate power-of-2 token budgets for static XLA compilation.
+
+        vLLM v0.33.0's ``_generate_budgets``. Upstream now uses a fine grid
+        (quarter-octave, then 128-token, then 1/8-octave steps) because its
+        CUDA graph captures share one buffer set. On TPU, every budget holds
+        its own template buffer and runs a full XLA compile (plus an
+        encoder-DP all-gather compile), so keep power-of-2 buckets.
+
+        ``cap`` (``encoder_cudagraph_max_token_budget``, 5120 by default in
+        v0.34.0) is accepted for upstream's call signature but ignored: GPU
+        runs a batch above the cap eagerly, while on TPU an item above the
+        largest budget would run an unbucketed eager forward. Budgets
+        therefore span the model's full range, e.g. Kimi-K3's
+        ``max_num_batched_tokens``.
+        """
+        budgets: list[int] = []
+        b = min_budget
+        while b <= max_budget:
+            budgets.append(b)
+            b *= 2
+        if not budgets or budgets[-1] < max_budget:
+            budgets.append(max_budget)
+        return budgets
+
+    @staticmethod
+    def _item_multiple_budgets(item_tokens: int, max_budget: int) -> list[int]:
+        """Keep power-of-2 XLA buckets for fixed-size encoder paths too."""
+        return MMEncoderManager._generate_budgets(item_tokens, max_budget)
 
     def _pad_to_template(
         self,
@@ -284,8 +345,43 @@ class MMEncoderManager(EncoderCudaGraphManager):
         self,
         mm_kwargs: dict[str, Any],
     ) -> list[torch.Tensor]:
-        """Execute locally, temporally chunking videos that exceed max budget."""
+        """Execute locally in item groups that each fit a compiled budget.
+
+        vLLM v0.34.0's ``_execute_local`` replays one budget for the whole
+        batch and runs ``encoder_eager_forward`` (an unbucketed XLA shape)
+        when the batch exceeds the largest budget or ``max_batch_size``.
+        Split the batch, as v0.33.0 did, into groups that fit the largest
+        budget of every path. An item above the largest budget gets its own
+        group, where ``_execute_group`` chunks videos and runs other items
+        eagerly as v0.33.0 did.
+        """
         item_specs = self._get_item_specs(mm_kwargs)
+        paths = tuple(self.path_token_budgets)
+        groups = _group_encoder_items(
+            [
+                tuple(spec.get_path_output_tokens(path) for path in paths)
+                for spec in item_specs
+            ],
+            tuple(max(self.path_token_budgets[path]) for path in paths),
+            self.max_batch_size,
+        )
+        if len(groups) <= 1:
+            return self._execute_group(mm_kwargs, item_specs)
+        outputs: dict[int, torch.Tensor] = {}
+        for group in groups:
+            group_kwargs, _ = self._select_items(mm_kwargs, group)
+            group_outputs = self._execute_group(
+                group_kwargs, [item_specs[index] for index in group]
+            )
+            outputs.update(zip(group, group_outputs, strict=True))
+        return [outputs[index] for index in range(len(item_specs))]
+
+    def _execute_group(
+        self,
+        mm_kwargs: dict[str, Any],
+        item_specs: list[EncoderItemSpec],
+    ) -> list[torch.Tensor]:
+        """Execute one item group, temporally chunking videos over max budget."""
         total_tokens = sum(spec.output_tokens for spec in item_specs)
         max_budget = max(self.token_budgets, default=0)
         # When total batch tokens exceed the largest compiled bucket

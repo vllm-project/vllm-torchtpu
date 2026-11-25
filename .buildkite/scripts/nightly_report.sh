@@ -39,11 +39,28 @@ meta() {
 }
 
 # The keys of file $1's steps a nightly runs: every key but the (PR) steps'
-# `_pr` ones.
+# `_pr` ones and the steps the file skips outright (a non-empty `skip:`), which
+# report no `passed` outcome and so would stop every pair being recorded.
 nightly_keys_in() {
-  grep -oE '^[[:space:]]*key:[[:space:]]*"?[A-Za-z0-9_-]+' "$1" \
-    | sed -E 's/.*key:[[:space:]]*"?//' \
-    | grep -v '_pr$'
+  awk '
+    function emit() {
+      if (key != "" && !skipped && key !~ /_pr$/) print key
+      key = ""
+      skipped = 0
+    }
+    /^[ \t]*- (label|group|block|input|trigger|wait)([ \t:]|$)/ { emit() }
+    /^[ \t]*key:/ {
+      key = $0
+      sub(/^[ \t]*key:[ \t]*"?/, "", key)
+      sub(/[^A-Za-z0-9_-].*$/, "", key)
+    }
+    /^[ \t]*skip:/ {
+      value = $0
+      sub(/^[ \t]*skip:[ \t]*/, "", value)
+      if (value !~ /^(""|'"''"'|false)?[ \t]*$/) skipped = 1
+    }
+    END { emit() }
+  ' "$1"
 }
 
 # The keys of every CPU and tests-lane step a nightly runs, the tests lane's

@@ -17,7 +17,8 @@ from vllm_torchtpu.tpu_info import get_num_chips
 
 
 def register_omni_tpu_platform() -> str | None:
-    """Plugin entry point for vllm_omni.platform_plugins."""
+    """Platform hook for vllm_omni.platform_plugins (not registered with the
+    pinned vLLM; see README.md)."""
     if get_num_chips() <= 0:
         return None
     return "vllm_torchtpu.omni.platform.OmniTpuPlatform"
