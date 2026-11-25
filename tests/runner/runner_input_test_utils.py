@@ -87,6 +87,7 @@ def _make_runner(
     runner._pp_handoff = None
     runner._adaptive_verification = None
     runner._routed_experts = None
+    runner._uses_rpa_smem_page_table = True  # noqa: SLF001 -- runner stub state
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,

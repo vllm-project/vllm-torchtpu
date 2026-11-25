@@ -245,6 +245,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
         _decode_device_cache_key=("stale",),
         _attention_kernel_block_size=kernel_page_size,
         _attention_kv_cache_group_id=0,
+        _uses_rpa_smem_page_table=True,
     )
     runner._refresh_smem_request_caps = (
         TPUModelRunner._refresh_smem_request_caps.__get__(runner)
@@ -364,6 +365,7 @@ def test_smem_caps_refresh_after_backend_block_size_update():
         kv_cache_config=None,
         _attention_capacity={"stale": object()},
         _decode_device_cache_key=("stale",),
+        _uses_rpa_smem_page_table=True,
     )
     runner._refresh_smem_request_caps = (
         TPUModelRunner._refresh_smem_request_caps.__get__(runner)
@@ -398,6 +400,7 @@ def test_smem_caps_refresh_keeps_block_table_width_when_block_size_unchanged():
         kv_cache_config=None,
         _attention_capacity={},
         _decode_device_cache_key=None,
+        _uses_rpa_smem_page_table=True,
     )
     TPUModelRunner._refresh_smem_request_caps(runner)
     assert runner.block_size == 16
@@ -425,6 +428,7 @@ def test_smem_caps_refresh_keeps_block_size_until_platform_finalizes_it():
         kv_cache_config=None,
         _attention_capacity={},
         _decode_device_cache_key=None,
+        _uses_rpa_smem_page_table=True,
     )
     TPUModelRunner._refresh_smem_request_caps(runner)
     assert runner.block_size == 384
