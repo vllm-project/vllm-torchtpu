@@ -76,6 +76,12 @@ DECODE_UNIT_GROUPS = 4
 UNIT_MAX_PAGES_8BIT = 16
 # Units whose pages are in flight ahead of the running one.
 UNIT_PREFETCH = 1
+# Decode calls of at least this many tiles run their tile pairs in width
+# order (`_width_order`). In the c64 twin's 256-token decode steps (32
+# tiles) the order's XLA ops left the asynchronous q all-gather beside them
+# finishing ~20 us later per layer: +0.9 ms a step (served-modelled) against
+# the kernel's -0.3 ms (j-fe8637ec vs j-7ddde299); 384 tokens gained net.
+WIDTH_ORDER_MIN_TILES = 48
 # Units pair only groups of one grid step (its query and output blocks), so
 # decode-tile calls put up to this many tiles in a step, their token count
 # padded to whole output windows (`_merged_store_rows`).
@@ -930,8 +936,8 @@ def _store_unaligned_rows(o_ref, start, rows, packed, out):
     when `rows` is not a multiple of the output's packed sublane tile
     (`packed`): a store at a run-time offset inside a packed tile does not
     lower (Mosaic E2003), so the tile holding the rows is read, merged and
-    written whole. Tiles of a grid step run in order, so the rest of the
-    packed tile holds an earlier tile's rows or rows a later one writes."""
+    written whole. A step's tiles run one at a time, so the rest of the
+    packed tile holds rows another tile wrote or will write."""
     base = pl.multiple_of(start // packed * packed, packed)
     window = o_ref.at[:, pl.ds(base, packed), :]
     copies = jnp.concatenate([out.astype(jnp.float32)] * (packed // rows), axis=1)
@@ -1815,7 +1821,7 @@ def _chunk_work(
         block_q,
         pages_per_step,
         align=_merged_store_rows(block_q, num_q_heads // num_heads, dtype, packed),
-        width_order=units is not None,
+        width_order=units is not None and step // block_q >= WIDTH_ORDER_MIN_TILES,
         most=units
         or (
             PREFILL_TILES_PER_STEP_4BIT
