@@ -136,6 +136,32 @@ def token_counts(starts: list[int], ends: list[int], prefix: int) -> dict:
 _ACTIVE = None
 _INSTALLED = False
 
+# DSV41_HOST_SPANS=1 times these runner methods in every recorded step, so the
+# host loop's segments split by function at every step on every rank.
+HOST_SPANS = (
+    "_update_states",
+    "_flush_disjoint_async_results",
+    "_reorder_batch_for_rpa",
+    "_count_input_chunks",
+    "_needs_draft_proposals",
+    "_needs_draft_context",
+    "maybe_setup_kv_connector",
+    "_prepare_inputs",
+    "_flush_mamba_state_seed_copies",
+    "_reset_read_offsets_for_new_requests",
+    "_apply_async_token_substitution",
+    "_record_input_staging_fence",
+    "_get_model_inputs",
+    "forward_model",
+    "_sample_spec_verify_chunk",
+    "_modify_prev_results",
+    "maybe_wait_for_kv_save",
+    "get_finished_kv_transfers",
+    "_assemble_async_spec_substitution",
+    "_update_placeholder",
+    "_dp_bound_next_step",
+)
+
 
 def _stage_wrapper(original: Any, stage: str) -> Any:
     @functools.wraps(original)
@@ -249,6 +275,13 @@ class Recorder:
                 self.pending["dp_agree_ns"] = [started, time.perf_counter_ns()]
 
         runner._dp_end_step = dp_end_step
+        if os.environ.get("DSV41_HOST_SPANS") == "1":
+            for name in HOST_SPANS:
+                setattr(runner, name, self._span(name, getattr(runner, name)))
+            manager = runner.spec_decode_manager
+            manager.propose_draft_token_ids = self._span(
+                "propose_draft_token_ids", manager.propose_draft_token_ids
+            )
         if scenario.name == "decode":
             drafter = runner.drafter
             prepare = drafter._prepare_dflash_inputs
@@ -273,6 +306,20 @@ class Recorder:
                 return result
 
             drafter._prepare_dflash_inputs = prepare_draft
+
+    def _span(self, name: str, original: Any) -> Any:
+        @functools.wraps(original)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            started = time.perf_counter_ns()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                if self.enabled and self.pending is not None:
+                    self.pending.setdefault("spans", []).append(
+                        [name, started, time.perf_counter_ns()]
+                    )
+
+        return call
 
     def execute_model(self, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
         if not self.enabled:
