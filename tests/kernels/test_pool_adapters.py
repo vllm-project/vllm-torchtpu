@@ -172,18 +172,29 @@ def test_scatter_region_writes_ids_outside_the_pool_to_the_null_block(
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("split", [1, 3])
 def test_scatter_region_outside_ids_change_no_live_block(split):
-    """On TPU: a request whose id is outside the pool writes only the null
-    block; every live block keeps its bytes except the valid request's."""
-    pool = _arange_pool((12, 16, 2, 128), jnp.bfloat16)
-    before = np.asarray(pool.view(jnp.uint16)).reshape(12 // split, -1)
-    ntok = 16 * split  # whole (manager) blocks
+    """On TPU: the valid request writes its block; the requests whose ids are
+    outside the pool, written after it with other values, land in the null
+    block 0; every other block keeps its bytes."""
     mgr_blocks = 12 // split
+    ntok = 16 * split  # whole (manager) blocks
+    pool = _arange_pool((12, 16, 2, 128), jnp.bfloat16)
+    before = np.asarray(pool.view(jnp.uint16)).reshape(mgr_blocks, -1)
     ids = jnp.asarray([1, mgr_blocks, -1, 2**31 - 1], dtype=jnp.int32)
-    vals = jnp.full((4, ntok * 2, 128), 7.0, jnp.bfloat16)
+    valid, outside = 7.0, -3.0
+    vals = jnp.concatenate(
+        [
+            jnp.full((1, ntok * 2, 128), valid, jnp.bfloat16),
+            jnp.full((3, ntok * 2, 128), outside, jnp.bfloat16),
+        ]
+    )
     pool = pool_adapters.scatter_region(pool, vals, ids, tok0=0, ntok=ntok, split=split)
     after = np.asarray(pool.view(jnp.uint16)).reshape(mgr_blocks, -1)
-    seven = np.asarray(jnp.full((1,), 7.0, jnp.bfloat16).view(jnp.uint16))[0]
-    assert (after[1] == seven).all()
+
+    def bits(value):
+        return np.asarray(jnp.full((1,), value, jnp.bfloat16).view(jnp.uint16))[0]
+
+    assert (after[1] == bits(valid)).all()
+    assert (after[0] == bits(outside)).all()
     for block in range(2, mgr_blocks):
         np.testing.assert_array_equal(after[block], before[block])
 

@@ -313,7 +313,7 @@ def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int, nblocks: i
     )(mgr_indices, vals, pool)
 
 
-def null_out_of_range_blocks(indices, num_blocks: int):
+def null_out_of_range_blocks(indices: jax.Array, num_blocks: int) -> jax.Array:
     """Replaces every block index outside `[0, num_blocks)` by 0.
 
     Block 0 is vLLM's reserved null block, which no request owns, so a write
