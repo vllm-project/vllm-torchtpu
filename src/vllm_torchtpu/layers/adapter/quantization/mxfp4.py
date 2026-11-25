@@ -370,9 +370,6 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
 REQUANTIZED_BLOCK_SIZE = (
     int(envs.MOE_REQUANTIZE_BLOCK_SIZE) if envs.MOE_REQUANTIZE_BLOCK_SIZE else 512
 )
-# "pow2" rounds each block scale up to the next power of two (the official
-# UE8M0 grid) instead of using amax/6. The scale keeps its shape and dtype, so
-# the MoE kernels do not change; only the codes and the scale values do.
 REQUANTIZED_SCALE_MODE = envs.MOE_REQUANTIZE_SCALE_MODE
 
 
