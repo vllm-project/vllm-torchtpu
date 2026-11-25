@@ -247,6 +247,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_5_attn_moe_overlap",
     ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
+    assert "patch_runai_file_streamer_memory_limit" in stages["worker_init"]
 
 
 def test_plugin_import_sets_environment_before_jax():

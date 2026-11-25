@@ -124,6 +124,10 @@ PATCHES = (
         _ACTIVE,
     ),
     Patch(
+        "vllm_torchtpu.model_loader_patches:patch_runai_file_streamer_memory_limit",
+        _ACTIVE,
+    ),
+    Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_model_loader_page_cache",
         _ACTIVE,
     ),

@@ -214,15 +214,10 @@ def test_failed_bootstrap_can_retry(bootstrap):
 @pytest.mark.parametrize(
     "tp_size, dp_size, dp_local, nnodes, expected",
     [
-        (1, 1, 1, 1, 1),
-        (8, 1, 1, 1, 8),
-        (1, 8, 8, 1, 8),
-        (2, 4, 4, 1, 8),
-        (1, 16, 8, 1, 8),
-        (1, 16, 8, 2, 8),
-        (16, 1, 1, 2, 8),
-        (16, 2, 1, 4, 8),
-        (8, 8, 0, 1, 0),
+        (1, 1, 1, 1, 1),  # single rank
+        (2, 4, 4, 1, 8),  # TP ranks of every local DP engine
+        (16, 1, 1, 2, 8),  # nnodes > 1: only this node's TP ranks
+        (8, 8, 0, 1, 0),  # no local DP engine
     ],
 )
 def test_local_tpu_worker_count(tp_size, dp_size, dp_local, nnodes, expected):

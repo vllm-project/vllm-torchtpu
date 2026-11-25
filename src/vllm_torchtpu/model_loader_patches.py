@@ -67,7 +67,7 @@ from vllm_torchtpu.distributed.tpu_mp_multihost import local_tpu_worker_count
 from vllm_torchtpu.logger import init_logger
 
 if typing.TYPE_CHECKING:
-    from vllm.config import VllmConfig
+    from vllm.config import LoadConfig, VllmConfig
 
 logger = init_logger(__name__)
 
@@ -92,6 +92,16 @@ def _default_runai_memory_limit(local_ranks: int) -> int:
     return _RUNAI_HOST_MEMORY_BUDGET_BYTES // local_ranks
 
 
+def _is_runai_load_without_memory_limit(load_config: "LoadConfig") -> bool:
+    """Whether this is a Run:AI streamer load whose operator set no memory limit."""
+    if load_config.load_format not in _RUNAI_STREAMER_LOAD_FORMATS:
+        return False
+    if envs.RUNAI_STREAMER_MEMORY_LIMIT is not None:
+        return False
+    extra_config = load_config.model_loader_extra_config
+    return not (isinstance(extra_config, dict) and "memory_limit" in extra_config)
+
+
 def apply_default_runai_streamer_memory_limit(vllm_config: "VllmConfig") -> None:
     """Record a default per-rank Run:AI streamer cap when multiple ranks share a host.
 
@@ -102,12 +112,7 @@ def apply_default_runai_streamer_memory_limit(vllm_config: "VllmConfig") -> None
     the load-time ``FileStreamer`` wrapper together with its largest-tensor floor.
     """
     load_config = vllm_config.load_config
-    if load_config.load_format not in _RUNAI_STREAMER_LOAD_FORMATS:
-        return
-    if envs.RUNAI_STREAMER_MEMORY_LIMIT is not None:
-        return
-    extra_config = load_config.model_loader_extra_config
-    if isinstance(extra_config, dict) and "memory_limit" in extra_config:
+    if not _is_runai_load_without_memory_limit(load_config):
         return
     additional_config = vllm_config.additional_config
     if (
@@ -531,12 +536,7 @@ def _resolve_auto_runai_memory_limit(vllm_config: "VllmConfig") -> int | None:
     streamer loader, or when only one TPU rank loads on the host.
     """
     load_config = vllm_config.load_config
-    if load_config.load_format not in _RUNAI_STREAMER_LOAD_FORMATS:
-        return None
-    if envs.RUNAI_STREAMER_MEMORY_LIMIT is not None:
-        return None
-    extra_config = load_config.model_loader_extra_config
-    if isinstance(extra_config, dict) and "memory_limit" in extra_config:
+    if not _is_runai_load_without_memory_limit(load_config):
         return None
     additional_config = vllm_config.additional_config
     if (
@@ -572,8 +572,12 @@ def _resolve_auto_runai_memory_limit(vllm_config: "VllmConfig") -> int | None:
     return ray_limit
 
 
-def _patch_runai_file_streamer_memory_limit() -> None:
+def patch_runai_file_streamer_memory_limit() -> None:
     """Apply and floor the automatic per-rank memory limit at the largest tensor.
+
+    Wraps ``FileStreamer.stream_files``, which every Run:AI load reaches
+    (``runai_streamer`` with or without the EP weight filter, and
+    ``runai_streamer_sharded``).
 
     ``runai-model-streamer`` raises ``RunaiStreamerMemoryLimitException`` when
     a positive ``memory_limit`` is smaller than the largest chunk in the
@@ -653,16 +657,13 @@ def patch_runai_sharded_expert_streaming() -> None:
     Inert unless ``--enable-expert-parallel`` AND
     ``--enable-ep-weight-filter`` are both set (and EPLB is off); any
     failure to set up the filter falls back to the stock full-checkpoint
-    streaming. Also installs the load-time Run:AI ``memory_limit`` wrapper so
-    automatic per-rank caps never reject a checkpoint with a larger tensor and
-    Ray workers derive their cap from ``LOCAL_WORLD_SIZE``.
+    streaming.
     """
     from vllm.model_executor.model_loader import runai_streamer_loader as rsl
 
     if getattr(rsl.RunaiModelStreamerLoader, "_tpu_sharded_ep_patch", False):
         return
     _patch_runai_local_rank_discovery()
-    _patch_runai_file_streamer_memory_limit()
     original_get_iterator = rsl.RunaiModelStreamerLoader._get_weights_iterator
     original_load_weights = rsl.RunaiModelStreamerLoader.load_weights
 
