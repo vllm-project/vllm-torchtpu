@@ -174,7 +174,8 @@ CORE_DEFAULT_TILES: core_exec_spec.Tiles = core_exec_spec.Tiles()
 class CoreLimits:
     """Live execution limits sourced from `megakernel/core`.
 
-    `max_ar_slots_per_layer` mirrors the ring bound in `core/planner.py`.
+    `max_ar_slots_per_layer` mirrors the ring bound in `core/planner.py`
+    (verified by `spec_bridge.verify_core_limits_sync()`).
     """
 
     max_batch_rows: int = core_exec_spec.MAX_BATCH_ROWS
@@ -210,3 +211,85 @@ PUBLIC_MEASUREMENT_ALIASES: frozenset[str] = frozenset({"bundled", "auto"})
 # Sparse attention (DSA) and lightning indexer packing alignment constants.
 INDEXER_SCALE_BLOCK_SIZE: int = 128
 WORD_ALIGN_BYTES: int = 4
+
+CHIP_KIND_MAP: Mapping[str, str] = {"tpu7x": "TPU7x"}
+# core/pool/layout.py:PoolLayout enforces float8_e4m3fn for KV pages.
+CORE_KV_DTYPE_ALIASES: Mapping[str, str] = {
+    "fp8": "float8_e4m3fn",
+    "fp8_e4m3": "float8_e4m3fn",
+    "fp8_e4m3fn": "float8_e4m3fn",
+}
+CORE_SUPPORTED_KV_DTYPES: frozenset[str] = frozenset(CORE_KV_DTYPE_ALIASES)
+# core/pool/layout.py and core/modules/gdn/decls.py store recurrent state in BF16.
+CORE_STATE_DTYPE_ALIASES: Mapping[str, str] = {
+    "bf16": "bfloat16",
+    "bfloat16": "bfloat16",
+}
+CORE_SUPPORTED_STATE_DTYPES: frozenset[str] = frozenset(CORE_STATE_DTYPE_ALIASES)
+# Match measured all-reduce latency within 1 octave [0.5x, 2.0x] of analytical bytes.
+AR_BYTE_MATCH_MIN_RATIO: float = 0.5
+AR_BYTE_MATCH_MAX_RATIO: float = 2.0
+# Recurrent step reads and writes state once each (2x resident bytes).
+RECURRENT_STATE_RW_PASSES: float = 2.0
+DEFAULT_USABLE_VMEM_MIB = CORE_LIMITS.vmem_mib
+# Minimum 256 KiB DMA slot floor and 1/4-layer weight slice for pipeline fill/drain.
+MIN_FIRST_DMA_SLOT_BYTES = 1 << 18
+FIRST_SLOT_LAYER_WEIGHT_DIVISOR = 4
+DOUBLE_BUFFER_SLOTS = 2
+GROUPED_MOE_MODES: frozenset[str] = frozenset({"grouped_on_chip"})
+ARENA_ALIGN_RESERVE_BYTES = 2 << 20
+ATTN_TILE_TOKENS = 128
+GDN_STREAMED_HEADS_CAP = 8
+DENSE_FFN_TILE_CAP = 1024
+BF16_BYTES = 2
+FP32_BYTES = 4
+LSE_SCALARS_PER_HEAD = 1
+SUBCHANNEL_BLOCK_K_THRESHOLD = 512
+SUBCHANNEL_VPU_OPS_PER_BLOCK = 2.0
+# Elements per 32-bit vector word: 4 at the widest packing of 8-bit elements, and 8
+# when unpacking weights stored below one byte (4-bit elements).
+VECTOR_MAX_ELEMENTS_PER_WORD = 4
+VECTOR_SUB_BYTE_ELEMENTS_PER_WORD = 8
+# Per-element vector op counts:
+# - RMSNorm + residual: square, sum-reduce/rsqrt, mul, gamma, add (~8 ops).
+# - SwiGLU activation: neg, exp, add-1, div/silu, up-proj mul (~4 ops).
+# - Sub-byte unpack: shift and mask/sign-extend per weight element (2 ops).
+RMSNORM_RESIDUAL_VEC_OPS_PER_ELEM = 8.0
+SWIGLU_ACT_VEC_OPS_PER_ELEM = 4.0
+SUB_BYTE_UNPACK_VEC_OPS_PER_ELEM = 2.0
+SUB_BYTE_EXPERT_DTYPES: frozenset[str] = frozenset({"nvfp4", "mxfp4", "fp4", "int4"})
+CORES_PER_HOST = 8
+DEFAULT_LAUNCH_GAP_VAL_US = 2.0
+DEFAULT_LAUNCH_GAP_UPPER_US = 8.0
+COMPILED_XLA_GAP_P50_US = 1.0
+COMPILED_XLA_GAP_P90_US = 1.5
+UNFUSED_EAGER_GAP_US = 6.0
+PER_OP_COLLECTIVE_CALL_FACTOR = 2
+BOUNDARY_SYNC_HOP_FACTOR = 2.0
+SUBLAYER_BOUNDARIES_PER_LAYER = 2
+DCP_COLLECTIVES_PER_ATTN_LAYER = 2
+COLLECTIVE_PATH_IN_KERNEL = "in_kernel"
+COLLECTIVE_OP_ALL_REDUCE = "all-reduce"
+# 128-byte HBM burst/cacheline alignment for scattered sparse-KV row gathers.
+HBM_CACHELINE_BYTES: int = 128
+# 8 four-bit radix passes sort 32-bit FP32 indexer scores across 2^4 = 16 buckets.
+INDEXER_RADIX_PASSES: int = 8
+INDEXER_RADIX_BUCKETS: int = 16
+# Per-head ReLU + weight multiply-add (2 ops/head) plus block scale/bias (2 ops/key).
+INDEXER_HEAD_REDUCE_VEC_OPS: float = 2.0
+INDEXER_SCALE_VEC_OPS: float = 2.0
+# Per-pass 4-bit radix work: nibble extract, 16-bucket compare, prefix, scatter.
+INDEXER_RADIX_PASS_VEC_OPS: float = 36.0
+# Scattered KV unpack, 128-lane pad, tail mask, and sub-byte transpose ops per element.
+DSA_UNPACK_MASK_VEC_OPS: float = 10.0
+# Online softmax per (head, selected_key): max, sub, exp, sum, div, mask, and update.
+DSA_SOFTMAX_VEC_OPS: float = 8.0
+# Online output accumulator rescale + accumulation per (head, value_dim).
+DSA_OUTPUT_RESCALE_VEC_OPS: float = 4.0
+# Cross-DCP log-sum-exp partial merge: max, exp-weight, multiply-add, normalize.
+DCP_LSE_MERGE_VEC_OPS: float = 6.0
+# Unfused per_op out-of-core HBM traffic: FP32 score write+read (2 * 4 B = 8 B)
+# and gathered sparse-KV buffer write+read (2x) across standalone kernel boundaries.
+PER_OP_INDEXER_SCORE_ROUNDTRIP_BYTES: float = 2.0 * FP32_BYTES
+PER_OP_DSA_KV_ROUNDTRIP_FACTOR: float = 2.0
+FUSED_ELIGIBLE_PHASES: tuple[str, ...] = ("decode", "verify")
