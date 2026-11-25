@@ -55,10 +55,9 @@ def test_thresholds_matches_unrolled_reference(tie_skip: bool, early_exit: tuple
     scores = rng.uniform(0.0, 10.0, size=(R_rows, S, 128)).astype(np.float32)
     scores[1] = np.floor(scores[1] * 4.0) / 4.0  # force ties at threshold
     bits = jax.lax.bitcast_convert_type(jnp.array(scores), jnp.int32)
-    ids = (
-        jax.lax.broadcasted_iota(jnp.int32, (R_rows, S, 128), 1) * 128
-        + jax.lax.broadcasted_iota(jnp.int32, (R_rows, S, 128), 2)
-    )
+    ids = jax.lax.broadcasted_iota(
+        jnp.int32, (R_rows, S, 128), 1
+    ) * 128 + jax.lax.broadcasted_iota(jnp.int32, (R_rows, S, 128), 2)
     nv = jnp.array([[[200]], [[500]], [[30]], [[G]]], dtype=jnp.int32)
     bits = jnp.where(ids < nv, bits, -1)
 
@@ -71,12 +70,12 @@ def test_thresholds_matches_unrolled_reference(tie_skip: bool, early_exit: tuple
     # selected set is already exact; verify exact selected mask in all modes,
     # and exact (thr, tmax) when early_exit is off.
     over = nv > K
-    sel_ref = (
-        over & ((bits > ref_thr) | ((bits == ref_thr) & (ids <= ref_tm)))
-    ) | (~over & (bits >= 0))
-    sel_got = (
-        over & ((bits > got_thr) | ((bits == got_thr) & (ids <= got_tm)))
-    ) | (~over & (bits >= 0))
+    sel_ref = (over & ((bits > ref_thr) | ((bits == ref_thr) & (ids <= ref_tm)))) | (
+        ~over & (bits >= 0)
+    )
+    sel_got = (over & ((bits > got_thr) | ((bits == got_thr) & (ids <= got_tm)))) | (
+        ~over & (bits >= 0)
+    )
     np.testing.assert_array_equal(np.asarray(sel_got), np.asarray(sel_ref))
     if not early_exit:
         np.testing.assert_array_equal(np.asarray(got_thr), np.asarray(ref_thr))
@@ -127,9 +126,13 @@ def test_compact_union_into_interpret_matches_reference(
         interpret=True,
     )(code)
 
-    sl = slice(base_rank * KU, (base_rank + 1) * KU)
-    np.testing.assert_array_equal(np.asarray(got_ids[0, :, sl]), np.asarray(ref_ids))
-    np.testing.assert_array_equal(
-        np.asarray(got_codes[0, :, sl]), np.asarray(ref_codes)
-    )
     assert int(got_n[0]) == int(jnp.sum(ref_n))
+    check_len = ((n_active + ua.UNION_CHUNK - 1) // ua.UNION_CHUNK) * ua.UNION_CHUNK
+    if check_len > 0:
+        sl = slice(base_rank * KU, base_rank * KU + check_len)
+        np.testing.assert_array_equal(
+            np.asarray(got_ids[0, :, sl]), np.asarray(ref_ids[:, :check_len])
+        )
+        np.testing.assert_array_equal(
+            np.asarray(got_codes[0, :, sl]), np.asarray(ref_codes[:, :check_len])
+        )

@@ -250,19 +250,23 @@ class GDNBlock(Block):
         if cache_exec(ex).FUSED:
             return fused_io().gdn_fused_scratch(ex, gp, plan)
         # The fused and GPR pool readers bitcast bf16 state words into `recb`.
-        assert REC == BF16 or not gp.GPR, "VLLM_TPU_MK_GDN_REC_F32=1 needs the split gather"
+        assert REC == BF16 or not gp.GPR, (
+            "VLLM_TPU_MK_GDN_REC_F32=1 needs the split gather"
+        )
+        need_sbuf = 2 * gp.kh > gp.vh
         scr: dict[str, Any] = {
             "recb": (
                 pltpu.VMEM((gp.NRB, gp.CBV, gp.KD, gp.VD), REC)
                 if gp.GCH
                 else pltpu.VMEM((ex.B * gp.vh, gp.KD, gp.VD), REC)
             ),
-            "sbuf": pltpu.VMEM((gp.vh, gp.KD, gp.VD), F32),
             "convb": pltpu.VMEM(
                 (ex.NS, gp.HR, gp.QKV) if ex.VER else (gp.CR, gp.QKV), F32
             ),
             "st_sem": pltpu.SemaphoreType.DMA((4,)),
         }
+        if need_sbuf:
+            scr["sbuf"] = pltpu.VMEM((gp.vh, gp.KD, gp.VD), F32)
         if ex.VER and not gp.GCH:
             scr.update(
                 {

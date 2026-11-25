@@ -64,14 +64,32 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     slot_ec = l_idx % 2
     NCP = R * EXTRA
     MROW = E // 128
+    vec_local = (
+        not VEC
+        and not mp.dedup_vec
+        and not ECOPY
+        and not m.dbg.row_mask
+        and not mp.moe_tp
+        and E % 128 == 0
+        and mp.ER <= 128
+        and 128 % mp.ER == 0
+        and MROW <= MR
+    )
     with sc("route_topk", 2):
-        route_topk(m, choice, p8, VEC, slot_ec, NCP, MROW)
+        route_topk(m, choice, p8, VEC, slot_ec, NCP, MROW, vec_local=vec_local)
         if mp.RB:
             rb_tables(m)
     with sc("route_dma", 2):
         if mp.dedup_vec:  # hit list + count only (`dedup_rows_vec`)
             cp = pltpu.make_async_copy(
-                scr["hitv"].at[pl.ds(0, 8)], scr["hits"].at[pl.ds(0, 8)],
+                scr["hitv"].at[pl.ds(0, 8)],
+                scr["hits"].at[pl.ds(0, 8)],
+                scr["misc_sem"],
+            )
+        elif vec_local:
+            cp = pltpu.make_async_copy(
+                scr["hitv"].at[pl.ds(0, MROW)],
+                scr["hits"].at[pl.ds(0, MROW)],
                 scr["misc_sem"],
             )
         else:
@@ -94,7 +112,7 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     elif ECOPY:
         n_hit = dedup_ecopy(m, VEC, slot_ec, stamp, n_tot, n_hit, n_cp)
     else:
-        n_hit = dedup_local(m, stamp)
+        n_hit = dedup_local(m, stamp, vec_local=vec_local)
     if "experts" in skip:
         n_hit = jnp.int32(0)
     scr["st"][0] = n_hit * TE

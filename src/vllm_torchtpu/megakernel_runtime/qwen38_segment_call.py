@@ -79,7 +79,14 @@ def segment_tiles(
     nbe, nbd = rings or DEFAULT_RINGS or ring_depths(B)
     h = DEFAULT_HIER if hier is None else hier
     return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=h).with_blocks(
-        {"moe": {"pipe_ep": PIPE_EP, "moe_unroll": True}}
+        {
+            "moe": {
+                "pipe_ep": PIPE_EP,
+                "moe_unroll": True,
+                "topk_lanes": True,
+                "r2_direct_store": True,
+            }
+        }
     )
 
 
