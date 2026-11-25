@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import dataclasses
+import re
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -354,7 +355,7 @@ def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> 
 DEFAULT_RAIDEN_TELEMETRY_BACKENDS: tuple[str, ...] = ("buffered",)
 _RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY = "raiden_telemetry_backends"
 _RAIDEN_METRIC_PREFIX = "tpu_raiden_"
-_RANK_LABEL_KEYS = ("local_rank", "rank")
+_RANK_LABEL_PATTERN = re.compile(r"(?:^|,)\s*(?:local_rank|rank)\s*=")
 
 
 def get_raiden_telemetry_backends(vllm_config: "VllmConfig | None") -> list[str]:
@@ -427,7 +428,7 @@ def _add_worker_rank_to_gauge_key(raw_key: str, worker_rank: int) -> str:
     if key.endswith("}") and "{" in key:
         base, rest = key.split("{", 1)
         inner = rest[:-1].strip()
-        if any(f"{rk}=" in inner for rk in _RANK_LABEL_KEYS):
+        if _RANK_LABEL_PATTERN.search(inner):
             return key
         rank_pair = f'local_rank="{worker_rank}"'
         return f"{base}{{{inner},{rank_pair}}}" if inner else f"{base}{{{rank_pair}}}"

@@ -476,12 +476,15 @@ class TestRaidenBufferedTelemetryGating:
             SimpleNamespace(name="buffer_allocated_bytes", type="GAUGE"),
             SimpleNamespace(name="host_memory_breakdown_bytes", type="GAUGE"),
             SimpleNamespace(name="host_numa_memory_bytes", type="GAUGE"),
+            SimpleNamespace(name="host_pool_blocks", type="GAUGE"),
             SimpleNamespace(name="d2h_bytes_total", type="COUNTER"),
         ]
         mock_telemetry.get_and_reset_metric_samples.return_value = {
             "tpu_raiden_buffer_allocated_bytes": [2048.0],
             'tpu_raiden_host_memory_breakdown_bytes{component="kv_pool"}': [4096.0],
             'tpu_raiden_host_numa_memory_bytes{local_rank="1",numa_node="0"}': [8192.0],
+            # `dp_rank` must not be mistaken for `rank`.
+            'tpu_raiden_host_pool_blocks{dp_rank="0",state="used"}': [16.0],
             'tpu_raiden_d2h_bytes_total{host_ip="10.0.0.1"}': [512.0],
         }
         monkeypatch.setattr(
@@ -494,10 +497,14 @@ class TestRaidenBufferedTelemetryGating:
         breakdown_key = (
             'tpu_raiden_host_memory_breakdown_bytes{component="kv_pool",local_rank="1"}'
         )
+        pool_key = (
+            'tpu_raiden_host_pool_blocks{dp_rank="0",state="used",local_rank="1"}'
+        )
         assert samples == {
             'tpu_raiden_buffer_allocated_bytes{local_rank="1"}': [2048.0],
             breakdown_key: [4096.0],
             'tpu_raiden_host_numa_memory_bytes{local_rank="1",numa_node="0"}': [8192.0],
+            pool_key: [16.0],
             'tpu_raiden_d2h_bytes_total{host_ip="10.0.0.1"}': [512.0],
         }
 
