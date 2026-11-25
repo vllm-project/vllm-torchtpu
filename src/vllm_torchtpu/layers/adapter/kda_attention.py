@@ -45,6 +45,7 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architecture
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
     build_kimi_pooled_kda_op,
@@ -144,8 +145,16 @@ class KdaAttention(nn.Module, MambaBase):
         head_k_dim: Query and key head size; also the decay gate's width.
         head_v_dim: Value head size; also the output gate's width.
         gate_rank: Width of the low-rank decay and output-gate projections.
+        norm_eps: Epsilon of the gated output RMSNorm.
         gate_bias: Whether the output-gate projection has a bias.
+        use_full_rank_gate: Project the output gate straight from the hidden
+            state (``g_proj``) instead of through ``gate_rank``.
+        gate_lower_bound: Floor of the per-token log-decay, or ``None`` for
+            the unbounded gate.
         beta_scale: Beta is ``beta_scale * sigmoid(b)``.
+
+    The unified KV pool supports only ``beta_scale=1`` and equal head sizes;
+    other configurations are rejected at construction when it is enabled.
     """
 
     supports_dcp = False
@@ -168,6 +177,15 @@ class KdaAttention(nn.Module, MambaBase):
         beta_scale: float = 1.0,
     ) -> None:
         super().__init__()
+        supports_pooled = beta_scale == 1.0 and head_v_dim == head_k_dim
+        if not supports_pooled and unified_kv_layout_enabled_for_architecture(
+            vllm_config.model_config.architecture
+        ):
+            raise NotImplementedError(
+                "The unified KV pool supports KDA only with beta_scale=1 and "
+                "equal key and value head sizes; run with "
+                "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0"
+            )
         self.prefix = prefix
         self.vllm_config = vllm_config
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -292,8 +310,6 @@ class KdaAttention(nn.Module, MambaBase):
         # block-size derivation for the pool runs after model construction
         # (hybrid layers are built before the adjusted value exists), so the
         # op reads cache_config.block_size per call, not here.
-        # The pooled op supports neither a beta scale nor a value head wider
-        # than the key head.
         self.pooled_kda_op = (
             build_kimi_pooled_kda_op(
                 prefix,
@@ -302,7 +318,7 @@ class KdaAttention(nn.Module, MambaBase):
                 vllm_config=vllm_config,
                 num_spec_tokens=self.num_spec_tokens,
             )
-            if beta_scale == 1.0 and head_v_dim == head_k_dim
+            if supports_pooled
             else None
         )
 
@@ -476,12 +492,8 @@ class KdaAttention(nn.Module, MambaBase):
             raise NotImplementedError(
                 "KDA does not support PCP streaming prefill with the unified KV pool"
             )
-        if self.pooled_kda_op is None:
-            raise NotImplementedError(
-                "The unified KV pool supports KDA only with beta_scale=1 and "
-                "equal key and value head sizes; run with "
-                "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0"
-            )
+        # `__init__` rejects the unified pool when it cannot build this op.
+        assert self.pooled_kda_op is not None
         state_indices = metadata.mamba_state_indices
         if state_indices is None:
             raise RuntimeError(

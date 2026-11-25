@@ -772,7 +772,7 @@ class _ConvWeight(nn.Module):
 
 
 def _set_kda_dims(layer, *, conv_size: int, num_heads: int, head_dim: int) -> None:
-    """Set the per-rank sizes Kimi's KDA derives in `__init__`."""
+    """Set the per-rank sizes the shared `KdaAttention.__init__` derives."""
     layer.conv_size, layer.num_heads = conv_size, num_heads
     layer.head_k_dim = layer.head_v_dim = layer.gate_rank = head_dim
     layer.local_key_size = layer.local_value_size = num_heads * head_dim

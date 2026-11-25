@@ -65,7 +65,8 @@ class LatentMoE(nn.Module):
             ``min_intermediate_per_partition`` per MoE TP shard it is
             zero-padded up to that.
         shared_experts: Added to the routed output by the fused-MoE runner.
-        latent_norm_eps: Adds ``routed_expert_norm`` with this epsilon.
+        latent_norm_eps: Adds ``routed_expert_norm`` with this epsilon when
+            ``latent_size`` is set.
         use_score_correction_bias: Adds the router's
             ``gate.e_score_correction_bias``.
     """

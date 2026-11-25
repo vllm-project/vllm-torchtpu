@@ -85,19 +85,12 @@ class _RecordingLinear(nn.Module):
 
 
 @pytest.fixture
-def cpu_vllm_config():
-    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
-    with set_current_vllm_config(config):
-        yield config
+def build_kda(monkeypatch: pytest.MonkeyPatch):
+    """Build the real `KdaAttention` with stand-in linears and ops.
 
-
-def test_kda_construction_with_wider_value_heads(
-    monkeypatch: pytest.MonkeyPatch, cpu_vllm_config: VllmConfig
-) -> None:
-    """Every projection, parameter and state is sized from the head size it
-    belongs to: decay (f) and dt_bias by the key head, the output gate, norm
-    and o_proj by the value head. The beta scale reaches the dispatched op,
-    and the pooled op, which supports neither, is not built."""
+    Returns `build(unified_pool=False, **layer_kwargs) -> (layer, context,
+    dispatched_op_kwargs)`.
+    """
     for name in (
         "ColumnParallelLinear",
         "MergedColumnParallelLinear",
@@ -120,27 +113,73 @@ def test_kda_construction_with_wider_value_heads(
     monkeypatch.setattr(kda_attention, "build_kimi_dispatched_kda_op", build_dispatched)
     monkeypatch.setattr(kda_attention, "build_kimi_pooled_kda_op", build_pooled)
 
-    layer = KdaAttention(
-        cpu_vllm_config,
-        "model.layers.0.mixer",
-        hidden_size=HIDDEN,
-        num_heads=HEADS,
-        head_k_dim=HEAD_K,
-        head_v_dim=HEAD_V,
-        conv_kernel_size=CONV,
-        gate_rank=HEAD_V,
-        norm_eps=1e-6,
-        gate_bias=True,
-        beta_scale=2.0,
-    )
+    def build(unified_pool: bool = False, **layer_kwargs):
+        monkeypatch.setattr(
+            kda_attention,
+            "unified_kv_layout_enabled_for_architecture",
+            lambda architecture: unified_pool,
+        )
+        context = {}
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(architecture="Olmo35ForCausalLM"),
+            speculative_config=None,
+            quant_config=None,
+            compilation_config=SimpleNamespace(static_forward_context=context),
+        )
+        kwargs = dict(
+            hidden_size=HIDDEN,
+            num_heads=HEADS,
+            head_k_dim=HEAD_K,
+            head_v_dim=HEAD_V,
+            conv_kernel_size=CONV,
+            gate_rank=HEAD_V,
+            norm_eps=1e-6,
+            gate_bias=True,
+            beta_scale=2.0,
+        )
+        kwargs.update(layer_kwargs)
+        # RMSNorm reads the current config; pinned to CPU, where the default
+        # device detection can fail.
+        with set_current_vllm_config(
+            VllmConfig(device_config=DeviceConfig(device="cpu"))
+        ):
+            layer = KdaAttention(vllm_config, "model.layers.0.mixer", **kwargs)
+        return layer, context, op_kwargs
+
+    return build
+
+
+@pytest.mark.parametrize("use_full_rank_gate", [False, True])
+def test_kda_construction_with_wider_value_heads(build_kda, use_full_rank_gate) -> None:
+    """Every projection, parameter and state is sized from the head size it
+    belongs to: decay (f) and dt_bias by the key head, the output gate, norm
+    and o_proj by the value head, the down-projections by the gate rank. The
+    output gate, low-rank or full-rank, gets the bias. The beta scale reaches
+    the dispatched op, and the pooled op, which supports neither, is not
+    built."""
+    layer, context, op_kwargs = build_kda(use_full_rank_gate=use_full_rank_gate)
 
     key, value = HEADS * HEAD_K, HEADS * HEAD_V
     assert layer.fused_qkvb_proj.output_sizes == [key, key, value, HEADS]
-    assert layer.fused_fa_ga_proj.output_sizes == [HEAD_V, HEAD_V]
     assert (layer.f_b_proj.input_size, layer.f_b_proj.output_sizes) == (HEAD_V, key)
     assert not layer.f_b_proj.has_bias
-    assert (layer.g_b_proj.input_size, layer.g_b_proj.output_sizes) == (HEAD_V, value)
-    assert layer.g_b_proj.has_bias
+    if use_full_rank_gate:
+        assert layer.fused_fa_ga_proj is None and layer.g_b_proj is None
+        assert (layer.f_a_proj.input_size, layer.f_a_proj.output_sizes) == (
+            HIDDEN,
+            HEAD_V,
+        )
+        assert not layer.f_a_proj.has_bias
+        assert (layer.g_proj.input_size, layer.g_proj.output_sizes) == (HIDDEN, value)
+        assert layer.g_proj.has_bias
+    else:
+        assert layer.f_a_proj is None and layer.g_proj is None
+        assert layer.fused_fa_ga_proj.output_sizes == [HEAD_V, HEAD_V]
+        assert (layer.g_b_proj.input_size, layer.g_b_proj.output_sizes) == (
+            HEAD_V,
+            value,
+        )
+        assert layer.g_b_proj.has_bias
     assert layer.o_proj.input_size == value
     assert layer.q_conv1d.weight.shape == (key, 1, CONV)
     assert layer.v_conv1d.weight.shape == (value, 1, CONV)
@@ -154,8 +193,17 @@ def test_kda_construction_with_wider_value_heads(
     )
     assert op_kwargs["beta_scale"] == 2.0
     assert layer.pooled_kda_op is None
-    context = cpu_vllm_config.compilation_config.static_forward_context
     assert context["model.layers.0.mixer"] is layer
+
+
+@pytest.mark.parametrize(("head_v_dim", "beta_scale"), [(HEAD_V, 1.0), (HEAD_K, 2.0)])
+def test_unified_pool_is_rejected_before_allocation(
+    build_kda, head_v_dim, beta_scale
+) -> None:
+    """A configuration the pooled op cannot run fails at construction with
+    the fix, before any weight, op or forward-context entry exists."""
+    with pytest.raises(NotImplementedError, match="UNIFIED_BLOCK_POOL=0"):
+        build_kda(unified_pool=True, head_v_dim=head_v_dim, beta_scale=beta_scale)
 
 
 def _bare_layer(head_k_dim: int, head_v_dim: int) -> KdaAttention:
@@ -307,18 +355,3 @@ def test_forward_returns_value_wide_zeros_without_state() -> None:
         torch.ones(2, HEADS * HEAD_V),
     )
     torch.testing.assert_close(output, torch.zeros(2, HEADS * HEAD_V))
-
-
-def test_pooled_cache_without_pooled_op_says_how_to_run(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A configuration the pooled op cannot run fails with the fix, not a
-    trace-time shape error."""
-    layer = _bare_layer(HEAD_K, HEAD_V)
-    layer.pooled_kda_op = None
-    monkeypatch.setattr(
-        kda_attention, "is_pcp_streaming_attention_metadata", lambda md: False
-    )
-
-    with pytest.raises(NotImplementedError, match="UNIFIED_BLOCK_POOL=0"):
-        layer._core_attention_pooled(None, None, None, None, None, SimpleNamespace())

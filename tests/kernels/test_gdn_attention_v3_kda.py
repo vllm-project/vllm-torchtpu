@@ -599,7 +599,8 @@ class KdaAttentionV3Test(parameterized.TestCase):
         a = jax.random.normal(
             next(rngs), (sum(spec_lengths), n_v * d_k), dtype=jnp.bfloat16
         )
-        # Production KDA keeps conv state in fp32 (kimi_k3 attention kda_state_dtype).
+        # Production KDA keeps conv state in fp32 (layers/adapter/kda_attention.py
+        # kda_state_dtype).
         conv_state = jax.random.normal(
             next(rngs),
             (num_blocks, kernel_size - 1, dim_size),
