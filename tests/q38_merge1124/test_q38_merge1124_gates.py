@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "src"
 PKG = SRC / "vllm_torchtpu"
 PROXY = ROOT / "examples" / "disagg" / "toy_proxy_server.py"
-NAMED = ("k_cut1", "k_pkg", "k_sup", "oxk", "d1121", "k_sb11", "b1", "hix", "b3")
+NAMED = ("k_cut1", "k_pkg", "k_sup", "oxk", "d1121", "k_sb11", "b1", "hix", "b3", "q38f")
 PROXY_FORMS = ("w3", "k", "opener")
 _PROBE = "import vllm_torchtpu as v; print('Q38PATH', v.__path__[0])"
 
