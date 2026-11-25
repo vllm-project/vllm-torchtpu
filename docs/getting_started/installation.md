@@ -208,8 +208,8 @@ pip install \
 | `--group vllm` | Installs pinned upstream `vllm` (`v0.34.0`) from source. |
 | `--group test` | Installs `pytest`, `pytest-mock`, `pytest-cov`, `parameterized`, and `vllm_test_utils`. |
 | `--extra benchmarking` | Installs `lm-eval`, `evalscope`, `datasets`, and `runai-model-streamer[gcs]`. |
-| `--extra omni` | Installs `vllm-omni` for multimodal diffusion models (e.g., FLUX, Wan2.2). |
-| `--group omni-git` | Installs `vllm-omni` 0.32.0rc1 from its git tag for `--extra omni`, until that release is on PyPI. |
+| `--extra omni` | Does not install with vLLM 0.34: the pinned `vllm-omni` 0.32.0rc1 needs an older vLLM. Omni support is moving to vllm-omni-torchtpu. |
+| `--group omni-git` | Source of `vllm-omni` 0.32.0rc1 for `--extra omni`; does not install with vLLM 0.34 either. |
 
 ---
 

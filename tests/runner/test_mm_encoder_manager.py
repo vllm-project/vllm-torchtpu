@@ -45,6 +45,8 @@ def _make_manager(
         lambda budget, *args, path: SimpleNamespace(values=capture_values(budget))
     )
     model.get_encoder_cudagraph_item_specs.return_value = [Mock(), Mock()]
+    # Only read on the auto-budget path (budgets=None).
+    model.get_encoder_cudagraph_budget_range.return_value = (64, 4096)
     config = SimpleNamespace(
         model_config=SimpleNamespace(
             dtype=torch.float32,
@@ -56,7 +58,7 @@ def _make_manager(
         ),
         compilation_config=SimpleNamespace(
             cudagraph_mm_encoder=True,
-            encoder_cudagraph_token_budgets=list(budgets),
+            encoder_cudagraph_token_budgets=None if budgets is None else list(budgets),
             encoder_cudagraph_max_token_budget=None,
             encoder_cudagraph_max_vision_items_per_batch=2,
             encoder_cudagraph_max_frames_per_batch=0,
@@ -98,16 +100,25 @@ def test_initialization_compiles_encoder_forward(manager, compile_mock):
     )
 
 
-def test_auto_budgets_stay_power_of_two_for_xla_compilation():
-    assert mm.MMEncoderManager._generate_budgets(64, 4096) == [
-        64,
-        128,
-        256,
-        512,
-        1024,
-        2048,
-        4096,
-    ]
+def test_auto_budgets_initialize_power_of_two_xla_buckets(compile_mock):
+    # With no user budgets, upstream's init builds them through the
+    # manager's _generate_budgets / _item_multiple_budgets: power-of-2 buckets
+    # instead of the subdivided CUDA-graph grid (34 budgets up to 4096).
+    mgr = _make_manager(
+        lambda budget: {"pixels": torch.zeros(budget, 2)},
+        paths={
+            "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
+            "fixed": SimpleNamespace(min_token_budget=256, allow_zero_tokens=False),
+        },
+        budgets=None,
+    )
+    powers = [64, 128, 256, 512, 1024, 2048, 4096]
+    assert mgr.token_budgets == powers
+    assert mgr.path_token_budgets == {"default": powers, "fixed": powers[2:]}
+    assert {path: list(t) for path, t in mgr.budget_templates.items()} == {
+        "default": powers,
+        "fixed": powers[2:],
+    }
     assert mm.MMEncoderManager._generate_budgets(64, 4096, cap=1500) == [
         64,
         128,
@@ -115,13 +126,6 @@ def test_auto_budgets_stay_power_of_two_for_xla_compilation():
         512,
         1024,
         1500,
-    ]
-    assert mm.MMEncoderManager._item_multiple_budgets(256, 4096) == [
-        256,
-        512,
-        1024,
-        2048,
-        4096,
     ]
 
 

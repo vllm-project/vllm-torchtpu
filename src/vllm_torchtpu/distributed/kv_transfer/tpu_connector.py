@@ -2178,7 +2178,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         Block tables are accumulated from the scheduler output the way the
         workers accumulate theirs: a new request's table is taken whole and a
         cached request appends its new blocks per group. A resumed request
-        arrives as a new one (vLLM >= 0.34).
+        arrives as a new one.
         """
         for req_id in scheduler_output.preempted_req_ids or ():
             self._stage3_block_tables.pop(req_id, None)

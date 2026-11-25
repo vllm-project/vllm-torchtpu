@@ -361,7 +361,8 @@ class Lockstep:
                     entry,
                 )
         cached = self.pool.cached_block_hash_to_block
-        # vLLM stores one block id per key, plus all ids of duplicate keys.
+        # vLLM stores one block id per key; _dup_ids holds every id (the
+        # primary included) for keys with more than one block.
         for key, block_id in cached._cache.items():
             if get_group_id(key) != MAMBA_GROUP:
                 continue

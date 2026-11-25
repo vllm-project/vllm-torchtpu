@@ -445,9 +445,10 @@ def test_update_states_tracks_new_requests_and_forgets_finished_ones():
 
 
 def test_update_states_tracks_preempted_requests_again_on_resume():
-    """vLLM >= 0.34 drops a preempted request's worker state and re-sends it
-    as a new request when it resumes; `add` registers it again, and its count
-    continues from the output rebuilt from prefill_token_ids."""
+    """vLLM drops a preempted request's worker state and re-sends it as a new
+    request when it resumes: batch_state forgets it once it leaves the runner's
+    requests, `add` registers it again, and its count continues from the output
+    rebuilt from prefill_token_ids."""
     runner = object.__new__(TPUModelRunner)
     runner._min_tokens = min_tokens.MinTokensTracker()
     params = SamplingParams(min_tokens=10, stop_token_ids=[9])
@@ -458,7 +459,8 @@ def test_update_states_tracks_preempted_requests_again_on_resume():
     runner.requests = {}
     runner._install_spec_token_room_guard = lambda: None
     resumed = SimpleNamespace(req_id="p", sampling_params=params)
-    for preempted, new_reqs in (({"p"}, []), (None, [resumed])):
+
+    def step(preempted, new_reqs):
         scheduler_output = SimpleNamespace(
             finished_req_ids=set(),
             preempted_req_ids=preempted,
@@ -467,7 +469,19 @@ def test_update_states_tracks_preempted_requests_again_on_resume():
         )
         with patch.object(GPUModelRunner, "_update_states", return_value=None):
             TPUModelRunner._update_states(runner, scheduler_output)
-        assert list(runner._min_tokens.requests) == ["p"]
+
+    # Preempted: gone from the runner's requests, so batch_state drops it.
+    step({"p"}, [])
+    assert runner._min_tokens.batch_state({}, lambda _: None) == {}
+    assert not runner._min_tokens.requests
+
+    # Resumed as a new request: tracked again, and 3 rebuilt outputs of
+    # min_tokens=10 still mask the stop token.
+    step(None, [resumed])
+    assert list(runner._min_tokens.requests) == ["p"]
+    assert runner._min_tokens.batch_state({"p": 0}, lambda _: 3) == {
+        0: (10, 3, (9,), False)
+    }
 
 
 def _precompile_runner(speculative_config, mtp_prefill_only):

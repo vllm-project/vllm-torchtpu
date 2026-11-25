@@ -128,6 +128,12 @@ def test_non_diagnostic_keys_still_change_the_factors(patched_compile_factors):
     ) != patched_compile_factors(_StubVllmConfig({"some_plugin_knob": 2, KEY: 128}))
 
 
+def test_diagnostic_key_is_dropped_next_to_live_keys(patched_compile_factors):
+    assert patched_compile_factors(
+        _StubVllmConfig({"some_plugin_knob": 1, KEY: 128})
+    ) == patched_compile_factors(_StubVllmConfig({"some_plugin_knob": 1}))
+
+
 def test_untouched_configs_keep_their_upstream_factors(patched_compile_factors):
     config = _StubVllmConfig({"some_plugin_knob": 1})
 

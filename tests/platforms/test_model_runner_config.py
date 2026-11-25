@@ -147,6 +147,9 @@ def test_tpu_post_init_disables_default_async_scheduling_where_unsupported(
 ):
     seen_before_upstream = []
     monkeypatch.setattr(VllmConfig, "_tpu_runner_validation_patch", False)
+    # Re-installing wraps these again; restore them after the test.
+    for name in ("_validate_model_runner", "_validate_adaptive_verification"):
+        monkeypatch.setattr(VllmConfig, name, getattr(VllmConfig, name))
     monkeypatch.setattr(
         VllmConfig,
         "__post_init__",
