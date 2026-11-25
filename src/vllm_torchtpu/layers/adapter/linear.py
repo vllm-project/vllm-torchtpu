@@ -72,7 +72,8 @@ class TpuRowParallelLinear(RowParallelLinear):
     ``super().forward()``.
     """
 
-    # TODO: drop this override once vLLM adds the bias after the all-reduce.
+    # TODO: drop this override once vLLM adds the bias after the all-reduce:
+    # https://github.com/vllm-project/vllm/issues/70000
     def forward(
         self,
         input_,

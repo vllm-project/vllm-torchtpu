@@ -39,7 +39,8 @@ class TpuRowParallelLinearWithLoRA(RowParallelLinearWithLoRA):
     ``super().forward()``.
     """
 
-    # TODO: drop this override once vLLM adds the bias after the all-reduce.
+    # TODO: drop this override once vLLM adds the bias after the all-reduce:
+    # https://github.com/vllm-project/vllm/issues/70000
     def forward(
         self, input_: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
@@ -59,7 +60,8 @@ def use_tpu_lora_layers(modules: Iterable[BaseLayerWithLoRA]) -> None:
     are retyped once vLLM has created them. The TPU classes add no state.
     """
     # TODO: register the TPU layer through vLLM once it has a hook for
-    # out-of-tree LoRA layers, and stop retyping.
+    # out-of-tree LoRA layers, and stop retyping:
+    # https://github.com/vllm-project/vllm/issues/70000
     for module in modules:
         if type(module) is RowParallelLinearWithLoRA:
             module.__class__ = TpuRowParallelLinearWithLoRA
