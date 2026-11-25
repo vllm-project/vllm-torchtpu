@@ -1,0 +1,18 @@
+{
+ "config": {
+  "gpu_memory_utilization": 0.92,
+  "max_num_seqs": 32
+ },
+ "plans": {
+  "agentx-c48": {
+   "c48_stack": "on",
+   "decode_batch": "large",
+   "pool_budget": "fixed_61g"
+  },
+  "agentx-mixed-256k": {
+   "c48_stack": "off",
+   "decode_batch": "large",
+   "pool_budget": "fixed_61g"
+  }
+ }
+}

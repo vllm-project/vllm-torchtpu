@@ -34,6 +34,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.block_major_pool import (
+    BlockMajorPoolBindable,
     BlockMajorPoolLayout,
     flat_manager_ids,
     kernel_view,
@@ -351,7 +352,7 @@ def _localize_gdn_mamba_spec_for_pcp(
 
 
 @QwenGatedDeltaNetAttention.register_oot
-class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
+class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBindable):
     # Whether pooled ops consume the merged block-major unified pool, along
     # with `(pool_index, layout)` once bound by `set_block_major_pool()`.
     # Class-level defaults support test/mock instances constructed without `__init__`.
