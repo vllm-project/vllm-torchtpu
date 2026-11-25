@@ -211,3 +211,24 @@ def test_mask_router_logits_for_padding():
     finally:
         token_padding.set_padding_state(None)
     assert token_padding.mask_router_logits_for_padding(logits) is logits
+
+
+def test_update_alternating_rows_rewrites_each_mask():
+    # A decode step alternates the target's rows with the drafter's.
+    state = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
+    for _ in range(2):
+        state.update(8, 8)
+        assert state.get_local_padding_mask(8).sum().item() == 0
+        state.update(7, 8)
+        assert state.get_local_padding_mask(8).tolist() == [False] * 7 + [True]
+
+
+def test_update_keeps_mask_identity():
+    # Compiled graphs read this tensor object; updates must write into it.
+    mask = torch.zeros(8, dtype=torch.bool)
+    state = TokenPaddingState(local_padding_mask=mask)
+    state.update(2, 4)
+    state.update(5, 8)
+    state.update(2, 4)
+    assert state.local_padding_mask is mask
+    assert mask.tolist() == [False, False, True, True] + [False] * 4

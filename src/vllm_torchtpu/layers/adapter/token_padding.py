@@ -12,11 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 
 import torch
 
 _padding_state: "TokenPaddingState | None" = None
+
+# Distinct (valid, padded) row counts whose device masks are kept: a decode
+# step alternates between the target's and the drafter's, prefill adds a few.
+_MAX_CACHED_MASKS = 16
 
 
 @dataclass
@@ -24,6 +29,11 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # The (valid, padded) rows `local_padding_mask` holds, and device copies of
+    # recent masks: a steady decode step rewrites the mask from device memory
+    # instead of a synchronous host upload per forward.
+    _rows: tuple[int, int] | None = field(default=None, init=False, repr=False)
+    _masks: OrderedDict = field(default_factory=OrderedDict, init=False, repr=False)
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
@@ -34,10 +44,20 @@ class TokenPaddingState:
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
-        host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
-        host[local_valid_tokens:local_padded_tokens] = True
-        # Synchronous copy since the host tensor is temporary.
-        self.local_padding_mask.copy_(host)
+        rows = (local_valid_tokens, local_padded_tokens)
+        if rows == self._rows:
+            return
+        mask = self._masks.pop(rows, None)
+        if mask is None:
+            host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
+            host[local_valid_tokens:local_padded_tokens] = True
+            # Synchronous copy since the host tensor is temporary.
+            mask = host.to(self.local_padding_mask.device)
+        self._masks[rows] = mask
+        if len(self._masks) > _MAX_CACHED_MASKS:
+            self._masks.popitem(last=False)
+        self.local_padding_mask.copy_(mask)
+        self._rows = rows
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
