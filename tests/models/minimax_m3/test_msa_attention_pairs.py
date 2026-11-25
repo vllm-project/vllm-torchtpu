@@ -105,10 +105,15 @@ def test_pairs_match_reference_and_tiles(num_tokens, num_real, window, crowd):
     np.testing.assert_allclose(got, np.asarray(tiles.astype(jnp.float32)), atol=1e-2)
 
 
-def test_window_fits_vmem():
-    """More query heads take a smaller token window; none fitting -> no support."""
-    assert msa_attention_pairs._max_window(16, HEAD_DIM) == msa_attention_pairs.WINDOW
-    assert msa_attention_pairs._max_window(32, HEAD_DIM) == 400
+def test_window_fits_vmem_and_sort_key():
+    """More query heads, or page keys, take a smaller token window; none
+    fitting -> no support."""
+    window = msa_attention_pairs._max_window
+    assert window(16, HEAD_DIM, 128, 2048) == msa_attention_pairs.WINDOW
+    assert 8 <= window(32, HEAD_DIM, 128, 2048) < msa_attention_pairs.WINDOW
+    assert window(16, HEAD_DIM, 128, 4096) == 1024
+    assert not msa_attention_pairs.supports(16, HEAD_DIM, 128, 8192)
+    assert window(16, HEAD_DIM, 128, 8192, window=152) % 8 == 0
     assert msa_attention_pairs.supports(32, HEAD_DIM, 128, 2048)
     assert not msa_attention_pairs.supports(4096, HEAD_DIM, 128, 2048)
 
