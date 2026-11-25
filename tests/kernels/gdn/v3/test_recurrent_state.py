@@ -24,10 +24,23 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
+from vllm_torchtpu.kernels.gdn.v3 import compute_gdn, config, tiling
 from vllm_torchtpu.kernels.gdn.v3 import recurrent_state as rs
-from vllm_torchtpu.kernels.gdn.v3 import tiling
 
 _SCALED_FORMATS = (rs.RecurrentStateFormat.FP8,)
+# The FP8 decode update from stored values rounds each element to bfloat16 a
+# few times, each time by under 0.4%.
+_MAX_FP8_DECODE_REL_ERROR = 1e-2
+
+
+def _rel_error(
+    want: jax.Array, got: jax.Array, axis: int | tuple[int, ...]
+) -> np.ndarray:
+    want_f64 = np.asarray(want, np.float64)
+    err = np.asarray(got, np.float64) - want_f64
+    return np.sqrt(
+        np.sum(np.square(err), axis=axis) / np.sum(np.square(want_f64), axis=axis)
+    )
 
 
 def _rel_l2(ref: np.ndarray, got: np.ndarray) -> float:
@@ -692,6 +705,229 @@ class RecurrentStateTest(parameterized.TestCase):
                     d_v=128,
                     fmt=rs.RecurrentStateFormat.FP8,
                 )
+        with self.assertRaisesRegex(ValueError, "load_dtype"):
+            rs.RecurrentStateStream(
+                dummy_ref,
+                dummy_ref,
+                fmt=rs.RecurrentStateFormat.FP8,
+                n_v=8,
+                d_k=128,
+                d_v=128,
+                window_size=1,
+                seq_has_init=[jnp.bool_(True)],
+                load_dtype=jnp.float16,
+            )
+        with self.assertRaisesRegex(ValueError, "carry_ref"):
+            rs.RecurrentStateStream(
+                dummy_ref,
+                dummy_ref,
+                fmt=rs.RecurrentStateFormat.FP8,
+                n_v=8,
+                d_k=128,
+                d_v=128,
+                window_size=1,
+                seq_has_init=[jnp.bool_(True)],
+                carry_ref=dummy_ref,
+                seq_is_first_tile=[jnp.bool_(True)],
+                load_dtype=jnp.bfloat16,
+            )
+        fp8_stream = rs.RecurrentStateStream(
+            dummy_ref,
+            dummy_ref,
+            fmt=rs.RecurrentStateFormat.FP8,
+            n_v=8,
+            d_k=128,
+            d_v=128,
+            window_size=1,
+            seq_has_init=[jnp.bool_(True)],
+            load_dtype=jnp.bfloat16,
+        )
+        for bad_v in (-1, 8):
+            with self.assertRaisesRegex(ValueError, "Head index v"):
+                fp8_stream.load_head(0, bad_v)
+
+    @parameterized.parameters((2, 16), (3, 6))
+    def test_fp8_bf16_decode_matches_float32_update(self, n_kq, n_v):
+        fmt = rs.RecurrentStateFormat.FP8
+        n_seq, d = 2, 128
+        f32 = jnp.dtype(jnp.float32)
+        cfg = config.GDNConfig(
+            mode=config.GDNMode.BATCHED,
+            dtypes=config.Dtypes(f32, f32, f32, jnp.dtype(jnp.uint32), f32),
+            batch_size=n_seq,
+            dim_size=(2 * n_kq + n_v) * d,
+            kernel_size=4,
+            tile_size=n_seq,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=d,
+            v_head_dim=d,
+            recurrent_state_format=fmt,
+        )
+        rng = np.random.default_rng(4)
+
+        def normal(*shape: int) -> jax.Array:
+            return jnp.asarray(rng.standard_normal(shape), jnp.float32)
+
+        state = _wide_state(4, n_v=n_v)
+        q = normal(n_seq, n_kq, 1, 1, d)
+        k = normal(n_seq, n_kq, 1, 1, d)
+        v = normal(n_seq, n_v, 1, 1, d)
+        b = normal(n_seq, 1, 1, 1, n_v)
+        a = normal(n_seq, 1, 1, 1, n_v)
+        # Heads with short and with long memory.
+        a_log = jnp.asarray(rng.uniform(-3.0, 0.5, n_v), jnp.float32)
+        in_slot = _to_u32_slot(state, fmt)
+
+        # Independent float64 mathematical reference on the unpacked initial state.
+        init_unpacked = np.asarray(
+            rs.unpack_state(in_slot[:, 0], fmt, n_v=n_v, d_k=d), dtype=np.float64
+        )
+        q_np = np.repeat(np.asarray(q[:, :, 0, 0, :], np.float64), n_v // n_kq, axis=1)
+        k_np = np.repeat(np.asarray(k[:, :, 0, 0, :], np.float64), n_v // n_kq, axis=1)
+        q_np = (q_np / np.sqrt(np.sum(q_np * q_np, axis=-1, keepdims=True) + 1e-6)) * (
+            d**-0.5
+        )
+        k_np = k_np / np.sqrt(np.sum(k_np * k_np, axis=-1, keepdims=True) + 1e-6)
+        v_np = np.asarray(v[:, :, 0, 0, :], np.float64)
+        beta_np = 1.0 / (1.0 + np.exp(-np.asarray(b[:, 0, 0, 0, :], np.float64)))
+        a_np = np.asarray(a[:, 0, 0, 0, :], np.float64)
+        decay_np = np.exp(
+            -np.exp(np.asarray(a_log, np.float64)[None, :]) * np.log1p(np.exp(a_np))
+        )
+        state_upd_ref = init_unpacked * decay_np[:, :, None, None]
+        v_pred_ref = np.einsum("shd,shdm->shm", k_np, state_upd_ref)
+        v_new_ref = beta_np[:, :, None] * (v_np - v_pred_ref)
+        ref_state = state_upd_ref + np.einsum("shd,shm->shdm", k_np, v_new_ref)
+        ref_out = np.einsum("shd,shdm->shm", q_np, ref_state)[:, None, :, :]
+
+        stored_dtypes: list[jnp.dtype] = []
+
+        def decode(slot_in: jax.Array, use_bf16: bool):
+            in_ref = _FakeSlotRef(slot_in)
+            out_shape = (n_seq, 1, *rs.slot_window_shape(fmt, n_v, d, d))
+            out_ref = _FakeSlotRef(jnp.zeros(out_shape, jnp.uint32))
+            stream = rs.RecurrentStateStream(
+                cast(jax.Ref, in_ref),
+                cast(jax.Ref, out_ref),
+                fmt=fmt,
+                n_v=n_v,
+                d_k=d,
+                d_v=d,
+                window_size=1,
+                seq_has_init=[jnp.bool_(True)] * n_seq,
+                load_dtype=jnp.bfloat16 if use_bf16 else jnp.float32,
+            )
+
+            def _record_and_store(s, h, w_idx, head):
+                if use_bf16:
+                    stored_dtypes.append(head.dtype)
+                stream.store_ckpt_head(s, h, w_idx, head)
+
+            out, _ = compute_gdn.recurrent_gdn(
+                jnp.ones((n_seq,), jnp.int32),
+                q,
+                k,
+                v,
+                b,
+                a,
+                None,
+                a_log,
+                jnp.zeros((n_v,), jnp.float32),
+                cfg,
+                load_head_fn=stream.load_head,
+                store_ckpt_head_fn=_record_and_store,
+            )
+            return out, out_ref.arr[:, 0]
+
+        want_out, want_packed = jax.jit(lambda x: decode(x, False))(in_slot)
+        got_out, got_packed = jax.jit(lambda x: decode(x, True))(in_slot)
+        want_state = rs.unpack_state(want_packed, fmt, n_v=n_v, d_k=d)
+        got_state = rs.unpack_state(got_packed, fmt, n_v=n_v, d_k=d)
+
+        self.assertTrue(stored_dtypes)
+        self.assertTrue(all(dt == jnp.bfloat16 for dt in stored_dtypes))
+        np.testing.assert_array_less(
+            _rel_error(want_out, got_out, -1), _MAX_FP8_DECODE_REL_ERROR
+        )
+        np.testing.assert_array_less(
+            _rel_error(jnp.asarray(ref_out, jnp.float32), got_out, -1),
+            _MAX_FP8_DECODE_REL_ERROR,
+        )
+        np.testing.assert_array_less(
+            _rel_error(jnp.asarray(ref_state, jnp.float32), got_state, (-2, -1)),
+            6e-2,
+        )
+        np.testing.assert_array_less(
+            _rel_error(want_state, got_state, (-2, -1)),
+            6e-2,
+        )
+
+    def test_load_head_bf16_masks_nan_when_uninitialized(self):
+        fmt = rs.RecurrentStateFormat.FP8
+        n_v, d = 8, 128
+        in_shape = (1, 1, *rs.slot_window_shape(fmt, n_v, d, d))
+
+        @jax.jit
+        def load_head(raw_slot: jax.Array, has_init: jax.Array):
+            in_ref = _FakeSlotRef(raw_slot)
+            out_ref = _FakeSlotRef(jnp.zeros(in_shape, jnp.uint32))
+            stream = rs.RecurrentStateStream(
+                cast(jax.Ref, in_ref),
+                cast(jax.Ref, out_ref),
+                fmt=fmt,
+                n_v=n_v,
+                d_k=d,
+                d_v=d,
+                window_size=1,
+                seq_has_init=[has_init],
+                load_dtype=jnp.bfloat16,
+            )
+            return stream.load_head(0, 0)
+
+        # 0xFFFFFFFF poisons every float8_e4m3fn byte and the float32 scale with NaN.
+        poison = jnp.full(in_shape, jnp.uint32(0xFFFFFFFF))
+
+        head_uninit = load_head(poison, jnp.bool_(False))
+        self.assertEqual(head_uninit.dtype, jnp.bfloat16)
+        np.testing.assert_array_equal(
+            np.asarray(head_uninit), np.zeros((d, d), jnp.bfloat16)
+        )
+
+        # Control: without masking, the poisoned slot produces NaN values.
+        head_init = load_head(poison, jnp.bool_(True))
+        self.assertEqual(head_init.dtype, jnp.bfloat16)
+        self.assertTrue(bool(jnp.all(jnp.isnan(head_init))))
+
+    def test_in_memory_bf16_state_prev_preserves_float32_update(self):
+        n_seq, n_kq, n_v, d = 1, 2, 4, 128
+        f32 = jnp.dtype(jnp.float32)
+        cfg = config.GDNConfig(
+            mode=config.GDNMode.BATCHED,
+            dtypes=config.Dtypes(f32, f32, f32, jnp.dtype(jnp.bfloat16), f32),
+            batch_size=n_seq,
+            dim_size=(2 * n_kq + n_v) * d,
+            kernel_size=4,
+            tile_size=n_seq,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=d,
+            v_head_dim=d,
+        )
+        z = jnp.zeros
+        _, states = compute_gdn.recurrent_gdn(
+            jnp.ones((n_seq,), jnp.int32),
+            z((n_seq, n_kq, 1, 1, d), jnp.float32),
+            z((n_seq, n_kq, 1, 1, d), jnp.float32),
+            z((n_seq, n_v, 1, 1, d), jnp.float32),
+            z((n_seq, 1, 1, 1, n_v), jnp.float32),
+            z((n_seq, 1, 1, 1, n_v), jnp.float32),
+            z((n_seq, n_v, d, d), jnp.bfloat16),
+            z((n_v,), jnp.float32),
+            z((n_v,), jnp.float32),
+            cfg,
+        )
+        self.assertEqual(states.dtype, jnp.float32)
 
 
 @pytest.mark.tpu_test

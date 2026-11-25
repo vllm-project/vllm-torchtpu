@@ -209,13 +209,17 @@ def unpack_head(
     raw_u32: jax.Array,
     scale_f32: jax.Array,
     fmt: RecurrentStateFormat,
+    *,
+    dtype: jax.typing.DTypeLike = jnp.float32,
 ) -> jax.Array:
-    """Unpacks one FP8 head `(raw_u32, scale_f32)` to float32 `[d_k, d_v]`."""
+    """Unpacks one FP8 head `(raw_u32, scale_f32)` to `[d_k, d_v]` in `dtype`."""
     if fmt != RecurrentStateFormat.FP8:
         raise ValueError(f"unpack_head requires FP8; got {fmt!r}.")
     val_bf16 = pltpu.bitcast(raw_u32, jnp.float8_e4m3fn).astype(jnp.bfloat16)
     # Exact in bfloat16 because scale_f32 is a power of two (shifts only exponent).
-    return (val_bf16 * scale_f32.astype(jnp.bfloat16)).astype(jnp.float32)
+    scaled = val_bf16 * scale_f32.astype(jnp.bfloat16)
+    out_dtype = jnp.dtype(dtype)
+    return scaled if out_dtype == jnp.bfloat16 else scaled.astype(out_dtype)
 
 
 def load_scale_tile(
@@ -255,14 +259,15 @@ def load_head(
     fmt: RecurrentStateFormat,
     scale_row: jax.Array,
     has_init: jax.Array | None = None,
+    dtype: jax.typing.DTypeLike = jnp.float32,
 ) -> jax.Array:
-    """Loads one packed FP8 head `v` from `slot_ref` as `[d_k, d_v]` float32."""
+    """Loads one packed FP8 head `v` from `slot_ref` as `[d_k, d_v]`."""
     if fmt != RecurrentStateFormat.FP8:
         raise ValueError(f"load_head requires FP8; got {fmt!r}.")
     rph = data_rows_per_head(fmt, d_k)
     row0 = v * rph
     raw_v = _mask_u32(slot_ref[seq_idx, ckpt_idx, pl.ds(row0, rph), :], has_init)
-    return unpack_head(raw_v, scale_row, fmt)
+    return unpack_head(raw_v, scale_row, fmt, dtype=dtype)
 
 
 def store_head_block(
@@ -399,6 +404,7 @@ class RecurrentStateStream:
         carry_ref: jax.Ref | None = None,
         seq_is_first_tile: Sequence[jax.Array] | None = None,
         flush_cond: jax.Array | None = None,
+        load_dtype: jax.typing.DTypeLike = jnp.float32,
     ):
         """Initializes the per-head VMEM state stream.
 
@@ -416,9 +422,20 @@ class RecurrentStateStream:
             seq_is_first_tile: Per-sequence booleans selecting `in_slot_ref` vs
                 `carry_ref`; required when `carry_ref` is set.
             flush_cond: Optional scalar boolean gating FP8 writes to `out_slot_ref`.
+            load_dtype: Output dtype of `load_head` (`float32` or `bfloat16`).
         """
         if carry_ref is not None and seq_is_first_tile is None:
             raise ValueError("seq_is_first_tile is required when carry_ref is set.")
+        load_dtype_val = jnp.dtype(load_dtype)
+        if load_dtype_val not in (jnp.float32, jnp.bfloat16):
+            raise ValueError(
+                f"load_dtype must be float32 or bfloat16; got {load_dtype!r}."
+            )
+        if load_dtype_val == jnp.bfloat16 and carry_ref is not None:
+            raise ValueError(
+                "load_dtype=bfloat16 does not support carry_ref "
+                "(single-tile HBM reads only)."
+            )
         self._in_slot_ref = in_slot_ref
         self._out_slot_ref = out_slot_ref
         self._fmt = fmt
@@ -431,13 +448,14 @@ class RecurrentStateStream:
         self._carry_ref = carry_ref
         self._seq_is_first_tile = seq_is_first_tile
         self._flush_cond = flush_cond
+        self._load_dtype = load_dtype_val
         self._scale_key: tuple[int, int] | None = None
         self._scale_tile: jax.Array | None = None
         self._ckpt_heads: list[list[jax.Array]] = [[] for _ in range(window_size)]
         self._ckpt_keys: list[tuple[int, int] | None] = [None] * window_size
 
     def load_head(self, s: int, v: int) -> jax.Array:
-        """Loads head `v` of sequence `s` as `[d_k, d_v]` float32."""
+        """Loads head `v` of sequence `s` as `[d_k, d_v]` in `load_dtype`."""
         if not (0 <= v < self._n_v):
             raise ValueError(f"Head index v must be in 0..{self._n_v - 1}; got v={v}.")
         if self._is_scaled:
@@ -450,10 +468,13 @@ class RecurrentStateStream:
                 fmt=self._fmt,
                 scale_row=self._scale_row(s, v),
                 has_init=self._seq_has_init[s],
+                dtype=self._load_dtype,
             )
         else:
             raw_v = _mask_u32(self._in_slot_ref[s, 0, v], self._seq_has_init[s])
-            hbm_v = pltpu.bitcast(raw_v, _unscaled_dtype(self._fmt)).astype(jnp.float32)
+            hbm_v = pltpu.bitcast(raw_v, _unscaled_dtype(self._fmt)).astype(
+                self._load_dtype
+            )
         if self._carry_ref is not None:
             assert self._seq_is_first_tile is not None
             return jnp.where(self._seq_is_first_tile[s], hbm_v, self._carry_ref[s, v])
