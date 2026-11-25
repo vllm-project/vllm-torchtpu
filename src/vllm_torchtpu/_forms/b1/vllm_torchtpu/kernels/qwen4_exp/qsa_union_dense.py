@@ -597,6 +597,72 @@ _DEBRUIJN = np.asarray([0, 1, 28, 2, 29, 14, 24, 3, 30, 22, 20, 15, 25, 17, 4, 8
                         31, 27, 13, 23, 21, 19, 16, 7, 26, 12, 18, 6, 11, 5, 10, 9], np.int32)
 
 
+# q38 PSTEP-WALKRING R4XB (union_walk_kernel(walk_ring=R), R in {3, 4}; gathered walk only; default 0 = off): the gathered
+# walk's tiles stream through an R-slot ring of VMEM tile buffers (KV + lines, one DMA semaphore per slot) that continues
+# across grid blocks. The grid is ("arbitrary",): one core walks the blocks in order, so the ring's SMEM state carries from
+# block g to block g + 1. Tiles take ring positions in walk order (block by block, tile by tile); position k lives in slot
+# k mod R, so a slot holds at most one tile in flight and a tile's own semaphore counts its KV and line bytes. At most R
+# tiles are in flight: a block's prologue (before the query prep) issues its first min(count, R) tiles minus those the
+# previous block already issued; after each tile's compute the freed position is refilled with the next unissued tile of
+# this block (t + R) or, once this block is fully issued, of the next block (its tile t + R - count when count >= R), never
+# beyond the next block's own count and never past the last block, so no DMA is outstanding at exit. Same tiles, same
+# order, same per-tile compute on the same bytes (the gathered inputs are read-only): bitwise the double-buffered walk.
+# The two functions below are the whole schedule; ``_walk_kernel`` passes Pallas primitives (pl.when, lax.fori_loop, the
+# DMA issue / wait, compute_tile), and the CPU proof's DMA-protocol checker passes host stand-ins to the same code.
+# ``state`` (SMEM int32[4], carried across grid steps): [0] ring slot of this block's tile 0, [1] how many of this block's
+# tiles (a prefix) the previous block already issued, [2] this block's tiles issued, [3] the next block's tiles issued.
+def _ring_slot(position, slots):
+    """The ring slot of ``position``: position mod slots (a mask for 4 slots)."""
+    return position & 3 if slots == 4 else position % slots
+
+
+def walk_ring_prologue(state, *, block, count, slots, issue, when, minimum, maximum, **_):
+    """R4XB block prologue: issue this block's tiles [state[1], min(count, slots)), tile t into slot state[0] + t."""
+
+    @when(block == 0)
+    def _():
+        state[0] = 0
+        state[1] = 0
+
+    slot0, ahead = state[0], state[1]
+    for tile in range(slots):
+
+        @when((tile >= ahead) & (tile < count))
+        def _(tile=tile):
+            issue(block, tile, _ring_slot(slot0 + tile, slots))
+
+    state[2] = maximum(ahead, minimum(count, slots))
+    state[3] = 0
+
+
+def walk_ring_loop(state, *, block, nblocks, count, next_count, slots, issue, wait, compute, when, loop, **_):
+    """R4XB tile loop: per tile wait its slot, compute it, then refill the ring with the next unissued tile (this block's,
+    then the next block's, at most ``next_count`` of them); at exit record the next block's first slot and how many of its
+    tiles are in flight."""
+    slot0 = state[0]
+
+    def step(tile, slot):
+        wait(slot)
+        compute(tile, slot)
+        own, ahead = state[2], state[3]
+
+        @when(own < count)
+        def _():
+            issue(block, own, _ring_slot(slot0 + own, slots))
+            state[2] = own + 1
+
+        @when((own >= count) & (block + 1 < nblocks) & (ahead < next_count))
+        def _():
+            issue(block + 1, ahead, _ring_slot(slot0 + count + ahead, slots))
+            state[3] = ahead + 1
+
+        return _ring_slot(slot + 1, slots)
+
+    loop(0, count, step, slot0)
+    state[0] = _ring_slot(slot0 + count, slots)
+    state[1] = state[3]
+
+
 def _walk_kernel(
     tiles_ref,
     usize_ref,
@@ -665,7 +731,13 @@ def _walk_kernel(
     remat_max: bool = False,
     lse_ref=None,
     flat_out: bool = False,
+    walk_ring: int = 0,
+    ring_refs=None,
 ):
+    # walk_ring (q38 PSTEP-WALKRING R4XB, gathered walk only; default 0 = off): the R-slot cross-block tile ring (see
+    # ``walk_ring_prologue``); ring_refs = (KV ring [R, kv_tile, ...], line ring [R, rows, width], DMA semaphores [R],
+    # SMEM ring state int32[4]). The double buffers kv0 / kv1 / line0 / line1 are then not allocated (their arguments
+    # alias the rings and are never read).
     # q38 PSTEP-QSA bitwise register-pressure variants (gathered walk only; default off; the served math and op order per row):
     #   row_strips = n: each KV head's [rows, keys] score block runs as n row strips (whole q-heads, the full key range per
     #   strip), so each row sees the same select / max / exp / sum / P.V on the same operands; only the live block shrinks.
@@ -752,6 +824,23 @@ def _walk_kernel(
     usize = usize_ref[block]
     groups_per_tile = kv_tile // ratio
     width = bits_ref.shape[2]
+
+    if walk_ring:
+        # R4XB: the ring prologue issues this block's first tiles before the query prep and the state init.
+        ring_kv, ring_lines, ring_sems, ring_state = ring_refs
+        ring_rows = ring_lines.shape[1]
+        ring_ops = dict(slots=walk_ring, when=pl.when, loop=lax.fori_loop, minimum=jnp.minimum, maximum=jnp.maximum)
+
+        def ring_issue(at_block, tile, slot):
+            gathered_kv, gathered_lines = gathered_refs
+            at = at_block * gathered_cap_tiles + tile
+            with jax.named_scope("walk_issue") if scopes else contextlib.nullcontext():
+                pltpu.make_async_copy(gathered_kv.at[pl.ds(at * kv_tile, kv_tile)], ring_kv.at[slot],
+                                      ring_sems.at[slot]).start()
+                pltpu.make_async_copy(gathered_lines.at[pl.ds(at * ring_rows, ring_rows)], ring_lines.at[slot],
+                                      ring_sems.at[slot]).start()
+
+        walk_ring_prologue(ring_state, block=block, count=count, issue=ring_issue, **ring_ops)
 
     if stage_ubits:
         stage = pltpu.make_async_copy(
@@ -1438,7 +1527,15 @@ def _walk_kernel(
         def pipe_last_odd():
             stage_b(take(1))
 
-    if not walk_pipe:
+    if walk_ring:
+        nblocks = pl.num_programs(0)
+        walk_ring_loop(
+            ring_state, block=block, nblocks=nblocks, count=count,
+            next_count=tiles_ref[jnp.minimum(block + 1, nblocks - 1)], issue=ring_issue,
+            wait=lambda slot: wait_tile(ring_kv.at[slot], ring_sems.at[slot], ring_lines.at[slot]),
+            compute=lambda tile, slot: compute_tile(tile, ring_kv.at[slot], ring_lines.at[slot]), **ring_ops,
+        )
+    elif not walk_pipe:
         @pl.when(count > 0)
         def prefetch_first():
             start_tile(kv0_ref, line0_ref, sem0_ref)
@@ -1558,6 +1655,10 @@ def _walk_kernel_gathered(
         scratch = scratch[1:]
     if options.get("walk_pipe"):  # the last 4 scratch buffers: pipelined scores / values, slots 0 and 1
         scratch, options = scratch[:-4], dict(options, pipe_refs=scratch[-4:])
+    if options.get("walk_ring"):  # R4XB: line ring, KV ring, ring semaphores, ring state in place of the double buffers
+        line_ring, kv_ring, ring_sems, ring_state = scratch[4:8]
+        scratch = (*scratch[:4], line_ring, line_ring, kv_ring, kv_ring, ring_sems, ring_sems, *scratch[8:])
+        options = dict(options, ring_refs=(kv_ring, line_ring, ring_sems, ring_state))
     _walk_kernel(
         tiles_ref, usize_ref, table_ref, debruijn_ref, physw_ref, query_ref, bits_ref, lengths_ref,
         ubits_hbm_ref, cache_ref, output_ref, *scratch,
@@ -1846,7 +1947,7 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
                       qk16=False, gathered=None, listed=None, listed_lines=None, run_tables=None,
                       group_offset=0, lean_gathered=False, mask_view=False, vguard_lean=False, walk_pipe=False,
                       dot16=False, vguard_none=False, bf16_softmax=False, fos=0, lean_tile=False, row_strips=0,
-                      remat_max=False, emit_lse=False, inplace_out=None, flat_out=False):
+                      remat_max=False, emit_lse=False, inplace_out=None, flat_out=False, walk_ring=0):
     """The walking kernel alone, on a precomputed ``union_bits_plan`` (ungated bf16 output).
 
     ``inplace_out`` (q38 PSTEP-QCHAIN E4; the in-place lean gathered walk only): ``(total_groups, out, lse)``. The call
@@ -1854,6 +1955,10 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
     place into ``out`` / ``lse`` when they are given (aliased: the rows of other calls are kept) or into a fresh buffer
     whose other rows stay unwritten; the per-row values are the kernel's own, so the chunk outputs need no
     concatenation. ``flat_out`` (E4, with ``inplace_out``): the output is ``[rows, query heads * D]`` (o_proj's layout).
+
+    ``walk_ring`` (q38 PSTEP-WALKRING R4XB; 0 = off, 3 or 4 slots; gathered walk without walk_pipe): the tile ring
+    continued across grid blocks (see ``walk_ring_prologue``); same tiles, order and compute: bitwise the double-buffered
+    walk. The kernel name gains ``_ring<R>``.
 
     ``bf16_softmax`` / ``fos`` / ``lean_tile`` (q38 PSTEP-QSA WALK-FOS; gathered walk only; default off; NOT bitwise): the
     port of MM's R-B / L-A / L-B softmax and tile restructure (see ``_walk_kernel``). The kernel name gains ``_rb`` /
@@ -1939,6 +2044,8 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
     if walk_pipe not in (False, True, 0, 1, 2):
         raise ValueError("walk_pipe: 0 (off), 1 (stage A beside stage B) or 2 (interleaved per KV head)")
     walk_pipe = int(walk_pipe)
+    if walk_ring not in (0, 3, 4) or (walk_ring and (gathered is None or walk_pipe)):
+        raise ValueError("walk_ring (R4XB) must be 0, 3 or 4, and 3 / 4 need the gathered walk without walk_pipe")
     if (group_offset or bits is None) and gathered is None:
         raise ValueError("group_offset and bits=None need the gathered walk")
     in_place = bool(group_offset) or bits is None
@@ -2059,6 +2166,7 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
             **({"lean_tile": True} if lean_tile else {}), **({"row_strips": int(row_strips)} if row_strips else {}),
             **({"remat_max": True} if remat_max else {}), **({"emit_lse": True} if emit_lse else {}),
             **({"flat_out": True} if flat_out else {}),
+            **({"walk_ring": int(walk_ring)} if walk_ring else {}),
         ), len(alias_args)),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
@@ -2084,12 +2192,19 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
                 pltpu.SemaphoreType.DMA,
                 pltpu.SMEM((4,), jnp.int32),
                 pltpu.SMEM((words_padded if scan_list else 8,), jnp.int32),
-                pltpu.VMEM((kv_tile // ratio if line_matmul else kv_tile, width), jnp.int32),
-                pltpu.VMEM((kv_tile // ratio if line_matmul else kv_tile, width), jnp.int32),
-                pltpu.VMEM((kv_tile, head_axis, packing, head_dim), pool.dtype),
-                pltpu.VMEM((kv_tile, head_axis, packing, head_dim), pool.dtype),
-                pltpu.SemaphoreType.DMA,
-                pltpu.SemaphoreType.DMA,
+                *([
+                    pltpu.VMEM((kv_tile // ratio if line_matmul else kv_tile, width), jnp.int32),
+                    pltpu.VMEM((kv_tile // ratio if line_matmul else kv_tile, width), jnp.int32),
+                    pltpu.VMEM((kv_tile, head_axis, packing, head_dim), pool.dtype),
+                    pltpu.VMEM((kv_tile, head_axis, packing, head_dim), pool.dtype),
+                    pltpu.SemaphoreType.DMA,
+                    pltpu.SemaphoreType.DMA,
+                ] if not walk_ring else [   # R4XB: line ring, KV ring, one DMA semaphore per slot, SMEM ring state
+                    pltpu.VMEM((walk_ring, kv_tile // ratio if line_matmul else kv_tile, width), jnp.int32),
+                    pltpu.VMEM((walk_ring, kv_tile, head_axis, packing, head_dim), pool.dtype),
+                    pltpu.SemaphoreType.DMA((walk_ring,)),
+                    pltpu.SMEM((4,), jnp.int32),
+                ]),
                 pltpu.VMEM(state_shape, jnp.float32),
                 pltpu.VMEM(state_shape, jnp.float32),
                 pltpu.VMEM((*state_shape, head_dim), jnp.float32),
@@ -2126,7 +2241,7 @@ def union_walk_kernel(query, bits, ubits, usize, vlengths, pool, page_table_row,
         + ("_pipe" if walk_pipe == 1 else "_pipe2" if walk_pipe == 2 else "") + ("_d16" if dot16 else "")
         + ("_vn" if vguard_none else "") + ("_rb" if bf16_softmax else "") + (f"_fos{int(fos)}" if fos else "")
         + ("_lt" if lean_tile else "") + (f"_rs{int(row_strips)}" if row_strips else "") + ("_rm" if remat_max else "")
-        + ("_lse" if emit_lse else ""),
+        + ("_lse" if emit_lse else "") + (f"_ring{int(walk_ring)}" if walk_ring else ""),
     )(
         tiles,
         usize.astype(jnp.int32),
@@ -2314,8 +2429,12 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
                        gather_growth=1.0, compact_reqs=0, compact_copy_method="vmem", sc_bitset=False,
                        in_place=False, sc_bits_plan=False, gathered_lean=False, mask_view=False, vguard_lean=False,
                        align_gather=False, walk_pipe=False, dot16=False, vguard_none=False, bf16_softmax=False, fos=0,
-                       lean_tile=False, row_strips=0, remat_max=False):
+                       lean_tile=False, row_strips=0, remat_max=False, walk_ring=0):
     """D2 union-walk attention for a packed prefill step; ``(gated bf16 output, cache)``.
+
+    q38 PSTEP-WALKRING R4XB (default 0 = off): ``walk_ring`` (3 or 4) reaches the gathered walk kernel only, the fos=2
+    guard's exact re-run included (the cross-block tile ring; bitwise; see ``walk_ring_prologue``); one engagement line
+    per trace.
 
     q38 PSTEP-QSA WALK-FOS (default off; NOT bitwise): ``bf16_softmax`` / ``fos`` / ``lean_tile`` reach the gathered walk
     kernel only (see ``_walk_kernel``). PROTOTYPE: fos=2 has no overflow fallback here yet (census / numerics smoke only).
@@ -2513,6 +2632,13 @@ def union_walk_prefill(query, gate, blocks, lengths, table, cache, starts, *, kv
             raise ValueError("walk_pipe needs the gathered walk (gathered='reference' or 'sparsecore')")
         _engagement_log("QSA union walk: pipelined tile loop (walk_pipe %d) traced for %d-row steps (group %d, KV tile %d)",
                         int(walk_pipe), int(tokens), int(group), int(kv_tile))
+    if walk_ring:
+        if walk_ring not in (3, 4) or not gathered or walk_pipe:
+            raise ValueError("walk_ring (R4XB) must be 3 or 4 and needs the gathered walk without walk_pipe")
+        qa1["walk_ring"] = int(walk_ring)
+        # q38 PSTEP-WALKRING engagement marker: one line per trace on every rank (logger.info, not info_once).
+        _engagement_log("q38 PSTEP-WALKRING: R4XB walk ring %d traced for %d-row steps (group %d, KV tile %d, gathered %s)",
+                        int(walk_ring), int(tokens), int(group), int(kv_tile), gathered)
 
     def walk(max_tokens):
         """(ungated bf16 output in the original row order, whether every union fits)."""
@@ -2979,7 +3105,7 @@ def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows
                      union_cap, kv_tile, ratio, k_scale, v_scale, lean, qk16, growth=1.0, gather_pool=None,
                      in_place=False, lean_gathered=False, mask_view=False, vguard_lean=False, walk_pipe=False,
                      dot16=False, vguard_none=False, bf16_softmax=False, fos=0, lean_tile=False, row_strips=0,
-                     remat_max=False, flat_out=False):
+                     remat_max=False, flat_out=False, walk_ring=0):
     """``union_walk_prefill(gathered=...)``: per chunk of whole query groups, gather the chunk's union tiles from
     the list (``rows``/``ids``), then run the walk-free kernel on them; outputs concatenated in group order.
     ``flat_out`` (q38 PSTEP-QCHAIN E4): the output is [rows, heads * D]."""
@@ -2998,6 +3124,8 @@ def _gathered_chunks(query, bits, ubits, usize, vlengths, cache, page_rows, rows
            **({"vguard_none": True} if vguard_none else {}), **({"bf16_softmax": True} if bf16_softmax else {}),
            **({"fos": int(fos)} if fos else {}), **({"lean_tile": True} if lean_tile else {}),
            **({"row_strips": int(row_strips)} if row_strips else {}), **({"remat_max": True} if remat_max else {})}
+    if walk_ring:   # R4XB: every walk call of the chunk loop, the fos=2 guard's exact re-run included (``served`` keeps it)
+        qa1["walk_ring"] = int(walk_ring)
     from vllm_torchtpu.kernels.qwen4_exp import qsa_qchain  # q38 PSTEP-QCHAIN (lazy: no line shift above)
 
     walk_out = in_place and lean_gathered and qsa_qchain.engaged(4)

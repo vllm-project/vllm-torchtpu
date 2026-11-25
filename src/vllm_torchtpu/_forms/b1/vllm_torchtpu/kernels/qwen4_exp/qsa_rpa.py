@@ -1001,6 +1001,8 @@ def _prefill_attention(
             **({"bf16_softmax": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_BF16_SOFTMAX else {}),
             **({"fos": int(envs.VLLM_TPU_QSA_PREFILL_UNION_FOS)} if envs.VLLM_TPU_QSA_PREFILL_UNION_FOS else {}),
             **({"lean_tile": True} if envs.VLLM_TPU_QSA_PREFILL_UNION_LEAN_TILE else {}),
+            **({"walk_ring": int(envs.VLLM_TPU_QSA_PREFILL_UNION_WALK_RING)}
+               if envs.VLLM_TPU_QSA_PREFILL_UNION_WALK_RING else {}),
         )
     if gate.ndim == 2:
         # q38 PSTEP-QCHAIN E4: a step off the union walk takes the 3-D gate and returns the [rows / 8, 8, heads * D]

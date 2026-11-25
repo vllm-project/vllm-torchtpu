@@ -226,6 +226,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_UNION_BF16_SOFTMAX: bool = False
     VLLM_TPU_QSA_PREFILL_UNION_FOS: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_LEAN_TILE: bool = False
+    VLLM_TPU_QSA_PREFILL_UNION_WALK_RING: int = 0
     VLLM_TPU_QSA_PREFILL_UNION_GATHERED: str = ""
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS: int = 4
     VLLM_TPU_QSA_PREFILL_UNION_GATHER_GROWTH: float = 1.0
@@ -1299,6 +1300,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_QSA_PREFILL_UNION_BF16_SOFTMAX": env_bool("VLLM_TPU_QSA_PREFILL_UNION_BF16_SOFTMAX", default=False),
     "VLLM_TPU_QSA_PREFILL_UNION_FOS": env_int("VLLM_TPU_QSA_PREFILL_UNION_FOS", 0),
     "VLLM_TPU_QSA_PREFILL_UNION_LEAN_TILE": env_bool("VLLM_TPU_QSA_PREFILL_UNION_LEAN_TILE", default=False),
+    # q38 PSTEP-WALKRING R4XB (default 0 = off; gathered walk only, the fos=2 guard's exact re-run included): WALK_RING = R
+    # in {3, 4}: the gathered walk's tiles stream through an R-slot VMEM ring (one DMA semaphore per slot) that continues
+    # across grid blocks (the next block's first tiles are issued during this block's last ones; each block's prologue
+    # issues before the query prep). Same tiles, order and per-tile compute: bitwise the double-buffered walk. Read inside
+    # the compiled forward: a compile key. Kernel name gains _ring<R>; one engagement line per trace.
+    "VLLM_TPU_QSA_PREFILL_UNION_WALK_RING": lambda: int(
+        env_with_choices("VLLM_TPU_QSA_PREFILL_UNION_WALK_RING", "0", ["0", "3", "4"])()),
     # GATHERED ("", "reference", "sparsecore"; with LISTED): the walk-free kernel on chunked gathered tiles.
     "VLLM_TPU_QSA_PREFILL_UNION_GATHERED": env_str("VLLM_TPU_QSA_PREFILL_UNION_GATHERED", ""),
     "VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS": env_int("VLLM_TPU_QSA_PREFILL_UNION_GATHER_CHUNKS", 4),
