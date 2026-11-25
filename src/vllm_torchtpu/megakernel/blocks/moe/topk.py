@@ -25,6 +25,9 @@ from .context import MoEEmit
 
 NT = (((1,), (1,)), ((), ()))
 TOPK_NL = 16
+# `mark_first`: a pick's id carries this bit when it is the first appearance of an expert
+# the rank routes to (ids are < 512).
+FIRST_BIT = 16
 
 
 def _batcher_net(n: int) -> list[tuple[int, int]]:
@@ -85,10 +88,39 @@ def topk_rows_on_lanes(
     return ids, sel
 
 
+def mark_first(m: MoEEmit, ids: Any, sel: Any) -> Any:
+    """`ids` `[MR, 128]` (row `b`'s picks in lanes `k < TOPK`) with `FIRST_BIT` set on each
+    pick that is the first appearance, in the row-major pick order of `dedup_local`, of an
+    expert this rank owns (EP; any expert under MoE TP). A row's picks are distinct (`sel`
+    marks exactly them), so a pick is first iff no earlier live row selects its expert.
+    (Distinct picks need TOPK finite router scores per row, which real routing has.)"""
+    ex, mp = m.ex, m.mp
+    row = lax.broadcasted_iota(I32, sel.shape, 0)
+    live = sel & (row < ex.B)
+    first = live & (row == jnp.min(jnp.where(live, row, ex.MR), axis=0, keepdims=True))
+    if not mp.moe_tp:
+        first = first & (m.lane_e8 // mp.ER == m.me)
+    flags = jnp.zeros(ids.shape, I32)
+    for k in range(mp.TOPK):
+        hit = jnp.max(
+            jnp.where(first & (m.lane_e8 == ids[:, k : k + 1]), 1, 0), axis=1, keepdims=True
+        )
+        flags = jnp.where(m.lane128 == k, hit, flags)
+    return ids | jnp.left_shift(flags, FIRST_BIT)
+
+
 def route_topk(
-    m: MoEEmit, choice: Any, p8: Any, VEC: bool, slot_ec: Any, NCP: int, MROW: int
+    m: MoEEmit,
+    choice: Any,
+    p8: Any,
+    VEC: bool,
+    slot_ec: Any,
+    NCP: int,
+    MROW: int,
+    first: bool = False,
 ) -> None:
-    """Pick each row's top-k experts; write `hitv` (ids or VEC meta) and `wn`."""
+    """Pick each row's top-k experts; write `hitv` (ids or VEC meta; `first`: ids marked by
+    `mark_first`) and `wn`."""
     ctx, ex, mp, stream, scr = m.ctx, m.ex, m.mp, m.stream, m.scr
     EM, FLT_MIN, lane128, lane_e8, row8 = m.EM, m.FLT_MIN, m.lane128, m.lane_e8, m.row8
     B, MR, R = ex.B, ex.MR, ex.R
@@ -164,7 +196,7 @@ def route_topk(
         meta = jnp.where(lane_r < NCP, res[0:1] * 32.0 + res[1:2], res[2:3])
         scr["hitv"][MROW : MROW + 1, :] = meta.astype(I32)
     else:
-        scr["hitv"][...] = ids
+        scr["hitv"][...] = mark_first(m, ids, sel) if first else ids
     wsel = jnp.where(sel, p8, 0.0)
     scr["wn"][...] = jnp.where(
         row8 < B, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0

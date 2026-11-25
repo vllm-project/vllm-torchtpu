@@ -23,6 +23,7 @@ from jax import lax
 
 from ...ops import I32
 from .context import MoEEmit
+from .topk import FIRST_BIT
 
 
 def dedup_vec(m: MoEEmit, NCP: int, MROW: int, nb_picks: int) -> tuple[Any, Any, Any]:
@@ -240,11 +241,18 @@ def po2c(m: MoEEmit, slot_ec: Any, n_tot: Any, n_hit: Any, n_cp: Any) -> Any:
     return n_hit
 
 
-def dedup_local(m: MoEEmit, stamp: Any) -> Any:
-    """Hit list without redundant copies (TP: all experts; EP: this rank's)."""
+def dedup_local(m: MoEEmit, stamp: Any, marked: bool = False) -> Any:
+    """Hit list without redundant copies (TP: all experts; EP: this rank's). `marked`: the
+    picks carry `mark_first`'s flag, so each is stored and counted without `seen` stamps
+    (the same `elist` stores and count)."""
     ctx, ex, mp, scr, sc, me = m.ctx, m.ex, m.mp, m.scr, m.sc, m.me
     B, WIDE = ex.B, ex.WIDE
     ER, TOPK = mp.ER, mp.TOPK
+
+    def pick_marked(b, k, n):
+        v = scr["hits"][b, k]
+        scr["elist"][n] = lax.bitwise_and(v, (1 << FIRST_BIT) - 1)
+        return n + lax.shift_right_logical(v, FIRST_BIT)
 
     def pick(b, k, n):
         e = scr["hits"][b, k]
@@ -262,19 +270,20 @@ def dedup_local(m: MoEEmit, stamp: Any) -> Any:
         scr["elist"][n] = e
         return n + jnp.where(new, 1, 0).astype(I32)
 
+    walk = pick_marked if marked else pick
     n_hit = jnp.int32(0)
     with sc("route_dedup", 2):
         if WIDE:
 
             def row(b, n):
                 return lax.fori_loop(
-                    0, TOPK, functools.partial(pick, b), n, unroll=True
+                    0, TOPK, functools.partial(walk, b), n, unroll=True
                 )
 
             n_hit = lax.fori_loop(0, B, row, n_hit, unroll=2)
         else:
             for b in range(B):
                 n_hit = lax.fori_loop(
-                    0, TOPK, functools.partial(pick, b), n_hit, unroll=True
+                    0, TOPK, functools.partial(walk, b), n_hit, unroll=True
                 )
     return n_hit

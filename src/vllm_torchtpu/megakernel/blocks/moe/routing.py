@@ -64,8 +64,11 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     slot_ec = l_idx % 2
     NCP = R * EXTRA
     MROW = E // 128
+    # Without redundant copies the first appearances are marked in vector code
+    # (`mark_first`), so the scalar hit-list walk needs no `seen` stamps.
+    first = not (VEC or ECOPY or m.dbg.row_mask)
     with sc("route_topk", 2):
-        route_topk(m, choice, p8, VEC, slot_ec, NCP, MROW)
+        route_topk(m, choice, p8, VEC, slot_ec, NCP, MROW, first=first)
         if mp.RB:
             rb_tables(m)
     with sc("route_dma", 2):
@@ -86,7 +89,7 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     if ECOPY:
         n_hit = dedup_ecopy(m, VEC, slot_ec, stamp, n_tot, n_hit, n_cp)
     else:
-        n_hit = dedup_local(m, stamp)
+        n_hit = dedup_local(m, stamp, marked=first)
     if "experts" in skip:
         n_hit = jnp.int32(0)
     scr["st"][0] = n_hit * TE
