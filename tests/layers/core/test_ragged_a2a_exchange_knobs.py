@@ -99,6 +99,14 @@ CASES += [
     for option in ("plan_kernel", "plan_kernel_served")
     for combine in ("owner", "streamed")
 ] + [("plan_kernel_owner_tail", "owner")]
+# Whole-group sizes with the served options: no fallback conditional.
+OPTIONS["whole_group"] = dict(OPTIONS["plan_kernel_served"], whole_group=True)
+OPTIONS["whole_group_owner_tail"] = dict(
+    OPTIONS["plan_kernel_owner_tail"], whole_group=True
+)
+CASES += [("whole_group", combine) for combine in ("owner", "streamed")] + [
+    ("whole_group_owner_tail", "owner")
+]
 
 
 def _routing(rng, dp_size, num_tokens, num_experts, topk, skew):
@@ -542,3 +550,39 @@ def test_send_index_rows_minor_keeps_every_output_bit(
     base, got = np.asarray(base), np.asarray(got)
     assert np.abs(base.astype(np.float32)).max() > 0
     np.testing.assert_array_equal(got.view(np.uint16), base.view(np.uint16))
+
+
+@pytest.mark.parametrize("whole_group", [False, True])
+def test_whole_group_sizes_drop_the_fallback_conditional(whole_group):
+    """With whole-group sizes the lowered exchange has no conditional (no
+    step can overflow); with capacity sizes it keeps the full-size fallback."""
+    dp_size, tp_size, num_tokens, topk = 8, 1, 24, 10
+    devices = _require_eight_tpu_devices()
+    mesh = Mesh(np.asarray(devices).reshape(dp_size, tp_size), (DP_AXIS, TP_AXIS))
+    x, w1, w2, s1, s2, weights, ids, es = _inputs(
+        8, tp_size, num_tokens, 64, topk=topk, skew=False
+    )
+    stacked = tuple(
+        a.reshape(dp_size, tp_size, -1, *a.shape[1:])
+        for a in (x, w1, w2, s1, s2, weights, ids, es)
+    )
+    run = jax.jit(
+        functools.partial(
+            ragged_a2a_moe,
+            mesh=mesh,
+            topk=topk,
+            activation="silu",
+            use_sparse_core=True,
+            onehot_moe_permute_threshold=resolve_onehot_permute_threshold(
+                dp_size * num_tokens * topk
+            ),
+            capacity_factor=1.15,
+            route_factor=1.5,
+            owner_combine=True,
+            **OPTIONS["plan_kernel_owner_tail"],
+            whole_group=whole_group,
+        )
+    )
+    lowered = run.lower(*stacked).as_text()
+    has_cond = "stablehlo.case" in lowered or "stablehlo.if" in lowered
+    assert has_cond != whole_group

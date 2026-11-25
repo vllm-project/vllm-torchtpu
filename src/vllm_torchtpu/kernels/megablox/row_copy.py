@@ -42,6 +42,17 @@ def row_copy_supported(dtype, hidden: int) -> bool:
     return jnp.dtype(dtype) == jnp.bfloat16 and hidden % (ROW_SUBLANES * 128) == 0
 
 
+def row_copies_fit(num_tokens: int, rows: int, num_routes: int, hidden: int) -> bool:
+    """Whether `copy_send_rows` (``num_tokens`` tokens into ``rows`` send rows)
+    and `gather_rows` (``num_routes`` routes from ``rows`` receive rows) of
+    bf16 rows fit VMEM."""
+    cap = pltpu.get_tpu_info().vmem_capacity_bytes * 0.9
+    send = (pl.cdiv(num_tokens, _ROWS_PER_TILE) * _ROWS_PER_TILE + rows) * hidden * 2
+    tile = min(_GATHER_TILE, num_routes)
+    gather = (rows + 2 * tile) * hidden * 2
+    return send + (16 << 20) <= cap and gather + (8 << 20) <= cap
+
+
 def _canonical_bits(w):
     """The one-hot permute's result for two packed bf16 values per uint32: +0
     for zeros, subnormals, infinities and NaNs (the permute's isfinite select

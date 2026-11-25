@@ -729,9 +729,13 @@ def scatter_moe_supported(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int,
     rhs_quant_dtype=None,
+    row_gather: bool = False,
 ) -> bool:
     """Whether `fused_moe_scatter` takes these static shapes: the EP step runs
-    the local-routes one-hot path of `fused_moe_func` with `gmm_v2_mlp`."""
+    the local-routes one-hot path of `fused_moe_func` with `gmm_v2_mlp`.
+    ``row_gather``: the routes' rows come from `gather_rows`, not the one-hot
+    permute, so neither its bound nor the decode-size row bound applies (the
+    expert kernel computes only the routes a step has)."""
     if w1_scale is None or w2_scale is None:
         return False
     if w1_scale.ndim == 3:
@@ -746,10 +750,10 @@ def scatter_moe_supported(
     local_routes = min(max_local_routes or num_routes, num_routes)
     if not (
         use_sparse_core
-        and local_routes <= onehot_moe_permute_threshold
+        and (row_gather or local_routes <= onehot_moe_permute_threshold)
         and envs.TPU_MOE_OWNER_OUTPUT_MODE.lower() != "on"
         and not (0 < num_tokens <= _DENSE_EXPERT_THRESHOLD)
-        and local_routes <= _MLP_KERNEL_MAX_ROWS
+        and (row_gather or local_routes <= _MLP_KERNEL_MAX_ROWS)
         and w1.dtype == w2.dtype
         and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
         and w1.shape[1] == hidden_size

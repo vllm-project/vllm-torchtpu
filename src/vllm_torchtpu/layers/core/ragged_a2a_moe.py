@@ -59,7 +59,7 @@ from vllm_torchtpu.kernels.megablox.exchange_plan import (
     exchange_plan_supported,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import owner_token_sum
-from vllm_torchtpu.kernels.megablox.row_copy import copy_send_rows
+from vllm_torchtpu.kernels.megablox.row_copy import copy_send_rows, row_copies_fit
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     fused_moe_scatter,
@@ -1471,6 +1471,7 @@ def ragged_a2a_moe_local(
     routing_dma: bool = False,
     send_index_rows_minor: bool = False,
     plan_kernel: bool = False,
+    whole_group: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
@@ -1526,6 +1527,13 @@ def ragged_a2a_moe_local(
     fused kernel and `exchange_plan_supported` holds, one kernel computes the
     fit check, sizes, offsets, send index and receive rows from the gathered
     routing (`exchange_plan`) instead of XLA's ops (same integers).
+    ``whole_group`` (with ``plan_kernel``, ``row_scatter`` and ``row_gather``):
+    where the row copies' VMEM holds the DP group's every token, the
+    capacity exchange takes whole-group sizes (``D * S`` rows, ``D * S * K``
+    routes) whatever ``capacity_factor`` says. No step overflows them, so the
+    full-size fallback and its conditional are gone (same result). The
+    exchange moves only the rows a step has and the expert kernel computes
+    only its routes; the larger buffers cost memory, not time.
     """
     assert shared is None or owner_combine
     assert not owner_tail or owner_combine
@@ -1545,8 +1553,9 @@ def ragged_a2a_moe_local(
         local_num_experts=local_num_experts,
     )
 
-    def streamed(recv_rows, max_local_routes, collective_id):
-        """None when the exchange's local MoE does not take the fused kernel."""
+    def streamed(recv_rows, max_local_routes, collective_id, gathered=False):
+        """None when the exchange's local MoE does not take the fused kernel
+        (``gathered``: its rows come from the row gather)."""
         if not (streamed_combine or owner_combine) or not scatter_moe_supported(
             jax.ShapeDtypeStruct((recv_rows, x.shape[1]), x.dtype),
             w1,
@@ -1559,6 +1568,7 @@ def ragged_a2a_moe_local(
             use_sparse_core=use_sparse_core,
             onehot_moe_permute_threshold=onehot_moe_permute_threshold,
             rhs_quant_dtype=rhs_quant_dtype,
+            row_gather=gathered,
         ):
             return None
         if owner_combine:
@@ -1692,27 +1702,40 @@ def ragged_a2a_moe_local(
         route_factor=route_factor or None,
         row_tile=capacity_row_tile,
     )
-    if rows >= slots:
+    plan_ok = exchange_plan_supported(
+        num_members=dp_size,
+        tp_size=tp_size,
+        num_tokens=num_tokens,
+        topk=topk,
+        slots_per_rank=local_num_experts,
+    )
+    capacity_streamed = None
+    whole = (
+        whole_group
+        and plan_kernel
+        and row_gather
+        and row_scatter
+        and plan is not None
+        and plan_ok
+        and row_copies_fit(num_tokens, slots, slots * topk, x.shape[1])
+    )
+    if whole:
+        # Buffers for the DP group's every token and every route: no step
+        # overflows them, so no full-size fallback (nor its conditional).
+        capacity_streamed = streamed(slots, slots * topk, 2, gathered=True)
+        whole = capacity_streamed is not None
+    if whole:
+        rows, routes = slots, slots * topk
+    elif rows >= slots:
         # Bounding the routes alone saves less than the conditional costs
         # (the full exchange already runs the local-routes path over all routes).
         return full()
-
-    # The capacity exchange runs outside the conditional, so the schedule
-    # around it (weight prefetches for the following layers) is unchanged.
-    capacity_streamed = streamed(rows, routes, 2)
+    else:
+        # The capacity exchange runs outside the conditional, so the schedule
+        # around it (weight prefetches for the following layers) is unchanged.
+        capacity_streamed = streamed(rows, routes, 2)
     planned = None
-    if (
-        plan_kernel
-        and capacity_streamed is not None
-        and plan is not None
-        and exchange_plan_supported(
-            num_members=dp_size,
-            tp_size=tp_size,
-            num_tokens=num_tokens,
-            topk=topk,
-            slots_per_rank=local_num_experts,
-        )
-    ):
+    if plan_kernel and capacity_streamed is not None and plan is not None and plan_ok:
         planned = exchange_plan(
             gathered_words,
             (experts_start // local_num_experts).astype(jnp.int32),
@@ -1752,6 +1775,8 @@ def ragged_a2a_moe_local(
         planned=planned,
     )
     out = finish(out, capacity_streamed is not None)
+    if whole:
+        return out
     return jax.lax.cond(overflow, full, lambda: out)
 
 
@@ -1784,6 +1809,7 @@ def ragged_a2a_moe(
     routing_dma: bool = False,
     send_index_rows_minor: bool = False,
     plan_kernel: bool = False,
+    whole_group: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
@@ -1813,6 +1839,7 @@ def ragged_a2a_moe(
         routing_dma=routing_dma,
         send_index_rows_minor=send_index_rows_minor,
         plan_kernel=plan_kernel,
+        whole_group=whole_group,
     )
 
     scaled = w1_scale is not None

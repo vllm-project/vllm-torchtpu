@@ -92,6 +92,13 @@ PATHS: tuple[Path, ...] = (
         "check, sizes, offsets, send index and receive rows",
     ),
     Path(
+        "a2a_whole_group",
+        RAGGED_A2A,
+        "with a2a_plan_kernel and the row copies, the capacity exchange is "
+        "sized for the DP group's every token and route, so it needs no "
+        "full-size fallback conditional",
+    ),
+    Path(
         "a2a_unquantized",
         RAGGED_A2A,
         "unquantized layers without expert biases take the exchange",
@@ -196,6 +203,11 @@ def exchange_keywords(sw: Switches, *, owner_combine: bool) -> dict[str, object]
         send_index_rows_minor=sw.path("a2a_row_scatter")
         and sw.path("a2a_send_rows_minor"),
         plan_kernel=sw.path("a2a_sorted_plan") and sw.path("a2a_plan_kernel"),
+        whole_group=sw.path("a2a_sorted_plan")
+        and sw.path("a2a_plan_kernel")
+        and sw.path("a2a_row_gather")
+        and sw.path("a2a_row_scatter")
+        and sw.path("a2a_whole_group"),
     )
 
 

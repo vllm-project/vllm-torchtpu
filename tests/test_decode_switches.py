@@ -37,12 +37,13 @@ EXCHANGE_OF_THE_NEW_LINE = {
     "routing_dma": True,
     "send_index_rows_minor": True,
     "plan_kernel": True,
+    "whole_group": True,
 }
 
 
 def test_the_path_table_names_are_short_lowercase_and_unique():
     names = [p.name for p in ds.PATHS]
-    assert len(names) == len(set(names)) == 10
+    assert len(names) == len(set(names)) == 11
     assert all(n == n.lower() and " " not in n and len(n) <= 20 for n in names)
 
 
@@ -118,6 +119,17 @@ def test_the_plan_kernel_follows_the_sorted_plan():
     assert not ds.exchange_keywords(ds.resolve(env), owner_combine=True)["plan_kernel"]
     env["TPU_DECODE_FAST_PATHS_OFF"] = "a2a_sorted_plan,a2a_row_gather,a2a_row_scatter"
     assert not ds.exchange_keywords(ds.resolve(env), owner_combine=True)["plan_kernel"]
+
+
+@pytest.mark.parametrize(
+    "off", ["a2a_whole_group", "a2a_plan_kernel", "a2a_row_scatter"]
+)
+def test_whole_group_sizes_follow_the_plan_kernel_and_row_copies(off):
+    env = {"TPU_MOE_RAGGED_A2A": "1"}
+    assert ds.exchange_keywords(ds.resolve(env), owner_combine=True)["whole_group"]
+    env["TPU_DECODE_FAST_PATHS_OFF"] = off
+    kw = ds.exchange_keywords(ds.resolve(env), owner_combine=True)
+    assert not kw["whole_group"]
 
 
 def test_the_exchange_keywords_follow_the_layer_not_the_switch():
