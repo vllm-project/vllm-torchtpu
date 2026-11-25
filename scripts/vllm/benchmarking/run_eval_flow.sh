@@ -223,7 +223,6 @@ fi
 mkdir -p "$RESULTS_DIR"
 
 BASELINE_CONFIG="${BASELINE_CONFIG:-$CONFIG_NAME}"
-PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$BASELINE_CONFIG.baseline.json"
 
 PERF_LOG="$RESULTS_DIR/regression_check.md"
 
@@ -600,6 +599,33 @@ fi
 if [ "$BOOT_SERVER" = "1" ] && [ "$RUN_BENCH_SERVE" = "0" ] && [ "$CONFIG_BENCHMARK_MODE" = "spec_bench" ]; then
     echo "ERROR: $CONFIG_NAME is a spec_bench config and cannot run eval suites on a server this script starts. Point the evals at a running server with --host and --port or --base-url, or pass --skip-benchmark to use the one already on localhost:$PORT."
     exit 1
+fi
+
+# Perf baselines are per chip: baselines/perf/<chip>/<config>.baseline.json,
+# <chip> read from TPU_ACCELERATOR_TYPE (or GCE metadata). Without a baseline
+# the run reports without the perf gate and says so in a ::warning::, so an
+# uncalibrated run is not mistaken for a gated one; without a readable chip it
+# stops.
+# --skip-perf-check and a run without bench_serve have no perf gate and need
+# no chip, so the chip is read here: once the suites are resolved, and before
+# the cleanup below kills whatever is serving.
+PERF_BASELINE=""
+if [ "$SKIP_PERF_CHECK" = "0" ]; then
+    # The marker keeps whatever else the import prints out of the chip's name.
+    TPU_CHIP=$(python3 -c 'from vllm_torchtpu import tpu_info; print("TPU_CHIP=" + tpu_info.parse_chip_version(tpu_info.get_tpu_type() or "").value)' | sed -n 's/^TPU_CHIP=//p' | tail -n 1) || TPU_CHIP=""
+    if [ -z "$TPU_CHIP" ]; then
+        echo "ERROR: could not read the TPU chip to pick the perf baselines; set TPU_ACCELERATOR_TYPE, or pass --skip-perf-check to report without the perf gate" >&2
+        exit 1
+    fi
+    TPU_CHIP="v${TPU_CHIP#v}"
+    PERF_BASELINE="scripts/vllm/benchmarking/baselines/perf/$TPU_CHIP/$BASELINE_CONFIG.baseline.json"
+    if [ -f "$PERF_BASELINE" ]; then
+        echo "Perf baseline for $TPU_CHIP: $PERF_BASELINE"
+    else
+        # TODO(#<issue>): fail here instead of warning, once every perf-lane
+        # config has a baseline or passes --skip-perf-check.
+        echo "::warning::No perf baseline for $TPU_CHIP at $PERF_BASELINE; reporting without the perf gate. Calibrate and check in a baseline to gate this config, or pass --skip-perf-check to report on purpose."
+    fi
 fi
 
 # The name clients put in their requests. Empty means the config's MODEL, which

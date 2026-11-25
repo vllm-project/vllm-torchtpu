@@ -33,6 +33,7 @@ import threading
 from typing import Any
 
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _BENCHMARKING_SRC = _REPO_ROOT / "scripts" / "vllm" / "benchmarking"
@@ -282,8 +283,11 @@ class _Flow:
         (self._bench_dir / f"{name}.py").write_text(_PYTHON_RECORD_ARGV)
 
     def write_perf_baseline(self, config: str = _FIXTURE_CONFIG) -> str:
-        """Writes an empty perf baseline; returns the path the flow passes on."""
-        relative = f"scripts/vllm/benchmarking/baselines/perf/{config}.baseline.json"
+        """Writes an empty v7x perf baseline; returns the path the flow passes on."""
+        relative = (
+            f"scripts/vllm/benchmarking/baselines/perf/v7x/{config}.baseline.json"
+        )
+        (self._repo / relative).parent.mkdir()
         (self._repo / relative).write_text("{}")
         return relative
 
@@ -1645,6 +1649,69 @@ def test_perf_suites_bench_serve_beats_skip_benchmark_for_check_and_publish(flow
         "--image",
         "fixture-registry/image:tag",
     ]
+
+
+def test_perf_baselines_are_filed_under_a_chip():
+    # run_eval_flow.sh reads baselines/perf/<chip>/ alone, so a baseline filed
+    # anywhere else gates nothing.
+    perf_baselines = _BENCHMARKING_SRC / "baselines" / "perf"
+    assert not list(perf_baselines.glob("*.baseline.json"))
+    chips = {"v" + chip.value.removeprefix("v") for chip in pltpu.ChipVersion}
+    assert {path.name for path in perf_baselines.iterdir() if path.is_dir()} <= chips
+
+
+def _run_with_perf_check(
+    flow, accelerator_type: str, *args: str
+) -> subprocess.CompletedProcess[str]:
+    """Runs the flow on an ``accelerator_type`` chip with its perf check on."""
+    flow.stub_python_script("check_regression")
+    return flow.run_unchecked(
+        "--skip-db-upload",
+        *args,
+        env={"TPU_ACCELERATOR_TYPE": accelerator_type},
+        skip_upload_and_perf_check=False,
+    )
+
+
+def test_chip_without_baseline_reports_without_perf_gate(flow):
+    flow.write_perf_baseline()
+
+    proc = _run_with_perf_check(flow, "v6e-8", *flow.host_args)
+
+    assert proc.returncode == 0, proc.stderr
+    missing = (
+        f"scripts/vllm/benchmarking/baselines/perf/v6e/{_FIXTURE_CONFIG}.baseline.json"
+    )
+    # A ::warning:: line, so the run is not mistaken for a gated one.
+    expected = (
+        f"::warning::No perf baseline for v6e at {missing}; "
+        "reporting without the perf gate."
+    )
+    assert any(line.startswith(expected) for line in proc.stdout.splitlines())
+    assert flow.argv("check_regression") == []
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param(["--skip-perf-check"], id="skip_perf_check"),
+        pytest.param(["--perf-suites", "none"], id="perf_suites_none"),
+    ],
+)
+def test_run_without_perf_gate_needs_no_chip(flow, args):
+    proc = _run_with_perf_check(flow, "notachip-8", *flow.host_args, *args)
+
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_unknown_chip_stops_before_cleanup_and_benchmark(flow):
+    proc = _run_with_perf_check(flow, "notachip-8")
+
+    assert proc.returncode == 1
+    assert "Unrecognized TPU accelerator type 'notachip-8'" in proc.stderr
+    assert "ERROR: could not read the TPU chip" in proc.stderr
+    assert flow.argv("cleanup_server") == []
+    assert flow.argv("vllm") == []
 
 
 def test_eval_only_local_boot_uses_skip_bench_cells_and_runs_cleanup(flow):
