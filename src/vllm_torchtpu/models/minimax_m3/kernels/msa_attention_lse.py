@@ -87,6 +87,7 @@ def _kernel(
     packed_table: bool = False,
     union_page_ref=None,
     words: bool = False,
+    pair_rank_ref=None,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -120,7 +121,10 @@ def _kernel(
     With `words` (`_words_ring`) the page ring holds each page's 32-bit
     words as stored, a word row's K and V lane blocks as two rows ``[2 S /
     4, D]``: K and V are read by strided loads and one bitcast each, in the
-    bitcast's slot order, and enter the MXU as fp8."""
+    bitcast's slot order, and enter the MXU as fp8.
+
+    With `pair_rank_ref` (a DCP pair's rank, the heads in rank order) the
+    outputs are the pair's packs (`_write_pair_packs`), not ``out, lse``."""
     fp4 = fp4_rows is not None
     if transposed:  # a group's masked scores (`attend_t`)
         *refs, s_scr = refs
@@ -154,7 +158,13 @@ def _kernel(
             start = tile % tiles_per_step * bq
             rows = pl.ds(pl.multiple_of(start, bq), bq)
             q_ref = q_ref.at[:, rows, :]
-            packed = _merged_store_rows(bq, o_ref.shape[0], o_ref.dtype)
+            # A pack's 8-row stores at a run-time offset lower (tpu7x AOT, Hl
+            # = 8, 2 to 4 tiles per step: 16 to 256 tokens).
+            packed = (
+                1
+                if pair_rank_ref is not None
+                else _merged_store_rows(bq, o_ref.shape[0], o_ref.dtype)
+            )
             if packed > 1:
                 store_out = functools.partial(
                     _store_unaligned_rows, o_ref, start, bq, packed
@@ -163,7 +173,11 @@ def _kernel(
             selected_ref = selected_ref.at[rows, :]
             local_page_ref = local_page_ref.at[rows, :]
             local_limit_ref = local_limit_ref.at[rows, :]
-            lse_ref = lse_ref.at[:, pl.ds(tile % tiles_per_step, 1)]
+            lse_ref = (
+                lse_ref.at[:, rows, :]  # the other rank's pack
+                if pair_rank_ref is not None
+                else lse_ref.at[:, pl.ds(tile % tiles_per_step, 1)]
+            )
         meta = work_meta_ref[w]
         count = work_count_ref[w]
         num_heads, block_q, head_dim = q_ref.shape
@@ -265,6 +279,11 @@ def _kernel(
                 store_out(out)
 
         def write(out, lse):
+            if pair_rank_ref is not None:
+                _write_pair_packs(
+                    o_ref, lse_ref, pair_rank_ref[0], out, lse, q_ref.dtype
+                )
+                return
             put(out)
             lse_ref[...] = lse.T.reshape(lse_ref.shape)  # lane-dense row
 
@@ -504,6 +523,45 @@ def _kernel(
     jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
 
 
+def _write_pair_packs(own_ref, peer_ref, rank, out, lse, dtype):
+    """`_kernel`'s `write` of a DCP pair's partial, ``out [2 * Hl * Bq, D]``
+    f32 and ``lse [2 * Hl * Bq, 1]`` over both ranks' heads in rank order, as
+    `rank`'s pack of its own heads and its pack of the other rank's, ``own_ref``
+    and ``peer_ref [Hl + 1, Bq, D]`` uint16: a head block's partial bits
+    (`dtype`), then a row of each token's Hl LSEs, high halves then low halves
+    (`msa_dcp.merge_pair`). The other rank's pack is the operand of the pair's
+    collective permute as written: no XLA op slices or relays the partial."""
+    num_heads, block_q, head_dim = own_ref.shape
+    num_heads -= 1
+    heads = out.reshape(2 * num_heads, block_q, head_dim).astype(dtype)
+    first, second = heads[:num_heads], heads[num_heads:]
+    own = jnp.where(rank == 0, first, second)
+    peer = jnp.where(rank == 0, second, first)
+    own_ref[:num_heads] = jax.lax.bitcast_convert_type(own, jnp.uint16)
+    peer_ref[:num_heads] = jax.lax.bitcast_convert_type(peer, jnp.uint16)
+    bits = jax.lax.bitcast_convert_type(lse, jnp.int32)
+    bits = bits.reshape(2 * num_heads, block_q, 1)
+    first, second = bits[:num_heads], bits[num_heads:]
+    own_ref[num_heads] = _lse_halves(jnp.where(rank == 0, first, second), head_dim)
+    peer_ref[num_heads] = _lse_halves(jnp.where(rank == 0, second, first), head_dim)
+
+
+def _lse_halves(bits, width):
+    """``[Bq, width]`` uint16 from a head block's LSE bits ``[Hl, Bq, 1]``
+    int32: token ``t``'s high halves on lanes ``[0, Hl)``, low halves on
+    ``[Hl, 2 Hl)``, zeros after. Selects of lane-broadcast columns: a
+    transpose into a lane row and lane gathers would end each step with an
+    XLU round trip."""
+    num_heads, block_q, _ = bits.shape
+    lane = jax.lax.broadcasted_iota(jnp.int32, (block_q, width), 1)
+    words = jnp.zeros((block_q, width), jnp.int32)
+    for h in range(num_heads):
+        words = jnp.where((lane == h) | (lane == h + num_heads), bits[h], words)
+    return jnp.where(
+        lane < num_heads, jax.lax.shift_right_logical(words, 16), words & 0xFFFF
+    ).astype(jnp.uint16)
+
+
 def _words_ring(kv_cache, block_q: int, fp4: bool, row_width: int) -> bool:
     """Whether a call's page ring holds 32-bit words (`_kernel`'s `words`):
     8-token tiles of an fp8 cache with one KV head of D = 128 per row (a word
@@ -640,6 +698,7 @@ def _attention_call(
     interpret,
     scale_cache=None,
     scale_rows=None,
+    pair_rank=None,
 ):
     """One kernel call over the tiles ``tile_offset + [0, tiles)`` of the
     head-major ``q [G * Hg, T, D]``, ``selected [G, T, K]``, ``local_page``
@@ -660,7 +719,10 @@ def _attention_call(
     t``): into `out` in place when given (an earlier call's
     result), else into new arrays whose other rows are unset. A 4-bit
     `kv_cache` takes its `scale_cache` and `scale_rows` (`_kernel`'s
-    `fp4_rows`)."""
+    `fp4_rows`). With `pair_rank` (``int32[1]``, a scalar-prefetch input), a
+    DCP pair's one call over both ranks' heads in rank order writes the
+    pair's packs ``(own, peer) [Hl + 1, T, D]`` uint16 instead
+    (`_write_pair_packs`)."""
     num_q_heads, num_tokens, head_dim = q.shape
     num_heads = q_per_head
     _, rows_per_page, packing, _ = kv_cache.shape
@@ -695,6 +757,9 @@ def _attention_call(
         )
 
     def kernel(packed_ref, *refs, **kwargs):
+        if pair:  # the rank is the last scalar-prefetch input
+            kwargs["pair_rank_ref"] = refs[3]
+            refs = refs[:3] + refs[4:]
         if len(packed_ref.shape) == 2:  # a caller's [1, R] row (`_chunked_call`)
             packed_ref = packed_ref.at[0]
         if not in_kernel:
@@ -714,7 +779,7 @@ def _attention_call(
         )
         return run(packed_ref, words_ref, *refs, **kwargs)
 
-    def tile_block(b, packed, table, heads, offset):
+    def tile_block(b, packed, table, heads, offset, *rank):
         return (offset[0] // tiles_per_step + b, 0)
 
     def head_major_block(w, *prefetch):
@@ -738,6 +803,48 @@ def _attention_call(
     fp4 = scale_rows is not None
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
     words = _words_ring(kv_cache, block_q, fp4, row_width)
+    pair = pair_rank is not None
+    if pair and (
+        aliased
+        or transposed
+        or num_heads != num_q_heads
+        or num_heads % 2
+        or num_heads > head_dim
+        or q.dtype.itemsize != 2
+    ):
+        raise ValueError(
+            "a pair's packs come from one new call over both ranks' 16-bit "
+            f"heads, 2 * Hl <= D, scores not transposed; got q {q.dtype} "
+            f"{q.shape}, {num_heads} heads per call, block_q {block_q}"
+        )
+    if pair:
+        pack_spec = pl.BlockSpec(
+            (num_heads // 2 + 1, tiles_per_step * block_q, head_dim),
+            lambda w, *prefetch: (0, *tile_block(w, *prefetch)),
+        )
+        out_specs = [pack_spec] * 2
+        out_shape = [
+            jax.ShapeDtypeStruct((num_heads // 2 + 1, num_tokens, head_dim), jnp.uint16)
+        ] * 2
+    else:
+        out_specs = [
+            pl.BlockSpec(
+                (num_heads, tiles_per_step * block_q, head_dim), head_major_block
+            ),
+            pl.BlockSpec((1, tiles_per_step, 1, num_heads * block_q), lse_block),
+        ]
+        out_shape = [
+            jax.ShapeDtypeStruct((num_q_heads, num_tokens, head_dim), q.dtype),
+            jax.ShapeDtypeStruct(
+                (
+                    num_q_heads // num_heads,
+                    num_tokens // block_q,
+                    1,
+                    num_heads * block_q,
+                ),
+                jnp.float32,
+            ),
+        ]
     scale_inputs = (scale_cache,) if fp4 else ()
     ring = 1 + (_FP4_PREFETCH if fp4 else _WORDS_PREFETCH if words else 1)
     scale_scratch = (
@@ -749,7 +856,7 @@ def _attention_call(
         else ()
     )
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=4,
+        num_scalar_prefetch=4 + pair,
         grid=(num_steps,),
         in_specs=[
             pl.BlockSpec(
@@ -762,12 +869,7 @@ def _attention_call(
             *(pl.BlockSpec(memory_space=pl.ANY) for _ in scale_inputs),
             *in_place,
         ],
-        out_specs=[
-            pl.BlockSpec(
-                (num_heads, tiles_per_step * block_q, head_dim), head_major_block
-            ),
-            pl.BlockSpec((1, tiles_per_step, 1, num_heads * block_q), lse_block),
-        ],
+        out_specs=out_specs,
         scratch_shapes=[
             # m, l, acc: rows on sublanes for `attend`, lanes for `attend_t`.
             *(
@@ -812,7 +914,7 @@ def _attention_call(
             *([pltpu.SMEM((words_len + 1,), jnp.int32)] if in_kernel else []),
         ],
     )
-    num_inputs = 4 + 5 + len(scale_inputs)
+    num_inputs = 4 + pair + 5 + len(scale_inputs)
     # VMEM the call holds: its page (and scale) ring, double-buffered blocks.
     rows = tiles_per_step * block_q
     held = ring * pages_per_step * rows_per_page * packing * row_width
@@ -833,18 +935,7 @@ def _attention_call(
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
-        out_shape=[
-            jax.ShapeDtypeStruct((num_q_heads, num_tokens, head_dim), q.dtype),
-            jax.ShapeDtypeStruct(
-                (
-                    num_q_heads // num_heads,
-                    num_tokens // block_q,
-                    1,
-                    num_heads * block_q,
-                ),
-                jnp.float32,
-            ),
-        ],
+        out_shape=out_shape,
         input_output_aliases=({num_inputs: 0, num_inputs + 1: 1} if aliased else {}),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
@@ -865,6 +956,7 @@ def _attention_call(
         page_table,
         head,
         tile_offset,
+        *([pair_rank] if pair else []),
         q,
         selected,
         local_page,
@@ -939,7 +1031,7 @@ def _chunked_call(
     scale_rows=None,
     head_major=False,
     q_head_major=False,
-    lse_bits=False,
+    pair_rank=None,
     work=None,
     work_pages=False,
 ):
@@ -961,7 +1053,8 @@ def _chunked_call(
     D]``, as the kernel reads it. `work` is the one call's `_packed_work` row
     ``[1, R]`` if the caller built it (`msa_dcp.pair_work`); with
     `work_pages` it goes on with its unions' physical pages and `page_table`
-    is not read."""
+    is not read. With `pair_rank`, one call's pair packs ``(own, peer)``
+    come back (`_attention_call`)."""
     if not q_head_major:
         q = q.transpose(1, 0, 2)
     num_q_heads, num_tokens, _ = q.shape
@@ -979,6 +1072,7 @@ def _chunked_call(
         interpret=interpret,
         scale_cache=scale_cache,
         scale_rows=scale_rows,
+        pair_rank=pair_rank,
     )
     limit = msa_attention.MAX_TOKENS_PER_CALL
     step = min(num_tokens, max(block_q, limit - limit % block_q))
@@ -1002,6 +1096,8 @@ def _chunked_call(
     align = _merged_store_rows(block_q, num_q_heads // num_heads, q.dtype)
     if work_pages and work is None:
         raise ValueError("work_pages describes a caller's work row")
+    if pair_rank is not None and num_heads * num_chunks != 1:
+        raise ValueError("a pair's packs come from one call")
     if work is None:
         packed, tiles_per_step = _packed_work(
             selected.reshape(num_heads * num_chunks, step, selected.shape[2]),
@@ -1042,11 +1138,10 @@ def _chunked_call(
     if num_heads * num_chunks > 1:
         out = jax.lax.fori_loop(1, num_heads * num_chunks, head_chunk, out)
     out, lse = out
+    if pair_rank is not None:  # the pair's packs, head-major
+        return out[:, :num_tokens], lse[:, :num_tokens]
     # lse [head blocks, tiles, 1, Hg * Bq] -> [T, G * Hg] (or head-major)
     num_blocks, num_tiles = lse.shape[:2]
-    if lse_bits:
-        # Before the relayout: XLA fuses its unit-dim drop into the bitcast.
-        lse = jax.lax.bitcast_convert_type(lse, jnp.uint32)
     if head_major:
         lse = lse.reshape(num_blocks, num_tiles, -1, block_q).transpose(0, 2, 1, 3)
         lse = lse.reshape(num_q_heads, num_tiles * block_q)
@@ -1094,7 +1189,6 @@ def _check_rows(kv_cache, head_dim, head=None):
         "interpret",
         "head_major",
         "q_head_major",
-        "lse_bits",
         "work_pages",
     ),
 )
@@ -1116,7 +1210,7 @@ def msa_sparse_attention_lse(
     interpret: bool = False,
     head_major: bool = False,
     q_head_major: bool = False,
-    lse_bits: bool = False,
+    pair_rank: jax.Array | None = None,
     work: jax.Array | None = None,
     work_pages: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
@@ -1130,9 +1224,10 @@ def msa_sparse_attention_lse(
     A 4-bit cache takes its `scale_cache` (`msa_attention.msa_sparse_attention`).
     With `head_major`, the results come back head-major: ``out [H, T, D]``,
     ``lse [H, T]``; with `q_head_major`, q comes head-major, ``[H, T, D]``.
-    With `lse_bits`, the lse comes as its uint32 bits, for a consumer that
-    moves bits (a one-tile call's f32 relayout was a ~0.65 us reduce of its
-    own, bitcast first it fuses). `work` is the call's work list row when
+    With `pair_rank` (``int32[1]``; q holds a DCP pair's heads in rank order,
+    ``[2 * Hl, T, D]`` 16-bit), the results are this rank's and the other
+    rank's packs ``(own, peer) [Hl + 1, T, D]`` uint16 (`_write_pair_packs`,
+    `msa_dcp.merge_pair`). `work` is the call's work list row when
     the caller built it with the selection (`msa_dcp.pair_work`); with
     `work_pages` the row goes on with its unions' physical pages and
     `page_table` is not read.
@@ -1140,6 +1235,8 @@ def msa_sparse_attention_lse(
     num_tokens, head_dim = selected.shape[0], q.shape[2]
     msa_attention.check_cache(kv_cache, scale_cache)
     _check_rows(kv_cache, head_dim, head)
+    if pair_rank is not None and not (head_major and q_head_major):
+        raise ValueError("a pair's packs are head-major")
     q, selected, local_page, local_limit = _pad_tokens(
         q, selected, local_page, local_limit, block_q, q_head_major
     )
@@ -1159,7 +1256,7 @@ def msa_sparse_attention_lse(
         scale_rows=None if scale_cache is None else (k_scale_row, v_scale_row),
         head_major=head_major,
         q_head_major=q_head_major,
-        lse_bits=lse_bits,
+        pair_rank=pair_rank,
         work=work,
         work_pages=work_pages,
     )
