@@ -58,6 +58,7 @@ def _runner(*, all_greedy: bool = True, spec_k: int | None = None) -> SimpleName
         ),
         _stage_timing=MagicMock(),
         _greedy_sample=lambda x: torch.argmax(x, dim=-1, keepdim=True),
+        _fused_spec_sampler=False,
         _sampler_topk_candidates=lambda *_args: 0,
         _build_padded_sampling_params=lambda _start, _end, logits: (
             torch.full((logits.shape[0], 1), 0.7),
@@ -72,6 +73,7 @@ def _runner(*, all_greedy: bool = True, spec_k: int | None = None) -> SimpleName
         TPUModelRunner._mask_min_tokens,
         TPUModelRunner._apply_temperature,
         TPUModelRunner._sampler_applies_topk_topp,
+        TPUModelRunner._sampler_applies_top_k,
         TPUModelRunner.spec_bonus_and_target_logits,
         TPUModelRunner.spec_bonus_and_target_tokens,
         TPUModelRunner.spec_gather_bonus_and_target_logits,
