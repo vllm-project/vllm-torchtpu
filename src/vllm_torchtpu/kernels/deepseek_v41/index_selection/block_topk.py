@@ -108,7 +108,11 @@ def is_supported(
         fold = block_size // maxima_block
         # Folded maxima are staged in the two score chunks streamed rows keep.
         staged = fold * _maxima_chunk(block_width)
-        if block_size % maxima_block or fold & (fold - 1) or staged > 2 * _chunk(width):
+        if (
+            block_size % maxima_block
+            or fold & (fold - 1)
+            or (fold > 1 and staged > 2 * _chunk(width))
+        ):
             return False
     return blocks * block_size < width and plan is not None and (plan[0] or streamable)
 

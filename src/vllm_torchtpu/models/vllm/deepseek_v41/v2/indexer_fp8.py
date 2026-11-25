@@ -535,7 +535,27 @@ def _select_fp8_indexer_jax(
         max(tokens, query_tile),
         max(query_tile, _INDEX_UNTILED_SCORE_ELEMENTS // capacity),
     )
-    padded = (tokens + rows - 1) // rows * rows
+    stream_select = (
+        unordered
+        and not sparse_logits
+        and streaming_topk.is_supported(
+            width,
+            topk,
+            reconstruct_threshold=topk_reconstruction_threshold(topk),
+        )
+    )
+    chunk_rows = prefill_chunk_rows or indexer_query_rows(tokens, query_tile)
+    publish_rows = candidate_write and candidates.shape[1] * block_size < width
+    serial_padding = -tokens % rows
+    # The bounded publisher pipeline can use its own row stride even when
+    # the serial path would need padding.
+    use_pipeline = (
+        stream_select
+        and chunk_rows <= rows
+        and tokens % chunk_rows == 0
+        and (publish_rows or not serial_padding)
+    )
+    padded = tokens if use_pipeline else tokens + serial_padding
     # Callers group each request's queries contiguously in ascending request
     # order; padding requests (-1) trail them. Clamping padding to the last
     # request keeps that order, which the pipelined path relies on.
@@ -558,16 +578,6 @@ def _select_fp8_indexer_jax(
     if padded > tokens:
         # Tile padding rows own request 0, after its rows once sorted.
         query_offsets = query_offsets.at[1:].add(padded - tokens)
-    stream_select = (
-        unordered
-        and not sparse_logits
-        and streaming_topk.is_supported(
-            width,
-            topk,
-            reconstruct_threshold=topk_reconstruction_threshold(topk),
-        )
-    )
-    publish_rows = candidate_write and candidates.shape[1] * block_size < width
     select_topk = functools.partial(
         streaming_topk.streaming_topk,
         k=topk,
@@ -576,39 +586,30 @@ def _select_fp8_indexer_jax(
         # Attention re-sorts the records; skip ID tie-breaks and output sorting.
         unordered=unordered,
     )
-    chunk_rows = prefill_chunk_rows or indexer_query_rows(tokens, query_tile)
-    # Decode top-k scans only the blocks that can hold a winner. Publishing
-    # layers rank the same SparseCore block maxima for their candidates.
-    select_block = block_size if publish_rows else _BLOCK_TOPK_BLOCK
-    decode_tiles = (
-        stream_select and prefill_chunk_rows is None and chunk_rows is not None
-    )
-    block_select = decode_tiles and block_topk.is_supported(
-        chunk_rows, capacity, topk, select_block, given_maxima=True
-    )
-    # Publishing layers whose block maxima overflow SparseCore VMEM (1M-token
-    # contexts) select over blocks twice as wide, whose maxima block top-k
-    # folds from the scorer's, and publish from the scorer's directly.
-    folded_select = (
-        decode_tiles
-        and publish_rows
-        and not block_select
-        and block_topk.is_supported(
-            chunk_rows,
-            capacity,
-            topk,
-            2 * select_block,
-            given_maxima=True,
-            maxima_block=select_block,
+    maxima_block = block_size if publish_rows else _BLOCK_TOPK_BLOCK
+    selection_block = None
+    if use_pipeline and prefill_chunk_rows is None:
+        # Fold pairs only if the native maxima do not fit SparseCore VMEM.
+        sizes = (maxima_block, 2 * maxima_block) if publish_rows else (maxima_block,)
+        selection_block = next(
+            (
+                size
+                for size in sizes
+                if block_topk.is_supported(
+                    chunk_rows,
+                    capacity,
+                    topk,
+                    size,
+                    given_maxima=True,
+                    maxima_block=maxima_block,
+                )
+            ),
+            None,
         )
-    )
     pool = banks[0] if len(banks) == 1 else banks
 
-    def score(start, rows, inputs, *, pipelined, group=None, maxima=False):
-        """Scores of `rows` queries from `start`; decode tiles share the inputs.
-
-        `maxima` also returns the scores' block maxima for block top-k.
-        """
+    def score(start, rows, inputs, *, pipelined, group=None):
+        """Score `rows` queries from `start`; decode tiles share the inputs."""
         shared = pipelined and prefill_chunk_rows is None
         queries, row_weights, row_lengths = (
             inputs[:3]
@@ -636,7 +637,7 @@ def _select_fp8_indexer_jax(
             reuse_keys=prefill_chunk_rows is not None and capacity == key_tile,
             # The scorer holds every score; reducing them there saves block
             # top-k a SparseCore pass over the whole visible row.
-            block_maxima=select_block if maxima else 0,
+            block_maxima=maxima_block if selection_block is not None else 0,
         )
         if group is None:
             return scores
@@ -685,50 +686,37 @@ def _select_fp8_indexer_jax(
         inverse = jnp.argsort(order)
         return output[inverse][:tokens], published[inverse][:tokens]
 
-    if not stream_select or chunk_rows is None or chunk_rows > rows or padded != tokens:
+    if not use_pipeline:
         return select_serial()
 
     def select(tile, scores, group):
         row_lengths = jax.lax.dynamic_slice_in_dim(
             inputs[2], tile * chunk_rows, chunk_rows
         )
-        if folded_select:
+        block_scores = None
+        if selection_block is not None:
             scores, maxima = scores
+            fused_publish = publish_rows and selection_block == maxima_block
             selected = block_topk.block_topk(
                 scores,
                 row_lengths,
                 k=topk,
-                block_size=2 * select_block,
+                block_size=selection_block,
+                publish=candidates.shape[1] if fused_publish else 0,
                 maxima=maxima,
-                maxima_block=select_block,
+                maxima_block=maxima_block,
                 scheduling_group_id=group,
             )
-            return selected, _publish_candidate_blocks(
-                scores,
-                row_lengths,
-                candidates.shape[1],
-                block_size,
-                unordered,
-                block_scores=publication.visible_block_scores(
+            if fused_publish:
+                return selected
+            if publish_rows:
+                block_scores = publication.visible_block_scores(
                     maxima, row_lengths, block_size=block_size
-                ),
-                scheduling_group_id=group,
+                )
+        else:
+            selected = select_topk(
+                scores, valid_lengths=row_lengths, scheduling_group_id=group
             )
-        if block_select:
-            scores, maxima = scores
-            # One SparseCore pass ranks the block maxima for both outputs.
-            return block_topk.block_topk(
-                scores,
-                row_lengths,
-                k=topk,
-                block_size=select_block,
-                publish=candidates.shape[1] if publish_rows else 0,
-                maxima=maxima,
-                scheduling_group_id=group,
-            )
-        selected = select_topk(
-            scores, valid_lengths=row_lengths, scheduling_group_id=group
-        )
         if publish_rows:
             return selected, _publish_candidate_blocks(
                 scores,
@@ -736,6 +724,7 @@ def _select_fp8_indexer_jax(
                 candidates.shape[1],
                 block_size,
                 unordered,
+                block_scores=block_scores,
                 scheduling_group_id=group,
             )
         return selected
@@ -766,7 +755,6 @@ def _select_fp8_indexer_jax(
             inputs,
             pipelined=True,
             group=group,
-            maxima=block_select or folded_select,
         ),
         select,
         write,

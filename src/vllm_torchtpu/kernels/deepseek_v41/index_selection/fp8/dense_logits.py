@@ -233,9 +233,9 @@ class _QueryBlock:
         dst = k.out.at[:, pl.ds(tile * k.key_tile, k.key_tile)]
         _dma_rows(src, dst, sem, self.query.count, wait, dst_start=self.first_row)
         if k.block:
-            blocks = k.key_tile // k.block
             src, sem = k.maxima.at[slot], k.maxima_sem.at[slot]
-            dst = k.maxima_out.at[:, pl.ds(tile * blocks, blocks)]
+            columns = src.shape[-1]
+            dst = k.maxima_out.at[:, pl.ds(tile * columns, columns)]
             _dma_rows(src, dst, sem, self.query.count, wait, dst_start=self.first_row)
 
     def owner(self, future):
@@ -523,6 +523,11 @@ def fp8_paged_mqa_logits(
             return scores, maxima
         return scores
     info = cast(pltpu.TpuInfo, pltpu.get_tpu_info())
+    # Each maxima DMA needs a lane-aligned destination even when the score
+    # tile's width is not divisible by block * num_lanes.
+    maxima_tile = (
+        pl.cdiv(key_tile, block * info.num_lanes) * info.num_lanes if block else 0
+    )
     page_count = width // layout.page_size
     tile_pages = config.key_tile // layout.page_size
     page_ids = block_table[:, :page_count]
@@ -542,11 +547,7 @@ def fp8_paged_mqa_logits(
             pltpu.SMEM((4 * page_count,), jnp.int32),
             pltpu.VMEM((tile, config.key_tile), jnp.float32),
         )
-        + (
-            (pltpu.VMEM((4, tile, config.key_tile // block), jnp.float32),)
-            if block
-            else ()
-        ),
+        + ((pltpu.VMEM((4, tile, maxima_tile), jnp.float32),) if block else ()),
         tuple(
             dma(s)
             for s in ((config.key_buffers,), (4, tile), (2,), (4,), (2,))
@@ -561,7 +562,9 @@ def fp8_paged_mqa_logits(
     if block:
         out_shape = (
             out_shape,
-            jax.ShapeDtypeStruct((tokens, width // block), jnp.float32),
+            jax.ShapeDtypeStruct(
+                (tokens, width // key_tile * maxima_tile), jnp.float32
+            ),
         )
     result = pl.pallas_call(
         kernel,
@@ -582,5 +585,7 @@ def fp8_paged_mqa_logits(
     )(query_start_loc, context_lens, jnp.asarray(query_start, jnp.int32), inputs)
     if block:
         scores, maxima = result
+        maxima = maxima.reshape(tokens, -1, maxima_tile)[..., : key_tile // block]
+        maxima = maxima.reshape(tokens, width // block)
         return scores[:, :max_model_len], maxima[:, : pl.cdiv(max_model_len, block)]
     return result[:, :max_model_len]
