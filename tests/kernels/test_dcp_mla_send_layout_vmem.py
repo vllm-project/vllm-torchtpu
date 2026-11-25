@@ -131,6 +131,27 @@ def test_send_layout_call_caps_vmem_and_pins_hbm(monkeypatch):
     ]
 
 
+def test_send_layout_cap_rises_with_scratch(monkeypatch):
+    # Batch 16 and top-k cap 1024: the call's own VMEM scratch (about 37 MiB)
+    # exceeds the 32 MiB cap, so the limit becomes scratch + headroom instead.
+    _, config = _mla_call(
+        monkeypatch,
+        tokens=32,
+        topk=2048,
+        topk_cap=1024,
+        batch=16,
+        fused_window_prep=True,
+        decode_row_widths=(128, 256, 384),
+        send_world=8,
+    )
+    size = config["scoped_memory_configs"][0]["size"]
+    assert 32 * 1024 * 1024 < size < sparse_mla.DEFAULT_VMEM_LIMIT_BYTES
+    assert size - sparse_mla.SEND_LAYOUT_VMEM_HEADROOM_BYTES > 32 * 1024 * 1024
+    assert config["custom_call_config"]["input_memory_space_colors"] == [
+        {"operand_index": i, "color": 0} for i in range(4, 9)
+    ]
+
+
 def test_lse_call_keeps_default_vmem_and_no_pins(monkeypatch):
     # A 128-token call without the send layout (output and lse returned).
     name, config = _mla_call(

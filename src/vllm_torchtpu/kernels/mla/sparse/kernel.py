@@ -4842,6 +4842,21 @@ def prepare_gather_indices(
     return kv_lens, physical_indices
 
 
+# The send-layout cap never goes below the call's own VMEM scratch plus this
+# margin for Mosaic's internal scratch (a margin, not a measured value), so a
+# larger batch or top-k cap raises the limit instead of failing to compile.
+SEND_LAYOUT_VMEM_HEADROOM_BYTES = 8 * 1024 * 1024
+
+
+def _vmem_scratch_bytes(scratch_shapes) -> int:
+    """Bytes of the VMEM entries of a pallas_call's `scratch_shapes`."""
+    return sum(
+        int(np.prod(s.shape)) * get_dtype_bitwidth(s.dtype) // 8
+        for s in scratch_shapes
+        if s.memory_space == pltpu.VMEM
+    )
+
+
 def sparse_attention_chunk(
     q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim], padded
     # TensorCore: u8[pages, page_size, 4, 128].
@@ -5344,7 +5359,14 @@ def sparse_attention_chunk(
                             else SEND_EXCHANGE_VMEM_LIMIT_BYTES,
                         )
                         if send_exchange is not None
-                        else min(vmem_limit_bytes, SEND_LAYOUT_VMEM_LIMIT_BYTES)
+                        else min(
+                            vmem_limit_bytes,
+                            max(
+                                SEND_LAYOUT_VMEM_LIMIT_BYTES,
+                                _vmem_scratch_bytes(scratch_shapes)
+                                + SEND_LAYOUT_VMEM_HEADROOM_BYTES,
+                            ),
+                        )
                         if send_world
                         else vmem_limit_bytes
                     ),
