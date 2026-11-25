@@ -3601,7 +3601,9 @@ class TPUModelRunner(GPUModelRunner):
         The entry also holds `host`, so a temporary array stays alive while its
         non-blocking upload may still be reading it.
         """
-        key = (host.dtype, tuple(host.shape), host.numpy().tobytes())
+        # Raw bytes, so dtypes numpy lacks (bfloat16) key the same way.
+        raw = host.view(torch.uint8).numpy().tobytes()
+        key = (host.dtype, tuple(host.shape), raw)
         prev = self._h2d_reuse.get(slot)
         if prev is not None and prev[0] == key:
             return prev[1]
@@ -8572,10 +8574,11 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
         )
 
+        # The same requests keep their sampling params step after step.
         return (
-            temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_k_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
-            top_p_cpu.unsqueeze(1).to(logits.device, non_blocking=True),
+            self._upload_unless_unchanged("temperature", temps_cpu.unsqueeze(1)),
+            self._upload_unless_unchanged("top_k", top_k_cpu.unsqueeze(1)),
+            self._upload_unless_unchanged("top_p", top_p_cpu.unsqueeze(1)),
         )
 
     def _topk_candidate_blocks(self) -> int:

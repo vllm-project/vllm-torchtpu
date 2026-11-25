@@ -3340,6 +3340,11 @@ def test_upload_unless_unchanged_reuses_only_identical_values(device):
     z22 = upload("z", torch.zeros(2, 2, dtype=torch.float32))
     assert z22 is not zf and tuple(z22.shape) == (2, 2)
 
+    # bfloat16 (sampling temperatures) keys by its raw bytes too.
+    t = upload("t", torch.full((4, 1), 0.7, dtype=torch.bfloat16))
+    assert upload("t", torch.full((4, 1), 0.7, dtype=torch.bfloat16)) is t
+    assert upload("t", torch.full((4, 1), 0.8, dtype=torch.bfloat16)) is not t
+
 
 def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     """The draft shares the target's cached Pallas ops, which are traced
