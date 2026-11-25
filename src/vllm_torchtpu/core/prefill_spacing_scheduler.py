@@ -62,6 +62,21 @@ warmest-first admission, each step this scheduler:
   arrived ``R / rate`` seconds or more after it. It changes which prefill a
   step runs, never whether a step runs prefill (spacing and TPOT holds are
   unchanged).
+* with ``VLLM_TPU_PREFILL_DECODE_CADENCE`` = N, runs prefill and decode in
+  separate steps the way a fixed prefill-decode interval does: after a step
+  that runs prefill, N decode-only steps per full step of prefill tokens
+  (``max_num_batched_tokens``; a partial step owes its share, rounded up) go
+  before the next prefill step, while requests decode.
+* with ``VLLM_TPU_PREFILL_COALESCE_TOKENS`` set, while requests decode, holds
+  prefill until the pending prefill tokens (uncached tokens of the waiting
+  prompts the free running slots can admit, plus the running chunks' tokens
+  left) reach that many, or the oldest pending prompt arrived
+  ``VLLM_TPU_PREFILL_COALESCE_MAX_WAIT_S`` ago, so short prompts run together
+  as one full chunk instead of riding in many decode steps.
+  Neither of the two defers prefill while a waiting prompt not yet started
+  arrived more than ``VLLM_TPU_PREFILL_CADENCE_MAX_WAIT_S`` ago (TTFT bound;
+  running chunks keep the cadence); the spacing debt above still applies
+  then. Both change only whether a step runs prefill; SRPT still picks which.
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.prefill_spacing_scheduler.PrefillSpacingScheduler``.
@@ -116,6 +131,17 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self.max_wait_s = envs.VLLM_TPU_PREFILL_TPOT_MAX_WAIT_S
         self.srpt = envs.VLLM_TPU_PREFILL_SRPT
         self.srpt_aging = envs.VLLM_TPU_PREFILL_SRPT_AGING_TOKENS_PER_S
+        self.cadence = envs.VLLM_TPU_PREFILL_DECODE_CADENCE
+        self.cadence_max_wait_s = envs.VLLM_TPU_PREFILL_CADENCE_MAX_WAIT_S
+        self.coalesce_tokens = envs.VLLM_TPU_PREFILL_COALESCE_TOKENS
+        self.coalesce_max_wait_s = envs.VLLM_TPU_PREFILL_COALESCE_MAX_WAIT_S
+        # Decode-only steps owed before the next prefill step (cadence), and
+        # steps deferred by the cadence / coalescing / let through by the
+        # TTFT bound.
+        self._cadence_left = 0
+        self._cadence_steps = 0
+        self._coalesce_steps = 0
+        self._bound_steps = 0
         # SRPT: wall clock of the current step (arrival_time is wall time) and
         # the aged keys of the admissible window, parallel to _window_cold.
         self._srpt_now = time.time()
@@ -165,6 +191,15 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             self.srpt,
             self.srpt_aging,
         )
+        if self.cadence or self.coalesce_tokens:
+            logger.info(
+                "PrefillSpacingScheduler decode cadence=%d coalesce_tokens=%d "
+                "coalesce_max_wait_s=%.2f cadence_max_wait_s=%.1f",
+                self.cadence,
+                self.coalesce_tokens,
+                self.coalesce_max_wait_s,
+                self.cadence_max_wait_s,
+            )
 
     def _age_tokens(self, request: Request) -> float:
         """SRPT credit of ``request``: aging rate times seconds since arrival."""
@@ -234,6 +269,14 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         if not decoding:
             self._debt_s = 0.0
         spacing = self.spacing_frac > 0 and decoding and self._debt_s > 0
+        if (
+            (self.cadence or self.coalesce_tokens)
+            and decoding
+            and not spacing
+            and not throttle_prefills
+            and self._decode_priority_hold(queue)
+        ):
+            spacing = True
         self._fit_cap = None
         defer_debt = spacing or throttle_prefills
         if self.tpot_target_s > 0 and self._hold_for_tpot(decoders, queue):
@@ -288,11 +331,66 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         that can run (waiting and not blocked, or a running chunk), arrived
         more than ``max_wait_s`` ago: holds then stop adding to its TTFT. A few
         long prompts held step after step otherwise set the mean TTFT."""
+        oldest = self._oldest_pending_arrival(queue)
+        return oldest is not None and time.time() - oldest > self.max_wait_s
+
+    def _decode_priority_hold(self, queue: RequestQueue | None) -> bool:
+        """Whether the decode cadence or prefill coalescing makes this step
+        decode-only (called only while requests decode)."""
+        oldest = self._oldest_pending_arrival(queue)
+        if oldest is None:
+            return False
+        now = time.time()
+        waited = now - oldest
+        # The TTFT bound looks at prompts not yet started only: a long prompt
+        # already chunking keeps the cadence between its chunks (otherwise
+        # every multi-chunk prompt past the bound runs as a train of full
+        # steps, which is what sets the p90 ITL).
+        unstarted = self._oldest_pending_arrival(queue, include_chunks=False)
+        if (
+            self.cadence_max_wait_s > 0
+            and unstarted is not None
+            and now - unstarted > self.cadence_max_wait_s
+        ):
+            if self._cadence_left > 0 or self.coalesce_tokens:
+                self._bound_steps += 1
+            return False
+        if self._cadence_left > 0:
+            self._cadence_steps += 1
+            return True
+        if (
+            self.coalesce_tokens
+            and waited < self.coalesce_max_wait_s
+            and self._pending_prefill_tokens() < self.coalesce_tokens
+        ):
+            self._coalesce_steps += 1
+            return True
+        return False
+
+    def _pending_prefill_tokens(self) -> int:
+        """Uncached tokens of the waiting prompts the free running slots can
+        admit plus the tokens left of the running prefill chunks."""
+        room = min(self.max_num_running_reqs, self.max_num_active_reqs) - len(
+            self.running
+        )
+        tokens = sum(self._window_cold[: max(room, 0)])
+        return tokens + sum(
+            self._remaining(r) for r in self.running if r.is_prefill_chunk
+        )
+
+    def _oldest_pending_arrival(
+        self, queue: RequestQueue | None, include_chunks: bool = True
+    ) -> float | None:
+        """Arrival time of the oldest request still waiting for its first
+        token whose prefill can run (waiting and not blocked, or, with
+        ``include_chunks``, a running chunk); None if there is none."""
         waiting = (
             r for r in queue or () if not self._is_blocked_waiting_status(r.status)
         )
-        chunks = (r for r in self.running if r.is_prefill_chunk)
-        oldest = min(
+        chunks = (
+            r for r in self.running if include_chunks and r.is_prefill_chunk
+        )
+        return min(
             (
                 r.arrival_time
                 for r in chain(waiting, chunks)
@@ -300,7 +398,6 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             ),
             default=None,
         )
-        return oldest is not None and time.time() - oldest > self.max_wait_s
 
     def _track_decoders(self, decoders: list[Request], now: float) -> None:
         tokens = rows = 0
@@ -442,6 +539,15 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             self._pending_bins[id(output)] = next(
                 b for b in _FIT_BINS if prefill_tokens <= b
             )
+        if self.cadence:
+            if prefill_tokens:
+                # Owed even when nothing decoded before this step: its
+                # finished prompts decode from the next step on.
+                self._cadence_left = -(
+                    -self.cadence * prefill_tokens // self.max_num_scheduled_tokens
+                )
+            elif self._cadence_left > 0:
+                self._cadence_left -= 1
         if not decoding:
             self._debt_s = 0.0
         elif kind == _LONG:
@@ -465,6 +571,13 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
                 {k: round(v, 4) for k, v in self._step_s.items()},
                 {k: round(v, 4) for k, v in self._bin_s.items()},
             )
+            if self.cadence or self.coalesce_tokens:
+                logger.info(
+                    "PrefillSpacingScheduler: cadence=%d coalesce=%d bound=%d",
+                    self._cadence_steps,
+                    self._coalesce_steps,
+                    self._bound_steps,
+                )
 
     def update_from_output(
         self,
