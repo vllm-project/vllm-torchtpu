@@ -94,7 +94,7 @@ class TestTpuCompilerCache:
     ):
         return SimpleNamespace(
             cache_config=SimpleNamespace(
-                gpu_memory_utilization=0.9,
+                resolved_gpu_memory_utilization=0.9,
                 num_gpu_blocks=num_gpu_blocks,
                 num_gpu_blocks_override=None,
                 mamba_cache_mode=mamba_cache_mode,

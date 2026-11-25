@@ -1738,26 +1738,47 @@ def _patch_vllm_compile_prefix_isolation() -> None:
 
 
 def _patch_vllm_tpu_runner_validation() -> None:
-    """Validate the model runner and adaptive verification against TPU's runner.
+    """Validate and default TPU runner capabilities on ``VllmConfig``.
 
-    On TPU, ``VllmConfig._validate_model_runner`` also rejects what
-    ``TPUModelRunner`` does not implement (``_validate_tpu_runner_features``),
-    where vLLM v0.33.0 ran its V1 runner check. vLLM's
-    ``VllmConfig._validate_adaptive_verification`` requires full CUDA graphs,
-    which have no TPU counterpart, so on TPU the configuration is checked by
-    ``validate_adaptive_verification_config`` instead.
+    vLLM v0.33.0 disabled unrequested async scheduling and rejected V1-unsupported
+    features for its V1 model runner; v0.34.0 removed V1 and both checks. On TPU:
+    - ``VllmConfig.__post_init__`` disables unrequested async scheduling
+      (``async_scheduling is None``) when ``_tpu_async_scheduling_incompatibility``
+      reports an incompatible mode, before vLLM resolves the default to ``True``.
+    - ``VllmConfig._validate_model_runner`` rejects what ``TPUModelRunner`` does
+      not implement (``_validate_tpu_runner_features``).
+    - ``VllmConfig._validate_adaptive_verification`` uses TPU's check
+      (``validate_adaptive_verification_config``) instead of requiring full CUDA
+      graphs.
     """
     from vllm.config.vllm import VllmConfig
 
     if getattr(VllmConfig, "_tpu_runner_validation_patch", False):
         return
 
+    original_post_init = VllmConfig.__post_init__
     original_validate_runner = VllmConfig._validate_model_runner
     original_validate_adaptive = VllmConfig._validate_adaptive_verification
 
     def on_tpu(config) -> bool:
         device_config = getattr(config, "device_config", None)
         return device_config is not None and device_config.device_type == "tpu"
+
+    def patched_post_init(self):
+        if on_tpu(self) and self.scheduler_config.async_scheduling is None:
+            from vllm_torchtpu.platforms.tpu_platform import (
+                _tpu_async_scheduling_incompatibility,
+            )
+
+            incompat = _tpu_async_scheduling_incompatibility(self)
+            if incompat is not None:
+                logger.warning_once(
+                    "Async scheduling is disabled because TPUModelRunner does "
+                    "not support it with %s.",
+                    incompat,
+                )
+                self.scheduler_config.async_scheduling = False
+        original_post_init(self)
 
     def patched_validate_runner(self):
         original_validate_runner(self)
@@ -1777,6 +1798,7 @@ def _patch_vllm_tpu_runner_validation() -> None:
 
         validate_adaptive_verification_config(self)
 
+    VllmConfig.__post_init__ = patched_post_init
     VllmConfig._validate_model_runner = patched_validate_runner
     VllmConfig._validate_adaptive_verification = patched_validate_adaptive
     VllmConfig._tpu_runner_validation_patch = True

@@ -97,7 +97,6 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (
     AttentionGroup,
@@ -501,7 +500,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
-        self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
         self.layerwise_nvtx_hooks_registered = False
 
@@ -717,7 +715,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             reqs_to_add.append(req_state)
 
-        # Update the states of the running/resumed requests.
+        # Update the states of the running requests.
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
         scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens

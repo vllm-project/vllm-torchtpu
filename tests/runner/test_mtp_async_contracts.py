@@ -251,15 +251,16 @@ def test_mamba_read_offset_follows_storage_owner(
 
 
 def scheduler_for(request, k):
+    del k
     scheduler = object.__new__(AsyncScheduler)
     scheduler.requests = {request.request_id: request}
     scheduler.defer_block_free = False
     scheduler._inflight_prefills = set()
-    scheduler.enable_return_routed_experts = False
     scheduler.num_sampled_tokens_per_step = 1
+    scheduler.current_step = 0
+    scheduler.decode_stagger = 1
     scheduler.use_pp = False
     scheduler.scheduler_config = SimpleNamespace(async_scheduling=True)
-    scheduler._spec_token_placeholders = [-1] * k
     return scheduler
 
 

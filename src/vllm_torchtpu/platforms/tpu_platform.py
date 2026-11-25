@@ -235,6 +235,26 @@ _UNSUPPORTED_ARCHITECTURES = {
 }
 
 
+def _tpu_async_scheduling_incompatibility(vllm_config: VllmConfig) -> str | None:
+    """Feature incompatible with TPUModelRunner's async scheduling, or None.
+
+    vLLM v0.33.0 disabled unrequested async scheduling (``async_scheduling is
+    None``) for these on the V1 model runner before ``check_and_update_config``;
+    v0.34.0 removed V1 and enables async scheduling unconditionally there.
+    Explicit ``async_scheduling=True`` is left alone so the platform and runner
+    validators still reject it.
+    """
+    spec = vllm_config.speculative_config
+    if spec is not None:
+        if not spec.use_eagle():
+            return f"{spec.method}-based speculative decoding"
+        if spec.disable_padded_drafter_batch:
+            return "disable_padded_drafter_batch=True"
+    if vllm_config.parallel_config.pipeline_parallel_size > 1:
+        return "pipeline parallelism"
+    return None
+
+
 def _validate_tpu_runner_features(vllm_config: VllmConfig) -> None:
     """Reject features TPUModelRunner does not implement.
 
@@ -251,6 +271,13 @@ def _validate_tpu_runner_features(vllm_config: VllmConfig) -> None:
     if spec is not None:
         if spec.enable_adaptive_verification and spec.method != "dspark":
             unsupported.append("adaptive draft verification outside DSpark")
+        if (
+            spec.disable_padded_drafter_batch
+            and vllm_config.scheduler_config.async_scheduling
+        ):
+            unsupported.append(
+                "async scheduling with disable_padded_drafter_batch=True"
+            )
         if spec.draft_lm_head_quantization is not None:
             unsupported.append("draft lm_head quantization")
         draft_config = spec.draft_model_config

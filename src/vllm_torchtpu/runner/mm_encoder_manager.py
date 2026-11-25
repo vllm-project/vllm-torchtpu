@@ -167,6 +167,35 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.max_batch_size,
         )
 
+    @staticmethod
+    def _generate_budgets(
+        min_budget: int,
+        max_budget: int,
+        cap: int | None = None,
+    ) -> list[int]:
+        """Generate power-of-2 token budgets for static XLA compilation.
+
+        Upstream subdivides into 1/4- and 1/8-octave steps because CUDA graphs
+        share one buffer set and capture cheaply. On TPU, every budget holds its
+        own template buffer and runs a full XLA compile (plus an encoder-DP
+        all-gather compile), so keep power-of-2 buckets.
+        """
+        if cap is not None:
+            max_budget = min(max_budget, max(cap, min_budget))
+        budgets: list[int] = []
+        b = min_budget
+        while b <= max_budget:
+            budgets.append(b)
+            b *= 2
+        if not budgets or budgets[-1] < max_budget:
+            budgets.append(max_budget)
+        return budgets
+
+    @staticmethod
+    def _item_multiple_budgets(item_tokens: int, max_budget: int) -> list[int]:
+        """Keep power-of-2 XLA buckets for fixed-size encoder paths too."""
+        return MMEncoderManager._generate_budgets(item_tokens, max_budget)
+
     def _pad_to_template(
         self,
         replay_values: dict[str, torch.Tensor | None],

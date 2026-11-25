@@ -32,7 +32,12 @@ if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 Stage = Literal[
-    "import", "platform_activation", "engine_core", "worker_init", "model_load"
+    "import",
+    "platform_register",
+    "platform_activation",
+    "engine_core",
+    "worker_init",
+    "model_load",
 ]
 
 
@@ -112,7 +117,10 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner validation.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
-    Patch("vllm_torchtpu:_patch_vllm_tpu_runner_validation", _ACTIVE),
+    Patch(
+        "vllm_torchtpu:_patch_vllm_tpu_runner_validation",
+        ("platform_register", *_ACTIVE),
+    ),
     # Weight loading and embeddings.
     Patch(
         "vllm_torchtpu.model_loader_patches:patch_default_loader_ep_weight_filter",

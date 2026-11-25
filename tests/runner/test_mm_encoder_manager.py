@@ -98,6 +98,33 @@ def test_initialization_compiles_encoder_forward(manager, compile_mock):
     )
 
 
+def test_auto_budgets_stay_power_of_two_for_xla_compilation():
+    assert mm.MMEncoderManager._generate_budgets(64, 4096) == [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+    ]
+    assert mm.MMEncoderManager._generate_budgets(64, 4096, cap=1500) == [
+        64,
+        128,
+        256,
+        512,
+        1024,
+        1500,
+    ]
+    assert mm.MMEncoderManager._item_multiple_budgets(256, 4096) == [
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+    ]
+
+
 def test_initialization_builds_positive_budgets_per_path(manager):
     assert {
         path: list(templates) for path, templates in manager.budget_templates.items()

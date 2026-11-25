@@ -471,7 +471,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         # aligns the value actually used to min()); hashing it would split
         # ranks into separate cache dirs and force asymmetric recompiles.
         "kv_cache": {
-            "gpu_memory_utilization": cache_config.gpu_memory_utilization,
+            "gpu_memory_utilization": cache_config.resolved_gpu_memory_utilization,
             "num_gpu_blocks": cache_config.num_gpu_blocks,
         },
         # The GDN op traces with prefill checkpoint operands or with constant
