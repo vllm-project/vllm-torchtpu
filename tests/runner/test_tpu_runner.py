@@ -168,13 +168,15 @@ def test_chunk_samples_follows_the_discard_rule(computed, scheduled, tokens, sam
 
 def _lockstep_runner(**kwargs):
     runner = SimpleNamespace(
-        _dp_lockstep_enabled=lambda: True,
-        num_tokens_paddings=[72, 2048],
-        _expert_relayout=None,
-        _dp_step_index=0,
-        _dp_step_open=False,
-        max_num_reqs=12,
-        **kwargs,
+        **{
+            "_dp_lockstep_enabled": lambda: True,
+            "num_tokens_paddings": [72, 2048],
+            "_expert_relayout": None,
+            "_dp_step_index": 0,
+            "_dp_step_open": False,
+            "max_num_reqs": 12,
+            **kwargs,
+        }
     )
     agreement = dp_step.StepAgreement("cpu-group")
     runner._dp_step_agreement = lambda: agreement
@@ -2444,6 +2446,7 @@ class TestInputStagingFence:
             _dp_num_tokens_across_dp=lambda n: None,
             # a0567106's _dummy_run also asks whether DP lockstep is on.
             _dp_lockstep_enabled=lambda: False,
+            _publish_dp_agreed_rows=lambda n: None,
             forward_model=forward_model,
             compute_selected_logits=lambda out, idx: out,
         )
