@@ -178,10 +178,14 @@ def test_spec_boundary_pairs_warm_hits_serving_call(monkeypatch):
     assert len(frames) == warmed
 
 
-def test_warm_guard_flags_default_on(monkeypatch):
-    """Renders that never set them (za11 A16) recompiled every warmed
-    substitute bucket (thread-count guard) on its first served step."""
+def test_warm_guard_flags_default_off_and_enable(monkeypatch):
+    """New behaviour stays default-off and is enabled per serving profile;
+    a render that wants the warmed shapes to hit sets both flags to 1."""
     monkeypatch.delenv("VLLM_TPU_WARM_SERVING_THREADS", raising=False)
     monkeypatch.delenv("VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD", raising=False)
+    assert envs.VLLM_TPU_WARM_SERVING_THREADS is False
+    assert envs.VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD is False
+    monkeypatch.setenv("VLLM_TPU_WARM_SERVING_THREADS", "1")
+    monkeypatch.setenv("VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD", "1")
     assert envs.VLLM_TPU_WARM_SERVING_THREADS is True
     assert envs.VLLM_TPU_SUBTRACT_REJECTED_WARM_NO_GRAD is True
