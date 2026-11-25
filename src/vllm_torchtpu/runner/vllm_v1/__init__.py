@@ -21,20 +21,24 @@ package keeps copies of them from vLLM v0.33.0. utils.py holds the v0.33.0
 helpers these copies call that v0.34.0 deleted. The layout mirrors upstream's
 vllm/v1/ so each file diffs cleanly against its source.
 
-Only imports differ from upstream, except in two files. worker/gpu_model_runner.py
+Only imports differ from upstream, except in five files. worker/gpu_model_runner.py
 keeps only the GPUModelRunner methods TPUModelRunner reaches (including the
 ones vLLM's WorkerBase looks up by name) and drops the GPU-only drafter,
 sampler, CUDA graph and n-gram GPU code; its _update_states follows the
 v0.34.0 scheduler, which drops a preempted request and re-sends it as a new
 request when it resumes. worker/ec_connector_model_runner_mixin.py keeps only
-maybe_save_ec_to_connector.
+maybe_save_ec_to_connector. sample/logits_processor/__init__.py's
+_load_custom_logitsprocs returns [] and the plugin and FQCN loaders it called
+are removed. worker/gpu_input_batch.py and sample/metadata.py drop upstream's
+ThinkingBudgetStateHolder (and InputBatch's reasoning_config parameter):
+TPUModelRunner enforces thinking_token_budget with
+runner/thinking_budget_tracker.py.
 
-Custom logits processors are rejected on TPU at config time
-(platforms/tpu_platform.py _validate_tpu_runner_features): on TPU the copied
-sample/logits_processor _load_custom_logitsprocs loads none, so they would be
-silently ignored. Rules for
-edits are in
+TPUModelRunner applies no custom logits processors, so config-time
+logits_processors are rejected (platforms/tpu_platform.py
+_validate_tpu_runner_features) and installed vllm.logits_processors plugins are
+not loaded. Rules for edits are in
 docs/developers_guide/coding_guidance.md (R-3.1). Moving TPUModelRunner onto
-Model Runner V2 retires this package:
+Model Runner V2 retires this package and lifts that limit:
 https://github.com/vllm-project/vllm-torchtpu/issues/3723
 """

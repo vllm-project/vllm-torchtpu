@@ -29,16 +29,27 @@ def _make_request(
     num_preemptions: int = 0,
     num_computed_tokens: int = 0,
     skip_reading_prefix_cache: bool = False,
+    prefix_cache_hit_limit: int | None = None,
 ) -> SimpleNamespace:
-    return SimpleNamespace(
+    request = SimpleNamespace(
         request_id=request_id,
         num_tokens=num_tokens,
         arrival_time=arrival_time,
         num_preemptions=num_preemptions,
         num_computed_tokens=num_computed_tokens,
-        prefix_cache_hit_limit=0 if skip_reading_prefix_cache else None,
+        prefix_cache_hit_limit=0
+        if skip_reading_prefix_cache
+        else prefix_cache_hit_limit,
         block_hashes=[object()],
     )
+
+    def get_max_cache_hit_length(bound: int | None = None) -> int:
+        # Same as vllm.v1.request.Request.get_max_cache_hit_length.
+        limits = (request.num_tokens - 1, request.prefix_cache_hit_limit, bound)
+        return min(limit for limit in limits if limit is not None)
+
+    request.get_max_cache_hit_length = get_max_cache_hit_length
+    return request
 
 
 def _make_scheduler(
@@ -68,7 +79,8 @@ def _make_scheduler(
             raise RuntimeError("simulated coordinator failure")
         for r in requests:
             if r.block_hashes is block_hashes:
-                return ({}, warmth_map.get(r.request_id, 0), 0)
+                # Like the real coordinator, a hit never exceeds max_len.
+                return ({}, min(warmth_map.get(r.request_id, 0), max_len), 0)
         return ({}, 0, 0)
 
     coordinator.find_longest_cache_hit.side_effect = find_hit
@@ -196,6 +208,24 @@ def test_skip_reading_prefix_cache_or_caching_disabled():
     q_disabled = s_disabled._select_waiting_queue_for_scheduling()
     assert q_disabled is not None
     assert [r.request_id for r in q_disabled] == ["r1", "r3"]
+
+
+def test_positive_prefix_cache_hit_limit_caps_warmth():
+    now = time.time()
+    r1 = _make_request("r1", num_tokens=1000, arrival_time=now - 10)
+    # 900 tokens are cached, but only the first 100 may be read (as for a
+    # prompt-scoring request), so 900 tokens are uncached against r1's 700.
+    r2 = _make_request(
+        "r2", num_tokens=1000, arrival_time=now - 5, prefix_cache_hit_limit=100
+    )
+    s = _make_scheduler([r1, r2], {"r1": 300, "r2": 900})
+
+    q = s._select_waiting_queue_for_scheduling()
+    assert q is not None
+    assert [r.request_id for r in q] == ["r1", "r2"]
+    s.kv_cache_manager.coordinator.find_longest_cache_hit.assert_any_call(
+        r2.block_hashes, 100
+    )
 
 
 def test_coordinator_failure_falls_back_to_fcfs():

@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copied from vLLM v0.33.0 vllm/v1/sample/thinking_budget_state.py,
-# unchanged apart from imports; see vllm_torchtpu/runner/vllm_v1/__init__.py.
+# Copied from vLLM v0.33.0 vllm/v1/sample/thinking_budget_state.py, unchanged
+# apart from imports. A test reference only: vLLM v0.34.0 deleted the module,
+# and TPU enforces thinking_token_budget with ThinkingBudgetTracker
+# (vllm_torchtpu/runner/thinking_budget_tracker.py). test_thinking_budget.py
+# checks the tracker against this upstream ThinkingBudgetStateHolder.
 """Per-batch thinking token budget state; applied after penalties at sample time."""
 
 from typing import TYPE_CHECKING, Any

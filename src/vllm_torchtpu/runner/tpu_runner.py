@@ -1129,10 +1129,6 @@ class TPUModelRunner(GPUModelRunner):
         self.execute_model_state: ExecuteModelState | None = None
         self._pre_async_results: AsyncPreResults | None = None
         self._min_tokens = min_tokens_mask.MinTokensTracker()
-        # ThinkingBudgetTracker enforces thinking_token_budget; upstream's holder
-        # would make InputBatch.refresh_metadata run holder.sync_batch (prompt
-        # scans, unused per-row state) on every batch update.
-        self.input_batch.thinking_budget_state_holder = None
         self._thinking_budget = thinking_budget_tracker.ThinkingBudgetTracker(
             self.vllm_config.reasoning_config,
             max_num_reqs=self.max_num_reqs,
@@ -2845,11 +2841,11 @@ class TPUModelRunner(GPUModelRunner):
         Their D2H copy may still be in flight. Keep the results instead of
         waiting on it here, which would stall the host before this step's
         forward: sample_tokens() waits on them in _modify_prev_results() and
-        replaces them, after any number of zero-token steps. Never drop them
-        unsynchronized: on TP ranks other than the executor's output rank, vLLM
-        may discard the AsyncTPUModelRunnerOutput when the RPC returns, leaving
-        these results the only owner of the copy, whose buffers would be freed
-        mid-transfer.
+        replaces them, or execute_model() does on a zero-token step. Never drop
+        them unsynchronized: on TP ranks other than the executor's output rank,
+        vLLM may discard the AsyncTPUModelRunnerOutput when the RPC returns,
+        leaving these results the only owner of the copy, whose buffers would
+        be freed mid-transfer.
         """
         pre = self._pre_async_results
         if pre is None or not pre.req_id_to_index_copy:
@@ -4374,11 +4370,21 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
+        if self.scheduler_config.async_scheduling:
+            self._unmap_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
-            # No forward reads the previous step's results here, so they stay
-            # mapped: a request this step left out can return in the next one,
-            # where vLLM does not resend its tokens, and its unsettled
-            # placeholders are substituted then.
+            if (
+                self.scheduler_config.async_scheduling
+                and self._pre_async_results is not None
+            ):
+                # No sample_tokens() follows a zero-token step, so settle the
+                # previous step's results now. A request this step left out can
+                # return later, after vLLM has rolled its rejected drafts out of
+                # num_computed_tokens and num_output_tokens; results still
+                # pending then would subtract them again. No forward overlaps
+                # the wait here.
+                self._modify_prev_results()
+                self._pre_async_results = None
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
             # Even for a zero-token step and if DP lockstep is enabled, we must
@@ -4387,8 +4393,6 @@ class TPUModelRunner(GPUModelRunner):
             # safe to do for a zero-token step since no collectives are
             # triggered.
             return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
-        if self.scheduler_config.async_scheduling:
-            self._unmap_disjoint_async_results()
         if self._mtp_prefill_only:
             # Validate the actual scheduled span before any forward/collective.
             # Ending exactly at the prompt boundary produces the first output;
@@ -9181,10 +9185,6 @@ class TPUModelRunner(GPUModelRunner):
         if kernel_block_sizes is None:
             raise ValueError("kernel_block_sizes is required on TPU")
         super().may_reinitialize_input_batch(kv_cache_config)
-        # ThinkingBudgetTracker enforces thinking_token_budget; upstream's holder
-        # would make InputBatch.refresh_metadata run holder.sync_batch (prompt
-        # scans, unused per-row state) on every batch update.
-        self.input_batch.thinking_budget_state_holder = None
         install_kernel_block_tables(self.input_batch.block_table, kernel_block_sizes)
         if self.input_batch.block_table:
             self.max_num_blocks_per_req = self.input_batch.block_table[

@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copied from vLLM v0.33.0 vllm/v1/sample/metadata.py,
-# unchanged apart from imports; see vllm_torchtpu/runner/vllm_v1/__init__.py.
+# Copied from vLLM v0.33.0 vllm/v1/sample/metadata.py, unchanged apart from
+# imports and the dropped thinking_budget_state_holder field: TPU enforces
+# thinking_token_budget with runner/thinking_budget_tracker.py. See
+# vllm_torchtpu/runner/vllm_v1/__init__.py.
 
 from __future__ import annotations
 
@@ -22,9 +24,6 @@ from dataclasses import dataclass
 import torch
 
 from vllm_torchtpu.runner.vllm_v1.sample.logits_processor import LogitsProcessors
-from vllm_torchtpu.runner.vllm_v1.sample.thinking_budget_state import (
-    ThinkingBudgetStateHolder,
-)
 
 
 @dataclass
@@ -66,6 +65,3 @@ class SamplingMetadata:
 
     # Speculative token ids
     spec_token_ids: list[list[int]] | None = None
-    # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
-    # thinking-token-budget logits (holder may exist with an empty tracking set).
-    thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None

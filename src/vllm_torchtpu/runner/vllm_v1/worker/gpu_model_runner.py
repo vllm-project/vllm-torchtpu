@@ -308,13 +308,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 custom_logitsprocs,
             ),
             # We currently don't know whether a particular custom logits processor
-            # uses output token ids so we set this conservatively. Thinking-budget
-            # tracking is requested dynamically when a budgeted request is in the
-            # batch.
+            # uses output token ids so we set this conservatively.
             logitsprocs_need_output_token_ids=bool(custom_logitsprocs),
             is_pooling_model=self.is_pooling_model,
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-            reasoning_config=self.vllm_config.reasoning_config,
             use_replayssm=self.cache_config.use_replayssm,
         )
 
@@ -812,10 +809,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             if req_index is None:
                 # The request was not scheduled in the previous step and needs
-                # to be added again. Under async scheduling TPU has either
+                # to be added again. Under async scheduling TPU has already
                 # settled its placeholders in req_state (_modify_prev_results,
-                # after the forward step it left) or still maps them for
-                # substitution (after zero-token steps).
+                # run by sample_tokens or by a zero-token execute_model).
                 reqs_to_add.append(req_state)
                 continue
 
@@ -1511,7 +1507,6 @@ class GPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                     is_pooling_model=self.is_pooling_model,
                     cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
-                    reasoning_config=self.vllm_config.reasoning_config,
                     use_replayssm=self.cache_config.use_replayssm,
                     slot_mapping_modes=slot_mapping_modes,
                 )

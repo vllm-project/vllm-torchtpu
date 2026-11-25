@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Copied from vLLM v0.33.0 vllm/v1/sample/logits_processor/__init__.py,
-# unchanged apart from imports; see vllm_torchtpu/runner/vllm_v1/__init__.py.
-import importlib
+# Copied from vLLM v0.33.0 vllm/v1/sample/logits_processor/__init__.py. Apart
+# from imports, _load_custom_logitsprocs loads no custom logits processors and
+# the plugin and FQCN loaders it called are removed; see
+# vllm_torchtpu/runner/vllm_v1/__init__.py.
 import inspect
 import itertools
 from abc import abstractmethod
@@ -26,7 +27,6 @@ import torch
 from vllm.exceptions import VLLMValidationError
 from vllm.logits_process import LogitsProcessor as RequestLogitsProcessor
 from vllm.sampling_params import SamplingParams
-from vllm.utils.torch_utils import guard_cuda_initialization
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.vllm_v1.sample.logits_processor.builtin import (
@@ -62,8 +62,6 @@ STR_SPEC_DEC_REJECTS_LOGITSPROCS = (
     "Custom logits processors are not supported when speculative decoding is enabled."
 )
 
-LOGITSPROCS_GROUP = "vllm.logits_processors"
-
 BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [
     MinTokensLogitsProcessor,
     LogitBiasLogitsProcessor,
@@ -71,138 +69,26 @@ BUILTIN_LOGITS_PROCESSORS: list[type[LogitsProcessor]] = [
 ]
 
 
-def _load_logitsprocs_plugins() -> list[type[LogitsProcessor]]:
-    """Load all installed logit processor plugins."""
-    from importlib.metadata import entry_points
-
-    installed_logitsprocs_plugins = entry_points(group=LOGITSPROCS_GROUP)
-    if len(installed_logitsprocs_plugins) == 0:
-        logger.debug("No logitsprocs plugins installed (group %s).", LOGITSPROCS_GROUP)
-        return []
-
-    # Load logitsprocs plugins
-    logger.debug("Loading installed logitsprocs plugins (group %s):", LOGITSPROCS_GROUP)
-    classes: list[type[LogitsProcessor]] = []
-    for entrypoint in installed_logitsprocs_plugins:
-        try:
-            logger.debug(
-                "- Loading logitproc plugin entrypoint=%s target=%s",
-                entrypoint.name,
-                entrypoint.value,
-            )
-            with guard_cuda_initialization():
-                classes.append(entrypoint.load())
-        except Exception as e:
-            logger.error("Failed to load LogitsProcessor plugin %s: %s", entrypoint, e)
-            raise RuntimeError(
-                f"Failed to load LogitsProcessor plugin {entrypoint}"
-            ) from e
-    return classes
-
-
-def _load_logitsprocs_by_fqcns(
-    logits_processors: Sequence[str | type[LogitsProcessor]] | None,
-) -> list[type[LogitsProcessor]]:
-    """Load logit processor types, identifying them by fully-qualified class
-    names (FQCNs).
-
-    Effectively, a mixed list of logitproc types and FQCN strings is converted
-    into a list of entirely logitproc types, by loading from the FQCNs.
-
-    FQCN syntax is <module>:<type> i.e. x.y.z:CustomLogitProc
-
-    Already-loaded logitproc types must be subclasses of LogitsProcessor
-
-    Args:
-      logits_processors: Potentially mixed list of logitsprocs types and FQCN
-                         strings for logitproc types
-
-    Returns:
-      List of logitproc types
-
-    """
-    if not logits_processors:
-        return []
-
-    logger.debug(
-        "%s additional custom logits processors specified, checking whether "
-        "they need to be loaded.",
-        len(logits_processors),
-    )
-
-    classes: list[type[LogitsProcessor]] = []
-    for ldx, logitproc in enumerate(logits_processors):
-        if isinstance(logitproc, type):
-            logger.debug(" - Already-loaded logit processor: %s", logitproc.__name__)
-            if not issubclass(logitproc, LogitsProcessor):
-                raise ValueError(
-                    f"{logitproc.__name__} is not a subclass of LogitsProcessor"
-                )
-            classes.append(logitproc)
-            continue
-
-        logger.debug("- Loading logits processor %s", logitproc)
-        parts = logitproc.split(":")
-        if len(parts) != 2:
-            raise ValueError(
-                f"Invalid logits processor FQCN {logitproc!r}. "
-                "Expected format: '<module>:<type>'"
-            )
-        module_path, qualname = parts
-
-        try:
-            # Load module
-            with guard_cuda_initialization():
-                module = importlib.import_module(module_path)
-        except Exception as e:
-            logger.error(
-                "Failed to load %sth LogitsProcessor plugin %s: %s",
-                ldx,
-                logitproc,
-                e,
-            )
-            raise RuntimeError(
-                f"Failed to load {ldx}th LogitsProcessor plugin {logitproc}"
-            ) from e
-
-        # Walk down dotted name to get logitproc class
-        obj = module
-        for attr in qualname.split("."):
-            obj = getattr(obj, attr)
-        if not isinstance(obj, type):
-            raise ValueError("Loaded logit processor must be a type.")
-        if not issubclass(obj, LogitsProcessor):
-            raise ValueError(f"{obj.__name__} must be a subclass of LogitsProcessor")
-        classes.append(obj)
-
-    return classes
-
-
 def _load_custom_logitsprocs(
     logits_processors: Sequence[str | type[LogitsProcessor]] | None,
 ) -> list[type[LogitsProcessor]]:
     """Load all custom logits processors.
 
-    * First load all installed logitproc plugins
-    * Second load custom logitsprocs pass by the user at initialization time
+    TPU edit: loads none, neither installed vllm.logits_processors plugins nor
+    the ones passed in, because TPUModelRunner applies no custom logits
+    processors; platforms/tpu_platform.py _validate_tpu_runner_features rejects
+    configured ones at startup. Upstream skips loading only when
+    current_platform.is_tpu(), which is False for this out-of-tree platform.
 
     Args:
       logits_processors: potentially mixed list of logitproc types and
                          logitproc type fully-qualified names (FQCNs)
-                         which need to be loaded
 
     Returns:
-      A list of all loaded logitproc types
+      An empty list
 
     """
-    from vllm.platforms import current_platform
-
-    if current_platform.is_tpu():
-        # No logitsprocs specified by caller
-        # TODO(andy) - vLLM V1 on TPU does not support custom logitsprocs
-        return []
-
-    return _load_logitsprocs_plugins() + _load_logitsprocs_by_fqcns(logits_processors)
+    return []
 
 
 def build_logitsprocs(
@@ -380,6 +266,5 @@ __all__ = [
     "LogitsProcessors",
     "build_logitsprocs",
     "STR_POOLING_REJECTS_LOGITSPROCS",
-    "LOGITSPROCS_GROUP",
     "AdapterLogitsProcessor",
 ]

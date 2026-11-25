@@ -67,14 +67,16 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _prefix_warmth(self, request: Request) -> int:
         """Prompt tokens of ``request`` resident in the KV cache."""
         kvm = self.kv_cache_manager
-        # A hit limit of 0 means the request skips prefix cache reads.
-        if not kvm.enable_caching or request.prefix_cache_hit_limit == 0:
+        # Bounded by the request's prefix cache hit limit (0 when it skips
+        # prefix cache reads) and by the last token, which is always recomputed.
+        max_hit = request.get_max_cache_hit_length()
+        if not kvm.enable_caching or max_hit <= 0:
             return 0
         if request.num_computed_tokens > 0:
             return request.num_computed_tokens
         try:
             result = kvm.coordinator.find_longest_cache_hit(
-                request.block_hashes, max(request.num_tokens - 1, 0)
+                request.block_hashes, max_hit
             )
             return int(result[1])
         except Exception:

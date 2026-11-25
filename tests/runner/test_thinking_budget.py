@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 import torch
 from runner_input_test_utils import _make_sample_runner
+from upstream_thinking_budget_state import ThinkingBudgetStateHolder
 from vllm import SamplingParams
 from vllm.config.reasoning import ReasoningConfig
 from vllm.sampling_params import StructuredOutputsParams
@@ -77,9 +78,6 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 from vllm_torchtpu.runner.vllm_v1.sample.logits_processor import LogitsProcessors
 from vllm_torchtpu.runner.vllm_v1.sample.logits_processor.interface import BatchUpdate
-from vllm_torchtpu.runner.vllm_v1.sample.thinking_budget_state import (
-    ThinkingBudgetStateHolder,
-)
 from vllm_torchtpu.runner.vllm_v1.worker import gpu_model_runner
 from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
     CachedRequestState,
@@ -210,11 +208,7 @@ def _set_exec_state(
     )
 
 
-def _make_input_batch(
-    max_model_len: int = 128,
-    max_num_reqs: int = 4,
-    reasoning_config: ReasoningConfig | None = None,
-) -> InputBatch:
+def _make_input_batch(max_model_len: int = 128, max_num_reqs: int = 4) -> InputBatch:
     return InputBatch(
         max_num_reqs=max_num_reqs,
         max_model_len=max_model_len,
@@ -225,7 +219,6 @@ def _make_input_batch(
         max_num_blocks_per_req=[max_model_len // 16],
         logitsprocs=LogitsProcessors(),
         logitsprocs_need_output_token_ids=False,
-        reasoning_config=reasoning_config,
     )
 
 
@@ -834,30 +827,8 @@ class TestLifecyclePreemptionAndChunkedPrefill:
         allocated = tracker.slots.allocator.allocated_req_ids()
         assert "r0" not in allocated and "r2" in allocated
 
-        # InputBatch swap_states + upstream thinking_budget_state_holder cleanup.
-        batch = _make_input_batch(64, reasoning_config=cfg)
-        assert batch.thinking_budget_state_holder is not None
-        reinit_runner = object.__new__(TPUModelRunner)
-        reinit_runner.input_batch = batch
-        reinit_runner.max_num_reqs = 4
-        reinit_runner.max_num_blocks_per_req = 4
-        reinit_runner.block_table_cpu = torch.zeros((4, 4), dtype=torch.int32)
-        reinit_runner._refresh_smem_request_caps = lambda _cfg: None
-        with (
-            patch.object(
-                gpu_model_runner.GPUModelRunner,
-                "may_reinitialize_input_batch",
-                lambda self, _kv: None,
-            ),
-            patch(
-                "vllm_torchtpu.runner.tpu_runner.install_kernel_block_tables",
-                lambda *_a: None,
-            ),
-        ):
-            reinit_runner.may_reinitialize_input_batch(
-                MagicMock(), kernel_block_sizes=[16]
-            )
-        assert batch.thinking_budget_state_holder is None
+        # InputBatch swap_states moves the slots with their requests.
+        batch = _make_input_batch(64)
 
         tb_swap = ThinkingBudgetTracker(cfg, max_num_reqs=4, device=torch.device("cpu"))
         pa = SamplingParams(thinking_token_budget=1)

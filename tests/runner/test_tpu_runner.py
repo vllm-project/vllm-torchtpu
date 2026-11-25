@@ -1502,7 +1502,7 @@ class TestTPURunner:
         self.runner.supports_mm_inputs = False
         self.runner.vllm_config.compilation_config.compile_sizes = [16, 2048]
         self.runner._make_buffer = GPUModelRunner._make_buffer.__get__(self.runner)
-        self.runner.input_batch = SimpleNamespace(thinking_budget_state_holder=None)
+        self.runner.input_batch = SimpleNamespace()
 
         with (
             patch.object(GPUModelRunner, "__init__", return_value=None),
@@ -3596,30 +3596,57 @@ def test_unmap_keeps_async_results_until_sample_tokens_waits(
     assert runner.input_batch.token_ids_cpu[0].tolist() == row
 
 
-def test_zero_token_step_keeps_async_results_mapped():
-    """A zero-token step runs no forward, so the previous step's results stay
-    mapped: a request it left out can return in the next step, where vLLM does
-    not resend its tokens, and its placeholders are substituted then."""
-    pre = SimpleNamespace(req_id_to_index_copy={"req-a": 0})
+@pytest.mark.parametrize("has_kv_transfer", [False, True])
+def test_zero_token_step_settles_async_results(has_kv_transfer):
+    """No sample_tokens() follows a zero-token step, so execute_model() waits
+    on the previous step's copy, settles the requests it committed (all
+    outside the batch now) and drops the results."""
+    events = []
+
+    class FakeCopyState:
+        sampled_token_ids_cpu = torch.tensor([[7]], dtype=torch.int32)
+
+        def wait(self):
+            events.append("wait")
+
+    req_state = SimpleNamespace(output_token_ids=[5, 0])  # 0: the placeholder
     runner = SimpleNamespace(
         execute_model_state=None,
         _adaptive_verification=None,
         _update_states=lambda _so: None,
         scheduler_config=SimpleNamespace(async_scheduling=True),
-        input_batch=SimpleNamespace(num_reqs=0, req_ids=[]),
-        _pre_async_results=pre,
+        # The step left every request out of the batch.
+        input_batch=SimpleNamespace(num_reqs=0, req_ids=[], req_id_to_index={}),
+        _pre_async_results=AsyncPreResults(
+            req_ids=["req-a"],
+            next_tokens_tpu=torch.tensor([7], dtype=torch.int32),
+            request_seq_lens=[(0, req_state, 2, "req-a")],
+            discard_sampled_tokens_req_indices=[],
+            req_id_to_index_copy={"req-a": 0},
+            copy_state=FakeCopyState(),
+        ),
+        kv_connector_no_forward=lambda _so, _config: "no-forward",
+        vllm_config=None,
     )
     runner._unmap_disjoint_async_results = (
         lambda: TPUModelRunner._unmap_disjoint_async_results(runner)
     )
+    runner._modify_prev_results = lambda: TPUModelRunner._modify_prev_results(runner)
 
-    with patch.object(tpu_runner, "has_kv_transfer_group", return_value=False):
+    with patch.object(
+        tpu_runner, "has_kv_transfer_group", return_value=has_kv_transfer
+    ):
         output = TPUModelRunner.execute_model(
             runner, SimpleNamespace(total_num_scheduled_tokens=0)
         )
 
-    assert output is tpu_runner.EMPTY_MODEL_RUNNER_OUTPUT
-    assert pre.req_id_to_index_copy == {"req-a": 0}
+    if has_kv_transfer:
+        assert output == "no-forward"
+    else:
+        assert output is tpu_runner.EMPTY_MODEL_RUNNER_OUTPUT
+    assert events == ["wait"]
+    assert req_state.output_token_ids == [5, 7]
+    assert runner._pre_async_results is None
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
