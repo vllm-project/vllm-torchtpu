@@ -32,9 +32,13 @@ coverage run tpucov3 j-bb072340-2900-4cca-81f2, verdict `COV-PASS new=0 fw=FW-CO
 
 ## Your defaults do not change
 
-- With `Q38_FORM` and `Q38_PROXY_FORM` unset, the package and the proxy run exactly as on `caojx/qwen38-flash-1124-2`.
-- Two of your files are edited, and only to add the selectors: `src/vllm_torchtpu/__init__.py` (the form gate) and
-  `examples/disagg/toy_proxy_server.py` (a gate right after its imports). Everything else is new files.
+- With `Q38_FORM` and `Q38_PROXY_FORM` unset, the package and the proxy run exactly as on `caojx/qwen38-flash-1124-2`,
+  except the GDN v3 LOG-conv / BATCHED-metadata correctness fix (`aae3e349b3`), which changes the main-package kernel
+  with no env key and changes the `kernels/` compile-cache key; reproduce Jiaxin's earlier points from
+  `caojx/qwen38-flash-1124-2`.
+- Two of your files are edited only to add the selectors: `src/vllm_torchtpu/__init__.py` (the form gate) and
+  `examples/disagg/toy_proxy_server.py` (a gate right after its imports). The GDN fix above edits two more
+  (`kernels/gdn/v3/wrapper.py`, `kernels/gdn/v3/metadata.py`). Everything else is new files.
 - `Q38_OXPD_FORM=1` still selects the w3 oxpd form, with the same log line.
 
 ## The two selector keys
@@ -177,9 +181,13 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
     `d05d2b3d81`, CPU job ab2 j-cc9c93cd).
 - `b1` is a merge that has not yet run on a device: no served car stacks QGLUE-1 with SB1-1 on `b1` before one device
   bitwise check on `b1`.
-- To work on a lineage: branch from `caojx/qwen38-flash-1124`, edit `src/vllm_torchtpu/_forms/<form>/vllm_torchtpu/`,
-  and run with `Q38_FORM=<form>`. Register every new key in that form's `envs.py`, so it enters the compile key.
-- Dash-bound full runs run from a pushed commit of `caojx/qwen38-flash-1124` only.
+- To work on a lineage: branch from `shriharim/qwen38-flash-1125` (the q38 team branch; `caojx/qwen38-flash-1124`
+  at `bbffe86acf` and `shriharim/q38-merge-1124` at `892c501154` hold the same history up to those commits and no
+  longer move), edit `src/vllm_torchtpu/_forms/<form>/vllm_torchtpu/`, and run with `Q38_FORM=<form>`. Register
+  every new key in that form's `envs.py`, so it enters the compile key.
+- Dash-bound full runs run from a pushed commit of `shriharim/qwen38-flash-1125` only.
+- Syncs with `caojx/qwen38-flash-1124-2` land on `shriharim/qwen38-flash-1125` by merge, not rebase, so the branch
+  only moves by fast-forward.
 - A living form runs its own package: it does not get changes made to the main package (for example
   `VLLM_TPU_SHARED_BACKEND_CACHE`). Folding the living forms into the main package is the planned convergence step.
 
