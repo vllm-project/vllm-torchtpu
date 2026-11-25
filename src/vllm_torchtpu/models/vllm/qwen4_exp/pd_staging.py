@@ -846,14 +846,23 @@ def route_geometry_for(cfg, src_layout, decode_layout, rank) -> "pd_route.RouteG
     row = ROW_SUBLANES * ROW_LANES
     if src_layout.token_bytes != row or decode_layout.token_bytes != row:
         raise ValueError("routed staging needs 1,024-byte rows on both legs")
-    if getattr(src_layout, "merged_compressed", False) or int(getattr(src_layout, "main_dcp", 1)) > 1:
-        # pd_route models a plain TP1 producer: one main-KV page per ID and
-        # unmerged compressed keys. Merged keys (QWEN4_EXP_MERGE_COMPRESSED_K /
-        # QWEN4_EXP_PD_PRODUCER_MERGED) and a PCP producer's split main KV
-        # (QWEN4_EXP_PD_PRODUCER_PCP > 1) are refused rather than mis-routed.
+    merged = bool(getattr(src_layout, "merged_compressed", False))
+    merged_plain = (
+        merged
+        and int(getattr(src_layout, "merged_key_span", 1)) == 1
+        and not getattr(src_layout, "split_compressed", False)
+    )
+    if (merged and not merged_plain) or int(getattr(src_layout, "main_dcp", 1)) > 1:
+        # pd_route models a TP1 producer with one main-KV page per ID. Merged
+        # keys of one column per ID (QWEN4_EXP_MERGE_COMPRESSED_K on a TP1
+        # pipeline, QWEN4_EXP_PD_PRODUCER_MERGED) route like unmerged ones: a
+        # key block holds exactly an unmerged page's live rows, in order, and
+        # the producer lists it as a pool on the main-KV IDs. A PCP span or
+        # split, and a PCP producer's split main KV, are refused rather than
+        # mis-routed.
         raise ValueError(
-            "QWEN4_EXP_PD_ROUTED_DST supports a plain TP1 producer only "
-            "(no merged compressed keys, no PCP split main KV)"
+            "QWEN4_EXP_PD_ROUTED_DST supports a TP1 producer only (merged "
+            "compressed keys of one column per block ID, no PCP split main KV)"
         )
     src_gdn = gdn_geometry(cfg, 1, src_layout.token_bytes)
     dst_gdn = gdn_geometry(cfg, tp, decode_layout.token_bytes)
@@ -1737,6 +1746,31 @@ class StagedConsumer:
                     for r in ranks:
                         pool_name = key if r is None else f"{key}.pcp{r}"
                         self._key_pools[pool_name] = group.group_index
+                        if self.route is not None:
+                            # Routed (QWEN4_EXP_PD_ROUTED_DST): the producer
+                            # routes each key block's pair rows into compact
+                            # staging exactly as it routes an unmerged page's
+                            # live rows (pd_route.producer_spans, "compressed"),
+                            # so the pool is a plain compact compressed owner.
+                            # Only the producer group differs: main KV's.
+                            if r is not None:
+                                raise ValueError(
+                                    "QWEN4_EXP_PD_ROUTED_DST does not route split "
+                                    "producer keys (QWEN4_EXP_PD_PRODUCER_SPLIT_KEYS)"
+                                )
+                            key_entries.append(
+                                PoolEntry(
+                                    tag=pool_tag(group.group_index, key),
+                                    layer_name=pool_name,
+                                    storage_index=0,
+                                    base_offset_bytes=0,
+                                    block_stride_bytes=page_bytes,
+                                    num_blocks=self.pages,
+                                    regions=page_regions(key, page_bytes, compressed_live),
+                                    dtype_tag="qwen4-whole-fp8-page-v1",
+                                )
+                            )
+                            continue
                         key_entries.append(
                             PoolEntry(
                                 tag=pool_tag(

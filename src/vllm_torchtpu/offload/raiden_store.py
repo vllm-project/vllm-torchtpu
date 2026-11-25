@@ -396,6 +396,10 @@ class RaidenOffloadingManager(OffloadingManager):
         # host-tier class that registers finer rows (the compressed keys'
         # leading bytes) sets the rows a page holds.
         device_row_stride: int = 1,
+        # Rows before block 0 in the registered views: block b is device row
+        # b * device_row_stride + device_row_offset (a merged compressed-key
+        # mirror class: the key region after the carrier's scheduler pages).
+        device_row_offset: int = 0,
         # Keep the store time of every key the store holds (host-tier class
         # telemetry: occupancy, stores, evictions, the oldest entry).
         track_held: bool = False,
@@ -414,6 +418,12 @@ class RaidenOffloadingManager(OffloadingManager):
         self._capacity_keys = offload_logical_blocks_capacity
         self._device_block_size_factor = device_block_size_factor
         self._device_row_stride = device_row_stride
+        if device_row_offset and device_block_size_factor != 1:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: a device row offset needs one kernel "
+                f"block per scheduler block, got factor {device_block_size_factor}"
+            )
+        self._device_row_offset = device_row_offset
         self._key_namespace = key_namespace
         # Cross-instance sharing: publishing blocks to the global registry
         # requires a peer-reachable store_server_ip.
@@ -570,7 +580,8 @@ class RaidenOffloadingManager(OffloadingManager):
         # keep and report the scheduler's IDs.
         f = self._device_block_size_factor
         stride = self._device_row_stride
-        return [(b * f + i) * stride for b in device_block_ids for i in range(f)]
+        offset = getattr(self, "_device_row_offset", 0)
+        return [(b * f + i) * stride + offset for b in device_block_ids for i in range(f)]
 
     # -- pin bookkeeping -------------------------------------------------
 
@@ -1808,7 +1819,7 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                 )
                 row_tensors.append(
                     torch.empty(0, dtype=kv_dtype, device=int8_view.device)
-                    .set_(int8_view.untyped_storage())
+                    .set_(int8_view.untyped_storage(), 0, (storage_bytes // itemsize,), (1,))
                     .view(storage_bytes // row_bytes, row_bytes // itemsize)
                 )
             self._init_registration(
@@ -1907,7 +1918,12 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
             )
             device_tensors.append(
                 torch.empty(0, dtype=kv_dtype, device=int8_view.device)
-                .set_(int8_view.untyped_storage())
+                .set_(
+                    int8_view.untyped_storage(),
+                    0,
+                    (storage_bytes // torch.empty(0, dtype=kv_dtype).element_size(),),
+                    (1,),
+                )
                 .view((num_kernel_blocks,) + per_block_shape)
             )
 
@@ -2722,7 +2738,25 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 "spec was built"
             )
         key_row_bytes = None
-        if envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS:
+        merged_key_row_bytes = self._merged_key_row_bytes(vllm_config)
+        # Debug only (QWEN4_EXP_DEBUG_NO_KEY_MIRROR=1): plan no keys mirror, so a host
+        # hit restores main KV with stale keys. Isolates startup faults; never serve with it.
+        debug_no_mirror = os.environ.get("QWEN4_EXP_DEBUG_NO_KEY_MIRROR", "0") == "1"
+        if merged_key_row_bytes is not None and debug_no_mirror:
+            logger.warning(
+                "TPURaidenOffloadingConnector: QWEN4_EXP_DEBUG_NO_KEY_MIRROR=1: merged "
+                "compressed keys are NOT carried by the host tier (debug only)"
+            )
+            merged_key_row_bytes = None
+        if merged_key_row_bytes is not None:
+            # QWEN4_EXP_MERGE_COMPRESSED_K: no compressed-key group; a mirror of the
+            # main class carries each block's keys from the carriers' key region.
+            if envs.VLLM_TPU_OFFLOAD_TIER_CHECK or envs.VLLM_TPU_OFFLOAD_FP4:
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: merged compressed keys are not "
+                    "combined with VLLM_TPU_OFFLOAD_TIER_CHECK or VLLM_TPU_OFFLOAD_FP4"
+                )
+        elif envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS and not debug_no_mirror:
             key_row_bytes = self._compressed_key_live_bytes(vllm_config)
         main_row_bytes = None
         gdn_row_bytes = None
@@ -2742,8 +2776,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             key_row_bytes=key_row_bytes,
             main_row_bytes=main_row_bytes,
             gdn_row_bytes=gdn_row_bytes,
+            merged_key_row_bytes=merged_key_row_bytes,
         )
-        check_served_plan(plan)
+        if not debug_no_mirror:
+            check_served_plan(plan)
         refuse_ephemeral_ports(
             [
                 self._controller_port_base
@@ -2782,6 +2818,24 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             )
         return live
 
+    @staticmethod
+    def _merged_key_row_bytes(vllm_config: VllmConfig) -> int | None:
+        """Bytes of one block's merged compressed keys (one key-region column), or
+        None when this engine does not merge them."""
+        from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import (
+            pooled_cache_specs,
+        )
+
+        layout, _ = pooled_cache_specs(vllm_config)
+        if not getattr(layout, "merged_compressed", False):
+            return None
+        if layout.merged_key_span != 1 or layout.split_compressed:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: the host tier carries merged compressed "
+                "keys of one column per block ID only (no PCP span or split)"
+            )
+        return layout.page_bytes // layout.compressed_columns_per_page
+
     def tier_controller_port(self, tier_class: TierClass) -> int:
         """Controller port of a class's store: one block of ports per local DP rank."""
         assert self.tier_plan is not None
@@ -2817,6 +2871,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     store_server_ip=self.store_server_ip,
                     key_namespace=self.key_namespace,
                     device_row_stride=tier_class.rows_per_page,
+                    device_row_offset=tier_class.row_offset,
                     track_held=True,
                     store=None if stores is None else stores[tier_class.index],
                     store_types=store_types,
@@ -2869,7 +2924,11 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             )
             port = self.tier_controller_port(tier_class)
             class_caches = class_kv_caches(kv_caches, indices)
-            row_bytes = tier_class.row_bytes if tier_class.rows_per_page > 1 else None
+            row_bytes = (
+                tier_class.row_bytes
+                if tier_class.rows_per_page > 1 or tier_class.mirror
+                else None
+            )
             fp4_kind = None
             if envs.VLLM_TPU_OFFLOAD_FP4 and tier_class.kind == "main":
                 fp4_kind = "main"
