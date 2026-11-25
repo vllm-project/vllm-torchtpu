@@ -734,6 +734,7 @@ def test_update_draft_kv_cache_from_target_unit():
 @pytest.mark.tpu_test
 def test_propose_unit(device):
     proposer = _make_proposer(draft_tp=1)
+    proposer._draft_has_moe_cache = False
     K = 3
     proposer.speculative_config.num_speculative_tokens = K
     proposer._draft_attn_layer_names = {"dummy_layer"}
@@ -819,8 +820,9 @@ def _padding_mask_at_draft_forward(proposer, run, num_rows: int) -> list[bool]:
     return seen[0]
 
 
-def test_propose_marks_padding_for_draft_rows():
+def _propose_with_marked_padding(has_moe: bool) -> list[bool]:
     proposer = _make_proposer(draft_tp=1)
+    proposer._draft_has_moe_cache = has_moe
     proposer.speculative_config.num_speculative_tokens = 3
     proposer.runner = SimpleNamespace(
         device=torch.device("cpu"),
@@ -852,7 +854,7 @@ def test_propose_marks_padding_for_draft_rows():
     )
     proposer._build_draft_attn_metadata = mock.MagicMock(return_value={})
 
-    mask = _padding_mask_at_draft_forward(
+    return _padding_mask_at_draft_forward(
         proposer,
         lambda: proposer.propose(
             [], [], None, None, return_device=True, device_seed=[torch.zeros(2)]
@@ -860,11 +862,19 @@ def test_propose_marks_padding_for_draft_rows():
         num_rows=16,
     )
 
-    assert mask == [False] * 8 + [True] * 8
+
+def test_propose_marks_padding_for_draft_rows():
+    assert _propose_with_marked_padding(has_moe=True) == [False] * 8 + [True] * 8
+
+
+def test_moe_free_draft_leaves_the_target_padding_mask():
+    # The target step's mask (3 real rows of 16) is what no layer reads.
+    assert _propose_with_marked_padding(has_moe=False) == [False] * 3 + [True] * 13
 
 
 def test_dummy_draft_forward_marks_all_rows_padding(monkeypatch):
     proposer = _make_proposer(draft_tp=1)
+    proposer._draft_has_moe_cache = True
     proposer.speculative_config.num_speculative_tokens = 3
     proposer.runner = SimpleNamespace(
         device=torch.device("cpu"),

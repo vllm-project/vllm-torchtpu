@@ -97,6 +97,8 @@ def _draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
 
     Missing a MoE draft here is a hang, not an error: under EP-DP lockstep
     the busy rank's draft forward waits on all-to-alls that the idle ranks never issue.
+    It would also leave such a draft reading the target's token-padding mask
+    (`DFlashProposer._mark_draft_padding`), dropping real draft rows.
     """
     from vllm.model_executor.layers.fused_moe import MoERunner
     from vllm.model_executor.models.interfaces import is_mixture_of_experts
@@ -777,7 +779,7 @@ class DFlashProposer:
             )
             # The padding mask still describes the target's last chunk; a
             # MoE draft layer would skip real draft rows past its valid count.
-            token_padding.mark_padding(chunk.num_reqs * block_size, padded_len)
+            self._mark_draft_padding(chunk.num_reqs * block_size, padded_len)
 
             with (
                 # Precomputed so set_forward_context does not run its
@@ -1003,7 +1005,7 @@ class DFlashProposer:
         )
         # Every row of a dummy draft forward is padding, as in the runner's
         # warmup steps.
-        token_padding.mark_padding(0, num_tokens)
+        self._mark_draft_padding(0, num_tokens)
 
         with (
             # Same contract as propose(): precomputed DP metadata, no
@@ -1059,12 +1061,26 @@ class DFlashProposer:
             return False
         if not self._draft_replicated:
             return True
-        # Model-static: resolve once, not on every decode step.
+        if self.draft_model is None:
+            return False
+        return self._draft_has_moe()
+
+    def _draft_has_moe(self) -> bool:
+        """Whether the loaded draft has MoE layers; model-static, so resolved
+        once, not on every decode step."""
         if self._draft_has_moe_cache is None:
-            if self.draft_model is None:
-                return False
+            assert self.draft_model is not None
             self._draft_has_moe_cache = _draft_has_moe_layers(self.draft_model)
         return self._draft_has_moe_cache
+
+    def _mark_draft_padding(self, num_valid_tokens: int, num_padded_tokens: int):
+        """Describe a draft forward's rows in the shared padding mask.
+
+        Only MoE layers read the mask, so a MoE-free draft leaves the target's
+        mask in place, and steady decode does not rewrite it twice per step.
+        """
+        if self._draft_has_moe():
+            token_padding.mark_padding(num_valid_tokens, num_padded_tokens)
 
     @torch.no_grad()
     def run_dp_dummy_context(self, num_chunks: int) -> None:
