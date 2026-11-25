@@ -507,12 +507,19 @@ def test_peer_replay_claims_falls_back_to_rotated_without_fingerprint(
 ):
     """When a graph cannot be fingerprinted, claims falls back to the rotated
     order (wait=0) instead of the static deal."""
+    from vllm_torchtpu.runner.utils import PEER_REPLAY_RUN_ID_KEY
+
     monkeypatch.setattr(tpu_compiler, "_graph_fingerprint", lambda graph: None)
     _host(monkeypatch, 8)
     monkeypatch.setenv("LOCAL_RANK", "1")
     calls = []
     cache_dir = str(tmp_path / "hash1" / "rank_0_0" / "backbone")
-    vllm_config = SimpleNamespace(additional_config={"peer_replay_scheduler": "claims"})
+    vllm_config = SimpleNamespace(
+        additional_config={
+            "peer_replay_scheduler": "claims",
+            PEER_REPLAY_RUN_ID_KEY: "test_run",
+        }
+    )
     backend = SimpleNamespace(
         graph=object(),
         vllm_config=vllm_config,
@@ -551,6 +558,8 @@ def test_peer_replay_claims_falls_back_on_oserror(
     compile_all_ranges, monkeypatch, tmp_path
 ):
     """Read-only / unwritable claim directories fall back to rotated order."""
+    from vllm_torchtpu.runner.utils import PEER_REPLAY_RUN_ID_KEY
+
     monkeypatch.setattr(tpu_compiler, "_graph_fingerprint", lambda graph: "fp" * 16)
     monkeypatch.setattr(
         os,
@@ -561,7 +570,12 @@ def test_peer_replay_claims_falls_back_on_oserror(
     monkeypatch.setenv("LOCAL_RANK", "0")
     calls = []
     cache_dir = str(tmp_path / "hash1" / "rank_0_0" / "backbone")
-    vllm_config = SimpleNamespace(additional_config={"peer_replay_scheduler": "claims"})
+    vllm_config = SimpleNamespace(
+        additional_config={
+            "peer_replay_scheduler": "claims",
+            PEER_REPLAY_RUN_ID_KEY: "test_run",
+        }
+    )
     backend = SimpleNamespace(
         graph=object(),
         vllm_config=vllm_config,
@@ -845,55 +859,3 @@ def test_peer_replay_prunes_each_cache_root_once_per_process(
     assert not (
         tmp_path / "torch_compile_cache" / "hash1" / "peer_claims" / "old_run"
     ).exists()
-
-
-def test_peer_replay_skips_artifact_without_fp_sidecar_and_writes_fp_first(
-    monkeypatch, tmp_path
-):
-    """Artifacts missing a `.fp` sidecar are skipped without unpickling, and
-    `_save_handle` writes `.fp` before moving the artifact into place."""
-    import pickle
-
-    import torch
-
-    graph = torch.fx.symbolic_trace(lambda x: x + 1)
-
-    class Entry:
-        def __call__(self, *a):
-            return "ok"
-
-        def serialize(self):
-            return "entry"
-
-    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
-    monkeypatch.setattr(tpu_compiler, "_tpu_backend", lambda g, i: Entry())
-    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda e: (lambda *a: e))
-
-    # 1) _save_handle writes .fp before os.replace moves the artifact path.
-    r0 = tpu_compiler.TpuCompilerAdaptor()
-    r0.initialize_cache(cache_dir=str(tmp_path / "hash1" / "rank_0_0" / "backbone"))
-    order: list[str] = []
-    orig_replace = os.replace
-
-    def spy_replace(src, dst):
-        order.append(os.path.basename(dst))
-        return orig_replace(src, dst)
-
-    monkeypatch.setattr(os, "replace", spy_replace)
-    r0.compile(graph, [torch.zeros(4, 4)], {}, Range(4, 4), key="range_4_4")
-    assert order == ["range_4_4.fp", "range_4_4"]
-
-    # 2) _replay_from_peer skips an artifact missing its .fp sidecar (no unpickle).
-    os.remove(tmp_path / "hash1" / "rank_0_0" / "backbone" / "range_4_4.fp")
-    r1 = tpu_compiler.TpuCompilerAdaptor()
-    r1.initialize_cache(cache_dir=str(tmp_path / "hash1" / "rank_1_0" / "backbone"))
-    unpickled = []
-    orig_load = pickle.load
-    monkeypatch.setattr(
-        pickle, "load", lambda f: unpickled.append(f.name) or orig_load(f)
-    )
-    fp = tpu_compiler._graph_fingerprint(graph)
-    assert fp is not None
-    with tpu_compiler.wait_for_peer_artifact(0.0):
-        assert r1._replay_from_peer("range_4_4", graph, False, fp) is None
-    assert unpickled == []

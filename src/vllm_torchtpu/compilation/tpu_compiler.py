@@ -657,6 +657,9 @@ class TpuCompilerAdaptor(CompilerInterface):
                     with open(fp_tmp, "w") as f:
                         f.write(fingerprint)
                     os.replace(fp_tmp, path + _FP_SUFFIX)
+            else:
+                with contextlib.suppress(OSError):
+                    os.remove(path + _FP_SUFFIX)
             # Write-then-rename: a crash or a full disk partway through
             # pickling a 400 MB entry would otherwise leave a truncated file
             # that the next run reads back as a corrupt artifact.
@@ -892,11 +895,6 @@ class TpuCompilerAdaptor(CompilerInterface):
         tmp = f"{dst}.{os.getpid()}.tmp"
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            try:
-                os.link(src, tmp)
-            except OSError:
-                shutil.copyfile(src, tmp)
-            os.replace(tmp, dst)
             src_fp = src + _FP_SUFFIX
             if os.path.exists(src_fp):
                 dst_fp = dst + _FP_SUFFIX
@@ -907,6 +905,11 @@ class TpuCompilerAdaptor(CompilerInterface):
                     except OSError:
                         shutil.copyfile(src_fp, fp_tmp)
                     os.replace(fp_tmp, dst_fp)
+            try:
+                os.link(src, tmp)
+            except OSError:
+                shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
             return True
         except Exception as e:
             logger.warning(

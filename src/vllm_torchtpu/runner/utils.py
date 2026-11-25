@@ -25,7 +25,7 @@ from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
-from vllm_torchtpu import profiler_trace
+from vllm_torchtpu import envs, profiler_trace
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -64,20 +64,25 @@ HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
 )
 
 
-def get_peer_replay_scheduler(vllm_config: Any) -> str | None:
-    """Return `additional_config[PEER_REPLAY_SCHEDULER_KEY]`, or `None`."""
-    if vllm_config is None:
-        return None
-    extra = vllm_config.additional_config
-    return extra.get(PEER_REPLAY_SCHEDULER_KEY) if isinstance(extra, dict) else None
-
-
-def get_peer_replay_run_id(vllm_config: Any) -> str | None:
-    """Return the per-start claim run token from `additional_config`, or `None`."""
-    if vllm_config is None:
-        return None
-    extra = vllm_config.additional_config
-    return extra.get(PEER_REPLAY_RUN_ID_KEY) if isinstance(extra, dict) else None
+def peer_replay_scheduler(vllm_config: Any) -> str:
+    """Return the validated `additional_config` peer-replay scheduler."""
+    extra = vllm_config.additional_config if vllm_config is not None else None
+    if not isinstance(extra, dict) or PEER_REPLAY_SCHEDULER_KEY not in extra:
+        return "static"
+    scheduler = extra[PEER_REPLAY_SCHEDULER_KEY]
+    if scheduler is None:
+        return "static"
+    if scheduler not in ("static", "claims"):
+        raise ValueError(
+            f"additional_config.{PEER_REPLAY_SCHEDULER_KEY} must be 'static' or "
+            f"'claims', got {scheduler!r}"
+        )
+    if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
+        raise ValueError(
+            f"additional_config.{PEER_REPLAY_SCHEDULER_KEY}={scheduler!r} "
+            "requires TPU_PARALLEL_PRECOMPILE=1 and TPU_PRECOMPILE_PEER_REPLAY=1."
+        )
+    return scheduler
 
 
 class InferencePhase(Enum):

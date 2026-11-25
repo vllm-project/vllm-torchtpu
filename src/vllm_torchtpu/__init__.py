@@ -541,12 +541,9 @@ def _patch_vllm_compile_all_ranges() -> None:
             return
 
         from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
-        from vllm_torchtpu.runner.utils import get_peer_replay_scheduler
+        from vllm_torchtpu.runner.utils import peer_replay_scheduler
 
-        scheduler = (
-            get_peer_replay_scheduler(pairs[0][0].vllm_config if pairs else None)
-            or "static"
-        )
+        scheduler = peer_replay_scheduler(pairs[0][0].vllm_config if pairs else None)
         if scheduler == "claims":
             from vllm_torchtpu.compilation.peer_replay import compile_claimed
 

@@ -333,31 +333,18 @@ def _validate_peer_replay_config(vllm_config: "VllmConfig | None" = None) -> Non
     """
     from vllm_torchtpu.runner.utils import (
         PEER_REPLAY_RUN_ID_KEY,
-        get_peer_replay_scheduler,
+        peer_replay_scheduler,
     )
 
-    scheduler = get_peer_replay_scheduler(vllm_config)
-    if scheduler is not None:
-        if scheduler not in ("static", "claims"):
-            raise ValueError(
-                "additional_config.peer_replay_scheduler must be 'static' or "
-                f"'claims', got {scheduler!r}"
-            )
-        if scheduler == "claims" and not (
-            envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY
-        ):
-            raise ValueError(
-                "additional_config.peer_replay_scheduler='claims' requires "
-                "TPU_PARALLEL_PRECOMPILE=1 and TPU_PRECOMPILE_PEER_REPLAY=1."
-            )
-        if (
-            scheduler == "claims"
-            and vllm_config is not None
-            and isinstance(vllm_config.additional_config, dict)
-        ):
-            vllm_config.additional_config.setdefault(
-                PEER_REPLAY_RUN_ID_KEY, uuid.uuid4().hex[:12]
-            )
+    scheduler = peer_replay_scheduler(vllm_config)
+    if (
+        scheduler == "claims"
+        and vllm_config is not None
+        and isinstance(vllm_config.additional_config, dict)
+    ):
+        vllm_config.additional_config.setdefault(
+            PEER_REPLAY_RUN_ID_KEY, uuid.uuid4().hex[:12]
+        )
     if not (envs.TPU_PARALLEL_PRECOMPILE and envs.TPU_PRECOMPILE_PEER_REPLAY):
         return
     # Parse it now, so a bad value fails the launch rather than the precompile

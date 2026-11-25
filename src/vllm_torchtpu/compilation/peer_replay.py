@@ -18,20 +18,18 @@ import itertools
 import os
 import shutil
 import time
-import uuid
 from collections.abc import Callable
 from typing import Any
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import tpu_compiler
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.runner.utils import get_peer_replay_run_id
+from vllm_torchtpu.runner.utils import PEER_REPLAY_RUN_ID_KEY
 
 logger = init_logger(__name__)
 
 _claim_call_counter = itertools.count(1)
 _pruned_claims_roots: set[str] = set()
-_DEFAULT_RUN_ID = uuid.uuid4().hex[:12]
 _STALE_CLAIM_AGE_S = 86400.0
 
 
@@ -57,7 +55,12 @@ def _build_claim_dirs(
     to rotated compilation).
     """
     call_id = str(next(_claim_call_counter))
-    run_id = get_peer_replay_run_id(pairs[0][0].vllm_config) or _DEFAULT_RUN_ID
+    extra = pairs[0][0].vllm_config.additional_config
+    run_id = extra.get(PEER_REPLAY_RUN_ID_KEY) if isinstance(extra, dict) else None
+    if not run_id:
+        raise ValueError(
+            f"Missing {PEER_REPLAY_RUN_ID_KEY!r} in vllm_config.additional_config."
+        )
     claim_dirs: dict[int, str] = {}
     own_rank_dirs: dict[int, str] = {}
     for backend, _ in pairs:

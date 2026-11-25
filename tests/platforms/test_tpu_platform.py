@@ -1599,9 +1599,11 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
 
 
 def test_peer_replay_scheduler_validation(monkeypatch):
-    """additional_config.peer_replay_scheduler rejects unknown values and
-    fails fast when 'claims' is set without peer replay."""
+    """additional_config.peer_replay_scheduler rejects unknown values, rejects
+    being set when peer replay is off, and populates a persistent run token."""
     from types import SimpleNamespace
+
+    from vllm_torchtpu.runner.utils import PEER_REPLAY_RUN_ID_KEY
 
     monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "0")
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "0")
@@ -1611,10 +1613,16 @@ def test_peer_replay_scheduler_validation(monkeypatch):
     with pytest.raises(ValueError, match="peer_replay_scheduler"):
         _validate_peer_replay_config(bad_cfg)
 
-    claims_cfg = SimpleNamespace(additional_config={"peer_replay_scheduler": "claims"})
-    with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_REPLAY=1"):
-        _validate_peer_replay_config(claims_cfg)
+    for mode in ("static", "claims"):
+        cfg = SimpleNamespace(additional_config={"peer_replay_scheduler": mode})
+        with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_REPLAY=1"):
+            _validate_peer_replay_config(cfg)
 
     monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
+    claims_cfg = SimpleNamespace(additional_config={"peer_replay_scheduler": "claims"})
     _validate_peer_replay_config(claims_cfg)
+    token = claims_cfg.additional_config.get(PEER_REPLAY_RUN_ID_KEY)
+    assert isinstance(token, str) and len(token) == 12
+    _validate_peer_replay_config(claims_cfg)
+    assert claims_cfg.additional_config[PEER_REPLAY_RUN_ID_KEY] == token

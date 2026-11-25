@@ -1266,6 +1266,63 @@ class TestTpuCompilerCache:
         assert compiled == [0, 1, 3]
         assert replayed == ["entry-from-rank-1"]
 
+    def test_peer_replay_sidecar_ordering_and_missing_or_stale_fp(
+        self, tmp_path, monkeypatch
+    ):
+        """Sidecar `.fp` is written/linked before the artifact, removed when
+        fingerprint is None, and missing `.fp` skips unpickling."""
+        import os
+        import pickle
+
+        import torch
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        (r0, r1), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=2
+        )
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 1)
+
+        order: list[str] = []
+        orig_replace = os.replace
+
+        def spy_replace(src, dst):
+            order.append(os.path.basename(dst))
+            return orig_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", spy_replace)
+        compile(r0, graph=graph)
+        assert order == ["artifact_bucket.fp", "artifact_bucket"]
+
+        order.clear()
+        with tpu_compiler.wait_for_peer_artifact(0.0):
+            compile(r1, graph=graph)
+        assert order == ["artifact_bucket.fp", "artifact_bucket"]
+        assert replayed == ["entry-from-rank-0"]
+
+        # Removing .fp causes a fresh peer to skip the artifact without unpickling.
+        fp_path = tmp_path / "hash" / "rank_0_0" / "backbone" / "artifact_bucket.fp"
+        fp_path.unlink()
+        (tmp_path / "hash" / "rank_1_0" / "backbone" / "artifact_bucket").unlink()
+        (tmp_path / "hash" / "rank_1_0" / "backbone" / "artifact_bucket.fp").unlink()
+        unpickled = []
+        orig_load = pickle.load
+        monkeypatch.setattr(
+            pickle, "load", lambda f: unpickled.append(f.name) or orig_load(f)
+        )
+        fp = tpu_compiler._graph_fingerprint(graph)
+        assert fp is not None
+        with tpu_compiler.wait_for_peer_artifact(0.0):
+            assert r1._replay_from_peer("artifact_bucket", graph, False, fp) is None
+        assert unpickled == []
+
+        # _save_handle removes any stale .fp when fingerprint is None.
+        fp_path.write_text("stale_fp")
+        r0._save_handle(
+            "artifact_bucket", str(fp_path.with_suffix("")), "e", graph, False, None
+        )
+        assert not fp_path.exists()
+
 
 def test_deserialize_entry_does_not_copy_the_entry():
     """Replay rebuilds the runnable from the entry itself: a deepcopy would load
