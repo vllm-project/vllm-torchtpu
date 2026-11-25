@@ -1299,6 +1299,22 @@ def test_causal_lm_rejects_expert_count_not_divisible_by_ep(text_stack, monkeypa
         text_stack.MuseSparkForCausalLM(vllm_config=vllm_config)
 
 
+@pytest.mark.parametrize(
+    ("prefixes", "message"),
+    [("mlp.gate", "router weight in FP32"), ("mlp.experts", "BF16 or NVFP4 weights")],
+    ids=["router", "experts"],
+)
+def test_causal_lm_rejects_quantize_on_load_of_router_and_experts(
+    text_stack, monkeypatch, prefixes, message
+):
+    """Routing reads the router weight and the expert rows read the experts
+    directly, so an FP8 quantize-on-load method would bypass its scales."""
+    monkeypatch.setenv("QUANTIZE_ON_LOAD_PREFIXES", prefixes)
+    vllm_config = _text_vllm_config(_text_config())
+    with pytest.raises(ValueError, match=message):
+        text_stack.MuseSparkForCausalLM(vllm_config=vllm_config)
+
+
 class _StubAttention(nn.Module):
     """The same linear map for both decoder layers; carries upstream's norm name."""
 

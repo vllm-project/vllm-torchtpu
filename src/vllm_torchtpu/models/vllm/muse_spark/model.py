@@ -89,7 +89,12 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
-from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
+from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4MoEMethod
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedConfig,
+    VllmUnquantizedFusedMoEMethod,
+    VllmUnquantizedLinearMethod,
+)
 from vllm_torchtpu.moe_reference_parity import (
     SILU_BF16_KEY,
     get_moe_reference_parity,
@@ -117,6 +122,18 @@ class MuseRoutedExperts(RoutedExperts):
     TP or EP share; the shared MoE quantization method then lays the weights
     out for gmm_v2.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # _expert_rows reads BF16 or native FP4 experts and their block scales.
+        if not isinstance(
+            self.quant_method, (VllmUnquantizedFusedMoEMethod, VllmNvfp4MoEMethod)
+        ):
+            raise ValueError(
+                f"Muse TPU experts run BF16 or NVFP4 weights, but {self.layer_name} "
+                f"uses {type(self.quant_method).__name__}; QUANTIZE_ON_LOAD_PREFIXES "
+                "must not select the experts"
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded: set[str] = set()
@@ -249,6 +266,12 @@ class MuseMoE(nn.Module):
             quant_config=dense,
             prefix=f"{prefix}.gate",
         )
+        # route() reads the router weight directly, without a quantized matmul.
+        if not isinstance(self.gate.quant_method, VllmUnquantizedLinearMethod):
+            raise ValueError(
+                f"Muse TPU reads the {prefix}.gate router weight in FP32; "
+                "QUANTIZE_ON_LOAD_PREFIXES must not select it"
+            )
         self.gate.register_buffer(
             "e_score_correction_bias",
             torch.zeros(config.num_local_experts, dtype=torch.float32),
