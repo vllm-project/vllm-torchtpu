@@ -396,6 +396,18 @@ def _deferred_shape(block_q: int, ring: tuple, dtype) -> tuple[int, int]:
     return 2 * block_q, _v3_chunk(ring[1], block_q, page_size) // 2 * page_size
 
 
+def _unsigned_div(x: jax.Array, d: int) -> jax.Array:
+    """``x // d`` of a non-negative int32 `x`."""
+    if d & (d - 1) == 0:
+        return jax.lax.shift_right_logical(x, d.bit_length() - 1)
+    return jax.lax.div(x, d)
+
+
+def _unsigned_rem(x: jax.Array, d: int) -> jax.Array:
+    """``x % d`` of a non-negative int32 `x`."""
+    return x & (d - 1) if d & (d - 1) == 0 else jax.lax.rem(x, d)
+
+
 def _v3_chunk(pages_per_step: int, block_q: int, page_size: int) -> int:
     """Pages per dot of `_kernel_v3`: the f32 ``[chunk / 2 * S, 2 Bq]``
     product within twice `_MAX_SCORE_ELEMS`."""
@@ -428,6 +440,7 @@ def _kernel_v3(
     pending=None,
     pair_issue=False,
     issue_chunks=_DMA_ISSUE_CHUNKS,
+    last=None,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     groups (``buf.shape[0]``: `_RING_SLOTS`, the select call's
@@ -465,6 +478,7 @@ def _kernel_v3(
     at the last step after its body. The chunk's maxima, lane assembly and
     store were the step's exposed tail (~500 of a 128-page step's ~1,950
     bundles, AOT). `count` (SMEM) holds the deferring step's scored chunks.
+    `last()`, if given, runs at the last step, after the deferred maxima.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -698,15 +712,31 @@ def _kernel_v3(
 
     # One straight-line body per slot and count of scored chunks, so that a
     # chunk's matmuls overlap the previous chunk's maxima.
-    live_chunks = jnp.minimum(-(-live // chunk), num_chunks)
-    for slot in range(slots):
+    # live >= 1 and step >= 0: unsigned quotients, which skip signed
+    # division's corrections.
+    live_chunks = jnp.minimum(_unsigned_div(live + chunk - 1, chunk), num_chunks)
+    step_slot = _unsigned_rem(step, slots)
+
+    def slot_bodies(slot):
         for i, n in enumerate(counts):
             lo = counts[i - 1] if i else 0
-            pl.when((step % slots == slot) & (live_chunks > lo) & (live_chunks <= n))(
+            # Pages below lo * chunk are live: a body runs past lo chunks.
+            pl.when((live_chunks > lo) & (live_chunks <= n))(
                 functools.partial(body, slot, n, lo * chunk)
             )
-    if deferring:
-        pl.when(step == num_steps - 1)(lambda: flush(step, True))
+
+    # Nested, a step passes slots + len(counts) branches, not their product.
+    for slot in range(slots):
+        pl.when(step_slot == slot)(functools.partial(slot_bodies, slot))
+
+    def last_step():
+        if deferring:
+            flush(step, True)
+        if last is not None:
+            last()
+
+    if deferring or last is not None:
+        pl.when(step == num_steps - 1)(last_step)
 
 
 class RowSelect(NamedTuple):
@@ -894,25 +924,6 @@ def _kernel_v3_select(
                 page = merged_keys[pl.ds(written_run, 1), :, 0, :]
                 buf[slot, pl.ds(written, 1)] = page
 
-    _kernel_v3(
-        work_ref,
-        tile_seq_ref,
-        block_tables_ref,
-        seq_pages_ref,
-        q_ref,
-        cache_ref,
-        None,
-        buf,
-        sems,
-        store=store,
-        prologue=prologue,
-        on_pages=on_pages,
-        table_width=table_width,
-        pending=(*pending, store_at),
-        pair_issue=pair_issue,
-        issue_chunks=_SELECT_DMA_ISSUE_CHUNKS,
-    )
-
     def pick(width):
         for r0 in range(0, num_tokens, _SELECT_ROWS):
             n = min(_SELECT_ROWS, num_tokens - r0)
@@ -922,7 +933,6 @@ def _kernel_v3_select(
             )
             o_ref[pl.ds(r0, n)] = select.pick(s, pos_ref[pl.ds(r0, n)], meta.arg)
 
-    @pl.when(step == pl.num_programs(0) - 1)
     def _select():
         # The narrowest width holding every request's pages.
         most = meta.live_pages
@@ -944,6 +954,27 @@ def _kernel_v3_select(
             )
         if writes is not None:
             each_run(copies(pipe.out_copies, "wait"))
+
+    _kernel_v3(
+        work_ref,
+        tile_seq_ref,
+        block_tables_ref,
+        seq_pages_ref,
+        q_ref,
+        cache_ref,
+        None,
+        buf,
+        sems,
+        store=store,
+        prologue=prologue,
+        on_pages=on_pages,
+        table_width=table_width,
+        pending=(*pending, store_at),
+        pair_issue=pair_issue,
+        issue_chunks=_SELECT_DMA_ISSUE_CHUNKS,
+        # In the last step's branch, behind the deferred chunk's maxima.
+        last=_select,
+    )
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
