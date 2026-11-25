@@ -1500,6 +1500,100 @@ class TestTpuCompilerCache:
         assert a.cache_dir is not None
         assert os.path.samefile(path, os.path.join(a.cache_dir, key))
 
+    @pytest.mark.parametrize("peer_replay", ["1", None])
+    def test_load_refuses_another_ranks_rank_dependent_artifact(
+        self, tmp_path, monkeypatch, peer_replay
+    ):
+        """A cache written before rank salting can hold rank 0's artifact of
+        a rank-dependent graph hard-linked into rank 1's dir. `load` on rank 1
+        recompiles instead of serving rank 0's shard and overwrites the entry;
+        rank 0 still replays its own artifact."""
+        import pickle
+
+        import torch
+        import torch.distributed as dist
+        from vllm.config.utils import Range
+
+        from tests.compilation.test_rank_dependent_fingerprint import SP
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, peer_replay=peer_replay
+        )
+        rank = {"value": 0}
+        monkeypatch.setattr(dist, "is_available", lambda: True)
+        monkeypatch.setattr(dist, "is_initialized", lambda: True)
+        monkeypatch.setattr(dist, "get_rank", lambda: rank["value"])
+
+        _, handle_a = compile(a, torch.fx.symbolic_trace(SP()))
+        key, path_a, was_wrapped = handle_a
+        with open(path_a, "rb") as f:
+            assert pickle.load(f).fingerprint is not None
+        assert b.cache_dir is not None
+        os.makedirs(b.cache_dir)
+        path_b = os.path.join(b.cache_dir, key)
+        os.link(path_a, path_b)
+
+        def load(compiler, path):
+            return compiler.load(
+                (key, path, was_wrapped),
+                torch.fx.symbolic_trace(SP()),
+                [],
+                0,
+                Range(start=1, end=4096),
+            )
+
+        rank["value"] = 0
+        assert load(a, path_a)() == "entry-from-rank-0"
+        assert compiled == [0]
+
+        rank["value"] = 1
+        b.rank = 1
+        monkeypatch.setattr(
+            "vllm_torchtpu.compilation.tpu_compiler._tpu_backend",
+            lambda graph, example_inputs: compiled.append(1) or (lambda *a: (1,)),
+        )
+        replayed.clear()
+        assert load(b, path_b)() == 1
+        assert compiled == [0, 1]
+        assert replayed == []
+
+    def test_load_recompiles_a_rank_dependent_artifact_without_fingerprint(
+        self, tmp_path, monkeypatch
+    ):
+        """An artifact saved before rank salting carries no fingerprint, so
+        `load` cannot tell whose shard it holds and recompiles it."""
+        import pickle
+
+        import torch
+        from vllm.config.utils import Range
+
+        from tests.compilation.test_rank_dependent_fingerprint import SP
+
+        (a, _), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, peer_replay=None
+        )
+        _, (key, path, was_wrapped) = compile(a, torch.fx.symbolic_trace(SP()))
+        # `compile` runs the artifact it just saved; only `load` matters here.
+        replayed.clear()
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+        payload.fingerprint = None
+        with open(path, "wb") as f:
+            pickle.dump(payload, f)
+
+        a.load(
+            (key, path, was_wrapped),
+            torch.fx.symbolic_trace(SP()),
+            [],
+            0,
+            Range(start=1, end=4096),
+        )
+        assert compiled == [0, 0]
+        # Only the recompiled artifact runs, reloaded after it is overwritten.
+        assert replayed == ["entry-from-rank-0"]
+        with open(path, "rb") as f:
+            assert pickle.load(f).fingerprint is not None
+
 
 def test_deserialize_entry_does_not_copy_the_entry():
     """Replay rebuilds the runnable from the entry itself: a deepcopy would load
