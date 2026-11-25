@@ -55,9 +55,16 @@ def quantized_matmul(x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor):
 
 def quantize_head_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """`(w_q [H, V] float8_e4m3fn, w_s [V] float32)` of a `[V, H]` head shard: one
-    scale per vocab row (absmax / 448), canonical (k, n) layout for the matmul."""
+    scale per vocab row (absmax / 448), canonical (k, n) layout for the matmul.
+
+    `w_s` is an owned buffer: quantize_tensor's scale is a view of a `[V, 1, 1]`
+    tensor (the reshape keeps the view, so `.contiguous()` is a no-op), and torch_tpu
+    runs an eager execute_as_strided before every compiled call that takes a buffer
+    with a view in its history. `clone()` keeps that history, a host round trip does
+    not (megakernel_runtime/operand_hold.py). Same values, ~V*4 bytes once at load."""
     q, s = quantize_tensor(weight.to(torch.float32).t(), torch.float8_e4m3fn, axis=0)
-    return q.contiguous(), s.reshape(weight.shape[0]).contiguous()
+    s = s.reshape(weight.shape[0])
+    return q.contiguous(), s.to("cpu", copy=True).to(s.device)
 
 
 class _Fp8HeadMethod:
