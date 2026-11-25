@@ -90,7 +90,8 @@ def logprobs_lists(
 
 @dataclass
 class AsyncTPUCopyState:
-    """Async D2H copy state for sampled tokens.
+    """Async D2H copy state for a step's sampled tokens, their logprobs and
+    the step's prompt logprobs.
 
     Per-chunk device tensors are kept at their bucketed (padded) shapes so
     each D2H copy hits a precompiled program. Host-side trim and concat

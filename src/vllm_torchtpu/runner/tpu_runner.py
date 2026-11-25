@@ -5969,6 +5969,9 @@ class TPUModelRunner(GPUModelRunner):
 
         next_tokens_tpu = None
         copy_state = None
+        # Prompt rows come only from steps that sample, whose copy carries them.
+        # Checked before prepare() changes any request state.
+        assert combined_selected_tokens or not state.prompt_logprobs_chunks
         pending_prompt_logprobs = prompt_logprobs.prepare(
             state.prompt_logprobs_chunks, self.requests, self.num_prompt_logprobs
         )
@@ -5980,8 +5983,6 @@ class TPUModelRunner(GPUModelRunner):
                     logprobs=logprobs_chunks,
                     prompt_logprobs=pending_prompt_logprobs,
                 )
-        # Prompt rows come only from steps that sample.
-        assert copy_state is not None or pending_prompt_logprobs is None
 
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()

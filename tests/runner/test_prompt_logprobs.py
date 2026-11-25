@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Prompt logprobs through TPUModelRunner._prompt_logprobs_chunk and emit.
+"""Prompt logprobs through TPUModelRunner._prompt_logprobs_chunk, prepare and
+PendingPromptLogprobs.fill.
 
 The runner's own compute_selected_logits and gather_logprobs run eagerly on
 CPU over a linear LM head, and every step's result is checked against a
@@ -24,7 +25,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from runner_output_test_utils import _sample_tokens_runner, run_sample_tokens
 from vllm.distributed import parallel_state
+from vllm.v1.outputs import LogprobsTensors
 
 from vllm_torchtpu.runner import prompt_logprobs
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -359,3 +362,50 @@ def test_last_logits_call_pads_to_its_own_bucket_outside_lockstep():
     runner.compute_selected_logits = compute_selected_logits
     _run_steps(runner, [[{"d": 19, "a": 7}]], 32)
     assert sizes == [16, 8]
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_sample_tokens_returns_prompt_logprobs_through_the_async_copy(
+    async_scheduling,
+):
+    """sample_tokens hands the step's prompt rows to the async output copy,
+    and the output carries them once read, under either scheduling."""
+    runner = _sample_tokens_runner(
+        [torch.tensor([[0.0, 1.0]])],
+        [1],
+        scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+    )
+    request = runner.requests["r0"]
+    request.prompt_token_ids = [5, 6, 7]
+    request.in_progress_prompt_logprobs_cpu = None
+    runner.num_prompt_logprobs = {"r0": 1}
+    rows = LogprobsTensors(
+        logprob_token_ids=torch.tensor([[6, 1], [7, 2]], dtype=torch.int32),
+        logprobs=torch.tensor([[-0.5, -0.1], [-0.25, -0.2]]),
+        selected_token_ranks=torch.tensor([3, 4], dtype=torch.int32),
+    )
+    span = prompt_logprobs.PromptLogprobsSpan(
+        "r0", hidden_start=0, prompt_row_start=0, num_rows=2, completes_prompt=True
+    )
+    runner.execute_model_state.prompt_logprobs_chunks = [
+        prompt_logprobs.PromptLogprobsChunk([span], [(rows, 2)])
+    ]
+
+    output = run_sample_tokens(runner)
+    if async_scheduling:
+        output = output.get_output()
+
+    result = output.prompt_logprobs_dict["r0"]
+    assert torch.equal(result.logprob_token_ids, rows.logprob_token_ids)
+    assert torch.equal(result.logprobs, rows.logprobs)
+    assert torch.equal(result.selected_token_ranks, rows.selected_token_ranks)
+    assert runner.num_prompt_logprobs == {}
+
+
+def test_prepare_fails_on_planned_rows_that_were_not_scored():
+    """Caught on the runner thread, not later in fill() on the output thread."""
+    span = prompt_logprobs.PromptLogprobsSpan("a", 0, 0, 2, False)
+    with pytest.raises(AssertionError):
+        prompt_logprobs.prepare(
+            [prompt_logprobs.PromptLogprobsChunk([span])], _runner().requests, {"a": 1}
+        )

@@ -261,6 +261,9 @@ def prepare(
                 )
                 request.in_progress_prompt_logprobs_cpu = buffer
             if span.num_rows:
+                # Planned rows were scored (_score_prompt_logprobs); fail here,
+                # not in fill() on the output thread.
+                assert chunk.slices, span
                 writes.append(
                     _Write(
                         buffer=buffer,
