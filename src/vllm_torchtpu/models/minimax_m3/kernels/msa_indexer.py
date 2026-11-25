@@ -217,7 +217,7 @@ def _page_tokens(rows_per_page: int, dtype) -> int:
 # Pages per dot in `_kernel_v3`: 2 x 16 pages, paired along the contraction.
 _PAGES_PER_CHUNK = 32
 # `_kernel_v3` issues the ahead group's descriptors during its first chunks.
-_DMA_ISSUE_CHUNKS = 2
+_DMA_ISSUE_CHUNKS = 4
 # Page groups in `_kernel_v3`'s DMA ring.
 _RING_SLOTS = 3
 # Page descriptors per iteration of `_kernel_v3`'s step-0 issue loop (even:
@@ -479,9 +479,10 @@ def _kernel_v3(
     next_base, next_live = ahead_group(step + ahead)
     q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
     num_chunks = pages_per_step // chunk
-    # The ahead group's descriptors, spread over the first chunks' page pairs
-    # (in one chunk they crowd its scalar slots, in all chunks they issue
-    # late: both slower, benches j-9956cd34 / j-2e0b290e).
+    # The ahead group's descriptors, spread over the page pairs of up to
+    # `_DMA_ISSUE_CHUNKS` chunks: in one chunk they crowd its scalar slots
+    # (bench j-9956cd34); the group is used two steps later, so the last
+    # chunks still issue in time.
     issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
     per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
