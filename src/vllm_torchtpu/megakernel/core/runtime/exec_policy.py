@@ -74,6 +74,9 @@ def _parse_tri_flag(val: Any, *, true_extra: str, name: str) -> bool | str:
 
 
 def _parse_int(val: Any, name: str) -> int:
+    # A JSON bool or float is rejected like the string "4.5" is.
+    if isinstance(val, (bool, float)):
+        raise ValueError(f"Megakernel: invalid {name}={val!r}; expected an integer")
     try:
         return int(val)
     except (TypeError, ValueError):

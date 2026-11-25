@@ -62,8 +62,8 @@ class StepMetaOps(Protocol):
     def lt_zero(self, x: Any) -> Any: ...
     def logical_and(self, a: Any, b: Any) -> Any: ...
     def check_distinct_cols_2d(self, ckpt_g: Any, T: int) -> None:
-        """`check_ckpt_write_cols_distinct` on a host value; a no-op on traced
-        or device values (`pack_step_meta(validate=True)` only)."""
+        """`check_ckpt_write_cols_distinct` on a concrete value; a no-op on
+        traced values (`pack_step_meta(validate=True)` only)."""
         ...
 
 
