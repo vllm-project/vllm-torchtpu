@@ -59,16 +59,16 @@ _EXPECTED_MOE_RUNNER_FORWARD_PARAMS = (
 )
 
 
-def _check_upstream_forward_signature(forward_fn: Callable) -> None:
-    params = tuple(inspect.signature(forward_fn).parameters)
+def check_upstream_forward_signature(forward_fn: Callable | None = None) -> None:
+    """Verify upstream MoERunner.forward still matches the signature static
+    dispatch relies on (called when arming static dispatch, not at import)."""
+    fn = MoERunner.forward if forward_fn is None else forward_fn
+    params = tuple(inspect.signature(fn).parameters)
     if params != _EXPECTED_MOE_RUNNER_FORWARD_PARAMS:
         raise RuntimeError(
             f"MoERunner.forward signature changed: expected "
             f"{_EXPECTED_MOE_RUNNER_FORWARD_PARAMS}, got {params}"
         )
-
-
-_check_upstream_forward_signature(MoERunner.forward)
 
 
 @MoERunner.register_oot

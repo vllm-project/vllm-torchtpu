@@ -99,7 +99,12 @@ def _glm_runner(mlp, *, n=2, h=256, i=128, e=4, dtype=torch.bfloat16):
     qm._tpu_activation_str = "silu"
     par = SimpleNamespace(use_ep=True, ep_size=n, dp_size=1, tp_size=n)
     return SimpleNamespace(
-        moe_config=SimpleNamespace(moe_parallel_config=par, in_dtype=dtype),
+        moe_config=SimpleNamespace(
+            moe_parallel_config=par,
+            in_dtype=dtype,
+            hidden_dim=h,
+            hidden_dim_unpadded=h,
+        ),
         _quant_method=qm,
         routed_experts=SimpleNamespace(
             w13_weight=torch.zeros((e, h, 2 * i), dtype=torch.float8_e4m3fn),
@@ -860,6 +865,8 @@ def test_arm_static_dispatch_preserves_shared_experts_and_scaling(monkeypatch, c
     runner.moe_config = SimpleNamespace(
         moe_parallel_config=par,
         in_dtype=torch.bfloat16,
+        hidden_dim=256,
+        hidden_dim_unpadded=256,
         skip_final_all_reduce=False,
         experts_per_token=8,
         num_experts=8,
@@ -949,6 +956,8 @@ def test_arm_and_forward_declines_when_moe_owns_collectives(monkeypatch, flag):
     runner.moe_config = SimpleNamespace(
         moe_parallel_config=par,
         in_dtype=torch.bfloat16,
+        hidden_dim=256,
+        hidden_dim_unpadded=256,
         skip_final_all_reduce=False,
         experts_per_token=8,
         num_experts=8,
@@ -1418,16 +1427,19 @@ def test_static_dispatch_routing_matches_stock_moe_runner(
     assert torch.equal(decode_routing[0][1], exp_weights)
 
 
-def test_upstream_forward_signature_canary():
-    """The import-time signature canary passes on pinned MoERunner.forward and
-    fails loudly if upstream reorders, renames, or adds parameters."""
+def test_upstream_forward_signature_canary(monkeypatch):
+    """The arm-time signature canary passes on pinned MoERunner.forward and
+    fails loudly when static dispatch arms if upstream reorders, renames, or
+    adds parameters, while leaving kernel-off and non-static paths unaffected."""
+    import vllm.distributed
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
     from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import (
-        _check_upstream_forward_signature,
+        VllmMoERunner,
+        check_upstream_forward_signature,
     )
 
-    _check_upstream_forward_signature(MoERunner.forward)
+    check_upstream_forward_signature(MoERunner.forward)
 
     def swapped(
         self, hidden_states, router_logits, shared_experts_input=None, input_ids=None
@@ -1449,7 +1461,79 @@ def test_upstream_forward_signature_canary():
 
     for bad_fn in (swapped, renamed, extra):
         with pytest.raises(RuntimeError, match="MoERunner.forward signature changed"):
-            _check_upstream_forward_signature(bad_fn)
+            check_upstream_forward_signature(bad_fn)
+
+    # Verify arm_fused_moe_decode invokes the canary only when arming static
+    # dispatch, leaving kernel-off and non-static (pcp_size > 1) paths alone.
+    monkeypatch.setattr(MoERunner, "forward", swapped)
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(
+        bridge, "build_ep_mesh", lambda: SimpleNamespace(shape={EP_AXIS_NAME: 2})
+    )
+    monkeypatch.setattr(bridge, "ep_mesh_index", lambda: 0)
+    monkeypatch.setattr(bridge, "_check_vmem", lambda *a, **k: None)
+    monkeypatch.setattr(
+        bridge, "_check_same_arming_on_every_rank", lambda *a, **k: None
+    )
+    monkeypatch.setattr(bridge, "_RANK_BUFFER", None)
+    monkeypatch.setattr(bridge, "_build_op", lambda *a, **k: _DECODE_UNGATED_OP)
+
+    def _build_model(*, pcp_size: int) -> torch.nn.Module:
+        qm = VllmFp8MoEMethodTPU.__new__(VllmFp8MoEMethodTPU)
+        qm._tpu_activation_str = "silu"
+        qm._tpu_topk_weights_float32 = False
+        qm.moe_kernel = None
+        par = SimpleNamespace(
+            use_ep=True, ep_size=2, ep_rank=0, dp_size=1, tp_size=2, pcp_size=pcp_size
+        )
+        runner = VllmMoERunner.__new__(VllmMoERunner)
+        torch.nn.Module.__init__(runner)
+        runner.layer_name = "model.layers.0.mlp.experts"
+        runner.moe_config = SimpleNamespace(
+            moe_parallel_config=par,
+            in_dtype=torch.bfloat16,
+            hidden_dim=256,
+            hidden_dim_unpadded=256,
+            skip_final_all_reduce=False,
+            experts_per_token=8,
+            num_experts=8,
+            ep_size=2,
+            ep_rank=0,
+        )
+        runner.routed_experts = SimpleNamespace(
+            quant_method=qm,
+            moe_config=runner.moe_config,
+            global_num_experts=8,
+            w13_weight=torch.zeros((4, 256, 256), dtype=torch.float8_e4m3fn),
+            w2_weight=torch.zeros((4, 128, 256), dtype=torch.float8_e4m3fn),
+            w13_weight_scale_inv=torch.ones((4, 1, 1, 256)),
+            w2_weight_scale_inv=torch.ones((4, 1, 1, 256)),
+            _experts_start=torch.tensor(0, dtype=torch.int32),
+            register_buffer=lambda *a, **k: None,
+        )
+        runner.routed_input_transform = None
+        runner.routed_output_transform = None
+        runner.routed_scaling_factor = 2.5
+        runner.shared_expert_gate = None
+        runner._shared_experts = SimpleNamespace(_layer=DeepseekV2MLP(256, 128))
+        model = torch.nn.Module()
+        model.add_module("runner", runner)
+        return model
+
+    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL", False)
+    assert bridge.arm_fused_moe_decode(_build_model(pcp_size=1)) == 0
+
+    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL", True)
+    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 64)
+    # Non-static dispatch (pcp_size > 1) does not take VllmMoERunner.forward's
+    # fast path, so it still arms without hitting the static-dispatch canary.
+    assert bridge.arm_fused_moe_decode(_build_model(pcp_size=2)) == 1
+
+    # Static dispatch (dp_size == 1, pcp_size == 1) refuses to arm.
+    with pytest.raises(RuntimeError, match="MoERunner.forward signature changed"):
+        bridge.arm_fused_moe_decode(_build_model(pcp_size=1))
 
 
 @pytest.mark.parametrize("gated", [False, True])

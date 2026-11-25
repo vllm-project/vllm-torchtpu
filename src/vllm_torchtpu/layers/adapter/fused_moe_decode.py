@@ -551,10 +551,9 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     i_s = shared_w2.shape[0]  # the shared expert is a TP slice, even under EP
     # Match MoERunner.forward: the static-dispatch fast path skips
     # _maybe_pad_hidden_states and output truncation, so decline padded dims.
-    unpadded_h = getattr(cfg, "hidden_dim_unpadded", None)
     if (
-        getattr(cfg, "hidden_dim", h) != h
-        or (unpadded_h not in (None, 0) and unpadded_h != h)
+        cfg.hidden_dim != h
+        or (cfg.hidden_dim_unpadded not in (None, 0) and cfg.hidden_dim_unpadded != h)
         or qm.has_unpadded_output
     ):
         return None
@@ -618,7 +617,10 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         return 0
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
-    from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
+    from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import (
+        VllmMoERunner,
+        check_upstream_forward_signature,
+    )
 
     runners = [m for m in model.modules() if isinstance(m, MoERunner)]
     if not runners:
@@ -650,6 +652,13 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         ),
     )
     _check_same_arming_on_every_rank(signature, what)
+    if any(
+        isinstance(r, VllmMoERunner)
+        and r.moe_config.moe_parallel_config.dp_size == 1
+        and r.moe_config.moe_parallel_config.pcp_size == 1
+        for r, *_ in plan
+    ):
+        check_upstream_forward_signature()
     armed = 0
     static_armed = 0
     for runner, shared, expert_parallel, routed_scale in plan:
