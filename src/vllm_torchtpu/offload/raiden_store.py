@@ -2751,7 +2751,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     "TPURaidenOffloadingConnector: merged compressed keys are not "
                     "combined with VLLM_TPU_OFFLOAD_TIER_CHECK or VLLM_TPU_OFFLOAD_FP4"
                 )
-        elif envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS:
+        elif envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS and not debug_no_mirror:
             key_row_bytes = self._compressed_key_live_bytes(vllm_config)
         main_row_bytes = None
         gdn_row_bytes = None
