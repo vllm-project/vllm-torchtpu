@@ -118,6 +118,76 @@ def test_out_of_block_region_rejected():
         pool_adapters.gather_region(pool, idx, tok0=48, ntok=32, out_dtype=jnp.float32)
 
 
+# Block ids outside a pool of NB blocks: the first past it, below zero, the
+# int32 extremes, one whose `* 2` wraps in int32 to a negative id, and one
+# whose `* 2` wraps back into the pool, to kernel block 2.
+OUTSIDE_IDS = [NB, -1, 2**31 - 1, -(2**31), 2**30 + 1, -(2**31) + 1]
+
+
+def test_out_of_range_block_ids_become_the_null_block():
+    ids = jnp.asarray([0, 1, NB - 1] + OUTSIDE_IDS, dtype=jnp.int32)
+    out = pool_adapters.null_out_of_range_blocks(ids, NB)
+    assert out.dtype == jnp.int32
+    assert out.tolist() == [0, 1, NB - 1] + [0] * len(OUTSIDE_IDS)
+
+
+def _record_kernel_ids(monkeypatch):
+    """Replace pallas_call by a stand-in that records the block ids each
+    scatter kernel would write through and returns the pool unchanged."""
+    seen = []
+
+    def fake_pallas_call(_kernel, **_kwargs):
+        def run(ids, *operands):
+            seen.append(np.asarray(ids).tolist())
+            return operands[-1]
+
+        return run
+
+    monkeypatch.setattr(pool_adapters.pl, "pallas_call", fake_pallas_call)
+    return seen
+
+
+# (split, tok0, ntok, the kernel's ids for the requests [1, *OUTSIDE_IDS]):
+# the direct path, the split window (manager ids), and the per-kernel-block
+# path (manager id * split + kernel block).
+SCATTER_PATHS = [
+    (1, 0, 32, [1] + [0] * len(OUTSIDE_IDS)),
+    (2, 0, 2 * BS, [1] + [0] * len(OUTSIDE_IDS)),
+    (2, BS, 16, [3] + [1] * len(OUTSIDE_IDS)),
+]
+
+
+@pytest.mark.parametrize("split, tok0, ntok, kernel_ids", SCATTER_PATHS)
+def test_scatter_region_writes_ids_outside_the_pool_to_the_null_block(
+    monkeypatch, split, tok0, ntok, kernel_ids
+):
+    seen = _record_kernel_ids(monkeypatch)
+    ids = jnp.asarray([1] + OUTSIDE_IDS, dtype=jnp.int32)
+    ids = ids.at[1].set(NB // split)  # the first id past this split's pool
+    vals = jnp.zeros((ids.shape[0], ntok * KH * PACK, LANES), jnp.bfloat16)
+    pool_adapters.scatter_region(_pool(), vals, ids, tok0=tok0, ntok=ntok, split=split)
+    assert seen == [kernel_ids]
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("split", [1, 3])
+def test_scatter_region_outside_ids_change_no_live_block(split):
+    """On TPU: a request whose id is outside the pool writes only the null
+    block; every live block keeps its bytes except the valid request's."""
+    pool = _arange_pool((12, 16, 2, 128), jnp.bfloat16)
+    before = np.asarray(pool.view(jnp.uint16)).reshape(12 // split, -1)
+    ntok = 16 * split  # whole (manager) blocks
+    mgr_blocks = 12 // split
+    ids = jnp.asarray([1, mgr_blocks, -1, 2**31 - 1], dtype=jnp.int32)
+    vals = jnp.full((4, ntok * 2, 128), 7.0, jnp.bfloat16)
+    pool = pool_adapters.scatter_region(pool, vals, ids, tok0=0, ntok=ntok, split=split)
+    after = np.asarray(pool.view(jnp.uint16)).reshape(mgr_blocks, -1)
+    seven = np.asarray(jnp.full((1,), 7.0, jnp.bfloat16).view(jnp.uint16))[0]
+    assert (after[1] == seven).all()
+    for block in range(2, mgr_blocks):
+        np.testing.assert_array_equal(after[block], before[block])
+
+
 @pytest.mark.tpu_test
 class TestSidePoolGeometry:
     """The envelope side pool: bf16 (nb, 1, rows, 128), same-dtype payload.
