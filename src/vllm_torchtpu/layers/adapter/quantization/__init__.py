@@ -28,7 +28,10 @@ Flow:
 import copy
 
 from vllm.config import VllmConfig
+from vllm.model_executor.layers import quantization as vllm_quantization
+from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.platforms import current_platform
 
 from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
     VllmCompressedTensorsConfig,
@@ -49,6 +52,87 @@ from vllm_torchtpu.layers.core import quant_methods
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+# Built-in map from checkpoint quant method to TPU config class.
+_BUILTIN_QUANT_CONFIGS: dict[str | None, type[VllmQuantConfig]] = {
+    None: VllmUnquantizedConfig,
+    quant_methods.FP8: VllmFp8Config,
+    quant_methods.MXFP4: VllmMxfp4Config,
+    quant_methods.NVFP4: VllmNvfp4Config,
+    quant_methods.MODELOPT_MIXED: VllmModelOptMixedConfig,
+    quant_methods.COMPRESSED_TENSORS: VllmCompressedTensorsConfig,
+    quant_methods.DEEPSEEK_V4_FP8: VllmDeepseekV4Fp8Config,
+    # TODO: Add more quantization methods as needed
+    # quant_methods.AWQ: VllmAWQConfig,
+}
+
+# Checkpoint quant methods that model directories register for themselves.
+_MODEL_QUANT_CONFIGS: dict[str | None, type[VllmQuantConfig]] = {}
+
+
+def register_tpu_quant_config(
+    quant_method: str, config_cls: type[VllmQuantConfig]
+) -> None:
+    """Serve checkpoints whose resolved quant method is `quant_method`.
+
+    `quant_method` is the name vLLM resolves for the checkpoint
+    (`ModelConfig.quantization`, the dispatch key), not the checkpoint's own
+    `quant_method` string. vLLM can rename it with
+    `override_quantization_method`: a ModelOpt NVFP4 checkpoint declares
+    `modelopt` but resolves to `modelopt_fp4`, so a class registered under
+    `modelopt` never serves it.
+
+    Adds the method to the TPU dispatch table and to the current platform's
+    `supported_quantization`, and registers `config_cls` with vLLM under
+    `tpu-<quant_method>`, the name `get_tpu_quantization_config` builds it by.
+    When vLLM's `QUANTIZATION_METHODS` does not list `quant_method`,
+    `config_cls` is also registered under the plain name, so the checkpoint
+    passes vLLM's name check (`ModelConfig._verify_quantization`). A name vLLM
+    already lists (e.g. `mxfp8`) keeps vLLM's own class for that check.
+
+    The table is keyed by method name only: `config_cls` serves every
+    checkpoint in the process that resolves to `quant_method`, whatever its
+    architecture. Names a built-in TPU config serves (the table keys and the
+    names those classes return from `get_name()`, e.g. `unquantized`) cannot
+    be registered.
+
+    Call it at plugin load so it runs in every process, including the one that
+    validates the quant method before the model config is built.
+
+    Raises:
+        ValueError: `config_cls.get_name()` is not `quant_method`, or another
+            class (built-in or registered) already serves `quant_method`.
+    """
+    if config_cls.get_name() != quant_method:
+        raise ValueError(
+            f"{config_cls.__name__}.get_name() returns "
+            f"{config_cls.get_name()!r}, not {quant_method!r}."
+        )
+    served = _builtin_config_for(quant_method) or _MODEL_QUANT_CONFIGS.get(quant_method)
+    if served is not None and served is not config_cls:
+        raise ValueError(
+            f"TPU quant method {quant_method!r} is already served by {served.__name__}."
+        )
+    if served is None:
+        _MODEL_QUANT_CONFIGS[quant_method] = config_cls
+        if quant_method not in vllm_quantization.QUANTIZATION_METHODS:
+            register_quantization_config(quant_method)(config_cls)
+        register_quantization_config(quant_methods.get_tpu_quant_method(quant_method))(
+            config_cls
+        )
+    # Same list vLLM's register_quantization_config extends; a name vLLM
+    # already lists is not added there.
+    supported = current_platform.supported_quantization
+    if supported and quant_method not in supported:
+        supported.append(quant_method)
+
+
+def _builtin_config_for(quant_method: str) -> type[VllmQuantConfig] | None:
+    """Built-in TPU config serving `quant_method` by table key or `get_name()`."""
+    for method, config_cls in _BUILTIN_QUANT_CONFIGS.items():
+        if quant_method in (method, config_cls.get_name()):
+            return config_cls
+    return None
 
 
 def get_tpu_quantization_config(
@@ -71,18 +155,7 @@ def get_tpu_quantization_config(
     """
     model_config = copy.deepcopy(vllm_config.model_config)
 
-    # Map from quant method name to TPU config class
-    method_to_config: dict[str | None, type[VllmQuantConfig]] = {
-        None: VllmUnquantizedConfig,
-        quant_methods.FP8: VllmFp8Config,
-        quant_methods.MXFP4: VllmMxfp4Config,
-        quant_methods.NVFP4: VllmNvfp4Config,
-        quant_methods.MODELOPT_MIXED: VllmModelOptMixedConfig,
-        quant_methods.COMPRESSED_TENSORS: VllmCompressedTensorsConfig,
-        quant_methods.DEEPSEEK_V4_FP8: VllmDeepseekV4Fp8Config,
-        # TODO: Add more quantization methods as needed
-        # quant_methods.AWQ: VllmAWQConfig,
-    }
+    method_to_config = {**_BUILTIN_QUANT_CONFIGS, **_MODEL_QUANT_CONFIGS}
 
     if model_config.quantization not in method_to_config:
         raise NotImplementedError(
