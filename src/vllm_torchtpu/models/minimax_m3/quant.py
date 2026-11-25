@@ -252,27 +252,48 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        columns: int | None = None,
     ) -> torch.Tensor:
+        """``x @ W`` (+ bias), on W's first ``columns`` output columns when
+        given (an e4m3 weight's)."""
         if layer.weight.dtype != torch.float8_e4m3fn:
+            if columns is not None:
+                raise NotImplementedError("column prefixes of an e4m3 weight only")
             return VllmUnquantizedLinearMethod().apply(layer, x, bias)
-        w8 = sp_o_proj.local_weight(layer)
+        w8, scale = _weight_columns(layer, columns)
         rows = math.prod(x.shape[:-1])
         if rows >= _UPCAST_MIN_ROWS and x.dtype == torch.bfloat16:
             weight = _materialized_bf16(w8)
         else:
             weight = w8.to(x.dtype)
         # The scale is a power of two, so this rounds once, like x @ bf16(W).
-        return torch.matmul(x, weight) * layer.weight_scale
+        return torch.matmul(x, weight) * scale
 
     def apply_e4m3_rows(
-        self, layer: torch.nn.Module, q: torch.Tensor, row_scale: torch.Tensor
+        self,
+        layer: torch.nn.Module,
+        q: torch.Tensor,
+        row_scale: torch.Tensor,
+        columns: int | None = None,
     ) -> torch.Tensor:
         """``apply`` of the rows ``q * row_scale`` (e4m3 [T, K], f32 [T, 1]),
         as an e4m3 x e4m3 matmul when the weight is e4m3."""
         if layer.weight.dtype != torch.float8_e4m3fn:
-            return self.apply(layer, (q.float() * row_scale).to(torch.bfloat16))
-        w8 = sp_o_proj.local_weight(layer)
-        return _e4m3_matmul(q, row_scale, w8, layer.weight_scale)
+            x = (q.float() * row_scale).to(torch.bfloat16)
+            return self.apply(layer, x, columns=columns)
+        w8, scale = _weight_columns(layer, columns)
+        return _e4m3_matmul(q, row_scale, w8, scale)
+
+
+def _weight_columns(
+    layer: torch.nn.Module, columns: int | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """This rank's e4m3 [K, N] weight and [N] scale, cut to the first
+    ``columns`` (all when None)."""
+    w8, scale = sp_o_proj.local_weight(layer), layer.weight_scale
+    if columns is None:
+        return w8, scale
+    return w8[:, :columns], scale[:columns]
 
 
 class MiniMaxM3Nvfp4MoEMethod(VllmNvfp4MoEMethod):

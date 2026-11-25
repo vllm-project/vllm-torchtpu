@@ -811,10 +811,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3": env_bool(
         "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3", default=False
     ),
-    # A DCP group spanning several KV heads: every rank projects the K, V and
-    # index_q heads of its whole group itself (qkv_proj carries the group's
-    # columns, models/minimax_m3/dcp_local_kv.py) instead of all-gathering
-    # them over the group each layer.
+    # A DCP group spanning several KV heads: in decode-sized steps every rank
+    # projects the K, V and index_q heads of its whole group itself (qkv_proj
+    # carries the group's columns, models/minimax_m3/dcp_local_kv.py) instead
+    # of all-gathering them over the group each layer.
     "TPU_MINIMAX_M3_DCP_LOCAL_KV": env_bool(
         "TPU_MINIMAX_M3_DCP_LOCAL_KV", default=False
     ),
