@@ -2242,8 +2242,8 @@ def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Arr
 
 def _decode_plan_kernel(
     rank_ref,
-    own_ref,
     peer_ref,
+    own_ref,
     seq_lens_ref,
     cu_ref,
     keys_ref,
@@ -2258,7 +2258,8 @@ def _decode_plan_kernel(
     work,
 ):
     """A DCP pair's decode plan, in VMEM, from this rank's and its peer's
-    packed candidates ``[T, 2 * topk]``: the merged selection
+    packed candidates ``[T, 2 * topk]`` (the peer's as the 16-bit planes of
+    `words_to_u16_planes`, ``[T, >= 4 * topk]``): the merged selection
     (`merge_candidates`' dense ranking), this rank's page keys ``[T, topk]``,
     each token's local page and limit ``[T, 1]`` (`msa.token_positions`) and
     the attention call's work list (`msa_attention_lse.store_work_list`).
@@ -2271,9 +2272,16 @@ def _decode_plan_kernel(
     iota = functools.partial(jax.lax.broadcasted_iota, jnp.int32)
     # Candidates down the sublanes, tokens across the lanes: candidate j's
     # score and block broadcast over sublanes for the compares.
+    width = own_ref.shape[1]
+    planes = peer_ref[...]
+    peer = jax.lax.bitcast_convert_type(
+        planes[:, :width].astype(jnp.uint32)
+        | (planes[:, width : 2 * width].astype(jnp.uint32) << 16),
+        jnp.float32,
+    )
     halves = []
-    for ref in (own_ref, peer_ref):
-        c = ref[...].T  # [2 * topk, T]
+    for cands in (own_ref[...], peer):
+        c = cands.T  # [2 * topk, T]
         halves.append((c[:topk], c[topk : 2 * topk].astype(jnp.int32)))
     places = []
     for s_i, b_i in halves:
@@ -2337,13 +2345,17 @@ def _decode_plan_kernel(
     msa_attention_lse.store_work_list(tile_rows, work_ref, num_tiles=num_tiles, **work)
 
 
-def use_decode_plan(num_tokens: int, topk: int) -> bool:
-    """Whether a DCP pair's decode step of ``num_tokens`` rows attends through
-    `_attend_pair_decode` (8-token tiles whose work list the kernel builds)."""
+def use_decode_plan(num_tokens: int, topk: int, num_heads: int, head_dim: int) -> bool:
+    """Whether a DCP pair's decode step of ``num_tokens`` rows of
+    `num_heads` query heads per rank attends through `_attend_pair_decode`
+    (8-token tiles whose work list the kernel builds, in one grid step, a
+    tile's lse in one 128-lane row of the permute buffer)."""
     block_q = msa_attention.SMALL_BATCH_BLOCK_Q
     return (
         num_tokens % block_q == 0
         and num_tokens <= _PLAN_MAX_TOKENS
+        and 2 * num_heads * block_q == _LANES
+        and head_dim == _LANES
         and _LANES % topk == 0
         and block_q * topk == _LANES
         and msa_attention_lse.fits_work_row(block_q, topk, _SMALL_BATCH_PAGES_PER_STEP)
@@ -2351,10 +2363,10 @@ def use_decode_plan(num_tokens: int, topk: int) -> bool:
 
 
 def _attend_pair_decode(
-    q_all,
+    q,
+    swap,
     kv_cache,
-    own,
-    peer,
+    candidates,
     seq_lens,
     block_tables,
     cu_q_lens,
@@ -2365,37 +2377,16 @@ def _attend_pair_decode(
     scale_cache,
     interpret,
 ):
-    """`msa_attend_dcp` of a pair's decode step, its plan
-    (`_decode_plan_kernel`) run by the attention kernel itself
-    (`msa_attention_lse.planned_attention`)."""
-    num_q_heads, num_tokens, _ = q_all.shape
+    """`msa_attend_dcp` of a pair's decode step over this rank's query heads
+    `q` and the peer's heads and candidates in the permuted `swap` buffer
+    (`swap_buffer`), its plan (`_decode_plan_kernel`) run by the attention
+    kernel itself: `msa_attention_lse.planned_attention`'s ``(out, lse,
+    back)``."""
+    num_heads, num_tokens, _ = q.shape
     block_q = msa_attention.SMALL_BATCH_BLOCK_Q
     pages_per_step = _SMALL_BATCH_PAGES_PER_STEP
-    # Padding tokens (past the query starts: no keys) fill a grid step's
-    # output windows (`msa_attention_lse.token_multiple`).
-    pad = -num_tokens % msa_attention_lse.token_multiple(
-        num_tokens, block_q, num_q_heads, q_all.dtype, scale_cache is not None, False
-    )
-    if pad:
-        q_all = jnp.pad(q_all, ((0, 0), (0, pad), (0, 0)))
-        own, peer = (jnp.pad(x, ((0, pad), (0, 0))) for x in (own, peer))
-        out, lse = _attend_pair_decode(
-            q_all,
-            kv_cache,
-            own,
-            peer,
-            seq_lens,
-            block_tables,
-            cu_q_lens,
-            rank,
-            sm_scale=sm_scale,
-            topk=topk,
-            scale_cache=scale_cache,
-            interpret=interpret,
-        )
-        return out[:, :num_tokens], lse[:, :num_tokens]
     sections, _, tiles_per_step, groups_per_tile = msa_attention_lse.call_work_spec(
-        num_tokens, num_q_heads, q_all.dtype, topk, block_q, pages_per_step
+        num_tokens, 2 * num_heads, q.dtype, topk, block_q, pages_per_step
     )
     plan = functools.partial(
         _decode_plan_kernel,
@@ -2412,12 +2403,13 @@ def _attend_pair_decode(
     )
     i32 = jnp.int32
     return msa_attention_lse.planned_attention(
-        q_all,
+        q,
+        swap,
         kv_cache,
         block_tables.reshape(-1),
         plan,
         rank_array(rank),
-        (own, peer, seq_lens.astype(i32)[None], cu_q_lens.astype(i32)[None]),
+        (candidates, seq_lens.astype(i32)[None], cu_q_lens.astype(i32)[None]),
         topk=topk,
         sm_scale=sm_scale,
         block_q=block_q,
@@ -2429,6 +2421,112 @@ def _attend_pair_decode(
             else dict(scale_cache=scale_cache, scale_rows=(0, 1))
         ),
     )
+
+
+def _merge_pair_decode_kernel(out_ref, lse_ref, back_ref, *rest, rotated):
+    """`_merge_partials_kernel` of a pair's decode step: this rank's partial
+    of its heads (``out_ref [Hl, T, D]``, lse ``lse_ref [1, tiles, 1, 2 Hl *
+    Bq]`` lanes ``[0, Hl * Bq)``) and the peer's, from ``back_ref [Hl + 1,
+    T, D]`` (`planned_attention`'s `back`), (``hadamard [D, D]``), ``o_ref
+    [T, Hl * D]``. The same arithmetic in the same order."""
+    o_ref = rest[-1]
+    num_heads, num_tokens, head_dim = out_ref.shape
+    num_tiles = lse_ref.shape[1]
+    block_q = num_tokens // num_tiles
+    half = num_heads * block_q
+    planes = back_ref[num_heads, : 2 * num_tiles].astype(jnp.uint32)
+    peer = planes[:num_tiles] | (planes[num_tiles:] << 16)
+    rows = -(-num_tiles // 8) * 8
+
+    def columns(x):  # [tiles, 128] -> [128, tiles]: tile i's lanes down column i
+        return jnp.pad(x, ((0, rows - num_tiles), (0, 0))).T[:, :num_tiles]
+
+    # This rank's heads: lanes [0, half) of its own rows, [half, 2 half) of
+    # the peer's (the peer's lanes of its own heads come second).
+    lse = jnp.stack(
+        [
+            columns(lse_ref[0, :, 0, :])[:half],
+            columns(pltpu.bitcast(peer, jnp.float32))[half:],
+        ]
+    )
+    peak = jnp.max(lse, axis=0)
+    peak = jnp.where(jnp.isinf(peak), 0.0, peak)
+    total = peak + jnp.log(jnp.sum(jnp.exp(lse - peak[None]), axis=0))
+    weight = jnp.exp(lse - total[None])
+    weight = jnp.where(weight > 0, weight, 0.0)  # [2, half, tiles]
+    parts = (out_ref, back_ref.bitcast(out_ref.dtype))
+    for h in range(num_heads):
+        tiles = []
+        for i in range(num_tiles):
+            merged = None
+            for r in range(2):
+                w = weight[r, h * block_q : (h + 1) * block_q, i : i + 1]
+                w = jnp.broadcast_to(w, (block_q, head_dim))
+                part = parts[r][h, i * block_q : (i + 1) * block_q, :]
+                term = part.astype(jnp.float32) * w
+                merged = term if merged is None else merged + term
+            tiles.append(merged)
+        merged = jnp.concatenate(tiles).astype(o_ref.dtype)
+        if rotated:
+            merged = jnp.dot(merged, rest[0][...], preferred_element_type=jnp.float32)
+            merged = (merged * (1.0 / head_dim)).astype(o_ref.dtype)
+        o_ref[:, h * head_dim : (h + 1) * head_dim] = merged
+
+
+def merge_pair_decode(
+    out: jax.Array,
+    lse: jax.Array,
+    back: jax.Array,
+    hadamard: jax.Array | None = None,
+    *,
+    interpret: bool = False,
+) -> jax.Array:
+    """`merge_partials` of a pair's decode step from what the attention
+    kernel wrote (`msa_attention_lse.planned_attention`): this rank's ``out
+    [2 Hl, T, D]`` (its heads first) and ``lse``, and the peer's ``back``
+    buffer as the permute delivered it -> ``[T, Hl * D]``. Reading the
+    buffers as they are leaves no XLA op between the permute and the merge
+    (c4 b1 twin: ~0.6 us per layer of 16-bit packing, LSE relayouts and
+    copies around the permute, j-02cb6be8)."""
+    num_heads = back.shape[0] - 1
+    _, num_tokens, head_dim = out.shape
+    rotated = hadamard is not None
+
+    def whole(shape):
+        return pl.BlockSpec(shape, lambda i: (0,) * len(shape))
+
+    return pl.pallas_call(
+        functools.partial(_merge_pair_decode_kernel, rotated=rotated),
+        grid=(1,),
+        in_specs=[
+            whole((num_heads, num_tokens, head_dim)),
+            whole(lse.shape),
+            whole(back.shape),
+            *([whole((head_dim, head_dim))] if rotated else []),
+        ],
+        out_specs=whole((num_tokens, num_heads * head_dim)),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, num_heads * head_dim), out.dtype),
+        interpret=interpret,
+        name="minimax_m3_msa_dcp_merge_partials",
+    )(out, lse, back, *([hadamard] if rotated else []))
+
+
+def swap_buffer(x: jax.Array, extra: jax.Array) -> jax.Array:
+    """The 16-bit ``[H + 1, T, D]`` permute buffer of ``x [H, T, D]``
+    (16-bit) and ``extra [T, n]`` (32-bit): `x`'s bits, then `extra`'s as
+    one more head row (`words_to_u16_planes`; every permute start costs ~1
+    us on the TensorCore at decode, c4 twin j-6bbe97e2). As 16-bit integers:
+    float copies may canonicalize NaN or flush subnormal bit patterns."""
+    _, num_tokens, head_dim = x.shape
+    n = extra.shape[1]
+    if x.dtype.itemsize != 2 or extra.dtype.itemsize != 4 or 2 * n > head_dim:
+        raise ValueError(
+            f"16-bit x and 32-bit extra of at most {head_dim // 2} columns, got "
+            f"{x.dtype} {x.shape}, {extra.dtype} {extra.shape}"
+        )
+    bits = words_to_u16_planes(extra)[None]
+    bits = jnp.pad(bits, ((0, 0), (0, 0), (0, head_dim - 2 * n)))
+    return jnp.concatenate([jax.lax.bitcast_convert_type(x, jnp.uint16), bits])
 
 
 def words_to_u16_planes(x: jax.Array) -> jax.Array:
@@ -2449,26 +2547,18 @@ def u16_planes_to_words(planes: jax.Array, n: int, dtype) -> jax.Array:
     return jax.lax.bitcast_convert_type(lo | (hi << 16), dtype)
 
 
+def _swap(x: jax.Array, axis: str) -> jax.Array:
+    """A DCP pair's `x` swapped by one collective permute."""
+    return jax.lax.ppermute(x, axis, [(0, 1), (1, 0)])
+
+
 def _swap_with_row(x: jax.Array, extra: jax.Array, axis: str):
     """A DCP pair's ``x [H, T, D]`` (16-bit) and ``extra [T, n]`` (32-bit)
-    swapped by one collective permute: the bits of `extra` ride as one more
-    uint16 head row (`words_to_u16_planes`; every permute start costs ~1 us
-    on the TensorCore at decode, c4 twin j-6bbe97e2). As 16-bit integers:
-    float copies may canonicalize NaN or flush subnormal bit patterns."""
-    _, num_tokens, head_dim = x.shape
-    n = extra.shape[1]
-    if x.dtype.itemsize != 2 or extra.dtype.itemsize != 4 or 2 * n > head_dim:
-        raise ValueError(
-            f"16-bit x and 32-bit extra of at most {head_dim // 2} columns, got "
-            f"{x.dtype} {x.shape}, {extra.dtype} {extra.shape}"
-        )
-    bits = words_to_u16_planes(extra)[None]
-    bits = jnp.pad(bits, ((0, 0), (0, 0), (0, head_dim - 2 * n)))
-    send = jnp.concatenate([jax.lax.bitcast_convert_type(x, jnp.uint16), bits])
-    got = jax.lax.ppermute(send, axis, [(0, 1), (1, 0)])
+    swapped by one collective permute of their `swap_buffer`."""
+    got = _swap(swap_buffer(x, extra), axis)
     return (
         jax.lax.bitcast_convert_type(got[:-1], x.dtype),
-        u16_planes_to_words(got[-1], n, extra.dtype),
+        u16_planes_to_words(got[-1], extra.shape[1], extra.dtype),
     )
 
 
@@ -2520,6 +2610,28 @@ def attend_and_merge(
         and num_heads % 8 == 0
         and num_tokens > 0
     )
+    if small and use_decode_plan(num_tokens, topk, num_heads, head_dim):
+        # The attention reads the permuted buffer in place and writes the one
+        # it permutes back, which the merge reads as delivered (the order-free
+        # selection and the commuting merge as below).
+        swap = _swap(swap_buffer(q, candidates), axis)
+        out, lse, back = _attend_pair_decode(
+            q,
+            swap,
+            kv_cache,
+            candidates,
+            seq_lens,
+            block_tables,
+            cu_q_lens,
+            rank,
+            sm_scale=sm_scale,
+            topk=topk,
+            scale_cache=scale_cache,
+            interpret=interpret,
+        )
+        return merge_pair_decode(
+            out, lse, _swap(back, axis), hadamard, interpret=interpret
+        )
     if small:
         # Own heads and candidates first, the peer's second: every slice is
         # static (rank-indexed updates and slices of the permute buffers were
@@ -2537,48 +2649,32 @@ def attend_and_merge(
         q_all = (q, jax.lax.ppermute(q, axis, [(0, 1), (1, 0)]))
     else:
         q_all = _gather_heads(q, rank, axis, dcp)
-    if small and use_decode_plan(num_tokens, topk):
-        out, lse = _attend_pair_decode(
-            q_all,
-            kv_cache,
-            candidates,
-            peer_candidates,
-            seq_lens,
-            block_tables,
-            cu_q_lens,
-            rank,
-            sm_scale=sm_scale,
-            topk=topk,
-            scale_cache=scale_cache,
-            interpret=interpret,
-        )
-    else:
-        if dcp == 2 and not small:
-            # `merge_pair_candidates` reads the pair in either order: own
-            # first, by one permute (XLA's all-gather of the [T, 2 * topk]
-            # candidates blocked the TensorCore 15 us per layer at 8K tokens,
-            # j-2e5da13f).
-            peer_candidates = jax.lax.ppermute(candidates, axis, [(0, 1), (1, 0)])
-        cand_all = (
-            jnp.stack([candidates, peer_candidates])
-            if dcp == 2
-            else jax.lax.all_gather(candidates, axis, axis=0)
-        )
-        out, lse = msa_attend_dcp(
-            q_all,
-            kv_cache,
-            cand_all,
-            seq_lens,
-            block_tables,
-            cu_q_lens,
-            sm_scale=sm_scale,
-            topk=topk,
-            rank=rank,
-            dcp=dcp,
-            scale_cache=scale_cache,
-            q_head_major=True,
-            interpret=interpret,
-        )
+    if dcp == 2 and not small:
+        # `merge_pair_candidates` reads the pair in either order: own
+        # first, by one permute (XLA's all-gather of the [T, 2 * topk]
+        # candidates blocked the TensorCore 15 us per layer at 8K tokens,
+        # j-2e5da13f).
+        peer_candidates = jax.lax.ppermute(candidates, axis, [(0, 1), (1, 0)])
+    cand_all = (
+        jnp.stack([candidates, peer_candidates])
+        if dcp == 2
+        else jax.lax.all_gather(candidates, axis, axis=0)
+    )
+    out, lse = msa_attend_dcp(
+        q_all,
+        kv_cache,
+        cand_all,
+        seq_lens,
+        block_tables,
+        cu_q_lens,
+        sm_scale=sm_scale,
+        topk=topk,
+        rank=rank,
+        dcp=dcp,
+        scale_cache=scale_cache,
+        q_head_major=True,
+        interpret=interpret,
+    )
     if small:
         # The peer's partial of this rank's heads (the back half of its own:
         # its heads came first) and their LSEs, in one permute.

@@ -1198,6 +1198,7 @@ def _kernel_scratch(
 
 def planned_attention(
     q,
+    swap,
     kv_cache,
     page_table,
     plan,
@@ -1212,99 +1213,133 @@ def planned_attention(
     scale_cache=None,
     scale_rows=None,
 ):
-    """`msa_sparse_attention_lse` (one KV head, head-major q and results) of
-    a decode step whose selection, local pages and work list the kernel
-    computes itself in its first grid step: ``plan(plan_scalars_ref (SMEM),
-    *plan_input_refs, keys_ref [T, K], local_page_ref [T, 1], local_limit_ref
-    [T, 1], work_ref [1, length])`` (`msa_dcp._decode_plan_kernel`) writes
-    them into scratch, and the work list moves to SMEM there. One kernel in
-    place of a plan kernel and the attention kernel: each Pallas call costs
-    ~1 us plus ~0.2 us per operand (standalone bench j-97afc7d4). The page
-    table, and a one-tile step's queries, load while the plan runs: as a
-    scalar prefetch and a pipelined block they landed before it (c16 b1
-    decode, a 64 KiB table: 5.73 -> 4.71 us per call; c4 b1 4.89 -> 4.69,
-    anvil). Returns ``(out [H, T, D], lse [H, T])``."""
+    """`msa_sparse_attention_lse` (one KV head, head-major) of a DCP pair's
+    decode step, over this rank's query heads ``q [Hl, T, D]`` and the
+    peer's, which arrive as the first `Hl` rows of the permuted 16-bit
+    buffer ``swap [Hl + 1, T, D]`` (bits; `msa_dcp.attend_and_merge`). The
+    kernel computes the selection, local pages and work list itself:
+    ``plan(plan_scalars_ref (SMEM), swap_row_ref [T, D] (swap's last row),
+    *plan_input_refs, keys_ref [T, K], local_page_ref [T, 1],
+    local_limit_ref [T, 1], work_ref [1, length])``
+    (`msa_dcp._decode_plan_kernel`) writes them into scratch, and the work
+    list moves to SMEM. One kernel in place of a plan kernel and the
+    attention kernel: each Pallas call costs ~1 us plus ~0.2 us per operand
+    (standalone bench j-97afc7d4). The page table, and a one-tile step's
+    queries, load while the plan runs: as a scalar prefetch and a pipelined
+    block they landed before it (c16 b1 decode, a 64 KiB table: 5.73 -> 4.71
+    us per call; c4 b1 4.89 -> 4.69, anvil).
+
+    Returns ``(out [2 Hl, T, D], lse [1, T / Bq, 1, 2 Hl * Bq], back [Hl +
+    1, T, D] uint16)``: a tile's lse is a lane-dense row (``h * Bq + t``),
+    and `back` is the permute buffer of the peer's heads: their output's
+    bits and, in its last row, the lse rows' low 16 bits (row ``i`` for
+    tile ``i``) then their high 16 bits (row ``T / Bq + i``), so no XLA op
+    packs it (`msa_dcp.merge_pair_decode` reads it)."""
     num_heads, num_tokens, head_dim = q.shape
+    num_q_heads = 2 * num_heads
     num_tiles = num_tokens // block_q
     sections, length, tiles_per_step, groups_per_tile = call_work_spec(
-        num_tokens, num_heads, q.dtype, topk, block_q, pages_per_step
+        num_tokens, num_q_heads, q.dtype, topk, block_q, pages_per_step
     )
-    rows = tiles_per_step * block_q
+    if (
+        tiles_per_step != num_tiles
+        or num_q_heads * block_q != _LANES
+        or swap.shape != (num_heads + 1, num_tokens, head_dim)
+        or swap.dtype != jnp.uint16
+        or q.dtype.itemsize != 2
+    ):
+        raise ValueError(
+            f"a pair's one-step decode of {num_q_heads} x {block_q}-row tiles in "
+            f"128 lanes and a uint16 swap of {num_heads} + 1 heads, got q "
+            f"{q.dtype} {q.shape}, swap {swap.dtype} {swap.shape}, "
+            f"{num_tiles} tiles of {tiles_per_step} per step"
+        )
     fp4 = scale_rows is not None
     scale_inputs = (scale_cache,) if fp4 else ()
-    # One tile's queries load while the plan runs (as a pipelined block they
-    # landed before it); several tiles take the block, whose layout lowers
+    # One tile's queries load while the plan runs (as pipelined blocks they
+    # landed before it); several tiles take the blocks, whose layout lowers
     # their tiles' 8-row query slices (a VMEM scratch's does not, E2003).
     async_q = num_tiles == 1
 
-    def kernel(head_ref, offset_ref, scalars_ref, q_in, table_hbm, *refs, **kwargs):
+    def kernel(
+        head_ref, offset_ref, scalars_ref, q_in, peer_in, table_hbm, swap_row,
+        *refs, **kwargs,
+    ):  # fmt: skip
         num_plan = len(plan_inputs)
         plan_refs, refs = refs[:num_plan], refs[num_plan:]
-        num_scratch = 8 + async_q
+        num_scratch = 8 + 2 * async_q
         refs, scratch = refs[:-num_scratch], refs[-num_scratch:]
-        keys, local_page, local_limit, work_v, work_s, table_ref = scratch[:6]
-        work_sem, load_sems = scratch[6:8]
-        b = pl.program_id(0)
+        keys, local_page, local_limit, work_v, work_s = scratch[:5]
+        table_ref, work_sem, load_sems = scratch[5:8]
+        outs = 1 + len(scale_inputs)  # o_ref, lse_ref, back_ref after the inputs
+        o_ref, lse_ref, back_ref = refs[outs : outs + 3]
+        refs = refs[: outs + 2] + refs[outs + 3 :]
+        loads = [pltpu.make_async_copy(table_hbm, table_ref, load_sems.at[2])]
         if async_q:
-            q_ref = scratch[8]
-            q_copy = pltpu.make_async_copy(q_in, q_ref, load_sems.at[0])
-            q_copy.start()
+            q_ref, peer_ref = scratch[8:]
+            loads += [
+                pltpu.make_async_copy(q_in, q_ref, load_sems.at[0]),
+                pltpu.make_async_copy(
+                    peer_in.at[pl.ds(0, num_heads)], peer_ref, load_sems.at[1]
+                ),
+            ]
         else:
-            q_ref = q_in
-
-        @pl.when(b == 0)
-        def _plan():
-            table_copy = pltpu.make_async_copy(table_hbm, table_ref, load_sems.at[1])
-            table_copy.start()
-            plan(scalars_ref, *plan_refs, keys, local_page, local_limit, work_v)
-            copy = pltpu.make_async_copy(work_v.at[0], work_s, work_sem)
+            q_ref, peer_ref = q_in, peer_in
+        for copy in loads:
             copy.start()
+        plan(scalars_ref, swap_row, *plan_refs, keys, local_page, local_limit, work_v)
+        work = pltpu.make_async_copy(work_v.at[0], work_s, work_sem)
+        work.start()
+        work.wait()
+        for copy in loads:
             copy.wait()
-            table_copy.wait()
-
-        if async_q:
-            q_copy.wait()
         unions, metas, counts, starts = (work_s.at[pl.ds(at, n)] for at, n in sections)
-        step = pl.ds(pl.multiple_of(b * rows, rows), rows)
-        return _kernel(
+        _kernel(
             unions,
             metas,
             counts,
             table_ref,
             head_ref,
             offset_ref,
-            q_ref,
-            keys.at[step],
-            local_page.at[step],
-            local_limit.at[step],
+            (q_ref, peer_ref.bitcast(q.dtype)),
+            keys,
+            local_page,
+            local_limit,
             *refs,
             block_start_ref=starts,
             **kwargs,
         )
+        # The peer's heads go back as bits, their lse words as two planes.
+        back_ref.bitcast(q.dtype)[:num_heads] = o_ref[num_heads:]
+        words = pltpu.bitcast(lse_ref[0, :, 0, :], jnp.uint32)  # [tiles, 128]
+        planes = jnp.concatenate([words & 0xFFFF, words >> 16])
+        planes = jnp.pad(planes, ((0, num_tokens - 2 * num_tiles), (0, 0)))
+        back_ref[num_heads] = planes.astype(jnp.uint16)
 
     def whole(x):
         return pl.BlockSpec(x.shape, lambda b, *_: (0,) * x.ndim)
 
+    any_space = pl.BlockSpec(memory_space=pl.ANY)
+    heads = pl.BlockSpec((num_heads, num_tokens, head_dim), lambda b, *_: (0, 0, 0))
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=3,
-        grid=(num_tiles // tiles_per_step,),
+        grid=(1,),
         in_specs=[
-            pl.BlockSpec(memory_space=pl.ANY)
-            if async_q
-            else pl.BlockSpec((num_heads, rows, head_dim), lambda b, *_: (0, b, 0)),
-            pl.BlockSpec(memory_space=pl.ANY),
+            any_space if async_q else heads,
+            any_space if async_q else heads,
+            any_space,
+            pl.BlockSpec((None, num_tokens, head_dim), lambda b, *_: (num_heads, 0, 0)),
             *(whole(x) for x in plan_inputs),
-            pl.BlockSpec(memory_space=pl.ANY),
-            *(pl.BlockSpec(memory_space=pl.ANY) for _ in scale_inputs),
+            any_space,
+            *(any_space for _ in scale_inputs),
         ],
         out_specs=[
-            pl.BlockSpec((num_heads, rows, head_dim), lambda b, *_: (0, b, 0)),
-            pl.BlockSpec(
-                (1, tiles_per_step, 1, num_heads * block_q), lambda b, *_: (0, b, 0, 0)
-            ),
+            pl.BlockSpec((num_q_heads, num_tokens, head_dim), lambda b, *_: (0, 0, 0)),
+            pl.BlockSpec((1, num_tiles, 1, _LANES), lambda b, *_: (0, 0, 0, 0)),
+            whole(swap),
         ],
         scratch_shapes=_kernel_scratch(
-            num_heads * block_q,
+            num_q_heads * block_q,
             head_dim,
             pages_per_step,
             kv_cache,
@@ -1325,11 +1360,15 @@ def planned_attention(
             pltpu.SMEM((length,), jnp.int32),
             pltpu.SMEM(page_table.shape, jnp.int32),
             pltpu.SemaphoreType.DMA(()),
-            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((3,)),
         ]
-        + ([pltpu.VMEM((num_heads, rows, head_dim), q.dtype)] if async_q else []),
+        + (
+            [pltpu.VMEM(q.shape, q.dtype), pltpu.VMEM(q.shape, jnp.uint16)]
+            if async_q
+            else []
+        ),
     )
-    out, lse = pl.pallas_call(
+    return pl.pallas_call(
         functools.partial(
             kernel,
             sm_scale=sm_scale,
@@ -1341,8 +1380,9 @@ def planned_attention(
         ),
         grid_spec=grid_spec,
         out_shape=[
-            jax.ShapeDtypeStruct((num_heads, num_tokens, head_dim), q.dtype),
-            jax.ShapeDtypeStruct((1, num_tiles, 1, num_heads * block_q), jnp.float32),
+            jax.ShapeDtypeStruct((num_q_heads, num_tokens, head_dim), q.dtype),
+            jax.ShapeDtypeStruct((1, num_tiles, 1, _LANES), jnp.float32),
+            jax.ShapeDtypeStruct(swap.shape, swap.dtype),
         ],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
@@ -1357,13 +1397,13 @@ def planned_attention(
         jnp.zeros((1,), jnp.int32),
         plan_scalars,
         q,
+        swap,
         page_table,
+        swap,
         *plan_inputs,
         kv_cache,
         *scale_inputs,
     )
-    lse = lse.reshape(num_tiles, num_heads, block_q).transpose(1, 0, 2)
-    return out, lse.reshape(num_heads, num_tokens)
 
 
 def _tiles_per_step(

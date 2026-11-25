@@ -167,8 +167,9 @@ def test_attend_and_merge_matches_dcp_reference(q_lens, ctx_lens, num_tokens, fp
 
 
 def _decode_plan(own, peer, seq_lens, cu, rank, pages_per_seq, pages_per_step):
-    """`msa_dcp._decode_plan_kernel` as a kernel of its own: ``(keys,
-    local_key, local_limit, work)``."""
+    """`msa_dcp._decode_plan_kernel` as a kernel of its own, the peer's
+    candidates as the last row of its permute buffer (`swap_buffer`):
+    ``(keys, local_key, local_limit, work)``."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import tpu as pltpu
 
@@ -199,7 +200,13 @@ def _decode_plan(own, peer, seq_lens, cu, rank, pages_per_seq, pages_per_step):
             jax.ShapeDtypeStruct((1, length), i32),
         ],
         interpret=True,
-    )(jnp.asarray([rank], i32), own, peer, seq_lens[None], cu[None])
+    )(
+        jnp.asarray([rank], i32),
+        msa_dcp.swap_buffer(jnp.zeros((1, num_tokens, 128), jnp.bfloat16), peer)[-1],
+        own,
+        seq_lens[None],
+        cu[None],
+    )
     return keys, local_key, local_limit, work[0]
 
 
@@ -267,3 +274,33 @@ def test_decode_plan_matches_xla(rank, q_lens, ctx_lens, num_tokens, pages_per_s
             np.asarray(got[3][start : start + n]), np.asarray(work[0, at : at + n])
         )
         at += n
+
+
+@pytest.mark.parametrize("fp4", [False, True])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens,num_tokens",
+    [
+        ([8], [80000], 8),  # c4 b1
+        ([8, 8, 8], [3000, 129, 9000], 24),
+        ([8, 8, 8, 8, 8, 5], [3000, 5000, 70, 300, 9000, 1], 48),  # padded tail
+    ],
+)
+def test_planned_decode_matches_plain_bitwise(
+    q_lens, ctx_lens, num_tokens, fp4, monkeypatch
+):
+    """A pair's planned decode (`_attend_pair_decode` reading and writing the
+    permute buffers, `merge_pair_decode`) is the plain small-step path
+    (`msa_attend_dcp`, `merge_partials`) bit for bit."""
+    if len(jax.devices()) < DCP:
+        pytest.skip(
+            "needs 2 devices (XLA_FLAGS=--xla_force_host_platform_device_count=2)"
+        )
+    rng = np.random.default_rng(num_tokens + fp4)
+    pages_per_seq = 1024 if num_tokens == 8 else 80
+    *args, _ = _step(rng, q_lens, ctx_lens, pages_per_seq, num_tokens, fp4)
+    assert msa_dcp.use_decode_plan(num_tokens, TOPK, HL, HEAD_DIM)
+    planned = _spmd(*args, fp4)
+    monkeypatch.setattr(msa_dcp, "use_decode_plan", lambda *_: False)
+    plain = _spmd(*args, fp4)
+    for r in range(DCP):
+        np.testing.assert_array_equal(planned[r], plain[r])
