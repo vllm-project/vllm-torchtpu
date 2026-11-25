@@ -1224,6 +1224,7 @@ def fused_ep_moe_v2(
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
+        shared_l = None
         if has_shared:
             *scales_gating_biases, shared_l = scales_gating_biases
         w1s_l, w2s_l, gate_l, hash_l, score_bias_l, bias_it = unpack_operands(
@@ -1232,7 +1233,7 @@ def fused_ep_moe_v2(
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
         q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
         shared_rows = None
-        if has_shared:
+        if shared_l is not None:
             # Not before q_l exists, so the reduction cannot hold back the
             # activation all-gather's start.
             shared_l, _ = lax.optimization_barrier((shared_l, q_l))
