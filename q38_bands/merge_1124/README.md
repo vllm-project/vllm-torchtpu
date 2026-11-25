@@ -90,7 +90,32 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
 | Form | Lineage | Package tree (git) | Lever keys (all default off) |
 |---|---|---|---|
 | `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` + SB1-2 no-GDN `00f9aa3066` + SERVE HD rider `3d12a2ccb6` (clean merges) | `862b8e0254` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above; SB1-2: `VLLM_TPU_QSA_DECODE_FUSED_UNION=1`, `VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1`, `VLLM_TPU_PD_GATHER_BULK=1`, `VLLM_TPU_PD_STAGING_FOLD=1`, `VLLM_TPU_GC_WORKER=2600`, `VLLM_TPU_GC_WORKER_LOG=1`, `VLLM_TPU_KVL_INWAIT=1` (the PD / GC / KVL keys are deliberately outside the compile key: their runs prove a cold compile); HD rider: `VLLM_TPU_HD_STAGE_CPU=1`, `VLLM_TPU_HD_REQVEC=1` only (`VLLM_TPU_HD_MARKS` and `VLLM_TPU_HD_AB` unset; host-only, compile-ignored) |
+| `Q38_FORM=hix` | HIX H `cfbd1689c1` (`q38-hix700-s3a-h`: S3a = S2 stack + PREGATE (flag off) + MKH + H2 + KV-SCALE-GUARD v2, then MESHGUARD, SIDE-FIX, T1 fix, D-b, PLE-WINMASK), its `_forms/oxpd` package byte for byte | `a559582f70` | H's served decode env (194 items, with `Q38_FORM=hix` in place of `Q38_OXPD_FORM=1`); proxy `Q38_PROXY_FORM=opener` (the served proxy map holds blob `0532c97577`) |
 
+- `hix` disclosures:
+  - `VLLM_TPU_MK_GDN_SIDECAR` stays default off and is **NOT SERVABLE at MK buckets 8:16**: the one-trace bucket-8
+    ShapeSpecializationError (`_side_active`, `qwen38_wholestep.py:503-513`) and the operand misalignment at buckets=16
+    (IndexError, `qwen38_segment_call.py:114`). K1 is parked with it.
+  - MEMO is inert across the whole S3a family, H included: no measured run has ever had memo_store > 0
+    (memo_unsafe == fast on c70ns a1 decode-0, 458883 == 458883; 320 of 320 D98FAST lines on s16mkt3 j-14d3a112). The posted
+    HIX points ran with memo off. A later MEMO fix lands as its own env-keyed commit.
+  - Six members change behaviour with no key of their own: KV-SCALE-GUARD v2 (hard fail), MESHGUARD, SIDE-FIX, the T1
+    fix, D-b (fail-closed routed-expert block check) and PLE-WINMASK. All but PLE-WINMASK sit in `megakernel_runtime/`,
+    which runs only with the whole-step megakernel engaged (`VLLM_TPU_MK_*`); SIDE-FIX is in the SIDECAR path (off);
+    PLE-WINMASK is in `kernels/qwen4_exp/ple_fused.py`. No posted point runs `hix`, so no posted behaviour changes.
+  - Keys of the served env (186 vllm-family keys) and the compile key: 181 are registered in `envs.py`. 5 are not, and
+    each is read directly and added to the compile factors only when set (`compilation/tpu_compiler.py:799-817`):
+    `VLLM_TPU_QSA_FUSED_KV_WRITE_LEAN` (read in `kernels/qwen4_exp/fused_kv_write.py:40`),
+    `VLLM_TPU_QSA_DECODE_KV_BLOCK_ONE_WINDOW` (`kernels/qwen4_exp/pooled_qsa.py:768`), `VLLM_TPU_HC_XLA_MAX_ROWS`
+    (`kernels/qwen4_exp/hc_decode.py:118`), `VLLM_TPU_HC_DECODE_FUSED_MAX_ROWS` (`hc_decode.py:191`) and
+    `VLLM_TPU_DECODE_TP_AR` (`kernels/collectives/tp8_ar_decode_fn.py:20`). 65 registered keys are in
+    `_TPU_COMPILE_ENV_IGNORED` (host, logging and check keys, plus MKH's `VLLM_TPU_L6_MK_CTX` / `VLLM_TPU_L6_MK_THIN_TT`),
+    so a warm compile-cache artifact cannot tell them apart: every dash-bound `hix` car carries a cold-compile row.
+    Registering and un-ignoring the H-member keys is a later commit with its own record.
+  - Evidence (DEV, 1200 s, post-data / not blind): the reader-corrected c70ns re-read of record (proof v3.1 PASS 121/121) reads
+    KEEP-H: a1 (H, SIDECAR off) 465.82 x / 53.68 Mtok/$ against a0 422.60 / 52.10 (dx +10.2 %, dM +3.0 %); MEMO inert; MKH
+    attributed by pid.
+  - **Exos:** see Notes. `hix` runs on Exos from this branch only after the recipe patches the selected form.
 - QGLUE-1 in `b1`: a device STEP cut of record; no served gain shown at B1 c212 (within the measured A/A noise floor:
   span 2.34 ms, Mtok/$ ~1.5 %).
 - HD rider disclosure (SERVE car 1, DEV, 1200 s): KEEP-FOR-BUILD on the host cycle only (max-over-ranks p50 non-wait cycle

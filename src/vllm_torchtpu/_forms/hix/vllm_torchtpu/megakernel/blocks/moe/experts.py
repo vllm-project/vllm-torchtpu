@@ -1,0 +1,457 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""MoE routed experts: rolled / unrolled, `PIPE` and `PIPE_EP` schedules."""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+from jax import lax
+from jax.experimental import pallas as pl
+
+import os
+
+from ...ops import BF16, F32, rnd
+from .context import MoEEmit
+from .ring import egive, egive_group, es_wait, etake
+
+
+def gate_up(m: MoEEmit, i, w13):
+    mp, scr, stream = m.mp, m.scr, m.stream
+    IR, NSS = mp.IR, mp.NSS
+    h = stream.mm(scr["xb"][...], w13[...]) * scr["es"][i % NSS, :, : 2 * IR]
+    return rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:])).astype(BF16)
+
+
+def down(m: MoEEmit, i, mid, w2):
+    ex, lane_e8, mp, scr, stream = m.ex, m.lane_e8, m.mp, m.scr, m.stream
+    MR = ex.MR
+    CH, H, IR, NSS = mp.CH, mp.H, mp.IR, mp.NSS
+    e, s, part = scr["elist"][i], i % NSS, scr["part"]
+    wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
+    for j in range(H // CH):
+        lo = 2 * IR + j * CH
+        y = stream.mm(mid, w2[:, j * CH : (j + 1) * CH])[0:MR]
+        y = rnd(y * scr["es"][s, :, lo : lo + CH])
+        part[0:MR, j * CH : (j + 1) * CH] += wcol * y
+
+
+def expert(m: MoEEmit, l_idx, i, carry):
+    ex, lane_e8, mp, scr, stream, tk = m.ex, m.lane_e8, m.mp, m.scr, m.stream, m.tk
+    MB, MR = ex.MB, ex.MR
+    CH, H, IR, NSS, T13, T2, TE = mp.CH, mp.H, mp.IR, mp.NSS, mp.T13, mp.T2, mp.TE
+    e = scr["elist"][i]
+    s = i % NSS
+    base = i * TE
+    acc, xb, xb2, part = scr["acc"], scr["xb"], scr["xb2"], scr["part"]
+    DIRECT0 = mp.r2_direct_store
+    if T13 == 1:
+        h = stream.mm(xb[...], etake(m, "e13", base)[...])
+        egive(m, base, l_idx)
+    elif not mp.unroll:
+        # Default path: rolled tile loop with per-tile refill.
+        acc[:, : 2 * IR] = jnp.zeros((MB, 2 * IR), F32)
+
+        def b13(t, cc):
+            u = base + t
+            w = etake(m, "e13", u)
+            k0 = pl.multiple_of(t * tk["e13"], tk["e13"])
+            acc[:, : 2 * IR] += stream.mm(xb[:, pl.ds(k0, tk["e13"])], w[...])
+            egive(m, u, l_idx)
+            return cc
+
+        lax.fori_loop(0, T13, b13, 0)
+        h = acc[:, : 2 * IR]
+    else:
+        TK13 = tk["e13"]
+        if not DIRECT0:
+            acc[:, : 2 * IR] = jnp.zeros((MB, 2 * IR), F32)
+        for t in range(T13):
+            u = base + t
+            w = etake(m, "e13", u)
+            m13 = stream.mm(xb[:, t * TK13 : (t + 1) * TK13], w[...])
+            if DIRECT0 and t == 0:
+                acc[:, : 2 * IR] = m13
+            else:
+                acc[:, : 2 * IR] += m13
+            if mp.group_rel:
+                if t % 2 == 1:
+                    egive_group(m, [(u - 1, t - 1), (u, t)], l_idx)
+                elif t == T13 - 1:
+                    egive(m, u, l_idx, t)
+            else:
+                egive(m, u, l_idx, t)
+        h = acc[:, : 2 * IR]
+    es_wait(m, i)
+    h = h * scr["es"][s, :, : 2 * IR]
+    mid_ = rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:]))
+    xb2[:, :IR] = mid_.astype(BF16)
+    wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
+    u2 = base + T13
+    if T2 == 1:
+        w2 = etake(m, "e2", u2)[...]
+        xm = xb2[:, :IR]
+        for j in range(H // CH):
+            lo = 2 * IR + j * CH
+            y = stream.mm(xm, w2[:, j * CH : (j + 1) * CH])[0:MR]
+            y = rnd(y * scr["es"][s, :, lo : lo + CH])
+            part[0:MR, j * CH : (j + 1) * CH] += wcol * y
+        egive(m, u2, l_idx)
+    elif not mp.unroll:
+        acc[:, :H] = jnp.zeros((MB, H), F32)
+
+        def b2(t, cc):
+            u = u2 + t
+            w = etake(m, "e2", u)
+            k0 = pl.multiple_of(t * tk["e2"], tk["e2"])
+            acc[:, :H] += stream.mm(xb2[:, pl.ds(k0, tk["e2"])], w[...])
+            egive(m, u, l_idx)
+            return cc
+
+        lax.fori_loop(0, T2, b2, 0)
+        y = rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
+        part[0:MR, :] += wcol * y
+    else:
+        TK2 = tk["e2"]
+        if not DIRECT0:
+            acc[:, :H] = jnp.zeros((MB, H), F32)
+        for t in range(T2):
+            u = u2 + t
+            w = etake(m, "e2", u)
+            m2 = stream.mm(xb2[:, t * TK2 : (t + 1) * TK2], w[...])
+            if DIRECT0 and t == 0:
+                acc[:, :H] = m2
+            else:
+                acc[:, :H] += m2
+            if mp.group_rel:
+                if t % 2 == 1:
+                    egive_group(m, [(u - 1, T13 + t - 1), (u, T13 + t)], l_idx)
+                elif t == T2 - 1:
+                    egive(m, u, l_idx, T13 + t)
+            else:
+                egive(m, u, l_idx, T13 + t)
+        y = rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
+        part[0:MR, :] += wcol * y
+    return carry
+
+
+def experts_piped(m: MoEEmit, l_idx, n_hit):
+    mp, scr = m.mp, m.scr
+    IR, T13, TE = mp.IR, mp.T13, mp.TE
+    xb2 = scr["xb2"]
+
+    @pl.when(n_hit > 0)
+    def _():
+        w13 = etake(m, "e13", 0)
+        es_wait(m, 0)
+        xb2[:, :IR] = gate_up(m, 0, w13)
+        egive(m, 0, l_idx, 0)
+
+        def body(i, carry):
+            u13, u2 = (i + 1) * TE, i * TE + T13
+            w13 = etake(m, "e13", u13)
+            es_wait(m, i + 1)
+            w2 = etake(m, "e2", u2)[...]
+            mid = xb2[:, :IR]
+            nxt = gate_up(m, i + 1, w13)
+            down(m, i, mid, w2)
+            xb2[:, :IR] = nxt
+            egive(m, u13, l_idx, 0)
+            egive(m, u2, l_idx, T13)
+            return carry
+
+        lax.fori_loop(0, n_hit - 1, body, 0)
+        last = n_hit - 1
+        u2 = last * TE + T13
+        down(m, last, xb2[:, :IR], etake(m, "e2", u2)[...])
+        egive(m, u2, l_idx, T13)
+
+
+# Timing-only removal arms for the PIPE_EP expert loop (WRONG results; bench attribution only):
+# VLLM_TPU_MK_MOE_ABLATE=acc (skip the part accumulate), mid (skip silu*up), mm (skip the
+# expert matmuls; weight DMAs and ring waits stay).
+_ABLATE = frozenset(x for x in os.environ.get("VLLM_TPU_MK_MOE_ABLATE", "").split(",") if x)
+
+
+def _mm(stream, x, w):
+    """`stream.mm` unless the `mm` removal arm is on (then zeros of the product's shape)."""
+    if "mm" in _ABLATE:
+        return jnp.zeros((x.shape[0], w.shape[1]), F32)
+    return stream.mm(x, w)
+
+
+def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
+    ex, lane_e8, mp, scr, stream, tk = m.ex, m.lane_e8, m.mp, m.scr, m.stream, m.tk
+    MB, MR = ex.MB, ex.MR
+    H, IR, NSS, T13, T2, TE = mp.H, mp.IR, mp.NSS, mp.T13, mp.T2, mp.TE
+
+    @pl.when(n_hit > 0)
+    def _():
+        acc, acc13 = scr["acc"], scr["acc13"]
+        xb, xb2, part = scr["xb"], scr["xb2"], scr["part"]
+        BN = 2 * IR
+        TK13, TK2 = tk["e13"], tk["e2"]
+        DIRECT0 = mp.r2_direct_store
+
+        if not DIRECT0:
+            acc13[...] = jnp.zeros((MB, BN), F32)
+        for t in range(T13):
+            w13 = etake(m, "e13", t)
+            k0 = t * TK13
+            mm13 = _mm(stream, xb[:, k0 : k0 + TK13], w13[...])
+            if DIRECT0 and t == 0:
+                acc13[:, :BN] = mm13
+            else:
+                acc13[:, :BN] += mm13
+            if mp.group_rel:
+                if t % 2 == 1:
+                    egive_group(m, [(t - 1, t - 1), (t, t)], l_idx)
+                elif t == T13 - 1:
+                    egive(m, t, l_idx, t)
+            else:
+                egive(m, t, l_idx, t)
+        es_wait(m, 0)
+        if "mid" not in _ABLATE:
+            h0 = acc13[:, :BN] * scr["es"][0, :, :BN]
+            mid0 = rnd(rnd(jax.nn.silu(rnd(h0[:, :IR]))) * rnd(h0[:, IR:]))
+            xb2[:, :IR] = mid0.astype(BF16)
+
+        def body_ep(i, _):
+            e = scr["elist"][i]
+            s_cur = i % NSS
+            s_nxt = (i + 1) % NSS
+            base_w2 = i * TE + T13
+            base_nxt13 = (i + 1) * TE
+
+            if not DIRECT0:
+                acc[:, :H] = jnp.zeros((MB, H), F32)
+                acc13[...] = jnp.zeros((MB, BN), F32)
+
+            for s_step in range(T2):
+                u2 = base_w2 + s_step
+                t0 = 2 * s_step
+                t1 = 2 * s_step + 1
+                u13_0 = base_nxt13 + t0
+                u13_1 = base_nxt13 + t1
+
+                w2 = etake(m, "e2", u2)
+                w13_0 = etake(m, "e13", u13_0)
+                k2 = s_step * TK2
+                k13_0 = t0 * TK13
+                mm2 = _mm(stream, xb2[:, k2 : k2 + TK2], w2[...])
+                mm13_0 = _mm(stream, xb[:, k13_0 : k13_0 + TK13], w13_0[...])
+                if DIRECT0 and s_step == 0:
+                    acc[:, :H] = mm2
+                    acc13[:, :BN] = mm13_0
+                else:
+                    acc[:, :H] += mm2
+                    acc13[:, :BN] += mm13_0
+                if mp.group_rel:
+                    egive_group(m, [(u2, T13 + s_step), (u13_0, t0)], l_idx)
+                else:
+                    egive(m, u2, l_idx, T13 + s_step)
+                    egive(m, u13_0, l_idx, t0)
+
+                w13_1 = etake(m, "e13", u13_1)
+                k13_1 = t1 * TK13
+                acc13[:, :BN] += _mm(stream, xb[:, k13_1 : k13_1 + TK13], w13_1[...])
+                egive(m, u13_1, l_idx, t1)
+
+            wcol = jnp.sum(
+                jnp.where(lane_e8 == e, scr["wn"][...], 0.0),
+                axis=1,
+                keepdims=True,
+            )
+            y = rnd(acc[0:MR, :H] * scr["es"][s_cur, :, BN:])
+            if "acc" not in _ABLATE:
+                part[0:MR, :] += wcol * y
+
+            es_wait(m, i + 1)
+            if "mid" not in _ABLATE:
+                h_nxt = acc13[:, :BN] * scr["es"][s_nxt, :, :BN]
+                mid_nxt = rnd(rnd(jax.nn.silu(rnd(h_nxt[:, :IR]))) * rnd(h_nxt[:, IR:]))
+                xb2[:, :IR] = mid_nxt.astype(BF16)
+            return 0
+
+        lax.fori_loop(0, n_hit - 1, body_ep, 0)
+
+        i_last = n_hit - 1
+        e_last = scr["elist"][i_last]
+        s_last = i_last % NSS
+        base_last_w2 = i_last * TE + T13
+        if not DIRECT0:
+            acc[:, :H] = jnp.zeros((MB, H), F32)
+        for s_step in range(T2):
+            u2 = base_last_w2 + s_step
+            w2 = etake(m, "e2", u2)
+            k2 = s_step * TK2
+            mm2 = _mm(stream, xb2[:, k2 : k2 + TK2], w2[...])
+            if DIRECT0 and s_step == 0:
+                acc[:, :H] = mm2
+            else:
+                acc[:, :H] += mm2
+            if mp.group_rel:
+                if s_step % 2 == 1:
+                    egive_group(
+                        m,
+                        [(u2 - 1, T13 + s_step - 1), (u2, T13 + s_step)],
+                        l_idx,
+                    )
+                elif s_step == T2 - 1:
+                    egive(m, u2, l_idx, T13 + s_step)
+            else:
+                egive(m, u2, l_idx, T13 + s_step)
+        wcol_last = jnp.sum(
+            jnp.where(lane_e8 == e_last, scr["wn"][...], 0.0),
+            axis=1,
+            keepdims=True,
+        )
+        y_last = rnd(acc[0:MR, :H] * scr["es"][s_last, :, BN:])
+        if "acc" not in _ABLATE:
+            part[0:MR, :] += wcol_last * y_last
+
+
+# q38 HXSMALL AR0S-T (VLLM_TPU_HXS_AR0ST=1): the `expert()` path (the b16 whole step's: PIPE_EP needs an expert ring that
+# is a multiple of TE, params.py:146) with the LAST routed expert's down projection ordered by output column half: the
+# twin's half of `part` (the columns hier=2's round 0 sends, comm.py `ar_copies`) is finished first, round 0 starts
+# (HCSublayer's hook -> AllReduceRing.ar0s_start), then the own half is computed while round 0 is in flight.
+#   T2 == 1 (the served b16 shape: Qwen3.8's FP8 e2 [640, 2560] is one 2 MiB-bank tile): `expert()` already computes the
+#     down projection in CH-wide column chunks (CH = 640, four chunks); AR0S-T only REORDERS those independent chunks
+#     (twin pair first) -- the same matmuls of the same shapes on the same operands, so bitwise by construction;
+#   T2 > 1: each tile's matmul is split into the two column halves (a column slice of a dot = the same columns of the
+#     full dot: independent output columns, same K order); per column the same zero-fill / accumulate / scale / rnd.
+# Every element of `part` gets the same additions in the same order (shared expert, then the experts in `elist` order).
+# The last expert's e2 releases only refill past the layer's unit count (ring.py `egive`: never for the last expert),
+# so holding its tile until the own half is done delays no weight stream.
+def ar0s_supported(mp) -> bool:
+    """The `expert()` unrolled path (tiled gate-up), with column chunks that split at the hier=2 half when T2 == 1."""
+    if not (bool(mp.unroll) and mp.T13 > 1 and not mp.PIPE and not mp.PIPE_EP):
+        return False
+    if mp.T2 == 1:
+        return (mp.H // 2) % mp.CH == 0
+    return True
+
+
+def experts_ar0s(m: MoEEmit, l_idx, n_hit, hook):
+    import functools
+
+    from vllm_torchtpu import hxsmall
+
+    hxsmall.engage("VLLM_TPU_HXS_AR0ST", "MoE b%d: the last routed expert finishes the twin column half, starts the "
+                   "hier=2 round 0, then its own half (expert() path, T13 %d T2 %d)" % (m.ex.B, m.mp.T13, m.mp.T2))
+    lax.fori_loop(0, n_hit - 1, functools.partial(expert, m, l_idx), 0)
+
+    @pl.when(n_hit > 0)
+    def _():
+        _expert_last_ar0s(m, l_idx, n_hit - 1, hook)
+
+    @pl.when(n_hit == 0)
+    def _():
+        c_idx = lax.rem(m.me, 2)
+        for k in (0, 1):
+            pl.when(c_idx == k)(functools.partial(hook.start, m.scr["part"], k))
+
+
+def _expert_last_ar0s(m: MoEEmit, l_idx, i, hook):
+    """`expert(m, l_idx, i, 0)` (unrolled branches), with the down projection split as described above."""
+    ex, lane_e8, mp, scr, stream, tk = m.ex, m.lane_e8, m.mp, m.scr, m.stream, m.tk
+    MB, MR = ex.MB, ex.MR
+    H, IR, NSS, T13, T2, TE = mp.H, mp.IR, mp.NSS, mp.T13, mp.T2, mp.TE
+    e = scr["elist"][i]
+    s = i % NSS
+    base = i * TE
+    acc, xb, xb2, part = scr["acc"], scr["xb"], scr["xb2"], scr["part"]
+    DIRECT0 = mp.r2_direct_store
+    TK13 = tk["e13"]
+    if not DIRECT0:
+        acc[:, : 2 * IR] = jnp.zeros((MB, 2 * IR), F32)
+    for t in range(T13):
+        u = base + t
+        w = etake(m, "e13", u)
+        m13 = stream.mm(xb[:, t * TK13 : (t + 1) * TK13], w[...])
+        if DIRECT0 and t == 0:
+            acc[:, : 2 * IR] = m13
+        else:
+            acc[:, : 2 * IR] += m13
+        if mp.group_rel:
+            if t % 2 == 1:
+                egive_group(m, [(u - 1, t - 1), (u, t)], l_idx)
+            elif t == T13 - 1:
+                egive(m, u, l_idx, t)
+        else:
+            egive(m, u, l_idx, t)
+    h = acc[:, : 2 * IR]
+    es_wait(m, i)
+    h = h * scr["es"][s, :, : 2 * IR]
+    mid_ = rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:]))
+    xb2[:, :IR] = mid_.astype(BF16)
+    wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
+    u2 = base + T13
+    TK2 = tk["e2"]
+    HC2 = H // 2
+    c_idx = lax.rem(m.me, 2)
+    if T2 == 1:
+        CH = mp.CH
+        w2 = etake(m, "e2", u2)[...]
+        xm = xb2[:, :IR]
+        hc = HC2 // CH
+
+        def chunks(js):
+            for j in js:
+                lo = 2 * IR + j * CH
+                y = stream.mm(xm, w2[:, j * CH : (j + 1) * CH])[0:MR]
+                y = rnd(y * scr["es"][s, :, lo : lo + CH])
+                part[0:MR, j * CH : (j + 1) * CH] += wcol * y
+
+        for k in (0, 1):
+
+            @pl.when(c_idx == k)
+            def _(k=k):
+                chunks(range((1 - k) * hc, (2 - k) * hc))   # the twin's half (round 0's payload)
+                hook.start(part, k)
+                chunks(range(k * hc, (k + 1) * hc))         # this core's own half, while round 0 flies
+
+        egive(m, u2, l_idx)
+        return
+
+    def half(lo, take):
+        hi = lo + HC2
+        if not DIRECT0:
+            acc[:, lo:hi] = jnp.zeros((MB, HC2), F32)
+        for t in range(T2):
+            u = u2 + t
+            w = etake(m, "e2", u) if take else stream.eview("e2", u % mp.NBE)
+            m2 = stream.mm(xb2[:, t * TK2 : (t + 1) * TK2], w[:, lo:hi])
+            if DIRECT0 and t == 0:
+                acc[:, lo:hi] = m2
+            else:
+                acc[:, lo:hi] += m2
+            if not take:
+                if mp.group_rel:
+                    if t % 2 == 1:
+                        egive_group(m, [(u - 1, T13 + t - 1), (u, T13 + t)], l_idx)
+                    elif t == T2 - 1:
+                        egive(m, u, l_idx, T13 + t)
+                else:
+                    egive(m, u, l_idx, T13 + t)
+        y = rnd(acc[0:MR, lo:hi] * scr["es"][s, :, 2 * IR + lo : 2 * IR + hi])
+        part[0:MR, lo:hi] += wcol * y
+
+    for k in (0, 1):
+
+        @pl.when(c_idx == k)
+        def _(k=k):
+            half((1 - k) * HC2, True)   # the twin's half (round 0's payload)
+            hook.start(part, k)
+            half(k * HC2, False)        # this core's own half, while round 0 flies

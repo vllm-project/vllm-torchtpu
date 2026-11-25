@@ -1,0 +1,1 @@
+"""q38 hix LIVING form root (Q38_FORM=hix): vllm_torchtpu/ below is HIX H cfbd1689c1:src/vllm_torchtpu/_forms/oxpd/vllm_torchtpu byte for byte (q38-hix700-s3a-h: S3a + MESHGUARD + SIDE-FIX + T1 fix + D-b + PLE-WINMASK), served with SIDECAR off and MEMO inert. Living: q38 levers land here env-keyed and default-off. Never imported by any form."""
