@@ -286,6 +286,122 @@ def test_decode_step_with_no_page_on_rank() -> None:
     np.testing.assert_array_equal(np.asarray(got[:, _TOPK:]), -1)
 
 
+def _exact_block_maxima(index_q, index_cache, block_tables, pages, pages_per_seq):
+    """``[T, pages_per_seq]`` block maxima of integer-valued queries and keys
+    (exact in f32 in any order), per token over its request's first `pages`
+    entries (0 past them); `index_q` ``[T, D]``, `pages` per token."""
+    q = np.asarray(index_q, np.float32)
+    keys = np.asarray(index_cache.astype(jnp.float32)).reshape(
+        index_cache.shape[0], -1, index_cache.shape[-1]
+    )
+    out = np.zeros((q.shape[0], pages_per_seq), np.float32)
+    for t, (row, n) in enumerate(pages):
+        k = keys[
+            np.asarray(block_tables)[row * pages_per_seq : row * pages_per_seq + n]
+        ]
+        out[t, :n] = (k @ q[t]).max(axis=1)
+    return out
+
+
+def _integers(rng, shape, dtype, bound):
+    return jnp.asarray(rng.integers(-bound, bound + 1, shape), dtype)
+
+
+def test_partial_group_scores_ignore_stale_pages() -> None:
+    """A request's last page group, partly live, scores its live pages
+    exactly, whatever its ring slot holds past them: here the NaN pages a
+    group three steps earlier left there (the score ring has 3 slots). A
+    32-page chunk scores pages j and j + 16 in one contraction, so unmasked
+    stale keys would spoil live pages' scores."""
+    rng = np.random.default_rng(7)
+    dim, pages_per_seq = 128, 512
+    # 3 whole groups, then 100 live pages: past 64, so the last group's first
+    # half is known live; its pages 112.. (pairs of 96..) hold stale NaN. The
+    # NaN pages fill a chunk: a page paired with a NaN page is spoilt.
+    live = 3 * 128 + 100
+    pages = pages_per_seq + 8
+    block_tables = jnp.asarray(rng.permutation(pages)[:pages_per_seq], jnp.int32)
+    index_cache = _integers(rng, (pages, 32, 4, dim), jnp.float8_e4m3fn, 2)
+    stale = np.asarray(block_tables)[96:128]
+    index_cache = index_cache.at[stale].set(jnp.nan)
+    index_q = _integers(rng, (8, 1, dim), jnp.bfloat16, 3)
+    cu = jnp.asarray([0, 8], jnp.int32)
+    rows = msa_indexer.block_scores(
+        index_q,
+        index_cache,
+        jnp.asarray([128 * live], jnp.int32),
+        block_tables,
+        cu,
+        jnp.asarray(1, jnp.int32),
+        token_rows=True,
+        **msa.block_score_options(),
+        interpret=True,
+    )
+    got = np.asarray(rows.scores)[np.asarray(rows.rows)][:, :live]
+    want = _exact_block_maxima(
+        index_q[:, 0], index_cache, block_tables, [(0, live)] * 8, pages_per_seq
+    )[:, :live]
+    # The NaN pages' own maxima are not compared (a max may skip NaN).
+    fresh = np.r_[0:96, 128:live]
+    assert not np.isnan(want[:, fresh]).any()
+    np.testing.assert_array_equal(got[:, fresh], want[:, fresh])
+
+
+# Requests' last groups: 100 / 75 / 72 / 74 live pages (past 64), 40 and 1
+# (within 64), and whole groups.
+@pytest.mark.parametrize(
+    "local_pages", [[484], [484, 75, 1, 128, 168, 330]], ids=["t8", "t48"]
+)
+@pytest.mark.parametrize("rank", [0, 1])
+def test_decode_candidates_match_exact_scores(local_pages, rank):
+    """The decode step's write, block scores and pick in one kernel equal the
+    pick of exact block maxima of the written cache (integer-valued queries
+    and keys: their f32 dot products are exact in any order)."""
+    rng = np.random.default_rng(len(local_pages) + rank)
+    seqs, dim, dcp, pages_per_seq = len(local_pages), 128, 2, 512
+    tokens = 8 * seqs
+    pages = seqs * pages_per_seq + 8
+    cu = jnp.asarray(np.arange(seqs + 1) * 8, jnp.int32)
+    # `n` blocks on each rank, the last one partly written.
+    seq_lens = jnp.asarray([_BLOCK * (2 * n - 1) + 5 for n in local_pages], jnp.int32)
+    block_tables = jnp.asarray(
+        rng.permutation(pages)[: seqs * pages_per_seq], jnp.int32
+    )
+    fp8, bf16 = jnp.float8_e4m3fn, jnp.bfloat16
+    index_q = _integers(rng, (tokens, 1, dim), bf16, 3)
+    got = msa_dcp.msa_write_and_candidates_dcp(
+        _integers(rng, (tokens, 1, dim), bf16, 2),
+        _integers(rng, (tokens, 1, dim), bf16, 2),
+        index_q,
+        _integers(rng, (tokens, dim), bf16, 2),
+        _integers(rng, (pages, 32, 4, 2 * dim), fp8, 2),
+        _integers(rng, (pages, 32, 4, dim), fp8, 2),
+        seq_lens,
+        block_tables,
+        cu,
+        jnp.asarray([tokens] * 3, jnp.int32),
+        topk=_TOPK,
+        init_blocks=0,
+        local_blocks=1,
+        rank=rank,
+        dcp=dcp,
+        interpret=True,
+    )
+    local = msa_dcp.local_seq_lens(seq_lens, block_size=_BLOCK, rank=rank, dcp=dcp)
+    local = np.asarray(-(-local // _BLOCK))
+    seq_id, pos, _ = msa.token_positions(tokens, seq_lens, cu)
+    owner = [(int(r), int(local[r])) for r in np.asarray(seq_id)]
+    scores = _exact_block_maxima(
+        index_q[:, 0], got[1], block_tables, owner, pages_per_seq
+    )
+    want = msa_dcp.pack_candidates(
+        *_pick(
+            jnp.asarray(scores)[:, None, :], pos, rank, init_blocks=0, local_blocks=1
+        )
+    )
+    np.testing.assert_array_equal(np.asarray(got[2]), np.asarray(want))
+
+
 def _reference_merge(candidates: np.ndarray) -> np.ndarray:
     """Per token: the real candidates by score descending, then block."""
     out = -np.ones(candidates.shape[1:2] + (_TOPK,), np.int32)

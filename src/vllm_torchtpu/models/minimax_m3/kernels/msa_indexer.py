@@ -227,6 +227,11 @@ _RING_SLOTS = 3
 # at 3 / 5 requests of ~115K context (kbench j-a48608a4); a fourth and fifth
 # were slower (their step-0 issue delays the first group's scores).
 _SELECT_RING_SLOTS = 4
+# With three groups ahead, the select call issues the ahead group's descriptors
+# over all of a 128-page step's chunks: in the first two their ~10 scalar ops
+# per page held its weight pushes to ~11 cycles per pair instead of 8 (this
+# alone: step 1,526 -> 1,340 bundles at 8 tokens, AOT tpu7x).
+_SELECT_DMA_ISSUE_CHUNKS = 4
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed
 # (`_chunk_scores_t`, maxima across lanes); larger ones score token-major
 # (maxima across sublanes), a folded page with its slot scales folded into
@@ -299,7 +304,11 @@ def _transposed_keys(buf, p, live, dtype, folded, masked):
         k = pltpu.bitcast(buf[p, : rows - 1], jnp.int4)
     else:
         w = buf[p]
-        k = pltpu.bitcast(jnp.where(p < live, w, 0) if masked else w, dtype)
+        if masked:
+            # A vector compare: a scalar predicate is a select, a broadcast
+            # and a compare per page on the scalar slots the DMA issue fills.
+            w = jnp.where(jnp.full(w.shape, live, jnp.int32) > p, w, 0)
+        k = pltpu.bitcast(w, dtype)
     return k if k.dtype == key_dtype else k.astype(key_dtype)
 
 
@@ -339,7 +348,7 @@ def _lane_maxima(columns: list[jax.Array], lane0: int) -> jax.Array:
 
 
 def _chunk_scores_t(
-    q_pair, buf, first, chunk, live, issue, *, dtype, folded
+    q_pair, buf, first, chunk, live, issue, *, dtype, folded, live_below=0
 ) -> jax.Array:
     """``[2 Bq, chunk / 2 * S]`` scores of the pages ``buf[first : first +
     chunk]`` computed transposed: the MXU result is ``2 Bq`` rows rather than
@@ -347,7 +356,8 @@ def _chunk_scores_t(
     pages ``first + chunk / 2 + j``, page pair ``j`` in columns ``[j * S, (j +
     1) * S)``. A folded 4-bit page's per-token scales are a lane vector (the
     page's last word row), applied by a sublane broadcast. `issue(j)` runs
-    among the keys of page pair ``j``.
+    among the keys of page pair ``j``. Pages below `live_below` are known to
+    be below `live` (their keys are not masked).
     """
     rows = buf.shape[1]
     half = chunk // 2
@@ -359,7 +369,8 @@ def _chunk_scores_t(
         for side, p in enumerate((first + j, first + half + j)):
             # Only the right page of a pair can be past the end while its
             # partner is not.
-            pair.append(_transposed_keys(buf, p, live, dtype, folded, side == 1))
+            masked = side == 1 and p >= live_below
+            pair.append(_transposed_keys(buf, p, live, dtype, folded, masked))
             if folded:
                 s = pltpu.bitcast(buf[p, rows - 1 :], jnp.float32)  # [1, S]
                 # Stale VMEM past the request's end, unwritten slots: scale 0.
@@ -416,6 +427,7 @@ def _kernel_v3(
     table_width=None,
     pending=None,
     pair_issue=False,
+    issue_chunks=_DMA_ISSUE_CHUNKS,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     groups (``buf.shape[0]``: `_RING_SLOTS`, the select call's
@@ -500,11 +512,11 @@ def _kernel_v3(
         """Wait for the slot's `live` page copies: the slot's semaphore counts
         their bytes, so one wait per set bit of `live` waits for them all
         (a wait per page cost two serial bundles each)."""
-        live = jnp.minimum(live, pages_per_step)
-        n = 1
-        while n <= pages_per_step:
-            pl.when((live & n) != 0)(fake_copy(n, slot).wait)
-            n *= 2
+        sizes = [1 << k for k in range(pages_per_step.bit_length())]
+        # The tests ahead of the first wait, which they would queue behind.
+        tests = [(live & n) != 0 for n in sizes]
+        for n, test in zip(sizes, tests):
+            pl.when(test)(fake_copy(n, slot).wait)
 
     def fake_copy(n, slot):
         """A descriptor of `n` pages' bytes on the slot's semaphore, to wait on."""
@@ -561,16 +573,19 @@ def _kernel_v3(
     if prologue is not None:
         pl.when(step == 0)(prologue)
     base, live = group(step)
+    # Clamped here, not in each body, where it led the waits by 4 bundles.
+    waited = jnp.minimum(live, pages_per_step)
     next_base, next_live = ahead_group(step + ahead)
     q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
     num_chunks = pages_per_step // chunk
-    # The ahead group's descriptors, spread over the first chunks' page pairs
-    # (in one chunk they crowd its scalar slots, in all chunks they issue
-    # late: both slower, benches j-9956cd34 / j-2e0b290e).
-    issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
+    # The ahead group's descriptors, spread over the first `issue_chunks`
+    # chunks' page pairs (with two groups ahead, in one chunk they crowd its
+    # scalar slots, in all chunks they issue late: both slower, benches
+    # j-9956cd34 / j-2e0b290e).
+    issue_chunks = min(issue_chunks, num_chunks)
     per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
-    def score_chunk(slot, first, share, defer=False):
+    def score_chunk(slot, first, share, defer=False, live_below=0):
         """Score pages ``[first, first + chunk)``, issuing the ahead group's
         descriptors `share` among the first page pairs (`start`); with
         `defer`, leave its scores in `pending`'s scratch."""
@@ -594,6 +609,7 @@ def _kernel_v3(
                 issue,
                 dtype=cache_ref.dtype,
                 folded=folded,
+                live_below=live_below,
             )
             if defer:
                 pending[0][...] = s
@@ -658,11 +674,11 @@ def _kernel_v3(
             m = _lane_maxima(columns, first % 128)
             store_at(first, m, w, valid & (deferred == n), chunk)
 
-    def body(slot, scored):
+    def body(slot, scored, live_below):
         """Score the group's first `scored` chunks; the rest are past the
         request's last page (their scores are never read) and only issue
         their share of the ahead group's descriptors."""
-        wait_pages(live, slot)
+        wait_pages(waited, slot)
         if on_pages is not None:
             on_pages(slot)
         if deferring:
@@ -672,7 +688,9 @@ def _kernel_v3(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
             )
             if c < scored:
-                score_chunk(slot, c * chunk, pages, deferring and c == scored - 1)
+                score_chunk(
+                    slot, c * chunk, pages, deferring and c == scored - 1, live_below
+                )
             else:
                 start(next_base, next_live, pages, (slot + ahead) % slots)
         if deferring:
@@ -685,7 +703,7 @@ def _kernel_v3(
         for i, n in enumerate(counts):
             lo = counts[i - 1] if i else 0
             pl.when((step % slots == slot) & (live_chunks > lo) & (live_chunks <= n))(
-                functools.partial(body, slot, n)
+                functools.partial(body, slot, n, lo * chunk)
             )
     if deferring:
         pl.when(step == num_steps - 1)(lambda: flush(step, True))
@@ -866,13 +884,15 @@ def _kernel_v3_select(
 
         merged_keys = pipe.out_bufs[-1].bitcast(jnp.uint32)
 
-        def on_pages(slot):
-            g = meta.written_page[seq] - (entry & _GROUP_MASK) * pages_per_step
+        # Read ahead of the step's page waits, which they would queue behind.
+        written = meta.written_page[seq] - (entry & _GROUP_MASK) * pages_per_step
+        written_run = meta.written_run[seq]
 
-            @pl.when((g >= 0) & (g < pages_per_step))
+        def on_pages(slot):
+            @pl.when((written >= 0) & (written < pages_per_step))
             def _():
-                run = meta.written_run[seq]
-                buf[slot, pl.ds(g, 1)] = merged_keys[pl.ds(run, 1), :, 0, :]
+                page = merged_keys[pl.ds(written_run, 1), :, 0, :]
+                buf[slot, pl.ds(written, 1)] = page
 
     _kernel_v3(
         work_ref,
@@ -890,6 +910,7 @@ def _kernel_v3_select(
         table_width=table_width,
         pending=(*pending, store_at),
         pair_issue=pair_issue,
+        issue_chunks=_SELECT_DMA_ISSUE_CHUNKS,
     )
 
     def pick(width):
