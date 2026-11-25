@@ -409,6 +409,7 @@ def _make_sample_runner(
         TPUModelRunner._apply_temperature,
         TPUModelRunner._sampler_applies_topk_topp,
         TPUModelRunner._modify_prev_results,
+        TPUModelRunner._settle_in_flight_outputs,
         TPUModelRunner._update_placeholder,
         TPUModelRunner._sync_replicated_drafts_across_tp,
         TPUModelRunner._sync_one_replicated_draft,

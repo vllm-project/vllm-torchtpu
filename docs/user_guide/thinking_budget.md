@@ -44,7 +44,7 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 | `0` | The thinking block closes as soon as it opens. |
 | `N > 0` | At most `N` tokens inside the thinking block, then the end marker is forced. |
 
-vLLM rejects other negative values and non-integers when it validates the request. Thinking tokens already in the prompt count toward the budget, so a prompt that ends inside an open thinking block starts with part of the budget spent. If the model opens another thinking block later in the same response, that block gets a budget of its own. When the server has no reasoning markers (neither flag is set, or the parser defines no start and end strings), requests with a budget run unconstrained and the runner logs a warning once.
+vLLM rejects other negative values and non-integers when it validates the request. Thinking tokens already in the prompt count toward the budget, so a prompt that ends inside an open thinking block starts with part of the budget spent. If the model opens another thinking block later in the same response, that block gets a budget of its own. When either the start marker or the end marker resolves to no token IDs (for example, when neither flag is set, or only one marker string is set without a parser), the runner disables `thinking_token_budget` and logs one warning.
 
 ## How thinking closes
 
@@ -58,7 +58,7 @@ Reported logprobs come from the logits before the thinking-budget forcing, so a 
 
 ## Structured outputs and `min_tokens`
 
-The runner does not override other constraints. If structured outputs or `min_tokens` has masked the token it would force on a step (for example, the end marker is a stop token and the request is still below `min_tokens`), that step samples as usual, and forcing resumes on the first step where the token is allowed. The thinking block can then run past the budget.
+The runner does not override other constraints. When structured outputs or `min_tokens` mask the forced token ID on a step (for example, the end marker is a stop token and the request is still below `min_tokens`), the runner samples from the unmasked tokens on that step. Forcing starts again on the first step where those constraints allow the forced token ID. The thinking block can then run past the budget.
 
 ## Differences from upstream vLLM
 
@@ -69,13 +69,13 @@ The runner does not override other constraints. If structured outputs or `min_to
 
 With [speculative decoding](speculative_decoding.md), the runner enforces the budget in the verification step: it forces the target and bonus positions that reach the budget, and rejects any draft token that differs from the forced token. The cap is the same as without speculation; it has been validated with N-gram and MTP drafting.
 
-With `TPU_GREEDY_TOP_TOKENS`, greedy steps keep taking the vocabulary-parallel argmax when requests set a budget (such steps already exclude logprobs, structured outputs, and requests below `min_tokens`): the runner rewrites the selected token IDs instead of the logits. The precompile step then also warms these token-ID variants.
+With `TPU_GREEDY_TOP_TOKENS`, greedy steps keep taking the vocabulary-parallel argmax when requests set a budget. Such steps already exclude logprobs, structured outputs, and requests below `min_tokens`, so the runner rewrites the selected token IDs instead of masking the logits. Precompilation also warms these token-ID forcing graphs.
 
 ## Cost
 
 - **Without a reasoning parser or `--reasoning-config`**, nothing is compiled or allocated and sampling is unchanged.
 - **With a parser, while no running request sets a budget**, sampling does no extra per-step work. In a mixed batch, requests without a budget are unaffected.
-- **Startup** precompiles the forcing kernels for every request bucket, plus every verify bucket with speculative decoding. On TPU v7x (`TP=8`), this took 3.7 s for plain decode (Qwen3-8B, 128 sequences), 15.7 s with MTP `K=2` (Qwen3.5-27B, 32 sequences), and 29.9 s with N-gram `K=3` (Qwen3-8B, 128 sequences). With `TPU_GREEDY_TOP_TOKENS`, which also warms the top-token variants, it took 5.6 s, 17.6 s, and 33.4 s. KV-cache capacity changed by at most one block.
+- **Startup** precompiles the thinking-budget sampler functions for every request bucket, plus every verify bucket with speculative decoding. On TPU v7x (`TP=8`), this took 3.7 s for plain decode (Qwen3-8B, 128 sequences), 15.7 s with MTP `K=2` (Qwen3.5-27B, 32 sequences), and 29.9 s with N-gram `K=3` (Qwen3-8B, 128 sequences). With `TPU_GREEDY_TOP_TOKENS`, which also warms the top-token variants, it took 5.6 s, 17.6 s, and 33.4 s. KV-cache capacity changed by at most one block.
 - **Decode** cost, measured on Qwen3-8B (TPU v7x, `TP=8`, greedy, `TPU_GREEDY_TOP_TOKENS=0`) with a budget large enough that no request was forced:
 
 | Mode | Sequences | TPOT, no budget | TPOT, every request budgeted |
