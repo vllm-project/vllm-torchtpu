@@ -10,7 +10,7 @@ a latent mixture of experts.
   (`decoder_block: olmoe3`).
 
 - **Support tier**: `Experimental`
-- **Owners**: `@sierraisland`
+- **Owners**: `@sierraisland`, `@wenxindongwork`
 
 ## Directory Layout
 
