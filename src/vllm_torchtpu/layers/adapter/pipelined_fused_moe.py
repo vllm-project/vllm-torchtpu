@@ -205,6 +205,7 @@ def pipelined_fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    return_rows: bool = False,
 ) -> torch.Tensor:
     """Wrapper around fused_moe_gmm to pipeline DP/PCP collectives and compute.
 
@@ -238,10 +239,17 @@ def pipelined_fused_moe_gmm(
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.
         skip_padded_tokens: Optional flag to skip padded tokens.
+        return_rows: Not supported here: the rows of each expert are reduced
+            after this wrapper's reduce-scatter would already have run.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
+    if return_rows:
+        raise NotImplementedError(
+            "pipelined_fused_moe_gmm reduce-scatters weighted sums; expert rows "
+            "(return_rows=True) need the caller's own collectives"
+        )
     collective_group, _ = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]

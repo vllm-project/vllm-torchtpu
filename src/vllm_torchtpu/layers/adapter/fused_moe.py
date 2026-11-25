@@ -31,7 +31,7 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool, bool], Callable] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -157,6 +157,7 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    return_rows: bool = False,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -181,6 +182,7 @@ def _build_fused_moe_custom_op(
         onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        return_rows=return_rows,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -188,11 +190,21 @@ def _build_fused_moe_custom_op(
     # We must overwrite the default fake implementation as vLLM uses dynamic
     # dimensions for the hidden_states.
     def _fake_fused_moe(hidden_states, *args, **kwargs):
+        if return_rows:
+            num_tokens, hidden_size = hidden_states.shape
+            return hidden_states.new_empty((num_tokens, topk, hidden_size))
         return torch.empty_like(hidden_states)
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        return_rows,
+    )
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -204,10 +216,18 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    return_rows: bool = False,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
-    cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    cache_key = (
+        topk,
+        activation,
+        use_ep,
+        rhs_quant_dtype,
+        skip_padded_tokens,
+        return_rows,
+    )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -217,6 +237,7 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        return_rows=return_rows,
     )
 
 
@@ -227,6 +248,7 @@ def prebuild_fused_moe_kernel(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    return_rows: bool = False,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -235,6 +257,7 @@ def prebuild_fused_moe_kernel(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        return_rows=return_rows,
     )
 
 
@@ -253,6 +276,7 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    return_rows: bool = False,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -265,6 +289,9 @@ def fused_moe_gmm(
     program identical across ranks. The kernel remaps global ids to local ids
     with an elementwise subtract and masks non-local experts. When present,
     the sparse-core parity path dispatches ragged gather/gather-reduce.
+
+    With ``return_rows`` the result is the unweighted expert rows
+    [num_tokens, topk, hidden].
     """
     use_ep = experts_start is not None
     fused_moe = _get_fused_moe_custom_op(
@@ -273,6 +300,7 @@ def fused_moe_gmm(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        return_rows=return_rows,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand

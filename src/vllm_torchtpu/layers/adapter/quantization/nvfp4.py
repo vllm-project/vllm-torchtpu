@@ -262,6 +262,17 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
     def get_name(cls) -> QuantizationMethods:
         return NVFP4
 
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> VllmNvfp4Config:
+        quant_config = cast("VllmNvfp4Config", super().from_config(config))
+        # Checkpoints exported through transformers also list every unquantized
+        # module by full name in modules_to_not_convert.
+        not_converted = config.get("modules_to_not_convert") or []
+        quant_config.exclude_modules = list(
+            dict.fromkeys([*quant_config.exclude_modules, *not_converted])
+        )
+        return quant_config
+
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
         super().apply_vllm_mapper(hf_to_vllm_mapper)
         map_online_fp8(self, hf_to_vllm_mapper)
