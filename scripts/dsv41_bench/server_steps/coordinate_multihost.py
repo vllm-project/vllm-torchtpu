@@ -13,11 +13,13 @@ head host.
   preparation would otherwise eat the MP rendezvous timeout.
 - Shutdown: after the head's ``benchmark/formal-complete`` the worker sends
   SIGTERM to its ``benchmark/launcher.pid`` (run.py's orderly stop, which the
-  audit requires), waits for its benchmark to exit and posts its results. Only
-  then does the head get ``benchmark/shutdown-permitted``: stopping the DP
+  audit requires), waits for its benchmark to exit and posts its exit status.
+  Only then does the head get ``benchmark/shutdown-permitted``: stopping the DP
   master first would look like a peer crash to the worker.
-- Collection: the worker's ``worker/`` tree arrives as a tar and is unpacked
-  next to the head's results, where the head runs ``audit_multihost.py``.
+- Collection: the worker's ``worker/`` tree then arrives as a tar and is
+  unpacked next to the head's results, where the head runs
+  ``audit_multihost.py``. It is bounded apart from the stop: a profile makes
+  the tree ~0.9 GB, whose packing and upload alone outlasted the 120 s stop.
 
 Fail-closed. The head fails the run if the worker exits early, reports a
 failure, goes silent, or a second worker appears after launch (a recreated pod
@@ -100,6 +102,7 @@ class HeadState:
         self.abort = False
         self.error: str | None = None
         self.worker_rc: int | None = None
+        self.worker_results = False
         # Monotonic time of the registered worker's last poll.
         self.worker_seen: float | None = None
 
@@ -163,7 +166,7 @@ def make_handler(state: HeadState):
             body = self.rfile.read(length)
             path = urllib.parse.urlsplit(self.path).path
             worker = self.worker()
-            if not worker or path not in ("/ready", "/result"):
+            if not worker or path not in ("/ready", "/stopped", "/result"):
                 self.reply({"error": "not found"}, 404)
                 return
             state.check_worker(worker)
@@ -173,6 +176,11 @@ def make_handler(state: HeadState):
                 self.reply(state.snapshot())
                 return
             rc = int(self.headers.get("X-Exit-Status", "1"))
+            if path == "/stopped":
+                with state.lock:
+                    state.worker_rc = rc
+                self.reply({"received": True})
+                return
             try:
                 with tarfile.open(fileobj=io.BytesIO(body), mode="r:gz") as tar:
                     if any(
@@ -185,7 +193,10 @@ def make_handler(state: HeadState):
                 log(f"head: cannot unpack worker results: {error}")
                 rc = rc or 1
             with state.lock:
-                state.worker_rc = rc
+                # A failed /stopped post leaves the status to arrive here.
+                if state.worker_rc is None or rc:
+                    state.worker_rc = rc
+                state.worker_results = True
             self.reply({"received": True})
 
     return Handler
@@ -246,10 +257,11 @@ def supervise_head(args, state: HeadState, bench: subprocess.Popen) -> int:
     status = 1 if state.abort else rc
     # The endpoint stays up meanwhile, so a worker still running sees the
     # abort, stops and sends its logs.
-    if not wait_for(
-        lambda: state.worker_rc is not None, args.collect_timeout, args.poll
-    ):
+    if not wait_for(lambda: state.worker_results, args.collect_timeout, args.poll):
         log("head: worker results never arrived")
+        status = status or 1
+    elif state.worker_rc:
+        log(f"head: worker reported failure ({state.worker_rc})")
         status = status or 1
     if not (results / "worker").is_dir():
         log("head: missing worker/ results")
@@ -358,6 +370,18 @@ def supervise_worker(args, worker_id: str, bench: subprocess.Popen) -> str | Non
     return None
 
 
+def post(url: str, data: bytes, rc: int, what: str, poll: float) -> bool:
+    """POST ``data`` with exit status ``rc``, five attempts; whether it arrived."""
+    for attempt in range(1, 6):
+        try:
+            request(url, data=data, headers={"X-Exit-Status": str(rc)})
+            return True
+        except (OSError, ValueError) as error:
+            log(f"worker: {what} upload attempt {attempt}/5 failed: {error}")
+            time.sleep(poll)
+    return False
+
+
 def run_worker(args) -> int:
     results = Path(args.results) / "worker"
     base = f"http://{args.head}:{args.port}"
@@ -375,22 +399,14 @@ def run_worker(args) -> int:
     finally:
         terminate(bench)
 
+    post(f"{base}/stopped?worker={worker_id}", b"", rc, "exit status", args.poll)
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
         if results.is_dir():
             tar.add(results, arcname="worker")
-    for attempt in range(1, 6):
-        try:
-            request(
-                f"{base}/result?worker={worker_id}",
-                data=buffer.getvalue(),
-                headers={"X-Exit-Status": str(rc)},
-            )
-            break
-        except (OSError, ValueError) as error:
-            log(f"worker: result upload attempt {attempt}/5 failed: {error}")
-            time.sleep(args.poll)
-    else:
+    if not post(
+        f"{base}/result?worker={worker_id}", buffer.getvalue(), rc, "result", args.poll
+    ):
         log("worker: the head never received the results; it fails the run")
     # The head is the verdict either way: it has this exit status, or it fails
     # for want of the worker's results. A failing worker pod would instead fail
