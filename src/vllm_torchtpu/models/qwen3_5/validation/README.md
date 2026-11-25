@@ -42,6 +42,11 @@ Each leg (`prefill`, `decode`) lists:
   68 slots per rank (64 experts and 4 copies).
   Per-pod wiring (ports, hosts, engine ids, cache directories) is
   deployment-specific and not recorded.
+  Every leg also ran with `VLLM_KV_CACHE_LAYOUT=HND`, the seq-along-lane
+  KV cache, which vLLM reads and so this list cannot carry. The 128-token
+  kernel page both legs share and the batched RPA tuned tiles
+  (`attention.qwen3_5_tuned_tiles`) apply only on that layout: set it when
+  serving an entry.
 - `additional_config`: the `--additional-config` JSON for the leg. The
   `qwen3_5` section holds Qwen3.5 settings (`settings.py`); other sections
   belong to shared subsystems.

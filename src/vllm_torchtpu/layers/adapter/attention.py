@@ -647,17 +647,58 @@ def _pallas_rpa_kernel_default_bundled(
     return new_bundle, outputs
 
 
+# The KV role and the tensor, prefill context and decode context parallel
+# sizes of the Qwen3.5-397B-A17B PD legs the batched RPA tuned tiles were
+# measured on: the validation entries' legs (models/qwen3_5/validation/), all
+# run with the seq-along-lane KV cache (VLLM_KV_CACHE_LAYOUT=HND).
+_QWEN3_5_TUNED_TILE_LEGS = frozenset(
+    {
+        # Every point's prefill leg: PP8 x TP1, two KV heads per device.
+        ("kv_producer", 1, 1, 1),
+        # Point 1's decode leg: DP4 x TP2, one KV head per device.
+        ("kv_consumer", 2, 1, 1),
+        # The other points' decode legs: TP8 + DCP4, one KV head per device.
+        ("kv_consumer", 8, 1, 4),
+    }
+)
+
+
 def qwen3_5_tuned_tiles(vllm_config: VllmConfig | None) -> bool:
     """Whether the engine's batched RPA layers take the tuned tiles and decode
-    lanes (``tuned_tiles``): for a Qwen3.5 target, whose PD deployments were
-    tuned and validated with them. Every other model keeps the default tiles.
-    The rule keys on the engine's target model, so a Qwen3.5 MTP draft, which
-    runs under a copy of the target's config, takes them too."""
+    lanes (``tuned_tiles``): only on the legs they were measured on.
+
+    That is Qwen3.5-397B-A17B on TPU7x (``hooks.is_measured_target``), on a PD
+    leg whose KV role and parallel sizes are those of a validation entry's leg
+    (``_QWEN3_5_TUNED_TILE_LEGS``), with the seq-along-lane KV cache those legs
+    ran. Every other engine keeps main's tiles, among them main's CI model
+    (Qwen3.5-35B-A3B) and main's Qwen3.5-397B nightly configurations: at two
+    KV heads per device in the head-along-sublane layout the tuned decode
+    tiles need more VMEM than TPU7x has (Qwen3.5-35B-A3B at TP1, and
+    Qwen3.5-397B at TP1 x DP8). The rule keys on the engine's config, so a
+    Qwen3.5 MTP draft, which runs under a copy of the target's config, takes
+    the target's answer."""
     if vllm_config is None:
         return False
-    from vllm_torchtpu.models.qwen3_5 import settings as qwen3_5_settings
+    from vllm_torchtpu.models.qwen3_5 import hooks as qwen3_5_hooks
 
-    return qwen3_5_settings.is_qwen3_5(vllm_config.model_config)
+    if not qwen3_5_hooks.is_measured_target(vllm_config.model_config):
+        return False
+    transfer = vllm_config.kv_transfer_config
+    if transfer is None:
+        return False
+    parallel = vllm_config.parallel_config
+    leg = (
+        transfer.kv_role,
+        parallel.tensor_parallel_size,
+        parallel.prefill_context_parallel_size,
+        parallel.decode_context_parallel_size,
+    )
+    if leg not in _QWEN3_5_TUNED_TILE_LEGS:
+        return False
+    layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+    return (
+        KV_LAYOUT_BY_VLLM_LAYOUT[layout] is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+    )
 
 
 def _pallas_rpa_kernel_batched(

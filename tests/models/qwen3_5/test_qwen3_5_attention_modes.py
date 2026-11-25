@@ -35,7 +35,11 @@ QWEN35 = "Qwen3_5MoeForConditionalGeneration"
 def _vllm_config(section=None, arch=QWEN35, role="kv_consumer"):
     additional = {} if section is None else {"qwen3_5": section}
     return SimpleNamespace(
-        model_config=SimpleNamespace(architectures=[arch], max_model_len=262144),
+        # The text config of no measured checkpoint: the batched layer's
+        # tuned-tiles rule reads it (attention.qwen3_5_tuned_tiles).
+        model_config=SimpleNamespace(
+            architectures=[arch], max_model_len=262144, hf_text_config=SimpleNamespace()
+        ),
         additional_config=additional,
         speculative_config=None,
         kv_transfer_config=None if role is None else SimpleNamespace(kv_role=role),
