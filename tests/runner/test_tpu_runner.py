@@ -2909,6 +2909,8 @@ def test_prepare_inputs_single_req_fast_path_matches_general_path(
             speculative_config=None,
             _pre_async_results=None,
             _decode_device_cache_key=None,
+            _unfenced_h2d_sources=[],
+            _registered_h2d_sources=set(),
             _request_distribution_cpu=torch.zeros(3, dtype=torch.int32),
             _has_mamba_state=False,
             mamba_slot_read_offsets=None,
@@ -3393,3 +3395,28 @@ def test_padded_sampling_params_skip_filters_no_row_uses(top_k, top_p, padded_to
     else:
         assert k.view(-1).tolist() == padded_top_k
         assert p.view(-1).tolist() == pytest.approx(top_p + [1.0, 1.0])
+
+
+def test_upload_unchanged_reuses_the_device_copy_until_values_change():
+    from vllm_torchtpu.runner.tpu_runner import _upload_unchanged
+
+    runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+    )
+    values = np.array([0, 6, 12], dtype=np.int32)
+    first = _upload_unchanged(runner, "qsl", values)
+    # The host buffer is rewritten in place each step; the cache owns a copy.
+    values[:] = [0, 6, 12]
+    assert _upload_unchanged(runner, "qsl", values) is first
+    values[2] = 13
+    changed = _upload_unchanged(runner, "qsl", values)
+    assert changed is not first
+    assert first.tolist() == [0, 6, 12] and changed.tolist() == [0, 6, 13]
+    # Same values under another dtype or slot are uploaded on their own.
+    as_int64 = _upload_unchanged(runner, "qsl", values.astype(np.int64))
+    assert as_int64 is not changed and as_int64.dtype == torch.int64
+    assert _upload_unchanged(runner, "other", values) is not changed
+    # Every upload's private host copy stays alive until the staging fence.
+    assert len(runner._unfenced_h2d_sources) == 4

@@ -428,6 +428,8 @@ def test_prepare_inputs_single_req_fast_path_matches_general_path():
             speculative_config=None,
             _pre_async_results=None,
             _decode_device_cache_key=None,
+            _unfenced_h2d_sources=[],
+            _registered_h2d_sources=set(),
             _request_distribution_cpu=torch.zeros(3, dtype=torch.int32),
             _has_mamba_state=False,
             mamba_slot_read_offsets=None,

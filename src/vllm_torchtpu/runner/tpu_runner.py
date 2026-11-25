@@ -309,6 +309,32 @@ def _spec_logprob_row_tokens(
     return out[:num_rows, None]
 
 
+def _upload_unchanged(runner, slot: str, values: np.ndarray) -> torch.Tensor:
+    """The device copy of small host `values`, uploaded only when they differ
+    from the last values uploaded for `slot` by this runner.
+
+    A steady decode batch rebuilds the same per-step index vectors every step;
+    each upload is a separate host dispatch on the step's critical path. The
+    upload reads a private copy of the values, which `stage_h2d_upload` keeps
+    alive until a fence recorded after it has been waited on, so the caller may
+    refill its buffer and a replaced copy outlives its transfer. The cache is
+    created on first use, so runners built without `__init__` (tests) work.
+    """
+    cache = runner.__dict__.setdefault("_unchanged_uploads", {})
+    entry = cache.get(slot)
+    if (
+        entry is not None
+        and entry[0].dtype == values.dtype
+        and entry[0].shape == values.shape
+        and np.array_equal(entry[0], values)
+    ):
+        return entry[1]
+    host = values.copy()
+    device = stage_h2d_upload(runner, torch.from_numpy(host))
+    cache[slot] = (host, device)
+    return device
+
+
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
@@ -2377,12 +2403,14 @@ class TPUModelRunner(GPUModelRunner):
                 constant_values=-1,
             )
 
-            cur_input_indices = torch.from_numpy(
-                padded_token_in_tpu_cur_input_indices
-            ).to(self.device, non_blocking=True)
-            pre_next_tokens_indices = torch.from_numpy(
-                padded_token_in_tpu_pre_next_tokens_indices
-            ).to(self.device, non_blocking=True)
+            cur_input_indices = _upload_unchanged(
+                self, "substitution_cur", padded_token_in_tpu_cur_input_indices
+            )
+            pre_next_tokens_indices = _upload_unchanged(
+                self,
+                "substitution_pre_next",
+                padded_token_in_tpu_pre_next_tokens_indices,
+            )
 
         return _substitute_placeholder_token(
             input_ids,
@@ -3190,8 +3218,8 @@ class TPUModelRunner(GPUModelRunner):
                 seq_lens,
                 self.position_ids,
                 self._pre_async_results.spec_decode_num_rejected_tokens,
-                torch.from_numpy(seq_idx_np).to(self.device, non_blocking=True),
-                torch.from_numpy(pos_idx_np).to(self.device, non_blocking=True),
+                _upload_unchanged(self, "rejected_seq_idx", seq_idx_np),
+                _upload_unchanged(self, "rejected_pos_idx", pos_idx_np),
             )
 
         # For decode-only case, cache constant device tensors to skip H2D.
@@ -3251,14 +3279,13 @@ class TPUModelRunner(GPUModelRunner):
         else:
             # Compute and copy to device (first call or shape changed).
             if use_max_model_len:
-                query_start_loc = self.query_start_loc_cpu[
-                    : self.num_reqs_max_model_len + 1
-                ].to(self.device, non_blocking=True)
+                bound_reqs = self.num_reqs_max_model_len
             else:
                 assert self.num_reqs_most_model_len is not None
-                query_start_loc = self.query_start_loc_cpu[
-                    : self.num_reqs_most_model_len + 1
-                ].to(self.device, non_blocking=True)
+                bound_reqs = self.num_reqs_most_model_len
+            query_start_loc = _upload_unchanged(
+                self, "query_start_loc", self.query_start_loc_np[: bound_reqs + 1]
+            )
 
             if spec_decode_metadata is not None:
                 logits_indices = spec_decode_metadata.final_logits_indices
@@ -3281,8 +3308,8 @@ class TPUModelRunner(GPUModelRunner):
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_num_decode
             self._request_distribution_cpu[2] = num_reqs
-            request_distribution = self._request_distribution_cpu.to(
-                self.device, non_blocking=True
+            request_distribution = _upload_unchanged(
+                self, "request_distribution", self._request_distribution_cpu.numpy()
             )
 
             if can_cache_decode_metadata:

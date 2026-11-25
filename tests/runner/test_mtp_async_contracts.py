@@ -326,6 +326,9 @@ def test_proposed_drafts_reach_next_inputs(device, k, mode):
     runner.speculative_config = SimpleNamespace(num_speculative_tokens=k)
     runner._last_sequence_layout_plan = None
     runner._fast_token_substitution = False
+    # Uploads stage their host copies until a staging fence is waited on.
+    runner._unfenced_h2d_sources = []
+    runner._registered_h2d_sources = set()
     drafts = torch.tensor(
         [list(range(101, 101 + k)), list(range(201, 201 + k))],
         dtype=torch.int32,
