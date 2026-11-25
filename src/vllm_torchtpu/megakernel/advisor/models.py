@@ -53,6 +53,7 @@ from .specs import (
     as_mapping,
     as_scalar_number,
     as_sequence,
+    format_parallel_layout_label,
     int_tuple,
     scalar_float,
     scalar_int,
@@ -1044,15 +1045,7 @@ class ParallelLayout:
 
     def label(self) -> str:
         """Return the layout as `TP8 x EP8 x DCP4`, omitting degree-1 axes."""
-        axes = (
-            ("TP", self.tp),
-            ("DP", self.dp),
-            ("EP", self.ep),
-            ("PP", self.pp),
-            ("PCP", self.pcp),
-            ("DCP", self.dcp),
-        )
-        return " x ".join(f"{name}{deg}" for name, deg in axes if deg > 1) or "TP1"
+        return format_parallel_layout_label(self)
 
     def submodule_label(self) -> str:
         """Return the attention mesh and the routed-expert mesh as one label."""
