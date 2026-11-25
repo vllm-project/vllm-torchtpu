@@ -111,3 +111,84 @@ def test_window_fits_vmem():
     assert msa_attention_pairs._max_window(32, HEAD_DIM) == 400
     assert msa_attention_pairs.supports(32, HEAD_DIM, 128, 2048)
     assert not msa_attention_pairs.supports(4096, HEAD_DIM, 128, 2048)
+
+
+def test_pairs_many_blocks_of_mixed_sizes():
+    """More blocks than a unit and the copy ring hold, of every width: many
+    page keys (aliasing the few physical pages) picked by a handful of tokens
+    each, and hot keys whose runs are cut into several blocks."""
+    rng = np.random.default_rng(7)
+    num_tokens, num_keys, hot = 300, 90, 3
+    q = jnp.asarray(rng.standard_normal((num_tokens, Q_PER_KV, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+    table = rng.integers(0, PAGES, num_keys).astype(np.int32)
+    keys = np.full((num_tokens, TOPK), -1, np.int32)
+    local_key = np.full(num_tokens, -1, np.int32)
+    local_limit = np.zeros(num_tokens, np.int32)
+    for t in range(num_tokens):
+        chosen = np.concatenate(
+            [rng.choice(hot, 2, replace=False), hot + rng.choice(num_keys - hot, 3)]
+        )
+        keys[t, : len(chosen)] = chosen
+        local_key[t] = chosen[-1]
+        local_limit[t] = rng.integers(1, 129)
+    kv, scales, rows = _fp4_cache(rng, 1)
+    got = msa_sparse_attention_pairs(
+        q,
+        kv,
+        jnp.asarray(keys),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        scale_cache=jnp.asarray(scales),
+        window=152,
+        interpret=True,
+    )
+    got = np.asarray(got.astype(jnp.float32))
+    dedup = keys.copy()
+    for t in range(num_tokens):  # a page listed twice counts once
+        _, first = np.unique(keys[t], return_index=True)
+        dup = np.ones(TOPK, bool)
+        dup[first] = False
+        dedup[t, dup] = -1
+    want, _ = _reference(
+        np.asarray(q.astype(jnp.float32)), rows, dedup, local_key, local_limit, table, 0
+    )
+    np.testing.assert_allclose(got, want.transpose(1, 0, 2), atol=2e-2)
+
+
+def test_pairs_window_on_page_key_zero_only():
+    """A window whose few pairs all select page key 0: its block holds
+    those pairs only, not the padding past them (key 0 too)."""
+    rng = np.random.default_rng(3)
+    num_tokens = 40
+    q = jnp.asarray(rng.standard_normal((num_tokens, Q_PER_KV, HEAD_DIM))).astype(
+        jnp.bfloat16
+    )
+    table = rng.permutation(PAGES).astype(np.int32)
+    keys = np.full((num_tokens, TOPK), -1, np.int32)
+    keys[:3, 0] = 0
+    local_key = np.full(num_tokens, -1, np.int32)
+    local_limit = np.zeros(num_tokens, np.int32)
+    local_key[1], local_limit[1] = 0, 70
+    kv, scales, rows = _fp4_cache(rng, 1)
+    got = msa_sparse_attention_pairs(
+        q,
+        kv,
+        jnp.asarray(keys),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        scale_cache=jnp.asarray(scales),
+        window=32,
+        interpret=True,
+    )
+    got = np.asarray(got.astype(jnp.float32))
+    want, _ = _reference(
+        np.asarray(q.astype(jnp.float32)), rows, keys, local_key, local_limit, table, 0
+    )
+    assert np.abs(got[:, :3]).max() > 0
+    np.testing.assert_allclose(got, want.transpose(1, 0, 2), atol=2e-2)
