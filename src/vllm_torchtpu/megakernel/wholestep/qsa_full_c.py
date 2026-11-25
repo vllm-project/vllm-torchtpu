@@ -218,6 +218,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         B = ctx.extra[POOL].shape[1]
         return jax.lax.rem(pos // B, self.dcp) == jax.lax.rem(ctx.me, self.dcp)
 
+    @property
+    def _need_row_ids(self) -> bool:
+        """Whether per-row `qi_id` / `qi_ids` compaction and exchange are consumed."""
+        return (not self.union_attn) or self.debug or self.export_ids
+
     def _union_width(self, ex: ExecSpec) -> int:
         """Union slots per request: every row's whole selection, 128-lane aligned."""
         return -(-(ex.T * self.budget) // 128) * 128
@@ -979,7 +984,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
                 return self._by_tier(ctx.extra[NVIS][r], ctiers, scan)
 
-            need_row_ids = (not self.union_attn) or self.debug or self.export_ids
+            need_row_ids = self._need_row_ids
 
             def scan_row(r: Any, Sx: int, consts: Any, lid: Any) -> Any:
                 """Row `r`'s selection and compaction over score rows [0, Sx) (Sx < S: a
@@ -1269,13 +1274,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             self._exchange_merged(ctx)
             return
         ex, scr, K, T, MB = ctx.ex, ctx.scr, self.budget, ctx.ex.T, ctx.ex.MB
-        need_row_ids = (not self.union_attn) or self.debug or self.export_ids
+        need_row_ids = self._need_row_ids
         npr, rows, W = self._shard_rows(ex)
         me = ctx.me
         lane = jax.lax.broadcasted_iota(I32, (1, W), 1)
         lo = self._run(ctx) * rows
-        if need_row_ids:
-            scr["qi_z"][...] = jnp.zeros((1, 128), I32)
+        scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
 
         def pack(i: Any, carry: Any) -> Any:
             r = jnp.minimum(lo + i, MB - 1)  # past the last request: never read
@@ -1321,7 +1325,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         same lanes as `qg_send`) and its union (the same lanes as `qgu_send`, offset `u0`);
         unpacked into the same scratch as the two exchanges. int32 copies only."""
         ex, scr, K, T, MB = ctx.ex, ctx.scr, self.budget, ctx.ex.T, ctx.ex.MB
-        need_row_ids = (not self.union_attn) or self.debug or self.export_ids
+        need_row_ids = self._need_row_ids
         nreq = MB // T
         npr, rows, WS = self._shard_rows(ex)
         u0, _ = self._xmerge_width(ex)
@@ -1331,8 +1335,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         ulane = jax.lax.broadcasted_iota(I32, (1, 2 * W + 128), 1)
         run = self._run(ctx)
         send, recv = scr["qm_send"], scr["qm_recv"]
-        if need_row_ids:
-            scr["qi_z"][...] = jnp.zeros((1, 128), I32)
+        scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
 
         bal = self._balanced(ex)
 

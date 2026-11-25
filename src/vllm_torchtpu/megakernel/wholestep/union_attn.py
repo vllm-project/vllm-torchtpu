@@ -100,6 +100,8 @@ def compact_union(
     16 rows, j-c89e9978; 512 per pass still 62.4, j-bfd3a7f8); each slot's code is
     gathered from its group's sublane row by the
     same one-hot matmul (codes <= 15 are exact in BF16).
+
+    Kept as a pure-array reference and test oracle for `compact_union_into`.
     """
     U, Us, jcol0, srow, lane = consts
     S, W = code.shape[0], jcol0.shape[0]
