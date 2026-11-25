@@ -191,7 +191,7 @@ def test_eviction_waits_for_every_loader(evicted, monkeypatch, agreed):
     order.clear()
     mlp._loaded_weight_files.update(dict.fromkeys(["a"]))
     mlp.evict_loaded_weights_page_cache()
-    assert order == ["stop", "agree", "evict"] if agreed else ["stop", "agree"]
+    assert order == (["stop", "agree", "evict"] if agreed else ["stop", "agree"])
 
 
 @pytest.mark.parametrize("flag", [True, False])
