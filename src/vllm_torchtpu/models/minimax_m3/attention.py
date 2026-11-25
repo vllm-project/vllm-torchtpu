@@ -496,22 +496,15 @@ class MiniMaxM3SparseAttention(nn.Module):
         return self.head_dim**0.5 * q_gain * k_gain * self.key_rounding
 
     def _qkv(
-        self,
-        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        columns: int | None = None,
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
     ) -> torch.Tensor:
-        """qkv_proj of the rows, on its first ``columns`` output columns
-        (None: all)."""
-        method = self.qkv_proj.quant_method
-        e4m3_apply = getattr(method, "apply_e4m3_rows", None)
+        e4m3_apply = getattr(self.qkv_proj.quant_method, "apply_e4m3_rows", None)
         if isinstance(hidden_states, tuple) and e4m3_apply is None:
             q8, row_scale = hidden_states
             hidden_states = (q8.float() * row_scale).to(torch.bfloat16)
         if isinstance(hidden_states, tuple):
             # qkv_proj is bias-free and keeps the linear's forward = apply.
-            return e4m3_apply(self.qkv_proj, *hidden_states, columns=columns)
-        if columns is not None:
-            return method.apply(self.qkv_proj, hidden_states, columns=columns)
+            return e4m3_apply(self.qkv_proj, *hidden_states)
         qkv, _ = self.qkv_proj(hidden_states)
         return qkv
 
@@ -533,25 +526,23 @@ class MiniMaxM3SparseAttention(nn.Module):
         of them), attended with the step's derived metadata (StepHalves)."""
         if half is not None:
             positions = half[0].positions_of(half[1])
-        # dcp_local_kv: decode-sized steps project the group's KV heads (all
-        # of qkv_proj's columns), larger ones only this rank's (the first
-        # `width`, the unprepared weight's) and gather the others.
-        width = None
+        # dcp_local_kv: decode-sized steps also project the group's other KV
+        # heads; larger ones gather them.
         local = False
         if self.local_kv_heads > 1:
-            width = (self.num_heads + 4) * self.head_dim
-            local = positions.shape[0] < dcp_local_kv.MAX_TOKENS
             order = dcp_local_kv.group_order(
-                self.dcp_rank, self.local_kv_heads, self.kv_head_replicas
+                self.qkv_proj, self.dcp_rank, self.local_kv_heads, self.kv_head_replicas
             )
-        columns = None if local else width
+            local = (
+                qkv is None
+                and isinstance(hidden_states, torch.Tensor)
+                and positions.shape[0] < dcp_local_kv.MAX_TOKENS
+            )
         if qkv is None and isinstance(hidden_states, list):
             # An SP step's gathered row pieces: project each as it lands.
-            qkv = _step_rows([self._qkv(p, columns) for p in hidden_states])
+            qkv = _step_rows([self._qkv(p) for p in hidden_states])
         elif qkv is None:
-            qkv = self._qkv(hidden_states, columns)
-        elif columns is not None:
-            qkv = qkv[:, :columns]
+            qkv = self._qkv(hidden_states)
         if after is not None:
             # The caches are written in place: this call's writes must follow
             # the reads of the call that produced `after` (else XLA copies
@@ -560,14 +551,13 @@ class MiniMaxM3SparseAttention(nn.Module):
         kv_heads, norm_rope_op = self.num_kv_heads, self.norm_rope_op
         if local:
             kv_heads, norm_rope_op = self.local_kv_heads, self.local_norm_rope_op
-            if qkv.shape[-1] != width + 3 * (kv_heads - 1) * self.head_dim:
-                raise RuntimeError(
-                    f"qkv_proj emits {qkv.shape[-1]} columns, not the {kv_heads} "
-                    "group KV heads' of TPU_MINIMAX_M3_DCP_LOCAL_KV (prepared "
-                    "after loading)."
-                )
             qkv = dcp_local_kv.group_heads(
-                qkv, self.num_heads, self.head_dim, kv_heads, order
+                qkv,
+                dcp_local_kv.project(self.qkv_proj, hidden_states),
+                self.num_heads,
+                self.head_dim,
+                kv_heads,
+                order,
             )
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,

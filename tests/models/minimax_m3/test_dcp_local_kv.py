@@ -11,15 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""dcp_local_kv: a prepared qkv_proj keeps the unprepared weight as its
-column prefix, and `group_heads` turns its projection into this rank's q, the
-group's K / V / index_q heads in DCP rank order (the order ops/msa.py
-`gather_group_kv` all-gathers them in) and its index_k."""
+"""dcp_local_kv: `group_heads` turns qkv_proj's projection and the group
+columns' into this rank's q, the group's K / V / index_q heads in DCP rank
+order (the order ops/msa.py `gather_group_kv` all-gathers them in) and its
+index_k."""
 
 import pytest
 import torch
+from torch import nn
 
 from vllm_torchtpu.models.minimax_m3.dcp_local_kv import (
+    PREPARED_ATTR,
     group_columns,
     group_heads,
     group_order,
@@ -55,29 +57,27 @@ def test_group_heads_in_rank_order(dcp, replicas):
     x = torch.randn(5, K, generator=torch.Generator().manual_seed(1))
     kvi = slice(NQ * D, (NQ + 3) * D)
     heads = dcp // replicas
-    width = (NQ + 4) * D
     for first in range(0, TP, dcp):
         group = ranks[first : first + dcp]
         own = [_project(w, s, x) for w, s in group]
         # The gather path: rank g * replicas brings group head g.
         gathered = torch.stack(own)[::replicas, :, kvi].reshape(heads, -1, 3, D)
         for rank, (w, s) in enumerate(group):
-            new_w, new_s = group_columns(
-                w,
-                s,
+            group_w, group_s = group_columns(
                 torch.stack([gw[:, kvi] for gw, _ in group]),
                 torch.stack([gs[kvi] for _, gs in group]),
                 rank,
                 replicas,
             )
-            assert new_w.shape == (K, width + 3 * (heads - 1) * D)
-            assert torch.equal(new_w[:, :width], w)
-            assert torch.equal(new_s[:width], s)
-            order = group_order(
-                torch.tensor([rank], dtype=torch.int32), heads, replicas
-            )
-            got = group_heads(_project(new_w, new_s, x), NQ, D, heads, order)
+            assert group_w.shape == (K, 3 * (heads - 1) * D)
+            qkv_proj = nn.Module()
+            qkv_proj.group_weight, qkv_proj.group_scale = group_w, group_s
+            setattr(qkv_proj, PREPARED_ATTR, True)
+            dcp_rank = torch.tensor([rank], dtype=torch.int32)
+            order = group_order(qkv_proj, dcp_rank, heads, replicas)
             want = _project(w, s, x)
+            others = _project(group_w, group_s, x)
+            got = group_heads(want, others, NQ, D, heads, order)
             assert got.shape == (5, (NQ + 3 * heads + 1) * D)
             torch.testing.assert_close(got[:, : NQ * D], want[:, : NQ * D])
             torch.testing.assert_close(got[:, -D:], want[:, -D:])
@@ -92,14 +92,11 @@ def test_group_columns_move_bytes():
     kvi = slice(NQ * D, (NQ + 3) * D)
     group = ranks[:4]
     w8 = [to_bytes(w) for w, _ in group]
-    new_w, _ = group_columns(
-        w8[3],
-        group[3][1],
+    group_w, _ = group_columns(
         torch.stack([w[:, kvi] for w in w8]),
         torch.stack([s[kvi] for _, s in group]),
         3,
         2,
     )
-    assert new_w.dtype == torch.uint8
-    assert torch.equal(new_w[:, : w8[3].shape[1]], w8[3])
-    assert torch.equal(new_w[:, w8[3].shape[1] :], w8[0][:, kvi])
+    assert group_w.dtype == torch.uint8
+    assert torch.equal(group_w, w8[0][:, kvi])
