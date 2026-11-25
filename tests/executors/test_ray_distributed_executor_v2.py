@@ -68,6 +68,7 @@ class MockVllmConfig:
     return_value="127.0.0.1",
 )
 @patch("vllm_torchtpu.executors.ray_distributed_executor_v2._wait_until_pg_ready")
+@patch("vllm_torchtpu.executors.ray_distributed_executor_v2.get_num_chips", lambda: 0)
 class TestTpuRayDistributedExecutorV2:
     @pytest.fixture(autouse=True)
     def setup(self):
@@ -101,6 +102,31 @@ class TestTpuRayDistributedExecutorV2:
         mock_ray.init.assert_called_once()
         assert executor.parallel_config.placement_group == mock_placement_group
         mock_ray.util.placement_group.assert_called_once()
+
+    def test_initialize_ray_cluster_rejects_over_reported_tpu_devices(
+        self, mock_wait_until_pg_ready, mock_get_ip, mock_platform, mock_ray
+    ):
+        mock_platform.ray_device_key = "TPU"
+        mock_ray.is_initialized.return_value = True
+        mock_ray.nodes.return_value = [
+            {
+                "NodeID": "node_1",
+                "NodeManagerAddress": "10.0.0.1",
+                "Resources": {"TPU": 6.0},
+            }
+        ]
+        executor = RayDistributedExecutorV2(self.vllm_config)
+        executor.parallel_config = self.parallel_config
+
+        with (
+            patch(
+                "vllm_torchtpu.executors.ray_distributed_executor_v2.get_num_chips",
+                return_value=4,
+            ),
+            pytest.raises(ValueError, match="4 usable TPU compute devices"),
+        ):
+            executor._initialize_ray_cluster()
+        mock_ray.util.placement_group.assert_not_called()
 
     def test_initialize_ray_cluster_pipeline_parallelism(
         self, mock_wait_until_pg_ready, mock_get_ip, mock_platform, mock_ray

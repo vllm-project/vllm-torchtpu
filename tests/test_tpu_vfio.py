@@ -14,10 +14,10 @@
 """Unit tests for VFIO TPU detection, tpu_info helpers, and env_override fallback."""
 
 import io
+import logging
 import os
 import stat
 import types
-from unittest.mock import patch
 
 import jax.numpy as jnp
 import pytest
@@ -234,7 +234,7 @@ def test_get_num_chips_unreadable_sysfs_fallback_vs_inaccessible_vfio(monkeypatc
     assert tpu_vfio.detect_vfio_tpu_type() == "tpu7x"
 
 
-def test_get_num_chips_unknown_google_pci_id_warns_and_falls_back(monkeypatch):
+def test_get_num_chips_unknown_google_pci_id_warns_and_falls_back(monkeypatch, caplog):
     monkeypatch.setattr(tpu_info.glob, "glob", lambda pattern: [])
     _patch_vfio_fs(
         monkeypatch,
@@ -244,10 +244,9 @@ def test_get_num_chips_unknown_google_pci_id_warns_and_falls_back(monkeypatch):
             "0x1ae0\n" if s.endswith("/vendor") else "0x0099\n"
         ),
     )
-    with patch.object(tpu_vfio.logger, "warning_once") as warn_mock:
+    with caplog.at_level(logging.WARNING):
         assert tpu_info.get_num_chips() == 4
-    warn_mock.assert_called_once()
-    assert "0x0099" in str(warn_mock.call_args)
+    assert "0x0099" in caplog.text
 
     # Readable non-Google sysfs (e.g. NVIDIA GPU) still returns 0 with no fallback.
     _patch_vfio_fs(

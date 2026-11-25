@@ -204,7 +204,7 @@ def count_vfio_tpu_chips() -> int:
             "tpu_vfio | Found accessible Google PCI device(s) %s with no "
             "recognized TPU compute device ID; falling back to legacy VFIO "
             "count %d.",
-            sorted(unknown_google_ids),
+            ", ".join(sorted(unknown_google_ids)),
             accessible_count,
         )
         return accessible_count
