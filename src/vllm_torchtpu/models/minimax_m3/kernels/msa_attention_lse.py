@@ -81,6 +81,11 @@ DECODE_UNIT_GROUPS = 4
 UNIT_MAX_PAGES_8BIT = 16
 # Units whose pages are in flight ahead of the running one.
 UNIT_PREFETCH = 1
+# Unit bodies at most this wide emit every group's QK matmul, then every
+# softmax, then every p @ v, so the MXU takes another group's matmul while a
+# group's softmax runs (kernel bench, c64 b46 decode at locality .97: -8.6 %
+# per call; at 16+ pages the staged scores spill: c64 locality .5 +7 %).
+_STAGED_UNIT_PAGES = 8
 # Units pair only groups of one grid step (its query and output blocks), so
 # decode-tile calls put up to this many tiles in a step, their token count
 # padded to whole output windows (`_merged_store_rows`).
@@ -210,7 +215,7 @@ def _kernel(
     steps = pl.num_programs(0) if steps_per_call is None else steps_per_call
     num_groups = block_start_ref[steps]
     q_leaf = q_ref[0] if isinstance(q_ref, tuple) else q_ref
-    row_width = 2 * q_leaf.shape[-1]
+    row_width = 2 * q_leaf.shape[-1]  # the `head_dim` `_kernel_scratch` was given
     # A ring of whole cache rows (`_kernel_scratch`): one contiguous copy per
     # page, and a group reads its head's lanes.
     whole_rows = buf_ref.shape[-1] > row_width
@@ -615,9 +620,9 @@ def _kernel(
             `single` group (the tile's only one) needs no carried state."""
             update(*attend_parts(width, single), single, finish)
 
-        def attend_parts(width, single):
+        def attend_parts(width, single, staged=False):
             """`attend`'s ``(m_prev, m_new, l_cur, pv)`` over the group's first
-            `width` slots."""
+            `width` slots; with `staged`, its QK, softmax and p @ v steps."""
             if inline_issue_here and width > _INLINE_ISSUE_PAGES:
                 issue_next()
             # int4 and fp8 pages unpack in slot order; bf16 in the bitcast's order.
@@ -694,22 +699,33 @@ def _kernel(
             q = load_q().reshape(num_heads * block_q, head_dim)
             if not fp4:
                 q = (q.astype(jnp.float32) * scale).astype(q.dtype)
-            s = jax.lax.dot_general(
-                q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-            )
-            if fp4:  # x = int4 * scale: K scales the score columns, V scales p
-                s = s * (jnp.concatenate(k_scales, axis=1) * scale)
-            s = jnp.where(mask, s, -jnp.inf)
-            p, m_prev, m_new = exp_scores(s, single, 1)
-            l_cur = jnp.sum(p, axis=1, keepdims=True)
-            p_v = p * jnp.concatenate(v_scales, axis=1) if fp4 else p
-            pv = jax.lax.dot_general(
-                p_v.astype(jnp.bfloat16),
-                v,
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            return m_prev, m_new, l_cur, pv
+
+            def qk():
+                s = jax.lax.dot_general(
+                    q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
+                )
+                if fp4:  # x = int4 * scale: K scales the score columns, V scales p
+                    s = s * (jnp.concatenate(k_scales, axis=1) * scale)
+                return jnp.where(mask, s, -jnp.inf)
+
+            def softmax(s):
+                p, m_prev, m_new = exp_scores(s, single, 1)
+                l_cur = jnp.sum(p, axis=1, keepdims=True)
+                p_v = p * jnp.concatenate(v_scales, axis=1) if fp4 else p
+                return m_prev, m_new, l_cur, p_v
+
+            def p_at_v(m_prev, m_new, l_cur, p_v):
+                pv = jax.lax.dot_general(
+                    p_v.astype(jnp.bfloat16),
+                    v,
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )
+                return m_prev, m_new, l_cur, pv
+
+            if staged:
+                return qk, softmax, p_at_v
+            return p_at_v(*softmax(qk()))
 
         def fold(l_cur, pv):
             """A unit's group's `update` (`MAX_FREE`), after its earlier groups'."""
@@ -756,6 +772,7 @@ def _kernel(
                 alone=alone,
                 zero_to=zero_to,
                 parts=lambda width: attend_parts(width, False)[2:],
+                stages=lambda width: attend_parts(width, False, staged=True),
                 fold=fold,
                 empty=empty,
             )
@@ -824,7 +841,13 @@ def _kernel(
             def _body(width=width):
                 for g in groups:
                     g.zero_to(width)
-                parts = [g.parts(width) for g in groups]
+                if width <= _STAGED_UNIT_PAGES:
+                    stages = [g.stages(width) for g in groups]
+                    scores = [qk() for qk, _, _ in stages]
+                    probs = [sm(s) for (_, sm, _), s in zip(stages, scores)]
+                    parts = [pv(*p)[2:] for (_, _, pv), p in zip(stages, probs)]
+                else:
+                    parts = [g.parts(width) for g in groups]
                 for g, (l_cur, pv) in zip(groups, parts):
                     g.fold(l_cur, pv)
 
