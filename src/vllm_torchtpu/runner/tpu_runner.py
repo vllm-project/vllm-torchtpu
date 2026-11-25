@@ -90,7 +90,7 @@ from vllm_torchtpu.distributed.pp_wave import PPWave, pp_rank_flags
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter import expert_load, token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -118,6 +118,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     zeros_h2d_source,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
+    AllSequenceLayoutPlanner,
     SequenceLayoutKind,
     create_sequence_layout_planner,
 )
@@ -3630,6 +3631,7 @@ class TPUModelRunner(GPUModelRunner):
                     max_reqs=int(t[2].item()),
                     min_reqs=-int(t[9].item()),
                     max_num_reqs=int(self.max_num_reqs),
+                    padded_rows_counted=controller.padded_rows_counted,
                 ),
             )
         # Spec-decode draft forwards size themselves off the step's DP-wide
@@ -7209,6 +7211,32 @@ class TPUModelRunner(GPUModelRunner):
                     )
             except (IndexError, TypeError, AttributeError, KeyError):
                 pass
+
+    def padded_rows_reach_expert_load(self) -> bool:
+        """Whether a step's padded rows can reach the expert-load counts the
+        dynamic expert re-layout samples (expert_relayout.step_phase). They
+        stay out only when all of these hold, each fixed for the process and
+        so the same on every DP rank:
+
+        - the runner keeps a padding mask (`_token_padding_state`);
+        - every step uses the ALL sequence layout, the only one the mask
+          describes (`_token_padding_update` checks the same per plan; the
+          ALL planner makes only ALL plans);
+        - every counted layer runs the fused EP op, which sends masked rows
+          to no expert (expert_load.counts_leave_out_masked_rows);
+        - the drafter, if any, runs no MoE forward of its own (n-gram) or
+          marks its own padded rows before each forward (DFlash, DSpark);
+          another drafter's forwards would read the target's mask.
+        """
+        return not (
+            self._token_padding_state is not None
+            and isinstance(self.sequence_layout_planner, AllSequenceLayoutPlanner)
+            and expert_load.counts_leave_out_masked_rows()
+            and (
+                self.drafter is None
+                or isinstance(self.drafter, (NgramProposer, DFlashProposer))
+            )
+        )
 
     def _token_padding_update(self, num_tokens_padded: int) -> None:
         """Record which of this step's token rows are padding."""

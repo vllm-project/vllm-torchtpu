@@ -159,6 +159,8 @@ def test_dp_step_carries_the_relayout_fields_and_calls_the_controller():
     seen = []
 
     class Controller:
+        padded_rows_counted = True
+
         def fields(self):
             return (0x5A5A, -0x5A5A, -3)
 

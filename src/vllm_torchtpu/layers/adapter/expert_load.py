@@ -77,6 +77,20 @@ def registered_layers() -> int:
     return len(_REGISTERED)
 
 
+def counts_leave_out_masked_rows() -> bool:
+    """Whether every accumulator leaves out the rows a padding mask marks:
+    true when each registered layer runs the fused EP op, whose router sends
+    a masked row to no expert (fused_moe_ep._route_padded_rows_nowhere). The
+    non-fused path accumulates its counts before it zeroes padded rows'
+    weights, so a masked row still counts there."""
+    # Imported here: fused_moe_ep imports this module.
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+
+    return bool(_REGISTERED) and all(
+        fused_moe_ep_supported(layer.quant_method) for _, layer in _REGISTERED
+    )
+
+
 def _read_all_sync() -> np.ndarray:
     """Every registered layer's accumulator as one [layers, widest] int64 host
     array through torch: a stack program and a synchronous `.cpu()`. The
