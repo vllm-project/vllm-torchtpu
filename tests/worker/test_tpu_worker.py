@@ -873,22 +873,6 @@ def test_init_device_dense_dp_unified_slice_without_standalone_topology(monkeypa
     from vllm_torchtpu.worker import tpu_worker
 
     sb_addrs = ",".join(f"localhost:{20000 + i}" for i in range(8))
-    for var in (
-        "RANK",
-        "LOCAL_RANK",
-        "WORLD_SIZE",
-        "LOCAL_WORLD_SIZE",
-        "MASTER_ADDR",
-        "MASTER_PORT",
-        "ALLOW_MULTIPLE_LIBTPU_LOAD",
-    ):
-        monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "8")
-    monkeypatch.setenv("TORCH_TPU_DP_MASTER_ADDR", "127.0.0.1")
-    monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29501")
-    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", sb_addrs)
-    monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "2,2,1,2")
-
     monkeypatch.setattr(
         TpuPlatform, "_has_tpu_topology", classmethod(lambda cls, ws: ws != 1)
     )
@@ -930,6 +914,16 @@ def test_init_device_dense_dp_unified_slice_without_standalone_topology(monkeypa
     mock_pp = MagicMock(is_first_rank=True, is_last_rank=True)
 
     with (
+        patch.dict(
+            os.environ,
+            {
+                "TORCH_TPU_DP_SIZE": "8",
+                "TORCH_TPU_DP_MASTER_ADDR": "127.0.0.1",
+                "TORCH_TPU_DP_MASTER_PORT": "29501",
+                "TORCH_TPU_SLICEBUILDER_ADDRESSES": sb_addrs,
+                "TORCH_TPU_TOPOLOGY": "2,2,1,2",
+            },
+        ),
         patch("vllm.platforms.current_platform", mock_platform),
         patch.object(tpu_worker, "set_current_vllm_config"),
         patch.object(tpu_worker, "init_distributed_environment") as init_dist,
@@ -939,18 +933,20 @@ def test_init_device_dense_dp_unified_slice_without_standalone_topology(monkeypa
         patch.object(tpu_worker.dist_utils, "get_node_id", return_value="0"),
         patch.object(tpu_worker.vllm_utils, "report_usage_stats"),
     ):
+        os.environ.pop("ALLOW_MULTIPLE_LIBTPU_LOAD", None)
         worker.init_device()
 
-    assert pc.data_parallel_size == 8
-    assert pc.data_parallel_rank == 3
-    assert utils.dp_engines_in_lockstep(pc) is False
-    assert os.environ["RANK"] == "3"
-    assert os.environ["LOCAL_RANK"] == "3"
-    assert os.environ["WORLD_SIZE"] == "8"
-    assert os.environ["LOCAL_WORLD_SIZE"] == "8"
-    assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == sb_addrs
-    assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
-    assert "ALLOW_MULTIPLE_LIBTPU_LOAD" not in os.environ
+        assert pc.data_parallel_size == 8
+        assert pc.data_parallel_rank == 3
+        assert utils.dp_engines_in_lockstep(pc) is False
+        assert os.environ["RANK"] == "3"
+        assert os.environ["LOCAL_RANK"] == "3"
+        assert os.environ["WORLD_SIZE"] == "8"
+        assert os.environ["LOCAL_WORLD_SIZE"] == "8"
+        assert os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == sb_addrs
+        assert os.environ["TORCH_TPU_TOPOLOGY"] == "2,2,1,2"
+        assert "ALLOW_MULTIPLE_LIBTPU_LOAD" not in os.environ
+
     init_dist.assert_called_once_with(
         world_size=1,
         rank=0,

@@ -91,6 +91,7 @@ class TpuWorkerBinding:
     dp_rank: int = 0
     dp_size: int = 1
     local_rank_offset: int = 0
+    unified_dp_slice: bool = False
 
     def as_env(self) -> dict[str, str]:
         return {
@@ -206,6 +207,7 @@ def _slice_binding_from_env(
         dp_rank=dp_rank,
         dp_size=dp_size,
         local_rank_offset=local_rank_offset,
+        unified_dp_slice=True,
     )
 
 
@@ -221,7 +223,14 @@ def uses_unified_dp_slice(parallel_config) -> bool:
         return True
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
-    return not TpuPlatform._has_tpu_topology(parallel_config.world_size)
+    if not TpuPlatform._has_tpu_topology(parallel_config.world_size):
+        logger.info_once(
+            "Dense DP per-engine world_size=%d has no standalone TPU "
+            "topology; bootstrapping workers on the shared DP*TP slice.",
+            parallel_config.world_size,
+        )
+        return True
+    return False
 
 
 def get_tpu_worker_binding(
@@ -303,6 +312,7 @@ def get_tpu_worker_binding(
             dp_rank=dp_rank,
             dp_size=dp_size,
             local_rank_offset=local_rank_offset,
+            unified_dp_slice=True,
         )
 
     dp_rank = parallel_config.data_parallel_index or 0

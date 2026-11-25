@@ -689,12 +689,15 @@ class TpuPlatform(Platform):
 
         Returns True when no TPU is attached (``get_tpu_topology`` returns
         ``None``) so CPU-only callers and unit tests keep the default
-        replica-local dense DP behavior.
+        replica-local dense DP behavior. Non-topology ``RuntimeError``s
+        (e.g. PCI scan or permission failures) propagate.
         """
         try:
             hardware.get_tpu_topology(world_size)
-        except RuntimeError:
-            return False
+        except RuntimeError as exc:
+            if "no tpu topology found" in str(exc).lower():
+                return False
+            raise
         return True
 
     @classmethod

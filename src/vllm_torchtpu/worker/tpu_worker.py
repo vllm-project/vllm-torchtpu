@@ -57,10 +57,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
-from vllm_torchtpu.worker.tpu_rank_binding import (
-    get_tpu_worker_binding,
-    uses_unified_dp_slice,
-)
+from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
 logger = init_logger(__name__)
 
@@ -242,7 +239,7 @@ class TPUWorker(WorkerBase):
             # utils.dp_engines_in_lockstep() still keys on
             # enable_expert_parallel, so dense DP engines remain independently
             # schedulable without cross-replica step sync.
-            unified_dp_slice = uses_unified_dp_slice(pc)
+            unified_dp_slice = binding.unified_dp_slice
             if unified_dp_slice:
                 pc.data_parallel_size = dp_size
                 pc.data_parallel_rank = dp_rank
