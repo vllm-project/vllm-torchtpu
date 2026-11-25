@@ -54,6 +54,9 @@ def _make_runner(
     uses_mrope=False,
     mtp_enabled=False,
     pcp_size=2,
+    dp_size=1,
+    dp_rank=0,
+    enable_ep=False,
     max_num_reqs=8,
     block_size=16,
 ):
@@ -87,19 +90,44 @@ def _make_runner(
     runner._pp_handoff = None
     runner._adaptive_verification = None
     runner._routed_experts = None
+    runner._dp_vocab_logits = False  # noqa: SLF001 -- runner stub state
+    runner._pp_topk_buffer = None  # noqa: SLF001 -- runner stub state
+    runner.dp_size = dp_size
+    runner.dp_rank = dp_rank
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
         cp_kv_cache_interleave_size=block_size,
         decode_context_parallel_size=1,
         pipeline_parallel_size=1,
+        data_parallel_size=dp_size,
+        data_parallel_rank=dp_rank,
+        tensor_parallel_size=1,
+        world_size=dp_size * pcp_size,
+        enable_expert_parallel=enable_ep,
+        is_moe_model=enable_ep,
+        use_sequence_parallel_moe=False,
+    )
+    runner._dp_lockstep_enabled = types.MethodType(
+        TPUModelRunner._dp_lockstep_enabled,
+        runner,
+    )
+    runner._dp_num_tokens_across_dp = types.MethodType(
+        TPUModelRunner._dp_num_tokens_across_dp,
+        runner,
+    )
+    runner._prompt_logprob_rows_per_call = types.MethodType(
+        TPUModelRunner._prompt_logprob_rows_per_call,
+        runner,
     )
     runner.vllm_config = SimpleNamespace(
         parallel_config=runner.parallel_config,
         scheduler_config=runner.scheduler_config,
         speculative_config=None,
         kv_transfer_config=None,
-        compilation_config=SimpleNamespace(static_forward_context={}),
+        compilation_config=SimpleNamespace(
+            static_forward_context={}, fast_moe_cold_start=False
+        ),
     )
     runner.sequence_layout_planner = create_sequence_layout_planner(runner.vllm_config)
     runner.pcp_manager = None
