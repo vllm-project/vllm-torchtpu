@@ -942,3 +942,78 @@ def test_ray_distributed_executor_bundle_expansion():
     # Too many bundle indices raises ValueError
     with pytest.raises(ValueError, match="less than or equal to world_size"):
         expand_bundles(list(range(17)), 16)
+
+
+def test_validate_ray_tpu_device_counts_checks_driver_and_remote_nodes():
+    from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
+        _validate_ray_tpu_device_counts,
+    )
+
+    # Matching counts across all alive nodes pass (dead nodes are ignored).
+    _validate_ray_tpu_device_counts(
+        [
+            {"NodeID": "n0", "NodeManagerAddress": "10.0.0.1", "Resources": {"TPU": 8}},
+            {"NodeID": "n1", "NodeManagerAddress": "10.0.0.2", "Resources": {"TPU": 8}},
+            {
+                "NodeID": "dead",
+                "Alive": False,
+                "NodeManagerAddress": "10.0.0.3",
+                "Resources": {"TPU": 12},
+            },
+        ],
+        device_str="TPU",
+        local_usable_devices=8,
+    )
+
+    # Driver node over-reporting fails fast with actionable remediation.
+    with pytest.raises(ValueError, match='ray start --resources.*"TPU": 8'):
+        _validate_ray_tpu_device_counts(
+            [
+                {
+                    "NodeID": "n0",
+                    "NodeManagerAddress": "10.0.0.1",
+                    "Resources": {"TPU": 12},
+                }
+            ],
+            device_str="TPU",
+            local_usable_devices=8,
+        )
+
+    # Remote node over-reporting fails even when driver reports the right count.
+    with pytest.raises(ValueError, match="10.0.0.2"):
+        _validate_ray_tpu_device_counts(
+            [
+                {
+                    "NodeID": "n0",
+                    "NodeManagerAddress": "10.0.0.1",
+                    "Resources": {"TPU": 8},
+                },
+                {
+                    "NodeID": "n1",
+                    "NodeManagerAddress": "10.0.0.2",
+                    "Resources": {"TPU": 12},
+                },
+            ],
+            device_str="TPU",
+            local_usable_devices=8,
+        )
+
+    # Head-only driver (local_usable_devices=0) still catches inconsistent
+    # remote slice host counts.
+    with pytest.raises(ValueError, match="inconsistent TPU counts"):
+        _validate_ray_tpu_device_counts(
+            [
+                {
+                    "NodeID": "n1",
+                    "NodeManagerAddress": "10.0.0.2",
+                    "Resources": {"TPU": 8},
+                },
+                {
+                    "NodeID": "n2",
+                    "NodeManagerAddress": "10.0.0.3",
+                    "Resources": {"TPU": 12},
+                },
+            ],
+            device_str="TPU",
+            local_usable_devices=0,
+        )
