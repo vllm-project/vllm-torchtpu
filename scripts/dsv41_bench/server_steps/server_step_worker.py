@@ -278,7 +278,15 @@ class Recorder:
             return self.execute(scheduler_output, *args, **kwargs)
         if self.pending is not None:
             raise RuntimeError("Previous benchmark step did not complete sampling")
-        self.pending = {"start_ns": time.perf_counter_ns(), "stages": []}
+        import torch
+
+        # Cumulative tier-1 compile-cache misses: torch_tpu's eager
+        # MaterializationWorker compiles mid-serving without any log line.
+        self.pending = {
+            "start_ns": time.perf_counter_ns(),
+            "stages": [],
+            "cache_misses": int(torch.tpu._get_cache_misses()),
+        }
         if self.scenario.name == "decode":
             self.pending["scheduled_draft_lengths"] = {
                 req: len(tokens)
