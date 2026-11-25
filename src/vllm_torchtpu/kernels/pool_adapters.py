@@ -410,22 +410,20 @@ def copy_pairs_in_pool(src_indices, dst_indices, num_blocks: int):
     )
 
 
-def null_out_of_range_pairs(src_indices, dst_indices, num_blocks: int):
+def null_out_of_range_pairs(src_indices, dst_indices, num_blocks: int, *, in_pool=None):
     """Replaces every copy pair with an index outside `[0, num_blocks)` by `(0, 0)`.
 
     Block 0 is vLLM's reserved null block and `(0, 0)` is the copy's padding
     pair: it copies the null block onto itself, so a replaced pair writes
     nothing outside the pool and changes no block in it. A pair with both
     indices in range is returned unchanged.
+
+    `in_pool`, if given, must be `copy_pairs_in_pool(src_indices, dst_indices,
+    num_blocks)`. A caller that also needs that mask passes it, so that it is
+    computed once.
     """
-    return _null_pairs_not_in_pool(
-        src_indices,
-        dst_indices,
-        copy_pairs_in_pool(src_indices, dst_indices, num_blocks),
-    )
-
-
-def _null_pairs_not_in_pool(src_indices, dst_indices, in_pool):
+    if in_pool is None:
+        in_pool = copy_pairs_in_pool(src_indices, dst_indices, num_blocks)
     return (
         jnp.where(in_pool, src_indices, jnp.zeros_like(src_indices)),
         jnp.where(in_pool, dst_indices, jnp.zeros_like(dst_indices)),
@@ -483,7 +481,9 @@ def copy_blocks(pool, src_indices, dst_indices):
     """
     num_blocks = pool.shape[0]
     in_pool = copy_pairs_in_pool(src_indices, dst_indices, num_blocks)
-    src, dst = _null_pairs_not_in_pool(src_indices, dst_indices, in_pool)
+    src, dst = null_out_of_range_pairs(
+        src_indices, dst_indices, num_blocks, in_pool=in_pool
+    )
     if not pl.enable_debug_checks.value:
         return _copy_blocks_unchecked(pool, src, dst)
     # The callback only where it can run: a TPU program holds none.

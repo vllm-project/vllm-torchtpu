@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 from jax.experimental import pallas as pl
 
 from tests.distributed.tpu_test_utils import run_in_isolated_process
@@ -204,8 +205,6 @@ def _copies_with_debug_checks_on_tpu():
     # Set before anything is traced, so both programs compile the copy kernel
     # with its debug check.
     jax.config.update("jax_pallas_enable_debug_checks", True)
-    import torch
-
     gen = torch.Generator().manual_seed(0)
 
     def host_pool(shape):
