@@ -250,8 +250,7 @@ def test_mamba_read_offset_follows_storage_owner(
     assert actual == expected, "same live KV owner must retain its accepted checkpoint"
 
 
-def scheduler_for(request, k):
-    del k
+def scheduler_for(request):
     scheduler = object.__new__(AsyncScheduler)
     scheduler.requests = {request.request_id: request}
     scheduler.defer_block_free = False
@@ -273,7 +272,7 @@ def test_bootstrap_commits_once_after_upstream_update(device, monkeypatch, k):
     runner.input_batch.refresh_metadata()
     request = Request("A", list(range(10)), state.sampling_params, None)
     request.status = RequestStatus.RUNNING
-    scheduler = scheduler_for(request, k)
+    scheduler = scheduler_for(request)
     prefill = SchedulerOutput.make_empty()
     prefill.num_scheduled_tokens = {"A": 10}
     prefill.total_num_scheduled_tokens = 10
@@ -420,7 +419,7 @@ def test_dynamic_schedule_verifies_leading_drafts(device, num_spec_tokens_to_sch
         "A", list(range(10)), SamplingParams(temperature=0, max_tokens=32), None
     )
     request.status = RequestStatus.RUNNING
-    scheduler = scheduler_for(request, k)
+    scheduler = scheduler_for(request)
     prefill = SchedulerOutput.make_empty()
     prefill.num_scheduled_tokens = {"A": 10}
     prefill.total_num_scheduled_tokens = 10

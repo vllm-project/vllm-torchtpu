@@ -1622,7 +1622,9 @@ def test_attention_residual_matches_reference(num_blocks: int) -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
 
 
-def _attention_residual_stub(hidden: int, eps: float) -> AttentionResidual:
+def _attention_residual_stub(
+    hidden: int, eps: float, fold: bool = True
+) -> AttentionResidual:
     # Same stubbing as test_attention_residual_matches_reference: the fold
     # only reads the two weights.
     module = AttentionResidual.__new__(AttentionResidual)
@@ -1634,7 +1636,8 @@ def _attention_residual_stub(hidden: int, eps: float) -> AttentionResidual:
     module.proj = SimpleNamespace(
         weight=nn.Parameter(torch.randn(1, hidden, dtype=torch.bfloat16) * 0.1)
     )
-    module.process_weights_after_loading()
+    if fold:
+        module.process_weights_after_loading()
     return module
 
 
@@ -1642,15 +1645,7 @@ def test_vllm_post_load_pass_folds_nested_attention_residual() -> None:
     """vLLM runs every module's own post-load hook, so the Kimi model hook no
     longer folds its AttentionResidual layers itself."""
     torch.manual_seed(0)
-    residual = AttentionResidual.__new__(AttentionResidual)
-    nn.Module.__init__(residual)
-    residual.eps = 1e-5
-    residual.norm = SimpleNamespace(
-        weight=nn.Parameter(torch.randn(64, dtype=torch.bfloat16) * 0.5 + 1)
-    )
-    residual.proj = SimpleNamespace(
-        weight=nn.Parameter(torch.randn(1, 64, dtype=torch.bfloat16) * 0.1)
-    )
+    residual = _attention_residual_stub(hidden=64, eps=1e-5, fold=False)
     layer = nn.Module()
     layer.attn_res = residual
     model = nn.Module()

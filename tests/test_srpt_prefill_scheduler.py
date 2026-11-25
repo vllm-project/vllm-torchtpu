@@ -681,3 +681,17 @@ def test_attn_work_cap_holds_chunk_with_most_attention_work(shared_model_config)
     scheduler._other_rank_decoding = True
     scheduler.add_request(_make_real_request("wait", 64, hasher, seed=3))
     assert scheduler.schedule().num_scheduled_tokens == {"fresh": 64, "wait": 64}
+
+
+@pytest.mark.parametrize(("chunked_prefill", "expected"), [(True, 333), (False, 0)])
+def test_long_prefill_threshold_needs_chunked_prefill(chunked_prefill, expected):
+    # Like upstream Scheduler.schedule(): no threshold without chunked prefill.
+    scheduler = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            enable_chunked_prefill=chunked_prefill,
+            long_prefill_token_threshold=100,
+            max_num_batched_tokens=1000,
+        ),
+        adaptive_long_prefill_threshold=True,
+    )
+    assert SrptPrefillScheduler._long_prefill_threshold(scheduler, 3) == expected

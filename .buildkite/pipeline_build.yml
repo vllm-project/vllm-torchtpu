@@ -33,8 +33,7 @@ steps:
         key: "build_docker_omni"
         # The pinned vllm-omni (0.32.0rc1) does not install with the pinned vLLM,
         # and omni support is moving to vllm-omni-torchtpu, so this image and
-        # the Omni test steps are skipped until the omni code is removed. The
-        # skip was "${OMNI_IMAGE_SKIP:-}" (set by bootstrap.py).
+        # the Omni test steps are skipped until the omni code is removed.
         skip: "Omni not built: pinned vllm-omni does not install with pinned vLLM"
         agents:
           queue: cpu_64_core
