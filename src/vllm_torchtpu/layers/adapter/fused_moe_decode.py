@@ -22,31 +22,33 @@ layer runs ``fused_moe_decode`` under shard_map over the mesh for up to
 all-reduce in one Pallas call per rank.
 
 Arming happens once after the model is loaded (``arm_fused_moe_decode``), when
-the shared expert's linears have their final FP8 per-channel layout. For an
-armed layer the runner is told it has no shared expert (the kernel owns it),
-and ``MoERunner._fused_output_is_reduced`` reports True (see ``VllmMoERunner``
-in ``layers/adapter/custom_ops/moe_runner.py``), so vLLM issues neither the
-shared MLP nor any all-reduce. Above the token cap the same exported program
-computes what the runner would have with the kernel off: the regular GMM MoE
-(``fused_moe_func``, as the GMM custom op calls it), the shared expert and one
-all-reduce of their sum. The token count is static there, so the branch costs
-nothing at run time; branching in torch instead gives the two sides different
-graph inputs, which vLLM's per-bucket specialization of one traced graph
-refuses (``compilation.shape_variants``).
+the shared expert's linears have their final FP8 per-channel layout. On
+``VllmMoERunner`` with ``dp_size == 1`` and ``pcp_size == 1``, arming keeps
+``_shared_experts`` and ``routed_scaling_factor`` intact so
+``VllmMoERunner.forward`` dispatches ``m <= max_tokens`` to the fused op
+(``fused_moe_decode_runner_forward``) and ``m > max_tokens`` to unmodified stock
+``MoERunner`` / ``fused_moe_gmm`` at trace time during backbone warmup,
+anchoring ``_RANK_BUFFER`` into the fallback graph so both traces match under
+``compilation.shape_variants``. Modules compiled outside warmup (such as the
+MTP drafter) skip the trace-time branch and still run the op's in-op GMM
+fallback above the cap.
 
-For ``VllmMoERunner`` with ``dp_size == 1`` and ``pcp_size == 1``, arming
-instead leaves the shared expert and ``routed_scaling_factor`` intact so
-``VllmMoERunner.forward`` dispatches ``m <= max_tokens`` to the fused op and
-``m > max_tokens`` to stock ``MoERunner`` / ``fused_moe_gmm``, anchoring
-``_RANK_BUFFER`` into the fallback graph for ``shape_variants`` parity.
+On non-static layers (``dp_size > 1``, ``pcp_size > 1``, or plain
+``MoERunner``), arming instead clears ``_shared_experts`` (the op owns it),
+sets ``routed_scaling_factor`` to 1.0 (since the op scales the routed term
+only and the runner would otherwise scale the shared + routed sum), and
+``MoERunner._fused_output_is_reduced`` reports True (see ``VllmMoERunner`` in
+``layers/adapter/custom_ops/moe_runner.py``). Above the token cap the same
+exported program runs the regular GMM MoE (``fused_moe_func``), the shared
+expert and one all-reduce of their sum.
 
 Two shared-expert conventions are served, each as vLLM's MoERunner computes it
 with the kernel off: a shared expert gated by sigmoid(x . w_g) (Qwen3.5,
 ``expert_gate``) or an ungated ``DeepseekV2MLP`` (GLM-5.2). A
 ``runner.routed_scaling_factor`` (GLM-5.2: 2.5) scales the ROUTED output only,
 before the shared output is added (``_maybe_apply_routed_scale_to_output``);
-the op applies it the same way, and arming sets the runner's factor to 1.0,
-since the runner would otherwise scale the op's shared + routed sum.
+the op applies it the same way, and on the static-dispatch path stock
+``MoERunner`` keeps and applies the runner's factor directly above the cap.
 
 Every rank must arm the same layers: the kernel's collectives start at entry,
 and a rank serving a layer with the GMM path leaves its peers waiting. Arming
@@ -201,8 +203,8 @@ def _layer(
     routed_scale=1.0,
 ):
     """Per-rank body of the op: the kernel up to `max_tokens`, GMM MoE above.
-    An ungated layer still passes its placeholder shared_gate_weight operand
-    (fixed op arity); shared_gated=False ignores it."""
+    Gated layers pass `shared_gate_weight` (13-operand op); ungated layers
+    (`shared_gated=False`) pass `None` from the 12-operand `_ungated_fn` op."""
     start = rank[0, 1] if expert_parallel else None
     if x.shape[0] > max_tokens:
         return _gmm_layer(
@@ -485,6 +487,7 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     from vllm.distributed import get_tensor_model_parallel_world_size
 
     from vllm_torchtpu.layers.adapter import pipelined_fused_moe
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     cfg = runner.moe_config
@@ -506,7 +509,10 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     if qm._tpu_topk_weights_float32:
         # The kernel rounds the top-k weights to bfloat16.
         return None
-    # Match fp8.py apply_monolithic's owns_collectives short-circuit precedence.
+    # Match fp8.py apply_monolithic's precedence: adaptive / fused EP kernels
+    # and owns_collectives paths run ahead of fused_moe_decode.
+    if qm._use_adaptive_fused_moe or fused_moe_ep_supported(qm):
+        return None
     if (
         pipelined_fused_moe.enable_pipelined_collective_and_compute()
         or envs.TPU_MOE_FP8_ALL_GATHER
@@ -543,6 +549,15 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     e, h, two_i = w1.shape
     i = two_i // 2
     i_s = shared_w2.shape[0]  # the shared expert is a TP slice, even under EP
+    # Match MoERunner.forward: the static-dispatch fast path skips
+    # _maybe_pad_hidden_states and output truncation, so decline padded dims.
+    unpadded_h = getattr(cfg, "hidden_dim_unpadded", None)
+    if (
+        getattr(cfg, "hidden_dim", h) != h
+        or (unpadded_h not in (None, 0) and unpadded_h != h)
+        or qm.has_unpadded_output
+    ):
+        return None
     if (
         w1.dtype != torch.float8_e4m3fn
         or tuple(w2.shape) != (e, i, h)
@@ -672,9 +687,7 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         )
         par = runner.moe_config.moe_parallel_config
         can_static_dispatch = (
-            isinstance(runner, VllmMoERunner)
-            and int(getattr(par, "dp_size", 1)) == 1
-            and int(getattr(par, "pcp_size", 1)) == 1
+            isinstance(runner, VllmMoERunner) and par.dp_size == 1 and par.pcp_size == 1
         )
         setattr(qm, _QM_STATIC_DISPATCH_ATTR, can_static_dispatch)
         if can_static_dispatch:

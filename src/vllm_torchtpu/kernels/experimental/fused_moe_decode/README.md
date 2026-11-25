@@ -53,15 +53,21 @@ out = fused_moe_decode(
 
 `layers/adapter/fused_moe_decode.py` arms eligible layers once after load. That
 includes the MTP drafter. An armed layer runs this kernel for steps of up to
-`FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` tokens (default 256). Larger steps run the
-regular GMM MoE, the shared expert and one all-reduce, inside the same exported
-program.
+`FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` tokens (default 256). On `VllmMoERunner`
+layers with `dp_size == 1` and `pcp_size == 1`, the choice is made at trace
+time during backbone warmup: steps above the cap run the unmodified stock
+`MoERunner` / `fused_moe_gmm` path, and arming keeps `_shared_experts` and
+`routed_scaling_factor` intact. Modules compiled outside warmup (such as the
+MTP drafter) do not branch on the token count, so drafter steps above the cap
+still run the in-op GMM fallback. On non-static layers (`dp_size > 1`,
+`pcp_size > 1`, or plain `MoERunner`), steps above the cap run the regular GMM
+MoE, the shared expert and one all-reduce inside the same exported program, and
+arming clears `_shared_experts` and sets `routed_scaling_factor` to 1.0.
 
 Two shared-expert conventions are served: Qwen3.5's gated shared expert, and
-GLM-5.2's ungated `DeepseekV2MLP` with `routed_scaling_factor` 2.5. For the
-latter, arming sets the runner's factor to 1.0 because the op applies it.
-Every EP rank must arm the same layers, so arming compares across ranks and
-raises at load on any mismatch.
+GLM-5.2's ungated `DeepseekV2MLP` with `routed_scaling_factor` 2.5. Every EP
+rank must arm the same layers, so arming compares across ranks and raises at
+load on any mismatch.
 
 ## When to use it
 

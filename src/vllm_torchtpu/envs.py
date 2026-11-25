@@ -751,8 +751,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
-    # load. Steps above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens run the GMM
-    # MoE path; arming refuses a cap whose buffers do not fit in VMEM.
+    # load. On dp=1/pcp=1 VllmMoERunner layers compiled during warmup, steps
+    # above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens dispatch at trace time to
+    # stock MoERunner / fused_moe_gmm (dp>1, pcp>1, and drafter steps compiled
+    # outside warmup still use the op's in-op GMM fallback). Arming refuses a
+    # cap whose buffers do not fit in VMEM.
     "FUSED_MOE_DECODE_KERNEL": env_bool("FUSED_MOE_DECODE_KERNEL"),
     "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
         "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256

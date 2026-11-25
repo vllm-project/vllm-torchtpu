@@ -175,7 +175,7 @@ class VllmMoERunner(MoERunner):
         )
         if shared_experts_input is not None:
             return super().forward(*args, **kwargs)
-        max_tokens = getattr(self, RUNNER_MAX_TOKENS_ATTR, 0)
+        max_tokens = getattr(self, RUNNER_MAX_TOKENS_ATTR)
         # Only backbone warmup traces each side of the token-count branch;
         # modules compiled outside warmup (e.g. MTP drafters) skip the guard.
         can_branch = not torch.compiler.is_compiling() or shape_variants.in_warmup()

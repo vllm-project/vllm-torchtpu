@@ -11,11 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Token-cap dispatch of the fused-MoE-decode op's per-rank body: up to
-FUSED_MOE_DECODE_KERNEL_MAX_TOKENS the kernel serves it; above, the GMM MoE
-fallback. Admission and fallback of GLM-5.2's convention (ungated shared
-expert, routed scale). Which modules arm_runner_models arms, with and without
-a draft model. No TPU needed: the kernels are stubs."""
+"""CPU tests for the fused-MoE-decode adapter: per-rank op token-cap dispatch
+and real `_build_op` ungated wrapper parity, layer admission (GLM-5.2,
+activation/dtype/routing/collective/padding guards), `arm_runner_models`, and
+trace-time static bucket dispatch with `shape_variants` placeholder parity.
+No TPU needed: the kernels are stubs."""
 
 from types import SimpleNamespace
 
@@ -212,6 +212,163 @@ def test_glm_fallback_scales_routed_only(monkeypatch):
     assert not np.allclose(got, 2.5 * (x + shared), rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize("expert_parallel", [False, True])
+@pytest.mark.parametrize("tokens", [4, 6])
+def test_build_op_ungated_matches_layer_below_and_above_cap(
+    monkeypatch, tokens, expert_parallel
+):
+    """Real `_build_op(..., shared_gated=False)` builds a 12-operand sharded
+    `jax_op` whose `_ungated_fn`/`_ungated_body` matches `_layer` below and
+    above `max_tokens` on a 1-device mesh."""
+    from unittest.mock import Mock
+
+    import jax.numpy as jnp
+    from jax.sharding import Mesh, PartitionSpec
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    captured: dict = {}
+
+    def fake_jax_op(name, fn, **kwargs):
+        captured["name"] = name
+        captured["fn"] = fn
+        captured["kwargs"] = kwargs
+        return Mock()
+
+    def fake_kernel(
+        rank_idx,
+        x_,
+        w1_,
+        w2_,
+        w1s_,
+        w2s_,
+        sw1_,
+        sw1s_,
+        sw2_,
+        sw2s_,
+        sg_,
+        tw_,
+        ti_,
+        *,
+        n_ranks,
+        expert_start,
+        routed_scale,
+    ):
+        assert sg_ is None
+        assert ti_.dtype == jnp.int32
+        assert n_ranks == 1
+        assert routed_scale == 2.5
+        es = jnp.zeros((), jnp.int32) if expert_start is None else expert_start
+        scalar = (
+            1.0 * jnp.sum(rank_idx.astype(jnp.float32))
+            + 2.0 * jnp.sum(es.astype(jnp.float32))
+            + 3.0 * jnp.sum(w1_)
+            + 5.0 * jnp.sum(w2_)
+            + 7.0 * jnp.sum(w1s_)
+            + 11.0 * jnp.sum(w2s_)
+            + 13.0 * jnp.sum(sw1_)
+            + 17.0 * jnp.sum(sw1s_)
+            + 19.0 * jnp.sum(sw2_)
+            + 23.0 * jnp.sum(sw2s_)
+            + 29.0 * jnp.sum(tw_)
+            + 31.0 * jnp.sum(ti_.astype(jnp.float32))
+        )
+        return x_ * routed_scale + scalar
+
+    def fake_fused_moe(
+        x_, w1_, w2_, w1s_, w2s_, _g1, _g2, tw_, ti_, start_, *, use_ep, **_kwargs
+    ):
+        assert ti_.dtype == jnp.int32
+        assert use_ep is expert_parallel
+        scalar = (
+            2.0 * jnp.sum(start_.astype(jnp.float32))
+            + 3.0 * jnp.sum(w1_)
+            + 5.0 * jnp.sum(w2_)
+            + 7.0 * jnp.sum(w1s_)
+            + 11.0 * jnp.sum(w2s_)
+            + 29.0 * jnp.sum(tw_)
+            + 31.0 * jnp.sum(ti_.astype(jnp.float32))
+        )
+        return x_ + scalar
+
+    monkeypatch.setattr(bridge, "jax_op", fake_jax_op)
+    monkeypatch.setattr(bridge, "_kernel_body", fake_kernel)
+    monkeypatch.setattr(bridge, "fused_moe_func", fake_fused_moe)
+    monkeypatch.setattr(bridge, "_quantized_matmul_jax", lambda a, w, s: a @ (w * s))
+    monkeypatch.setattr(bridge, "resolve_onehot_permute_threshold", lambda: 0)
+    monkeypatch.setattr(bridge, "plan_weight_ring", lambda *a, **k: (None, 3))
+
+    mesh = Mesh(np.array(jax.devices()[:1]), (EP_AXIS_NAME,))
+    bridge._build_op(
+        mesh,
+        n_ranks=1,
+        topk=2,
+        expert_parallel=expert_parallel,
+        max_tokens=4,
+        shared_gated=False,
+        routed_scale=2.5,
+    )
+    spec = PartitionSpec(EP_AXIS_NAME)
+    assert captured["kwargs"]["input_partition_specs"] == (spec,) * 12
+    assert captured["kwargs"]["output_partition_specs"] == spec
+
+    rng = np.random.default_rng(7)
+    x = jnp.asarray(rng.normal(size=(tokens, H)).astype(np.float32))
+    w1 = jnp.asarray(rng.normal(size=(2, H, 4)).astype(np.float32))
+    w2 = jnp.asarray(rng.normal(size=(2, 2, H)).astype(np.float32))
+    w1_scale = jnp.asarray(rng.normal(size=(2, 1, 1, 4)).astype(np.float32))
+    w2_scale = jnp.asarray(rng.normal(size=(2, 1, 1, H)).astype(np.float32))
+    shared_w1 = jnp.asarray(rng.normal(size=(H, 4)).astype(np.float32))
+    shared_w1_scale = jnp.asarray(rng.normal(size=(4,)).astype(np.float32))
+    shared_w2 = jnp.asarray(rng.normal(size=(2, H)).astype(np.float32))
+    shared_w2_scale = jnp.asarray(rng.normal(size=(H,)).astype(np.float32))
+    tw = jnp.asarray(rng.normal(size=(tokens, 2)).astype(np.float32))
+    ti = jnp.asarray(rng.integers(0, 4, size=(tokens, 2), dtype=np.int64))
+    rank = jnp.asarray([[3, 192]], dtype=jnp.int32)
+
+    operands = (
+        x,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        shared_w1,
+        shared_w1_scale,
+        shared_w2,
+        shared_w2_scale,
+        tw,
+        ti,
+        rank,
+    )
+
+    def ref_layer(x_):
+        return bridge._layer(
+            rank,
+            x_,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            shared_w1,
+            shared_w1_scale,
+            shared_w2,
+            shared_w2_scale,
+            None,
+            tw,
+            ti.astype(jnp.int32),
+            n_ranks=1,
+            topk=2,
+            expert_parallel=expert_parallel,
+            max_tokens=4,
+            shared_gated=False,
+            routed_scale=2.5,
+        )
+
+    with jax.default_matmul_precision("float32"):
+        got = np.asarray(captured["fn"](*operands))
+        expected = np.asarray(jax.vmap(ref_layer, axis_name=EP_AXIS_NAME)(x[None])[0])
+    np.testing.assert_allclose(got, expected, rtol=1e-5, atol=1e-5)
+
+
 class _Runner:
     """The parts of the TPU runner arm_runner_models reads."""
 
@@ -281,6 +438,10 @@ def test_shared_slice_declines_bias_and_reduce_results(monkeypatch):
     mlp_bias.down_proj.bias = torch.zeros(256)
     assert bridge._admit(_glm_runner(mlp_bias), 2) is None
 
+    mlp_gate_up_bias = DeepseekV2MLP(256, 128)
+    mlp_gate_up_bias.gate_up_proj.bias = torch.zeros(256)
+    assert bridge._admit(_glm_runner(mlp_gate_up_bias), 2) is None
+
     mlp_reduced = DeepseekV2MLP(256, 128)
     mlp_reduced.down_proj.reduce_results = True
     assert bridge._admit(_glm_runner(mlp_reduced), 2) is None
@@ -298,6 +459,65 @@ def test_admission_declines_hash_routing(monkeypatch):
     runner = _glm_runner(DeepseekV2MLP(256, 128))
     assert bridge._admit(runner, 2) is not None
     runner.routed_experts.hash_indices_table = torch.zeros((16, 2), dtype=torch.int32)
+    assert bridge._admit(runner, 2) is None
+
+
+@pytest.mark.parametrize("kernel", ["adaptive", "fused_ep"])
+def test_admission_declines_adaptive_and_fused_ep(monkeypatch, kernel):
+    """fp8.py apply_monolithic serves adaptive / fused EP ahead of
+    fused_moe_decode; _admit must decline so static dispatch does not mix
+    kernels across the token cap."""
+    import vllm.distributed
+
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import FUSED_MOE_EP_OP_ATTR
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    runner = _glm_runner(DeepseekV2MLP(256, 128))
+    assert bridge._admit(runner, 2) is not None
+    if kernel == "adaptive":
+        runner._quant_method._use_adaptive_fused_moe = True
+    else:
+        setattr(runner._quant_method, FUSED_MOE_EP_OP_ATTR, object())
+    assert bridge._admit(runner, 2) is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "hidden_dim_padded",
+        "hidden_dim_unpadded_mismatch",
+        "has_unpadded_output",
+        "routed_input_transform",
+        "routed_output_transform",
+    ],
+)
+def test_admission_declines_hidden_dim_padding_and_transforms(monkeypatch, case):
+    """The static-dispatch fast path skips MoERunner's routed transforms and
+    hidden-dim padding/unpadding, so _admit declines layers that use them."""
+    import vllm.distributed
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    runner = _glm_runner(DeepseekV2MLP(256, 128))
+    runner.moe_config.hidden_dim = 256
+    runner.moe_config.hidden_dim_unpadded = 256
+    assert bridge._admit(runner, 2) is not None
+
+    if case == "hidden_dim_padded":
+        runner.moe_config.hidden_dim = 384
+    elif case == "hidden_dim_unpadded_mismatch":
+        runner.moe_config.hidden_dim_unpadded = 192
+    elif case == "has_unpadded_output":
+        monkeypatch.setattr(
+            VllmFp8MoEMethodTPU, "has_unpadded_output", property(lambda self: True)
+        )
+    elif case == "routed_input_transform":
+        runner.routed_input_transform = object()
+    else:
+        runner.routed_output_transform = object()
     assert bridge._admit(runner, 2) is None
 
 
@@ -463,6 +683,7 @@ def _build_static_dispatch_runner(
     *,
     gated: bool,
     ep: bool,
+    has_gate: bool = False,
     max_tokens: int = 16,
     routed_scale: float = 1.0,
     layer_name: str = "model.layers.0.mlp.experts",
@@ -507,7 +728,7 @@ def _build_static_dispatch_runner(
     runner.router = SimpleNamespace(prepare_monolithic_logits=lambda logits: logits)
     runner.routed_experts = _StubRoutedExperts(qm, e, h, i, ep=ep)
     runner._shared_experts = _StubSharedExperts(_StubSharedMLP(h, i_s, gated=gated))
-    runner.gate = None
+    runner.gate = _StubLinear(h, 4, scaled=False) if has_gate else None
     runner.shared_expert_gate = None
     runner._fse_fuse_gate = False
     runner.routed_input_transform = None
@@ -738,6 +959,8 @@ def test_arm_and_forward_declines_when_moe_owns_collectives(monkeypatch, flag):
     assert not getattr(runner, bridge.RUNNER_ARMED_ATTR, False)
     assert bridge.fused_moe_decode_supported(qm) is False
 
+    from vllm_torchtpu.layers.adapter.custom_ops import moe_runner as moe_runner_mod
+
     stock_calls: list[int] = []
     sentinel = torch.ones((16, 8))
     monkeypatch.setattr(
@@ -746,7 +969,7 @@ def test_arm_and_forward_declines_when_moe_owns_collectives(monkeypatch, flag):
         lambda self, x, logits, *a, **k: (stock_calls.append(x.shape[0]), sentinel)[1],
     )
     monkeypatch.setattr(
-        bridge,
+        moe_runner_mod,
         "fused_moe_decode_runner_forward",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("decode path called")),
     )
@@ -789,10 +1012,14 @@ def test_static_dispatch_eager_routing_and_live_weight_update(monkeypatch):
 
 @pytest.mark.parametrize("gated", [True, False])
 @pytest.mark.parametrize("ep", [False, True])
-def test_static_dispatch_shape_variants_placeholder_parity(monkeypatch, gated, ep):
+@pytest.mark.parametrize("has_gate", [False, True])
+def test_static_dispatch_shape_variants_placeholder_parity(
+    monkeypatch, gated, ep, has_gate
+):
     """Both sides of the m <= max_tokens trace-time branch produce identical
     ordered FX placeholders both top-level and per subgraph after split_module
-    (with TPU_MOE_SKIP_PADDED_TOKENS=1, FP8 weights, and a splitting op)."""
+    (with TPU_MOE_SKIP_PADDED_TOKENS=1, FP8 weights, optional runner.gate, and
+    a splitting op)."""
     import vllm.distributed.parallel_state as vllm_ps
     from torch.fx.passes.split_module import split_module
 
@@ -809,13 +1036,25 @@ def test_static_dispatch_shape_variants_placeholder_parity(monkeypatch, gated, e
     monkeypatch.setattr(tpu_pcp, "get_pcp_group", lambda: None)
 
     r0 = _build_static_dispatch_runner(
-        gated=gated, ep=ep, max_tokens=16, layer_name="model.layers.0.mlp.experts"
+        gated=gated,
+        ep=ep,
+        has_gate=has_gate,
+        max_tokens=16,
+        layer_name="model.layers.0.mlp.experts",
     )
     r1 = _build_static_dispatch_runner(
-        gated=gated, ep=ep, max_tokens=16, layer_name="model.layers.1.mlp.experts"
+        gated=gated,
+        ep=ep,
+        has_gate=has_gate,
+        max_tokens=16,
+        layer_name="model.layers.1.mlp.experts",
     )
     r2 = _build_static_dispatch_runner(
-        gated=gated, ep=ep, max_tokens=16, layer_name="model.layers.2.mlp.experts"
+        gated=gated,
+        ep=ep,
+        has_gate=has_gate,
+        max_tokens=16,
+        layer_name="model.layers.2.mlp.experts",
     )
 
     class SplitThreeLayerMoE(torch.nn.Module):
@@ -846,8 +1085,13 @@ def test_static_dispatch_shape_variants_placeholder_parity(monkeypatch, gated, e
                 part += 1
             else:
                 node_to_part[node] = part
+        # Match vLLM's piecewise splitter (vllm/compilation/backends.py).
         split_gm = split_module(
-            gm, None, lambda n: node_to_part[n], keep_original_order=True
+            gm,
+            None,
+            lambda n: node_to_part[n],
+            keep_original_order=True,
+            tuple_return=True,
         )
         out = []
         for sub_name in ("submod_0", "submod_2"):
@@ -900,6 +1144,9 @@ def test_static_dispatch_shape_variants_placeholder_parity(monkeypatch, gated, e
             n for n in sub_names_pre if n.startswith(("l_self_", "g_import_"))
         ]
         assert dec_params == pre_params
+        assert (
+            any("modules_gate_parameters_weight" in n for n in dec_params) is has_gate
+        )
         assert ("torch.bool", (64,)) in sub_sig_dec
         assert ("torch.int32", (1, 2)) in sub_sig_dec
         assert (("torch.int32", ()) in sub_sig_dec) is ep
@@ -937,6 +1184,8 @@ def test_static_dispatch_outside_warmup_emits_no_shape_guard(monkeypatch):
 
 
 def test_anchor_rank_buffer_for_trace_bitwise_identity(monkeypatch):
+    from vllm_torchtpu.compilation import shape_variants
+
     x = torch.tensor([0.0, -0.0, 1.5, float("nan")], dtype=torch.float32)
     monkeypatch.setattr(bridge, "_RANK_BUFFER", None)
     assert bridge.anchor_rank_buffer_for_trace(x) is x
@@ -946,8 +1195,24 @@ def test_anchor_rank_buffer_for_trace_bitwise_identity(monkeypatch):
     )
     assert bridge.anchor_rank_buffer_for_trace(x) is x
 
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    anchored = bridge.anchor_rank_buffer_for_trace(x)
+    # Under torch.compile, _RANK_BUFFER must enter the traced FX graph while
+    # preserving every bit of `x` (including -0.0 and NaN).
+    captured: list[torch.fx.GraphModule] = []
+
+    def capture_backend(gm, _example_inputs):
+        captured.append(gm)
+        return gm
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        lambda t: bridge.anchor_rank_buffer_for_trace(t),
+        backend=capture_backend,
+        fullgraph=True,
+    )
+    anchored = compiled(x)
+    assert len(captured) == 1
+    assert ("torch.int32", (1, 2)) in shape_variants.graph_signature(captured[0])
+    assert any(n.target is torch.where for n in captured[0].graph.nodes)
     torch.testing.assert_close(anchored, x, equal_nan=True)
     assert torch.equal(anchored.view(torch.int32), x.view(torch.int32))
 
