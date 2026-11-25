@@ -1576,6 +1576,11 @@ class VllmTPUIndexer(Indexer):
         indexer.k_cache.head_dim = (
             indexer.head_dim + indexer.head_dim // indexer.quant_block_size
         )
+        # TPU_INDEXER_ROPE_NEOX_PERMUTE: True once permute_rope_to_half_split
+        # put the rope columns in half-split order. Set here, so every rebound
+        # indexer holds it and glm_rope_half_split reads it with no default.
+        # pyrefly: ignore[bad-argument-type]
+        indexer._rope_neox_permuted = False
         # pyrefly: ignore[bad-argument-type]
         indexer._qprep_op = None
         if envs.TPU_INDEXER_QPREP_FUSED:
@@ -1952,8 +1957,9 @@ def glm_rope_half_split(model: Any, hf_config: Any = None) -> tuple[bool, bool]:
     mla = indexer = has_indexer = has_mla = rope_supported = False
     for module in model.modules():
         if isinstance(module, VllmTPUIndexer):
+            # An indexer holds the flag from rebind on.
             has_indexer = True
-            indexer = indexer or bool(getattr(module, "_rope_neox_permuted", False))
+            indexer = indexer or bool(module._rope_neox_permuted)
         elif isinstance(module, VllmTPUMultiHeadLatentAttentionWrapper):
             # An MLA layer: it holds the flag from construction on.
             has_mla = True

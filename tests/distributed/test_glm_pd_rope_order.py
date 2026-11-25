@@ -169,7 +169,7 @@ def _model(
 ):
     """One layer as the reader walks it: an MLA layer that holds
     ``_rope_neox_permuted`` from construction on, its rope, and optionally an
-    indexer, which sets the flag only once permuted."""
+    indexer, which holds it from rebind on."""
     model = torch.nn.Module()
     model.attn = _FakeMLA()
     model.attn._rope_neox_permuted = permuted_mla
@@ -177,8 +177,7 @@ def _model(
     model.attn.rotary_emb = _glm_rope(rope)
     if indexer:
         model.attn.indexer = _FakeIndexer()
-        if permuted_indexer:
-            model.attn.indexer._rope_neox_permuted = True
+        model.attn.indexer._rope_neox_permuted = permuted_indexer
     return model
 
 
