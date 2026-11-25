@@ -737,6 +737,8 @@ def _kernel(
                 parts=lambda width: attend_parts(width, False)[2:],
                 fold=fold,
                 empty=empty,
+                single=first & last,
+                tile=tile if tiles_per_step > 1 else None,
             )
 
         # Slots past the group's pages hold stale bytes: their limits are 0, so
@@ -772,6 +774,41 @@ def _kernel(
         return
     widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
 
+    block_q = q_ref[0].shape[1] if isinstance(q_ref, tuple) else q_ref.shape[1]
+    block_q //= tiles_per_step
+    # A unit's tiles of 8 rows each half-fill a bf16 output window
+    # (`_store_unaligned_rows`): when all its groups are whole tiles, pairs
+    # of them write their windows whole instead of merging each into them.
+    paired_stores = (
+        MAX_FREE
+        and unit_groups % 2 == 0
+        and tiles_per_step % 2 == 0
+        and _merged_store_rows(block_q, o_ref.shape[0], o_ref.dtype, packed_stores)
+        == 2 * block_q
+    )
+
+    def _paired_finish(groups, parts):
+        """`finish` (`MAX_FREE`) of groups that are whole tile pairs ``(2k,
+        2k + 1)``: each pair's outputs as one 2-tile window store per head,
+        and every group's lse from one transpose of their softmax sums (one
+        log of the lane rows, not one per [H * Bq, 1] column)."""
+        n = len(groups)
+        sums = jnp.concatenate([l_cur for l_cur, _ in parts], axis=1).T  # [n, H Bq]
+        # `finish`'s m * ln 2 + log(l) with m = 0, op for op (bit-identical).
+        lse = (0.0 * _LN_2 + jnp.log(sums)).reshape(lse_ref.shape[0], n, 1, -1)
+        outs = [
+            (pv * (1.0 / jnp.maximum(l_cur, _denom_floor()))).reshape(
+                o_ref.shape[0], block_q, -1
+            )
+            for l_cur, pv in parts
+        ]
+        for i in range(0, n, 2):
+            tile = groups[i].tile % tiles_per_step
+            rows = pl.ds(pl.multiple_of(tile * block_q, 2 * block_q), 2 * block_q)
+            out = jnp.concatenate(outs[i : i + 2], axis=1)
+            o_ref[:, rows, :] = out.astype(o_ref.dtype)
+            lse_ref[:, pl.ds(tile, 2)] = lse[:, i : i + 2]
+
     def run_unit(w0, size):
         """Groups ``w0 .. w0 + size - 1`` side by side, after issuing the page
         copies of every group up to ``w0 + ring - 1``: their ring slots held
@@ -804,8 +841,21 @@ def _kernel(
                 for g in groups:
                     g.zero_to(width)
                 parts = [g.parts(width) for g in groups]
-                for g, (l_cur, pv) in zip(groups, parts):
-                    g.fold(l_cur, pv)
+
+                def folds():
+                    for g, (l_cur, pv) in zip(groups, parts):
+                        g.fold(l_cur, pv)
+
+                if not paired_stores:
+                    folds()
+                    return
+                # Single-group tiles in whole pairs (`_paired_finish`).
+                paired = True
+                for a, b in zip(groups[0::2], groups[1::2]):
+                    paired &= a.single & b.single & (a.tile % 2 == 0)
+                    paired &= b.tile == a.tile + 1
+                pl.when(paired)(lambda: _paired_finish(groups, parts))
+                pl.when(jnp.logical_not(paired))(folds)
 
         if cap < pages_per_step:
 
