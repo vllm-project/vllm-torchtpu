@@ -630,3 +630,250 @@ def test_dense0_tail_traces_fullgraph_static(k):
     got = fn(nt, lengths, n, n, 16 * (1 + k), n, p, token, *steps[1:])
     ref = runner_mod._spec_tail_stack(nt, lengths, n, n, 16 * (1 + k), n, *steps)
     assert all(torch.equal(a, b) for a, b in zip(got, ref))
+
+
+# --- the drafter-recorded step-0 base and the "not used" self-check ----------
+
+
+def _not_used_lines(log):
+    return [
+        c.args[0] % c.args[1:]
+        for c in log.info.call_args_list
+        if c.args and "not used" in c.args[0]
+    ]
+
+
+@pytest.fixture
+def dense_log(dense_env, monkeypatch):
+    from unittest.mock import Mock
+
+    log = Mock()
+    monkeypatch.setattr(runner_mod, "logger", log)
+    monkeypatch.setattr(runner_mod, "_prep_fold_rank0", lambda: True)
+    return log
+
+
+@pytest.mark.parametrize("k", [1, 3])
+@pytest.mark.parametrize("n", [1, 3, 6, 8, 16])
+def test_dense_step0_uses_the_drafter_base_without_view_tracking(
+    dense_log, monkeypatch, k, n
+):
+    """Step 0 with no `_base` (a backend that does not track the [:p] view, or
+    a copy): the base the drafter recorded (`DraftStepTokens.step0_base`, MK
+    step 0's [capacity] token) still takes the dense variant, bitwise OFF."""
+    runner = _mk_runner(k)
+    _precompile(runner)
+    dense_calls = _spy(monkeypatch, "_spec_tail_stack_dense0_compiled")
+    nt, state, steps, token = _mk_steps(k, n, 16, seed=31 * k + n)
+    untracked = [steps[0].clone(), *steps[1:]]
+    assert untracked[0]._base is None
+    assert runner_mod._dense_step0_base(untracked[0]) is None
+    ref = runner._assemble_async_spec_substitution(
+        DraftStepTokens(steps, n).materialize(), [nt], state
+    )
+    got = runner._assemble_async_spec_substitution(
+        DraftStepTokens(untracked, n, step0_base=token, step0_source="mk"), [nt], state
+    )
+    assert len(dense_calls) == 1 and dense_calls[0][7] is token
+    _equal(got, ref)
+    assert _not_used_lines(dense_log) == [
+        "SPEC_TAIL_DENSE_STEP0: not used (the drafter returned stacked drafts "
+        "(not a one-chunk async SPEC_TAIL_STACK step))"
+    ]  # only the reference call's (stacked drafts)
+    passed = [
+        c.args[0] % c.args[1:]
+        for c in dense_log.info.call_args_list
+        if "step 0 passed as its" in c.args[0]
+    ]
+    assert passed == [
+        f"SPEC_TAIL_DENSE_STEP0: step 0 passed as its [16] base, sliced to "
+        f"{steps[0].shape[0]} rows in-graph (base: recorded by the drafter; the "
+        "view's own _base: step 0 is not a view (no _base); base is not a view)"
+    ]
+
+
+@pytest.mark.parametrize(
+    "case,reason",
+    [
+        ("stock", "step 0 is the stock draft step's token (no MK step 0); "
+                  "step 0 is not a view (no _base)"),
+        ("mk_fresh", "step 0 is MK draft step 0's own [capacity] output, no [:p] "
+                     "slice (MK_DRAFT_ROWS_FRESH at p == capacity); step 0 is not a "
+                     "view (no _base)"),
+        ("mk_step0_loop", "step 0 comes from VLLM_TPU_MK_DRAFT_STEP0_LOOP_PROGRAM's "
+                          "one program, [capacity] long, no [:p] slice; step 0 is not "
+                          "a view (no _base)"),
+        ("offset_view", "step 0 does not start at its base's first element"),
+        ("bad_base", "the drafter's step-0 base (16,) torch.int64 does not hold "
+                     "step 0 (8,) torch.int32"),
+    ],
+)
+def test_dense_step0_not_used_reasons(dense_log, monkeypatch, case, reason):
+    """Each way step 0 has no usable base logs its reason once (rank 0), and the
+    step takes the stack variant with the stock result."""
+    k, n = 3, 6
+    monkeypatch.setattr(
+        envs, "VLLM_TPU_MK_DRAFT_STEP0_LOOP_PROGRAM", case == "mk_step0_loop",
+        raising=False,
+    )
+    runner = _mk_runner(k)
+    _precompile(runner)
+    dense_calls = _spy(monkeypatch, "_spec_tail_stack_dense0_compiled")
+    stack_calls = _spy(monkeypatch, "_spec_tail_stack_compiled")
+    nt, state, steps = _served_step(k, n, seed=41)
+    p = steps[0].shape[0]
+    if case == "mk_step0_loop":
+        # That program's K tokens are all [capacity] (warmed as their own key).
+        g = torch.Generator().manual_seed(5)
+        steps = [torch.randint(0, 1000, (16,), generator=g, dtype=torch.int32)
+                 for _ in range(k)]
+        drafts = DraftStepTokens(steps, n, step0_source="mk_step0_loop")
+    elif case == "offset_view":
+        shifted = torch.zeros(16, dtype=torch.int32)
+        shifted[1 : p + 1] = steps[0]
+        steps = [shifted[1 : p + 1], *steps[1:]]
+        drafts = DraftStepTokens(steps, n, step0_source="mk")
+    elif case == "bad_base":
+        drafts = DraftStepTokens(
+            steps, n, step0_base=torch.zeros(16, dtype=torch.int64), step0_source="mk"
+        )
+    else:
+        drafts = DraftStepTokens(steps, n, step0_source=case.split("_")[0])
+    ref = runner._assemble_async_spec_substitution(
+        DraftStepTokens(steps, n).materialize(), [nt], state
+    )
+    del stack_calls[:]
+    dense_log.reset_mock()
+    for _ in range(2):
+        got = runner._assemble_async_spec_substitution(drafts, [nt], state)
+        _equal(got, ref)
+    assert not dense_calls and len(stack_calls) == 2
+    assert _not_used_lines(dense_log) == [f"SPEC_TAIL_DENSE_STEP0: not used ({reason})"]
+
+
+@pytest.mark.parametrize(
+    "case,reason",
+    [
+        ("compiled_off", "VLLM_TPU_SPEC_TAIL_COMPILED is off"),
+        ("two_chunks", "a step of more than one chunk"),
+        ("no_metadata", "a step without spec decode metadata"),
+        ("count", "a step whose chunk request count differs from the drafts'"),
+        ("bucketed", "a bucketed-draft drafter"),
+    ],
+)
+def test_spec_tail_early_return_reasons(dense_log, monkeypatch, case, reason):
+    """`_spec_tail_from_steps` returning early names its condition once."""
+    k, n = 3, 6
+    runner = _mk_runner(k)
+    _precompile(runner)
+    nt, state, steps, token = _mk_steps(k, n, 16, seed=43)
+    chunks = [nt]
+    if case == "compiled_off":
+        monkeypatch.setattr(envs, "VLLM_TPU_SPEC_TAIL_COMPILED", False, raising=False)
+    elif case == "two_chunks":
+        chunks = [nt, nt]
+    elif case == "no_metadata":
+        state.spec_decode_metadata_list[0] = None
+    elif case == "count":
+        state.num_reqs_list[0] = n - 1
+    else:
+        runner.drafter.bucketed_drafts = True
+    drafts = DraftStepTokens(steps, n, step0_base=token, step0_source="mk")
+    for _ in range(2):
+        assert runner._spec_tail_from_steps(drafts, chunks, state) is None
+    assert _not_used_lines(dense_log) == [
+        f"SPEC_TAIL_DENSE_STEP0: not used ({reason}: the stack path is not taken)"
+    ]
+
+
+@pytest.mark.parametrize(
+    "fence,structured,draft_tp,tp,spec,reason",
+    [
+        (False, False, 8, 8, False, "not a spec decode step"),
+        (True, False, 8, 8, True, "the KV producer fence reads them"),
+        (False, True, 8, 8, True, "structured-output requests read them on the host"),
+        (False, False, 1, 8, True, "the replicated drafter's TP pin reads them"),
+        (False, False, 8, 8, True, None),
+        (False, False, 1, 1, True, None),
+    ],
+)
+def test_draft_steps_stack_reason(monkeypatch, fence, structured, draft_tp, tp, spec,
+                                  reason):
+    import vllm.distributed
+
+    runner = _runner(3)
+    runner.speculative_config.draft_tensor_parallel_size = draft_tp
+    monkeypatch.setattr(
+        TPUModelRunner, "_fence_spec_kv_under_token_copy", property(lambda s: fence)
+    )
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: tp
+    )
+    sched = SimpleNamespace(has_structured_output_requests=structured)
+    assert runner._draft_steps_stack_reason(spec, object(), sched) == reason
+    assert runner._keep_draft_steps(spec, object(), sched) is (reason is None)
+    runner.scheduler_config.async_scheduling = False
+    assert runner._draft_steps_stack_reason(spec, object(), sched) == (
+        "not a spec decode step" if not spec else "no async scheduling"
+    )
+
+
+def test_dense_step0_not_used_rank0_once_and_flag_gated(dense_log, monkeypatch):
+    runner = _mk_runner(3)
+    for _ in range(3):
+        runner._spec_tail_dense0_not_used("r1")
+    runner._spec_tail_dense0_not_used("r2")
+    assert _not_used_lines(dense_log) == [
+        "SPEC_TAIL_DENSE_STEP0: not used (r1)",
+        "SPEC_TAIL_DENSE_STEP0: not used (r2)",
+    ]
+    dense_log.reset_mock()
+    monkeypatch.setattr(runner_mod, "_prep_fold_rank0", lambda: False)
+    runner._spec_tail_dense0_not_used("r3")  # other TP ranks: silent
+    monkeypatch.setattr(runner_mod, "_prep_fold_rank0", lambda: True)
+    monkeypatch.setattr(envs, "VLLM_TPU_SPEC_TAIL_DENSE_STEP0", False, raising=False)
+    runner._spec_tail_dense0_not_used("r4")  # flag off: silent
+    assert _not_used_lines(dense_log) == []
+
+
+def test_propose_records_the_mk_step0_base(monkeypatch):
+    """With MK draft step 0, propose's DraftStepTokens carries the [capacity]
+    token step 0 was sliced from (`step0_base`, source "mk"); step 0 is exactly
+    its leading [:p] rows; the drafts materialize as before."""
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    k, num_reqs, cap = 3, 3, 16
+    p = _bucket(num_reqs)
+    seen = {}
+    orig_propose = Eagle3Proposer.propose
+
+    def run(mk: bool):
+        def propose(self, *a, **kw):
+            if mk:
+                self._mk_draft_step0_ready = lambda *_a, **_k: True
+                self._mk_step0_loop_program_wanted = lambda *_a: False
+
+                def step0(chunk, input_ids, positions, ths, last, rej):
+                    g = torch.Generator().manual_seed(3)
+                    out = (
+                        torch.randn(cap, 8, generator=g),
+                        torch.randint(0, 1000, (cap,), generator=g, dtype=torch.int32),
+                        torch.arange(100, 100 + cap, dtype=torch.int32),
+                    )
+                    seen["token"] = out[1]
+                    return self._mk_step0_trim_recorded(out, last.shape[0])
+
+                self._run_mk_draft_step0 = step0
+            return orig_propose(self, *a, **kw)
+
+        monkeypatch.setattr(Eagle3Proposer, "propose", propose)
+        return _propose(monkeypatch, k, num_reqs, flag=True)
+
+    stock = run(False)
+    assert stock.step0_source == "stock" and stock.step0_base is None
+    on = run(True)
+    assert isinstance(on, DraftStepTokens) and on.step0_source == "mk"
+    assert on.step0_base is seen["token"] and on.step0_base.shape == (cap,)
+    assert on.steps[0].shape == (p,)
+    assert torch.equal(on.steps[0], on.step0_base[:p])
+    assert torch.equal(on.materialize()[:, 0], seen["token"][:num_reqs])

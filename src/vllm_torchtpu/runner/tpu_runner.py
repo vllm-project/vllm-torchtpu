@@ -1371,22 +1371,72 @@ def _dense_step0_base(step0: torch.Tensor) -> torch.Tensor | None:
     1-D and contiguous and the slice starts at its first element with unit
     stride, so `base[:p]` reads exactly `step0`'s elements; else None (step 0
     is dense already, or a view of another kind)."""
+    return _dense_step0_base_or_reason(step0)[0]
+
+
+def _dense_step0_base_or_reason(
+    step0: torch.Tensor,
+) -> tuple[torch.Tensor | None, str]:
+    """`(_dense_step0_base(step0), "")`, or `(None, why not)`."""
     base = step0._base
-    if base is None or step0.dim() != 1 or base.dim() != 1:
-        return None
+    if base is None:
+        return None, "step 0 is not a view (no _base)"
+    if step0.dim() != 1 or base.dim() != 1:
+        return None, f"step 0 is a {step0.dim()}-D view of a {base.dim()}-D tensor"
     try:
-        if not (
-            base.dtype == step0.dtype
-            and base.is_contiguous()
-            and step0.shape[0] <= base.shape[0]
-            and (step0.shape[0] <= 1 or step0.stride(0) == 1)
-            and step0.storage_offset() == base.storage_offset()
-        ):
-            return None
-    except (RuntimeError, NotImplementedError):
+        if base.dtype != step0.dtype:
+            return None, f"step 0's base is {base.dtype}, step 0 {step0.dtype}"
+        if not base.is_contiguous():
+            return None, "step 0's base is not contiguous"
+        if step0.shape[0] > base.shape[0]:
+            return None, "step 0 is longer than its base"
+        if step0.shape[0] > 1 and step0.stride(0) != 1:
+            return None, f"step 0 has stride {step0.stride(0)}"
+        if step0.storage_offset() != base.storage_offset():
+            return None, "step 0 does not start at its base's first element"
+    except (RuntimeError, NotImplementedError) as e:
         # A tensor without strided storage metadata: keep the stock path.
-        return None
-    return base
+        return None, f"no strided metadata ({type(e).__name__})"
+    return base, ""
+
+
+def _spec_tail_step0_base(drafts: DraftStepTokens) -> tuple[torch.Tensor | None, str]:
+    """VLLM_TPU_SPEC_TAIL_DENSE_STEP0: `(base, "")` when draft step 0 is a
+    leading `[:p]` slice of the 1-D `base` -- the base the drafter recorded
+    (`DraftStepTokens.step0_base`: MK draft step 0's `[capacity]` token), else
+    the view's own `_base` (`_dense_step0_base`) -- or `(None, why not)`."""
+    step0 = drafts.steps[0]
+    base = drafts.step0_base
+    source = drafts.step0_source
+    if base is not None:
+        if not (
+            base.dim() == 1
+            and step0.dim() == 1
+            and base.dtype == step0.dtype
+            and step0.shape[0] <= base.shape[0]
+        ):
+            return None, (
+                f"the drafter's step-0 base {tuple(base.shape)} {base.dtype} does "
+                f"not hold step 0 {tuple(step0.shape)} {step0.dtype}"
+            )
+        return base, ""
+    view_base, why = _dense_step0_base_or_reason(step0)
+    if source == "mk_step0_loop":
+        # All K tokens are that program's [capacity] outputs: nothing is sliced.
+        return None, (
+            "step 0 comes from VLLM_TPU_MK_DRAFT_STEP0_LOOP_PROGRAM's one program, "
+            f"[capacity] long, no [:p] slice; {why}"
+        )
+    if view_base is not None:
+        return view_base, ""
+    if source == "mk" and step0._base is None:
+        return None, (
+            "step 0 is MK draft step 0's own [capacity] output, no [:p] slice "
+            f"(MK_DRAFT_ROWS_FRESH at p == capacity); {why}"
+        )
+    if source == "stock":
+        return None, f"step 0 is the stock draft step's token (no MK step 0); {why}"
+    return None, why
 
 
 def _spec_tail_stack_dense0_key(next_tokens, draft_lengths, n, steps, base) -> tuple:
@@ -4646,13 +4696,21 @@ class TPUModelRunner(GPUModelRunner):
         `_assemble_async_spec_substitution` returns it) from the unstacked
         drafts, or None when the step is not the one-chunk steady case or its
         shapes were not precompiled (the caller then materializes)."""
-        if not (
-            envs.VLLM_TPU_SPEC_TAIL_COMPILED
-            and len(next_tokens_per_chunk) == 1
-            and state.spec_decode_metadata_list[0] is not None
-            and state.num_reqs_list[0] == drafts.num_reqs
-            and not getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
-        ):
+        skip = (
+            "VLLM_TPU_SPEC_TAIL_COMPILED is off"
+            if not envs.VLLM_TPU_SPEC_TAIL_COMPILED
+            else "a step of more than one chunk"
+            if len(next_tokens_per_chunk) != 1
+            else "a step without spec decode metadata"
+            if state.spec_decode_metadata_list[0] is None
+            else "a step whose chunk request count differs from the drafts'"
+            if state.num_reqs_list[0] != drafts.num_reqs
+            else "a bucketed-draft drafter"
+            if getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+            else None
+        )
+        if skip is not None:
+            self._spec_tail_dense0_not_used(f"{skip}: the stack path is not taken")
             return None
         nt_chunk = next_tokens_per_chunk[0]
         num_reqs = drafts.num_reqs
@@ -4664,8 +4722,10 @@ class TPUModelRunner(GPUModelRunner):
         if envs.VLLM_TPU_SPEC_TAIL_DENSE_STEP0:
             # Step 0 is a [:p] view (MK draft step 0's trim): hand the program
             # its dense base and slice in-graph, so no view crosses the call.
-            base = _dense_step0_base(steps[0])
-            if base is not None:
+            base, why = _spec_tail_step0_base(drafts)
+            if base is None:
+                self._spec_tail_dense0_not_used(why)
+            else:
                 dkey = _spec_tail_stack_dense0_key(
                     nt_chunk, md.draft_lengths, num_reqs, steps, base
                 )
@@ -4683,11 +4743,22 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if not getattr(self, "_spec_tail_dense0_logged", False):
                         self._spec_tail_dense0_logged = True
+                        # Where the base came from, and what the view's own
+                        # `_base` gives (served za11 found none there).
+                        view_base, why = _dense_step0_base_or_reason(steps[0])
                         logger.info(
                             "SPEC_TAIL_DENSE_STEP0: step 0 passed as its [%d] "
-                            "base, sliced to %d rows in-graph",
+                            "base, sliced to %d rows in-graph (base: %s; the "
+                            "view's own _base: %s; base is %sa view)",
                             base.shape[0],
                             steps[0].shape[0],
+                            "recorded by the drafter"
+                            if base is drafts.step0_base
+                            else "the view's _base",
+                            "the same tensor"
+                            if view_base is base
+                            else (why or f"another tensor {tuple(view_base.shape)}"),
+                            "" if base._base is not None else "not ",
                         )
                 else:
                     logger.warning_once(
@@ -4727,12 +4798,24 @@ class TPUModelRunner(GPUModelRunner):
         of this step's drafts, so they may stay unstacked. The KV fence, the
         structured-output host copy and the replicated-drafter TP pin read
         the dense tensor."""
-        if not (is_spec_step and self.scheduler_config.async_scheduling):
-            return False
+        return (
+            self._draft_steps_stack_reason(is_spec_step, copy_state, scheduler_output)
+            is None
+        )
+
+    def _draft_steps_stack_reason(
+        self, is_spec_step: bool, copy_state, scheduler_output
+    ) -> str | None:
+        """Why this step's drafts are stacked before the spec tail (None: the
+        spec tail is their only reader, `_keep_draft_steps`)."""
+        if not is_spec_step:
+            return "not a spec decode step"
+        if not self.scheduler_config.async_scheduling:
+            return "no async scheduling"
         if copy_state is not None and self._fence_spec_kv_under_token_copy:
-            return False
+            return "the KV producer fence reads them"
         if scheduler_output.has_structured_output_requests:
-            return False
+            return "structured-output requests read them on the host"
         if (
             self.speculative_config is not None
             and self.speculative_config.draft_tensor_parallel_size == 1
@@ -4740,8 +4823,21 @@ class TPUModelRunner(GPUModelRunner):
             from vllm.distributed import get_tensor_model_parallel_world_size
 
             if get_tensor_model_parallel_world_size() > 1:
-                return False
-        return True
+                return "the replicated drafter's TP pin reads them"
+        return None
+
+    def _spec_tail_dense0_not_used(self, reason: str) -> None:
+        """VLLM_TPU_SPEC_TAIL_DENSE_STEP0 self-check: log, once per reason and
+        on TP rank 0 only, why a step did not hand the spec tail step 0's base
+        (the success line is `SPEC_TAIL_DENSE_STEP0: step 0 passed as ...`)."""
+        if not envs.VLLM_TPU_SPEC_TAIL_DENSE_STEP0:
+            return
+        seen = self.__dict__.setdefault("_spec_tail_dense0_reasons", set())
+        if reason in seen:
+            return
+        seen.add(reason)
+        if _prep_fold_rank0():
+            logger.info("SPEC_TAIL_DENSE_STEP0: not used (%s)", reason)
 
     def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk, state):
         """Async-spec substitution assembler.
@@ -4770,6 +4866,14 @@ class TPUModelRunner(GPUModelRunner):
             if stacked is not None:
                 return stacked
             drafts = drafts.materialize()
+        elif not getattr(self, "_draft_steps_stacked", False):
+            # The drafter returned them stacked (Eagle3Proposer.propose returns
+            # DraftStepTokens only on one-chunk async steps with SPEC_TAIL_STACK
+            # and SPEC_TAIL_COMPILED).
+            self._spec_tail_dense0_not_used(
+                "the drafter returned stacked drafts (not a one-chunk async "
+                "SPEC_TAIL_STACK step)"
+            )
         drafts_per_chunk = self._drafts_per_chunk(drafts, state.num_reqs_list)
         if (
             envs.VLLM_TPU_SPEC_TAIL_COMPILED
@@ -8214,10 +8318,20 @@ class TPUModelRunner(GPUModelRunner):
                         device_seed=device_seed,
                     )
 
-        if isinstance(eagle3_drafts, DraftStepTokens) and not self._keep_draft_steps(
-            is_spec_step, copy_state, scheduler_output
-        ):
-            eagle3_drafts = eagle3_drafts.materialize()
+        # VLLM_TPU_SPEC_TAIL_DENSE_STEP0 self-check: this step's drafts were
+        # stacked here (the reason is logged here, not as the drafter's).
+        self._draft_steps_stacked = False
+        if isinstance(eagle3_drafts, DraftStepTokens):
+            stack_reason = self._draft_steps_stack_reason(
+                is_spec_step, copy_state, scheduler_output
+            )
+            if stack_reason is not None:
+                if is_spec_step:
+                    self._spec_tail_dense0_not_used(
+                        f"drafts stacked before the spec tail: {stack_reason}"
+                    )
+                self._draft_steps_stacked = True
+                eagle3_drafts = eagle3_drafts.materialize()
         host_phases.mark("draft_propose")
         if defer_prev_wait:
             self._modify_prev_results()

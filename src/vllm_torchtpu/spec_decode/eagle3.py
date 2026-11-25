@@ -456,6 +456,8 @@ class Eagle3Proposer:
         # VLLM_TPU_MK_DRAFT: draft step 0 as one MK call (built on first use).
         self._mk_draft_step0: torch.nn.Module | None = None
         self._mk_draft_step0_warm = False
+        # The [capacity] token the last MK step 0's token 0 was sliced from.
+        self._mk_step0_token_base: torch.Tensor | None = None
         # VLLM_TPU_MK_DRAFT_STEP0_LOOP_PROGRAM: MK step 0 + the stock fused loop as one
         # program (built on first use), and the (step-0 tokens, loop width) keys it
         # compiled; after warmup an uncompiled key runs the two programs.
@@ -1255,7 +1257,17 @@ class Eagle3Proposer:
                 self._mk_draft_step0(input_ids, positions, target_hidden_states, draft_rows)
                 self._mk_draft_step0_warm = True
             out = self._mk_draft_step0(input_ids, positions, target_hidden_states, draft_rows)
-        return self._mk_step0_trim(out, rows)
+        return self._mk_step0_trim_recorded(out, rows)
+
+    def _mk_step0_trim_recorded(
+        self, out: tuple[torch.Tensor, ...], rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """`_mk_step0_trim`, recording for VLLM_TPU_SPEC_TAIL_DENSE_STEP0 the
+        [capacity] token that token 0 is the [:rows] slice of (None when token 0
+        is that output itself)."""
+        trimmed = self._mk_step0_trim(out, rows)
+        self._mk_step0_token_base = out[1] if trimmed[1] is not out[1] else None
+        return trimmed
 
     def _loop_kernel_num_reqs(self, chunk: DraftChunkInputs) -> int:
         runner = self.runner
@@ -2215,6 +2227,9 @@ class Eagle3Proposer:
         saved_topk_per_chunk: list[list[torch.Tensor]] = []
         # VLLM_TPU_MK_DRAFT_STEP0_LOOP_PROGRAM: one program drafted every step.
         drafted_all_steps = False
+        # VLLM_TPU_SPEC_TAIL_DENSE_STEP0: the first chunk's step-0 source and,
+        # for MK step 0, the [capacity] token its token 0 was cut from.
+        step0_source, step0_base = "stock", None
         host_phases.mark("dp_entry")
         for ci, chunk in enumerate(chunks):
             if uses_aux_hidden_state:
@@ -2277,6 +2292,7 @@ class Eagle3Proposer:
                     host_phases.mark("dp_carries")
                     draft_tokens_per_chunk.append(all_tokens)
                     drafted_all_steps = True
+                    step0_source = "mk_step0_loop"
                     continue
             if mk0:
                 # VLLM_TPU_MK_DRAFT: step 0 + carry + token 0 as one kernel call.
@@ -2291,6 +2307,9 @@ class Eagle3Proposer:
                 positions_carry_per_chunk.append(positions_carry)
                 positions_next_per_chunk[id(chunk)] = positions_next
                 draft_tokens_per_chunk.append([fused_token0])
+                if ci == 0:
+                    step0_source = "mk"
+                    step0_base = self._mk_step0_token_base
                 continue
             capacity_rows = (
                 (
@@ -2581,7 +2600,12 @@ class Eagle3Proposer:
             # Steady async decode: the runner's spec-tail program stacks and
             # slices the steps in-graph (DraftStepTokens.materialize for any
             # other consumer).
-            return DraftStepTokens(draft_tokens_per_chunk[0], chunks[0].num_reqs)
+            return DraftStepTokens(
+                draft_tokens_per_chunk[0],
+                chunks[0].num_reqs,
+                step0_base=step0_base,
+                step0_source=step0_source,
+            )
         # Assemble [total_num_reqs, K]. Each chunk's tokens are padded to p; slice
         # to the real num_reqs at the end. Sync slices on the host (the [p, K] D2H
         # is constant-shape, so no recompile); async keeps the device slice
