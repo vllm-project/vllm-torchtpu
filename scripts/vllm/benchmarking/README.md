@@ -141,8 +141,10 @@ that the other runs reported.
 
 | Task | Enabled by | Endpoint | Gated metric |
 |------|------------|----------|--------------|
-| `mmlu_llama`, `mmlu_pro` | `--run-lm-eval` | chat completions | `exact_match` |
-| `humaneval_plus_tpu`, `mbpp_plus_tpu` | `--run-code-eval` (nightly only) | chat completions | pass@1 |
+| `mmlu_llama`, `mmlu_pro` | `--run-lm-eval` or `--eval-suites` | chat completions | `exact_match` |
+| `gsm8k` | `--eval-suites gsm8k` (or `all`) | chat completions | `exact_match` |
+| `humaneval_plus_tpu`, `mbpp_plus_tpu` | `--run-code-eval` or `--eval-suites` | chat completions | pass@1 |
+| `mmmu_pro` | `--run-mm-eval` or `--eval-suites` (via `evalscope`) | chat completions | `acc` |
 
 - `--run-lm-eval` walks `LM_EVAL_TASKS` (default `mmlu_llama mmlu_pro`; configs
   may narrow it).
@@ -177,6 +179,13 @@ A generation cap goes in `LM_EVAL_GEN_KWARGS` as `max_gen_toks`: the
 > a different flag ignores it silently and the model reasons anyway — Kimi-K2.6
 > wants `thinking`. Check the checkpoint's `chat_template.jinja` before assuming
 > the default lands.
+
+### `run_eval_flow.sh` flags
+
+- `--base-url URL`: API root URL (not a full route like `/v1/chat/completions`) with optional scheme, port, and path prefix. Bare host defaults to `:8000`; trailing `/` and `/v1` on the path are stripped, and paths beneath `/v1/` are rejected. Cannot be combined with `--host` or `--port`. Connects to the endpoint instead of starting a local server.
+- `--served-model-name NAME`: Model name sent in requests to a running server (`--base-url`, `--host`, or `--skip-benchmark` with the server already on `localhost`) when it differs from the config's `MODEL`. Before a run sends a request to a server it did not start (`--base-url`, `--host`, or `--skip-benchmark` with the server on `localhost`), it reads `<server>/v1/models` (sending `OPENAI_API_KEY` as a bearer token when set) and stops unless the name it will send is listed there. That name is `--served-model-name` when given, otherwise the config's `MODEL`. A lookup that fails (connection error, HTTP error, or a response that is not a model list) also stops the run.
+- `--eval-suites LIST`: Comma-separated list of accuracy suites (`mmlu_llama`, `mmlu_pro`, `gsm8k`, `humaneval_plus_tpu`, `mbpp_plus_tpu`, `mmmu_pro`, `all`, or `none`). `all` covers whichever of `mmlu_llama` and `mmlu_pro` the config's `LM_EVAL_TASKS` lists (both by default; a config that narrows the list to `mmlu_pro` gets no `mmlu_llama`), then `gsm8k`, `humaneval_plus_tpu`, and `mbpp_plus_tpu`, plus `mmmu_pro` for `*multimodal*` configs. Precedence is `--eval-suites` > legacy `--run-*-eval` flags > config `EVAL_SUITES` > none.
+- `--perf-suites LIST`: Comma-separated list of performance suites (`bench_serve`, `all`, or `none`; `all` currently runs `bench_serve`). Precedence matches eval suites: `--perf-suites` > legacy `--skip-benchmark` (which removes `bench_serve`) > config `PERF_SUITES` > `bench_serve`. Runs without `bench_serve` skip the perf regression check and the `ci.vllm.ai` dashboard publish. `--skip-benchmark` also decides which server the evals use: unless `--perf-suites` selects `bench_serve`, it never starts a server (even next to `--perf-suites none`) and sends the evals to the one already on `localhost:$PORT`, while `--perf-suites none` without `--skip-benchmark` runs `cleanup_server.sh` and starts a server for the evals. A `spec_bench` config cannot run eval-only on a server the script starts, because its servers exist only inside its `(BS, K)` sweep; the script rejects that before the cleanup, so point it at a running server with `--host`, `--base-url`, or `--skip-benchmark`.
 
 ## Speculative Decoding (`run_benchmarks.sh --mode spec_bench`)
 
@@ -253,3 +262,6 @@ prints the rows without posting them.
 | `SPEC_BENCH_DATASET` / `SPEC_BENCH_CATEGORY` (config var) | auto-download / `summarization` | Path to Spec-Bench `question.jsonl` and category filter |
 | `SPEC_NUM_PROMPTS` / `SPEC_WARMUP_PROMPTS` / `SPEC_REPS` (config var) | `100` / `20` / `2` | Prompts per measured pass, warmup prompts per cell, and measured repetitions per cell |
 | `SERVED_MODEL_NAME` (config var) | (empty) | Optional `--served-model-name` passed in `spec_bench` mode |
+| `EVAL_SUITES` (config var) | (empty) | Default comma-separated accuracy suites when neither `--eval-suites` nor `--run-*-eval` is passed |
+| `PERF_SUITES` (config var) | (empty) | Default comma-separated performance suites (`bench_serve`, `all`, or `none`) when `--perf-suites` is omitted; legacy `--skip-benchmark` still removes `bench_serve` |
+| `OPENAI_API_KEY` | (empty) | Sent as a bearer token to `/v1/models` and as `--api-key` to `evalscope` (in addition to `lm_eval` and `vllm bench serve`). `FORWARD` in `.buildkite/kubernetes/common.sh` does not name it, so a key set on a Buildkite kube step does not reach the pod; a gateway that requires the key then answers the `/v1/models` lookup with 401 and the run stops |
