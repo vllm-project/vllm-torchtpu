@@ -53,6 +53,8 @@ TILES_PER_STEP = 4
 # (a page and a scale page each) gain from 2 (bench j-caec1354: c64 shared
 # 2206 -> 2026, forced 2150 -> 2075 us per call), 8/16-bit ones do not.
 _FP4_PREFETCH = 2
+# Page copies issued (or waited on) per loop iteration (`_for_pages`).
+_COPY_UNROLL = 4
 _LOG2_E = math.log2(math.e)
 _LN_2 = math.log(2.0)
 
@@ -165,14 +167,13 @@ def _kernel(
         def start_group(group, half):
             base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
 
-            def start(g, carry):
+            def start(g):
                 for copy in page_copies(
                     half, g, page_table_ref[work_page_ref[base + g]]
                 ):
                     copy.start()
-                return carry
 
-            jax.lax.fori_loop(0, work_count_ref[group], start, 0)
+            _for_pages(work_count_ref[group], start)
 
         @pl.when(w == 0)
         def _first():
@@ -183,12 +184,11 @@ def _kernel(
         def _next():
             start_group(w + ring - 1, (w + ring - 1) % ring)
 
-        def wait(g, carry):
+        def wait(g):
             for copy in page_copies(half, g, 0):  # the source only sizes the wait
                 copy.wait()
-            return carry
 
-        jax.lax.fori_loop(0, count, wait, 0)
+        _for_pages(count, wait)
 
         kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
 
@@ -422,6 +422,20 @@ def _kernel(
 
     b = pl.program_id(0)
     jax.lax.fori_loop(block_start_ref[b], block_start_ref[b + 1], loop, 0)
+
+
+def _for_pages(count, body):
+    """``body(g)`` for ``g < count``, `_COPY_UNROLL` pages per loop iteration:
+    one page per iteration ran each page's dependent scalar loads (its key,
+    then its physical page) and copy issue back to back."""
+
+    def step(i, carry):
+        for j in range(_COPY_UNROLL):
+            g = i * _COPY_UNROLL + j
+            pl.when(g < count)(functools.partial(body, g))
+        return carry
+
+    jax.lax.fori_loop(0, (count + _COPY_UNROLL - 1) // _COPY_UNROLL, step, 0)
 
 
 def _fp8_page(kv_ref, page, selected, local_page, local_limit, slots, head_dim):
