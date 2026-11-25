@@ -585,11 +585,27 @@ torch.library.register_fake(
     "tpu_fmd_static_dispatch_test::qmm",
     lambda x, w, _s: x.new_empty((*x.shape[:-1], w.shape[-1])),
 )
+_ALL_REDUCE_SINK: list[int] | None = None
+
+
+def _all_reduce_op_impl(x: torch.Tensor) -> torch.Tensor:
+    if _ALL_REDUCE_SINK is not None:
+        _ALL_REDUCE_SINK.append(x.shape[0])
+    return x * 3.0
+
+
+_fmd_test_lib.define("all_reduce(Tensor x) -> Tensor")
+_fmd_test_lib.impl("all_reduce", _all_reduce_op_impl, "CPU")
+torch.library.register_fake(
+    "tpu_fmd_static_dispatch_test::all_reduce",
+    lambda x: torch.empty_like(x),
+)
 _DECODE_GATED_OP = torch.ops.tpu_fmd_static_dispatch_test.decode_gated
 _DECODE_UNGATED_OP = torch.ops.tpu_fmd_static_dispatch_test.decode_ungated
 _GMM_OP = torch.ops.tpu_fmd_static_dispatch_test.gmm
 _SPLIT_BARRIER_OP = torch.ops.tpu_fmd_static_dispatch_test.split_barrier
 _STUB_QMM_OP = torch.ops.tpu_fmd_static_dispatch_test.qmm
+_ALL_REDUCE_OP = torch.ops.tpu_fmd_static_dispatch_test.all_reduce
 
 
 class _StubLinear(torch.nn.Module):
@@ -788,20 +804,22 @@ def _patch_cpu_moe_runtime(monkeypatch, *, all_reduce_calls: list | None = None)
 
     monkeypatch.setattr(fp8_mod, "fused_moe_gmm", _stub_gmm)
 
-    def _stub_all_reduce(x):
-        if all_reduce_calls is not None:
-            all_reduce_calls.append(x.shape[0])
-        return x * 3.0
+    import sys
 
-    monkeypatch.setattr(vllm_mr, "tensor_model_parallel_all_reduce", _stub_all_reduce)
+    monkeypatch.setattr(sys.modules[__name__], "_ALL_REDUCE_SINK", all_reduce_calls)
+    monkeypatch.setattr(
+        vllm_mr, "tensor_model_parallel_all_reduce", lambda x: _ALL_REDUCE_OP(x)
+    )
     monkeypatch.setattr(
         vllm_mr.MoERunner, "_sequence_parallel_context", lambda self: nullcontext()
     )
 
 
-def test_arm_static_dispatch_preserves_shared_experts_and_scaling(monkeypatch):
+def test_arm_static_dispatch_preserves_shared_experts_and_scaling(monkeypatch, caplog):
     """Arming a VllmMoERunner with dp=1, pcp=1 keeps shared experts and
     routed_scaling_factor intact so m > max_tokens runs unmodified MoERunner."""
+    import logging
+
     import vllm.distributed
 
     from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
@@ -867,7 +885,10 @@ def test_arm_static_dispatch_preserves_shared_experts_and_scaling(monkeypatch):
     model = torch.nn.Module()
     model.add_module("runner", runner)
 
-    assert bridge.arm_fused_moe_decode(model) == 1
+    with caplog.at_level(logging.INFO, logger=bridge.logger.name):
+        assert bridge.arm_fused_moe_decode(model) == 1
+    assert "static dispatch 1/1" in caplog.text
+    assert "stock MoERunner above" in caplog.text
     assert runner._shared_experts is not None
     assert runner.routed_scaling_factor == 2.5
     assert getattr(runner, bridge.RUNNER_STATIC_DISPATCH_ATTR) is True
@@ -1027,7 +1048,8 @@ def test_static_dispatch_shape_variants_placeholder_parity(
     from vllm_torchtpu.distributed import pcp as tpu_pcp
     from vllm_torchtpu.layers.adapter import token_padding
 
-    _patch_cpu_moe_runtime(monkeypatch)
+    ar_calls: list[int] = []
+    _patch_cpu_moe_runtime(monkeypatch, all_reduce_calls=ar_calls)
     monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
     pad_state = token_padding.TokenPaddingState.create(64, torch.device("cpu"))
     pad_state.update(10, 16)
@@ -1071,7 +1093,9 @@ def test_static_dispatch_shape_variants_placeholder_parity(
             return self.l2(x, logits)
 
     model = SplitThreeLayerMoE()
-    captured: list[tuple[tuple, list[str], list[tuple[tuple, list[str]]], object]] = []
+    captured: list[
+        tuple[tuple, list[str], list[tuple[tuple, list[str]]], object, int]
+    ] = []
 
     def _split_subgraphs(gm: torch.fx.GraphModule) -> list[tuple[tuple, list[str]]]:
         node_to_part: dict[torch.fx.Node, int] = {}
@@ -1105,12 +1129,18 @@ def test_static_dispatch_shape_variants_placeholder_parity(
         return out
 
     def capture_backend(gm, _example_inputs):
+        ar_nodes = sum(
+            1
+            for n in gm.graph.nodes
+            if n.target in (_ALL_REDUCE_OP, _ALL_REDUCE_OP.default)
+        )
         captured.append(
             (
                 shape_variants.graph_signature(gm),
                 [n.name for n in gm.graph.nodes if n.op == "placeholder"],
                 _split_subgraphs(gm),
                 shape_variants.trace_shape_env(gm),
+                ar_nodes,
             )
         )
         return gm
@@ -1119,18 +1149,32 @@ def test_static_dispatch_shape_variants_placeholder_parity(
     with shape_variants.warmup():
         assert shape_variants.in_warmup()
         for tokens in (16, 32):
-            torch._dynamo.reset()
-            compiled = torch.compile(model, backend=capture_backend, fullgraph=True)
             x = torch.ones((tokens, 8), dtype=torch.float32)
             logits = torch.ones((tokens, 4), dtype=torch.float32)
+            ar_calls.clear()
+            eager_out = model(x, logits)
+            expected_ar = [] if tokens <= 16 else [tokens, tokens, tokens]
+            assert ar_calls == expected_ar
+
+            torch._dynamo.reset()
+            compiled = torch.compile(model, backend=capture_backend, fullgraph=True)
             torch._dynamo.mark_dynamic(x, 0)
             torch._dynamo.mark_dynamic(logits, 0)
-            compiled(x, logits)
+            ar_calls.clear()
+            compiled_out = compiled(x, logits)
+            assert ar_calls == expected_ar
+            torch.testing.assert_close(compiled_out, eager_out)
+            # 3 layers: decode op returns x (1.0); stock GMM (2x) * AR (3x) = 6^3.
+            expected_val = 1.0 if tokens <= 16 else 216.0
+            torch.testing.assert_close(compiled_out, torch.full_like(x, expected_val))
     assert not shape_variants.in_warmup()
 
-    (sig_dec, names_dec, subs_dec, env_dec), (sig_pre, names_pre, subs_pre, env_pre) = (
-        captured
-    )
+    (
+        (sig_dec, names_dec, subs_dec, env_dec, ar_nodes_dec),
+        (sig_pre, names_pre, subs_pre, env_pre, ar_nodes_pre),
+    ) = captured
+    assert ar_nodes_dec == 0
+    assert ar_nodes_pre == 3
     assert sig_dec == sig_pre
     assert names_dec == names_pre
     for (sub_sig_dec, sub_names_dec), (sub_sig_pre, sub_names_pre) in zip(
@@ -1372,3 +1416,227 @@ def test_static_dispatch_routing_matches_stock_moe_runner(
         )
     assert torch.equal(decode_routing[0][0], exp_ids)
     assert torch.equal(decode_routing[0][1], exp_weights)
+
+
+def test_upstream_forward_signature_canary():
+    """The import-time signature canary passes on pinned MoERunner.forward and
+    fails loudly if upstream reorders, renames, or adds parameters."""
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import (
+        _check_upstream_forward_signature,
+    )
+
+    _check_upstream_forward_signature(MoERunner.forward)
+
+    def swapped(
+        self, hidden_states, router_logits, shared_experts_input=None, input_ids=None
+    ):
+        return hidden_states
+
+    def renamed(self, hidden_states, router_logits, input_ids=None, shared_input=None):
+        return hidden_states
+
+    def extra(
+        self,
+        hidden_states,
+        router_logits,
+        input_ids=None,
+        shared_experts_input=None,
+        new_arg=None,
+    ):
+        return hidden_states
+
+    for bad_fn in (swapped, renamed, extra):
+        with pytest.raises(AssertionError, match="MoERunner.forward signature changed"):
+            _check_upstream_forward_signature(bad_fn)
+
+
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("ep", [False, True])
+@pytest.mark.parametrize("has_gate", [False, True])
+def test_static_dispatch_float32_reference_output_matches_stock_moe_runner(
+    monkeypatch, gated, ep, has_gate
+):
+    """End-to-end float32 CPU reference: m <= max_tokens (static dispatch op)
+    produces the same output as m > max_tokens (stock MoERunner + GMM + shared
+    expert + routed_scaling_factor + TP all-reduce) on identical non-zero FP8
+    weights, routing, padding mask, and EP expert_start."""
+    from contextlib import nullcontext
+
+    import vllm.distributed.parallel_state as vllm_ps
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner as vllm_mr
+
+    from vllm_torchtpu.distributed import pcp as tpu_pcp
+    from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+    from vllm_torchtpu.layers.adapter.quantization import fp8 as fp8_mod
+
+    n_ranks = 3
+    routed_scale = 2.5
+    experts_start_val = 1 if ep else 0
+
+    monkeypatch.setattr(
+        bridge,
+        "_RANK_BUFFER",
+        torch.tensor([[0, experts_start_val]], dtype=torch.int32),
+    )
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "topk")
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+    monkeypatch.setattr(envs, "TPU_MOE_FP8_ALL_GATHER", False)
+    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", False)
+    monkeypatch.setattr(
+        fp8_mod, "enable_pipelined_collective_and_compute", lambda: False
+    )
+    monkeypatch.setattr(
+        vllm_mr, "tensor_model_parallel_all_reduce", lambda x: x * n_ranks
+    )
+    monkeypatch.setattr(
+        vllm_mr.MoERunner, "_sequence_parallel_context", lambda self: nullcontext()
+    )
+    state = token_padding.TokenPaddingState.create(32, torch.device("cpu"))
+    state.update(10, 16)
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    monkeypatch.setattr(vllm_ps, "get_dp_group", lambda: None)
+    monkeypatch.setattr(tpu_pcp, "get_pcp_group", lambda: None)
+
+    runner = _build_static_dispatch_runner(
+        gated=gated, ep=ep, has_gate=has_gate, max_tokens=16, routed_scale=routed_scale
+    )
+    layer = runner.routed_experts
+    # 4 global experts when EP (local range [1, 3)), 2 when TP (local [0, 2)).
+    num_global_experts = 4 if ep else 2
+    if ep:
+        layer._experts_start.fill_(experts_start_val)
+    layer.custom_routing_function = None
+    layer.renormalize = True
+    layer.scoring_func = "softmax"
+    layer.use_grouped_topk = False
+    layer.num_expert_group = 1
+    layer.topk_group = 1
+    layer.e_score_correction_bias = None
+    layer.routed_scaling_factor = 1.0
+    layer.hash_indices_table = None
+    layer.capture_fn = None
+
+    gen = torch.Generator().manual_seed(42)
+
+    def _fill_fp8(t: torch.Tensor) -> None:
+        t.data.copy_(
+            (torch.randn(t.shape, generator=gen) * 0.5).to(torch.float8_e4m3fn)
+        )
+
+    def _fill_f32(t: torch.Tensor) -> None:
+        t.data.copy_(torch.randn(t.shape, generator=gen) * 0.3 + 0.8)
+
+    _fill_fp8(layer.w13_weight)
+    _fill_fp8(layer.w2_weight)
+    _fill_f32(layer.w13_weight_scale_inv)
+    _fill_f32(layer.w2_weight_scale_inv)
+    mlp = runner._shared_experts._layer
+    _fill_fp8(mlp.gate_up_proj.weight)
+    _fill_f32(mlp.gate_up_proj.weight_scale)
+    _fill_fp8(mlp.down_proj.weight)
+    _fill_f32(mlp.down_proj.weight_scale)
+    if gated:
+        mlp.expert_gate.weight.data.copy_(
+            (torch.randn(mlp.expert_gate.weight.shape, generator=gen) * 0.5).to(
+                torch.bfloat16
+            )
+        )
+    if has_gate:
+        runner.gate = _StubLinear(8, num_global_experts, scaled=False)
+        runner.gate.weight.data.copy_(
+            (torch.randn((8, num_global_experts), generator=gen) * 0.5).to(
+                torch.bfloat16
+            )
+        )
+
+    def _ref_routed_f32(x_, w1_, w2_, w1s_, w2s_, tw_, ti_, start_):
+        e_local, _h, two_i = w1_.shape
+        i_dim = two_i // 2
+        out_ = torch.zeros_like(x_, dtype=torch.float32)
+        start_int = 0 if start_ is None else int(start_.item())
+        for t in range(x_.shape[0]):
+            for k in range(ti_.shape[1]):
+                le = int(ti_[t, k].item()) - start_int
+                if 0 <= le < e_local:
+                    w1_e = w1_[le].float() * w1s_[le, 0, 0].float()
+                    w2_e = w2_[le].float() * w2s_[le, 0, 0].float()
+                    gu = x_[t].float() @ w1_e
+                    act = torch.nn.functional.silu(gu[:i_dim]) * gu[i_dim:]
+                    out_[t] += tw_[t, k].float() * (act @ w2_e)
+        return out_.to(x_.dtype)
+
+    def _ref_gmm(**kwargs):
+        return _ref_routed_f32(
+            kwargs["hidden_states"],
+            kwargs["w1"],
+            kwargs["w2"],
+            kwargs["w1_scale"],
+            kwargs["w2_scale"],
+            kwargs["topk_weights"],
+            kwargs["topk_ids"],
+            kwargs["experts_start"],
+        )
+
+    def _ref_decode_op(*args):
+        if gated:
+            assert len(args) == 13
+            (
+                x_,
+                w1_,
+                w2_,
+                w1s_,
+                w2s_,
+                sw1_,
+                sw1s_,
+                sw2_,
+                sw2s_,
+                sg_,
+                tw_,
+                ti_,
+                rk_,
+            ) = args
+        else:
+            assert len(args) == 12
+            (
+                x_,
+                w1_,
+                w2_,
+                w1s_,
+                w2s_,
+                sw1_,
+                sw1s_,
+                sw2_,
+                sw2s_,
+                tw_,
+                ti_,
+                rk_,
+            ) = args
+            sg_ = None
+        start_ = rk_[0, 1] if ep else None
+        routed = _ref_routed_f32(x_, w1_, w2_, w1s_, w2s_, tw_, ti_, start_)
+        routed = routed * routed_scale
+        i_s = sw2_.shape[0]
+        gu = (x_.float() @ sw1_.float()) * sw1s_.float()
+        shared = (
+            (torch.nn.functional.silu(gu[:, :i_s]) * gu[:, i_s:]) @ sw2_.float()
+        ) * sw2s_.float()
+        if gated:
+            assert sg_ is not None
+            shared = torch.sigmoid(x_.float() @ sg_.reshape(-1, 1).float()) * shared
+        return ((shared + routed) * n_ranks).to(x_.dtype)
+
+    setattr(runner._quant_method, bridge.FUSED_MOE_DECODE_OP_ATTR, _ref_decode_op)
+    monkeypatch.setattr(fp8_mod, "fused_moe_gmm", _ref_gmm)
+
+    x = torch.randn((16, 8), generator=gen, dtype=torch.float32)
+    logits = torch.randn((16, num_global_experts), generator=gen, dtype=torch.float32)
+
+    object.__setattr__(runner, bridge.RUNNER_MAX_TOKENS_ATTR, 16)
+    out_decode = runner(x, logits)
+    object.__setattr__(runner, bridge.RUNNER_MAX_TOKENS_ATTR, 8)
+    out_stock = runner(x, logits)
+
+    assert out_decode.abs().max().item() > 0.1
+    torch.testing.assert_close(out_decode, out_stock, rtol=1e-5, atol=1e-5)

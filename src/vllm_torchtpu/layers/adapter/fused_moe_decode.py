@@ -651,6 +651,7 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
     )
     _check_same_arming_on_every_rank(signature, what)
     armed = 0
+    static_armed = 0
     for runner, shared, expert_parallel, routed_scale in plan:
         layer = runner.routed_experts
         w13_weight = cast(torch.Tensor, layer.w13_weight)
@@ -696,6 +697,7 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
             # kernel and m > max_tokens to the unmodified stock MoERunner path.
             object.__setattr__(runner, RUNNER_STATIC_DISPATCH_ATTR, True)
             object.__setattr__(runner, RUNNER_MAX_TOKENS_ATTR, max_tokens)
+            static_armed += 1
         else:
             for name, tensor in zip(_SHARED_BUFFERS, shared):
                 layer.register_buffer(name, tensor, persistent=False)
@@ -706,20 +708,32 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         runner._forward_entry = runner._select_forward()
         object.__setattr__(runner, RUNNER_ARMED_ATTR, True)
         armed += 1
+    if static_armed == armed and armed:
+        above_cap = "stock MoERunner above"
+    elif static_armed:
+        above_cap = (
+            f"stock MoERunner above on {static_armed}, "
+            f"in-op GMM above on {armed - static_armed}"
+        )
+    else:
+        above_cap = "in-op GMM MoE above"
     # Every rank logs: the evidence that all ranks armed the same layers.
     logger.info(
         "Armed the fused MoE decode kernel on %d of %d MoE layers of the %s "
-        "(ep_mesh_index %s, experts_start %s, %d ranks, shared gate %s, "
-        "routed_scale %s, up to %d tokens; GMM MoE above)",
+        "(static dispatch %d/%d, ep_mesh_index %s, experts_start %s, %d ranks, "
+        "shared gate %s, routed_scale %s, up to %d tokens; %s)",
         armed,
         len(runners),
         what,
+        static_armed,
+        armed,
         _RANK_BUFFER_INDEX if armed else None,
         _RANK_BUFFER_START if armed else None,
         n_ranks,
         sorted({s[2] for s in signature[1]}),
         sorted({s[3] for s in signature[1]}),
         max_tokens,
+        above_cap,
     )
     return armed
 
@@ -766,6 +780,18 @@ def fused_moe_decode(
 def _anchor_tensors_for_trace(
     out: torch.Tensor, *anchors: torch.Tensor | None
 ) -> torch.Tensor:
+    """Force ``anchors`` into the traced FX graph as bitwise-identity no-ops.
+
+    Relies on three assumptions:
+    1. Dynamo lifts parameter/buffer placeholders in FX first-read order.
+    2. No FX pass before ``split_module`` simplifies ``torch.where(c, x, x)``
+       (which would drop the anchored placeholders from the subgraph).
+    3. XLA folds the dead ``select(c, out, out) -> out`` before codegen so
+       anchoring adds zero runtime cost.
+
+    Breaking (1) or (2) fails loudly at startup with
+    ``ShapeSpecializationError`` (subgraph inputs differ across traces).
+    """
     if not torch.compiler.is_compiling():
         return out
     live = [a for a in anchors if a is not None]

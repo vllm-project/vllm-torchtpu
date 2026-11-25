@@ -13,6 +13,7 @@
 # limitations under the License.
 """Out-of-tree (OOT) MoE runner: the TPU side of vLLM's MoE forward path."""
 
+import inspect
 from collections.abc import Callable
 from typing import Any
 
@@ -45,6 +46,28 @@ from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
 # _fused_output_is_reduced).
 _upstream_fused_output_is_reduced = MoERunner._fused_output_is_reduced.fget
 assert _upstream_fused_output_is_reduced is not None
+
+# Canary for VllmMoERunner.forward's positional/keyword indexing: args[3] is
+# shared_experts_input and the static fast path drops input_ids (stock FP8
+# ignores it and _admit declines hash-routed layers).
+_EXPECTED_MOE_RUNNER_FORWARD_PARAMS = (
+    "self",
+    "hidden_states",
+    "router_logits",
+    "input_ids",
+    "shared_experts_input",
+)
+
+
+def _check_upstream_forward_signature(forward_fn: Callable) -> None:
+    params = tuple(inspect.signature(forward_fn).parameters)
+    assert params == _EXPECTED_MOE_RUNNER_FORWARD_PARAMS, (
+        f"MoERunner.forward signature changed: expected "
+        f"{_EXPECTED_MOE_RUNNER_FORWARD_PARAMS}, got {params}"
+    )
+
+
+_check_upstream_forward_signature(MoERunner.forward)
 
 
 @MoERunner.register_oot
@@ -178,6 +201,12 @@ class VllmMoERunner(MoERunner):
         max_tokens = getattr(self, RUNNER_MAX_TOKENS_ATTR)
         # Only backbone warmup traces each side of the token-count branch;
         # modules compiled outside warmup (e.g. MTP drafters) skip the guard.
+        # `in_warmup()` is a Python-value branch invisible to ShapeEnv whose
+        # guard vLLM drops (see `shape_variants` module docstring). That is
+        # safe because every Dynamo trace executes entirely inside or entirely
+        # outside `shape_variants.warmup()`; if the backbone were ever
+        # re-traced outside warmup it falls back to kernel + in-op GMM
+        # (correct, not wrong).
         can_branch = not torch.compiler.is_compiling() or shape_variants.in_warmup()
         if not can_branch or hidden_states.shape[0] <= max_tokens:
             return fused_moe_decode_runner_forward(self, hidden_states, router_logits)
