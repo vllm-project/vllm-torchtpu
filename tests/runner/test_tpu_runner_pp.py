@@ -26,6 +26,7 @@ def _runner(**attrs):
         "_pp_outgoing_tensors",
         "_sample_tokens_pp_intermediate_stage",
         "sample_tokens",
+        "_sample_tokens",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
     for name, value in attrs.items():

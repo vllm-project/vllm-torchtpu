@@ -3351,6 +3351,6 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
-        TPUModelRunner.sample_tokens(runner, None)
+        TPUModelRunner._sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
