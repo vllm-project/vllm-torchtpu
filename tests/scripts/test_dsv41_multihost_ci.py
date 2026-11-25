@@ -336,6 +336,10 @@ while not (results / "launch-permitted").exists():
     time.sleep(0.02)
 (out / "launched").touch()
 if role == "head":
+    while failure == "lost":
+        # Serving outlives the worker pod, so the head sees it go silent
+        # rather than a worker that finished first.
+        time.sleep(0.02)
     (out / "formal-complete").touch()
     while not (out / "shutdown-permitted").exists():
         time.sleep(0.02)
