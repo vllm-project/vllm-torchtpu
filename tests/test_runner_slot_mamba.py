@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GDN groups that take no scheduler blocks (core/runner_slot_mamba.py): the
-gate and its TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0 opt-out, the slot-pool check,
-vLLM's registry and layer grouping, and admission / decode / free through
-vLLM's own KVCacheManager. No model weights or TPU execution."""
+"""GDN and KDA groups that take no scheduler blocks
+(core/runner_slot_mamba.py): the gate and its TPU_SKIP_MAMBA_SCHEDULER_BLOCKS=0
+opt-out, the slot-pool check, vLLM's registry and layer grouping, and
+admission / decode / free through vLLM's own KVCacheManager. No model weights
+or TPU execution."""
 
 import dataclasses
 from unittest.mock import MagicMock, patch
@@ -54,6 +55,12 @@ MAX_MODEL_LEN = 1024
 BLOCK = 16
 TOKENS = 160  # 10 attention blocks per request
 NUM_GDN_GROUPS = 3
+# OLMo 3.5-style layout: 5 attention and 35 KDA layers group as 1 attention
+# group plus 7 KDA groups of 5 layers.
+NUM_KDA_GROUPS = 7
+GDN = MambaAttentionBackendEnum.GDN_ATTN
+# KDA layers (Kimi, OLMo 3.5) report LINEAR.
+KDA = MambaAttentionBackendEnum.LINEAR
 ATTN_PAGE_BYTES = 2 * BLOCK * 8 * 128 * 2  # K and V, 8 heads x 128, bf16
 
 
@@ -111,19 +118,20 @@ def runner_slot_registered():
     runner_slot_mamba.register_runner_slot_mamba_spec()
 
 
+@pytest.mark.parametrize("mamba_type", [GDN, KDA], ids=["gdn", "kda"])
 class TestGate:
-    def test_opt_out_keeps_spec(self, opt_out):
-        spec = _gdn_spec()
+    def test_opt_out_keeps_spec(self, opt_out, mamba_type):
+        spec = _gdn_spec(mamba_type=mamba_type)
         out = maybe_runner_slot_mamba_spec(spec, _vllm_config(), runner_owns_slots=True)
         assert out is spec
 
     @pytest.mark.parametrize("env_value", [None, "1"], ids=["unset", "explicit"])
-    def test_swaps_gdn_spec_by_default(self, monkeypatch, env_value):
+    def test_swaps_spec_by_default(self, monkeypatch, env_value, mamba_type):
         if env_value is None:
             monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
         else:
             monkeypatch.setenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", env_value)
-        spec = _gdn_spec()
+        spec = _gdn_spec(mamba_type=mamba_type)
         out = maybe_runner_slot_mamba_spec(spec, _vllm_config(), runner_owns_slots=True)
         assert type(out) is RunnerSlotMambaSpec
         assert isinstance(out, MambaSpec)
@@ -134,7 +142,7 @@ class TestGate:
     @pytest.mark.parametrize(
         "config_kwargs, owns_slots, reason",
         [
-            ({}, False, "does not own the GDN slots"),
+            ({}, False, "does not own the mamba slots"),
             ({"speculative": True}, True, "speculative decoding"),
             ({"mamba_cache_mode": "align"}, True, "mamba cache mode"),
             ({"kv_connector": True}, True, "KV connector"),
@@ -142,9 +150,12 @@ class TestGate:
         ids=["unified_pool", "mtp", "prefix_caching", "kv_connector"],
     )
     def test_ineligible_keeps_stock_spec(
-        self, flag_default, config_kwargs, owns_slots, reason
+        self, flag_default, config_kwargs, owns_slots, reason, mamba_type
     ):
-        spec = _gdn_spec(mamba_cache_mode=config_kwargs.get("mamba_cache_mode", "none"))
+        spec = _gdn_spec(
+            mamba_cache_mode=config_kwargs.get("mamba_cache_mode", "none"),
+            mamba_type=mamba_type,
+        )
         with patch.object(runner_slot_mamba.logger, "debug_once") as log:
             out = maybe_runner_slot_mamba_spec(
                 spec, _vllm_config(**config_kwargs), runner_owns_slots=owns_slots
@@ -153,27 +164,29 @@ class TestGate:
         log.assert_called_once()
         assert reason in log.call_args.args[1]
 
-    def test_non_gdn_mamba_keeps_stock_spec(self, flag_default):
-        spec = _gdn_spec(mamba_type=MambaAttentionBackendEnum.MAMBA2)
-        with patch.object(runner_slot_mamba.logger, "debug_once") as log:
-            out = maybe_runner_slot_mamba_spec(
-                spec, _vllm_config(), runner_owns_slots=True
-            )
-        assert out is spec
-        assert "GDN layers only" in log.call_args.args[1]
-
-    def test_mamba_subclass_keeps_its_spec(self, flag_default):
+    def test_mamba_subclass_keeps_its_spec(self, flag_default, mamba_type):
         @dataclasses.dataclass(frozen=True)
         class OtherMambaSpec(MambaSpec):
             extra: int = 0
 
-        spec = _gdn_spec(OtherMambaSpec)
+        spec = _gdn_spec(OtherMambaSpec, mamba_type=mamba_type)
         with patch.object(runner_slot_mamba.logger, "debug_once") as log:
             out = maybe_runner_slot_mamba_spec(
                 spec, _vllm_config(), runner_owns_slots=True
             )
         assert out is spec
         assert "OtherMambaSpec" in log.call_args.args[1]
+
+
+class TestGateOtherLayers:
+    def test_other_mamba_keeps_stock_spec(self, flag_default):
+        spec = _gdn_spec(mamba_type=MambaAttentionBackendEnum.MAMBA2)
+        with patch.object(runner_slot_mamba.logger, "debug_once") as log:
+            out = maybe_runner_slot_mamba_spec(
+                spec, _vllm_config(), runner_owns_slots=True
+            )
+        assert out is spec
+        assert "GDN and KDA layers only" in log.call_args.args[1]
 
     def test_attention_spec_untouched(self, flag_default):
         spec = _attn_spec()
@@ -269,13 +282,21 @@ class TestRegistration:
 @pytest.mark.usefixtures("runner_slot_registered")
 class TestSchedulerAccounting:
     """vLLM's own KVCacheManager with prefix caching off, as the scheduler
-    builds it, with stock GDN specs and with RunnerSlotMambaSpec."""
+    builds it, with stock GDN/KDA specs and with RunnerSlotMambaSpec."""
 
-    def _manager(self, gdn_spec_cls, num_blocks: int = 131) -> KVCacheManager:
+    def _manager(
+        self,
+        gdn_spec_cls,
+        num_blocks: int = 131,
+        mamba_type=GDN,
+        num_mamba_groups: int = NUM_GDN_GROUPS,
+    ) -> KVCacheManager:
         groups = [KVCacheGroupSpec(["attn_0"], _attn_spec())]
         groups += [
-            KVCacheGroupSpec([f"gdn_{i}"], _gdn_spec(gdn_spec_cls))
-            for i in range(NUM_GDN_GROUPS)
+            KVCacheGroupSpec(
+                [f"mamba_{i}"], _gdn_spec(gdn_spec_cls, mamba_type=mamba_type)
+            )
+            for i in range(num_mamba_groups)
         ]
         config = KVCacheConfig(
             num_blocks=num_blocks, kv_cache_tensors=[], kv_cache_groups=groups
@@ -330,6 +351,27 @@ class TestSchedulerAccounting:
             attn_ids, *gdn_ids = manager.get_block_ids(req.request_id)
             assert len(attn_ids) == 10
             assert gdn_ids == [[]] * NUM_GDN_GROUPS
+
+    @pytest.mark.parametrize(
+        "spec_cls, expected_admitted",
+        # 130 usable blocks; each request takes 10 attention blocks, plus one
+        # per KDA group on the stock spec: 130 // 17 = 7 against 130 // 10.
+        [(MambaSpec, 7), (RunnerSlotMambaSpec, 13)],
+        ids=["stock_spec", "runner_slot_spec"],
+    )
+    def test_kda_groups(self, spec_cls, expected_admitted):
+        manager = self._manager(
+            spec_cls, mamba_type=KDA, num_mamba_groups=NUM_KDA_GROUPS
+        )
+        admitted = self._fill(manager, 14)
+        assert len(admitted) == expected_admitted
+        expected_kda_blocks = 1 if spec_cls is MambaSpec else 0
+        for req in admitted:
+            attn_ids, *kda_ids = manager.get_block_ids(req.request_id)
+            assert len(attn_ids) == 10
+            assert [len(ids) for ids in kda_ids] == (
+                [expected_kda_blocks] * NUM_KDA_GROUPS
+            )
 
     def test_usage_is_attention_usage(self):
         manager = self._manager(RunnerSlotMambaSpec)

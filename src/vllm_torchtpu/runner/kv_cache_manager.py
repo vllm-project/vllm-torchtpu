@@ -318,7 +318,7 @@ class KVCacheManager:
             if has_mamba:
                 self._update_mamba_page_size_padded(layers, block_size)
 
-        # Compact-mamba sizing (above) gave the GDN layers their own slot
+        # Compact-mamba sizing (above) gave the mamba layers their own slot
         # arrays, indexed by the runner's per-request slot ids: their scheduler
         # blocks are never read.
         runner_owns_mamba_slots = (
