@@ -28,7 +28,7 @@ owner into another memory space before entering the kernel.
 overlaps those gathers with calls to the same `csa2` kernel and retains gathered
 KV for reuse within a model stage. Its row-range step, `csa2_attend_rows`, also
 serves a source layer's selection (the model's `_select_gather_attend`), which
-gathers and attends each indexer tile while later tiles are still scored. `reference.py` contains independent attention
+gathers and attends each prefill indexer tile while later tiles are still scored. `reference.py` contains independent attention
 math for correctness checks. Benchmark-only mathematical ablations are not part
 of the production kernel.
 

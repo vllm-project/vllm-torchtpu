@@ -753,9 +753,12 @@ def _select_fp8_indexer_jax(
     visible = jnp.where(ids < lengths[:tokens, None], ids, -1)
     num_tiles = padded // chunk_rows
     bounded = prefill_chunk_rows is not None or publish_rows
-    # Unrolled tiles have static row offsets, so each tile's selection feeds
-    # the consumer while later tiles are still scored and selected.
-    unrolled = not bounded or num_tiles <= indexer.MAX_UNROLLED_TILES
+    # Unrolled prefill tiles have static row offsets, so each tile's selection
+    # feeds the consumer while later tiles are still scored and selected.
+    # Decode tiles (unbounded) gain nothing from it: their SparseCore
+    # selections and gathers serialize, so per-tile gathers and attention
+    # only add calls (72 rows, 3 tiles: 216.2 vs 210.0 us per layer, bitwise).
+    unrolled = bounded and num_tiles <= indexer.MAX_UNROLLED_TILES
     tile_consume = consume if unrolled else None
     # The SparseCore selection also resolves the consumer's records: the
     # TensorCore then has no page lookup between a tile's selection and its

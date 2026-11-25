@@ -259,9 +259,10 @@ def _select_gather_attend(
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Index selection, KV gather and attention of a source layer in one program.
 
-    Each indexer tile's selection is gathered and attended while later tiles
-    are still scored (TensorCore) and selected (SparseCore), so the gather
-    overlaps scoring instead of following the whole selection. Returns the
+    Each prefill indexer tile's selection is gathered and attended while
+    later tiles are still scored (TensorCore) and selected (SparseCore), so
+    the gather overlaps scoring instead of following the whole selection;
+    decode gathers and attends the whole selection at once. Returns the
     attention output, the main records [T,512] for stage reuse, and the
     gathered words, scales and valid counts, as `_gather_attend` does.
     """
