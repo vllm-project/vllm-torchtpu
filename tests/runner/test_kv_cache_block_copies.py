@@ -459,3 +459,118 @@ def test_dense_copy_fans_out_per_split_dedupes_and_pads(monkeypatch):
     torch.testing.assert_close(latent[4], before_latent[4])
     torch.testing.assert_close(indexer[10:12], before_indexer[4:6])
     torch.testing.assert_close(indexer[12], before_indexer[12])
+
+
+def _rollback_warmup_fake(num_groups, max_num_reqs, plan_len):
+    @contextmanager
+    def mock_timed(_name):
+        yield
+
+    return SimpleNamespace(
+        mamba_slot_read_offsets=torch.zeros(16, dtype=torch.long),
+        _mamba_copy_plan=[(gid, []) for gid in range(plan_len)],
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[object()] * num_groups),
+        max_num_reqs=max_num_reqs,
+        _bucket_len=TPUModelRunner._bucket_len,
+        _precompile_timed=mock_timed,
+    )
+
+
+def _warmed_rollback_lengths(monkeypatch, fake):
+    """Run the rollback warmup; return {(fn, length): grad_enabled}."""
+    warmed = {}
+
+    def record(name):
+        def fn(_offsets, *idx):
+            warmed[(name, len(idx[-1]))] = torch.is_grad_enabled()
+
+        return fn
+
+    monkeypatch.setattr(runner_mod, "_rollback_offsets_seed_compiled", record("seed"))
+    monkeypatch.setattr(
+        runner_mod, "_rollback_offsets_migrate_compiled", record("migrate")
+    )
+    TPUModelRunner._precompile_mamba_rollback_helpers(fake)
+    return warmed
+
+
+def test_rollback_warmup_runs_under_no_grad(monkeypatch):
+    """Both rollback callers run under execute_model's no_grad and dynamo
+    guards on grad mode, so the warmup must too or every entry misses."""
+    warmed = _warmed_rollback_lengths(monkeypatch, _rollback_warmup_fake(4, 16, 3))
+    assert torch.is_grad_enabled()
+    assert warmed
+    assert not any(warmed.values())
+
+
+def test_dynamo_guards_on_grad_mode():
+    """The premise of the no_grad warmup: an entry compiled with grad
+    enabled does not serve a no_grad call of the same shapes."""
+    frames = []
+
+    def backend(gm, _example_inputs):
+        frames.append(gm)
+        return gm.forward
+
+    def migrate(offsets, src, dst):
+        offsets[dst] = offsets[src]
+
+    compiled = torch.compile(migrate, backend=backend, fullgraph=True, dynamic=False)
+    offsets = torch.zeros(16, dtype=torch.long)
+    idx = torch.zeros(8, dtype=torch.long)
+    compiled(offsets, idx, idx.clone())
+    compiled(offsets, idx, idx.clone())
+    assert len(frames) == 1
+    with torch.no_grad():
+        compiled(offsets, idx, idx.clone())
+    assert len(frames) == 2
+
+
+@pytest.mark.parametrize("max_num_reqs", [1, 4, 8, 16, 32, 48])
+@pytest.mark.parametrize("num_groups,plan_len", [(1, 0), (2, 1), (4, 3), (49, 36)])
+def test_rollback_warmup_covers_every_caller_length(
+    monkeypatch, max_num_reqs, num_groups, plan_len
+):
+    """Every migrate length either caller can produce is warmed.
+
+    CoW (`_apply_kv_cache_block_copies`): vLLM queues at most one copy per
+    (request, kv-cache group) per step (`_partial_hit_reqs` is keyed by
+    request and popped on use), so 1..num_groups*max_num_reqs manager
+    pairs. Crossings: at most one pair per (request, mamba group).
+    """
+    fake = _rollback_warmup_fake(num_groups, max_num_reqs, plan_len)
+    warmed = _warmed_rollback_lengths(monkeypatch, fake)
+    migrate_lens = {n for (name, n) in warmed if name == "migrate"}
+    seed_lens = {n for (name, n) in warmed if name == "seed"}
+    assert migrate_lens == seed_lens
+
+    # Real CoW caller, every pair count it can be handed.
+    cow = SimpleNamespace(
+        kv_cache_raw_tensors=[torch.zeros(4, 4)],
+        is_unified_pool_used=lambda: True,
+        mamba_slot_read_offsets=torch.zeros(4, dtype=torch.long),
+        _pool_block_split=2,
+        _pad_to_bucket=TPUModelRunner._pad_to_bucket,
+        device="cpu",
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+        _copy_mamba_state_blocks=lambda *args: None,
+    )
+    seen = set()
+    monkeypatch.setattr(
+        runner_mod,
+        "_rollback_offsets_migrate",
+        lambda _offsets, src_t, dst_t: seen.add(len(src_t)),
+    )
+    for n in range(1, num_groups * max_num_reqs + 1):
+        copies = [KVCacheBlockCopy(src_block_id=0, dst_block_id=0)] * n
+        cow._unfenced_h2d_sources.clear()
+        TPUModelRunner._apply_kv_cache_block_copies(cow, copies)
+    assert seen <= migrate_lens, sorted(seen - migrate_lens)
+
+    # Crossing path pads offset_pairs / spec_dsts the same way.
+    crossing = {
+        TPUModelRunner._bucket_len(n)
+        for n in range(1, max(1, plan_len) * max_num_reqs + 1)
+    }
+    assert crossing <= migrate_lens
