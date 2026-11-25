@@ -630,6 +630,11 @@ class TPUWorker(WorkerBase):
             )
             if reserves.lora_slot_write > 0:
                 fix += ", or lowering --max-loras or --max-lora-rank"
+            if reserves.routed_experts > 0:
+                fix += (
+                    ", or lowering --max-num-batched-tokens or --max-num-seqs, "
+                    "or dropping compile_sizes above --max-num-batched-tokens"
+                )
             raise ValueError(
                 f"{total_hbm_used_gb=}GiB plus the HBM reserved after the "
                 f"memory profile ({kv_connector_hbm_reserve_gb=}GiB, "

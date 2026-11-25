@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
-from runner_output_test_utils import _host_copy_state
+from runner_output_test_utils import _host_copy_state, step_runner
 from vllm.config.aux_output import AuxOutputConfig
 from vllm.distributed.aux_output_connector import worker as aux_output_worker
 from vllm.distributed.aux_output_connector.connector import (
@@ -30,18 +30,6 @@ from vllm.distributed.aux_output_connector.connector import (
 from vllm.platforms import current_platform
 
 from tests.layers.adapter import routed_experts_test_utils as capture_utils
-from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
-    vllm_adapter as adaptive_moe,
-)
-from vllm_torchtpu.layers.adapter import (
-    expert_placement,
-    fused_moe_ep,
-    moe_tp_decode,
-)
-from vllm_torchtpu.layers.core.sequence_layout import (
-    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
-    SequenceLayoutPlan,
-)
 from vllm_torchtpu.runner import routed_experts
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
@@ -61,6 +49,7 @@ def _capture(monkeypatch, model, is_first_rank=True):
     monkeypatch.setattr(aux_output_worker, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(routed_experts, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(routed_experts, "MoERunner", capture_utils.MoELayer)
+    monkeypatch.setattr(routed_experts, "VllmMoERunner", capture_utils.MoELayer)
     return routed_experts.RoutedExpertsCapture(
         capture_utils.make_vllm_config(),
         model,
@@ -162,39 +151,52 @@ def test_a_rank_that_does_not_publish_copies_nothing(build_capture, on_host):
     assert not capture._capturer._step_copies
 
 
-@pytest.mark.parametrize(
-    "owner, attr",
-    [
-        ("quant_method", fused_moe_ep.FUSED_MOE_EP_OP_ATTR),
-        ("quant_method", adaptive_moe.FUSED_MOE_EP_OP_ATTR),
-        ("quant_method", moe_tp_decode._OP_ATTR),
-        ("routed_experts", expert_placement.EXPERT_ORDER_ATTR),
-    ],
-)
-def test_layers_capture_cannot_serve_are_refused(monkeypatch, on_host, owner, attr):
-    """Fused kernels and expert placement are set per layer, so the check
-    runs on the loaded model and names each layer it refuses."""
+def test_layers_capture_cannot_serve_are_refused(monkeypatch, on_host):
+    """Fused kernels are armed per layer, so the check runs on the loaded
+    model and names each layer it refuses."""
     model = capture_utils.make_moe_model()
-    target = model[1].routed_experts
-    setattr(target.quant_method if owner == "quant_method" else target, attr, (0,))
+    model[1].picks_experts_in_route = False
 
     with pytest.raises(NotImplementedError, match=r"MoE layers \[1\]"):
         _capture(monkeypatch, model)
 
 
-def test_hbm_reserve_covers_the_forward_tables_in_flight(monkeypatch):
-    """Two steps in flight, each with at most 8 forwards (one request each at
-    least), whose tables pad at most to twice their tokens or 16 rows: the
-    tables of 2 * (2 * 64 + 8 * 16) rows of 12 uint16 ids. That is more than
-    vLLM's int32 table of 64 rows."""
+def _reserve_config(
+    monkeypatch,
+    *,
+    max_num_batched_tokens=None,
+    max_num_seqs=None,
+    max_concurrent_batches=None,
+):
     monkeypatch.setattr(current_platform, "device_type", "cpu")
     vllm_config = capture_utils.make_vllm_config()
+    vllm_config.aux_output_config = AuxOutputConfig(enable_return_routed_experts=True)
+    scheduler_config = vllm_config.scheduler_config
+    if max_num_batched_tokens is not None:
+        scheduler_config.max_num_batched_tokens = max_num_batched_tokens
+    if max_num_seqs is not None:
+        scheduler_config.max_num_seqs = max_num_seqs
+    if max_concurrent_batches is not None:
+        vllm_config.max_concurrent_batches = max_concurrent_batches
+    return vllm_config
+
+
+# Bytes of one table row: 12 uint16 ids.
+ROW_BYTES = capture_utils.NUM_LAYERS * capture_utils.TOPK * 2
+
+
+def test_hbm_reserve_covers_the_forward_tables_in_flight(monkeypatch):
+    """Two steps in flight, each with at most 8 forwards (one request each at
+    least), whose tables pad at most to twice their tokens or 16 rows: 2 * (2
+    * 64 + 8 * 16) rows. Plus the latest table of 64 rows, which the capturer
+    keeps until the next forward returns. That is more than vLLM's int32
+    table of 64 rows."""
+    vllm_config = _reserve_config(monkeypatch)
     paddings = capture_utils.TOKEN_PADDINGS
 
-    vllm_config.aux_output_config = AuxOutputConfig(enable_return_routed_experts=True)
     reserve = routed_experts.hbm_reserve_bytes(vllm_config, paddings)
 
-    assert reserve == 2 * (2 * 64 + 8 * 16) * 12 * 2
+    assert reserve == (2 * (2 * 64 + 8 * 16) + 64) * ROW_BYTES
     assert reserve > 64 * 12 * 4
     vllm_config.aux_output_config = AuxOutputConfig()
     assert routed_experts.hbm_reserve_bytes(vllm_config, paddings) == 0
@@ -205,50 +207,83 @@ def test_hbm_reserve_covers_buckets_that_jump_more_than_double(monkeypatch):
     forwards of 9 tokens each pad to 64 rows, 448 in all, which a bound of
     twice the step's tokens (2 * 64 + 8 * 8 = 192) would miss. The reserve
     must cover every step of equal-sized forwards."""
-    monkeypatch.setattr(current_platform, "device_type", "cpu")
-    vllm_config = capture_utils.make_vllm_config()
-    vllm_config.aux_output_config = AuxOutputConfig(enable_return_routed_experts=True)
+    vllm_config = _reserve_config(monkeypatch)
     paddings = [8, 64]
     scheduler_config = vllm_config.scheduler_config
     num_tokens = scheduler_config.max_num_batched_tokens
 
     reserve = routed_experts.hbm_reserve_bytes(vllm_config, paddings)
 
-    step_rows = reserve // (12 * 2 * vllm_config.max_concurrent_batches)
-    assert step_rows == 8 * 64 + 8 * 8
+    rows = reserve // ROW_BYTES
+    step_rows = (rows - paddings[-1]) // vllm_config.max_concurrent_batches
     for forward_tokens in range(1, num_tokens + 1):
         num_forwards = min(num_tokens // forward_tokens, scheduler_config.max_num_seqs)
         bucket = min(size for size in paddings if size >= forward_tokens)
         assert num_forwards * bucket <= step_rows, forward_tokens
 
 
-def _step_runner(capture, model, chunks, bucket):
-    """A runner stand-in that runs one step as `chunks` forwards through the
-    real `execute_model` and `sample_tokens`. Each chunk is a list of
-    (request id, scheduled tokens), and its forward writes fresh expert ids.
-    Returns the runner and the ids each forward wrote."""
-    req_ids = [req_id for chunk in chunks for req_id, _ in chunk]
-    chunk_starts = np.cumsum([0, *map(len, chunks)])
-    written = []
+def test_hbm_reserve_of_far_apart_buckets_counts_whole_forwards(monkeypatch):
+    """With the buckets of `docs/deployment/v7x_recipes.md`, 8 and 8192 are
+    1024x apart, so 1024 times the step's tokens would reserve 8,388,616 rows
+    a step. A step runs at most 8 forwards, one request each at least, and
+    none pads past 8192 rows, so the reserve counts 8 * 8192 rows a step."""
+    vllm_config = _reserve_config(
+        monkeypatch, max_num_batched_tokens=8192, max_num_seqs=8
+    )
 
-    def prepare_inputs(_so, start_index, _num_decode, _num_windowed):
-        chunk = chunks[list(chunk_starts).index(start_index)]
-        counts = [n for _, n in chunk]
-        runner.query_start_loc_np[: len(chunk) + 1] = np.cumsum([0, *counts])
-        runner._last_sequence_layout_plan = SequenceLayoutPlan(
-            descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
-            token_slice=slice(0, bucket),
-            global_num_tokens=sum(counts),
-            global_padded_num_tokens=bucket,
-            local_num_tokens=sum(counts),
-            local_padded_num_tokens=bucket,
-            _packed_to_request_major_token_indices=None,
-        )
-        empty = torch.empty(0, dtype=torch.int32)
-        logits_indices = torch.tensor(np.cumsum(counts) - 1)
-        end_index = start_index + len(chunk)
-        return (None, logits_indices, len(chunk), len(chunk), end_index, empty,
-                empty, None, None, None)  # fmt: skip
+    reserve = routed_experts.hbm_reserve_bytes(vllm_config, [1, 8, 8192])
+
+    assert reserve == (2 * 8 * 8192 + 8192) * ROW_BYTES
+
+
+def test_hbm_reserve_bounds_a_step_by_its_scheduled_tokens(monkeypatch):
+    """Startup accepts `--max-num-batched-tokens 16384` with
+    `--max-num-scheduled-tokens 256` and buckets up to 256, because the
+    scheduler stops a step at 256 tokens. The reserve must size a step by
+    those 256 tokens too: 8 forwards of at most 256 rows, as 16x the step's
+    tokens is larger. vLLM's int32 table still holds 16384 rows."""
+    vllm_config = _reserve_config(
+        monkeypatch, max_num_batched_tokens=16384, max_num_seqs=8
+    )
+    vllm_config.scheduler_config.max_num_scheduled_tokens = 256
+
+    reserve = routed_experts.hbm_reserve_bytes(vllm_config, [16, 256])
+
+    assert reserve == max(
+        (2 * 8 * 256 + 256) * ROW_BYTES, 16384 * capture_utils.NUM_LAYERS
+        * capture_utils.TOPK * 4,
+    )  # fmt: skip
+
+
+def test_hbm_reserve_covers_two_tables_of_the_largest_bucket(monkeypatch):
+    """A synchronous step of one request fills one table of at most 64 rows.
+    Warmup also runs the 128-row bucket, which is above the step's tokens,
+    and the capturer keeps each forward's table until the next forward
+    returns, so two 128-row tables are held at once."""
+    vllm_config = _reserve_config(
+        monkeypatch, max_num_batched_tokens=64, max_num_seqs=1,
+        max_concurrent_batches=1,
+    )  # fmt: skip
+
+    reserve = routed_experts.hbm_reserve_bytes(vllm_config, [16, 32, 64, 128])
+
+    assert reserve == 2 * 128 * ROW_BYTES
+
+
+def test_a_row_format_wider_than_the_reserve_fails(monkeypatch, on_host):
+    """The reserve is computed before the capturer exists. If vLLM's capturer
+    stored wider ids than the reserve counts, building the capture fails."""
+    monkeypatch.setattr(routed_experts, "_RESERVED_ID_DTYPE", torch.uint8)
+
+    with pytest.raises(AssertionError, match="HBM reserve"):
+        _capture(monkeypatch, capture_utils.make_moe_model())
+
+
+def _step_runner(capture, model, chunks, bucket):
+    """A runner stand-in that runs one step as `chunks` forwards, each of
+    which writes fresh expert ids. Returns the runner and the ids each
+    forward wrote."""
+    written = []
 
     def forward_model(**_kwargs):
         ids = capture_utils.expert_ids(bucket, num_experts=PADDING, seed=len(written))
@@ -256,125 +291,28 @@ def _step_runner(capture, model, chunks, bucket):
         written.append(ids)
         return torch.zeros(bucket, 2), None
 
-    num_reqs = len(req_ids)
-    runner = SimpleNamespace(
-        _routed_experts=capture,
-        _pp_handoff=None,
-        _dp_step_other_decode=False,
-        _pp_is_first=True,
-        _pp_is_last=True,
-        _pp_pending_scheduler_output=None,
-        _pp_pending_kv_save_nan_check=None,
-        execute_model_state=None,
-        _update_states=lambda _so: None,
-        scheduler_config=SimpleNamespace(async_scheduling=False),
-        _mtp_prefill_only=False,
-        _reorder_batch_for_rpa=lambda _so: (0, 0),
-        _count_input_chunks=lambda _so: (len(chunks), max(map(len, chunks))),
-        _dp_coordinated_step=lambda *_args, **_kwargs: (bucket, len(chunks)),
-        _dp_local_prompt_logprob_rows=lambda _so: 0,
-        _dp_step_prompt_logprob_rows=0,
-        _thinking_budget=None,
-        _dp_num_tokens_across_dp=lambda _n: None,
-        supports_mm_inputs=False,
-        phase_based_profiler=None,
-        _is_async_drafter=False,
-        _greedy_top_tokens_this_step=lambda: False,
-        _min_tokens_batch_state=lambda: {},
-        _repetition_penalty=SimpleNamespace(begin_step=lambda _batch: False),
-        vllm_config=SimpleNamespace(),
-        maybe_setup_kv_connector=lambda *_args, **_kwargs: None,
-        input_batch=SimpleNamespace(
-            num_reqs=num_reqs,
-            req_ids=req_ids,
-            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
-            max_num_logprobs=None,
-            all_greedy=True,
-            num_tokens_no_spec=[n for chunk in chunks for _, n in chunk],
-            num_computed_tokens_cpu=np.zeros(num_reqs, dtype=np.int32),
-            token_ids_cpu=np.zeros((num_reqs, 2 * bucket), dtype=np.int32),
-        ),
-        requests={
-            req_id: SimpleNamespace(
-                num_computed_tokens=0, num_tokens=n, output_token_ids=[]
-            )
-            for chunk in chunks
-            for req_id, n in chunk
-        },
-        num_prompt_logprobs={},
-        query_start_loc_np=np.zeros(num_reqs + 1, dtype=np.int32),
-        _last_sequence_layout_plan=None,
-        position_ids=torch.zeros(bucket, dtype=torch.int32),
-        _flush_mamba_state_seed_copies=lambda: None,
-        _reset_read_offsets_for_new_requests=lambda *_args: None,
-        input_ids=torch.zeros(bucket, dtype=torch.int32),
-        _apply_async_token_substitution=lambda ids, *_args: ids,
-        _record_input_staging_fence=lambda: None,
-        _get_model_inputs=lambda ids, _mm: (ids, None),
-        _token_padding_update=lambda _n: None,
-        mesh=None,
-        _kv_cache_bundle=None,
-        _stage_timing=MagicMock(),
-        is_pooling_model=False,
-        pcp_manager=None,
-        sequence_layout_planner=SimpleNamespace(
-            maybe_select_logits_hidden_states=lambda hs, _plan, idx: hs[idx]
-        ),
-        compute_logits_from_hidden_states=lambda hs: torch.zeros(hs.shape[0], 8),
-        _attn_metadata_builder_ctx=SimpleNamespace(
-            mamba_state_indices=None, unified_mamba_state_indices=None, seq_lens=None
-        ),
-        mamba_slot_read_offsets=None,
-        speculative_config=None,
-        _fence_spec_kv_under_token_copy=False,
-        _is_dspark_pd_producer=False,
-        _adaptive_verification=None,
-        _get_sampling_generator=lambda: None,
-        _greedy_sample=lambda logits: torch.full((logits.shape[0],), 7),
-        _update_mamba_slot_read_offsets=lambda *_args: None,
-        _update_num_xla_graphs=lambda *_args: None,
-        _prepare_inputs=prepare_inputs,
-        forward_model=forward_model,
-    )
-    runner._stage_timing.stage.return_value = contextlib.nullcontext()
-    runner._stage_timing.take_samples.return_value = ([], [])
-    for name in (
-        "_any_decode",
-        "_readmit_trimmed_drafts",
-        "_sample_chunk_logits",
-        "_sample_plain_chunk",
-        "maybe_wait_for_kv_save",
-        "get_finished_kv_transfers",
-        "_build_kv_connector_output",
-        "sample_tokens",
-        "execute_model",
-        "_maybe_select_logits_hidden_states",
-    ):
-        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+    runner = step_runner(chunks, bucket, forward_model, _routed_experts=capture)
     return runner, written
 
 
-def test_runner_returns_each_requests_rows_from_a_two_forward_step(capture):
-    """The runner takes each forward with its real token count and hands
-    `prepare_output` the requests in the order the forwards ran them, so each
-    request gets back the rows its forward wrote."""
-    capture, model = capture
-    chunks = [[("a", 12)], [("b", 6), ("c", 3)]]
-    runner, written = _step_runner(capture, model, chunks, bucket=16)
-    scheduler_output = SimpleNamespace(
-        total_num_scheduled_tokens=21,
+def _scheduler_output(num_scheduled_tokens, finished_requests=()):
+    return SimpleNamespace(
+        total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
         scheduled_encoder_inputs={},
-        num_scheduled_tokens={"a": 12, "b": 6, "c": 3},
-        finished_req_ids=set(),
+        num_scheduled_tokens=num_scheduled_tokens,
+        finished_req_ids=set(finished_requests),
         has_structured_output_requests=False,
         aux_output_connector_metadata=AuxOutputConnectorMetadata(
             generation=0,
-            requests={"a": 0, "b": 0, "c": 0},
+            requests=dict.fromkeys(num_scheduled_tokens, 0),
             block_hashes={},
-            finished_requests=(),
+            finished_requests=tuple(finished_requests),
         ),
     )
 
+
+@contextlib.contextmanager
+def _runner_patches():
     no_context = lambda *_args, **_kwargs: contextlib.nullcontext()  # noqa: E731
     with (
         patch("vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", lambda: False),
@@ -390,6 +328,19 @@ def test_runner_returns_each_requests_rows_from_a_two_forward_step(capture):
             _host_copy_state,
         ),
     ):
+        yield
+
+
+def test_runner_returns_each_requests_rows_from_a_two_forward_step(capture):
+    """The runner takes each forward with its real token count and hands
+    `prepare_output` the requests in the order the forwards ran them, so each
+    request gets back the rows its forward wrote."""
+    capture, model = capture
+    chunks = [[("a", 12)], [("b", 6), ("c", 3)]]
+    runner, written = _step_runner(capture, model, chunks, bucket=16)
+
+    with _runner_patches():
+        scheduler_output = _scheduler_output({"a": 12, "b": 6, "c": 3})
         assert runner.execute_model(scheduler_output) is None
         output = runner.sample_tokens(None)
 
@@ -401,6 +352,22 @@ def test_runner_returns_each_requests_rows_from_a_two_forward_step(capture):
     assert np.array_equal(rows["a"], written[0][:12].numpy())
     assert np.array_equal(rows["b"], written[1][:6].numpy())
     assert np.array_equal(rows["c"], written[1][6:9].numpy())
+
+
+def test_a_zero_token_step_releases_the_requests_it_finishes(capture):
+    """The scheduler reports a finished request in one step's metadata only,
+    and that step may schedule no tokens. The runner still hands the report
+    to the connector, which then releases the request."""
+    capture, model = capture
+    chunks = [[("a", 12)], [("b", 6), ("c", 3)]]
+    runner, _ = _step_runner(capture, model, chunks, bucket=16)
+
+    with _runner_patches():
+        runner.execute_model(_scheduler_output({"a": 12, "b": 6, "c": 3}))
+        runner.sample_tokens(None)
+        runner.execute_model(_scheduler_output({}, finished_requests=["a"]))
+
+    assert set(capture._connector._requests) == {"b", "c"}
 
 
 @pytest.mark.parametrize("enabled", [True, False])

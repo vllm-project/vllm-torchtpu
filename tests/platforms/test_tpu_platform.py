@@ -1251,20 +1251,20 @@ class TestRoutedExpertsConfigValidation:
         *,
         enabled=True,
         data_parallel_size=1,
-        pipeline_parallel_size=1,
         use_sequence_parallel_moe=False,
         speculative_config=None,
         kv_transfer_config=None,
+        kv_offloading_size=None,
     ):
         return SimpleNamespace(
             aux_output_config=AuxOutputConfig(enable_return_routed_experts=enabled),
             parallel_config=SimpleNamespace(
                 data_parallel_size=data_parallel_size,
-                pipeline_parallel_size=pipeline_parallel_size,
                 use_sequence_parallel_moe=use_sequence_parallel_moe,
             ),
             speculative_config=speculative_config,
             kv_transfer_config=kv_transfer_config,
+            cache_config=SimpleNamespace(kv_offloading_size=kv_offloading_size),
         )
 
     def test_a_supported_config_passes(self):
@@ -1284,7 +1284,6 @@ class TestRoutedExpertsConfigValidation:
                 {},
                 "MoE sequence parallelism",
             ),
-            ({"pipeline_parallel_size": 2}, {}, "pipeline_parallel_size > 1"),
             ({}, {"TPU_K3_SP_PREFILL": "1"}, "TPU_K3_SP_PREFILL"),
             (
                 {},
@@ -1294,6 +1293,7 @@ class TestRoutedExpertsConfigValidation:
             ({}, {"TPU_EXPERT_PLACEMENT": "/tmp/p.json"}, "TPU_EXPERT_PLACEMENT"),
             ({"speculative_config": object()}, {}, "speculative decoding"),
             ({"kv_transfer_config": object()}, {}, "kv_transfer_config"),
+            ({"kv_offloading_size": 4.0}, {}, "--kv-offloading-size"),
         ],
     )
     def test_unsupported_setting_is_named(self, monkeypatch, kwargs, env, setting):

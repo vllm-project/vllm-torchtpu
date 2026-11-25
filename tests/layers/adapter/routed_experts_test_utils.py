@@ -43,7 +43,9 @@ def make_vllm_config(num_experts=512):
     vllm_config = SimpleNamespace(
         model_config=model_config,
         scheduler_config=SimpleNamespace(
-            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS, max_num_seqs=8
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            max_num_scheduled_tokens=None,
+            max_num_seqs=8,
         ),
         parallel_config=SimpleNamespace(
             data_parallel_rank=0,
@@ -116,6 +118,7 @@ class MoELayer(torch.nn.Module):
         super().__init__()
         self.layer_id = layer_id
         self.capture_fn = None
+        self.picks_experts_in_route = True
         self.routed_experts = SimpleNamespace(quant_method=SimpleNamespace())
 
 

@@ -13,6 +13,7 @@
 # limitations under the License.
 """Routed-experts capture (`--enable-return-routed-experts`) in TPU steps."""
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -35,85 +36,93 @@ from vllm_torchtpu.distributed.aux_output_connector import (
     num_rejected_rows,
     use_capturer,
 )
-from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
-    adaptive_fused_moe_supported,
-)
-from vllm_torchtpu.layers.adapter import expert_placement
-from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-from vllm_torchtpu.layers.adapter.moe_tp_decode import moe_tp_decode_supported
+from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 from vllm_torchtpu.layers.adapter.routed_experts_capturer import (
     HostSnapshot,
     TPURoutedExpertsCapturer,
 )
+
+# The widest dtype vLLM's capturer stores expert ids in.
+_RESERVED_ID_DTYPE = torch.uint16
+
+
+def _row_size(vllm_config: VllmConfig) -> int:
+    """Expert ids per token: one for each expert of each layer."""
+    model_config = vllm_config.model_config
+    return (
+        model_config.get_total_num_hidden_layers()
+        * model_config.get_num_experts_per_tok()
+    )
 
 
 def hbm_reserve_bytes(vllm_config: VllmConfig, token_paddings: list[int]) -> int:
     """HBM the capture takes after the memory profile; 0 without capture.
 
     The larger of two: vLLM's int32 table of `max_num_batched_tokens` rows,
-    which lives until `use_capturer` swaps in our capturer, and the forward
-    tables that serving keeps until their step's output is processed, for up
-    to `max_concurrent_batches` steps. Each forward runs at least one request,
-    and its table holds its bucket's rows: the smallest bucket, or less than
-    R times its tokens, where R is the largest ratio between neighboring
-    buckets. The tables are counted at uint16, the widest output dtype, and
-    on every rank: only the first TP rank keeps them, but vLLM sizes every
-    rank's KV cache by the smallest budget.
+    which lives until `use_capturer` swaps in our capturer, and our forward
+    tables. Serving keeps a step's tables until its output is processed, for
+    up to `max_concurrent_batches` steps. On top of those, `device_buffer`
+    keeps the latest forward's table until the next forward returns, which
+    in warmup holds two tables of the largest bucket at once. The tables are
+    counted at the widest output dtype, and on every rank: only the first TP
+    rank keeps them, but vLLM sizes every rank's KV cache by the smallest
+    budget.
     """
     if not vllm_config.aux_output_config.enabled:
         return 0
-    model_config = vllm_config.model_config
-    row_size = (
-        model_config.get_total_num_hidden_layers()
-        * model_config.get_num_experts_per_tok()
-    )
+    row_size = _row_size(vllm_config)
     scheduler_config = vllm_config.scheduler_config
     max_num_batched_tokens = scheduler_config.max_num_batched_tokens
+    max_num_seqs = scheduler_config.max_num_seqs
     vllm_table_bytes = torch.int32.itemsize * max_num_batched_tokens * row_size
-    # R times the step's tokens, rounded up. With one bucket, every forward
-    # pads to it, which the second term already counts.
+    # The scheduler stops a step at the smaller of the two token budgets, and
+    # startup checks only that one against `compile_sizes`.
+    step_tokens = max_num_batched_tokens
+    max_num_scheduled_tokens = scheduler_config.max_num_scheduled_tokens
+    if max_num_scheduled_tokens is not None:
+        step_tokens = min(step_tokens, max_num_scheduled_tokens)
+    # A step's tables, bounded two ways, since each forward runs at least one
+    # request. First, each table holds its bucket's rows: the smallest bucket,
+    # or less than R times its tokens, where R is the largest ratio between
+    # neighboring buckets. Rounded up; with one bucket, every forward pads to
+    # it, which `max_num_seqs * token_paddings[0]` already counts.
     padded_tokens = max(
         (
-            -(-larger * max_num_batched_tokens // smaller)
+            -(-larger * step_tokens // smaller)
             for smaller, larger in zip(token_paddings, token_paddings[1:])
         ),
         default=0,
     )
-    step_rows = padded_tokens + scheduler_config.max_num_seqs * token_paddings[0]
-    tables_bytes = (
-        torch.uint16.itemsize
-        * row_size
-        * step_rows
-        * vllm_config.max_concurrent_batches
+    rows_by_ratio = padded_tokens + max_num_seqs * token_paddings[0]
+    # Second, no forward has more tokens than the step, so none pads past the
+    # bucket that holds `step_tokens`. This bound is the tighter one when the
+    # buckets are far apart.
+    step_bucket = min(size for size in token_paddings if size >= step_tokens)
+    rows_by_forwards = max_num_seqs * step_bucket
+    step_rows = min(rows_by_ratio, rows_by_forwards)
+    largest_bucket = token_paddings[-1]
+    rows = (
+        max(vllm_config.max_concurrent_batches * step_rows, largest_bucket)
+        + largest_bucket
     )
+    tables_bytes = _RESERVED_ID_DTYPE.itemsize * row_size * rows
     return max(vllm_table_bytes, tables_bytes)
 
 
-def _uncapturable(module: MoERunner) -> bool:
-    quant_method = module.routed_experts.quant_method
-    return (
-        fused_moe_ep_supported(quant_method)
-        or adaptive_fused_moe_supported(quant_method)
-        or moe_tp_decode_supported(quant_method)
-        or expert_placement.expert_order(module.routed_experts) is not None
-    )
-
-
 def _reject_uncapturable_layers(model: torch.nn.Module) -> None:
-    """Fused kernels pick experts without `route()`, so capture would return
-    zeros; a placed layer's `route()` returns slot ids, not expert ids."""
+    """Rejects the MoE layers whose experts a fused kernel picks without
+    `route()`, as capture would return zeros for them."""
     layer_ids = [
         module.layer_id
         for module in model.modules()
-        if isinstance(module, MoERunner) and _uncapturable(module)
+        if isinstance(module, VllmMoERunner) and not module.picks_experts_in_route
     ]
     if layer_ids:
         raise NotImplementedError(
             f"--enable-return-routed-experts cannot capture MoE layers "
-            f"{layer_ids}: a fused kernel picks their experts, or an expert "
-            "placement renumbers them. Unset USE_MOE_FUSED_EP_KERNEL, "
-            "MOE_FUSED_EP_KERNEL_IMPL, USE_MOE_TP_DECODE_KERNEL and "
-            "TPU_EXPERT_PLACEMENT."
+            f"{layer_ids}: a fused kernel picks their experts. Unset "
+            "USE_MOE_FUSED_EP_KERNEL, MOE_FUSED_EP_KERNEL_IMPL and "
+            "USE_MOE_TP_DECODE_KERNEL."
         )
 
 
@@ -178,6 +187,18 @@ class RoutedExpertsCapture:
         # them to the host.
         self._capturer = TPURoutedExpertsCapturer(
             vllm_config, moe_layer_ids, copies_to_host=get_tp_group().is_first_rank
+        )
+        # `hbm_reserve_bytes` sizes the tables from the config before the
+        # capturer exists, so a row format vLLM changes must fail here.
+        row_size = math.prod(self._capturer.shape_per_token)
+        row_dtype = self._capturer.output_dtype
+        assert (
+            row_size == _row_size(vllm_config)
+            and row_dtype.itemsize <= _RESERVED_ID_DTYPE.itemsize
+        ), (
+            f"vLLM's capturer stores {row_size} {row_dtype} ids per token, but "
+            f"the routed-experts HBM reserve counts {_row_size(vllm_config)} "
+            f"{_RESERVED_ID_DTYPE} ids"
         )
         use_capturer(self._connector, model, self._capturer)
 

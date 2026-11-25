@@ -436,8 +436,6 @@ def _validate_routed_experts_config(vllm_config: "VllmConfig") -> None:
         "MoE sequence parallelism (TPU_MOE_SEQUENCE_PARALLEL)": (
             parallel_config.use_sequence_parallel_moe
         ),
-        # Each stage captures only its own MoE layers.
-        "pipeline_parallel_size > 1": parallel_config.pipeline_parallel_size > 1,
         # Experts are picked on this rank's share of the tokens.
         "TPU_K3_SP_PREFILL": envs.TPU_K3_SP_PREFILL,
         # The kernel picks experts itself, without `route()`.
@@ -450,6 +448,11 @@ def _validate_routed_experts_config(vllm_config: "VllmConfig") -> None:
         "speculative decoding": vllm_config.speculative_config is not None,
         # Untested.
         "kv_transfer_config": vllm_config.kv_transfer_config is not None,
+        # vLLM builds a KV transfer config from this flag only after this
+        # check runs, so the check above cannot see it.
+        "--kv-offloading-size": (
+            vllm_config.cache_config.kv_offloading_size is not None
+        ),
     }
     rejected = [setting for setting, hit in unsupported.items() if hit]
     if rejected:

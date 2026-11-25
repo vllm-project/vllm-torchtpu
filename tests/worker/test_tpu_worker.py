@@ -477,11 +477,12 @@ def test_out_of_memory_error_shows_the_lora_reserve(monkeypatch):
     assert "pp_handoff_hbm_reserve_gb=0.0GiB" in message
     assert "by 1.0GiB" in message
     assert "--max-loras" in message
+    assert "--max-num-seqs" not in message
 
 
 def test_out_of_memory_error_shows_the_routed_experts_reserve(monkeypatch):
     """Only the routed-experts reserve pushes the budget below zero, so the
-    error must show it."""
+    error must show it and the flags that shrink it."""
     worker = _ep_dp_worker(
         monkeypatch, dp_size=1, expert_parallel=False, local=0, peer=0
     )
@@ -505,6 +506,7 @@ def test_out_of_memory_error_shows_the_routed_experts_reserve(monkeypatch):
     message = str(error.value)
     assert "routed_experts_hbm_reserve_gb=2.0GiB" in message
     assert "by 1.0GiB" in message
+    assert "--max-num-batched-tokens or --max-num-seqs" in message
 
 
 def test_shutdown_stops_the_routed_experts_connector():
