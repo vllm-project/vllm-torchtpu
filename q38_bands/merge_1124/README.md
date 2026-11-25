@@ -4,6 +4,21 @@ This branch is `caojx/qwen38-flash-1124-2` plus the code behind every q38 dash p
 `mbpf-q38pf1119-c1-stack-d3600-bestband` on dash d-5234ec7a (24 points, on sheets `q38-pd-ixc-frontier-1118` and
 `q38-1p1d-curve-1122`). Each point reproduces **by env**: two selector keys pick the exact code the point ran.
 
+## One change to your main package: the GDN LOG-conv correctness fix (no key)
+
+One commit on this branch, "GDN v3: zero the LOG-mode conv log past a partial window; tile-pad the BATCHED metadata",
+changes your main package's GDN v3 kernel with no env key, because it is a correctness fix:
+
+- `kernels/gdn/v3/wrapper.py`: in the factored and the recurrent LOG branches, the conv inputs a tile logs keep window row
+  `1 + t` only while `1 + t < real_size`; the rows the act-in DMAs never fill were logged from stale VMEM and now log zero.
+- `kernels/gdn/v3/metadata.py` (`compute_batched_seq_metadata`): the per-slot arrays are padded to whole tiles, so a seat
+  count that is not a multiple of the tile no longer reads past their end (padding slots are invalid: 0 rows, no state read
+  or write).
+
+q38 found it on device (GDN-SMOKE j-ab697a88) and fixed it on its own lineage (b35a4bc3c2 + d4f63efc18; GDN-SMOKE re-run
+j-be5e3524 SMOKE-PASS, 12 cases). `git revert <that commit>` undoes it alone. The q38 forms are not touched: each still runs
+exactly the code its dash point ran.
+
 ## Your defaults do not change
 
 - With `Q38_FORM` and `Q38_PROXY_FORM` unset, the package and the proxy run exactly as on `caojx/qwen38-flash-1124-2`.

@@ -51,14 +51,22 @@ def compute_batched_seq_metadata(
     has_initial_state = (seq_lens - query_lens) > 0
     all_valid_seqs = jnp.where(is_valid_seqs, all_seqs, 0)
 
+    # q38 GDN-FIX F1: the kernel reads the per-slot arrays at
+    # p_id * seq_tile_size + idx for every slot of every tile, so they are
+    # padded to whole tiles (padding slots: invalid, 0 rows, sequence 0, so no
+    # state read or write); unpadded, a seat count that is not a multiple of
+    # the tile read past the arrays' end.
+    t = cfg.seq_tile_size
+    pad = (-is_valid_seqs.size) % t
+    valid = jnp.pad(is_valid_seqs, (0, pad))
     return memory_ref.MetadataRef.create(
         cfgs=cfg,
         num_tiles=pl.cdiv(end_seq, cfg.tile_size),
-        p_id_to_s_idx=all_valid_seqs,
-        p_id_to_r_base=query_start_loc[all_valid_seqs],
-        p_id_to_r_size=jnp.where(is_valid_seqs, query_lens, 0),
-        p_id_is_first_tile=is_valid_seqs,
-        p_id_is_last_tile=is_valid_seqs,
+        p_id_to_s_idx=jnp.pad(all_valid_seqs, (0, pad)),
+        p_id_to_r_base=jnp.pad(query_start_loc[all_valid_seqs], (0, pad)),
+        p_id_to_r_size=jnp.pad(jnp.where(is_valid_seqs, query_lens, 0), (0, pad)),
+        p_id_is_first_tile=valid,
+        p_id_is_last_tile=valid,
         s_idx_has_initial_state=has_initial_state,
         s_idx_to_state_indices=(
             state_indices if slot_rows is None else slot_rows.rows(slot_rows.state_indices)
