@@ -1572,6 +1572,11 @@ def _prep_fold_shapes(
 # previous step's request count: this step's n, or a few more when requests
 # finished in between (served c16 logged rows n+1 and n+2 as unwarmed keys).
 PREP_FOLD_PREV_ROWS = 3
+# A one-request prefill step (`_assemble_async_prefill_bootstrap`: one zero row
+# per prefilled request) hands the next verify step one rejected-count row,
+# whatever its request count: served za11 logged rows 1 at full-batch token
+# buckets as the only unwarmed keys (~1% of AgentX steps, more under GSM8K).
+PREP_FOLD_BOOTSTRAP_ROWS = (1,)
 
 
 # VLLM_TPU_PREFWD_PREP_FOLD self-check: of the steps that ran the async-spec
@@ -1606,9 +1611,11 @@ def prep_fold_recorded_line(counts: dict[str, int]) -> str:
 
 def _prep_fold_rows(n: int, max_num_reqs: int) -> set[int]:
     """Rejected-count row counts warmed for a step of `n` requests: exact and
-    bucketed `n`, and the previous step's count up to PREP_FOLD_PREV_ROWS more."""
+    bucketed `n`, the previous step's count up to PREP_FOLD_PREV_ROWS more, and
+    PREP_FOLD_BOOTSTRAP_ROWS (the first verify step after a one-request prefill)."""
     rows = {n, _get_padded_num_reqs_with_upper_limit(n, max_num_reqs)}
     rows.update(range(n + 1, min(n + PREP_FOLD_PREV_ROWS, max_num_reqs) + 1))
+    rows.update(PREP_FOLD_BOOTSTRAP_ROWS)
     return rows
 
 

@@ -211,9 +211,12 @@ def test_prep_fold_shapes_cover_steady_keys():
     # The rejected counts carry the previous step's request count: served c16
     # logged rows n+1 and n+2 (requests finished in between) as unwarmed keys.
     assert {(2, 4), (3, 4), (3, 8), (4, 8), (5, 16), (7, 16)} <= shapes
+    # The first verify step after a one-request prefill carries one rejected
+    # row at any request count: served za11 logged rows 1 at full-batch buckets.
+    assert {(1, 32), (1, 64)} <= shapes
     for rows, tokens in shapes:
         n = tokens // width
-        assert n <= rows <= min(
+        assert rows in tpu_runner.PREP_FOLD_BOOTSTRAP_ROWS or n <= rows <= min(
             max(n + tpu_runner.PREP_FOLD_PREV_ROWS,
                 _get_padded_num_reqs_with_upper_limit(n, MAX_REQS)),
             MAX_REQS,
@@ -790,7 +793,9 @@ def test_prep_fold_scatter_shapes_cover_steady_keys():
             for rows in (n, _get_padded_num_reqs_with_upper_limit(n, max_reqs)):
                 assert (rows, tokens) in shapes, (max_reqs, n, rows)
         assert {(1, 4), (2, 8), (3, 16), (16, 64)} <= shapes
-    assert (30, 128) in _prep_fold_scatter_shapes(32, 4, paddings)
+        # Rows 1 (after a one-request prefill) at every steady bucket.
+        assert {(1, 32), (1, 64)} <= shapes
+    assert {(30, 128), (1, 128)} <= _prep_fold_scatter_shapes(32, 4, paddings)
 
 
 # The za10y B arm's served flags around the fold (c16/c32): metadata reuse, the
@@ -891,6 +896,88 @@ def test_b_arm_flags_steady_steps_fold_after_warmup(monkeypatch, pooled, step_dt
         for key in ref[4]:
             assert torch.equal(ref[4][key], got[4][key]), (step, key)
     assert not misses
+
+
+@pytest.mark.parametrize("pooled", [False, True])
+def test_full_batch_after_one_request_prefill_folds(monkeypatch, pooled):
+    """The first verify step of a full batch after a one-request prefill (the
+    previous step's rejected counts have one row, `_assemble_async_prefill_bootstrap`)
+    folds after warmup -- the self-check counts it folded, not unwarmed -- and
+    its forward inputs are bitwise the unfolded ones. Without the rows-1 keys
+    (PREP_FOLD_BOOTSTRAP_ROWS) the same step is an unwarmed miss."""
+    _fold_envs(monkeypatch, window="1")
+    for name, value in B_ARM_FLAGS:
+        monkeypatch.setattr(envs, name, value, raising=False)
+    req_ids = list("abcdefgh")  # 8 requests x 4 tokens = the 32 bucket, full
+    prev_index = {"h": 0}  # one prefilled request: one rejected-count row
+
+    def run(bootstrap_rows):
+        monkeypatch.setattr(tpu_runner, "PREP_FOLD_BOOTSTRAP_ROWS", bootstrap_rows)
+        r_ref, a_ref = _make_runner(pooled)
+        r_fold, a_fold = _make_runner(pooled)
+        TPUModelRunner._precompile_prep_fold(r_fold)
+        outs = []
+        for runner, adapter, fold in ((r_ref, a_ref, 0), (r_fold, a_fold, 1)):
+            monkeypatch.setattr(envs, "VLLM_TPU_PREFWD_PREP_FOLD", fold)
+            s = _step_inputs(runner, req_ids, prev_index, seed=7, bucket=32)
+            assert s["pre"].spec_decode_num_rejected_tokens.shape == (1,)
+            adapter.begin_step()
+            if not fold:
+                outs.append(_run_unfolded(runner, adapter, s))
+                continue
+            runner._pre_async_results = s["pre"]
+            runner.position_ids = s["positions"].clone()
+            runner.input_ids = s["input_ids"].clone()
+            subst = TPUModelRunner._prep_fold_precheck(
+                runner, 0, s["n"], s["n"], s["sched"], s["tokens"],
+                NS(kind=SequenceLayoutKind.ALL),
+            )
+            assert subst is not None  # eligible: the miss is the warmup's
+            # As the serving call site: try, count the outcome, fall back.
+            seq_lens = TPUModelRunner._try_prep_fold(
+                runner, s["seq_lens"], s["subtract_idx"], s["md"], s["starts"],
+                s["state"], 0, s["n"], subst,
+            )
+            TPUModelRunner._note_prep_fold(
+                runner, "unwarmed" if seq_lens is None else "folded"
+            )
+            if seq_lens is None:
+                return runner, None
+            folded = runner._prep_fold_out
+            runner._attn_metadata_builder_ctx = NS(
+                query_start_loc=s["starts"], seq_lens=seq_lens,
+                mamba_state_indices=s["state"],
+            )
+            kwargs = adapter.prepare_inputs(
+                ModelInputSnapshot(
+                    adapter.token_store, 0, s["n"], s["tokens"],
+                    _tables(adapter, 8), folded["ids"],
+                )
+            )
+            outs.append(
+                (seq_lens, runner.position_ids, folded["ids"], folded["drafts"], kwargs)
+            )
+        return r_fold, outs
+
+    lines = []
+    monkeypatch.setattr(
+        tpu_runner.logger, "info", lambda msg, *a, **k: lines.append(msg % a if a else msg)
+    )
+    # Negative control: without the rows-1 keys the step misses.
+    runner, outs = run(())
+    assert outs is None and runner._prep_fold_counts == {"unwarmed": 1}
+    assert any("not warmed" in line for line in lines)
+    runner, (ref, got) = run((1,))
+    assert runner._prep_fold_counts == {"folded": 1}
+    assert tpu_runner.prep_fold_recorded_line(runner._prep_fold_counts) == (
+        "PREFWD_PREP_FOLD recorded: folded 1/1 steps (100.0%), unfolded: "
+        "precheck 0, unwarmed 0"
+    )
+    for i in range(4):
+        assert ref[i].dtype == got[i].dtype and torch.equal(ref[i], got[i]), i
+    assert ref[4].keys() == got[4].keys()
+    for key in ref[4]:
+        assert torch.equal(ref[4][key], got[4][key]), key
 
 
 def test_prep_fold_recorded_self_check(monkeypatch):
