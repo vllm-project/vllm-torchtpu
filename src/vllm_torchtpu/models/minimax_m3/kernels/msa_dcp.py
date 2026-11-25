@@ -194,19 +194,13 @@ def _candidates_kernel(
 # comparison: an order-preserving code of the score, shifted right one bit
 # (keys span less than 2**31) with its low `_key_bits(num_cols)` bits holding
 # the inverted column, so that the larger key is the higher score and, among
-# equal kept scores, the lower column. Keys are distinct, so a pick is the
-# largest key below the previous pick: ``max(key - (prev ^ INT_MIN))``, three
-# VALU ops per vreg (an int32 max is a compare and a select) and no store
-# (the f32 picks took five, a store and a second load: 56 -> 26 bundles per
-# 32 vregs, AOT). The scores keep 11 mantissa
+# equal kept scores, the lower column. Keys are distinct, so a row's picks
+# are its `topk` largest keys, best first. The scores keep 11 mantissa
 # bits (they come from fp8 / 4-bit keys and bf16 or e4m3 queries); every
 # rank keys with the same bits, so a DCP group's lists merge exactly
 # (`merge_pair_candidates`) on the scores the picks return. (The non-DCP
 # `msa_select` orders full f32 scores: near-ties may resolve differently.)
 _KEY_TOP = 1 << 30
-_INT_MIN = -(1 << 31)
-_PICK_ACCUMULATORS = 4
-
 
 # Column bits of every key up to 2,048 columns (262,144 tokens of 128-token
 # blocks on one rank), whatever the scores' padded width, so that the tile
@@ -241,12 +235,57 @@ def _key_scores(keys: jax.Array, col_bits: int) -> tuple[jax.Array, jax.Array]:
 
 
 # `_candidates_kernel_t` builds keys `_KEY_CHUNK[pretransposed]` columns at a
-# time; a pick scans them with `_PICK_ACCUMULATORS` running maxima (one per
-# 8-sublane group), its loop unrolled `_PICK_UNROLL` times (AOT: 26 bundles
-# per 32 vregs; 2 picks per scan in sorted pairs or 4 took 1.0-1.1 bundles
-# per vreg and pick, as the insertions chain).
+# time, and merges them `_sort_vregs(topk)` vregs (8 columns each) at a time into a
+# running sorted top-k per (sublane, lane): a sorting network on the group,
+# then the elementwise maxima of the descending top and the ascending group
+# (the top of both, one bitonic sequence) and a bitonic sort: ~26 VALU ops
+# per key vreg (a compare-exchange is two compares and two selects), each
+# loaded once (AOT: 119 bundles per 16-vreg group), where `topk` serial
+# passes of a running max over every key took 3 ops per vreg and pass (48 at
+# top-16) and a cross-sublane reduction between passes.
 _KEY_CHUNK = {True: 32, False: _LANES}
-_PICK_UNROLL = 4
+_SORT_VREGS = 16
+
+
+def _sort_vregs(topk: int) -> int:
+    """Key vregs per merged group: `_SORT_VREGS`, or the power of two that
+    holds `topk`."""
+    return max(_SORT_VREGS, 1 << (topk - 1).bit_length())
+
+
+def _sort_pairs(n: int) -> list[tuple[int, int]]:
+    """Batcher's odd-even merge sort of `n` (a power of two) elements, as
+    compare-exchanges ``(i, j)``, ``i < j``."""
+    pairs, p = [], 1
+    while p < n:
+        k = p
+        while k >= 1:
+            for j in range(k % p, n - k, 2 * k):
+                for i in range(min(k, n - j - k)):
+                    if (i + j) // (2 * p) == (i + j + k) // (2 * p):
+                        pairs.append((i + j, i + j + k))
+            k //= 2
+        p *= 2
+    return pairs
+
+
+def _bitonic_pairs(n: int) -> list[tuple[int, int]]:
+    """Compare-exchanges that sort a bitonic sequence of `n` (a power of two)."""
+    return [
+        (i, i + k)
+        for k in (n >> s for s in range(1, n.bit_length()))
+        for i in range(n)
+        if not i & k
+    ]
+
+
+def _sorted_desc(v: list, pairs: list[tuple[int, int]]) -> list:
+    """`v` (vregs) through compare-exchanges, the larger to the lower index."""
+    v = list(v)
+    for i, j in pairs:
+        hi = v[i] > v[j]
+        v[i], v[j] = jnp.where(hi, v[i], v[j]), jnp.where(hi, v[j], v[i])
+    return v
 
 
 def _candidates_kernel_t(
@@ -268,13 +307,14 @@ def _candidates_kernel_t(
 ):
     """`_candidates_kernel` with the row block transposed in VMEM: columns
     on sublanes, rows on lanes (``pos_ref [1, rows]``, outputs ``[topk,
-    rows]``). Each pick's max reduces across vregs and sublanes on the VPU
-    instead of across lanes on the XLU, which bound the row-major picks
-    (~310 bundles per pick of a 256 x 128 block in the LLO), over packed keys
+    rows]``). Each row's picks come from elementwise sorting networks over
+    vregs and sublanes on the VPU (see `_sort_vregs`) instead of reductions
+    across lanes on the XLU, which bound the row-major picks (~310 bundles
+    per pick of a 256 x 128 block in the LLO), over packed keys
     (`_score_keys`). `pretransposed` scores already come as ``[columns,
     rows]``.
 
-    The block keys and scans only the columns its rows can see (the scores
+    The block keys and merges only the columns its rows can see (the scores
     span max-model-len, mostly past every row's context): a loop bound read
     from its positions, one body for every width."""
     rank = rank_ref[0]
@@ -284,7 +324,13 @@ def _candidates_kernel_t(
     num_visible = pos_ref[...] // block_size + 1  # [1, rows]
     # A rank's blocks below n are among its first ceil(n / dcp) columns.
     needed = (jnp.max(num_visible) + dcp - 1) // dcp
-    chunks = jnp.clip((needed + chunk - 1) // chunk, 1, num_cols // chunk)
+    # Whole groups of columns, and a half group where that pads less.
+    sort_vregs = _sort_vregs(topk)
+    group_cols = 8 * sort_vregs
+    half_cols = group_cols // 2
+    halves = jnp.clip((needed + half_cols - 1) // half_cols, 2, num_cols // half_cols)
+    groups, half = halves // 2, halves % 2
+    chunks = (halves * half_cols + chunk - 1) // chunk
 
     def build(c, carry):
         start = pl.multiple_of(c * chunk, chunk)
@@ -309,39 +355,47 @@ def _candidates_kernel_t(
         return carry
 
     jax.lax.fori_loop(0, chunks, build, 0)
-    sub = 8 * _PICK_ACCUMULATORS
-    trips = chunks * chunk // sub
+    bitonic_pairs = _bitonic_pairs(sort_vregs)
 
-    def scan(off, acc, v):
-        x = key_ref[pl.ds(pl.multiple_of(v * sub, sub), sub), :]
-        return tuple(
-            jnp.maximum(a, x[8 * i : 8 * (i + 1)] - off) for i, a in enumerate(acc)
+    def group_sorted(g, lanes, n=sort_vregs):
+        """The `n` key vregs from column group `g`, sorted descending."""
+        start = pl.multiple_of(g * group_cols, group_cols)
+        v = [key_ref[pl.ds(start + 8 * i, 8), lanes] for i in range(n)]
+        return _sorted_desc(v, _sort_pairs(n))
+
+    def merged(top, other):
+        """The top of descending `top` and ascending `other` (its last
+        ``len(other)`` places), descending."""
+        n = len(top) - len(other)
+        maxima = [jnp.maximum(a, b) for a, b in zip(top[n:], other)]
+        return _sorted_desc([*top[:n], *maxima], bitonic_pairs)
+
+    lane_picks = []
+    for lane0 in range(0, rows, _LANES):
+        lanes = pl.ds(lane0, _LANES)
+        top = jax.lax.fori_loop(
+            1,
+            groups,
+            lambda g, top, lanes=lanes: tuple(
+                merged(top, group_sorted(g, lanes)[::-1])
+            ),
+            tuple(group_sorted(0, lanes)),
         )
-
-    picks, prev = [], jnp.full((8, rows), _KEY_TOP, jnp.int32)
-    for _ in range(topk):
-        # The largest key below the last pick: ``key - off`` wraps the keys
-        # at or above it below every other.
-        off = prev ^ _INT_MIN
-
-        def unrolled(i, acc, off=off):
-            for u in range(_PICK_UNROLL):
-                acc = scan(off, acc, i * _PICK_UNROLL + u)
-            return acc
-
-        acc = (jnp.full((8, rows), _INT_MIN, jnp.int32),) * _PICK_ACCUMULATORS
-        acc = jax.lax.fori_loop(0, trips // _PICK_UNROLL, unrolled, acc)
-        acc = jax.lax.fori_loop(
-            trips // _PICK_UNROLL * _PICK_UNROLL,
-            trips,
-            lambda v, acc, off=off: scan(off, acc, v),
-            acc,
+        top = jax.lax.fori_loop(
+            0,
+            half,
+            lambda _, top, lanes=lanes: tuple(
+                merged(top, group_sorted(groups, lanes, sort_vregs // 2)[::-1])
+            ),
+            top,
         )
-        best = functools.reduce(jnp.maximum, acc)
-        for shift in (4, 2, 1):  # across sublanes: every sublane gets the max
-            best = jnp.maximum(best, pltpu.roll(best, shift, 0))
-        prev = best + off
-        picks.append(prev[:1])
+        # Each sublane holds its own columns' top; merge across sublanes.
+        for shift in (4, 2, 1):
+            top = merged(top, [pltpu.roll(t, shift, 0) for t in top[::-1]])
+        lane_picks.append(top[:topk])
+    picks = [
+        jnp.concatenate([lp[k][:1] for lp in lane_picks], axis=1) for k in range(topk)
+    ]
     # Odd ranks list their picks in reverse (`local_candidates`).
     keys = jnp.where(
         (rank & 1) == 1, jnp.concatenate(picks[::-1]), jnp.concatenate(picks)
@@ -455,14 +509,16 @@ def local_candidates(
     num_blocks = (num_tokens + pad) // block_rows
     scratch = []
     if transposed:
-        # Whole key chunks (`_candidates_kernel_t`); the kernel masks the
-        # padded columns.
-        chunk = _KEY_CHUNK[pretransposed]
+        # Whole column groups (`_candidates_kernel_t`); the kernel masks the
+        # padded columns. A width that is not a multiple of the group takes a
+        # padded copy (the served widths, max_model_len / block / dcp
+        # columns, are whole groups).
         kernel = functools.partial(
             _candidates_kernel_t, real_cols=num_cols, pretransposed=pretransposed
         )
-        if num_cols % chunk:
-            col_pad = -num_cols % chunk
+        group_cols = 8 * _sort_vregs(topk)
+        if num_cols % group_cols:
+            col_pad = -num_cols % group_cols
             widths = [(0, col_pad), (0, 0)] if pretransposed else [(0, 0), (0, col_pad)]
             s = jnp.pad(s, [(0, 0)] * (s.ndim - 2) + widths, constant_values=_NEG_INF)
             num_cols += col_pad

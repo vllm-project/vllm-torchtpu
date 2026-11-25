@@ -25,12 +25,12 @@ BLOCK = 128
 TOPK = 16
 
 
-def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
+def _reference(scores, pos, rank, dcp, init_blocks, local_blocks, topk=TOPK):
     """Per row: this rank's top-k (forced blocks first, then score, ties to
     the lower block) as (scores, blocks), (-inf, -1) padded."""
     num_tokens, num_cols = scores.shape
-    out_s = np.full((num_tokens, TOPK), -np.inf, np.float32)
-    out_b = np.full((num_tokens, TOPK), -1, np.int32)
+    out_s = np.full((num_tokens, topk), -np.inf, np.float32)
+    out_b = np.full((num_tokens, topk), -1, np.int32)
     for t in range(num_tokens):
         visible = pos[t] // BLOCK + 1
         cand = []
@@ -45,7 +45,7 @@ def _reference(scores, pos, rank, dcp, init_blocks, local_blocks):
                 s = msa_select._FORCED_INIT_SCORE
             cand.append((-s, b, s))
         cand.sort()
-        for i, (_, b, s) in enumerate(cand[:TOPK]):
+        for i, (_, b, s) in enumerate(cand[:topk]):
             out_s[t, i], out_b[t, i] = s, b
     return out_s, out_b
 
@@ -171,6 +171,29 @@ def test_candidates_negative_scores_and_few_visible_blocks(num_tokens, pretransp
     )
     want_s, want_b = _reference(_kept_scores(scores, num_cols), pos, rank, 2, 0, 1)
     want_s, want_b = want_s[:, ::-1], want_b[:, ::-1]  # odd rank
+    np.testing.assert_array_equal(np.asarray(got_b), want_b)
+    np.testing.assert_array_equal(np.asarray(got_s), want_s)
+
+
+@pytest.mark.parametrize("pretransposed", [False, True])
+def test_candidates_more_picks_than_a_sort_group(pretransposed):
+    """More than 16 picks per row merge in wider column groups."""
+    rng = np.random.default_rng(7)
+    num_tokens, num_cols, topk = 130, 400, 24
+    scores = rng.integers(0, 50, (num_tokens, num_cols)).astype(np.float32)
+    pos = rng.integers(0, 2 * BLOCK * num_cols, num_tokens).astype(np.int32)
+    got_s, got_b = local_candidates(
+        jnp.asarray(scores).T if pretransposed else jnp.asarray(scores)[:, None, :],
+        jnp.asarray(pos),
+        block_size=BLOCK,
+        topk=topk,
+        init_blocks=1,
+        local_blocks=1,
+        rank=0,
+        dcp=2,
+        interpret=True,
+    )
+    want_s, want_b = _reference(scores, pos, 0, 2, 1, 1, topk)
     np.testing.assert_array_equal(np.asarray(got_b), want_b)
     np.testing.assert_array_equal(np.asarray(got_s), want_s)
 
