@@ -93,6 +93,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_HALVES: bool = False
     TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS: int = 4096
     TPU_MINIMAX_M3_MSA_WIDE_TILES: str = "off"
+    TPU_MINIMAX_M3_MSA_PAGE_MAJOR: str = "auto"
     TPU_MINIMAX_M3_FP8_DRAFT_LINEARS: bool = True
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS: int = 0
@@ -886,6 +887,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # twin), "on" always, "off" never.
     "TPU_MINIMAX_M3_MSA_WIDE_TILES": env_with_choices(
         "TPU_MINIMAX_M3_MSA_WIDE_TILES", "off", ["auto", "on", "off"]
+    ),
+    # MSA head-parallel (DCP prefill) attention page-major instead of in tiles
+    # (models/minimax_m3/kernels/msa_dcp_heads.py `PAGE_MAJOR`): "auto" per step
+    # from its selections' dispersion, "on" always, "off" never.
+    "TPU_MINIMAX_M3_MSA_PAGE_MAJOR": env_with_choices(
+        "TPU_MINIMAX_M3_MSA_PAGE_MAJOR", "auto", ["auto", "on", "off"]
     ),
     # MoE steps (EP or TP-MoE) of up to this many tokens with fp4 (NVFP4)
     # experts run the permutation-free dense-expert kernel (kernels/experimental/

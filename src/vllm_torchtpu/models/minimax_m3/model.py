@@ -53,7 +53,11 @@ from vllm_torchtpu.models.minimax_m3.attention import (
     MiniMaxM3SparseAttention,
     StepHalves,
 )
-from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse, sp_norm
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa_attention_lse,
+    msa_dcp_heads,
+    sp_norm,
+)
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
 from vllm_torchtpu.models.minimax_m3.ops.sp_norm import get_add_norm_quant_op
 from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
@@ -688,6 +692,7 @@ class MiniMaxM3Model(nn.Module):
         on = msa_attention_lse.configure_max_free(bound)
         logger.info("MiniMax-M3 MSA score bound %.1f: max-free softmax %s", bound, on)
         msa_attention_lse.WIDE_TILES = envs.TPU_MINIMAX_M3_MSA_WIDE_TILES
+        msa_dcp_heads.PAGE_MAJOR = envs.TPU_MINIMAX_M3_MSA_PAGE_MAJOR
         return loaded_params
 
 

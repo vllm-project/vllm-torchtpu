@@ -44,6 +44,7 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_attention,
     msa_attention_lse,
+    msa_attention_pairs,
     msa_dcp,
     msa_fp4,
 )
@@ -72,6 +73,17 @@ _SPLIT_PAGES_PER_STEP = 32
 # replica with less waits at the next exchange (c64 DCP 4 twin, per-core
 # kernel time up to 2.2x, j-867fc577). A block is a whole 64-token tile.
 _INTERLEAVE_TOKENS = 64
+# Head-parallel rows attend page-major (`msa_attention_pairs`) instead of in
+# tiles: "auto" when a step's mean page union per tile is over
+# `_PAGE_MAJOR_MIN_RATIO` times its tokens' mean pages (a tile's cost grows
+# with its union, page-major's with the pairs), "on" always, "off" never
+# (`TPU_MINIMAX_M3_MSA_PAGE_MAJOR`). Op replay of a 4,096-row x 16-head call,
+# tiles -> page-major, us (j-7166bc3d, j-2cf6896e): uniform selections over a
+# 111K context (union 593 per 64-token tile, ratio 37) 5183 -> 1163; a hot set
+# of 64 pages (65, ratio 4.1) 685 -> 779; local selections (26, ratio 1.6)
+# 344 -> 844; tiles cost ~8.7 us per union page.
+PAGE_MAJOR = "auto"
+_PAGE_MAJOR_MIN_RATIO = 7.0
 # Decode steps of a DCP group of 4 over 2 KV heads attend each KV head in its
 # own call so the cross-chip merge overlaps the second (`_pair_first_merge_by_head`).
 PAIR_FIRST_HEAD_CALLS = True
@@ -883,23 +895,17 @@ def _head_parallel_attend(
         page_table = jnp.arange(dcp * num_pages, dtype=jnp.int32)
 
         attend = functools.partial(
-            msa_attention_lse.msa_sparse_attention_lse,
+            _attend_head,
             sm_scale=sm_scale,
-            block_q=_BLOCK_Q,
             pages_per_step=_SPLIT_PAGES_PER_STEP if split else _PAGES_PER_STEP,
-            head=0,
             scale_cache=sc,
-            k_scale_row=0,
-            v_scale_row=1,
-            head_major=True,
             interpret=interpret,
         )
         if not merge:
             # One call over every row: the kernel chunks the rows and writes
             # its output in place; rows outside the round see no page and
             # come back zero (cheap empty tiles).
-            out, _ = attend(q, kv, keys, local, limit, page_table)
-            return out
+            return attend(q, kv, keys, local, limit, page_table)
 
         def window_body(i, acc):
             start = jnp.minimum(lo + i * window, rows - window)
@@ -907,7 +913,7 @@ def _head_parallel_attend(
             def sl(x):
                 return jax.lax.dynamic_slice_in_dim(x, start, window, 0)
 
-            out, _ = attend(sl(q), kv, sl(keys), sl(local), sl(limit), page_table)
+            out = attend(sl(q), kv, sl(keys), sl(local), sl(limit), page_table)
             old = jax.lax.dynamic_slice_in_dim(acc, start, window, 1)
             out = jnp.where(sl(mine)[None, :, None], out, old)  # earlier rounds
             return jax.lax.dynamic_update_slice_in_dim(acc, out, start, 1)
@@ -934,6 +940,72 @@ def _head_parallel_attend(
     if interleave:
         acc = _deinterleave(acc, axis=1)
     return acc
+
+
+def _attend_head(
+    q,
+    kv,
+    keys,
+    local,
+    limit,
+    page_table,
+    *,
+    sm_scale,
+    pages_per_step,
+    scale_cache,
+    interpret,
+):
+    """Head-major ``[H, T, D]`` attention of ``q [T, H, D]`` over one KV
+    head's 4-bit pages: in tiles, or page-major (`PAGE_MAJOR`) where the
+    page-major kernel takes the shape and the scores are max-free."""
+
+    def tiles(operands):
+        q, keys, local, limit = operands
+        out, _ = msa_attention_lse.msa_sparse_attention_lse(
+            q,
+            kv,
+            keys,
+            local,
+            limit,
+            page_table,
+            sm_scale=sm_scale,
+            block_q=_BLOCK_Q,
+            pages_per_step=pages_per_step,
+            head=0,
+            scale_cache=scale_cache,
+            k_scale_row=0,
+            v_scale_row=1,
+            head_major=True,
+            interpret=interpret,
+        )
+        return out
+
+    def pairs(operands):
+        q, keys, local, limit = operands
+        return msa_attention_pairs.msa_sparse_attention_pairs(
+            q,
+            kv,
+            keys,
+            local,
+            limit,
+            page_table,
+            sm_scale=sm_scale,
+            scale_cache=scale_cache,
+            interpret=interpret,
+        )
+
+    operands = (q, keys, local, limit)
+    num_tokens, num_heads, head_dim = q.shape
+    fits = msa_attention_pairs.supports(
+        num_heads, head_dim, msa_attention.page_tokens(kv), page_table.shape[0]
+    )
+    if PAGE_MAJOR == "off" or not (fits and msa_attention_lse.MAX_FREE):
+        return tiles(operands)
+    if PAGE_MAJOR == "on":
+        return pairs(operands)
+    tiled = jnp.pad(keys, ((0, -num_tokens % _BLOCK_Q), (0, 0)), constant_values=-1)
+    ratio = msa_attention_lse._union_ratio(tiled[:, None], _BLOCK_Q)
+    return jax.lax.cond(ratio > _PAGE_MAJOR_MIN_RATIO, pairs, tiles, operands)
 
 
 def _replica_rows(q, rank, *, axis, dcp):

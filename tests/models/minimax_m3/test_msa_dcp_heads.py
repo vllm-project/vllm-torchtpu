@@ -171,14 +171,16 @@ def _spmd(q, kvs, scs, cands, meta, **kw):
         ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320, 1 << 20, 2048, 12),
     ],
 )
+@pytest.mark.parametrize("page_major", ["off", "on", "auto"])
 def test_attend_and_merge_matches_dcp_reference(
-    q_lens, ctx_lens, num_tokens, min_tokens, max_call, width, monkeypatch
+    q_lens, ctx_lens, num_tokens, min_tokens, max_call, width, page_major, monkeypatch
 ):
     if len(jax.devices()) < DCP:
         pytest.skip(
             "needs 8 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)"
         )
     monkeypatch.setattr(msa_attention, "MAX_TOKENS_PER_CALL", max_call)
+    monkeypatch.setattr(msa_dcp_heads, "PAGE_MAJOR", page_major)
     rng = np.random.default_rng(0)
     step = _step(rng, q_lens, ctx_lens, width, num_tokens)
     *args, num_real = step
