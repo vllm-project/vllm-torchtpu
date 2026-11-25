@@ -245,11 +245,8 @@ def _tpu_async_scheduling_incompatibility(vllm_config: VllmConfig) -> str | None
     validators still reject it.
     """
     spec = vllm_config.speculative_config
-    if spec is not None:
-        if not spec.use_eagle():
-            return f"{spec.method}-based speculative decoding"
-        if spec.disable_padded_drafter_batch:
-            return "disable_padded_drafter_batch=True"
+    if spec is not None and not spec.use_eagle():
+        return f"{spec.method}-based speculative decoding"
     if vllm_config.parallel_config.pipeline_parallel_size > 1:
         return "pipeline parallelism"
     return None
@@ -271,13 +268,6 @@ def _validate_tpu_runner_features(vllm_config: VllmConfig) -> None:
     if spec is not None:
         if spec.enable_adaptive_verification and spec.method != "dspark":
             unsupported.append("adaptive draft verification outside DSpark")
-        if (
-            spec.disable_padded_drafter_batch
-            and vllm_config.scheduler_config.async_scheduling
-        ):
-            unsupported.append(
-                "async scheduling with disable_padded_drafter_batch=True"
-            )
         if spec.draft_lm_head_quantization is not None:
             unsupported.append("draft lm_head quantization")
         draft_config = spec.draft_model_config
@@ -602,6 +592,9 @@ class TpuPlatform(Platform):
     def pre_register_and_update(
         cls, parser: "FlexibleArgumentParser | None" = None
     ) -> None:
+        # vLLM calls this before EngineArgs builds the first VllmConfig, so the
+        # pre_register patches see that config's __post_init__.
+        patch_registry.apply("pre_register")
         if parser is not None:
             # Default EP weight filtering on for CLI entry points (`vllm serve`).
             # Both model loaders gate on MoE + EP (+ non-EPLB for Run:AI), so

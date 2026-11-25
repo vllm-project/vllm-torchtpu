@@ -48,7 +48,6 @@ def _config(device="tpu", method=None, pcp=1):
         else SimpleNamespace(
             method=method,
             enable_adaptive_verification=False,
-            disable_padded_drafter_batch=False,
             parallel_drafting=method in ("dflash", "dspark"),
             use_eagle=lambda: method in ("eagle", "eagle3", "mtp", "dflash", "dspark"),
             draft_lm_head_quantization=None,
@@ -84,7 +83,6 @@ def test_tpu_allows_dspark_adaptive_verification():
     "feature,reason",
     [
         ("adaptive", "adaptive draft verification outside DSpark"),
-        ("unpadded_async", "async scheduling with disable_padded_drafter_batch=True"),
         ("xpress", "xpress speculative decoding"),
         ("dflash2", "DFlash candidate-head drafts"),
         ("parse_mtp", "Parse 3.5 MTP"),
@@ -100,9 +98,6 @@ def test_tpu_rejects_what_tpu_model_runner_lacks(feature, reason):
     spec = config.speculative_config
     if feature == "adaptive":
         spec.enable_adaptive_verification = True
-    elif feature == "unpadded_async":
-        spec.disable_padded_drafter_batch = True
-        config.scheduler_config.async_scheduling = True
     elif feature == "xpress":
         spec.draft_model_config.architectures = ["DFlashQwen3XPressModel"]
     elif feature == "dflash2":
@@ -142,7 +137,6 @@ def test_non_tpu_validate_model_runner_skips_the_tpu_runner_check():
     [
         ("ngram", False),
         ("draft_model", False),
-        ("unpadded_drafter", False),
         ("pp", False),
         ("dflash", None),
         ("plain", None),
@@ -152,11 +146,7 @@ def test_tpu_post_init_disables_default_async_scheduling_where_unsupported(
     monkeypatch, mode, expected
 ):
     seen_before_upstream = []
-    monkeypatch.setattr(
-        plugin.VllmConfig if hasattr(plugin, "VllmConfig") else VllmConfig,
-        "_tpu_runner_validation_patch",
-        False,
-    )
+    monkeypatch.setattr(VllmConfig, "_tpu_runner_validation_patch", False)
     monkeypatch.setattr(
         VllmConfig,
         "__post_init__",
@@ -166,15 +156,9 @@ def test_tpu_post_init_disables_default_async_scheduling_where_unsupported(
     )
     plugin._patch_vllm_tpu_runner_validation()
 
-    method = (
-        mode
-        if mode in ("ngram", "draft_model", "dflash")
-        else ("eagle3" if mode == "unpadded_drafter" else None)
-    )
+    method = mode if mode in ("ngram", "draft_model", "dflash") else None
     config = _config(method=method)
-    if mode == "unpadded_drafter":
-        config.speculative_config.disable_padded_drafter_batch = True
-    elif mode == "pp":
+    if mode == "pp":
         config.parallel_config.pipeline_parallel_size = 2
 
     config.__post_init__()
@@ -190,6 +174,19 @@ def test_tpu_post_init_disables_default_async_scheduling_where_unsupported(
     non_tpu = _config(device="cuda", method="ngram")
     non_tpu.__post_init__()
     assert seen_before_upstream[-1] is None
+
+
+@pytest.mark.parametrize("parser", [None, "cli"])
+def test_pre_register_installs_patches_before_the_first_config(monkeypatch, parser):
+    # vLLM calls pre_register_and_update before EngineArgs builds a VllmConfig.
+    from vllm_torchtpu import patch_registry
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    stages = []
+    monkeypatch.setattr(patch_registry, "apply", stages.append)
+    cli = SimpleNamespace(set_defaults=lambda **_: None) if parser else None
+    TpuPlatform.pre_register_and_update(cli)
+    assert stages == ["pre_register"]
 
 
 def _adaptive_dspark_config(device):

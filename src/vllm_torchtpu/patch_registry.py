@@ -26,14 +26,14 @@ import logging
 import os
 from dataclasses import dataclass
 from threading import RLock
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, get_args
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 Stage = Literal[
     "import",
-    "platform_register",
+    "pre_register",
     "platform_activation",
     "engine_core",
     "worker_init",
@@ -119,7 +119,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
     Patch(
         "vllm_torchtpu:_patch_vllm_tpu_runner_validation",
-        ("platform_register", *_ACTIVE),
+        ("pre_register", *_ACTIVE),
     ),
     # Weight loading and embeddings.
     Patch(
@@ -218,13 +218,7 @@ def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
     outer invocation already owns that ordered pass. Failures propagate and
     leave the failing patch eligible for retry, retaining completed patches.
     """
-    if stage not in (
-        "import",
-        "platform_activation",
-        "engine_core",
-        "worker_init",
-        "model_load",
-    ):
+    if stage not in get_args(Stage):
         raise ValueError(f"Unknown TPU patch stage: {stage}")
     with _lock:
         if stage in _active_stages:
