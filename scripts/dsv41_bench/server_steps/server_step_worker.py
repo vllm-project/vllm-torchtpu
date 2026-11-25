@@ -278,16 +278,7 @@ class Recorder:
             return self.execute(scheduler_output, *args, **kwargs)
         if self.pending is not None:
             raise RuntimeError("Previous benchmark step did not complete sampling")
-        import torch
-
-        # Cumulative tier-1 compile-cache misses: a step whose count moves
-        # compiled (or loaded) an executable inside the serving window, which
-        # the eager MaterializationWorker does without any log line.
-        self.pending = {
-            "start_ns": time.perf_counter_ns(),
-            "stages": [],
-            "cache_misses": int(torch.tpu._get_cache_misses()),
-        }
+        self.pending = {"start_ns": time.perf_counter_ns(), "stages": []}
         if self.scenario.name == "decode":
             self.pending["scheduled_draft_lengths"] = {
                 req: len(tokens)
@@ -548,12 +539,6 @@ class ServerStepWorker:
         recorder.in_flight = 0
         recorder.enabled = True
         recorder.audit_start_wall_ns = time.time_ns()
-        # Maps step clocks (perf_counter) to log wall clocks.
-        recorder.clock_pair_ns = [recorder.audit_start_wall_ns, time.perf_counter_ns()]
-        if os.environ.get("DSV41_BENCH_DUMP_CACHE_MISS") == "1":
-            import torch
-
-            torch.tpu._set_dump_on_cache_miss(True)
         _ACTIVE = recorder
         cache = self.model_runner.kv_cache_config
         if cache is None:
@@ -578,10 +563,6 @@ class ServerStepWorker:
             raise RuntimeError("Serving has not naturally consumed all outputs")
         recorder.enabled = False
         _ACTIVE = None
-        if os.environ.get("DSV41_BENCH_DUMP_CACHE_MISS") == "1":
-            import torch
-
-            torch.tpu._set_dump_on_cache_miss(False)
         for step in recorder.steps:
             logging.getLogger(__name__).info(
                 "DSV41_SERVER_STEP %s",
@@ -595,7 +576,6 @@ class ServerStepWorker:
                     recorder.audit_start_wall_ns,
                     time.time_ns(),
                 ],
-                "clock_pair_ns": recorder.clock_pair_ns,
                 "steps": recorder.steps,
                 "stages": recorder.stages,
                 "scenario": recorder.scenario.to_dict(),
