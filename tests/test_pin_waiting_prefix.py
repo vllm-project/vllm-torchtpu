@@ -50,6 +50,9 @@ def _cache_and_free(pool, req, n):
     blocks = pool.get_new_blocks(n)
     pool.cache_full_blocks(req, blocks, 0, n, BS, 0)
     pool.free_blocks(blocks)
+    # The same-step-hit patch (if another test installed it) hides blocks cached in the
+    # current step until Scheduler.schedule clears the set; a scheduler step has passed here.
+    pool.__dict__.get("_tpu_unwritten_block_ids", set()).clear()
     return blocks
 
 
