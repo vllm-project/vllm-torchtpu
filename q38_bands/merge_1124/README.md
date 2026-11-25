@@ -31,6 +31,7 @@ This branch is `caojx/qwen38-flash-1124-2` plus the code behind every q38 dash p
 | `Q38_FORM=k_sup` | B3 supersede `cc23d50903` | `15bc882819` |
 | `Q38_FORM=oxk` | K3-ox.1 `1ea5a165a7` overlay (= `859e11f16e`) | `033a46e02a` |
 | `Q38_FORM=d1121` | `d8f139fa` (= `caojx/qwen38-flash-1121`), default form | `47ed2c5504` (= `9cd151fab5` without `_forms/`, `__init__.py` = its `_bl_init.py`) |
+| `Q38_FORM=k_sb11` | SB1-1 served head `17739744d1` (B1 record candidate, see below) | `577f761fba` |
 
 | Proxy form | Blob | Source |
 |---|---|---|
@@ -69,6 +70,13 @@ one is file-for-file identical to the commit). Env delta = what to add to the po
 | B6 | HIX-o p4c64m | 48.79 @ 423.91 (3.41 s) | j-74e61ed5 | `859e11f16e` | 68d7bbd856 / b30ec5e4bf4cb2d0 / 3480 | drop `Q38_OXPD_FORM=1`; `Q38_FORM=oxk Q38_PROXY_FORM=opener` |
 | B6 | HIX-o p4c56m | 43.91 @ 426.27 (2.55 s) | j-64d5ef35 | `859e11f16e` | same | drop `Q38_OXPD_FORM=1`; `Q38_FORM=oxk Q38_PROXY_FORM=opener` |
 | B6 | HIX-o p4c40m | 31.45 @ 437.66 (1.45 s) | j-52573012 | `859e11f16e` | same | drop `Q38_OXPD_FORM=1`; `Q38_FORM=oxk Q38_PROXY_FORM=opener` |
+
+**Record candidate, not yet on the sheet (BRANCH-KEEPER, 2026-11-25).** Its form is stored now, before its post, so that the code exists
+on this branch first. Until the sheet tags it, B1 is the T58x c212 row above (`k_cut1`).
+
+| Band | Point | Mtok/$ @ x (TTFT p90) | Job | Commit | SRC / TREE / N | Env delta |
+|---|---|---|---|---|---|---|
+| B1 | SB1-1 c212 (record candidate) | 307.30 @ 83.28 (5.75 s) | j-4be755be | `17739744d1` | 0d6c7d50a3 / e7753a66e8750121 / 1709 | `Q38_FORM=k_sb11 Q38_PROXY_FORM=k` |
 
 Bands are by p90 interactivity: B1 ≤ 110, B2 110-140, B3 140-160, B4 160-205, B5 205-275, B6 ≥ 275 tok/s/user.
 The 1P1D sheet is performance of record with accuracy uncertified. Routing disclosures (sticky decode routing on the

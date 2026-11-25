@@ -1,0 +1,3602 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Controller-driven KV cache offloading via Raiden `KVCacheStore`.
+
+This module provides the scheduler-side offloading manager and worker
+integration for Raiden-backed KV cache offloading. All directory tracking
+(hash -> host slot), LRU eviction, pinning, and DMA transfers are managed
+by Raiden's C++ `KVCacheStore`.
+
+Workers register device KV buffers once with the controller (`KVCacheManager`)
+and act as passive DMA endpoints for `save`/`load` operations initiated by
+the scheduler.
+
+Key components and mechanisms:
+
+- Block granularity and coalescing: One store entry per physical kernel block.
+  A logical device block maps to `device_block_size_factor` store entries with derived
+  sub-hashes `OffloadKey ‖ sub_idx`. Contiguous device kernel blocks are fused
+  by Raiden into single hardware DMAs.
+
+- Model and parallelism support: Supports dense full-attention (single KV group)
+  and hybrid attention+Mamba models on the TPU unified block pool. Supports
+  Prefill Context Parallelism (PCP) across ranks and Data Parallelism (DP)
+  with independent per-engine controller ports and job names.
+
+- Two-phase admission: `insert` atomically pins the whole batch, then a
+  post-admission `lookup` (stable under the job's own pins) picks out the
+  entries this admission inserted, and issues a DMA save for exactly those.
+
+- Pin lifecycle: the store hands out a pin with the answer — `lookup` pins what
+  it found, `insert` pins what it admitted — and a successful `save` or local
+  `load` spends that pin. Only the pins no transfer consumed are given back by
+  hand, which is what a job's terminal cleanup does. Bytes read from a peer are
+  never pinned here and never released.
+
+- Directory as the single source of truth: `prepare_store` probes Raiden per
+  key to decide what to offer, so a key displaced from the LRU is re-offered
+  on its next appearance. Displacements are also reported back: the manager
+  registers an eviction callback with the store and turns host LRU evictions
+  into `OffloadingEvent`s, which the connector surfaces as `BlockRemoved`
+  KV cache events.
+
+- Fault tolerance and recovery: Failed saves retry once. Timed-out drains
+  poison in-flight jobs to prevent committing torn bytes from reused blocks.
+
+- Cross-instance KV sharing: Saved blocks are published to the global registry
+  for cluster-wide reuse. Lookups resolve `REMOTE` hits and issue `read_remote`
+  straight into HBM. A peer read borrows nothing from the local store: it
+  reserves no capacity, keeps no host copy, and leaves no directory entry, so
+  the same key is fetched again on every miss until a local store admits it.
+
+- Storage tier (optional): with a storage path configured, every save also
+  writes the block to a POSIX directory behind the host DRAM pool, one file per
+  TP and PCP rank, and the save completes only once the files are written. Raiden
+  reports a block found only in storage as `SHARED_STORAGE`, whether or not the
+  global registry is enabled. The connector reads those back like a peer's
+  block: `read_remote` straight into HBM, no pin, no reserved capacity. Raiden
+  also publishes a landed block into host DRAM, unpinned, so the next lookup
+  finds it locally. A job's peer and storage blocks share one `read_remote`
+  call. Nothing deletes the files; the directory grows until an operator
+  prunes it.
+
+See `raiden_connector.py` for connector wiring, device fencing, and echo channels.
+"""
+
+from __future__ import annotations
+
+import enum
+import hashlib
+import math
+import os
+import socket
+import threading
+import time
+from collections import OrderedDict
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, cast
+
+from vllm.config import VllmConfig
+from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_offload.base import (
+    CanonicalKVCaches,
+    LoadStoreSpec,
+    Locality,
+    LookupResult,
+    Medium,
+    OffloadingEvent,
+    OffloadingManager,
+    OffloadingSpec,
+    OffloadingWorker,
+    OffloadKey,
+    PrepareStoreOutput,
+    ReqContext,
+    RequestOffloadingContext,
+    ScheduleEndContext,
+    TransferResult,
+)
+from vllm.v1.kv_offload.config import OffloadingConfig
+
+from vllm_torchtpu import envs
+from vllm_torchtpu.block_major_pool import unified_block_major_enabled
+from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.offload.block_major_layout import (
+    BlockMajorContract,
+    resolve_block_major_contract,
+)
+
+if TYPE_CHECKING:
+    import torch
+
+    from vllm_torchtpu.offload.tier_classes import (
+        TierClass,
+        TieredOffloadingManager,
+        TierPlan,
+    )
+
+logger = init_logger(__name__)
+
+# Upper bound (seconds) on a scheduler-side drain of in-flight store/load
+# jobs whose source/destination blocks are about to be reused.
+_DRAIN_TIMEOUT_S = envs.VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S
+
+# A save whose transfer failed is retried this many times (a failed save
+# leaves the entry HBM+pinned, so a second save() works). Retries are
+# suppressed for drained jobs: a drain means the source blocks are about to
+# be reused, so re-reading them would ship garbage.
+_SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
+
+# Controller port of the offload store (the first of the host-tier class
+# stores) when the extra config sets none: below Linux's default ephemeral
+# range (32768-60999), so no listener bound to port 0 in the pod (a PD
+# engine's Raiden servers among them) can hold it and take its workers'
+# registrations. The store binds this port and every worker dials it; the
+# Raiden wheel falls back to no default of its own.
+_DEFAULT_CONTROLLER_PORT = 31515
+
+_EPHEMERAL_PORT_RANGE = "/proc/sys/net/ipv4/ip_local_port_range"
+
+# TIER-X2 counters, in telemetry order.
+X2_COUNTERS = (
+    "registry_lookups",
+    "registry_us",
+    "registry_misses",
+    "miss_cached",
+    "remote_hit_keys",
+    "remote_reads",
+    "remote_read_blocks",
+    "remote_read_blocks_done",
+    "remote_read_blocks_failed",
+    "store_probe_lookups",
+    "store_probe_us",
+    "store_remote_skips",
+    "store_held_skips",
+    "store_probe_rpcs",
+    "store_probe_unrecorded",
+    "store_probe_neg_cached",
+    "lookup_unrecorded",
+    # Read room (staging for peer reads): a peer read lands through this host
+    # pool (Raiden's LoadRemoteBlocks allocates one free host block per
+    # sub-block, free space only, and fails the whole read if it cannot).
+    # Launches whose estimated free blocks were short of the read, sub-blocks
+    # the room step evicted, launches still short after it, and the failed
+    # peer sub-blocks split by whether their launch was short.
+    "read_room_short",
+    "read_room_evicted",
+    "read_room_still_short",
+    "remote_failed_short",
+    "remote_failed_roomy",
+)
+
+# TIER-X2: most keys remembered as registry misses at once; past it the expired
+# ones are dropped, and all of them if none had expired.
+_X2_MISSED_CAP = 1 << 20
+
+# TIER-X2: most keys remembered as possibly on this shard's store node (evicted
+# from its host pool). A key this shard never evicted cannot be on its node, so
+# it costs no registry call; past the cap the oldest are forgotten (a forgotten
+# key on the node is then found only after it is evicted here again).
+_X2_RECORD_CAP = 1 << 17
+
+# TIER-X2: the Raiden switches that make a store demote its cold host blocks to the
+# store nodes of its pool group. Without both, nothing ever reaches the second tier.
+X2_SWEEP_ENV = ("RAIDEN_ENABLE_STORE_MONITOR", "RAIDEN_ENABLE_EVICT_SWEEP")
+
+
+def x2_sweep_env_on() -> bool:
+    """Whether Raiden will run the evict sweep (it reads "true" or "1")."""
+    return all(os.environ.get(name, "") in ("true", "1") for name in X2_SWEEP_ENV)
+
+
+def x2_expand_env(name: str, value: str) -> str:
+    """TIER-X2: ``$VAR`` / ``${VAR}`` in an extra-config address expanded from the
+    environment; refused when a variable is unset (an unexpanded address would be
+    advertised to peers that can never dial it)."""
+    out = os.path.expandvars(value)
+    if "$" in out:
+        raise ValueError(
+            f"TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2: {name} "
+            f"{value!r} names an unset environment variable"
+        )
+    return out
+
+
+def x2_wait_registry(address: str, timeout_s: float | None = None) -> float:
+    """TIER-X2: waits until the global registry accepts a connection (its sidecar starts with the pod,
+    the shard stores register with it at construction); seconds waited. Refused after the timeout
+    (Q38X2_REGISTRY_WAIT_S, default 600)."""
+    if timeout_s is None:
+        timeout_s = float(os.environ.get("Q38X2_REGISTRY_WAIT_S", "600"))
+    host, _, port = address.rpartition(":")
+    host = host.strip("[]")
+    t0 = time.monotonic()
+    noted = False
+    while True:
+        try:
+            with socket.create_connection((host, int(port)), timeout=1.0):
+                return time.monotonic() - t0
+        except OSError:
+            pass
+        if time.monotonic() - t0 >= timeout_s:
+            raise ValueError(
+                f"TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2: the global registry at "
+                f"{address} did not answer within {timeout_s:.0f} s (is Q38X2_REGISTRY_PORT set "
+                "on this leg?)"
+            )
+        if not noted:
+            logger.info(
+                "TPURaidenOffloadingConnector: TIER-X2: waiting for the global registry at %s",
+                address,
+            )
+            noted = True
+        time.sleep(0.5)
+
+
+def x2_shard_namespace(key_namespace: bytes, shard: str) -> bytes:
+    """A shard's own key namespace: the shards of one class hold the same keys, and
+    the registry maps a key's bytes to one owner, so each shard's keys must differ."""
+    return hashlib.sha256(key_namespace + b"|tier-x2|" + shard.encode()).digest()[:16]
+
+
+def ephemeral_port_range(path: str = _EPHEMERAL_PORT_RANGE) -> tuple[int, int] | None:
+    """The kernel's ephemeral port range in this network namespace, or None."""
+    try:
+        with open(path) as f:
+            lo, hi = (int(v) for v in f.read().split())
+    except (OSError, ValueError):
+        return None
+    return lo, hi
+
+
+def refuse_ephemeral_ports(ports: Sequence[int]) -> None:
+    """Fails startup when a controller port lies in the ephemeral range, where a
+    listener bound to port 0 can hold it and take its workers' registrations."""
+    ephemeral = ephemeral_port_range()
+    if ephemeral is None:
+        return
+    lo, hi = ephemeral
+    inside = [port for port in ports if lo <= port <= hi]
+    if inside:
+        raise ValueError(
+            f"TPURaidenOffloadingConnector: controller ports {inside} fall in the "
+            f"ephemeral range {lo}-{hi}, where a listener bound to port 0 can hold "
+            "one and take its workers' registrations; set raiden_controller_port "
+            f"below {lo}"
+        )
+
+
+# Host bytes behind one offloaded block, summed over every worker rank, as
+# recorded from the per-worker KV cache configs before the offloading spec is
+# built (see ``_patch_vllm_offload_all_ranks_kv_bytes``). None until recorded.
+_all_ranks_kv_bytes_per_block: int | None = None
+
+# The per-worker KV cache configs that sum went over, in worker order; the
+# host tier's size classes read each worker's group-to-region plan from them.
+_worker_kv_cache_configs: tuple[Any, ...] | None = None
+
+
+def _worker_kv_bytes_per_block(kv_cache_config: Any) -> int:
+    """One worker's bytes per block, as vLLM's ``build_offloading_config``
+    derives ``worker_kv_bytes_per_block`` from that worker's config."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+        _group_kv_bytes_per_block,
+        get_offloading_group_ids,
+    )
+
+    if kv_cache_config.num_blocks <= 0:
+        return 0
+    if (
+        kv_cache_config.hisparse_host_num_blocks is None
+        and kv_cache_config.kv_cache_tensors
+    ):
+        return kv_cache_config.kv_cache_tensors[0].size // kv_cache_config.num_blocks
+    return sum(
+        _group_kv_bytes_per_block(kv_cache_config.kv_cache_groups[group_id])
+        for group_id in get_offloading_group_ids(kv_cache_config)
+    )
+
+
+def record_all_ranks_kv_bytes_per_block(kv_cache_configs: Sequence[Any]) -> int:
+    """Sum the per-worker bytes per block over all workers and remember it.
+
+    Every process that builds the offloading spec (the engine core and each
+    worker) sees the same list, so each computes the same host capacity.
+    Under pipeline parallelism the stages hold different layers, and the sum
+    over the per-worker configs is what one worker's figure times the world
+    size cannot give.
+    """
+    global _all_ranks_kv_bytes_per_block, _worker_kv_cache_configs
+    total = sum(_worker_kv_bytes_per_block(cfg) for cfg in kv_cache_configs)
+    _all_ranks_kv_bytes_per_block = total
+    _worker_kv_cache_configs = tuple(kv_cache_configs)
+    return total
+
+
+def all_ranks_kv_bytes_per_block() -> int | None:
+    return _all_ranks_kv_bytes_per_block
+
+
+def recorded_worker_kv_cache_configs() -> tuple[Any, ...] | None:
+    return _worker_kv_cache_configs
+
+
+def iter_leaf_kv_cache_specs(kv_cache_spec):
+    """Yield the per-layer specs behind a KV cache group spec."""
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        for leaf in kv_cache_spec.kv_cache_specs.values():
+            yield from iter_leaf_kv_cache_specs(leaf)
+    else:
+        yield kv_cache_spec
+
+
+def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
+    """Whether this model's KV cache consists of multiple tensors
+    of different shapes.
+    """
+    return vllm_config.model_config.architecture in (
+        "DeepseekV4ForCausalLM",
+        "GlmMoeDsaForCausalLM",
+    )
+
+
+def resolve_model_owned_pool_geometry(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> tuple[int, tuple[int, ...], object, int] | None:
+    """Geometry a model-owned unified pool declares for itself, or None.
+
+    Some models own a unified pool whose groups share one page size but not
+    one attention geometry (Qwen4Exp: QSA main KV, compressed keys, raw
+    rings, GDN and PLE state). Each (group, block) key still names exactly
+    one page, so the model describes the pool's carrier rows and every
+    group's page moves as opaque bytes.
+    """
+    from vllm_torchtpu.models.vllm.qwen4_exp.offload import (
+        is_qwen4_exp,
+        offload_pool_geometry,
+    )
+
+    if is_qwen4_exp(vllm_config):
+        return offload_pool_geometry(vllm_config, kv_cache_config)
+    return None
+
+
+def _ignore_evictions(evicted_hashes: list[bytes]) -> None:
+    """Eviction callback left registered after the manager shuts down."""
+
+
+class RaidenLoadStoreSpec(LoadStoreSpec):
+    """Offload-side specification describing the ordered keys for a job.
+
+    Device block IDs are bound later at submit time from the matching
+    `GPULoadStoreSpec` (as they are not yet known during prepare).
+
+    `pinned` is set to False if `prepare_load` lost the race against eviction
+    before acquiring pins. The load job then fails cleanly at submit time,
+    allowing vLLM to recompute the blocks.
+    """
+
+    def __init__(self, keys: list[OffloadKey], pinned: bool = True):
+        self.keys = keys
+        self.pinned = pinned
+
+    def __repr__(self) -> str:
+        return (
+            f"RaidenLoadStoreSpec({len(self.keys)} keys"
+            f"{'' if self.pinned else ', unpinned'})"
+        )
+
+
+class AdmissionOp(enum.Enum):
+    STORE = "store"
+    LOAD = "load"
+
+
+@dataclass
+class Admission:
+    """Exact-batch record of one launched store/load job.
+
+    Raiden keys its candidate-restoration state by the sorted hash batch
+    passed to `insert`, so release / rollback must use exactly the admitted
+    batch, exactly once. This record is the single source of truth for that
+    batch, for which of its pins are still held, and for which cleanup the
+    job's terminal state owes.
+    """
+
+    job_id: int
+    op: AdmissionOp
+    keys: list[OffloadKey]
+    sub_hashes: list[bytes]
+    # Sub-hashes still awaiting a poll_{save,load}_status verdict.
+    pending: set[bytes]
+    failed: bool = False
+    # Set by a timed-out drain: the job's blocks were handed back for reuse
+    # while its transfers were still in flight, so even a store-reported
+    # success may cover torn bytes. The finalizer treats the admission as
+    # failed regardless of the poll verdict.
+    poisoned: bool = False
+    # Loads only: owning request and destination device block IDs, reported
+    # through get_block_ids_with_load_errors on failure.
+    req_id: str | None = None
+    dst_device_block_ids: list[int] = field(default_factory=list)
+    # Loads only: the sub-hashes fetched via read_remote — from a peer or the
+    # storage tier — rather than from the local host pool. Drives the remote
+    # poll, and marks the sub-hashes this job holds no pin for — such a read
+    # neither takes one nor spends one.
+    remote_sub_hashes: set[bytes] = field(default_factory=set)
+    # Sub-hashes whose pin a completed transfer already spent. Releasing one of
+    # these again would drop a pin the job no longer holds.
+    consumed_sub_hashes: set[bytes] = field(default_factory=set)
+    # Stores only: the sub-hashes actually saved (newly admitted HBM entries;
+    # pre-existing HOST entries were pinned, not re-saved) and the remaining
+    # retry budget for the failed subset.
+    saved_sub_hashes: list[bytes] = field(default_factory=list)
+    # Sub-hashes that failed: the polls append transfer failures (stores
+    # retry exactly this subset), and launch failures pre-fill the batch.
+    failed_sub_hashes: list[bytes] = field(default_factory=list)
+    retries_left: int = 0
+    # TIER-X2 loads only: the launch's peer read found fewer estimated free
+    # host blocks than it needed (after the room step, if on).
+    room_short: bool = False
+
+
+@dataclass
+class FinishedJob:
+    job_id: int
+    op: AdmissionOp
+    success: bool
+    req_id: str | None = None
+    failed_device_block_ids: list[int] = field(default_factory=list)
+    # Stores only: the keys this job saved to the host (keys that were
+    # already resident are pinned in place, not saved).
+    stored_keys: list[OffloadKey] = field(default_factory=list)
+
+
+class RaidenOffloadingManager(OffloadingManager):
+    """Scheduler-side OffloadingManager backed by raiden's KVCacheStore.
+
+    The store owns the directory, LRU, pins, and transfers; this class maps
+    vLLM's manager contract onto it and owns the failure-aware job finalizer
+    (`poll_finished_jobs`).
+    """
+
+    def __init__(
+        self,
+        *,
+        kernel_physical_blocks_capacity: int,
+        offload_logical_blocks_capacity: int,
+        device_block_size_factor: int,
+        world_size: int,
+        raiden_controller_port: int,
+        raiden_job_name: str,
+        global_registry_address: str = "",
+        store_server_ip: str = "",
+        kv_pool_group: str = "",
+        key_namespace: bytes = b"",
+        # Storage tier behind the host DRAM pool: raiden BackendConfigs from
+        # `build_store_storage_backend_config`. Empty keeps the store DRAM-only.
+        secondary_backend_configs: Sequence[object] = (),
+        # Device rows per scheduler block in the registered views: block b's
+        # data is device row b * device_row_stride. 1 for whole-page rows; a
+        # host-tier class that registers finer rows (the compressed keys'
+        # leading bytes) sets the rows a page holds.
+        device_row_stride: int = 1,
+        # Keep the store time of every key the store holds (host-tier class
+        # telemetry: occupancy, stores, evictions, the oldest entry).
+        track_held: bool = False,
+        # TIER-X2 (VLLM_TPU_OFFLOAD_TIER_X2): the second tier behind this store is
+        # the registry's: a key missing from the host pool is looked for there,
+        # at most once per x2_miss_ttl_s while it keeps missing. Needs the
+        # global registry.
+        tier_x2: bool = False,
+        x2_miss_ttl_s: float = 0.0,
+        # TIER-X2 (VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM): before a peer read, evict
+        # this store's oldest unpinned held entries until the estimated free
+        # host blocks cover the read plus x2_read_room_margin. Needs track_held.
+        x2_read_room: bool = False,
+        x2_read_room_margin: int = 16,
+        # Test overrides: allow injecting mock store instance and type bindings.
+        store: Any = None,
+        store_types: Any = None,
+    ):
+        assert kernel_physical_blocks_capacity == (
+            offload_logical_blocks_capacity * device_block_size_factor
+        )
+        if device_row_stride != 1 and device_block_size_factor != 1:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: finer device rows need one kernel "
+                f"block per scheduler block, got factor {device_block_size_factor}"
+            )
+        self._capacity_keys = offload_logical_blocks_capacity
+        self._device_block_size_factor = device_block_size_factor
+        self._device_row_stride = device_row_stride
+        self._key_namespace = key_namespace
+        # Cross-instance sharing: publishing blocks to the global registry
+        # requires a peer-reachable store_server_ip.
+        self._enable_global = bool(global_registry_address)
+        if self._enable_global and not store_server_ip:
+            # KVCacheStore requires a dialable store_server_ip to advertise
+            # reachable endpoints to the global registry. Falling back to
+            # localhost (127.0.0.1) would publish an address peers cannot dial.
+            # Require the recipe to configure a valid Pod IP explicitly.
+            raise ValueError(
+                "TPURaidenOffloadingConnector: global registry configured without "
+                "store_server_ip: peers could never dial this replica. "
+                "Set store_server_ip to the pod IP in "
+                "kv_connector_extra_config."
+            )
+        if self._enable_global and not os.environ.get("PYTHONHASHSEED"):
+            # vLLM seeds its block-hash chain from os.urandom when
+            # PYTHONHASHSEED is unset, so unseeded replicas build disjoint
+            # hash chains and every cross-instance lookup misses — a silent
+            # zero-hit run with no error anywhere.
+            raise ValueError(
+                "TPURaidenOffloadingConnector: global_registry_address requires "
+                "PYTHONHASHSEED to be set (to the same value on every "
+                "replica): unseeded engines derive disjoint block hashes "
+                "and cross-instance lookups can never hit."
+            )
+
+        if store is None:
+            from tpu_sync.api.torch.kv_cache_manager import _torch_impl
+
+            store_types = _torch_impl()
+            logger.info(
+                "TPURaidenOffloadingConnector: blocking KVCacheStore construction "
+                "until %d worker(s) register",
+                world_size,
+            )
+            store = store_types.KVCacheStore(
+                capacity=kernel_physical_blocks_capacity,
+                raiden_id=store_types.RaidenId(raiden_job_name, "0", "kv_cache", 0),
+                # Transfer fanout is dynamically driven by registered workers.
+                num_shards=1,
+                shard_size_bytes=1,
+                raiden_controller_port=raiden_controller_port,
+                global_registry_address=global_registry_address,
+                # Local-only runs default to 127.0.0.1 to satisfy C++ non-empty check.
+                store_server_ip=store_server_ip or "127.0.0.1",
+                # Pool group this store's KV cache flows within (spec
+                # publication and eviction placement).
+                kv_pool_group=kv_pool_group,
+                # Construction blocks in RaidenController::Init() until every
+                # rank registers, and raises on timeout
+                # (RAIDEN_EXPECTED_WORKERS_TIMEOUT_S, default 120s).
+                expected_worker_count=world_size,
+                # Passed only when set, so a DRAM-only store is constructed
+                # exactly as before the storage tier existed.
+                **(
+                    {"secondary_backend_configs": list(secondary_backend_configs)}
+                    if secondary_backend_configs
+                    else {}
+                ),
+            )
+            logger.info(
+                "TPURaidenOffloadingConnector: KVCacheStore up: capacity=%d "
+                "kernel blocks (%d offloaded blocks x %d), namespace=%s, controller at "
+                "%s, all %d workers registered%s",
+                kernel_physical_blocks_capacity,
+                offload_logical_blocks_capacity,
+                device_block_size_factor,
+                key_namespace.hex(),
+                store.raiden_controller_address,
+                world_size,
+                (
+                    f", published at {store.store_server_address or '<nothing>'}"
+                    f" in registry {global_registry_address}"
+                    if self._enable_global
+                    else ""
+                ),
+            )
+        else:
+            # Injected store (tests): the caller supplies the module holding
+            # BlockStatus / RaidenBlockId so tpu_sync isn't imported.
+            assert store_types is not None
+        self._store = store
+        self._block_status = store_types.BlockStatus
+        self._block_id_cls = store_types.RaidenBlockId
+        self._raiden_id = self._store.raiden_id
+
+        # Eviction tracking and callback registration with host LRU cache.
+        self._eviction_lock = threading.Lock()
+        self._evicted_sub_hashes: dict[OffloadKey, set[int]] = {}
+        self._evicted_keys_queue: list[OffloadKey] = []
+        # `set_eviction_callback` landed in a recent Raiden wheel; on older
+        # wheels the manager still works, it just never reports removals.
+        # Say so rather than silently dropping BlockRemoved events.
+        self._supports_eviction_callback = hasattr(self._store, "set_eviction_callback")
+        if self._supports_eviction_callback:
+            self._store.set_eviction_callback(self._on_eviction)
+        else:
+            logger.warning(
+                "Raiden store predates set_eviction_callback(); host LRU "
+                "evictions will not be reported as KV cache events."
+            )
+
+        # The connector's only cache-state bookkeeping, and it is
+        # load-bearing: it bars a second admission of a key whose store job is
+        # in flight (fence-parked or launched), covering the window between
+        # `prepare_store` and `insert` where the Raiden directory
+        # holds nothing for the key. Every other store/skip/touch decision
+        # probes the directory itself.
+        self._inflight_store_keys: set[OffloadKey] = set()
+
+        # Peer and storage-tier location slices cached from lookups and
+        # consumed during `prepare_load`.
+        self._remote_slices: dict[bytes, object] = {}
+
+        # Peer and storage-tier slices `prepare_load` accepted, held until
+        # `submit_load_job` hands them to read_remote. A peer read leaves no
+        # local directory entry, so the slice is the only record of where the
+        # sub-hash lives, and it must outlive the scheduler step that found
+        # it. An entry a job never claims is harmless: the next lookup
+        # re-resolves the hash, and a slice that has gone stale simply fails
+        # its read and recomputes.
+        self._pending_remote_slices: dict[bytes, object] = {}
+
+        self._admissions: dict[int, Admission] = {}
+        self._hash_to_admission: dict[bytes, Admission] = {}
+        self._finished: list[FinishedJob] = []
+
+        # Held keys by the wall-clock time a store first landed them,
+        # oldest first; updated by successful stores and by the eviction
+        # callback, both under _eviction_lock. None when not tracked.
+        self._held: dict[OffloadKey, float] | None = {} if track_held else None
+        self._held_stored = 0
+        self._held_evicted = 0
+
+        # Exclusive restore (VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE; off unless
+        # set_exclusive_restore): the local sub-hashes of a landed load are
+        # evicted from the host pool, deferred to the parent job's verdict
+        # under the tier classes. Sub-hashes being evicted right now, so the
+        # eviction callback counts them as discards, not LRU evictions.
+        self._excl = False
+        self._excl_defer = False
+        self._excl_deferred: dict[int, list[bytes]] = {}
+        self._excl_evicting: frozenset[bytes] = frozenset()
+        self._excl_counts = dict.fromkeys(
+            ("calls", "asked", "evicted", "abandoned"), 0
+        )
+        self._held_discarded = 0
+
+        # TIER-X2: off unless tier_x2. Keys that missed the host pool and the
+        # registry, with the monotonic time until which they are answered as
+        # misses without a registry call.
+        if tier_x2 and not self._enable_global:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2 needs the "
+                "global registry (global_registry_address): the second tier is "
+                "found through it"
+            )
+        self._x2 = bool(tier_x2)
+        self._x2_miss_ttl_s = float(x2_miss_ttl_s)
+        self._x2_missed: dict[OffloadKey, float] = {}
+        self._x2_counts = dict.fromkeys(X2_COUNTERS, 0)
+        # Keys that may be on this shard's store node, oldest first; guarded by
+        # _eviction_lock (the store's eviction callback adds to it).
+        self._x2_record: OrderedDict[OffloadKey, None] = OrderedDict()
+        self._x2_record_cap = _X2_RECORD_CAP
+        self._x2_read_room = bool(x2_read_room) and self._x2
+        self._x2_read_room_margin = max(0, int(x2_read_room_margin))
+
+    # -- sub-hash / block-id expansion ----------------------------------
+
+    def _sub_hashes(self, key: OffloadKey) -> list[bytes]:
+        # The namespace prefix makes registry keys byte-distinct
+        # across incompatible engines; locally it is inert.
+        return [
+            self._key_namespace + key + i.to_bytes(4, "big")
+            for i in range(self._device_block_size_factor)
+        ]
+
+    def _expand_keys(self, keys: list[OffloadKey]) -> list[bytes]:
+        out: list[bytes] = []
+        for key in keys:
+            out.extend(self._sub_hashes(key))
+        return out
+
+    def _expand_device_blocks(self, device_block_ids: list[int]) -> list[int]:
+        # The only place a scheduler block ID becomes a device row: callers
+        # keep and report the scheduler's IDs.
+        f = self._device_block_size_factor
+        stride = self._device_row_stride
+        return [(b * f + i) * stride for b in device_block_ids for i in range(f)]
+
+    # -- pin bookkeeping -------------------------------------------------
+
+    def _probe(
+        self, sub_hashes: list[bytes], *, enable_global: bool = False
+    ) -> list[tuple[bytes, Any]]:
+        """Read the directory without laying claim to what it reports.
+
+        `lookup` pins its hits by default so the answer cannot be evicted
+        before the caller uses it. A probe uses the answer to make a decision
+        and transfers nothing, so it asks for no pin: taking one and handing it
+        straight back would drop the entry at the Most Recently Used position
+        and quietly reorder eviction, which is `touch`'s job to do on purpose.
+        """
+        return self._store.lookup(
+            sub_hashes, enable_global=enable_global, pin_found=False
+        )
+
+    def _pins_still_held(self, admission: Admission) -> list[bytes]:
+        """The job's sub-hashes whose pin nothing has spent yet.
+
+        A successful save or local load consumes the pin it was handed, and a
+        peer or storage read never took one; releasing either would drop a pin
+        the job does not hold. What is left is what a terminal job owes back.
+        """
+        return [
+            sub_hash
+            for sub_hash in admission.sub_hashes
+            if sub_hash not in admission.consumed_sub_hashes
+            and sub_hash not in admission.remote_sub_hashes
+        ]
+
+    def _newly_inserted_sub_hashes(
+        self, sub_hashes: list[bytes], device_ids: list[int]
+    ) -> list[bytes] | None:
+        """Return the sub-hashes this admission itself inserted — the ones a
+        DMA save must copy to host.
+
+        Called immediately after `insert` pinned the whole batch,
+        `sub_hashes[i]` having been admitted with device block `device_ids[i]`.
+        The pins hold the directory still, so a single lookup decides every
+        sub-hash:
+        - HBM bound to the device block this job supplied: this admission put
+          it there, so its bytes exist only on device; save it.
+        - HOST / HOST_AND_HBM: already host-resident and now pinned in place;
+          handing it to save() would trip Raiden's HBM gate and get the whole
+          batch rejected.
+        - REMOTE: the bytes live on a peer; nothing to transfer locally.
+
+        Returns None when a sub-hash is missing, or sits in a state none of
+        the above covers: an HBM entry bound to a device block this job never
+        supplied. That entry is the residue of an earlier save that failed and
+        exhausted its retries — the store has no removal API, so a dead device
+        binding outlives the job that made it and an insert pins such an entry
+        in place rather than rebinding it. Its recorded device block has since
+        been reused, so the bytes behind it are not this key's; the caller
+        fails the job closed rather than ship them. The entry is unpinned and
+        evictable, so the key stores normally again once the store reclaims
+        the slot.
+        """
+        # The admission already holds one pin per sub-hash, and that is the
+        # pin the save spends; this only needs to read their status.
+        matched = self._probe(sub_hashes)
+        if len(matched) < len(sub_hashes):
+            logger.error(
+                "TPURaidenOffloadingConnector: admitted sub-hash vanished under "
+                "its own pin (%d of %d resident); failing the store job",
+                len(matched),
+                len(sub_hashes),
+            )
+            return None
+        to_save: list[bytes] = []
+        for i, (sub_hash, block) in enumerate(matched):
+            status = block.status
+            if status in (
+                self._block_status.HOST,
+                self._block_status.HOST_AND_HBM,
+                self._block_status.REMOTE,
+            ):
+                continue
+            if (
+                status == self._block_status.HBM
+                and block.device_block_id == device_ids[i]
+            ):
+                to_save.append(sub_hash)
+                continue
+            logger.error(
+                "TPURaidenOffloadingConnector: admitted sub-hash in unexpected state "
+                "(status=%s, device_block_id=%d, expected device %d); failing "
+                "the store job",
+                status,
+                block.device_block_id,
+                device_ids[i],
+            )
+            return None
+        return to_save
+
+    # -- OffloadingManager contract --------------------------------------
+
+    def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
+        return RequestOffloadingContext()
+
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if self.__dict__.get("_x2", False):
+            return self._x2_lookup(key, req_context)
+        return self._lookup_verdict(key, req_context)
+
+    def _x2_lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        """TIER-X2 lookup: the host pool first, then the registry.
+
+        A key whose every sub-hash the host pool holds (or a save of which is in
+        flight) gets the single store's verdict without a registry call: Raiden asks
+        the registry only about local misses, and there are none. Otherwise the
+        registry is asked, unless the key missed both within the last
+        x2_miss_ttl_s. Every answer is the single store's own: a peer's block is
+        read back with read_remote, landing the bytes it was saved with.
+        """
+        if key in self._inflight_store_keys:
+            return LookupResult.HIT_PENDING
+        counts = self._x2_counts
+        sub_hashes = self._sub_hashes(key)
+        if len(self._probe(sub_hashes)) == len(sub_hashes):
+            return self._lookup_verdict(key, req_context)
+        if not self._x2_maybe_remote(key):
+            # Never evicted here (or forgotten): it cannot be on this shard's
+            # node, and the host pool does not hold it whole.
+            counts["lookup_unrecorded"] += 1
+            return LookupResult.MISS
+        now = time.monotonic()
+        until = self._x2_missed.get(key)
+        if until is not None and until > now:
+            counts["miss_cached"] += 1
+            return LookupResult.MISS
+        t0 = time.perf_counter()
+        result = self._lookup_verdict(key, req_context)
+        counts["registry_lookups"] += 1
+        counts["registry_us"] += int((time.perf_counter() - t0) * 1e6)
+        if result == LookupResult.MISS:
+            counts["registry_misses"] += 1
+            if self._x2_miss_ttl_s > 0:
+                if len(self._x2_missed) >= _X2_MISSED_CAP:
+                    self._x2_missed = {
+                        k: t for k, t in self._x2_missed.items() if t > now
+                    }
+                    if len(self._x2_missed) >= _X2_MISSED_CAP:
+                        self._x2_missed.clear()
+                self._x2_missed[key] = now + self._x2_miss_ttl_s
+        else:
+            self._x2_missed.pop(key, None)
+            if result == LookupResult.HIT and any(
+                h in self._remote_slices for h in sub_hashes
+            ):
+                counts["remote_hit_keys"] += 1
+        return result
+
+    def x2_stats(self) -> dict[str, int]:
+        """TIER-X2 counters (lookups, registry calls, peer reads)."""
+        return dict(self._x2_counts)
+
+    def _lookup_verdict(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if key in self._inflight_store_keys:
+            return LookupResult.HIT_PENDING
+        sub_hashes = self._sub_hashes(key)
+        # A probe across all sub-hashes, not a claim: the store pins every
+        # local hit it reports, and those pins go straight back below.
+        # `prepare_load` takes them again when the scheduler commits to a load.
+        # With the global registry enabled, local misses query remote peer slices.
+        # If the registry is unreachable or times out, the error is swallowed and
+        # lookup safely falls back to local-only caching without failing requests.
+        allow_remote = self._enable_global
+        matches = self._probe(sub_hashes, enable_global=allow_remote)
+        if len(matches) < len(sub_hashes):
+            return LookupResult.MISS
+        all_local = True
+        remote_slices: dict[bytes, object] = {}
+        for sub_hash, block in matches:
+            status = block.status
+            if status in (self._block_status.HOST, self._block_status.HOST_AND_HBM):
+                continue
+            if status == self._block_status.HBM:
+                if sub_hash in self._hash_to_admission:
+                    # A save for this sub-hash is genuinely in flight; the
+                    # scheduler should come back for it. (The common case is
+                    # already caught by the per-key in-flight set above; this
+                    # is the sub-hash-level net.)
+                    return LookupResult.HIT_PENDING
+                # HBM with no live job behind it is not a pending save. It is
+                # the residue of a save that failed and exhausted its retries
+                # -- `prepare_store` documents the same state from the store
+                # side. The store has no removal API, so the entry outlives
+                # the job that made it, and a host pool that can no longer
+                # accept writes never reclaims it. Answering HIT_PENDING here
+                # would park the request on a save that will never complete:
+                # the scheduler re-looks-up every step, gets HIT_PENDING
+                # again, and the request defers forever. The bytes are not on
+                # the host, so a load could not serve it either. It is a miss
+                # -- recompute, and let `prepare_store` re-offer the key.
+                return LookupResult.MISS
+            # A peer's block (REMOTE) and a storage tier's block
+            # (SHARED_STORAGE) are both read with read_remote straight into
+            # HBM. The storage tier answers whether or not the global registry
+            # is enabled, so only a peer hit is gated on it.
+            if (
+                status == self._block_status.REMOTE and allow_remote
+            ) or status == self._block_status.SHARED_STORAGE:
+                if sub_hash in self._hash_to_admission:
+                    # A read_remote for this sub-hash is already in flight;
+                    # a second launch on the same hash must not race it.
+                    return LookupResult.HIT_PENDING
+                all_local = False
+                remote_slices[sub_hash] = block
+                continue
+            return LookupResult.MISS
+        if not all_local:
+            self._remote_slices.update(remote_slices)
+        return LookupResult.HIT
+
+    def host_resident_prefix(self, keys: list[OffloadKey]) -> int:
+        """Counts the leading keys whose every sub-block is in the host pool.
+
+        Reads the directory through ``_probe``: no pin is taken and the LRU
+        order stays as it is. The store's lookup halts at the first miss, and
+        an entry that is not on the host (a save in flight, a peer's block, a
+        storage-tier block) also ends the run.
+        """
+        if not keys:
+            return 0
+        host = (self._block_status.HOST, self._block_status.HOST_AND_HBM)
+        resident = 0
+        for _, block in self._probe(self._expand_keys(list(keys))):
+            if block.status not in host:
+                break
+            resident += 1
+        return resident // self._device_block_size_factor
+
+    def touch(self, keys, req_context: ReqContext) -> None:
+        # A lookup pins what it finds and releasing drops the entry back at
+        # the Most Recently Used position, so probe-then-release is the touch:
+        # it refreshes LRU order and leaves the entry evictable again, holding
+        # nothing. A partially resident chain needs no special case — only the
+        # entries that were actually found move, and prepare_store re-offers
+        # the key on its next appearance.
+        #
+        # Only host-pool entries were pinned. A SHARED_STORAGE entry holds no
+        # pin, and it must not be released: the storage tier answers for the
+        # hashes past the first host-pool miss without the host pool having
+        # been asked about them, so the pool may still hold the same hash,
+        # pinned by an in-flight job, and a release would drop that job's pin.
+        skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
+        for key in keys:
+            sub_hashes = self._sub_hashes(key)
+            held = [
+                sub_hash
+                for sub_hash, block in self._store.lookup(sub_hashes)
+                if block.status not in skip
+            ]
+            if held:
+                self._store.release(held)
+
+    def touch_run(self, keys) -> int:
+        """``touch`` in one store call each way (VLLM_TPU_ARRIVAL_TOUCH).
+
+        One pinned lookup over every sub-hash of ``keys``, in order, and one
+        release of the host-pool entries it pinned: the store puts each released
+        entry at the Most Recently Used end, the first key nearest it, and holds
+        no pin afterwards. The lookup stops at the first miss, so only the
+        leading resident run moves. A peer's or storage tier's entry holds no
+        pin and is not released (see ``touch``). Returns the sub-hashes moved.
+        """
+        sub_hashes = self._expand_keys(list(keys))
+        if not sub_hashes:
+            return 0
+        skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
+        held = [
+            sub_hash
+            for sub_hash, block in self._store.lookup(
+                sub_hashes, enable_global=False, pin_found=True
+            )
+            if block.status not in skip
+        ]
+        if held:
+            self._store.release(held)
+        return len(held)
+
+    def prepare_load(self, keys, req_context: ReqContext) -> LoadStoreSpec:
+        keys = list(keys)
+        sub_hashes = self._expand_keys(keys)
+        # Split the batch by where the bytes are. A local sub-hash is pinned
+        # here so it survives until the load runs; a peer or storage sub-hash
+        # carries its slice forward to submit_load_job instead, because such a
+        # read borrows nothing from this store — there is no landing capacity
+        # to reserve and no local entry to pin.
+        #
+        # Residency decides, not the stash: a sub-hash the stash calls remote
+        # but that is resident here — a concurrent fetch landed it, or another
+        # request stored it — is loaded locally, which is both cheaper and the
+        # only option once the peer stops advertising it. That is why the batch
+        # is walked rather than partitioned in one pass: a lookup answers with
+        # the resident PREFIX of what it was asked, stopping at the first hash
+        # it cannot find, so each miss is resolved against the stash and the
+        # walk resumes after it.
+        #
+        # A storage tier bends that rule in one place. Past the first host-pool
+        # miss the store answers from the storage tier, and its SHARED_STORAGE
+        # hits hold no pin and say nothing about the host pool. Looking each of
+        # them up again would re-check the whole remainder against storage
+        # every time, so a storage run is taken from the stash in one pass: a
+        # sub-hash in it that the stash covers is read from where the stash
+        # says (a peer or the storage tier) even if it is also resident here.
+        # The first one the stash does not cover gets a fresh lookup, which
+        # finds it if it is resident.
+        #
+        # The first host-pool miss itself is known not to be resident, so when
+        # the stash does not cover it but this lookup found it in storage — it
+        # left the host pool after `lookup` — it is read from storage.
+        remote_slices: dict[bytes, object] = {}
+        local_hashes: list[bytes] = []
+        idx = 0
+        while idx < len(sub_hashes):
+            matched = self._store.lookup(sub_hashes[idx:])
+            local_run = next(
+                (
+                    i
+                    for i, (_, block) in enumerate(matched)
+                    if block.status == self._block_status.SHARED_STORAGE
+                ),
+                len(matched),
+            )
+            local_hashes.extend(sub_hash for sub_hash, _ in matched[:local_run])
+            idx += local_run
+            if idx == len(sub_hashes):
+                break
+            # sub_hashes[idx] missed the host pool; so, perhaps, did the rest
+            # of the storage run it starts.
+            run_end = idx + max(len(matched) - local_run, 1)
+            resolved_to = idx
+            for pos in range(idx, run_end):
+                block = self._remote_slices.pop(sub_hashes[pos], None)
+                if block is None and pos == idx and local_run < len(matched):
+                    block = matched[local_run][1]
+                if block is None:
+                    break
+                remote_slices[sub_hashes[pos]] = block
+                resolved_to = pos + 1
+            if resolved_to == idx:
+                # Not resident, not a peer's, not in storage: the entry the
+                # lookup promised is gone. Give back the pins taken so far and
+                # return an unpinned spec so submit_load_job fails the job
+                # cleanly and the blocks recompute.
+                if local_hashes:
+                    self._store.release(local_hashes)
+                logger.warning(
+                    "TPURaidenOffloadingConnector: prepare_load lost sub-block "
+                    "%d of %d for request %s to eviction; the load job will fail "
+                    "cleanly and the blocks recompute",
+                    idx + 1,
+                    len(sub_hashes),
+                    req_context.req_id,
+                )
+                return RaidenLoadStoreSpec(keys, pinned=False)
+            idx = resolved_to
+        self._pending_remote_slices.update(remote_slices)
+        return RaidenLoadStoreSpec(keys)
+
+    def unwind_prepared_load(self, spec: RaidenLoadStoreSpec) -> None:
+        """Gives back what a successful ``prepare_load`` took for ``spec``.
+
+        For a caller that prepared the load and will not submit it: one
+        release per local sub-hash, the pins that prepare took, and the peer
+        or storage slices it set aside. A pin another request holds on the
+        same entry is a count of its own and stays.
+        """
+        assert spec.pinned
+        local: list[bytes] = []
+        for sub_hash in self._expand_keys(spec.keys):
+            if self._pending_remote_slices.pop(sub_hash, None) is None:
+                local.append(sub_hash)
+        if local:
+            self._store.release(local)
+
+    def held_stats(self) -> tuple[int, int, int, float | None]:
+        """Keys held, keys stored and evicted since startup, and the store time
+        (``time.time()``) of the oldest held key. Needs ``track_held``."""
+        assert self._held is not None
+        with self._eviction_lock:
+            oldest = next(iter(self._held.values()), None)
+            return len(self._held), self._held_stored, self._held_evicted, oldest
+
+    def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
+        # The Raiden directory is the sole authority on what is stored: probe
+        # it per key, so a key whose entries were displaced from the LRU is
+        # re-offered here on its next appearance. A key is skipped only when
+        # its whole sub-hash chain is host-resident (HOST/HOST_AND_HBM) or
+        # cluster-resident (REMOTE — the data exists on a peer; no local
+        # re-store). A key found only in the storage tier (SHARED_STORAGE) is
+        # offered again on purpose. A storage read that lands also publishes
+        # the block into host DRAM, so a key still storage-only here is one
+        # that was recomputed — typically because its storage read failed —
+        # or whose recall found no host room. The save puts it back in host
+        # DRAM and rewrites the files, which also repairs a copy that could
+        # not be read.
+        if self.__dict__.get("_victim_mode", False):
+            # QWEN4_EXP_HOST_TIER_POLICY=victim: nothing is stored on compute.
+            # The caller's bookkeeping advances as for an all-resident batch;
+            # blocks reach the host only through prepare_victim_store, when
+            # HBM evicts them (offload/victim.py).
+            return PrepareStoreOutput(
+                keys_to_store=[], store_spec=RaidenLoadStoreSpec([]), evicted_keys=[]
+            )
+        keys_to_store = self._keys_needing_store(keys)
+        if len(keys_to_store) > self._capacity_keys:
+            return None
+        # Atomic admission happens at job-submit time via insert; in-flight
+        # tracking here only stops duplicate admission of the same key from a
+        # concurrent request.
+        self._inflight_store_keys.update(keys_to_store)
+        return PrepareStoreOutput(
+            keys_to_store=keys_to_store,
+            store_spec=RaidenLoadStoreSpec(keys_to_store),
+            evicted_keys=[],
+        )
+
+    def set_victim_mode(self, on: bool) -> None:
+        """Victim policy: prepare_store stores nothing; see prepare_victim_store."""
+        self.__dict__["_victim_mode"] = bool(on)
+
+    # -- exclusive restore (VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE) ---------------
+
+    def set_exclusive_restore(self, on: bool, defer: bool = False) -> None:
+        """Evict a landed load's local host entries (``defer``: on the parent
+        job's verdict, through ``excl_resolve``). Refuses a store without
+        ``evict``: a wheel that cannot evict must not run as if it did."""
+        if on and not hasattr(self._store, "evict"):
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_EXCLUSIVE "
+                "needs a Raiden build whose KVCacheStore has evict(); this one "
+                "does not"
+            )
+        self._excl = bool(on)
+        self._excl_defer = bool(on and defer)
+
+    def excl_resolve(self, job_id: int, success: bool) -> None:
+        """The parent load of a deferred child ended: evict on success; on
+        failure the host entries stay (the scheduler recomputes the job)."""
+        local = self._excl_deferred.pop(job_id, None)
+        if local is None:
+            return
+        if success:
+            self._excl_evict(local)
+        else:
+            self._excl_counts["abandoned"] += len(local)
+
+    def _excl_evict(self, sub_hashes: list[bytes]) -> None:
+        if not sub_hashes:
+            return
+        # Not under _eviction_lock: the store fires the eviction callback,
+        # which takes it, before evict returns.
+        self._excl_evicting = frozenset(sub_hashes)
+        try:
+            evicted = int(self._store.evict(list(sub_hashes)))
+        finally:
+            self._excl_evicting = frozenset()
+        counts = self._excl_counts
+        counts["calls"] += 1
+        counts["asked"] += len(sub_hashes)
+        counts["evicted"] += evicted
+
+    def _x2_staging_free_estimate(self) -> int | None:
+        """Free host blocks this store can stage a peer read through, estimated
+        from what this object tracks: capacity, minus the held keys' blocks, the
+        surviving blocks of partly evicted keys, the in-flight saves and the peer
+        reads still landing (each holds one staging block per sub-block until its
+        transfer resolves). None without track_held."""
+        if self._held is None:
+            return None
+        factor = self._device_block_size_factor
+        with self._eviction_lock:
+            held = len(self._held)
+            partial = sum(
+                factor - len(lost) for lost in self._evicted_sub_hashes.values()
+            )
+        staging = 0
+        for admission in self._admissions.values():
+            if admission.op == AdmissionOp.LOAD and admission.remote_sub_hashes:
+                staging += len(admission.remote_sub_hashes & admission.pending)
+        return (
+            self._capacity_keys * factor
+            - held * factor
+            - partial
+            - len(self._inflight_store_keys) * factor
+            - staging
+        )
+
+    def _x2_make_read_room(self, need: int, free: int) -> int:
+        """Evict this store's oldest held, unpinned entries until ``free`` plus the
+        evicted sub-blocks covers ``need`` (the read plus the margin), scanning at
+        most four times the keys that would take. The store skips pinned entries
+        (the load being launched pinned its local part), and the eviction callback
+        records these as discards: they go nowhere, so not as maybe-remote."""
+        if self._held is None or need <= free:
+            return 0
+        factor = self._device_block_size_factor
+        want_keys = -(-(need - free) // factor)
+        with self._eviction_lock:
+            candidates = []
+            for key in self._held:
+                candidates.append(key)
+                if len(candidates) >= 4 * want_keys:
+                    break
+        evicted = 0
+        pos = 0
+        while free + evicted < need and pos < len(candidates):
+            take = -(-(need - free - evicted) // factor)
+            batch = self._expand_keys(candidates[pos : pos + take])
+            pos += take
+            # Not under _eviction_lock: the store fires the callback, which
+            # takes it, before evict returns.
+            self._x2_room_evicting = frozenset(batch)
+            try:
+                evicted += int(self._store.evict(batch))
+            finally:
+                self._x2_room_evicting = frozenset()
+        self._x2_counts["read_room_evicted"] += evicted
+        return evicted
+
+    def excl_stats(self) -> dict[str, int]:
+        """Exclusive-restore counters, and the held keys it discarded."""
+        return dict(self._excl_counts, discarded=self._held_discarded)
+
+    def _keys_needing_store(self, keys) -> list[OffloadKey]:
+        """Keys not in flight and not wholly resident (host or a peer). The
+        probe pins then releases, so a resident key moves to the LRU's MRU
+        end, which is the victim policy's order for a key evicted again.
+
+        TIER-X2: a key the host pool misses is checked against the registry
+        only if this shard may have demoted it (``_x2_record``) and no recent
+        answer says it is absent; those keys share one batched registry lookup
+        (``_x2_cluster_resident``). One this shard's store node holds is
+        resident, not saved again."""
+        resident_statuses = (
+            self._block_status.HOST,
+            self._block_status.HOST_AND_HBM,
+            self._block_status.REMOTE,
+        )
+        x2 = self.__dict__.get("_x2", False)
+        decided: list[tuple[OffloadKey, bool | None]] = []  # None: ask the registry
+        probe: list[tuple[OffloadKey, list[bytes]]] = []
+        now = time.monotonic()
+        counts = self._x2_counts
+        for key in keys:
+            if key in self._inflight_store_keys:
+                continue
+            sub_hashes = self._sub_hashes(key)
+            matches = self._probe(sub_hashes)
+            if len(matches) == len(sub_hashes) and all(
+                block.status in resident_statuses for _, block in matches
+            ):
+                continue
+            if x2:
+                if not self._x2_maybe_remote(key):
+                    counts["store_probe_unrecorded"] += 1
+                else:
+                    until = self._x2_missed.get(key)
+                    if until is not None and until > now:
+                        counts["store_probe_neg_cached"] += 1
+                    else:
+                        probe.append((key, sub_hashes))
+                        decided.append((key, None))
+                        continue
+            decided.append((key, True))
+        resident = (
+            self._x2_cluster_resident(probe, resident_statuses) if probe else set()
+        )
+        return [
+            key
+            for key, store in decided
+            if store or (store is None and key not in resident)
+        ]
+
+    def _x2_maybe_remote(self, key: OffloadKey) -> bool:
+        with self._eviction_lock:
+            return key in self._x2_record
+
+    def _x2_note_maybe_remote(self, keys) -> None:
+        """Keys that may now be on this shard's store node: evicted from the host
+        pool (a demotion is an eviction here), or just read back from the node.
+        A remembered miss is void from here on. Caller holds _eviction_lock."""
+        record = self._x2_record
+        for key in keys:
+            record[key] = None
+            record.move_to_end(key)
+            self._x2_missed.pop(key, None)
+        while len(record) > self._x2_record_cap:
+            record.popitem(last=False)
+
+    def _x2_cluster_resident(
+        self, probe: list[tuple[OffloadKey, list[bytes]]], resident_statuses
+    ) -> set[OffloadKey]:
+        """TIER-X2: the keys of ``probe`` held here or on this shard's store node,
+        by the registry, in as few lookups as the answers allow. A lookup answers
+        every hash up to the first one neither the host pool nor the registry
+        resolves (interleaved lookup), so each call settles a run of keys and one
+        definite miss; the next call starts after the missed key. A key found
+        absent leaves the record (a later eviction is the only way it reaches the
+        node) and is remembered as a miss for x2_miss_ttl_s.
+
+        Such a key must not be saved again. Raiden's evict sweep keeps a node's
+        copy when the node already holds the hash (WriteRemote answers
+        WRITE_ALL_EXIST and the sweep frees the local copy), so a second save of
+        recomputed bytes would be dropped at its next demotion and a later peer
+        read would land the node's older bytes, not the bytes last saved (smoke
+        j-a44349b7). A local-only probe never sees a node's block."""
+        counts = self._x2_counts
+        flat: list[bytes] = []
+        owner: list[int] = []
+        for i, (_, sub_hashes) in enumerate(probe):
+            flat.extend(sub_hashes)
+            owner.extend([i] * len(sub_hashes))
+        good = [0] * len(probe)
+        absent: set[int] = set()
+        t0 = time.perf_counter()
+        pos = 0
+        while pos < len(flat):
+            matches = self._probe(flat[pos:], enable_global=True)
+            counts["store_probe_rpcs"] += 1
+            for j, (_, block) in enumerate(matches):
+                idx = owner[pos + j]
+                if block.status in resident_statuses:
+                    good[idx] += 1
+                else:
+                    absent.add(idx)
+            nxt = pos + len(matches)
+            if nxt >= len(flat):
+                break
+            missed = owner[nxt]
+            absent.add(missed)
+            while nxt < len(flat) and owner[nxt] == missed:
+                nxt += 1
+            pos = nxt
+        counts["store_probe_lookups"] += len(probe)
+        counts["store_probe_us"] += int((time.perf_counter() - t0) * 1e6)
+        resident: set[OffloadKey] = set()
+        now = time.monotonic()
+        for i, (key, sub_hashes) in enumerate(probe):
+            if i not in absent and good[i] == len(sub_hashes):
+                resident.add(key)
+                continue
+            with self._eviction_lock:
+                self._x2_record.pop(key, None)
+            if self._x2_miss_ttl_s > 0:
+                if len(self._x2_missed) >= _X2_MISSED_CAP:
+                    self._x2_missed.clear()
+                self._x2_missed[key] = now + self._x2_miss_ttl_s
+        counts["store_remote_skips"] += len(resident)
+        return resident
+
+    def prepare_victim_store(self, keys) -> list[OffloadKey]:
+        """Admission for blocks HBM is evicting (victim policy): the keys to
+        store now, marked in flight. At most the tier's capacity per call."""
+        keys_to_store = self._keys_needing_store(keys)[: self._capacity_keys]
+        self._inflight_store_keys.update(keys_to_store)
+        return keys_to_store
+
+    def _sub_hash_to_offload_key(
+        self, sub_hash: bytes
+    ) -> tuple[OffloadKey, int] | None:
+        """Helper to reverse a Raiden C++ sub_hash to (OffloadKey, sub_idx).
+
+        Structure of sub_hash:
+          [key_namespace] + [OffloadKey] + [4-byte sub_idx (big endian)]
+        """
+        ns_len = len(self._key_namespace)
+        if len(sub_hash) < ns_len + 5:
+            return None
+        if self._key_namespace and not sub_hash.startswith(self._key_namespace):
+            return None
+        key_bytes = sub_hash[ns_len:-4]
+        sub_idx = int.from_bytes(sub_hash[-4:], "big")
+        if sub_idx < 0 or sub_idx >= self._device_block_size_factor:
+            return None
+        return OffloadKey(key_bytes), sub_idx
+
+    def _on_eviction(self, evicted_hashes: list[bytes]) -> None:
+        """Callback invoked by Raiden C++ store upon host LRU cache eviction,
+        and by an exclusive-restore evict (counted as a discard)."""
+        discarding = self.__dict__.get("_excl_evicting", frozenset()) | self.__dict__.get(
+            "_x2_room_evicting", frozenset()
+        )
+        with self._eviction_lock:
+            for sub_hash in evicted_hashes:
+                parsed = self._sub_hash_to_offload_key(sub_hash)
+                if parsed is None:
+                    continue
+                key, sub_idx = parsed
+                if self.__dict__.get("_x2", False) and sub_hash not in discarding:
+                    # Evicted from the host pool, perhaps to this shard's node.
+                    # An exclusive-restore discard never goes there.
+                    self._x2_note_maybe_remote([key])
+                if self._held is not None and self._held.pop(key, None) is not None:
+                    if sub_hash in discarding:
+                        self._held_discarded += 1
+                    else:
+                        self._held_evicted += 1
+                sub_indices = self._evicted_sub_hashes.setdefault(key, set())
+                if not sub_indices:
+                    # Report eviction on the first sub-block loss: the logical
+                    # block is no longer intact or retrievable from host cache.
+                    self._evicted_keys_queue.append(key)
+                sub_indices.add(sub_idx)
+                if len(sub_indices) >= self._device_block_size_factor:
+                    self._evicted_sub_hashes.pop(key, None)
+
+    def take_events(self) -> list[OffloadingEvent]:
+        with self._eviction_lock:
+            if not self._evicted_keys_queue:
+                return []
+            evicted = list(self._evicted_keys_queue)
+            self._evicted_keys_queue.clear()
+
+        return [
+            OffloadingEvent(
+                keys=evicted,
+                medium=Medium.CPU,
+                removed=True,
+                locality=Locality.LOCAL,
+            )
+        ]
+
+    def on_schedule_end(self, context: ScheduleEndContext) -> None:
+        # Remote slices stashed by lookup() are consumed by prepare_load()
+        # within the same scheduler step. A hit that never reaches
+        # prepare_load (request aborted, or the scheduler declined it under
+        # HBM pressure) would otherwise leave its entries behind forever —
+        # and a stale slice popped by a later request could be handed to
+        # read_remote. Drop the leftovers each step; a request retried
+        # next step re-runs lookup() and repopulates the stash.
+        self._remote_slices.clear()
+
+    def reset_cache(self) -> None:
+        # Backstop only: TPURaidenOffloadingConnector.reset_cache() reports
+        # failure before the upstream scheduler reset can reach this hook.
+        # Kept as a raise (not the inherited silent no-op) so any future path
+        # that bypasses the connector override cannot falsely report success
+        # to POST /reset_prefix_cache?reset_external=true while the Raiden
+        # store continues serving cached entries.
+        raise NotImplementedError(
+            "TPURaidenOffloadingConnector: external cache reset is not supported "
+            "by the Raiden offload store."
+        )
+
+    def has_pending_work(self) -> bool:
+        return bool(self._admissions)
+
+    def shutdown(self) -> None:
+        # Unregister first: the callback runs on a Raiden-owned thread and
+        # must not fire into a half-torn-down manager while jobs drain. The
+        # binding takes a callable only (`set_eviction_callback(self,
+        # callback: object)` rejects None with a TypeError, which aborted the
+        # connector's shutdown before the drain), so swap in a no-op.
+        if self._supports_eviction_callback:
+            self._store.set_eviction_callback(_ignore_evictions)
+        if self._admissions:
+            self.drain_jobs(set(self._admissions.keys()))
+
+    # -- job submission bridge (called by the connector scheduler) --------
+
+    def submit_store_job(
+        self, job_id: int, keys: list[OffloadKey], device_block_ids: list[int]
+    ) -> None:
+        """Admit and launch a store job after all worker ranks acknowledge
+        the save fence.
+
+        Atomically admits the batch via insert (pinning pre-existing entries
+        in-place, reserving capacity, rolling back on failure), then a
+        post-admission lookup picks out the entries this admission inserted
+        and dispatches save() for exactly those; completion is tracked
+        asynchronously by the finalizer. A directory state that lookup cannot
+        account for fails the job closed (rollback + recompute).
+
+        TIER-X2: a shard saves only the keys it chose in ``prepare_store`` /
+        ``prepare_victim_store`` (the keys it put in flight). A sharded class
+        sends a key to every shard once any shard needs it; a shard that holds
+        the key here or on its store node must not save it again
+        (``_x2_cluster_resident``).
+        """
+        assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        if self.__dict__.get("_x2", False):
+            chosen = [i for i, key in enumerate(keys) if key in self._inflight_store_keys]
+            if len(chosen) < len(keys):
+                self._x2_counts["store_held_skips"] += len(keys) - len(chosen)
+                keys = [keys[i] for i in chosen]
+                device_block_ids = [device_block_ids[i] for i in chosen]
+            if not keys:
+                self._finished.append(
+                    FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True)
+                )
+                return
+        with self._eviction_lock:
+            for key in keys:
+                self._evicted_sub_hashes.pop(key, None)
+        sub_hashes = self._expand_keys(keys)
+        device_ids = self._expand_device_blocks(device_block_ids)
+        slices = [
+            self._block_id_cls(
+                raiden_id=self._raiden_id,
+                host_block_id=-1,
+                device_block_id=dev_id,
+                status=self._block_status.HBM,
+            )
+            for dev_id in device_ids
+        ]
+        if not self._store.insert(sub_hashes, slices, on_host=False):
+            # Atomically rolled back inside Raiden; no DMA save was issued.
+            logger.warning(
+                "TPURaidenOffloadingConnector: store job %d: insert rejected %d "
+                "sub-blocks (capacity pressure with pinned entries)",
+                job_id,
+                len(sub_hashes),
+            )
+            self._inflight_store_keys.difference_update(keys)
+            self._finished.append(
+                FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=False)
+            )
+            return
+        to_save = self._newly_inserted_sub_hashes(sub_hashes, device_ids)
+        if to_save is None:
+            # Broken invariant: unwind the admission and fail the job; the
+            # blocks recompute and the key is re-offered on its next miss.
+            self._store.release(sub_hashes)
+            self._inflight_store_keys.difference_update(keys)
+            self._finished.append(
+                FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=False)
+            )
+            return
+        if not to_save:
+            # All sub-hashes are already resident: unpin and finish successfully
+            # without issuing redundant DMA transfers.
+            self._store.release(sub_hashes)
+            self._inflight_store_keys.difference_update(keys)
+            self._finished.append(
+                FinishedJob(job_id=job_id, op=AdmissionOp.STORE, success=True)
+            )
+            return
+        if not self._store.save(to_save):
+            # Synchronous launch failure: finalize immediately to revert the
+            # admitted entries.
+            logger.error(
+                "TPURaidenOffloadingConnector: store job %d: save() launch failed "
+                "for %d sub-blocks",
+                job_id,
+                len(to_save),
+            )
+            self._finalize(
+                Admission(
+                    job_id=job_id,
+                    op=AdmissionOp.STORE,
+                    keys=keys,
+                    sub_hashes=sub_hashes,
+                    pending=set(),
+                    failed=True,
+                    failed_sub_hashes=list(to_save),
+                )
+            )
+            return
+        admission = Admission(
+            job_id=job_id,
+            op=AdmissionOp.STORE,
+            keys=keys,
+            sub_hashes=sub_hashes,
+            pending=set(to_save),
+            saved_sub_hashes=to_save,
+            retries_left=_SAVE_RETRIES,
+        )
+        self._admissions[job_id] = admission
+        for sub_hash in to_save:
+            self._hash_to_admission[sub_hash] = admission
+
+    def submit_load_job(
+        self,
+        job_id: int,
+        keys: list[OffloadKey],
+        device_block_ids: list[int],
+        req_id: str,
+        pinned: bool = True,
+    ) -> None:
+        """Launch a load job; entries were pinned in prepare_load."""
+        assert len(keys) == len(device_block_ids), (len(keys), len(device_block_ids))
+        if not pinned:
+            # prepare_load lost the pin race; nothing is held, so fail the
+            # job without touching the store and let vLLM recompute.
+            self._finished.append(
+                FinishedJob(
+                    job_id=job_id,
+                    op=AdmissionOp.LOAD,
+                    success=False,
+                    req_id=req_id,
+                    failed_device_block_ids=list(device_block_ids),
+                )
+            )
+            return
+        sub_hashes = self._expand_keys(keys)
+        device_ids = self._expand_device_blocks(device_block_ids)
+        # Partition by where prepare_load found each sub-hash: one that came
+        # with a peer or storage slice is read from there, everything else is
+        # pinned in the local host pool. The slice is the only record of a peer
+        # block — read_remote writes nothing to the local directory, so no live
+        # probe could rediscover it. Only the BYTES are non-local: every
+        # destination is one of this instance's HBM blocks. The two destination
+        # lists are disjoint subsequences of `device_ids`, each preserving its
+        # batch's hash-to-block pairing, because load() and read_remote() both
+        # require block_hashes[i] to line up with device_block_ids[i]. One
+        # read_remote call takes a peer's slices and storage slices together.
+        remote_hashes: list[bytes] = []
+        remote_slices: list[object] = []
+        dst_device_ids_for_remote: list[int] = []
+        local_hashes: list[bytes] = []
+        dst_device_ids_for_local: list[int] = []
+        for sub_hash, dev_id in zip(sub_hashes, device_ids):
+            block = self._pending_remote_slices.pop(sub_hash, None)
+            if block is not None:
+                remote_hashes.append(sub_hash)
+                remote_slices.append(block)
+                dst_device_ids_for_remote.append(dev_id)
+            else:
+                local_hashes.append(sub_hash)
+                dst_device_ids_for_local.append(dev_id)
+
+        room_short = False
+        if remote_hashes and self.__dict__.get("_x2", False):
+            # Read room: the peer read stages through this host pool.
+            need = len(remote_hashes)
+            free = self._x2_staging_free_estimate()
+            if free is not None and free < need:
+                self._x2_counts["read_room_short"] += 1
+                if self._x2_read_room:
+                    free += self._x2_make_read_room(
+                        need + self._x2_read_room_margin, free
+                    )
+                if free < need:
+                    room_short = True
+                    if self._x2_read_room:
+                        self._x2_counts["read_room_still_short"] += 1
+
+        def _fail_launch(
+            what: str, failed_hashes: list[bytes], in_flight: list[bytes]
+        ) -> None:
+            # failed_hashes is the batch whose launch failed.
+            logger.error(
+                "TPURaidenOffloadingConnector: load job %d (req %s): %s launch failed "
+                "(%d local, %d remote sub-blocks)",
+                job_id,
+                req_id,
+                what,
+                len(local_hashes),
+                len(remote_hashes),
+            )
+            admission = Admission(
+                job_id=job_id,
+                op=AdmissionOp.LOAD,
+                keys=keys,
+                sub_hashes=sub_hashes,
+                pending=set(in_flight),
+                failed=True,
+                req_id=req_id,
+                dst_device_block_ids=list(device_block_ids),
+                remote_sub_hashes=set(remote_hashes),
+                failed_sub_hashes=list(failed_hashes),
+                room_short=room_short,
+            )
+            if in_flight:
+                # The other launch already succeeded: the job must stay
+                # non-terminal until its transfer resolves, then the
+                # finalizer runs the failure cleanup exactly once.
+                self._admissions[job_id] = admission
+                for sub_hash in in_flight:
+                    self._hash_to_admission[sub_hash] = admission
+                return
+            # Nothing in flight: immediately terminal. The finalizer keeps
+            # HOST entries intact, deletes freshly installed REMOTE entries
+            # (landing blocks freed, the registry keeps the peer mapping),
+            # matching a polled failure.
+            self._finalize(admission)
+
+        if local_hashes and not self._store.load(
+            local_hashes, dst_device_ids_for_local
+        ):
+            _fail_launch("load()", local_hashes, [])
+            return
+        if remote_hashes and not self._store.read_remote(
+            remote_hashes, remote_slices, dst_device_ids_for_remote
+        ):
+            _fail_launch("read_remote()", remote_hashes, local_hashes)
+            return
+        if remote_hashes and self.__dict__.get("_x2", False):
+            self._x2_counts["remote_reads"] += 1
+            self._x2_counts["remote_read_blocks"] += len(remote_hashes)
+        admission = Admission(
+            job_id=job_id,
+            op=AdmissionOp.LOAD,
+            keys=keys,
+            sub_hashes=sub_hashes,
+            pending=set(sub_hashes),
+            req_id=req_id,
+            dst_device_block_ids=list(device_block_ids),
+            remote_sub_hashes=set(remote_hashes),
+            room_short=room_short,
+        )
+        self._admissions[job_id] = admission
+        for sub_hash in sub_hashes:
+            self._hash_to_admission[sub_hash] = admission
+
+    def on_store_job_cancelled(self, keys: list[OffloadKey]) -> None:
+        """A fence-pending (never admitted) store job was cancelled."""
+        self._inflight_store_keys.difference_update(keys)
+
+    def is_job_launched(self, job_id: int) -> bool:
+        """Whether a job has been admitted+launched and is not yet terminal."""
+        return job_id in self._admissions
+
+    # -- finalizer --------------------------------------------------------
+
+    def _finalize(self, admission: Admission) -> None:
+        # Launch failures finalize an admission that was never registered,
+        # so the pop tolerates absence; both paths share this one terminal
+        # transition (cleanup, finished-job report).
+        self._admissions.pop(admission.job_id, None)
+        for sub_hash in admission.sub_hashes:
+            self._hash_to_admission.pop(sub_hash, None)
+        success = not (admission.failed or admission.poisoned)
+        # Give back only what the job still holds. A transfer that landed
+        # already spent its pin and a peer read never took one, so the release
+        # covers the admitted entries no transfer accounted for: on a store,
+        # the sub-hashes that were pinned in place rather than saved; on any
+        # failure, the whole unspent remainder.
+        held = self._pins_still_held(admission)
+        if held:
+            self._store.release(held)
+        if admission.op == AdmissionOp.STORE:
+            self._inflight_store_keys.difference_update(admission.keys)
+            if success and self._held is not None:
+                now = time.time()
+                with self._eviction_lock:
+                    for key in admission.keys:
+                        if key not in self._held:
+                            self._held[key] = now
+                            self._held_stored += 1
+            saved = set(admission.saved_sub_hashes)
+            self._finished.append(
+                FinishedJob(
+                    job_id=admission.job_id,
+                    op=AdmissionOp.STORE,
+                    success=success,
+                    stored_keys=(
+                        [
+                            key
+                            for key in admission.keys
+                            if all(h in saved for h in self._sub_hashes(key))
+                        ]
+                        if success
+                        else []
+                    ),
+                )
+            )
+        else:
+            if success and admission.remote_sub_hashes and self.__dict__.get("_x2", False):
+                # Read back from the node: still there, and recently used.
+                read = []
+                for sub_hash in admission.remote_sub_hashes:
+                    parsed = self._sub_hash_to_offload_key(sub_hash)
+                    if parsed is not None:
+                        read.append(parsed[0])
+                with self._eviction_lock:
+                    self._x2_note_maybe_remote(read)
+            if admission.remote_sub_hashes and self.__dict__.get("_x2", False):
+                # Peer blocks whose read failed, and the ones that landed.
+                failed = len(
+                    admission.remote_sub_hashes.intersection(admission.failed_sub_hashes)
+                )
+                self._x2_counts["remote_read_blocks_failed"] += failed
+                if failed:
+                    self._x2_counts[
+                        "remote_failed_short" if admission.room_short else "remote_failed_roomy"
+                    ] += failed
+                self._x2_counts["remote_read_blocks_done"] += (
+                    len(admission.remote_sub_hashes) - failed
+                )
+            if success and self.__dict__.get("_excl", False):
+                # The bytes are in HBM now: the host copy only duplicates them.
+                # Peer and storage reads left no local entry to evict.
+                local = [
+                    h
+                    for h in admission.sub_hashes
+                    if h not in admission.remote_sub_hashes
+                ]
+                if self._excl_defer:
+                    self._excl_deferred[admission.job_id] = local
+                else:
+                    self._excl_evict(local)
+            self._finished.append(
+                FinishedJob(
+                    job_id=admission.job_id,
+                    op=AdmissionOp.LOAD,
+                    success=success,
+                    req_id=admission.req_id,
+                    failed_device_block_ids=(
+                        [] if success else list(admission.dst_device_block_ids)
+                    ),
+                )
+            )
+
+    def _poll_once(self) -> None:
+        if not self._admissions:
+            return
+        has_stores = any(
+            admission.op == AdmissionOp.STORE for admission in self._admissions.values()
+        )
+        has_loads = any(
+            admission.op == AdmissionOp.LOAD
+            and any(
+                sub_hash not in admission.remote_sub_hashes
+                for sub_hash in admission.pending
+            )
+            for admission in self._admissions.values()
+        )
+        has_remote = any(
+            admission.op == AdmissionOp.LOAD
+            and any(
+                sub_hash in admission.remote_sub_hashes
+                for sub_hash in admission.pending
+            )
+            for admission in self._admissions.values()
+        )
+        results: list[tuple[list[bytes], list[bytes]]] = []
+        if has_stores:
+            # Save polls carry two extra lists that annotate why a REMOTE save
+            # failed; a hash in either is already in `failed`, and both are
+            # empty for the local saves this connector issues.
+            done, failed, _pending, _existing, _unregistered = (
+                self._store.poll_save_status()
+            )
+            results.append((done, failed))
+        if has_loads:
+            done, failed, _pending = self._store.poll_load_status()
+            results.append((done, failed))
+        if has_remote:
+            done, failed, _pending = self._store.poll_remote_read_status()
+            results.append((done, failed))
+        # Keyed by job_id: a mixed batch whose last hashes resolve in the
+        # same poll (some done, some failed) must finalize exactly once.
+        newly_terminal: dict[int, Admission] = {}
+        for done, failed in results:
+            for sub_hash in failed:
+                admission = self._hash_to_admission.get(sub_hash)
+                if admission is None:
+                    continue
+                admission.failed = True
+                admission.failed_sub_hashes.append(sub_hash)
+                admission.pending.discard(sub_hash)
+                if not admission.pending:
+                    newly_terminal[admission.job_id] = admission
+            for sub_hash in done:
+                admission = self._hash_to_admission.get(sub_hash)
+                if admission is None:
+                    continue
+                if sub_hash not in admission.remote_sub_hashes:
+                    # A save or a local load that landed spends the pin the
+                    # job was holding for that sub-hash.
+                    admission.consumed_sub_hashes.add(sub_hash)
+                admission.pending.discard(sub_hash)
+                if not admission.pending:
+                    newly_terminal[admission.job_id] = admission
+        for admission in newly_terminal.values():
+            if self._maybe_retry_save(admission):
+                continue
+            self._finalize(admission)
+
+    def _maybe_retry_save(self, admission: Admission) -> bool:
+        """Re-issue the failed subset of a store job's save, at most
+        `retries_left` times.
+
+        Safe because a failed save leaves its entries HBM + pinned with the
+        host slot freed, and the job stays non-terminal so the connector's
+        pending-job gate keeps the source device blocks retained. Committed
+        sub-hashes are not re-saved. drain_jobs zeroes retries_left first —
+        after a flush the source blocks are about to be reused, so a retry
+        would read garbage.
+
+        With a storage tier the failed save also drops the entries' pin, so
+        the store refuses the retry's save() and the job fails the way it
+        would once out of retries.
+        """
+        if (
+            admission.op != AdmissionOp.STORE
+            or not admission.failed
+            or admission.retries_left <= 0
+        ):
+            return False
+        retry_hashes = admission.failed_sub_hashes
+        admission.retries_left -= 1
+        if not self._store.save(retry_hashes):
+            logger.error(
+                "TPURaidenOffloadingConnector: store job %d: save() retry launch "
+                "failed for %d sub-blocks; job fails",
+                admission.job_id,
+                len(retry_hashes),
+            )
+            return False
+        logger.warning(
+            "TPURaidenOffloadingConnector: store job %d: retrying save of %d failed "
+            "sub-blocks (%d retries left)",
+            admission.job_id,
+            len(retry_hashes),
+            admission.retries_left,
+        )
+        admission.pending = set(retry_hashes)
+        admission.failed_sub_hashes = []
+        admission.failed = False
+        return True
+
+    def poll_finished_jobs(self) -> list[FinishedJob]:
+        """Poll raiden completion and return newly terminal jobs."""
+        self._poll_once()
+        finished = self._finished
+        self._finished = []
+        return finished
+
+    def drain_jobs(
+        self, job_ids: set[int], deadline: float | None = None
+    ) -> list[FinishedJob]:
+        """Drain in-flight DMA transfers to safely reclaim HBM blocks before reuse.
+
+        Synchronously waits until the specified launched jobs complete (bounded
+        by timeout) so active transfers finish before subsequent forward passes
+        overwrite the source memory, preventing torn reads and cache corruption.
+
+        On timeout, in-flight admissions are marked as poisoned rather than
+        blocking indefinitely. Because Raiden lacks an abort API, poisoned jobs
+        remain live until hardware completion, but the finalizer treats them as
+        terminal failures to prevent committing corrupted/torn bytes from reused
+        blocks. Poisoned jobs are considered drained on subsequent calls.
+
+        ``deadline`` (a ``time.perf_counter()`` value) replaces the timeout,
+        so several managers can drain against one bound.
+        """
+        # Suppress retries for draining jobs: source blocks are being reclaimed,
+        # so subsequent reads would transfer invalid/overwritten data.
+        for job_id in job_ids:
+            admission = self._admissions.get(job_id)
+            if admission is not None:
+                admission.retries_left = 0
+        if deadline is None:
+            deadline = time.perf_counter() + _DRAIN_TIMEOUT_S
+        drained: list[FinishedJob] = []
+        while True:
+            self._poll_once()
+            drained.extend(f for f in self._finished if f.job_id in job_ids)
+            self._finished = [f for f in self._finished if f.job_id not in job_ids]
+            live = [
+                job_id
+                for job_id in job_ids
+                if job_id in self._admissions and not self._admissions[job_id].poisoned
+            ]
+            if not live:
+                return drained
+            if time.perf_counter() >= deadline:
+                for job_id in live:
+                    self._admissions[job_id].poisoned = True
+                logger.error(
+                    "TPURaidenOffloadingConnector: drain timed out after %.1fs; "
+                    "poisoned jobs %s (%d keys): their transfers are still in flight "
+                    "while their blocks are reused, so they will finalize "
+                    "as failures and uncommitted entries revert",
+                    _DRAIN_TIMEOUT_S,
+                    sorted(live),
+                    sum(len(self._admissions[job_id].keys) for job_id in live),
+                )
+                return drained
+            time.sleep(0.0005)
+
+
+def derive_offload_namespace(
+    vllm_config: VllmConfig,
+    *,
+    kernel_block_size: int,
+    per_block_shape: tuple[int, ...] | set[tuple[int, ...]],
+    kv_dtype: object,
+    device_block_size: int,
+    world_size: int,
+    num_kv_cache_groups: int,
+    num_kv_cache_tensors: int,
+    cp_geometry: tuple[int, ...] = (),
+    block_major_contract: BlockMajorContract | None = None,
+) -> bytes:
+    """Derive a deterministic compatibility namespace prefixed to every store and
+    registry key.
+
+    Ensures cache keys never collide across incompatible engine deployments by
+    hashing all configuration parameters that alter binary KV cache layout:
+    - Model identity: model name, revision, quantization.
+    - KV cache geometry: KV data type, kernel block size, per-block tensor shape,
+      device block size, and cache group/tensor counts.
+    - Distributed topology: world size (TP/PP) and context parallelism geometry
+      (pcp_size, dcp_size, interleave_size) which alters rank-local token placement.
+    - Hash scheme: prefix caching algorithm and namespace version salt.
+    - Layout contract: block-major layout version, row bytes, and logical fingerprint.
+
+    Returns:
+        A 16-byte SHA-256 digest unique to this engine and layout configuration.
+    """
+    model_config = vllm_config.model_config
+    # A multi-shape layout hands over sets, whose iteration order is not
+    # stable across processes -- `torch.dtype` hashes by identity, so
+    # `repr({torch.uint8, torch.bfloat16})` differs between runs. Canonicalize
+    # to sorted tuples: the namespace must be a pure function of the config,
+    # or every restart re-salts the registry keys.
+    shape_field: object = (
+        tuple(sorted(per_block_shape))
+        if isinstance(per_block_shape, (set, frozenset))
+        else per_block_shape
+    )
+    dtype_field: object = (
+        tuple(sorted(str(d) for d in kv_dtype))
+        if isinstance(kv_dtype, (set, frozenset))
+        else str(kv_dtype)
+    )
+    material_fields = (
+        model_config.model,
+        model_config.revision,
+        model_config.quantization,
+        dtype_field,
+        kernel_block_size,
+        shape_field,
+        device_block_size,
+        world_size,
+        num_kv_cache_groups,
+        num_kv_cache_tensors,
+        vllm_config.cache_config.prefix_caching_hash_algo,
+        "tpu-raiden-offload-ns1",
+    ) + cp_geometry
+    if block_major_contract is not None:
+        # Block-major layout bundles per-block bytes across layers; salt the namespace
+        # with the layout fingerprint to isolate cache entries and prevent collisions
+        # with layer-major or incompatible bundle geometries.
+        material_fields += (
+            "tpu-raiden-offload-ns2-block-major",
+            block_major_contract.fragment_count,
+            block_major_contract.bundle_row_bytes,
+            block_major_contract.logical_fingerprint,
+        )
+    material = repr(material_fields)
+    return hashlib.sha256(material.encode()).digest()[:16]
+
+
+def is_multi_shapes_geometry(per_block_shape: object) -> bool:
+    """True when `resolve_kernel_geometry` resolved a multi-shape KV layout.
+
+    A multi-shape layout answers with the *set* of its per-block shapes
+    rather than one shape.
+    """
+    return isinstance(per_block_shape, (set, frozenset))
+
+
+def _resolve_multi_shapes_kv_geometry(
+    kv_cache_config: KVCacheConfig,
+) -> tuple[int, set[tuple[int, ...]], set[object], int]:
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+
+    groups = kv_cache_config.kv_cache_groups
+    for group in groups:
+        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec):
+            assert isinstance(leaf, (MLAAttentionSpec, SlidingWindowMLASpec)), (
+                "TPURaidenOffloadingConnector: an aliased KV "
+                "layout has only MLA-family layers; got "
+                f"{type(leaf).__name__}"
+            )
+
+    mla_leaves = [
+        leaf
+        for group in groups
+        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec)
+        if isinstance(leaf, MLAAttentionSpec)
+    ]
+    assert mla_leaves
+    anchor_block_sizes = sorted({leaf.block_size for leaf in mla_leaves})
+    assert len(anchor_block_sizes) == 1
+    block_size = anchor_block_sizes[0]
+
+    # One entry per full-attention MLA cache.
+    per_block_shapes: set[tuple[int, ...]] = set()
+    kv_dtypes: set[object] = set()
+    for leaf in mla_leaves:
+        shape = (leaf.num_states, leaf.num_kv_heads, leaf.head_size)
+        per_block_shapes.add(shape)
+        kv_dtypes.add(leaf.dtype)
+    return block_size, per_block_shapes, kv_dtypes, block_size
+
+
+def resolve_attention_geometry(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> tuple[AttentionSpec, int, tuple[int, ...]]:
+    """Resolves the attention KV cache geometry from `VllmConfig` and `KVCacheConfig`.
+
+    Returns `(attention_spec, kernel_block_size, per_block_shape)`.
+
+    Supported architectures:
+    - Dense models: Defined directly by the single group's full-attention spec.
+    - Hybrid (Attention + Mamba) models: Requires TPU's unified block pool, where all
+      groups share uniform, attention-sized page rows. Attention geometry defines the
+      common row unit, allowing the dense sub-hash expansion to apply uniformly.
+    Multi-kv-shape models are handled by `resolve_kernel_geometry`.
+    """
+    from vllm.v1.kv_cache_interface import AttentionSpec
+    from vllm.v1.worker.utils import select_common_block_size
+
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    groups = kv_cache_config.kv_cache_groups
+    assert groups, "TPURaidenOffloadingConnector: no KV cache groups"
+
+    if len(groups) == 1:
+        spec0 = groups[0].kv_cache_spec
+        assert isinstance(spec0, FullAttentionSpec), (
+            "TPURaidenOffloadingConnector: single-group models must be full-attention; "
+            f"got {type(spec0).__name__}"
+        )
+    else:
+        # In hybrid models, group 0 may be a Mamba layer; filter for attention groups.
+        from vllm_torchtpu.platforms.tpu_block_size_utils import (
+            unified_kv_layout_enabled,
+        )
+
+        assert unified_kv_layout_enabled(vllm_config), (
+            "TPURaidenOffloadingConnector: hybrid models require the unified "
+            "block pool (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1)"
+        )
+        attn_specs = [
+            g.kv_cache_spec
+            for g in groups
+            if isinstance(g.kv_cache_spec, AttentionSpec)
+        ]
+        assert attn_specs, (
+            "TPURaidenOffloadingConnector: hybrid model has no attention KV group"
+        )
+        spec0 = attn_specs[0]
+        assert all(
+            (s.block_size, s.num_kv_heads, s.head_size, s.dtype, s.page_size_bytes)
+            == (
+                spec0.block_size,
+                spec0.num_kv_heads,
+                spec0.head_size,
+                spec0.dtype,
+                spec0.page_size_bytes,
+            )
+            for s in attn_specs
+        ), "TPURaidenOffloadingConnector: attention groups disagree on geometry"
+        # Ensure all groups share the unified pool's padded page size.
+        assert all(
+            g.kv_cache_spec.page_size_bytes == spec0.page_size_bytes for g in groups
+        ), (
+            "TPURaidenOffloadingConnector: unified pool groups must share one "
+            "padded page size"
+        )
+
+    from vllm.config import set_current_vllm_config
+
+    attn_backend = TpuPlatform._find_non_ssm_backend(vllm_config)
+    if attn_backend is None:
+        # In the EngineCore process, the model is not instantiated, so
+        # _find_non_ssm_backend returns None. Resolve the attention backend
+        # directly via get_attn_backend using the model configuration.
+        from vllm.v1.attention.selector import get_attn_backend
+
+        model_config = vllm_config.model_config
+        with set_current_vllm_config(vllm_config):
+            attn_backend = get_attn_backend(
+                head_size=model_config.get_head_size(),
+                dtype=cast("torch.dtype", model_config.dtype),
+                kv_cache_dtype=vllm_config.cache_config.cache_dtype,
+                use_mla=model_config.use_mla,
+            )
+    assert attn_backend is not None, (
+        "TPURaidenOffloadingConnector: requires a non-SSM attention backend"
+    )
+    assert not attn_backend.is_ssm(), (
+        "TPURaidenOffloadingConnector: resolved attention backend is SSM: "
+        f"{attn_backend.get_name()}"
+    )
+    # Both calls resolve the KV cache layout, which falls through to the KV
+    # connector and so needs a current config.
+    with set_current_vllm_config(vllm_config):
+        kernel_block_size = select_common_block_size(spec0.block_size, [attn_backend])
+        full_5d_shape = attn_backend.get_kv_cache_shape(
+            num_blocks=1,
+            block_size=kernel_block_size,
+            num_kv_heads=spec0.num_kv_heads,
+            head_size=spec0.head_size,
+            cache_dtype_str=spec0.dtype,
+        )
+    per_block_shape = tuple(full_5d_shape[1:])
+    return spec0, kernel_block_size, per_block_shape
+
+
+def resolve_kernel_geometry(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> tuple[int, tuple[int, ...] | set[tuple[int, ...]], object, int]:
+    """Resolve physical TPU kernel geometry:
+    (kernel_block_size, per_block_shape, kv_dtype, device_block_size).
+
+    Shared between the scheduler (capacity sizing, sub-hash factor) and worker ranks
+    (device view reconstruction) to guarantee exact geometry parity.
+    """
+    model_geometry = resolve_model_owned_pool_geometry(vllm_config, kv_cache_config)
+    if model_geometry is not None:
+        return model_geometry
+    if has_multi_shapes_kv_caches(vllm_config):
+        return _resolve_multi_shapes_kv_geometry(kv_cache_config)
+    spec0, kernel_block_size, per_block_shape = resolve_attention_geometry(
+        vllm_config, kv_cache_config
+    )
+    if unified_block_major_enabled(vllm_config):
+        # Register the block-major unified pool at scheduler-block granularity:
+        # each Raiden block corresponds to one manager block containing `split`
+        # kernel blocks per region so each block transfers as a single DMA.
+        from vllm_torchtpu.kv_cache_materializer import resolve_block_major_pool_layout
+
+        layout = resolve_block_major_pool_layout(kv_cache_config, kernel_block_size)
+        return (
+            spec0.block_size,
+            (layout.split,) + per_block_shape,
+            spec0.dtype,
+            spec0.block_size,
+        )
+    return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
+
+
+class RaidenStoreOffloadingWorker(OffloadingWorker):
+    """Worker-side endpoint that registers local TPU HBM device buffers with
+    the Controller.
+
+    Acts as a passive DMA target for controller-driven transfers. Offload jobs are
+    managed centrally by the controller and never dispatched to workers directly;
+    the worker submit hooks assert fail loudly if invoked.
+
+    Registration is eager but asynchronous: worker initialization occurs
+    before the scheduler creates the controller server, so a background
+    thread probes the controller endpoint and registers as soon as it is
+    reachable — normally while engine init is still loading/compiling, which
+    keeps the host-pool allocation and registration RPCs off the first
+    request's critical path. The scheduler side blocks KVCacheStore
+    construction on all ranks registering, so a rank that cannot register
+    fails engine startup when that barrier times out — and conversely, no
+    inference step can ever run unregistered, so there is no per-step
+    registration hook.
+    """
+
+    def __init__(
+        self,
+        kv_caches: CanonicalKVCaches,
+        *,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+        host_blocks_to_allocate: int,
+        controller_address: str,
+        rank: int,
+        block_major_contract: BlockMajorContract | None = None,
+        # This rank's storage-tier config, from
+        # `build_worker_storage_backend_config`. Empty registers no storage
+        # backend, which is right only when the store has no storage tier:
+        # with one, every save needs every worker to write its shard.
+        backend_configs: Sequence[object] = (),
+        # Register each region as rows of this many bytes instead of whole
+        # pages (a host-tier class that keeps a page's leading bytes only).
+        row_bytes: int | None = None,
+        # Names the registration thread and log lines (a host-tier class).
+        label: str = "",
+        # The node id this worker registers under (the rank when None). A TIER-X2
+        # shard numbers its workers densely, as Raiden's transfer spec wants.
+        node_id: int | None = None,
+    ):
+        import numpy as np
+        import torch
+
+        # Set before either branch below starts the registration thread.
+        self._backend_configs = list(backend_configs)
+        self._label = label
+        self._row_bytes = row_bytes
+        self._node_id = node_id
+
+        (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
+            resolve_kernel_geometry(vllm_config, kv_cache_config)
+        )
+        assert device_block_size % kernel_block_size == 0
+        device_block_size_factor = device_block_size // kernel_block_size
+
+        if row_bytes is not None:
+            # Each region as a view of finer rows over its whole storage, at
+            # offset 0: row r is bytes [r * row_bytes, (r + 1) * row_bytes).
+            assert block_major_contract is None and device_block_size_factor == 1
+            assert isinstance(kv_dtype, torch.dtype)
+            itemsize = torch.empty(0, dtype=kv_dtype).element_size()
+            assert row_bytes % itemsize == 0, (row_bytes, itemsize)
+            row_tensors: list[torch.Tensor] = []
+            for kv_cache_tensor in kv_caches.tensors:
+                int8_view = kv_cache_tensor.tensor
+                page = kv_cache_tensor.page_size_bytes
+                assert page % row_bytes == 0, (page, row_bytes)
+                storage_bytes = int8_view.numel() * int8_view.element_size()
+                assert storage_bytes == int8_view.shape[0] * page, (
+                    storage_bytes,
+                    int8_view.shape[0],
+                    page,
+                )
+                row_tensors.append(
+                    torch.empty(0, dtype=kv_dtype, device=int8_view.device)
+                    .set_(int8_view.untyped_storage())
+                    .view(storage_bytes // row_bytes, row_bytes // itemsize)
+                )
+            self._init_registration(
+                row_tensors, host_blocks_to_allocate, controller_address, rank
+            )
+            return
+
+        if is_multi_shapes_geometry(per_block_shape):
+            # Branch for models whose kv cache consists of multiple tensors
+            # with different shapes. The resolved shapes describe those
+            # arrays but do not tile a common row, so registration walks the
+            # canonical tensors instead of computing bytes per kernel block.
+            assert block_major_contract is None, (
+                "block-major bundling not yet implemented for this code path"
+            )
+            assert device_block_size_factor == 1
+            device_tensors: list[torch.Tensor] = []
+            for kv_cache_tensor in kv_caches.tensors:
+                int8_view = kv_cache_tensor.tensor
+                page_size_bytes = kv_cache_tensor.page_size_bytes
+                storage_bytes = int8_view.numel() * int8_view.element_size()
+                assert storage_bytes == int8_view.shape[0] * page_size_bytes, (
+                    "canonical KV array is not whole pages: "
+                    f"storage_bytes={storage_bytes}, "
+                    f"rows={int8_view.shape[0]}, page={page_size_bytes}"
+                )
+                device_tensors.append(int8_view)
+            self._init_registration(
+                device_tensors, host_blocks_to_allocate, controller_address, rank
+            )
+            return
+
+        assert isinstance(per_block_shape, tuple)
+        assert isinstance(kv_dtype, torch.dtype)
+        bytes_per_kernel_block = (
+            int(np.prod(per_block_shape))
+            * torch.empty(0, dtype=kv_dtype).element_size()
+        )
+
+        if block_major_contract is not None:
+            # Block-major registration: Register the entire multi-layer bundle as a
+            # single canonical storage ([kernel_blocks, F, *R]). Raiden views the bundle
+            # as 1 block array, executing 1 hardware DMA per block transfer rather than
+            # F DMAs.
+            #
+            # Safety invariants:
+            # - Consistent row geometry: Validates that fragment_row_bytes matches
+            #   physical row bytes.
+            # - Deployment protection: Layer-major peers registering fragment_row_bytes
+            #   are rejected by Raiden's block_array_bytes consistency check against
+            #   our bundle_row_bytes.
+            assert block_major_contract.fragment_row_bytes == bytes_per_kernel_block, (
+                "block-major contract kernel-row bytes "
+                f"{block_major_contract.fragment_row_bytes} != "
+                f"resolved geometry {bytes_per_kernel_block}"
+            )
+            assert len(kv_caches.tensors) == 1, (
+                "block-major requires the device bundle to be one canonical "
+                f"storage; got {len(kv_caches.tensors)} — the runner did not "
+                "materialize the [kernel_blocks, F, *R] bundle"
+            )
+            per_block_shape = (block_major_contract.fragment_count,) + per_block_shape
+            bytes_per_kernel_block = block_major_contract.bundle_row_bytes
+
+        # Rebuild typed tensor views shaped by physical kernel blocks from the
+        # underlying storage, ensuring leading dimensions match DMA tile layouts.
+        device_tensors: list[torch.Tensor] = []
+        for kv_cache_tensor in kv_caches.tensors:
+            # Verify that one canonical scheduler page equals exactly
+            # device_block_size_factor physical kernel rows. For hybrid models
+            # using the unified pool, this confirms that all group pages are
+            # uniformly padded and fungible across pool rows.
+            assert kv_cache_tensor.page_size_bytes == (
+                device_block_size_factor * bytes_per_kernel_block
+            ), (
+                "canonical page size does not match the kernel-row "
+                f"geometry: page={kv_cache_tensor.page_size_bytes}, "
+                f"factor={device_block_size_factor}, "
+                f"kernel_row_bytes={bytes_per_kernel_block}"
+            )
+            int8_view = kv_cache_tensor.tensor
+            storage_bytes = int8_view.numel() * int8_view.element_size()
+            assert storage_bytes % bytes_per_kernel_block == 0, (
+                "KV cache storage must contain whole physical kernel blocks:"
+                f" storage_bytes={storage_bytes}, "
+                f"bytes_per_kernel_block={bytes_per_kernel_block}"
+            )
+            num_kernel_blocks = storage_bytes // bytes_per_kernel_block
+            assert num_kernel_blocks == (
+                int8_view.shape[0] * device_block_size_factor
+            ), (
+                "canonical KV cache geometry does not match physical "
+                f"kernel-block geometry: canonical={int8_view.shape[0]}, "
+                f"factor={device_block_size_factor}, "
+                f"kernel_blocks={num_kernel_blocks}"
+            )
+            device_tensors.append(
+                torch.empty(0, dtype=kv_dtype, device=int8_view.device)
+                .set_(int8_view.untyped_storage())
+                .view((num_kernel_blocks,) + per_block_shape)
+            )
+
+        self._init_registration(
+            device_tensors, host_blocks_to_allocate, controller_address, rank
+        )
+
+    def _init_registration(
+        self,
+        device_tensors: list[torch.Tensor],
+        host_blocks_to_allocate: int,
+        controller_address: str,
+        rank: int,
+    ) -> None:
+        # Hold strong references to ensure PyTorch tensors remain allocated
+        # while Raiden C++ retains raw pointers to their underlying storage.
+        self._device_tensors = [[t] for t in device_tensors]
+        self._host_blocks_to_allocate = host_blocks_to_allocate
+        self._controller_address = controller_address
+        self._rank = rank
+        self._mgr = None
+        self._stop_registration = threading.Event()
+        self._register_thread = threading.Thread(
+            target=self._register_loop,
+            name=f"raiden-offload-register-rank{rank}"
+            + (f"-{self._label}" if self._label else ""),
+            daemon=True,
+        )
+        self._register_thread.start()
+
+    def _controller_reachable(self) -> bool:
+        """TCP-probe the controller endpoint (a listening server is a
+        precondition for registering, not proof of registration)."""
+        host, _, port = self._controller_address.rpartition(":")
+        host = host.strip("[]")
+        try:
+            with socket.create_connection((host, int(port)), timeout=1.0):
+                return True
+        except OSError:
+            return False
+
+    def _register_loop(self) -> None:
+        """Background registration: wait for the controller server to come up
+        (it is created scheduler-side after this worker), then register.
+
+        Retries with backoff until it succeeds or shutdown() stops it. The
+        verdict lives scheduler-side: KVCacheStore construction blocks until
+        every rank has registered and fails engine startup on timeout, so
+        this loop only has to keep trying, never to give up or escalate.
+        """
+        delay = 0.5
+        next_note = time.monotonic() + 30.0
+        while not self._stop_registration.is_set():
+            if self._controller_reachable():
+                try:
+                    from tpu_sync.api.torch import kv_cache_manager as _kcm
+
+                    # Registers the storage backend this rank writes its
+                    # shards through; omitted when there is no storage tier.
+                    # Any, not the inferred list type: a type checker matches
+                    # an unpacked dict's value type against every keyword
+                    # parameter the call does not pass explicitly.
+                    storage_kwargs: dict[str, Any] = (
+                        {"backend_configs": self._backend_configs}
+                        if self._backend_configs
+                        else {}
+                    )
+                    self._mgr = _kcm.KVCacheManager(
+                        kv_caches=self._device_tensors,
+                        local_control_port=0,
+                        host_blocks_to_allocate=self._host_blocks_to_allocate,
+                        raiden_worker_port=0,
+                        raiden_controller_address=self._controller_address,
+                        worker_id=f"shard_{self._rank}",
+                        node_id=(
+                            self._rank
+                            if self.__dict__.get("_node_id") is None
+                            else self._node_id
+                        ),
+                        **storage_kwargs,
+                    )
+                    logger.info(
+                        "TPURaidenOffloadingConnector: rank %d registered with offload "
+                        "controller at %s (%d host kernel blocks%s%s)",
+                        self._rank,
+                        self._controller_address,
+                        self._host_blocks_to_allocate,
+                        ", storage tier on" if self._backend_configs else "",
+                        f", tier class {self._label}" if self._label else "",
+                    )
+                    return
+                except Exception as exc:
+                    if (
+                        self._row_bytes is not None
+                        and "leading (block) dimension" in str(exc)
+                    ):
+                        # The installed Raiden refuses a view of finer rows
+                        # than the base buffer's. Retrying cannot help; the
+                        # class store's registration barrier fails startup.
+                        logger.error(
+                            "TPURaidenOffloadingConnector: rank %d: the installed "
+                            "Raiden refuses the %s class's view of %d-byte rows "
+                            "(%s). VLLM_TPU_OFFLOAD_TIER_KEY_ROWS needs a Raiden "
+                            "build that accepts a leading dimension that is a "
+                            "whole multiple of the base buffer's; startup fails "
+                            "at the class store's registration barrier.",
+                            self._rank,
+                            self._label,
+                            self._row_bytes,
+                            exc,
+                        )
+                        return
+                    # A persistent failure escalates via the
+                    # scheduler's construction barrier timeout.
+                    logger.warning(
+                        "TPURaidenOffloadingConnector: rank %d: background "
+                        "registration attempt failed; retrying in %.1fs",
+                        self._rank,
+                        delay,
+                        exc_info=True,
+                    )
+            elif time.monotonic() >= next_note:
+                # The unreachable case produces no exception to log, so this
+                # throttled note is its only signal (and names the probed
+                # address, the thing a misconfigured recipe gets wrong).
+                logger.warning(
+                    "TPURaidenOffloadingConnector: rank %d: offload controller at %s "
+                    "not reachable yet; still probing (the scheduler's "
+                    "registration barrier will fail engine startup if "
+                    "registration does not succeed in time)",
+                    self._rank,
+                    self._controller_address,
+                )
+                next_note = time.monotonic() + 30.0
+            self._stop_registration.wait(delay)
+            delay = min(delay * 2, 5.0)
+
+    def submit_store(self, job_id, src_spec, dst_spec) -> bool:
+        raise AssertionError(
+            "TPURaidenOffloadingConnector: submit_store reached a worker; "
+            "transfers are controller-driven and jobs must be stripped scheduler-side"
+        )
+
+    def submit_load(self, job_id, src_spec, dst_spec) -> bool:
+        raise AssertionError(
+            "TPURaidenOffloadingConnector: submit_load reached a worker; transfers are "
+            "controller-driven and jobs must be stripped scheduler-side"
+        )
+
+    def get_finished(self) -> list[TransferResult]:
+        return []
+
+    def wait(self, job_ids: set[int]) -> None:
+        # No-op on workers: jobs are drained centrally on the controller.
+        return
+
+    def shutdown(self) -> None:
+        self._stop_registration.set()
+        self._register_thread.join(timeout=5.0)
+        self._mgr = None
+
+
+# -- storage tier ---------------------------------------------------------------
+
+# kv_connector_extra_config keys for the storage tier. A non-empty value wins
+# over the environment variable named by the key in upper case, where there is
+# one; raiden_storage_properties and RAIDEN_STORAGE_PROPERTIES merge key by key.
+_STORAGE_PATH_KEY = "raiden_storage_path"
+_STORAGE_TYPE_KEY = "raiden_storage_type"
+_STORAGE_CAPACITY_GB_KEY = "raiden_storage_capacity_gb"
+_STORAGE_MODEL_NAME_KEY = "raiden_storage_model_name"
+_STORAGE_PROPERTIES_KEY = "raiden_storage_properties"
+# Experimental, for testing only: see resolve_storage_config.
+_STORAGE_SKIP_PARALLELISM_CHECK_KEY = (
+    "experimental_raiden_storage_skip_parallelism_check"
+)
+
+# The only storage backend type raiden accepts today.
+_POSIX_STORAGE_TYPE = "posix"
+
+# Backend properties the connector sets itself, mapped to where each comes
+# from. The pass-through properties may not set them, so each has one source.
+_MANAGED_STORAGE_PROPERTIES = {
+    "root_dir": f"{_STORAGE_PATH_KEY} / RAIDEN_STORAGE_PATH",
+    "model_name": _STORAGE_MODEL_NAME_KEY,
+    "capacity_bytes": f"{_STORAGE_CAPACITY_GB_KEY} / RAIDEN_STORAGE_CAPACITY_GB",
+    "tp_size": "the parallel config",
+    "tp_rank": "the parallel config",
+    "pcp_size": "the parallel config",
+    "pcp_rank": "the parallel config",
+    "pp_size": "the parallel config",
+    "pp_rank": "the parallel config",
+}
+
+
+@dataclass(frozen=True)
+class RaidenStorageConfig:
+    """Resolved settings for the storage tier behind the host DRAM pool.
+
+    Each rank writes its shard of a block to
+    `<root_dir>/<model_name>/<topology_dir>/...`, where `<topology_dir>` joins
+    `pp<P>_r<p>`, `pcp<C>_r<c>`, and `tp<T>_r<t>` for the declared axes from
+    `StorageRankCoords` (always `tp`, plus `pcp` and `pp` when greater than 1).
+    Raiden replaces characters outside `[A-Za-z0-9._-]` in `model_name` with `_`.
+    """
+
+    storage_type: str
+    root_dir: str
+    model_name: str
+    # Reported to raiden as the tier's capacity; 0 leaves it unset. Raiden
+    # does not enforce it, and nothing deletes files from root_dir.
+    capacity_bytes: int = 0
+    # Further backend properties as (key, value) pairs sorted by key, passed
+    # to the store and every worker unread, so a new backend tunable needs no
+    # change here. The store's metadata cache (metadata_cache_max_entries,
+    # metadata_cache_ttl_secs) is set this way too; workers check those but
+    # do not use them. Raiden checks every value when it builds the backend.
+    properties: tuple[tuple[str, str], ...] = ()
+
+
+def _storage_setting(extra_config: Mapping[str, Any], key: str, env_value: str) -> str:
+    """One storage setting: a non-empty extra-config value, else the env value."""
+    value = extra_config.get(key)
+    value = "" if value is None else str(value).strip()
+    return value or env_value
+
+
+def _parse_storage_capacity(value: str) -> int:
+    """GiB as a string -> bytes. "" means unset and reads as 0."""
+    if not value:
+        return 0
+    try:
+        gib = float(value)
+    except ValueError:
+        gib = math.nan
+    if not (math.isfinite(gib) and gib > 0):
+        raise ValueError(
+            "TPURaidenOffloadingConnector: storage capacity "
+            f"({_STORAGE_CAPACITY_GB_KEY} / RAIDEN_STORAGE_CAPACITY_GB) must be "
+            f"a positive number of GiB, got {value!r}"
+        )
+    return int(gib * (1 << 30))
+
+
+def _parse_storage_flag(value: Any, *, default: bool, what: str) -> bool:
+    """A yes/no setting from extra config: a boolean, or one of the strings
+    env_bool takes for an env var. None or "" reads as `default`; anything
+    else raises, as a misspelled env var does. `what` names the setting."""
+    if isinstance(value, bool):
+        return value
+    text = "" if value is None else str(value).strip().lower()
+    if not text:
+        return default
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off"):
+        return False
+    raise ValueError(
+        f"TPURaidenOffloadingConnector: {what} must be true or false, got {value!r}"
+    )
+
+
+def _parse_storage_properties(value: Any, source: str) -> dict[str, str]:
+    """Pass-through backend properties from one source: a mapping, or a
+    string of comma-separated key=value pairs.
+
+    Only their shape is checked; raiden checks the values. Each becomes the
+    string raiden takes, a boolean "true" or "false". An empty value leaves
+    its key out, so the other source or raiden's default applies.
+    """
+    where = f"TPURaidenOffloadingConnector: storage properties ({source})"
+    if value is None or isinstance(value, Mapping):
+        items = list((value or {}).items())
+    elif isinstance(value, str):
+        items = []
+        for item in filter(str.strip, value.split(",")):
+            key, sep, item_value = item.partition("=")
+            if not sep:
+                raise ValueError(f"{where}: {item.strip()!r} is not key=value")
+            items.append((key, item_value))
+    else:
+        raise ValueError(
+            f"{where} must be a mapping or a string of key=value pairs, got "
+            f"{type(value).__name__}"
+        )
+    properties: dict[str, str] = {}
+    for key, item_value in items:
+        key = str(key).strip()
+        if key in _MANAGED_STORAGE_PROPERTIES:
+            raise ValueError(
+                f"{where}: {key!r} is set by the connector, from "
+                f"{_MANAGED_STORAGE_PROPERTIES[key]}"
+            )
+        if not key or key in properties:
+            raise ValueError(f"{where}: empty or repeated key {key!r}")
+        if isinstance(item_value, bool):
+            item_value = "true" if item_value else "false"
+        elif item_value is None or isinstance(item_value, int | float):
+            item_value = "" if item_value is None else str(item_value)
+        elif not isinstance(item_value, str):
+            raise ValueError(
+                f"{where}: {key!r} must be a string, number or boolean, got "
+                f"{type(item_value).__name__}"
+            )
+        if item_value.strip():
+            properties[key] = item_value.strip()
+    return properties
+
+
+def _ensure_writable_dir(path: str) -> None:
+    """Create `path` if needed and check that this process can write to it,
+    so a bad directory stops startup instead of failing every save."""
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as exc:
+        raise ValueError(
+            "TPURaidenOffloadingConnector: cannot create storage directory "
+            f"{path!r}: {exc}"
+        ) from exc
+    if not os.access(path, os.W_OK | os.X_OK):
+        raise ValueError(
+            f"TPURaidenOffloadingConnector: storage directory {path!r} is not "
+            "writable by this process"
+        )
+
+
+def resolve_storage_config(
+    extra_config: Mapping[str, Any],
+    *,
+    model_name: str,
+    pp_size: int,
+) -> RaidenStorageConfig | None:
+    """Read and check the storage-tier settings. None means the tier is off.
+
+    The tier is on when a storage path is set, through `raiden_storage_path`
+    in kv_connector_extra_config or RAIDEN_STORAGE_PATH; the other settings
+    are read only then. Every check raises ValueError, so a bad setting stops
+    engine startup: raiden itself would only log it, and every save would
+    fail.
+
+    Pipeline parallelism is refused by default until end-to-end validation
+    completes. For testing only,
+    `experimental_raiden_storage_skip_parallelism_check` or
+    EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK turns that refusal
+    into a warning.
+    """
+    root_dir = _storage_setting(
+        extra_config, _STORAGE_PATH_KEY, envs.RAIDEN_STORAGE_PATH
+    )
+    if not root_dir:
+        return None
+    storage_type = (
+        _storage_setting(extra_config, _STORAGE_TYPE_KEY, envs.RAIDEN_STORAGE_TYPE)
+        or _POSIX_STORAGE_TYPE
+    ).lower()
+    if storage_type != _POSIX_STORAGE_TYPE:
+        raise ValueError(
+            f"TPURaidenOffloadingConnector: storage type {storage_type!r} "
+            f"({_STORAGE_TYPE_KEY} / RAIDEN_STORAGE_TYPE) is not supported; the "
+            f"only type is {_POSIX_STORAGE_TYPE!r}"
+        )
+    if not os.path.isabs(root_dir):
+        raise ValueError(
+            f"TPURaidenOffloadingConnector: storage path {root_dir!r} "
+            f"({_STORAGE_PATH_KEY} / RAIDEN_STORAGE_PATH) must be absolute"
+        )
+    skip_parallelism_check = _parse_storage_flag(
+        extra_config.get(_STORAGE_SKIP_PARALLELISM_CHECK_KEY),
+        default=envs.EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK,
+        what=_STORAGE_SKIP_PARALLELISM_CHECK_KEY,
+    )
+    if pp_size > 1:
+        problem = (
+            "the storage tier does not support pipeline parallelism by default "
+            f"(pp_size={pp_size})"
+        )
+        if not skip_parallelism_check:
+            raise ValueError(
+                f"TPURaidenOffloadingConnector: {problem}. For testing only, "
+                f"{_STORAGE_SKIP_PARALLELISM_CHECK_KEY} / "
+                "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK skips this "
+                "check."
+            )
+        logger.warning(
+            "TPURaidenOffloadingConnector: %s. Starting anyway, because the "
+            "experimental skip of this check is set. Use it for testing only.",
+            problem,
+        )
+    if not os.environ.get("PYTHONHASHSEED"):
+        raise ValueError(
+            "TPURaidenOffloadingConnector: the storage tier requires "
+            "PYTHONHASHSEED to be set, to the same value on every engine that "
+            "shares the directory: unseeded engines derive fresh block hashes "
+            "on every start, so nothing they write could be found again."
+        )
+    capacity_bytes = _parse_storage_capacity(
+        _storage_setting(
+            extra_config, _STORAGE_CAPACITY_GB_KEY, envs.RAIDEN_STORAGE_CAPACITY_GB
+        )
+    )
+    properties = _parse_storage_properties(
+        envs.RAIDEN_STORAGE_PROPERTIES, "RAIDEN_STORAGE_PROPERTIES"
+    )
+    properties.update(
+        _parse_storage_properties(
+            extra_config.get(_STORAGE_PROPERTIES_KEY), _STORAGE_PROPERTIES_KEY
+        )
+    )
+    root_dir = os.path.normpath(root_dir)
+    _ensure_writable_dir(root_dir)
+    return RaidenStorageConfig(
+        storage_type=storage_type,
+        root_dir=root_dir,
+        model_name=(
+            _storage_setting(extra_config, _STORAGE_MODEL_NAME_KEY, "") or model_name
+        ),
+        capacity_bytes=capacity_bytes,
+        properties=tuple(sorted(properties.items())),
+    )
+
+
+@dataclass(frozen=True)
+class StorageRankCoords:
+    """Where one rank's shards sit in the storage layout.
+
+    Raiden keys storage directories by the declared parallelism axes in order
+    `pp`, `pcp`, `tp`: `<axis><size>_r<rank>` joined by `_`. `tp` is always
+    declared; `pcp` and `pp` are declared when their size exceeds 1, keeping
+    pure-TP directory names unchanged (`tp<T>_r<t>`).
+    """
+
+    tp_rank: int
+    tp_size: int
+    pcp_rank: int = 0
+    pcp_size: int = 1
+    pp_rank: int = 0
+    pp_size: int = 1
+
+    def __post_init__(self) -> None:
+        for name, rank, size in (
+            ("TP", self.tp_rank, self.tp_size),
+            ("PCP", self.pcp_rank, self.pcp_size),
+            ("PP", self.pp_rank, self.pp_size),
+        ):
+            if not 0 <= rank < size:
+                raise ValueError(
+                    f"TPURaidenOffloadingConnector: storage {name} rank {rank} "
+                    f"is outside [0, {size})"
+                )
+
+    @property
+    def storage_rank(self) -> int:
+        """Which of a block's shard files this rank writes."""
+        return (
+            self.pp_rank * (self.pcp_size * self.tp_size)
+            + self.pcp_rank * self.tp_size
+            + self.tp_rank
+        )
+
+    @property
+    def storage_size(self) -> int:
+        """How many shard files a block has."""
+        return self.pp_size * self.pcp_size * self.tp_size
+
+
+def worker_storage_rank_coords() -> StorageRankCoords:
+    """This worker's storage coordinates, read from its TP, PCP, and PP groups.
+
+    Not from the world rank: with data parallelism that counts the ranks of
+    every replica, while storage paths are per TP, PCP, and PP rank.
+    """
+    from vllm.distributed import parallel_state
+
+    from vllm_torchtpu.distributed.pcp import get_pcp_rank, get_pcp_world_size
+
+    pp_group = parallel_state.get_pp_group()
+    return StorageRankCoords(
+        tp_rank=parallel_state.get_tensor_model_parallel_rank(),
+        tp_size=parallel_state.get_tensor_model_parallel_world_size(),
+        pcp_rank=get_pcp_rank(),
+        pcp_size=get_pcp_world_size(),
+        pp_rank=pp_group.rank_in_group,
+        pp_size=pp_group.world_size,
+    )
+
+
+def _new_storage_backend_config(impl: Any, storage: RaidenStorageConfig) -> Any:
+    backend_config_cls = getattr(impl, "BackendConfig", None)
+    if backend_config_cls is None:
+        raise RuntimeError(
+            "TPURaidenOffloadingConnector: the installed tpu_sync has no "
+            "BackendConfig, so it cannot configure the storage tier; upgrade "
+            "tpu-sync-torch or unset the storage path"
+        )
+    cfg = backend_config_cls()
+    cfg.type = storage.storage_type
+    for key, value in storage.properties:
+        cfg.set_property(key, value)
+    cfg.set_property("root_dir", storage.root_dir)
+    cfg.set_property("model_name", storage.model_name)
+    if storage.capacity_bytes:
+        cfg.set_property("capacity_bytes", str(storage.capacity_bytes))
+    return cfg
+
+
+def build_store_storage_backend_config(
+    impl: Any, storage: RaidenStorageConfig, coords: StorageRankCoords
+) -> Any:
+    """The scheduler-side store's config for the storage tier.
+
+    The store decides whether storage has a block by looking for the block's
+    shard files across every declared parallelism axis (`tp`, and `pcp` or `pp`
+    when greater than 1).
+    """
+    cfg = _new_storage_backend_config(impl, storage)
+    parallelism = impl.ParallelismConfig()
+    parallelism.tp_size = coords.tp_size
+    if coords.pcp_size > 1:
+        parallelism.pcp_size = coords.pcp_size
+    if coords.pp_size > 1:
+        parallelism.pp_size = coords.pp_size
+    cfg.parallelism = parallelism
+    return cfg
+
+
+def build_worker_storage_backend_config(
+    impl: Any, storage: RaidenStorageConfig, coords: StorageRankCoords
+) -> Any:
+    """One worker's config for the storage tier: which shard file of each
+    block it writes, passed as its coordinates on each declared parallelism
+    axis (`tp`, and `pcp` or `pp` when greater than 1).
+    """
+    cfg = _new_storage_backend_config(impl, storage)
+    parallelism = impl.ParallelismConfig()
+    parallelism.tp_rank = coords.tp_rank
+    parallelism.tp_size = coords.tp_size
+    if coords.pcp_size > 1:
+        parallelism.pcp_rank = coords.pcp_rank
+        parallelism.pcp_size = coords.pcp_size
+    if coords.pp_size > 1:
+        parallelism.pp_rank = coords.pp_rank
+        parallelism.pp_size = coords.pp_size
+    cfg.parallelism = parallelism
+    return cfg
+
+
+class TPURaidenStoreOffloadingSpec(OffloadingSpec):
+    """Configuration specification wiring the Raiden offloading manager and
+    per-rank workers.
+
+    Constructed directly by TPURaidenOffloadingConnector to encapsulate full engine
+    and KV cache configurations, compute hardware block capacities, and configure
+    distributed registry settings.
+    """
+
+    def __init__(
+        self,
+        config: OffloadingConfig,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+    ):
+        super().__init__(config)
+        self.vllm_config = vllm_config
+        self.kv_cache_config = kv_cache_config
+
+        assert config.cache.blocks_per_chunk == 1, (
+            "TPURaidenOffloadingConnector: requires blocks_per_chunk == 1 "
+            "(one OffloadKey = one scheduler device block); got "
+            f"{config.cache.blocks_per_chunk}"
+        )
+        parallel = config.parallel
+        assert not (parallel.pcp_size > 1 and parallel.dcp_size > 1), (
+            "TPURaidenOffloadingConnector: concurrent PCP and DCP is not "
+            f"supported: got pcp={parallel.pcp_size}, dcp={parallel.dcp_size}"
+        )
+        # Count all ranks in the distributed execution group (TP * PP * PCP)
+        # for registration barriers, save fanout, and total host capacity sizing.
+        self.world_size = parallel.world_size
+
+        # Ensure model-level hybrid flag and KV cache group specs agree before
+        # resolving attention kernel geometry.
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        self.is_hybrid_model = vllm_config.model_config.is_hybrid
+        has_mamba_group = any(
+            isinstance(g.kv_cache_spec, MambaSpec)
+            for g in kv_cache_config.kv_cache_groups
+        )
+        assert self.is_hybrid_model == has_mamba_group, (
+            "TPURaidenOffloadingConnector: model_config.is_hybrid="
+            f"{self.is_hybrid_model} but the KV cache groups "
+            f"{'contain' if has_mamba_group else 'lack'} a MambaSpec group"
+        )
+
+        cpu_bytes_to_use = self.extra_config.get("cpu_bytes_to_use")
+        if not cpu_bytes_to_use:
+            raise ValueError(
+                "cpu_bytes_to_use must be specified in "
+                "kv_connector_extra_config (--kv-offloading-size)"
+            )
+
+        (kernel_block_size, per_block_shape, kv_dtype, device_block_size) = (
+            resolve_kernel_geometry(vllm_config, kv_cache_config)
+        )
+        assert device_block_size % kernel_block_size == 0
+        self.device_block_size_factor = device_block_size // kernel_block_size
+
+        # Derive the block-major layout contract (returns None if disabled).
+        # Ensures scheduler and worker ranks agree on namespace salt and bundle geometry
+        # ahead of tensor allocation.
+        self.block_major_contract = resolve_block_major_contract(
+            vllm_config, kv_cache_config
+        )
+
+        # Verify CP scaling invariant: scheduler chunks at the logical all-CP-rank
+        # block span, whereas KV cache specs are rank-local. Ensure tokens_per_block
+        # scales by pcp_size * dcp_size so OffloadKey spans match scheduler blocks.
+        # `config.groups` lists only the offloaded (prefix-cacheable) groups, so
+        # each is matched to its KV cache group by id, not by position: a
+        # non-cacheable group (e.g. a per-request circular buffer) ahead of an
+        # offloaded one would otherwise pair specs of different groups.
+        for group_config in config.groups:
+            group = kv_cache_config.kv_cache_groups[group_config.group_id]
+            if isinstance(group.kv_cache_spec, AttentionSpec):
+                expected_cp_scale = parallel.pcp_size * parallel.dcp_size
+                assert group_config.tokens_per_block == (
+                    group.kv_cache_spec.block_size * expected_cp_scale
+                ), (
+                    "TPURaidenOffloadingConnector: offloading group tokens_per_block="
+                    f"{group_config.tokens_per_block} != rank-local "
+                    f"block_size={group.kv_cache_spec.block_size} x "
+                    f"cp={expected_cp_scale}; the CP-aware "
+                    "OffloadingConfig build patch did not run"
+                )
+
+        # Include context parallelism dimensions in key namespace only when CP
+        # is active, preserving namespace compatibility for standard pcp=1 runs.
+        cp_geometry: tuple[int, ...] = ()
+        if parallel.pcp_size > 1 or parallel.dcp_size > 1:
+            cp_geometry = (
+                parallel.pcp_size,
+                parallel.dcp_size,
+                vllm_config.parallel_config.cp_kv_cache_interleave_size,
+            )
+
+        # Calculate host block capacity from total bytes per logical block across
+        # all worker ranks, sizing both manager and worker pools consistently.
+        # The recorded sum over the per-worker configs covers pipeline stages
+        # that hold different layers; without it, every rank holds the same
+        # bytes only on a single stage.
+        bytes_per_block_all_ranks = all_ranks_kv_bytes_per_block()
+        if bytes_per_block_all_ranks is None:
+            if parallel.pp_size > 1:
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: the per-worker KV bytes per "
+                    "block were not recorded before the spec was built, so the "
+                    "host capacity cannot be sized for pipeline stages holding "
+                    "different layers"
+                )
+            bytes_per_block_all_ranks = (
+                config.worker_kv_bytes_per_block * self.world_size
+            )
+        assert bytes_per_block_all_ranks > 0
+        self.bytes_per_block_all_ranks = bytes_per_block_all_ranks
+        self.offload_logical_blocks_capacity = int(
+            int(cpu_bytes_to_use) // bytes_per_block_all_ranks
+        )
+        assert self.offload_logical_blocks_capacity > 0, (
+            "TPURaidenOffloadingConnector: cpu_bytes_to_use too small for even one "
+            f"offloaded block ({bytes_per_block_all_ranks} bytes)"
+        )
+        self.kernel_physical_blocks_capacity = (
+            self.offload_logical_blocks_capacity * self.device_block_size_factor
+        )
+
+        # Cross-instance KV sharing: configured via extra_config. Setting
+        # global_registry_address enables remote lookups and RDMA fetches;
+        # store_server_ip advertises the pod IP that peers dial for remote reads.
+        self.global_registry_address = str(
+            self.extra_config.get("global_registry_address", "")
+        )
+        self.store_server_ip = str(self.extra_config.get("store_server_ip", ""))
+        # KV pool group this store's KVTransferSpec is published under; the
+        # store nodes absorbing this pool's evictions name the same group.
+        # Empty falls back to the raiden job name, which the DP suffix below
+        # makes per-replica -- set it explicitly whenever another party must
+        # resolve this pool's spec.
+        self.kv_pool_group = str(self.extra_config.get("kv_pool_group", ""))
+
+        # Generate the compatibility namespace hash to isolate global registry
+        # entries across incompatible engine configurations.
+        self.key_namespace = derive_offload_namespace(
+            vllm_config,
+            kernel_block_size=kernel_block_size,
+            per_block_shape=per_block_shape,
+            kv_dtype=kv_dtype,
+            device_block_size=device_block_size,
+            world_size=self.world_size,
+            num_kv_cache_groups=len(kv_cache_config.kv_cache_groups),
+            num_kv_cache_tensors=len(kv_cache_config.kv_cache_tensors),
+            cp_geometry=cp_geometry,
+            block_major_contract=self.block_major_contract,
+        )
+
+        # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.
+        # Fail fast during initialization to prevent serving corrupted cache.
+        if envs.RAIDEN_SHM_KEY:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: RAIDEN_SHM_KEY is not supported: "
+                "shm-backed host pools are unsupported."
+            )
+
+        # Optional storage tier behind the host DRAM pool; None when off. The
+        # spec is built in the scheduler and in every worker, so each process
+        # checks the settings, the directory included, on its own host.
+        self.tp_size = parallel.tp_size
+        self.pcp_size = parallel.pcp_size
+        self.pp_size = parallel.pp_size
+        self.storage_config = resolve_storage_config(
+            self.extra_config,
+            model_name=vllm_config.model_config.model,
+            pp_size=parallel.pp_size,
+        )
+
+        # Offset controller port by local data parallel (DP) rank so multiple
+        # DP replicas colocated on the same host bind unique control ports.
+        dp_rank = vllm_config.parallel_config.data_parallel_rank
+        dp_rank_local = vllm_config.parallel_config.data_parallel_rank_local
+        if dp_rank_local is None:
+            dp_rank_local = dp_rank
+        self._controller_port_base = int(
+            self.extra_config.get("raiden_controller_port", _DEFAULT_CONTROLLER_PORT)
+        )
+        self._dp_rank_local = dp_rank_local
+        self.raiden_controller_port = dp_rank_local + self._controller_port_base
+        self.raiden_job_name = str(
+            self.extra_config.get("raiden_job_name", f"vllm-offload-{config.engine_id}")
+        )
+        # Suffix by global DP rank to ensure distinct RaidenId and registry
+        # entries across multi-node data parallel replicas.
+        if dp_rank:
+            self.raiden_job_name = f"{self.raiden_job_name}-dp{dp_rank}"
+
+        # Host tier in size classes (VLLM_TPU_OFFLOAD_TIER_CLASSES): None when off.
+        self.tier_plan: TierPlan | None = None
+        self.tier_x2 = bool(envs.VLLM_TPU_OFFLOAD_TIER_X2)
+        if self.tier_x2 and not envs.VLLM_TPU_OFFLOAD_TIER_CLASSES:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2 is a mode of "
+                "the host tier classes and needs VLLM_TPU_OFFLOAD_TIER_CLASSES=1"
+            )
+        if self.tier_x2:
+            # A recipe passes the extra config as one literal string, so the pod's
+            # own address arrives as ${VAR} (e.g. ${TPU_RAIDEN_ADVERTISE_HOST}).
+            self.global_registry_address = x2_expand_env(
+                "global_registry_address", self.global_registry_address
+            )
+            self.store_server_ip = x2_expand_env("store_server_ip", self.store_server_ip)
+            self.kv_pool_group = x2_expand_env("kv_pool_group", self.kv_pool_group)
+        if envs.VLLM_TPU_OFFLOAD_TIER_CLASSES:
+            self.tier_plan = self._build_tier_plan(
+                config, vllm_config, int(cpu_bytes_to_use)
+            )
+        elif envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS or envs.VLLM_TPU_OFFLOAD_TIER_CHECK:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_KEY_ROWS and "
+                "VLLM_TPU_OFFLOAD_TIER_CHECK are modes of the host tier classes and "
+                "need VLLM_TPU_OFFLOAD_TIER_CLASSES=1"
+            )
+
+        self._manager: OffloadingManager | None = None
+        self._worker: OffloadingWorker | None = None
+
+    # -- host tier classes (offload/tier_classes.py) ---------------------------
+
+    def _build_tier_plan(
+        self, config: OffloadingConfig, vllm_config: VllmConfig, budget: int
+    ) -> TierPlan:
+        """The classes from every worker's own plan, refused outside the local
+        DRAM tier and outside the served geometry. A shared-memory host pool
+        is refused before this, with the flag or without."""
+        from vllm_torchtpu.models.vllm.qwen4_exp.offload import (
+            is_qwen4_exp,
+            tier_group_kind,
+        )
+        from vllm_torchtpu.offload.tier_classes import (
+            build_tier_plan,
+            check_served_plan,
+        )
+
+        refused = []
+        if self.tier_x2:
+            # TIER-X2 is the classes' second tier through the registry: it needs
+            # the registry, an address peers dial, a pool group the store nodes
+            # name, and Raiden's evict sweep, without which nothing would ever
+            # leave the host pool for the second tier.
+            missing = [
+                name
+                for name, value in (
+                    ("global_registry_address", self.global_registry_address),
+                    ("store_server_ip", self.store_server_ip),
+                    ("kv_pool_group", self.kv_pool_group),
+                )
+                if not value
+            ]
+            if missing:
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2 needs "
+                    f"{', '.join(missing)} in kv_connector_extra_config"
+                )
+            if not x2_sweep_env_on():
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_X2 needs "
+                    f"{' and '.join(X2_SWEEP_ENV)} set to true: without Raiden's "
+                    "evict sweep no block ever reaches the second tier"
+                )
+        else:
+            if self.global_registry_address:
+                refused.append("a global registry (global_registry_address)")
+            if self.kv_pool_group:
+                refused.append("a peer store group (kv_pool_group)")
+        if self.storage_config is not None:
+            refused.append("a storage tier (raiden_storage_path / RAIDEN_STORAGE_PATH)")
+        if self.block_major_contract is not None:
+            refused.append("the block-major pool (VLLM_TPU_BLOCK_MAJOR_KV)")
+        if not is_qwen4_exp(vllm_config):
+            refused.append(
+                f"model {vllm_config.model_config.architecture!r} (Qwen4Exp only)"
+            )
+        if refused:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_CLASSES serves "
+                "the local host DRAM tier only; refused with " + ", ".join(refused)
+            )
+        worker_configs = recorded_worker_kv_cache_configs()
+        if worker_configs is None:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_CLASSES needs the "
+                "per-worker KV cache configs, which were not recorded before the "
+                "spec was built"
+            )
+        key_row_bytes = None
+        if envs.VLLM_TPU_OFFLOAD_TIER_KEY_ROWS:
+            key_row_bytes = self._compressed_key_live_bytes(vllm_config)
+        plan = build_tier_plan(
+            worker_configs,
+            [group.group_id for group in config.groups],
+            tier_group_kind,
+            budget,
+            envs.VLLM_TPU_OFFLOAD_TIER_CLASS_RATIO,
+            key_row_bytes=key_row_bytes,
+        )
+        check_served_plan(plan)
+        if self.tier_x2:
+            from vllm_torchtpu.offload.tier_classes import (
+                check_served_shards,
+                shard_plan,
+            )
+
+            plan = shard_plan(plan)
+            check_served_shards(plan)
+        refuse_ephemeral_ports(
+            [
+                self._controller_port_base
+                + self._dp_rank_local * len(plan.classes)
+                + c.index
+                for c in plan.classes
+            ]
+        )
+        logger.info(
+            "TPURaidenOffloadingConnector: host tier classes, budget %d B, ratio "
+            "%.2f (%d token-blocks, %d checkpoints): %s",
+            budget,
+            plan.ratio,
+            plan.token_blocks,
+            plan.checkpoints,
+            plan.describe(),
+        )
+        if self.tier_x2:
+            logger.info(
+                "TPURaidenOffloadingConnector: TIER-X2 on: %d shard stores join the "
+                "global registry at %s as %s, pool groups %s; evict sweep %s; a "
+                "registry miss is remembered %d ms",
+                len(plan.classes),
+                self.global_registry_address,
+                self.store_server_ip,
+                ",".join(self.tier_x2_pool_group(c) for c in plan.classes),
+                " ".join(
+                    f"{name}={os.environ.get(name, '')}"
+                    for name in X2_SWEEP_ENV
+                    + ("RAIDEN_EVICT_LOW_WATERMARK", "RAIDEN_EVICT_HIGH_WATERMARK")
+                ),
+                envs.VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS,
+            )
+        return plan
+
+    def tier_x2_pool_group(self, tier_class: TierClass) -> str:
+        """TIER-X2: the pool group a shard's store and its store nodes share."""
+        return f"{self.kv_pool_group}-{tier_class.name}"
+
+    @staticmethod
+    def _compressed_key_live_bytes(vllm_config: VllmConfig) -> int:
+        from vllm_torchtpu.models.vllm.qwen4_exp.pd_manifest import (
+            compressed_live_bytes,
+        )
+        from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import (
+            pooled_cache_specs,
+        )
+
+        layout, _ = pooled_cache_specs(vllm_config)
+        live = compressed_live_bytes(layout)
+        if live is None:
+            raise ValueError(
+                "TPURaidenOffloadingConnector: VLLM_TPU_OFFLOAD_TIER_KEY_ROWS needs "
+                "unpacked, unmerged compressed keys (one layer's keys at the start "
+                "of each page)"
+            )
+        return live
+
+    def tier_controller_port(self, tier_class: TierClass) -> int:
+        """Controller port of a class's store: one block of ports per local DP rank."""
+        assert self.tier_plan is not None
+        return (
+            self._controller_port_base
+            + self._dp_rank_local * len(self.tier_plan.classes)
+            + tier_class.index
+        )
+
+    def build_tier_manager(
+        self,
+        stores: Sequence[Any] | None = None,
+        store_types: Any = None,
+        check: bool | None = None,
+    ) -> TieredOffloadingManager:
+        """One manager per class (stores injected by tests), under one composite."""
+        from vllm_torchtpu.offload.tier_classes import TieredOffloadingManager
+
+        plan = self.tier_plan
+        assert plan is not None
+        factor = self.device_block_size_factor
+        if self.tier_x2 and stores is None:
+            waited = x2_wait_registry(self.global_registry_address)
+            logger.info(
+                "TPURaidenOffloadingConnector: TIER-X2: the global registry at %s answered "
+                "after %.1f s",
+                self.global_registry_address,
+                waited,
+            )
+        managers = []
+        for tier_class in plan.classes:
+            capacity = plan.capacity(tier_class)
+            # TIER-X2: each shard store joins the registry under its own pool group
+            # and key namespace.
+            x2: dict[str, Any] = (
+                {
+                    "global_registry_address": self.global_registry_address,
+                    "kv_pool_group": self.tier_x2_pool_group(tier_class),
+                    "tier_x2": True,
+                    "x2_miss_ttl_s": envs.VLLM_TPU_OFFLOAD_TIER_X2_MISS_TTL_MS / 1000.0,
+                    "x2_read_room": envs.VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM,
+                    "x2_read_room_margin": envs.VLLM_TPU_OFFLOAD_TIER_X2_READ_ROOM_MARGIN,
+                }
+                if self.tier_x2
+                else {}
+            )
+            managers.append(
+                RaidenOffloadingManager(
+                    kernel_physical_blocks_capacity=capacity * factor,
+                    offload_logical_blocks_capacity=capacity,
+                    device_block_size_factor=factor,
+                    world_size=tier_class.num_workers,
+                    raiden_controller_port=self.tier_controller_port(tier_class),
+                    raiden_job_name=f"{self.raiden_job_name}-{tier_class.name}",
+                    store_server_ip=self.store_server_ip,
+                    key_namespace=(
+                        x2_shard_namespace(self.key_namespace, tier_class.name)
+                        if self.tier_x2
+                        else self.key_namespace
+                    ),
+                    device_row_stride=tier_class.rows_per_page,
+                    track_held=True,
+                    store=None if stores is None else stores[tier_class.index],
+                    store_types=store_types,
+                    **x2,
+                )
+            )
+        if check is None:
+            check = envs.VLLM_TPU_OFFLOAD_TIER_CHECK
+        return TieredOffloadingManager(plan, managers, check=check)
+
+    def _tier_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        """A class worker for every class this worker has regions for."""
+        from vllm.distributed import parallel_state
+
+        from vllm_torchtpu.offload.tier_classes import (
+            TieredStoreOffloadingWorker,
+            class_kv_caches,
+            worker_group_regions,
+        )
+
+        plan = self.tier_plan
+        assert plan is not None
+        rank = parallel_state.get_world_group().rank_in_group
+        refs = kv_caches.group_data_refs
+        workers: dict[str, RaidenStoreOffloadingWorker] = {}
+        for tier_class in plan.classes:
+            indices = sorted(
+                {ref.tensor_idx for g in tier_class.groups for ref in refs[g]}
+            )
+            own = tuple(
+                sorted(
+                    {
+                        region
+                        for g in tier_class.groups
+                        for region in worker_group_regions(self.kv_cache_config, g)
+                    }
+                )
+            )
+            # register_kv_caches orders the tensors by region index.
+            assert tuple(indices) == own, (tier_class.name, indices, own)
+            if not own:
+                continue
+            # TIER-X2: a shard takes only its own workers, each under its dense node
+            # id; another shard of the class takes this rank's regions.
+            node_id: dict[str, int] = {}
+            if tier_class.shard_of is not None:
+                if not tier_class.worker_regions[rank]:
+                    continue
+                assert tier_class.worker_regions[rank] == own, (
+                    f"host tier shard {tier_class.name}: rank {rank} uses regions "
+                    f"{own}, the plan gives it {tier_class.worker_regions[rank]}"
+                )
+                node_id["node_id"] = tier_class.node_id(rank)
+            assert own in tier_class.worker_regions, (
+                f"host tier class {tier_class.name}: rank {rank} uses regions {own}, "
+                f"which no recorded worker config plans ({tier_class.worker_regions})"
+            )
+            port = self.tier_controller_port(tier_class)
+            workers[tier_class.name] = RaidenStoreOffloadingWorker(
+                class_kv_caches(kv_caches, indices),
+                vllm_config=self.vllm_config,
+                kv_cache_config=self.kv_cache_config,
+                host_blocks_to_allocate=plan.capacity(tier_class)
+                * self.device_block_size_factor,
+                controller_address=f"{self.store_server_ip or '127.0.0.1'}:{port}",
+                rank=rank,
+                row_bytes=(
+                    tier_class.row_bytes if tier_class.rows_per_page > 1 else None
+                ),
+                label=tier_class.name,
+                **node_id,
+            )
+        logger.info(
+            "TPURaidenOffloadingConnector: rank %d registers host tier classes %s",
+            rank,
+            {name: len(w._device_tensors) for name, w in workers.items()},
+        )
+        return TieredStoreOffloadingWorker(workers)
+
+    def get_manager(self) -> OffloadingManager:
+        if self._manager is None and self.tier_plan is not None:
+            self._manager = self.build_tier_manager()
+        if self._manager is None:
+            refuse_ephemeral_ports([self.raiden_controller_port])
+            secondary_backend_configs: list[object] = []
+            storage = self.storage_config
+            if storage is not None:
+                from tpu_sync.api.torch.kv_cache_manager import _torch_impl
+
+                # The store holds no shard; it needs only the shard count.
+                store_coords = StorageRankCoords(
+                    tp_rank=0,
+                    tp_size=self.tp_size,
+                    pcp_size=self.pcp_size,
+                    pp_size=self.pp_size,
+                )
+                secondary_backend_configs.append(
+                    build_store_storage_backend_config(
+                        _torch_impl(), storage, store_coords
+                    )
+                )
+                logger.info(
+                    "TPURaidenOffloadingConnector: storage tier on: %s under %s "
+                    "(model dir %r, %d shards per block (TP %d x PCP %d x PP %d), "
+                    "capacity %s, properties %s)",
+                    storage.storage_type,
+                    storage.root_dir,
+                    storage.model_name,
+                    store_coords.storage_size,
+                    self.tp_size,
+                    self.pcp_size,
+                    self.pp_size,
+                    (
+                        f"{storage.capacity_bytes / (1 << 30):g} GiB"
+                        if storage.capacity_bytes
+                        else "unset"
+                    ),
+                    dict(storage.properties) or "none",
+                )
+            self._manager = RaidenOffloadingManager(
+                kernel_physical_blocks_capacity=self.kernel_physical_blocks_capacity,
+                offload_logical_blocks_capacity=self.offload_logical_blocks_capacity,
+                device_block_size_factor=self.device_block_size_factor,
+                world_size=self.world_size,
+                raiden_controller_port=self.raiden_controller_port,
+                raiden_job_name=self.raiden_job_name,
+                global_registry_address=self.global_registry_address,
+                store_server_ip=self.store_server_ip,
+                kv_pool_group=self.kv_pool_group,
+                key_namespace=self.key_namespace,
+                secondary_backend_configs=secondary_backend_configs,
+            )
+        return self._manager
+
+    def get_worker(self, kv_caches: CanonicalKVCaches) -> OffloadingWorker:
+        if self._worker is None and self.tier_plan is not None:
+            self._worker = self._tier_worker(kv_caches)
+        if self._worker is None:
+            from vllm.distributed import parallel_state
+
+            refuse_ephemeral_ports([self.raiden_controller_port])
+            rank = parallel_state.get_world_group().rank_in_group
+            # Direct workers to dial the controller on store_server_ip when configured
+            # (bind-and-advertise), falling back to loopback (127.0.0.1) for local runs.
+            controller_address = (
+                f"{self.store_server_ip or '127.0.0.1'}:{self.raiden_controller_port}"
+            )
+            backend_configs: list[object] = []
+            if self.storage_config is not None:
+                from tpu_sync.api.torch.kv_cache_manager import _torch_impl
+
+                coords = worker_storage_rank_coords()
+                # The store looks for a block's files under the shard count
+                # from the config; a worker that disagreed would write where
+                # the store never looks.
+                assert (coords.tp_size, coords.pcp_size, coords.pp_size) == (
+                    self.tp_size,
+                    self.pcp_size,
+                    self.pp_size,
+                ), (
+                    "TPURaidenOffloadingConnector: worker group sizes TP="
+                    f"{coords.tp_size}, PCP={coords.pcp_size}, PP={coords.pp_size} != "
+                    f"configured TP={self.tp_size}, PCP={self.pcp_size}, "
+                    f"PP={self.pp_size}"
+                )
+                backend_configs.append(
+                    build_worker_storage_backend_config(
+                        _torch_impl(), self.storage_config, coords
+                    )
+                )
+                logger.info(
+                    "TPURaidenOffloadingConnector: rank %d writes storage shard "
+                    "%d of %d (TP rank %d, PCP rank %d, PP rank %d) under %s",
+                    rank,
+                    coords.storage_rank,
+                    coords.storage_size,
+                    coords.tp_rank,
+                    coords.pcp_rank,
+                    coords.pp_rank,
+                    self.storage_config.root_dir,
+                )
+            self._worker = RaidenStoreOffloadingWorker(
+                kv_caches,
+                vllm_config=self.vllm_config,
+                kv_cache_config=self.kv_cache_config,
+                host_blocks_to_allocate=self.kernel_physical_blocks_capacity,
+                controller_address=controller_address,
+                rank=rank,
+                block_major_contract=self.block_major_contract,
+                backend_configs=backend_configs,
+            )
+        return self._worker
