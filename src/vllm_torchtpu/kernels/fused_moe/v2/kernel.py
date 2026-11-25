@@ -168,6 +168,33 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     return tuple(range(step, tile_m + 1, step))
 
 
+def density_choices(
+    tile_m, rows_alloc, g_local, ep, occupied_slots=None, density_rows_alloc=None
+):
+    """(tile height rungs, push_from_vmem) for a build.
+
+    Both assume a shard's rows spread over the slots that can hold them:
+    `occupied_slots` when given (an expert layout's staging slots never hold
+    rows), else all `g_local`. Counting empty slots would make experts look
+    sparser than they are and pick the short-tile ladder and the VMEM push
+    for loads whose hot experts carry several tiles.
+
+    `density_rows_alloc` is the slab the same token bucket gets without the
+    layout's extra slots. The real slab carries alignment padding for every
+    physical slot, and at a bucket whose routed rows sit exactly on the
+    one-tile-per-expert bound that padding alone would flip the ladder; with
+    both given, a placed build makes the choices the unplaced build makes.
+    """
+    g_rows = g_local if occupied_slots is None else min(occupied_slots, g_local)
+    rows = (
+        rows_alloc
+        if density_rows_alloc is None
+        else min(density_rows_alloc, rows_alloc)
+    )
+    rungs = tile_height_rungs(tile_m, rows, g_rows, ep)
+    return rungs, rows <= ep * g_rows * tile_m
+
+
 def _row_scale(amax):
     """The row scale and its inverse, with the rows that have no usable one.
 
@@ -578,8 +605,19 @@ def _build_fused_ep_moe_kernel(
     has_w2_bias=False,
     pad_scale_rows=False,
     logical_intermediate_size=None,
+    occupied_slots=None,
+    density_rows_alloc=None,
 ):
     """Build the pallas_call and the function that invokes it.
+
+    occupied_slots: how many of a shard's `g_local` slots can hold rows, when
+    fewer than all of them can (an expert layout's spare staging slots never
+    do). The build's density estimates -- the tile-height ladder and whether a
+    tile ships from VMEM -- assume rows spread over the occupied slots; empty
+    slots would make experts look sparser than they are. Buffers are still
+    sized for all `g_local` slots. None means every slot can.
+    density_rows_alloc: the slab rows the same bucket gets without the extra
+    slots, for those estimates only (see density_choices).
 
     `pad_scale_rows` takes the four-bit scale tables as [G, rows, N] with
     rows = host.fp4_scale_rows(K, rhs_qb, padded=True): K / rhs_qb blocks
@@ -730,7 +768,9 @@ def _build_fused_ep_moe_kernel(
     # kernel converts between them with a shift.
     tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
     tile_shift = host.pow2_shift(tile_m, "tile_m")
-    height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
+    height_rungs, push_from_vmem = density_choices(
+        tile_m, ragged_rows_alloc, g_local, ep, occupied_slots, density_rows_alloc
+    )
     input_key = (pltpu.get_tpu_info().chip_version, tile_m, hidden, inter, rhs_qb)
     interleave_inputs = (
         rhs_packed4
@@ -859,9 +899,10 @@ def _build_fused_ep_moe_kernel(
     # read straight back out of it by the push that ships it -- two local
     # passes and, at the small buckets, about a quarter of the visit's DMA
     # enqueues, for a buffer nothing else reads. Where a build's experts are
-    # expected to fit inside one tile -- the same bound the height ladder
-    # above is emitted on -- the tile can be shipped from `out_vm` itself,
-    # deleting the commits, the drain that gates them and the slab's traffic.
+    # expected to fit inside one tile -- `push_from_vmem`, which
+    # density_choices makes above with the height ladder -- the tile can be
+    # shipped from `out_vm` itself, deleting the commits, the drain that
+    # gates them and the slab's traffic.
     # It costs a staging buffer that stays live until the wire has read it,
     # which is why a build whose visits carry several tiles keeps the slab:
     # there the wire is the busy resource and the round trip is what keeps
@@ -870,7 +911,6 @@ def _build_fused_ep_moe_kernel(
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
     tile_plan_capacity = ragged_rows_alloc // tile_m + g_local + 3
-    push_from_vmem = ragged_rows_alloc <= ep * g_local * tile_m
     ls_window_rows = host.act_scale_window_rows(tile_m)
     gather_tiles = host.TOKEN_GATHER_TILES_PER_WINDOW
     gather_payload_rows = gather_tiles * tile_m

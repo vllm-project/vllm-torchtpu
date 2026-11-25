@@ -99,6 +99,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.layer import (
     _row_routes,
     _unpack_routing_exchange,
     _unpermute_load_to_ep_rank_order,
+    density_build_kwargs,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
@@ -533,6 +534,7 @@ def fused_ep_moe_push(
         hbm_staging=hbm_staging,
         dispatch_ahead=dispatch_ahead,
         single_barrier=bool(single_barrier),
+        **density_build_kwargs(e_total, e_logical, ep, T, topk, capacity),
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)

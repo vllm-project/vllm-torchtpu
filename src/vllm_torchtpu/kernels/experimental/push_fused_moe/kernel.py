@@ -60,6 +60,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     _slot_copy,
     _tile_row_scales,
     combine_step_tokens,
+    density_choices,
     expert_ffn_bf16,
     expert_ffn_blockscale,
     expert_ffn_fp8,
@@ -132,10 +133,17 @@ def _build_push_moe_kernel(
     hbm_staging=False,
     dispatch_ahead=1,
     single_barrier=False,
+    occupied_slots=None,
+    density_rows_alloc=None,
 ):
     """Build the pallas_call and the function that invokes it.
 
     The v2 kernel with the activation all-gather replaced by push dispatch.
+    `occupied_slots` is how many of a shard's `g_local` slots can hold rows
+    (an expert layout's staging slots never do) and `density_rows_alloc` the
+    slab the same token bucket gets without the layout; with both given, the
+    VMEM-push choice is the unplaced build's. Push takes only that choice
+    from density_choices: its tile-height ladder is always emitted.
     `push_tokens` is t_local: the lhs operand is only this shard's rows,
     sorted by global expert (host.local_sort_activations), and every shard
     pushes each (destination, expert) run of them as one DMA straight into
@@ -424,9 +432,9 @@ def _build_push_moe_kernel(
     # read straight back out of it by the push that ships it -- two local
     # passes and, at the small buckets, about a quarter of the visit's DMA
     # enqueues, for a buffer nothing else reads. Where a build's experts are
-    # expected to fit inside one tile -- the same bound the height ladder
-    # above is emitted on -- the tile can be shipped from `out_vm` itself,
-    # deleting the commits, the drain that gates them and the slab's traffic.
+    # expected to fit inside one tile -- the bound density_choices checks --
+    # the tile can be shipped from `out_vm` itself, deleting the commits, the
+    # drain that gates them and the slab's traffic.
     # It costs a staging buffer that stays live until the wire has read it,
     # which is why a build whose visits carry several tiles keeps the slab:
     # there the wire is the busy resource and the round trip is what keeps
@@ -434,7 +442,10 @@ def _build_push_moe_kernel(
     #
     # This subsumes the deferred commit drain the same bound used to select:
     # deferring a wait one visit is worth nothing once the wait is gone.
-    push_from_vmem = not hbm_staging and ragged_rows_alloc <= ep * g_local * tile_m
+    _, dense = density_choices(
+        tile_m, ragged_rows_alloc, g_local, ep, occupied_slots, density_rows_alloc
+    )
+    push_from_vmem = not hbm_staging and dense
     ls_window_rows = host.act_scale_window_rows(tile_m)
     # A segment word packs dest << 24 | local expert << 16 | rows.
     if push_tokens >= 1 << 16 or ep > 128 or g_local > 256:
