@@ -512,6 +512,8 @@ class MuseDecoderLayer(nn.Module):
 class MuseModel(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str):
         super().__init__()
+        # The compile wrapper keys the on-disk compile cache on self.prefix.
+        self.prefix = prefix
         config = vllm_config.model_config.hf_text_config
         self.residual_dtype = torch.float32
         self.dtype = cast(torch.dtype, vllm_config.model_config.dtype)

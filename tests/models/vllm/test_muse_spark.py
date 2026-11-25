@@ -1028,7 +1028,7 @@ def test_model_embeds_runs_every_layer_and_normalizes(text_stack, monkeypatch):
     model = text_stack.MuseModel(
         vllm_config=_text_vllm_config(config), prefix="model.language_model"
     )
-    assert len(model.layers) == 2
+    assert len(model.layers) == 2 and model.prefix == "model.language_model"
     _initialize_text_weights(model, 15)
     calls = []
     for index, layer in enumerate(model.layers):
