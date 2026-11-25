@@ -137,9 +137,9 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
     )
 
     def reduce(tensor, **kwargs):
-        assert tensor.tolist() == [0] * 10
+        assert tensor.tolist() == [0] * 11
         tensor.copy_(
-            torch.tensor([2048, 2, 1, 0, int(peer_needs_draft), 0, 0, 0, 0, 0])
+            torch.tensor([2048, 2, 1, 0, int(peer_needs_draft), 0, 0, 0, 0, 0, 0])
         )
 
     with (
@@ -176,8 +176,8 @@ def test_dp_step_carries_the_relayout_fields_and_calls_the_controller():
     )
 
     def reduce(tensor, **kwargs):
-        assert tensor.tolist()[5:] == [0x5A5A, -0x5A5A, -3, 0, 0]
-        tensor.copy_(torch.tensor([128, 1, 1, 0, 1, 0x5A5A, -0x5A5A, -2, -128, -1]))
+        assert tensor.tolist()[5:] == [0x5A5A, -0x5A5A, -3, 0, 0, 0]
+        tensor.copy_(torch.tensor([128, 1, 1, 0, 1, 0x5A5A, -0x5A5A, -2, -128, -1, 0]))
 
     with (
         patch("vllm.distributed.parallel_state.get_dp_group") as group,

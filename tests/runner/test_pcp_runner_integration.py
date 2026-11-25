@@ -316,7 +316,8 @@ def test_execute_model_pcp_mtp_prefill_only_boundary(
     def stop_before_forward(_):
         raise ForwardBoundaryReached
 
-    runner._reorder_batch_for_rpa = stop_before_forward
+    # The batch reorder and DP step come first after the PCP checks.
+    runner._coordinate_dp_step = stop_before_forward
     if rejected:
         with pytest.raises(RuntimeError, match="PCP.*MTP.*req1"):
             TPUModelRunner.execute_model(runner, _scheduler_output(scheduled_tokens))

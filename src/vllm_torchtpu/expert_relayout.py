@@ -664,6 +664,7 @@ def step_phase(
     max_reqs: int,
     min_reqs: int,
     max_num_reqs: int,
+    max_prefill_reqs: int = 0,
     padded_rows_counted: bool = True,
 ) -> str:
     """The coordinated step's phase from the DP all-reduce's fields (the same
@@ -677,8 +678,15 @@ def step_phase(
     all pick the same experts and would dominate the window. When none of
     them reaches the counts (TPUModelRunner.padded_rows_reach_expert_load),
     the counts hold real rows only, so a partly filled step is clean -- the
-    load at the concurrency being served."""
-    is_decode = bucket <= DECODE_MAX_TOKENS
+    load at the concurrency being served. A small step that carries prefill
+    rows (`max_prefill_reqs`, the most prefill or mixed requests on any rank)
+    then counts as "prefill": its routing is not the decode mix, and without
+    the fill rule nothing else keeps it out of a decode window. Where padded
+    rows are counted, the fill rule already keeps most such steps out, so
+    they keep the bucket test."""
+    is_decode = bucket <= DECODE_MAX_TOKENS and (
+        padded_rows_counted or max_prefill_reqs == 0
+    )
     req_target = max(int(max_num_reqs), max_reqs)
     filled = min_tokens >= int(CLEAN_FILL * bucket) and (
         not is_decode or (max_reqs > 0 and min_reqs >= int(CLEAN_FILL * req_target))

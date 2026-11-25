@@ -3571,6 +3571,31 @@ class TPUModelRunner(GPUModelRunner):
                 return True
         return False
 
+    def _coordinate_dp_step(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> tuple[int, int, int]:
+        """Order the batch for RPA, count its chunks and run the DP step's
+        all-reduce. Returns (num_decode_reqs, num_windowed_reqs,
+        target_num_chunks) and records the DP-wide bucket and chunk count."""
+        num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
+            scheduler_output
+        )
+        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
+            scheduler_output
+        )
+        self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
+            scheduler_output.total_num_scheduled_tokens,
+            local_num_chunks,
+            local_num_reqs=local_max_chunk_reqs,
+            has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
+            needs_draft_proposals=self._needs_draft_proposals(scheduler_output),
+            # Requests past the 1-token decodes and speculative verify
+            # windows (`_reorder_batch_for_rpa`) carry prefill rows.
+            local_prefill_reqs=self.input_batch.num_reqs - num_windowed_reqs,
+        )
+        self._dp_step_num_chunks = target_num_chunks
+        return num_decode_reqs, num_windowed_reqs, target_num_chunks
+
     def _dp_coordinated_step(
         self,
         local_num_tokens: int,
@@ -3578,6 +3603,7 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         needs_draft_proposals: bool = True,
+        local_prefill_reqs: int = 0,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._draft_proposals_needed = needs_draft_proposals
@@ -3593,11 +3619,12 @@ class TPUModelRunner(GPUModelRunner):
         # model forward below receives this result explicitly as
         # num_tokens_across_dp, so set_forward_context does not run a second
         # DP synchronization.
-        # The last five fields belong to the dynamic expert re-layout
+        # The last six fields belong to the dynamic expert re-layout
         # (expert_relayout.py): its plan hash twice (max and -min say whether
         # every rank solved the same plan), -staged generation (the max is
-        # -the slowest rank's), and -tokens and -requests (the min over ranks,
-        # for `step_phase`). The vector's length is the same on every rank.
+        # -the slowest rank's), -tokens and -requests (the min over ranks),
+        # and prefill requests (the max over ranks), the last three for
+        # `step_phase`. The vector's length is the same on every rank.
         controller = self._expert_relayout
         relayout = controller.fields() if controller is not None else (0, 0, 0)
         t = torch.tensor(
@@ -3610,6 +3637,7 @@ class TPUModelRunner(GPUModelRunner):
                 *(int(v) for v in relayout),
                 -int(local_num_tokens),
                 -int(local_num_reqs),
+                int(local_prefill_reqs),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3631,6 +3659,7 @@ class TPUModelRunner(GPUModelRunner):
                     max_reqs=int(t[2].item()),
                     min_reqs=-int(t[9].item()),
                     max_num_reqs=int(self.max_num_reqs),
+                    max_prefill_reqs=int(t[10].item()),
                     padded_rows_counted=controller.padded_rows_counted,
                 ),
             )
@@ -3775,20 +3804,9 @@ class TPUModelRunner(GPUModelRunner):
                         f"num_prompt_tokens={num_prompt}. "
                         "Set SamplingParams(max_tokens=1) at the service entry."
                     )
-        num_decode_reqs, num_windowed_reqs = self._reorder_batch_for_rpa(
-            scheduler_output
+        num_decode_reqs, num_windowed_reqs, target_num_chunks = (
+            self._coordinate_dp_step(scheduler_output)
         )
-        local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
-            scheduler_output
-        )
-        self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
-            scheduler_output.total_num_scheduled_tokens,
-            local_num_chunks,
-            local_num_reqs=local_max_chunk_reqs,
-            has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
-            needs_draft_proposals=self._needs_draft_proposals(scheduler_output),
-        )
-        self._dp_step_num_chunks = target_num_chunks
 
         # Run the multimodal (vision) encoder. vLLM's base
         # GPUModelRunner.execute_model does this; our override must do it

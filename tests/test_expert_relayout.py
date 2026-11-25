@@ -29,6 +29,7 @@ from vllm_torchtpu.layers.adapter import expert_load, fused_moe_ep
 from vllm_torchtpu.layers.core.pcp_sequence_layout import PcpSequenceLayoutPlanner
 from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
@@ -804,6 +805,13 @@ PARTIAL_PREFILL = C64_DECODE | dict(
 )
 # One rank serving the c64 batch's requests while another runs a dummy step.
 IDLE_RANK = C64_DECODE | dict(min_tokens=0, min_reqs=0)
+# One rank's single 400-token prompt tail in a 512-token bucket, beside
+# decoding or idle ranks.
+SMALL_PREFILL = C64_DECODE | dict(
+    bucket=512, max_tokens=400, min_tokens=0, max_reqs=1, min_reqs=0, max_prefill_reqs=1
+)
+# A full decode batch with one prompt tail on some rank.
+FULL_MIXED = FULL_DECODE | dict(max_prefill_reqs=1)
 
 
 @pytest.mark.parametrize(
@@ -819,6 +827,10 @@ IDLE_RANK = C64_DECODE | dict(min_tokens=0, min_reqs=0)
         ),
         pytest.param(FULL_DECODE, True, "decode", id="full-counted"),
         pytest.param(FULL_DECODE, False, "decode", id="full-not-counted"),
+        pytest.param(SMALL_PREFILL, True, "padded", id="small-prefill-counted"),
+        pytest.param(SMALL_PREFILL, False, "prefill", id="small-prefill-not-counted"),
+        pytest.param(FULL_MIXED, True, "decode", id="full-mixed-counted"),
+        pytest.param(FULL_MIXED, False, "prefill", id="full-mixed-not-counted"),
         pytest.param(C64_DECODE, None, "padded", id="c64-default"),
     ],
 )
@@ -916,6 +928,9 @@ def _padding_runner(**over):
         pytest.param({}, False, id="dspark-drafter"),
         pytest.param(dict(drafter=None), False, id="no-drafter"),
         pytest.param(
+            dict(drafter=DFlashProposer.__new__(DFlashProposer)), False, id="dflash"
+        ),
+        pytest.param(
             dict(drafter=NgramProposer.__new__(NgramProposer)), False, id="ngram"
         ),
         pytest.param(dict(_token_padding_state=None), True, id="no-padding-mask"),
@@ -948,10 +963,16 @@ def test_runner_says_padded_rows_reach_the_counts_from_a_non_fused_layer(
     assert TPUModelRunner.padded_rows_reach_expert_load(_padding_runner()) is True
 
 
-@pytest.mark.parametrize(("counted", "phase"), [(True, "padded"), (False, "decode")])
-def test_runner_passes_the_controller_padding_answer_to_step_phase(counted, phase):
+@pytest.mark.parametrize(
+    ("counted", "prefill_reqs", "phase"),
+    [(True, 0, "padded"), (False, 0, "decode"), (False, 1, "prefill")],
+)
+def test_runner_passes_the_padding_answer_and_prefill_requests_to_step_phase(
+    counted, prefill_reqs, phase
+):
     """A c64 decode step over DP8 through the runner's coordinated step: the
-    all-reduce returns C64_DECODE's fields."""
+    all-reduce returns C64_DECODE's fields, and the most prefill requests on
+    any rank in its last field."""
     seen = []
 
     class Controller:
@@ -972,14 +993,15 @@ def test_runner_passes_the_controller_padding_answer_to_step_phase(counted, phas
     )
 
     def reduce(tensor, **kwargs):
-        tensor.copy_(torch.tensor([54, 1, 9, 0, 1, 0, 0, 0, -42, -7]))
+        assert tensor.tolist()[10] == 1
+        tensor.copy_(torch.tensor([54, 1, 9, 0, 1, 0, 0, 0, -42, -7, prefill_reqs]))
 
     with (
         patch("vllm.distributed.parallel_state.get_dp_group") as group,
         patch.object(torch.distributed, "all_reduce", side_effect=reduce),
     ):
         group.return_value.cpu_group = "cpu-group"
-        TPUModelRunner._dp_coordinated_step(runner, 48, 1, 8)
+        TPUModelRunner._dp_coordinated_step(runner, 48, 1, 8, local_prefill_reqs=1)
     assert seen == [phase]
 
 
@@ -997,3 +1019,29 @@ def test_arm_for_runner_passes_the_runner_padding_answer(monkeypatch, reach):
         )
         rl.arm_for_runner(runner)
     assert seen["padded_rows_counted"] is reach
+
+
+def test_the_step_reports_requests_past_the_decode_and_verify_windows():
+    """`execute_model`'s DP step tells the all-reduce how many of this rank's
+    requests carry prefill rows: those after the 1-token decodes and
+    speculative verify windows."""
+    seen = {}
+
+    def coordinated_step(tokens, chunks, **kwargs):
+        seen.update(kwargs, tokens=tokens, chunks=chunks)
+        return 512, 1
+
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=9),
+        _reorder_batch_for_rpa=lambda output: (6, 8),
+        _count_input_chunks=lambda output: (1, 9),
+        _dp_coordinated_step=coordinated_step,
+        _needs_draft_proposals=lambda output: True,
+    )
+    output = SimpleNamespace(
+        total_num_scheduled_tokens=448, scheduled_encoder_inputs={}
+    )
+    assert TPUModelRunner._coordinate_dp_step(runner, output) == (6, 8, 1)
+    assert seen["local_prefill_reqs"] == 1
+    assert (seen["tokens"], seen["chunks"], seen["local_num_reqs"]) == (448, 1, 9)
+    assert runner._dp_target_bucket == 512 and runner._dp_step_num_chunks == 1
