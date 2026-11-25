@@ -28,6 +28,7 @@ from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
 from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 
+from tests.megakernel.conftest import tpu_mesh
 from tests.megakernel.core.megakernel_fakes import (
     TINY_TILES,
     FakeGeometry,
@@ -38,12 +39,14 @@ from vllm_torchtpu.megakernel.core import kernel, planner
 from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.core.exec_spec import DebugOptions, ExecSpec
 from vllm_torchtpu.megakernel.core.ops import BF16, F32, I32, rmsnorm, round_bf16
+from vllm_torchtpu.megakernel.core.pool.config import CacheExec
 from vllm_torchtpu.megakernel.core.reference import spec_reference_step
 from vllm_torchtpu.megakernel.core.spec import (
     LayerType,
     ModelSpec,
     Module,
     SmallField,
+    StateDecl,
     WeightDecl,
 )
 from vllm_torchtpu.megakernel.core.weights.spec_inputs import (
@@ -266,7 +269,7 @@ def test_spec_inputs_per_layer_key_budget_and_bounded_pos():
         config=SimpleNamespace(L=2, H=256),
         layer_type=LayerType("lt", (_PerLayerNoHFModule(),)),
     )
-    with pytest.raises(AttributeError):
+    with pytest.raises(AttributeError, match="check"):
         kernel.build(ms_no_check, ex40)
 
 
@@ -474,29 +477,138 @@ def test_allreduce_ring_single_slot_layer_parity_alternation():
         assert jnp.allclose(out_u[r], ref, atol=2e-2, rtol=2e-2)
 
 
-def test_tiles_inplace_rejects_multi_rank_and_tpu_mesh_narrows_skip(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """`tiles.inplace` with `R > 1` raises `MegakernelConfigError`, and `tpu_mesh`
-    skips only on absent/busy TPU errors while propagating real `RuntimeError`s."""
-    from tests.megakernel import conftest as mk_conftest
+def test_tiles_inplace_aliases_leaf_offsets_and_rejects_multi_rank():
+    """`tiles.inplace` populates `info['input_output_aliases']` with flattened
+    input/output leaf offsets (including tupled outputs preceding `rw` states)
+    and raises `MegakernelConfigError` when `R > 1`."""
+
+    class _TupledOutputBeforeRWModule(Module):
+        name = "tupled_out_before_rw"
+        reduction = "allreduce"
+        input_norm = "in_norm"
+
+        def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
+            del ex
+            return [WeightDecl("w", K=g.H, N=g.H, dtype=BF16, stream_ring="static")]
+
+        def smalls(self, g: FakeGeometry, ex: ExecSpec) -> list[SmallField]:
+            del ex
+            return [SmallField("in_norm", g.H)]
+
+        def states(self, g: FakeGeometry, ex: ExecSpec) -> list[StateDecl]:
+            del g, ex
+            return [
+                StateDecl("ro_s", shape=(8, 128), dtype=F32, access="r"),
+                StateDecl(
+                    "rw_tup", shape=(8, 128), dtype=BF16, access="rw", tupled=True
+                ),
+                StateDecl("rw_flat", shape=(8, 128), dtype=F32, access="rw"),
+            ]
+
+        def outputs(self, g: FakeGeometry, ex: ExecSpec) -> list[StateDecl]:
+            del g, ex
+            return [
+                StateDecl(
+                    "tap_tup",
+                    shape=(8, 128),
+                    dtype=BF16,
+                    access="w",
+                    tupled=True,
+                    role="tap",
+                ),
+                StateDecl(
+                    "rw_tup", shape=(8, 128), dtype=BF16, access="rw", tupled=True
+                ),
+                StateDecl("rw_flat", shape=(8, 128), dtype=F32, access="rw"),
+            ]
+
+        def shared_widths(self, g: FakeGeometry, ex: ExecSpec) -> dict[str, int]:
+            return {"acc": g.H}
+
+    # `L = 3`: weights (`w`, `smalls`, `final_norm`) occupy operands 2..4;
+    # `ro_s` is operand 5; `rw_tup` (3 leaves) is operands 6..8; `rw_flat` is 9.
+    # Outputs: `hidden` is 0; `tap_tup` (3 leaves) is 1..3; `rw_tup` is 4..6;
+    # `rw_flat` is 7.
+    g_tup = FakeGeometry(L=3, H=256)
+    ms_tup = ModelSpec(
+        "tup_alias",
+        config=g_tup,
+        layer_type=LayerType("lt", (_TupledOutputBeforeRWModule(),)),
+    )
+    tiles_tup = dataclasses.replace(TINY_TILES, bank=64 << 10, nbd=2)
+    ex_tup_oop = ExecSpec(B=4, T=1, R=1, ctx=128, tiles=tiles_tup, interpret=False)
+    ex_tup_inp = dataclasses.replace(
+        ex_tup_oop, tiles=dataclasses.replace(tiles_tup, inplace=True)
+    )
+    _, info_tup_oop = kernel.build(ms_tup, ex_tup_oop)
+    _, info_tup_inp = kernel.build(ms_tup, ex_tup_inp)
+    assert info_tup_oop["input_output_aliases"] == {}
+    assert info_tup_inp["input_output_aliases"] == {6: 4, 7: 5, 8: 6, 9: 7}
+
+    # Hybrid `synth_hybrid_spec` (`R=1`, `T=1`) on both direct HBM and pooled raw
+    # refs (where `raw_pool` is a tupled state before/alongside `conv`/`rec`).
+    spec_r1 = synth_hybrid_spec(L=4, att_every=2, R=1)
+    tiles_r1 = dataclasses.replace(TINY_TILES, bank=512 << 10).with_modules(
+        {"gqa": {"kv_blk": 128, "nkv": 2}}
+    )
+    for paged_kv in (False, True):
+        cache_cfg = CacheExec(paged_kv=True, num_pages=128) if paged_kv else CacheExec()
+        ex_oop = ExecSpec(
+            B=4,
+            T=1,
+            R=1,
+            ctx=256,
+            stack_e=True,
+            tiles=tiles_r1,
+            interpret=False,
+            cache=cache_cfg,
+        )
+        ex_inp = dataclasses.replace(
+            ex_oop, tiles=dataclasses.replace(tiles_r1, inplace=True)
+        )
+        _, info_oop = kernel.build(spec_r1, ex_oop)
+        _, info_inp = kernel.build(spec_r1, ex_inp)
+        assert info_oop["input_output_aliases"] == {}
+        p = info_inp["plan"]
+        wsh, ssh, osh = info_inp["wshape"], info_inp["sshape"], info_inp["oshape"]
+        n_w = sum(
+            len(wsh[k]) if kernel.is_tupled_weight(wsh[k]) else 1 for k in p.w_names
+        )
+        want_aliases: dict[int, int] = {}
+        for rw_name in ("conv", "rec"):
+            s_idx = p.s_names.index(rw_name)
+            s_off = sum(
+                len(ssh[k]) if p.state_decls[k].tupled else 1 for k in p.s_names[:s_idx]
+            )
+            o_idx = p.o_names.index(rw_name)
+            o_off = sum(
+                len(osh[k]) if (k != "hidden" and p.output_decls[k].tupled) else 1
+                for k in p.o_names[:o_idx]
+            )
+            want_aliases[2 + n_w + s_off] = o_off
+        assert len(want_aliases) == 2
+        assert info_inp["input_output_aliases"] == want_aliases
 
     devs = jax.devices("cpu")
     mesh = Mesh(devs[:2], ("tp",))
-    spec = synth_hybrid_spec(L=2, att_every=2, R=2)
+    spec_r2 = synth_hybrid_spec(L=2, att_every=2, R=2)
     ex_bad = ExecSpec(
         B=4,
         T=1,
         R=2,
         ctx=256,
-        tiles=dataclasses.replace(
-            TINY_TILES, bank=512 << 10, inplace=True
-        ).with_modules({"gqa": {"kv_blk": 128, "nkv": 2}}),
+        tiles=dataclasses.replace(tiles_r1, inplace=True),
         interpret=False,
     )
     with pytest.raises(MegakernelConfigError, match=r"tiles\.inplace.*R > 1"):
-        kernel.make_step(mesh, spec, ex_bad, donate_states=True)
+        kernel.make_step(mesh, spec_r2, ex_bad, donate_states=True)
 
+
+def test_tpu_mesh_skips_only_absent_or_busy_errors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """`tpu_mesh` skips on absent/busy TPU errors and re-raises real `RuntimeError`s."""
+    devs = jax.devices("cpu")
     monkeypatch.setattr(
         jax,
         "devices",
@@ -505,7 +617,7 @@ def test_tiles_inplace_rejects_multi_rank_and_tpu_mesh_narrows_skip(
         ),
     )
     with pytest.raises(pytest.skip.Exception, match="busy"):
-        mk_conftest.tpu_mesh(1)
+        tpu_mesh(1)
 
     monkeypatch.setattr(
         jax,
@@ -515,7 +627,7 @@ def test_tiles_inplace_rejects_multi_rank_and_tpu_mesh_narrows_skip(
         ),
     )
     with pytest.raises(RuntimeError, match="broken PjRt plugin"):
-        mk_conftest.tpu_mesh(1)
+        tpu_mesh(1)
 
     monkeypatch.setattr(jax, "devices", lambda backend=None: [devs[0]])
     monkeypatch.setattr(
@@ -526,7 +638,7 @@ def test_tiles_inplace_rejects_multi_rank_and_tpu_mesh_narrows_skip(
         ),
     )
     with pytest.raises(pytest.skip.Exception, match="TPU device busy"):
-        mk_conftest.tpu_mesh(1)
+        tpu_mesh(1)
 
     monkeypatch.setattr(
         jax,
@@ -536,4 +648,4 @@ def test_tiles_inplace_rejects_multi_rank_and_tpu_mesh_narrows_skip(
         ),
     )
     with pytest.raises(RuntimeError, match="HBM transfer failed"):
-        mk_conftest.tpu_mesh(1)
+        tpu_mesh(1)

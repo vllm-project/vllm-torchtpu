@@ -448,6 +448,7 @@ def build(
         "wshape": wsh,
         "sshape": ssh,
         "oshape": osh,
+        "input_output_aliases": dict(aliases),
     }
     return call, info
 
