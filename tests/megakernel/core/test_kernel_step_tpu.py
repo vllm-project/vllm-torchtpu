@@ -361,8 +361,30 @@ def test_kernel_make_step_tiles_inplace_on_tpu(paged_kv: bool) -> None:
             )
         return st_tpu
 
-    step_oop, _ = kernel.make_step(mesh, spec, ex_oop, donate_states=False)
-    step_inp, _ = kernel.make_step(mesh, spec, ex_inp, donate_states=True)
+    step_oop, info_oop = kernel.make_step(mesh, spec, ex_oop, donate_states=False)
+    step_inp, info_inp = kernel.make_step(mesh, spec, ex_inp, donate_states=True)
+    assert info_oop["input_output_aliases"] == {}
+    assert len(info_inp["input_output_aliases"]) == 2
+
+    lowered_oop = step_oop.lower(pos_tpu, hid_tpu, w_tpu, _fresh_states())
+    lowered_inp = step_inp.lower(pos_tpu, hid_tpu, w_tpu, _fresh_states())
+    mlir_oop = lowered_oop.as_text()
+    mlir_inp = lowered_inp.as_text()
+    assert "#stablehlo.output_operand_alias<" not in mlir_oop
+    for in_idx, out_idx in info_inp["input_output_aliases"].items():
+        expected_alias = (
+            f"#stablehlo.output_operand_alias<output_tuple_indices = [{out_idx}], "
+            f"operand_index = {in_idx}, operand_tuple_indices = []>"
+        )
+        assert expected_alias in mlir_inp, expected_alias
+
+    hlo_oop = lowered_oop.compile().as_text()
+    hlo_inp = lowered_inp.compile().as_text()
+    assert hlo_oop is not None and hlo_inp is not None
+    assert "input_output_alias" not in hlo_oop
+    assert "output_to_operand_aliasing" not in hlo_oop
+    assert "input_output_alias" in hlo_inp
+    assert "output_to_operand_aliasing" in hlo_inp
 
     hid_oop, st_oop = step_oop(pos_tpu, hid_tpu, w_tpu, _fresh_states())
     hid_inp, st_inp = step_inp(pos_tpu, hid_tpu, w_tpu, _fresh_states())
