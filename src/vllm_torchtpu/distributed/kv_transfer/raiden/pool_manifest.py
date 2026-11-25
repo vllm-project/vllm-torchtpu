@@ -1799,10 +1799,15 @@ def _build_dsv41_pool_manifest(
                         f"DSv4.1 CSA2 SWA cache {layer_name} needs 1024-byte token "
                         f"rows (two 512-byte planes); got row_bytes={row_bytes}"
                     )
-                if stride_bytes != 2 * plane_rows * plane_row_bytes:
+                # The page is two planes; the stride may be larger: the
+                # block-outer layout (#3045) packs several SWA layers' pages in
+                # one block, each at its own offset. `_claim_range` checks the
+                # page stays inside the block and does not overlap a sibling.
+                if stride_bytes < 2 * plane_rows * plane_row_bytes:
                     raise ManifestError(
                         f"DSv4.1 CSA2 SWA cache {layer_name} page stride "
-                        f"{stride_bytes} is not two planes of {plane_rows} rows"
+                        f"{stride_bytes} is smaller than two planes of "
+                        f"{plane_rows} rows"
                     )
                 for plane, plane_tag in enumerate(TAG_DSV41_SWA_PLANES):
                     plane_offset = offset_bytes + plane * plane_rows * plane_row_bytes
