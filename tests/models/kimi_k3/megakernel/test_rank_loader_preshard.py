@@ -193,7 +193,7 @@ class _TinyLoadModule:
         return shapes
 
     @staticmethod
-    def _family_layers(
+    def family_layers(
         config: _TinyConfig,
         name: str,
         layers: int,
