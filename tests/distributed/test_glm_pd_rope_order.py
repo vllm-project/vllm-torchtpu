@@ -207,6 +207,32 @@ def test_rope_order_is_read_from_the_permuted_layers():
         assert read(None) == (False, False)
 
 
+@pytest.mark.parametrize(
+    ("mla_flag", "indexer_flag"), [(True, True), (True, False), (False, True)]
+)
+def test_model_without_mla_layers_refuses_to_guess(mla_flag, indexer_flag):
+    # Every admitted GLM stage holds an MLA layer. A model whose modules()
+    # yields none (a wrapper hiding the layers, a mock) was not read, so it
+    # must not declare the interleaved order while a permute flag is on.
+    hidden = torch.nn.Module()
+    hidden.layer = torch.nn.Linear(2, 2)
+    only_indexer = torch.nn.Module()
+    only_indexer.indexer = _FakeIndexer()
+    only_indexer.indexer._rope_neox_permuted = True
+    for model in (hidden, only_indexer, MagicMock()):
+        mla_patch, indexer_patch = _flags(mla_flag, indexer_flag)
+        with (
+            mla_patch,
+            indexer_patch,
+            pytest.raises(RuntimeError, match="holds no"),
+        ):
+            mla_op.glm_rope_half_split(model, SimpleNamespace())
+    # Both flags off: nothing was permuted, so there is nothing to read.
+    mla_patch, indexer_patch = _flags(False, False)
+    with mla_patch, indexer_patch:
+        assert mla_op.glm_rope_half_split(hidden) == (False, False)
+
+
 # A pipeline stage with no indexer layer ships no indexer key; it declares the
 # order an indexer layer of its own would cache its keys in. vLLM builds that
 # rope GPT-J style only under indexer_rope_interleave (GLM-5.2 sets it), NeoX

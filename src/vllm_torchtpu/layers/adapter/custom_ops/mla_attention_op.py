@@ -1939,7 +1939,8 @@ def glm_rope_half_split(model: Any, hf_config: Any = None) -> tuple[bool, bool]:
     checkpoint's own order and none declares it. Such a stage declares
     half-split for the indexer only with the flag on, ``indexer_rope_interleave``
     set, and a rope class the permute supports (its MLA layers'). Without the
-    model config to read, it refuses to guess."""
+    model config to read, it refuses to guess. So does a model with no MLA
+    layer to read while either flag is on."""
     if model is None:
         if envs.TPU_MLA_ROPE_NEOX_PERMUTE or envs.TPU_INDEXER_ROPE_NEOX_PERMUTE:
             raise RuntimeError(
@@ -1948,17 +1949,31 @@ def glm_rope_half_split(model: Any, hf_config: Any = None) -> tuple[bool, bool]:
                 "TPU_INDEXER_ROPE_NEOX_PERMUTE are on), but the runner has none"
             )
         return False, False
-    mla = indexer = has_indexer = rope_supported = False
+    mla = indexer = has_indexer = has_mla = rope_supported = False
     for module in model.modules():
         if isinstance(module, VllmTPUIndexer):
             has_indexer = True
             indexer = indexer or bool(getattr(module, "_rope_neox_permuted", False))
         elif isinstance(module, VllmTPUMultiHeadLatentAttentionWrapper):
             # An MLA layer: it holds the flag from construction on.
+            has_mla = True
             mla = mla or bool(module._rope_neox_permuted)
             rope_supported = rope_supported or rope_half_split_supported(
                 module.rotary_emb, int(module.qk_rope_head_dim)
             )
+    # Every admitted GLM stage holds at least one MLA layer: finding none
+    # means the walk read no layer (a wrapped or mocked model), and would
+    # declare the interleaved order whatever the layers cache.
+    if not has_mla and (
+        envs.TPU_MLA_ROPE_NEOX_PERMUTE or envs.TPU_INDEXER_ROPE_NEOX_PERMUTE
+    ):
+        raise RuntimeError(
+            "Raiden GLM admission reads the cached rope order from the "
+            "loaded model's MLA layers (TPU_MLA_ROPE_NEOX_PERMUTE / "
+            "TPU_INDEXER_ROPE_NEOX_PERMUTE are on), but "
+            f"{type(model).__name__}.modules() holds no "
+            "VllmTPUMultiHeadLatentAttentionWrapper"
+        )
     if not has_indexer and envs.TPU_INDEXER_ROPE_NEOX_PERMUTE:
         if hf_config is None:
             raise RuntimeError(
