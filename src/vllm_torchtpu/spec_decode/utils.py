@@ -74,11 +74,24 @@ class DraftStepTokens:
     stack and slice that `Eagle3Proposer.propose` returns without the flag.
     """
 
-    __slots__ = ("steps", "num_reqs", "_dense")
+    __slots__ = ("steps", "num_reqs", "step0_base", "step0_source", "_dense")
 
-    def __init__(self, steps: list[torch.Tensor], num_reqs: int) -> None:
+    def __init__(
+        self,
+        steps: list[torch.Tensor],
+        num_reqs: int,
+        step0_base: torch.Tensor | None = None,
+        step0_source: str = "",
+    ) -> None:
         self.steps = tuple(steps)
         self.num_reqs = num_reqs
+        # VLLM_TPU_SPEC_TAIL_DENSE_STEP0: the 1-D tensor `steps[0]` is the
+        # leading `[:p]` slice of, when the drafter cut it so (MK draft step
+        # 0's `[capacity]` token, `Eagle3Proposer._mk_step0_trim`); None
+        # otherwise. `step0_source` names where step 0 came from ("mk" /
+        # "mk_step0_loop" / "stock"), for the self-check line.
+        self.step0_base = step0_base
+        self.step0_source = step0_source
         self._dense: torch.Tensor | None = None
 
     def materialize(self) -> torch.Tensor:
