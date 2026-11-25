@@ -319,6 +319,8 @@ def test_one_compiled_forward_reads_each_steps_row_count():
         ),
         custom_routing_function=_top_logits,
         renormalize=False,
+        # Set by VllmMoERunner; moe_routing.route reads it.
+        capture_fn=None,
     )
     stock_method = _method(skip_padded_tokens=False)
     count_method = _method(skip_padded_tokens=True)
