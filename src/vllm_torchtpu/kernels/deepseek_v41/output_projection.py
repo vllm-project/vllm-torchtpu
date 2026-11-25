@@ -224,20 +224,12 @@ def _tile(
         for mx in range(2)
     )
 
-    def pop(p, epilogue):
-        for mx in range(2):
-            for m in range(chunks):
-                epilogue(p, mx, m, pltpu.matmul_pop(accs[mx][p][m]))
-
-    def mxu_matmul(lhs, rhs, k_tiles, epilogue, quant=None, previous=None, finish=True):
+    def mxu_matmul(lhs, rhs, k_tiles, epilogue, quant=None):
         """lhs(rows, ks) @ rhs(ks, cols) over all row chunks.
 
         epilogue(p, mx, m, value) consumes each popped [QUANT_ROWS, 256]
         block. quant(c), c in [0, chunks), is one vector work item; the
         items are spread evenly over the K-tile pairs of both block pairs.
-        With ``finish`` False, block pair 1 stays in its accumulators; the
-        next call pops it as ``previous`` behind its own first K-tile pair,
-        whose block pair 0 accumulators are already free.
         """
         pairs = k_tiles // 2
 
@@ -267,6 +259,11 @@ def _tile(
                 push(fp, fkb, 0)
             acc(p, kb + 1, 1)
 
+        def pop(p):
+            for mx in range(2):
+                for m in range(chunks):
+                    epilogue(p, mx, m, pltpu.matmul_pop(accs[mx][p][m]))
+
         # Fully unrolled: a loop around the K-tile pairs refills the MXU
         # pipeline every iteration (v7 T288 wo_a group, VMEM-resident: fori
         # 2.60 us vs unrolled 2.15 us with the quantize interleaved).
@@ -282,19 +279,14 @@ def _tile(
         push(0, 0, 0)
         for i, (p, kb) in enumerate(seq):
             two(p, kb, seq[i + 1] if i + 1 < len(seq) else None)
-            if i == 0 and previous is not None:
-                # Before this call's quantize items, which may overwrite
-                # the inverse scales the previous epilogue reads.
-                previous()
             if quant is not None:
                 for c in at.get(i, ()):
                     quant(c)
             if i == pairs:
-                pop(0, epilogue)
-        if finish:
-            pop(1, epilogue)
+                pop(0)
+        pop(1)
 
-    def epilogue_a(g, slot):
+    def project_a(g, wslot, slot, quant=None):
         def epilogue(p, mx, m, r):
             rows = pl.ds(m * QUANT_ROWS, QUANT_ROWS)
             cols = aligned(g * width + (2 * mx + p) * MXU_TILE, MXU_TILE)
@@ -306,23 +298,12 @@ def _tile(
                 jnp.max(jnp.abs(v.astype(jnp.float32)), axis=1, keepdims=True),
             )
 
-        return epilogue
-
-    def project_a(g, wslot, slot, quant=None, finish=False):
-        # Group g - 1 left its block pair 1 for this call to pop (g > 0).
-        previous = (
-            None
-            if isinstance(g, int) and g == 0
-            else functools.partial(pop, 1, epilogue_a(g - 1, 1 - slot))
-        )
         mxu_matmul(
             lambda r, k: qa[slot, r, k],
             lambda k, c: wab[wslot, k, c],
             wab.shape[1] // MXU_TILE,
-            epilogue_a(g, slot),
+            epilogue,
             quant,
-            previous,
-            finish,
         )
 
     def issue_b(g):
@@ -420,9 +401,9 @@ def _tile(
         last = groups - 1
         issue_b(last)
         wa_copy(last, last % group_depth).wait()
-        project_a(last, last % group_depth, last % 2, finish=True)
+        project_a(last, last % group_depth, last % 2)
 
-    def epilogue_b(i):
+    def project_b(i, slot):
         def epilogue(p, mx, m, z):
             r = pl.ds(m * QUANT_ROWS, QUANT_ROWS)
             block = (2 * mx + p) * MXU_TILE
@@ -431,22 +412,11 @@ def _tile(
                 out.dtype
             )
 
-        return epilogue
-
-    def project_b(i, slot):
-        # Window i - 1's block pair 1 is popped here, then its rows stored.
-        previous = (
-            None
-            if isinstance(i, int) and i == 0
-            else functools.partial(pop, 1, epilogue_b(i - 1))
-        )
         mxu_matmul(
             lambda r, k: qb[r, k],
             lambda k, c: wbb[slot, k, c],
             qb.shape[1] // MXU_TILE,
-            epilogue_b(i),
-            previous=previous,
-            finish=False,
+            epilogue,
         )
 
     def refill_and_store(i, slot):
@@ -454,8 +424,7 @@ def _tile(
         def _():
             wb_copy(i + window_depth, slot).start(priority=WEIGHT_PRIORITY)
 
-        if not (isinstance(i, int) and i == 0):
-            out_copy(i - 1).start()
+        out_copy(i).start()
 
     # Same operations and order as buffered._quantize_rows. Window 0's weights
     # land during wo_a, so its matmul only waits for the quantize. Running it
@@ -494,8 +463,6 @@ def _tile(
     jax.lax.fori_loop(1, windows, window, jnp.int32(1))
 
     with jax.named_scope("op_drain"):
-        pop(1, epilogue_b(windows - 1))
-        out_copy(windows - 1).start()
         out_copy(windows - 2).wait()
         out_copy(windows - 1).wait()
 
