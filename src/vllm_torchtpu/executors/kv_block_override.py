@@ -125,10 +125,12 @@ def adopt_worker_num_gpu_blocks_override(executor: Any) -> None:
     cache_config = executor.vllm_config.cache_config
     if cache_config.num_gpu_blocks_override is not None:
         return
+    from vllm_torchtpu.distributed.pipeline_stage import stage_size
+
     pc = executor.vllm_config.parallel_config
     agreed = reconcile_num_gpu_blocks_override(
         cast(list, executor.collective_rpc("get_num_gpu_blocks_override")),
-        workers_per_stage=pc.world_size // pc.pipeline_parallel_size,
+        workers_per_stage=stage_size(pc),
     )
     if agreed is not None:
         cache_config.num_gpu_blocks_override = agreed

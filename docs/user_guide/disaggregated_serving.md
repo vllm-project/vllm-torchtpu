@@ -74,6 +74,8 @@ vllm serve Qwen/Qwen3.5-35B-A3B-FP8 \
   }'
 ```
 
+For a pipeline-parallel prefill producer (`--pipeline-parallel-size > 1`), also set `VLLM_KV_CACHE_LAYOUT=HND`, `TPU_RAIDEN_POOL_TAGS_PER_LAYER=1`, and `TPU_RAIDEN_TRANSFER_PARALLELISM` equal to the engine's worker count (`pipeline_parallel_size * stage_size`, such as `PP * TP` or `PP * PCP`; multi-device stages require `torch_tpu` 0.3.0 or later).
+
 ### Step 3: Launch Decode Instance (`kv_consumer`)
 
 ```bash
@@ -170,6 +172,6 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 | `TPU_RAIDEN_CONTROLLER_ADDRESS` | `""` | `host:port` of the Raiden coordinator (`run_raiden_controller.py`). |
 | `TPU_RAIDEN_JOB_NAME` | `""` | Logical role identifier (`prefill` or `decode`) registered with the Raiden controller. |
 | `TPU_RAIDEN_ENGINE_ID` | `"0"` | Unique engine replica ID within the job role. |
-| `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of concurrent DMA transfer streams per worker. |
+| `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of source transfer units on the prefill producer (for example `TP`, `PCP`, `PP`, or `PP * TP` / `PP * PCP`). |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | KV resharding implementation (`controller` or `host`) when Prefill and Decode shardings differ. |
 | `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport protocol for host-side KV resharding (`zmq` or `tcp`). |

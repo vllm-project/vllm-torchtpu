@@ -126,6 +126,11 @@ def test_tpu_ar_worker_init_device_builds_ar_model_runner(
         "vllm_torchtpu.worker.tpu_worker.ensure_model_parallel_initialized",
         lambda **_: None,
     )
+    init_stage_calls: list[bool] = []
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker.init_pipeline_stage",
+        lambda: init_stage_calls.append(True),
+    )
     monkeypatch.setattr(
         "vllm_torchtpu.worker.tpu_worker.get_pp_group",
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
@@ -147,6 +152,7 @@ def test_tpu_ar_worker_init_device_builds_ar_model_runner(
     with patch.dict(os.environ):
         worker.init_device()
 
+    assert init_stage_calls == [True]
     assert isinstance(worker.model_runner, TPUARModelRunner)
     assert (worker.model_runner.model_stage, worker.model_runner.stage_id) == (
         "thinker",

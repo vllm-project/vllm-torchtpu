@@ -21,7 +21,7 @@ import pytest
 import torch
 from vllm.distributed import parallel_state
 
-from vllm_torchtpu.distributed import mesh_utils, pcp
+from vllm_torchtpu.distributed import mesh_utils, pcp, pipeline_stage
 
 # The real function, captured before any test patches it, so the fakes below
 # reject a call that its signature would reject.
@@ -235,6 +235,11 @@ def test_layout_missing_rank_is_not_cached(monkeypatch):
     assert mesh_utils._LAYOUT_CACHE == {}
 
 
+def _world(size):
+    """The stage of a world of `size` ranks without a pipeline."""
+    return pipeline_stage.PipelineStage(0, 1, tuple(range(size)), 0, None)
+
+
 def _pcp_mesh_environment(monkeypatch, layout_holder, world_size=2):
     """Everything ``get_or_create_pcp_mesh`` reads, except Torchtpu itself.
 
@@ -248,7 +253,7 @@ def _pcp_mesh_environment(monkeypatch, layout_holder, world_size=2):
         "get_pcp_group",
         lambda: SimpleNamespace(world_size=world_size, rank_in_group=0),
     )
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: world_size)
+    monkeypatch.setattr(pipeline_stage, "_STAGE", _world(world_size))
     # A mesh ordered by device id would disagree with the host's
     # rank_in_group split on any machine where the two orders differ, so the
     # point of the change is that this list is never consulted.
@@ -277,7 +282,10 @@ def test_mesh_comes_from_pallas_and_caches_by_axis_and_devices(monkeypatch):
     # Only the axis name: get_pallas_mesh numbers positions by PyTorch rank,
     # which is the binding torch_tpu#3522 guarantees, so there is no device
     # array to hand it.
-    assert get_pallas_mesh.call_args.kwargs == {"axis_names": ("pcp",)}
+    assert get_pallas_mesh.call_args.kwargs == {
+        "axis_names": ("pcp",),
+        "mesh_shape": (2,),
+    }
     assert pcp.get_or_create_pcp_mesh() is first
     assert pcp.get_or_create_pcp_mesh("ring") is not first
     holder[0] = pcp.PcpGroupLayout((0, 1), (10, 30), 1, 2)
@@ -289,7 +297,7 @@ def test_mesh_comes_from_pallas_and_caches_by_axis_and_devices(monkeypatch):
 def test_mesh_rejects_a_pcp_group_smaller_than_the_world(monkeypatch):
     holder = [pcp.PcpGroupLayout((0, 1), (30, 10), 0, 2)]
     get_pallas_mesh = _pcp_mesh_environment(monkeypatch, holder, world_size=2)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: 4)
+    monkeypatch.setattr(pipeline_stage, "_STAGE", _world(4))
 
     with pytest.raises(NotImplementedError, match="world_size=2"):
         pcp.get_or_create_pcp_mesh()
@@ -300,16 +308,16 @@ def test_mesh_rejects_a_pcp_group_smaller_than_the_world(monkeypatch):
 def _stage_mesh_environment(monkeypatch, holder, mesh_device_ids):
     """A slice of four pipeline stages of two devices, seen from stage 1."""
     _pcp_mesh_environment(monkeypatch, holder, world_size=2)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: 8)
-    monkeypatch.setattr(
-        parallel_state,
-        "get_pp_group",
-        lambda: SimpleNamespace(world_size=4, rank_in_group=1),
-    )
     group = SimpleNamespace(
         world_size=2, rank_in_group=0, ranks=[2, 3], device_group=object()
     )
     monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: group)
+    monkeypatch.setattr(
+        pipeline_stage,
+        "_STAGE",
+        pipeline_stage.PipelineStage(1, 4, (2, 3), 0, group),
+    )
+    monkeypatch.setattr(mesh_utils, "get_cp_group_layout", lambda group: holder[0])
 
     mesh = SimpleNamespace(
         devices=SimpleNamespace(

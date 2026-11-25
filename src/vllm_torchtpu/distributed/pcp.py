@@ -21,9 +21,9 @@ import torch
 from vllm_torchtpu.distributed.mesh_utils import (
     CpGroupLayout,
     get_cp_group_layout,
-    get_pipeline_stage,
     get_stage_mesh,
 )
+from vllm_torchtpu.distributed.pipeline_stage import get_pipeline_stage
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -92,17 +92,13 @@ def get_pcp_group_layout() -> PcpGroupLayout:
 def get_or_create_pcp_mesh(
     axis_name: str = "pcp", *, tp_axis_name: str | None = None
 ) -> Any:
-    """Build a rank-aligned PCP x TP mesh over the TorchTPU world.
+    """Build a rank-aligned PCP x TP mesh over this worker's pipeline stage.
 
-    Partition ``pcp_rank * tp_size + tp_rank`` is the global PyTorch rank.
-    Validate the actual vLLM groups rather than silently accepting reordered
-    groups that disagree with that runtime assignment.
-
-    Under pipeline parallelism the mesh covers this worker's stage, whose
-    ranks follow those of the stages before it.
+    Partition ``pcp_rank * tp_size + tp_rank`` is that position among the
+    stage's ranks. Validate the actual vLLM groups rather than silently
+    accepting reordered groups that disagree with that runtime assignment.
     """
     import torch.distributed as dist
-    from torch.tpu.pallas import get_pallas_mesh
 
     layout = get_pcp_group_layout()
     group = get_pcp_group()
@@ -139,48 +135,31 @@ def get_or_create_pcp_mesh(
             np.asarray(jax.local_devices()[:1]).reshape(shape), axis_names=axis_names
         )
     else:
-        world_size = int(dist.get_world_size())
-        stage, stages = get_pipeline_stage()
-        stage_size = layout.world_size * tp_size
-        if stage_size * stages != world_size:
+        stage = get_pipeline_stage()
+        if layout.world_size * tp_size != stage.size:
             raise NotImplementedError(
                 f"PCP world_size={layout.world_size} x TP={tp_size} does not "
-                f"cover the torch.distributed world={world_size}."
+                f"cover the pipeline stage of {stage.size}."
             )
-        if stages > 1 and tp_size > 1:
-            raise NotImplementedError(
-                "A pipeline stage spans a PCP group or a TP group, not both: "
-                f"PCP world_size={layout.world_size}, TP={tp_size}."
-            )
-        stage_start = stage * stage_size
-        expected_pcp_ranks = tuple(
-            range(stage_start + tp_rank, stage_start + stage_size, tp_size)
-        )
+        expected_pcp_ranks = stage.ranks[tp_rank::tp_size]
         if layout.ranks != expected_pcp_ranks:
             raise RuntimeError(
                 "PCP group must follow ranks 0..N-1 reshaped as PCP x TP: "
                 f"expected={expected_pcp_ranks}, actual={layout.ranks}."
             )
         if tp_group is not None:
-            first = stage_start + layout.rank_in_group * tp_size
-            expected_tp_ranks = tuple(range(first, first + tp_size))
+            first = layout.rank_in_group * tp_size
+            expected_tp_ranks = stage.ranks[first : first + tp_size]
             if (
                 tuple(tp_group.ranks) != expected_tp_ranks
-                or int(dist.get_rank()) != first + tp_rank
+                or int(dist.get_rank()) != stage.ranks[first + tp_rank]
             ):
                 raise RuntimeError(
                     "TP group coordinates disagree with the rank-aligned "
                     f"PCP x TP mesh: expected={expected_tp_ranks}, "
                     f"actual={tuple(tp_group.ranks)}."
                 )
-        if stages > 1:
-            mesh = get_stage_mesh(axis_names, shape, group, layout.device_ids)
-        else:
-            mesh = (
-                get_pallas_mesh(axis_names=axis_names)
-                if tp_axis_name is None
-                else get_pallas_mesh(axis_names=axis_names, mesh_shape=shape)
-            )
+        mesh = get_stage_mesh(axis_names, shape)
     logger.info(
         "PCP device mesh | axes=%s shape=%s PCP ranks=%s device_ids=%s",
         axis_names,

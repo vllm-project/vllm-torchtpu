@@ -429,6 +429,33 @@ def test_pp_pcp_producer_topology_and_unit_identity(monkeypatch, pp, pcp):
     assert worker._raiden_interleave_tokens(384, pp * pcp) == 128
 
 
+@pytest.mark.parametrize("pp,tp", [(2, 2), (4, 2), (8, 2), (2, 4)])
+def test_pp_tp_producer_topology_and_unit_identity(monkeypatch, pp, tp):
+    worker = _pp_pcp_worker(monkeypatch, pp=pp, pcp=1, tp=tp, dtp=tp)
+    assert worker._raiden_qwen35_admission_topology() == f"pp{pp}tp{tp}_prefill"
+    monkeypatch.setattr(worker, "_raiden_stage3_enabled", lambda: True)
+    ranks, ports = [], set()
+    for stage in range(pp):
+        for t in range(tp):
+            worker.tp_rank = t
+            pp_group, pcp_rank = _pp_pcp_coordinates(stage, 0)
+            with pp_group, pcp_rank:
+                rank = worker._local_raiden_transfer_rank()
+                endpoint, node = worker._raiden_endpoint_identity()
+            assert endpoint == node == rank
+            ranks.append(rank)
+            ports.add(worker._rank_control_port(9100, rank=endpoint))
+    # Stage-major, then the stage-local TP rank: contiguous from zero.
+    assert ranks == list(range(pp * tp))
+    assert len(ports) == pp * tp
+    # Every TP worker of a stage holds every token of its layers.
+    assert worker._raiden_interleave_tokens(384, pp * tp) == 384
+    with patch.object(tc.tpu_envs, "TPU_RAIDEN_POOL_TAGS_PER_LAYER", True):
+        worker._validate_stage3_transfer_parallelism(pp * tp)
+        with pytest.raises(ValueError, match="PP stage count"):
+            worker._validate_stage3_transfer_parallelism(pp)
+
+
 def test_pp_pcp_decode_stage_keeps_the_stage_rank(monkeypatch):
     worker = _pp_pcp_worker(monkeypatch, producer=False)
     pp_group, pcp_rank = _pp_pcp_coordinates(3, 5)
@@ -436,8 +463,16 @@ def test_pp_pcp_decode_stage_keeps_the_stage_rank(monkeypatch):
         assert worker._local_raiden_transfer_rank() == 3
 
 
+def test_pp_tp_decode_consumer_is_rejected(monkeypatch):
+    worker = _pp_pcp_worker(monkeypatch, pp=2, pcp=1, tp=2, producer=False)
+    worker.vllm_config.parallel_config.data_parallel_size = 2
+    with pytest.raises(ValueError, match="pipeline_parallel_size=2"):
+        worker._raiden_qwen35_admission_topology()
+
+
 @pytest.mark.parametrize(
-    "pp,pcp,tp,hnd", [(4, 8, 2, True), (4, 8, 1, False), (3, 8, 1, True)]
+    "pp,pcp,tp,hnd",
+    [(4, 8, 2, True), (4, 8, 1, False), (3, 8, 1, True), (4, 1, 2, False)],
 )
 def test_pp_pcp_producer_topology_rejects_unsupported_shapes(
     monkeypatch, pp, pcp, tp, hnd
@@ -497,6 +532,7 @@ def _pp_pcp_scheduler(monkeypatch, parallelism):
     scheduler = _make_raiden_scheduler(is_producer=True, pcp_size=8, block_size=384)
     config = scheduler.vllm_config
     config.parallel_config.pipeline_parallel_size = 4
+    config.parallel_config.world_size = 32
     config.parallel_config.cp_kv_cache_interleave_size = 128
     config.kv_transfer_config.kv_connector_extra_config = {
         "destination_decode_context_parallel_size": 8
@@ -532,7 +568,7 @@ def test_pp_pcp_scheduler_metadata_and_finished_count(monkeypatch, tokens):
 
 def test_pp_pcp_scheduler_rejects_stage_count_parallelism(monkeypatch):
     scheduler = _pp_pcp_scheduler(monkeypatch, 4)
-    with pytest.raises(ValueError, match=r"PP \* PCP"):
+    with pytest.raises(ValueError, match=r"PP \* stage size"):
         scheduler.request_finished(
             _finished_request(1000), [0], mamba_block_ids=[[4, 5]]
         )
