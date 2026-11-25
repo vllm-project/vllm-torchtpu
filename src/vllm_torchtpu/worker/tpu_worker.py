@@ -20,6 +20,7 @@ import ctypes
 import gc
 import os
 import time
+from collections.abc import Mapping
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -36,8 +37,11 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
+    get_dp_group,
+    get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
     get_world_group,
     init_distributed_environment,
     model_parallel_is_initialized,
@@ -93,6 +97,42 @@ def _release_free_host_heap() -> None:
     elif hasattr(process, "malloc_trim"):
         process.malloc_trim(0)
         logger.info("Released free host heap via glibc malloc_trim.")
+
+
+def _resolve_sharding_coords(worker: "TPUWorker"):
+    """Return local ``ShardingCoords`` for ``tp``, ``ep``, and ``moe_tp``."""
+    from vllm_torchtpu.rl.weight_installer import ShardingCoords
+
+    pc = worker.parallel_config
+    tp_size = int(get_tensor_model_parallel_world_size())
+    tp_rank = int(get_tensor_model_parallel_rank())
+
+    if pc.enable_expert_parallel:
+        ep_group = get_ep_group()
+        ep_size = int(ep_group.world_size)
+        ep_rank = int(ep_group.rank_in_group)
+        dp_group = get_dp_group()
+        dp_rank = int(dp_group.rank_in_group)
+        dp_size = int(dp_group.world_size)
+        if dp_size <= 1:
+            dp_size = int(utils.get_dp_size(pc))
+        moe_tp_size = max(1, (dp_size * tp_size) // ep_size)
+        global_rank = dp_rank * tp_size + tp_rank
+        moe_tp_rank = global_rank % moe_tp_size
+    else:
+        ep_size = 1
+        ep_rank = 0
+        moe_tp_size = tp_size
+        moe_tp_rank = tp_rank
+
+    return ShardingCoords(
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        moe_tp_rank=moe_tp_rank,
+        moe_tp_size=moe_tp_size,
+    )
 
 
 class TPUWorker(WorkerBase):
@@ -954,6 +994,59 @@ class TPUWorker(WorkerBase):
             transpose_keys=transpose_keys,
             reshard_fn=reshard_fn,
         )
+
+    def get_weight_mapping_manifest(self, *, expert_axis_grouped: bool = True) -> str:
+        """Return the serialized ``weight_mapping`` JSON manifest for this model."""
+        from vllm_torchtpu.rl.manifest_generator import generate_manifest
+
+        return generate_manifest(
+            self.get_model(),
+            parallel_config=self.parallel_config,
+            model_config=self.model_config,
+            vllm_config=self.vllm_config,
+            expert_axis_grouped=expert_axis_grouped,
+        )
+
+    def apply_converted_weights(
+        self,
+        converted_weights: Mapping[str, torch.Tensor],
+        manifest_json: str | None = None,
+    ) -> None:
+        """Install pre-converted global tensors in-place into live model buffers.
+
+        Delegates manifest validation, rank slicing, and exact key/shape/dtype
+        checks to :func:`vllm_torchtpu.rl.weight_installer.stage_converted_weights`,
+        then copies shards in-place without calling ``load_weights()`` or
+        ``process_weights_after_loading()`` and materializes TPU buffers via
+        ``synchronize_tensors()``.
+        """
+        from vllm_torchtpu.rl.weight_installer import stage_converted_weights
+
+        manifest_str = (
+            manifest_json
+            if manifest_json is not None
+            else self.get_weight_mapping_manifest()
+        )
+        staged = stage_converted_weights(
+            self.get_model(),
+            converted_weights,
+            manifest_str,
+            _resolve_sharding_coords(self),
+        )
+
+        updated_tensors: list[torch.Tensor] = []
+        with torch.no_grad():
+            for param, shard in staged:
+                src = (
+                    utils.fresh_buffer(shard)
+                    if shard.device.type == "tpu"
+                    else shard.contiguous()
+                )
+                param.data.copy_(src)
+                updated_tensors.append(param.data)
+
+        if updated_tensors and any(t.device.type == "tpu" for t in updated_tensors):
+            utils.synchronize_tensors(updated_tensors, wait=True)
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         if not has_kv_transfer_group():
