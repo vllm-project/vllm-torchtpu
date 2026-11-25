@@ -531,7 +531,7 @@ class TestMoEForwardPrecisionBranches:
                 topk=2,
                 activation="silu",
                 skip_padded_tokens=True,
-                row_info=torch.tensor([2], dtype=torch.int32),
+                row_info=torch.tensor([False, False, True, True]),
             )
 
     @pytest.mark.parametrize("pipelined", [False, True])

@@ -18,44 +18,56 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_torchtpu.layers.adapter import moe_skip_policy as msp
+from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedConfig,
+)
 
 
-def _supported_parallel_config(**overrides):
-    cfg = {
+@pytest.fixture(autouse=True)
+def _flag_on(monkeypatch):
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+    for name in (
+        "TORCH_TPU_DP_SIZE",
+        "TPU_MOE_COLLECTION_CHUNK_SIZE",
+        "USE_MOE_TP_DECODE_KERNEL",
+        "FUSED_MOE_DECODE_KERNEL",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _supported_config(**parallel_overrides):
+    parallel = {
         "data_parallel_size": 1,
         "pipeline_parallel_size": 1,
         "prefill_context_parallel_size": 1,
         "decode_context_parallel_size": 1,
         "enable_expert_parallel": False,
     }
-    cfg.update(overrides)
-    return SimpleNamespace(**cfg)
+    parallel.update(parallel_overrides)
+    return SimpleNamespace(
+        quant_config=VllmUnquantizedConfig(),
+        parallel_config=SimpleNamespace(**parallel),
+        speculative_config=None,
+        lora_config=None,
+    )
 
 
-def _resolve(**overrides):
-    kwargs = {
-        "skip_flag": True,
-        "parallel_config": _supported_parallel_config(),
-        "pipelined_collective": False,
-        "fused_decode_kernel": False,
-        "has_speculative": False,
-        "has_lora": False,
-        "is_unquantized_model": True,
-    }
-    kwargs.update(overrides)
-    return msp.resolve_bf16_moe_skip_policy(**kwargs)
+def test_supported_config_enables_skipping():
+    policy = msp.resolve_bf16_moe_skip_policy(_supported_config())
+    assert policy == msp.Bf16MoeSkipPolicy(enabled=True)
 
 
-def test_resolve_policy_supported_enables_skipping():
-    policy = _resolve()
-    assert policy.enabled is True
-    assert policy.fallback_reason is None
+@pytest.mark.parametrize("config", [_supported_config(), None])
+def test_flag_off_is_stock_without_reason(monkeypatch, config):
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+    policy = msp.resolve_bf16_moe_skip_policy(config)
+    assert policy == msp.Bf16MoeSkipPolicy(enabled=False)
 
 
-def test_resolve_policy_flag_off_is_stock_without_reason():
-    policy = _resolve(skip_flag=False)
+def test_no_current_config_runs_stock_with_reason():
+    policy = msp.resolve_bf16_moe_skip_policy(None)
     assert policy.enabled is False
-    assert policy.fallback_reason is None
+    assert policy.fallback_reason == "no current VllmConfig"
 
 
 @pytest.mark.parametrize(
@@ -68,80 +80,75 @@ def test_resolve_policy_flag_off_is_stock_without_reason():
         "decode_context_parallel_size",
     ],
 )
-def test_resolve_policy_fails_loudly_on_missing_parallel_field(missing):
+def test_missing_parallel_field_fails_loudly(missing):
     """A missing ParallelConfig field raises instead of defaulting to a size
     that would admit skipping."""
-    cfg = _supported_parallel_config()
-    delattr(cfg, missing)
+    config = _supported_config()
+    delattr(config.parallel_config, missing)
     with pytest.raises(AttributeError, match=missing):
-        _resolve(parallel_config=cfg)
+        msp.resolve_bf16_moe_skip_policy(config)
 
 
 @pytest.mark.parametrize(
-    "overrides, expected_fragment",
+    "mutate, expected",
     [
-        ({"is_unquantized_model": False}, "quantized model"),
+        (lambda c, mp: setattr(c, "quant_config", object()), "quantized model"),
         (
-            {
-                "parallel_config": _supported_parallel_config(
-                    enable_expert_parallel=True
-                )
-            },
-            "expert",
+            lambda c, mp: setattr(c.parallel_config, "enable_expert_parallel", True),
+            "expert parallelism",
         ),
         (
-            {"parallel_config": _supported_parallel_config(data_parallel_size=2)},
-            "data_parallel_size",
+            lambda c, mp: setattr(c.parallel_config, "data_parallel_size", 2),
+            "data_parallel_size > 1",
         ),
         (
-            {"parallel_config": _supported_parallel_config(pipeline_parallel_size=2)},
-            "pipeline_parallel_size",
+            lambda c, mp: setattr(c.parallel_config, "pipeline_parallel_size", 2),
+            "pipeline_parallel_size > 1",
         ),
         (
-            {
-                "parallel_config": _supported_parallel_config(
-                    prefill_context_parallel_size=2
-                )
-            },
-            "prefill_context_parallel_size",
+            lambda c, mp: setattr(
+                c.parallel_config, "prefill_context_parallel_size", 2
+            ),
+            "prefill_context_parallel_size > 1",
         ),
         (
-            {
-                "parallel_config": _supported_parallel_config(
-                    decode_context_parallel_size=2
-                )
-            },
-            "decode_context_parallel_size",
+            lambda c, mp: setattr(c.parallel_config, "decode_context_parallel_size", 2),
+            "decode_context_parallel_size > 1",
         ),
-        ({"pipelined_collective": True}, "pipelined"),
-        ({"fused_decode_kernel": True}, "fused MoE decode"),
-        ({"has_speculative": True}, "speculative"),
-        ({"has_lora": True}, "LoRA"),
+        (
+            lambda c, mp: mp.setenv("TPU_MOE_COLLECTION_CHUNK_SIZE", "16"),
+            "pipelined MoE collective (TPU_MOE_COLLECTION_CHUNK_SIZE)",
+        ),
+        (
+            lambda c, mp: setattr(c, "speculative_config", SimpleNamespace()),
+            "speculative decoding",
+        ),
+        (lambda c, mp: setattr(c, "lora_config", SimpleNamespace()), "LoRA"),
     ],
 )
-def test_resolve_policy_unsupported_falls_back_to_stock(overrides, expected_fragment):
-    """Unsupported topologies and features fall back to the stock contract
-    before model load / prebuild."""
-    policy = _resolve(**overrides)
-    assert policy.enabled is False
-    assert policy.fallback_reason is not None
-    assert expected_fragment in policy.fallback_reason
+def test_unsupported_config_falls_back_to_stock(monkeypatch, mutate, expected):
+    config = _supported_config()
+    mutate(config, monkeypatch)
+    policy = msp.resolve_bf16_moe_skip_policy(config)
+    assert policy == msp.Bf16MoeSkipPolicy(enabled=False, fallback_reason=expected)
 
 
-def test_bf16_policy_scope_nests_and_restores():
-    assert msp.get_active_bf16_policy() is None
-    outer = msp.Bf16MoeSkipPolicy(enabled=True)
-    inner = msp.Bf16MoeSkipPolicy(enabled=False, fallback_reason="test")
-    with msp.bf16_policy_scope(outer):
-        assert msp.get_active_bf16_policy() is outer
-        with msp.bf16_policy_scope(inner):
-            assert msp.get_active_bf16_policy() is inner
-        assert msp.get_active_bf16_policy() is outer
-    assert msp.get_active_bf16_policy() is None
+def test_dp_without_ep_falls_back_to_stock(monkeypatch):
+    """For DP without EP the worker sets data_parallel_size to 1, so the DP
+    size comes from TORCH_TPU_DP_SIZE (utils.get_dp_size)."""
+    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "2")
+    policy = msp.resolve_bf16_moe_skip_policy(_supported_config(data_parallel_size=1))
+    assert policy == msp.Bf16MoeSkipPolicy(
+        enabled=False, fallback_reason="data_parallel_size > 1"
+    )
 
 
-def test_bf16_policy_scope_restores_on_error():
-    policy = msp.Bf16MoeSkipPolicy(enabled=True)
-    with pytest.raises(RuntimeError, match="boom"), msp.bf16_policy_scope(policy):
-        raise RuntimeError("boom")
-    assert msp.get_active_bf16_policy() is None
+@pytest.mark.parametrize(
+    "name", ["USE_MOE_TP_DECODE_KERNEL", "FUSED_MOE_DECODE_KERNEL"]
+)
+def test_fused_moe_decode_kernels_keep_skipping(monkeypatch, name):
+    """Both fused MoE decode kernels admit only FP8 MoE layers, so they never
+    serve a BF16 MoE layer and do not turn skipping off."""
+    monkeypatch.setenv(name, "1")
+    policy = msp.resolve_bf16_moe_skip_policy(_supported_config())
+    assert policy == msp.Bf16MoeSkipPolicy(enabled=True)

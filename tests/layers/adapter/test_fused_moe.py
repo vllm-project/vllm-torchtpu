@@ -164,3 +164,86 @@ def test_get_fused_moe_activation_compiles():
 
     res = compiled_fn(torch.ones(1).to("tpu"), _Activation.SILU)
     assert res.cpu() == 2.0
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_tokens,num_valid", [(16, 0), (16, 9), (16, 16)])
+def test_adapter_padding_mask_through_custom_op_matches_stock(num_tokens, num_valid):
+    """fused_moe_gmm hands row_info (the token padding mask) to the compiled
+    custom op as a positional operand: real rows match the stock op bit for
+    bit, padded rows (non-zero gates, perturbed hidden states) are dropped."""
+    experts, hidden, inter, topk = 16, 2048, 768, 8
+    dev = torch.device("tpu")
+    gen = torch.Generator().manual_seed(0)
+    w1 = (torch.randn(experts, hidden, 2 * inter, generator=gen) * 0.02).to(
+        torch.bfloat16
+    )
+    w2 = (torch.randn(experts, inter, hidden, generator=gen) * 0.02).to(torch.bfloat16)
+    x = torch.randn(num_tokens, hidden, generator=gen)
+    x[num_valid:] *= 50
+    rows = torch.arange(num_tokens)[:, None]
+    ids = ((rows + 2 * torch.arange(topk)[None, :]) % experts).to(torch.int32)
+    weights = torch.rand(num_tokens, topk, generator=gen) * 0.25 + 0.05
+    if num_valid > 0:
+        weights[0, 0] = 0.0
+    # The runner's whole mask buffer, longer than the step.
+    mask = torch.zeros(2 * num_tokens, dtype=torch.bool)
+    mask[num_valid:num_tokens] = True
+    w1, w2, x, ids, weights, mask = (
+        t.to(dev)
+        for t in (w1, w2, x.to(torch.bfloat16), ids, weights.to(torch.bfloat16), mask)
+    )
+
+    fused_moe.prebuild_fused_moe_kernel(
+        topk=topk, activation="silu", use_ep=False, skip_padded_tokens=False
+    )
+    fused_moe.prebuild_fused_moe_kernel(
+        topk=topk,
+        activation="silu",
+        use_ep=False,
+        skip_padded_tokens=True,
+        has_row_info=True,
+    )
+
+    def stock(x, weights, ids):
+        return fused_moe.fused_moe_gmm(
+            x,
+            w1,
+            w2,
+            None,
+            None,
+            None,
+            None,
+            weights,
+            ids,
+            None,
+            topk,
+            "silu",
+            skip_padded_tokens=False,
+        )
+
+    def skipped(x, weights, ids, mask):
+        return fused_moe.fused_moe_gmm(
+            x,
+            w1,
+            w2,
+            None,
+            None,
+            None,
+            None,
+            weights,
+            ids,
+            None,
+            topk,
+            "silu",
+            skip_padded_tokens=True,
+            row_info=mask,
+        )
+
+    compile_opts = dict(backend="tpu", fullgraph=True, dynamic=False)
+    ref = torch.compile(stock, **compile_opts)(x, weights, ids).cpu()
+    out = torch.compile(skipped, **compile_opts)(x, weights, ids, mask).cpu()
+    assert torch.equal(out[:num_valid], ref[:num_valid])
+    assert torch.equal(out[num_valid:], torch.zeros_like(out[num_valid:]))
+    if num_valid < num_tokens:
+        assert ref[num_valid:].float().abs().max() > 0

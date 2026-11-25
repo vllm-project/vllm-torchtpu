@@ -24,40 +24,20 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
-    # This rank's valid-token count as a 1-element int32 device tensor, read by
-    # every MoE layer; allocated and updated only with track_valid_tokens=True.
-    local_valid_tokens: torch.Tensor | None = None
 
     @classmethod
-    def create(
-        cls,
-        max_local_tokens: int,
-        device,
-        *,
-        track_valid_tokens: bool = False,
-    ) -> "TokenPaddingState":
+    def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
         local_padding_mask = torch.zeros(
             max_local_tokens, dtype=torch.bool, device=device
         )
-        local_valid_tokens = (
-            torch.zeros(1, dtype=torch.int32, device=device)
-            if track_valid_tokens
-            else None
-        )
-        return cls(
-            local_padding_mask=local_padding_mask, local_valid_tokens=local_valid_tokens
-        )
+        return cls(local_padding_mask=local_padding_mask)
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
-        """Write this rank's token padding mask (and valid count if enabled)."""
+        """Write this rank's token padding mask."""
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
-        if self.local_valid_tokens is not None:
-            self.local_valid_tokens.copy_(
-                torch.tensor([local_valid_tokens], dtype=torch.int32)
-            )
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
@@ -66,13 +46,6 @@ class TokenPaddingState:
 def set_padding_state(state: "TokenPaddingState | None") -> None:
     global _padding_state
     _padding_state = state
-
-
-def get_local_valid_tokens() -> torch.Tensor | None:
-    """Return this rank's 1-element int32 valid-row count tensor, or None."""
-    if _padding_state is None:
-        return None
-    return _padding_state.local_valid_tokens
 
 
 def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:
