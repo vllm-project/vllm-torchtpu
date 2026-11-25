@@ -28,17 +28,18 @@ Kimi Delta Attention elsewhere; the first `first_k_dense_replace` layers have a
 wide dense SwiGLU and no routed experts. The token embedding is scaled by
 sqrt(hidden_size) and RMS-normalized before the first layer.
 
-The KDA layers run the same fused conv1d + GDN v3 Pallas kernel as Kimi, with
-OLMo's value heads twice as wide as its key heads and beta in [0, 2). The
+The KDA, latent-MoE and MLP layers are the shared ones in `layers/adapter/`
+(also used by Kimi K3): KDA runs the fused conv1d + GDN v3 Pallas kernel with
+OLMo's value heads twice as wide as its key heads and beta in [0, 2), and the
 routed experts go through vLLM's TPU fused-MoE backend with the latent
-projections as its routed input / output transforms, as in Kimi K3.
+projections as its routed input / output transforms.
 
 Checkpoint names (HF safetensors), per layer `model.layers.{i}.`:
 
     attn_in_norm / attn_out_norm / ffn_in_norm / ffn_out_norm .weight
     KDA layers, mixer.:
-        q_proj / k_proj / v_proj / b_proj .weight       -> qkvb_proj
-        f_a_proj / g_a_proj .weight                     -> fg_a_proj
+        q_proj / k_proj / v_proj / b_proj .weight       -> fused_qkvb_proj
+        f_a_proj / g_a_proj .weight                     -> fused_fa_ga_proj
         f_b_proj.weight, g_b_proj.weight / .bias
         q_conv1d / k_conv1d / v_conv1d .weight          [channels, 1, kernel]
         A_log, dt_bias, o_norm.weight, o_proj.weight
@@ -49,7 +50,9 @@ Checkpoint names (HF safetensors), per layer `model.layers.{i}.`:
     dense layers (i < first_k_dense_replace), mlp.:
         gate_proj / up_proj / down_proj .weight
     MoE layers, moe.:
-        gate.weight, latent_down.weight, latent_up.weight
+        gate.weight
+        latent_down.weight                              -> routed_expert_down_proj
+        latent_up.weight                                -> routed_expert_up_proj
         shared_experts.{gate_proj,up_proj,down_proj}.weight
         experts.{e}.{gate_proj,up_proj,down_proj}.weight
 
@@ -61,48 +64,36 @@ format; the loader will follow it once it is.
 from __future__ import annotations
 
 import math
-import zlib
 from collections.abc import Iterable
 from typing import Any, cast
 
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig, get_current_vllm_config_or_none
+from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import (
-    FusedMoEFactory,
-    fused_moe_make_expert_params_mapping,
-)
-from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
+from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
-    is_conv_state_dim_first,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    sharded_weight_loader,
-)
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
@@ -110,25 +101,14 @@ from vllm.model_executor.models.utils import (
     maybe_prefix,
 )
 from vllm.model_executor.utils import set_weight_attrs
-from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
-from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
-    build_kimi_dispatched_kda_op,
-)
-from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import make_latent_projection
-from vllm_torchtpu.layers.adapter.moe_hierarchical import (
-    hierarchical_moe_parallel_config,
-    hierarchical_split_or_none,
-)
-from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-from vllm_torchtpu.models.vllm.kimi_k3.attention import (
-    CausalDepthwiseConv1d,
-    _load_a_log,
+from vllm_torchtpu.layers.adapter.gated_mlp import GatedMLP
+from vllm_torchtpu.layers.adapter.kda_attention import (
+    KdaAttention,
     kda_state_dtype,
+    kda_state_shape,
 )
-from vllm_torchtpu.models.vllm.kimi_k3.layers import KimiMLP
-from vllm_torchtpu.models.vllm.kimi_k3.moe import KimiRoutedOutputTransform
-from vllm_torchtpu.utils import fresh_buffer
+from vllm_torchtpu.layers.adapter.latent_moe import LatentMoE
 
 from .config import Olmo35Config
 
@@ -144,205 +124,37 @@ def _config(vllm_config: VllmConfig) -> Olmo35Config:
     return config
 
 
-def _kda_local_dims(config: Olmo35Config, tp_size: int) -> tuple[int, int, int, int]:
-    """Per-rank (heads, key head dim, value head dim, conv channels)."""
+def _local_kda_heads(config: Olmo35Config, tp_size: int) -> int:
     if config.linear_num_heads % tp_size:
         raise ValueError(
             f"TP ({tp_size}) must divide the OLMo 3.5 KDA heads "
             f"({config.linear_num_heads})"
         )
-    heads = config.linear_num_heads // tp_size
-    head_k = config.linear_key_head_dim
-    head_v = config.linear_value_head_dim
-    return heads, head_k, head_v, heads * (2 * head_k + head_v)
+    return config.linear_num_heads // tp_size
 
 
-class Olmo35KimiDeltaAttention(nn.Module, MambaBase):
-    """OLMo 3.5 KDA, executed by the fused conv1d + GDN v3 Pallas kernel.
+def olmo35_kda(vllm_config: VllmConfig, prefix: str) -> KdaAttention:
+    """OLMo 3.5's KDA mixer: the shared layer with value heads twice the key
+    head size, low-rank gates of the value head size, a biased output gate
+    and beta in [0, 2).
 
-    Differs from Kimi's KDA in the value head size (2x the key head size),
-    the low-rank decay / output-gate projections (rank = value head size,
-    and the gate's second projection has a bias) and beta's range ([0, 2)).
+    TPUOlmo35Config rejects the unified pool and speculative decoding when
+    vLLM builds the config, before any layer is constructed.
     """
-
-    supports_dcp = False
-
-    def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
-        super().__init__()
-        # TPUOlmo35Config rejects the unified pool and speculative decoding
-        # when vLLM builds the config, before any layer is constructed.
-        config = _config(vllm_config)
-        self.prefix = prefix
-        self.vllm_config = vllm_config
-        self.tp_size = get_tensor_model_parallel_world_size()
-        self.total_heads = config.linear_num_heads
-        self.num_heads, self.head_k_dim, self.head_v_dim, self.local_conv_dim = (
-            _kda_local_dims(config, self.tp_size)
-        )
-        self.conv_size = config.linear_conv_kernel_dim
-        key_width = self.total_heads * self.head_k_dim
-        value_width = self.total_heads * self.head_v_dim
-        quant_config = vllm_config.quant_config
-
-        # q | k | v | b in one matmul. Each rank's output is its own q, k, v
-        # and b slices back to back, so the first `local_conv_dim` columns
-        # are exactly the kernel's mixed_qkv layout.
-        self.qkvb_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [key_width, key_width, value_width, self.total_heads],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.qkvb_proj",
-        )
-        # Low-rank decay (f) and output gate (g) down-projections, replicated.
-        self.fg_a_proj = MergedColumnParallelLinear(
-            config.hidden_size,
-            [self.head_v_dim, self.head_v_dim],
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fg_a_proj",
-            disable_tp=True,
-        )
-        self.f_b_proj = ColumnParallelLinear(
-            self.head_v_dim,
-            key_width,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.f_b_proj",
-        )
-        self.g_b_proj = ColumnParallelLinear(
-            self.head_v_dim,
-            value_width,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.g_b_proj",
-        )
-        self.q_conv1d = CausalDepthwiseConv1d(key_width, self.conv_size)
-        self.k_conv1d = CausalDepthwiseConv1d(key_width, self.conv_size)
-        self.v_conv1d = CausalDepthwiseConv1d(value_width, self.conv_size)
-        # [kernel_size, local q | k | v channels], built from the three
-        # checkpoint convs in `process_weights_after_loading`.
-        self.register_buffer(
-            "conv_weight_fused",
-            torch.empty(self.conv_size, self.local_conv_dim),
-            persistent=False,
-        )
-        self.A_log = nn.Parameter(torch.empty(self.num_heads, dtype=torch.float32))
-        self.dt_bias = nn.Parameter(
-            torch.empty(self.num_heads * self.head_k_dim, dtype=torch.float32)
-        )
-        set_weight_attrs(self.A_log, {"weight_loader": _load_a_log})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
-        self.o_norm = RMSNorm(self.head_v_dim, config.linear_norm_eps)
-        self.o_proj = RowParallelLinear(
-            value_width,
-            config.hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
-        )
-        # Bound by vLLM to (conv_state, recurrent_state); empty until then.
-        self.kv_cache: tuple[torch.Tensor, ...] = ()
-        self.kda_op = build_kimi_dispatched_kda_op(
-            prefix,
-            lower_bound=None,
-            eps=config.linear_norm_eps,
-            state_dim_first=is_conv_state_dim_first(),
-            beta_scale=config.linear_beta_scale,
-        )
-
-        context = vllm_config.compilation_config.static_forward_context
-        if prefix in context:
-            raise ValueError(f"Duplicate layer name: {prefix}")
-        context[prefix] = self
-
-    @property
-    def mamba_type(self) -> MambaAttentionBackendEnum:
-        return MambaAttentionBackendEnum.LINEAR
-
-    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
-        return kda_state_dtype(self.vllm_config)
-
-    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        return (
-            (self.conv_size - 1, 1, self.local_conv_dim),
-            (self.num_heads, self.head_k_dim, self.head_v_dim),
-        )
-
-    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
-        del act_dtype
-        fused = torch.cat(
-            [
-                w[:, 0, :].t()
-                for w in (
-                    self.q_conv1d.weight,
-                    self.k_conv1d.weight,
-                    self.v_conv1d.weight,
-                )
-            ],
-            dim=1,
-        )
-        # Break the lazy view chain so the op sees a plain row-major buffer
-        # (see KimiDeltaAttention.process_weights_after_loading).
-        self.conv_weight_fused = fresh_buffer(fused)
-
-    def _metadata(self) -> AttentionMetadata | None:
-        if not is_forward_context_available():
-            return None
-        metadata = get_forward_context().attn_metadata
-        if not isinstance(metadata, dict):
-            return None
-        layer_metadata = metadata[self.prefix]
-        if not isinstance(layer_metadata, AttentionMetadata):
-            raise TypeError("KDA received incompatible attention metadata")
-        return layer_metadata
-
-    def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
-        del positions
-        projected, _ = self.qkvb_proj(hidden_states)
-        mixed_qkv, beta = projected.split([self.local_conv_dim, self.num_heads], dim=-1)
-        fg, _ = self.fg_a_proj(hidden_states)
-        f_a, g_a = fg.split([self.head_v_dim, self.head_v_dim], dim=-1)
-        raw_gate, _ = self.f_b_proj(f_a)
-        output_gate, _ = self.g_b_proj(g_a)
-
-        metadata = self._metadata()
-        if metadata is None or not self.kv_cache or self.kv_cache[0].numel() == 0:
-            output = hidden_states.new_zeros(
-                (hidden_states.shape[0], self.num_heads * self.head_v_dim)
-            )
-        else:
-            conv_cache, recurrent_cache = self.kv_cache
-            window_distribution = metadata.mamba_request_distribution
-            if window_distribution is None:
-                window_distribution = metadata.request_distribution
-            # Unused without speculative decoding; any int32 [N] tensor keeps
-            # the op's ABI (see KimiDeltaAttention.forward).
-            slot_read_offsets = metadata.mamba_slot_read_offsets
-            if slot_read_offsets is None:
-                slot_read_offsets = metadata.mamba_state_indices
-                if slot_read_offsets is None:
-                    slot_read_offsets = metadata.seq_lens
-            output = self.kda_op(
-                mixed_qkv,
-                raw_gate,
-                beta,
-                output_gate,
-                conv_cache,
-                recurrent_cache,
-                self.conv_weight_fused,
-                self.A_log,
-                self.dt_bias,
-                self.o_norm.weight,
-                cast(torch.Tensor, metadata.query_start_loc),
-                cast(torch.Tensor, metadata.mamba_state_indices),
-                cast(torch.Tensor, metadata.seq_lens),
-                cast(torch.Tensor, metadata.request_distribution),
-                cast(torch.Tensor, window_distribution),
-                cast(torch.Tensor, slot_read_offsets),
-            ).flatten(1)
-        output, _ = self.o_proj(output)
-        return output
+    config = _config(vllm_config)
+    return KdaAttention(
+        vllm_config,
+        prefix,
+        hidden_size=config.hidden_size,
+        num_heads=config.linear_num_heads,
+        head_k_dim=config.linear_key_head_dim,
+        head_v_dim=config.linear_value_head_dim,
+        conv_kernel_size=config.linear_conv_kernel_dim,
+        gate_rank=config.linear_value_head_dim,
+        norm_eps=config.linear_norm_eps,
+        gate_bias=True,
+        beta_scale=config.linear_beta_scale,
+    )
 
 
 def _head_sharded_loader(total_heads: int):
@@ -482,7 +294,9 @@ class Olmo35Attention(nn.Module):
         return output
 
 
-class Olmo35MoE(nn.Module):
+def olmo35_moe(
+    config: Olmo35Config, quant_config: QuantizationConfig | None, prefix: str
+) -> LatentMoE:
     """Shared SwiGLU expert plus routed experts in a latent space.
 
     The router scores the full-width input; the experts see
@@ -491,106 +305,28 @@ class Olmo35MoE(nn.Module):
     `routed_scaling_factor` (top_k); the scale is folded into `latent_up`'s
     weight at load time, so the fused-MoE router runs unscaled.
     """
-
-    def __init__(
-        self,
-        config: Olmo35Config,
-        quant_config: QuantizationConfig | None,
-        prefix: str,
-    ) -> None:
-        super().__init__()
-        self.prefix = prefix
-        hidden_size = config.hidden_size
-        latent_size = config.moe_latent_size
-        tp_size = get_tensor_model_parallel_world_size()
-        vllm_config = get_current_vllm_config_or_none()
-        use_ep = (
-            vllm_config is not None
-            and vllm_config.parallel_config.enable_expert_parallel
-        )
-
-        self.gate = GateLinear(
-            input_size=hidden_size,
-            output_size=config.num_experts,
-            bias=False,
-            out_dtype=torch.float32,
-            prefix=f"{prefix}.gate",
-        )
-        self.latent_down = make_latent_projection(
-            hidden_size,
-            latent_size,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.latent_down",
-        )
-        self.latent_up = make_latent_projection(
-            latent_size,
-            hidden_size,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.latent_up",
-        )
-        self.shared_experts = KimiMLP(
-            hidden_size,
+    return LatentMoE(
+        hidden_size=config.hidden_size,
+        num_experts=config.num_experts,
+        top_k=config.num_experts_per_tok,
+        intermediate_size=config.moe_intermediate_size,
+        hidden_act=config.hidden_act,
+        quant_config=quant_config,
+        prefix=prefix,
+        shared_experts=GatedMLP(
+            config.hidden_size,
             config.shared_expert_intermediate_size,
             config.hidden_act,
             quant_config=quant_config,
             prefix=f"{prefix}.shared_experts",
             reduce_results=False,
-        )
-
-        intermediate_size = config.moe_intermediate_size
-        if use_ep:
-            split = hierarchical_split_or_none()
-            moe_tp_size = split[2] if split is not None else 1
-        else:
-            moe_tp_size = tp_size
-        min_per_partition = 128
-        if moe_tp_size > 1 and intermediate_size // moe_tp_size < min_per_partition:
-            raise ValueError(
-                "OLMo 3.5 expert width per TP shard is below the TPU GMM "
-                "minimum; enable expert parallelism"
-            )
-        with hierarchical_moe_parallel_config():
-            self.experts = FusedMoEFactory(
-                shared_experts=self.shared_experts,
-                num_experts=config.num_experts,
-                top_k=config.num_experts_per_tok,
-                hidden_size=latent_size,
-                intermediate_size=intermediate_size,
-                activation=config.hidden_act,
-                renormalize=True,
-                quant_config=quant_config,
-                prefix=f"{prefix}.experts",
-                scoring_func="softmax",
-                routed_scaling_factor=1.0,
-                routed_input_transform=self.latent_down,
-                routed_output_transform=KimiRoutedOutputTransform(None, self.latent_up),
-            )
-
-    def initialize_dummy_router(self) -> None:
-        """Give dummy-loaded routers unit-variance logits.
-
-        The dummy loader's +/-1e-3 weights make every router logit ~0, so top-k
-        ties send every token to the same experts and EP benchmarks measure
-        one hot rank. Fan-in scaled normal weights spread the load the way a
-        trained router roughly does.
-        """
-        config = get_current_vllm_config_or_none()
-        if config is None or str(config.load_config.load_format).lower() != "dummy":
-            return
-        generator = torch.Generator(device="cpu").manual_seed(
-            1234 + zlib.crc32(self.prefix.encode())
-        )
-        weight_param = cast(torch.Tensor, self.gate.weight)
-        weight = torch.randn(weight_param.shape, generator=generator)
-        weight *= self.gate.input_size**-0.5
-        with torch.no_grad():
-            weight_param.copy_(weight)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits, _ = self.gate(hidden_states)
-        return self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        ),
+        scoring_func="softmax",
+        renormalize=True,
+        routed_scaling_factor=1.0,
+        use_score_correction_bias=False,
+        latent_size=config.moe_latent_size,
+    )
 
 
 class Olmo35DecoderLayer(nn.Module):
@@ -602,15 +338,15 @@ class Olmo35DecoderLayer(nn.Module):
         if self.is_full_attention:
             self.mixer: nn.Module = Olmo35Attention(vllm_config, f"{prefix}.mixer")
         else:
-            self.mixer = Olmo35KimiDeltaAttention(vllm_config, f"{prefix}.mixer")
+            self.mixer = olmo35_kda(vllm_config, f"{prefix}.mixer")
 
         self.is_moe = self.layer_idx >= config.first_k_dense_replace
         if self.is_moe:
-            self.moe = Olmo35MoE(
+            self.moe = olmo35_moe(
                 config, vllm_config.quant_config, prefix=f"{prefix}.moe"
             )
         else:
-            self.mlp = KimiMLP(
+            self.mlp = GatedMLP(
                 config.hidden_size,
                 config.intermediate_size,
                 config.hidden_act,
@@ -687,17 +423,23 @@ class Olmo35ForCausalLM(nn.Module, HasInnerState, IsHybrid):
     # attention layer both have mixer.q_proj / k_proj / v_proj, so each entry
     # applies only where its target parameter exists.
     stacked_params_mapping = (
-        (".mixer.q_proj.", ".mixer.qkvb_proj.", 0),
-        (".mixer.k_proj.", ".mixer.qkvb_proj.", 1),
-        (".mixer.v_proj.", ".mixer.qkvb_proj.", 2),
-        (".mixer.b_proj.", ".mixer.qkvb_proj.", 3),
-        (".mixer.f_a_proj.", ".mixer.fg_a_proj.", 0),
-        (".mixer.g_a_proj.", ".mixer.fg_a_proj.", 1),
+        (".mixer.q_proj.", ".mixer.fused_qkvb_proj.", 0),
+        (".mixer.k_proj.", ".mixer.fused_qkvb_proj.", 1),
+        (".mixer.v_proj.", ".mixer.fused_qkvb_proj.", 2),
+        (".mixer.b_proj.", ".mixer.fused_qkvb_proj.", 3),
+        (".mixer.f_a_proj.", ".mixer.fused_fa_ga_proj.", 0),
+        (".mixer.g_a_proj.", ".mixer.fused_fa_ga_proj.", 1),
         (".mixer.q_proj.", ".mixer.qkv_proj.", "q"),
         (".mixer.k_proj.", ".mixer.qkv_proj.", "k"),
         (".mixer.v_proj.", ".mixer.qkv_proj.", "v"),
         (".gate_proj.", ".gate_up_proj.", 0),
         (".up_proj.", ".gate_up_proj.", 1),
+    )
+
+    # (checkpoint name, parameter name) of the latent-MoE projections.
+    latent_params_mapping = (
+        (".moe.latent_down.", ".moe.routed_expert_down_proj."),
+        (".moe.latent_up.", ".moe.routed_expert_up_proj."),
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -733,7 +475,7 @@ class Olmo35ForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def process_weights_after_loading(self) -> None:
         for module in self.modules():
-            if isinstance(module, Olmo35MoE):
+            if isinstance(module, LatentMoE):
                 module.initialize_dummy_router()
 
     @classmethod
@@ -750,12 +492,13 @@ class Olmo35ForCausalLM(nn.Module, HasInnerState, IsHybrid):
         cls, vllm_config: VllmConfig
     ) -> tuple[tuple[int, ...], tuple[int, int, int]]:
         config = _config(vllm_config)
-        heads, head_k, head_v, conv_dim = _kda_local_dims(
-            config, vllm_config.parallel_config.tensor_parallel_size
-        )
-        return (
-            (config.linear_conv_kernel_dim - 1, 1, conv_dim),
-            (heads, head_k, head_v),
+        return kda_state_shape(
+            num_heads=_local_kda_heads(
+                config, vllm_config.parallel_config.tensor_parallel_size
+            ),
+            head_k_dim=config.linear_key_head_dim,
+            head_v_dim=config.linear_value_head_dim,
+            conv_kernel_size=config.linear_conv_kernel_dim,
         )
 
     @classmethod
@@ -779,9 +522,11 @@ class Olmo35ForCausalLM(nn.Module, HasInnerState, IsHybrid):
         def _ordinary_weights():
             for name, loaded_weight in weights:
                 if ".moe.latent_up." in name and routed_scale != 1.0:
-                    # See Olmo35MoE: the top-k rescale is linear, so it is
+                    # See olmo35_moe: the top-k rescale is linear, so it is
                     # folded into the latent up-projection.
                     loaded_weight = loaded_weight * routed_scale
+                for checkpoint_name, param_name in self.latent_params_mapping:
+                    name = name.replace(checkpoint_name, param_name)
                 if ".moe.experts." in name:
                     for (
                         param_name,

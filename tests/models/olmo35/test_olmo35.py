@@ -28,9 +28,9 @@ from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.model_executor.utils import set_weight_attrs
 
 import vllm_torchtpu.gdn_pool_layout as gdn_pool_layout
+import vllm_torchtpu.layers.adapter.kda_attention as kda_attention
 import vllm_torchtpu.models.olmo35.config as config_mod
 import vllm_torchtpu.models.olmo35.model as model_mod
-import vllm_torchtpu.models.vllm.kimi_k3.attention as kimi_attention
 from vllm_torchtpu.models.olmo35.config import Olmo35Config
 from vllm_torchtpu.models.vllm import register_models
 
@@ -202,7 +202,7 @@ def test_tpu_config_allows_the_decode_bench_connector(monkeypatch):
 
 def test_tp_must_divide_the_kda_heads():
     with pytest.raises(ValueError, match=r"TP \(3\) must divide"):
-        model_mod._kda_local_dims(Olmo35Config(), 3)
+        model_mod._local_kda_heads(Olmo35Config(), 3)
 
 
 class _FakeLinear(nn.Module):
@@ -237,17 +237,20 @@ def _build_kda(monkeypatch):
         built.update(kwargs, prefix=prefix)
         return lambda *args: None
 
+    def build_pooled_op(*args, **kwargs):
+        raise AssertionError("the pooled KDA op does not support OLMo 3.5")
+
     for name in (
         "ColumnParallelLinear",
         "MergedColumnParallelLinear",
         "RowParallelLinear",
     ):
-        monkeypatch.setattr(model_mod, name, _FakeLinear)
-    monkeypatch.setattr(model_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(kda_attention, name, _FakeLinear)
     monkeypatch.setattr(
-        kimi_attention, "get_tensor_model_parallel_world_size", lambda: 1
+        kda_attention, "get_tensor_model_parallel_world_size", lambda: 1
     )
-    monkeypatch.setattr(model_mod, "build_kimi_dispatched_kda_op", build_op)
+    monkeypatch.setattr(kda_attention, "build_kimi_dispatched_kda_op", build_op)
+    monkeypatch.setattr(kda_attention, "build_kimi_pooled_kda_op", build_pooled_op)
     config = _small_kda_config()
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -260,23 +263,24 @@ def _build_kda(monkeypatch):
     )
     # Pinned to CPU: the default device detection can fail on CPU CI.
     with set_current_vllm_config(VllmConfig(device_config=DeviceConfig(device="cpu"))):
-        layer = model_mod.Olmo35KimiDeltaAttention(vllm_config, "model.layers.0.mixer")
+        layer = model_mod.olmo35_kda(vllm_config, "model.layers.0.mixer")
     return layer, vllm_config, built
 
 
 def test_kda_construction_wires_wide_value_heads_and_state(monkeypatch):
-    """The real constructor: projections sized for d_v != d_k, the op built
-    with the config's beta scale, the layer registered under its prefix, and
-    the per-layer state shape equal to the one the KV cache is sized with."""
+    """The shared KDA layer built from the OLMo config: projections sized for
+    d_v != d_k, a biased output gate, the op built with the config's beta
+    scale and no pooled op, the layer registered under its prefix, and the
+    per-layer state shape equal to the one the KV cache is sized with."""
     layer, vllm_config, built = _build_kda(monkeypatch)
 
     assert (layer.num_heads, layer.head_k_dim, layer.head_v_dim) == (2, 4, 8)
-    assert layer.local_conv_dim == 2 * (4 + 4 + 8)
-    assert layer.qkvb_proj.output_sizes == [8, 8, 16, 2]
-    assert layer.fg_a_proj.output_sizes == [8, 8]
+    assert layer.fused_qkvb_proj.output_sizes == [8, 8, 16, 2]
+    assert layer.fused_fa_ga_proj.output_sizes == [8, 8]
     assert layer.f_b_proj.weight.shape == (8, 8)
     assert layer.g_b_proj.weight.shape == (16, 8) and layer.g_b_proj.bias is not None
     assert built["beta_scale"] == 2.0 and built["prefix"] == "model.layers.0.mixer"
+    assert built["lower_bound"] is None and layer.pooled_kda_op is None
     context = vllm_config.compilation_config.static_forward_context
     assert context["model.layers.0.mixer"] is layer
     assert layer.get_state_shape() == ((3, 1, 32), (2, 4, 8))
@@ -302,8 +306,8 @@ def test_kda_forward_feeds_the_op_wide_value_shapes(monkeypatch):
     widths, hands it both caches, and reshapes its [T, heads, d_v] output."""
     layer, _, _ = _build_kda(monkeypatch)
     tokens, hidden = 3, 32
-    layer.qkvb_proj = _Fn(lambda x: torch.arange(34.0).expand(x.shape[0], 34))
-    layer.fg_a_proj = _Fn(lambda x: torch.ones(x.shape[0], 16))
+    layer.fused_qkvb_proj = _Fn(lambda x: torch.arange(34.0).expand(x.shape[0], 34))
+    layer.fused_fa_ga_proj = _Fn(lambda x: torch.ones(x.shape[0], 16))
     layer.f_b_proj = _Fn(lambda x: torch.full((x.shape[0], 8), 2.0))
     layer.g_b_proj = _Fn(lambda x: torch.full((x.shape[0], 16), 3.0))
     layer.o_proj = _Fn(lambda x: x.repeat(1, 2))
@@ -331,7 +335,10 @@ def test_kda_forward_feeds_the_op_wide_value_shapes(monkeypatch):
         )
         return torch.ones(mixed_qkv.shape[0], 2, 8)
 
-    layer.kda_op = kda_op
+    layer.dispatched_kda_op = kda_op
+    monkeypatch.setattr(
+        kda_attention, "get_tp_group", lambda: SimpleNamespace(all_reduce=lambda x: x)
+    )
     out = layer(torch.arange(tokens), torch.zeros(tokens, hidden))
 
     assert seen["mixed"].shape == (tokens, 32)
@@ -368,16 +375,17 @@ def _tiny_model_for_loading(routed_scale):
     calls = {"qkvb": [], "fg_a": [], "qkv": [], "w13": [], "w2": []}
     kda = nn.Module()
     kda.mixer = nn.Module()
-    kda.mixer.qkvb_proj = nn.Module()
-    kda.mixer.qkvb_proj.weight = _recording_parameter(calls["qkvb"], 1)
-    kda.mixer.fg_a_proj = nn.Module()
-    kda.mixer.fg_a_proj.weight = _recording_parameter(calls["fg_a"], 1)
+    kda.mixer.fused_qkvb_proj = nn.Module()
+    kda.mixer.fused_qkvb_proj.weight = _recording_parameter(calls["qkvb"], 1)
+    kda.mixer.fused_fa_ga_proj = nn.Module()
+    kda.mixer.fused_fa_ga_proj.weight = _recording_parameter(calls["fg_a"], 1)
     attn = nn.Module()
     attn.mixer = nn.Module()
     attn.mixer.qkv_proj = nn.Module()
     attn.mixer.qkv_proj.weight = _recording_parameter(calls["qkv"], 1)
     attn.moe = nn.Module()
-    attn.moe.latent_up = nn.Linear(2, 2, bias=False)
+    attn.moe.routed_expert_down_proj = nn.Linear(2, 2, bias=False)
+    attn.moe.routed_expert_up_proj = nn.Linear(2, 2, bias=False)
     attn.moe.experts = nn.Module()
     attn.moe.experts.routed_experts = nn.Module()
     routed = attn.moe.experts.routed_experts
@@ -390,9 +398,11 @@ def _tiny_model_for_loading(routed_scale):
 
 @pytest.mark.parametrize("routed_scale", [8.0, 1.0])
 def test_load_weights_routes_shared_names_by_layer_type(routed_scale):
-    """`mixer.q_proj` lands in `qkvb_proj` on a KDA layer and in `qkv_proj` on
-    an attention layer; `latent_up` is pre-multiplied by the routed scale; and
-    expert weights go to the fused-MoE parameters with their expert id."""
+    """`mixer.q_proj` lands in `fused_qkvb_proj` on a KDA layer and in
+    `qkv_proj` on an attention layer; `latent_down` / `latent_up` land in the
+    shared MoE's `routed_expert_down_proj` / `routed_expert_up_proj`, the
+    latter pre-multiplied by the routed scale; and expert weights go to the
+    fused-MoE parameters with their expert id."""
     model, calls = _tiny_model_for_loading(routed_scale)
     w = {i: torch.full((1,), float(i)) for i in range(8)}
     latent_up = torch.arange(4, dtype=torch.float32).reshape(2, 2)
@@ -403,6 +413,7 @@ def test_load_weights_routes_shared_names_by_layer_type(routed_scale):
             ("model.layers.0.mixer.g_a_proj.weight", w[2]),
             ("model.layers.1.mixer.q_proj.weight", w[3]),
             ("model.layers.1.mixer.v_proj.weight", w[4]),
+            ("model.layers.1.moe.latent_down.weight", latent_up),
             ("model.layers.1.moe.latent_up.weight", latent_up),
             ("model.layers.1.moe.experts.1.gate_proj.weight", w[5]),
             ("model.layers.1.moe.experts.0.down_proj.weight", w[6]),
@@ -419,11 +430,15 @@ def test_load_weights_routes_shared_names_by_layer_type(routed_scale):
     w2 = "model.layers.1.moe.experts.routed_experts.w2_weight"
     assert summary("w13") == [(5.0, (w13,), {"expert_id": 1, "shard_id": "w1"})]
     assert summary("w2") == [(6.0, (w2,), {"expert_id": 0, "shard_id": "w2"})]
+    moe = model.model.layers[1].moe
+    torch.testing.assert_close(moe.routed_expert_down_proj.weight.detach(), latent_up)
     torch.testing.assert_close(
-        model.model.layers[1].moe.latent_up.weight.detach(), latent_up * routed_scale
+        moe.routed_expert_up_proj.weight.detach(), latent_up * routed_scale
     )
-    assert {w13, w2, "model.layers.1.moe.latent_up.weight"} <= loaded
-    assert "model.layers.0.mixer.qkvb_proj.weight" in loaded
+    down = "model.layers.1.moe.routed_expert_down_proj.weight"
+    up = "model.layers.1.moe.routed_expert_up_proj.weight"
+    assert {w13, w2, down, up} <= loaded
+    assert "model.layers.0.mixer.fused_qkvb_proj.weight" in loaded
     assert "model.layers.1.mixer.qkv_proj.weight" in loaded
 
 
@@ -433,40 +448,6 @@ def test_load_weights_rejects_unknown_expert_weights():
         model.load_weights(
             [("model.layers.1.moe.experts.0.extra_proj.weight", torch.ones(1))]
         )
-
-
-def test_conv_weights_concatenate_into_the_kernel_layout():
-    """q, k and v convs (v twice as wide) concatenate channel-wise into the
-    fused [kernel_size, q | k | v] buffer the KDA op reads."""
-    layer = model_mod.Olmo35KimiDeltaAttention.__new__(
-        model_mod.Olmo35KimiDeltaAttention
-    )
-    nn.Module.__init__(layer)
-    kernel, key_width, value_width = 4, 3, 6
-    weights = {}
-    for name, width, offset in (
-        ("q_conv1d", key_width, 0),
-        ("k_conv1d", key_width, 100),
-        ("v_conv1d", value_width, 200),
-    ):
-        weight = offset + torch.arange(width * kernel, dtype=torch.float32)
-        weights[name] = weight.reshape(width, 1, kernel)
-        setattr(layer, name, SimpleNamespace(weight=weights[name]))
-
-    layer.process_weights_after_loading(torch.bfloat16)
-
-    fused = layer.conv_weight_fused
-    assert fused.shape == (kernel, 2 * key_width + value_width)
-    assert fused.is_contiguous()
-    expected = torch.cat(
-        [weights[n][:, 0, :].t() for n in ("q_conv1d", "k_conv1d", "v_conv1d")],
-        dim=1,
-    )
-    torch.testing.assert_close(fused, expected)
-    # Column j of the v block is v channel j.
-    torch.testing.assert_close(
-        fused[:, 2 * key_width + 5], weights["v_conv1d"][5, 0, :]
-    )
 
 
 @pytest.mark.parametrize("scalable_softmax", [True, False])

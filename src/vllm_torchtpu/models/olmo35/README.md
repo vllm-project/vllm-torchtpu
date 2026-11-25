@@ -18,7 +18,9 @@ a latent mixture of experts.
   architecture yet), its `AutoConfig` registration, and `TPUOlmo35Config`,
   the vLLM config hook that turns prefix caching off and rejects the features
   the model does not support.
-- `model.py`: the model and its checkpoint loader.
+- `model.py`: the model and its checkpoint loader. The KDA, latent-MoE and
+  MLP layers are the shared ones in `layers/adapter/` (`kda_attention.py`,
+  `latent_moe.py`, `gated_mlp.py`), also used by Kimi K3.
 
 The compile cache key covers the paths in `_RUNTIME_CACHE_KEY_PATHS` plus
 every `kernels/` and `ops/` directory under `vllm_torchtpu/models/`, so keep
