@@ -510,12 +510,6 @@ def normalize_draft_config(hf_config) -> dict:
     DFlashProposer and DSparkProposer read dflash_config.mask_token_id and
     load_model reads dflash_config.target_layer_ids; feed both the
     resolved values so the whole base machinery applies unchanged.
-
-    This must also run BEFORE GPUModelRunner.__init__: the upstream V1
-    runner transiently constructs its own EagleProposer for any
-    use_eagle() method (the TPU runner replaces it afterwards), and its
-    _init_parallel_drafting_params only knows pard_token / ptd_token_id /
-    dflash_config.mask_token_id — not dspark_noise_token_id.
     """
     hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
 

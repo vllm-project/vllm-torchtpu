@@ -338,9 +338,9 @@ def test_initialize_from_config_updates_num_gpu_blocks():
     worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cache_config)
 
 
-def test_reset_encoder_cache_clears_the_runner_caches():
+def _worker_with_late_interaction_entries():
+    """A worker whose runner holds one query in each late-interaction cache."""
     runner = TPUModelRunner.__new__(TPUModelRunner)
-    runner.encoder_cache = {"mm_hash": torch.zeros(1)}
     runner.late_interaction_runner = LateInteractionRunner(enable_flash=False)
     late = runner.late_interaction_runner
     late._query_cache["query"] = torch.zeros(1)
@@ -348,11 +348,41 @@ def test_reset_encoder_cache_clears_the_runner_caches():
     late._doc_query_keys["doc"] = "query"
     worker = TPUWorker.__new__(TPUWorker)
     worker.model_runner = runner
+    return worker, runner, late
+
+
+def test_reset_encoder_cache_clears_the_runner_caches():
+    worker, runner, late = _worker_with_late_interaction_entries()
+    runner.encoder_cache = {"mm_hash": torch.zeros(1)}
 
     worker.reset_encoder_cache()
 
     assert runner.encoder_cache == {}
     assert (late._query_cache, late._query_uses, late._doc_query_keys) == ({}, {}, {})
+
+
+def test_reset_mm_cache_clears_the_runner_caches():
+    # WorkerBase.reset_mm_cache finds the runner method by name and skips it
+    # silently when it is missing, so call through the worker.
+    worker, runner, late = _worker_with_late_interaction_entries()
+    runner.mm_budget = MagicMock()
+
+    worker.reset_mm_cache()
+
+    runner.mm_budget.reset_cache.assert_called_once_with()
+    assert (late._query_cache, late._query_uses, late._doc_query_keys) == ({}, {}, {})
+
+
+def test_release_late_interaction_query_cache_reaches_the_runner():
+    # Also found by name in WorkerBase.
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.late_interaction_runner = MagicMock()
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.model_runner = runner
+
+    worker.release_late_interaction_query_cache(["query"])
+
+    runner.late_interaction_runner.release_queries.assert_called_once_with(["query"])
 
 
 def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
