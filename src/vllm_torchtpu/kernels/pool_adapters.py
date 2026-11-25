@@ -102,13 +102,19 @@ def gather_region(
     Plain path (split == 1): per-request typed read of a pool token-range.
 
     pool: (num_blocks, block_size, heads2, lanes) KV dtype.
-    state_indices: (num_reqs,) int32 block ids.
+    state_indices: (num_reqs,) int32 block ids, manager ids when
+    ``split > 1``, valid in ``[0, num_blocks // split)``. A request whose id
+    is outside that range reads the null block 0 instead
+    (``null_out_of_range_blocks``).
     returns: (num_reqs, rows, out_lanes or lanes) out_dtype. With
     ``out_lanes`` (a divisor of the pool's lane count) the kernel splits
     lanes in place, so callers reshaping to a narrower-lane state shape
     pay no XLA lane-crossing relayout; the remaining outside reshape is
     lane-preserving (free).
     """
+    # Before the split routing, as in scatter_region: both kernels below read
+    # only through these ids.
+    state_indices = null_out_of_range_blocks(state_indices, pool.shape[0] // split)
     if split > 1:
         kernel_bs = pool.shape[1]
         if tok0 % kernel_bs == 0 and ntok % kernel_bs == 0:
@@ -316,9 +322,9 @@ def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int, nblocks: i
 def null_out_of_range_blocks(indices: jax.Array, num_blocks: int) -> jax.Array:
     """Replaces every block index outside `[0, num_blocks)` by 0.
 
-    Block 0 is vLLM's reserved null block, which no request owns, so a write
-    sent there cannot land outside the pool or on another request's block.
-    Indices in range are returned unchanged. A replaced index is not
+    Block 0 is vLLM's reserved null block, which no request owns, so a read
+    or write sent there cannot reach outside the pool or another request's
+    block. Indices in range are returned unchanged. A replaced index is not
     reported.
     """
     in_pool = (indices >= 0) & (indices < num_blocks)

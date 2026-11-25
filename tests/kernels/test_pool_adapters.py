@@ -133,13 +133,14 @@ def test_out_of_range_block_ids_become_the_null_block():
 
 def _record_kernel_ids(monkeypatch):
     """Replace pallas_call by a stand-in that records the block ids each
-    scatter kernel would write through and returns the pool unchanged."""
+    gather or scatter kernel would read or write through, and returns zeros
+    of the kernel's output shape."""
     seen = []
 
-    def fake_pallas_call(_kernel, **_kwargs):
-        def run(ids, *operands):
+    def fake_pallas_call(_kernel, *, out_shape, **_kwargs):
+        def run(ids, *_operands):
             seen.append(np.asarray(ids).tolist())
-            return operands[-1]
+            return jnp.zeros(out_shape.shape, out_shape.dtype)
 
         return run
 
@@ -149,21 +150,41 @@ def _record_kernel_ids(monkeypatch):
 
 # (split, tok0, ntok, the kernel's ids for the requests [1, *OUTSIDE_IDS]):
 # the direct path, the split window (manager ids), and the per-kernel-block
-# path (manager id * split + kernel block).
-SCATTER_PATHS = [
+# path (manager id * split + kernel block). Gather and scatter route alike.
+REGION_PATHS = [
     (1, 0, 32, [1] + [0] * len(OUTSIDE_IDS)),
     (2, 0, 2 * BS, [1] + [0] * len(OUTSIDE_IDS)),
     (2, BS, 16, [3] + [1] * len(OUTSIDE_IDS)),
 ]
 
 
-@pytest.mark.parametrize("split, tok0, ntok, kernel_ids", SCATTER_PATHS)
+def _ids_with_outside(split):
+    ids = jnp.asarray([1] + OUTSIDE_IDS, dtype=jnp.int32)
+    return ids.at[1].set(NB // split)  # the first id past this split's pool
+
+
+@pytest.mark.parametrize("split, tok0, ntok, kernel_ids", REGION_PATHS)
+def test_gather_region_reads_ids_outside_the_pool_from_the_null_block(
+    monkeypatch, split, tok0, ntok, kernel_ids
+):
+    seen = _record_kernel_ids(monkeypatch)
+    pool_adapters.gather_region(
+        _pool(),
+        _ids_with_outside(split),
+        tok0=tok0,
+        ntok=ntok,
+        out_dtype=jnp.bfloat16,
+        split=split,
+    )
+    assert seen == [kernel_ids]
+
+
+@pytest.mark.parametrize("split, tok0, ntok, kernel_ids", REGION_PATHS)
 def test_scatter_region_writes_ids_outside_the_pool_to_the_null_block(
     monkeypatch, split, tok0, ntok, kernel_ids
 ):
     seen = _record_kernel_ids(monkeypatch)
-    ids = jnp.asarray([1] + OUTSIDE_IDS, dtype=jnp.int32)
-    ids = ids.at[1].set(NB // split)  # the first id past this split's pool
+    ids = _ids_with_outside(split)
     vals = jnp.zeros((ids.shape[0], ntok * KH * PACK, LANES), jnp.bfloat16)
     pool_adapters.scatter_region(_pool(), vals, ids, tok0=tok0, ntok=ntok, split=split)
     assert seen == [kernel_ids]
@@ -197,6 +218,29 @@ def test_scatter_region_outside_ids_change_no_live_block(split):
     assert (after[0] == bits(outside)).all()
     for block in range(2, mgr_blocks):
         np.testing.assert_array_equal(after[block], before[block])
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("split", [1, 3])
+def test_gather_region_outside_ids_read_the_null_block(split):
+    """On TPU: a request whose id is outside the pool reads exactly what a
+    request for the null block 0 reads, and the valid request reads its own
+    block."""
+    mgr_blocks = 12 // split
+    ntok = 16 * split  # whole (manager) blocks
+    pool = _arange_pool((12, 16, 2, 128), jnp.bfloat16)
+    ids = jnp.asarray([1, mgr_blocks, -1, 2**31 - 1, -(2**31) + 1], dtype=jnp.int32)
+    nulls = jnp.asarray([1, 0, 0, 0, 0], dtype=jnp.int32)
+
+    def read(block_ids):
+        got = pool_adapters.gather_region(
+            pool, block_ids, tok0=0, ntok=ntok, out_dtype=jnp.bfloat16, split=split
+        )
+        return np.asarray(got.view(jnp.uint16))
+
+    got, expected = read(ids), read(nulls)
+    np.testing.assert_array_equal(got, expected)
+    assert not (expected[0] == expected[1]).all()  # block 1 differs from block 0
 
 
 @pytest.mark.tpu_test
