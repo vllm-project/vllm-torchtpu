@@ -31,16 +31,26 @@ FP8_E4M3_SUBNORMAL_ERROR_PER_ROW_MAX = (
 )
 
 
-def fp8_round_trip_tol(x: torch.Tensor) -> tuple[float, float]:
+def fp8_round_trip_tol(
+    x: torch.Tensor,
+    *,
+    reciprocal_ulps: float = 0.5,
+) -> tuple[float, float]:
     """Derive analytical (rtol, atol) for per-row FP8 e4m3fn round-trip.
 
-    Upper-bounds FP8 quantization unit roundoff plus up to three output-dtype
-    rounding sites across quantize_tensor and dequantize_tensor, and both FP8
+    Upper-bounds FP8 quantization unit roundoff, up to ``reciprocal_ulps`` ULPs
+    for the reciprocal ``1.0 / scale`` (0.5 on CPU, 1.0 on TPU), two half-ULP
+    output-dtype roundings (``x * scale_inv`` and the final cast), and both FP8
     and output-dtype subnormal floors.
     """
+    if reciprocal_ulps < 0.0:
+        msg = f"reciprocal_ulps must be non-negative, got {reciprocal_ulps}"
+        raise ValueError(msg)
     out_info = torch.finfo(x.dtype)
     out_eps = float(out_info.eps)
-    rtol = (1.0 + FP8_E4M3_UNIT_ROUNDOFF) * (1.0 + out_eps / 2.0) ** 3 - 1.0
+    rtol = (1.0 + FP8_E4M3_UNIT_ROUNDOFF) * (1.0 + reciprocal_ulps * out_eps) * (
+        1.0 + out_eps / 2.0
+    ) ** 2 - 1.0
     max_abs = float(x.abs().max().item()) if x.numel() else 0.0
     atol = (
         FP8_E4M3_SUBNORMAL_ERROR_PER_ROW_MAX * max_abs * (1.0 + out_eps)
@@ -197,3 +207,39 @@ def test_quantized_all_gather_float16_small_rows_with_zeros(magnitude: float) ->
     )
     expected_local = dequantize_tensor(q_ref, s_ref, axis=-1, out_dtype=torch.float16)
     assert torch.equal(out, expected_local.repeat(world_size, 1))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_fp8_round_trip_tol_reciprocal_ulps(dtype: torch.dtype) -> None:
+    """reciprocal_ulps widens rtol by the reciprocal factor without altering atol."""
+    out_info = torch.finfo(dtype)
+    out_eps = float(out_info.eps)
+    cpu_reciprocal_ulps = 0.5
+    tpu_reciprocal_ulps = 1.0
+    scale_factor = 2.0
+    x = torch.tensor([[1.0, -2.0]], dtype=dtype)
+
+    rtol_cpu, atol_cpu = fp8_round_trip_tol(x)
+    rtol_tpu, atol_tpu = fp8_round_trip_tol(x, reciprocal_ulps=tpu_reciprocal_ulps)
+    expected_cpu_rtol = (1.0 + FP8_E4M3_UNIT_ROUNDOFF) * (
+        1.0 + cpu_reciprocal_ulps * out_eps
+    ) * (1.0 + out_eps / 2.0) ** 2 - 1.0
+    expected_tpu_rtol = (1.0 + FP8_E4M3_UNIT_ROUNDOFF) * (
+        1.0 + tpu_reciprocal_ulps * out_eps
+    ) * (1.0 + out_eps / 2.0) ** 2 - 1.0
+    assert rtol_cpu == pytest.approx(expected_cpu_rtol, rel=1e-12, abs=0.0)
+    assert rtol_tpu == pytest.approx(expected_tpu_rtol, rel=1e-12, abs=0.0)
+    assert rtol_tpu > rtol_cpu
+    assert atol_tpu == atol_cpu
+
+    rtol_scaled, atol_scaled = fp8_round_trip_tol(
+        x * scale_factor, reciprocal_ulps=tpu_reciprocal_ulps
+    )
+    assert rtol_scaled == rtol_tpu
+    out_subnormal_floor = float(out_info.smallest_normal) * out_eps / 2.0
+    assert (atol_scaled - out_subnormal_floor) == pytest.approx(
+        scale_factor * (atol_tpu - out_subnormal_floor), rel=1e-12, abs=0.0
+    )
+
+    with pytest.raises(ValueError, match="non-negative"):
+        fp8_round_trip_tol(x, reciprocal_ulps=-0.1)

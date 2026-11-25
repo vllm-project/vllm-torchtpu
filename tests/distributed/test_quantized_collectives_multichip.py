@@ -33,6 +33,7 @@ import pytest
 import torch
 from vllm.distributed import parallel_state
 
+from tests.distributed.test_quantized_collectives import fp8_round_trip_tol
 from tests.distributed.tpu_test_utils import (
     launch_torchrun_workers,
     read_worker_results,
@@ -58,6 +59,8 @@ CALLS_PER_SHAPE = 2
 # Stays under Buildkite's multichip lane pytest --timeout=600.
 LAUNCH_TIMEOUT_SECONDS = 480
 _MAX_TOL_RATIO = 1.0
+# Up to 1 ULP for TPU reciprocal (1.0 / scale).
+_TPU_RECIPROCAL_ULPS = 1.0
 
 
 class _QuantizedWireGroup:
@@ -73,31 +76,6 @@ class _QuantizedWireGroup:
             msg = f"expected int8 or float32 wire dtype, got {tensor.dtype}"
             raise AssertionError(msg)
         return self._inner.all_gather(tensor, dim=dim)
-
-
-def _fp8_tpu_round_trip_tol(x: torch.Tensor) -> tuple[float, float]:
-    """Derive analytical (rtol, atol) for per-row FP8 e4m3fn round-trip on TPU.
-
-    Accounts for FP8 unit roundoff (eps / 2), up to 1 ULP for TPU reciprocal
-    (1.0 / scale), two half-ULP input-dtype roundings (x * scale_inv and the
-    final cast), and FP8 + output-dtype subnormal floors.
-    """
-    fp8_info = torch.finfo(torch.float8_e4m3fn)
-    out_info = torch.finfo(x.dtype)
-    fp8_roundoff = float(fp8_info.eps) / 2.0
-    out_eps = float(out_info.eps)
-    rtol = (1.0 + fp8_roundoff) * (1.0 + out_eps) * (1.0 + out_eps / 2.0) ** 2 - 1.0
-    fp8_subnormal_per_row_max = (
-        float(fp8_info.smallest_normal)
-        * float(fp8_info.eps)
-        / (2.0 * float(fp8_info.max))
-    )
-    max_abs = float(x.abs().max().item()) if x.numel() else 0.0
-    atol = (
-        fp8_subnormal_per_row_max * max_abs * (1.0 + out_eps)
-        + float(out_info.smallest_normal) * out_eps / 2.0
-    )
-    return rtol, atol
 
 
 def _check_shape(
@@ -124,7 +102,7 @@ def _check_shape(
         group_got = group.all_gather(x, dim=0).cpu()
         want = torch.cat(inputs, dim=0)
 
-        rtol, atol = _fp8_tpu_round_trip_tol(group_got)
+        rtol, atol = fp8_round_trip_tol(group_got, reciprocal_ulps=_TPU_RECIPROCAL_ULPS)
         diff = (got.float() - group_got.float()).abs()
         tol = atol + rtol * group_got.float().abs()
         max_tol_ratio = float((diff / tol).max().item())
