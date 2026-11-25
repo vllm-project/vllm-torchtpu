@@ -22,6 +22,9 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.sparse_logits import
     candidate_windows,
     fp8_gathered_mqa_logits,
 )
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
+    PACKED_FP8_PREFILL_QUERY_TILE,
+)
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_fp8 import (
     _select_from_prepared_candidates,
     select_fp8_indexer_jax,
@@ -194,7 +197,7 @@ def test_long_decode_row_beside_a_prefill_chunk_selects_top_scores():
                     query_start_loc=jnp.clip(bounds - start, 0, rows),
                     max_model_len=width,
                     q_scale=jnp.ones_like(weights[start : start + rows]),
-                    query_size=6,
+                    query_size=PACKED_FP8_PREFILL_QUERY_TILE,
                     cache_layout=layout,
                 )
             )

@@ -31,6 +31,9 @@ class PagedMQAConfig:
 
 # TPU v7, H32/D128, transposed packed FP8 pages.
 PACKED_FP8_MQA_CONFIG = PagedMQAConfig(6, 65536, 10, 4)
+# Query tile of the dense scorer on chunked prefill: 8 queries x 32 heads fill
+# the MXU's 256 rows where the decode tile of 6 fills 192.
+PACKED_FP8_PREFILL_QUERY_TILE = 8
 PACKED_FP8_PREPARED_MQA_CONFIG = PagedMQAConfig(2, 32768, 12, 6)
 # Query pairs per gathered-scorer iteration; they share one MXU issue window.
 PACKED_FP8_PREPARED_PAIRS = 2

@@ -38,6 +38,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.sparse_logits import
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.tuned import (
     PACKED_FP8_MQA_CONFIG,
+    PACKED_FP8_PREFILL_QUERY_TILE,
     indexer_query_rows,
     paged_mqa_key_tile,
     paged_mqa_query_tile,
@@ -516,7 +517,11 @@ def _select_fp8_indexer_jax(
     key_tile = paged_mqa_key_tile(
         width, layout.page_size, PACKED_FP8_MQA_CONFIG.key_tile
     )
-    query_tile = PACKED_FP8_MQA_CONFIG.query_tile
+    query_tile = (
+        PACKED_FP8_MQA_CONFIG.query_tile
+        if prefill_chunk_rows is None
+        else PACKED_FP8_PREFILL_QUERY_TILE
+    )
     capacity = (width + key_tile - 1) // key_tile * key_tile
     pages = page_table[:, : (width + layout.page_size - 1) // layout.page_size]
     pages = jnp.pad(
@@ -823,7 +828,7 @@ def select_fp8_indexer_jax(
     )
     capacity = (score_width + width - 1) // width * width
     chunk = max(
-        PACKED_FP8_MQA_CONFIG.query_tile,
+        PACKED_FP8_PREFILL_QUERY_TILE,
         _INDEX_UNTILED_SCORE_ELEMENTS // max(capacity, 1),
     )
     if (
@@ -848,7 +853,7 @@ def select_fp8_indexer_jax(
     grouped = jnp.all(requests[1:] >= requests[:-1])
     rows = query_start_loc[-1] - query_start_loc[0]
     spans = (query_start_loc[1:] > query_start_loc[:-1]).sum()
-    group = paged_mqa_query_tile(PACKED_FP8_MQA_CONFIG.query_tile, q.shape[1])
+    group = paged_mqa_query_tile(PACKED_FP8_PREFILL_QUERY_TILE, q.shape[1])
     shared_keys = rows >= 2 * group * spans
     return jax.lax.cond(
         grouped & shared_keys & (longest <= resident),
