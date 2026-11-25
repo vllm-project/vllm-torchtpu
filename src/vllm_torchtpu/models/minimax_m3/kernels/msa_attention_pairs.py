@@ -42,19 +42,23 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_attention
 
 # Tokens one grid step accumulates: a page's selecting tokens are gathered
 # within a window, so wider windows fill the per-page blocks (MXU rows)
-# better; the accumulator is WINDOW * H rows of 2D f32 in VMEM.
+# better; the accumulators are two WINDOW * H x D f32 arrays in VMEM.
 WINDOW = 1024
 # Token block widths: a page's run of pairs is cut into blocks of at most
 # the widest, and each block runs at the narrowest width holding it.
 _WIDTHS = (8, 16, 24, 32)
 # Blocks a loop step runs side by side (`unit`). Op replay, 4,096 rows x 16
-# heads, us: 1891 / 1502 / 1163 for 1 / 2 / 4 (uniform selections, j-7166bc3d).
-_UNIT = 4
+# heads, us: 1891 / 1502 / 1163 / 1022 for 1 / 2 / 4 / 8 (uniform
+# selections, j-7166bc3d, j-b5dbd63f).
+_UNIT = 8
 # Blocks whose page (and scale page) copies are in flight, the running ones included.
-_RING = 8
+_RING = 16
 _NO_PAIR = jnp.iinfo(jnp.int32).max
 # A pair word: its token's first query row (token * H) | visible slots << 16.
 _ROW_BITS = 16
+# A sort key: (page key * window + token) << 8 | visible slots: page keys
+# below 2^23 / window (8,192 at 1,024 tokens; `supports`).
+_LIMIT_BITS = 8
 # A block word: its page key | its pairs << 24.
 _KEY_BITS = 24
 _KEY_MASK = (1 << _KEY_BITS) - 1
@@ -70,9 +74,10 @@ def _kernel(
     kv_hbm_ref,  # [pages, S / 8, 4, G * 2D] uint8, in HBM
     scale_hbm_ref,  # [pages, R, S] f32, in HBM
     # Out
-    o_ref,  # [W * H, D]
+    o_ref,  # [H, W, D] head-major
     # Scratch
-    acc_ref,  # [W * H, 2D] f32 [acc | l]
+    acc_ref,  # [W * H, D] f32
+    l_ref,  # [W * H, D] f32, every column l
     kv_buf,  # [ring, 1, S / 8, 4, 2D] uint8
     scale_buf,  # [ring, 1, R, S] f32
     sem_ref,  # DMA [2, ring]
@@ -84,6 +89,7 @@ def _kernel(
     sm_scale: float,
 ):
     head_dim = q_ref.shape[1]
+    window = q_ref.shape[0] // num_heads
     row_width = kv_buf.shape[-1]
     page_size = kv_buf.shape[2] * 8
     num_pairs = num_pairs_ref[pl.program_id(0)]
@@ -108,6 +114,7 @@ def _kernel(
         return i + (word >> _KEY_BITS), k + 1
 
     acc_ref[...] = jnp.zeros_like(acc_ref)
+    l_ref[...] = jnp.zeros_like(l_ref)
 
     @pl.when(pl.program_id(0) == 0)
     def _clear_ring():  # a block of no pair may read a slot no copy wrote
@@ -159,8 +166,9 @@ def _kernel(
         terms = [attend(width, *b) for b in blocks]
         for starts, pv in terms:
             for j, start in enumerate(starts):
-                dst = acc_ref.at[pl.ds(start, num_heads)]
-                dst[...] += pv[j * num_heads : (j + 1) * num_heads]
+                rows = pv[j * num_heads : (j + 1) * num_heads]
+                acc_ref[pl.ds(start, num_heads)] += rows[:, :head_dim]
+                l_ref[pl.ds(start, num_heads)] += rows[:, head_dim:]
 
     def body(state):
         i, k, issued = state
@@ -193,18 +201,19 @@ def _kernel(
     zero = jnp.int32(0)
     jax.lax.while_loop(lambda s: s[0] < num_pairs, body, (zero, zero, (zero, zero)))
 
-    rows = math.gcd(acc_ref.shape[0], 1024)
+    # Head-major output: each head's rows are every H-th accumulator row.
+    tokens = math.gcd(window, 256)
 
     def finish(c, carry):
-        at = pl.ds(pl.multiple_of(c * rows, rows), rows)
-        acc = acc_ref[at]
-        denom = jnp.maximum(
-            acc[:, head_dim : head_dim + 1], msa_attention_lse._denom_floor()
-        )
-        o_ref[at] = (acc[:, :head_dim] * (1.0 / denom)).astype(o_ref.dtype)
+        for h in range(num_heads):
+            at = pl.ds(c * tokens * num_heads + h, tokens, stride=num_heads)
+            denom = jnp.maximum(l_ref[at][:, :1], msa_attention_lse._denom_floor())
+            o_ref[h, pl.ds(pl.multiple_of(c * tokens, tokens), tokens)] = (
+                acc_ref[at] * (1.0 / denom)
+            ).astype(o_ref.dtype)
         return carry
 
-    jax.lax.fori_loop(0, acc_ref.shape[0] // rows, finish, 0)
+    jax.lax.fori_loop(0, window // tokens, finish, 0)
 
 
 def _work(keys, local_key, local_limit, window, num_heads, page_size):
@@ -217,12 +226,13 @@ def _work(keys, local_key, local_limit, window, num_heads, page_size):
     windows = num_tokens // window
     tok = jnp.arange(num_tokens, dtype=jnp.int32)[:, None] % window
     limit = jnp.where(keys == local_key[:, None], local_limit[:, None], page_size)
-    pair = jnp.where(keys >= 0, keys * window + tok, _NO_PAIR)
-    word = tok * num_heads | (limit << _ROW_BITS)
-    pair, word = jax.lax.sort(
-        (pair.reshape(windows, -1), word.reshape(windows, -1)), dimension=1, num_keys=1
-    )
+    # One sort operand: (key * window + token) << 8 | visible slots.
+    pair = jnp.where(keys >= 0, (keys * window + tok) << _LIMIT_BITS | limit, _NO_PAIR)
+    pair = jax.lax.sort(pair.reshape(windows, -1), dimension=1)
     valid = pair != _NO_PAIR
+    limit = pair & ((1 << _LIMIT_BITS) - 1)
+    pair = jnp.where(valid, pair >> _LIMIT_BITS, _NO_PAIR)
+    word = (pair % window) * num_heads | (limit << _ROW_BITS)
     key = jnp.where(valid, pair // window, 0)
     dup = jnp.pad(pair[:, 1:] == pair[:, :-1], ((0, 0), (1, 0)))
     # Past the valid pairs, and a pair's copies: token 0, no slot.
@@ -239,11 +249,13 @@ def _work(keys, local_key, local_limit, window, num_heads, page_size):
 
 
 def _max_window(num_heads, head_dim, window=WINDOW) -> int:
-    """`window`, or fewer tokens (a multiple of 8) where its accumulator and
-    double-buffered query and output blocks would not fit the VMEM limit."""
+    """`window`, or fewer tokens (a multiple of 8) where its accumulators and
+    double-buffered query and output blocks, beside a unit's live blocks
+    ([q | onehot], s, p, [pv | l] per row), would not fit the VMEM limit."""
     row_bytes = num_heads * head_dim * (2 * 4 + 2 * 2 + 2 * 2)
-    budget = msa_attention._VMEM_LIMIT_BYTES * 3 // 4
-    return min(window, budget // row_bytes // 8 * 8)
+    unit_bytes = _UNIT * _WIDTHS[-1] * num_heads * head_dim * (2 * 2 + 4 + 2 + 2 * 4)
+    budget = msa_attention._VMEM_LIMIT_BYTES * 9 // 10 - unit_bytes
+    return min(window, max(budget, 0) // row_bytes // 8 * 8)
 
 
 def supports(num_heads, head_dim, page_size, num_keys, window=WINDOW) -> bool:
@@ -255,9 +267,11 @@ def supports(num_heads, head_dim, page_size, num_keys, window=WINDOW) -> bool:
     return (
         window >= 8
         and num_heads % 8 == 0
+        and head_dim % 128 == 0
         and page_size <= head_dim
+        and page_size < 1 << _LIMIT_BITS
         and _WIDTHS[-1] <= head_dim
-        and num_keys * window < _NO_PAIR
+        and num_keys * window < _NO_PAIR >> _LIMIT_BITS
         and num_keys <= _KEY_MASK
         and window * num_heads <= 1 << _ROW_BITS
     )
@@ -336,9 +350,12 @@ def msa_sparse_attention_pairs(
                 pl.BlockSpec(memory_space=pl.ANY),
                 pl.BlockSpec(memory_space=pl.ANY),
             ],
-            out_specs=pl.BlockSpec((rows, head_dim), lambda w, *_: (w, 0)),
+            out_specs=pl.BlockSpec(
+                (num_heads, window, head_dim), lambda w, *_: (0, w, 0)
+            ),
             scratch_shapes=[
-                pltpu.VMEM((rows, 2 * head_dim), jnp.float32),
+                pltpu.VMEM((rows, head_dim), jnp.float32),
+                pltpu.VMEM((rows, head_dim), jnp.float32),
                 pltpu.VMEM(
                     (_RING, 1, rows_per_page, packing, 2 * head_dim), kv_cache.dtype
                 ),
@@ -346,7 +363,9 @@ def msa_sparse_attention_pairs(
                 pltpu.SemaphoreType.DMA((2, _RING)),
             ],
         ),
-        out_shape=jax.ShapeDtypeStruct((windows * rows, head_dim), q.dtype),
+        out_shape=jax.ShapeDtypeStruct(
+            (num_heads, windows * window, head_dim), q.dtype
+        ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=msa_attention._VMEM_LIMIT_BYTES,
@@ -362,5 +381,4 @@ def msa_sparse_attention_pairs(
         kv_cache,
         scale_cache,
     )
-    out = out.reshape(windows * window, num_heads, head_dim)[:num_tokens]
-    return out.transpose(1, 0, 2)
+    return out[:, :num_tokens]

@@ -26,7 +26,10 @@ from tests.models.minimax_m3.test_msa_attention_lse import (
     _fp4_cache,
     _reference,
 )
-from vllm_torchtpu.models.minimax_m3.kernels import msa_attention_lse
+from vllm_torchtpu.models.minimax_m3.kernels import (
+    msa_attention_lse,
+    msa_attention_pairs,
+)
 from vllm_torchtpu.models.minimax_m3.kernels.msa_attention_pairs import (
     msa_sparse_attention_pairs,
 )
@@ -100,3 +103,11 @@ def test_pairs_match_reference_and_tiles(num_tokens, num_real, window, crowd):
     )
     # Same products; only the order of the f32 sums differs.
     np.testing.assert_allclose(got, np.asarray(tiles.astype(jnp.float32)), atol=1e-2)
+
+
+def test_window_fits_vmem():
+    """More query heads take a smaller token window; none fitting -> no support."""
+    assert msa_attention_pairs._max_window(16, HEAD_DIM) == msa_attention_pairs.WINDOW
+    assert msa_attention_pairs._max_window(32, HEAD_DIM) == 400
+    assert msa_attention_pairs.supports(32, HEAD_DIM, 128, 2048)
+    assert not msa_attention_pairs.supports(4096, HEAD_DIM, 128, 2048)
