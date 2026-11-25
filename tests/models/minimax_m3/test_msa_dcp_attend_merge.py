@@ -188,10 +188,11 @@ def _decode_plan(own, peer, seq_lens, cu, rank, pages_per_seq, pages_per_step):
                   tiles_per_step=tiles_per_step, sections=sections),
     )  # fmt: skip
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     i32 = jnp.int32
     keys, local_key, local_limit, work = pl.pallas_call(
         kernel,
-        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)] + [vmem] * 4,
+        in_specs=[smem] * 3 + [vmem] * 2,
         out_specs=[vmem] * 4,
         out_shape=[
             jax.ShapeDtypeStruct((num_tokens, TOPK), i32),
@@ -202,10 +203,10 @@ def _decode_plan(own, peer, seq_lens, cu, rank, pages_per_seq, pages_per_step):
         interpret=True,
     )(
         jnp.asarray([rank], i32),
+        cu,
+        seq_lens,
         msa_dcp.swap_buffer(jnp.zeros((1, num_tokens, 128), jnp.bfloat16), peer)[-1],
         own,
-        seq_lens[None],
-        cu[None],
     )
     return keys, local_key, local_limit, work[0]
 
@@ -298,7 +299,8 @@ def test_planned_decode_matches_plain_bitwise(
     rng = np.random.default_rng(num_tokens + fp4)
     pages_per_seq = 1024 if num_tokens == 8 else 80
     *args, _ = _step(rng, q_lens, ctx_lens, pages_per_seq, num_tokens, fp4)
-    assert msa_dcp.use_decode_plan(num_tokens, TOPK, HL, HEAD_DIM)
+    block_tables = args[4][1]
+    assert msa_dcp.use_decode_plan(num_tokens, TOPK, HL, HEAD_DIM, block_tables.size)
     planned = _spmd(*args, fp4)
     monkeypatch.setattr(msa_dcp, "use_decode_plan", lambda *_: False)
     plain = _spmd(*args, fp4)

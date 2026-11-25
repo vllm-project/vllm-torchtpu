@@ -2242,10 +2242,10 @@ def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Arr
 
 def _decode_plan_kernel(
     rank_ref,
+    cu_ref,
+    seq_lens_ref,
     peer_ref,
     own_ref,
-    seq_lens_ref,
-    cu_ref,
     keys_ref,
     local_key_ref,
     local_limit_ref,
@@ -2259,29 +2259,27 @@ def _decode_plan_kernel(
 ):
     """A DCP pair's decode plan, in VMEM, from this rank's and its peer's
     packed candidates ``[T, 2 * topk]`` (the peer's as the 16-bit planes of
-    `words_to_u16_planes`, ``[T, >= 4 * topk]``): the merged selection
-    (`merge_candidates`' dense ranking), this rank's page keys ``[T, topk]``,
-    each token's local page and limit ``[T, 1]`` (`msa.token_positions`) and
-    the attention call's work list (`msa_attention_lse.store_work_list`).
-    The same values as the XLA path of `msa_attend_dcp`, which costs a dozen
-    small ops of fixed cost each; `msa_attention_lse.planned_attention` runs
-    it in its first grid step."""
+    `words_to_u16_planes`, ``[T, >= 4 * topk]``) and the requests' query
+    starts and lengths (`cu_ref`, `seq_lens_ref` in SMEM): the merged
+    selection (`merge_candidates`' dense ranking), this rank's page keys
+    ``[T, topk]``, each token's local page and limit ``[T, 1]``
+    (`msa.token_positions`) and the attention call's work list
+    (`msa_attention_lse.store_work_list`). The same values as the XLA path
+    of `msa_attend_dcp`, which costs a dozen small ops of fixed cost each;
+    `msa_attention_lse.planned_attention` runs it before attending."""
     dcp = 2
     rank = rank_ref[0]
     num_tokens = own_ref.shape[0]
     iota = functools.partial(jax.lax.broadcasted_iota, jnp.int32)
     # Candidates down the sublanes, tokens across the lanes: candidate j's
     # score and block broadcast over sublanes for the compares.
+    # The peer's planes transposed: its low and high halves are then rows
+    # 4 * topk apart, which join without a lane shift.
     width = own_ref.shape[1]
-    planes = peer_ref[...]
-    peer = jax.lax.bitcast_convert_type(
-        planes[:, :width].astype(jnp.uint32)
-        | (planes[:, width : 2 * width].astype(jnp.uint32) << 16),
-        jnp.float32,
-    )
+    planes = peer_ref[...].astype(jnp.uint32).T  # [D, T]
+    peer = planes[:width] | (planes[width : 2 * width] << 16)
     halves = []
-    for cands in (own_ref[...], peer):
-        c = cands.T  # [2 * topk, T]
+    for c in (own_ref[...].T, jax.lax.bitcast_convert_type(peer, jnp.float32)):
         halves.append((c[:topk], c[topk : 2 * topk].astype(jnp.int32)))
     places = []
     for s_i, b_i in halves:
@@ -2299,67 +2297,82 @@ def _decode_plan_kernel(
     for (_, b_i), place in zip(halves, places):
         for i in range(topk):
             picked = jnp.where(slot == place[i : i + 1], b_i[i : i + 1], picked)
-    # Back to a token per row, slot k at lanes k, k + K, ...: token t's keys
-    # then sit at lanes [t * K, (t + 1) * K) of its tile row.
-    selected = jnp.concatenate([picked.T] * (_LANES // topk), axis=1)  # [T, 128]
-
-    # Token positions from the requests' query starts and lengths.
-    num_seqs = seq_lens_ref.shape[1]
-    tok = iota((num_tokens, 1), 0)
-    cu = cu_ref[...]  # [1, num_seqs + 1]
-    req = iota((1, num_seqs + 1), 1)
-    seq_id = jnp.sum(jnp.where((req >= 1) & (cu <= tok), 1, 0), axis=1, keepdims=True)
+    # Token positions with tokens across the lanes, from the query starts
+    # and lengths as scalars: compares and selects, no lane reductions.
+    num_seqs = seq_lens_ref.shape[0]
+    tok = iota((1, num_tokens), 1)
+    seq_id = jnp.zeros((1, num_tokens), jnp.int32)
+    for s in range(1, num_seqs + 1):
+        seq_id += jnp.where(cu_ref[s] <= tok, 1, 0)
     seq_id = jnp.minimum(seq_id, num_seqs - 1)
-
-    def lookup(table, index):
-        cols = iota((1, table.shape[1]), 1)
-        return jnp.sum(jnp.where(cols == index, table, 0), axis=1, keepdims=True)
-
-    start = lookup(cu, seq_id)
-    q_len = lookup(cu, seq_id + 1) - start
-    valid = tok < cu[:, num_seqs : num_seqs + 1]
-    pos = lookup(seq_lens_ref[...], seq_id) - q_len + (tok - start)
-    pos = jnp.where(valid, pos, 0)
+    start = jnp.zeros_like(seq_id)
+    end = jnp.zeros_like(seq_id)
+    seq_len = jnp.zeros_like(seq_id)
+    for s in range(num_seqs):
+        here = seq_id == s
+        start = jnp.where(here, cu_ref[s], start)
+        end = jnp.where(here, cu_ref[s + 1], end)
+        seq_len = jnp.where(here, seq_lens_ref[s], seq_len)
+    valid = tok < cu_ref[num_seqs]
+    pos = jnp.where(valid, seq_len - (end - start) + (tok - start), 0)
     own_block = pos // block_size
     base = seq_id * pages_per_seq
-    local_key_ref[...] = jnp.where(
+    local_key = jnp.where(
         valid & (own_block % dcp == rank), base + own_block // dcp, -1
     )
-    local_limit_ref[...] = pos % block_size + 1
-    mine = (selected >= 0) & (selected % dcp == rank) & valid
-    keys = jnp.where(mine, base + selected // dcp, -1)
-    keys_ref[...] = keys[:, :topk]
-
-    # Each tile's keys as one 128-lane row: token t's at lanes [t * K, (t + 1) * K).
+    mine = (picked >= 0) & (picked % dcp == rank) & valid
+    keys = jnp.where(mine, base + picked // dcp, -1)  # [K, T]
+    # One transpose turns all three into a token per row, the keys repeated
+    # across the lanes (k, k + K, ...): token t's then sit at lanes
+    # [t * K, (t + 1) * K) of its tile's row.
+    rows = jnp.concatenate(
+        [keys] * (_LANES // topk)
+        + [local_key, pos % block_size + 1, jnp.zeros((6, num_tokens), jnp.int32)]
+    )
+    cols = rows.T  # [T, 128 + 8]
+    selected = cols[:, :_LANES]
+    keys_ref[...] = cols[:, :topk]
+    local_key_ref[...] = cols[:, _LANES : _LANES + 1]
+    local_limit_ref[...] = cols[:, _LANES + 1 : _LANES + 2]
     num_tiles = num_tokens // block_q
-    rows = -(-num_tiles // 8) * 8
-    tile_rows = jnp.full((rows, _LANES), -1, jnp.int32)
-    tile_row_id = iota((rows, _LANES), 0)
     token_of_lane = iota((1, _LANES), 1) // topk
+    tile_rows = []
     for i in range(num_tiles):
         row = jnp.full((1, _LANES), -1, jnp.int32)
         for t in range(block_q):
-            token = keys[i * block_q + t : i * block_q + t + 1, :]
+            token = selected[i * block_q + t : i * block_q + t + 1, :]
             row = jnp.where(token_of_lane == t, token, row)
-        tile_rows = jnp.where(tile_row_id == i, row, tile_rows)
-    msa_attention_lse.store_work_list(tile_rows, work_ref, num_tiles=num_tiles, **work)
+        tile_rows.append(row)
+    msa_attention_lse.store_work_list(tile_rows, work_ref, **work)
 
 
-def use_decode_plan(num_tokens: int, topk: int, num_heads: int, head_dim: int) -> bool:
+def use_decode_plan(
+    num_tokens: int, topk: int, num_heads: int, head_dim: int, num_keys: int
+) -> bool:
     """Whether a DCP pair's decode step of ``num_tokens`` rows of
     `num_heads` query heads per rank attends through `_attend_pair_decode`
     (8-token tiles whose work list the kernel builds, in one grid step, a
-    tile's lse in one 128-lane row of the permute buffer)."""
+    tile's lse in one 128-lane row of the permute buffer, block tables of
+    `num_keys` entries)."""
     block_q = msa_attention.SMALL_BATCH_BLOCK_Q
     return (
         num_tokens % block_q == 0
         and num_tokens <= _PLAN_MAX_TOKENS
         and 2 * num_heads * block_q == _LANES
         and head_dim == _LANES
+        and num_keys <= msa_attention_lse.MAX_PLAN_KEYS
         and _LANES % topk == 0
         and block_q * topk == _LANES
         and msa_attention_lse.fits_work_row(block_q, topk, _SMALL_BATCH_PAGES_PER_STEP)
     )
+
+
+def _requests_in_step(rank_ref, cu_ref, seq_lens_ref):
+    """The requests (block-table rows) a step's tokens belong to: those that
+    start before the last query ends (``cu_ref`` in SMEM)."""
+    num_seqs = seq_lens_ref.shape[0]
+    end = cu_ref[num_seqs]
+    return sum(jnp.where(cu_ref[s] < end, 1, 0) for s in range(num_seqs))
 
 
 def _attend_pair_decode(
@@ -2406,10 +2419,11 @@ def _attend_pair_decode(
         q,
         swap,
         kv_cache,
-        block_tables.reshape(-1),
+        block_tables.reshape(seq_lens.shape[0], -1),
         plan,
-        rank_array(rank),
-        (candidates, seq_lens.astype(i32)[None], cu_q_lens.astype(i32)[None]),
+        (rank_array(rank), cu_q_lens.astype(i32), seq_lens.astype(i32)),
+        (candidates,),
+        rows_in_use=_requests_in_step,
         topk=topk,
         sm_scale=sm_scale,
         block_q=block_q,
@@ -2610,7 +2624,9 @@ def attend_and_merge(
         and num_heads % 8 == 0
         and num_tokens > 0
     )
-    if small and use_decode_plan(num_tokens, topk, num_heads, head_dim):
+    if small and use_decode_plan(
+        num_tokens, topk, num_heads, head_dim, block_tables.size
+    ):
         # The attention reads the permuted buffer in place and writes the one
         # it permutes back, which the merge reads as delivered (the order-free
         # selection and the commuting merge as below).

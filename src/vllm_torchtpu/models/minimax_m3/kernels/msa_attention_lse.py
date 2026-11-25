@@ -1205,6 +1205,7 @@ def planned_attention(
     plan_scalars,
     plan_inputs,
     *,
+    rows_in_use,
     topk,
     sm_scale,
     block_q,
@@ -1218,7 +1219,7 @@ def planned_attention(
     peer's, which arrive as the first `Hl` rows of the permuted 16-bit
     buffer ``swap [Hl + 1, T, D]`` (bits; `msa_dcp.attend_and_merge`). The
     kernel computes the selection, local pages and work list itself:
-    ``plan(plan_scalars_ref (SMEM), swap_row_ref [T, D] (swap's last row),
+    ``plan(*plan_scalar_refs (SMEM), swap_row_ref [T, D] (swap's last row),
     *plan_input_refs, keys_ref [T, K], local_page_ref [T, 1],
     local_limit_ref [T, 1], work_ref [1, length])``
     (`msa_dcp._decode_plan_kernel`) writes them into scratch, and the work
@@ -1227,7 +1228,9 @@ def planned_attention(
     (standalone bench j-97afc7d4). The page table, and a one-tile step's
     queries, load while the plan runs: as a scalar prefetch and a pipelined
     block they landed before it (c16 b1 decode, a 64 KiB table: 5.73 -> 4.71
-    us per call; c4 b1 4.89 -> 4.69, anvil).
+    us per call; c4 b1 4.89 -> 4.69, anvil). Of ``page_table [rows, n]``
+    only the first ``rows_in_use(*plan_scalar_refs)`` rows load, the ones the
+    step's keys index: the whole 64 KiB table outlasted the plan.
 
     Returns ``(out [2 Hl, T, D], lse [1, T / Bq, 1, 2 Hl * Bq], back [Hl +
     1, T, D] uint16)``: a tile's lse is a lane-dense row (``h * Bq + t``),
@@ -1256,15 +1259,16 @@ def planned_attention(
         )
     fp4 = scale_rows is not None
     scale_inputs = (scale_cache,) if fp4 else ()
+    row = page_table.shape[1]
+    num_scalars = len(plan_scalars)
     # One tile's queries load while the plan runs (as pipelined blocks they
     # landed before it); several tiles take the blocks, whose layout lowers
     # their tiles' 8-row query slices (a VMEM scratch's does not, E2003).
     async_q = num_tiles == 1
 
-    def kernel(
-        head_ref, offset_ref, scalars_ref, q_in, peer_in, table_hbm, swap_row,
-        *refs, **kwargs,
-    ):  # fmt: skip
+    def kernel(head_ref, offset_ref, *refs, **kwargs):
+        scalar_refs, refs = refs[:num_scalars], refs[num_scalars:]
+        (q_in, peer_in, table_hbm, swap_row), refs = refs[:4], refs[4:]
         num_plan = len(plan_inputs)
         plan_refs, refs = refs[:num_plan], refs[num_plan:]
         num_scratch = 8 + 2 * async_q
@@ -1274,25 +1278,33 @@ def planned_attention(
         outs = 1 + len(scale_inputs)  # o_ref, lse_ref, back_ref after the inputs
         o_ref, lse_ref, back_ref = refs[outs : outs + 3]
         refs = refs[: outs + 2] + refs[outs + 3 :]
-        loads = [pltpu.make_async_copy(table_hbm, table_ref, load_sems.at[2])]
         if async_q:
             q_ref, peer_ref = scratch[8:]
-            loads += [
+            loads = [
                 pltpu.make_async_copy(q_in, q_ref, load_sems.at[0]),
                 pltpu.make_async_copy(
                     peer_in.at[pl.ds(0, num_heads)], peer_ref, load_sems.at[1]
                 ),
             ]
         else:
-            q_ref, peer_ref = q_in, peer_in
+            q_ref, peer_ref, loads = q_in, peer_in, []
         for copy in loads:
             copy.start()
-        plan(scalars_ref, swap_row, *plan_refs, keys, local_page, local_limit, work_v)
+
+        def table_row(r):
+            return pltpu.make_async_copy(
+                table_hbm.at[r], table_ref.at[pl.ds(r * row, row)], load_sems.at[2]
+            )
+
+        rows = rows_in_use(*scalar_refs)
+        pl.loop(0, rows)(lambda r: table_row(r).start())
+        plan(*scalar_refs, swap_row, *plan_refs, keys, local_page, local_limit, work_v)
         work = pltpu.make_async_copy(work_v.at[0], work_s, work_sem)
         work.start()
         work.wait()
         for copy in loads:
             copy.wait()
+        pl.loop(0, rows)(lambda r: table_row(r).wait())
         unions, metas, counts, starts = (work_s.at[pl.ds(at, n)] for at, n in sections)
         _kernel(
             unions,
@@ -1322,7 +1334,7 @@ def planned_attention(
     any_space = pl.BlockSpec(memory_space=pl.ANY)
     heads = pl.BlockSpec((num_heads, num_tokens, head_dim), lambda b, *_: (0, 0, 0))
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=3,
+        num_scalar_prefetch=2 + num_scalars,
         grid=(1,),
         in_specs=[
             any_space if async_q else heads,
@@ -1358,7 +1370,7 @@ def planned_attention(
             pltpu.VMEM((num_tokens, 1), jnp.int32),
             pltpu.VMEM((1, length), jnp.int32),
             pltpu.SMEM((length,), jnp.int32),
-            pltpu.SMEM(page_table.shape, jnp.int32),
+            pltpu.SMEM((page_table.size,), jnp.int32),
             pltpu.SemaphoreType.DMA(()),
             pltpu.SemaphoreType.DMA((3,)),
         ]
@@ -1395,7 +1407,7 @@ def planned_attention(
     )(
         jnp.zeros((2,), jnp.int32),
         jnp.zeros((1,), jnp.int32),
-        plan_scalars,
+        *plan_scalars,
         q,
         swap,
         page_table,
@@ -1509,87 +1521,118 @@ def _page_limits(
     return jnp.where((pages >= 0) & hit, limit, 0).astype(jnp.int32)
 
 
-def _dense_unions(keys, num_tiles):
-    """`msa_attention._dense_unions` of each of the first `num_tiles` rows of
-    ``keys [rows, 128]`` (`_NO_PAGE` for no page), in VMEM."""
-    no_page = msa_attention._NO_PAGE
-    rows = keys.shape[0]
-    keys_t = keys.T  # [128, rows]: a tile's keys down the sublanes
+# Page keys a work list built in a kernel may hold: `_tile_unions` carries a
+# key + 1 in three exact 8-bit bf16 limbs and its differences in f32.
+MAX_PLAN_KEYS = 1 << 22
+
+
+def _tile_unions(tile_keys):
+    """Each tile's `msa_attention._dense_unions` in a kernel: ``tile_keys``,
+    a ``[1, 128]`` row of page keys per tile (-1 for no page, else below
+    `MAX_PLAN_KEYS`) -> per tile ``(union [1, 128]`` ascending, -1 past its
+    pages, ``count [1, 128]`` its page count in every lane). The pairwise
+    differences, each distinct page's slot and the page at each slot are
+    three small bf16 matmuls of exact integers (sums below 2**24), issued a
+    stage at a time over the tiles so the MXU pipelines them; compares and
+    reductions over [128, 128] keys took lane reductions, which made the plan
+    of a 24-tile step ~8 us (AOT critical path)."""
+    f32, bf16 = jnp.float32, jnp.bfloat16
     iota = functools.partial(jax.lax.broadcasted_iota, jnp.int32)
     sub, lane = iota((_LANES, _LANES), 0), iota((_LANES, _LANES), 1)
-    tile = iota((rows, _LANES), 0)
-    unions = jnp.full((rows, _LANES), no_page, jnp.int32)
-    for i in range(num_tiles):
-        x_r, x_c = keys[i : i + 1, :], keys_t[:, i : i + 1]
-        same = x_c == x_r  # [a, b]
-        seen_c = jnp.max(jnp.where(same & (lane < sub), 1, 0), axis=1, keepdims=True)
-        seen_r = jnp.max(jnp.where(same & (sub < lane), 1, 0), axis=0, keepdims=True)
-        first_c = (x_c != no_page) & (seen_c == 0)
-        first_r = (x_r != no_page) & (seen_r == 0)
-        # Each distinct page's slot in the ascending union.
-        place_c = jnp.sum(jnp.where(first_r & (x_r < x_c), 1, 0), axis=1, keepdims=True)
-        union = jnp.min(
-            jnp.where(first_c & (place_c == lane), x_c, no_page), axis=0, keepdims=True
+    ones = jnp.ones((1, _LANES), jnp.int32)
+    zeros = jnp.zeros((1, _LANES), jnp.int32)
+
+    def limbs(x):
+        return [x >> 16, (x >> 8) & 0xFF, x & 0xFF]
+
+    diffs = []
+    for keys in tile_keys:
+        # diff[a, b] = key[b] - key[a] = sum_m lhs[m, a] * rhs[m, b]; no
+        # page is 0, unequal to any page + 1.
+        shifted = jnp.where(keys >= 0, keys + 1, 0)
+        lhs = jnp.concatenate(
+            [-x for x in limbs(shifted)] + [ones << 16, ones << 8, ones, zeros, zeros]
         )
-        unions = jnp.where(tile == i, union, unions)
-    return unions
+        rhs = jnp.concatenate(
+            [ones << 16, ones << 8, ones] + limbs(shifted) + [zeros, zeros]
+        )
+        diffs.append(
+            jnp.dot(lhs.T.astype(bf16), rhs.astype(bf16), preferred_element_type=f32)
+        )
+    firsts, places = [], []
+    all_ones = jnp.ones((_LANES, _LANES), bf16)
+    for keys, diff in zip(tile_keys, diffs, strict=True):
+        dup = (diff == 0) & (sub < lane)
+        seen = jnp.max(jnp.where(dup, 1, 0), axis=0, keepdims=True)
+        first = (keys >= 0) & (seen == 0)  # [1, b]: a page's first occurrence
+        # Its slot: the first occurrences of smaller pages; and the count.
+        smaller = jnp.concatenate([(diff > 0).astype(bf16), all_ones], axis=1)
+        first8 = jnp.broadcast_to(first, (8, _LANES)).astype(bf16)
+        place = jnp.dot(first8, smaller, preferred_element_type=f32)
+        firsts.append(first)
+        places.append(place[0:1].astype(jnp.int32))
+    out = []
+    for keys, first, place in zip(tile_keys, firsts, places, strict=True):
+        slot = (first & (place[:, :_LANES] == sub)).astype(bf16)  # [slot, b]
+        # The page at each slot, limb by limb, and whether the slot is filled.
+        parts = jnp.concatenate(limbs(keys) + [ones, zeros, zeros, zeros, zeros])
+        got = jax.lax.dot_general(
+            parts.astype(bf16),
+            slot,
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=f32,
+        ).astype(jnp.int32)  # [limb, slot]
+        union = (got[0:1] << 16) | (got[1:2] << 8) | got[2:3]
+        out.append((jnp.where(got[3:4] > 0, union, -1), place[:, _LANES:]))
+    return out
 
 
 def store_work_list(
-    keys,
+    tile_keys,
     out_ref,
     *,
-    num_tiles,
     pages_per_step,
     groups_per_tile,
     tiles_per_step,
     sections,
 ):
     """Inside a kernel: `_packed_work`'s row ``out_ref [1, length]`` for one
-    call of `num_tiles` tiles of 128 page keys each (``keys [rows, 128]``, a
-    tile per row, -1 for no page): the same values as
-    `msa_attention._work_list` (dense unions) and the step starts."""
-    no_page = msa_attention._NO_PAGE
-    rows = keys.shape[0]
-    iota = functools.partial(jax.lax.broadcasted_iota, jnp.int32)
-    tile_c, tile_r = iota((rows, 1), 0), iota((1, rows), 1)
-    unions = _dense_unions(jnp.where(keys < 0, no_page, keys), num_tiles)
-    present = jnp.where(unions != no_page, 1, 0)
-    pages_c = jnp.sum(present, axis=1, keepdims=True)
-    pages_r = jnp.sum(present.T, axis=0, keepdims=True)
-    unions = jnp.where(unions == no_page, -1, unions)
-    unions_at, _ = sections[0]
-    for i in range(num_tiles):
-        at = unions_at + i * _LANES
-        out_ref[:, at : at + _LANES] = unions[i : i + 1]
-
-    def groups_of(pages, real):
-        return jnp.where(real, jnp.maximum(-(-pages // pages_per_step), 1), 0)
-
-    real_c = tile_c < num_tiles
-    groups_c = groups_of(pages_c, real_c)
-    groups_r = groups_of(pages_r, tile_r < num_tiles)
-    ends_c = jnp.sum(
-        jnp.where(iota((rows, rows), 1) <= iota((rows, rows), 0), groups_r, 0),
-        axis=1,
-        keepdims=True,
-    )
-    total = jnp.sum(groups_r, axis=1, keepdims=True)  # [1, 1]
-    starts_c = ends_c - groups_c
-    big = jnp.iinfo(jnp.int32).max
-    first_at = jnp.where(real_c, starts_c, big)
-    end_at = jnp.where(real_c, ends_c, big)
-    (meta_at, max_groups), (counts_at, _), (steps_at, num_bounds) = sections[1:]
+    call of tiles of 128 page keys each (``tile_keys``, a ``[1, 128]`` row
+    per tile, -1 for no page): the same values as `msa_attention._work_list`
+    (dense unions) and the step starts. Per-tile values are rows of one
+    value in every lane, so no step reduces across lanes."""
+    (unions_at, _), (meta_at, max_groups), (counts_at, _), (steps_at, bounds) = sections
     width = -(-max_groups // _LANES) * _LANES
-    w = iota((1, width), 1)
-    tile = jnp.sum(
-        jnp.where((tile_c >= 1) & (first_at <= w), 1, 0), axis=0, keepdims=True
-    )
-    start = jnp.max(jnp.where(first_at <= w, first_at, 0), axis=0, keepdims=True)
-    end = jnp.min(jnp.where(end_at > w, end_at, total), axis=0, keepdims=True)
-    tile_pages = jnp.max(
-        jnp.where((first_at <= w) & (end_at > w), pages_c, 0), axis=0, keepdims=True
-    )
+    steps = -(-bounds // _LANES) * _LANES
+    w = jax.lax.broadcasted_iota(jnp.int32, (1, width), 1)
+    bound = jax.lax.broadcasted_iota(jnp.int32, (1, steps), 1) * tiles_per_step
+
+    def wide(x, n):  # a one-value row as n lanes
+        return jnp.broadcast_to(x[:, :1], (1, n))
+
+    tile = jnp.zeros((1, width), jnp.int32)
+    start = jnp.zeros((1, width), jnp.int32)
+    tile_pages = jnp.zeros((1, width), jnp.int32)
+    step_starts = jnp.zeros((1, steps), jnp.int32)
+    ends = []
+    end_at = jnp.zeros((1, _LANES), jnp.int32)
+    for i, (union, pages) in enumerate(_tile_unions(tile_keys)):
+        out_ref[:, unions_at + i * _LANES : unions_at + (i + 1) * _LANES] = union
+        groups = jnp.maximum(-(-pages // pages_per_step), 1)
+        first_at = end_at
+        end_at = end_at + groups
+        here = wide(first_at, width) <= w
+        if i > 0:
+            tile += jnp.where(here, 1, 0)
+        start = jnp.where(here, wide(first_at, width), start)
+        live = here & (w < wide(end_at, width))
+        tile_pages = jnp.where(live, wide(pages, width), tile_pages)
+        step_starts += jnp.where(i < bound, wide(groups, steps), 0)
+        ends.append(end_at)
+    total = wide(end_at, width)
+    end = total
+    for end_at in reversed(ends):  # the least end past w
+        end = jnp.where(wide(end_at, width) > w, wide(end_at, width), end)
     group = jnp.clip(w - start, 0, groups_per_tile - 1)
     count = jnp.clip(tile_pages - group * pages_per_step, 0, pages_per_step)
     meta = (
@@ -1600,14 +1643,8 @@ def store_work_list(
     in_list = w < max_groups
     out_ref[:, meta_at : meta_at + width] = jnp.where(in_list, meta, 0)
     out_ref[:, counts_at : counts_at + width] = jnp.where(in_list, count, 0)
-    # Step b starts at the groups of the tiles before its first one.
-    steps = -(-num_bounds // _LANES) * _LANES
-    bound = iota((1, steps), 1) * tiles_per_step
-    step_starts = jnp.sum(
-        jnp.where(real_c & (tile_c < bound), groups_c, 0), axis=0, keepdims=True
-    )
     out_ref[:, steps_at : steps_at + steps] = jnp.where(
-        iota((1, steps), 1) < num_bounds, step_starts, 0
+        jax.lax.broadcasted_iota(jnp.int32, (1, steps), 1) < bounds, step_starts, 0
     )
 
 
