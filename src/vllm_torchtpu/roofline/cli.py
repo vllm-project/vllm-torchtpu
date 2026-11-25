@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CLI entrypoint for solve, plan, and explain subcommands."""
+"""CLI entrypoint for physics lower bounds, ceiling export, and explain."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import json
 import math
 import sys
 from dataclasses import asdict, replace
+from typing import TYPE_CHECKING
 
 from .chips import (
     CHIPS,
@@ -34,6 +35,7 @@ from .constants import (
     EXAMPLE_SLO_TIERS,
     EXPERT_DTYPE_BYTES,
     KV_DTYPE_BYTES,
+    NO_FEASIBLE_LAYOUT_WARNING,
     STATE_DTYPE_BYTES,
     UNIT_GIGA,
     UNIT_KILO,
@@ -41,6 +43,7 @@ from .constants import (
     UNIT_MICRO,
     WEIGHT_DTYPE_BYTES,
 )
+from .emit import emit_ceiling_rows
 from .geometry import UnsupportedArchitectureError, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config_with_identity
 from .modules import Dtypes, Parallel, StepShape
@@ -56,6 +59,9 @@ from .solver import (
     solve_serving_plan,
 )
 from .step import FloorOptions, SpecShape, spec_cycle_floor, step_floor
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def _add_model_source(parser: argparse.ArgumentParser) -> None:
@@ -170,20 +176,65 @@ def _add_scenario_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build argument parser for solve, plan, and explain subcommands."""
-    parser = argparse.ArgumentParser(prog="python -m vllm_torchtpu.roofline")
+    """Build argument parser for physics bounds, ceiling export, and explain."""
+    parser = argparse.ArgumentParser(
+        prog="python -m vllm_torchtpu.roofline",
+        description=(
+            "Compute physical lower bounds and uncalibrated serial-phase "
+            "layout rankings across TPU parallel configurations."
+        ),
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    solve_parser = sub.add_parser("solve")
+    solve_parser = sub.add_parser(
+        "solve",
+        help=(
+            "Prune with physical HBM bounds and order all physically legal layouts "
+            "against SLOs."
+        ),
+        description=(
+            "Prune parallel layouts via physical HBM bounds and order all "
+            "uncalibrated serial-phase candidates against traffic SLOs."
+        ),
+    )
     _add_scenario_args(solve_parser)
 
-    plan_parser = sub.add_parser("plan")
+    ceiling_parser = sub.add_parser(
+        "ceiling",
+        help="Export uncalibrated physics candidate ceiling rows from solve.",
+        description=(
+            "Export uncalibrated serial-phase physics candidate rows along the "
+            "estimated throughput-interactivity envelope."
+        ),
+    )
+    _add_scenario_args(ceiling_parser)
+
+    plan_parser = sub.add_parser(
+        "plan",
+        help=(
+            "Compute hard physical step floors and uncalibrated serial "
+            "decode estimates."
+        ),
+        description=(
+            "Compute per-concurrency hard physical step floors and "
+            "uncalibrated serial-phase decode estimates for one parallel layout."
+        ),
+    )
     _add_common_args(plan_parser)
     plan_parser.add_argument("--concurrency", default="1,4,16,64")
     plan_parser.add_argument("--spec-window", type=int, default=0)
     plan_parser.add_argument("--accept-len", type=float, default=None)
 
-    explain_parser = sub.add_parser("explain")
+    explain_parser = sub.add_parser(
+        "explain",
+        help=(
+            "Break down per-module physical HBM, FLOP, and ICI volumes for one step."
+        ),
+        description=(
+            "Report per-module physical HBM, FLOP, and ICI collective "
+            "volumes for one decode or speculative cycle step."
+        ),
+    )
     _add_common_args(explain_parser)
     explain_parser.add_argument("--batch", type=int, default=1)
     explain_parser.add_argument("--rows-per-seq", type=int, default=1)
@@ -293,10 +344,34 @@ def _format_pool_axes(pool: PoolMeshPlan) -> str:
     return " x ".join(axes) if axes else "TP1"
 
 
+def _write_warnings(warnings: Sequence[str]) -> None:
+    """Write formatted warning lines to stderr."""
+    for warning in warnings:
+        sys.stderr.write(f"WARNING: {warning}\n")
+
+
+def _dispatch_ceiling(args: argparse.Namespace, serving_plan: ServingPlan) -> int:
+    """Write uncalibrated candidate ceiling rows as JSON array or JSON lines."""
+    ceiling_rows = emit_ceiling_rows(serving_plan)
+    if serving_plan.warnings:
+        _write_warnings(serving_plan.warnings)
+    if not ceiling_rows:
+        if not serving_plan.warnings:
+            _write_warnings((NO_FEASIBLE_LAYOUT_WARNING,))
+        if args.json:
+            sys.stdout.write("[]\n")
+        return 1
+    if args.json:
+        sys.stdout.write(json.dumps(ceiling_rows, allow_nan=False) + "\n")
+        return 0
+    for ceiling_row in ceiling_rows:
+        sys.stdout.write(json.dumps(ceiling_row, allow_nan=False) + "\n")
+    return 0
+
+
 def _write_solve_text_output(serving_plan: ServingPlan) -> int:
     """Write solve warnings to stderr and formatted table rows to stdout."""
-    for warning in serving_plan.warnings:
-        sys.stderr.write(f"WARNING: {warning}\n")
+    _write_warnings(serving_plan.warnings)
     if serving_plan.candidates:
         sys.stdout.write(
             f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pareto':>6}  {'pools':<32}  "
@@ -368,6 +443,11 @@ def _dispatch_solve(
     resolved_dtypes = resolve_dtypes_from_args(args, config)
     chip, custom_topos = _resolve_chip_and_topos(args)
     chip = _apply_chip_overrides(chip, args)
+    include_pairs = args.pairs or (
+        args.cmd == "ceiling"
+        and args.mode in ("auto", "disagg")
+        and args.max_chips is not None
+    )
     serving_plan = solve_serving_plan(
         from_hf_config(config, model_ref=model_ref),
         resolved_dtypes,
@@ -380,10 +460,12 @@ def _dispatch_solve(
             hbm_reserve_gb=args.hbm_reserve_gb,
             topologies=tuple(custom_topos.values()) if custom_topos else None,
             sort_by=args.sort_by,
-            include_pairs=args.pairs,
+            include_pairs=include_pairs,
             top_k=args.top_k,
         ),
     )
+    if args.cmd == "ceiling":
+        return _dispatch_ceiling(args, serving_plan)
     if args.json:
         sys.stdout.write(json.dumps(asdict(serving_plan), allow_nan=False) + "\n")
         return 0
@@ -609,7 +691,7 @@ def _dispatch_explain(
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Run the roofline CLI subcommand."""
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = _build_parser()
@@ -621,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
         overrides = _parse_hf_overrides(args.hf_overrides)
         config, identity = load_hf_config_with_identity(src, hf_overrides=overrides)
         model_ref = identity.hf_repo
-        if args.cmd == "solve":
+        if args.cmd in ("solve", "ceiling"):
             return _dispatch_solve(args, parser, config, model_ref=model_ref)
         if args.cmd == "plan":
             return _dispatch_plan(args, parser, config, model_ref=model_ref)
