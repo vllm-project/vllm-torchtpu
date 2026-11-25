@@ -283,6 +283,9 @@ class DraftAttn(nn.Module):
         main_table = per_layer[attn.main_cache_name].block_tables
         n = block.shape[0]
         shared = attn._selection_rows[:n]
+        from vllm_torchtpu.hixglue import logical_cols  # q38 HIX-GLUE SL: no-op when widths match
+
+        shared = logical_cols(shared, attn.max_selected_tokens)
         rank = getattr(attn, "dcp_rank", None)
         if rank is None:
             rank = torch.zeros((1,), dtype=torch.int32, device=block.device)

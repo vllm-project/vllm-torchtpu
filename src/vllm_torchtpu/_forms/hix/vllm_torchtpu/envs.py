@@ -637,10 +637,15 @@ if TYPE_CHECKING:
     VLLM_TPU_HXS_VERIFY_FUSE: str = "0"
     VLLM_TPU_HXS_AR0ST: str = "0"
     VLLM_TPU_HXS_RUNNER_HOIST: str = "0"
+    # q38 HIX-GLUE (HIX-LEAD-8 lane; each default "0", strict "0" / "1", registered so it is hashed)
+    VLLM_TPU_HXG_SINK_LAYOUT: str = "0"
+    VLLM_TPU_HXG_GDN_META: str = "0"
+    VLLM_TPU_HXG_PLE_ONE: str = "0"
     VLLM_TPU_MK_TABLE_SLIM: str = "0"
     VLLM_TPU_MK_RING_S1: str = ""
     VLLM_TPU_MK_LIVE_ROWS: bool = False
     VLLM_TPU_MK_LIVE_GDN_COMPUTE: bool = False
+    VLLM_TPU_MK_KERN_REC_SKIP: bool = False  # q38 HIX-KERN K8 (default off; hashed)
     VLLM_TPU_MK_GDN_CKPT_INK: bool = False
     VLLM_TPU_MK_GDN_SIDECAR: bool = False
     VLLM_TPU_MK_GDN_COMMIT1: bool = False
@@ -651,6 +656,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_SELECT_OWNED: str = "0"; VLLM_TPU_MK_IDX_TWIN: str = "0"  # q38 HXIDX (same line)
     VLLM_TPU_MK_QSA_WRITE_ALL: bool = False
     VLLM_TPU_MK_QSA_WRITE_KVAL: bool = False
+    VLLM_TPU_MK_KERN_SIDE_PREFETCH: bool = False; VLLM_TPU_MK_KERN_ROUTE_VEC: bool = False; VLLM_TPU_MK_KERN_STOCK_KV: bool = False  # q38 HIX-KERN (same line)
     # q38 PORT-BL GDN (begin)
     VLLM_TPU_GDN_LEAN_GLUE3: bool = False
     VLLM_TPU_GDN_LEAN_GLUE3_COUNT: int = 0
@@ -3670,6 +3676,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # state copies (ExecSpec.live_rows = 2). Without it the GDN half skips only pad requests' pool-gather DMAs (bitwise vs
     # the flag off by construction). Changes the traced program, so it is hashed. Default off.
     "VLLM_TPU_MK_LIVE_GDN_COMPUTE": env_bool("VLLM_TPU_MK_LIVE_GDN_COMPUTE", False),
+    "VLLM_TPU_MK_KERN_REC_SKIP": env_bool("VLLM_TPU_MK_KERN_REC_SKIP", False),  # q38 HIX-KERN K8
     # q38 X-GLUE-1-D14: the pool GDN block writes its verify checkpoints (f32 state + conv window) into the pool
     # in-kernel (megakernel/models/qwen38_gdn_ckpt_ink.py); the whole-step / segment calls drop the rec_ckpt / conv_ckpt
     # outputs, the conv-window prep and the scatter. Changes the traced program, so it is hashed. Default off.
@@ -3717,6 +3724,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whole-step kernel's own QSA cache values (KV_NEW keys, CK_NEW, RING_NEW) instead of recomputing them in XLA.
     # Read when the whole-step call is built (extra kernel outputs, writer operands), so hashed.
     "VLLM_TPU_MK_QSA_WRITE_KVAL": env_bool("VLLM_TPU_MK_QSA_WRITE_KVAL", False),
+    # q38 HIX-KERN (megakernel_runtime/qwen38_kern.py): K1 SIDE_PREFETCH = the GDN-SIDECAR block starts ordinal o+1's sidecar copies at the end
+    # of ordinal o (same copies, same bytes); K3 ROUTE_VEC = the MoE hit list from an order-preserving vector pass (same elist / n_hit).
+    # Both change the traced kernel, so both are hashed (compile key). Default off.
+    # K6 STOCK_KV = the union walk feeds FP8 K / V to the dots, KV scales after them (wholestep/union_attn.py).
+    "VLLM_TPU_MK_KERN_SIDE_PREFETCH": env_bool("VLLM_TPU_MK_KERN_SIDE_PREFETCH", False), "VLLM_TPU_MK_KERN_ROUTE_VEC": env_bool("VLLM_TPU_MK_KERN_ROUTE_VEC", False),
+    "VLLM_TPU_MK_KERN_STOCK_KV": env_bool("VLLM_TPU_MK_KERN_STOCK_KV", False),
     # q38 PORT-BL GDN (begin): Benliang Wang's GDN lean glue (aa8e6b237, VLLM_TPU_GDN_LEAN_GLUE) less its
     # window-log piece ("no_ckpt", which needs VLLM_TPU_GDN_WINDOW_LOG and so refuses D14). On the per-region unified
     # pool, every pooled GDN call with read offsets (speculative decoding) reads the step's stacked slot rows (one
@@ -3746,6 +3759,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # every QSA decode RPA call; this one leaves the MTP draft, D14 and prefill programs alone (PORT-BL rule 3).
     # Changes the traced program, so hashed. Default off.
     "VLLM_TPU_RPA_SCHEDULE_HBM_O1S": env_bool("VLLM_TPU_RPA_SCHEDULE_HBM_O1S"),
+    # q38 HIX-GLUE (HIX-LEAD-8 lane, 2026-11-24; vllm_torchtpu/hixglue.py): the HIX 16-row outside-K glue levers, each
+    # default "0" and strict ("0" / "1"). Each changes the traced programs, so each is hashed (not in
+    # _TPU_COMPILE_ENV_IGNORED). Each prints a per-rank bind line when it binds.
+    # SINK_LAYOUT (SL): the MTP draft shared-selection buffers padded to a 128-lane width (row-major on device; no
+    # full-buffer layout copies in the draft program); readers slice the logical width. Bitwise.
+    "VLLM_TPU_HXG_SINK_LAYOUT": env_with_choices("VLLM_TPU_HXG_SINK_LAYOUT", "0", ["0", "1"]),
+    # GDN_META (GM): the whole step's shared-GDN-metadata program (D07-b1) at every bucket, b16 included (overrides
+    # VLLM_TPU_MK_GDN_META_DEDUP_MIN_ROWS; needs VLLM_TPU_MK_GDN_META_DEDUP=1), plus the GDN-SIDECAR accepted index in
+    # one vectorised gather. Bitwise (integer ops).
+    "VLLM_TPU_HXG_GDN_META": env_with_choices("VLLM_TPU_HXG_GDN_META", "0", ["0", "1"]),
+    # PLE_ONE (PF0): the resident PLE lookup of a megakernel bucket in one gather (VLLM_TPU_PLE_LOOKUP_CHUNK_MIN_ROWS
+    # treated as 0; needs VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS >= 64). Bitwise (per-token gather).
+    "VLLM_TPU_HXG_PLE_ONE": env_with_choices("VLLM_TPU_HXG_PLE_ONE", "0", ["0", "1"]),
 }
 
 

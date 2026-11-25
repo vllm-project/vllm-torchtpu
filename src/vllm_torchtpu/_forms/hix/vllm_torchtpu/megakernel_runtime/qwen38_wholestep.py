@@ -299,6 +299,8 @@ class Qwen38WholeStep(nn.Module):
         s2_construct_line(_rank)  # q38 S3A-ENG T2: S2 options bind twin, every engine start, every rank
         from vllm_torchtpu.hxsmall import ar0st_used_line  # q38 S3A-ENG T5
         ar0st_used_line(_rank, tag, buckets, spec, R, max_groups, served_exec)  # q38 S3A-ENG T5: AR0S-T used per bucket, every rank
+        from .qwen38_kern import kern_bind_line; kern_bind_line(_rank)  # noqa: E702  q38 HIX-KERN: bind line, every engine start, every rank
+        from .qwen38_k8 import k8_bind_line; k8_bind_line(_rank)  # noqa: E702  q38 HIX-KERN K8: per-rank bind line + refusals, every rank
         self.kind: _WholeKind | None = None; live_rows_construct_line(tag, buckets)  # q38 XKL: X-K-LIVE line of record (every engine start)
 
     def bind_pool(self, pool: torch.Tensor, layout: Any) -> None:
@@ -331,6 +333,11 @@ class Qwen38WholeStep(nn.Module):
                     ",".join(str(b) for b in below),
                 )
         # q38 L1-D07B1 end
+        from vllm_torchtpu import hixglue as _hxg  # q38 HIX-GLUE GM: per-rank bind line (refuses GM without the shared program)
+        if _hxg.on("VLLM_TPU_HXG_GDN_META"):
+            from .qwen38_wholestep_call import gm_bind_line
+
+            gm_bind_line(int(getattr(self.layers[self.qsa_ids[0]].self_attn, "tp_rank", -1)), self.tag, self.gdn_shared, self.buckets)
         # Union stats land here inside the compiled call (in place, like the pool); the
         # driver
         # reads them outside it (`log_union_stats`). Room for the largest bucket's

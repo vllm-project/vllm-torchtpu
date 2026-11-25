@@ -120,7 +120,7 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
 | Form | Lineage | Package tree (git) | Lever keys (all default off) |
 |---|---|---|---|
 | `Q38_FORM=b1` | SB1-1 `17739744d1` + QGLUE-1 B1 `10f346d259` + SB1-2 no-GDN `00f9aa3066` + SERVE HD rider `3d12a2ccb6` + R4XB walk ring `70664cdd56` (port `fec8a2526a`) + SERVE r0pin `37da395355` (clean merges) + the GDN LOG-conv fix (CORE `b35a4bc3c2` + F1 hand-port; no key) | `a5ef57de53` | QGLUE-1: `VLLM_TPU_QSA_QCHAIN=1`, `VLLM_TPU_QSA_QCHAIN_EDITS=124`, `VLLM_TPU_QSA_PREFILL_RING_PRODUCER=1`, `VLLM_TPU_QSA_PREFILL_EPI_FOLD=1`; SB1-1's stack keys as in its row above; SB1-2: `VLLM_TPU_QSA_DECODE_FUSED_UNION=1`, `VLLM_TPU_QSA_INDEXER_PADDED_ROWS=1`, `VLLM_TPU_PD_GATHER_BULK=1`, `VLLM_TPU_PD_STAGING_FOLD=1`, `VLLM_TPU_GC_WORKER=2600`, `VLLM_TPU_GC_WORKER_LOG=1`, `VLLM_TPU_KVL_INWAIT=1` (the PD / GC / KVL keys are deliberately outside the compile key: their runs prove a cold compile); HD rider: `VLLM_TPU_HD_STAGE_CPU=1`, `VLLM_TPU_HD_REQVEC=1` only (`VLLM_TPU_HD_MARKS` and `VLLM_TPU_HD_AB` unset; host-only, compile-ignored); R4XB: `VLLM_TPU_QSA_PREFILL_UNION_WALK_RING=3` or `4` (0 = off; registered and in the compile key, so `b1` compile caches miss once after this lands) ; r0pin arm c (decode only): `VLLM_TPU_CPU_PIN_RESERVE=24`, `VLLM_TPU_CPU_PIN_SKIP_CPUS=0-23` with `VLLM_TPU_CPU_PIN=slice` (RESERVE, SKIP_CPUS and `VLLM_TPU_CPU_IRQ_DUMP_S` are compile-ignored) |
-| `Q38_FORM=hix` | HIX H `cfbd1689c1` (`q38-hix700-s3a-h`: S3a = S2 stack + PREGATE (flag off) + MKH + H2 + KV-SCALE-GUARD v2, then MESHGUARD, SIDE-FIX, T1 fix, D-b, PLE-WINMASK), its `_forms/oxpd` package byte for byte | `a559582f70` | H's served decode env (194 items, with `Q38_FORM=hix` in place of `Q38_OXPD_FORM=1`); proxy `Q38_PROXY_FORM=opener` (the served proxy map holds blob `0532c97577`) |
+| `Q38_FORM=hix` | HIX H `cfbd1689c1` (`q38-hix700-s3a-h`: S3a = S2 stack + PREGATE (flag off) + MKH + H2 + KV-SCALE-GUARD v2, then MESHGUARD, SIDE-FIX, T1 fix, D-b, PLE-WINMASK), its `_forms/oxpd` package byte for byte, + the HIX bundle `7eebc74eef` (7 commits, every key default off) | `42d3fdde6e` | H's served decode env (194 items, with `Q38_FORM=hix` in place of `Q38_OXPD_FORM=1`); proxy `Q38_PROXY_FORM=opener` (the served proxy map holds blob `0532c97577`) |
 | `Q38_FORM=b3` | STKTREE L3S `7321c4e60e` = QGLUE-1 B3 `7fd4624a18` + SB3-1 / B3STACK `fe809505ac` (clean merge; no PLE) | `5793ea2980` | QGLUE-1 B3 and SB3-1 keys as in their lineages (all default off) |
 
 - `hix` disclosures:
@@ -149,6 +149,15 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
   - **Exos:** see Notes. `hix` runs on Exos from this branch only after the recipe patches the selected form.
   - DSIG for the hix form: U; required (a DSIG row or a counted 0-ShapeSpecializationError served log) before any
     dash-bound hix car.
+  - HIX bundle (port of `q38-hix-bundle-t1` `7eebc74eef` = H + 7 commits by HIX-GLUE / HIX-KERN / HIX-STACK; every key
+    default off): GLUE SL `VLLM_TPU_HXG_SINK_LAYOUT` (`59a1eabb05`), GLUE GM `VLLM_TPU_HXG_GDN_META` (`f6bc73c528`), GLUE
+    PF0 `VLLM_TPU_HXG_PLE_ONE` (`aacc8156e5`), KERN K3 `VLLM_TPU_MK_KERN_ROUTE_VEC` with the K3-MOSAIC fix (`1eb39a0040`,
+    `5584d10fd3`), KERN K8 `VLLM_TPU_MK_KERN_REC_SKIP` (`7eebc74eef`). KERN K1 (sidecar prefetch) and K6 (stock-order FP8
+    KV) come in the same commits, default off and NOT part of the measured set. Served A/B T44f (DEV, read of record
+    read2 j-e603e15b): KEEP-BUNDLE. Not proven on this branch yet: a CPU proof (keys-off identity, hash pair, engagement
+    and a mutant per member, SERVED-COMPILE one-trace buckets 8:16 with DSIG and FORM-SELECT) and a confirmation A/B on
+    this tree come before any dash car. The bundle tests under `tests_oxpd/` (`test_hxg_*`, `q38_hixk8`, `q38_hixkern`)
+    need `Q38_FORM=hix`.
 - `b3` disclosures:
   - Member evidence (not re-run here): QGLUE-1 B3 bitwise row bw-b3 j-9664d862 PASS; SB3-1 union rec3 j-51cfff2a PASS of
     record; first device proof of the form gate T46l (A `Q38_FORM=k_sup`, B `Q38_FORM=b3`, gate line on every container).

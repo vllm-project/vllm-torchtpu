@@ -24,6 +24,8 @@ from jax.experimental.pallas import tpu as pltpu
 
 from .context import MoEEmit
 from .dedup import dedup_ecopy, dedup_local, dedup_vec
+from .dedup import _row_on  # q38 HIX-KERN K3
+from .kern_route import kern_route_list, kern_route_vec  # q38 HIX-KERN K3
 from .ring import fetch_e, fetch_loop
 from .topk import route_topk
 from .pregate import pregate_plan, pregate_route_fetch
@@ -66,17 +68,21 @@ def route(m: MoEEmit, l_idx: Any, p8: Any) -> Any:
     MROW = E // 128
     with sc("route_topk", 2):
         route_topk(m, choice, p8, VEC, slot_ec, NCP, MROW)
-    with sc("route_dma", 2):
-        cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
-        cp.start()
-        cp.wait()
+    kv = kern_route_vec(m)  # q38 HIX-KERN K3 RC-VEC (default off): the same elist / n_hit from a vector pass (kern_route.py)
+    if not kv:
+        with sc("route_dma", 2):
+            cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
+            cp.start()
+            cp.wait()
     stamp = l_idx + 1
     n_tot: Any = jnp.int32(0)
     n_hit: Any = jnp.int32(0)
     n_cp: Any = jnp.int32(0)
     if VEC:
         n_tot, n_hit, n_cp = dedup_vec(m, NCP, MROW, nb_picks)
-    if ECOPY:
+    if kv:
+        n_hit = kern_route_list(m, _row_on)
+    elif ECOPY:
         n_hit = dedup_ecopy(m, VEC, slot_ec, stamp, n_tot, n_hit, n_cp)
     else:
         n_hit = dedup_local(m, stamp)

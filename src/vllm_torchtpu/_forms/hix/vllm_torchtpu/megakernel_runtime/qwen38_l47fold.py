@@ -148,5 +148,7 @@ def write_sink(attn: Any, selected: Any) -> bool:
         return False
     from vllm_torchtpu.layers.adapter.custom_ops.rows_update_op import update_rows_
 
-    update_rows_(sink, selected)
+    from vllm_torchtpu.hixglue import pad_cols  # q38 HIX-GLUE SL: no-op pad when widths match
+
+    update_rows_(sink, pad_cols(selected, sink.shape[-1]))
     return True

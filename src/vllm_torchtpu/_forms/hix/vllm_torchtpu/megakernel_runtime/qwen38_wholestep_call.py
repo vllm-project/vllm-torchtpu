@@ -388,7 +388,7 @@ def build_wholestep_call(
         x = pad(hidden)
         rb, wb, hi = gdn_blocks_shared(off, qsl, seq, sts, cks, NS, write)
         xs = dict(zip(names, inputs(pool, tables, positions, starts, context, trig)))
-        xs.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32)); xs.update(_live_xs(ex, qsl, NS, T)); xs.update(_ink_xs(fn, wb)); xs.update(_side_xs(fn, side, off, sts, NS, T))  # noqa: E702  q38 X-GLUE-1; q38 HIX700 GDN-SIDECAR
+        xs.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32)); xs.update(_live_xs(ex, qsl, NS, T)); xs.update(_ink_xs(fn, wb)); xs.update(_side_xs_gm(fn, side, off, sts, NS, T))  # noqa: E702  q38 X-GLUE-1; q38 HIX700 GDN-SIDECAR; q38 HIX-GLUE GM (vectorised with the key, else _side_xs)
         outs = fn(pos0, x, *(xs[k] for k in fn.extra_names), *w); outs = _ink_outs(fn, outs, pool, interpret); outs, side_ret = _side_outs(fn, outs, pool, side, interpret)  # noqa: E702  q38 X-GLUE-1 (call_shared); q38 HIX700 GDN-SIDECAR
         res, conv_ck, rec_ck, kv, kr, ir = outs[:6]
         pool = writes(pool, conv_ck, rec_ck, wb, kv, kr, ir, tables, positions, starts, context,
@@ -467,6 +467,8 @@ def gdn_meta_shared(B: int | None = None) -> bool:
     on = bool(envs.VLLM_TPU_MK_GDN_META_DEDUP)
     if not on or B is None:
         return on
+    if _hxg_gm_on():  # q38 HIX-GLUE GM: the shared program at every bucket (b16 included)
+        return True
     return int(B) >= int(envs.VLLM_TPU_MK_GDN_META_DEDUP_MIN_ROWS)
 
 
@@ -1286,3 +1288,47 @@ def s2_construct_line(rank: int) -> str:
     logging.getLogger("vllm." + __name__).info(msg)
     return msg
 # q38 S3A-ENG T2 end
+
+
+# q38 HIX-GLUE GM begin (VLLM_TPU_HXG_GDN_META; vllm_torchtpu/hixglue.py). Appended; `gdn_meta_shared` and `call_shared` carry
+# one-line hooks only, so the flag-off lowering is unchanged.
+def _hxg_gm_on() -> bool:
+    from vllm_torchtpu import hixglue
+
+    return hixglue.on("VLLM_TPU_HXG_GDN_META")
+
+
+def side_offsets_vectorised(off: Any, sts: Any, NS: int, T: int) -> Any:
+    """The GDN-SIDECAR accepted index per layer and request, `[NL, NS]` int32: `clip(off[st_l[:NS]], 0, T - 1)` for every layer in
+    one gather over the stacked state ids (`_side_xs`'s list does one fit + gather + clip chain per layer). Bit-identical."""
+    from .qwen38_segment_call import _fit, _fit_requests
+
+    if len({tuple(jnp.shape(s)) for s in sts}) == 1:
+        st = _fit_requests(jnp.stack([jnp.asarray(s) for s in sts]), NS)
+    else:
+        st = jnp.stack([_fit(jnp.asarray(s), NS) for s in sts])
+    return jnp.clip(off[st], 0, T - 1).astype(jnp.int32)
+
+
+def _side_xs_gm(fn: Any, side: Any, off: Any, sts: Any, NS: int, T: int) -> dict:
+    """`_side_xs` with the accepted-index operand built by `side_offsets_vectorised` when VLLM_TPU_HXG_GDN_META is on."""
+    if not _hxg_gm_on():
+        return _side_xs(fn, side, off, sts, NS, T)
+    from vllm_torchtpu.megakernel.models.qwen38_gdn_sidecar import SIDE_CONV, SIDE_OFF, SIDE_ON, SIDE_REC
+
+    if side is None or SIDE_REC not in getattr(fn, "extra_names", ()):
+        return {}
+    s_rec, s_conv, s_on = side
+    return {SIDE_REC: s_rec, SIDE_CONV: s_conv, SIDE_ON: s_on.reshape(1).astype(jnp.int32),
+            SIDE_OFF: side_offsets_vectorised(off, sts, NS, T)}
+
+
+def gm_bind_line(rank: int, tag: str, gdn_shared: bool, buckets: Any) -> str:
+    """GM's per-rank bind line (logger.info, every call); refuses GM without the shared program (VLLM_TPU_MK_GDN_META_DEDUP=0)."""
+    from vllm_torchtpu import hixglue
+
+    if not gdn_shared:
+        raise ValueError("VLLM_TPU_HXG_GDN_META=1 needs VLLM_TPU_MK_GDN_META_DEDUP=1 (the shared-GDN-metadata program it extends)")
+    return hixglue.bind_line("VLLM_TPU_HXG_GDN_META", rank, "whole step (%s): shared GDN metadata program at every bucket (%s), "
+                             "sidecar accepted index vectorised" % (tag, ",".join(str(int(b)) for b in buckets)))
+# q38 HIX-GLUE GM end

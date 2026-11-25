@@ -156,6 +156,9 @@ class ResidentPLETable(Qwen4ExpPLETable):
         # q38 PORT-BL MOE: VLLM_TPU_PLE_LOOKUP_CHUNK_MIN_ROWS passed only when set,
         # so the default build is today's call.
         min_rows = envs.VLLM_TPU_PLE_LOOKUP_CHUNK_MIN_ROWS
+        from vllm_torchtpu import hixglue as _hxg  # q38 HIX-GLUE PF0: 0 with VLLM_TPU_HXG_PLE_ONE (bind line), else unchanged
+
+        min_rows = _hxg.ple_min_rows(min_rows, envs.VLLM_TPU_PLE_LOOKUP_CHUNK_TOKENS, _hxg.rank_of(self))
         self._raw_lookup = build_raw_lookup_op(
             self.shard_indices.num_org_elements,
             self.embedding_dim,

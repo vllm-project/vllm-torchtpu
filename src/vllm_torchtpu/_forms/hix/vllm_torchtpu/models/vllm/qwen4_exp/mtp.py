@@ -589,8 +589,11 @@ class Qwen4ExpMTP(nn.Module):
             return False
         target = layers[-1].self_attn
         width = target.max_selected_tokens
+        from vllm_torchtpu import hixglue as _hxg  # q38 HIX-GLUE SL
+
+        alloc = _hxg.sink_alloc_width(width)  # q38 HIX-GLUE SL: == width with VLLM_TPU_HXG_SINK_LAYOUT off
         sink = torch.full(
-            (max_tokens, width), -1, dtype=torch.int32, device=target.rope_cache.device
+            (max_tokens, alloc), -1, dtype=torch.int32, device=target.rope_cache.device
         )
         target.register_buffer("_selection_sink", sink, persistent=False)
         for attention in drafts:
@@ -598,6 +601,12 @@ class Qwen4ExpMTP(nn.Module):
             attention.register_buffer("_selection_source", sink, persistent=False)
             attention.register_buffer(
                 "_selection_rows", torch.full_like(sink, -1), persistent=False
+            )
+        if alloc != width:  # q38 HIX-GLUE SL: the per-rank bind line
+            _hxg.bind_line(
+                "VLLM_TPU_HXG_SINK_LAYOUT", _hxg.rank_of(target),
+                "shared-selection sink + %d draft carried-rows buffer(s) [%d, %d] int32 (logical width %d, %d pad "
+                "columns of -1, never read)" % (len(drafts), max_tokens, alloc, width, alloc - width),
             )
         return True
 

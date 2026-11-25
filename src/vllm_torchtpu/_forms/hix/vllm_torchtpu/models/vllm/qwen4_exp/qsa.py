@@ -32,6 +32,7 @@ from vllm_torchtpu import envs as vllm_torchtpu_envs
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op, request_shard_applies
 from vllm_torchtpu.layers.adapter.custom_ops.rows_update_op import update_rows_
+from vllm_torchtpu.hixglue import logical_cols as _hxg_logical_cols, pad_cols as _hxg_pad_cols  # q38 HIX-GLUE SL
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.qwen4_exp.qsa_rank_operands import rank_operand
@@ -1070,6 +1071,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 update_rows_(carried, shared)
             else:
                 shared = carried[: hidden.shape[0]]
+            shared = _hxg_logical_cols(shared, self.max_selected_tokens)  # q38 HIX-GLUE SL: no-op when widths match
         use_shared = shared is not None and shared_ops is not None and not pick_rows
         if use_shared:
             op = shared_ops[rows is not None]
@@ -1111,7 +1113,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             # The target's selection for the MTP draft (bind_shared_selection).
             # Both writes go through the donating row update: a slice copy_
             # into the buffer copied all of it every step (~42 us at 8192 rows).
-            update_rows_(sink, selected)
+            update_rows_(sink, _hxg_pad_cols(selected, sink.shape[-1]))  # q38 HIX-GLUE SL: no-op pad when widths match
         return output, selected
 
     def _request_shard_applies(

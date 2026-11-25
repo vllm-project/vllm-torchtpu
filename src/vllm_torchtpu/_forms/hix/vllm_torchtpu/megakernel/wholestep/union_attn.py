@@ -199,6 +199,7 @@ def attend_request(
     else:
         from ..blocks.qsa_attn.block import _unpack_kv
     # q38 L2-UNPACK end
+    stock_kv = _kern_stock_kv()  # q38 HIX-KERN K6 (default off)
 
     def copies(t: Any, s: Any) -> list[Any]:
         # q38 L2-UAISSUE begin
@@ -290,12 +291,17 @@ def attend_request(
         ).astype(I32)
         tok = t * TILE + jax.lax.broadcasted_iota(I32, (1, TILE), 1)
         k8, v8 = _unpack_kv(ring.at[s], off, interpret)
-        key = k8.astype(F32) * scale_k
         tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
-        value = v8.astype(F32)
-        if dcp > 1:  # unowned slots hold the pair rank's rows (FP8: may be NaN)
-            value = jnp.where(value == value, value, 0.0)
-        value = jnp.where(tok_col < length, value * scale_v, 0.0)
+        if stock_kv:  # q38 HIX-KERN K6: FP8 operands straight to the MXU, scales after the dots (stock RPA order; kern_stock_kv below)
+            key, value = k8, _kern_value_f8(v8, tok_col < length, dcp > 1)
+            if interpret:  # CPU interpret has no mixed f32 x f8 dot: the exact f32 values (the device pushes the FP8 codes)
+                key, value = key.astype(F32), value.astype(F32)
+        else:
+            key = k8.astype(F32) * scale_k
+            value = v8.astype(F32)
+            if dcp > 1:  # unowned slots hold the pair rank's rows (FP8: may be NaN)
+                value = jnp.where(value == value, value, 0.0)
+            value = jnp.where(tok_col < length, value * scale_v, 0.0)
       with sc("u_rows", 3):
         if stack:
             m, l, acc = carry
@@ -303,17 +309,18 @@ def attend_request(
             score = jax.lax.dot_general(
                 qcat, key, (((1,), (1,)), ((), ())), preferred_element_type=F32
             )
-            score = jnp.where(valid, score * sm_scale, -jnp.inf)
+            score = jnp.where(valid, (score * sm_scale) * scale_k if stock_kv else score * sm_scale, -jnp.inf)
             m_new = jnp.maximum(m, jnp.max(score, axis=-1, keepdims=True))
             safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
             p = jnp.where(valid, jnp.exp(score - safe), 0.0)
             alpha = jnp.where(
                 m == -jnp.inf, jnp.where(m_new == -jnp.inf, 1.0, 0.0), jnp.exp(m - safe)
             )
+            pv = jnp.dot(p, value, preferred_element_type=F32)
             return (
                 m_new,
                 l * alpha + jnp.sum(p, axis=-1, keepdims=True),
-                acc * alpha + jnp.dot(p, value, preferred_element_type=F32),
+                acc * alpha + (pv * scale_v if stock_kv else pv),
             )
         out = []
         for r in range(T):
@@ -322,7 +329,7 @@ def attend_request(
             score = jax.lax.dot_general(
                 qf[r], key, (((1,), (1,)), ((), ())), preferred_element_type=F32
             )
-            score = jnp.where(valid, score * sm_scale, -jnp.inf)
+            score = jnp.where(valid, (score * sm_scale) * scale_k if stock_kv else score * sm_scale, -jnp.inf)
             m_new = jnp.maximum(m, jnp.max(score, axis=-1, keepdims=True))
             safe = jnp.where(
                 m_new == -jnp.inf, 0.0, m_new
@@ -335,7 +342,8 @@ def attend_request(
                 (
                     m_new,
                     l_sum * alpha + jnp.sum(p, axis=-1, keepdims=True),
-                    acc * alpha + jnp.dot(p, value, preferred_element_type=F32),
+                    acc * alpha + (jnp.dot(p, value, preferred_element_type=F32) * scale_v if stock_kv
+                                   else jnp.dot(p, value, preferred_element_type=F32)),
                 )
             )
         return tuple(out)
@@ -833,3 +841,28 @@ def pipe_request_loop(
         return inner, jax.lax.rem(base + nt, nslots)
 
     return jax.lax.fori_loop(0, nreq, req, (init, jnp.int32(0)))[0]
+
+
+# q38 HIX-KERN K6 begin (VLLM_TPU_MK_KERN_STOCK_KV, default off; appended, so no line above moves except the marked edits).
+# The union tile body dequantizes FP8 K / V before the dots (key = f32(k8) * scale_k, value = f32(v8) * scale_v, NaN / past-length rows zeroed
+# in f32) and Mosaic pushes that f32 right operand as bf16 in one pass (U1B j-9b68df9c). With the key the FP8 tiles go to the dots as FP8
+# (stock RPA's f32 x f8E4M3FN form, batched_rpa flash_attention.py:65-70 / :165-166) and the scales apply after: score = (dot(q, k8) *
+# sm_scale) * scale_k, acc += dot(p, v8) * scale_v. No operand is quantized: K / V are already FP8 in the pool and q / p stay f32. The value
+# mask moves to the integer domain before the bitcast (byte 0 = +0.0 for a NaN code when dcp > 1, or a row at / past the request's length),
+# which is the f32 path's +0.0. At the served scales (1.0 / 1.0, enforced by KV-SCALE-GUARD) the f32 path's operands are exactly the FP8
+# values, so outputs are bitwise IF the f8-push dot equals the bf16-push dot on the MXU: U on CPU (interpret mode upcasts), decided by the
+# deviceless LLO leg (vmatpush1.f8e4m3 on the right operand, left operand not cast to f8) and the DEV car's device bitwise row.
+def _kern_stock_kv() -> bool:
+    from vllm_torchtpu.megakernel_runtime.qwen38_kern import stock_kv_on
+
+    return stock_kv_on()
+
+
+def _kern_value_f8(v8: Any, keep_rows: Any, nan_mask: bool) -> Any:
+    """v8 [TILE, 256] FP8 with rows past the length (and NaN codes when `nan_mask`) set to byte 0 (+0.0), in the integer domain."""
+    vi = jax.lax.bitcast_convert_type(v8, jnp.uint8).astype(jnp.int32)  # the select runs on 32-bit lanes (zero-extended bytes), then truncates back
+    keep = jnp.broadcast_to(keep_rows, vi.shape)
+    if nan_mask:  # e4m3fn NaN = S.1111.111 (0x7F / 0xFF)
+        keep = jnp.logical_and(keep, jnp.bitwise_and(vi, 0x7F) != 0x7F)
+    return jax.lax.bitcast_convert_type(jnp.where(keep, vi, 0).astype(jnp.uint8), v8.dtype)
+# q38 HIX-KERN K6 end

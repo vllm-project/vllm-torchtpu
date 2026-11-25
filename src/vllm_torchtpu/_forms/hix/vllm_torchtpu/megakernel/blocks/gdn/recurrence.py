@@ -33,7 +33,7 @@ def gate_act(gate: str) -> Any:
 
 
 def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
-    if int(ctx.ex.live_rows) >= 2 or gdnink_ws(ctx): return (gdn_rec_live if int(ctx.ex.live_rows) >= 2 else gdn_rec_wshm)(ctx, gp, u, ybuf, slot)  # noqa: E701  Gated delta rule on key-major `recb [B * vh, KD, VD]` (`GCH=False`); q38 X-K-LIVE dispatch, same line; q38 L1-GDNINK dispatch, same line
+    if int(ctx.ex.live_rows) >= 2 or gdnink_ws(ctx) or _k8_rec_skip(ctx): return (gdn_rec_live if int(ctx.ex.live_rows) >= 2 else gdn_rec_wshm if gdnink_ws(ctx) else gdn_rec_kskip)(ctx, gp, u, ybuf, slot)  # noqa: E701  Gated delta rule on key-major `recb [B * vh, KD, VD]` (`GCH=False`); q38 X-K-LIVE dispatch, same line; q38 L1-GDNINK dispatch, same line
     ex = ctx.ex
     scr = ctx.scr
     B, T, VER = ex.B, ex.T, ex.VER
@@ -575,3 +575,83 @@ def gdn_rec_wshm(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
         zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
         scr["mix"][b, :Z] = rnd(val * gate_act(gp.gate)(zz)).reshape(Z)
 # q38 L1-GDNINK end
+
+
+# q38 HIX-KERN K8 begin (VLLM_TPU_MK_KERN_REC_SKIP, default off; megakernel_runtime/qwen38_k8.py; appended, so the flag-off functions keep
+# their lines except gdn_rec's dispatch line, extended in place as X-K-LIVE / L1-GDNINK did). Under X-K-LIVE mode 1 the whole-state
+# recurrence `gdn_rec` runs all B rows, so a pad request's T rows are computed: 12 / 8 / 4 of the 16 rows at 1 / 2 / 3 live. Mode 2
+# (VLLM_TPU_MK_LIVE_GDN_COMPUTE) skips them but is refused at <= 16 rows (9004e0aa9 / l1-live-aot-i2: its per-request regions overflowed
+# the 16-row bucket's scoped VMEM). `gdn_rec_kskip` is `gdn_rec`'s VER row body, op for op and with the SAME STATIC row offsets (no
+# dynamic row offset on any tiled ref: TILE-ALIGN; the rolled form 86d4dccc55 had dynamic single-row offsets on ybuf / mix), unrolled
+# over the request slots, each request's T rows under `pl.when(req_live(ctx, s))`; a pad request writes zero `mix` rows (as
+# `gdn_rec_live`) and leaves its `recb` rows as they are. Live rows see the same f32 operations in the same order on the same values (rows
+# of a request in t order; the chain through `recb` bf16 unchanged), so their outputs, states and checkpoints match the flag-off kernel;
+# pad rows' outputs are discarded downstream (X-K-LIVE's contract: write ids nulled, sidecar flush skips them).
+GDN_KSKIP_TRACES: list = []  # (B, T, vh) per traced flag-on recurrence (tests / engagement)
+
+
+def _k8_rec_skip(ctx: Any) -> bool:
+    from vllm_torchtpu.megakernel_runtime.qwen38_k8 import rec_skip_on
+
+    return bool(rec_skip_on()) and int(ctx.ex.live_rows) == 1 and bool(ctx.ex.VER)
+
+
+def gdn_rec_kskip(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
+    """`gdn_rec` (verify rows, X-K-LIVE mode 1) with pad requests skipped (block comment above)."""
+    from ...live_rows import req_live
+
+    ex = ctx.ex
+    scr = ctx.scr
+    B, T = ex.B, ex.T
+    kh, vh, KD, VD = gp.kh, gp.vh, gp.KD, gp.VD
+    QKV, Z, BA, A_OFF = gp.QKV, gp.Z, gp.BA, gp.A_OFF
+    l2_eps = gp.l2_eps
+    recb, sb = scr["recb"], scr["sbuf"]
+    alog = ctx.sm(slot, "alog")[0, :vh]
+    dtb = ctx.sm(slot, "dtb")[0, :vh]
+    gnw = ctx.sm(slot, "gnorm")[0, :].astype(BF16)
+    expand = vh // kh
+    assert B % T == 0, (B, T)
+    GDN_KSKIP_TRACES.append((B, T, vh))
+
+    def cols(x):
+        xc = jnp.swapaxes(jnp.broadcast_to(x[:, None, :], (kh, VD, KD)), 1, 2)
+        return jnp.broadcast_to(xc[:, None], (kh, expand, KD, VD)).reshape(vh, KD, VD)
+
+    def rows(s_: int) -> None:
+        for t_ in range(T):
+            b = s_ * T + t_
+            urow_ = scr["ub"][s_, t_ : t_ + 1, :]
+            q = urow_[0, : kh * KD].reshape(kh, KD)
+            k = urow_[0, kh * KD : 2 * kh * KD].reshape(kh, KD)
+            v = urow_[0, 2 * kh * KD :].reshape(vh, VD)
+            src = b if t_ == 0 else b - 1
+            q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + l2_eps)
+            q = q * KD**-0.5
+            k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
+            qc, kc_ = cols(q), cols(k)
+            beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
+            a = ybuf[b, A_OFF : A_OFF + vh]
+            decay = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
+            sb[...] = (
+                recb[src * vh : (src + 1) * vh].astype(F32) * jnp.exp(decay)[:, None, None]
+            )
+            pred = jnp.sum(sb[...] * kc_, axis=1)
+            delta = (v - pred) * beta[:, None]
+            sb[...] = sb[...] + kc_ * delta[:, None, :]
+            out = rnd(jnp.sum(sb[...] * qc, axis=1))
+            recb[b * vh : (b + 1) * vh] = sb[...].astype(REC)
+            val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
+            val = (gnw[None, :] * val.astype(BF16)).astype(F32)
+            zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
+            scr["mix"][b, :Z] = rnd(val * gate_act(gp.gate)(zz)).reshape(Z)
+
+    for s in range(B // T):
+        live = req_live(ctx, s)
+        pl.when(live)(lambda s=s: rows(s))
+
+        @pl.when(jnp.logical_not(live))
+        def _(s=s):
+            for t_ in range(T):
+                scr["mix"][s * T + t_, :Z] = jnp.zeros((Z,), scr["mix"].dtype)
+# q38 HIX-KERN K8 end

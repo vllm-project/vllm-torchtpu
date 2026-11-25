@@ -206,8 +206,14 @@ class Qwen38SidecarGDN(Qwen38PoolGDN):
             for c in cps[s]:
                 c.wait()
 
-        for s in range(NS):
-            self._live_gate(ctx, s, lambda s=s: start(s))
+        if _kern_prefetch():  # q38 HIX-KERN K1: only the call's first GDN ordinal starts its own copies; ordinal o was started by o - 1
+            @pl.when(o == 0)
+            def _():
+                for s in range(NS):
+                    self._live_gate(ctx, s, lambda s=s: start(s))
+        else:
+            for s in range(NS):
+                self._live_gate(ctx, s, lambda s=s: start(s))
         for s in range(NS):
             self._live_gate(ctx, s, lambda s=s: wait(s))
         scr["pg_conv"][...] = jnp.zeros(scr["pg_conv"].shape, F32)
@@ -244,7 +250,10 @@ class Qwen38SidecarGDN(Qwen38PoolGDN):
             Qwen38PoolGDN._gather(self, ctx, o, direct, ssm)
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
-        return super().emit(_redirect(ctx), l, slot)
+        out = super().emit(_redirect(ctx), l, slot)
+        if _kern_prefetch():
+            self._kern_prefetch_next(ctx, l)
+        return out
 
     def epilogue(self, ctx: Any) -> None:
         super().epilogue(_redirect(ctx))
@@ -280,3 +289,44 @@ def refuse_unsupported() -> None:
     if bool(getattr(envs, "VLLM_TPU_MK_GDN_COMMIT1", False)):
         raise SidecarConfigError(f"{ENV}=1 is not composed with VLLM_TPU_MK_GDN_COMMIT1 (G1's stash pops the whole-step call's last 4 "
                                  "outputs; the sidecar appends its 3 last); unset one")
+
+
+# q38 HIX-KERN K1 begin (VLLM_TPU_MK_KERN_SIDE_PREFETCH, default off; appended, so no line above moves except the two marked edits).
+# The side gather (`_side_gather`) starts and waits all of layer o's 2 x NS sidecar copies at the start of layer o, so one DMA latency plus
+# the transfer is exposed per GDN layer. With the key, GDN ordinal o starts ordinal o+1's copies at the END of its own GDN body (after
+# `GDNBlock.emit` returns: its rec_in copies out of `pg_rec` were waited before the recurrence and `sd_conv` was consumed by the window
+# select in the gather), so they fly under layer o's MoE, collectives and any QSA layer in between; ordinal o+1's gather then only waits.
+# Same descriptors (`_side_copies(ctx, o + 1)`: same source plane, rows, destination and semaphores), same live predicate (`_live_gate`,
+# constant within a step), same `gdn_side_on` predicate (constant within a call): every start has exactly one wait and the values read
+# are the same bytes (plane o+1 is written only by ordinal o+1's own write-back, after its gather), so outputs are bitwise the flag-off
+# block's. Ordinal 0 starts its own copies; the last ordinal (NGDN - 1) issues none, so no copy is in flight at kernel end. The pool
+# branch (`gdn_side_on` = 0: admission / after a flush) is untouched: nothing is prefetched there ("side path only").
+def _kern_prefetch() -> bool:
+    from vllm_torchtpu.megakernel_runtime.qwen38_kern import side_prefetch_on
+
+    return side_prefetch_on()
+
+
+KERN_PF_TRACES: list = []  # (NGDN, NS) per traced prefetch site (tests / engagement)
+_KERN_PF_AHEAD = 1  # the ordinal distance prefetched (tests only: the wrong-plane mutant sets 0)
+
+
+def _kern_prefetch_next(self: Any, ctx: Any, l: Any) -> None:  # noqa: E741
+    o = ctx.stream.sp.block_ord(l, self.name)
+    ngdn = ctx.block_params(self.name).NGDN
+    on = ctx.extra[SIDE_ON][0] != 0
+    KERN_PF_TRACES.append((int(ngdn), int(ctx.ex.NS)))
+
+    @pl.when(jnp.logical_and(on, o + 1 < ngdn))
+    def _():
+        cps = self._side_copies(ctx, o + _KERN_PF_AHEAD)
+        for s in range(ctx.ex.NS):
+            def start(s: int = s) -> None:
+                for c in cps[s]:
+                    c.start()
+
+            self._live_gate(ctx, s, start)
+
+
+Qwen38SidecarGDN._kern_prefetch_next = _kern_prefetch_next
+# q38 HIX-KERN K1 end
