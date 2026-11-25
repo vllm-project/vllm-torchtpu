@@ -2341,7 +2341,7 @@ def msa_sparse_attention_lse_head_calls(
             step // block_q,
             block_q,
             store_rows,
-            _decode_tiles_per_step(block_q, True, num_q_heads // num_heads, False),
+            _decode_tiles_per_step(block_q, True, num_q_heads // num_heads),
         )
         selected = selected.transpose(1, 0, 2)
         packed = _head_work_lists(
