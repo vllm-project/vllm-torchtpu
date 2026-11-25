@@ -200,7 +200,9 @@ def _kernel(
 
         def write(out, lse):
             o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
-            lse_ref[...] = lse.T.reshape(lse_ref.shape)  # lane-dense row
+            # Lane-dense for `attend_t`'s tiles; `attend`'s rows (h * Bq + t) go
+            # out as [heads, Bq], the head-major layout callers read.
+            lse_ref[...] = (lse.T if transposed else lse).reshape(lse_ref.shape)
 
         def finish(m, denom, acc):
             """Output and lse from a tile's softmax state (log2 units, ``m``
@@ -540,6 +542,11 @@ def _attention_call(
     fp4 = scale_rows is not None
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
     scale_inputs = (scale_cache,) if fp4 else ()
+    # A tile's lse: a lane-dense row for `attend_t`; [heads, Bq] for `attend`,
+    # whose rows (h * Bq + t) reshape to it in VMEM, where as a [1, H * Bq]
+    # row the head-major [H, T] callers take cost an XLA relayout op per call
+    # (~0.6 us at 8 tokens, c4 b1 twin).
+    lse_tile = (1, num_heads * block_q) if transposed else (num_heads, block_q)
     ring = 1 + (_FP4_PREFETCH if fp4 else 1)
     scale_scratch = (
         (
@@ -567,7 +574,7 @@ def _attention_call(
             pl.BlockSpec(
                 (num_heads, tiles_per_step * block_q, head_dim), head_major_block
             ),
-            pl.BlockSpec((1, tiles_per_step, 1, num_heads * block_q), lse_block),
+            pl.BlockSpec((1, tiles_per_step) + lse_tile, lse_block),
         ],
         scratch_shapes=[
             # m, l, acc: rows on sublanes for `attend`, lanes for `attend_t`.
@@ -607,12 +614,7 @@ def _attention_call(
         out_shape=[
             jax.ShapeDtypeStruct((num_q_heads, num_tokens, head_dim), q.dtype),
             jax.ShapeDtypeStruct(
-                (
-                    num_q_heads // num_heads,
-                    num_tokens // block_q,
-                    1,
-                    num_heads * block_q,
-                ),
+                (num_q_heads // num_heads, num_tokens // block_q) + lse_tile,
                 jnp.float32,
             ),
         ],
@@ -760,7 +762,8 @@ def _chunked_call(
     if num_heads * num_chunks > 1:
         out = jax.lax.fori_loop(1, num_heads * num_chunks, head_chunk, out)
     out, lse = out
-    # lse [head blocks, tiles, 1, Hg * Bq] -> [T, G * Hg] (or head-major)
+    # lse [head blocks, tiles, 1, Hg * Bq] (or [.., Hg, Bq]) -> [T, G * Hg] (or
+    # head-major)
     num_blocks, num_tiles = lse.shape[:2]
     if head_major:
         lse = lse.reshape(num_blocks, num_tiles, -1, block_q).transpose(0, 2, 1, 3)
