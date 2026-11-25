@@ -169,7 +169,7 @@ def test_dflash_partial_prefill_saves_context_without_async_draft_bootstrap(
         ),
         patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy),
     ):
-        output = TPUModelRunner.sample_tokens(runner, None)
+        output = TPUModelRunner._sample_tokens(runner, None)
     if is_async:
         output = output.get_output()
     assert output.sampled_token_ids == ([[]] if partial_prefill else [[7]])
@@ -221,7 +221,7 @@ def test_device_drafter_runs_before_kv_connector_save(
         ),
         patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy),
     ):
-        output = TPUModelRunner.sample_tokens(runner, None)
+        output = TPUModelRunner._sample_tokens(runner, None)
 
     assert isinstance(output, AsyncTPUModelRunnerOutput) == is_async
     if is_async:

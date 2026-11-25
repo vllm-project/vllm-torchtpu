@@ -32,9 +32,16 @@ class DecoderReplayPlan:
 
 
 def coordinate_decoder_replay(
-    plan: DecoderReplayPlan | None, num_tokens: int
+    plan: DecoderReplayPlan | None, num_tokens: int, agreed_rows: int | None
 ) -> DecoderReplayPlan | None:
-    """Make every EP participant enter the decoder with the same row bucket."""
+    """Make every EP participant enter the decoder with the same row bucket.
+
+    `agreed_rows` is the runner's row count for every stage of this forward,
+    agreed one step ahead (dp_step.AGREED_ROWS); without it the participants
+    agree the largest plan's bucket here.
+    """
+    if agreed_rows is not None:
+        return replace(plan, padded_num_tokens=agreed_rows) if plan else None
     group = get_dp_group()
     if group.world_size == 1:
         return plan

@@ -142,6 +142,13 @@ def _make_runner(
     runner._dp_num_tokens_across_dp = types.MethodType(
         TPUModelRunner._dp_num_tokens_across_dp, runner
     )
+    runner._dp_step_agreed_ahead = False
+    runner._dp_bound_next_step = types.MethodType(
+        TPUModelRunner._dp_bound_next_step, runner
+    )
+    runner._publish_dp_agreed_rows = types.MethodType(
+        TPUModelRunner._publish_dp_agreed_rows, runner
+    )
     runner._has_mamba_state = False
     # One pipeline stage: the runner embeds its own inputs.
     runner._pp_is_first = True

@@ -43,6 +43,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_torchtpu.distributed import dp_step
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
 )
@@ -165,29 +166,36 @@ def test_chunk_samples_follows_the_discard_rule(computed, scheduled, tokens, sam
     assert not TPUModelRunner._chunk_samples(runner, output, 0, 0)
 
 
+def _lockstep_runner(**kwargs):
+    runner = SimpleNamespace(
+        **{
+            "_dp_lockstep_enabled": lambda: True,
+            "num_tokens_paddings": [72, 2048],
+            "_expert_relayout": None,
+            "_dp_step_index": 0,
+            "_dp_step_open": False,
+            "max_num_reqs": 12,
+            **kwargs,
+        }
+    )
+    agreement = dp_step.StepAgreement("cpu-group")
+    runner._dp_step_agreement = lambda: agreement
+    return runner
+
+
 @pytest.mark.parametrize("peer_needs_draft", [False, True])
 def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft):
-    runner = SimpleNamespace(
-        _dp_lockstep_enabled=lambda: True,
-        num_tokens_paddings=[128, 2048],
-        _expert_relayout=None,
-        _dp_step_index=0,
-    )
+    runner = _lockstep_runner()
 
     def reduce(tensor, **kwargs):
-        assert tensor.tolist() == [0] * 11
+        assert tensor.tolist() == [0] * 8
         tensor.copy_(
-            torch.tensor(
-                [2048, 2, 1, 0, int(peer_needs_draft), 0, 0, 0, 0, 0]
-                + [int(peer_needs_draft)]
-            )
+            torch.tensor([2048, 2, 1, 0] + [int(peer_needs_draft)] * 2 + [0, 0])
         )
 
-    with (
-        patch("vllm.distributed.parallel_state.get_dp_group") as group,
-        patch.object(torch.distributed, "all_reduce", side_effect=reduce) as collective,
-    ):
-        group.return_value.cpu_group = "cpu-group"
+    with patch.object(
+        torch.distributed, "all_reduce", side_effect=reduce
+    ) as collective:
         result = TPUModelRunner._dp_coordinated_step(
             runner, 0, 0, needs_draft_proposals=False, needs_draft_context=False
         )
@@ -197,7 +205,10 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
     collective.assert_called_once()
 
 
-def test_dp_step_carries_the_relayout_fields_and_calls_the_controller():
+def test_dp_step_agrees_the_next_step_after_its_launches():
+    """A decoding rank publishes its bound and the re-layout fields after a
+    step's launches; the next step launches at that bound with no collective
+    of its own."""
     seen = []
 
     class Controller:
@@ -207,26 +218,37 @@ def test_dp_step_carries_the_relayout_fields_and_calls_the_controller():
         def on_step(self, step, reduced, phase):
             seen.append((step, reduced, phase))
 
-    runner = SimpleNamespace(
-        _dp_lockstep_enabled=lambda: True,
-        num_tokens_paddings=[128, 2048],
+    runner = _lockstep_runner(
         _expert_relayout=Controller(),
         _dp_step_index=41,
-        max_num_reqs=1,
+        max_num_tokens=2048,
+        most_model_len=None,
+        num_reqs_max_model_len=12,
     )
+    runner._count_input_chunks = TPUModelRunner._count_input_chunks.__get__(runner)
+    # The scheduler bounds twelve decoding requests, 1 + 5 tokens each.
+    output = SimpleNamespace(**{dp_step.NEXT_STEP_TOKENS: [6] * 12})
+    runner._dp_next_bound = TPUModelRunner._dp_bound_next_step(runner, output)
+    runner._dp_step_open = True
+    operands = []
 
     def reduce(tensor, **kwargs):
-        assert tensor.tolist()[5:] == [0x5A5A, -0x5A5A, -3, 0, 0, 1]
-        tensor.copy_(torch.tensor([128, 1, 1, 0, 1, 0x5A5A, -0x5A5A, -2, -128, -1, 1]))
+        operands.append(tensor.tolist())
 
     with (
-        patch("vllm.distributed.parallel_state.get_dp_group") as group,
         patch.object(torch.distributed, "all_reduce", side_effect=reduce),
+        patch.object(tpu_runner.gc_policy, "on_coordinated_step") as collect,
     ):
-        group.return_value.cpu_group = "cpu-group"
-        TPUModelRunner._dp_coordinated_step(runner, 0, 0)
-    assert runner._dp_step_index == 42
-    assert seen == [(42, (0x5A5A, -0x5A5A, -2), "decode")]
+        TPUModelRunner._dp_end_step(runner)
+        assert operands == [[0, 72, 1, 12, 0, 1, 1, -72, -12, 0x5A5A, -0x5A5A, -3]]
+        bucket, chunks = TPUModelRunner._dp_coordinated_step(
+            runner, 66, 1, local_num_reqs=11
+        )
+    collect.assert_called_once()
+    assert len(operands) == 1
+    assert (bucket, chunks, runner._dp_step_max_reqs) == (72, 1, 12)
+    assert runner._dp_step_agreed_ahead
+    assert seen == [(42, (0x5A5A, -0x5A5A, -3), "decode")]
 
 
 def test_non_lockstep_partial_prefill_skips_proposals():
@@ -2424,6 +2446,7 @@ class TestInputStagingFence:
             _dp_num_tokens_across_dp=lambda n: None,
             # a0567106's _dummy_run also asks whether DP lockstep is on.
             _dp_lockstep_enabled=lambda: False,
+            _publish_dp_agreed_rows=lambda n: None,
             forward_model=forward_model,
             compute_selected_logits=lambda out, idx: out,
         )
@@ -3331,6 +3354,6 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
             setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
 
-        TPUModelRunner.sample_tokens(runner, None)
+        TPUModelRunner._sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
