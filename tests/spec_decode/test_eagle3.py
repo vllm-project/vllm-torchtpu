@@ -1938,7 +1938,7 @@ def test_second_chunk_step0_clobbers_first_chunk_rows_and_restore_fixes_it():
 # table); sub_slice passes with or without it and only checks coverage.
 @pytest.mark.parametrize("num_rows", [6, 2], ids=["full_buffer", "sub_slice"])
 def test_snapshot_is_a_buffer_of_its_own_when_clone_aliases(
-    monkeypatch, num_rows, clobber
+    monkeypatch, aliasing_clone, num_rows, clobber
 ):
     """Another step-0 forward -- the next chunk's, or an EP-DP padding chunk's
     under DP lockstep -- writes the buffer between a chunk's snapshot and its
@@ -1946,21 +1946,13 @@ def test_snapshot_is_a_buffer_of_its_own_when_clone_aliases(
     a clone of a view that covers its whole base by aliasing the base's
     buffer; CPU torch always copies, so mimic that, and replace fresh_buffer
     by its TPU branch (`+ 0`). The snapshot must keep the chunk's rows."""
-    real_clone = torch.Tensor.clone
-
-    def aliasing_clone(self, *args, **kwargs):
-        base = self._base if self._base is not None else self
-        if self.is_contiguous() and self.numel() == base.numel():
-            return self.view(self.shape)
-        return real_clone(self, *args, **kwargs)
-
     buf = torch.zeros(6, 4, dtype=torch.int32)
     proposer = _mtp_proposer_with_buffer(buf)
     live = proposer._mtp_topk_buffers[0]
     live.copy_(torch.arange(6 * 4, dtype=torch.int32).reshape(6, 4))
     gather = torch.arange(num_rows).flip(0)
     chunk0_rows = live[gather]  # advanced indexing: a copy
-    monkeypatch.setattr(torch.Tensor, "clone", aliasing_clone)
+    aliasing_clone()
     monkeypatch.setattr(
         "vllm_torchtpu.spec_decode.eagle3.fresh_buffer", lambda t: t + 0
     )

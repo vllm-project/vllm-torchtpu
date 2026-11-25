@@ -228,6 +228,26 @@ def make_fp8_experts(monkeypatch):
 
 
 @pytest.fixture
+def aliasing_clone(monkeypatch):
+    """Returns a function that makes `Tensor.clone` alias as torch_tpu may.
+
+    torch_tpu may satisfy a clone of a view that covers its whole base by
+    aliasing the base's buffer; CPU torch always copies. After the call, and
+    for the rest of the test, such a clone returns a view of the same buffer;
+    other clones still copy. Take expected values before the call.
+    """
+    real_clone = torch.Tensor.clone
+
+    def clone(self, *args, **kwargs):
+        base = self._base if self._base is not None else self
+        if self.is_contiguous() and self.numel() == base.numel():
+            return self.view(self.shape)
+        return real_clone(self, *args, **kwargs)
+
+    return lambda: monkeypatch.setattr(torch.Tensor, "clone", clone)
+
+
+@pytest.fixture
 def device(request):
     """Get the device to run tests on (CPU or TPU).
 

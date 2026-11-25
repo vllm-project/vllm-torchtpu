@@ -142,7 +142,7 @@ class TestTopkHandoff:
 
     @pytest.mark.parametrize("rows", [64, 16])
     def test_handed_on_indices_survive_the_next_forward_writing_the_table(
-        self, monkeypatch, rows
+        self, monkeypatch, aliasing_clone, rows
     ):
         # torch_tpu may satisfy a clone of a view by aliasing the source's
         # buffer, which the TPU test below shows for a full-table view; CPU
@@ -150,18 +150,10 @@ class TestTopkHandoff:
         # base, and replace fresh_buffer by its TPU branch (`+ 0`). The
         # handed-on indices must still hold this step's rows after the next
         # forward rewrites (on TPU: donates) the table.
-        real_clone = torch.Tensor.clone
-
-        def aliasing_clone(self, *args, **kwargs):
-            base = self._base if self._base is not None else self
-            if self.is_contiguous() and self.numel() == base.numel():
-                return self.view(self.shape)
-            return real_clone(self, *args, **kwargs)
-
         runner, buffer = self._runner_with_buffer()
         buffer.copy_(torch.arange(buffer.numel(), dtype=torch.int32).view_as(buffer))
-        want = real_clone(buffer[:rows])
-        monkeypatch.setattr(torch.Tensor, "clone", aliasing_clone)
+        want = buffer[:rows].clone()
+        aliasing_clone()
         monkeypatch.setattr(tpu_runner, "fresh_buffer", lambda t: t + 0)
 
         out = runner._pp_outgoing_tensors({"hidden_states": torch.zeros(rows, 8)}, rows)
