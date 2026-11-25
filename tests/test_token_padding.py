@@ -211,3 +211,31 @@ def test_mask_router_logits_for_padding():
     finally:
         token_padding.set_padding_state(None)
     assert token_padding.mask_router_logits_for_padding(logits) is logits
+
+
+def test_valid_tokens_allocation_is_gated_by_track_valid_tokens():
+    state_off = TokenPaddingState.create(8, "cpu")
+    assert state_off.local_valid_tokens is None
+    token_padding.set_padding_state(state_off)
+    try:
+        state_off.update(3, 8)
+        assert state_off.local_valid_tokens is None
+        assert token_padding.get_local_valid_tokens() is None
+    finally:
+        token_padding.set_padding_state(None)
+
+    state_on = TokenPaddingState.create(8, "cpu", track_valid_tokens=True)
+    assert state_on.local_valid_tokens is not None
+    assert state_on.local_valid_tokens.shape == (1,)
+    assert state_on.local_valid_tokens.dtype == torch.int32
+    token_padding.set_padding_state(state_on)
+    try:
+        state_on.update(5, 8)
+        count = token_padding.get_local_valid_tokens()
+        assert count is state_on.local_valid_tokens
+        assert count is not None and count.tolist() == [5]
+        state_on.update(0, 8)
+        assert count.tolist() == [0]
+    finally:
+        token_padding.set_padding_state(None)
+    assert token_padding.get_local_valid_tokens() is None

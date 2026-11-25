@@ -41,7 +41,7 @@ logger = init_logger(__name__)
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[
-    tuple[int, str, bool, Any, bool, bool, bool], Callable
+    tuple[int, str, bool, Any, bool, bool, bool, bool], Callable
 ] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
@@ -213,7 +213,7 @@ def _build_fused_moe_custom_op(
     rhs_quant_dtype=None,
     topk_weights_float32: bool = False,
     return_rows: bool = False,
-):
+) -> Callable:
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
 
@@ -252,17 +252,6 @@ def _build_fused_moe_custom_op(
         return torch.empty_like(hidden_states)
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
-
-    cache_key = (
-        topk,
-        activation,
-        use_ep,
-        rhs_quant_dtype,
-        skip_padded_tokens,
-        topk_weights_float32,
-        return_rows,
-    )
-    _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
 
@@ -272,12 +261,13 @@ def _get_fused_moe_custom_op(
     activation: str,
     use_ep: bool,
     rhs_quant_dtype=None,
-    skip_padded_tokens: bool | None = None,
+    skip_padded_tokens: bool,
+    has_row_info: bool,
     topk_weights_float32: bool = False,
     return_rows: bool = False,
-):
-    if skip_padded_tokens is None:
-        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
+) -> Callable:
+    # A custom op is always called with the same operands, so the variant that
+    # takes ``row_info`` (the BF16 row-count filter) is a separate op.
     cache_key = (
         topk,
         activation,
@@ -285,20 +275,22 @@ def _get_fused_moe_custom_op(
         rhs_quant_dtype,
         skip_padded_tokens,
         topk_weights_float32,
+        has_row_info,
         return_rows,
     )
     kernel = _fused_moe_kernel_cache.get(cache_key)
-    if kernel is not None:
-        return kernel
-    return _build_fused_moe_custom_op(
-        topk=topk,
-        activation=activation,
-        use_ep=use_ep,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
-        topk_weights_float32=topk_weights_float32,
-        return_rows=return_rows,
-    )
+    if kernel is None:
+        kernel = _build_fused_moe_custom_op(
+            topk=topk,
+            activation=activation,
+            use_ep=use_ep,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+            topk_weights_float32=topk_weights_float32,
+            return_rows=return_rows,
+        )
+        _fused_moe_kernel_cache[cache_key] = kernel
+    return kernel
 
 
 def prebuild_fused_moe_kernel(
@@ -309,15 +301,23 @@ def prebuild_fused_moe_kernel(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     topk_weights_float32: bool = False,
+    has_row_info: bool = False,
     return_rows: bool = False,
 ) -> None:
-    """Prebuild and cache fused MoE custom op outside compile-time tracing."""
+    """Prebuild and cache fused MoE custom op outside compile-time tracing.
+
+    ``has_row_info=True`` prebuilds the op that ``fused_moe_gmm`` calls with a
+    ``row_info`` tensor.
+    """
+    if skip_padded_tokens is None:
+        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
     _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        has_row_info=has_row_info,
         topk_weights_float32=topk_weights_float32,
         return_rows=return_rows,
     )
@@ -339,9 +339,14 @@ def fused_moe_gmm(
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
     topk_weights_float32: bool = False,
+    row_info: torch.Tensor | None = None,
     return_rows: bool = False,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
+
+    With ``skip_padded_tokens`` and a ``row_info`` tensor (1-element int32,
+    the valid prefix row count), the kernel excludes padded rows by row index;
+    without ``row_info`` it drops routes whose routing weight is zero.
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see
@@ -356,6 +361,8 @@ def fused_moe_gmm(
     With ``return_rows`` the result is the unweighted expert rows
     [num_tokens, topk, hidden].
     """
+    if skip_padded_tokens is None:
+        skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
     use_ep = experts_start is not None
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,
@@ -363,6 +370,7 @@ def fused_moe_gmm(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        has_row_info=row_info is not None,
         topk_weights_float32=topk_weights_float32,
         return_rows=return_rows,
     )
@@ -382,4 +390,5 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+        *(() if row_info is None else (row_info,)),
     )
