@@ -347,9 +347,7 @@ def _build_op(
     spec = PartitionSpec(EP_AXIS_NAME)
     # The score-correction bias is indexed by GLOBAL expert id and read by
     # every shard for its own tokens, so it is replicated where the other
-    # The score-correction bias is indexed by GLOBAL expert id and read by
-    # every shard for its own tokens, so it is replicated where the other
-    # seven are sharded on axis 0. The spec tuple goes straight to shard_map,
+    # inputs are sharded on axis 0. The spec tuple goes straight to shard_map,
     # so a heterogeneous tuple is what it wants; the bias is NOT closed over
     # as a constant because it differs per layer and `_OPS` would then key one
     # exported program per MoE layer.
