@@ -59,8 +59,9 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 VERIFY_FLAG = "VLLM_TPU_DEVICE_DECODE_VERIFY"
 
-# A tiny Qwen3.5 text config. Like the published one, it declares an M-RoPE
-# section, so vLLM gives the runner M-RoPE positions for a text-only model.
+# A tiny Qwen3.5 text config with an M-RoPE section. vLLM's `uses_mrope`
+# counts it as M-RoPE, so the runner stages three rows of positions, as it
+# does for a multimodal Qwen3.5 checkpoint started text-only.
 TINY_CONFIG = Qwen3_5MoeTextConfig(
     hidden_size=64,
     num_hidden_layers=2,
@@ -300,17 +301,26 @@ def test_slots_take_each_request_delta(monkeypatch):
 
 @pytest.mark.parametrize("num_outputs", [1, 4])
 @pytest.mark.parametrize(
-    "kinds",
-    [["text"] * 3, ["image", "text", "video"], ["video", "image", "text"] * 5],
-    ids=["text-only", "multimodal-delta", "multimodal-delta-15"],
+    ("kinds", "target_rows"),
+    [
+        (["text"] * 3, MAX_NUM_REQS),
+        (["image", "text", "video"], MAX_NUM_REQS),
+        (["video", "image", "text"] * 5, MAX_NUM_REQS),
+        # A full batch on 2 attention rows: the padded columns of the
+        # 16-token bucket map to the last live slot.
+        (["image", "video"], 2),
+    ],
+    ids=["text-only", "multimodal-delta", "multimodal-delta-15", "full-batch"],
 )
-def test_device_positions_are_the_stock_positions(monkeypatch, kinds, num_outputs):
+def test_device_positions_are_the_stock_positions(
+    monkeypatch, kinds, target_rows, num_outputs
+):
     """The positions a device step builds for an M-RoPE model are those the
     stock `_prepare_inputs` stages from `_calc_mrope_positions`: every live
     column holds the token's index plus its request's delta in all three
-    rows, and the padded columns are zero. Same dtype and shape, bit for
-    bit."""
-    runner = make_mrope_runner(monkeypatch)
+    rows, and the padded columns are zero, also those that map to a live
+    slot. Same dtype and shape, bit for bit."""
+    runner = make_mrope_runner(monkeypatch, target_rows=target_rows)
     prompts = prompts_for(kinds)
     add_decoding_requests(runner, prompts, num_outputs)
     slots = decode_ready_slots(runner)
@@ -421,9 +431,9 @@ def mrope_engines(monkeypatch, *, async_scheduling=False):
 
 
 def test_text_mrope_models_pass_the_startup_gate(monkeypatch):
-    """M-RoPE alone no longer keeps every step on the stock path, so a
-    Qwen3.5 text config decodes on the device. Multimodal models still stay
-    on the stock path."""
+    """M-RoPE alone no longer keeps every step on the stock path, so an
+    M-RoPE model that takes no multimodal inputs decodes on the device. A
+    model that accepts multimodal inputs still stays on the stock path."""
     runner = make_mrope_runner(monkeypatch)
     monkeypatch.setenv(FLAG, "1")
     controller = DeviceDecodeController.maybe_create(runner)

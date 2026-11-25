@@ -567,9 +567,9 @@ class DecodeSlots:
         scalars[_COL_TOP_P] = _float32_bits(input_batch.top_p_cpu[row])
         if self.mrope_delta is not None:
             # Set by `_init_mrope_positions` when the runner adds the request
-            # or applies a streaming update, which both allocate a slot again.
-            # Only multimodal pruning rewrites it later, and multimodal models
-            # keep every step on the stock path.
+            # or applies a streaming update, which both allocate a fresh slot.
+            # Only multimodal pruning rewrites it later, and a model that
+            # accepts multimodal inputs keeps every step on the stock path.
             scalars[_COL_MROPE_DELTA] = runner.requests[req_id].mrope_position_delta
         self._dirty_scalars.add(slot)
         self._ready[slot] = False
