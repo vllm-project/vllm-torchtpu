@@ -57,7 +57,6 @@ from vllm.model_executor.models.kimi_k25_vit import (
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
-    _flatten_embeddings,
     init_vllm_registered_model,
     maybe_prefix,
 )
@@ -78,6 +77,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
+from ..multimodal_merge import merge_multimodal_embeddings
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
 from .collective_ops import TokenShardCollectives
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
@@ -930,39 +930,9 @@ class KimiK3ForConditionalGeneration(
             self.get_language_model().embed_input_ids,
             is_multimodal=is_multimodal,
         )
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return inputs_embeds
-        if is_multimodal is None:
-            raise ValueError("is_multimodal is required when merging vision embeddings")
-
-        mm_embeds = _flatten_embeddings(multimodal_embeddings).to(
-            device=inputs_embeds.device, dtype=inputs_embeds.dtype
+        return merge_multimodal_embeddings(
+            inputs_embeds, multimodal_embeddings, is_multimodal
         )
-        mask_cpu = is_multimodal.detach().reshape(-1).to(device="cpu", dtype=torch.bool)
-        expected = int(mask_cpu.sum().item())
-        actual = mm_embeds.shape[0]
-        if actual != expected:
-            raise ValueError(
-                f"Attempted to assign {actual} multimodal tokens to "
-                f"{expected} placeholders"
-            )
-        if actual == 0:
-            return inputs_embeds
-
-        media_indices_cpu = mask_cpu.to(torch.int64).cumsum(0).sub_(1)
-        media_indices_cpu.clamp_(min=0)
-        media_indices = media_indices_cpu.to(device=inputs_embeds.device)
-        aligned_media = mm_embeds.index_select(0, media_indices)
-        mask = is_multimodal.reshape(-1, 1).to(
-            device=inputs_embeds.device, dtype=torch.bool
-        )
-        merged = torch.where(mask, aligned_media, inputs_embeds)
-        if merged.device.type != "tpu":
-            return merged
-
-        materialized = fresh_buffer(merged)
-        synchronize_tensors(materialized)
-        return materialized
 
     def forward(
         self,

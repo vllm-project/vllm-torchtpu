@@ -109,9 +109,12 @@ from .layers import (
 from .weights import selected_packed_expert_outputs
 
 if TYPE_CHECKING:
+    from vllm.models.muse_spark.common.audio import AutoEncoder
     from vllm.transformers_utils.configs.muse_spark import MuseSparkTextConfig
 
     from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
+
+    from .vision import NaViT
 
 
 class MuseRoutedExperts(RoutedExperts):
@@ -556,6 +559,9 @@ class MuseModel(nn.Module):
 
 class _MuseModelComponents(nn.Module):
     language_model: MuseModel
+    vision_tower: "NaViT"
+    vision_projection: RowParallelLinear
+    audio_tower: "AutoEncoder"
 
 
 class MuseSparkForCausalLM(nn.Module):

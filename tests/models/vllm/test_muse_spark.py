@@ -81,20 +81,27 @@ def decode_expert_weight(parts: dict[str, torch.Tensor], name: str) -> torch.Ten
 
 
 @pytest.mark.parametrize(
-    "arch", ["MuseSparkForCausalLM", "MuseSparkForConditionalGeneration"]
+    ("arch", "module"),
+    [
+        ("MuseSparkForCausalLM", "model"),
+        ("MuseSparkForConditionalGeneration", "multimodal"),
+    ],
 )
-def test_architectures_register_the_text_model(arch):
-    """The released checkpoints declare MuseSparkForConditionalGeneration;
-    both names load the TPU text model instead of upstream's classes."""
+def test_architectures_register_the_tpu_models(arch, module):
+    """Both architectures load the TPU classes instead of upstream's."""
+    import importlib
+
     from vllm.model_executor.models import ModelRegistry
 
     from vllm_torchtpu.models.vllm import register_models
-    from vllm_torchtpu.models.vllm.muse_spark.model import MuseSparkForCausalLM
 
+    expected = getattr(
+        importlib.import_module(f"vllm_torchtpu.models.vllm.muse_spark.{module}"), arch
+    )
     previous = ModelRegistry.models.get(arch)
     try:
         register_models()
-        assert ModelRegistry.models[arch].load_model_cls() is MuseSparkForCausalLM
+        assert ModelRegistry.models[arch].load_model_cls() is expected
     finally:
         if previous is None:
             ModelRegistry.models.pop(arch, None)
