@@ -99,6 +99,7 @@ class TorchStepMetaOps:
         return a & b
 
     def check_distinct_cols_2d(self, ckpt_g: torch.Tensor, T: int) -> None:
+        # Also skips a device tensor: checking it would sync it to the host.
         if torch.compiler.is_compiling() or ckpt_g.device.type != "cpu":
             return
         check_ckpt_write_cols_distinct(ckpt_g, T)

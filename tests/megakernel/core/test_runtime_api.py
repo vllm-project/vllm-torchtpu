@@ -30,14 +30,15 @@ import pytest
 
 import vllm_torchtpu.megakernel.core as mk
 from tests.megakernel.core.megakernel_synth import TINY_TILES, synth_hybrid_spec
-from vllm_torchtpu.megakernel.core import cache as mk_cache
 from vllm_torchtpu.megakernel.core import (
+    _builtins,
     cache_flat,
     fused_io_hook,
     model_def,
     planner,
     profile,
 )
+from vllm_torchtpu.megakernel.core import cache as mk_cache
 from vllm_torchtpu.megakernel.core import runtime as mk_rt
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.core.geometry import ModelGeometry
@@ -279,6 +280,46 @@ def test_runtime_config_and_gpr_bucket_exec_spec():
         assert not use_gpr_split, prof_g.name
 
 
+def test_bucket_exec_spec_defaults_to_the_profile_fused_policy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Without `fused_pool_io*` arguments, `bucket_exec_spec` takes the policy
+    and thresholds from the profile: an `"auto"` profile fuses a bucket at or
+    below its `fused_pool_io_max_b` (which turns GPR off) and splits one above
+    it, where its `pool_gather=True` gathers."""
+    # Mark a fused pool I/O implementation as registered, without loading one:
+    # only the pool I/O mode is resolved, no fused kernel runs.
+    monkeypatch.setattr(_builtins, "_LOADED", set(_builtins.BUILTINS))
+    monkeypatch.setattr(fused_io_hook, "_IMPL", object())
+    ms = synth_hybrid_spec(L=4, att_every=4, R=1, KH=2, VH=4)
+    base_ex = ExecSpec(
+        R=1,
+        B=4,
+        T=1,
+        ctx=256,
+        interpret=True,
+        stack_e=False,
+        tiles=dataclasses.replace(TINY_TILES, bank=512 << 10),
+        cache=CacheExec(paged_kv=True, num_pages=96, max_pages_per_seq=2),
+    )
+    prof = Profile(
+        name="test-fused-auto",
+        numerics="approx",
+        fused_pool_io="auto",
+        fused_pool_io_max_b=8,
+        fused_pool_io_min_b_hi=56,
+        pool_gather=True,
+    )
+    # B=16 fuses under the library default threshold (24), not under the
+    # profile's (8).
+    for bucket_t, want in ((8, (True, False)), (16, (False, True))):
+        ex, use_fused, use_gpr = bucket_exec_spec(
+            ms, base_ex, prof, bucket_t=bucket_t, tokens_per_seq=4
+        )
+        assert (use_fused, use_gpr) == want, bucket_t
+        assert (cache_exec(ex).fused_pool_io, cache_exec(ex).pool_gather) == want
+
+
 def test_parse_runtime_options_profile_defaults_and_value_errors(
     isolated_model_registry,
 ):
@@ -346,9 +387,14 @@ def test_parse_runtime_options_profile_defaults_and_value_errors(
         ("pool_gather", "gather", "invalid pool_gather='gather'"),
         ("fused_pool_io_max_b", "abc", "invalid fused_pool_io_max_b='abc'"),
         ("fused_pool_io_min_b_hi", "4.5", "invalid fused_pool_io_min_b_hi='4.5'"),
+        # JSON values: a bool or float is no more an integer than "4.5" is.
+        ("fused_pool_io_min_b_hi", 4.5, "invalid fused_pool_io_min_b_hi=4.5"),
+        ("fused_pool_io_max_b", True, "invalid fused_pool_io_max_b=True"),
     ):
         with pytest.raises(ValueError, match=f"^Megakernel: {msg}"):
             parse_runtime_options({key: val})
+    cfg_int = parse_runtime_options({"fused_pool_io_max_b": 12})
+    assert cfg_int["fused_pool_io_max_b"] == 12
 
 
 def test_resolve_driver_profile_defaults_overrides_and_errors(
