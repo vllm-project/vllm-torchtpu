@@ -1696,7 +1696,7 @@ def _align_raiden_num_blocks(
 
 
 def _patch_vllm_new_request_prompt_ndarray() -> None:
-    """Ship long prompts to the workers as int32 ndarrays, not Python lists.
+    """Ship long prompts to the workers as int32 array.array, not Python lists.
 
     A new request's ``prompt_token_ids`` travels EngineCore -> worker inside
     the pickled SchedulerOutput. As a list of several hundred thousand Python
@@ -1705,17 +1705,22 @@ def _patch_vllm_new_request_prompt_ndarray() -> None:
     ``token_ids_cpu`` (~4 ms per 150k tokens, ~25 ms at 800k). That runs on the
     worker's main thread, so under DP/EP lockstep every rank waits for the one
     admitting a long request (seen on DSv4.1 1P1D decode under AgentX). An
-    ndarray pickles as one buffer and the worker copy is a memcpy. Only the
-    worker-bound NewRequestData is changed; the scheduler's Request keeps its
-    list. Worker-side users only take len(), index, slice or bulk-assign it.
+    ``array.array('i')`` pickles as one in-band bytes object and the worker's
+    numpy bulk-assign reads it through the buffer protocol (800k tokens:
+    ~1.6 ms instead of ~25 ms). Not an ndarray: shm_broadcast sends pickle
+    buffers >= 1 MiB out of band as views into its ring buffer, so an ndarray
+    prompt over ~262k tokens aliased a reused slot and the worker later read
+    garbage token ids. Only the worker-bound NewRequestData is changed; the
+    scheduler's Request keeps its list. Worker-side users only take len(),
+    index, slice or bulk-assign it (list concatenation would raise TypeError).
     TPU_NEW_REQ_PROMPT_NDARRAY_MIN (default 8192, 0 = off) is the minimum
     prompt length converted. Read from the environment, not envs, so it does
     not enter the compile-cache hash.
     """
+    import array
     import functools
     import os
 
-    import numpy as np
     from vllm.v1.core.sched.output import NewRequestData
 
     threshold = int(os.environ.get("TPU_NEW_REQ_PROMPT_NDARRAY_MIN", "8192"))
@@ -1729,14 +1734,14 @@ def _patch_vllm_new_request_prompt_ndarray() -> None:
         data = original_fn(cls, request, *args, **kwargs)
         ids = data.prompt_token_ids
         if isinstance(ids, list) and len(ids) >= threshold:
-            data.prompt_token_ids = np.asarray(ids, dtype=np.int32)
+            data.prompt_token_ids = array.array("i", ids)
         return data
 
     from_request._tpu_prompt_ndarray = True  # type: ignore[attr-defined]
     NewRequestData.from_request = classmethod(from_request)  # type: ignore[method-assign]
     logger.info(
-        "Applied TPU patch: NewRequestData ships prompts >= %d tokens as int32 "
-        "ndarrays.",
+        "Applied TPU patch: NewRequestData ships prompts >= %d tokens as "
+        "array('i').",
         threshold,
     )
 
