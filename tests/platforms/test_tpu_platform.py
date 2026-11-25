@@ -955,16 +955,65 @@ class TestTpuPlatform:
         monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
         monkeypatch.setattr(tpu_platform.envs, "USE_TPU_PCP_MANAGER", use_pcp_manager)
         vllm_config.model_config.architecture = "Qwen3_5ForConditionalGeneration"
+        vllm_config.model_config.use_mla = False
+        vllm_config.model_config.is_multimodal_model = True
+        vllm_config.model_config.multimodal_config = SimpleNamespace(
+            language_model_only=True
+        )
+        vllm_config.model_config.runner_type = "generate"
         vllm_config.model_config.get_head_size.return_value = 128
         vllm_config.cache_config.block_size = 256
+        vllm_config.compilation_config.compile_sizes = [16, 32, 512]
         vllm_config.parallel_config.prefill_context_parallel_size = 4
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.is_moe_model = False
         vllm_config.parallel_config.cp_kv_cache_interleave_size = 1
+        vllm_config.speculative_config = None
+        vllm_config.lora_config = None
+        vllm_config.kv_transfer_config = None
 
         with pytest.raises(ValueError, match="multiple of 16"):
             TpuPlatform.check_and_update_config(vllm_config)
 
         vllm_config.parallel_config.cp_kv_cache_interleave_size = 128
         TpuPlatform.check_and_update_config(vllm_config)
+
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_default_compile_sizes_cover_512_interleaved_pcp(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(tpu_platform.envs, "USE_TPU_PCP_MANAGER", True)
+        vllm_config.model_config.architecture = "LlamaForCausalLM"
+        vllm_config.model_config.use_mla = False
+        vllm_config.model_config.is_multimodal_model = False
+        vllm_config.model_config.multimodal_config = None
+        vllm_config.model_config.runner_type = "generate"
+        vllm_config.model_config.get_head_size.return_value = 128
+        vllm_config.cache_config.block_size = 256
+        vllm_config.compilation_config.compile_sizes = None
+        vllm_config.scheduler_config.max_num_batched_tokens = 256
+        vllm_config.scheduler_config.max_num_scheduled_tokens = None
+        vllm_config.parallel_config.prefill_context_parallel_size = 4
+        vllm_config.parallel_config.decode_context_parallel_size = 1
+        vllm_config.parallel_config.pipeline_parallel_size = 1
+        vllm_config.parallel_config.data_parallel_size = 1
+        vllm_config.parallel_config.is_moe_model = False
+        vllm_config.parallel_config.cp_kv_cache_interleave_size = 128
+        vllm_config.speculative_config = None
+        vllm_config.lora_config = None
+        vllm_config.kv_transfer_config = None
+
+        TpuPlatform.check_and_update_config(vllm_config)
+        assert 512 in vllm_config.compilation_config.compile_sizes
 
     @pytest.mark.parametrize(
         ("initial_cls", "expected_cls"),

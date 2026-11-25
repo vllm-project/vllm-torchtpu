@@ -104,6 +104,7 @@ def _fake_runner(num_computed, num_prompt, q_lens, seq_lens):
     lens[: len(seq_lens)] = seq_lens
     return SimpleNamespace(
         device=torch.device("cpu"),
+        uses_mrope=False,
         input_batch=SimpleNamespace(
             num_computed_tokens_cpu=np.asarray(num_computed, dtype=np.int32),
             num_prompt_tokens=np.asarray(num_prompt, dtype=np.int32),

@@ -58,7 +58,11 @@ def _make_runner(
     block_size=16,
 ):
     num_reqs = len(scheduled_tokens)
-    max_model_len = max(64, max(prompt_tokens) + 16)
+    max_seq_len = max(
+        max(int(p), int(c) + int(s))
+        for p, c, s in zip(prompt_tokens, num_computed_tokens, scheduled_tokens)
+    )
+    max_model_len = max(64, max_seq_len + 16)
     target_num_reqs = max_num_reqs
     max_num_tokens = max(token_paddings)
 
@@ -86,7 +90,11 @@ def _make_runner(
     runner._pp_is_last = True
     runner._pp_handoff = None
     runner._adaptive_verification = None
-    runner.scheduler_config = SimpleNamespace(async_scheduling=False)
+    runner.scheduler_config = SimpleNamespace(
+        async_scheduling=False,
+        max_num_batched_tokens=max_num_tokens,
+        max_num_scheduled_tokens=None,
+    )
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
         cp_kv_cache_interleave_size=block_size,
@@ -193,7 +201,9 @@ def _make_runner(
         runner.mrope_positions = make_buffer(3, max_num_tokens + 1, dtype=torch.int32)
 
         def fill_mrope_positions(_scheduler_output):
-            positions = torch.arange(max_num_tokens + 1, dtype=torch.int32)
+            positions = torch.arange(
+                runner.mrope_positions.cpu.shape[1], dtype=torch.int32
+            )
             runner.mrope_positions.cpu[0] = positions
             runner.mrope_positions.cpu[1] = positions + 1000
             runner.mrope_positions.cpu[2] = positions + 2000
@@ -208,7 +218,7 @@ def _make_runner(
             dtype=torch.int32,
         )
 
-    pages_per_req = max(4, (max(prompt_tokens) + block_size - 1) // block_size)
+    pages_per_req = max(4, (max_seq_len + block_size - 1) // block_size)
     block_tables = torch.zeros((num_reqs, pages_per_req), dtype=torch.int32)
     next_block = 0
     for req_idx, seq_len in enumerate(prompt_tokens):
@@ -285,6 +295,7 @@ def _scheduler_output(scheduled_tokens):
             f"req{i}": int(n) for i, n in enumerate(scheduled_tokens)
         },
         scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
     )
 
 

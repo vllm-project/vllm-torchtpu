@@ -71,6 +71,7 @@ def _load_pcp_local_token_counts():
 
 def _budget_config(sizes, batched, pcp=1, interleave=1, scheduled=None):
     return SimpleNamespace(
+        model_config=SimpleNamespace(use_mla=False),
         compilation_config=SimpleNamespace(compile_sizes=sizes),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=batched,
@@ -270,3 +271,32 @@ def test_hint_matches_runner_rank_local_rows(check_budget, pcp, interleave, budg
 @pytest.mark.parametrize("sizes", [[], None])
 def test_no_compile_sizes_is_skipped(check_budget, sizes):
     check_budget(_budget_config(sizes, 16384))
+
+
+def test_interleaved_pcp_manager_requires_512_multiple_compile_size(
+    check_budget, monkeypatch
+):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "USE_TPU_PCP_MANAGER", True)
+    cfg = _budget_config([1000, 3000], 8192, pcp=4, interleave=128)
+    with pytest.raises(ValueError, match="divisible by 512") as excinfo:
+        check_budget(cfg)
+    assert "or lower" not in str(excinfo.value)
+
+    cfg_small_budget = _budget_config([16, 256], 256, pcp=4, interleave=128)
+    with pytest.raises(ValueError, match="divisible by 512") as excinfo_small:
+        check_budget(cfg_small_budget)
+    assert "or lower" not in str(excinfo_small.value)
+
+    cfg_small = _budget_config([512, 3000], 8192, pcp=4, interleave=128)
+    with pytest.raises(ValueError, match="at least 2048"):
+        check_budget(cfg_small)
+
+    cfg_ok = _budget_config([512, 2048, 3000], 8192, pcp=4, interleave=128)
+    check_budget(cfg_ok)
+
+    cfg_scheduled_cap = _budget_config(
+        [512, 1024], 8192, pcp=4, interleave=128, scheduled=4096
+    )
+    check_budget(cfg_scheduled_cap)

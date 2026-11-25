@@ -55,14 +55,14 @@ def _vllm_config(pcp_size=2, interleave_size=4):
     )
 
 
-def _impl(kv_cache_dtype="bfloat16", **kwargs):
+def _impl(kv_cache_dtype="bfloat16", head_size=128, sliding_window=None, **kwargs):
     return PallasAttentionBackendImpl(
         num_heads=2,
-        head_size=128,
+        head_size=head_size,
         scale=1.0,
         num_kv_heads=1,
         alibi_slopes=None,
-        sliding_window=None,
+        sliding_window=sliding_window,
         kv_cache_dtype=kv_cache_dtype,
         **kwargs,
     )
@@ -239,15 +239,24 @@ def test_forward_rejects_unsupported_pcp_streaming_features(
         _impl(**impl_kwargs).forward(_layer(), query, key, value, kv_cache, metadata)
 
 
-@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    ("impl_kwargs", "expected_message"),
+    [
+        ({"logits_soft_cap": 30.0}, "logits soft cap"),
+        ({"head_size": 64}, "head_size == 64"),
+        ({"sliding_window": 128}, "sliding window"),
+    ],
+)
 def test_initialize_kernel_rejects_unsupported_pcp_streaming_features(
-    vllm_config_context,
+    impl_kwargs,
+    expected_message,
+    cpu_vllm_config_context,
 ):
     with (
         set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
-        pytest.raises(NotImplementedError, match="logits soft cap"),
+        pytest.raises(NotImplementedError, match=expected_message),
     ):
-        _impl(logits_soft_cap=30.0).initialize_kernel(_layer())
+        _impl(**impl_kwargs).initialize_kernel(_layer())
 
 
 @pytest.mark.tpu_test
