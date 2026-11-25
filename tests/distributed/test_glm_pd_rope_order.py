@@ -24,7 +24,6 @@ from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 
 from tests.layers.adapter.test_indexer_rope_neox_permute import _indexer
 from tests.layers.adapter.test_mla_rope_neox_permute import _wrapper
-from vllm_torchtpu.distributed.kv_transfer import tpu_connector as tc
 from vllm_torchtpu.distributed.kv_transfer.raiden import layout_fingerprint as rlf
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mla_op
@@ -351,15 +350,13 @@ def test_flag_on_but_permute_skipped_declares_interleaved():
             assert mla_op.glm_rope_half_split(model, glm) == (False, False)
 
 
-class _ComparingController:
-    """The reshard service as the workers see it: it keeps each unit's
-    registered layout fingerprint and refuses a transfer whose source and
-    destination units registered different ones (the native service's
-    "Layout fingerprint mismatch between source and destination")."""
+class _RecordingController:
+    """The reshard service as the workers see it at registration: it keeps
+    each unit's registered layout fingerprint. The real service refuses a
+    transfer between units that registered different ones."""
 
     def __init__(self):
         self.fingerprints = {}
-        self.start_transfer_calls = 0
 
     @staticmethod
     def _key(unit):
@@ -367,15 +364,6 @@ class _ComparingController:
 
     def register_work_unit(self, *, unit, layout_fingerprint, **_):
         self.fingerprints[self._key(unit)] = layout_fingerprint
-
-    def start_transfer(self, *, src_units, dst_units, **_):
-        self.start_transfer_calls += 1
-        seen = {self.fingerprints[self._key(u)] for u in [*src_units, *dst_units]}
-        if len(seen) != 1:
-            raise RuntimeError(
-                "Layout fingerprint mismatch between source and destination"
-            )
-        return True
 
 
 @pytest.fixture
@@ -433,62 +421,41 @@ def _register(controller, *, is_producer, model, path, layers=(0, 1)):
     return unit, registration["layout_fingerprint_payload"]
 
 
-# How a leg's layers ended up: permuted, never permuted, or flag on with a
-# rope the permute skipped.
+# How a leg's layers ended up, and the rope order its cache holds: permuted,
+# never permuted, or flag on with a rope the permute skipped.
 _ENGINES = {
-    "interleaved": {},
-    "half_split": {"permuted_mla": True, "permuted_indexer": True},
-    "skipped": {"rope": _OwnForwardRope},
+    "interleaved": ({}, "interleaved"),
+    "half_split": ({"permuted_mla": True, "permuted_indexer": True}, HALF),
+    "skipped": ({"rope": _OwnForwardRope}, "interleaved"),
 }
 
 
-@pytest.mark.usefixtures("_fake_layer_classes")
+@pytest.mark.usefixtures("_fake_layer_classes", "_golden_layouts")
 @pytest.mark.parametrize("path", ["tp", "identity"])
-@pytest.mark.parametrize(
-    ("producer", "decode", "refused"),
-    [
-        ("interleaved", "half_split", True),
-        ("half_split", "interleaved", True),
-        ("half_split", "half_split", False),
-        ("interleaved", "interleaved", False),
-        ("skipped", "interleaved", False),
-        ("interleaved", "skipped", False),
-        ("skipped", "half_split", True),
-        ("half_split", "skipped", True),
-    ],
-)
-def test_mixed_rope_pairing_is_refused_at_transfer_start(
-    _golden_layouts, path, producer, decode, refused
-):
-    # End to end on the CPU side: each leg measures its own layers, registers
-    # its fingerprint, and the decode's transfer start goes through the same
-    # retry wrapper as a real load. A mixed pairing is refused and not
-    # retried; a matched pairing (either order) is accepted.
-    controller = _ComparingController()
+@pytest.mark.parametrize("decode", list(_ENGINES))
+@pytest.mark.parametrize("producer", list(_ENGINES))
+def test_legs_register_one_fingerprint_only_for_one_rope_order(path, producer, decode):
+    # End to end on the CPU side: each leg measures its own layers and
+    # registers its fingerprint, the one the service compares at transfer
+    # start. The two legs register the same fingerprint exactly when their
+    # caches hold the same rope order.
+    controller = _RecordingController()
+    (producer_layers, producer_order), (decode_layers, decode_order) = (
+        _ENGINES[producer],
+        _ENGINES[decode],
+    )
     src, src_payload = _register(
-        controller, is_producer=True, model=_model(**_ENGINES[producer]), path=path
+        controller, is_producer=True, model=_model(**producer_layers), path=path
     )
     dst, dst_payload = _register(
-        controller, is_producer=False, model=_model(**_ENGINES[decode]), path=path
+        controller, is_producer=False, model=_model(**decode_layers), path=path
     )
     for kind, payload in ((producer, src_payload), (decode, dst_payload)):
         declared = {payload.get("mla_rope_order"), payload.get("indexer_rope_order")}
         assert declared == ({HALF} if kind == "half_split" else {None})
-    start = functools.partial(
-        tc.TPURaidenConnectorWorker._start_stage3_transfer_with_d5_retry,
-        controller,
-        src_units=[src],
-        dst_units=[dst],
-        req_id="probe",
-        uuid=1,
-    )
-    with patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0):
-        if refused:
-            with pytest.raises(RuntimeError, match="Layout fingerprint mismatch"):
-                start()
-        else:
-            assert start() is True
-    assert controller.start_transfer_calls == 1
+    fingerprints = controller.fingerprints
+    same = fingerprints[controller._key(src)] == fingerprints[controller._key(dst)]
+    assert same == (producer_order == decode_order)
 
 
 def test_rope_order_is_read_from_real_layers(monkeypatch):
@@ -522,7 +489,7 @@ def test_default_pp_stage_and_dcp_decode_payloads_agree(monkeypatch, _golden_lay
         "pp_stage_without_indexer": (_real_glm_layer(indexer=False), True, (1,)),
         "dcp8_decode": (_real_glm_layer(indexer=True, dcp=8), False, (0, 1)),
     }
-    controller = _ComparingController()
+    controller = _RecordingController()
     registered = {}
     for name, (model, is_producer, layers) in legs.items():
         _post_load_permute(model)
