@@ -1038,26 +1038,22 @@ def test_deepseek_v41_causal_lm(monkeypatch: pytest.MonkeyPatch):
         scheduler_config=SimpleNamespace(async_scheduling=True),
     )
 
-    with unittest.mock.patch(
-        "vllm_torchtpu.models.vllm.deepseek_v41.v2.async_fence.install_lookback_fence"
-    ) as mock_fence:
-        causal = v2_model.DeepseekV41ForCausalLM(vllm_config=vllm_cfg)
-        mock_fence.assert_called_once()
-        assert causal.hf_to_vllm_mapper == "mapper"
+    causal = v2_model.DeepseekV41ForCausalLM(vllm_config=vllm_cfg)
+    assert causal.hf_to_vllm_mapper == "mapper"
 
-        causal.model = SimpleNamespace(
-            engram_hash=SimpleNamespace(ensure_cache=unittest.mock.MagicMock())
-        )
-        out = causal.forward()
-        assert out == "causal_out"
-        causal.model.engram_hash.ensure_cache.assert_called_once()
+    causal.model = SimpleNamespace(
+        engram_hash=SimpleNamespace(ensure_cache=unittest.mock.MagicMock())
+    )
+    out = causal.forward()
+    assert out == "causal_out"
+    causal.model.engram_hash.ensure_cache.assert_called_once()
 
-        # causal.model.engram_hash is None -> skips ensure_cache
-        causal.model.engram_hash = None
-        out_no_hash = causal.forward()
-        assert out_no_hash == "causal_out"
+    # causal.model.engram_hash is None -> skips ensure_cache
+    causal.model.engram_hash = None
+    out_no_hash = causal.forward()
+    assert out_no_hash == "causal_out"
 
-    # async_scheduling is False -> skips install_lookback_fence
+    # async_scheduling is False
     vllm_cfg.scheduler_config.async_scheduling = False
     causal_no_async = v2_model.DeepseekV41ForCausalLM(vllm_config=vllm_cfg)
     assert causal_no_async is not None

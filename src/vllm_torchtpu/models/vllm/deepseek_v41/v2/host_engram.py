@@ -7,8 +7,8 @@ step and stops async scheduling from overlapping host work with the device.
 The runner already holds every hash input on the host before uploading it, so
 V4.1 publishes those host copies for the model instead.
 
-Like ``async_fence.py``, this wraps the runner's lookback upload rather than
-editing the shared runner: ``forward_model`` calls
+This wraps the runner's lookback upload rather than editing the shared
+runner: ``forward_model`` calls
 ``_prepare_lookback_token_ids`` inside the step's forward context, after
 ``input_ids_cpu``, ``positions_cpu`` and ``query_start_loc_cpu`` are final.
 """

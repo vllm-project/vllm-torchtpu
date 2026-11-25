@@ -1839,10 +1839,6 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
                 f"V4.1 TPU does not support speculative method "
                 f"{getattr(spec_cfg, 'method', None)!r}"
             )
-        if vllm_config.scheduler_config.async_scheduling:
-            from .async_fence import install_lookback_fence
-
-            install_lookback_fence()
         if engram_cpu_offload(vllm_config):
             # Host-DRAM Engram tables: hash on the host from the runner's host
             # inputs instead of copying device hashes back every step.

@@ -2554,7 +2554,10 @@ class TPUModelRunner(GPUModelRunner):
             rows = np.arange(num_reqs)[:, None]
             ids = self.input_batch.token_ids_cpu[rows, np.clip(pos, 0, None)]
             buf.np[:num_reqs] = np.where(valid, ids, -1)
-        return buf.copy_to_gpu()
+        # A decoding request's lookback stays -1 once it is past its prompt, so
+        # the table rarely changes; the upload copies the host buffer, which
+        # the next step refills, before it is issued.
+        return _upload_unchanged(self, "lookback_token_ids", buf.np)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
         invalidated_req_ids = (

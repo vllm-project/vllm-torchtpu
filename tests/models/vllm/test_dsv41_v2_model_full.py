@@ -1995,9 +1995,6 @@ class TestDeepseekV41ForCausalLM:
         with (
             patch.dict(os.environ, {"TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": "1"}),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.async_fence.install_lookback_fence"
-            ) as mock_fence,
-            patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.install_host_engram_inputs"
             ) as mock_host_engram,
             patch(
@@ -2012,7 +2009,6 @@ class TestDeepseekV41ForCausalLM:
             model_inst = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
             model_inst.config = SimpleNamespace(expert_dtype="fp4")
             model_inst.__init__(vllm_config=cfg)
-            mock_fence.assert_called_once()
             mock_host_engram.assert_called_once()
             mock_make_mapper.assert_called_once_with("fp4", "weight_scale_inv")
             assert model_inst.hf_to_vllm_mapper == "mock_mapper"
@@ -2021,9 +2017,6 @@ class TestDeepseekV41ForCausalLM:
         cfg_sync = _mock_vllm_config(async_scheduling=False)
         with (
             patch.dict(os.environ, {"TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": "0"}),
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.async_fence.install_lookback_fence"
-            ) as mock_fence,
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.install_host_engram_inputs"
             ) as mock_host_engram,
@@ -2039,7 +2032,6 @@ class TestDeepseekV41ForCausalLM:
             model_inst = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
             model_inst.config = SimpleNamespace()
             model_inst.__init__(vllm_config=cfg_sync)
-            mock_fence.assert_not_called()
             mock_host_engram.assert_not_called()
 
     def test_forward_ensure_cache_branches(self) -> None:

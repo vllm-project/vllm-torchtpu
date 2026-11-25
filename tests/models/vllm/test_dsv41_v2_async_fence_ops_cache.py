@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""100% Coverage Suite for DeepSeek-V4.1 v2 Async Fence, Ops, Cache.
+"""100% Coverage Suite for DeepSeek-V4.1 v2 Ops, Cache.
 
 Covers 100% of lines and branches in:
-- vllm_torchtpu.models.vllm.deepseek_v41.v2.async_fence (lines 1-37)
 - vllm_torchtpu.models.vllm.deepseek_v41.v2.ops (lines 1-133)
 - vllm_torchtpu.models.vllm.deepseek_v41.v2.cache (lines 1-856)
 """
@@ -25,11 +24,6 @@ import torch
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as v2_cache
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ops as v2_ops
-
-# ==============================================================================
-# 1. Tests for v2/async_fence.py
-# ==============================================================================
-
 
 # ==============================================================================
 # 2. Tests for v2/ops.py

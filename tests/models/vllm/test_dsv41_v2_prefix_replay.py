@@ -187,12 +187,12 @@ class _Buffer:
     def __init__(self, rows, depth):
         self.np = np.zeros((rows, depth), dtype=np.int64)
 
-    def copy_to_gpu(self):
-        return torch.from_numpy(self.np.copy())
-
 
 def test_lookback_reads_committed_tokens_on_a_replayed_admission():
     runner = _runner()
+    runner.device = torch.device("cpu")
+    runner._unfenced_h2d_sources = []
+    runner._registered_h2d_sources = set()
     runner.lookback_token_ids = _Buffer(rows=3, depth=2)
     tokens = np.arange(1000, dtype=np.int64)[None, :].repeat(3, axis=0)
     runner.input_batch = SimpleNamespace(
