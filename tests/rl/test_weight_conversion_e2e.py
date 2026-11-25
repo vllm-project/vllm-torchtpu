@@ -54,10 +54,6 @@ def _has_torch_tpu() -> bool:
 _HAS_TORCH_TPU = _has_torch_tpu()
 
 DEFAULT_MODEL = os.environ.get("RL_E2E_MODEL", "Qwen/Qwen2.5-0.5B")
-DEFAULT_TP_SIZE = int(os.environ.get("RL_E2E_TP_SIZE", "1"))
-DEFAULT_ENABLE_EP = os.environ.get("RL_E2E_ENABLE_EP", "0") == "1"
-MOE_MODEL = os.environ.get("RL_E2E_MOE_MODEL", "")
-MOE_TP_SIZE = int(os.environ.get("RL_E2E_MOE_TP_SIZE", "4"))
 
 DEFAULT_PROMPTS = [
     "The capital of France is",
@@ -166,8 +162,8 @@ def _shutdown_llm(llm: Any) -> None:
 def run_e2e_parity(
     *,
     model: str = DEFAULT_MODEL,
-    tensor_parallel_size: int = DEFAULT_TP_SIZE,
-    enable_expert_parallel: bool = DEFAULT_ENABLE_EP,
+    tensor_parallel_size: int = 1,
+    enable_expert_parallel: bool = False,
     max_model_len: int = 256,
     max_tokens: int = 16,
     gpu_memory_utilization: float = 0.6,
@@ -209,7 +205,7 @@ def run_e2e_parity(
         cleanup_dist_env_and_memory()
 
     # 2. Protocol path: dummy init -> get_weight_mapping_manifest ->
-    #    from_hf -> apply_converted_weights (or load_from_hf)
+    #    from_hf -> apply_converted_weights
     hf_weights = load_hf_state_dict(model)
 
     rl_llm = LLM(**common_kwargs, load_format="dummy")
@@ -253,29 +249,11 @@ def run_e2e_parity(
     not _HAS_TORCH_TPU,
     reason="TPU hardware / torch_tpu is required for Tier 2 E2E test",
 )
-def test_qwen2_5_weight_conversion_e2e() -> None:
+@pytest.mark.parametrize("tensor_parallel_size", [1, 2])
+def test_qwen2_5_weight_conversion_e2e(tensor_parallel_size: int) -> None:
     """Verify Qwen2.5 dense parity via dummy load + weight conversion RPC."""
     run_e2e_parity(
         model=DEFAULT_MODEL,
-        tensor_parallel_size=DEFAULT_TP_SIZE,
+        tensor_parallel_size=tensor_parallel_size,
         enable_expert_parallel=False,
-    )
-
-
-@pytest.mark.tpu_test
-@pytest.mark.multichip
-@pytest.mark.spawns_tpu_workers
-@pytest.mark.skipif(
-    not _HAS_TORCH_TPU or not MOE_MODEL,
-    reason=(
-        "Requires TPU hardware / torch_tpu and RL_E2E_MOE_MODEL set "
-        "(e.g. Qwen/Qwen3.5-35B-A3B)"
-    ),
-)
-def test_qwen3_5_moe_weight_conversion_e2e() -> None:
-    """Verify Qwen3.5-MoE parity via dummy load + weight conversion RPC."""
-    run_e2e_parity(
-        model=MOE_MODEL,
-        tensor_parallel_size=MOE_TP_SIZE,
-        enable_expert_parallel=DEFAULT_ENABLE_EP,
     )

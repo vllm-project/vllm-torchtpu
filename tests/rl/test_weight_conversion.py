@@ -110,6 +110,10 @@ def test_all_12_ops_round_trip() -> None:
     assert torch.equal(dst["b"], r.repeat_interleave(3, dim=0))
 
     # scale (bf16 via fp32 compute + fp64 precision preserved)
+    sbf = torch.randn(4, 4, generator=g, dtype=torch.bfloat16)
+    dst_bf, _ = _round_trip(_op_m({"scale": {"factor": 4.0}}), {"a": sbf})
+    assert dst_bf["b"].dtype == torch.bfloat16
+    assert torch.equal(dst_bf["b"], (sbf.float() * 4.0).to(torch.bfloat16))
     s32 = torch.randn(4, 4, generator=g, dtype=torch.float32)
     dst, _ = _round_trip(_op_m({"scale": {"factor": 4.0}}), {"a": s32})
     torch.testing.assert_close(dst["b"], s32 * 4.0)
@@ -195,9 +199,7 @@ def test_cardinalities_and_api_wrappers() -> None:
     )
     dst, _ = _round_trip(m, {"a": a, "b": b})
     assert dst["c"].shape == (2, 4) and dst["d"].shape == (6, 4)
-    assert torch.equal(
-        from_hf(json.dumps(m), {"a": a, "b": b}, mesh=object())["c"], dst["c"]
-    )
+    assert torch.equal(from_hf(json.dumps(m), {"a": a, "b": b})["c"], dst["c"])
     inv = invert_manifest(m)
     assert torch.equal(execute_manifest(inv, dst)["a"], a)
     with pytest.raises(TypeError, match="from_hf expects dst_rule to be str"):
@@ -221,18 +223,12 @@ def test_tied_keys_dropped_keys_and_chaining_invariants() -> None:
     )
     out = execute_manifest(m, {"embed": emb, "norm": norm})
     assert set(out) == {"embed", "norm", "lm_head"} and torch.equal(out["lm_head"], emb)
-    inv = invert_manifest(
-        _m(
-            [
-                {"source_keys": ["embed"], "target_keys": ["embed"], "ops": []},
-                {"source_keys": ["norm"], "target_keys": ["norm"], "ops": []},
-            ],
-            tied_keys=[["embed", "lm_head"]],
-        )
-    )
+    inv = invert_manifest(m)
     assert inv["tied_keys"] == []
+    assert inv["dropped_keys"] == ["drop_dst"]
     rec = execute_manifest(inv, out)
     assert set(rec) == {"embed", "norm"}
+    assert torch.equal(rec["embed"], emb) and torch.equal(rec["norm"], norm)
 
     # Same-name source key reused across rules is not pruned or clobbered.
     x = torch.tensor([1.0, 2.0])

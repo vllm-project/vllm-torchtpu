@@ -19,6 +19,7 @@ import importlib.util
 import json
 import sys
 import types
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -37,16 +38,17 @@ from vllm_torchtpu.rl.weight_installer import (
 
 
 def _import_tpu_worker():
-    """Import TPUWorker on CPU dev hosts without torch_tpu, restoring globals."""
+    """Import TPUWorker on CPU dev hosts without torch_tpu, restoring sys.modules."""
     if importlib.util.find_spec("torch_tpu") is not None:
-        from vllm_torchtpu.worker.tpu_worker import TPUWorker as _TPUWorker
+        from vllm_torchtpu.worker import tpu_worker as tw_mod
 
-        return _TPUWorker
+        return tw_mod.TPUWorker, tw_mod
 
     import vllm.platforms as _vllm_platforms
 
     had_platform = hasattr(_vllm_platforms, "_current_platform")
     prev_platform = getattr(_vllm_platforms, "_current_platform", None)
+    had_tw = "vllm_torchtpu.worker.tpu_worker" in sys.modules
     stubbed: list[str] = []
     try:
         if prev_platform is None:
@@ -80,17 +82,52 @@ def _import_tpu_worker():
             "vllm_torchtpu.runner.tpu_pooling"
         ].compute_pooling_kv_cache_cap_bytes = lambda *a, **kw: None
         sys.modules["vllm_torchtpu.runner.tpu_runner"].TPUModelRunner = object
-        from vllm_torchtpu.worker.tpu_worker import TPUWorker as _TPUWorker
+        from vllm_torchtpu.worker import tpu_worker as tw_mod
 
-        return _TPUWorker
+        return tw_mod.TPUWorker, tw_mod
     finally:
         for name in stubbed:
             sys.modules.pop(name, None)
+        if not had_tw:
+            sys.modules.pop("vllm_torchtpu.worker.tpu_worker", None)
         if had_platform:
             _vllm_platforms._current_platform = prev_platform
 
 
-TPUWorker = _import_tpu_worker()
+TPUWorker, _TW_MOD = _import_tpu_worker()
+
+
+@contextmanager
+def _mock_parallel_state(
+    *,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+    dp_size: int = 1,
+    dp_rank: int = 0,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+):
+    """Patch vLLM parallel_state accessors on ``_TW_MOD`` for unit tests."""
+    dp_group = SimpleNamespace(world_size=dp_size, rank_in_group=dp_rank)
+    ep_group = SimpleNamespace(world_size=ep_size, rank_in_group=ep_rank)
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch.object(
+                _TW_MOD, "get_tensor_model_parallel_world_size", return_value=tp_size
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                _TW_MOD, "get_tensor_model_parallel_rank", return_value=tp_rank
+            )
+        )
+        stack.enter_context(
+            patch.object(_TW_MOD, "get_dp_group", return_value=dp_group)
+        )
+        stack.enter_context(
+            patch.object(_TW_MOD, "get_ep_group", return_value=ep_group)
+        )
+        yield
 
 
 class _SimpleParamModel(nn.Module):
@@ -125,6 +162,7 @@ def _make_worker(
         expert_parallel_size=ep_size,
     )
     worker.model_config = model_config
+    worker.vllm_config = None
     worker.model_runner = MagicMock()
     worker.model_runner.get_model.return_value = model
     return worker
@@ -181,7 +219,8 @@ def test_apply_converted_weights_replicated_preserves_buffer_identity() -> None:
         ]
     )
     new_w = torch.arange(32, dtype=torch.bfloat16).reshape(4, 8)
-    _make_worker(model).apply_converted_weights({"w": new_w}, manifest_json=m)
+    with _mock_parallel_state():
+        _make_worker(model).apply_converted_weights({"w": new_w}, manifest_json=m)
     assert model.w.data.data_ptr() == ptr_before
     assert torch.equal(model.w.data, new_w)
 
@@ -202,9 +241,10 @@ def test_apply_converted_weights_tp_multi_rank(tp_size: int) -> None:
     )
     for r in range(tp_size):
         model = _SimpleParamModel({"w": torch.zeros(4, 8, dtype=torch.bfloat16)})
-        _make_worker(model, rank=r, tp_size=tp_size).apply_converted_weights(
-            {"w": g_w}, manifest_json=m
-        )
+        with _mock_parallel_state(tp_size=tp_size, tp_rank=r):
+            _make_worker(model, rank=r, tp_size=tp_size).apply_converted_weights(
+                {"w": g_w}, manifest_json=m
+            )
         assert torch.equal(model.w.data, g_w[r * 4 : (r + 1) * 4])
 
 
@@ -234,7 +274,15 @@ def test_apply_converted_weights_ep_and_moe_tp_axes() -> None:
             enable_ep=True,
             ep_size=ep_size,
         )
-        w.apply_converted_weights({"e": g_w}, manifest_json=m)
+        with _mock_parallel_state(
+            tp_size=2,
+            tp_rank=mtp_r,
+            dp_size=2,
+            dp_rank=ep_r,
+            ep_size=ep_size,
+            ep_rank=ep_r,
+        ):
+            w.apply_converted_weights({"e": g_w}, manifest_json=m)
         assert torch.equal(
             model.e.data, g_w[ep_r * 2 : (ep_r + 1) * 2, mtp_r * 4 : (mtp_r + 1) * 4]
         )
@@ -287,36 +335,37 @@ def test_apply_converted_weights_error_checks() -> None:
         ]
     )
     worker = _make_worker(model)
-    with pytest.raises(ValueError, match="missing="):
-        worker.apply_converted_weights({}, manifest_json=m)
-    with pytest.raises(ValueError, match="unexpected="):
-        worker.apply_converted_weights(
-            {"w": torch.zeros(4, 8, dtype=torch.bfloat16), "extra": torch.zeros(1)},
-            manifest_json=m,
-        )
-    with pytest.raises(ValueError, match="Shape mismatch"):
-        worker.apply_converted_weights(
-            {"w": torch.zeros(2, 8, dtype=torch.bfloat16)}, manifest_json=m
-        )
-    with pytest.raises(ValueError, match="Dtype mismatch"):
-        worker.apply_converted_weights(
-            {"w": torch.zeros(4, 8, dtype=torch.float32)}, manifest_json=m
-        )
+    with _mock_parallel_state():
+        with pytest.raises(ValueError, match="missing="):
+            worker.apply_converted_weights({}, manifest_json=m)
+        with pytest.raises(ValueError, match="unexpected="):
+            worker.apply_converted_weights(
+                {"w": torch.zeros(4, 8, dtype=torch.bfloat16), "extra": torch.zeros(1)},
+                manifest_json=m,
+            )
+        with pytest.raises(ValueError, match="Shape mismatch"):
+            worker.apply_converted_weights(
+                {"w": torch.zeros(2, 8, dtype=torch.bfloat16)}, manifest_json=m
+            )
+        with pytest.raises(ValueError, match="Dtype mismatch"):
+            worker.apply_converted_weights(
+                {"w": torch.zeros(4, 8, dtype=torch.float32)}, manifest_json=m
+            )
 
-    m_bad_ax = _manifest_json(
-        [
-            {
-                "source_keys": ["w"],
-                "target_keys": ["w"],
-                "ops": [],
-                "sharding": ["bogus", None],
-            }
-        ]
-    )
-    with pytest.raises(ValueError, match="Unsupported sharding axis"):
-        worker.apply_converted_weights(
-            {"w": torch.zeros(4, 8, dtype=torch.bfloat16)}, manifest_json=m_bad_ax
+        m_bad_ax = _manifest_json(
+            [
+                {
+                    "source_keys": ["w"],
+                    "target_keys": ["w"],
+                    "ops": [],
+                    "sharding": ["bogus", None],
+                }
+            ]
         )
+        with pytest.raises(ValueError, match="Unsupported sharding axis"):
+            worker.apply_converted_weights(
+                {"w": torch.zeros(4, 8, dtype=torch.bfloat16)}, manifest_json=m_bad_ax
+            )
 
     m_indiv = _manifest_json(
         [
@@ -329,15 +378,16 @@ def test_apply_converted_weights_error_checks() -> None:
         ],
         stripes={"tp_size": 3},
     )
-    with pytest.raises(ValueError, match="not divisible"):
+    with (
+        _mock_parallel_state(tp_size=3, tp_rank=0),
+        pytest.raises(ValueError, match="not divisible"),
+    ):
         _make_worker(model, tp_size=3).apply_converted_weights(
             {"w": torch.zeros(4, 8, dtype=torch.bfloat16)}, manifest_json=m_indiv
         )
 
 
 def test_apply_converted_weights_tpu_sync_and_fresh_buffer() -> None:
-    from vllm_torchtpu.worker import tpu_worker as tw_mod
-
     model = _SimpleParamModel({"w": torch.zeros(4, 8, dtype=torch.bfloat16)})
     m = _manifest_json(
         [
@@ -349,57 +399,68 @@ def test_apply_converted_weights_tpu_sync_and_fresh_buffer() -> None:
             }
         ]
     )
-    with patch.object(tw_mod.utils, "synchronize_tensors") as mock_sync:
+    with (
+        _mock_parallel_state(),
+        patch.object(_TW_MOD.utils, "synchronize_tensors") as mock_sync,
+    ):
         _make_worker(model).apply_converted_weights(
             {"w": torch.ones(4, 8, dtype=torch.bfloat16)}, manifest_json=m
         )
         mock_sync.assert_not_called()
 
-    # Fake TPU shard triggers utils.fresh_buffer + synchronize_tensors
+    # Fake TPU shard + TPU param.data triggers fresh_buffer AND synchronize_tensors
     fake_shard = MagicMock(spec=torch.Tensor)
     fake_shard.device = SimpleNamespace(type="tpu")
     fresh = torch.ones(4, 8, dtype=torch.bfloat16)
+    fake_param_data = MagicMock(spec=torch.Tensor)
+    fake_param_data.device = SimpleNamespace(type="tpu")
+    fake_param = SimpleNamespace(data=fake_param_data)
     with (
+        _mock_parallel_state(),
         patch(
             "vllm_torchtpu.rl.weight_installer.stage_converted_weights",
-            return_value=[(model.w, fake_shard)],
+            return_value=[(fake_param, fake_shard)],
         ),
-        patch.object(tw_mod.utils, "fresh_buffer", return_value=fresh) as mock_fb,
-        patch.object(tw_mod.utils, "synchronize_tensors") as mock_sync,
+        patch.object(_TW_MOD.utils, "fresh_buffer", return_value=fresh) as mock_fb,
+        patch.object(_TW_MOD.utils, "synchronize_tensors") as mock_sync,
     ):
         _make_worker(model).apply_converted_weights({"w": fresh}, manifest_json=m)
         mock_fb.assert_called_once_with(fake_shard)
-        assert torch.equal(model.w.data, fresh)
-        mock_sync.assert_not_called()  # model.w.data is on CPU in this unit test
+        fake_param_data.copy_.assert_called_once_with(fresh)
+        mock_sync.assert_called_once_with([fake_param_data], wait=True)
 
 
-def test_resolve_sharding_coords_bijective_when_moe_tp_gt_tp() -> None:
-    import vllm_torchtpu.worker.tpu_worker as tw_mod
-
+@pytest.mark.parametrize(
+    ("tp_size", "dp_size", "ep_size"),
+    [(2, 4, 2), (2, 2, 4)],
+)
+def test_resolve_sharding_coords_bijective(
+    tp_size: int, dp_size: int, ep_size: int
+) -> None:
+    world_size = tp_size * dp_size
+    moe_tp_size = world_size // ep_size
     seen = set()
-    for g_rank in range(8):
+    for g_rank in range(world_size):
         worker = _make_worker(
-            nn.Module(), rank=g_rank, tp_size=2, dp_size=4, enable_ep=True, ep_size=2
+            nn.Module(),
+            rank=g_rank,
+            tp_size=tp_size,
+            dp_size=dp_size,
+            enable_ep=True,
+            ep_size=ep_size,
         )
-        tp_rank = g_rank % 2
-        dp_rank = g_rank // 2
-        ep_rank = g_rank // 4
-        tp_group = SimpleNamespace(world_size=2, rank_in_group=tp_rank)
-        dp_group = SimpleNamespace(world_size=4, rank_in_group=dp_rank)
-        ep_group = SimpleNamespace(world_size=2, rank_in_group=ep_rank)
-        with (
-            patch.object(tw_mod, "model_parallel_is_initialized", return_value=True),
-            patch(
-                "vllm.distributed.parallel_state.get_tp_group", return_value=tp_group
-            ),
-            patch(
-                "vllm.distributed.parallel_state.get_dp_group", return_value=dp_group
-            ),
-            patch(
-                "vllm.distributed.parallel_state.get_ep_group", return_value=ep_group
-            ),
+        tp_rank = g_rank % tp_size
+        dp_rank = g_rank // tp_size
+        ep_rank = g_rank // moe_tp_size
+        with _mock_parallel_state(
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            dp_size=dp_size,
+            dp_rank=dp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
         ):
-            coords = tw_mod._resolve_sharding_coords(worker)
+            coords = _TW_MOD._resolve_sharding_coords(worker)
             seen.add((coords.ep_rank, coords.moe_tp_rank))
-            assert coords.ep_size == 2 and coords.moe_tp_size == 4
-    assert len(seen) == 8
+            assert coords.ep_size == ep_size and coords.moe_tp_size == moe_tp_size
+    assert len(seen) == world_size

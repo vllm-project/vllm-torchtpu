@@ -37,6 +37,8 @@ from vllm.distributed.kv_transfer import (
 )
 from vllm.distributed.parallel_state import (
     ensure_model_parallel_initialized,
+    get_dp_group,
+    get_ep_group,
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -101,41 +103,22 @@ def _resolve_sharding_coords(worker: "TPUWorker"):
     """Return local ``ShardingCoords`` for ``tp``, ``ep``, and ``moe_tp``."""
     from vllm_torchtpu.rl.weight_installer import ShardingCoords
 
-    pc = getattr(worker, "parallel_config", None)
-    if model_parallel_is_initialized():
-        tp_size = int(get_tensor_model_parallel_world_size())
-        tp_rank = int(get_tensor_model_parallel_rank())
-    else:
-        tp_size = int(getattr(pc, "tensor_parallel_size", 1) or 1)
-        tp_rank = int(getattr(worker, "rank", 0)) % tp_size
+    pc = worker.parallel_config
+    tp_size = int(get_tensor_model_parallel_world_size())
+    tp_rank = int(get_tensor_model_parallel_rank())
 
-    enable_ep = bool(getattr(pc, "enable_expert_parallel", False))
-    dp_size = int(utils.get_dp_size(pc)) if pc is not None else 1
-    if enable_ep:
-        if model_parallel_is_initialized():
-            from vllm.distributed.parallel_state import get_dp_group, get_ep_group
-
-            ep_group = get_ep_group()
-            ep_size = int(ep_group.world_size)
-            ep_rank = int(ep_group.rank_in_group)
-            dp_group = get_dp_group()
-            dp_rank = int(dp_group.rank_in_group)
-            if int(dp_group.world_size) > 1:
-                dp_size = int(dp_group.world_size)
-            moe_tp_size = max(1, (dp_size * tp_size) // ep_size)
-            global_rank = dp_rank * tp_size + tp_rank
-            moe_tp_rank = global_rank % moe_tp_size
-        else:
-            ep_size = int(getattr(pc, "expert_parallel_size", 0) or (dp_size * tp_size))
-            moe_tp_size = max(1, (dp_size * tp_size) // ep_size)
-            dp_rank = getattr(pc, "data_parallel_rank", None)
-            global_rank = (
-                int(dp_rank) * tp_size + tp_rank
-                if dp_rank is not None
-                else int(getattr(worker, "rank", 0))
-            )
-            moe_tp_rank = global_rank % moe_tp_size
-            ep_rank = (global_rank // moe_tp_size) % ep_size
+    if pc.enable_expert_parallel:
+        ep_group = get_ep_group()
+        ep_size = int(ep_group.world_size)
+        ep_rank = int(ep_group.rank_in_group)
+        dp_group = get_dp_group()
+        dp_rank = int(dp_group.rank_in_group)
+        dp_size = int(dp_group.world_size)
+        if dp_size <= 1:
+            dp_size = int(utils.get_dp_size(pc))
+        moe_tp_size = max(1, (dp_size * tp_size) // ep_size)
+        global_rank = dp_rank * tp_size + tp_rank
+        moe_tp_rank = global_rank % moe_tp_size
     else:
         ep_size = 1
         ep_rank = 0
@@ -1020,7 +1003,7 @@ class TPUWorker(WorkerBase):
             self.get_model(),
             parallel_config=self.parallel_config,
             model_config=self.model_config,
-            vllm_config=getattr(self, "vllm_config", None),
+            vllm_config=self.vllm_config,
             expert_axis_grouped=expert_axis_grouped,
         )
 

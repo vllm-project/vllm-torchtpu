@@ -65,10 +65,9 @@ _DTYPE_MAP: dict[str, torch.dtype] = {
     "int8": torch.int8,
     "uint8": torch.uint8,
     "bool": torch.bool,
+    "float8_e4m3fn": torch.float8_e4m3fn,
+    "float8_e5m2": torch.float8_e5m2,
 }
-for _fp8_name in ("float8_e4m3fn", "float8_e5m2"):
-    if hasattr(torch, _fp8_name):
-        _DTYPE_MAP[_fp8_name] = getattr(torch, _fp8_name)
 
 _TOP_KEYS = frozenset(
     {
@@ -415,6 +414,16 @@ def _invert_op(op: Mapping[str, Any]) -> OpSpec:
 def invert_manifest(manifest: RuleSpec) -> dict[str, Any]:
     """Invert a ``weight_mapping`` manifest (reversing chained rules and ops)."""
     spec = _parse_manifest(manifest)
+    fwd_dropped = set(spec["dropped_keys"])
+    inv_dropped: list[str] = []
+    inv_dropped_seen: set[str] = set()
+    for r in spec["rules"]:
+        if any(k in fwd_dropped for k in r["source_keys"]):
+            fwd_dropped.update(r["target_keys"])
+            for tk in r["target_keys"]:
+                if not tk.startswith(TMP_KEY_PREFIX) and tk not in inv_dropped_seen:
+                    inv_dropped.append(tk)
+                    inv_dropped_seen.add(tk)
     inv_rules = [
         {
             "source_keys": list(r["target_keys"]),
@@ -428,7 +437,7 @@ def invert_manifest(manifest: RuleSpec) -> dict[str, Any]:
         "expert_axis_grouped": spec["expert_axis_grouped"],
         "stripes": dict(spec["stripes"]),
         "tied_keys": [],
-        "dropped_keys": list(spec["dropped_keys"]),
+        "dropped_keys": inv_dropped,
         "rules": inv_rules,
     }
 
@@ -487,10 +496,8 @@ def execute_manifest(
 def from_hf(
     dst_rule: str,
     hf_weights: Mapping[str, torch.Tensor],
-    mesh: Any = None,
 ) -> dict[str, torch.Tensor]:
     """Convert HuggingFace weights using a serialized JSON ``dst_rule`` string."""
-    del mesh
     if not isinstance(dst_rule, str):
         raise TypeError(
             f"from_hf expects dst_rule to be str, got {type(dst_rule).__name__}"

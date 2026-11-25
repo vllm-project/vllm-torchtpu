@@ -173,15 +173,103 @@ def test_qwen35_moe_2d_parity_and_roundtrip(
     converted = _assert_round_trip(manifest_json, hf)
     rules = _rule_map(manifest)
 
-    # Check padded & transposed RoutedExperts shard on rank (0, 0)
+    # Independent per-(ep, moe_tp)-rank value parity for RoutedExperts w13 & w2
     w13 = converted["model.layers.0.mlp.experts.w13_weight"]
-    local_w13 = slice_tensor_for_shard(
-        "model.layers.0.mlp.experts.w13_weight",
-        w13,
-        rules["model.layers.0.mlp.experts.w13_weight"]["sharding"],
-        {"ep": (0, ep_size), "moe_tp": (0, moe_tp_size)},
-    )
-    assert local_w13.shape == model.model.layers[0].mlp.experts.w13_weight.shape
+    w2 = converted["model.layers.0.mlp.experts.w2_weight"]
+    num_e, inter_total, hidden = 4, 192, 64
+    e_per_ep = num_e // ep_size
+    unpadded = inter_total // moe_tp_size
+    aligned = ((unpadded + 127) // 128) * 128
+    pad_amt = aligned - unpadded
+    for ep_r in range(ep_size):
+        for mtp_r in range(moe_tp_size):
+            coords = {"ep": (ep_r, ep_size), "moe_tp": (mtp_r, moe_tp_size)}
+            local_w13 = slice_tensor_for_shard(
+                "model.layers.0.mlp.experts.w13_weight",
+                w13,
+                rules["model.layers.0.mlp.experts.w13_weight"]["sharding"],
+                coords,
+            )
+            local_w2 = slice_tensor_for_shard(
+                "model.layers.0.mlp.experts.w2_weight",
+                w2,
+                rules["model.layers.0.mlp.experts.w2_weight"]["sharding"],
+                coords,
+            )
+            assert local_w13.shape == model.model.layers[0].mlp.experts.w13_weight.shape
+            assert local_w2.shape == model.model.layers[0].mlp.experts.w2_weight.shape
+            # Reference per VllmUnquantizedFusedMoEMethod PWAL:
+            # slice per (ep_r, mtp_r), right-pad each half to 128, transpose.
+            ref_w13_list, ref_w2_list = [], []
+            for e in range(ep_r * e_per_ep, (ep_r + 1) * e_per_ep):
+                g_e = hf[f"model.layers.0.mlp.experts.{e}.gate_proj.weight"]
+                u_e = hf[f"model.layers.0.mlp.experts.{e}.up_proj.weight"]
+                d_e = hf[f"model.layers.0.mlp.experts.{e}.down_proj.weight"]
+                g_s = g_e[mtp_r * unpadded : (mtp_r + 1) * unpadded, :]
+                u_s = u_e[mtp_r * unpadded : (mtp_r + 1) * unpadded, :]
+                d_s = d_e[:, mtp_r * unpadded : (mtp_r + 1) * unpadded]
+                if pad_amt:
+                    z1 = torch.zeros(pad_amt, hidden, dtype=g_s.dtype)
+                    g_s = torch.cat([g_s, z1], dim=0)
+                    u_s = torch.cat([u_s, z1], dim=0)
+                    z2 = torch.zeros(hidden, pad_amt, dtype=d_s.dtype)
+                    d_s = torch.cat([d_s, z2], dim=1)
+                ref_w13_list.append(torch.cat([g_s, u_s], dim=0).T)
+                ref_w2_list.append(d_s.T)
+            assert torch.equal(local_w13, torch.stack(ref_w13_list, dim=0))
+            assert torch.equal(local_w2, torch.stack(ref_w2_list, dim=0))
+
+    # Independent per-TP-rank value parity for GDN in_proj_qkvz (with K/Q replication
+    # when tp_size=4 > num_k_heads=2) and 3D conv1d.
+    qkvz = converted["model.layers.0.linear_attn.in_proj_qkvz.weight"]
+    conv = converted["model.layers.0.linear_attn.conv1d.weight"]
+    hf_qkv = hf["model.layers.0.linear_attn.in_proj_qkv.weight"]
+    hf_z = hf["model.layers.0.linear_attn.in_proj_z.weight"]
+    hf_conv = hf["model.layers.0.linear_attn.conv1d.weight"]
+    q_w, k_w, v_w = torch.split(hf_qkv, [16, 16, 32], dim=0)
+    cq, ck, cv = torch.split(hf_conv, [16, 16, 32], dim=0)
+    k_rep = max(1, tp_size // 2)  # num_k_heads=2
+    q_rep_w = q_w.reshape(2, 8, hidden).repeat_interleave(k_rep, dim=0)
+    k_rep_w = k_w.reshape(2, 8, hidden).repeat_interleave(k_rep, dim=0)
+    cq_rep = cq.reshape(2, 8, 1, 4).repeat_interleave(k_rep, dim=0)
+    ck_rep = ck.reshape(2, 8, 1, 4).repeat_interleave(k_rep, dim=0)
+    q_per = (2 * k_rep) // tp_size
+    v_per = 32 // tp_size
+    for r in range(tp_size):
+        local_qkvz = slice_tensor_for_shard(
+            "model.layers.0.linear_attn.in_proj_qkvz.weight",
+            qkvz,
+            rules["model.layers.0.linear_attn.in_proj_qkvz.weight"]["sharding"],
+            {"tp": (r, tp_size)},
+        )
+        ref_qkvz = torch.cat(
+            [
+                q_rep_w[r * q_per : (r + 1) * q_per].reshape(-1, hidden),
+                k_rep_w[r * q_per : (r + 1) * q_per].reshape(-1, hidden),
+                v_w[r * v_per : (r + 1) * v_per],
+                hf_z[r * v_per : (r + 1) * v_per],
+            ],
+            dim=0,
+        )
+        if qkvz_flipped:
+            ref_qkvz = ref_qkvz.T
+        assert torch.equal(local_qkvz, ref_qkvz)
+
+        local_conv = slice_tensor_for_shard(
+            "model.layers.0.linear_attn.conv1d.weight",
+            conv,
+            rules["model.layers.0.linear_attn.conv1d.weight"]["sharding"],
+            {"tp": (r, tp_size)},
+        )
+        ref_conv = torch.cat(
+            [
+                cq_rep[r * q_per : (r + 1) * q_per].reshape(-1, 1, 4),
+                ck_rep[r * q_per : (r + 1) * q_per].reshape(-1, 1, 4),
+                cv[r * v_per : (r + 1) * v_per],
+            ],
+            dim=0,
+        )
+        assert torch.equal(local_conv, ref_conv)
 
 
 def test_qwen35_moe_canonical_3d_stacked_roundtrip() -> None:
@@ -222,8 +310,30 @@ def test_gdn_interleaved_ba_parity_and_roundtrip(tp_size: int) -> None:
         flipped=True,
     )
     manifest_json = generate_manifest(m, tp_size=tp_size)
-    hf = {"in_proj_ba.weight": torch.randn(8, 16, dtype=torch.bfloat16)}
-    _assert_round_trip(manifest_json, hf)
+    hf_w = torch.randn(8, 16, dtype=torch.bfloat16)
+    converted = _assert_round_trip(manifest_json, {"in_proj_ba.weight": hf_w})
+    sharding = _rule_map(json.loads(manifest_json))["in_proj_ba.weight"]["sharding"]
+    # Reference: HF layout is [num_kq_heads=2, n_segs=2, seg_w=2, hidden=16];
+    # each TP rank owns [b_local, a_local] transposed (flipped=True).
+    grouped = hf_w.reshape(2, 2, 2, 16)
+    b_all = grouped[:, 0].reshape(4, 16)
+    a_all = grouped[:, 1].reshape(4, 16)
+    seg_per_rank = 4 // tp_size
+    for r in range(tp_size):
+        local = slice_tensor_for_shard(
+            "in_proj_ba.weight",
+            converted["in_proj_ba.weight"],
+            sharding,
+            {"tp": (r, tp_size)},
+        )
+        ref = torch.cat(
+            [
+                b_all[r * seg_per_rank : (r + 1) * seg_per_rank],
+                a_all[r * seg_per_rank : (r + 1) * seg_per_rank],
+            ],
+            dim=0,
+        ).T
+        assert torch.equal(local, ref)
 
 
 @pytest.mark.parametrize("use_mapper", [False, True])
@@ -287,13 +397,17 @@ def test_model_agnostic_reflection_and_config_edge_cases(
     with pytest.raises(NotImplementedError, match="Quantization"):
         generate_manifest(m)
 
-    # TORCH_TPU_DP_SIZE env override for EP inference
-    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "2")
+    # TORCH_TPU_DP_SIZE env override for DP/EP inference
+    from vllm_torchtpu.rl.manifest_generator import _resolve_parallel
+
     pc = SimpleNamespace(
         tensor_parallel_size=2, data_parallel_size=1, enable_expert_parallel=True
     )
-    m_ep = Qwen3_5MoeForCausalLM(tp_size=2, ep_size=4, moe_tp_size=1)
-    assert generate_manifest_dict(m_ep, parallel_config=pc)["stripes"]["ep_size"] == 4
+    m_dp = Qwen2ForCausalLM(tp_size=2)
+    monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
+    assert _resolve_parallel(m_dp, pc, None, None, None) == (2, 1, 2)
+    monkeypatch.setenv("TORCH_TPU_DP_SIZE", "2")
+    assert _resolve_parallel(m_dp, pc, None, None, None) == (2, 2, 4)
 
     # Square routed experts: UnquantizedFusedMoEMethod vs ambiguous fail-closed
     class UnquantizedFusedMoEMethod(nn.Module):

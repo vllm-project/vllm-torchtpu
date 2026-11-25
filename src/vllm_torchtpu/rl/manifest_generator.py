@@ -37,6 +37,8 @@ from vllm_torchtpu.rl.weight_conversion import (
     validate_manifest,
 )
 
+# Mirrored from layers/adapter/linear_common.py and dp_vocab_parallel.py to avoid
+# importing torch_tpu / JAX on CPU-only hosts.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 DP_VOCAB_ATTR = "_tpu_dp_vocab"
 
@@ -60,7 +62,7 @@ _COL_LINEAR_CLASSES = frozenset({"ColumnParallelLinear"})
 _MERGED_COL_CLASSES = frozenset({"MergedColumnParallelLinear"})
 _QKV_CLASSES = frozenset({"QKVParallelLinear"})
 _GDN_INTERLEAVED_CLASSES = frozenset({"GdnInterleavedColumnParallelLinear"})
-_GDN_SEG_CLASSES = frozenset({"GdnColumnParallelLinear", "GdnConv1d"})
+_GDN_SEG_CLASSES = frozenset({"GdnColumnParallelLinear"})
 _ROUTED_EXPERTS_CLASSES = frozenset({"RoutedExperts"})
 _NORM_CLASSES = frozenset(
     {
@@ -256,9 +258,10 @@ def _check_supported(
 
     from vllm_torchtpu import envs
 
-    ep_env = str(envs.TPU_EXPERT_PLACEMENT or "").strip().lower()
-    if ep_env and ep_env not in ("0", "false", "no", "linear"):
-        raise NotImplementedError(f"TPU_EXPERT_PLACEMENT={ep_env!r} is not supported.")
+    if envs.TPU_EXPERT_PLACEMENT:
+        raise NotImplementedError(
+            f"TPU_EXPERT_PLACEMENT={envs.TPU_EXPERT_PLACEMENT!r} is not supported."
+        )
 
     if model_config is not None:
         quant = getattr(model_config, "quantization", None)
