@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_RAGGED_A2A: bool = True
     TPU_MOE_A2A_CAPACITY: float | None = None
+    TPU_MOE_A2A_FP8_DISPATCH: bool = False
     TPU_MOE_A2A_ROUTE_CAPACITY: float | None = None
     TPU_DECODE_FAST_PATHS_OFF: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
@@ -785,6 +786,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # exchange stays on the one-hot path (its rerun is cheap there). Unset = by
     # the DP group size: 3 up to 8 members, 5 up to 16, 8.5 above.
     "TPU_MOE_A2A_ROUTE_CAPACITY": env_optional_float("TPU_MOE_A2A_ROUTE_CAPACITY"),
+    # Ragged all-to-all capacity exchange: send the token rows as fp8 e4m3 with
+    # one float32 scale per token (amax / 448), which travels with the routing
+    # all-gather, and dequantize to bf16 in the row gather. Halves the
+    # exchange's bytes; changes the expert inputs by fp8 rounding.
+    "TPU_MOE_A2A_FP8_DISPATCH": env_bool("TPU_MOE_A2A_FP8_DISPATCH", default=False),
     # Comma-separated paths of decode_switches.PATHS to leave off although their
     # parent switch is on. Unknown names refuse to start.
     "TPU_DECODE_FAST_PATHS_OFF": env_str("TPU_DECODE_FAST_PATHS_OFF", ""),

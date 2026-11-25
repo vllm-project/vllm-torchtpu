@@ -59,7 +59,12 @@ from vllm_torchtpu.kernels.megablox.exchange_plan import (
     exchange_plan_supported,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import owner_token_sum
-from vllm_torchtpu.kernels.megablox.row_copy import copy_send_rows, row_copies_fit
+from vllm_torchtpu.kernels.megablox.row_copy import (
+    copy_send_rows,
+    copy_send_rows_fp8,
+    fp8_rows_supported,
+    row_copies_fit,
+)
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     fused_moe_scatter,
@@ -130,11 +135,24 @@ def _tile_rows(a: jax.Array) -> jax.Array:
     return a.reshape(rows, 1, hidden)
 
 
+def _fp8_scales(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """The float32 scale of each row of ``x`` [S, H] for fp8 e4m3 (amax / 448;
+    1 for an all-zero row) and its inverse: the row's fp8 values are ``x *
+    inverse``. Non-finite values count as zeros, as the bf16 exchange's row
+    copies treat them."""
+    xf = x.astype(jnp.float32)
+    amax = jnp.max(jnp.where(jnp.isfinite(xf), jnp.abs(xf), 0.0), axis=1)
+    scale = jnp.where(amax > 0, amax / 448.0, 1.0)
+    return scale, 1.0 / scale
+
+
 # A packed route with expert id -1 and weight +0.0: what an empty slot reads.
 _EMPTY_ROUTE = -1 << 16
 
 
-def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array, *, dma_members=0):
+def _gather_routing(
+    topk_ids: jax.Array, topk_weights: jax.Array, *, dma_members=0, extra=None
+):
     """All-gather the DP group's routing in one collective when it packs:
     a bf16 weight and an expert id below 2**15 share one int32. With
     ``dma_members`` (the DP group's size) the packed routing travels by
@@ -142,8 +160,9 @@ def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array, *, dma_members
 
     Returns the gathered ids [D, S, K], a function that reads the routes of
     the given flat (member, token) rows (an out-of-range row reads expert id
-    -1 with weight 0), and the packed routes [D * S, K] and [D, K, S] (None
-    unpacked).
+    -1 with weight 0), the packed routes [D * S, K] and [D, K, S] (None
+    unpacked), and ``extra`` [S] int32 (one more word per token, packed
+    routing only) gathered as [D, S] (None without it).
     """
     if topk_weights.dtype != jnp.bfloat16:
         ids = jax.lax.all_gather(topk_ids, DP_AXIS)
@@ -157,15 +176,28 @@ def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array, *, dma_members
                 flat_weights.at[rows].get(mode="fill", fill_value=0),
             )
 
-        return ids, read, None, None
+        assert extra is None
+        return ids, read, None, None, None
     bits = jax.lax.bitcast_convert_type(topk_weights, jnp.uint16).astype(jnp.int32)
     routes = jnp.left_shift(topk_ids, 16) | bits
+    topk = routes.shape[1]
+    gathered_extra = None
     if dma_members:
         # One [K, S] block per member: the tokens fill the lanes.
-        words = dma_all_gather(routes.T, axis=DP_AXIS, num_members=dma_members)
+        block = routes.T if extra is None else jnp.concatenate([routes.T, extra[None]])
+        words = dma_all_gather(block, axis=DP_AXIS, num_members=dma_members)
+        if extra is not None:
+            gathered_extra = words[:, topk]
+            words = words[:, :topk]
         packed = jnp.swapaxes(words, 1, 2)
     else:
-        packed = jax.lax.all_gather(routes, DP_AXIS)
+        block = (
+            routes if extra is None else jnp.concatenate([routes, extra[:, None]], 1)
+        )
+        packed = jax.lax.all_gather(block, DP_AXIS)
+        if extra is not None:
+            gathered_extra = packed[:, :, topk]
+            packed = packed[:, :, :topk]
         words = jnp.swapaxes(packed, 1, 2)
 
     def read(rows):
@@ -177,6 +209,7 @@ def _gather_routing(topk_ids: jax.Array, topk_weights: jax.Array, *, dma_members
         read,
         packed.reshape(-1, packed.shape[-1]),
         words,
+        gathered_extra,
     )
 
 
@@ -784,6 +817,7 @@ def _capacity_exchange(
     row_scatter=False,
     send_index_rows_minor=False,
     planned=None,
+    fp8=None,
 ):
     """Send and receive buffers of ``rows`` rows, filled without gaps.
 
@@ -805,6 +839,11 @@ def _capacity_exchange(
     ``send_index_rows_minor``). ``planned`` (an `ExchangePlan`, with
     ``streamed`` and ``plan``): the sizes, offsets, send index and receive
     rows come from the plan kernel instead (same integers).
+    ``fp8`` = (inverse scales [S], scales gathered [D, S]) (with ``planned``,
+    ``row_scatter`` and ``row_gather``): the send kernel quantizes the token
+    rows to fp8 and the exchange moves them as uint32 words (`fp8_row_words`:
+    a 32-bit transport type keeps the all-to-all offloaded); the row gather
+    dequantizes each with its token's scale.
     """
     num_tokens, hidden = x.shape
     local_num_experts = w1.shape[0]
@@ -866,7 +905,21 @@ def _capacity_exchange(
             rows=rows,
             gathered_weights=gathered_weights,
         )
-        if row_scatter and planned is not None:
+        row_scale = None
+        if fp8 is not None and row_scatter and row_gather and planned is not None:
+            inv_scale, gathered_scale = fp8
+            sent = copy_send_rows_fp8(x, inv_scale, send_index, planned.count, rows)
+            # Each receive row's token scale: the tokens that reach this rank
+            # land at their planned rows (the others write past the end).
+            reach = (
+                (gathered_ids >= 0) & (gathered_ids // local_num_experts == ep_rank)
+            ).any(axis=2)
+            row_scale = (
+                jnp.ones((rows + 1,), jnp.float32)
+                .at[jnp.where(reach, in_row, rows)]
+                .set(gathered_scale)[:rows]
+            )
+        elif row_scatter and planned is not None:
             sent = copy_send_rows(x, send_index, planned.count, rows)
         elif row_scatter:
             # Written before the overflow flag is known: a step that does not
@@ -899,6 +952,7 @@ def _capacity_exchange(
         src_rows = jnp.sum(recv_sizes, dtype=jnp.int32)[None]
         if planned is not None:
             src_rows = planned.src_rows
+        extra = {} if row_scale is None else {"row_scale": row_scale}
         return streamed(
             received,
             None,
@@ -909,6 +963,7 @@ def _capacity_exchange(
             fits,
             plan=routes_plan,
             src_rows=src_rows,
+            **extra,
         )
 
     out_row = send_start[None, :] + jnp.cumsum(need_out, axis=0, dtype=jnp.int32) - 1
@@ -999,6 +1054,7 @@ def _streamed_combine(
     plan=None,
     row_gather=False,
     src_rows=None,
+    row_scale=None,
 ):
     """The expert kernel sends each output row to the rank that sent its token.
 
@@ -1032,6 +1088,7 @@ def _streamed_combine(
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             src_rows=src_rows,
+            row_scale=row_scale,
             num_recv_rows=num_tokens * topk,
             axis=DP_AXIS,
             num_members=dp_size,
@@ -1310,6 +1367,7 @@ def _owner_combine(
     row_gather=False,
     src_rows=None,
     owner_tail=False,
+    row_scale=None,
 ):
     """The expert kernel sends each output row to its token's OWNER rank: TP rank
     ``t // ceil(S / tp)`` of the token's engine owns token ``t``. The owner sums
@@ -1386,6 +1444,7 @@ def _owner_combine(
             extra,
             src_rows=src_rows,
             tail=tail,
+            row_scale=row_scale,
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             num_recv_rows=blk * topk,
@@ -1472,6 +1531,7 @@ def ragged_a2a_moe_local(
     send_index_rows_minor: bool = False,
     plan_kernel: bool = False,
     whole_group: bool = False,
+    fp8_dispatch: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
@@ -1534,6 +1594,11 @@ def ragged_a2a_moe_local(
     full-size fallback and its conditional are gone (same result). The
     exchange moves only the rows a step has and the expert kernel computes
     only its routes; the larger buffers cost memory, not time.
+    ``fp8_dispatch`` (with ``plan_kernel``, ``row_scatter`` and
+    ``row_gather``): the capacity exchange sends fp8 rows with one float32
+    scale per token, the scales riding along with the routing all-gather, and
+    the row gather dequantizes them to bf16 (NOT bitwise: the expert inputs
+    carry fp8 rounding). The full-size fallback stays bf16.
     """
     assert shared is None or owner_combine
     assert not owner_tail or owner_combine
@@ -1541,9 +1606,28 @@ def ragged_a2a_moe_local(
     num_tokens = x.shape[0]
     local_num_experts = w1.shape[0]
     slots = dp_size * num_tokens
-    gathered_ids, read_routes, packed_routes, gathered_words = _gather_routing(
-        topk_ids, topk_weights, dma_members=dp_size if routing_dma else 0
+    fp8 = None
+    x_inv = None
+    if (
+        fp8_dispatch
+        and plan_kernel
+        and row_scatter
+        and row_gather
+        and topk_weights.dtype == jnp.bfloat16
+        and fp8_rows_supported(x.shape[1])
+    ):
+        x_scale, x_inv = _fp8_scales(x)
+        scale_word = jax.lax.bitcast_convert_type(x_scale, jnp.int32)
+    gathered_ids, read_routes, packed_routes, gathered_words, gathered_scale = (
+        _gather_routing(
+            topk_ids,
+            topk_weights,
+            dma_members=dp_size if routing_dma else 0,
+            extra=None if x_inv is None else scale_word,
+        )
     )
+    if x_inv is not None:
+        fp8 = (x_inv, jax.lax.bitcast_convert_type(gathered_scale, jnp.float32))
     ep_rank = experts_start[0] // local_num_experts
     member_index = functools.partial(
         _member_index,
@@ -1773,6 +1857,7 @@ def ragged_a2a_moe_local(
         row_scatter=row_scatter,
         send_index_rows_minor=send_index_rows_minor,
         planned=planned,
+        fp8=fp8 if planned is not None else None,
     )
     out = finish(out, capacity_streamed is not None)
     if whole:
@@ -1810,6 +1895,7 @@ def ragged_a2a_moe(
     send_index_rows_minor: bool = False,
     plan_kernel: bool = False,
     whole_group: bool = False,
+    fp8_dispatch: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
@@ -1840,6 +1926,7 @@ def ragged_a2a_moe(
         send_index_rows_minor=send_index_rows_minor,
         plan_kernel=plan_kernel,
         whole_group=whole_group,
+        fp8_dispatch=fp8_dispatch,
     )
 
     scaled = w1_scale is not None

@@ -53,6 +53,28 @@ def row_copies_fit(num_tokens: int, rows: int, num_routes: int, hidden: int) -> 
     return send + (16 << 20) <= cap and gather + (8 << 20) <= cap
 
 
+# An fp8 exchange row of H elements travels as uint32 words [8, H / 32]: whole
+# native 32-bit tiles, which the row DMAs and the all-to-all move as they are.
+# Word (s, l) holds the fp8 values of rows 4s..4s+3 of the row's [32, H / 32]
+# view at lane l, low byte first: the order in which a packed bitcast of the
+# words to fp8 reads them back.
+FP8_ROW_SUBLANES = 8
+_FP8_PER_WORD = 4
+
+
+def fp8_rows_supported(hidden: int) -> bool:
+    """Whether fp8 rows of this width travel as whole-tile word blocks."""
+    return hidden % (FP8_ROW_SUBLANES * _FP8_PER_WORD * 128) == 0
+
+
+def fp8_row_words(q):
+    """fp8 rows [N, H] as their exchange words [N, 8, H / 32] uint32."""
+    num, hidden = q.shape
+    lanes = hidden // (FP8_ROW_SUBLANES * _FP8_PER_WORD)
+    b = q.reshape(num, FP8_ROW_SUBLANES, _FP8_PER_WORD, lanes)
+    return lax.bitcast_convert_type(jnp.swapaxes(b, 2, 3), jnp.uint32)
+
+
 def _canonical_bits(w):
     """The one-hot permute's result for two packed bf16 values per uint32: +0
     for zeros, subnormals, infinities and NaNs (the permute's isfinite select
@@ -69,6 +91,25 @@ def _gather_kernel(
     index_ref,
     sizes_ref,
     filled_ref,
+    *refs,
+    tile: int,
+    num_rows: int,
+    scaled: bool,
+):
+    if scaled:
+        scale_ref, *refs = refs
+    else:
+        scale_ref = None
+    _gather_body(
+        index_ref, sizes_ref, filled_ref, scale_ref, *refs, tile=tile, num_rows=num_rows
+    )
+
+
+def _gather_body(
+    index_ref,
+    sizes_ref,
+    filled_ref,
+    scale_ref,
     src_ref,
     out_ref,
     rows_vmem,
@@ -131,7 +172,14 @@ def _gather_kernel(
         for j in range(_ROWS_PER_TILE):
             pos = base + j
             row = jnp.where(pos < n, index_ref[jnp.minimum(pos, num_rows - 1)], 0)
-            rows.append(rows_vmem[row])
+            if scale_ref is None:
+                rows.append(rows_vmem[row])
+            else:
+                # An fp8 row (its words read back as fp8) times its token's
+                # scale, as bf16.
+                fp8 = pltpu.bitcast(rows_vmem[row], jnp.float8_e4m3fn)
+                value = fp8.astype(jnp.float32) * scale_ref[row]
+                rows.append(value.astype(out_buf.dtype))
         x = jnp.stack(rows).reshape(_ROWS_PER_TILE, hidden)
         # Rows past the gathered ones come out as zeros. uint32 sublane j packs
         # bf16 rows 2j (low half) and 2j + 1 (high half).
@@ -170,7 +218,7 @@ def _gather_kernel(
 
 
 @functools.partial(jax.jit, static_argnames=("tile",))
-def gather_rows(src, index, sizes, filled, *, tile: int = _GATHER_TILE):
+def gather_rows(src, index, sizes, filled, scale=None, *, tile: int = _GATHER_TILE):
     """Matmul rows of the routes' token rows: ``out[j] = src[index[j]]`` for
     ``j < sum(sizes)``, as `fused_moe_scatter_planned`'s one-hot permute
     computes them (zeros, subnormals and non-finite values become +0).
@@ -182,38 +230,56 @@ def gather_rows(src, index, sizes, filled, *, tile: int = _GATHER_TILE):
     16-row block are zeros, later rows are not written. P must be a multiple
     of 16. The kernel copies ``src[:filled]`` to VMEM in whole chunks and
     reads each row from there.
+
+    ``scale`` [R] float32: ``src`` holds fp8 rows as their words [R, 8, H /
+    32] (`fp8_row_words`) and the result is bf16 ``fp8 row index[j] *
+    scale[index[j]]`` (the same zero, subnormal and non-finite handling).
     """
     num_src, sub, lanes = src.shape
     hidden = sub * lanes
     (num_rows,) = index.shape
-    if sub != ROW_SUBLANES or not row_copy_supported(src.dtype, hidden):
+    scaled = scale is not None
+    if scaled:
+        hidden *= _FP8_PER_WORD
+        if (
+            sub != FP8_ROW_SUBLANES
+            or src.dtype != jnp.uint32
+            or not fp8_rows_supported(hidden)
+        ):
+            raise ValueError(
+                f"gather_rows takes fp8 row words uint32 [R, 8, H / 32], got "
+                f"{src.dtype}{src.shape}"
+            )
+    elif sub != ROW_SUBLANES or not row_copy_supported(src.dtype, hidden):
         raise ValueError(
             f"gather_rows takes bf16 [R, 16, H / 16] rows, got {src.shape}"
         )
+    out_dtype = jnp.bfloat16 if scaled else src.dtype
     if num_rows % _ROWS_PER_TILE or tile % _ROWS_PER_TILE:
         raise ValueError(f"gather_rows needs whole 16-row tiles: {num_rows}, {tile}")
     tile = min(tile, num_rows)
-    vmem = (num_src + 2 * tile) * hidden * src.dtype.itemsize
+    vmem = (num_src * src.dtype.itemsize + 2 * tile * 2) * hidden
     vmem_limit = vmem + (8 << 20)
     if vmem_limit > pltpu.get_tpu_info().vmem_capacity_bytes * 0.9:
         raise ValueError(f"gather_rows: {num_src} source rows do not fit VMEM")
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     # The kernel copies the rows itself: XLA must not stage them in VMEM.
     src = pltpu.with_memory_space_constraint(src, pltpu.HBM)
+    prefetch = (index, sizes, filled) + ((scale.astype(jnp.float32),) if scaled else ())
     return pl.pallas_call(
-        functools.partial(_gather_kernel, tile=tile, num_rows=num_rows),
+        functools.partial(_gather_kernel, tile=tile, num_rows=num_rows, scaled=scaled),
         # In HBM, where the expert kernel reads it. Left to XLA, the result
         # lands in VMEM and is copied to HBM after the kernel (a whole [P, H]
         # copy, 3.8 us at P = 640, H = 8192), though only the routed rows are
         # written.
-        out_shape=pltpu.HBM((num_rows, hidden), src.dtype),
+        out_shape=pltpu.HBM((num_rows, hidden), out_dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
+            num_scalar_prefetch=len(prefetch),
             in_specs=[hbm],
             out_specs=hbm,
             scratch_shapes=[
                 pltpu.VMEM((num_src, sub, lanes), src.dtype),
-                pltpu.VMEM((2, tile, hidden), src.dtype),
+                pltpu.VMEM((2, tile, hidden), out_dtype),
                 pltpu.SemaphoreType.DMA((1,)),
                 pltpu.SemaphoreType.DMA((2,)),
             ],
@@ -221,21 +287,54 @@ def gather_rows(src, index, sizes, filled, *, tile: int = _GATHER_TILE):
         compiler_params=pltpu.CompilerParams(
             disable_bounds_checks=True, vmem_limit_bytes=vmem_limit
         ),
-        name=f"row_copy_gather-p_{num_rows}-r_{num_src}-h_{hidden}-t_{tile}",
-    )(index, sizes, filled, src)
+        name=f"row_copy_gather-p_{num_rows}-r_{num_src}-h_{hidden}-t_{tile}"
+        + ("-f8" if scaled else ""),
+    )(*prefetch, src)
 
 
 def _send_kernel(
     num_tokens, index_ref, count_ref, x_ref, out_ref, stage, rows_vmem, sem
 ):
+    _send_body(
+        num_tokens, index_ref, count_ref, None, x_ref, out_ref, stage, rows_vmem, sem
+    )
+
+
+def _send_fp8_kernel(
+    num_tokens, index_ref, count_ref, inv_ref, x_ref, out_ref, stage, rows_vmem, sem
+):
+    _send_body(
+        num_tokens, index_ref, count_ref, inv_ref, x_ref, out_ref, stage, rows_vmem, sem
+    )
+
+
+def _send_body(
+    num_tokens, index_ref, count_ref, inv_ref, x_ref, out_ref, stage, rows_vmem, sem
+):
     c = pl.program_id(0)
-    sub = ROW_SUBLANES
+    fp8 = inv_ref is not None
+    sub = FP8_ROW_SUBLANES if fp8 else ROW_SUBLANES
     lanes = stage.shape[1]
 
     def relayout(block):
-        # Token t's row is stage rows [16 t, 16 t + 16): whole tiles.
+        # Token t's row is stage rows [sub t, sub t + sub): whole tiles.
         num_rows = block.shape[0]
-        block = block.reshape(num_rows, sub, lanes)
+        if fp8:
+            # Each row times its token's inverse scale, as fp8 [32, H / 32],
+            # packed into its words [8, H / 32] (`fp8_row_words`' order).
+            x = block.astype(jnp.float32)
+            x = jnp.where(jnp.isfinite(x), x, 0.0)
+            x = x.reshape(num_rows, _FP8_PER_WORD * sub, lanes)
+            first = c * _ROWS_PER_TILE
+            x = jnp.stack(
+                [
+                    x[i] * inv_ref[jnp.minimum(first + i, num_tokens - 1)]
+                    for i in range(num_rows)
+                ]
+            )
+            block = pltpu.bitcast(x.astype(jnp.float8_e4m3fn), jnp.uint32)
+        else:
+            block = block.reshape(num_rows, sub, lanes)
         start = pl.multiple_of(c * _ROWS_PER_TILE * sub, _ROWS_PER_TILE * sub)
         stage[pl.ds(start, num_rows * sub)] = block.reshape(num_rows * sub, lanes)
 
@@ -324,4 +423,45 @@ def copy_send_rows(x, index, count, rows: int):
         ),
         name=f"row_copy_send-s_{num_tokens}-r_{rows}-h_{hidden}",
     )(index, count, x)
+    return out.reshape(rows, sub, lanes)
+
+
+@functools.partial(jax.jit, static_argnames=("rows",))
+def copy_send_rows_fp8(x, inv_scale, index, count, rows: int):
+    """`copy_send_rows` for the fp8 exchange: row ``r`` of the [rows, 8, H /
+    32] uint32 result is the words (`fp8_row_words`) of token ``index[r]``'s
+    row of ``x`` [S, H] bf16 times ``inv_scale[index[r]]`` [S] float32, as
+    fp8 e4m3 (non-finite values as zeros), for ``r < count[0]``; later rows
+    are not written. The kernel quantizes and packs ``x`` in VMEM once and
+    copies rows there."""
+    num_tokens, hidden = x.shape
+    if not (row_copy_supported(x.dtype, hidden) and fp8_rows_supported(hidden)):
+        raise ValueError(f"copy_send_rows_fp8 takes bf16 rows, got {x.shape}")
+    sub = FP8_ROW_SUBLANES
+    lanes = hidden // (sub * _FP8_PER_WORD)
+    num_chunks = pl.cdiv(num_tokens, _ROWS_PER_TILE)
+    vmem = (num_chunks * _ROWS_PER_TILE + rows) * hidden + (16 << 20)
+    if vmem > pltpu.get_tpu_info().vmem_capacity_bytes * 0.9:
+        raise ValueError(f"copy_send_rows_fp8: {rows} rows do not fit VMEM")
+    out = pl.pallas_call(
+        functools.partial(_send_fp8_kernel, num_tokens),
+        out_shape=pltpu.HBM((rows * sub, lanes), jnp.uint32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(num_chunks,),
+            in_specs=[pl.BlockSpec((_ROWS_PER_TILE, hidden), lambda c, *_: (c, 0))],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((num_chunks * _ROWS_PER_TILE * sub, lanes), jnp.uint32),
+                pltpu.VMEM((rows * sub, lanes), jnp.uint32),
+                pltpu.SemaphoreType.DMA((1,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=True,
+            vmem_limit_bytes=vmem,
+        ),
+        name=f"row_copy_send_fp8-s_{num_tokens}-r_{rows}-h_{hidden}",
+    )(index, count, inv_scale.astype(jnp.float32), x)
     return out.reshape(rows, sub, lanes)

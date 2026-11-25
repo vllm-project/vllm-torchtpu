@@ -306,3 +306,61 @@ def test_send_index_rows_minor_matches_the_default_on_tpu(
         sent = np.asarray(send_rows_minor(x, out_row)).view(np.uint16)
         sent_default = np.asarray(send_default(x, out_row)).view(np.uint16)
         np.testing.assert_array_equal(sent[:count], sent_default[:count])
+
+
+@pytest.mark.parametrize("num_routes", [640, 1840])
+@pytest.mark.parametrize("count", [0, 1, 65, -1])
+@pytest.mark.parametrize("hidden", [8192, 4096])
+def test_gather_rows_dequantizes_fp8_rows(num_routes, count, hidden):
+    """fp8 rows with a scale per receive row: every computed route's row is
+    bf16 ``row * scale`` of its receive row, rows past them to the end of
+    their 16-row block are zeros."""
+    _require_tpu()
+    count = num_routes if count < 0 else count
+    rng = np.random.default_rng(num_routes * 7 + count)
+    num_src = 184 if num_routes == 1840 else 480
+    x = jnp.asarray(rng.standard_normal((num_src, hidden)), jnp.float32)
+    q = x.astype(jnp.float8_e4m3fn)
+    scale = jnp.asarray(rng.uniform(0.01, 4.0, size=num_src), jnp.float32)
+    index = rng.integers(0, num_src, size=num_routes).astype(np.int32)
+    index[count:] = num_src
+    sizes = _group_sizes(rng, count)
+    filled = int(index[:count].max()) + 1 if count else 0
+    got = gather_rows(
+        row_copy.fp8_row_words(q),
+        jnp.asarray(index),
+        jnp.asarray(sizes),
+        jnp.asarray([filled], jnp.int32),
+        scale,
+    )
+    assert got.dtype == jnp.bfloat16
+    rows = np.asarray(q.astype(jnp.float32) * scale[:, None])
+    want = np.zeros((num_routes, hidden), np.float32)
+    want[:count] = rows[index[:count]]
+    want = np.asarray(jnp.asarray(want, jnp.bfloat16).astype(jnp.float32))
+    written = min(num_routes, -(-count // 16) * 16)
+    np.testing.assert_array_equal(
+        np.asarray(got.astype(jnp.float32))[:written], want[:written]
+    )
+
+
+@pytest.mark.parametrize("num_tokens", [12, 13, 48, 92])
+@pytest.mark.parametrize("hidden", [8192, 4096])
+def test_copy_send_rows_fp8_writes_the_fp8_words(num_tokens, hidden):
+    """Each written send row is bitwise the words of its token's row times its
+    inverse scale as fp8 (non-finite values as zeros)."""
+    _require_tpu()
+    rng = np.random.default_rng(num_tokens * 3 + hidden)
+    x = _rows(rng, num_tokens, hidden)
+    inv = jnp.asarray(rng.uniform(0.5, 300.0, size=num_tokens), jnp.float32)
+    rows = 480
+    index = rng.integers(0, num_tokens, size=rows).astype(np.int32)
+    count = min(rows, 7 * num_tokens)
+    got = row_copy.copy_send_rows_fp8(
+        x, inv, jnp.asarray(index), jnp.asarray([count], jnp.int32), rows
+    )
+    xf = x.astype(jnp.float32)
+    xf = jnp.where(jnp.isfinite(xf), xf, 0.0)
+    want = row_copy.fp8_row_words((xf * inv[:, None]).astype(jnp.float8_e4m3fn))
+    want = np.asarray(want)[index[:count]]
+    np.testing.assert_array_equal(np.asarray(got)[:count], want)

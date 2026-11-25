@@ -946,6 +946,7 @@ def fused_moe_scatter_planned(
     extra=None,
     src_rows=None,
     tail=None,
+    row_scale=None,
     *,
     activation: str,
     rhs_quant_dtype=None,
@@ -965,7 +966,9 @@ def fused_moe_scatter_planned(
     ``row_gather``: ``hidden_states`` holds whole-tile rows [R, 16, H / 16]
     and `gather_rows` copies out the computed routes' rows, the same rows
     the one-hot permute gives; ``src_rows`` [1] (default R) bounds the rows
-    they come from."""
+    they come from. ``row_scale`` [R] (with ``row_gather``): ``hidden_states``
+    holds fp8 row words [R, 8, H / 32] and row ``r`` stands for bf16
+    ``hidden_states[r] * row_scale[r]`` (see `gather_rows`)."""
     if w1_scale.ndim == 3:
         w1_scale = jnp.expand_dims(w1_scale, 2)
     if w2_scale.ndim == 3:
@@ -980,7 +983,7 @@ def fused_moe_scatter_planned(
             )
         if src_rows is None:
             src_rows = jnp.full((1,), hidden_states.shape[0], jnp.int32)
-        x = gather_rows(hidden_states, token_sorted, group_sizes, src_rows)
+        x = gather_rows(hidden_states, token_sorted, group_sizes, src_rows, row_scale)
     else:
         x = onehot_permute(hidden_states, token_sorted)
     return gmm_v2_mlp_scatter(
