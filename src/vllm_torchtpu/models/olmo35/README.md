@@ -25,10 +25,3 @@ a latent mixture of experts.
 The compile cache key covers the paths in `_RUNTIME_CACHE_KEY_PATHS` plus
 every `kernels/` and `ops/` directory under `vllm_torchtpu/models/`, so keep
 custom-op bridges and kernel copies in those directories.
-
-## Limits
-
-Prefix caching off (turned off automatically), no unified KV pool, no P/D or
-offload connector, no speculative decoding, no context parallelism, and TP
-must divide the 8 KDA heads. The KDA state takes about 150 MB per
-`--max-num-seqs` slot summed over the TP ranks (35 layers of 8x256x512 fp32).
