@@ -234,6 +234,12 @@ _PAGES_PER_CHUNK = 128
 # is one chunk and a 256-page group two, which then carry all of it (the
 # 128-page dots measured faster with this spreading collapsed, j-3fb5ff45).
 _DMA_ISSUE_CHUNKS = 8
+# Partial last chunks (pages) the transposed tiles score in `_kernel_v3`, so
+# that a 256-page group with 129-224 live pages skips its last 32 pages.
+# More sizes cost more code than they save (bench j-3bcdf4d5: (64, 96)
+# slower than (96,) at every decode shape).
+_TAIL_PAGES = (96,)
+assert all(t % 2 == 0 for t in _TAIL_PAGES), "tails pair their pages"
 # Page groups in `_kernel_v3`'s DMA ring.
 _RING_SLOTS = 3
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed
@@ -494,15 +500,17 @@ def _kernel_v3(
         jnp.clip(q_pair, -448, 448).astype(jnp.float8_e4m3fn) if fp8_queries else None
     )
     num_chunks = pages_per_step // chunk
+    scores_transposed = _scores_transposed(block_q, rows, cache_ref.dtype)
     # The ahead group's descriptors, spread over the first chunks' page pairs
     # (in one chunk they crowd its scalar slots: slower, bench j-9956cd34;
     # `_DMA_ISSUE_CHUNKS` says how many).
     issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
     per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
-    def score_chunk(slot, first, share):
-        """Score pages ``[first, first + chunk)``, issuing the ahead group's
-        descriptors `share` among the first page pairs (`start`)."""
+    def score_chunk(slot, first, share, size=chunk):
+        """Score pages ``[first, first + size)``, issuing the ahead group's
+        descriptors `share` among the first page pairs (`start`); a partial
+        chunk (transposed tiles only) issues the rest of its share after."""
 
         def issue(j):
             if j < chunk // 2:
@@ -513,21 +521,24 @@ def _kernel_v3(
                     (slot + ahead) % slots,
                 )
 
-        if _scores_transposed(block_q, rows, cache_ref.dtype):
+        if scores_transposed:
             m = _chunk_maxima_t(
                 q_pair,
                 buf.at[slot],
                 first,
-                chunk,
+                size,
                 live,
                 issue,
                 dtype=cache_ref.dtype,
                 folded=folded,
-            )  # [Bq, chunk]
+            )  # [Bq, size]
             if transposed:
-                o_ref[:, pl.ds(first, chunk)] = m
+                o_ref[:, pl.ds(first, size)] = m
             else:
-                o_ref[pl.ds(first, chunk), :] = m.T
+                o_ref[pl.ds(first, size), :] = m.T
+            if size < chunk:
+                rest = share[size // 2 * per_pair :]
+                start(next_base, next_live, rest, (slot + ahead) % slots)
             return
 
         if folded:
@@ -575,7 +586,8 @@ def _kernel_v3(
     share = per_pair * (chunk // 2)
 
     def body(slot, scored):
-        """Score the group's first `scored` chunks; the rest are past the
+        """Score the group's first `scored` pages (whole chunks, but for a
+        partial last chunk of transposed tiles); the rest are past the
         request's last page (their scores are never read) and only issue
         their share of the ahead group's descriptors."""
         wait_pages(live, slot)
@@ -583,19 +595,27 @@ def _kernel_v3(
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
             )
-            if c < scored:
-                score_chunk(slot, c * chunk, pages)
+            size = min(chunk, scored - c * chunk)
+            if size > 0:
+                score_chunk(slot, c * chunk, pages, size)
             else:
                 start(next_base, next_live, pages, (slot + ahead) % slots)
 
-    # One straight-line body per slot and count of scored chunks, so that a
+    # One straight-line body per slot and count of scored pages, so that a
     # chunk's matmuls overlap the previous chunk's maxima.
     counts = sorted({num_chunks} | {2**k for k in range(1, 8) if 2**k < num_chunks})
-    live_chunks = jnp.minimum(-(-live // chunk), num_chunks)
+    scored = [n * chunk for n in counts]
+    if scores_transposed:
+        # Transposed (decode) tiles also stop after one chunk or at a partial
+        # last chunk: a step scores up to the next of these page counts
+        # (bench j-7a44afac, b43 twin shape: 70.1 -> 66.1 us per call).
+        tails = {s - chunk + t for s in scored for t in _TAIL_PAGES if t < chunk}
+        scored = sorted({chunk} | set(scored) | {s for s in tails if s > chunk})
+    group_live = jnp.minimum(live, pages_per_step)
     for slot in range(slots):
-        for i, n in enumerate(counts):
-            lo = counts[i - 1] if i else 0
-            pl.when((step % slots == slot) & (live_chunks > lo) & (live_chunks <= n))(
+        for i, n in enumerate(scored):
+            lo = scored[i - 1] if i else 0
+            pl.when((step % slots == slot) & (group_live > lo) & (group_live <= n))(
                 functools.partial(body, slot, n)
             )
 

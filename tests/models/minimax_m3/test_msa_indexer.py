@@ -173,6 +173,46 @@ def test_served_page_groups_match_reference(cache_kind, q_lens, ctx_lens):
         np.testing.assert_allclose(got, expected, **tol)
 
 
+@pytest.mark.parametrize("cache_kind", [jnp.float8_e4m3fn, "fp4"])
+def test_transposed_partial_chunks_match_reference(cache_kind, monkeypatch):
+    """Transposed decode tiles stop after one chunk or at a partial last
+    chunk (`_TAIL_PAGES`), shrunk here to 16-page chunks in 32-page groups:
+    last groups of 20 (a 12-page tail), 31 (whole group) and 7 live pages,
+    one request over three groups."""
+    # The patched constants are not in block_scores' jit key.
+    jax.clear_caches()
+    monkeypatch.setattr(msa_indexer, "_PAGES_PER_CHUNK", 16)
+    monkeypatch.setattr(msa_indexer, "_TAIL_PAGES", (12,))
+    q_lens, ctx_lens = [8, 8, 8], [52 * PAGE - 8, 31 * PAGE - 8, 70 * PAGE]
+    index_q, cache, keys, seq_lens, tables, cu_q, num_seqs = _served_case(
+        q_lens, ctx_lens, cache_kind, 7
+    )
+    scores = block_scores(
+        index_q,
+        cache,
+        jnp.asarray(seq_lens),
+        jnp.asarray(tables.reshape(-1)),
+        jnp.asarray(cu_q),
+        jnp.int32(num_seqs),
+        small_pages_per_step=32,
+        interpret=True,
+    )
+    scores = np.asarray(scores)[:, 0]
+    jax.clear_caches()
+    queries = np.asarray(index_q.astype(jnp.float32))[:, 0]
+    for r in range(num_seqs):
+        num_pages_r = -(-seq_lens[r] // PAGE)
+        q_r = queries[cu_q[r] : cu_q[r + 1]]
+        expected = np.einsum("psd,td->tps", keys[tables[r, :num_pages_r]], q_r)
+        got = scores[cu_q[r] : cu_q[r + 1], :num_pages_r]
+        # 4-bit: the bound `test_served_page_groups_match_reference` uses for
+        # `_served_case` (the scores before the partial chunks miss 1e-4 too).
+        tol = {"rtol": 2e-2, "atol": 5e-2}
+        if cache_kind != "fp4":
+            tol = {"rtol": 1e-4, "atol": 1e-3}
+        np.testing.assert_allclose(got, expected.max(-1), **tol)
+
+
 @pytest.mark.parametrize("kernel", ["v1", "v2", "v3"])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 def test_lowers_for_tpu(dtype, kernel):
