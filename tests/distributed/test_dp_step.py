@@ -35,7 +35,7 @@ class _Request:
 
     def __init__(self, request_id: str, prompt: int, computed: int, image: bool):
         self.request_id = request_id
-        self.prompt = prompt
+        self.prompt = self.num_prompt_tokens = prompt
         self.num_computed_tokens = computed
         self.num_output_placeholders = 0
         self.image = image
@@ -121,18 +121,8 @@ class _Runner:
             request_id: self.requests[request_id][0] + count
             for request_id, count in scheduled.items()
         }
-        self.bound = (
-            None
-            if getattr(output, dp_step.NEXT_STEP_UNBOUNDED)
-            else dp_step.decode_bound(
-                (
-                    (computed + scheduled.get(request_id, 0), prompt)
-                    for request_id, (computed, prompt, _) in self.requests.items()
-                ),
-                1 + DRAFTS,
-                MAX_REQS,
-                _count_chunks,
-            )
+        self.bound = dp_step.next_step_bound(
+            getattr(output, dp_step.NEXT_STEP_TOKENS), BUDGET, _count_chunks
         )
         if not scheduled:
             return dp_step.StepShape.local(0, 0, 0)

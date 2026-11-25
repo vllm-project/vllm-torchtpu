@@ -3711,27 +3711,13 @@ class TPUModelRunner(GPUModelRunner):
     def _dp_bound_next_step(
         self, scheduler_output: "SchedulerOutput"
     ) -> dp_step.StepShape | None:
-        """This rank's bound on its next lockstep step (dp_step.py).
-
-        A scheduler without the admission gate, or one that announced new
-        work, leaves the next step unbounded.
-        """
-        if not self._dp_lockstep_enabled() or getattr(
-            scheduler_output, dp_step.NEXT_STEP_UNBOUNDED, True
-        ):
+        """This rank's bound on its next lockstep step (dp_step.py), from its
+        scheduler; one without the admission gate leaves it unbounded."""
+        if not self._dp_lockstep_enabled():
             return None
-        scheduled = scheduler_output.num_scheduled_tokens
-        spec = self.speculative_config
-        return dp_step.decode_bound(
-            (
-                (
-                    state.num_computed_tokens + scheduled.get(req_id, 0),
-                    state.num_prompt_tokens,
-                )
-                for req_id, state in self.requests.items()
-            ),
-            1 + (spec.num_speculative_tokens if spec is not None else 0),
-            self.scheduler_config.max_num_seqs,
+        return dp_step.next_step_bound(
+            getattr(scheduler_output, dp_step.NEXT_STEP_TOKENS, None),
+            self.max_num_tokens,
             self._count_input_chunks,
         )
 
@@ -4295,6 +4281,9 @@ class TPUModelRunner(GPUModelRunner):
 
         if not self._pp_is_last:
             self._pp_pending_scheduler_output = scheduler_output
+            # Its last launch is behind it, and an executor need not call
+            # sample_tokens on a stage that samples nothing.
+            self._dp_end_step()
             return None
         self.execute_model_state = ExecuteModelState(
             scheduler_output=scheduler_output,

@@ -19,27 +19,30 @@ shape before its launch, as every step did before: it is the one step with two
 all-reduces. Every step keeps one barrier, so the ranks never drift more than
 a step apart.
 
-A rank bounds its next step when every request it holds has finished its
-prompt (`decode_bound`): a decoding request is scheduled at most 1 + K tokens.
-A finished request only shrinks the next step, and its rows become padding.
-What a rank cannot see coming is new work from its scheduler, so the scheduler
-announces it one step ahead (`gated_schedule`): it admits waiting requests
-only on a step the previous step announced, and a running request rolled back
-to a prefill between two schedules (a failed KV load) waits for an announced
-step too. A new request therefore enters one step after it becomes
-admissible, on a step whose shape is agreed before launch.
+The bound comes from the rank's scheduler, which alone knows its next step
+(`gated_schedule`). Once every running request has finished its prompt, the
+next schedule gives each at most what it gives it now: 1 + its draft count
+under vLLM's token formula, which accepted and rejected drafts leave
+unchanged. A finished request only shrinks the next step, and its rows become
+padding. New work is what breaks the bound, so the scheduler announces it one
+step ahead: it admits waiting requests only on a step the previous schedule
+announced, and holds a running request rolled back to a prefill between two
+schedules (a failed KV load) for one step as well. A new request therefore
+enters one step after it becomes admissible, on a step whose shape is agreed
+before its launch.
 """
 
 import dataclasses
 import functools
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
 
-# Set by `gated_schedule` on every SchedulerOutput: whether the scheduler may
-# give this rank work beyond the decode bound in the next step.
-NEXT_STEP_UNBOUNDED = "tpu_dp_next_step_unbounded"
+# Set by `gated_schedule` on every SchedulerOutput: per running request, the
+# most tokens the next schedule gives it; None when the next step may carry new
+# work (an admission, a prompt chunk).
+NEXT_STEP_TOKENS = "tpu_dp_next_step_tokens"
 
 # Forward-context key (`additional_kwargs`): the token rows every DP rank runs
 # for each stage of this forward, agreed one step ahead. Absent on a step whose
@@ -174,38 +177,26 @@ class StepAgreement:
         return operand.tolist()
 
 
-def decode_bound(
-    spans: Iterable[tuple[int, int]],
-    step_tokens: int,
-    max_reqs: int,
+def next_step_bound(
+    tokens: Sequence[int] | None,
+    max_tokens: int,
     count_chunks: Callable[[Sequence[int]], tuple[int, int]],
 ) -> StepShape | None:
-    """Bound a rank's next step from the requests it holds.
+    """A rank's bound on its next step from its scheduler's `NEXT_STEP_TOKENS`.
 
     Args:
-        spans: per request, its tokens computed once this step completes and
-            its prompt length. Preempted requests are among them, so they can
-            outnumber what the scheduler runs at once.
-        step_tokens: the most tokens a decoding request is scheduled in a step
-            (1 + the number of draft tokens).
-        max_reqs: the most requests the scheduler runs in a step.
+        tokens: the scheduler's per-request token bounds, or None.
+        max_tokens: the largest token bucket; the scheduler's token budget
+            never exceeds it.
         count_chunks: (forward chunks, largest chunk's request count) for a
             batch of per-request token counts.
-
-    Returns:
-        The bound, or None while a prompt is unfinished: its next chunk may
-        carry any token count and encoder inputs.
     """
-    num_reqs = 0
-    for computed, prompt in spans:
-        if computed < prompt:
-            return None
-        num_reqs += 1
-    num_reqs = min(num_reqs, max_reqs)
-    chunks, reqs = count_chunks([step_tokens] * num_reqs)
-    busy = num_reqs > 0
+    if tokens is None:
+        return None
+    chunks, reqs = count_chunks(tokens)
+    busy = bool(tokens)
     return StepShape.local(
-        step_tokens * num_reqs, chunks, reqs, proposals=busy, context=busy
+        min(sum(tokens), max_tokens), chunks, reqs, proposals=busy, context=busy
     )
 
 
@@ -219,21 +210,27 @@ def lockstep_enabled(parallel_config: Any) -> bool:
     )
 
 
-def _rolled_back(scheduler: Any) -> bool:
-    """Whether a running request's next schedule exceeds a decode step.
+def _next_step_tokens(scheduler: Any) -> list[int] | None:
+    """Per running request, the most tokens the next schedule gives it.
 
     vLLM schedules a running request num_tokens_with_spec +
     num_output_placeholders - num_computed_tokens tokens (before budget
-    clamps); for a decoding request that stays 1 + its draft count.
+    clamps); a decoding request keeps that at 1 + its draft count. None when a
+    request is in its prompt or was rolled back further: its next chunk may
+    carry any token count and encoder inputs.
     """
     limit = 1 + scheduler.num_spec_tokens
-    return any(
-        request.num_tokens_with_spec
-        + request.num_output_placeholders
-        - request.num_computed_tokens
-        > limit
-        for request in scheduler.running
-    )
+    tokens = []
+    for request in scheduler.running:
+        count = (
+            request.num_tokens_with_spec
+            + request.num_output_placeholders
+            - request.num_computed_tokens
+        )
+        if request.num_computed_tokens < request.num_prompt_tokens or count > limit:
+            return None
+        tokens.append(max(count, 0))
+    return tokens
 
 
 def _admissible(scheduler: Any) -> bool:
@@ -260,15 +257,15 @@ def gated_schedule(
 ) -> Any:
     """Run `schedule`, admitting new work only on an announced step.
 
-    A step is announced by the schedule before it (`NEXT_STEP_UNBOUNDED`);
-    the first is. An unannounced step schedules running decodes only; if a
-    running request was rolled back to a prefill it schedules nothing, and
-    announces the next.
+    The schedule before a step announces it by publishing no bound
+    (`NEXT_STEP_TOKENS`); the first step is announced. An unannounced step
+    schedules running decodes only; if a running request was rolled back to a
+    prefill it schedules nothing, and announces the next.
     """
     from vllm.v1.core.sched.interface import PauseState
 
     announced = getattr(scheduler, "_tpu_dp_announced", True)
-    held = not announced and _rolled_back(scheduler)
+    held = not announced and _next_step_tokens(scheduler) is None
     previous = scheduler._pause_state
     if held:
         scheduler._pause_state = PauseState.PAUSED_ALL
@@ -278,9 +275,9 @@ def gated_schedule(
         output = schedule(scheduler, *args, **kwargs)
     finally:
         scheduler._pause_state = previous
-    unbounded = held or _rolled_back(scheduler) or _admissible(scheduler)
-    scheduler._tpu_dp_announced = unbounded
-    setattr(output, NEXT_STEP_UNBOUNDED, unbounded)
+    tokens = None if held or _admissible(scheduler) else _next_step_tokens(scheduler)
+    scheduler._tpu_dp_announced = tokens is None
+    setattr(output, NEXT_STEP_TOKENS, tokens)
     return output
 
 
