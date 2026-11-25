@@ -39,6 +39,12 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
     QB4,
     ROWBLK,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.host import SMEM_HEADROOM_BYTES
+from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
+    combine_prefetch_bytes,
+    combine_smem_budget,
+    combine_tables_fit,
+)
 
 # The clamped GPT-OSS activation is the grouped-matmul kernel's own tested
 # implementation, called here rather than copied.
@@ -2035,6 +2041,21 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     packed-f8 rows, and the live accumulator is one token wide.
     """
     tb = combine_step_tokens(t_local)
+    if not tb:
+        raise ValueError(
+            f"combine kernel requires t_local >= {COMBINE_MIN_TOKENS} with an "
+            f"aligned step count, got t_local={t_local}"
+        )
+    info = pltpu.get_tpu_info()
+    if not combine_tables_fit(t_local, topk, info=info):
+        need = combine_prefetch_bytes(t_local, topk)
+        budget = combine_smem_budget(info)
+        raise ValueError(
+            f"combine kernel scalar prefetch for t_local={t_local}, "
+            f"topk={topk} needs {need} bytes, exceeding the {budget}-byte "
+            f"SMEM budget ({info.smem_capacity_bytes} bytes less "
+            f"{SMEM_HEADROOM_BYTES} of headroom)"
+        )
     steps = t_local // tb
     gt = COMBINE_GROUP
     groups = tb // gt

@@ -48,6 +48,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     ROWBLK,
     ROWBLK_SHIFT,
+    SMEM_HEADROOM_BYTES,
     act_scale_slab_rows,
     align_up,
     pow2_shift,
@@ -67,11 +68,8 @@ F32_EXACT_MAX = 1 << 24
 WORD_BITS = 32
 # The kernel's SMEM scratch (the gathered pairs and the two slab tables) grows
 # with ep * t_local * topk; a shape over the chip's SMEM fails to compile, so
-# route_plan_supported refuses it and the layer keeps XLA. The headroom covers
-# what route_plan_smem_bytes leaves out (register spill slots, small-array
-# padding, the rank prefetch): at EP32, t_local=256 on v7x (1 MiB SMEM) the
-# compiler reported 5.2 KiB over against 1.6 KiB estimated.
-SMEM_HEADROOM_BYTES = 32 << 10
+# route_plan_supported refuses it and the layer keeps XLA. SMEM_HEADROOM_BYTES
+# covers what route_plan_smem_bytes leaves out (the rank prefetch among it).
 
 # DMA semaphore slots.
 _SEM_SEND, _SEM_RECV, _SEM_OWN, _SEM_ZERO, _SEM_PAIRS, _SEM_STAGE, _SEM_OUT = range(7)

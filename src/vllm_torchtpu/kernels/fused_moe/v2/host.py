@@ -105,6 +105,12 @@ TOKEN_GATHER_DMA_ALIGNMENT = HIDDEN_LANE_BLOCK
 HIDDEN_MAX_BLOCKS = 64
 # The share of the chip's VMEM the kernel may claim.
 VMEM_FRACTION = 0.98
+# SMEM a kernel leaves free beyond the arrays it sizes itself: register spill
+# slots, small-array padding and short prefetches. Measured on v7x (1 MiB
+# SMEM): the route plan at EP32, t_local=256 went 5.2 KiB over against 1.6
+# KiB estimated, and the combine at t_local=16384, topk=10 used 1.1 KiB
+# beyond its two prefetched tables.
+SMEM_HEADROOM_BYTES = 32 << 10
 # The routing tables pack an arrival position and an alignment slot into
 # one word as position * this + slot, so the slot field is this wide and
 # the alignment slots a mesh needs have to fit under it.
