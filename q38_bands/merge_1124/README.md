@@ -19,6 +19,17 @@ q38 found it on device (GDN-SMOKE j-ab697a88) and fixed it on its own lineage (b
 j-be5e3524 SMOKE-PASS, 12 cases). `git revert <that commit>` undoes it alone. The q38 forms are not touched: each still runs
 exactly the code its dash point ran.
 
+Known TPU finding on this branch, not caused by this fix: 13 test ids fail on TPU both with and without it (q38 TPU
+coverage run tpucov3 j-bb072340-2900-4cca-81f2, verdict `COV-PASS new=0 fw=FW-COMMON`):
+
+- 7 are `tests/kernels/gdn/v3/test_factored_window.py::TestFactoredBody::test_matches_recurrence` (normal-split,
+  normal-vpu, tiny-split, tiny-vpu, underflow-split, zero-split, zero-vpu). On CPU the file passes on both trees (q38
+  CPU job gfcovst4 j-c921db49-5e7b-419f-ab9c: `GFCOV FW FW-CLEAN file=tests/kernels/gdn/v3/test_factored_window.py
+  fix=COMPLETE base=COMPLETE regression=0 ... -> no failure on either tree`).
+- The other 6: 5 parametrizations of `tests/kernels/test_gdn_bf16_qkv_2d.py::test_q38_pooled_prefill_2d_rows_bitwise`
+  and 1 of `tests/kernels/test_gdn_pooled_prefill_parity.py` (five-step:
+  `TestProductionShapeDenseVsUnifiedPool::test_prefill_five_step_correctness_and_timing`).
+
 ## Your defaults do not change
 
 - With `Q38_FORM` and `Q38_PROXY_FORM` unset, the package and the proxy run exactly as on `caojx/qwen38-flash-1124-2`.
@@ -131,6 +142,8 @@ living form, one per lineage, env-keyed and default-off, so the team builds on o
     KEEP-H: a1 (H, SIDECAR off) 465.82 x / 53.68 Mtok/$ against a0 422.60 / 52.10 (dx +10.2 %, dM +3.0 %); MEMO inert; MKH
     attributed by pid.
   - **Exos:** see Notes. `hix` runs on Exos from this branch only after the recipe patches the selected form.
+  - DSIG for the hix form: U; required (a DSIG row or a counted 0-ShapeSpecializationError served log) before any
+    dash-bound hix car.
 - QGLUE-1 in `b1`: a device STEP cut of record; no served gain shown at B1 c212 (within the measured A/A noise floor:
   span 2.34 ms, Mtok/$ ~1.5 %).
 - HD rider disclosure (SERVE car 1, DEV, 1200 s): KEEP-FOR-BUILD on the host cycle only (max-over-ranks p50 non-wait cycle
