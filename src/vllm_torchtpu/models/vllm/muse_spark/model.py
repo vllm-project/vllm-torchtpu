@@ -11,10 +11,39 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Muse Spark text inference with DP attention and TP or DP×TP EP experts."""
+"""Muse Spark text model on TPU, with DP attention and TP or DP×TP EP experts.
+
+Upstream source: ``vllm/models/muse_spark/nvidia/model.py``
+(``MuseSpark1xAttention``, ``MuseSpark1xMoE``, ``MuseSpark1xDecoderLayer``,
+``MuseSpark1xModel`` and ``MuseSpark1xForCausalLM``). The residual gate and the
+logit soft cap are imported unchanged from
+``vllm/models/muse_spark/common/layers.py``.
+
+TPU changes:
+
+- Modules keep the checkpoint's names and layout (separate ``qkv_proj`` and
+  ``gate_proj``, ``mlp``, ``*_residual_gate``), so weights load without
+  upstream's renames or q/k row interleaving; RoPE is NeoX-style on the
+  checkpoint's ``[even | odd]`` q/k rows instead.
+- Attention applies the q/k norm, vLLM's FP32 rotary embedding and the sigmoid
+  output gate separately instead of the fused CUDA qk-norm-RoPE-KV and
+  o-norm-gate kernels.
+- Routing uses ``moe_routing.select_experts`` on FP32 router logits from a
+  scoped ``Precision.HIGHEST`` matmul (``fp32_matmul``). Experts are the
+  shared ``RoutedExperts`` with the shared NVFP4 MoE method (native FP4 with
+  FP32 block scales), run through ``fused_moe_func``'s rows mode, which returns
+  one row per token and expert so the per-expert post-norm runs before the
+  weighted sum.
+  TP partials are all-reduced before the post-norm; DP attention with EP
+  gathers tokens over DP, reduce-scatters the FP32 sums over DP and
+  all-reduces over TP.
+- RMSNorms are unfused FP32 (``layers.MuseRMSNorm``).
+- No sequence parallelism, MegaMoE, fused residual-norm boundaries, PP,
+  context parallelism, EPLB or LoRA.
+"""
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
@@ -28,6 +57,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import FusedMoEFactory, RoutedExperts
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -35,161 +65,167 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.models.muse_spark.common.layers import (
+    MulTanhSoftCap,
+    MuseSpark1xNormPreservingResidualConnection,
+)
 from vllm.sequence import IntermediateTensors
 
 from vllm_torchtpu.layers.adapter import moe_routing
-from vllm_torchtpu.layers.adapter.custom_ops.routed_expert_rows_op import (
-    routed_expert_rows_op,
+from vllm_torchtpu.layers.adapter.custom_ops.fp32_matmul_op import (
+    fp32_matmul,
+    prebuild_fp32_matmul_op,
 )
-from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
+from vllm_torchtpu.layers.adapter.fused_moe import (
+    fused_moe_gmm,
+    prebuild_fused_moe_kernel,
+)
+from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
-from vllm_torchtpu.logger import init_logger
 
 from .layers import (
-    MuseResidual,
     MuseRMSNorm,
+    MuseRMSNormWithInputScale,
     attention_layout,
     selected_expert_outputs,
 )
-from .weights import (
-    decode_expert_weight,
-    expand_global_scale,
-    expert_ep_slice,
-    expert_tp_slice,
-    selected_packed_expert_outputs,
-)
-
-logger = init_logger(__name__)
+from .weights import selected_packed_expert_outputs
 
 if TYPE_CHECKING:
     from vllm.transformers_utils.configs.muse_spark import MuseSparkTextConfig
 
-    from .audio import AutoEncoder
-    from .vision import NaViT, NaViTAdapter
+    from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
 
 
-class MuseExperts(nn.Module):
-    gate_up_proj: nn.Parameter
-    down_proj: nn.Parameter
-    gate_up_proj_weight_scale: nn.Parameter
-    down_proj_weight_scale: nn.Parameter
-    gate_up_proj_weight_scale_2: nn.Parameter
-    down_proj_weight_scale_2: nn.Parameter
-    experts_start: torch.Tensor | None
-    post_expert_norm: MuseRMSNorm
+class MuseRoutedExperts(RoutedExperts):
+    """The shared routed experts, loaded from the checkpoint's stacked tensors.
 
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        num_experts: int,
-        packed: bool = False,
-        use_ep: bool = False,
-    ):
-        super().__init__()
-        tp = get_tensor_model_parallel_world_size()
-        expert_tp = 1 if use_ep else tp
-        if intermediate_size % expert_tp:
-            raise ValueError("Muse intermediate dimension must be divisible by TP")
-        local = intermediate_size // expert_tp
-        self.packed = packed
-        self.use_ep = use_ep
-        if use_ep:
-            ep_group = get_ep_group()
-            if num_experts % ep_group.world_size:
-                raise ValueError("Muse expert count must be divisible by EP")
-            local_experts = num_experts // ep_group.world_size
-            start = ep_group.rank_in_group * local_experts
-        else:
-            local_experts, start = num_experts, 0
-        self.register_buffer(
-            "experts_start",
-            torch.tensor([start], dtype=torch.int32) if use_ep else None,
-            persistent=False,
-        )
-        self._routed_expert_rows = routed_expert_rows_op(use_ep)
-        num_experts = local_experts
-        if packed:
-            if hidden_size % 16 or local % 16:
-                raise ValueError("Packed Muse expert dimensions must align to block 16")
-            for name, rows, columns in (
-                ("gate_up_proj", 2 * local, hidden_size),
-                ("down_proj", hidden_size, local),
-            ):
-                self.register_parameter(
-                    name,
-                    nn.Parameter(
-                        torch.zeros(num_experts, columns // 2, rows, dtype=torch.uint8),
-                        requires_grad=False,
-                    ),
+    The checkpoint stores each projection as one [experts, ...] tensor. Each
+    expert's slice goes to the shared weight loader, which keeps this rank's
+    TP or EP share; the shared MoE quantization method then lays the weights
+    out for gmm_v2.
+    """
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loaded: set[str] = set()
+        for name, tensor in weights:
+            w13 = name.startswith("gate_up_proj")
+            if not w13 and not name.startswith("down_proj"):
+                raise ValueError(f"Unexpected Muse expert tensor: {name}")
+            suffix = name.removeprefix("gate_up_proj" if w13 else "down_proj")
+            param_name = ("w13" if w13 else "w2") + (suffix or "_weight")
+            param = getattr(self, param_name, None)
+            if param is None:
+                raise ValueError(
+                    f"Muse experts have no {param_name} for {name}; NVFP4 experts "
+                    "must not be listed in modules_to_not_convert"
                 )
-                self.register_parameter(
-                    name + "_weight_scale",
-                    nn.Parameter(
-                        torch.empty(
-                            num_experts, columns // 16, rows, dtype=torch.uint8
-                        ),
-                        requires_grad=False,
-                    ),
+            if w13:
+                # The gate and up halves load as the w1 and w3 shards.
+                halves = (
+                    tensor.chunk(2, dim=1) if tensor.dim() == 3 else tensor.unbind(1)
                 )
-                # Global scales expanded to gmm_v2's [E, 1, N] once at load.
-                self.register_parameter(
-                    name + "_weight_scale_2",
-                    nn.Parameter(
-                        torch.empty(num_experts, 1, rows, dtype=torch.float32),
-                        requires_grad=False,
-                    ),
-                )
+                shards = list(zip(("w1", "w3"), halves))
+            else:
+                shards = [("w2", tensor)]
+            for shard_id, part in shards:
+                for expert_id, value in enumerate(part.unbind(0)):
+                    param.weight_loader(
+                        param=param,
+                        loaded_weight=value,
+                        weight_name=param_name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                        return_success=True,
+                    )
+            loaded.add(param_name)
+        return loaded
+
+    def initialize_dummy_quantized_weights(self, seed: int) -> None:
+        """Finite, non-zero NVFP4 experts for ``--load-format dummy``.
+
+        The dummy loader's packed bytes and block scales do not decode to
+        usable experts. After the NVFP4 MoE method lays the experts out
+        (native FP4 [E, K, N] and FP32 block scales), use random +/-0.5 FP4
+        values and a fan-in block scale, generated on CPU so no full-size
+        random tensor lands in HBM.
+        """
+        layer = cast("TpuRoutedExperts", self)
+        if layer.w13_weight.dtype != torch.float4_e2m1fn_x2:
             return
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(num_experts, hidden_size, 2 * local), requires_grad=False
-        )
-        self.down_proj = nn.Parameter(
-            torch.empty(num_experts, local, hidden_size), requires_grad=False
-        )
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        for prefix in ("w13", "w2"):
+            weight = getattr(layer, f"{prefix}_weight")
+            values = torch.randint(
+                0, 256, weight.shape, dtype=torch.uint8, generator=generator
+            )
+            values = values.bitwise_and_(0x88).bitwise_or_(0x11)
+            weight.data.copy_(values.view(torch.float4_e2m1fn_x2))
+            getattr(layer, f"{prefix}_weight_scale").data.fill_(weight.shape[1] ** -0.5)
 
-    def forward(self, x: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
-        if x.device.type == "tpu":
-            return self._routed_expert_rows(
-                x,
-                ids,
-                self.gate_up_proj,
-                self.down_proj,
-                self.gate_up_proj_weight_scale if self.packed else None,
-                self.down_proj_weight_scale if self.packed else None,
-                self.gate_up_proj_weight_scale_2 if self.packed else None,
-                self.down_proj_weight_scale_2 if self.packed else None,
-                self.experts_start,
-            )
-        owned = None
-        if self.use_ep:
-            assert self.experts_start is not None
-            local_ids = ids - self.experts_start
-            owned = (local_ids >= 0) & (local_ids < self.gate_up_proj.shape[0])
-            ids = local_ids.clamp(0, self.gate_up_proj.shape[0] - 1)
-        if self.packed:
-            rows = selected_packed_expert_outputs(
-                x,
-                ids,
-                self.gate_up_proj.transpose(1, 2),
-                self.down_proj.transpose(1, 2),
-                self.gate_up_proj_weight_scale.transpose(1, 2),
-                self.down_proj_weight_scale.transpose(1, 2),
-                self.gate_up_proj_weight_scale_2,
-                self.down_proj_weight_scale_2,
-            )
-        else:
-            rows = selected_expert_outputs(x, ids, self.gate_up_proj, self.down_proj)
-        return rows if owned is None else rows.masked_fill(~owned[..., None], 0)
+
+def _expert_rows(
+    experts: RoutedExperts, x: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor
+) -> torch.Tensor:
+    """Unweighted rows [tokens, top_k, hidden] from this rank's experts."""
+    layer = cast("TpuRoutedExperts", experts)
+    if x.device.type == "tpu":
+        # NVFP4 experts are native FP4 with FP32 block scales; BF16 has none.
+        scaled = layer.w13_weight.dtype == torch.float4_e2m1fn_x2
+        return fused_moe_gmm(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale if scaled else None,
+            layer.w2_weight_scale if scaled else None,
+            None,
+            None,
+            weights,
+            ids,
+            layer._experts_start,
+            topk=ids.shape[-1],
+            activation="silu",
+            return_rows=True,
+        )
+    # The CPU reference reads the checkpoint layout: packed uint8 rows with
+    # E4M3 block scales and per-expert global scales.
+    packed = layer.w13_weight.dtype == torch.uint8
+    owned = None
+    if layer._experts_start is not None:
+        local_ids = ids - layer._experts_start
+        owned = (local_ids >= 0) & (local_ids < layer.w13_weight.shape[0])
+        ids = local_ids.clamp(0, layer.w13_weight.shape[0] - 1)
+    if packed:
+        rows = selected_packed_expert_outputs(
+            x,
+            ids,
+            layer.w13_weight,
+            layer.w2_weight,
+            layer.w13_weight_scale.view(torch.uint8),
+            layer.w2_weight_scale.view(torch.uint8),
+            layer.w13_weight_scale_2,
+            layer.w2_weight_scale_2,
+        )
+    else:
+        rows = selected_expert_outputs(x, ids, layer.w13_weight, layer.w2_weight)
+    return rows if owned is None else rows.masked_fill(~owned[..., None], 0)
 
 
 class MuseMoE(nn.Module):
-    def __init__(self, config, prefix: str, packed: bool = False, use_ep: bool = False):
+    def __init__(
+        self,
+        config,
+        prefix: str,
+        quant_config: QuantizationConfig | None = None,
+        use_ep: bool = False,
+    ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.use_ep = use_ep
@@ -222,31 +258,43 @@ class MuseMoE(nn.Module):
             quant_config=dense,
             prefix=f"{prefix}.pre_expert_proj",
         )
-        self.post_expert_proj = RowParallelLinear(
+        self.post_expert_proj = ColumnParallelLinear(
             hidden,
             config.hidden_size,
             bias=False,
-            input_is_parallel=False,
+            gather_output=True,
             quant_config=dense,
             prefix=f"{prefix}.post_expert_proj",
         )
         self.pre_expert_norm = MuseRMSNorm(
             hidden, config.rms_norm_eps, zero_centered=True
         )
-        self.experts = MuseExperts(
-            hidden,
-            config.moe_intermediate_size,
-            config.num_local_experts,
-            packed=packed,
-            use_ep=use_ep,
+        self.experts = FusedMoEFactory(
+            num_experts=config.num_local_experts,
+            top_k=self.top_k,
+            hidden_size=hidden,
+            intermediate_size=config.moe_intermediate_size,
+            params_dtype=torch.bfloat16,
+            renormalize=True,
+            quant_config=quant_config or dense,
+            prefix=f"{prefix}.experts",
+            scoring_func="sigmoid",
+            routed_experts_cls=MuseRoutedExperts,
+        ).routed_experts
+        self.post_expert_norm = MuseRMSNormWithInputScale(
+            hidden, config.post_norm_eps, zero_centered=True
         )
-        self.experts.post_expert_norm = MuseRMSNorm(
-            hidden, config.post_norm_eps, zero_centered=True, weight_first=True
+        # Build the router and rows ops outside torch.compile tracing.
+        prebuild_fp32_matmul_op()
+        prebuild_fused_moe_kernel(
+            topk=self.top_k, activation="silu", use_ep=use_ep, return_rows=True
         )
 
     def route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """FP32 routing weights and int32 expert ids for each token."""
-        logits, _ = self.gate(x.float())
+        # Expert selection is sensitive to logit rounding; TPU FP32 matmuls
+        # otherwise run as BF16 passes.
+        logits = fp32_matmul(x, self.gate.weight)
         return moe_routing.select_experts(
             x.float(),
             logits * self.multiplier,
@@ -266,18 +314,18 @@ class MuseMoE(nn.Module):
             x = self.dp_group.all_gather(x, dim=0)
             weights = self.dp_group.all_gather(weights, dim=0)
             ids = self.dp_group.all_gather(ids, dim=0)
-        rows = self.experts(x, ids)
+        rows = _expert_rows(self.experts, x, weights, ids)
         # Normalize the sum of TP partials, not individual shards.
         if self.tp_size > 1 and not self.use_ep:
             rows = tensor_model_parallel_all_reduce(rows.contiguous())
-        rows = self.experts.post_expert_norm(rows, out_dtype=torch.float32)
+        rows = self.post_expert_norm(rows, out_dtype=torch.float32)
         result = (rows * weights.unsqueeze(-1)).sum(dim=1)
         if self.dp_size > 1:
             assert self.dp_group is not None
             # Return this DP engine's rows before the remaining TP reduction.
             result = self.dp_group.reduce_scatter(result.contiguous(), dim=0)
         if self.use_ep and self.tp_size > 1:
-            # Normalize whole experts before the weighted FP32 reduction.
+            # Under EP each TP rank holds different experts; add their sums.
             result = tensor_model_parallel_all_reduce(result.contiguous())
         result = result.to(x.dtype)
         result, _ = self.post_expert_proj(result)
@@ -289,8 +337,6 @@ class MuseAttention(nn.Module):
         super().__init__()
         tp = get_tensor_model_parallel_world_size()
         self.head_dim = config.head_dim
-        # Pad explicitly: the native 64-wide cache packs K/V differently.
-        self.attention_head_dim = max(128, self.head_dim)
         self.num_heads = config.num_attention_heads // tp
         self.num_kv_heads = max(1, config.num_key_value_heads // tp)
         self.q_size = self.num_heads * self.head_dim
@@ -312,6 +358,10 @@ class MuseAttention(nn.Module):
             quant_config=dense,
             prefix=f"{prefix}.gate_proj",
         )
+        # The flipped [in, out] layout makes a 1-token forward copy a transposed
+        # weight every step; the vLLM layout does not, and longer forwards
+        # compile the same either way.
+        setattr(self.gate_proj, KEEP_VLLM_LAYOUT_ATTR, True)
         self.o_proj = RowParallelLinear(
             config.num_attention_heads * config.head_dim,
             config.hidden_size,
@@ -343,7 +393,7 @@ class MuseAttention(nn.Module):
         scale = config.head_dim**-0.5 * config.qk_scale_factor
         self.attn = Attention(
             self.num_heads,
-            self.attention_head_dim,
+            self.head_dim,
             scale,
             num_kv_heads=self.num_kv_heads,
             cache_config=vllm_config.cache_config,
@@ -361,16 +411,8 @@ class MuseAttention(nn.Module):
             # FP32 inputs keep the FP32 cos/sin table; round once afterwards.
             q, k = self.rotary_emb(positions, q.float(), k.float())
             q, k = q.to(x.dtype), cast(torch.Tensor, k).to(x.dtype)
-        v = v.reshape(-1, self.num_kv_heads, self.head_dim)
-        if self.attention_head_dim != self.head_dim:
-            padding = (0, self.attention_head_dim - self.head_dim)
-            q = torch.nn.functional.pad(q, padding)
-            k = torch.nn.functional.pad(k, padding)
-            v = torch.nn.functional.pad(v, padding)
-        out = self.attn(q.flatten(1), k.flatten(1), v.flatten(1))
-        out = out.reshape(-1, self.num_heads, self.attention_head_dim)[
-            ..., : self.head_dim
-        ]
+        out = self.attn(q.flatten(1), k.flatten(1), v)
+        out = out.reshape(-1, self.num_heads, self.head_dim)
         out = self.o_norm(out, out_dtype=torch.float32)
         gate, _ = self.gate_proj(x)
         out = out * gate.reshape_as(out).float().sigmoid()
@@ -384,20 +426,10 @@ class MuseDecoderLayer(nn.Module):
         self.self_attn = MuseAttention(
             config, vllm_config, layer_idx, f"{prefix}.self_attn"
         )
-        moe_prefix = f"{prefix}.mlp"
-        packed = (
-            vllm_config.model_config.quantization == "modelopt_fp4"
-            and cast(dict[str, Any], vllm_config.additional_config).get(
-                "muse_packed_experts", get_tensor_model_parallel_world_size() <= 16
-            )
-            and not cast(VllmNvfp4Config, vllm_config.quant_config).is_layer_excluded(
-                moe_prefix + ".experts"
-            )
-        )
         self.mlp = MuseMoE(
             config,
-            moe_prefix,
-            packed=packed,
+            f"{prefix}.mlp",
+            quant_config=vllm_config.quant_config,
             use_ep=vllm_config.parallel_config.enable_expert_parallel,
         )
         self.input_layernorm = MuseRMSNorm(
@@ -409,17 +441,16 @@ class MuseDecoderLayer(nn.Module):
         self.post_attn_norm = MuseRMSNorm(
             config.hidden_size, config.post_norm_eps, has_weight=False
         )
-        self.post_feedforward_layernorm = MuseRMSNorm(
-            config.hidden_size,
-            config.post_norm_eps,
-            zero_centered=True,
-            weight_first=True,
+        self.post_feedforward_layernorm = MuseRMSNormWithInputScale(
+            config.hidden_size, config.post_norm_eps, zero_centered=True
         )
-        self.post_attention_residual_gate = MuseResidual(
-            config.hidden_size, config.residual_gate_temperature
+        self.post_attention_residual_gate = MuseSpark1xNormPreservingResidualConnection(
+            config.hidden_size, temperature=config.residual_gate_temperature
         )
-        self.post_feedforward_residual_gate = MuseResidual(
-            config.hidden_size, config.residual_gate_temperature
+        self.post_feedforward_residual_gate = (
+            MuseSpark1xNormPreservingResidualConnection(
+                config.hidden_size, temperature=config.residual_gate_temperature
+            )
         )
 
     def forward(self, positions: torch.Tensor, stream: torch.Tensor) -> torch.Tensor:
@@ -439,7 +470,6 @@ class MuseDecoderLayer(nn.Module):
 class MuseModel(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str):
         super().__init__()
-        self.prefix = prefix
         config = vllm_config.model_config.hf_text_config
         self.residual_dtype = torch.float32
         self.dtype = cast(torch.dtype, vllm_config.model_config.dtype)
@@ -482,14 +512,23 @@ class MuseModel(nn.Module):
 
 class _MuseModelComponents(nn.Module):
     language_model: MuseModel
-    vision_tower: "NaViT"
-    vision_adapter: "NaViTAdapter"
-    vision_projection: RowParallelLinear
-    audio_tower: "AutoEncoder"
 
 
 class MuseSparkForCausalLM(nn.Module):
+    # The text-only model skips the checkpoint's vision and audio tensors.
+    ignored_weight_prefixes: tuple[str, ...] = (
+        "model.vision_tower.",
+        "model.vision_adapter.",
+        "model.vision_projection.",
+        "model.audio_tower.",
+    )
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_substr={".mlp.experts.post_expert_norm.": ".mlp.post_expert_norm."},
+        orig_to_new_stacked={
+            f".self_attn.{p}_proj.": (".self_attn.qkv_proj.", p) for p in "qkv"
+        },
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -523,13 +562,10 @@ class MuseSparkForCausalLM(nn.Module):
             raise ValueError(
                 f"Muse TPU supports BF16 and NVFP4 checkpoints, got {quant}"
             )
-        if quant == "modelopt_fp4":
-            quant_config = cast(VllmNvfp4Config, vllm_config.quant_config)
-            quant_config.exclude_modules = list(
-                vllm_config.model_config.hf_config.quantization_config[
-                    "modules_to_not_convert"
-                ]
-            )
+        load_format = vllm_config.load_config.load_format
+        self._dummy_load = (
+            str(getattr(load_format, "value", load_format)).lower() == "dummy"
+        )
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.ep_rank = get_ep_group().rank_in_group if self.use_ep else 0
@@ -537,9 +573,10 @@ class MuseSparkForCausalLM(nn.Module):
         expert_tp = 1 if self.use_ep else self.tp_size
         if self.use_ep and config.num_local_experts % self.ep_size:
             raise ValueError("Muse expert count must be divisible by EP")
+        # NVFP4 block scales cover 16 values along K, and the down projection
+        # contracts over the TP-sliced intermediate dimension.
         if quant == "modelopt_fp4" and config.moe_intermediate_size % (16 * expert_tp):
             raise ValueError("Muse NVFP4 TP partitions must align to 16-value blocks")
-        torch.set_float32_matmul_precision("highest")
         model_prefix = (
             f"{prefix}.model.language_model" if prefix else "model.language_model"
         )
@@ -550,13 +587,15 @@ class MuseSparkForCausalLM(nn.Module):
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            params_dtype=torch.bfloat16,
             prefix=f"{prefix}.lm_head" if prefix else "lm_head",
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
-        self.logits_processor.head_dtype = cast(torch.Tensor, self.lm_head.weight).dtype
         self.multiplier = config.output_multiplier
-        self.soft_cap = config.final_logit_softcapping
+        self.soft_cap = (
+            None
+            if config.final_logit_softcapping is None
+            else MulTanhSoftCap(self.multiplier, config.final_logit_softcapping)
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.language_model.embed_input_ids(input_ids)
@@ -579,163 +618,33 @@ class MuseSparkForCausalLM(nn.Module):
         )
         if logits is None:
             return None
-        logits = logits.float() * self.multiplier
         if self.soft_cap is not None:
-            logits = self.soft_cap * torch.tanh(logits / self.soft_cap)
-        return logits
+            return self.soft_cap(logits)
+        return logits.float() * self.multiplier
+
+    def process_weights_after_loading(self) -> None:
+        if not self._dummy_load:
+            return
+        experts = (m for m in self.modules() if isinstance(m, MuseRoutedExperts))
+        for layer, module in enumerate(experts):
+            module.initialize_dummy_quantized_weights(
+                1234 + 104729 * (layer * self.ep_size + self.ep_rank) + self.tp_rank
+            )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params = {
-            name: param
-            for name, param in self.named_parameters()
-            if name.startswith(("model.language_model.", "lm_head."))
-        }
-        buffers = dict(self.named_buffers())
-        pending: dict[str, dict[str, torch.Tensor]] = {}
-        loaded: set[str] = set()
-        qkv_parts: dict[str, set[str]] = {}
-        seen: set[str] = set()
-        for name, tensor in weights:
-            if name.startswith(
-                (
-                    "model.vision_tower.",
-                    "model.vision_adapter.",
-                    "model.vision_projection.",
-                    "model.audio_tower.",
-                )
-            ):
-                continue
-            if name in seen:
-                raise ValueError(f"Duplicate Muse checkpoint tensor: {name}")
-            seen.add(name)
-            if ".experts." in name and name.rsplit(".", 1)[-1].startswith(
-                ("gate_up_proj", "down_proj")
-            ):
-                module_name, suffix = name.rsplit(".", 1)
-                if suffix in ("gate_up_proj_input_scale", "down_proj_input_scale"):
-                    continue  # BF16 activations do not consume NVFP4 activation scales.
-                local = (
-                    expert_ep_slice(tensor, self.ep_rank, self.ep_size)
-                    if self.use_ep
-                    else expert_tp_slice(tensor, suffix, self.tp_rank, self.tp_size)
-                )
-                if (
-                    suffix in ("gate_up_proj", "down_proj")
-                    and tensor.dtype == torch.bfloat16
+        def bf16_dense(weights: Iterable[tuple[str, torch.Tensor]]):
+            for name, tensor in weights:
+                if ".experts." not in name and (
+                    name.endswith(("_scale", "_scale_2")) or tensor.dtype == torch.uint8
                 ):
-                    local = local.transpose(1, 2).contiguous()
-                    if tuple(local.shape) != tuple(params[name].shape):
-                        raise ValueError(f"Muse expert shape mismatch: {name}")
-                    params[name].data.copy_(local)
-                    loaded.add(name)
-                    continue
-                group = pending.setdefault(module_name, {})
-                group[suffix] = local
-                for weight_name in ("gate_up_proj", "down_proj"):
-                    components = (
-                        weight_name,
-                        weight_name + "_weight_scale",
-                        weight_name + "_weight_scale_2",
-                    )
-                    if all(k in group for k in components):
-                        full_name = module_name + "." + weight_name
-                        if params[full_name].dtype == torch.uint8:
-                            # Transpose to K-major on CPU once, before device transfer.
-                            packed = group[weight_name].transpose(1, 2).contiguous()
-                            block_scale = group[weight_name + "_weight_scale"]
-                            if block_scale.dtype != torch.float8_e4m3fn:
-                                raise ValueError(
-                                    f"Muse NVFP4 block scales must be E4M3: {full_name}"
-                                )
-                            scales = (
-                                block_scale.view(torch.uint8)
-                                .transpose(1, 2)
-                                .contiguous()
-                            )
-                            global_scale = expand_global_scale(
-                                group[weight_name + "_weight_scale_2"],
-                                packed.shape[-1],
-                            )
-                            scale_name = full_name + "_weight_scale"
-                            global_name = full_name + "_weight_scale_2"
-                            if (
-                                packed.shape != params[full_name].shape
-                                or scales.shape != params[scale_name].shape
-                                or global_scale.shape != params[global_name].shape
-                            ):
-                                raise ValueError(
-                                    f"Muse packed expert shape mismatch: {full_name}"
-                                )
-                            params[full_name].data.copy_(packed)
-                            params[scale_name].data.copy_(scales)
-                            params[global_name].data.copy_(global_scale)
-                            loaded.update((full_name, scale_name, global_name))
-                            for key in components:
-                                del group[key]
-                            continue
-                        decoded = decode_expert_weight(group, weight_name)
-                        if tuple(decoded.shape) != tuple(params[full_name].shape):
-                            raise ValueError(f"Muse expert shape mismatch: {full_name}")
-                        params[full_name].data.copy_(decoded)
-                        loaded.add(full_name)
-                        if self.tp_rank == 0 and weight_name == "down_proj":
-                            logger.info("Decoded Muse NVFP4 experts: %s", module_name)
-                        for key in components:
-                            del group[key]
-                        del decoded
-                if not group:
-                    del pending[module_name]
-                continue
-            mapped = name
-            shard = None
-            for projection, shard_id in (
-                ("q_proj", "q"),
-                ("k_proj", "k"),
-                ("v_proj", "v"),
-            ):
-                if f".self_attn.{projection}." in name:
-                    mapped = name.replace(f".{projection}.", ".qkv_proj.")
-                    shard = shard_id
-                    break
-            param = params.get(mapped, buffers.get(mapped))
-            if param is None:
-                raise ValueError(f"Unexpected Muse text tensor: {name}")
-            loader = getattr(param, "weight_loader", None)
-            if shard is not None:
-                assert loader is not None
-                loader(param, tensor, shard)
-                qkv_parts.setdefault(mapped, set()).add(shard)
-                if qkv_parts[mapped] == {"q", "k", "v"}:
-                    loaded.add(mapped)
-            elif loader is not None:
-                loader(param, tensor)
-                loaded.add(mapped)
-            else:
-                if tuple(param.shape) != tuple(tensor.shape):
                     raise ValueError(
-                        f"Muse weight shape mismatch: {name}: "
-                        f"{tensor.shape} != {param.shape}"
+                        f"Muse TPU runs dense projections in BF16, but {name} is "
+                        "quantized; list the module in the checkpoint's "
+                        "modules_to_not_convert and store it in BF16"
                     )
-                param.data.copy_(tensor)
-                loaded.add(mapped)
-        required = set(params) | {
-            n for n in buffers if n.endswith(".gate.e_score_correction_bias")
-        }
-        missing = required - loaded
-        if pending or missing:
-            raise ValueError(
-                f"Incomplete Muse checkpoint: missing={sorted(missing)}, "
-                f"unmatched expert components={list(pending)}"
-            )
-        logger.info(
-            "Loaded %d Muse text tensors on TP rank %d/%d, EP rank %d/%d; "
-            "experts use %s, "
-            "compute is BF16",
-            len(loaded),
-            self.tp_rank,
-            self.tp_size,
-            self.ep_rank,
-            self.ep_size,
-            "EP" if self.use_ep else "TP",
+                yield name, tensor
+
+        loader = AutoWeightsLoader(
+            self, ignore_unexpected_prefixes=list(self.ignored_weight_prefixes)
         )
-        return loaded
+        return loader.load_weights(bf16_dense(weights), mapper=self.hf_to_vllm_mapper)

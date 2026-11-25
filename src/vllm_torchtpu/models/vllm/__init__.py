@@ -65,11 +65,10 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen2ForCausalLM"] = _TPUQwen2Config
 
-    for architecture, module in (
-        ("MuseSparkForCausalLM", "model"),
-        ("MuseSparkForConditionalGeneration", "multimodal"),
-    ):
+    # The released checkpoints declare MuseSparkForConditionalGeneration; TPU
+    # serves their text model.
+    for architecture in ("MuseSparkForCausalLM", "MuseSparkForConditionalGeneration"):
         ModelRegistry.register_model(
             architecture,
-            f"vllm_torchtpu.models.vllm.muse_spark.{module}:{architecture}",
+            "vllm_torchtpu.models.vllm.muse_spark.model:MuseSparkForCausalLM",
         )

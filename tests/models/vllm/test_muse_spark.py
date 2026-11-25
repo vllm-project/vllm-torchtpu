@@ -20,20 +20,69 @@ import pytest
 import torch
 from torch import nn
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.models.muse_spark.common.layers import (
+    MulTanhSoftCap,
+    MuseSpark1xNormPreservingResidualConnection,
+)
 from vllm.transformers_utils.configs.muse_spark import MuseSparkTextConfig
 
 from vllm_torchtpu.models.vllm.muse_spark.layers import (
-    MuseResidual,
-    MuseRMSNorm,
+    MuseRMSNormWithInputScale,
     attention_layout,
     selected_expert_outputs,
 )
-from vllm_torchtpu.models.vllm.muse_spark.weights import (
-    decode_expert_weight,
-    dequantize_nvfp4,
-    expand_global_scale,
-    expert_tp_slice,
-)
+from vllm_torchtpu.models.vllm.muse_spark.weights import dequantize_nvfp4
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _cpu_platform_without_tpu_device():
+    """CPU CI registers no TPU device type with PyTorch, so there the vLLM
+    configs and the Gloo groups from `dist_ctx` must use the CPU device.
+
+    Module-scoped and autouse so it is in place before `dist_ctx`; TPU hosts
+    keep the real platform for the TPU-marked tests.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        try:
+            torch.device("tpu")
+        except RuntimeError:
+            from vllm.platforms import current_platform
+
+            patch.setattr(current_platform, "device_name", "cpu")
+            patch.setattr(current_platform, "device_type", "cpu")
+        yield
+
+
+def decode_expert_weight(parts: dict[str, torch.Tensor], name: str) -> torch.Tensor:
+    """Return BF16 [E, K, N], decoding one expert at a time to bound CPU memory."""
+    packed = parts[name]
+    out_shape = (packed.shape[0], packed.shape[-1] * 2, packed.shape[1])
+    result = torch.empty(out_shape, dtype=torch.bfloat16, device="cpu")
+    scales = parts[name + "_weight_scale"]
+    globals_ = parts[name + "_weight_scale_2"]
+    for e in range(packed.shape[0]):
+        if name == "gate_up_proj":
+            if globals_.shape != (packed.shape[0], 2):
+                raise ValueError(
+                    "Muse gate/up require separate per-expert global scales"
+                )
+            gate, up = packed[e].chunk(2, dim=0)
+            sg, su = scales[e].chunk(2, dim=0)
+            decoded = torch.cat(
+                (
+                    dequantize_nvfp4(gate, sg, globals_[e, 0]),
+                    dequantize_nvfp4(up, su, globals_[e, 1]),
+                ),
+                dim=0,
+            )
+        else:
+            if globals_.shape != (packed.shape[0],):
+                raise ValueError(
+                    "Muse down projection requires one global scale per expert"
+                )
+            decoded = dequantize_nvfp4(packed[e], scales[e], globals_[e])
+        result[e].copy_(decoded.t())
+    return result
 
 
 def test_packed_expert_execution_matches_bf16_decoder_with_repeated_routes():
@@ -41,10 +90,7 @@ def test_packed_expert_execution_matches_bf16_decoder_with_repeated_routes():
         selected_packed_expert_outputs,
     )
 
-    parts = {
-        name: expert_tp_slice(value, name, 1, 2)
-        for name, value in _packed_experts().items()
-    }
+    parts = _tp_shard(_packed_experts(), 1, 2)
     x = torch.randn(4, 32, generator=torch.Generator().manual_seed(9)).bfloat16()
     x[-1].zero_()
     ids = torch.tensor([[0, 1], [1, 1], [1, 0], [0, 1]])
@@ -68,62 +114,161 @@ def test_packed_expert_execution_matches_bf16_decoder_with_repeated_routes():
     assert actual[-1].count_nonzero() == 0
 
 
-def test_packed_loader_keeps_e4m3_bytes_and_separate_global_scales():
-    model = _loader_target()
-    expert = model.model.language_model.layers[0].mlp.experts
-    parts = _packed_experts()
-    local = {name: expert_tp_slice(value, name, 1, 2) for name, value in parts.items()}
-    for name in ("gate_up_proj", "down_proj"):
-        setattr(
-            expert,
-            name,
-            nn.Parameter(
-                torch.empty_like(local[name].transpose(1, 2)), requires_grad=False
-            ),
-        )
-        setattr(
-            expert,
-            name + "_weight_scale",
-            nn.Parameter(
-                torch.empty_like(
-                    local[name + "_weight_scale"].transpose(1, 2), dtype=torch.uint8
-                ),
-                requires_grad=False,
-            ),
-        )
-        setattr(
-            expert,
-            name + "_weight_scale_2",
-            nn.Parameter(
-                torch.empty(local[name].shape[0], 1, local[name].shape[1]),
-                requires_grad=False,
-            ),
-        )
-    prefix = "model.language_model.layers.0.mlp.experts."
-    loaded = model.load_weights(
-        [(prefix + name, value) for name, value in reversed(list(parts.items()))]
-    )
-    assert len(loaded) == 6
-    for name in ("gate_up_proj", "down_proj"):
-        torch.testing.assert_close(
-            getattr(expert, name), local[name].transpose(1, 2), rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            getattr(expert, name + "_weight_scale"),
-            local[name + "_weight_scale"].view(torch.uint8).transpose(1, 2),
-            rtol=0,
-            atol=0,
+def _tp_shard(parts, rank, tp):
+    """One TP rank's slice of stacked experts, as the reference for the loader:
+    this rank's gate and up rows, and this rank's down-projection columns."""
+    shard = {}
+    for name, value in parts.items():
+        if name.endswith(("_scale_2", "_input_scale")):
+            shard[name] = value
+        elif name.startswith("gate_up_proj"):
+            gate, up = value.chunk(2, dim=1)
+            width = gate.shape[1] // tp
+            rows = slice(rank * width, (rank + 1) * width)
+            shard[name] = torch.cat((gate[:, rows], up[:, rows]), dim=1)
+        else:
+            width = value.shape[-1] // tp
+            shard[name] = value[..., rank * width : (rank + 1) * width]
+    return shard
+
+
+def _make_experts(
+    num_experts, hidden, intermediate, *, packed, tp=1, tp_rank=0, ep=1, ep_rank=0
+):
+    """CPU MuseRoutedExperts holding one TP or EP rank's experts."""
+    with torch.inference_mode(False):
+        return _build_experts(
+            num_experts, hidden, intermediate, packed, tp, tp_rank, ep, ep_rank
         )
 
+
+def _build_experts(num_experts, hidden, intermediate, packed, tp, tp_rank, ep, ep_rank):
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        MoEActivation,
+        RoutingMethodType,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+        ExpertMapManager,
+    )
+
+    from vllm_torchtpu.layers.adapter.quantization.nvfp4 import VllmNvfp4Config
+    from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+        VllmUnquantizedConfig,
+    )
+    from vllm_torchtpu.models.vllm.muse_spark.model import MuseRoutedExperts
+
+    parallel = FusedMoEParallelConfig(
+        tp_size=tp,
+        pcp_size=1,
+        dp_size=1,
+        ep_size=ep,
+        tp_rank=tp_rank,
+        pcp_rank=0,
+        dp_rank=0,
+        ep_rank=ep_rank,
+        sp_size=1,
+        use_ep=ep > 1,
+        all2all_backend="allgather_reducescatter",
+        enable_eplb=False,
+    )
+    config = FusedMoEConfig(
+        num_experts=num_experts,
+        experts_per_token=2,
+        hidden_dim=hidden,
+        intermediate_size=intermediate,
+        num_local_experts=num_experts // ep,
+        num_logical_experts=num_experts,
+        activation=MoEActivation.SILU,
+        device=torch.device("cpu"),
+        routing_method=RoutingMethodType.Renormalize,
+        moe_parallel_config=parallel,
+        in_dtype=torch.bfloat16,
+    )
+    expert_map = ExpertMapManager(
+        max_num_batched_tokens=16,
+        top_k=2,
+        global_num_experts=num_experts,
+        num_redundant_experts=0,
+        num_expert_group=None,
+        moe_parallel_config=parallel,
+        placement_strategy="linear",
+        enable_eplb=False,
+    )
+    quant = (
+        VllmNvfp4Config.from_config(
+            {"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16}
+        )
+        if packed
+        else VllmUnquantizedConfig()
+    )
+    quant.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_expert_parallel=ep > 1),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace()),
+    )
+    with set_current_vllm_config(VllmConfig()):
+        experts = MuseRoutedExperts(
+            layer_name="model.language_model.layers.0.mlp.experts",
+            params_dtype=torch.bfloat16,
+            moe_config=config,
+            quant_config=quant,
+            expert_map_manager=expert_map,
+        )
+    return experts
+
+
+def _prepare(experts, parts):
+    """Load stacked checkpoint tensors. BF16 experts are laid out for the
+    kernel here; the NVFP4 layout needs a TPU (see ``_lay_out_on_tpu``), so on
+    CPU NVFP4 experts keep the checkpoint layout the reference path reads."""
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    loaded = experts.load_weights(list(parts.items()))
+    if experts.w13_weight.dtype != torch.uint8:
+        experts.quant_method.process_weights_after_loading(experts)
+    else:
+        # The layout step also records this rank's first expert id.
+        moe_routing.register_experts_start_buffer(
+            experts, device=experts.w13_weight.device
+        )
+    return loaded
+
+
+def _lay_out_on_tpu(experts):
+    """Move loaded experts to TPU, where the NVFP4 MoE method lays them out."""
+    experts.to("tpu")
+    if experts.w13_weight.dtype == torch.uint8:
+        experts.quant_method.process_weights_after_loading(experts)
+
+
+def test_shared_loader_keeps_each_tp_ranks_checkpoint_bytes(dist_ctx):
+    parts = _packed_experts()
+    local = _tp_shard(parts, 1, 2)
+    experts = _make_experts(2, 32, 64, packed=True, tp=2, tp_rank=1)
+    loaded = _prepare(experts, dict(reversed(list(parts.items()))))
+    assert len(loaded) == 6
+    for name, prefix in (("gate_up_proj", "w13"), ("down_proj", "w2")):
         torch.testing.assert_close(
-            getattr(expert, name + "_weight_scale_2"),
-            expand_global_scale(local[name + "_weight_scale_2"], local[name].shape[1]),
+            getattr(experts, f"{prefix}_weight"), local[name], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            getattr(experts, f"{prefix}_weight_scale").view(torch.uint8),
+            local[name + "_weight_scale"].view(torch.uint8),
             rtol=0,
             atol=0,
         )
-    gate, up = expert.gate_up_proj_weight_scale_2.chunk(2, dim=-1)
-    assert (gate == local["gate_up_proj_weight_scale_2"][:, None, :1]).all()
-    assert (up == local["gate_up_proj_weight_scale_2"][:, None, 1:]).all()
+    # Gate and up keep their own per-expert global scales.
+    torch.testing.assert_close(
+        experts.w13_weight_scale_2,
+        local["gate_up_proj_weight_scale_2"],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        experts.w2_weight_scale_2, local["down_proj_weight_scale_2"], rtol=0, atol=0
+    )
 
 
 def test_config_preserves_text_numerics_and_roundtrips():
@@ -154,9 +299,7 @@ def test_config_preserves_text_numerics_and_roundtrips():
 def test_gain_center_and_weight_placement():
     weight_first, center = True, 1.0
     x = torch.tensor([[0.25, -1.5, 4.0, 2.0]], dtype=torch.bfloat16)
-    norm = MuseRMSNorm(
-        4, 1e-5, zero_centered=True, center=center, weight_first=weight_first
-    )
+    norm = MuseRMSNormWithInputScale(4, 1e-5, zero_centered=True)
     norm.weight.data.copy_(torch.tensor([0.5, 2.0, -0.25, 1.25]))
     w = norm.weight.float() + center
     values = x.float() * w if weight_first else x.float()
@@ -169,7 +312,7 @@ def test_gain_center_and_weight_placement():
 
 
 def test_residual_gate_preserves_fp32_stream():
-    residual = MuseResidual(4, 0.3)
+    residual = MuseSpark1xNormPreservingResidualConnection(4, temperature=0.3)
     residual.gate.data.copy_(torch.tensor([-1.0, 0.0, 0.3, 1.0]))
     stream = torch.tensor([[1.001, 2.003, -3.001, 4.002]])
     branch = torch.tensor([[0.5, 1.0, 2.0, 3.0]], dtype=torch.bfloat16)
@@ -191,12 +334,13 @@ def test_router_bias_affects_selection_but_not_contribution():
             )
             self.routed_scaling_factor = 1.7
             self.use_grouped_topk = False
-
-        def forward(self, x):
-            return torch.tensor([[2.0, -2.0, 1.0, 0.0]]), None
+            # [in, out], as the TPU dense loader stores it; row 0 holds the logits.
+            self.weight = nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+            self.weight.data[0] = torch.tensor([2.0, -2.0, 1.0, 0.0])
 
     moe = SimpleNamespace(gate=Gate(), multiplier=0.5, top_k=2)
-    weights, ids = MuseMoE.route(moe, torch.zeros(1, 4, dtype=torch.bfloat16))
+    x = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.bfloat16)
+    weights, ids = MuseMoE.route(moe, x)
     assert ids.tolist() == [[1, 2]]
     assert weights.dtype == torch.float32
     scores = [1 / (1 + math.exp(1)), 1 / (1 + math.exp(-0.5))]
@@ -237,23 +381,6 @@ def _packed_experts():
     }
 
 
-def test_nvfp4_shard_before_decode_matches_full_decode():
-    tp = 2
-    parts = _packed_experts()
-    full13 = decode_expert_weight(parts, "gate_up_proj")
-    full2 = decode_expert_weight(parts, "down_proj")
-    shards = [
-        {k: expert_tp_slice(v, k, rank, tp) for k, v in parts.items()}
-        for rank in range(tp)
-    ]
-    local13 = [decode_expert_weight(s, "gate_up_proj") for s in shards]
-    local2 = [decode_expert_weight(s, "down_proj") for s in shards]
-    gate = torch.cat([s.chunk(2, -1)[0] for s in local13], dim=-1)
-    up = torch.cat([s.chunk(2, -1)[1] for s in local13], dim=-1)
-    torch.testing.assert_close(torch.cat((gate, up), dim=-1), full13, rtol=0, atol=0)
-    torch.testing.assert_close(torch.cat(local2, dim=1), full2, rtol=0, atol=0)
-
-
 def test_native_nope_and_window_alignment():
     config = SimpleNamespace(
         layer_rope_theta=[0 if i % 4 == 1 else 500000 for i in range(62)],
@@ -267,7 +394,7 @@ def test_native_nope_and_window_alignment():
         assert (rope, window) == ((False, None) if i % 4 == 1 else (True, 2048))
 
 
-def test_rope_matches_complex_rotation_across_window_boundary():
+def test_rope_matches_complex_rotation_across_window_boundary(vllm_config_context):
     generator = torch.Generator().manual_seed(7)
     x = torch.randn(3, 2, 64, generator=generator, dtype=torch.bfloat16)
     positions = torch.tensor([2047, 2048, 2049])
@@ -290,31 +417,22 @@ def test_rope_matches_complex_rotation_across_window_boundary():
     torch.testing.assert_close(k.bfloat16(), expected, rtol=0, atol=0)
 
 
-def _loader_target():
+def _causal_lm():
     from vllm_torchtpu.models.vllm.muse_spark.model import MuseSparkForCausalLM
 
     model = MuseSparkForCausalLM.__new__(MuseSparkForCausalLM)
     nn.Module.__init__(model)
-    model.tp_rank, model.tp_size = 1, 2
-    model.ep_rank, model.ep_size = 0, 1
-    model.use_ep = False
+    return model
+
+
+def test_model_loader_routes_experts_and_ignores_modality_tensors(dist_ctx):
+    model = _causal_lm()
     model.model = nn.Module()
     model.model.language_model = nn.Module()
     layer = nn.Module()
     layer.mlp = nn.Module()
-    layer.mlp.experts = nn.Module()
-    layer.mlp.experts.gate_up_proj = nn.Parameter(
-        torch.empty(2, 32, 64, dtype=torch.bfloat16)
-    )
-    layer.mlp.experts.down_proj = nn.Parameter(
-        torch.empty(2, 32, 32, dtype=torch.bfloat16)
-    )
+    layer.mlp.experts = _make_experts(2, 32, 64, packed=True, tp=2, tp_rank=1)
     model.model.language_model.layers = nn.ModuleList([layer])
-    return model
-
-
-def test_loader_accepts_reordered_quant_components_and_ignores_activation_scales():
-    model = _loader_target()
     prefix = "model.language_model.layers.0.mlp.experts."
     parts = _packed_experts()
     weights = [(prefix + k, parts[k]) for k in reversed(list(parts))]
@@ -323,45 +441,34 @@ def test_loader_accepts_reordered_quant_components_and_ignores_activation_scales
         ("model.vision_tower.unused.weight", torch.ones(1)),
     ]
     loaded = model.load_weights(weights)
-    assert loaded == {prefix + "gate_up_proj", prefix + "down_proj"}
-    local = {k: expert_tp_slice(v, k, 1, 2) for k, v in parts.items()}
+    names = ("weight", "weight_scale", "weight_scale_2")
+    assert loaded == {prefix + f"{p}_{n}" for p in ("w13", "w2") for n in names} | {
+        prefix + "w13_input_scale"
+    }
     torch.testing.assert_close(
-        model.model.language_model.layers[0].mlp.experts.gate_up_proj,
-        decode_expert_weight(local, "gate_up_proj"),
+        layer.mlp.experts.w13_weight,
+        _tp_shard(parts, 1, 2)["gate_up_proj"],
         rtol=0,
         atol=0,
     )
 
 
-def test_bf16_loader_shards_gate_up_and_down_without_quantization():
+def test_bf16_loader_shards_gate_up_and_down_without_quantization(dist_ctx):
     tp, rank = 32, 17
-    model = _loader_target()
-    model.tp_size, model.tp_rank = tp, rank
-    expert = model.model.language_model.layers[0].mlp.experts
-    width = 64 // tp
-    expert.gate_up_proj = nn.Parameter(
-        torch.empty(2, 32, 2 * width, dtype=torch.bfloat16)
-    )
-    expert.down_proj = nn.Parameter(torch.empty(2, width, 32, dtype=torch.bfloat16))
-    prefix = "model.language_model.layers.0.mlp.experts."
+    experts = _make_experts(2, 32, 64, packed=False, tp=tp, tp_rank=rank)
     w13 = torch.arange(2 * 128 * 32).reshape(2, 128, 32).bfloat16()
     w2 = -torch.arange(2 * 32 * 64).reshape(2, 32, 64).bfloat16()
-    loaded = model.load_weights(
-        [(prefix + "down_proj", w2), (prefix + "gate_up_proj", w13)]
-    )
-    assert loaded == {prefix + "gate_up_proj", prefix + "down_proj"}
-    start, end = rank * width, (rank + 1) * width
-    expected13 = torch.cat(
-        (w13[:, start:end], w13[:, 64 + start : 64 + end]), 1
-    ).transpose(1, 2)
-    torch.testing.assert_close(expert.gate_up_proj, expected13, rtol=0, atol=0)
+    loaded = experts.load_weights([("down_proj", w2), ("gate_up_proj", w13)])
+    assert loaded == {"w13_weight", "w2_weight"}
+    local = _tp_shard({"gate_up_proj": w13, "down_proj": w2}, rank, tp)
     torch.testing.assert_close(
-        expert.down_proj, w2[..., start:end].transpose(1, 2), rtol=0, atol=0
+        experts.w13_weight, local["gate_up_proj"], rtol=0, atol=0
     )
+    torch.testing.assert_close(experts.w2_weight, local["down_proj"], rtol=0, atol=0)
 
 
 def test_logits_apply_fp32_multiplier_and_soft_cap():
-    model = _loader_target()
+    model = _causal_lm()
     model.lm_head = nn.Linear(3, 4, bias=False, dtype=torch.bfloat16)
     model.lm_head.weight.data.copy_(
         torch.tensor(
@@ -375,7 +482,7 @@ def test_logits_apply_fp32_multiplier_and_soft_cap():
     )
     model.logits_processor = lambda head, hidden: head(hidden)
     model.multiplier = 1 / math.sqrt(32)
-    model.soft_cap = 20.0
+    model.soft_cap = MulTanhSoftCap(model.multiplier, 20.0)
     hidden = torch.tensor([[1.0, -2.0, 3.0]], dtype=torch.bfloat16)
     actual = model.compute_logits(hidden)
     expected = 20 * torch.tanh(
@@ -386,12 +493,20 @@ def test_logits_apply_fp32_multiplier_and_soft_cap():
 
 
 @torch.no_grad()
-def test_latent_projections_shard_and_preserve_full_vector(monkeypatch):
+def test_latent_projections_shard_and_preserve_full_vector(
+    vllm_config_context, monkeypatch
+):
     import vllm.model_executor.layers.linear as linear
     import vllm.model_executor.parameter as parameter
 
     from vllm_torchtpu.models.vllm.muse_spark import model
 
+    # The routed experts are not under test here.
+    monkeypatch.setattr(
+        model,
+        "FusedMoEFactory",
+        lambda **_: SimpleNamespace(routed_experts=nn.Module()),
+    )
     rank, tp = 0, 8
     for module in (linear, parameter, model):
         if hasattr(module, "get_tensor_model_parallel_rank"):
@@ -442,25 +557,26 @@ def test_latent_projections_shard_and_preserve_full_vector(monkeypatch):
         expected_norm = moe.pre_expert_norm(pooled)
         torch.testing.assert_close(moe.pre_expert_norm(actual), expected_norm)
         expected = expected_norm @ unpool.T
+        out_start, out_end = rank * 64 // tp, (rank + 1) * 64 // tp
 
-        def reduce(
+        def gather_unpooled(
             partial,
-            start=start,
-            end=end,
+            out_start=out_start,
+            out_end=out_end,
             expected_norm=expected_norm,
             expected=expected,
         ):
             torch.testing.assert_close(
-                partial, expected_norm[:, start:end] @ unpool[:, start:end].T
+                partial, expected_norm @ unpool[out_start:out_end].T
             )
             return expected
 
-        monkeypatch.setattr(linear, "tensor_model_parallel_all_reduce", reduce)
+        monkeypatch.setattr(linear, "tensor_model_parallel_all_gather", gather_unpooled)
         output, _ = moe.post_expert_proj(expected_norm)
         torch.testing.assert_close(output, expected)
     torch.testing.assert_close(torch.cat(loaded_pool, dim=1), pool.T, rtol=0, atol=0)
     torch.testing.assert_close(
-        torch.cat(loaded_unpool, dim=0), unpool.T, rtol=0, atol=0
+        torch.cat(loaded_unpool, dim=1), unpool.T, rtol=0, atol=0
     )
 
 
@@ -513,8 +629,8 @@ def _tp8_rank_packed_weights(num_experts: int, hidden: int, intermediate: int):
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("use_ep", [False, True], ids=["tp", "ep"])
 @torch.inference_mode()
-def test_tpu_grouped_experts_match_packed_reference_decoder(monkeypatch, use_ep):
-    """Serving path (routed_expert_rows -> gmm_v2) against the checkpoint decoder."""
+def test_tpu_grouped_experts_match_packed_reference_decoder(dist_ctx, use_ep):
+    """Serving path (shared expert rows -> gmm_v2) against the checkpoint decoder."""
     from vllm_torchtpu.models.vllm.muse_spark import model
     from vllm_torchtpu.models.vllm.muse_spark.weights import (
         selected_packed_expert_outputs,
@@ -522,36 +638,19 @@ def test_tpu_grouped_experts_match_packed_reference_decoder(monkeypatch, use_ep)
 
     # Per-rank expert shapes of the NVFP4 checkpoint at TP8, with fewer experts.
     hidden, intermediate, num_experts, top_k = 4096, 512, 8, 4
-    ep_size, ep_rank = 2, 1
-    monkeypatch.setattr(model, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(
-        model,
-        "get_ep_group",
-        lambda: SimpleNamespace(world_size=ep_size, rank_in_group=ep_rank),
+    ep_size, ep_rank = (2, 1) if use_ep else (1, 0)
+    experts = _make_experts(
+        num_experts, hidden, intermediate, packed=True, ep=ep_size, ep_rank=ep_rank
     )
-    target = model.MuseSparkForCausalLM.__new__(model.MuseSparkForCausalLM)
-    nn.Module.__init__(target)
-    target.tp_rank, target.tp_size, target.use_ep = 0, 1, use_ep
-    target.ep_rank, target.ep_size = ep_rank, ep_size
-    target.model = nn.Module()
-    target.model.language_model = nn.Module()
-    layer = nn.Module()
-    layer.mlp = nn.Module()
-    experts = model.MuseExperts(
-        hidden, intermediate, num_experts, packed=True, use_ep=use_ep
-    )
-    layer.mlp.experts = experts
-    target.model.language_model.layers = nn.ModuleList([layer])
     parts = _tp8_rank_packed_weights(num_experts, hidden, intermediate)
-    prefix = "model.language_model.layers.0.mlp.experts."
-    loaded = target.load_weights((prefix + k, v) for k, v in parts.items())
-    assert len(loaded) == 6
+    assert len(_prepare(experts, parts)) == 6
 
     rng = torch.Generator().manual_seed(106)
     tokens = 37
     x = torch.randn(tokens, hidden, generator=rng).bfloat16()
     x[-1] = 0
-    ids = torch.rand(tokens, num_experts, generator=rng).argsort(-1)[:, :top_k]
+    ids = torch.rand(tokens, num_experts, generator=rng).argsort(-1)[:, :top_k].int()
+    weights = torch.rand(tokens, top_k, generator=rng) + 0.1
     expected = selected_packed_expert_outputs(
         x,
         ids,
@@ -566,17 +665,64 @@ def test_tpu_grouped_experts_match_packed_reference_decoder(monkeypatch, use_ep)
         owned = ids // (num_experts // ep_size) == ep_rank
         expected = expected.masked_fill(~owned[..., None], 0)
 
-    actual = experts.to("tpu")(x.to("tpu"), ids.to("tpu")).cpu()
+    _lay_out_on_tpu(experts)
+    actual = model._expert_rows(
+        experts, x.to("tpu"), weights.to("tpu"), ids.to("tpu")
+    ).cpu()
 
-    # Weights decode identically; only FP32 summation order changes BF16 rows.
+    # Each tile rounds its FP32 block scales and dequantized weights to BF16,
+    # and FP32 summation order changes BF16 rows.
+    torch.testing.assert_close(actual, expected, rtol=1.6e-2, atol=2**-5)
+    assert actual[-1].count_nonzero() == 0
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("use_ep", [False, True], ids=["tp", "ep"])
+@torch.inference_mode()
+def test_tpu_bf16_grouped_experts_match_reference(dist_ctx, use_ep):
+    """BF16 checkpoint experts (packed=False) through gmm_v2 rows mode."""
+    from vllm_torchtpu.models.vllm.muse_spark import model
+
+    hidden, intermediate, num_experts, top_k = 4096, 512, 8, 4
+    ep_size, ep_rank = (2, 1) if use_ep else (1, 0)
+    experts = _make_experts(
+        num_experts, hidden, intermediate, packed=False, ep=ep_size, ep_rank=ep_rank
+    )
+    parts = _tp8_rank_packed_weights(num_experts, hidden, intermediate)
+    w13 = decode_expert_weight(parts, "gate_up_proj")
+    w2 = decode_expert_weight(parts, "down_proj")
+    # The BF16 checkpoint stores each projection as [experts, out, in].
+    checkpoint = {
+        "gate_up_proj": w13.transpose(1, 2).contiguous(),
+        "down_proj": w2.transpose(1, 2).contiguous(),
+    }
+    assert _prepare(experts, checkpoint) == {"w13_weight", "w2_weight"}
+
+    rng = torch.Generator().manual_seed(107)
+    tokens = 37
+    x = torch.randn(tokens, hidden, generator=rng).bfloat16()
+    x[-1] = 0
+    ids = torch.rand(tokens, num_experts, generator=rng).argsort(-1)[:, :top_k].int()
+    weights = torch.rand(tokens, top_k, generator=rng) + 0.1
+    expected = selected_expert_outputs(x, ids, w13, w2)
+    if use_ep:
+        owned = ids // (num_experts // ep_size) == ep_rank
+        expected = expected.masked_fill(~owned[..., None], 0)
+
+    experts.to("tpu")
+    actual = model._expert_rows(
+        experts, x.to("tpu"), weights.to("tpu"), ids.to("tpu")
+    ).cpu()
+
     torch.testing.assert_close(actual, expected, rtol=1.6e-2, atol=2**-5)
     assert actual[-1].count_nonzero() == 0
 
 
 @pytest.mark.tpu_test
 @torch.inference_mode()
-def test_tpu_one_hot_ep_permute_keeps_non_finite_row_local(monkeypatch):
+def test_tpu_one_hot_ep_permute_keeps_non_finite_row_local(dist_ctx, monkeypatch):
     """A NaN row must not reach other tokens through the one-hot EP permute."""
+    from vllm_torchtpu.layers.adapter import fused_moe
     from vllm_torchtpu.models.vllm.muse_spark import model
     from vllm_torchtpu.models.vllm.muse_spark.weights import (
         selected_packed_expert_outputs,
@@ -584,36 +730,22 @@ def test_tpu_one_hot_ep_permute_keeps_non_finite_row_local(monkeypatch):
 
     monkeypatch.setenv("USE_MOE_SPARSE_CORE", "1")
     monkeypatch.setenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "4096")
+    # The shared op binds the permute settings when it is first built.
+    monkeypatch.setattr(fused_moe, "_fused_moe_kernel_cache", {})
     hidden, intermediate, num_experts, top_k = 4096, 512, 8, 4
     ep_size, ep_rank = 2, 1
-    monkeypatch.setattr(model, "get_tensor_model_parallel_world_size", lambda: 1)
-    monkeypatch.setattr(
-        model,
-        "get_ep_group",
-        lambda: SimpleNamespace(world_size=ep_size, rank_in_group=ep_rank),
+    experts = _make_experts(
+        num_experts, hidden, intermediate, packed=True, ep=ep_size, ep_rank=ep_rank
     )
-    target = model.MuseSparkForCausalLM.__new__(model.MuseSparkForCausalLM)
-    nn.Module.__init__(target)
-    target.tp_rank, target.tp_size, target.use_ep = 0, 1, True
-    target.ep_rank, target.ep_size = ep_rank, ep_size
-    target.model = nn.Module()
-    target.model.language_model = nn.Module()
-    layer = nn.Module()
-    layer.mlp = nn.Module()
-    experts = model.MuseExperts(
-        hidden, intermediate, num_experts, packed=True, use_ep=True
-    )
-    layer.mlp.experts = experts
-    target.model.language_model.layers = nn.ModuleList([layer])
     parts = _tp8_rank_packed_weights(num_experts, hidden, intermediate)
-    prefix = "model.language_model.layers.0.mlp.experts."
-    assert len(target.load_weights((prefix + k, v) for k, v in parts.items())) == 6
+    assert len(_prepare(experts, parts)) == 6
 
     rng = torch.Generator().manual_seed(107)
     tokens = 16
     x = torch.randn(tokens, hidden, generator=rng).bfloat16()
     x[-1] = float("nan")
-    ids = torch.rand(tokens, num_experts, generator=rng).argsort(-1)[:, :top_k]
+    ids = torch.rand(tokens, num_experts, generator=rng).argsort(-1)[:, :top_k].int()
+    weights = torch.rand(tokens, top_k, generator=rng) + 0.1
     clean = x.clone()
     clean[-1] = 0
     expected = selected_packed_expert_outputs(
@@ -629,7 +761,10 @@ def test_tpu_one_hot_ep_permute_keeps_non_finite_row_local(monkeypatch):
     owned = ids // (num_experts // ep_size) == ep_rank
     expected = expected.masked_fill(~owned[..., None], 0)
 
-    actual = experts.to("tpu")(x.to("tpu"), ids.to("tpu")).cpu()
+    _lay_out_on_tpu(experts)
+    actual = model._expert_rows(
+        experts, x.to("tpu"), weights.to("tpu"), ids.to("tpu")
+    ).cpu()
 
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=1.6e-2, atol=2**-5)
@@ -638,12 +773,10 @@ def test_tpu_one_hot_ep_permute_keeps_non_finite_row_local(monkeypatch):
 
 @pytest.mark.parametrize("packed", [False, True])
 @torch.inference_mode()
-def test_ep_loader_and_local_expert_outputs(monkeypatch, packed):
+def test_ep_loader_and_local_expert_outputs(dist_ctx, packed):
     from vllm_torchtpu.models.vllm.muse_spark import model
 
-    tp, dp = 4, 2
-    ep = tp * dp
-    monkeypatch.setattr(model, "get_tensor_model_parallel_world_size", lambda: tp)
+    ep = 8
     parts = _ep_packed_weights()
     full13 = decode_expert_weight(parts, "gate_up_proj")
     full2 = decode_expert_weight(parts, "down_proj")
@@ -658,43 +791,11 @@ def test_ep_loader_and_local_expert_outputs(monkeypatch, packed):
     )
     expected = selected_expert_outputs(x, ids, full13, full2)
     for rank in (0, ep // 2, ep - 1):
-        monkeypatch.setattr(
-            model, "get_tensor_model_parallel_rank", lambda rank=rank: rank % tp
-        )
-        monkeypatch.setattr(
-            model,
-            "get_ep_group",
-            lambda rank=rank: SimpleNamespace(world_size=ep, rank_in_group=rank),
-        )
-        target = model.MuseSparkForCausalLM.__new__(model.MuseSparkForCausalLM)
-        nn.Module.__init__(target)
-        target.tp_rank, target.tp_size, target.use_ep = rank % tp, tp, True
-        target.ep_rank, target.ep_size = rank, ep
-        target.model = nn.Module()
-        target.model.language_model = nn.Module()
-        layer = nn.Module()
-        layer.mlp = nn.Module()
-        experts = model.MuseExperts(32, 64, 32, packed=packed, use_ep=True)
-        if not packed:
-            experts.to(torch.bfloat16)
-        layer.mlp.experts = experts
-        target.model.language_model.layers = nn.ModuleList([layer])
-        prefix = "model.language_model.layers.0.mlp.experts."
-        loaded = target.load_weights(
-            (prefix + k, v) for k, v in reversed(list(parts.items()))
-        )
+        experts = _make_experts(32, 32, 64, packed=packed, ep=ep, ep_rank=rank)
+        loaded = _prepare(experts, dict(reversed(list(parts.items()))))
         assert len(loaded) == (6 if packed else 2)
         start, end = rank * (32 // ep), (rank + 1) * (32 // ep)
-        for name, value in parts.items():
-            want = value[start:end]
-            if name.endswith("_weight_scale"):
-                want = want.view(torch.uint8)
-            if name.endswith("_weight_scale_2"):
-                want = expand_global_scale(want, getattr(experts, name).shape[-1])
-            else:
-                want = want.transpose(1, 2)
-            torch.testing.assert_close(getattr(experts, name), want, rtol=0, atol=0)
-        actual = experts(x, ids)
+        actual = model._expert_rows(experts, x, torch.ones(ids.shape), ids)
         owned = (ids >= start) & (ids < end)
         torch.testing.assert_close(
             actual, expected.masked_fill(~owned[..., None], 0), rtol=0, atol=0
@@ -703,16 +804,10 @@ def test_ep_loader_and_local_expert_outputs(monkeypatch, packed):
 
 
 @torch.inference_mode()
-def test_ep_normalizes_each_expert_before_weighted_reduction(monkeypatch):
+def test_ep_normalizes_each_expert_before_weighted_reduction(dist_ctx, monkeypatch):
     from vllm_torchtpu.models.vllm.muse_spark import model
 
     ep = 8
-    monkeypatch.setattr(
-        "vllm.distributed.parallel_state._TP",
-        SimpleNamespace(world_size=ep, rank_in_group=0),
-    )
-    monkeypatch.setattr(model, "get_tensor_model_parallel_world_size", lambda: ep)
-    monkeypatch.setattr(model, "get_dp_group", lambda: SimpleNamespace(world_size=1))
     config = SimpleNamespace(
         hidden_size=32,
         moe_hidden_size=32,
@@ -729,32 +824,38 @@ def test_ep_normalizes_each_expert_before_weighted_reduction(monkeypatch):
     x[-1] = 0
     w13 = (torch.randn(32, 32, 128, generator=rng) * 0.1).bfloat16()
     w2 = (torch.randn(32, 64, 32, generator=rng) * 0.1).bfloat16()
+    stacked = {"gate_up_proj": w13.transpose(1, 2), "down_proj": w2.transpose(1, 2)}
+    rank_experts = []
+    for rank in range(ep):
+        experts = _make_experts(32, 32, 64, packed=False, ep=ep, ep_rank=rank)
+        _prepare(experts, stacked)
+        rank_experts.append(experts)
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state._TP",
+        SimpleNamespace(world_size=ep, rank_in_group=0),
+    )
+    monkeypatch.setattr(model, "get_tensor_model_parallel_world_size", lambda: ep)
+    monkeypatch.setattr(model, "get_dp_group", lambda: SimpleNamespace(world_size=1))
     # All routes belong to the first few ranks: others must reduce exact zero.
     bias = torch.arange(32, 0, -1).float()
-    for rank in range(ep):
-        monkeypatch.setattr(
-            model, "get_tensor_model_parallel_rank", lambda rank=rank: rank
-        )
+    for rank, experts in enumerate(rank_experts):
         monkeypatch.setattr(
             model,
-            "get_ep_group",
-            lambda rank=rank: SimpleNamespace(world_size=ep, rank_in_group=rank),
+            "FusedMoEFactory",
+            lambda experts=experts, **_: SimpleNamespace(routed_experts=experts),
         )
         moe = model.MuseMoE(config, "test", use_ep=True)
         moe.pre_expert_proj.forward = lambda x: (x, None)
         moe.post_expert_proj.forward = lambda x: (x, None)
         moe.pre_expert_norm = nn.Identity()
-        moe.experts.to(torch.bfloat16)
         moe.gate.weight.zero_()
         moe.gate.quant_method.process_weights_after_loading(moe.gate)
         moe.gate.e_score_correction_bias.copy_(bias)
-        moe.experts.post_expert_norm.weight.fill_(0.7)
+        moe.post_expert_norm.weight.fill_(0.7)
         count = 32 // ep
-        moe.experts.gate_up_proj.copy_(w13[rank * count : (rank + 1) * count])
-        moe.experts.down_proj.copy_(w2[rank * count : (rank + 1) * count])
         weights, ids = moe.route(x)
         rows = selected_expert_outputs(x, ids, w13, w2)
-        normalized = moe.experts.post_expert_norm(rows, out_dtype=torch.float32)
+        normalized = moe.post_expert_norm(rows, out_dtype=torch.float32)
         expected = (normalized * weights[..., None]).sum(1)
         owned = (ids >= rank * count) & (ids < (rank + 1) * count)
         local = (normalized.masked_fill(~owned[..., None], 0) * weights[..., None]).sum(
@@ -771,18 +872,24 @@ def test_ep_normalizes_each_expert_before_weighted_reduction(monkeypatch):
         monkeypatch.setattr(model, "tensor_model_parallel_all_reduce", reduce)
         torch.testing.assert_close(moe(x), expected.bfloat16(), rtol=0, atol=0)
         assert len(calls) == 1
-        wrong = moe.experts.post_expert_norm(
+        wrong = moe.post_expert_norm(
             (rows.float() * weights[..., None]).sum(1), out_dtype=torch.float32
         )
         assert not torch.allclose(wrong, expected, rtol=0.01, atol=0.01)
 
 
 @torch.inference_mode()
-def test_dp_attention_returns_only_local_tokens(monkeypatch):
+def test_dp_attention_returns_only_local_tokens(dist_ctx, monkeypatch):
     from vllm_torchtpu.models.vllm.muse_spark import model
 
     """Distinct DP inputs, an idle engine, and owners outside the local TP group."""
-    tp, dp, packed = 2, 4, True
+    tp, dp = 2, 4
+    rank_experts = [
+        _make_experts(32, 32, 64, packed=True, ep=tp * dp, ep_rank=rank)
+        for rank in range(tp * dp)
+    ]
+    for experts in rank_experts:
+        _prepare(experts, _ep_packed_weights())
     monkeypatch.setattr(
         "vllm.distributed.parallel_state._TP",
         SimpleNamespace(world_size=tp, rank_in_group=0),
@@ -816,35 +923,22 @@ def test_dp_attention_returns_only_local_tokens(monkeypatch):
         dp_rank, tp_rank = divmod(rank, tp)
         monkeypatch.setattr(
             model,
-            "get_ep_group",
-            lambda rank=rank: SimpleNamespace(world_size=ep, rank_in_group=rank),
+            "FusedMoEFactory",
+            lambda experts=rank_experts[rank], **_: SimpleNamespace(
+                routed_experts=experts
+            ),
         )
         group = SimpleNamespace(world_size=dp, rank_in_group=dp_rank)
         monkeypatch.setattr(model, "get_dp_group", lambda group=group: group)
-        moe = model.MuseMoE(config, "test", packed=packed, use_ep=True)
+        moe = model.MuseMoE(config, "test", use_ep=True)
         moe.pre_expert_proj.forward = lambda x: (x, None)
         moe.post_expert_proj.forward = lambda x: (x, None)
         moe.pre_expert_norm = nn.Identity()
         moe.gate.weight.copy_(router)
         moe.gate.quant_method.process_weights_after_loading(moe.gate)
-        moe.experts.post_expert_norm.weight.copy_(torch.linspace(0.2, 1.2, hidden))
-        if packed:
-            for name, value in parts.items():
-                value = value[rank * count : (rank + 1) * count]
-                target = getattr(moe.experts, name)
-                if name.endswith("_weight_scale"):
-                    value = value.view(torch.uint8)
-                if name.endswith("_weight_scale_2"):
-                    value = expand_global_scale(value, target.shape[-1])
-                else:
-                    value = value.transpose(1, 2)
-                target.copy_(value)
-        else:
-            moe.experts.to(torch.bfloat16)
-            moe.experts.gate_up_proj.copy_(w13[rank * count : (rank + 1) * count])
-            moe.experts.down_proj.copy_(w2[rank * count : (rank + 1) * count])
+        moe.post_expert_norm.weight.copy_(torch.linspace(0.2, 1.2, hidden))
         weights, ids = moe.route(x)
-        rows = moe.experts.post_expert_norm(
+        rows = moe.post_expert_norm(
             selected_expert_outputs(x, ids, w13, w2), out_dtype=torch.float32
         )
         contributions = rows * weights[..., None]
@@ -883,3 +977,373 @@ def test_dp_attention_returns_only_local_tokens(monkeypatch):
         assert calls == ["gather"] * 3 + ["scatter"] + (["reduce"] if tp > 1 else [])
         if dp_rank == dp - 1:
             assert actual.count_nonzero() == 0
+
+
+class _ReferenceAttention(nn.Module):
+    """Causal single-sequence GQA attention standing in for the paged backend."""
+
+    def __init__(self, num_heads, head_size, scale, num_kv_heads, **kwargs):
+        super().__init__()
+        self.num_heads, self.head_size, self.scale = num_heads, head_size, scale
+        self.num_kv_heads = num_kv_heads
+        self.window = kwargs.get("per_layer_sliding_window")
+        self.widths = []
+
+    def forward(self, q, k, v):
+        self.widths.append((q.shape[-1], k.shape[-1], v.shape[-1]))
+        tokens = q.shape[0]
+        q = q.reshape(tokens, self.num_heads, self.head_size).float()
+        k = k.reshape(tokens, self.num_kv_heads, self.head_size).float()
+        v = v.reshape(tokens, self.num_kv_heads, self.head_size).float()
+        groups = self.num_heads // self.num_kv_heads
+        k, v = k.repeat_interleave(groups, 1), v.repeat_interleave(groups, 1)
+        scores = torch.einsum("qhd,khd->hqk", q, k) * self.scale
+        position = torch.arange(tokens)
+        mask = position[None, :] <= position[:, None]
+        if self.window is not None:
+            mask &= position[:, None] - position[None, :] < self.window
+        scores = scores.masked_fill(~mask, float("-inf"))
+        out = torch.einsum("hqk,khd->qhd", scores.softmax(-1), v)
+        return out.reshape(tokens, -1).to(torch.bfloat16)
+
+
+def _text_config(**overrides):
+    values = dict(
+        vocab_size=48,
+        hidden_size=64,
+        head_dim=64,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        rms_norm_eps=1e-5,
+        post_norm_eps=1e-8,
+        layer_rope_theta=[500000.0, 0.0],
+        layer_types=["sliding_attention", "full_attention"],
+        mlp_layer_types=["sparse", "sparse"],
+        sliding_window=4,
+        qk_scale_factor=1.5,
+        rope_parameters={"rope_type": "default", "rope_theta": 500000.0},
+        num_experts_per_tok=2,
+        num_local_experts=4,
+        moe_hidden_size=32,
+        moe_intermediate_size=32,
+        output_multiplier=0.25,
+        routed_scaling_factor=1.0,
+        residual_gate_temperature=0.3,
+        tie_word_embeddings=False,
+        final_logit_softcapping=30.0,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _text_vllm_config(config, parallel=None, **model):
+    from vllm.config.compilation import CompilationMode
+
+    parallel_config = dict(
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        enable_eplb=False,
+        enable_expert_parallel=False,
+        data_parallel_size=1,
+        expert_placement_strategy="linear",
+    )
+    parallel_config.update(parallel or {})
+    model_config = dict(
+        hf_text_config=config,
+        dtype=torch.bfloat16,
+        max_model_len=64,
+        quantization=None,
+    )
+    model_config.update(model)
+    return SimpleNamespace(
+        model_config=SimpleNamespace(**model_config),
+        parallel_config=SimpleNamespace(**parallel_config),
+        load_config=SimpleNamespace(load_format="safetensors"),
+        compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
+        cache_config=None,
+        quant_config=None,
+    )
+
+
+@pytest.fixture
+def text_stack(dist_ctx, monkeypatch):
+    """The Muse text modules on CPU, with reference attention and BF16 experts.
+
+    Modules build under the BF16 default dtype, as the model loader builds
+    them; tests create FP32 inputs explicitly.
+    """
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.muse_spark import model as muse
+
+    monkeypatch.setattr(muse, "Attention", _ReferenceAttention)
+    monkeypatch.setattr(
+        muse,
+        "FusedMoEFactory",
+        lambda **kw: SimpleNamespace(
+            routed_experts=_make_experts(
+                kw["num_experts"],
+                kw["hidden_size"],
+                kw["intermediate_size"],
+                packed=False,
+            )
+        ),
+    )
+    with (
+        set_current_vllm_config(VllmConfig(device_config=DeviceConfig("cpu"))),
+        set_default_torch_dtype(torch.bfloat16),
+    ):
+        yield muse
+
+
+def _initialize_text_weights(module, seed):
+    rng = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for param in module.parameters():
+            values = torch.randn(param.shape, generator=rng, dtype=torch.float32)
+            param.copy_((values * 0.05).to(param.dtype))
+    for child in module.modules():
+        quant_method = getattr(child, "quant_method", None)
+        if quant_method is not None:
+            quant_method.process_weights_after_loading(child)
+
+
+@pytest.mark.parametrize("layer_idx", [0, 1], ids=["sliding_rope", "full_nope"])
+@torch.inference_mode()
+def test_attention_uses_native_head_size_64(text_stack, layer_idx):
+    config = _text_config()
+    attention = text_stack.MuseAttention(
+        config, _text_vllm_config(config), layer_idx, "layers.0.self_attn"
+    )
+    _initialize_text_weights(attention, 11)
+    assert attention.attn.head_size == 64
+    assert (attention.rotary_emb is None) == (layer_idx == 1)
+    assert attention.attn.window == (4 if layer_idx == 0 else None)
+    # gate_proj keeps vLLM's [out, in] layout; the other linears are flipped.
+    assert attention.gate_proj.weight.shape == (4 * 64, 64)
+    assert attention.qkv_proj.weight.shape == (64, (4 + 2 * 2) * 64)
+    rng = torch.Generator().manual_seed(12)
+    x = torch.randn(7, 64, generator=rng, dtype=torch.float32).bfloat16()
+
+    out = attention(torch.arange(7), x)
+
+    assert out.shape == (7, 64) and out.dtype == torch.bfloat16
+    assert torch.isfinite(out).all()
+    assert attention.attn.widths == [(4 * 64, 2 * 64, 2 * 64)]
+
+
+@torch.inference_mode()
+def test_decoder_layer_keeps_fp32_stream(text_stack):
+    config = _text_config()
+    layer = text_stack.MuseDecoderLayer(
+        config, _text_vllm_config(config), 0, "layers.0"
+    )
+    assert layer.mlp.experts.w13_weight.dtype == torch.bfloat16
+    _initialize_text_weights(layer, 13)
+    rng = torch.Generator().manual_seed(14)
+    stream = torch.randn(6, 64, generator=rng, dtype=torch.float32)
+
+    out = layer(torch.arange(6), stream)
+
+    assert out.shape == stream.shape and out.dtype == torch.float32
+    assert torch.isfinite(out).all()
+    assert not torch.equal(out, stream)
+
+
+@torch.inference_mode()
+def test_model_embeds_runs_every_layer_and_normalizes(text_stack, monkeypatch):
+    config = _text_config()
+    model = text_stack.MuseModel(
+        vllm_config=_text_vllm_config(config), prefix="model.language_model"
+    )
+    assert len(model.layers) == 2
+    _initialize_text_weights(model, 15)
+    calls = []
+    for index, layer in enumerate(model.layers):
+        forward = layer.forward
+
+        def record(positions, stream, index=index, forward=forward):
+            assert stream.dtype == torch.float32
+            calls.append(index)
+            return forward(positions, stream)
+
+        monkeypatch.setattr(layer, "forward", record)
+    ids = torch.tensor([3, 1, 4, 1, 5])
+    positions = torch.arange(5)
+
+    from_ids = model(ids, positions)
+    from_embeds = model(None, positions, inputs_embeds=model.embed_input_ids(ids))
+
+    assert calls == [0, 1, 0, 1]
+    assert from_ids.shape == (5, 64) and from_ids.dtype == torch.bfloat16
+    torch.testing.assert_close(from_ids, from_embeds, rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_causal_lm_builds_text_stack_and_returns_capped_logits(text_stack):
+    config = _text_config()
+    lm = text_stack.MuseSparkForCausalLM(vllm_config=_text_vllm_config(config))
+    assert isinstance(lm.model.language_model, text_stack.MuseModel)
+    assert lm.lm_head.org_vocab_size == 48 and lm.lm_head.weight.shape[1] == 64
+    assert lm.soft_cap is not None and not lm._dummy_load
+    _initialize_text_weights(lm, 16)
+
+    hidden = lm(torch.tensor([7, 8, 9]), torch.arange(3))
+    logits = lm.compute_logits(hidden)
+
+    assert logits.shape == (3, 48) and logits.dtype == torch.float32
+    assert logits.abs().max() <= 30.0
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"parallel": {"pipeline_parallel_size": 2}}, "PP, context parallelism"),
+        ({"parallel": {"decode_context_parallel_size": 2}}, "context parallelism"),
+        ({"parallel": {"enable_eplb": True}}, "EPLB are not supported"),
+        ({"parallel": {"data_parallel_size": 2}}, "requires expert parallelism"),
+        (
+            {
+                "parallel": {
+                    "enable_expert_parallel": True,
+                    "expert_placement_strategy": "round_robin",
+                }
+            },
+            "linear expert placement",
+        ),
+        ({"config": {"mlp_layer_types": ["dense", "sparse"]}}, "routed MoE layers"),
+        ({"config": {"tie_word_embeddings": True}}, "untied output projection"),
+        ({"model": {"dtype": torch.float32}}, "--dtype bfloat16"),
+        ({"model": {"quantization": "fp8"}}, "BF16 and NVFP4 checkpoints"),
+        (
+            {
+                "model": {"quantization": "modelopt_fp4"},
+                "config": {"moe_intermediate_size": 40},
+            },
+            "align to 16-value blocks",
+        ),
+    ],
+    ids=[
+        "pipeline",
+        "context",
+        "eplb",
+        "dp_without_ep",
+        "placement",
+        "dense_mlp",
+        "tied",
+        "fp32",
+        "fp8",
+        "nvfp4_blocks",
+    ],
+)
+def test_causal_lm_rejects_unsupported_setups(text_stack, overrides, message):
+    config = _text_config(**overrides.get("config", {}))
+    vllm_config = _text_vllm_config(
+        config, overrides.get("parallel"), **overrides.get("model", {})
+    )
+    with pytest.raises(ValueError, match=message):
+        text_stack.MuseSparkForCausalLM(vllm_config=vllm_config)
+
+
+def test_causal_lm_rejects_expert_count_not_divisible_by_ep(text_stack, monkeypatch):
+    monkeypatch.setattr(
+        text_stack,
+        "get_ep_group",
+        lambda: SimpleNamespace(world_size=3, rank_in_group=0),
+    )
+    config = _text_config()
+    vllm_config = _text_vllm_config(config, {"enable_expert_parallel": True})
+    with pytest.raises(ValueError, match="divisible by EP"):
+        text_stack.MuseSparkForCausalLM(vllm_config=vllm_config)
+
+
+class _StubAttention(nn.Module):
+    """The same linear map for both decoder layers; carries upstream's norm name."""
+
+    def __init__(self, weight, pre_qkv_proj_norm):
+        super().__init__()
+        self.weight = weight
+        self.pre_qkv_proj_norm = pre_qkv_proj_norm
+
+    def forward(self, positions, hidden_states):
+        return (hidden_states.float() @ self.weight).to(hidden_states.dtype)
+
+
+class _StubExperts(nn.Module):
+    def __init__(self, weight):
+        super().__init__()
+        self.weight = weight
+
+    def forward(self, x):
+        return (x.float() @ self.weight).to(x.dtype)
+
+
+@torch.no_grad()
+def test_decoder_layer_matches_upstream(text_stack):
+    """Norm order, dtypes and gated residual blends match upstream
+    ``MuseSpark1xDecoderLayer.forward`` on the same norms and gates, with
+    attention and experts replaced by the same stand-ins, as in
+    ``test_qwen3_5_patch.py::test_forward_matches_upstream``.
+
+    Upstream's CPU fallback rounds each post-norm branch to BF16 before the
+    blend, where its fused CUDA kernels, like this model, keep it in FP32, so
+    the comparison allows that rounding.
+    """
+    from vllm.models.muse_spark.common.layers import norm_then_gated_residual
+    from vllm.models.muse_spark.nvidia.model import MuseSpark1xDecoderLayer
+
+    config = _text_config()
+    layer = text_stack.MuseDecoderLayer(
+        config, _text_vllm_config(config), 0, "layers.0"
+    )
+    _initialize_text_weights(layer, 21)
+    rng = torch.Generator().manual_seed(22)
+    layer.self_attn = _StubAttention(
+        torch.randn(64, 64, generator=rng, dtype=torch.float32) / 8,
+        layer.input_layernorm,
+    )
+    layer.mlp = _StubExperts(
+        torch.randn(64, 64, generator=rng, dtype=torch.float32) / 8
+    )
+
+    upstream = MuseSpark1xDecoderLayer.__new__(MuseSpark1xDecoderLayer)
+    nn.Module.__init__(upstream)
+    upstream.self_attn = layer.self_attn
+    upstream.post_attn_norm = layer.post_attn_norm
+    upstream.add_attn = layer.post_attention_residual_gate
+    upstream.pre_ffn_norm = layer.pre_feedforward_layernorm
+    upstream.feed_forward = layer.mlp
+    upstream.post_ffn_norm = layer.post_feedforward_layernorm
+    upstream.add_ffn = layer.post_feedforward_residual_gate
+    upstream.residual_dtype = torch.float32
+    upstream.default_dtype = torch.bfloat16
+    upstream.is_sequence_parallel = upstream.is_sequence_parallel_input = False
+    upstream.all_gather_dual_norm = None
+
+    stream = torch.randn(6, 64, generator=rng, dtype=torch.float32)
+    positions = torch.arange(6)
+    expected = norm_then_gated_residual(upstream(positions, stream))
+    actual = layer(positions, stream)
+
+    assert actual.dtype == expected.dtype == torch.float32
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-2)
+
+
+@pytest.mark.parametrize("zero_centered", [False, True])
+def test_weight_first_norm_matches_upstream(zero_centered):
+    from vllm.models.muse_spark.common.layers import MuseSpark1xRMSNormWithInputScale
+
+    norm = MuseRMSNormWithInputScale(64, 1e-8, zero_centered=zero_centered)
+    rng = torch.Generator().manual_seed(18)
+    norm.weight.data.copy_(torch.randn(64, generator=rng, dtype=torch.float32))
+    x = torch.randn(5, 64, generator=rng, dtype=torch.float32).bfloat16()
+
+    actual = norm(x, out_dtype=torch.float32)
+    expected = MuseSpark1xRMSNormWithInputScale.forward_native(
+        norm, x, out_dtype=torch.float32
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)

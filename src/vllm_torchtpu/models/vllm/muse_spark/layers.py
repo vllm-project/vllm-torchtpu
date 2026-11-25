@@ -11,14 +11,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unfused Muse math. Norms and residual arithmetic deliberately stay in FP32."""
+"""Muse Spark RMSNorms for TPU, plus reference and layout helpers.
+
+Upstream source: ``vllm/models/muse_spark/common/layers.py``.
+
+TPU changes:
+
+- ``MuseRMSNorm`` is ``MuseSpark1xRMSNorm`` with an FP32 weight, and always
+  runs its ``forward_native`` instead of dispatching to the Triton kernel.
+- ``MuseRMSNormWithInputScale`` is the weight-first variant
+  (``MuseSpark1xRMSNormWithInputScale``); it normalizes with the same explicit
+  FP32 mean square as ``forward_native`` instead of ``F.rms_norm``.
+- ``selected_expert_outputs`` and ``attention_layout`` have no upstream
+  counterpart.
+"""
 
 import torch
 from torch import nn
 from torch.nn import functional as F
+from vllm.models.muse_spark.common.layers import MuseSpark1xRMSNorm
 
 
-class MuseRMSNorm(nn.Module):
+class MuseRMSNorm(MuseSpark1xRMSNorm):
     def __init__(
         self,
         hidden_size: int,
@@ -26,47 +40,42 @@ class MuseRMSNorm(nn.Module):
         *,
         has_weight: bool = True,
         zero_centered: bool = False,
-        center: float = 1.0,
-        weight_first: bool = False,
     ):
-        super().__init__()
-        self.eps = eps
-        self.center = center if zero_centered else 0.0
-        self.weight_first = weight_first
-        self.weight = (
-            nn.Parameter(
+        super().__init__(
+            hidden_size, eps, has_weight=has_weight, zero_centered_gamma=zero_centered
+        )
+        if has_weight:
+            self.weight = nn.Parameter(
                 torch.empty(hidden_size, dtype=torch.float32), requires_grad=False
             )
-            if has_weight
-            else None
-        )
 
     def forward(
-        self, x: torch.Tensor, out_dtype: torch.dtype | None = None
-    ) -> torch.Tensor:
-        dtype = out_dtype or x.dtype
-        y = x.float()
-        weight = None if self.weight is None else self.weight.float() + self.center
-        if self.weight_first and weight is not None:
-            y = y * weight
-        y = y * torch.rsqrt(y.square().mean(dim=-1, keepdim=True) + self.eps)
-        if not self.weight_first and weight is not None:
-            y = y * weight
-        return y.to(dtype)
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(x, residual, out_dtype)
 
 
-class MuseResidual(nn.Module):
-    def __init__(self, hidden_size: int, temperature: float):
-        super().__init__()
-        self.gate = nn.Parameter(torch.empty(hidden_size), requires_grad=False)
-        self.temperature = temperature
+class MuseRMSNormWithInputScale(MuseRMSNorm):
+    """Weight-first RMSNorm: ``rms_norm(x * weight)``."""
 
-    def forward(self, stream: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
-        branch = branch.to(stream.dtype)
-        w = self.gate.float() / self.temperature
-        beta = torch.sigmoid(w)
-        alpha = torch.sqrt(torch.clamp(torch.sigmoid(-w) * (1 + beta), min=1e-3))
-        return (alpha * stream + beta * branch).to(stream.dtype)
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        assert residual is None and self.weight is not None
+        weight = self.weight.float()
+        if self.zero_centered_gamma:
+            weight = weight + self.gain_center
+        y = x.float() * weight
+        y = y * torch.rsqrt(
+            y.square().mean(dim=-1, keepdim=True) + self.variance_epsilon
+        )
+        return y.to(out_dtype or x.dtype)
 
 
 def selected_expert_outputs(
