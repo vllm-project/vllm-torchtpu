@@ -14,8 +14,6 @@
 
 import dataclasses
 import functools
-import itertools
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import jax
@@ -52,6 +50,10 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.layers.adapter.custom_ops.mamba_op_utils import (
+    extract_mamba_step_metadata,
+    get_shared_mamba_jax_op,
+)
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
@@ -77,19 +79,17 @@ _GDN_TP_AXIS_NAME = "tp"
 _GDN_PCP_TP_STATE_AXIS = (_GDN_TP_AXIS_NAME, _GDN_PCP_AXIS_NAME)
 
 if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.custom_ops.mamba_op_utils import (
+        MambaAttentionMetadata,
+    )
 
-    class _GdnAttentionMetadata(Protocol):
+    class _GdnAttentionMetadata(MambaAttentionMetadata, Protocol):
         """The per-layer AttentionMetadata fields that GDN reads.
 
         The runner fills them with torch tensors, while AttentionMetadata
         annotates them as jax.Array.
         """
 
-        block_tables: torch.Tensor
-        seq_lens: torch.Tensor
-        query_start_loc: torch.Tensor
-        request_distribution: torch.Tensor
-        mamba_state_indices: torch.Tensor | None
         mamba_prefill_ckpt_offsets: torch.Tensor | None
         mamba_prefill_ckpt_indices: torch.Tensor | None
 
@@ -348,26 +348,6 @@ def _localize_gdn_mamba_spec_for_pcp(
         shapes=geometry.local_state_shapes(spec.shapes, d_k, d_v),
         page_size_padded=page_size_padded,
     )
-
-
-# GDN custom ops shared by every layer with the same kernel config. A
-# JaxCallable caches its jax.export per instance, so one op per layer re-exported
-# (and re-lowered) the identical kernel for every layer at every compile bucket.
-_shared_gdn_ops: dict[tuple, Any] = {}
-_shared_gdn_op_ids = itertools.count()
-
-
-def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> Any:
-    """Return the ``pallas::<kind>_<n>`` op for ``(kind, key)``, building it once.
-
-    ``kind`` and ``key`` together must cover every value that the op's kernel
-    and fake capture.
-    """
-    op = _shared_gdn_ops.get((kind, key))
-    if op is None:
-        op = build(f"pallas::{kind}_{next(_shared_gdn_op_ids)}")
-        _shared_gdn_ops[(kind, key)] = op
-    return op
 
 
 @QwenGatedDeltaNetAttention.register_oot
@@ -833,23 +813,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             new_pool, output = result
             return new_pool.reshape(recurrent_state.shape), output
 
-        def _fake_gdn(mixed_qkv, _b, _a, recurrent_state, *args, **kwargs):
-            num_tokens = mixed_qkv.size(0)
-            out_shape = (num_tokens, local_num_v_heads, d_v)
-            out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=mixed_qkv.device)
-            return torch.empty_like(recurrent_state), out
-
-        def build_op(op_name: str):
-            # The recurrent state (arg 3) is the attention-shaped pool: the ssm
-            # and conv byte-regions are read/written through it by the pool
-            # adapters, so it is the only donated input. inplace-donation
-            # aliases its program-level output to the input buffer so the
-            # ~pool-sized update is not double-counted at compile.
-            op = pallas.jax_op(op_name, wrapped_fn, donate_argnums=(3,))
-            op.register_fake(_fake_gdn)
-            return op
-
-        gdn_jax_op = _get_shared_gdn_op(
+        # The recurrent state (arg 3) is the attention-shaped pool: the ssm
+        # and conv byte-regions are read/written through it by the pool
+        # adapters, so it is the only donated input. In-place donation
+        # aliases its program-level output to the input buffer so the
+        # ~pool-sized update is not double-counted at compile.
+        return get_shared_mamba_jax_op(
             "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled",
             (
                 id(mesh),
@@ -862,54 +831,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 recurrent_state_dtype,
                 num_spec_tokens,
             ),
-            build_op,
+            wrapped_fn,
+            (local_num_v_heads, d_v),
+            donate_argnums=(3,),
         )
-
-        def gdn_impl(
-            mixed_qkv: torch.Tensor,
-            b: torch.Tensor,
-            a: torch.Tensor,
-            recurrent_state: torch.Tensor,
-            conv_weight: torch.Tensor,
-            conv_bias: torch.Tensor | None,
-            A_log: torch.Tensor,
-            dt_bias: torch.Tensor,
-            state_indices: torch.Tensor,
-            query_start_loc: torch.Tensor,
-            request_distribution: torch.Tensor,
-            seq_lens: torch.Tensor,
-            slot_read_offsets: torch.Tensor | None = None,
-            ckpt_indices: torch.Tensor | None = None,
-            prefill_ckpt_offsets: torch.Tensor | None = None,
-            prefill_ckpt_indices: torch.Tensor | None = None,
-        ) -> torch.Tensor:
-            # Keep optional operands after the donated pool tensor so dropping
-            # None args at the TorchTPU boundary does not shift donate_argnums.
-            new_rec, outputs = gdn_jax_op(
-                mixed_qkv,
-                b,
-                a,
-                recurrent_state,
-                conv_weight,
-                conv_bias,
-                A_log,
-                dt_bias,
-                state_indices,
-                query_start_loc,
-                request_distribution,
-                seq_lens,
-                slot_read_offsets,
-                ckpt_indices,
-                prefill_ckpt_offsets,
-                prefill_ckpt_indices,
-            )
-
-            # Plain donation + copy_ writeback (aliased in-place by XLA).
-            recurrent_state.copy_(new_rec)
-
-            return outputs
-
-        return gdn_impl
 
     def _build_pooled_pcp_gdn_op(self, *, block_major: bool = False):
         vllm_context = get_vllm_model_wrapper_context()
@@ -1281,23 +1206,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # metadata builder.
                 (recurrent_state,) = kv_cache
                 assert attn_metadata.mamba_state_indices is not None
-                state_indices = self._bm_state_ids(
-                    attn_metadata.mamba_state_indices.to(torch.int32)
-                )
-                # Speculative decoding: the GDN kernel's windowed segment
-                # covers both 1-token decodes and speculative verify
-                # windows (the batch is ordered [decode][verify][prefill]);
-                # ragged paged attention keeps `request_distribution` with
-                # its 1-token decode front segment.
-                request_distribution = attn_metadata.request_distribution
+                (
+                    state_indices,
+                    query_start_loc,
+                    request_distribution,
+                    seq_lens,
+                ) = extract_mamba_step_metadata(self.prefix, attn_metadata)
+                state_indices = self._bm_state_ids(state_indices)
                 slot_read_offsets = getattr(
                     attn_metadata, "mamba_slot_read_offsets", None
                 )
-                mamba_request_distribution = getattr(
-                    attn_metadata, "mamba_request_distribution", None
-                )
-                if mamba_request_distribution is not None:
-                    request_distribution = mamba_request_distribution
                 if self.num_spec > 0:
                     assert slot_read_offsets is not None, (
                         "Speculative decoding with GDN layers requires "
@@ -1317,9 +1235,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     self.A_log,
                     self.dt_bias,
                     state_indices,
-                    attn_metadata.query_start_loc,
+                    query_start_loc,
                     request_distribution,
-                    attn_metadata.seq_lens,
+                    seq_lens,
                     slot_read_offsets,
                     ckpt_indices,
                     prefill_ckpt_offsets,
@@ -1332,38 +1250,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 assert attn_metadata.mamba_prefill_ckpt_offsets is None, (
                     "GDN prefill checkpoints need the unified KV pool."
                 )
-                # Recurrent-state slot id per persistent-batch position.
-                # Compact-mamba: the mamba pool has only `_mamba_num_blocks` slots
-                # (< attention `num_blocks`), so the slot id is carried explicitly
-                # in `mamba_state_indices` (in [0, _mamba_num_blocks)) rather than
-                # derived from the attention `block_tables[:, 0]`. Fall back to
-                # `block_tables[:, 0]` only when compact sizing was skipped and
-                # mamba shares the attention block pool (uniform layout).
-                if attn_metadata.mamba_state_indices is not None:
-                    state_indices = attn_metadata.mamba_state_indices.to(torch.int32)
-                else:
-                    max_reqs = attn_metadata.seq_lens.shape[0]
-                    max_blocks_per_req = attn_metadata.block_tables.shape[0] // max_reqs
-                    block_tables_2d = torch.reshape(
-                        attn_metadata.block_tables,
-                        (max_reqs, max_blocks_per_req),
-                    )
-                    state_indices = block_tables_2d[:, 0].to(torch.int32)
-
-                # Speculative decoding: the GDN kernel's windowed segment
-                # covers both 1-token decodes and speculative verify windows
-                # (the batch is ordered [decode][verify][prefill/mixed]);
-                # ragged paged attention keeps using `request_distribution`
-                # with its 1-token decode front segment.
-                request_distribution = attn_metadata.request_distribution
+                (
+                    state_indices,
+                    query_start_loc,
+                    request_distribution,
+                    seq_lens,
+                ) = extract_mamba_step_metadata(self.prefix, attn_metadata)
                 slot_read_offsets = getattr(
                     attn_metadata, "mamba_slot_read_offsets", None
                 )
-                mamba_request_distribution = getattr(
-                    attn_metadata, "mamba_request_distribution", None
-                )
-                if mamba_request_distribution is not None:
-                    request_distribution = mamba_request_distribution
                 use_pcp_streaming = is_pcp_streaming_attention_metadata(attn_metadata)
                 if not use_pcp_streaming and self.num_spec > 0:
                     assert slot_read_offsets is not None, (
@@ -1384,9 +1279,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                         self.A_log,
                         self.dt_bias,
                         state_indices,
-                        attn_metadata.query_start_loc,
+                        query_start_loc,
                         request_distribution,
-                        attn_metadata.seq_lens,
+                        seq_lens,
                         slot_read_offsets,
                     )
                 else:

@@ -38,13 +38,13 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEFp8EmbeddingMethod,
 )
 
-import vllm_torchtpu.models.vllm.qwen4_exp.model as qwen4_model
+import vllm_torchtpu.models.qwen4_exp.model as qwen4_model
 from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
 from vllm_torchtpu.layers import register_layers
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
-from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
-from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
-from vllm_torchtpu.models.vllm.qwen4_exp.ple import (
+from vllm_torchtpu.models.qwen4_exp.config import TPUQwen4ExpConfig
+from vllm_torchtpu.models.qwen4_exp.model import Qwen4ExpForCausalLM
+from vllm_torchtpu.models.qwen4_exp.ple import (
     PLEInputs,
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLELayer,
@@ -62,20 +62,7 @@ VOCAB = 32
 LAYER_TYPES = ["linear_attention", "full_attention"]
 
 
-@pytest.fixture(autouse=True)
-def _cpu_model_tests(monkeypatch):
-    # Same guard as the Kimi model tests: keep Dynamo from querying a TPU
-    # device while these CPU-only tests run.
-    tpu = getattr(torch, "tpu", None)
-    if tpu is not None:
-        monkeypatch.setattr(tpu, "is_available", lambda: False)
-        monkeypatch.setattr(tpu, "current_device", lambda: 0)
-        monkeypatch.setattr(tpu, "device_count", lambda: 0)
-        monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
-    if hasattr(torch, "accelerator"):
-        monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
-        monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
-        monkeypatch.setattr(torch.accelerator, "device_count", lambda: 0)
+pytestmark = pytest.mark.usefixtures("cpu_model_tests")
 
 
 def _text_config(**overrides) -> Qwen4ExpTextConfig:

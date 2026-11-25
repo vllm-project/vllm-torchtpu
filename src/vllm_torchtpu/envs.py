@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
+    TPU_MOE_REQUANT_CHUNK_BYTES: int = 1 << 30
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_SKIP_MAMBA_SCHEDULER_BLOCKS: bool = True
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
@@ -105,8 +106,8 @@ if TYPE_CHECKING:
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
-    TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
     TPU_MOE_EP_HIER_RS: str = "off"
+    TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE: float | None = None
     USE_MOE_FUSED_EP_KERNEL: bool = False
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
@@ -114,6 +115,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
+    MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS: int = 1024
     TPU_EXPERT_PLACEMENT: str = ""
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
@@ -217,6 +219,8 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     VLLM_TPU_MEGAKERNEL: str = ""
+    VLLM_TPU_EXPERIMENTAL_USE_RUST: bool = False
+    VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY: str = ""
 
 
 def env_with_choices(
@@ -610,6 +614,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
     if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
     else None,
+    # Float32 bytes one load-time MoE requantization chunk materializes on
+    # the device. The quantized chunk, its scales and the formatting
+    # temporaries come on top. A chunk always holds at least one expert.
+    # Unset or empty keeps 1 GiB; a value <= 0 raises.
+    "TPU_MOE_REQUANT_CHUNK_BYTES": lambda: (
+        env_positive_int_or_none("TPU_MOE_REQUANT_CHUNK_BYTES")() or 1 << 30
+    ),
     # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
     # wins; unset defers to
     # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects
@@ -848,17 +859,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_ROUTER_TOPK": env_with_choices(
         "TPU_MOE_ROUTER_TOPK", "rowmax", ["sort", "rowmax"]
     ),
-    # Keep FusedMoE top-k routing weights in float32 precision instead of casting
-    # to the activation dtype (e.g. bfloat16) in fused_moe_gmm. Improves numerical
-    # parity with training frameworks (e.g. MaxText) in RL and distillation workloads.
-    "TPU_MOE_TOPK_WEIGHTS_FLOAT32": env_bool(
-        "TPU_MOE_TOPK_WEIGHTS_FLOAT32", default=False
-    ),
     # Runs the EP MoE combine's reduce-scatter on the hierrs_tc TensorCore
-    # kernels instead of the group's, with this wire dtype between chips.
-    # Remove once that is the default or the kernels are retired.
+    # kernels instead of the group's, with this wire dtype between chips
+    # (accumulation stays bf16). Remove once that is the default or the
+    # kernels are retired.
     "TPU_MOE_EP_HIER_RS": env_with_choices(
-        "TPU_MOE_EP_HIER_RS", "off", ["off", "bf16"]
+        "TPU_MOE_EP_HIER_RS", "off", ["off", "bf16", "fp8"]
+    ),
+    # Required with fp8; see docs/reference/env_vars.md.
+    "TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE": lambda: (
+        float(v) if (v := os.getenv("TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE")) else None
     ),
     # Run the whole expert-parallel MoE layer -- top-k, dispatch, both expert
     # matmuls, combine, and the cross-rank transport -- as one SPMD Pallas
@@ -907,6 +917,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel.
     "MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE": lambda: int(
         os.getenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", "0") or 0
+    ),
+    # Local tokens per EP rank at or above which fused EP MoE v2 enqueues the
+    # activation all-gather ahead of the slab scatters (see the comment where
+    # kernels/fused_moe/v2/layer.py reads it).
+    "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS": env_nonnegative_int(
+        "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS", 1024
     ),
     # Shard Kimi K3's latent-MoE down/up projections across the cores of a
     # chip instead of replicating them. They are unquantized [7168, 3584] and
@@ -1329,6 +1345,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable and configure the fused Pallas megakernel ("1"/"true" for defaults,
     # "ep"/"tp" for mode, or "mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1").
     "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", ""),
+    # Opt in to serving models with the native Rust runtime (rvllm) behind `vllm serve`.
+    # Encompasses both HTTP frontend and engine backend.
+    # Experimental, off by default until rvllm reaches feature parity.
+    "VLLM_TPU_EXPERIMENTAL_USE_RUST": env_bool(
+        "VLLM_TPU_EXPERIMENTAL_USE_RUST", default=False
+    ),
+    # The rvllm binary; takes the same values as the launcher's --rvllm-binary.
+    # When unset, rvllm is looked up on PATH.
+    "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(
+        "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
+    ),
 }
 
 

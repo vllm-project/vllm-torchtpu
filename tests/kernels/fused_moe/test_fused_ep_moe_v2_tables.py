@@ -37,6 +37,8 @@ client for every registered platform including TPU. Nothing here needs one, but
 do not read the fixture as a claim that the chips stay free.
 """
 
+import types
+
 import numpy as np
 import pytest
 
@@ -45,7 +47,7 @@ jnp = jax.numpy
 
 from jax.experimental.pallas import tpu as pltpu  # noqa: E402
 
-from vllm_torchtpu.kernels.fused_moe.v2 import host  # noqa: E402
+from vllm_torchtpu.kernels.fused_moe.v2 import host, kernel  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -469,6 +471,205 @@ def test_slab_tables_follow_the_sparse_core(chip, on_tensorcore):
     assert host.slab_tables_on_tensorcore(info) is on_tensorcore
 
 
+@pytest.mark.parametrize(
+    "smem,tokens,fits",
+    [
+        (None, 131072, True),  # TPU8i's record: 1 MiB, so the full 512 KiB
+        (None, 131073, False),
+        (512 * 1024, 65536, True),  # half the SMEM, so half the budget
+        (512 * 1024, 65537, False),
+    ],
+)
+def test_scale_slab_budget_follows_the_chips_smem(smem, tokens, fits):
+    """The lookup's scale table takes at most half of the chip's SMEM."""
+    if smem is None:
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_8I, 1)
+    else:
+        info = types.SimpleNamespace(smem_capacity_bytes=smem)
+    assert kernel.scale_slab_fits(tokens, info) is fits
+
+
+@pytest.mark.parametrize(
+    "ep,t_local,g_local,topk",
+    GEOMETRIES + [pytest.param(32, 48, 16, 10, id="qwen38_ep32_g16_t48")],
+)
+@pytest.mark.parametrize("routing", ["uniform", "skewed", "padded"])
+@pytest.mark.parametrize("seed", [0, 1])
+def test_sorted_token_gather_is_the_scattered_one(
+    ep, t_local, g_local, topk, routing, seed
+):
+    """The sort build gives the scatter's table, from either plan builder.
+
+    Skewed routing is the case that matters most: most runs are empty or odd,
+    so the padding elements the sort carries are live on some runs and not on
+    others. Padded routing puts expert id e_total on whole rows and on all of
+    one shard, which the sort has to key off-shard as the plans do.
+    """
+    idx, kwargs = _routing_inputs(
+        ep, t_local, g_local, topk, skew=routing == "skewed", seed=seed
+    )
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    if routing == "padded":
+        idx = _pad_half_of_each_shard(idx, ep=ep, t_local=t_local, e_total=e_total)
+    assert host.token_gather_sort_fits(ep * t_local, topk, e_total=e_total, ep=ep)
+    whole = host.build_routing_tables(idx, **kwargs)
+    counts = jnp.asarray(_plan_counts(idx, ep=ep, t_local=t_local, e_total=e_total))
+    for me in range(ep):
+        shard = host.build_routing_tables_sharded(
+            idx, jnp.int32(me), all_gather_rows=lambda _row: counts, **kwargs
+        )
+        for plan in (whole, shard):
+            np.testing.assert_array_equal(
+                np.asarray(
+                    host.shard_token_gather_sorted(
+                        idx,
+                        plan,
+                        jnp.int32(me),
+                        e_total=e_total,
+                        ep=ep,
+                        shard_stride=stride,
+                    )
+                ),
+                np.asarray(host.shard_token_gather(plan, me, shard_stride=stride)),
+                err_msg=f"shard {me}",
+            )
+
+
+def _sender_payloads(idx, scale_bits, *, ep, t_local, topk, block):
+    """Every shard's expert-sorted payload as the run-copy exchange gathers it.
+
+    Returns the token numbers and the scale bits, [ep, pair_w] each with every
+    source padded to the lane-block-aligned section width, and that width.
+    """
+    pair_w = host.align_up(t_local * topk, host.HIDDEN_LANE_BLOCK)
+    tokens, scales = [], []
+    for s in range(ep):
+        rows = slice(s * t_local, (s + 1) * t_local)
+        t_s, c_s = host.sender_sorted_pairs(
+            jnp.asarray(idx)[rows].reshape(-1, block),
+            jnp.int32(s),
+            t_local=t_local,
+            topk=topk,
+            scale_bits=jnp.asarray(scale_bits)[rows],
+        )
+        tokens.append(np.pad(np.asarray(t_s), (0, pair_w - t_s.size)))
+        scales.append(np.pad(np.asarray(c_s), (0, pair_w - c_s.size)))
+    return np.stack(tokens), np.stack(scales), pair_w
+
+
+@pytest.mark.parametrize(
+    "ep,t_local,g_local,topk",
+    GEOMETRIES + [pytest.param(32, 48, 16, 10, id="qwen38_ep32_g16_t48")],
+)
+@pytest.mark.parametrize("routing", ["uniform", "skewed", "padded"])
+def test_slab_runs_copy_out_the_scattered_tables(ep, t_local, g_local, topk, routing):
+    """Copying runs of the expert-sorted payloads rebuilds both slab tables.
+
+    The host half of the run-copy form: sender_sorted_pairs on every source,
+    then slab_run_copy_runs' offsets for each shard, copied here in numpy (the
+    kernel that does it on the chip is checked against this in its own test).
+    The result must be the scatter's token-gather table, padding and clip
+    included, and the scatter's scale slab over the whole slab: zero on the
+    ROWBLK padding of every run, as the scatter leaves it.
+    """
+    idx, kwargs = _routing_inputs(
+        ep, t_local, g_local, topk, skew=routing == "skewed", seed=7
+    )
+    e_total = kwargs["e_total"]
+    stride = kwargs["shard_stride"]
+    if routing == "padded":
+        idx = _pad_half_of_each_shard(idx, ep=ep, t_local=t_local, e_total=e_total)
+    T = ep * t_local
+    rng = np.random.default_rng(8)
+    scale_bits = (rng.random(T, dtype=np.float32) + 0.5).view(np.int32)
+    tokens, scales, pair_w = _sender_payloads(
+        idx,
+        scale_bits,
+        ep=ep,
+        t_local=t_local,
+        topk=topk,
+        block=kwargs["block"],
+    )
+    counts = jnp.asarray(_plan_counts(idx, ep=ep, t_local=t_local, e_total=e_total))
+    view_rows = host.act_scale_slab_rows(stride) * host.HIDDEN_LANE_BLOCK
+    lo, hi = host.gather_clamp_bounds(T)
+    for me in range(ep):
+        plan = host.build_routing_tables_sharded(
+            idx, jnp.int32(me), all_gather_rows=lambda _row: counts, **kwargs
+        )
+        rows = host.local_slab_rows(plan, me, shard_stride=stride)
+        src, dst, length = (
+            np.asarray(a)
+            for a in host.slab_run_copy_runs(
+                plan, jnp.int32(me), e_total=e_total, ep=ep, src_stride=pair_w
+            )
+        )
+        assert length.size == g_local * ep
+        got_tokens = np.zeros(view_rows, np.int32)
+        got_scales = np.zeros(view_rows, np.int32)
+        for a, b, n in zip(src, dst, length):
+            got_tokens[b : b + n] = tokens.reshape(-1)[a : a + n]
+            got_scales[b : b + n] = scales.reshape(-1)[a : a + n]
+        np.testing.assert_array_equal(
+            np.clip(got_tokens[:stride], lo, hi),
+            np.asarray(
+                host.shard_token_gather(plan, me, shard_stride=stride, rows=rows)
+            ),
+            err_msg=f"token-gather table, shard {me}",
+        )
+        scattered = host.slab_scatter(
+            view_rows, rows, jnp.asarray(np.repeat(scale_bits, topk)), by_set=False
+        )
+        np.testing.assert_array_equal(
+            got_scales[:stride],
+            np.asarray(scattered)[:stride],
+            err_msg=f"activation-scale slab, shard {me}",
+        )
+
+
+def test_token_gather_sort_keys_fit_the_served_shapes():
+    """Qwen3.8's EP32 prefill step is far inside the int32 key range."""
+    assert host.token_gather_sort_fits(16384, 10, e_total=512, ep=32)
+    assert not host.token_gather_sort_fits(2**24, 10, e_total=512, ep=32)
+
+
+def test_token_gather_sort_keys_stop_at_the_int32_bound():
+    """The bound is exact: the off-shard key, e_total * run_span, stays < 2**31."""
+    e_total, topk, ep = 2, 1, 1
+    at_bound = 2**30 - (host.ROWBLK - 1)  # e_total * run_span == 2**31
+    assert not host.token_gather_sort_fits(at_bound, topk, e_total=e_total, ep=ep)
+    assert host.token_gather_sort_fits(at_bound - 1, topk, e_total=e_total, ep=ep)
+
+
+@pytest.mark.parametrize(
+    "tokens,pays", [(1536, False), (4096, False), (8192, True), (16384, True)]
+)
+def test_slab_run_copy_pays_at_qwen38s_measured_steps(tokens, pays):
+    """At Qwen3.8's shape (top-10 of 512) the gate picks the steps measured to gain."""
+    assert kernel.slab_run_copy_pays(tokens, 10, e_total=512) is pays
+
+
+@pytest.mark.parametrize(
+    "t_local,vmem,fits",
+    [
+        (256, None, True),  # Qwen3.8's 8,192-token step on TPU8i
+        (512, None, True),  # and its 16,384-token step
+        (1 << 16, None, False),  # ~2M tokens: past TPU8i's VMEM budget
+        (512, 1 << 20, False),  # the 16,384-token step on a 1 MiB VMEM
+    ],
+)
+def test_slab_run_copy_fits_its_vmem_budget(t_local, vmem, fits):
+    """The run copy is admitted only where its streams and tables fit VMEM."""
+    ep, topk, e_total, capacity = 32, 10, 512, 128
+    stride = host.ragged_stride_bound(ep * t_local, topk, e_total, capacity)
+    if vmem is None:
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_8I, 1)
+    else:
+        info = types.SimpleNamespace(vmem_capacity_bytes=vmem)
+    assert host.slab_run_copy_fits(t_local, topk, ep, stride, info) is fits
+
+
 def test_combine_arrivals_isolates_nan_on_unrouted_padded_tokens():
     """NaN arrival rows stay isolated to padded rows and zero out via row_routes."""
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
@@ -530,3 +731,14 @@ def test_row_routes_rejects_nan_and_neg_inf_across_all_scoring_fns(scoring_fn):
     scores = _apply_scoring_fn(gate_l, scoring_fn)
     routes = np.asarray(_row_routes(scores, gate_l))
     np.testing.assert_array_equal(routes, np.array([[True], [False], [False], [True]]))
+
+
+@pytest.mark.parametrize("tile_m,rows", [(64, 1), (128, 1), (256, 2), (512, 4)])
+def test_mirror_rows_per_tile_keeps_128_lanes_above_a_lane_block(tile_m, rows):
+    """A tile's mirror sublane above 128 lanes is stored as rows of 128."""
+    assert host.mirror_rows_per_tile(tile_m) == rows
+
+
+def test_mirror_rows_per_tile_refuses_a_partial_lane_row():
+    with pytest.raises(ValueError):
+        host.mirror_rows_per_tile(192)

@@ -65,6 +65,10 @@ class GDNConfig:
     # KDA only, and must be negative. Selects the bounded gate form over the
     # unbounded one; see `fused_conv1d_gdn` for the two and their validation.
     gate_lower_bound: float | None = None
+    # KDA only. Multiplies the delta-rule step size: beta = beta_scale *
+    # sigmoid(b). 1.0 keeps beta in [0, 1]; OLMo 3.5's KDA trains with
+    # allow_neg_eigval, i.e. 2.0 and beta in [0, 2).
+    beta_scale: float = 1.0
     num_buffers: int = 2
     # Max tokens per speculative verify window (= num_speculative_tokens + 1),
     # which is also the number of state checkpoints kept per sequence. The
@@ -153,7 +157,7 @@ class GDNConfig:
         # B = 16 // 3 = 5, which does not divide a 128-row chunk).
         # Chunk sizes are powers of two, so pick the largest power of two
         # that satisfies the budget instead of the exact quotient.
-        head_groups = pl.cdiv(self.num_v_heads, 8)
+        head_groups = pl.cdiv(self.num_v_heads, self.HEADS_PER_GROUP)
         if self.is_kda:
             for b in (16, 8, 4):
                 if head_groups * b * b <= 256:
@@ -198,6 +202,8 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
+        if self.is_kda and self.beta_scale != 1.0:
+            suffix += "_beta_scaled"
         return (
             f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
             f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
@@ -225,14 +231,47 @@ class GDNConfig:
     # wrapper sizes the tile against the same factor.
     DEFAULT_VMEM_FRACTION: ClassVar[float] = 0.80
     WINDOWED_VMEM_FRACTION: ClassVar[float] = 0.90
+    # 64 MiB TPU v7x VMEM capacity where dynamic tile timings were calibrated;
+    # capping heuristic sizing here prevents larger-VMEM chips from picking
+    # untimed tiles.
+    CALIBRATED_VMEM_CAPACITY_BYTES: ClassVar[int] = 64 * 1024 * 1024
+    # One TPU sublane group of 8 value heads; sizes triangular_block_size head
+    # groups and gates the KDA full-group prefill chunk cap.
+    HEADS_PER_GROUP: ClassVar[int] = 8
+    # Once n_v >= HEADS_PER_GROUP fills one sublane group, C = 64 saturates the
+    # KDA intra-chunk pipeline while C = 128 doubles per-token off-diagonal work.
+    MAX_KDA_FULL_GROUP_CHUNK: ClassVar[int] = 64
+    # Cap decode tiles at 16 sequences: larger tiles increase per-slot state DMA
+    # descriptors and register spills without reducing per-slot compute.
+    DECODE_TILE_SIZES: ClassVar[tuple[int, ...]] = (16, 8, 4, 2, 1)
+    MIXED_TILE_SIZES: ClassVar[tuple[int, ...]] = (128, 64, 32, 16, 8, 4, 2, 1)
 
     @classmethod
-    def get_vmem_limit_bytes(cls, window_size: int = 1) -> int:
-        """Returns the VMEM limit for a kernel keeping window_size checkpoints."""
+    def get_vmem_limit_bytes(
+        cls,
+        window_size: int = 1,
+        vmem_capacity_bytes: int | None = None,
+    ) -> int:
+        """Return the VMEM limit for a kernel keeping window_size checkpoints."""
+        capacity = (
+            pltpu.get_tpu_info().vmem_capacity_bytes
+            if vmem_capacity_bytes is None
+            else vmem_capacity_bytes
+        )
         fraction = (
             cls.WINDOWED_VMEM_FRACTION if window_size > 1 else cls.DEFAULT_VMEM_FRACTION
         )
-        return int(fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
+        return int(fraction * capacity)
+
+    @classmethod
+    def get_tiling_vmem_limit_bytes(cls, window_size: int = 1) -> int:
+        """Return heuristic VMEM budget capped at CALIBRATED_VMEM_CAPACITY_BYTES."""
+        return min(
+            cls.get_vmem_limit_bytes(window_size),
+            cls.get_vmem_limit_bytes(
+                window_size, vmem_capacity_bytes=cls.CALIBRATED_VMEM_CAPACITY_BYTES
+            ),
+        )
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
         conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)

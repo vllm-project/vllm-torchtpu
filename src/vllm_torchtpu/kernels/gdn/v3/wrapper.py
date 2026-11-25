@@ -308,28 +308,32 @@ def outer_kernel(
     _run()
 
 
+FUSED_CONV1D_GDN_STATIC_ARGNAMES: tuple[str, ...] = (
+    "n_kq",
+    "n_v",
+    "d_k",
+    "d_v",
+    "kernel_size",
+    "num_spec_tokens",
+    "decode_tile_size",
+    "mixed_tile_size",
+    "batched_only",
+    "prefill_only",
+    "zero_initialize_out",
+    "compute_precision",
+    "recurrent_dtype",
+    "conv_dtype",
+    "attention_mode",
+    "gate_lower_bound",
+    "beta_scale",
+    "kernel_act_dtype",
+    "kernel_conv_weight_dtype",
+)
+
+
 @jax.jit(
     donate_argnames=("states",),
-    static_argnames=(
-        "n_kq",
-        "n_v",
-        "d_k",
-        "d_v",
-        "kernel_size",
-        "num_spec_tokens",
-        "decode_tile_size",
-        "mixed_tile_size",
-        "batched_only",
-        "prefill_only",
-        "zero_initialize_out",
-        "compute_precision",
-        "recurrent_dtype",
-        "conv_dtype",
-        "attention_mode",
-        "gate_lower_bound",
-        "kernel_act_dtype",
-        "kernel_conv_weight_dtype",
-    ),
+    static_argnames=FUSED_CONV1D_GDN_STATIC_ARGNAMES,
 )
 def fused_conv1d_gdn(
     qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
@@ -356,6 +360,7 @@ def fused_conv1d_gdn(
     kernel_size: int,
     attention_mode: config.AttentionMode = config.AttentionMode.GDN,
     gate_lower_bound: float | None = None,
+    beta_scale: float = 1.0,
     recurrent_dtype: jnp.dtype | None = None,
     conv_dtype: jnp.dtype | None = None,
     num_spec_tokens: int = 0,
@@ -429,6 +434,9 @@ def fused_conv1d_gdn(
             `gate_lower_bound * sigmoid(exp(A_log) * (g + dt_bias))` (every K3
             variant, at -5.0). Different functions of the same weights, so a
             mismatch with the model's KDA config silently changes the decay.
+        beta_scale: KDA only. Scales the delta-rule step size,
+            `beta = beta_scale * sigmoid(b)`. 1.0 (Kimi) keeps beta in
+            [0, 1]; OLMo 3.5 uses 2.0 (allow_neg_eigval).
         num_spec_tokens: Number of speculative draft tokens (0 gives the
             plain 1-token-per-sequence decode path).
         batched_only: Run only the leading decode/verify segment.
@@ -503,6 +511,15 @@ def fused_conv1d_gdn(
                 "support."
             )
 
+    if beta_scale != 1.0 and not is_kda:
+        # GDN's delta rule has the same beta; only the KDA path scales it.
+        raise NotImplementedError(
+            "beta_scale is only implemented for KDA; got "
+            f"attention_mode={attention_mode}."
+        )
+    if beta_scale <= 0:
+        raise ValueError(f"beta_scale must be positive; got {beta_scale}.")
+
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
     assert conv_weight.shape == (dim, 1, kernel_size)
@@ -540,7 +557,23 @@ def fused_conv1d_gdn(
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
 
-    num_lanes = pltpu.get_tpu_info().num_lanes
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
+    num_sublanes = tpu_info.num_sublanes
+    # The unified pool addresses its state regions in lane-row granules
+    # (`_GranuleStateRef._granule_width`), which a wider value head would
+    # straddle.
+    if is_shared and d_v != num_lanes:
+        raise NotImplementedError(
+            f"The unified KV pool requires d_v == {num_lanes}; got d_v={d_v}."
+        )
+    # A bf16 recurrent state is packed (d_k // 2, 2, d_v) before the uint32
+    # bitcast; the full-row granule for d_v > num_lanes is only exercised for
+    # fp32 states.
+    if not is_shared and jnp.dtype(recurrent_dtype) == jnp.bfloat16 and d_v > num_lanes:
+        raise NotImplementedError(
+            f"A bf16 recurrent state requires d_v <= {num_lanes}; got d_v={d_v}."
+        )
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
     decode_tile_size = min(decode_tile_size, batch_size)
@@ -548,8 +581,7 @@ def fused_conv1d_gdn(
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
 
-    # KDA stays on static tiles until the VMEM estimate models its gate.
-    if envs.TPU_ENABLE_GDN_DYNAMIC_TILING and not is_kda:
+    if envs.TPU_ENABLE_GDN_DYNAMIC_TILING:
         decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
             batch_size=batch_size,
             num_seqs=num_seqs,
@@ -563,12 +595,17 @@ def fused_conv1d_gdn(
             act_out_dtype=act_out_dtype,
             recurrent_state_dtype=recurrent_dtype,
             num_lanes=num_lanes,
-            decode_vmem_limit_bytes=decode_vmem_limit_bytes,
-            mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+            decode_vmem_limit_bytes=config.GDNConfig.get_tiling_vmem_limit_bytes(
+                window_size
+            ),
+            mixed_vmem_limit_bytes=config.GDNConfig.get_tiling_vmem_limit_bytes(),
             window_size=window_size,
+            attention_mode=attention_mode,
+            num_sublanes=num_sublanes,
         )
         logger.info_once(
-            "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
+            "%s dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
+            attention_mode.value.upper(),
             num_seqs,
             batch_size,
             window_size,
@@ -602,11 +639,10 @@ def fused_conv1d_gdn(
         decode_tile_size = max(
             1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
         )
-
-    if num_spec_tokens > 0 and is_kda:
-        # KDA verify keeps one sequence per tile until multi-sequence KDA
-        # verify tiles are sized by a KDA-aware VMEM estimate.
-        decode_tile_size = 1
+        if num_spec_tokens > 0 and is_kda:
+            # Static fallback keeps one sequence per KDA verify tile when
+            # TPU_ENABLE_GDN_DYNAMIC_TILING is off.
+            decode_tile_size = 1
 
     batch_padding_size = padded_batch_size - batch_size
     num_v_padding_size = aligned_num_v_heads - n_v
@@ -677,6 +713,7 @@ def fused_conv1d_gdn(
             v_head_dim=d_v,
             attention_mode=attention_mode,
             gate_lower_bound=gate_lower_bound,
+            beta_scale=beta_scale,
             dtypes=config.Dtypes(
                 act_in=act_in_dtype,
                 act_out=act_out_dtype,

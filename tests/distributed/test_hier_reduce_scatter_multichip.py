@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_MOE_EP_HIER_RS over real collectives (EP = DP = 8 on one tpu7x host).
+"""TPU_MOE_EP_HIER_RS=bf16|fp8 over real collectives (EP = DP = 8, one tpu7x host).
 
 `test_hier_reduce_scatter.py` pins arming and dispatch against stand-ins; this
 arms the real op through `prebuild_hier_reduce_scatter()` and checks that
@@ -41,8 +41,10 @@ WORLD_SIZE = 8
 # must fall back to the micro-batched kernel (2048 x 7168 = 28 MiB).
 SHAPES = ((64, 4096), (160, 4096), (1024, 4096), (3072, 4096), (2048, 7168))
 CALLS_PER_SHAPE = 2  # serving calls the op once per MoE layer on new data
-# Both sides round a sum of 8 bf16 values to bf16, in different orders.
-MAX_REL_ERR = 1e-2
+# Both sides round a sum of 8 bf16 values to bf16, in different orders. On the
+# fp8 wire, calls of 16 MiB or more also round partial sums to e4m3 (~30 dB).
+MAX_REL_ERR = {"bf16": 1e-2, "fp8": 6e-2}
+FP8_STATIC_SCALE = "16"
 # Under the per-PR multichip lane's pytest --timeout=600.
 LAUNCH_TIMEOUT_SECONDS = 480
 
@@ -138,7 +140,8 @@ def _check(rank: int) -> dict:
     return out
 
 
-def test_hier_reduce_scatter_on_real_collectives(tmp_path):
+@pytest.mark.parametrize("wire", ["bf16", "fp8"])
+def test_hier_reduce_scatter_on_real_collectives(tmp_path, wire):
     result_dir = tmp_path / "hier_rs"
     result_dir.mkdir()
     from tests.distributed.tpu_test_utils import (
@@ -148,7 +151,9 @@ def test_hier_reduce_scatter_on_real_collectives(tmp_path):
     )
 
     env = torchrun_worker_env(WORLD_SIZE)
-    env["TPU_MOE_EP_HIER_RS"] = "bf16"
+    env["TPU_MOE_EP_HIER_RS"] = wire
+    if wire == "fp8":
+        env["TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE"] = FP8_STATIC_SCALE
     completed = launch_torchrun_workers(
         Path(__file__).resolve(),
         result_dir,
@@ -169,8 +174,8 @@ def test_hier_reduce_scatter_on_real_collectives(tmp_path):
                     assert case["kernel_calls"] == CALLS_PER_SHAPE, (r["rank"], case)
                 for call in case["calls"]:
                     assert call["shape"] == [rows // WORLD_SIZE, hidden], case
-                    assert call["vs_f32"] < MAX_REL_ERR, (r["rank"], how, case)
-                    assert call["vs_group"] < MAX_REL_ERR, (r["rank"], how, case)
+                    assert call["vs_f32"] < MAX_REL_ERR[wire], (r["rank"], how, case)
+                    assert call["vs_group"] < MAX_REL_ERR[wire], (r["rank"], how, case)
 
 
 if __name__ == "__main__":

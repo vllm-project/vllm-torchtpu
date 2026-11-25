@@ -127,33 +127,34 @@ if [ -z "${ACCESS_TOKEN:-}" ]; then
   exit 1
 fi
 
+resolve_latest_cp312_wheel_version() {
+  local dist_pkg="$1"
+  local wheel_prefix="$2"
+  local raw_html version
+
+  raw_html="$(curl -f -s -H "Authorization: Bearer ${ACCESS_TOKEN}" "${REGISTRY_URL}/${dist_pkg}/")" || {
+    echo "[FATAL] Failed to fetch ${dist_pkg} package index from ${REGISTRY_URL}/${dist_pkg}/" >&2
+    exit 1
+  }
+  # PEP 427 wheel names separate fields with '-'; match up to -cp312 without
+  # '-' inside the version segment so -cp312-cp312- is not partially kept.
+  version="$({ echo "${raw_html}" | grep -oE "${wheel_prefix}-[0-9a-zA-Z.+_]+-cp312" || true; } | sed "s/^${wheel_prefix}-//;s/-cp312\$//" | sort -V | tail -n 1)"
+  if [ -z "${version}" ]; then
+    echo "[FATAL] TORCHTPU_NIGHTLY is enabled, but failed to resolve a cp312 wheel for ${dist_pkg}!" >&2
+    exit 1
+  fi
+  echo "${version}"
+}
+
 TORCH_TPU_VERSION="${TORCH_TPU_VERSION_OVERRIDE:-}"
 TPU_SYNC_TORCH_VERSION="${TPU_SYNC_TORCH_VERSION_OVERRIDE:-}"
 
 if [ -z "${TORCH_TPU_VERSION}" ]; then
-  RAW_HTML_TORCH_TPU="$(curl -f -s -H "Authorization: Bearer ${ACCESS_TOKEN}" "${REGISTRY_URL}/torch-tpu/")" || {
-    echo "[FATAL] Failed to fetch torch-tpu package index from ${REGISTRY_URL}/torch-tpu/" >&2
-    exit 1
-  }
-  TORCH_TPU_VERSION="$(echo "${RAW_HTML_TORCH_TPU}" | grep -oE 'torch_tpu-[0-9a-zA-Z.+_-]+-cp312' | sed 's/torch_tpu-//;s/-cp312//' | sort -V | tail -n 1)"
+  TORCH_TPU_VERSION="$(resolve_latest_cp312_wheel_version "torch-tpu" "torch_tpu")" || exit 1
 fi
 
 if [ -z "${TPU_SYNC_TORCH_VERSION}" ]; then
-  RAW_HTML_TPU_SYNC="$(curl -f -s -H "Authorization: Bearer ${ACCESS_TOKEN}" "${REGISTRY_URL}/tpu-sync-torch/")" || {
-    echo "[FATAL] Failed to fetch tpu-sync-torch package index from ${REGISTRY_URL}/tpu-sync-torch/" >&2
-    exit 1
-  }
-  TPU_SYNC_TORCH_VERSION="$(echo "${RAW_HTML_TPU_SYNC}" | grep -oE 'tpu_sync_torch-[0-9a-zA-Z.+_-]+-cp312' | sed 's/tpu_sync_torch-//;s/-cp312//' | sort -V | tail -n 1)"
-fi
-
-if [ -z "${TORCH_TPU_VERSION}" ]; then
-  echo "[FATAL] TORCHTPU_NIGHTLY is enabled, but failed to resolve a cp312 wheel for torch-tpu!" >&2
-  exit 1
-fi
-
-if [ -z "${TPU_SYNC_TORCH_VERSION}" ]; then
-  echo "[FATAL] TORCHTPU_NIGHTLY is enabled, but failed to resolve a cp312 wheel for tpu-sync-torch!" >&2
-  exit 1
+  TPU_SYNC_TORCH_VERSION="$(resolve_latest_cp312_wheel_version "tpu-sync-torch" "tpu_sync_torch")" || exit 1
 fi
 
 echo "Resolved torch-tpu version: ${TORCH_TPU_VERSION}"

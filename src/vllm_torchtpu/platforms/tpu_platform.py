@@ -34,6 +34,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -218,9 +220,9 @@ _tpu_kv_connectors_registered = False
 
 
 def _configure_torchtpu_eager_mode() -> None:
-    from torch_tpu._internal import execution_mode
+    from torch import tpu
 
-    previous_mode = execution_mode.eager_mode
+    previous_mode = tpu.eager_mode
     # Kernel-iteration mode keeps DEFER_NEVER: DEFER_AND_FUSE fuses the eager
     # region around the split-out Pallas ops into per-context device programs,
     # each of which recompiles after a kernel hot-swap. With DEFER_NEVER the
@@ -230,10 +232,10 @@ def _configure_torchtpu_eager_mode() -> None:
             "TorchTPU eager mode left at %s (TPU_KERNEL_ITER_MODE).", previous_mode.name
         )
         return
-    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
+    tpu.eager_mode = tpu.EagerMode.DEFER_AND_FUSE
     logger.info(
         "TorchTPU eager mode configured: %s (previous=%s)",
-        execution_mode.eager_mode.name,
+        tpu.eager_mode.name,
         previous_mode.name,
     )
 
@@ -471,6 +473,7 @@ class TpuPlatform(Platform):
         "fp8",
         "mxfp4",
         "modelopt_fp4",
+        "modelopt_mixed",
         "deepseek_v4_fp8",
     ]
 
@@ -496,6 +499,7 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
+        "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS",
         "TPU_DP_VOCAB_PARALLEL",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
@@ -510,6 +514,18 @@ class TpuPlatform(Platform):
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
     ]
+
+    @classmethod
+    def pre_register_and_update(
+        cls, parser: "FlexibleArgumentParser | None" = None
+    ) -> None:
+        if parser is not None:
+            # Default EP weight filtering on for CLI entry points (`vllm serve`).
+            # Both model loaders gate on MoE + EP (+ non-EPLB for Run:AI), so
+            # this is a no-op for dense or non-EP runs while letting
+            # --disable-ep-weight-filter / --config YAML opt-outs travel cleanly
+            # through EngineArgs and pickled VllmConfig into spawned children.
+            parser.set_defaults(enable_ep_weight_filter=True)
 
     # The "Platform" base class has import_kernels() that tries to import
     # vllm._C, which is not available in the TPU Platform setup.
@@ -851,6 +867,14 @@ class TpuPlatform(Platform):
                 "nothing. Unset it; the fused expert-parallel MoE kernel is "
                 "USE_MOE_FUSED_EP_KERNEL=1."
             )
+        if "TPU_MOE_TOPK_WEIGHTS_FLOAT32" in os.environ:
+            raise ValueError(
+                "TPU_MOE_TOPK_WEIGHTS_FLOAT32 is no longer supported. Unset it "
+                "and pass --additional-config "
+                "'{\"tpu_moe_topk_weights_float32\": true}' instead."
+            )
+        # Rejects non-bool MoE reference-parity values before any worker starts.
+        get_moe_reference_parity(vllm_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
@@ -909,16 +933,20 @@ class TpuPlatform(Platform):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
         # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
-        if (
-            layout is VllmKVCacheLayout.LBHNC
-            and vllm_config.model_config is not None
-            and vllm_config.model_config.get_head_size() == 64
-        ):
-            raise NotImplementedError(
-                "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
-                "layout, which the head_dim==64 RPA kernel does not "
-                "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
+        # ModelConfig.get_head_size() collapses differing layers with max(), so
+        # also check each layer's typed ModelArchitectureConfig view.
+        if layout is VllmKVCacheLayout.LBHNC and vllm_config.model_config is not None:
+            arch_config = vllm_config.model_config.model_arch_config
+            has_hd64_layer = vllm_config.model_config.get_head_size() == 64 or any(
+                arch_config[i].head_size == 64
+                for i in range(arch_config.total_num_hidden_layers)
             )
+            if has_hd64_layer:
+                raise NotImplementedError(
+                    "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
+                    "layout, which the head_dim==64 RPA kernel does not "
+                    "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
+                )
         kv_cache_layout = get_flashinfer_layout_string(layout)
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
@@ -1180,8 +1208,9 @@ class TpuPlatform(Platform):
                 # vLLM may pass per-engine ParallelConfig objects to workers
                 # with data_parallel_size collapsed to 1. Preserve the original
                 # single-host DP size for TorchTPU rank/env setup.
-                # TODO: Remove TORCH_TPU_DP_SIZE once TorchTPU physical
-                # chip/PjRt binding no longer depends on torchrun-style
+                # TODO(https://github.com/google-pytorch/torch_tpu/issues/6757):
+                # Remove TORCH_TPU_DP_SIZE once TorchTPU physical chip/PjRt
+                # binding no longer depends on torchrun-style
                 # RANK/LOCAL_RANK/WORLD_SIZE before vLLM distributed init.
                 os.environ["TORCH_TPU_DP_SIZE"] = str(dp_size)
                 os.environ.setdefault(

@@ -500,6 +500,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         moe_routing.register_experts_start_buffer(layer, device=layer.w13_weight.device)
         if not self._use_adaptive_fused_moe:
             prebuild_fused_moe_kernel(
+                topk_weights_float32=self._tpu_topk_weights_float32,
                 topk=layer.moe_config.experts_per_token,
                 activation=activation_str,
                 use_ep=layer.moe_config.moe_parallel_config.use_ep,
@@ -569,8 +570,14 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         # the other three TPU MoE methods already passed it). moe_routing.route
         # passes `layer` uniformly, which fixes that -- flagging separately as
         # it's a behavior change, not just a refactor.
-        topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+        topk_weights, topk_ids = moe_routing.route(
+            layer,
+            x,
+            router_logits,
+            topk_weights_float32=self._tpu_topk_weights_float32,
+        )
         kwargs = {
+            "topk_weights_float32": self._tpu_topk_weights_float32,
             "hidden_states": x,
             "w1": layer.w13_weight,
             "w2": layer.w2_weight,

@@ -11,3 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+TPU_TILE_ROWS = 8
+_BF16_ITEMSIZE = 2
+
+
+def fused_qkvz_pcp_dma_row_alignment(hidden_itemsize: int = _BF16_ITEMSIZE) -> int:
+    """Row alignment required by ``fused_qkvz_projection_pcp_gdn`` VMEM DMA."""
+    return TPU_TILE_ROWS * (4 // hidden_itemsize)
+
+
+__all__ = ["TPU_TILE_ROWS", "fused_qkvz_pcp_dma_row_alignment"]

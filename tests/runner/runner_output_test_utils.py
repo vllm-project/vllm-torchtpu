@@ -16,19 +16,21 @@
 sampled tokens and logprobs, and references for the logprobs it returns."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import torch
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
+from vllm_torchtpu.runner import min_tokens, repetition_penalty
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
 
 
 def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
     """The runner state `TPUModelRunner.sample_tokens` reads for a synchronous
-    step without speculative decoding, logprobs, grammar or KV connector.
+    step without speculative decoding, logprobs, grammar, `repetition_penalty`
+    or KV connector.
     Chunk `i` holds `num_reqs_list[i]` requests and their logits
     `logits_list[i]`. The requests are r0, r1, ... in batch order, each with
     one scheduled token and no output yet, and they sample greedily (the
@@ -91,6 +93,7 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
             propose_draft_token_ids=lambda **_kwargs: None
         ),
         _min_tokens_batch_state=lambda: {},
+        _repetition_penalty=SimpleNamespace(begin_step=lambda _batch: False),
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda x: torch.argmax(x, dim=-1),
         _update_mamba_slot_read_offsets=lambda *_args: None,
@@ -125,6 +128,53 @@ def _host_copy_state(chunks, lengths, **kwargs):
         copy_ready_event=MagicMock(),
         **kwargs,
     )
+
+
+def plain_step_runner(logits: torch.Tensor) -> SimpleNamespace:
+    """`_sample_tokens_runner` state for one chunk with the greedy request
+    `r0`, with the runner's own `min_tokens` and `repetition_penalty` trackers
+    and methods and neither set on the request. Tests change the fields they
+    need."""
+    runner = _sample_tokens_runner(
+        [logits],
+        [1],
+        _min_tokens=min_tokens.MinTokensTracker(),
+        _repetition_penalty=repetition_penalty.RepetitionPenaltyTracker(
+            logits.shape[1],
+            max(8, logits.shape[0]),
+            async_scheduling=False,
+            speculative_decoding=False,
+        ),
+    )
+    request = runner.requests["r0"]
+    request.prompt_token_ids = None
+    batch = runner.input_batch
+    batch.repetition_penalties_reqs = set()
+    batch.repetition_penalties_cpu = np.ones(1, dtype=np.float32)
+    batch.req_output_token_ids = [request.output_token_ids]
+    for name in (
+        "_mask_min_tokens",
+        "_min_tokens_batch_state",
+        "_settle_draft_placeholders_for_min_tokens",
+        "_num_output_tokens",
+    ):
+        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+    return runner
+
+
+def run_sample_tokens(runner):
+    """`TPUModelRunner.sample_tokens` on `runner`, eager, with the D2H copy of
+    the sampled tokens replaced by a host copy."""
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=False
+        ),
+        patch.object(
+            AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy_state
+        ),
+        torch.compiler.set_stance("force_eager"),
+    ):
+        return TPUModelRunner.sample_tokens(runner, None)
 
 
 def _blocking_logprobs_lists(chunks):

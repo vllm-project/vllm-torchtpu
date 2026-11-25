@@ -79,7 +79,7 @@ On multi-chip and multi-host slices, `vllm-torchtpu` provides specialized MoE ex
 | `USE_MOE_SPARSE_CORE` | `1` | Offloads MoE token routing/gather-reduce collectives to TPU SparseCores. |
 | `USE_MOE_FUSED_EP_KERNEL` | `0` | Enables the fused Expert-Parallel Pallas kernel (`v1` or `v2` via `MOE_FUSED_EP_KERNEL_IMPL`). |
 | `TPU_MOE_HIERARCHICAL_EP` | `0` | Enables two-level (intra-chip / inter-chip) hierarchical EP token dispatch on dual-core TPU v7x topologies. |
-| `TPU_MOE_EP_HIER_RS` | `off` | `bf16` runs the EP MoE combine's reduce-scatter on the hierrs_tc TensorCore kernels. Off by default until it has an end-to-end evaluation. Needs one tpu7x 2x2x1 host with `DP=8, TP=1 + EP`, no `MOE_FUSED_EP_SORTED_GATHER` and no MTP; anywhere else it warns and keeps the group's reduce-scatter. No effect on layers the fused EP kernel serves. See [Environment Variables](../reference/env_vars.md). |
+| `TPU_MOE_EP_HIER_RS` | `off` | `bf16` or `fp8` runs the EP MoE combine's reduce-scatter on the hierrs_tc TensorCore kernels with that wire dtype between chips (`fp8` needs `TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE`). Off by default until it has an end-to-end evaluation. Needs one tpu7x 2x2x1 host with `DP=8, TP=1 + EP`, no `MOE_FUSED_EP_SORTED_GATHER` and no MTP; anywhere else it warns and keeps the group's reduce-scatter. No effect on layers the fused EP kernel serves. See [Environment Variables](../reference/env_vars.md). |
 | `TPU_EXPERT_PLACEMENT` | `""` | Static expert placement: a JSON table (local path or `gs://` URI) giving, per MoE layer, which experts each EP rank holds, as a permutation that evens out their load. Applied at weight load; works with every MoE kernel. |
 | `TPU_MOE_SEQUENCE_PARALLEL` | `0` | Keeps activations sequence-parallel entering MoE layers to replace all-reduce with reduce-scatter + all-gather. |
 | `TPU_LATENT_PROJ_INTRA_CHIP_TP` | `0` | Shards MLA latent projections across the 2 cores of each physical TPU v7x chip even when `TP=1`. |
@@ -109,13 +109,14 @@ A pipeline stage may also span a prefill context-parallel group (`--prefill-cont
 
 For long-context workloads (32K–256K+ tokens) or Prefill/Decode disaggregated serving:
 
-- **Prefill Context Parallelism (`--prefill-context-parallel-size`)**: Distributes prefill sequence chunks across `PCP` ranks. `TPU_PCP_TOPOLOGY_AWARE_MESH=1` (enabled by default) binds consecutive PCP ranks to adjacent physical chips on the ICI torus to minimize ring-attention hop latency.
+- **Prefill Context Parallelism (`--prefill-context-parallel-size`)**: Distributes prefill sequence chunks across `PCP` ranks. `TPU_PCP_TOPOLOGY_AWARE_MESH=1` (enabled by default) binds consecutive PCP ranks to adjacent physical chips on the ICI torus to minimize ring-attention hop latency. Pooled Qwen GDN hybrid models require `--cp-kv-cache-interleave-size` to be a multiple of `16` (for example, `128` or `256`; vLLM defaults to `1`).
 - **Decode Context Parallelism (`--decode-context-parallel-size`)**: Distributes KV cache pages across `DCP` ranks during decode.
 
 ```bash
 vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
   --tensor-parallel-size 2 \
   --prefill-context-parallel-size 4 \
+  --cp-kv-cache-interleave-size 128 \
   --enable-expert-parallel \
   --kv-cache-dtype fp8 \
   --max-model-len 65536

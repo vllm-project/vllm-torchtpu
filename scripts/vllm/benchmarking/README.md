@@ -81,6 +81,11 @@ Compares `lm_eval` accuracy to `baselines/eval/<config>.<task>.baseline.json`.
 The default tolerance is 1.5pp; a config can override it with `EVAL_TOLERANCE`.
 Only keys present in the baseline are gated.
 
+Each task is compared on the accuracy metric of its baseline entry, the first
+in the script's `ACC_KEYS` order when the entry has several. A task whose
+results lack that metric fails as `(no result)`. No other accuracy metric of
+the task stands in for it.
+
 Where the baseline carries a standard error (`exact_match_stderr`), the allowed
 drop becomes a one-sided 95% significance test:
 
@@ -108,6 +113,27 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --results-dir <DIR> \
   --baseline scripts/vllm/benchmarking/baselines/eval/<config>.<task>.baseline.json
 ```
+
+`--calibrate` writes a baseline as the median of the runs, one `--results-dir`
+per run:
+
+```bash
+python3 scripts/vllm/benchmarking/check_regression.py \
+  --mode eval --calibrate --task-filter <task> \
+  --results-dir <RUN1> --results-dir <RUN2> --results-dir <RUN3>
+```
+
+`--task-filter` selects the tasks that go into the baseline. It takes
+comma-separated tasks, or `all` for every task in the runs. Its default is
+`mmlu_llama`, `mmlu_llama_humanities`, `mmlu_llama_stem`,
+`mmlu_llama_social_sciences`, `mmlu_llama_other`, `mmlu_pro`,
+`humaneval_plus_tpu`, and `mbpp_plus_tpu`. Any other task, such as `mmmu_pro`,
+needs the flag.
+
+`--calibrate` exits `2` instead of writing a baseline when a run has no
+selected task or lacks an accuracy metric that another run has. A run may lack
+a standard error. The baseline then takes the median of the standard errors
+that the other runs reported.
 
 ## Accuracy Evaluation (`lm_eval`)
 

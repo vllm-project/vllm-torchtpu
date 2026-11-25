@@ -19,15 +19,18 @@ from unittest.mock import MagicMock
 import numpy as np
 import torch
 from vllm.config.reasoning import ReasoningConfig
+from vllm.model_executor.layers.attention import Attention
+from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import create_sequence_layout_planner
-from vllm_torchtpu.runner import min_tokens
+from vllm_torchtpu.runner import min_tokens, repetition_penalty
 from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import CachedRequestState
 from vllm_torchtpu.structured_decoding.structured_decoding_manager import (
     StructuredDecodingManager,
 )
@@ -304,7 +307,8 @@ def _make_sample_runner(
     ``_sample_plain_chunk``, ``_sample_spec_verify_chunk``, min_tokens, async
     output, verify gathers) to a CPU ``SimpleNamespace`` with real
     ``MinTokensTracker`` and ``ThinkingBudgetTracker`` instances fed from
-    ``requests``.
+    ``requests``, and a real ``RepetitionPenaltyTracker`` with no penalized
+    request.
     """
     tracker = ThinkingBudgetTracker(
         reasoning_cfg, max_num_reqs=max_num_reqs, device=torch.device("cpu")
@@ -345,6 +349,7 @@ def _make_sample_runner(
                 for rid in req_ids
             ],
             token_ids_cpu=np.zeros((max(len(req_ids), 1), 64), dtype=np.int32),
+            repetition_penalties_reqs=set(),
         ),
         requests=requests,
         num_prompt_logprobs={},
@@ -352,6 +357,12 @@ def _make_sample_runner(
         _dp_step_other_decode=False,
         _min_tokens=min_tracker,
         _thinking_budget=tracker,
+        _repetition_penalty=repetition_penalty.RepetitionPenaltyTracker(
+            vocab_size,
+            max_num_reqs,
+            async_scheduling=async_scheduling,
+            speculative_decoding=spec_k is not None,
+        ),
         _greedy_head_owner=object() if top_tokens else None,
         speculative_config=spec_cfg,
         rejection_sampler=(
@@ -422,3 +433,28 @@ def _make_sample_runner(
         runner  # type: ignore[arg-type]
     )
     return runner
+
+
+def attention_layer_mock(backend=PallasAttentionBackend, **attrs):
+    """An `Attention` mock whose `get_attn_backend()` returns a real backend.
+
+    `get_kv_cache_spec` measures page padding through the backend the layer
+    reports. A bare `MagicMock` returns a mock shape, which iterates as empty
+    and silently makes that arithmetic meaningless.
+
+    `attrs` set layer attributes; when given, the layer is also a plain
+    decoder layer with no sliding window, KV sharing or draft role unless
+    `attrs` say otherwise.
+    """
+    layer = MagicMock(spec=Attention)
+    layer.get_attn_backend.return_value = backend
+    if attrs:
+        defaults = {
+            "attn_type": AttentionType.DECODER,
+            "sliding_window": None,
+            "kv_sharing_target_layer_name": None,
+            "is_draft_layer": False,
+        }
+        for name, value in {**defaults, **attrs}.items():
+            setattr(layer, name, value)
+    return layer
