@@ -151,11 +151,27 @@ class _FakeMtpModel:
 _ROWS, _WIDTH = 64, 32  # the table: max_num_batched_tokens x index_topk
 
 
+@pytest.fixture(params=["defer_never", "defer_and_fuse"])
+def eager_mode(request):
+    """torch_tpu's eager mode for one test, put back afterwards.
+
+    The eager mode decides which ops torch_tpu fuses, and so which buffers
+    alias. Serving sets DEFER_AND_FUSE through `_configure_torchtpu_eager_mode`;
+    kernel-iteration runs (TPU_KERNEL_ITER_MODE) keep DEFER_NEVER.
+    """
+    previous = torch.tpu.eager_mode
+    try:
+        torch.tpu.eager_mode = torch.tpu.EagerMode.DEFER_NEVER
+        if request.param == "defer_and_fuse":
+            _configure_torchtpu_eager_mode()
+        yield
+    finally:
+        torch.tpu.eager_mode = previous
+
+
 def _mtp_table(compiled):
     """A table the two-layer forward has written (donating it twice), the
     forward, a stand-in proposer holding the table, and the table's contents."""
-    # Serving runs torch_tpu's eager ops in this mode; prove the snapshot in it.
-    _configure_torchtpu_eager_mode()
     stale, topk_a, topk_b = _inputs(_ROWS, _WIDTH, _WIDTH, _ROWS, _ROWS, n=2)
     layers, fwd = _check_two_layers(
         stale, _WIDTH, _ROWS, topk_a, topk_b, compiled=compiled
@@ -180,7 +196,7 @@ def _donated_write(fwd, table, first, second):
 @pytest.mark.parametrize("clobber", ["next_chunk", "dp_padding_chunk"])
 @pytest.mark.parametrize("num_rows", [_ROWS, 2], ids=["full_table", "sub_slice"])
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
-def test_mtp_restore_after_donated_write(compiled, num_rows, clobber):
+def test_mtp_restore_after_donated_write(eager_mode, compiled, num_rows, clobber):
     """`Eagle3Proposer` holds the table and writes it outside the donated op.
     IndexShare compacts and snapshots step 0's rows; another step-0 forward --
     the next chunk's, or an EP-DP padding chunk's under DP lockstep -- donates
@@ -188,7 +204,7 @@ def test_mtp_restore_after_donated_write(compiled, num_rows, clobber):
     satisfy a clone of a view that covers the whole table by aliasing the
     table's buffer, so a full-table snapshot must be a buffer of its own or
     the restore reads a donated buffer. The table must stay a valid, writable
-    tensor across all of it."""
+    tensor across all of it, in both eager modes."""
     buf, fwd, proposer, table, topk_a, topk_b = _mtp_table(compiled)
     g = torch.Generator().manual_seed(num_rows)
 
