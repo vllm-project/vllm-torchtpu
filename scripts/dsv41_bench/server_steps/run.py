@@ -466,10 +466,12 @@ def main() -> None:
             ]
             assert_no_compilation((args.out / "server.log").read_text(), intervals)
             timing["formal_status"] = "passed"
-            # DSV41_PYSPY_SECONDS=<n> samples every server process's Python
-            # stacks for n seconds over decode rounds on the cached prefixes,
-            # so the host loop's time can be split by function.
-            if decode and (seconds := int(env.get("DSV41_PYSPY_SECONDS", "0"))):
+            # DSV41_PYSPY=1 samples every server process's Python stacks over
+            # four decode rounds on the cached prefixes, so the host loop's
+            # time can be split by function. The window is the client's run:
+            # py-spy's --duration counts sampling intervals, and behind on the
+            # server's process tree it ran 276 s past a 40 s duration.
+            if decode and env.get("DSV41_PYSPY", "0") == "1":
                 if shutil.which("py-spy") is None:
                     subprocess.run(
                         ["uv", "pip", "install", "--system", "-q", "py-spy"],
@@ -486,8 +488,6 @@ def main() -> None:
                         "--idle",
                         "--rate",
                         "200",
-                        "--duration",
-                        str(seconds),
                         "--format",
                         "raw",
                         "--output",
@@ -511,7 +511,9 @@ def main() -> None:
                         stderr=subprocess.STDOUT,
                         check=True,
                     )
-                sampler.wait(timeout=seconds + 120)
+                # SIGINT makes py-spy stop sampling and write its output.
+                sampler.send_signal(signal.SIGINT)
+                sampler.wait(timeout=120)
             if args.profile:
                 timing["profile_status"] = "failed"
                 with (args.out / "client-profile.log").open("w") as profile_log:
