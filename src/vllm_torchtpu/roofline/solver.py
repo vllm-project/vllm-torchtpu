@@ -29,6 +29,7 @@ from .constants import (
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
     LINEAR_ATTENTION_LAYER_TOKENS,
+    NO_FEASIBLE_LAYOUT_WARNING,
     UNIT_GIGA,
     UNIT_MILLIS_PER_SECOND,
 )
@@ -341,6 +342,7 @@ class ServingPlan:
     collective_latency_s: float = 0.0
     spec_k: int = 0
     sort_by: _SortBy = "throughput"
+    model_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -2338,14 +2340,31 @@ def _validate_solve_options(opts: SolveOptions) -> None:
         raise ValueError(msg)
 
 
+def _active_mode_min_ttft(
+    mode: str,
+    min_prefill_ttft_ms: float,
+    min_mixed_ttft_ms: float,
+) -> float:
+    """Return minimum single-request TTFT floor for the requested serving mode."""
+    if mode == "disagg":
+        return min_prefill_ttft_ms
+    if mode == "mixed":
+        return min_mixed_ttft_ms
+    return min(min_prefill_ttft_ms, min_mixed_ttft_ms)
+
+
 def _collect_warnings(
     geometry: ModelGeometry,
     scenario: TrafficScenario,
-    min_c1_tpot_ms: float,
-    min_req_ttft_ms: float,
+    min_floors_ms: tuple[float, float],
     ordered_candidates: tuple[ParetoPoint, ...],
+    *,
+    has_any_pool: bool = True,
+    pools_meet_slo: bool = True,
+    disagg_pairs_skipped: bool = False,
 ) -> tuple[str, ...]:
-    """Collect scenario context and SLO infeasibility warnings."""
+    """Collect scenario context, capacity, and SLO infeasibility warnings."""
+    min_c1_tpot_ms, min_req_ttft_ms = min_floors_ms
     ctx_full = scenario.isl + scenario.osl
     warnings: list[str] = []
     if (
@@ -2374,12 +2393,17 @@ def _collect_warnings(
             f"INFEASIBLE_SLO: ttft_slo_ms={scenario.ttft_slo_ms:.2f} < "
             f"single-request prefill floor {min_req_ttft_ms:.2f} ms",
         )
-    if (
-        ordered_candidates
-        and not any(point.slo_met for point in ordered_candidates)
-        and not warnings
-    ):
+    if not ordered_candidates and not has_any_pool:
+        warnings.append(NO_FEASIBLE_LAYOUT_WARNING)
+    elif ordered_candidates and not any(point.slo_met for point in ordered_candidates):
         warnings.append("SLO_UNMET: no feasible topology met both TTFT and TPOT bounds")
+    elif not ordered_candidates and has_any_pool and not pools_meet_slo:
+        warnings.append("SLO_UNMET: no feasible pool met the active SLO bounds")
+    if disagg_pairs_skipped and has_any_pool:
+        warnings.append(
+            "DISAGG_PAIRS_NOT_EVALUATED: disaggregated pool pairs were not evaluated "
+            "(pass include_pairs=True or --pairs)"
+        )
     return tuple(warnings)
 
 
@@ -2465,19 +2489,28 @@ def solve_serving_plan(
         opts.sort_by,
         opts.top_k,
     )
+    pools_meet_slo = (
+        not prefill_pools or any(record.slo_met for record in prefill_pools)
+    ) and (not decode_pools or any(record.slo_met for record in decode_pools))
     warnings = _collect_warnings(
         geometry,
         scenario,
-        min_c1_tpot_ms,
-        min(min_prefill_ttft_ms, min_mixed_ttft_ms),
+        (
+            min_c1_tpot_ms,
+            _active_mode_min_ttft(opts.mode, min_prefill_ttft_ms, min_mixed_ttft_ms),
+        ),
         ordered_candidates,
+        has_any_pool=bool(prefill_pools or decode_pools),
+        pools_meet_slo=pools_meet_slo,
+        disagg_pairs_skipped=opts.mode in ("auto", "disagg") and not opts.include_pairs,
     )
+    slo_met_candidates = [point for point in ordered_candidates if point.slo_met]
     recommended = (
         min(
-            ordered_candidates,
+            slo_met_candidates,
             key=lambda point: _candidate_sort_key(point, opts.sort_by),
         )
-        if ordered_candidates
+        if slo_met_candidates
         else None
     )
     return ServingPlan(
@@ -2495,4 +2528,5 @@ def solve_serving_plan(
         collective_latency_s=opts.collective_latency_s,
         spec_k=spec_k,
         sort_by=opts.sort_by,
+        model_id=geometry.model_id,
     )

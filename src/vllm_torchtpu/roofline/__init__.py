@@ -48,6 +48,10 @@ from .constants import (
     SUPPORTED_MODELS,
     ModelSpec,
 )
+from .emit import (
+    CeilingRow,
+    emit_ceiling_rows,
+)
 from .geometry import (
     KeyTracker,
     LayerCounts,
@@ -126,6 +130,7 @@ __all__ = [
     "SUPPORTED_MODEL_TYPES",
     "TOPOLOGIES",
     "ActivationRegime",
+    "CeilingRow",
     "ChipOverrides",
     "ChipSpec",
     "Collective",
@@ -171,6 +176,7 @@ __all__ = [
     "count_layer_types",
     "dsa_indexer_layer_weight_elems",
     "dtypes_from_hf_config",
+    "emit_ceiling_rows",
     "eval_link_subset_bound_s",
     "from_hf_config",
     "hbm_breakdown_per_core_bytes",
