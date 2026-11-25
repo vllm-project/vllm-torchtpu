@@ -1725,6 +1725,14 @@ SEND_EXCHANGE_VMEM_LIMIT_BYTES = 16 * 1024 * 1024
 # none, or these roles -- "kv" (the gathered KV / live views), "q", "q_pe",
 # "tab" (the q rope table), "recv" (the aliased receive-buffer input).
 SEND_EXCHANGE_PIN_ROLES = ("kv", "q", "q_pe", "tab", "recv")
+# Scoped VMEM of the send-layout call without the fused exchange (`send_world`
+# without `send_exchange`; about 11 MiB of scratch at T = 32). The default
+# limit reserves all of VMEM for the call, so no XLA prefetch (o_proj's weight)
+# can stay live across it and the copy waits for the call to end. As for the
+# fused exchange, its array operands and the send buffer are pinned to HBM:
+# XLA would otherwise stage the gathered KV into VMEM before the call and evict
+# the send buffer to HBM after it, both with exposed copies.
+SEND_LAYOUT_VMEM_LIMIT_BYTES = 32 * 1024 * 1024
 # Test-only: positive controls (misrouted / dropped peer block) and timing-
 # only removal arms (the round replaced by local copies; the barrier waited
 # at entry instead of after the body) of the fused exchange.
@@ -5336,6 +5344,8 @@ def sparse_attention_chunk(
                             else SEND_EXCHANGE_VMEM_LIMIT_BYTES,
                         )
                         if send_exchange is not None
+                        else min(vmem_limit_bytes, SEND_LAYOUT_VMEM_LIMIT_BYTES)
+                        if send_world
                         else vmem_limit_bytes
                     ),
                     disable_bounds_checks=True,
@@ -5377,11 +5387,12 @@ def sparse_attention_chunk(
                             dtype=jnp.int16,
                         )
                         if send_exchange is not None
-                        else jax.ShapeDtypeStruct(
-                            shape=send_layout_shape(
+                        # SEND_LAYOUT_VMEM_LIMIT_BYTES: the send buffer in HBM.
+                        else pltpu.HBM(
+                            send_layout_shape(
                                 q.shape[0], num_q_heads, send_world, q.shape[-1]
                             ),
-                            dtype=jnp.int16,
+                            jnp.int16,
                         )
                         if send_world
                         else jax.ShapeDtypeStruct(shape=lse_shape, dtype=jnp.float32),
@@ -5444,6 +5455,11 @@ def sparse_attention_chunk(
                 if pin is True or (pin and r in pin)
                 else x
                 for x, r in zip(operands, roles)
+            ]
+        elif send_world:
+            # SEND_LAYOUT_VMEM_LIMIT_BYTES: every array operand stays in HBM.
+            operands = [
+                pltpu.with_memory_space_constraint(x, pltpu.HBM) for x in operands
             ]
         if out_vmem:
             operands = [
