@@ -73,7 +73,9 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    CircularBufferSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
@@ -3710,6 +3712,11 @@ class TPUModelRunner(GPUModelRunner):
                 self.device, non_blocking=True
             )
         else:
+            if zero_pad_tail:
+                # Avoid stale position IDs in padded rows when tail zeroing is active.
+                self.positions_cpu[
+                    total_num_scheduled_tokens:padded_total_num_scheduled_tokens
+                ] = 0
             self.position_ids = self.positions_cpu[local_token_slice].to(
                 self.device, non_blocking=True
             )
@@ -6860,6 +6867,10 @@ class TPUModelRunner(GPUModelRunner):
                 num_tokens, zeros=not profiling, random=profiling
             )
             self._pp_take_topk_indices(intermediate_tensors, num_tokens)
+        # Populate DPMetadata on warmup/profile dummy runs too (dp_lockstep=False)
+        # so set_forward_context skips coordinate_batch_across_dp(0) and matches
+        # serving's active DP forward context.
+        num_tokens_across_dp = self._dp_num_tokens_across_dp(num_tokens)
         with (
             self.maybe_select_dummy_loras(
                 self.lora_config, np.array([num_tokens], dtype=np.int32)
@@ -6867,10 +6878,8 @@ class TPUModelRunner(GPUModelRunner):
             set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=num_tokens if dp_lockstep else 0,
-                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens)
-                if dp_lockstep
-                else None,
+                num_tokens=num_tokens if num_tokens_across_dp is not None else 0,
+                num_tokens_across_dp=num_tokens_across_dp,
             ),
             set_vllm_model_wrapper_context(
                 mesh=self.mesh,
@@ -6915,8 +6924,16 @@ class TPUModelRunner(GPUModelRunner):
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
+                # Avoid unpadded/oversized logits shapes when num_tokens < num_reqs.
+                logits_num_reqs = (
+                    self._dp_vocab_logits_rows()
+                    if self._dp_vocab_logits
+                    else _get_padded_num_reqs_with_upper_limit(
+                        min(num_tokens, num_reqs), self.max_num_reqs
+                    )
+                )
                 _idx = torch.zeros(
-                    self._dp_vocab_logits_rows() if self._dp_vocab_logits else num_reqs,
+                    logits_num_reqs,
                     dtype=torch.int32,
                     device=out.device,
                 )
@@ -8004,11 +8021,7 @@ class TPUModelRunner(GPUModelRunner):
         block_ids_per_group = []
         max_nblk = 0
         for group in self.kv_cache_config.kv_cache_groups:
-            group_block_size = int(group.kv_cache_spec.block_size)
-            group_num_blocks = min(
-                cdiv(max_pos, group_block_size),
-                cdiv(self.max_model_len, group_block_size),
-            )
+            group_num_blocks = _spec_warmup_group_num_blocks(self, group, max_pos)
             block_ids_per_group.append(list(range(top - group_num_blocks, top)))
             max_nblk = max(max_nblk, group_num_blocks)
         if top <= max_nblk + 1:
@@ -8796,10 +8809,7 @@ class TPUModelRunner(GPUModelRunner):
                 P_mix = int(self.max_num_tokens) - R * (1 + K)
                 P_mix = max(P, min(P_mix, self.max_model_len - (1 + K) - 1))
                 mix_nblks = [
-                    min(
-                        cdiv(P_mix + 1 + K, int(g.kv_cache_spec.block_size)),
-                        cdiv(self.max_model_len, int(g.kv_cache_spec.block_size)),
-                    )
+                    _spec_warmup_group_num_blocks(self, g, P_mix + 1 + K)
                     for g in self.kv_cache_config.kv_cache_groups
                 ]
                 mix_nblk = max(mix_nblks)
@@ -9720,6 +9730,19 @@ def _get_req_paddings(min_req_size: int, max_req_size: int) -> list[int]:
 def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
     res = MIN_NUM_SEQS if x <= MIN_NUM_SEQS else 1 << (x - 1).bit_length()
     return min(res, upper_limit)
+
+
+def _spec_warmup_group_num_blocks(
+    runner: "TPUModelRunner",
+    group: KVCacheGroupSpec,
+    max_position: int,
+) -> int:
+    spec = group.kv_cache_spec
+    first_spec = spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+    max_len = min(max_position, runner.max_model_len)
+    if isinstance(first_spec, CircularBufferSpec):
+        return spec.max_num_blocks_per_req(runner.vllm_config, max_len)
+    return cdiv(max_len, int(spec.block_size))
 
 
 def _get_padded_token_len(paddings: list[int], x: int) -> int:
