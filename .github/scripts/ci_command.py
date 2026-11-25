@@ -62,6 +62,9 @@ CANARY_BUILDS_URL = (
     "https://api.buildkite.com/v2/organizations/vllm/pipelines/"
     "vllm-torchtpu-ci-mq-canary/builds"
 )
+# CI is retired on this unmaintained partner release branch, so /ci ignores
+# PRs based on it.
+RETIRED_BASE = "partner/release-0.0.1"
 GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
 _AUTO_MERGE_MUTATION = (
     "mutation($id: ID!) { "
@@ -166,11 +169,13 @@ def _builds_url(pr: dict[str, Any]) -> str:
 
 
 def _is_inert(repo: str, pr_number: int, gh_token: str, *, live: bool) -> bool:
-    """Before cutover, ignore every PR that isn't based on the canary branch."""
-    if live:
-        return False
+    """Ignore PRs based on the retired partner branch, and before cutover every
+    PR that isn't based on the canary branch."""
     pr = _api_json(f"https://api.github.com/repos/{repo}/pulls/{pr_number}", gh_token)
-    return _base_ref(pr) != CANARY_BASE
+    base_ref = _base_ref(pr)
+    if base_ref == RETIRED_BASE:
+        return True
+    return not live and base_ref != CANARY_BASE
 
 
 def _err_summary(exc: Exception) -> str:

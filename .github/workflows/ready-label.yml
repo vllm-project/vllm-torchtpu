@@ -47,6 +47,9 @@ concurrency:
 jobs:
   ready-label:
     name: Check for Ready Label
+    # CI is retired on partner/release-0.0.1. pull_request_target always runs
+    # this file from main, so the branch can't turn the check off itself.
+    if: github.event.pull_request.base.ref != 'partner/release-0.0.1'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - name: Require the ready label
