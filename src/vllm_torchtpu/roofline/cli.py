@@ -35,6 +35,8 @@ from .constants import (
     EXAMPLE_SLO_TIERS,
     EXPERT_DTYPE_BYTES,
     KV_DTYPE_BYTES,
+    MIN_INSTANCES,
+    MIN_TOP_K,
     NO_FEASIBLE_LAYOUT_WARNING,
     STATE_DTYPE_BYTES,
     UNIT_GIGA,
@@ -43,7 +45,12 @@ from .constants import (
     UNIT_MICRO,
     WEIGHT_DTYPE_BYTES,
 )
-from .emit import emit_ceiling_rows
+from .emit import (
+    build_solve_payload,
+    emit_ceiling_rows,
+    format_solve_json,
+    slice_per_concurrency,
+)
 from .geometry import UnsupportedArchitectureError, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config_with_identity
 from .modules import Dtypes, Parallel, StepShape
@@ -145,7 +152,12 @@ def _add_scenario_args(parser: argparse.ArgumentParser) -> None:
         "--example-scenario", default=None, choices=sorted(EXAMPLE_SCENARIOS)
     )
     parser.add_argument("--mode", default="auto", choices=("auto", "mixed", "disagg"))
-    parser.add_argument("--max-chips", type=int, default=None)
+    parser.add_argument(
+        "--max-chips", "--num-chips", dest="max_chips", type=int, default=None
+    )
+    parser.add_argument("--prefill-topology", type=str, default=None)
+    parser.add_argument("--decode-topology", type=str, default=None)
+    parser.add_argument("--pd", type=str, default=None)
     parser.add_argument("--max-instances", type=int, default=None)
     parser.add_argument(
         "--example-slo-tier", default="none", choices=sorted(EXAMPLE_SLO_TIERS)
@@ -303,12 +315,10 @@ def _resolve_scenario(
         or args.osl is None
         or args.prefix_hit_rate is None
         or args.accept_len is None
-        or args.think_time_s is None
     ):
         parser.error(
             "Either --example-scenario or all of --isl, --osl, "
-            "--prefix-hit-rate, --accept-len, and --think-time-s "
-            "are required."
+            "--prefix-hit-rate, and --accept-len are required."
         )
     return TrafficScenario(
         name="custom",
@@ -352,7 +362,7 @@ def _write_warnings(warnings: Sequence[str]) -> None:
 
 def _dispatch_ceiling(args: argparse.Namespace, serving_plan: ServingPlan) -> int:
     """Write uncalibrated candidate ceiling rows as JSON array or JSON lines."""
-    ceiling_rows = emit_ceiling_rows(serving_plan)
+    ceiling_rows = emit_ceiling_rows(serving_plan, top_k=args.top_k)
     if serving_plan.warnings:
         _write_warnings(serving_plan.warnings)
     if not ceiling_rows:
@@ -369,16 +379,41 @@ def _dispatch_ceiling(args: argparse.Namespace, serving_plan: ServingPlan) -> in
     return 0
 
 
-def _write_solve_text_output(serving_plan: ServingPlan) -> int:
+def _parse_pd_ratio(
+    raw_pd: str | None,
+    parser: argparse.ArgumentParser,
+) -> tuple[int, int] | None:
+    """Parse optional --pd PREFILL:DECODE string into positive integer pair."""
+    if raw_pd is None:
+        return None
+    parts = raw_pd.split(":")
+    expected_parts = 2
+    if len(parts) != expected_parts:
+        parser.error(f"--pd must be PREFILL:DECODE, got {raw_pd!r}")
+    try:
+        prefill_instances, decode_instances = int(parts[0]), int(parts[1])
+    except ValueError:
+        parser.error(f"--pd must contain integer counts, got {raw_pd!r}")
+    if prefill_instances < 1 or decode_instances < 1:
+        parser.error(f"--pd counts must be >= 1, got {raw_pd!r}")
+    return (prefill_instances, decode_instances)
+
+
+def _write_solve_text_output(
+    serving_plan: ServingPlan,
+    *,
+    top_k: int | None = None,
+) -> int:
     """Write solve warnings to stderr and formatted table rows to stdout."""
     _write_warnings(serving_plan.warnings)
-    if serving_plan.candidates:
+    visible_candidates = slice_per_concurrency(serving_plan.candidates, top_k)
+    if visible_candidates:
         sys.stdout.write(
             f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pareto':>6}  {'pools':<32}  "
             f"{'est_int_tok_s':>13}  {'tok_tput_chip':>13}  {'est_ttft_ms':>11}  "
             f"{'est_tpot_ms':>11}\n"
         )
-        for point in serving_plan.candidates:
+        for point in visible_candidates:
             if point.prefill_pool is not None:
                 pools = (
                     f"{point.prefill_pool.instances}x{point.prefill_pool.topology}"
@@ -403,7 +438,9 @@ def _write_solve_text_output(serving_plan: ServingPlan) -> int:
             f"{'role':<8}  {'c':>5}  {'chips':>5}  {'pareto':>6}  {'pool':<28}  "
             f"{'tok_tput_chip':>13}  {'ttft_ms':>10}  {'tpot_ms':>10}\n"
         )
-        for record in (*serving_plan.prefill_pools, *serving_plan.decode_pools):
+        visible_prefill = slice_per_concurrency(serving_plan.prefill_pools, top_k)
+        visible_decode = slice_per_concurrency(serving_plan.decode_pools, top_k)
+        for record in (*visible_prefill, *visible_decode):
             mark = "*" if record.is_pareto else ""
             pool_lbl = f"{record.pool.topology}({_format_pool_axes(record.pool)})"
             ttft_text = (
@@ -434,11 +471,20 @@ def _dispatch_solve(
 ) -> int:
     """Execute the solve subcommand and write JSON or table output."""
     scenario = _resolve_scenario(args, parser)
-    if args.max_chips is None and args.max_instances is None:
-        parser.error("Either --max-chips or --max-instances is required.")
+    pd_ratio = _parse_pd_ratio(args.pd, parser)
+    has_pins = bool(args.prefill_topology and args.decode_topology and pd_ratio)
+    if args.max_chips is None and args.max_instances is None and not has_pins:
+        parser.error(
+            "Either --max-chips, complete pins (--prefill-topology, "
+            "--decode-topology, --pd), or --max-instances is required."
+        )
     _require_positive_int("--max-chips", args.max_chips)
-    _require_positive_int("--max-instances", args.max_instances)
-    _require_positive_int("--top-k", args.top_k)
+    if args.max_instances is not None and args.max_instances < MIN_INSTANCES:
+        msg = f"--max-instances must be >= {MIN_INSTANCES}, got {args.max_instances}"
+        raise ValueError(msg)
+    if args.top_k is not None and args.top_k < MIN_TOP_K:
+        msg = f"--top-k must be >= {MIN_TOP_K}, got {args.top_k}"
+        raise ValueError(msg)
     _require_non_negative_finite("--hbm-reserve-gb", args.hbm_reserve_gb)
     resolved_dtypes = resolve_dtypes_from_args(args, config)
     chip, custom_topos = _resolve_chip_and_topos(args)
@@ -446,7 +492,7 @@ def _dispatch_solve(
     include_pairs = args.pairs or (
         args.cmd == "ceiling"
         and args.mode in ("auto", "disagg")
-        and args.max_chips is not None
+        and (args.max_chips is not None or has_pins)
     )
     serving_plan = solve_serving_plan(
         from_hf_config(config, model_ref=model_ref),
@@ -462,14 +508,25 @@ def _dispatch_solve(
             sort_by=args.sort_by,
             include_pairs=include_pairs,
             top_k=args.top_k,
+            prefill_topology=args.prefill_topology,
+            decode_topology=args.decode_topology,
+            pd_ratio=pd_ratio,
         ),
     )
     if args.cmd == "ceiling":
         return _dispatch_ceiling(args, serving_plan)
     if args.json:
-        sys.stdout.write(json.dumps(asdict(serving_plan), allow_nan=False) + "\n")
+        payload = build_solve_payload(
+            serving_plan,
+            chip=chip,
+            dtypes=resolved_dtypes,
+            model=args.model if args.model is not None else (model_ref or args.config),
+            top_k=args.top_k,
+            topologies=custom_topos,
+        )
+        sys.stdout.write(format_solve_json(payload) + "\n")
         return 0
-    return _write_solve_text_output(serving_plan)
+    return _write_solve_text_output(serving_plan, top_k=args.top_k)
 
 
 def _apply_chip_overrides(chip: ChipSpec, args: argparse.Namespace) -> ChipSpec:
@@ -536,7 +593,12 @@ def resolve_dtypes_from_args(
             kv_dtype=args.kv_dtype,
         )
     if args.state_dtype is not None:
-        dtypes = replace(dtypes, state=STATE_DTYPE_BYTES[args.state_dtype])
+        dtypes = replace(
+            dtypes,
+            state=STATE_DTYPE_BYTES[args.state_dtype],
+            state_source="flag",
+            state_dtype=args.state_dtype,
+        )
     if args.act is not None:
         if args.act in ("a4", "fp4", "nvfp4"):
             dtypes = replace(dtypes, act="a4")

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU unit tests for physics-only ceiling curve export and launch-free CLI."""
+"""CPU unit tests for physics-only ceiling curve export and solve JSON payloads."""
 
 from __future__ import annotations
 
@@ -29,8 +29,11 @@ from vllm_torchtpu.roofline import (
     CeilingRow,
     SolveOptions,
     TrafficScenario,
+    build_solve_payload,
     cli,
     emit_ceiling_rows,
+    format_solve_json,
+    format_submodule_parallelism,
     solve_serving_plan,
 )
 from vllm_torchtpu.roofline.constants import NO_FEASIBLE_LAYOUT_WARNING
@@ -50,6 +53,10 @@ _CEILING_KEYS = [
     "binding_unit",
     "slo_met",
     "is_pareto",
+    "decode_topology",
+    "decode_parallelism",
+    "prefill_topology",
+    "prefill_parallelism",
 ]
 
 
@@ -250,7 +257,6 @@ def test_ceiling_cli_warns_and_exits_nonzero_when_no_layout_fits(
     assert captured.out.strip() == "[]"
     assert f"WARNING: {NO_FEASIBLE_LAYOUT_WARNING}" in captured.err
 
-    # Disagg ceiling on 4 chips cannot form a 1P+1D pair: warns on stderr and exits 1.
     rc_disagg_4 = cli.main(
         [
             "ceiling",
@@ -272,7 +278,6 @@ def test_ceiling_cli_warns_and_exits_nonzero_when_no_layout_fits(
     assert captured_disagg_4.out.strip() == "[]"
     assert "WARNING:" in captured_disagg_4.err
 
-    # Disagg ceiling with --max-instances 1 (no --max-chips) skips pair grid and warns.
     rc_disagg_inst = cli.main(
         [
             "ceiling",
@@ -339,3 +344,345 @@ def test_disagg_pool_only_warnings_and_empty_plan_ceiling() -> None:
     )
     assert infeasible_plan.candidates == ()
     assert NO_FEASIBLE_LAYOUT_WARNING in infeasible_plan.warnings
+
+
+def test_solve_default_returns_all_layouts_ordered_per_concurrency(
+    locked_config_path: Callable[[str], Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify solve --json returns all legal layouts ordered per concurrency."""
+    cfg_path = locked_config_path("qwen3_5_397b_fp8.json")
+    rc = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--mode",
+            "auto",
+            "--max-chips",
+            "4",
+            "--concurrency",
+            "1,16",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema"] == rf_const.SOLVE_SCHEMA
+    assert payload["top_k_limit"] is None
+    assert payload["sort_by"] == "throughput"
+    assert payload["prefill_pools"]
+    assert payload["decode_pools"]
+    assert payload["provenance"]["calibrated"] is False
+    assert "p90" not in payload["provenance"]["basis"].lower()
+    assert payload["model"] == str(cfg_path)
+    for concurrency in (1, 16):
+        cands = [p for p in payload["candidates"] if p["concurrency"] == concurrency]
+        assert len(cands) > rf_const.DEFAULT_TOP_K
+        assert any(p["is_pareto"] for p in cands)
+        tputs = [p["token_throughput_per_chip"] for p in cands]
+        assert tputs == sorted(tputs, reverse=True)
+    for entry in payload["top_k"]:
+        assert "launch" not in entry
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+@pytest.mark.parametrize("sort_by", ("throughput", "interactivity"))
+def test_sort_by_roles_margins_floor_bounds_and_residual(
+    fixture_name: str,
+    sort_by: Literal["throughput", "interactivity"],
+) -> None:
+    """Verify sort_by roles/margins, FloorTimes 4-bound max, and residual payload."""
+    bundle = load_locked_bundle(fixture_name)
+    chip = CHIPS["tpu7x"]
+    scenario = TrafficScenario(
+        name="sort-roles-check",
+        isl=4096,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1, 16),
+        kv_working_set_turns=1.0,
+    )
+    plan = solve_serving_plan(
+        bundle.geometry,
+        bundle.dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4, sort_by=sort_by),
+    )
+    payload = build_solve_payload(plan, chip=chip, dtypes=bundle.dtypes, top_k=3)
+    assert format_solve_json(payload)
+    assert payload["sort_by"] == sort_by
+    assert "p90" not in payload["provenance"]["basis"].lower()
+    top_entries = payload["top_k"]
+    assert top_entries
+    expected_rank1_role = (
+        "max_interactivity" if sort_by == "interactivity" else "max_throughput"
+    )
+    assert top_entries[0]["frontier_role"] == expected_rank1_role
+    assert top_entries[0]["margin_vs_rank1_pct"] == 0.0
+    for entry in top_entries[1:]:
+        assert entry["margin_vs_rank1_pct"] <= 0.0
+    if len(top_entries) >= 2:
+        expected_opp_role = (
+            "max_throughput" if sort_by == "interactivity" else "max_interactivity"
+        )
+        opp_entries = [
+            entry
+            for entry in top_entries
+            if entry["frontier_role"] == expected_opp_role
+        ]
+        assert len(opp_entries) == 1
+        slo_cands = [pt for pt in plan.candidates if pt.slo_met]
+        if sort_by == "interactivity":
+            global_opp = max(slo_cands, key=lambda pt: pt.token_throughput_per_chip)
+            assert opp_entries[0]["point"][
+                "token_throughput_per_chip"
+            ] == pytest.approx(global_opp.token_throughput_per_chip, rel=1e-9)
+        else:
+            global_opp = max(slo_cands, key=lambda pt: pt.est_interactivity_tok_s)
+            assert opp_entries[0]["point"]["est_interactivity_tok_s"] == pytest.approx(
+                global_opp.est_interactivity_tok_s, rel=1e-9
+            )
+    for point in plan.candidates:
+        assert point.decode_floor is not None
+        assert point.decode_pool.residual in ("replicated", "sp")
+        max_bound = max(
+            point.decode_floor.hbm_bound_ms,
+            point.decode_floor.matmul_bound_ms,
+            point.decode_floor.vector_bound_ms,
+            point.decode_floor.coll_bound_ms,
+        )
+        assert max_bound == pytest.approx(point.decode_floor.hard_floor_ms, rel=1e-9)
+
+
+@pytest.mark.parametrize("top_k", (None, 1, 3))
+def test_top_k_preserves_frontier_and_single_host_fit_while_slicing_payload(
+    top_k: int | None,
+) -> None:
+    """Verify top_k slices payload lists per concurrency without truncating plan."""
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    chip = CHIPS["tpu7x"]
+    scenario = TrafficScenario(
+        name="top-k-presentation-check",
+        isl=4096,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1, 16),
+        kv_working_set_turns=1.0,
+    )
+    full_plan = solve_serving_plan(
+        bundle.geometry,
+        bundle.dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="auto", max_chips=8, top_k=None),
+    )
+    k_plan = solve_serving_plan(
+        bundle.geometry,
+        bundle.dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="auto", max_chips=8, top_k=top_k),
+    )
+    assert len(k_plan.candidates) == len(full_plan.candidates)
+    assert len(k_plan.frontier) == len(full_plan.frontier)
+    full_payload = build_solve_payload(full_plan, chip=chip, top_k=None)
+    k_payload = build_solve_payload(k_plan, chip=chip, top_k=top_k)
+    assert (
+        k_payload["single_host_fit"]["status"]
+        == full_payload["single_host_fit"]["status"]
+    )
+    assert len(k_payload["frontier"]) == len(full_payload["frontier"])
+    if top_k is not None:
+        assert len(k_payload["top_k"]) <= top_k
+        for concurrency in (1, 16):
+            cands = [
+                p for p in k_payload["candidates"] if p["concurrency"] == concurrency
+            ]
+            pref = [
+                r for r in k_payload["prefill_pools"] if r["concurrency"] == concurrency
+            ]
+            dec = [
+                r for r in k_payload["decode_pools"] if r["concurrency"] == concurrency
+            ]
+            assert len(cands) == top_k
+            assert len(pref) == top_k
+            assert len(dec) == top_k
+
+
+def test_solve_payload_preserves_pins_optional_think_time_and_validation(
+    locked_config_path: Callable[[str], Path], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Verify pinned-budget CLI, optional think-time, pin validation, and submodule."""
+    cfg_path = locked_config_path("qwen3_5_397b_fp8.json")
+    rc = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--isl",
+            "1024",
+            "--osl",
+            "128",
+            "--prefix-hit-rate",
+            "0.0",
+            "--accept-len",
+            "1.0",
+            "--concurrency",
+            "4",
+            "--mode",
+            "disagg",
+            "--prefill-topology",
+            "2x2x1",
+            "--decode-topology",
+            "2x2x1",
+            "--pd",
+            "1:1",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["budget"] == 8
+    assert payload["budget_source"] == "pins"
+    assert payload["pins"] == {
+        "prefill_topology": "2x2x1",
+        "decode_topology": "2x2x1",
+        "pd_ratio": "1:1",
+    }
+    assert payload["scenario"]["think_time_s"] is None
+    assert payload["candidates"]
+    assert all(p["total_chips"] == 8 for p in payload["candidates"])
+
+    # Asymmetric disagg pins must prune competing legal pairs under 16 chips.
+    rc_asym = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--isl",
+            "1024",
+            "--osl",
+            "128",
+            "--prefix-hit-rate",
+            "0.0",
+            "--accept-len",
+            "1.0",
+            "--concurrency",
+            "4",
+            "--mode",
+            "disagg",
+            "--prefill-topology",
+            "2x2x1",
+            "--decode-topology",
+            "2x2x2",
+            "--pd",
+            "2:1",
+            "--json",
+        ]
+    )
+    assert rc_asym == 0
+    asym_payload = json.loads(capsys.readouterr().out)
+    assert asym_payload["budget"] == 16
+    assert asym_payload["budget_source"] == "pins"
+    assert asym_payload["candidates"]
+    for point in asym_payload["candidates"]:
+        assert point["prefill_pool"]["instances"] == 2
+        assert point["prefill_pool"]["topology"] == "2x2x1"
+        assert point["decode_pool"]["instances"] == 1
+        assert point["decode_pool"]["topology"] == "2x2x2"
+        assert point["total_chips"] == 16
+
+    # Direct library SolveOptions(max_instances=2) derives budget_source automatically.
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    lib_scen = TrafficScenario(
+        name="lib-max-inst",
+        isl=1024,
+        osl=128,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(4,),
+        kv_working_set_turns=1.0,
+    )
+    lib_plan = solve_serving_plan(
+        bundle.geometry,
+        bundle.dtypes,
+        CHIPS["tpu7x"],
+        lib_scen,
+        SolveOptions(mode="mixed", max_instances=2),
+    )
+    assert lib_plan.budget_source == "max_instances"
+    lib_payload = build_solve_payload(lib_plan, chip=CHIPS["tpu7x"])
+    assert lib_payload["budget_source"] == "max_instances"
+    assert lib_payload["chip_budget"]["max_chips"] is None
+
+    # Invalid topology pin and --mode mixed --pd must fail closed with ValueError.
+    base_scen = TrafficScenario(
+        name="pin-err",
+        isl=1024,
+        osl=128,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(4,),
+        kv_working_set_turns=1.0,
+        tpot_slo_ms=25.0,
+    )
+    with pytest.raises(ValueError, match="Unknown decode_topology"):
+        solve_serving_plan(
+            bundle.geometry,
+            bundle.dtypes,
+            CHIPS["tpu7x"],
+            base_scen,
+            SolveOptions(mode="mixed", max_chips=4, decode_topology="9x9x9"),
+        )
+    with pytest.raises(ValueError, match="mode='mixed'"):
+        solve_serving_plan(
+            bundle.geometry,
+            bundle.dtypes,
+            CHIPS["tpu7x"],
+            base_scen,
+            SolveOptions(mode="mixed", max_chips=8, pd_ratio=(1, 1)),
+        )
+    single_slo_plan = solve_serving_plan(
+        bundle.geometry,
+        bundle.dtypes,
+        CHIPS["tpu7x"],
+        base_scen,
+        SolveOptions(mode="mixed", max_chips=4),
+    )
+    assert rf_const.UNKNOWN_THINK_TIME_WARNING in single_slo_plan.warnings
+
+    # Subgroup MoE display renders EP x TP when 1 < ep < tp.
+    assert (
+        format_submodule_parallelism({"tp": 8, "ep": 4, "dp": 1, "pp": 1, "pcp": 1})
+        == "Attn: TP8 · MoE: EP4 x TP2"
+    )
+
+    # max_instances without max_chips keeps chip_budget["max_chips"] as None.
+    rc_inst = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--mode",
+            "mixed",
+            "--max-instances",
+            "1",
+            "--concurrency",
+            "4",
+            "--json",
+        ]
+    )
+    assert rc_inst == 0
+    inst_payload = json.loads(capsys.readouterr().out)
+    assert inst_payload["chip_budget"]["max_chips"] is None
