@@ -67,8 +67,10 @@ CONV_ROWS = 16  # pool rows holding the conv history (rounded to a power of two)
 CHUNK_GATHER = os.environ.get("VLLM_TPU_MK_GDN_CHUNK_GATHER", "auto")
 CHUNK_GATHER_AUTO_ROWS = 32
 # Staging buffers with `Qwen38PoolGDN.state_prefetch`: up to this many requests' copies go
-# out before the HC mix.
+# out before the HC mix (whole-state gather), and up to `CONV_PREFETCH_BUFS` requests' conv
+# histories (16 KiB each) under the chunk gather.
 PREFETCH_BUFS = 8
+CONV_PREFETCH_BUFS = 16
 
 
 def _chunk_gather(gp: GDNParams, ex: ExecSpec) -> bool:
@@ -201,8 +203,9 @@ class Qwen38PoolGDN(Qwen38GDN):
     """`Qwen38GDN` whose input states come straight from the unified pool.
 
     `state_prefetch` (VLLM_TPU_MK_GDN_STATE_PREFETCH; the block under an `HCSublayer`,
-    which calls `prefetch`): the whole-state gather's first requests' pool copies, one per
-    staging buffer, start before the layer's HC mix instead of in `gdn_pool_gather`."""
+    which calls `prefetch`): the gather's first requests' pool copies (the chunk gather: their
+    conv histories only), one per staging buffer, start before the layer's HC mix instead of
+    in `gdn_pool_gather`."""
 
     def __init__(self, *, state_prefetch: bool = False, **kw: Any) -> None:
         super().__init__(**kw)
@@ -229,8 +232,10 @@ class Qwen38PoolGDN(Qwen38GDN):
         raw = not (ex.resolved_tiles.lean_scratch and _chunk_gather(gp, ex))
         # One whole ref per staged block: a typed view of a sliced ref is not
         # supported everywhere, a view of a whole scratch ref is.
+        # The chunk gather stages only conv histories: its SSM staging stays at 2 buffers.
+        n_raw = 2 if _chunk_gather(gp, ex) else self._bufs(gp, ex)
         for b in range(self._bufs(gp, ex)):
-            for j in range(SSM_BLOCKS if raw else 0):
+            for j in range(SSM_BLOCKS if raw and b < n_raw else 0):
                 scr[f"pg_raw{b}{j}"] = pltpu.VMEM((SSM_ROWS, 1, 4, 256), f8)
             scr[f"pg_craw{b}"] = pltpu.VMEM((CONV_ROWS, 1, 4, 256), f8)
         scr.update(
@@ -274,9 +279,10 @@ class Qwen38PoolGDN(Qwen38GDN):
 
     def _bufs(self, gp: GDNParams, ex: ExecSpec) -> int:
         """Staging buffers the scratch holds: request `s` stages in `s % bufs`."""
-        if not self.state_prefetch or _chunk_gather(gp, ex):
+        if not self.state_prefetch:
             return 2
-        return max(2, min(ex.NS, PREFETCH_BUFS))
+        cap = CONV_PREFETCH_BUFS if _chunk_gather(gp, ex) else PREFETCH_BUFS
+        return max(2, min(ex.NS, cap))
 
     @staticmethod
     def _staged(scr: Any) -> int:
@@ -284,13 +290,15 @@ class Qwen38PoolGDN(Qwen38GDN):
         return sum(1 for k in scr if k.startswith("pg_craw"))
 
     def prefetch(self, ctx: Any, l: Any, slot: Any) -> None:  # noqa: E741
-        """Start the whole-state gather's first requests' copies, one per staging buffer."""
-        if not self.state_prefetch or _chunk_gather(ctx.block_params(self.name), ctx.ex):
+        """Start the gather's first requests' copies, one per staging buffer (the chunk
+        gather: their conv histories only)."""
+        if not self.state_prefetch:
             return
+        ssm = not _chunk_gather(ctx.block_params(self.name), ctx.ex)
         o, nb = ctx.stream.sp.block_ord(l, self.name), self._staged(ctx.scr)
         self._inflight = min(ctx.ex.NS, nb)
         for s in range(self._inflight):
-            for c in self._copies(ctx, o, s, s % nb):
+            for c in self._copies(ctx, o, s, s % nb, ssm):
                 c.start()
 
     def _gather(self, ctx: Any, o: Any, direct: bool = False, ssm: bool = True) -> None:
@@ -323,19 +331,14 @@ class Qwen38PoolGDN(Qwen38GDN):
         scr["pg_conv"][...] = jnp.zeros(scr["pg_conv"].shape, F32)
         started, self._inflight = self._inflight, 0
         nb = self._staged(scr)
-        pending = self._copies(ctx, o, 0, 0, ssm)
-        if started == 0:
-            for c in pending:
+        # Every staging buffer holds a request in flight: request `s + nb` refills buffer
+        # `s % nb` once request `s` has been read out of it.
+        for s in range(started, min(NS, nb)):
+            for c in self._copies(ctx, o, s, s % nb, ssm):
                 c.start()
-        nxt = pending
         for s in range(NS):
             buf = s % nb
-            if s + 1 < NS:
-                nxt = self._copies(ctx, o, s + 1, (s + 1) % nb, ssm)
-                if s + 1 >= started:
-                    for c in nxt:
-                        c.start()
-            for c in pending:
+            for c in self._copies(ctx, o, s, buf, ssm):
                 c.wait()
             keep = ctx.extra[HAS_STATE][o, s] != 0
             if ssm:
@@ -352,8 +355,9 @@ class Qwen38PoolGDN(Qwen38GDN):
                     scr["pg_conv"][s, r : r + 1, c * 256 : (c + 1) * 256] = jnp.where(
                         keep, crow[r * per + c : r * per + c + 1], 0.0
                     )
-            if s + 1 < NS:
-                pending = nxt
+            if s + nb < NS:
+                for c in self._copies(ctx, o, s + nb, buf, ssm):
+                    c.start()
 
     def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
         o = ctx.stream.sp.block_ord(l, self.name)

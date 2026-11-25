@@ -182,3 +182,20 @@ def test_pool_gdn_state_prefetch_is_exact(monkeypatch):
     early = _wide_pool_step(monkeypatch, "0", has_state, state_prefetch=True)
     for k in late:
         np.testing.assert_array_equal(early[k], late[k], err_msg=k)
+
+
+@pytest.mark.parametrize("chunk_gather", ["0", "1"])
+def test_pool_gdn_staging_refill_is_exact(monkeypatch, chunk_gather):
+    """Fewer staging buffers than requests (each refilled once its request is read out), with
+    the copies started before the HC mix == no prefetch, bitwise, over 6 requests, for the
+    whole-state and the chunk gather."""
+    from vllm_torchtpu.megakernel.models import qwen38_gdn_pool
+
+    NL, NS = qwen38.SEGMENT_LAYERS - 1, 6
+    has_state = (np.arange(NL * NS).reshape(NL, NS) % 3 != 1).astype(np.int32)
+    late = _wide_pool_step(monkeypatch, chunk_gather, has_state, state_prefetch=False)
+    monkeypatch.setattr(qwen38_gdn_pool, "PREFETCH_BUFS", 4)
+    monkeypatch.setattr(qwen38_gdn_pool, "CONV_PREFETCH_BUFS", 4)
+    early = _wide_pool_step(monkeypatch, chunk_gather, has_state, state_prefetch=True)
+    for k in late:
+        np.testing.assert_array_equal(early[k], late[k], err_msg=k)
