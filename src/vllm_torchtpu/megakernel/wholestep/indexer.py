@@ -124,19 +124,35 @@ def thresholds(bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int,
     if early_exit:
         lo = _value_passes_early(bits, cnt, over, K, *early_exit)
     else:
-        for b in range(30, -1, -1):
-            cand = lo | (1 << b)
-            lo = jnp.where(cnt(bits >= cand) >= K, cand, lo)
+        lo = jax.lax.fori_loop(
+            0,
+            31,
+            lambda i, acc: jnp.where(
+                cnt(bits >= (acc | (jnp.int32(1) << (jnp.int32(30) - i)))) >= K,
+                acc | (jnp.int32(1) << (jnp.int32(30) - i)),
+                acc,
+            ),
+            lo,
+        )
     thr = jnp.where(over, lo, 0)
     eq = bits == thr
     need = K - cnt(bits > thr)
 
     def ties() -> jax.Array:
-        t = jnp.zeros(nv.shape, I32)
-        for b in range(int(G - 1).bit_length() - 1, -1, -1):
-            cand = t | (1 << b)
-            t = jnp.where(cnt(eq & (ids < cand)) < need, cand, t)
-        return t
+        nbits = int(G - 1).bit_length()
+        return jax.lax.fori_loop(
+            0,
+            nbits,
+            lambda i, acc: jnp.where(
+                cnt(
+                    eq & (ids < (acc | (jnp.int32(1) << (jnp.int32(nbits - 1) - i))))
+                )
+                < need,
+                acc | (jnp.int32(1) << (jnp.int32(nbits - 1) - i)),
+                acc,
+            ),
+            jnp.zeros(nv.shape, I32),
+        )
 
     if not (tie_skip or early_exit):
         t = ties()

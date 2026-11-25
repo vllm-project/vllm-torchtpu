@@ -41,7 +41,6 @@ outputs for a post-kernel scatter:
 from __future__ import annotations
 
 import functools
-
 from typing import Any
 
 import jax
@@ -55,8 +54,8 @@ from ..ops import BF16, F32, I32, rmsnorm, rnd
 from ..spec import ExtraInput, ScratchReq, SmallField, StateDecl
 from . import indexer as ix
 from . import union_attn as ua
-from .qsa_full import OFFSET, POOL, ROPE, SCALES
-from .qsa_full_b import CK, GPK, IDX_N, IDX_W, MTAB, NVIS, TAIL, QSAFullIndexedBlock
+from .qsa_full import POOL, SCALES
+from .qsa_full_b import GPK, IDX_N, IDX_W, MTAB, NVIS, TAIL, QSAFullIndexedBlock
 
 CTXQ = "qsa_ctx"  # [requests] tokens before this step
 RING = "qsa_ring"  # [requests, 8, 128] raw index-key ring (lane = position % 8)
@@ -163,39 +162,58 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> list[ScratchReq]:
         nreq, f8 = ex.MB // ex.T, jnp.float8_e4m3fn
-        return super().scratch(g, ex, plan) + [
-            ScratchReq("qc_ring", pltpu.VMEM((8, ix.IDX_DIM), BF16)),
-            ScratchReq("qc_rope", pltpu.VMEM((1, 128), F32)),
-            ScratchReq("qc_ck", pltpu.VMEM((1, ix.IDX_DIM), BF16)),
-            ScratchReq("qc_rnew", pltpu.VMEM((8, ix.IDX_DIM), BF16)),
-            ScratchReq("qc_old", pltpu.VMEM((MICRO, 1, 4, 256), f8)),
-            ScratchReq("qc_rk", pltpu.VMEM((nreq, 8, 256), F32)),
-            ScratchReq("qc_rv", pltpu.VMEM((nreq, 8, 256), F32)),
-            ScratchReq("qc_sga", pltpu.SMEM((ex.MB,), I32)),
-            ScratchReq("qc_sem", pltpu.SemaphoreType.DMA((4,))),
-            ScratchReq("qf_kr", pltpu.VMEM((ex.MB, g.HD), BF16)),
-            ScratchReq("qc_ir", pltpu.VMEM((ex.MB, ix.IDX_DIM), BF16)),
-            ScratchReq("qc_osem", pltpu.SemaphoreType.DMA((2,))),
-        ] + ([
-            # Request-major copies for the traced request index of `loop_requests`: a dynamic
-            # `[q * T, (q + 1) * T)` sublane window of a row-major tile is not provably aligned
-            # (Mosaic E2003, j-bfd3a7f8); a leading-dim index is.
-            ScratchReq("qc_irq", pltpu.VMEM((nreq, ex.T, ix.IDX_DIM), F32)),
-            ScratchReq("qc_kvq", pltpu.VMEM((nreq, ex.T, 2 * g.HD), F32)),
-        ] if self.loop_requests else []) + ([
-            # `xreq_loads`: the request loop's loads, banked by request parity (q mod 2).
-            ScratchReq("qx_ring", pltpu.VMEM((2, 8, ix.IDX_DIM), BF16)),
-            ScratchReq("qx_rope", pltpu.VMEM((2, 1, 128), F32)),
-            ScratchReq("qx_old", pltpu.VMEM((2, MICRO, 1, 4, 256), f8)),
-            ScratchReq("qx_sem", pltpu.SemaphoreType.DMA((6,))),
-        ] if self.xreq_loads else []) + ([
-            # `req_async`: the new group's output stores, banked by request parity (q mod 2).
-            ScratchReq("qa_ck", pltpu.VMEM((2, 1, ix.IDX_DIM), BF16)),
-            ScratchReq("qa_rnew", pltpu.VMEM((2, 8, ix.IDX_DIM), BF16)),
-            ScratchReq("qa_sem", pltpu.SemaphoreType.DMA((4,))),
-        ] if self.req_async else []) + (self._shard_scratch(ex) if self.shard_index else []) + (
-            self._union_scratch(ex) if self.union_attn else []
-        ) + (self._dcp_scratch(g, ex) if self.dcp > 1 else [])
+        return (
+            super().scratch(g, ex, plan)
+            + [
+                ScratchReq("qc_ring", pltpu.VMEM((8, ix.IDX_DIM), BF16)),
+                ScratchReq("qc_rope", pltpu.VMEM((1, 128), F32)),
+                ScratchReq("qc_ck", pltpu.VMEM((1, ix.IDX_DIM), BF16)),
+                ScratchReq("qc_rnew", pltpu.VMEM((8, ix.IDX_DIM), BF16)),
+                ScratchReq("qc_old", pltpu.VMEM((MICRO, 1, 4, 256), f8)),
+                ScratchReq("qc_rk", pltpu.VMEM((nreq, 8, 256), F32)),
+                ScratchReq("qc_rv", pltpu.VMEM((nreq, 8, 256), F32)),
+                ScratchReq("qc_sga", pltpu.SMEM((ex.MB,), I32)),
+                ScratchReq("qc_sem", pltpu.SemaphoreType.DMA((4,))),
+                ScratchReq("qf_kr", pltpu.VMEM((ex.MB, g.HD), BF16)),
+                ScratchReq("qc_ir", pltpu.VMEM((ex.MB, ix.IDX_DIM), BF16)),
+                ScratchReq("qc_osem", pltpu.SemaphoreType.DMA((2,))),
+            ]
+            + (
+                [
+                    # Request-major copies for the traced request index of `loop_requests`: a dynamic
+                    # `[q * T, (q + 1) * T)` sublane window of a row-major tile is not provably aligned
+                    # (Mosaic E2003, j-bfd3a7f8); a leading-dim index is.
+                    ScratchReq("qc_irq", pltpu.VMEM((nreq, ex.T, ix.IDX_DIM), F32)),
+                    ScratchReq("qc_kvq", pltpu.VMEM((nreq, ex.T, 2 * g.HD), F32)),
+                ]
+                if self.loop_requests
+                else []
+            )
+            + (
+                [
+                    # `xreq_loads`: the request loop's loads, banked by request parity (q mod 2).
+                    ScratchReq("qx_ring", pltpu.VMEM((2, 8, ix.IDX_DIM), BF16)),
+                    ScratchReq("qx_rope", pltpu.VMEM((2, 1, 128), F32)),
+                    ScratchReq("qx_old", pltpu.VMEM((2, MICRO, 1, 4, 256), f8)),
+                    ScratchReq("qx_sem", pltpu.SemaphoreType.DMA((6,))),
+                ]
+                if self.xreq_loads
+                else []
+            )
+            + (
+                [
+                    # `req_async`: the new group's output stores, banked by request parity (q mod 2).
+                    ScratchReq("qa_ck", pltpu.VMEM((2, 1, ix.IDX_DIM), BF16)),
+                    ScratchReq("qa_rnew", pltpu.VMEM((2, 8, ix.IDX_DIM), BF16)),
+                    ScratchReq("qa_sem", pltpu.SemaphoreType.DMA((4,))),
+                ]
+                if self.req_async
+                else []
+            )
+            + (self._shard_scratch(ex) if self.shard_index else [])
+            + (self._union_scratch(ex) if self.union_attn else [])
+            + (self._dcp_scratch(g, ex) if self.dcp > 1 else [])
+        )
 
     def _dcp_scratch(self, g: Any, ex: ExecSpec) -> list[ScratchReq]:
         """Main-KV DCP: the pair rank's q (`qd_q`), this rank's partial over its own heads
@@ -205,18 +223,27 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         o, lse = pltpu.VMEM((ex.MB, nh, g.HD), F32), pltpu.VMEM((ex.MB, nh, 128), F32)
         return [
             ScratchReq("qd_q", pltpu.VMEM((ex.MB, nh, g.HD), F32)),
-            ScratchReq("qd_o", o), ScratchReq("qd_l", lse),
-            ScratchReq("qd_os", o), ScratchReq("qd_ls", lse),
-            ScratchReq("qd_or", o), ScratchReq("qd_lr", lse),
+            ScratchReq("qd_o", o),
+            ScratchReq("qd_l", lse),
+            ScratchReq("qd_os", o),
+            ScratchReq("qd_ls", lse),
+            ScratchReq("qd_or", o),
+            ScratchReq("qd_lr", lse),
         ] + [
             ScratchReq(f"qd_{k}sem{i}", pltpu.SemaphoreType.DMA((1,)))
-            for i in range(3) for k in "sr"
+            for i in range(3)
+            for k in "sr"
         ]
 
     def _dcp_owned(self, ctx: Any, pos: Any) -> Any:
         """Whether this rank owns token positions `pos` (main-KV DCP: `(pos // B) % 2`)."""
         B = ctx.extra[POOL].shape[1]
         return jax.lax.rem(pos // B, self.dcp) == jax.lax.rem(ctx.me, self.dcp)
+
+    @property
+    def _need_row_ids(self) -> bool:
+        """Whether per-row `qi_id` / `qi_ids` compaction and exchange are consumed."""
+        return (not self.union_attn) or self.debug or self.export_ids
 
     def _union_width(self, ex: ExecSpec) -> int:
         """Union slots per request: every row's whole selection, 128-lane aligned."""
@@ -234,8 +261,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qu_n", pltpu.SMEM((nreq, D), I32)),
             # `xreq_prefetch`: two banks (request q's ids, request q+1's staged).
             # `req_async` 2: two banks (request q's ids, request q+1's staged).
-            ScratchReq("qu_row", pltpu.SMEM(
-                (2 if self.xreq_prefetch or self.req_async_bank else 1, KU + 128), I32)),
+            ScratchReq(
+                "qu_row",
+                pltpu.SMEM(
+                    (2 if self.xreq_prefetch or self.req_async_bank else 1, KU + 128),
+                    I32,
+                ),
+            ),
             ScratchReq("qu_sem", pltpu.SemaphoreType.DMA((3,))),
             ScratchReq("qu_st", pltpu.VMEM((1, 128), I32)),
         ]
@@ -248,7 +280,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             npr, n = self._shard_rows(ex)[0], max(ex.R - 1, 1)
             out += [
                 ScratchReq("qgu_send", pltpu.VMEM((npr, 1, 2 * D * KU + 128), I32)),
-                ScratchReq("qgu_recv", pltpu.VMEM((self._runs(ex), npr, 1, 2 * D * KU + 128), I32)),
+                ScratchReq(
+                    "qgu_recv",
+                    pltpu.VMEM((self._runs(ex), npr, 1, 2 * D * KU + 128), I32),
+                ),
                 ScratchReq("qgu_ssem", pltpu.SemaphoreType.DMA((n,))),
                 ScratchReq("qgu_rsem", pltpu.SemaphoreType.DMA((n,))),
             ]
@@ -293,7 +328,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             k = jnp.int32(0)
             for p in range(nreq):
                 if p != q:
-                    k = jnp.where((nv[p] >= nv[q]) if p < q else (nv[p] > nv[q]), k + 1, k)
+                    k = jnp.where(
+                        (nv[p] >= nv[q]) if p < q else (nv[p] > nv[q]), k + 1, k
+                    )
             scr["qb_rk"][q] = k
             scr["qb_inv"][k] = jnp.int32(q)
         for q in range(nreq):
@@ -307,7 +344,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             scr["qb_slot"][run * 2 + jnp.where(first, 0, 1)] = jnp.int32(q)
 
     def _gather_runs(
-        self, ctx: Any, send: Any, recv: Any, ssem: Any, rsem: Any, own_rank: bool = False
+        self,
+        ctx: Any,
+        send: Any,
+        recv: Any,
+        ssem: Any,
+        rsem: Any,
+        own_rank: bool = False,
     ) -> None:
         """All-gather every run's `send` into `recv [runs, ...]` (slot = run). Under
         `compressed_dcp` both ranks of a pair hold their run's results; only pair rank 0 sends
@@ -319,13 +362,18 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         if ex.R == 1:
             return
         if not self.compressed_dcp:
-            ctx.comm.exchange(ctx.comm.group_copies(lambda off: send, recv.at[me], ssem, rsem, ex.R))
+            ctx.comm.exchange(
+                ctx.comm.group_copies(lambda off: send, recv.at[me], ssem, rsem, ex.R)
+            )
             return
         D = self.dcp
         descs = {
             off: pltpu.make_async_remote_copy(
-                src_ref=send, dst_ref=recv.at[me // D], send_sem=ssem.at[off - 1],
-                recv_sem=rsem.at[off - 1], device_id=(me ^ off,),
+                src_ref=send,
+                dst_ref=recv.at[me // D],
+                send_sem=ssem.at[off - 1],
+                recv_sem=rsem.at[off - 1],
+                device_id=(me ^ off,),
                 device_id_type=pl.DeviceIdType.MESH,
             )
             for off in range(D, ex.R)  # me ^ off with off < D is the pair itself
@@ -357,7 +405,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
     def _cdcp_credit(self, ctx: Any) -> None:
         """Tell the pair rank its next score half may land here (`_cdcp_swap`)."""
         pl.semaphore_signal(
-            ctx.scr["qx_credit"].at[0], 1, device_id=(ctx.me ^ 1,),
+            ctx.scr["qx_credit"].at[0],
+            1,
+            device_id=(ctx.me ^ 1,),
             device_id_type=pl.DeviceIdType.MESH,
         )
 
@@ -378,8 +428,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         def desc(c: Any) -> Any:
             ref = scr["qi_s"].at[pl.ds(0, T), off + c]
             return pltpu.make_async_remote_copy(
-                src_ref=ref, dst_ref=ref, send_sem=scr["qx_ssem"].at[0],
-                recv_sem=scr["qx_rsem"].at[0], device_id=(ctx.me ^ 1,),
+                src_ref=ref,
+                dst_ref=ref,
+                send_sem=scr["qx_ssem"].at[0],
+                recv_sem=scr["qx_rsem"].at[0],
+                device_id=(ctx.me ^ 1,),
                 device_id_type=pl.DeviceIdType.MESH,
             )
 
@@ -417,15 +470,20 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         groups): one static scan per tier, chosen by nested conds."""
         if len(tiers) == 1:
             return fn(tiers[0])
-        return jax.lax.cond(nv <= tiers[0] * 128, lambda: fn(tiers[0]),
-                            lambda: self._by_tier(nv, tiers[1:], fn))
+        return jax.lax.cond(
+            nv <= tiers[0] * 128,
+            lambda: fn(tiers[0]),
+            lambda: self._by_tier(nv, tiers[1:], fn),
+        )
 
     def _nvis_plan(self, ctx: Any, nv: Any, CH: int) -> tuple:
         """(count, base row of chunk i) of the `CH`-row score chunks holding groups < `nv`
         (scalar), in score-position order: under `compressed_dcp` rank 0's half's visible
         prefix, then rank 1's."""
         S, span = self.max_groups // 128, CH * 128
-        nv = jnp.clip(nv, 0, self.max_groups)  # hardening: out-of-range n_vis cannot widen m
+        nv = jnp.clip(
+            nv, 0, self.max_groups
+        )  # hardening: out-of-range n_vis cannot widen m
         if not self.compressed_dcp:
             return jnp.minimum((nv + span - 1) // span, S // CH), lambda i: i * CH
         Sh = S // self.dcp
@@ -448,7 +506,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         )
         return self._cdcp_gid(ctx, p) if self.compressed_dcp else p
 
-    def _nvis_thresholds(self, ctx: Any, r0: Any, n: int, nv: Any, nv_max: Any) -> tuple:
+    def _nvis_thresholds(
+        self, ctx: Any, r0: Any, n: int, nv: Any, nv_max: Any
+    ) -> tuple:
         """`ix.thresholds` of the `n` rows at `qi_s[r0 …]` (per-row `nv [n, 1, 1]`) over the
         chunks holding groups < `nv_max` (scalar); none when no row has more than `budget`
         visible groups (thresholds 0 / max_groups whatever the counts). Masks those chunks'
@@ -475,11 +535,19 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return pltpu.bitcast(qs[ix_].reshape(shape), I32)
 
         return ix.thresholds_chunks(
-            bits, lambda c: self._nvis_ids(ctx, shape, base_of(c)), m, nv, K, G, shape,
+            bits,
+            lambda c: self._nvis_ids(ctx, shape, base_of(c)),
+            m,
+            nv,
+            K,
+            G,
+            shape,
             digit=self.nvis_digit,
         )
 
-    def _nvis_row(self, ctx: Any, r: Any, lo: Any, s0: Any, ga: Any, consts: tuple) -> tuple:
+    def _nvis_row(
+        self, ctx: Any, r: Any, lo: Any, s0: Any, ga: Any, consts: tuple
+    ) -> tuple:
         """`row`'s selection and compaction of row `r` over the score rows holding its
         visible groups, two `CM`-row halves per compaction chunk (under `compressed_dcp` the
         two halves may sit in the two ranks' score halves). Returns (ids `[1, K]` int32
@@ -508,7 +576,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 sga = sga + (sel & (lid == ga)).astype(I32)
                 s2 = sel & (lid < ga)
                 kept = kept + s2.astype(I32)
-                if self.union_attn:  # row bit r - lo of every pool-path group it selects
+                if (
+                    self.union_attn
+                ):  # row bit r - lo of every pool-path group it selects
                     rows = pl.ds(pl.multiple_of(base, 8), CM)
                     scr["qu_code"][rows] = scr["qu_code"][rows] | jnp.where(
                         s2, jnp.left_shift(1, r - lo), 0
@@ -519,18 +589,23 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             def row_of(rj: Any) -> Any:
                 return jnp.where(rj < CM, bases[0] + rj, bases[1] + rj - CM)
 
-            part, tot = ix.compact_chunk(jnp.concatenate(sels, axis=0), tot, row_of, consts)
+            part, tot = ix.compact_chunk(
+                jnp.concatenate(sels, axis=0), tot, row_of, consts
+            )
             return acc + part, tot, sga, kept
 
         z = jnp.zeros((CM, 128), I32)
         acc, _, sga, kept = jax.lax.fori_loop(
-            0, (m + 1) // 2, it,
+            0,
+            (m + 1) // 2,
+            it,
             (jnp.zeros((1, K), F32), jnp.zeros((1, 1), F32), z, z),
         )
         return acc.astype(I32), jnp.sum(sga), jnp.sum(kept)
 
-    def _nvis_union(self, ctx: Any, lo: Any, r: Any, KU: int, D: int, gpp: int,
-                    nv_max: Any) -> None:
+    def _nvis_union(
+        self, ctx: Any, lo: Any, r: Any, KU: int, D: int, gpp: int, nv_max: Any
+    ) -> None:
         """The `qsa_ucompact` union of request `lo // T` for pair rank `r` (its owned groups
         under main-KV DCP) over the score rows holding groups < `nv_max` (no row's union code
         is set past them), two `CM`-row halves per chunk; slot windows past the union are
@@ -583,7 +658,19 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         u0 = ex.T * self._shard_rows(ex)[2]
         return u0, u0 + 2 * WU + 128
 
+    def _fuse_union_exchange(self, ex: ExecSpec) -> bool:
+        """When union_attn is on without per-row ids or xmerge, pack qi_kvl and qc_sga
+        into qgu_send's trailing 128 metadata lanes and skip the separate qg_send all-gather."""
+        return (
+            self.union_attn
+            and not self._need_row_ids
+            and not self.xmerge
+            and max(self.dcp, 1) + 2 * ex.T <= 128
+        )
+
     def _shard_scratch(self, ex: ExecSpec) -> list[ScratchReq]:
+        if self._fuse_union_exchange(ex):
+            return []
         _, rows, W = self._shard_rows(ex)
         n = max(ex.R - 1, 1)
         if self.xmerge:
@@ -594,11 +681,21 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 ScratchReq("qm_recv", pltpu.VMEM((self._runs(ex), npr, 1, Wm), I32)),
                 ScratchReq("qm_ssem", pltpu.SemaphoreType.DMA((n,))),
                 ScratchReq("qm_rsem", pltpu.SemaphoreType.DMA((n,))),
-            ] + ([  # `nvis_balance`: the request -> run tables (`_balance_tables`)
-                ScratchReq(name, pltpu.SMEM((size,), I32))
-                for name, size in (("qb_rk", nreq), ("qb_inv", P), ("qb_run", nreq),
-                                   ("qb_first", nreq), ("qb_nxt", nreq), ("qb_slot", P))
-            ] if self._balanced(ex) else [])
+            ] + (
+                [  # `nvis_balance`: the request -> run tables (`_balance_tables`)
+                    ScratchReq(name, pltpu.SMEM((size,), I32))
+                    for name, size in (
+                        ("qb_rk", nreq),
+                        ("qb_inv", P),
+                        ("qb_run", nreq),
+                        ("qb_first", nreq),
+                        ("qb_nxt", nreq),
+                        ("qb_slot", P),
+                    )
+                ]
+                if self._balanced(ex)
+                else []
+            )
         return [
             ScratchReq("qg_send", pltpu.VMEM((rows, 1, W), I32)),
             ScratchReq("qg_recv", pltpu.VMEM((self._runs(ex), rows, 1, W), I32)),
@@ -609,7 +706,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
     # ------------------------------------------------------------ in kernel
     @_scoped("qsa_newgrp")
     def _new_group(
-        self, ctx: Any, l: Any, q: int, raw_q: jax.Array, bank: Any = None, sbank: Any = None
+        self,
+        ctx: Any,
+        l: Any,
+        q: int,
+        raw_q: jax.Array,
+        bank: Any = None,
+        sbank: Any = None,
     ) -> jax.Array:
         """Compressed key of request `q`'s group completed this step; writes its outputs.
         `bank`: its loads were issued ahead (`_xreq_loads`) into that bank. `sbank`
@@ -645,8 +748,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         """`req_async`: request `q`'s two output stores out of bank `sbank`."""
         scr, o = ctx.scr, ctx.stream.sp.block_ord(l, self.name)
         return [
-            pltpu.make_async_copy(src.at[sbank], ctx.O[dst].at[o, q], scr["qa_sem"].at[2 * sbank + i])
-            for i, (src, dst) in enumerate(((scr["qa_ck"], CK_NEW), (scr["qa_rnew"], RING_NEW)))
+            pltpu.make_async_copy(
+                src.at[sbank], ctx.O[dst].at[o, q], scr["qa_sem"].at[2 * sbank + i]
+            )
+            for i, (src, dst) in enumerate(
+                ((scr["qa_ck"], CK_NEW), (scr["qa_rnew"], RING_NEW))
+            )
         ]
 
     def _wait_new_group_stores(self, ctx: Any, l: Any, sbank: Any) -> None:
@@ -663,7 +770,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             pl.when(n_loop > b)(lambda b=b: self._wait_new_group_stores(ctx, l, b))
 
     def _new_group_body(
-        self, ctx: Any, l: Any, q: Any, raw_q: jax.Array, c0: Any, ring: jax.Array, rope: Any,
+        self,
+        ctx: Any,
+        l: Any,
+        q: Any,
+        raw_q: jax.Array,
+        c0: Any,
+        ring: jax.Array,
+        rope: Any,
         sbank: Any = None,
     ) -> jax.Array:
         ex, scr, g, T = ctx.ex, ctx.scr, ctx.g, ctx.ex.T
@@ -712,7 +826,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             pltpu.make_async_copy(src, ctx.O[dst].at[o, q], scr["qc_sem"].at[2 + i])
             if self.async_dma
             else pltpu.make_async_copy(src, ctx.O[dst].at[o, q], scr["qc_sem"].at[2])
-            for i, (src, dst) in enumerate(((scr["qc_ck"], CK_NEW), (scr["qc_rnew"], RING_NEW)))
+            for i, (src, dst) in enumerate(
+                ((scr["qc_ck"], CK_NEW), (scr["qc_rnew"], RING_NEW))
+            )
         ]
         for cp in stores:
             cp.start()
@@ -742,13 +858,19 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         micro = self._recent_micro(ctx, l, q)
         return [
             pltpu.make_async_copy(src, dst.at[bank], scr["qx_sem"].at[3 * bank + i])
-            for i, (src, dst) in enumerate((
-                (ctx.extra[RING].at[self.row_base(ctx, l) + q], scr["qx_ring"]),
-                (ctx.extra[ROPE_CK].at[q], scr["qx_rope"]),
-                (ctx.extra[POOL].at[
-                    micro >> shift, pl.ds((micro & (per_page - 1)) * MICRO, MICRO)
-                ], scr["qx_old"]),
-            ))
+            for i, (src, dst) in enumerate(
+                (
+                    (ctx.extra[RING].at[self.row_base(ctx, l) + q], scr["qx_ring"]),
+                    (ctx.extra[ROPE_CK].at[q], scr["qx_rope"]),
+                    (
+                        ctx.extra[POOL].at[
+                            micro >> shift,
+                            pl.ds((micro & (per_page - 1)) * MICRO, MICRO),
+                        ],
+                        scr["qx_old"],
+                    ),
+                )
+            )
         ]
 
     def _recent_tile(self, ctx: Any, l: Any, q: int, bank: Any = None) -> None:
@@ -760,7 +882,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         ga = c0 // 4
         per_page = ctx.extra[POOL].shape[1] // MICRO
         shift = per_page.bit_length() - 1
-        cshift = shift + self.dcp.bit_length() - 1  # DCP: a column covers `dcp * B` tokens
+        cshift = (
+            shift + self.dcp.bit_length() - 1
+        )  # DCP: a column covers `dcp * B` tokens
         qb = self.tab_base(ctx, l) + q
         micro = self.tables(ctx)[1][qb, ga >> cshift] * per_page + (ga & (per_page - 1))
         cp = pltpu.make_async_copy(
@@ -846,14 +970,15 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             nv = jnp.zeros((n, 1, 1), I32)
             for i in range(n):  # `lo` may be traced (`loop_requests`)
                 nv = jnp.where(rid == lo + i, ctx.extra[NVIS][lo + i], nv)
-            ids = (
-                jax.lax.broadcasted_iota(I32, (n, S, 128), 1) * 128
-                + jax.lax.broadcasted_iota(I32, (n, S, 128), 2)
-            )
+            ids = jax.lax.broadcasted_iota(
+                I32, (n, S, 128), 1
+            ) * 128 + jax.lax.broadcasted_iota(I32, (n, S, 128), 2)
             if cdcp:
                 ids = self._cdcp_gid(ctx, ids)
 
-            def nv_max(r0: Any, k: int) -> Any:  # scalar max `n_vis` of rows [r0, r0 + k)
+            def nv_max(
+                r0: Any, k: int
+            ) -> Any:  # scalar max `n_vis` of rows [r0, r0 + k)
                 v = ctx.extra[NVIS][r0]
                 for i in range(1, k):
                     v = jnp.maximum(v, ctx.extra[NVIS][r0 + i])
@@ -870,13 +995,18 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 """`ix.thresholds` of rows [lo, lo + n) over all S score rows, or (tiers) over
                 the smallest tier holding `nvm` (scalar max n_vis) groups: the rows past it
                 are invisible (-1) and count nothing."""
+
                 def scan(Sx: int) -> Any:
                     sc = pltpu.bitcast(
-                        scr["qi_s"][pl.ds(s0, n), pl.ds(0, Sx // RS)].reshape(n, Sx, 128), I32
+                        scr["qi_s"][pl.ds(s0, n), pl.ds(0, Sx // RS)].reshape(
+                            n, Sx, 128
+                        ),
+                        I32,
                     )
                     idx = ids[:, :Sx]
-                    return ix.thresholds(jnp.where(idx < nv, sc, -1), idx, nv, K, G,
-                                         **self.thr_kw)
+                    return ix.thresholds(
+                        jnp.where(idx < nv, sc, -1), idx, nv, K, G, **self.thr_kw
+                    )
 
                 return self._by_tier(nvm, tiers, scan) if tiers else scan(S)
 
@@ -898,28 +1028,46 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         sc = pltpu.bitcast(
                             scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32
                         )
-                        return ix.thresholds(jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G,
-                                             **self.thr_kw)
+                        return ix.thresholds(
+                            jnp.where(ids_h < nv_h, sc, -1),
+                            ids_h,
+                            nv_h,
+                            K,
+                            G,
+                            **self.thr_kw,
+                        )
 
                     with ctx.stream.sc("qsa_thr", 2):
                         thr, tmax = self._nvis_route(
-                            nvm, self.nvis_cut,
-                            lambda: self._nvis_thresholds(ctx, s0 + o, h, nv_h, nvm), full_h,
+                            nvm,
+                            self.nvis_cut,
+                            lambda: self._nvis_thresholds(ctx, s0 + o, h, nv_h, nvm),
+                            full_h,
                         )
                 else:
-                    sc = pltpu.bitcast(scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32)
+                    sc = pltpu.bitcast(
+                        scr["qi_s"][pl.ds(s0 + o, h)].reshape(h, S, 128), I32
+                    )
                     with ctx.stream.sc("qsa_thr", 2):
                         thr, tmax = ix.thresholds(
-                            jnp.where(ids_h < nv_h, sc, -1), ids_h, nv_h, K, G, **self.thr_kw
+                            jnp.where(ids_h < nv_h, sc, -1),
+                            ids_h,
+                            nv_h,
+                            K,
+                            G,
+                            **self.thr_kw,
                         )
                 scr["qi_th"][pl.ds(lo + o, h)] = jnp.broadcast_to(thr, (h, 1, 128))
                 scr["qi_tm"][pl.ds(lo + o, h)] = jnp.broadcast_to(tmax, (h, 1, 128))
                 with ctx.stream.sc("qsa_cdcp_thx", 2):
                     xs = [
                         pltpu.make_async_remote_copy(
-                            src_ref=scr[k].at[pl.ds(lo + o, h)], dst_ref=scr[k].at[pl.ds(lo + o, h)],
-                            send_sem=scr["qx_ssem"].at[1], recv_sem=scr["qx_rsem"].at[1],
-                            device_id=(ctx.me ^ 1,), device_id_type=pl.DeviceIdType.MESH,
+                            src_ref=scr[k].at[pl.ds(lo + o, h)],
+                            dst_ref=scr[k].at[pl.ds(lo + o, h)],
+                            send_sem=scr["qx_ssem"].at[1],
+                            recv_sem=scr["qx_rsem"].at[1],
+                            device_id=(ctx.me ^ 1,),
+                            device_id_type=pl.DeviceIdType.MESH,
                         )
                         for k in ("qi_th", "qi_tm")
                     ]
@@ -932,8 +1080,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
                 with ctx.stream.sc("qsa_thr", 2):
                     thr, tmax = self._nvis_route(
-                        nvm, self.nvis_cut,
-                        lambda: self._nvis_thresholds(ctx, s0, n, nv, nvm), full_n,
+                        nvm,
+                        self.nvis_cut,
+                        lambda: self._nvis_thresholds(ctx, s0, n, nv, nvm),
+                        full_n,
                     )
                 scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
                 scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
@@ -979,13 +1129,18 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
                 return self._by_tier(ctx.extra[NVIS][r], ctiers, scan)
 
+            need_row_ids = self._need_row_ids
+
             def scan_row(r: Any, Sx: int, consts: Any, lid: Any) -> Any:
                 """Row `r`'s selection and compaction over score rows [0, Sx) (Sx < S: a
                 row tier holding all its visible groups)."""
                 nvr = scr["qi_nv"][r][:, :1]
                 ga = ctx.extra[CTXQ][r // T] // 4
-                sc = scr["qi_s"][r - lo + s0] if Sx == S else scr["qi_s"][
-                    r - lo + s0, pl.ds(0, Sx // RS)]
+                sc = (
+                    scr["qi_s"][r - lo + s0]
+                    if Sx == S
+                    else scr["qi_s"][r - lo + s0, pl.ds(0, Sx // RS)]
+                )
                 b = jnp.where(lid < nvr, pltpu.bitcast(sc.reshape(Sx, 128), I32), -1)
                 th, tm = scr["qi_th"][r][:, :1], scr["qi_tm"][r][:, :1]
                 ov = nvr > K
@@ -1007,65 +1162,90 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     scr["qu_code"][rows] = scr["qu_code"][rows] | jnp.where(
                         sel & (lid < ga), jnp.left_shift(1, r - lo), 0
                     )
-                pos = ix.compact_row(
-                    b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
-                    jnp.zeros((1, 1), I32) + kept, K, consts,
-                )
+                if need_row_ids:
+                    pos = ix.compact_row(
+                        b2,
+                        jnp.zeros((1, 1), I32),
+                        jnp.zeros((1, 1), I32) + G,
+                        jnp.zeros((1, 1), I32) + kept,
+                        K,
+                        consts,
+                    )
+                else:
+                    pos = jnp.zeros((1, K), I32)
                 return pos, kept
 
             def tail(r: Any, pos: Any, kept: Any, carry: Any) -> Any:
-                scr["qi_id"][r] = self._cdcp_gid(ctx, pos) if cdcp else pos
-                cs = self._ids_copies(ctx, r)
-                for c in cs:
-                    c.start()
-                if not self.async_dma:
+                if need_row_ids:
+                    scr["qi_id"][r] = self._cdcp_gid(ctx, pos) if cdcp else pos
+                    cs = self._ids_copies(ctx, r)
                     for c in cs:
-                        c.wait()
+                        c.start()
+                    if not self.async_dma:
+                        for c in cs:
+                            c.wait()
                 scr["qi_kvl"][r] = 4 * kept
                 return carry
 
             with ctx.stream.sc("qsa_rowsel", 2):
                 jax.lax.fori_loop(lo, lo + n, row, 0)
-                if self.async_dma:
+                if self.async_dma and need_row_ids:
                     self._wait_ids_copies(ctx, n)
-            if self.union_attn:  # per-request call: rows [lo, lo + T) are request lo // T
+            if (
+                self.union_attn
+            ):  # per-request call: rows [lo, lo + T) are request lo // T
                 KU, D = self._union_width(ex), max(self.dcp, 1)
                 with ctx.stream.sc("qsa_ucompact", 2):
                     # Main-KV DCP: one union per pair rank over the groups it owns (group g
                     # lives on rank (g // groups-per-page) % D), each compacted ascending.
                     code_all = scr["qu_code"][...]
                     gpp = ctx.extra[POOL].shape[1] // ua.MICRO
-                    gidx = (
-                        jax.lax.broadcasted_iota(I32, (S, 128), 0) * 128
-                        + jax.lax.broadcasted_iota(I32, (S, 128), 1)
-                    )
-                    if cdcp:  # each rank's groups are one ascending half: ids map in order
+                    gidx = jax.lax.broadcasted_iota(
+                        I32, (S, 128), 0
+                    ) * 128 + jax.lax.broadcasted_iota(I32, (S, 128), 1)
+                    if (
+                        cdcp
+                    ):  # each rank's groups are one ascending half: ids map in order
                         gidx = self._cdcp_gid(ctx, gidx)
+
                     # Under `compressed_dcp` both pair ranks hold the request: each builds only
                     # its own union (the one it attends), and `_exchange_unions` sends it to the
                     # ranks of the same pair rank.
                     def full_union(r: Any) -> None:
-                        code = code_all if D == 1 else jnp.where(
-                            jax.lax.rem(gidx // gpp, D) == r, code_all, 0
+                        code = (
+                            code_all
+                            if D == 1
+                            else jnp.where(
+                                jax.lax.rem(gidx // gpp, D) == r, code_all, 0
+                            )
                         )
-                        ids, codes, nu = ua.compact_union(code, KU, ua.union_consts(S, KU))
-                        if cdcp:
-                            ids = self._cdcp_gid(ctx, ids)
                         at = pl.multiple_of(r * KU, 128) if cdcp else r * KU
-                        scr["qu_id"][lo // T, :, pl.ds(at, KU)] = ids
-                        scr["qu_cd"][lo // T, :, pl.ds(at, KU)] = codes
+                        nu = ua.compact_union_into(
+                            code,
+                            KU,
+                            ua.union_consts(S, KU),
+                            scr["qu_id"],
+                            scr["qu_cd"],
+                            lo // T,
+                            at,
+                            map_id=(lambda x: self._cdcp_gid(ctx, x)) if cdcp else None,
+                        )
                         scr["qu_n"][lo // T, r] = jnp.sum(nu)
 
                     for r in [jax.lax.rem(ctx.me, D)] if cdcp else range(D):
                         if self.select_nvis_union:
                             nvm = nv_max(lo, T)
                             self._nvis_route(
-                                nvm, self.nvis_ucut,
-                                lambda r=r, nvm=nvm: self._nvis_union(ctx, lo, r, KU, D, gpp, nvm),
+                                nvm,
+                                self.nvis_ucut,
+                                lambda r=r, nvm=nvm: self._nvis_union(
+                                    ctx, lo, r, KU, D, gpp, nvm
+                                ),
                                 lambda r=r: full_union(r),
                             )
                             continue
                         full_union(r)
+
         self.load_tables(ctx, l)
         npr = self._shard_rows(ex)[0] if self.shard_index else nreq
         c_off = jax.lax.rem(ctx.me, self.dcp) * (NC // self.dcp) if cdcp else 0
@@ -1081,12 +1261,21 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             """Request `q`'s scores (this rank's groups, then the pair's under `compressed_dcp`)
             with the completed group's fresh key in its stale cached column; then selected."""
             self._score_request(
-                ctx, q, qr, self.tab_base(ctx, l), row0=0, first=first, last=last, c_off=c_off,
+                ctx,
+                q,
+                qr,
+                self.tab_base(ctx, l),
+                row0=0,
+                first=first,
+                last=last,
+                c_off=c_off,
                 nxt=nxt,
             )
             if cdcp:
                 self._cdcp_swap(ctx, q)
-            s_new = ix.score_rows(qr, jnp.broadcast_to(ck.astype(BF16), (8, ix.IDX_DIM)))
+            s_new = ix.score_rows(
+                qr, jnp.broadcast_to(ck.astype(BF16), (8, ix.IDX_DIM))
+            )
             scr["qi_s"][0:T] = jnp.where(
                 gid == gc, s_new[:, :1].reshape(T, 1, 1, 1), scr["qi_s"][0:T]
             )
@@ -1122,20 +1311,33 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                         issue_loads(jnp.minimum(q + 1, nreq - 1), 1 - bank)
 
                 ck, gc = self._new_group(
-                    ctx, l, q, scr["qc_irq"][q], bank,
+                    ctx,
+                    l,
+                    q,
+                    scr["qc_irq"][q],
+                    bank,
                     jax.lax.rem(q, 2) if self.req_async else None,
                 )
 
                 def own_bal() -> None:  # `nvis_balance`: the run from `_balance_tables`
                     nxt = scr["qb_nxt"][q]
                     score_merge(
-                        q, scr["qi_q"][q].astype(BF16), ck, gc, scr["qb_first"][q] == 1,
-                        nxt < 0, jnp.maximum(nxt, 0),
+                        q,
+                        scr["qi_q"][q].astype(BF16),
+                        ck,
+                        gc,
+                        scr["qb_first"][q] == 1,
+                        nxt < 0,
+                        jnp.maximum(nxt, 0),
                     )
 
                 def own() -> None:
                     score_merge(
-                        q, scr["qi_q"][q].astype(BF16), ck, gc, jax.lax.rem(q, npr) == 0,
+                        q,
+                        scr["qi_q"][q].astype(BF16),
+                        ck,
+                        gc,
+                        jax.lax.rem(q, npr) == 0,
                         # The last request of a run stops the key prefetch (`n_loop`: the
                         # last live one under `skip_idle`).
                         (jax.lax.rem(q, npr) == npr - 1) | (q == n_loop - 1),
@@ -1168,7 +1370,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 @pl.when(q // npr == self._run(ctx))
                 def _(q=q, ck=ck, gc=gc):
                     score_merge(
-                        q, scr["qi_q"][q].astype(BF16), ck, gc, q % npr == 0,
+                        q,
+                        scr["qi_q"][q].astype(BF16),
+                        ck,
+                        gc,
+                        q % npr == 0,
                         q % npr == npr - 1 or q == nreq - 1,
                     )
 
@@ -1258,42 +1464,52 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             self._exchange_merged(ctx)
             return
         ex, scr, K, T, MB = ctx.ex, ctx.scr, self.budget, ctx.ex.T, ctx.ex.MB
+        scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
+        if self._fuse_union_exchange(ex):
+            self._exchange_unions(ctx, fuse_sel=True)
+            return
+        need_row_ids = self._need_row_ids
         npr, rows, W = self._shard_rows(ex)
         me = ctx.me
         lane = jax.lax.broadcasted_iota(I32, (1, W), 1)
         lo = self._run(ctx) * rows
-        scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
 
         def pack(i: Any, carry: Any) -> Any:
             r = jnp.minimum(lo + i, MB - 1)  # past the last request: never read
-            scr["qg_send"][i, :, pl.ds(0, K)] = scr["qi_id"][r]
             head = jnp.where(lane == K, scr["qi_kvl"][r], 0)
-            scr["qg_send"][i] = jnp.where(
-                lane < K,
-                scr["qg_send"][i],
-                jnp.where(lane == K + 1, scr["qc_sga"][r], head),
-            )
+            if need_row_ids:
+                scr["qg_send"][i, :, pl.ds(0, K)] = scr["qi_id"][r]
+                scr["qg_send"][i] = jnp.where(
+                    lane < K,
+                    scr["qg_send"][i],
+                    jnp.where(lane == K + 1, scr["qc_sga"][r], head),
+                )
+            else:
+                scr["qg_send"][i] = jnp.where(lane == K + 1, scr["qc_sga"][r], head)
             return carry
 
         jax.lax.fori_loop(0, rows, pack, 0)
-        self._gather_runs(ctx, scr["qg_send"], scr["qg_recv"], scr["qg_ssem"], scr["qg_rsem"])
+        self._gather_runs(
+            ctx, scr["qg_send"], scr["qg_recv"], scr["qg_ssem"], scr["qg_rsem"]
+        )
 
         def unpack(r: Any, carry: Any) -> Any:
             o = r // T // npr
             row = scr["qg_recv"][o, r - o * rows]
-            scr["qi_id"][r] = row[:, :K]
             scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K, row, 0))
             scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K + 1, row, 0))
-            cs = self._ids_copies(ctx, r)
-            for c in cs:
-                c.start()
-            if not self.async_dma:
+            if need_row_ids:
+                scr["qi_id"][r] = row[:, :K]
+                cs = self._ids_copies(ctx, r)
                 for c in cs:
-                    c.wait()
+                    c.start()
+                if not self.async_dma:
+                    for c in cs:
+                        c.wait()
             return carry
 
         jax.lax.fori_loop(0, MB, unpack, 0)
-        if self.async_dma:
+        if self.async_dma and need_row_ids:
             self._wait_ids_copies(ctx, MB)
         if self.union_attn:
             self._exchange_unions(ctx)
@@ -1304,6 +1520,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         same lanes as `qg_send`) and its union (the same lanes as `qgu_send`, offset `u0`);
         unpacked into the same scratch as the two exchanges. int32 copies only."""
         ex, scr, K, T, MB = ctx.ex, ctx.scr, self.budget, ctx.ex.T, ctx.ex.MB
+        need_row_ids = self._need_row_ids
         nreq = MB // T
         npr, rows, WS = self._shard_rows(ex)
         u0, _ = self._xmerge_width(ex)
@@ -1318,22 +1535,34 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         bal = self._balanced(ex)
 
         def pack(i: Any, carry: Any) -> Any:
-            if bal:  # `nvis_balance`: the run's i-th request (an empty slot: never read)
+            if (
+                bal
+            ):  # `nvis_balance`: the run's i-th request (an empty slot: never read)
                 qb = jnp.maximum(scr["qb_slot"][run * npr + i], 0)
             for t in range(T):
                 r = (
-                    qb * T + t if bal
-                    else jnp.minimum(run * rows + i * T + t, MB - 1)  # past the last request: never read
+                    qb * T + t
+                    if bal
+                    else jnp.minimum(
+                        run * rows + i * T + t, MB - 1
+                    )  # past the last request: never read
                 )
                 at = t * WS
-                send[i, :, pl.ds(at, K)] = scr["qi_id"][r]
                 head = jnp.where(lane == K, scr["qi_kvl"][r], 0)
-                send[i, :, pl.ds(at, WS)] = jnp.where(
-                    lane < K,
-                    send[i, :, pl.ds(at, WS)],
-                    jnp.where(lane == K + 1, scr["qc_sga"][r], head),
-                )
-            q = qb if bal else jnp.minimum(run * npr + i, nreq - 1)  # past the last: never read
+                if need_row_ids:
+                    send[i, :, pl.ds(at, K)] = scr["qi_id"][r]
+                    send[i, :, pl.ds(at, WS)] = jnp.where(
+                        lane < K,
+                        send[i, :, pl.ds(at, WS)],
+                        jnp.where(lane == K + 1, scr["qc_sga"][r], head),
+                    )
+                else:
+                    send[i, :, pl.ds(at, WS)] = jnp.where(
+                        lane == K + 1, scr["qc_sga"][r], head
+                    )
+            q = (
+                qb if bal else jnp.minimum(run * npr + i, nreq - 1)
+            )  # past the last: never read
             send[i, :, pl.ds(u0, W)] = scr["qu_id"][q]
             send[i, :, pl.ds(u0 + W, W)] = scr["qu_cd"][q]
             nl = jnp.zeros((1, 128), I32)
@@ -1349,15 +1578,16 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             for t in range(T):
                 r = q * T + t
                 row = recv[o, j, :, pl.ds(t * WS, WS)]
-                scr["qi_id"][r] = row[:, :K]
                 scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K, row, 0))
                 scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K + 1, row, 0))
-                cs = self._ids_copies(ctx, r)
-                for c in cs:
-                    c.start()
-                if not self.async_dma:
+                if need_row_ids:
+                    scr["qi_id"][r] = row[:, :K]
+                    cs = self._ids_copies(ctx, r)
                     for c in cs:
-                        c.wait()
+                        c.start()
+                    if not self.async_dma:
+                        for c in cs:
+                            c.wait()
             urow = recv[o, j, :, pl.ds(u0, 2 * W + 128)]
             scr["qu_id"][q] = urow[:, :W]
             scr["qu_cd"][q] = urow[:, W : 2 * W]
@@ -1369,7 +1599,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             unpack_slot(q, o, q - o * npr)
             return carry
 
-        def unpack_bal(sl: Any, carry: Any) -> Any:  # `nvis_balance`: every slot of every run
+        def unpack_bal(
+            sl: Any, carry: Any
+        ) -> Any:  # `nvis_balance`: every slot of every run
             q = scr["qb_slot"][sl]
             o = sl // npr
             pl.when(q >= 0)(lambda: unpack_slot(q, o, sl - o * npr))
@@ -1379,33 +1611,48 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             jax.lax.fori_loop(0, self._runs(ex) * npr, unpack_bal, 0)
         else:
             jax.lax.fori_loop(0, nreq, unpack, 0)
-        if self.async_dma:
+        if self.async_dma and need_row_ids:
             self._wait_ids_copies(ctx, MB)
 
     @_scoped("qsa_ux")
-    def _exchange_unions(self, ctx: Any) -> None:
-        """All-gather the owners' per-request unions (ids, row codes, count; int32)."""
+    def _exchange_unions(self, ctx: Any, fuse_sel: bool = False) -> None:
+        """All-gather the owners' per-request unions (ids, row codes, count; int32).
+        When `fuse_sel=True`, also packs each request's `T` `qi_kvl` and `qc_sga` scalars
+        into the trailing 128-lane metadata tail (`[D .. D + 2*T)`), eliminating the
+        separate `_exchange_selection` all-gather."""
         ex, scr = ctx.ex, ctx.scr
-        nreq, KU = ex.MB // ex.T, self._union_width(ex)
+        T = ex.T
+        nreq, KU = ex.MB // T, self._union_width(ex)
         npr = self._shard_rows(ex)[0]
-        me = ctx.me
         D = max(self.dcp, 1)
         W = D * KU
         lane = jax.lax.broadcasted_iota(I32, (1, 2 * W + 128), 1)
+        lane128 = lane[:, :128]
 
         def pack(i: Any, carry: Any) -> Any:
-            q = jnp.minimum(self._run(ctx) * npr + i, nreq - 1)  # past the last request: never read
+            q = jnp.minimum(
+                self._run(ctx) * npr + i, nreq - 1
+            )  # past the last request: never read
             scr["qgu_send"][i, :, pl.ds(0, W)] = scr["qu_id"][q]
             scr["qgu_send"][i, :, pl.ds(W, W)] = scr["qu_cd"][q]
             nl = jnp.zeros((1, 128), I32)
             for r in range(D):
-                nl = jnp.where(lane[:, :128] == r, scr["qu_n"][q, r], nl)
+                nl = jnp.where(lane128 == r, scr["qu_n"][q, r], nl)
+            if fuse_sel:
+                for t in range(T):
+                    nl = jnp.where(lane128 == D + t, scr["qi_kvl"][q * T + t], nl)
+                    nl = jnp.where(lane128 == D + T + t, scr["qc_sga"][q * T + t], nl)
             scr["qgu_send"][i, :, pl.ds(2 * W, 128)] = nl
             return carry
 
         jax.lax.fori_loop(0, npr, pack, 0)
         self._gather_runs(
-            ctx, scr["qgu_send"], scr["qgu_recv"], scr["qgu_ssem"], scr["qgu_rsem"], own_rank=True
+            ctx,
+            scr["qgu_send"],
+            scr["qgu_recv"],
+            scr["qgu_ssem"],
+            scr["qgu_rsem"],
+            own_rank=True,
         )
 
         def unpack(q: Any, carry: Any) -> Any:
@@ -1415,6 +1662,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             scr["qu_cd"][q] = row[:, W : 2 * W]
             for r in range(D):
                 scr["qu_n"][q, r] = jnp.sum(jnp.where(lane == 2 * W + r, row, 0))
+            if fuse_sel:
+                for t in range(T):
+                    scr["qi_kvl"][q * T + t] = jnp.sum(
+                        jnp.where(lane == 2 * W + D + t, row, 0)
+                    )
+                    scr["qc_sga"][q * T + t] = jnp.sum(
+                        jnp.where(lane == 2 * W + D + T + t, row, 0)
+                    )
             return carry
 
         jax.lax.fori_loop(0, nreq, unpack, 0)
@@ -1480,7 +1735,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     # every slot a tile reads (< ceil(n / 64) * 64 <= ceil(n / 128) * 128).
                     o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
                     cp = pltpu.make_async_copy(
-                        ctx.extra[MTAB].at[o, pl.ds(q, 1)], scr["qu_tab"], scr["qu_sem"].at[2]
+                        ctx.extra[MTAB].at[o, pl.ds(q, 1)],
+                        scr["qu_tab"],
+                        scr["qu_sem"].at[2],
                     )
                     cp.start()
                     cp.wait()
@@ -1498,11 +1755,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     src = scr["qu_pv"]
                 cs = [
                     pltpu.make_async_copy(
-                        src, scr["qu_row"].at[pl.ds(bank, 1), pl.ds(0, KU)],
+                        src,
+                        scr["qu_row"].at[pl.ds(bank, 1), pl.ds(0, KU)],
                         scr["qu_sem"].at[0],
                     ),
                     pltpu.make_async_copy(
-                        scr["qi_z"], scr["qu_row"].at[pl.ds(bank, 1), pl.ds(KU, 128)],
+                        scr["qi_z"],
+                        scr["qu_row"].at[pl.ds(bank, 1), pl.ds(KU, 128)],
                         scr["qu_sem"].at[1],
                     ),
                 ]
@@ -1519,11 +1778,13 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             with sc("qsa_u_ids", 2):
                 for c in (
                     pltpu.make_async_copy(
-                        scr["qu_id"].at[0, :, pl.ds(0, KU)], scr["qu_row"].at[pl.ds(0, 1), pl.ds(0, KU)],
+                        scr["qu_id"].at[0, :, pl.ds(0, KU)],
+                        scr["qu_row"].at[pl.ds(0, 1), pl.ds(0, KU)],
                         scr["qu_sem"].at[0],
                     ),
                     pltpu.make_async_copy(
-                        scr["qi_z"], scr["qu_row"].at[pl.ds(0, 1), pl.ds(KU, 128)],
+                        scr["qi_z"],
+                        scr["qu_row"].at[pl.ds(0, 1), pl.ds(KU, 128)],
                         scr["qu_sem"].at[1],
                     ),
                 ):
@@ -1535,6 +1796,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 bank = jax.lax.rem(q, 2)
                 qn = jnp.minimum(q + 1, nreq - 1)
                 nlive = q + 1 < n_loop
+
                 # The next request's ids, staged while this request's first tiles (issued by
                 # the previous request) are in flight.
                 @pl.when(nlive)
@@ -1542,7 +1804,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     stage_ids(qn, 1 - bank)
 
                 stream = (
-                    sbase, q == 0,
+                    sbase,
+                    q == 0,
                     (nlive, 1 - bank, self.tab_base(ctx, l) + qn, scr["qu_n"][qn, rk]),
                 )
                 n_u = scr["qu_n"][q, rk]
@@ -1550,7 +1813,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 outs, stream = carry, None
                 bank = jax.lax.rem(q, 2) if rbank else 0
                 n_u = scr["qu_n"][q, rk]
-                if rbank:  # q's ids are in: q + 1's go to the other bank during q's attention
+                if (
+                    rbank
+                ):  # q's ids are in: q + 1's go to the other bank during q's attention
                     wait_ids()
 
                     @pl.when(q + 1 < n_loop)
@@ -1565,30 +1830,45 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             for r in rs[1:]:
                 ok_any = ok_any | self._recent_ok(ctx, r, scol)
             if self.dcp > 1:  # both pair ranks' heads, this rank's first
-                qs = [jnp.concatenate([scr["qf_q"][r], scr["qd_q"][r]], axis=0) for r in rs]
+                qs = [
+                    jnp.concatenate([scr["qf_q"][r], scr["qd_q"][r]], axis=0)
+                    for r in rs
+                ]
             else:
                 qs = [scr["qf_q"][r] for r in rs]
             if rasync and not rbank:
                 wait_ids()
             with sc("qsa_u_attend", 2):
                 res = ua.attend_request(
-                    T=T, nh=nh * self.dcp, pool=ctx.extra[POOL], ring=scr["qf_ring"],
+                    T=T,
+                    nh=nh * self.dcp,
+                    pool=ctx.extra[POOL],
+                    ring=scr["qf_ring"],
                     sems=scr["qf_ring_sem"],
-                    ids=scr["qu_row"], codes=scr["qu_cd"].at[q, :, pl.ds(uoff, KU)],
-                        n_union=n_u,
-                    table=self.tables(ctx)[1], table_row=self.tab_base(ctx, l) + q,
+                    ids=scr["qu_row"],
+                    codes=scr["qu_cd"].at[q, :, pl.ds(uoff, KU)],
+                    n_union=n_u,
+                    table=self.tables(ctx)[1],
+                    table_row=self.tab_base(ctx, l) + q,
                     qs=qs,
                     gates=[scr["qf_g"][r] for r in rs],
                     has=[scr["qi_kvl"][r] > 0 for r in rs],
-                    off=self.offset(ctx, l), scale_k=ctx.extra[SCALES][0],
-                    scale_v=ctx.extra[SCALES][1], sm_scale=g.HD**-0.5, interpret=ex.interpret,
-                    recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok, ok_any), phys=self.union_phys,
-                    dcp=self.dcp, sc=ctx.stream.sc,
+                    off=self.offset(ctx, l),
+                    scale_k=ctx.extra[SCALES][0],
+                    scale_v=ctx.extra[SCALES][1],
+                    sm_scale=g.HD**-0.5,
+                    interpret=ex.interpret,
+                    recent=(scr["qc_rk"][q], scr["qc_rv"][q], ok, ok_any),
+                    phys=self.union_phys,
+                    dcp=self.dcp,
+                    sc=ctx.stream.sc,
                     **(dict(ids_row=bank, stream=stream) if xreq else {}),
                     **(dict(ids_row=bank) if rbank else {}),
                     **(dict(lite=True) if self.uattn_lite else {}),
                 )
-            if rasync and not rbank:  # request q's ids are read: the next request's go into `qu_row`
+            if (
+                rasync and not rbank
+            ):  # request q's ids are read: the next request's go into `qu_row`
 
                 @pl.when(q + 1 < n_loop)
                 def _():
@@ -1637,6 +1917,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
         if not xreq:
             return list(jax.lax.fori_loop(0, n_loop, req, zeros))
+
         @pl.when(n_loop > 0)
         def _():
             stage_ids(0, 0)
@@ -1647,9 +1928,15 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
     def _dcp_pair(self, ctx: Any, src: Any, dst: Any, i: int) -> None:
         """`src` -> the pair rank's `dst` (and its `src` -> ours), waited on both sides."""
         scr = ctx.scr
-        ctx.comm.exchange(ctx.comm.group_copies(
-            lambda off: src, dst, scr[f"qd_ssem{i}"], scr[f"qd_rsem{i}"], 2,
-        ))
+        ctx.comm.exchange(
+            ctx.comm.group_copies(
+                lambda off: src,
+                dst,
+                scr[f"qd_ssem{i}"],
+                scr[f"qd_rsem{i}"],
+                2,
+            )
+        )
 
     def _dcp_attend(self, ctx: Any, l: Any, zeros: tuple) -> None:
         """Pair q exchange, then the union attention over this rank's groups for both ranks'
@@ -1677,13 +1964,23 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             w0 = jnp.where(fin, jnp.exp(l0 - safe), 0.0)
             w1 = jnp.where(fin, jnp.exp(l1 - safe), 0.0)
             tot = w0 + w1
-            o = (w0 * scr["qd_o"][r] + w1 * scr["qd_or"][r]) / jnp.where(tot > 0, tot, 1.0)
+            o = (w0 * scr["qd_o"][r] + w1 * scr["qd_or"][r]) / jnp.where(
+                tot > 0, tot, 1.0
+            )
             gated = (
-                o.astype(BF16).astype(F32)
-                * jax.nn.sigmoid(scr["qf_g"][r].astype(F32)).astype(BF16).astype(F32)
-            ).astype(BF16).astype(F32)
+                (
+                    o.astype(BF16).astype(F32)
+                    * jax.nn.sigmoid(scr["qf_g"][r].astype(F32))
+                    .astype(BF16)
+                    .astype(F32)
+                )
+                .astype(BF16)
+                .astype(F32)
+            )
             res = jnp.where(fin, gated, 0.0)
-            return tuple(jnp.where(rows == r, res[h : h + 1], o_) for h, o_ in enumerate(outs))
+            return tuple(
+                jnp.where(rows == r, res[h : h + 1], o_) for h, o_ in enumerate(outs)
+            )
 
         zeros = tuple(jnp.zeros((ex.MB, g.HD), F32) for _ in range(nh))
         return list(jax.lax.fori_loop(0, ex.MB, row, zeros))

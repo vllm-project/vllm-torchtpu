@@ -240,11 +240,26 @@ def po2c(m: MoEEmit, slot_ec: Any, n_tot: Any, n_hit: Any, n_cp: Any) -> Any:
     return n_hit
 
 
-def dedup_local(m: MoEEmit, stamp: Any) -> Any:
+def dedup_local(m: MoEEmit, stamp: Any, vec_local: bool = False) -> Any:
     """Hit list without redundant copies (TP: all experts; EP: this rank's)."""
     ctx, ex, mp, scr, sc, me = m.ctx, m.ex, m.mp, m.scr, m.sc, m.me
     B, WIDE = ex.B, ex.WIDE
     ER, TOPK = mp.ER, mp.TOPK
+
+    if vec_local:
+        nb_picks = scr["elist"].shape[0]
+        base = me * ER
+        row = lax.shift_right_logical(base, 7)
+        col0 = lax.bitwise_and(base, 127)
+
+        def prim(s, n):
+            f = scr["hits"][row, col0 + s]
+            idx = jnp.minimum(n, nb_picks - 1)
+            scr["elist"][idx] = base + s
+            return n + f
+
+        with sc("route_dedup", 2):
+            return lax.fori_loop(0, ER, prim, jnp.int32(0), unroll=True)
 
     def pick(b, k, n):
         e = scr["hits"][b, k]

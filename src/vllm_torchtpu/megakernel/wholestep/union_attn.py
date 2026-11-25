@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-
 from typing import Any
 
 import jax
@@ -100,6 +99,8 @@ def compact_union(
     16 rows, j-c89e9978; 512 per pass still 62.4, j-bfd3a7f8); each slot's code is
     gathered from its group's sublane row by the
     same one-hot matmul (codes <= 15 are exact in BF16).
+
+    Kept as a pure-array reference and test oracle for `compact_union_into`.
     """
     U, Us, jcol0, srow, lane = consts
     S, W = code.shape[0], jcol0.shape[0]
@@ -111,7 +112,9 @@ def compact_union(
     Pb, codeb = P.astype(BF16), code.astype(F32).astype(BF16)
     n = jnp.sum(sel.astype(I32), axis=(0, 1), keepdims=True)
     ids_out, codes_out = [], []
-    assert KU % W == 0, f"union window {W} must divide KU={KU} (a partial last window overruns the store)"
+    assert KU % W == 0, (
+        f"union window {W} must divide KU={KU} (a partial last window overruns the store)"
+    )
     for j0 in range(0, KU, W):
         jcol = jcol0 + j0
         jf = jcol.astype(F32)
@@ -136,8 +139,65 @@ def compact_union(
     return cat(ids_out), cat(codes_out), n
 
 
-def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts: tuple,
-                        store) -> tuple:
+def compact_union_into(
+    code: jax.Array,
+    KU: int,
+    consts: tuple,
+    id_ref: Any,
+    cd_ref: Any,
+    req_idx: Any,
+    base_col: Any,
+    map_id: Any = None,
+) -> jax.Array:
+    """Looped `compact_union` writing `[1, W]` chunks directly into VMEM refs."""
+    U, Us, jcol0, srow, lane = consts
+    S, W = code.shape[0], jcol0.shape[0]
+    assert KU % W == 0, (
+        f"union window {W} must divide KU={KU} "
+        "(a partial last window overruns the store)"
+    )
+    nchunks = KU // W
+    sel = code > 0
+    P = jnp.dot(sel.astype(F32).astype(BF16), U, preferred_element_type=F32)
+    c_row = jnp.transpose(jnp.broadcast_to(P[:, 127:128], (S, 128)))[0:1, :]
+    O_row = exclusive_prefix(c_row, Us)
+    E_row = O_row + c_row
+    Pb, codeb = P.astype(BF16), code.astype(F32).astype(BF16)
+    n_scalar = jnp.sum(sel.astype(I32))
+    n = jnp.sum(sel.astype(I32), axis=(0, 1), keepdims=True)
+
+    def body(c: Any, carry: Any) -> Any:
+        j0 = c * W
+        jcol = jcol0 + j0
+        jf = jcol.astype(F32)
+        r_j = jnp.sum((E_row <= jf).astype(I32), axis=1, keepdims=True)
+        hit = srow == r_j
+        oh = hit.astype(F32).astype(BF16)
+        Pg = jnp.dot(oh, Pb, preferred_element_type=F32)
+        O_rj = jnp.sum(jnp.where(hit, O_row, 0.0), axis=1, keepdims=True)
+        lane_j = jnp.sum((Pg <= jf - O_rj).astype(I32), axis=1, keepdims=True)
+        Cg = jnp.dot(oh, codeb, preferred_element_type=F32)
+        code_j = jnp.sum(jnp.where(lane == lane_j, Cg, 0.0), axis=1, keepdims=True)
+        live = jcol < n
+        ids = jnp.where(live, r_j * 128 + lane_j, 0).astype(F32)
+        codes = jnp.where(live, code_j, 0.0)
+        ids_row = jnp.transpose(jnp.broadcast_to(ids, (W, 128)))[0:1, :].astype(I32)
+        if map_id is not None:
+            ids_row = map_id(ids_row)
+        codes_row = jnp.transpose(jnp.broadcast_to(codes, (W, 128)))[0:1, :].astype(I32)
+        col_off = pl.multiple_of(base_col + c * W, 128)
+        id_ref[req_idx, :, pl.ds(col_off, W)] = ids_row
+        cd_ref[req_idx, :, pl.ds(col_off, W)] = codes_row
+        return carry
+
+    nchunks_live = (n_scalar + W - 1) // W
+    jax.lax.fori_loop(0, nchunks_live, body, 0)
+    return n
+
+
+def compact_union_chunk(
+    code: jax.Array, tot: jax.Array, row_of, KU: int, consts: tuple, store
+) -> tuple:
     """One row chunk of `compact_union` (`VLLM_TPU_MK_QSA_SELECT_NVIS`): the coded lanes of
     `code [CR, 128]` take union slots `[tot, tot + count)` (`tot`: scalar int32 count of the
     chunks before it, which hold lower ids). For each `UNION_CHUNK` slot window that meets
@@ -154,7 +214,9 @@ def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts
     E_row = O_row + c_row
     Pb, codeb = P.astype(BF16), code.astype(F32).astype(BF16)
     n = jnp.sum(sel.astype(I32))
-    assert KU % W == 0, f"union window {W} must divide KU={KU} (a partial last window overruns the store)"
+    assert KU % W == 0, (
+        f"union window {W} must divide KU={KU} (a partial last window overruns the store)"
+    )
     for j0 in range(0, KU, W):
 
         @pl.when((j0 < tot + n) & (j0 + W > tot))
@@ -181,7 +243,9 @@ def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts
     return tot + n
 
 
-def physical_ids(ids: jax.Array, tab: jax.Array, per_page: int, dcp: int = 1) -> jax.Array:
+def physical_ids(
+    ids: jax.Array, tab: jax.Array, per_page: int, dcp: int = 1
+) -> jax.Array:
     """Physical micro-page ids `[1, 128]` of 128 request-local group ids `ids [1, 128]`: what
     `attend_request` computes per copy (`tab[v >> shift] * per_page + (v & (per_page - 1))`), as
     one vector pass against the request's page-table row `tab [1, pps]` (lane select + lane sum:
@@ -353,71 +417,81 @@ def attend_request(
         return _tile_body(t, s, carry)
 
     def _tile_body(t: Any, s: Any, carry: Any) -> Any:
-      with sc("u_unpack", 3):
-        win = codes[:, pl.ds(pl.multiple_of((t // 2) * 128, 128), 128)].astype(F32).astype(BF16)
-        if lite:
-            ex = jnp.where(jax.lax.rem(t, 2) == 0, expand[0], expand[1])
-            tok_code = jnp.dot(win, ex, preferred_element_type=F32).astype(I32)
-        else:
-            tok_code = jnp.where(
-                jax.lax.rem(t, 2) == 0,
-                jnp.dot(win, expand[0], preferred_element_type=F32),
-                jnp.dot(win, expand[1], preferred_element_type=F32),
-            ).astype(I32)
-        tok = t * TILE + jax.lax.broadcasted_iota(I32, (1, TILE), 1)
-        k8, v8 = _unpack_kv(ring.at[s], off, interpret)
-        key = k8.astype(F32) * scale_k
-        tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
-        value = v8.astype(F32)
-        if lite and dcp > 1:  # sanitize + scale in one select; no length mask (see `lite`)
-            value = jnp.where(value == value, value * scale_v, 0.0)
-        else:
-            if dcp > 1:  # unowned slots hold the pair rank's rows (FP8: may be NaN)
-                value = jnp.where(value == value, value, 0.0)
-            value = jnp.where(tok_col < length, value * scale_v, 0.0)
-      with sc("u_rows", 3):
-        if stack:
-            m, l, acc = carry
-            valid = (tok < length) & ((jnp.right_shift(tok_code, rowbit) & 1) != 0)
-            score = jax.lax.dot_general(
-                qcat, key, (((1,), (1,)), ((), ())), preferred_element_type=F32
+        with sc("u_unpack", 3):
+            win = (
+                codes[:, pl.ds(pl.multiple_of((t // 2) * 128, 128), 128)]
+                .astype(F32)
+                .astype(BF16)
             )
-            score = jnp.where(valid, score * sm_scale, -jnp.inf)
-            m_new = jnp.maximum(m, jnp.max(score, axis=-1, keepdims=True))
-            safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
-            p = jnp.where(valid, jnp.exp(score - safe), 0.0)
-            alpha = jnp.where(
-                m == -jnp.inf, jnp.where(m_new == -jnp.inf, 1.0, 0.0), jnp.exp(m - safe)
-            )
-            return (
-                m_new,
-                l * alpha + jnp.sum(p, axis=-1, keepdims=True),
-                acc * alpha + jnp.dot(p, value, preferred_element_type=F32),
-            )
-        out = []
-        for r in range(T):
-            m, l_sum, acc = carry[r]
-            valid = (tok < length) & ((tok_code & (1 << r)) != 0)
-            score = jax.lax.dot_general(
-                qf[r], key, (((1,), (1,)), ((), ())), preferred_element_type=F32
-            )
-            score = jnp.where(valid, score * sm_scale, -jnp.inf)
-            m_new = jnp.maximum(m, jnp.max(score, axis=-1, keepdims=True))
-            safe = jnp.where(
-                m_new == -jnp.inf, 0.0, m_new
-            )  # no token of this row so far
-            p = jnp.where(valid, jnp.exp(score - safe), 0.0)
-            alpha = jnp.where(
-                m == -jnp.inf, jnp.where(m_new == -jnp.inf, 1.0, 0.0), jnp.exp(m - safe)
-            )
-            out.append(
-                (
+            if lite:
+                ex = jnp.where(jax.lax.rem(t, 2) == 0, expand[0], expand[1])
+                tok_code = jnp.dot(win, ex, preferred_element_type=F32).astype(I32)
+            else:
+                tok_code = jnp.where(
+                    jax.lax.rem(t, 2) == 0,
+                    jnp.dot(win, expand[0], preferred_element_type=F32),
+                    jnp.dot(win, expand[1], preferred_element_type=F32),
+                ).astype(I32)
+            tok = t * TILE + jax.lax.broadcasted_iota(I32, (1, TILE), 1)
+            k8, v8 = _unpack_kv(ring.at[s], off, interpret)
+            key = k8.astype(F32) * scale_k
+            tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
+            value = v8.astype(F32)
+            if (
+                lite and dcp > 1
+            ):  # sanitize + scale in one select; no length mask (see `lite`)
+                value = jnp.where(value == value, value * scale_v, 0.0)
+            else:
+                if dcp > 1:  # unowned slots hold the pair rank's rows (FP8: may be NaN)
+                    value = jnp.where(value == value, value, 0.0)
+                value = jnp.where(tok_col < length, value * scale_v, 0.0)
+        with sc("u_rows", 3):
+            if stack:
+                m, l, acc = carry
+                valid = (tok < length) & ((jnp.right_shift(tok_code, rowbit) & 1) != 0)
+                score = jax.lax.dot_general(
+                    qcat, key, (((1,), (1,)), ((), ())), preferred_element_type=F32
+                )
+                score = jnp.where(valid, score * sm_scale, -jnp.inf)
+                m_new = jnp.maximum(m, jnp.max(score, axis=-1, keepdims=True))
+                safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
+                p = jnp.where(valid, jnp.exp(score - safe), 0.0)
+                alpha = jnp.where(
+                    m == -jnp.inf,
+                    jnp.where(m_new == -jnp.inf, 1.0, 0.0),
+                    jnp.exp(m - safe),
+                )
+                return (
                     m_new,
-                    l_sum * alpha + jnp.sum(p, axis=-1, keepdims=True),
+                    l * alpha + jnp.sum(p, axis=-1, keepdims=True),
                     acc * alpha + jnp.dot(p, value, preferred_element_type=F32),
                 )
-            )
-        return tuple(out)
+            out = []
+            for r in range(T):
+                m, l_sum, acc = carry[r]
+                valid = (tok < length) & ((tok_code & (1 << r)) != 0)
+                score = jax.lax.dot_general(
+                    qf[r], key, (((1,), (1,)), ((), ())), preferred_element_type=F32
+                )
+                score = jnp.where(valid, score * sm_scale, -jnp.inf)
+                m_new = jnp.maximum(m, jnp.max(score, axis=-1, keepdims=True))
+                safe = jnp.where(
+                    m_new == -jnp.inf, 0.0, m_new
+                )  # no token of this row so far
+                p = jnp.where(valid, jnp.exp(score - safe), 0.0)
+                alpha = jnp.where(
+                    m == -jnp.inf,
+                    jnp.where(m_new == -jnp.inf, 1.0, 0.0),
+                    jnp.exp(m - safe),
+                )
+                out.append(
+                    (
+                        m_new,
+                        l_sum * alpha + jnp.sum(p, axis=-1, keepdims=True),
+                        acc * alpha + jnp.dot(p, value, preferred_element_type=F32),
+                    )
+                )
+            return tuple(out)
 
     dim = qs[0].shape[-1]
     init = tuple(
@@ -435,32 +509,85 @@ def attend_request(
             jnp.zeros((T * nh, dim), F32),
         )
     state = jax.lax.fori_loop(0, ntiles, tile, init)
-    if stack:
-        state = tuple(
-            tuple(x[r * nh : (r + 1) * nh] for x in state) for r in range(T)
-        )
     rk, rv, ok_rows, ok_any = recent
     rkey = rk * scale_k
     rval = jnp.where(ok_any, rv * scale_v, 0.0)
+    if stack:
+        m, l_sum, acc = state
+        ok_cat = (
+            jnp.concatenate(
+                [jnp.broadcast_to(ok_rows[r].astype(I32), (nh, 8)) for r in range(T)],
+                axis=0,
+            )
+            != 0
+        )
+        sc_r = jax.lax.dot_general(
+            qcat, rkey, (((1,), (1,)), ((), ())), preferred_element_type=F32
+        )
+        sc_r = jnp.where(ok_cat, sc_r * sm_scale, -jnp.inf)
+        m_new = jnp.maximum(m, jnp.max(sc_r, axis=-1, keepdims=True))
+        safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
+        p = jnp.where(ok_cat, jnp.exp(sc_r - safe), 0.0)
+        alpha = jnp.where(m == -jnp.inf, 0.0, jnp.exp(m - safe))
+        l_sum = l_sum * alpha + jnp.sum(p, axis=-1, keepdims=True)
+        acc = acc * alpha + jnp.dot(p, rval, preferred_element_type=F32)
+        attn = acc / jnp.where(l_sum > 0, l_sum, 1.0)
+        if dcp > 1:
+            lse = jnp.where(
+                l_sum > 0, m_new + jnp.log(jnp.where(l_sum > 0, l_sum, 1.0)), -jnp.inf
+            )
+            att_z = jnp.where(l_sum > 0, attn, 0.0)
+            return [
+                (att_z[r * nh : (r + 1) * nh], lse[r * nh : (r + 1) * nh])
+                for r in range(T)
+            ]
+        gcat = jnp.concatenate([g.astype(F32) for g in gates], axis=0)
+        gated = (
+            (
+                attn.astype(BF16).astype(F32)
+                * jax.nn.sigmoid(gcat).astype(BF16).astype(F32)
+            )
+            .astype(BF16)
+            .astype(F32)
+        )
+        has_cat = (
+            jnp.concatenate(
+                [
+                    jnp.broadcast_to(
+                        (has[r] | (jnp.max(jnp.where(ok_rows[r], 1, 0)) > 0)).astype(
+                            I32
+                        ),
+                        (nh, 1),
+                    )
+                    for r in range(T)
+                ],
+                axis=0,
+            )
+            != 0
+        )
+        out_cat = jnp.where(has_cat, gated, 0.0)
+        return [out_cat[r * nh : (r + 1) * nh] for r in range(T)]
     if dcp > 1:
         partial = []
     out = []
     for r in range(T):
         m, l_sum, acc = state[r]
         ok = ok_rows[r]
-        sc = jax.lax.dot_general(
+        sc_r = jax.lax.dot_general(
             qf[r], rkey, (((1,), (1,)), ((), ())), preferred_element_type=F32
         )
-        sc = jnp.where(ok, sc * sm_scale, -jnp.inf)
-        m_new = jnp.maximum(m, jnp.max(sc, axis=-1, keepdims=True))
+        sc_r = jnp.where(ok, sc_r * sm_scale, -jnp.inf)
+        m_new = jnp.maximum(m, jnp.max(sc_r, axis=-1, keepdims=True))
         safe = jnp.where(m_new == -jnp.inf, 0.0, m_new)
-        p = jnp.where(ok, jnp.exp(sc - safe), 0.0)
+        p = jnp.where(ok, jnp.exp(sc_r - safe), 0.0)
         alpha = jnp.where(m == -jnp.inf, 0.0, jnp.exp(m - safe))
         l_sum = l_sum * alpha + jnp.sum(p, axis=-1, keepdims=True)
         acc = acc * alpha + jnp.dot(p, rval, preferred_element_type=F32)
         attn = acc / jnp.where(l_sum > 0, l_sum, 1.0)
         if dcp > 1:
-            lse = jnp.where(l_sum > 0, m_new + jnp.log(jnp.where(l_sum > 0, l_sum, 1.0)), -jnp.inf)
+            lse = jnp.where(
+                l_sum > 0, m_new + jnp.log(jnp.where(l_sum > 0, l_sum, 1.0)), -jnp.inf
+            )
             partial.append((jnp.where(l_sum > 0, attn, 0.0), lse))
             continue
         gated = (

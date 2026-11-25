@@ -125,34 +125,40 @@ def dedup_rows_vec(ids: Any, B: int, TOPK: int, base: Any, ER: int) -> Any:
         axis=0,
         keepdims=True,
     )
-    n_hit = jnp.sum(
-        jnp.where(fp < float(DEDUP_BIG), 1.0, 0.0), axis=1, keepdims=True
-    )
+    n_hit = jnp.sum(jnp.where(fp < float(DEDUP_BIG), 1.0, 0.0), axis=1, keepdims=True)
     r8 = lax.broadcasted_iota(I32, (8, 128), 0)
     out = jnp.where(r8 == 0, elist, jnp.where(r8 == 1, n_hit, 0.0))
     return out.astype(I32)
 
 
 def route_topk(
-    m: MoEEmit, choice: Any, p8: Any, VEC: bool, slot_ec: Any, NCP: int, MROW: int
+    m: MoEEmit,
+    choice: Any,
+    p8: Any,
+    VEC: bool,
+    slot_ec: Any,
+    NCP: int,
+    MROW: int,
+    vec_local: bool = False,
 ) -> None:
     """Pick each row's top-k experts; write `hitv` (ids or VEC meta) and `wn`."""
     ctx, ex, mp, stream, scr = m.ctx, m.ex, m.mp, m.stream, m.scr
     EM, FLT_MIN, lane128, lane_e8, row8 = m.EM, m.FLT_MIN, m.lane128, m.lane_e8, m.row8
     B, MR, R = ex.B, ex.MR, ex.R
     E, ER, TOPK = mp.E, mp.ER, mp.TOPK
+    need_ids = not VEC and not vec_local
     ids = jnp.zeros((MR, 128), I32)
     if mp.topk_packed:
         kb = lax.bitcast_convert_type(jnp.maximum(choice, FLT_MIN), I32)
         key = lax.bitcast_convert_type((kb & ~EM) | (EM - lane_e8), F32)
         if mp.topk_lanes and E % 128 == 0 and MR <= 128 and TOPK <= 128:
-            ids_l, sel = topk_rows_on_lanes(key, TOPK, EM, need_ids=not VEC)
-            if not VEC:
+            ids_l, sel = topk_rows_on_lanes(key, TOPK, EM, need_ids=need_ids)
+            if need_ids:
                 ids = ids_l
         else:
             for k in range(TOPK):
                 kmax = jnp.max(key, axis=-1, keepdims=True)
-                if not VEC:
+                if need_ids:
                     am_ = EM - (lax.bitcast_convert_type(kmax, I32) & EM)
                     ids = jnp.where(lane128 == k, am_, ids)
                 key = jnp.where(key == kmax, -1.0, key)
@@ -213,6 +219,14 @@ def route_topk(
         scr["hitv"][MROW : MROW + 1, :] = meta.astype(I32)
     elif mp.dedup_vec:
         scr["hitv"][0:8, :] = dedup_rows_vec(ids, B, TOPK, m.me * ER, ER)
+    elif vec_local:
+        hitf = jnp.max(
+            jnp.where(jnp.logical_and(sel, row8 < B), 1, 0).astype(I32),
+            axis=0,
+            keepdims=True,
+        )
+        for j in range(MROW):
+            scr["hitv"][j : j + 1, :] = hitf[:, j * 128 : (j + 1) * 128]
     else:
         scr["hitv"][...] = ids
     wsel = jnp.where(sel, p8, 0.0)
