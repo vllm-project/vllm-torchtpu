@@ -206,8 +206,9 @@ def short_conv(
     # position zero, so taps read history only for each request's first rows.
     fast_history = request_owned_history and envs.VLLM_TPU_PLE_CONV_HISTORY_FAST
     # VLLM_TPU_MK_IO_LEAN=pleconv: each tap's rows of this step as a static shift
-    # (`shifted_rows`) instead of a gather at clipped indices; the same rows.
-    static_shift = io_lean("pleconv")
+    # (`shifted_rows`) instead of a gather at clipped indices; the same rows. Only up to
+    # VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS rows (slower on larger stock decode steps).
+    static_shift = io_lean("pleconv", rows=token_count)
 
     def gathers_history_per_token(distance):  # the branch below that reads `history[req]`
         return not (fast_history and distance == 0) and not (

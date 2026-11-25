@@ -21,7 +21,8 @@ before the head kernels: `ple` (megakernel programs only) feeds the n-gram hash 
 embedding mask int32 operands and trace-time hash constants instead of int64 operands,
 and finds each token's request with one comparison; `pleconv` reads each conv tap's
 rows of the step as a static shift instead of a gather, and the taps' history rows in one
-gather (every program that runs the PLE conv op).
+gather (every program that runs the PLE conv op, up to
+VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS rows).
 """
 
 from __future__ import annotations
@@ -48,10 +49,18 @@ def io_lean_levers(raw: str | None = None) -> frozenset[str]:
     return frozenset(parts)
 
 
-# Levers that stay off above VLLM_TPU_MK_IO_LEAN_MAX_ROWS rows (default 48): at c32
-# main-KV DCP-2 b64 either one turns `qsa_select` +12..17 us slower on every rank (an XLA
-# scheduling / placement effect; outputs identical, ~/q38f/scag/mk_iolean.md).
-ROW_CAPPED = frozenset({"cktab", "conv"})
+# Levers that stay off above a row count, and the env var holding it. cktab / conv:
+# VLLM_TPU_MK_IO_LEAN_MAX_ROWS (default 48): at c32 main-KV DCP-2 b64 either one turns
+# `qsa_select` +12..17 us slower on every rank (an XLA scheduling / placement effect;
+# outputs identical, ~/q38f/scag/mk_iolean.md). pleconv: VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS
+# (default 32): the lean PLE conv program is faster at every step of <= 32 rows but up
+# to 20 us slower at 48..96 rows of 32 requests (stock decode buckets; envs.py).
+_ROW_CAP_ENV = {
+    "cktab": "VLLM_TPU_MK_IO_LEAN_MAX_ROWS",
+    "conv": "VLLM_TPU_MK_IO_LEAN_MAX_ROWS",
+    "pleconv": "VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS",
+}
+ROW_CAPPED = frozenset(_ROW_CAP_ENV)
 
 
 def io_lean(lever: str, rows: int | None = None) -> bool:
@@ -60,7 +69,7 @@ def io_lean(lever: str, rows: int | None = None) -> bool:
     if lever not in io_lean_levers():
         return False
     if lever in ROW_CAPPED and rows is not None:
-        return rows <= envs.VLLM_TPU_MK_IO_LEAN_MAX_ROWS
+        return rows <= getattr(envs, _ROW_CAP_ENV[lever])
     return True
 
 
@@ -76,7 +85,7 @@ def io_lean_line() -> str | None:
     names = ",".join(lv for lv in LEVERS if lv in levers) or "none"
     return (
         f"MK_IO_LEAN levers={names} max_rows={envs.VLLM_TPU_MK_IO_LEAN_MAX_ROWS} "
-        f"ple_trim={int(trim)}"
+        f"pleconv_max_rows={envs.VLLM_TPU_MK_IO_LEAN_PLECONV_MAX_ROWS} ple_trim={int(trim)}"
     )
 
 
