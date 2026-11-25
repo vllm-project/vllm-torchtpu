@@ -11,10 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SEND_LAYOUT_VMEM_LIMIT_BYTES: the send-layout decode attention call
-(`send_world` without the fused exchange) caps its scoped VMEM and keeps its
-array operands and its send buffer in HBM; a call without the send layout keeps
-the default limit and no memory-space pins.
+"""TPU_MLA_SEND_LAYOUT_VMEM_CAP: with the flag on, the send-layout decode
+attention call (`send_world` without the fused exchange) caps its scoped VMEM
+(SEND_LAYOUT_VMEM_LIMIT_BYTES, never below its scratch plus headroom) and keeps
+its array operands and its send buffer in HBM. With it off, and for calls
+without the send layout, the call keeps the default limit and no memory-space
+pins. The kernel body is the same either way.
 
 Checked on CPU by lowering `sparse_ragged_paged_attention` for TPU (no device)
 and reading the MLA call's tpu_custom_call backend config. The SparseCore
@@ -32,6 +34,8 @@ import pytest
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla
 
 HEADS = 64
+FLAG = "TPU_MLA_SEND_LAYOUT_VMEM_CAP"
+PLACEMENT = ("input_memory_space_colors", "output_memory_space_colors")
 # Lowering off-device has to name the target TPU (Pallas queries its geometry).
 TPU7X = jax.sharding.AbstractMesh(
     (1,),
@@ -40,6 +44,18 @@ TPU7X = jax.sharding.AbstractMesh(
         device_kind="TPU7x", num_cores=1, platform="tpu"
     ),
 )
+# The 32-token DCP decode call: send layout for 8 ranks, no fused exchange.
+SEND_32 = dict(
+    tokens=32,
+    topk=2048,
+    topk_cap=512,
+    batch=8,
+    fused_window_prep=True,
+    decode_row_widths=(128, 256, 384),
+    send_world=8,
+)
+# Calls without the send layout (output and lse returned), one chunk.
+LSE = dict(topk=1024, topk_cap=256, batch=16, gather_and_attention_chunk_size=128)
 
 
 def _stub_gather(
@@ -55,11 +71,14 @@ def _stub_gather(
     return out + ((cache_kv_nope, cache_kv_rope) if kv_write is not None else ())
 
 
-def _mla_call(monkeypatch, *, tokens, topk, topk_cap, batch, **kwargs):
+def _mla_call(monkeypatch, cap, *, tokens, topk, topk_cap, batch, **kwargs):
     """(kernel name, backend config) of the one MLA call in the lowered module."""
     monkeypatch.setattr(
         sparse_mla.native_sc_gather, "dsa_gather_native_sc", _stub_gather
     )
+    monkeypatch.setenv(FLAG, "1" if cap else "0")
+    # The flag is read at trace time; drop traces made under the other value.
+    jax.clear_caches()
     sds = jax.ShapeDtypeStruct
     with jax.sharding.use_abstract_mesh(TPU7X):
         lowered = _lower(sds, tokens, topk, topk_cap, batch, kwargs)
@@ -102,18 +121,21 @@ def _lower(sds, tokens, topk, topk_cap, batch, kwargs):
     ).lower(lowering_platforms=("tpu",))
 
 
-def test_send_layout_call_caps_vmem_and_pins_hbm(monkeypatch):
-    # The 32-token DCP decode call: send layout for 8 ranks, no fused exchange.
-    name, config = _mla_call(
-        monkeypatch,
-        tokens=32,
-        topk=2048,
-        topk_cap=512,
-        batch=8,
-        fused_window_prep=True,
-        decode_row_widths=(128, 256, 384),
-        send_world=8,
-    )
+def _default_unpinned(config):
+    assert config["scoped_memory_configs"] == [
+        {"memory_space": 1, "offset": 0, "size": sparse_mla.DEFAULT_VMEM_LIMIT_BYTES}
+    ]
+    assert not set(PLACEMENT) & set(config["custom_call_config"])
+
+
+def test_send_layout_call_off_keeps_default(monkeypatch):
+    name, config = _mla_call(monkeypatch, False, **SEND_32)
+    assert "-xa2a" not in name and "-ov" not in name, name
+    _default_unpinned(config)
+
+
+def test_send_layout_call_on_caps_vmem_and_pins_hbm(monkeypatch):
+    name, config = _mla_call(monkeypatch, True, **SEND_32)
     assert "-xa2a" not in name and "-ov" not in name, name
     assert config["scoped_memory_configs"] == [
         {"memory_space": 1, "offset": 0, "size": 32 * 1024 * 1024}
@@ -131,19 +153,21 @@ def test_send_layout_call_caps_vmem_and_pins_hbm(monkeypatch):
     ]
 
 
+def test_send_layout_flag_changes_placement_only(monkeypatch):
+    _, off = _mla_call(monkeypatch, False, **SEND_32)
+    _, on = _mla_call(monkeypatch, True, **SEND_32)
+    for config in (off, on):
+        config.pop("scoped_memory_configs")
+        for key in PLACEMENT:
+            config["custom_call_config"].pop(key, None)
+    # Everything else, the serialized kernel body included, is the same.
+    assert on == off
+
+
 def test_send_layout_cap_rises_with_scratch(monkeypatch):
     # Batch 16 and top-k cap 1024: the call's own VMEM scratch (about 37 MiB)
     # exceeds the 32 MiB cap, so the limit becomes scratch + headroom instead.
-    _, config = _mla_call(
-        monkeypatch,
-        tokens=32,
-        topk=2048,
-        topk_cap=1024,
-        batch=16,
-        fused_window_prep=True,
-        decode_row_widths=(128, 256, 384),
-        send_world=8,
-    )
+    _, config = _mla_call(monkeypatch, True, **dict(SEND_32, topk_cap=1024, batch=16))
     size = config["scoped_memory_configs"][0]["size"]
     assert 32 * 1024 * 1024 < size < sparse_mla.DEFAULT_VMEM_LIMIT_BYTES
     assert size - sparse_mla.SEND_LAYOUT_VMEM_HEADROOM_BYTES > 32 * 1024 * 1024
@@ -152,36 +176,8 @@ def test_send_layout_cap_rises_with_scratch(monkeypatch):
     ]
 
 
-def test_lse_call_keeps_default_vmem_and_no_pins(monkeypatch):
-    # A 128-token call without the send layout (output and lse returned).
-    name, config = _mla_call(
-        monkeypatch,
-        tokens=128,
-        topk=1024,
-        topk_cap=256,
-        batch=16,
-        gather_and_attention_chunk_size=128,
-    )
+@pytest.mark.parametrize("tokens", [80, 96, 128])
+def test_lse_calls_unchanged_with_flag_on(monkeypatch, tokens):
+    name, config = _mla_call(monkeypatch, True, tokens=tokens, **LSE)
     assert "-xa2a" not in name and "-ov" not in name, name
-    assert config["scoped_memory_configs"] == [
-        {"memory_space": 1, "offset": 0, "size": sparse_mla.DEFAULT_VMEM_LIMIT_BYTES}
-    ]
-    call = config["custom_call_config"]
-    assert "input_memory_space_colors" not in call
-    assert "output_memory_space_colors" not in call
-
-
-@pytest.mark.parametrize("tokens", [80, 96])
-def test_other_lse_buckets_unpinned(monkeypatch, tokens):
-    _, config = _mla_call(
-        monkeypatch,
-        tokens=tokens,
-        topk=1024,
-        topk_cap=256,
-        batch=16,
-        gather_and_attention_chunk_size=128,
-    )
-    assert config["scoped_memory_configs"][0]["size"] == (
-        sparse_mla.DEFAULT_VMEM_LIMIT_BYTES
-    )
-    assert "input_memory_space_colors" not in config["custom_call_config"]
+    _default_unpinned(config)
