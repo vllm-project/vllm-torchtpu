@@ -26,7 +26,11 @@ from vllm.lora.layers import (
     RowParallelLinearWithShardedLoRA,
 )
 
-import vllm_torchtpu.lora.layers as tpu_layers_mod
+from tests.layers.adapter.rowparallel_test_utils import (
+    as_pair,
+    assert_same,
+    run_tp_group,
+)
 from vllm_torchtpu.lora.layers import (
     TpuRowParallelLinearWithLoRA,
     use_tpu_lora_layers,
@@ -74,47 +78,21 @@ def _make_layer(
 
 
 def _run_tp_group(monkeypatch, cls, w_blocks, lora_blocks, x_blocks, **layer_kwargs):
-    """Runs the forward of cls on every rank of a simulated TP group.
-
-    A real all-reduce hands every rank the same sum, which takes two passes to
-    imitate: capture each rank's pre-reduce output, then replay every rank
-    with the all-reduce returning their sum.
-    """
+    """Runs the forward of cls on every rank of a simulated TP group."""
     tp_size = len(w_blocks)
-
-    def run_all_ranks(all_reduce):
-        # vLLM's forward reads all_reduce from its module globals, ours from ours.
-        monkeypatch.setattr(
-            vllm_row_mod, "tensor_model_parallel_all_reduce", all_reduce
-        )
-        monkeypatch.setattr(
-            tpu_layers_mod, "tensor_model_parallel_all_reduce", all_reduce
-        )
-        return [
-            _make_layer(
-                cls,
-                rank,
-                tp_size,
-                weight_block=w_blocks[rank],
-                lora_block=lora_blocks[rank],
-                **layer_kwargs,
-            )(x_blocks[rank])
-            for rank in range(tp_size)
-        ]
-
-    pre_reduce = []
-
-    def capture(tensor):
-        pre_reduce.append(tensor)
-        return tensor
-
-    run_all_ranks(capture)
-    reduced = sum(pre_reduce) if pre_reduce else None
-    return run_all_ranks(lambda tensor: reduced)
-
-
-def _as_pair(ret):
-    return ret if isinstance(ret, tuple) else (ret, None)
+    return run_tp_group(
+        monkeypatch,
+        vllm_row_mod,
+        tp_size,
+        lambda rank: _make_layer(
+            cls,
+            rank,
+            tp_size,
+            weight_block=w_blocks[rank],
+            lora_block=lora_blocks[rank],
+            **layer_kwargs,
+        )(x_blocks[rank]),
+    )
 
 
 def _blocks(seed=0, out_features=6, in_features=8, tokens=3):
@@ -166,12 +144,7 @@ def test_matches_vllm_tp2(
     )
 
     for rank, (mine, theirs) in enumerate(zip(ours, upstream)):
-        out, out_bias = _as_pair(mine)
-        want_out, want_bias = _as_pair(theirs)
-        torch.testing.assert_close(out, want_out, msg=f"rank {rank}")
-        assert (out_bias is None) == (want_bias is None), rank
-        if out_bias is not None:
-            torch.testing.assert_close(out_bias, want_bias, msg=f"rank {rank}")
+        assert_same(mine, theirs, f"rank {rank}")
     if not reduce_results:
         return  # No collective: each rank keeps its own partial product.
     # Every rank also agrees with one unsharded layer with the adapter.
@@ -179,7 +152,7 @@ def test_matches_vllm_tp2(
     if bias_present and not skip_bias_add:
         expected = expected + bias
     for rank, mine in enumerate(ours):
-        torch.testing.assert_close(_as_pair(mine)[0], expected, msg=f"rank {rank}")
+        torch.testing.assert_close(as_pair(mine)[0], expected, msg=f"rank {rank}")
 
 
 def test_every_rank_passes_the_same_bias_to_the_gemm(monkeypatch):
@@ -201,7 +174,8 @@ def test_every_rank_passes_the_same_bias_to_the_gemm(monkeypatch):
         )
         return seen
 
-    assert all(seen is None for seen in biases_seen(TpuRowParallelLinearWithLoRA))
+    ours = biases_seen(TpuRowParallelLinearWithLoRA)
+    assert ours and all(seen is None for seen in ours)
     # Guards against a vacuous check: vLLM's forward does differ by rank.
     upstream = biases_seen(RowParallelLinearWithLoRA)
     assert any(seen is None for seen in upstream)

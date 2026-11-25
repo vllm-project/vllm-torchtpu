@@ -14,13 +14,16 @@
 """LoRA layers whose forward has to differ from vLLM's on TPU."""
 
 from collections.abc import Iterable
+from typing import cast
 
 import torch
-from vllm.distributed import (
-    split_tensor_along_last_dim,
-    tensor_model_parallel_all_reduce,
-)
 from vllm.lora.layers import BaseLayerWithLoRA, RowParallelLinearWithLoRA
+from vllm.model_executor.layers.linear import RowParallelLinear
+
+from vllm_torchtpu.layers.adapter.linear import (
+    defers_bias,
+    forward_with_deferred_bias,
+)
 
 
 class TpuRowParallelLinearWithLoRA(RowParallelLinearWithLoRA):
@@ -36,35 +39,17 @@ class TpuRowParallelLinearWithLoRA(RowParallelLinearWithLoRA):
     ``super().forward()``.
     """
 
+    # TODO: drop this override once vLLM adds the bias after the all-reduce.
     def forward(
         self, input_: torch.Tensor
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
-        base_layer = self.base_layer
-        defer_bias = (
-            base_layer.reduce_results
-            and self.tp_size > 1
-            and not base_layer.skip_bias_add
-            and base_layer.bias is not None
-        )
-        if not defer_bias:
+        # vLLM types base_layer as LinearBase; this class wraps RowParallelLinear.
+        base_layer = cast(RowParallelLinear, self.base_layer)
+        if not defers_bias(base_layer):
             return super().forward(input_)
-
-        if base_layer.input_is_parallel:
-            input_parallel = input_
-        else:
-            split_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.tp_size
-            )
-            input_parallel = split_input[self.tp_rank].contiguous()
-
-        output_parallel = self.apply(input_parallel, None)
-        output = tensor_model_parallel_all_reduce(output_parallel)
-        output = output + base_layer.bias
-
-        # skip_bias_add is False here, so there is no bias left to return.
-        if not base_layer.return_bias:
-            return output
-        return output, None
+        return forward_with_deferred_bias(
+            base_layer, input_, lambda x: self.apply(x, None)
+        )
 
 
 def use_tpu_lora_layers(modules: Iterable[BaseLayerWithLoRA]) -> None:
@@ -73,6 +58,8 @@ def use_tpu_lora_layers(modules: Iterable[BaseLayerWithLoRA]) -> None:
     vLLM picks the LoRA layer for each module from a fixed list, so the layers
     are retyped once vLLM has created them. The TPU classes add no state.
     """
+    # TODO: register the TPU layer through vLLM once it has a hook for
+    # out-of-tree LoRA layers, and stop retyping.
     for module in modules:
         if type(module) is RowParallelLinearWithLoRA:
             module.__class__ = TpuRowParallelLinearWithLoRA

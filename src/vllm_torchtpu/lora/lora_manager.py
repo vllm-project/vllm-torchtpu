@@ -54,6 +54,8 @@ _SUPPORTED_LAYERS = (
     MergedColumnParallelLinearVariableSliceWithLoRA,
     QKVParallelLinearWithLoRA,
     MergedQKVParallelLinearWithLoRA,
+    # TPULoRAModelManager retypes these to TpuRowParallelLinearWithLoRA, which
+    # keeps set_lora, so both are staged.
     RowParallelLinearWithLoRA,
     TpuRowParallelLinearWithLoRA,
     ReplicatedLinearWithLoRA,

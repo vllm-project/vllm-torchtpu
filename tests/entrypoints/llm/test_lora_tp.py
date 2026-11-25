@@ -22,6 +22,8 @@ different token where the top tokens are close, with or without LoRA. So runs
 are compared by the distribution of the first token, and a difference counts
 only against how far another adapter moves that distribution.
 
+A test here runs on pull requests unless it is marked nightly.
+
 Run with: pytest tests/entrypoints/llm/test_lora_tp.py -v
 """
 
@@ -40,7 +42,7 @@ from tests.entrypoints.llm.test_lora import (
     merged_model,  # noqa: F401
 )
 
-pytestmark = [pytest.mark.tpu_test, pytest.mark.multichip, pytest.mark.nightly]
+pytestmark = [pytest.mark.tpu_test, pytest.mark.multichip]
 
 
 @pytest.fixture(scope="module")
@@ -57,9 +59,11 @@ def tp_size() -> int:
 
 
 def _lora_slots(worker):
-    """The adapter id in each LoRA slot of this rank, and its LoRA layers."""
+    """The adapter id in each LoRA slot of this rank, and the class names of
+    its LoRA layers."""
     manager = worker.model_runner.lora_manager._adapter_manager
-    return list(manager.lora_index_to_id), len(manager.modules)
+    layer_classes = sorted(type(module).__name__ for module in manager.modules.values())
+    return list(manager.lora_index_to_id), layer_classes
 
 
 @pytest.fixture(scope="class")
@@ -69,6 +73,7 @@ def tp_lora_llm(tp_size):
 
 
 class TestLoRATensorParallelEngine:
+    @pytest.mark.nightly
     def test_adapters_change_the_output(self, tp_lora_llm, adapters):  # noqa: F811
         base = _greedy(tp_lora_llm, None)
         a = _greedy(tp_lora_llm, adapters["a"])
@@ -84,9 +89,13 @@ class TestLoRATensorParallelEngine:
         assert len(ranks) == tp_size
         for slots, lora_layers in ranks:
             assert adapters["a"].lora_int_id in slots
-            assert lora_layers > 0
+            # The manager swapped in the TPU layer for every o_proj and
+            # down_proj.
+            assert "TpuRowParallelLinearWithLoRA" in lora_layers
+            assert "RowParallelLinearWithLoRA" not in lora_layers
         assert all(rank == ranks[0] for rank in ranks)
 
+    @pytest.mark.nightly
     def test_mixed_batch_matches_uniform_batches(self, tp_lora_llm, adapters):  # noqa: F811
         """Rows of one batch that use different adapters, or none, come out as
         they do in batches that use a single one, and not as another row's
@@ -102,6 +111,7 @@ class TestLoRATensorParallelEngine:
         other = _mean_total_variation(mixed, [uniform[(i + 1) % 3][i] for i in rows])
         assert own < 0.25 * other, (own, other)
 
+    @pytest.mark.nightly
     def test_evicted_adapter_reloads_with_the_same_output(
         self,
         tp_lora_llm,
@@ -119,6 +129,7 @@ class TestLoRATensorParallelEngine:
         adapter_effect = _mean_total_variation(other, before)
         assert reload_gap < 0.25 * adapter_effect, (reload_gap, adapter_effect)
 
+    @pytest.mark.nightly
     def test_adapter_rpcs_reach_every_rank(self, tp_lora_llm, adapters):  # noqa: F811
         engine = tp_lora_llm.llm_engine
         request = LoRARequest("rpc", 50, adapters["a"].lora_path)
@@ -133,6 +144,7 @@ class TestLoRATensorParallelEngine:
             assert request.lora_int_id not in slots
 
 
+@pytest.mark.nightly
 def test_lora_matches_the_adapter_merged_into_the_weights(
     tp_size,
     adapters,  # noqa: F811
@@ -154,6 +166,7 @@ def test_lora_matches_the_adapter_merged_into_the_weights(
     assert lora_gap < 0.5 * adapter_effect, (lora_gap, adapter_effect)
 
 
+@pytest.mark.nightly
 def test_lm_head_adapter_matches_one_chip(tp_size, adapters):  # noqa: F811
     """An adapter on lm_head alone moves the output as it does on one chip."""
     with _engine(**LORA_ARGS, tensor_parallel_size=tp_size) as llm:

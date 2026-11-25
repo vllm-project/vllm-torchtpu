@@ -25,7 +25,11 @@ import vllm.model_executor.layers.linear as linear_mod
 from vllm.model_executor.custom_op import maybe_get_oot_by_class, op_registry_oot
 from vllm.model_executor.layers.linear import RowParallelLinear
 
-import vllm_torchtpu.layers.adapter.linear as tpu_linear_mod
+from tests.layers.adapter.rowparallel_test_utils import (
+    as_pair,
+    assert_same,
+    run_tp_group,
+)
 from vllm_torchtpu.layers.adapter.linear import TpuRowParallelLinear
 
 
@@ -37,6 +41,7 @@ def _make_layer(
     skip_bias_add,
     reduce_results=True,
     return_bias=False,
+    input_is_parallel=True,
 ):
     """A RowParallelLinear stand-in: ``__new__`` without ``__init__``, which
     would need an initialised distributed group."""
@@ -48,7 +53,7 @@ def _make_layer(
         return out
 
     layer = TpuRowParallelLinear.__new__(TpuRowParallelLinear)
-    layer.input_is_parallel = True
+    layer.input_is_parallel = input_is_parallel
     layer.tp_rank = tp_rank
     layer.tp_size = tp_size
     layer.reduce_results = reduce_results
@@ -60,49 +65,17 @@ def _make_layer(
 
 
 def _run_tp_group(monkeypatch, forward, w_blocks, x_blocks, **layer_kwargs):
-    """Run ``forward`` on every rank of a simulated TP group.
-
-    A real all-reduce hands every rank the same sum, which takes two passes to
-    imitate: capture each rank's pre-reduce output, then replay every rank with
-    the all-reduce returning their sum.
-    """
+    """Runs ``forward`` on every rank of a simulated TP group."""
     tp_size = len(w_blocks)
-
-    def run_all_ranks(all_reduce):
-        # Upstream reads all_reduce from vLLM's module globals, ours from ours.
-        monkeypatch.setattr(linear_mod, "tensor_model_parallel_all_reduce", all_reduce)
-        monkeypatch.setattr(
-            tpu_linear_mod, "tensor_model_parallel_all_reduce", all_reduce
-        )
-        return [
-            forward(
-                _make_layer(r, tp_size, weight_block=w, **layer_kwargs), x_blocks[r]
-            )
-            for r, w in enumerate(w_blocks)
-        ]
-
-    pre_reduce = []
-
-    def capture(tensor):
-        pre_reduce.append(tensor)
-        return tensor
-
-    run_all_ranks(capture)
-    reduced = sum(pre_reduce) if pre_reduce else None
-    return run_all_ranks(lambda tensor: reduced)
-
-
-def _as_pair(ret):
-    return ret if isinstance(ret, tuple) else (ret, None)
-
-
-def _assert_same(ours, upstream, msg):
-    out, bias = _as_pair(ours)
-    want_out, want_bias = _as_pair(upstream)
-    torch.testing.assert_close(out, want_out, msg=msg)
-    assert (bias is None) == (want_bias is None), msg
-    if bias is not None:
-        torch.testing.assert_close(bias, want_bias, msg=msg)
+    return run_tp_group(
+        monkeypatch,
+        linear_mod,
+        tp_size,
+        lambda rank: forward(
+            _make_layer(rank, tp_size, weight_block=w_blocks[rank], **layer_kwargs),
+            x_blocks[rank],
+        ),
+    )
 
 
 def test_registered_under_the_upstream_class_name():
@@ -122,8 +95,14 @@ def test_registered_under_the_upstream_class_name():
 @pytest.mark.parametrize("skip_bias_add", [False, True])
 @pytest.mark.parametrize("return_bias", [False, True])
 @pytest.mark.parametrize("reduce_results", [True, False])
+@pytest.mark.parametrize("input_is_parallel", [True, False])
 def test_matches_upstream_tp2(
-    monkeypatch, bias_present, skip_bias_add, return_bias, reduce_results
+    monkeypatch,
+    bias_present,
+    skip_bias_add,
+    return_bias,
+    reduce_results,
+    input_is_parallel,
 ):
     """Our forward == upstream's, rank by rank, on a simulated TP=2 group."""
     rng = torch.Generator().manual_seed(0)
@@ -137,11 +116,15 @@ def test_matches_upstream_tp2(
     half = in_f // 2
     w_blocks = [W[:, :half], W[:, half:]]
     x_blocks = [x[:, :half], x[:, half:]]
+    if not input_is_parallel:
+        # Every rank gets the whole input and takes its own block.
+        x_blocks = [x, x]
     kwargs = dict(
         bias=b,
         skip_bias_add=skip_bias_add,
         return_bias=return_bias,
         reduce_results=reduce_results,
+        input_is_parallel=input_is_parallel,
     )
 
     ours = _run_tp_group(
@@ -151,7 +134,7 @@ def test_matches_upstream_tp2(
         monkeypatch, RowParallelLinear.forward, w_blocks, x_blocks, **kwargs
     )
     for rank, (mine, theirs) in enumerate(zip(ours, upstream)):
-        _assert_same(mine, theirs, f"rank {rank}")
+        assert_same(mine, theirs, f"rank {rank}")
 
     if not reduce_results:
         return  # no collective: each rank keeps its own partial product
@@ -161,7 +144,7 @@ def test_matches_upstream_tp2(
     if b is not None and not skip_bias_add:
         expected = expected + b
     for rank, mine in enumerate(ours):
-        torch.testing.assert_close(_as_pair(mine)[0], expected, msg=f"rank {rank}")
+        torch.testing.assert_close(as_pair(mine)[0], expected, msg=f"rank {rank}")
 
 
 def test_delegates_to_upstream_at_tp1(monkeypatch):
@@ -176,5 +159,5 @@ def test_delegates_to_upstream_at_tp1(monkeypatch):
     ours = _run_tp_group(monkeypatch, TpuRowParallelLinear.forward, [W], [x], **kwargs)
     upstream = _run_tp_group(monkeypatch, RowParallelLinear.forward, [W], [x], **kwargs)
 
-    _assert_same(ours[0], upstream[0], "tp1")
-    torch.testing.assert_close(_as_pair(ours[0])[0], x @ W.T + b)
+    assert_same(ours[0], upstream[0], "tp1")
+    torch.testing.assert_close(as_pair(ours[0])[0], x @ W.T + b)

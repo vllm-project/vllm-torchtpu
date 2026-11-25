@@ -120,6 +120,11 @@ def update_gqa_head_padding_config(model_config: Any, parallel_config: Any) -> N
     object.__setattr__(arch_config, "total_num_attention_heads", padded_heads)
 
 
+def pads_query_heads(model_config: Any) -> bool:
+    """Whether ``update_gqa_head_padding_config`` padded this model's heads."""
+    return getattr(model_config, "orig_total_num_attention_heads", None) is not None
+
+
 def _spans_heads(tensor: torch.Tensor, dim: int, num_heads: int, head_dim: int) -> bool:
     """Whether ``tensor`` has exactly ``num_heads * head_dim`` entries along ``dim``."""
     return tensor.dim() > dim and tensor.shape[dim] == num_heads * head_dim
