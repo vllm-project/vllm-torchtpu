@@ -121,7 +121,7 @@ def requant_load_kmajor_fp4(
 
 
 def quantize_native_fp4_kmajor(
-    w: torch.Tensor, block: int, pack: bool = True, scale_mode: str = "fp32"
+    w: torch.Tensor, block: int, pack: bool = True, scale_mode: str = "four_over_six"
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize an already-dequantized, K-major float weight to native FP4.
 

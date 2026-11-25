@@ -143,7 +143,7 @@ def requant_unpack_kmajor(
 
 
 def quantize_to_native_fp4_kmajor(
-    w: jax.Array, block: int, pack: bool = True, scale_mode: str = "fp32"
+    w: jax.Array, block: int, pack: bool = True, scale_mode: str = "four_over_six"
 ) -> tuple[jax.Array, jax.Array]:
     """Quantize K-major float weight ([..., K, N]) to packed uint8 e2m1 and
     per-block FP32 scale.
