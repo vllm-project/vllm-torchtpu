@@ -54,8 +54,11 @@ MIRROR_MISMATCH: Final[str] = "mirror_mismatch"
     _COL_TOP_P,
 ) = range(8)
 _NUM_SCALAR_COLS: Final[int] = 8
+# A staged row of an M-RoPE model has one more column: the request's delta.
+_COL_MROPE_DELTA: Final[int] = _NUM_SCALAR_COLS
 # The per-slot scalar tensors of `DecodeSlots`, 4 bytes each: num_computed,
-# last_token, temperature, top_k, top_p, seed_lo, seed_hi and mamba_slot.
+# last_token, temperature, top_k, top_p, seed_lo, seed_hi and mamba_slot. The
+# slots of an M-RoPE model add mrope_delta.
 _NUM_SLOT_COLUMNS: Final[int] = 8
 
 
@@ -81,6 +84,12 @@ def _as_int32(value: int) -> int:
 
 def _float32_bits(value: float) -> int:
     return int(np.float32(value).view(np.int32))
+
+
+def mrope_position_rows(runner: Any) -> int:
+    """The rows of the M-RoPE positions the runner stages (its int32
+    `mrope_positions` buffer), or 0 for a model with 1D positions."""
+    return int(runner.mrope_positions.cpu.shape[0]) if runner.uses_mrope else 0
 
 
 def num_reqs_padding(runner: Any, num_reqs: int) -> int:
@@ -109,6 +118,9 @@ class SlotConfig:
     group_widths: tuple[int, ...]
     vocab_size: int
     model_seed: int
+    # Rows of an M-RoPE model's positions (`mrope_position_rows`), 0 for 1D
+    # positions. With M-RoPE each slot also holds its request's delta.
+    mrope_rows: int = 0
 
     @property
     def num_slots(self) -> int:
@@ -121,8 +133,10 @@ class SlotConfig:
     @property
     def device_bytes(self) -> int:
         """The HBM the slot tensors of `DecodeSlots` take: one row per slot
-        of the scalar columns and of every group's block table, all 4-byte."""
-        return 4 * self.num_slots * (_NUM_SLOT_COLUMNS + sum(self.group_widths))
+        of the scalar columns (with M-RoPE, the delta too) and of every
+        group's block table, all 4-byte."""
+        num_columns = _NUM_SLOT_COLUMNS + (1 if self.mrope_rows else 0)
+        return 4 * self.num_slots * (num_columns + sum(self.group_widths))
 
     @staticmethod
     def from_runner(runner: Any) -> SlotConfig:
@@ -135,6 +149,7 @@ class SlotConfig:
             ),
             vocab_size=runner.vocab_size,
             model_seed=int(runner.model_config.seed or 0),
+            mrope_rows=mrope_position_rows(runner),
         )
 
 
@@ -170,8 +185,10 @@ def _write_scalar_rows_impl(
     mamba_slot: torch.Tensor,
     temperature: torch.Tensor,
     top_p: torch.Tensor,
+    mrope_delta: torch.Tensor | None = None,
 ) -> None:
-    rows = staged.view(-1, _NUM_SCALAR_COLS)
+    num_cols = _NUM_SCALAR_COLS if mrope_delta is None else _NUM_SCALAR_COLS + 1
+    rows = staged.view(-1, num_cols)
     float_rows = rows.view(torch.float32)
     index = (rows[:, _COL_SLOT].long(),)
     num_computed.index_put_(index, rows[:, _COL_NUM_COMPUTED])
@@ -181,6 +198,8 @@ def _write_scalar_rows_impl(
     mamba_slot.index_put_(index, rows[:, _COL_MAMBA_SLOT])
     temperature.index_put_(index, float_rows[:, _COL_TEMPERATURE])
     top_p.index_put_(index, float_rows[:, _COL_TOP_P])
+    if mrope_delta is not None:
+        mrope_delta.index_put_(index, rows[:, _COL_MROPE_DELTA])
 
 
 def _write_block_rows_impl(staged: torch.Tensor, block_table: torch.Tensor) -> None:
@@ -235,13 +254,17 @@ class DecodeSlots:
         self.seed_lo = column(torch.int32)
         self.seed_hi = column(torch.int32)
         self.mamba_slot = column(torch.int32)
+        # An M-RoPE request's position delta: a generated token's position is
+        # its index plus the delta in every section.
+        self.mrope_delta = column(torch.int32) if config.mrope_rows else None
         self.block_tables = tuple(
             torch.zeros((num_slots, width), dtype=torch.int32).to(device)
             for width in config.group_widths
         )
 
         # Host mirrors, by slot. A slot's scalar row is kept as last written.
-        self._scalars = np.zeros((num_slots, _NUM_SCALAR_COLS), dtype=np.int32)
+        num_cols = _NUM_SCALAR_COLS + (1 if config.mrope_rows else 0)
+        self._scalars = np.zeros((num_slots, num_cols), dtype=np.int32)
         self._scalars[:, _COL_SLOT] = config.null_slot
         self._scalars[:, _COL_TEMPERATURE] = _float32_bits(1.0)
         self._scalars[:, _COL_TOP_P] = _float32_bits(1.0)
@@ -311,8 +334,9 @@ class DecodeSlots:
             slots = sorted(self._dirty_scalars)
             self._dirty_scalars.clear()
             num_rows = num_reqs_padding(runner, len(slots))
-            host = zeros_h2d_source(runner, num_rows * _NUM_SCALAR_COLS)
-            rows = host.numpy().reshape(num_rows, _NUM_SCALAR_COLS)
+            num_cols = self._scalars.shape[1]
+            host = zeros_h2d_source(runner, num_rows * num_cols)
+            rows = host.numpy().reshape(num_rows, num_cols)
             rows[:] = self._scalars[null_slot]
             rows[: len(slots)] = self._scalars[slots]
             self._write_scalar_rows(stage_h2d_upload(runner, host))
@@ -502,6 +526,7 @@ class DecodeSlots:
                 self.mamba_slot,
                 self.temperature,
                 self.top_p,
+                self.mrope_delta,
             )
 
     def _write_block_rows(self, staged: torch.Tensor, gid: int) -> None:
@@ -540,6 +565,12 @@ class DecodeSlots:
         scalars[_COL_MAMBA_SLOT] = 0
         scalars[_COL_TEMPERATURE] = _float32_bits(input_batch.temperature_cpu[row])
         scalars[_COL_TOP_P] = _float32_bits(input_batch.top_p_cpu[row])
+        if self.mrope_delta is not None:
+            # Set by `_init_mrope_positions` when the runner adds the request
+            # or applies a streaming update, which both allocate a slot again.
+            # Only multimodal pruning rewrites it later, and multimodal models
+            # keep every step on the stock path.
+            scalars[_COL_MROPE_DELTA] = runner.requests[req_id].mrope_position_delta
         self._dirty_scalars.add(slot)
         self._ready[slot] = False
         if runner._has_mamba_state:
