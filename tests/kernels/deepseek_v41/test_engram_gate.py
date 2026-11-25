@@ -95,3 +95,38 @@ def test_engram_gate_error_no_worse_than_xla(tokens, heads, dim, k_dim, window, 
     assert fused_err.max() <= xla_err.max() * 1.05 + 1e-6
     masked = ~np.asarray(mask, bool)
     np.testing.assert_array_equal(np.asarray(fused)[masked], np.asarray(hidden)[masked])
+
+
+@pytest.mark.parametrize("tokens", [288, 2048])
+def test_engram_gate_packed_rows_match_bf16_rows(tokens):
+    """Packed staging words give the bits of the rows dequant_fp8_rows builds,
+    including -0 bytes, byte-255 (invalid) and byte-0 scales and zero rows."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("the packed prologue is validated on TPU")
+    from vllm_torchtpu.models.vllm.deepseek_v41.common.engram_hbm import dequant
+
+    heads, dim, k_dim, block = 4, 5120, 6144, 32
+    rng = np.random.default_rng(0)
+    raw = rng.integers(0, 256, (tokens, k_dim), dtype=np.uint8)
+    raw[(raw & 0x7F) == 0x7F] = 0x80
+    raw[5] = 0
+    scale = (127 + rng.integers(-12, 12, (tokens, k_dim // block))).astype(np.uint8)
+    scale[rng.random(scale.shape) < 0.02] = 255
+    scale[7] = 255
+    scale[9, :3] = 0
+    w = jnp.asarray(
+        rng.standard_normal((k_dim, (heads + 1) * dim)) * 30, jnp.float8_e4m3fn
+    )
+    w_scale = jnp.asarray(rng.uniform(1e-3, 2e-3, (heads + 1) * dim), jnp.float32)
+    hidden = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
+    q_weight = jnp.asarray(1 + 0.1 * rng.standard_normal((heads, dim)), jnp.bfloat16)
+    k_weight = jnp.asarray(1 + 0.1 * rng.standard_normal((heads, dim)), jnp.bfloat16)
+    mask = jnp.asarray(rng.random(tokens) > 0.1, jnp.float32)
+    rest = (w, w_scale, hidden, q_weight, k_weight, mask)
+    rows = dequant(jnp.asarray(raw), jnp.asarray(scale), block)
+    expected = engram_gate(rows, *rest, eps=EPS, clamp=CLAMP)
+    words = (jnp.asarray(raw.view(np.int32)), jnp.asarray(scale.view(np.int32)))
+    actual = engram_gate(words, *rest, eps=EPS, clamp=CLAMP, block_size=block)
+    np.testing.assert_array_equal(
+        np.asarray(actual).view(np.uint16), np.asarray(expected).view(np.uint16)
+    )
