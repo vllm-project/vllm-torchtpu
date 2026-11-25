@@ -185,11 +185,11 @@ def density_choices(
     one-tile-per-expert bound that padding alone would flip the ladder; with
     both given, a placed build makes the choices the unplaced build makes.
     """
-    g_rows = g_local if occupied_slots is None else min(int(occupied_slots), g_local)
+    g_rows = g_local if occupied_slots is None else min(occupied_slots, g_local)
     rows = (
         rows_alloc
         if density_rows_alloc is None
-        else min(int(density_rows_alloc), rows_alloc)
+        else min(density_rows_alloc, rows_alloc)
     )
     rungs = tile_height_rungs(tile_m, rows, g_rows, ep)
     return rungs, rows <= ep * g_rows * tile_m

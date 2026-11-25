@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import jax
+import types
+from typing import NamedTuple
+
 import jax.numpy as jnp
-import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.experimental.push_fused_moe import kernel as push_kernel
 from vllm_torchtpu.kernels.experimental.push_fused_moe import layer as push_layer
 from vllm_torchtpu.kernels.fused_moe.v2 import host, kernel
 from vllm_torchtpu.kernels.fused_moe.v2 import layer as v2_layer
@@ -427,24 +429,15 @@ def test_input_scratch_refuses_invalid_geometry(options, message):
 # bucket gets without the extra slots.
 # --------------------------------------------------------------------------- #
 
-DENSITY_TILE_M, DENSITY_EP = 128, 8
+DENSITY_TILE_M, DENSITY_EP, DENSITY_TOPK = 128, 8, 6
+# Global token buckets, 16 to 1,024 tokens per shard at EP8.
+DENSITY_BUCKETS = [128, 256, 512, 1024, 2048, 4096, 8192]
 
-# (slab rows at 48 slots, slab rows at 56 slots): host.ragged_stride_bound at
-# each DeepSeek-V4.1 token bucket for 384 vs 448 physical slots (the slab
-# grows by the extra slots' row-block alignment).
-TARGET_BUILDS = [
-    (1280, 1408),
-    (2048, 2176),
-    (3584, 3712),
-    (6656, 6784),
-    (7424, 7552),
-    (12800, 12928),
-    (25088, 25216),
-    (49664, 49792),
-]
-# A smaller model sharing the layout scheme: 16 logical experts per shard
-# in 24 slots.
-SMALL_BUILDS = [(1280, 1280), (2176, 2304), (4096, 4224), (7936, 8064)]
+
+def _slab(tokens, slots_per_shard):
+    return host.ragged_stride_bound(
+        tokens, DENSITY_TOPK, DENSITY_EP * slots_per_shard, DENSITY_TILE_M
+    )
 
 
 @pytest.mark.parametrize("g_local", [8, 16, 48, 56])
@@ -455,21 +448,24 @@ def test_without_occupied_slots_the_density_choices_are_unchanged(g_local, rows)
     assert push == (rows <= DENSITY_EP * g_local * DENSITY_TILE_M)
 
 
+@pytest.mark.parametrize("tokens", DENSITY_BUCKETS)
 @pytest.mark.parametrize(
-    "logical, slots, builds", [(48, 56, TARGET_BUILDS), (16, 24, SMALL_BUILDS)]
+    "logical, slots",
+    [pytest.param(48, 56, id="dsv41"), pytest.param(16, 24, id="small")],
 )
-def test_staging_slots_get_the_unplaced_density_choices(logical, slots, builds):
-    for rows_plain, rows_placed in builds:
-        plain = kernel.density_choices(DENSITY_TILE_M, rows_plain, logical, DENSITY_EP)
-        placed = kernel.density_choices(
-            DENSITY_TILE_M,
-            rows_placed,
-            slots,
-            DENSITY_EP,
-            occupied_slots=logical,
-            density_rows_alloc=rows_plain,
-        )
-        assert placed == plain, (rows_plain, rows_placed, plain, placed)
+def test_staging_slots_get_the_unplaced_density_choices(logical, slots, tokens):
+    plain = kernel.density_choices(
+        DENSITY_TILE_M, _slab(tokens, logical), logical, DENSITY_EP
+    )
+    placed = kernel.density_choices(
+        DENSITY_TILE_M,
+        _slab(tokens, slots),
+        slots,
+        DENSITY_EP,
+        occupied_slots=logical,
+        density_rows_alloc=_slab(tokens, logical),
+    )
+    assert placed == plain
 
 
 def test_the_unplaced_slab_decides_at_the_one_tile_bound():
@@ -493,12 +489,6 @@ def test_the_unplaced_slab_decides_at_the_one_tile_bound():
     assert both == plain
 
 
-def test_the_1024_token_bucket_differed_when_staging_slots_counted():
-    plain = kernel.density_choices(DENSITY_TILE_M, 49664, 48, DENSITY_EP)
-    counted = kernel.density_choices(DENSITY_TILE_M, 49792, 56, DENSITY_EP)
-    assert plain[1] is False and counted[1] is True
-
-
 def test_density_inputs_never_exceed_the_build():
     """Each case would flip the push choice if its input were not clamped:
     99 slots would put 49,664 rows under the bound, and 10**6 rows would put
@@ -511,19 +501,21 @@ def test_density_inputs_never_exceed_the_build():
     ) == kernel.density_choices(DENSITY_TILE_M, 49152, 48, DENSITY_EP)
 
 
-def test_density_build_kwargs_give_a_layout_the_unplaced_choices():
-    tokens = 8 * 1024
-    kw = density_build_kwargs(448, 384, 8, tokens, 6, 128)
-    assert kw == {
-        "occupied_slots": 48,
-        "density_rows_alloc": host.ragged_stride_bound(tokens, 6, 384, 128),
+@pytest.mark.parametrize(
+    "e_total, e_logical, tokens, occupied",
+    [
+        pytest.param(448, 384, 8192, 48, id="dsv41"),
+        # 380 / 8 = 47.5 logical experts per shard: a shard holds up to 48.
+        pytest.param(448, 380, 64, 48, id="rounds_up"),
+    ],
+)
+def test_density_build_kwargs_give_a_layout_the_unplaced_inputs(
+    e_total, e_logical, tokens, occupied
+):
+    assert density_build_kwargs(e_total, e_logical, 8, tokens, 6, 128) == {
+        "occupied_slots": occupied,
+        "density_rows_alloc": host.ragged_stride_bound(tokens, 6, e_logical, 128),
     }
-    placed = kernel.density_choices(
-        128, host.ragged_stride_bound(tokens, 6, 448, 128), 56, 8, **kw
-    )
-    assert placed == kernel.density_choices(
-        128, host.ragged_stride_bound(tokens, 6, 384, 128), 48, 8
-    )
 
 
 def test_density_build_kwargs_are_empty_without_extra_slots():
@@ -534,18 +526,47 @@ class _BuilderReached(Exception):
     pass
 
 
-# One shard, 48 logical experts in 56 slots. At 56 tokens the slabs differ:
-# 512 rows for 48 experts, 640 for 56 slots.
-CALL_LOGICAL, CALL_SLOTS, CALL_TOKENS, CALL_TOPK = 48, 56, 56, 6
+class _Call(NamedTuple):
+    """One layer call: `tokens` rows of x over `ep` shards, `logical` experts
+    in `slots` physical slots (an identity layout when slots > logical), and
+    the token count the layer routes after splitting rows over `groups`."""
+
+    ep: int
+    logical: int
+    slots: int
+    tokens: int
+    groups: tuple | None
+    routed: int
+
+
+CALL_TOPK = 6
+PAIRS = ((0, 1), (2, 3), (4, 5), (6, 7))
+# One shard with 48 logical experts in 56 slots; and eight shards with 380 in
+# 448, where a shard holds up to 48 logical experts and pairs of replicas
+# split each shard's 11 tokens into 6, aligned to 8, so the layer routes 64
+# tokens rather than 88. The three slabs then all differ: unplaced 896,
+# placed 1,024, and 1,152 if the slab were sized from the 88 tokens given.
+PLACED_CALLS = [
+    pytest.param(_Call(1, 48, 56, 56, None, 56), id="ep1"),
+    pytest.param(_Call(8, 380, 448, 88, PAIRS, 64), id="ep8_pairs"),
+]
+UNPLACED_CALLS = [
+    pytest.param(_Call(1, 48, 48, 56, None, 56), id="ep1"),
+    pytest.param(_Call(8, 384, 384, 88, PAIRS, 64), id="ep8_pairs"),
+]
 LAYER_BUILDERS = [
     pytest.param(v2_layer, "build_fused_ep_moe_kernel", "fused_ep_moe_v2", id="v2"),
     pytest.param(push_layer, "build_push_moe_kernel", "fused_ep_moe_push", id="push"),
 ]
 
 
-def _builder_kwargs(monkeypatch, module, builder, entry, *, placed):
+def _builder_kwargs(monkeypatch, module, builder, entry, call):
     """Call a layer entry point up to its kernel build; return the build's
-    kwargs."""
+    kwargs.
+
+    The mesh is a stand-in carrying what the layers read off one before the
+    build -- the axis name and its size -- so every case runs on one CPU
+    device."""
     seen = {}
 
     def spy(**kwargs):
@@ -554,51 +575,99 @@ def _builder_kwargs(monkeypatch, module, builder, entry, *, placed):
 
     monkeypatch.setattr(module, builder, spy)
     hidden, inter = 256, 128
-    slots = CALL_SLOTS if placed else CALL_LOGICAL
-    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("ep",))
+    mesh = types.SimpleNamespace(axis_names=("ep",), shape={"ep": call.ep})
     layout = (
-        dict(expert_slot=jnp.arange(CALL_LOGICAL, dtype=jnp.int32)[:, None])
-        if placed
+        dict(expert_slot=jnp.arange(call.logical, dtype=jnp.int32)[:, None])
+        if call.slots > call.logical
         else {}
     )
     with pytest.raises(_BuilderReached):
         getattr(module, entry)(
-            jnp.zeros((CALL_TOKENS, hidden), jnp.bfloat16),
-            jnp.zeros((slots, hidden, 2 * inter), jnp.float8_e4m3fn),
-            jnp.zeros((slots, inter, hidden), jnp.float8_e4m3fn),
-            jnp.zeros((slots, 2 * inter), jnp.float32),
-            jnp.zeros((slots, hidden), jnp.float32),
-            jnp.zeros((CALL_TOKENS, CALL_LOGICAL), jnp.float32),
+            jnp.zeros((call.tokens, hidden), jnp.bfloat16),
+            jnp.zeros((call.slots, hidden, 2 * inter), jnp.float8_e4m3fn),
+            jnp.zeros((call.slots, inter, hidden), jnp.float8_e4m3fn),
+            jnp.zeros((call.slots, 2 * inter), jnp.float32),
+            jnp.zeros((call.slots, hidden), jnp.float32),
+            jnp.zeros((call.tokens, call.logical), jnp.float32),
             topk=CALL_TOPK,
             renormalize=True,
             mesh=mesh,
             capacity=128,
+            token_replica_groups=call.groups,
             **layout,
         )
     return seen
 
 
+@pytest.mark.parametrize("call", PLACED_CALLS)
 @pytest.mark.parametrize("module, builder, entry", LAYER_BUILDERS)
 def test_layers_build_a_layout_with_the_unplaced_density_inputs(
-    monkeypatch, module, builder, entry
+    monkeypatch, module, builder, entry, call
 ):
-    seen = _builder_kwargs(monkeypatch, module, builder, entry, placed=True)
-    assert seen["g_local"] == CALL_SLOTS
+    seen = _builder_kwargs(monkeypatch, module, builder, entry, call)
+    assert seen["g_local"] == call.slots // call.ep
     assert seen["ragged_rows_alloc"] == host.ragged_stride_bound(
-        CALL_TOKENS, CALL_TOPK, CALL_SLOTS, 128
+        call.routed, CALL_TOPK, call.slots, 128
     )
-    assert seen["occupied_slots"] == CALL_LOGICAL
+    assert seen["occupied_slots"] == -(-call.logical // call.ep)
     assert seen["density_rows_alloc"] == host.ragged_stride_bound(
-        CALL_TOKENS, CALL_TOPK, CALL_LOGICAL, 128
+        call.routed, CALL_TOPK, call.logical, 128
     )
     assert seen["density_rows_alloc"] < seen["ragged_rows_alloc"]
 
 
+@pytest.mark.parametrize("call", UNPLACED_CALLS)
 @pytest.mark.parametrize("module, builder, entry", LAYER_BUILDERS)
 def test_layers_pass_no_density_inputs_without_a_layout(
-    monkeypatch, module, builder, entry
+    monkeypatch, module, builder, entry, call
 ):
-    seen = _builder_kwargs(monkeypatch, module, builder, entry, placed=False)
-    assert seen["g_local"] == CALL_LOGICAL
+    seen = _builder_kwargs(monkeypatch, module, builder, entry, call)
+    assert seen["g_local"] == call.logical // call.ep
     assert "occupied_slots" not in seen
     assert "density_rows_alloc" not in seen
+
+
+# The kernel modules and their builders' arguments beyond the shared ones.
+KERNEL_BUILDS = [
+    pytest.param(kernel, "_build_fused_ep_moe_kernel", {}, id="v2"),
+    pytest.param(
+        push_kernel,
+        "_build_push_moe_kernel",
+        dict(push_tokens=1024, sc_prepush=2),
+        id="push",
+    ),
+]
+
+
+@pytest.mark.parametrize("module, builder, extra", KERNEL_BUILDS)
+def test_kernels_make_their_density_choices_from_the_density_inputs(
+    monkeypatch, module, builder, extra
+):
+    """The 1024-token bucket at EP8, 48 logical experts in 56 slots: counting
+    the staging slots puts the placed slab (49,792 rows) under the one-tile
+    bound, which takes the short-tile ladder and ships from VMEM; the density
+    inputs keep the unplaced build's choices, full tiles and the HBM slab."""
+    info = module.pltpu.get_tpu_info_for_chip(module.pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(module.pltpu, "get_tpu_info", lambda: info)
+    placed, unplaced = _slab(8192, 56), _slab(8192, 48)
+    calls = []
+    real = kernel.density_choices
+
+    def recording(*args):
+        result = real(*args)
+        calls.append((args, result))
+        return result
+
+    monkeypatch.setattr(module, "density_choices", recording)
+    getattr(module, builder)(
+        **(TUNED | dict(g_local=56)),
+        ep=8,
+        weight_format=host.WeightFormat.FP4,
+        rhs_qb=512,
+        ragged_rows_alloc=placed,
+        occupied_slots=48,
+        density_rows_alloc=unplaced,
+        **extra,
+    )
+    assert calls == [((128, placed, 56, 8, 48, unplaced), ((128,), False))]
+    assert kernel.density_choices(128, placed, 56, 8) == ((32, 64, 96, 128), True)
