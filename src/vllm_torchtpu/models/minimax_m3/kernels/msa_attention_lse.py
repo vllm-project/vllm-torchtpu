@@ -1219,8 +1219,11 @@ def planned_attention(
     [T, 1], work_ref [1, length])`` (`msa_dcp._decode_plan_kernel`) writes
     them into scratch, and the work list moves to SMEM there. One kernel in
     place of a plan kernel and the attention kernel: each Pallas call costs
-    ~1 us plus ~0.2 us per operand (standalone bench j-97afc7d4). Returns
-    ``(out [H, T, D], lse [H, T])``."""
+    ~1 us plus ~0.2 us per operand (standalone bench j-97afc7d4). The page
+    table, and a one-tile step's queries, load while the plan runs: as a
+    scalar prefetch and a pipelined block they landed before it (c16 b1
+    decode, a 64 KiB table: 5.73 -> 4.71 us per call; c4 b1 4.89 -> 4.69,
+    anvil). Returns ``(out [H, T, D], lse [H, T])``."""
     num_heads, num_tokens, head_dim = q.shape
     num_tiles = num_tokens // block_q
     sections, length, tiles_per_step, groups_per_tile = call_work_spec(
@@ -1229,23 +1232,38 @@ def planned_attention(
     rows = tiles_per_step * block_q
     fp4 = scale_rows is not None
     scale_inputs = (scale_cache,) if fp4 else ()
+    # One tile's queries load while the plan runs (as a pipelined block they
+    # landed before it); several tiles take the block, whose layout lowers
+    # their tiles' 8-row query slices (a VMEM scratch's does not, E2003).
+    async_q = num_tiles == 1
 
-    def kernel(table_ref, head_ref, offset_ref, scalars_ref, q_ref, *refs, **kwargs):
+    def kernel(head_ref, offset_ref, scalars_ref, q_in, table_hbm, *refs, **kwargs):
         num_plan = len(plan_inputs)
         plan_refs, refs = refs[:num_plan], refs[num_plan:]
-        refs, (keys, local_page, local_limit, work_v, work_s, sem) = (
-            refs[:-6],
-            refs[-6:],
-        )
+        num_scratch = 8 + async_q
+        refs, scratch = refs[:-num_scratch], refs[-num_scratch:]
+        keys, local_page, local_limit, work_v, work_s, table_ref = scratch[:6]
+        work_sem, load_sems = scratch[6:8]
         b = pl.program_id(0)
+        if async_q:
+            q_ref = scratch[8]
+            q_copy = pltpu.make_async_copy(q_in, q_ref, load_sems.at[0])
+            q_copy.start()
+        else:
+            q_ref = q_in
 
         @pl.when(b == 0)
         def _plan():
+            table_copy = pltpu.make_async_copy(table_hbm, table_ref, load_sems.at[1])
+            table_copy.start()
             plan(scalars_ref, *plan_refs, keys, local_page, local_limit, work_v)
-            copy = pltpu.make_async_copy(work_v.at[0], work_s, sem)
+            copy = pltpu.make_async_copy(work_v.at[0], work_s, work_sem)
             copy.start()
             copy.wait()
+            table_copy.wait()
 
+        if async_q:
+            q_copy.wait()
         unions, metas, counts, starts = (work_s.at[pl.ds(at, n)] for at, n in sections)
         step = pl.ds(pl.multiple_of(b * rows, rows), rows)
         return _kernel(
@@ -1268,10 +1286,13 @@ def planned_attention(
         return pl.BlockSpec(x.shape, lambda b, *_: (0,) * x.ndim)
 
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=4,
+        num_scalar_prefetch=3,
         grid=(num_tiles // tiles_per_step,),
         in_specs=[
-            pl.BlockSpec((num_heads, rows, head_dim), lambda b, *_: (0, b, 0)),
+            pl.BlockSpec(memory_space=pl.ANY)
+            if async_q
+            else pl.BlockSpec((num_heads, rows, head_dim), lambda b, *_: (0, b, 0)),
+            pl.BlockSpec(memory_space=pl.ANY),
             *(whole(x) for x in plan_inputs),
             pl.BlockSpec(memory_space=pl.ANY),
             *(pl.BlockSpec(memory_space=pl.ANY) for _ in scale_inputs),
@@ -1302,8 +1323,11 @@ def planned_attention(
             pltpu.VMEM((num_tokens, 1), jnp.int32),
             pltpu.VMEM((1, length), jnp.int32),
             pltpu.SMEM((length,), jnp.int32),
+            pltpu.SMEM(page_table.shape, jnp.int32),
             pltpu.SemaphoreType.DMA(()),
-        ],
+            pltpu.SemaphoreType.DMA((2,)),
+        ]
+        + ([pltpu.VMEM((num_heads, rows, head_dim), q.dtype)] if async_q else []),
     )
     out, lse = pl.pallas_call(
         functools.partial(
@@ -1329,11 +1353,11 @@ def planned_attention(
         interpret=interpret,
         name="minimax_m3_msa_planned_attention_lse",
     )(
-        page_table,
         jnp.zeros((2,), jnp.int32),
         jnp.zeros((1,), jnp.int32),
         plan_scalars,
         q,
+        page_table,
         *plan_inputs,
         kv_cache,
         *scale_inputs,
