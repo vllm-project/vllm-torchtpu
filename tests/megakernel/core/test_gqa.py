@@ -34,13 +34,18 @@ from tests.megakernel.core.megakernel_fakes import (
     FakeGeometry,
     MiniCtx,
 )
-from vllm_torchtpu.megakernel.core import planner
-from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
+from vllm_torchtpu.megakernel.core import planner, pool
+from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.core.exec_spec import DebugOptions, ExecSpec
 from vllm_torchtpu.megakernel.core.modules.gqa import GQAModule
 from vllm_torchtpu.megakernel.core.modules.gqa.context import GQAEmit
 from vllm_torchtpu.megakernel.core.modules.gqa.merge import split_merge
 from vllm_torchtpu.megakernel.core.modules.gqa.new_token import att_new
 from vllm_torchtpu.megakernel.core.modules.gqa.params import GQATunables
+from vllm_torchtpu.megakernel.core.modules.gqa.staging import (
+    q_exchange_start,
+    q_gather_finish,
+)
 from vllm_torchtpu.megakernel.core.ops import (
     BF16,
     F32,
@@ -660,9 +665,11 @@ def test_gqa_host_update_states_single_scatter_vs_loop_and_numpy(T: int, NS: int
 
     states = {"kc": kc_init, "vc": vc_init}
     raw_out = {"knew": knew, "vnew": vnew}
+    pos_padded = jnp.pad(pos, (0, 8), constant_values=ctx + 99)
     out_default = gqa.host_update_states(g, ex_default, pos, states, raw_out)
     out_vec0 = gqa.host_update_states(g, ex_vec0, pos, states, raw_out)
-    out_loop = gqa.host_update_states(g, ex_loop, pos, states, raw_out)
+    out_vec0_pad = gqa.host_update_states(g, ex_vec0, pos_padded, states, raw_out)
+    out_loop = gqa.host_update_states(g, ex_loop, pos_padded, states, raw_out)
 
     # NumPy scatter oracle.
     kc_exp = np.asarray(kc_init).copy()
@@ -674,7 +681,7 @@ def test_gqa_host_update_states_single_scatter_vs_loop_and_numpy(T: int, NS: int
         kc_exp[:, s_idx, pos_np[b], :] = knew_bf16[:, b, :]
         vc_exp[:, s_idx, pos_np[b], :] = vnew_bf16[:, b, :]
 
-    for out in (out_default, out_vec0, out_loop):
+    for out in (out_default, out_vec0, out_vec0_pad, out_loop):
         np.testing.assert_array_equal(
             np.asarray(out["kc"]).view(np.uint16), kc_exp.view(np.uint16)
         )
@@ -685,3 +692,194 @@ def test_gqa_host_update_states_single_scatter_vs_loop_and_numpy(T: int, NS: int
         np.asarray(out_vec0["kc"]).view(np.uint16),
         np.asarray(kc_init).view(np.uint16),
     )
+
+
+def test_gqa_with_cache_layout_envelope_and_logical_state_checks():
+    """Verify `with_cache_layout`, `nh`/`HD`/`ROT` envelopes, and state checks."""
+    g = FakeGeometry(L=2, att_every=1, H=256, NH=4, NKV=2, HD=256, ROT=64)
+    lay1 = pool.PoolLayout(num_pools=2, slots_per_pool=0, hd=256, page_size=128)
+    lay2 = pool.PoolLayout(num_pools=2, slots_per_pool=0, hd=128, page_size=128)
+    gqa_unbound = GQAModule()
+    assert gqa_unbound.pool_layout is None
+    ms = ModelSpec(
+        "gqa_pool",
+        config=g,
+        layer_type=LayerType("lt", slots=(gqa_unbound, FakeFFNModule())),
+        cache_backend=pool.make_pool_backend(lay1),
+    )
+    gqa_b1 = ms.all_modules()[0]
+    assert isinstance(gqa_b1, GQAModule) and gqa_b1.pool_layout is lay1
+    assert gqa_b1.with_cache_layout(lay1) is gqa_b1
+    ms2 = ms.with_layout(lay2)
+    gqa_b2 = ms2.all_modules()[0]
+    assert isinstance(gqa_b2, GQAModule) and gqa_b2.pool_layout is lay2
+    assert gqa_b2.cache_decl().hd == 128
+
+    ex_paged = ExecSpec(
+        B=4,
+        T=1,
+        R=2,
+        ctx=256,
+        tiles=_TINY_GQA_TILES,
+        cache=pool.CacheExec(paged_kv=True, page_size=128, num_pages=16),
+    )
+    with pytest.raises(MegakernelConfigError, match="paged KV reads need pool pages"):
+        gqa_b2.kv_page_shape(g, ex_paged)
+
+    # Envelope validation: nh > 8 and SPLIT with HD % 128 != 0 fail at plan time.
+    ex_r2 = ExecSpec(
+        B=4,
+        T=1,
+        R=2,
+        ctx=256,
+        tiles=dataclasses.replace(_TINY_GQA_TILES, bank=512 << 10),
+    )
+    ms_nh10 = ModelSpec(
+        "gqa_nh10",
+        config=FakeGeometry(L=1, att_every=1, H=256, NH=20, NKV=2, HD=128),
+        layer_type=LayerType("lt", slots=(GQAModule(), FakeFFNModule())),
+    )
+    with pytest.raises(MegakernelConfigError, match="nh = NH // R <= 8"):
+        planner.plan(ms_nh10, ex_r2)
+
+    ms_hd64_split = ModelSpec(
+        "gqa_hd64_split",
+        config=FakeGeometry(L=1, att_every=1, H=256, NH=4, NKV=1, HD=64, ROT=32),
+        layer_type=LayerType("lt", slots=(GQAModule(), FakeFFNModule())),
+    )
+    with pytest.raises(MegakernelConfigError, match="multiple of 128"):
+        planner.plan(ms_hd64_split, ex_r2)
+
+    # QV with ROT=512 (half=256 > 128) allocates a 256-lane `rope` buffer.
+    ex_qv512 = ExecSpec(
+        B=4,
+        T=2,
+        R=1,
+        ctx=256,
+        tiles=dataclasses.replace(_TINY_GQA_TILES, bank=512 << 10).with_modules(
+            {"gqa": {"gqa_qv": True}}
+        ),
+    )
+    ms_rot512 = ModelSpec(
+        "gqa_rot512",
+        config=FakeGeometry(L=1, att_every=1, H=512, NH=1, NKV=1, HD=512, ROT=512),
+        layer_type=LayerType("lt", slots=(GQAModule(), FakeFFNModule())),
+    )
+    _, scr_rot512 = _build_gqa_test_scratch(ms_rot512, ex_qv512)
+    assert scr_rot512["rope"].shape == (2, ex_qv512.MR, 256)
+
+    # `init_logical_states` rejects R < NKV or R % NKV != 0, and roundtrips R=4.
+    gqa_geom = GQAModule(geometry=g)
+    for bad_r in (1, 3):
+        ex_bad = ExecSpec(B=4, T=1, R=bad_r, ctx=256, tiles=_TINY_GQA_TILES)
+        with pytest.raises(MegakernelConfigError, match="1 <= NKV=2 <= R="):
+            gqa_geom.init_logical_states(jax.random.PRNGKey(0), g, ex_bad, n_layers=2)
+    ex_r4 = ExecSpec(B=4, T=1, R=4, ctx=256, tiles=_TINY_GQA_TILES)
+    st_log = gqa_geom.init_logical_states(jax.random.PRNGKey(0), g, ex_r4, n_layers=2)
+    assert st_log["kc"].shape == (4, 2, ex_r4.NS, 256, g.HD)
+    packed = gqa_geom.pack_logical_states(st_log, g, ex_r4)
+    assert packed["kc"].shape == (8, ex_r4.NS, 256, g.HD)
+    unpacked = gqa_geom.unpack_kernel_states(packed, g, ex_r4)
+    next_st = gqa_geom.next_logical_states(unpacked, g, ex_r4)
+    np.testing.assert_array_equal(
+        np.asarray(next_st["kc"]).view(np.uint16),
+        np.asarray(st_log["kc"]).view(np.uint16),
+    )
+
+
+@pytest.mark.parametrize("expect_gq", [True, False])
+def test_gqa_split_skip_comm_skips_group_copies(expect_gq: bool):
+    """Verify `skip={'comm'}` skips `group_copies` and zeroes peer receive buffers."""
+    tiles = dataclasses.replace(_TINY_GQA_TILES, bank=512 << 10).with_modules(
+        {"gqa": {"gqa_qv": expect_gq, "gq_pack": expect_gq}}
+    )
+    ex = ExecSpec(
+        B=8,
+        T=4,
+        R=2,
+        ctx=256,
+        stack_e=True,
+        tiles=tiles,
+        debug=DebugOptions(skip=frozenset({"comm"})),
+        interpret=True,
+    )
+    g = FakeGeometry(
+        L=1,
+        att_every=1,
+        H=256,
+        NH=8,
+        NKV=1,
+        HD=256,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        moe_tp=True,
+    )
+    gqa = GQAModule()
+    ms = ModelSpec(
+        "gqa_skip_comm",
+        config=g,
+        layer_type=LayerType("lt", slots=(gqa, FakeFFNModule())),
+    )
+    cp, scratch = _build_gqa_test_scratch(ms, ex)
+    ap = cp.module("gqa")
+    assert ap.SPLIT is True and ap.GQ is expect_gq
+    s_names = list(scratch.keys())
+
+    class _ForbidComm:
+        def group_copies(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+            raise AssertionError("group_copies must not run when 'comm' is in skip")
+
+    def body(pos_ref, mix_out_ref, *scr_refs):
+        scr = dict(zip(s_names, scr_refs))
+        # Poison peer staging/receive buffers with NaN before `init_buffers`.
+        scr["pri"][...] = jnp.full(scr["pri"].shape, jnp.nan, F32)
+        scr["qg"][...] = jnp.full(scr["qg"].shape, jnp.nan, F32)
+        if ap.GQ:
+            scr["qxb"][...] = jnp.full(scr["qxb"].shape, jnp.nan, BF16)
+        scr["am"][...] = jnp.ones(scr["am"].shape, F32) * 0.5
+        scr["al"][...] = jnp.ones(scr["al"].shape, F32) * 1.5
+        scr["aacc"][...] = jnp.ones(scr["aacc"].shape, F32) * 0.25
+        scr["gate"][...] = jnp.zeros(scr["gate"].shape, F32)
+        scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
+
+        ctx = MiniCtx(
+            g=g,
+            ex=ex,
+            core_plan=cp,
+            pos_ref=pos_ref,
+            W={},
+            ST={},
+            O={},
+            scr=scr,
+            me=jnp.int32(0),
+            stream=_FakeGQAStream(cp.stream, {}, scr),
+            comm=_ForbidComm(),
+            skip=ex.skip,
+        )
+        gqa.init_buffers(ctx)
+        if ap.GQ:
+            scr["qxb"][0] = jnp.ones(scr["qxb"].shape[1:], BF16) * 0.1
+        else:
+            scr["qg"][0] = jnp.ones(scr["qg"].shape[1:], F32) * 0.1
+        cx = GQAEmit.build(ctx, ap, jnp.int32(0), gqa.name)
+        qx = q_exchange_start(cx)
+        assert qx == []
+        q_gather_finish(cx, qx)
+        split_merge(cx)
+        att_new(cx)
+        mix_out_ref[...] = scr["mix"][:, : ap.nh * ap.HD]
+
+    mix_sh = (ex.MB, ap.nh * ap.HD)
+    call = pl.pallas_call(
+        body,
+        out_shape=jax.ShapeDtypeStruct(mix_sh, F32),
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
+        out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
+        scratch_shapes=[scratch[k] for k in s_names],
+        interpret=pltpu.InterpretParams(),
+    )
+    pos = jnp.arange(ex.B, dtype=I32)
+    mix_out = jax.jit(call)(pos)
+    assert jnp.all(jnp.isfinite(mix_out[: ex.B]))
