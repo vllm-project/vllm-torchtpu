@@ -37,13 +37,37 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.pcp_sharding_plan import PcpShardingPlanName
 from vllm_torchtpu.runner.pcp.sharding_plan import (
     PcpShardingPlan,
-    grow_host_token_buffers,
+    assert_host_token_buffer_capacity,
     round_up_to_bucket,
 )
 
 logger = init_logger(__name__)
+
+
+def mla_kv_page_size(kv_cache_config: Any) -> int:
+    """The single block size of the MLA KV cache groups (the sparse-MLA
+    cache's page size), looking inside `UniformTypeKVCacheSpecs`."""
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, UniformTypeKVCacheSpecs
+
+    sizes: set[int] = set()
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        specs = (
+            spec.kv_cache_specs.values()
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else (spec,)
+        )
+        sizes.update(
+            int(s.block_size) for s in specs if isinstance(s, MLAAttentionSpec)
+        )
+    if len(sizes) != 1:
+        raise ValueError(
+            f"PCP manager expects one MLA KV cache block size, got {sorted(sizes)}"
+        )
+    return sizes.pop()
 
 
 @dataclass(frozen=True)
@@ -359,16 +383,14 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         # The step's `PcpMetadata` fields except the block tables, as int32 host
         # arrays; None when attention needs no `PcpMetadata`.
         self.host_metadata: dict[str, np.ndarray] | None = None
-        # `host_metadata` uploaded once for every KV cache group of the step,
-        # and host tensors outliving their non-blocking uploads.
+        # `host_metadata` uploaded once for every KV cache group of the step.
         self._staged: dict[str, torch.Tensor] | None = None
-        self._keepalive: list[torch.Tensor] = []
 
-    @property
-    def local_reqs_per_req(self) -> int:
-        # A split prefill is two DualChunkSwap chunks on every rank, each its
-        # own local request; a decode is one.
-        return 2
+    # A split prefill is two DualChunkSwap chunks on every rank, each its own
+    # local request; a decode is one.
+    plan_name = PcpShardingPlanName.HEADTAIL
+    local_reqs_per_req = 2
+    uses_pcp_metadata = True
 
     @property
     def max_local_num_tokens(self) -> int:
@@ -392,6 +414,37 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
             self.page_size,
             self.num_ws_pages,
             self.num_ws_pages * self.virtual_page_size,
+        )
+
+    def configure_kv_cache(self, kv_cache_config: Any) -> None:
+        self.set_page_size(mla_kv_page_size(kv_cache_config))
+
+    def padded_num_tokens(
+        self,
+        *,
+        runner: Any,
+        scheduler_output: Any,
+    ) -> int:
+        num_reqs = runner.input_batch.num_reqs
+        q_lens = [
+            int(scheduler_output.num_scheduled_tokens[req_id])
+            for req_id in runner.input_batch.req_ids[:num_reqs]
+            if req_id is not None
+        ]
+        if not q_lens or sum(q_lens) <= 0:
+            return 0
+        is_split = list(self.split_mask(q_lens))
+        local_max = max(
+            pcp_rank_token_counts(q_lens, is_split, self.pcp_size), default=0
+        )
+        if local_max > self._max_local_num_tokens:
+            raise RuntimeError(
+                f"PCP step needs {local_max} tokens on a rank, exceeding "
+                f"max_local_num_tokens={self._max_local_num_tokens}."
+            )
+        return (
+            round_up_to_bucket(runner.num_tokens_paddings, max(1, local_max))
+            * self.pcp_size
         )
 
     def _rep_window_size(self, target_num_reqs: int) -> int:
@@ -473,7 +526,7 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
 
         # Pack every rank's rows rank-major; this rank reads its own slice.
         num_packed = local_padded * self.pcp_size
-        grow_host_token_buffers(runner, num_packed)
+        assert_host_token_buffer_capacity(runner, num_packed)
         gather_idx = torch.as_tensor(plan.padded_gather_idx, dtype=torch.long)
         valid = torch.as_tensor(plan.gathered_valid, dtype=torch.bool)
         packed_ids = torch.where(valid, global_input_ids.index_select(0, gather_idx), 0)
@@ -523,13 +576,10 @@ class HeadTailPcpShardingPlan(PcpShardingPlan):
         self.local_num_tokens = plan.per_rank_num_tokens[self.pcp_rank]
         self.local_padded_num_tokens = local_padded
         self.logits_indices_cpu = torch.from_numpy(logits_indices.astype(np.int32))
-        # Upload now, before the runner records its input staging fence: the
-        # next step's prepare waits only on that fence before it drops these
-        # host tensors.
-        hosts = (torch.from_numpy(logits_local), torch.from_numpy(owner_mask))
-        self._keepalive.extend(hosts)
-        self.logits_local_indices, self.logits_owner_mask = (
-            t.to(runner.device, non_blocking=True) for t in hosts
+        self._stage_logits_selection(
+            runner.device,
+            torch.from_numpy(logits_local),
+            torch.from_numpy(owner_mask),
         )
         self.logits_all_local = logits_all_local
         self.request_major_to_local = request_major_to_local

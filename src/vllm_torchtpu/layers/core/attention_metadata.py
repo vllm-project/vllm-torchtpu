@@ -557,10 +557,10 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             # table whose upload is still in flight (see `stage_h2d_upload`).
             flat = zeros_h2d_source(runner, target_num_reqs * target_num_blocks)
             block_tables = flat.view(target_num_reqs, target_num_blocks)
-            # PCP currently only read block table inside pcpmetadata
+            # Head-tail PCP layers read block tables inside pcp_metadata.
             # TODO(weiyulin): Evaluate if we want to derive split/replicated block
             # tables for pcpmanager from md.blocktable
-            if runner.pcp_manager is None:
+            if runner.pcp_manager is None or not runner.pcp_manager.uses_pcp_metadata:
                 source_block_tables = block_table_obj.get_cpu_tensor()
                 block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
                     ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
@@ -728,8 +728,10 @@ def stage_block_table_uploads(
     # (see `stage_h2d_upload`).
     flat = zeros_h2d_source(runner, total)
 
-    # The PCP manager's layers read block tables inside pcp_metadata.
-    if ctx.position_ids_override is None and runner.pcp_manager is None:
+    # Head-tail PCP layers read block tables inside pcp_metadata.
+    if ctx.position_ids_override is None and (
+        runner.pcp_manager is None or not runner.pcp_manager.uses_pcp_metadata
+    ):
         offset = 0
         for _, block_table_obj, target_num_blocks in entries:
             rows = flat[offset : offset + num_reqs_padded * target_num_blocks].view(

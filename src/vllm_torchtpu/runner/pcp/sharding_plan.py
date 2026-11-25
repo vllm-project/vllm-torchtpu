@@ -26,9 +26,38 @@ import numpy as np
 import torch
 
 from vllm_torchtpu.distributed.pcp import all_reduce_sum
+from vllm_torchtpu.layers.core.sequence_layout import (
+    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+    SequenceLayoutDescriptor,
+    SequenceLayoutPlan,
+)
+from vllm_torchtpu.pcp_sharding_plan import PcpShardingPlanName
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
+
+
+def assert_host_token_buffer_capacity(runner: Any, required_num_tokens: int) -> None:
+    """Assert host token staging buffers cover `required_num_tokens`."""
+    required = int(required_num_tokens)
+    if required <= 0:
+        return
+    input_cap = int(runner.input_ids_cpu.shape[0])
+    pos_cap = int(runner.positions_cpu.shape[0])
+    arange_cap = len(runner.arange_np)
+    if input_cap < required or pos_cap < required or arange_cap < required:
+        raise RuntimeError(
+            "Host token staging buffers are smaller than required: "
+            f"required={required}, input_ids_cpu={input_cap}, "
+            f"positions_cpu={pos_cap}, arange_np={arange_cap}."
+        )
+    if runner.uses_mrope:
+        mrope_cols = int(runner.mrope_positions.cpu.shape[1])
+        if mrope_cols < required + 1:
+            raise RuntimeError(
+                "Host mrope_positions buffer is smaller than required: "
+                f"required={required + 1}, mrope_cols={mrope_cols}."
+            )
 
 
 def round_up_to_bucket(paddings: list[int] | tuple[int, ...], value: int) -> int:
@@ -42,20 +71,6 @@ def round_up_to_bucket(paddings: list[int] | tuple[int, ...], value: int) -> int
     return int(paddings[index])
 
 
-def grow_host_token_buffers(runner: Any, required: int) -> None:
-    if len(runner.arange_np) < required:
-        runner.arange_np = np.arange(required, dtype=np.int64)
-    current = int(runner.input_ids_cpu.shape[0])
-    if current >= required:
-        return
-    for name in ("input_ids_cpu", "positions_cpu"):
-        old = getattr(runner, name)
-        new = torch.zeros(required, dtype=old.dtype, device=old.device)
-        new[:current] = old
-        setattr(runner, name, new)
-    runner.positions_np = runner.positions_cpu.numpy()
-
-
 class PcpShardingPlan(ABC):
     """How a step's tokens are sharded over PCP ranks and restored after.
 
@@ -63,13 +78,25 @@ class PcpShardingPlan(ABC):
     runner reads it until the next prepare.
     """
 
+    plan_name: PcpShardingPlanName
+    local_reqs_per_req: int = 1
+    sequence_layout_descriptor: SequenceLayoutDescriptor = (
+        DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+    )
+    requires_backend_preinit: bool = False
+    local_compile_token_multiple: int = 1
+    uses_pcp_metadata: bool = False
+
     def __init__(self, pcp_size: int, pcp_rank: int, dcp_size: int) -> None:
         self.pcp_size = int(pcp_size)
         self.pcp_rank = int(pcp_rank)
         self.dcp_size = int(dcp_size)
+        self.page_size = 0
         self._reset_step_state()
 
     def _reset_step_state(self) -> None:
+        self.sequence_layout_plan: SequenceLayoutPlan | None = None
+        self._keepalive: list[torch.Tensor] = []
         # This rank's rows `token_slice` of the rank-major packed tokens.
         self.token_slice = slice(0, 0)
         self.global_num_tokens = 0
@@ -93,15 +120,22 @@ class PcpShardingPlan(ABC):
 
     @property
     @abstractmethod
-    def local_reqs_per_req(self) -> int:
-        """Rank-local requests one scheduled request can become."""
-
-    @property
-    @abstractmethod
     def max_local_num_tokens(self) -> int: ...
 
     def set_page_size(self, page_size: int) -> None:
         self.page_size = int(page_size)
+
+    def configure_kv_cache(self, kv_cache_config: Any) -> None:
+        del kv_cache_config
+
+    @abstractmethod
+    def padded_num_tokens(
+        self,
+        *,
+        runner: Any,
+        scheduler_output: Any,
+    ) -> int:
+        """Return the step's global padded token count without staging."""
 
     @abstractmethod
     def prepare_real(
@@ -150,6 +184,8 @@ class PcpShardingPlan(ABC):
         `local_reqs_per_req` of them) and its context length after this step
         (`seq_lens`)."""
         del seq_lens
+        if self.local_reqs_per_req == 1:
+            return min(len(q_lens), max(capacity, 1))
         # TODO(weiyulin): Remove once the head and tail chunks share one
         # page table row.
         num_local = 0
@@ -169,6 +205,10 @@ class PcpShardingPlan(ABC):
     def local_index_for_request_major_token(
         self, request_major_index: int
     ) -> int | None:
+        if self.sequence_layout_plan is not None:
+            return self.sequence_layout_plan.local_index_for_request_major_token(
+                request_major_index
+            )
         if self.request_major_to_local is not None:
             local = int(self.request_major_to_local[int(request_major_index)])
             return None if local < 0 else local
@@ -176,6 +216,20 @@ class PcpShardingPlan(ABC):
         if not start <= request_major_index < stop:
             return None
         return request_major_index - start
+
+    def _stage_logits_selection(
+        self,
+        device: Any,
+        local_indices_cpu: torch.Tensor,
+        owner_mask_cpu: torch.Tensor,
+    ) -> None:
+        # Upload before the runner records its input staging fence; the next
+        # step's prepare waits on that fence before dropping these host tensors.
+        hosts = (local_indices_cpu, owner_mask_cpu)
+        self._keepalive.extend(hosts)
+        self.logits_local_indices, self.logits_owner_mask = (
+            t.to(device, non_blocking=True) for t in hosts
+        )
 
     def maybe_select_logits_hidden_states(
         self, hidden_states: torch.Tensor
