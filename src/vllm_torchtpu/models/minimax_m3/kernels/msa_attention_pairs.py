@@ -56,11 +56,12 @@ _WIDTHS = (8, 12, 16, 20, 24, 28, 32)  # `_width`
 # Blocks a loop step runs side by side (`unit`). Op replay, 4,096 rows x 16
 # heads, us: 1891 / 1502 / 1163 / 1022 for 1 / 2 / 4 / 8 (uniform
 # selections, j-7166bc3d, j-b5dbd63f). A unit's schedule is its MXU pushes
-# plus a fixed tail (the s -> exp2 -> p @ v result latencies), which 16
-# blocks spread over twice the pushes of 8.
-_UNIT = 16
+# plus a fixed tail (the s -> exp2 -> p @ v result latencies), which more
+# blocks spread over more pushes: 16 -> 32 was -6 to -9 % at c4k-c8k shapes,
+# +6 % at 1,024 tokens (op bench j-145c546e).
+_UNIT = 32
 # VMEM `_max_window` leaves beside the kernel's buffers for Mosaic's own: a
-# 2,048-token window of 16 heads (35.0 MiB of buffers) compiles within 36 MiB,
+# 2,048-token window of 16 heads (35.6 MiB of buffers) compiles within 36 MiB,
 # 8, 24, 32 and 48 heads at their windows within 48 MiB (deviceless tpu7x).
 _VMEM_MARGIN = 2 * 1024 * 1024
 # Blocks the width ordering places per loop step (a chain of dependent
