@@ -1274,9 +1274,11 @@ def _decode_plan_kernel(
     (`merge_candidates`' dense ranking), this rank's page keys ``[T, topk]``,
     each token's local page and limit ``[T, 1]`` (`msa.token_positions`) and
     the attention call's work list (`msa_attention_lse.store_work_list`).
-    The same values as the XLA path of `msa_attend_dcp`, which costs a dozen
-    small ops of fixed cost each; `msa_attention_lse.planned_attention` runs
-    it in its first grid step."""
+    The same values as the XLA path of `msa_attend_dcp` (whose work list may
+    run a step's groups in width order, `msa_attention_lse._width_order`;
+    here they stay in tile order), which costs a dozen small ops of fixed
+    cost each; `msa_attention_lse.planned_attention` runs it in its first
+    grid step."""
     dcp = 2
     rank = rank_ref[0]
     num_tokens = own_ref.shape[0]

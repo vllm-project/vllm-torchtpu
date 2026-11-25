@@ -1451,7 +1451,57 @@ def fits_work_row(block_q, topk, pages_per_step) -> bool:
     return block_q * topk == _LANES and groups_per_tile * pages_per_step == _LANES
 
 
-def _packed_work(selected, block_q, pages_per_step, align=1, most=None):
+def _width_order(meta, counts, live, tile, num_tiles, tiles_per_step, pages_per_step):
+    """Each call's groups (``meta``, ``counts`` ``[C, M]``, in tile order) in
+    the order a step's units should run them: within each grid step, tile
+    pairs ``(2k, 2k + 1)`` by the step width (`_STEP_WIDTHS`) of their wider
+    tile, narrowest first and tiles of no page last, each pair's tiles and a
+    tile's groups kept in order. A unit runs at its widest group's width, so
+    pairs of like widths waste fewer score columns; pairs stay whole for
+    `_kernel`'s paired stores. Compares and sums only: no gather, scatter or
+    sort (each a slow XLA op at this size); the one-hot move is ``[C, M, M]``
+    over a call's groups, M <= 1,024 in the <= 1,024-token calls that run
+    units."""
+    calls, num_groups = meta.shape
+    t_ids = jnp.arange(num_tiles, dtype=jnp.int32)
+    of_tile = tile[:, :, None] == t_ids[None, None, :]  # [C, M, T]
+    groups_t = jnp.sum(of_tile, axis=1, dtype=jnp.int32)  # [C, T]
+    pages_t = jnp.sum(jnp.where(of_tile, counts[:, :, None], 0), axis=1)
+    widths = jnp.asarray([n for n in _STEP_WIDTHS if n < pages_per_step], jnp.int32)
+    cls = jnp.sum(pages_t[..., None] > widths, axis=-1, dtype=jnp.int32)
+    cls = jnp.where(pages_t > pages_per_step, widths.shape[0] + 1, cls)
+    cls = jnp.where(pages_t == 0, -1, cls)  # a tile of no page: its partner's width
+    pairs = num_tiles // 2
+    p_ids = jnp.arange(pairs, dtype=jnp.int32)
+    key = jnp.maximum(cls[:, 0::2], cls[:, 1::2])
+    key = jnp.where(key < 0, widths.shape[0] + 2, key) * pairs + p_ids  # [C, P]
+    pair_groups = groups_t[:, 0::2] + groups_t[:, 1::2]
+    step = p_ids // (tiles_per_step // 2)
+    before = (step[:, None] == step[None, :]) & (key[:, None, :] < key[:, :, None])
+    pair_at = jnp.sum(jnp.where(before, pair_groups[:, None, :], 0), axis=2)
+    step_t = t_ids // tiles_per_step
+    step_at = jnp.sum(
+        jnp.where(
+            step_t[None, None, :] < step_t[None, :, None], groups_t[:, None, :], 0
+        ),
+        axis=2,
+    )  # [C, T]: groups of the steps before the tile's
+    partner = jnp.stack([jnp.zeros_like(groups_t[:, 0::2]), groups_t[:, 0::2]], -1)
+    tile_at = step_at + jnp.repeat(pair_at, 2, axis=1) + partner.reshape(calls, -1)
+    shift = tile_at - (jnp.cumsum(groups_t, axis=1) - groups_t)  # new - old first group
+    w_ids = jnp.arange(num_groups, dtype=jnp.int32)
+    pos = w_ids + jnp.sum(jnp.where(of_tile, shift[:, None, :], 0), axis=2)
+    pos = jnp.where(live, pos, w_ids)
+    moved = pos[:, :, None] == w_ids[None, None, :]  # [C, M (from), M (to)]
+    return tuple(
+        jnp.sum(jnp.where(moved, x[:, :, None], 0), axis=1, dtype=x.dtype)
+        for x in (meta, counts)
+    )
+
+
+def _packed_work(
+    selected, block_q, pages_per_step, align=1, most=None, width_order=False
+):
     """`msa_attention._work_list` of each call's ``selected [C, T, K]`` as
     one int32 row per call, ``[unions | meta words | counts | step
     starts]``, and the tiles each grid step takes: a call then takes one
@@ -1472,6 +1522,10 @@ def _packed_work(selected, block_q, pages_per_step, align=1, most=None):
     tile = jnp.where(live, msa_attention._meta_tile(meta, groups_per_tile), num_tiles)
     bounds = jnp.arange(0, num_tiles + 1, tiles_per_step, dtype=jnp.int32)
     starts = jnp.sum(tile[:, None, :] < bounds[None, :, None], axis=2, dtype=jnp.int32)
+    if width_order and tiles_per_step % 2 == 0:
+        meta, counts = _width_order(
+            meta, counts, live, tile, num_tiles, tiles_per_step, pages_per_step
+        )
     return jnp.concatenate([pages, meta, counts, starts], axis=1), tiles_per_step
 
 
@@ -1753,14 +1807,16 @@ def _chunk_work(
     selected = jnp.pad(
         selected, ((0, pad), (0, 0), (0, 0)), constant_values=-1
     ).transpose(1, 0, 2)
+    units = _decode_tiles_per_step(
+        block_q, fp4, num_q_heads // num_heads, num_heads == 1
+    )
     packed = _packed_work(
         selected.reshape(num_heads * num_chunks, step, topk),
         block_q,
         pages_per_step,
         align=_merged_store_rows(block_q, num_q_heads // num_heads, dtype, packed),
-        most=_decode_tiles_per_step(
-            block_q, fp4, num_q_heads // num_heads, num_heads == 1
-        )
+        width_order=units is not None,
+        most=units
         or (
             PREFILL_TILES_PER_STEP_4BIT
             if fp4

@@ -493,6 +493,77 @@ def test_decode_units_match_reference(
     _check(got, (np.concatenate(outs, axis=1), np.concatenate(lses, axis=1)))
 
 
+@pytest.mark.parametrize("num_tokens,most_tiles", [(96, 64), (256, 8), (48, 64)])
+def test_width_order_keeps_tiles_and_pairs_whole(num_tokens, most_tiles):
+    """`_packed_work`'s width order only permutes each grid step's groups:
+    unions and step starts unchanged, every tile's groups contiguous and in
+    order (first .. last), tile pairs (2k, 2k + 1) adjacent, and the pairs
+    of a step in non-decreasing width, tiles of no page last."""
+    rng = np.random.default_rng(num_tokens)
+    block_q, topk, pages_per_step = 8, 16, 32
+    num_tiles = num_tokens // block_q
+    selected = np.full((2, num_tokens, topk), -1, np.int32)
+    for c in range(2):
+        for t in range(num_tiles):
+            union = rng.choice([0, 1, 3, 9, 20, 31, 45, 70])
+            pool = t * 1000 + rng.permutation(500)[: max(union, 1)]
+            for i in range(block_q):
+                n = min(topk, union)
+                selected[c, t * block_q + i, :n] = rng.choice(pool, n, replace=False)
+    args = (jnp.asarray(selected), block_q, pages_per_step)
+    kw = dict(align=16, most=most_tiles)
+    plain, tiles_per_step = msa_attention_lse._packed_work(*args, **kw)
+    ordered, _ = msa_attention_lse._packed_work(*args, **kw, width_order=True)
+    plain, ordered = np.asarray(plain), np.asarray(ordered)
+    groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    num_groups = num_tiles * groups_per_tile
+    unions = num_groups * pages_per_step
+    meta, counts = (
+        slice(unions, unions + num_groups),
+        slice(unions + num_groups, unions + 2 * num_groups),
+    )
+    np.testing.assert_array_equal(ordered[:, :unions], plain[:, :unions])
+    np.testing.assert_array_equal(
+        ordered[:, unions + 2 * num_groups :], plain[:, unions + 2 * num_groups :]
+    )
+    widths = [n for n in msa_attention_lse._STEP_WIDTHS if n < pages_per_step]
+    for c in range(2):
+        starts = plain[c, unions + 2 * num_groups :]
+        for step in range(num_tiles // tiles_per_step):
+            lo, hi = starts[step], starts[step + 1]
+            group = slice(meta.start + lo, meta.start + hi)
+            n_group = slice(counts.start + lo, counts.start + hi)
+            old = sorted(zip(plain[c, group], plain[c, n_group]))
+            new = list(zip(ordered[c, group], ordered[c, n_group]))
+            assert sorted(new) == old
+            tiles = [int(msa_attention._meta_tile(m, groups_per_tile)) for m, _ in new]
+            runs = [tiles[0]] + [b for a, b in zip(tiles, tiles[1:]) if b != a]
+            assert len(runs) == len(set(runs)), "a tile's groups split"
+            assert all(
+                a % 2 == 0 and b == a + 1 for a, b in zip(runs[0::2], runs[1::2])
+            )
+            assert [m for m, _ in new] == sorted(
+                (m for m, _ in new),
+                key=lambda m: (
+                    runs.index(int(msa_attention._meta_tile(m, groups_per_tile))),
+                    m,
+                ),
+            )
+            pages = {t: 0 for t in runs}
+            for t, (_, n) in zip(tiles, new):
+                pages[t] += int(n)
+
+            def width(t, pages=pages):
+                p = pages[t]
+                return (
+                    -1 if p == 0 else sum(p > w for w in widths) + (p > pages_per_step)
+                )
+
+            keys = [max(width(a), width(b)) for a, b in zip(runs[0::2], runs[1::2])]
+            keys = [len(widths) + 2 if k < 0 else k for k in keys]
+            assert keys == sorted(keys)
+
+
 @pytest.mark.parametrize("pages_per_step", [16, 32])
 def test_decode_tiles_read_unwritten_slots_through_the_write(pages_per_step):
     """8-bit decode tiles feed pages to the MXU unmasked: a local page's
