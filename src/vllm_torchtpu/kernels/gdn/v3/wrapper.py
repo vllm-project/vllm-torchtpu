@@ -99,6 +99,13 @@ def _run_streamed_recurrent_gdn(ctx: _TileContext) -> None:
         if ctx.carry_recurrent_scratch_ref is not None
         else None
     )
+    # One-byte FP8 state read directly from HBM on 1-token decode updates in
+    # bfloat16.
+    fp8_from_hbm = (
+        cfg.state_format == config.RecurrentStateFormat.FP8
+        and ctx.carry_recurrent_scratch_ref is None
+        and cfg.chunk_size == 1
+    )
     state_stream = recurrent_state_lib.RecurrentStateStream(
         ctx.recurrent_in_slot_ref,
         ctx.recurrent_out_slot_ref,
@@ -113,6 +120,7 @@ def _run_streamed_recurrent_gdn(ctx: _TileContext) -> None:
         carry_ref=ctx.carry_recurrent_scratch_ref,
         seq_is_first_tile=seq_is_first_tile,
         flush_cond=flush_cond,
+        load_dtype=jnp.bfloat16 if fp8_from_hbm else jnp.float32,
     )
 
     out, _ = compute_gdn.recurrent_gdn(

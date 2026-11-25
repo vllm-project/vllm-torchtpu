@@ -3238,3 +3238,91 @@ class GDNAttentionTest(parameterized.TestCase):
             )
             self.assertLess(self._rel_l2(o_ref[1:], o_f8_fp8[1:]), 4e-2)
             self.assertLess(self._rel_l2(r_ref[2], r_f8_unpacked[2]), 8e-2)
+
+    def test_fp8_bf16_single_token_decode_update(self):
+        """Dedicated TPU test for direct-bfloat16 1-token FP8 decode update."""
+        rng = np.random.default_rng(103)
+        n_kq, n_v, d_k, d_v, kernel_size = 2, 10, 128, 128, 4
+        dim = 2 * n_kq * d_k + n_v * d_v
+        n_seq = 4
+        conv_w = jnp.asarray(rng.standard_normal((dim, 1, kernel_size)), jnp.float32)
+        conv_b = jnp.asarray(rng.standard_normal((dim,)), jnp.float32)
+        a_log = jnp.asarray(rng.uniform(-2.0, 0.5, (n_v,)), jnp.float32)
+        dt_bias = jnp.asarray(rng.uniform(-3.0, -1.0, (n_v,)), jnp.bfloat16)
+        conv_init = jnp.asarray(
+            rng.standard_normal((n_seq + 1, kernel_size - 1, dim)), jnp.float32
+        )
+        rec_init = jnp.asarray(
+            rng.standard_normal((n_seq + 1, n_v, d_k, d_v)), jnp.float32
+        )
+        rec_packed = recurrent_state_lib.pack_state(rec_init, "fp8")
+        # Poison slot 1 with 0xFFFFFFFF to exercise has_init=False masking on TPU.
+        rec_packed = rec_packed.at[1].set(jnp.uint32(0xFFFFFFFF))
+        rec_ref = (
+            recurrent_state_lib.unpack_state(rec_packed, "fp8", n_v=n_v, d_k=d_k)
+            .at[1]
+            .set(0.0)
+        )
+        conv_ref = conv_init
+        conv_fp8 = conv_init
+        qsl = jnp.arange(n_seq + 1, dtype=jnp.int32)
+        sidx = jnp.arange(1, n_seq + 1, dtype=jnp.int32)
+        dist = jnp.array([n_seq, n_seq, n_seq], dtype=jnp.int32)
+
+        # Run 4 consecutive 1-token decode steps (seq 0 starts fresh, seqs 1..3
+        # resume) and verify outputs and packed states against gdn_attention_ref.
+        for step in range(4):
+            qkv = jnp.asarray(rng.standard_normal((n_seq, dim)), jnp.bfloat16)
+            b = jnp.asarray(0.2 * rng.standard_normal((n_seq, n_v)), jnp.bfloat16)
+            a = jnp.asarray(0.2 * rng.standard_normal((n_seq, n_v)), jnp.bfloat16)
+            # Step 0 has seq_lens=1 for seq 0 (has_init=False), >1 thereafter.
+            slens = jnp.array([1 + step, 64 + step, 64 + step, 64 + step], jnp.int32)
+            (conv_ref, rec_ref), o_ref_flat = gdn_attention_ref(
+                qkv=qkv,
+                b=b,
+                a=a,
+                states=(conv_ref, rec_ref),
+                conv_weight=conv_w,
+                conv_bias=conv_b,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                query_start_loc=qsl,
+                state_indices=sidx,
+                distribution=dist,
+                seq_lens=slens,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+            )
+            (conv_fp8, rec_packed), o_fp8 = wrapper.fused_conv1d_gdn(
+                qkv=qkv,
+                b=b,
+                a=a,
+                states=(conv_fp8, rec_packed),
+                conv_weight=conv_w,
+                conv_bias=conv_b,
+                a_log=a_log,
+                dt_bias=dt_bias,
+                query_start_loc=qsl,
+                state_indices=sidx,
+                distribution=dist,
+                seq_lens=slens,
+                n_kq=n_kq,
+                n_v=n_v,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                batched_only=True,
+                recurrent_state_format="fp8",
+            )
+            rec_unpacked = recurrent_state_lib.unpack_state(
+                rec_packed, "fp8", n_v=n_v, d_k=d_k
+            )
+            self.assertTrue(bool(jnp.all(jnp.isfinite(o_fp8))))
+            self.assertTrue(bool(jnp.all(jnp.isfinite(rec_unpacked[1:]))))
+            self.assertLess(
+                self._rel_l2(o_ref_flat.reshape(n_seq, n_v, d_v), o_fp8), 6e-2
+            )
+            self.assertLess(self._rel_l2(rec_ref[1:], rec_unpacked[1:]), 1e-1)

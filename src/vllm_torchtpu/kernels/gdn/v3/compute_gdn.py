@@ -407,7 +407,7 @@ def _make_in_memory_state_io(
     ]
 
     def load_head(s: int, v: int) -> jax.Array:
-        return state_prev[s, v]
+        return state_prev[s, v].astype(cfg.dtypes.compute)
 
     def store_ckpt(s: int, v: int, w_idx: int, state_j: jax.Array) -> None:
         assert v == len(ckpts[s][w_idx]), (
@@ -512,42 +512,64 @@ def _run_single_token_recurrent(
     )
     seq_outs: list[jax.Array] = []
     for s in range(cfg.seq_tile_size):
-        k_t_per_kq = [
-            fused_transpose_broadcast(
-                step.k[s : s + 1, kq_idx : kq_idx + 1], src_dim=3, dst_dim=2
-            )[0, 0]
-            for kq_idx in range(cfg.num_kq_heads)
-        ]
+        k_t_per_kq: list[jax.Array] | None = None
         head_outs: list[jax.Array] = []
         for sub0 in range(0, cfg.num_v_heads, sub_block_heads):
             sub_blk = min(sub_block_heads, cfg.num_v_heads - sub0)
-            state_upd_list = [
-                load_head(s, sub0 + j) * step.gating[s, sub0 + j]
-                for j in range(sub_blk)
-            ]
+            states_sub = [load_head(s, sub0 + j) for j in range(sub_blk)]
+            bf16_state = states_sub[0].dtype == jnp.bfloat16
+            if k_t_per_kq is None:
+                k_t_per_kq = [
+                    fused_transpose_broadcast(
+                        step.k[s : s + 1, kq_idx : kq_idx + 1], src_dim=3, dst_dim=2
+                    )[0, 0]
+                    for kq_idx in range(cfg.num_kq_heads)
+                ]
+                if bf16_state:
+                    k_t_per_kq = [k_t.astype(jnp.bfloat16) for k_t in k_t_per_kq]
+            if bf16_state:
+                # Defer scalar decay past the MXU dot so the projection keeps
+                # float32 decay precision; state_upd rounds decay to bfloat16
+                # (decays above 1 - 2**-9 become 1).
+                mxu_rhs = jnp.stack(states_sub, axis=0)
+                state_upd_list = [
+                    st * step.gating[s, sub0 + j].astype(jnp.bfloat16)
+                    for j, st in enumerate(states_sub)
+                ]
+            else:
+                state_upd_list = [
+                    st * step.gating[s, sub0 + j] for j, st in enumerate(states_sub)
+                ]
+                mxu_rhs = jnp.stack(state_upd_list, axis=0)
             kq_sub = jnp.stack(
                 [kq[s, (sub0 + j) // cfg.v_per_kq_head] for j in range(sub_blk)],
                 axis=0,
             )
+            if bf16_state:
+                kq_sub = kq_sub.astype(jnp.bfloat16)
             kq_proj = jax.lax.dot_general(
                 kq_sub,
-                jnp.stack(state_upd_list, axis=0),
+                mxu_rhs,
                 dimension_numbers=dot_dims,
                 preferred_element_type=jnp.float32,
-            ).astype(cfg.dtypes.compute)
+            )
 
             for j in range(sub_blk):
                 v = sub0 + j
                 kq_idx = v // cfg.v_per_kq_head
-                v_updated_j = kq_proj[j, :1, :]
-                out_decayed_j = kq_proj[j, 1:, :]
+                proj_j = (
+                    kq_proj[j] * step.gating[s, v] if bf16_state else kq_proj[j]
+                ).astype(cfg.dtypes.compute)
+                v_updated_j = proj_j[:1, :]
+                out_decayed_j = proj_j[1:, :]
                 v_new_j = step.beta[s, v] * (step.v[s, v] - v_updated_j)
                 out_j = (
                     out_decayed_j.astype(jnp.float32)
                     + qk_dot[s, kq_idx] * v_new_j.astype(jnp.float32)
                 ).astype(cfg.dtypes.compute)
                 head_outs.append(out_j)
-                state_j = state_upd_list[j] + k_t_per_kq[kq_idx] * v_new_j
+                v_for_upd = v_new_j.astype(jnp.bfloat16) if bf16_state else v_new_j
+                state_j = state_upd_list[j] + k_t_per_kq[kq_idx] * v_for_upd
                 store_ckpt(s, v, 0, state_j)
 
         seq_outs.append(jnp.concatenate(head_outs, axis=0)[jnp.newaxis])
@@ -699,7 +721,9 @@ def recurrent_gdn(
         dt_bias: Per-head decay bias parameter.
         cfg: GDN kernel configuration.
         load_head_fn: Per-head loader `(s, v) -> [kq_dim, v_dim]` when
-            `state_prev` is `None`.
+            `state_prev` is `None`. On single-token decode (`chunk_size == 1`),
+            returning `bfloat16` keeps the MXU projection and state update in
+            `bfloat16`.
         store_ckpt_head_fn: Per-head checkpoint writer `(s, v, w_idx, state)`
             when `state_prev` is `None`.
         sub_block_heads: Number of value heads kept live in registers at once
@@ -718,6 +742,7 @@ def recurrent_gdn(
             "recurrent_gdn requires 1 <= cfg.window_size <= cfg.chunk_size; "
             f"got window_size={cfg.window_size}, chunk_size={cfg.chunk_size}."
         )
+
     if state_prev is not None:
         if load_head_fn is not None or store_ckpt_head_fn is not None:
             raise ValueError(
