@@ -85,6 +85,28 @@ def decode_expert_weight(parts: dict[str, torch.Tensor], name: str) -> torch.Ten
     return result
 
 
+@pytest.mark.parametrize(
+    "arch", ["MuseSparkForCausalLM", "MuseSparkForConditionalGeneration"]
+)
+def test_architectures_register_the_text_model(arch):
+    """The released checkpoints declare MuseSparkForConditionalGeneration;
+    both names load the TPU text model instead of upstream's classes."""
+    from vllm.model_executor.models import ModelRegistry
+
+    from vllm_torchtpu.models.vllm import register_models
+    from vllm_torchtpu.models.vllm.muse_spark.model import MuseSparkForCausalLM
+
+    previous = ModelRegistry.models.get(arch)
+    try:
+        register_models()
+        assert ModelRegistry.models[arch].load_model_cls() is MuseSparkForCausalLM
+    finally:
+        if previous is None:
+            ModelRegistry.models.pop(arch, None)
+        else:
+            ModelRegistry.models[arch] = previous
+
+
 def test_packed_expert_execution_matches_bf16_decoder_with_repeated_routes():
     from vllm_torchtpu.models.vllm.muse_spark.weights import (
         selected_packed_expert_outputs,
