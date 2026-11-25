@@ -7240,6 +7240,8 @@ class TPUModelRunner(GPUModelRunner):
                 # request would otherwise compile new graphs. Warm those
                 # through the real two-phase spec-decode path.
                 self._warmup_spec_decode()
+                if isinstance(self._async_drafter, DFlashProposer):
+                    self._async_drafter.mark_compiled_graphs_warmed()
 
     def _check_draft_buckets(self) -> None:
         """Refuses to start a producer whose draft lacks a target bucket.

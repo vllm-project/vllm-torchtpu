@@ -164,6 +164,8 @@ class DFlashProposer:
         )
 
         self._max_model_len = vllm_config.model_config.max_model_len
+        # Set by the runner once every draft bucket is compiled.
+        self.compiled_graphs_warmed = False
         self.draft_model = None
         self._draft_has_moe_cache: bool | None = None
         self._draft_attn_layer_names: set[str] | None = None
@@ -184,6 +186,29 @@ class DFlashProposer:
     def block_size(self) -> int:
         """Tokens per request in a draft forward (see _query_block_size)."""
         return self._query_block_size(self.speculative_config.num_speculative_tokens)
+
+    def mark_compiled_graphs_warmed(self) -> None:
+        """Called once every draft bucket is compiled (see `_warmed_guards`)."""
+        self.compiled_graphs_warmed = True
+
+    def _warmed_guards(self) -> contextlib.AbstractContextManager:
+        """Around a draft graph call: once `compiled_graphs_warmed` is set,
+        check only the guards that tell its warmed graphs apart.
+
+        `_dflash_forward_and_sample` and `_tpu_precompute_and_update_kv_cache`
+        each guard the whole draft model (~2,800 and ~1,100 guards per graph),
+        a few hundred microseconds of host time per decode step. Their graphs
+        differ only in the input token count, warmed for every bucket by
+        `TPUModelRunner.capture_model`; the draft model's modules do not change
+        after it (`torch.compiler.set_stance(skip_guard_eval_unsafe=True)`).
+        An input that fails the guards separating the graphs raises instead of
+        compiling. Guards shared by every warmed graph are skipped, so state
+        traced into these graphs (e.g. `DSparkProposer.use_confidence_head`)
+        must not change after `mark_compiled_graphs_warmed`.
+        """
+        if not self.compiled_graphs_warmed:
+            return contextlib.nullcontext()
+        return torch.compiler.set_stance(skip_guard_eval_unsafe=True)
 
     def _get_static_attn_tensors(
         self, padded_num_reqs: int
@@ -651,8 +676,11 @@ class DFlashProposer:
         positions = positions[:num_tokens]
         draft_md_tuple = self._build_draft_layer_metadata(chunk.attn_metadata)
 
-        with set_vllm_model_wrapper_context(
-            mesh=self.runner.mesh, vllm_config=self.vllm_config
+        with (
+            set_vllm_model_wrapper_context(
+                mesh=self.runner.mesh, vllm_config=self.vllm_config
+            ),
+            self._warmed_guards(),
         ):
             self._tpu_precompute_and_update_kv_cache(
                 target_hidden, positions, draft_md_tuple
@@ -765,6 +793,7 @@ class DFlashProposer:
                     mesh=self.runner.mesh, vllm_config=self.vllm_config
                 ),
                 _without_layerwise_kv_connector(),
+                self._warmed_guards(),
             ):
                 draft_tokens_chunk, draft_aux = self._dflash_forward_and_sample(
                     input_ids, positions, block_size

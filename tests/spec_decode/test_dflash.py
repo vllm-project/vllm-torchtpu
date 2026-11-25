@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import inspect
 from types import SimpleNamespace
 from unittest import mock
@@ -1045,3 +1046,23 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
     assert programs() == before, (
         f"{builder} builder compiled a program per request count"
     )
+
+
+def test_draft_graph_calls_check_only_differentiating_guards_once_warmed(
+    monkeypatch,
+):
+    proposer = _make_proposer(draft_tp=1)
+    stances = []
+
+    def _set_stance(**kwargs):
+        stances.append(kwargs)
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(torch.compiler, "set_stance", _set_stance)
+    with proposer._warmed_guards():
+        pass
+    assert stances == []
+    proposer.mark_compiled_graphs_warmed()
+    with proposer._warmed_guards():
+        pass
+    assert stances == [{"skip_guard_eval_unsafe": True}]
