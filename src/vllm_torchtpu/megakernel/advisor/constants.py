@@ -231,6 +231,8 @@ AR_BYTE_MATCH_MIN_RATIO: float = 0.5
 AR_BYTE_MATCH_MAX_RATIO: float = 2.0
 # Recurrent step reads and writes state once each (2x resident bytes).
 RECURRENT_STATE_RW_PASSES: float = 2.0
+# XLA per-op collectives stage one HBM read and one HBM write around ICI transfer.
+XLA_COLLECTIVE_HBM_STAGING_PASSES: float = 2.0
 DEFAULT_USABLE_VMEM_MIB = CORE_LIMITS.vmem_mib
 # Minimum 256 KiB DMA slot floor and 1/4-layer weight slice for pipeline fill/drain.
 MIN_FIRST_DMA_SLOT_BYTES = 1 << 18
@@ -259,6 +261,7 @@ SWIGLU_ACT_VEC_OPS_PER_ELEM = 4.0
 SUB_BYTE_UNPACK_VEC_OPS_PER_ELEM = 2.0
 SUB_BYTE_EXPERT_DTYPES: frozenset[str] = frozenset({"nvfp4", "mxfp4", "fp4", "int4"})
 CORES_PER_HOST = 8
+DEFAULT_LAUNCH_GAP_FLOOR_US = 1.0
 DEFAULT_LAUNCH_GAP_VAL_US = 2.0
 DEFAULT_LAUNCH_GAP_UPPER_US = 8.0
 COMPILED_XLA_GAP_P50_US = 1.0
@@ -268,6 +271,7 @@ PER_OP_COLLECTIVE_CALL_FACTOR = 2
 BOUNDARY_SYNC_HOP_FACTOR = 2.0
 SUBLAYER_BOUNDARIES_PER_LAYER = 2
 DCP_COLLECTIVES_PER_ATTN_LAYER = 2
+QUANTILE_DECIMALS = 4
 COLLECTIVE_PATH_IN_KERNEL = "in_kernel"
 COLLECTIVE_OP_ALL_REDUCE = "all-reduce"
 # 128-byte HBM burst/cacheline alignment for scattered sparse-KV row gathers.
@@ -293,3 +297,10 @@ DCP_LSE_MERGE_VEC_OPS: float = 6.0
 PER_OP_INDEXER_SCORE_ROUNDTRIP_BYTES: float = 2.0 * FP32_BYTES
 PER_OP_DSA_KV_ROUNDTRIP_FACTOR: float = 2.0
 FUSED_ELIGIBLE_PHASES: tuple[str, ...] = ("decode", "verify")
+EQUAL_SPLIT_GROUP_COUNTS: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
+LAYER_GROUP_PRICING_NOTE: str = (
+    "Numbers price one fused kernel per group; a runtime whose groups are "
+    "compiled calls of per-op kernels runs at per_op. In this analytical "
+    "model, layer_group cost depends on group count rather than individual "
+    "group sizes."
+)

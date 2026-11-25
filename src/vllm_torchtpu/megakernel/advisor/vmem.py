@@ -596,6 +596,15 @@ def _mesh_issue_pairs(
     return pairs
 
 
+def _mesh_divisibility_reasons(
+    profile: ModelProfile,
+    workload: WorkloadSpec,
+    chip_spec: ChipSpec | None = None,
+) -> list[str]:
+    """Return non-raising sharding divisibility and topology violation codes."""
+    return [tag for tag, _ in _mesh_issue_pairs(profile, workload, chip_spec)]
+
+
 def collect_validation_reasons(
     profile: ModelProfile,
     workload: WorkloadSpec,
