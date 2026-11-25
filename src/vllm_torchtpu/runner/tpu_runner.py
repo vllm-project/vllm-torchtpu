@@ -1169,7 +1169,6 @@ class TPUModelRunner(GPUModelRunner):
         self._repetition_penalty = repetition_penalty_tracker.RepetitionPenaltyTracker(
             self.vocab_size,
             self.max_num_reqs,
-            async_scheduling=bool(self.scheduler_config.async_scheduling),
             speculative_decoding=self.speculative_config is not None,
         )
         # 1 on TP rank 0, else 0; built lazily on first use by
@@ -3017,7 +3016,7 @@ class TPUModelRunner(GPUModelRunner):
         # below. None/absent -> 0 drafts (non-spec or a non-spec mixed chunk).
         pre_num_draft_per_req = self._pre_async_results.num_draft_per_req
 
-        # Wait even when there is nothing to roll back: both callers drop these
+        # Wait even when there is nothing to roll back: the callers drop these
         # results afterwards, and on non-output TP ranks they can be the only
         # owner of the in-flight D2H copy (#985).
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
@@ -5749,6 +5748,20 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 request_seq_lens.append((i, req_state, seq_len, req_id))
 
+        if (
+            rep_pen
+            and self._pre_async_results is not None
+            and not self.input_batch.repetition_penalties_reqs.isdisjoint(
+                self._pre_async_results.req_id_to_index_copy
+            )
+        ):
+            # Async scheduling: the last output id of a penalized request that
+            # the previous step sampled is still a placeholder. Put that step's
+            # tokens in before the seen-token bitmasks read the outputs. This
+            # waits for the previous step's D2H copy before any of this step's
+            # sampling is enqueued.
+            self._modify_prev_results()
+            self._pre_async_results = None
         tb_step = None
         if not self.is_pooling_model and state.logits_list and self._thinking_budget:
             if self._pre_async_results is not None:
