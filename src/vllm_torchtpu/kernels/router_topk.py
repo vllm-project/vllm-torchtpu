@@ -33,6 +33,8 @@ NEG = -3.0e38
 # Rows per grid step, measured fastest at 512 experts. The grid rounds up, so
 # this does not have to divide the row count.
 MAX_BLOCK_ROWS = 512
+# Blocks of whole lane tiles of rows run transposed (`_select_kernel_t`).
+_LANES = 128
 
 
 def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
@@ -63,6 +65,24 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_ref[...])
 
 
+def _select_kernel_t(x_ref, w_ref, i_ref, *, topk: int, n: int):
+    """`_select_kernel` on the block transposed, rows along lanes: each pass's
+    max and min reduce across vregs instead of across lanes, and the
+    ``[topk, rows]`` outputs store whole lane rows (tpu7x, 8192 x 128 experts,
+    k=4: 2418 -> 929 bundles per 512-row block, deviceless AOT)."""
+    x = x_ref[...].T
+    x = jnp.where(x > NEG, x, NEG)
+    masked = jnp.finfo(x.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+    for j in range(topk):
+        m = jnp.max(x, axis=0, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=0, keepdims=True)
+        w_ref[j : j + 1, :] = m
+        i_ref[j : j + 1, :] = idx
+        x = jnp.where(iota == idx, masked, x)
+    w_ref[...] = jnp.where(w_ref[:1, :] <= NEG, jnp.nan, w_ref[...])
+
+
 def select(
     scores: jax.Array, topk: int, interpret: bool = False
 ) -> tuple[jax.Array, jax.Array]:
@@ -79,6 +99,22 @@ def select(
     """
     rows, n = scores.shape
     block = min(MAX_BLOCK_ROWS, rows)
+    if block % _LANES == 0 and n % _LANES == 0:
+        w, i = pl.pallas_call(
+            functools.partial(_select_kernel_t, topk=topk, n=n),
+            grid=(pl.cdiv(rows, block),),
+            in_specs=[pl.BlockSpec((block, n), lambda b: (b, 0))],
+            out_specs=[
+                pl.BlockSpec((topk, block), lambda b: (0, b)),
+                pl.BlockSpec((topk, block), lambda b: (0, b)),
+            ],
+            out_shape=[
+                jax.ShapeDtypeStruct((topk, rows), jnp.float32),
+                jax.ShapeDtypeStruct((topk, rows), jnp.int32),
+            ],
+            interpret=interpret,
+        )(scores)
+        return w.T, i.T
     return pl.pallas_call(
         functools.partial(_select_kernel, topk=topk, n=n),
         grid=(pl.cdiv(rows, block),),
