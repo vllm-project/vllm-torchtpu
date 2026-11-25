@@ -57,6 +57,40 @@ def attention_block_table_width(
     )
 
 
+@dataclass(frozen=True)
+class HostScheduleSnapshot:
+    """Immutable host-side scheduling tuples for graph-break-free planning.
+
+    Carried on `AttentionMetadata.host_schedule` and excluded from JAX pytree
+    leaves via `drop_fields`, so host consumers must read it before crossing a
+    JAX pytree flatten/unflatten boundary.
+    """
+
+    # Cumulative query token offsets in the flattened batch; length
+    # `target_num_reqs + 1`, with padding slots repeating the last end offset.
+    query_start_loc: tuple[int, ...]
+    # Total sequence lengths after this step (`num_computed + scheduled`);
+    # length `target_num_reqs`, zero-padded for inactive slots.
+    seq_lens: tuple[int, ...]
+    # Original prompt lengths (excluding generated tokens); length
+    # `target_num_reqs`, zero-padded for inactive slots.
+    prompt_lens: tuple[int, ...]
+    # 0-based token positions where SWA bounded replay starts (0 when inactive);
+    # length `target_num_reqs`, zero-padded for inactive slots.
+    replay_starts: tuple[int, ...]
+
+    @classmethod
+    def zeros(cls, num_reqs: int) -> HostScheduleSnapshot:
+        """Return an all-zero snapshot representing 0 active requests."""
+        zeros = (0,) * num_reqs
+        return cls(
+            query_start_loc=(0,) * (num_reqs + 1),
+            seq_lens=zeros,
+            prompt_lens=zeros,
+            replay_starts=zeros,
+        )
+
+
 @functools.partial(
     jax.tree_util.register_dataclass,
     data_fields=[
@@ -78,7 +112,7 @@ def attention_block_table_width(
         "sequence_layout_protocol",
         "sequence_layout_version",
     ],
-    drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
+    drop_fields=["query_start_loc_cpu", "seq_lens_cpu", "host_schedule"],
 )
 @dataclass
 class AttentionMetadata:
@@ -132,6 +166,10 @@ class AttentionMetadata:
     mamba_prefill_ckpt_indices: jax.Array | torch.Tensor | None = None
     # PCP manager only (see `runner/pcp/manager.py`); None elsewhere.
     pcp_metadata: PcpMetadata | None = None
+    # Host-side scheduling snapshot on SequenceLayoutKind.ALL steps and idle
+    # dp_lockstep dummy runs (all-zero); None on non-ALL or warmup/profiling
+    # steps and dropped across JAX pytree flatten/unflatten.
+    host_schedule: HostScheduleSnapshot | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -159,6 +197,7 @@ class AttentionMetadataBuilderContext:
     query_start_loc: torch.Tensor
     request_distribution: torch.Tensor
     position_ids_override: torch.Tensor | None = None
+    host_schedule: HostScheduleSnapshot | None = None
     # Compact-mamba per-request recurrent-slot ids (device int32, length =
     # target_num_reqs). Only the mamba group's builder reads it; None when the
     # model has no mamba layers. See AttentionMetadata.mamba_state_indices.
@@ -677,6 +716,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
             pcp_metadata=pcp_metadata,
+            host_schedule=ctx.host_schedule,
             mamba_prefill_ckpt_offsets=mamba_prefill_ckpt_offsets,
             mamba_prefill_ckpt_indices=mamba_prefill_ckpt_indices,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
