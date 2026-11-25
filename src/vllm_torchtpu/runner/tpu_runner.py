@@ -10919,15 +10919,21 @@ class TPUModelRunner(GPUModelRunner):
         path exercises), so without this the first real crossing would
         compile XLA mid-serving while lockstep peers wait at their next
         collective. All-zero indices write the null slot, moving no state.
-        Crossings accumulate across every mamba group in a step, so the
-        ladder tops out at num_groups * max_num_reqs; src and dst must be
-        DISTINCT tensors or dynamo specializes the migrate graph on
-        src-is-dst and the real two-tensor call retraces mid-serving.
+        Crossings accumulate across every mamba group in a step, and the
+        prefix-hit CoW pairs `_apply_kv_cache_block_copies` migrates are at
+        most one per (request, kv-cache group) per step, so the ladder tops
+        out at num_groups * max_num_reqs; src and dst must be DISTINCT
+        tensors or dynamo specializes the migrate graph on src-is-dst and
+        the real two-tensor call retraces mid-serving.
+
+        Both callers run under execute_model's no_grad, and dynamo guards on
+        grad mode: warmed outside it, every entry missed and each bucket
+        recompiled on its first served use (~50 ms, all ranks in lockstep).
         """
         offsets = self.mamba_slot_read_offsets
         if offsets is None:
             return
-        with self._precompile_timed("mamba rollback helpers"):
+        with self._precompile_timed("mamba rollback helpers"), torch.no_grad():
             num_groups = max(
                 1,
                 len(self._mamba_copy_plan),
