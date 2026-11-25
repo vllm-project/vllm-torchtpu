@@ -256,6 +256,30 @@ def test_local_tensor_ranges_all_local_is_one_range(tmp_path):
     assert _local_tensor_ranges(shard, {0, 5, 6, 7}) == [(base, end)]
 
 
+def test_local_tensor_ranges_skip_the_loading_models_unused_tensors(tmp_path):
+    # The prefetch reads what the lazy iterator reads: neither the other
+    # ranks' experts nor the tensors the loading model (e.g. a draft) marks
+    # unused.
+    shard = _save_shard(tmp_path)
+    base, header = _header(shard)
+
+    def is_unused(name):
+        return "self_attn" in name
+
+    ranges = _local_tensor_ranges(shard, {0}, is_unused)
+
+    covered = set()
+    for lo, hi in ranges:
+        covered.update(range(lo, hi))
+    for name, info in header.items():
+        start, end = (base + o for o in info["data_offsets"])
+        span = set(range(start, end))
+        if is_unused(name) or _should_skip_weight_tpu(name, {0}):
+            assert not span & covered, name
+        else:
+            assert span <= covered, name
+
+
 def test_range_prefetch_reads_only_local_ranges(tmp_path, monkeypatch):
     import os
 
@@ -278,9 +302,10 @@ def test_range_prefetch_reads_only_local_ranges(tmp_path, monkeypatch):
         return real_pread(fd, n, off)
 
     monkeypatch.setattr(model_loader_patches.threading, "Thread", _RecordedThread)
+    monkeypatch.setattr(model_loader_patches, "_prefetches", [])
     monkeypatch.setattr(model_loader_patches.os, "pread", tracking_pread)
 
-    _start_ep_range_prefetch([shard], {0}, num_threads=2, block_size=16)
+    _start_ep_range_prefetch([shard], {0}, None, num_threads=2, block_size=16)
     for thread in started:
         thread.join(timeout=30)
 
@@ -321,7 +346,9 @@ def test_prefetch_strategy_under_filter_switches_to_lazy(tmp_path, monkeypatch):
     monkeypatch.setattr(
         model_loader_patches,
         "_start_ep_range_prefetch",
-        lambda files, ids, threads, block: prefetches.append((files, ids)),
+        lambda files, ids, is_unused, threads, block: prefetches.append(
+            (files, ids, is_unused)
+        ),
     )
     patch_default_loader_ep_weight_filter()
     iterator = weight_utils.safetensors_weights_iterator
@@ -330,7 +357,11 @@ def test_prefetch_strategy_under_filter_switches_to_lazy(tmp_path, monkeypatch):
         name for name, _ in iterator([shard], False, "prefetch", local_expert_ids={0})
     }
     assert strategies == ["lazy"]
-    assert prefetches == [([shard], {0})]
+    ((files, ids, prefetch_is_unused),) = prefetches
+    assert (files, ids) == ([shard], {0})
+    # No unused-tensor test on this branch: the iterator skips only the other
+    # ranks' experts, and so does the prefetch.
+    assert prefetch_is_unused is None
     assert f"{_E}.0.w1.scale" in names
     assert f"{_E}.7.w1.scale" not in names
 
