@@ -250,3 +250,68 @@ def test_folded_write_matches_write_then_candidates(
     np.testing.assert_array_equal(
         np.asarray(got[-1])[:num_real], np.asarray(want[-1])[:num_real]
     )
+
+
+_THREE_GROUPS = 2 * 128 * 128 * 4 + 9_000  # 3 page groups of 128 on a DCP 4 rank
+
+
+@pytest.mark.parametrize(
+    "cache_kind,rank,dcp,q_lens,ctx_lens,max_seqs,pad",
+    [
+        ("int4", 3, 4, [8, 5, 8], [_THREE_GROUPS, 9_000, 300], 4, 3),
+        ("int4", 0, 4, [8, 5, 8], [_THREE_GROUPS, 9_000, 300], 4, 3),
+        (jnp.float8_e4m3fn, 1, 4, [8, 5, 8], [_THREE_GROUPS, 9_000, 300], 4, 3),
+        ("int4", 1, 2, [8, 5, 8], [_THREE_GROUPS // 2, 9_000, 300], 4, 3),
+        # 256 rows: picked in 256-row blocks.
+        ("int4", 2, 4, [8] * 16, [3_000 + 4_000 * i for i in range(16)], 16, 0),
+    ],
+)
+def test_two_heads_match_partial_block_scores_then_candidates(
+    cache_kind, rank, dcp, q_lens, ctx_lens, max_seqs, pad, monkeypatch
+):
+    """Two KV heads per rank (c64: DCP 4): their rows fold into one kernel,
+    against `msa.partial_block_scores` + `local_candidates`."""
+    from tests.models.minimax_m3.test_msa_dcp_classes import _caches
+
+    heads, pages_per_seq = 2, 300
+    rng = np.random.default_rng(10 * dcp + rank)
+    num_seqs = len(q_lens)
+    num_real = sum(q_lens)
+    num_tokens = num_real + pad
+    num_pages = max_seqs * pages_per_seq + 8
+    seq_lens = np.zeros(max_seqs, np.int32)
+    seq_lens[:num_seqs] = np.array(ctx_lens) + np.array(q_lens)
+    cu_q = np.full(max_seqs + 1, num_real, np.int32)
+    cu_q[: num_seqs + 1] = np.concatenate([[0], np.cumsum(q_lens)])
+    tables = rng.permutation(np.arange(1, num_pages))[: max_seqs * pages_per_seq]
+    meta = [
+        jnp.asarray(a.astype(np.int32))
+        for a in (seq_lens, tables, cu_q, np.array([num_seqs, 0, num_seqs]))
+    ]
+    kv, index, scales = _caches(cache_kind, num_pages, rng, heads)
+    k, v, index_q = (
+        jnp.asarray(rng.standard_normal((num_tokens, heads, HEAD_DIM)), jnp.bfloat16)
+        for _ in range(3)
+    )
+    index_k = jnp.asarray(rng.standard_normal((num_tokens, HEAD_DIM)), jnp.bfloat16)
+    assert not msa_indexer.is_prefill_step(num_tokens * heads, max_seqs)
+    assert msa_dcp.decodes_in_one_kernel(
+        num_tokens * heads, index, max_seqs, pages_per_seq, heads
+    )
+
+    def run():
+        return msa_dcp.msa_write_and_candidates_dcp(
+            k, v, index_q, index_k, kv, index, *meta, topk=TOPK, init_blocks=0,
+            local_blocks=1, rank=rank, dcp=dcp, scale_cache=scales, interpret=True,
+        )  # fmt: skip
+
+    got = run()
+    monkeypatch.setattr(msa_dcp, "decodes_in_one_kernel", lambda *_: False)
+    want = run()
+
+    assert len(got) == len(want)
+    for g, w in zip(got[:-1], want[:-1]):  # the caches
+        np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+    np.testing.assert_array_equal(
+        np.asarray(got[-1])[:num_real], np.asarray(want[-1])[:num_real]
+    )

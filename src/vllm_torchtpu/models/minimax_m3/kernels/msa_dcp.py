@@ -824,8 +824,9 @@ def _decode_candidates_kernel(
     def _():
         if write is not None:
             runs(settle)
-        for b in range(out_ref.shape[0] // _TRANSPOSED_ROWS):
-            r = pl.ds(b * _TRANSPOSED_ROWS, _TRANSPOSED_ROWS)
+        width = key_ref.shape[1]
+        for b in range(out_ref.shape[0] // width):
+            r = pl.ds(b * width, width)
             score, block = _pick_t(
                 rank_ref[0],
                 scores_ref.at[r],
@@ -845,11 +846,16 @@ def _decode_candidates_kernel(
 
 
 def decodes_in_one_kernel(
-    num_tokens: int, index_cache: jax.Array, max_num_seqs: int, pages_per_seq: int
+    num_tokens: int,
+    index_cache: jax.Array,
+    max_num_seqs: int,
+    pages_per_seq: int,
+    index_heads: int = 1,
 ) -> bool:
-    """Whether `decode_candidates` takes a step of `num_tokens` over this index
-    cache: a step no larger than every request's verify rows
-    (`msa._DECODE_ROWS` each) or than the indexer's small tiles, whose block
+    """Whether `decode_candidates` takes a step of `num_tokens` query rows
+    (tokens times `index_heads`) over this index cache: a step no larger than
+    every request's verify rows (`msa._DECODE_ROWS` per head) or than the
+    indexer's small tiles, whose block
     scores fit `_DECODE_SCORES_VMEM_BYTES`, and pages of v3 (fp8 or bf16,
     4-bit with their scales folded in).
 
@@ -860,9 +866,13 @@ def decodes_in_one_kernel(
     layer at c48's 192-row steps, j-17330f6e, cost more than the kernel
     saved when it routed such requests, twin j-90ea0b66)."""
     _, rows_per_page, _, _ = index_cache.shape
-    rows = max(msa.block_score_options()["block_q"], max_num_seqs * msa._DECODE_ROWS)
-    # `decode_candidates`' score scratch: whole row blocks of its page groups.
-    score_rows = -(-num_tokens // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS + _LANES
+    rows = max(
+        msa.block_score_options()["block_q"],
+        max_num_seqs * msa._DECODE_ROWS * index_heads,
+    )
+    # `decode_candidates`' score scratch (whole row blocks of its page groups)
+    # and key scratch (up to `_INSERT_ROWS` columns).
+    score_rows = -(-num_tokens // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS + _INSERT_ROWS
     score_cols = -(-pages_per_seq // _LANES) * _LANES + 2 * _LANES
     return (
         num_tokens <= rows and 4 * score_rows * score_cols <= _DECODE_SCORES_VMEM_BYTES
@@ -890,29 +900,42 @@ def decode_candidates(
     write: DecodeWrite | None = None,
     interpret: bool = False,
 ) -> jax.Array | tuple[list[jax.Array], jax.Array]:
-    """`pack_candidates` of `local_candidates` over `msa._block_scores` for a
-    decode-sized step (`msa_indexer.is_prefill_step` false) in one kernel
-    (`_decode_candidates_kernel`): ``[T, 2 * topk]``, the same values. With
-    `write` it first writes the step's rows as `msa.write_caches` would (the
-    index target is `index_cache`) and returns ``(caches, candidates)``.
+    """`pack_candidates` of `local_candidates` over `msa._block_scores` (one
+    index head) or `msa.partial_block_scores` (``G > 1``) for a decode-sized
+    step (`msa_indexer.is_prefill_step` false) in one kernel
+    (`_decode_candidates_kernel`): ``[T, G * 2 * topk]``, head-major per
+    token, the same values. With `write` (one head) it first writes the
+    step's rows as `msa.write_caches` would (the index target is
+    `index_cache`) and returns ``(caches, candidates)``.
 
-    ``index_q [T, 1, D]`` (rotated for a 4-bit cache), ``local_lens`` this
-    rank's lengths (`local_seq_lens`), ``seq_id`` and ``pos [T]`` the tokens'
+    ``index_q [T, G, D]`` (rotated for a 4-bit cache): the heads fold into
+    each request's query rows in (token, head) order, as
+    `msa.partial_block_scores` scores them. ``local_lens`` this rank's
+    lengths (`local_seq_lens`), ``seq_id`` and ``pos [T]`` the tokens'
     requests and positions (`msa.token_positions`)."""
-    num_tokens, _, head_dim = index_q.shape
+    num_tokens, heads, head_dim = index_q.shape
     _, rows_per_page, _, _ = index_cache.shape
+    if heads > 1:
+        if write is not None:
+            raise NotImplementedError("a folded write takes one index head")
+        index_q = index_q.reshape(num_tokens * heads, 1, head_dim)
+        cu_q_lens = heads * cu_q_lens
+        pos = jnp.repeat(pos, heads)
+    out_tokens, num_tokens = num_tokens, num_tokens * heads
     if not decodes_in_one_kernel(
         num_tokens,
         index_cache,
         local_lens.shape[0],
         block_tables.shape[0] // local_lens.shape[0],
+        heads,
     ):
         raise NotImplementedError(
-            f"no one-kernel decode of {num_tokens} tokens over {index_cache.shape}"
+            f"no one-kernel decode of {num_tokens} rows over {index_cache.shape}"
         )
     max_num_seqs = local_lens.shape[0]
     options = msa.block_score_options(
-        1, msa._wide_decode_scores(index_q, index_cache, local_lens, block_tables, 1)
+        heads,
+        msa._wide_decode_scores(index_q, index_cache, local_lens, block_tables, heads),
     )
     pages_per_step = options["small_pages_per_step"]
     transposed = msa_indexer._scores_transposed(1, rows_per_page, index_cache.dtype)
@@ -936,6 +959,9 @@ def decode_candidates(
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     num_cols = -(-pages_per_seq // pages_per_step) * pages_per_step
     rows = -(-num_tokens // _TRANSPOSED_ROWS) * _TRANSPOSED_ROWS
+    # Steps of a multiple of `_INSERT_ROWS` rows pick in blocks of that many,
+    # two 128-row blocks' insertions in flight (`_INSERT_ROWS`).
+    pick_rows = _INSERT_ROWS if rows % _INSERT_ROWS == 0 else _TRANSPOSED_ROWS
     # The last tile starts at most at the last token's aligned row and runs
     # block_q rows; the picks read the first `rows`.
     score_rows = max(rows, -(-num_tokens // 8) * 8 + block_q)
@@ -977,11 +1003,11 @@ def decode_candidates(
         ),
         pltpu.SemaphoreType.DMA((msa_indexer._RING_SLOTS,)),
         pltpu.VMEM((score_rows, num_cols), jnp.float32),
-        pltpu.VMEM((num_cols, _TRANSPOSED_ROWS), jnp.float32),
+        pltpu.VMEM((num_cols, pick_rows), jnp.float32),
     ]
     vmem_bytes = 4 * (
         msa_indexer._RING_SLOTS * pages_per_step * rows_per_page * head_dim
-        + (score_rows + _TRANSPOSED_ROWS) * num_cols
+        + (score_rows + pick_rows) * num_cols
     )
     aliases, write_kwargs = {}, None
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
@@ -1042,7 +1068,7 @@ def decode_candidates(
         interpret=interpret,
         name="minimax_m3_msa_dcp_decode_candidates",
     )(*scalars, *inputs)
-    candidates = out[0][:num_tokens]
+    candidates = out[0][:num_tokens].reshape(out_tokens, -1)
     if write is None:
         return candidates
     return out[1:], candidates
@@ -1862,6 +1888,34 @@ def msa_write_and_candidates_dcp(
             interpret=interpret,
         )
         return (*caches, packed)
+    if num_heads > 1 and decodes_in_one_kernel(
+        num_tokens * num_heads,
+        index_cache,
+        max_num_seqs,
+        block_tables.shape[0] // max_num_seqs,
+        num_heads,
+    ):
+        # All heads' rows in one kernel, as one head's with its write
+        # (`fold_write`); the write stays ahead (`after_write`).
+        packed = decode_candidates(
+            index_q,
+            index_cache,
+            local_lens,
+            block_tables,
+            cu_q_lens,
+            distribution[2],
+            seq_id,
+            pos,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            rank=rank,
+            dcp=dcp,
+            interpret=interpret,
+        )
+        if fp4:
+            return done(kv_cache, index_cache, scale_cache, packed)
+        return done(kv_cache, index_cache, packed)
     if num_heads == 1:
         scores = msa._block_scores(
             index_q,
