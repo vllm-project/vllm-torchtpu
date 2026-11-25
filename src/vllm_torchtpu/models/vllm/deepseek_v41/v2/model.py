@@ -197,6 +197,23 @@ def _replay_bounds(plan, positions, reuse: dict):
     return _reused(reuse, "bounds", key, bounds)
 
 
+def _replays_in_place(plan, num_tokens: int, real_tokens: int | None) -> bool:
+    """Whether the decoder may run on the token rows as they are.
+
+    True when the plan keeps every row (identity), or keeps every real token
+    row, in order, and pads to the token bucket itself (steady decode: the live
+    rows lead the bucket). Either way the gather would only copy rows, and any
+    row past the decoder's query bounds is the runner's padding.
+    """
+    if (
+        not envs.TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY
+        or plan.padded_num_tokens != num_tokens
+    ):
+        return False
+    kept = len(plan.indices)
+    return kept in (num_tokens, real_tokens) and plan.indices == tuple(range(kept))
+
+
 def _gather_replay_inputs(gather, *tensors):
     """``tensor[gather]`` for each decoder input; None stays None."""
     return tuple(
@@ -1109,6 +1126,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # DEFER_AND_FUSE does not fuse both stages across the boundary.
                 synchronize_tensors((hidden, pre_mix))
 
+        in_place = False
         if plan is None:
             # pyrefly: ignore[unbound-name]
             decoder_metadata = metadata
@@ -1124,14 +1142,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 else torch.zeros_like(positions, dtype=torch.bool)
             )
         else:
-            num_tokens = positions.shape[0]
-            if (
-                envs.TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY
-                and plan.padded_num_tokens == num_tokens
-                and plan.indices == tuple(range(num_tokens))
-            ):
-                # Every row replays in place (steady decode): gathering and
-                # scattering by the identity only copies rows.
+            bounds_cpu = getattr(first, "query_start_loc_cpu", None)
+            in_place = _replays_in_place(
+                plan, positions.shape[0], bounds_cpu[-1] if bounds_cpu else None
+            )
+            if in_place:
+                # Every kept row replays in place (steady decode: the live rows
+                # lead the token bucket): gathering and scattering by the
+                # identity only copies rows. Rows past the plan's query bounds
+                # stay decoder padding, as on the full-bucket path above; their
+                # outputs (hidden and aux) are unspecified, not zeroed.
                 placement = None
                 decoder_positions, decoder_ids = positions, input_ids
                 decoder_hidden, decoder_mix = hidden, pre_mix
@@ -1186,14 +1206,15 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # dummy batches) it is a set lookup.
             self._precompile_replay_glue(positions, input_ids, hidden, pre_mix, output)
         total_rows = positions.shape[0]
-        # An identity plan (every row kept, in order, no padding row) leaves
-        # the decoder output in original row order: skip the scatter back.
-        # The plan itself still fed the decoder its query bounds and replay
-        # starts above.
-        identity = (
-            plan is not None
-            and plan.padded_num_tokens == total_rows
-            and plan.indices == tuple(range(total_rows))
+        # An identity or in-place plan leaves the decoder output in original
+        # row order: skip the scatter back. The plan itself still fed the
+        # decoder its query bounds and replay starts above.
+        identity = plan is not None and (
+            in_place
+            or (
+                plan.padded_num_tokens == total_rows
+                and plan.indices == tuple(range(total_rows))
+            )
         )
         if identity:
             # Serving evidence that steady decode takes the scatter-free path.

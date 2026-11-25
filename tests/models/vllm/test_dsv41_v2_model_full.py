@@ -9,6 +9,7 @@ Covers all lines and branch decision points in:
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import os
 import sys
@@ -70,6 +71,7 @@ class _FakeAttnMeta:
     query_start_loc: Any = None
     seq_lens: Any = None
     block_tables: Any = None
+    query_start_loc_cpu: Any = None
 
 
 def _mock_runner(
@@ -1120,6 +1122,75 @@ class TestModelForward:
         torch.testing.assert_close(kwargs["inputs_embeds"], hidden, rtol=0, atol=0)
         torch.testing.assert_close(kwargs["encoder_pre_mix"], pre_mix, rtol=0, atol=0)
         assert (kwargs["inputs_embeds"] is hidden) == identity_switch
+
+    @pytest.mark.parametrize("identity_switch", [False, True])
+    def test_forward_ced_leading_rows_replay_in_place(
+        self, monkeypatch, identity_switch
+    ) -> None:
+        # Steady decode: the live rows lead the token bucket and the plan pads
+        # to the bucket itself. With the switch the decoder takes the token rows
+        # as they are; either way the live rows' outputs and the decoder's query
+        # bounds and padding mask are the same.
+        monkeypatch.setenv(
+            "TPU_DEEPSEEK_V41_CED_IDENTITY_REPLAY", "1" if identity_switch else "0"
+        )
+        model = self._create_model(ced_enabled=True, sp_enabled=False)
+        hidden = torch.arange(4 * 64, dtype=torch.float32).reshape(4, 64)
+        pre_mix = -hidden
+        model.encoder_stage = MagicMock(return_value=(hidden, pre_mix))
+        plan = DecoderReplayPlan(
+            indices=(0, 1),
+            padded_num_tokens=4,
+            query_start_loc=(0, 2),
+            replay_starts=(0,),
+        )
+        model.decoder_stage = MagicMock(
+            side_effect=lambda ids, positions, inputs_embeds, encoder_pre_mix: (
+                inputs_embeds * 2 + encoder_pre_mix + positions[:, None]
+            )
+        )
+        contexts = []
+
+        @contextlib.contextmanager
+        def record_context(context):
+            contexts.append(context)
+            yield
+
+        meta_entry = _FakeAttnMeta(
+            input_positions=None,
+            query_start_loc=None,
+            seq_lens=torch.tensor([2]),
+            query_start_loc_cpu=(0, 2),
+        )
+        mock_ctx = _FakeForwardCtx(attn_metadata={"layer_0": meta_entry})
+        ids, positions = torch.tensor([1, 2, 0, 0]), torch.tensor([5, 6, 0, 0])
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=mock_ctx,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.override_forward_context",
+                side_effect=record_context,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=plan,
+            ),
+        ):
+            res = model.forward(ids, positions)
+        expected = hidden * 2 + pre_mix + positions[:, None]
+        torch.testing.assert_close(res[:2], expected[:2], rtol=0, atol=0)
+        args, kwargs = model.decoder_stage.call_args
+        assert (kwargs["inputs_embeds"] is hidden) == identity_switch
+        decoder_ctx = contexts[-1]
+        meta = decoder_ctx.attn_metadata["layer_0"]
+        torch.testing.assert_close(
+            meta.query_start_loc, torch.tensor([0, 2], dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            decoder_ctx.is_padding, torch.tensor([False, False, True, True])
+        )
 
 
 # ==============================================================================
