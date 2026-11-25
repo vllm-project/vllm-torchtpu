@@ -39,7 +39,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
-from vllm_torchtpu.models.minimax_m3 import sp_o_proj
+from vllm_torchtpu.models.minimax_m3 import dcp_local_kv, sp_o_proj
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     fp4_dcp_rotates_queries,
@@ -387,6 +387,18 @@ class MiniMaxM3SparseAttention(nn.Module):
         # heads, and each rank stores all of their rows for its blocks.
         self.kv_head_replicas = max(1, tp_size // config.num_key_value_heads)
         self.dcp_kv_heads = max(1, self.dcp_size // self.kv_head_replicas)
+        # KV heads qkv_proj emits: the group's with dcp_local_kv, else this
+        # rank's own.
+        self.qkv_kv_heads = self.num_kv_heads
+        if self.dcp_kv_heads > 1 and dcp_local_kv.enabled():
+            self.qkv_kv_heads = self.dcp_kv_heads
+            dcp_local_kv.mark(
+                self.qkv_proj,
+                self.num_heads,
+                self.head_dim,
+                self.dcp_size,
+                self.kv_head_replicas,
+            )
         dtype = cache_dtype(cache_config)
         self.kv_cache = MiniMaxM3Cache(
             2 * self.head_dim * self.dcp_kv_heads, dtype, prefix=f"{prefix}.attn"
@@ -460,7 +472,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.q_head_major = self.dcp_size > 1 and self.dcp_kv_heads == 1
         self.norm_rope_op = get_qk_norm_rope_op(
             self.num_heads,
-            self.num_kv_heads,
+            self.qkv_kv_heads,
             self.head_dim,
             eps,
             self.q_head_major,
@@ -519,11 +531,17 @@ class MiniMaxM3SparseAttention(nn.Module):
             # the reads of the call that produced `after` (else XLA copies
             # the caches).
             qkv = qkv + _zero_of(after).to(qkv.dtype)
+        kv_heads = self.qkv_kv_heads
+        if qkv.shape[-1] != (self.num_heads + 3 * kv_heads + 1) * self.head_dim:
+            raise RuntimeError(
+                f"qkv_proj emitted {qkv.shape[-1]} columns, not {kv_heads} KV heads' "
+                "(TPU_MINIMAX_M3_DCP_LOCAL_KV prepares qkv_proj after loading)."
+            )
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,
             self.num_heads,
-            self.num_kv_heads,
+            kv_heads,
             self.head_dim,
             (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm),
             self.rotary_emb,
@@ -542,7 +560,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         else:
             layer_metadata = metadata[self.kv_cache.prefix]
             assert isinstance(layer_metadata, AttentionMetadata)
-            index_q = index_q.view(num_tokens, self.num_kv_heads, self.index_head_dim)
+            index_q = index_q.view(num_tokens, kv_heads, self.index_head_dim)
             if self.index_shards > 1:
                 # Every rank scores all index heads on its share of the keys.
                 index_q = get_tp_group().all_gather(index_q.contiguous(), dim=1)
@@ -555,8 +573,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                 layer_metadata = half[0].metadata(layer_metadata, half[1])
             attn_output = self.msa_op(
                 q,
-                k.view(num_tokens, self.num_kv_heads, self.head_dim),
-                v.view(num_tokens, self.num_kv_heads, self.head_dim),
+                k.view(num_tokens, kv_heads, self.head_dim),
+                v.view(num_tokens, kv_heads, self.head_dim),
                 index_q,
                 index_k,
                 kv_cache,

@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_FUSED_NORM: bool = False
     TPU_MINIMAX_M3_FUSED_RESIDUAL_AR: int = 0
     TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3: bool = False
+    TPU_MINIMAX_M3_DCP_LOCAL_KV: bool = False
     TPU_MINIMAX_M3_SP_E4M3_QKV: bool = False
     TPU_MINIMAX_M3_SP_A2A_OPROJ: str = "off"
     TPU_MINIMAX_M3_SP_A2A_E4M3: bool = False
@@ -809,6 +810,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of converting the weight to bf16 inside the dot's fusion.
     "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3": env_bool(
         "TPU_MINIMAX_M3_FUSED_RESIDUAL_AR_E4M3", default=False
+    ),
+    # A DCP group spanning several KV heads: every rank projects the K, V and
+    # index_q heads of its whole group itself (qkv_proj carries the group's
+    # columns, models/minimax_m3/dcp_local_kv.py) instead of all-gathering
+    # them over the group each layer.
+    "TPU_MINIMAX_M3_DCP_LOCAL_KV": env_bool(
+        "TPU_MINIMAX_M3_DCP_LOCAL_KV", default=False
     ),
     # "full" SP with the e4m3 gathers: qkv_proj, a dense layer's MLP gate_up
     # and a model-side shared expert (TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS)

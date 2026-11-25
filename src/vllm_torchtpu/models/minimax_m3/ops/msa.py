@@ -658,10 +658,12 @@ def get_msa_dcp_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
-        if kv_heads > 1:
+        if kv_heads > 1 and k.shape[1] == 1:
             q_all, k, v, index_q = gather_group_heads(
                 q, k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
             )
+        elif kv_heads > 1:  # the caller projected the group's K/V heads (dcp_local_kv)
+            q_all = gather_query_heads(q, group)
         new_kv_cache, new_index_cache, candidates = score_op(
             k,
             v,
@@ -851,7 +853,8 @@ def _get_msa_dcp_fp4_op(
     ) -> torch.Tensor:
         group = get_dcp_group()
         assert group is not None, "DCP group is not initialized"
-        if kv_heads > 1:
+        if kv_heads > 1 and k.shape[1] == 1:
+            # Else the caller projected the group's K/V heads (dcp_local_kv).
             k, v, index_q = gather_group_kv(
                 k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
             )

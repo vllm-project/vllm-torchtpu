@@ -55,7 +55,7 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 )
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.models.minimax_m3 import sp_o_proj
+from vllm_torchtpu.models.minimax_m3 import dcp_local_kv, sp_o_proj
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -206,6 +206,11 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if not self._runs_fp8(layer):
+            if getattr(layer, dcp_local_kv.PREPARE_ATTR, None):
+                raise RuntimeError(
+                    "TPU_MINIMAX_M3_DCP_LOCAL_KV needs qkv_proj on e4m3 weights "
+                    "(TPU_MINIMAX_M3_FP8_LINEARS)."
+                )
             weight = dequantize_mxfp8(layer.weight.data, layer.weight_scale.data)
             del layer.weight_scale
             replace_parameter(
@@ -225,6 +230,8 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
             torch.nn.Parameter(scale.to(torch.bfloat16), requires_grad=False),
         )
         setattr(layer, WEIGHT_FLIPPED_ATTR, True)
+        if getattr(layer, dcp_local_kv.PREPARE_ATTR, None):
+            dcp_local_kv.prepare(layer)
         if weight.device.type == "tpu":
             synchronize_tensors([layer.weight, layer.weight_scale])
         if getattr(layer, sp_o_proj.PREPARE_ATTR, False):
