@@ -1014,13 +1014,21 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # The extra output row absorbs padded scatter writes. Reusing
                 # row zero for padding would overwrite a real request's first
                 # result.
+                padded = plan.indices + (num_tokens,) * (
+                    plan.padded_num_tokens - len(plan.indices)
+                )
                 indices = torch.tensor(
-                    plan.indices
-                    + (num_tokens,) * (plan.padded_num_tokens - len(plan.indices)),
+                    padded, dtype=torch.int64, device=positions.device
+                )
+                # Clamp on the host. The eager group traces Python ints as
+                # arguments shared by value, so a real-row count equal to
+                # num_tokens - 1 traced a second graph and compiled it
+                # mid-decode (264 ms, every rank waiting at the EP exchange).
+                gather = torch.tensor(
+                    [min(row, num_tokens - 1) for row in padded],
                     dtype=torch.int64,
                     device=positions.device,
                 )
-                gather = indices.clamp(max=num_tokens - 1)
                 decoder_positions = positions[gather]
                 decoder_ids = input_ids[gather] if input_ids is not None else None
                 decoder_hidden, decoder_mix = hidden[gather], pre_mix[gather]
@@ -1037,9 +1045,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # pyrefly: ignore[unbound-name]
                 for key, value in metadata.items()
             }
-            decoder_padding = torch.arange(
-                plan.padded_num_tokens, device=positions.device
-            ) >= len(plan.indices)
+            # Host-built like `gather`: no row count enters the eager group.
+            decoder_padding = torch.tensor(
+                [row >= len(plan.indices) for row in range(plan.padded_num_tokens)],
+                dtype=torch.bool,
+                device=positions.device,
+            )
         decoder_context = replace(
             context,
             dp_metadata=(
