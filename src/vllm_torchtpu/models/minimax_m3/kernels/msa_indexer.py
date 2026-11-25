@@ -517,7 +517,8 @@ def _kernel_v3(
             # g + 1 read one word (a dynamic half cost ~4 scalar ops per page).
             if word is None:
                 word = block_tables_ref[(base >> 1) + g // 2]
-            page = (word >> 16) & 0xFFFF if g % 2 else word & 0xFFFF
+            # A logical shift leaves the high entry alone: no mask.
+            page = jax.lax.shift_right_logical(word, 16) if g % 2 else word & 0xFFFF
         else:
             page = table_entry(base + col)
         return pltpu.make_async_copy(words.at[page], buf.at[slot, g], sems.at[slot])
