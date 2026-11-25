@@ -18,18 +18,25 @@ from __future__ import annotations
 import copy
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
 import pytest
 
 from vllm_torchtpu.roofline import (
+    Dtypes,
     ModelGeometry,
     ModelIdentity,
+    Parallel,
+    StepShape,
+    apply_hf_overrides,
+    dtypes_from_hf_config,
     from_hf_config,
+    pass_costs,
     resolve_model_identity,
 )
+from vllm_torchtpu.roofline.modules import ModuleCost
 
 FIXTURES_DIR: Path = Path(__file__).resolve().parent / "fixtures"
 LOCKED_FIXTURE_FILES: tuple[str, ...] = (
@@ -42,12 +49,12 @@ LOCKED_FIXTURE_FILES: tuple[str, ...] = (
 
 @dataclass(frozen=True, slots=True)
 class LockedBundle:
-    """Bundled config, identity, geometry, and optional dtypes for a locked fixture."""
+    """Bundled config, identity, geometry, and dtypes for a locked fixture."""
 
     config: dict[str, object]
     identity: ModelIdentity
     geometry: ModelGeometry
-    dtypes: object = None
+    dtypes: Dtypes
 
 
 @lru_cache(maxsize=16)
@@ -70,14 +77,69 @@ def load_locked_geometry(
     return from_hf_config(_read_fixture_json(fixture_name))
 
 
+def load_locked_dtypes(
+    fixture_name: str = "qwen3_5_397b_fp8.json",
+) -> Dtypes:
+    """Derive Dtypes from one of the 4 locked basis HF checkpoint configs."""
+    return dtypes_from_hf_config(_read_fixture_json(fixture_name))
+
+
 def load_locked_bundle(
     fixture_name: str = "qwen3_5_397b_fp8.json",
 ) -> LockedBundle:
-    """Load config copy, canonical identity, and geometry for one locked fixture."""
+    """Load config copy, canonical identity, geometry, and dtypes for a fixture."""
     config = load_locked_config(fixture_name)
     identity = resolve_model_identity(config)
     geometry = from_hf_config(config)
-    return LockedBundle(config=config, identity=identity, geometry=geometry)
+    dtypes = dtypes_from_hf_config(config)
+    return LockedBundle(
+        config=config, identity=identity, geometry=geometry, dtypes=dtypes
+    )
+
+
+def override_locked_config(
+    fixture_name: str,
+    overrides: dict[str, object],
+) -> dict[str, object]:
+    """Return a locked HF config copy patched via apply_hf_overrides."""
+    return dict(apply_hf_overrides(load_locked_config(fixture_name), overrides))
+
+
+def modules_by_name(
+    geometry: ModelGeometry,
+    parallel: Parallel,
+    shape: StepShape,
+    dtypes: Dtypes,
+) -> dict[str, ModuleCost]:
+    """Return pass_costs indexed by module name."""
+    return {
+        module.name: module for module in pass_costs(geometry, parallel, shape, dtypes)
+    }
+
+
+def make_dense_from_locked(
+    fixture_name: str = "qwen3_5_397b_fp8.json",
+    *,
+    num_layers: int = 4,
+    dense_inter: int = 8192,
+) -> ModelGeometry:
+    """Derive a pure dense full-attention geometry from a locked fixture."""
+    base = load_locked_geometry(fixture_name)
+    return replace(
+        base,
+        num_layers=num_layers,
+        layer_types=("full_attention",) * num_layers,
+        num_experts=0,
+        top_k=0,
+        moe_inter=0,
+        shared_inter=0,
+        dense_inter=dense_inter,
+        first_k_dense_replace=0,
+        ffn_kinds=("dense",) * num_layers,
+        n_moe_layers=0,
+        n_dense_layers=num_layers,
+        mtp_layers=0,
+    )
 
 
 @pytest.fixture
