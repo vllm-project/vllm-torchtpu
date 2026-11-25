@@ -18,6 +18,7 @@ they cover; see vllm-project/vllm-torchtpu#713.
 """
 
 import dataclasses
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -33,6 +34,7 @@ from vllm.config import (
     get_current_vllm_config_or_none,
 )
 from vllm.model_executor.layers.attention import Attention, MLAAttention
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -44,6 +46,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -56,6 +59,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasBatchedRPAAttentionBackend,
     PallasMLAttentionBackend,
+    VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     RunLocalStateSpec,
@@ -1869,6 +1873,267 @@ class TestKVCacheManager:
         caches["attn.0"][kv_cache_config.num_blocks - 1].fill_(1)
         assert torch.all(caches["attn.1"][-1] == 1)
 
+    def _owned_mla_cache_then_drafter(self):
+        """A model-owned MLA cache registers first; a drafter adds a plain
+        `Attention` layer. `_find_non_ssm_backend` returns the MLA backend."""
+        owned = MagicMock(spec=AttentionLayerBase)
+        owned.get_attn_backend.return_value = PallasMLAttentionBackend
+        drafter = _attention_layer_mock(num_kv_heads=8, head_size=128)
+        drafter.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+        self.runner.vllm_config.compilation_config.static_forward_context = {
+            "target.cache": owned,
+            "draft.attn": drafter,
+        }
+        return drafter
+
+    @patch.object(
+        TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend
+    )
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    def test_get_kv_cache_spec_sizes_drafter_with_dense_backend(
+        self, mock_get_layers, _mock_first_backend
+    ):
+        drafter = self._owned_mla_cache_then_drafter()
+        mock_get_layers.return_value = {"draft.attn": drafter}
+
+        spec = self.runner.get_kv_cache_spec()["draft.attn"]
+
+        dense_page = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 8, 128, torch.bfloat16
+        )
+        assert dense_page != PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 8, 128, torch.bfloat16
+        )
+        assert type(spec) is FullAttentionSpec
+        assert spec.page_size_bytes == dense_page
+
+    @pytest.mark.parametrize(
+        ("with_mamba", "hint"),
+        [
+            (True, "not supported with Mamba layers"),
+            (
+                False,
+                r"per-layer KV cache layout \(TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0\)",
+            ),
+        ],
+    )
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    def test_get_kv_cache_spec_rejects_unified_pool_mixing_mla_and_attention(
+        self, mock_get_layers, with_mamba, hint
+    ):
+        mla = MagicMock(spec=MLAAttention)
+        mla.head_size = 576
+        layers = {
+            "target.mla": mla,
+            "draft.attn": _attention_layer_mock(num_kv_heads=8, head_size=128),
+        }
+        if with_mamba:
+            layers["mamba_0"] = DummyMamba()
+        mock_get_layers.return_value = layers
+        self.runner._unified_kv_layout = True
+
+        with pytest.raises(NotImplementedError, match="unified KV block pool") as exc:
+            self.runner.get_kv_cache_spec()
+        assert re.search(hint, str(exc.value))
+        assert ("per-layer" in str(exc.value)) is not with_mamba
+
+    @pytest.mark.usefixtures("vllm_config_context")
+    def test_initialize_kv_cache_allocates_drafter_with_dense_backend(self):
+        self._owned_mla_cache_then_drafter()
+        dtype = torch.bfloat16
+        page_bytes = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 8, 128, dtype
+        )
+        spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=dtype,
+            page_size_padded=page_bytes,
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=page_bytes * 4,
+                    layers=["draft.attn"],
+                    layer_stride=page_bytes * 4,
+                    block_stride=page_bytes,
+                ),
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["draft.attn"], kv_cache_spec=spec)
+            ],
+        )
+        self.runner.block_table_cpu = torch.zeros((1, 4), dtype=torch.int32)
+        self.runner.kv_caches = []
+        mock_bt = MagicMock()
+        mock_bt.max_num_blocks_per_req = 4
+        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 4), dtype=torch.int32)
+        self.runner.input_batch = MagicMock()
+        self.runner.input_batch.block_table = [mock_bt]
+
+        with (
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as mock_bind,
+            patch.object(
+                TpuPlatform,
+                "_find_non_ssm_backend",
+                return_value=PallasMLAttentionBackend,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=False,
+            ),
+        ):
+            self.runner.initialize_kv_cache(kv_cache_config)
+
+        cache = mock_bind.call_args.args[0]["draft.attn"]
+        assert cache.shape == PallasAttentionBackend.get_kv_cache_shape(
+            4, 16, 8, 128, dtype
+        )
+        assert cache.dim() == 5
+        assert cache.stride(0) * dtype.itemsize == page_bytes
+
+    def _mla_target_then_drafter(self):
+        """Two `MLAAttention` target layers register first; a drafter adds a
+        plain `Attention` layer."""
+        layers = {}
+        for i in range(2):
+            mla = MagicMock(spec=MLAAttention)
+            mla.head_size = 576
+            mla.use_sparse = False
+            mla.get_attn_backend.return_value = PallasMLAttentionBackend
+            layers[f"target.mla.{i}"] = mla
+        drafter = _attention_layer_mock(num_kv_heads=8, head_size=128)
+        drafter.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+        layers["draft.attn"] = drafter
+        self.runner.vllm_config.compilation_config.static_forward_context = layers
+        self.runner._unified_kv_layout = False
+        self.runner._uniform_mamba_layout = False
+        return layers
+
+    @patch.object(
+        TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend
+    )
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    def test_get_kv_cache_spec_keeps_native_pages_for_mla_and_drafter(
+        self, mock_get_layers, _mock_first_backend
+    ):
+        mock_get_layers.return_value = self._mla_target_then_drafter()
+
+        specs = self.runner.get_kv_cache_spec()
+
+        mla_page = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 1, 576, torch.bfloat16
+        )
+        dense_page = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 8, 128, torch.bfloat16
+        )
+        assert mla_page != dense_page
+        for i in range(2):
+            assert type(specs[f"target.mla.{i}"]) is MLAAttentionSpec
+            assert specs[f"target.mla.{i}"].page_size_bytes == mla_page
+        assert type(specs["draft.attn"]) is FullAttentionSpec
+        assert specs["draft.attn"].page_size_bytes == dense_page
+        assert self.runner._hybrid_uniform_page_size_bytes is None
+        # vLLM puts the layers in one group that keeps per-layer pages.
+        assert UniformTypeKVCacheSpecs.is_uniform_type(specs)
+
+    @pytest.mark.usefixtures("vllm_config_context")
+    def test_initialize_kv_cache_allocates_mla_and_drafter_caches(self):
+        self._mla_target_then_drafter()
+        dtype = torch.bfloat16
+        num_blocks = 4
+        mla_page = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 1, 576, dtype
+        )
+        dense_page = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 8, 128, dtype
+        )
+        mla_spec = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=dtype,
+            page_size_padded=mla_page,
+        )
+        dense_spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=dtype,
+            page_size_padded=dense_page,
+        )
+        group_spec = UniformTypeKVCacheSpecs(
+            block_size=16,
+            kv_cache_specs={
+                "target.mla.0": mla_spec,
+                "target.mla.1": mla_spec,
+                "draft.attn": dense_spec,
+            },
+        )
+        size = (2 * mla_page + dense_page) * num_blocks
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=size,
+                    layers=["target.mla.0", "target.mla.1"],
+                    layer_stride=mla_page * num_blocks,
+                    block_stride=mla_page,
+                ),
+                KVCacheTensor(
+                    size=size,
+                    layers=["draft.attn"],
+                    layer_stride=dense_page * num_blocks,
+                    block_stride=dense_page,
+                    offset=2 * mla_page * num_blocks,
+                ),
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=["target.mla.0", "target.mla.1", "draft.attn"],
+                    kv_cache_spec=group_spec,
+                )
+            ],
+        )
+        self.runner.block_table_cpu = torch.zeros((1, 4), dtype=torch.int32)
+        self.runner.kv_caches = []
+        mock_bt = MagicMock()
+        mock_bt.max_num_blocks_per_req = 4
+        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 4), dtype=torch.int32)
+        self.runner.input_batch = MagicMock()
+        self.runner.input_batch.block_table = [mock_bt]
+
+        with (
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as mock_bind,
+            patch.object(
+                TpuPlatform,
+                "_find_non_ssm_backend",
+                return_value=PallasMLAttentionBackend,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=False,
+            ),
+        ):
+            self.runner.initialize_kv_cache(kv_cache_config)
+
+        caches = mock_bind.call_args.args[0]
+        for i in range(2):
+            mla_cache = caches[f"target.mla.{i}"]
+            assert mla_cache.shape == PallasMLAttentionBackend.get_kv_cache_shape(
+                num_blocks, 16, 1, 576, dtype
+            )
+            assert mla_cache.dim() == 4
+            assert mla_cache.nbytes == mla_page * num_blocks
+        drafter_cache = caches["draft.attn"]
+        assert drafter_cache.shape == PallasAttentionBackend.get_kv_cache_shape(
+            num_blocks, 16, 8, 128, dtype
+        )
+        assert drafter_cache.dim() == 5
+        assert drafter_cache.nbytes == dense_page * num_blocks
+
     def test_initialize_kv_cache_composite_specs(self):
         """Verify composite kv_cache_specs unpacking when a group's spec wraps
         a dictionary of individual per-layer specs."""
@@ -2808,6 +3073,157 @@ class TestUpdateAttentionPageSizePadded:
         )
 
 
+class _DsV4SWABackend(PallasMLAttentionBackend):
+    """Stands in for `VllmDeepseekSparseSWABackend`."""
+
+
+class _DsV4AttentionBackend(PallasAttentionBackend):
+    """Stands in for `DeepseekV4TPUAttentionBackend`, a
+    `PallasAttentionBackend` subclass."""
+
+
+class TestDenseAttentionBackend:
+    """Plain `Attention` caches take the backend of the plain layers, also
+    behind an MLA-family first backend (model-owned caches, a drafter)."""
+
+    _attn = staticmethod(TestUpdateAttentionPageSizePadded._attn)
+
+    @staticmethod
+    def _layer(spec, backend):
+        layer = MagicMock(spec=spec)
+        layer.get_attn_backend.return_value = backend
+        return layer
+
+    @staticmethod
+    def _config(layers):
+        return SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context=layers)
+        )
+
+    def _stub(self, layers):
+        stub = TestUpdateAttentionPageSizePadded._stub(stale_block_size=128)
+        stub._mamba_num_blocks = None
+        stub.vllm_config.cache_config = stub.cache_config
+        stub.vllm_config.compilation_config.static_forward_context = layers
+        return stub
+
+    def test_helper_skips_dsv4_cache_backends(self):
+        """DSv4 registers its SWA cache before its attention layer; neither is
+        a plain `Attention`, so a plain drafter keeps its own backend."""
+        from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+        from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+
+        layers = {
+            "layers.0.swa_cache": self._layer(DeepseekV4SWACache, _DsV4SWABackend),
+            "layers.0.attn": self._layer(DeepseekV4Attention, _DsV4AttentionBackend),
+            "draft.attn": self._layer(Attention, PallasBatchedRPAAttentionBackend),
+        }
+        assert (
+            TpuPlatform._find_dense_attention_backend(self._config(layers))
+            is PallasBatchedRPAAttentionBackend
+        )
+
+    def test_helper_keeps_first_backend_without_plain_attention(self):
+        layers = {"mla": self._layer(MLAAttention, PallasMLAttentionBackend)}
+        with patch.object(
+            TpuPlatform,
+            "_find_non_ssm_backends",
+            return_value=[PallasMLAttentionBackend],
+        ):
+            assert (
+                TpuPlatform._find_dense_attention_backend(self._config(layers))
+                is PallasMLAttentionBackend
+            )
+
+    def test_mamba_padding_sizes_plain_first_layer_with_dense_backend(self):
+        """A plain first layer behind an MLA-first backend list takes the
+        dense page, not the MLA formula."""
+        drafter = self._attn(num_kv_heads=8, head_size=128)
+        drafter.get_attn_backend.return_value = PallasAttentionBackend
+        owned = self._layer(AttentionLayerBase, PallasMLAttentionBackend)
+        layers = {"draft.attn": drafter, **{f"m{i}": DummyMamba() for i in range(3)}}
+        stub = self._stub({"target.cache": owned, "draft.attn": drafter})
+        manager = KVCacheManager(stub)
+
+        with (
+            patch.object(
+                TpuPlatform,
+                "_find_non_ssm_backend",
+                return_value=PallasMLAttentionBackend,
+            ),
+            patch.object(manager, "_maybe_select_compact_mamba_layout") as compact,
+            patch.object(manager, "_maybe_set_num_blocks_override"),
+        ):
+            manager._update_mamba_page_size_padded(layers, 128)
+
+        dense_page = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            128, 8, 128, torch.bfloat16
+        )
+        assert dense_page != PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            128, 8, 128, torch.bfloat16
+        )
+        assert compact.call_args.args[0] == dense_page
+        # 1 attention + 3 mamba layers: 1 attention group, 3 mamba groups of
+        # (4 * 128 * 2) + (8 * 64 * 32 * 4) = 66560 bytes.
+        assert stub._hybrid_uniform_page_size_bytes == dense_page + 3 * 66560
+
+    def test_mamba_padding_sizes_first_mla_layer_with_mla_backend(self):
+        """An indexer cache registers before its MLA sibling; the MLA page
+        still takes `PallasMLAttentionBackend`."""
+        mla = MagicMock(spec=MLAAttention)
+        mla.head_size = 576
+        mla.use_sparse = False
+        layers = {"mla": mla, **{f"m{i}": DummyMamba() for i in range(3)}}
+        stub = self._stub({})
+        manager = KVCacheManager(stub)
+
+        with (
+            patch.object(
+                TpuPlatform,
+                "_find_non_ssm_backend",
+                return_value=VllmTPUDeepseekV32IndexerBackend,
+            ),
+            patch.object(manager, "_maybe_select_compact_mamba_layout") as compact,
+            patch.object(manager, "_maybe_set_num_blocks_override"),
+        ):
+            manager._update_mamba_page_size_padded(layers, 128)
+
+        assert compact.call_args.args[
+            0
+        ] == PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            128, 1, 576, torch.bfloat16
+        )
+
+    def test_mamba_padding_rejects_mla_with_plain_attention(self):
+        mla = MagicMock(spec=MLAAttention)
+        mla.head_size = 576
+        mla.use_sparse = False
+        drafter = self._attn(num_kv_heads=8, head_size=128)
+        drafter.get_attn_backend.return_value = PallasAttentionBackend
+        layers = {
+            "target.mla": mla,
+            "draft.attn": drafter,
+            **{f"m{i}": DummyMamba() for i in range(3)},
+        }
+        manager = KVCacheManager(self._stub(layers))
+
+        with pytest.raises(NotImplementedError, match="MLA and plain"):
+            manager._update_mamba_page_size_padded(layers, 128)
+
+    def test_mamba_padding_rejects_different_attention_pages(self):
+        layers = {
+            "a": self._attn(num_kv_heads=2, head_size=256),
+            "b": self._attn(num_kv_heads=2, head_size=512),
+            **{f"m{i}": DummyMamba() for i in range(3)},
+        }
+        for name in ("a", "b"):
+            layers[name].get_attn_backend.return_value = PallasAttentionBackend
+        manager = KVCacheManager(self._stub(layers))
+
+        with pytest.raises(NotImplementedError, match="one attention page size"):
+            manager._update_mamba_page_size_padded(layers, 128)
+
+
 def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
     monkeypatch.setattr(
         TpuPlatform, "_find_non_ssm_backend", lambda *_: PallasAttentionBackend
@@ -2858,7 +3274,10 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
             is_hybrid=False,
         ),
         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
-        vllm_config=SimpleNamespace(cache_config=cache_config),
+        vllm_config=SimpleNamespace(
+            cache_config=cache_config,
+            compilation_config=SimpleNamespace(static_forward_context=layers),
+        ),
         shared_kv_cache_layers={},
         runner_only_attn_layers=set(),
         _hybrid_uniform_page_size_bytes=None,
