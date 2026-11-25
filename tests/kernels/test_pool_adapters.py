@@ -13,9 +13,12 @@
 # limitations under the License.
 """TPU roundtrip tests for the unified-pool region adapters."""
 
+import contextlib
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import pool_adapters
 
@@ -86,6 +89,31 @@ def test_copy_blocks():
     np.testing.assert_array_equal(after[1], before[2])
     np.testing.assert_array_equal(after[0], before[0])
     np.testing.assert_array_equal(after[2], before[2])
+
+
+@pytest.mark.parametrize(
+    "mode", [pytest.param("tpu", marks=pytest.mark.tpu_test), "interpret"]
+)
+def test_copy_blocks_replaces_a_pair_outside_the_pool_by_the_null_pair(mode):
+    """The real copy kernel, on TPU or in Pallas's TPU interpret mode on the
+    host (which raises on a block index outside the pool): each pair that
+    joins a live block to an index outside the pool copies nothing."""
+    pool = _pool()
+    before = np.asarray(pool)
+    src = jnp.asarray([2, NB, -1, 1, 2**31 - 1], dtype=jnp.int32)
+    dst = jnp.asarray([3, 1, 1, NB, 1], dtype=jnp.int32)
+
+    with (
+        pltpu.force_tpu_interpret_mode(pltpu.InterpretParams())
+        if mode == "interpret"
+        else contextlib.nullcontext()
+    ):
+        pool = pool_adapters.copy_blocks(pool, src, dst)
+
+    after = np.asarray(pool)
+    np.testing.assert_array_equal(after[3], before[2])
+    for block in (0, 1, 2):
+        np.testing.assert_array_equal(after[block], before[block])
 
 
 @pytest.mark.tpu_test

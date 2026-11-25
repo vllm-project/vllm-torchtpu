@@ -31,10 +31,12 @@ the pool in place (`input_output_aliases`); the unwritten complement is
 preserved via the HBM alias, with no read-modify-write.
 """
 
+import functools
 import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
@@ -397,6 +399,49 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
     )(state_indices, vals.reshape(na * chunks, v_rows, v_lanes), pool)
 
 
+def null_out_of_range_pairs(src_indices, dst_indices, num_blocks: int):
+    """Replaces every copy pair with an index outside `[0, num_blocks)` by `(0, 0)`.
+
+    Block 0 is vLLM's reserved null block and `(0, 0)` is the copy's padding
+    pair: it copies the null block onto itself, so a replaced pair changes no
+    block. Such a pair can then neither write outside the pool nor, as
+    clamping the index to the last block could, overwrite another request's
+    block or copy one into this request. A pair with both indices in range is
+    returned unchanged.
+
+    The check is `pl.enable_debug_checks`: when it is set as the program is
+    traced, a host callback raises `RuntimeError` naming the replaced pairs.
+    When it is not set (the default), nothing is added to the program.
+    """
+    in_pool = (
+        (src_indices >= 0)
+        & (src_indices < num_blocks)
+        & (dst_indices >= 0)
+        & (dst_indices < num_blocks)
+    )
+    if pl.enable_debug_checks.value:
+        jax.debug.callback(
+            functools.partial(_raise_on_replaced_pairs, num_blocks),
+            in_pool,
+            src_indices,
+            dst_indices,
+        )
+    return (
+        jnp.where(in_pool, src_indices, jnp.zeros_like(src_indices)),
+        jnp.where(in_pool, dst_indices, jnp.zeros_like(dst_indices)),
+    )
+
+
+def _raise_on_replaced_pairs(num_blocks, in_pool, src_indices, dst_indices):
+    bad = np.flatnonzero(~np.asarray(in_pool))
+    if bad.size:
+        pairs = [(int(src_indices[i]), int(dst_indices[i])) for i in bad[:8]]
+        raise RuntimeError(
+            f"block copy: {bad.size} (src, dst) pair(s) outside [0, {num_blocks}) "
+            f"replaced by the (0, 0) padding pair, first ones: {pairs}"
+        )
+
+
 def copy_blocks(pool, src_indices, dst_indices):
     """Whole-block copies within the pool: pool[dst[i]] = pool[src[i]].
 
@@ -404,7 +449,21 @@ def copy_blocks(pool, src_indices, dst_indices):
     the block-table-derived state block advances (chunked-prefill boundary,
     decode crossing, or prefix-cache resume). Pairs with src == dst are
     no-ops used as padding.
+
+    Valid indices are `[0, pool.shape[0])`. A pair whose src or dst is
+    outside that range is replaced by the `(0, 0)` padding pair and changes
+    no block; with `pl.enable_debug_checks` it is reported
+    (`null_out_of_range_pairs`). Pairs inside the pool are copied unchanged.
     """
+    src_indices, dst_indices = null_out_of_range_pairs(
+        src_indices, dst_indices, pool.shape[0]
+    )
+    return _copy_blocks_unchecked(pool, src_indices, dst_indices)
+
+
+def _copy_blocks_unchecked(pool, src_indices, dst_indices):
+    """The copy kernel of `copy_blocks`. It does no bounds checks: every index
+    must be inside the pool."""
     na = src_indices.shape[0]
     block_shape = (1,) + pool.shape[1:]
     pad = (0,) * (pool.ndim - 1)

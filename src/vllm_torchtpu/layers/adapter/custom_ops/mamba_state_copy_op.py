@@ -31,22 +31,9 @@ from vllm_torchtpu.kernels import pool_adapters
 # counterpart of upstream vLLM's ``preprocess_mamba`` block copies.
 
 
-def _clamp_rows(idx: jax.Array, num_rows: int) -> jax.Array:
-    """Clamp host-provided copy indices into ``[0, num_rows)``.
-
-    The copy kernel does no bounds checks, so a garbage index (e.g. a stale or
-    torn host upload) would write outside the pool, possibly into weights.
-    Clamping keeps such a write inside the pool. Valid indices are unchanged.
-    It fuses into the copy program: no extra dispatch, no sync.
-    """
-    return jnp.clip(idx, 0, num_rows - 1).astype(idx.dtype)
-
-
 def _copy_fn(
     pool: jax.Array, src: jax.Array, dst: jax.Array
 ) -> tuple[jax.Array, jax.Array]:
-    src = _clamp_rows(src, pool.shape[0])
-    dst = _clamp_rows(dst, pool.shape[0])
     new_pool = pool_adapters.copy_blocks(pool, src, dst)
     return new_pool, src[0]
 
@@ -73,6 +60,11 @@ def copy_mamba_state_blocks(
     state-block advance must be mirrored on each of them with the same
     pairs; seeding them all from one program costs one dispatch per step
     instead of one per buffer.
+
+    ``src`` and ``dst`` are block indices, valid in ``[0, pool.shape[0])`` of
+    each pool. A pair with either index outside that range is replaced by the
+    ``(0, 0)`` padding pair, which copies the null block onto itself, so it
+    changes no block (``pool_adapters.copy_blocks``).
     """
     marker = None
     for pool in pools:
@@ -129,8 +121,9 @@ def _row_copy_fn(num_pools: int, split: int, step_rows: int):
         pool: jax.Array, src: jax.Array, dst: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
         assert pool.shape[1] == rows, (pool.shape, rows)
-        src = _clamp_rows(src, pool.shape[0])
-        dst = _clamp_rows(dst, pool.shape[0])
+        # Here as well as in copy_blocks: `src * steps` can wrap in int32 and
+        # land back inside the pool, where copy_blocks cannot tell it apart.
+        src, dst = pool_adapters.null_out_of_range_pairs(src, dst, pool.shape[0])
         view = pool.reshape(pool.shape[0] * steps, step_rows, *pool.shape[2:])
         offsets = jnp.arange(steps, dtype=src.dtype)
         src_steps = (src[:, None] * steps + offsets).reshape(-1)
@@ -159,6 +152,11 @@ def copy_mamba_state_rows(
     """Copies whole manager-block rows in place within the merged block-major pool.
 
     Each `(src[i], dst[i])` pair moves `num_pools * split` kernel blocks.
+    `src` and `dst` are manager rows, valid in `[0, pool.shape[0])`. A pair
+    with either index outside that range is replaced by the `(0, 0)` padding
+    pair before the rows expand into kernel blocks, so it copies the null
+    block's row onto itself and changes no row
+    (`pool_adapters.null_out_of_range_pairs`).
     """
     kernel_block_bytes = pool[0, 0].numel() * pool.element_size()
     step_rows = _row_copy_step_rows(
