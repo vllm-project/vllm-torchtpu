@@ -165,6 +165,7 @@ def _kernel(
     kernel_limits: bool = False,
     packed_stores: bool = False,
     unit_groups: int = 1,
+    whole_rows: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -215,10 +216,9 @@ def _kernel(
     steps = pl.num_programs(0) if steps_per_call is None else steps_per_call
     num_groups = block_start_ref[steps]
     q_leaf = q_ref[0] if isinstance(q_ref, tuple) else q_ref
-    row_width = 2 * q_leaf.shape[-1]  # the `head_dim` `_kernel_scratch` was given
-    # A ring of whole cache rows (`_kernel_scratch`): one contiguous copy per
-    # page, and a group reads its head's lanes.
-    whole_rows = buf_ref.shape[-1] > row_width
+    row_width = 2 * q_leaf.shape[-1]
+    # With `whole_rows` (`_whole_rows`) the ring holds whole cache rows: one
+    # contiguous copy per page, and a group reads its head's lanes.
 
     def page_copies(half, g, page, n=1):
         """Copies of ``n`` pages from `page` on into slots ``g ..``: every
@@ -845,7 +845,7 @@ def _kernel(
                     stages = [g.stages(width) for g in groups]
                     scores = [qk() for qk, _, _ in stages]
                     probs = [sm(s) for (_, sm, _), s in zip(stages, scores)]
-                    parts = [pv(*p)[2:] for (_, _, pv), p in zip(stages, probs)]
+                    parts = [p_at_v(*p)[2:] for (_, _, p_at_v), p in zip(stages, probs)]
                 else:
                     parts = [g.parts(width) for g in groups]
                 for g, (l_cur, pv) in zip(groups, parts):
@@ -1098,6 +1098,12 @@ def _attention_call(
             kernel_limits=kernel_limits,
             packed_stores=packed_stores,
             unit_groups=_unit_groups(transposed, tiles),
+            whole_rows=_whole_rows(
+                kv_cache,
+                scale_cache if fp4 else None,
+                head_dim,
+                _unit_groups(transposed, tiles),
+            ),
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
@@ -1191,6 +1197,17 @@ def token_multiple(
     return math.lcm(block_q, _merged_store_rows(block_q, q_per_kv, dtype))
 
 
+def _whole_rows(kv_cache, scale_cache, head_dim: int, unit_groups: int) -> bool:
+    """Whether `_kernel`'s page ring holds whole cache rows: 4-bit units over
+    rows of two KV heads (c64, DCP4), whose head's lanes alone are a strided
+    copy of 256-byte runs."""
+    return (
+        scale_cache is not None
+        and unit_groups > 1
+        and kv_cache.shape[-1] == 2 * (2 * head_dim)
+    )
+
+
 def _kernel_scratch(
     rows, head_dim, pages_per_step, kv_cache, scale_cache, transposed, unit_groups=1
 ):
@@ -1203,13 +1220,7 @@ def _kernel_scratch(
         ring = (1 + UNIT_PREFETCH) * unit_groups
     else:
         ring = 1 + (_FP4_PREFETCH if scale_cache is not None else 1)
-    # 4-bit units of rows holding two KV heads (c64, DCP4) copy whole rows: a
-    # head's lanes alone are a strided copy of 256-byte runs.
-    whole_rows = (
-        scale_cache is not None
-        and unit_groups > 1
-        and kv_cache.shape[-1] == 2 * (2 * head_dim)
-    )
+    whole_rows = _whole_rows(kv_cache, scale_cache, head_dim, unit_groups)
     if transposed:
         softmax = [(1, rows), (1, rows), (head_dim, rows)]
     elif unit_groups > 1 and rows <= head_dim:  # `fold`'s lane-replicated sums
@@ -1427,6 +1438,12 @@ def planned_attention(
             tiles_per_step=tiles_per_step,
             groups_per_tile=groups_per_tile,
             unit_groups=_unit_groups(False, num_tiles),
+            whole_rows=_whole_rows(
+                kv_cache,
+                scale_cache if fp4 else None,
+                head_dim,
+                _unit_groups(False, num_tiles),
+            ),
             kernel_limits=_kernel_limits(kv_cache),
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
