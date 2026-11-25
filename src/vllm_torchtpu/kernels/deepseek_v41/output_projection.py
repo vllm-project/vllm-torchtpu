@@ -47,13 +47,16 @@ MXU_TILE = 256
 B_ISSUE = (5, 6, 7)
 # Weight streams yield to activation and scale copies.
 WEIGHT_PRIORITY = 1
-# All of v7's VMEM. A 320-token tile fits; 384 exceeds it by 224 KiB.
+# All of v7's VMEM. A 352-token tile fits; 384 exceeds it by 224 KiB.
 VMEM_LIMIT_BYTES = 64 * 1024**2
-MAX_TILE = 320
+# The largest QUANT_ROWS multiple that fits. Every tile re-reads all 75.5 MB
+# of weights, so a 2,048-row prefill chunk takes 6 passes instead of 7 at 320
+# (v7, 40 calls each: 236 -> 222 us).
+MAX_TILE = 352
 # Just past MAX_TILE, two tiles each read the full weights, so the two-kernel
 # chain is faster until the chain's own cost catches up. v7, 50 calls each,
-# fused vs chain: T330 62.4 vs 58.0 us, T384 64.3 vs 63.3 us, T416 65.3 vs
-# 69.9 us. Token counts in (MAX_TILE, TWO_TILE_MIN) take the chain.
+# fused vs chain: T384 64.3 vs 63.3 us, T416 65.3 vs 69.9 us. Token counts in
+# (MAX_TILE, TWO_TILE_MIN) take the chain.
 TWO_TILE_MIN = 416
 # Row granule of the 2D output DMA: Mosaic rejects bf16 row slices that are
 # not whole (16, 128) tiles (v7: T = 1, 100, 300 failed to compile).
