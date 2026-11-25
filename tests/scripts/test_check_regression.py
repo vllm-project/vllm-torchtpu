@@ -681,3 +681,29 @@ def test_check_eval_reads_the_run_under_the_baselines_metric():
     result = check_regression.check_eval(only_flexible, strict, tolerance=0.02)
     assert result.failed_count == 1
     assert result.rows[0].metric == "(no exact_match,strict-match in result)"
+
+
+def test_a_pending_baseline_is_refused_even_next_to_a_real_entry(
+    tmp_path, monkeypatch, capsys
+):
+    """Marking a baseline pending refuses it whatever else it holds, so a
+    half-written file cannot gate on an entry nobody has confirmed."""
+    results_dir = tmp_path / "results"
+    results_dir.mkdir()
+    (results_dir / "results_gsm8k.json").write_text(
+        json.dumps({"results": {"gsm8k": {"exact_match,strict-match": 0.97}}})
+    )
+    baseline = tmp_path / "half.baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "_pending": "second run not merged yet",
+                "gsm8k": {
+                    "exact_match,strict-match": 0.97,
+                    "exact_match_stderr,strict-match": 0.004,
+                },
+            }
+        )
+    )
+    assert _run_cli(monkeypatch, "eval", results_dir, baseline) == 3
+    assert "baseline is pending" in capsys.readouterr().err

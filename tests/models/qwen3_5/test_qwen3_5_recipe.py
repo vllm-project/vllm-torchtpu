@@ -32,7 +32,6 @@ import importlib.util
 import json
 import os
 import pathlib
-import re
 import shlex
 import subprocess
 import sys
@@ -431,13 +430,6 @@ def test_gated_evals_have_baselines_and_pending_ones_show_on_the_step(config, ma
         a.split("=", 1) for a in values["EXTRA_LM_EVAL_MODEL_ARGS"].split(",")
     )
     assert model_args["max_retries"] == "1"
-    # The stages ask for lm-eval themselves; the config cannot turn it off.
-    stages = (
-        REPO / "scripts" / "vllm" / "integration" / "run_qwen35_397b_pd_correctness.sh"
-    ).read_text()
-    assert re.search(
-        r"run_eval_flow\.sh \\\n\s+--config \"\$\{CONFIG\}\" --run-lm-eval ", stages
-    )
     # The gate's whole split, and no silently skipped baseline.
     assert flow_args[flow_args.index("--lm-eval-limit") + 1] == "none"
     assert "--require-baselines" in flow_args

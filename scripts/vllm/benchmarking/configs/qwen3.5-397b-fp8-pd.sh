@@ -258,7 +258,8 @@ export VLLM_LOGGING_LEVEL=INFO
 export VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S:-7200}"
 
 # Raiden wiring. Per pod, so the entries do not record it; the measured runs'
-# values, which differ between the two roles so they do not collide.
+# values. These two ports are the same on both roles; the identities and port
+# bases that must differ so the roles do not collide are set per role below.
 export TPU_KV_TRANSFER_PORT=9100
 export TPU_SIDE_CHANNEL_PORT=9600
 # What the records' runs set beside it: Raiden as the KV reshard transport

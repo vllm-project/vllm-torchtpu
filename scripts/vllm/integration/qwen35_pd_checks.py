@@ -19,22 +19,25 @@ serving a different configuration from the one it claims, or while dropping
 requests that a retry hid, so the run also checks:
 
   leg-status   (on each engine's pod) the engine's own log: the kernel page
-               list each worker's platform logged at start-up (one entry, 128,
-               when the Qwen3.5 config hook pins the page), and Raiden
+               lists its processes logged at start-up (one entry, 128, when
+               the Qwen3.5 config hook pins the page), and Raiden
                layout-fingerprint mismatches. Written as JSON, which each pod
                serves over HTTP for the prefill head to read.
-  leg-check    a leg-status file or URL against the expected kernel page and
-               zero mismatches.
+  leg-check    a leg-status file or URL: at least one page list logged, every
+               one the expected page alone, and zero mismatches. The number of
+               page lines is reported, not checked: it depends on how many
+               processes derive a block size, which this check does not know.
   prefix-hit   one long prompt sent through the proxy once more than decode
                has API servers, so at least two land on one decode rank
                whatever the proxy's policy (vllm-router's consistent hash
                sends them all to one): the repeat must be served from
                decode's own prefix cache, and prefill must hit its own.
   eval-ran     the eval stage measured something: lm-eval wrote a result for
-               the task on its whole split, no request failed (a failed
-               request lm-eval retried would leave the score intact), and,
-               unless the baseline is still pending, the gate printed a row
-               for it.
+               the task on its whole split with the gate's metric (the
+               baseline's, or the result's own while the baseline is
+               pending), no request failed (a failed request lm-eval retried
+               would leave the score intact), and, unless the baseline is
+               still pending, the gate printed a row for it.
   transfer     the decode leg received prompt KV from prefill and computed
                almost none of its prompt tokens itself. Every answer would
                still be right, only slower, if the connector gave up and
@@ -50,6 +53,7 @@ when it could not measure.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import pathlib
@@ -76,8 +80,8 @@ def leg_status(log_text: str) -> dict:
 
 
 def leg_failures(status: dict, page: int) -> list[str]:
-    """Why a leg-status fails: no page logged, a page other than ``page``, or
-    any fingerprint mismatch. Empty when it passes."""
+    """Why a leg-status fails: no page list logged, a page list other than
+    ``[page]``, or any fingerprint mismatch. Empty when it passes."""
     failures = []
     pages = status.get("kernel_pages")
     if not pages:
@@ -182,10 +186,12 @@ def _long_prompt() -> str:
 def cmd_leg_status(args: argparse.Namespace) -> int:
     with open(args.log, errors="replace") as f:
         status = leg_status(f.read())
-    with open(args.out + ".tmp", "w") as f:
+    # A temporary name of this call's own, replaced whole: a reader never
+    # sees half a file, and two overlapping writers never share one.
+    tmp = f"{args.out}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
         json.dump(status, f)
-    # Replaced whole, so a reader never sees half a file.
-    os.replace(args.out + ".tmp", args.out)
+    os.replace(tmp, args.out)
     print(json.dumps(status))
     return 0
 
@@ -277,15 +283,48 @@ def _latest_result(results_dir: str, task: str) -> dict | None:
     return max(found, key=lambda item: item[0])[1] if found else None
 
 
+def _check_regression():
+    """scripts/vllm/benchmarking/check_regression.py, the gate whose metric
+    choice this check follows."""
+    name = "_qwen35_pd_check_regression"
+    if name not in sys.modules:
+        path = pathlib.Path(__file__).resolve().parents[1] / "benchmarking"
+        spec = importlib.util.spec_from_file_location(
+            name, path / "check_regression.py"
+        )
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        # Registered first: its dataclasses resolve annotations through it.
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def gate_metric(baseline: dict, task: str, result: dict) -> str | None:
+    """The metric the gate reads for ``task``: the baseline's primary one, or,
+    while the baseline is pending, the result's own. None when there is none."""
+    primary_metric = _check_regression().primary_metric
+    entry = result if "_pending" in baseline else baseline.get(task)
+    metric = primary_metric(entry) if isinstance(entry, dict) else None
+    return metric.name if metric else None
+
+
 def eval_failures(
-    results_dir: str, task: str, metric: str, flow_log: str, baseline: dict
+    results_dir: str, task: str, metric: str | None, flow_log: str, baseline: dict
 ) -> list[str]:
     """Why an eval stage measured nothing, or nothing whole. Empty when it
-    measured the task on its whole split with no failed request."""
+    measured the task on its whole split with no failed request. ``metric``
+    None takes the gate's (``gate_metric``)."""
     failures = []
     body = _latest_result(results_dir, task)
     if body is None:
         return [f"lm-eval wrote no result for {task} under {results_dir}"]
+    if metric is None:
+        metric = gate_metric(baseline, task, body["results"][task])
+        if metric is None:
+            return [
+                f"neither the {task} baseline nor its result has an accuracy metric"
+            ]
     if not isinstance(body["results"][task].get(metric), (int, float)):
         failures.append(f"the {task} result has no {metric}")
     samples = (body.get("n-samples") or {}).get(task) or {}
@@ -402,7 +441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     p = sub.add_parser("eval-ran")
     p.add_argument("--results-dir", required=True)
     p.add_argument("--task", required=True)
-    p.add_argument("--metric", required=True)
+    p.add_argument("--metric", help="default: the gate's (the baseline's metric)")
     p.add_argument("--flow-log", required=True)
     p.add_argument("--baseline", required=True)
     p.set_defaults(func=cmd_eval_ran)

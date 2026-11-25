@@ -54,6 +54,9 @@ INDEX="${PD_REPLICA_INDEX:-0}"
 read -r -a prefill_hosts <<<"$PREFILL_HOSTS"
 read -r -a decode_hosts <<<"$DECODE_HOSTS"
 
+# multihost_lib.sh's pod_setup, less TPU_SKIP_MDS_QUERY=1: the measured runs
+# did not set it, and the recipe states the one-host shape itself
+# (TPU_TOPOLOGY, TPU_HOST_BOUNDS), so the engines see what those runs saw.
 REPO_DIR="${REPO_DIR:-/workspace/vllm-torchtpu}"
 cd "$REPO_DIR" || { echo "$0: no such directory: $REPO_DIR" >&2; exit 2; }
 # Core dumps are gigabytes each and fill the pod's ephemeral storage.
@@ -154,6 +157,8 @@ fi
 
 mkdir -p "$run_dir/status"
 serve_log="$run_dir/serve.log"
+# Before tee does, so the first status write below finds it.
+: >"$serve_log"
 echo "--- Starting the ${role} engine (replica ${INDEX}) from ${CONFIG}"
 vllm serve "${SERVE_ARGS[@]}" > >(tee "$serve_log") 2>&1 &
 serve_pid=$!

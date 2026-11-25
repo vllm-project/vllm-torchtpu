@@ -355,3 +355,49 @@ def test_eval_failures_needs_a_whole_split_with_no_failed_request(
         assert failures == []
     else:
         assert any(reason in f for f in failures), failures
+
+
+def _result_dir(tmp_path, metric: str, row_metric: str | None):
+    out = tmp_path / "eval"
+    (out / "model").mkdir(parents=True)
+    stderr = metric.replace("exact_match,", "exact_match_stderr,")
+    body = {
+        "results": {"task": {metric: 0.8, stderr: 0.01}},
+        "n-samples": {"task": {"original": 100, "effective": 100}},
+    }
+    (out / "model" / "results_2026.json").write_text(json.dumps(body))
+    if row_metric:
+        (out / "eval_check_task.md").write_text(
+            f"| `task` | {row_metric} | 0.8000 | 0.8000 | 0.0141 | 0.0200 "
+            "| +0.0000 | PASS |\n"
+        )
+    return str(out)
+
+
+def test_eval_ran_reads_the_metric_from_the_baseline(tmp_path):
+    """With no --metric, a task is checked on its baseline's metric (the
+    result's own while the baseline is pending), not on gsm8k's."""
+    custom = "exact_match,custom-extract"
+    measured = {"task": {custom: 0.8, "exact_match_stderr,custom-extract": 0.01}}
+    assert (
+        checks.eval_failures(
+            _result_dir(tmp_path / "a", custom, custom), "task", None, "", measured
+        )
+        == []
+    )
+    assert (
+        checks.eval_failures(
+            _result_dir(tmp_path / "b", custom, None), "task", None, "", _PENDING
+        )
+        == []
+    )
+    # A measured strict-match baseline and a result scored on another filter.
+    strict = {"task": {_STRICT: 0.8, "exact_match_stderr,strict-match": 0.01}}
+    failures = checks.eval_failures(
+        _result_dir(tmp_path / "c", "exact_match,flexible-extract", None),
+        "task",
+        None,
+        "",
+        strict,
+    )
+    assert any("has no exact_match,strict-match" in f for f in failures), failures

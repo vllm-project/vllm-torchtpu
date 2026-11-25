@@ -29,18 +29,20 @@
 # Stage 3  gsm8k        run_eval_flow.sh --run-lm-eval, the config's
 #                       PD_EVAL_FLOW_ARGS, then qwen35_pd_checks.py eval-ran
 #   The config's LM_EVAL_TASKS (GSM8K) through the proxy against its
-#   baselines; a missing or pending baseline fails unless EVAL_SOFT_FAIL=1.
-#   The stage also fails when lm-eval wrote no result, ran less than the
-#   whole split, logged a failed request, or (baseline measured) the gate
-#   printed no row.
+#   baselines, into a results directory of this run's own. A regression or a
+#   pending baseline fails unless EVAL_SOFT_FAIL=1; a missing baseline always
+#   fails. The stage also fails when lm-eval wrote no result, ran less than
+#   the whole split, logged a failed request, or (baseline measured) the gate
+#   printed no row for the baseline's metric.
 # Stage 4  transfer     qwen35_pd_checks.py transfer
 #   Over the whole run, decode received prompt KV from prefill and computed
 #   at most PD_MAX_DECODE_COMPUTE_PCT percent of its prompt tokens itself.
 # Stage 5  mtp          qwen35_pd_checks.py mtp
 #   Decode's MTP acceptance rate is at least PD_MIN_MTP_ACCEPTANCE_RATE.
 # Stage 6  legs         qwen35_pd_checks.py leg-check
-#   Every worker of both legs ran the PD_KERNEL_PAGE_TOKENS kernel page, and
-#   neither leg logged a Raiden layout-fingerprint mismatch. Waits
+#   Each leg logged at least one kernel page list, every one of them the
+#   PD_KERNEL_PAGE_TOKENS page alone, and no Raiden layout-fingerprint
+#   mismatch. Waits
 #   LEG_STATUS_SETTLE_S (15 s) first: the engine pods refresh their status
 #   every 10 s.
 #
@@ -94,9 +96,6 @@ config_values="$(
   read -r -a EVAL_FLOW_ARGS
   read -r -a EVAL_TASKS
 } <<<"${config_values}"
-EVAL_DIR="${LOG_DIR}/eval"
-# The metric the gate reads for every task here (lm-eval gsm8k's regex filter).
-EVAL_METRIC="exact_match,strict-match"
 
 read -r -a decode_servers <<<"${DECODE_URLS}"
 decode_metrics=()
@@ -118,18 +117,24 @@ stage() {
 
 # shellcheck disable=SC2317,SC2329  # run through stage
 eval_stage() {
-  local rc=0 task flow_log="${LOG_DIR}/eval_flow.log"
+  local rc=0 task eval_dir flow_log="${LOG_DIR}/eval_flow.log"
+  # A results directory of this run's own: lm-eval and the gate read every
+  # results file under it, so one left by an earlier run into the same
+  # LOG_DIR would stand in for a run that wrote none.
+  eval_dir="$(mktemp -d "${LOG_DIR}/eval.XXXXXX")" || return 2
   # --run-lm-eval here, not from the config: without it run_eval_flow.sh runs
   # nothing and exits 0. run_benchmarks.sh sources the config to read the
   # model and the eval settings, and the config wants a role.
   PD_ROLE=prefill bash scripts/vllm/benchmarking/run_eval_flow.sh \
     --config "${CONFIG}" --run-lm-eval "${EVAL_FLOW_ARGS[@]}" --skip-benchmark \
-    --skip-db-upload --results-dir "${EVAL_DIR}" --host "${PROXY_HOST}" --port "${PROXY_PORT}" \
+    --skip-db-upload --results-dir "${eval_dir}" --host "${PROXY_HOST}" --port "${PROXY_PORT}" \
     2>&1 | tee "${flow_log}"
   rc="${PIPESTATUS[0]}"
+  # eval-ran reads each task's metric from its baseline (the result's own
+  # when the baseline is pending).
   for task in "${EVAL_TASKS[@]}"; do
-    "${checks[@]}" eval-ran --results-dir "${EVAL_DIR}" --task "${task}" \
-      --metric "${EVAL_METRIC}" --flow-log "${flow_log}" \
+    "${checks[@]}" eval-ran --results-dir "${eval_dir}" --task "${task}" \
+      --flow-log "${flow_log}" \
       --baseline "scripts/vllm/benchmarking/baselines/eval/${CONFIG}.${task}.baseline.json" || rc=1
   done
   return "${rc}"

@@ -201,7 +201,13 @@ def _leg_status(path: pathlib.Path, *lines: str) -> str:
     return str(path)
 
 
-def _run(root: pathlib.Path, knobs: str = "", baseline: dict | None = None, **env: str):
+def _run(
+    root: pathlib.Path,
+    knobs: str = "",
+    baseline: dict | None = None,
+    fresh_logs: bool = True,
+    **env: str,
+):
     tmp = root.parent
     if baseline is not None:
         (root / _BASELINE).write_text(json.dumps(baseline))
@@ -225,7 +231,8 @@ def _run(root: pathlib.Path, knobs: str = "", baseline: dict | None = None, **en
         "LEG_STATUS_SETTLE_S": "0",
         **env,
     }
-    shutil.rmtree(tmp / "logs", ignore_errors=True)
+    if fresh_logs:
+        shutil.rmtree(tmp / "logs", ignore_errors=True)
     try:
         proc = subprocess.run(
             ["bash", "scripts/vllm/integration/run_qwen35_397b_pd_correctness.sh"],
@@ -296,3 +303,16 @@ def test_a_pending_baseline_only_warns_under_eval_soft_fail(sandbox):
     assert proc.returncode == 0, proc.stdout[-3000:]
     assert set(stages.values()) == {0}
     assert "baseline is pending" in proc.stdout
+
+
+def test_a_rerun_into_the_same_log_dir_cannot_pass_on_the_last_score(sandbox):
+    """lm-eval exiting 0 with no result, after a good run into the same
+    LOG_DIR, must fail the stage, not pass on the earlier run's results."""
+    proc, stages = _run(sandbox, baseline=_MEASURED)
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    proc, stages = _run(
+        sandbox, baseline=_MEASURED, fresh_logs=False, FAKE_LM_EVAL="noresults"
+    )
+    assert proc.returncode == 1, proc.stdout[-3000:]
+    assert {k for k, v in stages.items() if v} == {"gsm8k"}
+    assert "lm-eval wrote no result for gsm8k" in proc.stdout

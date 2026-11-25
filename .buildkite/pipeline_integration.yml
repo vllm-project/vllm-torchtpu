@@ -289,9 +289,10 @@ steps:
       # Kueue holds them for. The step timeout covers that wait, and the launcher's
       # limits run to hours.
       #
-      # None uploads artifacts. The pod is deleted when the run ends and these
-      # submit a manifest rather than going through run.sh's upload wrapper, so the
-      # logs are the record - as for the multihost step above.
+      # The two below upload no artifacts. The pod is deleted when the run ends and
+      # these submit a manifest rather than going through run.sh's upload wrapper,
+      # so the logs are the record - as for the multihost step above. (The
+      # Qwen3.5-397B C3 step further down uploads its own, from its prefill pod.)
       - label: "Integration: qwen35-pcp8-2tp4dp-disagg-correctness"
         key: "integration_qwen35_pcp8_2tp4dp_disagg_correctness"
         <<: *integration_step
