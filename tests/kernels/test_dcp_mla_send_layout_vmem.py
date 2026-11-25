@@ -82,6 +82,10 @@ def _mla_call(monkeypatch, cap, *, tokens, topk, topk_cap, batch, **kwargs):
     sds = jax.ShapeDtypeStruct
     with jax.sharding.use_abstract_mesh(TPU7X):
         lowered = _lower(sds, tokens, topk, topk_cap, batch, kwargs)
+    return _the_mla_call(lowered)
+
+
+def _the_mla_call(lowered):
     calls = [
         (m.group(1), m.group(2))
         for line in lowered.as_text().splitlines()
@@ -115,9 +119,8 @@ def _lower(sds, tokens, topk, topk_cap, batch, kwargs):
         is_dcp_mode=True,
         lse_lane_dense=True,
         lse_mask_empty=True,
-        lse_in_kernel=True,
         decode_body_levers=sparse_mla.DECODE_BODY_DEFAULT,
-        **kwargs,
+        **{"lse_in_kernel": True, **kwargs},
     ).lower(lowering_platforms=("tpu",))
 
 
@@ -181,3 +184,128 @@ def test_lse_calls_unchanged_with_flag_on(monkeypatch, tokens):
     name, config = _mla_call(monkeypatch, True, tokens=tokens, **LSE)
     assert "-xa2a" not in name and "-ov" not in name, name
     _default_unpinned(config)
+
+
+def test_out_vmem_call_untouched(monkeypatch):
+    # The 64-token -ov call (out_vmem): the same lowering with the flag off and
+    # on, its own 32 MiB limit and VMEM outputs.
+    ov = dict(
+        tokens=64,
+        topk=2048,
+        topk_cap=512,
+        batch=16,
+        gather_and_attention_chunk_size=64,
+        lse_in_kernel=False,
+        out_vmem=32 * 1024 * 1024,
+    )
+    name, off = _mla_call(monkeypatch, False, **ov)
+    _, on = _mla_call(monkeypatch, True, **ov)
+    assert name.endswith("-ov"), name
+    assert on == off
+    assert off["scoped_memory_configs"][0]["size"] == 32 * 1024 * 1024
+    assert off["custom_call_config"]["output_memory_space_colors"] == [
+        {"color": 1, "shape_index": [0]},
+        {"color": 1, "shape_index": [1]},
+    ]
+
+
+def _exchange_call(monkeypatch, cap):
+    """The 16-token fused-exchange (-xa2a) call with the gathered KV pinned at
+    32 MiB, as served: sparse_attention_chunk on pre-gathered KV inside a
+    shard_map over the (dcp_lane 2, dcp 8) mesh."""
+    monkeypatch.setenv(FLAG, "1" if cap else "0")
+    jax.clear_caches()
+    tokens, cap_rows, topk, world = 16, 512, 2048, 8
+    windows = topk // cap_rows
+    mesh = jax.sharding.AbstractMesh(
+        (2, world),
+        ("dcp_lane", "dcp"),
+        abstract_device=TPU7X.abstract_device,
+    )
+    spec = jax.sharding.PartitionSpec(("dcp_lane", "dcp"))
+    n = 2 * world
+    shapes = (
+        ((n, tokens, HEADS, 512), jnp.bfloat16),
+        ((n, tokens, HEADS, sparse_mla.Q_ROPE_HEAD_DIM), jnp.bfloat16),
+        ((n, tokens, 2, 128), jnp.float32),
+        ((n, windows * tokens, cap_rows, 128), jnp.uint32),
+        ((n, windows * tokens, cap_rows // 4, 128), jnp.uint32),
+        ((n, tokens), jnp.int32),
+        ((n,), jnp.int32),
+        ((n,), jnp.int32),
+    )
+
+    def body(q, q_pe, tab, nope, rope, kv_lens, rank, lane):
+        q, q_pe, tab, nope, rope, kv_lens = (
+            a[0] for a in (q, q_pe, tab, nope, rope, kv_lens)
+        )
+        out = sparse_mla.sparse_attention_chunk(
+            q,
+            nope,
+            rope,
+            kv_lens,
+            None,
+            None,
+            start_pos=0,
+            end_pos=tokens,
+            token_end=jnp.int32(tokens),
+            sm_scale=1 / 24,
+            k_scale=0.1,
+            cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            small_chunk_tokens=0,
+            attention_kernel_batch_size=tokens,
+            topk_cap=cap_rows,
+            topk_override=topk,
+            is_dcp_mode=True,
+            q_pe=q_pe,
+            lse_lane_dense=True,
+            lse_mask_empty=True,
+            row_widths=(128, 256, 384),
+            row_levers=sparse_mla.DECODE_BODY_DEFAULT,
+            q_rope_table=tab,
+            lse_fill=True,
+            send_world=world,
+            pre_gathered=(nope, rope, None),
+            send_exchange=("dcp", "dcp_lane", 32 * 1024 * 1024, ("kv",)),
+            send_peer=jnp.stack([rank[0], lane[0]]),
+        )
+        return out[1][None]
+
+    fn = jax.shard_map(
+        body, mesh=mesh, in_specs=(spec,) * len(shapes), out_specs=spec, check_vma=False
+    )
+    sharding = jax.sharding.NamedSharding(mesh, spec)
+    with jax.sharding.use_abstract_mesh(mesh):
+        lowered = (
+            jax.jit(fn)
+            .trace(*(jax.ShapeDtypeStruct(s, d, sharding=sharding) for s, d in shapes))
+            .lower(lowering_platforms=("tpu",))
+        )
+    return _the_mla_call(lowered)
+
+
+def test_fused_exchange_call_untouched(monkeypatch):
+    name, off = _exchange_call(monkeypatch, False)
+    _, on = _exchange_call(monkeypatch, True)
+    assert name.endswith("-xa2a"), name
+    assert on == off
+    assert off["scoped_memory_configs"][0]["size"] == 32 * 1024 * 1024
+    # Its own pins: the gathered NOPE and ROPE KV (operands 4 and 5) in HBM.
+    assert off["custom_call_config"]["input_memory_space_colors"] == [
+        {"operand_index": 4, "color": 0},
+        {"operand_index": 5, "color": 0},
+    ]
+
+
+def test_flag_is_in_the_compile_key(monkeypatch):
+    # Every registered env var not in _TPU_COMPILE_ENV_IGNORED is a compile-key
+    # factor, so the flag's two values compile into separate caches.
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    assert FLAG not in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    monkeypatch.setenv(FLAG, "0")
+    off = tpu_compiler._tpu_compile_env_factors()
+    monkeypatch.setenv(FLAG, "1")
+    on = tpu_compiler._tpu_compile_env_factors()
+    assert (off[FLAG], on[FLAG]) == (False, True)
+    assert on != off

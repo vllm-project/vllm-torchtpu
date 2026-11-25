@@ -803,12 +803,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefetches it may run under the call). The kernel's scratch is ~13 MiB
     # at T = 64; 32 is the pinned fused small all-to-all calls' limit.
     "TPU_DCP_MLA_OUT_VMEM_MIB": env_int("TPU_DCP_MLA_OUT_VMEM_MIB", 32),
-    # The send-layout decode MLA call (TPU_DCP_MLA_SEND_LAYOUT without the
-    # fused small all-to-all and without TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS; the
-    # 32-token bucket on 4-chip DCP8) takes a 32 MiB scoped VMEM limit, never
-    # below its own scratch plus 8 MiB, instead of all of VMEM, so XLA can keep
-    # o_proj's weight prefetch live across it; its array operands and its send
-    # buffer stay in HBM. Same bits; placement only. Off: unchanged kernel.
+    # The send-layout decode MLA call without the fused small all-to-all
+    # (TPU_DCP_MLA_SEND_LAYOUT; the 32-token bucket on 4-chip DCP8; such calls
+    # never take TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS' path) takes a 32 MiB scoped
+    # VMEM limit, never below its own scratch plus 8 MiB, instead of all of
+    # VMEM, so XLA can keep o_proj's weight prefetch live across it; its array
+    # operands and its send buffer stay in HBM. Same bits; placement only. Off:
+    # unchanged kernel. The kernel reads it at trace time, so set it before the
+    # process starts.
     "TPU_MLA_SEND_LAYOUT_VMEM_CAP": env_bool(
         "TPU_MLA_SEND_LAYOUT_VMEM_CAP", default=False
     ),

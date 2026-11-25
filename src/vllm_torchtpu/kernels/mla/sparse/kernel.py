@@ -4834,30 +4834,6 @@ def prepare_gather_indices(
     return kv_lens, physical_indices
 
 
-# TPU_MLA_SEND_LAYOUT_VMEM_CAP: scoped VMEM of the send-layout call without the
-# fused exchange (`send_world` without `send_exchange`; about 11 MiB of scratch
-# at T = 32). The default limit reserves all of VMEM for the call, so no XLA
-# prefetch (o_proj's weight) can stay live across it and the copy waits for the
-# call to end. As for the fused exchange, its array operands and the send
-# buffer are pinned to HBM: XLA would otherwise stage the gathered KV into VMEM
-# before the call and evict the send buffer to HBM after it, both with exposed
-# copies. Off: the call keeps the default limit and no pins.
-SEND_LAYOUT_VMEM_LIMIT_BYTES = 32 * 1024 * 1024
-# The send-layout cap never goes below the call's own VMEM scratch plus this
-# margin for Mosaic's internal scratch (a margin, not a measured value), so a
-# larger batch or top-k cap raises the limit instead of failing to compile.
-SEND_LAYOUT_VMEM_HEADROOM_BYTES = 8 * 1024 * 1024
-
-
-def _vmem_scratch_bytes(scratch_shapes) -> int:
-    """Bytes of the VMEM entries of a pallas_call's `scratch_shapes`."""
-    return sum(
-        int(np.prod(s.shape)) * get_dtype_bitwidth(s.dtype) // 8
-        for s in scratch_shapes
-        if s.memory_space == pltpu.VMEM
-    )
-
-
 def sparse_attention_chunk(
     q: jax.Array,  # [max_num_tokens, num_q_heads, head_dim], padded
     # TensorCore: u8[pages, page_size, 4, 128].
@@ -5034,15 +5010,7 @@ def sparse_attention_chunk(
         is_dcp_mode: bool = False,
         live_views: tuple[jax.Array, jax.Array] | None = None,
     ):
-        from vllm_torchtpu import envs
-
         batch_size = kernel_batch_size
-        # SEND_LAYOUT_VMEM_LIMIT_BYTES, read at trace time.
-        send_layout_cap = (
-            bool(send_world)
-            and send_exchange is None
-            and envs.TPU_MLA_SEND_LAYOUT_VMEM_CAP
-        )
         out_rows, out_offset, out_carried = (
             (q.shape[0], 0, None) if out_piece is None else out_piece
         )
@@ -5368,16 +5336,7 @@ def sparse_attention_chunk(
                             else SEND_EXCHANGE_VMEM_LIMIT_BYTES,
                         )
                         if send_exchange is not None
-                        else min(
-                            vmem_limit_bytes,
-                            max(
-                                SEND_LAYOUT_VMEM_LIMIT_BYTES,
-                                _vmem_scratch_bytes(scratch_shapes)
-                                + SEND_LAYOUT_VMEM_HEADROOM_BYTES,
-                            ),
-                        )
-                        if send_layout_cap
-                        else vmem_limit_bytes
+                        else _send_vmem(vmem_limit_bytes, send_world, scratch_shapes)
                     ),
                     disable_bounds_checks=True,
                     # pyrefly: ignore[bad-argument-type]
@@ -5418,15 +5377,7 @@ def sparse_attention_chunk(
                             dtype=jnp.int16,
                         )
                         if send_exchange is not None
-                        # SEND_LAYOUT_VMEM_LIMIT_BYTES: the send buffer in HBM.
-                        else pltpu.HBM(
-                            send_layout_shape(
-                                q.shape[0], num_q_heads, send_world, q.shape[-1]
-                            ),
-                            jnp.int16,
-                        )
-                        if send_layout_cap
-                        else jax.ShapeDtypeStruct(
+                        else _send_buffer_shape(
                             shape=send_layout_shape(
                                 q.shape[0], num_q_heads, send_world, q.shape[-1]
                             ),
@@ -5483,8 +5434,8 @@ def sparse_attention_chunk(
         if out_carried is not None:
             operands.append(out_carried)
             roles.append("out")
-        if send_exchange is not None:
-            pin = send_exchange[3] if len(send_exchange) > 3 else True
+        if send_exchange is not None or _send_cap(send_world):
+            pin = send_exchange[3] if send_exchange and len(send_exchange) > 3 else True
             # True: every array operand; a tuple of roles (SEND_EXCHANGE_PIN_ROLES):
             # only those -- e.g. ("kv",) keeps the gathered KV in HBM (XLA would
             # stage it into VMEM ahead of the call) and leaves q where XLA puts it.
@@ -5493,11 +5444,6 @@ def sparse_attention_chunk(
                 if pin is True or (pin and r in pin)
                 else x
                 for x, r in zip(operands, roles)
-            ]
-        elif send_layout_cap:
-            # SEND_LAYOUT_VMEM_LIMIT_BYTES: every array operand stays in HBM.
-            operands = [
-                pltpu.with_memory_space_constraint(x, pltpu.HBM) for x in operands
             ]
         if out_vmem:
             operands = [
@@ -5759,3 +5705,59 @@ def sparse_attention_chunk(
     if kv_write is not None:
         return result, (cache_kv_nope, cache_kv_rope)
     return result
+
+
+# TPU_MLA_SEND_LAYOUT_VMEM_CAP: the send-layout call without the fused exchange
+# (`send_world` without `send_exchange`; `out_vmem` never comes with
+# `send_world`, sparse_attention_chunk rejects the pair) takes a scoped VMEM
+# limit of SEND_LAYOUT_VMEM_LIMIT_BYTES instead of the default, which reserves
+# all of VMEM for the call, so no XLA prefetch (o_proj's weight) can stay live
+# across it and the copy waits for the call to end. As for the fused exchange,
+# its array operands and its send buffer are pinned to HBM: XLA would otherwise
+# stage the gathered KV into VMEM before the call and evict the send buffer to
+# HBM after it, both with exposed copies. These helpers sit after the kernels
+# so that no line above them moves: with the flag off the lowered program is
+# the one without them, debug locations included.
+SEND_LAYOUT_VMEM_LIMIT_BYTES = 32 * 1024 * 1024
+# The cap never goes below the call's own VMEM scratch plus this margin for
+# Mosaic's internal scratch (a margin, not a measured value), so a larger batch
+# or top-k cap raises the limit instead of failing to compile.
+SEND_LAYOUT_VMEM_HEADROOM_BYTES = 8 * 1024 * 1024
+
+
+def _send_cap(send_world: int) -> bool:
+    """Whether a send-layout call without the fused exchange (the only callers)
+    takes the cap. Read at trace time."""
+    from vllm_torchtpu import envs
+
+    return bool(send_world) and envs.TPU_MLA_SEND_LAYOUT_VMEM_CAP
+
+
+def _vmem_scratch_bytes(scratch_shapes) -> int:
+    """Bytes of the VMEM entries of a pallas_call's `scratch_shapes`."""
+    return sum(
+        int(np.prod(s.shape)) * get_dtype_bitwidth(s.dtype) // 8
+        for s in scratch_shapes
+        if s.memory_space == pltpu.VMEM
+    )
+
+
+def _send_vmem(vmem_limit_bytes: int, send_world: int, scratch_shapes) -> int:
+    """Scoped VMEM limit of a call without the fused exchange or out_vmem."""
+    if not _send_cap(send_world):
+        return vmem_limit_bytes
+    return min(
+        vmem_limit_bytes,
+        max(
+            SEND_LAYOUT_VMEM_LIMIT_BYTES,
+            _vmem_scratch_bytes(scratch_shapes) + SEND_LAYOUT_VMEM_HEADROOM_BYTES,
+        ),
+    )
+
+
+def _send_buffer_shape(*, shape, dtype):
+    """The send buffer's out_shape on the send layout without the fused
+    exchange (its only caller)."""
+    if _send_cap(True):
+        return pltpu.HBM(shape, dtype)
+    return jax.ShapeDtypeStruct(shape=shape, dtype=dtype)
