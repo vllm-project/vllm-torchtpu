@@ -123,7 +123,7 @@ exec vllm serve "${MODEL_URI}" \
   --attention-config '{"indexer_kv_dtype":"fp8"}' \
   --engram-config '{"cpu_offload":true}' \
   --additional-config '{"deepseek_v41":{"execution":"ced","moe":"fused_ep_w4a8"}}' \
-  --block-size 16 \
+  --block-size "${BLOCK_SIZE:-256}" \
   --max-num-batched-tokens "${MAX_BATCHED_TOKENS:-2048}" --max-num-seqs "${MAX_NUM_SEQS:-16}" \
   "${KV_ARGS[@]}" "${MML_ARGS[@]}" \
   --compilation-config "{\"compile_sizes\":${COMPILE_SIZES}}" \
