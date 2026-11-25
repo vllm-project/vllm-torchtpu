@@ -70,7 +70,7 @@ def _attn_spec() -> FullAttentionSpec:
     )
 
 
-def _gdn_spec(
+def _mamba_spec(
     spec_cls=MambaSpec,
     mamba_cache_mode: str = "none",
     mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
@@ -121,7 +121,7 @@ def runner_slot_registered():
 @pytest.mark.parametrize("mamba_type", [GDN, KDA], ids=["gdn", "kda"])
 class TestGate:
     def test_opt_out_keeps_spec(self, opt_out, mamba_type):
-        spec = _gdn_spec(mamba_type=mamba_type)
+        spec = _mamba_spec(mamba_type=mamba_type)
         out = maybe_runner_slot_mamba_spec(spec, _vllm_config(), runner_owns_slots=True)
         assert out is spec
 
@@ -131,7 +131,7 @@ class TestGate:
             monkeypatch.delenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", raising=False)
         else:
             monkeypatch.setenv("TPU_SKIP_MAMBA_SCHEDULER_BLOCKS", env_value)
-        spec = _gdn_spec(mamba_type=mamba_type)
+        spec = _mamba_spec(mamba_type=mamba_type)
         out = maybe_runner_slot_mamba_spec(spec, _vllm_config(), runner_owns_slots=True)
         assert type(out) is RunnerSlotMambaSpec
         assert isinstance(out, MambaSpec)
@@ -152,7 +152,7 @@ class TestGate:
     def test_ineligible_keeps_stock_spec(
         self, flag_default, config_kwargs, owns_slots, reason, mamba_type
     ):
-        spec = _gdn_spec(
+        spec = _mamba_spec(
             mamba_cache_mode=config_kwargs.get("mamba_cache_mode", "none"),
             mamba_type=mamba_type,
         )
@@ -169,7 +169,7 @@ class TestGate:
         class OtherMambaSpec(MambaSpec):
             extra: int = 0
 
-        spec = _gdn_spec(OtherMambaSpec, mamba_type=mamba_type)
+        spec = _mamba_spec(OtherMambaSpec, mamba_type=mamba_type)
         with patch.object(runner_slot_mamba.logger, "debug_once") as log:
             out = maybe_runner_slot_mamba_spec(
                 spec, _vllm_config(), runner_owns_slots=True
@@ -180,7 +180,7 @@ class TestGate:
 
 class TestGateOtherLayers:
     def test_other_mamba_keeps_stock_spec(self, flag_default):
-        spec = _gdn_spec(mamba_type=MambaAttentionBackendEnum.MAMBA2)
+        spec = _mamba_spec(mamba_type=MambaAttentionBackendEnum.MAMBA2)
         with patch.object(runner_slot_mamba.logger, "debug_once") as log:
             out = maybe_runner_slot_mamba_spec(
                 spec, _vllm_config(), runner_owns_slots=True
@@ -203,13 +203,13 @@ class TestSlotGroupCheck:
     runner's slot pool, or every request would read and write block 0."""
 
     @staticmethod
-    def _config(gdn_spec_cls) -> KVCacheConfig:
+    def _config(spec_cls) -> KVCacheConfig:
         return KVCacheConfig(
             num_blocks=8,
             kv_cache_tensors=[],
             kv_cache_groups=[
                 KVCacheGroupSpec(["attn_0"], _attn_spec()),
-                KVCacheGroupSpec(["gdn_0"], _gdn_spec(gdn_spec_cls)),
+                KVCacheGroupSpec(["gdn_0"], _mamba_spec(spec_cls)),
             ],
         )
 
@@ -239,18 +239,18 @@ class TestRegistration:
         hook = MagicMock(wraps=TpuPlatform.register_custom_kv_cache_specs)
         monkeypatch.setattr(TpuPlatform, "register_custom_kv_cache_specs", hook)
 
-        spec = _gdn_spec(RunnerSlotMambaSpec)
+        spec = _mamba_spec(RunnerSlotMambaSpec)
         assert KVCacheSpecRegistry.get_manager_class(spec) is RunnerSlotMambaManager
         hook.assert_called_once()
         assert KVCacheSpecRegistry.get_uniform_type_base_spec(spec) is MambaSpec
-        assert KVCacheSpecRegistry.get_manager_class(_gdn_spec()) is MambaManager
+        assert KVCacheSpecRegistry.get_manager_class(_mamba_spec()) is MambaManager
 
     def test_platform_hook_is_idempotent(self):
         # The hook may run again (another process, another config).
         KVCacheSpecRegistry.get_manager_class(_attn_spec())
         TpuPlatform.register_custom_kv_cache_specs(MagicMock())
         TpuPlatform.register_custom_kv_cache_specs(MagicMock())
-        spec = _gdn_spec(RunnerSlotMambaSpec)
+        spec = _mamba_spec(RunnerSlotMambaSpec)
         assert KVCacheSpecRegistry.get_manager_class(spec) is RunnerSlotMambaManager
 
     def test_flag_stays_out_of_compile_cache_key(self):
@@ -271,7 +271,10 @@ class TestRegistration:
         vllm_config.scheduler_config.disable_hybrid_kv_cache_manager = False
         specs = {"attn_0": _attn_spec()}
         specs.update(
-            {f"gdn_{i}": _gdn_spec(RunnerSlotMambaSpec) for i in range(NUM_GDN_GROUPS)}
+            {
+                f"gdn_{i}": _mamba_spec(RunnerSlotMambaSpec)
+                for i in range(NUM_GDN_GROUPS)
+            }
         )
         groups = get_kv_cache_groups(vllm_config, specs)
         gdn_groups = [g for g in groups if isinstance(g.kv_cache_spec, MambaSpec)]
@@ -286,7 +289,7 @@ class TestSchedulerAccounting:
 
     def _manager(
         self,
-        gdn_spec_cls,
+        spec_cls,
         num_blocks: int = 131,
         mamba_type=GDN,
         num_mamba_groups: int = NUM_GDN_GROUPS,
@@ -294,7 +297,7 @@ class TestSchedulerAccounting:
         groups = [KVCacheGroupSpec(["attn_0"], _attn_spec())]
         groups += [
             KVCacheGroupSpec(
-                [f"mamba_{i}"], _gdn_spec(gdn_spec_cls, mamba_type=mamba_type)
+                [f"mamba_{i}"], _mamba_spec(spec_cls, mamba_type=mamba_type)
             )
             for i in range(num_mamba_groups)
         ]

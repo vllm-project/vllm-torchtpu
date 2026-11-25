@@ -118,7 +118,12 @@ class RunnerSlotMambaManager(MambaManager):
 
 
 # The layer types whose ops index state by the runner's slot ids on the compact
-# layout: GDN, and KDA (which reports LINEAR).
+# layout: GDN, and KDA (which reports LINEAR). The only LINEAR layers that run
+# on this plugin are the KDA layers (Kimi, OLMo 3.5). Upstream vLLM's other
+# LINEAR layer, MiniMax-Text-01's lightning attention, runs Triton kernels and
+# is not served here; a new LINEAR layer must index its state by
+# `mamba_state_indices` on the compact layout, or this gate needs a narrower
+# check.
 _RUNNER_SLOT_MAMBA_TYPES = frozenset(
     {MambaAttentionBackendEnum.GDN_ATTN, MambaAttentionBackendEnum.LINEAR}
 )
