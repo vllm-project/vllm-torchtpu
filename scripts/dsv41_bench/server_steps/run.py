@@ -108,6 +108,40 @@ def bootstrap_ports(env: dict[str, str], out: Path) -> None:
     raise RuntimeError("No available ten-port bootstrap block")
 
 
+# torch_tpu fixes tier 2 at <TIER2_PARENT>/<name>/; only the name is settable.
+TIER2_PARENT = Path("/dev/shm/torch_tpu_cache")
+TIER2_NAME = "dsv41-bench"
+
+
+def compile_cache_env(cache_dir: str | None) -> dict[str, str]:
+    """torch_tpu's executable cache: off, or kept in cache_dir across launches.
+
+    An entry's key covers the graph, every Pallas kernel's MLIR, the shapes,
+    XLA_FLAGS and LIBTPU_INIT_ARGS, so an edited kernel misses instead of
+    reusing a stale executable. torch_tpu reads tier 3 (cache_dir/tier3) only
+    with tier 2 on, and a symlink keeps tier 2 on disk (cache_dir/tier2).
+    """
+    if not cache_dir:
+        return {
+            "TORCH_TPU_TIER2_COMPILATION_CACHE": "disabled",
+            "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE": "disabled",
+        }
+    root = Path(cache_dir).resolve()
+    (root / "tier2").mkdir(parents=True, exist_ok=True)
+    link = TIER2_PARENT / TIER2_NAME
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink():
+        link.unlink()
+    elif link.exists():
+        shutil.rmtree(link)
+    link.symlink_to(root / "tier2")
+    return {
+        "TORCH_TPU_TIER2_COMPILATION_CACHE": TIER2_NAME,
+        "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE": TIER2_NAME,
+        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": str(root / "tier3"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
@@ -164,19 +198,15 @@ def main() -> None:
         "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
     ):
         env.pop(key, None)
-    # Opt-in for iteration (workbench): torch_tpu's executable cache is keyed
-    # by HLO content, so unchanged graphs skip compilation across launches.
-    # vLLM's dynamo cache stays per launch: it is filed by rank role.
-    tier3_root = os.environ.get("DSV41_BENCH_TIER3_CACHE_ROOT")
-    if tier3_root:
-        env["TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"] = tier3_root
+    # Opt-in for iteration (workbench). vLLM's dynamo cache stays per launch:
+    # it is filed by rank role.
+    cache_dir = os.environ.get("DSV41_BENCH_COMPILE_CACHE_DIR")
+    env.update(compile_cache_env(cache_dir))
     env.update(
         VLLM_DISABLE_COMPILE_CACHE="1",
         JAX_ENABLE_COMPILATION_CACHE="false",
         TORCHINDUCTOR_FORCE_DISABLE_CACHES="1",
         TORCHINDUCTOR_AUTOGRAD_CACHE="0",
-        TORCH_TPU_TIER2_COMPILATION_CACHE="disabled",
-        TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="disabled",
     )
     env["KV_BYTES"] = "auto"
     env["MOE_FUSED_EP_PREPROCESS_BACKEND"] = "topology" if decode else "native"
@@ -272,10 +302,10 @@ def main() -> None:
     manifest = {
         "scenario": args.scenario,
         "compile_sizes": buckets,
-        "cache_mode": "tier3" if tier3_root else "disabled",
+        "cache_mode": "tier3" if cache_dir else "disabled",
         "serialization": "enabled",
         "engram_transfer": "raw_dma",
-        "tier2": "disabled (public and internal)",
+        "tier2": env["TORCH_TPU_TIER2_COMPILATION_CACHE"],
         "packages": {
             name: importlib.metadata.version(name)
             for name in [

@@ -332,6 +332,24 @@ def test_ci_launch_and_optional_profile_share_one_server(
     assert status["completed"] == (profile != "failed")
 
 
+@pytest.mark.parametrize("stale", [None, "dir", "link"])
+def test_compile_cache_opt_in_keeps_tier2_on_and_on_disk(tmp_path, monkeypatch, stale):
+    # torch_tpu ignores the tier-3 root while tier 2 is disabled.
+    assert "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT" not in launcher.compile_cache_env(None)
+    monkeypatch.setattr(launcher, "TIER2_PARENT", tmp_path / "shm")
+    link = tmp_path / "shm" / launcher.TIER2_NAME
+    link.parent.mkdir()
+    if stale == "dir":
+        link.mkdir()
+    elif stale == "link":
+        link.symlink_to(tmp_path)
+    env = launcher.compile_cache_env(str(tmp_path / "cache"))
+    assert env["TORCH_TPU_TIER2_COMPILATION_CACHE"] == launcher.TIER2_NAME
+    assert env["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] == launcher.TIER2_NAME
+    assert env["TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT"] == str(tmp_path / "cache/tier3")
+    assert link.resolve() == tmp_path / "cache/tier2"
+
+
 def test_dp16_ci_launch_keeps_local_shapes_and_selects_hbm(tmp_path, monkeypatch):
     test_ci_launch_and_optional_profile_share_one_server(
         tmp_path,
