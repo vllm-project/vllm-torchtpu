@@ -108,6 +108,8 @@ def materialize_upstream_kv_cache(
     layout,
     *,
     word_rows=False,
+    csa2_layers: frozenset[str] = frozenset(),
+    swa_word_layers: frozenset[str] = frozenset(),
 ) -> MaterializedNativeKVCache:
     """Keep upstream placements, with one TPU input per shared physical region."""
     from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index

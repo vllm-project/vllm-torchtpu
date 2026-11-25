@@ -1380,6 +1380,22 @@ class KVCacheManager:
                     self.runner.device,
                     self.runner.cache_config.get_resolved_kv_cache_layout(),
                     word_rows=True,
+                    # Stage-3 transfer reads the per-layer SWA page layout
+                    # from these (raiden/pool_manifest.py).
+                    csa2_layers=frozenset(
+                        name
+                        for name, module in (
+                            self.runner.vllm_config.compilation_config.static_forward_context.items()  # noqa: E501
+                        )
+                        if getattr(module, "_csa2", False) is True
+                    ),
+                    swa_word_layers=frozenset(
+                        name
+                        for name, module in (
+                            self.runner.vllm_config.compilation_config.static_forward_context.items()  # noqa: E501
+                        )
+                        if getattr(module, "_tpu_swa_words", False) is True
+                    ),
                 )
                 native_scale_pools = materialized.scale_pools
             else:
