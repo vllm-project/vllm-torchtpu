@@ -183,6 +183,24 @@ def test_prepare_singlehost_tpu_env_skips_distributed_bootstrap_for_tp1(monkeypa
     assert "WORLD_SIZE" not in os.environ
 
 
+def test_has_tpu_topology_handles_runtime_error_and_cpu_none(monkeypatch):
+    """_has_tpu_topology returns False only when hardware rejects the count."""
+    with patch.object(
+        tpu_platform.hardware, "get_tpu_topology", return_value="1,1,1,2"
+    ):
+        assert TpuPlatform._has_tpu_topology(2) is True
+
+    with patch.object(tpu_platform.hardware, "get_tpu_topology", return_value=None):
+        assert TpuPlatform._has_tpu_topology(2) is True
+
+    with patch.object(
+        tpu_platform.hardware,
+        "get_tpu_topology",
+        side_effect=RuntimeError("No TPU topology found for count: 1"),
+    ):
+        assert TpuPlatform._has_tpu_topology(1) is False
+
+
 def test_prepare_singlehost_tpu_env_keeps_inherited_slice_bootstrap(monkeypatch):
     """A DP engine must not clear the slice env it inherited from the parent."""
     monkeypatch.setenv("WORLD_SIZE", "8")

@@ -209,6 +209,21 @@ def _slice_binding_from_env(
     )
 
 
+def uses_unified_dp_slice(parallel_config) -> bool:
+    """Return True when DP workers must bootstrap a single shared TPU slice.
+
+    Expert-parallel DP always needs a shared slice for cross-replica expert
+    collectives. Dense DP normally isolates each replica to its own sub-slice
+    of size ``parallel_config.world_size``, unless that sub-slice size has no
+    standalone TPU topology (e.g. TP=1 on dual-core TPU v7x).
+    """
+    if parallel_config.enable_expert_parallel:
+        return True
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    return not TpuPlatform._has_tpu_topology(parallel_config.world_size)
+
+
 def get_tpu_worker_binding(
     parallel_config,
     rank: int,
@@ -226,7 +241,7 @@ def get_tpu_worker_binding(
 
     rank = int(rank)
     local_rank = int(local_rank)
-    if dp_size > 1 and parallel_config.enable_expert_parallel:
+    if dp_size > 1 and uses_unified_dp_slice(parallel_config):
         dp_rank = parallel_config.data_parallel_index
         assert dp_rank is not None, (
             "ParallelConfig.data_parallel_index must be resolved when "

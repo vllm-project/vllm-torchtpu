@@ -57,7 +57,10 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
-from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
+from vllm_torchtpu.worker.tpu_rank_binding import (
+    get_tpu_worker_binding,
+    uses_unified_dp_slice,
+)
 
 logger = init_logger(__name__)
 
@@ -234,8 +237,13 @@ class TPUWorker(WorkerBase):
             dp_rank = binding.dp_rank
 
             # TorchTPU uses independent per-engine tpu_dist worlds unless EP
-            # needs a unified DP*TP world for expert collectives.
-            if pc.enable_expert_parallel:
+            # needs a unified DP*TP world or the per-engine world lacks a
+            # standalone TPU topology (e.g. TP=1 on dual-core TPU v7x).
+            # utils.dp_engines_in_lockstep() still keys on
+            # enable_expert_parallel, so dense DP engines remain independently
+            # schedulable without cross-replica step sync.
+            unified_dp_slice = uses_unified_dp_slice(pc)
+            if unified_dp_slice:
                 pc.data_parallel_size = dp_size
                 pc.data_parallel_rank = dp_rank
                 if pc.data_parallel_rank_local is None:
@@ -257,7 +265,7 @@ class TPUWorker(WorkerBase):
             os.environ["MASTER_ADDR"] = str(master_addr)
             os.environ["MASTER_PORT"] = str(master_port)
 
-            if pc.enable_expert_parallel:
+            if unified_dp_slice:
                 # Setting data_parallel_size above puts
                 # init_distributed_environment() on its DP path, where it
                 # discards the rank and the init method it was handed and

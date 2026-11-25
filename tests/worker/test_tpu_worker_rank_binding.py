@@ -453,3 +453,68 @@ def test_executor_slice_binding_rejects_pcp():
 
     with pytest.raises(NotImplementedError, match="context parallelism"):
         binding.get_tpu_worker_binding(pc, rank=1, local_rank=1, env=env)
+
+
+def test_dense_dp_without_standalone_topology_uses_unified_slice(monkeypatch):
+    """Dense DP (e.g. TP=1 x DP=8 on dual-core TPU v7x) must use the unified
+    DP*TP slice binding when per-engine world_size lacks a standalone topology.
+    """
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    monkeypatch.setattr(
+        TpuPlatform, "_has_tpu_topology", classmethod(lambda cls, ws: ws != 1)
+    )
+
+    bindings = {}
+    for dp_rank in range(8):
+        pc = _parallel_config(
+            world_size=1,
+            data_parallel_size=8,
+            data_parallel_size_local=8,
+            data_parallel_index=dp_rank,
+            data_parallel_rank_local=dp_rank,
+            enable_expert_parallel=False,
+            prefill_context_parallel_size=1,
+        )
+        assert binding.uses_unified_dp_slice(pc) is True
+        bindings[dp_rank] = binding.get_tpu_worker_binding(
+            pc, rank=0, local_rank=0, env={"TORCH_TPU_DP_SIZE": "8"}
+        )
+
+    for dp_rank, b in bindings.items():
+        assert b.as_env() == {
+            "RANK": str(dp_rank),
+            "LOCAL_RANK": str(dp_rank),
+            "WORLD_SIZE": "8",
+            "LOCAL_WORLD_SIZE": "8",
+        }
+        assert b.init_rank == 0
+        assert b.init_world_size == 1
+        assert b.init_local_rank == dp_rank
+        assert b.native_local_rank == dp_rank
+        assert b.dp_rank == dp_rank
+        assert b.dp_size == 8
+
+
+def test_dense_dp_with_standalone_topology_stays_replica_local(monkeypatch):
+    """Dense DP on hardware that supports a standalone world_size=1 topology
+    (e.g. single-core TPU v6e) stays replica-local.
+    """
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    monkeypatch.setattr(
+        TpuPlatform, "_has_tpu_topology", classmethod(lambda cls, ws: True)
+    )
+
+    pc = _parallel_config(
+        world_size=1,
+        data_parallel_size=4,
+        data_parallel_index=2,
+        enable_expert_parallel=False,
+        prefill_context_parallel_size=1,
+    )
+    assert binding.uses_unified_dp_slice(pc) is False
+    b = binding.get_tpu_worker_binding(pc, rank=0, local_rank=0, env={})
+    assert b.rank == 0
+    assert b.world_size == 1
+    assert b.native_local_rank == 2
