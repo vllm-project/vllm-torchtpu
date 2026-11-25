@@ -148,11 +148,7 @@ For GLM (`TPU_RAIDEN_GLM_ADMISSION=1`), the fingerprint includes the rope channe
 - With them off, or on a tree without the permute, the engine caches the checkpoint's interleaved order and declares nothing.
 - A pipeline stage whose layers hold no indexer declares the order an indexer layer of its own would cache: half-split when `TPU_INDEXER_ROPE_NEOX_PERMUTE` is on and the model config sets `indexer_rope_interleave`.
 
-The page geometry is the same in both orders, so run both legs with the same two settings: a half-split leg and an interleaved leg register different fingerprints, and every transfer between them is refused. The Decode worker logs each refused transfer with the controller's error after the colon:
-
-```text
-Stage-3 controller transfer outcome uncertain; waiting for native terminal state req_id=<id> destination_req_id=<id> uuid=<n>: <controller error>
-```
+The page geometry is the same in both orders, so run both legs with the same two settings: a half-split leg and an interleaved leg register different fingerprints, and every transfer between them is refused. The refusal itself comes from the controller; the Decode worker logs it as a Stage-3 controller transfer error carrying the controller's message.
 
 Each worker logs its registration in one line with the fingerprint and its payload, so the two legs' lines show the field that differs:
 
