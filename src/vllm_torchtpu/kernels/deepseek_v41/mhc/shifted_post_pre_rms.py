@@ -169,9 +169,11 @@ def shifted_post_pre_rms(
         # Gates arrive and leave as [.., T] HBM arrays moved inside the call:
         # memory-space inputs cost XLA a copy per gate before the call.
         por, cr, pr = gate_pads
-        copy_pairs = list(zip((poh, ch, ph), gate_scratch)) + list(
-            zip((scale_h, base_h), gate_params)
-        ) + [(wh, wr)]
+        copy_pairs = (
+            list(zip((poh, ch, ph), gate_scratch))
+            + list(zip((scale_h, base_h), gate_params))
+            + [(wh, wr)]
+        )
         norm_work_refs = norm_refs
         if norm_weight is not None:
             copy_pairs.insert(-1, (norm_refs[0], norm_weight_scratch[0]))
@@ -453,9 +455,7 @@ def shifted_post_pre_rms(
             zip(gates, gate_out, (pre_h, post_h, comb_h))
         ):
             scratch[...] = value[..., :t]
-            outs.append(
-                pltpu.make_async_copy(scratch, target, gate_out_sems.at[index])
-            )
+            outs.append(pltpu.make_async_copy(scratch, target, gate_out_sems.at[index]))
             outs[-1].start()
         # The last tiles drain while the gates compute.
         for index in range(num_tiles - output_buffers, num_tiles):
@@ -528,7 +528,13 @@ def shifted_post_pre_rms(
         pltpu.with_memory_space_constraint(scale, pltpu.HBM),
         pltpu.with_memory_space_constraint(base, pltpu.HBM),
     )
-    return (residual, new_post.T[:, :, None], new_comb.transpose(2, 0, 1), value, new_pre.T)
+    return (
+        residual,
+        new_post.T[:, :, None],
+        new_comb.transpose(2, 0, 1),
+        value,
+        new_pre.T,
+    )
 
 
 def _rms_norm_inplace(value_ref, weight_ref, square, *, columns: int, eps: float):
