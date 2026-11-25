@@ -674,6 +674,9 @@ class MuseSparkForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def bf16_dense(weights: Iterable[tuple[str, torch.Tensor]]):
             for name, tensor in weights:
+                # Vision and audio tensors are skipped before the BF16 check.
+                if name.startswith(self.ignored_weight_prefixes):
+                    continue
                 if ".experts." not in name and (
                     name.endswith(("_scale", "_scale_2")) or tensor.dtype == torch.uint8
                 ):
@@ -684,7 +687,5 @@ class MuseSparkForCausalLM(nn.Module):
                     )
                 yield name, tensor
 
-        loader = AutoWeightsLoader(
-            self, ignore_unexpected_prefixes=list(self.ignored_weight_prefixes)
-        )
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(bf16_dense(weights), mapper=self.hf_to_vllm_mapper)

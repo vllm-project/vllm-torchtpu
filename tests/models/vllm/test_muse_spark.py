@@ -461,6 +461,9 @@ def test_model_loader_routes_experts_and_ignores_modality_tensors(dist_ctx):
     weights += [
         (prefix + "gate_up_proj_input_scale", torch.ones(2, 2)),
         ("model.vision_tower.unused.weight", torch.ones(1)),
+        # Skipped before the BF16 check, which would reject these names.
+        ("model.vision_tower.blocks.0.mlp.fc1.weight", torch.ones(2, 4).byte()),
+        ("model.audio_tower.proj.weight_scale", torch.ones(1)),
     ]
     loaded = model.load_weights(weights)
     names = ("weight", "weight_scale", "weight_scale_2")
