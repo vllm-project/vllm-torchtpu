@@ -370,11 +370,12 @@ def _kernel_v3(
     waited out its pages' DMA latency (~1.3 us per step at 64 or 128 pages,
     bench j-9956cd34).
 
-    Each ring slot has straight-line bodies (static buffers, so the
-    scheduler sees the ahead group's copies do not touch the pages being
-    scored), and the ahead group's descriptors are issued among this
-    group's matmuls. A wait between chunks would drain the MXU pipeline, so
-    all of the group's pages are waited for first.
+    A grid step runs a straight-line body for its count of scored chunks on
+    its ring slot (a dynamic index: one body per slot tripled the kernel's
+    code, which the 60-layer program reloads on every call), and the ahead
+    group's descriptors are issued among this group's matmuls. A wait
+    between chunks would drain the MXU pipeline, so all of the group's pages
+    are waited for first.
 
     A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
     int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
@@ -548,16 +549,15 @@ def _kernel_v3(
             else:
                 start(next_base, next_live, pages, (slot + ahead) % slots)
 
-    # One straight-line body per slot and count of scored chunks, so that a
-    # chunk's matmuls overlap the previous chunk's maxima.
+    # One straight-line body per count of scored chunks, so that a chunk's
+    # matmuls overlap the previous chunk's maxima.
     counts = sorted({num_chunks} | {2**k for k in range(1, 8) if 2**k < num_chunks})
     live_chunks = jnp.minimum(-(-live // chunk), num_chunks)
-    for slot in range(slots):
-        for i, n in enumerate(counts):
-            lo = counts[i - 1] if i else 0
-            pl.when((step % slots == slot) & (live_chunks > lo) & (live_chunks <= n))(
-                functools.partial(body, slot, n)
-            )
+    for i, n in enumerate(counts):
+        lo = counts[i - 1] if i else 0
+        pl.when((live_chunks > lo) & (live_chunks <= n))(
+            functools.partial(body, step % slots, n)
+        )
     if write is not None:
         pl.when(step == num_steps - 1)(write.finish)
 
