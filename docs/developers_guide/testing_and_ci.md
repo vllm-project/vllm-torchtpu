@@ -57,19 +57,15 @@ pytest tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=3600 \
   -m "not nightly and multichip"
 ```
 
-### 5. Omni Multimodal & Diffusion TPU Tests (`tests_omni/`)
+### 5. Omni Multimodal & Diffusion TPU Tests
 
-With `--extra omni` installed (plus `--group omni-git` until vllm-omni 0.32.0rc1 is on PyPI), run the `vllm-omni` test suite:
-
-```bash
-pytest tests_omni/ -sv --timeout=1200 -m "not nightly and omni"
-```
+Tests for `vllm-omni` multimodal and diffusion models live in the [`vllm-omni-torchtpu`](https://github.com/vllm-project/vllm-omni-torchtpu) repository.
 
 ---
 
 ## Pytest Markers Reference
 
-Every test in `tests/` and `tests_omni/` is routed to the appropriate CI hardware using the markers registered in `[tool.pytest.ini_options]` in `pyproject.toml`:
+CI routes every test in `tests/` to the target hardware using the markers registered in `[tool.pytest.ini_options]` in `pyproject.toml`:
 
 | Marker | CI hardware (kube pod) | Description |
 | :--- | :--- | :--- |
@@ -78,7 +74,6 @@ Every test in `tests/` and `tests_omni/` is routed to the appropriate CI hardwar
 | `@pytest.mark.multichip` | Multi-chip pod: v7x 2x2x1 (4 chips, 8 devices); v6e 2x4 (8 chips, 8 devices) with `CI_EXTRAS=tpu-all` or `tpu-v6e` | Tests that need more devices than the single-chip pod has (e.g., TP/EP/DP collectives). |
 | `@pytest.mark.spawns_tpu_workers` | Multi-chip TPU slice | Tests that spawn a `torch.distributed.run` worker group spanning the TPU slice; ordered by `tests/conftest.py` to run before any in-process TPU test in the same `pytest` session. |
 | `@pytest.mark.nightly` | Nightly CI workflow (`NIGHTLY=1`) | Long-running or full-checkpoint tests excluded from per-PR CI gates. Must still be combined with `tpu_test` or `multichip` if TPU hardware is required. |
-| `@pytest.mark.omni` | TPU v7x 1x1x1 (`-omni` image); v6e 1x1 with `CI_EXTRAS=tpu-all` or `tpu-v6e` | Tests that run `vllm-omni` multimodal and diffusion models (`tests_omni/`). |
 
 ---
 

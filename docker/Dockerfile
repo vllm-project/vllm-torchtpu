@@ -278,25 +278,7 @@ ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu"
 CMD ["/bin/bash"]
 
 
-# Variant 4: Omni Image (Omni Variant with dev + omni dependencies)
-FROM dev AS omni
-
-# vllm-omni depends on opencv-python (not -headless), whose cv2 links libGL and
-# glib; without them multi-rank diffusion workers crash at startup.
-RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
-
-# --group vllm keeps vLLM's source pin in this resolution, so vllm-omni cannot
-# replace it with a PyPI vllm. --group omni-git supplies the omni extra's
-# vllm-omni from its git tag until the release is on PyPI (see pyproject.toml).
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system \
-      -r pyproject.toml \
-      --group vllm \
-      --extra omni \
-      --group omni-git
-
-
-# Variant 5: Production/Full Image (Production/Minimal Variant)
+# Variant 4: Production/Full Image (Production/Minimal Variant)
 # This variant copies all source code and installs the package regularly
 # without extra dev/testing tools, starting directly from the runtime base.
 FROM base AS prod

@@ -115,11 +115,6 @@
 # Kernels: Causal Conv1D
 /src/vllm_torchtpu/kernels/causal_conv1d/ @kyuyeunk @qizzzh @bigeye @helloworld1 @jrplatin @ShobhitBehl
 
-# Kernels: Diffusion Attention (WAN)
-/src/vllm_torchtpu/kernels/diffusion_attention/ @mbohlool @pi314ever @kyuyeunk @qizzzh @eltsai @syhuang22 @chandrasekhard2
-/tests/kernels/test_diffusion_*.py @mbohlool @pi314ever @kyuyeunk @qizzzh @eltsai @syhuang22 @chandrasekhard2
-/tests/kernels/test_wan_*.py @mbohlool @pi314ever @kyuyeunk @qizzzh @eltsai @syhuang22 @chandrasekhard2
-
 # Kernels: Gated Delta Net (GDN)
 /src/vllm_torchtpu/kernels/gdn/ @mhhuang-machine @annyan09023 @kyuyeunk @brianseung-google
 /tests/kernels/gdn/ @mhhuang-machine @annyan09023 @kyuyeunk @brianseung-google
@@ -216,10 +211,6 @@
 # Multi-LoRA
 /src/vllm_torchtpu/lora/ @aman2930 @haotianxue-google
 /tests/lora/ @aman2930 @haotianxue-google
-
-# Omni & Diffusion Support
-/src/vllm_torchtpu/omni/ @mbohlool @pi314ever @chandrasekhard2 @yixinshi
-/tests_omni/ @mbohlool @pi314ever @chandrasekhard2
 
 # Experimental Model Export
 /src/vllm_torchtpu/experimental/ @maxwillzq @jrplatin @yunyao-gg

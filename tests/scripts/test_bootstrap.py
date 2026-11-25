@@ -325,7 +325,6 @@ class TestBootstrapUnits(unittest.TestCase):
                 "automatic": [{"exit_status": -1, "limit": 2}],
             },
         )
-        self.assertNotIn("OMNI_IMAGE_SKIP", step["env"])
         prefix = "python3 .buildkite/scripts/bootstrap.py upload-stages "
         self.assertTrue(step["command"].startswith(prefix))
         raw_args = step["command"].removeprefix(prefix).split()
@@ -1571,7 +1570,6 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertEqual(
             json.loads(pr.uploads[0][1])["steps"][1]["env"]["CI_FLEET"], "kube"
         )
-        self.assertEqual(pr.uploads[2][2]["OMNI_IMAGE_SKIP"], "")
         self.assertNotIn("tpu-pr/alice@example.com", pr.uploads[1][1])
         self.assertEqual(pr.stderr, "")
         for expected_line in (
@@ -1747,8 +1745,6 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertIn(("WORKLOAD_PRIORITY", wprio), fx.meta)
             self.assertTrue(fx.annotations[0][2].startswith("CI suite: pr+cpu-only: "))
             self.assertEqual([u[0] for u in fx.uploads], ["cpu", "build"])
-            self.assertTrue(bool(fx.uploads[1][2]["OMNI_IMAGE_SKIP"]))
-            self.assertLessEqual(len(fx.uploads[1][2]["OMNI_IMAGE_SKIP"]), 70)
 
         # main post-merge (even when merged PR had run-full-ci / run-perf-eval)
         # runs default suite in one stage without NIGHTLY.
@@ -1789,7 +1785,6 @@ class TestBootstrapUnits(unittest.TestCase):
             {"CI_SUITE": "perf", "CI_LANES": "perf", "BUILDKITE_BRANCH": "main"}
         )
         self.assertEqual([u[0] for u in perf_sched.uploads], ["perf", "build"])
-        self.assertTrue(bool(perf_sched.uploads[-1][2]["OMNI_IMAGE_SKIP"]))
 
         # Scheduled Nightly, release builds (tag or releases/vX.Y.Z branch), and
         # manual CI_SUITE=full run 1-stage full suite with NIGHTLY=1 substituted.
@@ -2032,7 +2027,6 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertIn(("JOB_PRIORITY", "6"), pre.meta)
         self.assertTrue(pre.annotations[0][2].startswith("CI suite: pr+cpu-only: "))
         self.assertEqual([u[0] for u in pre.uploads], ["cpu", "build"])
-        self.assertTrue(bool(pre.uploads[1][2]["OMNI_IMAGE_SKIP"]))
 
         # Merge queue on main: priority 11 (post-merge), ignores PR labels and
         # CI_PR_PUSH_CPU_ONLY, diffs against BUILDKITE_MERGE_QUEUE_BASE_COMMIT, and

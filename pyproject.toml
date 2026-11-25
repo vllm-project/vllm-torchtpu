@@ -52,11 +52,10 @@ dependencies = [
     # * from v5.18 on: indexed_attention
     #   (https://github.com/huggingface/transformers/pull/48974)
     # qwen4_exp/ accepts only indexed_attention, hence the floor. vLLM 0.33.0
-    # takes transformers>=5.16.1,<5.21.0 and vllm-omni 0.32.0rc1 takes
-    # >=5.16.1,<5.20.0. No upper bound in base dependencies, so upstream vLLM
-    # HEAD canary builds (vllm-torchtpu-canary-vllm) can resolve. Monitored for
-    # potential structured-output spec-decode divergence (#1093) on
-    # transformers>=5.17.
+    # takes transformers>=5.16.1,<5.21.0. No upper bound in base dependencies,
+    # so upstream vLLM HEAD canary builds (vllm-torchtpu-canary-vllm) can
+    # resolve. Monitored for potential structured-output spec-decode divergence
+    # (#1093) on transformers>=5.17.
     "transformers>=5.18.0",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
@@ -100,28 +99,11 @@ benchmarking = [
     "runai-model-streamer[gcs]>=0.17",
 ]
 
-# vLLM-Omni optional dependency. vllm-omni keeps major.minor aligned with vLLM.
-# 0.32.0rc1 is not on PyPI yet; until it is, add the `omni-git` dependency
-# group below, which supplies it from its git tag.
-omni = [
-    "vllm-omni==0.32.0rc1",
-    # vllm-omni pulls torchaudio through s3tokenizer. The PyPI torchaudio is a
-    # CUDA build that fails to load libcudart, and transformers imports
-    # torchaudio whenever it is installed, so every vLLM import would fail.
-    # Take the CPU build instead (see [tool.uv.sources]). 2.11.0 is the newest
-    # torchaudio release; it declares no torch requirement and imports against
-    # torch 2.13.0.
-    "torchaudio==2.11.0",
-]
-
 [project.entry-points."vllm.platform_plugins"]
 # Standard vLLM out-of-tree platform plugin discovery. The function returns
 # the dotted class path when this platform should activate, else None. See
 # https://docs.vllm.ai/en/latest/design/plugin_system/
 torchtpu = "vllm_torchtpu.platforms:register_tpu_platform"
-
-[project.entry-points."vllm_omni.platform_plugins"]
-torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
@@ -138,13 +120,6 @@ vllm = [
     # Note: we **intentionally** build vllm from source, see README.
     # Keep vllm_test_utils on the same upstream tag below.
     "vllm @ git+https://github.com/vllm-project/vllm.git@v0.33.0",
-]
-
-# Source for the `omni` extra's vllm-omni==0.32.0rc1 while that release is not
-# on PyPI: install `--extra omni --group omni-git`. Drop this group, and the
-# flag, once it is.
-omni-git = [
-    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.32.0rc1",
 ]
 
 # Required for running tests
@@ -168,7 +143,6 @@ markers = [
     "nightly: tests that only run in the nightly CI workflow",
     "multichip: tests that need more than 2 TPU chips; CI runs them on an 8-chip agent",
     "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
-    "omni: tests that run omni multimodal and diffusion models",
 ]
 
 [tool.ruff]
@@ -298,7 +272,6 @@ ignore-missing-imports = [
     "tqdm", "tqdm.*",
     "transformers", "transformers.*",
     "vllm", "vllm.*",
-    "vllm_omni", "vllm_omni.*",
     "zmq", "zmq.*",
 ]
 
@@ -327,4 +300,3 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
-torchaudio = { index = "pytorch-cpu" }

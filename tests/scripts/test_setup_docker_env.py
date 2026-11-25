@@ -163,21 +163,24 @@ class TestSetupDockerEnv(unittest.TestCase):
             return proc, calls
 
     def test_non_canary_reuses_registry_image_without_building(self) -> None:
-        for target, expected_key, expected_tag in (
-            ("dev", "CI_IMAGE_TAG", f"{_IMAGE_REPO}:deadbeef-vllmsha123"),
-            ("omni", "CI_IMAGE_TAG-omni", f"{_IMAGE_REPO}:deadbeef-vllmsha123-omni"),
-        ):
-            with self.subTest(target=target):
-                proc, calls = self._run(target=target, meta_leg="", manifest_rc=0)
-                self.assertEqual(proc.returncode, 0, msg=proc.stderr)
-                self.assertEqual(
-                    _docker_calls(calls, "manifest"),
-                    [["manifest", "inspect", expected_tag]],
-                )
-                self.assertEqual(_docker_calls(calls, "build"), [])
-                self.assertEqual(_docker_calls(calls, "push"), [])
-                self.assertEqual(_curl_urls(calls), [])
-                self.assertEqual(_meta_sets(calls), [(expected_key, expected_tag)])
+        expected_tag = f"{_IMAGE_REPO}:deadbeef-vllmsha123"
+        proc, calls = self._run(target="dev", meta_leg="", manifest_rc=0)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertEqual(
+            _docker_calls(calls, "manifest"),
+            [["manifest", "inspect", expected_tag]],
+        )
+        self.assertEqual(_docker_calls(calls, "build"), [])
+        self.assertEqual(_docker_calls(calls, "push"), [])
+        self.assertEqual(_curl_urls(calls), [])
+        self.assertEqual(_meta_sets(calls), [("CI_IMAGE_TAG", expected_tag)])
+
+    def test_unsupported_target_fails_fast(self) -> None:
+        proc, calls = self._run(target="bogus", meta_leg="", manifest_rc=0)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Unsupported target 'bogus'; expected dev.", proc.stderr)
+        self.assertEqual(_docker_calls(calls, "build"), [])
+        self.assertEqual(_meta_sets(calls), [])
 
     def test_single_leg_selection_override_and_metadata(self) -> None:
         cases = [
@@ -255,37 +258,6 @@ class TestSetupDockerEnv(unittest.TestCase):
                 "pushes": [f"{_IMAGE_REPO}:deadbeef-vllmsha123-torch-tpu_0.2.0.dev9"],
                 "meta_key": "CI_IMAGE_TAG",
                 "ver_key": "TORCH_TPU_VERSION",
-            },
-            # Omni target publishes CI_IMAGE_TAG-omni without overwriting
-            # CI_IMAGE_TAG for both legs.
-            {
-                "name": "omni_torch_tpu",
-                "target": "omni",
-                "meta_leg": "torch-tpu",
-                "env": {"TORCH_TPU_VERSION_OVERRIDE": "0.2.0.dev1"},
-                "pkg": "torch-tpu",
-                "ver": "0.2.0.dev1",
-                "curl_suffix": None,
-                "pushes": [
-                    f"{_IMAGE_REPO}:deadbeef-vllmsha123-omni-torch-tpu_0.2.0.dev1"
-                ],
-                "meta_key": "CI_IMAGE_TAG-omni",
-                "ver_key": "TORCH_TPU_VERSION",
-            },
-            {
-                "name": "omni_tpu_sync",
-                "target": "omni",
-                "meta_leg": "tpu-sync",
-                "env": {"TPU_SYNC_TORCH_VERSION_OVERRIDE": "0.0.1.dev2"},
-                "pkg": "tpu-sync-torch",
-                "ver": "0.0.1.dev2",
-                "curl_suffix": None,
-                "pushes": [
-                    f"{_IMAGE_REPO}:deadbeef-vllmsha123-omni-tpu-sync_0.0.1.dev2",
-                    f"{_IMAGE_REPO}:deadbeef-vllmsha123-omni-tpu-sync-torch_0.0.1.dev2",
-                ],
-                "meta_key": "CI_IMAGE_TAG-omni",
-                "ver_key": "TPU_SYNC_TORCH_VERSION",
             },
         ]
 

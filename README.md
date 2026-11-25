@@ -90,7 +90,7 @@ The [Quickstart](https://vllm-torchtpu.readthedocs.io/en/latest/getting_started/
 
 ## Supported models and features
 
-`vllm-torchtpu` can serve most PyTorch models supported by vLLM, with first-class TPU kernel, quantization, and parallelism support for Qwen3 / Qwen3.5, DeepSeek-V3 / R1 / V4, Kimi-K2.5 / K3, GLM-5, Llama 3 / 4, GPT-OSS, Gemma 3 / 4, Mixtral, Qwen-VL and Gemma VL families, and diffusion models via `vllm-omni`.
+`vllm-torchtpu` can serve most PyTorch models supported by vLLM, with first-class TPU kernel, quantization, and parallelism support for Qwen3 / Qwen3.5, DeepSeek-V3 / R1 / V4, Kimi-K2.5 / K3, GLM-5, Llama 3 / 4, GPT-OSS, Gemma 3 / 4, Mixtral, and the Qwen-VL and Gemma VL families. For omni multimodal and diffusion models on TPU, see [`vllm-omni-torchtpu`](https://github.com/vllm-project/vllm-omni-torchtpu).
 
 - **[Supported Models & Features](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/supported_models/)** — validated model families, feature status, and quantization formats.
 - **[Nightly support matrices](support_matrices/nightly/)** — TPU v7x unit, correctness, and benchmark status, updated automatically from nightly CI.

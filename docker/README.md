@@ -72,7 +72,7 @@ curl http://localhost:8000/v1/chat/completions \
 
 ## What's supported
 
-First-class TPU kernel, quantization, and parallelism support for Qwen3 / Qwen3.5, DeepSeek-V3 / R1 / V4, Kimi-K2.5 / K3, GLM-5, Llama 3 / 4, GPT-OSS, Gemma 3 / 4, Mixtral, and the Qwen-VL and Gemma VL families, plus diffusion models via `vllm-omni`.
+First-class TPU kernel, quantization, and parallelism support for Qwen3 / Qwen3.5, DeepSeek-V3 / R1 / V4, Kimi-K2.5 / K3, GLM-5, Llama 3 / 4, GPT-OSS, Gemma 3 / 4, Mixtral, and the Qwen-VL and Gemma VL families. For omni multimodal and diffusion models on TPU, use [`vllm-omni-torchtpu`](https://github.com/vllm-project/vllm-omni-torchtpu).
 
 - **Kernels:** Ragged Paged Attention, dense and sparse MLA, Gated DeltaNet, fused MoE with SparseCore offload, FP8 / INT8 / MXFP4 quantized matmul.
 - **Scale-out:** TP, DP, PP, EP, and prefill/decode context parallelism across single- and multi-host TPU slices, with disaggregated prefill/decode serving.
