@@ -24,8 +24,13 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from ._parsing import (
+    _is_exact_int,
+    _parse_bucket_list,
+    _parse_verify_tokens,
+    _raise_invalid,
+)
 from .constants import (
-    _MIN_OUT_ROW_MULTIPLE,
     DEFAULT_BUCKETS,
     DEFAULT_VERIFY_BUCKETS,
     FALSE_STRS,
@@ -33,14 +38,12 @@ from .constants import (
     MIN_VERIFY_TOKENS,
     MTP_SPECULATIVE_TOKENS,
     MTP_VERIFY_TOKENS,
-    _is_exact_int,
-    _parse_bucket_list,
-    _parse_verify_tokens,
-    _raise_invalid,
 )
 
 if TYPE_CHECKING:
     from ..profile import Profile
+
+_MIN_OUT_ROW_MULTIPLE: int = 16
 
 
 def parse_mk_buckets(val: str | Iterable[int]) -> tuple[int, ...]:
@@ -83,7 +86,11 @@ def parse_mk_verify_buckets(
     Raises:
         ValueError: If `verify_tokens` or `val` is invalid or unaligned.
     """
-    widths = _parse_verify_tokens(verify_tokens)
+    widths = (
+        (MTP_VERIFY_TOKENS,)
+        if verify_tokens is None
+        else _parse_verify_tokens(verify_tokens)
+    )
     min_width = widths[0]
     return _parse_bucket_list(
         val,
@@ -139,14 +146,7 @@ class BucketPolicy:
         object.__setattr__(
             self,
             "verify_buckets",
-            _parse_bucket_list(
-                self.verify_buckets,
-                valid_fn=lambda b: (
-                    1 <= b <= MAX_BUCKET_ROWS
-                    and any(b % width == 0 for width in resolved_widths)
-                ),
-                label="verify_buckets",
-            ),
+            parse_mk_verify_buckets(self.verify_buckets, resolved_widths),
         )
         raw_paddings = self.token_paddings
         if isinstance(raw_paddings, (str, bytes, bytearray)) or not isinstance(
@@ -198,10 +198,19 @@ class BucketPolicy:
             Canonical `BucketPolicy` filtered to the active decode/verify mode.
 
         Raises:
-            ValueError: If bucket values, `verify_tokens`, `token_paddings`, or
-                explicit `verify_buckets` alignment are invalid.
+            ValueError: If bucket values, `speculative_tokens`, `verify_tokens`,
+                `token_paddings`, or explicit `verify_buckets` alignment are
+                invalid.
         """
-        resolved_verify_tokens = _parse_verify_tokens(verify_tokens)
+        if speculative_tokens is not None and (
+            not _is_exact_int(speculative_tokens) or speculative_tokens < 0
+        ):
+            _raise_invalid("speculative_tokens", speculative_tokens)
+        resolved_verify_tokens = (
+            (MTP_VERIFY_TOKENS,)
+            if verify_tokens is None
+            else _parse_verify_tokens(verify_tokens)
+        )
         default_buckets = (
             DEFAULT_BUCKETS if profile.buckets is None else profile.buckets
         )
@@ -215,7 +224,7 @@ class BucketPolicy:
         )
         raw_verify_buckets = _parse_bucket_list(
             default_verify_buckets if verify_buckets is None else verify_buckets,
-            valid_fn=lambda b: 1 <= b <= MAX_BUCKET_ROWS,
+            valid_fn=lambda b: MIN_VERIFY_TOKENS <= b <= MAX_BUCKET_ROWS,
             label="verify_buckets",
         )
         sorted_verify_buckets = tuple(

@@ -29,12 +29,13 @@ from ..modules.gqa import GQAModule, GQATunables
 from ..pool.config import FUSED_POOL_IO_MAX_B, FUSED_POOL_IO_MIN_B_HI, with_cache
 from ..profile import Profile, get_profile, model_default_profile
 from ..spec import ModelSpec
+from ._parsing import _parse_bucket_list
 from .constants import (
     DEFAULT_BUCKETS,
     DEFAULT_VERIFY_BUCKETS,
     FALSE_STRS,
     MAX_BUCKET_ROWS,
-    _parse_bucket_list,
+    MIN_VERIFY_TOKENS,
 )
 from .policy import parse_mk_buckets
 
@@ -85,7 +86,9 @@ def _parse_verify_rows(val: Any) -> tuple[int, ...]:
     """Verify bucket rows, range-checked only: `BucketPolicy.resolve` checks
     them against the program's verify widths (`verify_tokens`)."""
     return _parse_bucket_list(
-        val, valid_fn=lambda b: 1 <= b <= MAX_BUCKET_ROWS, label="verify_buckets"
+        val,
+        valid_fn=lambda b: MIN_VERIFY_TOKENS <= b <= MAX_BUCKET_ROWS,
+        label="verify_buckets",
     )
 
 

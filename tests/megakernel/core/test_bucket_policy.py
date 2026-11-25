@@ -21,6 +21,7 @@ from __future__ import annotations
 import inspect
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -56,6 +57,8 @@ from vllm_torchtpu.megakernel.core.runtime.stats import BatchShape, inspect_batc
 @pytest.mark.parametrize(
     "module, blocked",
     [
+        # _parsing is framework-free: no jax either.
+        ("_parsing", ("jax", "jaxlib", "torch", "vllm")),
         # constants is framework-free: no jax either.
         ("constants", ("jax", "jaxlib", "torch", "vllm")),
         # policy is framework-free: no jax either.
@@ -627,6 +630,14 @@ def test_resolve_verify_tokens_none_and_empty_verify_multiples() -> None:
     )
     assert parse_mk_verify_buckets("8, 16", verify_tokens=None) == (8, 16)
 
+    none_vt: Any = None
+    with pytest.raises(ValueError, match="invalid verify_tokens"):
+        BucketPolicy((8,), (), verify_tokens=none_vt)
+    for bad_spec in (-1, -4, True, False, 1.5, "3"):
+        bad_k: Any = bad_spec
+        with pytest.raises(ValueError, match="invalid speculative_tokens"):
+            BucketPolicy.resolve(prof, speculative_tokens=bad_k)
+
     pol_no_mult = BucketPolicy.resolve(prof, speculative_tokens=10, verify_tokens=(11,))
     assert pol_no_mult.verify_tokens == (11,)
     assert (pol_no_mult.buckets, pol_no_mult.verify_buckets) == ((), ())
@@ -666,7 +677,7 @@ def test_resolve_profile_verify_buckets_filtering_and_range_errors() -> None:
     )
     assert pol_non_exp_12.verify_buckets == (12,)
 
-    for out_of_range in ((0, 8), (68,), (-4,)):
+    for out_of_range in ((0, 8), (1,), (1, 8), (68,), (-4,)):
         prof_oor = Profile(
             name="test_prof_oor", numerics="exact", verify_buckets=out_of_range
         )

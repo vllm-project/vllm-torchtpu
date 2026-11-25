@@ -217,8 +217,7 @@ def create(view: RunnerView, options: Mapping[str, Any]) -> Qwen35Program | Decl
         speculative_tokens=view.speculative_tokens,
         buckets_explicit=cfg["buckets_explicit"],
         verify_buckets_explicit=cfg["verify_buckets_explicit"],
-        # The program compiles only the MTP `T=4` verify step; without this,
-        # `resolve` would derive `K + 1` from the draft length.
+        # The program compiles only the MTP `T=4` verify step.
         verify_tokens=(mk_rt.MTP_VERIFY_TOKENS,),
     )
     el_post = mk_rt.check_post_mesh_eligibility(
