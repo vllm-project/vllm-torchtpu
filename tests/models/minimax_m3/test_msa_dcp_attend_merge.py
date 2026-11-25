@@ -219,6 +219,7 @@ def _decode_plan(own, peer, seq_lens, cu, rank, pages_per_seq, pages_per_step):
         ([8], [80000], 8),  # c4 b1
         ([8, 8, 8], [3000, 129, 9000], 24),  # a request at a block edge
         ([8, 8, 8, 8, 8, 5], [3000, 5000, 70, 300, 9000, 1], 48),  # padded tail
+        ([8] * 24, [300 * i + 50 for i in range(24)], 192),  # c48 b22 bucket
     ],
 )
 def test_decode_plan_matches_xla(rank, q_lens, ctx_lens, num_tokens, pages_per_step):
@@ -284,6 +285,7 @@ def test_decode_plan_matches_xla(rank, q_lens, ctx_lens, num_tokens, pages_per_s
         ([8], [80000], 8),  # c4 b1
         ([8, 8, 8], [3000, 129, 9000], 24),
         ([8, 8, 8, 8, 8, 5], [3000, 5000, 70, 300, 9000, 1], 48),  # padded tail
+        ([8] * 24, [300 * i + 50 for i in range(24)], 192),  # c48 b22 bucket
     ],
 )
 def test_planned_decode_matches_plain_bitwise(

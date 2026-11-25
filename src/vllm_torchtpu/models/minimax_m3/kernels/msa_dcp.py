@@ -90,11 +90,12 @@ DCP_SMALL_BATCH_TOKENS = 1024
 _SMALL_BATCH_PAGES_PER_STEP = 32
 
 
-# Decode steps of up to this many tokens run `_decode_plan_kernel`: its dense
-# per-tile unions cost per tile, and at 16 tiles the XLA path was cheaper
-# (standalone bench j-8228a157: 8 tokens 4.0 vs 5.2 us, 48 tokens 4.8 vs 6.6,
-# 128 tokens 9.0 vs 7.9).
-_PLAN_MAX_TOKENS = 64
+# Decode steps of up to this many tokens (a pair's 48 requests of 8 rows) run
+# `_decode_plan_kernel` in the attention kernel, in place of the XLA work list
+# (two sorts and ~20 small ops): anvil chain of one rank, 4-bit cache, region
+# us at selection locality .97 / .5: 128 rows 42.3 -> 26.7 / 59.8 -> 49.4,
+# 192 rows 51.9 -> 34.4 / 81.5 -> 73.5, 384 rows 74.4 -> 58.4 / 123.2 -> 120.8.
+_PLAN_MAX_TOKENS = 384
 # Page buffers a decode step's folded write may keep in VMEM (every run's
 # pages, in and out): c48's 4-bit 128-row steps take ~5.6 MiB.
 _FOLDED_WRITE_VMEM_BYTES = 16 << 20
