@@ -76,5 +76,5 @@ separate PRs.
 | `runtime_shim/config.py` (`MegakernelEngineConfig`) | `megakernel/adapter/plugin.py` (`RunnerView`) | Phase 2 (RFC C1) |
 | `runtime_shim/layout.py` (`KVLayout`) | `megakernel/core/pool/layout.py` (`PoolLayout`, once extended with bf16 256-token / fp8 512-token pages, fp32 recurrent state, and draft-ring region support) | Phase 1 (RFC D1, before runner C1 binds pools) |
 | `runtime_shim/compilation.py` (`CompileCall`, `compile_ops`) | `megakernel/adapter/driver.py` (`ProgramDriver._compile`, `bind_and_warmup`, `warmup`) | Phase 2 (RFC C1) |
-| `runtime_shim/bridge.py` (`kernel_mesh`, `spmd_safe_axis_index`) | `megakernel/adapter/driver.py` (`_build_tp_rank_mesh`) and `megakernel/core/collectives/spmd.py` (`mesh_axis_index`) | Phase 2 (cleanup delegates scalar axis lookup to shared `mesh_axis_index`) |
+| `runtime_shim/bridge.py` (`kernel_mesh`) | `megakernel/adapter/driver.py` (`_build_tp_rank_mesh`) | Phase 2 (all outer `shard_map` axis lookups already call shared `mesh_axis_index` directly) |
 | `runtime_shim/export_cache.py` and `_register_sharded_op` | Kept local in `models/kimi_k3/` (the K3 op builder attaches the export cache; the shared builder has no hook for it) | Re-evaluated when `torch_tpu` native export cache matches |

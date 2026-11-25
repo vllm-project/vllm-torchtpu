@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import builtins
 import contextlib
@@ -44,6 +45,7 @@ from jaxlib.mlir import ir as mlir_ir
 from vllm.config import SpeculativeConfig
 
 from vllm_torchtpu.distributed import pallas_shapes
+from vllm_torchtpu.megakernel.core.collectives.spmd import mesh_axis_index
 from vllm_torchtpu.models.kimi_k3.megakernel import common
 from vllm_torchtpu.models.kimi_k3.megakernel import config as k3_config
 from vllm_torchtpu.models.kimi_k3.megakernel import layout as k3_layout
@@ -674,8 +676,10 @@ def test_bridge_typed_signature_registers_without_exec(
         "kimi_k3::typed_local_op",
         mesh,
         lambda x, y: (x + y,),
-        (spec, spec),
-        (spec,),
+        bridge.OpRegistrationSpec(
+            in_specs=(spec, spec),
+            out_specs=(spec,),
+        ),
     )
     local_fn = captured_ops["kimi_k3::typed_local_op"]
     local_sig = inspect.signature(local_fn)
@@ -711,31 +715,6 @@ def test_bridge_typed_signature_registers_without_exec(
         "arg_0": jax.Array,
         "return": tuple[jax.Array, jax.Array],
     }
-
-
-def test_bridge_resolve_op_spec_rejects_invalid_out_specs() -> None:
-    """Fail closed with TypeError on missing or duplicate out_specs."""
-    mesh = Mesh(np.array(jax.devices()[:1]), ("tp",))
-    spec = PartitionSpec("tp")
-    missing_error = ""
-    try:
-        bridge.register_op("kimi_k3::missing_out", mesh, lambda x: (x,), (spec,))
-    except TypeError as exc:
-        missing_error = str(exc)
-    assert "out_specs is required" in missing_error
-
-    duplicate_error = ""
-    try:
-        bridge.register_op(
-            "kimi_k3::extra_out",
-            mesh,
-            lambda x: (x,),
-            bridge.OpRegistrationSpec(in_specs=(spec,), out_specs=(spec,)),
-            (spec,),
-        )
-    except TypeError as exc:
-        duplicate_error = str(exc)
-    assert "out_specs must be omitted" in duplicate_error
 
 
 def test_export_cache_placeholder_roundtrip(
@@ -1580,27 +1559,30 @@ def test_kernel_mesh_rejects_mismatched_world_size_on_cache_hit(
         bridge.kernel_mesh("tp", world_size=wrong_world)
 
 
-def test_spmd_safe_axis_index_traces_scalar_pallas_call_and_rejects_non_str() -> None:
-    """Trace string axis lookup via shared ``mesh_axis_index`` and reject non-str."""
-    topology = jax_topologies.get_topology_desc("tpu7x_2x2x4")
-    mesh = Mesh(np.array(list(topology.devices)), ("tp",))
+def test_custom_compiler_options_context_delegates_to_compiler_options(
+    monkeypatch: _MonkeyPatch,
+) -> None:
+    """Verify custom_compiler_options_context enters and exits underlying helper."""
+    events: list[tuple[str, dict[str, str]]] = []
 
-    def read_axis(_x: jax.Array) -> jax.Array:
-        """Read the ``tp`` coordinate inside a ``shard_map`` body."""
-        return jax.lax.axis_index("tp")
+    @contextlib.contextmanager
+    def _fake_custom_options(options: dict[str, str]) -> Iterator[None]:
+        """Record option context entry and exit."""
+        events.append(("enter", dict(options)))
+        try:
+            yield
+        finally:
+            events.append(("exit", dict(options)))
 
-    sharded_read = jax.shard_map(
-        read_axis,
-        mesh=mesh,
-        in_specs=PartitionSpec(),
-        out_specs=PartitionSpec(),
-        check_vma=False,
+    fake_mod = _stub_module(
+        "torch_tpu._internal.compiler_options",
+        custom_compiler_options=_fake_custom_options,
     )
-    with bridge.spmd_safe_axis_index():
-        traced = jax.make_jaxpr(sharded_read)(jnp.zeros((1,), dtype=jnp.int32))
-        assert "pallas_call" in str(traced)
-        with pytest.raises(TypeError, match="requires a str axis name"):
-            jax.lax.axis_index(("tp", "dp"))
+    monkeypatch.setitem(sys.modules, "torch_tpu._internal.compiler_options", fake_mod)
+    opts = {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
+    with compilation.custom_compiler_options_context(opts):
+        assert events == [("enter", opts)]
+    assert events == [("enter", opts), ("exit", opts)]
 
 
 def test_resolve_execution_mode_prefers_public_torch_tpu_and_handles_both_enum_names(
@@ -2008,3 +1990,97 @@ def test_backend_rejects_uris_bool_dp_and_vmem_pool_guards(
         mp.setattr(vmem_pool.pool_alias, "storage_size", lambda _s, _d: 64)
         with pytest.raises(vmem_pool.PoolError, match="128"):
             pool_with_arena.view(0, (8, 128), jnp.bfloat16)
+
+
+def _assert_no_private_pallas_imports(path: Path) -> None:
+    """Assert that ``path`` contains no ``jax._src.pallas`` imports."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            assert not node.module.startswith("jax._src.pallas")
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert not alias.name.startswith("jax._src.pallas")
+
+
+def _find_axis_index_calls(root: Path, filenames: tuple[str, ...]) -> list[str]:
+    """Return ``filename:line`` entries for any ``axis_index`` call under ``root``."""
+    hits: list[str] = []
+    for filename in filenames:
+        tree = ast.parse((root / filename).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (isinstance(func, ast.Name) and func.id == "axis_index") or (
+                isinstance(func, ast.Attribute) and func.attr == "axis_index"
+            ):
+                hits.append(f"{filename}:{node.lineno}")
+    return hits
+
+
+def test_bridge_retires_spmd_safe_axis_index_and_legacy_tuple_spec() -> None:
+    """Verify legacy bridge helpers are retired and program modules avoid axis_index."""
+    for retired in (
+        "spmd_safe_axis_index",
+        "_AXIS_INDEX_LOCK",
+        "_AXIS_INDEX_STATE",
+        "_STOCK_AXIS_INDEX",
+        "_resolve_op_spec",
+    ):
+        assert not hasattr(bridge, retired)
+    assert "spmd_safe_axis_index" not in bridge.__all__
+
+    bridge_path = Path(bridge.__file__)
+    _assert_no_private_pallas_imports(bridge_path)
+
+    topology = jax_topologies.get_topology_desc("tpu7x_2x2x4")
+    mesh = Mesh(np.array(list(topology.devices)), ("tp",))
+    spec = PartitionSpec("tp")
+
+    register_op_untyped = cast("Callable[..., object]", bridge.register_op)
+    register_global_untyped = cast("Callable[..., object]", bridge.register_global_op)
+    with pytest.raises(TypeError):
+        register_op_untyped(
+            "kimi_k3::legacy_pair", mesh, lambda x: (x,), (spec,), (spec,)
+        )
+    with pytest.raises(TypeError):
+        register_op_untyped("kimi_k3::legacy_single", mesh, lambda x: (x,), (spec,))
+    with pytest.raises(TypeError):
+        register_global_untyped(
+            "kimi_k3::legacy_global_pair", mesh, lambda x: (x,), (spec,), (spec,)
+        )
+    with pytest.raises(TypeError):
+        register_global_untyped(
+            "kimi_k3::legacy_global_single", mesh, lambda x: (x,), (spec,)
+        )
+
+    def read_axis(_x: jax.Array) -> jax.Array:
+        """Read the ``tp`` coordinate via shared ``mesh_axis_index``."""
+        return mesh_axis_index("tp")
+
+    sharded_read = jax.shard_map(
+        read_axis,
+        mesh=mesh,
+        in_specs=PartitionSpec(),
+        out_specs=PartitionSpec(),
+        check_vma=False,
+    )
+    traced = jax.make_jaxpr(sharded_read)(jnp.zeros((1,), dtype=jnp.int32))
+    assert "pallas_call" in str(traced)
+    lowered = jax.jit(sharded_read).lower(jax.ShapeDtypeStruct((1,), jnp.int32))
+    assert "partition-id" not in lowered.as_text()
+
+    program_modules = (
+        "decode.py",
+        "decode_ops.py",
+        "draft.py",
+        "draft_mla.py",
+        "draft_mla_prefill.py",
+        "draft_ring.py",
+        "pools.py",
+        "prefill.py",
+        "program.py",
+        "sampling.py",
+    )
+    assert _find_axis_index_calls(bridge_path.parents[1], program_modules) == []
