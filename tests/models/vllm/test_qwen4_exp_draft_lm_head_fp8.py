@@ -197,3 +197,23 @@ def test_flag_in_compile_key(monkeypatch):
     assert off["VLLM_TPU_DRAFT_LMHEAD_FP8"] is False
     assert on["VLLM_TPU_DRAFT_LMHEAD_FP8"] is True
     assert {k for k in on if on[k] != off.get(k)} == {"VLLM_TPU_DRAFT_LMHEAD_FP8"}
+
+
+def test_scale_is_an_owned_buffer(monkeypatch, setup):
+    """quantize_tensor's scale is a view (of a [V, 1, 1] tensor), which costs torch_tpu
+    an execute_as_strided program before every compiled call that reads it. The head's
+    scale owns its storage and holds the same values."""
+    from vllm_torchtpu.layers.core.quantization import quantize_tensor
+
+    target, draft, _ = setup
+    w = target.weight.detach()
+    _, s = quantize_tensor(w.to(torch.float32).t(), torch.float8_e4m3fn, axis=0)
+    view = s.reshape(V).contiguous()  # the scale as bound before
+    assert view._base is not None
+    _, w_s = dlh.quantize_head_weight(w)
+    assert w_s._base is None
+    assert w_s.untyped_storage().data_ptr() != view.untyped_storage().data_ptr()
+    assert w_s.shape == (V,) and w_s.dtype == torch.float32 and w_s.is_contiguous()
+    assert torch.equal(w_s, view)
+    _bind(monkeypatch, draft, True)
+    assert torch.equal(draft.lm_head.w_s, view)
