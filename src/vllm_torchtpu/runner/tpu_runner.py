@@ -181,6 +181,11 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
     maybe_create_mm_encoder_manager,
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
+from vllm_torchtpu.runner.model_adapters import (
+    ModelAdapter,
+    ModelInputSnapshot,
+    select_model_adapter,
+)
 from vllm_torchtpu.runner.pcp import (
     PcpManager,
     mla_kv_page_size,
@@ -216,6 +221,7 @@ from vllm_torchtpu.spec_decode.adaptive_verification import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+from vllm_torchtpu.spec_decode.proposer_registry import build_draft_proposer
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
@@ -887,6 +893,9 @@ class TPUModelRunner(GPUModelRunner):
         # does not, e.g. a KV connector or CPU-only tests) — in which case
         # mamba and attention share the uniform `num_blocks` as before.
         self._mamba_num_blocks: int | None = None
+        # Optional model-owned inputs and cache (runner/model_adapters.py),
+        # selected in load_model; None keeps the ordinary path.
+        self.model_adapter: ModelAdapter | None = None
         # req_id -> physical mamba slot id, plus the free-slot pool. Slots are
         # allocated when a request first appears and retained until its KV
         # ownership ends. Keying on req_id (rather than persistent-batch
@@ -1524,7 +1533,9 @@ class TPUModelRunner(GPUModelRunner):
             elif self.speculative_config.method == "dspark":
                 self.drafter = DSparkProposer(self, self.vllm_config)
             elif self.speculative_config.use_eagle():
-                self.drafter = Eagle3Proposer(self, self.vllm_config)
+                # A model directory may supply its own proposer for its draft
+                # architecture; none registered builds the shared one.
+                self.drafter = build_draft_proposer(self, self.vllm_config)
             else:
                 raise NotImplementedError(
                     "Unsupported speculative decoding method: "
@@ -1907,6 +1918,12 @@ class TPUModelRunner(GPUModelRunner):
         effective_num_reqs_padded = (
             num_reqs_padded if num_reqs_padded is not None else num_reqs
         )
+        if self.model_adapter is not None:
+            owned = self.model_adapter.build_attention_metadata(
+                ctx, effective_num_reqs_padded
+            )
+            if owned is not None:
+                return owned, None
 
         if ctx.staged_block_tables is None:
             # One batched H2D for every group's block table (zero-filled for
@@ -4446,6 +4463,10 @@ class TPUModelRunner(GPUModelRunner):
                 if has_encoder_inputs:
                     synchronize_tensors()
 
+        step_token_store = (
+            self.model_adapter.begin_step() if self.model_adapter is not None else None
+        )
+
         # Profile the current batch composition (prefill vs decode) if phased profiling
         # is enabled.
         batch_composition_stats = None
@@ -4663,6 +4684,21 @@ class TPUModelRunner(GPUModelRunner):
                         src_key, "UNKNOWN" if src_key == "phase" else 0
                     )
 
+            model_kwargs = None
+            if self.model_adapter is not None:
+                assert step_token_store is not None
+                assert input_ids is not None
+                model_kwargs = self.model_adapter.prepare_inputs(
+                    ModelInputSnapshot(
+                        token_store=step_token_store,
+                        row_start=start_index,
+                        num_requests=num_reqs,
+                        num_tokens_padded=num_tokens_padded,
+                        attention_metadata=attn_metadata,
+                        input_ids=input_ids,
+                    )
+                )
+
             trace_name = f"ModelForward: {num_reqs} reqs, {num_tokens_padded} toks"
             if "min_kv_len" in trace_kwargs:
                 trace_name += (
@@ -4697,6 +4733,7 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
+                    model_kwargs=model_kwargs,
                 )
 
             if nan_check is not None:
@@ -6234,7 +6271,33 @@ class TPUModelRunner(GPUModelRunner):
 
         return async_output
 
+    def _check_model_adapter_support(self) -> None:
+        """Reject configurations the model adapter path does not support.
+
+        Supported: one pipeline stage, no LoRA, and speculative decoding only
+        through the async (hidden-state) drafter, whose layers the adapter
+        binds with `bind_draft`.
+        """
+        unsupported = []
+        if self.parallel_config.pipeline_parallel_size != 1:
+            unsupported.append("pipeline parallelism")
+        if self.lora_config is not None:
+            unsupported.append("LoRA")
+        if self.speculative_config is not None and not self._is_async_drafter:
+            unsupported.append(
+                f"speculative decoding method {self.speculative_config.method!r}"
+            )
+        if unsupported:
+            raise NotImplementedError(
+                f"The model adapter for {self.model_config.architecture} does "
+                f"not support {', '.join(unsupported)}"
+            )
+
     def load_model(self) -> None:
+        self.model_adapter = select_model_adapter(self)
+        if self.model_adapter is not None:
+            self._check_model_adapter_support()
+        self.kv_cache_manager.model_adapter = self.model_adapter
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
@@ -6274,6 +6337,8 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if self.model_adapter is not None:
+            self.model_adapter.bind_model(model)
         if self.lora_config is not None:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
         self._dp_vocab_logits = dp_vocab_parallel.check_layers_sharded_over_dp(
@@ -6317,6 +6382,9 @@ class TPUModelRunner(GPUModelRunner):
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
             self._async_drafter.load_model(self.model)
+            # A model-owned cache binds and names the draft's own layers.
+            if self.model_adapter is not None:
+                self.model_adapter.bind_draft(self.drafter)
             # The draft reuses the target's Pallas ops (cached by op name),
             # which were traced against the target's relayouted tables. Its
             # own rope caches and hash tables need the same layout, or the
@@ -6635,6 +6703,20 @@ class TPUModelRunner(GPUModelRunner):
         # Same fence discipline as a serving chunk: release the previous
         # chunk's host sources, then fence this one's before its forward.
         self._wait_input_staging_fence()
+        if self.model_adapter is not None:
+            # The adapter owns its dummy-run geometry: it lays out the batch
+            # from num_tokens and num_reqs against its own cache, so
+            # num_blocks and use_max_model_len (which only size the runner's
+            # block tables) are not passed on. Decode-shaped profiles and
+            # pipeline hand-offs are not supported.
+            if through_handoff or profile_decode_query_lens is not None:
+                raise NotImplementedError(
+                    "A model adapter's dummy run supports neither through_handoff "
+                    "nor profile_decode_query_lens"
+                )
+            return self.model_adapter.dummy_run(
+                num_tokens, num_reqs, profile_prefix, dp_lockstep=dp_lockstep
+            )
         kv_cache_initialized = self.kv_cache_config is not None
         profiling = profile_prefix is not None
         assert profile_decode_query_lens is None or profiling
@@ -7834,6 +7916,12 @@ class TPUModelRunner(GPUModelRunner):
             self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
             self._precompile_spec_boundary_copies()
+            if self.model_adapter is not None:
+                with self._precompile_timed("fused model-adapter inputs"):
+                    self.model_adapter.precompile_fused_inputs(
+                        self.num_tokens_paddings,
+                        (self.num_reqs_max_model_len, self.num_reqs_most_model_len),
+                    )
 
             # Precompile multimodal vision encoder graphs
             self.encoder_cudagraph_manager = maybe_create_mm_encoder_manager(
@@ -8072,7 +8160,7 @@ class TPUModelRunner(GPUModelRunner):
                 for num_tokens in self._backbone_token_paddings():
                     logger.info("  -- num_tokens: %d", num_tokens)
                     if buckets.needs_retrace(num_tokens):
-                        shape_variants.retrace(self.model, self.vllm_config)
+                        shape_variants.retrace(self.model, self.vllm_config, num_tokens)
                     self._backbone_dummy_runs(num_tokens)
                 if buckets.refused:
                     # A refusal that no trace picked up leaves a raising
@@ -9235,11 +9323,16 @@ class TPUModelRunner(GPUModelRunner):
         padding_state.update(num_valid_tokens, num_tokens_padded)
 
     def forward_model(
-        self, input_ids, positions, inputs_embeds=None, intermediate_tensors=None
+        self,
+        input_ids,
+        positions,
+        inputs_embeds=None,
+        intermediate_tensors=None,
+        model_kwargs=None,
     ):
         # @support_torch_compile annotations will be put on the vLLM model if it
         # supports torch.compile
-        kwargs = {}
+        kwargs = {} if model_kwargs is None else dict(model_kwargs)
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
         out = self.model(
