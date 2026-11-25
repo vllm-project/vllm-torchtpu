@@ -206,6 +206,22 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
+# Evaluate xla_jf_program_hbm_alignment_in_kib=1 (google-pytorch/torch_tpu#6231).
+case " ${TORCH_TPU_INTERNAL_XLA_OPTIONS:-} " in
+    *" xla_jf_program_hbm_alignment_in_kib="*) ;;
+    *)
+        export TORCH_TPU_INTERNAL_XLA_OPTIONS="${TORCH_TPU_INTERNAL_XLA_OPTIONS:+$TORCH_TPU_INTERNAL_XLA_OPTIONS }xla_jf_program_hbm_alignment_in_kib=1"
+        ;;
+esac
+if [ -n "${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY:-}" ]; then
+    case ",${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY}," in
+        *,TORCH_TPU_INTERNAL_XLA_OPTIONS,*) ;;
+        *)
+            export VLLM_RAY_EXTRA_ENV_VARS_TO_COPY="${VLLM_RAY_EXTRA_ENV_VARS_TO_COPY},TORCH_TPU_INTERNAL_XLA_OPTIONS"
+            ;;
+    esac
+fi
+
 if [ -n "${BENCHMARK_MODE_CLI:-}" ]; then
     BENCHMARK_MODE="$BENCHMARK_MODE_CLI"
 fi
@@ -415,6 +431,7 @@ start_vllm_server() {
     echo "  max_num_batched_tokens=$max_num_batched_tokens"
     echo "  max_num_seqs=$max_num_seqs"
     echo "  gpu_mem_util=$gpu_mem_util"
+    echo "  TORCH_TPU_INTERNAL_XLA_OPTIONS=${TORCH_TPU_INTERNAL_XLA_OPTIONS:-}"
     echo "================================================"
     echo "[cmd] $server_cmd"
 

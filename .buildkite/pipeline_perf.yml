@@ -20,6 +20,7 @@
 # it is a property of this lane, not of any one benchmark.
 env:
   ARTIFACTS_DIR: "perf_eval_results"
+  TORCH_TPU_INTERNAL_XLA_OPTIONS: "xla_jf_program_hbm_alignment_in_kib=1"
 
 x-kube-plugin: &kube_plugin
   kubernetes:
