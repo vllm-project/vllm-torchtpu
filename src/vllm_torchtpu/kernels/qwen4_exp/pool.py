@@ -268,7 +268,12 @@ def token_checkpoints(x, history, starts, initial, active, ckpt_ids, windowed):
     positions = (
         rel[:, None] + 1 - state_len + jnp.arange(state_len, dtype=jnp.int32)[None]
     )
-    past = history[req[:, None], jnp.clip(positions + state_len, 0, state_len - 1)]
+    # A row gather from the flat [count * state_len, channels] history: indexing the
+    # 3-D history by (request, position) makes XLA relayout it before a slow gather
+    # (whole call at 16 tokens on v7x: 54 -> 27 us). Same rows.
+    past = history.reshape(count * state_len, -1)[
+        req[:, None] * state_len + jnp.clip(positions + state_len, 0, state_len - 1)
+    ]
     past = jnp.where(initial[req][:, None, None], past, 0)
     current = x[jnp.clip(starts[req][:, None] + positions, 0, max(token_count - 1, 0))]
     values = jnp.where((positions >= 0)[..., None], current, past.astype(x.dtype))
