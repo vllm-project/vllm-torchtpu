@@ -1801,3 +1801,50 @@ def test_skip_idle_buckets_keeps_nvis_balance_bit_identical(monkeypatch):
     base = _main_run(monkeypatch, 16, skip_idle=False, nvis_balance=True, **kw)
     assert np.isfinite(base[0]).all()
     _assert_xreq_identical(base, run)
+
+
+@pytest.mark.parametrize("dcp,nvis,fast,cut", [(1, 3, "1", "1024"), (1, 3, "1", "16384"),
+                                               (2, 3, "te", "1024"), (1, 1, "0", "1024")])
+def test_lane_major_select_and_dense_read_bit_identical(monkeypatch, dcp, nvis, fast, cut):
+    """VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT (+ VLLM_TPU_MK_FP8_DENSE_READ): int16 count passes
+    (THR_FAST early exit / tiers included), lane-major row, pool-path and union compactions
+    (ranged union with the DCP-2 lane pack, full union) give a bit-identical step: residual,
+    selection ids, compressed keys and ring. `cut` routes the rows to the full scan (1024) or
+    the ranged one (16384)."""
+    from vllm_torchtpu.megakernel.wholestep import indexer as ix
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+    from vllm_torchtpu.models.vllm.qwen4_exp import pool_layout
+
+    if dcp > 1:
+        monkeypatch.setenv(pool_layout.MAIN_KV_DCP_ENV, "2")
+        monkeypatch.setenv("VLLM_TPU_MK_QSA_UNION_LANEPACK", "1")
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_THR_FAST", fast)
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_NVIS_CUT", cut)
+    kw = dict(long=True, rank_ids=True, union=True, shard=True, shared_kv=True, dcp=dcp,
+              select_nvis=nvis, nvis_rows=(16, 16), max_groups=8192, ctx=[30001, 9000])
+    seen = []
+    for mod, name in ((ix, "compact_sel"), (ix, "_value_passes16_early"),
+                      (ua, "_compact_union_lm"), (ua, "_compact_union_chunk_lm")):
+        orig = getattr(mod, name)
+
+        def spy(*a, _orig=orig, _name=name, **k):
+            seen.append(_name)
+            return _orig(*a, **k)
+
+        monkeypatch.setattr(mod, name, spy)
+    monkeypatch.delenv("VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT", raising=False)
+    monkeypatch.delenv("VLLM_TPU_MK_FP8_DENSE_READ", raising=False)
+    off = _run_c(**kw)
+    assert not seen
+    monkeypatch.setenv("VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT", "1")
+    monkeypatch.setenv("VLLM_TPU_MK_FP8_DENSE_READ", "1")
+    jax.clear_caches()
+    on = _run_c(**kw)
+    if cut == "1024":  # full-scan rows: the lane-major row / pool-path compaction ran
+        assert "compact_sel" in seen
+    assert ("_compact_union_chunk_lm" if nvis >= 2 else "_compact_union_lm") in seen
+    if cut == "1024" and "e" in (fast if fast != "1" else "ter2"):
+        assert "_value_passes16_early" in seen
+    assert np.isfinite(on[0]).all()
+    for i in (0, 3, 4, 7):  # residual, compressed keys, ring, selection ids
+        np.testing.assert_array_equal(on[i], off[i])
