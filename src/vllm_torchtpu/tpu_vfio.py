@@ -29,10 +29,10 @@ logger = init_logger(__name__)
 TPU_PCI_VENDOR_ID = "0x1ae0"
 
 # Google TPU PCI device IDs mapped to canonical accelerator prefixes (matching
-# jax/_src/hardware_utils.py).
+# public generations in jax/_src/hardware_utils.py; omits 0x0056 / plc which
+# has no public name and falls through to the unknown-Google legacy fallback).
 TPU_PCI_DEVICE_ID_TO_TYPE: dict[str, str] = {
     "0x0027": "v3",
-    "0x0056": "v5litepod",
     "0x005e": "v4",
     "0x0062": "v5p",
     "0x0063": "v5litepod",
@@ -42,12 +42,12 @@ TPU_PCI_DEVICE_ID_TO_TYPE: dict[str, str] = {
     "0x0083": "tpu8i",
 }
 
-# Hardware-verified SR-IOV application VF counts per physical function
-# (virtfn0 .. virtfn{k-1}) when bare-metal sysfs exposes ``physfn`` alongside
-# ICI management VFs. GCE/GKE guest VMs pass through VFs without ``physfn`` in
-# guest sysfs, so ``_is_application_pci_function`` accepts them without a cap.
+# Bare-metal-verified SR-IOV application VF counts per physical function
+# (virtfn0 .. virtfn{k-1}) when host sysfs exposes ``physfn`` alongside ICI
+# management VFs. Only 0x0076 (TPU7x) is bare-metal verified here; GCE/GKE
+# guest VMs pass through VFs without ``physfn`` in guest sysfs, so
+# ``_is_application_pci_function`` accepts them without a cap.
 TPU_VFIO_MAX_APP_VFS_PER_PF: dict[str, int] = {
-    "0x006f": 1,
     "0x0076": 2,
 }
 

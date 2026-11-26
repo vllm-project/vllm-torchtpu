@@ -201,6 +201,20 @@ def test_get_num_chips_excludes_sriov_pf_and_mgmt_vf(monkeypatch):
     monkeypatch.delenv("TPU_ACCELERATOR_TYPE", raising=False)
     assert tpu_info.get_tpu_type() == "tpu7x"
 
+    # Only bare-metal-verified 0x0076 carries a per-PF cap; GCE/GKE guest VMs
+    # (e.g. v6e / 0x006f without physfn in sysfs) count all compute VFs.
+    assert tpu_vfio.TPU_VFIO_MAX_APP_VFS_PER_PF == {"0x0076": 2}
+    _patch_vfio_fs(
+        monkeypatch,
+        vfio_entries=["0", "1", "2", "3"],
+        iommu_devices_fn=lambda _: ["0000:00:04.0"],
+        open_sysfs_fn=lambda s: io.StringIO(
+            "0x1ae0\n" if s.endswith("/vendor") else "0x006f\n"
+        ),
+    )
+    assert tpu_info.get_num_chips() == 4
+    assert tpu_info.get_tpu_type() == "v6e"
+
 
 def test_get_num_chips_unreadable_sysfs_fallback_vs_inaccessible_vfio(monkeypatch):
     monkeypatch.setattr(tpu_info.glob, "glob", lambda pattern: [])
@@ -236,17 +250,22 @@ def test_get_num_chips_unreadable_sysfs_fallback_vs_inaccessible_vfio(monkeypatc
 
 def test_get_num_chips_unknown_google_pci_id_warns_and_falls_back(monkeypatch, caplog):
     monkeypatch.setattr(tpu_info.glob, "glob", lambda pattern: [])
-    _patch_vfio_fs(
-        monkeypatch,
-        vfio_entries=["0", "1", "2", "3"],
-        iommu_devices_fn=lambda _: ["0000:00:04.0"],
-        open_sysfs_fn=lambda s: io.StringIO(
-            "0x1ae0\n" if s.endswith("/vendor") else "0x0099\n"
-        ),
-    )
-    with caplog.at_level(logging.WARNING):
-        assert tpu_info.get_num_chips() == 4
-    assert "0x0099" in caplog.text
+    # Unrecognized Google PCI IDs (including 0x0056 / plc, which has no public
+    # name in JAX) are not misclassified and fall back to legacy VFIO count.
+    for device_id in ("0x0099", "0x0056"):
+        caplog.clear()
+        _patch_vfio_fs(
+            monkeypatch,
+            vfio_entries=["0", "1", "2", "3"],
+            iommu_devices_fn=lambda _: ["0000:00:04.0"],
+            open_sysfs_fn=lambda s, dev_id=device_id: io.StringIO(
+                "0x1ae0\n" if s.endswith("/vendor") else f"{dev_id}\n"
+            ),
+        )
+        assert tpu_vfio.detect_vfio_tpu_type() is None
+        with caplog.at_level(logging.WARNING):
+            assert tpu_info.get_num_chips() == 4
+        assert device_id in caplog.text
 
     # Readable non-Google sysfs (e.g. NVIDIA GPU) still returns 0 with no fallback.
     _patch_vfio_fs(
