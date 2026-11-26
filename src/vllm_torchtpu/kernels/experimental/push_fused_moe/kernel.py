@@ -82,6 +82,21 @@ N_DISPATCH_TABLES = 2
 HEIGHT_RUNGS = 2
 
 
+class _CopyGroup:
+    """Several async copies started and waited as one."""
+
+    def __init__(self, copies):
+        self.copies = copies
+
+    def start(self, **kwargs):
+        for copy in self.copies:
+            copy.start(**kwargs)
+
+    def wait(self):
+        for copy in self.copies:
+            copy.wait()
+
+
 def tile_height_rungs(tile_m, override=0):
     """v2's equally spaced tile-height ladder at this build's HEIGHT_RUNGS.
 
@@ -597,6 +612,20 @@ def _build_push_moe_kernel(
 
         def w1_copy(expert, slot):
             """The gate/up weight slab of `expert`, into weight slot `slot`."""
+            if rhs_packed4 and trim_gate_up_padding:
+                # The gate/up contractions never read either half's padded
+                # columns [effective_inter, inter): copy the two live column
+                # ranges only, on the slot's one semaphore.
+                return _CopyGroup(
+                    tuple(
+                        pltpu.make_async_copy(
+                            w1_hbm.at[expert, :, pl.ds(start, effective_inter)],
+                            w1_vm.at[slot, :, pl.ds(start, effective_inter)],
+                            w1_sems.at[slot],
+                        )
+                        for start in (0, inter)
+                    )
+                )
             return _slot_copy(w1_hbm.at[expert], w1_vm, w1_sems, slot)
 
         def w2_copy(expert, slot):
