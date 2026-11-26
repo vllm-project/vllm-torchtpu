@@ -92,27 +92,21 @@ class TestResetCompileWrapperRecursion:
 
 
 class TestPiecewiseBackendDispatch:
-    """Bucket dispatch when no argument is a SymInt, plus decode-only overlay."""
+    """Bucket dispatch when no argument is a SymInt."""
 
     @pytest.fixture(autouse=True)
     def patched(self):
-        original_init = PiecewiseBackend.__init__
-        original_call = PiecewiseBackend.__call__
+        original = PiecewiseBackend.__call__
         _patch_vllm_piecewise_backend()
         yield
-        PiecewiseBackend.__init__ = original_init
-        PiecewiseBackend.__call__ = original_call
+        PiecewiseBackend.__call__ = original
 
     @staticmethod
     def _backend(sym_shape_indices):
         """A backend with two compiled buckets, keyed by the shape asked for."""
         entries = {
             n: SimpleNamespace(
-                compiled=True,
-                compile_range=SimpleNamespace(
-                    start=n, end=n, is_single_size=lambda: True
-                ),
-                runnable=lambda *a, n=n, **k: n,
+                compiled=True, compile_range=(n, n), runnable=lambda *a, n=n, **k: n
             )
             for n in (16, 128)
         }
@@ -141,69 +135,6 @@ class TestPiecewiseBackendDispatch:
         backend = self._backend(sym_shape_indices=[])
         with pytest.raises(AssertionError):
             PiecewiseBackend.__call__(backend, torch.zeros(999, 4))
-
-    def test_decode_only_overlay_dispatch_and_fallback(self):
-        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-            set_vllm_model_wrapper_context,
-        )
-
-        backend = self._backend(sym_shape_indices=[])
-        backend._tpu_decode_only_runnables = {16: lambda *a, **k: "decode_16"}
-
-        assert PiecewiseBackend.__call__(backend, torch.zeros(16, 4)) == 16
-        with set_vllm_model_wrapper_context(
-            mesh=None,  # type: ignore[arg-type]
-            rpa_decode_only=True,
-        ):
-            assert PiecewiseBackend.__call__(backend, torch.zeros(16, 4)) == "decode_16"
-            # Bucket without a decode-only entry falls back to the mixed runnable.
-            assert PiecewiseBackend.__call__(backend, torch.zeros(128, 4)) == 128
-            with set_vllm_model_wrapper_context(
-                mesh=None,  # type: ignore[arg-type]
-                rpa_decode_only=False,
-            ):
-                assert PiecewiseBackend.__call__(backend, torch.zeros(16, 4)) == 16
-
-        # Single-bucket backend also dispatches decode-only when attached.
-        single_entry = {
-            32: SimpleNamespace(
-                compiled=True,
-                compile_range=SimpleNamespace(
-                    start=32, end=32, is_single_size=lambda: True
-                ),
-                runnable=lambda *a, **k: "mixed_32",
-            )
-        }
-        single = SimpleNamespace(
-            sym_shape_indices=[],
-            range_entries=single_entry,
-            compile_sizes=[32],
-            compile_ranges=[(32, 32)],
-            _find_range_for_shape=single_entry.get,
-            _tpu_decode_only_runnables={32: lambda *a, **k: "decode_32"},
-        )
-        assert PiecewiseBackend.__call__(single, torch.zeros(32, 4)) == "mixed_32"
-        with set_vllm_model_wrapper_context(
-            mesh=None,  # type: ignore[arg-type]
-            rpa_decode_only=True,
-        ):
-            assert PiecewiseBackend.__call__(single, torch.zeros(32, 4)) == "decode_32"
-
-    def test_init_registers_backend_in_shape_variants_session(self):
-        from vllm_torchtpu.compilation import shape_variants
-
-        recorded: list[object] = []
-
-        def fake_init(self, *args, **kwargs):
-            recorded.append(self)
-
-        PiecewiseBackend.__init__ = fake_init
-        _patch_vllm_piecewise_backend()
-        inst = object.__new__(PiecewiseBackend)
-        with shape_variants.warmup() as session:
-            PiecewiseBackend.__init__(inst)
-            assert session.backends == [(0, inst)]
-        assert recorded == [inst]
 
 
 class TestCompilePrefixIsolation:

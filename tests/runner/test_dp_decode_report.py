@@ -109,30 +109,3 @@ def test_any_decode_means_a_request_past_its_prompt(
     )
     scheduler_output = SimpleNamespace(num_scheduled_tokens={"a": 8, "b": 1})
     assert runner._any_decode(scheduler_output) is expected
-
-
-@pytest.mark.parametrize(
-    ("mixed_ranks", "expected"),
-    [
-        (set(), [False] * DP_SIZE),
-        ({2}, [True] * DP_SIZE),
-        ({0, 3}, [True] * DP_SIZE),
-    ],
-)
-def test_dp_coordinated_step_propagates_rpa_mixed(monkeypatch, mixed_ranks, expected):
-    """Every DP rank agrees on whether any rank has mixed/prefill RPA work."""
-    runners = [_runner() for _ in range(DP_SIZE)]
-    sent: list[torch.Tensor] = []
-
-    def _run_rank(rank: int, runner: TPUModelRunner, all_reduce):
-        group = SimpleNamespace(rank_in_group=rank, world_size=DP_SIZE, cpu_group=None)
-        monkeypatch.setattr(parallel_state, "get_dp_group", lambda: group)
-        monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
-        runner._dp_coordinated_step(16, 1, local_has_rpa_mixed=(rank in mixed_ranks))
-
-    for rank, runner in enumerate(runners):
-        _run_rank(rank, runner, lambda t, op=None, group=None: sent.append(t.clone()))
-    reduced = torch.stack(sent).amax(dim=0)
-    for rank, runner in enumerate(runners):
-        _run_rank(rank, runner, lambda t, op=None, group=None: t.copy_(reduced))
-    assert [runner._dp_step_has_rpa_mixed for runner in runners] == expected
