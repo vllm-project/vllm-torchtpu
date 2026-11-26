@@ -527,9 +527,12 @@ def _kernel(
                 limit = jnp.where(page >= 0, limit * hit, 0)  # [1, Bq]
                 seen = jnp.max(limit)
                 if fp4:
-                    # Each key's scale (with the score scale) and each value's
-                    # fold into their bf16 rows: a scale column per page, not a
-                    # multiply per score. int4 rows and the sanitized scales are
+                    # Each key's scale (with the score scale) folds into its
+                    # bf16 row, a scale column per page, not a multiply per
+                    # score; each value's into v^T, where the scales are a lane
+                    # vector broadcast down the sublanes: no lane broadcasts of
+                    # a column (half the XLU work, kernel bench c48 2048-token
+                    # call -2..-4 %). int4 rows and the sanitized scales are
                     # finite, so masked keys and values meet p = 0 harmlessly.
                     if fp4_rows == "head":
                         k_row = 2 * head_ref[0]
@@ -539,9 +542,8 @@ def _kernel(
                     rows, sk, sv = msa_attention._fp4_page(
                         kv_ref, scale_buf_ref.at[half, g], k_row, v_row
                     )
+                    values.append((rows[:, head_dim:].T * sv).astype(jnp.bfloat16))
                     k_col = (sk * (sm_scale * _LOG2_E)).reshape(page_size, 1)
-                    v_col = sv.reshape(page_size, 1)
-                    values.append((rows[:, head_dim:] * v_col).astype(jnp.bfloat16))
                     rows = (rows[:, :head_dim] * k_col).astype(jnp.bfloat16)
                 elif direct_t:
                     # As stored (words bitcast, rows in `row_slots` order).
@@ -576,7 +578,7 @@ def _kernel(
                     # Rows are head-major (h * Bq + t): heads share a token's mask.
                     masks.append(row_slots < jnp.tile(limit, (1, num_heads)))
             k = jnp.concatenate(keys, axis=0)
-            v = jnp.concatenate(values, axis=0)
+            v = jnp.concatenate(values, axis=1 if fp4 else 0)  # 4-bit: v^T [D, W * S]
             q = load_q().reshape(num_heads * block_q, head_dim)
             if not fp4:  # 4-bit keys carry the scale
                 q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
@@ -596,13 +598,22 @@ def _kernel(
             # value rows (rows of ones streamed with v^T), not from a VPU add
             # per score vreg (the body is VALU-bound; kernel bench j-3e361d8c).
             # The sum is over the bf16 p the matmul weighs v with.
-            ones = jnp.ones((v.shape[0], _SUM_ROWS), v.dtype)
-            pv = jax.lax.dot_general(
-                jnp.concatenate([v, ones], axis=1),
-                p.astype(jnp.bfloat16),  # bf16 x fp8 dot for 8-bit `direct_t`
-                (((0,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )  # [D + _SUM_ROWS, rows]
+            if fp4:
+                ones = jnp.ones((_SUM_ROWS, v.shape[1]), v.dtype)
+                pv = jax.lax.dot_general(
+                    jnp.concatenate([v, ones], axis=0),
+                    p.astype(jnp.bfloat16),
+                    (((1,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )  # [D + _SUM_ROWS, rows]
+            else:
+                ones = jnp.ones((v.shape[0], _SUM_ROWS), v.dtype)
+                pv = jax.lax.dot_general(
+                    jnp.concatenate([v, ones], axis=1),
+                    p.astype(jnp.bfloat16),  # bf16 x fp8 dot for 8-bit `direct_t`
+                    (((0,), (0,)), ((), ())),
+                    preferred_element_type=jnp.float32,
+                )  # [D + _SUM_ROWS, rows]
             l_cur, pv = pv[head_dim : head_dim + 1], pv[:head_dim]
             return m_prev, m_new, l_cur, pv
 
