@@ -101,6 +101,12 @@ PATCHES = (
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
+    # Also installed by register_tpu_platform: engine-args validation in the API
+    # server runs after platform resolution but before platform activation.
+    Patch(
+        "vllm_torchtpu.platforms.pp_validation:patch_mtp_draft_verify_as_one_stage",
+        _ACTIVE,
+    ),
     Patch("vllm_torchtpu:_patch_dflash_bypass_v2_runner_check", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_config_triton_tpu", _ACTIVE),
     # Weight loading and embeddings.

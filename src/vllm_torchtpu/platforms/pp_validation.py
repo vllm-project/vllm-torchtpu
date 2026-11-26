@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Static checks for pipeline parallelism on TPU."""
 
+import copy
 from typing import Any
 
 
@@ -244,3 +245,39 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         raise NotImplementedError(
             f"Pipeline parallelism on TPU does not support {unsupported} yet.{remedy}"
         )
+
+
+def patch_mtp_draft_verify_as_one_stage() -> bool | None:
+    """Verify an MTP draft's model config as one stage under the PP gate.
+
+    SpeculativeConfig verifies the draft against the target's pipeline size,
+    and the DeepSeek-style MTP draft (``deepseek_mtp``) does not implement
+    SupportsPP. Under TPU_PP_MTP_PREFILL_KV the draft is built whole on the
+    last stage only, so it is checked with a pipeline size of 1. The API
+    server's create_engine_config needs it, so register_tpu_platform installs
+    it as well as the patch registry.
+    """
+    try:
+        from vllm.config.model import ModelConfig
+    except ImportError:
+        # vllm.config mid-import (platform resolved from inside it): retry.
+        return False
+    if getattr(ModelConfig, "_tpu_pp_mtp_draft_patch", False):
+        return None
+    original = ModelConfig.verify_with_parallel_config
+
+    def verify_with_parallel_config(self, parallel_config):
+        from vllm_torchtpu import envs
+
+        if (
+            parallel_config.pipeline_parallel_size > 1
+            and envs.TPU_PP_MTP_PREFILL_KV
+            and getattr(self.hf_config, "model_type", None) == "deepseek_mtp"
+        ):
+            parallel_config = copy.copy(parallel_config)
+            parallel_config.pipeline_parallel_size = 1
+        return original(self, parallel_config)
+
+    ModelConfig.verify_with_parallel_config = verify_with_parallel_config
+    ModelConfig._tpu_pp_mtp_draft_patch = True
+    return None

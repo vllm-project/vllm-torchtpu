@@ -41,8 +41,13 @@ def _log_tpu_info() -> None:
 
 def register_tpu_platform() -> str:
     """vLLM out-of-tree platform plugin entry point."""
+    from vllm_torchtpu.platforms.pp_validation import (
+        patch_mtp_draft_verify_as_one_stage,
+    )
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
+    # Before create_engine_config builds the SpeculativeConfig.
+    patch_mtp_draft_verify_as_one_stage()
     _log_tpu_info()
     return f"{TpuPlatform.__module__}.{TpuPlatform.__qualname__}"
 
