@@ -1707,8 +1707,11 @@ class WaveRefs:
     """Refs of `gmm_v2_mlp_scatter`'s rows as they land (see `wave_lhs`
     there)."""
 
-    recv: jax.Array  # HBM uint32[size_m, 8, size_k / 32], fp8 row words
-    sems: jax.Array  # DMA[>= size_lhs_group]: wave e counts lhs group e's rows
+    recv: jax.Array  # HBM uint32[>= size_m, 8, size_k / 32], fp8 row words
+    # DMA[size_lhs_group + 1]: wave e counts lhs group e's rows, the last one
+    # `sentinels` rows
+    sems: jax.Array
+    sentinels: jax.Array  # SMEM int32[1]
     scale_hbm: jax.Array  # HBM float32[size_m]
     scale: jax.Array  # SMEM float32[size_m], valid after `scale_copy`
     rows: jax.Array  # VMEM uint32[tile_m, 8, size_k / 32]
@@ -2522,8 +2525,10 @@ def _mlp_kernel(
             wave.scale_copy().wait()
 
         # Every wave semaphore ends balanced, the waves of experts without
-        # tiles included.
-        wait_waves(lhs_group_sizes_ref.shape[0])
+        # tiles and the sentinels included.
+        num_waves = lhs_group_sizes_ref.shape[0]
+        wait_waves(num_waves)
+        wait_rows(wave.sems.at[num_waves], wave.recv, wave.sentinels[0])
 
     if scatter is not None:
         if wave is None:
@@ -2787,6 +2792,7 @@ def mlp_scatter_kernel_main(
         return out
 
     group_sizes, group_offset, me, expected = take(4)
+    wave_prefetch = take(1) if wave else []
     extra_prefetch = take(3) if extra else []
     tail_prefetch = take(5) if tail else []
     lhs, w1, s1, w2, s2, dest_member_hbm, dest_row_hbm = take(7)
@@ -2827,6 +2833,7 @@ def mlp_scatter_kernel_main(
         wave_refs = WaveRefs(
             recv=lhs,
             sems=wave_sems,
+            sentinels=wave_prefetch[0],
             scale_hbm=scale_hbm,
             scale=wave_scale,
             rows=wave_rows,
@@ -2952,7 +2959,7 @@ def gmm_v2_mlp_scatter(
     expected: jax.Array,  # int32[1]
     extra: tuple[jax.Array, ...] | None = None,
     tail: tuple[jax.Array, ...] | None = None,
-    wave_lhs: tuple[jax.Array, jax.Array, jax.Array] | None = None,
+    wave_lhs: tuple[jax.Array, ...] | None = None,
     *,
     num_recv_rows: int,
     num_extra_recv_rows: int = 0,
@@ -3000,29 +3007,33 @@ def gmm_v2_mlp_scatter(
     block by owned block, returned once this member's copies have left and
     the other ranks' blocks have landed. `fits[0]` = 0: no sums, no copies.
 
-    `wave_lhs` = (recv, row_scale, wave_sems), lhs None: the rows come as
-    they land. recv uint32 [size_m, 8, size_k / 32] holds fp8 row words
-    (`row_copy.fp8_row_words`) and row `j` stands for bf16 ``recv[j] *
-    row_scale[j]`` (row_scale float32 [size_m]) as `gather_rows` makes it.
-    wave_sems: DMA semaphores of this core, from another kernel; semaphore
-    `e` counts lhs group `e`'s rows (8 KB each at size_k 8192) as they land.
-    Before its first tile the kernel waits for all of an expert's rows (for
-    `group_sizes[e]` rows of each wave up to it, every wave once, in order),
-    and before it exits for every wave's rows. The result is bitwise lhs =
-    `gather_rows`' rows. size_m must be a multiple of 16.
+    `wave_lhs` = (recv, row_scale, wave_sems, sentinels), lhs None: the
+    rows come as they land. recv uint32 [>= size_m, 8, size_k / 32] holds
+    fp8 row words (`row_copy.fp8_row_words`) and row `j` < size_m stands
+    for bf16 ``recv[j] * row_scale[j]`` (row_scale float32 [size_m]) as
+    `gather_rows` makes it. wave_sems: size_lhs_group + 1 DMA semaphores of
+    this core, from another kernel; semaphore `e` counts lhs group `e`'s
+    rows as they land, the last one ``sentinels[0]`` (int32 [1]) more rows,
+    one recv row's bytes each. Before its first tile the kernel waits for
+    all of an expert's rows (for `group_sizes[e]` rows of each wave up to
+    it, every wave once, in order), and before it exits for every wave's
+    rows and the sentinels. The result is bitwise lhs = `gather_rows`'
+    rows. size_m must be a multiple of 16.
     """
 
     wave = wave_lhs is not None
     if wave:
-        recv, row_scale, wave_sems = wave_lhs
-        size_m, words_sub, lanes = recv.shape
+        recv, row_scale, wave_sems, sentinels = wave_lhs
+        (size_m,) = row_scale.shape
+        _, words_sub, lanes = recv.shape
         if (
             lhs is not None
             or recv.dtype != jnp.uint32
             or words_sub != FP8_ROW_SUBLANES
             or size_m % 16
-            or row_scale.shape != (size_m,)
-            or wave_sems.shape[0] < group_sizes.shape[0]
+            or recv.shape[0] < size_m
+            or wave_sems.shape != (group_sizes.shape[0] + 1,)
+            or sentinels.shape != (1,)
         ):
             raise ValueError("gmm_v2_mlp_scatter does not support these landing rows")
         lhs = recv
@@ -3148,9 +3159,10 @@ def gmm_v2_mlp_scatter(
         for a in (dest_member, dest_row)
     ]
     in_specs = [hbm] * len(inputs)
-    if wave:
-        # The landing rows are read where the other kernel's copies write
-        # them, while they land.
+    if wave_lhs is not None:
+        # recv (inputs[0]) is read where the other kernel's copies write the
+        # rows, while they land.
+        _, row_scale, wave_sems, sentinels = wave_lhs
         inputs += [
             pltpu.with_memory_space_constraint(
                 row_scale.astype(jnp.float32), pltpu.HBM
@@ -3158,6 +3170,7 @@ def gmm_v2_mlp_scatter(
             wave_sems,
         ]
         in_specs += [hbm, pl.BlockSpec(memory_space=pltpu.SEMAPHORE)]
+        prefetch += [sentinels.astype(jnp.int32)]
         name += "-w"
     out_shape = recv_shape
     out_specs = hbm
@@ -3186,7 +3199,7 @@ def gmm_v2_mlp_scatter(
         name += "-t"
     if wave:
         scratch_shapes += [
-            pltpu.VMEM((cfgs.tile_m,) + recv.shape[1:], recv.dtype),
+            pltpu.VMEM((cfgs.tile_m,) + lhs.shape[1:], lhs.dtype),
             pltpu.VMEM((cfgs.tile_m // sub, sub, dims.size_k), dtype),
             pltpu.SMEM((size_m,), jnp.float32),
             pltpu.SemaphoreType.DMA((2,)),

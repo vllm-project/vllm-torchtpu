@@ -974,10 +974,11 @@ def fused_moe_scatter_planned(
     holds fp8 row words [R, 8, H / 32] and row ``r`` stands for bf16
     ``hidden_states[r] * row_scale[r]`` (see `gather_rows`).
 
-    ``wave_lhs`` = (recv, row_scale_sorted, wave_sems): the routes' rows
-    instead land while the expert kernel runs (see `gmm_v2_mlp_scatter`),
-    fp8 row words in route order, sorted route ``j``'s at ``recv[j]`` with
-    token scale ``row_scale_sorted[j]``; ``hidden_states`` and
+    ``wave_lhs`` = (recv, row_scale_sorted, wave_sems, sentinels): the
+    routes' rows instead land while the expert kernel runs (see
+    `gmm_v2_mlp_scatter`), fp8 row words in route order, sorted route
+    ``j``'s at ``recv[j]`` with token scale ``row_scale_sorted[j]``, and
+    ``sentinels[0]`` more rows on the last semaphore; ``hidden_states`` and
     ``token_sorted`` are not read. The routes are a multiple of 16."""
     if w1_scale.ndim == 3:
         w1_scale = jnp.expand_dims(w1_scale, 2)

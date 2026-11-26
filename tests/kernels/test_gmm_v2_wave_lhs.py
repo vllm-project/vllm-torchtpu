@@ -23,7 +23,6 @@ the SC dispatch does; see tests/kernels/test_sc_wave_dispatch.py on branch
 gxd/q38-sc-wave-dispatch-test for the pattern and the flags.
 """
 
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -89,52 +88,65 @@ def _wait_count(n, wait_rows, big):
         b //= 2
 
 
-def sc_land_rows(rows, sizes, tc_mesh, axes):
+def sc_land_rows(rows, counts, tc_mesh, axes):
     """SC kernel: copies `rows` [P, 8, H / 32] row by row to the same rows of
-    a new buffer on this device, lhs group after lhs group (``sizes``), row
-    `j` of group `e` signalling TC DMA semaphore `e`; exits with the copies
-    in flight. Returns (buffer, semaphores, send semaphore, rows sent)."""
+    a new buffer [P + 16, ...] on this device, lhs group after lhs group
+    (``counts[:-1]``), row `j` of group `e` signalling TC DMA semaphore `e`,
+    then ``counts[-1]`` sentinel rows from row P on the last semaphore, as
+    the SC dispatch does; exits with the copies in flight. Returns (buffer,
+    semaphores, send semaphore)."""
     sc_mesh = plsc.ScalarSubcoreMesh(axis_name="core", num_cores=1)
-    groups = sizes.shape[0]
+    groups = counts.shape[0] - 1
+    num_rows = rows.shape[0]
 
-    def body(rows_hbm, sizes_hbm, buf, sems, send_sems, sizes_s, dma_sem):
-        pltpu.async_copy(sizes_hbm, sizes_s, dma_sem).wait()
+    def body(rows_hbm, counts_hbm, buf, sems, send_sems, counts_s, dma_sem):
+        pltpu.async_copy(counts_hbm, counts_s, dma_sem).wait()
         me = {a: lax.axis_index(a) for a in axes}
 
-        def wave(e, start):
-            @pl.loop(0, sizes_s[e])
-            def _(r):
-                pltpu.async_remote_copy(
-                    rows_hbm.at[start + r],
-                    buf.at[start + r],
-                    send_sems.at[0],
-                    sems.at[e],
-                    device_id={**me, "tc": 0},
-                )
+        def copy(src, dst, sem):
+            pltpu.async_remote_copy(
+                rows_hbm.at[src],
+                buf.at[dst],
+                send_sems.at[0],
+                sems.at[sem],
+                device_id={**me, "tc": 0},
+            )
 
-            return start + sizes_s[e]
+        def wave(e, start):
+            @pl.loop(0, counts_s[e])
+            def _(r):
+                copy(start + r, start + r, e)
+
+            return start + counts_s[e]
 
         lax.fori_loop(0, groups, wave, jnp.int32(0))
+
+        @pl.loop(0, counts_s[groups])
+        def _(r):
+            copy(0, num_rows + r, groups)
 
     buf, sems, send_sem = pl.kernel(
         body,
         out_type=(
-            pltpu.HBM(rows.shape, rows.dtype),
-            pltpu.SemaphoreType.DMA((groups,)) @ tc_mesh,
+            pltpu.HBM((num_rows + 16,) + rows.shape[1:], rows.dtype),
+            pltpu.SemaphoreType.DMA((groups + 1,)) @ tc_mesh,
             pltpu.SemaphoreType.DMA((1,)) @ sc_mesh,
         ),
         mesh=sc_mesh,
-        scratch_types=[pltpu.SMEM(sizes.shape, jnp.int32), pltpu.SemaphoreType.DMA(())],
+        scratch_types=[
+            pltpu.SMEM(counts.shape, jnp.int32),
+            pltpu.SemaphoreType.DMA(()),
+        ],
         name="sc_land_rows",
-    )(rows, sizes)
+    )(rows, counts)
     return buf, sems, send_sem
 
 
-def sc_drain(send_sem, rows, sizes):
+def sc_drain(send_sem, rows, counts):
     """SC kernel: waits `send_sem` for the rows `sc_land_rows` sent."""
     sc_mesh = plsc.ScalarSubcoreMesh(axis_name="core", num_cores=1)
     sem_ref = jax.new_ref(send_sem, memory_space=pltpu.SEMAPHORE @ sc_mesh)
-    total = jnp.sum(sizes, dtype=jnp.int32)[None]
+    total = jnp.sum(counts, dtype=jnp.int32)[None]
 
     def body(sem_r, rows_hbm, total_hbm, total_s, dma_sem):
         pltpu.async_copy(total_hbm, total_s, dma_sem).wait()
@@ -283,11 +295,14 @@ def test_wave_lhs_matches_gathered_rows(layout):
             )
             base = call(0, x, None)
             rows = words[token]
+            # 0..2 sentinel rows, varying by member and call.
+            sentinels = lax.rem(me + i, 3).astype(jnp.int32)
+            counts = jnp.concatenate([sizes, sentinels])
             recv, sems, send_sem = sc_land_rows(
-                rows, sizes, tc_mesh, (DP_AXIS, TP_AXIS)
+                rows, counts, tc_mesh, (DP_AXIS, TP_AXIS)
             )
-            sc_drain(send_sem, rows, sizes)
-            got = call(1, None, (recv, scale_i[token], sems))
+            sc_drain(send_sem, rows, counts)
+            got = call(1, None, (recv, scale_i[token], sems, sentinels))
             return None, (base, got)
 
         _, (base, got) = lax.scan(step, None, jnp.arange(calls))
