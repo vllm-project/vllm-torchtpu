@@ -80,6 +80,20 @@ warmest-first admission, each step this scheduler:
 * with ``VLLM_TPU_SIBLING_HOLD`` (PrefixAwareScheduler), a waiting request held
   for a running request's shared prefix is left out of the reserve: running
   chunks, the prefix's owner included, are not cut for it.
+* with ``VLLM_TPU_DECODE_ACTIVE_CAP`` = A, at most A requests decode at once
+  (a request decodes from the step that schedules its last prompt token on;
+  requests that already have output tokens are never held). A request past
+  the cap still prefills, in the usual SRPT / cadence order, but stops
+  ``max(num_prefill_lookahead, 1)`` tokens short of its prompt end ("parked")
+  and finishes when a decoding request leaves, so its wait is charged to TTFT
+  and never to ITL. Parked requests finish oldest first (smallest aged key),
+  ahead of every other prefill and without reserves cut from them. A step the
+  spacing, cadence or TPOT hold would make decode-only still finishes parked
+  requests into free decode slots (only those, at most a few tokens each), and
+  such a step counts as decode-only for the cadence and the spacing debt.
+  Parked requests are not pending prefill for the TTFT bounds.
+  ``VLLM_TPU_DECODE_ACTIVE_CAP_AHEAD`` = K >= 0 caps RUNNING at A + K
+  (K = 0: no prefill ahead, like vLLM's ``max_num_active_seqs``).
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.prefill_spacing_scheduler.PrefillSpacingScheduler``.
@@ -122,6 +136,11 @@ _FIT_BINS = (512, 1024, 2048, 4096)
 class PrefillSpacingScheduler(PrefixAwareScheduler):
     """Shortest remaining prefill first; decode-only steps after long chunks."""
 
+    # Decode active cap off unless __init__ reads it (tests build partial
+    # instances).
+    dcap: int = 0
+    dcap_ahead: int = -1
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.spacing_frac = envs.VLLM_TPU_PREFILL_SPACING_FRAC
@@ -138,6 +157,31 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         self.cadence_max_wait_s = envs.VLLM_TPU_PREFILL_CADENCE_MAX_WAIT_S
         self.coalesce_tokens = envs.VLLM_TPU_PREFILL_COALESCE_TOKENS
         self.coalesce_max_wait_s = envs.VLLM_TPU_PREFILL_COALESCE_MAX_WAIT_S
+        # Decode active cap: decode-active requests at the start of the step,
+        # requests let into decode during it, the prompt tokens a held
+        # request keeps back, and the ids whose prompt end this step ran.
+        self.dcap = envs.VLLM_TPU_DECODE_ACTIVE_CAP
+        self.dcap_ahead = envs.VLLM_TPU_DECODE_ACTIVE_CAP_AHEAD
+        self._dcap_tail = max(int(getattr(self, "num_prefill_lookahead", 1)), 1)
+        # A prompt end of at most this many tokens may run in a step that is
+        # otherwise decode-only (a fully cached new request is padded to the
+        # spec decode width).
+        self._dcap_tail_max = self._dcap_tail + int(
+            getattr(self, "num_spec_tokens", 0) or 0
+        )
+        self._dcap_active = 0
+        self._dcap_admitted = 0
+        self._dcap_tail_only = False
+        self._dcap_tail_ids: set[str] = set()
+        # Requests the cap has held at their prompt end and not let in yet.
+        self._dcap_held: set[str] = set()
+        self._dcap_gated = False
+        self._dcap_gated_steps = 0
+        self._dcap_tail_steps = 0
+        if self.dcap and self.dcap_ahead >= 0:
+            self.max_num_active_reqs = min(
+                self.max_num_active_reqs, self.dcap + self.dcap_ahead
+            )
         # Decode-only steps owed before the next prefill step (cadence), and
         # steps deferred by the cadence / coalescing / let through by the
         # TTFT bound.
@@ -203,6 +247,34 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
                 self.coalesce_max_wait_s,
                 self.cadence_max_wait_s,
             )
+        if self.dcap:
+            logger.info(
+                "PrefillSpacingScheduler decode active cap=%d ahead=%d "
+                "(max_num_active_reqs=%d, tail=%d)",
+                self.dcap,
+                self.dcap_ahead,
+                self.max_num_active_reqs,
+                self._dcap_tail,
+            )
+
+    @staticmethod
+    def _before_first_token(request: Request) -> bool:
+        """Whether ``request`` has not yet scheduled its last prompt token."""
+        return (
+            request.num_output_tokens == 0
+            and request.num_computed_tokens < request.num_prompt_tokens
+        )
+
+    def _dcap_parked(self, request: Request) -> bool:
+        """Whether a running request is held by the decode active cap: the
+        cap stopped it at its prompt end, and only that tail is left."""
+        if not self.dcap or request.request_id not in self._dcap_held:
+            return False
+        left = request.num_prompt_tokens - request.num_computed_tokens
+        return 0 < left <= self._dcap_tail
+
+    def _dcap_full(self) -> bool:
+        return self._dcap_active + self._dcap_admitted >= self.dcap
 
     def _age_tokens(self, request: Request) -> float:
         """SRPT credit of ``request``: aging rate times seconds since arrival."""
@@ -242,6 +314,11 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             live = {r.request_id for r in window}
             for req_id in [k for k in cache if k not in live]:
                 del cache[req_id]
+        if self.dcap and self._dcap_full():
+            # A held request with nothing to prefill gets 0 tokens, which
+            # ends the waiting pass: put such requests after the others so
+            # they do not block prefill ahead for the rest of the window.
+            scored.sort(key=lambda t: t[1].num_tokens - t[0][1] <= self._dcap_tail)
         ordered = [r for _, r in scored]
         if ordered != window:
             queue.remove_requests(window)
@@ -268,6 +345,15 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         queue = getattr(self, "kv_holding_waiting", None) or getattr(
             self, "waiting", None
         )
+        if self.dcap:
+            self._dcap_active = sum(
+                not self._before_first_token(r) for r in self.running
+            )
+            self._dcap_admitted = 0
+            self._dcap_tail_ids = set()
+            self._dcap_gated = False
+            if self._dcap_held:
+                self._dcap_held = {i for i in self._dcap_held if i in self.requests}
         if queue is not None:
             self._promote_warmest(queue)
         decoders = [r for r in self.running if not r.is_prefill_chunk]
@@ -292,8 +378,22 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
                 self._fit_steps += 1
             spacing = not fit
         defer = throttle_prefills or spacing
+        self._dcap_tail_only = (
+            spacing
+            and not throttle_prefills
+            and self.dcap > 0
+            and not self._dcap_full()
+            and any(self._dcap_parked(r) for r in self.running)
+        )
+        if self._dcap_tail_only:
+            # Finish parked requests into the free decode slots; every other
+            # prefill stays deferred (see _dcap_gate).
+            defer = False
+            self._dcap_tail_steps += 1
         prefilling = [r for r in self.running if r.is_prefill_chunk]
         self._reserve = {} if defer else self._plan_reserve(prefilling)
+        if self._dcap_tail_only:
+            self._reserve = {}
         capacity_bound = self.prefill_capacity_bound
         if spacing:
             # Scheduler.schedule() defers prefill only while not capacity-bound.
@@ -306,8 +406,9 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             self._in_schedule = False
             if spacing:
                 self.prefill_capacity_bound = capacity_bound
-        if not defer:
+        if not defer and not self._dcap_tail_only:
             self._update_starved(prefilling, output)
+        self._dcap_gated_steps += self._dcap_gated
         self._account(output, decoding, spacing)
         return output
 
@@ -318,7 +419,9 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         can still meet the TPOT target past it, while prefill is pending."""
         now = time.monotonic()
         self._track_decoders(decoders, now)
-        pending = bool(queue) or any(r.is_prefill_chunk for r in self.running)
+        pending = bool(queue) or any(
+            r.is_prefill_chunk and not self._dcap_parked(r) for r in self.running
+        )
         hold = pending and self._short_of_slack(decoders, now)
         if hold and self.max_wait_s > 0 and self._waited_too_long(queue):
             hold = False
@@ -390,11 +493,19 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         """Arrival time of the oldest request still waiting for its first
         token whose prefill can run (waiting and not blocked, or, with
         ``include_chunks``, a running chunk); None if there is none."""
+        # Decode active cap: a parked request waits for a decode slot, not
+        # for prefill; with RUNNING full (cap + ahead) waiting prompts cannot
+        # start prefill either.
         waiting = (
-            r for r in queue or () if not self._is_blocked_waiting_status(r.status)
+            r
+            for r in queue or ()
+            if not self._is_blocked_waiting_status(r.status)
+            and not (self.dcap and self.dcap_ahead >= 0 and self._running_room() <= 0)
         )
         chunks = (
-            r for r in self.running if include_chunks and r.is_prefill_chunk
+            r
+            for r in self.running
+            if include_chunks and r.is_prefill_chunk and not self._dcap_parked(r)
         )
         return min(
             (
@@ -403,6 +514,11 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
                 if r.num_output_tokens == 0
             ),
             default=None,
+        )
+
+    def _running_room(self) -> int:
+        return min(self.max_num_running_reqs, self.max_num_active_reqs) - len(
+            self.running
         )
 
     def _track_decoders(self, decoders: list[Request], now: float) -> None:
@@ -462,8 +578,17 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         # Off: both sides rank by tokens left; SRPT: by the aged key.
         rank = self._srpt_key if self.srpt else self._remaining
         window_rank = self._window_key if self.srpt else self._window_cold
+        if self.dcap:
+            # Parked requests first, oldest first: they run only their tail,
+            # and only into a free decode slot.
+            def order(r: Request) -> tuple[bool, float]:
+                if self._dcap_parked(r):
+                    return (False, r.arrival_time)
+                return (True, rank(r))
+        else:
+            order = rank
         self.running[:] = [r for r in self.running if not r.is_prefill_chunk] + sorted(
-            prefilling, key=rank
+            prefilling, key=order
         )
         room = min(self.max_num_running_reqs, self.max_num_active_reqs) - len(
             self.running
@@ -473,6 +598,9 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         reserve = {}
         for r in prefilling:
             if self._starved.get(r.request_id, 0) >= self.max_starved_steps:
+                continue
+            if self._dcap_parked(r):
+                # Its few tokens left run as soon as a decode slot frees.
                 continue
             key = rank(r)
             tokens = sum(c for k, c in admissible if k < key)
@@ -496,6 +624,10 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
         num_new_tokens = super()._reserve_prefill_lookahead(
             request, num_computed_tokens, num_new_tokens
         )
+        if self._in_schedule and self.dcap:
+            num_new_tokens = self._dcap_gate(
+                request, num_computed_tokens, num_new_tokens
+            )
         if (
             self._in_schedule
             and self._fit_cap is not None
@@ -508,6 +640,40 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             self._fit_used += num_new_tokens
         if running:
             self._running_tokens += num_new_tokens
+        return num_new_tokens
+
+    def _dcap_gate(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        """Decode active cap: hold a prompt end that would start a decode past
+        the cap, parking the request ``tail`` tokens short of it. In a step
+        the holds made decode-only, run only parked prompt ends into free
+        decode slots."""
+        if num_new_tokens <= 0:
+            return num_new_tokens
+        prompt = request.num_prompt_tokens
+        first = request.num_output_tokens == 0 and num_computed_tokens < prompt
+        if not first:
+            # Decodes run; a resumed request's recompute is prefill work and
+            # stays deferred in a decode-only step.
+            if self._dcap_tail_only and num_computed_tokens < request.num_tokens - 1:
+                return 0
+            return num_new_tokens
+        ends = num_computed_tokens + num_new_tokens >= prompt
+        if ends and not self._dcap_full():
+            if self._dcap_tail_only and num_new_tokens > self._dcap_tail_max:
+                return 0
+            self._dcap_admitted += 1
+            self._dcap_held.discard(request.request_id)
+            if num_new_tokens <= self._dcap_tail_max:
+                self._dcap_tail_ids.add(request.request_id)
+            return num_new_tokens
+        if self._dcap_tail_only:
+            return 0
+        if ends:
+            self._dcap_gated = True
+            self._dcap_held.add(request.request_id)
+            num_new_tokens = max(prompt - num_computed_tokens - self._dcap_tail, 0)
         return num_new_tokens
 
     def _update_starved(
@@ -529,7 +695,7 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
             r = self.requests[req_id]
             # num_computed_tokens already includes this step's tokens.
             computed = r.num_computed_tokens - n
-            if computed < r.num_prompt_tokens:
+            if computed < r.num_prompt_tokens and req_id not in self._dcap_tail_ids:
                 prefill_tokens += n
                 if r.num_prompt_tokens - computed >= self.long_prompt_tokens:
                     kind = _LONG
@@ -577,6 +743,14 @@ class PrefillSpacingScheduler(PrefixAwareScheduler):
                 {k: round(v, 4) for k, v in self._step_s.items()},
                 {k: round(v, 4) for k, v in self._bin_s.items()},
             )
+            if self.dcap:
+                logger.info(
+                    "PrefillSpacingScheduler: decode cap=%d gated_steps=%d "
+                    "tail_only_steps=%d",
+                    self.dcap,
+                    self._dcap_gated_steps,
+                    self._dcap_tail_steps,
+                )
             if self.cadence or self.coalesce_tokens:
                 logger.info(
                     "PrefillSpacingScheduler: cadence=%d coalesce=%d bound=%d",

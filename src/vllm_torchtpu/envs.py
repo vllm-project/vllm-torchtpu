@@ -310,6 +310,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PREFILL_COALESCE_MAX_WAIT_S: float = 0.5
     VLLM_TPU_SIBLING_HOLD: bool = False
     VLLM_TPU_SIBLING_HOLD_MAX_S: float = 4.0
+    VLLM_TPU_DECODE_ACTIVE_CAP: int = 0
+    VLLM_TPU_DECODE_ACTIVE_CAP_AHEAD: int = -1
     TPU_MINIMAX_M3_DCP_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_QCAND_GATHER_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_FUSED_DECODE_MAX_TOKENS: int = 0
@@ -2053,6 +2055,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # it is admitted as usual (bounds the TTFT added by the hold).
     "VLLM_TPU_SIBLING_HOLD_MAX_S": env_nonnegative_float(
         "VLLM_TPU_SIBLING_HOLD_MAX_S", 4.0
+    ),
+    # PrefillSpacingScheduler: at most this many requests decode at once. A
+    # request past the cap is prefilled up to its last prompt tokens and then
+    # waits, before its first token, until a decoding request finishes, so the
+    # wait counts toward TTFT and never toward ITL. Requests that already have
+    # output tokens (preempted and resumed) are never held. 0 (default): off.
+    "VLLM_TPU_DECODE_ACTIVE_CAP": env_nonnegative_int(
+        "VLLM_TPU_DECODE_ACTIVE_CAP", 0
+    ),
+    # With VLLM_TPU_DECODE_ACTIVE_CAP: how many requests past the cap may be
+    # in RUNNING (prefilling ahead and holding KV) at once; RUNNING admission
+    # is then capped at cap + this. -1 (default): no limit beyond
+    # max_num_seqs. 0: no prefill ahead (like vLLM's max_num_active_seqs).
+    "VLLM_TPU_DECODE_ACTIVE_CAP_AHEAD": env_int(
+        "VLLM_TPU_DECODE_ACTIVE_CAP_AHEAD", -1
     ),
     # MiniMax M3 DCP steps of at most this many tokens merge the attention
     # partials with one packed all-to-all instead of an LSE all-gather plus an
