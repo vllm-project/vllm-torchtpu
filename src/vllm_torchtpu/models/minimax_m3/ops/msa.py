@@ -588,6 +588,43 @@ def _gather_group_rows(
     return tuple(per_head[:, :, i].contiguous() for i in range(n))
 
 
+def gather_group_kv_head_major(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    index_q: torch.Tensor,
+    group: Any,
+    dcp: int,
+    kv_head_replicas: int,
+    dcp_rank: torch.Tensor,
+) -> torch.Tensor | None:
+    """`gather_group_kv` as one head-major tensor ``[dcp // kv_head_replicas,
+    T, 3 * D]`` (``[k | v | index_q]`` per row), or None when the tokens do
+    not split over the replicas. The rows go lane-dense into the replica-split
+    all-gather, whose ``[dcp, T / replicas, 3 * D]`` result is already this
+    layout (rank ``h * replicas + j`` sent part ``j`` of KV head ``h``), so
+    nothing is relaid out before the scoring op (`gather_group_kv` returns
+    three token-major ``[T, G, D]`` copies of a ``[.., 3, 128]``-padded
+    gather). Same values bit for bit."""
+    num_tokens, _, head_dim = k.shape
+    reps = kv_head_replicas
+    if num_tokens % reps:
+        return None
+    part = num_tokens // reps
+    rows = torch.cat((k, v, index_q), dim=-1).view(reps, part, 3 * head_dim)
+    mine = torch.index_select(rows, 0, dcp_rank % reps)
+    parts = group.all_gather(mine.contiguous(), dim=0)  # [dcp, part, 3D]
+    return parts.view(dcp // reps, num_tokens, 3 * head_dim)
+
+
+def split_head_major_kv(kvq: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`gather_group_kv_head_major`'s ``[G, T, 3 * D]`` -> ``k``, ``v``,
+    ``index_q [T, G, D]`` (inside the scoring op, where XLA fuses the split
+    into its consumers)."""
+    head_dim = kvq.shape[2] // 3
+    rows = kvq.transpose(1, 0, 2)
+    return tuple(rows[:, :, i * head_dim : (i + 1) * head_dim] for i in range(3))
+
+
 @functools.cache
 def get_msa_dcp_op(
     sm_scale: float,
@@ -1083,6 +1120,38 @@ def _get_msa_dcp_fp4_op(
             msa_fp4.rotate_queries(q),
         )
 
+    def _score_hm_jax(
+        kvq: jax.Array,
+        index_k: jax.Array,
+        kv_cache: jax.Array,
+        index_cache: jax.Array,
+        scale_cache: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        dcp_rank: jax.Array,
+        q: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        # `kvq`: the group's head-major [G, T, 3 * D] rows
+        # (`gather_group_kv_head_major`).
+        k, v, index_q = split_head_major_kv(kvq)
+        return _score_jax(
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            scale_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            dcp_rank,
+            q,
+        )
+
     def _attend_jax(
         q: jax.Array,
         kv_cache: jax.Array,
@@ -1187,6 +1256,33 @@ def _get_msa_dcp_fp4_op(
         )
 
     score_op.register_fake(_score_fake)
+    score_hm_op = None
+    if kv_heads > 1 and envs.TPU_MINIMAX_M3_DCP_KV_GATHER_HEAD_MAJOR:
+        score_hm_op = pallas.jax_op(
+            f"pallas::minimax_m3_msa_dcp_fp4_score_hm_{suffix}",
+            _score_hm_jax,
+            # kv_cache, index_cache, scale_cache: two inputs fewer ahead of them.
+            donate_argnums=(
+                _SHARD_KV_CACHE_ARG - 2,
+                _SHARD_INDEX_CACHE_ARG - 2,
+                _DCP_SCALE_CACHE_ARG - 2,
+            ),
+        )
+
+        def _score_hm_fake(kvq, index_k, kv_cache, index_cache, scale_cache, *args):
+            return (
+                torch.empty_like(kv_cache),
+                torch.empty_like(index_cache),
+                torch.empty_like(scale_cache),
+                torch.empty(
+                    (kvq.shape[1], kvq.shape[0] * 2 * topk),
+                    dtype=torch.float32,
+                    device=kvq.device,
+                ),
+                torch.empty_like(args[-1]),
+            )
+
+        score_hm_op.register_fake(_score_hm_fake)
     attend_merge_op = (
         _get_msa_dcp_attend_merge_op(
             sm_scale, topk, dcp, True, suffix, scale_row0=scale_row0
@@ -1425,14 +1521,21 @@ def _get_msa_dcp_fp4_op(
             parts = tp_group.all_gather(parts.unsqueeze(0), dim=0)
             candidates = split_merge_op(parts, dcp_rank, dcp_lane)
         else:
-            if kv_heads > 1:
-                k, v, index_q = gather_group_kv(
+            kvq = None
+            if score_hm_op is not None:
+                kvq = gather_group_kv_head_major(
                     k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
                 )
-            new_kv_cache, new_index_cache, new_scale_cache, candidates, q = score_op(
-                k,
-                v,
-                index_q,
+            if kvq is not None:
+                score, score_in = score_hm_op, (kvq,)
+            else:
+                if kv_heads > 1:
+                    k, v, index_q = gather_group_kv(
+                        k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
+                    )
+                score, score_in = score_op, (k, v, index_q)
+            new_kv_cache, new_index_cache, new_scale_cache, candidates, q = score(
+                *score_in,
                 index_k,
                 kv_cache,
                 index_cache,
