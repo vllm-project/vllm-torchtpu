@@ -19,6 +19,16 @@ export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="/path/to/persistent_cache"
     - **Scope**: Stores PyTorch Dynamo FX graph bytecode, Guard expressions, AOTAutograd tracing artifacts (`torch_compile_cache/torch_aot_compile`), and `TpuCompilerAdaptor` metadata pickle handles (`artifact_compile_range_*`).
     - **Note**: `VLLM_CACHE_ROOT` manages Python framework artifacts and is completely independent of the C++ PJRT compiled binary executables managed by `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`.
 
+## Multi-host Expert Parallelism
+
+Programs built over the expert-parallel (EP) mesh, such as the fused EP MoE kernel, have the EP device placement compiled in: which TPU device each EP rank runs on. On a multi-host slice this placement can change between two starts of the same deployment, because the host that runs EP ranks 0-7 does not always hold the lowest device ids. The compile cache key includes the placement, so a program compiled for one placement is never reused under another one.
+
+What this costs an operator:
+
+- **Cold start per new placement**: a start with a placement the cache has not seen compiles from scratch. For DeepSeek-V4-Pro on a 2-host v7x-16 slice, that is about 20 minutes of compilation instead of under 2 minutes.
+- **Disk**: each placement gets its own cache directory, so the cache grows with every placement seen. A slice with H hosts can have up to H! placements: 2 on a 2-host slice, 24 on a 4-host slice.
+- **Single host**: the placement on one host does not change between starts, so it compiles once.
+
 ## Compilation Debugging & Telemetry
 
 ### `VLLM_XLA_CHECK_RECOMPILATION` (Runtime Recompilation Detector)
