@@ -86,7 +86,8 @@ vllm-torchtpu is a **vLLM platform plugin, not a fork**. vLLM installs as a
 plain wheel; this repo injects TPU behavior through vLLM's
 [plugin entry points](https://docs.vllm.ai/en/latest/design/plugin_system/)
 (`vllm.platform_plugins`, `vllm.general_plugins`). Model execution is
-**torch** (`TPUModelRunner` subclasses vLLM's `GPUModelRunner`, running under
+**torch** (`TPUModelRunner` subclasses the V1 `GPUModelRunner` kept in
+`runner/vllm_v1/`, see R-3.1, running under
 `torch.compile(backend="tpu", fullgraph=True)`); kernels are **JAX/Pallas**,
 bridged into torch as custom ops via `torch_tpu._internal.pallas.jax_op`.
 This is **one example** of the bridge pattern — there are many call sites
@@ -171,6 +172,24 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
         def apply(self, layer, x, ...):
             ...  # dispatch to the Pallas kernel
     ```
+
+    **Exception: `src/vllm_torchtpu/runner/vllm_v1/`.** vLLM v0.34.0 removed
+    Model Runner V1 ([vllm#63373](https://github.com/vllm-project/vllm/pull/63373)),
+    which `TPUModelRunner` is built on. This package keeps copies of the V1
+    pieces it still uses, taken from vLLM v0.33.0 with the code TPU never
+    reaches removed. Rules for edits there:
+
+    - Change a copy only to keep it working against the pinned vLLM, to
+      remove code TPU no longer reaches, or to fix a TPU bug, and say which
+      in the PR.
+    - Add new TPU behavior to `TPUModelRunner` and its helpers, not to the
+      copies.
+    - A method vLLM looks up by name (for example, `WorkerBase` calls
+      `getattr(self.model_runner, "reset_mm_cache", None)`) counts as
+      reached; check before removing one.
+
+    Moving `TPUModelRunner` onto Model Runner V2 retires the package
+    ([tracking issue](https://github.com/vllm-project/vllm-torchtpu/issues/3723)).
 
 - **R-3.2** **No per-model forks of shared layers.** New models extend or
   subclass the common attention/MoE/RoPE implementation — never carry private

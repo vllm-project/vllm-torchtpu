@@ -35,8 +35,8 @@
 /support_matrices/verified_commit_hashes.csv @QiliangCui @CienetStingLin @theminghuang @charlesli640
 
 # Platform Support & Envs
-/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @wenxindongwork @weiyu0824 @maxwillzq @brianseung-google
-/tests/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @wenxindongwork @weiyu0824 @maxwillzq @brianseung-google
+/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @wenxindongwork @weiyu0824 @maxwillzq @brianseung-google @Nanfang-Li
+/tests/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @wenxindongwork @weiyu0824 @maxwillzq @brianseung-google @Nanfang-Li
 /src/vllm_torchtpu/envs.py @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @wenxindongwork @weiyu0824 @maxwillzq @brianseung-google
 
 # TPU Worker
@@ -136,14 +136,14 @@
 
 # Context Parallelism
 /src/vllm_torchtpu/distributed/pcp*.py @wenxindongwork @weiyu0824
-/src/vllm_torchtpu/platforms/pcp_validation.py @wenxindongwork @weiyu0824
+/src/vllm_torchtpu/platforms/pcp_validation.py @wenxindongwork @weiyu0824 @Nanfang-Li
 /src/vllm_torchtpu/layers/core/pcp_sequence_layout.py @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/layers/adapter/cp_attention.py @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/layers/adapter/cp_mla_attention.py @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/ @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/ @wenxindongwork @weiyu0824
 /tests/runner/test_pcp_*.py @wenxindongwork @weiyu0824
-/tests/platforms/test_*pcp*.py @wenxindongwork @weiyu0824
+/tests/platforms/test_*pcp*.py @wenxindongwork @weiyu0824 @Nanfang-Li
 /tests/distributed/test_pcp_*.py @wenxindongwork @weiyu0824
 /tests/layers/core/test_*pcp*.py @wenxindongwork @weiyu0824
 /tests/layers/adapter/test_cp_*.py @wenxindongwork @weiyu0824
@@ -183,6 +183,7 @@
 
 # Models: Qwen4 Experimental
 /src/vllm_torchtpu/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
+/tests/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
 
 # Models: Qwen4 Experimental (experimental tier)
 /src/vllm_torchtpu/models/qwen4_exp/experimental/ @caojx-google @DRZDONG @benliangw @mshrihari3

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -23,6 +23,9 @@ from vllm.v1.outputs import (
     LogprobsTensors,
     ModelRunnerOutput,
 )
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.runner.routed_experts import PendingRoutedExperts
 
 INVALID_TOKEN_ID = -1
 
@@ -207,12 +210,22 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         copy_state: AsyncTPUCopyState | None,
         discard_sampled_tokens_req_indices: list[int],
+        routed_experts: "PendingRoutedExperts | None" = None,
     ):
         self._model_runner_output: ModelRunnerOutput = model_runner_output
         self.copy_state = copy_state
         self.discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
+        self.routed_experts = routed_experts
 
     def get_output(self) -> ModelRunnerOutput:
+        output = self._get_sampled_output()
+        if self.routed_experts is not None:
+            output.aux_output_connector_output = self.routed_experts.process_output(
+                output.sampled_token_ids
+            )
+        return output
+
+    def _get_sampled_output(self) -> ModelRunnerOutput:
         if self.copy_state is None:
             self._model_runner_output.sampled_token_ids = []
             return self._model_runner_output

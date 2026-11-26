@@ -20,10 +20,16 @@ Framework-free: imports no jax, torch, or vLLM (stdlib only at run time).
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING
 
+from ._parsing import (
+    _is_exact_int,
+    _parse_bucket_list,
+    _parse_verify_tokens,
+    _raise_invalid,
+)
 from .constants import (
     DEFAULT_BUCKETS,
     DEFAULT_VERIFY_BUCKETS,
@@ -38,51 +44,6 @@ if TYPE_CHECKING:
     from ..profile import Profile
 
 _MIN_OUT_ROW_MULTIPLE: int = 16
-
-
-def _raise_invalid(label: str, val: object) -> NoReturn:
-    """Raise a standardized `ValueError` for an invalid policy argument."""
-    msg = f"Megakernel: invalid {label}={val!r}"
-    raise ValueError(msg)
-
-
-def _is_exact_int(item: object) -> bool:
-    """Return whether `item` is an `int` and not a `bool`."""
-    return type(item) is int
-
-
-def _parse_bucket_list(
-    val: str | Iterable[int],
-    *,
-    valid_fn: Callable[[int], bool],
-    label: str,
-) -> tuple[int, ...]:
-    """Parse, validate, and sort unique integer buckets from `val`."""
-    if not isinstance(val, str):
-        if isinstance(val, (bytes, bytearray)) or not isinstance(val, Iterable):
-            _raise_invalid(label, val)
-        parsed_buckets = list(val)
-        if any(not _is_exact_int(b) or not valid_fn(b) for b in parsed_buckets) or len(
-            set(parsed_buckets)
-        ) != len(parsed_buckets):
-            _raise_invalid(label, val)
-        return tuple(sorted(parsed_buckets))
-    raw = val.strip()
-    if raw.lower() in FALSE_STRS:
-        return ()
-    parts = [part.strip() for part in raw.replace(":", ",").split(",") if part.strip()]
-    try:
-        parsed_buckets = [int(part) for part in parts]
-    except ValueError:
-        msg = f"Megakernel: invalid {label}={val!r}"
-        raise ValueError(msg) from None
-    if (
-        not parsed_buckets
-        or len(set(parsed_buckets)) != len(parsed_buckets)
-        or any(not valid_fn(b) for b in parsed_buckets)
-    ):
-        _raise_invalid(label, val)
-    return tuple(sorted(parsed_buckets))
 
 
 def parse_mk_buckets(val: str | Iterable[int]) -> tuple[int, ...]:
@@ -106,36 +67,18 @@ def parse_mk_buckets(val: str | Iterable[int]) -> tuple[int, ...]:
     )
 
 
-def _parse_verify_tokens(val: Iterable[int]) -> tuple[int, ...]:
-    """Validate and sort unique verify-step token widths (`t >= 2`)."""
-    if isinstance(val, (str, bytes, bytearray)) or not isinstance(val, Iterable):
-        _raise_invalid("verify_tokens", val)
-    widths = list(val)
-    if (
-        not widths
-        or any(
-            not _is_exact_int(width)
-            or width < MIN_VERIFY_TOKENS
-            or width > MAX_BUCKET_ROWS
-            for width in widths
-        )
-        or len(set(widths)) != len(widths)
-    ):
-        _raise_invalid("verify_tokens", val)
-    return tuple(sorted(widths))
-
-
 def parse_mk_verify_buckets(
     val: str | Iterable[int],
-    verify_tokens: Sequence[int] = (MTP_VERIFY_TOKENS,),
+    verify_tokens: Sequence[int] | None = (MTP_VERIFY_TOKENS,),
 ) -> tuple[int, ...]:
     """Parse verify row buckets from a string or iterable (`'0'` disables).
 
     Args:
         val: Comma- or colon-separated bucket string, `'0'`/`'false'`/`'none'`
             to disable verify buckets, or an iterable of unique positive ints.
-        verify_tokens: Allowed verify-step token widths (`t >= 2`). Every
-            bucket in `val` must be divisible by at least one width.
+        verify_tokens: Allowed verify-step token widths (`t >= 2`), or `None`
+            for `(MTP_VERIFY_TOKENS,)`. Every bucket in `val` must be divisible
+            by at least one width.
 
     Returns:
         Sorted tuple of unique validated verify bucket row counts.
@@ -143,7 +86,11 @@ def parse_mk_verify_buckets(
     Raises:
         ValueError: If `verify_tokens` or `val` is invalid or unaligned.
     """
-    widths = _parse_verify_tokens(verify_tokens)
+    widths = (
+        (MTP_VERIFY_TOKENS,)
+        if verify_tokens is None
+        else _parse_verify_tokens(verify_tokens)
+    )
     min_width = widths[0]
     return _parse_bucket_list(
         val,
@@ -199,14 +146,7 @@ class BucketPolicy:
         object.__setattr__(
             self,
             "verify_buckets",
-            _parse_bucket_list(
-                self.verify_buckets,
-                valid_fn=lambda b: (
-                    1 <= b <= MAX_BUCKET_ROWS
-                    and any(b % width == 0 for width in resolved_widths)
-                ),
-                label="verify_buckets",
-            ),
+            parse_mk_verify_buckets(self.verify_buckets, resolved_widths),
         )
         raw_paddings = self.token_paddings
         if isinstance(raw_paddings, (str, bytes, bytearray)) or not isinstance(
@@ -229,7 +169,7 @@ class BucketPolicy:
         buckets_explicit: bool | None = None,
         verify_buckets_explicit: bool | None = None,
         token_paddings: Sequence[int] = (),
-        verify_tokens: Sequence[int] | None = None,
+        verify_tokens: Sequence[int] | None = (MTP_VERIFY_TOKENS,),
     ) -> BucketPolicy:
         """Resolve `(buckets, verify_buckets)` from explicit overrides or `profile`.
 
@@ -240,32 +180,37 @@ class BucketPolicy:
             verify_buckets: Optional verify bucket sequence; `None` uses
                 `profile` or `DEFAULT_VERIFY_BUCKETS`.
             speculative_tokens: Number of draft tokens (`K`), or `None` when
-                unspecified (`0` disables speculative verify; `K >= 1` implies
-                verify width `K + 1` unless `verify_tokens` overrides it).
+                unspecified. The implicit-list drop rule applies only when
+                `speculative_tokens` is not `None` (when `None`, both bucket
+                lists stay active): `K + 1 in verify_tokens` drops implicit
+                decode buckets, while any other `K` drops implicit verify
+                buckets and keeps decode buckets.
             buckets_explicit: Whether `buckets` came from an explicit user
                 override; `None` infers `buckets is not None`.
             verify_buckets_explicit: Whether `verify_buckets` came from an
                 explicit user override; `None` infers `verify_buckets is not None`.
             token_paddings: Runner output-row padding sizes.
-            verify_tokens: Allowed verify widths (`t >= 2`); `None` derives
-                `(speculative_tokens + 1,)` when `speculative_tokens >= 1`,
-                otherwise `(MTP_VERIFY_TOKENS,)`.
+            verify_tokens: Allowed verify widths (`t >= 2`) supported by the
+                caller, defaulting to `(MTP_VERIFY_TOKENS,)` (`None` also uses
+                `(MTP_VERIFY_TOKENS,)`, decoupled from `speculative_tokens`).
 
         Returns:
             Canonical `BucketPolicy` filtered to the active decode/verify mode.
 
         Raises:
-            ValueError: If bucket values, `verify_tokens`, or explicit
-                `verify_buckets` alignment are invalid.
+            ValueError: If bucket values, `speculative_tokens`, `verify_tokens`,
+                `token_paddings`, or explicit `verify_buckets` alignment are
+                invalid.
         """
-        if verify_tokens is None:
-            if speculative_tokens is not None and speculative_tokens >= 1:
-                resolved_verify_tokens = (speculative_tokens + 1,)
-            else:
-                resolved_verify_tokens = (MTP_VERIFY_TOKENS,)
-        else:
-            resolved_verify_tokens = _parse_verify_tokens(verify_tokens)
-
+        if speculative_tokens is not None and (
+            not _is_exact_int(speculative_tokens) or speculative_tokens < 0
+        ):
+            _raise_invalid("speculative_tokens", speculative_tokens)
+        resolved_verify_tokens = (
+            (MTP_VERIFY_TOKENS,)
+            if verify_tokens is None
+            else _parse_verify_tokens(verify_tokens)
+        )
         default_buckets = (
             DEFAULT_BUCKETS if profile.buckets is None else profile.buckets
         )
@@ -279,7 +224,7 @@ class BucketPolicy:
         )
         raw_verify_buckets = _parse_bucket_list(
             default_verify_buckets if verify_buckets is None else verify_buckets,
-            valid_fn=lambda b: 1 <= b <= MAX_BUCKET_ROWS,
+            valid_fn=lambda b: MIN_VERIFY_TOKENS <= b <= MAX_BUCKET_ROWS,
             label="verify_buckets",
         )
         sorted_verify_buckets = tuple(
@@ -296,10 +241,7 @@ class BucketPolicy:
             if verify_buckets_explicit is None
             else verify_buckets_explicit
         )
-        must_align_all = is_verify_buckets_explicit or (
-            verify_buckets is None and profile.verify_buckets is not None
-        )
-        if must_align_all:
+        if is_verify_buckets_explicit:
             unaligned = [
                 b for b in raw_verify_buckets if b not in sorted_verify_buckets
             ]

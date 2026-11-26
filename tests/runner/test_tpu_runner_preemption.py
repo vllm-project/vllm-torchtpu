@@ -20,10 +20,10 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_model_runner import GPUModelRunner
 
 
 @pytest.mark.parametrize("transition", ["preempt", "resume", "finish", "continue"])

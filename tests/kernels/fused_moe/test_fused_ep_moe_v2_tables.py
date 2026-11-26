@@ -731,3 +731,14 @@ def test_row_routes_rejects_nan_and_neg_inf_across_all_scoring_fns(scoring_fn):
     scores = _apply_scoring_fn(gate_l, scoring_fn)
     routes = np.asarray(_row_routes(scores, gate_l))
     np.testing.assert_array_equal(routes, np.array([[True], [False], [False], [True]]))
+
+
+@pytest.mark.parametrize("tile_m,rows", [(64, 1), (128, 1), (256, 2), (512, 4)])
+def test_mirror_rows_per_tile_keeps_128_lanes_above_a_lane_block(tile_m, rows):
+    """A tile's mirror sublane above 128 lanes is stored as rows of 128."""
+    assert host.mirror_rows_per_tile(tile_m) == rows
+
+
+def test_mirror_rows_per_tile_refuses_a_partial_lane_row():
+    with pytest.raises(ValueError):
+        host.mirror_rows_per_tile(192)

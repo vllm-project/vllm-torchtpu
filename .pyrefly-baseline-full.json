@@ -1262,21 +1262,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-assignment",
-      "concise_description": "`(batch: Unknown) -> PoolingMetadata` is not assignable to attribute `get_pooling_metadata` with type `(self: InputBatch) -> PoolingMetadata`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPUModelRunner.kv_cache_config` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPUModelRunner.execute_model_state` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `None` is not assignable to parameter `forward_context` with type `ForwardContext` in function `vllm.distributed.kv_transfer.kv_connector.v1.base.KVConnectorBase_V1.start_load_kv`"
     },
@@ -1297,26 +1282,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TPUModelRunner._build_attention_metadata` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TPUModelRunner.initialize_kv_cache` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `InputBatch` has no attribute `_tpu_spec_room_guard`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TPUModelRunner._prepare_inputs` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `tpu` in module `torch`"
     },
@@ -1324,21 +1289,6 @@
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "not-callable",
       "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPUModelRunner.sample_tokens` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPUModelRunner.load_model` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TPUModelRunner._dummy_run` overrides parent class `GPUModelRunner` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
@@ -1354,16 +1304,6 @@
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `schedule_capacity` in module `vllm_torchtpu.kernels.experimental.batched_rpa.wrapper`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override-mutable-attribute",
-      "concise_description": "Class member `TPUModelRunner.capture_model` overrides parent class `GPUModelRunner` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "bad-override",
-      "concise_description": "Class member `TPUModelRunner.profile_run` overrides parent class `GPUModelRunner` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",

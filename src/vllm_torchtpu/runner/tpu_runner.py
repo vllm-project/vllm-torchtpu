@@ -81,14 +81,12 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     DraftTokenIds,
+    KVConnectorOutput,
     LogprobsTensors,
     ModelRunnerOutput,
 )
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, rope_in_graph_flag, rope_patch, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -115,6 +113,7 @@ from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
     expert_placement,
+    moe_skip_policy,
     token_padding,
 )
 from vllm_torchtpu.layers.adapter.attention import (
@@ -131,8 +130,12 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_rows,
     copy_pool_blocks,
 )
+from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    enable_pipelined_collective_and_compute,
+)
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
+from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
@@ -168,6 +171,7 @@ from vllm_torchtpu.runner import (
     chunk_processors,
     greedy_top_tokens,
     prompt_logprobs,
+    routed_experts,
     spec_boundary_state,
     thinking_budget_tracker,
 )
@@ -209,6 +213,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUModelRunnerOutput,
     LogprobsChunk,
 )
+from vllm_torchtpu.runner.vllm_v1.spec_decode.ngram_proposer import NgramProposer
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_torchtpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
     StepCostTable,
@@ -220,7 +226,6 @@ from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     fit_rows,
     handoff_seed_tokens,
-    normalize_draft_config,
 )
 from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 from vllm_torchtpu.tpu_info import get_libtpu_version, get_tpu_library_path
@@ -422,7 +427,8 @@ def _substitute_placeholder_token(
         token_in_tpu_cur_input_indices: int tensor [N], destination slots.
         token_in_tpu_pre_next_tokens_indices: int tensor [N], source slots
             in `next_tokens`; -1 marks a padding slot to leave unchanged.
-        next_tokens: int tensor of tokens from the previous async step.
+        next_tokens: int tensor ([M] or [M, 1]) of tokens from the previous
+            async step.
     Return:
         input_ids with real placeholders replaced; padding slots untouched.
     """
@@ -443,7 +449,7 @@ def _substitute_placeholder_token(
     # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
     # slots; their gathered values are discarded by `mask` in `where`.
     safe_idx = torch.clamp_min(token_in_tpu_pre_next_tokens_indices, 0)
-    new_token_values = next_tokens[safe_idx].to(input_ids.dtype)
+    new_token_values = next_tokens.reshape(-1)[safe_idx].to(input_ids.dtype)
     original_values = input_ids[token_in_tpu_cur_input_indices]
     update_values = torch.where(mask, new_token_values, original_values)
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
@@ -704,11 +710,8 @@ def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
 #   3. `_dummy_run` exercises every padding bucket so all shapes are AOT-
 #      compiled before the first real request.
 class TPUModelRunner(GPUModelRunner):
-    # pyrefly: ignore[bad-override-mutable-attribute]
     drafter: NgramProposer | DFlashProposer | Eagle3Proposer | None
-    # pyrefly: ignore[bad-override-mutable-attribute]
     rejection_sampler: RejectionSampler | None
-    # pyrefly: ignore[bad-override-mutable-attribute]
     model: torch.nn.Module
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
@@ -718,6 +721,7 @@ class TPUModelRunner(GPUModelRunner):
     _dp_step_other_decode: bool = False
     _adaptive_verification: AdaptiveVerificationManager | None = None
     _thinking_budget: thinking_budget_tracker.ThinkingBudgetTracker | None = None
+    _routed_experts: routed_experts.RoutedExpertsCapture | None = None
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
     _tp_rank0_confidence_mask: torch.Tensor | None = None
@@ -815,20 +819,10 @@ class TPUModelRunner(GPUModelRunner):
                     sequence_layout_planner.backend_preinit_world_size,
                     len(layout_devices),
                 )
-        # Disable cudagraphs before parent init so its dispatch self-disables.
-        # TPU uses AOT bucket precompile (_precompile_* methods) instead.
+        # TPU does not use CUDA graphs; it precompiles AOT buckets
+        # (_precompile_* methods) instead.
         vllm_config.compilation_config.cudagraph_capture_sizes = []
         vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
-        # DSpark/DFlash checkpoints may spell the mask token dspark_noise_token_id;
-        # the parent __init__ transiently builds an upstream EagleProposer
-        # that raises unless dflash_config.mask_token_id resolves.
-        if (
-            vllm_config.speculative_config is not None
-            and vllm_config.speculative_config.method in ("dflash", "dspark")
-        ):
-            normalize_draft_config(
-                vllm_config.speculative_config.draft_model_config.hf_config
-            )
         with _torch_tpu_wrapper():
             super().__init__(vllm_config, device)
         self.pcp_manager = pcp_manager
@@ -852,8 +846,13 @@ class TPUModelRunner(GPUModelRunner):
             def get_pooling_metadata(batch):
                 return build_pooling_metadata(batch, getattr(self, "requests", None))
 
-            from vllm.v1.worker.gpu_input_batch import InputBatch as GPUInputBatch
+            from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
+                InputBatch as GPUInputBatch,
+            )
 
+            # Monkeypatch: the replacement takes the batch positionally as `batch`,
+            # not as `self`, which pyrefly cannot match to the method type.
+            # pyrefly: ignore[bad-assignment]
             GPUInputBatch.get_pooling_metadata = get_pooling_metadata
             self.input_batch.get_pooling_metadata = lambda: get_pooling_metadata(
                 self.input_batch
@@ -890,7 +889,8 @@ class TPUModelRunner(GPUModelRunner):
         # allocated when a request first appears and retained until its KV
         # ownership ends. Keying on req_id (rather than persistent-batch
         # position) makes the mapping immune to condense/swap reordering in
-        # upstream vLLM's InputBatch, which we do not subclass.
+        # the V1 InputBatch (in-tree copy in runner/vllm_v1), which we do not
+        # subclass.
         self._mamba_slot_by_req_id: dict[str, int] = {}
         self._free_mamba_slots: list[int] = []
         # State checkpoints per request under speculative decoding: one per
@@ -984,6 +984,10 @@ class TPUModelRunner(GPUModelRunner):
 
         # XLA graph tracker (TPU-specific debug aid).
         self.enforce_eager = self.model_config.enforce_eager
+        if self.check_recompilation and not self.enforce_eager:
+            # The graph counts say that Dynamo traced again. This log says
+            # why, for example "GLOBAL_STATE changed: grad_mode".
+            torch._logging.set_logs(recompiles=True)
         self.num_xla_graphs = 0
         self._update_num_xla_graphs("init")
         # torchTPU doesn't support SymInt yet, so widen Dynamo cache limits.
@@ -1273,6 +1277,9 @@ class TPUModelRunner(GPUModelRunner):
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
+        # BF16 MoE padded-token skipping policy, resolved before model loading
+        # and MoE kernel prebuild.
+        self._bf16_moe_skip_policy = moe_skip_policy.Bf16MoeSkipPolicy(enabled=False)
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
 
@@ -1424,7 +1431,7 @@ class TPUModelRunner(GPUModelRunner):
         # NOT via finished_sending. Without plumbing this, the
         # OffloadingConnector's complete_store is never called, host-pool
         # blocks stay not-ready (ref_cnt=-1), and prefix-reuse lookups defer
-        # forever -> the engine busy-spins / hangs. Mirrors
+        # forever -> the engine busy-spins / hangs. Mirrors vLLM v0.33.0's
         # KVConnectorModelRunnerMixin._get_kv_connector_output.
         worker_meta = kv_connector.build_connector_worker_meta()
         kv_connector_stats = kv_connector.get_kv_connector_stats()
@@ -1439,7 +1446,7 @@ class TPUModelRunner(GPUModelRunner):
                     break
                 if isinstance(stats, MultiKVConnectorStats):
                     stats_to_visit.extend(stats.data.values())
-        # Mirror KVConnectorModelRunnerMixin._get_kv_connector_output:
+        # Mirror vLLM v0.33.0's KVConnectorModelRunnerMixin._get_kv_connector_output:
         # metadata is bound per-step and must be cleared after use.
         kv_connector.clear_connector_metadata()
         return (
@@ -1525,6 +1532,27 @@ class TPUModelRunner(GPUModelRunner):
                     "Unsupported speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
+
+    def _patch_rope_in_graph(self, *models: torch.nn.Module | None) -> None:
+        """Replace position-indexed rotary cache buffers on ``models`` in-graph."""
+        live_models = [m for m in models if m is not None]
+        if not live_models:
+            return
+        patched = sum(
+            rope_patch.patch_in_graph_rotary_embedding(m, allow_table_recovery=False)
+            for m in live_models
+        )
+        tier1_count = sum(
+            1
+            for _, sub in runner_utils.iter_unique_modules(*live_models)
+            if getattr(sub, "_tpu_in_graph_tier1", False)
+        )
+        if tier1_count or patched:
+            logger.info(
+                "Enabled in-graph RoPE on %d Tier-1 and %d Tier-2 rotary module(s).",
+                tier1_count,
+                patched,
+            )
 
     def _relayout_tables(self, model: torch.nn.Module | None) -> None:
         """Give ``model`` the table shapes and row-major layouts the env knobs ask for.
@@ -1612,7 +1640,7 @@ class TPUModelRunner(GPUModelRunner):
                 num_eligible,
                 len(truncated_by_id),
             )
-        else:
+        elif not rope_in_graph_flag.in_graph_enabled(self.vllm_config):
             logger.warning(
                 "TPU_ROPE_CACHE_TRUNCATE is set but the model has no "
                 "position-indexed rope cache, nothing was truncated"
@@ -1660,6 +1688,10 @@ class TPUModelRunner(GPUModelRunner):
     # because the first report runs from inside __init__, so an instance
     # attribute has to be assigned above that call to exist in time.
     _xla_graphs_checked_at = None
+
+    # Dynamo graphs counted by the previous report. A class attribute for the
+    # same reason as _xla_graphs_checked_at.
+    _num_dynamo_graphs = 0
 
     @staticmethod
     def _describe_xla_graph(entry) -> str:
@@ -1720,10 +1752,32 @@ class TPUModelRunner(GPUModelRunner):
         fresh.sort(key=self._xla_graph_compile_secs, reverse=True)
         return fresh
 
+    def _report_new_dynamo_graphs(self, case_str) -> None:
+        """Logs the graphs Dynamo traced since the previous report.
+
+        The XLA cache cannot show these. After a guard miss Dynamo traces the
+        function again and the backend reuses the cached XLA program, so the
+        entry count stays the same while the step still pays for the trace.
+        """
+        total_graphs = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+        new_graphs = total_graphs - self._num_dynamo_graphs
+        self._num_dynamo_graphs = total_graphs
+        if new_graphs > 0:
+            logger.info(
+                "Dynamo traced %d graphs since the last check (%d in total), case: %s",
+                new_graphs,
+                total_graphs,
+                case_str,
+            )
+
     def _update_num_xla_graphs(self, case_str):
         check_comp = self.check_recompilation and not self.enforce_eager
         if not check_comp:
             return
+
+        # Runs before the XLA report, which returns early when the cache did
+        # not grow. A retrace that reuses a cached XLA program is that case.
+        self._report_new_dynamo_graphs(case_str)
 
         stats = torch.tpu._get_cache_stats()
         entries = stats.per_entry_stats
@@ -1965,6 +2019,18 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
         if self.pcp_manager is not None:
             self.pcp_manager.set_page_size(mla_kv_page_size(kv_cache_config))
+        if self.vllm_config.aux_output_config.enabled:
+            # Before warmup traces the backbone: a compiled forward keeps the
+            # hooks bound when it was traced.
+            self._routed_experts = routed_experts.RoutedExpertsCapture(
+                self.vllm_config, self.model, kv_cache_config
+            )
+
+    def close_routed_experts(self) -> None:
+        """Closes the routed-experts connector at shutdown, as vLLM's runner
+        does."""
+        if self._routed_experts is not None:
+            self._routed_experts.close()
 
     def _init_prefill_checkpoint_units(self, kv_cache_config: KVCacheConfig) -> None:
         """Initializes the units the worker places prefill checkpoints with.
@@ -2643,7 +2709,7 @@ class TPUModelRunner(GPUModelRunner):
             return
         pool_sets = self._dense_kv_copy_pool_sets()
         # At most one CoW pair per newly scheduled request per step.
-        with self._precompile_timed("dense KV CoW copies"), torch.no_grad():
+        with self._precompile_timed("dense KV CoW copies"):
             for split, pools in pool_sets.items():
                 synchronize_tensors(pools)
                 limit = self._bucket_len(self.max_num_reqs * split)
@@ -2822,25 +2888,37 @@ class TPUModelRunner(GPUModelRunner):
             self._pre_async_results.next_tokens_tpu,
         )
 
-    def _flush_disjoint_async_results(self) -> None:
-        if self._pre_async_results is None:
+    def _unmap_disjoint_async_results(self) -> None:
+        """Unmap the previous step's results when no request of this step
+        continues one of its requests.
+
+        This step then reads none of their outputs: the previous step's
+        requests committed no tokens (partial prefill chunks) or left the batch
+        (finished, preempted or not scheduled), as on every step of one-token
+        requests. Their rollback records go too: rolling back a request outside
+        the batch only rewrites its req_state.output_token_ids, which nothing
+        reads while it is out, and vLLM's _update_states() rebuilds that list
+        from the scheduler's tokens if the request returns.
+
+        Their D2H copy may still be in flight. Keep the results instead of
+        waiting on it here, which would stall the host before this step's
+        forward: sample_tokens() waits on them in _modify_prev_results() and
+        replaces them, after any number of zero-token steps. Never drop them
+        unsynchronized: on TP ranks other than the executor's output rank, vLLM
+        may discard the AsyncTPUModelRunnerOutput when the RPC returns, leaving
+        these results the only owner of the copy, whose buffers would be freed
+        mid-transfer.
+        """
+        pre = self._pre_async_results
+        if pre is None or not pre.req_id_to_index_copy:
             return
         current_req_ids = set(self.input_batch.req_ids[: self.input_batch.num_reqs])
-        previous_req_ids = self._pre_async_results.req_id_to_index_copy
-        # An empty map means nothing to roll back (the previous step committed no
-        # tokens, or all its requests finished or were preempted), but its D2H
-        # copy may still be in flight. Keep the results instead of waiting here,
-        # which would stall the host before this step's forward: sample_tokens()
-        # waits on them in _modify_prev_results() and then replaces them. Never
-        # drop them unsynchronized: on TP ranks other than the executor's output
-        # rank, vLLM may discard the AsyncTPUModelRunnerOutput when the RPC
-        # returns, leaving these results the only owner of the copy (#985).
-        if not previous_req_ids or any(
-            req_id in current_req_ids for req_id in previous_req_ids
-        ):
+        if any(req_id in current_req_ids for req_id in pre.req_id_to_index_copy):
             return
-        self._modify_prev_results()
-        self._pre_async_results = None
+        # With nothing mapped, _prepare_inputs substitutes no tokens and skips
+        # the rejected-token subtraction.
+        pre.req_id_to_index_copy.clear()
+        pre.request_seq_lens = []
 
     def _install_spec_token_room_guard(self) -> None:
         """Wrap InputBatch.update_req_spec_token_ids to clamp its *write*.
@@ -2912,6 +2990,8 @@ class TPUModelRunner(GPUModelRunner):
             return None
 
         input_batch.update_req_spec_token_ids = guarded
+        # Marker read back with getattr() above; InputBatch does not declare it.
+        # pyrefly: ignore[missing-attribute]
         input_batch._tpu_spec_room_guard = True
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Any:
@@ -2951,7 +3031,16 @@ class TPUModelRunner(GPUModelRunner):
         )
         # The base implementation uses an advanced-index assignment which
         # TorchTPU functionalizes into a full raw-storage result. Hide only
-        # the copy field from it; block zeroing and state updates stay intact.
+        # the copy field from it; state updates stay intact. The base never
+        # zeroes `new_block_ids_to_zero` on TPU (`_zero_block_ids` needs a
+        # `_kv_block_zeroer`, which only GPU workers build), and none is
+        # needed. A request with no history: the GDN kernels read its state
+        # only when `has_initial_state = (seq_lens - query_lens) > 0`
+        # (kernels/gdn/v3/metadata.py) and use zeros otherwise
+        # (kernels/gdn/v3/vmem_ldst.py). A request with history that moves
+        # to a new state block (mamba align mode):
+        # `_collect_mamba_state_seed_copies` stages a copy from the previous
+        # block, which `_flush_mamba_state_seed_copies` runs before the forward.
         base_output = (
             dataclasses.replace(scheduler_output, kv_cache_block_copies=None)
             if use_page_local_copy or use_dense_copy
@@ -2965,7 +3054,6 @@ class TPUModelRunner(GPUModelRunner):
             self._thinking_budget.update_states(
                 scheduler_output, self.input_batch.req_id_to_index, self.requests
             )
-        # Copy after the base zeroes new blocks (the CoW dst is one of them).
         if use_page_local_copy:
             self._apply_kv_cache_block_copies(copies)
         elif use_dense_copy:
@@ -2986,9 +3074,9 @@ class TPUModelRunner(GPUModelRunner):
         # below. None/absent -> 0 drafts (non-spec or a non-spec mixed chunk).
         pre_num_draft_per_req = self._pre_async_results.num_draft_per_req
 
-        # Wait even when there is nothing to roll back: both callers drop these
-        # results afterwards, and on non-output TP ranks they can be the only
-        # owner of the in-flight D2H copy (#985).
+        # Wait even when there is nothing to roll back: every caller drops or
+        # replaces these results afterwards, and on non-output TP ranks they can
+        # be the only owner of the in-flight D2H copy.
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
         assert pre_next_tokens_cpu is not None
 
@@ -3675,10 +3763,11 @@ class TPUModelRunner(GPUModelRunner):
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
         # per-request rejected count on-device, keyed by req position.
-        # req_id_to_index_copy is empty for zero-token results that
-        # _flush_disjoint_async_results() keeps until sample_tokens() waits on
-        # their copy. Nothing maps then, and under PCP the full-size index arrays
-        # below would not match this rank's shard of position_ids.
+        # req_id_to_index_copy is empty for results that no request of this step
+        # continues, which _unmap_disjoint_async_results() keeps until
+        # sample_tokens() waits on their copy. Nothing maps then, and under PCP
+        # the full-size index arrays below would not match this rank's shard of
+        # position_ids.
         if (
             self.scheduler_config.async_scheduling
             and self.speculative_config
@@ -4344,8 +4433,16 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
+        if self._routed_experts is not None:
+            # Before the zero-token return below: a step that schedules no
+            # tokens can still be the only one that reports some requests as
+            # finished, and the connector releases a request only when it sees
+            # that report.
+            self._routed_experts.begin_step(
+                scheduler_output.aux_output_connector_metadata
+            )
         if self.scheduler_config.async_scheduling:
-            self._flush_disjoint_async_results()
+            self._unmap_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
             if not has_kv_transfer_group():
                 return EMPTY_MODEL_RUNNER_OUTPUT
@@ -4666,6 +4763,10 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
+                )
+            if self._routed_experts is not None:
+                self._routed_experts.take_forward(
+                    num_tokens_padded, int(self.query_start_loc_np[num_reqs])
                 )
 
             if nan_check is not None:
@@ -5082,14 +5183,15 @@ class TPUModelRunner(GPUModelRunner):
     def _get_sampling_generator(self) -> torch.Generator:
         """Return the dedicated non-greedy sampling generator, seeded once.
 
-        Seeded lazily on first use from ``model_config.seed`` -- the same value
-        on every worker -- then advanced naturally by the draws (never reseeded
-        per step). A replica's TP ranks run in lockstep (same ``SchedulerOutput``
-        -> same bucketed draw shapes each step), so with the same seed they stay
-        at the same offset in the stream and sample identical tokens -- the
-        property spec decode needs to keep the TP ranks from diverging. (DP
-        replicas share the same base sequence but draw at their own pace on
-        independent request streams, so they decorrelate, which is fine.)
+        Initialized eagerly in ``load_model`` (with a lazy fallback for unit
+        tests) from ``model_config.seed`` -- the same value on every worker --
+        then advanced naturally by the draws (never reseeded per step). A
+        replica's TP ranks run in lockstep (same ``SchedulerOutput`` -> same
+        bucketed draw shapes each step), so with the same seed they stay at the
+        same offset in the stream and sample identical tokens -- the property
+        spec decode needs to keep the TP ranks from diverging. (DP replicas
+        share the same base sequence but draw at their own pace on independent
+        request streams, so they decorrelate, which is fine.)
         """
         if self._sampling_generator is None:
             gen = torch.Generator(device=self.device)
@@ -5623,6 +5725,7 @@ class TPUModelRunner(GPUModelRunner):
             proc.finish(next_tokens)
         return next_tokens
 
+    @torch.no_grad()
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -5885,7 +5988,10 @@ class TPUModelRunner(GPUModelRunner):
                 combined_selected_tokens.append(selected_token_ids)
                 combined_selected_tokens_real_lens.append(num_reqs)
                 if self.scheduler_config.async_scheduling:
-                    next_tokens_tpu_chunks.append(selected_token_ids.view(-1))
+                    # Keep the [num_reqs, 1] base buffer; _substitute_placeholder_token
+                    # flattens inside the compiled graph so torch_tpu does not emit a
+                    # standalone as_strided view program at step 1.
+                    next_tokens_tpu_chunks.append(selected_token_ids)
                     for req_idx in range(cur_start_idx, cur_end_idx):
                         next_token_indices[req_idx] = (
                             next_tokens_tpu_offset + req_idx - cur_start_idx
@@ -5917,6 +6023,13 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens_real_lens,
                     logprobs=logprobs_chunks,
                 )
+        routed_experts_output = None
+        if self._routed_experts is not None:
+            routed_experts_output = self._routed_experts.prepare_output(
+                req_ids,
+                scheduler_output.num_scheduled_tokens,
+                self.input_batch.num_computed_tokens_cpu[: len(req_ids)],
+            )
 
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
@@ -6160,6 +6273,7 @@ class TPUModelRunner(GPUModelRunner):
                 model_runner_output=model_runner_output,
                 copy_state=copy_state,
                 discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+                routed_experts=routed_experts_output,
             )
 
         if not self.scheduler_config.async_scheduling:
@@ -6202,6 +6316,13 @@ class TPUModelRunner(GPUModelRunner):
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
+        if not self.is_pooling_model:
+            # Allocate and seed the device RNG before any non_blocking=True H2D
+            # transfer runs: THPGenerator_pynew / manual_seed block in
+            # TpuMallocAndMemcpyHtoD while holding the GIL, which deadlocks if
+            # libtpu's DMA completion thread is waiting on the GIL to decref a
+            # host tensor from an in-flight async H2D copy.
+            self._get_sampling_generator()
 
         # Set TPU-specific quantization config before model loading.
         # This ensures that TPU-compatible quantization methods are used
@@ -6213,6 +6334,9 @@ class TPUModelRunner(GPUModelRunner):
             "Setting TPU quantization config for: %s", self.model_config.quantization
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
+        # Resolve BF16 MoE padded-token skipping before model loading so the
+        # MoE layers, kernel prebuild and TokenPaddingState share one mode.
+        self._bf16_moe_skip_policy = self._resolve_bf16_moe_skip_policy()
 
         # No placed layers or target depth left over from an earlier load.
         expert_placement.reset_model_state()
@@ -6224,6 +6348,7 @@ class TPUModelRunner(GPUModelRunner):
                 mesh=self.mesh, vllm_config=self.vllm_config
             ),
             set_current_vllm_config(self.vllm_config),
+            moe_skip_policy.bf16_policy_scope(self._bf16_moe_skip_policy),
         ):
             load_model = cast(Callable[..., torch.nn.Module], model_loader.load_model)
             model = load_model(
@@ -6273,7 +6398,7 @@ class TPUModelRunner(GPUModelRunner):
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
-            self._async_drafter.load_model(self.model)
+            self._load_async_drafter()
             # The draft reuses the target's Pallas ops (cached by op name),
             # which were traced against the target's relayouted tables. Its
             # own rope caches and hash tables need the same layout, or the
@@ -6302,6 +6427,13 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
+
+        if rope_in_graph_flag.in_graph_enabled(self.vllm_config):
+            # After any draft loads, so the sweep also covers the draft model.
+            self._patch_rope_in_graph(
+                self.model,
+                self._async_drafter.draft_model if self._is_async_drafter else None,
+            )
 
         # After the drafter: every placed MoE layer, the drafter's too, must
         # have had its router renumbered with its experts.
@@ -6342,7 +6474,9 @@ class TPUModelRunner(GPUModelRunner):
                     max_padded_tokens, self.max_num_reqs * self.drafter.block_size
                 )
             self._token_padding_state = token_padding.TokenPaddingState.create(
-                max_padded_tokens, self.device
+                max_padded_tokens,
+                self.device,
+                track_valid_tokens=self._bf16_moe_skip_policy.enabled,
             )
             token_padding.set_padding_state(self._token_padding_state)
 
@@ -6404,6 +6538,9 @@ class TPUModelRunner(GPUModelRunner):
             kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config),
             lora_slot_write=self.lora_slot_write_hbm_bytes(),
             pp_handoff=self.pp_handoff_hbm_reserve_bytes(),
+            routed_experts=routed_experts.hbm_reserve_bytes(
+                self.vllm_config, self.num_tokens_paddings
+            ),
         )
 
     def _initialize_pallas_kernels(self):
@@ -7149,10 +7286,15 @@ class TPUModelRunner(GPUModelRunner):
 
     @contextlib.contextmanager
     def _precompile_timed(self, name: str):
-        """Common boilerplate for each AOT bucket precompile pass."""
+        """Times one AOT bucket precompile pass and runs it under no_grad.
+
+        Serving runs under no_grad and Dynamo guards on grad mode. A pass that
+        traces with grad enabled is traced again at the first request.
+        """
         logger.info("Compiling %s with different input shapes.", name)
         start = time.perf_counter()
-        yield
+        with torch.no_grad():
+            yield
         logger.info("Compilation finished in %.2f [secs].", time.perf_counter() - start)
         self._update_num_xla_graphs(name)
 
@@ -7416,15 +7558,21 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_substitute_placeholder_token(self) -> None:
         if not self.scheduler_config.async_scheduling:
             return
-        # next_tokens source lengths the runtime produces: stride-1 num_reqs
-        # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
-        # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
-        # substitute doesn't recompile per real num_reqs.
-        next_lens = list(self.num_reqs_paddings)
+        # next_tokens source shapes the runtime produces: [num_reqs, 1] buckets
+        # from non-spec sampling (kept 2D to avoid an eager view program), plus
+        # the bounded 1D stride-(1+K) span async eagle3 parks
+        # (max_num_reqs*(1+K); see sample_tokens) so spec substitute doesn't
+        # recompile per real num_reqs.
+        next_shapes: list[tuple[int, ...]] = [
+            (nlen, 1) for nlen in self.num_reqs_paddings
+        ]
         if self._is_async_drafter:
             assert self.speculative_config is not None
-            next_lens.append(
-                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+            next_shapes.append(
+                (
+                    self.max_num_reqs
+                    * (1 + self.speculative_config.num_speculative_tokens),
+                )
             )
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
@@ -7437,8 +7585,8 @@ class TPUModelRunner(GPUModelRunner):
                 pre_next_tokens_indices = torch.full(
                     (num_tokens,), -1, dtype=torch.int32
                 ).to(self.device)
-                for nlen in next_lens:
-                    next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
+                for shape in next_shapes:
+                    next_tokens = torch.zeros(shape, dtype=torch.int64).to(self.device)
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,
@@ -7446,7 +7594,9 @@ class TPUModelRunner(GPUModelRunner):
                         next_tokens,
                     )
                     synchronize_tensors(out)
-                    logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
+                    logger.info(
+                        "  -- num_tokens: %d, next_len: %d", num_tokens, shape[0]
+                    )
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
@@ -7686,8 +7836,7 @@ class TPUModelRunner(GPUModelRunner):
         bucket grid.
 
         Uses the runtime buckets (num_tokens_paddings x num_reqs_paddings) with
-        the logits precompile's pruning, and runs under no_grad like
-        execute_model so the Dynamo guards match at serve time.
+        the logits precompile's pruning.
         """
         if not self.is_pooling_model or not self._pp_is_last:
             return
@@ -7696,7 +7845,7 @@ class TPUModelRunner(GPUModelRunner):
             logger.info("Skipping pooler precompile: %s", self._static_pooler_reason)
             return
         hsize = self.model_config.get_hidden_size()
-        with self._precompile_timed("static pooler"), torch.no_grad():
+        with self._precompile_timed("static pooler"):
             dummy_hidden = None
             for num_tokens, num_reqs in iter_pooler_precompile_grid(
                 self.num_tokens_paddings, self.num_reqs_paddings, self.max_num_reqs
@@ -8042,6 +8191,39 @@ class TPUModelRunner(GPUModelRunner):
         if self._pp_handoff is not None:
             self._warmup_handoff_forwards()
 
+    def _resolve_bf16_moe_skip_policy(self) -> moe_skip_policy.Bf16MoeSkipPolicy:
+        """Resolve BF16 MoE padded-token skipping before model loading.
+
+        Gated here, ahead of ``VllmUnquantizedFusedMoEMethod`` construction,
+        GMM kernel prebuild, and the first backbone trace. The BF16 MoE layers
+        log a fallback when they are built.
+        """
+        return moe_skip_policy.resolve_bf16_moe_skip_policy(
+            skip_flag=bool(envs.TPU_MOE_SKIP_PADDED_TOKENS),
+            parallel_config=self.parallel_config,
+            pipelined_collective=enable_pipelined_collective_and_compute(),
+            fused_decode_kernel=bool(
+                envs.USE_MOE_TP_DECODE_KERNEL or envs.FUSED_MOE_DECODE_KERNEL
+            ),
+            has_speculative=(
+                self.speculative_config is not None or self.drafter is not None
+            ),
+            has_lora=self.lora_config is not None,
+            is_unquantized_model=isinstance(
+                self.vllm_config.quant_config, VllmUnquantizedConfig
+            ),
+        )
+
+    def _load_async_drafter(self) -> None:
+        """Load the draft model under the target's BF16 MoE skipping policy.
+
+        The draft's BF16 MoE layers must take the runner's policy: it is off
+        under speculative decoding, so TokenPaddingState tracks no valid-token
+        count for them to read.
+        """
+        with moe_skip_policy.bf16_policy_scope(self._bf16_moe_skip_policy):
+            self._async_drafter.load_model(self.model)
+
     def _backbone_dummy_runs(self, num_tokens: int) -> None:
         """One warmup forward of the backbone per context bucket."""
         self._dummy_run(
@@ -8117,9 +8299,7 @@ class TPUModelRunner(GPUModelRunner):
                 tuple(id(r) for r in self.kv_cache_raw_tensors),
                 self.kv_cache_raw_tensors,
             )
-        # Serving calls the program under execute_model's no_grad, and dynamo
-        # guards on grad mode: compile it the same way.
-        with self._precompile_timed("mamba state seed copies"), torch.no_grad():
+        with self._precompile_timed("mamba state seed copies"):
             num_groups = max(
                 1,
                 len(self._mamba_copy_plan),
@@ -8885,12 +9065,10 @@ class TPUModelRunner(GPUModelRunner):
         # the first real execute_model raise the "State error".
         self.execute_model_state = None
         # The last async warmup step parks an AsyncPreResults (in-flight D2H copy
-        # + optimistic 1+K placeholders) with no follower step to drain it.
-        # Finish the copy and null it BEFORE the drain below so the drain's
-        # _flush_disjoint_async_results early-returns instead of issuing a stray
-        # D2H / placeholder rollback on the torn-down synthetic request, and no
-        # in-flight copy host buffer is freed mid-transfer (defensive: covers the
-        # `if present:`-skip path). No-op in sync (always None).
+        # + optimistic 1+K placeholders) with no follower step to drain it. This
+        # function drops it on every path, so wait on its copy first: dropped
+        # unsynchronized, it could free a host buffer the copy is still writing.
+        # No-op in sync (always None).
         if self._pre_async_results is not None:
             try:
                 self._pre_async_results.wait_for_copy()

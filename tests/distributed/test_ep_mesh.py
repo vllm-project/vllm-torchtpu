@@ -22,12 +22,14 @@ import torch
 from vllm.distributed import parallel_state
 
 from vllm_torchtpu.distributed import ep_mesh as ep
+from vllm_torchtpu.distributed import mesh_utils
 
 
 @pytest.fixture(autouse=True)
 def mesh_cache(monkeypatch):
     monkeypatch.setattr(ep, "_MESH_CACHE", {})
     monkeypatch.setattr(ep, "_TOKEN_GROUP_CACHE", {})
+    monkeypatch.setattr(mesh_utils, "_LAYOUT_CACHE", {})
     monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 1)
     monkeypatch.setattr(ep, "get_dcp_world_size", lambda: 1)
 
@@ -63,28 +65,67 @@ def test_disabled_ep_helpers(monkeypatch):
     assert ep.ep_rank_order() is None
     assert ep.ep_mesh_index() is None
     assert ep.build_ep_mesh() is None
+    assert ep.ep_device_placement_key() == ()
 
 
 @pytest.fixture
 def group(monkeypatch):
-    group = SimpleNamespace(world_size=4, ranks=[2, 4, 6, 8])
+    group = SimpleNamespace(world_size=4, ranks=[2, 4, 6, 8], rank_in_group=2)
     monkeypatch.setattr(ep, "get_ep_group", lambda: group)
     monkeypatch.setattr(ep, "_get_current_global_rank", lambda: 6)
-    monkeypatch.setattr(ep, "_get_tpu_global_device_id", lambda: 10)
+    monkeypatch.setattr(mesh_utils, "_get_current_global_rank", lambda: 6)
+    monkeypatch.setattr(mesh_utils, "_get_tpu_global_device_id", lambda: 10)
     return group
 
 
 def test_ep_rank_mapping_and_mesh_index(monkeypatch, group):
     """The mesh is in ascending device-id order, so mesh index i holds the
     EP rank whose device sorts i-th, and this rank's index is where its own
-    device sorts."""
+    device sorts. The device ids are gathered once and reused."""
     gather = Mock(return_value={8: 30, 2: 40, 6: 10, 4: 20})
-    monkeypatch.setattr(ep, "_collect_rank_to_device_id", gather)
+    monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id", gather)
     assert ep.ep_device_ids() == (40, 20, 10, 30)
-    gather.assert_called_once_with(group, 6, 10)
     # Devices 10, 20, 30, 40 belong to EP ranks 2, 1, 3, 0.
     assert ep.ep_rank_order() == (2, 1, 3, 0)
     assert ep.ep_mesh_index() == 0
+    gather.assert_called_once_with(group, 6, 10)
+
+
+def test_device_placement_key_holds_the_gathered_device_ids(monkeypatch, group):
+    monkeypatch.setattr(
+        mesh_utils,
+        "_collect_rank_to_device_id",
+        lambda *a: {2: 40, 4: 20, 6: 10, 8: 30},
+    )
+    ep.ep_device_ids()
+    assert ep.ep_device_placement_key() == (((2, 4, 6, 8), (40, 20, 10, 30)),)
+
+
+def test_placement_gathered_after_the_key_raises(monkeypatch, group):
+    """Gathering the same placement again is fine; a new one would be missing
+    from a compile cache key already in use."""
+    placement = {2: 40, 4: 20, 6: 10, 8: 30}
+    monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id", lambda *a: placement)
+    ep.ep_device_ids()
+    ep.ep_device_placement_key()
+    assert ep.ep_device_ids() == (40, 20, 10, 30)
+    placement = {2: 10, 4: 20, 6: 30, 8: 40}
+    mesh_utils._LAYOUT_CACHE.clear()
+    with pytest.raises(RuntimeError, match="after the compile cache key"):
+        ep.ep_device_ids()
+
+
+def test_first_placement_gathered_after_the_key_raises(monkeypatch, group):
+    """The key was read before this group's placement was gathered, so the
+    key in use does not cover it."""
+    monkeypatch.setattr(
+        mesh_utils,
+        "_collect_rank_to_device_id",
+        lambda *a: {2: 40, 4: 20, 6: 10, 8: 30},
+    )
+    assert ep.ep_device_placement_key() == ()
+    with pytest.raises(RuntimeError, match="after the compile cache key"):
+        ep.ep_device_ids()
 
 
 @_RANK_ORDERED_CP
@@ -104,7 +145,7 @@ def test_cp_keeps_rank_order(monkeypatch, group, cp_size_fn, cp_size):
 
 def test_missing_rank_mapping(monkeypatch, group):
     monkeypatch.setattr(
-        ep, "_collect_rank_to_device_id", lambda *args: {2: 40, 4: 20, 8: 30}
+        mesh_utils, "_collect_rank_to_device_id", lambda *args: {2: 40, 4: 20, 8: 30}
     )
     with pytest.raises(RuntimeError, match=r"missing=\[6\]"):
         ep.ep_device_ids()
