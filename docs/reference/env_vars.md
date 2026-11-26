@@ -65,7 +65,7 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `USE_MOE_SPARSE_CORE` | `True` | Enables TPU SparseCore offload for MoE token permutation and ragged gather/reduce. The SparseCore kernels are validated on TPU v5p, v6e, 7, and 7x; other chips fall back to TensorCore. |
 | `ONEHOT_MOE_PERMUTE_THRESHOLD` | `None` | Token threshold for switching between one-hot matmul and SparseCore sort/permute in MoE routing. |
 | `USE_MOE_FUSED_EP_KERNEL` | `False` | Enables the fused Expert-Parallel (`EP`) Pallas MoE kernel. |
-| `MOE_FUSED_EP_KERNEL_IMPL` | `None` | Selects a specific fused EP MoE kernel implementation (`"v1"` or `"v2"`). |
+| `MOE_FUSED_EP_KERNEL_IMPL` | `None` | Selects a specific fused EP MoE kernel implementation (`"v2"` or `"adaptive"`); setting it also enables fused EP. |
 | `MOE_FUSED_EP_ENABLE_W4A8` | `False` | Enables 4-bit weight / 8-bit activation (`W4A8`) execution in the fused EP MoE kernel. |
 | `MOE_FUSED_EP_SORTED_GATHER` | `False` | Keeps the fused EP MoE mesh in EP-rank order and performs the activation all-gather outside the kernel over a process group in ascending device-id order. |
 | `FUSED_MOE_DECODE_KERNEL` | `False` | Serves eligible MoE layers (TP experts, or EP with TP attention) up to `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` tokens with the fused MoE decode Pallas kernel (routed experts, shared expert, and all-reduce in one call); arming refuses a cap whose buffers do not fit in VMEM, and stands down on layers a fused EP MoE kernel serves (`USE_MOE_FUSED_EP_KERNEL` / `MOE_FUSED_EP_KERNEL_IMPL`). |
