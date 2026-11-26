@@ -1540,19 +1540,18 @@ _PREFILL_VMEM_BYTES = 40 << 20
 
 
 def _prefill_vmem_bytes(
-    plan, index_cache, small_rows: int, num_rows: int, topk: int
+    plan, index_cache, small_rows: int, num_rows: int, topk: int, key_cache: bool
 ) -> int:
-    """VMEM of `_prefill_candidates`: the page ring, the request's fp8 keys,
-    the step's pick keys and the lists, the query tile (double-buffered), the
-    assembled output and the small class's picks, whose [rows, 2 * topk] f32
-    pad to 128 lanes."""
+    """VMEM of `_prefill_candidates`: the page ring, the request's fp8 keys
+    (with `key_cache`), the step's pick keys and the lists, the query tile
+    (double-buffered), the assembled output and the small class's picks,
+    whose [rows, 2 * topk] f32 pad to 128 lanes."""
     _, rows_per_page, _, head_dim = index_cache.shape
     block_q = plan.large_block_q
     ring = msa_indexer._RING_SLOTS * plan.large_pages_per_step * rows_per_page
     page_size = msa_indexer._page_tokens(rows_per_page, index_cache.dtype)
-    cacheable = msa_indexer.keys_cacheable(block_q, rows_per_page, index_cache.dtype)
-    key_cache = plan.large_pages * page_size * head_dim if cacheable else 0
-    return key_cache + 4 * (
+    cache = plan.large_pages * page_size * head_dim if key_cache else 0
+    return cache + 4 * (
         ring * head_dim
         + (plan.large_pages_per_step + 8 * topk) * block_q
         + 2 * block_q * head_dim
@@ -1568,18 +1567,25 @@ def _prefill_chunk(plan, index_cache) -> int:
     )
 
 
-def _prefill_fits(plan, index_cache, small_rows: int, num_rows: int, topk: int) -> bool:
+def _prefill_fits(
+    plan, index_cache, small_rows: int, num_rows: int, topk: int, key_cache: bool
+) -> bool:
     """Whether `_prefill_candidates` takes the step: tile-major large and
-    token-major small tiles, key columns in whole `_network_picks` groups
-    (whole dots each) and VMEM within `_PREFILL_VMEM_BYTES`."""
+    token-major small tiles, pick keys in whole merge groups of `topk` key
+    vregs (whole dots each, whole key vregs per dot) and VMEM within
+    `_PREFILL_VMEM_BYTES`."""
     step_cols = 8 * topk
+    chunk = _prefill_chunk(plan, index_cache)
     return (
         plan.large_tile_major
         and plan.token_major
         and topk & (topk - 1) == 0
         and plan.large_pages_per_step % step_cols == 0
-        and step_cols % _prefill_chunk(plan, index_cache) == 0
-        and _prefill_vmem_bytes(plan, index_cache, small_rows, num_rows, topk)
+        and step_cols % chunk == 0
+        and chunk % 8 == 0
+        and _prefill_vmem_bytes(
+            plan, index_cache, small_rows, num_rows, topk, key_cache
+        )
         <= _PREFILL_VMEM_BYTES
     )
 
@@ -1596,13 +1602,15 @@ def _prefill_candidates(
     *,
     pick: dict,
     rank: jax.Array,
+    key_cache: bool,
     interpret: bool,
 ) -> jax.Array:
     """`_prefill_candidates_kernel`: the packed candidates ``[num_rows, 2 *
     topk]`` of every (heads-folded) query row, the large class's picked in
-    the indexer kernel, the small class's (`small_packed`, as `small` scored
-    them) placed at their rows. `positions(tile_seq, tile_row0, block_q)`
-    gives a class's column positions."""
+    the indexer kernel (its keys in a `key_cache` across tiles if set), the
+    small class's (`small_packed`, as `small` scored them) placed at their
+    rows. `positions(tile_seq, tile_row0, block_q)` gives a class's column
+    positions."""
     _, rows_per_page, _, head_dim = index_cache.shape
     work = plan.large_work()
     block_q, pages_per_step = plan.large_block_q, plan.large_pages_per_step
@@ -1649,10 +1657,10 @@ def _prefill_candidates(
         pltpu.VMEM(small_packed.shape, jnp.float32),
         pltpu.SemaphoreType.DMA((2,)),
     ]
-    if msa_indexer.keys_cacheable(block_q, rows_per_page, index_cache.dtype):
+    if key_cache:
         scratch.append(pltpu.VMEM((num_cols, page_size // 4, head_dim), jnp.uint32))
     vmem_bytes = _prefill_vmem_bytes(
-        plan, index_cache, small_packed.shape[0], num_rows, pick["topk"]
+        plan, index_cache, small_packed.shape[0], num_rows, pick["topk"], key_cache
     )
     return pl.pallas_call(
         functools.partial(_prefill_candidates_kernel, pick=pick, chunk=chunk),
@@ -1772,9 +1780,20 @@ def _class_candidates(
     small = plan.small()
     small_picks = class_picks(small, plan.small_block_q, not plan.token_major)
     prefill_plan = class_plan(**options | {"pages_per_step": _PREFILL_PAGES_PER_STEP})
-    if _prefill_fits(
-        prefill_plan, index_cache, small_picks.shape[0], num_tokens * num_heads, topk
-    ):
+    fits = functools.partial(
+        _prefill_fits,
+        prefill_plan,
+        index_cache,
+        small_picks.shape[0],
+        num_tokens * num_heads,
+        topk,
+    )
+    # Without the key cache if only that does not fit: it is as wide as the
+    # block tables (max-model-len), whatever the step's context.
+    key_cache = msa_indexer.keys_cacheable(
+        plan.large_block_q, index_cache.shape[1], index_cache.dtype
+    ) and fits(True)
+    if key_cache or fits(False):
         packed = _prefill_candidates(
             prefill_plan,
             index_cache,
@@ -1794,6 +1813,7 @@ def _class_candidates(
                 real_cols=prefill_plan.large_pages,
             ),
             rank=rank,
+            key_cache=key_cache,
             interpret=interpret,
         )  # [T * G, 2 * topk], (token, head) rows
         return packed.reshape(num_tokens, -1)

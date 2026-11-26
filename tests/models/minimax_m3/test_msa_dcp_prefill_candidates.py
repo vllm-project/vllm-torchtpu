@@ -14,7 +14,7 @@
 """DCP candidates of a mixed (decode + prefill chunk) step, the large tiles
 picked inside their indexer kernel, against the token-order path (interpret
 mode), bit for bit: several large tiles of several page groups each, an
-unaligned chunk start, padding rows."""
+unaligned chunk start, padding rows, two large requests."""
 
 import jax.numpy as jnp
 import numpy as np
@@ -24,14 +24,15 @@ from tests.models.minimax_m3.test_msa_dcp_classes import HEAD_DIM, TOPK, _caches
 from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_indexer
 
 
-def _mixed_step(dtype, rank, dcp, heads):
+def _mixed_step(dtype, rank, dcp, heads, q_lens=None, ctx_lens=None):
     """A run of `msa_write_and_candidates_dcp` over a mixed step, and its
     real rows."""
     rng = np.random.default_rng(10 * dcp + rank)
     # Two decode requests, then a chunk of 3+ large tiles starting at row 21;
-    # the chunk's context spans 3 page groups of 128 pages on every rank.
-    q_lens = [8, 13, 1100]
-    ctx_lens = [9_000, 300, 2 * 128 * 128 * dcp + 5_000]
+    # the chunk's context spans 2 page groups of 256 pages (3 of 128) on
+    # every rank.
+    q_lens = q_lens or [8, 13, 1100]
+    ctx_lens = ctx_lens or [9_000, 300, 2 * 128 * 128 * dcp + 5_000]
     num_seqs = len(q_lens)
     max_num_seqs = 4
     num_real = sum(q_lens)
@@ -94,6 +95,18 @@ def test_mixed_step_matches_token_order(dtype, rank, dcp, heads, monkeypatch):
     # Padding rows hold the picks of position 0: block 0 on rank 0.
     blocks = got[num_real:, TOPK : 2 * TOPK]
     assert np.all((blocks == -1) | (blocks == 0))
+
+
+def test_two_large_requests_match_token_order(monkeypatch):
+    """A second large request with fewer pages than the first: its first
+    tile refills the 4-bit pages' key cache, its later tiles read it."""
+    run, num_real = _mixed_step(
+        "int4", 1, 2, 1, q_lens=[8, 1100, 700], ctx_lens=[9_000, 70_000, 40_000]
+    )
+    got = np.asarray(run())
+    monkeypatch.setattr(msa_indexer, "is_prefill_step", lambda *_: False)
+    want = np.asarray(run())
+    np.testing.assert_array_equal(got[:num_real], want[:num_real])
 
 
 def test_over_vmem_budget_picks_in_their_own_kernel(monkeypatch):
