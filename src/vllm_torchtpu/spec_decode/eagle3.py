@@ -47,6 +47,7 @@ from vllm_torchtpu.spec_decode.utils import (
     _force_draft_tp1,
     disable_ep_weight_filter_for_replicated_draft,
     dp_lockstep_num_reqs,
+    draft_has_moe_layers,
     iter_mtp_shared_heads,
     maybe_share_embeddings,
     maybe_share_lm_head,
@@ -2226,9 +2227,7 @@ class Eagle3Proposer:
         if self._draft_has_moe_cache is None:
             if self.draft_model is None:
                 return False
-            from vllm.model_executor.models.interfaces import is_mixture_of_experts
-
-            self._draft_has_moe_cache = bool(is_mixture_of_experts(self.draft_model))
+            self._draft_has_moe_cache = draft_has_moe_layers(self.draft_model)
         return self._draft_has_moe_cache
 
     def _dp_lockstep_sharded(self) -> bool:
