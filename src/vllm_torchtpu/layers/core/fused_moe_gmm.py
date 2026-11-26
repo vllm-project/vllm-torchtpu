@@ -402,10 +402,13 @@ def prepare_routed_gmm_inputs(
         # Padded tokens keep their selected expert ids, but carry zero
         # expert routing weights. Treat them as invalid to remove them
         # from GMM work.
-        valid_mask = (topk_indices_flat >= 0) & (topk_weights_flat != 0)
+        valid_mask = (topk_indices_local >= 0) & (topk_weights_local != 0)
     else:
-        valid_mask = topk_indices_flat >= 0
-    sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
+        valid_mask = topk_indices_local >= 0
+    # Built in the [tokens, topk] layout and flattened once: each array
+    # flattened from that layout is a relayout of its own.
+    sort_keys = jnp.where(valid_mask, topk_indices_local, local_num_experts).flatten()
+    valid_mask = valid_mask.flatten()
     # The keys take only `local_num_experts + 1` values, so a counting sort
     # gives the positions and `group_sizes` without a second comparison sort:
     # on the ragged permute at any row count (as before), and -- unless
@@ -524,8 +527,9 @@ def prepare_routed_gmm_inputs(
         else:
             # Match uLLM/reference EP routing: materialize the valid local
             # expert prefix through SparseCore ragged_gather. Invalid
-            # non-local rows are sorted after the valid prefix.
-            valid_count = group_sizes_local.sum(dtype=jnp.int32)
+            # non-local rows are sorted after the valid prefix. Counted from
+            # the mask, so the gather does not wait for `group_sizes`.
+            valid_count = jnp.sum(valid_mask, dtype=jnp.int32)
             x = ragged_gather_v2(
                 hidden_states_local,
                 token_indices_sorted,
