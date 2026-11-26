@@ -14,8 +14,6 @@
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
-from typing import Any
-
 import vllm_torchtpu.env_override  # noqa: F401
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
@@ -614,7 +612,8 @@ def _patch_vllm_compile_all_ranges() -> None:
                 range_entry.compiled = False
                 range_entry.runnable = None
                 if mode == "skip":
-                    skip_tag = getattr(range_entry, "_tpu_skip_tag", None)
+                    skip_tag = range_entry._tpu_skip_tag
+                    del range_entry._tpu_skip_tag
                     size = (
                         range_entry.compile_range.start
                         if range_entry.compile_range.is_single_size()
@@ -1647,7 +1646,7 @@ def _patch_vllm_reset_compile_wrapper() -> None:
     )
 
 
-def _mark_patched(fn: Any, sentinel: str) -> None:
+def _mark_patched(fn: object, sentinel: str) -> None:
     setattr(fn, sentinel, True)
 
 

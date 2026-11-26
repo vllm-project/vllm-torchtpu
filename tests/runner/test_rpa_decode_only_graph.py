@@ -21,6 +21,7 @@ from vllm.distributed import parallel_state
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.runner import rpa_decode_only_graph
+from vllm_torchtpu.runner.tpu_runner import _get_padded_token_len
 
 
 def _fake_impl(*, has_decode_only: bool) -> PallasAttentionBackendImpl:
@@ -40,6 +41,7 @@ def _resolve(monkeypatch, *, has_decode_only: bool = True, **overrides):
     kwargs = dict(
         vllm_config=None,
         token_paddings=[16, 32, 64, 128, 256],
+        pad_token_len=_get_padded_token_len,
         num_reqs_max_model_len=64,
         num_reqs_most_model_len=None,
         reorder_batch_threshold=1,
@@ -111,9 +113,21 @@ def test_self_disable_logs_warning(monkeypatch, overrides, has_decode_only):
     assert len(warnings) == 1
 
 
-@pytest.mark.parametrize(("peer_agreed", "expected"), [(1, [16, 32, 64]), (0, [])])
-def test_pp_stage_agreement(monkeypatch, peer_agreed, expected):
-    """Under PP, decode-only graph is enabled iff every PP stage agrees."""
+@pytest.mark.parametrize(
+    ("local_max_reqs", "peer_top_bucket", "expected"),
+    [
+        # Both stages agree on 64.
+        (64, 64, [16, 32, 64]),
+        # Local derives 128, peer derives 64 -> MIN reduction agrees on 64.
+        (100, 64, [16, 32, 64]),
+        # Peer disables (0) -> all stages disable.
+        (64, 0, []),
+    ],
+)
+def test_pp_stage_agreement_reduces_top_bucket(
+    monkeypatch, local_max_reqs, peer_top_bucket, expected
+):
+    """Under PP, stages reduce top_bucket via min_over_group to stay in lockstep."""
     monkeypatch.setenv("TPU_RPA_DECODE_ONLY_GRAPH", "1")
     pp_group = SimpleNamespace(cpu_group="pp")
     monkeypatch.setattr(parallel_state, "get_pp_group", lambda: pp_group)
@@ -121,7 +135,14 @@ def test_pp_stage_agreement(monkeypatch, peer_agreed, expected):
     def _all_reduce(t, op=None, group=None):
         assert op == torch.distributed.ReduceOp.MIN
         assert group == "pp"
-        t.clamp_(max=peer_agreed)
+        t.clamp_(max=peer_top_bucket)
 
     monkeypatch.setattr(torch.distributed, "all_reduce", _all_reduce)
-    assert _resolve(monkeypatch, pipeline_parallel_size=2) == expected
+    assert (
+        _resolve(
+            monkeypatch,
+            num_reqs_max_model_len=local_max_reqs,
+            pipeline_parallel_size=2,
+        )
+        == expected
+    )

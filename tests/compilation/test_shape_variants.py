@@ -724,6 +724,7 @@ def _decode_only_two_pass(cache_root, expect_warm: bool):
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
         set_vllm_model_wrapper_context,
     )
+    from vllm_torchtpu.runner import rpa_decode_only_graph
 
     config, backend = prepare(cache_root)
     model = build(DecodeOnlyModel, config)
@@ -737,22 +738,34 @@ def _decode_only_two_pass(cache_root, expect_warm: bool):
         ):
             run(model, config, num_tokens)
 
-    with set_current_vllm_config(config):
-        shape_variants.retrace(model, config, prefix_suffix="_decode_only")
+    def run_pass(
+        token_paddings,
+        *,
+        trace_first: bool,
+        allowed_sizes=None,
+        cache_tag=None,
+        prefix_suffix: str = "",
+        rpa_decode_only: bool = False,
+    ) -> shape_variants.BucketExecutables:
+        del trace_first
         with shape_variants.warmup(
-            allowed_sizes=frozenset(decode_buckets),
-            cache_tag="decode_only",
-        ) as decode_session:
-            for size in decode_buckets:
-                run_variant(size, rpa_decode_only=True)
-        decode_runnables = shape_variants.collect_variant_runnables(
-            decode_session, prefix_suffix="_decode_only"
-        )
-        shape_variants.retrace(model, config)
+            allowed_sizes=allowed_sizes, cache_tag=cache_tag
+        ) as session:
+            for size in token_paddings:
+                if session.needs_retrace(size):
+                    shape_variants.retrace(model, config, prefix_suffix=prefix_suffix)
+                run_variant(size, rpa_decode_only=rpa_decode_only)
+        return session
 
-        with shape_variants.warmup() as mixed_session:
-            for size in BUCKETS:
-                run_variant(size, rpa_decode_only=False)
+    with set_current_vllm_config(config):
+        decode_runnables = rpa_decode_only_graph.precompile_decode_only_overlay(
+            model=model,
+            vllm_config=config,
+            decode_buckets=decode_buckets,
+            trace_first=False,
+            run_pass=run_pass,
+        )
+        mixed_session = run_pass(BUCKETS, trace_first=False)
 
     attached = shape_variants.attach_decode_only_runnables(
         mixed_session, decode_runnables

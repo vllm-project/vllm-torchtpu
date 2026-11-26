@@ -8118,6 +8118,7 @@ class TPUModelRunner(GPUModelRunner):
         return rpa_decode_only_graph.resolve_decode_only_buckets(
             vllm_config=self.vllm_config,
             token_paddings=self._backbone_token_paddings(),
+            pad_token_len=_get_padded_token_len,
             num_reqs_max_model_len=self.num_reqs_max_model_len,
             num_reqs_most_model_len=self.num_reqs_most_model_len,
             reorder_batch_threshold=self.reorder_batch_threshold,
@@ -8134,10 +8135,10 @@ class TPUModelRunner(GPUModelRunner):
         trace_first: bool,
         allowed_sizes: frozenset[int] | None = None,
         cache_tag: str | None = None,
+        prefix_suffix: str = "",
         rpa_decode_only: bool = False,
     ) -> shape_variants.BucketExecutables:
         """Run one backbone warmup pass over `token_paddings` and return its session."""
-        prefix_suffix = f"_{cache_tag}" if cache_tag else ""
         with shape_variants.warmup(
             allowed_sizes=allowed_sizes,
             cache_tag=cache_tag,
@@ -8224,11 +8225,16 @@ class TPUModelRunner(GPUModelRunner):
             self._backbone_token_paddings(),
             trace_first=trace_first,
         )
-        if decode_runnables:
+        if decode_buckets:
+            if not decode_runnables:
+                raise shape_variants.ShapeSpecializationError(
+                    "decode-only precompile collected no executables for "
+                    f"buckets {decode_buckets}"
+                )
             attached = shape_variants.attach_decode_only_runnables(
                 mixed_session, decode_runnables
             )
-            self._has_rpa_decode_only_graph = attached > 0
+            self._has_rpa_decode_only_graph = True
             # Exercise the live decode-only dispatch path at startup so a broken
             # attachment fails during warmup rather than on the first decode step.
             for num_tokens in decode_buckets:

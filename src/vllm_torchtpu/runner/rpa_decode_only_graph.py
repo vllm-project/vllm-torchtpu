@@ -15,7 +15,6 @@
 
 from __future__ import annotations
 
-import bisect
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +23,7 @@ import vllm.envs as vllm_envs
 from vllm.config import get_layers_from_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.logger import init_logger
@@ -38,24 +37,20 @@ DECODE_ONLY_CACHE_TAG = "decode_only"
 DECODE_ONLY_PREFIX_SUFFIX = f"_{DECODE_ONLY_CACHE_TAG}"
 
 
-def _agree_across_pp(has_local_buckets: bool, pipeline_parallel_size: int) -> bool:
-    """Ensure every pipeline stage makes the same decode-only graph decision."""
+def _min_top_bucket_across_pp(top_bucket: int, pipeline_parallel_size: int) -> int:
+    """Agree on a single covering bucket (0 = disabled) across all PP stages."""
     if pipeline_parallel_size <= 1:
-        return has_local_buckets
+        return top_bucket
     from vllm.distributed.parallel_state import get_pp_group
 
-    pp_group = get_pp_group()
-    agreed = torch.tensor([int(has_local_buckets)], dtype=torch.int64, device="cpu")
-    torch.distributed.all_reduce(
-        agreed, op=torch.distributed.ReduceOp.MIN, group=pp_group.cpu_group
-    )
-    return bool(agreed.item())
+    return utils.min_over_group(top_bucket, get_pp_group().cpu_group)
 
 
 def resolve_decode_only_buckets(
     *,
     vllm_config: VllmConfig,
     token_paddings: Sequence[int],
+    pad_token_len: Callable[[list[int], int], int],
     num_reqs_max_model_len: int,
     num_reqs_most_model_len: int | None,
     reorder_batch_threshold: int | None,
@@ -68,8 +63,9 @@ def resolve_decode_only_buckets(
 
     Logs a warning once whenever ``TPU_RPA_DECODE_ONLY_GRAPH=1`` self-disables
     for an unsupported configuration, and raises when incompatible with mega
-    AOT artifacts. Under pipeline parallelism, all stages must agree so
-    hand-off warmup runs the same sequence on every stage.
+    AOT artifacts. Under pipeline parallelism, all stages agree on the exact
+    covering bucket (0 disables) via a single MIN reduction so hand-off warmup
+    runs the same bucket list on every stage.
     """
     if not envs.TPU_RPA_DECODE_ONLY_GRAPH:
         return []
@@ -106,26 +102,26 @@ def resolve_decode_only_buckets(
                 "no attention layer pre-built a decode-only batched RPA kernel"
             )
 
+    paddings = list(token_paddings)
     if disable_reason is not None:
         logger.warning_once("TPU_RPA_DECODE_ONLY_GRAPH=1 disabled: %s.", disable_reason)
-        _agree_across_pp(False, pipeline_parallel_size)
-        return []
+        local_top_bucket = 0
+    else:
+        max_reqs = max(num_reqs_max_model_len, num_reqs_most_model_len or 0)
+        max_decode_tokens = max(1, max_reqs * (reorder_batch_threshold or 1))
+        # Round up to the covering bucket so steps whose active decode token
+        # count falls between two buckets (e.g. 65..100 padding to 128) still
+        # hit the decode-only graph.
+        local_top_bucket = pad_token_len(paddings, min(max_decode_tokens, paddings[-1]))
 
-    if not _agree_across_pp(True, pipeline_parallel_size):
-        logger.warning_once(
-            "TPU_RPA_DECODE_ONLY_GRAPH=1 disabled: not all pipeline stages have "
-            "eligible batched RPA layers."
-        )
+    top_bucket = _min_top_bucket_across_pp(local_top_bucket, pipeline_parallel_size)
+    if top_bucket == 0:
+        if local_top_bucket > 0:
+            logger.warning_once(
+                "TPU_RPA_DECODE_ONLY_GRAPH=1 disabled: not all pipeline stages "
+                "have eligible batched RPA layers."
+            )
         return []
-
-    max_reqs = max(num_reqs_max_model_len, num_reqs_most_model_len or 0)
-    max_decode_tokens = max(1, max_reqs * (reorder_batch_threshold or 1))
-    # Round up to the covering bucket so steps whose active decode token count
-    # falls between two buckets (e.g. 65..100 padding to 128) still hit the
-    # decode-only graph.
-    paddings = list(token_paddings)
-    capped = min(max_decode_tokens, paddings[-1])
-    top_bucket = paddings[bisect.bisect_left(paddings, capped)]
     return [n for n in paddings if n <= top_bucket]
 
 
@@ -144,6 +140,7 @@ def precompile_decode_only_overlay(
         trace_first=trace_first,
         allowed_sizes=frozenset(decode_buckets),
         cache_tag=DECODE_ONLY_CACHE_TAG,
+        prefix_suffix=DECODE_ONLY_PREFIX_SUFFIX,
         rpa_decode_only=True,
     )
     decode_runnables = shape_variants.collect_variant_runnables(

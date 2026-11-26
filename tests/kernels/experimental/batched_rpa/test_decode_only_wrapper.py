@@ -11,13 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for batched RPA static decode_only=True wrapper path."""
+"""CPU JAXPR tests for batched RPA static decode_only=True wrapper path.
+
+Reference-backed TPU functional coverage for `decode_only=True` lives in
+`correctness_test.py` (`*_spec_decode`, `*_nan_kv_stays_in_its_sequence`,
+and `*_1m_context`).
+"""
 
 from unittest import mock
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
@@ -107,97 +111,3 @@ def test_wrapper_decode_only_omits_mixed_and_preserves_aliasing(kv_layout, retur
     assert decode_calls[1][0].startswith("RPAd-")
     assert decode_calls[1][1] == mixed_calls[1][1]
     assert len(decode_calls[1][1]) == (3 if return_lse else 2)
-
-
-@pytest.mark.tpu_test
-@pytest.mark.parametrize(
-    "kv_layout",
-    [configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE],
-)
-@pytest.mark.parametrize("decode_query_size", [1, 4])
-def test_tpu_decode_only_matches_mixed_bit_for_bit(kv_layout, decode_query_size):
-    """On TPU, decode_only=True matches decode_only=False on pure-decode batches."""
-    if jax.default_backend() != "tpu":
-        pytest.skip("requires TPU backend")
-
-    rng = np.random.default_rng(0)
-    active_seqs = 6
-    max_seqs = 8
-    page_size = 128
-    pages_per_seq = 2
-    num_pages = max_seqs * pages_per_seq
-    num_q_heads = 8
-    num_kv_heads = 2
-    head_dim = 128
-    active_tokens = active_seqs * decode_query_size
-    max_tokens = active_tokens + 8  # trailing padded token slots
-
-    q = jnp.asarray(
-        rng.normal(size=(max_tokens, num_q_heads, head_dim)), dtype=jnp.bfloat16
-    )
-    k = jnp.asarray(
-        rng.normal(size=(max_tokens, num_kv_heads, head_dim)), dtype=jnp.bfloat16
-    )
-    v = jnp.asarray(
-        rng.normal(size=(max_tokens, num_kv_heads, head_dim)), dtype=jnp.bfloat16
-    )
-    kv_shape = wrapper.get_kv_cache_shape(
-        num_pages,
-        page_size,
-        num_kv_heads,
-        head_dim,
-        jnp.bfloat16,
-        kv_layout=kv_layout,
-    )
-    kv_init = jnp.asarray(rng.normal(size=kv_shape), dtype=jnp.bfloat16)
-    kv_lens_np = np.zeros((max_seqs,), dtype=np.int32)
-    kv_lens_np[:active_seqs] = rng.integers(
-        decode_query_size + 1, page_size * pages_per_seq, size=(active_seqs,)
-    )
-    kv_lens = jnp.asarray(kv_lens_np, dtype=jnp.int32)
-    page_indices = jnp.arange(num_pages, dtype=jnp.int32)
-    q_lens = [decode_query_size] * active_seqs + [0] * (max_seqs - active_seqs)
-    cu_q_lens = jnp.asarray([0, *np.cumsum(q_lens).tolist()], dtype=jnp.int32)
-    distribution = jnp.array([active_seqs, active_seqs, active_seqs], dtype=jnp.int32)
-
-    out_mixed, kv_mixed = wrapper.ragged_paged_attention(
-        q,
-        k,
-        v,
-        kv_init.copy(),
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        sm_scale=head_dim**-0.5,
-        kv_layout=kv_layout,
-        decode_query_size=decode_query_size,
-        decode_only=False,
-    )
-    out_decode, kv_decode = wrapper.ragged_paged_attention(
-        q,
-        k,
-        v,
-        kv_init.copy(),
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        sm_scale=head_dim**-0.5,
-        kv_layout=kv_layout,
-        decode_query_size=decode_query_size,
-        decode_only=True,
-    )
-    out_mixed, kv_mixed, out_decode, kv_decode = jax.block_until_ready(
-        (out_mixed, kv_mixed, out_decode, kv_decode)
-    )
-    out_decode_np = np.asarray(out_decode[:active_tokens].astype(jnp.float32))
-    assert np.any(out_decode_np != 0.0), "decode output unexpectedly all zeros"
-    np.testing.assert_array_equal(
-        out_decode_np,
-        np.asarray(out_mixed[:active_tokens].astype(jnp.float32)),
-    )
-    np.testing.assert_array_equal(
-        np.asarray(kv_decode.astype(jnp.float32)),
-        np.asarray(kv_mixed.astype(jnp.float32)),
-    )

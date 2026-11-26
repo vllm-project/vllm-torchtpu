@@ -1035,6 +1035,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if self._subpage_split != subpage_split:
             self._subpage_split = subpage_split
             self._kernel_config_cache.clear()
+            self.rpa_kernel_decode_only = None
 
     def set_block_major_pool(
         self, pool_index: int, layout: BlockMajorPoolLayout
