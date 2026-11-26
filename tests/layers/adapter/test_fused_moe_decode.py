@@ -279,12 +279,18 @@ def test_arm_runner_models_skips_a_draft_that_is_the_target(monkeypatch):
     assert armed == [(runner.model, "target model")]
 
 
-@pytest.mark.parametrize("ep_impl", ["default", "adaptive"])
+@pytest.mark.parametrize(
+    "ep_impl", ["default", "adaptive", "none", "fp8_all_gather", "collection_chunks"]
+)
 def test_stands_down_when_fused_ep_serves_layer(monkeypatch, ep_impl):
     """An FP8 pure-EP layer armed with a fused EP kernel must not also be armed
     by fused_moe_decode: apply_monolithic returns from the fused EP branch
     before fused_moe_decode, so arming decode would drop the runner's shared
-    expert and routed_scaling_factor."""
+    expert and routed_scaling_factor. The same holds when the MoE takes vLLM's
+    collectives (TPU_MOE_FP8_ALL_GATHER, or TPU_MOE_COLLECTION_CHUNK_SIZE > 0):
+    apply_monolithic returns the pipelined GMM first. 'none' is the positive
+    control: the same layer with neither arms, so a refusal in the other cases
+    comes from the stand-down, not from another _admit check."""
     import vllm.config as vllm_config
     import vllm.distributed
     import vllm.distributed.parallel_state as parallel_state
@@ -321,14 +327,19 @@ def test_stands_down_when_fused_ep_serves_layer(monkeypatch, ep_impl):
         decode_calls += 1
         return torch.full_like(x, 99.0)
 
-    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", True)
-    monkeypatch.setattr(envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS", 1)
-    monkeypatch.setattr(envs, "MOE_FUSED_EP_SORTED_GATHER", False)
-    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL", True)
-    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256)
-    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
-    monkeypatch.setattr(envs, "TPU_MOE_FP8_ALL_GATHER", False)
-    monkeypatch.setattr(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0)
+    # setitem on the module dict: undo deletes the key, so envs.__getattr__
+    # reads the real environment again for later tests.
+    for name, value in {
+        "USE_MOE_FUSED_EP_KERNEL": True,
+        "MOE_FUSED_EP_KERNEL_MIN_TOKENS": 1,
+        "MOE_FUSED_EP_SORTED_GATHER": False,
+        "FUSED_MOE_DECODE_KERNEL": True,
+        "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": 256,
+        "TPU_MOE_SKIP_PADDED_TOKENS": False,
+        "TPU_MOE_FP8_ALL_GATHER": ep_impl == "fp8_all_gather",
+        "TPU_MOE_COLLECTION_CHUNK_SIZE": 1024 if ep_impl == "collection_chunks" else 0,
+    }.items():
+        monkeypatch.setitem(vars(envs), name, value)
     monkeypatch.setattr(
         pltpu,
         "get_tpu_info",
@@ -442,7 +453,9 @@ def test_stands_down_when_fused_ep_serves_layer(monkeypatch, ep_impl):
             pass
 
     routed = _EpRoutedExperts()
-    if ep_impl == "adaptive":
+    if ep_impl in ("none", "fp8_all_gather", "collection_chunks"):
+        pass  # no fused EP op
+    elif ep_impl == "adaptive":
         qm._use_adaptive_fused_moe = True
         qm._adaptive_fused_moe_op = adaptive_moe.prebuild_adaptive_fused_moe(
             routed, topk=topk, renormalize=True, activation="silu"
@@ -468,11 +481,17 @@ def test_stands_down_when_fused_ep_serves_layer(monkeypatch, ep_impl):
     model.add_module("moe", runner)
 
     armed = bridge.arm_fused_moe_decode(model)
+    if ep_impl == "none":
+        # Positive control: nothing serves the layer first, so decode arms it.
+        assert armed == 1 and bridge.fused_moe_decode_supported(qm)
+        return
+    assert armed == 0 and not bridge.fused_moe_decode_supported(qm)
+    assert runner.shared_experts is not None and runner.routed_scaling_factor == 2.5
+    if ep_impl in ("fp8_all_gather", "collection_chunks"):
+        return  # the pipelined GMM path needs real collectives; arming is the check
     x = torch.ones((4, h), dtype=torch.bfloat16)
     logits = torch.zeros((4, e * n_ranks), dtype=torch.float32)
     out = runner(hidden_states=x, router_logits=logits)
 
     torch.testing.assert_close(out, torch.full_like(x, 20.0))
     assert (ep_calls, shared_mlp.calls, decode_calls) == (1, 1, 0)
-    assert armed == 0 and not bridge.fused_moe_decode_supported(qm)
-    assert runner.shared_experts is not None and runner.routed_scaling_factor == 2.5

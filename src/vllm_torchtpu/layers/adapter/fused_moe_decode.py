@@ -413,7 +413,10 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     from vllm.distributed import get_tensor_model_parallel_world_size
 
     from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+        VllmFp8MoEMethodTPU,
+        moe_owns_collectives,
+    )
 
     cfg = runner.moe_config
     par = cfg.moe_parallel_config
@@ -441,6 +444,16 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
         logger.info_once(
             "FUSED_MOE_DECODE_KERNEL: a fused EP MoE kernel serves this layer; "
             "the fused MoE decode kernel stands down on it."
+        )
+        return None
+    # With vLLM's collectives (TPU_MOE_COLLECTION_CHUNK_SIZE > 0 or
+    # TPU_MOE_FP8_ALL_GATHER), apply_monolithic returns the pipelined GMM before
+    # the decode branch: the same stand-down as above.
+    if moe_owns_collectives():
+        logger.info_once(
+            "FUSED_MOE_DECODE_KERNEL: the MoE takes vLLM's collectives "
+            "(TPU_MOE_COLLECTION_CHUNK_SIZE > 0 or TPU_MOE_FP8_ALL_GATHER); "
+            "the fused MoE decode kernel stands down."
         )
         return None
     if getattr(layer, "w13_bias", None) is not None or (
