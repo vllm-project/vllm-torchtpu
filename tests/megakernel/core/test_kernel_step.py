@@ -26,8 +26,10 @@ import numpy as np
 import pytest
 from jax._src.pallas.mosaic.interpret import interpret_pallas_call as ipc
 from jax.experimental.pallas import tpu as pltpu
+from jax.extend import backend as jax_backend
 from jax.sharding import Mesh
 
+from tests.megakernel import conftest as mk_conftest
 from tests.megakernel.conftest import tpu_mesh
 from tests.megakernel.core.megakernel_fakes import (
     TINY_TILES,
@@ -604,28 +606,32 @@ def test_tiles_inplace_aliases_leaf_offsets_and_rejects_multi_rank():
         kernel.make_step(mesh, spec_r2, ex_bad, donate_states=True)
 
 
-def test_tpu_mesh_skips_only_absent_or_busy_errors(
+def test_tpu_mesh_fails_on_a_busy_tpu_and_reraises_other_errors(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """`tpu_mesh` skips on absent/busy TPU errors and re-raises real `RuntimeError`s."""
+    """`tpu_mesh` fails (after the bounded wait) on a busy TPU and re-raises
+    other `RuntimeError`s; `tests/megakernel/test_tpu_probe.py` covers the
+    retry and the skip without a TPU backend."""
     devs = jax.devices("cpu")
-    monkeypatch.setattr(
-        jax,
-        "devices",
-        lambda backend=None: (_ for _ in ()).throw(
-            RuntimeError("RESOURCE_UNAVAILABLE: Device or resource busy")
-        ),
-    )
-    with pytest.raises(pytest.skip.Exception, match="busy"):
-        tpu_mesh(1)
+    clock = [0.0]
+
+    def sleep(s: float) -> None:
+        clock[0] += s
+
+    monkeypatch.setattr(mk_conftest.time, "sleep", sleep)
+    monkeypatch.setattr(mk_conftest.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(jax_backend, "clear_backends", lambda: None)
+
+    def raises(msg: str) -> Any:
+        return lambda *a, **kw: (_ for _ in ()).throw(RuntimeError(msg))
 
     monkeypatch.setattr(
-        jax,
-        "devices",
-        lambda backend=None: (_ for _ in ()).throw(
-            RuntimeError("INTERNAL: broken PjRt plugin")
-        ),
+        jax, "devices", raises("RESOURCE_UNAVAILABLE: Device or resource busy")
     )
+    with pytest.raises(pytest.fail.Exception, match="still busy after 120s"):
+        tpu_mesh(1)
+
+    monkeypatch.setattr(jax, "devices", raises("INTERNAL: broken PjRt plugin"))
     with pytest.raises(RuntimeError, match="broken PjRt plugin"):
         tpu_mesh(1)
 
@@ -633,19 +639,11 @@ def test_tpu_mesh_skips_only_absent_or_busy_errors(
     monkeypatch.setattr(
         jax,
         "device_put",
-        lambda *a, **kw: (_ for _ in ()).throw(
-            RuntimeError("RESOURCE_EXHAUSTED: Device or resource busy (EBUSY)")
-        ),
+        raises("RESOURCE_EXHAUSTED: Device or resource busy (EBUSY)"),
     )
-    with pytest.raises(pytest.skip.Exception, match="TPU device busy"):
+    with pytest.raises(pytest.fail.Exception, match="still busy after 120s"):
         tpu_mesh(1)
 
-    monkeypatch.setattr(
-        jax,
-        "device_put",
-        lambda *a, **kw: (_ for _ in ()).throw(
-            RuntimeError("INTERNAL: HBM transfer failed")
-        ),
-    )
+    monkeypatch.setattr(jax, "device_put", raises("INTERNAL: HBM transfer failed"))
     with pytest.raises(RuntimeError, match="HBM transfer failed"):
         tpu_mesh(1)
