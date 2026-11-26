@@ -534,7 +534,7 @@ class TPUWorker(WorkerBase):
             profiler_world_size=self.profile_world_size,
             local_rank=self.local_rank,
             local_world_size=local_world_for_pin,
-            enable_cpu_pin=(self._orig_dp_size == 1),
+            enable_cpu_pin=(self._orig_dp_size == 1 and runner_cls is TPUModelRunner),
         )
         logger.info(
             "Init worker | "

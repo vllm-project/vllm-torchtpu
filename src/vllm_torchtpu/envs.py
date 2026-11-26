@@ -204,33 +204,6 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
-    K3_AGGREGATE_EP16: bool = False
-    K3_DCP_COMBINE_CHUNKS: bool = True
-    K3_DECODE_EXPERT_BANKS: bool = False
-    K3_FP8_WIRES: str = ""
-    K3_HOT_PLAN: str = ""
-    K3_MAX_PREFILL_STEP_TOKENS: int = 16384
-    K3_PREFILL_A2A_CHIP_SHARD: bool = True
-    K3_PREFILL_EXPERT_PLAN: str = "plan_ep16_real_hotfirst.npz"
-    K3_PREFILL_KDA_A2A: bool = True
-    K3_PREFILL_KDA_DUAL_GATHER: bool = False
-    K3_PREFILL_KDA_RING_SET: bool = True
-    K3_PREFILL_KDA_A2A_FP8: bool = False
-    K3_PREFILL_KDA_FP8_GATHER: bool = False
-    K3_PREFILL_MLA_A2A: bool = True
-    K3_PREFILL_MLA_A2A_FP8: bool = False
-    K3_PREFILL_MOE_16K_MONOLITHIC: bool = True
-    K3_PREFILL_MOE_DENSE_FP8: bool = False
-    K3_PREFILL_MOE_W4A8: bool = True
-    K3_PREFILL_PREFIX_FP8: bool = True
-    K3_PREFILL_REPLICA_PLAN: str = "replica_plan_ep16_real_plain4.npz"
-    K3_PREFILL_ROUTE_COUNTS: bool = False
-    K3_PREFILL_ROUTE_COUNTS_DIR: str = ""
-    K3_PREFILL_SJF: bool = True
-    K3_PREFILL_SJF_AGING: float = 16384.0
-    K3_REPLICA_PLAN: str = "replica_plan_ep16_real_plain4.npz"
-    K3_SERIAL_PREFILL: bool = True
-    K3_UNIFIED_EP16: bool = True
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
@@ -1281,40 +1254,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
-    # Kimi K3 megakernel and prefill scheduler knobs.
-    "K3_AGGREGATE_EP16": env_bool("K3_AGGREGATE_EP16", default=False),
-    "K3_DCP_COMBINE_CHUNKS": env_bool("K3_DCP_COMBINE_CHUNKS", default=True),
-    "K3_DECODE_EXPERT_BANKS": env_bool("K3_DECODE_EXPERT_BANKS", default=False),
-    "K3_FP8_WIRES": env_str("K3_FP8_WIRES", ""),
-    "K3_HOT_PLAN": env_str("K3_HOT_PLAN", ""),
-    "K3_MAX_PREFILL_STEP_TOKENS": env_int("K3_MAX_PREFILL_STEP_TOKENS", 16384),
-    "K3_PREFILL_A2A_CHIP_SHARD": env_bool("K3_PREFILL_A2A_CHIP_SHARD", default=True),
-    "K3_PREFILL_EXPERT_PLAN": env_str(
-        "K3_PREFILL_EXPERT_PLAN", "plan_ep16_real_hotfirst.npz"
-    ),
-    "K3_PREFILL_KDA_A2A": env_bool("K3_PREFILL_KDA_A2A", default=True),
-    "K3_PREFILL_KDA_DUAL_GATHER": env_bool("K3_PREFILL_KDA_DUAL_GATHER", default=False),
-    "K3_PREFILL_KDA_RING_SET": env_bool("K3_PREFILL_KDA_RING_SET", default=True),
-    "K3_PREFILL_KDA_A2A_FP8": env_bool("K3_PREFILL_KDA_A2A_FP8", default=False),
-    "K3_PREFILL_KDA_FP8_GATHER": env_bool("K3_PREFILL_KDA_FP8_GATHER", default=False),
-    "K3_PREFILL_MLA_A2A": env_bool("K3_PREFILL_MLA_A2A", default=True),
-    "K3_PREFILL_MLA_A2A_FP8": env_bool("K3_PREFILL_MLA_A2A_FP8", default=False),
-    "K3_PREFILL_MOE_16K_MONOLITHIC": env_bool(
-        "K3_PREFILL_MOE_16K_MONOLITHIC", default=True
-    ),
-    "K3_PREFILL_MOE_DENSE_FP8": env_bool("K3_PREFILL_MOE_DENSE_FP8", default=False),
-    "K3_PREFILL_MOE_W4A8": env_bool("K3_PREFILL_MOE_W4A8", default=True),
-    "K3_PREFILL_PREFIX_FP8": env_bool("K3_PREFILL_PREFIX_FP8", default=True),
-    "K3_PREFILL_REPLICA_PLAN": env_str(
-        "K3_PREFILL_REPLICA_PLAN", "replica_plan_ep16_real_plain4.npz"
-    ),
-    "K3_PREFILL_ROUTE_COUNTS": env_bool("K3_PREFILL_ROUTE_COUNTS", default=False),
-    "K3_PREFILL_ROUTE_COUNTS_DIR": env_str("K3_PREFILL_ROUTE_COUNTS_DIR", ""),
-    "K3_PREFILL_SJF": env_bool("K3_PREFILL_SJF", default=True),
-    "K3_PREFILL_SJF_AGING": env_float("K3_PREFILL_SJF_AGING", 16384.0),
-    "K3_REPLICA_PLAN": env_str("K3_REPLICA_PLAN", "replica_plan_ep16_real_plain4.npz"),
-    "K3_SERIAL_PREFILL": env_bool("K3_SERIAL_PREFILL", default=True),
-    "K3_UNIFIED_EP16": env_bool("K3_UNIFIED_EP16", default=True),
     # Pooling models: run LAST/CLS/MEAN embed pooling through the AOT-compiled
     # static pooler over the (token, request) bucket grid. 0 falls back to the
     # eager vLLM pooler (finished-mask gating still applies).
@@ -1390,8 +1329,3 @@ def use_raiden_glm_admission() -> bool:
 def is_indexer_kv_cache_mode_explicit() -> bool:
     """True when VLLM_TPU_INDEXER_KV_CACHE_MODE was explicitly set."""
     return "VLLM_TPU_INDEXER_KV_CACHE_MODE" in os.environ
-
-
-def is_k3_prefill_replica_plan_explicit() -> bool:
-    """True when K3_PREFILL_REPLICA_PLAN was explicitly set."""
-    return "K3_PREFILL_REPLICA_PLAN" in os.environ

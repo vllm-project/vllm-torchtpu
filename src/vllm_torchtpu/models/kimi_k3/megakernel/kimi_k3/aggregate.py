@@ -147,8 +147,8 @@ class KimiAggregate:
             )
         if kernel.prefill_expert_parallel == 8 and kernel.kd_hot_plan:
             raise NotImplementedError(
-                "the K3 aggregate engine does not run K3_HOT_PLAN at EP8; "
-                "use K3_REPLICA_PLAN instead"
+                "the K3 aggregate engine does not run kd_hot_plan at EP8; "
+                "use kd_replica_plan instead"
             )
         if config.attention_dp != 1:
             raise NotImplementedError(

@@ -256,9 +256,15 @@ def prepare_distributed(calls: Sequence[Any]) -> None:
             if index % world != rank:
                 continue
             inputs = tuple(tpu_torch_compile.placeholder_like(t) for t in call.operands)
-            with execution_mode.set_eager_mode(
-                execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
-            ):
+            eager_mode = (
+                getattr(
+                    execution_mode.EagerMode,
+                    "INTERNAL_COMPILE_FX_GRAPH",
+                    None,
+                )
+                or execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
+            )
+            with execution_mode.set_eager_mode(eager_mode):
                 call.op(*inputs)
     except Exception as exc:
         failure = exc

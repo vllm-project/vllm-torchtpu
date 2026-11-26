@@ -158,13 +158,13 @@ def test_should_break_when_source_row_blocks_are_permuted():
 
 
 def test_should_keep_ring_reduce_scatter_when_env_disabled(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_KDA_A2A", "0")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_KDA_A2A", False)
 
     assert KernelConfig().prefill_kda_a2a is False
 
 
 def test_should_select_all_to_all_when_env_set(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_KDA_A2A", "1")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_KDA_A2A", True)
 
     assert KernelConfig().prefill_kda_a2a is True
 
@@ -461,14 +461,18 @@ def test_should_reject_invalid_split_prefill_chunk_count():
 
 
 def test_should_keep_kda_a2a_fp8_disabled_when_env_unset(monkeypatch):
-    monkeypatch.delenv("K3_PREFILL_KDA_A2A_FP8", raising=False)
+    monkeypatch.setattr(
+        k3_config,
+        "DEFAULT_PREFILL_KDA_A2A_FP8",
+        k3_config.PRODUCTION_DEFAULTS["DEFAULT_PREFILL_KDA_A2A_FP8"],
+    )
 
     assert KernelConfig().prefill_kda_a2a_fp8 is False
 
 
 def test_should_enable_kda_a2a_fp8_when_a2a_and_fp8_envs_set(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_KDA_A2A", "1")
-    monkeypatch.setenv("K3_PREFILL_KDA_A2A_FP8", "1")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_KDA_A2A", True)
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_KDA_A2A_FP8", True)
 
     cfg = KernelConfig()
     assert cfg.prefill_kda_a2a is True
@@ -476,8 +480,8 @@ def test_should_enable_kda_a2a_fp8_when_a2a_and_fp8_envs_set(monkeypatch):
 
 
 def test_should_reject_kda_a2a_fp8_when_kda_a2a_is_disabled(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_KDA_A2A", "0")
-    monkeypatch.setenv("K3_PREFILL_KDA_A2A_FP8", "1")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_KDA_A2A", False)
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_KDA_A2A_FP8", True)
 
     with pytest.raises(ValueError, match="requires prefill_kda_a2a"):
         KernelConfig()
@@ -770,11 +774,11 @@ def test_should_replicate_kda_output_projection_in_prefill_load(
 def test_should_keep_a2a_chip_shard_off_when_disabled_and_validate_dependencies(
     monkeypatch,
 ):
-    monkeypatch.setenv("K3_PREFILL_A2A_CHIP_SHARD", "0")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_A2A_CHIP_SHARD", False)
     assert KernelConfig().prefill_a2a_chip_shard is False
 
-    monkeypatch.setenv("K3_PREFILL_KDA_A2A", "1")
-    monkeypatch.setenv("K3_PREFILL_A2A_CHIP_SHARD", "1")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_KDA_A2A", True)
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_A2A_CHIP_SHARD", True)
     assert KernelConfig().prefill_a2a_chip_shard is True
 
     with pytest.raises(
@@ -984,13 +988,17 @@ def test_should_match_replicated_oracle_bitwise_for_kda_chip_pair_across_ranks(l
 
 
 def test_should_keep_one_gather_ring_in_flight_when_dual_gather_env_unset(monkeypatch):
-    monkeypatch.delenv("K3_PREFILL_KDA_DUAL_GATHER", raising=False)
+    monkeypatch.setattr(
+        k3_config,
+        "DEFAULT_PREFILL_KDA_DUAL_GATHER",
+        k3_config.PRODUCTION_DEFAULTS["DEFAULT_PREFILL_KDA_DUAL_GATHER"],
+    )
 
     assert KernelConfig().prefill_kda_dual_gather is False
 
 
 def test_should_select_dual_gather_when_env_set(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_KDA_DUAL_GATHER", "1")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_KDA_DUAL_GATHER", True)
 
     assert KernelConfig().prefill_kda_dual_gather is True
 

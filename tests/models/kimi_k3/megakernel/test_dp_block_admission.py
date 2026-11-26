@@ -69,3 +69,60 @@ def test_releasing_a_waiting_request_clears_its_retry_state():
     pool.release("waiting")
     assert "waiting" not in pool.blocked_since
     assert "waiting" not in pool.req_group
+
+
+def test_scheduler_prefix_cache_hit_forwards_max_cache_hit_length(monkeypatch):
+    import sys
+    import types
+
+    from vllm_torchtpu.models.kimi_k3.megakernel import dp_blocks
+
+    monkeypatch.setattr(dp_blocks, "_INSTALLED", False)
+    seen: list[tuple[object, tuple[object, ...], dict[str, object]]] = []
+
+    class FakeScheduler:
+        current_step = 7
+
+        def __init__(self, vllm_config, *args, **kwargs):
+            self.kv_cache_manager = types.SimpleNamespace(block_pool=object())
+
+        def _get_local_prefix_cache_hit(self, request, max_cache_hit_length=None):
+            seen.append((request, (max_cache_hit_length,), {}))
+            return ("blocks", 0, 0, False)
+
+        def _update_waiting_for_remote_kv(self, request):
+            return None
+
+    class FakeKVCacheManager:
+        block_pool = object()
+
+        def allocate_slots(self, request, *args, **kwargs):
+            return None
+
+        def free(self, request):
+            return None
+
+        def pop_blocks_for_free(self, request):
+            return []
+
+    coord_mod = types.ModuleType("vllm.v1.core.kv_cache_coordinator")
+    coord_mod.BlockPool = object  # type: ignore[attr-defined]
+    mgr_mod = types.ModuleType("vllm.v1.core.kv_cache_manager")
+    mgr_mod.KVCacheManager = FakeKVCacheManager  # type: ignore[attr-defined]
+    sched_mod = types.ModuleType("vllm.v1.core.sched.scheduler")
+    sched_mod.Scheduler = FakeScheduler  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.kv_cache_coordinator", coord_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.kv_cache_manager", mgr_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.core.sched.scheduler", sched_mod)
+
+    dp_blocks.install()
+    sched = FakeScheduler.__new__(FakeScheduler)
+    pool = RegionBlockPool(128, False, 16, groups=2, shared=16, cap=2)
+    sched.kv_cache_manager = types.SimpleNamespace(block_pool=pool)
+    req = types.SimpleNamespace(request_id="req_033")
+
+    res = sched._get_local_prefix_cache_hit(req, 1024)
+    assert res == ("blocks", 0, 0, False)
+    assert seen == [(req, (1024,), {})]
+    assert "req_033" in pool.req_group

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prefill EP16 expert placement (K3_PREFILL_EXPERT_PLAN): the planned loader
+"""Prefill EP16 expert placement (prefill_expert_plan): the planned loader
 reproduces the pre-shard's regroup under the identity plan and places each
 planned expert's rows under a random plan; the shipped serving plan is valid."""
 

@@ -20,7 +20,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.models.kimi_k3.megakernel import runner
 from vllm_torchtpu.models.kimi_k3.megakernel.config import MegakernelEngineConfig
 from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3 import aggregate as aggregate_mod
@@ -172,10 +171,9 @@ def _extract_decode_half(
 def test_should_default_k3_unified_ep16_env_to_true(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("K3_UNIFIED_EP16", raising=False)
-    assert envs.environment_variables["K3_UNIFIED_EP16"]() is True
-    monkeypatch.setenv("K3_UNIFIED_EP16", "0")
-    assert envs.environment_variables["K3_UNIFIED_EP16"]() is False
+    assert config.PRODUCTION_DEFAULTS["DEFAULT_UNIFIED_EP16"] is True
+    monkeypatch.setattr(config, "DEFAULT_UNIFIED_EP16", False)
+    assert config.DEFAULT_UNIFIED_EP16 is False
 
 
 def test_should_resolve_unified_ep16_settings_when_enabled() -> None:
@@ -637,8 +635,8 @@ def test_should_install_unified_ep16_kernel_config_in_build_program(
         "build",
         lambda cfg, presharded, draft, *, tp_rank: ("built", cfg.role, tp_rank),
     )
-    monkeypatch.setenv("K3_UNIFIED_EP16", "1")
-    monkeypatch.setenv("K3_PREFILL_EXPERT_PLAN", EP8_DEFAULT_EXPERT_PLAN)
+    monkeypatch.setattr(config, "DEFAULT_UNIFIED_EP16", True)
+    monkeypatch.setattr(config, "DEFAULT_PREFILL_EXPERT_PLAN", EP8_DEFAULT_EXPERT_PLAN)
 
     fake_vllm_cfg = types.SimpleNamespace(
         model_config=types.SimpleNamespace(
@@ -1082,11 +1080,8 @@ def _fake_megakernel_vllm_config(
 def test_build_program_and_kernel_config_isolate_1p1d_and_aggregate_modes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import os
-
-    for key in list(os.environ):
-        if key.startswith("K3_"):
-            monkeypatch.delenv(key, raising=False)
+    for name, value in config.PRODUCTION_DEFAULTS.items():
+        monkeypatch.setattr(config, name, value)
 
     # 1. Bare KernelConfig() never pairs decode_expert_parallel=8 with EP16 plan,
     # and strips/normalizes disabled tokens across all plan fields.
@@ -1115,7 +1110,7 @@ def test_build_program_and_kernel_config_isolate_1p1d_and_aggregate_modes(
         lambda cfg, presharded, draft, *, tp_rank: ("built", cfg.role, tp_rank),
     )
 
-    # 2. 1P1D decode (dp=1, default envs): installs EP8 decode with empty plans.
+    # 2. 1P1D decode (dp=1, default settings): installs EP8 decode with empty plans.
     installed.clear()
     runner.build_program(_fake_megakernel_vllm_config(role="decode"), tp_rank=0)
     assert len(installed) == 1
@@ -1124,9 +1119,9 @@ def test_build_program_and_kernel_config_isolate_1p1d_and_aggregate_modes(
     assert installed[0].prefill_replica_plan == ""
     assert installed[0].prefill_expert_plan == ""
 
-    # 3. 1P1D decode (dp=2, dcp=16) + K3_HOT_PLAN: no prefill_replica_plan clash.
+    # 3. 1P1D decode (dp=2, dcp=16) + hot_plan: no prefill_replica_plan clash.
     installed.clear()
-    monkeypatch.setenv("K3_HOT_PLAN", "hot.npz")
+    monkeypatch.setattr(config, "DEFAULT_HOT_PLAN", "hot.npz")
     runner.build_program(
         _fake_megakernel_vllm_config(role="decode", attention_dp=2, dcp=16),
         tp_rank=0,
@@ -1134,20 +1129,26 @@ def test_build_program_and_kernel_config_isolate_1p1d_and_aggregate_modes(
     assert installed[0].kd_hot_plan == "hot.npz"
     assert installed[0].kd_replica_plan == ""
     assert installed[0].prefill_replica_plan == ""
-    monkeypatch.delenv("K3_HOT_PLAN")
+    monkeypatch.setattr(
+        config, "DEFAULT_HOT_PLAN", config.PRODUCTION_DEFAULTS["DEFAULT_HOT_PLAN"]
+    )
 
-    # 4. 1P1D decode (dp=2, dcp=16) + EP8 K3_REPLICA_PLAN: no mismatch crash.
+    # 4. 1P1D decode (dp=2, dcp=16) + EP8 replica_plan: no mismatch crash.
     installed.clear()
-    monkeypatch.setenv("K3_REPLICA_PLAN", EP8_DEFAULT_REPLICA_PLAN)
+    monkeypatch.setattr(config, "DEFAULT_REPLICA_PLAN", EP8_DEFAULT_REPLICA_PLAN)
     runner.build_program(
         _fake_megakernel_vllm_config(role="decode", attention_dp=2, dcp=16),
         tp_rank=0,
     )
     assert installed[0].kd_replica_plan == EP8_DEFAULT_REPLICA_PLAN
     assert installed[0].prefill_replica_plan == ""
-    monkeypatch.delenv("K3_REPLICA_PLAN")
+    monkeypatch.setattr(
+        config,
+        "DEFAULT_REPLICA_PLAN",
+        config.PRODUCTION_DEFAULTS["DEFAULT_REPLICA_PLAN"],
+    )
 
-    # 5. 1P1D prefill (default envs and K3_PREFILL_EXPERT_PLAN=none).
+    # 5. 1P1D prefill (default settings and prefill_expert_plan=none).
     installed.clear()
     runner.build_program(_fake_megakernel_vllm_config(role="prefill"), tp_rank=0)
     assert installed[0].prefill_expert_parallel == 16
@@ -1156,31 +1157,35 @@ def test_build_program_and_kernel_config_isolate_1p1d_and_aggregate_modes(
     assert installed[0].kd_replica_plan == ""
 
     installed.clear()
-    monkeypatch.setenv("K3_PREFILL_EXPERT_PLAN", "none")
+    monkeypatch.setattr(config, "DEFAULT_PREFILL_EXPERT_PLAN", "none")
     runner.build_program(_fake_megakernel_vllm_config(role="prefill"), tp_rank=0)
     assert installed[0].prefill_expert_plan == ""
-    monkeypatch.delenv("K3_PREFILL_EXPERT_PLAN")
+    monkeypatch.setattr(
+        config,
+        "DEFAULT_PREFILL_EXPERT_PLAN",
+        config.PRODUCTION_DEFAULTS["DEFAULT_PREFILL_EXPERT_PLAN"],
+    )
 
-    # 6. Aggregate EP8 (K3_UNIFIED_EP16=0, K3_AGGREGATE_EP16=0).
+    # 6. Aggregate EP8 (unified_ep16=False, aggregate_ep16=False).
     installed.clear()
-    monkeypatch.setenv("K3_UNIFIED_EP16", "0")
-    monkeypatch.setenv("K3_AGGREGATE_EP16", "0")
+    monkeypatch.setattr(config, "DEFAULT_UNIFIED_EP16", False)
+    monkeypatch.setattr(config, "DEFAULT_AGGREGATE_EP16", False)
     runner.build_program(_fake_megakernel_vllm_config(role="aggregate"), tp_rank=0)
     assert installed[0].prefill_expert_parallel == 8
     assert installed[0].decode_expert_parallel == 8
     assert installed[0].kd_replica_plan == EP8_DEFAULT_REPLICA_PLAN
     assert installed[0].prefill_replica_plan == ""
 
-    # 7. Aggregate unified EP16 with K3_REPLICA_PLAN=none and custom plan.
+    # 7. Aggregate unified EP16 with replica_plan=none and custom plan.
     installed.clear()
-    monkeypatch.setenv("K3_UNIFIED_EP16", "1")
-    monkeypatch.setenv("K3_REPLICA_PLAN", "none")
+    monkeypatch.setattr(config, "DEFAULT_UNIFIED_EP16", True)
+    monkeypatch.setattr(config, "DEFAULT_REPLICA_PLAN", "none")
     runner.build_program(_fake_megakernel_vllm_config(role="aggregate"), tp_rank=0)
     assert installed[0].kd_replica_plan == ""
     assert installed[0].prefill_replica_plan == ""
 
     installed.clear()
-    monkeypatch.setenv("K3_REPLICA_PLAN", "custom_ep16.npz")
+    monkeypatch.setattr(config, "DEFAULT_REPLICA_PLAN", "custom_ep16.npz")
     runner.build_program(_fake_megakernel_vllm_config(role="aggregate"), tp_rank=0)
     assert installed[0].kd_replica_plan == "custom_ep16.npz"
     assert installed[0].prefill_replica_plan == "custom_ep16.npz"

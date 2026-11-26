@@ -111,7 +111,11 @@ def test_should_reject_chunked_tiles_beyond_semaphore_groups(
 
 
 def test_should_default_combine_chunks_on(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("K3_DCP_COMBINE_CHUNKS", raising=False)
+    monkeypatch.setattr(
+        k3_config,
+        "DEFAULT_DCP_COMBINE_CHUNKS",
+        k3_config.PRODUCTION_DEFAULTS["DEFAULT_DCP_COMBINE_CHUNKS"],
+    )
 
     assert k3_config.KernelConfig().dcp_combine_chunks
 
@@ -119,7 +123,7 @@ def test_should_default_combine_chunks_on(monkeypatch: pytest.MonkeyPatch) -> No
 def test_should_disable_combine_chunks_from_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("K3_DCP_COMBINE_CHUNKS", "0")
+    monkeypatch.setattr(k3_config, "DEFAULT_DCP_COMBINE_CHUNKS", False)
 
     assert not k3_config.KernelConfig().dcp_combine_chunks
 

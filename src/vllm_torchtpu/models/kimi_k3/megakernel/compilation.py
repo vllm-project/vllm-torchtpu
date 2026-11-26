@@ -62,9 +62,15 @@ def compile_ops(calls: Iterable[CompileCall]) -> None:
             if len(pending) == 8:
                 finish()
             inputs = tuple(tpu_torch_compile.placeholder_like(t) for t in call.operands)
-            with execution_mode.set_eager_mode(
-                execution_mode.EagerMode.INTERNAL_COMPILE_FX_GRAPH
-            ):
+            eager_mode = (
+                getattr(
+                    execution_mode.EagerMode,
+                    "INTERNAL_COMPILE_FX_GRAPH",
+                    None,
+                )
+                or execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
+            )
+            with execution_mode.set_eager_mode(eager_mode):
                 outputs = call.op(*inputs)
             with custom_compiler_options(call.options):
                 handle = tpu_torch_compile.async_traverse_and_compile(

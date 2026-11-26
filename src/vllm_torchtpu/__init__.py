@@ -286,7 +286,9 @@ def _patch_vllm_prefill_sjf_queue() -> None:
         if not (sjf_queue.enabled() and megakernel_role in ("prefill", "aggregate")):
             return
         if self.waiting:
-            raise RuntimeError("K3_PREFILL_SJF: the waiting queue is not empty at init")
+            raise RuntimeError(
+                "Prefill SJF queue: the waiting queue is not empty at init"
+            )
         self.waiting = sjf_queue.SJFRequestQueue(
             sjf_queue.uncached_estimator(self), sjf_queue.aging()
         )
@@ -330,7 +332,10 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     ):
         needs_pages = getattr(self, "_tpu_page_aligned_chunks", None)
         if needs_pages is None:
-            needs_pages = _model_needs_page_aligned_chunks(self.vllm_config)
+            vllm_cfg = getattr(self, "vllm_config", None)
+            needs_pages = vllm_cfg is not None and _model_needs_page_aligned_chunks(
+                vllm_cfg
+            )
             self._tpu_page_aligned_chunks = needs_pages
         start = (
             request.num_computed_tokens
@@ -342,7 +347,8 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         page = physical_cache_config.block_size
         req_id = getattr(request, "request_id", None)
         orig_max_sched = self.max_num_scheduled_tokens
-        max_step = envs.K3_MAX_PREFILL_STEP_TOKENS
+        max_step = 0
+        serial_prefill = False
         is_agg = False
         pf_target = prefill_end
         largest_window = orig_max_sched
@@ -352,6 +358,12 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         max_for_req = None
         eff_start = start if start % page == 0 else 0
         if needs_pages:
+            from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3 import (
+                config as k3_config,
+            )
+
+            max_step = k3_config.DEFAULT_MAX_PREFILL_STEP_TOKENS
+            serial_prefill = k3_config.DEFAULT_SERIAL_PREFILL
             is_agg_attr = getattr(self, "_tpu_is_aggregate", None)
             if is_agg_attr is None:
                 from vllm_torchtpu.models.kimi_k3.megakernel import backend
@@ -365,7 +377,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
                 request, is_aggregate=is_agg, decoding_ids=decoding_ids
             )
         if needs_pages and start < prefill_end:
-            if envs.K3_SERIAL_PREFILL and req_id is not None and start < pf_target:
+            if serial_prefill and req_id is not None and start < pf_target:
                 from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3.prefill import (
                     prefill_windows,
                 )
@@ -429,7 +441,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
                 if max_for_req <= 0:
                     return 0
                 num_new_tokens = min(num_new_tokens, max_for_req)
-            elif max_step > 0 and not (envs.K3_SERIAL_PREFILL and req_id is not None):
+            elif max_step > 0 and not (serial_prefill and req_id is not None):
                 max_for_req = min(orig_max_sched, max_step)
                 num_new_tokens = min(num_new_tokens, max_for_req)
         args = (
@@ -486,7 +498,7 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         if (
             num_new_tokens > 0
             and start < pf_target
-            and envs.K3_SERIAL_PREFILL
+            and serial_prefill
             and req_id is not None
             and step_info is not None
         ):

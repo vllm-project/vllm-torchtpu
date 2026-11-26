@@ -26,7 +26,6 @@ import pytest
 from jax.experimental import pallas as pl
 from jax.sharding import Mesh
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.models.kimi_k3.megakernel import runner
 from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3 import config as k3_config
 from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3 import prefill as k3_prefill
@@ -480,12 +479,11 @@ def test_should_ship_balanced_ep16_plan_and_zero_collision_replica_plan() -> Non
 def test_should_normalize_and_validate_prefill_replica_plan_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("K3_PREFILL_REPLICA_PLAN", raising=False)
     assert (
-        envs.environment_variables["K3_PREFILL_REPLICA_PLAN"]()
+        k3_config.PRODUCTION_DEFAULTS["DEFAULT_PREFILL_REPLICA_PLAN"]
         == EP16_DEFAULT_REPLICA_PLAN
     )
-    monkeypatch.setenv("K3_PREFILL_REPLICA_PLAN", "")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_REPLICA_PLAN", "")
     assert KernelConfig().prefill_replica_plan == ""
 
     for disabled in ("0", "none", "NONE", "off", "false"):
@@ -543,9 +541,12 @@ def test_should_keep_decode_replicas_off_when_runner_sets_prefill_replica_only(
         "build",
         lambda cfg, presharded, draft, *, tp_rank: ("built", cfg.role, tp_rank),
     )
-    monkeypatch.setenv("K3_UNIFIED_EP16", "1")
-    monkeypatch.setenv("K3_REPLICA_PLAN", "none")
-    monkeypatch.setenv("K3_PREFILL_REPLICA_PLAN", EP16_DEFAULT_REPLICA_PLAN)
+    monkeypatch.setattr(k3_config, "DEFAULT_UNIFIED_EP16", True)
+    monkeypatch.setattr(k3_config, "DEFAULT_REPLICA_PLAN", "none")
+    monkeypatch.setattr(
+        k3_config, "DEFAULT_PREFILL_REPLICA_PLAN", EP16_DEFAULT_REPLICA_PLAN
+    )
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_REPLICA_PLAN_EXPLICIT", True)
 
     fake_vllm_cfg = types.SimpleNamespace(
         model_config=types.SimpleNamespace(

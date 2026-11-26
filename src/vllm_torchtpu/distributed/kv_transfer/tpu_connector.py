@@ -4641,8 +4641,15 @@ class TPURaidenConnectorWorker:
         src_dcp_size = int(
             self.vllm_config.parallel_config.decode_context_parallel_size
         )
+        from vllm_torchtpu.models.kimi_k3.megakernel import (
+            backend as megakernel,
+        )
+
+        is_megakernel = megakernel.role(self.vllm_config) is not None
         dcp_source = _use_raiden_glm_admission() and src_dcp_size > 1
-        raw_dst_dcp_size = _raiden_dst_dcp_size(self.vllm_config)
+        raw_dst_dcp_size = (
+            _raiden_dst_dcp_size(self.vllm_config) if is_megakernel else 1
+        )
         for req_id, req_meta in metadata.reqs_to_send.items():
             uuid = int(req_meta.uuid)
             num_tokens = int(req_meta.num_tokens or 0)
@@ -4670,7 +4677,11 @@ class TPURaidenConnectorWorker:
                     )
                     for tag in transfer_tags
                 ]
-            elif src_dcp_size > 1 and 1 < raw_dst_dcp_size != src_dcp_size:
+            elif (
+                is_megakernel
+                and src_dcp_size > 1
+                and 1 < raw_dst_dcp_size != src_dcp_size
+            ):
                 pool_spans = [
                     lower_dcp_page_spans_to_dcp(
                         tag=tag,
@@ -4685,7 +4696,7 @@ class TPURaidenConnectorWorker:
                     )
                     for tag in transfer_tags
                 ]
-            elif src_dcp_size > 1:
+            elif is_megakernel and src_dcp_size > 1:
                 pool_spans = [
                     lower_dcp_page_spans(
                         tag=tag,
@@ -5845,13 +5856,19 @@ class TPURaidenConnectorWorker:
                 dst_shards=1,
             )
         else:
+            from vllm_torchtpu.models.kimi_k3.megakernel import (
+                backend as megakernel,
+            )
+
             token_bytes = self._stage3_fa_token_bytes(
                 int(self.vllm_config.cache_config.block_size)
             )
-            dcp_size = int(
-                self.vllm_config.parallel_config.decode_context_parallel_size or 1
-            )
-            return skip_tokens // dcp_size * token_bytes
+            if megakernel.role(self.vllm_config) is not None:
+                dcp_size = int(
+                    self.vllm_config.parallel_config.decode_context_parallel_size or 1
+                )
+                return skip_tokens // dcp_size * token_bytes
+            return skip_tokens * token_bytes
 
     def _stage_stage3_submit_task(
         self, pending: _Stage3PendingSubmit, synchronous: bool

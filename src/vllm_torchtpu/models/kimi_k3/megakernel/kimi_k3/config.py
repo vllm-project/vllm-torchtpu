@@ -25,7 +25,6 @@ import hashlib
 import json
 from typing import Any, Final
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.models.kimi_k3.megakernel.config import set_active_kernel_config
 
 _DISABLED_PLAN_VALUES: Final[frozenset[str]] = frozenset(
@@ -35,6 +34,63 @@ EP8_DEFAULT_EXPERT_PLAN: Final[str] = "plan_ep8_real_hotfirst.npz"
 EP16_DEFAULT_EXPERT_PLAN: Final[str] = "plan_ep16_real_hotfirst.npz"
 EP8_DEFAULT_REPLICA_PLAN: Final[str] = "replica_plan_ep8_real_plain4.npz"
 EP16_DEFAULT_REPLICA_PLAN: Final[str] = "replica_plan_ep16_real_plain4.npz"
+
+# Production defaults for Kimi-K3 TPU7x megakernel serving and prefill scheduling.
+DEFAULT_AGGREGATE_EP16: bool = False
+DEFAULT_DCP_COMBINE_CHUNKS: bool = True
+DEFAULT_DECODE_EXPERT_BANKS: bool = False
+DEFAULT_FP8_WIRES: str = ""
+DEFAULT_HOT_PLAN: str = ""
+DEFAULT_MAX_PREFILL_STEP_TOKENS: int = 16384
+DEFAULT_PREFILL_A2A_CHIP_SHARD: bool = True
+DEFAULT_PREFILL_EXPERT_PLAN: str = EP16_DEFAULT_EXPERT_PLAN
+DEFAULT_PREFILL_KDA_A2A: bool = True
+DEFAULT_PREFILL_KDA_DUAL_GATHER: bool = False
+DEFAULT_PREFILL_KDA_RING_SET: bool = True
+DEFAULT_PREFILL_KDA_A2A_FP8: bool = False
+DEFAULT_PREFILL_KDA_FP8_GATHER: bool = False
+DEFAULT_PREFILL_MLA_A2A: bool = True
+DEFAULT_PREFILL_MLA_A2A_FP8: bool = False
+DEFAULT_PREFILL_MOE_16K_MONOLITHIC: bool = True
+DEFAULT_PREFILL_MOE_DENSE_FP8: bool = False
+DEFAULT_PREFILL_MOE_W4A8: bool = True
+DEFAULT_PREFILL_PREFIX_FP8: bool = True
+DEFAULT_PREFILL_REPLICA_PLAN: str = EP16_DEFAULT_REPLICA_PLAN
+DEFAULT_PREFILL_REPLICA_PLAN_EXPLICIT: bool = False
+DEFAULT_PREFILL_ROUTE_COUNTS: bool = False
+DEFAULT_PREFILL_ROUTE_COUNTS_DIR: str = ""
+DEFAULT_REPLICA_PLAN: str = EP16_DEFAULT_REPLICA_PLAN
+DEFAULT_SERIAL_PREFILL: bool = True
+DEFAULT_UNIFIED_EP16: bool = True
+
+PRODUCTION_DEFAULTS: Final[dict[str, Any]] = {
+    "DEFAULT_AGGREGATE_EP16": DEFAULT_AGGREGATE_EP16,
+    "DEFAULT_DCP_COMBINE_CHUNKS": DEFAULT_DCP_COMBINE_CHUNKS,
+    "DEFAULT_DECODE_EXPERT_BANKS": DEFAULT_DECODE_EXPERT_BANKS,
+    "DEFAULT_FP8_WIRES": DEFAULT_FP8_WIRES,
+    "DEFAULT_HOT_PLAN": DEFAULT_HOT_PLAN,
+    "DEFAULT_MAX_PREFILL_STEP_TOKENS": DEFAULT_MAX_PREFILL_STEP_TOKENS,
+    "DEFAULT_PREFILL_A2A_CHIP_SHARD": DEFAULT_PREFILL_A2A_CHIP_SHARD,
+    "DEFAULT_PREFILL_EXPERT_PLAN": DEFAULT_PREFILL_EXPERT_PLAN,
+    "DEFAULT_PREFILL_KDA_A2A": DEFAULT_PREFILL_KDA_A2A,
+    "DEFAULT_PREFILL_KDA_DUAL_GATHER": DEFAULT_PREFILL_KDA_DUAL_GATHER,
+    "DEFAULT_PREFILL_KDA_RING_SET": DEFAULT_PREFILL_KDA_RING_SET,
+    "DEFAULT_PREFILL_KDA_A2A_FP8": DEFAULT_PREFILL_KDA_A2A_FP8,
+    "DEFAULT_PREFILL_KDA_FP8_GATHER": DEFAULT_PREFILL_KDA_FP8_GATHER,
+    "DEFAULT_PREFILL_MLA_A2A": DEFAULT_PREFILL_MLA_A2A,
+    "DEFAULT_PREFILL_MLA_A2A_FP8": DEFAULT_PREFILL_MLA_A2A_FP8,
+    "DEFAULT_PREFILL_MOE_16K_MONOLITHIC": DEFAULT_PREFILL_MOE_16K_MONOLITHIC,
+    "DEFAULT_PREFILL_MOE_DENSE_FP8": DEFAULT_PREFILL_MOE_DENSE_FP8,
+    "DEFAULT_PREFILL_MOE_W4A8": DEFAULT_PREFILL_MOE_W4A8,
+    "DEFAULT_PREFILL_PREFIX_FP8": DEFAULT_PREFILL_PREFIX_FP8,
+    "DEFAULT_PREFILL_REPLICA_PLAN": DEFAULT_PREFILL_REPLICA_PLAN,
+    "DEFAULT_PREFILL_REPLICA_PLAN_EXPLICIT": DEFAULT_PREFILL_REPLICA_PLAN_EXPLICIT,
+    "DEFAULT_PREFILL_ROUTE_COUNTS": DEFAULT_PREFILL_ROUTE_COUNTS,
+    "DEFAULT_PREFILL_ROUTE_COUNTS_DIR": DEFAULT_PREFILL_ROUTE_COUNTS_DIR,
+    "DEFAULT_REPLICA_PLAN": DEFAULT_REPLICA_PLAN,
+    "DEFAULT_SERIAL_PREFILL": DEFAULT_SERIAL_PREFILL,
+    "DEFAULT_UNIFIED_EP16": DEFAULT_UNIFIED_EP16,
+}
 
 
 def resolve_expert_parallel_settings(
@@ -214,7 +270,7 @@ class KernelConfig:
     # page ids).
     dcp_tables: str = "local"
     dcp_combine_chunks: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_DCP_COMBINE_CHUNKS
+        default_factory=lambda: DEFAULT_DCP_COMBINE_CHUNKS
     )
     # MLA decode key tile (tokens per page fold). 2048 is opt-in and applies
     # only to FP8 plain decode at attention_dp=2, dcp_group=16 with 32 rows per
@@ -260,12 +316,12 @@ class KernelConfig:
     # Cached-prefix attention in FP8 (E4M3FN keys/values from the expansion, FP8
     # queries, probabilities x16 in E4M3FN, FP32 statistics); the window's own
     prefill_prefix_fp8: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_PREFIX_FP8
+        default_factory=lambda: DEFAULT_PREFILL_PREFIX_FP8
     )
     # Prefill MoE route counts (diagnostic): each fused MoE call also returns its
     # chip's 56 local expert counts; the prefiller saves cumulative snapshots.
     prefill_route_counts: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_ROUTE_COUNTS
+        default_factory=lambda: DEFAULT_PREFILL_ROUTE_COUNTS
     )
     prefill_route_counts_every: int = 200
     # Prefill EP16 expert placement (empty: the pre-shard's): an npz whose
@@ -273,10 +329,10 @@ class KernelConfig:
     # slots 56c..56c+55); the router columns and expert weights are loaded in
     # that order. A bare name loads from kimi_k3/data.
     prefill_expert_plan: str = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_EXPERT_PLAN
+        default_factory=lambda: DEFAULT_PREFILL_EXPERT_PLAN
     )
     prefill_replica_plan: str = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_REPLICA_PLAN
+        default_factory=lambda: DEFAULT_PREFILL_REPLICA_PLAN
     )
     # Prefill MoE expert parallelism: 8 (EP8/TP4, the pre-shard layout), 16
     # (EP16/TP2: 56 experts, TP2 within the chip) or 32 (28 whole experts);
@@ -287,37 +343,37 @@ class KernelConfig:
     # False: the unfused SparseCore gather/combine.
     prefill_fused_moe: bool = True
     prefill_moe_16k_monolithic: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_MOE_16K_MONOLITHIC
+        default_factory=lambda: DEFAULT_PREFILL_MOE_16K_MONOLITHIC
     )
     prefill_moe_dense_fp8: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_MOE_DENSE_FP8
+        default_factory=lambda: DEFAULT_PREFILL_MOE_DENSE_FP8
     )
     prefill_moe_w4a8: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_MOE_W4A8
+        default_factory=lambda: DEFAULT_PREFILL_MOE_W4A8
     )
     prefill_kda_fp8_gather: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_KDA_FP8_GATHER
+        default_factory=lambda: DEFAULT_PREFILL_KDA_FP8_GATHER
     )
     prefill_kda_a2a: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_KDA_A2A
+        default_factory=lambda: DEFAULT_PREFILL_KDA_A2A
     )
     prefill_kda_dual_gather: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_KDA_DUAL_GATHER
+        default_factory=lambda: DEFAULT_PREFILL_KDA_DUAL_GATHER
     )
     prefill_kda_ring_set: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_KDA_RING_SET
+        default_factory=lambda: DEFAULT_PREFILL_KDA_RING_SET
     )
     prefill_kda_a2a_fp8: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_KDA_A2A_FP8
+        default_factory=lambda: DEFAULT_PREFILL_KDA_A2A_FP8
     )
     prefill_mla_a2a: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_MLA_A2A
+        default_factory=lambda: DEFAULT_PREFILL_MLA_A2A
     )
     prefill_mla_a2a_fp8: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_MLA_A2A_FP8
+        default_factory=lambda: DEFAULT_PREFILL_MLA_A2A_FP8
     )
     prefill_a2a_chip_shard: bool = dataclasses.field(
-        default_factory=lambda: envs.K3_PREFILL_A2A_CHIP_SHARD
+        default_factory=lambda: DEFAULT_PREFILL_A2A_CHIP_SHARD
     )
     # Weight loading.
     read_streams: int = 4
@@ -331,7 +387,7 @@ class KernelConfig:
     # Hot-expert fp8 copies (off when empty): an npz whose ``experts``
     # [92, 8, S] holds the global expert id in copy slot j of EP group g
     # per MoE layer (-1: empty). A bare name loads from kimi_k3/data.
-    kd_hot_plan: str = dataclasses.field(default_factory=lambda: envs.K3_HOT_PLAN)
+    kd_hot_plan: str = dataclasses.field(default_factory=lambda: DEFAULT_HOT_PLAN)
     # A hot expert's routes use its fp8 copy from this many rows.
     hot_min_rows: int = 9
     # Hot-expert MXFP4 replicas on other EP groups (off when empty; exclusive
@@ -341,13 +397,13 @@ class KernelConfig:
     # expert's routes stay home, split by row parity, or move to the replica,
     # whichever gives the lowest modeled slowest-group expert time. A bare
     kd_replica_plan: str = dataclasses.field(
-        default_factory=lambda: envs.K3_REPLICA_PLAN
+        default_factory=lambda: DEFAULT_REPLICA_PLAN
     )
     # FP8 wires for attention DP's hidden-row gathers (off when empty): "t0"
     # the attention input, "t10" the MoE input. Rows travel as e4m3 with one
     # FP32 scale each; every rank uses the dequantized rows.
     fp8_wires: tuple[str, ...] = dataclasses.field(
-        default_factory=lambda: tuple(filter(None, envs.K3_FP8_WIRES.split(",")))
+        default_factory=lambda: tuple(filter(None, DEFAULT_FP8_WIRES.split(",")))
     )
     pool_report: bool = False
     vmem_report: bool = False

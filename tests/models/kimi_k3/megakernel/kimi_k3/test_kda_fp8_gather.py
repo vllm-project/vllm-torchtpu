@@ -13,16 +13,21 @@
 # limitations under the License.
 
 
+from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3 import config as k3_config
 from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3.config import KernelConfig
 
 
 def test_should_keep_bf16_window_when_env_unset(monkeypatch):
-    monkeypatch.delenv("K3_PREFILL_KDA_FP8_GATHER", raising=False)
+    monkeypatch.setattr(
+        k3_config,
+        "DEFAULT_PREFILL_KDA_FP8_GATHER",
+        k3_config.PRODUCTION_DEFAULTS["DEFAULT_PREFILL_KDA_FP8_GATHER"],
+    )
 
     assert KernelConfig().prefill_kda_fp8_gather is False
 
 
 def test_should_select_fp8_window_when_env_set(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_KDA_FP8_GATHER", "1")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_KDA_FP8_GATHER", True)
 
     assert KernelConfig().prefill_kda_fp8_gather is True

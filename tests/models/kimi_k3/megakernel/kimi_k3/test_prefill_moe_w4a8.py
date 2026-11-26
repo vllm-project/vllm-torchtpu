@@ -48,8 +48,8 @@ def _mxfp8_block32_quant_dequant(x_f32: np.ndarray) -> np.ndarray:
 
 
 def test_should_keep_prefill_moe_w4a8_off_when_disabled(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_MOE_W4A8", "0")
-    monkeypatch.setenv("K3_PREFILL_MOE_16K_MONOLITHIC", "0")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MOE_W4A8", False)
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MOE_16K_MONOLITHIC", False)
     cfg = KernelConfig()
 
     assert cfg.prefill_moe_w4a8 is False
@@ -58,8 +58,8 @@ def test_should_keep_prefill_moe_w4a8_off_when_disabled(monkeypatch):
 
 
 def test_should_enable_prefill_moe_w4a8_when_env_set(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_MOE_16K_MONOLITHIC", "1")
-    monkeypatch.setenv("K3_PREFILL_MOE_W4A8", "1")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MOE_16K_MONOLITHIC", True)
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MOE_W4A8", True)
 
     cfg = KernelConfig()
     assert cfg.prefill_moe_16k_monolithic is True

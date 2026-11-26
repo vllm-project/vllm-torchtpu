@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shortest-uncached-prompt-first waiting queue for a P/D prefill engine.
+"""Shortest-uncached-prompt-first waiting queue for a P/D or aggregate prefill engine.
 
-With ``K3_PREFILL_SJF=1`` a KV producer's scheduler admits waiting requests
+When enabled, a megakernel prefill or aggregate scheduler admits waiting requests
 in order of their uncached prompt tokens (estimated from the local prefix
 cache when the request is queued), minus an aging credit of
-``K3_PREFILL_SJF_AGING`` tokens per second waited, so long prompts are not
+``DEFAULT_AGING`` tokens per second waited, so long prompts are not
 starved. Running requests keep their chunks; the scheduling policy stays
 FCFS, so preemption picks its usual victim and never reorders by size.
 Requests put back at the front (``prepend_request``, e.g. after a
@@ -30,21 +30,20 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from typing import TYPE_CHECKING
 
-from vllm_torchtpu import envs
-
 if TYPE_CHECKING:
     from vllm.v1.core.sched.request_queue import RequestQueue
     from vllm.v1.request import Request
 
-DEFAULT_AGING = 16384.0  # tokens of credit per second waited
+DEFAULT_ENABLED: bool = True
+DEFAULT_AGING: float = 16384.0  # tokens of credit per second waited
 
 
 def enabled() -> bool:
-    return envs.K3_PREFILL_SJF
+    return DEFAULT_ENABLED
 
 
 def aging() -> float:
-    return envs.K3_PREFILL_SJF_AGING
+    return DEFAULT_AGING
 
 
 class SJFRequestQueue:

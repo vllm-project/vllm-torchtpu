@@ -51,7 +51,6 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.kimi_k3.megakernel import (
     backend,
@@ -150,15 +149,15 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
         hot_plan,
     ) = kernel_config.resolve_role_kernel_settings(
         role=config.role,
-        unified_ep16=envs.K3_UNIFIED_EP16,
-        aggregate_ep16=envs.K3_AGGREGATE_EP16,
-        raw_expert_plan=envs.K3_PREFILL_EXPERT_PLAN,
-        raw_replica_plan=envs.K3_REPLICA_PLAN,
-        raw_prefill_replica_plan=envs.K3_PREFILL_REPLICA_PLAN,
-        raw_hot_plan=envs.K3_HOT_PLAN,
-        prefill_replica_plan_explicit=getattr(
-            envs, "is_k3_prefill_replica_plan_explicit", lambda: False
-        )(),
+        unified_ep16=kernel_config.DEFAULT_UNIFIED_EP16,
+        aggregate_ep16=kernel_config.DEFAULT_AGGREGATE_EP16,
+        raw_expert_plan=kernel_config.DEFAULT_PREFILL_EXPERT_PLAN,
+        raw_replica_plan=kernel_config.DEFAULT_REPLICA_PLAN,
+        raw_prefill_replica_plan=kernel_config.DEFAULT_PREFILL_REPLICA_PLAN,
+        raw_hot_plan=kernel_config.DEFAULT_HOT_PLAN,
+        prefill_replica_plan_explicit=(
+            kernel_config.DEFAULT_PREFILL_REPLICA_PLAN_EXPLICIT
+        ),
     )
     kernel_config.install(
         kernel_config.KernelConfig(
@@ -171,15 +170,15 @@ def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
             prefill_replica_plan=prefill_replica_plan,
             kd_hot_plan=hot_plan,
             prefill_moe_w4a8=(
-                envs.K3_PREFILL_MOE_W4A8
+                kernel_config.DEFAULT_PREFILL_MOE_W4A8
                 and prefill_ep == 16
-                and envs.K3_PREFILL_MOE_16K_MONOLITHIC
-                and not envs.K3_PREFILL_MOE_DENSE_FP8
+                and kernel_config.DEFAULT_PREFILL_MOE_16K_MONOLITHIC
+                and not kernel_config.DEFAULT_PREFILL_MOE_DENSE_FP8
             ),
             decode_expert_banks=kernel_config.resolve_decode_expert_banks(
                 prefill_ep=prefill_ep,
                 decode_ep=decode_ep,
-                enabled=envs.K3_DECODE_EXPERT_BANKS,
+                enabled=kernel_config.DEFAULT_DECODE_EXPERT_BANKS,
             ),
         )
     )
@@ -495,7 +494,7 @@ class MegakernelModelRunner(TPUModelRunner):
                 req_ids=req_ids,
                 req_id_to_index=dict(self.input_batch.req_id_to_index),
                 sampled_token_ids=[],
-                logprobs=[],
+                logprobs=None,
                 prompt_logprobs_dict={req_id: None for req_id in req_ids},
                 pooler_output=[],
                 kv_connector_output=kv_connector_output,

@@ -132,11 +132,13 @@ def test_sub_block_chunk_ends_stay_on_pages_for_programs_that_need_it(
 
 
 def test_serial_prefill_two_slot_tail_packing_and_skip_guard(monkeypatch):
+    from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3 import config as k3_config
+
     monkeypatch.setattr(
         vllm_torchtpu, "_model_needs_page_aligned_chunks", lambda vllm_config: True
     )
-    monkeypatch.setattr(vllm_torchtpu.envs, "K3_SERIAL_PREFILL", True)
-    monkeypatch.setattr(vllm_torchtpu.envs, "K3_MAX_PREFILL_STEP_TOKENS", 16384)
+    monkeypatch.setattr(k3_config, "DEFAULT_SERIAL_PREFILL", True)
+    monkeypatch.setattr(k3_config, "DEFAULT_MAX_PREFILL_STEP_TOKENS", 16384)
     _patch_vllm_mamba_split_scheduler_block_size()
 
     scheduler, _ = _scheduler(page=512, block=16384, budget=16448)
@@ -183,10 +185,12 @@ def test_serial_prefill_two_slot_tail_packing_and_skip_guard(monkeypatch):
 
 
 def test_serial_prefill_aggregate_target_and_step_cap(monkeypatch):
+    from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3 import config as k3_config
+
     monkeypatch.setattr(
         vllm_torchtpu, "_model_needs_page_aligned_chunks", lambda vllm_config: True
     )
-    monkeypatch.setattr(vllm_torchtpu.envs, "K3_SERIAL_PREFILL", True)
+    monkeypatch.setattr(k3_config, "DEFAULT_SERIAL_PREFILL", True)
     _patch_vllm_mamba_split_scheduler_block_size()
 
     scheduler, _ = _scheduler(page=512, block=16384, budget=16448)
@@ -199,7 +203,7 @@ def test_serial_prefill_aggregate_target_and_step_cap(monkeypatch):
     scheduler._tpu_is_aggregate = True
     scheduler._tpu_decoding_ids = set()
 
-    monkeypatch.setattr(vllm_torchtpu.envs, "K3_MAX_PREFILL_STEP_TOKENS", 8192)
+    monkeypatch.setattr(k3_config, "DEFAULT_MAX_PREFILL_STEP_TOKENS", 8192)
     scheduler._tpu_unfinished_prefill_ids = set()
     scheduler._tpu_step_prefill_info = {}
     scheduler._tpu_effective_start = {}
@@ -231,7 +235,7 @@ def test_serial_prefill_aggregate_target_and_step_cap(monkeypatch):
         == 8192
     )
 
-    monkeypatch.setattr(vllm_torchtpu.envs, "K3_MAX_PREFILL_STEP_TOKENS", 0)
+    monkeypatch.setattr(k3_config, "DEFAULT_MAX_PREFILL_STEP_TOKENS", 0)
     scheduler._tpu_step_prefill_info = {}
     scheduler._tpu_effective_start = {"rc": 65536}
     scheduler._tpu_unfinished_prefill_ids = {"rc"}

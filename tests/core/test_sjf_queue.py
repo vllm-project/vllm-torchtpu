@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""K3_PREFILL_SJF waiting queue: shortest uncached prompt first, aging so old
-long prompts overtake new short ones, front requeues, peek/pop agreement."""
+"""Shortest-uncached-prompt-first waiting queue: shortest uncached prompt first,
+aging so old long prompts overtake new short ones, front requeues, peek/pop
+agreement."""
 
 from vllm_torchtpu.core.sjf_queue import SJFRequestQueue
 

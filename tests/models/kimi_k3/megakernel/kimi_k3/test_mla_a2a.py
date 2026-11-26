@@ -78,13 +78,13 @@ def _numpy_owner_reference(
 
 
 def test_should_keep_ring_mla_when_env_disabled(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_MLA_A2A", "0")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MLA_A2A", False)
 
     assert KernelConfig().prefill_mla_a2a is False
 
 
 def test_should_select_mla_a2a_when_env_set(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_MLA_A2A", "1")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MLA_A2A", True)
 
     assert KernelConfig().prefill_mla_a2a is True
 
@@ -614,12 +614,16 @@ def test_should_replicate_mla_gate_and_output_in_prefill_load_without_mutating_s
 def test_should_keep_mla_a2a_fp8_off_by_default_and_require_mla_a2a_when_enabled(
     monkeypatch,
 ):
-    monkeypatch.setenv("K3_PREFILL_MLA_A2A", "0")
-    monkeypatch.delenv("K3_PREFILL_MLA_A2A_FP8", raising=False)
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MLA_A2A", False)
+    monkeypatch.setattr(
+        k3_config,
+        "DEFAULT_PREFILL_MLA_A2A_FP8",
+        k3_config.PRODUCTION_DEFAULTS["DEFAULT_PREFILL_MLA_A2A_FP8"],
+    )
     assert KernelConfig().prefill_mla_a2a_fp8 is False
 
-    monkeypatch.setenv("K3_PREFILL_MLA_A2A", "1")
-    monkeypatch.setenv("K3_PREFILL_MLA_A2A_FP8", "1")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MLA_A2A", True)
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MLA_A2A_FP8", True)
     cfg = KernelConfig()
     assert cfg.prefill_mla_a2a is True
     assert cfg.prefill_mla_a2a_fp8 is True

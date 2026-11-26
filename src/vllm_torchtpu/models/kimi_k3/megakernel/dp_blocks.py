@@ -335,7 +335,11 @@ def _install(scheduler: Any) -> None:
     manager.block_pool = _GroupView(pool)
 
     def allocate_external_computed_blocks(
-        request_id, num_local_computed_tokens, num_external_computed_tokens
+        request_id,
+        num_local_computed_tokens,
+        num_external_computed_tokens,
+        record_for_zeroing: bool = True,
+        **_kwargs,
     ):
         if num_external_computed_tokens <= 0:
             return
@@ -344,6 +348,8 @@ def _install(scheduler: Any) -> None:
         num_new = max(0, _cdiv(total, manager.block_size) - len(req_blocks))
         blocks, twins = pool.take_pairs(pool.group, num_new)
         req_blocks.extend(blocks)
+        if getattr(manager, "_record_new_block_ids", False) and record_for_zeroing:
+            manager.new_block_ids.extend(b.block_id for b in blocks)
         pool.twins.setdefault(request_id, []).extend(twins)
 
     manager.allocate_external_computed_blocks = allocate_external_computed_blocks
@@ -357,7 +363,12 @@ def _install(scheduler: Any) -> None:
         num_local_computed_tokens,
         num_tokens_main_model,
         apply_admission_cap=False,
+        prefill_end=0,
+        **_kwargs,
     ):
+        eff_prefill_end = (
+            0 if getattr(coordinator, "retention_interval", 0) != 0 else prefill_end
+        )
         group = pool.place(request_id)
         need = [0] * len(pool.queues)
         for i, m in enumerate(managers):
@@ -370,6 +381,7 @@ def _install(scheduler: Any) -> None:
                     num_local_computed_tokens,
                     num_tokens_main_model,
                     apply_admission_cap=apply_admission_cap,
+                    prefill_end=eff_prefill_end,
                 )
             )
         first = request_id not in pool.active
@@ -452,24 +464,25 @@ def install() -> None:
     original_lookup = Scheduler._get_local_prefix_cache_hit
 
     @functools.wraps(original_lookup)
-    def _get_local_prefix_cache_hit(self, request):
-        pool = self.kv_cache_manager.block_pool
+    def _get_local_prefix_cache_hit(self, request, *args, **kwargs):
+        pool = getattr(getattr(self, "kv_cache_manager", None), "block_pool", None)
         if isinstance(pool, RegionBlockPool):
             pool.place(request.request_id, step=self.current_step)
-        return original_lookup(self, request)
+        return original_lookup(self, request, *args, **kwargs)
 
     Scheduler._get_local_prefix_cache_hit = _get_local_prefix_cache_hit
 
     original_remote_kv = Scheduler._update_waiting_for_remote_kv
 
     @functools.wraps(original_remote_kv)
-    def _update_waiting_for_remote_kv(self, request):
-        original_remote_kv(self, request)
-        pool = self.kv_cache_manager.block_pool
+    def _update_waiting_for_remote_kv(self, request, *args, **kwargs):
+        result = original_remote_kv(self, request, *args, **kwargs)
+        pool = getattr(getattr(self, "kv_cache_manager", None), "block_pool", None)
         if isinstance(pool, RegionBlockPool):
             twins = pool.twins.pop(request.request_id, [])
             if twins:
                 pool.free_blocks(twins)
+        return result
 
     Scheduler._update_waiting_for_remote_kv = _update_waiting_for_remote_kv
 
@@ -477,7 +490,7 @@ def install() -> None:
 
     @functools.wraps(original_allocate)
     def allocate_slots(self, request, *args, **kwargs):
-        pool = self.block_pool
+        pool = getattr(self, "block_pool", None)
         if not isinstance(pool, RegionBlockPool):
             return original_allocate(self, request, *args, **kwargs)
         group = pool.place(request.request_id)
@@ -493,7 +506,7 @@ def install() -> None:
     @functools.wraps(original_free)
     def free(self, request):
         original_free(self, request)
-        pool = self.block_pool
+        pool = getattr(self, "block_pool", None)
         if isinstance(pool, RegionBlockPool):
             twins = pool.release(request.request_id)
             if twins:
@@ -506,7 +519,7 @@ def install() -> None:
     @functools.wraps(original_pop)
     def pop_blocks_for_free(self, request):
         blocks = original_pop(self, request)
-        pool = self.block_pool
+        pool = getattr(self, "block_pool", None)
         if isinstance(pool, RegionBlockPool):
             twins = pool.release(request.request_id)
             # Freed in reverse order: the twins go after the request's blocks.

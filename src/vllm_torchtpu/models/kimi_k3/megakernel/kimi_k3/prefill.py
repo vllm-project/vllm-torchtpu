@@ -50,7 +50,6 @@ import numpy as np
 import torch
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.kimi_k3.megakernel.bridge import (
     hbm,
@@ -62,6 +61,7 @@ from vllm_torchtpu.models.kimi_k3.megakernel.bridge import (
     stream_to_device,
 )
 from vllm_torchtpu.models.kimi_k3.megakernel.config import MegakernelEngineConfig
+from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3 import config as k3_config
 from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3 import expert_banks
 from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3.config import active
 from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3.layout import NUM_LAYERS
@@ -1656,7 +1656,8 @@ class KimiPrefiller:
         # rounding slack per sequence, in multiples of 1024.
         capacity = max(windows[-1], -(-config.max_model_len // 4096) * 4096)
         self.slots = min(
-            config.max_num_seqs, SERIAL_SLOTS if envs.K3_SERIAL_PREFILL else SLOTS
+            config.max_num_seqs,
+            SERIAL_SLOTS if k3_config.DEFAULT_SERIAL_PREFILL else SLOTS,
         )
         self.cp_capacity = (
             -(-(capacity // DCP_SIZE + self.slots * self.page_tokens) // 1024) * 1024
@@ -2164,12 +2165,10 @@ class KimiPrefiller:
         return logits
 
     def _count_routes(self) -> None:
-        """K3_PREFILL_ROUTE_COUNTS: accumulate the window's MoE route counts
-        ([1, 92, 56] per rank: its chip's local experts per MoE layer) and
-        have each chip's even rank save a cumulative snapshot every
-        ``prefill_route_counts_every`` windows under
-        ``$K3_PREFILL_ROUTE_COUNTS_DIR`` (default
-        ``/tmp/prefill_route_counts``)."""
+        """Accumulate the window's MoE route counts ([1, 92, 56] per rank: its
+        chip's local experts per MoE layer) and have each chip's even rank save
+        a cumulative snapshot every ``prefill_route_counts_every`` windows under
+        ``DEFAULT_PREFILL_ROUTE_COUNTS_DIR`` (default ``/tmp/prefill_route_counts``)."""
         routes = getattr(self.program, "last_routes", None)
         if routes is None:
             return
@@ -2181,7 +2180,9 @@ class KimiPrefiller:
         every = active().prefill_route_counts_every
         if self._route_windows % every or self.rank % ep_tp:
             return
-        directory = envs.K3_PREFILL_ROUTE_COUNTS_DIR or "/tmp/prefill_route_counts"
+        directory = (
+            k3_config.DEFAULT_PREFILL_ROUTE_COUNTS_DIR or "/tmp/prefill_route_counts"
+        )
         os.makedirs(directory, exist_ok=True)
         counts = np.asarray(self._route_total.cpu()).reshape(
             NUM_LAYERS - 1, local_experts

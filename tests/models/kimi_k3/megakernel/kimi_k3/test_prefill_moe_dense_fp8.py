@@ -25,7 +25,11 @@ from vllm_torchtpu.models.kimi_k3.megakernel.kimi_k3.kernels.prefill_moe import 
 
 
 def test_should_keep_prefill_moe_dense_fp8_off_by_default(monkeypatch):
-    monkeypatch.delenv("K3_PREFILL_MOE_DENSE_FP8", raising=False)
+    monkeypatch.setattr(
+        k3_config,
+        "DEFAULT_PREFILL_MOE_DENSE_FP8",
+        k3_config.PRODUCTION_DEFAULTS["DEFAULT_PREFILL_MOE_DENSE_FP8"],
+    )
     cfg = KernelConfig()
 
     assert cfg.prefill_moe_dense_fp8 is False
@@ -33,7 +37,7 @@ def test_should_keep_prefill_moe_dense_fp8_off_by_default(monkeypatch):
 
 
 def test_should_enable_prefill_moe_dense_fp8_when_env_set(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_MOE_DENSE_FP8", "1")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MOE_DENSE_FP8", True)
 
     assert KernelConfig().prefill_moe_dense_fp8 is True
 

@@ -812,7 +812,8 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
 
         # Retain pool tensor references to dispatch their writes during save fences.
         self._pool_sync_tensors = list(pool_sources.values())
-        self.connector_worker.spec.pool_sources = list(pool_sources.values())
+        if getattr(self.connector_worker, "spec", None) is not None:
+            self.connector_worker.spec.pool_sources = list(pool_sources.values())
 
         # One ref list per offloaded group, as vLLM's own registration builds:
         # groups that are not prefix-cacheable are not offloaded.

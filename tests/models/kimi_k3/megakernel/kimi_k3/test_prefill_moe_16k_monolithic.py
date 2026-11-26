@@ -85,7 +85,7 @@ class _AtIndexer:
 
 
 def test_should_keep_compound_16k_when_env_disabled(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_MOE_16K_MONOLITHIC", "0")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MOE_16K_MONOLITHIC", False)
     cfg = KernelConfig()
 
     assert cfg.prefill_moe_16k_monolithic is False
@@ -93,7 +93,7 @@ def test_should_keep_compound_16k_when_env_disabled(monkeypatch):
 
 
 def test_should_enable_monolithic_16k_when_env_set(monkeypatch):
-    monkeypatch.setenv("K3_PREFILL_MOE_16K_MONOLITHIC", "1")
+    monkeypatch.setattr(k3_config, "DEFAULT_PREFILL_MOE_16K_MONOLITHIC", True)
 
     assert KernelConfig().prefill_moe_16k_monolithic is True
 

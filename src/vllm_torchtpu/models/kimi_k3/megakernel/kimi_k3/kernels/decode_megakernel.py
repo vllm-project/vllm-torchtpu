@@ -2366,24 +2366,34 @@ def _run_routed_expert_stream(
                     rows = source[
                         pl.ds(pl.multiple_of(block * 16, 16), 16), :expert_input_size
                     ]
+                    in_upper = (indices % 16) >= 8
                     gather_indices = jnp.broadcast_to(
-                        (indices % 16).astype(jnp.int16)[:, None],
+                        (indices % 8)[:, None],
                         (compact_capacity, expert_input_size),
                     )
-                    selected_rows = jnp.take_along_axis(
-                        rows,
+                    selected_lower = jnp.take_along_axis(
+                        rows[:8].astype(jnp.float32),
                         gather_indices,
                         axis=0,
                         mode="promise_in_bounds",
-                    ).astype(jnp.float32)
+                    )
+                    selected_upper = jnp.take_along_axis(
+                        rows[8:].astype(jnp.float32),
+                        gather_indices,
+                        axis=0,
+                        mode="promise_in_bounds",
+                    )
+                    selected_rows = jnp.where(
+                        in_upper[:, None], selected_upper, selected_lower
+                    )
                     destination[...] = jnp.where(
                         in_block[:, None], selected_rows, destination[...]
                     )
 
             return
 
-        # Each gather stays inside one native 16-row BF16 tile. Matching
-        # int16 indices avoid unsupported mixed-width Mosaic gathers.
+        # JAX 0.11+ promotes take_along_axis indices to int32, and Mosaic
+        # dynamic_gather requires a single 8-row FP32 source VREG along axis 0.
         @pl.loop(0, jnp.sum(valid.astype(jnp.float32)).astype(jnp.int32))
         def copy_row(position):
             index = jnp.sum(
@@ -2396,13 +2406,16 @@ def _run_routed_expert_stream(
             rows = source[
                 pl.ds(pl.multiple_of(index // 16 * 16, 16), 16), :expert_input_size
             ]
-            gather_indices = jnp.full((1, expert_input_size), index % 16, jnp.int16)
+            half_rows = jnp.where(index % 16 >= 8, rows[8:], rows[:8]).astype(
+                jnp.float32
+            )
+            gather_indices = jnp.full((1, expert_input_size), index % 8, jnp.int32)
             selected_row = jnp.take_along_axis(
-                rows,
+                half_rows,
                 gather_indices,
                 axis=0,
                 mode="promise_in_bounds",
-            ).astype(jnp.float32)
+            )
             destination[pl.ds(position, 1), :] = selected_row
 
     def stage_compact_rows(active_rows, destination, offset=0, row_plan=None):
