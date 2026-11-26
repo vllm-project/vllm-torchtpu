@@ -346,11 +346,6 @@
       "concise_description": "Object of class `FunctionType` has no attribute `_tpu_qwen3_vl_vision_transformer_patch`"
     },
     {
-      "path": "src/vllm_torchtpu/omni/platform.py",
-      "name": "bad-override",
-      "concise_description": "Class member `OmniTpuPlatform.dist_backend` overrides parent class `TpuPlatform` in an inconsistent manner"
-    },
-    {
       "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `ModuleType` has no attribute `build_app`"

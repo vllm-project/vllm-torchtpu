@@ -20,11 +20,8 @@ echo "--- Cleaning up old Docker images and cache"
 bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
 TARGET="${1:-dev}"
-IMAGE_SUFFIX=""
-if [ "${TARGET}" = "omni" ]; then
-  IMAGE_SUFFIX="-omni"
-elif [ "${TARGET}" != "dev" ]; then
-  echo "[FATAL] Unsupported target '${TARGET}'; expected dev or omni." >&2
+if [ "${TARGET}" != "dev" ]; then
+  echo "[FATAL] Unsupported target '${TARGET}'; expected dev." >&2
   exit 1
 fi
 
@@ -37,14 +34,14 @@ if [ -z "${VLLM_COMMIT_HASH}" ]; then
   exit 1
 fi
 
-BASE_TAG="${COMMIT_HASH}-${VLLM_COMMIT_HASH}${IMAGE_SUFFIX}"
+BASE_TAG="${COMMIT_HASH}-${VLLM_COMMIT_HASH}"
 BASE_IMAGE_TAG="${IMAGE_REPO}:${BASE_TAG}"
 
-# CI_IMAGE=<image> (the dev target only): publish that image as this build's
-# and build nothing, as K3_ENGINE_IMAGE does for the Kimi-K3 engine image. The
-# image's code is what the steps run, so give one built from a commit whose
-# image would be the same - a rerun of a pipeline-only change, say.
-if [[ -n "${CI_IMAGE:-}" && -z "${IMAGE_SUFFIX}" ]]; then
+# CI_IMAGE=<image>: publish that image as this build's and build nothing, as
+# K3_ENGINE_IMAGE does for the Kimi-K3 engine image. The image's code is what
+# the steps run, so give one built from a commit whose image would be the same
+# - a rerun of a pipeline-only change, say.
+if [[ -n "${CI_IMAGE:-}" ]]; then
   if ! docker manifest inspect "${CI_IMAGE}" >/dev/null 2>&1; then
     echo "[FATAL] CI_IMAGE=${CI_IMAGE} is not in the registry." >&2
     exit 1
@@ -82,7 +79,7 @@ fi
 if [[ -z "${CANARY_LEG}" && "${CI_IMAGE_REBUILD:-0}" != "1" ]] \
     && docker manifest inspect "${BASE_IMAGE_TAG}" >/dev/null 2>&1; then
   echo "--- ${BASE_IMAGE_TAG} is already in the registry; reusing it"
-  buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX}" "${BASE_IMAGE_TAG}"
+  buildkite-agent meta-data set "CI_IMAGE_TAG" "${BASE_IMAGE_TAG}"
   echo "--- Done setup_docker_env.sh"
   exit 0
 fi
@@ -93,7 +90,7 @@ if [ -z "${CANARY_LEG}" ]; then
   ./docker/build_image.sh --target "${TARGET}" -t "${BASE_IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}"
 
   # Publish image tag metadata for downstream test steps
-  buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX}" "${BASE_IMAGE_TAG}"
+  buildkite-agent meta-data set "CI_IMAGE_TAG" "${BASE_IMAGE_TAG}"
 
   echo "--- Pushing Docker Image to Registry"
   docker push "${BASE_IMAGE_TAG}"
@@ -228,9 +225,8 @@ for image_tag in "${IMAGES_TO_PUSH[@]}"; do
   docker push "${image_tag}"
 done
 
-# Publish image tag metadata for downstream test steps without overwriting
-# non-omni keys when building TARGET=omni.
-buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX}" "${OVERRIDE_IMAGE_TAG}"
+# Publish image tag metadata for downstream test steps.
+buildkite-agent meta-data set "CI_IMAGE_TAG" "${OVERRIDE_IMAGE_TAG}"
 buildkite-agent meta-data set "${VERSION_META_KEY}" "${OVERRIDE_VERSION}"
 
 buildkite-agent annotate \

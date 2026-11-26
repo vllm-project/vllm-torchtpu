@@ -23,7 +23,7 @@ Builds the vllm-torchtpu image from the repository root as the docker context.
 Options:
   -t, --image-tag TAG      Tag for the built image (default: vllm-torchtpu-local)
   -s, --vllm-source DIR    Local vLLM source tree to install in editable mode
-      --target TARGET      Dockerfile stage to build: prod, dev, ci, or omni (default: prod)
+      --target TARGET      Dockerfile stage to build: prod, dev, or ci (default: prod)
       --vllm-rs            Compile vLLM's Rust frontend (vllm-rs) into the image; takes minutes
       --experimental-rvllm-url LOCATION
                            Include the native Rust serving runtime (rvllm) from

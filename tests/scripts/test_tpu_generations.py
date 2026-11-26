@@ -73,7 +73,7 @@ class TestTpuGenerations(unittest.TestCase):
                         "depends_on": [
                             "build_docker",
                             {"step": "general", "allow_failure": True},
-                            {"step": "build_docker_omni"},
+                            {"step": "typecheck_full"},
                         ],
                     },
                     {"label": "Alone", "depends_on": "report"},
@@ -102,7 +102,7 @@ class TestTpuGenerations(unittest.TestCase):
                     "depends_on": [
                         "build_docker",
                         {"step": "v6e_general", "allow_failure": True},
-                        {"step": "build_docker_omni"},
+                        {"step": "typecheck_full"},
                     ],
                 },
                 {"label": "v6e Alone", "depends_on": "v6e_report"},

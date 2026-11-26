@@ -56,8 +56,8 @@ include them. Both use the CI image built by `pipeline_build.yml`. On PR builds,
 `bootstrap.py` uploads stage 0 (`pipeline_build.yml` and `pipeline_cpu.yml`)
 followed by a `wait` and an `upload-stages` step that uploads the TPU lanes
 (`tests`, `integration`, `verify`, plus `perf` with `run-perf-eval` or
-`run-full-ci`) only after every stage-0 step (both image builds, including
-`-omni`, and the CPU checks) passes. Retrying a failed stage-0 step in Buildkite
+`run-full-ci`) only after every stage-0 step (the image build and the CPU
+checks) passes. Retrying a failed stage-0 step in Buildkite
 releases the `wait` once the retry passes and runs the uploader step. The
 `oncall-fix` label raises job and Kueue workload priority without changing the
 suite.
@@ -81,9 +81,8 @@ build that sets `KUBE_SHAPE_SINGLE` or `KUBE_SHAPE_MULTI` is rejected: the
 generation brings its shapes.
 
 The v6e steps do not pass yet, and they are not `soft_fail`, so a build that
-runs them is expected to fail: for one, the `tests_omni` tests are not
-qualified for v6e's 32 GB of HBM. No build has to set either extra. Use them on
-a manual build to see where v6e stands.
+runs them is expected to fail. No build has to set either extra. Use them on a
+manual build to see where v6e stands.
 
 These extras choose the chips for the `tests` lane only. A build with
 `NIGHTLY=1` also runs the nightly model and feature tests for both chips (the
@@ -119,8 +118,8 @@ pipeline also runs the lane, because its LKG promotion waits on two of its
 steps.
 
 A PR labeled `skip-tpu-ci` (it still needs `ready`) uploads only the `cpu` lane
-and the image build (skipping the `-omni` image and every TPU lane), so what
-runs is the image build, the type check, and the CPU unit tests. The post-merge
+and the image build (skipping every TPU lane), so what runs is the image build,
+the type check, and the CPU unit tests. The post-merge
 build of such a PR does the same: `bootstrap.py` reads the merged PR's labels
 from GitHub (ignoring `run-perf-eval` and `run-full-ci` post-merge). On a PR,
 the suite labels `skip-tpu-ci`, `run-perf-eval`, and `run-full-ci` are mutually

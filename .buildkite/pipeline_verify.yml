@@ -45,8 +45,6 @@ steps:
       - "v7x_unit_tests_multichip_nightly"
       - "v7x_unit_tests_spec_decode_nightly"
       - "v7x_unit_tests_spec_decode_multichip_nightly"
-      - "v7x_unit_tests_omni_nightly"
-      - "v7x_unit_tests_omni_multichip_nightly"
     allow_dependency_failure: true
     agents:
       queue: cpu

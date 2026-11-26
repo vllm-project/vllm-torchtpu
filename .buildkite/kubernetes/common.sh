@@ -25,10 +25,9 @@
 # surfaces twenty minutes later as ImagePullBackOff on a TPU node that scaled up
 # to sit idle.
 #
-# A step on another variant of the image - the -omni build - names it with
-# DOCKER_IMAGE_SUFFIX. A step may
-# also name its own image, which the disagg lane does - it builds one of its
-# own rather than using the CI image.
+# A step on another variant of the image names it with DOCKER_IMAGE_SUFFIX or
+# CI_IMAGE_TAG_KEY. A step may also name its own image, which the disagg lane
+# does - it builds one of its own rather than using the CI image.
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
   WORKLOAD_IMAGE=$(buildkite-agent meta-data get "${CI_IMAGE_TAG_KEY:-CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}}" \
     --default "" 2>/dev/null || true)

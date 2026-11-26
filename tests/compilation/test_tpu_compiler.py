@@ -367,22 +367,7 @@ class TestTpuCompilerCache:
             for path in (source_root / "vllm_torchtpu").rglob("*.py")
             if "pallas.jax_op" in path.read_text()
         }
-        excluded_files = set(tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
-        excluded_dirs = tuple(
-            f"{rel_path}/"
-            for rel_path in tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS
-        )
-        omni_only = {
-            path
-            for path in custom_op_boundaries
-            if path in excluded_files or path.startswith(excluded_dirs)
-        }
-        assert custom_op_boundaries - omni_only <= hashed
-        assert not {
-            path
-            for path in hashed
-            if path in excluded_files or path.startswith(excluded_dirs)
-        }
+        assert custom_op_boundaries <= hashed
         assert {
             "vllm_torchtpu/gdn_pool_layout.py",
             "vllm_torchtpu/kv_cache_spec_normalizer.py",
@@ -391,34 +376,6 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
-
-    def test_runtime_hash_excluded_kernels_stay_omni_only(self):
-        """Excluded diffusion kernels must have no caller in hashed code.
-
-        An LLM path importing one would compile it into a cached executable
-        whose key no longer covers the kernel's source.
-        """
-        from vllm_torchtpu.compilation import tpu_compiler
-
-        source_root = Path(tpu_compiler.__file__).resolve().parents[2]
-        excluded_files = set(tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
-        excluded_dirs = tuple(
-            f"{rel_path}/"
-            for rel_path in tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS
-        )
-        importers = {
-            path.relative_to(source_root).as_posix()
-            for path in (source_root / "vllm_torchtpu").rglob("*.py")
-            if not (
-                path.relative_to(source_root).as_posix() in excluded_files
-                or path.relative_to(source_root).as_posix().startswith(excluded_dirs)
-            )
-            and re.search(
-                r"kernels\.diffusion_attention|kernels import diffusion_attention",
-                path.read_text(),
-            )
-        }
-        assert not importers
 
     def test_serving_only_kv_knobs_stay_out_of_the_compile_cache_key(self):
         """Serving-time knobs must stay out of the compile-cache key.
@@ -917,18 +874,6 @@ class TestTpuCompilerCache:
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
         assert compiler.cache_dir == "/tmp/test_cache_dir"
-
-    def test_runtime_hash_excludes_omni_rope(self):
-        """Verify that diffusion/Omni specific paths are excluded from the hash."""
-        from vllm_torchtpu.compilation.tpu_compiler import (
-            _RUNTIME_CACHE_KEY_EXCLUDED_PATHS,
-        )
-
-        assert (
-            "vllm_torchtpu/kernels/diffusion_attention"
-            in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
-        )
-        assert "vllm_torchtpu/omni/rope.py" in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
 
     @staticmethod
     def _first_ids_per_compile(monkeypatch, *reservers, compiles=2, count=3):

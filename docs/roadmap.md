@@ -32,7 +32,7 @@ For what is supported **today**, see [Supported Models & Features](user_guide/su
 | **24-Hour Day-0 Model Onboarding Pipeline** | Community Enablement | Deploy an automated CI pipeline to ingest, benchmark, and publish support matrices for newly released open-weight models within 24 hours of launch. |
 | **Qwen 3.5, Kimi K3 & GLM 5.2/5.3 Benchmarks** | SOTA Performance | Complete performance hill-climbing and publish competitive AgentX load-tester submissions (including llm-d xP/yD runs) for Qwen 3.5, Kimi K3, and GLM 5.2 / 5.3 (1M context). |
 | **Speculative Decoding & Agentic Traces** | Latency Acceleration | Roll out Speculative Decoding (including Multi-Token Prediction) and publish AgentX benchmark submissions for multi-host speculative decoding and agentic trace distributions. |
-| **Native Diffusion Model Serving** | Multimodal Serving | Integrate native serving support for major video and image diffusion models (e.g., Wan 2.2, Lightrick2) directly into `vllm-torchtpu` via `vllm-omni`. |
+| **Native Diffusion Model Serving** | Multimodal Serving | Deliver native serving support for video and image diffusion models (such as Wan 2.2 and LTX-2) on TPU in [`vllm-omni-torchtpu`](https://github.com/vllm-project/vllm-omni-torchtpu). |
 | **Public Nightly CI/CD Support Matrix** | Developer Tooling | Launch a public, nightly-updated CI/CD support matrix tracking model execution status, quantization formats (BF16, FP8, MXFP4), serving features, and automated evaluation scores. |
 
 ### December 2026
