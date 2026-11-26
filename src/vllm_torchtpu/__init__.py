@@ -2155,6 +2155,8 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             # int32 masks the same ids, and an int64 scalar operand costs each
             # program that embeds a serial split before its first op.
             dtype = torch.int32 if envs.VLLM_TPU_VOCAB_BOUNDS_INT32 else torch.int64
+            if dtype == torch.int32:
+                logger.info_once("VOCAB_BOUNDS_INT32 active: int32 vocab-shard bounds")
             si = self.shard_indices
             for name in (
                 "org_vocab_start_index",
