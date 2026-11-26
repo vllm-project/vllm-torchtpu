@@ -1195,8 +1195,24 @@ def _fold_shared_expert(runner) -> None:
     setattr(owner, FUSED_MOE_EP_SHARED_ATTR, shared_expert)
     # Keeps it in the model's module tree once the runner lets go of it.
     layer.register_module(FUSED_MOE_EP_SHARED_ATTR, shared_expert)
+    # MoERunner has no public way to drop its shared expert, and its __init__
+    # caches a forward entry chosen by whether it has one. If a vLLM bump
+    # renames either field, the runner keeps running and all-reducing the
+    # shared expert while the op adds it too: double-counted, silently. Fail
+    # at load instead.
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
     runner._shared_experts = None
     runner._forward_entry = runner._select_forward()
+    assert runner.shared_experts is None, (
+        f"{runner.layer_name}: clearing MoERunner._shared_experts did not drop "
+        "the shared expert; update _fold_shared_expert for this vLLM version"
+    )
+    assert runner._forward_entry is moe_runner._moe_forward, (
+        f"{runner.layer_name}: MoERunner still forwards through "
+        f"{runner._forward_entry!r}; update _fold_shared_expert for this vLLM "
+        "version"
+    )
 
 
 def fused_moe_ep_unsupported_reason(

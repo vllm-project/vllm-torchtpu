@@ -26,11 +26,18 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+    FusedMoEMethodBase,
+)
+from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+from vllm.model_executor.layers.fused_moe.runner import moe_runner as upstream
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.fused_moe.v2.host import token_gather_smem_bytes
 from vllm_torchtpu.layers.adapter import fused_moe_ep as bridge
 from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
+from vllm_torchtpu.layers.adapter.quantization import fp8
 
 # The width of the mesh `_prebuild` stubs in. `_layer` sizes the global expert
 # count against it, because the kernel requires one equal block per shard.
@@ -1426,8 +1433,6 @@ def _fold_runner():
 
 
 def test_fold_hands_the_shared_expert_to_the_op():
-    from vllm.model_executor.layers.fused_moe.runner import moe_runner as upstream
-
     folded, refused = _fold_runner(), _fold_runner()
     refused.routed_scaling_factor = 2.5
     model, draft = torch.nn.Module(), torch.nn.Module()
@@ -1492,3 +1497,127 @@ def test_shared_fold_refusals(change, reason):
     assert bridge._shared_fold_refusal(runner) is None
     change(runner)
     assert reason in bridge._shared_fold_refusal(runner)
+
+
+class _CountingSharedMLP(torch.nn.Module):
+    """A TP-partial shared expert that counts its calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(0.5), requires_grad=False)
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        return x * self.scale
+
+
+class _ArmedRoutedExperts(torch.nn.Module):
+    """The RoutedExperts state an armed fp8 layer's forward reads."""
+
+    forward_monolithic = RoutedExperts.forward_monolithic
+
+    def __init__(self, quant_method):
+        super().__init__()
+        self.quant_method = quant_method
+        layer = _layer()
+        for name in (
+            "w13_weight",
+            "w2_weight",
+            "w13_weight_scale_inv",
+            "w2_weight_scale_inv",
+        ):
+            param = torch.nn.Parameter(getattr(layer, name), requires_grad=False)
+            self.register_parameter(name, param)
+
+    def _ensure_moe_quant_config_init(self):
+        pass
+
+
+def test_fold_survives_upstream_moe_runner_forward(monkeypatch):
+    """The fold rewrites MoERunner internals, so check it through upstream's
+    own __init__ and forward: once folded, the shared expert runs exactly once,
+    inside the op, and the runner neither adds nor all-reduces it again."""
+    name = "model.layers.0.mlp.experts"
+    layers, all_reduces, fold_calls = {}, [], []
+
+    def all_reduce(t):
+        all_reduces.append(t)
+        return t
+
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
+    monkeypatch.setattr(upstream, "get_current_vllm_config", lambda: None)
+    monkeypatch.setattr(
+        upstream, "register_layer_for_moe_forward_op", lambda config, layer: None
+    )
+    monkeypatch.setattr(upstream, "get_layer_from_name", layers.__getitem__)
+    monkeypatch.setattr(upstream, "is_forward_context_available", lambda: False)
+    monkeypatch.setattr(
+        upstream,
+        "get_forward_context",
+        lambda: SimpleNamespace(dp_metadata=None, all_moe_layers=None),
+    )
+    monkeypatch.setattr(upstream, "tensor_model_parallel_all_reduce", all_reduce)
+
+    parallel = SimpleNamespace(
+        use_ep=True,
+        ep_size=_STUB_EP,
+        tp_size=1,
+        dp_size=1,
+        pcp_size=1,
+        enable_eplb=False,
+        all2all_backend="allgather_reducescatter",
+        use_fi_nvl_two_sided_kernels=False,
+        use_all2all_kernels=False,
+    )
+    moe_config = SimpleNamespace(
+        moe_parallel_config=parallel,
+        is_sequence_parallel=False,
+        skip_final_all_reduce=False,
+        tp_size=1,
+        ep_size=_STUB_EP,
+        dp_size=1,
+        pcp_size=1,
+        sp_size=1,
+        hidden_dim=8,
+        hidden_dim_unpadded=8,
+    )
+    quant_method = fp8.VllmFp8MoEMethodTPU.__new__(fp8.VllmFp8MoEMethodTPU)
+    FusedMoEMethodBase.__init__(quant_method, moe_config)
+    quant_method._tpu_activation_str = "silu"
+    routed = _ArmedRoutedExperts(quant_method)
+    # What prebuild stages: the plain op, and the op that also takes the
+    # shared expert's TP-partial rows and adds their TP sum.
+    setattr(quant_method, bridge.FUSED_MOE_EP_OP_ATTR, lambda x, *_: x * 0.25)
+
+    def fold_op(x, *operands):
+        fold_calls.append(operands)
+        return x * 0.25 + operands[-1]
+
+    setattr(routed, bridge._SHARED_FOLD_OP_ATTR, fold_op)
+    shared = _CountingSharedMLP()
+    runner = MoERunner(
+        layer_name=name,
+        moe_config=moe_config,
+        router=SimpleNamespace(prepare_monolithic_logits=lambda logits: logits),
+        routed_experts=routed,
+        shared_experts=shared,
+    )
+    layers[name] = runner
+    model = torch.nn.Module()
+    model.experts = runner
+    x = torch.randn(4, 8)
+    logits = torch.randn(4, 4 * _STUB_EP)
+    want = x * 0.25 + x * 0.5
+
+    # Unfolded, the runner runs the shared expert and all-reduces it.
+    assert torch.equal(runner(hidden_states=x, router_logits=logits), want)
+    assert shared.calls == 1 and len(all_reduces) == 1
+
+    assert bridge.fold_shared_experts(model) == 1
+    out = runner(hidden_states=x, router_logits=logits)
+
+    # Had the runner kept it, the shared expert would run and be added twice.
+    assert torch.equal(out, want)
+    assert shared.calls == 2 and len(all_reduces) == 1
+    assert len(fold_calls) == 1 and torch.equal(fold_calls[0][-1], x * 0.5)
