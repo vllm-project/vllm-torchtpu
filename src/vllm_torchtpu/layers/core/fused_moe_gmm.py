@@ -31,8 +31,10 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import (
     dense_expert_moe_fp4,
     shared_activation,
 )
-from vllm_torchtpu.kernels.megablox import pair_combine, tc_combine
+from vllm_torchtpu.kernels.megablox import gmm_mlp_stream, pair_combine, tc_combine
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
+    FP8_DECODE_MAX_M,
+    FP8_DECODE_TILE_M,
     LHS_AMAX_LANES,
     get_packing_factor,
     gmm_v2,
@@ -685,22 +687,33 @@ def moe_gmm(
         and w1_bias is None
         and w2_bias is None
     ):
-        # One kernel for both gmms (gmm_v2_mlp): down's first weight block
-        # loads under gate_up's last step instead of after it. Packing
-        # factor 1 means rhs_quant_dtype carries nothing gmm_v2_mlp needs.
-        gmm2_res = gmm_v2_mlp(
-            x,
-            w1,
-            w2,
-            group_sizes,
-            rhs1_scale=w1_scale,
-            rhs2_scale=w2_scale,
-            group_offset=group_offset,
-            fuse_act=activation,
-            preferred_element_type=out_dtype,
-            maybe_quantize_lhs=False,
-            lhs_amax=x_amax,
-        )
+        if (
+            envs.TPU_MOE_DECODE_MLP_STREAM
+            and x_amax is None
+            # gmm_v2's decode-tile condition (calculate_tiling).
+            and x.shape[0] <= min(FP8_DECODE_MAX_M, FP8_DECODE_TILE_M * w1.shape[0])
+            and gmm_mlp_stream.supported(x, w1, w1_scale, w2, w2_scale, activation)
+        ):
+            gmm2_res = gmm_mlp_stream.gmm_mlp_stream(
+                x, w1, w2, group_sizes, w1_scale, w2_scale, fuse_act=activation
+            )
+        else:
+            # One kernel for both gmms (gmm_v2_mlp): down's first weight block
+            # loads under gate_up's last step instead of after it. Packing
+            # factor 1 means rhs_quant_dtype carries nothing gmm_v2_mlp needs.
+            gmm2_res = gmm_v2_mlp(
+                x,
+                w1,
+                w2,
+                group_sizes,
+                rhs1_scale=w1_scale,
+                rhs2_scale=w2_scale,
+                group_offset=group_offset,
+                fuse_act=activation,
+                preferred_element_type=out_dtype,
+                maybe_quantize_lhs=False,
+                lhs_amax=x_amax,
+            )
     else:
         assert x_amax is None
         gmm1_res = gmm_wrapper(

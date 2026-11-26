@@ -105,6 +105,7 @@ if TYPE_CHECKING:
     TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS: int = 0
     TPU_MOE_DUAL_LAYOUT_MAX_TOKENS: int = 0
     TPU_GMM_FP8_W8A8: bool = False
+    TPU_MOE_DECODE_MLP_STREAM: bool = True
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -960,6 +961,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lhs rows to e4m3 with per-row scales (kernels/megablox/gmm_v2.py
     # uses_fp8_w8a8). ~1.6x faster at 8k-token chunks, ~6% output error vs 0.4%.
     "TPU_GMM_FP8_W8A8": env_bool("TPU_GMM_FP8_W8A8", default=False),
+    # Decode-sized routed-expert MLPs on fp4 experts whose gmm_v2 call would
+    # take decode tiles stream each expert as contiguous weight chunks
+    # (kernels/megablox/gmm_mlp_stream.py) instead of gmm_v2_mlp. Migration
+    # selector: 0 restores gmm_v2_mlp bit for bit, including its bf16 rounding
+    # of groups past 48 rows; drop it once the stream is the only decode path.
+    "TPU_MOE_DECODE_MLP_STREAM": env_bool("TPU_MOE_DECODE_MLP_STREAM", default=True),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
