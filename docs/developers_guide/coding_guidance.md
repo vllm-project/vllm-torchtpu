@@ -434,6 +434,16 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   notes. When code needs to cite the reasoning behind a design, inline the
   reasoning in the comment or cite a public source (vLLM source path, HF
   model card, published paper).
+- **R-7.13** **No non-public TPU hardware or compiler internals in code,
+  comments, or PR text.** Do not include unreleased or internal TPU codenames,
+  undocumented TPU ISA, low-level assembly, or microarchitecture claims with no
+  public source (and no `pltpu.get_tpu_info()` or self-measured evidence), or
+  closed-source Mosaic TPU or XLA compiler lowering passes or raw internal
+  compiler error strings that have no public source. Public upstream sources
+  (such as ops and errors in public `openxla/xla` or pinned `jax`, e.g.,
+  `tpu.matmul` in `jax/_src/pallas/mosaic/lowering.py`, and errors observable
+  from pinned public PyPI `libtpu`), executable calls to public OpenXLA ops,
+  and HLO or trace evidence that another rule asks for are allowed.
 
 ## 8. Tests
 
@@ -525,7 +535,8 @@ Background material for the rules above.
 9. **Thresholds** — CI perf thresholds updated in the same PR if performance
    moved. (PR-1, optimization doc)
 10. **Hygiene** — `pre-commit run --all-files` clean; 88 columns; license
-    headers; explicit imports; no internal links. (R-1.x, R-7.12)
+    headers; explicit imports; no internal links or non-public compiler
+    internals. (R-1.x, R-7.12, R-7.13)
 11. **Lifecycle** — WIP as Draft; branch updated by rebase, never merge;
     nothing merges until CI is green on the current head; every changed line
     read and defensible by the human submitter (R-7.7).
