@@ -35,7 +35,7 @@ NEG = -3.0e38
 MAX_BLOCK_ROWS = 512
 
 
-def _select_kernel(x_ref, *refs, topk: int, n: int, pick: bool):
+def _select_kernel(x_ref, *refs, topk: int, n: int, pick: bool, lanes_are_rows: bool):
     """One block of rows: top ``topk`` by repeated max-and-mask.
 
     Scores at or below ``NEG`` are clamped up to it first, so every row has a
@@ -50,23 +50,41 @@ def _select_kernel(x_ref, *refs, topk: int, n: int, pick: bool):
     With ``pick`` the first ref holds a second ``[rows, n]`` array, and the
     weights are its entries at the selected columns (``gather``) instead of
     the maxima.
+
+    With ``lanes_are_rows`` the block is transposed first, so each pass
+    reduces over sublanes (elementwise across vregs) instead of across the
+    lanes of every vreg; every value is unchanged.
     """
     y_ref, w_ref, i_ref = refs if pick else (None, *refs)
-    x = jnp.where(x_ref[...] > NEG, x_ref[...], NEG)
+    x = x_ref[...]
+    y = y_ref[...] if pick else None
+    axis = 1
+    if lanes_are_rows:
+        x = x.T
+        y = y.T if pick else None
+        axis = 0
+    x = jnp.where(x > NEG, x, NEG)
     masked = jnp.finfo(x.dtype).min
-    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
-    for j in range(topk):
-        m = jnp.max(x, axis=1, keepdims=True)
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, axis)
+    picked = []
+    for _ in range(topk):
+        m = jnp.max(x, axis=axis, keepdims=True)
         # Lowest column attaining the max; the rest fill with the last expert
         # so the min never selects a phantom.
-        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
-        hit = iota == idx[:, None]
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=axis, keepdims=True)
+        hit = iota == idx
         if pick:
-            w_ref[:, j] = jnp.max(jnp.where(hit, y_ref[...], -jnp.inf), axis=1)
-        else:
-            w_ref[:, j] = m[:, 0]
-        i_ref[:, j] = idx.astype(jnp.int32)
+            m = jnp.max(jnp.where(hit, y, -jnp.inf), axis=axis, keepdims=True)
+        picked.append((m, idx))
         x = jnp.where(hit, masked, x)
+    if lanes_are_rows:
+        # Back to [rows, topk]: one lane-dense row per pass, transposed once.
+        w_ref[...] = jnp.concatenate([m for m, _ in picked], axis=0).T
+        i_ref[...] = jnp.concatenate([idx for _, idx in picked], axis=0).T
+    else:
+        for j, (m, idx) in enumerate(picked):
+            w_ref[:, j] = m[:, 0]
+            i_ref[:, j] = idx[:, 0]
     if not pick:
         # No score above the sentinel means no real maximum: keep the row
         # poisonous rather than letting renormalization make it plausible.
@@ -97,7 +115,13 @@ def select(
     pick = values is not None
     spec = pl.BlockSpec((block, n), lambda i: (i, 0))
     return pl.pallas_call(
-        functools.partial(_select_kernel, topk=topk, n=n, pick=pick),
+        functools.partial(
+            _select_kernel,
+            topk=topk,
+            n=n,
+            pick=pick,
+            lanes_are_rows=block % 128 == 0,
+        ),
         grid=(pl.cdiv(rows, block),),
         in_specs=[spec, spec] if pick else [spec],
         out_specs=[
