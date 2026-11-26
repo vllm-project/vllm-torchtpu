@@ -368,9 +368,12 @@ def _chunk_maxima_t(
             # partner is not.
             pair.append(_transposed_keys(buf, p, live, dtype, folded, side == 1))
             if folded:
-                s = pltpu.bitcast(buf[p, rows - 1 :], jnp.float32)  # [1, S]
-                # Stale VMEM past the request's end, unwritten slots: scale 0.
-                scale_rows[side].append(jnp.where(jnp.isfinite(s) & (p < live), s, 0.0))
+                # Unmasked (AOT c48 decode body 5.88 -> 5.32 bundles per page):
+                # the writer zeroes unwritten slots' scales (`msa_write`), and
+                # a page past the request's end (stale VMEM, maybe NaN) scales
+                # only its own rows' scores, of blocks no row of the request
+                # sees, which every reader of the scores masks.
+                scale_rows[side].append(pltpu.bitcast(buf[p, rows - 1 :], jnp.float32))
         keys.append(jnp.concatenate(pair, axis=0))  # [2 D, S]
     page_size = keys[0].shape[1]
     s = jax.lax.dot_general(

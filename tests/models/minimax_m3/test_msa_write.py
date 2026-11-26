@@ -205,8 +205,8 @@ def test_fp4_matches_scatter(q_lens, ctx_lens, pad_tokens, folded):
     p, s = np.asarray(pages)[keep], np.asarray(pos)[keep] % PAGE
     want[p, s] = np.asarray(rows)[keep]
     np.testing.assert_array_equal(np.asarray(msa_fp4.unpack_rows(got)), want)
-    if folded:
-        want_scales = np.asarray(page_scales).copy()
+    if folded:  # slots past each run take scale 0, as their keys take 0
+        want_scales = _zero_past_runs(page_scales, pages, pos)
         want_scales[p, s] = np.asarray(scales)[keep]
         np.testing.assert_array_equal(
             np.asarray(msa_fp4.folded_scales(got)), want_scales

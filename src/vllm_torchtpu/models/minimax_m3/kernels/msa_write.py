@@ -244,6 +244,9 @@ def _run_ops(
                     bits = jnp.pad(bits, ((0, 0), (0, width - _LANES)))
                 take = (row == rows - 1) & (lane >= lo) & (lane < hi)
                 words = jnp.where(take, bits[:, :width], words)
+                # Unwritten slots' scales too: the decode indexer multiplies
+                # every slot's (zeroed) key score by its scale unmasked.
+                words = jnp.where((row == rows - 1) & (lane >= hi), 0, words)
             out_buf.bitcast(jnp.uint32)[slot, :, 0, :] = words
 
     return RunOps(in_copies, out_copies, merge, out_bufs)
@@ -487,11 +490,13 @@ def write_runs(
     """Write token ``t``'s rows / values of every target at ``(pages[t],
     slots[t])`` of its cache; returns the caches in `targets` order.
 
-    A `Rows` target's data slots past each run's last token are zeroed: the
-    8-bit decode attention (`msa_attention_lse._kernel`) multiplies a page's
-    unseen values by p = 0 unmasked, and its prefill tiles (`DIRECT_T`) feed
-    the keys to the MXU unmasked, so no slot they read may hold NaN bytes.
-    Any other writer of these caches must keep that invariant.
+    A `Rows` target's data slots past each run's last token are zeroed, and
+    so are their folded scales: the 8-bit decode attention
+    (`msa_attention_lse._kernel`) multiplies a page's unseen values by p = 0
+    unmasked, its prefill tiles (`DIRECT_T`) feed the keys to the MXU
+    unmasked, and the decode indexer (`msa_indexer._chunk_maxima_t`) scales
+    every slot's score, so no slot they read may hold NaN bytes. Any other
+    writer of these caches must keep that invariant.
 
     The caches share the page geometry (same pages, slots per page). Tokens
     with a page outside the caches are dropped. Consecutive tokens of a run
