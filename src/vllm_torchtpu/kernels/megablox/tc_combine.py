@@ -54,7 +54,9 @@ def max_tiles(token_block: int, topk: int, num_experts: int) -> int:
     return -(-tiles // _TILES_PER_CHUNK) * _TILES_PER_CHUNK
 
 
-def pick_token_block(num_tokens: int, hidden: int, topk: int, num_experts: int) -> int:
+def pick_token_block(
+    num_tokens: int, hidden: int, topk: int, num_experts: int, residual: bool = False
+) -> int:
     """The widest of TOKEN_BLOCKS that divides the tokens and whose buffers
     fit in VMEM, or 0."""
     for block in TOKEN_BLOCKS:
@@ -64,17 +66,24 @@ def pick_token_block(num_tokens: int, hidden: int, topk: int, num_experts: int) 
         vmem = (
             2 * tiles * TILE_ROWS * hidden * 2  # double-buffered tiles
             + block * hidden * 4  # f32 accumulator
-            + 2 * block * hidden * 2  # output blocks
+            + (4 if residual else 2) * block * hidden * 2  # output (+ residual) blocks
         )
         if vmem <= _VMEM_LIMIT_BYTES - 8 * 1024 * 1024:
             return block
     return 0
 
 
-def supported(num_tokens: int, hidden: int, topk: int, num_experts: int, dtype) -> bool:
+def supported(
+    num_tokens: int,
+    hidden: int,
+    topk: int,
+    num_experts: int,
+    dtype,
+    residual: bool = False,
+) -> bool:
     if dtype != jnp.bfloat16 or hidden % 128:
         return False
-    return pick_token_block(num_tokens, hidden, topk, num_experts) > 0
+    return pick_token_block(num_tokens, hidden, topk, num_experts, residual) > 0
 
 
 def plan_stride(maxt: int) -> int:
@@ -188,14 +197,14 @@ def _kernel(
     row_ref,  # VMEM [TB, k]
     w_ref,  # VMEM [TB, k]
     x_hbm,  # ANY [Mx, H]
-    out_ref,  # VMEM [TB, H]
-    buf,  # VMEM [2, maxt * 16, H]
-    acc,  # VMEM [TB, H] f32
-    sems,  # DMA [2]
-    *,
+    *refs,  # [residual VMEM [TB, H]], out VMEM [TB, H], buf, acc, sems
     stride: int,
     topk: int,
+    residual: bool,
 ):
+    res_ref = refs[0] if residual else None
+    out_ref, buf, acc, sems = refs[1:] if residual else refs
+    # buf: VMEM [2, maxt * 16, H]; acc: VMEM [TB, H] f32; sems: DMA [2]
     b = pl.program_id(0)
     nb = pl.num_programs(0)
 
@@ -296,13 +305,19 @@ def _kernel(
 
     lax.fori_loop(0, n_chunks, chunk, 0)
 
+    def store(routed):
+        if residual:
+            # Rounded as `routed + residual` of two bf16 arrays.
+            routed = routed.astype(jnp.float32) + res_ref[...].astype(jnp.float32)
+        out_ref[...] = routed.astype(out_ref.dtype)
+
     @pl.when(n_chunks == 0)
     def _():
-        out_ref[...] = jnp.zeros_like(out_ref)
+        store(jnp.zeros(out_ref.shape, out_ref.dtype))
 
     @pl.when(n_chunks > 0)
     def _():
-        out_ref[...] = acc[...].astype(out_ref.dtype)
+        store(acc[...].astype(out_ref.dtype))
 
 
 @functools.partial(jax.jit, static_argnames=("topk", "interpret"))
@@ -313,10 +328,12 @@ def tc_combine(
     group_sizes: jax.Array,
     *,
     topk: int,
+    residual: jax.Array | None = None,
     interpret=False,
 ) -> jax.Array:
     """out[t] = sum_j weights * x[pos] over the local routes j < topk, f32
-    accumulation, bf16 out. `x` rows [0, sum(group_sizes)) are the GMM output
+    accumulation, bf16 out, plus `residual` ([T, H] bf16) when given, rounded
+    as a bf16 sum. `x` rows [0, sum(group_sizes)) are the GMM output
     grouped by local expert (sizes `group_sizes`), tokens ascending within a
     group (as the stable sorts in fused_moe_gmm leave them: a block's routes
     then never need more than `max_tiles` tiles); a route whose `pos` is past
@@ -325,7 +342,9 @@ def tc_combine(
     num_tokens = pos.shape[0] // topk
     hidden = x.shape[1]
     num_experts = group_sizes.shape[0]
-    block = pick_token_block(num_tokens, hidden, topk, num_experts)
+    block = pick_token_block(
+        num_tokens, hidden, topk, num_experts, residual is not None
+    )
     nb = num_tokens // block
     maxt = max_tiles(block, topk, num_experts)
     plan, rows = _plan(
@@ -337,6 +356,7 @@ def tc_combine(
     w = weights.reshape(num_tokens, topk)
     if w.dtype != jnp.bfloat16:
         w = w.astype(jnp.float32)
+    token_block = pl.BlockSpec((block, hidden), lambda b, *_: (b, 0))
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=2,
         grid=(nb,),
@@ -344,8 +364,9 @@ def tc_combine(
             pl.BlockSpec((block, topk), lambda b, *_: (b, 0)),
             pl.BlockSpec((block, topk), lambda b, *_: (b, 0)),
             pl.BlockSpec(memory_space=pl.ANY),
+            *([] if residual is None else [token_block]),
         ],
-        out_specs=pl.BlockSpec((block, hidden), lambda b, *_: (b, 0)),
+        out_specs=token_block,
         scratch_shapes=[
             pltpu.VMEM((2, maxt * TILE_ROWS, hidden), x.dtype),
             pltpu.VMEM((block, hidden), jnp.float32),
@@ -353,7 +374,9 @@ def tc_combine(
         ],
     )
     return pl.pallas_call(
-        functools.partial(_kernel, stride=plan_stride(maxt), topk=topk),
+        functools.partial(
+            _kernel, stride=plan_stride(maxt), topk=topk, residual=residual is not None
+        ),
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct((num_tokens, hidden), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
@@ -362,4 +385,4 @@ def tc_combine(
         ),
         interpret=interpret,
         name="tc_moe_combine",
-    )(plan, valid_rows, rows, w, x)
+    )(plan, valid_rows, rows, w, x, *([] if residual is None else [residual]))

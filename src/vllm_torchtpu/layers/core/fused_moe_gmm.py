@@ -569,14 +569,19 @@ def moe_gmm(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     rhs_quant_dtype: jnp.dtype | None = None,
+    residual: jax.Array | None = None,
 ) -> jax.Array:
-    """Run grouped GEMM for routed tokens and reduce back to tokens.
+    """Run grouped GEMM for routed tokens and reduce back to tokens, plus
+    ``residual`` ([num_tokens, hidden]) when given.
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
+
+    def add_residual(out):
+        return out if residual is None else out + residual
 
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
@@ -667,13 +672,15 @@ def moe_gmm(
             alignment = token_block_alignment(gmm2_res.shape[-1], tpu_info)
             padded_tokens = -(-num_tokens // alignment) * alignment
             if num_tokens >= alignment and padded_tokens * 2 <= num_tokens * 3:
-                return ragged_gather_reduce_v3(
-                    gmm2_res,
-                    argsort_revert_indices,
-                    topk_weights_flat,
-                    valid_mask_flat,
-                    reduce_group_size=topk,
-                ).astype(x.dtype)
+                return add_residual(
+                    ragged_gather_reduce_v3(
+                        gmm2_res,
+                        argsort_revert_indices,
+                        topk_weights_flat,
+                        valid_mask_flat,
+                        reduce_group_size=topk,
+                    ).astype(x.dtype)
+                )
     if use_ep and use_sparse_core:
         if argsort_revert_indices.size <= onehot_moe_permute_threshold:
             # Use onehot + matmul for unpermutation, which can be faster
@@ -703,24 +710,28 @@ def moe_gmm(
                     gmm2_res.shape[1],
                     num_tokens,
                 )
-                return blockwise_onehot_unpermute(
-                    gmm2_res,
-                    token_indices_sorted,
-                    topk_weights_sorted,
-                    valid_count,
-                    num_tokens=num_tokens,
-                ).astype(x.dtype)
+                return add_residual(
+                    blockwise_onehot_unpermute(
+                        gmm2_res,
+                        token_indices_sorted,
+                        topk_weights_sorted,
+                        valid_count,
+                        num_tokens=num_tokens,
+                    ).astype(x.dtype)
+                )
             # The dense combine one-hot takes the weights' dtype; the kernel
             # multiplies in the routed rows' dtype.
             if topk_weights.dtype == gmm2_res.dtype and _use_bounded_onehot(
                 num_tokens, argsort_revert_indices.size, gmm2_res
             ):
-                return bounded_onehot_combine(
-                    gmm2_res,
-                    argsort_revert_indices,
-                    jnp.where(valid_mask, topk_weights, 0),
-                    valid_count,
-                ).astype(x.dtype)
+                return add_residual(
+                    bounded_onehot_combine(
+                        gmm2_res,
+                        argsort_revert_indices,
+                        jnp.where(valid_mask, topk_weights, 0),
+                        valid_count,
+                    ).astype(x.dtype)
+                )
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them
             # so stale NaNs cannot spread through the matmul (0 * NaN == NaN).
@@ -735,9 +746,14 @@ def moe_gmm(
             combine = (onehot * topk_weights[..., None] * valid_mask[..., None]).sum(
                 axis=1
             )
-            return (combine @ gmm2_res).astype(x.dtype)
+            return add_residual((combine @ gmm2_res).astype(x.dtype))
         if envs.TPU_MOE_TC_COMBINE and tc_combine.supported(
-            num_tokens, gmm2_res.shape[-1], topk, group_sizes.shape[0], gmm2_res.dtype
+            num_tokens,
+            gmm2_res.shape[-1],
+            topk,
+            group_sizes.shape[0],
+            gmm2_res.dtype,
+            residual=residual is not None,
         ):
             # Non-local routes sort after the valid prefix, so the positions
             # alone mark them.
@@ -747,21 +763,24 @@ def moe_gmm(
                 topk_weights_flat,
                 group_sizes,
                 topk=topk,
+                residual=None if residual is None else residual.astype(jnp.bfloat16),
             ).astype(x.dtype)
-        return ragged_gather_reduce(
-            gmm2_res,
-            argsort_revert_indices,
-            topk_weights_flat,
-            valid_mask_flat,
-            reduce_group_size=topk,
-        ).astype(x.dtype)
+        return add_residual(
+            ragged_gather_reduce(
+                gmm2_res,
+                argsort_revert_indices,
+                topk_weights_flat,
+                valid_mask_flat,
+                reduce_group_size=topk,
+            ).astype(x.dtype)
+        )
 
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape((num_tokens, topk, gmm2_res.shape[-1]))
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights, axis=-1)
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
-    return token_topk_hidden.sum(axis=1).astype(x.dtype)
+    return add_residual(token_topk_hidden.sum(axis=1).astype(x.dtype))
 
 
 # MiniMaxM3Mxfp8LinearMethod materializes the bf16 weight from this many rows
@@ -774,6 +793,12 @@ def shared_expert_mlp(
 ) -> jax.Array:
     """``routed`` plus `shared` on the bf16 tokens ``x``, rounded as
     SharedExpert describes."""
+    return shared_expert_out(x, shared) + routed
+
+
+def shared_expert_out(x: jax.Array, shared: SharedExpert) -> jax.Array:
+    """`shared` on the bf16 tokens ``x``, rounded to bf16 as SharedExpert
+    describes."""
 
     def projection(v, w, scale):
         if v.dtype == jnp.bfloat16 and 0 < v.shape[0] <= fp8_linear.max_rows(*w.shape):
@@ -786,7 +811,7 @@ def shared_expert_mlp(
 
     gate, up = jnp.split(projection(x, shared.w1, shared.s1), 2, axis=-1)
     act = shared_activation(gate.astype(jnp.float32), up.astype(jnp.float32))
-    return projection(act.astype(jnp.bfloat16), shared.w2, shared.s2) + routed
+    return projection(act.astype(jnp.bfloat16), shared.w2, shared.s2)
 
 
 @functools.partial(
@@ -823,8 +848,12 @@ def fused_moe_func(
     shared: SharedExpert | None = None,
     replicas: jax.Array | None = None,
     replica_groups: int = 0,
+    residual: jax.Array | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
+
+    ``residual`` ([num_tokens, hidden], the routed output's dtype) is added
+    to the routed output, in the TensorCore combine's epilogue where it runs.
 
     With ``shared``, an always-on expert's output (rounded to bf16) is added to
     the routed output, as vLLM's MoERunner adds a separately computed shared
@@ -888,7 +917,11 @@ def fused_moe_func(
     if shared is not None and activation != "swigluoai":
         raise NotImplementedError(f"shared experts take swigluoai, not {activation}")
     if shared is not None and not dense_fp4:
-        routed = fused_moe_func(
+        if residual is not None:
+            raise ValueError("fused_moe_func adds the shared expert or a residual.")
+        # The shared expert needs no routing: computed first, it can run while
+        # the SparseCore gathers the routed rows, and the combine adds it.
+        return fused_moe_func(
             hidden_states,
             w1,
             w2,
@@ -908,8 +941,11 @@ def fused_moe_func(
             skip_padded_tokens=skip_padded_tokens,
             replicas=replicas,
             replica_groups=replica_groups,
+            residual=shared_expert_out(hidden_states, shared),
         )
-        return shared_expert_mlp(hidden_states, shared, routed)
+
+    def with_residual(routed):
+        return routed if residual is None else routed + residual
 
     # NVFP4 weights arrive as native float4_e2m1fn in gmm_v2's K-major layout
     # (unpacked once at load; see fused_moe.load_kmajor_fp4). gmm_v2 picks the
@@ -945,20 +981,22 @@ def fused_moe_func(
             if skip_padded_tokens:
                 topk_ids = jnp.where(topk_weights != 0, topk_ids, -1)
             logger.info_once("Selected dense-expert fp4 decode MoE with replicas")
-            return dense_expert_moe_fp4(
-                hidden_states,
-                w1,
-                w2,
-                w1_scale,
-                w2_scale,
-                topk_weights,
-                topk_ids,
-                activation=activation,
-                shared=shared,
-                sparse_rows=sparse_rows,
-                replicas=replicas,
-                block_index=experts_start // w1.shape[0],
-                replica_groups=replica_groups,
+            return with_residual(
+                dense_expert_moe_fp4(
+                    hidden_states,
+                    w1,
+                    w2,
+                    w1_scale,
+                    w2_scale,
+                    topk_weights,
+                    topk_ids,
+                    activation=activation,
+                    shared=shared,
+                    sparse_rows=sparse_rows,
+                    replicas=replicas,
+                    block_index=experts_start // w1.shape[0],
+                    replica_groups=replica_groups,
+                )
             )
         # Home copies: slot s is local expert s % block of block s // block.
         block = w1.shape[0] - per_group
@@ -991,8 +1029,10 @@ def fused_moe_func(
         logger.info_once("Selected experimental dense-expert decode MoE")
         if onehot_permute:
             hidden_states = _zero_non_finite(hidden_states)
-        return dense_expert_moe(
-            hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+        return with_residual(
+            dense_expert_moe(
+                hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+            )
         )
 
     # Decode under EP: a core holds few routed rows per expert and weight
@@ -1000,17 +1040,19 @@ def fused_moe_func(
     # permute and combine around the GMM.
     if dense_fp4:
         logger.info_once("Selected dense-expert fp4 decode MoE")
-        return dense_expert_moe_fp4(
-            hidden_states,
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            topk_weights,
-            topk_ids,
-            activation=activation,
-            shared=shared,
-            sparse_rows=sparse_rows,
+        return with_residual(
+            dense_expert_moe_fp4(
+                hidden_states,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                topk_weights,
+                topk_ids,
+                activation=activation,
+                shared=shared,
+                sparse_rows=sparse_rows,
+            )
         )
 
     (
@@ -1052,5 +1094,9 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         rhs_quant_dtype=rhs_quant_dtype,
+        residual=residual if padded_hidden_size == hidden_size else None,
     )
-    return x[:num_tokens, :hidden_size]
+    x = x[:num_tokens, :hidden_size]
+    if padded_hidden_size != hidden_size:
+        x = with_residual(x)
+    return x

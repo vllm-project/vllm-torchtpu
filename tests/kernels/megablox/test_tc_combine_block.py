@@ -13,6 +13,7 @@
 # limitations under the License.
 """tc_combine: the token block, the per-block plan and the combine."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -109,3 +110,23 @@ def test_combine_matches_gather():
     routed = np.where(local[:, None], xb[np.where(local, pos, 0)] * w[:, None], 0)
     ref = routed.reshape(tokens, topk, hidden).sum(axis=1)
     np.testing.assert_allclose(np.asarray(out, np.float64), ref, rtol=1e-2, atol=1e-2)
+
+
+def test_combine_residual_is_the_bf16_sum():
+    tokens, experts, topk, hidden = 512, 36, 4, 256
+    pos, _, sizes = _routing(tokens, experts, topk, 400, seed=2)
+    rng = np.random.default_rng(3)
+    x = jnp.asarray(rng.standard_normal((tokens * topk, hidden)), jnp.bfloat16)
+    w = jnp.asarray(rng.random(tokens * topk), jnp.float32)
+    residual = jnp.asarray(
+        rng.standard_normal((tokens, hidden))
+        * np.exp(4 * rng.standard_normal((tokens, 1))),
+        jnp.bfloat16,
+    )
+    args = (x, jnp.asarray(pos), w, jnp.asarray(sizes))
+    routed = tc_combine.tc_combine(*args, topk=topk, interpret=True)
+    fused = tc_combine.tc_combine(*args, topk=topk, residual=residual, interpret=True)
+    np.testing.assert_array_equal(
+        np.asarray(jax.lax.bitcast_convert_type(fused, jnp.uint16)),
+        np.asarray(jax.lax.bitcast_convert_type(routed + residual, jnp.uint16)),
+    )
