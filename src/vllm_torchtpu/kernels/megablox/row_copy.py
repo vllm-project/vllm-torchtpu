@@ -87,6 +87,30 @@ def _canonical_bits(w):
     return w & (jnp.left_shift(keep, u(1)) - jnp.right_shift(keep, u(15)))
 
 
+def fp8_row_value(words, scale):
+    """An fp8 row (its words [8, H / 32] read back as fp8 [32, H / 32]) times
+    its token's scale, as bf16."""
+    fp8 = pltpu.bitcast(words, jnp.float8_e4m3fn)
+    return (fp8.astype(jnp.float32) * scale).astype(jnp.bfloat16)
+
+
+def matmul_rows(x, end, start=None):
+    """16 bf16 rows [16, H] as `gather_rows` writes them: rows ``start`` (0
+    when None) to ``end`` with the one-hot permute's bits (see
+    `_canonical_bits`), the others zeros."""
+    u = jnp.uint32
+    # uint32 sublane j packs bf16 rows 2j (low half) and 2j + 1 (high half).
+    sublane = lax.broadcasted_iota(jnp.int32, (_ROWS_PER_TILE // 2, 1), 0)
+    lo, hi = 2 * sublane, 2 * sublane + 1
+    keep_lo, keep_hi = lo < end, hi < end
+    if start is not None:
+        keep_lo = jnp.logical_and(keep_lo, start <= lo)
+        keep_hi = jnp.logical_and(keep_hi, start <= hi)
+    keep = jnp.where(keep_lo, u(0xFFFF), u(0)) | jnp.where(keep_hi, u(0xFFFF0000), u(0))
+    w = _canonical_bits(pltpu.bitcast(x, jnp.uint32)) & keep
+    return pltpu.bitcast(w, x.dtype)
+
+
 def _gather_kernel(
     sizes_ref,
     filled_ref,
@@ -179,8 +203,6 @@ def _gather_body(
         def _():
             getattr(store(t, slot, tail), op)()
 
-    u = jnp.uint32
-
     def rows_block(t, slot, c):
         base = t * tile + c * _ROWS_PER_TILE
         rows = []
@@ -190,21 +212,11 @@ def _gather_body(
             if scale_ref is None:
                 rows.append(rows_vmem[row])
             else:
-                # An fp8 row (its words read back as fp8) times its token's
-                # scale, as bf16.
-                fp8 = pltpu.bitcast(rows_vmem[row], jnp.float8_e4m3fn)
-                value = fp8.astype(jnp.float32) * scale_ref[row]
-                rows.append(value.astype(out_buf.dtype))
+                rows.append(fp8_row_value(rows_vmem[row], scale_ref[row]))
         x = jnp.stack(rows).reshape(_ROWS_PER_TILE, hidden)
-        # Rows past the gathered ones come out as zeros. uint32 sublane j packs
-        # bf16 rows 2j (low half) and 2j + 1 (high half).
-        sublane = lax.broadcasted_iota(jnp.int32, (_ROWS_PER_TILE // 2, 1), 0)
-        v = n - base
-        keep = jnp.where(2 * sublane < v, u(0xFFFF), u(0))
-        keep = keep | jnp.where(2 * sublane + 1 < v, u(0xFFFF0000), u(0))
-        w = _canonical_bits(pltpu.bitcast(x, jnp.uint32)) & keep
-        out_buf[slot, pl.ds(c * _ROWS_PER_TILE, _ROWS_PER_TILE)] = pltpu.bitcast(
-            w, out_buf.dtype
+        # Rows past the gathered ones come out as zeros.
+        out_buf[slot, pl.ds(c * _ROWS_PER_TILE, _ROWS_PER_TILE)] = matmul_rows(
+            x, n - base
         )
 
     def step(t, carry):
