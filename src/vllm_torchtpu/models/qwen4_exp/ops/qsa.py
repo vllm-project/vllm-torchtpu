@@ -25,6 +25,7 @@ import torch_tpu  # noqa: F401 - attaches torch.tpu.pallas
 # Chunk sizes bounding HBM/VMEM peak during tiled sparse attention.
 _SPARSE_TOKEN_BATCH = 64
 _SPARSE_ATTN_BATCH = 8
+_SPARSE_VERIFY_BATCH = 4
 _SPARSE_BLOCK_TILE = 4096
 
 _FP8_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
@@ -174,6 +175,7 @@ def _qsa_attention(
     scale: float,
     norm_eps: float,
     token_batch: int = _SPARSE_TOKEN_BATCH,
+    verify_batch: int = _SPARSE_VERIFY_BATCH,
     block_tile: int = _SPARSE_BLOCK_TILE,
 ) -> tuple[jax.Array, jax.Array]:
     """Plain-XLA QSA math; returns (output, updated index_pool)."""
@@ -207,6 +209,8 @@ def _qsa_attention(
     index_q = _rope(index_q, positions, cos_sin)
     request, chunk_pos, valid = _token_requests(query_start_loc, num_tokens)
     index_rows = _PagedRows(index_pool, block_tables, num_reqs)
+    if index_rows.tables.shape[1] == 0:
+        return dense_out, index_pool
 
     # Pooled key of the block ending at each position: earlier raw keys come
     # from this chunk or from the cache if the block started in an earlier step.
@@ -230,22 +234,31 @@ def _qsa_attention(
     )
     pooled = jnp.where(((positions + 1) % ratio == 0)[:, None], pooled, 0)
     # Padding tokens write into slot 0, the null block.
+    # Speculative decoding contract: any rewrite inside a compressed block must
+    # re-run that block's closing token `(pos + 1) % ratio == 0` so its pooled
+    # index key stays causally exact.
     write_slots = jnp.where(valid, index_rows.slots(request, positions), 0)
     index_pool = _write_index_rows(
         index_pool, write_slots, raw_keys, pooled, num_kv_heads
     )
+
+    total_blocks = index_rows.max_tokens // ratio
+    if total_blocks <= topk_blocks:
+        # Every query in this table fits in topk_blocks + open tail, so dense
+        # attention is already exact and sparse top_k cannot run.
+        return dense_out, index_pool
 
     sparse = valid & (((positions + 1) // ratio) > topk_blocks)
 
     def sparse_attention() -> jax.Array:
         updated_index = _PagedRows(index_pool, block_tables, num_reqs)
         main_rows = _PagedRows(main_pool, block_tables, num_reqs)
-        total_blocks = updated_index.max_tokens // ratio
         tile_size = min(max(block_tile, topk_blocks), total_blocks)
         num_tiles = math.ceil(total_blocks / tile_size)
         tile_offsets = jnp.arange(tile_size, dtype=jnp.int32)
         group = num_heads // num_kv_heads
-        k_heads = jnp.arange(num_kv_heads) * 2
+        k_heads = slice(0, 2 * num_kv_heads, 2)
+        v_heads = slice(1, 2 * num_kv_heads, 2)
         matmul_dtype = q.dtype
         inv_sqrt_d = 1.0 / math.sqrt(index_head_dim)
 
@@ -307,7 +320,7 @@ def _qsa_attention(
             keep = jnp.concatenate([jnp.ones(selected.shape, bool), tail <= pos])
             slots = main_rows.slots(req, jnp.concatenate([selected, tail]))
             k = main_rows.read(slots, k_heads, head_dim)
-            v = main_rows.read(slots, k_heads + 1, head_dim)
+            v = main_rows.read(slots, v_heads, head_dim)
             # Zero masked tail slots so uninitialized fp8 NaNs cannot poison 0 * NaN.
             k = jnp.where(
                 keep[:, None, None],
@@ -344,7 +357,10 @@ def _qsa_attention(
 
             def compute_chunk():
                 def single_req():
-                    top = topk_for_req(c_req[0], (c_pos + 1) // ratio, c_iq)
+                    # Zero visible for padded/non-sparse rows so max_visible is
+                    # never inflated by trailing padding positions.
+                    visible = jnp.where(c_sp, (c_pos + 1) // ratio, 0)
+                    top = topk_for_req(c_req[0], visible, c_iq)
                     c_out = jax.lax.map(
                         attend_one,
                         (c_req, c_pos, top, c_q),
@@ -373,8 +389,80 @@ def _qsa_attention(
                     )
                     return out
 
+                def by_req_runs():
+                    # Step a cursor across contiguous runs of the same request
+                    # inside this chunk, scoring up to `verify_batch` tokens
+                    # per request in one `topk_for_req` scan.
+                    v_batch = min(chunk_size, verify_batch)
+                    v_offs = jnp.arange(v_batch, dtype=jnp.int32)
+                    padded_out = jnp.pad(c_dout, ((0, v_batch), (0, 0), (0, 0)))
+
+                    def cond_fn(state):
+                        cursor, _ = state
+                        return cursor < chunk_size
+
+                    def body_fn(state):
+                        cursor, out_acc = state
+                        run_req = c_req[cursor]
+                        idx = jnp.minimum(cursor + v_offs, chunk_size - 1)
+                        in_bounds = (cursor + v_offs) < chunk_size
+                        same = in_bounds & (c_req[idx] == run_req)
+                        run_len = jnp.min(jnp.where(same, v_batch, v_offs))
+                        in_run = v_offs < run_len
+
+                        r_pos = c_pos[idx]
+                        r_iq = c_iq[idx]
+                        r_q = c_q[idx]
+                        r_sp = c_sp[idx] & in_run
+                        r_dout = c_dout[idx]
+
+                        def compute_run():
+                            # Zero visible for inactive/non-sparse slots so
+                            # max_visible is never inflated by a neighbor req.
+                            visible = jnp.where(r_sp, (r_pos + 1) // ratio, 0)
+                            top = topk_for_req(run_req, visible, r_iq)
+
+                            def one_slot(_, tok):
+                                pos_s, top_s, qh_s, sp_s, dout_s = tok
+                                res = jax.lax.cond(
+                                    sp_s,
+                                    lambda: attend_one(
+                                        (run_req, pos_s, top_s, qh_s)
+                                    ).astype(dense_out.dtype),
+                                    lambda: dout_s,
+                                )
+                                return None, res
+
+                            _, run_out = jax.lax.scan(
+                                one_slot, None, (r_pos, top, r_q, r_sp, r_dout)
+                            )
+                            cur_slice = jax.lax.dynamic_slice(
+                                out_acc,
+                                (cursor, 0, 0),
+                                (v_batch, num_heads, head_dim),
+                            )
+                            merged = jnp.where(r_sp[:, None, None], run_out, cur_slice)
+                            return jax.lax.dynamic_update_slice(
+                                out_acc, merged, (cursor, 0, 0)
+                            )
+
+                        new_out = jax.lax.cond(
+                            jnp.any(r_sp), compute_run, lambda: out_acc
+                        )
+                        return cursor + jnp.maximum(run_len, 1), new_out
+
+                    _, out = jax.lax.while_loop(
+                        cond_fn, body_fn, (jnp.int32(0), padded_out)
+                    )
+                    return out[:chunk_size]
+
                 same_req = jnp.all(c_req == c_req[0])
-                return jax.lax.cond(same_req, single_req, per_token)
+                has_runs = jnp.any((c_req[1:] == c_req[:-1]) & c_sp[1:] & c_sp[:-1])
+                return jax.lax.cond(
+                    same_req,
+                    single_req,
+                    lambda: jax.lax.cond(has_runs, by_req_runs, per_token),
+                )
 
             return None, jax.lax.cond(jnp.any(c_sp), compute_chunk, lambda: c_dout)
 
@@ -426,13 +514,11 @@ class _PagedRows:
         page = self.tables[request, position // self.page_tokens]
         return page * self.page_tokens + position % self.page_tokens
 
-    def read(self, slots: jax.Array, heads, dim: int) -> jax.Array:
+    def read(self, slots: jax.Array, heads: int | slice, dim: int) -> jax.Array:
         """Rows [..., (heads,) dim] at ``slots``; K of kv head h is 2h, V is 2h + 1."""
         pool = self.pool
-        rows = pool.reshape(-1, *pool.shape[2:])[slots]
-        pack = pool.shape[3]
-        heads = jnp.asarray(heads)
-        return rows[..., heads // pack, heads % pack, :dim]
+        rows = pool.reshape(-1, pool.shape[2] * pool.shape[3], pool.shape[4])[slots]
+        return rows[..., heads, :dim]
 
 
 def _write_index_rows(

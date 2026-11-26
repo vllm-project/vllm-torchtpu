@@ -105,6 +105,11 @@ class Qwen4ExpQSA(nn.Module):
                 f"QSA stores index keys in a head_dim={head_dim} cache; "
                 f"indexer_head_dim={index_head_dim} does not fit."
             )
+        if head_dim == 64:
+            raise NotImplementedError(
+                "QSA does not support head_dim=64 on TPU because K and V are "
+                "packed across lanes rather than interleaved by head."
+            )
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim

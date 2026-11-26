@@ -348,3 +348,391 @@ def test_qsa_attention_op_traces_with_symbolic_fake_tensors() -> None:
         )
         assert out.shape == (num_tokens, H, D)
         assert out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("num_req_slots", [1, 16], ids=["single_req", "padded_reqs"])
+def test_padded_request_slots_match_reference(num_req_slots: int) -> None:
+    """The runner pads query_start_loc to the request bucket and tokens to the
+    token bucket. Padded slots point at the null page and must not change the
+    real rows, for a full prefill chunk and for a padded verify window."""
+    torch.manual_seed(11)
+    n_total = 20
+    seq = {
+        "q": torch.randn(n_total, H, D),
+        "k": torch.randn(n_total, KVH, D),
+        "v": torch.randn(n_total, KVH, D),
+        "iq": torch.randn(n_total, IH, DI),
+        "raw": torch.randn(n_total, DI),
+    }
+    k_norm_weight = torch.randn(DI) * 0.1
+    cos_sin = _cos_sin(64)
+    num_pages = 1 + PAGES_PER_REQ
+    # Request 0 owns pages 1..PAGES_PER_REQ; any padded slots point at page 0.
+    tables = np.zeros((num_req_slots, PAGES_PER_REQ), dtype=np.int32)
+    tables[0] = np.arange(1, 1 + PAGES_PER_REQ, dtype=np.int32)
+    main_pool = torch.zeros(num_pages, PAGE, 2 * KVH, 1, 128)
+    _write_main(main_pool, tables, 0, list(range(n_total)), seq)
+    # A read of the null page would turn the output into NaN.
+    main_pool[0] = float("nan")
+    index_pool = jnp.zeros((num_pages, PAGE, 2 * KVH, 1, 128), jnp.float32)
+    first_sparse = (TOPK + 1) * RATIO - 1
+
+    def run_step(real_positions: list[int], index_pool):
+        pad = 16 - len(real_positions)
+        rows = real_positions
+        q = torch.cat([seq["q"][rows], torch.zeros(pad, H, D)])
+        iq = torch.cat([seq["iq"][rows], torch.zeros(pad, IH, DI)])
+        raw = torch.cat([seq["raw"][rows], torch.zeros(pad, DI)])
+        dense = torch.stack([_dense(seq, p) for p in rows] + [torch.zeros(H, D)] * pad)
+        # Padded tokens carry a large stale position.
+        positions = np.array(rows + [60] * pad, dtype=np.int32)
+        qsl = np.array([0] + [len(rows)] * num_req_slots, dtype=np.int32)
+        seq_lens = np.array([rows[-1] + 1] + [0] * (num_req_slots - 1), dtype=np.int32)
+        out, index_pool = _qsa_attention(
+            jnp.asarray(q.numpy()),
+            jnp.asarray(iq.numpy()),
+            jnp.asarray(raw.numpy()),
+            jnp.asarray(dense.numpy()),
+            jnp.asarray(positions),
+            jnp.asarray(qsl),
+            jnp.asarray(seq_lens),
+            jnp.asarray(tables.reshape(-1), jnp.int32),
+            jnp.asarray(main_pool.numpy()),
+            index_pool,
+            jnp.asarray(cos_sin.numpy()),
+            jnp.asarray(k_norm_weight.numpy()),
+            jnp.ones(2, jnp.float32),
+            **_QSA_KWARGS,
+            token_batch=16,
+        )
+        return torch.from_numpy(np.asarray(out).copy()), index_pool
+
+    with jax.default_matmul_precision("highest"):
+        # A full 16-token prefill chunk of request 0, then a 4-token verify
+        # window padded to 16 tokens.
+        prefill_out, index_pool = run_step(list(range(16)), index_pool)
+        verify_out, _ = run_step([16, 17, 18, 19], index_pool)
+
+    for p in range(first_sparse, 16):
+        expected = _reference(seq, p, k_norm_weight, cos_sin)
+        torch.testing.assert_close(prefill_out[p], expected, rtol=1e-5, atol=1e-5)
+    for i, p in enumerate(range(16, 20)):
+        expected = _reference(seq, p, k_norm_weight, cos_sin)
+        torch.testing.assert_close(verify_out[i], expected, rtol=1e-5, atol=1e-5)
+    # Padded rows keep the dense output they came in with.
+    assert torch.equal(verify_out[4:], torch.zeros(12, H, D))
+
+
+def test_qsa_rejects_head_dim_64() -> None:
+    """At head_dim=64 the TPU KV cache packs K and V of a head into one row,
+    which QSA would read as K with an all-zero V."""
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.models.qwen4_exp.layout import unfused_qkv
+    from vllm_torchtpu.models.qwen4_exp.qsa import Qwen4ExpQSA
+
+    config = SimpleNamespace(
+        indexer_kv_heads=1,
+        indexer_compress_ratio=4,
+        indexer_budget=16,
+        indexer_head_dim=64,
+        indexer_n_heads=2,
+        hidden_size=128,
+        rms_norm_eps=1e-6,
+    )
+    with pytest.raises(NotImplementedError, match="head_dim=64"):
+        Qwen4ExpQSA(
+            config,  # type: ignore[arg-type]
+            num_heads=4,
+            num_kv_heads=2,
+            head_dim=64,
+            scaling=64**-0.5,
+            qkv_layout=unfused_qkv(),
+            cache_config=None,
+            quant_config=None,
+            prefix="model.layers.0.self_attn",
+        )
+
+
+@pytest.mark.parametrize("pages_per_req", [0, 1, 2])
+def test_qsa_narrow_table_returns_dense_without_topk_crash(
+    pages_per_req: int,
+) -> None:
+    """When total_blocks <= topk_blocks (including 0), _qsa_attention returns
+    dense_out cleanly without calling lax.top_k or dividing by zero."""
+    n = 6
+    dense = jnp.arange(n * H * D, dtype=jnp.float32).reshape(n, H, D)
+    num_pages = max(1, 1 + pages_per_req)
+    pool = jnp.zeros((num_pages, PAGE, 2 * KVH, 1, 128), jnp.float32)
+    tables = jnp.arange(1, 1 + pages_per_req, dtype=jnp.int32)
+    out, _ = _qsa_attention(
+        jnp.ones((n, H, D), jnp.float32),
+        jnp.ones((n, IH, DI), jnp.float32),
+        jnp.ones((n, DI), jnp.float32),
+        dense,
+        jnp.arange(n, dtype=jnp.int32),
+        jnp.asarray([0, n], jnp.int32),
+        jnp.asarray([n], jnp.int32),
+        tables,
+        pool,
+        pool,
+        jnp.ones((64, ROTARY), jnp.float32),
+        jnp.zeros((DI,), jnp.float32),
+        jnp.ones((2,), jnp.float32),
+        **_QSA_KWARGS,
+    )
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(dense))
+
+
+@pytest.mark.parametrize("verify_batch", [4, 8])
+def test_qsa_grouped_verify_matches_per_token_on_misaligned_mixed_batch(
+    verify_batch: int,
+) -> None:
+    """Cursor-grouped verify matches verify_batch=1 within 1e-5 on random
+    non-constant inputs across misaligned decode, verify, and prefill runs."""
+    rng = np.random.default_rng(7)
+    pages_per_req = 12
+    num_reqs = 5
+    q_lens = [1, 4, 3, 4, 6]
+    hist_lens = [18, 22, 14, 25, 19]
+    num_pages = 1 + num_reqs * pages_per_req
+    tables = np.array(
+        [
+            [1 + r * pages_per_req + i for i in range(pages_per_req)]
+            for r in range(num_reqs)
+        ],
+        dtype=np.int32,
+    )
+    main_pool = jnp.asarray(
+        rng.standard_normal((num_pages, PAGE, 2 * KVH, 1, 128)).astype(np.float32)
+    )
+    index_pool = jnp.asarray(
+        rng.standard_normal((num_pages, PAGE, 2 * KVH, 1, 128)).astype(np.float32)
+    )
+    cos_sin = jnp.asarray(rng.standard_normal((64, ROTARY)).astype(np.float32))
+    k_norm = jnp.asarray(rng.standard_normal((DI,)).astype(np.float32) * 0.1)
+
+    total_real = sum(q_lens)
+    pad = 5
+    num_tokens = total_real + pad
+    qsl = np.cumsum([0] + q_lens, dtype=np.int32)
+    positions = np.concatenate(
+        [
+            np.arange(hist_lens[r], hist_lens[r] + q_lens[r], dtype=np.int32)
+            for r in range(num_reqs)
+        ]
+        + [np.zeros(pad, dtype=np.int32)]
+    )
+    seq_lens = np.array([h0 + ql for h0, ql in zip(hist_lens, q_lens)], dtype=np.int32)
+
+    q = jnp.asarray(rng.standard_normal((num_tokens, H, D)).astype(np.float32))
+    iq = jnp.asarray(rng.standard_normal((num_tokens, IH, DI)).astype(np.float32))
+    rk = jnp.asarray(rng.standard_normal((num_tokens, DI)).astype(np.float32))
+    dense = jnp.asarray(rng.standard_normal((num_tokens, H, D)).astype(np.float32))
+
+    common = dict(**_QSA_KWARGS, token_batch=16, block_tile=4)
+    with jax.default_matmul_precision("highest"):
+        out_ref, pool_ref = _qsa_attention(
+            q,
+            iq,
+            rk,
+            dense,
+            jnp.asarray(positions),
+            jnp.asarray(qsl),
+            jnp.asarray(seq_lens),
+            jnp.asarray(tables.reshape(-1)),
+            main_pool,
+            index_pool,
+            cos_sin,
+            k_norm,
+            jnp.ones(2, jnp.float32),
+            verify_batch=1,
+            **common,
+        )
+        out_grp, pool_grp = _qsa_attention(
+            q,
+            iq,
+            rk,
+            dense,
+            jnp.asarray(positions),
+            jnp.asarray(qsl),
+            jnp.asarray(seq_lens),
+            jnp.asarray(tables.reshape(-1)),
+            main_pool,
+            index_pool,
+            cos_sin,
+            k_norm,
+            jnp.ones(2, jnp.float32),
+            verify_batch=verify_batch,
+            **common,
+        )
+    np.testing.assert_allclose(
+        np.asarray(out_grp), np.asarray(out_ref), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_array_equal(np.asarray(pool_grp), np.asarray(pool_ref))
+
+
+def test_qsa_multi_req_one_token_decode_matches_reference() -> None:
+    """Multi-request 1-token decode takes the M=1 per_token path (has_runs=False)
+    and matches the HF reference math."""
+    torch.manual_seed(19)
+    num_reqs = 5
+    prefill_lens = [15, 19, 13, 21, 17]
+    seqs = [
+        {
+            "q": torch.randn(n + 1, H, D),
+            "k": torch.randn(n + 1, KVH, D),
+            "v": torch.randn(n + 1, KVH, D),
+            "iq": torch.randn(n + 1, IH, DI),
+            "raw": torch.randn(n + 1, DI),
+        }
+        for n in prefill_lens
+    ]
+    k_norm_weight = torch.randn(DI) * 0.1
+    cos_sin = _cos_sin(64)
+    num_pages = 1 + num_reqs * PAGES_PER_REQ
+    tables = torch.tensor(
+        [
+            [1 + r * PAGES_PER_REQ + i for i in range(PAGES_PER_REQ)]
+            for r in range(num_reqs)
+        ],
+        dtype=torch.int32,
+    )
+    main_pool = torch.zeros(num_pages, PAGE, 2 * KVH, 1, 128)
+    index_pool = jnp.zeros((num_pages, PAGE, 2 * KVH, 1, 128), jnp.float32)
+
+    with jax.default_matmul_precision("highest"):
+        # Step 1: Prefill all 5 requests.
+        flat_pre = [(r, p) for r, n in enumerate(prefill_lens) for p in range(n)]
+        for r, n in enumerate(prefill_lens):
+            _write_main(main_pool, tables, r, list(range(n)), seqs[r])
+        qsl_pre = np.cumsum([0] + prefill_lens, dtype=np.int32)
+        _, index_pool = _qsa_attention(
+            jnp.asarray(torch.stack([seqs[r]["q"][p] for r, p in flat_pre]).numpy()),
+            jnp.asarray(torch.stack([seqs[r]["iq"][p] for r, p in flat_pre]).numpy()),
+            jnp.asarray(torch.stack([seqs[r]["raw"][p] for r, p in flat_pre]).numpy()),
+            jnp.zeros((len(flat_pre), H, D), jnp.float32),
+            jnp.asarray([p for _, p in flat_pre], jnp.int32),
+            jnp.asarray(qsl_pre, jnp.int32),
+            jnp.asarray(prefill_lens, jnp.int32),
+            jnp.asarray(tables.reshape(-1).numpy(), jnp.int32),
+            jnp.asarray(main_pool.numpy()),
+            index_pool,
+            jnp.asarray(cos_sin.numpy()),
+            jnp.asarray(k_norm_weight.numpy()),
+            jnp.ones(2, jnp.float32),
+            **_QSA_KWARGS,
+            token_batch=16,
+            block_tile=4,
+        )
+
+        # Step 2: 1-token decode per request padded to 8 tokens (has_runs=False).
+        pad = 3
+        for r, n in enumerate(prefill_lens):
+            _write_main(main_pool, tables, r, [n], seqs[r])
+        q_dec = torch.stack(
+            [seqs[r]["q"][n] for r, n in enumerate(prefill_lens)]
+            + [torch.zeros(H, D)] * pad
+        )
+        iq_dec = torch.stack(
+            [seqs[r]["iq"][n] for r, n in enumerate(prefill_lens)]
+            + [torch.zeros(IH, DI)] * pad
+        )
+        raw_dec = torch.stack(
+            [seqs[r]["raw"][n] for r, n in enumerate(prefill_lens)]
+            + [torch.zeros(DI)] * pad
+        )
+        dense_dec = torch.stack(
+            [_dense(seqs[r], n) for r, n in enumerate(prefill_lens)]
+            + [torch.zeros(H, D)] * pad
+        )
+        out_dec, _ = _qsa_attention(
+            jnp.asarray(q_dec.numpy()),
+            jnp.asarray(iq_dec.numpy()),
+            jnp.asarray(raw_dec.numpy()),
+            jnp.asarray(dense_dec.numpy()),
+            jnp.asarray(prefill_lens + [0] * pad, jnp.int32),
+            jnp.asarray(list(range(num_reqs + 1)), jnp.int32),
+            jnp.asarray([n + 1 for n in prefill_lens], jnp.int32),
+            jnp.asarray(tables.reshape(-1).numpy(), jnp.int32),
+            jnp.asarray(main_pool.numpy()),
+            index_pool,
+            jnp.asarray(cos_sin.numpy()),
+            jnp.asarray(k_norm_weight.numpy()),
+            jnp.ones(2, jnp.float32),
+            **_QSA_KWARGS,
+            token_batch=16,
+            block_tile=4,
+        )
+    out_t = torch.from_numpy(np.asarray(out_dec).copy())
+    for r, n in enumerate(prefill_lens):
+        expected = _reference(seqs[r], n, k_norm_weight, cos_sin)
+        torch.testing.assert_close(out_t[r], expected, rtol=1e-5, atol=1e-5)
+
+
+def test_qsa_position_rewind_rewrites_compressed_block_boundary() -> None:
+    """Rewriting speculative draft positions across a compressed-block closing
+    boundary `(pos + 1) % ratio == 0` replaces the pooled index key so later
+    sparse queries match the accepted sequence."""
+    torch.manual_seed(23)
+    n_total = 20
+    seq = {
+        "q": torch.randn(n_total, H, D),
+        "k": torch.randn(n_total, KVH, D),
+        "v": torch.randn(n_total, KVH, D),
+        "iq": torch.randn(n_total, IH, DI),
+        "raw": torch.randn(n_total, DI),
+    }
+    k_norm_weight = torch.randn(DI) * 0.1
+    cos_sin = _cos_sin(64)
+    num_pages = 1 + PAGES_PER_REQ
+    tables = torch.arange(1, num_pages, dtype=torch.int32)[None]
+    main_pool = torch.zeros(num_pages, PAGE, 2 * KVH, 1, 128)
+    index_pool = jnp.zeros((num_pages, PAGE, 2 * KVH, 1, 128), jnp.float32)
+
+    def run_positions(
+        pos_list: list[int],
+        cur_seq: dict[str, torch.Tensor],
+        cur_index_pool: jax.Array,
+    ):
+        _write_main(main_pool, tables, 0, pos_list, cur_seq)
+        out, cur_index_pool = _qsa_attention(
+            jnp.asarray(cur_seq["q"][pos_list].numpy()),
+            jnp.asarray(cur_seq["iq"][pos_list].numpy()),
+            jnp.asarray(cur_seq["raw"][pos_list].numpy()),
+            jnp.asarray(torch.stack([_dense(cur_seq, p) for p in pos_list]).numpy()),
+            jnp.asarray(pos_list, jnp.int32),
+            jnp.asarray([0, len(pos_list)], jnp.int32),
+            jnp.asarray([pos_list[-1] + 1], jnp.int32),
+            jnp.asarray(tables.reshape(-1).numpy(), jnp.int32),
+            jnp.asarray(main_pool.numpy()),
+            cur_index_pool,
+            jnp.asarray(cos_sin.numpy()),
+            jnp.asarray(k_norm_weight.numpy()),
+            jnp.ones(2, jnp.float32),
+            **_QSA_KWARGS,
+            token_batch=16,
+            block_tile=4,
+        )
+        return torch.from_numpy(np.asarray(out).copy()), cur_index_pool
+
+    # Bogus speculative draft tokens at positions 14..16 crossing block 3's
+    # closing boundary at pos=15 ((15 + 1) % 4 == 0).
+    bogus_seq = {k: v.clone() for k, v in seq.items()}
+    bogus_seq["k"][14:17] = 5.0
+    bogus_seq["v"][14:17] = -5.0
+    bogus_seq["raw"][14:17] = 10.0
+
+    with jax.default_matmul_precision("highest"):
+        _, index_pool = run_positions(list(range(14)), seq, index_pool)
+        _, index_pool = run_positions([14, 15, 16], bogus_seq, index_pool)
+        # Rewind to pos 14 and overwrite [14, 15, 16, 17] with accepted tokens.
+        out_rewound, index_pool = run_positions([14, 15, 16, 17], seq, index_pool)
+        out_next, _ = run_positions([18, 19], seq, index_pool)
+
+    for i, p in enumerate([14, 15, 16, 17]):
+        expected = _reference(seq, p, k_norm_weight, cos_sin)
+        torch.testing.assert_close(out_rewound[i], expected, rtol=1e-5, atol=1e-5)
+    for i, p in enumerate([18, 19]):
+        expected = _reference(seq, p, k_norm_weight, cos_sin)
+        torch.testing.assert_close(out_next[i], expected, rtol=1e-5, atol=1e-5)
