@@ -141,6 +141,34 @@ def pp_mtp_prefill_kv_only(vllm_config: Any) -> bool:
     )
 
 
+def patch_engine_core_for_pp_mtp_prefill_kv(vllm_config: Any) -> None:
+    """Stop the engine core asking the workers for drafts after every step.
+
+    Without async scheduling, EngineCore.post_step calls
+    take_draft_token_ids, a blocking collective RPC that queues behind the
+    step on the last stage: the engine waits for each batch to leave the
+    pipeline before it schedules the next, so the stages never overlap. Here
+    the drafter runs for its KV only and returns no drafts, so there is
+    nothing to ask for. Installed from the platform's config check and the
+    engine-core process entry point; idempotent.
+    """
+    if vllm_config is None or not pp_mtp_prefill_kv_only(vllm_config):
+        return
+    from vllm.v1.engine.core import EngineCore
+
+    if getattr(EngineCore, "_tpu_pp_mtp_kv_patch", False):
+        return
+    orig_init = EngineCore.__init__
+
+    def __init__(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        if pp_mtp_prefill_kv_only(self.vllm_config):
+            self.check_for_draft_tokens = False
+
+    EngineCore.__init__ = __init__
+    EngineCore._tpu_pp_mtp_kv_patch = True
+
+
 def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     """Reject configurations the TPU pipeline-parallel path does not serve.
 
