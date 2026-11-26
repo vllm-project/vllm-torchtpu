@@ -211,3 +211,59 @@ def test_model_side_shared_matches_routed_op_side(monkeypatch):
     moe, routed, calls = _layer(monkeypatch, skip_final_all_reduce=False)
     moe(x)
     assert calls[-1].get("shared") is not None
+
+
+def _forward_pieces(moe, pieces):
+    """SP steps hand the MoE a list of gathered e4m3 row pieces
+    (TPU_MINIMAX_M3_SP_FFN_PIECES)."""
+
+    def fwd(x):
+        if x.shape[0] < SP_MIN:
+            return moe(x)
+        scale = x.float().abs().amax(-1, keepdim=True).clamp(min=1e-6) / 448
+        q = (x.float() / scale).to(E4M3)
+        return moe(list(zip(q.chunk(pieces), scale.chunk(pieces))))
+
+    return fwd
+
+
+@pytest.mark.parametrize("pieces", [1, 2])
+def test_row_pieces_reach_the_routed_op(monkeypatch, pieces):
+    """The SHARED_ROWS producer: with SP row pieces, an armed layer hands the
+    routed op SHARED_ROWS_PIECES e4m3 pieces (a lone list piece stays one
+    block); every bucket keeps one signature, and the attribute is cleared."""
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SP_E4M3_SHARED", True)
+    monkeypatch.setattr(envs, "TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS", 0)
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SHARED_IN_COMBINE", False)
+    moe, routed, calls = _layer(monkeypatch)
+    sigs = {}
+    for tokens in BUCKETS:
+        calls.clear()
+        sigs[tokens] = _signatures(_forward_pieces(moe, pieces), tokens)
+        assert len(calls) == 1
+        rows = calls[0].get("shared_rows")
+        if tokens < SP_MIN:
+            assert rows is None
+        else:
+            assert len(rows) == (2 if pieces == 2 else 1)
+        assert getattr(routed, dfs.SHARED_ROWS_ATTR) is None
+    sp = [s for t, s in sigs.items() if t >= SP_MIN]
+    assert all(s == sp[0] for s in sp)
+    small = [s for t, s in sigs.items() if t < SP_MIN]
+    assert all(s == small[0] for s in small)
+
+
+def test_two_pieces_match_one_block(monkeypatch):
+    """The two pieces carry the same rows, in order, as the joined block."""
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_SP_E4M3_SHARED", True)
+    monkeypatch.setattr(envs, "TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS", 0)
+    moe, routed, calls = _layer(monkeypatch)
+    x = torch.randn(SP_MIN, H).to(BF16)
+    scale = x.float().abs().amax(-1, keepdim=True).clamp(min=1e-6) / 448
+    q = (x.float() / scale).to(E4M3)
+    out_block = moe((q, scale))
+    out_pieces = moe(list(zip(q.chunk(2), scale.chunk(2))))
+    torch.testing.assert_close(out_pieces, out_block, rtol=0, atol=0)
+    (q0, s0), (q1, s1) = calls[-1]["shared_rows"]
+    assert torch.equal(torch.cat([q0, q1]).float(), q.float())
+    assert torch.equal(torch.cat([s0, s1]), scale)
