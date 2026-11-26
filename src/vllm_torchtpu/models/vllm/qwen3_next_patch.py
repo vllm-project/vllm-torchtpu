@@ -123,6 +123,22 @@ def patched_decoder_layer_forward(
     return hidden_states, residual
 
 
+def all_gather_sharded_stream(
+    hidden_states: torch.Tensor,
+    aux_hidden_states: list[torch.Tensor],
+    num_tokens: int,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
+    """All-gather a TP-sharded output and its sharded aux captures together."""
+    if not aux_hidden_states:
+        hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+        return hidden_states.narrow(0, 0, num_tokens), []
+    hidden_size = hidden_states.shape[-1]
+    stacked = torch.cat([hidden_states, *aux_hidden_states], dim=-1)
+    stacked = tensor_model_parallel_all_gather(stacked, 0)
+    hidden_states, *aux = stacked.narrow(0, 0, num_tokens).split(hidden_size, dim=-1)
+    return hidden_states, list(aux)
+
+
 def patched_model_forward(
     self,
     input_ids: torch.Tensor | None,
@@ -172,15 +188,9 @@ def patched_model_forward(
         )
     hidden_states, _ = self.norm(hidden_states, residual)
     if self.use_sequence_parallel:
-        if aux_hidden_states:
-            hidden_size = hidden_states.shape[-1]
-            hidden_states = torch.cat([hidden_states, *aux_hidden_states], dim=-1)
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-            hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
-            hidden_states, *aux_hidden_states = hidden_states.split(hidden_size, dim=-1)
-        else:
-            hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
-            hidden_states = hidden_states.narrow(0, 0, full_num_tokens)
+        hidden_states, aux_hidden_states = all_gather_sharded_stream(
+            hidden_states, aux_hidden_states, full_num_tokens
+        )
     if aux_hidden_states:
         return hidden_states, aux_hidden_states
     return hidden_states

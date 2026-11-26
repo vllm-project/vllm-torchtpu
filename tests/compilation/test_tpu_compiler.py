@@ -28,6 +28,8 @@ from tests.compilation.test_graph_fingerprint import (
     _trace_all_reduce_graph,
     install_group_stand_ins,
 )
+from vllm_torchtpu.compilation import tpu_compiler as tpu_compiler_module
+from vllm_torchtpu.compilation.tpu_compiler import _iter_runtime_cache_key_files
 from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
 
 
@@ -390,6 +392,18 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/kernels/pool_adapters.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+        } <= hashed
+
+    def test_runtime_hash_covers_trace2_overlap_helpers(self) -> None:
+        """Hash modules only inlined on Trace 2 of Qwen3.5 overlap warmup."""
+        source_root = Path(tpu_compiler_module.__file__).resolve().parents[2]
+        hashed = {
+            path.relative_to(source_root).as_posix()
+            for path in _iter_runtime_cache_key_files(source_root)
+        }
+        assert {
+            "vllm_torchtpu/distributed/collectives.py",
+            "vllm_torchtpu/models/vllm/qwen3_next_patch.py",
         } <= hashed
 
     def test_runtime_hash_excluded_kernels_stay_omni_only(self):

@@ -297,6 +297,7 @@ def test_forward_matches_upstream(
     def worker(rank: int) -> None:
         try:
             rank_layer = SimpleNamespace()
+            rank_layer.uses_sharded_residual = False
             rank_layer.input_layernorm = input_norm
             rank_layer.post_attention_layernorm = post_norm
             rank_layer.layer_type = layer_type
@@ -387,6 +388,7 @@ def test_overlap_disabled_when_compiling_outside_shape_variants_warmup(
 
     d = 16
     layer = SimpleNamespace(
+        uses_sharded_residual=False,
         input_layernorm=_CpuRMSNorm(d),
         post_attention_layernorm=_CpuRMSNorm(d),
         layer_type="full_attention",
@@ -475,6 +477,7 @@ def test_overlap_forward_collective_schedule_by_token_regime(
     )
     norm = _CpuRMSNorm(d).to(torch.bfloat16)
     layer = SimpleNamespace(
+        uses_sharded_residual=False,
         input_layernorm=norm,
         post_attention_layernorm=norm,
         layer_type="full_attention",
@@ -528,6 +531,7 @@ def test_overlap_forward_narrows_padded_all_gather(
     seen_shapes: list[tuple[torch.Size, torch.Size]] = []
     d = 16
     layer = SimpleNamespace(
+        uses_sharded_residual=False,
         input_layernorm=_CpuRMSNorm(d),
         post_attention_layernorm=_CpuRMSNorm(d),
         layer_type="full_attention",
