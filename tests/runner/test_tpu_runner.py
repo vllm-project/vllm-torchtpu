@@ -3170,7 +3170,6 @@ def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
     """Uniform noise `u` in float32 preserves the upper Gumbel tail above the
     bfloat16 ceiling (-log(-log(1 - 2^-7)) ~= 4.85) when logits are bfloat16."""
     runner = SimpleNamespace()
-    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
     sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
 
     logits = torch.tensor([[6.0, 0.0]], dtype=torch.bfloat16)
@@ -3236,25 +3235,26 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
     assert seen_u_dtypes == [torch.float32] * 3
     seen_u_dtypes.clear()
 
-    # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
+    # 2. _sample_spec_verify_chunk (bonus_u, accept_u and recover_u)
     seen_recover_dtypes: list[torch.dtype] = []
 
-    def fake_rejection_sampler(**kwargs):
-        seen_recover_dtypes.append(kwargs["recover_u"].dtype)
+    def fake_sample_and_verify(*args):
+        bonus_u, accept_u, recover_u = args[-3:]
+        seen_u_dtypes.append(bonus_u.dtype)
+        seen_recover_dtypes.extend((accept_u.dtype, recover_u.dtype))
         return torch.zeros((2, 2), dtype=torch.int32)
 
     spec_runner = SimpleNamespace(
-        spec_gather_bonus_and_target_logits=lambda logits, b_idx, t_idx: (
-            bf16_logits,
-            bf16_logits,
+        _build_padded_sampling_params=(
+            lambda start, end, logits, padded_num_reqs=None: sampling_params
         ),
-        _build_padded_sampling_params=lambda start, end, logits: sampling_params,
         _sampler_topk_candidates=lambda start, end, grammar: 0,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
-    spec_runner.rejection_sampler = MagicMock(side_effect=fake_rejection_sampler)
-    spec_runner.rejection_sampler.synthetic_mode = False
+    spec_runner.rejection_sampler = SimpleNamespace(
+        synthetic_mode=False, sample_and_verify=fake_sample_and_verify
+    )
     md = SimpleNamespace(
         bonus_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
         target_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
@@ -3275,7 +3275,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         sampling_generator=None,
     )
     assert seen_u_dtypes == [torch.float32]
-    assert seen_recover_dtypes == [torch.float32]
+    assert seen_recover_dtypes == [torch.float32] * 2
     seen_u_dtypes.clear()
 
     # 3 & 4. sample_tokens (both non-speculative and speculative non-verify chunk)

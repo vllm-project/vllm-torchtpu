@@ -31,6 +31,33 @@ PLACEHOLDER_TOKEN_ID = -1
 # logits into a one-hot at argmax -> deterministic accept/recover for free
 # (mirrors JAX tpu-inference's `logits /= (temperatures + 1e-9)`).
 TEMPERATURE_EPS = 1e-9
+# Rows whose temperature is at or below this sample greedily.
+SAMPLING_EPS = 1e-5
+
+
+def gumbel_sample(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    u: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+) -> torch.Tensor:
+    """Sample one token per row by Gumbel-max on the shaped logits.
+
+    ``u`` holds one uniform draw per logit; rows at temperature
+    <= SAMPLING_EPS take the plain argmax. Returns [rows, 1].
+    """
+    is_greedy = temperatures <= SAMPLING_EPS
+    safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
+    scaled_logits = logits / safe_temperatures
+    masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
+    u_clamped = torch.clamp(
+        u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
+    )
+    gumbel_noise = -torch.log(-torch.log(u_clamped))
+    noisy_logits = masked_logits + gumbel_noise
+    final_logits = torch.where(is_greedy, logits, noisy_logits)
+    return torch.argmax(final_logits, dim=-1, keepdim=True)
 
 
 class RejectionSampler:
@@ -223,6 +250,50 @@ class RejectionSampler:
             group_indices,
             max_draft_tokens,
             accept_u,
+            self.synthetic_conditional_rates,
+            self.synthetic_mode,
+        )
+
+    def sample_and_verify(
+        self,
+        logits: torch.Tensor,
+        bonus_indices: torch.Tensor,
+        target_indices: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        num_draft_tokens: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        max_draft_tokens: int,
+        temperatures: torch.Tensor,
+        top_k: torch.Tensor | None,
+        top_p: torch.Tensor | None,
+        bonus_u: torch.Tensor,
+        accept_u: torch.Tensor,
+        recover_u: torch.Tensor,
+    ) -> torch.Tensor:
+        """Non-greedy verify of one chunk as a single compiled program.
+
+        Gathers the bonus and target rows of ``logits``, samples the bonus
+        tokens (``gumbel_sample``) and runs the random rejection sampler.
+        ``temperatures``, ``top_k`` and ``top_p`` are per request
+        ([padded_num_reqs, 1]); the uniform draws come from the caller, so
+        the random stream is the caller's.
+        """
+        return _sample_and_random_rejection(
+            logits,
+            bonus_indices,
+            target_indices,
+            draft_token_ids,
+            num_draft_tokens,
+            segment_ids,
+            group_indices,
+            max_draft_tokens,
+            temperatures,
+            top_k,
+            top_p,
+            bonus_u,
+            accept_u,
+            recover_u,
             self.synthetic_conditional_rates,
             self.synthetic_mode,
         )
@@ -630,3 +701,45 @@ def _random_rejection_sample_with_segment(
     selected_tokens[batch_range, accepted_count] = bonus_token_at_accepted_count
 
     return selected_tokens[:batch_size]
+
+
+@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+def _sample_and_random_rejection(
+    logits: torch.Tensor,
+    bonus_indices: torch.Tensor,
+    target_indices: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    num_draft_tokens: torch.Tensor,
+    segment_ids: torch.Tensor,
+    group_indices: torch.Tensor,
+    max_draft_tokens: int,
+    temperatures: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    bonus_u: torch.Tensor,
+    accept_u: torch.Tensor,
+    recover_u: torch.Tensor,
+    synthetic_conditional_rates: torch.Tensor | None,
+    synthetic_mode: bool,
+) -> torch.Tensor:
+    bonus_logits = torch.index_select(logits, 0, bonus_indices)
+    target_logits = torch.index_select(logits, 0, target_indices)
+    bonus_token_ids = gumbel_sample(
+        bonus_logits, temperatures, bonus_u, top_k, top_p
+    ).view(-1)
+    return _random_rejection_sample_with_segment(
+        draft_token_ids,
+        target_logits,
+        num_draft_tokens,
+        bonus_token_ids,
+        segment_ids,
+        group_indices,
+        max_draft_tokens,
+        temperatures[segment_ids],
+        None if top_k is None else top_k[segment_ids],
+        None if top_p is None else top_p[segment_ids],
+        accept_u,
+        recover_u,
+        synthetic_conditional_rates,
+        synthetic_mode,
+    )

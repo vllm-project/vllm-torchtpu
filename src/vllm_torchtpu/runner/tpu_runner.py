@@ -108,8 +108,10 @@ from vllm_torchtpu.layers.adapter.sample.fused_greedy_head import (
     FusedGreedyHead,
     GreedyTokenIds,
 )
-from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
-from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
+from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
+    RejectionSampler,
+    gumbel_sample,
+)
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
@@ -472,7 +474,6 @@ def _build_kv_connector_output(
 
 # Smallest output size
 MIN_NUM_SEQS = 8
-SAMPLING_EPS = 1e-5
 # (greedy, top_p) of the synthetic spec-decode warmup requests: one per
 # verify+sample program family (greedy, random, random with top-k/top-p).
 _SPEC_WARMUP_SAMPLING = ((True, 1.0), (False, 1.0), (False, 0.9))
@@ -4539,7 +4540,50 @@ class TPUModelRunner(GPUModelRunner):
                 max_draft_tokens=self.speculative_config.num_speculative_tokens,
                 accept_u=accept_u,
             )
+        elif grammar_output is None:
+            assert isinstance(logits, torch.Tensor)
+            assert self.rejection_sampler is not None
+            assert self.speculative_config is not None
+            req_temperatures, req_top_k, req_top_p = self._build_padded_sampling_params(
+                cur_start_idx,
+                cur_end_idx,
+                logits,
+                padded_num_reqs=md.bonus_logits_indices.shape[0],
+            )
+            # Same draws, in the same order, as the unfused path below.
+            vocab = logits.shape[-1]
+            bonus_u, accept_u, recover_u = (
+                torch.rand(
+                    shape,
+                    dtype=torch.float32,
+                    device=logits.device,
+                    generator=sampling_generator,
+                )
+                for shape in (
+                    (md.bonus_logits_indices.shape[0], vocab),
+                    md.draft_token_ids.shape,
+                    (md.target_logits_indices.shape[0], vocab),
+                )
+            )
+            return self.rejection_sampler.sample_and_verify(
+                logits,
+                md.bonus_logits_indices,
+                md.target_logits_indices,
+                md.draft_token_ids,
+                md.draft_lengths,
+                md.segment_ids,
+                md.group_indices,
+                self.speculative_config.num_speculative_tokens,
+                req_temperatures,
+                req_top_k,
+                req_top_p,
+                bonus_u,
+                accept_u,
+                recover_u,
+            )
         else:
+            # Grammar-masked chunks: the masks apply between the gather and the
+            # samplers, so they keep the separate programs.
             assert isinstance(logits, torch.Tensor)
             bonus_logits, target_logits = self.spec_gather_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
@@ -6398,6 +6442,46 @@ class TPUModelRunner(GPUModelRunner):
                             do_sampling=True,
                         )
                         synchronize_tensors(out)
+                    # The single-program non-greedy verify (no grammar), whose
+                    # sampling params are per request.
+                    logger.info(
+                        "Rejection warmup: stage=sample_and_verify rows=%d reqs=%d",
+                        num_tokens,
+                        num_reqs,
+                    )
+                    warm_req_temps = torch.zeros(
+                        (num_reqs, 1), dtype=self._hidden_states_dtype
+                    ).to(self.device)
+                    warm_req_top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(
+                        self.device
+                    )
+                    warm_req_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
+                        self.device
+                    )
+                    warm_bonus_u = torch.zeros(
+                        (num_reqs, self.vocab_size), dtype=torch.float32
+                    ).to(self.device)
+                    for top_k, top_p in [
+                        (warm_req_top_k, warm_req_top_p),
+                        (None, None),
+                    ]:
+                        out = self.rejection_sampler.sample_and_verify(
+                            dummy_logits,
+                            bonus_logits_indices,
+                            target_logits_indices,
+                            draft_token_ids,
+                            draft_lengths,
+                            segment_ids,
+                            group_indices,
+                            k,
+                            warm_req_temps,
+                            top_k,
+                            top_p,
+                            warm_bonus_u,
+                            warm_accept_u,
+                            warm_recover_u,
+                        )
+                        synchronize_tensors(out)
                     logger.info(
                         "  -- padded_logits_length: %d, num_seqs: %d",
                         num_tokens,
@@ -7560,10 +7644,13 @@ class TPUModelRunner(GPUModelRunner):
         cur_start_idx: int,
         cur_end_idx: int,
         logits: torch.Tensor,
+        padded_num_reqs: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        # Stage [padded_num_reqs] on CPU with neutral padding, then use one
-        # fixed-shape H2D copy per tensor to keep decode shape-stable.
-        padded_num_reqs = logits.shape[0]
+        # Stage [padded_num_reqs] (default: one per logits row) on CPU with
+        # neutral padding, then use one fixed-shape H2D copy per tensor to keep
+        # decode shape-stable. ``logits`` gives the dtype and device.
+        if padded_num_reqs is None:
+            padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
         temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
@@ -7730,12 +7817,6 @@ class TPUModelRunner(GPUModelRunner):
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits
 
-    def _apply_temperature(
-        self, logits: torch.Tensor, temperatures: torch.Tensor
-    ) -> torch.Tensor:
-        safe_temperatures = torch.where(temperatures == 0.0, 1.0, temperatures)
-        return logits / safe_temperatures
-
     # TODO: Under SPMD mode, sample_from_logits has correctness issue.
     #       Re-enable the torch.compile once the issue is fixed in torchxla.
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -7754,16 +7835,7 @@ class TPUModelRunner(GPUModelRunner):
         """
         if all_greedy:
             return torch.argmax(logits, dim=-1, keepdim=True)
-        is_greedy = temperatures <= SAMPLING_EPS
-        scaled_logits = self._apply_temperature(logits, temperatures)
-        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p)
-        u_clamped = torch.clamp(
-            u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
-        )
-        gumbel_noise = -torch.log(-torch.log(u_clamped))
-        noisy_logits = masked_logits + gumbel_noise
-        final_logits = torch.where(is_greedy, logits, noisy_logits)
-        return torch.argmax(final_logits, dim=-1, keepdim=True)
+        return gumbel_sample(logits, temperatures, u, top_k, top_p)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def spec_logprob_row_tokens(

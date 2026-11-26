@@ -23,6 +23,7 @@ import torch._dynamo
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import (
     PLACEHOLDER_TOKEN_ID,
     RejectionSampler,
+    gumbel_sample,
 )
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     MASKED_LOGIT_VALUE,
@@ -885,4 +886,76 @@ def test_greedy_token_ids_match_logits_path(device, synthetic, edge):
     )
     assert torch.equal(bonus_ids.cpu(), bonus_reference.cpu())
     assert torch.equal(target_ids.cpu(), torch.argmax(gathered, dim=-1).cpu())
+    assert torch.equal(actual.cpu(), expected.cpu())
+
+
+@pytest.mark.parametrize("synthetic", [False, True])
+@pytest.mark.parametrize("filtered", [False, True])
+def test_sample_and_verify_matches_unfused_path(device, synthetic, filtered):
+    """The single-program non-greedy verify returns what the gather, the bonus
+    sampler and the random rejection sampler return as separate calls."""
+    sampler = (
+        _synthetic_sampler([0.9, 0.6, 0.3], device) if synthetic else RejectionSampler()
+    )
+    gen = torch.Generator().manual_seed(7)
+    vocab = 64
+    logits = torch.randn((12, vocab), generator=gen).to(device)
+    # 3 requests padded to 4; request 1 has no drafts, the last slot is padding
+    # with the num_reqs sentinel segment.
+    target_indices = torch.tensor([0, 1, 2, 6, 7, 9, 10], dtype=torch.int32).to(device)
+    bonus_indices = torch.tensor([3, 5, 8, 11], dtype=torch.int32).to(device)
+    num_drafts = torch.tensor([3, 0, 3, 0], dtype=torch.int32).to(device)
+    segments = torch.tensor([0, 0, 0, 2, 2, 2, 3], dtype=torch.int64).to(device)
+    groups = torch.tensor([0, 1, 2, 0, 1, 2, 0], dtype=torch.int32).to(device)
+    gathered = torch.index_select(logits, 0, target_indices)
+    drafts = torch.argmax(gathered, dim=-1).to(torch.int32)
+    drafts[1] = (drafts[1] + 1) % vocab
+    drafts[-1] = PLACEHOLDER_TOKEN_ID
+    temperatures = torch.tensor([[0.7], [1.0], [0.0], [1.0]]).to(device)
+    top_k = top_p = None
+    if filtered:
+        top_k = torch.tensor([[5], [0], [0], [0]], dtype=torch.int32).to(device)
+        top_p = torch.tensor([[1.0], [0.9], [1.0], [1.0]]).to(device)
+    bonus_u = torch.rand((4, vocab), generator=gen).to(device)
+    accept_u = torch.rand((7,), generator=gen).to(device)
+    recover_u = torch.rand((7, vocab), generator=gen).to(device)
+
+    bonus = gumbel_sample(
+        torch.index_select(logits, 0, bonus_indices),
+        temperatures,
+        bonus_u,
+        top_k,
+        top_p,
+    ).view(-1)
+    expected = sampler(
+        draft_token_ids=drafts,
+        num_draft_tokens=num_drafts,
+        target_logits=gathered,
+        bonus_token_ids=bonus,
+        segment_ids=segments,
+        group_indices=groups,
+        max_draft_tokens=3,
+        temperatures=temperatures[segments],
+        top_k=None if top_k is None else top_k[segments],
+        top_p=None if top_p is None else top_p[segments],
+        accept_u=accept_u,
+        recover_u=recover_u,
+        do_sampling=True,
+    )
+    actual = sampler.sample_and_verify(
+        logits,
+        bonus_indices,
+        target_indices,
+        drafts,
+        num_drafts,
+        segments,
+        groups,
+        3,
+        temperatures,
+        top_k,
+        top_p,
+        bonus_u,
+        accept_u,
+        recover_u,
+    )
     assert torch.equal(actual.cpu(), expected.cpu())
