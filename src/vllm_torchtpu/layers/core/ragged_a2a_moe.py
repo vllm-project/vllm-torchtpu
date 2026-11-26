@@ -2068,6 +2068,10 @@ def ragged_a2a_moe_local(
             skip_padded=skip_padded_tokens,
             recv_rows=routes,
         )
+        # Whole-group buffers never overflow, and the SparseCore path reads
+        # nothing else of the exchange plan: without this XLA would still run
+        # exchange_plan (~2.7 us) on the critical path for this constant.
+        overflow = jnp.zeros((), jnp.bool_)
     out = _capacity_exchange(
         x,
         w1,
