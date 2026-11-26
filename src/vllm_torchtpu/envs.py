@@ -345,6 +345,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_KV4_SHARED_SCALES: bool = False
     TPU_SPEC_VERIFY_COARSE_PAD: bool = False
     TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES: bool = False
+    TPU_SKIP_DEVICE_SAMPLING_METADATA: bool = False
     TPU_MINIMAX_M3_KV4_INDEXER_LARGE_BLOCK_Q: int = 0
 
 
@@ -2341,6 +2342,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # program mid-serving. Rows past num_reqs are never read; same values.
     "TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES": env_bool(
         "TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES", default=False
+    ),
+    # Never rebuild upstream InputBatch.sampling_metadata after the first
+    # batch: the TPU samplers read the CPU sampling tensors, and each rebuild
+    # uploads temperature/top_p/top_k (an online compile per request count,
+    # H2D copies queued behind KV-offload loads). Supersedes
+    # TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES. Exact (same tokens).
+    "TPU_SKIP_DEVICE_SAMPLING_METADATA": env_bool(
+        "TPU_SKIP_DEVICE_SAMPLING_METADATA", default=False
     ),
     # MiniMax M3 4-bit index caches (--kv-cache-dtype int4_per_token_head):
     # query rows per tile of the MSA indexer's large (prefill) class, instead

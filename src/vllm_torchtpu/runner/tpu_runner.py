@@ -2827,6 +2827,23 @@ class TPUModelRunner(GPUModelRunner):
         self._modify_prev_results()
         self._pre_async_results = None
 
+    def _skip_device_sampling_metadata(self) -> None:
+        """TPU_SKIP_DEVICE_SAMPLING_METADATA: stop upstream InputBatch from
+        rebuilding ``sampling_metadata`` on every batch change. The TPU
+        samplers read the CPU sampling tensors (`_padded_sampling_params`)
+        and min_tokens has its own tracker, so nothing here reads the
+        metadata, but each rebuild uploads temperature/top_p/top_k into their
+        device copies (`copy_slice`, f32[num_reqs] into f32[max_num_reqs]):
+        one program per distinct num_reqs compiled online, and host-to-device
+        copies that queue behind KV-offload loads."""
+        input_batch = self.input_batch
+        if input_batch.is_pooling_model or getattr(
+            input_batch, "_tpu_skips_sampling_metadata", False
+        ):
+            return
+        input_batch._make_sampling_metadata = lambda: input_batch.sampling_metadata
+        input_batch._tpu_skips_sampling_metadata = True
+
     def _install_spec_token_room_guard(self) -> None:
         """Wrap InputBatch.update_req_spec_token_ids to clamp its *write*.
 
@@ -2927,6 +2944,8 @@ class TPUModelRunner(GPUModelRunner):
         for req_state in self.requests.values():
             req_state.prev_num_draft_len = 0
         self._install_spec_token_room_guard()
+        if envs.TPU_SKIP_DEVICE_SAMPLING_METADATA:
+            self._skip_device_sampling_metadata()
         copies = scheduler_output.kv_cache_block_copies
         use_page_local_copy = bool(copies and self.is_unified_pool_used())
         # Per-layer (non-pooled) attention caches, e.g. DCP fine-grained
