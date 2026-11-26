@@ -1674,8 +1674,8 @@ class OwnerTailRefs:
 class ScatterRefs:
     """Refs of `gmm_v2_mlp_scatter`'s row sends (see there)."""
 
-    dest_member: jax.Array  # SMEM int32[size_m]
-    dest_row: jax.Array  # SMEM int32[size_m]
+    dest_member: jax.Array  # SMEM int32[size_m], valid after `dest_copies`
+    dest_row: jax.Array  # SMEM int32[size_m], valid after `dest_copies`
     me: jax.Array  # SMEM int32[1]
     expected: jax.Array  # SMEM int32[1]
     recv: jax.Array  # HBM [num_recv_rows, row_sublanes, size_n / row_sublanes]
@@ -1691,6 +1691,9 @@ class ScatterRefs:
     num_members: int | tuple[int, ...]
     extra: ExtraRowRefs | None = None
     tail: OwnerTailRefs | None = None
+    # The HBM -> SMEM copies of dest_member and dest_row, started at entry
+    # and waited for before the first row leaves.
+    dest_copies: tuple = ()
 
 
 def _axes(axis, num_members):
@@ -2100,6 +2103,8 @@ def _mlp_kernel(
         )
         for i in range(5):
             scatter.in_flight[i] = 0
+        for c in scatter.dest_copies:
+            c.start()
 
     tiled = dataclasses.replace(up, tiles=dataclasses.replace(up.tiles, tile_m=tile_m))
     num_gm = fill_metadata(
@@ -2221,6 +2226,8 @@ def _mlp_kernel(
 
         @pl.when(sc.in_flight[4] == 0)
         def _():
+            for c in sc.dest_copies:
+                c.wait()
             pl.semaphore_wait(
                 pltpu.get_barrier_semaphore(), _num_members(sc.num_members)
             )
@@ -2647,10 +2654,10 @@ def mlp_scatter_kernel_main(
         del refs[:n]
         return out
 
-    group_sizes, group_offset, dest_member, dest_row, me, expected = take(6)
+    group_sizes, group_offset, me, expected = take(4)
     extra_prefetch = take(3) if extra else []
     tail_prefetch = take(5) if tail else []
-    lhs, w1, s1, w2, s2 = take(5)
+    lhs, w1, s1, w2, s2, dest_member_hbm, dest_row_hbm = take(7)
     extra_inputs = take(1) if extra else []
     recv = take(1)[0]
     extra_outputs = take(1) if extra else []
@@ -2672,7 +2679,10 @@ def mlp_scatter_kernel_main(
         recv_sem,
         in_flight_ref,
         entered_sem,
-    ) = take(16)
+        dest_member,
+        dest_row,
+        dest_sem,
+    ) = take(19)
     extra_scratch = take(2) if extra else []
     tail_scratch = take(2) if tail else []
     assert not refs
@@ -2731,6 +2741,10 @@ def mlp_scatter_kernel_main(
         scatter=ScatterRefs(
             dest_member=dest_member,
             dest_row=dest_row,
+            dest_copies=(
+                pltpu.make_async_copy(dest_member_hbm, dest_member, dest_sem.at[0]),
+                pltpu.make_async_copy(dest_row_hbm, dest_row, dest_sem.at[0]),
+            ),
             me=me,
             expected=expected,
             recv=recv,
@@ -2922,6 +2936,9 @@ def gmm_v2_mlp_scatter(
         pltpu.SemaphoreType.DMA((1,)),
         pltpu.SMEM((5,), jnp.int32),
         pltpu.SemaphoreType.REGULAR,
+        pltpu.SMEM((padded_size_m,), jnp.int32),
+        pltpu.SMEM((padded_size_m,), jnp.int32),
+        pltpu.SemaphoreType.DMA((1,)),
     ]
     if extra is not None:
         scratch_shapes += [pltpu.SemaphoreType.DMA((3,)), pltpu.SMEM((2,), jnp.int32)]
@@ -2939,8 +2956,13 @@ def gmm_v2_mlp_scatter(
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     recv_shape = pltpu.HBM((num_recv_rows, row_sub, size_n // row_sub), lhs.dtype)
-    prefetch = [group_sizes, group_offset, dest_member, dest_row, me, expected]
-    inputs = [lhs, w1, w1_scale, w2, w2_scale]
+    prefetch = [group_sizes, group_offset, me, expected]
+    # The rows' destinations are read only when rows leave: the kernel copies
+    # them to SMEM itself behind the first tile instead of before it starts
+    # (scalar prefetch of 2 x size_m words, ~2 us at whole-group sizes).
+    inputs = [lhs, w1, w1_scale, w2, w2_scale] + [
+        pltpu.with_memory_space_constraint(a, pltpu.HBM) for a in (dest_member, dest_row)
+    ]
     out_shape = recv_shape
     out_specs = hbm
     if extra is not None:
