@@ -584,19 +584,20 @@ def _kernel(
 
         def group_limits(width, selected, local_page, local_limit):
             """Each token's limit on the group's first `width` pages, ``[Bq,
-            W]`` (as `_page_limits`): the pages down the sublanes, one compare
-            per selection column."""
-            slot = jax.lax.broadcasted_iota(jnp.int32, (width, 1), 0)
-            pages = jnp.zeros((width, 1), jnp.int32)
+            W]`` (as `_page_limits`): the pages across the lanes, one compare
+            per selection column. With the pages down the sublanes, the two
+            transposes (of the selections and of the limits) led every unit's
+            critical path (AOT: 284 cycles of a 4-group 8-page unit's 2,231)."""
+            lane = jax.lax.broadcasted_iota(jnp.int32, (1, width), 1)
+            pages = jnp.zeros((1, width), jnp.int32)
             for g in range(width):
                 page = work_page_ref[msa_attention._slot(meta, pages_per_step, g)]
-                pages = jnp.where(slot == g, page, pages)
-            sel_t = selected.T  # [K, Bq]
-            hit = sel_t[0:1] == pages
-            for k in range(1, sel_t.shape[0]):
-                hit = hit | (sel_t[k : k + 1] == pages)  # [W, Bq]
-            limit = jnp.where(pages == local_page.T, local_limit.T, page_size)
-            return jnp.where((pages >= 0) & hit, limit, 0).T
+                pages = jnp.where(lane == g, page, pages)
+            hit = selected[:, 0:1] == pages
+            for k in range(1, selected.shape[1]):
+                hit = hit | (selected[:, k : k + 1] == pages)  # [Bq, W]
+            limit = jnp.where(pages == local_page, local_limit, page_size)
+            return jnp.where((pages >= 0) & hit, limit, 0)
 
         def attend(width, single):
             """One softmax update over the group's first `width` slots; a
@@ -606,6 +607,12 @@ def _kernel(
         def attend_parts(width, single):
             """`attend`'s ``(m_prev, m_new, l_cur, pv)`` over the group's first
             `width` slots."""
+            m_prev, m_new, l_cur, p_v, v = attend_scores(width, single)
+            return m_prev, m_new, l_cur, _p_at_v(p_v, v)
+
+        def attend_scores(width, single):
+            """`attend_parts` up to the p @ v matmul: ``(m_prev, m_new, l_cur,
+            p_v, v)``."""
             if inline_issue_here and width > _INLINE_ISSUE_PAGES:
                 issue_next()
             # int4 and fp8 pages unpack in slot order; bf16 in the bitcast's order.
@@ -698,13 +705,7 @@ def _kernel(
             p, m_prev, m_new = exp_scores(s, single, 1)
             l_cur = jnp.sum(p, axis=1, keepdims=True)
             p_v = p * jnp.concatenate(v_scales, axis=1) if fp4 else p
-            pv = jax.lax.dot_general(
-                p_v.astype(jnp.bfloat16),
-                v,
-                (((1,), (0,)), ((), ())),
-                preferred_element_type=jnp.float32,
-            )
-            return m_prev, m_new, l_cur, pv
+            return m_prev, m_new, l_cur, p_v.astype(jnp.bfloat16), v
 
         def fold(l_cur, pv):
             """A unit's group's `update` (`MAX_FREE`), after its earlier groups'."""
@@ -740,7 +741,7 @@ def _kernel(
                 count=count,
                 alone=alone,
                 zero_to=zero_to,
-                parts=lambda width: attend_parts(width, False)[2:],
+                scores=lambda width: attend_scores(width, False)[2:],
                 fold=fold,
                 empty=empty,
                 single=first & last,
@@ -846,7 +847,11 @@ def _kernel(
             def _body(width=width):
                 for g in groups:
                     g.zero_to(width)
-                parts = [g.parts(width) for g in groups]
+                # Every group's scores before any p @ v: a group's p @ v waits
+                # on its exp, which the later groups' QK matmuls now cover
+                # (AOT, 4 groups of 8 pages: 2,134 -> 1,710 cycles).
+                scores = [g.scores(width) for g in groups]
+                parts = [(l_cur, _p_at_v(p_v, v)) for l_cur, p_v, v in scores]
 
                 def folds():
                     for g, (l_cur, pv) in zip(groups, parts):
@@ -902,6 +907,13 @@ def _kernel(
 
     jax.lax.fori_loop(0, full, full_unit, 0)
     jax.lax.fori_loop(start + full * unit_groups, end, one, 0)
+
+
+def _p_at_v(p, v):
+    """`attend`'s p @ v (``p [rows, W * S]`` bf16) in f32."""
+    return jax.lax.dot_general(
+        p, v, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32
+    )
 
 
 def configure_max_free(score_bound: float) -> bool:
