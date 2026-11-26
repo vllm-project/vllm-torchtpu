@@ -82,6 +82,7 @@ def _kernel(
     tiles_per_step: int = 1,
     groups_per_tile: int = 1,
     transposed: bool = False,
+    single_bodies: bool = True,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -98,9 +99,10 @@ def _kernel(
     arithmetic and checks (~800 scalar bundles of a ~2,200-bundle 4-page
     step in the LLO).
 
-    A tile of one group (its first and last) runs a plain softmax that
-    keeps nothing in the m / l / acc scratch, and a tile with no page only
-    writes its zero output.
+    With `single_bodies`, a tile of one group (its first and last) runs a
+    plain softmax that keeps nothing in the m / l / acc scratch; without, it
+    runs the carried update from the initial state (`carried`), with the same
+    result and half the code. A tile with no page only writes its zero output.
 
     A 4-bit cache (`fp4_rows`: static K / V scale-page rows, or ``"head"``
     for rows ``2k, 2k + 1`` of the cache-row KV head ``k``) copies each
@@ -192,11 +194,20 @@ def _kernel(
 
         kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
 
-        @pl.when(first & jnp.logical_not(last))
-        def _init():
-            m_ref[...] = jnp.full_like(m_ref, msa_attention._MASK_VALUE)
-            l_ref[...] = jnp.zeros_like(l_ref)
-            acc_ref[...] = jnp.zeros_like(acc_ref)
+        if single_bodies:
+
+            @pl.when(first & jnp.logical_not(last))
+            def _init():
+                m_ref[...] = jnp.full_like(m_ref, msa_attention._MASK_VALUE)
+                l_ref[...] = jnp.zeros_like(l_ref)
+                acc_ref[...] = jnp.zeros_like(acc_ref)
+
+        def carried(ref, init):
+            """A softmax state ahead of this group: the scratch, or `init` for
+            a tile's first group without `single_bodies` (selected, not stored
+            and reloaded)."""
+            x = ref[...]
+            return x if single_bodies else jnp.where(first, init, x)
 
         def write(out, lse):
             o_ref[...] = out.reshape(num_heads, block_q, head_dim).astype(o_ref.dtype)
@@ -263,7 +274,10 @@ def _kernel(
                 k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
             )  # [W * S, rows]
             s = jnp.where(mask, s, -jnp.inf)
-            m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
+            if single:
+                m_prev = msa_attention._MASK_VALUE
+            else:
+                m_prev = carried(m_ref, msa_attention._MASK_VALUE)
             m_new = jnp.maximum(m_prev, jnp.max(s, axis=0, keepdims=True))
             p = jnp.exp2(s - m_new)
             l_cur = jnp.sum(p, axis=0, keepdims=True)
@@ -277,8 +291,8 @@ def _kernel(
                 finish_t(m_new, l_cur, pv)
                 return
             alpha = jnp.exp2(m_prev - m_new)
-            l_new = alpha * l_ref[...] + l_cur
-            acc_new = alpha * acc_ref[...] + pv
+            l_new = alpha * carried(l_ref, 0.0) + l_cur
+            acc_new = alpha * carried(acc_ref, 0.0) + pv
 
             @pl.when(last)
             def _finalize():
@@ -364,7 +378,10 @@ def _kernel(
 
             # The running max starts at a finite floor (`_MASK_VALUE`), so a row
             # with no visible slot gets p = exp2(-inf) = 0, not exp2(nan).
-            m_prev = m_ref[...] if not single else msa_attention._MASK_VALUE
+            if single:
+                m_prev = msa_attention._MASK_VALUE
+            else:
+                m_prev = carried(m_ref, msa_attention._MASK_VALUE)
             m_new = jnp.maximum(m_prev, jnp.max(s, axis=1, keepdims=True))
             p = jnp.exp2(s - m_new)
             l_cur = jnp.sum(p, axis=1, keepdims=True)
@@ -379,8 +396,8 @@ def _kernel(
                 finish(m_new, l_cur, pv)
                 return
             alpha = jnp.exp2(m_prev - m_new)
-            l_new = alpha * l_ref[...] + l_cur
-            acc_new = alpha * acc_ref[...] + pv
+            l_new = alpha * carried(l_ref, 0.0) + l_cur
+            acc_new = alpha * carried(acc_ref, 0.0) + pv
 
             @pl.when(last)
             def _finalize():
@@ -406,6 +423,9 @@ def _kernel(
             if width < pages_per_step:
                 fits = fits & (count <= width)
             body = attend_t if transposed else attend
+            if not single_bodies:
+                pl.when(fits)(functools.partial(body, width, False))
+                continue
             pl.when(fits & single)(functools.partial(body, width, True))
             pl.when(fits & jnp.logical_not(single))(
                 functools.partial(body, width, False)
@@ -541,6 +561,10 @@ def _attention_call(
     in_place = (pl.BlockSpec(memory_space=pl.ANY),) * 2 if aliased else ()
     fp4 = scale_rows is not None
     transposed = not fp4 and block_q >= msa_attention.DEFAULT_BLOCK_Q
+    # Decode tiles' calls are short enough that the kernel's code, reloaded
+    # per call in a deep program, costs as much as its work: no separate
+    # bodies for single-group tiles there.
+    single_bodies = block_q >= msa_attention.DEFAULT_BLOCK_Q
     scale_inputs = (scale_cache,) if fp4 else ()
     # A tile's lse: a lane-dense row for `attend_t`; [heads, Bq] for `attend`,
     # whose rows (h * Bq + t) reshape to it in VMEM, where as a [1, H * Bq]
@@ -608,6 +632,7 @@ def _attention_call(
             tiles_per_step=tiles_per_step,
             groups_per_tile=groups_per_tile,
             transposed=transposed,
+            single_bodies=single_bodies,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
         grid_spec=grid_spec,
