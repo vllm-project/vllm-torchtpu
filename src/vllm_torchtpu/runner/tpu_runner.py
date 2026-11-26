@@ -3180,17 +3180,6 @@ class TPUModelRunner(GPUModelRunner):
                 torch.from_numpy(pos_idx_np).to(self.device, non_blocking=True),
             )
 
-        # For decode-only case, cache constant device tensors to skip H2D.
-        # query_start_loc, logits_indices, and request_distribution don't
-        # change between decode steps for a given (num_reqs, padded_num_reqs).
-        is_decode_only = max_num_scheduled_tokens_all_reqs == 1
-        decode_cache_key = (
-            num_reqs,
-            padded_num_reqs,
-            use_max_model_len,
-            layout_plan.descriptor.cache_key,
-        )
-
         # Speculative decoding metadata.
         spec_decode_metadata = None
         if self.speculative_config:
@@ -3212,40 +3201,44 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
 
-        # Default decode layouts keep logits_indices stable for a fixed
-        # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
-        # explicit rank-major logits indices that can change as q_start crosses
-        # an interleave/rank boundary, so they must not reuse a stale cached
-        # logits_indices tensor.
-        can_cache_decode_metadata = (
-            is_decode_only
-            and spec_decode_metadata is None
-            and layout_plan.logits_indices_cpu is None
+        # query_start_loc, request_distribution and, without spec metadata,
+        # logits_indices are functions of the chunk's host query_start_loc and
+        # decode count, which repeat across steady decode and verify steps:
+        # reuse their device copies while those host values repeat (each
+        # upload costs the host loop ~0.1 ms). PCP streaming layouts provide
+        # explicit rank-major logits indices that can change as q_start
+        # crosses an interleave/rank boundary, so they always upload.
+        # For the V3 kernel, request_distribution is
+        # [decode_end, prefill_end, mixed_end]. We put decode requests first,
+        # no dedicated prefill-only bucket, and all remaining requests in
+        # mixed mode.
+        chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
+        query_start_loc_cpu = self.query_start_loc_cpu[: target_num_reqs + 1]
+        decode_cache_key = (
+            query_start_loc_cpu.numpy().tobytes(),
+            chunk_num_decode,
+            num_reqs,
+            padded_num_reqs,
+            spec_decode_metadata is None,
+            layout_plan.descriptor.cache_key,
         )
-
+        can_cache_decode_metadata = layout_plan.logits_indices_cpu is None
         if (
             can_cache_decode_metadata
             and decode_cache_key == self._decode_device_cache_key
         ):
-            # Reuse cached device tensors — skip 3 H2D copies.
             query_start_loc = self._cached_query_start_loc
-            logits_indices = self._cached_logits_indices
             request_distribution = self._cached_request_distribution
+            logits_indices = (
+                self._cached_logits_indices
+                if spec_decode_metadata is None
+                else spec_decode_metadata.final_logits_indices
+            )
             assert query_start_loc is not None
             assert logits_indices is not None
             assert request_distribution is not None
         else:
-            # Compute and copy to device (first call or shape changed).
-            if use_max_model_len:
-                query_start_loc = self.query_start_loc_cpu[
-                    : self.num_reqs_max_model_len + 1
-                ].to(self.device, non_blocking=True)
-            else:
-                assert self.num_reqs_most_model_len is not None
-                query_start_loc = self.query_start_loc_cpu[
-                    : self.num_reqs_most_model_len + 1
-                ].to(self.device, non_blocking=True)
-
+            query_start_loc = query_start_loc_cpu.to(self.device, non_blocking=True)
             if spec_decode_metadata is not None:
                 logits_indices = spec_decode_metadata.final_logits_indices
             elif layout_plan.logits_indices_cpu is not None:
@@ -3258,21 +3251,13 @@ class TPUModelRunner(GPUModelRunner):
                 logits_indices = (
                     self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
                 ).to(self.device, non_blocking=True)
-
-            # For the V3 kernel, request_distribution is
-            # [decode_end, prefill_end, mixed_end]. We put decode requests first,
-            # no dedicated prefill-only bucket, and all remaining requests in
-            # mixed mode.
-            chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_num_decode
             self._request_distribution_cpu[2] = num_reqs
             request_distribution = self._request_distribution_cpu.to(
                 self.device, non_blocking=True
             )
-
             if can_cache_decode_metadata:
-                # Cache for future decode steps.
                 self._decode_device_cache_key = decode_cache_key
                 self._cached_query_start_loc = query_start_loc
                 self._cached_logits_indices = logits_indices
