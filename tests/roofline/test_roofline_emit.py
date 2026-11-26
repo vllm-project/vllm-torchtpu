@@ -741,3 +741,816 @@ def test_format_submodule_parallelism_splits_attn_and_moe() -> None:
 
     dense_tp_pool = {"tp": 8, "dp": 1, "ep": 1, "pp": 1, "pcp": 1, "kv_split": 1}
     assert rf_pkg.format_submodule_parallelism(dense_tp_pool, has_moe=False) == "TP8"
+
+
+def test_ordered_candidates_distinguish_prefill_mesh_families() -> None:
+    """Real disagg solve keeps distinct prefill mesh families in ordered output."""
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    target_concurrency = 16
+    scenario = rf_pkg.TrafficScenario(
+        name="disagg-prefill-diversity",
+        isl=4096,
+        osl=512,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(target_concurrency,),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = rf_pkg.solve_serving_plan(
+        geometry,
+        dtypes,
+        rf_pkg.CHIPS["tpu7x"],
+        scenario,
+        rf_pkg.SolveOptions(
+            mode="disagg",
+            max_chips=8,
+            prefill_topology="2x2x1",
+            decode_topology="2x2x1",
+            pd_ratio=(1, 1),
+            include_pairs=True,
+        ),
+    )
+    ordered = rf_pkg.ordered_candidates_by_concurrency(serving_plan)
+    assert target_concurrency in ordered
+    prefill_meshes = {
+        (
+            point.prefill_pool.tp,
+            point.prefill_pool.dp,
+            point.prefill_pool.ep,
+            point.prefill_pool.pp,
+            point.prefill_pool.pcp,
+        )
+        for point in ordered[target_concurrency]
+        if point.prefill_pool is not None
+    }
+    assert len(prefill_meshes) > 1
+    families = rf_pkg.build_bound_families_by_concurrency(serving_plan)
+    assert len(families[str(target_concurrency)]) >= len(prefill_meshes)
+
+
+def test_reference_layout_rank_compares_same_concurrency_peers() -> None:
+    """Reference layout ranking compares strictly against same-concurrency peers."""
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    scenario = rf_pkg.TrafficScenario(
+        name="ref-rank-same-conc",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(1, 64),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = rf_pkg.solve_serving_plan(
+        geometry,
+        dtypes,
+        rf_pkg.CHIPS["tpu7x"],
+        scenario,
+        rf_pkg.SolveOptions(mode="mixed", max_chips=4),
+    )
+    c1_points = [point for point in serving_plan.candidates if point.concurrency == 1]
+    assert len(c1_points) > 1
+    assert len(serving_plan.candidates) > len(c1_points)
+    report = rf_pkg.reference_layout_report(
+        serving_plan,
+        rf_pkg.top_layouts(serving_plan),
+        "TP8 x EP8",
+        "",
+    )
+    assert report["found"] is True
+    assert report["ruled_out"] is False
+    assert report["concurrency"] in (1, 64)
+    same_c_points = [
+        point
+        for point in serving_plan.candidates
+        if point.concurrency == report["concurrency"]
+    ]
+    axis_groups: dict[
+        tuple[int, int, int, int, int, int], list[rf_pkg.ParetoPoint]
+    ] = {}
+    for point in same_c_points:
+        pool = point.decode_pool
+        key = (pool.tp, pool.dp, pool.ep, pool.pp, pool.pcp, pool.kv_split)
+        axis_groups.setdefault(key, []).append(point)
+    ref_key = (8, 1, 8, 1, 1, 1)
+    assert ref_key in axis_groups
+    expected_ref_bound = min(
+        point.decode_floor.hard_floor_ms for point in axis_groups[ref_key]
+    )
+    expected_ref_tput = max(
+        point.token_throughput_per_chip for point in axis_groups[ref_key]
+    )
+    expected_bound_rank = 1 + sum(
+        1
+        for key, pts in axis_groups.items()
+        if key != ref_key
+        and min(p.decode_floor.hard_floor_ms for p in pts) < expected_ref_bound - 1e-9
+    )
+    expected_tput_rank = 1 + sum(
+        1
+        for key, pts in axis_groups.items()
+        if key != ref_key
+        and max(p.token_throughput_per_chip for p in pts) > expected_ref_tput + 1e-9
+    )
+    assert report["candidates"] == len(axis_groups)
+    assert report["rank_by_tpot_bound"] == expected_bound_rank
+    assert report["rank_by_estimated_throughput"] == expected_tput_rank
+    assert report["point"] is not None
+    assert report["point"]["concurrency"] == report["concurrency"]
+
+
+@pytest.mark.parametrize(
+    ("layout_text", "mode", "opts_kwargs", "override_gdn", "expected_sub"),
+    [
+        (
+            "P: PP4 / D: TP8 x EP8",
+            "mixed",
+            {"max_chips": 4},
+            False,
+            "disaggregated mode",
+        ),
+        ("TP8 x EP8", "disagg", {"max_chips": 8}, False, "single-pool layout"),
+        (
+            "TP3",
+            "mixed",
+            {"max_chips": 4},
+            False,
+            "does not divide the attention heads",
+        ),
+        (
+            "TP16 x EP16",
+            "mixed",
+            {"max_chips": 8},
+            True,
+            "not a valid linear-attention shard degree",
+        ),
+        ("PP999", "mixed", {"max_chips": 4}, False, "exceeds model layers"),
+        (
+            "TP2 x DCP4",
+            "mixed",
+            {"max_chips": 4},
+            False,
+            "is not physically valid for TP2",
+        ),
+        ("TP8 x EP3", "mixed", {"max_chips": 4}, False, "is not physically divisible"),
+        (
+            "TP4 x PCP2 x EP8",
+            "mixed",
+            {"max_chips": 4},
+            False,
+            "mixed layout requires PCP1",
+        ),
+        (
+            "P: TP8 x EP8 / D: TP4 x PCP2 x EP8",
+            "disagg",
+            {"max_chips": 8, "include_pairs": True},
+            False,
+            "decode pool requires PCP1",
+        ),
+        (
+            "TP16 x EP16",
+            "mixed",
+            {"max_chips": 8, "decode_topology": "2x2x1"},
+            False,
+            "pinned decode topology 2x2x1",
+        ),
+        (
+            "TP2 x DP3",
+            "mixed",
+            {"max_chips": 4},
+            False,
+            "no searched slice has that many",
+        ),
+        (
+            "TP16 x EP16",
+            "mixed",
+            {"max_chips": 4},
+            False,
+            "exceeding max_chips=4",
+        ),
+        (
+            "P: TP8 x EP8 / D: TP8 x EP8",
+            "disagg",
+            {"max_chips": 8, "pd_ratio": (2, 2), "include_pairs": True},
+            False,
+            "exceeding max_chips=8",
+        ),
+        (
+            "P: TP8 x EP8 / D: TP8 x EP8",
+            "disagg",
+            {"max_chips": 4, "include_pairs": True},
+            False,
+            "1P+1D",
+        ),
+        (
+            "P: TP8 x EP8 / D: TP8 x EP8",
+            "disagg",
+            {
+                "max_chips": 32,
+                "pd_ratio": (2, 2),
+                "max_instances": 3,
+                "include_pairs": True,
+            },
+            False,
+            "exceeding max_instances=3",
+        ),
+        (
+            "P: TP8 x EP8 / D: TP8 x EP8",
+            "disagg",
+            {"max_chips": 32, "max_instances": 1, "include_pairs": True},
+            False,
+            "exceeding max_instances=1",
+        ),
+        (
+            "P: TP8 x EP8 / D: TP8 x EP8",
+            "disagg",
+            {"max_chips": 8, "include_pairs": False},
+            False,
+            "pair candidates are off",
+        ),
+        (
+            "TP8 x EP8",
+            "mixed",
+            {"max_chips": 4},
+            False,
+            "enumerated, but no searched point",
+        ),
+    ],
+)
+def test_parse_layout_and_explain_rejection_diagnostics(
+    layout_text: str,
+    mode: Literal["auto", "mixed", "disagg"],
+    opts_kwargs: dict[str, object],
+    override_gdn: bool,
+    expected_sub: str,
+) -> None:
+    """Verify explain_layout_rejection names the exact failing physical rule."""
+    from dataclasses import replace
+
+    geometry = load_locked_bundle("qwen3_5_397b_fp8.json").geometry
+    if override_gdn:
+        geometry = replace(geometry, linear_v_heads=8, linear_k_heads=4)
+    topos = tuple(rf_pkg.TOPOLOGIES.values())
+    opts = rf_pkg.SolveOptions(mode=mode, **opts_kwargs)  # type: ignore[arg-type]
+    reason = rf_pkg.explain_layout_rejection(
+        geometry, rf_pkg.parse_layout(layout_text), topos, opts
+    )
+    assert expected_sub in reason
+
+
+def test_explain_layout_rejection_not_enumerated_and_parse_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    locked_config_path: Callable[[str], Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Cover not-enumerated path, parse_layout errors/D:, strict_rank ties, and CLI."""
+    from vllm_torchtpu.roofline import solver as rf_solver
+
+    # Valid multi-pool and single-pool D: syntax.
+    parsed_pd = rf_pkg.parse_layout("P: PP4 x EP1 / D: TP8 x EP8 x DCP2")
+    assert parsed_pd["prefill"]["pp"] == 4
+    assert parsed_pd["decode"]["tp"] == 8
+    assert parsed_pd["decode"]["kv_split"] == 2
+    parsed_d = rf_pkg.parse_layout("D: TP8 x EP8")
+    assert "prefill" not in parsed_d
+    assert parsed_d["decode"]["tp"] == 8
+    assert parsed_d["decode"]["ep"] == 8
+
+    # All parse_layout error branches.
+    invalid_specs = [
+        "",
+        "   ",
+        "TP8 x QP2",
+        "TP4 x TP2",
+        "TP0",
+        "TPbad",
+        "P: TP8 / D: TP8 / D: TP4",
+        "X: TP8 / D: TP8",
+        "P: TP8 / X: TP8",
+        "P: TP8",
+    ]
+    for bad in invalid_specs:
+        with pytest.raises(ValueError):
+            rf_pkg.parse_layout(bad)
+
+    # strict_rank exact ordering and ties (both directions).
+    assert rf_pkg.strict_rank(10.0, [5.0, 10.0, 10.0, 20.0], lower_is_better=True) == 2
+    assert rf_pkg.strict_rank(10.0, [5.0, 10.0, 15.0, 20.0], lower_is_better=False) == 3
+    assert rf_pkg.strict_rank(5.0, [5.0, 5.0], lower_is_better=True) == 1
+
+    # Not-enumerated slice branch.
+    geometry = load_locked_bundle("qwen3_5_397b_fp8.json").geometry
+    monkeypatch.setattr(rf_solver, "_candidate_decode_parallels", lambda _g, _t: [])
+    reason = rf_pkg.explain_layout_rejection(
+        geometry,
+        rf_pkg.parse_layout("TP8 x EP8"),
+        tuple(rf_pkg.TOPOLOGIES.values()),
+        rf_pkg.SolveOptions(mode="mixed", max_chips=4),
+    )
+    assert "not enumerated on a 8-core slice" in reason
+    monkeypatch.undo()
+
+    # Invalid --reference-layout fails fast before solve via parser.error (exit 2).
+    cfg_path = locked_config_path("qwen3_5_397b_fp8.json")
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "solve",
+                "--config",
+                str(cfg_path),
+                "--example-scenario",
+                "chat-8k1k",
+                "--mode",
+                "mixed",
+                "--max-chips",
+                "4",
+                "--concurrency",
+                "1",
+                "--reference-layout",
+                "TP8 x QP2",
+            ]
+        )
+    assert exc_info.value.code == 2
+    capsys.readouterr()
+
+    # Rejected valid --reference-layout populates found=False in JSON and text summary.
+    rc_json = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--concurrency",
+            "1",
+            "--reference-layout",
+            "TP4 x PCP2 x EP8",
+            "--json",
+        ]
+    )
+    assert rc_json == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reference"]["found"] is False
+    assert "PCP1" in payload["reference"]["rejected_by"]
+
+    rc_text = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--concurrency",
+            "1",
+            "--reference-layout",
+            "TP4 x PCP2 x EP8",
+        ]
+    )
+    assert rc_text == 0
+    text_out = capsys.readouterr().out
+    assert "not found" in text_out
+    assert "PCP1" in text_out
+
+
+def test_concurrency_top_k_never_crowns_slo_failing_points() -> None:
+    """concurrency_top_k labels SLO-failing candidates as ruled_out, never frontier."""
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    # First get an unconstrained solve to pick a tight TPOT SLO that fails some points.
+    base_scen = rf_pkg.TrafficScenario(
+        name="slo-split-probe",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+    )
+    base_plan = rf_pkg.solve_serving_plan(
+        geometry,
+        dtypes,
+        rf_pkg.CHIPS["tpu7x"],
+        base_scen,
+        rf_pkg.SolveOptions(mode="mixed", max_chips=8),
+    )
+    tpots = sorted(pt.est_tpot_ms for pt in base_plan.candidates)
+    assert len(tpots) >= 3
+    mid_tpot = 0.5 * (tpots[0] + tpots[-1])
+
+    # Case 1: mixed SLO-met and SLO-failing points at the same concurrency.
+    mixed_scen = rf_pkg.TrafficScenario(
+        name="slo-split-mixed",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+        tpot_slo_ms=mid_tpot,
+    )
+    mixed_plan = rf_pkg.solve_serving_plan(
+        geometry,
+        dtypes,
+        rf_pkg.CHIPS["tpu7x"],
+        mixed_scen,
+        rf_pkg.SolveOptions(mode="mixed", max_chips=8),
+    )
+    mixed_payload = build_solve_payload(
+        mixed_plan, chip=rf_pkg.CHIPS["tpu7x"], dtypes=dtypes
+    )
+    entries = mixed_payload["concurrency_top_k"]["16"]
+    assert any(e["point"]["slo_met"] for e in entries)
+    assert any(not e["point"]["slo_met"] for e in entries)
+    for entry in entries:
+        if not entry["point"]["slo_met"]:
+            expected_role = entry["point"].get("slo_verdict", "ruled_out")
+            assert entry["frontier_role"] == expected_role
+        else:
+            assert entry["frontier_role"] not in ("ruled_out", "undecided")
+
+    # Case 2: impossible SLO where all points fail -> zero frontier roles crowned.
+    impossible_scen = rf_pkg.TrafficScenario(
+        name="slo-split-none",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+        tpot_slo_ms=0.001,
+    )
+    impossible_plan = rf_pkg.solve_serving_plan(
+        geometry,
+        dtypes,
+        rf_pkg.CHIPS["tpu7x"],
+        impossible_scen,
+        rf_pkg.SolveOptions(mode="mixed", max_chips=4),
+    )
+    impossible_payload = build_solve_payload(
+        impossible_plan, chip=rf_pkg.CHIPS["tpu7x"], dtypes=dtypes
+    )
+    imp_entries = impossible_payload["concurrency_top_k"]["16"]
+    assert imp_entries
+    assert all(entry["frontier_role"] == "ruled_out" for entry in imp_entries)
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+def test_bound_families_apply_speculative_accept_len(fixture_name: str) -> None:
+    """Speculative decode bound families divide TPOT lower bound by accept_len."""
+    bundle = load_locked_bundle(fixture_name)
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    scenario = rf_pkg.TrafficScenario(
+        name="spec-decode-bound-family",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.5,
+        accept_len=3.0,
+        think_time_s=None,
+        concurrencies=(1, 16),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = rf_pkg.solve_serving_plan(
+        geometry,
+        dtypes,
+        rf_pkg.CHIPS["tpu7x"],
+        scenario,
+        rf_pkg.SolveOptions(mode="mixed", max_chips=8),
+    )
+    families_by_conc = rf_pkg.build_bound_families_by_concurrency(serving_plan)
+    assert families_by_conc
+    for entries in families_by_conc.values():
+        assert entries
+        prev_bound = 0.0
+        for entry in entries:
+            min_bound = entry["min_bound_tpot_ms"]
+            assert min_bound is not None
+            assert min_bound > 0.0
+            expected_min = min(
+                member["decode_floor"]["hard_floor_ms"] / 3.0
+                for member in entry["members"]
+            )
+            assert min_bound == pytest.approx(expected_min)
+            assert min_bound >= prev_bound - 1e-9
+            prev_bound = min_bound
+            for member in entry["members"]:
+                est_tpot = member["est_tpot_ms"]
+                assert isinstance(est_tpot, (int, float))
+                assert min_bound <= est_tpot + 1e-6
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+def test_pool_only_disagg_families_rank_roles_separately_and_render_clean_html(
+    fixture_name: str,
+) -> None:
+    """Pool-only disagg ranks decode and prefill separately with clean HTML members."""
+    bundle = load_locked_bundle(fixture_name)
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    scenario = rf_pkg.TrafficScenario(
+        name="pool-only-disagg",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(4,),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = rf_pkg.solve_serving_plan(
+        geometry,
+        dtypes,
+        rf_pkg.CHIPS["tpu7x"],
+        scenario,
+        rf_pkg.SolveOptions(mode="disagg", max_chips=8, include_pairs=False),
+    )
+    payload = build_solve_payload(
+        serving_plan, chip=rf_pkg.CHIPS["tpu7x"], dtypes=dtypes
+    )
+    families = payload["bound_families_by_concurrency"]["4"]
+    decode_entries = [entry for entry in families if entry["family"][0] == "decode"]
+    prefill_entries = [entry for entry in families if entry["family"][0] == "prefill"]
+    assert decode_entries
+    assert prefill_entries
+    assert families[: len(decode_entries)] == decode_entries
+    assert [entry["rank"] for entry in decode_entries] == list(
+        range(1, len(decode_entries) + 1)
+    )
+    assert [entry["rank"] for entry in prefill_entries] == list(
+        range(1, len(prefill_entries) + 1)
+    )
+    for entry in decode_entries:
+        assert entry["min_bound_tpot_ms"] is not None
+        assert entry["min_bound_ttft_ms"] is None
+    for entry in prefill_entries:
+        assert entry["min_bound_tpot_ms"] is None
+        assert entry["min_bound_ttft_ms"] is not None
+    html = rf_pkg.render_html(payload)
+    assert "{'role'" not in html
+    assert "{&#x27;role&#x27;" not in html
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+@pytest.mark.parametrize("sort_by", ("throughput", "interactivity"))
+def test_reference_layout_multi_ratio_disagg_and_sort_by(
+    fixture_name: str,
+    sort_by: Literal["throughput", "interactivity"],
+) -> None:
+    """Multi-ratio disagg reference ranking uses symmetric floor and peer count."""
+    bundle = load_locked_bundle(fixture_name)
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    topo_2x2x2 = rf_pkg.TOPOLOGIES["2x2x2"]
+    scenario = rf_pkg.TrafficScenario(
+        name="disagg-multi-ratio",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(4,),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = rf_pkg.solve_serving_plan(
+        geometry,
+        dtypes,
+        rf_pkg.CHIPS["tpu7x"],
+        scenario,
+        rf_pkg.SolveOptions(
+            mode="disagg",
+            max_chips=24,
+            topologies=(topo_2x2x2,),
+            sort_by=sort_by,
+            include_pairs=True,
+        ),
+    )
+    assert serving_plan.candidates
+    sample = serving_plan.candidates[0]
+    assert sample.prefill_pool is not None
+    prefill_label = rf_pkg.format_parallelism(
+        {
+            "tp": sample.prefill_pool.tp,
+            "dp": sample.prefill_pool.dp,
+            "ep": sample.prefill_pool.ep,
+            "pp": sample.prefill_pool.pp,
+            "pcp": sample.prefill_pool.pcp,
+            "kv_split": sample.prefill_pool.kv_split,
+        }
+    )
+    decode_label = rf_pkg.format_parallelism(
+        {
+            "tp": sample.decode_pool.tp,
+            "dp": sample.decode_pool.dp,
+            "ep": sample.decode_pool.ep,
+            "pp": sample.decode_pool.pp,
+            "pcp": sample.decode_pool.pcp,
+            "kv_split": sample.decode_pool.kv_split,
+        }
+    )
+    layout_text = f"P: {prefill_label} / D: {decode_label}"
+    report = rf_pkg.reference_layout_report(
+        serving_plan,
+        rf_pkg.top_layouts(serving_plan),
+        layout_text,
+        "",
+    )
+    assert report["found"] is True
+    assert report["concurrency"] == 4
+    axis_groups: dict[
+        tuple[
+            tuple[int, int, int, int, int, int] | None,
+            tuple[int, int, int, int, int, int],
+        ],
+        list[rf_pkg.ParetoPoint],
+    ] = {}
+    for cand in serving_plan.candidates:
+        if cand.concurrency != 4:
+            continue
+        p_pool = cand.prefill_pool
+        d_pool = cand.decode_pool
+        p_key = (
+            (p_pool.tp, p_pool.dp, p_pool.ep, p_pool.pp, p_pool.pcp, p_pool.kv_split)
+            if p_pool is not None
+            else None
+        )
+        d_key = (
+            d_pool.tp,
+            d_pool.dp,
+            d_pool.ep,
+            d_pool.pp,
+            d_pool.pcp,
+            d_pool.kv_split,
+        )
+        axis_groups.setdefault((p_key, d_key), []).append(cand)
+    sample_p = sample.prefill_pool
+    sample_d = sample.decode_pool
+    ref_key = (
+        (
+            sample_p.tp,
+            sample_p.dp,
+            sample_p.ep,
+            sample_p.pp,
+            sample_p.pcp,
+            sample_p.kv_split,
+        ),
+        (
+            sample_d.tp,
+            sample_d.dp,
+            sample_d.ep,
+            sample_d.pp,
+            sample_d.pcp,
+            sample_d.kv_split,
+        ),
+    )
+    matching = axis_groups[ref_key]
+    expected_best = min(
+        matching,
+        key=lambda cand: (
+            not cand.slo_met,
+            -(
+                cand.est_interactivity_tok_s
+                if sort_by == "interactivity"
+                else cand.token_throughput_per_chip
+            ),
+            -(
+                cand.token_throughput_per_chip
+                if sort_by == "interactivity"
+                else cand.est_interactivity_tok_s
+            ),
+            cand.total_chips,
+        ),
+    )
+    expected_ref_bound = min(cand.decode_floor.hard_floor_ms for cand in matching)
+    expected_ref_tput = max(cand.token_throughput_per_chip for cand in matching)
+    expected_bound_rank = 1 + sum(
+        1
+        for key, pts in axis_groups.items()
+        if key != ref_key
+        and min(p.decode_floor.hard_floor_ms for p in pts) < expected_ref_bound - 1e-9
+    )
+    expected_tput_rank = 1 + sum(
+        1
+        for key, pts in axis_groups.items()
+        if key != ref_key
+        and max(p.token_throughput_per_chip for p in pts) > expected_ref_tput + 1e-9
+    )
+    assert report["candidates"] == len(axis_groups)
+    assert report["rank_by_tpot_bound"] == expected_bound_rank
+    assert report["rank_by_estimated_throughput"] == expected_tput_rank
+    assert report["point"] is not None
+    assert report["point"]["total_chips"] == expected_best.total_chips
+    assert report["point"]["token_throughput_per_chip"] == pytest.approx(
+        expected_best.token_throughput_per_chip
+    )
+    assert report["point"]["est_interactivity_tok_s"] == pytest.approx(
+        expected_best.est_interactivity_tok_s
+    )
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+def test_top_k_one_preserves_reference_and_interactivity_roles(
+    fixture_name: str,
+    locked_config_path: Callable[[str], Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI --top-k 1 keeps families and valid reference layout, honoring --sort-by."""
+    cfg_path = locked_config_path(fixture_name)
+    bundle = load_locked_bundle(fixture_name)
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    scenario = rf_pkg.build_example_scenario("chat-8k1k").__class__(
+        name="chat-8k1k-short",
+        isl=8192,
+        osl=1024,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(1, 4),
+        kv_working_set_turns=1.0,
+    )
+    full_plan = rf_pkg.solve_serving_plan(
+        geometry,
+        dtypes,
+        rf_pkg.CHIPS["tpu7x"],
+        scenario,
+        rf_pkg.SolveOptions(mode="mixed", max_chips=8, sort_by="interactivity"),
+    )
+    full_families = rf_pkg.build_bound_families_by_concurrency(full_plan)
+    ref_cand = full_plan.candidates[-1]
+    ref_layout = rf_pkg.format_parallelism(
+        {
+            "tp": ref_cand.decode_pool.tp,
+            "dp": ref_cand.decode_pool.dp,
+            "ep": ref_cand.decode_pool.ep,
+            "pp": ref_cand.decode_pool.pp,
+            "pcp": ref_cand.decode_pool.pcp,
+            "kv_split": ref_cand.decode_pool.kv_split,
+        }
+    )
+    rc_json = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "8",
+            "--concurrency",
+            "1,4",
+            "--sort-by",
+            "interactivity",
+            "--top-k",
+            "1",
+            "--reference-layout",
+            ref_layout,
+            "--json",
+        ]
+    )
+    assert rc_json == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["reference"]["found"] is True
+    assert out["reference"]["concurrency"] in (1, 4)
+    assert "launch" not in out["reference"]
+    assert len(out["bound_families_by_concurrency"]["1"]) == len(full_families["1"])
+    conc_top_k = out["concurrency_top_k"]["1"]
+    assert len(conc_top_k) == 1
+    assert conc_top_k[0]["frontier_role"] == "max_interactivity"
+    assert conc_top_k[0]["margin_vs_rank1_pct"] == 0.0
+
+    rc_text = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "8",
+            "--concurrency",
+            "1,4",
+            "--sort-by",
+            "interactivity",
+            "--top-k",
+            "1",
+            "--reference-layout",
+            ref_layout,
+        ]
+    )
+    assert rc_text == 0
+    text_out = capsys.readouterr().out
+    assert f"reference {ref_layout}: c=" in text_out

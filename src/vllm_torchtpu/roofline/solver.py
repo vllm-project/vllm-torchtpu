@@ -58,11 +58,12 @@ from .schema import (
     ServingPlan,
     SortBy,
     TrafficScenario,
+    candidate_sort_key,
 )
 from .step import FloorOptions, SpecShape, StepFloor, spec_cycle_floor, step_floor
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from .geometry import ModelGeometry
 
@@ -416,22 +417,11 @@ def _pool_tie_key(pool: PoolMeshPlan | None) -> tuple[object, ...]:
     )
 
 
-def _candidate_sort_key(point: ParetoPoint, sort_by: SortBy) -> tuple[object, ...]:
-    """Build deterministic per-concurrency sort key for a candidate point."""
-    primary, secondary = (
-        (point.est_interactivity_tok_s, point.token_throughput_per_chip)
-        if sort_by == "interactivity"
-        else (point.token_throughput_per_chip, point.est_interactivity_tok_s)
-    )
-    return (
-        not point.slo_met,
-        -primary,
-        -secondary,
-        point.total_chips,
-        point.mode,
-        _pool_tie_key(point.decode_pool),
-        _pool_tie_key(point.prefill_pool),
-    )
+def _candidate_sort_key(
+    point: ParetoPoint, sort_by: SortBy
+) -> tuple[bool, bool, float, float, int, str]:
+    """Delegate per-concurrency candidate ordering to shared schema sort key."""
+    return candidate_sort_key(point, sort_by)
 
 
 def _order_and_mark_candidates(
@@ -2855,4 +2845,231 @@ def solve_serving_plan(
         budget_source=budget_source,
         max_instances=eff_opts.max_instances,
         pins=pins,
+    )
+
+
+def _explain_mode_rejection(
+    layout: Mapping[str, Mapping[str, int]],
+    mode: str,
+) -> str | None:
+    """Return rejection reason if layout contradicts solver mode."""
+    if mode == "mixed" and "prefill" in layout:
+        return "a prefill and decode layout is only searched in disaggregated mode"
+    if mode == "disagg" and "prefill" not in layout:
+        return "a single-pool layout is only searched in mixed mode"
+    return None
+
+
+def _explain_pool_axis_rejection(
+    geometry: ModelGeometry,
+    axes: Mapping[str, int],
+    role_label: str,
+) -> str | None:
+    """Return first physical divisibility rejection for a single pool layout."""
+    tp = axes.get("tp", 1)
+    dp = axes.get("dp", 1)
+    ep = axes.get("ep", 1)
+    pp = axes.get("pp", 1)
+    pcp = axes.get("pcp", 1)
+    kv_split = axes.get("kv_split", 1)
+    if not _valid_head_tp(geometry, tp):
+        return f"{role_label} TP{tp} does not divide the attention heads"
+    if not _valid_gdn_degree(geometry, tp):
+        return f"{role_label} TP{tp} is not a valid linear-attention shard degree"
+    if pp > geometry.num_layers:
+        return f"{role_label} PP{pp} exceeds model layers ({geometry.num_layers})"
+    if kv_split not in _kv_splits_for_tp(geometry, tp):
+        return f"{role_label} DCP{kv_split} is not physically valid for TP{tp}"
+    ep_domain = tp * dp * pcp
+    legal_moe = _candidate_pool_moe_modes(geometry, tp, ep_domain)
+    if not any(ep_val == ep for _, ep_val in legal_moe):
+        return (
+            f"{role_label} EP{ep} is not physically divisible for "
+            f"TP{tp} x DP{dp} x PCP{pcp}"
+        )
+    return None
+
+
+def _explain_pool_rejection(
+    geometry: ModelGeometry,
+    axes: Mapping[str, int],
+    topologies: Sequence[SliceTopology],
+    role_label: str,
+    *,
+    is_disagg: bool = False,
+    pinned_topology: str | None = None,
+) -> str | None:
+    """Return first physical or slice-size rejection for a pool layout."""
+    axis_reason = _explain_pool_axis_rejection(geometry, axes, role_label)
+    if axis_reason is not None:
+        return axis_reason
+    tp = axes.get("tp", 1)
+    dp = axes.get("dp", 1)
+    pp = axes.get("pp", 1)
+    pcp = axes.get("pcp", 1)
+    ep = axes.get("ep", 1)
+    kv_split = axes.get("kv_split", 1)
+    if (not is_disagg or role_label == "decode") and pcp > 1:
+        return (
+            "decode pool requires PCP1 in disaggregated mode"
+            if is_disagg
+            else "mixed layout requires PCP1"
+        )
+    needed_cores = tp * dp * pp * pcp
+    if pinned_topology is not None and not topologies:
+        return (
+            f"{role_label} topology pin {pinned_topology!r} is not in the "
+            "searched topologies"
+        )
+    matching_topos = [
+        topology for topology in topologies if topology.num_cores == needed_cores
+    ]
+    if not matching_topos:
+        if pinned_topology is not None:
+            pinned_cores = topologies[0].num_cores
+            return (
+                f"{role_label} layout needs {needed_cores} cores, which does not "
+                f"match pinned {role_label} topology {pinned_topology} "
+                f"({pinned_cores} cores)"
+            )
+        return (
+            f"{role_label} layout needs {needed_cores} cores and no searched "
+            "slice has that many"
+        )
+    if not is_disagg or role_label == "decode":
+        enum_fn = _candidate_decode_parallels
+    else:
+        enum_fn = _candidate_prefill_parallels
+    found = any(
+        cand.tp == tp
+        and cand.dp == dp
+        and cand.pp == pp
+        and cand.pcp == pcp
+        and cand.ep == ep
+        and cand.kv_split == kv_split
+        for topology in matching_topos
+        for cand in enum_fn(geometry, topology)
+    )
+    if not found:
+        return (
+            f"this {role_label} layout is not enumerated on a {needed_cores}-core slice"
+        )
+    return None
+
+
+def _min_matching_chips(
+    axes: Mapping[str, int],
+    topologies: Sequence[SliceTopology],
+) -> int | None:
+    """Return smallest chip count among topologies matching a pool's core count."""
+    needed_cores = (
+        axes.get("tp", 1) * axes.get("dp", 1) * axes.get("pp", 1) * axes.get("pcp", 1)
+    )
+    chips = [
+        topology.num_chips
+        for topology in topologies
+        if topology.num_cores == needed_cores
+    ]
+    return min(chips) if chips else None
+
+
+def explain_layout_rejection(
+    geometry: ModelGeometry,
+    layout: Mapping[str, Mapping[str, int]],
+    topologies: Sequence[SliceTopology],
+    opts: SolveOptions | None = None,
+) -> str:
+    """Name the first physical rule that leaves a reference layout absent."""
+    options = opts or SolveOptions()
+    mode_reason = _explain_mode_rejection(layout, options.mode)
+    if mode_reason is not None:
+        return mode_reason
+    is_disagg = "prefill" in layout
+    decode_topologies = [
+        topology
+        for topology in topologies
+        if options.decode_topology is None or topology.name == options.decode_topology
+    ]
+    prefill_topologies = [
+        topology
+        for topology in topologies
+        if options.prefill_topology is None or topology.name == options.prefill_topology
+    ]
+    decode_reason = _explain_pool_rejection(
+        geometry,
+        layout["decode"],
+        decode_topologies,
+        "decode",
+        is_disagg=is_disagg,
+        pinned_topology=options.decode_topology,
+    )
+    if decode_reason is not None:
+        return decode_reason
+    min_decode_chips = _min_matching_chips(layout["decode"], decode_topologies)
+    if is_disagg:
+        prefill_reason = _explain_pool_rejection(
+            geometry,
+            layout["prefill"],
+            prefill_topologies,
+            "prefill",
+            is_disagg=True,
+            pinned_topology=options.prefill_topology,
+        )
+        if prefill_reason is not None:
+            return prefill_reason
+        if options.max_instances is not None:
+            if options.pd_ratio is not None:
+                prefill_inst, decode_inst = options.pd_ratio
+                if prefill_inst + decode_inst > options.max_instances:
+                    return (
+                        f"disaggregated layout with --pd {prefill_inst}:{decode_inst} "
+                        f"needs {prefill_inst + decode_inst} instances, exceeding "
+                        f"max_instances={options.max_instances}"
+                    )
+            elif options.max_instances < MIN_DISAGG_INSTANCES:
+                return (
+                    "disaggregated layout needs at least "
+                    f"{MIN_DISAGG_INSTANCES} instances (1P+1D), exceeding "
+                    f"max_instances={options.max_instances}"
+                )
+        min_prefill_chips = _min_matching_chips(layout["prefill"], prefill_topologies)
+        if (
+            options.max_chips is not None
+            and min_decode_chips is not None
+            and min_prefill_chips is not None
+        ):
+            if options.pd_ratio is not None:
+                prefill_inst, decode_inst = options.pd_ratio
+                needed_chips = (
+                    prefill_inst * min_prefill_chips + decode_inst * min_decode_chips
+                )
+                if needed_chips > options.max_chips:
+                    return (
+                        f"disaggregated layout with --pd {prefill_inst}:{decode_inst} "
+                        f"needs at least {needed_chips} chips, exceeding "
+                        f"max_chips={options.max_chips}"
+                    )
+            elif min_prefill_chips + min_decode_chips > options.max_chips:
+                return (
+                    "disaggregated layout needs at least "
+                    f"{min_prefill_chips + min_decode_chips} chips (1P+1D), "
+                    f"exceeding max_chips={options.max_chips}"
+                )
+        if not options.include_pairs and options.pd_ratio is None:
+            return (
+                "disaggregated pair candidates are off by default; "
+                "pass --pairs or --pd to evaluate pairs"
+            )
+    elif (
+        options.max_chips is not None
+        and min_decode_chips is not None
+        and min_decode_chips > options.max_chips
+    ):
+        return (
+            f"decode layout needs at least {min_decode_chips} chips, "
+            f"exceeding max_chips={options.max_chips}"
+        )
+    return (
+        "enumerated, but no searched point with this layout passed the "
+        "memory fit, the chip budget, and the latency targets"
     )

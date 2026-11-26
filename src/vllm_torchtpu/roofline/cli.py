@@ -51,11 +51,18 @@ from .emit import (
     emit_ceiling_rows,
     format_solve_json,
     slice_per_concurrency,
+    top_layouts,
 )
-from .geometry import UnsupportedArchitectureError, from_hf_config
+from .families import (
+    attach_reference_report,
+    parse_layout,
+    reference_layout_report,
+)
+from .geometry import ModelGeometry, UnsupportedArchitectureError, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config_with_identity
 from .modules import Dtypes, Parallel, StepShape
 from .report import write_html
+from .schema import ReferenceLayoutReport
 from .serving import ServingRequest, plan
 from .solver import (
     EXAMPLE_SCENARIOS,
@@ -64,7 +71,9 @@ from .solver import (
     ServingPlan,
     SolveOptions,
     TrafficScenario,
+    _resolve_solve_topologies,
     build_example_scenario,
+    explain_layout_rejection,
     solve_serving_plan,
 )
 from .step import FloorOptions, SpecShape, spec_cycle_floor, step_floor
@@ -217,6 +226,14 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Write an offline HTML report to PATH.",
+    )
+    solve_parser.add_argument(
+        "--reference-layout",
+        default=None,
+        help=(
+            "Compare a reference layout (e.g. 'TP8 x EP8' or "
+            "'P: PP4 / D: TP8') against solver candidates."
+        ),
     )
 
     ceiling_parser = sub.add_parser(
@@ -409,6 +426,7 @@ def _parse_pd_ratio(
 
 def _write_solve_text_output(
     serving_plan: ServingPlan,
+    ref_report: ReferenceLayoutReport | None = None,
     *,
     top_k: int | None = None,
 ) -> int:
@@ -467,6 +485,7 @@ def _write_solve_text_output(
                 f"{record.token_throughput_per_chip:>13.1f}  "
                 f"{ttft_text}  {tpot_text}\n"
             )
+    _write_reference_summary(ref_report)
     return 0
 
 
@@ -502,28 +521,35 @@ def _dispatch_solve(
         and args.mode in ("auto", "disagg")
         and (args.max_chips is not None or has_pins)
     )
+    parsed_ref: dict[str, dict[str, int]] | None = None
+    if args.cmd == "solve" and args.reference_layout is not None:
+        try:
+            parsed_ref = parse_layout(args.reference_layout)
+        except ValueError as err:
+            parser.error(f"invalid --reference-layout: {err}")
+    geometry = from_hf_config(config, model_ref=model_ref)
+    solve_opts = SolveOptions(
+        mode=args.mode,
+        max_chips=args.max_chips,
+        max_instances=args.max_instances,
+        hbm_reserve_gb=args.hbm_reserve_gb,
+        topologies=tuple(custom_topos.values()) if custom_topos else None,
+        sort_by=args.sort_by,
+        include_pairs=include_pairs,
+        top_k=args.top_k,
+        prefill_topology=args.prefill_topology,
+        decode_topology=args.decode_topology,
+        pd_ratio=pd_ratio,
+    )
     serving_plan = solve_serving_plan(
-        from_hf_config(config, model_ref=model_ref),
-        resolved_dtypes,
-        chip,
-        scenario,
-        SolveOptions(
-            mode=args.mode,
-            max_chips=args.max_chips,
-            max_instances=args.max_instances,
-            hbm_reserve_gb=args.hbm_reserve_gb,
-            topologies=tuple(custom_topos.values()) if custom_topos else None,
-            sort_by=args.sort_by,
-            include_pairs=include_pairs,
-            top_k=args.top_k,
-            prefill_topology=args.prefill_topology,
-            decode_topology=args.decode_topology,
-            pd_ratio=pd_ratio,
-        ),
+        geometry, resolved_dtypes, chip, scenario, solve_opts
     )
     if args.cmd == "ceiling":
         return _dispatch_ceiling(args, serving_plan)
     src = args.model if args.model is not None else (model_ref or args.config)
+    ref_report = _build_reference_report_for_cli(
+        args, geometry, serving_plan, chip, solve_opts, parsed_ref=parsed_ref
+    )
     payload = (
         build_solve_payload(
             serving_plan,
@@ -536,12 +562,59 @@ def _dispatch_solve(
         if (args.html is not None or args.json)
         else None
     )
+    if payload is not None and ref_report is not None:
+        payload = attach_reference_report(payload, ref_report)
     if args.html is not None and payload is not None:
         write_html(payload, args.html)
     if args.json and payload is not None:
         sys.stdout.write(format_solve_json(payload) + "\n")
         return 0
-    return _write_solve_text_output(serving_plan, top_k=args.top_k)
+    return _write_solve_text_output(serving_plan, ref_report, top_k=args.top_k)
+
+
+def _build_reference_report_for_cli(
+    args: argparse.Namespace,
+    geometry: ModelGeometry,
+    serving_plan: ServingPlan,
+    chip: ChipSpec,
+    solve_opts: SolveOptions,
+    *,
+    parsed_ref: dict[str, dict[str, int]] | None = None,
+) -> ReferenceLayoutReport | None:
+    """Build optional reference-layout diagnostic report for solve CLI."""
+    ref_layout = args.reference_layout
+    if ref_layout is None:
+        return None
+    resolved_ref = parsed_ref if parsed_ref is not None else parse_layout(ref_layout)
+    topos = _resolve_solve_topologies(solve_opts, chip=chip)
+    rejected_by = explain_layout_rejection(geometry, resolved_ref, topos, solve_opts)
+    return reference_layout_report(
+        serving_plan,
+        top_layouts(serving_plan, args.top_k),
+        ref_layout,
+        rejected_by,
+    )
+
+
+def _write_reference_summary(ref_report: ReferenceLayoutReport | None) -> None:
+    """Write reference-layout summary line to stdout in text mode."""
+    if ref_report is None:
+        return
+    if ref_report["found"]:
+        concurrency = ref_report["concurrency"]
+        concurrency_part = f"c={concurrency}, " if concurrency is not None else ""
+        sys.stdout.write(
+            f"reference {ref_report['layout']}: "
+            f"{concurrency_part}"
+            f"tpot_bound_rank={ref_report['rank_by_tpot_bound']}/"
+            f"{ref_report['candidates']}, "
+            f"tput_rank={ref_report['rank_by_estimated_throughput']}/"
+            f"{ref_report['candidates']}\n"
+        )
+        return
+    sys.stdout.write(
+        f"reference {ref_report['layout']}: not found ({ref_report['rejected_by']})\n"
+    )
 
 
 def _apply_chip_overrides(chip: ChipSpec, args: argparse.Namespace) -> ChipSpec:
