@@ -1435,6 +1435,7 @@ def _prefill_candidates_kernel(
         buf,
         sems,
         store=store,
+        slot_bodies=False,
     )
 
     def put_rows(info, picked, live=True):
@@ -1515,6 +1516,11 @@ def _prefill_candidates_kernel(
         out.wait()
 
 
+# Pages per large-tile step of `_prefill_candidates_kernel`, its bodies one
+# per count of scored chunks (`_kernel_v3` without slot bodies: 3 x 128-page
+# bodies ran ~28K bundles, 3 x 256-page ones ~58K and 1.3-6x slower): half
+# the grid steps of 128-page groups.
+_PREFILL_PAGES_PER_STEP = 256
 # VMEM `_prefill_candidates_kernel` may take (v7x: 64 MiB per core, with room
 # for the compiler's own); a larger step picks its large tiles in their own
 # kernel. c64's 8K-token mixed step (2 heads folded) takes ~17 MiB.
@@ -1687,18 +1693,20 @@ def _class_candidates(
     rows = rows.reshape(num_tokens, num_heads).T  # [G, T]: head h of token t
     folded = folded[:, None]
     folded_cu = num_heads * cu_q_lens
-    plan = msa_indexer.class_plan(
+    class_plan = functools.partial(
+        msa_indexer.class_plan,
         folded,
         index_cache,
         local_lens,
         block_tables,
         folded_cu,
         num_seqs,
-        **msa.block_score_options(num_heads),
         scale_cache=scale_cache,
         scale_row=scale_row,
         interpret=interpret,
     )
+    options = msa.block_score_options(num_heads)
+    plan = class_plan(**options)
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     max_num_seqs = q_lens.shape[0]
     seq_of_token = jnp.minimum(seq_id, max_num_seqs - 1)
@@ -1739,11 +1747,12 @@ def _class_candidates(
 
     small = plan.small()
     small_picks = class_picks(small, plan.small_block_q, not plan.token_major)
+    prefill_plan = class_plan(**options | {"pages_per_step": _PREFILL_PAGES_PER_STEP})
     if _prefill_fits(
-        plan, index_cache, small_picks.shape[0], num_tokens * num_heads, topk
+        prefill_plan, index_cache, small_picks.shape[0], num_tokens * num_heads, topk
     ):
         packed = _prefill_candidates(
-            plan,
+            prefill_plan,
             index_cache,
             block_tables,
             folded_cu,
@@ -1757,8 +1766,8 @@ def _class_candidates(
                 init_blocks=init_blocks,
                 local_blocks=local_blocks,
                 dcp=dcp,
-                col_bits=_key_bits(plan.large_pages),
-                real_cols=plan.large_pages,
+                col_bits=_key_bits(prefill_plan.large_pages),
+                real_cols=prefill_plan.large_pages,
             ),
             rank=rank,
             interpret=interpret,

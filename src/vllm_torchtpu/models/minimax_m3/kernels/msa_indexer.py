@@ -387,6 +387,7 @@ def _kernel_v3(
     transposed=False,
     store=None,
     after_wait=None,
+    slot_bodies=True,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -409,6 +410,9 @@ def _kernel_v3(
     chunk]`` if `rows_major` (`_scores_transposed`), else ``[chunk, Bq]``;
     `after_wait(slot)`
     runs once the step's pages are in ring slot `slot`, before they are scored.
+    Without `slot_bodies` the bodies index the ring slot dynamically, one per
+    count of scored chunks rather than per slot and count: a third of the
+    code, for groups of many chunks.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -589,12 +593,14 @@ def _kernel_v3(
     # chunk's matmuls overlap the previous chunk's maxima.
     counts = sorted({num_chunks} | {2**k for k in range(1, 8) if 2**k < num_chunks})
     live_chunks = jnp.minimum(-(-live // chunk), num_chunks)
-    for slot in range(slots):
-        for i, n in enumerate(counts):
-            lo = counts[i - 1] if i else 0
-            pl.when((step % slots == slot) & (live_chunks > lo) & (live_chunks <= n))(
-                functools.partial(body, slot, n)
-            )
+    for i, n in enumerate(counts):
+        lo = counts[i - 1] if i else 0
+        in_count = (live_chunks > lo) & (live_chunks <= n)
+        if not slot_bodies:
+            pl.when(in_count)(functools.partial(body, step % slots, n))
+            continue
+        for slot in range(slots):
+            pl.when((step % slots == slot) & in_count)(functools.partial(body, slot, n))
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
