@@ -63,6 +63,8 @@ _UNIT = 32
 # VMEM `_max_window` leaves beside the kernel's buffers for Mosaic's own: a
 # 2,048-token window of 16 heads (35.6 MiB of buffers) compiles within 36 MiB,
 # 8, 24, 32 and 48 heads at their windows within 48 MiB (deviceless tpu7x).
+# It also holds the pair words' VMEM copy (2 x 132 KiB at a 2,048-token
+# window of top-16 selections).
 _VMEM_MARGIN = 2 * 1024 * 1024
 # Blocks the width ordering places per loop step (a chain of dependent
 # scalar loads, which the unrolled steps fill).
@@ -94,6 +96,7 @@ def _kernel(
     # In
     blocks_ref,  # SMEM [P]: page key | block size << 24
     words_ref,  # SMEM [P]: each pair's token | its visible slots << 16
+    words_vmem,  # [P / 128, 128]: the same words, for a block's limits as a vector
     q_hbm_ref,  # [T, H, D] in HBM
     kv_hbm_ref,  # [pages, S / 8, 4, G * 2D] uint8, in HBM
     scale_hbm_ref,  # [pages, R, S] f32, in HBM
@@ -181,14 +184,21 @@ def _kernel(
         next page's pairs, or padding) sees no slot, and its zero terms go to
         spare tokens: a block's tokens are distinct."""
         rows, targets = [], []
-        lane = jax.lax.broadcasted_iota(jnp.int32, (1, head_dim), 1)
-        limit = jnp.zeros((1, head_dim), jnp.int32)
         for j in range(width):
-            word = words_ref[i + j]
-            token = word & ((1 << _TOKEN_BITS) - 1)
+            token = words_ref[i + j] & ((1 << _TOKEN_BITS) - 1)
             rows.append(q_ref[token])
             targets.append(jnp.where(j < n, token, window + j))
-            limit = jnp.where(lane == j, word >> _TOKEN_BITS, limit)
+        # The block's visible slots on lanes 0 .. n - 1: words i .. i + 127
+        # are two rows of words_vmem, each rotated by i % 128.
+        off = i % _LANES
+        two = words_vmem[pl.ds(i // _LANES, 2), :]
+        shift = (_LANES - off) % _LANES
+        near = pltpu.roll(two[0:1], shift, 1)
+        far = pltpu.roll(two[1:2], shift, 1)
+        lane = jax.lax.broadcasted_iota(jnp.int32, (1, _LANES), 1)
+        limit = jnp.where(lane < _LANES - off, near, far) >> _TOKEN_BITS
+        limit = jnp.pad(limit, ((0, 0), (0, head_dim - _LANES)))
+        lane = jax.lax.broadcasted_iota(jnp.int32, (1, head_dim), 1)
         limit = jnp.where(lane < n, limit, 0)
         # [q | onehot(token)] against [K | A]: A[slot, j] masks the slots
         # token j does not see (`msa_attention_lse.MXU_MASK`).
@@ -539,8 +549,9 @@ def _work(keys, local_key, local_limit, window, page_size, interpret=False):
         interpret=interpret,
         name="minimax_m3_msa_pairs_work",
     )(pair.reshape(windows, r, _LANES))
-    # Room for the widest block past the last pair, in whole 1,024-word SMEM blocks.
-    pad = ((0, 0), (0, -(length + _WIDTHS[-1]) % 1024 + _WIDTHS[-1]))
+    # Room past the last pair for the widest block and for a block's 128 words
+    # in VMEM (`_kernel`'s limits), in whole 1,024-word SMEM blocks.
+    pad = ((0, 0), (0, -(length + _LANES) % 1024 + _LANES))
 
     def flat(x):
         return jnp.pad(x.reshape(windows, size)[:, :length], pad).reshape(-1)
@@ -676,6 +687,10 @@ def msa_sparse_attention_pairs(
             in_specs=[
                 smem,
                 smem,
+                pl.BlockSpec(
+                    (blocks.shape[0] // windows // _LANES, _LANES),
+                    lambda w, *_: (w, 0),
+                ),
                 pl.BlockSpec(memory_space=pl.ANY),
                 pl.BlockSpec(memory_space=pl.ANY),
                 pl.BlockSpec(memory_space=pl.ANY),
@@ -713,6 +728,7 @@ def msa_sparse_attention_pairs(
         width_blocks,
         blocks,
         words,
+        words.reshape(-1, _LANES),
         q,
         kv_cache,
         scale_cache,

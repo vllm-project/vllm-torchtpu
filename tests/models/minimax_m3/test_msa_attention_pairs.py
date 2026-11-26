@@ -206,7 +206,7 @@ def _work_reference(keys, local_key, local_limit, window, page_size):
     widest, widths = msa_attention_pairs._WIDTHS[-1], len(msa_attention_pairs._WIDTHS)
     blocks, words, num_pairs, width_blocks = [], [], [], []
     length = window * keys.shape[1]
-    pad = -(length + widest) % 1024 + widest
+    pad = -(length + 128) % 1024 + 128
     for w in range(keys.shape[0] // window):
         pairs = set()
         for t in range(w * window, (w + 1) * window):
