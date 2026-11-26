@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -653,7 +654,14 @@ def test_tpu_oot_custom_inv_freq_ropes_match_and_support_get_cos_sin(
     )
     _assert_cache_buffers_gone(tier2_rope)
 
+    is_proportional = rope_params.get("rope_type") == "proportional"
     for candidate in (tier1_rope, tier2_rope):
+        spec = candidate._in_graph_spec
+        assert isinstance(spec, rope_in_graph.RopeInGraphSpec)
+        if is_proportional:
+            assert spec.active_angles == 16
+        else:
+            assert spec.active_angles is None
         for method in (
             candidate,
             candidate.forward_native,
@@ -661,8 +669,12 @@ def test_tpu_oot_custom_inv_freq_ropes_match_and_support_get_cos_sin(
             candidate.forward_tpu,
         ):
             out_q, out_k = method(positions, q.clone(), k.clone())
-            torch.testing.assert_close(out_q, ref_q, rtol=0, atol=1.6e-2)
-            torch.testing.assert_close(out_k, ref_k, rtol=0, atol=1.6e-2)
+            if is_proportional:
+                assert torch.equal(out_q, ref_q)
+                assert torch.equal(out_k, ref_k)
+            else:
+                torch.testing.assert_close(out_q, ref_q, rtol=0, atol=1.6e-2)
+                torch.testing.assert_close(out_k, ref_k, rtol=0, atol=1.6e-2)
 
         cos, sin = candidate.get_cos_sin(32)
         torch.testing.assert_close(cos, ref_cos, rtol=0, atol=1.6e-2)
@@ -1358,3 +1370,152 @@ def test_vllm_deepseek_scaling_forward_uses_spec_without_indexing_cache(
         torch.testing.assert_close(uut_sin, ref_sin, rtol=0, atol=0)
     finally:
         torch.set_num_threads(prev_threads)
+
+
+def test_active_rope_angles_rules() -> None:
+    assert rope_in_graph.active_rope_angles((), None) is None
+    assert rope_in_graph.active_rope_angles((0.0, 0.0, 0.0, 0.0), None) is None
+    assert rope_in_graph.active_rope_angles((1.0, 0.5, 0.25, 0.125), None) is None
+    assert rope_in_graph.active_rope_angles((1.0, 0.0, 0.25, 0.125), None) is None
+    assert rope_in_graph.active_rope_angles((1.0, 0.5, 1e-38), None) is None
+
+    padded_128 = (*([1.0] * 32), *([0.0] * 96))
+    assert rope_in_graph.active_rope_angles(padded_128, None) == 32
+    assert rope_in_graph.active_rope_angles(padded_128, 32) == 32
+    assert rope_in_graph.active_rope_angles(padded_128, 16) is None
+    assert rope_in_graph.active_rope_angles(padded_128, 64) is None
+
+
+def test_compaction_is_off_without_trailing_zero_inv_freq(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers import rotary_embedding as rope_lib
+
+    std = _SyntheticRotaryEmbedding()
+    partial = _SyntheticRotaryEmbedding(rotary_dim=_HEAD_SIZE // 2)
+    mrope = _SyntheticRotaryEmbedding(mrope_section=[8, 12, 12], mrope_interleaved=True)
+    for mod in (std, partial, mrope):
+        assert (
+            rope_patch.patch_in_graph_rotary_embedding(mod, allow_table_recovery=True)
+            == 1
+        )
+        spec = getattr(mod, "_in_graph_spec", None)
+        assert isinstance(spec, rope_in_graph.RopeInGraphSpec)
+        assert spec.active_angles is None
+
+    monkeypatch.setattr(rope_lib, "_ROPE_DICT", {})
+    with set_current_vllm_config(_vllm_config(1024, in_graph=True)):
+        llama3 = rope_lib.get_rope(
+            _HEAD_SIZE,
+            max_position=1024,
+            is_neox_style=True,
+            rope_parameters={
+                "rope_type": "llama3",
+                "rope_theta": 500000.0,
+                "factor": 8.0,
+                "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0,
+                "original_max_position_embeddings": 8192,
+            },
+            dtype=torch.bfloat16,
+        )
+    spec = getattr(llama3, "_in_graph_spec", None)
+    assert isinstance(spec, rope_in_graph.RopeInGraphSpec)
+    assert spec.active_angles is None
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("neox", [True, False])
+def test_proportional_rope_rotates_only_active_angles(
+    dtype: torch.dtype, neox: bool
+) -> None:
+    """Compact proportional RoPE matches unpatched and full-width forwards.
+
+    Note on sign of zero: on identity pairs the full-width path computes
+    `x - (y * 0.0)`, turning `-0.0` into `+0.0` when `y < 0`, whereas the compact
+    path passes `-0.0` through unchanged. `torch.equal` treats `-0.0` and `+0.0`
+    as equal (a raw bitwise compare would not).
+    """
+    rope = _SyntheticProportionalRotaryEmbedding(is_neox_style=neox, dtype=dtype)
+    ref_rope = copy.deepcopy(rope)
+    rot = rope.rope_angles
+    half = rope.rotary_dim // 2
+
+    positions = torch.tensor([0, 1, 13, 127, 511], dtype=torch.int32)
+    q, k = _qk(positions.numel(), dtype=dtype)
+    ref_q, ref_k = ref_rope(positions, q.clone(), k.clone())
+    assert ref_k is not None
+
+    assert (
+        rope_patch.patch_in_graph_rotary_embedding(rope, allow_table_recovery=True) == 1
+    )
+    spec = getattr(rope, "_in_graph_spec", None)
+    assert isinstance(spec, rope_in_graph.RopeInGraphSpec)
+    assert spec.active_angles == rot
+
+    out_q, out_k = rope(positions, q.clone(), k.clone())
+    assert out_k is not None
+    assert torch.equal(out_q, ref_q)
+    assert torch.equal(out_k, ref_k)
+
+    full_rope = copy.deepcopy(rope)
+    full_rope._in_graph_spec = dataclasses.replace(spec, active_angles=None)
+    full_q, full_k = full_rope(positions, q.clone(), k.clone())
+    assert full_k is not None
+    assert torch.equal(out_q, full_q)
+    assert torch.equal(out_k, full_k)
+
+    qv = q.view(positions.numel(), -1, rope.head_size)
+    kv = k.view(positions.numel(), -1, rope.head_size)
+    oqv = out_q.view(positions.numel(), -1, rope.head_size)
+    okv = out_k.view(positions.numel(), -1, rope.head_size)
+    if neox:
+        assert torch.equal(oqv[..., rot:half], qv[..., rot:half])
+        assert torch.equal(oqv[..., half + rot :], qv[..., half + rot :])
+        assert torch.equal(okv[..., rot:half], kv[..., rot:half])
+        assert torch.equal(okv[..., half + rot :], kv[..., half + rot :])
+    else:
+        assert torch.equal(oqv[..., 2 * rot :], qv[..., 2 * rot :])
+        assert torch.equal(okv[..., 2 * rot :], kv[..., 2 * rot :])
+
+    cos, sin = rope.get_cos_sin(16)
+    assert cos.shape == (16, rope.head_size // 2)
+    assert sin.shape == (16, rope.head_size // 2)
+    assert torch.all(cos[:, rot:] == 1)
+    assert torch.all(sin[:, rot:] == 0)
+
+
+def test_proportional_tier1_in_graph_cache_stays_full_width(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier-1 proportional RoPE compacts forward; `InGraphCosSinCache` stays full."""
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers import rotary_embedding as rope_lib
+
+    monkeypatch.setattr(rope_lib, "_ROPE_DICT", {})
+    with set_current_vllm_config(_vllm_config(1024, in_graph=True)):
+        rope = rope_lib.get_rope(
+            _HEAD_SIZE,
+            max_position=1024,
+            is_neox_style=True,
+            rope_parameters={
+                "rope_type": "proportional",
+                "rope_theta": 1000000.0,
+                "partial_rotary_factor": 0.25,
+            },
+            dtype=torch.bfloat16,
+        )
+    spec = getattr(rope, "_in_graph_spec", None)
+    assert isinstance(spec, rope_in_graph.RopeInGraphSpec)
+    assert spec.active_angles == 8
+
+    cache = rope.cos_sin_cache
+    assert isinstance(cache, rope_in_graph.InGraphCosSinCache)
+    assert cache.shape == (1024, _HEAD_SIZE)
+    positions = torch.tensor([0, 1, 13, 127], dtype=torch.int32)
+    rows = cache[positions]
+    assert rows.shape == (positions.numel(), _HEAD_SIZE)
+    cos, sin = rows.chunk(2, dim=-1)
+    assert torch.all(cos[:, 8:] == 1)
+    assert torch.all(sin[:, 8:] == 0)

@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 from typing import Any
 
 import pytest
@@ -435,3 +437,69 @@ def test_mla_wrapper_process_weights_after_loading_tracks_tpu_device(
     else:
         assert isinstance(wrapper.rotary_emb.cos_sin_cache, torch.Tensor)
         assert wrapper.rotary_emb.cos_sin_cache.device.type == "tpu"
+
+
+@pytest.mark.parametrize("num_tokens", [256, 4096])
+def test_proportional_compact_matches_full_width_on_tpu(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+) -> None:
+    """Compact proportional RoPE forward is `torch.equal` to full-width on TPU.
+
+    On identity pairs the full-width path computes `x - (y * 0.0)` (turning `-0.0`
+    into `+0.0` when `y < 0`) while the compact path passes `-0.0` through;
+    `torch.equal` treats both zeros as equal.
+    """
+    import torch_tpu  # noqa: F401
+
+    head_size = 256
+    max_pos = 262144
+    num_q_heads = 32
+    num_kv_heads = 8
+
+    monkeypatch.setattr(rope_lib, "_ROPE_DICT", {})
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        additional_config={rope_in_graph_flag.KEY: True},
+    )
+    dev = torch.device("tpu")
+
+    with set_current_vllm_config(config), dev:
+        rope = rope_lib.get_rope(
+            head_size,
+            max_position=max_pos,
+            is_neox_style=True,
+            rope_parameters={
+                "rope_type": "proportional",
+                "rope_theta": 1000000.0,
+                "partial_rotary_factor": 0.25,
+            },
+            dtype=torch.bfloat16,
+        )
+
+    spec = getattr(rope, "_in_graph_spec", None)
+    assert isinstance(spec, rope_in_graph.RopeInGraphSpec)
+    assert spec.active_angles == 32
+
+    full_rope = copy.deepcopy(rope)
+    full_rope._in_graph_spec = dataclasses.replace(spec, active_angles=None)
+
+    gen = torch.Generator().manual_seed(num_tokens)
+    pos = torch.randint(0, max_pos, (num_tokens,), dtype=torch.int32, generator=gen).to(
+        dev
+    )
+    q = torch.randn(
+        num_tokens, num_q_heads * head_size, dtype=torch.bfloat16, generator=gen
+    ).to(dev)
+    k = torch.randn(
+        num_tokens, num_kv_heads * head_size, dtype=torch.bfloat16, generator=gen
+    ).to(dev)
+
+    run_compact = torch.compile(rope, backend="tpu", fullgraph=True, dynamic=False)
+    run_full = torch.compile(full_rope, backend="tpu", fullgraph=True, dynamic=False)
+
+    cq, ck = run_compact(pos, q, k)
+    fq, fk = run_full(pos, q, k)
+    assert ck is not None and fk is not None
+    assert torch.equal(cq.cpu(), fq.cpu())
+    assert torch.equal(ck.cpu(), fk.cpu())
