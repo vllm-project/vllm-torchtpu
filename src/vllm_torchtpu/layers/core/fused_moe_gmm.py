@@ -950,6 +950,7 @@ def fused_moe_scatter_planned(
     src_rows=None,
     tail=None,
     row_scale=None,
+    wave_lhs=None,
     *,
     activation: str,
     rhs_quant_dtype=None,
@@ -971,12 +972,20 @@ def fused_moe_scatter_planned(
     the one-hot permute gives; ``src_rows`` [1] (default R) bounds the rows
     they come from. ``row_scale`` [R] (with ``row_gather``): ``hidden_states``
     holds fp8 row words [R, 8, H / 32] and row ``r`` stands for bf16
-    ``hidden_states[r] * row_scale[r]`` (see `gather_rows`)."""
+    ``hidden_states[r] * row_scale[r]`` (see `gather_rows`).
+
+    ``wave_lhs`` = (recv, row_scale_sorted, wave_sems): the routes' rows
+    instead land while the expert kernel runs (see `gmm_v2_mlp_scatter`),
+    fp8 row words in route order, sorted route ``j``'s at ``recv[j]`` with
+    token scale ``row_scale_sorted[j]``; ``hidden_states`` and
+    ``token_sorted`` are not read. The routes are a multiple of 16."""
     if w1_scale.ndim == 3:
         w1_scale = jnp.expand_dims(w1_scale, 2)
     if w2_scale.ndim == 3:
         w2_scale = jnp.expand_dims(w2_scale, 2)
-    if row_gather:
+    if wave_lhs is not None:
+        x = None
+    elif row_gather:
         # The expert kernel takes rows in whole 16-row tiles; it pads the
         # same way when the routes are not.
         pad = -token_sorted.shape[0] % 16
@@ -1003,6 +1012,7 @@ def fused_moe_scatter_planned(
         expected,
         extra,
         tail,
+        wave_lhs,
         num_recv_rows=num_recv_rows,
         num_extra_recv_rows=num_extra_recv_rows,
         axis=axis,
