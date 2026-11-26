@@ -6302,6 +6302,14 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.layers.adapter.fused_moe_decode import arm_runner_models
 
             arm_runner_models(self)
+        # After the fused decode kernels (they take the shared expert of the
+        # layers they arm first). Target model only.
+        if envs.TPU_MOE_DENSE_FP4_SHARED:
+            from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
+                arm_dense_fp4_shared,
+            )
+
+            arm_dense_fp4_shared(self.model, "target model")
 
         # After the drafter: an MTP draft re-reads the target checkpoint.
         from vllm_torchtpu.model_loader_patches import evict_loaded_weights_page_cache

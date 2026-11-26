@@ -113,7 +113,7 @@ def test_sparse_rows_match_all_rows_kernel_bitwise(monkeypatch, m, h, i, e, topk
         # at most one bf16 rounding step apart. With the all-rows kernel's
         # unit width the rows mode is bit-identical.
         np.testing.assert_allclose(sparse, dense, rtol=2**-7, atol=2**-7)
-        monkeypatch.setattr(k, "_rows_chunk", lambda m, h, i, cap: k._chunk(i))
+        monkeypatch.setattr(k, "_rows_chunk", lambda m, h, i, *a: k._chunk(i))
         k.dense_expert_moe_fp4.clear_cache()
         same = _run(x, w1, w2, s1, s2, tw, ids, sparse_rows=True)
         np.testing.assert_array_equal(same, dense)
@@ -170,9 +170,7 @@ def test_admission():
     s1b = jax.ShapeDtypeStruct((129, h // 128, 1, 2 * i), jnp.float32)
     s2b = jax.ShapeDtypeStruct((129, i // 128, 1, h), jnp.float32)
     assert not k.can_use_dense_expert_fp4(x, big[0], w2b, s1b, s2b, **ok)
-    assert k.can_use_dense_expert_fp4(
-        x, big[0], w2b, s1b, s2b, activation="swigluoai"
-    )
+    assert k.can_use_dense_expert_fp4(x, big[0], w2b, s1b, s2b, activation="swigluoai")
     # Token buffers past VMEM (MiniMax-M3-sized hidden): no unit fits.
     xh = jax.ShapeDtypeStruct((4096, 3072), jnp.bfloat16)
     w1h = jax.ShapeDtypeStruct((8, 3072, 2 * 1536), FP4)
@@ -182,3 +180,75 @@ def test_admission():
     assert not k.can_use_dense_expert_fp4(xh, w1h, w2h, s1h, s2h, **ok)
     xs = jax.ShapeDtypeStruct((128, 3072), jnp.bfloat16)
     assert k.can_use_dense_expert_fp4(xs, w1h, w2h, s1h, s2h, **ok)
+
+
+# ------------------------------------------------------------ shared expert
+# (TPU_MOE_DENSE_FP4_SHARED)
+
+
+def _shared(h, i_s, seed=5):
+    rng = np.random.default_rng(seed)
+    e4m3 = jnp.float8_e4m3fn
+    return k.SharedExpert(
+        jnp.asarray(rng.normal(size=(h, 2 * i_s)), jnp.float32).astype(e4m3),
+        # MiniMax-M3's per-channel scales are powers of two.
+        jnp.asarray(2.0 ** rng.integers(-7, -4, (1, 2 * i_s)), jnp.float32),
+        jnp.asarray(rng.normal(size=(i_s, h)), jnp.float32).astype(e4m3),
+        jnp.asarray(2.0 ** rng.integers(-8, -5, (1, h)), jnp.float32),
+    )
+
+
+def _shared_reference(x, sh):
+    """torch_tpu's roundings: bf16(bf16(x @ bf16(w)) * s) per projection."""
+    f32, bf16 = jnp.float32, jnp.bfloat16
+    i_s = sh.w2.shape[0]
+
+    def proj(v, w, s):
+        y = jnp.dot(v, w.astype(bf16), preferred_element_type=f32)
+        return (y.astype(bf16).astype(f32) * s).astype(bf16)
+
+    gu = proj(x, sh.w1, sh.s1).astype(f32)
+    act = k.shared_activation(gu[:, :i_s], gu[:, i_s:]).astype(bf16)
+    return proj(act, sh.w2, sh.s2)
+
+
+@pytest.mark.parametrize(
+    "m,sparse",
+    [(1, False), (12, False), (16, False), (24, True), (77, True), (128, True)],
+)
+def test_shared_expert_in_the_same_call(m, sparse):
+    h, i, e, i_s = 256, 256, 8, 256
+    w1, w2, s1, s2 = _experts(e, h, i)
+    ids, tw = _routing(m, e, 4)
+    x = _tokens(m, h)
+    sh = _shared(h, i_s)
+    kw = dict(activation="swigluoai", sparse_rows=sparse)
+    assert k.can_use_dense_expert_fp4(x, w1, w2, s1, s2, shared=sh, **kw)
+    routed = _run(x, w1, w2, s1, s2, tw, ids, **kw)
+    both = _run(x, w1, w2, s1, s2, tw, ids, shared=sh, **kw)
+    shared = np.asarray(_shared_reference(x, sh).astype(jnp.float32))
+    want = np.asarray(jnp.asarray(routed + shared).astype(jnp.bfloat16), np.float32)
+    # The routed sum rounds to bf16 first, then the bf16 add (the separate
+    # add's roundings): bit-identical.
+    np.testing.assert_array_equal(both, want)
+    if sparse:
+        dense_rows = _run(x, w1, w2, s1, s2, tw, ids, shared=sh)
+        np.testing.assert_array_equal(both, dense_rows)
+
+
+def test_shared_expert_admission():
+    h, i, e = 256, 256, 4
+    w1, w2, s1, s2 = _experts(e, h, i)
+    x = _tokens(8, h)
+    sh = _shared(h, 256)
+    assert not k.can_use_dense_expert_fp4(
+        x, w1, w2, s1, s2, activation="silu", shared=sh
+    )
+    bad = sh._replace(s1=sh.s1.astype(jnp.bfloat16))
+    assert not k.can_use_dense_expert_fp4(
+        x, w1, w2, s1, s2, activation="swigluoai", shared=bad
+    )
+    odd = _shared(h, 192)
+    assert not k.can_use_dense_expert_fp4(
+        x, w1, w2, s1, s2, activation="swigluoai", shared=odd
+    )

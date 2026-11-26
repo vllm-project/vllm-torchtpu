@@ -593,7 +593,22 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 
-        return fused_moe_gmm(**kwargs)
+        from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
+            SHARED_ROWS_ATTR,
+            model_side_shared,
+            shared_operands,
+        )
+
+        # An armed shared expert (TPU_MOE_DENSE_FP4_SHARED) runs in the routed
+        # op unless this step leaves it to the model.
+        shared = shared_operands(layer)
+        if shared is None or model_side_shared(layer, x.shape[0]):
+            return fused_moe_gmm(**kwargs)
+        # The model's gathered e4m3 rows for the shared expert, if any (see
+        # SHARED_ROWS_ATTR).
+        return fused_moe_gmm(
+            **kwargs, shared=shared, shared_rows=getattr(layer, SHARED_ROWS_ATTR, None)
+        )
 
     def _gmm_route(
         self, layer: TpuRoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
