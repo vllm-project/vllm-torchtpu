@@ -242,6 +242,12 @@ _TAIL_PAGES = (96,)
 assert all(t % 2 == 0 for t in _TAIL_PAGES), "tails pair their pages"
 # Page groups in `_kernel_v3`'s DMA ring.
 _RING_SLOTS = 3
+# `_kernel_v3`'s block-table windows start at multiples of this many entries
+# (the lane width), as HBM -> SMEM copies of a 1-D table need.
+_TABLE_ALIGN = 128
+# Block-table windows in SMEM: the ring's groups and the windows copied
+# ahead of them.
+_TABLE_SLOTS = _RING_SLOTS + 1
 # Folded 4-bit and fp8 tiles of up to this many rows score transposed
 # (`_chunk_maxima_t`, maxima across lanes); larger ones score token-major
 # (maxima across sublanes), a folded page with its slot scales folded into
@@ -396,17 +402,20 @@ def _kernel_v3(
     # Scalar prefetch
     work_ref,  # [groups] tile << _TILE_SHIFT | page group within the request
     tile_seq_ref,  # [tiles] request of each tile
-    block_tables_ref,  # [max_num_seqs * pages_per_seq]
     seq_pages_ref,  # [max_num_seqs] pages of each request
     # In
     q_ref,  # [Bq, D]
     cache_ref,  # [pages, S / p, p, D] index cache, left in HBM
+    block_tables_ref,  # [max_num_seqs * pages_per_seq (+ pad)], left in HBM
     # Out
     o_ref,  # [G, Bq], or [Bq, G] if `transposed`
     # Scratch
     buf,  # [R, G, S / p, D] ring of R groups of pages, as 32-bit words
     sems,  # DMA semaphores [R], one per ring slot
+    tables,  # SMEM [W * table_len]: block-table windows of W work items
+    table_sems,  # DMA semaphores [W], one per window
     *,
+    pages_per_seq,
     transposed=False,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
@@ -424,14 +433,19 @@ def _kernel_v3(
 
     A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
     int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
+
+    The block table stays in HBM: each work item's window of it is copied
+    into SMEM a step before its pages are issued, so the call does not start
+    with a copy of the whole table into SMEM.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
+    table_slots = table_sems.shape[0]
+    table_len = tables.shape[0] // table_slots
     ahead = slots - 1
     block_q = q_ref.shape[0]
     folded = msa_fp4.scales_in_page(rows, cache_ref.dtype)
     page_size = _page_tokens(rows, cache_ref.dtype)
     chunk = _v3_chunk(pages_per_step, block_q, page_size)
-    pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
     # The pages as 32-bit words: a dense VMEM layout, so each key vreg is one
     # load (a packed [S / p, p, D] page tiles VMEM in (p, D) tiles).
@@ -444,14 +458,32 @@ def _kernel_v3(
         first = (entry & _GROUP_MASK) * pages_per_step
         return seq * pages_per_seq + first, jnp.maximum(seq_pages_ref[seq] - first, 1)
 
-    def copy(base, g, slot):
+    def table_start(base):
+        """The first block-table entry of the window holding `base`."""
+        return base // _TABLE_ALIGN * _TABLE_ALIGN
+
+    def table_copy(k):
+        """The copy of work item `k`'s block-table window into its slot."""
+        base, _ = group(jnp.minimum(k, num_steps - 1))
+        slot = k % table_slots
+        return pltpu.make_async_copy(
+            block_tables_ref.at[
+                pl.ds(pl.multiple_of(table_start(base), _TABLE_ALIGN), table_len)
+            ],
+            tables.at[pl.ds(pl.multiple_of(slot * table_len, _TABLE_ALIGN), table_len)],
+            table_sems.at[slot],
+        )
+
+    def copy(base, g, slot, table_slot):
         col = g
         if pages_per_seq % pages_per_step:
             # Keep the last group's block-table reads in its request's row.
             first = base % pages_per_seq
             col = jnp.minimum(first + g, pages_per_seq - 1) - first
+        if table_len > pages_per_step:  # windows start below unaligned groups
+            col = col + base - table_start(base)
         return pltpu.make_async_copy(
-            words.at[block_tables_ref[base + col]],
+            words.at[tables[table_slot * table_len + col]],
             buf.at[slot, g],
             sems.at[slot],
         )
@@ -472,26 +504,39 @@ def _kernel_v3(
             words.at[pl.ds(0, n)], buf.at[slot, pl.ds(0, n)], sems.at[slot]
         )
 
-    def start(base, live, pages, slot):
-        """Start the copies of a group's `pages` that are below its `live`
-        pages, alternate pages on the second DMA queue (priority 1)."""
+    def start(item, pages, slot):
+        """Start the copies of `item`'s (`ahead_group`) `pages` that are below
+        its live pages, alternate pages on the second DMA queue (priority 1)."""
+        base, live, table_slot = item
         for g in pages:
             pl.when(g < live)(
-                functools.partial(copy(base, g, slot).start, priority=g % 2)
+                functools.partial(copy(base, g, slot, table_slot).start, priority=g % 2)
             )
 
     def ahead_group(k):
-        """(first entry, live pages) of work item `k`; none past the grid."""
+        """(first entry, live pages, table slot) of work item `k`; no live
+        pages past the grid."""
         k_base, k_live = group(jnp.minimum(k, num_steps - 1))
-        return k_base, jnp.where(k < num_steps, k_live, 0)
+        return k_base, jnp.where(k < num_steps, k_live, 0), k % table_slots
+
+    lead = table_slots - ahead - 1
 
     @pl.when(step == 0)
     def _():
+        for k in range(ahead + lead):
+            pl.when(k < num_steps)(table_copy(k).start)
         for k in range(ahead):
-            start(*ahead_group(k), range(pages_per_step), k)
+            pl.when(k < num_steps)(table_copy(k).wait)
+            start(ahead_group(k), range(pages_per_step), k)
 
+    # The ahead group's table window is needed for its copies below; the
+    # one `lead` steps later starts now.
+    pl.when(step + ahead < num_steps)(table_copy(step + ahead).wait)
+    pl.when(step + ahead + lead < num_steps)(
+        lambda: table_copy(step + ahead + lead).start()
+    )
     base, live = group(step)
-    next_base, next_live = ahead_group(step + ahead)
+    next_item = ahead_group(step + ahead)
     q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
     # Prefill-chunk tiles only (`FP8_MXU_QUERIES`); decode-sized tiles keep bf16.
     fp8_queries = FP8_MXU_QUERIES and block_q > DEFAULT_BLOCK_Q
@@ -515,8 +560,7 @@ def _kernel_v3(
         def issue(j):
             if j < chunk // 2:
                 start(
-                    next_base,
-                    next_live,
+                    next_item,
                     share[j * per_pair : (j + 1) * per_pair],
                     (slot + ahead) % slots,
                 )
@@ -538,7 +582,7 @@ def _kernel_v3(
                 o_ref[pl.ds(first, size), :] = m.T
             if size < chunk:
                 rest = share[size // 2 * per_pair :]
-                start(next_base, next_live, rest, (slot + ahead) % slots)
+                start(next_item, rest, (slot + ahead) % slots)
             return
 
         if folded:
@@ -599,7 +643,7 @@ def _kernel_v3(
             if size > 0:
                 score_chunk(slot, c * chunk, pages, size)
             else:
-                start(next_base, next_live, pages, (slot + ahead) % slots)
+                start(next_item, pages, (slot + ahead) % slots)
 
     # One straight-line body per slot and count of scored pages, so that a
     # chunk's matmuls overlap the previous chunk's maxima.
@@ -831,12 +875,27 @@ def _class_scores(
                 f"pages_per_step must be an even divisor or a multiple of it, "
                 f"got {pages_per_step}"
             )
+        # Block-table windows of a group's entries, whole alignment units:
+        # an unaligned group's starts below it, so it takes one more, and the
+        # table is padded for the last request's.
+        table_len = -(-pages_per_step // _TABLE_ALIGN) * _TABLE_ALIGN
+        if (pages_per_seq % _TABLE_ALIGN) or (pages_per_step % _TABLE_ALIGN):
+            table_len += _TABLE_ALIGN
+        last_base = (max_num_seqs - 1) * pages_per_seq + padded_pages - pages_per_step
+        table_end = last_base // _TABLE_ALIGN * _TABLE_ALIGN + table_len
+        tables = jnp.pad(block_tables, (0, max(0, table_end - block_tables.shape[0])))
         scores_t = pl.pallas_call(
-            functools.partial(_kernel_v3, transposed=token_major),
+            functools.partial(
+                _kernel_v3, pages_per_seq=pages_per_seq, transposed=token_major
+            ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=4,
+                num_scalar_prefetch=3,
                 grid=grid_spec.grid,
-                in_specs=[grid_spec.in_specs[0], pl.BlockSpec(memory_space=pl.ANY)],
+                in_specs=[
+                    grid_spec.in_specs[0],
+                    pl.BlockSpec(memory_space=pl.ANY),
+                    pl.BlockSpec(memory_space=pl.ANY),
+                ],
                 out_specs=out_specs,
                 scratch_shapes=[
                     pltpu.VMEM(
@@ -844,13 +903,15 @@ def _class_scores(
                         jnp.uint32,
                     ),
                     pltpu.SemaphoreType.DMA((_RING_SLOTS,)),
+                    pltpu.SMEM((_TABLE_SLOTS * table_len,), jnp.int32),
+                    pltpu.SemaphoreType.DMA((_TABLE_SLOTS,)),
                 ],
             ),
             out_shape=out_shape,
             compiler_params=params,
             interpret=interpret,
             name="minimax_m3_msa_block_scores",
-        )(work, tile_info, block_tables, seq_pages, q_rows, index_cache)
+        )(work, tile_info, seq_pages, q_rows, index_cache, tables)
     else:
         kernel_fn = _KERNELS[kernel]
         if fp4:
