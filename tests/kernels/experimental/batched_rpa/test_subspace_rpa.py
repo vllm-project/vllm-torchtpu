@@ -166,10 +166,12 @@ def test_subspace_rpa_prefill_decode_and_mixed_parity(
     sm_scale = _HEAD_DIM**-0.5
     pages_per_seq = 3
     num_seqs = 2
-    # Allocate 1 extra canary page at the end to verify untouched pages stay intact.
+    # Use a shuffled page table with an untouched canary page in the middle so
+    # page-table indirection mistakes cannot hide behind an identity mapping.
     total_pages = num_seqs * pages_per_seq + 1
-    canary_page = total_pages - 1
-    page_indices = jnp.arange(num_seqs * pages_per_seq, dtype=jnp.int32)
+    canary_page = 3
+    page_table_list = [5, 1, 6, 2, 0, 4]
+    page_indices = jnp.asarray(page_table_list, dtype=jnp.int32)
 
     max_len = pages_per_seq * _PAGE_SIZE
     full_k_rot = [
@@ -350,7 +352,7 @@ def test_subspace_rpa_prefill_decode_and_mixed_parity(
     # decode append, and chunked-prefill tail) and verify canary page is untouched.
     for seq_idx, kv_len in enumerate(mixed_kv_lens):
         for tok_pos in (0, _PAGE_SIZE - 1, _PAGE_SIZE, kv_len - 1):
-            page_id = seq_idx * pages_per_seq + (tok_pos // _PAGE_SIZE)
+            page_id = page_table_list[seq_idx * pages_per_seq + (tok_pos // _PAGE_SIZE)]
             offset = tok_pos % _PAGE_SIZE
             got_bytes = _extract_cache_token_bytes(cache, page_id, offset, kv_layout)
             want_bytes = _pack_expected_page_token(
@@ -364,3 +366,107 @@ def test_subspace_rpa_prefill_decode_and_mixed_parity(
         jax.lax.bitcast_convert_type(cache, jnp.uint8)[canary_page]
     )
     np.testing.assert_array_equal(after_canary, canary_bytes)
+
+
+@pytest.mark.parametrize(
+    "kv_layout",
+    [configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE],
+)
+def test_subspace_rpa_default_block_sizes_parity(kv_layout: configs.KVLayout) -> None:
+    """Exercise default calculate_block_sizes on TPU at a serving shape."""
+    rng = np.random.default_rng(71)
+    num_q_heads = 4
+    num_kv_heads = 1
+    page_size = 256
+    sm_scale = _HEAD_DIM**-0.5
+    pages_per_seq = 4
+    num_seqs = 2
+    total_pages = num_seqs * pages_per_seq
+    page_table = [6, 2, 7, 0, 5, 1, 4, 3]
+    page_indices = jnp.asarray(page_table, dtype=jnp.int32)
+
+    max_len = pages_per_seq * page_size
+    full_k_rot = [
+        (rng.standard_normal((max_len, num_kv_heads, _ROT_DIM)) * 0.5).astype(
+            np.float32
+        )
+        for _ in range(num_seqs)
+    ]
+    full_v = [
+        (rng.standard_normal((max_len, num_kv_heads, _HEAD_DIM)) * 0.5).astype(
+            np.float32
+        )
+        for _ in range(num_seqs)
+    ]
+    cache_shape = wrapper.get_kv_cache_shape(
+        total_pages,
+        page_size,
+        num_kv_heads,
+        _HEAD_DIM,
+        jnp.float8_e4m3fn,
+        kv_layout=kv_layout,
+        subspace_k_rot_dim=_ROT_DIM,
+    )
+    cache = jax.lax.bitcast_convert_type(
+        jnp.full(cache_shape, 0x38, dtype=jnp.uint8), jnp.float8_e4m3fn
+    )
+
+    prefill_lens = (300, 270)
+    q_pre = (
+        rng.standard_normal((sum(prefill_lens), num_q_heads, _HEAD_DIM)) * 0.5
+    ).astype(np.float32)
+    k_pre = np.concatenate(
+        [full_k_rot[i][: prefill_lens[i]] for i in range(num_seqs)], axis=0
+    )
+    v_pre = np.concatenate(
+        [full_v[i][: prefill_lens[i]] for i in range(num_seqs)], axis=0
+    )
+    q_j, k_j, v_j = _prepare_step_inputs(q_pre, k_pre, v_pre, kv_layout)
+    out_pre, cache = wrapper.ragged_paged_attention(
+        q_j,
+        k_j,
+        v_j,
+        cache,
+        jnp.asarray(prefill_lens, jnp.int32),
+        page_indices,
+        jnp.array([0, prefill_lens[0], sum(prefill_lens)], jnp.int32),
+        jnp.array([0, 0, num_seqs], jnp.int32),
+        sm_scale=sm_scale,
+        k_scale=_K_SCALE,
+        v_scale=_V_SCALE,
+        kv_layout=kv_layout,
+    )
+    ref_pre = _reference_subspace_attention(
+        q_pre, full_k_rot, full_v, prefill_lens, prefill_lens, kv_layout, sm_scale
+    )
+    np.testing.assert_allclose(
+        np.asarray(out_pre.astype(jnp.float32)), ref_pre, atol=2.5e-2, rtol=2e-2
+    )
+
+    dec_kv_lens = (prefill_lens[0] + 1, prefill_lens[1] + 1)
+    q_dec = (rng.standard_normal((num_seqs, num_q_heads, _HEAD_DIM)) * 0.5).astype(
+        np.float32
+    )
+    k_dec = np.stack([full_k_rot[i][prefill_lens[i]] for i in range(num_seqs)], axis=0)
+    v_dec = np.stack([full_v[i][prefill_lens[i]] for i in range(num_seqs)], axis=0)
+    q_j, k_j, v_j = _prepare_step_inputs(q_dec, k_dec, v_dec, kv_layout)
+    out_dec, cache = wrapper.ragged_paged_attention(
+        q_j,
+        k_j,
+        v_j,
+        cache,
+        jnp.asarray(dec_kv_lens, jnp.int32),
+        page_indices,
+        jnp.array([0, 1, 2], jnp.int32),
+        jnp.array([num_seqs, num_seqs, num_seqs], jnp.int32),
+        sm_scale=sm_scale,
+        k_scale=_K_SCALE,
+        v_scale=_V_SCALE,
+        kv_layout=kv_layout,
+    )
+    ref_dec = _reference_subspace_attention(
+        q_dec, full_k_rot, full_v, (1, 1), dec_kv_lens, kv_layout, sm_scale
+    )
+    np.testing.assert_allclose(
+        np.asarray(out_dec.astype(jnp.float32)), ref_dec, atol=2.5e-2, rtol=2e-2
+    )

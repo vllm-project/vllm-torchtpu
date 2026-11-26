@@ -700,21 +700,13 @@ class RpaConfigs:
                 num_lanes=tpu_info.num_lanes,
                 num_sublanes=tpu_info.num_sublanes,
             )
-            if k.shape != (
+            exp_k = (
                 q.shape[0],
                 self.model.num_kv_heads,
                 self.serve.subspace_k_rot_dim,
-            ) or v.shape != (
-                q.shape[0],
-                self.model.num_kv_heads,
-                expected_kv_head_dim,
-            ):
-                exp_k = (
-                    q.shape[0],
-                    self.model.num_kv_heads,
-                    self.serve.subspace_k_rot_dim,
-                )
-                exp_v = (q.shape[0], self.model.num_kv_heads, expected_kv_head_dim)
+            )
+            exp_v = (q.shape[0], self.model.num_kv_heads, expected_kv_head_dim)
+            if k.shape != exp_k or v.shape != exp_v:
                 raise ValueError(
                     f"Subspace-RPA expected k={exp_k} and v={exp_v}, "
                     f"got {k.shape=}, {v.shape=}"

@@ -163,8 +163,14 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
 }
 
 
-def _is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
-    return cache_dtype_str.lower().strip() in frozenset(("fp8", "fp8_e4m3", "fp8_e5m2"))
+def is_8bit_float_dtype(dtype: torch.dtype | None) -> bool:
+    """Return True for 8-bit floating dtypes (excludes int8/uint8 packed FP4)."""
+    return dtype is not None and dtype.is_floating_point and dtype.itemsize == 1
+
+
+def is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
+    dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE.get(cache_dtype_str.lower().strip())
+    return is_8bit_float_dtype(dtype)
 
 
 def _resolve_kv_cache_dtype(cache_dtype: str | torch.dtype) -> torch.dtype:
@@ -622,11 +628,6 @@ def _pallas_rpa_kernel_batched(
 # ======================================================================================
 
 
-def is_8bit_float_dtype(dtype: torch.dtype | None) -> bool:
-    """Return True for 8-bit floating dtypes (excludes int8/uint8 packed FP4)."""
-    return dtype is not None and dtype.is_floating_point and dtype.itemsize == 1
-
-
 def is_subspace_rpa_model_config(model_config: Any) -> bool:
     """Return True if ``model_config`` is Gemma 4 eligible for Subspace-RPA."""
     if model_config is None:
@@ -1046,7 +1047,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         self.kv_cache_quantized_dtype = None
         # Only set kv_cache_quantized_dtype for fp8 KV cache
-        if _is_fp8_kv_cache_dtype(kv_cache_dtype):
+        if is_fp8_kv_cache_dtype(kv_cache_dtype):
             self.kv_cache_quantized_dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE[
                 kv_cache_dtype.lower().strip()
             ]

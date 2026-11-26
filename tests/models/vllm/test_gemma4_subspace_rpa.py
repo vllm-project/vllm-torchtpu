@@ -22,7 +22,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
-from vllm.config import CacheConfig, DeviceConfig, VllmConfig, set_current_vllm_config
+from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.config.attention import AttentionConfig
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -88,6 +94,29 @@ def _subrpa_mock_fp8_linear(
 def _(x: torch.Tensor, w: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
     del w_scale
     return torch.empty(x.shape[0], w.shape[-1], dtype=x.dtype, device=x.device)
+
+
+@torch.library.custom_op(
+    "pallas::subrpa_mock_unified_attn_out", mutates_args=("output",)
+)
+def _subrpa_mock_unified_attn_out(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    del k
+    output.copy_(q + v.repeat_interleave(q.shape[1] // v.shape[1], dim=1))
+
+
+@_subrpa_mock_unified_attn_out.register_fake
+def _(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    del q, k, v, output
 
 
 class _FlippedLinear(nn.Module):
@@ -397,7 +426,9 @@ def test_subspace_rpa_blockwise_fp8_oproj_rewrite(python_attention) -> None:
 def test_subspace_rpa_mixed_precision_kv_quantization_sqnr_advantage(
     python_attention,
 ):
-    """Verify Subspace-RPA (BF16-K_rot + FP8-V) beats stock FP8 K+V SQNR."""
+    """Verify the analytical BF16-K_rot + FP8-V decomposition beats stock FP8 K+V
+    in Python attention (real TPU kernel storage parity is tested in
+    ``test_subspace_rpa.py``)."""
     ref_exact, _ = _build_gemma4_global_attn_pair(torch.bfloat16, quantize_kv_fp8=False)
     ref_fp8_kv, sub_fp8_kv = _build_gemma4_global_attn_pair(
         torch.bfloat16, quantize_kv_fp8=True
@@ -439,8 +470,11 @@ def _make_gemma4_model_cfg(
     sliding_head_dim: int = 256,
     global_head_dim: int = 512,
 ) -> SimpleNamespace:
-    text_cfg = SimpleNamespace(
-        model_type="gemma4_text",
+    text_cfg = Gemma4TextConfig(
+        architectures=["Gemma4ForConditionalGeneration"],
+        num_hidden_layers=6,
+        head_dim=sliding_head_dim,
+        global_head_dim=global_head_dim,
         attention_k_eq_v=attention_k_eq_v,
         num_kv_shared_layers=num_kv_shared_layers,
         attention_bias=attention_bias,
@@ -452,11 +486,6 @@ def _make_gemma4_model_cfg(
                 "rope_theta": 1_000_000.0,
             },
         },
-        layer_types=["sliding_attention", "full_attention"],
-        per_layer_config=[
-            SimpleNamespace(head_dim=sliding_head_dim),
-            SimpleNamespace(head_dim=global_head_dim),
-        ],
     )
     return SimpleNamespace(
         architectures=["Gemma4ForConditionalGeneration"],
@@ -469,7 +498,7 @@ def test_subspace_rpa_kv_cache_shape_unification_and_gates(monkeypatch) -> None:
     """Verify CUSTOM vs FLASH_ATTN backend shapes, model gates, and platform checks."""
     assert "TPU_SUBSPACE_RPA" in TpuPlatform.additional_env_vars
     gemma4_cfg = _make_gemma4_model_cfg()
-    kv_shared_gemma4_cfg = _make_gemma4_model_cfg(num_kv_shared_layers=18)
+    kv_shared_gemma4_cfg = _make_gemma4_model_cfg(num_kv_shared_layers=2)
     biased_gemma4_cfg = _make_gemma4_model_cfg(attention_bias=True)
     wrong_rope_gemma4_cfg = _make_gemma4_model_cfg(partial_rotary_factor=0.5)
     sliding_512_gemma4_cfg = _make_gemma4_model_cfg(sliding_head_dim=512)
@@ -553,7 +582,7 @@ def test_subspace_rpa_kv_cache_shape_unification_and_gates(monkeypatch) -> None:
 
     # Target layer of a KV-shared Gemma 4 checkpoint is also rejected.
     ref_mod.attn = SimpleNamespace(impl=_make_batched_rpa_impl())
-    ref_mod.config.num_kv_shared_layers = 18
+    ref_mod.config.num_kv_shared_layers = 2
     assert gsub.is_subspace_eligible_gemma4_attn(ref_mod) is False
     ref_mod.config.num_kv_shared_layers = 0
 
@@ -610,14 +639,6 @@ def test_subspace_rpa_kv_cache_shape_unification_and_gates(monkeypatch) -> None:
     )
     bad_model_cfg.model_config = non_gemma_cfg
 
-    in_graph_rope_cfg = VllmConfig(
-        device_config=DeviceConfig(device="cpu"),
-        attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
-        cache_config=CacheConfig(cache_dtype="fp8"),
-        additional_config={"tpu_rope_in_graph": True},
-    )
-    in_graph_rope_cfg.model_config = gemma4_cfg
-
     monkeypatch.setattr(envs, "TPU_SUBSPACE_RPA", True)
     with pytest.raises(NotImplementedError, match="--attention-backend CUSTOM"):
         TpuPlatform.check_and_update_config(bad_backend_cfg)
@@ -625,46 +646,152 @@ def test_subspace_rpa_kv_cache_shape_unification_and_gates(monkeypatch) -> None:
         TpuPlatform.check_and_update_config(bad_dtype_cfg)
     with pytest.raises(NotImplementedError, match="Gemma 4"):
         TpuPlatform.check_and_update_config(bad_model_cfg)
-    with pytest.raises(NotImplementedError, match="tpu_rope_in_graph"):
-        TpuPlatform.check_and_update_config(in_graph_rope_cfg)
 
 
-def test_call_subspace_unified_attention_layer_name_fullgraph(monkeypatch) -> None:
-    """Ensure the real vLLM ``layer_name`` branch compiles under ``fullgraph=True``."""
-
-    @torch.library.custom_op(
-        "pallas::subrpa_mock_unified_attn_out", mutates_args=("output",)
+@pytest.mark.parametrize(
+    "case, match",
+    [
+        ("pcp", "context parallelism"),
+        ("dcp", "context parallelism"),
+        ("block_major", "VLLM_TPU_BLOCK_MAJOR_KV"),
+        ("rope_in_graph", "tpu_rope_in_graph"),
+        ("spec_decode", "speculative decoding"),
+    ],
+)
+def test_platform_gate_rejects_unsupported_modes(monkeypatch, case: str, match: str):
+    """TpuPlatform.check_and_update_config rejects unsupported Subspace-RPA modes."""
+    monkeypatch.setattr(envs, "TPU_SUBSPACE_RPA", False)
+    monkeypatch.setattr(envs, "VLLM_TPU_BLOCK_MAJOR_KV", False)
+    cfg = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
+        cache_config=CacheConfig(cache_dtype="fp8"),
+        additional_config={"tpu_rope_in_graph": True}
+        if case == "rope_in_graph"
+        else {},
     )
-    def _mock_unified_out(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        del k
-        output.copy_(q + v.repeat_interleave(q.shape[1] // v.shape[1], dim=1))
+    cfg.model_config = _make_gemma4_model_cfg()
+    if case == "pcp":
+        cfg.parallel_config.prefill_context_parallel_size = 2
+    elif case == "dcp":
+        cfg.parallel_config.decode_context_parallel_size = 2
+    elif case == "spec_decode":
+        cfg.speculative_config = SimpleNamespace(method="mtp")
+    if case == "block_major":
+        monkeypatch.setattr(envs, "VLLM_TPU_BLOCK_MAJOR_KV", True)
 
-    @_mock_unified_out.register_fake
-    def _(
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        del q, k, v, output
+    monkeypatch.setattr(envs, "TPU_SUBSPACE_RPA", True)
+    with pytest.raises(NotImplementedError, match=match):
+        TpuPlatform.check_and_update_config(cfg)
+
+
+def test_maybe_patch_gemma4_subspace_rpa_hook_and_forward_dispatch(
+    monkeypatch, python_attention
+) -> None:
+    """Eligible maybe_patch_gemma4_subspace_rpa hooks loader and dispatches forward."""
+    from vllm.model_executor.model_loader import base_loader
+    from vllm.model_executor.models.gemma4 import Gemma4Attention
+
+    monkeypatch.setattr(envs, "TPU_SUBSPACE_RPA", True)
+    monkeypatch.setattr(
+        base_loader,
+        "process_weights_after_loading",
+        lambda model, model_config, target_device: "loaded",
+    )
+    orig_calls: list[str] = []
+
+    def _orig_forward(self, positions, hidden_states, **kwargs):
+        del positions, kwargs
+        orig_calls.append(self.tag)
+        return hidden_states
+
+    monkeypatch.setattr(Gemma4Attention, "forward", _orig_forward)
+    monkeypatch.delattr(Gemma4Attention, gsub._PATCHED_ATTN_CLS_ATTR, raising=False)
+
+    gemma4_cfg = _make_gemma4_model_cfg()
+    assert gsub.maybe_patch_gemma4_subspace_rpa(gemma4_cfg) is True
+
+    # Build a fake Gemma4Attention subclass with one eligible global layer and
+    # one ineligible sliding layer so both dispatch branches are exercised.
+    ref_mod, _ = _build_gemma4_global_attn_pair(torch.bfloat16)
+
+    class _FakeGemma4Attn(Gemma4Attention):
+        def __init__(self, tag: str, is_sliding: bool):
+            nn.Module.__init__(self)
+            self.tag = tag
+            self.is_sliding = is_sliding
+            self.is_kv_shared_layer = False
+            self.config = gemma4_cfg.hf_text_config
+            self.num_heads = ref_mod.num_heads
+            self.num_kv_heads = ref_mod.num_kv_heads
+            self.head_dim = ref_mod.head_dim
+            self.q_size = ref_mod.q_size
+            self.kv_size = ref_mod.kv_size
+            self.qkv_proj = copy.deepcopy(ref_mod.qkv_proj)
+            self.o_proj = copy.deepcopy(ref_mod.o_proj)
+            self.q_norm = copy.deepcopy(ref_mod.q_norm)
+            self.k_norm = copy.deepcopy(ref_mod.k_norm)
+            self.v_norm = copy.deepcopy(ref_mod.v_norm)
+            self.rotary_emb = ref_mod.rotary_emb
+            self.attn = SimpleNamespace(impl=_make_batched_rpa_impl())
+
+    eligible = _FakeGemma4Attn("global", is_sliding=False)
+    sliding = _FakeGemma4Attn("sliding", is_sliding=True)
+    model = nn.ModuleList([eligible, sliding])
+
+    res = base_loader.process_weights_after_loading(model, gemma4_cfg, "cpu")
+    assert res == "loaded"
+    assert getattr(eligible, gsub._SUBRPA_ACTIVE_ATTR, False) is True
+    assert getattr(sliding, gsub._SUBRPA_ACTIVE_ATTR, False) is False
+
+    subspace_calls: list[str] = []
+
+    def _spy_subspace(attn, positions, x):
+        del positions
+        subspace_calls.append(attn.tag)
+        return x + 1.0
+
+    monkeypatch.setattr(gsub, "subspace_attention_partial", _spy_subspace)
+
+    x = torch.zeros((4, 256), dtype=torch.bfloat16)
+    pos = torch.arange(4, dtype=torch.long)
+    out_global = eligible(pos, x)
+    out_sliding = sliding(pos, x)
+
+    assert subspace_calls == ["global"]
+    assert orig_calls == ["sliding"]
+    torch.testing.assert_close(out_global, x + 1.0)
+    torch.testing.assert_close(out_sliding, x)
+
+
+@pytest.mark.parametrize("use_direct_call", [True, False])
+def test_call_subspace_unified_attention_fullgraph(
+    monkeypatch, use_direct_call: bool
+) -> None:
+    """Compile call_subspace_unified_attention under fullgraph=True and check values."""
+    # Verify the pinned torch.ops.vllm.unified_attention_with_output schema
+    # accepts kv_cache_dummy_dep=None as passed in the non-direct branch.
+    op_schema = str(torch.ops.vllm.unified_attention_with_output.default._schema)
+    assert "kv_cache_dummy_dep" in op_schema
 
     def _fake_direct(q, k, v, out, layer_name, kv_cache_dummy_dep=None):
         del layer_name, kv_cache_dummy_dep
-        _mock_unified_out(q, k, v, out)
+        _subrpa_mock_unified_attn_out(q, k, v, out)
 
-    monkeypatch.setattr(
-        gsub.vllm_attn_layer, "unified_attention_with_output", _fake_direct
-    )
+    if use_direct_call:
+        monkeypatch.setattr(
+            gsub.vllm_attn_layer, "unified_attention_with_output", _fake_direct
+        )
+    else:
+        monkeypatch.setattr(
+            torch.ops.vllm, "unified_attention_with_output", _fake_direct
+        )
+
     attn_layer = SimpleNamespace(
         layer_name="model.layers.5.self_attn.attn",
         num_heads=4,
         head_size_v=512,
-        use_direct_call=True,
+        use_direct_call=use_direct_call,
     )
 
     def _fn(q: torch.Tensor, kr: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -676,4 +803,126 @@ def test_call_subspace_unified_attention_layer_name_fullgraph(monkeypatch) -> No
     kr = torch.randn(8, 1, 128, dtype=torch.bfloat16)
     v = torch.randn(8, 1, 512, dtype=torch.bfloat16)
     out = compiled(q, kr, v)
-    assert out.shape == (8, 2048)
+    expected = (q + v.repeat_interleave(4, dim=1)).reshape(8, 2048)
+    torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("layout_env", [None, "HND"], ids=["LBNHC", "LBHNC"])
+def test_batched_rpa_impl_forward_subspace_rpa_both_layouts(
+    monkeypatch, layout_env: str | None
+) -> None:
+    """Exercise PallasBatchedRPAAttentionBackendImpl.forward with 128-dim K on TPU.
+
+    Passes unquantized BF16 K_rot and V with non-unit k_scale/v_scale through
+    the real adapter forward path and real BatchedRPA Pallas kernel across
+    prefill and decode, verifying V-only quantization for HEAD_ALONG_SUBLANE
+    and K_rot+V quantization for SEQ_ALONG_LANE against an independent reference.
+    """
+    import jax
+    import numpy as np
+    from jax.sharding import Mesh
+
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    monkeypatch.setattr(envs, "TPU_SUBSPACE_RPA", True)
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    gemma4_cfg = _make_gemma4_model_cfg()
+    vllm_cfg = _make_vllm_cfg(gemma4_cfg, layout_env=layout_env)
+
+    num_heads = 4
+    num_kv_heads = 1
+    head_dim = 512
+    rot_dim = 128
+    page_size = 128
+    num_blocks = 4
+    scale = head_dim**-0.5
+    k_scale = 0.75
+    v_scale = 1.25
+    tpu = torch.device("tpu")
+
+    with set_current_vllm_config(vllm_cfg):
+        cache_shape = PallasBatchedRPAAttentionBackend.get_kv_cache_shape(
+            num_blocks, page_size, num_kv_heads, head_dim, torch.float8_e4m3fn
+        )
+        impl = PallasBatchedRPAAttentionBackendImpl(
+            num_heads=num_heads,
+            head_size=head_dim,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="fp8",
+            kv_cache_quantized_dtype=torch.float8_e4m3fn,
+        )
+
+    assert impl._pool_is_seq_along_lane is (layout_env == "HND")
+
+    prefill_len = page_size + 24
+    total_len = prefill_len + 1
+    torch.manual_seed(29)
+    q_all = (torch.randn(total_len, num_heads, head_dim) * 0.5).to(torch.bfloat16)
+    k_all = (torch.randn(total_len, num_kv_heads, rot_dim) * 0.6).to(torch.bfloat16)
+    v_all = (torch.randn(total_len, num_kv_heads, head_dim) * 0.6).to(torch.bfloat16)
+
+    kv_cache = torch.zeros(cache_shape, dtype=torch.float8_e4m3fn, device=tpu)
+    block_tables = torch.tensor([2, 0], dtype=torch.int32, device=tpu)
+    layer = SimpleNamespace(_k_scale_float=k_scale, _v_scale_float=v_scale)
+    mesh = Mesh(np.asarray(jax.devices("tpu")[:1]), ("model",))
+
+    def _run_step(sl: slice, seq_len: int, is_decode: bool) -> torch.Tensor:
+        q_step = q_all[sl].reshape(-1, num_heads * head_dim).to(tpu)
+        k_step = k_all[sl].reshape(-1, num_kv_heads * rot_dim).to(tpu)
+        v_step = v_all[sl].reshape(-1, num_kv_heads * head_dim).to(tpu)
+        q_len = q_step.shape[0]
+        dist = [1, 1, 1] if is_decode else [0, 0, 1]
+        meta = AttentionMetadata(
+            input_positions=torch.arange(
+                seq_len - q_len, seq_len, dtype=torch.int32, device=tpu
+            ),
+            block_tables=block_tables,
+            seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=tpu),
+            query_start_loc=torch.tensor([0, q_len], dtype=torch.int32, device=tpu),
+            request_distribution=torch.tensor(dist, dtype=torch.int32, device=tpu),
+        )
+        with set_vllm_model_wrapper_context(mesh=mesh, vllm_config=vllm_cfg):
+            out = impl.forward(
+                layer=layer,
+                query=q_step,
+                key=k_step,
+                value=v_step,
+                kv_cache=kv_cache,
+                attn_metadata=meta,
+            )
+        return out.cpu().float().reshape(q_len, num_heads, head_dim)
+
+    out_pre = _run_step(slice(0, prefill_len), prefill_len, is_decode=False)
+    out_dec = _run_step(slice(prefill_len, total_len), total_len, is_decode=True)
+
+    def _ref(q_sl: slice, kv_len: int) -> torch.Tensor:
+        q_f = q_all[q_sl].float()
+        v_f = _quant_dequant_fp8(v_all[:kv_len], v_scale)
+        if layout_env == "HND":
+            k_rot_f = _quant_dequant_fp8(k_all[:kv_len], k_scale)
+        else:
+            k_rot_f = k_all[:kv_len].float()
+        k_full = torch.cat([k_rot_f, v_f[..., rot_dim:]], dim=-1)
+        k_rep = k_full.repeat_interleave(num_heads // num_kv_heads, dim=1)
+        v_rep = v_f.repeat_interleave(num_heads // num_kv_heads, dim=1)
+        scores = torch.einsum("thd,shd->hts", q_f, k_rep) * scale
+        q_len = q_f.shape[0]
+        q_pos = (kv_len - q_len) + torch.arange(q_len)[:, None]
+        k_pos = torch.arange(kv_len)[None, :]
+        scores = scores.masked_fill((k_pos > q_pos).unsqueeze(0), float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        return torch.einsum("hts,shd->thd", probs, v_rep).to(torch.bfloat16).float()
+
+    ref_pre = _ref(slice(0, prefill_len), prefill_len)
+    ref_dec = _ref(slice(prefill_len, total_len), total_len)
+    assert _sqnr_db(ref_pre, out_pre) > 35.0
+    assert _sqnr_db(ref_dec, out_dec) > 35.0
+    np.testing.assert_allclose(out_pre.numpy(), ref_pre.numpy(), atol=3e-2, rtol=2e-2)
+    np.testing.assert_allclose(out_dec.numpy(), ref_dec.numpy(), atol=3e-2, rtol=2e-2)

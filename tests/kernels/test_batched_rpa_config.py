@@ -338,14 +338,14 @@ def test_subspace_rpa_admission_guards(kwargs, match):
     [configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE],
 )
 def test_subspace_rpa_calculate_block_sizes(kv_layout):
-    """Subspace-RPA block-size selection succeeds and page-aligns bkv_sz."""
+    """Subspace-RPA's smaller KV buffers allow a larger decode bkv_sz."""
     model_cfg = configs.ModelConfigs(
         num_q_heads=4,
         num_kv_heads=1,
         head_dim=512,
         mask_value=-1e9,
     )
-    serve_cfg = configs.ServingConfigs(
+    base_serve = configs.ServingConfigs(
         num_seqs=8,
         page_size=128,
         total_q_tokens=512,
@@ -354,12 +354,17 @@ def test_subspace_rpa_calculate_block_sizes(kv_layout):
         dtype_kv=jnp.float8_e4m3fn,
         dtype_out=jnp.bfloat16,
         kv_layout=kv_layout,
-        subspace_k_rot_dim=128,
     )
+    sub_serve = dataclasses.replace(base_serve, subspace_k_rot_dim=128)
+    # Tight VMEM budget where KV buffer bytes cap decode bkv_sz below max_seq_len.
+    vmem_limit = 32 * 1024 * 1024
     with patch(
         "jax.experimental.pallas.tpu.get_tpu_info",
         return_value=_create_mock_tpu_info(7, chip_version="v7x", mxu_column_size=256),
     ):
-        dec, pre = wrapper.calculate_block_sizes(model_cfg, serve_cfg, 64 * 1024 * 1024)
-    assert dec.bkv_sz % 128 == 0 and dec.bkv_sz >= 256
-    assert pre.bkv_sz % 128 == 0 and pre.bkv_sz >= 256
+        base_dec, _ = wrapper.calculate_block_sizes(model_cfg, base_serve, vmem_limit)
+        sub_dec, sub_pre = wrapper.calculate_block_sizes(
+            model_cfg, sub_serve, vmem_limit
+        )
+    assert sub_dec.bkv_sz % 128 == 0 and sub_dec.bkv_sz > base_dec.bkv_sz
+    assert sub_pre.bkv_sz % 128 == 0 and sub_pre.bkv_sz >= 256

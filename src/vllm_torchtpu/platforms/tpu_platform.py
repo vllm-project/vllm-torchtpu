@@ -949,7 +949,7 @@ class TpuPlatform(Platform):
         from vllm_torchtpu.layers.adapter.attention import (
             PallasAttentionBackend,
             PallasBatchedRPAAttentionBackend,
-            _is_fp8_kv_cache_dtype,
+            is_fp8_kv_cache_dtype,
             is_subspace_rpa_model_config,
         )
 
@@ -985,7 +985,7 @@ class TpuPlatform(Platform):
                     "global layers with 25% proportional RoPE, and no "
                     "attention bias."
                 )
-            if not _is_fp8_kv_cache_dtype(vllm_config.cache_config.cache_dtype):
+            if not is_fp8_kv_cache_dtype(vllm_config.cache_config.cache_dtype):
                 raise NotImplementedError(
                     "TPU_SUBSPACE_RPA=1 requires an FP8 KV cache; "
                     "pass --kv-cache-dtype fp8 "
@@ -996,11 +996,12 @@ class TpuPlatform(Platform):
                 or parallel_config.decode_context_parallel_size > 1
                 or envs.VLLM_TPU_BLOCK_MAJOR_KV
                 or rope_in_graph_flag.in_graph_enabled(vllm_config)
+                or vllm_config.speculative_config is not None
             ):
                 raise NotImplementedError(
                     "TPU_SUBSPACE_RPA=1 does not support context parallelism "
-                    "(PCP/DCP), VLLM_TPU_BLOCK_MAJOR_KV=1, or "
-                    "tpu_rope_in_graph=True."
+                    "(PCP/DCP), VLLM_TPU_BLOCK_MAJOR_KV=1, "
+                    "tpu_rope_in_graph=True, or speculative decoding."
                 )
         supported = [layout.name for layout in backend.supported_kv_cache_layouts()]
         if (
