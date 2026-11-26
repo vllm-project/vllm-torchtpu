@@ -706,6 +706,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         flush = self._wb_near_eviction()
         for req_id in flush:
             self._wb_unregister(req_id)
+            self._touch_on_flush(req_id)
         self.wb_counters["flushed_requests"] += len(flush)
         self.wb_counters["held_requests"] = len(self._wb_blocks)
         self._maybe_log_write_back()
@@ -813,6 +814,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             if keys:
                 allowed[req_id] = keys
                 c["stored_chunks"] += len(keys)
+                self._touch_on_flush(req_id)
             release |= self._wb_forget_blocks(chunk_bids | bids)
         self._wb_allowed = allowed
         self._wb_urgent = urgent & allowed.keys()
@@ -1133,15 +1135,34 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         if traced:
             traced.discard(request.request_id)
         if self._lru_refresh_on_finish:
-            req_status = self._req_status.get(request.request_id)
-            if req_status is not None:
-                for group_config, group_state in zip(
-                    self.config.kv_group_configs, req_status.group_states
-                ):
-                    if group_config.is_eagle_group or not group_state.offload_keys:
-                        continue
-                    self._raiden_manager.refresh_resident(group_state.offload_keys)
+            self._refresh_chain(request.request_id)
+        elif tpu_envs.VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH and self._write_back is None:
+            # Write-back refreshes at the flush instead (`_touch_on_flush`):
+            # a held chain is device-resident, and refreshing it now would put
+            # host duplicates of live chains ahead of idle conversations'.
+            self._refresh_chain(request.request_id)
         return super().request_finished(request, *args, **kwargs)
+
+    def _refresh_chain(self, req_id: str) -> None:
+        """Refresh the request's host-resident leading chain, head last
+        (`RaidenOffloadingManager.refresh_resident`), eagle groups skipped."""
+        req_status = self._req_status.get(req_id)
+        if req_status is None:
+            return
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            if group_config.is_eagle_group or not group_state.offload_keys:
+                continue
+            self._raiden_manager.refresh_resident(group_state.offload_keys)
+
+    def _touch_on_flush(self, req_id: str) -> None:
+        """VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH in write-back mode: refresh a held
+        request's resident chain as its store is flushed, so its head is not
+        left older on the host than the tail chunks this flush stores. (With
+        TPU_RAIDEN_LRU_REFRESH=2 the finish already refreshed it.)"""
+        if tpu_envs.VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH and not self._lru_refresh_on_finish:
+            self._refresh_chain(req_id)
 
     def peek_external_prefix_tokens(
         self, request: Request, num_local_tokens: int

@@ -257,6 +257,7 @@ if TYPE_CHECKING:
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
     VLLM_TPU_OFFLOAD_MAX_INFLIGHT_LOAD_MIB: int = 128
     VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB: int = 64
+    VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH: bool = False
     TPU_RAIDEN_LRU_REFRESH: int = 0
     TPU_HOST_HEAP_REPORT: int = 0
     TPU_HOST_HEAP_USAGE_AFTER_S: int = 900
@@ -1752,6 +1753,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB": env_int(
         "VLLM_TPU_OFFLOAD_MAX_INFLIGHT_STORE_MIB", 64
     ),
+    # Raiden KV offload: refresh a request's host-resident chain head last
+    # (`RaidenOffloadingManager.refresh_resident`), so a live conversation's
+    # oldest chunks are not evicted first. Write-through refreshes when the
+    # request finishes; write-back when it flushes the held request (its host
+    # copy only matters once HBM evicts it). Scheduler-side, host-only.
+    # Same refresh as TPU_RAIDEN_LRU_REFRESH=2, but timed by the offload mode.
+    "VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH": env_bool("VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH"),
     # Raiden host-pool LRU refresh of chains a request already finds resident.
     # The store skips a resident key without touching it, and a key served
     # from HBM is never looked up on the host, so the head of a long-lived
