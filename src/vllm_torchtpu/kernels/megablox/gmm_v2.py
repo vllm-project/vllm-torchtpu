@@ -1717,7 +1717,9 @@ class WaveRefs:
     rows: jax.Array  # VMEM uint32[tile_m, 8, size_k / 32]
     lhs: jax.Array  # VMEM [tile_m / sub, sub, size_k]
     copy_sems: jax.Array  # DMA[2]: the tile's rows, the scales
-    waited: jax.Array  # SMEM int32[1]: the waves waited for so far
+    # SMEM int32[2]: the waves waited for so far, the last tile whose rows'
+    # copy has started
+    waited: jax.Array
 
     def scale_copy(self):
         return pltpu.make_async_copy(self.scale_hbm, self.scale, self.copy_sems.at[1])
@@ -2130,6 +2132,7 @@ def _mlp_kernel(
         # The scales are read from the first tile on.
         wave.scale_copy().start()
         wave.waited[0] = 0
+        wave.waited[1] = -1
 
     if scatter is not None:
         # No row may land in a member's receive buffer before that member runs
@@ -2304,6 +2307,26 @@ def _mlp_kernel(
                 group_offset_ref[0] + metadata_ref.gm_id_to_group_id[gm_id] + 1
             )
         wave_rows_copy(gm_id).start()
+        wave.waited[1] = gm_id
+
+    # A DMA semaphore counts a landed 8 KB fp8 row as 256 (32-byte units).
+    row_units = wave.recv.shape[1] * wave.recv.shape[2] * 4 // 32 if wave else 0
+
+    def fetch_rows_if_landed(gm_id):
+        """Start tile `gm_id`'s rows copy now if their waves have already
+        landed, ahead of the weight copies this tile issues; the copy then has
+        a whole tile to finish. Otherwise `fetch_rows` waits for them later."""
+        end = group_offset_ref[0] + metadata_ref.gm_id_to_group_id[gm_id] + 1
+
+        def landed(w, ok):
+            need = lhs_group_sizes_ref[w] * row_units
+            return jnp.logical_and(ok, pl.semaphore_read(wave.sems.at[w]) >= need)
+
+        ok = lax.fori_loop(wave.waited[0], end, landed, jnp.bool_(True))
+
+        @pl.when(ok)
+        def _():
+            fetch_rows(gm_id)
 
     def convert_rows(gm_id):
         """The tile's landed fp8 rows as `gather_rows` gives them (bf16, the
@@ -2337,6 +2360,12 @@ def _mlp_kernel(
             jnp.minimum(gm_id + 1, num_gm - 1)
         ]
         fetch_next = jnp.logical_and(has_next, next_group_id != group_id)
+
+        if wave is not None:
+            # Before this tile issues any weight copy (see fetch_rows_if_landed).
+            @pl.when(has_next)
+            def _():
+                fetch_rows_if_landed(gm_id + 1)
 
         # The first tile's weights start copying here, once the pipeline has
         # fetched its rows: started before the pipeline, the ~25 MB of weight
@@ -2420,10 +2449,10 @@ def _mlp_kernel(
                 start(up_copies(p, next_group_id))
 
         if wave is not None:
-            # The next tile's rows copy behind the down projection. A wave
-            # still landing holds back this tile's down projection and sends,
-            # not the next tile, which needs it anyway.
-            @pl.when(has_next)
+            # Otherwise the next tile's rows copy behind the down projection.
+            # A wave still landing holds back this tile's down projection and
+            # sends, not the next tile, which needs it anyway.
+            @pl.when(jnp.logical_and(has_next, wave.waited[1] != gm_id + 1))
             def _():
                 fetch_rows(gm_id + 1)
 
@@ -3209,7 +3238,7 @@ def gmm_v2_mlp_scatter(
             pltpu.VMEM((cfgs.tile_m // sub, sub, dims.size_k), dtype),
             pltpu.SMEM((size_m,), jnp.float32),
             pltpu.SemaphoreType.DMA((2,)),
-            pltpu.SMEM((1,), jnp.int32),
+            pltpu.SMEM((2,), jnp.int32),
         ]
     # The receive buffers and the owner tail's result are pinned to HBM: other
     # members write into them.
