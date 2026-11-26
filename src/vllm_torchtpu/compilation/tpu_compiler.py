@@ -21,6 +21,7 @@ pipeline. Each shape bucket gets its own compiled executable.
 import contextlib
 import copy
 import dataclasses
+import functools
 import gc
 import glob
 import hashlib
@@ -34,7 +35,8 @@ import re
 import shutil
 import threading
 import time
-from collections.abc import Callable
+import types
+from collections.abc import Callable, Collection
 from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
@@ -44,7 +46,12 @@ import torch._guards
 import torch.fx as fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch_tpu._internal.compile._backend import TpuBackend
+from torch_tpu._internal.compile.split_compiler import (
+    _SplitCompiledExecutable,
+    _WrapperModule,
+)
 from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+    NoOpCompiledArtifact,
     TorchTpuCompiledExecutable,
 )
 from vllm.compilation.compiler_interface import CompilerInterface
@@ -252,6 +259,176 @@ def _rebuild_sharing_executables(entry: Any) -> Callable[..., Any]:
     buffer.seek(0)
     copied = _ExecutableKeepingUnpickler(buffer, executables).load()
     return _deserialize_entry(copied)
+
+
+# The artifacts whose references `_release_compiled_graph_cycles` knows: once
+# it has dismantled them, the in-process compile result holds no cycle left
+# for anything but a Gen-0 sweep.
+_KNOWN_COMPILED_ARTIFACTS = (
+    _SplitCompiledExecutable,
+    TorchTpuCompiledExecutable,
+    NoOpCompiledArtifact,
+)
+
+
+def _break_fx_graph_cycles(gm: fx.GraphModule, skip_ids: set[int]) -> None:
+    """Sever the `GraphModule <-> Graph`, `Graph <-> _root`, namespace, and
+    codegen links of `gm` and of every GraphModule under it, skipping any
+    module whose `id()` is in `skip_ids` (and recording each dismantled module
+    in `skip_ids` to avoid re-visiting shared submodules).
+
+    Node `meta` dicts are left untouched because one may be shared with a graph
+    that is still in use; clearing `_graph_namespace._obj_to_name` and
+    `root.graph` lets refcounting drop the `fx.Graph`, erased nodes, and their
+    references to `meta`. `_root._prev`/`_root._next` stay self-linked (as
+    `erase_node` leaves them) so post-dismantle iteration and repeated
+    dismantling stay safe and idempotent.
+    """
+    for mod in gm.modules():
+        if not isinstance(mod, fx.GraphModule) or id(mod) in skip_ids:
+            continue
+        skip_ids.add(id(mod))
+        graph = mod.graph
+        for node in graph.nodes:
+            node.args = ()
+            node.kwargs = {}
+        for node in reversed(list(graph.nodes)):
+            graph.erase_node(node)
+            erased: Any = node
+            erased._prev = None
+            erased._next = None
+            erased.graph = None
+        graph._graph_namespace._obj_to_name.clear()
+        # Keep _root._prev/_next self-linked so C++ _NodeIter stays safe on
+        # empty graphs and repeated _break_fx_graph_cycles calls are idempotent.
+        root: Any = graph._root
+        root.graph = None
+        graph.__dict__.pop("_insert", None)
+        graph._codegen.__dict__.pop("additional_globals", None)
+        graph._owning_module = None
+
+
+def _entry_artifact(entry: Any, attr: str) -> Any:
+    """Return `entry.<attr>.result` when present, else None."""
+    if not hasattr(entry, attr):
+        return None
+    loadable = getattr(entry, attr)
+    return loadable.result if hasattr(loadable, "result") else None
+
+
+def _release_compiled_graph_cycles(
+    compiled_fn: Any,
+    entry: Any,
+    *,
+    preserve: Collection[Any] = (),
+) -> bool:
+    """Dismantle the FX graph cycles of an in-process compile result about to
+    be dropped, so refcounting frees it. True if a Gen-0 sweep then suffices.
+
+    Pickling the entry in `_save_handle` allocates enough to trigger Gen-0 and
+    Gen-1 passes, which can promote `_SplitCompiledExecutable._split_gm`
+    (`GraphModule <-> Graph`) to Gen-2, where only a full `gc.collect()` --
+    seconds over a loaded model's heap, per bucket -- would find it. With the
+    cycles cut, `_split_gm`, its constants and its leaf wrappers go as soon
+    as the last reference does. Leaf executables are not touched: the rebuilt
+    runnable shares them.
+
+    Visits `entry.compiled_fw` / `compiled_bw` results and the backend's
+    `compiled_artifacts` closure list (which it empties). GraphModules under
+    `preserve` -- the caller's graphs -- are left intact. Returns False (and
+    logs once), so the caller runs a full collection, when `entry` has no
+    forward artifact or holds an artifact of a type it does not know, which
+    may keep cycles of its own. `compile` and `load` call this only after
+    `_save_handle` has pickled `entry`, which resolves each
+    `AsyncCompiledArtifact` into the artifact it wraps, so none reaches it
+    unresolved from there.
+    """
+    skip_ids = {
+        id(mod)
+        for root in preserve
+        if isinstance(root, torch.nn.Module)
+        for mod in root.modules()
+    }
+    seen: set[int] = set()
+    unknown_types: list[str] = []
+
+    def visit(artifact: Any) -> bool:
+        if artifact is None or id(artifact) in seen:
+            return True
+        seen.add(id(artifact))
+        if not isinstance(artifact, _SplitCompiledExecutable):
+            if isinstance(artifact, _KNOWN_COMPILED_ARTIFACTS):
+                return True
+            unknown_types.append(type(artifact).__name__)
+            return False
+        # Read before `_split_gm` is dismantled; its children stay attached.
+        # Walk `_WrapperModule` children directly rather than
+        # `artifact.compiled_executables`, which filters out
+        # non-`CompiledArtifact` submods and would mask unknown wrappers.
+        known = all(
+            [
+                visit(child.submod)
+                for child in artifact._split_gm.children()
+                if isinstance(child, _WrapperModule)
+            ]
+        )
+        # `recompile_fn` is a `functools.partial` holding the AOT forward
+        # GraphModule owned solely by this in-process compile's recompile hook;
+        # `skip_ids` protects any preserved caller graph.
+        if isinstance(artifact.recompile_fn, functools.partial):
+            for arg in artifact.recompile_fn.args:
+                if isinstance(arg, fx.GraphModule):
+                    _break_fx_graph_cycles(arg, skip_ids)
+        artifact.recompile_fn = None
+        artifact._graph_module_str = None
+        _break_fx_graph_cycles(artifact._split_gm, skip_ids)
+        return known
+
+    fw_result = _entry_artifact(entry, "compiled_fw")
+    bw_result = _entry_artifact(entry, "compiled_bw")
+    known = fw_result is not None
+    known = visit(fw_result) and known
+    known = visit(bw_result) and known
+
+    if isinstance(compiled_fn, types.FunctionType) and compiled_fn.__closure__:
+        for name, cell in zip(
+            compiled_fn.__code__.co_freevars, compiled_fn.__closure__
+        ):
+            if name == "compiled_artifacts" and isinstance(cell.cell_contents, list):
+                known = all([visit(item) for item in cell.cell_contents]) and known
+                cell.cell_contents.clear()
+
+    if not known:
+        reason = (
+            f"unknown artifact type(s): {', '.join(dict.fromkeys(unknown_types))}"
+            if unknown_types
+            else "missing compiled_fw.result"
+        )
+        logger.warning_once(
+            "[TpuCompilerAdaptor] Could not dismantle all compiled graph cycles "
+            "(%s), falling back to full gc.collect().",
+            reason,
+        )
+    return known
+
+
+def _collect_dropped_result(gen0_suffices: bool) -> None:
+    """Collect what is left of an in-process compile result just dropped.
+
+    A Gen-0 sweep when `_release_compiled_graph_cycles` dismantled all of it,
+    instead of a full collection over a loaded model's heap; a full one when
+    it met an artifact it does not know.
+    """
+    if gen0_suffices:
+        gc.collect(0)
+    else:
+        gc.collect()
+
+
+def _drop_graph_copy(graph: fx.GraphModule, orig_graph: fx.GraphModule) -> None:
+    """Sever the FX cycles of a temporary `deepcopy(orig_graph)` copy so
+    refcounting frees it without touching modules shared with `orig_graph`."""
+    _break_fx_graph_cycles(graph, {id(mod) for mod in orig_graph.modules()})
 
 
 _TPU_COMPILE_ENV_IGNORED = {
@@ -801,7 +978,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         except Exception as e:
             # Non-fatal by design: a failed save costs a recompile next run,
             # which is strictly better than persisting something unloadable.
-            logger.warning("[TpuCompilerAdaptor] Failed to save artifact: %s", e)
+            logger.warning("[TpuCompilerAdaptor] Failed to save artifact: %s", str(e))
             with contextlib.suppress(OSError):
                 os.remove(tmp_path)
             return False
@@ -861,7 +1038,9 @@ class TpuCompilerAdaptor(CompilerInterface):
             with open(path, "rb") as f:
                 payload = pickle.load(f)
         except Exception as e:
-            logger.warning("[TpuCompilerAdaptor] Unreadable artifact %s: %s", path, e)
+            logger.warning(
+                "[TpuCompilerAdaptor] Unreadable artifact %s: %s", path, str(e)
+            )
             return None
 
         reason = None
@@ -902,7 +1081,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             logger.warning(
                 "[TpuCompilerAdaptor] Could not replay artifact %s, recompiling: %s",
                 path,
-                e,
+                str(e),
             )
             return None
 
@@ -1060,7 +1239,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         # first because _ensure_tuple_output rewrites the output node in place
         # and vLLM keeps its own reference to `graph`. Only the output node
         # moves, so the placeholder signature is unaffected.
-        graph = copy.deepcopy(graph)
+        orig_graph = graph
+        graph = copy.deepcopy(orig_graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         save_path = (
@@ -1100,18 +1280,15 @@ class TpuCompilerAdaptor(CompilerInterface):
                 if self._link_artifact(peer_path, save_path)
                 else None
             )
+            _drop_graph_copy(graph, orig_graph)
+            del graph
             if was_wrapped:
                 compiled_fn = self._unwrap_compiled_fn(compiled_fn)
             if size is not None:
-                shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+                shape_variants.remember(self.cache_dir, key, orig_graph, compiled_fn)
             return compiled_fn, handle
 
         compiled_fn, entry = self._run_backend(graph, example_inputs)
-
-        if was_wrapped:
-            # Undo _ensure_tuple_output on the result side, so callers see the
-            # single tensor the original graph returned.
-            compiled_fn = self._unwrap_compiled_fn(compiled_fn)
 
         # Persist torch's bundled AOTAutograd entry -- the aot_autograd wrapper
         # metadata and the compiled executable as one object. It has to be one
@@ -1148,13 +1325,16 @@ class TpuCompilerAdaptor(CompilerInterface):
             if handle is None
             else self._rebuild_saved(entry, handle[1], graph, was_wrapped, fingerprint)
         )
+        # Dismantle the in-process result while `entry` still reaches it.
+        gen0_suffices = reloaded is not None and _release_compiled_graph_cycles(
+            compiled_fn, entry, preserve=(orig_graph,)
+        )
         del entry
         if reloaded is not None:
-            compiled_fn = (
-                self._unwrap_compiled_fn(reloaded) if was_wrapped else reloaded
-            )
-            # The in-process result holds reference cycles.
-            gc.collect()
+            _drop_graph_copy(graph, orig_graph)
+            del graph
+            compiled_fn = reloaded
+            _collect_dropped_result(gen0_suffices)
         # Under peer replay, other ranks of the host may be waiting for this
         # artifact: say so when it will not come, so they compile it now.
         if fingerprint is not None:
@@ -1164,11 +1344,16 @@ class TpuCompilerAdaptor(CompilerInterface):
             else:
                 self._clear_failed(key)
 
+        if was_wrapped:
+            # Undo _ensure_tuple_output on the result side, so callers see the
+            # single tensor the original graph returned.
+            compiled_fn = self._unwrap_compiled_fn(compiled_fn)
+
         # Offer this bucket to later traces of the same model, so a graph that
         # refuses it reuses this runnable instead of building a second
         # executable for it (see shape_variants.BucketExecutables).
         if key is not None and size is not None:
-            shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+            shape_variants.remember(self.cache_dir, key, orig_graph, compiled_fn)
         return compiled_fn, handle
 
     def load(
@@ -1207,11 +1392,15 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
         # artifact is checked against is shaped the way it was when saved.
-        graph = copy.deepcopy(graph)
+        orig_graph = graph
+        graph = copy.deepcopy(orig_graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)
-        if compiled_fn is None:
+        if compiled_fn is not None:
+            _drop_graph_copy(graph, orig_graph)
+            del graph
+        else:
             fingerprint = (
                 _graph_fingerprint(graph) if envs.TPU_PRECOMPILE_PEER_REPLAY else None
             )
@@ -1231,10 +1420,15 @@ class TpuCompilerAdaptor(CompilerInterface):
                 if saved
                 else None
             )
+            gen0_suffices = reloaded is not None and _release_compiled_graph_cycles(
+                compiled_fn, entry, preserve=(orig_graph,)
+            )
             del entry
             if reloaded is not None:
+                _drop_graph_copy(graph, orig_graph)
+                del graph
                 compiled_fn = reloaded
-                gc.collect()
+                _collect_dropped_result(gen0_suffices)
 
         if was_wrapped:
             compiled_fn = self._unwrap_compiled_fn(compiled_fn)
@@ -1243,5 +1437,5 @@ class TpuCompilerAdaptor(CompilerInterface):
         # one, so a graph that refuses this bucket reuses this runnable instead
         # of replaying the artifact into a second HBM program region.
         if size is not None:
-            shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+            shape_variants.remember(self.cache_dir, key, orig_graph, compiled_fn)
         return compiled_fn
