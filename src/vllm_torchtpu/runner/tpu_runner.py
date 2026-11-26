@@ -3489,8 +3489,8 @@ class TPUModelRunner(GPUModelRunner):
                 ).to(self.device, non_blocking=True)
 
             if self.mamba_slot_read_offsets is None:
-                request_distribution = self._request_distribution_cpu.to(
-                    self.device, non_blocking=True
+                request_distribution = self._upload_unless_unchanged(
+                    "request_distribution", self._request_distribution_cpu
                 )
             else:
                 # Replaced below by a view of the combined RPA + GDN upload;
