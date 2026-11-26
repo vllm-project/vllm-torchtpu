@@ -295,7 +295,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2,
            req_async: int = 0, nvis_balance: bool = False, uattn_lite: bool = False,
            key_lanes: int = 0, export: bool = False, select_nvis: int = 0,
-           nvis_rows: tuple | None = None):
+           nvis_rows: tuple | None = None, phys_mxu: bool = False):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -335,7 +335,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
         _ck_split(d)
     long_kw = dict(carrier="bf16", chunk_pages=8, hbm_tables=True, per_request_scores=True,
                    bounded_chunks=True, shard_index=shard, union_attn=union,
-                   union_stats=stats, union_phys=phys, loop_requests=loop, dcp=dcp,
+                   union_stats=stats, union_phys=phys or phys_mxu, loop_requests=loop, dcp=dcp,
                    compressed_dcp=cdcp, xreq_prefetch=xreq, skip_idle=skip_idle,
                    manager_pages=key_mp, key_slots=key_slots, ck_lanes=key_lanes,
                    **(dict(xmerge=True) if xmerge else {}),
@@ -343,7 +343,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
                    **(dict(nvis_balance=True) if nvis_balance else {}),
                    **(dict(uattn_lite=True) if uattn_lite else {}),
                    **(dict(select_nvis=select_nvis) if select_nvis else {}),
-                   **(dict(nvis_rows=nvis_rows) if nvis_rows else {}))
+                   **(dict(nvis_rows=nvis_rows) if nvis_rows else {}),
+                   **(dict(union_phys_mxu=pps) if phys_mxu else {}))
     spec = wholestep_spec(
         G,
         R,
@@ -760,6 +761,88 @@ def test_physical_ids_match_the_copy_address_math():
             )
         )[0]
         assert not np.array_equal(bad, want[:128])
+
+
+def test_physical_ids_scan_only_the_visible_table_chunks():
+    """`wholephysmxu`: `physical_ids` with `n_tab = table_chunks(n_vis, ...)` reads only the
+    table chunks holding the columns of groups `< n_vis` (MXU byte-split gather) and equals
+    the vector pass, for 1-4 byte entries incl. the largest; one chunk too few misses the ids
+    of the last chunk (the bound is what makes it equal)."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    rng = np.random.default_rng(1)
+    for per_page, pps, dcp, nbytes in ((128, 512, 1, 3), (128, 512, 2, 3), (4, 256, 1, 3),
+                                       (128, 256, 1, 1), (128, 256, 2, 2), (32, 384, 1, 4)):
+        hi = min(1 << (8 * nbytes), 1 << 30)
+        tab = rng.integers(0, hi, (1, pps)).astype(np.int32)
+        tab[0, :2] = (0, hi - 1)
+        cs = per_page.bit_length() - 1 + dcp.bit_length() - 1
+        for n_vis in (1, 5 << cs, (128 << cs) + 3, (pps << cs) - 1):
+            ids = rng.integers(0, n_vis, (1, 128)).astype(np.int32)
+            ids[0, :4] = (0, n_vis - 1, 0, n_vis - 1)
+            want = np.asarray(ua.physical_ids(jnp.asarray(ids), jnp.asarray(tab), per_page, dcp))
+
+            def run(n_tab, ids=ids, tab=tab, per_page=per_page, dcp=dcp, nbytes=nbytes):
+                def kern(ids_ref, tab_ref, out_ref):
+                    out_ref[...] = ua.physical_ids(
+                        ids_ref[...], tab_ref, per_page, dcp, n_tab, table_bytes=nbytes
+                    )
+
+                return np.asarray(pl.pallas_call(
+                    kern, out_shape=jax.ShapeDtypeStruct((1, 128), jnp.int32),
+                    in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+                    out_specs=pl.BlockSpec(memory_space=pltpu.VMEM), interpret=True,
+                )(jnp.asarray(ids), jnp.asarray(tab)))
+
+            n_tab = int(ua.table_chunks(jnp.int32(n_vis), per_page, dcp, pps))
+            np.testing.assert_array_equal(run(n_tab), want,
+                                          err_msg=f"{per_page} {dcp} {nbytes} {n_vis}")
+            if n_tab > 1:
+                assert not np.array_equal(run(n_tab - 1), want)
+
+
+# `wholephysmxu` on the full kernel needs a 128-lane-multiple table row: max_groups 4096
+# (pps 128, one chunk) and 8192 with a context past 128 columns of 32 groups (pps 256, two).
+PHYS_MXU_CASES = [
+    dict(max_groups=4096),
+    dict(max_groups=4096, shard=True, loop=True),
+    dict(max_groups=8192, ctx=[17000, 100], shard=True, loop=True),
+]
+
+
+@pytest.mark.parametrize("kw", PHYS_MXU_CASES)
+def test_union_physical_ids_mxu_bit_identical(kw):
+    """`wholephysmxu` (prefetched table rows, MXU gather of only the visible chunks): every
+    output byte-identical to the union kernel without physical ids, and to `wholephys`."""
+    import gc
+
+    outs = []
+    for arm in (dict(), dict(phys=True), dict(phys_mxu=True)):
+        res = _run_c(long=True, rank_ids=True, union=True, **arm, **kw)
+        outs.append([res[i] for i in (0, 3, 4, 7)])
+        del res
+        jax.clear_caches()  # one compiled step at a time (CPU memory)
+        gc.collect()
+    base, phys, run = outs
+    for j, name in enumerate(("residual", "ck_new", "ring_new", "ids")):
+        np.testing.assert_array_equal(run[j], base[j], err_msg=f"{name} {kw}")
+        np.testing.assert_array_equal(run[j], phys[j], err_msg=f"{name} phys {kw}")
+
+
+def test_union_physical_ids_mxu_short_scan_is_caught(monkeypatch):
+    """Mutation: the gather scans no table chunk (every id -> page 0); the comparison must
+    fail (the MXU path really makes the copies' addresses)."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    kw = dict(long=True, rank_ids=True, union=True, max_groups=4096)
+    base = _run_c(**kw)
+    monkeypatch.setattr(ua, "table_chunks", lambda *a, **k: jnp.int32(0))
+    run = _run_c(**kw, phys_mxu=True)
+    with pytest.raises(AssertionError):
+        np.testing.assert_array_equal(run[0], base[0])
 
 
 def test_union_physical_ids_bit_identical():
