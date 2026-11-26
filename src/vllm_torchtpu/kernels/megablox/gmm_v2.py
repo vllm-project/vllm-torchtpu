@@ -1670,7 +1670,9 @@ class OwnerTailRefs:
     weight: jax.Array  # SMEM float32[K, blk]
     fits: jax.Array  # SMEM int32[1]: 0 = the step sends nothing
     out: jax.Array  # HBM [tp * blk, row_sublanes, L]: every TP rank's sums
-    sems: jax.Array  # DMA[7]: loads x2, stores x2, pushes x2, forwards
+    # DMA[5 + 2 * chunk]: stores x2, pushes x2, forwards, then per stage slot
+    # each token's loads
+    sems: jax.Array
     recv_sems: jax.Array  # DMA[1 + chunks]: peer rows, partner chunks
     tp_size: int
     chunk: int  # tokens summed per stage slot
@@ -1973,7 +1975,7 @@ def _owner_tail(sc: ScatterRefs, tl: OwnerTailRefs) -> None:
     chunks = [(c * chunk, chunk) for c in range(nfull)]
     if rest:
         chunks.append((nfull * chunk, rest))
-    forward_sem = tl.sems.at[6]
+    forward_sem = tl.sems.at[4]
     peer_sem = tl.recv_sems.at[0]
 
     def device(member):
@@ -2002,35 +2004,41 @@ def _owner_tail(sc: ScatterRefs, tl: OwnerTailRefs) -> None:
 
         expected = (tp - 1) * blk
 
-    def loads(c0, n, slot):
-        sem = tl.sems.at[slot]
+    def token_loads(t, i, slot):
+        # Per token, so its sum starts once its own rows are in.
+        sem = tl.sems.at[5 + slot * chunk + i]
         cps = [
             pltpu.make_async_copy(
-                recv.at[:, pl.ds(c0, n)],
-                groups.at[slot, pl.ds(0, topk), pl.ds(0, n)],
+                recv.at[:, pl.ds(t, 1)],
+                groups.at[slot, pl.ds(0, topk), pl.ds(i, 1)],
                 sem,
             )
         ]
         if shared is not None:
             cps.append(
                 pltpu.make_async_copy(
-                    shared.at[:, pl.ds(c0, n)],
-                    groups.at[slot, pl.ds(topk, tp), pl.ds(0, n)],
+                    shared.at[:, pl.ds(t, 1)],
+                    groups.at[slot, pl.ds(topk, tp), pl.ds(i, 1)],
                     sem,
                 )
             )
         return cps
 
+    def start_loads(c0, n, slot):
+        for i in range(n):
+            for cp in token_loads(c0 + i, i, slot):
+                cp.start()
+
     def copies(c, c0, n, slot):
         src = groups.at[slot, sums, pl.ds(0, n)]
         dst = tl.out.at[pl.ds(my_tp * blk + c0, n)]
-        out = [pltpu.make_async_copy(src, dst, tl.sems.at[2 + slot])]
+        out = [pltpu.make_async_copy(src, dst, tl.sems.at[slot])]
         for member, recv_sem in pushes(c):
             out.append(
                 pltpu.make_async_remote_copy(
                     src,
                     dst,
-                    tl.sems.at[4 + slot],
+                    tl.sems.at[2 + slot],
                     recv_sem,
                     device_id=device(member),
                     device_id_type=pl.DeviceIdType.MESH,
@@ -2046,6 +2054,8 @@ def _owner_tail(sc: ScatterRefs, tl: OwnerTailRefs) -> None:
 
     def compute(c0, n, slot):
         for i in range(n):
+            for cp in token_loads(c0 + i, i, slot):
+                cp.wait()
             tables = (tl.tp_rank, tl.dp_pos, tl.sent, tl.weight, c0 + i)
             if shared is None:
                 out = owner_token_sum(
@@ -2066,8 +2076,7 @@ def _owner_tail(sc: ScatterRefs, tl: OwnerTailRefs) -> None:
     @pl.when(tl.fits[0] != 0)
     def _():
         with jax.named_scope("tail_sum"):
-            for cp in loads(*chunks[0], 0):
-                cp.start()
+            start_loads(*chunks[0], 0)
 
             def body(c, carry):
                 slot = lax.rem(c, 2)
@@ -2076,18 +2085,13 @@ def _owner_tail(sc: ScatterRefs, tl: OwnerTailRefs) -> None:
 
                     @pl.when(c + 1 < nfull)
                     def _():
-                        for cp in loads((c + 1) * chunk, chunk, 1 - slot):
-                            cp.start()
+                        start_loads((c + 1) * chunk, chunk, 1 - slot)
 
                 if rest:
 
                     @pl.when(c + 1 == nfull)
                     def _():
-                        for cp in loads(nfull * chunk, rest, 1 - slot):
-                            cp.start()
-
-                for cp in loads(c * chunk, chunk, slot):
-                    cp.wait()
+                        start_loads(nfull * chunk, rest, 1 - slot)
 
                 @pl.when(c >= 2)
                 def _():
@@ -2103,8 +2107,6 @@ def _owner_tail(sc: ScatterRefs, tl: OwnerTailRefs) -> None:
                 lax.fori_loop(0, nfull, body, 0)
             if rest:
                 slot = nfull % 2
-                for cp in loads(nfull * chunk, rest, slot):
-                    cp.wait()
                 if nfull >= 2:
                     wait_copies(nfull - 2, (nfull - 2) * chunk, chunk, slot)
                 compute(nfull * chunk, rest, slot)
@@ -3348,7 +3350,7 @@ def gmm_v2_mlp_scatter(
         out_shape = (out_shape, result) if extra is None else (*out_shape, result)
         out_specs = (hbm,) * len(out_shape)
         scratch_shapes += [
-            pltpu.SemaphoreType.DMA((7,)),
+            pltpu.SemaphoreType.DMA((5 + 2 * chunk,)),
             pltpu.SemaphoreType.DMA((1 + pl.cdiv(blk, chunk),)),
         ]
         name += "-t"
