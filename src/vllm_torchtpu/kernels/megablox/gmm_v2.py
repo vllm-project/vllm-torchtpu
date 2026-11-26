@@ -2170,8 +2170,8 @@ def _mlp_kernel(
         for c in copies:
             c.start()
 
-    def start_first_weights(group_id):
-        for p in range(cfgs.num_parts):
+    def start_first_weights(group_id, first_part=0):
+        for p in range(first_part, cfgs.num_parts):
             start(up_copies(p, group_id))
         for q in range(cfgs.down_parts):
             start(down_copies(q, group_id))
@@ -2601,14 +2601,17 @@ def _mlp_kernel(
 
         @pl.when(num_gm > 0)
         def _():
+            first_group = metadata_ref.gm_id_to_group_id[0]
+            # The first gate/up part loads while the first wave lands.
+            start(up_copies(0, first_group))
             fetch_rows(0)
-            # The first rows (and the scales) are in before the first weights
+            # The first rows (and the scales) are in before the other weights
             # start: issued behind them, the first rows' copy completed only
             # after the first expert's ~25 MB of weights (j-b2022c4a).
             with jax.named_scope("wave_rows_wait"):
                 wave_rows_copy(0).wait()
                 scale_copy.wait()
-            start_first_weights(metadata_ref.gm_id_to_group_id[0])
+            start_first_weights(first_group, first_part=1)
 
         def step(gm_id, carry):
             @pl.when(gm_id > 0)
