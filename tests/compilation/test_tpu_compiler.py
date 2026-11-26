@@ -731,6 +731,106 @@ class TestTpuCompilerCache:
         assert compiled == [0]
         assert result["fn"]() == "entry-from-rank-0"
 
+    def test_one_rank_per_graph_variant_compiles_a_bucket(
+        self, tmp_path, monkeypatch
+    ):
+        """Ranks 0-1 and 2-3 trace two variants of the graph. The owner's
+        artifact fits only its own variant: one rank of the other variant
+        compiles the bucket and the other replays it, instead of both
+        compiling it."""
+        monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY_VARIANTS", "1")
+        import threading
+
+        import torch
+
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        ranks, compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=4
+        )
+        graphs = [
+            torch.fx.symbolic_trace(lambda x: x * 2 + 1),
+            torch.fx.symbolic_trace(lambda x: x * 2 + 2),
+        ]
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        lock = threading.Lock()
+        results = {}
+        local = threading.local()
+
+        class Compiled:
+            def __init__(self, rank):
+                self.rank = rank
+
+            def __call__(self, *args):
+                return (self.rank,)
+
+            def serialize(self):
+                return f"entry-from-rank-{self.rank}"
+
+        def backend(graph, example_inputs):
+            # The helper's backend keeps the compiling rank in shared state;
+            # these ranks compile concurrently, so keep it per thread.
+            compiled.append(local.rank)
+            return Compiled(local.rank)
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+
+        def waiter(rank):
+            local.rank = rank
+            with wait_for_peer_artifact(30.0):
+                fn, _ = compile(ranks[rank], graphs[rank // 2])
+            with lock:
+                results[rank] = fn()
+
+        threads = [threading.Thread(target=waiter, args=(r,)) for r in (1, 2, 3)]
+        for t in threads:
+            t.start()
+        local.rank = 0
+        compile(ranks[0], graphs[0])
+        for t in threads:
+            t.join(30.0)
+
+        assert not any(t.is_alive() for t in threads)
+        assert compiled[0] == 0 and len(compiled) == 2 and compiled[1] in (2, 3)
+        assert results[1] == "entry-from-rank-0"
+        other = 5 - compiled[1]
+        assert results[other] == f"entry-from-rank-{compiled[1]}"
+
+    def test_a_claim_left_by_an_earlier_run_is_replaced(self, tmp_path, monkeypatch):
+        import torch
+
+        monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY_VARIANTS", "1")
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a, torch.fx.symbolic_trace(lambda x: x * 2 + 1))
+        graph = torch.fx.symbolic_trace(lambda x: x * 2 + 2)
+        stale = b._claim_path(
+            "artifact_bucket", tpu_compiler._graph_fingerprint(graph)
+        )
+        open(stale, "w").close()
+        os.utime(stale, (0, 0))
+        compile(b, graph)
+        assert compiled == [0, 1]
+
+    def test_variants_flag_off_keeps_first_peer_only(self, tmp_path, monkeypatch):
+        """TPU_PRECOMPILE_PEER_REPLAY_VARIANTS unset: a rank of another graph
+        variant compiles the bucket itself and writes no claim marker."""
+        import torch
+
+        monkeypatch.delenv("TPU_PRECOMPILE_PEER_REPLAY_VARIANTS", raising=False)
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a, torch.fx.symbolic_trace(lambda x: x * 2 + 1))
+        compile(b, torch.fx.symbolic_trace(lambda x: x * 2 + 2))
+        assert compiled == [0, 1]
+        assert not list(tmp_path.rglob("*.claim"))
+
     def test_a_rank_compiles_itself_when_no_peer_saves_in_time(
         self, tmp_path, monkeypatch
     ):

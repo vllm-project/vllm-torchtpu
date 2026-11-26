@@ -98,6 +98,7 @@ _PEER_POLL_S = 0.5
 # are ignored; one written this run is minutes newer than the process start,
 # so clock skew between the host and a shared cache filesystem does not matter.
 _FAILED_SUFFIX = ".failed"
+_CLAIM_SUFFIX = ".claim"
 _PROCESS_START = time.time()
 # get_attr tensors up to this size are hashed by value; bigger ones, which are
 # weights rather than constants, by dtype and shape.
@@ -219,6 +220,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_PARALLEL_PRECOMPILE",
     "TPU_PRECOMPILE_BIGGEST_FIRST",
     "TPU_PRECOMPILE_PEER_REPLAY",
+    "TPU_PRECOMPILE_PEER_REPLAY_VARIANTS",
     "TPU_PRECOMPILE_PEER_WAIT_S",
     "TPU_PRECOMPILE_TRACE_FIRST",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
@@ -824,6 +826,48 @@ class TpuCompilerAdaptor(CompilerInterface):
                         return path
         return None
 
+    def _claim_path(self, key: str, fingerprint: str) -> str | None:
+        """Claim marker for `key` among the ranks tracing `fingerprint`.
+
+        It sits next to the `rank_*` dirs (`<hash>/<prefix>.<key>.<fp>.claim`),
+        so every rank of the host sees the same file. None outside a rank dir.
+        """
+        assert self.cache_dir is not None
+        rank_dir, prefix = os.path.split(os.path.normpath(self.cache_dir))
+        if re.fullmatch(r"rank_\d+_\d+", os.path.basename(rank_dir)) is None:
+            return None
+        return os.path.join(
+            os.path.dirname(rank_dir),
+            f"{prefix}.{key}.{fingerprint[:16]}{_CLAIM_SUFFIX}",
+        )
+
+    def _claim(self, key: str, fingerprint: str) -> bool:
+        """True if this rank is the first of this run tracing `fingerprint`
+        to claim `key`: it compiles the bucket for the others.
+
+        Used once the bucket's owner has saved an artifact of another graph
+        (ranks that bake a rank-dependent value into the graph trace a few
+        variants of it). Without it every rank of a variant compiled the
+        bucket itself. A claim left by an earlier run is replaced.
+        """
+        path = self._claim_path(key, fingerprint)
+        if path is None:
+            return True
+        for _ in range(2):
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                with contextlib.suppress(OSError):
+                    if os.path.getmtime(path) < _PROCESS_START:
+                        os.remove(path)
+                        continue
+                return False
+            except OSError:
+                return True
+            os.close(fd)
+            return True
+        return False
+
     def _replay_from_peer(
         self,
         key: str,
@@ -835,11 +879,61 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         Waits for one to appear inside `wait_for_peer_artifact`. Returns the
         runnable and the peer's path, or None to compile: nothing appeared in
-        time, a rank compiling this graph left a marker saying it will not save
-        it, or what appeared was built from a different graph -- then the ranks
-        do not trace the same program and waiting on would not help.
+        time, or a rank compiling this graph left a marker saying it will not
+        save it. Every peer artifact is tried, not only the first: when the
+        ranks trace several variants of the graph, the owner's artifact fits
+        only its own variant. Then one rank per variant claims the bucket
+        (`_claim`) and compiles it, and the others of that variant wait for
+        its artifact.
         """
         deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
+        if not envs.TPU_PRECOMPILE_PEER_REPLAY_VARIANTS:
+            return self._replay_first_peer(
+                key, graph, was_wrapped, fingerprint, deadline
+            )
+        tried: set[str] = set()
+        claimed = False
+        while True:
+            for path in self._peer_paths(key):
+                if path in tried:
+                    continue
+                tried.add(path)
+                compiled_fn = self._replay(path, graph, was_wrapped, fingerprint)
+                if compiled_fn is not None:
+                    return compiled_fn, path
+            if tried and not claimed:
+                # Only artifacts of other graphs so far: this variant's
+                # first claimant compiles it.
+                if self._claim(key, fingerprint):
+                    logger.info(
+                        "[TpuCompilerAdaptor] %s: no peer artifact of this "
+                        "graph; compiling it here for the ranks that trace it",
+                        key,
+                    )
+                    return None
+                claimed = True
+            if time.monotonic() >= deadline:
+                return None
+            failed = self._peer_failed(key, fingerprint)
+            if failed is not None:
+                logger.info(
+                    "[TpuCompilerAdaptor] %s: its owner could not save it; "
+                    "compiling it here instead of waiting",
+                    failed,
+                )
+                return None
+            time.sleep(_PEER_POLL_S)
+
+    def _replay_first_peer(
+        self,
+        key: str,
+        graph: fx.GraphModule,
+        was_wrapped: bool,
+        fingerprint: str,
+        deadline: float,
+    ) -> tuple[Callable[..., Any], str] | None:
+        """TPU_PRECOMPILE_PEER_REPLAY_VARIANTS=0: replay only the first peer
+        artifact that appears; compile if it was built from another graph."""
         paths = self._peer_paths(key)
         while not paths and time.monotonic() < deadline:
             failed = self._peer_failed(key, fingerprint)

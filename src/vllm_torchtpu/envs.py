@@ -175,6 +175,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
+    TPU_PRECOMPILE_PEER_REPLAY_VARIANTS: bool = False
     TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
@@ -1389,6 +1390,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per host and the others wait for its artifact. Off compiles every bucket
     # on every rank, sharing only through the Tier-2 cache.
     "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=False),
+    # Under TPU_PRECOMPILE_PEER_REPLAY, try every peer artifact of a bucket,
+    # not only the first. When ranks trace a few variants of the graph (e.g.
+    # MiniMax-M3 DCP4: ranks 0-3 vs 4-7), one rank per variant claims the
+    # bucket and compiles it, and the others of that variant replay it. Off
+    # tries only the first peer artifact, and then every rank of the other
+    # variant compiles the bucket itself. Compile time and cache size only.
+    "TPU_PRECOMPILE_PEER_REPLAY_VARIANTS": env_bool(
+        "TPU_PRECOMPILE_PEER_REPLAY_VARIANTS", default=False
+    ),
     # Under TPU_PRECOMPILE_PEER_REPLAY, how long a rank waits for a bucket's
     # owner to save it before compiling the bucket itself. The default fits
     # well over a single bucket compile with every rank of the host compiling
