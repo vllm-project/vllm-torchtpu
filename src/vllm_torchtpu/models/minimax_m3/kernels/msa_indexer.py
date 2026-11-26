@@ -412,7 +412,7 @@ def _chunk_maxima_t(
         ]
 
     return _page_maxima(
-        page_scores, None if scales is None else scales.__getitem__, chunk
+        page_scores, None if scales is None else (lambda p: scales[p]), chunk
     )
 
 
@@ -444,8 +444,8 @@ def _kernel_v3(
     # With `defer`:
     #   out_buf [2, G / 128, Bq, 128] f32: two steps' maxima of their other chunks
     #   raw_buf [chunk, Bq, S] f32: a step's last chunk's scores, page-major
-    #   raw_scale [chunk, S] f32: their slot scales (folded pages)
     #   meta SMEM [1]: their chunk's lane tile
+    #   raw_scale [chunk, S] f32: their slot scales (folded pages only)
     *deferred,
     pages_per_seq,
     transposed=False,
@@ -489,7 +489,8 @@ def _kernel_v3(
     # Work items: the grid's steps, but for the extra step of `defer`.
     num_items = num_steps - 1 if defer else num_steps
     if defer:
-        out_buf, raw_buf, raw_scale, meta = deferred
+        out_buf, raw_buf, meta, *raw_scale = deferred
+        raw_scale = raw_scale[0] if folded else None
     # The pages as 32-bit words: a dense VMEM layout, so each key vreg is one
     # load (a packed [S / p, p, D] page tiles VMEM in (p, D) tiles).
     words = cache_ref.bitcast(jnp.uint32).reshape(cache_ref.shape[0], rows, head_dim)
@@ -982,6 +983,8 @@ def _class_scores(
                     0,
                 ),
             )
+            # Steps 0 and 1 map to the same block, so step 0's write (of no
+            # chunk) is never written back: step 1 overwrites the block.
             out_specs = pl.BlockSpec(
                 (block_q, pages_per_step),
                 lambda w, work, *_: (
@@ -992,9 +995,10 @@ def _class_scores(
             deferred = [
                 pltpu.VMEM((2, pages_per_step // 128, block_q, 128), jnp.float32),
                 pltpu.VMEM((chunk, block_q, page_size), jnp.float32),
-                pltpu.VMEM((chunk, head_dim), jnp.float32),
                 pltpu.SMEM((1,), jnp.int32),
             ]
+            if msa_fp4.scales_in_page(rows_per_page, index_cache.dtype):
+                deferred.append(pltpu.VMEM((chunk, head_dim), jnp.float32))
         scores_t = pl.pallas_call(
             functools.partial(
                 _kernel_v3,

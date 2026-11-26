@@ -213,6 +213,40 @@ def test_transposed_partial_chunks_match_reference(cache_kind, monkeypatch):
         np.testing.assert_allclose(got, expected.max(-1), **tol)
 
 
+@pytest.mark.parametrize("cache_kind", [jnp.float8_e4m3fn, "fp4"])
+def test_deferred_last_chunks_match_reference(cache_kind):
+    """Decode tiles over 256-page groups (`msa._wide_decode_scores`) take each
+    step's last chunk's maxima in the next step (`_kernel_v3`'s `defer`):
+    requests of 100 pages (one chunk), 200 (a 96-page tail) and 300 (a full
+    group, then 44 pages of a group the 384-page row cuts short)."""
+    q_lens, ctx_lens = [8, 8, 8], [100 * PAGE - 8, 200 * PAGE - 8, 300 * PAGE - 8]
+    index_q, cache, keys, seq_lens, tables, cu_q, num_seqs = _served_case(
+        q_lens, ctx_lens, cache_kind, 11
+    )
+    scores = block_scores(
+        index_q,
+        cache,
+        jnp.asarray(seq_lens),
+        jnp.asarray(tables.reshape(-1)),
+        jnp.asarray(cu_q),
+        jnp.int32(num_seqs),
+        small_pages_per_step=256,
+        interpret=True,
+    )
+    scores = np.asarray(scores)[:, 0]
+    queries = np.asarray(index_q.astype(jnp.float32))[:, 0]
+    # 4-bit: the bound `test_served_page_groups_match_reference` uses.
+    tol = {"rtol": 2e-2, "atol": 5e-2}
+    if cache_kind != "fp4":
+        tol = {"rtol": 1e-4, "atol": 1e-3}
+    for r in range(num_seqs):
+        num_pages_r = -(-seq_lens[r] // PAGE)
+        q_r = queries[cu_q[r] : cu_q[r + 1]]
+        expected = np.einsum("psd,td->tps", keys[tables[r, :num_pages_r]], q_r)
+        got = scores[cu_q[r] : cu_q[r + 1], :num_pages_r]
+        np.testing.assert_allclose(got, expected.max(-1), **tol)
+
+
 @pytest.mark.parametrize("kernel", ["v1", "v2", "v3"])
 @pytest.mark.parametrize("dtype", CACHE_DTYPES)
 def test_lowers_for_tpu(dtype, kernel):
