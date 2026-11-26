@@ -176,6 +176,7 @@ from vllm_torchtpu.runner import (
     routed_experts,
     spec_boundary_state,
     thinking_budget_tracker,
+    token_lookback,
 )
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import repetition_penalty as repetition_penalty_tracker
@@ -722,6 +723,8 @@ class TPUModelRunner(GPUModelRunner):
     _pp_handoff: PPBuffered | None = None
     _dp_step_other_decode: bool = False
     _bounded_replay: bounded_replay.BoundedReplayTracker | None = None
+    _token_lookback: token_lookback.TokenLookbackRing | None = None
+    _lookback_chunk_span: tuple[int, int] | None = None
     _adaptive_verification: AdaptiveVerificationManager | None = None
     _thinking_budget: thinking_budget_tracker.ThinkingBudgetTracker | None = None
     _routed_experts: routed_experts.RoutedExpertsCapture | None = None
@@ -1159,6 +1162,8 @@ class TPUModelRunner(GPUModelRunner):
         self._bounded_replay: bounded_replay.BoundedReplayTracker | None = (
             bounded_replay.BoundedReplayTracker()
         )
+        self._token_lookback: token_lookback.TokenLookbackRing | None = None
+        self._lookback_chunk_span: tuple[int, int] | None = None
         # ThinkingBudgetTracker enforces thinking_token_budget; upstream's holder
         # would make InputBatch.refresh_metadata run holder.sync_batch (prompt
         # scans, unused per-row state) on every batch update.
@@ -3994,6 +3999,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._prefill_ckpt_offsets_cpu[:target_num_reqs],
             )
 
+        self._lookback_chunk_span = (start_index, num_reqs)
         is_all_layout = (
             layout_plan is not None and layout_plan.kind is SequenceLayoutKind.ALL
         )
@@ -6401,6 +6407,17 @@ class TPUModelRunner(GPUModelRunner):
         self._prompt_logprobs_unsupported = self._prompt_logprobs_unsupported_reason()
         if self.is_pooling_model:
             self._resolve_static_pooler()
+        # Allocate the 4-slot fenced lookback staging ring after model load
+        # (TPUModelRunner does not delegate to GPUModelRunner.load_model).
+        if isinstance(self.model, utils.TokenLookbackModel):
+            depth = self.model.token_lookback_depth
+            self._token_lookback = (
+                token_lookback.TokenLookbackRing.create(
+                    self._make_buffer, self.max_num_reqs, depth
+                )
+                if depth > 0
+                else None
+            )
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
@@ -6845,6 +6862,7 @@ class TPUModelRunner(GPUModelRunner):
                 kv_cache_initialized=kv_cache_initialized,
             ).descriptor
 
+        self._lookback_chunk_span = (0, num_reqs)
         if self.kv_cache_config is not None:
             # Dummy compact-mamba slot ids (all null slot 0): the dummy run
             # only traces shapes/HBM, so the recurrent state read/written is
@@ -9404,6 +9422,17 @@ class TPUModelRunner(GPUModelRunner):
         kwargs = {}
         if intermediate_tensors is not None:
             kwargs["intermediate_tensors"] = intermediate_tensors
+        if (
+            isinstance(self.model, utils.TokenLookbackModel)
+            and self._token_lookback is not None
+        ):
+            kwargs["lookback_token_ids"] = self._token_lookback.prepare_for_chunk(
+                self.input_batch,
+                self._lookback_chunk_span,
+                async_scheduling=self.scheduler_config.async_scheduling,
+                device_type=self.device.type,
+                replay_tracker=self._bounded_replay,
+            )
         out = self.model(
             input_ids=input_ids,
             positions=positions,
