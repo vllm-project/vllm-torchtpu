@@ -684,6 +684,9 @@ def test_precompile_backbone_trace_first_env_guards(
     runner._backbone_token_paddings = TPUModelRunner._backbone_token_paddings.__get__(
         runner
     )
+    runner._precompile_backbone_pass = TPUModelRunner._precompile_backbone_pass.__get__(
+        runner
+    )
     if expected_error is not None:
         with pytest.raises(ValueError, match=expected_error):
             TPUModelRunner._precompile_backbone(runner)
