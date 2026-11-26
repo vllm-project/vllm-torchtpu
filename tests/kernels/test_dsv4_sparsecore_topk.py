@@ -173,10 +173,21 @@ def _scores(kind: str, b: int, n: int, rng: np.random.Generator) -> np.ndarray:
     raise ValueError(kind)
 
 
-def _run(scores: np.ndarray, k: int, row_lengths: np.ndarray) -> np.ndarray:
+def _run(
+    scores: np.ndarray,
+    k: int,
+    row_lengths: np.ndarray,
+    *,
+    double_slice_budget: bool = False,
+) -> np.ndarray:
     return np.asarray(
         jax.block_until_ready(
-            sparsecore_topk(jnp.asarray(scores), k, jnp.asarray(row_lengths))
+            sparsecore_topk(
+                jnp.asarray(scores),
+                k,
+                jnp.asarray(row_lengths),
+                double_slice_budget=double_slice_budget,
+            )
         )
     )
 
@@ -289,6 +300,51 @@ def test_exact_topk_ragged_rows_straddle_partition_boundaries(b, n, k, expected_
     )
     row_lengths = np.array([edges[i % len(edges)] for i in range(b)], np.int32)
     assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
+
+
+def test_should_pick_p1_for_wide_batch_up_to_120k_and_keep_coop_for_small_or_128k():
+    for n in (81920, 98304, 114688, 122880):
+        assert _pick_partition(32, n, 2048, double_slice_budget=True) == 1
+        assert _pick_partition(128, n, 2048, double_slice_budget=True) == 1
+        assert _pick_partition(32, n, 2048) == 4
+        assert _pick_partition(16, n, 2048, double_slice_budget=True) == 2
+    assert _pick_partition(128, 131072, 2048, double_slice_budget=True) == 2
+    assert _pick_partition(128, N_128K, 2048, double_slice_budget=True) == 4
+    assert _pick_partition(128, N_1M, 2048, double_slice_budget=True) == 16
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("n", [81920, 122880])
+def test_should_match_exact_topk_across_wide_p1_wave_handoffs(n):
+    k = 2048
+    pattern = [
+        lambda f: 5000 + 16 * f,
+        lambda f: MAX_SLICE_WORDS,
+        lambda f: 70000 + 16 * f,
+        lambda f: 7 + f,
+        lambda f: 0,
+        lambda f: n - f,
+    ]
+    b = 32 * len(pattern)
+    assert _pick_partition(b, n, k, double_slice_budget=True) == 1
+    row_lengths = np.array(
+        [pattern[w](f) for w in range(len(pattern)) for f in range(32)], np.int32
+    )
+    rng = np.random.default_rng(SEED)
+    for kind in ("random", "heavy_ties"):
+        scores = _scores(kind, b, n, rng)
+        idx = _run(scores, k, row_lengths, double_slice_budget=True)
+        assert _mismatch(scores, idx, k, row_lengths) is None, (n, kind)
+    scores_rs = _scores("random", b, n, rng)
+    idx_rs, keys_rs = sparsecore_topk(
+        jnp.asarray(scores_rs),
+        k,
+        jnp.asarray(row_lengths),
+        return_scores=True,
+        double_slice_budget=True,
+    )
+    assert _mismatch(scores_rs, np.asarray(idx_rs), k, row_lengths) is None
+    assert np.asarray(keys_rs).shape == (b, k)
 
 
 @pytest.mark.tpu_test
@@ -498,3 +554,126 @@ def test_scheduling_group_ids_do_not_change_the_selection(kind):
         np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1), axis=1),
         np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1), axis=1),
     )
+
+
+def test_should_select_wide_radix_and_56k_half_only_when_p1_budget_fits():
+    use_wide, max_half = sc_module._p1_wide_radix_and_half(  # noqa: SLF001 -- exercises budget selector boundary
+        p=1,
+        wave_loop=True,
+        b=128,
+        padded_b=128,
+        k=2048,
+        slice_len=81920,
+        return_scores=False,
+    )
+    assert use_wide is True
+    assert max_half == 56 * 1024
+
+    # Cooperative (p > 1), DCP merge (wave_loop=False), and tiny decode batches
+    # (b < 32) must keep the default 8-bit schedule.
+    for kw in (
+        dict(
+            p=2,
+            wave_loop=True,
+            b=128,
+            padded_b=128,
+            k=2048,
+            slice_len=65536,
+            return_scores=False,
+        ),
+        dict(
+            p=1,
+            wave_loop=False,
+            b=128,
+            padded_b=128,
+            k=2048,
+            slice_len=32768,
+            return_scores=False,
+        ),
+        dict(
+            p=1,
+            wave_loop=True,
+            b=8,
+            padded_b=32,
+            k=2048,
+            slice_len=65536,
+            return_scores=False,
+        ),
+    ):
+        w, h = sc_module._p1_wide_radix_and_half(**kw)  # noqa: SLF001 -- exercises budget selector boundary
+        assert w is False
+        if kw["p"] > 1 or not kw["wave_loop"]:
+            assert h == MAX_SLICE_WORDS
+
+    # Oversized meta_vmem + slice_len near the ceiling must fall back cleanly.
+    w_tight, _ = sc_module._p1_wide_radix_and_half(  # noqa: SLF001 -- exercises budget selector boundary
+        p=1,
+        wave_loop=True,
+        b=16384,
+        padded_b=16384,
+        k=4096,
+        slice_len=122880,
+        return_scores=True,
+    )
+    assert w_tight is False
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "n,kind,return_scores",
+    [
+        (49152, "random", False),
+        (81920, "random", False),
+        (81920, "heavy_ties", False),
+        (98304, "random", False),
+        (114688, "random", False),
+        (122880, "random", False),
+        (81920, "random", True),
+    ],
+    ids=[
+        "48k_rand",
+        "80k_rand",
+        "80k_ties",
+        "96k_rand",
+        "112k_rand",
+        "120k_ceiling",
+        "80k_scores",
+    ],
+)
+def test_should_match_exact_topk_with_wide_radix_and_56k_dblbuf(n, kind, return_scores):
+    b, k = 128, 2048
+    assert _pick_partition(b, n, k, double_slice_budget=True) == 1
+    rng = np.random.default_rng(SEED + n + int(return_scores))
+    scores = _scores(kind, b, n, rng)
+    # Mix empty, short (<k), double-buffered (<=56K), and single-buffered (>56K)
+    # rows in the same call to exercise both wave-buffer branches.
+    lengths = np.full(b, n, np.int32)
+    lengths[0] = 0
+    lengths[1] = k // 2
+    lengths[2:34] = min(n, 49152)
+    lengths[34:66] = min(n, 57344)
+    lengths[66:98] = min(n, 65536)
+
+    out = sparsecore_topk(
+        jnp.asarray(scores),
+        k,
+        jnp.asarray(lengths),
+        return_scores=return_scores,
+        double_slice_budget=True,
+    )
+    if return_scores:
+        idx_j, bits_j = out
+        idx = np.asarray(jax.block_until_ready(idx_j))
+        ret_scores = np.asarray(
+            jax.block_until_ready(jax.lax.bitcast_convert_type(bits_j, jnp.float32))
+        )
+    else:
+        idx = np.asarray(jax.block_until_ready(out))
+        ret_scores = None
+
+    assert _mismatch(scores, idx, k, lengths) is None
+    if ret_scores is not None:
+        live = idx >= 0
+        picked = np.take_along_axis(scores, np.maximum(idx, 0), axis=1)
+        np.testing.assert_array_equal(ret_scores[live], picked[live])
+        assert np.all(ret_scores[~live] == -np.inf)

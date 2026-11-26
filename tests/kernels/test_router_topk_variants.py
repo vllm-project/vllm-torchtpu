@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU Pallas interpret and TPU tests for scaled router top-k selection."""
+"""CPU Pallas interpret tests for biased and scaled router top-k variants."""
 
 import jax
 import jax.numpy as jnp
@@ -21,29 +21,48 @@ import pytest
 from vllm_torchtpu.kernels import router_topk
 
 
-def test_select_scaled_lowest_index_tie_break_and_nan() -> None:
+@pytest.mark.parametrize("topk", [1, 4, 8])
+@pytest.mark.parametrize("num_tokens", [8, 32])
+def test_select_bias_matches_unbiased_choice_gathering(
+    num_tokens: int, topk: int
+) -> None:
+    num_experts = 128
+    key_s, key_b = jax.random.split(jax.random.key(100 + num_tokens + topk))
+    scores = jax.nn.sigmoid(
+        jax.random.normal(key_s, (num_tokens, num_experts), dtype=jnp.float32)
+    )
+    bias = 0.2 * jax.random.normal(key_b, (num_experts,), dtype=jnp.float32)
+
+    weights, indices = router_topk.select_bias(scores, bias, topk=topk, interpret=True)
+
+    choice = scores + bias
+    _, ref_idx = jax.lax.top_k(choice, topk)
+    ref_w = jnp.take_along_axis(scores, ref_idx, axis=-1)
+
+    assert weights.dtype == jnp.float32
+    assert indices.dtype == jnp.int32
+    np.testing.assert_array_equal(np.asarray(indices), np.asarray(ref_idx))
+    np.testing.assert_array_equal(np.asarray(weights), np.asarray(ref_w))
+
+
+def test_select_bias_lowest_index_tie_break_and_nan() -> None:
     num_tokens, num_experts, topk = 8, 128, 4
     scores = jnp.ones((num_tokens, num_experts), dtype=jnp.float32) * 0.5
     scores = scores.at[0, 3].set(jnp.nan)
-    scale = jnp.arange(1, num_experts + 1, dtype=jnp.bfloat16)
+    bias = jnp.zeros((num_experts,), dtype=jnp.float32)
 
-    weights, indices, sel_scales = router_topk.select_scaled(
-        scores, scale, topk=topk, interpret=True
-    )
+    weights, indices = router_topk.select_bias(scores, bias, topk=topk, interpret=True)
     np.testing.assert_array_equal(
         np.asarray(indices[0]), np.array([0, 1, 2, 4], dtype=np.int32)
     )
     np.testing.assert_array_equal(
         np.asarray(indices[1]), np.array([0, 1, 2, 3], dtype=np.int32)
     )
-    np.testing.assert_allclose(
-        np.asarray(sel_scales[0]), np.array([1.0, 2.0, 3.0, 5.0], dtype=np.float32)
-    )
     assert np.all(np.isfinite(np.asarray(weights)))
 
     dead_scores = scores.at[2, :].set(jnp.nan)
-    dead_weights, _, _ = router_topk.select_scaled(
-        dead_scores, scale, topk=topk, interpret=True
+    dead_weights, _ = router_topk.select_bias(
+        dead_scores, bias, topk=topk, interpret=True
     )
     assert np.all(np.isnan(np.asarray(dead_weights[2])))
     assert np.all(np.isfinite(np.asarray(dead_weights[:2])))
@@ -78,19 +97,27 @@ def test_select_scaled_softmax_renorm_and_per_expert_scale(topk: int) -> None:
 
 
 @pytest.mark.tpu_test
-def test_router_topk_scaled_on_tpu() -> None:
+def test_router_topk_variants_on_tpu() -> None:
     if jax.default_backend() != "tpu":
         pytest.skip("Requires TPU backend")
-    k1, k2 = jax.random.split(jax.random.key(321), 2)
+    k1, k2, k3 = jax.random.split(jax.random.key(321), 3)
     scores = jax.nn.sigmoid(jax.random.normal(k1, (16, 128), dtype=jnp.float32))
+    bias = 0.2 * jax.random.normal(k2, (128,), dtype=jnp.float32)
     per_expert = jax.nn.softplus(
-        jax.random.normal(k2, (128,), dtype=jnp.float32)
+        jax.random.normal(k3, (128,), dtype=jnp.float32)
     ).astype(jnp.bfloat16)
 
     w0, i0 = router_topk.select(scores, topk=8)
     ref_w0, ref_i0 = jax.lax.top_k(scores, 8)
     np.testing.assert_array_equal(np.asarray(i0), np.asarray(ref_i0))
     np.testing.assert_allclose(np.asarray(w0), np.asarray(ref_w0), rtol=1e-6)
+
+    wb, ib = router_topk.select_bias(scores, bias, topk=8)
+    _, ref_ib = jax.lax.top_k(scores + bias, 8)
+    np.testing.assert_array_equal(np.asarray(ib), np.asarray(ref_ib))
+    np.testing.assert_allclose(
+        np.asarray(wb), np.asarray(jnp.take_along_axis(scores, ref_ib, axis=-1))
+    )
 
     ws, isc, ss = router_topk.select_scaled(scores, per_expert, topk=8)
     np.testing.assert_array_equal(np.asarray(isc), np.asarray(ref_i0))

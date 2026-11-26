@@ -38,7 +38,12 @@ import pytest
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
-from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import (
+    all_reduce,
+)
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import (
+    kernel as kernel_impl,
+)
 from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import _quantize_blocks
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
@@ -54,6 +59,10 @@ GLM52_TP16 = dict(h=6144, e=256, i=128, fs=128, topk=8)
 # ring (6 slots).
 SMALL = dict(h=4096, e=8, i=128, fs=128, topk=4)
 ROUTED_SCALE = 2.5
+SMALL_EP = dict(h=2048, e=16, i=256, fs=128, topk=4, ep=4)
+GLM52_EP4TP4 = dict(h=6144, e=256, i=512, fs=128, topk=8, ep=4)
+GLM52_EP8TP2 = dict(h=6144, e=256, i=1024, fs=128, topk=8, ep=8)
+EP_CASES = ((16, 16), (32, 12), (64, 33), (16, 0))
 # (rows, n_valid) called directly: zero and full for 16 rows; fold, trim and
 # full for 32; fold (8, the most rows that fold), trim (16) and full with
 # padding (33, the fewest tokens only this bucket serves) for 64. Zero and
@@ -72,6 +81,8 @@ CASES = (
     (64, 33),
 )
 BODY_CASE = (16, 7)
+SUB_BUCKET_CASE = (8, 5)
+FAST_CASES = ((16, 0), (16, 16), (32, 12))
 # A token count the kernel does not admit: the op body's psum path.
 CHAIN_ROWS = 128
 # Row 0 of OUTLIER_CASE gets OUTLIER at OUTLIER_COLUMN (inside the second
@@ -115,6 +126,57 @@ def _shapes(m, h, e, i, fs, *, w_dtype=jnp.float8_e4m3fn, score_experts=None):
 def _glm52_shapes(rows, **kwargs):
     c = GLM52_TP16
     return _shapes(rows, c["h"], c["e"], c["i"], c["fs"], **kwargs)
+
+
+def _glm52_ep_shapes(rows, cfg=GLM52_EP4TP4):
+    e_local = cfg["e"] // cfg["ep"]
+    return _shapes(rows, cfg["h"], e_local, cfg["i"], cfg["fs"], score_experts=cfg["e"])
+
+
+@pytest.mark.parametrize("cfg", [GLM52_EP4TP4, GLM52_EP8TP2], ids=["ep4tp4", "ep8tp2"])
+@pytest.mark.parametrize(
+    "rows, admitted", [(16, True), (32, True), (64, True), (48, False)]
+)
+def test_admits_an_expert_range_at_glm52_ep_by_tp_shapes(
+    monkeypatch, cfg, rows, admitted
+):
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    shapes = _glm52_ep_shapes(rows, cfg)
+    assert kernel.can_use_moe_tp_decode(*shapes, topk=8, n_ranks=N_RANKS) is admitted
+
+
+def test_refuses_an_expert_block_that_does_not_tile_the_router(monkeypatch):
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    c = GLM52_EP4TP4
+    shapes = _shapes(16, c["h"], 48, c["i"], c["fs"], score_experts=c["e"])
+    assert not kernel.can_use_moe_tp_decode(*shapes, topk=8, n_ranks=N_RANKS)
+
+
+def test_expert_range_kernel_name():
+    assert kernel.kernel_name(64, 16, 6144, 512, 128, 16, 256).endswith("-ne_256")
+    assert kernel.kernel_name(256, 16, 6144, 128, 128, 16, 256) == (
+        kernel.kernel_name(256, 16, 6144, 128, 128, 16)
+    )
+    name = kernel.kernel_name(
+        32, 64, 6144, 1024, 128, 16, 256, fast=True, ar_one_shot=True, nb=5
+    )
+    assert "-nb_5-n_16-sm-ne_256-fast-os" in name
+
+
+def test_one_shot_row_paths_at_glm52_shapes(monkeypatch):
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    info = _tpu7x()
+    h = GLM52_TP16["h"]
+    assert all_reduce.one_shot_supported(h, info)
+    assert not all_reduce.one_shot_supported(2048 + 128, info)
+    spec16 = all_reduce.make_spec(N_RANKS, 16, h, one_shot=True)
+    assert spec16.one_shot and all_reduce.kernel_name(spec16).endswith("-os")
+    assert all_reduce.selftest_row_counts(spec16) == [16, 1, 5, 0]
+    spec32 = all_reduce.make_spec(N_RANKS, 32, h, one_shot=True)
+    assert all_reduce.selftest_row_counts(spec32) == [32, 1, 5, 16, 0]
+    assert kernel.can_use_moe_tp_decode(
+        *_glm52_shapes(16), topk=8, n_ranks=N_RANKS, ar_one_shot=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -228,7 +290,7 @@ def _run_worker(part):
         env=env,
         capture_output=True,
         text=True,
-        timeout=540,
+        timeout=900,
     )
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
@@ -277,6 +339,69 @@ def test_routed_x_outlier_on_16_devices(on_16_devices_b):
     assert case["per_row_rel_l2"] >= 100 * EXPECTED_REL_L2, case
 
 
+@pytest.mark.parametrize("rows, n_valid", FAST_CASES)
+def test_fast_schedule_is_bitwise(on_16_devices, rows, n_valid):
+    got = on_16_devices["fast"][f"{rows}:{n_valid}"]
+    assert got["bitwise"] and not got["races_found"], got
+
+
+def _route_inputs(kind, rows=16, e=256, seed=0):
+    rng = np.random.default_rng(seed)
+    bias = np.zeros((e,), np.float32)
+    if kind == "bf16_logits":
+        logits = (rng.standard_normal((rows, e)) * 2.3e-3).astype(jnp.bfloat16)
+        scores = np.asarray(jax.nn.sigmoid(jnp.asarray(logits, jnp.float32)))
+    elif kind == "coarse":
+        scores = (rng.integers(0, 12, (rows, e)) / 16).astype(np.float32)
+    elif kind == "boundary":
+        scores = rng.uniform(0, 0.4, (rows, e)).astype(np.float32)
+        for r in range(rows):
+            cols = rng.choice(e, 10, replace=False)
+            scores[r, cols[:7]] = np.linspace(0.99, 0.93, 7)
+            scores[r, np.sort(cols[7:])[::-1]] = 0.9
+    elif kind == "signed_zero":
+        scores = rng.choice(np.array([0.0, -0.0, -0.25], np.float32), (rows, e))
+    elif kind == "nan":
+        scores = rng.uniform(0, 1, (rows, e)).astype(np.float32)
+        scores[3, :200] = np.nan
+    else:
+        scores = (rng.uniform(0, 1, (rows, e)) ** 40).astype(np.float32)
+    return jnp.asarray(scores), jnp.asarray(bias)
+
+
+@pytest.mark.parametrize(
+    "kind", ["bf16_logits", "coarse", "boundary", "signed_zero", "nan"]
+)
+@pytest.mark.parametrize("n_valid", [16, 5])
+def test_fast_route_breaks_ties_as_the_exact_route(kind, n_valid):
+    scores, bias = _route_inputs(kind)
+    want = kernel_impl._route(scores, bias, n_valid, topk=8)
+    got, flag = kernel_impl._route_fast(scores, bias, n_valid, topk=8)
+    assert float(flag[0, 0]) == 0.0
+    assert np.array_equal(
+        np.asarray(got).view(np.uint32), np.asarray(want).view(np.uint32)
+    )
+
+
+def test_fast_route_flags_picks_beyond_the_key_window():
+    scores, bias = _route_inputs("wide")
+    _, flag = kernel_impl._route_fast(scores, bias, 16, topk=8)
+    assert float(flag[0, 0]) == 1.0
+    _, flag = kernel_impl._route_fast(scores, bias, 0, topk=8)
+    assert float(flag[0, 0]) == 0.0
+
+
+def test_op_body_pads_sub_bucket_token_counts(on_16_devices):
+    case = on_16_devices["body_sub_bucket"]
+    assert case["ranks_identical"], case
+    assert case["padding_rows_positive_zero"], case
+    assert not case["races_found"], case
+    assert case["nan"] == 0, case
+    assert case["rel_l2"] <= TOLERANCE["rel_l2"], case
+    assert case["cos"] >= TOLERANCE["cos"], case
+    assert case["expected_rel_l2"] <= EXPECTED_REL_L2, case
+
+
 def test_op_body_runs_the_kernel_with_n_valid_from_the_padding_mask(on_16_devices):
     rows, n_valid = BODY_CASE
     case = on_16_devices["body_kernel"]
@@ -293,11 +418,68 @@ def test_op_body_psums_the_usual_path_at_other_token_counts(on_16_devices_b):
     # The usual path is stubbed with ones on real rows: the psum over 16 ranks
     # gives exactly 16 there and 0 on padded rows.
     assert on_16_devices_b["body_chain_exact"]
+    assert on_16_devices_b["body_sub_bucket_non_glm_chain"]
 
 
 def test_all_reduce_selftest_on_16_devices(on_16_devices_b):
     # 32 rows: one call per row path (full, fold, trim, zero).
     assert on_16_devices_b["selftest_ok"]
+    assert on_16_devices_b["selftest_one_shot_ok"]
+
+
+@pytest.fixture(scope="module")
+def ep_on_16_devices():
+    flags = os.environ.get("XLA_FLAGS", "")
+    env = dict(
+        os.environ,
+        JAX_PLATFORMS="cpu",
+        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count={N_RANKS}",
+    )
+    proc = subprocess.run(
+        [sys.executable, __file__, "ep"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, proc.stdout[-3000:] + proc.stderr[-3000:]
+    return json.loads(lines[-1][len("RESULT ") :])
+
+
+@pytest.mark.parametrize("rows, n_valid", EP_CASES)
+def test_expert_range_kernel_on_16_devices(ep_on_16_devices, rows, n_valid):
+    case = ep_on_16_devices["cases"][f"{rows}:{n_valid}"]
+    assert case["ranks_identical"], case
+    assert case["padding_rows_positive_zero"], case
+    assert not case["races_found"], case
+    if n_valid:
+        assert case["nan"] == 0, case
+        assert case["rel_l2"] <= TOLERANCE["rel_l2"], case
+        assert case["cos"] >= TOLERANCE["cos"], case
+
+
+@pytest.mark.parametrize("case", [f"{r}:{n}" for r, n in EP_CASES] + ["tie"])
+def test_expert_range_fast_schedule_is_bitwise(ep_on_16_devices, case):
+    got = ep_on_16_devices["fast"][case]
+    assert got["bitwise"] and not got["races_found"], got
+    if case == "tie":
+        assert got["tie"], got
+
+
+def test_expert_range_wrong_offset_fails_the_oracle(ep_on_16_devices):
+    case = ep_on_16_devices["wrong_offset"]
+    assert case["rel_l2"] > TOLERANCE["rel_l2"], case
+
+
+def test_expert_range_op_body_psums_the_ep_path(ep_on_16_devices):
+    case = ep_on_16_devices["body_chain"]
+    assert case["ranks_identical"], case
+    assert case["rel_l2"] <= TOLERANCE["rel_l2"], case
+    assert ep_on_16_devices["ep_calls_all_use_ep"]
+    case = ep_on_16_devices["body_kernel_vs_chain"]
+    assert case["rel_l2_vs_chain"] <= TOLERANCE["rel_l2"], case
+    assert case["rel_l2"] <= TOLERANCE["rel_l2"], case
 
 
 # ---------------------------------------------------------------------------
@@ -331,8 +513,7 @@ def _rank_weights(key, c):
     )
 
 
-def _reference(x, scores, bias, n_valid, ranks, c):
-    """f32 sum over ranks of shared + scale * routed, dequantized weights."""
+def _reference(x, scores, bias, n_valid, ranks, c, starts=None):
     f32 = jnp.float32
     x = x.astype(f32)
     _, ids = jax.lax.top_k(scores + bias, c["topk"])
@@ -340,11 +521,12 @@ def _reference(x, scores, bias, n_valid, ranks, c):
     w = w / jnp.sum(w, axis=-1, keepdims=True)
     coef = jnp.sum(jax.nn.one_hot(ids, c["e"], dtype=f32) * w[..., None], axis=1)
     out = jnp.zeros(x.shape, f32)
-    for w13, w2, s13, s2, sw13, ss13, sw2, ss2 in ranks:
+    for r, (w13, w2, s13, s2, sw13, ss13, sw2, ss2) in enumerate(ranks):
+        e0 = 0 if starts is None else starts[r]
         gu = jnp.einsum("nh,ehk->enk", x, w13.astype(f32) * s13[:, 0])
         act = jax.nn.silu(gu[..., : c["i"]]) * gu[..., c["i"] :]
         y = jnp.einsum("eni,eih->enh", act, w2.astype(f32) * s2[:, 0])
-        routed = jnp.einsum("ne,enh->nh", coef, y)
+        routed = jnp.einsum("ne,enh->nh", coef[:, e0 : e0 + w13.shape[0]], y)
         sgu = x @ (sw13.astype(f32) * ss13)
         sact = jax.nn.silu(sgu[:, : c["fs"]]) * sgu[:, c["fs"] :]
         out = out + sact @ (sw2.astype(f32) * ss2) + ROUTED_SCALE * routed
@@ -364,7 +546,9 @@ def _gmm_v2_quantize(x, width=Q_BLOCK):
     return blocks
 
 
-def _expected(x, scores, bias, n_valid, ranks, c, *, x_block=Q_BLOCK):
+def _expected(
+    x, scores, bias, n_valid, ranks, c, *, x_block=Q_BLOCK, pair_first: bool = False
+):
     """The kernel's arithmetic in plain JAX ops run one at a time (so bf16 is
     rounded after every op), each part as the path it replaces computes it:
     routing as select_experts (top-k of scores + bias; the picked unbiased
@@ -386,7 +570,7 @@ def _expected(x, scores, bias, n_valid, ranks, c, *, x_block=Q_BLOCK):
     w = (picked / jnp.maximum(wsum, 1e-20)).astype(BF16).astype(F32)
     coef = jnp.sum(jax.nn.one_hot(ids, c["e"], dtype=F32) * w[..., None], axis=1)
     blocks = _gmm_v2_quantize(x, x_block)
-    total = None
+    partials = []
     for w13, w2, s13, s2, sw13, ss13, sw2, ss2 in ranks:
         routed = jnp.zeros(x.shape, F32)
         for e in range(c["e"]):
@@ -407,8 +591,19 @@ def _expected(x, scores, bias, n_valid, ranks, c, *, x_block=Q_BLOCK):
         gate_up = xla_quantized_matmul(x, sw13, ss13)
         act = jax.nn.silu(gate_up[:, :fs].astype(F32)).astype(BF16)
         shared = xla_quantized_matmul(act * gate_up[:, fs:], sw2, ss2)
-        partial = (shared + routed.astype(BF16) * ROUTED_SCALE).astype(F32)
-        total = partial if total is None else total + partial
+        partials.append((shared + routed.astype(BF16) * ROUTED_SCALE).astype(F32))
+    if pair_first and len(partials) >= 4 and len(partials) % 2 == 0:
+        paired = [
+            (partials[p] + partials[p + 1]).astype(BF16).astype(F32)
+            for p in range(0, len(partials), 2)
+        ]
+        total = paired[0]
+        for p_sum in paired[1:]:
+            total = total + p_sum
+    else:
+        total = partials[0]
+        for p_sum in partials[1:]:
+            total = total + p_sum
     return np.asarray(total.astype(BF16)[:n_valid]).astype(np.float32)
 
 
@@ -473,7 +668,7 @@ def _worker(part):
     rank_ids = jnp.arange(N_RANKS, dtype=jnp.int32).reshape(N_RANKS, 1)
     specs = (P("d"), P("d"), P(), P(), P("d")) + (P("d"),) * 8
 
-    def body(x, scores, b, n_valid, rank, *weights):
+    def body(x, scores, b, n_valid, rank, *weights, fast=False):
         return kernel.moe_tp_decode(
             x,
             scores,
@@ -484,11 +679,21 @@ def _worker(part):
             routed_scale=ROUTED_SCALE,
             topk=c["topk"],
             n_ranks=N_RANKS,
+            fast=fast,
         )
 
     run = jax.jit(
         jax.shard_map(
             body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+        )
+    )
+    run_fast = jax.jit(
+        jax.shard_map(
+            lambda *a: body(*a, fast=True),
+            mesh=mesh,
+            in_specs=specs,
+            out_specs=P("d"),
+            check_vma=False,
         )
     )
 
@@ -502,15 +707,15 @@ def _worker(part):
 
     cache = {}
 
-    def references(key, x, scores, rows, weights):
-        # Every row of these inputs: a valid row's result is independent of
-        # n_valid, so cases with the same inputs share them.
-        if key not in cache:
-            cache[key] = (
+    def references(key, x, scores, rows, n_valid, weights):
+        pair_first = rows >= 32 and n_valid > 16
+        cache_key = (key, pair_first)
+        if cache_key not in cache:
+            cache[cache_key] = (
                 _reference(x, scores, bias, rows, weights, c),
-                _expected(x, scores, bias, rows, weights, c),
+                _expected(x, scores, bias, rows, weights, c, pair_first=pair_first),
             )
-        return cache[key]
+        return cache[cache_key]
 
     def checks(out, x, scores, rows, n_valid, races, start, key, weights=ranks):
         out = out.reshape(N_RANKS, rows, c["h"]).astype(np.float32)
@@ -525,7 +730,7 @@ def _worker(part):
         )
         if n_valid:
             got = out[0, :n_valid]
-            want, exp = references(key, x, scores, rows, weights)
+            want, exp = references(key, x, scores, rows, n_valid, weights)
             want, exp = want[:n_valid].astype(np.float64), exp[:n_valid]
             case.update(
                 rel_l2=rel_l2(got, want),
@@ -555,11 +760,29 @@ def _worker(part):
         activation="silu",
         use_sparse_core=False,
         onehot_threshold=0,
+        pad_sub_bucket=True,
     )
-    body_specs = (P("d"), P("d"), P(), P()) + (P("d"),) * 9
+    non_glm_statics = adapter._OpStatics(
+        topk=c["topk"],
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        pad_sub_bucket=False,
+    )
+    body_specs = (P("d"), P("d"), P(), P()) + (P("d"),) * 10
     run_body = jax.jit(
         jax.shard_map(
             adapter._op_body(statics, N_RANKS, "d"),
+            mesh=mesh,
+            in_specs=body_specs,
+            out_specs=P("d"),
+            check_vma=False,
+        )
+    )
+    run_body_non_glm = jax.jit(
+        jax.shard_map(
+            adapter._op_body(non_glm_statics, N_RANKS, "d"),
             mesh=mesh,
             in_specs=body_specs,
             out_specs=P("d"),
@@ -577,11 +800,12 @@ def _worker(part):
                 pad_mask,
                 *stacked,
                 rank_ids,
+                jnp.zeros((N_RANKS, 1), jnp.int32),
             ),
             body_specs,
         )
 
-    result = {"cases": {}}
+    result = {"cases": {}, "fast": {}}
     if part == "a":
         result["race_control"] = _race_control()
     for rows, n_valid in CASES:
@@ -601,6 +825,12 @@ def _worker(part):
         result["cases"][f"{rows}:{n_valid}"] = checks(
             out, x, scores, rows, n_valid, races, start, rows
         )
+        if (rows, n_valid) in FAST_CASES:
+            fast, fast_races = _interpret(run_fast, *put(operands, specs))
+            result["fast"][f"{rows}:{n_valid}"] = dict(
+                bitwise=bool(np.array_equal(fast.view(np.uint32), out.view(np.uint32))),
+                races_found=fast_races,
+            )
 
     if part == "a":
         rows, n_valid = BODY_CASE
@@ -609,6 +839,13 @@ def _worker(part):
         out, races = _interpret(run_body, *body_operands(x, scores, n_valid))
         result["body_kernel"] = checks(
             out, x, scores, rows, n_valid, races, start, rows
+        )
+        sub_rows, sub_valid = SUB_BUCKET_CASE
+        sx, sscores = inputs(sub_rows)
+        start = time.monotonic()
+        sout, sraces = _interpret(run_body, *body_operands(sx, sscores, sub_valid))
+        result["body_sub_bucket"] = checks(
+            sout, sx, sscores, sub_rows, sub_valid, sraces, start, sub_rows
         )
         print("RESULT " + json.dumps(result))
         return
@@ -655,40 +892,289 @@ def _worker(part):
     result["body_chain_exact"] = bool(
         np.array_equal(out, np.broadcast_to(want, out.shape))
     )
-    spec = all_reduce.make_spec(N_RANKS, 32, c["h"])
-    call = all_reduce.standalone(spec)
-    partials = all_reduce.selftest_inputs(spec)
+    sub_rows, sub_valid = SUB_BUCKET_CASE
+    sx, sscores = inputs(sub_rows)
+    sout_non_glm = (
+        np.asarray(
+            jax.block_until_ready(
+                run_body_non_glm(*body_operands(sx, sscores, sub_valid))
+            )
+        )
+        .reshape(N_RANKS, sub_rows, c["h"])
+        .astype(np.float32)
+    )
+    swant = np.zeros((sub_rows, c["h"]), np.float32)
+    swant[:sub_valid] = N_RANKS
+    result["body_sub_bucket_non_glm_chain"] = bool(
+        np.array_equal(sout_non_glm, np.broadcast_to(swant, sout_non_glm.shape))
+    )
 
-    def selftest(x, rank, n_valid):
-        return call(jnp.stack([n_valid.reshape(()), rank.reshape(())]), x)
+    def run_ar_selftest(one_shot):
+        spec = all_reduce.make_spec(N_RANKS, 32, c["h"], one_shot=one_shot)
+        call = all_reduce.standalone(spec)
+        partials = all_reduce.selftest_inputs(spec)
 
-    run_selftest = jax.jit(
+        def selftest(x, rank, n_valid):
+            return call(jnp.stack([n_valid.reshape(()), rank.reshape(())]), x)
+
+        run_selftest = jax.jit(
+            jax.shard_map(
+                selftest,
+                mesh=mesh,
+                in_specs=(P("d"), P("d"), P()),
+                out_specs=P("d"),
+                check_vma=False,
+            )
+        )
+        ok = True
+        for n_valid in all_reduce.selftest_row_counts(spec):
+            out, races = _interpret(
+                run_selftest,
+                jnp.asarray(partials.reshape(N_RANKS * 32, -1), jnp.bfloat16),
+                rank_ids,
+                jnp.asarray([n_valid], jnp.int32),
+            )
+            out = out.reshape(N_RANKS, 32, -1)
+            ok &= not races and all(
+                all_reduce.selftest_ok(spec, partials, out[r], n_valid)
+                for r in range(N_RANKS)
+            )
+        return bool(ok)
+
+    result["selftest_ok"] = run_ar_selftest(False)
+    result["selftest_one_shot_ok"] = run_ar_selftest(True)
+    print("RESULT " + json.dumps(result))
+
+
+def ep_layout(c, n_ranks):
+    """(local experts, per-rank first global expert) for consecutive TP groups."""
+    ep = c["ep"]
+    local = c["e"] // ep
+    tp = n_ranks // ep
+    return local, [(r // tp) * local for r in range(n_ranks)]
+
+
+def _ep_worker():
+    try:
+        from jax._src import tpu_info as jax_tpu_info
+    except ImportError:
+        jax_tpu_info = None
+    from jax._src.pallas.mosaic import tpu_info
+    from jax.sharding import Mesh, NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.layers.adapter import moe_tp_decode as adapter
+
+    pltpu.get_tpu_info = _tpu7x
+    tpu_info.get_tpu_info = _tpu7x
+    if jax_tpu_info is not None:
+        jax_tpu_info.get_tpu_info = _tpu7x
+    c = SMALL_EP
+    devices = sorted(jax.devices("cpu"), key=lambda d: d.id)
+    mesh = Mesh(np.asarray(devices), ("d",))
+    local, starts = ep_layout(c, N_RANKS)
+    keys = jax.random.split(jax.random.key(1), N_RANKS + 3)
+    ranks = [_rank_weights(keys[r], dict(c, e=local)) for r in range(N_RANKS)]
+    stacked = [jnp.concatenate(ws, axis=0) for ws in zip(*ranks, strict=True)]
+    gate = jax.random.normal(keys[-1], (c["e"], c["h"])) / math.sqrt(c["h"])
+    bias = jax.random.uniform(keys[-2], (c["e"],), jnp.float32, -0.05, 0.05)
+    rank_ids = jnp.arange(N_RANKS, dtype=jnp.int32).reshape(N_RANKS, 1)
+    e0s = jnp.asarray(starts, jnp.int32).reshape(N_RANKS, 1)
+    wrong = jnp.asarray([(s + local) % c["e"] for s in starts], jnp.int32).reshape(
+        N_RANKS, 1
+    )
+    specs = (P("d"), P("d"), P(), P(), P("d")) + (P("d"),) * 9
+
+    def body(x, scores, b, n_valid, rank, *weights_e0, fast=False):
+        *weights, e0 = weights_e0
+        return kernel.moe_tp_decode(
+            x,
+            scores,
+            b,
+            n_valid[0],
+            rank.reshape(()),
+            *weights,
+            e0.reshape(()),
+            routed_scale=ROUTED_SCALE,
+            topk=c["topk"],
+            n_ranks=N_RANKS,
+            fast=fast,
+        )
+
+    run = jax.jit(
         jax.shard_map(
-            selftest,
+            body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+        )
+    )
+    run_fast = jax.jit(
+        jax.shard_map(
+            lambda *a: body(*a, fast=True),
             mesh=mesh,
-            in_specs=(P("d"), P("d"), P()),
+            in_specs=specs,
             out_specs=P("d"),
             check_vma=False,
         )
     )
-    ok = True
-    for n_valid in all_reduce.selftest_row_counts(spec):
-        out, races = _interpret(
-            run_selftest,
-            jnp.asarray(partials.reshape(N_RANKS * 32, -1), jnp.bfloat16),
-            rank_ids,
+
+    def put(operands, in_specs):
+        return [
+            jax.device_put(a, NamedSharding(mesh, s))
+            for a, s in zip(operands, in_specs, strict=True)
+        ]
+
+    def inputs(rows):
+        x = jax.random.normal(keys[-3], (rows, c["h"])).astype(jnp.bfloat16)
+        return x, jax.nn.sigmoid(x.astype(jnp.float32) @ gate.T)
+
+    def summary(out, x, scores, rows, n_valid, races=False):
+        out = out.reshape(N_RANKS, rows, c["h"]).astype(np.float32)
+        bits = out.view(np.uint32)
+        pad = out[:, n_valid:]
+        case = dict(
+            ranks_identical=bool((bits == bits[0]).all()),
+            padding_rows_positive_zero=bool(np.all((pad == 0) & ~np.signbit(pad))),
+            races_found=races,
+            nan=int(np.isnan(out).sum()),
+        )
+        if n_valid:
+            got = out[0, :n_valid].astype(np.float64)
+            want = _reference(x, scores, bias, n_valid, ranks, c, starts)
+            want = want.astype(np.float64)
+            case.update(
+                rel_l2=float(np.linalg.norm(got - want) / np.linalg.norm(want)),
+                cos=float(
+                    np.vdot(got, want) / (np.linalg.norm(got) * np.linalg.norm(want))
+                ),
+            )
+        return case, out
+
+    result = {"cases": {}, "fast": {}}
+    for rows, n_valid in EP_CASES:
+        x, scores = inputs(rows)
+        ops = (
+            jnp.tile(x, (N_RANKS, 1)),
+            jnp.tile(scores, (N_RANKS, 1)),
+            bias,
             jnp.asarray([n_valid], jnp.int32),
+            rank_ids,
+            *stacked,
+            e0s,
         )
-        out = out.reshape(N_RANKS, 32, -1)
-        ok &= not races and all(
-            all_reduce.selftest_ok(spec, partials, out[r], n_valid)
-            for r in range(N_RANKS)
+        out, races = _interpret(run, *put(ops, specs))
+        result["cases"][f"{rows}:{n_valid}"] = summary(
+            out, x, scores, rows, n_valid, races
+        )[0]
+        fast, fast_races = _interpret(run_fast, *put(ops, specs))
+        result["fast"][f"{rows}:{n_valid}"] = dict(
+            bitwise=bool(np.array_equal(fast.view(np.uint32), out.view(np.uint32))),
+            races_found=fast_races,
         )
-    result["selftest_ok"] = bool(ok)
+        if (rows, n_valid) == (16, 16):
+            bad, _ = _interpret(run, *put((*ops[:-1], wrong), specs))
+            result["wrong_offset"] = summary(bad, x, scores, rows, n_valid)[0]
+
+    x, scores = inputs(16)
+    tied = np.asarray(scores).copy()
+    b_np = np.asarray(bias)
+    tied[0, 1] = 0.99
+    tied[0, 9] = np.float32(np.float32(0.99) + b_np[1]) - b_np[9]
+    ops = (
+        jnp.tile(x, (N_RANKS, 1)),
+        jnp.tile(jnp.asarray(tied), (N_RANKS, 1)),
+        bias,
+        jnp.asarray([16], jnp.int32),
+        rank_ids,
+        *stacked,
+        e0s,
+    )
+    out, _ = _interpret(run, *put(ops, specs))
+    fast, fast_races = _interpret(run_fast, *put(ops, specs))
+    result["fast"]["tie"] = dict(
+        tie=bool(tied[0, 1] + b_np[1] == tied[0, 9] + b_np[9]),
+        bitwise=bool(np.array_equal(fast.view(np.uint32), out.view(np.uint32))),
+        races_found=fast_races,
+    )
+
+    ep_calls = []
+
+    def dense_fused_moe(x, w1, w2, s1, s2, b1, b2, w, ids, experts_start, **kw):
+        ep_calls.append((kw["use_ep"], experts_start is not None))
+        f32 = jnp.float32
+        n_local, _, two_i = w1.shape
+        local_ids = ids - experts_start
+        keep = (local_ids >= 0) & (local_ids < n_local)
+        coef = jnp.sum(
+            jax.nn.one_hot(jnp.where(keep, local_ids, n_local), n_local, dtype=f32)
+            * w.astype(f32)[..., None],
+            axis=1,
+        )
+        gu = jnp.einsum("nh,ehk->enk", x.astype(f32), w1.astype(f32) * s1[:, 0])
+        act = jax.nn.silu(gu[..., : two_i // 2]) * gu[..., two_i // 2 :]
+        y = jnp.einsum("eni,eih->enh", act, w2.astype(f32) * s2[:, 0])
+        return jnp.einsum("ne,enh->nh", coef, y).astype(x.dtype)
+
+    adapter.fused_moe_func = dense_fused_moe
+    statics = adapter._OpStatics(
+        topk=c["topk"],
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        use_ep=True,
+        router_bias=False,
+    )
+    body_specs = (P("d"), P("d"), P(), P()) + (P("d"),) * 10
+
+    def run_body(rows, n_valid, chain_only=False):
+        st = statics
+        fn = adapter._op_body(st, N_RANKS, "d")
+        if chain_only:
+
+            def fn(x, scores, b, pad_mask, *rest):  # noqa: F811
+                *weights, _rank, e0 = rest
+                is_pad = pad_mask[: x.shape[0]]
+                partial = adapter._tp_chain(
+                    x, scores, b, is_pad, *weights, st, e0.reshape(())
+                )
+                return jax.lax.psum(partial, "d")
+
+        x, scores = inputs(rows)
+        pad_mask = jnp.arange(CHAIN_ROWS) >= n_valid
+        ops = put(
+            (
+                jnp.tile(x, (N_RANKS, 1)),
+                jnp.tile(scores, (N_RANKS, 1)),
+                bias,
+                pad_mask,
+                *stacked,
+                rank_ids,
+                e0s,
+            ),
+            body_specs,
+        )
+        sharded = jax.jit(
+            jax.shard_map(
+                fn, mesh=mesh, in_specs=body_specs, out_specs=P("d"), check_vma=False
+            )
+        )
+        out, _ = _interpret(sharded, *ops)
+        return summary(out, x, scores, rows, n_valid)
+
+    result["body_chain"] = run_body(CHAIN_ROWS, CHAIN_ROWS - 5)[0]
+    case, got = run_body(16, 11)
+    _, ref = run_body(16, 11, chain_only=True)
+    a, b = got[0, :11].astype(np.float64), ref[0, :11].astype(np.float64)
+    case["rel_l2_vs_chain"] = float(np.linalg.norm(a - b) / np.linalg.norm(b))
+    case["max_abs_vs_chain"] = float(np.max(np.abs(a - b)))
+    result["body_kernel_vs_chain"] = case
+    result["ep_calls_all_use_ep"] = bool(ep_calls) and all(a and b for a, b in ep_calls)
     print("RESULT " + json.dumps(result))
 
 
 if __name__ == "__main__":
     # Around everything: pallas_call reads the mode when it is built.
     with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams(detect_races=True)):
-        _worker(sys.argv[1])
+        if sys.argv[1:] == ["ep"]:
+            _ep_worker()
+        else:
+            _worker(sys.argv[1])

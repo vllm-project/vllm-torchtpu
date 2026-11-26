@@ -60,7 +60,7 @@ FP8_MAX = float(jnp.finfo(FP8).max)
 ROW_BUCKETS = (16, 32, 64)
 # router_topk's clamp floor, above the finfo.min that masks a pick.
 ROUTER_NEG = -3.0e38
-# moe_routing: weights / clamp(sum, min=1e-20).
+KEY_BASE = 0x00800000
 SUM_FLOOR = 1e-20
 PAIR = 128
 # VMEM limit = need x headroom (Mosaic temporaries), refused above a fraction
@@ -75,12 +75,32 @@ _Q_BLOCK = 512
 # Weight ring depth. One slot holds the expert whose first matmul is in
 # flight, so num_buffers - 2 transfers run ahead of compute.
 _NUM_BUFFERS = 6
+_MIN_BUFFERS = 3
+_I_CHUNK = 128
 
 
 def exact_in_bf16(value: float) -> bool:
     """True if `value` is a bf16 number, so bf16 and f32 products agree."""
     rounded = np.asarray(value, dtype=jnp.bfloat16).astype(np.float32)
     return float(rounded) == float(value)
+
+
+class _Meta:
+    """Index across three ``[1]`` scalar refs ``(n_valid, rank, e0)``."""
+
+    def __init__(self, refs):
+        self.refs = refs
+
+    def __getitem__(self, i):
+        return self.refs[i][0]
+
+
+def _split_entry(n_valid_ref, rank_ref, e0_ref, *refs, **kwargs):
+    return _kernel(_Meta((n_valid_ref, rank_ref, e0_ref)), *refs, **kwargs)
+
+
+def _i_chunk(i: int) -> int:
+    return min(i, _I_CHUNK)
 
 
 def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
@@ -104,18 +124,50 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
         + t((1, e_pad), jnp.int32)  # hits_v
     )
     slot = t((h, 2 * i), FP8) + t((i, h), FP8) + t((1, 2 * i), f32) + t((1, h), f32)
-    need = fixed + _NUM_BUFFERS * slot + all_reduce.vmem_bytes(spec, info)
-    limit = int(need * VMEM_HEADROOM)
-    if limit > int(info.vmem_capacity_bytes * VMEM_FRACTION):
+    ar_bytes = all_reduce.vmem_bytes(spec, info)
+    budget = int(info.vmem_capacity_bytes * VMEM_FRACTION)
+    for nb in range(_NUM_BUFFERS, _MIN_BUFFERS - 1, -1):
+        need = fixed + nb * slot + ar_bytes
+        limit = int(need * VMEM_HEADROOM)
+        if limit <= budget:
+            return nb, need, min(limit, info.vmem_capacity_bytes)
+    return None
+
+
+def _plan_ring(m, h, i, num_experts, shared_inter, info, spec):
+    ic = _i_chunk(i)
+    if ic % PAIR != 0 or i % ic != 0:
         return None
-    return need, min(limit, info.vmem_capacity_bytes)
+    plan = _vmem_plan(m, h, ic, num_experts, shared_inter, info, spec)
+    return (ic, *plan) if plan is not None else None
 
 
-def kernel_name(experts, m, h, i, shared_inter, n_ranks) -> str:
-    return (
+def kernel_name(
+    experts,
+    m,
+    h,
+    i,
+    shared_inter,
+    n_ranks,
+    num_experts=None,
+    fast=False,
+    ar_one_shot=False,
+    *,
+    nb=None,
+) -> str:
+    if nb is None:
+        nb = _NUM_BUFFERS
+    name = (
         f"moe_tp_decode-e_{experts}-m_{m}-h_{h}-i_{i}-fs_{shared_inter}"
-        f"-nb_{_NUM_BUFFERS}-n_{n_ranks}"
+        f"-nb_{nb}-n_{n_ranks}-sm"
     )
+    if num_experts is not None and num_experts != experts:
+        name += f"-ne_{num_experts}"
+    if fast:
+        name += "-fast"
+    if ar_one_shot:
+        name += "-os"
+    return name
 
 
 def can_use_moe_tp_decode(
@@ -133,6 +185,7 @@ def can_use_moe_tp_decode(
     *,
     topk: int,
     n_ranks: int,
+    ar_one_shot: bool = False,
 ) -> bool:
     """Trace-time admission; False means the caller keeps its own path.
 
@@ -153,7 +206,7 @@ def can_use_moe_tp_decode(
     num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
     if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
         return False
-    if bias.shape != (num_experts,) or experts != num_experts:
+    if bias.shape != (num_experts,) or experts <= 0 or num_experts % experts:
         return False
     if not 0 < topk <= num_experts or i <= 0 or i % info.num_lanes:
         return False
@@ -175,8 +228,10 @@ def can_use_moe_tp_decode(
         return False
     if not all_reduce.supported(n_ranks, m, h, info):
         return False
-    spec = all_reduce.make_spec(n_ranks, m, h)
-    return _vmem_plan(m, h, i, num_experts, shared_inter, info, spec) is not None
+    if ar_one_shot and not all_reduce.one_shot_supported(h, info):
+        return False
+    spec = all_reduce.make_spec(n_ranks, m, h, one_shot=ar_one_shot)
+    return _plan_ring(m, h, i, num_experts, shared_inter, info, spec) is not None
 
 
 def _route(scores, bias, n_valid, *, topk):
@@ -202,6 +257,72 @@ def _route(scores, bias, n_valid, *, topk):
     w = (jnp.where(chosen, scores, 0.0) / denom).astype(jnp.bfloat16)
     valid = lax.broadcasted_iota(jnp.int32, (rows, n), 0) < n_valid
     return jnp.where(jnp.logical_and(chosen, valid), w.astype(jnp.float32), 0.0)
+
+
+def _route_fast(scores, bias, n_valid, *, topk):
+    rows, n = scores.shape
+    lb = max(1, (n - 1).bit_length())
+    window = (1 << (30 - lb)) - 1
+    x = scores + bias
+    x = jnp.where(x > ROUTER_NEG, x, ROUTER_NEG)
+    x = jnp.where(x == 0.0, 0.0, x)  # -0.0 == +0.0 in _route: one ordinal
+    xm = jnp.max(x, axis=1, keepdims=True)
+
+    def ordinal(v):
+        b = lax.bitcast_convert_type(v, jnp.int32)
+        return jnp.where(b < 0, b ^ 0x7FFFFFFF, b)
+
+    d = ordinal(xm) - ordinal(x)
+    inside = jnp.logical_and(d >= 0, d < window - 1)
+    rank = jnp.where(inside, (window - 1) - d, 0)
+    lane = lax.broadcasted_iota(jnp.int32, (rows, n), 1)
+    key = lax.bitcast_convert_type(
+        KEY_BASE + jnp.left_shift(rank, lb) + ((n - 1) - lane), jnp.float32
+    )
+    wsum = jnp.zeros((rows, 1), jnp.float32)
+    km = None
+    for _ in range(topk):
+        km = jnp.max(key, axis=1, keepdims=True)
+        pick = key == km
+        wsum = wsum + jnp.sum(jnp.where(pick, scores, 0.0), axis=1, keepdims=True)
+        key = jnp.where(pick, 0.0, key)
+    chosen = key == 0.0
+    denom = jnp.where(wsum < SUM_FLOOR, SUM_FLOOR, wsum)
+    w = (jnp.where(chosen, scores, 0.0) / denom).astype(jnp.bfloat16)
+    valid = lax.broadcasted_iota(jnp.int32, (rows, n), 0) < n_valid
+    assert km is not None
+    last_bits = lax.bitcast_convert_type(km, jnp.int32)
+    beyond = last_bits < KEY_BASE + (1 << lb)
+    valid_row = lax.broadcasted_iota(jnp.int32, (rows, 1), 0) < n_valid
+    bad = jnp.where(jnp.logical_and(valid_row, beyond), 1.0, 0.0)
+    flag = jnp.max(bad, axis=0, keepdims=True)
+    return jnp.where(jnp.logical_and(chosen, valid), w.astype(jnp.float32), 0.0), flag
+
+
+def _compact_vector(wtab, e0, local):
+    f32 = jnp.float32
+    e_pad = wtab.shape[1]
+    lanes = 128
+    w = pl.cdiv(local, lanes) * lanes
+    hit = jnp.any(wtab != 0, axis=0, keepdims=True).astype(f32)
+    rows = lax.broadcasted_iota(jnp.int32, (e_pad, w), 0)
+    cols = lax.broadcasted_iota(jnp.int32, (e_pad, w), 1)
+    window = jnp.where(jnp.logical_and(rows == cols + e0, cols < local), 1.0, 0.0)
+    loc = jnp.dot(
+        jnp.broadcast_to(hit, (8, e_pad)), window, preferred_element_type=f32
+    )[0:1]
+    sub = lax.broadcasted_iota(jnp.int32, (w, w), 0)
+    lane = lax.broadcasted_iota(jnp.int32, (w, w), 1)
+    loc_b = jnp.broadcast_to(loc, (w, w))
+    below = jnp.sum(jnp.where(lane < sub, loc_b, 0.0), axis=1, keepdims=True)
+    own = jnp.sum(jnp.where(lane == sub, loc_b, 0.0), axis=1, keepdims=True)
+    nth = jnp.logical_and(below == lane.astype(f32), own > 0)
+    ids = jnp.sum(jnp.where(nth, sub.astype(f32), 0.0), axis=0, keepdims=True)
+    return ids, jnp.sum(loc, axis=1, keepdims=True)
+
+
+def _unused(fn):
+    return fn
 
 
 def _quantize_blocks(x, q_ref, scale_ref):
@@ -284,16 +405,21 @@ def _kernel(
     hit_sem,
     *ar_scr,
     local_experts,
+    n_chunks,
     topk,
     routed_scale,
     ar_spec,
+    fast=False,
 ):
     all_reduce.prologue(ar_spec)
     m, h = x_ref.shape
-    i = w2_hbm.shape[1]
-    nb = _NUM_BUFFERS
+    i = w2_hbm.shape[1]  # this rank's I
+    ic = w2_ref.shape[1]  # columns per ring item; i == ic * n_chunks
+    nc = n_chunks
+    nb = w1_ref.shape[0]
     n_valid = meta_ref[0]
     rank = meta_ref[1]
+    e0 = meta_ref[2]
 
     # The shared slice does not depend on routing: load it first.
     shared_copies = (
@@ -305,16 +431,51 @@ def _kernel(
     for copy in shared_copies:
         copy.start()
 
-    wtab_ref[...] = _route(scores_ref[...], bias_ref[...], n_valid, topk=topk)
-    hit = jnp.any(wtab_ref[...] != 0, axis=0, keepdims=True)
-    hits_v_ref[...] = jnp.where(hit, 1, 0).astype(jnp.int32)
-    hit_copy = pltpu.make_async_copy(hits_v_ref, hits_s_ref, hit_sem.at[0])
-    hit_copy.start()
-    hit_copy.wait()
+    def store_hits():
+        hit = jnp.any(wtab_ref[...] != 0, axis=0, keepdims=True)
+        hits_v_ref[0:1, :] = jnp.where(hit, 1, 0).astype(jnp.int32)
+
+    def copy_hits():
+        hit_copy = pltpu.make_async_copy(hits_v_ref, hits_s_ref, hit_sem.at[0])
+        hit_copy.start()
+        hit_copy.wait()
+
+    def store_active():
+        ids, n_active = _compact_vector(wtab_ref[...], e0, local_experts)
+        hits_v_ref[2:3, 0 : ids.shape[1]] = ids.astype(jnp.int32)
+        hits_v_ref[3:4, :] = jnp.broadcast_to(
+            n_active, (1, hits_v_ref.shape[1])
+        ).astype(jnp.int32)
+
+    if fast:
+        wtab, flag = _route_fast(scores_ref[...], bias_ref[...], n_valid, topk=topk)
+        wtab_ref[...] = wtab
+        store_active()
+        hits_v_ref[1:2, :] = jnp.broadcast_to(flag, (1, hits_v_ref.shape[1])).astype(
+            jnp.int32
+        )
+        copy_hits()
+
+        @pl.when(hits_s_ref[1, 0] != 0)
+        def _exact_routing():
+            wtab_ref[...] = _route(scores_ref[...], bias_ref[...], n_valid, topk=topk)
+            store_active()
+            copy_hits()
+
+    else:
+        wtab_ref[...] = _route(scores_ref[...], bias_ref[...], n_valid, topk=topk)
+        store_hits()
+        copy_hits()
+
+    def active(j):
+        """Local id of the j-th active expert."""
+        return hits_s_ref[2, j] if fast else active_ids_ref[j]
 
     def transfers(step):
+        if nc > 1:
+            return chunk_transfers(step)
         # Active expert `step`'s weights and scales into ring slot step % nb.
-        e, slot = active_ids_ref[step], step % nb
+        e, slot = active(step), step % nb
         return [
             pltpu.make_async_copy(w1_hbm.at[e], w1_ref.at[slot], ring_sem.at[slot, 0]),
             pltpu.make_async_copy(w2_hbm.at[e], w2_ref.at[slot], ring_sem.at[slot, 1]),
@@ -326,25 +487,59 @@ def _kernel(
             ),
         ]
 
+    def chunk_transfers(step):
+        e = active(lax.div(step, nc))
+        c0 = pl.multiple_of(lax.rem(step, nc) * ic, ic)
+        slot = step % nb
+        sem = ring_sem.at[slot]
+        lo, hi = pl.ds(0, ic), pl.ds(ic, ic)
+        gate, up = pl.ds(c0, ic), pl.ds(i + c0, ic)
+        return [
+            pltpu.make_async_copy(
+                w1_hbm.at[e, :, gate], w1_ref.at[slot, :, lo], sem.at[0]
+            ),
+            pltpu.make_async_copy(
+                w1_hbm.at[e, :, up], w1_ref.at[slot, :, hi], sem.at[1]
+            ),
+            pltpu.make_async_copy(w2_hbm.at[e, gate], w2_ref.at[slot], sem.at[2]),
+            pltpu.make_async_copy(
+                s1_hbm.at[e, 0, :, gate], s1_ref.at[slot, :, lo], sem.at[3]
+            ),
+            pltpu.make_async_copy(
+                s1_hbm.at[e, 0, :, up], s1_ref.at[slot, :, hi], sem.at[4]
+            ),
+            pltpu.make_async_copy(s2_hbm.at[e, 0], s2_ref.at[slot], sem.at[5]),
+        ]
+
     def compact(e, count):
-        # Appends expert e to active_ids_ref if any row picked it. The store
-        # is unconditional, so the loop body has no branch: count <= e, a
-        # later hit overwrites the entry, and no read touches one >= count.
-        hit = hits_s_ref[0, e] != 0
+        hit = hits_s_ref[0, e0 + e] != 0
         active_ids_ref[count] = e
         return count + hit.astype(jnp.int32)
 
-    count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
+    if fast:
+        count = hits_s_ref[3, 0]
+    else:
+        count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
+    items = count * nc
 
-    def prime(step):
-        @pl.when(step < count)
-        def start():
-            for copy in transfers(step):
+    if fast:
+
+        def prime_fast(item, carry):
+            for copy in transfers(item):
                 copy.start()
+            return carry
 
-    # The first nb active experts start their weight copies.
-    for s in range(nb):
-        prime(jnp.int32(s))
+        lax.fori_loop(0, jnp.minimum(items, nb), prime_fast, 0)
+    else:
+
+        def prime(step):
+            @pl.when(step < items)
+            def start():
+                for copy in transfers(step):
+                    copy.start()
+
+        for s in range(nb):
+            prime(jnp.int32(s))
 
     # The shared expert's copies started at entry. Waiting for them here,
     # before the zeroing and the x quantization, leaves no DMA wait between
@@ -371,29 +566,27 @@ def _kernel(
         # w1, rounded to bf16, times its x block's scales and then the weight
         # scales in bf16, summed in bf16 (moe_dense_expert's pattern).
         w_scale = s1_ref[slot].astype(jnp.bfloat16)
-        acc = jnp.zeros((m, 2 * i), jnp.bfloat16)
+        acc = jnp.zeros((m, 2 * ic), jnp.bfloat16)
         for k in range(0, h, _Q_BLOCK):
             part = jnp.matmul(
                 xq_ref[:, k : k + _Q_BLOCK],
                 w1_ref[slot, k : k + _Q_BLOCK, :],
                 preferred_element_type=jnp.float32,
             ).astype(jnp.bfloat16)
-            part *= jnp.concatenate([xs_ref[k // _Q_BLOCK]] * (2 * i // lanes), axis=1)
+            part *= jnp.concatenate([xs_ref[k // _Q_BLOCK]] * (2 * ic // lanes), axis=1)
             part *= w_scale
             acc += part
         return acc
 
     def finish(step, slot, acc1):
-        e = active_ids_ref[step]
-        # Each row's routing weight for expert e (column e of the routing
-        # table, 0 for rows that did not pick it).
+        e = active(lax.div(step, nc)) if nc > 1 else active(step)
         coeff = jnp.sum(
-            jnp.where(expert_columns == e, wtab_ref[...], 0.0),
+            jnp.where(expert_columns == e0 + e, wtab_ref[...], 0.0),
             axis=1,
             keepdims=True,
         )
         # gmm_v2's fused SiLU, on the bf16 gate_up result.
-        act = jax.nn.silu(acc1[:, :i]) * acc1[:, i:]
+        act = jax.nn.silu(acc1[:, :ic]) * acc1[:, ic:]
         # Mask, not multiply: a padded row with non-finite hidden would give
         # NaN * 0 = NaN. Rows this expert does not own contribute exactly 0.
         mid = jnp.where(coeff != 0, act.astype(jnp.float32) * coeff, 0.0)
@@ -409,7 +602,33 @@ def _kernel(
                 acc2 * s2_ref[slot, :, n : n + _N_CHUNK] * ms
             )
 
-    @pl.when(count > 0)
+    def ring_step(step, acc1, refill):
+        """Wait for item step + 1, issue its gate_up, finish item step, and
+        (refill) start item step + nb into the slot item step leaves."""
+        nxt = step + 1
+        for copy in transfers(nxt):
+            copy.wait()
+        acc1_next = gate_up(nxt % nb)
+        finish(step, step % nb, acc1)
+        if refill:
+            for copy in transfers(step + nb):
+                copy.start()
+        return acc1_next
+
+    @(pl.when(items > 0) if fast else _unused)
+    def run_experts_fast():
+        for copy in transfers(jnp.int32(0)):
+            copy.wait()
+        n_refill = jnp.maximum(items - nb, 0)
+        acc1 = lax.fori_loop(
+            0, n_refill, lambda s, a: ring_step(s, a, True), gate_up(0)
+        )
+        acc1 = lax.fori_loop(
+            n_refill, items - 1, lambda s, a: ring_step(s, a, False), acc1
+        )
+        finish(items - 1, (items - 1) % nb, acc1)
+
+    @(_unused if fast else pl.when(items > 0))
     def run_experts():
         # The prime loop after the compaction started the first nb experts'
         # copies.
@@ -419,7 +638,7 @@ def _kernel(
         def expert_body(step, acc1):
             nxt = step + 1
 
-            @pl.when(nxt < count)
+            @pl.when(nxt < items)
             def wait_next():
                 for copy in transfers(nxt):
                     copy.wait()
@@ -430,15 +649,14 @@ def _kernel(
             acc1_next = gate_up(nxt % nb)
             finish(step, step % nb, acc1)
 
-            # This expert's slot is free once its second matmul has read it.
-            @pl.when(step + nb < count)
+            @pl.when(step + nb < items)
             def refill():
                 for copy in transfers(step + nb):
                     copy.start()
 
             return acc1_next
 
-        lax.fori_loop(0, count, expert_body, gate_up(0))
+        lax.fori_loop(0, items, expert_body, gate_up(0))
 
     # Outside pl.when(count > 0): every rank must take part in the exchange
     # (its peers wait for its chunks), consume the barrier signals sent at
@@ -453,7 +671,17 @@ def _kernel(
     )
 
 
-@functools.partial(jax.jit, static_argnames=("routed_scale", "topk", "n_ranks"))
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "routed_scale",
+        "topk",
+        "n_ranks",
+        "fast",
+        "hbm_operands",
+        "ar_one_shot",
+    ),
+)
 def moe_tp_decode(
     x,
     scores,
@@ -468,10 +696,14 @@ def moe_tp_decode(
     shared_s13,
     shared_w2,
     shared_s2,
+    experts_start=0,
     *,
     routed_scale: float,
     topk: int,
     n_ranks: int,
+    fast: bool = False,
+    hbm_operands: bool = False,
+    ar_one_shot: bool = False,
 ):
     """The layer's bf16 [N, D] output, summed over the n_ranks TP ranks.
 
@@ -506,45 +738,55 @@ def moe_tp_decode(
     num_experts = scores.shape[1]
     shared_inter = shared_w2.shape[0]
     info = pltpu.get_tpu_info()
-    ar_spec = all_reduce.make_spec(n_ranks, m, h)
-    plan = _vmem_plan(m, h, i, num_experts, shared_inter, info, ar_spec)
+    ar_spec = all_reduce.make_spec(n_ranks, m, h, one_shot=ar_one_shot)
+    plan = _plan_ring(m, h, i, num_experts, shared_inter, info, ar_spec)
     if plan is None:
         raise ValueError("moe_tp_decode does not fit VMEM; check can_use_moe_tp_decode")
-    _, limit = plan
-    nb = _NUM_BUFFERS
-    # Lane-dense routing table. Padded experts never win: their biased score
-    # is -inf, clamped to ROUTER_NEG, and every real column has a lower index.
+    ic, nb, _, limit = plan
     e_pad = pl.cdiv(num_experts, info.num_lanes) * info.num_lanes
     scores = scores.astype(jnp.float32)
     bias = bias.astype(jnp.float32)
     if e_pad != num_experts:
         scores = jnp.pad(scores, ((0, 0), (0, e_pad - num_experts)))
         bias = jnp.pad(bias, (0, e_pad - num_experts), constant_values=-jnp.inf)
-    meta = jnp.stack(
-        [
-            jnp.asarray(n_valid, jnp.int32).reshape(()),
-            jnp.asarray(rank, jnp.int32).reshape(()),
-        ]
+    metas = tuple(
+        jnp.asarray(v, jnp.int32).reshape(1) for v in (n_valid, rank, experts_start)
     )
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    weights = (
+        w13,
+        w2,
+        s13,
+        s2,
+        shared_w13,
+        shared_s13.reshape(1, 2 * shared_inter),
+        shared_w2,
+        shared_s2.reshape(1, h),
+    )
+    if hbm_operands:
+        weights = tuple(
+            pltpu.with_memory_space_constraint(w, pltpu.HBM) for w in weights
+        )
     return pl.pallas_call(
         functools.partial(
-            _kernel,
+            _split_entry,
             local_experts=experts,
+            n_chunks=i // ic,
             topk=topk,
             routed_scale=float(routed_scale),
             ar_spec=ar_spec,
+            fast=fast,
         ),
         out_shape=jax.ShapeDtypeStruct((m, h), x.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=len(metas),
             in_specs=[vmem, vmem, vmem, *[hbm] * 8],
             out_specs=vmem,
             scratch_shapes=[
-                pltpu.VMEM((nb, h, 2 * i), FP8),
-                pltpu.VMEM((nb, i, h), FP8),
-                pltpu.VMEM((nb, 1, 2 * i), jnp.float32),
+                pltpu.VMEM((nb, h, 2 * ic), FP8),
+                pltpu.VMEM((nb, ic, h), FP8),
+                pltpu.VMEM((nb, 1, 2 * ic), jnp.float32),
                 pltpu.VMEM((nb, 1, h), jnp.float32),
                 pltpu.VMEM((h, 2 * shared_inter), FP8),
                 pltpu.VMEM((1, 2 * shared_inter), jnp.float32),
@@ -556,10 +798,10 @@ def moe_tp_decode(
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.VMEM((m, e_pad), jnp.float32),
-                pltpu.VMEM((1, e_pad), jnp.int32),
-                pltpu.SMEM((1, e_pad), jnp.int32),
+                pltpu.VMEM((4 if fast else 1, e_pad), jnp.int32),
+                pltpu.SMEM((4 if fast else 1, e_pad), jnp.int32),
                 pltpu.SMEM((experts,), jnp.int32),
-                pltpu.SemaphoreType.DMA((nb, 4)),
+                pltpu.SemaphoreType.DMA((nb, 4 if i == ic else 6)),
                 pltpu.SemaphoreType.DMA((4,)),
                 pltpu.SemaphoreType.DMA((1,)),
                 *all_reduce.scratch_shapes(ar_spec),
@@ -568,18 +810,22 @@ def moe_tp_decode(
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=limit, collective_id=all_reduce.COLLECTIVE_ID
         ),
-        name=kernel_name(experts, m, h, i, shared_inter, n_ranks),
+        name=kernel_name(
+            experts,
+            m,
+            h,
+            i,
+            shared_inter,
+            n_ranks,
+            num_experts,
+            fast,
+            ar_one_shot,
+            nb=nb,
+        ),
     )(
-        meta,
+        *metas,
         x,
         scores,
         bias.reshape(1, e_pad),
-        w13,
-        w2,
-        s13,
-        s2,
-        shared_w13,
-        shared_s13.reshape(1, 2 * shared_inter),
-        shared_w2,
-        shared_s2.reshape(1, h),
+        *weights,
     )

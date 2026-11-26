@@ -97,7 +97,14 @@ def _row_routes(scores, gate_l):
 
 
 def _combine_arrivals(
-    arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+    arrivals,
+    arrival_scales,
+    pos,
+    mirror_pos,
+    topk_weights,
+    out_dtype,
+    *,
+    topk_weights_1d=None,
 ):
     """Combine arrivals [rows, lane blocks, 128] into [t_local, hidden].
 
@@ -127,11 +134,7 @@ def _combine_arrivals(
     # A gather clamps an out-of-range index to the last one; a DMA does not,
     # and a sublane index clamped on its own would pair the last sublane with
     # the wrong lane. Neither position is ever negative.
-    rows = jnp.minimum(pos, recv_rows - 1)
     shift = pow2_shift(tile_m, "the mirror's lane count")
-    scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
-    row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
-    coef = row_scales * topk_weights.astype(jnp.float32)
     if combine_step_tokens(t_local):
         combine = build_combine_kernel(
             t_local=t_local,
@@ -141,7 +144,22 @@ def _combine_arrivals(
             wire_dtype=arrivals.dtype,
             out_dtype=out_dtype,
         )
-        return combine(arrivals, coef, rows)
+        # Avoid 2D [t_local, topk] clamp and scale multiply on the kernel path:
+        # topk < 128 pads the minor axis to a full lane block and adds a retile.
+        rows_1d = jnp.minimum(pos.reshape(-1), recv_rows - 1)
+        scl_1d = jnp.minimum(mirror_pos.reshape(-1), mirror_sublanes * tile_m - 1)
+        row_scales_1d = arrival_scales[
+            jnp.right_shift(scl_1d, shift), scl_1d & (tile_m - 1)
+        ]
+        tw_1d = (
+            topk_weights_1d
+            if topk_weights_1d is not None
+            else topk_weights.astype(jnp.float32).reshape(-1)
+        )
+        return combine(arrivals, row_scales_1d * tw_1d, rows_1d)
+    scl = jnp.minimum(mirror_pos, mirror_sublanes * tile_m - 1)
+    row_scales = arrival_scales[jnp.right_shift(scl, shift), scl & (tile_m - 1)]
+    coef = row_scales * topk_weights.astype(jnp.float32)
     rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
     coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
     terms = []
@@ -250,6 +268,572 @@ _LAYER_SM_CACHE = {}
 _LAYER_SM_CACHE_LOCK = threading.Lock()
 
 
+TP_PAIR_MAX_ROW_SPLITS = 4
+TP_PAIR_VISIT_FLOOR_TILES = 2.4
+TP_PAIR_Z_CLONE_MIN_TOTAL = 2048
+TP_PAIR_Z_CLONE_MIN_REMOTE = 1024
+# Avoid scheduling the cloned visit early (delay <= 4): waiting on the Z-link
+# weight DMA during peak early-visit combine traffic regresses skewed layers
+# by +160..+240 us/L; appending after local visits hides the weight transfer
+# behind cold experts.
+TP_PAIR_Z_CLONE_DELAY_STEPS = 1024
+
+
+def _ep_tp_pair_flip_mask(counts_2):
+    """Return alternating-parity swap mask [n_chips, g_local] for paired experts."""
+    c0, c1 = counts_2[:, 0, :], counts_2[:, 1, :]
+    hi = jnp.maximum(c0, c1)
+    lo = jnp.minimum(c0, c1)
+    # Sort by 2*max - min so asymmetric heavy pairs alternate across cores while
+    # balanced (H, H) pairs do not skew the alternating parity.
+    pair_key = (2 * hi) - lo
+    pair_rank = jnp.argsort(jnp.argsort(-pair_key, axis=1, stable=True), axis=1).astype(
+        jnp.int32
+    )
+    return jnp.where((pair_rank & 1) == 0, c1 > c0, c0 > c1)
+
+
+def _pack_flip_words(flip):
+    n_pairs = flip.size
+    n_words = (n_pairs + 31) // 32
+    flip_pad = jnp.pad(
+        flip.reshape(-1).astype(jnp.uint32), (0, n_words * 32 - n_pairs)
+    ).reshape(n_words, 32)
+    bit_weights = jnp.left_shift(jnp.uint32(1), jnp.arange(32, dtype=jnp.uint32))
+    return jnp.sum(flip_pad * bit_weights[None, :], axis=1, dtype=jnp.uint32)
+
+
+def _select_by_chip(chip_idx, per_chip_vals, n_chips):
+    # Avoid 1D dynamic LUT gather over T*topk pairs: XLA offloads it to
+    # SparseCore, whereas a small unrolled chip select stays on the VPU.
+    val = per_chip_vals[0]
+    for ci in range(1, n_chips):
+        val = jnp.where(chip_idx == jnp.int32(ci), per_chip_vals[ci], val)
+    return val
+
+
+def _choose_ep_tp_row_splits(counts_chip, *, g_local, k_split, capacity):
+    """Pick per-chip split count ks in [0, k_split] minimizing lockstep tiles."""
+    n_chips = counts_chip.shape[0]
+    top_order = jnp.argsort(-counts_chip, axis=1, stable=True).astype(jnp.int32)
+    split_phys = top_order[:, :k_split]
+    split_rows = jnp.take_along_axis(counts_chip, split_phys, axis=1)
+    phys_idx = jnp.arange(2 * g_local, dtype=jnp.int32)[None, :]
+    min_split_rows = jnp.int32(2 * capacity)
+    k_arange = jnp.arange(k_split, dtype=jnp.int32)[None, :]
+    floor_tiles = jnp.float32(TP_PAIR_VISIT_FLOOR_TILES)
+
+    def _tile_cost(rows):
+        tiles = ((rows + jnp.int32(capacity - 1)) // jnp.int32(capacity)).astype(
+            jnp.float32
+        )
+        return jnp.where(rows > 0, jnp.maximum(tiles, floor_tiles), jnp.float32(0.0))
+
+    costs = []
+    for ks in range(k_split + 1):
+        act = (k_arange < jnp.int32(ks)) & (split_rows >= min_split_rows)
+        is_sp = jnp.any(
+            (phys_idx[:, :, None] == split_phys[:, None, :]) & act[:, None, :],
+            axis=-1,
+        )
+        rem_2 = jnp.where(is_sp, jnp.int32(0), counts_chip).reshape(n_chips, 2, g_local)
+        fl = _ep_tp_pair_flip_mask(rem_2)
+        c0_rem = jnp.where(fl, rem_2[:, 1, :], rem_2[:, 0, :])
+        c1_rem = jnp.where(fl, rem_2[:, 0, :], rem_2[:, 1, :])
+        h0 = jnp.where(act, (split_rows + jnp.int32(1)) // jnp.int32(2), jnp.int32(0))
+        h1 = jnp.where(act, split_rows // jnp.int32(2), jnp.int32(0))
+        v0 = jnp.sort(jnp.concatenate([c0_rem, h0], axis=1), axis=1)[:, ::-1]
+        v1 = jnp.sort(jnp.concatenate([c1_rem, h1], axis=1), axis=1)[:, ::-1]
+        # Tiny tie-break favors fewer splits when lockstep cost is identical.
+        step_cost = jnp.sum(
+            jnp.maximum(_tile_cost(v0), _tile_cost(v1)), axis=1
+        ) + jnp.float32(1e-4 * ks)
+        costs.append(step_cost)
+
+    best_ks = jnp.argmin(jnp.stack(costs, axis=0), axis=0).astype(jnp.int32)
+    split_active = (k_arange < best_ks[:, None]) & (split_rows >= min_split_rows)
+    is_split_phys = jnp.any(
+        (phys_idx[:, :, None] == split_phys[:, None, :]) & split_active[:, None, :],
+        axis=-1,
+    )
+    rem_2 = jnp.where(is_split_phys, jnp.int32(0), counts_chip).reshape(
+        n_chips, 2, g_local
+    )
+    flip = _ep_tp_pair_flip_mask(rem_2)
+    return split_phys, split_active, is_split_phys, flip
+
+
+def _resolve_ep_tp_row_splits(
+    *,
+    ep_tp_size,
+    has_bias,
+    g_local,
+    n_tokens,
+    topk,
+    ep,
+    capacity,
+    user_ragged_stride,
+    ep_tp_row_splits,
+):
+    if ep_tp_size != 2 or has_bias or g_local <= 0 or (g_local & (g_local - 1)) != 0:
+        return 0
+    if ep_tp_row_splits is None:
+        if n_tokens < 2 * capacity:
+            return 0
+        candidate = min(TP_PAIR_MAX_ROW_SPLITS, g_local)
+    else:
+        candidate = min(max(int(ep_tp_row_splits), 0), g_local)
+    if candidate <= 0:
+        return 0
+    split_stride = ragged_stride_bound(
+        n_tokens, topk, ep * (g_local + candidate), capacity
+    )
+    if user_ragged_stride is not None and user_ragged_stride < split_stride:
+        return 0
+    return candidate
+
+
+def _resolve_ep_tp_z_clone(
+    *,
+    ep_tp_size,
+    has_bias,
+    weight_format,
+    g_local,
+    k_split,
+    n_tokens,
+    topk,
+    ep,
+    capacity,
+    user_ragged_stride,
+    ep_tp_z_clone,
+):
+    if (
+        ep_tp_size != 2
+        or has_bias
+        or weight_format != WeightFormat.FP8
+        or g_local <= 0
+        or (g_local & (g_local - 1)) != 0
+        or ep < 4
+        or ep % 4 != 0
+    ):
+        return False
+    if ep_tp_z_clone is None:
+        if ep != 16 or n_tokens < TP_PAIR_Z_CLONE_MIN_TOTAL:
+            return False
+        want = True
+    else:
+        want = bool(ep_tp_z_clone)
+    if not want:
+        return False
+    clone_stride = ragged_stride_bound(
+        n_tokens, topk, ep * (g_local + k_split + 1), capacity
+    )
+    return user_ragged_stride is None or user_ragged_stride >= clone_stride
+
+
+def _select_z_clone_plan(
+    rows_by_dest,
+    counts_chip,
+    *,
+    ep: int,
+    n_chips: int,
+    g_local: int,
+    capacity: int,
+    z_min_total: int,
+    z_min_remote: int,
+    z_waterfill: bool,
+):
+    half_ep = ep // 2
+    half_chips = n_chips // 2
+    counts_h0 = rows_by_dest[:half_ep].sum(axis=0).reshape(n_chips, 2 * g_local)
+    counts_h1 = rows_by_dest[half_ep:].sum(axis=0).reshape(n_chips, 2 * g_local)
+    chip_host = jnp.arange(n_chips, dtype=jnp.int32) >= jnp.int32(half_chips)
+    remote_counts = jnp.where(chip_host[:, None], counts_h0, counts_h1)
+    z_hot_phys = jnp.argmax(remote_counts, axis=1).astype(jnp.int32)
+    z_hot_tot = jnp.take_along_axis(counts_chip, z_hot_phys[:, None], axis=1)[:, 0]
+    chip_base_1d = jnp.arange(n_chips, dtype=jnp.int32) * jnp.int32(2 * g_local)
+    hot_global = chip_base_1d + z_hot_phys
+    per_rank_hot = jnp.take(rows_by_dest, hot_global, axis=1)
+
+    # Avoid activating z_clone when 0 remote rows move: z_partner would skip an
+    # empty slot_z visit and leave z_recv_sems unwaited.
+    min_rem = max(int(z_min_remote), 1)
+    if z_waterfill:
+        # Avoid offloading all remote-host ranks blindly: bidirectional Z-clones
+        # or pushes onto a heavier Z-partner thrash the inter-host link and raise
+        # lockstep tiles, whereas water-filling remote ranks minimizes max(c, c^4).
+        ordered_rem = jnp.where(
+            chip_host[:, None],
+            per_rank_hot[:half_ep, :].T,
+            per_rank_hot[half_ep:, :].T,
+        )
+        opts = jnp.concatenate(
+            [jnp.zeros((n_chips, 1), dtype=jnp.int32), jnp.cumsum(ordered_rem, axis=1)],
+            axis=1,
+        )
+        chip_tot = counts_chip.sum(axis=1)
+        z_partner_idx = lax.bitwise_xor(
+            jnp.arange(n_chips, dtype=jnp.int32), jnp.int32(half_chips)
+        )
+        partner_tot = jnp.take(chip_tot, z_partner_idx, axis=0)
+        gap = chip_tot - partner_tot
+        visit_pen = int(round(TP_PAIR_VISIT_FLOOR_TILES * capacity))
+        k_idx = jnp.arange(half_ep + 1, dtype=jnp.int32)[None, :]
+        pen = jnp.where(k_idx == 0, jnp.int32(0), jnp.int32(visit_pen))
+        valid_opt = (k_idx == 0) | (
+            (opts >= jnp.int32(min_rem))
+            & (z_hot_tot[:, None] >= jnp.int32(z_min_total))
+            & (gap[:, None] >= jnp.int32(z_min_total))
+        )
+        obj = jnp.where(
+            valid_opt,
+            jnp.maximum(chip_tot[:, None] - opts, partner_tot[:, None] + opts + pen),
+            jnp.int32(1 << 29),
+        )
+        best_k = jnp.argmin(obj, axis=1).astype(jnp.int32)
+    else:
+        z_hot_rem = jnp.take_along_axis(remote_counts, z_hot_phys[:, None], axis=1)[
+            :, 0
+        ]
+        legacy_active = (z_hot_tot >= jnp.int32(z_min_total)) & (
+            z_hot_rem >= jnp.int32(min_rem)
+        )
+        best_k = jnp.where(legacy_active, jnp.int32(half_ep), jnp.int32(0))
+
+    z_active = best_k > jnp.int32(0)
+    z_push_phys_by_chip = jnp.where(z_active, z_hot_phys, jnp.int32(-1))
+    phys_idx_z = jnp.arange(2 * g_local, dtype=jnp.int32)[None, :]
+    is_z_hot = (phys_idx_z == z_hot_phys[:, None]) & z_active[:, None]
+
+    src_ranks = jnp.arange(ep, dtype=jnp.int32)
+    src_is_h1 = src_ranks >= jnp.int32(half_ep)
+    if (half_ep & (half_ep - 1)) == 0:
+        src_rem_ord = jnp.bitwise_and(src_ranks, jnp.int32(half_ep - 1))
+    else:
+        src_rem_ord = src_ranks % jnp.int32(half_ep)
+    take_rc = (src_is_h1[:, None] != chip_host[None, :]) & (
+        src_rem_ord[:, None] < best_k[None, :]
+    )
+    z_moved_tot = jnp.sum(per_rank_hot * take_rc.astype(jnp.int32), axis=0)
+    counts_for_split = jnp.where(
+        is_z_hot, counts_chip - z_moved_tot[:, None], counts_chip
+    )
+    return (
+        chip_host,
+        z_active,
+        z_hot_phys,
+        z_push_phys_by_chip,
+        is_z_hot,
+        best_k,
+        src_is_h1,
+        src_rem_ord,
+        take_rc,
+        counts_for_split,
+    )
+
+
+def _row_hist_by_core_slot(ids_2d, *, n_cores, g_plan):
+    """Per-row histogram of planned ids -> [rows, n_cores * g_plan].
+
+    An id counts in bin `id` when it lies in [0, n_cores * g_plan).
+    """
+    core = jnp.floor_divide(ids_2d, jnp.int32(g_plan))
+    slot = ids_2d - core * jnp.int32(g_plan)
+    # Avoid a [rows, e_plan, pairs] one-hot compare-and-reduce: build the two
+    # small one-hots class-major (pairs on lanes) and contract them on the MXU.
+    core_oh = (
+        core[:, None, :] == jnp.arange(n_cores, dtype=jnp.int32)[None, :, None]
+    ).astype(jnp.bfloat16)
+    slot_oh = (
+        slot[:, None, :] == jnp.arange(g_plan, dtype=jnp.int32)[None, :, None]
+    ).astype(jnp.bfloat16)
+    counts = jnp.einsum(
+        "rce,rse->rcs", core_oh, slot_oh, preferred_element_type=jnp.float32
+    )
+    return counts.astype(jnp.int32).reshape(ids_2d.shape[0], n_cores * g_plan)
+
+
+def rebalance_ep_tp_pair_experts(
+    pairs_g,
+    local_blocks,
+    block_hist,
+    rows_by_dest,
+    *,
+    ep,
+    ep_tp_size,
+    g_local,
+    e_total,
+    k_split=0,
+    capacity=128,
+    me=None,
+    t_local=None,
+    topk=None,
+    z_clone=False,
+    z_min_total=TP_PAIR_Z_CLONE_MIN_TOTAL,
+    z_min_remote=TP_PAIR_Z_CLONE_MIN_REMOTE,
+    z_waterfill=True,
+):
+    """Balance paired experts and optionally split or Z-clone hot experts."""
+    g_shift = g_local.bit_length() - 1
+    chip_shift = g_shift + 1
+    n_chips = ep // ep_tp_size
+    counts_chip = rows_by_dest.sum(axis=0).reshape(n_chips, 2 * g_local)
+
+    if k_split <= 0 and not z_clone:
+        flip = _ep_tp_pair_flip_mask(counts_chip.reshape(n_chips, 2, g_local))
+        words = _pack_flip_words(flip)
+        n_words = words.shape[0]
+
+        def _remap_ids(ids):
+            # Avoid 1D dynamic LUT gather over T*topk pairs: XLA offloads it to
+            # SparseCore and adds ~438us/layer overhead on uniform routing.
+            pair_idx = jnp.bitwise_or(
+                jnp.left_shift(jnp.right_shift(ids, chip_shift), g_shift),
+                jnp.bitwise_and(ids, jnp.int32(g_local - 1)),
+            )
+            word_idx = jnp.right_shift(pair_idx, 5)
+            bit_idx = jnp.bitwise_and(pair_idx, jnp.int32(31)).astype(jnp.uint32)
+            w = words[0]
+            for wi in range(1, n_words):
+                w = jnp.where(word_idx == jnp.int32(wi), words[wi], w)
+            bit = jnp.bitwise_and(jnp.right_shift(w, bit_idx), jnp.uint32(1))
+            do_flip = jnp.where(
+                (ids >= jnp.int32(0)) & (ids < jnp.int32(e_total)),
+                bit.astype(jnp.int32),
+                jnp.int32(0),
+            )
+            return jnp.bitwise_xor(ids, jnp.left_shift(do_flip, g_shift))
+
+        def _swap_hist(h):
+            h4 = h.reshape(h.shape[0], n_chips, 2, g_local)
+            return jnp.where(flip[None, :, None, :], h4[:, :, ::-1, :], h4).reshape(
+                h.shape
+            )
+
+        base_phys = jnp.broadcast_to(
+            jnp.arange(2 * g_local, dtype=jnp.int32).reshape(1, 2, g_local),
+            (n_chips, 2, g_local),
+        )
+        tp_slot_to_local_phys = jnp.where(
+            flip[:, None, :], base_phys[:, ::-1, :], base_phys
+        ).reshape(n_chips, 2 * g_local)
+        return (
+            _remap_ids(pairs_g),
+            _remap_ids(local_blocks),
+            _swap_hist(block_hist),
+            _swap_hist(rows_by_dest),
+            tp_slot_to_local_phys,
+        )
+
+    assert me is not None and t_local is not None and topk is not None
+    half_chips = n_chips // 2
+    g_plan = g_local + k_split + int(z_clone)
+    slot_z = g_local + k_split
+    e_plan = ep * g_plan
+    z_phys_id = 2 * g_local
+
+    if z_clone:
+        (
+            chip_host,
+            z_active,
+            z_hot_phys,
+            z_push_phys_by_chip,
+            _,
+            best_k,
+            src_is_h1,
+            src_rem_ord,
+            take_rc,
+            counts_for_split,
+        ) = _select_z_clone_plan(
+            rows_by_dest,
+            counts_chip,
+            ep=ep,
+            n_chips=n_chips,
+            g_local=g_local,
+            capacity=capacity,
+            z_min_total=z_min_total,
+            z_min_remote=z_min_remote,
+            z_waterfill=z_waterfill,
+        )
+    else:
+        chip_host = None
+        z_active = None
+        z_hot_phys = None
+        z_push_phys_by_chip = None
+        best_k = None
+        src_is_h1 = None
+        src_rem_ord = None
+        take_rc = None
+        counts_for_split = counts_chip
+
+    if k_split > 0:
+        split_phys, split_active, _, flip = _choose_ep_tp_row_splits(
+            counts_for_split, g_local=g_local, k_split=k_split, capacity=capacity
+        )
+    else:
+        flip = _ep_tp_pair_flip_mask(counts_for_split.reshape(n_chips, 2, g_local))
+        split_phys = jnp.zeros((n_chips, 0), dtype=jnp.int32)
+        split_active = jnp.zeros((n_chips, 0), dtype=jnp.bool_)
+
+    words = _pack_flip_words(flip)
+    n_words = words.shape[0]
+    chip_base_1d = jnp.arange(n_chips, dtype=jnp.int32) * jnp.int32(2 * g_local)
+    split_match = jnp.where(
+        split_active, chip_base_1d[:, None] + split_phys, jnp.int32(-1)
+    )
+    use_rank_take_mask = bool(z_clone and n_chips <= 32)
+    if z_clone:
+        assert (
+            chip_host is not None
+            and z_active is not None
+            and z_hot_phys is not None
+            and best_k is not None
+            and take_rc is not None
+        )
+        z_match = jnp.where(z_active, chip_base_1d + z_hot_phys, jnp.int32(-1))
+        if use_rank_take_mask:
+            # Avoid broadcasting [ep, t_local * topk] host and rank-ordinal
+            # tables: packing take_rc into one uint32 bitmask per rank tests
+            # chip membership in place.
+            take_mask_by_rank = jnp.sum(
+                jnp.left_shift(
+                    take_rc.astype(jnp.uint32),
+                    jnp.arange(n_chips, dtype=jnp.uint32)[None, :],
+                ),
+                axis=1,
+                keepdims=True,
+                dtype=jnp.uint32,
+            )
+        else:
+            take_mask_by_rank = None
+    else:
+        z_match = None
+        take_mask_by_rank = None
+
+    def _remap_with_splits(ids, tok_par, tok_host, tok_rem_ord):
+        valid = (ids >= jnp.int32(0)) & (ids < jnp.int32(e_total))
+        pair_idx = jnp.bitwise_or(
+            jnp.left_shift(jnp.right_shift(ids, chip_shift), g_shift),
+            jnp.bitwise_and(ids, jnp.int32(g_local - 1)),
+        )
+        word_idx = jnp.right_shift(pair_idx, 5)
+        bit_idx = jnp.bitwise_and(pair_idx, jnp.int32(31)).astype(jnp.uint32)
+        w = words[0]
+        for wi in range(1, n_words):
+            w = jnp.where(word_idx == jnp.int32(wi), words[wi], w)
+        bit = jnp.bitwise_and(jnp.right_shift(w, bit_idx), jnp.uint32(1))
+        do_flip = jnp.where(valid, bit.astype(jnp.int32), jnp.int32(0))
+        swapped = jnp.bitwise_xor(ids, jnp.left_shift(do_flip, g_shift))
+        core = jnp.right_shift(swapped, g_shift)
+        slot = jnp.bitwise_and(swapped, jnp.int32(g_local - 1))
+        log_id = core * jnp.int32(g_plan) + slot
+        ch = jnp.right_shift(ids, chip_shift)
+        if z_clone:
+            z_m = _select_by_chip(ch, z_match, n_chips)
+            if take_mask_by_rank is not None:
+                ch_2d = jnp.clip(ch, 0, n_chips - 1).reshape(ep, t_local * topk)
+                take_z = (
+                    jnp.bitwise_and(
+                        jnp.right_shift(take_mask_by_rank, ch_2d.astype(jnp.uint32)),
+                        jnp.uint32(1),
+                    )
+                    != jnp.uint32(0)
+                ).reshape(ch.shape)
+                hit_z = valid & (ids == z_m) & take_z
+            else:
+                ch_host = ch >= jnp.int32(half_chips)
+                k_take = _select_by_chip(ch, best_k, n_chips)
+                hit_z = (
+                    valid
+                    & (ids == z_m)
+                    & (tok_host != ch_host)
+                    & (tok_rem_ord < k_take)
+                )
+        else:
+            hit_z = None
+        for k in range(k_split):
+            s_k = _select_by_chip(ch, split_match[:, k], n_chips)
+            hit_k = valid & (ids == s_k)
+            if hit_z is not None:
+                hit_k = hit_k & (~hit_z)
+            dst_k = (jnp.left_shift(ch, 1) + tok_par) * jnp.int32(g_plan) + jnp.int32(
+                g_local + k
+            )
+            log_id = jnp.where(hit_k, dst_k, log_id)
+        if hit_z is not None:
+            ch_z = lax.bitwise_xor(ch, jnp.int32(half_chips))
+            dst_z = (jnp.left_shift(ch_z, 1) + tok_par) * jnp.int32(g_plan) + jnp.int32(
+                slot_z
+            )
+            log_id = jnp.where(hit_z, dst_z, log_id)
+        # Avoid leaving masked rows at e_total: e_total is now a live virtual
+        # expert slot, so shift non-negative out-of-range sentinels to e_plan.
+        sentinel = jnp.where(ids >= jnp.int32(e_total), jnp.int32(e_plan), ids)
+        return jnp.where(valid, log_id, sentinel)
+
+    n_tokens = pairs_g.size // topk
+    global_par = jnp.broadcast_to(
+        (jnp.arange(n_tokens, dtype=jnp.int32) & jnp.int32(1))[:, None],
+        (n_tokens, topk),
+    ).reshape(pairs_g.shape)
+    if z_clone and not use_rank_take_mask:
+        assert src_is_h1 is not None and src_rem_ord is not None
+        global_host = jnp.broadcast_to(
+            src_is_h1[:, None], (ep, t_local * topk)
+        ).reshape(pairs_g.shape)
+        global_rem_ord = jnp.broadcast_to(
+            src_rem_ord[:, None], (ep, t_local * topk)
+        ).reshape(pairs_g.shape)
+    else:
+        global_host = None
+        global_rem_ord = None
+    new_pairs = _remap_with_splits(pairs_g, global_par, global_host, global_rem_ord)
+    # NOTE(cross-boundary-contract): fused_ep_moe_v2.local_fn all-gathers
+    # local_blocks.reshape(-1) in rank order, so pairs_g[me] is this shard's
+    # pairs and its remap is new_local. Avoid remapping local_blocks a second
+    # time: it repeats the per-pair select chains (~30 us/layer on TPU).
+    new_local = lax.dynamic_index_in_dim(
+        new_pairs.reshape(ep, t_local * topk), me, axis=0, keepdims=False
+    ).reshape(local_blocks.shape)
+
+    # Avoid re-deriving the histograms from block_hist / rows_by_dest plus
+    # per-chip masked counts of the moved pairs: each (class, chip, parity)
+    # count is a full masked reduction, and on [t_local, topk]-shaped masks the
+    # topk-wide minor axis pads to full lane tiles. Every valid pair lands in
+    # exactly one planned id and masked pairs stay outside [0, e_plan), so
+    # direct histograms of the remapped ids are the same counts.
+    new_rbd = _row_hist_by_core_slot(
+        new_pairs.reshape(ep, t_local * topk), n_cores=ep, g_plan=g_plan
+    )
+    new_bh = pair_block_hist(new_local, e_plan)
+
+    base_phys = jnp.broadcast_to(
+        jnp.arange(2 * g_local, dtype=jnp.int32).reshape(1, 2, g_local),
+        (n_chips, 2, g_local),
+    )
+    orig_phys = jnp.where(flip[:, None, :], base_phys[:, ::-1, :], base_phys)
+    phys_parts = [orig_phys]
+    if k_split > 0:
+        phys_parts.append(
+            jnp.broadcast_to(split_phys[:, None, :], (n_chips, 2, k_split))
+        )
+    if z_clone:
+        phys_parts.append(jnp.full((n_chips, 2, 1), z_phys_id, dtype=jnp.int32))
+    tp_slot_to_local_phys = jnp.concatenate(phys_parts, axis=2).reshape(
+        n_chips, 2 * g_plan
+    )
+    if z_clone:
+        return (
+            new_pairs,
+            new_local,
+            new_bh,
+            new_rbd,
+            tp_slot_to_local_phys,
+            z_push_phys_by_chip,
+        )
+    return new_pairs, new_local, new_bh, new_rbd, tp_slot_to_local_phys
+
+
 def fused_ep_moe_v2(
     x,
     w1,
@@ -280,6 +864,13 @@ def fused_ep_moe_v2(
     stage="fused",
     routed=None,
     gather_positions=None,
+    wire_dtype=None,
+    ep_tp_size=1,
+    ep_tp_row_splits=None,
+    ep_tp_z_clone=None,
+    ep_tp_z_clone_delay=TP_PAIR_Z_CLONE_DELAY_STEPS,
+    ep_tp_z_clone_min_total=TP_PAIR_Z_CLONE_MIN_TOTAL,
+    ep_tp_z_clone_min_remote=TP_PAIR_Z_CLONE_MIN_REMOTE,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -380,9 +971,26 @@ def fused_ep_moe_v2(
         )
     if (w1_scale is None) != (w2_scale is None):
         raise ValueError("both weight scales are supplied together or neither is")
+    ep_tp_size = int(ep_tp_size)
+    if ep_tp_size < 1:
+        raise ValueError(f"ep_tp_size must be >= 1; got {ep_tp_size}")
+    if ep_tp_size > 1 and weight_format != WeightFormat.FP8:
+        raise NotImplementedError(
+            f"ep_tp_size > 1 supports FP8 weights only; got {weight_format!r}"
+        )
     T, hidden = x.shape
-    e_total = w1.shape[0]
-    inter = w1.shape[2] // 2
+    w1_experts = w1.shape[0]
+    if w1_experts % ep_tp_size:
+        raise ValueError(
+            f"w1 expert axis {w1_experts} is not divisible by ep_tp_size={ep_tp_size}"
+        )
+    e_total = w1_experts // ep_tp_size
+    inter_slice = w1.shape[2] // 2
+    inter = inter_slice * ep_tp_size
+    if ep_tp_size > 1 and w2.shape != (w1_experts, inter_slice, hidden):
+        raise ValueError(
+            f"w2 layout {tuple(w2.shape)} is not {(w1_experts, inter_slice, hidden)}"
+        )
     # Where the weight scales' layout is fixed: [E, N] per output channel,
     # [E, blocks, N] per contraction block, which is what the kernel's own
     # operands are. The scales are constants of the weights, so whatever
@@ -393,11 +1001,11 @@ def fused_ep_moe_v2(
     if form.has_scales:
         ndim = 3 if form.scale_layout == "per_contraction_block" else 2
         for name, s, n in (
-            ("w1_scale", w1_scale, 2 * inter),
+            ("w1_scale", w1_scale, 2 * inter_slice),
             ("w2_scale", w2_scale, hidden),
         ):
-            if s.ndim != ndim or s.shape[0] != e_total or s.shape[-1] != n:
-                want = (e_total, "blocks", n) if ndim == 3 else (e_total, n)
+            if s.ndim != ndim or s.shape[0] != w1_experts or s.shape[-1] != n:
+                want = (w1_experts, "blocks", n) if ndim == 3 else (w1_experts, n)
                 raise ValueError(
                     f"{name} layout {tuple(s.shape)} is not the "
                     f"{form.scale_layout} form {want} the kernel "
@@ -405,6 +1013,10 @@ def fused_ep_moe_v2(
                 )
     (ax,) = mesh.axis_names
     ep = mesh.shape[ax]
+    if ep % ep_tp_size:
+        raise ValueError(f"mesh size {ep} is not divisible by ep_tp_size={ep_tp_size}")
+    if ep_tp_size > 1 and mesh_ep_ranks is not None:
+        raise ValueError("ep_tp_size > 1 requires a rank-ordered EP mesh")
     if mesh_ep_ranks is not None:
         mesh_ep_ranks = tuple(int(rank) for rank in mesh_ep_ranks)
         if tuple(sorted(mesh_ep_ranks)) != tuple(range(ep)):
@@ -440,7 +1052,40 @@ def fused_ep_moe_v2(
     t_wire = replica_wire_rows(T // ep, len(token_layout.groups[0]), U32_SUBLANE_TILE)
     T = ep * t_local
     P = jax.sharding.PartitionSpec
-    stride_bound = ragged_stride_bound(T, topk, e_total, capacity)
+    has_w1_bias = w1_bias is not None
+    has_w2_bias = w2_bias is not None
+    if ep_tp_size > 1 and (has_w1_bias or has_w2_bias):
+        raise NotImplementedError("ep_tp_size > 1 does not support expert biases")
+    k_split = _resolve_ep_tp_row_splits(
+        ep_tp_size=ep_tp_size,
+        has_bias=has_w1_bias or has_w2_bias,
+        g_local=g_local,
+        n_tokens=T,
+        topk=topk,
+        ep=ep,
+        capacity=capacity,
+        user_ragged_stride=ragged_stride,
+        ep_tp_row_splits=ep_tp_row_splits,
+    )
+    use_z_clone = _resolve_ep_tp_z_clone(
+        ep_tp_size=ep_tp_size,
+        has_bias=has_w1_bias or has_w2_bias,
+        weight_format=weight_format,
+        g_local=g_local,
+        k_split=k_split,
+        n_tokens=T,
+        topk=topk,
+        ep=ep,
+        capacity=capacity,
+        user_ragged_stride=ragged_stride,
+        ep_tp_z_clone=ep_tp_z_clone,
+    )
+    z_clone_delay = max(int(ep_tp_z_clone_delay), 0)
+    z_min_total = max(int(ep_tp_z_clone_min_total), 1)
+    z_min_remote = max(int(ep_tp_z_clone_min_remote), 1)
+    g_plan = g_local + k_split + int(use_z_clone)
+    e_plan = ep * g_plan
+    stride_bound = ragged_stride_bound(T, topk, e_plan, capacity)
     if ragged_stride is None:
         ragged_stride = stride_bound
     if block is None:
@@ -456,8 +1101,6 @@ def fused_ep_moe_v2(
             f"{stride_bound}, so one shard's slab could bleed into the "
             f"next. Pass {stride_bound} or more."
         )
-    has_w1_bias = w1_bias is not None
-    has_w2_bias = w2_bias is not None
     has_score_bias = score_bias is not None
     has_hash_ids = hash_topk_ids is not None
     if scoring_fn not in SCORING_FNS:
@@ -479,7 +1122,7 @@ def fused_ep_moe_v2(
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
     kfn = build_fused_ep_moe_kernel(
-        g_local=g_local,
+        g_local=g_plan,
         capacity=capacity,
         hidden=hidden,
         inter=inter,
@@ -490,6 +1133,9 @@ def fused_ep_moe_v2(
         act_fn=act_fn,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        **({} if wire_dtype is None else {"wire_dtype": jnp.dtype(wire_dtype)}),
+        **({} if ep_tp_size == 1 else {"ep_tp_size": ep_tp_size}),
+        **({"ep_tp_z_clone": True} if use_z_clone else {}),
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -635,9 +1281,50 @@ def fused_ep_moe_v2(
     ):
         """Plan, kernel and combine over the gathered rows and payload."""
         me = rank_l[0, 0]
+        topk_weights_1d = (
+            lax.optimization_barrier(topk_weights.astype(jnp.float32).reshape(-1))
+            if combine_step_tokens(t_local)
+            else None
+        )
         pairs_g, scale_bits_g, rows_by_dest = _unpack_routing_exchange(
             exchange, layout, t_local, topk, e_total
         )
+        tp_slot_to_local_phys = None
+        z_push_phys_by_chip = None
+        if (
+            ep_tp_size == 2
+            and not has_w1_bias
+            and not has_w2_bias
+            and g_local > 0
+            and (g_local & (g_local - 1)) == 0
+        ):
+            rebal = rebalance_ep_tp_pair_experts(
+                pairs_g,
+                local_blocks,
+                block_hist,
+                rows_by_dest,
+                ep=ep,
+                ep_tp_size=ep_tp_size,
+                g_local=g_local,
+                e_total=e_total,
+                k_split=k_split,
+                capacity=capacity,
+                me=me,
+                t_local=t_local,
+                topk=topk,
+                z_clone=use_z_clone,
+                z_min_total=z_min_total,
+                z_min_remote=z_min_remote,
+            )
+            (
+                pairs_g,
+                local_blocks,
+                block_hist,
+                rows_by_dest,
+                tp_slot_to_local_phys,
+            ) = rebal[:5]
+            if len(rebal) == 6:
+                z_push_phys_by_chip = rebal[5]
         gathered = GatheredPairs(
             expert_blocks=pairs_g.reshape(T * topk // block, block),
             local_blocks=local_blocks,
@@ -648,7 +1335,7 @@ def fused_ep_moe_v2(
         )
 
         plan_kw = dict(
-            e_total=e_total,
+            e_total=e_plan,
             ep=ep,
             t_local=t_local,
             block=block,
@@ -662,9 +1349,9 @@ def fused_ep_moe_v2(
         else:
             routing = build_routing_tables(pairs_g.reshape(T, topk), **plan_kw)
         block_tables = shard_transport_tables_in_blocks(
-            routing, me, e_total=e_total, ep=ep
+            routing, me, e_total=e_plan, ep=ep
         )
-        row_tables = shard_push_tables_in_rows(routing, me, e_total=e_total, ep=ep)
+        row_tables = shard_push_tables_in_rows(routing, me, e_total=e_plan, ep=ep)
         # Both slab tables scatter onto this shard's own slab. The rows of
         # the other shards are dropped where they are computed rather than
         # built into a replicated slab and sliced away afterwards.
@@ -722,8 +1409,8 @@ def fused_ep_moe_v2(
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
             scale_slab = None
-        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_total, ep=ep)
-        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
+        expert_rows, slab_base = shard_expert_slabs(routing, me, e_total=e_plan, ep=ep)
+        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_plan, ROWBLK)
         # The bias tables are per expert and per output channel on every
         # weight format, so they take one layout: [G, N].
         w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
@@ -733,10 +1420,63 @@ def fused_ep_moe_v2(
         # row of the count table rather than its own reduction, so this
         # builder's second value is not read; it leaves the program with
         # the rest of the dead code, and its own test still sees it.
-        visit, _ = expert_visit_list(expert_rows, g_local)
+        rank_for_kernel = rank_l
+        if ep_tp_size > 1:
+            tp_grp = lax.div(me, jnp.int32(ep_tp_size))
+            grp_rows = lax.dynamic_slice(
+                routing.expert_rows_aligned,
+                (tp_grp * ep_tp_size * g_plan,),
+                (ep_tp_size * g_plan,),
+            ).reshape(ep_tp_size, g_plan)
+            if use_z_clone:
+                assert z_push_phys_by_chip is not None
+                slot_z = g_plan - 1
+                n_chips = ep // ep_tp_size
+                half_chips = n_chips // 2
+                grp_rows_loc = grp_rows[:, :slot_z]
+                tp_order_loc = jnp.argsort(-grp_rows_loc, axis=1, stable=True).astype(
+                    jnp.int32
+                )
+                sorted_loc = jnp.take_along_axis(grp_rows_loc, tp_order_loc, axis=1)
+                n_loc = (sorted_loc.max(axis=0) > 0).sum().astype(jnp.int32)
+                z_partner_chip = lax.bitwise_xor(tp_grp, jnp.int32(half_chips))
+                z_recv_active = z_push_phys_by_chip[z_partner_chip] >= jnp.int32(0)
+                z_pos = jnp.minimum(jnp.int32(z_clone_delay), n_loc)
+                step_idx = jnp.arange(g_plan, dtype=jnp.int32)[None, :]
+                loc_pad = jnp.concatenate(
+                    [tp_order_loc, jnp.full((ep_tp_size, 1), slot_z, dtype=jnp.int32)],
+                    axis=1,
+                )
+                shifted = jnp.take_along_axis(
+                    loc_pad, jnp.maximum(step_idx - jnp.int32(1), jnp.int32(0)), axis=1
+                )
+                tp_order_with_z = jnp.where(
+                    step_idx < z_pos,
+                    loc_pad,
+                    jnp.where(step_idx == z_pos, jnp.int32(slot_z), shifted),
+                )
+                tp_order = jnp.where(z_recv_active, tp_order_with_z, loc_pad)
+                z_push_phys = z_push_phys_by_chip[tp_grp]
+                z_recv_step = jnp.where(z_recv_active, z_pos, jnp.int32(-1))
+                z_peer_rank = lax.bitwise_xor(me, jnp.int32(ep // 2))
+                rank_for_kernel = jnp.stack(
+                    [me, z_push_phys, z_recv_step, z_peer_rank], axis=0
+                )[None, :]
+            else:
+                tp_order = jnp.argsort(-grp_rows, axis=1, stable=True).astype(jnp.int32)
+            sorted_rows = jnp.take_along_axis(grp_rows, tp_order, axis=1)
+            active_step = (sorted_rows.max(axis=0, keepdims=True) > 0).astype(jnp.int32)
+            if tp_slot_to_local_phys is not None:
+                chip_phys = tp_slot_to_local_phys[tp_grp].reshape(ep_tp_size, g_plan)
+                tp_phys_order = jnp.take_along_axis(chip_phys, tp_order, axis=1)
+                visit = jnp.concatenate([tp_order, active_step, tp_phys_order], axis=0)
+            else:
+                visit = jnp.concatenate([tp_order, active_step], axis=0)
+        else:
+            visit, _ = expert_visit_list(expert_rows, g_local)
         # One pass builds every count the kernel needs, still spread over
         # the expert-parallel axis; the kernel's scalar core closes them.
-        counts = shard_count_vector(routing, expert_rows, me, e_total=e_total, ep=ep)
+        counts = shard_count_vector(routing, expert_rows, me, e_total=e_plan, ep=ep)
 
         # The kernel takes four of the seven transport tables and one of the
         # three push tables. The two totals are rows of `counts`, and three
@@ -763,7 +1503,7 @@ def fused_ep_moe_v2(
             recv_rows=recv_rows,
             visit=visit,
             counts=counts,
-            rank=rank_l,
+            rank=rank_for_kernel,
         )
 
         # The destination's own table: one arrival row per selection slot.
@@ -786,7 +1526,13 @@ def fused_ep_moe_v2(
             )
         )
         combined = _combine_arrivals(
-            arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
+            arrivals,
+            arrival_scales,
+            pos,
+            mirror_pos,
+            topk_weights,
+            out_dtype,
+            topk_weights_1d=topk_weights_1d,
         )
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
@@ -938,14 +1684,21 @@ def fused_ep_moe_v2(
         w2.dtype,
         form.has_scales and w1_scale.dtype,
         gating.dtype,
-        has_w1_bias and w1_bias.dtype,
-        has_w2_bias and w2_bias.dtype,
+        has_w1_bias and cast(jax.Array, w1_bias).dtype,
+        has_w2_bias and cast(jax.Array, w2_bias).dtype,
         scoring_fn,
         has_score_bias and cast(jax.Array, score_bias).dtype,
         has_hash_ids and hash_topk_ids.dtype,
         float(routed_scaling_factor),
         stage,
         gather_positions,
+        None if wire_dtype is None else jnp.dtype(wire_dtype),
+        ep_tp_size,
+        k_split,
+        use_z_clone,
+        z_clone_delay if use_z_clone else 0,
+        z_min_total if use_z_clone else 0,
+        z_min_remote if use_z_clone else 0,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),

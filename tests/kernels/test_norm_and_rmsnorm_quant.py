@@ -11,14 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pallas interpret and TPU tests for sandwich and MoE norm-quant kernels."""
+"""CPU Pallas interpret tests for sandwich norm-quant and fused add+RMSNorm."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels import norm_quant
+from vllm_torchtpu.kernels import fused_add_rmsnorm, norm_quant
 
 
 def _rms(x: jax.Array, w: jax.Array, eps: float) -> jax.Array:
@@ -40,6 +40,24 @@ def _fp8_quant(x: jax.Array) -> tuple[jax.Array, jax.Array]:
         ),
         scale,
     )
+
+
+def _assert_bf16_within_ulps(
+    actual: jax.Array, ref: jax.Array, max_ulps: int = 2
+) -> None:
+    if jax.default_backend() == "cpu":
+        np.testing.assert_array_equal(
+            np.asarray(actual.view(jnp.uint16)), np.asarray(ref.view(jnp.uint16))
+        )
+        return
+    assert np.all(np.isfinite(np.asarray(actual, np.float32)))
+    a_u, b_u = (
+        np.asarray(actual.view(jnp.uint16), np.int32),
+        np.asarray(ref.view(jnp.uint16), np.int32),
+    )
+    a_ord = np.where((a_u & 0x8000) != 0, -(a_u & 0x7FFF), a_u)
+    b_ord = np.where((b_u & 0x8000) != 0, -(b_u & 0x7FFF), b_u)
+    assert int(np.max(np.abs(a_ord - b_ord))) <= max_ulps
 
 
 def _assert_fp8_pair(
@@ -196,8 +214,47 @@ def test_moe_tail_and_head_rms_norm_quantize_match_reference() -> None:
     _assert_fp8_pair(q_mlp, s_mlp, ref_q_mlp, ref_s_mlp, cpu_tol=3e-2)
 
 
+@pytest.mark.parametrize("emit_y", [True, False])
+def test_fused_add_rmsnorm_quant_bit_exact_with_reference(emit_y: bool) -> None:
+    assert (
+        fused_add_rmsnorm.supports(256, 256)
+        and fused_add_rmsnorm.supports(16, 256, block_rows=16)
+        and not fused_add_rmsnorm.supports(7, 256, block_rows=16)
+        and not fused_add_rmsnorm.supports(256, 320)
+    )
+    t, h, eps = 16, 512, 1e-6
+    k1, k2, k3 = jax.random.split(jax.random.key(99 + int(emit_y)), 3)
+    x = jax.random.normal(k1, (t, h), dtype=jnp.bfloat16)
+    r = jax.random.normal(k2, (t, h), dtype=jnp.bfloat16)
+    w = jax.random.uniform(k3, (h,), dtype=jnp.bfloat16) + 0.5
+
+    y_ref, r_ref = fused_add_rmsnorm.reference(x, r, w, eps=eps)
+    y_norm, r_norm = fused_add_rmsnorm.fused_add_rms_norm(
+        x, r, w, eps=eps, block_rows=16, interpret=True
+    )
+    _assert_bf16_within_ulps(y_norm, y_ref)
+    _assert_bf16_within_ulps(r_norm, r_ref)
+
+    y_out, q, scale, r_out = fused_add_rmsnorm.fused_add_rms_norm_quant(
+        x, r, w, eps=eps, emit_y=emit_y, block_rows=16, interpret=True
+    )
+    assert (y_out is not None) if emit_y else (y_out is None)
+    if y_out is not None:
+        _assert_bf16_within_ulps(y_out, y_ref)
+    ref_q, ref_s = _fp8_quant(y_ref)
+    _assert_bf16_within_ulps(r_out, r_ref)
+    if jax.default_backend() == "cpu":
+        np.testing.assert_array_equal(np.asarray(scale), np.asarray(ref_s))
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(q, jnp.uint8)),
+            np.asarray(jax.lax.bitcast_convert_type(ref_q, jnp.uint8)),
+        )
+    else:
+        _assert_fp8_pair(q, scale, ref_q, ref_s)
+
+
 @pytest.mark.tpu_test
-def test_norm_quant_on_tpu() -> None:
+def test_norm_quant_and_fused_add_rmsnorm_on_tpu() -> None:
     if jax.default_backend() != "tpu":
         pytest.skip("Requires TPU backend")
     t, h, eps = 16, 512, 1e-6
@@ -206,6 +263,15 @@ def test_norm_quant_on_tpu() -> None:
     r = jax.random.normal(k2, (t, h), dtype=jnp.bfloat16)
     w = jax.random.uniform(k3, (h,), dtype=jnp.bfloat16) + 0.5
     w_next = jax.random.uniform(k4, (h,), dtype=jnp.bfloat16) + 0.5
+
+    y_ref, r_ref = fused_add_rmsnorm.reference(x, r, w, eps=eps)
+    y_out, q, scale, r_out = fused_add_rmsnorm.fused_add_rms_norm_quant(
+        x, r, w, eps=eps, emit_y=True, block_rows=16
+    )
+    assert y_out is not None
+    _assert_bf16_within_ulps(y_out, y_ref)
+    _assert_bf16_within_ulps(r_out, r_ref)
+    _assert_fp8_pair(q, scale, *_fp8_quant(y_ref))
 
     h_out, q_nq, s_nq = norm_quant.add_rms_norm_quantize(
         x, r, w, w_next, None, eps=eps, quant_dtype=jnp.float8_e4m3fn

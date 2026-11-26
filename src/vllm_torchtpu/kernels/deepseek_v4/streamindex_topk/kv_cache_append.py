@@ -44,10 +44,10 @@ So the kernel works in *granules*, the smallest DMA-addressable unit: a quad
     granules, waits for them, blends, writes, and waits for all writes.
 
 Both steps run in the kernel. Building the run table in XLA instead
-(`searchsorted` + gathers) measured ~120 µs at 1024 tokens on TPU7x; the
-scalar walk costs ~13 µs there and ~1 µs for a 16-token decode step. Writing
+(`searchsorted` + gathers) measured ~120 us at 1024 tokens on TPU7x; the
+scalar walk costs ~13 us there and ~1 us for a 16-token decode step. Writing
 page-long runs instead (partial-granule read-modify-write at each end + one
-DMA for the whole granules between) was ~5-10 µs faster only for 1024-token
+DMA for the whole granules between) was ~5-10 us faster only for 1024-token
 `HAS` prefill, ~2x slower for decode batches of 128+, and ~150 lines longer.
 
 Contract (as with the XLA scatter it replaces): two tokens must not target the
@@ -921,6 +921,7 @@ def coalesced_kv_append_dcp(
     interleave_size: int,
     kv_layout: KVLayout | str | None = KVLayout.HEAD_ALONG_SUBLANE,
     interpret: bool = False,
+    compact: bool = False,
 ) -> jax.Array:
     """DCP twin of `coalesced_kv_append`: writes the rows this rank owns.
 
@@ -940,6 +941,9 @@ def coalesced_kv_append_dcp(
       interleave_size: Consecutive positions per rank per round-robin step.
       kv_layout: Cache layout.
       interpret: Forwarded to `scatter_rows`.
+      compact: hand the writer only this
+        rank's rows (`compact_owned_rows`), so its scalar walk visits about
+        `T / dcp_size` tokens instead of `T`. Same rows, same order.
 
     Returns:
       The updated cache shard.
@@ -956,11 +960,381 @@ def coalesced_kv_append_dcp(
         dcp_size=dcp_size,
         interleave_size=interleave_size,
     )
+    dst_rows = kv_cache_utils.get_dst_rows(page, slot, page_size)
+    if compact:
+        k_packed, dst_rows = compact_owned_rows(
+            k_packed,
+            dst_rows,
+            num_seqs=seq_lens.shape[0],
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
     return scatter_rows(
         cache_kv,
         k_packed,
-        kv_cache_utils.get_dst_rows(page, slot, page_size),
+        dst_rows,
         kv_layout,
+        interpret=interpret,
+    )
+
+
+def _pack_u8_to_u32_band(src: jax.Array) -> tuple[jax.Array, int]:
+    orig_width = int(src.shape[-1])
+    pad = (-orig_width) % 4
+    padded = jnp.pad(src, ((0, 0), (0, pad))) if pad else src
+    band = padded.shape[-1] // 4
+    # Avoid cross-width uint8->uint32 bitcast_convert_type: XLA emits a slow
+    # sub-word tiling relayout; shift-OR across 4 equal bands stays vectorized.
+    words = padded[:, :band].astype(jnp.uint32)
+    words = words | (padded[:, band : 2 * band].astype(jnp.uint32) << jnp.uint32(8))
+    words = words | (
+        padded[:, 2 * band : 3 * band].astype(jnp.uint32) << jnp.uint32(16)
+    )
+    words = words | (padded[:, 3 * band :].astype(jnp.uint32) << jnp.uint32(24))
+    return words, orig_width
+
+
+def _unpack_u32_band_to_u8(packed: jax.Array, orig_width: int) -> jax.Array:
+    mask = jnp.uint32(0xFF)
+    out = jnp.concatenate(
+        [
+            (packed & mask).astype(jnp.uint8),
+            ((packed >> jnp.uint32(8)) & mask).astype(jnp.uint8),
+            ((packed >> jnp.uint32(16)) & mask).astype(jnp.uint8),
+            ((packed >> jnp.uint32(24)) & mask).astype(jnp.uint8),
+        ],
+        axis=-1,
+    )
+    return out[:, :orig_width] if out.shape[-1] != orig_width else out
+
+
+def sort_recv_by_dst_row(
+    recv_u32: jax.Array,
+    recv_dst: jax.Array,
+    *,
+    num_rows: int,
+    max_valid_rows: int,
+) -> tuple[jax.Array, jax.Array]:
+    # Avoid passing unsorted `zigzag_bands > 1` rows to `scatter_rows`:
+    # alternating bands split one 128-lane granule across separate ranks, so
+    # concurrent `_write_runs` waves would read-modify-write stale tiles.
+    sentinel = jnp.int32(jnp.iinfo(jnp.int32).max)
+    valid = (recv_dst >= 0) & (recv_dst < num_rows)
+    sort_key = jnp.where(valid, recv_dst, sentinel)
+    sorted_key, perm = lax.sort_key_val(
+        sort_key,
+        jnp.arange(recv_dst.shape[0], dtype=jnp.int32),
+        is_stable=False,
+    )
+    keep = min(int(recv_dst.shape[0]), max_valid_rows)
+    sorted_k = sorted_key[:keep]
+    sorted_dst = jnp.where(
+        sorted_k < num_rows,
+        sorted_k,
+        jnp.int32(kv_cache_utils.SKIP_ROW),
+    )
+    return recv_u32[perm[:keep]], sorted_dst
+
+
+def sharded_kv_append_dcp(
+    cache_kv: jax.Array,
+    k_packed_local: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    dcp_rank: jax.Array | int,
+    *,
+    dcp_size: int,
+    interleave_size: int,
+    axis_name: str,
+    kv_layout: KVLayout | str | None = KVLayout.SEQ_ALONG_LANE,
+    interpret: bool = False,
+    use_pallas_scatter: bool = True,
+    zigzag_bands: int = 1,
+) -> jax.Array:
+    """Route sequence-sharded u8 K records via owner all_to_all into DCP cache."""
+    page_size = cache_page_size(cache_kv, kv_layout)
+    if dcp_size == 1:
+        if use_pallas_scatter:
+            return coalesced_kv_append_dcp(
+                cache_kv,
+                k_packed_local,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                dcp_rank,
+                dcp_size=1,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+                interpret=interpret,
+            )
+        page, slot = kv_cache_utils.get_dcp_page_and_slot(
+            k_packed_local.shape[0],
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            dcp_rank,
+            page_size=page_size,
+            num_pages=cache_kv.shape[0],
+            dcp_size=1,
+            interleave_size=interleave_size,
+        )
+        dst_rows = kv_cache_utils.get_dst_rows(page, slot, page_size)
+        return scatter_rows_reference(cache_kv, k_packed_local, dst_rows, kv_layout)
+
+    rows_local = int(k_packed_local.shape[0])
+    cap_full = kv_cache_utils.sharded_a2a_cap(
+        rows_local,
+        num_seqs=int(seq_lens.shape[0]),
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+        zigzag_bands=zigzag_bands,
+    )
+    send_idx, recv_dst_all = kv_cache_utils.build_sharded_dcp_a2a_plan(
+        rows_local,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        dcp_rank,
+        page_size=page_size,
+        num_pages=int(cache_kv.shape[0]),
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+        cap=cap_full,
+        axis_name=axis_name,
+        zigzag_bands=zigzag_bands,
+    )
+    k_u32, orig_width = _pack_u8_to_u32_band(k_packed_local)
+    band_words = int(k_u32.shape[-1])
+    num_seqs = int(seq_lens.shape[0])
+    num_cache_rows = int(cache_kv.shape[0]) * page_size
+
+    def _scatter_tier(cap: int, seq_bound: int) -> jax.Array:
+        sent = k_u32[send_idx[:, :cap]]
+        recv = jax.lax.all_to_all(
+            sent, axis_name, split_axis=0, concat_axis=0, tiled=False
+        ).reshape(-1, band_words)
+        recv_dst = recv_dst_all[:, :cap].reshape(-1)
+        if zigzag_bands > 1:
+            max_valid = owned_rows_bound(
+                rows_local * dcp_size,
+                num_seqs=seq_bound,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+            )
+            recv, recv_dst = sort_recv_by_dst_row(
+                recv,
+                recv_dst,
+                num_rows=num_cache_rows,
+                max_valid_rows=max_valid,
+            )
+        recv_u8 = _unpack_u32_band_to_u8(recv, orig_width)
+        if use_pallas_scatter:
+            return scatter_rows(
+                cache_kv, recv_u8, recv_dst, kv_layout, interpret=interpret
+            )
+        return scatter_rows_reference(cache_kv, recv_u8, recv_dst, kv_layout)
+
+    max_fast_seqs = kv_cache_utils.sharded_a2a_fast_seq_limit(
+        rows_local,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+        zigzag_bands=zigzag_bands,
+    )
+    if cap_full > kv_cache_utils.SHARDED_A2A_FAST_CAP and max_fast_seqs >= 1:
+        # Avoid lax.pmax across ranks: cu_q_lens is replicated, so live_seqs
+        # gives a zero-collective sufficient condition for max_cnt <= fast cap.
+        live_seqs = jnp.sum((cu_q_lens[1:] > cu_q_lens[:-1]).astype(jnp.int32))
+        fast_seq_bound = min(num_seqs, max_fast_seqs)
+        return jax.lax.cond(
+            live_seqs <= jnp.int32(max_fast_seqs),
+            lambda: _scatter_tier(kv_cache_utils.SHARDED_A2A_FAST_CAP, fast_seq_bound),
+            lambda: _scatter_tier(cap_full, num_seqs),
+        )
+    return _scatter_tier(cap_full, num_seqs)
+
+
+def owned_rows_bound_from_local(
+    local_rows: int, *, num_seqs: int, interleave_size: int
+) -> int:
+    return _align_to(local_rows + 2 * interleave_size * num_seqs, 8)
+
+
+def owned_rows_bound(
+    num_tokens: int, *, num_seqs: int, dcp_size: int, interleave_size: int
+) -> int:
+    """A static upper bound on the rows one DCP rank owns in a step.
+
+    A sequence contributes `L` contiguous positions; rank `r` owns the
+    `interleave_size`-chunks at `r * I` in every `C = dcp_size * I` cycle, of
+    which a window of `L` positions meets at most `floor((L + I - 1) / C) + 1`,
+    each for at most `I` tokens: `<= L / dcp_size + I (I - 1) / C + I
+    <= L / dcp_size + 2 I`. Summed over the `num_seqs` slots (padding tokens
+    belong to none): `<= T / dcp_size + 2 I num_seqs`. Rounded up to 8."""
+    return owned_rows_bound_from_local(
+        -(-num_tokens // dcp_size),
+        num_seqs=num_seqs,
+        interleave_size=interleave_size,
+    )
+
+
+_COMPACT_BLOCK = 256
+
+
+def compact_owned_row_indices(
+    dst_rows: jax.Array,
+    *,
+    num_seqs: int,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    num_tokens = dst_rows.shape[0]
+    cap = owned_rows_bound(
+        num_tokens,
+        num_seqs=num_seqs,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    if cap >= num_tokens:
+        return jnp.arange(num_tokens, dtype=jnp.int32), dst_rows
+    valid = dst_rows >= 0
+    csum = jnp.cumsum(valid.astype(jnp.int32))
+    j = jnp.arange(cap, dtype=jnp.int32)
+    if num_tokens >= 2 * _COMPACT_BLOCK and num_tokens % _COMPACT_BLOCK == 0:
+        num_blocks = num_tokens // _COMPACT_BLOCK
+        csum_2d = csum.reshape(num_blocks, _COMPACT_BLOCK)
+        blk = jnp.sum(
+            (csum_2d[:, _COMPACT_BLOCK - 1][None, :] <= j[:, None]).astype(jnp.int32),
+            axis=1,
+        )
+        blk_clamped = jnp.minimum(blk, num_blocks - 1)
+        in_blk = jnp.sum((csum_2d[blk_clamped] <= j[:, None]).astype(jnp.int32), axis=1)
+        idx = jnp.minimum(blk * _COMPACT_BLOCK + in_blk, num_tokens - 1)
+    else:
+        idx = jnp.sum((csum[None, :] <= j[:, None]).astype(jnp.int32), axis=1)
+        idx = jnp.minimum(idx, num_tokens - 1)
+    keep = j < csum[-1]
+    dst_c = jnp.where(keep, jnp.take(dst_rows, idx), jnp.int32(kv_cache_utils.SKIP_ROW))
+    return idx, dst_c
+
+
+def zigzag_to_rank_major_idx(
+    req_idx: jax.Array,
+    *,
+    num_tokens: int,
+    dcp_size: int,
+    zigzag_bands: int,
+) -> jax.Array:
+    if zigzag_bands <= 1:
+        return req_idx
+    band = num_tokens // (dcp_size * zigzag_bands)
+    block = req_idx // band
+    in_band = req_idx - block * band
+    k = block // dcp_size
+    pos_in_k = block - k * dcp_size
+    r = jnp.where((k & 1) == 1, jnp.int32(dcp_size - 1) - pos_in_k, pos_in_k)
+    return (r * zigzag_bands + k) * band + in_band
+
+
+def compact_owned_rows(
+    src: jax.Array,
+    dst_rows: jax.Array,
+    *,
+    num_seqs: int,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Compact writable rows (`dst_rows >= 0`) to `owned_rows_bound` in order.
+
+    Returns `(src, dst_rows)` unchanged when `owned_rows_bound >= dst_rows.shape[0]`.
+    """
+    if (
+        owned_rows_bound(
+            dst_rows.shape[0],
+            num_seqs=num_seqs,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+        >= dst_rows.shape[0]
+    ):
+        return src, dst_rows
+    idx, dst_c = compact_owned_row_indices(
+        dst_rows,
+        num_seqs=num_seqs,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    return jnp.take(src, idx, axis=0), dst_c
+
+
+def scatter_owned_rows_dcp(
+    cache_kv: jax.Array,
+    k_packed_owned: jax.Array,
+    dst_rows_owned: jax.Array,
+    *,
+    kv_layout: KVLayout | str | None = KVLayout.SEQ_ALONG_LANE,
+    writer: str = "pallas",
+    interpret: bool = False,
+) -> jax.Array:
+    if writer == "pallas":
+        return scatter_rows(
+            cache_kv,
+            k_packed_owned,
+            dst_rows_owned,
+            kv_layout,
+            interpret=interpret,
+        )
+    if writer == "xla":
+        return scatter_rows_reference(
+            cache_kv, k_packed_owned, dst_rows_owned, kv_layout
+        )
+    raise ValueError(f"Expected writer in ('pallas', 'xla'), got {writer!r}.")
+
+
+def coalesced_owned_kv_append_dcp(
+    cache_kv: jax.Array,
+    k_packed_owned: jax.Array,
+    seq_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    dcp_rank: jax.Array | int,
+    *,
+    num_tokens: int,
+    dcp_size: int,
+    interleave_size: int,
+    kv_layout: KVLayout | str | None = KVLayout.SEQ_ALONG_LANE,
+    writer: str = "pallas",
+    interpret: bool = False,
+) -> jax.Array:
+    page_size = cache_page_size(cache_kv, kv_layout)
+    page, slot = kv_cache_utils.get_dcp_page_and_slot(
+        num_tokens,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        dcp_rank,
+        page_size=page_size,
+        num_pages=cache_kv.shape[0],
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    dst_rows = kv_cache_utils.get_dst_rows(page, slot, page_size)
+    _, dst_c = compact_owned_row_indices(
+        dst_rows,
+        num_seqs=seq_lens.shape[0],
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    if dst_c.shape[0] != k_packed_owned.shape[0]:
+        raise ValueError(
+            f"Expected {dst_c.shape[0]} owned K rows, got {k_packed_owned.shape[0]}."
+        )
+    return scatter_owned_rows_dcp(
+        cache_kv,
+        k_packed_owned,
+        dst_c,
+        kv_layout=kv_layout,
+        writer=writer,
         interpret=interpret,
     )
 

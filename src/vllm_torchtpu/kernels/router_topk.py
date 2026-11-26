@@ -100,6 +100,54 @@ def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     return select(scores, topk)
 
 
+def _select_bias_kernel(s_ref, b_ref, w_ref, i_ref, *, topk: int, n: int):
+    s = s_ref[...]
+    x = s + b_ref[...]
+    x = jnp.where(x > NEG, x, NEG)
+    all_neg = jnp.max(x, axis=1, keepdims=True) <= NEG
+    masked = jnp.finfo(x.dtype).min
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
+    for j in range(topk):
+        m = jnp.max(x, axis=1, keepdims=True)
+        idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=1)
+        sel = iota == idx[:, None]
+        w_ref[:, j] = jnp.max(jnp.where(sel, s, -jnp.inf), axis=1)
+        i_ref[:, j] = idx.astype(jnp.int32)
+        x = jnp.where(sel, masked, x)
+    w_ref[...] = jnp.where(all_neg, jnp.nan, w_ref[...])
+
+
+def select_bias(
+    scores: jax.Array, bias: jax.Array, topk: int, interpret: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """Top-k ids of ``scores + bias``; weights are ``scores`` at those ids."""
+    rows, n = scores.shape
+    block = min(MAX_BLOCK_ROWS, rows)
+    return pl.pallas_call(
+        functools.partial(_select_bias_kernel, topk=topk, n=n),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[
+            pl.BlockSpec((block, n), lambda i: (i, 0)),
+            pl.BlockSpec((1, n), lambda i: (0, 0)),
+        ],
+        out_specs=[
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+            pl.BlockSpec((block, topk), lambda i: (i, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((rows, topk), jnp.float32),
+            jax.ShapeDtypeStruct((rows, topk), jnp.int32),
+        ],
+        interpret=interpret,
+    )(scores, bias.reshape(1, n))
+
+
+def router_topk_bias(
+    scores: jax.Array, bias: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array]:
+    return select_bias(scores, bias, topk)
+
+
 def _select_scaled_kernel(x_ref, s_ref, w_ref, i_ref, ws_ref, *, topk: int, n: int):
     x = jnp.where(x_ref[...] > NEG, x_ref[...], NEG)
     masked = jnp.finfo(x.dtype).min

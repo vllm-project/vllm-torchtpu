@@ -93,10 +93,16 @@ class AllReduceSpec:
     h: int
     tile_rows: int  # bf16 sublane tiling
     lanes: int
+    one_shot: bool = False
 
     @property
     def chunk(self) -> int:
         return self.h // self.n
+
+    @property
+    def row_tile_width(self) -> int:
+        """Columns of the one-row path's fold, q1 [tile_rows, h / tile_rows]."""
+        return self.h // self.tile_rows
 
     @property
     def lane_groups(self) -> int:
@@ -110,8 +116,24 @@ class AllReduceSpec:
     def fold(self) -> bool:
         return self.lane_groups >= 2 and self.fold_rows >= 1
 
+    @property
+    def d2d_first(self) -> bool:
+        """Use 1-barrier pair-first + half-world RS/AG on full m>=32 buckets."""
+        return (
+            self.n >= 4
+            and self.n % 2 == 0
+            and self.m >= 32
+            and self.h % 2 == 0
+            and self.chunk % self.lanes == 0
+        )
 
-def make_spec(n: int, m: int, h: int) -> AllReduceSpec:
+
+def one_shot_supported(h: int, info) -> bool:
+    """Whether one row of h columns folds into one row tile of whole lane groups."""
+    return h % (info.get_sublane_tiling(BF16) * info.num_lanes) == 0
+
+
+def make_spec(n: int, m: int, h: int, one_shot: bool = False) -> AllReduceSpec:
     info = pltpu.get_tpu_info()
     if not supported(n, m, h, info):
         raise ValueError(
@@ -119,16 +141,37 @@ def make_spec(n: int, m: int, h: int) -> AllReduceSpec:
             f"multiple of {info.num_lanes} lanes and m a multiple of "
             f"{info.get_sublane_tiling(BF16)} rows"
         )
-    return AllReduceSpec(n, m, h, info.get_sublane_tiling(BF16), info.num_lanes)
+    if one_shot and not one_shot_supported(h, info):
+        raise ValueError(
+            f"the one-row all-reduce path needs h = {h} to be a multiple of "
+            f"{info.get_sublane_tiling(BF16)} x {info.num_lanes}"
+        )
+    return AllReduceSpec(
+        n, m, h, info.get_sublane_tiling(BF16), info.num_lanes, one_shot
+    )
 
 
 def kernel_name(spec: AllReduceSpec) -> str:
-    return f"moe_tp_decode_all_reduce-m_{spec.m}-h_{spec.h}-n_{spec.n}"
+    suffix = "-os" if spec.one_shot else ""
+    return f"moe_tp_decode_all_reduce-m_{spec.m}-h_{spec.h}-n_{spec.n}{suffix}"
 
 
 def _scratch_names(spec: AllReduceSpec) -> tuple[str, ...]:
     fold = ("q",) if spec.fold else ()
-    return ("recv", "red", *fold, "rs_send", "rs_recv", "ag_send", "ag_recv", "loc")
+    one = ("one",) if spec.one_shot else ()
+    d2d = ("d2d_recv", "d2d_sems") if spec.d2d_first else ()
+    return (
+        "recv",
+        "red",
+        *fold,
+        *one,
+        *d2d,
+        "rs_send",
+        "rs_recv",
+        "ag_send",
+        "ag_recv",
+        "loc",
+    )
 
 
 def scratch_shapes(spec: AllReduceSpec) -> list:
@@ -139,10 +182,25 @@ def scratch_shapes(spec: AllReduceSpec) -> list:
         if spec.fold
         else []
     )
+    one = (
+        [pltpu.VMEM((n, spec.tile_rows, spec.row_tile_width), BF16)]
+        if spec.one_shot
+        else []
+    )
+    d2d = (
+        [
+            pltpu.VMEM((m, spec.h // 2), BF16),
+            pltpu.SemaphoreType.DMA((4,)),
+        ]
+        if spec.d2d_first
+        else []
+    )
     return [
         pltpu.VMEM((n, m, w), BF16),
         pltpu.VMEM((m, w), BF16),
         *fold,
+        *one,
+        *d2d,
         *[pltpu.SemaphoreType.DMA((n,)) for _ in range(4)],
         pltpu.SemaphoreType.DMA((2,)),
     ]
@@ -157,6 +215,11 @@ def vmem_bytes(spec: AllReduceSpec, info) -> int:
     if spec.fold:
         block = (spec.tile_rows, h // spec.lane_groups)
         total += t(block, BF16) + (spec.lane_groups + 1) * t(block, F32)
+    if spec.one_shot:
+        block = (spec.tile_rows, spec.row_tile_width)
+        total += t((n, *block), BF16) + 2 * t(block, F32)
+    if spec.d2d_first:
+        total += t((m, h // 2), BF16)
     return total
 
 
@@ -283,6 +346,115 @@ def _exchange(spec, me, buf, rows, cols, s):
         copy.wait_send()
 
 
+def _half_world_rs_ag(spec, pair, bit, buf, rows, col_off, cw, steps, s):
+    """RS + f32 sum + AG over n/2 pair peers at rank `dst_p * 2 + bit`."""
+    n_pairs = spec.n // 2
+
+    def chunk(p_idx):
+        return buf.at[
+            pl.ds(0, rows), pl.ds(pl.multiple_of(col_off + p_idx * cw, cw), cw)
+        ]
+
+    def slot(p_idx):
+        return s["recv"].at[p_idx, pl.ds(0, rows), pl.ds(0, cw)]
+
+    red = s["red"].at[pl.ds(0, rows), pl.ds(0, cw)]
+    own = pltpu.make_async_copy(chunk(pair), slot(pair), s["loc"].at[0])
+    own.start()
+    rs = []
+    for idx, st in enumerate(steps):
+        dst_p = lax.rem(pair + st, n_pairs)
+        cp = pltpu.make_async_remote_copy(
+            chunk(dst_p),
+            slot(pair),
+            s["rs_send"].at[idx],
+            s["rs_recv"].at[pair],
+            device_id=(dst_p * 2 + bit,),
+            device_id_type=_MESH,
+        )
+        cp.start()
+        rs.append(cp)
+    own.wait()
+    for st in steps:
+        src_p = lax.rem(pair + (n_pairs - st), n_pairs)
+        pltpu.make_async_copy(
+            slot(src_p), slot(src_p), s["rs_recv"].at[src_p]
+        ).wait_recv()
+    red[...] = _sum_slots(
+        lambda q: s["recv"][q, pl.ds(0, rows), pl.ds(0, cw)], n_pairs
+    ).astype(red.dtype)
+    own_ag = pltpu.make_async_copy(red, chunk(pair), s["loc"].at[1])
+    own_ag.start()
+    ag = []
+    for idx, st in enumerate(steps):
+        dst_p = lax.rem(pair + st, n_pairs)
+        cp = pltpu.make_async_remote_copy(
+            red,
+            chunk(pair),
+            s["ag_send"].at[idx],
+            s["ag_recv"].at[pair],
+            device_id=(dst_p * 2 + bit,),
+            device_id_type=_MESH,
+        )
+        cp.start()
+        ag.append(cp)
+    own_ag.wait()
+    for st in steps:
+        src_p = lax.rem(pair + (n_pairs - st), n_pairs)
+        pltpu.make_async_copy(
+            chunk(src_p), chunk(src_p), s["ag_recv"].at[src_p]
+        ).wait_recv()
+    return rs, ag
+
+
+def _exchange_d2d_first(spec, me, buf, rows, s):
+    """1-barrier pair-first RS + half-world RS/AG + pair AG over [rows, h]."""
+    half_h = spec.h // 2
+    n_pairs = spec.n // 2
+    cw = half_h // n_pairs
+    bit = lax.bitwise_and(me, jnp.int32(1))
+    pair = lax.shift_right_logical(me, jnp.int32(1))
+    partner = lax.bitwise_xor(me, jnp.int32(1))
+    my_off = bit * half_h
+    peer_off = (1 - bit) * half_h
+    my_slice = buf.at[pl.ds(0, rows), pl.ds(pl.multiple_of(my_off, half_h), half_h)]
+    peer_slice = buf.at[pl.ds(0, rows), pl.ds(pl.multiple_of(peer_off, half_h), half_h)]
+    d2d_buf = s["d2d_recv"].at[pl.ds(0, rows), pl.ds(0, half_h)]
+    d2d_sems = s["d2d_sems"]
+
+    pair_rs = pltpu.make_async_remote_copy(
+        peer_slice,
+        d2d_buf,
+        d2d_sems.at[0],
+        d2d_sems.at[1],
+        device_id=(partner,),
+        device_id_type=_MESH,
+    )
+    pair_rs.start()
+    pltpu.make_async_copy(d2d_buf, d2d_buf, d2d_sems.at[1]).wait_recv()
+    my_slice[...] = (my_slice[...].astype(F32) + d2d_buf[...].astype(F32)).astype(
+        my_slice.dtype
+    )
+
+    steps = tuple(range(1, n_pairs))
+    rs, ag = _half_world_rs_ag(spec, pair, bit, buf, rows, my_off, cw, steps, s)
+
+    pair_rs.wait_send()
+    pair_ag = pltpu.make_async_remote_copy(
+        my_slice,
+        my_slice,
+        d2d_sems.at[2],
+        d2d_sems.at[3],
+        device_id=(partner,),
+        device_id_type=_MESH,
+    )
+    pair_ag.start()
+    pltpu.make_async_copy(peer_slice, peer_slice, d2d_sems.at[3]).wait_recv()
+    pair_ag.wait_send()
+    for copy in (*rs, *ag):
+        copy.wait_send()
+
+
 def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier):
     """One row path (fold / trim / full): stage, barrier wait, exchange."""
     m, h, tr = spec.m, spec.h, spec.tile_rows
@@ -295,9 +467,38 @@ def _run_path(spec, kind, me, nv, partial, out_ref, s, barrier):
         _stage_rows(out_ref, partial, nv)
         buf = out_ref if rows == m else out_ref.at[pl.ds(0, rows)]
     pl.semaphore_wait(barrier, spec.n)
-    _exchange(spec, me, buf, rows, cols, s)
+    if kind == "full" and spec.d2d_first:
+        _exchange_d2d_first(spec, me, buf, rows, s)
+    else:
+        _exchange(spec, me, buf, rows, cols, s)
     if kind == "fold":
         _unfold(spec, s["q"][...].astype(F32), nv, out_ref)
+
+
+def _one_row_path(spec, me, partial, out_ref, s, barrier):
+    n, m, tr, w = spec.n, spec.m, spec.tile_rows, spec.row_tile_width
+    slots = s["one"]
+    p0 = partial[0:1].astype(BF16).astype(F32)
+    rows = lax.broadcasted_iota(jnp.int32, (tr, w), 0)
+    q1 = jnp.zeros((tr, w), F32)
+    for j in range(tr):
+        part = jnp.broadcast_to(p0[:, j * w : (j + 1) * w], (tr, w))
+        q1 = jnp.where(rows == j, part, q1)
+    slots.at[me][...] = q1.astype(BF16)
+    pl.semaphore_wait(barrier, n)
+
+    def slot(q):
+        return slots.at[q]
+
+    sends = _send_all(spec, me, lambda t: slot(me), slot, s["rs_send"], s["rs_recv"])
+    _recv_all(spec, me, slot, s["rs_recv"])
+    total = _sum_slots(lambda q: slots[q], n).astype(BF16).astype(F32)
+    first = lax.broadcasted_iota(jnp.int32, (m, w), 0) == 0
+    for j in range(tr):
+        part = jnp.broadcast_to(total[j : j + 1, :], (m, w))
+        out_ref[:, pl.ds(j * w, w)] = jnp.where(first, part, 0.0).astype(out_ref.dtype)
+    for copy in sends:
+        copy.wait_send()
 
 
 def prologue(spec: AllReduceSpec) -> None:
@@ -338,9 +539,16 @@ def epilogue(spec: AllReduceSpec, rank, n_valid, partial, out_ref, scr) -> None:
         pl.semaphore_wait(barrier, spec.n)
 
     lo = 0
-    if spec.fold:
+    if spec.one_shot:
 
-        @pl.when((nv > 0) & (nv <= spec.fold_rows))
+        @pl.when(nv == 1)
+        def _one_path():
+            _one_row_path(spec, rank, partial, out_ref, s, barrier)
+
+        lo = 1
+    if spec.fold and spec.fold_rows > lo:
+
+        @pl.when((nv > lo) & (nv <= spec.fold_rows))
         def _fold_path():
             _run_path(spec, "fold", rank, nv, partial, out_ref, s, barrier)
 
@@ -416,7 +624,9 @@ def selftest_inputs(spec: AllReduceSpec) -> np.ndarray:
 def selftest_row_counts(spec: AllReduceSpec) -> list[int]:
     """One n_valid per row path: full, fold, trim (where they exist), zero."""
     counts = [spec.m]
-    if spec.fold:
+    if spec.one_shot:
+        counts.append(1)
+    if spec.fold and spec.fold_rows > int(spec.one_shot):
         counts.append(spec.fold_rows)
     if spec.tile_rows < spec.m:
         counts.append(spec.tile_rows)

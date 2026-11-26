@@ -13,13 +13,26 @@
 # limitations under the License.
 """Byte-exact TPU test for the combined native-SC gather."""
 
+import contextlib
+import re
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from absl.testing import absltest
+from jax import export
+from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.mla.sparse import native_sc_cache_layout, native_sc_gather
+from vllm_torchtpu.kernels.mla.sparse import (
+    kernel as sparse_mla_kernel,
+)
+from vllm_torchtpu.kernels.mla.sparse import (
+    native_sc_cache_layout,
+    native_sc_gather,
+)
 
 
 @pytest.mark.tpu_test
@@ -247,6 +260,257 @@ class NativeScGatherCpuTest(absltest.TestCase):
                     idx,
                     out_size=16 * 64,
                 )
+
+    def test_should_match_wide_atom_gather_for_linear_and_packed_modes(self):
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("native-SC gather requires a TPU SparseCore")
+        pages, page_size = 32, 256
+        rng = np.random.default_rng(20261118)
+        nope_u8 = rng.integers(0, 256, (pages, page_size, 4, 128), np.uint8)
+        rope_u8 = rng.integers(0, 0x7E, (pages, page_size // 4, 4, 128), np.uint8)
+        rope_u8[..., 64:] = 0
+        nope_i32 = jnp.asarray(native_sc_cache_layout.pack_nope(nope_u8))
+        rope_padded = jnp.asarray(native_sc_cache_layout.pack_rope_banded(rope_u8))
+        flat_rope_u8 = rope_u8.reshape(-1, 128)
+        rope_packed = jnp.asarray(
+            native_sc_cache_layout.pack_rope_packed(
+                flat_rope_u8[:, :64].reshape(pages, page_size, 64)
+            )
+        )
+        flat_nope = native_sc_cache_layout.flatten_nope_rows(
+            native_sc_cache_layout.pack_nope(nope_u8)
+        )
+
+        cases = [
+            (64, 2048, 16, True, True, None),
+            (64, 2048, 16, True, False, None),
+            (64, 2048, 16, False, True, 48 * 2048),
+            (16, 512, 2, True, True, 12 * 512),
+        ]
+        for rows, topk, apb, packed, linear, num_live in cases:
+            with self.subTest(
+                rows=rows,
+                topk=topk,
+                apb=apb,
+                packed=packed,
+                linear=linear,
+                num_live=num_live,
+            ):
+                count = rows * topk
+                flat_indices = rng.integers(0, pages * page_size, count, np.int32)
+                idx = jnp.asarray(flat_indices.reshape(rows, topk))
+                kwargs = {}
+                if num_live is not None:
+                    kwargs["num_live_indices"] = jnp.int32(num_live)
+                got_nope, got_rope = jax.block_until_ready(
+                    native_sc_gather.dsa_gather_native_sc(
+                        nope_i32,
+                        rope_packed if packed else rope_padded,
+                        idx,
+                        out_size=count,
+                        atoms_per_batch=apb,
+                        packed_rope=packed,
+                        linear_indices=linear,
+                        **kwargs,
+                    )
+                )
+                live_n = count if num_live is None else num_live
+                np.testing.assert_array_equal(
+                    np.asarray(got_nope)[:live_n], flat_nope[flat_indices[:live_n]]
+                )
+                expected_rope = native_sc_cache_layout.pack_selected_rope_for_tc(
+                    flat_rope_u8[flat_indices]
+                )
+                groups = live_n // native_sc_gather.ROPE_PACKING
+                np.testing.assert_array_equal(
+                    np.asarray(got_rope)[:groups], expected_rope[:groups]
+                )
+
+    def test_should_select_wide_atom_factor_only_for_pipelined_overlap_batches(self):
+        self.assertEqual(
+            native_sc_gather._wide_atom_factor(  # noqa: SLF001 -- geometry helper
+                16,
+                wait_mode="overlap_rope",
+                serve_pipelined=True,
+                is_dcp_mode=False,
+                has_row_live_atoms=False,
+            ),
+            4,
+        )
+        self.assertEqual(
+            native_sc_gather._wide_atom_factor(  # noqa: SLF001 -- geometry helper
+                2,
+                wait_mode="overlap_rope",
+                serve_pipelined=True,
+                is_dcp_mode=False,
+                has_row_live_atoms=False,
+            ),
+            2,
+        )
+        self.assertEqual(
+            native_sc_gather._wide_atom_factor(  # noqa: SLF001 -- geometry helper
+                16,
+                wait_mode="overlap_rope",
+                serve_pipelined=True,
+                is_dcp_mode=True,
+                has_row_live_atoms=False,
+            ),
+            1,
+        )
+
+    def test_should_reject_compact_rope_when_packed_rope_is_disabled(self):
+        nope = jnp.zeros((2, 64, 128), dtype=jnp.uint32)
+        rope = jnp.zeros((2, 16, 128), dtype=jnp.uint32)
+        idx = jnp.zeros((32, 64), dtype=jnp.int32)
+        with self.assertRaisesRegex(ValueError, "compact_rope requires packed_rope"):
+            native_sc_gather.dsa_gather_native_sc(
+                nope,
+                rope,
+                idx,
+                out_size=32 * 64,
+                atoms_per_batch=1,
+                packed_rope=False,
+                compact_rope=True,
+            )
+
+    def test_should_match_padded_rope_when_compact_rope_packs_eight_tokens_per_row(
+        self,
+    ):
+        if jax.default_backend() != "tpu":
+            self.skipTest("Native SC compact rope gather runs on TPU")
+        rng = np.random.default_rng(1802)
+        pages, page_size = 8, 256
+        nope_i32 = jnp.asarray(
+            rng.integers(0, 2**32 - 1, (pages, page_size, 128), dtype=np.uint32)
+        )
+        rope_raw = rng.integers(0, 256, (pages, page_size, 64), dtype=np.uint8)
+        rope_packed = jnp.asarray(native_sc_cache_layout.pack_rope_packed(rope_raw))
+        flat_nope = np.asarray(nope_i32).reshape(-1, 128)
+        flat_rope_u8 = np.pad(rope_raw.reshape(-1, 64), ((0, 0), (0, 64)))
+
+        cases = [
+            (32, 64, 1, False, None),
+            (16, 512, 2, True, 12 * 512),
+            (64, 2048, 16, True, None),
+            (64, 2048, 16, False, 48 * 2048),
+        ]
+        for rows, topk, apb, linear, num_live in cases:
+            with self.subTest(rows=rows, topk=topk, apb=apb, linear=linear):
+                count = rows * topk
+                flat_indices = rng.integers(0, pages * page_size, count, np.int32)
+                idx = jnp.asarray(flat_indices.reshape(rows, topk))
+                kwargs = {}
+                if num_live is not None:
+                    kwargs["num_live_indices"] = jnp.int32(num_live)
+                got_nope, got_rope = jax.block_until_ready(
+                    native_sc_gather.dsa_gather_native_sc(
+                        nope_i32,
+                        rope_packed,
+                        idx,
+                        out_size=count,
+                        atoms_per_batch=apb,
+                        packed_rope=True,
+                        compact_rope=True,
+                        linear_indices=linear,
+                        **kwargs,
+                    )
+                )
+                live_n = count if num_live is None else num_live
+                np.testing.assert_array_equal(
+                    np.asarray(got_nope)[:live_n], flat_nope[flat_indices[:live_n]]
+                )
+                got_r = np.asarray(got_rope)
+                self.assertEqual(
+                    got_r.shape,
+                    (count // native_sc_gather.COMPACT_ROPE_PACKING, 128),
+                )
+                n_atoms = count // native_sc_gather.OCCURRENCES_PER_ATOM
+                expanded = np.zeros(
+                    (count // native_sc_gather.ROPE_PACKING, 128), dtype=np.uint32
+                )
+                for a in range(n_atoms):
+                    src = got_r[a * 8 : (a + 1) * 8]
+                    expanded[a * 16 : a * 16 + 8, :64] = src[:, :64]
+                    expanded[a * 16 + 8 : a * 16 + 16, :64] = src[:, 64:]
+                expected_rope = native_sc_cache_layout.pack_selected_rope_for_tc(
+                    flat_rope_u8[flat_indices]
+                )
+                groups = live_n // native_sc_gather.ROPE_PACKING
+                np.testing.assert_array_equal(expanded[:groups], expected_rope[:groups])
+
+    def test_should_export_compact_rope_attention_with_16_lane_indirect_dmas(self):
+        fake_sc = SimpleNamespace(num_cores=2, num_subcores=16, num_lanes=16)
+        fake_info = SimpleNamespace(
+            sparse_core=fake_sc,
+            num_sublanes=8,
+            num_lanes=128,
+            vmem_capacity_bytes=64 * 1024 * 1024,
+            generation=7,
+            get_sublane_tiling=lambda dtype: 32 // jnp.dtype(dtype).itemsize,
+        )
+        specs = (
+            jax.ShapeDtypeStruct((64, 64, 512), jnp.bfloat16),
+            jax.ShapeDtypeStruct((64, 64, 64), jnp.bfloat16),
+            jax.ShapeDtypeStruct((16, 256, 128), jnp.uint32),
+            jax.ShapeDtypeStruct((16, 32, 128), jnp.uint32),
+            jax.ShapeDtypeStruct((64, 2048), jnp.int32),
+            jax.ShapeDtypeStruct((2,), jnp.int32),
+            jax.ShapeDtypeStruct((3,), jnp.int32),
+        )
+
+        def _run_attn(qn, qp, kn, kr, idx, qsl, dist):
+            return sparse_mla_kernel.sparse_ragged_paged_attention(
+                qn,
+                kn,
+                kr,
+                idx,
+                None,
+                qsl,
+                dist,
+                k_scale=1.0,
+                sm_scale=0.1,
+                cache_layout=sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT,
+                packed_rope=True,
+                q_pe=qp,
+                gather_and_attention_chunk_size=64,
+                attention_kernel_batch_size=16,
+                mixed_body_levers=sparse_mla_kernel.MIXED_BODY_DEFAULT,
+            )
+
+        ctx = contextlib.ExitStack()
+        if jax.default_backend() != "tpu":
+            ctx.enter_context(
+                patch.object(pltpu, "get_tpu_info", return_value=fake_info)
+            )
+            ctx.enter_context(
+                patch(
+                    "jax._src.pallas.mosaic.tpu_info.get_tpu_info",
+                    return_value=fake_info,
+                )
+            )
+            ctx.enter_context(
+                patch(
+                    "jax._src.tpu_info.get_tpu_info",
+                    return_value=fake_info,
+                )
+            )
+        with ctx:
+            sparse_mla_kernel.sparse_ragged_paged_attention.clear_cache()
+            native_sc_gather.dsa_gather_native_sc.clear_cache()
+            if jax.default_backend() == "tpu":
+                mlir = export.export(jax.jit(_run_attn), platforms=("tpu",))(
+                    *specs
+                ).mlir_module()
+                self.assertIn("_rw16_", mlir)
+                self.assertIn("_compactrope_w4", mlir)
+                bad_widths = re.findall(
+                    r"enqueue_indirect_dma[^\n]*vector<(?!16x)\d+xi32>", mlir
+                )
+                self.assertEqual(bad_widths, [])
+            else:
+                jaxpr_text = str(jax.make_jaxpr(_run_attn)(*specs))
+                self.assertIn("_rw16_", jaxpr_text)
+                self.assertIn("_compactrope_w4", jaxpr_text)
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ combine reduce-scatter."""
 
 import functools
 import threading
-from typing import cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -65,6 +65,7 @@ FP4_OUTPUT_CHUNK = 256
 # top rung is always tile_m, so a full tile is unchanged. Overridable per
 # process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
 HEIGHT_RUNGS = 4
+CHUNK_PUSH_TILES = 4
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -139,7 +140,7 @@ def _apply_act(gate, up, act_fn):
     )
 
 
-def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
+def tile_height_rungs(tile_m, rows_alloc, g_local, ep, *, ep_tp_size=1):
     """The ascending static tile heights a build emits, ending at tile_m.
 
     Equally spaced so that a tail tile's rounding-up waste is bounded by one
@@ -162,10 +163,42 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
         rungs < 2
         or step % ROWBLK
         or step * rungs != tile_m
-        or rows_alloc > ep * g_local * tile_m
+        or (ep_tp_size <= 1 and rows_alloc > ep * g_local * tile_m)
     ):
         return (tile_m,)
     return tuple(range(step, tile_m + 1, step))
+
+
+def rotated_push_peer(me: jax.Array, ep: int, step_idx: int) -> jax.Array:
+    if ep >= 8 and (ep & (ep - 1)) == 0:
+        # Avoid fixed 0..ep-1 lockstep order: all ranks would target peer 0 first
+        # and leave half of cross-host links idle during the first ep // 2 sends.
+        return jnp.bitwise_xor(me, jnp.int32((ep // 2) ^ step_idx))
+    return jnp.int32(step_idx)
+
+
+def slice_run_true_rows(
+    run_start_blocks: jax.Array,
+    run_len_blocks: jax.Array,
+    true_rows: jax.Array,
+    lo_blocks: jax.Array,
+    hi_blocks: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    lo = jnp.maximum(run_start_blocks, lo_blocks)
+    hi = jnp.minimum(run_start_blocks + run_len_blocks, hi_blocks)
+    overlap_blocks = jnp.maximum(hi - lo, 0)
+    lo_clamped = jnp.minimum(lo, hi)
+    into_run_rows = (lo_clamped - run_start_blocks) * ROWBLK
+    true_rows_in_slice = jnp.clip(true_rows - into_run_rows, 0, overlap_blocks * ROWBLK)
+    return into_run_rows, true_rows_in_slice
+
+
+def tail_chunk_start_blocks(
+    rows: jax.Array, tile_m: int, chunk_tiles: int, tile_blocks: int
+) -> jax.Array:
+    n_tiles = -(-rows // tile_m)
+    n_interior_chunks = jnp.maximum(-(-n_tiles // chunk_tiles) - 1, 0)
+    return n_interior_chunks * chunk_tiles * tile_blocks
 
 
 def _row_scale(amax):
@@ -266,8 +299,12 @@ def _intermediate_rows(acc1, act_scale, inter, *, w1s, act_fn, w1b, requantize=T
     """
 
     def half(lo, hi):
-        """One post-scale half of the accumulator, columns [lo, hi)."""
-        scaled = acc1[:, lo:hi]
+        """One post-scale half of the accumulator, columns [lo, hi).
+
+        acc1 is either the [m, 2 * inter] accumulator or a callable handing
+        back its columns [lo, hi) from wherever they are held (the TP-pair
+        layout keeps them in two halves)."""
+        scaled = acc1(lo, hi) if callable(acc1) else acc1[:, lo:hi]
         if act_scale is not None:
             scaled = scaled * act_scale
         if w1s is not None:
@@ -322,20 +359,206 @@ def _chunked_dot(lhs, rhs_chunk, n_chunks, kb):
     return acc
 
 
-def expert_ffn_fp8(act_q, act_scale, w1, w2, w1s, act_fn="silu", w1b=None):
-    """One expert's FFN on eight-bit weights: the gate/up matmul, the
-    activation, the intermediate requantization and the down matmul.
+def _expert_gate_up_fp8(
+    act_q,
+    act_scale,
+    w1,
+    w1s,
+    *,
+    act_fn="silu",
+    w1b=None,
+    wait_w1=None,
+    retire_w1=None,
+    ep_tp_size=1,
+):
+    if wait_w1 is not None:
+        wait_w1()
+    if isinstance(w1, tuple):
+        # The TP-pair layout: the gate/up slab arrives as two contiguous
+        # [k, 2 * i_slice] halves ([gate | up] each), own half first. The
+        # two matmuls accumulate into two [m, 2 * i_slice] halves and the
+        # activation reads its chunks straight out of them in the logical
+        # [gate(inter) | up(inter)] order, position-major within each, so
+        # no [m, 4 * i_slice] concatenation is ever materialized.
+        w1_own, w1_peer = (w() if callable(w) else w for w in w1)
+        i_slice = w1_own.shape[-1] // 2
+        inter = i_slice * ep_tp_size
+        acc_own = lax.dot_general(act_q, w1_own, DN, preferred_element_type=jnp.float32)
+        # Avoid stalling local w1_own refill behind peer dot/down/tp_barrier.
+        if retire_w1 is not None:
+            retire_w1()
+        acc_halves = (
+            acc_own,
+            lax.dot_general(act_q, w1_peer, DN, preferred_element_type=jnp.float32),
+        )
+
+        def acc1(lo, hi):
+            half, lo_j = divmod(lo, inter)
+            assert (hi - 1) // inter == half, (lo, hi, inter)
+            hi_j = hi - half * inter
+            pieces = []
+            for pos in range(ep_tp_size):
+                p_lo = max(lo_j, pos * i_slice) - pos * i_slice
+                p_hi = min(hi_j, (pos + 1) * i_slice) - pos * i_slice
+                if p_hi > p_lo:
+                    start = half * i_slice + p_lo
+                    pieces.append(acc_halves[pos][:, start : start + (p_hi - p_lo)])
+            return pieces[0] if len(pieces) == 1 else jnp.concatenate(pieces, axis=-1)
+
+    else:
+        w1_arr = w1() if callable(w1) else w1
+        inter = w1_arr.shape[-1] // 2
+        acc1 = lax.dot_general(act_q, w1_arr, DN, preferred_element_type=jnp.float32)
+        if retire_w1 is not None:
+            retire_w1()
+    mid_q, mid_scale = _intermediate_rows(
+        acc1, act_scale, inter, w1s=w1s, act_fn=act_fn, w1b=w1b
+    )
+    return mid_q, mid_scale, inter
+
+
+def expert_ffn_fp8_tp_chunked_wire(
+    act_q,
+    act_scale,
+    w1,
+    w2_own_slice,
+    w2_peer_slice,
+    w1s,
+    tp_w2s_slice,
+    *,
+    hidden: int,
+    down_chunk: int,
+    act_fn="silu",
+    wait_w1=None,
+    retire_w1=None,
+    wait_w2=None,
+    retire_w2=None,
+    ep_tp_size=2,
+):
+    """Contract TP-pair FP8 expert FFN in `down_chunk` output slices into FP8 wire.
+
+    Assumes `hidden % down_chunk == 0`, `ep_tp_size == 2`, and zero biases.
+    """
+    mid_q, mid_scale, inter = _expert_gate_up_fp8(
+        act_q,
+        act_scale,
+        w1,
+        w1s,
+        act_fn=act_fn,
+        w1b=None,
+        wait_w1=wait_w1,
+        retire_w1=retire_w1,
+        ep_tp_size=ep_tp_size,
+    )
+    assert mid_scale is not None
+    i_slice = inter // ep_tp_size
+    mid_q_own = mid_q[:, :i_slice]
+    mid_q_peer = mid_q[:, i_slice : 2 * i_slice]
+    if wait_w2 is not None:
+        wait_w2()
+    # Avoid scf.for over down_chunk: static unroll preserves MXU/VPU overlap
+    # while bounding live f32 down accumulators to [m, down_chunk].
+    dn_chunks = []
+    amax_dn = None
+    for c0 in range(0, hidden, down_chunk):
+        part0 = lax.dot_general(
+            mid_q_own,
+            w2_own_slice(c0, down_chunk),
+            DN,
+            preferred_element_type=jnp.float32,
+        ) * tp_w2s_slice(0, c0, down_chunk)
+        if c0 + down_chunk == hidden and retire_w2 is not None:
+            retire_w2()
+        part1 = lax.dot_general(
+            mid_q_peer,
+            w2_peer_slice(c0, down_chunk),
+            DN,
+            preferred_element_type=jnp.float32,
+        ) * tp_w2s_slice(1, c0, down_chunk)
+        chunk_bf16 = ((part0 + part1) * mid_scale).astype(jnp.bfloat16)
+        dn_chunks.append(chunk_bf16)
+        chunk_amax = _absmax_rows(chunk_bf16)
+        amax_dn = chunk_amax if amax_dn is None else jnp.maximum(amax_dn, chunk_amax)
+    wire_scales, dn_sinv, dn_usable = _row_scale(amax_dn)
+    dn_sinv_bf16 = dn_sinv.astype(jnp.bfloat16)
+    wire_rows = jnp.concatenate(
+        [_quant_apply(chk, dn_sinv_bf16, dn_usable) for chk in dn_chunks],
+        axis=-1,
+    )
+    return wire_rows, wire_scales
+
+
+def expert_ffn_fp8(
+    act_q,
+    act_scale,
+    w1,
+    w2,
+    w1s,
+    act_fn="silu",
+    w1b=None,
+    wait_w1=None,
+    retire_w1=None,
+    wait_w2=None,
+    retire_w2=None,
+    tp_w2s=None,
+    ep_tp_size=1,
+):
+    """Contract one FP8 expert FFN into unscaled down accumulator and mid scale.
 
     act_q fp8 [m, k] and act_scale f32 [m, 1] are the row-quantized
     activation rows. Returns the down matmul's accumulator and the
     intermediate row scale the caller still has to apply to it.
     """
-    inter = w1.shape[-1] // 2
-    acc1 = lax.dot_general(act_q, w1, DN, preferred_element_type=jnp.float32)
-    mid_q, mid_scale = _intermediate_rows(
-        acc1, act_scale, inter, w1s=w1s, act_fn=act_fn, w1b=w1b
+    mid_q, mid_scale, inter = _expert_gate_up_fp8(
+        act_q,
+        act_scale,
+        w1,
+        w1s,
+        act_fn=act_fn,
+        w1b=w1b,
+        wait_w1=wait_w1,
+        retire_w1=retire_w1,
+        ep_tp_size=ep_tp_size,
     )
-    acc2 = lax.dot_general(mid_q, w2, DN, preferred_element_type=jnp.float32)
+    if wait_w2 is not None:
+        wait_w2()
+    if isinstance(w2, tuple):
+        w2_own, w2_peer = (w() if callable(w) else w for w in w2)
+        i_slice = inter // ep_tp_size
+        part0 = lax.dot_general(
+            mid_q[:, 0:i_slice], w2_own, DN, preferred_element_type=jnp.float32
+        )
+        # Avoid stalling local w2_own refill behind peer w2 dot and tp_barrier.
+        if retire_w2 is not None:
+            retire_w2()
+        part1 = lax.dot_general(
+            mid_q[:, i_slice : 2 * i_slice],
+            w2_peer,
+            DN,
+            preferred_element_type=jnp.float32,
+        )
+        if tp_w2s is None:
+            acc2 = part0 + part1
+        else:
+            acc2 = part0 * tp_w2s(0) + part1 * tp_w2s(1)
+    else:
+        w2_arr = w2() if callable(w2) else w2
+        if tp_w2s is None:
+            acc2 = lax.dot_general(
+                mid_q, w2_arr, DN, preferred_element_type=jnp.float32
+            )
+        else:
+            i_slice = inter // ep_tp_size
+            acc2 = None
+            for m in range(ep_tp_size):
+                part = lax.dot_general(
+                    mid_q[:, m * i_slice : (m + 1) * i_slice],
+                    w2_arr[m * i_slice : (m + 1) * i_slice, :],
+                    DN,
+                    preferred_element_type=jnp.float32,
+                )
+                part = part * tp_w2s(m)
+                acc2 = part if acc2 is None else acc2 + part
     return acc2, mid_scale
 
 
@@ -534,18 +757,47 @@ def _build_fused_ep_moe_kernel(
     act_fn="silu",
     has_w1_bias=False,
     has_w2_bias=False,
+    wire_dtype=None,
+    ep_tp_size=1,
+    ep_tp_z_clone=False,
 ):
-    """Build the pallas_call and the function that invokes it."""
+    """Build the pallas_call and the function that invokes it.
+
+    `wire_dtype` overrides the format's result wire (`host.weight_form`)."""
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
         )
+    ep_tp_size = int(ep_tp_size)
+    ep_tp_z_clone = bool(ep_tp_z_clone)
+    if ep_tp_z_clone and (
+        ep_tp_size != 2
+        or weight_format != host.WeightFormat.FP8
+        or has_w1_bias
+        or has_w2_bias
+    ):
+        raise ValueError(
+            "ep_tp_z_clone requires ep_tp_size=2, FP8 weights, and no expert biases"
+        )
+    if ep_tp_size < 1 or ep % ep_tp_size:
+        raise ValueError(f"ep={ep} must be divisible by ep_tp_size={ep_tp_size}")
+    inter_slice = inter // ep_tp_size
+    if ep_tp_size > 1:
+        if weight_format != host.WeightFormat.FP8:
+            raise NotImplementedError(
+                f"ep_tp_size > 1 supports FP8 weights only; got {weight_format!r}"
+            )
+        if inter % ep_tp_size or inter_slice % HIDDEN_LANE_BLOCK:
+            raise ValueError(
+                f"inter={inter} / ep_tp_size={ep_tp_size} must be a whole "
+                f"number of {HIDDEN_LANE_BLOCK}-lane blocks"
+            )
     # The kernel fetches lhs rows by index from the ungathered token buffer
     # [tokens, lane blocks, 128], using the token-gather table, and ships
     # results over an all-to-all carrying unweighted rows; it returns
     # (arrival rows, arrival scales f32). The element type of the staging and
     # of the wire is the weight format's, not a literal here.
-    form = host.weight_form(weight_format)
+    form = host.weight_form(weight_format, wire_dtype)
     rhs_packed4 = weight_format == host.WeightFormat.FP4
     # The weight prefetch distance and the slot count it needs are chosen
     # below, once the shapes they are sized against have been checked: they
@@ -639,13 +891,78 @@ def _build_fused_ep_moe_kernel(
         capacity,
         hidden,
         inter,
+        max_distance=0 if ep_tp_size > 1 else host.MAX_WEIGHT_PREFETCH_DISTANCE,
         weight_format=weight_format,
         rhs_qb=rhs_qb,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        wire_dtype=wire_dtype,
     )
-    prefetch_distance = slots.distance
-    nbuf = slots.nbuf
+    prefetch_distance = 0 if ep_tp_size > 1 else slots.distance
+    nbuf = 1 if ep_tp_size > 1 else slots.nbuf
+    # The TP-pair schedule (ep_tp_size == 2). Each core of the pair holds its
+    # I-slice of every expert in the group and the pair splits the group's
+    # visit list between them: a core computes its own expert on the full I
+    # by receiving the peer's half of the expert's gate/up and down slabs
+    # over the intra-chip link, pushed by the peer out of the peer's HBM.
+    #
+    # Weight VMEM in the TP-pair schedule allocates TWO slots for both the
+    # local gate/up half (`w1_vm`) and the peer's gate/up half (`tp_w1p_vm`)
+    # whenever two local slots fit inside the VMEM budget (e.g. 5120x1536 has
+    # 7.5 MiB per local [gate|up] slot, 49.3 MiB total << 62.7 MiB), so both
+    # halves prefetch a full visit ahead with zero write-while-read hazard.
+    # Only if two local slots exceed the VMEM budget (e.g. 6144x2048 at
+    # capacity=128) does `w1_vm` step down to one slot and refill after the
+    # pair barrier in `tp_after_visit`.
+    tp_scl_slots = 2 if ep_tp_size > 1 else 0
+    tp_w1p_slots = 2 if ep_tp_size > 1 else 0
+    tp_w1_slots = 0
+    tp_w2p_slots = 0
+    tp_down_chunk = host.resolve_tp_down_chunk(
+        hidden,
+        ep_tp_size=ep_tp_size,
+        weight_format=weight_format,
+        has_w1_bias=has_w1_bias,
+        has_w2_bias=has_w2_bias,
+        wire_dtype=wire_dtype,
+    )
+    if ep_tp_size > 1:
+        if ep_tp_size != 2:
+            raise NotImplementedError(
+                "the fused EP MoE TP-pair schedule takes ep_tp_size=2; "
+                f"got {ep_tp_size}"
+            )
+        # Prefer 2-slot peer down buffer (tp_w2p_slots=2) so peer w2 D2D pushes
+        # hide a full visit ahead alongside tp_w1p_vm instead of stalling after
+        # tp_barrier; step down local w1 first (already overlapped via retire_w1).
+        tp_vmem = slots.limit + 1
+        for cand_w1, cand_w2p in ((2, 2), (1, 2), (1, 1)):
+            cand_vmem = host.tp_pair_vmem_bytes(
+                g_local,
+                capacity,
+                hidden,
+                inter,
+                tp_w1_slots=cand_w1,
+                tp_w1p_slots=tp_w1p_slots,
+                tp_w2p_slots=cand_w2p,
+                tp_scl_slots=tp_scl_slots,
+                ep_tp_size=ep_tp_size,
+                weight_format=weight_format,
+                rhs_qb=rhs_qb,
+                has_w1_bias=has_w1_bias,
+                has_w2_bias=has_w2_bias,
+                wire_dtype=wire_dtype,
+                down_chunk=tp_down_chunk,
+            )
+            tp_w1_slots, tp_w2p_slots, tp_vmem = cand_w1, cand_w2p, cand_vmem
+            if cand_vmem <= slots.limit:
+                break
+        if tp_vmem > slots.limit:
+            raise ValueError(
+                f"the TP-pair schedule needs {tp_vmem / 2**20:.1f}MiB of VMEM, "
+                f"over the {slots.limit / 2**20:.1f}MiB budget, for experts of "
+                f"{hidden}x{inter} at capacity={capacity}"
+            )
     # The relation the whole schedule rests on: a refill writes its slot
     # while the readers of `distance` earlier experts are still live, so
     # distance + 1 consecutive experts have to occupy distinct slots. This
@@ -663,10 +980,7 @@ def _build_fused_ep_moe_kernel(
 
     # Whether each expert's weights are waited by the block that first reads
     # it rather than waiting at the beginning of each expert's visit.
-    # fp4, fp8 expert FFN are running different code paths. This flag can
-    # be activated only for fp4 expert FFN now. But the idea should be
-    # applicable to fp8 expert FFN as well.
-    streams_weights = rhs_packed4
+    streams_weights = rhs_packed4 or weight_format == host.WeightFormat.FP8
     # Whether issue async copy the NEXT expert's weights as soon as we finish
     # reading the current expert's weights, instead of at the beginning of the
     # next expert's visit.
@@ -675,7 +989,7 @@ def _build_fused_ep_moe_kernel(
     # reader has just finished with: for example gate/up is dead from the
     # last gate/up block of an expert's last tile, which is overlapped with
     # a whole down matmul plus an epilogue.
-    starts_next_weights = streams_weights and not prefetches
+    starts_next_weights = streams_weights and not prefetches and ep_tp_size == 1
     if rhs_packed4:
         # Asked here, beside the other device reads, because the packed
         # four-bit layout is the one place a written-down device fact and a
@@ -733,7 +1047,9 @@ def _build_fused_ep_moe_kernel(
     # kernel converts between them with a shift.
     tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
     tile_shift = host.pow2_shift(tile_m, "tile_m")
-    height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
+    height_rungs = tile_height_rungs(
+        tile_m, ragged_rows_alloc, g_local, ep, ep_tp_size=ep_tp_size
+    )
     # The contribution slab exists for one reason: to give the push an HBM
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
     # read straight back out of it by the push that ships it -- two local
@@ -804,22 +1120,29 @@ def _build_fused_ep_moe_kernel(
         # instead, where they are read, because that is the end of the
         # kernel and their arithmetic has everything before it to hide in.
         n_visit = count(host.COUNT_VISITS)
+        if ep_tp_size > 1:
+            n_tp_visit = visit_sm[ep_tp_size, 0]
+            for g in range(1, g_local):
+                n_tp_visit = n_tp_visit + visit_sm[ep_tp_size, g]
+        else:
+            n_tp_visit = jnp.int32(0)
         # The full token-gather table stays in HBM. Two fixed SMEM windows
         # below stream only the rows the current expert tiles consume.
+        _none_ref: Any = None
         token_gather_hbm = next(it)
         # lhs_hbm is the ungathered token buffer [tokens, lane blocks, 128].
         # The wire never ships the topk weight, so it is not an operand.
         lhs_hbm = next(it)
         # The activation row scale exists only where the rows were quantized.
-        ls_hbm = next(it) if has_act_scale else None
+        ls_hbm = next(it) if has_act_scale else _none_ref
         w1_hbm, w2_hbm = (next(it) for _ in range(2))
         # The weight scale tables exist only where the weights carry scales.
-        w1s_hbm = next(it) if has_scales else None
-        w2s_hbm = next(it) if has_scales else None
+        w1s_hbm = next(it) if has_scales else _none_ref
+        w2s_hbm = next(it) if has_scales else _none_ref
         # Optional per-expert bias tables, one row per local expert, in the
         # same [G, N] layout as the per-channel weight scales beside them.
-        w1b_hbm = next(it) if has_w1_bias else None
-        w2b_hbm = next(it) if has_w2_bias else None
+        w1b_hbm = next(it) if has_w1_bias else _none_ref
+        w2b_hbm = next(it) if has_w2_bias else _none_ref
         if rhs_packed4:
             # Packed-u32 weight stream: the four-bit [G, K, N] refs viewed as
             # [G, K//8, N] uint32, so the DMA moves half the bytes. This is
@@ -846,6 +1169,10 @@ def _build_fused_ep_moe_kernel(
         # for their row geometry, which the send waits count bytes against.
         contrib_hbm = next(it)
         cscl_hbm = next(it)
+        if ep_tp_z_clone:
+            z_w1_hbm, z_w2_hbm, z_w1s_hbm, z_w2s_hbm = (next(it) for _ in range(4))
+        else:
+            z_w1_hbm = z_w2_hbm = z_w1s_hbm = z_w2s_hbm = _none_ref
         # Two independent refs (rather than a leading slot dimension) let the
         # scalar core branch once per activation tile and then use static SMEM
         # indexing for all of that tile's token rows.
@@ -855,17 +1182,17 @@ def _build_fused_ep_moe_kernel(
         # bias tables each build asked for, the activation row scale where
         # it exists, then the wire buffer and its scale mirror.
         (lhs_vm, w1_vm, w2_vm) = (next(it) for _ in range(3))
-        w1s_vm = next(it) if has_scales else None
-        w2s_vm = next(it) if has_scales else None
-        w1b_vm = next(it) if has_w1_bias else None
-        w2b_vm = next(it) if has_w2_bias else None
-        ls_vm = next(it) if has_act_scale else None
+        w1s_vm = next(it) if has_scales else _none_ref
+        w2s_vm = next(it) if has_scales else _none_ref
+        w1b_vm = next(it) if has_w1_bias else _none_ref
+        w2b_vm = next(it) if has_w2_bias else _none_ref
+        ls_vm = next(it) if has_act_scale else _none_ref
         out_vm = next(it)
         oscl_vm = next(it)  # [parities, tile blocks, ROWBLK] f32
         token_gather_sem0, token_gather_sem1 = (next(it) for _ in range(2))
         lhs_sems, w1_sems, w2_sems = (next(it) for _ in range(3))
-        w1s_sems = next(it) if has_scales else None
-        w2s_sems = next(it) if has_scales else None
+        w1s_sems = next(it) if has_scales else _none_ref
+        w2s_sems = next(it) if has_scales else _none_ref
         cp_sem = next(it)
         # One send sem per out_vm parity: with a shared sem the other parity's
         # bytes could satisfy a wait, and order is not promised. Where the
@@ -879,16 +1206,48 @@ def _build_fused_ep_moe_kernel(
             send_sems, recv_sem = (next(it) for _ in range(2))
             # Scale-mirror DMAs need their own sems: waits are per-buffer.
             send_scl_sems, recv_scl_sem = (next(it) for _ in range(2))
-            commit_sems = commit_scl_sems = None
-            mehop_sem = mehop_scl_sem = None
+            commit_sems = commit_scl_sems = _none_ref
+            mehop_scl_sem = _none_ref
         else:
             commit_sems, send_sem, recv_sem = (next(it) for _ in range(3))
             (commit_scl_sems, send_scl_sem, recv_scl_sem) = (next(it) for _ in range(3))
-            # Never cp_sem: its start+wait users must not consume these.
-            mehop_sem = next(it)
+            # Never cp_sem: its start+wait users must not consume this.
             mehop_scl_sem = next(it)
+        if ep_tp_size > 1:
+            tp_w2s_vm = next(it)
+            tp_w1p_vm = next(it)
+            tp_w2p_vm = next(it)
+            tp_w1_s_sem, tp_w1_r_sem = (next(it) for _ in range(2))
+            tp_w2_s_sem, tp_w2_r_sem = (next(it) for _ in range(2))
+            tp_w1s_s_sem, tp_w1s_r_sem = (next(it) for _ in range(2))
+            tp_w2s_s_sem, tp_w2s_r_sem = (next(it) for _ in range(2))
+            tp_bar_sem = next(it)
+            if ep_tp_z_clone:
+                z_send_sems, z_recv_sems = (next(it) for _ in range(2))
+            else:
+                z_send_sems = z_recv_sems = _none_ref
+        else:
+            tp_w2s_vm = _none_ref
+            tp_w1p_vm = _none_ref
+            tp_w2p_vm = _none_ref
+            tp_w1_s_sem = tp_w1_r_sem = _none_ref
+            tp_w2_s_sem = tp_w2_r_sem = _none_ref
+            tp_w1s_s_sem = tp_w1s_r_sem = _none_ref
+            tp_w2s_s_sem = tp_w2s_r_sem = _none_ref
+            tp_bar_sem = _none_ref
+            z_send_sems = z_recv_sems = _none_ref
 
         me = rank_sm[0, 0]
+        tp_grp = lax.div(me, jnp.int32(ep_tp_size))
+        tp_me = lax.rem(me, jnp.int32(ep_tp_size))
+        if ep_tp_z_clone:
+            z_push_phys = rank_sm[0, 1]
+            z_recv_step = rank_sm[0, 2]
+            z_peer_rank = rank_sm[0, 3]
+        else:
+            z_push_phys = jnp.int32(-1)
+            z_recv_step = jnp.int32(-1)
+            z_peer_rank = jnp.int32(0)
 
         def sync(src, dst):
             """Copy `src` into `dst` and wait for it before returning."""
@@ -905,11 +1264,9 @@ def _build_fused_ep_moe_kernel(
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
         def w1s_copy(expert, slot):
-            assert w1s_hbm is not None
             return _slot_copy(w1s_hbm.at[expert], w1s_vm, w1s_sems, slot)
 
         def w2s_copy(expert, slot):
-            assert w2s_hbm is not None
             return _slot_copy(w2s_hbm.at[expert], w2s_vm, w2s_sems, slot)
 
         def weight_starts(expert, slot):
@@ -960,6 +1317,481 @@ def _build_fused_ep_moe_kernel(
 
         prologue()
         _all_pairs_barrier(ep)
+        if ep_tp_z_clone:
+
+            @pl.when(z_push_phys >= 0)
+            def _():
+                z_peer = (z_peer_rank,)
+                # Avoid queueing scale tables behind multi-MiB w1/w2 slabs:
+                # tp_scales_starts waits scales first while w2 hides an extra visit.
+                pltpu.make_async_remote_copy(
+                    src_ref=w1s_hbm.at[z_push_phys, pl.ds(0, 2 * inter_slice)],
+                    dst_ref=z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
+                    send_sem=z_send_sems.at[2],
+                    recv_sem=z_recv_sems.at[2],
+                    device_id=z_peer,
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=w2s_hbm.at[z_push_phys, pl.ds(0, hidden)],
+                    dst_ref=z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                    send_sem=z_send_sems.at[3],
+                    recv_sem=z_recv_sems.at[3],
+                    device_id=z_peer,
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=w1_hbm.at[z_push_phys],
+                    dst_ref=z_w1_hbm.at[0],
+                    send_sem=z_send_sems.at[0],
+                    recv_sem=z_recv_sems.at[0],
+                    device_id=z_peer,
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=w2_hbm.at[z_push_phys],
+                    dst_ref=z_w2_hbm.at[0],
+                    send_sem=z_send_sems.at[1],
+                    recv_sem=z_recv_sems.at[1],
+                    device_id=z_peer,
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+
+        def tp_barrier_signal(step):
+            bpar = lax.rem(step, jnp.int32(2))
+
+            @pl.when(bpar == 0)
+            def _():
+                for m in range(ep_tp_size):
+                    pl.semaphore_signal(
+                        tp_bar_sem.at[0],
+                        inc=1,
+                        device_id=(tp_grp * ep_tp_size + m,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+
+            @pl.when(bpar == 1)
+            def _():
+                for m in range(ep_tp_size):
+                    pl.semaphore_signal(
+                        tp_bar_sem.at[1],
+                        inc=1,
+                        device_id=(tp_grp * ep_tp_size + m,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+
+        def tp_barrier_wait(step):
+            bpar = lax.rem(step, jnp.int32(2))
+
+            @pl.when(bpar == 0)
+            def _():
+                pl.semaphore_wait(tp_bar_sem.at[0], ep_tp_size)
+
+            @pl.when(bpar == 1)
+            def _():
+                pl.semaphore_wait(tp_bar_sem.at[1], ep_tp_size)
+
+        # ---- TP-pair weight transport (ep_tp_size == 2) ----
+        # Expert e of member m is HBM slab m * g_local + visit_sm[m, step]
+        # on EVERY core of the pair: each core holds its I-slice of the whole
+        # group. A core's own half is a local copy; the peer's half is PUSHED
+        # by the peer out of the peer's HBM into this core's VMEM (a remote
+        # DMA writes the far side), so each core issues, per step, one local
+        # copy and one push of its own slice of the PEER's expert.
+        #
+        # Positions, not members, index the intermediate axis: own half at
+        # position 0, the peer's at position 1, on both cores.
+        tp_peer = jnp.int32(1) - tp_me
+        tp_peer_id = (tp_grp * ep_tp_size + tp_peer,)
+
+        def _tp_expert(m, step):
+            if visit_sm.shape[0] > ep_tp_size + 1:
+                return visit_sm[ep_tp_size + 1 + m, step]
+            return m * g_local + visit_sm[m, step]
+
+        def _z_wait_recv_w1_scales():
+            pltpu.make_async_copy(
+                z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
+                z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
+                z_recv_sems.at[2],
+            ).wait()
+            pltpu.make_async_copy(
+                z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                z_recv_sems.at[3],
+            ).wait()
+            pltpu.make_async_copy(
+                z_w1_hbm.at[0], z_w1_hbm.at[0], z_recv_sems.at[0]
+            ).wait()
+            # Avoid waiting on z_w2 here: defer z_w2 wait to visit_i + 1 == z_recv_step
+            # so inter-host Z-link w2 transfer overlaps visit z_recv_step - 1.
+
+        def _z_wait_recv_w2():
+            pltpu.make_async_copy(
+                z_w2_hbm.at[0], z_w2_hbm.at[0], z_recv_sems.at[1]
+            ).wait()
+
+        def tp_w1_local_start(step, s):
+            """Own gate/up half of this core's expert at `step` into slot `s`."""
+            pltpu.make_async_copy(
+                w1_hbm.at[_tp_expert(tp_me, step)],
+                w1_vm.at[s],
+                w1_sems.at[s],
+            ).start(priority=WEIGHT_DMA_PRIORITY)
+
+        def tp_w1_local_or_z(step, s):
+            if not ep_tp_z_clone:
+                tp_w1_local_start(step, s)
+                return
+
+            @pl.when(step != z_recv_step)
+            def _():
+                tp_w1_local_start(step, s)
+
+            @pl.when(step == z_recv_step)
+            def _():
+                pltpu.make_async_copy(
+                    z_w1_hbm.at[0],
+                    w1_vm.at[s],
+                    w1_sems.at[s],
+                ).start(priority=WEIGHT_DMA_PRIORITY)
+
+        def tp_w1_peer_start(step, s):
+            """Push this core's half of the PEER's expert at `step` into the
+            peer's slot `s`; the peer does the same for this core."""
+            if ep_tp_z_clone:
+
+                @pl.when(step != z_recv_step)
+                def _():
+                    pltpu.make_async_remote_copy(
+                        src_ref=w1_hbm.at[_tp_expert(tp_peer, step)],
+                        dst_ref=tp_w1p_vm.at[s],
+                        send_sem=tp_w1_s_sem.at[s],
+                        recv_sem=tp_w1_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                @pl.when(step == z_recv_step)
+                def _():
+                    pltpu.make_async_remote_copy(
+                        src_ref=z_w1_hbm.at[0],
+                        dst_ref=tp_w1p_vm.at[s],
+                        send_sem=tp_w1_s_sem.at[s],
+                        recv_sem=tp_w1_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                return
+            pltpu.make_async_remote_copy(
+                src_ref=w1_hbm.at[_tp_expert(tp_peer, step)],
+                dst_ref=tp_w1p_vm.at[s],
+                send_sem=tp_w1_s_sem.at[s],
+                recv_sem=tp_w1_r_sem.at[s],
+                device_id=tp_peer_id,
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+
+        def tp_scales_starts(step, s):
+            """Scale tables for `step` into slot `s`, own half at position 0
+            locally and this core's half at position 1 on the peer."""
+            if ep_tp_z_clone:
+
+                @pl.when(step != z_recv_step)
+                def _():
+                    exp_me = _tp_expert(tp_me, step)
+                    exp_pr = _tp_expert(tp_peer, step)
+                    pltpu.make_async_copy(
+                        w1s_hbm.at[exp_me, pl.ds(0, inter_slice)],
+                        w1s_vm.at[s, pl.ds(0, inter_slice)],
+                        w1s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_copy(
+                        w1s_hbm.at[exp_me, pl.ds(inter_slice, inter_slice)],
+                        w1s_vm.at[s, pl.ds(inter, inter_slice)],
+                        w1s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_copy(
+                        w2s_hbm.at[exp_me, pl.ds(0, hidden)],
+                        tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                        w2s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_remote_copy(
+                        src_ref=w1s_hbm.at[exp_pr, pl.ds(0, inter_slice)],
+                        dst_ref=w1s_vm.at[s, pl.ds(inter_slice, inter_slice)],
+                        send_sem=tp_w1s_s_sem.at[s],
+                        recv_sem=tp_w1s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+                    pltpu.make_async_remote_copy(
+                        src_ref=w1s_hbm.at[exp_pr, pl.ds(inter_slice, inter_slice)],
+                        dst_ref=w1s_vm.at[s, pl.ds(inter + inter_slice, inter_slice)],
+                        send_sem=tp_w1s_s_sem.at[s],
+                        recv_sem=tp_w1s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+                    pltpu.make_async_remote_copy(
+                        src_ref=w2s_hbm.at[exp_pr, pl.ds(0, hidden)],
+                        dst_ref=tp_w2s_vm.at[s, pl.ds(hidden, hidden)],
+                        send_sem=tp_w2s_s_sem.at[s],
+                        recv_sem=tp_w2s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                @pl.when(step == z_recv_step)
+                def _():
+                    _z_wait_recv_w1_scales()
+                    pltpu.make_async_copy(
+                        z_w1s_hbm.at[0, pl.ds(0, inter_slice)],
+                        w1s_vm.at[s, pl.ds(0, inter_slice)],
+                        w1s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_copy(
+                        z_w1s_hbm.at[0, pl.ds(inter_slice, inter_slice)],
+                        w1s_vm.at[s, pl.ds(inter, inter_slice)],
+                        w1s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_copy(
+                        z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                        tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                        w2s_sems.at[s],
+                    ).start(priority=WEIGHT_DMA_PRIORITY)
+                    pltpu.make_async_remote_copy(
+                        src_ref=z_w1s_hbm.at[0, pl.ds(0, inter_slice)],
+                        dst_ref=w1s_vm.at[s, pl.ds(inter_slice, inter_slice)],
+                        send_sem=tp_w1s_s_sem.at[s],
+                        recv_sem=tp_w1s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+                    pltpu.make_async_remote_copy(
+                        src_ref=z_w1s_hbm.at[0, pl.ds(inter_slice, inter_slice)],
+                        dst_ref=w1s_vm.at[s, pl.ds(inter + inter_slice, inter_slice)],
+                        send_sem=tp_w1s_s_sem.at[s],
+                        recv_sem=tp_w1s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+                    pltpu.make_async_remote_copy(
+                        src_ref=z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                        dst_ref=tp_w2s_vm.at[s, pl.ds(hidden, hidden)],
+                        send_sem=tp_w2s_s_sem.at[s],
+                        recv_sem=tp_w2s_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                return
+            exp_me = _tp_expert(tp_me, step)
+            exp_pr = _tp_expert(tp_peer, step)
+            pltpu.make_async_copy(
+                w1s_hbm.at[exp_me, pl.ds(0, inter_slice)],
+                w1s_vm.at[s, pl.ds(0, inter_slice)],
+                w1s_sems.at[s],
+            ).start(priority=WEIGHT_DMA_PRIORITY)
+            pltpu.make_async_copy(
+                w1s_hbm.at[exp_me, pl.ds(inter_slice, inter_slice)],
+                w1s_vm.at[s, pl.ds(inter, inter_slice)],
+                w1s_sems.at[s],
+            ).start(priority=WEIGHT_DMA_PRIORITY)
+            pltpu.make_async_copy(
+                w2s_hbm.at[exp_me, pl.ds(0, hidden)],
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                w2s_sems.at[s],
+            ).start(priority=WEIGHT_DMA_PRIORITY)
+            pltpu.make_async_remote_copy(
+                src_ref=w1s_hbm.at[exp_pr, pl.ds(0, inter_slice)],
+                dst_ref=w1s_vm.at[s, pl.ds(inter_slice, inter_slice)],
+                send_sem=tp_w1s_s_sem.at[s],
+                recv_sem=tp_w1s_r_sem.at[s],
+                device_id=tp_peer_id,
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+            pltpu.make_async_remote_copy(
+                src_ref=w1s_hbm.at[exp_pr, pl.ds(inter_slice, inter_slice)],
+                dst_ref=w1s_vm.at[s, pl.ds(inter + inter_slice, inter_slice)],
+                send_sem=tp_w1s_s_sem.at[s],
+                recv_sem=tp_w1s_r_sem.at[s],
+                device_id=tp_peer_id,
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+            pltpu.make_async_remote_copy(
+                src_ref=w2s_hbm.at[exp_pr, pl.ds(0, hidden)],
+                dst_ref=tp_w2s_vm.at[s, pl.ds(hidden, hidden)],
+                send_sem=tp_w2s_s_sem.at[s],
+                recv_sem=tp_w2s_r_sem.at[s],
+                device_id=tp_peer_id,
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+
+        def tp_w2_local_start(step):
+            pltpu.make_async_copy(
+                w2_hbm.at[_tp_expert(tp_me, step)],
+                w2_vm.at[0],
+                w2_sems.at[0],
+            ).start(priority=WEIGHT_DMA_PRIORITY)
+
+        def tp_w2_local_or_z(step):
+            if not ep_tp_z_clone:
+                tp_w2_local_start(step)
+                return
+
+            @pl.when(step != z_recv_step)
+            def _():
+                tp_w2_local_start(step)
+
+            @pl.when(step == z_recv_step)
+            def _():
+                pltpu.make_async_copy(
+                    z_w2_hbm.at[0],
+                    w2_vm.at[0],
+                    w2_sems.at[0],
+                ).start(priority=WEIGHT_DMA_PRIORITY)
+
+        def tp_w2_peer_start(step, s):
+            if ep_tp_z_clone:
+
+                @pl.when(step != z_recv_step)
+                def _():
+                    pltpu.make_async_remote_copy(
+                        src_ref=w2_hbm.at[_tp_expert(tp_peer, step)],
+                        dst_ref=tp_w2p_vm.at[s],
+                        send_sem=tp_w2_s_sem.at[s],
+                        recv_sem=tp_w2_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                @pl.when(step == z_recv_step)
+                def _():
+                    pltpu.make_async_remote_copy(
+                        src_ref=z_w2_hbm.at[0],
+                        dst_ref=tp_w2p_vm.at[s],
+                        send_sem=tp_w2_s_sem.at[s],
+                        recv_sem=tp_w2_r_sem.at[s],
+                        device_id=tp_peer_id,
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+
+                return
+            pltpu.make_async_remote_copy(
+                src_ref=w2_hbm.at[_tp_expert(tp_peer, step)],
+                dst_ref=tp_w2p_vm.at[s],
+                send_sem=tp_w2_s_sem.at[s],
+                recv_sem=tp_w2_r_sem.at[s],
+                device_id=tp_peer_id,
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+
+        def tp_w2_starts(step, s):
+            """Down slab for `step`: own half locally and peer half into slot `s`."""
+            tp_w2_local_or_z(step)
+            tp_w2_peer_start(step, s)
+
+        def tp_wait_scales(s):
+            # Semaphores count bytes: each wait names a view of the bytes the
+            # matching starts moved, own half and pushed half alike. The send
+            # waits drain this core's own pushes (the peer's credit mirrors
+            # them), so every semaphore returns to zero once per slot use.
+            pltpu.make_async_copy(
+                w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
+                w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
+                w1s_sems.at[s],
+            ).wait()
+            pltpu.make_async_copy(
+                w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
+                w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
+                tp_w1s_s_sem.at[s],
+            ).wait()
+            pltpu.make_async_copy(
+                w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
+                w1s_vm.at[s, pl.ds(0, 2 * inter_slice)],
+                tp_w1s_r_sem.at[s],
+            ).wait()
+            pltpu.make_async_copy(
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                w2s_sems.at[s],
+            ).wait()
+            pltpu.make_async_copy(
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                tp_w2s_s_sem.at[s],
+            ).wait()
+            pltpu.make_async_copy(
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                tp_w2s_vm.at[s, pl.ds(0, hidden)],
+                tp_w2s_r_sem.at[s],
+            ).wait()
+
+        def tp_wait_w1(w1_s, s):
+            """Land the own half (`w1_s`) and the peer half (`s`) of gate/up."""
+            pltpu.make_async_copy(
+                w1_vm.at[w1_s], w1_vm.at[w1_s], w1_sems.at[w1_s]
+            ).wait()
+            pltpu.make_async_copy(
+                tp_w1p_vm.at[s], tp_w1p_vm.at[s], tp_w1_s_sem.at[s]
+            ).wait()
+            pltpu.make_async_copy(
+                tp_w1p_vm.at[s], tp_w1p_vm.at[s], tp_w1_r_sem.at[s]
+            ).wait()
+
+        def tp_wait_w2(w2p_s):
+            """Land both halves of the down slab (own slot 0, peer slot `w2p_s`)."""
+            pltpu.make_async_copy(w2_vm.at[0], w2_vm.at[0], w2_sems.at[0]).wait()
+            pltpu.make_async_copy(
+                tp_w2p_vm.at[w2p_s], tp_w2p_vm.at[w2p_s], tp_w2_s_sem.at[w2p_s]
+            ).wait()
+            pltpu.make_async_copy(
+                tp_w2p_vm.at[w2p_s], tp_w2p_vm.at[w2p_s], tp_w2_r_sem.at[w2p_s]
+            ).wait()
+
+        def tp_after_visit(visit_i):
+            """End of visit `visit_i`: pair barrier, then refill peer slots."""
+
+            @pl.when(visit_i + 1 < n_tp_visit)
+            def _():
+                s = lax.rem(visit_i, jnp.int32(tp_w1p_slots))
+                tp_barrier_wait(visit_i)
+                if ep_tp_z_clone:
+
+                    @pl.when(visit_i + 1 == z_recv_step)
+                    def _():
+                        _z_wait_recv_w2()
+                        if tp_w1_slots == 1:
+                            pltpu.make_async_copy(
+                                z_w1_hbm.at[0], w1_vm.at[0], w1_sems.at[0]
+                            ).start(priority=WEIGHT_DMA_PRIORITY)
+                        pltpu.make_async_copy(
+                            z_w2_hbm.at[0], w2_vm.at[0], w2_sems.at[0]
+                        ).start(priority=WEIGHT_DMA_PRIORITY)
+                        if tp_w2p_slots > 1:
+                            tp_w2_peer_start(
+                                visit_i + 1,
+                                lax.rem(visit_i + 1, jnp.int32(tp_w2p_slots)),
+                            )
+
+                if tp_w2p_slots == 1:
+                    tp_w2_peer_start(visit_i + 1, jnp.int32(0))
+
+                @pl.when(visit_i + 2 < n_tp_visit)
+                def _():
+                    tp_scales_starts(visit_i + 2, s)
+                    if tp_w1_slots > 1:
+                        tp_w1_local_or_z(visit_i + 2, s)
+                    tp_w1_peer_start(visit_i + 2, s)
+                    if tp_w2p_slots > 1:
+                        if ep_tp_z_clone:
+
+                            @pl.when(visit_i + 2 != z_recv_step)
+                            def _():
+                                tp_w2_peer_start(visit_i + 2, s)
+                        else:
+                            tp_w2_peer_start(visit_i + 2, s)
 
         def _start_next_gate_up(visit_i, slot, last_tile):
             """`() -> ()`: start the NEXT expert's gate/up slab, called from
@@ -1159,7 +1991,6 @@ def _build_fused_ep_moe_kernel(
                 # ls rides along on the same sem. The slab is the dense
                 # lane-block view of one f32 per row, so a tile's window is
                 # the sublanes its rows fall in, not a row range.
-                assert ls_hbm is not None and ls_vm is not None
                 pltpu.make_async_copy(
                     ls_hbm.at[pl.ds(row_base // HIDDEN_LANE_BLOCK, ls_window_rows)],
                     ls_vm.at[slot],
@@ -1176,7 +2007,6 @@ def _build_fused_ep_moe_kernel(
                 lhs_sems.at[slot],
             ).wait()
             if has_act_scale:
-                assert ls_vm is not None
                 pltpu.make_async_copy(
                     ls_vm.at[slot], ls_vm.at[slot], lhs_sems.at[slot]
                 ).wait()
@@ -1210,7 +2040,6 @@ def _build_fused_ep_moe_kernel(
 
         def wait_commits(parity, live_blocks):
             """Wait one tile's commits on `parity`: data rows, then scales."""
-            assert commit_sems is not None and commit_scl_sems is not None
             _rows_wait(commit_sems.at[parity], contrib_hbm, live_blocks * ROWBLK)
             # One tile committed one mirror sublane, whatever its row count.
             _rows_wait(commit_scl_sems.at[parity], cscl_hbm, 1)
@@ -1276,38 +2105,41 @@ def _build_fused_ep_moe_kernel(
             # The weight slot indexes a contiguous counter so DISTANCE + 1 of
             # them occupy distinct slots; the DMA base stays the real expert.
             slot = lax.rem(visit_i, jnp.int32(nbuf))
-            if not prefetches and not starts_next_weights:
-                # No runway: nobody started this visit's weights, so it
-                # starts them itself and waits on the two lines below.
-                # Refilling the one slot cannot race the previous visit's
-                # reads of it, because those reads feed accumulators whose
-                # results are stored into out_vm inside the tile loop -- so
-                # they have all retired by the loop's back edge, which is
-                # before this.
-                weight_starts(e, slot)
-            if starts_next_weights:
-                # Every later visit had its weights started by the one before,
-                # which is the whole point; the first has nobody to start them
-                # for it.
-
-                @pl.when(visit_i == 0)
-                def _():
+            if ep_tp_size == 1:
+                if not prefetches and not starts_next_weights:
+                    # No runway: nobody started this visit's weights, so it
+                    # starts them itself and waits on the two lines below.
+                    # Refilling the one slot cannot race the previous visit's
+                    # reads of it, because those reads feed accumulators whose
+                    # results are stored into out_vm inside the tile loop -- so
+                    # they have all retired by the loop's back edge, which is
+                    # before this.
                     weight_starts(e, slot)
+                if starts_next_weights:
+                    # Every later visit had its weights started by the one before,
+                    # which is the whole point; the first has nobody to start them
+                    # for it.
 
-            weight_waits(e, slot)
+                    @pl.when(visit_i == 0)
+                    def _():
+                        weight_starts(e, slot)
 
-            # Refill the slot for the expert DISTANCE ahead: the previous
-            # expert last read it, and DISTANCE < nbuf keeps it off both live
-            # readers, so no wait is needed.
-            if prefetches:
+                weight_waits(e, slot)
 
-                @pl.when(visit_i + prefetch_distance < n_visit)
-                def _():
-                    refill_slot = lax.rem(visit_i + prefetch_distance, jnp.int32(nbuf))
-                    ahead = visit_sm[visit_i + prefetch_distance]
-                    # Weight refills take their own DMA priority to stay off
-                    # the in-order token-gather queue.
-                    weight_starts(ahead, refill_slot)
+                # Refill the slot for the expert DISTANCE ahead: the previous
+                # expert last read it, and DISTANCE < nbuf keeps it off both live
+                # readers, so no wait is needed.
+                if prefetches:
+
+                    @pl.when(visit_i + prefetch_distance < n_visit)
+                    def _():
+                        refill_slot = lax.rem(
+                            visit_i + prefetch_distance, jnp.int32(nbuf)
+                        )
+                        ahead = visit_sm[visit_i + prefetch_distance]
+                        # Weight refills take their own DMA priority to stay off
+                        # the in-order token-gather queue.
+                        weight_starts(ahead, refill_slot)
 
             rows = expert_rows_sm[e]
             slab_base = expert_base_sm[e]
@@ -1322,43 +2154,58 @@ def _build_fused_ep_moe_kernel(
 
             def commit_tile(parity, t, tile_block_base, live_blocks):
                 """Commit the tile's intersection with each (expert, dest) run."""
-                assert commit_sems is not None and commit_scl_sems is not None
-                # The runs tile the expert slab contiguously, so the
-                # per-dest lengths sum to exactly live_blocks. Rows go per
-                # run; the scales go once, below, because a tile's are one
-                # sublane wherever its rows went.
-                for d in range(ep):
-                    run_start = commit_start_sm[e, d]
-                    run_len = commit_len_sm[e, d]
-                    lo = jnp.maximum(run_start, tile_block_base)
-                    hi = jnp.minimum(run_start + run_len, tile_block_base + live_blocks)
-                    overlap = jnp.maximum(hi - lo, 0)
-                    # An empty intersection leaves lo unclamped, so the
-                    # offsets below can point out of range; the copies are
-                    # predicated out rather than issued at zero length. The
-                    # commit waits count bytes, and a skipped copy
-                    # contributes zero bytes either way.
-                    lo = jnp.minimum(lo, hi)
-                    src_block = lo - tile_block_base
-                    dst_block = contrib_off_sm[e, d] + (lo - run_start)
+                # Avoid ep-way per-destination DMA loop: expert-contiguous
+                # contrib collapses remote runs into pre-me and post-me spans.
+                tile_hi = tile_block_base + live_blocks
+                exp_contrib_base = contrib_off_sm[e, 0]
+                me_lo = commit_start_sm[e, me]
+                me_hi = me_lo + commit_len_sm[e, me]
 
-                    @pl.when(overlap > 0)
-                    def _(
-                        src_block=src_block,
-                        dst_block=dst_block,
-                        overlap=overlap,
-                        parity=parity,
-                    ):
-                        pltpu.make_async_copy(
-                            out_vm.at[
-                                parity, pl.ds(src_block * ROWBLK, overlap * ROWBLK)
-                            ],
-                            contrib_hbm.at[pl.ds(dst_block * ROWBLK, overlap * ROWBLK)],
-                            commit_sems.at[parity],
-                        ).start()
+                pre_hi = jnp.minimum(tile_hi, me_lo)
+                pre_len = jnp.maximum(pre_hi - tile_block_base, 0)
 
-                # The tile's scales are one sublane wherever its rows
-                # went, so they commit once, outside the per-dest loop.
+                own_lo = jnp.maximum(tile_block_base, me_lo)
+                own_hi = jnp.minimum(tile_hi, me_hi)
+                own_len = jnp.maximum(own_hi - own_lo, 0)
+                own_lo_clamped = jnp.minimum(own_lo, own_hi)
+                own_src = own_lo_clamped - tile_block_base
+                own_dst = push_dst_sm[e, me] + (own_lo_clamped - me_lo)
+
+                post_lo = jnp.maximum(tile_block_base, me_hi)
+                post_len = jnp.maximum(tile_hi - post_lo, 0)
+                post_lo_clamped = jnp.minimum(post_lo, tile_hi)
+                post_src = post_lo_clamped - tile_block_base
+                post_dst = exp_contrib_base + post_lo_clamped
+
+                @pl.when(pre_len > 0)
+                def _():
+                    pltpu.make_async_copy(
+                        out_vm.at[parity, pl.ds(0, pre_len * ROWBLK)],
+                        contrib_hbm.at[
+                            pl.ds(
+                                (exp_contrib_base + tile_block_base) * ROWBLK,
+                                pre_len * ROWBLK,
+                            )
+                        ],
+                        commit_sems.at[parity],
+                    ).start()
+
+                @pl.when(own_len > 0)
+                def _():
+                    pltpu.make_async_copy(
+                        out_vm.at[parity, pl.ds(own_src * ROWBLK, own_len * ROWBLK)],
+                        recv_hbm.at[pl.ds(own_dst * ROWBLK, own_len * ROWBLK)],
+                        commit_sems.at[parity],
+                    ).start()
+
+                @pl.when(post_len > 0)
+                def _():
+                    pltpu.make_async_copy(
+                        out_vm.at[parity, pl.ds(post_src * ROWBLK, post_len * ROWBLK)],
+                        contrib_hbm.at[pl.ds(post_dst * ROWBLK, post_len * ROWBLK)],
+                        commit_sems.at[parity],
+                    ).start()
+
                 pltpu.make_async_copy(
                     oscl_vm.at[parity],
                     cscl_hbm.at[pl.ds(_mirror_base(e) + t, 1)],
@@ -1529,11 +2376,24 @@ def _build_fused_ep_moe_kernel(
                 # The next expert's index window, a tile early. This is the
                 # only arrival the kernel waits for with nothing issued
                 # behind it, so a tile of compute is what it costs to hide.
-                @pl.when(jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit))
-                def _():
-                    issue_gather_window(
-                        expert_base_sm[visit_sm[visit_i + 1]], next_wslot
+                if ep_tp_size == 1:
+
+                    @pl.when(jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit))
+                    def _():
+                        issue_gather_window(
+                            expert_base_sm[visit_sm[visit_i + 1]], next_wslot
+                        )
+                else:
+
+                    @pl.when(
+                        jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_tp_visit)
                     )
+                    def _():
+                        nxt = visit_sm[tp_me, visit_i + 1]
+
+                        @pl.when(expert_rows_sm[nxt] > 0)
+                        def _():
+                            issue_gather_window(expert_base_sm[nxt], next_wslot)
 
                 def compute_tile(height):
                     """Run the FFN on the tile's leading `height` rows.
@@ -1547,102 +2407,257 @@ def _build_fused_ep_moe_kernel(
                         lhs_vm[parity] if full else lhs_vm[parity, pl.ds(0, height)]
                     ).reshape(height, hidden)
                     act_scales = (
-                        _tile_row_scales(cast(jax.Ref, ls_vm)[parity], row_base, height)
+                        _tile_row_scales(ls_vm[parity], row_base, height)
                         if has_act_scale
                         else None
                     )
-                    w1b_row = (
-                        cast(jax.Ref, w1b_vm)[pl.ds(e, 1), :] if has_w1_bias else None
-                    )
-                    if rhs_packed4:
-                        # The block scales apply inside
-                        # expert_ffn_blockscale, so the epilogues below must
-                        # not apply w2s again.
-                        assert w1s_vm is not None and w2s_vm is not None
-                        w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
-                        w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
+                    w1b_row = w1b_vm[pl.ds(e, 1), :] if has_w1_bias else None
+                    if (
+                        not rhs_packed4
+                        and weight_format == host.WeightFormat.FP8
+                        and tp_down_chunk is not None
+                    ):
                         first_tile, last_tile = t == 0, t == n_tiles - 1
-                        w1_block, w2_block = _fp4_block_readers(
-                            slot,
-                            wait_slab=(
-                                _slab_waiter(e, slot, first_tile)
-                                if streams_weights
-                                else None
-                            ),
-                            slab_retired=(
-                                _start_next_gate_up(visit_i, slot, last_tile)
-                                if starts_next_weights
-                                else None
-                            ),
+                        tp_s = lax.rem(visit_i, jnp.int32(tp_scl_slots))
+                        tp_w1_s = lax.rem(visit_i, jnp.int32(tp_w1_slots))
+                        tp_w2p_s = lax.rem(visit_i, jnp.int32(tp_w2p_slots))
+                        retire_cond = jnp.logical_and(
+                            last_tile,
+                            jnp.logical_and(
+                                visit_i + 1 < n_tp_visit,
+                                visit_i + 1 != z_recv_step,
+                            )
+                            if ep_tp_z_clone
+                            else visit_i + 1 < n_tp_visit,
                         )
-                        acc2, mid_scale = expert_ffn_blockscale(
+                        wire_rows, wire_scales = expert_ffn_fp8_tp_chunked_wire(
                             act_rows,
                             act_scales,
-                            w1_block,
-                            w2_block,
-                            w1s_blocks,
-                            w2s_blocks,
-                            qb=rhs_qb,
+                            (lambda: w1_vm[tp_w1_s], lambda: tp_w1p_vm[tp_s]),
+                            lambda c0, cw: w2_vm[0, :, pl.ds(c0, cw)],
+                            lambda c0, cw: tp_w2p_vm[tp_w2p_s, :, pl.ds(c0, cw)],
+                            w1s_vm[pl.ds(tp_s, 1), :],
+                            lambda m, c0, cw: tp_w2s_vm[
+                                pl.ds(tp_s, 1), pl.ds(m * hidden + c0, cw)
+                            ],
+                            hidden=hidden,
+                            down_chunk=tp_down_chunk,
                             act_fn=act_fn,
-                            w1b=w1b_row,
-                        )
-                    elif weight_format == host.WeightFormat.INT8:
-                        assert w1s_vm is not None
-                        w1_chunk, w2_chunk = _int8_chunk_readers(slot)
-                        acc2, mid_scale = expert_ffn_int8(
-                            act_rows,
-                            w1_chunk,
-                            w2_chunk,
-                            w1s_vm[pl.ds(slot, 1), :],
-                            n_chunks1=hidden // host.WIDEN_KCHUNK,
-                            n_chunks2=inter // host.WIDEN_KCHUNK,
-                            act_fn=act_fn,
-                            w1b=w1b_row,
-                        )
-                    elif weight_format == host.WeightFormat.BF16:
-                        acc2, mid_scale = expert_ffn_bf16(
-                            act_rows,
-                            w1_vm[slot],
-                            w2_vm[slot],
-                            act_fn=act_fn,
-                            w1b=w1b_row,
+                            wait_w1=lambda: pl.when(first_tile)(
+                                lambda: tp_wait_w1(tp_w1_s, tp_s)
+                            ),
+                            retire_w1=(
+                                (
+                                    lambda: pl.when(retire_cond)(
+                                        lambda: tp_w1_local_start(
+                                            visit_i + 1, jnp.int32(0)
+                                        )
+                                    )
+                                )
+                                if tp_w1_slots == 1
+                                else None
+                            ),
+                            wait_w2=lambda: pl.when(first_tile)(
+                                lambda: tp_wait_w2(tp_w2p_s)
+                            ),
+                            retire_w2=lambda: pl.when(retire_cond)(
+                                lambda: tp_w2_local_start(visit_i + 1)
+                            ),
+                            ep_tp_size=ep_tp_size,
                         )
                     else:
-                        assert w1s_vm is not None
-                        acc2, mid_scale = expert_ffn_fp8(
-                            act_rows,
-                            act_scales,
-                            w1_vm[slot],
-                            w2_vm[slot],
-                            w1s_vm[pl.ds(slot, 1), :],
-                            act_fn=act_fn,
-                            w1b=w1b_row,
+                        if rhs_packed4:
+                            # The block scales apply inside
+                            # expert_ffn_blockscale, so the epilogues below must
+                            # not apply w2s again.
+                            w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
+                            w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
+                            first_tile, last_tile = t == 0, t == n_tiles - 1
+                            w1_block, w2_block = _fp4_block_readers(
+                                slot,
+                                wait_slab=(
+                                    _slab_waiter(e, slot, first_tile)
+                                    if streams_weights
+                                    else None
+                                ),
+                                slab_retired=(
+                                    _start_next_gate_up(visit_i, slot, last_tile)
+                                    if starts_next_weights
+                                    else None
+                                ),
+                            )
+                            acc2, mid_scale = expert_ffn_blockscale(
+                                act_rows,
+                                act_scales,
+                                w1_block,
+                                w2_block,
+                                w1s_blocks,
+                                w2s_blocks,
+                                qb=rhs_qb,
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                            )
+                        elif weight_format == host.WeightFormat.INT8:
+                            w1_chunk, w2_chunk = _int8_chunk_readers(slot)
+                            acc2, mid_scale = expert_ffn_int8(
+                                act_rows,
+                                w1_chunk,
+                                w2_chunk,
+                                w1s_vm[pl.ds(slot, 1), :],
+                                n_chunks1=hidden // host.WIDEN_KCHUNK,
+                                n_chunks2=inter // host.WIDEN_KCHUNK,
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                            )
+                        elif weight_format == host.WeightFormat.BF16:
+                            acc2, mid_scale = expert_ffn_bf16(
+                                act_rows,
+                                w1_vm[slot],
+                                w2_vm[slot],
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                            )
+                        else:
+                            first_tile, last_tile = t == 0, t == n_tiles - 1
+                            # The pair schedule slots its scale tables and the
+                            # peer gate/up half by visit parity; the own gate/up
+                            # half and the down slab have one slot each.
+                            tp_s = (
+                                lax.rem(visit_i, jnp.int32(tp_scl_slots))
+                                if ep_tp_size > 1
+                                else slot
+                            )
+                            tp_w1_s = (
+                                lax.rem(visit_i, jnp.int32(tp_w1_slots))
+                                if ep_tp_size > 1
+                                else slot
+                            )
+                            tp_w2p_s = (
+                                lax.rem(visit_i, jnp.int32(tp_w2p_slots))
+                                if ep_tp_size > 1
+                                else slot
+                            )
+                            wait_slab = (
+                                _slab_waiter(e, slot, first_tile)
+                                if (streams_weights and ep_tp_size == 1)
+                                else None
+                            )
+                            acc2, mid_scale = expert_ffn_fp8(
+                                act_rows,
+                                act_scales,
+                                (
+                                    (lambda: w1_vm[tp_w1_s], lambda: tp_w1p_vm[tp_s])
+                                    if ep_tp_size > 1
+                                    else (lambda: w1_vm[slot])
+                                ),
+                                (
+                                    (lambda: w2_vm[0], lambda: tp_w2p_vm[tp_w2p_s])
+                                    if ep_tp_size > 1
+                                    else (lambda: w2_vm[slot])
+                                ),
+                                w1s_vm[pl.ds(tp_s, 1), :],
+                                act_fn=act_fn,
+                                w1b=w1b_row,
+                                wait_w1=(
+                                    (
+                                        lambda: pl.when(first_tile)(
+                                            lambda: tp_wait_w1(tp_w1_s, tp_s)
+                                        )
+                                    )
+                                    if ep_tp_size > 1
+                                    else (
+                                        (lambda: wait_slab(w1_copy, 0))
+                                        if wait_slab is not None
+                                        else None
+                                    )
+                                ),
+                                retire_w1=(
+                                    (
+                                        lambda: pl.when(
+                                            jnp.logical_and(
+                                                last_tile,
+                                                jnp.logical_and(
+                                                    visit_i + 1 < n_tp_visit,
+                                                    visit_i + 1 != z_recv_step,
+                                                )
+                                                if ep_tp_z_clone
+                                                else visit_i + 1 < n_tp_visit,
+                                            )
+                                        )(
+                                            lambda: tp_w1_local_start(
+                                                visit_i + 1, jnp.int32(0)
+                                            )
+                                        )
+                                    )
+                                    if (ep_tp_size > 1 and tp_w1_slots == 1)
+                                    else (
+                                        _start_next_gate_up(visit_i, slot, last_tile)
+                                        if (starts_next_weights and ep_tp_size == 1)
+                                        else None
+                                    )
+                                ),
+                                wait_w2=(
+                                    (
+                                        lambda: pl.when(first_tile)(
+                                            lambda: tp_wait_w2(tp_w2p_s)
+                                        )
+                                    )
+                                    if ep_tp_size > 1
+                                    else (
+                                        (lambda: wait_slab(w2_copy, 0))
+                                        if wait_slab is not None
+                                        else None
+                                    )
+                                ),
+                                retire_w2=(
+                                    (
+                                        lambda: pl.when(
+                                            jnp.logical_and(
+                                                last_tile,
+                                                jnp.logical_and(
+                                                    visit_i + 1 < n_tp_visit,
+                                                    visit_i + 1 != z_recv_step,
+                                                )
+                                                if ep_tp_z_clone
+                                                else visit_i + 1 < n_tp_visit,
+                                            )
+                                        )(lambda: tp_w2_local_start(visit_i + 1))
+                                    )
+                                    if ep_tp_size > 1
+                                    else None
+                                ),
+                                tp_w2s=(
+                                    (
+                                        lambda m: tp_w2s_vm[
+                                            pl.ds(tp_s, 1), pl.ds(m * hidden, hidden)
+                                        ]
+                                    )
+                                    if ep_tp_size > 1
+                                    else None
+                                ),
+                                ep_tp_size=ep_tp_size,
+                            )
+                        # The destination applies the router weight, not this.
+                        # Four-bit weights carry w2s inside the block sums; the
+                        # formats whose second matmul took bf16 rows return no row
+                        # scale, so the only thing left to apply is the
+                        # per-channel weight scale where the format has one. The
+                        # epilogue itself is a module-level function, so the
+                        # placement of each of these -- and the down bias's
+                        # add-once property in particular -- has a host-side
+                        # witness rather than only a device-marked one.
+                        wire_rows, wire_scales = wire_row_and_scale(
+                            acc2,
+                            mid_scale,
+                            w2s=(
+                                w2s_vm[pl.ds(slot, 1), :]
+                                if (has_scales and not rhs_packed4 and ep_tp_size == 1)
+                                else None
+                            ),
+                            w2b=w2b_vm[pl.ds(e, 1), :] if has_w2_bias else None,
+                            wire_dtype=form.wire_dtype,
+                            tile_m=height,
                         )
-                    # The destination applies the router weight, not this.
-                    # Four-bit weights carry w2s inside the block sums; the
-                    # formats whose second matmul took bf16 rows return no row
-                    # scale, so the only thing left to apply is the
-                    # per-channel weight scale where the format has one. The
-                    # epilogue itself is a module-level function, so the
-                    # placement of each of these -- and the down bias's
-                    # add-once property in particular -- has a host-side
-                    # witness rather than only a device-marked one.
-                    wire_rows, wire_scales = wire_row_and_scale(
-                        acc2,
-                        mid_scale,
-                        w2s=(
-                            cast(jax.Ref, w2s_vm)[pl.ds(slot, 1), :]
-                            if (has_scales and not rhs_packed4)
-                            else None
-                        ),
-                        w2b=(
-                            cast(jax.Ref, w2b_vm)[pl.ds(e, 1), :]
-                            if has_w2_bias
-                            else None
-                        ),
-                        wire_dtype=form.wire_dtype,
-                        tile_m=height,
-                    )
                     wire_rows_staged = wire_rows.reshape(
                         height, lane_blocks, HIDDEN_LANE_BLOCK
                     )
@@ -1696,11 +2711,68 @@ def _build_fused_ep_moe_kernel(
                     )
 
                 commit_tile(parity, t, tile_block_base, live_blocks)
+                new_p0 = jnp.where(parity == 0, live_blocks, carried[1])
+                new_p1 = jnp.where(parity == 1, live_blocks, carried[2])
+                # Avoid a second tile_body fori_loop for interior chunks:
+                # duplicating multi-rung FFN bodies overflows instruction cache.
+                is_chunk_end = jnp.logical_and(
+                    t + 1 < n_tiles,
+                    lax.rem(t + 1, jnp.int32(CHUNK_PUSH_TILES)) == 0,
+                )
+
+                @pl.when(is_chunk_end)
+                def _():
+                    @pl.when(new_p0 > 0)
+                    def _():
+                        wait_commits(0, new_p0)
+
+                    @pl.when(new_p1 > 0)
+                    def _():
+                        wait_commits(1, new_p1)
+
+                    chunk_lo_blocks = (t + 1 - CHUNK_PUSH_TILES) * tile_blocks
+                    chunk_hi_blocks = (t + 1) * tile_blocks
+                    for step_idx in range(ep):
+                        d_peer = rotated_push_peer(me, ep, step_idx)
+                        into_run_rows, true_here = slice_run_true_rows(
+                            commit_start_sm[e, d_peer],
+                            commit_len_sm[e, d_peer],
+                            true_rows_sm[e, d_peer],
+                            chunk_lo_blocks,
+                            chunk_hi_blocks,
+                        )
+                        is_me = d_peer == me
+
+                        @pl.when(_and_nonempty(jnp.logical_not(is_me), true_here))
+                        def _(
+                            d_peer=d_peer,
+                            into_run_rows=into_run_rows,
+                            true_here=true_here,
+                        ):
+                            pltpu.make_async_remote_copy(
+                                src_ref=contrib_hbm.at[
+                                    pl.ds(
+                                        contrib_off_sm[e, d_peer] * ROWBLK
+                                        + into_run_rows,
+                                        true_here,
+                                    )
+                                ],
+                                dst_ref=recv_hbm.at[
+                                    pl.ds(
+                                        push_dst_sm[e, d_peer] * ROWBLK + into_run_rows,
+                                        true_here,
+                                    )
+                                ],
+                                send_sem=send_sem,
+                                recv_sem=recv_sem,
+                                device_id=(d_peer,),
+                                device_id_type=pl.DeviceIdType.MESH,
+                            ).start()
 
                 return (
                     tile_count + 1,
-                    jnp.where(parity == 0, live_blocks, carried[1]),
-                    jnp.where(parity == 1, live_blocks, carried[2]),
+                    jnp.where(is_chunk_end, jnp.int32(0), new_p0),
+                    jnp.where(is_chunk_end, jnp.int32(0), new_p1),
                     wslot,
                 )
 
@@ -1726,17 +2798,18 @@ def _build_fused_ep_moe_kernel(
             # activation tile before this expert's commit drain and push. Its
             # index window went out on the last tile, so this is the wait and
             # not the round trip. Empty experts are absent from the visit list.
-            tiles_done = carry[0]
+            if ep_tp_size == 1:
+                tiles_done = carry[0]
 
-            @pl.when(visit_i + 1 < n_visit)
-            def _():
-                nxt = visit_sm[visit_i + 1]
-                prime_expert(
-                    nxt,
-                    lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
-                    next_wslot,
-                    jnp.bool_(True),
-                )
+                @pl.when(visit_i + 1 < n_visit)
+                def _():
+                    nxt = visit_sm[visit_i + 1]
+                    prime_expert(
+                        nxt,
+                        lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
+                        next_wslot,
+                        jnp.bool_(True),
+                    )
 
             return carry[:-1] + (next_wslot,)
 
@@ -1765,66 +2838,67 @@ def _build_fused_ep_moe_kernel(
             for p in range(host.OUT_PARITIES):
                 wait_shipped(p, carried[1 + p], carried[3 + p])
 
-        @pl.when(n_visit > 0)
-        def _():
-            prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False))
+        if ep_tp_size == 1:
+
+            @pl.when(n_visit > 0)
+            def _():
+                prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False))
 
         def push_expert(e):
-            """Push expert e's remote regions and hop its own-dest region."""
-            # Remote pushes go per (expert, dest) at true length; run starts
-            # stay aligned, so recv positions are unchanged. Each is predicated
-            # on its own length: a zero-length REMOTE DMA must never issue.
-            for d in range(ep):
+            """Push expert e's unpushed tail rows and mirror scales."""
+            rows_e = expert_rows_sm[e]
+            tail_lo_blocks = tail_chunk_start_blocks(
+                rows_e, tile_m, CHUNK_PUSH_TILES, tile_blocks
+            )
+            total_blocks = rows_e // ROWBLK
+            for step_idx in range(ep):
+                d = rotated_push_peer(me, ep, step_idx)
                 region_blocks = commit_len_sm[e, d]
-                src_block = contrib_off_sm[e, d]
-                dst_block = push_dst_sm[e, d]
-                is_me = jnp.int32(d) == me
+                is_me = d == me
 
                 @pl.when(_and_nonempty(jnp.logical_not(is_me), region_blocks))
-                def _():
-                    # One expert per push, so the region IS expert e's run.
-                    true_rows = true_rows_sm[e, d]
+                def _(d=d, region_blocks=region_blocks):
+                    into_run_rows, true_here = slice_run_true_rows(
+                        commit_start_sm[e, d],
+                        region_blocks,
+                        true_rows_sm[e, d],
+                        tail_lo_blocks,
+                        total_blocks,
+                    )
 
                     def push_run():
-                        """The rows themselves, at their true length."""
                         pltpu.make_async_remote_copy(
                             src_ref=contrib_hbm.at[
-                                pl.ds(contrib_off_sm[e, d] * ROWBLK, true_rows)
+                                pl.ds(
+                                    contrib_off_sm[e, d] * ROWBLK + into_run_rows,
+                                    true_here,
+                                )
                             ],
                             dst_ref=recv_hbm.at[
-                                pl.ds(push_dst_sm[e, d] * ROWBLK, true_rows)
+                                pl.ds(
+                                    push_dst_sm[e, d] * ROWBLK + into_run_rows,
+                                    true_here,
+                                )
                             ],
                             send_sem=send_sem,
                             recv_sem=recv_sem,
-                            device_id=(jnp.int32(d),),
+                            device_id=(d,),
                             device_id_type=pl.DeviceIdType.MESH,
                         ).start()
 
-                    # A nonempty region can hold an empty (e, d) run.
-                    pl.when(true_rows > 0)(push_run)
-                    # Scale mirror: the source tiles this run's rows
-                    # fall in, landing at the base the destination's own
-                    # plan gave the run.
+                    pl.when(true_here > 0)(push_run)
                     src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
                     pltpu.make_async_remote_copy(
                         src_ref=cscl_hbm.at[pl.ds(src_sub, n_sub)],
                         dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
                         send_sem=send_scl_sem,
                         recv_sem=recv_scl_sem,
-                        device_id=(jnp.int32(d),),
+                        device_id=(d,),
                         device_id_type=pl.DeviceIdType.MESH,
                     ).start()
 
-                # Safe to defer: recv is read only after the drain.
                 @pl.when(_and_nonempty(is_me, region_blocks))
-                def _():
-                    pltpu.make_async_copy(
-                        contrib_hbm.at[
-                            pl.ds(src_block * ROWBLK, region_blocks * ROWBLK)
-                        ],
-                        recv_hbm.at[pl.ds(dst_block * ROWBLK, region_blocks * ROWBLK)],
-                        mehop_sem,
-                    ).start()
+                def _(d=d, region_blocks=region_blocks):
                     src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
                     pltpu.make_async_copy(
                         cscl_hbm.at[pl.ds(src_sub, n_sub)],
@@ -1844,7 +2918,118 @@ def _build_fused_ep_moe_kernel(
             return carry
 
         carry0 = tuple(jnp.int32(0) for _ in range(6 if push_from_vmem else 4))
-        carry_end = lax.fori_loop(0, n_visit, visit_step, carry0)
+        if ep_tp_size == 1:
+            carry_end = lax.fori_loop(0, n_visit, visit_step, carry0)
+        else:
+            # The pair schedule's prologue: everything visit 0 reads, and the
+            # peer gate/up half and scale tables of visit 1 into their other
+            # slot, so that visit 1 is a visit ahead from the start.
+
+            @pl.when(n_tp_visit > 0)
+            def _():
+                tp_scales_starts(jnp.int32(0), jnp.int32(0))
+                tp_w1_local_or_z(jnp.int32(0), jnp.int32(0))
+                tp_w1_peer_start(jnp.int32(0), jnp.int32(0))
+                if ep_tp_z_clone:
+
+                    @pl.when(z_recv_step == 0)
+                    def _():
+                        _z_wait_recv_w2()
+
+                tp_w2_starts(jnp.int32(0), jnp.int32(0))
+
+                @pl.when(n_tp_visit > 1)
+                def _():
+                    tp_scales_starts(jnp.int32(1), jnp.int32(1))
+                    if tp_w1_slots > 1:
+                        tp_w1_local_or_z(jnp.int32(1), jnp.int32(1))
+                    tp_w1_peer_start(jnp.int32(1), jnp.int32(1))
+                    if tp_w2p_slots > 1:
+                        if ep_tp_z_clone:
+
+                            @pl.when(z_recv_step != 1)
+                            def _():
+                                tp_w2_peer_start(jnp.int32(1), jnp.int32(1))
+                        else:
+                            tp_w2_peer_start(jnp.int32(1), jnp.int32(1))
+
+                e0 = visit_sm[tp_me, 0]
+
+                @pl.when(expert_rows_sm[e0] > 0)
+                def _():
+                    prime_expert(e0, jnp.int32(0), jnp.int32(0), jnp.bool_(False))
+
+            def tp_visit_step(visit_i, carry):
+                e = visit_sm[tp_me, visit_i]
+                rows = expert_rows_sm[e]
+                s = lax.rem(visit_i, jnp.int32(tp_scl_slots))
+                w1_s = lax.rem(visit_i, jnp.int32(tp_w1_slots))
+                w2p_s = lax.rem(visit_i, jnp.int32(tp_w2p_slots))
+                tp_wait_scales(s)
+
+                # A core whose expert at this step is empty (its peer's is
+                # not: an all-empty step is not in the list) still owes the
+                # step's waits, so the semaphores and the pushes it is the
+                # far side of stay in step with the peer's.
+                @pl.when(rows == 0)
+                def _():
+                    tp_wait_w1(w1_s, s)
+                    next_is_local = (
+                        jnp.logical_and(
+                            visit_i + 1 < n_tp_visit, visit_i + 1 != z_recv_step
+                        )
+                        if ep_tp_z_clone
+                        else visit_i + 1 < n_tp_visit
+                    )
+                    if tp_w1_slots == 1:
+
+                        @pl.when(next_is_local)
+                        def _():
+                            tp_w1_local_start(visit_i + 1, jnp.int32(0))
+
+                    tp_wait_w2(w2p_s)
+
+                    @pl.when(next_is_local)
+                    def _():
+                        tp_w2_local_start(visit_i + 1)
+
+                carry = expert_tiles(e, visit_i, carry)
+
+                # Avoid delaying pair-barrier signal behind commit drain and ICI
+                # push: early signal hides D2D rendezvous behind local tail work.
+                @pl.when(visit_i + 1 < n_tp_visit)
+                def _():
+                    tp_barrier_signal(visit_i)
+
+                # Next expert's first tile starts before tp_barrier so row
+                # gather hides behind any pair straggler wait.
+                @pl.when(visit_i + 1 < n_tp_visit)
+                def _():
+                    nxt = visit_sm[tp_me, visit_i + 1]
+
+                    @pl.when(expert_rows_sm[nxt] > 0)
+                    def _():
+                        prime_expert(
+                            nxt,
+                            lax.rem(carry[0], jnp.int32(OUT_PARITIES)),
+                            carry[-1],
+                            rows > 0,
+                        )
+
+                if not push_from_vmem:
+                    carry = drain_commits(carry)
+
+                    # Avoid sitting idle on ICI during pair straggler wait: push
+                    # finished expert rows before tp_barrier so network traffic
+                    # overlaps with peer skew waits.
+                    @pl.when(rows > 0)
+                    def _():
+                        push_expert(e)
+
+                tp_after_visit(visit_i)
+                return carry
+
+            carry_end = lax.fori_loop(0, n_tp_visit, tp_visit_step, carry0)
 
         def drain_transport():
             """Consume the pushes and the commits the per-tile waits left."""
@@ -1865,18 +3050,45 @@ def _build_fused_ep_moe_kernel(
             # than a division of the row counts.
             _rows_wait(send_scl_sem, cscl_hbm, count(host.COUNT_SEND_MIRROR))
             _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
-            # Deferred own-destination drain: the total sums my own-dest
-            # region lengths, and a skipped pair owes exactly zero rows.
-            self_blocks = commit_len_sm[0, me]
-            for g in range(1, g_local):
-                self_blocks = self_blocks + commit_len_sm[g, me]
-            _rows_wait(mehop_sem, recv_hbm, self_blocks * ROWBLK)
             _rows_wait(mehop_scl_sem, rscl_hbm, count(host.COUNT_SELF_MIRROR))
 
         drain_transport()
-        _all_pairs_barrier(ep)
+        if ep_tp_z_clone:
+
+            @pl.when(z_push_phys >= 0)
+            def _():
+                pltpu.make_async_copy(
+                    z_w1_hbm.at[0], z_w1_hbm.at[0], z_send_sems.at[0]
+                ).wait()
+                pltpu.make_async_copy(
+                    z_w2_hbm.at[0], z_w2_hbm.at[0], z_send_sems.at[1]
+                ).wait()
+                pltpu.make_async_copy(
+                    z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
+                    z_w1s_hbm.at[0, pl.ds(0, 2 * inter_slice)],
+                    z_send_sems.at[2],
+                ).wait()
+                pltpu.make_async_copy(
+                    z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                    z_w2s_hbm.at[0, pl.ds(0, hidden)],
+                    z_send_sems.at[3],
+                ).wait()
+
+        # Avoid trailing all-pairs barrier: every send/recv/pair/Z semaphore is
+        # drained above, and an exit barrier stalls fast shards on stragglers.
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
+
+    def _tp_scratch_shape(arr_name, shape):
+        """The pair schedule's shape for one of the host-listed buffers."""
+        if arr_name == "w1_vm":
+            return (tp_w1_slots, hidden, 2 * inter_slice)
+        if arr_name == "w2_vm":
+            return (1, inter_slice, hidden)
+        if arr_name == "w1s_vm":
+            return (tp_scl_slots, *shape[1:])
+        return shape
+
     # The VMEM buffers come from the same list the VMEM accounting sums, in
     # the order the kernel body unpacks them: lhs_vm, w1_vm, w2_vm, the scale
     # tables where the format has them, the bias tables each build asked for,
@@ -1890,8 +3102,14 @@ def _build_fused_ep_moe_kernel(
             pltpu.SMEM((gather_window_rows,), jnp.int32),
         ]
         + [
-            pltpu.VMEM(shape, dtype)
-            for _, shape, dtype in host.vmem_scratch_arrays(
+            # The pair schedule re-slots two of these (see the schedule note
+            # at the top of the build): the gate/up slab holds the OWN half
+            # only, and the gate/up scale table is visit-parity deep.
+            pltpu.VMEM(
+                _tp_scratch_shape(arr_name, shape) if ep_tp_size > 1 else shape,
+                dtype,
+            )
+            for arr_name, shape, dtype in host.vmem_scratch_arrays(
                 g_local,
                 capacity,
                 hidden,
@@ -1901,6 +3119,7 @@ def _build_fused_ep_moe_kernel(
                 rhs_qb=rhs_qb,
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
+                wire_dtype=wire_dtype,
             )
         ]
         + [
@@ -1909,15 +3128,21 @@ def _build_fused_ep_moe_kernel(
             # lhs_sems. Parity-deep, not nbuf-deep: every index into it, and into
             # the lhs_vm and ls_vm buffers it guards, is an out-parity.
             pltpu.SemaphoreType.DMA((OUT_PARITIES,)),
-            pltpu.SemaphoreType.DMA((nbuf,)),  # w1_sems
+            pltpu.SemaphoreType.DMA(
+                (tp_w1_slots if ep_tp_size > 1 else nbuf,)
+            ),  # w1_sems
             pltpu.SemaphoreType.DMA((nbuf,)),  # w2_sems
         ]
         + (
             [
                 # The scale tables travel with the slabs they scale, so they are
                 # slot-deep and need their own sems: a wait is per-buffer.
-                pltpu.SemaphoreType.DMA((nbuf,)),  # w1s_sems
-                pltpu.SemaphoreType.DMA((nbuf,)),  # w2s_sems
+                pltpu.SemaphoreType.DMA(
+                    (tp_scl_slots if ep_tp_size > 1 else nbuf,)
+                ),  # w1s_sems
+                pltpu.SemaphoreType.DMA(
+                    (tp_scl_slots if ep_tp_size > 1 else nbuf,)
+                ),  # w2s_sems
             ]
             if has_scales
             else []
@@ -1940,9 +3165,40 @@ def _build_fused_ep_moe_kernel(
                 pltpu.SemaphoreType.DMA((OUT_PARITIES,)),  # commit_scl_sems
                 pltpu.SemaphoreType.DMA,  # send_scl_sem
                 pltpu.SemaphoreType.DMA,  # recv_scl_sem
-                pltpu.SemaphoreType.DMA,  # mehop_sem
                 pltpu.SemaphoreType.DMA,  # mehop_scl_sem
             ]
+        )
+        + (
+            [
+                pltpu.VMEM(
+                    (tp_scl_slots, ep_tp_size * hidden), jnp.float32
+                ),  # tp_w2s_vm
+                pltpu.VMEM(
+                    (tp_w1p_slots, hidden, 2 * inter_slice), form.weight_dtype
+                ),  # tp_w1p_vm
+                pltpu.VMEM(
+                    (tp_w2p_slots, inter_slice, hidden), form.weight_dtype
+                ),  # tp_w2p_vm
+                pltpu.SemaphoreType.DMA((tp_w1p_slots,)),  # tp_w1_s_sem
+                pltpu.SemaphoreType.DMA((tp_w1p_slots,)),  # tp_w1_r_sem
+                pltpu.SemaphoreType.DMA((tp_w2p_slots,)),  # tp_w2_s_sem
+                pltpu.SemaphoreType.DMA((tp_w2p_slots,)),  # tp_w2_r_sem
+                pltpu.SemaphoreType.DMA((tp_scl_slots,)),  # tp_w1s_s_sem
+                pltpu.SemaphoreType.DMA((tp_scl_slots,)),  # tp_w1s_r_sem
+                pltpu.SemaphoreType.DMA((tp_scl_slots,)),  # tp_w2s_s_sem
+                pltpu.SemaphoreType.DMA((tp_scl_slots,)),  # tp_w2s_r_sem
+                pltpu.SemaphoreType.REGULAR((2,)),  # tp_bar_sem
+            ]
+            + (
+                [
+                    pltpu.SemaphoreType.DMA((4,)),  # z_send_sems
+                    pltpu.SemaphoreType.DMA((4,)),  # z_recv_sems
+                ]
+                if ep_tp_z_clone
+                else []
+            )
+            if ep_tp_size > 1
+            else []
         )
     )
     # The staging buffer and the two weight slabs are always operands; the
@@ -1984,6 +3240,17 @@ def _build_fused_ep_moe_kernel(
                 jnp.float32,
             ),
         ]
+        if ep_tp_z_clone:
+            out_shape.extend(
+                [
+                    jax.ShapeDtypeStruct(
+                        (1, hidden, 2 * inter_slice), form.weight_dtype
+                    ),
+                    jax.ShapeDtypeStruct((1, inter_slice, hidden), form.weight_dtype),
+                    jax.ShapeDtypeStruct((ROWBLK, 2 * inter_slice), jnp.float32),
+                    jax.ShapeDtypeStruct((ROWBLK, hidden), jnp.float32),
+                ]
+            )
         # Each suffix appears only when its feature is on, so a kernel that
         # fuses silu on eight-bit float weights with no biases keeps the name
         # it had before any of those operands existed, and every fingerprint
@@ -1997,6 +3264,14 @@ def _build_fused_ep_moe_kernel(
         bias_tag = ("_w13bias" if has_w1_bias else "") + (
             "_w2bias" if has_w2_bias else ""
         )
+        if wire_dtype is not None:
+            bias_tag += "_bf16wire"
+        if ep_tp_size > 1:
+            bias_tag += f"_eptp{ep_tp_size}"
+        if tp_w2p_slots > 1:
+            bias_tag += f"_w2p{tp_w2p_slots}"
+        if ep_tp_z_clone:
+            bias_tag += "_zclone"
         name = (
             f"fused_ep_moe_v2"
             f"{format_tag}"
@@ -2108,7 +3383,7 @@ def _build_fused_ep_moe_kernel(
             *scale_args,
             *biases,
         )
-        recv, rscl, _contrib, _contrib_scl = res
+        recv, rscl = res[0], res[1]
         return recv, rscl
 
     return fn
@@ -2348,13 +3623,20 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
         # contiguous SMEM run and its 2 * topk scalar reads share a single
         # address computation. That is also the order the plan builds them in,
         # so neither flatten is a transpose.
-        if pos.shape != (t_local, topk) or coef.shape != (t_local, topk):
+        valid_shapes = ((t_local, topk), (t_local * topk,))
+        if pos.shape not in valid_shapes or coef.shape not in valid_shapes:
             raise ValueError(
                 f"the combine takes token-major "
-                f"[{t_local}, {topk}] tables, got pos "
+                f"[{t_local}, {topk}] or [{t_local * topk}] tables, got pos "
                 f"{pos.shape} and coef {coef.shape}"
             )
-        return call(pos.astype(jnp.int32).reshape(-1), coef.reshape(-1), arrivals)
+        pos_1d = (
+            pos.astype(jnp.int32)
+            if pos.ndim == 1
+            else pos.astype(jnp.int32).reshape(-1)
+        )
+        coef_1d = coef if coef.ndim == 1 else coef.reshape(-1)
+        return call(pos_1d, coef_1d, arrivals)
 
     return fn
 
