@@ -27,11 +27,16 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 
+from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilderContext,
+)
+from vllm_torchtpu.layers.core.draft_dcp_attention import (
+    DraftDcpAttention,
+    DraftDcpAttentionProvider,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -68,6 +73,24 @@ def _draft_has_moe_layers(draft_model: torch.nn.Module) -> bool:
     if is_mixture_of_experts(draft_model):
         return True
     return any(isinstance(m, MoERunner) for m in draft_model.modules())
+
+
+class TpuContextKVFromAuxList:
+    """Drafter capability: build the context KV from the aux hidden-state list.
+
+    A drafter that inherits this receives the target's auxiliary hidden
+    states as a list in ``tpu_precompute_and_store_context_kv``, before they
+    are concatenated, so it can slice first and concatenate only what it
+    needs. Drafters without it get the concatenated tensor.
+    """
+
+    def tpu_precompute_and_store_context_kv(
+        self,
+        hidden_states: list[torch.Tensor],
+        positions: torch.Tensor,
+        draft_md_tuple: tuple[AttentionMetadata, ...],
+    ) -> tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor:
+        raise NotImplementedError
 
 
 class DFlashProposer:
@@ -257,6 +280,10 @@ class DFlashProposer:
         else:
             raise RuntimeError("Draft model does not support get_draft_attn_causal")
 
+        # Under DCP the draft keeps its KV whole on every rank: its context KV
+        # write and its block attention see the full context through the
+        # target's logical block table, with no DCP merge.
+        dcp = self.vllm_config.parallel_config.decode_context_parallel_size
         with set_vllm_model_wrapper_context(
             mesh=self.runner.mesh, vllm_config=self.vllm_config
         ):
@@ -271,7 +298,78 @@ class DFlashProposer:
                 if isinstance(attn_impl, PallasAttentionBackendImpl):
                     attn_impl.layer_idx = i
                     attn_impl.use_causal_mask = layer_causal_list[i]
+                    attn_impl.kv_replicated_over_dcp = dcp > 1
+                    sharded = (
+                        self._draft_dcp_attention(attn_obj, attn_impl, dcp)
+                        if dcp > 1
+                        else None
+                    )
+                    if sharded is not None:
+                        self._require_draft_owned_context_kv()
+                        dcp_group = get_dcp_group()
+                        assert dcp_group is not None, "DCP group is not initialized"
+                        attn_impl.enable_sharded_draft_dcp(
+                            attn_obj,
+                            impl=sharded,
+                            dcp=dcp,
+                            dcp_rank=dcp_group.rank_in_group,
+                            kv_head_replicas=self._draft_kv_head_replicas(),
+                        )
                     attn_impl.initialize_kernel(attn_obj)
+            if dcp > 1 and isinstance(self.draft_model, DraftDcpAttentionProvider):
+                self.draft_model.prepare_sharded_context_kv(
+                    get_dcp_group(), dcp, self._draft_kv_head_replicas()
+                )
+
+    def _draft_dcp_attention(
+        self,
+        attn_obj: torch.nn.Module,
+        attn_impl: PallasAttentionBackendImpl,
+        dcp: int,
+    ) -> DraftDcpAttention | None:
+        """The drafter's attention for this layer when its KV stays
+        DCP-sharded like the target's, or None to keep it whole on every
+        rank (the default; see `DraftDcpAttentionProvider`)."""
+        sharded = None
+        if isinstance(self.draft_model, DraftDcpAttentionProvider):
+            sharded = self.draft_model.make_draft_dcp_attention(
+                attn_obj,
+                attn_impl,
+                dcp=dcp,
+                kv_head_replicas=self._draft_kv_head_replicas(),
+                max_query_len=self.block_size,
+            )
+        logger.info_once(
+            "Draft KV under DCP: %s (draft=%s, sliding_window=%s, causal=%s)",
+            "sharded" if sharded is not None else "replicated",
+            type(self.draft_model).__name__,
+            attn_impl.sliding_window,
+            attn_impl.use_causal_mask,
+        )
+        return sharded
+
+    def _require_draft_owned_context_kv(self) -> None:
+        """A DCP-sharded draft layer's context K/V goes through
+        `write_sharded_draft_kv`, which only a drafter writing its own context
+        K/V calls (the first two branches of
+        `_tpu_precompute_and_update_kv_cache`). The generic path writes
+        through `forward`, which a sharded layer routes to
+        `DraftDcpAttention.forward` (that never writes): reject it at load."""
+        if callable(
+            getattr(self.draft_model, "tpu_precompute_and_store_context_kv", None)
+        ) or getattr(type(self.draft_model), "owns_context_kv", False):
+            return
+        raise NotImplementedError(
+            f"{type(self.draft_model).__name__} returns a DraftDcpAttention but "
+            "does not write its own context K/V (tpu_precompute_and_store_"
+            "context_kv or owns_context_kv)"
+        )
+
+    def _draft_kv_head_replicas(self) -> int:
+        """Tensor-parallel ranks per draft KV head."""
+        tp = self.vllm_config.parallel_config.tensor_parallel_size
+        kv_heads = self.speculative_config.draft_model_config.get_total_num_kv_heads()
+        return max(1, tp // kv_heads)
 
     def _load_draft_model(self) -> None:
         logger.info("Loading DFlash draft model...")
@@ -1009,6 +1107,18 @@ class DFlashProposer:
         """
         assert self.draft_model is not None
         self_model = self.draft_model.model
+        # Only opt into TPU-specific hooks; upstream methods with a similar
+        # name may call GPU custom ops. Other drafts use the TPU path below.
+        tpu_precompute = getattr(
+            self.draft_model, "tpu_precompute_and_store_context_kv", None
+        )
+        if isinstance(self.draft_model, TpuContextKVFromAuxList) and isinstance(
+            hidden_states, (list, tuple)
+        ):
+            # The drafter concatenates (or slices first, then concatenates).
+            return self.draft_model.tpu_precompute_and_store_context_kv(
+                list(hidden_states), positions, draft_md_tuple
+            )
         if isinstance(hidden_states, (list, tuple)):
             target_hidden = (
                 hidden_states[0]
@@ -1018,11 +1128,6 @@ class DFlashProposer:
         else:
             target_hidden = hidden_states
 
-        # Only opt into TPU-specific hooks; upstream methods with a similar
-        # name may call GPU custom ops. Other drafts use the TPU path below.
-        tpu_precompute = getattr(
-            self.draft_model, "tpu_precompute_and_store_context_kv", None
-        )
         if callable(tpu_precompute):
             return tpu_precompute(target_hidden, positions, draft_md_tuple)
         if getattr(type(self.draft_model), "owns_context_kv", False):

@@ -20,6 +20,7 @@ import bisect
 import contextlib
 import copy
 import dataclasses
+import functools
 import math
 import os
 import time
@@ -189,6 +190,11 @@ from vllm_torchtpu.runner.pcp import (
     PcpManager,
     mla_kv_page_size,
     validate_pcp_manager_layers,
+)
+from vllm_torchtpu.runner.spec_verify_sampler import (
+    SpecVerifyInputs,
+    SpecVerifySampler,
+    model_spec_verify_sampler,
 )
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
@@ -725,6 +731,9 @@ class TPUModelRunner(GPUModelRunner):
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
     _tp_rank0_confidence_mask: torch.Tensor | None = None
+    # The target model's non-greedy verify sampler (spec_verify_sampler);
+    # None keeps the runner's own verify.
+    _spec_verify_sampler: SpecVerifySampler | None = None
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -5622,6 +5631,17 @@ class TPUModelRunner(GPUModelRunner):
                     min_tokens_rows = min_tokens_mask.verify_rows(
                         min_toks, cur_start_idx, draft_lengths.tolist()
                     )
+            if (
+                self._spec_verify_sampler is not None
+                and not all_greedy
+                and grammar_output is None
+                and not processors
+            ):
+                # Without a grammar, min_tokens rows were masked on the full
+                # logits above.
+                return self._sample_spec_verify_model(
+                    logits, md, cur_start_idx, cur_end_idx, sampling_generator
+                )
             if all_greedy and grammar_output is None and not processors:
                 bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                     logits, md.bonus_logits_indices, md.target_logits_indices
@@ -5724,6 +5744,69 @@ class TPUModelRunner(GPUModelRunner):
         for proc in processors:
             proc.finish(next_tokens)
         return next_tokens
+
+    def _sample_spec_verify_model(
+        self,
+        logits: torch.Tensor,
+        md: SpecDecodeMetadata,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        sampling_generator: torch.Generator | None,
+    ) -> torch.Tensor:
+        """The non-greedy, grammar-free branch of `_sample_spec_verify_chunk`
+        through the model's `spec_verify_sampler`. Builds the same sampling
+        params and takes the same random draws in the same order as that
+        branch (bonus, accept, recover)."""
+        assert self._spec_verify_sampler is not None
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        assert md.draft_token_ids is not None
+        num_reqs = md.bonus_logits_indices.shape[0]
+        num_tokens = md.target_logits_indices.shape[0]
+        vocab = logits.shape[-1]
+        req_temperatures, req_top_k, req_top_p = self._build_padded_sampling_params(
+            cur_start_idx,
+            cur_end_idx,
+            logits,
+            padded_num_reqs=num_reqs,
+        )
+        topk_candidates = self._sampler_topk_candidates(
+            cur_start_idx, cur_end_idx, None
+        )
+        draw = functools.partial(
+            torch.rand,
+            dtype=torch.float32,
+            device=logits.device,
+            generator=sampling_generator,
+        )
+        bonus_u = draw((num_reqs, vocab))
+        accept_u = draw(md.draft_token_ids.shape)
+        recover_u = draw((num_tokens, vocab))
+        return self._spec_verify_sampler.sample(
+            SpecVerifyInputs(
+                logits=logits,
+                bonus_logits_indices=md.bonus_logits_indices,
+                target_logits_indices=md.target_logits_indices,
+                draft_token_ids=md.draft_token_ids,
+                num_draft_tokens=md.draft_lengths,
+                segment_ids=md.segment_ids,
+                group_indices=md.group_indices,
+                temperatures=req_temperatures,
+                top_k=req_top_k,
+                top_p=req_top_p,
+                bonus_u=bonus_u,
+                accept_u=accept_u,
+                recover_u=recover_u,
+                synthetic_conditional_rates=(
+                    self.rejection_sampler.synthetic_conditional_rates
+                ),
+                synthetic_mode=self.rejection_sampler.synthetic_mode,
+                max_draft_tokens=self.speculative_config.num_speculative_tokens,
+                topk_candidates=topk_candidates,
+                apply_topk_topp=self._sampler_applies_topk_topp(),
+                any_top_k=not self.input_batch.no_top_k,
+            )
+        )
 
     @torch.no_grad()
     def sample_tokens(
@@ -6358,6 +6441,10 @@ class TPUModelRunner(GPUModelRunner):
         self.model = model
         if self.lora_config is not None:
             self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
+        if self.speculative_config and self._pp_is_last:
+            # The model's non-greedy verify sampler, if it sets one; off by
+            # default (spec_verify_sampler).
+            self._spec_verify_sampler = model_spec_verify_sampler(self.model)
         self._dp_vocab_logits = dp_vocab_parallel.check_layers_sharded_over_dp(
             self.model
         )
@@ -6486,6 +6573,11 @@ class TPUModelRunner(GPUModelRunner):
 
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
             arm(self.model, draft)
+        # Off unless the model sets its own all-reduce (tpu_communicator
+        # .ModelAllReduce). Its setup may run collectives, so after the load.
+        from vllm_torchtpu.distributed.tpu_communicator import install_model_all_reduce
+
+        install_model_all_reduce(self.model, self.vllm_config, self.device)
         self._arm_hier_reduce_scatter()
 
     def _arm_hier_reduce_scatter(self) -> None:
@@ -7750,11 +7842,75 @@ class TPUModelRunner(GPUModelRunner):
                         apply_topk_topp=apply_topk_topp,
                     )
                     synchronize_tensors(out)
+                if self._spec_verify_sampler is not None:
+                    self._precompile_spec_verify_model(
+                        dummy_logits,
+                        bonus_logits_indices,
+                        target_logits_indices,
+                        draft_token_ids,
+                        draft_lengths,
+                        segment_ids,
+                        group_indices,
+                        warm_accept_u,
+                        warm_recover_u,
+                    )
                 logger.info(
                     "  -- padded_logits_length: %d, num_seqs: %d",
                     num_tokens,
                     num_reqs,
                 )
+
+    def _precompile_spec_verify_model(
+        self,
+        dummy_logits: torch.Tensor,
+        bonus_logits_indices: torch.Tensor,
+        target_logits_indices: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        draft_lengths: torch.Tensor,
+        segment_ids: torch.Tensor,
+        group_indices: torch.Tensor,
+        warm_accept_u: torch.Tensor,
+        warm_recover_u: torch.Tensor,
+    ) -> None:
+        """Every program the model's `spec_verify_sampler` can pick at this
+        (num_tokens, num_reqs) bucket."""
+        assert self._spec_verify_sampler is not None
+        assert self.rejection_sampler is not None
+        assert self.speculative_config is not None
+        num_reqs = bonus_logits_indices.shape[0]
+        device = dummy_logits.device
+        temps = torch.ones((num_reqs, 1), dtype=dummy_logits.dtype).to(device)
+        top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(device)
+        top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(device)
+        bonus_u = torch.zeros((num_reqs, self.vocab_size), dtype=torch.float32).to(
+            device
+        )
+        self._spec_verify_sampler.precompile(
+            SpecVerifyInputs(
+                logits=dummy_logits,
+                bonus_logits_indices=bonus_logits_indices,
+                target_logits_indices=target_logits_indices,
+                draft_token_ids=draft_token_ids,
+                num_draft_tokens=draft_lengths,
+                segment_ids=segment_ids,
+                group_indices=group_indices,
+                temperatures=temps,
+                top_k=top_k,
+                top_p=top_p,
+                bonus_u=bonus_u,
+                accept_u=warm_accept_u,
+                recover_u=warm_recover_u,
+                synthetic_conditional_rates=(
+                    self.rejection_sampler.synthetic_conditional_rates
+                ),
+                synthetic_mode=self.rejection_sampler.synthetic_mode,
+                max_draft_tokens=self.speculative_config.num_speculative_tokens,
+                topk_candidates=0,
+                apply_topk_topp=True,
+                any_top_k=True,
+            ),
+            list(random_sampler_variants(self._topk_candidate_blocks())),
+        )
 
     def _precompile_top_token_verify(
         self,
@@ -9481,10 +9637,14 @@ class TPUModelRunner(GPUModelRunner):
         cur_start_idx: int,
         cur_end_idx: int,
         logits: torch.Tensor,
+        padded_num_reqs: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
-        padded_num_reqs = logits.shape[0]
+        # `logits` gives the dtype and device, and the row count unless
+        # `padded_num_reqs` is given.
+        if padded_num_reqs is None:
+            padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
         temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
