@@ -30,3 +30,24 @@ def all_to_all(x: torch.Tensor, group: "GroupCoordinator") -> torch.Tensor:
     if isinstance(out, funcol.AsyncCollectiveTensor):
         return funcol.wait_tensor(out)
     return out
+
+
+def isolated_all_gather(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """`tensor_model_parallel_all_gather` in a device program of its own.
+
+    Under torch_tpu's DEFER_AND_FUSE eager mode an eager collective is fused
+    with the deferred ops that produced its input. When those ops differ
+    across ranks, each rank's collective lands in a different device program
+    and the ranks do not pair: one returns wrong data and another hangs.
+    Materializing the input and synchronizing before and after the collective
+    keeps it in an identical program on every rank.
+    """
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
+
+    materialized = fresh_buffer(input_)
+    synchronize_tensors(materialized)
+    gathered = tensor_model_parallel_all_gather(materialized, dim=dim)
+    synchronize_tensors(gathered)
+    return gathered
