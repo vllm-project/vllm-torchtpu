@@ -37,7 +37,7 @@ def coordinate_decoder_replay(
     """Make every EP participant enter the decoder with the same row bucket.
 
     `agreed_rows` is the runner's row count for every stage of this forward,
-    agreed one step ahead (dp_step.AGREED_ROWS); without it the participants
+    agreed ahead (dp_step.AGREED_ROWS); without it the participants
     agree the largest plan's bucket here.
     """
     if agreed_rows is not None:

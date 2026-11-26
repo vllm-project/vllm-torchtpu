@@ -1,37 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One host all-reduce per EP-DP lockstep step, after the step's launches.
+"""EP-DP lockstep shapes, agreed two steps ahead by a background all-reduce.
 
 Under expert parallelism the DP ranks reduce partial expert outputs across one
 another, so every rank must enter a step's collectives with the same shapes:
 the token bucket, the number of forward chunks, the per-chunk request count
 that sizes the draft forward, and the draft and encoder flags. Each rank's
 scheduler decides its own work, so the ranks agree these on vLLM's CPU DP
-group. Agreeing them before a step's launch puts the all-reduce (1.45 ms for
-16 ranks on one host, plus the wait for the slowest rank) between the host's
-schedule and its launch, where a host-bound decode step pays it.
+group. A blocking all-reduce costs a host-bound decode step 1.45 ms for 16
+ranks on two hosts, plus the wait for the slowest rank, on every step.
 
-So the agreement runs one step ahead. After step k's last launch, while the
-device executes, every rank contributes a bound on its step k+1
-(`StepAgreement.end`); step k+1 then launches at the agreed bound with no
-collective, once a local check confirms that its work fits (`begin`). A rank
-that cannot bound its next step says so, and that next step agrees its exact
-shape before its launch, as every step did before: it is the one step with two
-all-reduces. Every step keeps one barrier, so the ranks never drift more than
-a step apart.
+So no step waits on its own agreement. After step k's last launch every rank
+contributes a bound on its step k+2 (`StepAgreement.end`) to an asynchronous
+all-reduce, which completes while the host runs step k+1; step k+2 reads it
+before its first launch and runs at the agreed bound once a local check
+confirms that its work fits (`begin`). A rank that cannot bound that step says
+so, and the step agrees its exact shape before its launch: it is the one step
+with a blocking all-reduce. The ranks' hosts drift at most two steps apart.
 
-The bound comes from the rank's scheduler, which alone knows its next step
-(`gated_schedule`). Once every running request has finished its prompt, the
-next schedule gives each at most what it gives it now: 1 + its draft count
-under vLLM's token formula, which accepted and rejected drafts leave
-unchanged. A finished request only shrinks the next step, and its rows become
-padding. New work is what breaks the bound, so the scheduler announces it one
-step ahead: it admits waiting requests only on a step the previous schedule
-announced, and holds a running request rolled back to a prefill between two
-schedules (a failed KV load) for one step as well. A new request therefore
-enters one step after it becomes admissible, on a step whose shape is agreed
-before its launch.
+The bound comes from the rank's scheduler, which alone knows its next steps
+(`gated_schedule`). Once every running request has finished its prompt, vLLM
+schedules each at most 1 + its draft count, at most 1 + num_spec_tokens,
+whatever the drafts' acceptance. A finished request only shrinks a later
+step, and its rows become padding. New work is what breaks the bound, so the
+scheduler announces it two schedules ahead: it admits waiting requests only on
+a step that neither of the two previous schedules bounded, and holds a running
+request rolled back to a prefill between schedules (a failed KV load) on a
+bounded step as well. A new request therefore enters at most two steps after
+it becomes admissible, on a step whose shape is agreed before its launch.
+
+Two premises of vLLM's DP engine loop carry the bound. Each step's bound is
+the rank's latest schedule's (`_dp_next_bound`): a step that schedules
+nothing, or an idle engine iteration that runs no schedule, publishes the
+bound of the schedule before it, whose admissions the gate history still
+holds. And an engine that empties its last request schedules once more with
+nothing running, so the bound an idle rank publishes is the empty one.
 """
 
+import collections
 import dataclasses
 import functools
 from collections.abc import Callable, Sequence
@@ -39,13 +44,16 @@ from typing import Any
 
 import torch
 
+# Steps between a step's closing all-reduce and the step whose shape it agrees.
+AHEAD = 2
+
 # Set by `gated_schedule` on every SchedulerOutput: per running request, the
-# most tokens the next schedule gives it; None when the next step may carry new
-# work (an admission, a prompt chunk).
+# most tokens either of the next AHEAD schedules gives it; None when one of
+# those steps may carry new work (an admission, a prompt chunk).
 NEXT_STEP_TOKENS = "tpu_dp_next_step_tokens"
 
 # Forward-context key (`additional_kwargs`): the token rows every DP rank runs
-# for each stage of this forward, agreed one step ahead. Absent on a step whose
+# for each stage of this forward, agreed ahead. Absent on a step whose
 # shape was agreed before its launch, where a stage that narrows its rows must
 # agree its own count.
 AGREED_ROWS = "tpu_dp_agreed_rows"
@@ -129,8 +137,20 @@ _IDLE = StepShape.local(0, 0, 0)
 _WIDTH = len(_IDLE.encode())
 
 
+@dataclasses.dataclass(frozen=True)
+class _Reduction:
+    """An all-reduce in flight; Gloo reads and writes `operand` until done."""
+
+    operand: torch.Tensor
+    work: Any
+
+    def wait(self) -> list[int]:
+        self.work.wait()
+        return self.operand.tolist()
+
+
 class StepAgreement:
-    """One rank's side of the one-step-ahead agreement.
+    """One rank's side of the agreement AHEAD steps ahead.
 
     Every step calls `begin` before its first launch and `end` after its last,
     in the same order on every rank.
@@ -138,43 +158,51 @@ class StepAgreement:
 
     def __init__(self, group: Any) -> None:
         self._group = group
-        self._next: StepShape | None = None
+        # The closing all-reduces of the last AHEAD steps, oldest first.
+        self._in_flight: collections.deque[_Reduction] = collections.deque()
         # Whether the last `begin` agreed its shape before launch.
         self.synchronous = True
-        # The expert re-layout fields reduced by the last `end`.
+        # The expert re-layout fields of the reduction the last `begin` read.
         self.relayout: tuple[int, ...] = (0, 0, 0)
 
     def begin(self, local: StepShape) -> StepShape:
         """This step's DP-wide shape.
 
         Raises:
-            RuntimeError: this rank's step exceeds the shape agreed one step
-                earlier; its collectives would not pair with its peers'.
+            RuntimeError: this rank's step exceeds the shape agreed AHEAD
+                steps earlier; its collectives would not pair with its peers'.
         """
-        agreed, self._next = self._next, None
+        agreed = None
+        if len(self._in_flight) == AHEAD:
+            values = self._in_flight.popleft().wait()
+            self.relayout = tuple(values[1 + _WIDTH :])
+            if not values[0]:
+                agreed = StepShape.decode(values[1 : 1 + _WIDTH])
         self.synchronous = agreed is None
         if agreed is None:
-            return StepShape.decode(self._all_reduce(local.encode()))
+            return StepShape.decode(self._all_reduce(local.encode()).wait())
         if not local.fits(agreed):
             raise RuntimeError(
-                f"DP step {local} exceeds the shape agreed one step earlier {agreed}"
+                f"DP step {local} exceeds the shape agreed {AHEAD} steps "
+                f"earlier {agreed}"
             )
         return agreed
 
     def end(self, bound: StepShape | None, relayout: Sequence[int]) -> None:
-        """Agree the next step from every rank's `bound` (None: unbounded)."""
-        values = self._all_reduce(
-            [int(bound is None), *(bound or _IDLE).encode(), *relayout]
-        )
-        self.relayout = tuple(values[1 + _WIDTH :])
-        self._next = None if values[0] else StepShape.decode(values[1 : 1 + _WIDTH])
+        """Start agreeing the step AHEAD steps on from every rank's `bound`
+        (None: unbounded); the all-reduce runs while the host goes on."""
+        values = [int(bound is None), *(bound or _IDLE).encode(), *relayout]
+        self._in_flight.append(self._all_reduce(values))
 
-    def _all_reduce(self, values: list[int]) -> list[int]:
+    def _all_reduce(self, values: list[int]) -> _Reduction:
         operand = torch.tensor(values, dtype=torch.int64)
-        torch.distributed.all_reduce(
-            operand, op=torch.distributed.ReduceOp.MAX, group=self._group
+        work = torch.distributed.all_reduce(
+            operand,
+            op=torch.distributed.ReduceOp.MAX,
+            group=self._group,
+            async_op=True,
         )
-        return operand.tolist()
+        return _Reduction(operand, work)
 
 
 def next_step_bound(
@@ -211,16 +239,15 @@ def lockstep_enabled(parallel_config: Any) -> bool:
 
 
 def _next_step_tokens(scheduler: Any) -> list[int] | None:
-    """Per running request, the most tokens the next schedule gives it.
+    """Per running request, the most tokens a later schedule gives it.
 
     vLLM schedules a running request num_tokens_with_spec +
     num_output_placeholders - num_computed_tokens tokens (before budget
-    clamps); a decoding request keeps that at 1 + its draft count. None when a
-    request is in its prompt or was rolled back further: its next chunk may
-    carry any token count and encoder inputs.
+    clamps); a decoding request keeps that at 1 + its draft count, at most
+    1 + num_spec_tokens. None when a request is in its prompt or was rolled
+    back further: its next chunk may carry any token count and encoder inputs.
     """
     limit = 1 + scheduler.num_spec_tokens
-    tokens = []
     for request in scheduler.running:
         count = (
             request.num_tokens_with_spec
@@ -229,8 +256,7 @@ def _next_step_tokens(scheduler: Any) -> list[int] | None:
         )
         if request.num_computed_tokens < request.num_prompt_tokens or count > limit:
             return None
-        tokens.append(max(count, 0))
-    return tokens
+    return [limit] * len(scheduler.running)
 
 
 def _admissible(scheduler: Any) -> bool:
@@ -257,14 +283,16 @@ def gated_schedule(
 ) -> Any:
     """Run `schedule`, admitting new work only on an announced step.
 
-    The schedule before a step announces it by publishing no bound
-    (`NEXT_STEP_TOKENS`); the first step is announced. An unannounced step
-    schedules running decodes only; if a running request was rolled back to a
-    prefill it schedules nothing, and announces the next.
+    A step is announced when none of the AHEAD schedules before it published
+    a bound (`NEXT_STEP_TOKENS`); the first steps are announced. An
+    unannounced step schedules running decodes only; if a running request was
+    rolled back to a prefill it schedules nothing, and announces a later one.
     """
     from vllm.v1.core.sched.interface import PauseState
 
-    announced = getattr(scheduler, "_tpu_dp_announced", True)
+    # Whether each of the last AHEAD schedules published a bound, oldest first.
+    bounded = getattr(scheduler, "_tpu_dp_bounded", (False,) * AHEAD)
+    announced = not any(bounded)
     held = not announced and _next_step_tokens(scheduler) is None
     previous = scheduler._pause_state
     if held:
@@ -276,7 +304,7 @@ def gated_schedule(
     finally:
         scheduler._pause_state = previous
     tokens = None if held or _admissible(scheduler) else _next_step_tokens(scheduler)
-    scheduler._tpu_dp_announced = tokens is None
+    scheduler._tpu_dp_bounded = (*bounded[1:], tokens is not None)
     setattr(output, NEXT_STEP_TOKENS, tokens)
     return output
 

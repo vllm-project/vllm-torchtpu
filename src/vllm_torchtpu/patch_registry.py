@@ -120,8 +120,8 @@ PATCHES = (
     # The serving gc policy also owns the engine core's heap (gc_policy.py);
     # the runner arms its own at the end of warmup.
     Patch("vllm_torchtpu.gc_policy:install_engine_core", ("engine_core",)),
-    # EP-DP lockstep agrees each step one step ahead, so the scheduler
-    # announces new work one step before it runs (distributed/dp_step.py).
+    # EP-DP lockstep agrees each step two steps ahead, so the scheduler
+    # announces new work two schedules before it runs (distributed/dp_step.py).
     Patch("vllm_torchtpu.distributed.dp_step:install_admission_gate", ("engine_core",)),
     # Platform runtime configuration.
     Patch(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""16 ranks run the one-step-ahead DP agreement over real Gloo collectives."""
+"""16 ranks run the two-steps-ahead DP agreement over real Gloo collectives."""
 
 import importlib.util
 import random
@@ -22,7 +22,7 @@ _SPEC.loader.exec_module(dp_step)
 
 RANKS = 16
 STEPS = 160
-DRAFTS = 2  # A decoding request runs 1 + DRAFTS tokens a step.
+DRAFTS = 2  # A decoding request runs 1 + at most DRAFTS tokens a step.
 BUDGET = 1024
 CHUNK_REQS = 4
 LONG_TOKENS = 16  # A chunk holding a longer request takes CHUNK_REQS // 2.
@@ -40,12 +40,13 @@ class _Request:
         self.num_output_placeholders = 0
         self.image = image
         self.status = RequestStatus.WAITING
+        self.drafts = DRAFTS  # The drafter's proposals for its next step.
 
     @property
     def num_tokens_with_spec(self) -> int:
         if self.num_computed_tokens < self.prompt:
             return self.prompt
-        return self.num_computed_tokens + 1 + DRAFTS
+        return self.num_computed_tokens + 1 + self.drafts
 
 
 class _Scheduler:
@@ -172,8 +173,8 @@ def _run(rank: int) -> None:
                 f"{rank}-{step}", prompt, prompt if loaded else 0, rng.random() < 0.3
             )
             scheduler.waiting.append(request)
-            announced = getattr(scheduler, "_tpu_dp_announced", True)
-            arrivals[request.request_id] = (step, announced)
+            bounded = getattr(scheduler, "_tpu_dp_bounded", (False, False))
+            arrivals[request.request_id] = (step, bounded)
         decoding = [r for r in scheduler.running if r.num_computed_tokens >= r.prompt]
         if burst and decoding and rng.random() < 0.1:
             # A failed KV load rolls a running request back to a prefill.
@@ -184,12 +185,16 @@ def _run(rank: int) -> None:
             done = scheduler.running.pop(rng.randrange(len(scheduler.running)))
             scheduler.finished.add(done.request_id)
 
+        for request in scheduler.running:
+            # Draft counts vary step to step, so a bound from two schedules
+            # back must cover any count, not the one current then.
+            request.drafts = rng.randrange(DRAFTS + 1)
         output = dp_step.gated_schedule(scheduler, _schedule)
         for request in output.new:
             admitted[request.request_id] = step
         local = runner.step(output)
-        relayout = agreement.relayout
         agreed = agreement.begin(local)
+        relayout = agreement.relayout
         # (b) This rank's work fits the step every rank runs.
         assert local.fits(agreed), (step, local, agreed)
         log.append((agreement.synchronous, tuple(agreed.encode()), relayout))
@@ -198,29 +203,36 @@ def _run(rank: int) -> None:
         agreement.end(runner.bound, fields)
 
     every = [None] * RANKS
-    dist.all_gather_object(every, (log, published), group=dist.group.WORLD)
+    dist.all_gather_object(
+        every, (log, published, len(arrivals)), group=dist.group.WORLD
+    )
     # (a) Every rank ran the same collectives at the same shapes.
-    assert all(other == log for other, _ in every)
+    assert all(other == log for other, _, _ in every)
     for step, (synchronous, _, relayout) in enumerate(log):
-        # Quiet steps launch without a collective before them.
-        assert step % 10 < 6 or not synchronous, step
-        # The re-layout fields ride the previous step's closing all-reduce.
+        # Quiet steps launch without a collective before them: the last
+        # burst step's arrival enters by step % 10 == 4 and its prompt chunk
+        # runs there, so from step % 10 == 7 on every rank's bound holds.
+        assert step % 10 < 7 or not synchronous, step
+        # The re-layout fields ride the closing all-reduce two steps back.
         expected = (
             (0, 0, 0)
-            if step == 0
+            if step < 2
             else tuple(
-                max(fields[step - 1][i] for _, fields in every) for i in range(3)
+                max(fields[step - 2][i] for _, fields, _ in every) for i in range(3)
             )
         )
         assert relayout == expected, step
-    # (c) A request enters on the first step its predecessor announced: its
-    # arrival step if that one was announced, else the next; and that step
-    # agrees its shape before launch.
-    assert len(admitted) == len(arrivals) > 5
-    for request_id, (step, announced) in arrivals.items():
-        assert admitted[request_id] == step + (not announced), request_id
+    # (c) A request enters on the first step that neither of the two schedules
+    # before it bounded: its arrival step, one later if only the older one
+    # bounded, two later if the newer one did (its arrival schedule publishes
+    # no bound); and that step agrees its shape before launch.
+    assert len(admitted) == len(arrivals)
+    assert sum(count for _, _, count in every) > 5 * RANKS
+    for request_id, (step, (older, newer)) in arrivals.items():
+        delay = 2 if newer else 1 if older else 0
+        assert admitted[request_id] == step + delay, request_id
         assert log[admitted[request_id]][0], request_id
 
 
-def test_sixteen_ranks_agree_each_step_one_step_ahead(tmp_path):
+def test_sixteen_ranks_agree_each_step_two_steps_ahead(tmp_path):
     mp.spawn(_worker, args=((tmp_path / "gloo").as_uri(),), nprocs=RANKS)

@@ -136,6 +136,90 @@ def token_counts(starts: list[int], ends: list[int], prefix: int) -> dict:
 _ACTIVE = None
 _INSTALLED = False
 
+# DSV41_HOST_SPANS=1 times these runner methods in every recorded step, so the
+# host loop's segments split by function at every step on every rank.
+HOST_SPANS = (
+    "_update_states",
+    "_flush_disjoint_async_results",
+    "_reorder_batch_for_rpa",
+    "_count_input_chunks",
+    "_needs_draft_proposals",
+    "_needs_draft_context",
+    "maybe_setup_kv_connector",
+    "_prepare_inputs",
+    "_flush_mamba_state_seed_copies",
+    "_reset_read_offsets_for_new_requests",
+    "_apply_async_token_substitution",
+    "_record_input_staging_fence",
+    "_get_model_inputs",
+    "forward_model",
+    "_sample_spec_verify_chunk",
+    "_modify_prev_results",
+    "maybe_wait_for_kv_save",
+    "get_finished_kv_transfers",
+    "_assemble_async_spec_substitution",
+    "_update_placeholder",
+    "_dp_bound_next_step",
+)
+
+
+def host_placement() -> dict:
+    """Where this worker's threads run: per thread its CPU time, context
+    switches and last CPU; the process's allowed CPUs and thread pools; and
+    the NUMA nodes of its CPUs and of the TPU devices it opened."""
+    import glob
+
+    import torch
+
+    def numa_of_cpu(cpu: int) -> int:
+        nodes = glob.glob(f"/sys/devices/system/cpu/cpu{cpu}/node*")
+        return int(nodes[0].rsplit("node", 1)[1]) if nodes else -1
+
+    threads = {}
+    for task in glob.glob("/proc/self/task/*"):
+        try:
+            stat = Path(task, "stat").read_text()
+            status = Path(task, "status").read_text()
+        except OSError:
+            continue
+        name = stat[stat.index("(") + 1 : stat.rindex(")")]
+        fields = stat[stat.rindex(")") + 2 :].split()
+        # Other status lines may hold any number of colons (thread names).
+        switches = {
+            k: int(v)
+            for k, _, v in (line.partition(":") for line in status.splitlines())
+            if k in ("voluntary_ctxt_switches", "nonvoluntary_ctxt_switches")
+        }
+        cpu = int(fields[36])
+        threads[task.rsplit("/", 1)[1]] = {
+            "name": name,
+            "cpu_ticks": int(fields[11]) + int(fields[12]),
+            "last_cpu": cpu,
+            "last_numa": numa_of_cpu(cpu),
+            **switches,
+        }
+    devices = set()
+    for fd in glob.glob("/proc/self/fd/*"):
+        try:
+            target = os.readlink(fd)
+        except OSError:
+            continue
+        if target.startswith("/dev/vfio/") and target[10:].isdigit():
+            for node in glob.glob(f"/sys/kernel/iommu_groups/{target[10:]}/devices/*"):
+                devices.add(
+                    (Path(node).name, Path(node, "numa_node").read_text().strip())
+                )
+    allowed = sorted(os.sched_getaffinity(0))
+    return {
+        "pid": os.getpid(),
+        "allowed_cpus": len(allowed),
+        "allowed_numa": sorted({numa_of_cpu(c) for c in allowed}),
+        "torch_threads": torch.get_num_threads(),
+        "torch_interop_threads": torch.get_num_interop_threads(),
+        "tpu_devices": sorted(devices),
+        "threads": threads,
+    }
+
 
 def _stage_wrapper(original: Any, stage: str) -> Any:
     @functools.wraps(original)
@@ -215,6 +299,7 @@ class Recorder:
         self.scenario = scenario
         self.rank = rank
         self.provenance = {}
+        self.placement = None
         self.forward_id = 0
         self.decoder_snapshot = None
         self.stages = []
@@ -229,8 +314,8 @@ class Recorder:
         coordinate = runner._dp_coordinated_step
 
         def dp_coordinated_step(*args: Any, **kwargs: Any) -> Any:
-            # Before the step's launches: a local check of the shape agreed one
-            # step ahead, or the DP-wide all-reduce of a step that changes it.
+            # Before the step's launches: a local check of the shape agreed
+            # ahead, or the DP-wide all-reduce of a step that changes it.
             started = time.perf_counter_ns()
             result = coordinate(*args, **kwargs)
             if self.enabled and self.pending is not None:
@@ -241,13 +326,21 @@ class Recorder:
         end_step = runner._dp_end_step
 
         def dp_end_step() -> None:
-            # After the step's launches: the all-reduce agreeing the next step.
+            # After the step's launches: starts the all-reduce agreeing a later
+            # step (dp_step.AHEAD).
             started = time.perf_counter_ns()
             end_step()
             if self.enabled and self.pending is not None:
                 self.pending["dp_agree_ns"] = [started, time.perf_counter_ns()]
 
         runner._dp_end_step = dp_end_step
+        if os.environ.get("DSV41_HOST_SPANS") == "1":
+            for name in HOST_SPANS:
+                setattr(runner, name, self._span(name, getattr(runner, name)))
+            manager = runner.spec_decode_manager
+            manager.propose_draft_token_ids = self._span(
+                "propose_draft_token_ids", manager.propose_draft_token_ids
+            )
         if scenario.name == "decode":
             drafter = runner.drafter
             prepare = drafter._prepare_dflash_inputs
@@ -272,6 +365,20 @@ class Recorder:
                 return result
 
             drafter._prepare_dflash_inputs = prepare_draft
+
+    def _span(self, name: str, original: Any) -> Any:
+        @functools.wraps(original)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            started = time.perf_counter_ns()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                if self.enabled and self.pending is not None:
+                    self.pending.setdefault("spans", []).append(
+                        [name, started, time.perf_counter_ns()]
+                    )
+
+        return call
 
     def execute_model(self, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
         if not self.enabled:
@@ -547,6 +654,9 @@ class ServerStepWorker:
         recorder.in_flight = 0
         recorder.enabled = True
         recorder.audit_start_wall_ns = time.time_ns()
+        recorder.placement = (
+            host_placement() if os.environ.get("DSV41_HOST_SPANS") == "1" else None
+        )
         _ACTIVE = recorder
         cache = self.model_runner.kv_cache_config
         if cache is None:
@@ -586,6 +696,9 @@ class ServerStepWorker:
                 ],
                 "steps": recorder.steps,
                 "stages": recorder.stages,
+                # At the round's start and end: the deltas are the round's.
+                "host_placement": recorder.placement
+                and [recorder.placement, host_placement()],
                 "scenario": recorder.scenario.to_dict(),
                 "provenance": recorder.provenance,
             }

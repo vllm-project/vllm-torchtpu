@@ -4,8 +4,11 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import contextlib
+import glob
 import os
 import time
+from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
 
@@ -50,6 +53,56 @@ def _get_kv_connector_handshake_metadata_key(metadata=None) -> tuple[int, int]:
         else int(get_tensor_model_parallel_rank())
     )
     return get_pp_group().rank_in_group, rank
+
+
+def _pin_to_tpu_numa_node() -> None:
+    """Run this worker's threads on the CPUs of its TPU device's NUMA node.
+
+    libtpu binds a worker to the device at index TPU_VISIBLE_CHIPS (or
+    LOCAL_RANK, which torch_tpu copies into it) of this host's TPU PCI
+    functions in ascending PCI address order (tpu_rank_binding.py). On a
+    two-socket host the scheduler otherwise runs a worker's host loop on
+    either socket, so its doorbells and small H2D copies cross the socket link
+    on some ranks and not others, and the slowest rank paces the DP step.
+    Threads started later inherit the affinity; pages first touched later
+    land on the node too.
+    """
+    index = os.environ.get("TPU_VISIBLE_CHIPS", os.environ.get("LOCAL_RANK", ""))
+    nodes = glob.glob("/sys/devices/system/node/node[0-9]*")
+    if not index.isdigit() or len(nodes) < 2:
+        return
+    devices = []
+    for device in sorted(glob.glob("/sys/bus/pci/devices/*")):
+        group = os.path.join(device, "iommu_group")
+        if (
+            Path(device, "vendor").read_text().strip() == "0x1ae0"
+            and os.path.exists(group)
+            and os.path.exists(f"/dev/vfio/{os.path.basename(os.readlink(group))}")
+        ):
+            devices.append(device)
+    if int(index) >= len(devices):
+        return
+    node = int(Path(devices[int(index)], "numa_node").read_text())
+    if node < 0:
+        return
+    cpus = set()
+    cpulist = Path(f"/sys/devices/system/node/node{node}/cpulist").read_text()
+    for part in cpulist.split(","):
+        first, _, last = part.strip().partition("-")
+        cpus.update(range(int(first), int(last or first) + 1))
+    cpus &= os.sched_getaffinity(0)
+    if not cpus:
+        return
+    for tid in os.listdir("/proc/self/task"):
+        with contextlib.suppress(OSError):  # The thread exited.
+            os.sched_setaffinity(int(tid), cpus)
+    logger.info(
+        "TPU device %s (index %s) is on NUMA node %d: pinned to its %d CPUs",
+        os.path.basename(devices[int(index)]),
+        index,
+        node,
+        len(cpus),
+    )
 
 
 def _configure_tpu_process_env(
@@ -406,6 +459,7 @@ class TPUWorker(WorkerBase):
         tpu_platform = cast(TpuPlatform, current_platform)
         dist_backend = tpu_platform.get_worker_distributed_backend(dist_world_size)
 
+        _pin_to_tpu_numa_node()
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(
                 world_size=init_world,

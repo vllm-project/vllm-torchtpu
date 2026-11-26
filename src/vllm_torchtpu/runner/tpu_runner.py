@@ -770,10 +770,10 @@ class TPUModelRunner(GPUModelRunner):
         self._draft_proposals_needed: bool = True
         self._draft_context_needed: bool = True
         self._dp_step_has_encoder_inputs = False
-        # The one-step-ahead agreement (dp_step.py), created at the first
-        # lockstep step; the bound this rank published for its next step; and
-        # whether a step is open (between _dp_coordinated_step and
-        # _dp_end_step) and was agreed one step ahead.
+        # The agreement ahead of each step (dp_step.py), created at the first
+        # lockstep step; the bound this rank publishes after the open step's
+        # launches; and whether a step is open (between _dp_coordinated_step
+        # and _dp_end_step) and was agreed ahead.
         self._dp_agreement: dp_step.StepAgreement | None = None
         self._dp_next_bound: dp_step.StepShape | None = None
         self._dp_step_open = False
@@ -3180,17 +3180,6 @@ class TPUModelRunner(GPUModelRunner):
                 torch.from_numpy(pos_idx_np).to(self.device, non_blocking=True),
             )
 
-        # For decode-only case, cache constant device tensors to skip H2D.
-        # query_start_loc, logits_indices, and request_distribution don't
-        # change between decode steps for a given (num_reqs, padded_num_reqs).
-        is_decode_only = max_num_scheduled_tokens_all_reqs == 1
-        decode_cache_key = (
-            num_reqs,
-            padded_num_reqs,
-            use_max_model_len,
-            layout_plan.descriptor.cache_key,
-        )
-
         # Speculative decoding metadata.
         spec_decode_metadata = None
         if self.speculative_config:
@@ -3212,40 +3201,44 @@ class TPUModelRunner(GPUModelRunner):
                     )
                 )
 
-        # Default decode layouts keep logits_indices stable for a fixed
-        # (num_reqs, padded_num_reqs) bucket. PCP streaming layouts provide
-        # explicit rank-major logits indices that can change as q_start crosses
-        # an interleave/rank boundary, so they must not reuse a stale cached
-        # logits_indices tensor.
-        can_cache_decode_metadata = (
-            is_decode_only
-            and spec_decode_metadata is None
-            and layout_plan.logits_indices_cpu is None
+        # query_start_loc, request_distribution and, without spec metadata,
+        # logits_indices are functions of the chunk's host query_start_loc and
+        # decode count, which repeat across steady decode and verify steps:
+        # reuse their device copies while those host values repeat (each
+        # upload costs the host loop ~0.1 ms). PCP streaming layouts provide
+        # explicit rank-major logits indices that can change as q_start
+        # crosses an interleave/rank boundary, so they always upload.
+        # For the V3 kernel, request_distribution is
+        # [decode_end, prefill_end, mixed_end]. We put decode requests first,
+        # no dedicated prefill-only bucket, and all remaining requests in
+        # mixed mode.
+        chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
+        query_start_loc_cpu = self.query_start_loc_cpu[: target_num_reqs + 1]
+        decode_cache_key = (
+            query_start_loc_cpu.numpy().tobytes(),
+            chunk_num_decode,
+            num_reqs,
+            padded_num_reqs,
+            spec_decode_metadata is None,
+            layout_plan.descriptor.cache_key,
         )
-
+        can_cache_decode_metadata = layout_plan.logits_indices_cpu is None
         if (
             can_cache_decode_metadata
             and decode_cache_key == self._decode_device_cache_key
         ):
-            # Reuse cached device tensors — skip 3 H2D copies.
             query_start_loc = self._cached_query_start_loc
-            logits_indices = self._cached_logits_indices
             request_distribution = self._cached_request_distribution
+            logits_indices = (
+                self._cached_logits_indices
+                if spec_decode_metadata is None
+                else spec_decode_metadata.final_logits_indices
+            )
             assert query_start_loc is not None
             assert logits_indices is not None
             assert request_distribution is not None
         else:
-            # Compute and copy to device (first call or shape changed).
-            if use_max_model_len:
-                query_start_loc = self.query_start_loc_cpu[
-                    : self.num_reqs_max_model_len + 1
-                ].to(self.device, non_blocking=True)
-            else:
-                assert self.num_reqs_most_model_len is not None
-                query_start_loc = self.query_start_loc_cpu[
-                    : self.num_reqs_most_model_len + 1
-                ].to(self.device, non_blocking=True)
-
+            query_start_loc = query_start_loc_cpu.to(self.device, non_blocking=True)
             if spec_decode_metadata is not None:
                 logits_indices = spec_decode_metadata.final_logits_indices
             elif layout_plan.logits_indices_cpu is not None:
@@ -3258,21 +3251,13 @@ class TPUModelRunner(GPUModelRunner):
                 logits_indices = (
                     self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
                 ).to(self.device, non_blocking=True)
-
-            # For the V3 kernel, request_distribution is
-            # [decode_end, prefill_end, mixed_end]. We put decode requests first,
-            # no dedicated prefill-only bucket, and all remaining requests in
-            # mixed mode.
-            chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_num_decode
             self._request_distribution_cpu[2] = num_reqs
             request_distribution = self._request_distribution_cpu.to(
                 self.device, non_blocking=True
             )
-
             if can_cache_decode_metadata:
-                # Cache for future decode steps.
                 self._decode_device_cache_key = decode_cache_key
                 self._cached_query_start_loc = query_start_loc
                 self._cached_logits_indices = logits_indices
@@ -3646,8 +3631,9 @@ class TPUModelRunner(GPUModelRunner):
         )
         if not agreement.synchronous:
             logger.info_once(
-                "DP lockstep: steps are agreed one step ahead, after the "
-                "previous step's launches"
+                "DP lockstep: steps are agreed %d steps ahead, by an all-reduce "
+                "that runs behind the launches",
+                dp_step.AHEAD,
             )
         self._dp_step_agreed_ahead = not agreement.synchronous
         self._dp_step_index += 1
@@ -3655,7 +3641,7 @@ class TPUModelRunner(GPUModelRunner):
         controller = self._expert_relayout
         if controller is not None:
             # The dynamic expert re-layout's fields (expert_relayout.py) ride
-            # the previous step's closing all-reduce.
+            # the closing all-reduce of the step dp_step.AHEAD steps back.
             controller.on_step(
                 self._dp_step_index,
                 agreement.relayout,
@@ -3685,9 +3671,10 @@ class TPUModelRunner(GPUModelRunner):
             return
         self._dp_step_open = False
         self._dp_step_agreed_ahead = False
-        # Every rank reaches this point once per step, which is what makes a
-        # step-cadenced collection land on all of them at once instead of 32
-        # independent pauses, while the device runs the step just launched.
+        # Every rank reaches this point once per step, so a step-cadenced
+        # collection lands on all of them at the same step index (at most
+        # dp_step.AHEAD steps apart in time) instead of 32 independent pauses,
+        # while the device runs the step just launched.
         gc_policy.on_coordinated_step()
         if not self._dp_lockstep_enabled():
             return
@@ -3698,8 +3685,8 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _publish_dp_agreed_rows(self, num_tokens: int) -> None:
-        """Tell the model, in a step agreed one step ahead, that every DP
-        rank runs each of this forward's stages at `num_tokens` rows."""
+        """Tell the model, in a step agreed ahead, that every DP rank runs
+        each of this forward's stages at `num_tokens` rows."""
         if self._dp_step_agreed_ahead:
             get_forward_context().additional_kwargs[dp_step.AGREED_ROWS] = num_tokens
 
@@ -3714,8 +3701,9 @@ class TPUModelRunner(GPUModelRunner):
     def _dp_bound_next_step(
         self, scheduler_output: "SchedulerOutput"
     ) -> dp_step.StepShape | None:
-        """This rank's bound on its next lockstep step (dp_step.py), from its
-        scheduler; one without the admission gate leaves it unbounded."""
+        """This rank's bound on the lockstep step dp_step.AHEAD steps on
+        (dp_step.py), from its scheduler; one without the admission gate
+        leaves it unbounded."""
         if not self._dp_lockstep_enabled():
             return None
         return dp_step.next_step_bound(
