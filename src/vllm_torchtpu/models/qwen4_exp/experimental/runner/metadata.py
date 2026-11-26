@@ -37,6 +37,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import torch
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.kv_cache_interface import MambaSpec, UniformTypeKVCacheSpecs
 
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -46,6 +48,140 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     stage_h2d_upload,
     zeros_h2d_source,
 )
+
+from ..config import mtp_gdn_two_slot_enabled
+
+_QWEN4_EXP_ARCHITECTURES = (
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
+)
+
+
+def is_ping_pong_mamba_spec(spec: Any, vllm_config: Any) -> bool:
+    """True when `spec` is a 2-slot ping-pong Mamba group (including K=1 opt-in)."""
+    first_spec = (
+        getattr(spec, "first_spec", spec)
+        if isinstance(spec, UniformTypeKVCacheSpecs)
+        else spec
+    )
+    if not isinstance(first_spec, MambaSpec):
+        return False
+    spec_blocks = int(getattr(first_spec, "num_speculative_blocks", 0) or 0)
+    if spec_blocks != 1 or vllm_config is None:
+        return False
+    spec_cfg = getattr(vllm_config, "speculative_config", None)
+    num_spec = (
+        int(getattr(spec_cfg, "num_speculative_tokens", 0) or 0)
+        if spec_cfg is not None
+        else 0
+    )
+    if num_spec > 1:
+        return True
+    if num_spec == 1:
+        model_cfg = getattr(vllm_config, "model_config", None)
+        arch = getattr(model_cfg, "architecture", None)
+        if arch is None:
+            hf_cfg = getattr(model_cfg, "hf_config", None)
+            archs = getattr(hf_cfg, "architectures", None) or ()
+            arch = archs[0] if archs else None
+        is_qwen4 = arch is None or arch in _QWEN4_EXP_ARCHITECTURES
+        return (
+            is_qwen4
+            and getattr(first_spec, "mamba_type", None)
+            == MambaAttentionBackendEnum.GDN_ATTN
+            and mtp_gdn_two_slot_enabled(vllm_config)
+        )
+    return False
+
+
+def _builder_spec_ckpt_window(builder: Any) -> int:
+    spec = getattr(builder, "kv_cache_spec", None)
+    first_spec = (
+        getattr(spec, "first_spec", spec)
+        if isinstance(spec, UniformTypeKVCacheSpecs)
+        else spec
+    )
+    if not isinstance(first_spec, MambaSpec):
+        return 0
+    spec_blocks = int(getattr(first_spec, "num_speculative_blocks", 0) or 0)
+    return 1 + spec_blocks if spec_blocks > 0 else 0
+
+
+def _builder_window_props(
+    builder: Any, vllm_config: Any, ckpt_window: int
+) -> tuple[int, bool]:
+    """Return ``(effective_ckpt_window, is_ping_pong)`` for a group builder."""
+    if not getattr(builder, "is_mamba_group", False) or ckpt_window <= 1:
+        return (1, False)
+    spec_win = _builder_spec_ckpt_window(builder)
+    eff = min(ckpt_window, spec_win) if spec_win >= 1 else ckpt_window
+    spec = getattr(builder, "kv_cache_spec", None)
+    is_pp = is_ping_pong_mamba_spec(spec, vllm_config) or (1 < eff < ckpt_window)
+    return (eff, is_pp)
+
+
+def effective_ckpt_window(builder: Any, ckpt_window: int) -> int:
+    """Per-group checkpoint block count (e.g. 2 for 2-slot GDN, 4 for PLE)."""
+    return _builder_window_props(builder, None, ckpt_window)[0]
+
+
+def is_ping_pong_mamba_group(builder: Any, vllm_config: Any, ckpt_window: int) -> bool:
+    """True when `builder` owns a 2-slot ping-pong Mamba cache group."""
+    return _builder_window_props(builder, vllm_config, ckpt_window)[1]
+
+
+def _block_table_geometry_for_group(
+    builder: Any, ctx: AttentionMetadataBuilderContext
+) -> tuple[Any, int]:
+    """Like `builder._block_table_geometry(ctx)`, adjusting width to `eff_window`."""
+    bt_obj, target_num_blocks = builder._block_table_geometry(ctx)
+    if (
+        getattr(builder, "is_mamba_group", False)
+        and not ctx.use_max_model_len
+        and ctx.mamba_ckpt_window > 1
+    ):
+        eff = effective_ckpt_window(builder, ctx.mamba_ckpt_window)
+        if 1 < eff < ctx.mamba_ckpt_window:
+            runner = builder.runner
+            bs = int(getattr(builder, "target_block_size", 1) or 1)
+            base_blocks = (runner.most_model_len + bs - 1) // bs
+            target_num_blocks = min(
+                base_blocks + eff - 1, bt_obj.max_num_blocks_per_req
+            )
+    return bt_obj, target_num_blocks
+
+
+def _mamba_row_plan_for_window(
+    builder: Any,
+    ctx: AttentionMetadataBuilderContext,
+    target_num_blocks: int,
+    eff_window: int,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    """Cached row plan keyed by `(block_size, target_num_blocks, eff_window)`."""
+    if eff_window == ctx.mamba_ckpt_window or eff_window <= 1:
+        return builder._mamba_row_plan(ctx, target_num_blocks)
+    cache = getattr(ctx, "_two_slot_mamba_row_plans", None)
+    if cache is None:
+        cache = {}
+        ctx._two_slot_mamba_row_plans = cache  # type: ignore[attr-defined]
+    key = (builder.target_block_size, target_num_blocks, eff_window)
+    hit = cache.get(key)
+    if hit is not None:
+        return hit
+    state_offsets = torch.clamp(
+        (ctx.seq_lens - 1) // builder.target_block_size,
+        min=0,
+        max=max(0, target_num_blocks - 1),
+    ).to(torch.int64)
+    state_index = state_offsets.unsqueeze(1)
+    ckpt_offsets = state_index + torch.arange(
+        eff_window, device=state_offsets.device, dtype=state_offsets.dtype
+    ).unsqueeze(0)
+    in_row = (ckpt_offsets < target_num_blocks) & (ctx.seq_lens > 0).unsqueeze(1)
+    safe_ckpt = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
+    plan = (state_index, safe_ckpt, in_row)
+    cache[key] = plan
+    return plan
 
 
 def _staged_walk_products(
@@ -66,18 +202,30 @@ def _staged_walk_products(
         for off, n, t in table_geom:
             outs.append(staged_dev[off : off + n * t].clone())
     states: list = [None] * len(mamba_geom)
-    ckpts: list = [None] * len(mamba_geom)
+    ckpts_by_j: dict[int, torch.Tensor] = {}
     prefill_ckpts = []
+    pp_indices: list[int] = []
+    std_indices: list[int] = []
     if mamba_geom:
         active = seq_lens > 0
         device = seq_lens.device
-        # Groups sharing (num_blocks, block_size) share every row offset, so
-        # each such class is one gather over the flat staged buffer instead
-        # of one small gather per group (~1.5 us each, ~70 per step).
-        classes: dict[tuple[int, int], list[int]] = {}
-        for j, (_, t, bs, _) in enumerate(mamba_geom):
-            classes.setdefault((t, bs), []).append(j)
-        for (t, bs), members in classes.items():
+        # Groups sharing `(num_blocks, block_size, eff_window, is_ping_pong)`
+        # share every row offset, so each class is one batched gather over
+        # the flat staged buffer instead of one small gather per group.
+        # Accepts either the legacy 4-tuple `(ti, t, bs, prefill_ckpt_spec)`
+        # or the 6-tuple `(ti, t, bs, prefill_ckpt_spec, eff_window, is_pp)`.
+        classes: dict[tuple[int, int, int, int], list[int]] = {}
+        for j, entry in enumerate(mamba_geom):
+            t, bs = entry[1], entry[2]
+            ew = entry[4] if len(entry) > 4 else ckpt_window
+            pp = entry[5] if len(entry) > 5 else int(1 < ew < ckpt_window)
+            classes.setdefault((t, bs, ew, pp), []).append(j)
+            if ckpt_window > 1:
+                if pp and ew == 2:
+                    pp_indices.append(j)
+                else:
+                    std_indices.append(j)
+        for (t, bs, ew, _pp), members in classes.items():
             n = table_geom[mamba_geom[members[0]][0]][1]
             # Flat offset of row r of member g: table offset + r * t.
             bases = torch.tensor(
@@ -93,15 +241,17 @@ def _staged_walk_products(
             gathered = staged_dev[bases + state_offsets.unsqueeze(0)]
             gathered = torch.where(
                 active.unsqueeze(0), gathered, torch.zeros_like(gathered)
-            )
+            ).to(torch.int32)
             ck: torch.Tensor | None = None
-            if ckpt_window > 1:
+            if ckpt_window > 1 and ew > 1:
                 ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
-                    ckpt_window, device=device, dtype=torch.int64
+                    ew, device=device, dtype=torch.int64
                 ).unsqueeze(0)
                 in_row = (ckpt_offsets < t) & active.unsqueeze(1)
                 safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
-                ck = staged_dev[bases.unsqueeze(2) + safe.unsqueeze(0)] * in_row
+                ck = (staged_dev[bases.unsqueeze(2) + safe.unsqueeze(0)] * in_row).to(
+                    torch.int32
+                )
             # Clone each slice: a sliced graph output is a view into the
             # class's [G, ...] buffer, and the model programs compiled for a
             # standalone [n] input reject the larger backing buffer
@@ -109,11 +259,17 @@ def _staged_walk_products(
             for k, j in enumerate(members):
                 states[j] = gathered[k].clone()
                 if ck is not None:
-                    ckpts[j] = ck[k].clone()
+                    ckpts_by_j[j] = ck[k].clone()
         # Internal prefill checkpoints stay per group, in group order: only
         # the few groups that declare them gather.
         if prefill_ckpt_offsets is not None:
-            for ti, t, bs, prefill_ckpt_spec_blocks in mamba_geom:
+            for entry in mamba_geom:
+                ti, t, bs, prefill_ckpt_spec_blocks = (
+                    entry[0],
+                    entry[1],
+                    entry[2],
+                    entry[3],
+                )
                 if prefill_ckpt_spec_blocks is None:
                     continue
                 off, n, _ = table_geom[ti]
@@ -129,9 +285,26 @@ def _staged_walk_products(
                         prefill_ckpt_spec_blocks,
                     )
                 )
-    if ckpt_window <= 1:
-        ckpts = []
-    return tuple(outs) + tuple(states) + tuple(ckpts) + tuple(prefill_ckpts)
+    ckpts_ordered = (
+        [ckpts_by_j[j] for j in range(len(mamba_geom)) if j in ckpts_by_j]
+        if ckpt_window > 1
+        else []
+    )
+    tail: list[torch.Tensor] = []
+    if pp_indices:
+        # Preserve original `mamba_geom` order even if ping-pong groups span
+        # multiple `(t, bs)` geometry classes.
+        tail.append(torch.stack([states[j] for j in pp_indices], dim=0))
+        tail.append(torch.stack([ckpts_by_j[j] for j in pp_indices], dim=0))
+        if std_indices:
+            tail.append(torch.stack([states[j] for j in std_indices], dim=0))
+    return (
+        tuple(outs)
+        + tuple(states)
+        + tuple(ckpts_ordered)
+        + tuple(prefill_ckpts)
+        + tuple(tail)
+    )
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -251,14 +424,15 @@ def _build_group(self, common_prefix_len, common_attn_metadata, fast_build=False
                 mamba_prefill_ckpt_indices,
             ) = staged_products
         else:
-            _, target_num_blocks = self._block_table_geometry(ctx)
+            _, target_num_blocks = _block_table_geometry_for_group(self, ctx)
             block_tables_2d = block_tables_dev.reshape(
                 target_num_reqs, target_num_blocks
             )
+            eff_window = effective_ckpt_window(self, ctx.mamba_ckpt_window)
             # Everything but the gathers is shared with the other mamba
-            # groups; see `_mamba_row_plan`.
-            state_index, ckpt_index, ckpt_in_row = self._mamba_row_plan(
-                ctx, target_num_blocks
+            # groups; see `_mamba_row_plan_for_window`.
+            state_index, ckpt_index, ckpt_in_row = _mamba_row_plan_for_window(
+                self, ctx, target_num_blocks, eff_window
             )
             gathered_state_indices = torch.gather(
                 block_tables_2d,
@@ -287,9 +461,21 @@ def _build_group(self, common_prefix_len, common_attn_metadata, fast_build=False
                     self.prefill_ckpt_spec_blocks,
                 )
         if ctx.unified_mamba_state_indices is not None:
-            # Spec decode: expose this group's state blocks for the
-            # post-sampling read-offset scatter.
-            ctx.unified_mamba_state_indices.append(mamba_state_indices)
+            # Partition 2-slot ping-pong GDN groups from standard multi-slot
+            # Mamba groups (e.g. PLE) so pre-step `c_read` stays intact until
+            # post-verify rejection replay completes.
+            if is_ping_pong_mamba_group(
+                self, getattr(runner, "vllm_config", None), ctx.mamba_ckpt_window
+            ):
+                pp_list = getattr(ctx, "unified_ping_pong_mamba_state_indices", None)
+                if pp_list is None:
+                    pp_list = []
+                    ctx.unified_ping_pong_mamba_state_indices = pp_list  # type: ignore[attr-defined]
+                assert mamba_state_indices is not None
+                pp_list.append(mamba_state_indices)
+            else:
+                assert mamba_state_indices is not None
+                ctx.unified_mamba_state_indices.append(mamba_state_indices)
     else:
         mamba_state_indices = None
 
@@ -423,7 +609,9 @@ def stage_block_table_uploads(
                 if gid in seen or (gids is not None and gid not in gids):
                     continue
                 seen.add(gid)
-                block_table_obj, target_num_blocks = builder._block_table_geometry(ctx)
+                block_table_obj, target_num_blocks = _block_table_geometry_for_group(
+                    builder, ctx
+                )
                 entries.append((gid, block_table_obj, target_num_blocks))
                 entry_builders.append(builder)
         runner._stage_entries_cache = (entries_key, entries, entry_builders)
@@ -600,20 +788,34 @@ def _issue_walk_products(
     # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
     # per-group indices — which is what this precompute batches.
     unified_mamba = ctx.mamba_state_indices is None and runner._unified_kv_layout
-    mamba_geom: list[tuple[int, int, int, int | None]] = []
+    vllm_config = getattr(runner, "vllm_config", None)
+    mamba_geom_6: list[tuple[int, int, int, int | None, int, int]] = []
     mamba_entry_indices: list[int] = []
+    has_heterogeneous_pp = False
     if unified_mamba:
         for i, builder in enumerate(entry_builders):
             if builder.is_mamba_group:
-                mamba_geom.append(
+                ew, is_pp = _builder_window_props(
+                    builder, vllm_config, ctx.mamba_ckpt_window
+                )
+                if is_pp or (ctx.mamba_ckpt_window > 1 and ew != ctx.mamba_ckpt_window):
+                    has_heterogeneous_pp = True
+                mamba_geom_6.append(
                     (
                         i,
                         table_geom[i][2],
                         builder.target_block_size,
                         builder.prefill_ckpt_spec_blocks,
+                        ew,
+                        int(is_pp),
                     )
                 )
                 mamba_entry_indices.append(i)
+    mamba_geom: tuple = (
+        tuple(mamba_geom_6)
+        if has_heterogeneous_pp
+        else tuple((ti, t, bs, pc) for ti, t, bs, pc, _, _ in mamba_geom_6)
+    )
 
     if len(entries) == 1 and not mamba_geom:
         # Exactly one group with no mamba derivation: the flat upload is
@@ -666,26 +868,54 @@ def _issue_walk_products(
     if n_mamba:
         states = products[n_tables : n_tables + n_mamba]
         rest = products[n_tables + n_mamba :]
-        if ctx.mamba_ckpt_window > 1:
-            ckpts = rest[:n_mamba]
-            rest = rest[n_mamba:]
-        else:
-            ckpts = (None,) * n_mamba
+        has_ckpt = ctx.mamba_ckpt_window > 1
+        ckpt_cursor = 0
+        has_pp_2col = False
+        has_std = False
+        ckpts_per_group: list[torch.Tensor | None] = []
+        for entry in mamba_geom_6:
+            ew, pp = entry[4], entry[5]
+            if has_ckpt and ew > 1:
+                ckpts_per_group.append(rest[ckpt_cursor])
+                ckpt_cursor += 1
+                if pp and ew == 2:
+                    has_pp_2col = True
+                else:
+                    has_std = True
+            else:
+                ckpts_per_group.append(None)
+                if has_ckpt:
+                    has_std = True
+        rest = rest[ckpt_cursor:]
         # Prefill checkpoint ids follow, one per group that declares them.
-        prefill_ckpts = iter(rest)
+        num_prefill_ckpts = (
+            sum(1 for e in mamba_geom_6 if e[3] is not None)
+            if ctx.mamba_prefill_ckpt_offsets is not None
+            else 0
+        )
+        prefill_iter = iter(rest[:num_prefill_ckpts])
+        tail = rest[num_prefill_ckpts:]
         ctx.staged_mamba_products = {}
         for j, ei in enumerate(mamba_entry_indices):
             prefill_ckpt = (
-                next(prefill_ckpts)
+                next(prefill_iter)
                 if ctx.mamba_prefill_ckpt_offsets is not None
-                and mamba_geom[j][3] is not None
+                and mamba_geom_6[j][3] is not None
                 else None
             )
             ctx.staged_mamba_products[entries[ei][0]] = (
                 states[j],
-                ckpts[j],
+                ckpts_per_group[j],
                 prefill_ckpt,
             )
+        if has_heterogeneous_pp and has_pp_2col and len(tail) >= 2:
+            ctx.staged_ping_pong_stacks = (tail[0], tail[1])  # type: ignore[attr-defined]
+            ctx.staged_std_mamba_stack = (  # type: ignore[attr-defined]
+                tail[2] if (has_std and len(tail) >= 3) else None
+            )
+        else:
+            ctx.staged_ping_pong_stacks = None  # type: ignore[attr-defined]
+            ctx.staged_std_mamba_stack = None  # type: ignore[attr-defined]
 
 
 def build_attention_metadata(
@@ -738,7 +968,7 @@ def _build_attention_metadata_staged(self, ctx: AttentionMetadataBuilderContext)
     the caller runs the ordinary walk."""
     plan = self.__dict__.get("_fast_metadata_plan")
     if plan is None or plan[0] is not self.attn_groups:
-        groups: list[tuple[int, bool, tuple[str, ...]]] = []
+        groups: list[tuple[int, bool, tuple[str, ...], Any]] = []
         supported = True
         for group_list in self.attn_groups:
             for group in group_list:
@@ -751,6 +981,7 @@ def _build_attention_metadata_staged(self, ctx: AttentionMetadataBuilderContext)
                         builder.kv_cache_group_id,
                         builder.is_mamba_group,
                         tuple(group.layer_names),
+                        builder,
                     )
                 )
             if not supported:
@@ -771,7 +1002,7 @@ def _build_attention_metadata_staged(self, ctx: AttentionMetadataBuilderContext)
         # Internal prefill checkpoints: the builders resolve per-group
         # checkpoint ids and offsets; take their walk.
         return None
-    for gid, is_mamba, _ in plan[1]:
+    for gid, is_mamba, _, _ in plan[1]:
         if gid not in staged or (
             is_mamba and unified and (products is None or gid not in products)
         ):
@@ -786,8 +1017,9 @@ def _build_attention_metadata_staged(self, ctx: AttentionMetadataBuilderContext)
         sequence_layout_protocol=descriptor.protocol,
         sequence_layout_version=descriptor.version,
     )
+    vllm_config = getattr(self, "vllm_config", None)
     per_layer: dict[str, AttentionMetadata] = {}
-    for gid, is_mamba, layer_names in plan[1]:
+    for gid, is_mamba, layer_names, builder in plan[1]:
         if is_mamba:
             ckpt = None
             if compact is not None:
@@ -798,8 +1030,19 @@ def _build_attention_metadata_staged(self, ctx: AttentionMetadataBuilderContext)
             else:
                 state = None
             if unified and ctx.unified_mamba_state_indices is not None:
-                # pyrefly: ignore[bad-argument-type]
-                ctx.unified_mamba_state_indices.append(state)
+                assert state is not None
+                if is_ping_pong_mamba_group(
+                    builder, vllm_config, ctx.mamba_ckpt_window
+                ):
+                    pp_list = getattr(
+                        ctx, "unified_ping_pong_mamba_state_indices", None
+                    )
+                    if pp_list is None:
+                        pp_list = []
+                        ctx.unified_ping_pong_mamba_state_indices = pp_list  # type: ignore[attr-defined]
+                    pp_list.append(state)
+                else:
+                    ctx.unified_mamba_state_indices.append(state)
             built = AttentionMetadata(
                 block_tables=staged[gid],
                 mamba_state_indices=state,

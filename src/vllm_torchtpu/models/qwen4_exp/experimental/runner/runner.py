@@ -45,7 +45,7 @@ import contextlib
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -99,8 +99,35 @@ from vllm_torchtpu.spec_decode.utils import (
 )
 from vllm_torchtpu.utils import synchronize_tensors
 
+from ..metadata_access import mamba_ckpt_of, mamba_state_of
+from .metadata import is_ping_pong_mamba_spec
+from .two_slot import (
+    PingPongMambaChunkState,
+    compute_boundary_copy_and_interior_compiled,
+    compute_boundary_copy_and_interior_impl,
+    compute_boundary_copy_no_verify_compiled,
+    compute_boundary_copy_no_verify_impl,
+    compute_replay_commit_lens,
+    expand_split_masked,
+    get_or_build_multi_layer_two_slot_replay,
+    has_ping_pong_copy_groups,
+    is_ping_pong_copy_gid,
+    ping_pong_layers_match_group_order,
+    spec_boundary_pairs_compiled,
+    spec_boundary_pairs_impl,
+    two_slot_entries_shape,
+    update_ping_pong_read_offsets_compiled,
+    update_ping_pong_read_offsets_impl,
+)
+from .two_slot import (
+    SpecBoundaryPlan as TwoSlotBoundaryPlan,
+)
+
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import GrammarOutput
+    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+
+    from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 
 
 def _update_read_offsets_impl(
@@ -287,6 +314,899 @@ class Qwen38Runner(TPUModelRunner):
         super().__init__(*args, **kwargs)
         # #2723: stage timings are recorded only with a KV connector sink.
         self._stage_timing = SinkStageTiming(int(self._stage_timing._rank))
+        self._mamba_copy_group_windows: dict[int, int] = {}
+        self._mamba_copy_ping_pong_gids: set[int] = set()
+        self._two_slot_in_execute_model: bool = False
+        self._two_slot_chunk_records: list[dict[str, Any]] = []
+
+    def _build_mamba_copy_plan(
+        self,
+        kv_cache_config: "KVCacheConfig",
+        layer_to_raw: dict[str, torch.Tensor],
+        bm_pool_layout: "BlockMajorPoolLayout | None",
+    ) -> None:
+        super()._build_mamba_copy_plan(kv_cache_config, layer_to_raw, bm_pool_layout)
+        from vllm.v1.kv_cache_interface import MambaSpec
+
+        group_windows: dict[int, int] = {}
+        ping_pong_gids: set[int] = set()
+        if self.cache_config.mamba_cache_mode == "align":
+            plan_gids = {gid for gid, _ in self._mamba_copy_plan}
+            for gid, group in enumerate(kv_cache_config.kv_cache_groups):
+                if not isinstance(group.kv_cache_spec, MambaSpec):
+                    continue
+                spec_blocks = int(
+                    getattr(group.kv_cache_spec, "num_speculative_blocks", 0) or 0
+                )
+                if spec_blocks > 0:
+                    group_windows[gid] = 1 + spec_blocks
+                if gid in plan_gids and is_ping_pong_mamba_spec(
+                    group.kv_cache_spec, getattr(self, "vllm_config", None)
+                ):
+                    ping_pong_gids.add(gid)
+        self._mamba_copy_group_windows = group_windows
+        self._mamba_copy_ping_pong_gids = ping_pong_gids
+
+    def _mamba_state_index_groups(self) -> list[torch.Tensor] | None:
+        ctx = self._attn_metadata_builder_ctx
+        if self.mamba_slot_read_offsets is None or ctx is None:
+            return None
+        if ctx.mamba_state_indices is not None:
+            return [ctx.mamba_state_indices]
+        combined = list(ctx.unified_mamba_state_indices or ()) + list(
+            getattr(ctx, "unified_ping_pong_mamba_state_indices", None) or ()
+        )
+        return combined or None
+
+    def _get_two_slot_gdn_layers(self) -> tuple[Any, ...]:
+        model = getattr(self, "model", None)
+        if model is None:
+            return ()
+        cached = getattr(self, "_two_slot_gdn_layers_cache", None)
+        if cached is not None and cached[0] is model:
+            return cached[1]
+        found: list[Any] = []
+        backbone = getattr(model, "model", model)
+        for layer in getattr(backbone, "layers", ()):
+            lin = getattr(layer, "linear_attn", None)
+            if lin is not None and getattr(lin, "_two_slot_mtp", False):
+                found.append(lin)
+        if not found and hasattr(model, "named_modules"):
+            for _, mod in model.named_modules():
+                if getattr(mod, "_two_slot_mtp", False) and hasattr(
+                    mod, "replay_two_slot_state"
+                ):
+                    found.append(mod)
+        layers_tuple = tuple(found)
+        self._two_slot_gdn_layers_cache = (model, layers_tuple)
+        return layers_tuple
+
+    def _snapshot_two_slot_gdn_verify_inputs(
+        self, max_rows: int
+    ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        snap: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        for layer in self._get_two_slot_gdn_layers():
+            item = layer.snapshot_verify_inputs(max_rows=max_rows)
+            if item is not None:
+                snap[layer.prefix] = item
+        return snap
+
+    def _plan_two_slot_boundary_copies(
+        self,
+        scheduler_output: "SchedulerOutput",
+        start_index: int,
+        num_reqs: int,
+        seq_lens: torch.Tensor,
+    ) -> TwoSlotBoundaryPlan | None:
+        if not (
+            has_ping_pong_copy_groups(self)
+            and self._mamba_ckpt_window > 1
+            and self.mamba_slot_read_offsets is not None
+            and bool(self._mamba_copy_plan)
+            and (
+                self.cache_config.enable_prefix_caching
+                or self.vllm_config.kv_transfer_config is not None
+            )
+        ):
+            return None
+        block_size = self._mamba_column_stride()
+        slack = 0
+        if self.scheduler_config.async_scheduling:
+            assert self.speculative_config is not None
+            slack = self.speculative_config.num_speculative_tokens
+        num_computed = self.input_batch.num_computed_tokens_cpu
+        if (
+            hasattr(self, "query_start_loc_np")
+            and len(self.query_start_loc_np) >= num_reqs + 1
+        ):
+            comp_slice = num_computed[start_index : start_index + num_reqs]
+            sched_slice = (
+                self.query_start_loc_np[1 : num_reqs + 1]
+                - self.query_start_loc_np[:num_reqs]
+            )
+            first_bnds = (
+                np.maximum(comp_slice - slack, 0) // block_size + 1
+            ) * block_size
+            if bool(np.all(first_bnds > comp_slice + sched_slice)):
+                return None
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens or {}
+        req_ids = self.input_batch.req_ids
+        candidates: list[tuple[int, int, int]] = []
+        for i in range(num_reqs):
+            req_id = req_ids[start_index + i]
+            assert req_id is not None
+            computed = int(num_computed[start_index + i])
+            scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            is_spec_req = bool(spec_tokens.get(req_id))
+            if not is_spec_req and not (scheduled == 1 and computed > 0):
+                continue
+            boundary = (max(computed - slack, 0) // block_size + 1) * block_size
+            while boundary <= computed + scheduled:
+                candidates.append((i, boundary, scheduled))
+                boundary += block_size
+        if not candidates:
+            return None
+        width = self._mamba_ckpt_window + 1
+        n = len(candidates)
+        host = torch.zeros(two_slot_entries_shape(self, n), dtype=torch.int32)
+        host[:n, :3] = torch.tensor(candidates, dtype=torch.int32)
+        for g, (gid, _) in enumerate(self._mamba_copy_plan):
+            bt = self.input_batch.block_table[gid].get_cpu_tensor()
+            row_width = bt.shape[1]
+            base = 3 + g * width
+            for e, (i, boundary, _) in enumerate(candidates):
+                first = boundary // block_size - 1
+                last = min(first + width, row_width)
+                host[e, base : base + last - first] = bt[start_index + i, first:last]
+        entries = stage_h2d_upload(self, host)
+        if entries.device.type == "tpu":
+            return TwoSlotBoundaryPlan(
+                entries=entries,
+                rows=None,
+                seq_lens=None,
+                block_size=block_size,
+                host_entries=host,
+                chunk_seq_lens=seq_lens,
+            )
+        rows = entries[:, 0].long()
+        return TwoSlotBoundaryPlan(
+            entries=entries,
+            rows=rows,
+            seq_lens=seq_lens.index_select(0, rows).to(torch.int32),
+            block_size=block_size,
+            host_entries=host,
+            chunk_seq_lens=seq_lens,
+        )
+
+    def _prepare_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        start_index: int,
+        num_decode_reqs: int,
+        num_windowed_reqs: int | None = None,
+    ):
+        # If a previous chunk executed inside the same `execute_model` step,
+        # snapshot its staged verify buffers before this chunk's forward can
+        # overwrite them (multi-chunk batch safety; zero cost on 1-chunk steps).
+        if self._two_slot_in_execute_model and self._two_slot_chunk_records:
+            prev = self._two_slot_chunk_records[-1]
+            if prev["staged_verify_inputs"] is None and prev["win_rows"] > 0:
+                prev["staged_verify_inputs"] = (
+                    self._snapshot_two_slot_gdn_verify_inputs(prev["win_rows"])
+                )
+        result = super()._prepare_inputs(
+            scheduler_output, start_index, num_decode_reqs, num_windowed_reqs
+        )
+        if self._two_slot_in_execute_model and self.mamba_slot_read_offsets is not None:
+            per_layer_attn_metadata = result[0]
+            num_reqs = result[3]
+            eff_windowed = (
+                num_decode_reqs if num_windowed_reqs is None else num_windowed_reqs
+            )
+            ctx = self._attn_metadata_builder_ctx
+            pp_indices = getattr(ctx, "unified_ping_pong_mamba_state_indices", None)
+            chunk_num_win = max(0, min(eff_windowed - start_index, num_reqs))
+            win_rows = (
+                int(self.query_start_loc_np[chunk_num_win])
+                if chunk_num_win > 0 and hasattr(self, "query_start_loc_np")
+                else 0
+            )
+            boundary_plan = self._plan_two_slot_boundary_copies(
+                scheduler_output, start_index, num_reqs, ctx.seq_lens
+            )
+            self._two_slot_chunk_records.append(
+                {
+                    "pp_indices": list(pp_indices) if pp_indices else None,
+                    "attn_metadata": per_layer_attn_metadata,
+                    "chunk_num_windowed": chunk_num_win,
+                    "win_rows": win_rows,
+                    "num_reqs": num_reqs,
+                    "query_start_loc": ctx.query_start_loc,
+                    "seq_lens": ctx.seq_lens,
+                    "staged_verify_inputs": None,
+                    "staged_ping_pong_stacks": getattr(
+                        ctx, "staged_ping_pong_stacks", None
+                    ),
+                    "staged_std_mamba_stack": getattr(
+                        ctx, "staged_std_mamba_stack", None
+                    ),
+                    "boundary_plan": boundary_plan,
+                }
+            )
+        return result
+
+    @torch.no_grad()
+    def execute_model(
+        self,
+        scheduler_output: "SchedulerOutput",
+        intermediate_tensors: Any = None,
+    ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput | None:
+        self._two_slot_in_execute_model = True
+        self._two_slot_chunk_records = []
+        try:
+            out = super().execute_model(scheduler_output, intermediate_tensors)
+            state = self.execute_model_state
+            if state is not None and self._two_slot_chunk_records:
+                pp_chunks: list[PingPongMambaChunkState | None] = []
+                boundary_plans: list[TwoSlotBoundaryPlan | None] = []
+                for rec in self._two_slot_chunk_records:
+                    if rec["pp_indices"]:
+                        pp_chunks.append(
+                            PingPongMambaChunkState(
+                                state_indices=rec["pp_indices"],
+                                attn_metadata=rec["attn_metadata"],
+                                chunk_num_windowed=rec["chunk_num_windowed"],
+                                num_reqs=rec["num_reqs"],
+                                query_start_loc=rec["query_start_loc"],
+                                seq_lens=rec["seq_lens"],
+                                staged_verify_inputs=rec["staged_verify_inputs"],
+                                staged_ping_pong_stacks=rec["staged_ping_pong_stacks"],
+                                staged_std_mamba_stack=rec["staged_std_mamba_stack"],
+                            )
+                        )
+                    else:
+                        pp_chunks.append(None)
+                    boundary_plans.append(rec["boundary_plan"])
+                state.ping_pong_mamba_chunks = pp_chunks  # type: ignore[attr-defined]
+                state.two_slot_boundary_plans = boundary_plans  # type: ignore[attr-defined]
+            return out
+        finally:
+            self._two_slot_in_execute_model = False
+            self._two_slot_chunk_records = []
+
+    def _two_slot_dist3(self, w: int, dev: torch.device) -> torch.Tensor:
+        cache = self.__dict__.setdefault("_two_slot_dist3_device", {})
+        key = (int(w), dev)
+        t = cache.get(key)
+        if t is None:
+            t = torch.tensor([int(w), int(w), int(w)], dtype=torch.int32, device=dev)
+            cache[key] = t
+        return t
+
+    def _get_compiled_boundary_meta(
+        self, layers: tuple[Any, ...], dev: torch.device
+    ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        if not self._mamba_copy_plan or self.mamba_slot_read_offsets is None:
+            return None
+        raw_keys = {tuple(id(raw) for raw in raws) for _, raws in self._mamba_copy_plan}
+        if len(raw_keys) != 1:
+            return None
+        raws0 = self._mamba_copy_plan[0][1]
+        cache_key = (
+            tuple(gid for gid, _ in self._mamba_copy_plan),
+            tuple(id(r) for r in raws0),
+            tuple(id(layer) for layer in layers),
+            int(self.mamba_slot_read_offsets.shape[0]),
+            dev,
+        )
+        cached = self.__dict__.get("_compiled_boundary_meta_cache")
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+        gid_to_pos = {gid: pos for pos, (gid, _) in enumerate(self._mamba_copy_plan)}
+        layer_to_gid: dict[str, int] = {}
+        for group_list in getattr(self, "attn_groups", ()) or ():
+            for group in group_list:
+                for lname in group.layer_names:
+                    layer_to_gid[lname] = group.kv_cache_group_id
+        layer_positions: list[int] = []
+        for layer in layers:
+            gid = layer_to_gid.get(layer.prefix)
+            if (
+                gid is None
+                or gid not in gid_to_pos
+                or not is_ping_pong_copy_gid(self, gid)
+            ):
+                self._compiled_boundary_meta_cache = (cache_key, None)
+                return None
+            layer_positions.append(gid_to_pos[gid])
+        is_pp_mask = torch.tensor(
+            [is_ping_pong_copy_gid(self, gid) for gid, _ in self._mamba_copy_plan],
+            dtype=torch.bool,
+            device=dev,
+        )
+        layer_to_plan_idx = torch.tensor(layer_positions, dtype=torch.int64, device=dev)
+        zero_offsets = self.__dict__.get("_zero_mamba_slot_read_offsets")
+        if (
+            zero_offsets is None
+            or zero_offsets.shape != self.mamba_slot_read_offsets.shape
+            or zero_offsets.device != dev
+        ):
+            zero_offsets = torch.zeros_like(self.mamba_slot_read_offsets)
+            self._zero_mamba_slot_read_offsets = zero_offsets
+        res = (raws0, is_pp_mask, layer_to_plan_idx, zero_offsets)
+        self._compiled_boundary_meta_cache = (cache_key, res)
+        return res
+
+    def _two_slot_win_and_reqs(self, w: int, n: int, dev: torch.device) -> torch.Tensor:
+        cache = self.__dict__.setdefault("_two_slot_win_reqs_device", {})
+        key = (int(w), int(n), dev)
+        t = cache.get(key)
+        if t is None:
+            t = torch.tensor([int(w), int(n)], dtype=torch.int32, device=dev)
+            cache[key] = t
+        return t
+
+    @torch.no_grad()
+    def _post_verify_two_slot_gdn_chunk(
+        self,
+        chunk: PingPongMambaChunkState | None,
+        md: Any,
+        next_tokens: torch.Tensor,
+        boundary_plan: Any,
+        mamba_indices: list[torch.Tensor] | None = None,
+    ) -> bool:
+        """Fused post-verify 2-slot GDN replay + boundary export + offset update.
+
+        Returns True when non-ping-pong Mamba groups (`mamba_indices`, e.g. 12
+        PLE groups) also had their `slot_read_offsets` updated inside
+        `replay_and_flip`, allowing `sample_tokens` to skip the separate
+        `_update_mamba_slot_read_offsets` dispatch.
+        """
+        if (
+            chunk is not None
+            and chunk.chunk_num_windowed > 0
+            and chunk.staged_verify_inputs is None
+            and chunk.staged_ping_pong_stacks is not None
+            and self.mamba_slot_read_offsets is not None
+            and chunk.query_start_loc.device.type == "tpu"
+            and bool(md.draft_lengths_cpu[: chunk.num_reqs].any())
+        ):
+            layers = self._get_two_slot_gdn_layers()
+            if layers:
+                s_st, c_st = chunk.staged_ping_pong_stacks
+                if (
+                    s_st.shape[0] in (1, len(layers))
+                    and c_st.shape[0] == s_st.shape[0]
+                    and ping_pong_layers_match_group_order(
+                        self, layers, is_ping_pong_spec=is_ping_pong_mamba_spec
+                    )
+                ):
+                    multi_runner = get_or_build_multi_layer_two_slot_replay(
+                        self, layers
+                    )
+                    if (
+                        multi_runner is not None
+                        and multi_runner.can_replay_and_flip_fast()
+                    ):
+                        dev = chunk.query_start_loc.device
+                        w = chunk.chunk_num_windowed
+                        ple_st = (
+                            chunk.staged_std_mamba_stack
+                            if (
+                                chunk.staged_std_mamba_stack is not None
+                                and mamba_indices is not None
+                                and chunk.staged_std_mamba_stack.shape[0]
+                                == len(mamba_indices)
+                            )
+                            else None
+                        )
+                        ple_done = ple_st is not None or not mamba_indices
+                        dist = self._two_slot_dist3(w, dev)
+                        wr_vec = self._two_slot_win_and_reqs(w, chunk.num_reqs, dev)
+                        if boundary_plan is None:
+                            multi_runner.replay_and_flip(
+                                state_stack=s_st,
+                                ckpt_stack=c_st,
+                                query_start_loc=chunk.query_start_loc,
+                                next_tokens=next_tokens,
+                                win_and_reqs=wr_vec,
+                                distribution=dist,
+                                seq_lens=chunk.seq_lens,
+                                slot_read_offsets=self.mamba_slot_read_offsets,
+                                ple_state_stack=ple_st,
+                            )
+                            return ple_done
+                        bmeta = self._get_compiled_boundary_meta(layers, dev)
+                        if bmeta is not None:
+                            raws0, is_pp_mask, layer_to_plan_idx, zero_offsets = bmeta
+                            width = self._mamba_ckpt_window + 1
+                            split = max(1, self._pool_block_split)
+                            out_bucket = self._bucket_len(
+                                len(self._mamba_copy_plan)
+                                * int(boundary_plan.entries.shape[0])
+                                * split
+                            )
+                            # Compute boundary copy & interior replay targets BEFORE
+                            # `replay_and_flip` flips `mamba_slot_read_offsets`.
+                            c_src, c_dst, s_int, ckpt_int, cl_int = (
+                                compute_boundary_copy_and_interior_compiled(
+                                    boundary_plan.entries,
+                                    chunk.seq_lens,
+                                    next_tokens,
+                                    self.mamba_slot_read_offsets,
+                                    self._num_reqs_tensor(w),
+                                    is_pp_mask,
+                                    layer_to_plan_idx,
+                                    boundary_plan.block_size,
+                                    width,
+                                    split,
+                                    out_bucket,
+                                )
+                            )
+                            multi_runner.replay_and_flip(
+                                state_stack=s_st,
+                                ckpt_stack=c_st,
+                                query_start_loc=chunk.query_start_loc,
+                                next_tokens=next_tokens,
+                                win_and_reqs=wr_vec,
+                                distribution=dist,
+                                seq_lens=chunk.seq_lens,
+                                slot_read_offsets=self.mamba_slot_read_offsets,
+                                ple_state_stack=ple_st,
+                            )
+                            self._copy_mamba_state_blocks(raws0, c_src, c_dst)
+                            multi_runner(
+                                raw_state_indices_stack=s_int,
+                                raw_ckpt_indices_stack=ckpt_int,
+                                commit_lens_stack=cl_int,
+                                query_start_loc=chunk.query_start_loc,
+                                distribution=dist,
+                                seq_lens=chunk.seq_lens,
+                                slot_read_offsets=zero_offsets,
+                            )
+                            return ple_done
+
+        self._replay_two_slot_gdn_chunk(chunk, md, next_tokens)
+        self._copy_two_slot_boundary_states(
+            boundary_plan, next_tokens, ping_pong_chunk=chunk
+        )
+        self._update_ping_pong_mamba_slot_read_offsets(chunk)
+        return False
+
+    @torch.no_grad()
+    def _replay_two_slot_gdn_chunk(
+        self,
+        chunk: PingPongMambaChunkState | None,
+        md: Any,
+        next_tokens: torch.Tensor,
+    ) -> None:
+        if (
+            chunk is None
+            or chunk.chunk_num_windowed <= 0
+            or self.mamba_slot_read_offsets is None
+        ):
+            return
+        if int(md.draft_lengths_cpu[: chunk.num_reqs].sum()) == 0:
+            return
+        layers = self._get_two_slot_gdn_layers()
+        if not layers:
+            return
+        commit_lens = compute_replay_commit_lens(
+            chunk.query_start_loc, next_tokens, chunk.chunk_num_windowed
+        )
+        if commit_lens.device.type == "cpu" and not bool((commit_lens > 0).any()):
+            return
+        dev = chunk.query_start_loc.device
+        dist = self._two_slot_dist3(chunk.chunk_num_windowed, dev)
+        multi_runner = get_or_build_multi_layer_two_slot_replay(self, layers)
+        if multi_runner is not None:
+            if chunk.staged_ping_pong_stacks is not None and dev.type == "tpu":
+                s_st, c_st = chunk.staged_ping_pong_stacks
+                if (
+                    s_st.shape[0] in (1, len(layers))
+                    and c_st.shape[0] == s_st.shape[0]
+                    and ping_pong_layers_match_group_order(
+                        self, layers, is_ping_pong_spec=is_ping_pong_mamba_spec
+                    )
+                ):
+                    multi_runner(
+                        raw_state_indices_stack=s_st,
+                        raw_ckpt_indices_stack=c_st,
+                        commit_lens_stack=commit_lens.unsqueeze(0),
+                        query_start_loc=chunk.query_start_loc,
+                        distribution=dist,
+                        seq_lens=chunk.seq_lens,
+                        slot_read_offsets=self.mamba_slot_read_offsets,
+                        staged_inputs=chunk.staged_verify_inputs,
+                    )
+                    return
+            per_layer_sc: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for layer in layers:
+                layer_md = chunk.attn_metadata.get(layer.prefix)
+                if layer_md is None:
+                    per_layer_sc = []
+                    break
+                s_ids = mamba_state_of(layer_md)
+                c_ids = mamba_ckpt_of(layer_md)
+                if s_ids is None or c_ids is None:
+                    per_layer_sc = []
+                    break
+                per_layer_sc.append((s_ids, c_ids))
+            if len(per_layer_sc) == len(layers):
+                s_stack = torch.stack(
+                    [s.to(torch.int32) for s, _ in per_layer_sc], dim=0
+                )
+                c_stack = torch.stack(
+                    [c.to(torch.int32) for _, c in per_layer_sc], dim=0
+                )
+                multi_runner(
+                    raw_state_indices_stack=s_stack,
+                    raw_ckpt_indices_stack=c_stack,
+                    commit_lens_stack=commit_lens.unsqueeze(0),
+                    query_start_loc=chunk.query_start_loc,
+                    distribution=dist,
+                    seq_lens=chunk.seq_lens,
+                    slot_read_offsets=self.mamba_slot_read_offsets,
+                    staged_inputs=chunk.staged_verify_inputs,
+                )
+                return
+        for layer in layers:
+            layer_md = chunk.attn_metadata.get(layer.prefix)
+            if layer_md is None:
+                continue
+            state_ids = mamba_state_of(layer_md)
+            ckpt_ids = mamba_ckpt_of(layer_md)
+            if state_ids is None or ckpt_ids is None:
+                continue
+            staged = (
+                chunk.staged_verify_inputs.get(layer.prefix)
+                if chunk.staged_verify_inputs is not None
+                else None
+            )
+            layer.replay_two_slot_state(
+                state_indices=state_ids,
+                query_start_loc=chunk.query_start_loc,
+                distribution=dist,
+                seq_lens=chunk.seq_lens,
+                slot_read_offsets=self.mamba_slot_read_offsets,
+                ckpt_indices=ckpt_ids,
+                commit_lens=commit_lens,
+                staged_inputs=staged,
+            )
+
+    @torch.no_grad()
+    def _export_two_slot_interior_boundaries(
+        self,
+        s_int: torch.Tensor,
+        ckpt_int: torch.Tensor,
+        cl_int: torch.Tensor,
+        chunk: PingPongMambaChunkState,
+        zero_offsets: torch.Tensor,
+    ) -> None:
+        layers = self._get_two_slot_gdn_layers()
+        if not layers:
+            return
+        dev = chunk.seq_lens.device
+        dist = self._two_slot_dist3(chunk.chunk_num_windowed, dev)
+        if cl_int.device.type == "cpu" and not bool((cl_int > 0).any()):
+            return
+        multi_runner = get_or_build_multi_layer_two_slot_replay(self, layers)
+        if multi_runner is not None:
+            multi_runner(
+                raw_state_indices_stack=s_int,
+                raw_ckpt_indices_stack=ckpt_int,
+                commit_lens_stack=cl_int,
+                query_start_loc=chunk.query_start_loc,
+                distribution=dist,
+                seq_lens=chunk.seq_lens,
+                slot_read_offsets=zero_offsets,
+                staged_inputs=chunk.staged_verify_inputs,
+            )
+            return
+        for l_idx, layer in enumerate(layers):
+            cl_l = cl_int[l_idx]
+            if cl_l.device.type == "cpu" and not bool((cl_l > 0).any()):
+                continue
+            staged = (
+                chunk.staged_verify_inputs.get(layer.prefix)
+                if chunk.staged_verify_inputs is not None
+                else None
+            )
+            layer.replay_two_slot_state(
+                state_indices=s_int[l_idx],
+                query_start_loc=chunk.query_start_loc,
+                distribution=dist,
+                seq_lens=chunk.seq_lens,
+                slot_read_offsets=zero_offsets,
+                ckpt_indices=ckpt_int[l_idx],
+                commit_lens=cl_l,
+                staged_inputs=staged,
+            )
+
+    @torch.no_grad()
+    def _copy_two_slot_boundary_states(
+        self,
+        plan: Any,
+        next_tokens: torch.Tensor | None,
+        ping_pong_chunk: PingPongMambaChunkState | None = None,
+    ) -> None:
+        if plan is None or self.mamba_slot_read_offsets is None:
+            return
+        width = self._mamba_ckpt_window + 1
+        split = max(1, self._pool_block_split)
+        entries = plan.entries
+        dev = entries.device
+        chunk_seq_lens = (
+            getattr(plan, "chunk_seq_lens", None)
+            if isinstance(plan, TwoSlotBoundaryPlan)
+            else plan.seq_lens
+        )
+        if chunk_seq_lens is None and ping_pong_chunk is not None:
+            chunk_seq_lens = ping_pong_chunk.seq_lens
+        layers = self._get_two_slot_gdn_layers()
+        bmeta = self._get_compiled_boundary_meta(layers, dev) if layers else None
+        if next_tokens is None and bmeta is not None and chunk_seq_lens is not None:
+            raws0, is_pp_mask, _, _ = bmeta
+            out_bucket = self._bucket_len(
+                len(self._mamba_copy_plan) * int(entries.shape[0]) * split
+            )
+            has_win = ping_pong_chunk is not None
+            win_val = ping_pong_chunk.chunk_num_windowed if has_win else 0
+            fn = (
+                compute_boundary_copy_no_verify_compiled
+                if dev.type == "tpu"
+                else compute_boundary_copy_no_verify_impl
+            )
+            c_src, c_dst = fn(
+                entries,
+                chunk_seq_lens,
+                self.mamba_slot_read_offsets,
+                self._num_reqs_tensor(win_val),
+                is_pp_mask,
+                has_win,
+                plan.block_size,
+                width,
+                split,
+                out_bucket,
+            )
+            self._copy_mamba_state_blocks(raws0, c_src, c_dst)
+            return
+        if (
+            next_tokens is not None
+            and bmeta is not None
+            and chunk_seq_lens is not None
+            and ping_pong_chunk is not None
+        ):
+            raws0, is_pp_mask, layer_to_plan_idx, zero_offsets = bmeta
+            out_bucket = self._bucket_len(
+                len(self._mamba_copy_plan) * int(entries.shape[0]) * split
+            )
+            fn_v = (
+                compute_boundary_copy_and_interior_compiled
+                if dev.type == "tpu"
+                else compute_boundary_copy_and_interior_impl
+            )
+            c_src, c_dst, s_int, ckpt_int, cl_int = fn_v(
+                entries,
+                chunk_seq_lens,
+                next_tokens,
+                self.mamba_slot_read_offsets,
+                self._num_reqs_tensor(ping_pong_chunk.chunk_num_windowed),
+                is_pp_mask,
+                layer_to_plan_idx,
+                plan.block_size,
+                width,
+                split,
+                out_bucket,
+            )
+            self._copy_mamba_state_blocks(raws0, c_src, c_dst)
+            self._export_two_slot_interior_boundaries(
+                s_int, ckpt_int, cl_int, ping_pong_chunk, zero_offsets
+            )
+            return
+        # Fallback when groups use distinct raw pools or there are no GDN layers.
+        rows = entries[:, 0].long()
+        if chunk_seq_lens is None:
+            return
+        max_seqs = chunk_seq_lens.shape[0]
+        valid_seq_row = (rows >= 0) & (rows < max_seqs)
+        safe_rows = rows.clamp(0, max(0, max_seqs - 1))
+        plan_seq_lens = torch.where(
+            valid_seq_row,
+            chunk_seq_lens.index_select(0, safe_rows).to(torch.int32),
+            torch.zeros(rows.shape[0], dtype=torch.int32, device=dev),
+        )
+        if next_tokens is not None:
+            valid_nt = valid_seq_row & (rows < next_tokens.shape[0])
+            safe_nt = rows.clamp(0, max(0, next_tokens.shape[0] - 1))
+            num_valid = torch.where(
+                valid_nt,
+                (next_tokens.index_select(0, safe_nt) != INVALID_TOKEN_ID)
+                .sum(dim=1)
+                .to(torch.int32),
+                torch.zeros_like(plan_seq_lens),
+            )
+            fn_std = (
+                spec_boundary_pairs_compiled
+                if dev.type == "tpu"
+                else spec_boundary_pairs_impl
+            )
+            std_src, std_dst = fn_std(
+                entries,
+                plan_seq_lens,
+                num_valid,
+                plan.block_size,
+                width,
+                valid_rows=valid_nt,
+            )
+        else:
+            valid_nt = valid_seq_row
+            num_valid = torch.ones_like(plan_seq_lens)
+            std_src = std_dst = None
+        offsets = self.mamba_slot_read_offsets
+        n_off = int(offsets.shape[0])
+        boundary = entries[:, 1]
+        scheduled = entries[:, 2]
+        start = plan_seq_lens - scheduled
+        reached = (
+            valid_nt
+            & (boundary > 0)
+            & (scheduled > 0)
+            & (start < boundary)
+            & (boundary <= start + num_valid)
+        )
+        if ping_pong_chunk is not None:
+            reached = reached & (rows < ping_pong_chunk.chunk_num_windowed)
+        exact_hit = reached & (boundary == start + num_valid)
+        interior_hit = reached & (boundary < start + num_valid)
+        blocks = entries[:, 3:].reshape(entries.shape[0], -1, width).transpose(0, 1)
+        raw_col_rel = (plan_seq_lens - 1) // plan.block_size - (
+            boundary // plan.block_size - 1
+        )
+        col_in_range = (raw_col_rel >= 0) & (raw_col_rel + 1 < width)
+        col_rel = raw_col_rel.clamp(0, max(0, width - 2))
+        idx0 = col_rel.view(1, -1, 1).expand(blocks.shape[0], -1, 1)
+        idx1 = (
+            (col_rel + 1)
+            .clamp(max=width - 1)
+            .view(1, -1, 1)
+            .expand(blocks.shape[0], -1, 1)
+        )
+        b0_all = blocks.gather(2, idx0).squeeze(2)
+        b1_all = blocks.gather(2, idx1).squeeze(2)
+        per_raw: dict[
+            tuple[int, ...],
+            tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]],
+        ] = {}
+        interior_gid_pairs: dict[
+            int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+        for g, (gid, raws) in enumerate(self._mamba_copy_plan):
+            if is_ping_pong_copy_gid(self, gid):
+                b0 = b0_all[g]
+                b1 = b1_all[g]
+                dst_b = blocks[g, :, 0]
+                valid_pair = (
+                    col_in_range
+                    & (b0 > 0)
+                    & (b0 < n_off)
+                    & (b1 > 0)
+                    & (b1 < n_off)
+                    & (dst_b > 0)
+                    & (dst_b < n_off)
+                )
+                null_g = torch.zeros_like(dst_b)
+                c_read = (
+                    offsets[b0.clamp(0, n_off - 1).long()].clamp(0, 1)
+                    if n_off > 0
+                    else null_g
+                )
+                write_blk = torch.where(c_read == 0, b1, b0)
+                read_blk = torch.where(c_read == 0, b0, b1)
+                do_copy = exact_hit & valid_pair & (write_blk != dst_b)
+                src_g, dst_g = expand_split_masked(
+                    torch.where(do_copy, write_blk, null_g),
+                    torch.where(do_copy, dst_b, null_g),
+                    split,
+                )
+                entry = per_raw.setdefault(tuple(id(r) for r in raws), (raws, [], []))
+                entry[1].append(src_g)
+                entry[2].append(dst_g)
+                if next_tokens is not None:
+                    int_mask = interior_hit & valid_pair
+                    if int_mask.device.type != "cpu" or bool(int_mask.any()):
+                        interior_gid_pairs[gid] = (
+                            torch.where(int_mask, read_blk, null_g),
+                            torch.where(int_mask, dst_b, null_g),
+                            torch.where(
+                                int_mask,
+                                (boundary - start).to(torch.int32),
+                                null_g,
+                            ),
+                        )
+                continue
+            if std_src is None or std_dst is None:
+                continue
+            src_g, dst_g = expand_split_masked(std_src[g], std_dst[g], split)
+            entry = per_raw.setdefault(tuple(id(r) for r in raws), (raws, [], []))
+            entry[1].append(src_g)
+            entry[2].append(dst_g)
+        for raws, srcs, dsts in per_raw.values():
+            self._copy_mamba_state_blocks(
+                raws,
+                self._pad_dev_to_bucket(torch.cat(srcs)),
+                self._pad_dev_to_bucket(torch.cat(dsts)),
+            )
+        if interior_gid_pairs and ping_pong_chunk is not None and layers:
+            zero_offsets = torch.zeros_like(offsets)
+            dummy_row = torch.full_like(rows, max_seqs)
+            layer_to_gid: dict[str, int] = {}
+            for group_list in getattr(self, "attn_groups", ()) or ():
+                for group in group_list:
+                    for lname in group.layer_names:
+                        layer_to_gid[lname] = group.kv_cache_group_id
+            dist = self._two_slot_dist3(ping_pong_chunk.chunk_num_windowed, dev)
+            for layer in layers:
+                gid = layer_to_gid.get(layer.prefix)
+                if gid is None or gid not in interior_gid_pairs:
+                    continue
+                read_c, dst_c, k_c = interior_gid_pairs[gid]
+                active_c = valid_seq_row & (k_c > 0) & (read_c > 0) & (dst_c > 0)
+                if active_c.device.type == "cpu" and not bool(active_c.any()):
+                    continue
+                tgt = torch.where(active_c, rows.clamp(0, max_seqs), dummy_row)
+                r_pad = torch.zeros(max_seqs + 1, dtype=torch.int32, device=dev)
+                d_pad = torch.zeros(max_seqs + 1, dtype=torch.int32, device=dev)
+                c_pad = torch.zeros(max_seqs + 1, dtype=torch.int32, device=dev)
+                r_pad.index_put_((tgt,), read_c.to(torch.int32))
+                d_pad.index_put_((tgt,), dst_c.to(torch.int32))
+                c_pad.index_put_((tgt,), k_c.to(torch.int32))
+                r_seq = r_pad[:max_seqs]
+                d_seq = d_pad[:max_seqs]
+                c_seq = c_pad[:max_seqs]
+                staged = (
+                    ping_pong_chunk.staged_verify_inputs.get(layer.prefix)
+                    if ping_pong_chunk.staged_verify_inputs is not None
+                    else None
+                )
+                layer.replay_two_slot_state(
+                    state_indices=r_seq,
+                    query_start_loc=ping_pong_chunk.query_start_loc,
+                    distribution=dist,
+                    seq_lens=ping_pong_chunk.seq_lens,
+                    slot_read_offsets=zero_offsets,
+                    ckpt_indices=torch.stack([r_seq, d_seq], dim=1),
+                    commit_lens=c_seq,
+                    staged_inputs=staged,
+                )
+
+    @torch.no_grad()
+    def _update_ping_pong_mamba_slot_read_offsets(
+        self, chunk: PingPongMambaChunkState | None
+    ) -> None:
+        if (
+            chunk is None
+            or not chunk.state_indices
+            or self.mamba_slot_read_offsets is None
+        ):
+            return
+        groups = (
+            [chunk.staged_ping_pong_stacks[0]]
+            if chunk.staged_ping_pong_stacks is not None
+            else list(chunk.state_indices)
+        )
+        fn = (
+            update_ping_pong_read_offsets_compiled
+            if self.mamba_slot_read_offsets.device.type == "tpu"
+            else update_ping_pong_read_offsets_impl
+        )
+        fn(
+            self.mamba_slot_read_offsets,
+            groups,
+            chunk.query_start_loc,
+            self._num_reqs_tensor(chunk.chunk_num_windowed),
+            self._num_reqs_tensor(chunk.num_reqs),
+        )
 
     def load_model(self) -> None:
         super().load_model()
@@ -304,6 +1224,221 @@ class Qwen38Runner(TPUModelRunner):
         # #2650: `capture_model` compiles the one-chunk spec tail right after
         # the boundary copies.
         self._precompile_spec_tail()
+        self._precompile_two_slot_runtime()
+
+    def _precompile_two_slot_runtime(self) -> None:
+        """Warm 2-slot ping-pong GDN replay, offset flips, and boundary copies.
+
+        Synthetic warmup never rejects drafts or crosses a 512-token block
+        boundary, so without precompilation the first served rejection, chunk
+        crossing, or boundary export compiles XLA mid-serving while lockstep
+        peers wait at their next collective. All-zero indices address the null
+        block (0) and `commit_lens == 0` / `dist == [0, 0, 0]` perform no HBM
+        state writes.
+        """
+        dev = getattr(self, "device", None)
+        offsets = getattr(self, "mamba_slot_read_offsets", None)
+        if dev is None or dev.type != "tpu" or offsets is None:
+            return
+        layers = self._get_two_slot_gdn_layers()
+        has_pp_copy = has_ping_pong_copy_groups(self)
+        if not layers and not has_pp_copy:
+            return
+        num_rows = sorted(
+            r
+            for r in {
+                getattr(self, "num_reqs_max_model_len", None),
+                getattr(self, "num_reqs_most_model_len", None),
+            }
+            if r is not None and r > 0
+        )
+        if not num_rows:
+            num_rows = [int(self.max_num_reqs)]
+        pp_group_ids: set[int] = set(getattr(self, "_mamba_copy_ping_pong_gids", ()))
+        if not pp_group_ids:
+            vllm_cfg = getattr(self, "vllm_config", None)
+            for group_list in getattr(self, "attn_groups", ()) or ():
+                for group in group_list:
+                    if is_ping_pong_mamba_spec(group.kv_cache_spec, vllm_cfg):
+                        pp_group_ids.add(group.kv_cache_group_id)
+        num_pp_groups = len(pp_group_ids) if pp_group_ids else len(layers)
+        with self._precompile_timed("two-slot GDN runtime"), torch.no_grad():
+            z0 = self._num_reqs_tensor(0)
+            # 1. Warm ping-pong read-offset flips for both the staged `[G, n]`
+            # stack and the non-staged list-of-G input shapes.
+            if num_pp_groups > 0:
+                for rows in num_rows:
+                    qsl = torch.zeros(rows + 1, dtype=torch.int32, device=dev)
+                    stacked = torch.zeros(
+                        (num_pp_groups, rows), dtype=torch.int32, device=dev
+                    )
+                    update_ping_pong_read_offsets_compiled(
+                        offsets, [stacked], qsl, z0, z0
+                    )
+                    per_group = [
+                        torch.zeros(rows, dtype=torch.int32, device=dev)
+                        for _ in range(num_pp_groups)
+                    ]
+                    update_ping_pong_read_offsets_compiled(
+                        offsets, per_group, qsl, z0, z0
+                    )
+            # 2. Warm per-layer replay (`gdn_pooled_replay_op`) on fixed-shape
+            # `(win_cap, ...)` staging buffers for every `num_reqs_*_model_len`.
+            if layers:
+                seen_replay_ops: set[tuple[int, int, int]] = set()
+                dist0 = self._two_slot_dist3(0, dev)
+                for layer in layers:
+                    kv = layer.kv_cache
+                    if kv is None or len(kv) != 1 or kv[0].numel() == 0:
+                        continue
+                    op_key = (
+                        id(layer.gdn_pooled_replay_op),
+                        int(layer._verify_win_cap),
+                        id(kv[0]),
+                    )
+                    if op_key in seen_replay_ops:
+                        continue
+                    seen_replay_ops.add(op_key)
+                    for rows in num_rows:
+                        z_rows = torch.zeros(rows, dtype=torch.int32, device=dev)
+                        qsl = torch.zeros(rows + 1, dtype=torch.int32, device=dev)
+                        ckpt2 = torch.zeros((rows, 2), dtype=torch.int32, device=dev)
+                        layer.replay_two_slot_state(
+                            state_indices=z_rows,
+                            query_start_loc=qsl,
+                            distribution=dist0,
+                            seq_lens=z_rows,
+                            slot_read_offsets=offsets,
+                            ckpt_indices=ckpt2,
+                            commit_lens=z_rows,
+                        )
+            # 3. Warm two-slot boundary copy & interior export programs plus
+            # resized `_copy_mamba_state_blocks` buckets.
+            if (
+                has_pp_copy
+                and self._mamba_ckpt_window > 1
+                and bool(self._mamba_copy_plan)
+                and (
+                    self.cache_config.enable_prefix_caching
+                    or self.vllm_config.kv_transfer_config is not None
+                )
+            ):
+                width = self._mamba_ckpt_window + 1
+                split = max(1, self._pool_block_split)
+                block_size = self._mamba_column_stride()
+                entries_shapes = sorted(
+                    {
+                        two_slot_entries_shape(self, n)
+                        for n in range(1, self.max_num_reqs + 1)
+                    }
+                )
+                bmeta = (
+                    self._get_compiled_boundary_meta(layers, dev) if layers else None
+                )
+                k_cols = (
+                    self.speculative_config.num_speculative_tokens + 1
+                    if self.speculative_config is not None
+                    else self._mamba_ckpt_window
+                )
+                warmed_copy_buckets: set[tuple[tuple[int, ...], int]] = set()
+                for rows in num_rows:
+                    seq_lens = torch.zeros(rows, dtype=torch.int32, device=dev)
+                    nt_paddings = sorted(
+                        {
+                            _get_padded_num_reqs_with_upper_limit(n, self.max_num_reqs)
+                            for n in range(1, min(rows, self.max_num_reqs) + 1)
+                        }
+                    )
+                    for shape in entries_shapes:
+                        entries = torch.zeros(shape, dtype=torch.int32, device=dev)
+                        out_bucket = self._bucket_len(
+                            len(self._mamba_copy_plan) * shape[0] * split
+                        )
+                        if bmeta is not None:
+                            raws0, is_pp_mask, layer_to_plan_idx, _ = bmeta
+                            raws_key = (tuple(id(r) for r in raws0), out_bucket)
+                            for has_win in (False, True):
+                                c_src, c_dst = compute_boundary_copy_no_verify_compiled(
+                                    entries,
+                                    seq_lens,
+                                    offsets,
+                                    z0,
+                                    is_pp_mask,
+                                    has_win,
+                                    block_size,
+                                    width,
+                                    split,
+                                    out_bucket,
+                                )
+                                if raws_key not in warmed_copy_buckets:
+                                    warmed_copy_buckets.add(raws_key)
+                                    self._copy_mamba_state_blocks(raws0, c_src, c_dst)
+                            for nt_rows in nt_paddings:
+                                next_tokens = torch.full(
+                                    (nt_rows, k_cols),
+                                    INVALID_TOKEN_ID,
+                                    dtype=torch.int32,
+                                    device=dev,
+                                )
+                                c_src_v, c_dst_v, _, _, _ = (
+                                    compute_boundary_copy_and_interior_compiled(
+                                        entries,
+                                        seq_lens,
+                                        next_tokens,
+                                        offsets,
+                                        z0,
+                                        is_pp_mask,
+                                        layer_to_plan_idx,
+                                        block_size,
+                                        width,
+                                        split,
+                                        out_bucket,
+                                    )
+                                )
+                                if raws_key not in warmed_copy_buckets:
+                                    warmed_copy_buckets.add(raws_key)
+                                    self._copy_mamba_state_blocks(
+                                        raws0, c_src_v, c_dst_v
+                                    )
+                        else:
+                            z_cand = torch.zeros(
+                                shape[0], dtype=torch.int32, device=dev
+                            )
+                            z_valid = torch.zeros(
+                                shape[0], dtype=torch.bool, device=dev
+                            )
+                            spec_boundary_pairs_compiled(
+                                entries,
+                                z_cand,
+                                z_cand,
+                                block_size,
+                                width,
+                                valid_rows=z_valid,
+                            )
+                            per_raw_counts: dict[
+                                tuple[int, ...], tuple[list[torch.Tensor], int]
+                            ] = {}
+                            for _, raws in self._mamba_copy_plan:
+                                rk = tuple(id(r) for r in raws)
+                                prev_cnt = per_raw_counts.get(rk, (raws, 0))[1]
+                                per_raw_counts[rk] = (
+                                    raws,
+                                    prev_cnt + shape[0] * split,
+                                )
+                            for rk, (raws, total_pairs) in per_raw_counts.items():
+                                b_len = self._bucket_len(total_pairs)
+                                if (rk, b_len) not in warmed_copy_buckets:
+                                    warmed_copy_buckets.add((rk, b_len))
+                                    z_src = torch.zeros(
+                                        b_len, dtype=torch.int32, device=dev
+                                    )
+                                    z_dst = torch.zeros(
+                                        b_len, dtype=torch.int32, device=dev
+                                    )
+                                    self._copy_mamba_state_blocks(raws, z_src, z_dst)
+            synchronize_tensors([offsets])
+            for _, raws in getattr(self, "_mamba_copy_plan", ()):
+                synchronize_tensors(raws)
 
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
@@ -576,7 +1711,10 @@ class Qwen38Runner(TPUModelRunner):
         # the request's new state block.
         offset_pairs: list[tuple[int, int]] = []
         spec_dsts: list[int] = []
+        group_windows = getattr(self, "_mamba_copy_group_windows", None) or {}
         for gid, raws in self._mamba_copy_plan:
+            gw_raw = group_windows.get(gid, 0)
+            gw = min(window, gw_raw) if gw_raw > 1 else window
             bt = self.input_batch.block_table[gid].get_cpu_tensor()
             row_width = bt.shape[1]
             pairs: list[tuple[int, int]] = []
@@ -589,17 +1727,17 @@ class Qwen38Runner(TPUModelRunner):
                 pairs.append((src, dst))
                 if spec_seed:
                     new_owner = req_ids[row] not in self._mamba_offset_seeded
-                    # The pre-crossing group's checkpoint blocks. A column
-                    # the manager has not filled reads past the row or lands
-                    # on the null block; either way fall back to the state
-                    # block, so a short row seeds from live state instead of
-                    # from nothing. The offset never names one in practice —
-                    # it is bounded by the accepted count.
+                    # The pre-crossing group's checkpoint blocks. Columns past
+                    # the group's own checkpoint window (`gw`, e.g. 2 for 2-slot
+                    # GDN vs 4 for PLE) fall back to `src`.
                     row_ckpts = []
                     for t in range(window):
-                        col = prev + t
-                        ckpt = int(bt[row, col]) if col < row_width else 0
-                        row_ckpts.append(ckpt if ckpt != 0 else src)
+                        if t < gw:
+                            col = prev + t
+                            ckpt = int(bt[row, col]) if col < row_width else 0
+                            row_ckpts.append(ckpt if ckpt != 0 else src)
+                        else:
+                            row_ckpts.append(src)
                     spec_rows.append([src, int(new_owner), 1, dst, *row_ckpts])
             if not pairs:
                 continue
@@ -937,6 +2075,12 @@ class Qwen38Runner(TPUModelRunner):
             state.logits_list
         )
         boundary_plans = state.mamba_boundary_plans or [None] * len(state.logits_list)
+        ping_pong_chunks = getattr(state, "ping_pong_mamba_chunks", None) or [
+            None
+        ] * len(state.logits_list)
+        two_slot_boundary_plans = getattr(state, "two_slot_boundary_plans", None) or [
+            None
+        ] * len(state.logits_list)
         # Per-chunk device rejection outputs, kept for the async-spec
         # producer below.
         next_tokens_per_chunk: list[torch.Tensor] = []
@@ -948,12 +2092,22 @@ class Qwen38Runner(TPUModelRunner):
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, md, mamba_indices, boundary_plan in zip(
+            for (
+                logits,
+                num_reqs,
+                md,
+                mamba_indices,
+                boundary_plan,
+                ping_pong_chunk,
+                two_slot_plan,
+            ) in zip(
                 state.logits_list,
                 state.num_reqs_list,
                 state.spec_decode_metadata_list,
                 mamba_idx_list,
                 boundary_plans,
+                ping_pong_chunks,
+                two_slot_boundary_plans,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
                 if md is not None:
@@ -973,10 +2127,30 @@ class Qwen38Runner(TPUModelRunner):
                     combined_selected_tokens.append(next_tokens)
                     combined_selected_tokens_real_lens.append(num_reqs)
                     next_tokens_per_chunk.append(next_tokens)
-                    read_offsets = self._update_mamba_slot_read_offsets(
-                        mamba_indices, next_tokens, num_reqs
-                    )
-                    spec_boundary_state.copy_states(self, boundary_plan, read_offsets)
+                    if ping_pong_chunk is not None or has_ping_pong_copy_groups(self):
+                        active_plan = (
+                            two_slot_plan
+                            if two_slot_plan is not None
+                            else boundary_plan
+                        )
+                        ple_handled = self._post_verify_two_slot_gdn_chunk(
+                            ping_pong_chunk,
+                            md,
+                            next_tokens,
+                            active_plan,
+                            mamba_indices,
+                        )
+                        if not ple_handled:
+                            self._update_mamba_slot_read_offsets(
+                                mamba_indices, next_tokens, num_reqs
+                            )
+                    else:
+                        read_offsets = self._update_mamba_slot_read_offsets(
+                            mamba_indices, next_tokens, num_reqs
+                        )
+                        spec_boundary_state.copy_states(
+                            self, boundary_plan, read_offsets
+                        )
                     if needs_logprobs:
                         # Raw verify logits, one row per draft slot and bonus
                         # slot; each row paired with the token its slot chose.
@@ -1028,9 +2202,14 @@ class Qwen38Runner(TPUModelRunner):
                                 row_starts=np.arange(num_reqs),
                             )
                         )
-                    # Non-verify chunk in a spec step: reset the read offsets
-                    # (the latest state checkpoint is at the group base).
+                    # Non-verify chunk in a spec step: export any 1-token
+                    # ping-pong boundary crossing before updating/resetting offsets.
+                    if ping_pong_chunk is not None or two_slot_plan is not None:
+                        self._copy_two_slot_boundary_states(
+                            two_slot_plan, None, ping_pong_chunk=ping_pong_chunk
+                        )
                     self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
+                    self._update_ping_pong_mamba_slot_read_offsets(ping_pong_chunk)
                 self._update_num_xla_graphs("spec_step")
                 cur_start_idx = cur_end_idx
         else:
@@ -1039,13 +2218,28 @@ class Qwen38Runner(TPUModelRunner):
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
             all_greedy = self.input_batch.all_greedy
-            for logits, num_reqs, mamba_indices in zip(
-                state.logits_list, state.num_reqs_list, mamba_idx_list
+            for (
+                logits,
+                num_reqs,
+                mamba_indices,
+                ping_pong_chunk,
+                two_slot_plan,
+            ) in zip(
+                state.logits_list,
+                state.num_reqs_list,
+                mamba_idx_list,
+                ping_pong_chunks,
+                two_slot_boundary_plans,
             ):
                 cur_end_idx = cur_start_idx + num_reqs
-                # Non-spec step (prefill / plain decode): reset the mamba
-                # read offsets so the next step resumes from the group base.
+                # Non-spec step (prefill / plain decode): export any 1-token
+                # ping-pong boundary crossing before resetting/flipping offsets.
+                if ping_pong_chunk is not None or two_slot_plan is not None:
+                    self._copy_two_slot_boundary_states(
+                        two_slot_plan, None, ping_pong_chunk=ping_pong_chunk
+                    )
                 self._update_mamba_slot_read_offsets(mamba_indices, None, num_reqs)
+                self._update_ping_pong_mamba_slot_read_offsets(ping_pong_chunk)
                 selected_token_ids, logprob_logits = self._sample_plain_chunk(
                     logits,
                     cur_start_idx=cur_start_idx,

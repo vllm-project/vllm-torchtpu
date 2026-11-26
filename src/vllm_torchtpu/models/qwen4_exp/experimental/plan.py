@@ -53,21 +53,30 @@ def profile_name(vllm_config: Any) -> str:
     return name
 
 
-def resolve_plan(vllm_config: Any) -> dict[str, str]:
-    """{slot: variant name}: per slot, the profile's first eligible variant."""
-    name = profile_name(vllm_config)
-    plan = {}
-    for slot, choices in PROFILES[name].items():
-        pick = next(
-            (c for c in choices if VARIANTS[slot][c].eligible(vllm_config)), None
+def _resolve_slot(vllm_config: Any, profile: str, slot: str) -> str:
+    if slot == "gdn_spec_slots":
+        override = mtp_gdn_two_slot_override(vllm_config)
+        if override is not None:
+            return "two_slot" if override else "per_token"
+    choices = PROFILES[profile][slot]
+    pick = next((c for c in choices if VARIANTS[slot][c].eligible(vllm_config)), None)
+    if pick is None:
+        raise ValueError(
+            f"Qwen3.8-Flash profile {profile!r}: no eligible {slot} variant among "
+            f"{list(choices)} for this config."
         )
-        if pick is None:
-            raise ValueError(
-                f"Qwen3.8-Flash profile {name!r}: no eligible {slot} variant among "
-                f"{list(choices)} for this config."
-            )
-        plan[slot] = pick
-    return plan
+    return pick
+
+
+def resolve_plan(vllm_config: Any) -> dict[str, str]:
+    """{slot: variant name}: per slot, the profile's first eligible variant.
+
+    An explicit ``additional_config['qwen4_exp']['mtp_gdn_two_slot']`` bool
+    override folds directly into the ``gdn_spec_slots`` slot so ``plan.value``
+    and ``compile_key_factors`` always agree with what runs.
+    """
+    name = profile_name(vllm_config)
+    return {slot: _resolve_slot(vllm_config, name, slot) for slot in PROFILES[name]}
 
 
 # Kernel and op modules never import the plan: `bind` pushes their slot
@@ -151,6 +160,7 @@ UNBOUND_PLAN: dict[str, str] = {
     "decode_batch": "small",
     "c48_stack": "off",
     "pool_budget": "auto",
+    "gdn_spec_slots": "per_token",
 }
 
 
@@ -183,6 +193,39 @@ def value(name: str) -> Any:
     if name not in feats:
         raise KeyError(f"no Qwen3.8-Flash plan feature {name!r}")
     return feats[name]
+
+
+def feature_for_config(vllm_config: Any, name: str) -> Any:
+    """Resolve one plan feature from ``vllm_config`` without mutating ``_bound``."""
+    prof = profile_name(vllm_config)
+    for slot, variants in VARIANTS.items():
+        first = next(iter(variants.values()))
+        if name in first.features:
+            pick = _resolve_slot(vllm_config, prof, slot)
+            return variants[pick].features[name]
+    if name in SERVED:
+        return SERVED[name]
+    raise KeyError(f"no Qwen3.8-Flash plan feature {name!r}")
+
+
+def mtp_gdn_two_slot_override(vllm_config: Any) -> bool | None:
+    """Optional explicit bool override from ``additional_config['qwen4_exp']``.
+
+    Allows combining two-slot GDN checkpoints with another profile (such as
+    ``agentx-c48``) or disabling two-slot without multiplying profiles. Folded
+    into ``resolve_plan`` so ``plan.value('QWEN4_EXP_GDN_TWO_SLOT')`` and
+    ``compile_key_factors()`` stay consistent, and centralized in ``plan.py``
+    so no other experimental module reads ``additional_config`` directly
+    (``test_experimental_reads_no_global_switches``).
+    """
+    additional = vllm_config.additional_config
+    qwen_cfg = additional.get("qwen4_exp") if isinstance(additional, dict) else None
+    if isinstance(qwen_cfg, dict) and "mtp_gdn_two_slot" in qwen_cfg:
+        flag = qwen_cfg["mtp_gdn_two_slot"]
+        if type(flag) is not bool:
+            raise ValueError("Qwen4Exp mtp_gdn_two_slot must be bool")
+        return flag
+    return None
 
 
 def compile_key_factors() -> dict[str, Any]:

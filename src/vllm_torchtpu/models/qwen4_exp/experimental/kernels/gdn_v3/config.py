@@ -127,10 +127,21 @@ class GDNConfig:
     # shapes and loops can be sized off it unconditionally and the extra axis
     # / iterations fold away in the non-speculative paths.
     window_size: int = 1
+    # Write at most 1 committed state checkpoint per sequence instead of
+    # `window_size` checkpoints (used by MTP 2-slot ping-pong state replay).
+    single_checkpoint: bool = False
+    # Skip output-activation DMAs (state-only multi-layer rejection replay).
+    skip_out_write: bool = False
     # PER_SEQ chunked GDN only: the tile holds two chunks of the same
     # sequence (tile_size = 2 * sub_chunk_size), whose state-independent
     # work is batched over heads (TPU_GDN_CHUNK_PAIR).
     chunk_pair: bool = False
+
+    @property
+    def num_state_checkpoints(self) -> int:
+        if self.single_checkpoint:
+            return 1
+        return self.window_size
 
     @property
     def sub_chunk_size(self) -> int:
@@ -237,6 +248,8 @@ class GDNConfig:
         # Windows of different sizes compile to different kernels; keep them
         # distinguishable in profiles.
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
+        if self.single_checkpoint and self.window_size > 1:
+            suffix += "_s1"
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
         if self.chunk_pair:
@@ -270,10 +283,14 @@ class GDNConfig:
     WINDOWED_VMEM_FRACTION: ClassVar[float] = 0.90
 
     @classmethod
-    def get_vmem_limit_bytes(cls, window_size: int = 1) -> int:
+    def get_vmem_limit_bytes(
+        cls, window_size: int = 1, single_checkpoint: bool = False
+    ) -> int:
         """Returns the VMEM limit for a kernel keeping window_size checkpoints."""
         fraction = (
-            cls.WINDOWED_VMEM_FRACTION if window_size > 1 else cls.DEFAULT_VMEM_FRACTION
+            cls.WINDOWED_VMEM_FRACTION
+            if (window_size > 1 and not single_checkpoint)
+            else cls.DEFAULT_VMEM_FRACTION
         )
         return int(fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
 

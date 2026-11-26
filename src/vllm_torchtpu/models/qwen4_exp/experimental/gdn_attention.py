@@ -21,6 +21,7 @@ Bridge the torch gdn_attention_core op for gated deltanet attention TPU impl
 """
 
 import functools
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -888,6 +889,9 @@ def run_jax_gdn_attention_pooled_local(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    single_checkpoint: bool = False,
+    batched_only: bool = False,
+    commit_lens: jnp.ndarray | None = None,
     prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
@@ -934,6 +938,7 @@ def run_jax_gdn_attention_pooled_local(
         seq_lens,
         read_offsets,
         ckpt_indices,
+        commit_lens,
         n_kq=n_kq,
         n_v=n_v,
         d_k=d_k,
@@ -943,6 +948,8 @@ def run_jax_gdn_attention_pooled_local(
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
+        single_checkpoint=single_checkpoint,
+        batched_only=batched_only,
         per_seq_inputs=per_seq_inputs,
         prefill_ckpt=prefill_ckpt,
         # Checkpoint offsets are whole manager blocks.
@@ -1008,10 +1015,14 @@ def run_jax_gdn_attention_pooled(
     kernel_size: int,
     pool_block_tokens: int,
     mesh: jax.sharding.Mesh,
-    recurrent_state_dtype: jnp.dtype = jnp.float32,
-    conv_state_dtype: jnp.dtype = jnp.bfloat16,
+    recurrent_state_dtype: Any = jnp.float32,
+    conv_state_dtype: Any = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    single_checkpoint: bool = False,
+    batched_only: bool = False,
+    commit_lens: jnp.ndarray | None = None,
+    read_offset_indices: jnp.ndarray | None = None,
     step_metadata: tuple[jnp.ndarray, ...] | None = None,
     prefill_ckpt: tuple[jnp.ndarray, jnp.ndarray] | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
@@ -1124,17 +1135,32 @@ def run_jax_gdn_attention_pooled(
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
         conv_weight_kmajor=conv_weight_kmajor,
+        single_checkpoint=single_checkpoint,
+        batched_only=batched_only,
     )
     local_fn = p_run_jax_gdn_attention_pooled_local
-    if prefill_ckpt is not None:
+    has_commit = commit_lens is not None
+    has_prefill_ckpt = prefill_ckpt is not None
+    if has_commit:
+        in_specs = in_specs + (P(None),)
+    if has_prefill_ckpt:
         # Two more replicated per-sequence inputs, appended after whichever
         # optional inputs precede them.
         in_specs = in_specs + (P(None), P(None))
+    if has_commit or has_prefill_ckpt:
 
         def local_fn(*args):
-            *rest, ckpt_offsets, ckpt_blocks = args
+            rest = list(args)
+            ckpt_pair = None
+            if has_prefill_ckpt:
+                ckpt_blocks = rest.pop()
+                ckpt_offsets = rest.pop()
+                ckpt_pair = (ckpt_offsets, ckpt_blocks)
+            cl = rest.pop() if has_commit else None
             return p_run_jax_gdn_attention_pooled_local(
-                *rest, prefill_ckpt=(ckpt_offsets, ckpt_blocks)
+                *rest,
+                commit_lens=cl,
+                prefill_ckpt=ckpt_pair,
             )
 
     mapped_fn = jax.shard_map(
@@ -1146,24 +1172,31 @@ def run_jax_gdn_attention_pooled(
     )
 
     # `slot_read_offsets` is the per-slot offset buffer indexed by manager
-    # block id: `slot_read_offsets[block]` holds `num_accepted - 1` for the
-    # request whose state block is `block`. Index it by `state_indices`
-    # (each sequence's state block) to get the per-sequence read offsets
-    # the kernel expects (shape (num_seqs,)); it then reads each request's
-    # initial state from checkpoint `read_offsets[s]` of block
-    # `state_indices[s]`. Both operands are replicated, so gather here,
-    # outside the shard_map (mirrors run_jax_gdn_attention).
+    # block id: `slot_read_offsets[block]` holds `num_accepted - 1` (or ping-pong
+    # slot index `0`/`1`) for the request whose state block is `block`. Under
+    # block-major unified pools, `read_offset_indices` holds the unscaled
+    # manager block IDs while `state_indices` holds physical flat pool IDs.
     if step_metadata is not None:
         read_offsets, step_ckpt_indices, *per_seq_inputs = step_metadata
-        extra_args = (read_offsets, step_ckpt_indices, tuple(per_seq_inputs))
+        extra_args: tuple[Any, ...] = (
+            read_offsets,
+            step_ckpt_indices,
+            tuple(per_seq_inputs),
+        )
     elif slot_read_offsets is not None:
-        extra_args = (slot_read_offsets[state_indices],)
+        if read_offset_indices is None:
+            extra_args = (slot_read_offsets[state_indices],)
+        else:
+            ro_max = max(0, int(slot_read_offsets.shape[0]) - 1)
+            extra_args = (slot_read_offsets[jnp.clip(read_offset_indices, 0, ro_max)],)
     else:
         extra_args = ()
     if ckpt_indices is not None:
         # Already per-sequence (row s names sequence s's checkpoint blocks),
         # so it needs no gather by state_indices.
         extra_args = extra_args + (ckpt_indices,)
+    if commit_lens is not None:
+        extra_args = extra_args + (commit_lens,)
     if prefill_ckpt is not None:
         extra_args = extra_args + tuple(prefill_ckpt)
     outputs = mapped_fn(
@@ -1184,6 +1217,154 @@ def run_jax_gdn_attention_pooled(
     )
 
     return outputs
+
+
+def run_jax_gdn_multi_layer_replay_pooled(
+    j_qkv_3d: jnp.ndarray,
+    j_b_3d: jnp.ndarray,
+    j_a_3d: jnp.ndarray,
+    recurrent_state: jnp.ndarray,
+    j_conv_weight_stack: jnp.ndarray,
+    j_conv_bias_stack: jnp.ndarray | None,
+    j_A_log_stack: jnp.ndarray,
+    j_dt_bias_stack: jnp.ndarray,
+    state_indices_stack: jnp.ndarray,
+    read_offsets_stack: jnp.ndarray,
+    ckpt_indices_stack: jnp.ndarray,
+    commit_lens_stack: jnp.ndarray,
+    query_start_loc: jnp.ndarray,
+    distribution: jnp.ndarray,
+    seq_lens: jnp.ndarray,
+    *,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    pool_block_tokens: int,
+    mesh: jax.sharding.Mesh,
+    recurrent_state_dtype: Any = jnp.float32,
+    conv_state_dtype: Any = jnp.bfloat16,
+    num_spec_tokens: int = 0,
+    conv_weight_kmajor: bool = False,
+    interpret: Any = False,
+) -> jnp.ndarray:
+    """Single-launch L-layer 2-slot ping-pong batched replay over the unified pool."""
+    pool_spec = P(*([None] * recurrent_state.ndim))
+    in_specs: tuple[Any, ...] = (
+        P(None, None, "model"),
+        P(None, None, "model"),
+        P(None, None, "model"),
+        pool_spec,
+        (
+            P(None, None, None, "model")
+            if conv_weight_kmajor
+            else P(None, "model", None, None)
+        ),
+        P(None, "model") if j_conv_bias_stack is not None else None,
+        P(None, "model"),
+        P(None, "model"),
+        P(None, None),
+        P(None, None),
+        P(None, None, None),
+        P(None, None),
+        P(None),
+        P(None),
+        P(None),
+    )
+    tp_size = get_mesh_shape_product(mesh, "model")
+    if n_kq % tp_size != 0 or n_v % tp_size != 0:
+        raise ValueError(
+            f"n_kq={n_kq}, n_v={n_v} must be divisible by tp_size={tp_size}"
+        )
+    local_n_kq = n_kq // tp_size
+    local_n_v = n_v // tp_size
+    if local_n_kq <= 0 or local_n_v <= 0:
+        raise ValueError(
+            f"n_kq={n_kq}, n_v={n_v} must be positive multiples of tp_size={tp_size}"
+        )
+
+    def _local_multi_replay(
+        qkv_3d,
+        b_3d,
+        a_3d,
+        rec_state,
+        cw_stack,
+        cb_stack,
+        alog_stack,
+        dtb_stack,
+        s_stack,
+        ro_stack,
+        c_stack,
+        cl_stack,
+        qsl,
+        dist,
+        slens,
+    ):
+        conv_dim = cw_stack.shape[-1 if conv_weight_kmajor else 1]
+        plan = _build_v3_pool_state_plan(
+            rec_state,
+            conv_dim=conv_dim,
+            n_v=local_n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            pool_block_tokens=pool_block_tokens,
+            qk_pair_layout=False,
+            recurrent_state_dtype=recurrent_state_dtype,
+            conv_state_dtype=conv_state_dtype,
+        )
+        return gdn_v3_wrapper.run_multi_layer_batched_replay_pooled(
+            qkv_3d,
+            b_3d,
+            a_3d,
+            rec_state,
+            cw_stack,
+            cb_stack,
+            alog_stack,
+            dtb_stack,
+            s_stack,
+            ro_stack,
+            c_stack,
+            cl_stack,
+            qsl,
+            dist,
+            slens,
+            state_plan=plan,
+            n_kq=local_n_kq,
+            n_v=local_n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            num_spec_tokens=num_spec_tokens,
+            conv_weight_kmajor=conv_weight_kmajor,
+            interpret=interpret,
+        )
+
+    mapped_fn = jax.shard_map(
+        _local_multi_replay,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=pool_spec,
+        check_vma=False,
+    )
+    return mapped_fn(
+        j_qkv_3d,
+        j_b_3d,
+        j_a_3d,
+        recurrent_state,
+        j_conv_weight_stack,
+        j_conv_bias_stack,
+        j_A_log_stack,
+        j_dt_bias_stack,
+        state_indices_stack,
+        read_offsets_stack,
+        ckpt_indices_stack,
+        commit_lens_stack,
+        query_start_loc,
+        distribution,
+        seq_lens,
+    )
 
 
 def run_jax_gdn_attention_pooled_pcp_prefill_projection(

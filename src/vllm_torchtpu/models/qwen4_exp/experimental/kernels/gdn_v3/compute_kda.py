@@ -379,6 +379,7 @@ def recurrent_kda_per_seq(
     beta: jax.Array,  # (num_v_heads, chunk, 1)
     state: jax.Array,  # (num_v_heads, kq_head_dim, v_head_dim)
     cfgs: config.GDNConfig,
+    target_commit: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Run the token recurrence and retain one state per verify position.
 
@@ -390,6 +391,7 @@ def recurrent_kda_per_seq(
     """
     out_list = []
     state_list = []
+    committed_state = state
     contract_dk = (((2,), (1,)), ((0,), (0,)))
 
     for c_idx in range(cfgs.chunk_size):
@@ -428,9 +430,16 @@ def recurrent_kda_per_seq(
         ).astype(cfgs.dtypes.compute)
         out_list.append(out[:, 0, :])
 
-        if c_idx >= cfgs.chunk_size - cfgs.window_size:
+        if cfgs.single_checkpoint:
+            assert target_commit is not None
+            committed_state = jnp.where(
+                c_idx + 1 == target_commit, state, committed_state
+            )
+        elif c_idx >= cfgs.chunk_size - cfgs.window_size:
             state_list.append(state)
 
+    if cfgs.single_checkpoint:
+        return jnp.stack(out_list, axis=0), committed_state[jnp.newaxis]
     return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
 
 
@@ -445,6 +454,7 @@ def recurrent_kda(
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
+    commit_sizes: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     mask_dtype = compute_gdn.get_mask_dtype(cfg.dtypes.compute)
     iota = jax.lax.broadcasted_iota(
@@ -478,6 +488,9 @@ def recurrent_kda(
     k = k[:, :, :, 0, :]
     v = v[:, :, :, 0, :]
 
+    target_commits = (
+        real_sizes if commit_sizes is None else jnp.clip(commit_sizes, 0, real_sizes)
+    )
     out_list = []
     new_state_list = []
     for idx in range(cfg.seq_tile_size):
@@ -489,6 +502,7 @@ def recurrent_kda(
             beta[idx],
             state_prev[idx],
             cfg,
+            target_commit=target_commits[idx] if cfg.single_checkpoint else None,
         )
         out_list.append(out)
         new_state_list.append(state)

@@ -18,7 +18,7 @@
 #   Ported from main: #2438's power-of-two clip of the static (KDA) mixed tile.
 
 import functools
-from typing import cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -117,6 +117,11 @@ def inner_kernel(
         carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
         cfg=cfg,
     )
+    commit_sizes = (
+        vmem_ldst.load_commit_sizes(metadata_ref, p_id, real_sizes, cfg)
+        if cfg.single_checkpoint
+        else None
+    )
 
     # Step 1: Conv1D.
     # NOTE: Conv1D requires performing sliding window where inputs are slided
@@ -139,6 +144,7 @@ def inner_kernel(
         conv_weight=conv_weight,
         conv_bias=conv_bias,
         cfg=cfg,
+        commit_sizes=commit_sizes,
     )
 
     if cfg.state_plan is None:
@@ -148,7 +154,7 @@ def inner_kernel(
         # through the region's typed view; copy_out pushes the raw bytes
         # of the valid checkpoints back to the source.
         for idx in range(cfg.seq_tile_size):
-            for t in range(cfg.window_size):
+            for t in range(cfg.num_state_checkpoints):
                 args = (
                     conv_state_out_slot_ref.at[idx, t],
                     cfg.state_plan.conv,
@@ -172,6 +178,7 @@ def inner_kernel(
     # Step 2: GDN.
 
     # Prepare gdn weights.
+    assert weights_ref.gdn.dt_bias is not None
     if cfg.is_kda:
         # KDA reshapes these per (head, channel) rather than padding out to
         # a lane multiple over heads.
@@ -210,6 +217,7 @@ def inner_kernel(
             dt_bias=dt_bias,
             cfg=cfg,
             real_sizes=real_sizes,
+            commit_sizes=commit_sizes,
         )
 
     else:
@@ -245,7 +253,7 @@ def inner_kernel(
         )
     else:
         for idx in range(cfg.seq_tile_size):
-            for t in range(cfg.window_size):
+            for t in range(cfg.num_state_checkpoints):
                 args = (
                     recurrent_out_slot_ref.at[idx, t],
                     cfg.state_plan.recurrent,
@@ -377,6 +385,7 @@ def kernel_metadata(
     ckpt_indices: jax.Array | None,
     per_seq_inputs: tuple[jax.Array, ...] | None = None,
     prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
+    commit_lens: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """The scalar-prefetch metadata of one `fused_conv1d_gdn` kernel call."""
     if cfg.mode != config.GDNMode.PER_SEQ:
@@ -388,6 +397,7 @@ def kernel_metadata(
             read_offsets=read_offsets,
             end_seq=distribution[0],
             ckpt_indices=ckpt_indices,
+            commit_lens=commit_lens if cfg.single_checkpoint else None,
         )
     if per_seq_inputs is not None:
         ps_qsl, ps_seq_lens, ps_state, ps_read, ps_ckpt = per_seq_inputs
@@ -436,6 +446,8 @@ def kernel_metadata(
         "attention_mode",
         "gate_lower_bound",
         "prefill_ckpt_alignment",
+        "single_checkpoint",
+        "interpret",
     ),
 )
 def fused_conv1d_gdn(
@@ -454,6 +466,7 @@ def fused_conv1d_gdn(
     seq_lens: jax.Array,  # [num_seqs]
     read_offsets: jax.Array | None = None,  # [num_seqs]
     ckpt_indices: jax.Array | None = None,  # [num_seqs, num_spec_tokens + 1]
+    commit_lens: jax.Array | None = None,  # [num_seqs]
     *,
     n_kq: int,
     n_v: int,
@@ -466,6 +479,7 @@ def fused_conv1d_gdn(
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    single_checkpoint: bool = False,
     batched_only: bool = False,
     prefill_only: bool = False,
     zero_initialize_out: bool = True,
@@ -476,6 +490,7 @@ def fused_conv1d_gdn(
     per_seq_inputs: tuple[jax.Array, ...] | None = None,
     prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
     prefill_ckpt_alignment: int = 0,
+    interpret: Any = False,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -629,7 +644,7 @@ def fused_conv1d_gdn(
     assert query_start_loc.shape == (num_seqs + 1,)
     assert state_indices.shape == (num_seqs,)
     assert distribution.shape == (3,)
-    if num_spec_tokens > 0:
+    if num_spec_tokens > 0 and not single_checkpoint:
         assert read_offsets is not None, (
             "read_offsets is required when num_spec_tokens > 0"
         )
@@ -638,28 +653,63 @@ def fused_conv1d_gdn(
     assert read_offsets.shape == (num_seqs,)
     read_offsets = read_offsets.astype(jnp.int32)
     if ckpt_indices is not None:
-        # One source block per checkpoint (vLLM's ssm_state_indices scheme):
-        # checkpoint t of sequence s lives at block ckpt_indices[s, t], so
-        # the pool block only ever has to hold a single state.
-        assert ckpt_indices.shape == (num_seqs, num_spec_tokens + 1), (
-            ckpt_indices.shape,
-            num_seqs,
-            num_spec_tokens,
+        # One source block per checkpoint (vLLM's ssm_state_indices scheme).
+        # Under single_checkpoint=True, allow 1 (in-place single slot), 2
+        # (2-slot ping-pong), or window_size columns.
+        allowed_ckpts = (
+            tuple(dict.fromkeys((1, 2, num_spec_tokens + 1)))
+            if single_checkpoint
+            else (num_spec_tokens + 1,)
         )
+        if (
+            ckpt_indices.ndim != 2
+            or ckpt_indices.shape[0] != num_seqs
+            or ckpt_indices.shape[1] not in allowed_ckpts
+        ):
+            raise ValueError(
+                f"ckpt_indices must have shape ({num_seqs}, {allowed_ckpts}); got "
+                f"{ckpt_indices.shape}."
+            )
         ckpt_indices = ckpt_indices.astype(jnp.int32)
+    if commit_lens is not None:
+        if not single_checkpoint:
+            raise ValueError("commit_lens requires single_checkpoint=True.")
+        if prefill_only:
+            raise ValueError("commit_lens is not supported with prefill_only=True.")
+        if commit_lens.shape != (num_seqs,):
+            raise ValueError(
+                f"commit_lens must have shape ({num_seqs},); got {commit_lens.shape}."
+            )
+        commit_lens = commit_lens.astype(jnp.int32)
     act_in_dtype = jnp.dtype(jnp.float32)
     assert a.dtype == b.dtype == act_in_dtype
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
-    decode_tile_size = min(decode_tile_size, batch_size)
+    if single_checkpoint:
+        decode_tile_size = max(1, min(decode_tile_size, num_seqs, batch_size))
+    else:
+        decode_tile_size = min(decode_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
     window_size = num_spec_tokens + 1
-    decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+    decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(
+        window_size, single_checkpoint=single_checkpoint
+    )
 
     # KDA stays on static tiles until the VMEM estimate models its gate.
     if not is_kda:
+        if pooled and single_checkpoint:
+            assert state_plan is not None
+            rec_state_dtype = jnp.dtype(
+                jnp.bfloat16
+                if state_plan.recurrent.view_dtype == jnp.uint32
+                else state_plan.recurrent.view_dtype
+            )
+        else:
+            rec_state_dtype = jnp.dtype(
+                jnp.float32 if recurrent_state is None else recurrent_state.dtype
+            )
         decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
             batch_size=batch_size,
             num_seqs=num_seqs,
@@ -671,19 +721,19 @@ def fused_conv1d_gdn(
             kernel_size=kernel_size,
             conv_state_dim_size=dim if conv_state is None else conv_state.shape[-1],
             act_out_dtype=act_out_dtype,
-            recurrent_state_dtype=(
-                jnp.float32 if recurrent_state is None else recurrent_state.dtype
-            ),
+            recurrent_state_dtype=rec_state_dtype,
             num_lanes=num_lanes,
             decode_vmem_limit_bytes=decode_vmem_limit_bytes,
             mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
             window_size=window_size,
+            single_checkpoint=single_checkpoint,
         )
         logger.info_once(
-            "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
+            "GDN dynamic tiling: num_seqs=%d batch=%d window=%d s1=%s -> T=%d C=%d",
             num_seqs,
             batch_size,
             window_size,
+            single_checkpoint,
             decode_tile_size,
             mixed_tile_size,
         )
@@ -692,12 +742,11 @@ def fused_conv1d_gdn(
         # non-power-of-two token bucket (e.g. TPU_TOKEN_BUCKET_EXTRA or tiny
         # max_num_batched_tokens) stays divisible by triangular_block_size.
         mixed_tile_size = tiling.clip_mixed_tile_size(mixed_tile_size, batch_size)
-        # Each sequence holds 1 input state slot plus `window` output
-        # checkpoint slots per buffer in VMEM. Shrink the tile so the
-        # double-buffered windows fit in roughly half the scoped-VMEM budget.
+        # Each sequence holds 1 input state slot plus output checkpoint slots
+        # per buffer in VMEM (`1` under `single_checkpoint`, else `window`).
         window = num_spec_tokens + 1
         num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-        state_positions = 1 + window
+        state_positions = 1 + (1 if single_checkpoint else window)
         recurrent_bytes_per_seq = state_positions * n_v * d_k * d_v * 4
         bytes_per_seq = (
             # Recurrent checkpoints (fp32) — the dominant term.
@@ -708,9 +757,12 @@ def fused_conv1d_gdn(
             + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
         )
         spec_tile_budget = (decode_vmem_limit_bytes // 2) // num_buffers
-        decode_tile_size = max(
-            1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
+        decode_tile_cap = (
+            min(decode_tile_size, num_seqs, spec_tile_budget // bytes_per_seq)
+            if single_checkpoint
+            else min(decode_tile_size, spec_tile_budget // bytes_per_seq)
         )
+        decode_tile_size = max(1, decode_tile_cap)
 
     if num_spec_tokens > 0 and is_kda:
         # KDA verify keeps one sequence per tile until multi-sequence KDA
@@ -784,6 +836,7 @@ def fused_conv1d_gdn(
             kernel_size=kernel_size,
             tile_size=tile_size,
             window_size=window_size,
+            single_checkpoint=(single_checkpoint and mode != config.GDNMode.PER_SEQ),
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,
@@ -832,6 +885,7 @@ def fused_conv1d_gdn(
             ckpt_indices=ckpt_indices,
             per_seq_inputs=per_seq_inputs,
             prefill_ckpt=ckpt,
+            commit_lens=commit_lens if cfg.single_checkpoint else None,
         )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
@@ -853,7 +907,9 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
 
-        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(
+            window_size, single_checkpoint=cfg.single_checkpoint
+        )
 
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
@@ -875,6 +931,7 @@ def fused_conv1d_gdn(
                 disable_bounds_checks=True,
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
+            interpret=interpret,
             name=cfg.get_kernel_name(),
             # pyrefly: ignore[bad-argument-type]
             metadata=cfg.get_metadata(),
@@ -945,3 +1002,503 @@ def fused_conv1d_gdn(
     out_recurrent_state = out_recurrent_state.astype(recurrent_out_dtype)
 
     return (out_conv_state, out_recurrent_state), out_act
+
+
+def _multi_layer_replay_inner_kernel(
+    qkv_slot_ref: jax.Ref,
+    b_slot_ref: jax.Ref,
+    a_slot_ref: jax.Ref,
+    conv_state_in_slot_ref: jax.Ref,
+    recurrent_in_slot_ref: jax.Ref,
+    out_slot_ref: jax.Ref,
+    conv_state_out_slot_ref: jax.Ref,
+    recurrent_out_slot_ref: jax.Ref,
+    metadata_ref: memory_ref.MetadataRef,
+    weights_ref: memory_ref.WeightRefs,
+    *,
+    cfg: config.GDNConfig,
+) -> None:
+    """Single-launch multi-layer 2-slot ping-pong batched replay inner body.
+
+    Weights are packed with (8, num_lanes)-aligned inner dimensions in VMEM:
+      - weights_ref.conv.weight: float32[L, k_pad, dim_pad]
+      - weights_ref.conv.bias:   None or float32[L, 8, dim_pad]
+      - weights_ref.gdn.a_log:   float32[L, 8, aligned_num_v_heads]
+                                 (row 0 = padded a_log, row 1 = padded dt_bias)
+    """
+    del out_slot_ref
+    p_id = pl.program_id(0)
+    l_id = metadata_ref.p_id_to_layer[p_id]
+
+    real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
+        metadata_ref=metadata_ref,
+        p_id=p_id,
+        conv_state_in_slot_ref=conv_state_in_slot_ref,
+        recurrent_in_slot_ref=recurrent_in_slot_ref,
+        carry_conv_scratch_ref=None,
+        carry_recurrent_scratch_ref=None,
+        cfg=cfg,
+    )
+    commit_sizes = vmem_ldst.load_commit_sizes(metadata_ref, p_id, real_sizes, cfg)
+
+    qkv_in_compact = qkv_slot_ref[...].astype(jnp.float32)
+    qkv_in_compact = jnp.concat([prev_conv, qkv_in_compact], axis=1)
+
+    cw_tile = weights_ref.conv.weight[l_id]
+    conv_weight = cw_tile[: cfg.kernel_size, : cfg.dim_size][:, None, :]
+    conv_bias = (
+        None
+        if weights_ref.conv.bias is None
+        else weights_ref.conv.bias[l_id][0, : cfg.dim_size]
+    )
+
+    qkv_out_compact, new_conv_state = compute_conv1d.causal_conv1d(
+        real_sizes=real_sizes,
+        lhs=qkv_in_compact,
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        cfg=cfg,
+        commit_sizes=commit_sizes,
+    )
+    assert cfg.state_plan is not None
+    for idx in range(cfg.seq_tile_size):
+        vmem_ldst.store_state_region(
+            conv_state_out_slot_ref.at[idx, 0],
+            cfg.state_plan.conv,
+            new_conv_state[idx, 0],
+        )
+
+    qkv_out_compact = jax.nn.silu(qkv_out_compact)
+
+    ab_tile = weights_ref.gdn.a_log[l_id]
+    a_log = ab_tile[0]
+    dt_bias = ab_tile[1]
+
+    q_compact, k_compact, v_compact, b_compact, a_compact = (
+        vmem_ldst.load_activation_as_compact(
+            qkv_vreg=qkv_out_compact,
+            qkv_vmem_ref=qkv_slot_ref,
+            b_vmem_ref=b_slot_ref,
+            a_vmem_ref=a_slot_ref,
+            cfgs=cfg,
+        )
+    )
+    _, new_recurrent_state = compute_gdn.recurrent_gdn(
+        q_compact=q_compact,
+        k_compact=k_compact,
+        v_compact=v_compact,
+        b_compact=b_compact,
+        a_compact=a_compact,
+        state_prev=prev_recurrent,
+        a_log=a_log,
+        dt_bias=dt_bias,
+        cfg=cfg,
+        real_sizes=real_sizes,
+        commit_sizes=commit_sizes,
+    )
+    for idx in range(cfg.seq_tile_size):
+        vmem_ldst.store_state_region(
+            recurrent_out_slot_ref.at[idx, 0],
+            cfg.state_plan.recurrent,
+            new_recurrent_state[idx, 0],
+        )
+
+
+def _multi_layer_replay_outer_kernel(
+    metadata_ref: memory_ref.MetadataRef,
+    qkv_ref: jax.Array,
+    b_ref: jax.Array,
+    a_ref: jax.Array,
+    source_ref: jax.Array,
+    weights_ref: memory_ref.WeightRefs,
+    out_ref: jax.Array,
+    source_out_ref: jax.Array,
+    *,
+    cfg: config.GDNConfig,
+) -> None:
+    (
+        qkv_alloc,
+        b_alloc,
+        a_alloc,
+        conv_in_alloc,
+        recurrent_in_alloc,
+        out_alloc,
+        conv_out_alloc,
+        recurrent_out_alloc,
+    ) = memory_ref.create_allocs(
+        metadata_ref=metadata_ref,
+        qkv_ref=qkv_ref,
+        b_ref=b_ref,
+        a_ref=a_ref,
+        out_ref=out_ref,
+        conv_state_ref=source_ref,
+        recurrent_state_ref=source_ref,
+        cfg=cfg,
+    )
+    num_tiles = metadata_ref.num_tiles[...]
+    pipeline_func = pltpu.emit_pipeline(
+        body=functools.partial(_multi_layer_replay_inner_kernel, cfg=cfg),
+        grid=(num_tiles,),
+        in_specs=(
+            qkv_alloc.spec,
+            b_alloc.spec,
+            a_alloc.spec,
+            conv_in_alloc.spec,
+            recurrent_in_alloc.spec,
+        ),
+        out_specs=(
+            out_alloc.spec,
+            conv_out_alloc.spec,
+            recurrent_out_alloc.spec,
+        ),
+    )
+
+    @pl.with_scoped(
+        allocations=(
+            qkv_alloc,
+            b_alloc,
+            a_alloc,
+            conv_in_alloc,
+            recurrent_in_alloc,
+            out_alloc,
+            conv_out_alloc,
+            recurrent_out_alloc,
+        ),
+    )
+    def _run(allocations):
+        pipeline_func(
+            qkv_ref,
+            b_ref,
+            a_ref,
+            source_ref,
+            source_ref,
+            out_ref,
+            source_out_ref,
+            source_out_ref,
+            scratches=(metadata_ref, weights_ref),
+            allocations=allocations,
+        )
+
+    _run()
+
+
+def run_multi_layer_batched_replay_pooled(
+    qkv_3d: jax.Array,  # [L, win_rows, dim]
+    b_3d: jax.Array,  # [L, win_rows, n_v]
+    a_3d: jax.Array,  # [L, win_rows, n_v]
+    state_source: jax.Array,
+    conv_weight_stack: jax.Array,  # [L, K, 1, dim] or [L, dim, 1, K]
+    conv_bias_stack: jax.Array | None,  # [L, dim] or None
+    a_log_stack: jax.Array,  # [L, n_v]
+    dt_bias_stack: jax.Array,  # [L, n_v]
+    state_indices_stack: jax.Array,  # [L, max_seqs]
+    read_offsets_stack: jax.Array,  # [L, max_seqs]
+    ckpt_indices_stack: jax.Array,  # [L, max_seqs, 2]
+    commit_lens_stack: jax.Array,  # [1, max_seqs] or [L, max_seqs]
+    query_start_loc: jax.Array,  # [max_seqs + 1]
+    distribution: jax.Array,  # [3]
+    seq_lens: jax.Array,  # [max_seqs]
+    *,
+    state_plan: config.StateSourcePlan,
+    n_kq: int,
+    n_v: int,
+    d_k: int,
+    d_v: int,
+    kernel_size: int,
+    num_spec_tokens: int,
+    conv_weight_kmajor: bool = False,
+    enable_dynamic_tiling: bool = True,
+    compute_precision: jnp.dtype = jnp.float32.dtype,
+    decode_tile_size: int = 16,
+    interpret: Any = False,
+) -> jax.Array:
+    """Single-launch L-layer 2-slot ping-pong batched replay over `state_source`.
+
+    Compacts active rejected requests (`commit_lens > 0`) into contiguous tiles
+    across all `L` GDN layers (e.g. 36 or 69) using 1D `jnp.nonzero` when
+    `commit_lens_stack.shape[0] == 1` and skipping all output-activation DMAs
+    via `skip_out_write=True`. When no request requires replay, `num_tiles == 0`
+    so the kernel returns `state_source` unmodified.
+    """
+    num_layers, win_rows, dim = qkv_3d.shape
+    if num_layers <= 0:
+        raise ValueError(f"num_layers must be >= 1; got {num_layers}.")
+    max_seqs = seq_lens.size
+    if state_indices_stack.shape != (num_layers, max_seqs):
+        raise ValueError(
+            f"state_indices_stack must have shape ({num_layers}, {max_seqs}); "
+            f"got {state_indices_stack.shape}."
+        )
+    if ckpt_indices_stack.shape != (num_layers, max_seqs, 2):
+        raise ValueError(
+            f"ckpt_indices_stack must have shape ({num_layers}, {max_seqs}, 2); "
+            f"got {ckpt_indices_stack.shape}."
+        )
+    if (
+        commit_lens_stack.ndim != 2
+        or commit_lens_stack.shape[0] not in (1, num_layers)
+        or commit_lens_stack.shape[1] != max_seqs
+    ):
+        raise ValueError(
+            f"commit_lens_stack must have shape (1|{num_layers}, {max_seqs}); "
+            f"got {commit_lens_stack.shape}."
+        )
+    act_out_dtype = qkv_3d.dtype
+    tpu_info = pltpu.get_tpu_info()
+    num_lanes = tpu_info.num_lanes
+    aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
+    nv_pad = aligned_num_v_heads - n_v
+    window_size = num_spec_tokens + 1
+    padded_win_rows = max(8, pl.cdiv(win_rows, 8) * 8)
+    win_row_pad = padded_win_rows - win_rows
+
+    # Pack weights with (8, num_lanes) inner tile alignment before sizing tiles
+    # so the VMEM tile budget accounts for resident stacked weights.
+    if conv_weight_kmajor:
+        cw_3d = conv_weight_stack.astype(jnp.float32).reshape(
+            num_layers, kernel_size, dim
+        )
+    else:
+        cw_3d = (
+            jnp.swapaxes(conv_weight_stack, 1, 3)
+            .astype(jnp.float32)
+            .reshape(num_layers, kernel_size, dim)
+        )
+    k_pad = pl.cdiv(kernel_size, 8) * 8 - kernel_size
+    dim_pad = pl.cdiv(dim, num_lanes) * num_lanes - dim
+    if k_pad > 0 or dim_pad > 0:
+        cw_3d = jnp.pad(cw_3d, ((0, 0), (0, k_pad), (0, dim_pad)))
+
+    if conv_bias_stack is not None:
+        cb_3d = conv_bias_stack.astype(jnp.float32)[:, None, :]
+        cb_3d = jnp.pad(cb_3d, ((0, 0), (0, 7), (0, dim_pad)))
+    else:
+        cb_3d = None
+
+    alog_p = a_log_stack.astype(jnp.float32)
+    dtb_p = dt_bias_stack.astype(jnp.float32)
+    if nv_pad > 0:
+        alog_p = jnp.pad(alog_p, ((0, 0), (0, nv_pad)))
+        dtb_p = jnp.pad(dtb_p, ((0, 0), (0, nv_pad)))
+    ab_2 = jnp.stack([alog_p, dtb_p], axis=1)
+    ab_tile_stack = jnp.pad(ab_2, ((0, 0), (0, 6), (0, 0)))
+
+    # Keep `dt_bias=None` so a single packed [L, 8, aligned_num_v_heads] array
+    # holds both `a_log` (row 0) and `dt_bias` (row 1) without double VMEM cost.
+    weights = memory_ref.WeightRefs(
+        conv=memory_ref.ConvWeightsRef(weight=cw_3d, bias=cb_3d),
+        gdn=memory_ref.GDNWeightsRef(a_log=ab_tile_stack, dt_bias=None),
+    )
+
+    weight_vmem_bytes = sum(
+        int(x.size) * jnp.dtype(x.dtype).itemsize
+        for x in jax.tree_util.tree_leaves(weights)
+    )
+    max_cap_bytes = int(0.92 * tpu_info.vmem_capacity_bytes)
+    decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(
+        window_size, single_checkpoint=True
+    )
+    tile_vmem_budget_bytes = max(
+        1, min(decode_vmem_limit_bytes, max_cap_bytes - weight_vmem_bytes)
+    )
+    vmem_limit_bytes = min(max_cap_bytes, tile_vmem_budget_bytes + weight_vmem_bytes)
+
+    tile_sz = max(1, min(decode_tile_size, max_seqs, padded_win_rows))
+    if enable_dynamic_tiling:
+        rec_dt = (
+            jnp.bfloat16
+            if state_plan.recurrent.view_dtype == jnp.uint32
+            else state_plan.recurrent.view_dtype
+        )
+        tile_sz, _ = tiling.get_tile_sizes(
+            batch_size=padded_win_rows,
+            num_seqs=max_seqs,
+            padded_batch_size=padded_win_rows,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+            conv_state_dim_size=dim,
+            act_out_dtype=act_out_dtype,
+            recurrent_state_dtype=jnp.dtype(rec_dt),
+            num_lanes=num_lanes,
+            decode_vmem_limit_bytes=tile_vmem_budget_bytes,
+            mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
+            window_size=window_size,
+            single_checkpoint=True,
+        )
+    else:
+        num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
+        state_positions = 2
+        bytes_per_seq = (
+            state_positions * n_v * d_k * d_v * 4
+            + state_positions * (kernel_size - 1) * dim * 4
+            + window_size * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
+        )
+        spec_tile_budget = (tile_vmem_budget_bytes // 2) // num_buffers
+        tile_sz = max(1, min(tile_sz, max(1, spec_tile_budget // bytes_per_seq)))
+
+    cfg = config.GDNConfig(
+        mode=config.GDNMode.BATCHED,
+        batch_size=padded_win_rows,
+        kernel_size=kernel_size,
+        tile_size=tile_sz,
+        window_size=window_size,
+        single_checkpoint=True,
+        skip_out_write=True,
+        dim_size=dim,
+        num_kq_heads=n_kq,
+        num_v_heads=n_v,
+        kq_head_dim=d_k,
+        v_head_dim=d_v,
+        attention_mode=config.AttentionMode.GDN,
+        gate_lower_bound=None,
+        chunk_pair=False,
+        dtypes=config.Dtypes(
+            act_in=jnp.dtype(jnp.float32),
+            act_out=act_out_dtype,
+            compute=compute_precision,
+            recurrent_state=jnp.float32.dtype,
+            conv_state=jnp.float32.dtype,
+        ),
+        state_plan=state_plan,
+    )
+
+    qkv_f32 = qkv_3d.astype(jnp.float32)
+    b_f32 = b_3d.astype(jnp.float32)
+    a_f32 = a_3d.astype(jnp.float32)
+    if win_row_pad > 0:
+        qkv_f32 = jnp.pad(qkv_f32, ((0, 0), (0, win_row_pad), (0, 0)))
+        b_f32 = jnp.pad(b_f32, ((0, 0), (0, win_row_pad), (0, 0)))
+        a_f32 = jnp.pad(a_f32, ((0, 0), (0, win_row_pad), (0, 0)))
+    if nv_pad > 0:
+        b_f32 = jnp.pad(b_f32, ((0, 0), (0, 0), (0, nv_pad)))
+        a_f32 = jnp.pad(a_f32, ((0, 0), (0, 0), (0, nv_pad)))
+    qkv_all = qkv_f32.reshape(num_layers * padded_win_rows, 1, dim)
+    b_all = b_f32.reshape(num_layers * padded_win_rows, 1, aligned_num_v_heads)
+    a_all = a_f32.reshape(num_layers * padded_win_rows, 1, aligned_num_v_heads)
+
+    # Vectorized multi-layer active-sequence tile compaction in JAX.
+    qsl_i32 = jnp.minimum(query_start_loc.astype(jnp.int32), win_rows)
+    query_lens = qsl_i32[1:] - qsl_i32[:-1]
+    all_seqs = jnp.arange(max_seqs, dtype=jnp.int32)
+    end_seq = distribution[0].astype(jnp.int32)
+    is_valid_seqs = all_seqs < end_seq
+    has_init_1d = (seq_lens.astype(jnp.int32) - query_lens) > 0
+
+    if commit_lens_stack.shape[0] == 1:
+        cl_1d = jnp.where(
+            is_valid_seqs,
+            jnp.clip(commit_lens_stack[0].astype(jnp.int32), 0, query_lens),
+            0,
+        )
+        needs_1d = cl_1d > 0
+        num_act_0 = jnp.sum(needs_1d.astype(jnp.int32))
+        act_seqs_0 = jnp.nonzero(needs_1d, size=max_seqs, fill_value=0)[0].astype(
+            jnp.int32
+        )
+        clamped_commit = jnp.broadcast_to(cl_1d[None, :], (num_layers, max_seqs))
+        num_active = jnp.broadcast_to(num_act_0, (num_layers,))
+        active_seqs = jnp.broadcast_to(act_seqs_0[None, :], (num_layers, max_seqs))
+        t_max = pl.cdiv(num_act_0, cfg.seq_tile_size)
+    else:
+        clamped_commit = jnp.where(
+            is_valid_seqs[None, :],
+            jnp.clip(commit_lens_stack.astype(jnp.int32), 0, query_lens[None, :]),
+            0,
+        )
+        needs_commit = clamped_commit > 0
+        num_active = jnp.sum(needs_commit.astype(jnp.int32), axis=1)
+        active_seqs = jax.vmap(
+            lambda m: jnp.nonzero(m, size=max_seqs, fill_value=0)[0].astype(jnp.int32)
+        )(needs_commit)
+        tiles_per_layer = pl.cdiv(num_active, cfg.seq_tile_size)
+        t_max = jnp.max(tiles_per_layer)
+
+    max_tiles_per_layer = pl.cdiv(max_seqs, cfg.seq_tile_size)
+    total_active_tiles = num_layers * t_max
+    t_safe = jnp.maximum(t_max, 1)
+
+    max_total_tiles = num_layers * max_tiles_per_layer
+    p_ids = jnp.arange(max_total_tiles, dtype=jnp.int32)
+    p_layer = jnp.minimum(p_ids // t_safe, num_layers - 1)
+    p_lt = p_ids % t_safe
+
+    slot_offsets = (
+        p_lt[:, None] * cfg.seq_tile_size
+        + jnp.arange(cfg.seq_tile_size, dtype=jnp.int32)[None, :]
+    )
+    layer_num_active = num_active[p_layer][:, None]
+    active_mask = (p_ids[:, None] < total_active_tiles) & (
+        slot_offsets < layer_num_active
+    )
+    safe_slot = jnp.minimum(slot_offsets, max_seqs - 1)
+    s_local = jnp.where(active_mask, active_seqs[p_layer[:, None], safe_slot], 0)
+    s_global = p_layer[:, None] * max_seqs + s_local
+    r_base = jnp.where(
+        active_mask,
+        p_layer[:, None] * padded_win_rows + qsl_i32[s_local],
+        p_layer[:, None] * padded_win_rows,
+    )
+    r_size = jnp.where(active_mask, clamped_commit[p_layer[:, None], s_local], 0)
+
+    metadata_obj = memory_ref.MetadataRef.create(
+        cfgs=cfg,
+        num_tiles=total_active_tiles,
+        p_id_to_s_idx=s_global.reshape(-1),
+        p_id_to_r_base=r_base.reshape(-1),
+        p_id_to_r_size=r_size.reshape(-1),
+        p_id_is_first_tile=active_mask.reshape(-1),
+        p_id_is_last_tile=active_mask.reshape(-1),
+        s_idx_has_initial_state=jnp.broadcast_to(
+            has_init_1d[None, :], (num_layers, max_seqs)
+        ).reshape(-1),
+        s_idx_to_state_indices=state_indices_stack.astype(jnp.int32).reshape(-1),
+        s_idx_to_read_offset=read_offsets_stack.astype(jnp.int32).reshape(-1),
+        s_idx_to_ckpt_indices=ckpt_indices_stack.astype(jnp.int32).reshape(
+            num_layers * max_seqs, 2
+        ),
+        s_idx_to_commit_len=clamped_commit.reshape(-1),
+        p_id_to_layer=p_layer,
+    )
+
+    smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+    vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
+    metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
+    weights_spec = jax.tree.map(lambda _: vmem_spec, weights)
+
+    out_rows = max(padded_win_rows, cfg.seq_tile_size * cfg.chunk_size)
+    out_shape = jax.ShapeDtypeStruct((out_rows, n_v, d_v), act_out_dtype)
+
+    num_meta_leaves = len(metadata_obj)
+    _, out_source = pl.pallas_call(
+        functools.partial(_multi_layer_replay_outer_kernel, cfg=cfg),
+        out_shape=(out_shape, state_source),
+        in_specs=(
+            metadata_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            hbm_spec,
+            weights_spec,
+        ),
+        out_specs=(hbm_spec, hbm_spec),
+        input_output_aliases={num_meta_leaves + 3: 1},
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True,
+            vmem_limit_bytes=vmem_limit_bytes,
+        ),
+        interpret=interpret,
+        name=f"{cfg.get_kernel_name()}_ml{num_layers}",
+        metadata=cast(Any, cfg.get_metadata()),
+    )(
+        metadata_obj,
+        qkv_all,
+        b_all,
+        a_all,
+        state_source,
+        weights,
+    )
+    return out_source

@@ -20,11 +20,12 @@
 import dataclasses
 import functools
 import itertools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import torch
 from einops import rearrange
 from jax.sharding import PartitionSpec
@@ -71,12 +72,14 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.utils import fresh_buffer
 
+from ..config import mtp_gdn_two_slot_enabled
 from ..gdn_attention import (
     gdn_step_metadata,
     run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill,
     run_jax_gdn_attention_pooled,
     run_jax_gdn_attention_pooled_pcp_prefill_projection,
+    run_jax_gdn_multi_layer_replay_pooled,
 )
 from ..kernels.gdn_v3.input_layout import (
     Conv1DInput,
@@ -85,6 +88,8 @@ from ..metadata_access import (
     mamba_ckpt_of,
     mamba_state_of,
 )
+from ..runner.two_slot import INVALID_TOKEN_ID
+from .rows_update_op import update_rows_ as _update_verify_rows_
 
 # Set by the model plan through `configure` before the layers are built (the
 # defaults are the small-batch / non-c48 choices).
@@ -233,6 +238,10 @@ def gdn_attention_pooled_core_tpu(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    single_checkpoint: bool = False,
+    batched_only: bool = False,
+    commit_lens: jax.Array | None = None,
+    read_offset_indices: jax.Array | None = None,
     step_metadata: tuple[jax.Array, ...] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
@@ -261,6 +270,10 @@ def gdn_attention_pooled_core_tpu(
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
+        single_checkpoint=single_checkpoint,
+        batched_only=batched_only,
+        commit_lens=commit_lens,
+        read_offset_indices=read_offset_indices,
         step_metadata=step_metadata,
     )
 
@@ -460,6 +473,24 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
     _bm_kernel: bool = False
     _pooled_conv_state_dtype: torch.dtype = torch.bfloat16
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+    _two_slot_mtp: bool = False
+    _verify_win_cap: int = 0
+    _verify_qkv_dim: int = 0
+    _verify_local_n_v: int = 0
+    _verify_act_dtype: torch.dtype = torch.bfloat16
+    _shared_verify_flat_info: tuple[Any, ...] | None = None
+    _shared_verify_flat_tensors: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+    ) = None
+    _shared_verify_sp_flat_tensors: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+    ) = None
+    _shared_verify_backbone_ref: Any = None
+    # Type-only annotations for non-persistent buffers registered in __init__
+    # (no class defaults so nn.Module.register_buffer is never shadowed).
+    _verify_qkv_buf: torch.Tensor | None
+    _verify_b_buf: torch.Tensor | None
+    _verify_a_buf: torch.Tensor | None
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
@@ -493,6 +524,27 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
         )
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
+        self._two_slot_mtp = vllm_config is not None and mtp_gdn_two_slot_enabled(
+            vllm_config
+        )
+        self.gdn_pooled_single_ckpt_op = (
+            self._build_pooled_gdn_op(
+                block_major=self._bm_kernel,
+                single_checkpoint=True,
+            )
+            if self._two_slot_mtp
+            else None
+        )
+        self.gdn_pooled_replay_op = (
+            self._build_pooled_gdn_op(
+                block_major=self._bm_kernel,
+                single_checkpoint=True,
+                batched_only=True,
+            )
+            if self._two_slot_mtp
+            else None
+        )
+        self._init_verify_input_buffers(vllm_config)
         # Block-major state ids are per layer (pool_index), so only the
         # plain unified pool can share one step's metadata across layers.
         self.gdn_pooled_hoisted_op = (
@@ -529,6 +581,214 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
         assert self._bm_region is not None
         pool_index, layout = self._bm_region
         return flat_manager_ids(ids, pool_index, layout.num_pools)
+
+    def _bm_ckpt_ids(self, ckpt_ids: torch.Tensor) -> torch.Tensor:
+        """Map manager checkpoint block IDs to physical block-major pool IDs.
+
+        Null sentinel entries (``0``) remain ``0`` so inactive checkpoint
+        columns never address layer-0+pool_index physical blocks.
+        """
+        if not self._bm_kernel:
+            return ckpt_ids
+        assert self._bm_region is not None
+        pool_index, layout = self._bm_region
+        if layout.num_pools <= 1:
+            return ckpt_ids
+        mapped = flat_manager_ids(ckpt_ids, pool_index, layout.num_pools)
+        return torch.where(ckpt_ids > 0, mapped, torch.zeros_like(mapped))
+
+    def _init_verify_input_buffers(self, vllm_config: VllmConfig | None) -> None:
+        """Allocate non-persistent verify staging buffers for 2-slot MTP replay."""
+        if not self._two_slot_mtp or vllm_config is None:
+            self._verify_win_cap = 0
+            self.register_buffer("_verify_qkv_buf", None, persistent=False)
+            self.register_buffer("_verify_b_buf", None, persistent=False)
+            self.register_buffer("_verify_a_buf", None, persistent=False)
+            return
+        sched = vllm_config.scheduler_config
+        max_reqs = int(sched.max_num_seqs)
+        max_batched = int(
+            sched.max_num_batched_tokens or max_reqs * (self.num_spec + 1)
+        )
+        win_cap = max(1, min(max_batched, max_reqs * (self.num_spec + 1)))
+        qkv_dim = self.tp_head_geometry.local_conv_dim(self.head_k_dim, self.head_v_dim)
+        local_n_v = self.num_v_heads // self.tp_size
+        act_dtype = self.model_config.dtype
+        assert isinstance(act_dtype, torch.dtype)
+        dev = self.A_log.device
+        self._verify_win_cap = win_cap
+        self._verify_qkv_dim = qkv_dim
+        self._verify_local_n_v = local_n_v
+        self._verify_act_dtype = act_dtype
+        self.register_buffer(
+            "_verify_qkv_buf",
+            torch.zeros((win_cap, qkv_dim), dtype=act_dtype, device=dev),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_verify_b_buf",
+            torch.zeros((win_cap, local_n_v), dtype=act_dtype, device=dev),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_verify_a_buf",
+            torch.zeros((win_cap, local_n_v), dtype=act_dtype, device=dev),
+            persistent=False,
+        )
+
+    def bind_shared_verify_flat(
+        self,
+        qkv_flat: torch.Tensor,
+        b_flat: torch.Tensor,
+        a_flat: torch.Tensor,
+        ord_idx: int,
+        *,
+        win_stride: int | None = None,
+        sp_flat_tensors: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
+        backbone_ref: Any = None,
+    ) -> None:
+        """Bind this layer onto shared 2D verify staging buffers.
+
+        Non-SP decode buckets (`16..1024`) use major-axis `[L * win_stride, dim]`
+        (`dim=0`) to avoid per-layer cross-lane `dim=-1` shifts. Sequence-parallel
+        buckets (`2048..8192`) optionally preserve `[win_cap, L * dim]` (`dim=-1`)
+        so SP HLO buffer lifetimes remain unchanged alongside `_qsa_sel_buf`.
+        """
+        object.__setattr__(
+            self, "_shared_verify_flat_tensors", (qkv_flat, b_flat, a_flat)
+        )
+        object.__setattr__(self, "_shared_verify_sp_flat_tensors", sp_flat_tensors)
+        object.__setattr__(self, "_shared_verify_backbone_ref", backbone_ref)
+        self._shared_verify_flat_info = (
+            ord_idx,
+            self._verify_qkv_dim,
+            self._verify_local_n_v,
+            win_stride,
+            self._verify_win_cap,
+        )
+        self._verify_qkv_buf = None
+        self._verify_b_buf = None
+        self._verify_a_buf = None
+
+    def get_active_verify_flat_tensors(
+        self, *, force_sp: bool | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return the active shared verify flat buffer tuple (SP or non-SP)."""
+        return _active_verify_flat_tensors(self, force_sp=force_sp)
+
+    def get_verify_inputs(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return staged verify ``(qkv, b, a)`` buffers for rejection replay."""
+        flat = _active_verify_flat_tensors(self)
+        info = self._shared_verify_flat_info
+        if flat is not None and info is not None:
+            qkv_f, b_f, a_f = flat
+            ord_idx, qd, vd, w_stride, w_cap = info
+            if qkv_f.shape[-1] == qd and w_stride is not None:
+                r0 = ord_idx * w_stride
+                r1 = r0 + min(w_stride, w_cap)
+                return (
+                    qkv_f[r0:r1].contiguous(),
+                    b_f[r0:r1].contiguous(),
+                    a_f[r0:r1].contiguous(),
+                )
+            return (
+                qkv_f[:, ord_idx * qd : (ord_idx + 1) * qd].contiguous(),
+                b_f[:, ord_idx * vd : (ord_idx + 1) * vd].contiguous(),
+                a_f[:, ord_idx * vd : (ord_idx + 1) * vd].contiguous(),
+            )
+        qkv_buf = self._verify_qkv_buf
+        b_buf = self._verify_b_buf
+        a_buf = self._verify_a_buf
+        if qkv_buf is None or b_buf is None or a_buf is None:
+            return None
+        return (qkv_buf, b_buf, a_buf)
+
+    def snapshot_verify_inputs(
+        self, max_rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Clone fixed-shape ``(win_cap, ...)`` staged verify buffers across chunks.
+
+        Keeping the full static ``win_cap`` row count matches single-chunk
+        replay so multi-chunk steps never trigger XLA/Pallas recompilations;
+        rows past ``max_rows`` lie outside ``query_start_loc`` for the chunk's
+        windowed sequences and carry ``commit_lens == 0``.
+        """
+        staged = self.get_verify_inputs()
+        if staged is None:
+            return None
+        qkv_b, b_b, a_b = staged
+        rows = max(0, min(int(max_rows), int(qkv_b.shape[0])))
+        if rows == 0:
+            return None
+        return (
+            qkv_b.clone(),
+            b_b.clone(),
+            a_b.clone(),
+        )
+
+    @torch.no_grad()
+    def replay_two_slot_state(
+        self,
+        *,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        distribution: torch.Tensor,
+        seq_lens: torch.Tensor,
+        slot_read_offsets: torch.Tensor,
+        ckpt_indices: torch.Tensor,
+        commit_lens: torch.Tensor,
+        staged_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> None:
+        """Re-advance GDN state from `c_read` to `commit_lens` into `1 - c_read`."""
+        kv_cache = self.kv_cache
+        if kv_cache is None or len(kv_cache) != 1 or kv_cache[0].numel() == 0:
+            return
+        if not self._two_slot_mtp:
+            raise RuntimeError(
+                f"replay_two_slot_state called on non-two-slot GDN layer {self.prefix}"
+            )
+        replay_op = self.gdn_pooled_replay_op
+        if replay_op is None:
+            raise RuntimeError(
+                f"Two-slot GDN layer {self.prefix} has no gdn_pooled_replay_op"
+            )
+        inputs = (
+            staged_inputs if staged_inputs is not None else self.get_verify_inputs()
+        )
+        if inputs is None:
+            raise RuntimeError(
+                f"Two-slot GDN layer {self.prefix} has no staged verify inputs "
+                "for replay"
+            )
+        qkv_in, b_in, a_in = inputs
+        win_rows = int(qkv_in.shape[0])
+        qsl_clamped = torch.clamp(query_start_loc.to(torch.int32), 0, win_rows)
+        raw_state = state_indices.to(torch.int32)
+        phys_state = self._bm_state_ids(raw_state)
+        phys_ckpt = self._bm_ckpt_ids(ckpt_indices.to(torch.int32))
+        (recurrent_state,) = kv_cache
+        replay_op(
+            qkv_in,
+            b_in,
+            a_in,
+            recurrent_state,
+            self._pooled_conv_weight(),
+            self.conv1d.bias,
+            self.A_log,
+            self.dt_bias,
+            phys_state,
+            qsl_clamped,
+            distribution.to(torch.int32),
+            seq_lens.to(torch.int32),
+            slot_read_offsets,
+            phys_ckpt,
+            commit_lens.to(torch.int32),
+            raw_state if self._bm_kernel else None,
+        )
 
     @property
     def tp_head_geometry(self) -> GdnHeadGeometry:
@@ -850,6 +1110,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
         *,
         block_major: bool = False,
         hoisted: bool = False,
+        single_checkpoint: bool = False,
+        batched_only: bool = False,
     ):
         """The pooled GDN op. ``hoisted``: the variant taking the step's
         `gdn_step_metadata` outputs (VLLM_TPU_GDN_HOIST_METADATA)."""
@@ -888,13 +1150,19 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
             seq_lens,
             slot_read_offsets,
             ckpt_indices,
+            commit_lens=None,
+            read_offset_indices=None,
             step_metadata=None,
         ):
             # Fold the `(num_blocks, rows_per_block, *page)` block-major pool so
             # pool adapters index flat kernel blocks along dim 0; both reshapes
             # compile to zero-copy bitcasts on the donated buffer.
             pool = kernel_view(recurrent_state) if block_major else recurrent_state
-            prepared_qkv = self._prepare_pooled_gdn_input(mixed_qkv, seq_lens, mesh)
+            prepared_qkv = (
+                mixed_qkv
+                if batched_only
+                else self._prepare_pooled_gdn_input(mixed_qkv, seq_lens, mesh)
+            )
             result = gdn_attention_pooled_core_tpu(
                 prepared_qkv,
                 b,
@@ -927,6 +1195,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                 conv_state_dtype=conv_state_dtype,
                 num_spec_tokens=num_spec_tokens,
                 conv_weight_kmajor=conv_weight_kmajor,
+                single_checkpoint=single_checkpoint,
+                batched_only=batched_only,
+                commit_lens=commit_lens,
+                read_offset_indices=read_offset_indices,
                 step_metadata=step_metadata,
             )
             if not block_major:
@@ -949,6 +1221,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
             seq_lens: jax.Array,
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
+            commit_lens: jax.Array | None = None,
+            read_offset_indices: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array]:
             return run(
                 mixed_qkv,
@@ -965,6 +1239,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                commit_lens=commit_lens,
+                read_offset_indices=read_offset_indices,
             )
 
         # VLLM_TPU_GDN_HOIST_METADATA: the step's `gdn_step_metadata` outputs
@@ -1037,8 +1313,21 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
             return op
 
         if hoisted:
-            assert not block_major
+            assert not block_major and not single_checkpoint and not batched_only
             kind = "gdn_attention_pooled_hoisted"
+        elif batched_only:
+            assert single_checkpoint
+            kind = (
+                "gdn_attention_pooled_replay_bm"
+                if block_major
+                else "gdn_attention_pooled_replay"
+            )
+        elif single_checkpoint:
+            kind = (
+                "gdn_attention_pooled_s1_bm"
+                if block_major
+                else "gdn_attention_pooled_s1"
+            )
         else:
             kind = "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled"
         gdn_jax_op = _get_shared_gdn_op(
@@ -1056,6 +1345,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                 conv_state_dtype,
                 num_spec_tokens,
                 conv_weight_kmajor,
+                single_checkpoint,
+                batched_only,
             ),
             build_op,
         )
@@ -1075,12 +1366,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
             seq_lens: torch.Tensor,
             slot_read_offsets: torch.Tensor | None = None,
             ckpt_indices: torch.Tensor | None = None,
-            *step_metadata: torch.Tensor,
+            *extra: torch.Tensor | None,
         ) -> torch.Tensor:
             # Hoisted: `slot_read_offsets` / `ckpt_indices` are the step's
-            # read offsets / int32 checkpoint ids, followed by the rolled
+            # read offsets / int32 checkpoint ids, followed by the 5 rolled
             # per-sequence inputs (see gdn_step_metadata).
-            assert len(step_metadata) == (5 if hoisted else 0)
+            # Non-hoisted: optional `(commit_lens, read_offset_indices)`.
+            if hoisted:
+                assert len(extra) == 5
+            else:
+                assert len(extra) <= 2
             new_rec, outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
@@ -1096,7 +1391,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
-                *step_metadata,
+                *extra,
             )
 
             # Plain donation + copy_ writeback (aliased in-place by XLA).
@@ -1383,6 +1678,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
         self,
         hidden_states: torch.Tensor,
         gdn_step_metadata_cache: GdnStepMetadataCache | None = None,
+        verify_collector: (
+            list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None
+        ) = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
@@ -1450,7 +1748,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                 (recurrent_state,) = kv_cache
                 md_state = mamba_state_of(attn_metadata)
                 assert md_state is not None
-                state_indices = self._bm_state_ids(md_state.to(torch.int32))
+                raw_state_indices = md_state.to(torch.int32)
+                state_indices = self._bm_state_ids(raw_state_indices)
                 # Speculative decoding: the GDN kernel's windowed segment
                 # covers both 1-token decodes and speculative verify
                 # windows (the batch is ordered [decode][verify][prefill]);
@@ -1471,10 +1770,50 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                         "mamba_slot_read_offsets in the attention metadata."
                     )
                 ckpt_indices = mamba_ckpt_of(attn_metadata)
-                step_metadata: tuple[torch.Tensor, ...] = ()
-                pooled_op = self.gdn_pooled_op
+                use_two_slot = (
+                    self._two_slot_mtp
+                    and self.gdn_pooled_single_ckpt_op is not None
+                    and ckpt_indices is not None
+                    and ckpt_indices.ndim == 2
+                    and ckpt_indices.shape[1] in (1, 2)
+                )
+                if use_two_slot and self._verify_win_cap > 0:
+                    n_save = min(num_tokens, self._verify_win_cap)
+                    if n_save > 0:
+                        qkv_save = mixed_qkv[:n_save]
+                        b_save = b[:n_save]
+                        a_save = a[:n_save]
+                        if verify_collector is not None:
+                            verify_collector.append((qkv_save, b_save, a_save))
+                        else:
+                            qkv_buf = self._verify_qkv_buf
+                            b_buf = self._verify_b_buf
+                            a_buf = self._verify_a_buf
+                            if (
+                                qkv_buf is not None
+                                and b_buf is not None
+                                and a_buf is not None
+                            ):
+                                if qkv_buf.device.type == "tpu":
+                                    _update_verify_rows_(qkv_buf, qkv_save)
+                                    _update_verify_rows_(b_buf, b_save)
+                                    _update_verify_rows_(a_buf, a_save)
+                                else:
+                                    qkv_buf[:n_save].copy_(qkv_save.to(qkv_buf.dtype))
+                                    b_buf[:n_save].copy_(b_save.to(b_buf.dtype))
+                                    a_buf[:n_save].copy_(a_save.to(a_buf.dtype))
+                if use_two_slot and ckpt_indices is not None:
+                    ckpt_indices = self._bm_ckpt_ids(ckpt_indices.to(torch.int32))
+                step_metadata: tuple[torch.Tensor | None, ...] = ()
+                pooled_op = (
+                    self.gdn_pooled_single_ckpt_op
+                    if use_two_slot
+                    else self.gdn_pooled_op
+                )
+                assert pooled_op is not None
                 if (
-                    gdn_step_metadata_cache is not None
+                    not use_two_slot
+                    and gdn_step_metadata_cache is not None
                     and self.gdn_pooled_hoisted_op is not None
                     and self.gdn_step_metadata_op is not None
                     and slot_read_offsets is not None
@@ -1498,6 +1837,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                     )
                     step_metadata = tuple(rest)
                     pooled_op = self.gdn_pooled_hoisted_op
+                elif use_two_slot and self._bm_kernel and slot_read_offsets is not None:
+                    # Under merged block-major pools, `slot_read_offsets` is
+                    # indexed by unscaled manager block ID (`raw_state_indices`),
+                    # while `state_indices` / `ckpt_indices` hold physical pool
+                    # block IDs.
+                    step_metadata = (None, raw_state_indices)
                 core_attn_out = pooled_op(
                     mixed_qkv,
                     b,
@@ -1610,3 +1955,1087 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
         # Part 3: Output Projection
         # ============================================================
         return self._apply_output_projection(core_attn_out, z, num_tokens)
+
+
+def _active_verify_flat_tensors(
+    layer: Any, *, force_sp: bool | None = None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    """Select the SP (`dim=-1`) or non-SP (`dim=0`) shared verify flat tensors."""
+    bref = layer._shared_verify_backbone_ref
+    sp_flat = layer._shared_verify_sp_flat_tensors
+    use_sp = (
+        force_sp
+        if force_sp is not None
+        else (bref is not None and bool(bref._last_verify_flat_from_sp))
+    )
+    if use_sp and sp_flat is not None:
+        return sp_flat
+    return layer._shared_verify_flat_tensors
+
+
+def _compute_flip_commit_lens_and_valid(
+    query_start_loc: torch.Tensor,
+    next_tokens: torch.Tensor,
+    win_and_reqs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Derive `(qsl_i32, wr_i32, num_valid, cl_st)` for fused replay+flip."""
+    qsl_i32 = query_start_loc.to(torch.int32)
+    q_lens = qsl_i32[1:] - qsl_i32[:-1]
+    max_seqs = q_lens.shape[0]
+    raw_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1).to(torch.int32)
+    if raw_valid.shape[0] >= max_seqs:
+        num_valid = raw_valid[:max_seqs]
+    else:
+        num_valid = torch.nn.functional.pad(
+            raw_valid, (0, max_seqs - raw_valid.shape[0])
+        )
+    row_idx = torch.arange(max_seqs, device=q_lens.device, dtype=torch.int32)
+    wr_i32 = win_and_reqs.to(torch.int32)
+    is_win = row_idx < wr_i32[0]
+    rejected = is_win & (num_valid < q_lens) & (num_valid > 0)
+    cl_st = torch.where(rejected, num_valid, torch.zeros_like(q_lens)).unsqueeze(0)
+    return qsl_i32, wr_i32, num_valid, cl_st
+
+
+def _torch_to_jax_cpu(t: torch.Tensor) -> jax.Array:
+    if t.dtype == torch.bfloat16:
+        arr = t.detach().cpu().view(torch.uint16).numpy()
+        return jnp.asarray(arr).view(jnp.bfloat16)
+    return jnp.asarray(t.detach().cpu().numpy())
+
+
+def _copy_jax_to_torch_cpu(dst: torch.Tensor, src: jax.Array) -> None:
+    if dst.dtype == torch.bfloat16:
+        raw = np.asarray(jax.lax.bitcast_convert_type(src, jnp.uint16)).copy()
+        dst.copy_(torch.from_numpy(raw).view(torch.bfloat16))
+    else:
+        dst.copy_(torch.from_numpy(np.asarray(src).copy()))
+
+
+def compute_fused_flip_and_ple_offsets_jax(
+    slot_read_offsets: jax.Array,
+    raw_state_indices_stack: jax.Array,
+    query_start_loc: jax.Array,
+    win_and_reqs: jax.Array,
+    ple_state_stack: jax.Array | None = None,
+    ple_offsets_1d: jax.Array | None = None,
+) -> jax.Array:
+    """Pure JAX fused read-offset scatter covering GDN ping-pong + PLE groups.
+
+    Flips active 2-slot ping-pong GDN slots (`0 <-> 1`), resets non-windowed
+    active GDN rows to `0`, and optionally scatters `num_valid - 1` offsets
+    for all standard multi-slot PLE Mamba groups in a single buffer update.
+    """
+    max_seqs = int(query_start_loc.shape[0]) - 1
+    row_idx = jnp.arange(max_seqs, dtype=jnp.int32)
+    q_lens = query_start_loc[1:].astype(jnp.int32) - query_start_loc[:-1].astype(
+        jnp.int32
+    )
+    num_win = win_and_reqs[0].astype(jnp.int32)
+    num_reqs = win_and_reqs[1].astype(jnp.int32)
+    active = (row_idx < num_reqs) & (q_lens > 0)
+    is_win_row = row_idx < num_win
+    n_off = int(slot_read_offsets.shape[0])
+    s_i32 = raw_state_indices_stack.astype(jnp.int32)
+    valid_pp = active[None, :] & (s_i32 > 0) & (s_i32 < n_off)
+    targets = jnp.where(valid_pp, s_i32, 0)
+    old_off = jnp.clip(slot_read_offsets[targets], 0, 1)
+    flipped = (1 - old_off).astype(slot_read_offsets.dtype)
+    new_vals = jnp.where(
+        valid_pp & is_win_row[None, :],
+        flipped,
+        jnp.zeros_like(flipped),
+    )
+    if ple_state_stack is not None and ple_offsets_1d is not None:
+        p_i32 = ple_state_stack.astype(jnp.int32)
+        ple_active = row_idx < num_reqs
+        valid_ple = ple_active[None, :] & (p_i32 > 0) & (p_i32 < n_off)
+        ple_targets = jnp.where(valid_ple, p_i32, 0)
+        ple_vals = jnp.where(
+            valid_ple,
+            jnp.broadcast_to(
+                ple_offsets_1d.astype(slot_read_offsets.dtype)[None, :],
+                p_i32.shape,
+            ),
+            jnp.zeros(p_i32.shape, dtype=slot_read_offsets.dtype),
+        )
+        all_targets = jnp.concatenate(
+            [targets.reshape(-1), ple_targets.reshape(-1)], axis=0
+        )
+        all_vals = jnp.concatenate([new_vals.reshape(-1), ple_vals.reshape(-1)], axis=0)
+        return slot_read_offsets.at[all_targets].set(all_vals)
+    return slot_read_offsets.at[targets.reshape(-1)].set(new_vals.reshape(-1))
+
+
+class MultiLayerPooledReplayRunner:
+    """Single-graph multi-layer 2-slot ping-pong GDN replay + offset updater.
+
+    Combines `L` homogeneous pooled GDN layers (arbitrary `L`, e.g. 36 or 69)
+    into one donated JAX custom op under the `qwen4_exp::` namespace:
+      - Invokes `run_multi_layer_batched_replay_pooled` (one Pallas kernel
+        launch with 1D `jnp.nonzero` compaction) gated by `jax.lax.cond` so an
+        all-accepted step performs zero replay kernel work.
+      - `replay_and_flip(...)` optionally updates both ping-pong GDN and
+        standard multi-slot PLE read offsets in the same donated graph.
+    """
+
+    def __init__(
+        self,
+        layers: Sequence[VllmGatedDeltaNetAttention],
+    ) -> None:
+        self.layers = tuple(layers)
+        self.num_layers = len(self.layers)
+        layer0 = self.layers[0]
+        vllm_context = get_vllm_model_wrapper_context()
+        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
+        mesh = vllm_context.mesh
+        local_num_v_heads = layer0.num_v_heads // layer0.tp_size
+        n_kq = layer0.tp_head_geometry.local_num_kq_heads
+        d_k = layer0.head_k_dim
+        d_v = layer0.head_v_dim
+        kernel_size = layer0.conv_kernel_size
+        qkv_dim = layer0.tp_head_geometry.local_conv_dim(d_k, d_v)
+        num_spec_tokens = layer0.num_spec
+        recurrent_state_dtype = _to_jax_ssm_state_dtype(layer0.get_state_dtype()[1])
+        conv_state_dtype = _to_jax_ssm_state_dtype(layer0._pooled_conv_state_dtype)
+        conv_weight_kmajor = _OPTIONS["GDN_CONV_WEIGHT_KMAJOR"]
+        block_major = bool(layer0._bm_kernel)
+        has_conv_bias = layer0.conv1d.bias is not None
+        pool_indices: tuple[int, ...] = (
+            tuple(int(cast(Any, layer._bm_region)[0]) for layer in self.layers)
+            if block_major
+            else ()
+        )
+        num_pools = int(cast(Any, layer0._bm_region)[1].num_pools) if block_major else 1
+        num_layers = self.num_layers
+        self._has_conv_bias = has_conv_bias
+
+        def _replay_pool_fn(
+            rec_state: jax.Array,
+            mixed_qkv_in: jax.Array,
+            b_in: jax.Array,
+            a_in: jax.Array,
+            conv_weight_stack: jax.Array,
+            conv_bias_stack: jax.Array | None,
+            A_log_stack: jax.Array,
+            dt_bias_stack: jax.Array,
+            raw_state_indices_stack: jax.Array,
+            query_start_loc: jax.Array,
+            distribution: jax.Array,
+            seq_lens: jax.Array,
+            slot_read_offsets: jax.Array,
+            raw_ckpt_indices_stack: jax.Array,
+            commit_lens_stack: jax.Array,
+            *,
+            flat_layout: bool,
+        ) -> jax.Array:
+            cur_pool = kernel_view(rec_state) if block_major else rec_state
+            if flat_layout:
+                if mixed_qkv_in.shape[-1] == qkv_dim:
+                    # Non-SP dim=0 layout: [L * win_stride, dim].
+                    win_rows = mixed_qkv_in.shape[0] // num_layers
+                    qkv_3d = mixed_qkv_in.reshape(num_layers, win_rows, qkv_dim)
+                    b_3d = b_in.reshape(num_layers, win_rows, local_num_v_heads)
+                    a_3d = a_in.reshape(num_layers, win_rows, local_num_v_heads)
+                else:
+                    # SP dim=-1 layout: [win_cap, L * dim].
+                    win_rows = mixed_qkv_in.shape[0]
+                    qkv_3d = jnp.swapaxes(
+                        mixed_qkv_in.reshape(win_rows, num_layers, qkv_dim), 0, 1
+                    )
+                    b_3d = jnp.swapaxes(
+                        b_in.reshape(win_rows, num_layers, local_num_v_heads), 0, 1
+                    )
+                    a_3d = jnp.swapaxes(
+                        a_in.reshape(win_rows, num_layers, local_num_v_heads), 0, 1
+                    )
+            else:
+                win_rows = mixed_qkv_in.shape[1]
+                qkv_3d = mixed_qkv_in
+                b_3d = b_in
+                a_3d = a_in
+            qsl_clamped = jnp.minimum(query_start_loc.astype(jnp.int32), win_rows)
+            block_tokens = vllm_config.cache_config.block_size
+            s_rows = raw_state_indices_stack.shape[0]
+            c_rows = raw_ckpt_indices_stack.shape[0]
+            max_seqs = seq_lens.shape[0]
+
+            raw_s_2d = (
+                jnp.broadcast_to(raw_state_indices_stack, (num_layers, max_seqs))
+                if s_rows == 1
+                else raw_state_indices_stack
+            ).astype(jnp.int32)
+            raw_c_3d = (
+                jnp.broadcast_to(
+                    raw_ckpt_indices_stack,
+                    (num_layers, max_seqs, raw_ckpt_indices_stack.shape[-1]),
+                )
+                if c_rows == 1
+                else raw_ckpt_indices_stack
+            ).astype(jnp.int32)
+            if block_major and num_pools > 1:
+                pidx_arr = jnp.asarray(pool_indices, dtype=jnp.int32)[:, None]
+                s_ids_2d = raw_s_2d * num_pools + pidx_arr
+                c_ids_3d = jnp.where(
+                    raw_c_3d > 0,
+                    raw_c_3d * num_pools + pidx_arr[:, :, None],
+                    0,
+                )
+                ro_idx_2d = raw_s_2d
+            else:
+                s_ids_2d = raw_s_2d
+                c_ids_3d = raw_c_3d
+                ro_idx_2d = s_ids_2d
+            ro_max = max(0, int(slot_read_offsets.shape[0]) - 1)
+            ro_2d = slot_read_offsets[jnp.clip(ro_idx_2d, 0, ro_max)]
+            # Keep [1, max_seqs] commit_lens_stack when shared across layers
+            # so the kernel selects the 1D `jnp.nonzero` compaction fast path.
+            cur_pool = run_jax_gdn_multi_layer_replay_pooled(
+                qkv_3d,
+                b_3d,
+                a_3d,
+                cur_pool,
+                conv_weight_stack,
+                conv_bias_stack,
+                A_log_stack,
+                dt_bias_stack,
+                s_ids_2d,
+                ro_2d,
+                c_ids_3d,
+                commit_lens_stack.astype(jnp.int32),
+                qsl_clamped,
+                distribution,
+                seq_lens,
+                mesh=mesh,
+                n_kq=n_kq,
+                n_v=local_num_v_heads,
+                d_k=d_k,
+                d_v=d_v,
+                kernel_size=kernel_size,
+                pool_block_tokens=block_tokens,
+                recurrent_state_dtype=recurrent_state_dtype,
+                conv_state_dtype=conv_state_dtype,
+                num_spec_tokens=num_spec_tokens,
+                conv_weight_kmajor=conv_weight_kmajor,
+            )
+            if block_major:
+                cur_pool = cur_pool.reshape(rec_state.shape)
+            return cur_pool
+
+        def _dispatch(
+            rec_state: jax.Array,
+            mixed_qkv_in: jax.Array,
+            b_in: jax.Array,
+            a_in: jax.Array,
+            conv_weight_stack: jax.Array,
+            conv_bias_stack: jax.Array | None,
+            A_log_stack: jax.Array,
+            dt_bias_stack: jax.Array,
+            raw_state_indices_stack: jax.Array,
+            query_start_loc: jax.Array,
+            distribution: jax.Array,
+            seq_lens: jax.Array,
+            slot_read_offsets: jax.Array,
+            raw_ckpt_indices_stack: jax.Array,
+            commit_lens_stack: jax.Array,
+            *,
+            flat_layout: bool,
+            win_and_reqs: jax.Array | None = None,
+            ple_state_stack: jax.Array | None = None,
+            ple_offsets_1d: jax.Array | None = None,
+        ) -> tuple[jax.Array, jax.Array]:
+            req_width = commit_lens_stack.shape[1]
+            valid_mask = (
+                jnp.arange(req_width, dtype=jnp.int32)
+                < distribution[0].astype(jnp.int32)
+            )[None, :]
+            has_work = jnp.any(valid_mask & (commit_lens_stack > 0))
+            out_state = jax.lax.cond(
+                has_work,
+                lambda s: _replay_pool_fn(
+                    s,
+                    mixed_qkv_in,
+                    b_in,
+                    a_in,
+                    conv_weight_stack,
+                    conv_bias_stack,
+                    A_log_stack,
+                    dt_bias_stack,
+                    raw_state_indices_stack,
+                    query_start_loc,
+                    distribution,
+                    seq_lens,
+                    slot_read_offsets,
+                    raw_ckpt_indices_stack,
+                    commit_lens_stack,
+                    flat_layout=flat_layout,
+                ),
+                lambda s: s,
+                rec_state,
+            )
+            if win_and_reqs is not None:
+                new_ro = compute_fused_flip_and_ple_offsets_jax(
+                    slot_read_offsets,
+                    raw_state_indices_stack,
+                    query_start_loc,
+                    win_and_reqs,
+                    ple_state_stack=ple_state_stack,
+                    ple_offsets_1d=ple_offsets_1d,
+                )
+                return out_state, new_ro
+            return out_state, raw_state_indices_stack[0, 0]
+
+        def _make_wrapped(
+            flat_layout: bool, flip: bool, with_bias: bool, with_ple: bool = False
+        ):
+            if not flip and not with_bias:
+
+                def fn(
+                    rec: jax.Array,
+                    qkv: jax.Array,
+                    b: jax.Array,
+                    a: jax.Array,
+                    cw: jax.Array,
+                    al: jax.Array,
+                    dtb: jax.Array,
+                    s: jax.Array,
+                    qsl: jax.Array,
+                    dist: jax.Array,
+                    sl: jax.Array,
+                    ro: jax.Array,
+                    c: jax.Array,
+                    cl: jax.Array,
+                ) -> tuple[jax.Array, jax.Array]:
+                    return _dispatch(
+                        rec,
+                        qkv,
+                        b,
+                        a,
+                        cw,
+                        None,
+                        al,
+                        dtb,
+                        s,
+                        qsl,
+                        dist,
+                        sl,
+                        ro,
+                        c,
+                        cl,
+                        flat_layout=flat_layout,
+                    )
+
+                return fn
+            if not flip and with_bias:
+
+                def fn(
+                    rec: jax.Array,
+                    qkv: jax.Array,
+                    b: jax.Array,
+                    a: jax.Array,
+                    cw: jax.Array,
+                    cb: jax.Array,
+                    al: jax.Array,
+                    dtb: jax.Array,
+                    s: jax.Array,
+                    qsl: jax.Array,
+                    dist: jax.Array,
+                    sl: jax.Array,
+                    ro: jax.Array,
+                    c: jax.Array,
+                    cl: jax.Array,
+                ) -> tuple[jax.Array, jax.Array]:
+                    return _dispatch(
+                        rec,
+                        qkv,
+                        b,
+                        a,
+                        cw,
+                        cb,
+                        al,
+                        dtb,
+                        s,
+                        qsl,
+                        dist,
+                        sl,
+                        ro,
+                        c,
+                        cl,
+                        flat_layout=flat_layout,
+                    )
+
+                return fn
+            if flip and not with_bias and not with_ple:
+
+                def fn(
+                    rec: jax.Array,
+                    qkv: jax.Array,
+                    b: jax.Array,
+                    a: jax.Array,
+                    cw: jax.Array,
+                    al: jax.Array,
+                    dtb: jax.Array,
+                    s: jax.Array,
+                    qsl: jax.Array,
+                    dist: jax.Array,
+                    sl: jax.Array,
+                    ro: jax.Array,
+                    c: jax.Array,
+                    cl: jax.Array,
+                    wr: jax.Array,
+                ) -> tuple[jax.Array, jax.Array]:
+                    return _dispatch(
+                        rec,
+                        qkv,
+                        b,
+                        a,
+                        cw,
+                        None,
+                        al,
+                        dtb,
+                        s,
+                        qsl,
+                        dist,
+                        sl,
+                        ro,
+                        c,
+                        cl,
+                        flat_layout=flat_layout,
+                        win_and_reqs=wr,
+                    )
+
+                return fn
+            if flip and with_bias and not with_ple:
+
+                def fn(
+                    rec: jax.Array,
+                    qkv: jax.Array,
+                    b: jax.Array,
+                    a: jax.Array,
+                    cw: jax.Array,
+                    cb: jax.Array,
+                    al: jax.Array,
+                    dtb: jax.Array,
+                    s: jax.Array,
+                    qsl: jax.Array,
+                    dist: jax.Array,
+                    sl: jax.Array,
+                    ro: jax.Array,
+                    c: jax.Array,
+                    cl: jax.Array,
+                    wr: jax.Array,
+                ) -> tuple[jax.Array, jax.Array]:
+                    return _dispatch(
+                        rec,
+                        qkv,
+                        b,
+                        a,
+                        cw,
+                        cb,
+                        al,
+                        dtb,
+                        s,
+                        qsl,
+                        dist,
+                        sl,
+                        ro,
+                        c,
+                        cl,
+                        flat_layout=flat_layout,
+                        win_and_reqs=wr,
+                    )
+
+                return fn
+            if flip and not with_bias and with_ple:
+
+                def fn(
+                    rec: jax.Array,
+                    qkv: jax.Array,
+                    b: jax.Array,
+                    a: jax.Array,
+                    cw: jax.Array,
+                    al: jax.Array,
+                    dtb: jax.Array,
+                    s: jax.Array,
+                    qsl: jax.Array,
+                    dist: jax.Array,
+                    sl: jax.Array,
+                    ro: jax.Array,
+                    c: jax.Array,
+                    cl: jax.Array,
+                    wr: jax.Array,
+                    ps: jax.Array,
+                    po: jax.Array,
+                ) -> tuple[jax.Array, jax.Array]:
+                    return _dispatch(
+                        rec,
+                        qkv,
+                        b,
+                        a,
+                        cw,
+                        None,
+                        al,
+                        dtb,
+                        s,
+                        qsl,
+                        dist,
+                        sl,
+                        ro,
+                        c,
+                        cl,
+                        flat_layout=flat_layout,
+                        win_and_reqs=wr,
+                        ple_state_stack=ps,
+                        ple_offsets_1d=po,
+                    )
+
+                return fn
+
+            def fn(
+                rec: jax.Array,
+                qkv: jax.Array,
+                b: jax.Array,
+                a: jax.Array,
+                cw: jax.Array,
+                cb: jax.Array,
+                al: jax.Array,
+                dtb: jax.Array,
+                s: jax.Array,
+                qsl: jax.Array,
+                dist: jax.Array,
+                sl: jax.Array,
+                ro: jax.Array,
+                c: jax.Array,
+                cl: jax.Array,
+                wr: jax.Array,
+                ps: jax.Array,
+                po: jax.Array,
+            ) -> tuple[jax.Array, jax.Array]:
+                return _dispatch(
+                    rec,
+                    qkv,
+                    b,
+                    a,
+                    cw,
+                    cb,
+                    al,
+                    dtb,
+                    s,
+                    qsl,
+                    dist,
+                    sl,
+                    ro,
+                    c,
+                    cl,
+                    flat_layout=flat_layout,
+                    win_and_reqs=wr,
+                    ple_state_stack=ps,
+                    ple_offsets_1d=po,
+                )
+
+            return fn
+
+        def _fake_replay_only(rec: torch.Tensor, *args, **kwargs):
+            del args, kwargs
+            return torch.empty_like(rec), torch.empty(
+                (), dtype=torch.int32, device=rec.device
+            )
+
+        def _fake_replay_and_flip(rec: torch.Tensor, *args, **kwargs):
+            del kwargs
+            ro_idx = (12 if has_conv_bias else 11) - 1
+            ro = args[ro_idx]
+            return torch.empty_like(rec), torch.empty_like(ro)
+
+        def build_ops(op_name: str):
+            fn_std = _make_wrapped(False, False, has_conv_bias)
+            op_std = pallas.jax_op(
+                f"qwen4_exp::{op_name}_std", fn_std, donate_argnums=(0,)
+            )
+            op_std.register_fake(_fake_replay_only)
+
+            fn_flat = _make_wrapped(True, False, has_conv_bias)
+            op_flat = pallas.jax_op(
+                f"qwen4_exp::{op_name}_flat", fn_flat, donate_argnums=(0,)
+            )
+            op_flat.register_fake(_fake_replay_only)
+
+            ro_pos = 12 if has_conv_bias else 11
+            fn_flip = _make_wrapped(True, True, has_conv_bias, with_ple=False)
+            op_flip = pallas.jax_op(
+                f"qwen4_exp::{op_name}_flip", fn_flip, donate_argnums=(0, ro_pos)
+            )
+            op_flip.register_fake(_fake_replay_and_flip)
+
+            fn_flip_ple = _make_wrapped(True, True, has_conv_bias, with_ple=True)
+            op_flip_ple = pallas.jax_op(
+                f"qwen4_exp::{op_name}_flip_ple",
+                fn_flip_ple,
+                donate_argnums=(0, ro_pos),
+            )
+            op_flip_ple.register_fake(_fake_replay_and_flip)
+
+            @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+            def _compiled_std(
+                recurrent_state: torch.Tensor,
+                qkv_3d: torch.Tensor,
+                b_3d: torch.Tensor,
+                a_3d: torch.Tensor,
+                *rest: torch.Tensor,
+            ) -> None:
+                new_rec, _ = op_std(recurrent_state, qkv_3d, b_3d, a_3d, *rest)
+                recurrent_state.copy_(new_rec)
+
+            @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+            def _compiled_flat(
+                recurrent_state: torch.Tensor,
+                qkv_flat: torch.Tensor,
+                b_flat: torch.Tensor,
+                a_flat: torch.Tensor,
+                *rest: torch.Tensor,
+            ) -> None:
+                new_rec, _ = op_flat(recurrent_state, qkv_flat, b_flat, a_flat, *rest)
+                recurrent_state.copy_(new_rec)
+
+            @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+            def _compiled_flip(
+                recurrent_state: torch.Tensor,
+                qkv_flat: torch.Tensor,
+                b_flat: torch.Tensor,
+                a_flat: torch.Tensor,
+                *rest: torch.Tensor,
+            ) -> None:
+                w_cnt = 4 if has_conv_bias else 3
+                weights = rest[:w_cnt]
+                s_st, c_st, qsl, next_tokens, win_and_reqs, dist, slens, ro = rest[
+                    w_cnt:
+                ]
+                qsl_i32, wr_i32, _, cl_st = _compute_flip_commit_lens_and_valid(
+                    qsl, next_tokens, win_and_reqs
+                )
+                new_rec, new_ro = op_flip(
+                    recurrent_state,
+                    qkv_flat,
+                    b_flat,
+                    a_flat,
+                    *weights,
+                    s_st.to(torch.int32),
+                    qsl_i32,
+                    dist.to(torch.int32),
+                    slens.to(torch.int32),
+                    ro,
+                    c_st.to(torch.int32),
+                    cl_st,
+                    wr_i32,
+                )
+                recurrent_state.copy_(new_rec)
+                ro.copy_(new_ro)
+
+            @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+            def _compiled_flip_with_ple(
+                recurrent_state: torch.Tensor,
+                qkv_flat: torch.Tensor,
+                b_flat: torch.Tensor,
+                a_flat: torch.Tensor,
+                *rest: torch.Tensor,
+            ) -> None:
+                w_cnt = 4 if has_conv_bias else 3
+                weights = rest[:w_cnt]
+                (
+                    s_st,
+                    c_st,
+                    qsl,
+                    next_tokens,
+                    win_and_reqs,
+                    dist,
+                    slens,
+                    ro,
+                    ple_s_st,
+                ) = rest[w_cnt:]
+                qsl_i32, wr_i32, num_valid, cl_st = _compute_flip_commit_lens_and_valid(
+                    qsl, next_tokens, win_and_reqs
+                )
+                ple_off_1d = (num_valid - 1).clamp(min=0)
+                new_rec, new_ro = op_flip_ple(
+                    recurrent_state,
+                    qkv_flat,
+                    b_flat,
+                    a_flat,
+                    *weights,
+                    s_st.to(torch.int32),
+                    qsl_i32,
+                    dist.to(torch.int32),
+                    slens.to(torch.int32),
+                    ro,
+                    c_st.to(torch.int32),
+                    cl_st,
+                    wr_i32,
+                    ple_s_st.to(torch.int32),
+                    ple_off_1d,
+                )
+                recurrent_state.copy_(new_rec)
+                ro.copy_(new_ro)
+
+            return (
+                fn_std,
+                fn_flat,
+                fn_flip,
+                fn_flip_ple,
+                _compiled_std,
+                _compiled_flat,
+                _compiled_flip,
+                _compiled_flip_with_ple,
+            )
+
+        kind = (
+            f"gdn_multi_layer_pooled_replay_{num_layers}l"
+            f"{'_bm' if block_major else ''}"
+            f"{'_bias' if has_conv_bias else ''}"
+        )
+        (
+            self._jax_fn_std,
+            self._jax_fn_flat,
+            self._jax_fn_flip,
+            self._jax_fn_flip_ple,
+            self._compiled_std,
+            self._compiled_flat,
+            self._compiled_flip,
+            self._compiled_flip_with_ple,
+        ) = _get_shared_gdn_op(
+            kind,
+            (
+                id(mesh),
+                id(vllm_config),
+                num_layers,
+                n_kq,
+                local_num_v_heads,
+                d_k,
+                d_v,
+                kernel_size,
+                recurrent_state_dtype,
+                conv_state_dtype,
+                num_spec_tokens,
+                conv_weight_kmajor,
+                block_major,
+                num_pools,
+                pool_indices,
+                has_conv_bias,
+            ),
+            build_ops,
+        )
+        self._weight_key: tuple[int, ...] | None = None
+        self._cached_weight_stacks: tuple[torch.Tensor, ...] | None = None
+
+    def _weight_stacks(self) -> tuple[torch.Tensor, ...]:
+        # Stacked model weights are immutable during TPU serving; skip 3*L
+        # `.data_ptr()` PJRT calls once cached on TPU device.
+        if (
+            self._cached_weight_stacks is not None
+            and self.layers[0].A_log.device.type == "tpu"
+        ):
+            return self._cached_weight_stacks
+        key_parts: list[int] = []
+        cws: list[torch.Tensor] = []
+        cbs: list[torch.Tensor] = []
+        alogs: list[torch.Tensor] = []
+        dtbs: list[torch.Tensor] = []
+        for layer in self.layers:
+            cw = layer._pooled_conv_weight()
+            cws.append(cw)
+            key_parts.append(int(cw.data_ptr()))
+            key_parts.append(int(cw._version))
+            if self._has_conv_bias:
+                cb = layer.conv1d.bias
+                assert cb is not None
+                cbs.append(cb)
+                key_parts.append(int(cb.data_ptr()))
+                key_parts.append(int(cb._version))
+            alogs.append(layer.A_log)
+            dtbs.append(layer.dt_bias)
+            key_parts.append(int(layer.A_log.data_ptr()))
+            key_parts.append(int(layer.A_log._version))
+            key_parts.append(int(layer.dt_bias.data_ptr()))
+            key_parts.append(int(layer.dt_bias._version))
+        key = tuple(key_parts)
+        if self._cached_weight_stacks is not None and self._weight_key == key:
+            return self._cached_weight_stacks
+        if self._has_conv_bias:
+            stacks: tuple[torch.Tensor, ...] = (
+                torch.stack(cws, dim=0).contiguous(),
+                torch.stack(cbs, dim=0).contiguous(),
+                torch.stack(alogs, dim=0).contiguous(),
+                torch.stack(dtbs, dim=0).contiguous(),
+            )
+        else:
+            stacks = (
+                torch.stack(cws, dim=0).contiguous(),
+                torch.stack(alogs, dim=0).contiguous(),
+                torch.stack(dtbs, dim=0).contiguous(),
+            )
+        self._weight_key = key
+        self._cached_weight_stacks = stacks
+        return stacks
+
+    def can_replay_and_flip_fast(self) -> bool:
+        """True when all layers share one backbone-owned verify flat buffer."""
+        if self.layers[0]._shared_verify_flat_tensors is None:
+            return False
+        return all(
+            layer._shared_verify_flat_tensors is not None for layer in self.layers
+        )
+
+    @torch.no_grad()
+    def replay_and_flip(
+        self,
+        *,
+        state_stack: torch.Tensor,
+        ckpt_stack: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        next_tokens: torch.Tensor,
+        win_and_reqs: torch.Tensor,
+        distribution: torch.Tensor,
+        seq_lens: torch.Tensor,
+        slot_read_offsets: torch.Tensor,
+        ple_state_stack: torch.Tensor | None = None,
+        force_sp: bool | None = None,
+    ) -> None:
+        kv0 = self.layers[0].kv_cache
+        if kv0 is None or len(kv0) != 1 or kv0[0].numel() == 0:
+            return
+        pool = kv0[0]
+        flat0 = _active_verify_flat_tensors(self.layers[0], force_sp=force_sp)
+        assert flat0 is not None
+        qkv_flat, b_flat, a_flat = flat0
+        weight_stacks = self._weight_stacks()
+        if pool.device.type == "tpu":
+            if ple_state_stack is not None:
+                self._compiled_flip_with_ple(
+                    pool,
+                    qkv_flat,
+                    b_flat,
+                    a_flat,
+                    *weight_stacks,
+                    state_stack,
+                    ckpt_stack,
+                    query_start_loc,
+                    next_tokens,
+                    win_and_reqs,
+                    distribution,
+                    seq_lens,
+                    slot_read_offsets,
+                    ple_state_stack,
+                )
+            else:
+                self._compiled_flip(
+                    pool,
+                    qkv_flat,
+                    b_flat,
+                    a_flat,
+                    *weight_stacks,
+                    state_stack,
+                    ckpt_stack,
+                    query_start_loc,
+                    next_tokens,
+                    win_and_reqs,
+                    distribution,
+                    seq_lens,
+                    slot_read_offsets,
+                )
+            return
+
+        # CPU fallback for unit tests (bit-exact with compiled TPU graph).
+        qsl_i32, wr_i32, num_valid, cl_st = _compute_flip_commit_lens_and_valid(
+            query_start_loc, next_tokens, win_and_reqs
+        )
+        j_weights = [_torch_to_jax_cpu(w) for w in weight_stacks]
+        if ple_state_stack is not None:
+            ple_off_1d = (num_valid - 1).clamp(min=0)
+            new_rec, new_ro = self._jax_fn_flip_ple(
+                _torch_to_jax_cpu(pool),
+                _torch_to_jax_cpu(qkv_flat),
+                _torch_to_jax_cpu(b_flat),
+                _torch_to_jax_cpu(a_flat),
+                *j_weights,
+                _torch_to_jax_cpu(state_stack.to(torch.int32)),
+                _torch_to_jax_cpu(qsl_i32),
+                _torch_to_jax_cpu(distribution.to(torch.int32)),
+                _torch_to_jax_cpu(seq_lens.to(torch.int32)),
+                _torch_to_jax_cpu(slot_read_offsets),
+                _torch_to_jax_cpu(ckpt_stack.to(torch.int32)),
+                _torch_to_jax_cpu(cl_st),
+                _torch_to_jax_cpu(wr_i32),
+                _torch_to_jax_cpu(ple_state_stack.to(torch.int32)),
+                _torch_to_jax_cpu(ple_off_1d),
+            )
+        else:
+            new_rec, new_ro = self._jax_fn_flip(
+                _torch_to_jax_cpu(pool),
+                _torch_to_jax_cpu(qkv_flat),
+                _torch_to_jax_cpu(b_flat),
+                _torch_to_jax_cpu(a_flat),
+                *j_weights,
+                _torch_to_jax_cpu(state_stack.to(torch.int32)),
+                _torch_to_jax_cpu(qsl_i32),
+                _torch_to_jax_cpu(distribution.to(torch.int32)),
+                _torch_to_jax_cpu(seq_lens.to(torch.int32)),
+                _torch_to_jax_cpu(slot_read_offsets),
+                _torch_to_jax_cpu(ckpt_stack.to(torch.int32)),
+                _torch_to_jax_cpu(cl_st),
+                _torch_to_jax_cpu(wr_i32),
+            )
+        _copy_jax_to_torch_cpu(pool, new_rec)
+        _copy_jax_to_torch_cpu(slot_read_offsets, new_ro)
+
+    @torch.no_grad()
+    def __call__(
+        self,
+        *,
+        raw_state_indices_stack: torch.Tensor,
+        raw_ckpt_indices_stack: torch.Tensor,
+        commit_lens_stack: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        distribution: torch.Tensor,
+        seq_lens: torch.Tensor,
+        slot_read_offsets: torch.Tensor,
+        staged_inputs: (
+            dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None
+        ) = None,
+        force_sp: bool | None = None,
+    ) -> None:
+        kv0 = self.layers[0].kv_cache
+        if kv0 is None or len(kv0) != 1 or kv0[0].numel() == 0:
+            return
+        pool = kv0[0]
+        weight_stacks = self._weight_stacks()
+        flat0 = _active_verify_flat_tensors(self.layers[0], force_sp=force_sp)
+        if staged_inputs is None and flat0 is not None:
+            qkv_flat, b_flat, a_flat = flat0
+            if pool.device.type == "tpu":
+                self._compiled_flat(
+                    pool,
+                    qkv_flat,
+                    b_flat,
+                    a_flat,
+                    *weight_stacks,
+                    raw_state_indices_stack.to(torch.int32),
+                    query_start_loc.to(torch.int32),
+                    distribution.to(torch.int32),
+                    seq_lens.to(torch.int32),
+                    slot_read_offsets,
+                    raw_ckpt_indices_stack.to(torch.int32),
+                    commit_lens_stack.to(torch.int32),
+                )
+                return
+            new_rec, _ = self._jax_fn_flat(
+                _torch_to_jax_cpu(pool),
+                _torch_to_jax_cpu(qkv_flat),
+                _torch_to_jax_cpu(b_flat),
+                _torch_to_jax_cpu(a_flat),
+                *[_torch_to_jax_cpu(w) for w in weight_stacks],
+                _torch_to_jax_cpu(raw_state_indices_stack.to(torch.int32)),
+                _torch_to_jax_cpu(query_start_loc.to(torch.int32)),
+                _torch_to_jax_cpu(distribution.to(torch.int32)),
+                _torch_to_jax_cpu(seq_lens.to(torch.int32)),
+                _torch_to_jax_cpu(slot_read_offsets),
+                _torch_to_jax_cpu(raw_ckpt_indices_stack.to(torch.int32)),
+                _torch_to_jax_cpu(commit_lens_stack.to(torch.int32)),
+            )
+            _copy_jax_to_torch_cpu(pool, new_rec)
+            return
+
+        # Per-layer staged verify tensors stacked along dim=0: [L, win_rows, dim].
+        qkvs, bs, as_ = [], [], []
+        for layer in self.layers:
+            item = (
+                staged_inputs.get(layer.prefix)
+                if staged_inputs is not None
+                else layer.get_verify_inputs()
+            )
+            if item is None:
+                return
+            qkvs.append(item[0])
+            bs.append(item[1])
+            as_.append(item[2])
+        qkv_3d = torch.stack(qkvs, dim=0).contiguous()
+        b_3d = torch.stack(bs, dim=0).contiguous()
+        a_3d = torch.stack(as_, dim=0).contiguous()
+        if pool.device.type == "tpu":
+            self._compiled_std(
+                pool,
+                qkv_3d,
+                b_3d,
+                a_3d,
+                *weight_stacks,
+                raw_state_indices_stack.to(torch.int32),
+                query_start_loc.to(torch.int32),
+                distribution.to(torch.int32),
+                seq_lens.to(torch.int32),
+                slot_read_offsets,
+                raw_ckpt_indices_stack.to(torch.int32),
+                commit_lens_stack.to(torch.int32),
+            )
+            return
+        new_rec, _ = self._jax_fn_std(
+            _torch_to_jax_cpu(pool),
+            _torch_to_jax_cpu(qkv_3d),
+            _torch_to_jax_cpu(b_3d),
+            _torch_to_jax_cpu(a_3d),
+            *[_torch_to_jax_cpu(w) for w in weight_stacks],
+            _torch_to_jax_cpu(raw_state_indices_stack.to(torch.int32)),
+            _torch_to_jax_cpu(query_start_loc.to(torch.int32)),
+            _torch_to_jax_cpu(distribution.to(torch.int32)),
+            _torch_to_jax_cpu(seq_lens.to(torch.int32)),
+            _torch_to_jax_cpu(slot_read_offsets),
+            _torch_to_jax_cpu(raw_ckpt_indices_stack.to(torch.int32)),
+            _torch_to_jax_cpu(commit_lens_stack.to(torch.int32)),
+        )
+        _copy_jax_to_torch_cpu(pool, new_rec)
+
+
+def build_multi_layer_pooled_replay_runner(
+    layers: Sequence[Any],
+) -> MultiLayerPooledReplayRunner | None:
+    """Build a single-launch multi-layer replay runner when `layers` share one pool."""
+    if not layers:
+        return None
+    gdn_layers = tuple(layers)
+    l0 = gdn_layers[0]
+    if not isinstance(l0, VllmGatedDeltaNetAttention):
+        return None
+    kv0 = l0.kv_cache
+    if kv0 is None or len(kv0) != 1 or kv0[0].numel() == 0:
+        return None
+    pool0 = kv0[0]
+    block_major = bool(l0._bm_kernel)
+    has_bias = l0.conv1d.bias is not None
+    bm_num_pools = (
+        int(cast(Any, l0._bm_region)[1].num_pools)
+        if (block_major and l0._bm_region is not None)
+        else 0
+    )
+    for layer in gdn_layers:
+        if not isinstance(layer, VllmGatedDeltaNetAttention):
+            return None
+        if not layer._two_slot_mtp:
+            return None
+        kv = layer.kv_cache
+        if kv is None or len(kv) != 1 or kv[0] is not pool0:
+            return None
+        if (layer.conv1d.bias is not None) != has_bias:
+            return None
+        if (
+            layer.num_v_heads != l0.num_v_heads
+            or layer.num_k_heads != l0.num_k_heads
+            or layer.head_k_dim != l0.head_k_dim
+            or layer.head_v_dim != l0.head_v_dim
+            or layer.conv_kernel_size != l0.conv_kernel_size
+            or layer.num_spec != l0.num_spec
+            or bool(layer._bm_kernel) != block_major
+        ):
+            return None
+        if block_major and (
+            layer._bm_region is None
+            or int(cast(Any, layer._bm_region)[1].num_pools) != bm_num_pools
+        ):
+            return None
+    return MultiLayerPooledReplayRunner(gdn_layers)
