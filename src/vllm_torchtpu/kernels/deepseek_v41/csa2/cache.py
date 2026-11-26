@@ -255,9 +255,16 @@ def _gather_sc_banked_deep(words, scales, records, into=None, row_offset=0):
     assert info is not None
     lanes = info.num_lanes
     cores = info.num_cores * info.num_subcores
-    streams, subchunks, slots = (4 if len(words) == 1 else 2), 512 // lanes, 3
-    block = cores * lanes * subchunks
+    streams, slots = (4 if len(words) == 1 else 2), 3
     count = records.size
+    # Padding ids gather zero rows like -1 ids, so blocks of at most 512 ids
+    # per subcore are balanced instead of padding the last one: T=72 decode
+    # (36,864 ids) runs three 12,288-id blocks, not 16,384 + 16,384 + 4,096
+    # on all 32 subcores. Two steps per block fill the pipeline.
+    blocks = pl.cdiv(count, cores * 512)
+    steps = max(2, pl.cdiv(count, blocks * cores * lanes * streams))
+    subchunks = steps * streams
+    block = cores * lanes * subchunks
     padding = -count % block
     indices = jnp.pad(records.reshape(-1), (0, padding), constant_values=-1)
     zero_words = jnp.zeros((_ZERO_ROWS, 128), jnp.int32)
@@ -284,7 +291,6 @@ def _gather_sc_banked_deep(words, scales, records, into=None, row_offset=0):
     ):
         core = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
         split = word_refs[0].shape[0]
-        steps = subchunks // streams
         lane = jnp.arange(lanes, dtype=jnp.int32)
 
         def outer(ids):
