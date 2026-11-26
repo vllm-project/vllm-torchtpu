@@ -2299,7 +2299,10 @@ def _mlp_kernel(
     def fetch_rows(gm_id):
         """Start copying tile `gm_id`'s rows once its expert's wave (and every
         earlier one) has landed whole."""
-        wait_waves(group_offset_ref[0] + metadata_ref.gm_id_to_group_id[gm_id] + 1)
+        with jax.named_scope("wave_wait"):
+            wait_waves(
+                group_offset_ref[0] + metadata_ref.gm_id_to_group_id[gm_id] + 1
+            )
         wave_rows_copy(gm_id).start()
 
     def convert_rows(gm_id):
@@ -2508,13 +2511,15 @@ def _mlp_kernel(
             start_first_weights(metadata_ref.gm_id_to_group_id[0])
 
         def step(gm_id, carry):
-            wave_rows_copy(gm_id).wait()
+            with jax.named_scope("wave_rows_wait"):
+                wave_rows_copy(gm_id).wait()
 
-            @pl.when(gm_id == 0)
-            def _():
-                wave.scale_copy().wait()
+                @pl.when(gm_id == 0)
+                def _():
+                    wave.scale_copy().wait()
 
-            convert_rows(gm_id)
+            with jax.named_scope("wave_convert"):
+                convert_rows(gm_id)
             body(wave.lhs, gm_id=gm_id)
             return carry
 
@@ -2527,8 +2532,9 @@ def _mlp_kernel(
         # Every wave semaphore ends balanced, the waves of experts without
         # tiles and the sentinels included.
         num_waves = lhs_group_sizes_ref.shape[0]
-        wait_waves(num_waves)
-        wait_rows(wave.sems.at[num_waves], wave.recv, wave.sentinels[0])
+        with jax.named_scope("wave_final_wait"):
+            wait_waves(num_waves)
+            wait_rows(wave.sems.at[num_waves], wave.recv, wave.sentinels[0])
 
     if scatter is not None:
         if wave is None:
