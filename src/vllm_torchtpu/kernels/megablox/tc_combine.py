@@ -51,6 +51,8 @@ TOKEN_BLOCK = 256
 _VMEM_LIMIT_BYTES = 60 * 1024 * 1024
 # Output columns per shared-expert product (bounds its f32 temporary).
 _SHARED_COLS = 512
+# Sublanes of a 32-bit vreg tile: a slot-major route block's row padding.
+_SLOT_ROWS = 8
 
 
 def max_tiles(token_block: int, topk: int, num_experts: int) -> int:
@@ -88,17 +90,28 @@ def supported(
 
 def _plan(pos, valid, group_sizes, num_tokens: int, topk: int, token_block: int):
     """Per block: the x tiles to load (in buffer order) and their count, and
-    each route's row in the block's buffer (-1: not a local route)."""
+    each route's row in the block's buffer (-1: not a local route).
+
+    ``pos``/``valid`` are flat token-major ``[T * topk]`` or slot-major
+    ``[topk, T]``; the rows come back as ``[T, topk]`` or ``[topk, T]``."""
     num_experts = group_sizes.shape[0]
     nb = num_tokens // token_block
+    slot_major = pos.ndim == 2
+
+    def by_block(a):
+        # [nb, topk * token_block]: a block's routes (their order is free).
+        if slot_major:
+            a = a.reshape(topk, nb, token_block).transpose(1, 0, 2)
+        return a.reshape(nb, -1)
+
+    pos, valid = by_block(pos), by_block(valid)
     ends = jnp.cumsum(group_sizes)
-    expert = jnp.sum(pos[:, None] >= ends[None, :], axis=1, dtype=jnp.int32)
+    expert = jnp.sum(pos[..., None] >= ends, axis=2, dtype=jnp.int32)
     valid = valid & (expert < num_experts)
     big = jnp.int32(2**30)
     eid = jnp.arange(num_experts, dtype=jnp.int32)
-    hit = valid[:, None] & (expert[:, None] == eid[None, :])  # [T*k, E]
-    hit = hit.reshape(nb, token_block * topk, num_experts)
-    pos_b = pos.reshape(nb, token_block * topk, 1)
+    hit = valid[..., None] & (expert[..., None] == eid)  # [nb, k*TB, E]
+    pos_b = pos[..., None]
     lo = jnp.min(jnp.where(hit, pos_b, big), axis=1)  # [nb, E]
     hi = jnp.max(jnp.where(hit, pos_b + 1, 0), axis=1)
     present = hi > 0
@@ -125,12 +138,16 @@ def _plan(pos, valid, group_sizes, num_tokens: int, topk: int, token_block: int)
     # the first loaded tile of that expert.
     shift = (tile_off - first) * TILE_ROWS  # [nb, E]
     route_shift = jnp.sum(jnp.where(hit, shift[:, None, :], 0), axis=2)
-    row = route_shift + pos.reshape(nb, -1)
-    row = jnp.where(valid.reshape(nb, -1), row, -1)
+    row = jnp.where(valid, route_shift + pos, -1)
+    if slot_major:
+        row = row.reshape(nb, topk, token_block).transpose(1, 0, 2)
+        row = row.reshape(topk, num_tokens)
+    else:
+        row = row.reshape(num_tokens, topk)
     return (
         tiles.reshape(-1).astype(jnp.int32),
         total.astype(jnp.int32),
-        row.reshape(num_tokens, topk).astype(jnp.int32),
+        row.astype(jnp.int32),
     )
 
 
@@ -138,13 +155,15 @@ def _kernel(
     tiles_ref,  # SMEM [nb * maxt]
     count_ref,  # SMEM [nb]
     valid_rows_ref,  # SMEM [1]: rows of x the GMM wrote
-    row_ref,  # VMEM [TB, k]
-    w_ref,  # VMEM [TB, k]
+    row_ref,  # VMEM [TB, k], or slot-major [k padded to 8s, TB]
+    w_ref,  # VMEM like row_ref
     x_hbm,  # ANY [Mx, H]
     *refs,
     maxt: int,
     topk: int,
     shared: bool,
+    slot_major: bool,
+    p_dtype,
 ):
     if shared:
         act_ref, w2s_ref, s2s_ref, *refs = refs  # [TB, i_s] bf16, [i_s, H], [1, H]
@@ -229,7 +248,9 @@ def _kernel(
     # summed them through VMEM.
     rows = row_ref[...]
     w = w_ref[...].astype(jnp.float32)
-    p_dtype = jnp.bfloat16 if w_ref.dtype == jnp.bfloat16 else jnp.float32
+    if slot_major:
+        # The block's lane-dense slot rows to tokens on sublanes (XLU).
+        rows, w = rows.T[:, :topk], w.T[:, :topk]
 
     def product(first, chunks):
         size = chunks * _CHUNK_ROWS
@@ -309,14 +330,17 @@ def tc_combine(
     """out[t] = sum_j where(valid, weights * x[pos], 0) over j < topk, f32
     accumulation, bf16 out. `x` rows [0, sum(group_sizes)) are the GMM output
     grouped by local expert (sizes `group_sizes`), tokens ascending within a
-    group; `pos`, `weights`, `valid` are flat [T * topk] in token-major order.
+    group; `pos`, `weights`, `valid` are flat [T * topk] in token-major order,
+    or [topk, T] slot-major (how the routing prep lays them out: a [T, topk]
+    layout pads topk to the 128 lanes and costs relayouts per array).
     ``shared_down`` (activation [T, i_s] bf16, w2 [i_s, H] e4m3, s2 [1, H]
     f32) adds bf16(bf16(act @ w2) * s2) to the bf16 sum, in bf16.
     ``fallback=False`` drops the gather fallback for rows out of token order
     (a caller whose routes come from a stable sort by expert never takes it):
     the plain kernel call lets XLA overlap an async collective with it, which
     it does not across the conditional."""
-    num_tokens = pos.shape[0] // topk
+    slot_major = pos.ndim == 2
+    num_tokens = pos.shape[1] if slot_major else pos.shape[0] // topk
     hidden = x.shape[1]
     num_experts = group_sizes.shape[0]
     token_block = TOKEN_BLOCK
@@ -328,9 +352,20 @@ def tc_combine(
     if x.shape[0] % TILE_ROWS:
         x = jnp.pad(x, ((0, TILE_ROWS - x.shape[0] % TILE_ROWS), (0, 0)))
     valid_rows = jnp.sum(group_sizes, dtype=jnp.int32)[None]
-    w = weights.reshape(num_tokens, topk)
-    if w.dtype != jnp.bfloat16:
-        w = w.astype(jnp.float32)
+    p_dtype = jnp.bfloat16 if weights.dtype == jnp.bfloat16 else jnp.float32
+    if slot_major:
+        # Sublane-padded so the kernel transposes whole vregs; f32 for the
+        # 32-bit transpose (exact: the products round to p_dtype as before).
+        slots = -(-topk // _SLOT_ROWS) * _SLOT_ROWS
+        pad = ((0, slots - topk), (0, 0))
+        rows = jnp.pad(rows, pad, constant_values=-1)
+        w = jnp.pad(weights.astype(jnp.float32), pad)
+        route_spec = pl.BlockSpec((slots, token_block), lambda b, *_: (0, b))
+    else:
+        w = weights.reshape(num_tokens, topk)
+        if w.dtype != jnp.bfloat16:
+            w = w.astype(jnp.float32)
+        route_spec = pl.BlockSpec((token_block, topk), lambda b, *_: (b, 0))
     shared_operands, shared_specs = (), []
     if shared_down is not None:
         act, w2s, s2s = shared_down
@@ -344,8 +379,8 @@ def tc_combine(
         num_scalar_prefetch=3,
         grid=(nb,),
         in_specs=[
-            pl.BlockSpec((token_block, topk), lambda b, *_: (b, 0)),
-            pl.BlockSpec((token_block, topk), lambda b, *_: (b, 0)),
+            route_spec,
+            route_spec,
             pl.BlockSpec(memory_space=pl.ANY),
             *shared_specs,
         ],
@@ -358,7 +393,12 @@ def tc_combine(
     )
     combine = pl.pallas_call(
         functools.partial(
-            _kernel, maxt=maxt, topk=topk, shared=shared_down is not None
+            _kernel,
+            maxt=maxt,
+            topk=topk,
+            shared=shared_down is not None,
+            slot_major=slot_major,
+            p_dtype=p_dtype,
         ),
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct((num_tokens, hidden), jnp.bfloat16),
@@ -373,6 +413,8 @@ def tc_combine(
     # rows are not in token order; then take the plain gather.
     if not fallback:
         return combine(tiles, counts, valid_rows, rows, w, x, *shared_operands)
+    if slot_major:
+        pos, weights, valid = (a.T.reshape(-1) for a in (pos, weights, valid))
     return lax.cond(
         jnp.any(counts > maxt),
         lambda: _gather_combine(x, pos, weights, valid, topk, shared_down),

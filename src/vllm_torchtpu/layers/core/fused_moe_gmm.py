@@ -900,18 +900,24 @@ def moe_gmm(
             )
             pieces = _combine_pieces(num_tokens, tc_args[1:], gmm2_res.dtype)
             per = num_tokens // pieces
+            # Slot-major [topk, tokens]: the routing prep builds them so
+            # (prepare_routed_gmm_inputs), and these transposes cancel its.
+            pos_t, weights_t, valid_t = (
+                a.reshape(num_tokens, topk).T
+                for a in (argsort_revert_indices, topk_weights_flat, valid_mask_flat)
+            )
             out = []
             for i in range(pieces):
-                routes = slice(i * per * topk, (i + 1) * per * topk)
+                tokens = slice(i * per, (i + 1) * per)
                 piece_shared = None
                 if shared_down is not None:
                     act, w2, s2 = shared_down
-                    piece_shared = (act[i * per : (i + 1) * per], w2, s2)
+                    piece_shared = (act[tokens], w2, s2)
                 routed = tc_combine.tc_combine(
                     gmm2_res,
-                    argsort_revert_indices[routes],
-                    topk_weights_flat[routes],
-                    valid_mask_flat[routes],
+                    pos_t[:, tokens],
+                    weights_t[:, tokens],
+                    valid_t[:, tokens],
                     group_sizes,
                     topk=topk,
                     shared_down=piece_shared if fuse else None,

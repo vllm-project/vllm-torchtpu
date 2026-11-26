@@ -218,3 +218,33 @@ def test_token_pieces_equal_the_whole():
     np.testing.assert_array_equal(
         np.asarray(jnp.concatenate(pieces), np.float32), np.asarray(whole, np.float32)
     )
+
+
+@pytest.mark.parametrize(
+    "num_tokens, skew, padded, w_dtype",
+    [(512, 0.0, 0, jnp.bfloat16), (768, 2.0, 7, jnp.float32)],
+)
+def test_slot_major_routes_match_token_major(num_tokens, skew, padded, w_dtype):
+    """[topk, T] route arrays (the routing prep's layout) give bit-identical
+    output to the flat token-major ones."""
+    x, pos, w, valid, group_sizes = _routes(num_tokens, 256, skew, padded, seed=4)
+    xb = jnp.asarray(x, jnp.bfloat16)
+    wj = jnp.asarray(w, w_dtype)
+
+    def run(*routes):
+        return tc_combine.tc_combine(
+            xb,
+            *routes,
+            jnp.asarray(group_sizes),
+            topk=TOPK,
+            interpret=pltpu.InterpretParams(),
+        )
+
+    def slot_major(a):
+        return jnp.asarray(a).reshape(num_tokens, TOPK).T
+
+    flat = run(jnp.asarray(pos), wj, jnp.asarray(valid))
+    slots = run(slot_major(pos), slot_major(wj), slot_major(valid))
+    np.testing.assert_array_equal(
+        np.asarray(flat.astype(jnp.float32)), np.asarray(slots.astype(jnp.float32))
+    )
