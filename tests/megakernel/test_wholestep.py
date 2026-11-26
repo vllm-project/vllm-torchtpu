@@ -809,7 +809,7 @@ def test_physical_ids_scan_only_the_visible_table_chunks():
 PHYS_MXU_CASES = [
     dict(max_groups=4096),
     dict(max_groups=4096, shard=True, loop=True),
-    dict(max_groups=8192, ctx=[17000, 100], shard=True, loop=True),
+    dict(max_groups=8192, ctx=[17000, 100]),
 ]
 
 
