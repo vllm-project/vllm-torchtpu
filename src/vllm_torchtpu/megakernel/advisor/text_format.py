@@ -42,6 +42,9 @@ __all__ = [
     "format_advisor_summary",
     "format_layer_group_search",
     "format_regime_table",
+    "format_ring_slots",
+    "gain_basis_label",
+    "recommended_scope_dict",
     "vector_register_load_cap_line",
 ]
 
@@ -67,11 +70,30 @@ def _mapping_float(
     return default if num is None else num
 
 
+def format_ring_slots(dense_slots: int, expert_slots: int) -> str:
+    """Format `(dense_slots,expert_slots)` pair, or `"-"` when unbuffered."""
+    return f"({dense_slots},{expert_slots})" if dense_slots > 0 else "-"
+
+
+def gain_basis_label(gain_basis: str) -> str:
+    """Return human-readable label for a gain-basis enum string."""
+    return (
+        "calibrated whole-server E2E"
+        if gain_basis == GAIN_BASIS_CALIBRATED_E2E
+        else "fused-scope device estimate"
+    )
+
+
+def recommended_scope_dict(regime_entry: RegimeEntry) -> Mapping[str, object]:
+    """Return serialized scope dict matching `regime_entry.recommended_scope`."""
+    return _scope_dict_by_name(regime_entry, regime_entry.recommended_scope)
+
+
 def _format_ring_pair(scope_dict: Mapping[str, object]) -> str:
     """Format `(dense_slots, expert_slots)` ring depths when present."""
     dense = int(_mapping_float(scope_dict, "selected_dense_slots"))
     expert = int(_mapping_float(scope_dict, "selected_expert_slots"))
-    return f"({dense},{expert})" if dense > 0 else "-"
+    return format_ring_slots(dense, expert)
 
 
 def metric_float(
@@ -145,11 +167,7 @@ def _format_gain_summary_lines(report: AdvisorReport) -> list[str]:
             if calibrated
             else ""
         )
-        basis = (
-            "calibrated whole-server E2E"
-            if calibrated
-            else "fused-scope device estimate"
-        )
+        basis = gain_basis_label(report.gain_basis)
         lines.append(
             f"{prefix}Fusion gain (estimate): "
             f"{_mapping_float(physics_gain_metric, 'value'):+.2f} us "

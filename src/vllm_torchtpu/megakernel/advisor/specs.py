@@ -59,8 +59,12 @@ ObjectiveMode = Literal["step", "throughput", "both"]
 DispatchRegime = Literal["auto", "zero_floor", "compiled_xla", "unfused_eager"]
 SupportStatus = Literal["baseline", "within_core_limits", "outside_core_limits"]
 VALID_SOURCE_SCOPES: frozenset[str] = frozenset({"", *get_args(FusionScope)})
+BUCKET_SCHEDULE_SCHEMA = "advisor.bucket_schedule.v1"
+BUCKET_CONSUMER_STATUS = "advisory_offline_v1"
 
 __all__ = [
+    "BUCKET_CONSUMER_STATUS",
+    "BUCKET_SCHEDULE_SCHEMA",
     "CORE_MODULE_FAMILIES",
     "CORE_SUPPORTED_DTYPES",
     "DTYPE_BYTES",
@@ -69,6 +73,8 @@ __all__ = [
     "VALID_SOURCE_SCOPES",
     "AdvisorReport",
     "AdvisorSweepReport",
+    "BucketScheduleEntry",
+    "BucketScheduleReport",
     "CollectiveCall",
     "DisaggHandoffSpec",
     "DispatchRegime",
@@ -960,3 +966,57 @@ class AdvisorSweepReport:
         payload = asdict(self)
         payload["regimes"] = [entry.to_dict() for entry in self.regimes]
         return payload
+
+
+@dataclass(frozen=True)
+class BucketScheduleEntry:
+    """Contiguous active-token interval sharing scope, MoE mode, and readiness.
+
+    When multiple sweep rows share `(recommended_scope, recommended_moe_mode,
+    verdict, core_support, core_ready_scope, core_blockers)` across context
+    lengths, `build_bucket_schedule` coalesces them into one interval whose
+    `effective_context` records the maximum context across the merged rows.
+    """
+
+    phase: Phase
+    layout: str
+    min_active_tokens: int
+    max_active_tokens: int
+    effective_context: int
+    recommended_scope: FusionScope
+    recommended_moe_mode: str
+    max_vmem_tokens: int
+    num_vmem_splits: int
+    step_bound_us: float
+    verdict: str
+    core_support: SupportStatus = "baseline"
+    core_ready_scope: FusionScope = "per_op"
+    core_blockers: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize `BucketScheduleEntry` to a JSON-compatible dictionary."""
+        payload = asdict(self)
+        payload["core_blockers"] = list(self.core_blockers)
+        return payload
+
+
+@dataclass(frozen=True)
+class BucketScheduleReport:
+    """Offline advisory token-bucket schedule derived from a regime sweep."""
+
+    schema: str
+    consumer_status: str
+    model: str
+    chip: str
+    default_layout: str
+    vmem_budget_mib: float
+    max_vmem_tokens: int
+    ridge_tokens: int
+    buckets: tuple[BucketScheduleEntry, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """Serialize `BucketScheduleReport` to a JSON-compatible dictionary."""
+        return {
+            **asdict(self),
+            "buckets": [entry.to_dict() for entry in self.buckets],
+        }

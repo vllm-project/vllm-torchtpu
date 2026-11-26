@@ -59,6 +59,11 @@ from .regimes import (
     advise_regimes,
     recommend_parallelism,
 )
+from .report import (
+    build_bucket_schedule,
+    write_advisor_html,
+    write_bucket_schedule,
+)
 from .specs import DispatchRegime, MoEMode, ObjectiveMode, Phase, WorkloadSpec
 from .text_format import (
     format_advisor_summary,
@@ -443,6 +448,12 @@ def _add_output_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--search-layer-groups", action="store_true", help="Layer-group search."
     )
+    parser.add_argument(
+        "--html",
+        type=str,
+        default=None,
+        help="Write self-contained HTML audit report to disk.",
+    )
     parser.add_argument("--json", nargs="?", const="-", help="JSON stdout or file.")
     parser.add_argument("--explain", action="store_true", help="Metric provenance.")
     parser.add_argument("--unresolved", action="store_true", help="Assumed inputs.")
@@ -451,6 +462,15 @@ def _add_output_args(parser: argparse.ArgumentParser) -> None:
         action="store_false",
         dest="deployment_preset",
         help="Ignore presets.",
+    )
+    parser.add_argument(
+        "--bucket-schedule",
+        type=str,
+        default=None,
+        help=(
+            "Write advisory advisor.bucket_schedule.v1 JSON schedule to this path "
+            "(or '-' for stdout)."
+        ),
     )
 
 
@@ -559,6 +579,8 @@ def _validate_cli_combinations(args: argparse.Namespace) -> None:
             ("--no-deployment-preset", not args.deployment_preset),
         )
         opt_flags = (
+            ("--html", "html"),
+            ("--bucket-schedule", "bucket_schedule"),
             ("--json", "json"),
             ("--measurements", "measurements"),
             ("--tp", "tp"),
@@ -582,13 +604,15 @@ def _validate_cli_combinations(args: argparse.Namespace) -> None:
                 f"--list-models cannot be combined with {', '.join(conflicting_flags)}"
             )
             raise errors.MegakernelConfigError(msg)
-    if args.regime_sweep and (args.search_layer_groups or args.explain or single_only):
+    sweep_mode = args.regime_sweep or args.bucket_schedule is not None
+    if sweep_mode and (args.search_layer_groups or args.explain or single_only):
+        mode_flag = "--regime-sweep" if args.regime_sweep else "--bucket-schedule"
         bad_sweep = (
             *(["--search-layer-groups"] if args.search_layer_groups else []),
             *(["--explain"] if args.explain else []),
             *single_only,
         )
-        msg = f"--regime-sweep cannot be combined with {', '.join(bad_sweep)}"
+        msg = f"{mode_flag} cannot be combined with {', '.join(bad_sweep)}"
         raise errors.MegakernelConfigError(msg)
     if args.search_layer_groups and (args.explain or args.unresolved):
         bad_search = (
@@ -604,6 +628,50 @@ def _validate_cli_combinations(args: argparse.Namespace) -> None:
         msg = (
             "--decoding-seqs, --output-tok-s, and --mean-tpot-ms are not valid "
             "with --phase prefill"
+        )
+        raise errors.MegakernelConfigError(msg)
+
+
+def _validate_output_file_arg(
+    raw_path: str | None, flag_name: str, *, allow_stdout: bool = False
+) -> str | None:
+    """Validate that an optional file output flag is non-empty and not a dir."""
+    if raw_path is None:
+        return None
+    cleaned = raw_path.strip()
+    if not cleaned or (not allow_stdout and cleaned == "-"):
+        msg = f"{flag_name} requires a non-empty file path, not '-' (stdout)."
+        raise errors.MegakernelConfigError(msg)
+    if cleaned != "-" and Path(cleaned).is_dir():
+        msg = f"{flag_name} path is a directory: {raw_path!r}"
+        raise errors.MegakernelConfigError(msg)
+    return cleaned
+
+
+def _validate_output_exclusivity(args: argparse.Namespace) -> None:
+    """Enforce valid CLI output paths and flag combinations before evaluation."""
+    args.html = _validate_output_file_arg(args.html, "--html")
+    args.bucket_schedule = _validate_output_file_arg(
+        args.bucket_schedule, "--bucket-schedule", allow_stdout=True
+    )
+    if args.bucket_schedule is not None and args.unresolved and not args.regime_sweep:
+        msg = (
+            "--unresolved requires --regime-sweep or single-run output "
+            "and cannot be combined with --bucket-schedule alone."
+        )
+        raise errors.MegakernelConfigError(msg)
+    if args.search_layer_groups and args.html is not None:
+        msg = "--search-layer-groups cannot be combined with --html."
+        raise errors.MegakernelConfigError(msg)
+    if args.bucket_schedule != "-":
+        return
+    if args.json == "-":
+        msg = "Cannot output both --bucket-schedule and --json to stdout ('-')."
+        raise errors.MegakernelConfigError(msg)
+    if args.regime_sweep:
+        msg = (
+            "Cannot output --bucket-schedule to stdout ('-') when --regime-sweep "
+            "text table is requested."
         )
         raise errors.MegakernelConfigError(msg)
 
@@ -767,11 +835,21 @@ def _run_sweep_command(
     invalid = any(
         entry.verdict.startswith("invalid_config(") for entry in sweep.regimes
     )
+    exit_code = INVALID_CONFIG_EXIT_CODE if invalid else 0
+    if args.html is not None:
+        write_advisor_html(sweep, args.html)
+    if args.bucket_schedule is not None:
+        if args.bucket_schedule == "-":
+            _emit_json(build_bucket_schedule(sweep).to_dict(), "-")
+        else:
+            write_bucket_schedule(sweep, args.bucket_schedule)
+    if args.json is None and not args.regime_sweep:
+        return exit_code
     return _finish_output(
         args,
         sweep.to_dict(),
         lambda: format_regime_table(sweep, unresolved=args.unresolved),
-        INVALID_CONFIG_EXIT_CODE if invalid else 0,
+        exit_code,
     )
 
 
@@ -822,6 +900,8 @@ def _run_single_command(
             INVALID_CONFIG_EXIT_CODE if invalid else 0,
         )
     report = advise(profile, workload, chip_spec, measurements=measurements_path)
+    if args.html is not None:
+        write_advisor_html(report, args.html)
     return _finish_output(
         args,
         report.to_dict(),
@@ -835,11 +915,12 @@ def _run_single_command(
 def _dispatch(args: argparse.Namespace) -> int:
     """Dispatch parsed CLI arguments to listing, regime sweep, or estimate."""
     _validate_cli_combinations(args)
+    _validate_output_exclusivity(args)
     if args.list_models:
         sys.stdout.write(format_model_listing() + "\n")
         return 0
     profile, chip_spec = _resolve_cli_model_and_chip(args)
-    if args.regime_sweep:
+    if args.regime_sweep or args.bucket_schedule is not None:
         return _run_sweep_command(args, profile, chip_spec, args.measurements)
     return _run_single_command(args, profile, chip_spec, args.measurements)
 
