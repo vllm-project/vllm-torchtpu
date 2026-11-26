@@ -310,6 +310,7 @@ def get_msa_sharded_op(
             -(-pages_per_seq // step) * step
             for step in (
                 msa_indexer.DEFAULT_PAGES_PER_STEP,
+                msa_indexer.DEFAULT_LARGE_PAGES_PER_STEP,
                 msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP,
             )
         )

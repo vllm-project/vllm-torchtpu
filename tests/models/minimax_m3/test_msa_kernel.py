@@ -80,6 +80,7 @@ def test_msa_forward_matches_dense_reference(
         monkeypatch.setattr(msa_indexer, "DEFAULT_BLOCK_Q", 16)
         monkeypatch.setattr(msa_indexer, "DEFAULT_LARGE_BLOCK_Q", 8)
         monkeypatch.setattr(msa_indexer, "DEFAULT_PAGES_PER_STEP", 2)
+        monkeypatch.setattr(msa_indexer, "DEFAULT_LARGE_PAGES_PER_STEP", 2)
     rng = np.random.default_rng(0)
     num_seqs = len(q_lens)
     max_num_seqs = num_seqs + 1

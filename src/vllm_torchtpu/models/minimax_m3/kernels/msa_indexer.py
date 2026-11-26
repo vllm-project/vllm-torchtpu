@@ -49,8 +49,12 @@ DEFAULT_LARGE_BLOCK_Q = 512
 DEFAULT_PAGES_PER_STEP = 32
 # The block_q class (decode, MTP verify) runs the v3 DMA ring; 128 pages per
 # step keep more bytes in flight (j-dba77583: 32 req x 8 tokens at 128K,
-# 1.95 -> 1.66 ms). The large prefill class keeps 32.
+# 1.95 -> 1.66 ms).
 DEFAULT_SMALL_PAGES_PER_STEP = 128
+# The large prefill class on kernel v3 (`late_issue`): a step's chunks share
+# one scheduling block, so more pages per step pay fewer chunk tails. Other
+# kernels keep DEFAULT_PAGES_PER_STEP.
+DEFAULT_LARGE_PAGES_PER_STEP = 128
 DEFAULT_KERNEL = "v3"
 # Rows per token-major query tile of the block_q class (see `block_scores`).
 _SMALL_TILE_Q = 64
@@ -365,6 +369,7 @@ def _kernel_v3(
     *,
     transposed=False,
     write=None,
+    late_issue=False,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -386,6 +391,12 @@ def _kernel_v3(
     With `write` (`_FusedWrite`), the kernel also writes the step's rows into
     the caches, `cache_ref` among them, and scores the pages it writes as
     written.
+
+    With `late_issue`, the ahead group's descriptors are issued after the
+    step's chunks instead: issued among them, their conditional starts cut
+    the step into a scheduling block per chunk, and each chunk's matmuls
+    then wait for the previous chunk's maxima. For long chunks (large
+    tiles), the lost overlap costs more than the unhidden issue.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -491,7 +502,7 @@ def _kernel_v3(
         descriptors `share` among the first page pairs (`start`)."""
 
         def issue(j):
-            if j < chunk // 2:
+            if j < chunk // 2 and not late_issue:
                 start(
                     next_base,
                     next_live,
@@ -569,8 +580,10 @@ def _kernel_v3(
             )
             if c < scored:
                 score_chunk(slot, c * chunk, pages)
-            else:
+            elif not late_issue:
                 start(next_base, next_live, pages, (slot + ahead) % slots)
+        if late_issue:
+            start(next_base, next_live, range(pages_per_step), (slot + ahead) % slots)
 
     # One straight-line body per count of scored chunks, so that a chunk's
     # matmuls overlap the previous chunk's maxima.
@@ -748,6 +761,7 @@ def _class_scores(
     scale_row=None,
     q_pad=None,
     write=None,
+    late_issue=False,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
@@ -758,7 +772,8 @@ def _class_scores(
     With ``write = (msa_write.Write, run_seq, run_block, target)`` (kernel
     v3, token-major), the kernel also writes the step's rows into the
     write's caches, of which ``caches[target]`` is `index_cache`, scoring
-    the pages it writes as written; returns ``(ClassScores, caches)``."""
+    the pages it writes as written; returns ``(ClassScores, caches)``.
+    `late_issue`: as `_kernel_v3`'s."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = _page_tokens(rows_per_page, index_cache.dtype)
@@ -887,7 +902,9 @@ def _class_scores(
         prefetch = (work, tile_info, block_tables, seq_pages)
         if write is None:
             scores_t = pl.pallas_call(
-                functools.partial(_kernel_v3, transposed=token_major),
+                functools.partial(
+                    _kernel_v3, transposed=token_major, late_issue=late_issue
+                ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=4,
                     grid=grid_spec.grid,
@@ -1025,7 +1042,7 @@ def class_plan(
     *,
     block_q: int = DEFAULT_BLOCK_Q,
     large_block_q: int = DEFAULT_LARGE_BLOCK_Q,
-    pages_per_step: int = DEFAULT_PAGES_PER_STEP,
+    pages_per_step: int | None = None,
     small_pages_per_step: int = DEFAULT_SMALL_PAGES_PER_STEP,
     kernel: str = DEFAULT_KERNEL,
     large_kernel: str = DEFAULT_LARGE_KERNEL,
@@ -1075,6 +1092,12 @@ def class_plan(
     unfolded_fp4 = scale_row is not None
     small_kernel = "v2" if kernel == "v3" and unfolded_fp4 else kernel
     large_kernel = "v2" if large_kernel == "v3" and unfolded_fp4 else large_kernel
+    if pages_per_step is None:
+        pages_per_step = (
+            DEFAULT_LARGE_PAGES_PER_STEP
+            if large_kernel == "v3"
+            else DEFAULT_PAGES_PER_STEP
+        )
     # Token-major scores make the gather back to token order a row gather; a
     # column gather first relayouts the whole padded [P, tiles * block_q] f32
     # block (36 us per layer in the c48 decode twin, j-a281ffb0). Needs
@@ -1122,6 +1145,7 @@ def class_plan(
         + 1,
         pages_per_step=pages_per_step,
         kernel=large_kernel,
+        late_issue=True,
     )
     pages_per_seq = block_tables.shape[0] // max_num_seqs
     return _ClassPlan(
@@ -1160,7 +1184,7 @@ def block_scores(
     *,
     block_q: int = DEFAULT_BLOCK_Q,
     large_block_q: int = DEFAULT_LARGE_BLOCK_Q,
-    pages_per_step: int = DEFAULT_PAGES_PER_STEP,
+    pages_per_step: int | None = None,
     small_pages_per_step: int = DEFAULT_SMALL_PAGES_PER_STEP,
     kernel: str = DEFAULT_KERNEL,
     large_kernel: str = DEFAULT_LARGE_KERNEL,
@@ -1186,7 +1210,8 @@ def block_scores(
         without folded scales runs v2 where v3 is asked for.
       large_kernel: the same choice (and fallback) for the `large_block_q` tiles.
       pages_per_step / small_pages_per_step: pages per grid step of the large
-        and the block_q tile classes.
+        and the block_q tile classes (large: by default
+        DEFAULT_LARGE_PAGES_PER_STEP on kernel v3, else DEFAULT_PAGES_PER_STEP).
       scale_cache, scale_row: for a 4-bit (uint8) index cache without folded
         scales (`msa_fp4.scales_in_page`),
         the ``[pages, 8, 128]`` f32 scale cache and the row of the index-key
