@@ -25,11 +25,13 @@ from . import (
     regimes,
     report,
     roofline,
+    serve,
     spec_bridge,
     specs,
     text_format,
     verdict,
     vmem,
+    workbench,
 )
 from .calibrate import (
     CalibrateOptions,
@@ -45,6 +47,7 @@ from .chips import TPU7X_TOPOLOGIES, ChipSpec, resolve_chip_spec
 from .cli import (
     build_calibrate_arg_parser,
     build_parser,
+    build_serve_arg_parser,
     derive_decoding_sequences,
     format_model_listing,
     main,
@@ -72,6 +75,11 @@ from .report import (
     write_bucket_schedule,
 )
 from .roofline import evaluate_scopes, experts_hit_busiest
+from .serve import (
+    WorkbenchServerOptions,
+    create_workbench_server,
+    run_workbench_server,
+)
 from .spec_bridge import verify_core_limits_sync
 from .specs import (
     BUCKET_CONSUMER_STATUS,
@@ -111,6 +119,11 @@ from .vmem import (
     fit_vmem_budget_bytes,
     validate_advise_inputs,
 )
+from .workbench import (
+    PhaseMapOptions,
+    render_workbench_html,
+    write_workbench_html,
+)
 
 __all__ = [
     "BUCKET_CONSUMER_STATUS",
@@ -142,6 +155,7 @@ __all__ = [
     "ParallelismRecommendation",
     "ParallelismSearchOptions",
     "Phase",
+    "PhaseMapOptions",
     "QuantileSummary",
     "RegimeEntry",
     "RegimeSweepOptions",
@@ -149,6 +163,7 @@ __all__ = [
     "ScopeEstimate",
     "StepCoverageSummary",
     "UnsupportedArchitectureError",
+    "WorkbenchServerOptions",
     "WorkloadSpec",
     "XPlaneToolUnavailableError",
     "advise",
@@ -157,6 +172,7 @@ __all__ = [
     "build_bucket_schedule",
     "build_calibrate_arg_parser",
     "build_parser",
+    "build_serve_arg_parser",
     "calibrate",
     "calibrate_trace",
     "chips",
@@ -165,6 +181,7 @@ __all__ = [
     "compute_all_reduce_transfer_cost",
     "compute_per_token_vmem_bytes",
     "constants",
+    "create_workbench_server",
     "derive_decoding_sequences",
     "evaluate_core_legality",
     "evaluate_scopes",
@@ -182,11 +199,14 @@ __all__ = [
     "recommend_parallelism",
     "regimes",
     "render_advisor_html",
+    "render_workbench_html",
     "report",
     "resolve_chip_spec",
     "resolve_model_profile",
     "roofline",
+    "run_workbench_server",
     "search_layer_groups",
+    "serve",
     "spec_bridge",
     "specs",
     "text_format",
@@ -195,6 +215,8 @@ __all__ = [
     "verdict",
     "verify_core_limits_sync",
     "vmem",
+    "workbench",
     "write_advisor_html",
     "write_bucket_schedule",
+    "write_workbench_html",
 ]
