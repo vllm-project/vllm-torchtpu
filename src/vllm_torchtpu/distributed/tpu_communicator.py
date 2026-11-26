@@ -27,6 +27,9 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
+from vllm_torchtpu.layers.adapter import small_all_reduce_op
+from vllm_torchtpu.models.vllm.glm_dsa_dispatch import glm_dsa_v7x_active
+
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
@@ -41,6 +44,13 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         # (support_fault_tolerance=False); it is never used for compute.
         if self.use_all2all:
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if glm_dsa_v7x_active():
+            return small_all_reduce_op.all_reduce_or(
+                input_, self.ranks, super().all_reduce
+            )
+        return super().all_reduce(input_)
 
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()

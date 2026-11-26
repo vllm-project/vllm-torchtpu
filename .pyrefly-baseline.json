@@ -266,11 +266,6 @@
       "concise_description": "`x_scale_tmp` may be uninitialized"
     },
     {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-return",
-      "concise_description": "Function declared to return `tuple[Unknown, Unknown]` but is missing an explicit `return`"
-    },
-    {
       "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable"

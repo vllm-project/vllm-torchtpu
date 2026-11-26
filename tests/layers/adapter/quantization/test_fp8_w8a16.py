@@ -39,7 +39,6 @@ def _weights(seed=0):
     return w_q, jnp.asarray(scale, dtype=jnp.float32)
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "rows,max_rows,expect_quantized",
     [
@@ -70,7 +69,6 @@ def test_activation_quantization_follows_threshold(
     assert seen["quantize_activation"] is expect_quantized
 
 
-@pytest.mark.cpu_test
 def test_int8_weights_keep_w8a8_below_threshold(monkeypatch):
     seen = {}
     real = linear_common.xla_quantized_matmul
@@ -86,7 +84,6 @@ def test_int8_weights_keep_w8a8_below_threshold(monkeypatch):
     assert seen["quantize_activation"] is True
 
 
-@pytest.mark.cpu_test
 def test_blockwise_path_ignores_threshold(monkeypatch):
     seen = {}
 
@@ -102,7 +99,6 @@ def test_blockwise_path_ignores_threshold(monkeypatch):
     assert seen["maybe_quantize_lhs"] is True
 
 
-@pytest.mark.cpu_test
 def test_direct_jax_bridge_defaults_to_w8a8(monkeypatch):
     seen = {}
     real = linear_common.xla_quantized_matmul
@@ -117,7 +113,6 @@ def test_direct_jax_bridge_defaults_to_w8a8(monkeypatch):
     assert seen["quantize_activation"] is True
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("env_val,expected", [(None, 0), ("0", 0), ("16", 16)])
 def test_fp8_linear_method_forwards_w8a16_max_rows(monkeypatch, env_val, expected):
     if env_val is None:
@@ -146,7 +141,6 @@ def test_fp8_linear_method_forwards_w8a16_max_rows(monkeypatch, env_val, expecte
     assert seen["w8a16_max_rows"] == expected
 
 
-@pytest.mark.cpu_test
 def test_fp8_linear_method_takes_w8a16_max_rows_from_linear_config(monkeypatch):
     # Production path: VllmQuantLinearConfig reads the env when the layer is
     # built, and the linear method uses that value, not a later env read.
@@ -180,7 +174,6 @@ def test_fp8_linear_method_takes_w8a16_max_rows_from_linear_config(monkeypatch):
     assert seen["w8a16_max_rows"] == 32
 
 
-@pytest.mark.cpu_test
 def test_quantized_matmul_op_accepts_w8a16_max_rows():
     op = linear_common._get_quantized_matmul_op()
     with torch.device("meta"):
@@ -192,7 +185,6 @@ def test_quantized_matmul_op_accepts_w8a16_max_rows():
     assert out.dtype == torch.bfloat16
 
 
-@pytest.mark.cpu_test
 def test_w8a16_skips_activation_rounding():
     """Kernel-level check only: W8A16 matches the bf16-activation reference at
     least as closely as W8A8, because it skips rounding activations to FP8.

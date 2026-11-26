@@ -11,22 +11,46 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for sharded_jax_op."""
+"""Unit tests for sharded_jax_op and DCP rank/lane operand caching."""
 
 import inspect
 import uuid
+from types import SimpleNamespace
 
 import jax
 import numpy as np
 import torch
 from jax.sharding import Mesh, PartitionSpec
 
+from vllm_torchtpu.distributed import dcp
 from vllm_torchtpu.distributed import sharded_jax_op as sjo
 
 
 def _cpu_mesh() -> Mesh:
     devs = np.array(jax.devices("cpu")[:1])
     return Mesh(devs, ("x",))
+
+
+def test_dcp_rank_and_lane_operands_do_not_poison_cache_before_init(monkeypatch):
+    monkeypatch.setattr(dcp, "_RANK_OPERANDS", {})
+    monkeypatch.setattr(dcp, "get_dcp_group", lambda: None)
+    monkeypatch.setattr(dcp.dist, "is_initialized", lambda: False)
+    pre_rank = dcp.dcp_rank_operand(device="cpu")
+    pre_lane = dcp.dcp_lane_operand(device="cpu")
+    assert pre_rank.tolist() == [0]
+    assert pre_lane.tolist() == [0]
+
+    monkeypatch.setattr(
+        dcp, "get_dcp_group", lambda: SimpleNamespace(rank_in_group=3, world_size=4)
+    )
+    monkeypatch.setattr(dcp.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dcp.dist, "get_rank", lambda: 11)
+    post_rank = dcp.dcp_rank_operand(device="cpu")
+    post_lane = dcp.dcp_lane_operand(device="cpu")
+    assert post_rank.tolist() == [3]
+    assert post_lane.tolist() == [2]
+    assert dcp.dcp_rank_operand(device="cpu") is post_rank
+    assert dcp.dcp_lane_operand(device="cpu") is post_lane
 
 
 def test_sharded_jax_op_uses_custom_fake_impl(monkeypatch):

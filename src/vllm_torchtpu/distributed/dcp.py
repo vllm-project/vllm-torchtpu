@@ -24,6 +24,9 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+import torch.distributed as dist
+
 from vllm_torchtpu.distributed.mesh_utils import CpGroupLayout, get_cp_group_layout
 from vllm_torchtpu.logger import init_logger
 
@@ -40,6 +43,7 @@ DCP_LANE_AXIS_NAME = "dcp_lane"
 # it keeps its own cache for the same reason pcp.py does: the key is the mesh
 # shape and the group, not a device list.
 _MESH_CACHE: dict[tuple, Any] = {}
+_RANK_OPERANDS: dict[tuple[str, str, int], torch.Tensor] = {}
 
 
 def get_dcp_group() -> Any | None:
@@ -57,6 +61,32 @@ def get_dcp_rank() -> int:
     return 0 if group is None else int(group.rank_in_group)
 
 
+def dcp_rank_operand(device: Any = None) -> torch.Tensor:
+    if device is None:
+        device = torch.device("tpu")
+    rank = get_dcp_rank()
+    key = ("rank", str(device), rank)
+    tensor = _RANK_OPERANDS.get(key)
+    if tensor is None:
+        tensor = torch.tensor([rank], dtype=torch.int32, device=device)
+        _RANK_OPERANDS[key] = tensor
+    return tensor
+
+
+def dcp_lane_operand(device: Any = None) -> torch.Tensor:
+    if device is None:
+        device = torch.device("tpu")
+    dcp_size = get_dcp_world_size()
+    rank = int(dist.get_rank()) if dist.is_initialized() else 0
+    lane = rank // max(dcp_size, 1)
+    key = ("lane", str(device), lane)
+    tensor = _RANK_OPERANDS.get(key)
+    if tensor is None:
+        tensor = torch.tensor([lane], dtype=torch.int32, device=device)
+        _RANK_OPERANDS[key] = tensor
+    return tensor
+
+
 def get_dcp_world_size() -> int:
     group = get_dcp_group()
     return 1 if group is None else int(group.world_size)
@@ -68,16 +98,6 @@ def get_dcp_group_layout() -> CpGroupLayout:
 
 
 def _validate_dcp_rank_alignment(group: Any, dcp_size: int) -> None:
-    """Check DCP is the fastest-varying factor of the global rank.
-
-    ``get_pallas_mesh`` numbers mesh positions by PyTorch rank, so a
-    ``(lane, dcp)`` mesh only describes the DCP grouping when
-    ``global_rank == lane * dcp_size + dcp_rank``. If it does not, the mesh
-    still builds and the kernels still run -- they collect over the wrong
-    partners, which is a wrong answer rather than an error.
-    """
-    import torch.distributed as dist
-
     rank = int(dist.get_rank())
     lane, dcp_rank = divmod(rank, dcp_size)
     expected = tuple(range(lane * dcp_size, (lane + 1) * dcp_size))
@@ -102,20 +122,7 @@ def _single_device_dcp_mesh(axis_names: tuple[str, str]) -> Any:
 
 
 def get_or_create_dcp_mesh(axis_name: str | None = None) -> Any:
-    """Build the full-world ``(lane, DCP)`` mesh the DCP Pallas ops run on.
-
-    torch_tpu requires a Pallas kernel's mesh to span the whole world, so the
-    mesh carries a leading axis for the TP lanes DCP does not shard over. The
-    kernels still collect only over `axis_name`, which gives one independent
-    DCP group per lane. Under `dcp == tp` the shape is `(1, world)` and the
-    device order is the one the single-axis builder used to produce.
-
-    The axis name defaults to `DCP_AXIS_NAME`; the kernels take the same
-    constant from here, so a caller that overrides it has to override it in
-    both places or the mesh and the partition specs will not agree.
-    """
-    import torch.distributed as dist
-
+    """Build the full-world ``(lane, DCP)`` mesh for DCP Pallas ops."""
     if axis_name is None:
         axis_name = DCP_AXIS_NAME
     axis_names = (DCP_LANE_AXIS_NAME, axis_name)

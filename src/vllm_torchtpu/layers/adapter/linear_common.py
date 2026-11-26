@@ -26,7 +26,7 @@ from vllm_torchtpu.kernels.gelu_quant import (
     gelu_tanh_and_mul_quantize as _gelu_tanh_and_mul_quantize_kernel,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul import decode_gemv
+from vllm_torchtpu.kernels.quantized_matmul import decode_gemv, fp8_skinny
 from vllm_torchtpu.kernels.quantized_matmul.util import (
     quantize_tensor,
     xla_prequantized_matmul,
@@ -47,7 +47,58 @@ logger = init_logger(__name__)
 # is made -- and it moves with the code if a layer is renamed, which a
 # name-matched list would not.
 KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
+DCP_ROWS_ATTR = "_tpu_dcp_rows"
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
+FP8_PALLAS_N_ATTR = "_tpu_fp8_pallas_n_out"
+FP8_PALLAS_WEIGHT = "weight_pallas"
+FP8_PALLAS_SCALE = "weight_scale_pallas"
+FP8_PALLAS_HBM_PIN_ATTR = "_tpu_fp8_pallas_hbm_pin"
+PREQUANT_ATTR = "_tpu_prequant_slot"
+# Tuple of parameter names storing disjoint FP8 column chunks and matching
+# per-channel scales after detaching the fused_qkv_a_proj monolith.
+FP8_SPLIT_WEIGHTS_ATTR = "_tpu_fp8_split_weights"
+FP8_SPLIT_SCALES_ATTR = "_tpu_fp8_split_scales"
+
+
+class PrequantSlot:
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
+def _keep_input_fn(a: jax.Array, b: jax.Array) -> jax.Array:
+    del b
+    return a
+
+
+def _keep_input_fake(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    del b
+    return torch.empty_like(a)
+
+
+_keep_input = pallas.jax_op("pallas::linear_keep_input", _keep_input_fn)
+_keep_input.register_fake(_keep_input_fake)
+
+
+def coerce_jax_keep_dtype(x: torch.Tensor) -> torch.Tensor:
+    """Narrow 64-bit tensors to 32-bit so JAX (x64 disabled) MLIR types match."""
+    if x.dtype == torch.int64:
+        return x.to(torch.int32)
+    if x.dtype == torch.uint64:
+        return x.to(torch.uint32)
+    if x.dtype == torch.float64:
+        return x.to(torch.float32)
+    return x
+
+
+def retain_input(out: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    if out.device.type == "tpu":
+        return _keep_input(out.contiguous(), coerce_jax_keep_dtype(x))
+    if x.numel() > 0:
+        v = torch.nan_to_num(x.reshape(-1)[:1]).to(out.dtype)
+        return out + (v - v)
+    return out
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
@@ -283,6 +334,11 @@ def _fake_prequantized_matmul_bf16(x_q, x_scale, w_q, w_s, decode_gemv_max_rows=
 _prequantized_matmul_bf16_op.register_fake(_fake_prequantized_matmul_bf16)
 
 
+def get_prequantized_matmul_op() -> Callable:
+    """Return the pre-registered per-channel pre-quantized matmul op."""
+    return _prequantized_matmul_bf16_op
+
+
 def prequantized_matmul(
     x_q: torch.Tensor,
     x_scale: torch.Tensor,
@@ -299,6 +355,44 @@ def prequantized_matmul(
             f"{w_q.shape[0]}."
         )
     return _prequantized_matmul_bf16_op(x_q, x_scale, w_q, w_s, decode_gemv_max_rows)
+
+
+_quantize_fp8_row_op: Callable | None = None
+
+
+def _quantize_fp8_row_jax(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    return quantize_tensor(x, jnp.float8_e4m3fn)
+
+
+def get_quantize_fp8_row_op() -> Callable:
+    """Build per-row FP8 activation quantization op outside Dynamo."""
+    global _quantize_fp8_row_op
+    if _quantize_fp8_row_op is not None:
+        return _quantize_fp8_row_op
+    with _quantized_matmul_kernel_op_lock:
+        if _quantize_fp8_row_op is not None:
+            return _quantize_fp8_row_op
+        op = pallas.jax_op("pallas::quantize_fp8_row", _quantize_fp8_row_jax)
+
+        def _fake(x):
+            return (
+                torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device),
+                torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+            )
+
+        op.register_fake(_fake)
+        _quantize_fp8_row_op = op
+        return op
+
+
+def quantize_fp8_row(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize `[M, K]` activations row-wise to FP8 e4m3fn using the pre-built op."""
+    op = _quantize_fp8_row_op
+    if op is None:
+        raise RuntimeError(
+            "quantize_fp8_row op not built: call get_quantize_fp8_row_op() at load"
+        )
+    return op(x)
 
 
 def _decode_matmul_nt_jax(x: jax.Array, w: jax.Array) -> jax.Array:
@@ -360,6 +454,164 @@ def gelu_tanh_and_mul_quantize(
     if op is None:
         raise ValueError(f"no fused GELU quantization for {w_q.dtype}")
     return op(x)
+
+
+def _fp8_linear_pallas(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w_k: jax.Array | None = None,
+    s_k: jax.Array | None = None,
+    *,
+    hbm_pin: bool = False,
+    decode_gemv_max_rows: int = 0,
+) -> jax.Array:
+    n_out = w_q.shape[1]
+    if w_k is None:
+        kw, ks = w_q, w_s
+    else:
+        assert s_k is not None
+        kw, ks = w_k, s_k
+    rows = x.shape[0]
+    if fp8_skinny.supports(rows, kw, ks):
+        return fp8_skinny.fp8_skinny_matmul(
+            x,
+            kw,
+            ks,
+            n_logical=n_out,
+            scale_dma=fp8_skinny.scale_dma_applies(*kw.shape),
+            hbm_pin=hbm_pin,
+        )
+    if _use_decode_gemv(rows, w_q, w_s, decode_gemv_max_rows):
+        return decode_gemv.fp8_decode_matmul(x, w_q, w_s)
+    return xla_quantized_matmul(x, w_q, w_s)
+
+
+def _fp8_linear_pallas_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w_k: jax.Array | None = None,
+    s_k: jax.Array | None = None,
+) -> jax.Array:
+    return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k, hbm_pin=False)
+
+
+def _fp8_linear_pallas_hbm_pinned_jax(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w_k: jax.Array | None = None,
+    s_k: jax.Array | None = None,
+) -> jax.Array:
+    return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k, hbm_pin=True)
+
+
+_fp8_linear_pallas_ops: dict[tuple[bool, bool, int], Callable] = {}
+
+
+def get_fp8_linear_pallas_op(
+    padded_copy: bool, hbm_pin: bool = False, decode_gemv_max_rows: int = 0
+) -> Callable:
+    key = (padded_copy, hbm_pin, decode_gemv_max_rows)
+    op = _fp8_linear_pallas_ops.get(key)
+    if op is not None:
+        return op
+    with _quantized_matmul_kernel_op_lock:
+        op = _fp8_linear_pallas_ops.get(key)
+        if op is not None:
+            return op
+        name = "pallas::fp8_linear_pallas"
+        if padded_copy:
+            name += "_padded"
+        if hbm_pin:
+            name += "_hbm"
+        if decode_gemv_max_rows:
+            name += f"_dg{decode_gemv_max_rows}"
+        if padded_copy:
+
+            def fn_padded(
+                x: jax.Array,
+                w_q: jax.Array,
+                w_s: jax.Array,
+                w_k: jax.Array,
+                s_k: jax.Array,
+            ) -> jax.Array:
+                return _fp8_linear_pallas(
+                    x,
+                    w_q,
+                    w_s,
+                    w_k,
+                    s_k,
+                    hbm_pin=hbm_pin,
+                    decode_gemv_max_rows=decode_gemv_max_rows,
+                )
+
+            def fake_padded(
+                x: torch.Tensor,
+                w_q: torch.Tensor,
+                w_s: torch.Tensor,
+                w_k: torch.Tensor,
+                s_k: torch.Tensor,
+            ) -> torch.Tensor:
+                del w_s, w_k, s_k
+                return torch.empty(
+                    x.shape[0], w_q.shape[1], dtype=x.dtype, device=x.device
+                )
+
+            op = pallas.jax_op(name, fn_padded)
+            op.register_fake(fake_padded)
+        else:
+
+            def fn_direct(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.Array:
+                return _fp8_linear_pallas(
+                    x,
+                    w_q,
+                    w_s,
+                    hbm_pin=hbm_pin,
+                    decode_gemv_max_rows=decode_gemv_max_rows,
+                )
+
+            def fake_direct(
+                x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+            ) -> torch.Tensor:
+                del w_s
+                return torch.empty(
+                    x.shape[0], w_q.shape[1], dtype=x.dtype, device=x.device
+                )
+
+            op = pallas.jax_op(name, fn_direct)
+            op.register_fake(fake_direct)
+
+        _fp8_linear_pallas_ops[key] = op
+        return op
+
+
+def quantized_matmul_pallas(
+    x: torch.Tensor,
+    w_q: torch.Tensor,
+    w_s: torch.Tensor,
+    w_kernel: torch.Tensor | None = None,
+    s_kernel: torch.Tensor | None = None,
+    *,
+    hbm_pin: bool = False,
+    decode_gemv_max_rows: int = 0,
+) -> torch.Tensor:
+    if x.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    x_2d = x.reshape(-1, x.shape[-1])
+    if w_kernel is None:
+        out_2d = get_fp8_linear_pallas_op(
+            False, hbm_pin=hbm_pin, decode_gemv_max_rows=decode_gemv_max_rows
+        )(x_2d, w_q, w_s)
+    else:
+        out_2d = get_fp8_linear_pallas_op(
+            True, hbm_pin=hbm_pin, decode_gemv_max_rows=decode_gemv_max_rows
+        )(x_2d, w_q, w_s, w_kernel, s_kernel)
+    return out_2d.reshape(*x.shape[:-1], w_q.shape[1])
 
 
 def _quantized_matmul_fp4_jax(

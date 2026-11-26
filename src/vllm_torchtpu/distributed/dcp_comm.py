@@ -13,11 +13,43 @@
 # limitations under the License.
 """DCP merge of partial attention results (GQA and MLA)."""
 
-from __future__ import annotations
-
 from typing import Any, Literal, overload
 
 import torch
+from torch_tpu._internal import pallas as _ttpu_pallas
+
+from vllm_torchtpu.kernels.lse_rescale import (
+    lse_rescale_head_major_bf16,
+    lse_rescale_head_major_f32,
+)
+from vllm_torchtpu.models.vllm.glm_dsa_dispatch import glm_dsa_v7x_active
+
+
+def _register_lse_rescale(name: str, fn: Any, dtype: torch.dtype) -> Any:
+    op: Any = _ttpu_pallas.jax_op(name, fn)
+    op.register_fake(
+        lambda out, _lse, _m: out.new_empty(
+            (out.shape[1], out.shape[0], out.shape[2]), dtype=dtype
+        )
+    )
+    return op
+
+
+_lse_rescale_head_major_f32 = _register_lse_rescale(
+    "pallas::lse_rescale_head_major_f32", lse_rescale_head_major_f32, torch.float32
+)
+_lse_rescale_head_major_bf16 = _register_lse_rescale(
+    "pallas::lse_rescale_head_major_bf16", lse_rescale_head_major_bf16, torch.bfloat16
+)
+
+
+def lse_rescale_head_major_op(dtype: torch.dtype | None) -> Any | None:
+    eff = dtype if dtype is not None else torch.float32
+    if eff == torch.float32:
+        return _lse_rescale_head_major_f32
+    if eff == torch.bfloat16:
+        return _lse_rescale_head_major_bf16
+    return None
 
 
 @overload
@@ -72,14 +104,18 @@ def cp_lse_ag_out_rs(
     lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
     merged_lse = torch.logsumexp(lses, dim=0)
 
-    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-    weight = torch.exp(lse - merged_lse).unsqueeze(-1)
-    weighted = output.to(torch.float32) * weight
-    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
-
-    if rs_dtype is not None:
-        weighted = weighted.to(rs_dtype)
-    merged = group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)
+    rescale_op = lse_rescale_head_major_op(rs_dtype)
+    if output.device.type == "tpu" and rescale_op is not None and glm_dsa_v7x_active():
+        weighted = rescale_op(output, lse, merged_lse)
+        merged = group.reduce_scatter(weighted, dim=0).transpose(0, 1).contiguous()
+    else:
+        weight = torch.exp(lse - merged_lse).unsqueeze(-1)
+        weighted = output.to(torch.float32) * weight
+        weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+        if rs_dtype is not None:
+            weighted = weighted.to(rs_dtype)
+        merged = group.reduce_scatter(weighted.contiguous(), dim=1)
+    merged = merged.to(output.dtype)
     if not return_lse:
         return merged
 

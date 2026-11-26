@@ -807,3 +807,183 @@ class SparseMlaLseTest(parameterized.TestCase):
             counts,
         )
         np.testing.assert_allclose(merged, whole, rtol=2e-2, atol=2e-2)
+
+
+def test_should_register_and_cache_local_q_norm_all_gather_op(monkeypatch):
+    import inspect
+
+    from vllm_torchtpu.distributed import dcp
+    from vllm_torchtpu.distributed import sharded_jax_op as sjo
+
+    class _Mesh:
+        shape = {dcp.DCP_AXIS_NAME: 16}
+        axis_names = (dcp.DCP_AXIS_NAME,)
+
+    built = []
+
+    def checked_op(name, fn, **_):
+        signature = inspect.signature(inspect.unwrap(fn), eval_str=True)
+        sjo.pallas_impl._verify_signature(signature)  # noqa: SLF001 -- torch_tpu check
+        assert sjo.pallas_impl._infer_static_argnums(signature) == ()  # noqa: SLF001 -- torch_tpu check
+        built.append(name)
+        return object()
+
+    monkeypatch.setattr(cp_mla, "get_or_create_dcp_mesh", lambda: _Mesh())
+    monkeypatch.setattr(cp_mla, "sharded_jax_op", checked_op)
+    monkeypatch.setattr(cp_mla, "_LOCAL_Q_NORM_ALL_GATHER_OPS", {})
+    op_a = cp_mla.local_q_norm_all_gather_op(1e-6)
+    op_b = cp_mla.local_q_norm_all_gather_op(1e-6)
+    op_c = cp_mla.local_q_norm_all_gather_op(1e-5)
+    assert op_a is op_b
+    assert op_a is not op_c
+    assert built == [
+        "pallas::fp8_window_all_gather_rn_16_1em06",
+        "pallas::fp8_window_all_gather_rn_16_1em05",
+    ]
+
+
+def test_should_gate_q_norm_fusion_to_tiny_nonindexer_layers(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mao
+
+    operands = (
+        torch.zeros((2048, 16384), dtype=torch.float8_e4m3fn),
+        torch.ones((16384,), dtype=torch.float32),
+    )
+    monkeypatch.setattr(mao, "_qb_overlap_operands", lambda _proj: operands)
+    gate = (
+        mao.VllmTPUMultiHeadLatentAttentionWrapper._local_q_norm_serves  # noqa: SLF001 -- verify gate contract
+    )
+
+    def make_stub(**kw):
+        return SimpleNamespace(
+            local_q_norm_fused_op=kw.get("op", object()),
+            indexer=kw.get("indexer"),
+            skip_topk=kw.get("skip_topk", False),
+            dcp_group_size=16,
+            q_a_layernorm=kw.get(
+                "norm",
+                SimpleNamespace(
+                    has_weight=True,
+                    variance_size_override=None,
+                    weight=torch.ones(2048, dtype=torch.bfloat16),
+                ),
+            ),
+            q_b_proj=kw.get("qb", object()),
+        )
+
+    q4 = torch.zeros((4, 2048), dtype=torch.bfloat16)
+    q8 = torch.zeros((8, 2048), dtype=torch.bfloat16)
+    assert gate(make_stub(), q4)
+    assert gate(make_stub(indexer=object(), skip_topk=True), q4)
+    assert not gate(make_stub(op=None), q4)
+    assert not gate(make_stub(indexer=object(), skip_topk=False), q4)
+    assert not gate(make_stub(), q8)
+    assert not gate(
+        make_stub(
+            norm=SimpleNamespace(
+                has_weight=True,
+                variance_size_override=1024,
+                weight=torch.ones(2048, dtype=torch.bfloat16),
+            )
+        ),
+        q4,
+    )
+
+
+def test_should_clamp_decode_topk_cap_for_dcp16():
+    assert (
+        attention_interface.resolve_decode_topk_cap(512, 16, 2048, decode_bucket=True)
+        == 256
+    )
+    assert (
+        attention_interface.resolve_decode_topk_cap(512, 16, 2048, decode_bucket=False)
+        == 512
+    )
+    assert (
+        attention_interface.resolve_decode_topk_cap(512, 8, 2048, decode_bucket=True)
+        == 512
+    )
+    assert (
+        attention_interface.resolve_decode_topk_cap(128, 16, 2048, decode_bucket=True)
+        == 128
+    )
+    assert (
+        attention_interface.resolve_decode_topk_cap(0, 16, 2048, decode_bucket=True)
+        == 0
+    )
+
+
+def test_should_filter_default_mixed_live_widths_below_topk_cap():
+    assert attention_interface.filter_mixed_live_widths(None, "256,384", 256) == ()
+    assert attention_interface.filter_mixed_live_widths(None, "128,256,384", 256) == (
+        128,
+    )
+    assert attention_interface.filter_mixed_live_widths(None, "256,384", 512) == (
+        256,
+        384,
+    )
+    assert attention_interface.filter_mixed_live_widths((128, 256), "384", 256) == (
+        128,
+    )
+    assert attention_interface.filter_mixed_live_widths(None, "256,384", 0) == (
+        256,
+        384,
+    )
+
+
+def test_should_build_8row_aligned_live_tiers_for_decode_buckets():
+    assert sparse_mla_kernel.xchg_live_row_tiers(4, 4, 4, 24) == (8, 16, 24)
+    assert sparse_mla_kernel.xchg_live_row_tiers(8, 4, 8, 40) == (16, 24, 32, 40)
+    assert sparse_mla_kernel.xchg_live_row_tiers(8, 4, 16, 72) == (16, 24, 40, 56, 72)
+    assert sparse_mla_kernel.xchg_live_row_tiers(8, 4, 32, 136) == (
+        24,
+        40,
+        72,
+        104,
+        136,
+    )
+    assert sparse_mla_kernel.xchg_live_row_tiers(8, 8, 4, 40) == (16, 24, 32, 40)
+
+
+@pytest.mark.parametrize("world", [2, 4, 8, 16])
+def test_should_produce_collision_free_rotated_peer_bijection(world):
+    schedules = [sparse_mla_kernel.xchg_peer_order(me, world) for me in range(world)]
+    for me, peers in enumerate(schedules):
+        assert len(peers) == world - 1
+        assert len(set(peers)) == world - 1
+        assert me not in peers
+        assert set(peers) == set(range(world)) - {me}
+        if world == 16:
+            assert all(((p ^ me) & 8) == 8 for p in peers[:8])
+            assert all(((p ^ me) & 8) == 0 for p in peers[8:])
+    for step in range(world - 1):
+        receivers = [schedules[me][step] for me in range(world)]
+        assert len(set(receivers)) == world
+
+
+def test_should_pack_valid_token_count_in_fused_exchange_peer():
+    peer = attention_interface.build_fused_exchange_peer(
+        jnp.asarray(5, jnp.int32),
+        jnp.asarray(0, jnp.int32),
+        jnp.asarray([0, 1, 2, 3], jnp.int32),
+    )
+    assert peer.shape == (3,)
+    assert peer.dtype == jnp.int32
+    assert [int(x) for x in peer] == [5, 0, 3]
+
+
+def test_glm_dsa_v7x_shared_env_resolvers(monkeypatch):
+    from vllm_torchtpu.models.vllm import glm_dsa_dispatch
+
+    monkeypatch.setattr(glm_dsa_dispatch, "glm_dsa_v7x_active", lambda *_a, **_k: False)
+    assert glm_dsa_dispatch.resolve_dcp_mla_topk_cap_chunk(256) == 256
+    assert glm_dsa_dispatch.resolve_dcp_lse_merge_a2a_max_tokens(64) == 64
+
+    monkeypatch.setattr(glm_dsa_dispatch, "glm_dsa_v7x_active", lambda *_a, **_k: True)
+    assert glm_dsa_dispatch.resolve_dcp_mla_topk_cap_chunk(256) == 512
+    assert glm_dsa_dispatch.resolve_dcp_mla_topk_cap_chunk(128) == 128
+    assert glm_dsa_dispatch.resolve_dcp_lse_merge_a2a_max_tokens(64) == 32
+    assert glm_dsa_dispatch.resolve_dcp_lse_merge_a2a_max_tokens(0) == 0
+    assert glm_dsa_dispatch.resolve_dcp_lse_merge_a2a_max_tokens(256) == 256

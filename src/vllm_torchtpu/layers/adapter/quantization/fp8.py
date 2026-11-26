@@ -77,9 +77,11 @@ from vllm.model_executor.parameter import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 from vllm_torchtpu import envs, tpu_info
+from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
+from vllm_torchtpu.kernels.quantized_matmul.fp8_skinny import TUNED, padded_n
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
@@ -87,11 +89,24 @@ from vllm_torchtpu.layers.adapter.fused_moe import (
     prebuild_fused_moe_kernel,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    DCP_ROWS_ATTR,
+    FP8_PALLAS_HBM_PIN_ATTR,
+    FP8_PALLAS_N_ATTR,
+    FP8_PALLAS_SCALE,
+    FP8_PALLAS_WEIGHT,
+    FP8_SPLIT_SCALES_ATTR,
+    FP8_SPLIT_WEIGHTS_ATTR,
     KEEP_VLLM_LAYOUT_ATTR,
+    PREQUANT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    get_fp8_linear_pallas_op,
+    get_prequantized_matmul_op,
+    get_quantize_fp8_row_op,
     prequantized_matmul,
     quantize_activation,
+    quantize_fp8_row,
     quantized_matmul,
+    quantized_matmul_pallas,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -332,6 +347,18 @@ def _process_fp8_linear_weights(
         logical_widths=layer.logical_widths,
         out_dtype=torch.float32,
     )
+    if (
+        getattr(layer, DCP_ROWS_ATTR, False)
+        and not getattr(layer, WEIGHT_FLIPPED_ATTR, False)
+        and requant_dtype.is_floating_point
+    ):
+        group = get_dcp_group()
+        assert group is not None
+        w, s = quantize_tensor(
+            group.all_gather(weight_f, dim=1), quant_dtype=requant_dtype, axis=-1
+        )
+        layer.weight_dcp = fresh_buffer(w.transpose(0, 1))
+        layer.weight_scale_dcp = fresh_buffer(s.reshape(-1))
     if requant_block_size is not None and weight_f.shape[-1] < requant_block_size:
         # Sub-block TP partition along the contracting dimension (e.g. RowParallel
         # down_proj with input_size_per_partition=64 < 128 at TP=16) has a single
@@ -1356,8 +1383,24 @@ def _wrap_block_scale_weight_loader(weight_loader: Callable) -> Callable:
     return _wrapped
 
 
+_FP8_SKINNY_SITES = ("q_b_proj", "self_attn.o_proj", "mlp.gate_up_proj")
+_FP8_SKINNY_HBM_PIN_SITES = ("self_attn.o_proj", "q_b_proj")
 _DECODE_GEMV_MAX_ROWS = 64
 _DECODE_GEMV_MAX_TP_SIZE = 8
+
+
+def _suffix_matches(prefix: str, suffixes: tuple[str, ...]) -> bool:
+    if not prefix:
+        return False
+    return any(prefix == site or prefix.endswith("." + site) for site in suffixes)
+
+
+def _fp8_linear_pallas_selected(prefix: str) -> bool:
+    return _suffix_matches(prefix, _FP8_SKINNY_SITES)
+
+
+def fp8_skinny_hbm_pin_selected(prefix: str) -> bool:
+    return _suffix_matches(prefix, _FP8_SKINNY_HBM_PIN_SITES)
 
 
 def _default_decode_gemv_max_rows() -> int:
@@ -1369,6 +1412,26 @@ def _default_decode_gemv_max_rows() -> int:
         else 1
     )
     return _DECODE_GEMV_MAX_ROWS if tp_size <= _DECODE_GEMV_MAX_TP_SIZE else 0
+
+
+def _set_fp8_pallas_copy(layer: torch.nn.Module) -> None:
+    weight = cast(torch.Tensor, layer.weight).data
+    scale = cast(torch.Tensor, layer.weight_scale).data
+    n_in, n_out = weight.shape
+    n_pad = padded_n(n_out)
+    raw = torch.zeros(n_in, n_pad, dtype=torch.uint8, device=weight.device)
+    raw[:, :n_out].copy_(weight.contiguous().view(torch.uint8))
+    pad_scale = torch.ones(n_pad, dtype=scale.dtype, device=scale.device)
+    pad_scale[:n_out].copy_(scale)
+    for name, tensor in (
+        (FP8_PALLAS_WEIGHT, raw.view(weight.dtype)),
+        (FP8_PALLAS_SCALE, pad_scale),
+    ):
+        param = torch.nn.Parameter(tensor, requires_grad=False)
+        if hasattr(layer, name):
+            replace_parameter(layer, name, param)
+        else:
+            layer.register_parameter(name, param)
 
 
 @register_weight_loader_v2_supported_method
@@ -1663,6 +1726,29 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if hasattr(layer, "weight_scale_inv"):
             delattr(layer, "weight_scale_inv")
         replace_parameter(layer, "weight_scale", weight_scale)
+        layer_prefix = getattr(layer, "prefix", "") or self.prefix
+        if (
+            tpu_info.v7x_model_fastpaths_enabled()
+            and self.w8a16_max_rows == 0
+            and not keep_vllm_layout
+            and weight_scale.ndim == 1
+            and weight_scale.shape[0] == ckpt_n_out
+            and weight.dtype == torch.float8_e4m3fn
+            and (ckpt_n_in, padded_n(ckpt_n_out)) in TUNED
+            and _fp8_linear_pallas_selected(layer_prefix)
+        ):
+            setattr(layer, FP8_PALLAS_N_ATTR, ckpt_n_out)
+            padded_copy = padded_n(ckpt_n_out) != ckpt_n_out
+            if padded_copy:
+                _set_fp8_pallas_copy(layer)
+            hbm_pin = fp8_skinny_hbm_pin_selected(layer_prefix)
+            if hbm_pin:
+                setattr(layer, FP8_PALLAS_HBM_PIN_ATTR, True)
+            get_fp8_linear_pallas_op(
+                padded_copy,
+                hbm_pin=hbm_pin,
+                decode_gemv_max_rows=self.decode_gemv_max_rows,
+            )
         if requant_block_size is None:
             # Stated in checkpoint [n_out, n_in] terms, which is what the
             # downstream dequantization pipelines read; the transpose above
@@ -1678,7 +1764,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             layer.weight_block_size = requant_block_size
 
         if layer.weight.device.type == "tpu":
-            synchronize_tensors([layer.weight, layer.weight_scale])
+            extra_params = [
+                getattr(layer, name)
+                for name in (FP8_PALLAS_WEIGHT, FP8_PALLAS_SCALE)
+                if hasattr(layer, name)
+            ]
+            synchronize_tensors([layer.weight, layer.weight_scale, *extra_params])
 
         if self.online_fp8:
             layer._tpu_online_fp8_processed = True
@@ -1698,14 +1789,65 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
     ) -> torch.Tensor:
         layer = cast("TpuLinear", layer)
+        split_w = getattr(layer, FP8_SPLIT_WEIGHTS_ATTR, None)
+        if split_w is not None:
+            split_s = getattr(layer, FP8_SPLIT_SCALES_ATTR)
+            slot = getattr(layer, PREQUANT_ATTR, None)
+            prequant = None if slot is None else slot.value
+            if prequant is not None:
+                assert slot is not None
+                slot.value = None
+                x_q, x_scale = prequant
+            else:
+                x_q, x_scale = quantize_fp8_row(x.reshape(-1, x.shape[-1]))
+            parts = [
+                prequantized_matmul(
+                    x_q,
+                    x_scale,
+                    getattr(layer, w_name),
+                    getattr(layer, s_name),
+                )
+                for w_name, s_name in zip(split_w, split_s, strict=True)
+            ]
+            out = torch.cat(parts, dim=-1)
+            out = out.reshape(*x.shape[:-1], out.shape[-1])
+            if out.dtype != x.dtype:
+                out = out.to(x.dtype)
+            if bias is not None:
+                out = out + bias
+            return out
         weight = layer.weight
         if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
+        slot = getattr(layer, PREQUANT_ATTR, None)
+        prequant = None if slot is None else slot.value
         if isinstance(layer, VocabParallelEmbedding):
             # Prevent the quantization of activations to FP8 (W8A16).
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
+        elif prequant is not None:
+            assert slot is not None
+            slot.value = None
+            x_q, x_scale = prequant
+            out = prequantized_matmul(
+                x_q,
+                x_scale,
+                weight,
+                layer.weight_scale,
+                decode_gemv_max_rows=self.decode_gemv_max_rows,
+            )
+            out = out.reshape(*x.shape[:-1], out.shape[-1])
+        elif getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
+            out = quantized_matmul_pallas(
+                x,
+                weight,
+                layer.weight_scale,
+                getattr(layer, FP8_PALLAS_WEIGHT, None),
+                getattr(layer, FP8_PALLAS_SCALE, None),
+                hbm_pin=bool(getattr(layer, FP8_PALLAS_HBM_PIN_ATTR, False)),
+                decode_gemv_max_rows=self.decode_gemv_max_rows,
+            )
         elif self.decode_gemv_max_rows:
             out = quantized_matmul(
                 x,
@@ -1731,6 +1873,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         return (
             layer.weight_scale.dim() == 1
             and not getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+            and getattr(layer, FP8_PALLAS_N_ATTR, None) is None
             and not isinstance(layer, VocabParallelEmbedding)
             and getattr(layer, "params_dtype", None) == torch.bfloat16
             and rows > self.w8a16_max_rows
@@ -1769,6 +1912,81 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         layer.weight_scale = embed_tokens.weight_scale
         setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
         return layer
+
+
+def split_fp8_linear_columns(layer: torch.nn.Module, widths: tuple[int, ...]) -> bool:
+    """Split a canonical `(k, n)` per-channel FP8 linear into disjoint columns.
+
+    Allocates fresh contiguous parameter buffers for each width and detaches the
+    monolithic `weight` and `weight_scale` so runtime HBM footprint stays flat.
+    """
+    if len(widths) < 2 or any(width <= 0 for width in widths):
+        return False
+    if getattr(layer, FP8_SPLIT_WEIGHTS_ATTR, None) is not None:
+        return False
+    if not isinstance(getattr(layer, "quant_method", None), VllmFp8LinearMethodTPU):
+        return False
+    if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+        return False
+    if getattr(layer, FP8_PALLAS_N_ATTR, None) is not None:
+        return False
+    if getattr(layer, "bias", None) is not None:
+        return False
+    weight_obj = getattr(layer, "weight", None)
+    scale_obj = getattr(layer, "weight_scale", None)
+    if not isinstance(weight_obj, torch.Tensor) or not isinstance(
+        scale_obj, torch.Tensor
+    ):
+        return False
+    weight = cast(torch.Tensor, weight_obj)
+    scale = cast(torch.Tensor, scale_obj)
+    if (
+        weight.dtype != torch.float8_e4m3fn
+        or weight.ndim != 2
+        or scale.ndim != 1
+        or scale.shape[0] != weight.shape[1]
+        or sum(widths) != weight.shape[1]
+    ):
+        return False
+
+    # Build the JAX custom ops outside Dynamo before registering split buffers.
+    get_prequantized_matmul_op()
+    get_quantize_fp8_row_op()
+
+    weight_data = weight.data
+    scale_data = scale.data
+    is_tpu = weight_data.device.type == "tpu"
+    w_names: list[str] = []
+    s_names: list[str] = []
+    sync_list: list[torch.Tensor] = []
+    col = 0
+    for idx, width in enumerate(widths):
+        # Avoid dynamic slices of a single device buffer: XLA tracks prefetch
+        # size per parameter, so independent fresh_buffer slabs let the compiler
+        # allocate smaller tiles without pinning the original monolith in VMEM.
+        w_part = fresh_buffer(weight_data[:, col : col + width])
+        s_part = fresh_buffer(scale_data[col : col + width])
+        col += width
+        w_name = f"weight_split_{idx}"
+        s_name = f"weight_scale_split_{idx}"
+        layer.register_parameter(
+            w_name, torch.nn.Parameter(w_part, requires_grad=False)
+        )
+        layer.register_parameter(
+            s_name, torch.nn.Parameter(s_part, requires_grad=False)
+        )
+        w_names.append(w_name)
+        s_names.append(s_name)
+        sync_list.extend((w_part, s_part))
+
+    layer.register_parameter("weight", None)
+    layer.register_parameter("weight_scale", None)
+    del weight, scale, weight_data, scale_data
+    setattr(layer, FP8_SPLIT_WEIGHTS_ATTR, tuple(w_names))
+    setattr(layer, FP8_SPLIT_SCALES_ATTR, tuple(s_names))
+    if is_tpu:
+        synchronize_tensors(sync_list)
+    return True
 
 
 def resolve_online_fp8(

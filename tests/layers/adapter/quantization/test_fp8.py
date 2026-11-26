@@ -107,7 +107,6 @@ def test_fp8_routed_experts_checkpoint_allocation(
         torch.testing.assert_close(w2_scale[0], scales[:, 2:])
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "tp_size,full_inter",
     [(1, 64), (1, 192), (4, 768), (8, 768), (16, 1024)],
@@ -271,7 +270,6 @@ def test_fp8_routed_experts_tp_shard_loading(monkeypatch, tp_size, full_inter):
         assert not got_w2[:, shard:].any()
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "tp_size,full_inter,expected_block",
     [
@@ -421,7 +419,6 @@ class TestFp8LinearSubBlockTP:
                 raising=False,
             )
 
-    @pytest.mark.cpu_test
     @pytest.mark.parametrize("fused_checkpoint", [False, True])
     def test_merged_column_parallel_tp16_shared_expert_gate_up(
         self, monkeypatch, fused_checkpoint
@@ -509,7 +506,6 @@ class TestFp8LinearSubBlockTP:
             torch.testing.assert_close(got[:shard], ref_gate[sl], rtol=5e-2, atol=2e-1)
             torch.testing.assert_close(got[shard:], ref_up[sl], rtol=5e-2, atol=2e-1)
 
-    @pytest.mark.cpu_test
     @pytest.mark.parametrize("enable_blockwise_kernel", [False, True])
     def test_row_parallel_tp16_shared_expert_down(
         self, monkeypatch, enable_blockwise_kernel
@@ -580,7 +576,6 @@ class TestFp8LinearSubBlockTP:
             got = (layer.weight.float() * layer.weight_scale[None, :]).T
             torch.testing.assert_close(got, ref_down[:, sl], rtol=5e-2, atol=2e-1)
 
-    @pytest.mark.cpu_test
     def test_column_parallel_tp16_sub_block(self, monkeypatch):
         """ColumnParallelLinear with output_size=1024 at TP=16 (64 rows per shard)."""
         from vllm.model_executor.layers.linear import ColumnParallelLinear
@@ -626,7 +621,6 @@ class TestFp8LinearSubBlockTP:
             got = (layer.weight.float() * layer.weight_scale[None, :]).T
             torch.testing.assert_close(got, ref[sl], rtol=5e-2, atol=2e-1)
 
-    @pytest.mark.cpu_test
     def test_qkv_parallel_tp16_sub_block_with_kv_replication(self, monkeypatch):
         """QKVParallelLinear with KV head replication and sub-block shards at TP=16."""
         from vllm.model_executor.layers.linear import QKVParallelLinear
@@ -692,7 +686,6 @@ def _fp8_config(block_size):
     )
 
 
-@pytest.mark.cpu_test
 def test_fp8_tp_rejects_partial_checkpoint_block(make_fp8_experts):
     # A whole I=800 checkpoint has a partial scale block. Refining its ceil
     # scale grid then evenly slicing it would silently misassign TP scales.
@@ -700,7 +693,6 @@ def test_fp8_tp_rejects_partial_checkpoint_block(make_fp8_experts):
         make_fp8_experts(_fp8_config([128, 128]), 100, tp_size=8, tp_rank=0)
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "intermediate,tp_size",
     [(512, 2), (384, 2), (640, 1), (640, 2), (640, 4), (640, 8), (768, 3), (800, 1)],
