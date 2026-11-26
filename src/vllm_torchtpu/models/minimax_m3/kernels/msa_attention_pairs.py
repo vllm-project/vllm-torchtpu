@@ -73,14 +73,17 @@ _RMW_GROUP = 8
 # included: a unit runs while the next one's copies land.
 _RING = 2 * _UNIT
 _NO_PAIR = jnp.iinfo(jnp.int32).max
-# A sort key: (page key * window + token) << 8 | visible slots: page keys
-# times the window below 2^23 (`_max_window`).
+# A sort key: (page key << `_token_bits` | token) << 8 | visible slots: page
+# keys times the token field's span below 2^23 (`_max_window`).
 _LIMIT_BITS = 8
 # A pair word: its token | its visible slots << 16.
 _TOKEN_BITS = 16
 # A block word: its page key | its pairs << 24.
 _KEY_BITS = 24
 _KEY_MASK = (1 << _KEY_BITS) - 1
+# The work list's kernel (`_work_kernel`) holds a window's pairs as [8, 128]
+# tiles.
+_LANES, _SUBLANES = 128, 8
 
 
 def _kernel(
@@ -307,13 +310,197 @@ def _width(n):
     return jnp.maximum((n - 1) >> 2, 1) - 1
 
 
-def _work(keys, local_key, local_limit, window, page_size):
+def _token_bits(window):
+    """Bits of a pair key's token field: a window's tokens."""
+    return max(window - 1, 1).bit_length()
+
+
+def _work_kernel(x_ref, blocks_ref, words_ref, stats_ref, *, token_bits):
+    """One window's pair keys (``(key << token_bits | token) << _LIMIT_BITS |
+    visible slots``, `_NO_PAIR` none), n = R * 128 of them, sorted and turned
+    into `_work`'s block and pair words, plus its blocks of each width (lanes
+    ``0 .. len(_WIDTHS) - 1`` of ``stats_ref``) and its valid pairs (lane 127).
+
+    Pair i is held at row i % R (tile i % R // 8, sublane i % 8), lane i // R:
+    the bitonic sort's most frequent partner distances (the low bits of i) are
+    sublane or whole-tile moves, and a run's neighbours along i are in the
+    same lane but at its ends. The sorted [R, 128] blocks transpose to the
+    window's words in order."""
+    rows = x_ref.shape[0]
+    num = rows // _SUBLANES
+    n = rows * _LANES
+    lane = jax.lax.broadcasted_iota(jnp.int32, (_SUBLANES, _LANES), 1)
+    sub = jax.lax.broadcasted_iota(jnp.int32, (_SUBLANES, _LANES), 0)
+    tiles = [x_ref[pl.ds(v * _SUBLANES, _SUBLANES), :] for v in range(num)]
+
+    def bit_kind(bit):
+        if bit < _SUBLANES:
+            return "s", bit
+        if bit < rows:
+            return "t", bit // _SUBLANES
+        return "l", bit // rows
+
+    def low(bit, v):
+        """i & bit == 0 in tile v: a mask, or a static bool."""
+        kind, d = bit_kind(bit)
+        if kind == "s":
+            return (sub & d) == 0
+        if kind == "l":
+            return (lane & d) == 0
+        return not (v & d)
+
+    # Bitonic sort, ascending.
+    k = 2
+    while k <= n:
+        j = k // 2
+        while j >= 1:
+            kind, d = bit_kind(j)
+            out = list(tiles)
+            for v in range(num):
+                up = True if k == n else low(k, v)
+                if kind == "t":
+                    if v & d:
+                        continue
+                    a, b = tiles[v], tiles[v + d]
+                    lt = a < b
+                    lo, hi = jnp.where(lt, a, b), jnp.where(lt, b, a)
+                    if isinstance(up, bool):
+                        out[v], out[v + d] = (lo, hi) if up else (hi, lo)
+                    else:
+                        out[v] = jnp.where(up, lo, hi)
+                        out[v + d] = jnp.where(up, hi, lo)
+                    continue
+                x = tiles[v]
+                axis, size = (0, _SUBLANES) if kind == "s" else (1, _LANES)
+                first = low(j, v)
+                partner = jnp.where(
+                    first, pltpu.roll(x, size - d, axis), pltpu.roll(x, d, axis)
+                )
+                if up is True:
+                    keep = first
+                elif up is False:
+                    keep = jnp.logical_not(first)
+                else:
+                    keep = first == up
+                out[v] = jnp.where((x < partner) == keep, x, partner)
+            tiles = out
+            j //= 2
+        k *= 2
+
+    idx = [v * _SUBLANES + sub + rows * lane for v in range(num)]
+    valid = [x != _NO_PAIR for x in tiles]
+    key = [
+        jnp.where(ok, x >> (token_bits + _LIMIT_BITS), 0) for x, ok in zip(tiles, valid)
+    ]
+
+    def row(x, r):  # sublane r of x on every sublane
+        return jnp.broadcast_to(x[r : r + 1], x.shape)
+
+    def neighbour(xs, step):
+        """xs at i + step (step = +-1); the wrapped ends are don't-cares."""
+        out = []
+        for v, x in enumerate(xs):
+            if step > 0:
+                inner = pltpu.roll(x, _SUBLANES - 1, 0)  # x[s + 1]
+                if v + 1 < num:
+                    edge = row(xs[v + 1], 0)
+                else:
+                    edge = pltpu.roll(row(xs[0], 0), _LANES - 1, 1)  # next lane
+                out.append(jnp.where(sub < _SUBLANES - 1, inner, edge))
+            else:
+                inner = pltpu.roll(x, 1, 0)  # x[s - 1]
+                if v > 0:
+                    edge = row(xs[v - 1], _SUBLANES - 1)
+                else:
+                    edge = pltpu.roll(row(xs[-1], _SUBLANES - 1), 1, 1)  # previous lane
+                out.append(jnp.where(sub > 0, inner, edge))
+        return out
+
+    def scan(xs, op, neutral, reverse):
+        """Inclusive scan of `op` along i (descending i with `reverse`)."""
+        xs = list(xs)
+        order = range(num - 1, -1, -1) if reverse else range(num)
+        carry = None
+        for v in order:  # along rows: sublanes, then tiles
+            x = xs[v]
+            d = 1
+            while d < _SUBLANES:
+                if reverse:
+                    sh = jnp.where(
+                        sub < _SUBLANES - d, pltpu.roll(x, _SUBLANES - d, 0), neutral
+                    )
+                else:
+                    sh = jnp.where(sub >= d, pltpu.roll(x, d, 0), neutral)
+                x = op(x, sh)
+                d *= 2
+            if carry is not None:
+                x = op(x, carry)
+            carry = row(x, 0 if reverse else _SUBLANES - 1)
+            xs[v] = x
+        # across lanes: each lane takes the scan of the lanes before it
+        tot = carry
+        d = 1
+        while d < _LANES:
+            if reverse:
+                sh = jnp.where(
+                    lane < _LANES - d, pltpu.roll(tot, _LANES - d, 1), neutral
+                )
+            else:
+                sh = jnp.where(lane >= d, pltpu.roll(tot, d, 1), neutral)
+            tot = op(tot, sh)
+            d *= 2
+        if reverse:
+            before = jnp.where(
+                lane < _LANES - 1, pltpu.roll(tot, _LANES - 1, 1), neutral
+            )
+        else:
+            before = jnp.where(lane >= 1, pltpu.roll(tot, 1, 1), neutral)
+        return [op(x, before) for x in xs]
+
+    key_next = neighbour(key, 1)
+    valid_next = neighbour([jnp.where(ok, 1, 0) for ok in valid], 1)
+    key_prev = neighbour(key, -1)
+    ends = [
+        jnp.where((kk != kn) | (vn == 0) | (i == n - 1), i + 1, n)
+        for kk, kn, vn, i in zip(key, key_next, valid_next, idx)
+    ]
+    run_end = scan(ends, jnp.minimum, n, True)
+    starts = [
+        jnp.where((kk != kp) | (i == 0), i, 0) for kk, kp, i in zip(key, key_prev, idx)
+    ]
+    run_start = scan(starts, jnp.maximum, 0, False)
+
+    counts = [jnp.zeros((_SUBLANES, _LANES), jnp.int32) for _ in _WIDTHS]
+    pairs = jnp.zeros((_SUBLANES, _LANES), jnp.int32)
+    blocks, words = [], []
+    for v in range(num):
+        x, ok, i = tiles[v], valid[v], idx[v]
+        size = jnp.minimum(run_end[v] - i, _WIDTHS[-1])
+        start = ok & (((i - run_start[v]) & (_WIDTHS[-1] - 1)) == 0)
+        width = _width(size)
+        for w in range(len(_WIDTHS)):
+            counts[w] = counts[w] + jnp.where(start & (width == w), 1, 0)
+        pairs = pairs + jnp.where(ok, 1, 0)
+        token = jnp.where(ok, (x >> _LIMIT_BITS) & ((1 << token_bits) - 1), 0)
+        limit = jnp.where(ok, x & ((1 << _LIMIT_BITS) - 1), 0)
+        blocks.append(key[v] | (size << _KEY_BITS))
+        words.append(token | (limit << _TOKEN_BITS))
+    stats = jnp.zeros((_SUBLANES, _LANES), jnp.int32)
+    for w, c in enumerate(counts):
+        stats = jnp.where(lane == w, jnp.sum(c), stats)
+    stats_ref[...] = jnp.where(lane == _LANES - 1, jnp.sum(pairs), stats)
+    blocks_ref[...] = jnp.concatenate(blocks, axis=0).T
+    words_ref[...] = jnp.concatenate(words, axis=0).T
+
+
+def _work(keys, local_key, local_limit, window, page_size, interpret=False):
     """Per window of `window` tokens: its (page key, token) pairs in key order,
     as two ``[windows * P]`` arrays: the page key with the size of the
     block starting there (the rest of its page's run, at most the widest
     width), and the pair word (`_TOKEN_BITS`); the valid pairs per window; and
     each window's blocks of each width (``[windows * widths]``).
-    A page a token lists twice is one pair."""
+    A page a token lists twice is one pair. The pairs are sorted and turned
+    into words in one kernel per window (`_work_kernel`)."""
     num_tokens, topk = keys.shape
     windows = num_tokens // window
     earlier = jnp.arange(topk)[:, None] > jnp.arange(topk)[None, :]
@@ -321,44 +508,48 @@ def _work(keys, local_key, local_limit, window, page_size):
     keys = jnp.where(again, -1, keys)
     tok = jnp.arange(num_tokens, dtype=jnp.int32)[:, None] % window
     limit = jnp.where(keys == local_key[:, None], local_limit[:, None], page_size)
-    # One sort operand: (key * window + token) << 8 | visible slots.
-    pair = jnp.where(keys >= 0, (keys * window + tok) << _LIMIT_BITS | limit, _NO_PAIR)
-    # One operand of distinct keys (but for the equal empty ones) sorts to the
-    # same array either way; s32[2, 32768]: 48 us unstable, 107 stable (tpu7x,
-    # j-b9559c5d).
-    pair = jax.lax.sort(pair.reshape(windows, -1), dimension=1, is_stable=False)
-    valid = pair != _NO_PAIR
-    limit = jnp.where(valid, pair & ((1 << _LIMIT_BITS) - 1), 0)
-    pair = pair >> _LIMIT_BITS
-    token = jnp.where(valid, pair % window, 0)
-    key = jnp.where(valid, pair // window, 0)
-    length = pair.shape[1]
-    idx = jnp.arange(length, dtype=jnp.int32)[None]
-    # A run ends at its page's last pair; the last page's, at the last valid one.
-    change = (key[:, 1:] != key[:, :-1]) | ~valid[:, 1:]
-    last = jnp.pad(change, ((0, 0), (0, 1)), constant_values=True)
-    run_end = jax.lax.cummin(jnp.where(last, idx + 1, length), axis=1, reverse=True)
-    size = jnp.minimum(run_end - idx, _WIDTHS[-1])
-    first = jnp.pad(key[:, 1:] != key[:, :-1], ((0, 0), (1, 0)), constant_values=True)
-    run_start = jax.lax.cummax(jnp.where(first, idx, 0), axis=1)
-    start = valid & ((idx - run_start) % _WIDTHS[-1] == 0)
-    width = _width(size)
-    width_blocks = jnp.sum(
-        start[:, :, None] & (width[:, :, None] == jnp.arange(len(_WIDTHS))),
-        axis=1,
-        dtype=jnp.int32,
+    token_bits = _token_bits(window)
+    pair = jnp.where(
+        keys >= 0, (keys << token_bits | tok) << _LIMIT_BITS | limit, _NO_PAIR
     )
+    length = window * topk
+    # The kernel unrolls its sort over every tile of the window: sized for
+    # `WINDOW` x top-16 (32,768 pairs, 128 KiB a window in VMEM).
+    size = max(pl.next_power_of_2(length), _SUBLANES * _LANES)
+    pair = jnp.pad(
+        pair.reshape(windows, length),
+        ((0, 0), (0, size - length)),
+        constant_values=_NO_PAIR,
+    )
+    r = size // _LANES
+    blocks, words, stats = pl.pallas_call(
+        functools.partial(_work_kernel, token_bits=token_bits),
+        grid=(windows,),
+        in_specs=[pl.BlockSpec((None, r, _LANES), lambda w: (w, 0, 0))],
+        out_specs=[
+            pl.BlockSpec((None, _LANES, r), lambda w: (w, 0, 0)),
+            pl.BlockSpec((None, _LANES, r), lambda w: (w, 0, 0)),
+            pl.BlockSpec((None, _SUBLANES, _LANES), lambda w: (w, 0, 0)),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((windows, _LANES, r), jnp.int32),
+            jax.ShapeDtypeStruct((windows, _LANES, r), jnp.int32),
+            jax.ShapeDtypeStruct((windows, _SUBLANES, _LANES), jnp.int32),
+        ],
+        interpret=interpret,
+        name="minimax_m3_msa_pairs_work",
+    )(pair.reshape(windows, r, _LANES))
     # Room for the widest block past the last pair, in whole 1,024-word SMEM blocks.
     pad = ((0, 0), (0, -(length + _WIDTHS[-1]) % 1024 + _WIDTHS[-1]))
 
     def flat(x):
-        return jnp.pad(x, pad).reshape(-1)
+        return jnp.pad(x.reshape(windows, size)[:, :length], pad).reshape(-1)
 
     return (
-        flat(key | (size << _KEY_BITS)),
-        flat(token | (limit << _TOKEN_BITS)),
-        jnp.sum(valid, axis=1, dtype=jnp.int32),
-        width_blocks.reshape(-1),
+        flat(blocks),
+        flat(words),
+        stats[:, 0, _LANES - 1],
+        stats[:, 0, : len(_WIDTHS)].reshape(-1),
     )
 
 
@@ -382,7 +573,7 @@ def _max_window(num_heads, head_dim, page_size, num_keys, window=WINDOW) -> int:
     # windows), down to the 1,024 tokens of the first version: larger page
     # tables go to the tiles (`supports`).
     keys = ((_NO_PAIR >> _LIMIT_BITS) - 1) // max(num_keys, 1)
-    while window > keys and window > 1024:
+    while 1 << _token_bits(window) > keys and window > 1024:
         window //= 2
     return min(window, max(budget, 0) // token_bytes) // 8 * 8
 
@@ -403,7 +594,7 @@ def supports(num_heads, head_dim, page_size, num_keys, window=WINDOW) -> bool:
         and page_size < 1 << _LIMIT_BITS
         and _WIDTHS[-1] <= head_dim
         and num_keys <= _KEY_MASK
-        and num_keys * window < _NO_PAIR >> _LIMIT_BITS
+        and num_keys << _token_bits(window) < _NO_PAIR >> _LIMIT_BITS
     )
 
 
@@ -457,7 +648,7 @@ def msa_sparse_attention_pairs(
         q, selected, local_page, local_limit, window
     )
     blocks, words, num_pairs, width_blocks = _work(
-        selected, local_page, local_limit, window, page_size
+        selected, local_page, local_limit, window, page_size, interpret
     )
     windows = q.shape[0] // window
     tokens = math.gcd(window, 256)  # an output chunk

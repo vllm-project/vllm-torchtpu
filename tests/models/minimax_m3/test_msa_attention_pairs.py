@@ -197,3 +197,75 @@ def test_pairs_window_on_page_key_zero_only():
     )
     assert np.abs(got[:, :3]).max() > 0
     np.testing.assert_allclose(got, want.transpose(1, 0, 2), atol=2e-2)
+
+
+def _work_reference(keys, local_key, local_limit, window, page_size):
+    """`msa_attention_pairs._work`'s outputs, in numpy: each window's pairs
+    sorted by (page key, token), cut into runs per page and blocks of at most
+    the widest width."""
+    widest, widths = msa_attention_pairs._WIDTHS[-1], len(msa_attention_pairs._WIDTHS)
+    blocks, words, num_pairs, width_blocks = [], [], [], []
+    length = window * keys.shape[1]
+    pad = -(length + widest) % 1024 + widest
+    for w in range(keys.shape[0] // window):
+        pairs = set()
+        for t in range(w * window, (w + 1) * window):
+            for k in set(keys[t][keys[t] >= 0].tolist()):
+                vis = local_limit[t] if k == local_key[t] else page_size
+                pairs.add((k, t - w * window, vis))
+        pairs = sorted(pairs)
+        b = np.zeros(length + pad, np.int64)
+        b[len(pairs) : length] = 1 << 24  # empty words: blocks of one
+        wd = np.zeros(length + pad, np.int64)
+        counts = np.zeros(widths, np.int64)
+        i = 0
+        while i < len(pairs):
+            run = 1
+            while i + run < len(pairs) and pairs[i + run][0] == pairs[i][0]:
+                run += 1
+            for j in range(run):
+                size = min(run - j, widest)
+                b[i + j] = pairs[i][0] | size << 24
+                if j % widest == 0:
+                    counts[max((size - 1) >> 2, 1) - 1] += 1
+            i += run
+        for i, (_, tok, vis) in enumerate(pairs):
+            wd[i] = tok | vis << 16
+        blocks.append(b)
+        words.append(wd)
+        num_pairs.append(len(pairs))
+        width_blocks.append(counts)
+    return [
+        np.concatenate(blocks),
+        np.concatenate(words),
+        np.array(num_pairs),
+        np.concatenate(width_blocks),
+    ]
+
+
+@pytest.mark.parametrize(
+    "window,num_keys", [(32, 12), (152, 90), (48, 2000), (688, 300)]
+)
+def test_work_list_matches_reference(window, num_keys):
+    """The work list's kernel (sort, runs, blocks, counts) against numpy, in
+    windows whose pairs do not fill a power of two, with pages listed twice
+    and tokens selecting nothing; 688 tokens hold their pairs in eight tiles
+    (cross-tile compares, neighbours and scan carries)."""
+    rng = np.random.default_rng(window)
+    num_tokens = 2 * window
+    keys = rng.integers(-1, num_keys, (num_tokens, TOPK)).astype(np.int32)
+    keys[::5, 1] = keys[::5, 0]
+    keys[3] = -1
+    local_key = keys[:, 0].copy()
+    local_limit = rng.integers(1, 129, num_tokens).astype(np.int32)
+    got = msa_attention_pairs._work(
+        jnp.asarray(keys),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        window,
+        128,
+        interpret=True,
+    )
+    want = _work_reference(keys, local_key, local_limit, window, 128)
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(np.asarray(g), w)
