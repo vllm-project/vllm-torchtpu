@@ -364,3 +364,23 @@ def test_copy_send_rows_fp8_writes_the_fp8_words(num_tokens, hidden):
     want = row_copy.fp8_row_words((xf * inv[:, None]).astype(jnp.float8_e4m3fn))
     want = np.asarray(want)[index[:count]]
     np.testing.assert_array_equal(np.asarray(got)[:count], want)
+
+
+@pytest.mark.parametrize("num_tokens", [12, 13, 48, 92])
+@pytest.mark.parametrize("hidden", [8192, 4096])
+def test_fp8_source_rows_are_the_send_rows(num_tokens, hidden):
+    """Row t of `fp8_source_rows` is bitwise `copy_send_rows_fp8`'s send row
+    of token t."""
+    _require_tpu()
+    rng = np.random.default_rng(num_tokens * 5 + hidden)
+    x = _rows(rng, num_tokens, hidden)
+    inv = jnp.asarray(rng.uniform(0.5, 300.0, size=num_tokens), jnp.float32)
+    want = row_copy.copy_send_rows_fp8(
+        x,
+        inv,
+        jnp.arange(num_tokens, dtype=jnp.int32),
+        jnp.asarray([num_tokens], jnp.int32),
+        num_tokens,
+    )
+    got = row_copy.fp8_source_rows(x, inv)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))

@@ -327,16 +327,15 @@ def _send_fp8_kernel(
     )
 
 
-def _send_body(
-    num_tokens, index_ref, count_ref, inv_ref, x_ref, out_ref, stage, rows_vmem, sem
-):
+def _stage_rows(num_tokens, inv_ref, x_ref, stage):
+    """Grid step ``c``'s block of token rows into ``stage``: token ``t``'s row
+    as stage rows [sub t, sub t + sub), bf16 or (``inv_ref``) its fp8 words."""
     c = pl.program_id(0)
     fp8 = inv_ref is not None
     sub = FP8_ROW_SUBLANES if fp8 else ROW_SUBLANES
     lanes = stage.shape[1]
 
     def relayout(block):
-        # Token t's row is stage rows [sub t, sub t + sub): whole tiles.
         num_rows = block.shape[0]
         if fp8:
             # Each row times its token's inverse scale, as fp8 [32, H / 32],
@@ -368,7 +367,14 @@ def _send_body(
         # after them would be read past the array's end.
         pl.when(c == whole)(lambda: relayout(x_ref[pl.ds(0, rest)]))
 
-    @pl.when(c == pl.num_programs(0) - 1)
+
+def _send_body(
+    num_tokens, index_ref, count_ref, inv_ref, x_ref, out_ref, stage, rows_vmem, sem
+):
+    sub = FP8_ROW_SUBLANES if inv_ref is not None else ROW_SUBLANES
+    _stage_rows(num_tokens, inv_ref, x_ref, stage)
+
+    @pl.when(pl.program_id(0) == pl.num_programs(0) - 1)
     def _():
         n = count_ref[0]
 
@@ -484,3 +490,66 @@ def copy_send_rows_fp8(x, inv_scale, index, count, rows: int):
         name=f"row_copy_send_fp8-s_{num_tokens}-r_{rows}-h_{hidden}",
     )(index, count, inv_scale.astype(jnp.float32), x)
     return out.reshape(rows, sub, lanes)
+
+
+def _quantize_fp8_kernel(num_tokens, inv_ref, x_ref, out_ref, stage, sem):
+    c = pl.program_id(0)
+    _stage_rows(num_tokens, inv_ref, x_ref, stage)
+    sub = FP8_ROW_SUBLANES
+    whole, rest = divmod(num_tokens, _ROWS_PER_TILE)
+
+    def copy(chunk, num_rows):
+        first = pl.multiple_of(chunk * _ROWS_PER_TILE * sub, _ROWS_PER_TILE * sub)
+        return pltpu.make_async_copy(
+            stage.at[pl.ds(first, num_rows * sub)],
+            out_ref.at[pl.ds(first, num_rows * sub)],
+            sem.at[0],
+        )
+
+    # Each block's words leave as soon as they are staged.
+    if whole:
+        pl.when(c < whole)(lambda: copy(c, _ROWS_PER_TILE).start())
+    if rest:
+        pl.when(c == whole)(lambda: copy(whole, rest).start())
+
+    @pl.when(c == pl.num_programs(0) - 1)
+    def _():
+        for _ in range(whole):
+            copy(0, _ROWS_PER_TILE).wait()
+        if rest:
+            copy(whole, rest).wait()
+
+
+@jax.jit
+def fp8_source_rows(x, inv_scale):
+    """Every token row of ``x`` [S, H] bf16 as the fp8 words `copy_send_rows_fp8`
+    sends for it: row ``t`` of the [S, 8, H / 32] uint32 result is
+    ``copy_send_rows_fp8``'s row for ``index = t``, in HBM, where DMAs read it.
+    """
+    num_tokens, hidden = x.shape
+    if not (row_copy_supported(x.dtype, hidden) and fp8_rows_supported(hidden)):
+        raise ValueError(f"fp8_source_rows takes bf16 rows, got {x.shape}")
+    sub = FP8_ROW_SUBLANES
+    lanes = hidden // (sub * _FP8_PER_WORD)
+    num_chunks = pl.cdiv(num_tokens, _ROWS_PER_TILE)
+    out = pl.pallas_call(
+        functools.partial(_quantize_fp8_kernel, num_tokens),
+        out_shape=pltpu.HBM((num_tokens * sub, lanes), jnp.uint32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(num_chunks,),
+            in_specs=[pl.BlockSpec((_ROWS_PER_TILE, hidden), lambda c, *_: (c, 0))],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((num_chunks * _ROWS_PER_TILE * sub, lanes), jnp.uint32),
+                pltpu.SemaphoreType.DMA((1,)),
+            ],
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=True,
+            vmem_limit_bytes=num_chunks * _ROWS_PER_TILE * hidden + (16 << 20),
+        ),
+        name=f"row_copy_fp8_source-s_{num_tokens}-h_{hidden}",
+    )(inv_scale.astype(jnp.float32), x)
+    return out.reshape(num_tokens, sub, lanes)
