@@ -56,10 +56,9 @@ from vllm_torchtpu.models.minimax_m3.kernels import (
 # about 2K tokens (~0.16 us per token at c64 DCP 8, j-0a66fa2e).
 HEAD_PARALLEL_MIN_TOKENS = 2048
 # Tiles and pages per kernel step of the head-parallel calls (every rank's
-# pages): 64-token tiles as `msa_attention.PREFILL_BLOCK_Q_4BIT` (standalone
-# 16 heads x 4096 tokens: 0.659 -> 0.385 ms at .999-local selections, 0.684 ->
-# 0.587 at .995, r12 j-9c5505d9), wide groups to amortize a step's fixed cost.
-_BLOCK_Q = 64
+# pages): the tile of `msa_attention.PREFILL_BLOCK_Q_4BIT`, wide groups to
+# amortize a step's fixed cost.
+_BLOCK_Q = msa_attention.PREFILL_BLOCK_Q_4BIT
 _PAGES_PER_STEP = 64
 # A KV head's two replicas split a long step's rows instead of its query
 # heads: each attends half the tokens with all 16 heads, so a tile's page
@@ -72,7 +71,7 @@ _SPLIT_PAGES_PER_STEP = 32
 # halves: a step's halves differ in work (the decode rows a mixed step puts
 # first attend nothing here; later chunk tokens see more pages), and the
 # replica with less waits at the next exchange (c64 DCP 4 twin, per-core
-# kernel time up to 2.2x, j-867fc577). A block is a whole 64-token tile.
+# kernel time up to 2.2x, j-867fc577). A block is whole tiles (`_BLOCK_Q`).
 _INTERLEAVE_TOKENS = 64
 # Decode steps of a DCP group of 4 over 2 KV heads attend each KV head in its
 # own call so the cross-chip merge overlaps the second (`_pair_first_merge_by_head`).
