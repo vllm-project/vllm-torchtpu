@@ -53,6 +53,7 @@ def _profile_run(monkeypatch, runner, num_tokens, prefix, first_stage=True):
         lambda tensors=None, **_kwargs: seen.setdefault("synced", []).append(tensors),
     )
     runner.maybe_select_dummy_loras = lambda *_args, **_kwargs: contextlib.nullcontext()
+    runner.model_adapter = None
     runner._pp_is_first = first_stage
     runner.vocab_size = 1000
     runner._profile_inputs = {}
@@ -300,6 +301,7 @@ def test_capture_model_checks_draft_buckets_after_the_mtp_warmup(monkeypatch):
     runner.enforce_eager = False
     runner.lora_config = None
     runner.vllm_config = runner.device = runner.model = None
+    runner.model_adapter = None
     runner._mtp_prefill_only = True
     runner._is_async_drafter = False
     calls = []

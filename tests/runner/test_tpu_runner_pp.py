@@ -422,6 +422,7 @@ class TestBufferedStepPosting:
             supports_mm_inputs=False,
             phase_based_profiler=None,
             _is_async_drafter=False,
+            model_adapter=None,
             # the first call after the posting point
             _greedy_top_tokens_this_step=stop,
         )

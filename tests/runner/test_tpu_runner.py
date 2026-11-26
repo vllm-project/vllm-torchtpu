@@ -2828,6 +2828,7 @@ def _dummy_run_stand_in(monkeypatch, forward_model):
 
     runner = SimpleNamespace(
         device=torch.device("cpu"),
+        model_adapter=None,
         max_model_len=64,
         max_num_tokens=64,
         max_num_reqs=4,
@@ -4425,7 +4426,8 @@ def test_load_model_eagerly_initializes_sampling_generator_before_transfers(
         device_config=SimpleNamespace(device=real_device("cpu")),
         device=real_device("cpu"),
         vllm_config=SimpleNamespace(device_config=None, quant_config=None),
-        model_config=SimpleNamespace(quantization=None, seed=42),
+        model_config=SimpleNamespace(quantization=None, seed=42, architecture=None),
+        kv_cache_manager=SimpleNamespace(),
         is_pooling_model=False,
         _sampling_generator=None,
     )

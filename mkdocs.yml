@@ -88,6 +88,7 @@ nav:
     - 'Coding Guidance': developers_guide/coding_guidance.md
     - 'Optimization Best Practices': developers_guide/optimization_best_practices.md
     - 'TPU Patch Mechanism': developers_guide/tpu_patch_mechanism.md
+    - 'Model Adapters': developers_guide/model_adapters.md
     - 'Type Checking': developers_guide/type_checking.md
     - 'Testing & CI': developers_guide/testing_and_ci.md
     - 'Benchmarking': developers_guide/benchmarking.md

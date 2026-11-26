@@ -180,6 +180,7 @@ def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
     )
 
     runner.maybe_select_dummy_loras = lambda *_args, **_kwargs: contextlib.nullcontext()
+    runner.model_adapter = None
     runner.forward_model = MagicMock(
         side_effect=lambda input_ids,
         positions,

@@ -327,6 +327,7 @@ def step_runner(chunks, bucket, forward_model, **overrides):
         _update_num_xla_graphs=lambda *_args: None,
         _prepare_inputs=prepare_inputs,
         forward_model=forward_model,
+        model_adapter=None,
     )
     attributes.update(overrides)
     runner = SimpleNamespace(**attributes)
