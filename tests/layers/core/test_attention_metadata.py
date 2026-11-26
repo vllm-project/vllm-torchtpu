@@ -503,6 +503,39 @@ class TestAttentionMetadataBuilderPlumbing:
         assert ctx.staged_mamba_products is None
         assert ctx.staged_block_tables[0].numel() == 4 * 4
 
+    def test_unchanged_block_tables_reuse_the_upload(self, monkeypatch):
+        """TPU_REUSE_UNCHANGED_BLOCK_TABLES: a walk whose packed tables repeat
+        hands back the previous device copy (no new H2D source); a change
+        uploads again."""
+        from vllm_torchtpu import envs
+
+        monkeypatch.setattr(envs, "TPU_REUSE_UNCHANGED_BLOCK_TABLES", True, raising=False)
+        runner = self._make_runner_mock(num_groups=1)
+        runner._staged_block_tables_reuse = {}
+        self._make_attn_groups(runner, [self._make_builder(runner, 0)])
+
+        def walk():
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=2,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones(4, dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([2, 2, 2], dtype=torch.int32),
+            )
+            stage_block_table_uploads(runner, ctx, 4)
+            return ctx.staged_block_tables[0]
+
+        first = walk()
+        n = len(runner._unfenced_h2d_sources)
+        second = walk()
+        assert len(runner._unfenced_h2d_sources) == n
+        torch.testing.assert_close(second, first, rtol=0, atol=0)
+        runner.input_batch.block_table[0].get_cpu_tensor()[0, 0] += 1
+        third = walk()
+        assert len(runner._unfenced_h2d_sources) == n + 1
+        assert not torch.equal(third, first)
+
     @pytest.mark.parametrize("num_groups", [1, 3])
     def test_each_staged_walk_owns_its_host_buffer(self, num_groups):
         """TorchTPU reads a non-blocking H2D source until the copy drains, so a

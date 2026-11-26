@@ -347,6 +347,7 @@ if TYPE_CHECKING:
     TPU_SPEC_VERIFY_COARSE_PAD: bool = False
     TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES: bool = False
     TPU_SKIP_DEVICE_SAMPLING_METADATA: bool = False
+    TPU_REUSE_UNCHANGED_BLOCK_TABLES: bool = False
     TPU_MINIMAX_M3_KV4_INDEXER_LARGE_BLOCK_Q: int = 0
 
 
@@ -2357,6 +2358,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES. Exact (same tokens).
     "TPU_SKIP_DEVICE_SAMPLING_METADATA": env_bool(
         "TPU_SKIP_DEVICE_SAMPLING_METADATA", default=False
+    ),
+    # The batched block-table upload of a metadata walk reuses the previous
+    # step's device copy while the packed tables are unchanged (they change
+    # only when a request gains or loses a block): one H2D copy fewer per
+    # walk and step, none queued behind KV-offload loads. Exact.
+    "TPU_REUSE_UNCHANGED_BLOCK_TABLES": env_bool(
+        "TPU_REUSE_UNCHANGED_BLOCK_TABLES", default=False
     ),
     # MiniMax M3 4-bit index caches (--kv-cache-dtype int4_per_token_head):
     # query rows per tile of the MSA indexer's large (prefill) class, instead

@@ -1267,6 +1267,9 @@ class TPUModelRunner(GPUModelRunner):
         self._unfenced_h2d_sources: list[tuple[torch.Tensor, Callable[[], None]]] = []
         self._fenced_h2d_sources: list[tuple[torch.Tensor, Callable[[], None]]] = []
         self._free_h2d_sources: dict[tuple[int, torch.dtype], list[torch.Tensor]] = {}
+        # TPU_REUSE_UNCHANGED_BLOCK_TABLES: per metadata walk, the last packed
+        # block tables' bytes and their device copy.
+        self._staged_block_tables_reuse: dict[tuple, tuple[tuple, torch.Tensor]] = {}
         self._registered_h2d_sources: set[int] = set()
         self._cached_query_start_loc: torch.Tensor | None = None
         self._cached_logits_indices: torch.Tensor | None = None
