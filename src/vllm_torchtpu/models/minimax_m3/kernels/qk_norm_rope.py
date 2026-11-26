@@ -91,7 +91,11 @@ def _kernel(
         cos_sin = cos_sin_ref[r, :].astype(jnp.bfloat16)
         cos = dot(cos_sin, factors_ref[0])
         sin = dot(cos_sin, factors_ref[1])
+        # Past the rotary lanes n * 1 + partner * -0 is n, signed zeros
+        # included (partner is +0 there): no select per head.
         lane = jax.lax.broadcasted_iota(jnp.int32, cos.shape, 1)
+        cos = jnp.where(lane < rotary_dim, cos, 1.0)
+        sin = jnp.where(lane < rotary_dim, sin, -0.0)
 
         def norm_rope(col, w_row):
             x = qkv_ref[r, col * d : (col + 1) * d].astype(jnp.float32)
@@ -100,9 +104,7 @@ def _kernel(
             n = x.astype(dtype)
             partner = dot(n.astype(jnp.bfloat16), partner_ref[...])
             n = n.astype(jnp.float32)
-            return jnp.where(lane < rotary_dim, n * cos + partner * sin, n).astype(
-                dtype
-            )
+            return (n * cos + partner * sin).astype(dtype)
 
         def rotated(x):
             # msa_fp4.rotate_queries: one bf16 pass, f32 accumulation, then 1 / D.
