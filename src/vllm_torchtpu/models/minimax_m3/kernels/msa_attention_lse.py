@@ -219,9 +219,14 @@ def _kernel(
         """Copies of ``n`` pages from `page` on into slots ``g ..``: every
         copy of a ring slot signals its one semaphore, so a wait sized to
         ``n`` pages waits for any ``n`` of them."""
-        src = kv_hbm_ref.at[
-            pl.ds(page, n), :, :, pl.ds(head_ref[0] * row_width, row_width)
-        ]
+        if fp4:  # the words of each row: dense [S / 8, W] uint32 in the ring
+            src = kv_hbm_ref.bitcast(jnp.uint32).at[
+                pl.ds(page, n), :, 0, pl.ds(head_ref[0] * row_width, row_width)
+            ]
+        else:
+            src = kv_hbm_ref.at[
+                pl.ds(page, n), :, :, pl.ds(head_ref[0] * row_width, row_width)
+            ]
         copies = [
             pltpu.make_async_copy(
                 src, buf_ref.at[half, pl.ds(g, n), 0], sem_ref.at[half, 0]
@@ -312,7 +317,11 @@ def _kernel(
                 return q_refs[0][...]
             return jnp.concatenate([r[...] for r in q_refs], axis=0)
 
-        rows_per_page, packing, row_width = buf_ref.shape[3:]
+        if fp4:
+            rows_per_page, row_width = buf_ref.shape[3:]
+            packing = 4  # the uint8 cache's; the 4-bit paths do not read it
+        else:
+            rows_per_page, packing, row_width = buf_ref.shape[3:]
         page_size = rows_per_page * (msa_fp4.TOKENS_PER_WORD if fp4 else packing)
         # 8-bit pages of `attend` reach the MXU without an unpack.
         direct = not fp4 and not transposed and packing == 4
@@ -1247,10 +1256,18 @@ def _kernel_scratch(
     else:
         softmax = [(rows, 1), (rows, 1), (rows, head_dim)]
     scratch = [pltpu.VMEM(shape, jnp.float32) for shape in softmax]
+    # A 4-bit page lands as its rows' 32-bit words: the uint8 [S / 8, 4, W]
+    # page bitcast in VMEM to [S / 8, W] words cost two relayouts per page
+    # (AOT, 4-group unit body of 32-page groups: 6,358 -> 5,530 bundles).
+    page_shape = (
+        (rows_per_page, 2 * head_dim)
+        if scale_cache is not None
+        else (rows_per_page, packing, 2 * head_dim)
+    )
     scratch += [
         pltpu.VMEM(
-            (ring, pages_per_step, 1, rows_per_page, packing, 2 * head_dim),
-            kv_cache.dtype,
+            (ring, pages_per_step, 1, *page_shape),
+            jnp.uint32 if scale_cache is not None else kv_cache.dtype,
         ),
         pltpu.SemaphoreType.DMA((ring, 1)),
     ]

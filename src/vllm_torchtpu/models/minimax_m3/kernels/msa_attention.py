@@ -229,12 +229,16 @@ def _bitcast_slots(rows_per_page: int, packing: int) -> jax.Array:
 
 
 def _fp4_page(kv_ref, scale_ref, k_row, v_row):
-    """4-bit page (uint8 ``[1, S / 8, 4, 2D]``, `msa_fp4`) -> unscaled bf16
+    """4-bit page (uint8 ``[1, S / 8, 4, 2D]``, `msa_fp4`, or its words as
+    uint32 ``[1, S / 8, 2D]``) -> unscaled bf16
     rows ``[S, 2D]`` in slot order, and its K / V scales (scale-page rows
     `k_row` / `v_row`, static ints or run-time scalars) as ``[1, S]`` lane
     vectors. An unwritten slot's scale may be any bits: non-finite reads 0
     (int4 data itself has no NaN code)."""
-    words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
+    if kv_ref.dtype == jnp.uint32:  # the page's words, [1, S / 8, 2D]
+        words = kv_ref[0]
+    else:
+        words = kv_ref.bitcast(jnp.uint32)[0, :, 0, :]
     rows = pltpu.bitcast(words, jnp.int4).astype(jnp.bfloat16)
     if isinstance(k_row, int):  # static rows
         page = scale_ref[0]  # [R, S]
