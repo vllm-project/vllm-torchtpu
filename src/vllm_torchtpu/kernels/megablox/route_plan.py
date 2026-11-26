@@ -60,6 +60,8 @@ _MOVE_BITS = 7
 _PAYLOAD_BITS = 32 - _MOVE_BITS
 # Expert ids span the signed 16-bit field of a routing word.
 _ID_LIMIT = 1 << 15
+# float32 1.0: the scale past the sorted routes.
+_ONE_F32_BITS = 0x3F800000
 # The owner order's key of a route that names no expert of the mesh, plus k.
 _UNROUTED_KEY = 1 << 24
 
@@ -88,6 +90,7 @@ class LocalRoutePlan(NamedTuple):
     dest_row: jax.Array  # [routes] (0 past the routes)
     row_scale: jax.Array | None  # [rows] f32 (1 where no token lands)
     owner: OwnerPlan | None
+    route_scale: jax.Array | None = None  # [routes] f32 (1 past the routes)
 
 
 class _Dests(NamedTuple):
@@ -217,33 +220,35 @@ def _flat_scan_excl(x):
     return _sublane_scan_excl(totals) + incl - x
 
 
-def _expand(payload, extra, distinct, total, *, topk):
+def _expand(payloads, extra, distinct, total, *, topk):
     """The sorted routes from one entry per distinct key: entry ``q`` (of
-    ``distinct``) stands for ``extra[q] + 1`` equal routes. Each entry moves
-    ``g`` positions later (``g`` the extra routes before it; high bits first,
-    so the entries never meet), then the empty positions below ``total`` take
-    the entry before them."""
-    flat = jax.lax.broadcasted_iota(
-        I32, payload.shape, 0
-    ) * _LANES + jax.lax.broadcasted_iota(I32, payload.shape, 1)
+    ``distinct``) stands for ``extra[q] + 1`` equal routes. Each entry (of
+    every array in ``payloads``) moves ``g`` positions later (``g`` the extra
+    routes before it; high bits first, so the entries never meet), then the
+    empty positions below ``total`` take the entry before them."""
+    shape = payloads[0].shape
+    flat = jax.lax.broadcasted_iota(I32, shape, 0) * _LANES + jax.lax.broadcasted_iota(
+        I32, shape, 1
+    )
     live = (flat < distinct).astype(I32)
-    payload = jnp.where(live != 0, payload, 0)
+    payloads = [jnp.where(live != 0, p, 0) for p in payloads]
     g = _flat_scan_excl(jnp.where(live != 0, extra, 0))
-    for b in reversed(range((payload.size - 1).bit_length())):
+    for b in reversed(range((payloads[0].size - 1).bit_length())):
         d = 1 << b
         moves = (live != 0) & ((g & d) != 0)
         arrives = _flat_shift(moves.astype(I32), d, flat) != 0
-        payload = jnp.where(
-            arrives, _flat_shift(payload, d, flat), jnp.where(moves, 0, payload)
-        )
+        payloads = [
+            jnp.where(arrives, _flat_shift(p, d, flat), jnp.where(moves, 0, p))
+            for p in payloads
+        ]
         g = jnp.where(arrives, _flat_shift(g, d, flat), jnp.where(moves, 0, g))
         live = jnp.where(arrives, 1, jnp.where(moves, 0, live))
     d = 1
     while d < topk:
-        payload = jnp.where(live != 0, payload, _flat_shift(payload, d, flat))
+        payloads = [jnp.where(live != 0, p, _flat_shift(p, d, flat)) for p in payloads]
         live = live | _flat_shift(live, d, flat)
         d *= 2
-    return payload
+    return payloads
 
 
 def _kernel(
@@ -261,12 +266,16 @@ def _kernel(
     rows,
     with_scale,
     owner_plan,
+    route_scale,
 ):
     refs = list(refs)
     scale_ref = refs.pop(0) if with_scale else None
     tok_ref, mem_ref, row_ref, gs_ref = refs[:4]
     rs_ref = refs[4] if with_scale else None
     owner_refs = refs[4 + with_scale : 12 + with_scale] if owner_plan else None
+    if route_scale:
+        scale_dense_ref = refs.pop()
+        scale_rot_ref = refs.pop()
     if owner_plan:
         owned_ref = refs.pop()
     slabs_ref, pad_ref, rot_ref, key_ref, dense_ref, extra_ref = refs[-6:]
@@ -399,12 +408,13 @@ def _kernel(
     def count_mxu(lhs, rhs):
         return jnp.dot(lhs, rhs, preferred_element_type=jnp.float32).astype(I32)
 
-    def sort_rows(value):
+    def sort_rows(value, carried=None):
         """Per (local expert, row of tokens): ``value(e, count)`` of the
         tokens with a computed route to expert ``e``, compacted and rotated to
         where the row's run starts in the sorted order (`rot_ref`), and each
-        lane's sorted row (`key_ref`, -1: none). Returns the distinct sort
-        keys."""
+        lane's sorted row (`key_ref`, -1: none). ``carried``: one more int32
+        per token, moved the same way (into `scale_rot_ref`). Returns the
+        distinct sort keys."""
         counts = [counter(computed, e) for e in range(num_local)]
         live = jnp.concatenate([(c > 0).astype(I32) for c in counts])
         rank_in_row = count_mxu(live.astype(jnp.bfloat16), upper)
@@ -416,21 +426,27 @@ def _kernel(
         run = count_mxu(lower, rows_n)
         payload = jnp.concatenate([value(e, c) for e, c in enumerate(counts)])
         move = jnp.where(live != 0, lane + 1 - rank_in_row, 0)
-        word, _ = _compact(
+        vals = []
+        if carried is not None:
+            vals = [jnp.where(live != 0, jnp.concatenate([carried] * num_local), 0)]
+        word, vals = _compact(
             jnp.where(live != 0, payload | (move << _PAYLOAD_BITS), 0),
+            vals,
             at=_PAYLOAD_BITS,
         )
         amount = run & (_LANES - 1)
         rot_ref[...] = _rotate(word & ((1 << _PAYLOAD_BITS) - 1), amount)
+        if carried is not None:
+            scale_rot_ref[...] = _rotate(vals[0], amount)
         i = (lane - amount) & (_LANES - 1)
         key_ref[...] = jnp.where(i < n, (run + i) >> 7, -1)
         return jnp.max(run + n)
 
-    def place(out_ref, distinct):
+    def place(out_ref, distinct, src_ref=rot_ref):
         """The rotated rows summed into the sorted rows they cover."""
 
         def body(d, carry):
-            hit = jnp.where(key_ref[...] == d, rot_ref[...], 0)
+            hit = jnp.where(key_ref[...] == d, src_ref[...], 0)
             out_ref[pl.ds(d, 1), :] = hit.sum(axis=0, keepdims=True)
             return carry
 
@@ -443,8 +459,13 @@ def _kernel(
         group = jnp.where(sort_lane[:1] == e, size, group)
     gs_ref[...] = group[0, :num_local]
     total = jnp.sum(group)
-    distinct = sort_rows(lambda e, count: base + earlier_local(e) * dests.row_step)
+    distinct = sort_rows(
+        lambda e, count: base + earlier_local(e) * dests.row_step,
+        scale[0] if route_scale else None,
+    )
     place(dense_ref, distinct)
+    if route_scale:
+        place(scale_dense_ref, distinct, scale_rot_ref)
 
     @pl.when(total != distinct)
     def _():
@@ -452,9 +473,14 @@ def _kernel(
         # sort key and take consecutive positions.
         sort_rows(lambda e, count: count - 1)
         place(extra_ref, distinct)
-        dense_ref[...] = _expand(
-            dense_ref[...], extra_ref[...], distinct, total, topk=topk
+        expanded = [dense_ref]
+        if route_scale:
+            expanded.append(scale_dense_ref)
+        values = _expand(
+            [r[...] for r in expanded], extra_ref[...], distinct, total, topk=topk
         )
+        for r, v in zip(expanded, values, strict=True):
+            r[...] = v
 
     flat = jax.lax.broadcasted_iota(
         I32, dense_ref.shape, 0
@@ -469,6 +495,11 @@ def _kernel(
         (row_ref, jnp.where(sorted_route, dense & row_mask, 0)),
     ):
         ref[...] = value[:num_out].reshape(-1)
+    if route_scale:
+        bits = jnp.where(sorted_route, scale_dense_ref[...], _ONE_F32_BITS)
+        rs_ref[...] = jax.lax.bitcast_convert_type(bits[:num_out], jnp.float32).reshape(
+            -1
+        )
 
     if owner_refs is not None:
         _owner_plan_arrays(
@@ -484,7 +515,7 @@ def _kernel(
             tp_size=tp_size,
             skip_padded=skip_padded,
         )
-    if rs_ref is None:
+    if rs_ref is None or route_scale:
         return
     # Each receive row's token scale, as the sorted routes: the reaching
     # tokens' scales compacted per row and rotated to their receive rows.
@@ -628,6 +659,7 @@ def _owner_plan_arrays(
         "rows",
         "routes",
         "owner_plan",
+        "route_scale",
         "interpret",
     ),
 )
@@ -644,6 +676,7 @@ def local_route_plan(
     rows: int,
     routes: int,
     owner_plan: bool = False,
+    route_scale: bool = False,
     interpret: bool = False,
 ) -> LocalRoutePlan:
     """`route_plan` with `owner_dests` (``owner``) or `streamed_dests`, from
@@ -660,6 +693,10 @@ def local_route_plan(
     ``skip_padded``: a route with a zero weight is not computed.
     ``owner_plan`` (with ``owner``): also the owner combine's arrays
     (`OwnerPlan`), for bf16 activations.
+    ``route_scale`` (with ``scale``): the scales come per sorted route
+    (``route_scale[j]`` = the scale of route ``j``'s token, the receive-row
+    scale at ``token_sorted[j]``), for a consumer whose rows land in route
+    order, instead of per receive row (``row_scale`` is None).
 
     Same arrays as `route_plan` (and the scale scatter of
     `_capacity_exchange`, `owner_plan`) on a step that fits; past the sorted
@@ -688,6 +725,7 @@ def local_route_plan(
     out_rows = -(-routes // _LANES)
     dense_rows = -(-out_rows // _SUBLANES) * _SUBLANES
     with_scale = scale is not None
+    assert with_scale or not route_scale
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     smem = pl.BlockSpec(memory_space=pltpu.SMEM)
     operands = [ep_rank.astype(I32), fits.astype(I32), words]
@@ -697,9 +735,8 @@ def local_route_plan(
     out_specs = [vmem] * len(out_shape)
     if with_scale:
         operands.append(jax.lax.bitcast_convert_type(scale, I32))
-        out_shape.append(
-            jax.ShapeDtypeStruct((-(-rows // _LANES) * _LANES,), jnp.float32)
-        )
+        scale_len = out_rows if route_scale else -(-rows // _LANES)
+        out_shape.append(jax.ShapeDtypeStruct((scale_len * _LANES,), jnp.float32))
         out_specs.append(vmem)
     if owner_plan:
         blk = -(-num_tokens // tp_size)
@@ -724,6 +761,7 @@ def local_route_plan(
             rows=rows,
             with_scale=with_scale,
             owner_plan=owner_plan,
+            route_scale=route_scale,
         ),
         out_shape=out_shape,
         in_specs=[smem, smem] + [vmem] * (len(operands) - 2),
@@ -740,6 +778,14 @@ def local_route_plan(
             [pltpu.VMEM((-(-topk // _SUBLANES) * _SUBLANES, _LANES), I32)]
             if owner_plan
             else []
+        )
+        + (
+            [
+                pltpu.VMEM((local_num_experts * sort_rows, _LANES), I32),
+                pltpu.VMEM((dense_rows, _LANES), I32),
+            ]
+            if route_scale
+            else []
         ),
         interpret=interpret,
         name=(
@@ -749,8 +795,14 @@ def local_route_plan(
     )(*operands)
     # Whole lane rows; a slice only where the sizes are not.
     token_sorted, dest_member, dest_row = (o[:routes] for o in outs[:3])
-    row_scale = outs[4][:rows] if with_scale else None
+    row_scale = outs[4][:rows] if with_scale and not route_scale else None
     owner_arrays = OwnerPlan(*outs[4 + with_scale :]) if owner_plan else None
     return LocalRoutePlan(
-        token_sorted, outs[3], dest_member, dest_row, row_scale, owner_arrays
+        token_sorted,
+        outs[3],
+        dest_member,
+        dest_row,
+        row_scale,
+        owner_arrays,
+        outs[4][:routes] if route_scale else None,
     )

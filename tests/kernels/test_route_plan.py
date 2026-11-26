@@ -155,6 +155,33 @@ def check(words, ep, fits, scale, interpret, **kw):
             np.asarray(row_scale).view(np.int32),
             "row_scale",
         )
+    assert got.route_scale is None
+    by_route = local_route_plan(
+        words,
+        jnp.array([ep], jnp.int32),
+        jnp.array([int(fits)], jnp.int32),
+        scale,
+        local_num_experts=kw["local"],
+        tp_size=kw["tp_size"],
+        owner=kw["owner"],
+        skip_padded=kw["skip"],
+        rows=kw["rows"],
+        routes=kw["routes"],
+        interpret=interpret,
+        route_scale=True,
+    )
+    assert by_route.row_scale is None
+    for name in ("token_sorted", "group_sizes", "dest_member", "dest_row"):
+        np.testing.assert_array_equal(
+            getattr(by_route, name), getattr(got, name), f"{name} by route"
+        )
+    want_route_scale = np.ones((kw["routes"],), np.float32)
+    want_route_scale[:n] = np.asarray(row_scale)[np.asarray(token_sorted)[:n]]
+    np.testing.assert_array_equal(
+        np.asarray(by_route.route_scale).view(np.int32),
+        want_route_scale.view(np.int32),
+        "route_scale",
+    )
     if not kw["owner"]:
         assert got.owner is None
         return
