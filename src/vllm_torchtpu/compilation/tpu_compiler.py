@@ -841,6 +841,28 @@ class TpuCompilerAdaptor(CompilerInterface):
                 os.remove(tmp)
         return mine
 
+    def _earlier_artifact(self, key: str, fingerprint: str) -> str | None:
+        """The artifact that an earlier run's claim for `(key, fingerprint)`
+        names, if it is on disk.
+
+        Ranks that load a range from vLLM's cache make no claim, so a rank
+        whose own entry is missing would otherwise compile the range again,
+        or wait for an owner that never comes. `_replay` still checks the
+        artifact's fingerprint, since it may have been saved over since.
+        """
+        claim_dir = self._claim_dir()
+        if claim_dir is None:
+            return None
+        claim = os.path.join(claim_dir, f"{key}.{fingerprint}")
+        try:
+            if os.path.getmtime(claim) >= _PROCESS_START:
+                return None
+            with open(claim) as f:
+                owner = f.read()
+        except OSError:
+            return None
+        return owner if owner and os.path.exists(owner) else None
+
     def _claims(self, key: str) -> dict[str, str]:
         """The owner's artifact path of each claim made this run for `key`,
         by fingerprint."""
@@ -912,12 +934,19 @@ class TpuCompilerAdaptor(CompilerInterface):
         never loads one built from another graph. When only claims for other
         fingerprints appear (e.g. by a rank of another TP subgroup, whose
         collectives run on other devices), it claims the bucket itself, and
-        the other ranks of its subgroup replay its artifact. Returns the
+        the other ranks of its subgroup replay its artifact. Before any of
+        that, it replays the artifact that an earlier run's claim for this
+        fingerprint names, if that artifact is still on disk. Returns the
         runnable and the owner's path, or None to compile here: this rank owns
         the bucket, the owner left a marker saying it will not save it, or
         nothing came in time.
         """
         assert self.cache_dir is not None
+        earlier = self._earlier_artifact(key, fingerprint)
+        if earlier is not None:
+            compiled_fn = self._replay(earlier, graph, was_wrapped, fingerprint)
+            if compiled_fn is not None:
+                return compiled_fn, earlier
         mine = os.path.join(self.cache_dir, key)
         deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
         while True:

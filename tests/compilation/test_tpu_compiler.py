@@ -1647,6 +1647,58 @@ class TestTpuCompilerCache:
         with open(claims / claim) as f:
             assert f.read() == os.path.join(b.cache_dir, "artifact_bucket")
 
+    def test_an_earlier_runs_artifact_is_replayed_at_once(self, tmp_path, monkeypatch):
+        """When an earlier run's claim names an artifact that is still on disk,
+        a rank whose own entry is missing replays it at once: it neither
+        waits for an owner of this run (the ranks that load the range from
+        vLLM's cache make no claim) nor compiles the range again."""
+        import time
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a)
+        claims = tmp_path / "hash" / "peer_claims" / "backbone"
+        [claim] = os.listdir(claims)
+        old = tpu_compiler._PROCESS_START - 3600
+        os.utime(claims / claim, (old, old))
+        start = time.monotonic()
+        with wait_for_peer_artifact(30.0):
+            fn, handle = compile(b)
+        assert time.monotonic() - start < 10.0
+        assert compiled == [0]
+        assert fn() == "entry-from-rank-0"
+        assert os.path.samefile(handle[1], os.path.join(a.cache_dir, "artifact_bucket"))
+        # The claim is left as it was: nothing of this run took it over.
+        assert os.path.getmtime(claims / claim) == old
+
+    def test_an_earlier_runs_artifact_of_another_graph_is_not_replayed(
+        self, tmp_path, monkeypatch
+    ):
+        """An earlier claim whose artifact was since saved over by another
+        graph is not replayed: the rank claims and compiles the range."""
+        import torch
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a)
+        claims = tmp_path / "hash" / "peer_claims" / "backbone"
+        [claim] = os.listdir(claims)
+        old = tpu_compiler._PROCESS_START - 3600
+        os.utime(claims / claim, (old, old))
+        # Rank 0 saves another graph over the artifact the claim names.
+        compile(a, graph=torch.fx.symbolic_trace(lambda x: x * 3 - 1))
+        for c in os.listdir(claims):
+            os.utime(claims / c, (old, old))
+        compile(b)
+        assert compiled == [0, 0, 1]
+
 
 def test_deserialize_entry_does_not_copy_the_entry():
     """Replay rebuilds the runnable from the entry itself: a deepcopy would load
