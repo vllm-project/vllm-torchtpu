@@ -1372,7 +1372,7 @@ def _prefill_candidates_kernel(
     rows_ref,  # [rows + Bq, 2 * topk] f32 the candidates being assembled
     small_buf,  # [small tiles * Bs, 2 * topk] f32
     copy_sems,  # DMA [2]: small-class candidates in, candidates out
-    *,
+    *key_cache,  # [P, S / 4, D] the request's pages' fp8 MXU keys, if cacheable
     pick,
     chunk,
 ):
@@ -1424,6 +1424,13 @@ def _prefill_candidates_kernel(
         )
         keys_ref[pl.ds(col0, m.shape[0]), :] = _float_keys(keys, col_bits)
 
+    def cached(w):
+        # A request's tiles are consecutive: all but its first find its
+        # pages' keys in `key_cache`.
+        t = work_ref[w] >> tile_shift
+        prev = tile_info_ref[jnp.maximum(t - 1, 0)]
+        return (t > 0) & ((prev & seq_mask) == (tile_info_ref[t] & seq_mask))
+
     msa_indexer._kernel_v3(
         work_ref,
         tile_info_ref,
@@ -1436,6 +1443,8 @@ def _prefill_candidates_kernel(
         sems,
         store=store,
         slot_bodies=False,
+        key_cache=key_cache[0] if key_cache else None,
+        cached=cached,
     )
 
     def put_rows(info, picked, live=True):
@@ -1528,13 +1537,17 @@ _PREFILL_VMEM_BYTES = 40 << 20
 
 
 def _prefill_vmem_bytes(plan, index_cache, small_rows: int, num_rows: int) -> int:
-    """VMEM of `_prefill_candidates`: the page ring, the tile's keys, the
-    query tile (double-buffered), the assembled output and the small class's
-    picks, whose [rows, 2 * topk] f32 pad to 128 lanes."""
+    """VMEM of `_prefill_candidates`: the page ring, the request's fp8 keys,
+    the tile's pick keys, the query tile (double-buffered), the assembled
+    output and the small class's picks, whose [rows, 2 * topk] f32 pad to 128
+    lanes."""
     _, rows_per_page, _, head_dim = index_cache.shape
     block_q = plan.large_block_q
     ring = msa_indexer._RING_SLOTS * plan.large_pages_per_step * rows_per_page
-    return 4 * (
+    page_size = msa_indexer._page_tokens(rows_per_page, index_cache.dtype)
+    cacheable = msa_indexer.keys_cacheable(block_q, rows_per_page, index_cache.dtype)
+    key_cache = plan.large_pages * page_size * head_dim if cacheable else 0
+    return key_cache + 4 * (
         ring * head_dim
         + plan.large_pages * block_q
         + 2 * block_q * head_dim
@@ -1618,6 +1631,7 @@ def _prefill_candidates(
     width = small_packed.shape[1]
     assembled_rows = num_rows + block_q
     ring = (msa_indexer._RING_SLOTS, pages_per_step, rows_per_page, head_dim)
+    page_size = msa_indexer._page_tokens(rows_per_page, index_cache.dtype)
     chunk = _prefill_chunk(plan, index_cache)
     scratch = [
         pltpu.VMEM(ring, jnp.uint32),
@@ -1629,6 +1643,8 @@ def _prefill_candidates(
         pltpu.VMEM(small_packed.shape, jnp.float32),
         pltpu.SemaphoreType.DMA((2,)),
     ]
+    if msa_indexer.keys_cacheable(block_q, rows_per_page, index_cache.dtype):
+        scratch.append(pltpu.VMEM((num_cols, page_size // 4, head_dim), jnp.uint32))
     vmem_bytes = _prefill_vmem_bytes(plan, index_cache, small_packed.shape[0], num_rows)
     return pl.pallas_call(
         functools.partial(_prefill_candidates_kernel, pick=pick, chunk=chunk),

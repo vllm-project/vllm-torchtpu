@@ -360,6 +360,19 @@ def _chunk_maxima_t(
     return jnp.concatenate([m[:block_q], m[block_q:]], axis=1)
 
 
+def keys_cacheable(block_q: int, rows_per_page: int, dtype) -> bool:
+    """Whether `_kernel_v3` scores `block_q`-row tiles of these pages
+    token-major from fp8 MXU keys converted from folded 4-bit pages, which a
+    `key_cache` can hold. (fp8 pages enter the MXU as stored: cached, the
+    c4 / c16 prefill candidates ran 4% slower.)"""
+    return (
+        FP8_MXU_QUERIES
+        and block_q > DEFAULT_BLOCK_Q
+        and msa_fp4.scales_in_page(rows_per_page, dtype)
+        and not _scores_transposed(block_q, rows_per_page, dtype)
+    )
+
+
 def _v3_chunk(pages_per_step: int, block_q: int, page_size: int) -> int:
     """Pages per dot of `_kernel_v3`: the f32 ``[chunk / 2 * S, 2 Bq]``
     product within twice `_MAX_SCORE_ELEMS`."""
@@ -388,6 +401,8 @@ def _kernel_v3(
     store=None,
     after_wait=None,
     slot_bodies=True,
+    key_cache=None,
+    cached=None,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -413,6 +428,12 @@ def _kernel_v3(
     Without `slot_bodies` the bodies index the ring slot dynamically, one per
     count of scored chunks rather than per slot and count: a third of the
     code, for groups of many chunks.
+
+    `key_cache` (``[pages, S / 4, D]`` u32 VMEM, packed as fp8 pages) keeps
+    the MXU keys of a request's pages (`keys_cacheable`), page group `g` at
+    ``g * pages_per_step``, for the tiles after its first: a work item `w`
+    with ``cached(w)`` copies no pages and scores the keys its request's
+    first tile stored, the same keys.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -420,6 +441,8 @@ def _kernel_v3(
     folded = msa_fp4.scales_in_page(rows, cache_ref.dtype)
     page_size = _page_tokens(rows, cache_ref.dtype)
     chunk = _v3_chunk(pages_per_step, block_q, page_size)
+    if key_cache is not None and not keys_cacheable(block_q, rows, cache_ref.dtype):
+        raise NotImplementedError("key_cache: folded 4-bit token-major tiles only")
     pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
     # The pages as 32-bit words: a dense VMEM layout, so each key vreg is one
@@ -470,9 +493,13 @@ def _kernel_v3(
             )
 
     def ahead_group(k):
-        """(first entry, live pages) of work item `k`; none past the grid."""
+        """(first entry, live pages) of work item `k`; none past the grid or
+        cached."""
         k_base, k_live = group(jnp.minimum(k, num_steps - 1))
-        return k_base, jnp.where(k < num_steps, k_live, 0)
+        copies = k < num_steps
+        if key_cache is not None:
+            copies &= jnp.logical_not(cached(jnp.minimum(k, num_steps - 1)))
+        return k_base, jnp.where(copies, k_live, 0)
 
     @pl.when(step == 0)
     def _():
@@ -489,6 +516,7 @@ def _kernel_v3(
         jnp.clip(q_pair, -448, 448).astype(jnp.float8_e4m3fn) if fp8_queries else None
     )
     num_chunks = pages_per_step // chunk
+    group_page = (work_ref[step] & _GROUP_MASK) * pages_per_step
 
     def put(first, m, rows_major):
         """Store maxima ``m``: ``[Bq, chunk]`` if `rows_major`, else ``[chunk, Bq]``."""
@@ -505,9 +533,10 @@ def _kernel_v3(
     issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
     per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
-    def score_chunk(slot, first, share):
+    def score_chunk(slot, first, share, hit=False):
         """Score pages ``[first, first + chunk)``, issuing the ahead group's
-        descriptors `share` among the first page pairs (`start`)."""
+        descriptors `share` among the first page pairs (`start`); from
+        `key_cache` if `hit`."""
 
         def issue(j):
             if j < chunk // 2:
@@ -517,6 +546,18 @@ def _kernel_v3(
                     share[j * per_pair : (j + 1) * per_pair],
                     (slot + ahead) % slots,
                 )
+
+        fp8_mxu = fp8_queries and (folded or cache_ref.dtype == jnp.float8_e4m3fn)
+        if hit:
+
+            def cached_keys(j):
+                issue(j)
+                return pltpu.bitcast(
+                    key_cache[group_page + first + j], jnp.float8_e4m3fn
+                )
+
+            put(first, _chunk_maxima(q_pair_fp8, cached_keys, chunk), rows_major=False)
+            return
 
         if _scores_transposed(block_q, rows, cache_ref.dtype):
             m = _chunk_maxima_t(
@@ -548,9 +589,13 @@ def _kernel_v3(
                 jnp.isfinite(scale_rows) & (page < live), scale_rows, 0.0
             ).T.astype(jnp.bfloat16)  # [S, chunk]
 
-        fp8_mxu = fp8_queries and (folded or cache_ref.dtype == jnp.float8_e4m3fn)
-
         def page_keys(j):
+            k = keys_of(j)
+            if key_cache is not None:
+                key_cache[group_page + first + j] = pltpu.bitcast(k, jnp.uint32)
+            return k
+
+        def keys_of(j):
             issue(j)
             if folded:
                 k = pltpu.bitcast(buf[slot, first + j, : rows - 1], jnp.int4)
@@ -573,11 +618,12 @@ def _kernel_v3(
 
     share = per_pair * (chunk // 2)
 
-    def body(slot, scored):
+    def body(slot, scored, hit=False):
         """Score the group's first `scored` chunks; the rest are past the
         request's last page (their scores are never read) and only issue
         their share of the ahead group's descriptors."""
-        wait_pages(live, slot)
+        if not hit:
+            wait_pages(live, slot)
         if after_wait is not None:
             after_wait(slot)
         for c in range(num_chunks):
@@ -585,7 +631,7 @@ def _kernel_v3(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
             )
             if c < scored:
-                score_chunk(slot, c * chunk, pages)
+                score_chunk(slot, c * chunk, pages, hit)
             else:
                 start(next_base, next_live, pages, (slot + ahead) % slots)
 
@@ -593,9 +639,13 @@ def _kernel_v3(
     # chunk's matmuls overlap the previous chunk's maxima.
     counts = sorted({num_chunks} | {2**k for k in range(1, 8) if 2**k < num_chunks})
     live_chunks = jnp.minimum(-(-live // chunk), num_chunks)
+    hit = False if key_cache is None else cached(step)
     for i, n in enumerate(counts):
         lo = counts[i - 1] if i else 0
         in_count = (live_chunks > lo) & (live_chunks <= n)
+        if key_cache is not None:
+            pl.when(in_count & hit)(functools.partial(body, step % slots, n, True))
+            in_count &= jnp.logical_not(hit)
         if not slot_bodies:
             pl.when(in_count)(functools.partial(body, step % slots, n))
             continue
