@@ -141,7 +141,28 @@ def test_resolve_local_slicebuilder_host_raises_when_unresolvable(monkeypatch):
         sb.resolve_local_slicebuilder_host("2001:db8::dead")
 
 
-def test_validate_slicebuilder_hosts_accepts_distinct_and_rejects_duplicates():
+def _fake_dns(monkeypatch, dns_map):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, *a, **kw: (
+            [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (dns_map[host], 0, 0, 0))]
+            if host in dns_map
+            else (_ for _ in ()).throw(socket.gaierror(f"unknown {host}"))
+        ),
+    )
+
+
+def test_validate_slicebuilder_hosts_accepts_distinct_and_rejects_duplicates(
+    monkeypatch,
+):
+    _fake_dns(
+        monkeypatch,
+        {
+            "host-0.svc.cluster.local": "2001:db8::1",
+            "host-1.svc.cluster.local": "2001:db8::2",
+        },
+    )
     assert sb.validate_slicebuilder_hosts(
         ["2001:db8::1", "2001:db8::2"],
         ["host-0.svc.cluster.local", "host-1.svc.cluster.local"],
@@ -167,6 +188,48 @@ def test_validate_slicebuilder_hosts_accepts_distinct_and_rejects_duplicates():
 
     with pytest.raises(ValueError, match="does not match"):
         sb.validate_slicebuilder_hosts(["10.0.0.1", "10.0.0.2"], ["10.0.0.1"])
+
+
+def test_validate_slicebuilder_hosts_rejects_name_only_its_owner_resolves(
+    monkeypatch,
+):
+    # host-1 is only in its owner's /etc/hosts: this peer cannot resolve it,
+    # and a name resolving to loopback is rejected too.
+    _fake_dns(
+        monkeypatch,
+        {"host-0.svc.cluster.local": "2001:db8::1", "host-2.local": "::1"},
+    )
+    monkeypatch.setattr(sb, "_PEER_RESOLVE_TIMEOUT_S", 0.0)
+    with pytest.raises(ValueError, match="host-1.internal.*host-2.local"):
+        sb.validate_slicebuilder_hosts(
+            ["2001:db8::1", "2001:db8::2", "2001:db8::3"],
+            ["host-0.svc.cluster.local", "host-1.internal", "host-2.local"],
+        )
+
+
+def test_validate_slicebuilder_hosts_retries_until_peer_dns_publishes(monkeypatch):
+    lookups = {"host-1.svc.cluster.local": 0}
+    real_dns = {
+        "host-0.svc.cluster.local": "2001:db8::1",
+        "host-1.svc.cluster.local": "2001:db8::2",
+    }
+
+    def _getaddrinfo(host, *a, **kw):
+        if host in lookups:
+            lookups[host] += 1
+            if lookups[host] < 3:
+                raise socket.gaierror("NXDOMAIN")
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (real_dns[host], 0, 0, 0))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+    sleeps: list[float] = []
+    monkeypatch.setattr(sb.time, "sleep", sleeps.append)
+    assert sb.validate_slicebuilder_hosts(
+        ["2001:db8::1", "2001:db8::2"],
+        ["host-0.svc.cluster.local", "host-1.svc.cluster.local"],
+    ) == ["host-0.svc.cluster.local", "host-1.svc.cluster.local"]
+    assert lookups["host-1.svc.cluster.local"] == 3
+    assert sleeps == [sb._PEER_RESOLVE_RETRY_INTERVAL_S] * 2
 
 
 def test_node_identity_probe_pickles_by_value_without_heavy_imports():

@@ -293,12 +293,13 @@ def test_rendezvous_publishes_local_lws_ipv6_hostname(monkeypatch):
     worker1_dns = "vllm-lws-0-1.vllm-lws.default.svc.cluster.local"
     monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
     monkeypatch.setenv("LWS_WORKER_INDEX", "1")
+    dns_map = {leader_dns: "2001:db8::9", worker1_dns: "2001:db8::a"}
     monkeypatch.setattr(
         socket,
         "getaddrinfo",
         lambda host, *a, **kw: (
-            [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::a", 0, 0, 0))]
-            if host == worker1_dns
+            [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (dns_map[host], 0, 0, 0))]
+            if host in dns_map
             else (_ for _ in ()).throw(socket.gaierror(f"unknown {host}"))
         ),
     )

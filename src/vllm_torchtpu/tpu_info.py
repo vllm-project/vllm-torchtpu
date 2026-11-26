@@ -186,6 +186,8 @@ def get_node_worker_id() -> int:
         return int(worker_id)
     if envs.LWS_WORKER_INDEX is not None:
         return envs.LWS_WORKER_INDEX
+    if envs.LWS_LEADER_ADDRESS:
+        return 0
     worker_id = get_tpu_metadata(key="agent-worker-number")
     if worker_id is None:
         return 0

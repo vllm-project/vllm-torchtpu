@@ -19,9 +19,16 @@ hostname substitution workaround once TorchTPU accepts bracketed
 """
 
 import ipaddress
+import socket
+import time
 from collections.abc import Callable
 
 from vllm_torchtpu import envs
+
+# A pod's own name is in its /etc/hosts before cluster DNS publishes it, and an
+# early miss can be negatively cached, so peers retry failed lookups briefly.
+_PEER_RESOLVE_TIMEOUT_S = 30.0
+_PEER_RESOLVE_RETRY_INTERVAL_S = 2.0
 
 _LOOPBACK_HOSTNAMES = frozenset(
     {
@@ -58,6 +65,42 @@ def lws_pod_hostname(leader_address: str, worker_index: int) -> str:
 def _is_usable_hostname(hostname: str) -> bool:
     name = hostname.strip().rstrip(".").lower()
     return bool(name) and ":" not in name and name not in _LOOPBACK_HOSTNAMES
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _resolves_to_non_loopback(hostname: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    for info in infos:
+        addr = info[4][0] if info[4] else None
+        if not isinstance(addr, str):
+            continue
+        try:
+            if not ipaddress.ip_address(normalize_ip(addr)).is_loopback:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _unresolvable_hostnames(hosts: list[str]) -> list[str]:
+    """Return the hostnames this process cannot resolve to a non-loopback address."""
+    pending = [h for h in hosts if not _is_ip_literal(h)]
+    deadline = time.monotonic() + _PEER_RESOLVE_TIMEOUT_S
+    while True:
+        pending = [h for h in pending if not _resolves_to_non_loopback(h)]
+        if not pending or time.monotonic() >= deadline:
+            return pending
+        time.sleep(_PEER_RESOLVE_RETRY_INTERVAL_S)
 
 
 def make_node_identity_probe() -> Callable[[str, str], tuple[int | None, str | None]]:
@@ -212,5 +255,15 @@ def validate_slicebuilder_hosts(host_ips: list[str], sb_hosts: list[str]) -> lis
             "Multiple slice hosts resolved to the same slicebuilder host "
             f"{sorted(set(duplicates))} (full list: {cleaned}); each host "
             "must publish a distinct address."
+        )
+
+    # Each host checked only that its own resolver knows its name; peers must
+    # resolve it too (an /etc/hosts-only name would pass the owner's check).
+    unresolvable = _unresolvable_hostnames(cleaned)
+    if unresolvable:
+        raise ValueError(
+            f"Slicebuilder hosts {unresolvable} do not resolve to a non-loopback "
+            f"address from this host after {_PEER_RESOLVE_TIMEOUT_S:.0f}s; every "
+            "slice host must be resolvable through DNS shared by all peers."
         )
     return cleaned

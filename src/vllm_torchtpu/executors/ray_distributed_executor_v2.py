@@ -97,7 +97,9 @@ _TPU_WORKER_SPECIFIC_ENV_VARS: frozenset[str] = frozenset(
 )
 
 
-_RAY_NODE_PROBE_TIMEOUT_S = 30.0
+# Probe tasks inherit the job's runtime_env, which a node may need to set up on
+# first use; the cap still bounds a stuck raylet.
+_RAY_NODE_PROBE_TIMEOUT_S = 120.0
 
 
 @dataclass(frozen=True)
@@ -146,36 +148,32 @@ class RayDistributedExecutorV2(RayExecutorV2):
         self,
         nodes: list[tuple[str, str]],
         current_node_id: str | None,
-    ) -> dict[str, tuple[int | None, str | None]] | None:
+    ) -> dict[str, tuple[int | None, str | None]]:
         """Read ``(LWS_WORKER_INDEX, local_sb_host)`` once per Ray node.
 
         Defines a local stdlib-only task so Ray pickles it by value and remote
-        probe workers never import ``vllm``, ``torch``, or ``libtpu``.
+        probe workers never import ``vllm``, ``torch``, or ``libtpu``. Raises
+        instead of falling back, so every DP engine either derives the same
+        host layout or fails.
         """
         probed: dict[str, tuple[int | None, str | None]] = {}
         remote_nodes: list[tuple[str, str]] = []
         for node_id, node_ip in nodes:
             if current_node_id is not None and node_id == current_node_id:
-                try:
-                    local_sb_host: str | None = resolve_local_slicebuilder_host(node_ip)
-                except RuntimeError as exc:
-                    logger.warning(
-                        "RayDistributedExecutorV2 | Failed to resolve local "
-                        "slicebuilder host for %s: %s",
-                        node_ip,
-                        exc,
-                    )
-                    local_sb_host = None
-                probed[node_ip] = (tpu_envs.LWS_WORKER_INDEX, local_sb_host)
+                probed[node_ip] = (
+                    tpu_envs.LWS_WORKER_INDEX,
+                    resolve_local_slicebuilder_host(node_ip),
+                )
+            elif not node_id:
+                raise RuntimeError(
+                    f"Ray node {node_ip} has no NodeID; cannot probe it for its "
+                    "LWS_WORKER_INDEX and slicebuilder host."
+                )
             else:
-                if not node_id:
-                    return None
                 remote_nodes.append((node_id, node_ip))
 
         if not remote_nodes:
             return probed
-        if not ray.is_initialized():
-            return None
 
         leader_address = tpu_envs.LWS_LEADER_ADDRESS
         try:
@@ -191,13 +189,11 @@ class RayDistributedExecutorV2(RayExecutorV2):
             ]
             reported = ray.get(refs, timeout=_RAY_NODE_PROBE_TIMEOUT_S)
         except Exception as exc:
-            logger.warning(
-                "RayDistributedExecutorV2 | Remote node identity probe failed "
-                "or timed out after %.1fs (%s).",
-                _RAY_NODE_PROBE_TIMEOUT_S,
-                exc,
-            )
-            return None
+            raise RuntimeError(
+                "RayDistributedExecutorV2 | Remote node identity probe failed or "
+                f"timed out after {_RAY_NODE_PROBE_TIMEOUT_S:.0f}s on "
+                f"{[ip for _, ip in remote_nodes]}: {exc}"
+            ) from exc
 
         for (_, node_ip), result in zip(remote_nodes, reported):
             probed[node_ip] = result
@@ -215,7 +211,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
             return cache[device_str]
 
         hosts: list[tuple[int, str, int, str]] = []
-        hostnames_by_ip: dict[str, str] = {}
         has_worker_id = True
         raw_current_node_id = (
             ray.get_runtime_context().get_node_id() if ray.is_initialized() else None
@@ -238,10 +233,6 @@ class RayDistributedExecutorV2(RayExecutorV2):
                     f"Ray node {node.get('NodeID')} reports {device_str} but "
                     "no address to reach it by."
                 )
-
-            hostname = str(node.get("NodeManagerHostname") or "")
-            if hostname:
-                hostnames_by_ip[node_ip] = hostname
 
             node_id = str(node.get("NodeID") or "")
             labels = node.get("labels") or node.get("Labels") or {}
@@ -312,11 +303,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
                 hosts.sort(key=lambda x: x[1])
 
         host_order = [ip for _, ip, _, _ in hosts]
-        if needs_sb_host:
-            if probed is not None:
-                raw_sb_hosts = [probed[ip][1] or "" for ip in host_order]
-            else:
-                raw_sb_hosts = [hostnames_by_ip.get(ip, "") for ip in host_order]
+        if needs_sb_host and probed is not None:
+            raw_sb_hosts = [probed[ip][1] or "" for ip in host_order]
             validated_sb_hosts = validate_slicebuilder_hosts(host_order, raw_sb_hosts)
             sb_host_by_ip = dict(zip(host_order, validated_sb_hosts))
         else:

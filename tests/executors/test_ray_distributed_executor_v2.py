@@ -813,7 +813,7 @@ class TestTpuRayDistributedExecutorV2:
 
     @pytest.mark.parametrize(
         "mode",
-        ["lws_worker_index_probe", "lws_worker_id_multinic", "node_hostname_fallback"],
+        ["lws_worker_index_probe", "lws_worker_id_multinic", "probe_timeout"],
     )
     @patch(
         "vllm_torchtpu.executors.ray_distributed_executor_v2.get_driver_env_vars",
@@ -893,8 +893,11 @@ class TestTpuRayDistributedExecutorV2:
                 },
             ]
         else:
+            # The driver resolves its own name, but the remote probe times out:
+            # startup must fail rather than guess the other host's name.
             host0_name, host1_name = "tpu-host-0.internal", "tpu-host-1.internal"
-            dns_to_ip = {}
+            monkeypatch.setattr(socket, "getfqdn", lambda: host0_name)
+            dns_to_ip = {host0_name: host0_ip}
             expected_hosts = (host0_name, host1_name)
             remote_probe_result = TimeoutError("probe timed out")
             nodes = [
@@ -1001,6 +1004,11 @@ class TestTpuRayDistributedExecutorV2:
             ]
 
             try:
+                if mode == "probe_timeout":
+                    with pytest.raises(RuntimeError, match="timed out"):
+                        executor._init_executor()
+                    mock_ray.util.placement_group.assert_not_called()
+                    return
                 executor._init_executor()
 
                 # Probe ran exactly once (cached between _initialize_ray_cluster
@@ -1173,12 +1181,17 @@ def test_resolve_slice_host_layout_probes_once_with_affinity_and_timeout(monkeyp
 
     monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
     monkeypatch.setenv("LWS_WORKER_INDEX", "0")
+    dns_map = {
+        leader_dns: "2001:db8:1::9",
+        worker1_dns: "2001:db8:1::a",
+        worker2_dns: "2001:db8:1::1",
+    }
     monkeypatch.setattr(
         socket,
         "getaddrinfo",
         lambda host, *a, **kw: (
-            [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8:1::9", 0, 0, 0))]
-            if host == leader_dns
+            [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (dns_map[host], 0, 0, 0))]
+            if host in dns_map
             else (_ for _ in ()).throw(socket.gaierror(f"unknown {host}"))
         ),
     )
@@ -1261,7 +1274,7 @@ def test_resolve_slice_host_layout_probes_once_with_affinity_and_timeout(monkeyp
 
 
 def test_resolve_slice_host_layout_probe_timeout_and_duplicate_rejection(monkeypatch):
-    """Probe timeout degrades to IP order; duplicate IPv6 slicebuilder hosts fail."""
+    """Probe timeout fails startup; duplicate IPv6 slicebuilder hosts fail."""
     node0_id, node1_id = "0" * 56, "1" * 56
     monkeypatch.setenv(
         "LWS_LEADER_ADDRESS", "vllm-lws-0.vllm-lws.default.svc.cluster.local"
@@ -1274,7 +1287,8 @@ def test_resolve_slice_host_layout_probe_timeout_and_duplicate_rejection(monkeyp
         lambda: MagicMock(get_node_id=lambda: node0_id),
     )
 
-    # Case 1: IPv4 LWS probe timeout -> warns and falls back to IP order.
+    # Case 1: IPv4 LWS probe timeout raises instead of falling back to IP order,
+    # so DP engines cannot derive different host orders.
     probe_remote = MagicMock()
     probe_remote.options.return_value.remote.return_value = "ref_1"
     monkeypatch.setattr(rde2.ray, "remote", lambda _fn: probe_remote)
@@ -1300,11 +1314,8 @@ def test_resolve_slice_host_layout_probe_timeout_and_duplicate_rejection(monkeyp
         ],
     )
     executor = RayDistributedExecutorV2.__new__(RayDistributedExecutorV2)
-    with patch.object(rde2.logger, "warning") as warn_mock:
-        layout = executor._resolve_slice_host_layout("TPU")
-    assert layout.host_order == ["10.0.0.1", "10.0.0.2"]
-    assert layout.sb_host_by_ip == {"10.0.0.1": "10.0.0.1", "10.0.0.2": "10.0.0.2"}
-    assert warn_mock.call_count >= 2
+    with pytest.raises(RuntimeError, match="timed out.*raylet stuck"):
+        executor._resolve_slice_host_layout("TPU")
 
     # Case 2: Duplicate self-published IPv6 hostnames are rejected.
     monkeypatch.setattr(
