@@ -34,10 +34,10 @@ class TokenPaddingState:
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask."""
-        host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
-        host[local_valid_tokens:local_padded_tokens] = True
-        # Synchronous copy since the host tensor is temporary.
-        self.local_padding_mask.copy_(host)
+        # Written on the device: a blocking host-to-device copy would wait for
+        # the forward still in flight (torch_tpu >= 0.3.0), stalling decode.
+        self.local_padding_mask.zero_()
+        self.local_padding_mask[local_valid_tokens:local_padded_tokens] = True
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
