@@ -77,16 +77,18 @@ _INTERLEAVE_TOKENS = 64
 # tiles: "auto" when a step's mean page union per tile is over
 # `_PAGE_MAJOR_MIN_RATIO` times its tokens' mean pages (a tile's cost grows
 # with its union, page-major's with the pairs), "on" always, "off" never
-# (`TPU_MINIMAX_M3_MSA_PAGE_MAJOR`). Op replay of a 4,096-row x 16-head call,
-# tiles -> page-major, us (j-7166bc3d, j-2cf6896e): uniform selections over a
-# 111K context (union 593 per 64-token tile, ratio 37) 5183 -> 1163; a hot set
-# of 64 pages (65, ratio 4.1) 685 -> 779; local selections (26, ratio 1.6)
-# 344 -> 844; tiles cost ~8.7 us per union page.
+# (`TPU_MINIMAX_M3_MSA_PAGE_MAJOR`). Op bench of a 4,096-row x 16-head call
+# over a 130K prefix, each token's 15 other pages drawn from the last N, us
+# tiles / page-major (j-42053fce): ratio 1.1: 321 / 535, 2.1: 440 / 535,
+# 3.1: 598 / 538, 4.1: 721 / 537, 6.0: 998 / 546, 38.5: 5495 / 579. Tiles
+# grow with the union, page-major stays near its pair count; the crossover
+# is ~2.7 at 4,096 rows, ~3.1 at 2,048 and ~3.6 at 1,024 (j-9bc53a54).
 PAGE_MAJOR = "auto"
 # The ratio is estimated over a 1,024-bit bitmap per tile, and the head's
 # exchanged page keys span dcp * num_pages: far pages alias and the estimate
-# comes out low (uniform selections over a 253K context: 39 for a true 48).
-_PAGE_MAJOR_MIN_RATIO = 7.0
+# comes out low (uniform selections over a 253K context: 39 for a true 48);
+# near the threshold (unions of a few dozen pages) it barely aliases.
+_PAGE_MAJOR_MIN_RATIO = 3.0
 # Decode steps of a DCP group of 4 over 2 KV heads attend each KV head in its
 # own call so the cross-chip merge overlaps the second (`_pair_first_merge_by_head`).
 PAIR_FIRST_HEAD_CALLS = True
