@@ -1486,7 +1486,8 @@ def build_attention_op(
         split_rows = layout.split_rows
 
         def _qc_head_shift(q_c_local: jax.Array, rk: jax.Array) -> jax.Array:
-            zigzag_local = layout.effective_zigzag_bands(q_c_local.shape[0] * dcp) > 1
+            # Avoid multiplying by dcp: outside shard_map q_c_local is global [T, C].
+            zigzag_local = layout.effective_zigzag_bands(q_c_local.shape[0]) > 1
             return jax.shard_map(
                 lambda qc, r: dcp_token_parallel.gather_qc_head_rows(
                     qc,
