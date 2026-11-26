@@ -321,6 +321,7 @@ def get_raiden_inline_load() -> bool:
 
 _RAIDEN_TELEMETRY_MODULE = None
 _RAIDEN_TELEMETRY_CONFIGURED = False
+_RAIDEN_TELEMETRY_CONFIGURED_BACKENDS: frozenset[str] | None = None
 _RAIDEN_TELEMETRY_IMPORT_ATTEMPTED = False
 
 
@@ -342,12 +343,23 @@ def get_raiden_telemetry_module():
 
 def configure_raiden_telemetry(backends: list[str] | set[str] | None = None) -> None:
     """Configures TPU Raiden C++ telemetry backends if available."""
-    global _RAIDEN_TELEMETRY_CONFIGURED
+    global _RAIDEN_TELEMETRY_CONFIGURED, _RAIDEN_TELEMETRY_CONFIGURED_BACKENDS
     try:
+        requested_backends = (
+            None
+            if backends is None
+            else frozenset(b.strip().lower() for b in backends if b.strip())
+        )
+        if _RAIDEN_TELEMETRY_CONFIGURED and (
+            requested_backends is None
+            or requested_backends == _RAIDEN_TELEMETRY_CONFIGURED_BACKENDS
+        ):
+            return
         telemetry = get_raiden_telemetry_module()
         if telemetry is not None and hasattr(telemetry, "configure_telemetry"):
             telemetry.configure_telemetry(backends)
             _RAIDEN_TELEMETRY_CONFIGURED = True
+            _RAIDEN_TELEMETRY_CONFIGURED_BACKENDS = requested_backends
             logger.info("Configured TPU Raiden C++ telemetry backends")
     except Exception as e:
         logger.warning("Failed to configure TPU Raiden C++ telemetry: %s", e)
