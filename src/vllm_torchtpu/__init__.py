@@ -2151,39 +2151,21 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         if not hasattr(self, "org_vocab_start_index"):
-            self.register_buffer(
+            # VLLM_TPU_VOCAB_BOUNDS_INT32: the bounds are vocab indices (< 2**31), so
+            # int32 masks the same ids, and an int64 scalar operand costs each
+            # program that embeds a serial split before its first op.
+            dtype = torch.int32 if envs.VLLM_TPU_VOCAB_BOUNDS_INT32 else torch.int64
+            si = self.shard_indices
+            for name in (
                 "org_vocab_start_index",
-                torch.tensor(
-                    self.shard_indices.org_vocab_start_index, dtype=torch.int64
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
                 "org_vocab_end_index",
-                torch.tensor(self.shard_indices.org_vocab_end_index, dtype=torch.int64),
-                persistent=False,
-            )
-            self.register_buffer(
                 "num_org_vocab_padding",
-                torch.tensor(
-                    self.shard_indices.num_org_vocab_padding, dtype=torch.int64
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
                 "added_vocab_start_index",
-                torch.tensor(
-                    self.shard_indices.added_vocab_start_index, dtype=torch.int64
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
                 "added_vocab_end_index",
-                torch.tensor(
-                    self.shard_indices.added_vocab_end_index, dtype=torch.int64
-                ),
-                persistent=False,
-            )
+            ):
+                self.register_buffer(
+                    name, torch.tensor(getattr(si, name), dtype=dtype), persistent=False
+                )
 
     def patched_forward(self, input_):
         input_mask = None
