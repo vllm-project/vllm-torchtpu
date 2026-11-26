@@ -98,6 +98,8 @@ def prepare_tpu_environment(world_size: int | None = None) -> None:
 # Multichip tests that launch one worker per device with torchrun. The test
 # file runs as the worker script: `<file> --worker --result-dir DIR`.
 
+_STACK_DUMP_ENV = "TPU_TEST_WORKER_STACK_DUMP_SECONDS"
+
 _LAUNCH_ENV_KEYS = (
     "TORCH_TPU_XPROF_SESSION_ID",
     "TORCH_TPU_SLICEBUILDER_ADDRESSES",
@@ -149,6 +151,9 @@ def launch_torchrun_workers(
     import subprocess
     import sys
 
+    # Workers dump their Python stacks shortly before the launch times out, so
+    # a hang shows where each rank is stuck (see run_torchrun_worker).
+    env = {**env, _STACK_DUMP_ENV: str(max(timeout - 45, 1))}
     process = subprocess.Popen(
         [
             sys.executable,
@@ -197,13 +202,26 @@ def read_worker_results(result_dir: Any, world_size: int, completed: Any) -> lis
             else {"rank": rank, "error": "missing worker result"}
         )
     errors = [r for r in results if "error" in r]
-    assert not errors, (errors, (completed.stdout or "")[-4000:])
+    assert not errors, (errors, _host_cpus(), (completed.stdout or "")[-24000:])
     return results
+
+
+def _host_cpus() -> str:
+    """The CPUs the workers could use: a starved host compiles slowly."""
+    import os
+    from pathlib import Path
+
+    quota = Path("/sys/fs/cgroup/cpu.max")
+    return (
+        f"cpu_count={os.cpu_count()} affinity={len(os.sched_getaffinity(0))} "
+        f"cgroup cpu.max={quota.read_text().strip() if quota.exists() else None}"
+    )
 
 
 def run_torchrun_worker(result_dir: Any, check: Callable[[int], dict]) -> None:
     """Worker side: joins torch.distributed and vLLM's world, runs
     `check(rank)` and writes the rank's result for read_worker_results."""
+    import faulthandler
     import json
     import os
 
@@ -213,6 +231,8 @@ def run_torchrun_worker(result_dir: Any, check: Callable[[int], dict]) -> None:
 
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
+    if os.environ.get(_STACK_DUMP_ENV):
+        faulthandler.dump_traceback_later(float(os.environ[_STACK_DUMP_ENV]))
     result: dict[str, object] = {"rank": rank, "world": world}
     initialized = False
     try:
