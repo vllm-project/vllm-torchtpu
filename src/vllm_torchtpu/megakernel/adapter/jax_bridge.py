@@ -13,12 +13,11 @@
 # limitations under the License.
 """Generic torch <-> jax step bridge (no `megakernel` library imports).
 
-- `sharded_jax_callable`: an SPMD JAX function over a mesh as a `torch_tpu`
-  `JaxCallable`, built by torch_tpu's own `pallas.custom_jax_kernel`, for
-  callers that wrap it in their own custom op (e.g. to take `list[Tensor]`
-  arguments past the 64-argument schema limit of a `torch.library` op).
-- `make_typed_step_wrapper`: a fixed-arity, `jax.Array`-annotated wrapper of a
-  `*args` step function (`JaxCallable` rejects `*args` signatures).
+- `sharded_jax_callable`: an SPMD JAX function over a mesh as a callable over
+  torch tensors, registered with torch_tpu's `pallas.jax_op`. The operands
+  are passed as `list[Tensor]` arguments, one per partition spec (and per
+  donated or not), so any number of operands fits the 64-argument schema
+  limit of a `torch.library` op.
 - `torch_cpu_to_jax` / `jax_to_torch_cpu`: lossless CPU conversions for the
   CPU interpret path of unit tests (a 64-bit dtype needs `jax_enable_x64`;
   without it the conversion raises rather than narrowing).
@@ -38,6 +37,7 @@ inside the stock model belongs in that list instead.
 
 from __future__ import annotations
 
+import inspect
 import itertools
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -65,31 +65,67 @@ def sharded_jax_callable(
     input_partition_specs: Sequence[P],
     output_partition_specs: Any,
     donate_argnums: Sequence[int] | None = None,
-) -> Any:
-    """`fn`, an SPMD JAX function over `mesh`, as a `torch_tpu` `JaxCallable`.
+) -> Callable[..., list[torch.Tensor]]:
+    """`fn`, an SPMD JAX function over `mesh`, as a callable over torch tensors.
 
     Called with this rank's shards of the operands (`input_partition_specs`
     describe the global arrays), it returns this rank's shards of the
-    outputs (`output_partition_specs`). Every parameter of `fn` must be an
-    array (no static arguments). No custom op is registered.
+    outputs (`output_partition_specs`, one per output) as a list. Every
+    parameter of `fn` must be an array (no static arguments), and every
+    `donate_argnums` operand is donated.
+
+    It registers `fn` with torch_tpu's `pallas.jax_op` as the op `name`, which
+    applies one partition spec and one donation flag to a whole `list[Tensor]`
+    argument: the operands are grouped into one list per `(spec, donated)`, in
+    order of first use, and `fn` gets them back in their own order.
     """
-    from torch_tpu._internal.pallas import pallas as pallas_impl
+    from torch_tpu._internal import pallas
 
     if name.count("::") != 1:
         raise ValueError(f"op name {name!r} must be 'namespace::op', with one '::'")
-    # torch_tpu's custom_jax_kernel stubs type the partition specs as
-    # tuple[tuple[str, ...], ...], while runtime NamedSharding takes PartitionSpecs.
-    in_specs: Any = tuple(input_partition_specs)
-    out_specs: Any = tuple(_leaf_output_specs(output_partition_specs))
-    return pallas_impl.custom_jax_kernel(
-        fn,
-        name,
-        donate_argnums=list(donate_argnums) if donate_argnums else None,
-        mesh=mesh,
-        input_partition_specs=in_specs,
-        output_partition_specs=out_specs,
-        warn_deprecated=False,
+    in_specs = tuple(input_partition_specs)
+    donated = set(donate_argnums or ())
+    group_of: dict[tuple[P, bool], int] = {}
+    members: list[list[int]] = []
+    slots: list[tuple[int, int]] = []
+    for i, spec in enumerate(in_specs):
+        g = group_of.setdefault((spec, i in donated), len(members))
+        if g == len(members):
+            members.append([])
+        slots.append((g, len(members[g])))
+        members[g].append(i)
+    group_keys = sorted(group_of, key=group_of.__getitem__)
+
+    def jax_step(*groups: list[jax.Array]) -> list[jax.Array]:
+        return list(jax.tree.leaves(fn(*(groups[g][j] for g, j in slots))))
+
+    # jax_op reads one `list[jax.Array]` parameter per group from the signature.
+    jax_step.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        [
+            inspect.Parameter(
+                f"g{g}",
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                annotation=list[jax.Array],
+            )
+            for g in range(len(members))
+        ],
+        return_annotation=list[jax.Array],
     )
+    # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
+    # jax_op takes PartitionSpecs at runtime, as other jax_op call sites pass them.
+    op: Any = pallas.jax_op(
+        name,
+        jax_step,
+        mesh=mesh,
+        input_partition_specs=tuple(spec for spec, _ in group_keys),
+        output_partition_specs=tuple(_leaf_output_specs(output_partition_specs)),
+        donate_argnums=tuple(g for g, (_, d) in enumerate(group_keys) if d) or None,
+    )
+
+    def call(*operands: torch.Tensor) -> list[torch.Tensor]:
+        return list(op(*([operands[i] for i in m] for m in members)))
+
+    return call
 
 
 def torch_cpu_to_jax(
@@ -97,11 +133,12 @@ def torch_cpu_to_jax(
 ) -> jax.Array:
     """Convert a CPU `torch.Tensor` to a `jax.Array` without precision loss.
 
-    Raises `ValueError` for a 64-bit tensor (int64 / float64 / ...) while
+    Raises `ValueError` for an int64 / uint64 / float64 tensor while
     `jax_enable_x64` is off: JAX would narrow it to 32 bits silently.
+    (complex64 is two 32-bit floats, which JAX keeps without x64.)
     """
     t_c = t.detach().cpu().contiguous()
-    if t_c.dtype.itemsize == 8 and not jax.config.jax_enable_x64:
+    if t_c.dtype in _X64_DTYPES and not jax.config.jax_enable_x64:
         raise ValueError(
             f"torch_cpu_to_jax: a {t_c.dtype} tensor needs jax_enable_x64; "
             "without it JAX narrows it to 32 bits. Pass a 32-bit tensor or "
@@ -119,42 +156,33 @@ def torch_cpu_to_jax(
 
 
 def jax_to_torch_cpu(a: jax.Array, like: torch.Tensor) -> torch.Tensor:
-    """Convert a `jax.Array` to a CPU `torch.Tensor` matching `like.dtype`."""
+    """Convert a `jax.Array` to a CPU `torch.Tensor` of dtype `like.dtype`.
+
+    Raises `ValueError` when `a.dtype` is not the JAX dtype of `like.dtype`:
+    the conversion reinterprets bytes, it does not cast.
+    """
+    want = _TORCH_TO_JAX_DTYPE.get(like.dtype)
+    if want is None:  # a dtype numpy has, e.g. complex64
+        want = torch.empty(0, dtype=like.dtype).numpy().dtype
+    if jnp.dtype(a.dtype) != jnp.dtype(want):
+        raise ValueError(
+            f"jax_to_torch_cpu: a {jnp.dtype(a.dtype)} array can't be read as "
+            f"{like.dtype} (expected {jnp.dtype(want)})"
+        )
     np_arr = np.asarray(a)
     if like.dtype == torch.float8_e4m3fn:
         out = torch.from_numpy(np_arr.view(np.uint8).copy()).view(torch.float8_e4m3fn)
     elif like.dtype == torch.bfloat16:
         out = torch.from_numpy(np_arr.view(np.uint16).copy()).view(torch.bfloat16)
     else:
-        out = torch.from_numpy(np_arr.copy()).to(like.dtype)
+        out = torch.from_numpy(np_arr.copy())
     return out
-
-
-def make_typed_step_wrapper(
-    fn_name: str,
-    step_fn: Callable[..., Any],
-    num_inputs: int,
-    num_outputs: int,
-) -> Callable[..., Any]:
-    """Synthesize a fixed-arity `jax.Array`-annotated wrapper for `JaxCallable`.
-
-    `torch_tpu`'s `JaxCallable` inspects the function's explicit positional
-    parameters and rejects `*args` signatures.
-    """
-    args = [f"x{i}" for i in range(num_inputs)]
-    ret = "tuple[" + ", ".join(["jax.Array"] * num_outputs) + "]"
-    src = (
-        f"def {fn_name}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"
-        f"    return _step_fn({', '.join(args)})\n"
-    )
-    ns: dict[str, Any] = {"jax": jax, "_step_fn": step_fn}
-    exec(compile(src, f"<{fn_name}>", "exec"), ns)  # noqa: S102
-    return ns[fn_name]
 
 
 _OP_IDS = itertools.count()
 
 _TORCH_TO_JAX_DTYPE: dict[torch.dtype, Any] = {
+    torch.float64: jnp.float64,
     torch.float32: jnp.float32,
     torch.float16: jnp.float16,
     torch.bfloat16: jnp.bfloat16,
@@ -167,6 +195,8 @@ _TORCH_TO_JAX_DTYPE: dict[torch.dtype, Any] = {
     torch.bool: jnp.bool_,
 }
 _JAX_TO_TORCH_DTYPE = {jnp.dtype(j): t for t, j in _TORCH_TO_JAX_DTYPE.items()}
+# The dtypes JAX narrows to 32 bits unless `jax_enable_x64` is on.
+_X64_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
 
 
 def _jax_to_torch(a: jax.Array) -> torch.Tensor:
@@ -188,7 +218,7 @@ def _out_structs(
 
     With `mesh`, the operands are this rank's shards: they are scaled to the
     global shapes by `in_specs`, `fn`'s global outputs are shrunk to this
-    rank's shards by `out_specs` (what torch_tpu's `JaxCallable` returns).
+    rank's shards by `out_specs` (what `sharded_jax_callable` returns).
     Without, the operands and outputs are the global arrays.
     """
     structs = []
@@ -238,7 +268,10 @@ def build_jax_step_op(
       (`interpret_on_cpu=False` makes that an error). Kernels that need
       Pallas interpret mode on CPU choose it inside `fn`.
     The op's fake kernel (from `jax.eval_shape`) gives the outputs those
-    shapes, so `torch.compile` can trace it.
+    shapes, so `torch.compile` can trace it. The op and its fake kernel check
+    the operand count and that every operand is on one device. A donated
+    output must have its input's shape and dtype, and a step that donates
+    inputs must run under `torch.compile` when given TPU tensors.
     """
     single = isinstance(out_specs, P)
     outs_specs: tuple[P, ...] = (out_specs,) if single else tuple(out_specs)
@@ -270,13 +303,10 @@ def build_jax_step_op(
 
     def tpu_callable() -> Any:
         if not tpu_fn:
-            typed = make_typed_step_wrapper(
-                name.replace("::", "_"), tuple_fn, n_in, n_out
-            )
             tpu_fn.append(
                 sharded_jax_callable(
-                    name,
-                    typed,
+                    f"{name}_jax",
+                    tuple_fn,
                     mesh=mesh,
                     input_partition_specs=ins_specs,
                     output_partition_specs=outs_specs,
@@ -285,13 +315,23 @@ def build_jax_step_op(
             )
         return tpu_fn[0]
 
-    @torch.library.custom_op(name, mutates_args=())
-    def op(operands: list[torch.Tensor]) -> list[torch.Tensor]:
+    def check_operands(operands: Sequence[torch.Tensor]) -> torch.device:
+        """The operands' one device, after the operand count and device checks."""
         if len(operands) != n_in:
             raise ValueError(f"{name}: {len(operands)} operands, in_specs has {n_in}")
-        if operands[0].device.type == "cpu":
-            if not interpret_on_cpu:
-                raise RuntimeError(f"{name}: CPU operands with interpret_on_cpu=False")
+        devices = {t.device for t in operands}
+        if len(devices) != 1:
+            # A CPU operand among TPU ones would take the CPU path, which
+            # copies every operand (TPU pools included) to the host.
+            raise ValueError(f"{name}: operands on more than one device: {devices}")
+        dev = devices.pop()
+        if dev.type == "cpu" and not interpret_on_cpu:
+            raise RuntimeError(f"{name}: CPU operands with interpret_on_cpu=False")
+        return dev
+
+    @torch.library.custom_op(name, mutates_args=())
+    def op(operands: list[torch.Tensor]) -> list[torch.Tensor]:
+        if check_operands(operands).type == "cpu":
             arrays = [
                 torch_cpu_to_jax(t, sh) for t, sh in zip(operands, in_sh, strict=True)
             ]
@@ -300,7 +340,7 @@ def build_jax_step_op(
 
     @op.register_fake
     def _(operands: list[torch.Tensor]) -> list[torch.Tensor]:
-        dev = operands[0].device
+        dev = check_operands(operands)
         sharded = dev.type != "cpu"
         structs = _out_structs(
             tuple_fn,
@@ -318,15 +358,31 @@ def build_jax_step_op(
         ]
 
     def step(*operands: torch.Tensor) -> Any:
+        dev = check_operands(operands)
+        if aliases and dev.type != "cpu" and not torch.compiler.is_compiling():
+            # Eagerly, the donated input is consumed by the call and the result
+            # is copied back into it: a pool-sized copy every step. Under
+            # `torch.compile` the copy-back aliases the donated buffer instead.
+            raise RuntimeError(
+                f"{name}: a step that donates inputs must run under "
+                "torch.compile with TPU tensors (eagerly it copies each donated "
+                "input every call)"
+            )
         outs = op(list(operands))
         res = []
         for o, out in enumerate(outs):
             i = aliases.get(o)
             if i is None:
                 res.append(out)
-            else:
-                operands[i].copy_(out)
-                res.append(operands[i])
+                continue
+            src = operands[i]
+            if out.shape != src.shape or out.dtype != src.dtype:
+                raise ValueError(
+                    f"{name}: donated output {o} is {out.dtype}{list(out.shape)} "
+                    f"but its input {i} is {src.dtype}{list(src.shape)}"
+                )
+            src.copy_(out)
+            res.append(src)
         return res[0] if single else tuple(res)
 
     step.op = op  # type: ignore[attr-defined]
@@ -337,7 +393,6 @@ def build_jax_step_op(
 __all__ = [
     "build_jax_step_op",
     "jax_to_torch_cpu",
-    "make_typed_step_wrapper",
     "sharded_jax_callable",
     "torch_cpu_to_jax",
 ]

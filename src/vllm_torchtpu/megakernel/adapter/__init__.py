@@ -42,9 +42,7 @@ _BRIDGE_EXPORTS = frozenset(
         "export_pooled_step",
     }
 )
-_JAX_BRIDGE_EXPORTS = frozenset(
-    {"build_jax_step_op", "make_typed_step_wrapper", "sharded_jax_callable"}
-)
+_JAX_BRIDGE_EXPORTS = frozenset({"build_jax_step_op", "sharded_jax_callable"})
 
 _WEIGHT_SOURCE_EXPORTS = frozenset(
     {"TorchArrayOps", "VLLMWeightSource", "WEIGHT_FLIPPED_ATTR", "load_vllm_weights"}
@@ -143,7 +141,6 @@ __all__ = [
     "guard_weight_update",
     "is_suppressed",
     "load_vllm_weights",
-    "make_typed_step_wrapper",
     "maybe_create",
     "reshard_experts_ep_to_tp_local",
     "reshard_layer_experts_ep_to_tp",

@@ -13,8 +13,8 @@
 # limitations under the License.
 """Bridge between `megakernel` (`make_flat_pooled_step`) and PyTorch/vLLM.
 
-The generic torch <-> jax pieces (`sharded_jax_callable`,
-`make_typed_step_wrapper`, the CPU conversions) are in `jax_bridge`; this
+The generic torch <-> jax pieces (`sharded_jax_callable`, the CPU
+conversions) are in `jax_bridge`; this
 module adds the `cache` / `ModelSpec`-bound pooled-step op. Provides:
 - `build_pooled_step_op`: wraps `cache.make_flat_pooled_step` into a
   `sharded_jax_callable` + `@torch.library.custom_op` (taking `list[Tensor]`
@@ -27,7 +27,7 @@ module adds the `cache` / `ModelSpec`-bound pooled-step op. Provides:
   `tf.aliasing_output` under `torch.compile(backend="tpu")`.
 - `export_pooled_step`: offline inspection/serialization helper that exports the
   StableHLO module and aliasing manifest (`PooledStepExport`) via `jax.export`
-  (serving traces directly through `build_pooled_step_op` / `JaxCallable`).
+  (serving runs the step through `build_pooled_step_op`).
 """
 
 from __future__ import annotations
@@ -44,10 +44,7 @@ from jax.sharding import PartitionSpec as P
 from vllm_torchtpu.megakernel.adapter.jax_bridge import (
     jax_to_torch_cpu as _jax_to_torch_cpu,
 )
-from vllm_torchtpu.megakernel.adapter.jax_bridge import (
-    make_typed_step_wrapper,
-    sharded_jax_callable,
-)
+from vllm_torchtpu.megakernel.adapter.jax_bridge import sharded_jax_callable
 from vllm_torchtpu.megakernel.adapter.jax_bridge import (
     torch_cpu_to_jax as _torch_cpu_to_jax,
 )
@@ -88,8 +85,8 @@ def export_pooled_step(
 ) -> PooledStepExport:
     """Export `make_flat_pooled_step` to a serialized StableHLO module.
 
-    Note: At serving time, `build_pooled_step_op` traces through
-    `sharded_jax_callable` (`JaxCallable`). This helper is provided for offline
+    Note: At serving time, `build_pooled_step_op` runs the step through
+    `sharded_jax_callable` (`pallas.jax_op`). This helper is provided for offline
     StableHLO inspection and serialization tests.
     """
     step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
@@ -165,14 +162,10 @@ def build_pooled_step_op(
     elif "::" not in op_name:
         op_name = f"megakernel::{op_name}"
 
-    fn_name = op_name.replace("::", "_")
-    typed_fn = make_typed_step_wrapper(
-        fn_name, step_fn, num_inputs=len(in_specs), num_outputs=len(out_specs)
-    )
     try:
         flat_callable: Any = sharded_jax_callable(
-            op_name,
-            typed_fn,
+            f"{op_name}_jax",
+            step_fn,
             mesh=mesh,
             input_partition_specs=in_specs,
             output_partition_specs=out_specs,
