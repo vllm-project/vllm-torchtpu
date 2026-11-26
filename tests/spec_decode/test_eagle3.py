@@ -3089,3 +3089,60 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+def _load_mtp_proposer(monkeypatch, target, *, hc_mult):
+    proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
+    draft_hf_config = SimpleNamespace()
+    if hc_mult is not None:
+        draft_hf_config.hc_mult = hc_mult
+    proposer.speculative_config.draft_model_config = SimpleNamespace(
+        hf_config=draft_hf_config,
+        hf_text_config=SimpleNamespace(hidden_size=256),
+    )
+    proposer.speculative_config.num_speculative_tokens = 1
+    draft, _ = _make_vocab_models()
+    draft.config = SimpleNamespace(hidden_size=256)
+    proposer._load_draft_model = lambda _t: setattr(proposer, "draft_model", draft)
+    monkeypatch.setattr(
+        spec_decode_utils, "gather_sharded_weight", _fake_gather_sharded_weight
+    )
+    with mock.patch(
+        "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config",
+        return_value={},
+    ):
+        proposer.load_model(target)
+    return proposer
+
+
+def test_mtp_draft_input_is_hc_mult_wide_when_the_target_emits_its_residual(
+    monkeypatch,
+):
+    _, target = _make_vocab_models()
+    target.mtp_emits_aux_hidden_state = True
+    proposer = _load_mtp_proposer(monkeypatch, target, hc_mult=4)
+    assert proposer._draft_hidden_size() == 256
+    assert proposer._draft_input_hidden_size() == 1024
+
+
+def test_mtp_draft_input_stays_hidden_size_for_deepseek_v4(monkeypatch):
+    """DeepSeek-V4 defines upstream's get_mtp_target_hidden_states, but its TPU
+    forward() collapses the HC streams, so the draft takes the collapsed state.
+    """
+    from vllm_torchtpu.models.vllm.deepseek_v4.model import DeepseekV4ForCausalLM
+
+    assert hasattr(DeepseekV4ForCausalLM, "get_mtp_target_hidden_states")
+    assert not hasattr(DeepseekV4ForCausalLM, "mtp_emits_aux_hidden_state")
+    _, target = _make_vocab_models()
+    proposer = _load_mtp_proposer(monkeypatch, target, hc_mult=4)
+    assert proposer._draft_input_hidden_size() == 256
+
+
+@pytest.mark.parametrize("hc_mult", [None, True, 1], ids=["missing", "bool", "one"])
+def test_mtp_residual_target_rejects_a_draft_config_without_hc_mult(
+    monkeypatch, hc_mult
+):
+    _, target = _make_vocab_models()
+    target.mtp_emits_aux_hidden_state = True
+    with pytest.raises(ValueError, match="integer hc_mult >= 2"):
+        _load_mtp_proposer(monkeypatch, target, hc_mult=hc_mult)
