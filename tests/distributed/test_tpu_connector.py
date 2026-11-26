@@ -10058,7 +10058,9 @@ class TestStage3DmaDrainSafety:
         assert worker.get_finished() == (set(), set())
 
         # Case B: Store-restart race where lease expiry cancels unclaimed=True
-        # while D2H is still in flight, then native done_sending arrives.
+        # while D2H is still in flight, then a late native done_sending arrives.
+        # Monotonic priority (failed > cancelled > done) preserves
+        # UNCLAIMED_TIMEOUT and avoids force-releasing via complete_request_blocks.
         worker2, engine2, facade2 = self._seeded_prefill_worker(
             req_id="send-restart-drain", uuid=703, expiration_time=0.0
         )
@@ -10070,13 +10072,40 @@ class TestStage3DmaDrainSafety:
         assert worker2.get_finished() == (set(), set())
         assert len(facade2.cancel_request_blocks_calls) == 1
 
+        # Late native done_sending while still draining must not downgrade
+        # "cancelled" to "done".
         engine2.poll_results.append((["send-restart-drain"], [], []))
+        assert worker2.get_finished() == (set(), set())
+        assert worker2._stage3_draining_sends == {"send-restart-drain": "cancelled"}
+
         engine2.send_settled = True
         assert worker2.get_finished() == ({"send-restart-drain"}, set())
         results2 = worker2.take_pd_send_results()
         assert results2 is not None
-        assert results2.outcomes == {"send-restart-drain": RaidenSendOutcome.SUCCESS}
-        assert len(facade2.complete_request_blocks_calls) == 1
+        assert results2.outcomes == {
+            "send-restart-drain": RaidenSendOutcome.UNCLAIMED_TIMEOUT
+        }
+        assert facade2.complete_request_blocks_calls == []
+
+        # Case C: Draining "cancelled" send followed by native failed_sending
+        # (e.g., active D2H aborted by cancel_send) upgrades monotonically to
+        # SEND_FAILURE and force-releases via complete_request_blocks.
+        worker3, engine3, facade3 = self._seeded_prefill_worker(
+            req_id="send-cancel-then-fail", uuid=805, expiration_time=0.0
+        )
+        assert worker3.get_finished() == (set(), set())
+        assert worker3._stage3_draining_sends == {"send-cancel-then-fail": "cancelled"}
+        engine3.poll_results.append(([], [], ["send-cancel-then-fail"]))
+        assert worker3.get_finished() == (set(), set())
+        assert worker3._stage3_draining_sends == {"send-cancel-then-fail": "failed"}
+        engine3.send_settled = True
+        assert worker3.get_finished() == ({"send-cancel-then-fail"}, set())
+        results3 = worker3.take_pd_send_results()
+        assert results3 is not None
+        assert results3.outcomes == {
+            "send-cancel-then-fail": RaidenSendOutcome.SEND_FAILURE
+        }
+        assert len(facade3.complete_request_blocks_calls) == 1
 
         # Seed _stage3_draining_sends (plus timestamp/logged tracking) for BOTH
         # an expired tombstone and a registered send named in reqs_to_release,
@@ -10291,6 +10320,129 @@ class TestStage3DmaDrainSafety:
         assert built is cold_engine
         assert cold_worker._stage3_drain_engine_ref is cold_engine
         assert prewarm_warn.call_count == 1
+
+    def test_transient_cancel_errors_retry_on_prefill_inline_and_async_decode(
+        self, monkeypatch
+    ):
+        from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+            RaidenSendOutcome,
+        )
+
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+
+        # Prefill: send only settles after cancel_send succeeds; first call raises.
+        class _TransientCancelSendEngine(_DmaDrainEngine):
+            def __init__(self):
+                super().__init__()
+                self.cancelled: set[int] = set()
+
+            def cancel_send(self, uuid):
+                self.cancel_send_calls.append(int(uuid))
+                if len(self.cancel_send_calls) == 1:
+                    raise RuntimeError("transient cancel_send")
+                self.cancelled.add(int(uuid))
+                return False
+
+            def is_send_settled(self, uuid):
+                self.calls.append(("is_send_settled", int(uuid)))
+                return int(uuid) in self.cancelled
+
+        prefill_worker, _, _ = self._seeded_prefill_worker(
+            req_id="send-retry", uuid=802, expiration_time=0.0
+        )
+        prefill_engine = _TransientCancelSendEngine()
+        prefill_worker._raiden_transfer_engine = prefill_engine
+
+        assert prefill_worker.get_finished() == (set(), set())
+        assert prefill_engine.cancel_send_calls == [802]
+        assert "send-retry" not in prefill_worker._stage3_cancelled_sends
+
+        assert prefill_worker.get_finished() == (set(), set())
+        assert prefill_engine.cancel_send_calls == [802, 802]
+        assert "send-retry" in prefill_worker._stage3_cancelled_sends
+
+        assert prefill_worker.get_finished() == ({"send-retry"}, set())
+        assert prefill_engine.cancel_send_calls == [802, 802]
+        assert prefill_worker._stage3_cancelled_sends == set()
+        prefill_res = prefill_worker.take_pd_send_results()
+        assert prefill_res is not None
+        assert prefill_res.outcomes == {
+            "send-retry": RaidenSendOutcome.UNCLAIMED_TIMEOUT
+        }
+
+        # Decode engine where receive only settles after cancel_receive succeeds.
+        class _TransientCancelRecvEngine(_DmaDrainEngine):
+            def __init__(self):
+                super().__init__()
+                self.cancelled: set[int] = set()
+
+            def cancel_receive(self, uuid):
+                self.cancel_receive_calls.append(int(uuid))
+                if len(self.cancel_receive_calls) == 1:
+                    raise RuntimeError("transient cancel_receive")
+                self.cancelled.add(int(uuid))
+                return True
+
+            def is_receive_settled(self, uuid):
+                self.calls.append(("is_receive_settled", int(uuid)))
+                return int(uuid) in self.cancelled
+
+        # Inline decode: _wait_for_recving retries cancel_receive without hanging.
+        inline_worker, _ = self._seeded_decode_worker(
+            dst_req_id="dst-inline-retry",
+            src_req_id="src-inline-retry",
+            uuid=803,
+            blocks=[5],
+        )
+        inline_engine = _TransientCancelRecvEngine()
+        inline_worker._raiden_transfer_engine = inline_engine
+        inline_worker._stage3_controller_accepted.add("dst-inline-retry")
+
+        now_s = [100.0]
+
+        def _fake_time():
+            now_s[0] += 1.0
+            return now_s[0]
+
+        sleeps = [0]
+
+        def _bounded_sleep(_s):
+            sleeps[0] += 1
+            assert sleeps[0] <= 20, "inline _wait_for_recving hung on cancel retry"
+
+        monkeypatch.setattr(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", lambda: 2.0)
+        monkeypatch.setattr(f"{_MOD}.time.time", _fake_time)
+        monkeypatch.setattr(f"{_MOD}.time.sleep", _bounded_sleep)
+
+        inline_worker._wait_for_recving({"dst-inline-retry"})
+        assert inline_engine.cancel_receive_calls == [803, 803]
+        assert "dst-inline-retry" in inline_worker._failed_recving
+        assert inline_worker._stage3_draining_cancelled_loads == {}
+        assert inline_worker._stage3_draining_load_recancel == set()
+        assert inline_worker.get_block_ids_with_load_errors() == {5}
+
+        # Async decode: expired uncertain load retries cancel_receive on next poll.
+        monkeypatch.setattr(f"{_MOD}.dist_utils.get_raiden_inline_load", lambda: False)
+        async_worker, _ = self._seeded_decode_worker(
+            dst_req_id="dst-async-retry",
+            src_req_id="src-async-retry",
+            uuid=804,
+            blocks=[6],
+        )
+        async_engine = _TransientCancelRecvEngine()
+        async_worker._raiden_transfer_engine = async_engine
+        async_worker._stage3_controller_accepted.add("dst-async-retry")
+        async_worker._stage3_pending_controller_failures["dst-async-retry"] = 0.0
+
+        assert async_worker.get_finished() == (set(), set())
+        assert async_engine.cancel_receive_calls == [804]
+        assert "dst-async-retry" in async_worker._stage3_draining_load_recancel
+
+        assert async_worker.get_finished() == (set(), {"dst-async-retry"})
+        assert async_engine.cancel_receive_calls == [804, 804]
+        assert async_worker._stage3_draining_cancelled_loads == {}
+        assert async_worker._stage3_draining_load_recancel == set()
+        assert async_worker.get_block_ids_with_load_errors() == {6}
 
     def test_missing_drain_apis_warns_once_and_caches_per_engine(self, monkeypatch):
         monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
