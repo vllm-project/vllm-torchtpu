@@ -166,7 +166,7 @@ def _validate_slot_spec(spec: Any, slot_name: str, *, allow_none: bool = False) 
         return
     if isinstance(spec, Sequence) and not isinstance(spec, (str, bytes)) and spec:
         for idx, item in enumerate(spec):
-            if not _is_module_or_binding(item):
+            if not (_is_module_or_binding(item) or (allow_none and item is None)):
                 raise MegakernelConfigError(
                     f"Schedule.{slot_name}: layer {idx} has no valid module ({item!r})"
                 )
@@ -285,14 +285,18 @@ class ResolvedSchedule:
         return out
 
 
+NormSeq = Sequence[ModuleOrBinding | None]
+NormSlotSpec = ModuleOrBinding | FromHFLayerTypes | Every | NormSeq | None
+
+
 @dataclass(frozen=True)
 class Schedule:
     """Declarative layer schedule (`mixer`, `ffn`, norms, and per-layer `overrides`)."""
 
     mixer: Any
     ffn: Any
-    pre_norm: ModuleOrBinding | None = None
-    post_norm: ModuleOrBinding | None = None
+    pre_norm: NormSlotSpec = None
+    post_norm: NormSlotSpec = None
     overrides: Mapping[int, Mapping[str, Any]] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:

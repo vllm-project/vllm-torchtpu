@@ -186,9 +186,9 @@ def test_m1_qwen35_rows_above_64_vs_logical_reference(B: int):
     ex = ExecSpec(B=B, T=T, R=R, ctx=256, tiles=tiles, interpret=True)
 
     # Negative controls: ceilings above 128 rows or TOPK > 128 must still fail.
-    with pytest.raises(MegakernelConfigError, match="Invalid E="):
+    with pytest.raises(MegakernelConfigError, match="MoE TOPK=129"):
         dataclasses.replace(g, TOPK=129).check(ex)
-    with pytest.raises(MegakernelConfigError, match="Invalid E="):
+    with pytest.raises(MegakernelConfigError, match="Invalid B=132"):
         g.check(ExecSpec(B=132, T=T, R=R, ctx=256, tiles=tiles, interpret=True))
 
     key = jax.random.PRNGKey(7 + B)
