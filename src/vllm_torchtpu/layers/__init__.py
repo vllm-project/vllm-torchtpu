@@ -17,9 +17,11 @@
 from vllm_torchtpu.layers.adapter import attention as attention
 from vllm_torchtpu.layers.adapter import linear as linear
 from vllm_torchtpu.models.vllm import register_models
+from vllm_torchtpu.reasoning_parsers import register_reasoning_parsers
 from vllm_torchtpu.tokenizers import register_tokenizers
 
 
 def register_layers() -> None:
     register_models()
     register_tokenizers()
+    register_reasoning_parsers()
