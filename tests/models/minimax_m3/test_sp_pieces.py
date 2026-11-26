@@ -22,6 +22,7 @@ one-piece result bit for bit.
 
 import contextlib
 import threading
+import types
 
 import pytest
 import torch
@@ -411,3 +412,163 @@ def test_attention_projects_each_piece(monkeypatch):
         with pytest.raises(base._Stop):
             attn.forward(torch.arange(64), hidden)
     torch.testing.assert_close(seen[1], seen[0], rtol=0, atol=0)
+
+
+# ------------------------------------------------------ trace signatures
+class _IdentityTP(base._TP):
+    """TP 1 without threads, so Dynamo can trace the collectives."""
+
+    def __init__(self):
+        super().__init__(1)
+        self.local.rank = 0
+
+    def _exchange(self, x):
+        return [x]
+
+    def group(self):
+        return _GROUP
+
+
+def _quantize_pow2(x):
+    amax = x.float().abs().amax(-1, keepdim=True)
+    scale = torch.exp2(torch.ceil(torch.log2(amax.clamp(min=1e-30) / 448.0)))
+    return (x.float() / scale).to(base.E4M3), scale
+
+
+def _o_proj_e4m3(q, r, w, s):
+    top = r.amax(0)
+    q = (q.float() * (r / top)).to(base.E4M3)
+    acc = torch.einsum("eti,ein->tn", q.float(), w.float())
+    return (acc * top * s.float()).to(torch.bfloat16)
+
+
+def _e4m3_matmul(q, rs, w, ws):
+    return ((q.float() @ w.float()) * rs * ws.float()).to(torch.bfloat16)
+
+
+def _add_norm_quant(shard, update, weight):
+    x = shard + update
+    xf = x.float()
+    normed = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + base.EPS) * weight
+    q, scale = mm._quantize_rows(normed.to(x.dtype))
+    return x, q, scale
+
+
+class _MoeConfig:
+    skip_final_all_reduce = False
+
+
+_RANK = torch.zeros((1, 1), dtype=torch.int32)
+_GROUP = types.SimpleNamespace(world_size=1, rank_in_group=0, ranks=[0])
+
+
+def _signatures(monkeypatch, sizes, **kw):
+    """graph_signature of the whole model's Dynamo trace (no split graph on
+    TPU: one subgraph whose placeholders are the inputs and every parameter /
+    buffer, in first-use order) at each token count, traced dynamic as the
+    warmup traces each bucket group."""
+    from vllm_torchtpu.compilation import shape_variants
+
+    _env(monkeypatch, **kw)
+    g = _IdentityTP()
+    for name in (
+        "tensor_model_parallel_reduce_scatter",
+        "tensor_model_parallel_all_gather",
+        "tensor_model_parallel_all_reduce",
+    ):
+        monkeypatch.setattr(mm, name, getattr(g, name.split("model_parallel_")[1]))
+    monkeypatch.setattr(
+        base.sp_o_proj, "tensor_model_parallel_all_gather", g.all_gather
+    )
+    monkeypatch.setattr(base.sp_o_proj, "all_to_all_rows", g.all_to_all_rows)
+    monkeypatch.setattr(base.sp_o_proj, "get_tp_group", g.group)
+    monkeypatch.setattr(mm, "get_tp_group", g.group)
+    monkeypatch.setattr(attn_mod, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(pallas_all_reduce, "armed_rank", lambda ranks: _RANK)
+    monkeypatch.setattr(base.sp_o_proj, "_quantize_op", _quantize_pow2)
+    monkeypatch.setattr(base.sp_o_proj, "_o_proj_e4m3_op", _o_proj_e4m3)
+    monkeypatch.setattr(base.quant, "_e4m3_matmul", _e4m3_matmul)
+    monkeypatch.setattr(base, "_fused_norm_op", _add_norm_quant)
+    monkeypatch.setattr(base, "_Experts", _MaskedExperts)
+    monkeypatch.setattr(base, "_Attn", _PieceAttn)
+    monkeypatch.setattr(base, "TP", 1)
+    min_tokens = envs.TPU_MINIMAX_M3_SP_MIN_TOKENS
+    monkeypatch.setattr(
+        mm, "_sp_step", lambda n, size: n >= min_tokens and n % size == 0
+    )
+    state = token_padding.TokenPaddingState.create(max(sizes), "cpu")
+    monkeypatch.setattr(token_padding, "_padding_state", state)
+    model = base._model(0, g, "full" if kw.get("TPU_MINIMAX_M3_SP_MODE") else "off")
+    model.tp_size = 1
+    for layer in model.layers:
+        layer.tp_size = 1
+        if layer.is_moe_layer:
+            layer.block_sparse_moe.experts.moe_config = _MoeConfig()
+    out = {}
+    for t in sizes:
+        graphs = []
+
+        def backend(gm, example_inputs, graphs=graphs):
+            graphs.append((shape_variants.graph_signature(gm), len(gm.graph.nodes)))
+            raise base._Stop  # traced; running needs the TPU ops
+
+        torch._dynamo.reset()
+        x = torch.randn(t, base.H).to(torch.bfloat16)
+        pos = torch.arange(t)
+        torch._dynamo.mark_dynamic(x, 0)
+        torch._dynamo.mark_dynamic(pos, 0)
+        fn = torch.compile(
+            lambda p, e: mm.MiniMaxM3Model.forward(model, None, p, inputs_embeds=e),
+            backend=backend,
+            fullgraph=True,
+        )
+        with pytest.raises(Exception) as err:
+            fn(pos, x)
+        assert graphs, err.value
+        assert len(graphs) == 1
+        out[t] = graphs[0][0]
+        NODES[t] = graphs[0][1]
+    torch._dynamo.reset()
+    return out
+
+
+# Node count of the last _signatures trace per token count.
+NODES: dict[int, int] = {}
+
+_SMALL = [16, 32, 64, 128, 256, 512]
+_SP_ONLY = [1024, 2048]
+_LARGE = [8192, 16384]
+
+_JOB = dict(
+    base._TARGET,
+    TPU_MINIMAX_M3_SP_MIN_TOKENS=1024,
+    TPU_MINIMAX_M3_SP_FFN_PIECES=2,
+    TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS=4096,
+    TPU_MINIMAX_M3_SP_ATTN_PIECES=True,
+)
+
+
+def test_piece_traces_keep_the_signature(monkeypatch):
+    """The r15-merge job's flags (SP from 1024 tokens, FFN + attention pieces
+    from 4096). shape_variants hands a bucket between traces only when they
+    take the same inputs in the same order. The SP traces without pieces
+    (1024, 2048) and with pieces (8192, 16384) must agree, and every trace
+    must be exactly the one with the pieces flags off: the small plain
+    buckets (16..512) trace unchanged. (Plain vs SP is not compared here:
+    the stand-ins read the armed rank only on the SP path, unlike serving.)"""
+    sizes = _SMALL + _SP_ONLY + _LARGE
+    on = _signatures(monkeypatch, sizes, **_JOB)
+    nodes_on = dict(NODES)
+    off = _signatures(
+        monkeypatch,
+        sizes,
+        **dict(
+            _JOB, TPU_MINIMAX_M3_SP_FFN_PIECES=1, TPU_MINIMAX_M3_SP_ATTN_PIECES=False
+        ),
+    )
+    # The pieces engage only from 4096 tokens: smaller traces are identical.
+    assert all(nodes_on[t] == NODES[t] for t in _SMALL + _SP_ONLY)
+    assert all(nodes_on[t] > NODES[t] for t in _LARGE)
+    assert on == off
+    assert len({on[t] for t in _SMALL}) == 1
+    assert len({on[t] for t in _SP_ONLY + _LARGE}) == 1
