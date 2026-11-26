@@ -282,7 +282,9 @@ def test_arm_runner_models_skips_a_draft_that_is_the_target(monkeypatch):
 @pytest.mark.parametrize(
     "ep_impl", ["default", "adaptive", "none", "fp8_all_gather", "collection_chunks"]
 )
-def test_stands_down_when_fused_ep_serves_layer(monkeypatch, ep_impl):
+def test_stands_down_when_fused_ep_serves_layer(
+    monkeypatch, ep_impl, fp8_moe_runner_kit
+):
     """An FP8 pure-EP layer armed with a fused EP kernel must not also be armed
     by fused_moe_decode: apply_monolithic returns from the fused EP branch
     before fused_moe_decode, so arming decode would drop the runner's shared
@@ -293,21 +295,11 @@ def test_stands_down_when_fused_ep_serves_layer(monkeypatch, ep_impl):
     comes from the stand-down, not from another _admit check."""
     import vllm.config as vllm_config
     import vllm.distributed
-    import vllm.distributed.parallel_state as parallel_state
-    from jax.experimental.pallas import tpu as pltpu
-    from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
-        FusedMoEMethodBase,
-    )
-    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
-    from vllm.model_executor.layers.fused_moe.runner import (
-        moe_runner as moe_runner_mod,
-    )
-    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
     from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
         vllm_adapter as adaptive_moe,
     )
-    from vllm_torchtpu.layers.adapter import fused_moe_ep, moe_routing
+    from vllm_torchtpu.layers.adapter import fused_moe_ep
     from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import (
         VllmMoERunner,  # noqa: F401
     )
@@ -341,15 +333,7 @@ def test_stands_down_when_fused_ep_serves_layer(monkeypatch, ep_impl):
     }.items():
         monkeypatch.setitem(vars(envs), name, value)
     monkeypatch.setattr(
-        pltpu,
-        "get_tpu_info",
-        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
-    )
-    monkeypatch.setattr(
         vllm.distributed, "get_tensor_model_parallel_world_size", lambda: n_ranks
-    )
-    monkeypatch.setattr(
-        parallel_state, "get_dp_group", lambda: SimpleNamespace(world_size=1)
     )
     cfg_stub = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=2048)
@@ -371,88 +355,22 @@ def test_stands_down_when_fused_ep_serves_layer(monkeypatch, ep_impl):
     monkeypatch.setattr(bridge, "_check_same_arming_on_every_rank", lambda *_a: None)
     monkeypatch.setattr(bridge, "_build_op", lambda *_a, **_k: fake_decode_op)
 
-    layers: dict[str, MoERunner] = {}
-    monkeypatch.setattr(moe_runner_mod, "get_current_vllm_config", lambda: None)
-    monkeypatch.setattr(
-        moe_runner_mod, "register_layer_for_moe_forward_op", lambda _c, _l: None
+    kit = fp8_moe_runner_kit  # tests/conftest.py: MoERunner hooks + builders
+    moe_cfg = kit.moe_config(
+        use_ep=True, n_ranks=n_ranks, topk=topk, hidden=h, in_dtype=torch.bfloat16
     )
-    monkeypatch.setattr(moe_runner_mod, "get_layer_from_name", layers.__getitem__)
-    monkeypatch.setattr(
-        moe_runner_mod,
-        "get_forward_context",
-        lambda: SimpleNamespace(dp_metadata=None, all_moe_layers=None),
+    qm = kit.fp8_method(moe_cfg)
+    routed = kit.routed_experts(
+        moe_cfg,
+        qm,
+        local_experts=e,
+        global_experts=e * n_ranks,
+        hidden=h,
+        inter=inter,
+        scoring_func="softmax",
+        use_grouped_topk=False,
+        random_weights=False,
     )
-    monkeypatch.setattr(moe_runner_mod, "is_forward_context_available", lambda: False)
-    monkeypatch.setattr(moe_runner_mod, "tensor_model_parallel_all_reduce", lambda t: t)
-
-    par = SimpleNamespace(
-        use_ep=True,
-        ep_size=n_ranks,
-        ep_rank=0,
-        tp_size=1,
-        dp_size=1,
-        pcp_size=1,
-        enable_eplb=False,
-        is_sequence_parallel=False,
-        all2all_backend="allgather_reducescatter",
-        use_fi_nvl_two_sided_kernels=False,
-        use_all2all_kernels=False,
-    )
-    moe_cfg = SimpleNamespace(
-        moe_parallel_config=par,
-        experts_per_token=topk,
-        in_dtype=torch.bfloat16,
-        is_sequence_parallel=False,
-        skip_final_all_reduce=False,
-        tp_size=1,
-        ep_size=n_ranks,
-        ep_rank=0,
-        dp_size=1,
-        pcp_size=1,
-        sp_size=1,
-        hidden_dim=h,
-        hidden_dim_unpadded=h,
-    )
-    qm = VllmFp8MoEMethodTPU.__new__(VllmFp8MoEMethodTPU)
-    FusedMoEMethodBase.__init__(qm, moe_cfg)
-    qm._tpu_activation_str = "silu"
-
-    class _EpRoutedExperts(torch.nn.Module):
-        forward_monolithic = RoutedExperts.forward_monolithic
-
-        def __init__(self):
-            super().__init__()
-            self.moe_config = moe_cfg
-            self.quant_method = qm
-            self.global_num_experts = e * n_ranks
-            self.scoring_func = "softmax"
-            self.renormalize = True
-            self.use_grouped_topk = False
-            self.num_expert_group = 1
-            self.topk_group = 1
-            self.custom_routing_function = None
-            self.routed_scaling_factor = 1.0
-            self.e_score_correction_bias = None
-            self.expert_placement_strategy = "linear"
-            f8 = torch.float8_e4m3fn
-            self.w13_weight = torch.nn.Parameter(
-                torch.zeros((e, h, 2 * inter), dtype=f8), requires_grad=False
-            )
-            self.w2_weight = torch.nn.Parameter(
-                torch.zeros((e, inter, h), dtype=f8), requires_grad=False
-            )
-            self.w13_weight_scale_inv = torch.nn.Parameter(
-                torch.ones((e, 1, 1, 2 * inter)), requires_grad=False
-            )
-            self.w2_weight_scale_inv = torch.nn.Parameter(
-                torch.ones((e, 1, 1, h)), requires_grad=False
-            )
-            moe_routing.register_experts_start_buffer(self, device=torch.device("cpu"))
-
-        def _ensure_moe_quant_config_init(self):
-            pass
-
-    routed = _EpRoutedExperts()
     if ep_impl in ("none", "fp8_all_gather", "collection_chunks"):
         pass  # no fused EP op
     elif ep_impl == "adaptive":
@@ -468,15 +386,13 @@ def test_stands_down_when_fused_ep_serves_layer(monkeypatch, ep_impl):
         setattr(qm, fused_moe_ep.FUSED_MOE_EP_OP_ATTR, ep_op)
 
     shared_mlp = DeepseekV2MLP(h, i_s)
-    runner = MoERunner(
-        layer_name="model.layers.0.mlp.experts",
-        moe_config=moe_cfg,
-        router=SimpleNamespace(prepare_monolithic_logits=lambda logits: logits),
-        routed_experts=routed,
+    runner = kit.runner(
+        "model.layers.0.mlp.experts",
+        moe_cfg,
+        routed,
         shared_experts=shared_mlp,
         routed_scaling_factor=2.5,
     )
-    layers[runner.layer_name] = runner
     model = torch.nn.Module()
     model.add_module("moe", runner)
 
