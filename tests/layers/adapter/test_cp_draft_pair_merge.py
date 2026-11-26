@@ -244,3 +244,206 @@ def test_armed_for(monkeypatch):
     assert par.armed_for([0, 2]) is None
     monkeypatch.setattr(par, "_ARMED", None)
     assert par.armed_for([0, 1]) is None
+
+
+# ---------------------------------------------------------------------------
+# TPU_DRAFT_DCP_PAIR_MERGE_BLOCK
+# ---------------------------------------------------------------------------
+Q_BLOCK = 8
+
+
+def test_forward_folded_dispatch_same_ops_every_bucket(monkeypatch):
+    """With ``ops["pair_merge_block"]`` the attention runs raw (its kernel
+    LSE layout) and the fused op returns the layer output: no block op, no
+    cp_lse_ag_out_rs, for every bucket."""
+    from vllm_torchtpu.distributed import dcp_comm
+
+    def no_ag_rs(*a, **k):
+        raise AssertionError("cp_lse_ag_out_rs on the folded path")
+
+    monkeypatch.setattr(dcp_comm, "cp_lse_ag_out_rs", no_ag_rs)
+    meta = torch.tensor([[1, 0]], dtype=torch.int32)
+    for t in TOKENS:
+        calls = []
+        ops = _recording_ops(calls)
+
+        def attend_raw(q_all, *args):
+            calls.append(("attend_raw", tuple(q_all.shape)))
+            return torch.zeros(q_all.shape[0], 2 * H, D), torch.zeros(4, 1, 16 * H)
+
+        def fused(out, lse, m, q, key, value, seq_lens):
+            calls.append(("pair_merge_block", tuple(lse.shape), key.dtype))
+            return q
+
+        ops.update(attend_raw=attend_raw, pair_merge_block=fused)
+        got = _forward(t, ops, meta, _Group())
+        assert tuple(got.shape) == (t, H, D)
+        assert calls == [
+            ("attend_raw", (t, 2 * H, D)),
+            ("pair_merge_block", (4, 1, 16 * H), torch.bfloat16),
+        ]
+        # Unarmed layers keep the old ops even when the fused op exists.
+        calls.clear()
+        monkeypatch.setattr(
+            dcp_comm, "cp_lse_ag_out_rs", lambda o, ls, g, return_lse: (o[:, :H], ls[:, :H])
+        )
+        _forward(t, ops, None, _Group())
+        assert [c[0] for c in calls] == ["attend", "block"]
+        monkeypatch.setattr(dcp_comm, "cp_lse_ag_out_rs", no_ag_rs)
+
+
+def _block_layer(uniform, quantized, raw=True):
+    layer = _Layer(_Group())
+    ops = dict(
+        attend=1,
+        block_args=dict(max_query_len=Q_BLOCK, sm_scale=0.1, causal=False,
+                        uniform_blocks=uniform, k_scale=0.5, v_scale=0.25),
+    )
+    if raw:
+        ops["attend_raw"] = 2
+    layer.impl.sharded_draft_dcp["ops"] = ops
+    layer.impl.kv_cache_quantized_dtype = quantized
+    return layer
+
+
+def test_block_key():
+    assert cda._block_key(_block_layer(True, torch.float8_e4m3fn)) == (
+        Q_BLOCK, 0.1, False, 0.5, 0.25, "float8_e4m3fn"
+    )
+    assert cda._block_key(_block_layer(True, None))[-1] is None
+    assert cda._block_key(_block_layer(False, None)) is None
+    # Built without the raw attention (flag off at build time): never folded.
+    assert cda._block_key(_block_layer(True, None, raw=False)) is None
+    assert cda._block_key(_Layer(_Group())) is None
+
+
+def test_build_ops_raw_attention_only_with_both_flags(monkeypatch):
+    pytest.importorskip("torch_tpu")
+    from vllm_torchtpu import envs
+
+    kw = dict(dcp=4, head_ranks=2, max_query_len=Q_BLOCK, sliding_window=1024,
+              sm_scale=0.1, causal=False, k_scale=None, v_scale=None,
+              uniform_blocks=True)
+    for pm, blk, want in [(False, True, False), (True, False, False),
+                          (True, True, True)]:
+        monkeypatch.setattr(envs, "TPU_DRAFT_DCP_PAIR_MERGE", pm, raising=False)
+        monkeypatch.setattr(envs, "TPU_DRAFT_DCP_PAIR_MERGE_BLOCK", blk, raising=False)
+        ops = cda.build_ops(**kw)
+        assert ("attend_raw" in ops) == want
+        assert {"write", "attend", "block", "block_args"} <= set(ops)
+
+
+@pytest.mark.parametrize("blocks_ok", [True, False])
+def test_arm_wires_block_ops(monkeypatch, blocks_ok):
+    from vllm_torchtpu import envs
+
+    group = _Group()
+    layers = [_block_layer(True, None), _block_layer(False, None)]
+    for layer in layers:
+        layer.impl.sharded_draft_dcp["head_group"] = group
+    model = torch.nn.Sequential(*layers)
+    _arm_env(monkeypatch, SimpleNamespace(mesh="mesh", rank_ordered=True))
+    monkeypatch.setattr(cda, "_pair_merge_op", lambda mesh, perm: "op")
+    monkeypatch.setattr(cda, "_pair_selftest", lambda *a: True)
+    monkeypatch.setattr(envs, "TPU_DRAFT_DCP_PAIR_MERGE_BLOCK", True, raising=False)
+    monkeypatch.setattr(
+        cda, "_selftest_block_op",
+        lambda key, *a: (("block_op", key), blocks_ok),
+    )
+    assert cda.arm_pair_merge(model) == 2
+    uniform, ragged = (layer.impl.sharded_draft_dcp["ops"] for layer in model)
+    assert uniform["pair_merge"] == ragged["pair_merge"] == "op"
+    assert "pair_merge_block" not in ragged
+    if blocks_ok:
+        assert uniform["pair_merge_block"] == (
+            "block_op", (Q_BLOCK, 0.1, False, 0.5, 0.25, None)
+        )
+    else:
+        assert "pair_merge_block" not in uniform
+
+
+def test_block_ops_one_dynamo_graph_for_all_buckets():
+    """The raw attention op and the fused pair merge + block op trace once
+    with a dynamic token dim (torch.compile fullgraph over meta tensors) for
+    every draft bucket and a large T, with their fake output shapes."""
+    mesh = _cpu_mesh()
+    cda._pair_merge_block_op.cache_clear()
+    fused = cda._pair_merge_block_op(
+        mesh, ((0, 1), (1, 0)), Q_BLOCK, 0.088, False, 0.05, 0.03, "float8_e4m3fn"
+    )
+    attend_raw = cda._attend_op(2, Q_BLOCK, 1024, 0.088, 4, 0.05, 0.03, True, raw=True)
+    frames = []
+
+    def backend(gm, example_inputs):
+        frames.append(gm)
+        return gm.forward
+
+    def step(q, q_all, key, value, cache, seq_lens, tables, starts, rank, meta):
+        out, lse = attend_raw(q_all, cache, seq_lens, tables, starts, rank)
+        return fused(out, lse, meta, q, key, value, seq_lens)
+
+    torch._dynamo.reset()
+    fn = torch.compile(step, backend=backend, fullgraph=True)
+    reqs = 4
+
+    def m(*shape, dtype=torch.bfloat16):
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    fixed = dict(
+        cache=m(64, 128, 2, 2, D, dtype=torch.float8_e4m3fn),
+        seq_lens=m(reqs, dtype=torch.int32),
+        tables=m(reqs, 16, dtype=torch.int32),
+        starts=m(reqs + 1, dtype=torch.int32),
+        rank=m(1, dtype=torch.int32),
+        meta=m(1, 2, dtype=torch.int32),
+    )
+    for t in TOKENS:
+        q, q_all, key, value = m(t, H, D), m(t, 2 * H, D), m(t, 1, D), m(t, 1, D)
+        for x in (q, q_all, key, value):
+            torch._dynamo.mark_dynamic(x, 0)
+        got = fn(q, q_all, key, value, **fixed)
+        assert tuple(got.shape) == (t, H, D) and got.dtype == torch.bfloat16
+    assert len(frames) == 1, len(frames)
+
+
+def test_attend_cached_raw_is_kernel_layout():
+    """``raw=True`` hands out the attention kernel's own outputs: the same
+    partial rows and the LSE as ``[R, 1, Q * 2H]`` (request r's rows
+    lane-major), which reshape to the token-order LSE of the default path."""
+    jnp = pytest.importorskip("jax.numpy")
+    page, dcp, reqs, heads = 128, 4, 3, 2 * H
+    rng = np.random.default_rng(0)
+    ctx = np.array([300, 0, 700], np.int32)
+    total = ctx + Q_BLOCK
+    logical = -(-int(total.max()) // (page * dcp)) + 1
+    tables = jnp.asarray(rng.permutation(reqs * logical), jnp.int32)
+    t = reqs * Q_BLOCK + 8
+    # Context K/V of one KV head, written to every rank's share.
+    cu_ctx = jnp.asarray(np.concatenate([[0], np.cumsum(total)]), jnp.int32)
+    n_ctx = int(total.sum())
+    kv = jnp.asarray(rng.standard_normal((n_ctx, 1, D)), jnp.bfloat16)
+    cache0 = jnp.zeros((reqs * logical, page, 2, 2, D), jnp.bfloat16)
+    cu_q = jnp.asarray(np.arange(reqs + 1) * Q_BLOCK, jnp.int32)
+    q = jnp.asarray(rng.standard_normal((t, heads, D)) * 0.3, jnp.bfloat16)
+    for rank in range(2):
+        cache = cda.write_kv(
+            cache0, kv, kv, jnp.asarray(total), tables, cu_ctx, dcp=dcp,
+            head_ranks=2, rank=jnp.int32(rank), interpret=True,
+        )
+        kw = dict(head_ranks=2, max_query_len=Q_BLOCK, sliding_window=1024,
+                  sm_scale=0.088, dcp=dcp, rank=jnp.int32(rank), interpret=True,
+                  uniform_blocks=True)
+        out, lse = cda.attend_cached(q, cache, jnp.asarray(total), tables, cu_q, **kw)
+        raw_out, raw_lse = cda.attend_cached(
+            q, cache, jnp.asarray(total), tables, cu_q, raw=True, **kw
+        )
+        assert raw_lse.shape == (reqs, 1, Q_BLOCK * heads)
+        live = reqs * Q_BLOCK
+        np.testing.assert_array_equal(
+            np.asarray(raw_lse).reshape(live, heads), np.asarray(lse[:live])
+        )
+        assert np.all(np.asarray(lse[live:]) == -np.inf)
+        np.testing.assert_array_equal(
+            np.asarray(raw_out[:live].astype(jnp.float32)),
+            np.asarray(out[:live].astype(jnp.float32)),
+        )

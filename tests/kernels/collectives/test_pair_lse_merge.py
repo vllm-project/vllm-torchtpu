@@ -231,3 +231,134 @@ def test_compiles_for_tpu7x(t):
     )
     with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
         f.lower(*args).compile()
+
+
+# ---------------------------------------------------------------------------
+# exchange_block (TPU_DRAFT_DCP_PAIR_MERGE_BLOCK): the exchange plus the draft
+# block's own attention and the final merge in one kernel, against the unfused
+# path (token-order partials, collective-permute merge, cache round trip of
+# the block's K/V, cp_draft_attention.attend_block + merge).
+# ---------------------------------------------------------------------------
+Q_BLOCK = 8
+
+
+def _block_inputs(num_reqs, t, two_h, d, seed, scaled):
+    rng = np.random.default_rng(seed)
+    h = two_h // 2
+
+    def bf(*shape, scale=1.0):
+        x = rng.standard_normal((8, *shape)) * scale
+        return jnp.asarray(x, jnp.bfloat16)
+
+    out = bf(t, two_h, d)
+    lse = jnp.asarray(
+        rng.standard_normal((8, num_reqs, 1, Q_BLOCK * two_h)) * 3, jnp.float32
+    )
+    q, k, v = bf(t, h, d, scale=0.3), bf(t, 1, d), bf(t, 1, d)
+    if scaled:
+        return out, lse, q, k, v, dict(k_scale=0.05, v_scale=0.03,
+                                       cache_dtype=jnp.float8_e4m3fn)
+    return out, lse, q, k, v, dict(k_scale=None, v_scale=None, cache_dtype=None)
+
+
+def _unfused(out, lse, meta, q, k, v, *, num_reqs, perm, sm_scale, causal, quant):
+    from vllm_torchtpu.layers.adapter import cp_draft_attention as cda
+
+    t, two_h, _ = out.shape
+    valid = jnp.arange(t) < num_reqs * Q_BLOCK
+    out = jnp.where(valid[:, None, None], out, 0).astype(out.dtype)
+    lse = cda._pad_rows(lse.reshape(-1, two_h), t, -jnp.inf)
+    if quant["k_scale"] is not None:
+        k = cda._round_trip(k, quant["k_scale"], quant["cache_dtype"])
+        v = cda._round_trip(v, quant["v_scale"], quant["cache_dtype"])
+    ctx, ctx_lse = plm.exchange_xla(out, lse, meta.reshape(-1)[1], "x", perm)
+    seq_lens = jnp.zeros((num_reqs,), jnp.int32)
+    out_b, lse_b = cda.attend_block(
+        q, k, v, seq_lens, None, max_query_len=Q_BLOCK, sm_scale=sm_scale,
+        causal=causal, uniform_blocks=True,
+    )
+    return cda.merge(ctx.astype(out_b.dtype), ctx_lse, out_b, lse_b)[0]
+
+
+def _run_block(body, args):
+    mesh = _mesh()
+    f = jax.jit(
+        jax.shard_map(body, mesh=mesh, in_specs=(P("x"),) * 6, out_specs=P("x"),
+                      check_vma=False)
+    )
+    flat = [a.reshape(8 * a.shape[1], *a.shape[2:]) for a in args]
+    got = f(*flat)
+    return np.asarray(got.astype(jnp.float32)).reshape(8, -1, *got.shape[1:])
+
+
+@pytest.mark.parametrize("scaled", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_reqs,t", [(2, 18), (4, 32)])
+def test_exchange_block_interpret_matches_unfused(tpu7x, scaled, causal, num_reqs, t):
+    """Every rank's merged block output from the fused kernel (interpret mode)
+    matches the unfused ops to bf16 roundings (the self-test's tolerance):
+    the kernel computes the block attention in f32 over all heads at once and
+    rounds where the unfused path hands bf16 tensors between ops."""
+    pairs = PAIRS
+    out, lse, q, k, v, quant = _block_inputs(num_reqs, t, 16, 128, 4, scaled)
+    meta = _meta(pairs)
+    sm_scale = 128**-0.5
+    kw = dict(q_block=Q_BLOCK, sm_scale=sm_scale, causal=causal, **quant)
+    try:
+        got = _run_block(
+            lambda o, ls, m, q_, k_, v_: plm.exchange_block(
+                o, ls.reshape(num_reqs, 1, -1), m, q_, k_, v_, **kw,
+                interpret=pltpu.InterpretParams(),
+            ),
+            (out, lse, meta.reshape(8, 1, 2), q, k, v),
+        )
+    except NotImplementedError as e:  # interpreter without remote DMA
+        pytest.skip(f"interpret mode cannot run the remote copies: {e}")
+    want = _run_block(
+        lambda o, ls, m, q_, k_, v_: _unfused(
+            o, ls.reshape(num_reqs, 1, -1), m, q_, k_, v_, num_reqs=num_reqs,
+            perm=_perm(pairs), sm_scale=sm_scale, causal=causal, quant=quant,
+        ),
+        (out, lse, meta.reshape(8, 1, 2), q, k, v),
+    )
+    live = num_reqs * Q_BLOCK
+    np.testing.assert_allclose(got[:, :live], want[:, :live], rtol=2**-6, atol=1e-2)
+    err = np.abs(got[:, :live] - want[:, :live])
+    # For the record: mostly equal, the rest bf16 roundings.
+    assert np.mean(err == 0) > 0.5, np.mean(err == 0)
+
+
+def test_exchange_block_compiles_for_tpu7x():
+    """Mosaic lowers the fused block kernel (deviceless tpu7x 2x2x1) at a
+    64-row draft bucket of 8 requests, int8-like cache round trip off."""
+    from jax.experimental import topologies
+    from jax.sharding import NamedSharding
+
+    try:
+        topo = topologies.get_topology_desc("tpu7x:2x2x1", "tpu")
+    except Exception as e:  # no libtpu
+        pytest.skip(f"no deviceless tpu7x topology: {e}")
+    mesh = Mesh(np.array(topo.devices), ("x",))
+    t, num_reqs = 64, 8
+
+    def body(o, ls, m, q_, k_, v_):
+        return plm.exchange_block(o, ls, m, q_, k_, v_, q_block=Q_BLOCK,
+                                  sm_scale=0.088, causal=False)
+
+    f = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=(P("x"),) * 6,
+                              out_specs=P("x"), check_vma=False))
+    sh = NamedSharding(mesh, P("x"))
+
+    def s(shape, dt):
+        return jax.ShapeDtypeStruct(shape, dt, sharding=sh)
+
+    args = (
+        s((8 * t, 16, 128), jnp.bfloat16),
+        s((8 * num_reqs, 1, Q_BLOCK * 16), jnp.float32),
+        s((8, 2), jnp.int32),
+        s((8 * t, 8, 128), jnp.bfloat16),
+        s((8 * t, 1, 128), jnp.bfloat16),
+        s((8 * t, 1, 128), jnp.bfloat16),
+    )
+    with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+        f.lower(*args).compile()

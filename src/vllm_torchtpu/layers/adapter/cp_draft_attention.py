@@ -61,6 +61,7 @@ import torch
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import tight_vmem
 from vllm_torchtpu.logger import init_logger
 
@@ -529,6 +530,7 @@ def attend_cached(
     v_scale: float | None = None,
     interpret: bool = False,
     uniform_blocks: bool = False,
+    raw: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Partial attention of ``q [T, H, D]`` (every query head of this rank's
     KV head) over the cached tokens of the window held by this rank. Returns
@@ -567,7 +569,12 @@ def attend_cached(
         k_scale=k_scale,
         v_scale=v_scale,
         interpret=interpret,
+        native_lse=raw,
     )
+    if raw:
+        # The kernel's own layout (`attend_pages` ``native_lse``), for
+        # consumers that take it as it is (`pair_lse_merge.exchange_block`).
+        return out, lse
     # Back to token order.
     if uniform_blocks:
         valid = _uniform_rows(seq_lens.shape[0], max_query_len, num_tokens)
@@ -610,6 +617,7 @@ def attend_pages(
     k_scale: float | None = None,
     v_scale: float | None = None,
     interpret: bool = False,
+    native_lse: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Each request's query tokens (``q [T, H, D]`` rows ``q_starts[r]`` on,
     ``q_lens[r]`` of at most ``max_query_len``) over its window pages
@@ -886,6 +894,10 @@ def attend_pages(
         q,
         kv_cache,
     )
+    if native_lse:
+        # [R, 1, Q * H] as the kernel writes it (request r's rows lane-major):
+        # the reshape below is a relayout XLA runs as its own op.
+        return out, lse
     return out, lse.reshape(num_reqs, q_block, num_heads)
 
 
@@ -1066,6 +1078,21 @@ def build_ops(
     """The write, cached-attention and block ops of one draft layer.
     ``uniform_blocks``: every forward's query rows are ``max_query_len``
     tokens per request (`attend_cached`)."""
+    extra: dict[str, Any] = {}
+    if envs.TPU_DRAFT_DCP_PAIR_MERGE and envs.TPU_DRAFT_DCP_PAIR_MERGE_BLOCK:
+        # The attention with the kernel's own LSE layout, for the pair merge
+        # op that folds the block op in (`arm_pair_merge`).
+        extra["attend_raw"] = _attend_op(
+            head_ranks,
+            max_query_len,
+            sliding_window,
+            sm_scale,
+            dcp,
+            k_scale,
+            v_scale,
+            uniform_blocks,
+            raw=True,
+        )
     return dict(
         write=_write_op(dcp, head_ranks, k_scale, v_scale),
         attend=_attend_op(
@@ -1079,6 +1106,16 @@ def build_ops(
             uniform_blocks,
         ),
         block=_block_op(max_query_len, sm_scale, causal, uniform_blocks),
+        # The block op's static arguments (`_block_key`).
+        block_args=dict(
+            max_query_len=max_query_len,
+            sm_scale=sm_scale,
+            causal=causal,
+            uniform_blocks=uniform_blocks,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        ),
+        **extra,
     )
 
 
@@ -1126,6 +1163,7 @@ def _attend_op(
     k_scale: float | None,
     v_scale: float | None,
     uniform_blocks: bool,
+    raw: bool = False,
 ):
     from torch_tpu._internal import pallas
 
@@ -1152,13 +1190,27 @@ def _attend_op(
             k_scale=k_scale,
             v_scale=v_scale,
             uniform_blocks=uniform_blocks,
+            raw=raw,
         )
 
     name = (
         f"pallas::dcp_draft_attend_h{head_ranks}_q{max_query_len}_w{sliding_window}"
         f"_s{sm_scale:.8f}_d{dcp}_k{k_scale}_v{v_scale}_u{int(uniform_blocks)}"
+        f"{'_raw' if raw else ''}"
     ).replace(".", "p")
     op = pallas.jax_op(name, _attend)
+    if raw:
+        op.register_fake(
+            lambda q, kv_cache, seq_lens, *args: (
+                torch.empty_like(q),
+                torch.empty(
+                    (seq_lens.shape[0], 1, max_query_len * q.shape[1]),
+                    dtype=torch.float32,
+                    device=q.device,
+                ),
+            )
+        )
+        return op
     op.register_fake(
         lambda q, *args: (
             torch.empty_like(q),
@@ -1378,7 +1430,9 @@ def forward_with_dcp(
     heads; ``key``/``value [T, 1, D]``, own KV head) over the window of a
     DCP-sharded cache plus the block itself. The block is not written.
     ``pair_meta``: set by `arm_pair_merge`, the partials merge through
-    ``ops["pair_merge"]`` (one exchange with the head's other rank)."""
+    ``ops["pair_merge"]`` (one exchange with the head's other rank), or with
+    ``ops["pair_merge_block"]`` the exchange, the block's own attention and
+    the final merge run in one op."""
     from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 
     del dcp, kv_head_replicas  # shared layer args (the cache spec uses them)
@@ -1387,7 +1441,8 @@ def forward_with_dcp(
     q_all = query
     if head_group is not None:
         q_all = head_group.all_gather(query.contiguous(), dim=1)
-    ctx_out, ctx_lse = ops["attend"](
+    folded = pair_meta is not None and "pair_merge_block" in ops
+    ctx_out, ctx_lse = ops["attend_raw" if folded else "attend"](
         q_all,
         kv_cache,
         attn_metadata.seq_lens,
@@ -1395,6 +1450,18 @@ def forward_with_dcp(
         attn_metadata.query_start_loc,
         dcp_rank,
     )
+    if folded:
+        # The kernel's own LSE layout and the block's K/V as they are: the op
+        # quantizes them like the cache.
+        return ops["pair_merge_block"](
+            ctx_out,
+            ctx_lse,
+            pair_meta,
+            query,
+            key.to(query.dtype),
+            value.to(query.dtype),
+            attn_metadata.seq_lens,
+        )
     if pair_meta is not None:
         ctx_out, ctx_lse = ops["pair_merge"](ctx_out, ctx_lse, pair_meta)
     else:
@@ -1504,6 +1571,206 @@ def _pair_selftest(
     return ok
 
 
+def _round_trip(x: jax.Array, scale: float, quantized) -> jax.Array:
+    """x as the draft cache holds it (`forward_with_dcp`'s block K/V)."""
+    stored = (x.astype(jnp.float32) / scale).astype(quantized).astype(jnp.float32)
+    return (stored * scale).astype(x.dtype)
+
+
+@functools.cache
+def _pair_merge_block_op(
+    mesh: Any,
+    perm: tuple[tuple[int, int], ...],
+    max_query_len: int,
+    sm_scale: float,
+    causal: bool,
+    k_scale: float | None,
+    v_scale: float | None,
+    cache_dtype: str | None,
+):
+    """`_pair_merge_op` with the draft block's own attention and the final
+    merge (`_block_op`, uniform blocks) folded into the exchange kernel
+    (`pair_lse_merge.exchange_block`); the unfused ops past its cap. Takes
+    the attention's `attend_raw` outputs and the block's K/V before the
+    cache quantization (``k_scale``, ``v_scale`` into ``cache_dtype``)."""
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.kernels.collectives import pair_lse_merge
+
+    axis = mesh.axis_names[0]
+
+    quantized = jnp.dtype(cache_dtype) if k_scale is not None else None
+
+    def body(out, lse, meta, q, key, value, seq_lens):
+        if pair_lse_merge.supported(out.shape, out.dtype):
+            return pair_lse_merge.exchange_block(
+                out,
+                lse,
+                meta,
+                q,
+                key,
+                value,
+                q_block=max_query_len,
+                sm_scale=sm_scale,
+                causal=causal,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                cache_dtype=quantized,
+            )
+        # The unfused ops on the attention's token-order outputs
+        # (`attend_cached`'s uniform-block layout).
+        num_tokens, two_h, _ = out.shape
+        valid = jnp.arange(num_tokens) < seq_lens.shape[0] * max_query_len
+        out = jnp.where(valid[:, None, None], out, 0).astype(out.dtype)
+        lse = _pad_rows(lse.reshape(-1, two_h), num_tokens, _NEG_INF)
+        if quantized is not None:
+            key = _round_trip(key, k_scale, quantized)
+            value = _round_trip(value, v_scale, quantized)
+        block = meta.reshape(-1)[1]
+        ctx, ctx_lse = pair_lse_merge.exchange_xla(out, lse, block, axis, list(perm))
+        out_b, lse_b = attend_block(
+            q,
+            key,
+            value,
+            seq_lens,
+            None,
+            max_query_len=max_query_len,
+            sm_scale=sm_scale,
+            causal=causal,
+            uniform_blocks=True,
+        )
+        return merge(ctx.astype(out_b.dtype), ctx_lse, out_b, lse_b)[0]
+
+    specs = (P(axis),) * 7
+    sharded = jax.shard_map(
+        body, mesh=mesh, in_specs=specs, out_specs=P(axis), check_vma=False
+    )
+
+    # torch_tpu reads the operand types from these annotations.
+    def fn(
+        out: jax.Array,
+        lse: jax.Array,
+        meta: jax.Array,
+        q: jax.Array,
+        key: jax.Array,
+        value: jax.Array,
+        seq_lens: jax.Array,
+    ) -> jax.Array:
+        args = (out, lse, meta, q, key, value, seq_lens)
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    name = (
+        f"pallas::dcp_draft_pair_merge_block_q{max_query_len}_s{sm_scale:.8f}"
+        f"_c{int(causal)}_k{k_scale}_v{v_scale}_{cache_dtype}"
+    ).replace(".", "p")
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        name, fn, mesh=mesh, input_partition_specs=specs, output_partition_specs=P(axis)
+    )
+    op.register_fake(lambda out, lse, meta, q, *args: torch.empty_like(q))
+    return op
+
+
+def _block_key(layer: Any) -> tuple | None:
+    """`_pair_merge_block_op`'s static arguments for a layer whose block op
+    the pair merge can fold in (uniform blocks), else None."""
+    ops = layer.impl.sharded_draft_dcp["ops"]
+    block_args = ops.get("block_args")
+    if block_args is None or "attend_raw" not in ops:
+        return None
+    if not block_args["uniform_blocks"]:
+        return None
+    quantized = layer.impl.kv_cache_quantized_dtype
+    return (
+        block_args["max_query_len"],
+        block_args["sm_scale"],
+        block_args["causal"],
+        block_args["k_scale"],
+        block_args["v_scale"],
+        None if quantized is None else str(quantized).removeprefix("torch."),
+    )
+
+
+def _arm_pair_merge_block(layers, mesh, perm, pair_op, meta, shape, tp) -> dict:
+    """`TPU_DRAFT_DCP_PAIR_MERGE_BLOCK`: the folded block op per distinct
+    block configuration of ``layers``, each self-tested against the unfused
+    pair merge + block op on a decode block; {} when off or a test fails on
+    any rank. Collective over the TP group."""
+    if not envs.TPU_DRAFT_DCP_PAIR_MERGE_BLOCK:
+        return {}
+    keys = {_block_key(m) for m in layers}
+    keys.discard(None)
+    import faulthandler
+
+    device = meta.device
+    gen = torch.Generator().manual_seed(11 + int(tp.rank_in_group))
+    built, ok = {}, True
+    # A wrong peer or semaphore hangs the exchange instead of failing.
+    faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
+    try:
+        for key in sorted(keys, key=repr):
+            try:
+                built[key], passed = _selftest_block_op(
+                    key, mesh, perm, pair_op, meta, shape, gen, device
+                )
+            except Exception as e:  # noqa: BLE001 - any failure keeps it off
+                logger.warning("DCP draft pair merge + block self-test raised: %r", e)
+                passed = False
+            ok &= passed
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+    seen = [None] * tp.world_size
+    torch.distributed.all_gather_object(seen, ok, group=tp.cpu_group)
+    if not all(seen):
+        logger.warning("DCP draft pair merge + block not armed: self-test %s", seen)
+        return {}
+    logger.info("DCP draft pair merge folds the block op (%s).", sorted(built))
+    return built
+
+
+def _selftest_block_op(key, mesh, perm, pair_op, meta, shape, gen, device):
+    """The folded op of block configuration ``key`` and whether it matches the
+    unfused path (`forward_with_dcp`: the attention's token-order outputs,
+    the pair merge, the cache round trip of the block's K/V, the block op) on
+    a decode block of two requests and two padding rows."""
+    max_query_len, sm_scale, causal, k_scale, v_scale, cache_dtype = key
+    block_op = _pair_merge_block_op(mesh, perm, *key)
+    rows, (two_h, d) = 2 * max_query_len + 2, shape
+    heads, valid = two_h // 2, 2 * max_query_len
+
+    def t(*dims, dtype=torch.bfloat16, scale=1.0):
+        return (torch.randn(dims, generator=gen) * scale).to(dtype).to(device)
+
+    out = t(rows, two_h, d)
+    lse = t(2, 1, max_query_len * two_h, dtype=torch.float32, scale=3)
+    q, key_, value = t(rows, heads, d), t(rows, 1, d), t(rows, 1, d)
+    seq_lens = torch.zeros(2, dtype=torch.int32, device=device)
+    starts = torch.arange(3, dtype=torch.int32, device=device) * max_query_len
+    got = block_op(out, lse, meta, q, key_, value, seq_lens)
+    out_t = out.clone()
+    out_t[valid:] = 0
+    lse_t = torch.full((rows, two_h), float("-inf"), device=device)
+    lse_t[:valid] = lse.reshape(valid, two_h)
+    ctx, ctx_lse = pair_op(out_t, lse_t, meta)
+    if k_scale is not None:
+        quantized = getattr(torch, cache_dtype)
+        key_ = ((key_.float() / k_scale).to(quantized).float() * k_scale).to(q.dtype)
+        value = ((value.float() / v_scale).to(quantized).float() * v_scale).to(
+            q.dtype
+        )
+    want = _block_op(max_query_len, sm_scale, causal, True)(
+        q, key_, value, seq_lens, starts, ctx, ctx_lse
+    )
+    passed = torch.allclose(
+        got.float().cpu(), want.float().cpu(), rtol=2**-6, atol=1e-2
+    )
+    return block_op, bool(passed)
+
+
 def _pair_perm(pairs, tp_ranks) -> tuple[tuple[int, int], ...]:
     """The collective-permute pairs (mesh indices, both directions) of the
     two-rank head groups ``pairs`` (global ranks) over the TP group whose
@@ -1566,8 +1833,12 @@ def arm_pair_merge(model: torch.nn.Module) -> int:
     if not all(ok):
         logger.warning("DCP draft pair merge not armed: self-test failed %s", ok)
         return 0
+    block_ops = _arm_pair_merge_block(layers, armed.mesh, perm, op, meta, shape, tp)
     for layer in layers:
         ops = dict(layer.impl.sharded_draft_dcp["ops"], pair_merge=op)
+        key = _block_key(layer)
+        if key in block_ops:
+            ops["pair_merge_block"] = block_ops[key]
         layer.impl.sharded_draft_dcp["ops"] = ops
         layer.register_buffer("draft_pair_meta", meta, persistent=False)
     logger.info(

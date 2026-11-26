@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE: bool = False
     TPU_MINIMAX_M3_DSPARK_CONTEXT_KV_CAT: bool = False
     TPU_DRAFT_DCP_PAIR_MERGE: bool = False
+    TPU_DRAFT_DCP_PAIR_MERGE_BLOCK: bool = False
     TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS: int = 0
     TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS: int = 0
     TPU_MINIMAX_M3_SP_MODE: str = "off"
@@ -882,6 +883,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES > 0) in rank order and an async
     # drafter; armed after a self-test, else the usual merge. Default off.
     "TPU_DRAFT_DCP_PAIR_MERGE": env_bool("TPU_DRAFT_DCP_PAIR_MERGE", default=False),
+    # With TPU_DRAFT_DCP_PAIR_MERGE armed: the draft block's own attention and
+    # the final merge run in the pair exchange kernel
+    # (kernels/collectives/pair_lse_merge.py `exchange_block`, uniform draft
+    # blocks) instead of the XLA block op after it. Armed per block
+    # configuration after a self-test; else the unfused pair merge. Default off.
+    "TPU_DRAFT_DCP_PAIR_MERGE_BLOCK": env_bool(
+        "TPU_DRAFT_DCP_PAIR_MERGE_BLOCK", default=False
+    ),
     # MiniMax-M3 e4m3 linears: token buckets of at most this many rows split
     # the bf16 activations into two e4m3 terms (x ~ s * (hi + lo / 16), one
     # power-of-two scale s per row) and run one fp8 x fp8 MXU matmul over the
