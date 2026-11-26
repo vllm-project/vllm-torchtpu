@@ -6977,10 +6977,21 @@ class TPURaidenConnectorWorker:
                         done_recving.append(req_id)
             for req_id in done_recving:
                 if req_id in self._stage3_inflight_submits:
-                    self._stage3_deferred_native_failures[req_id] = False
+                    self._stage3_deferred_native_failures.setdefault(req_id, False)
             for req_id in failed_recving:
                 if req_id in self._stage3_inflight_submits:
                     self._stage3_deferred_native_failures[req_id] = True
+            native_failed_recvs = list(
+                dict.fromkeys(
+                    req_id
+                    for req_id in failed_recving
+                    if req_id in self._stage3_controller_accepted
+                    and req_id not in self._stage3_inflight_submits
+                    and req_id not in self._stage3_terminal_loads
+                    and req_id not in self._stage3_draining_cancelled_loads
+                )
+            )
+            native_failed_set = set(native_failed_recvs)
             done_recving = [
                 req_id
                 for req_id in done_recving
@@ -6988,16 +6999,10 @@ class TPURaidenConnectorWorker:
                 and req_id not in self._stage3_inflight_submits
                 and req_id not in self._stage3_terminal_loads
                 and req_id not in self._stage3_draining_cancelled_loads
+                and req_id not in native_failed_set
             ]
-            failed_recving = [
-                req_id
-                for req_id in failed_recving
-                if req_id in self._stage3_controller_accepted
-                and req_id not in self._stage3_inflight_submits
-                and req_id not in self._stage3_terminal_loads
-                and req_id not in self._stage3_draining_cancelled_loads
-            ]
-            terminal_recvs = set(done_recving) | set(failed_recving)
+            failed_recving = []
+            terminal_recvs = set(done_recving) | native_failed_set
             for req_id in terminal_recvs:
                 self._stage3_pending_controller_failures.pop(req_id, None)
             now = time.time()
@@ -7038,6 +7043,9 @@ class TPURaidenConnectorWorker:
                     self._record_stage3_load_failure(
                         req_id, self._load_block_ids.get(req_id, [])
                     )
+                    failed_recving.append(req_id)
+            for req_id in native_failed_recvs:
+                if self._cancel_or_drain_stage3_load(engine, req_id):
                     failed_recving.append(req_id)
             expired_uncertain = [
                 req_id

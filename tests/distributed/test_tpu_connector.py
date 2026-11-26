@@ -9060,6 +9060,82 @@ class TestStage3DmaDrainSafety:
         assert worker.get_finished({"dst-timeout-late-done"}) == (set(), set())
         assert worker._load_block_ids == {}
 
+    def test_decode_deferred_failure_not_overwritten_and_native_fail_drains(
+        self, monkeypatch
+    ):
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+
+        # Case 1: Late done_recving while inflight must not overwrite a
+        # deferred native failure.
+        worker1, engine1 = self._seeded_decode_worker(
+            dst_req_id="dst-def-fail",
+            src_req_id="src-def-fail",
+            uuid=640,
+            blocks=[1, 2],
+        )
+        worker1._stage3_inflight_submits.add("dst-def-fail")
+        engine1.poll_results.append(([], [], ["src-def-fail"]))
+        assert worker1.get_finished() == (set(), set())
+        assert worker1._stage3_deferred_native_failures == {"dst-def-fail": True}
+
+        engine1.poll_results.append(([], ["src-def-fail"], []))
+        assert worker1.get_finished() == (set(), set())
+        assert worker1._stage3_deferred_native_failures == {"dst-def-fail": True}
+
+        worker1._stage3_inflight_submits.discard("dst-def-fail")
+        worker1._stage3_controller_accepted.add("dst-def-fail")
+        engine1.cancel_receive_settled = True
+        engine1.receive_settled = True
+        assert worker1.get_finished() == (set(), {"dst-def-fail"})
+        assert worker1.get_block_ids_with_load_errors() == {1, 2}
+        assert engine1.cancel_receive_calls == [640]
+
+        # Case 2: Native failed_recving calls cancel_receive(root_uuid) and
+        # holds destination blocks in _stage3_draining_cancelled_loads until
+        # is_receive_settled returns True.
+        worker2, engine2 = self._seeded_decode_worker(
+            dst_req_id="dst-native-fail-drain",
+            src_req_id="src-native-fail-drain",
+            uuid=641,
+            blocks=[3, 4],
+        )
+        worker2._stage3_controller_accepted.add("dst-native-fail-drain")
+        engine2.poll_results.append(([], [], ["src-native-fail-drain"]))
+        assert worker2.get_finished() == (set(), set())
+        assert engine2.cancel_receive_calls == [641]
+        assert worker2._stage3_draining_cancelled_loads == {
+            "dst-native-fail-drain": 641
+        }
+        assert worker2.get_block_ids_with_load_errors() == set()
+
+        engine2.receive_settled = True
+        assert worker2.get_finished() == (set(), {"dst-native-fail-drain"})
+        assert worker2.get_block_ids_with_load_errors() == {3, 4}
+        assert worker2._stage3_draining_cancelled_loads == {}
+
+        # Case 3: Same-poll done_recving + failed_recving suppresses
+        # done_recving and avoids logging raiden_stage3_receiver_complete.
+        worker3, engine3 = self._seeded_decode_worker(
+            dst_req_id="dst-same-poll-both",
+            src_req_id="src-same-poll-both",
+            uuid=642,
+            blocks=[5],
+        )
+        worker3._stage3_controller_accepted.add("dst-same-poll-both")
+        engine3.cancel_receive_settled = True
+        engine3.receive_settled = True
+        engine3.poll_results.append(
+            ([], ["src-same-poll-both"], ["src-same-poll-both"])
+        )
+        with patch(f"{_MOD}.logger.info") as info_log:
+            assert worker3.get_finished() == (set(), {"dst-same-poll-both"})
+        assert not any(
+            "raiden_stage3_receiver_complete" in str(call.args)
+            for call in info_log.call_args_list
+        )
+        assert worker3.get_block_ids_with_load_errors() == {5}
+        assert engine3.cancel_receive_calls == [642]
+
     def test_decode_draining_receive_and_immediate_settle(self, monkeypatch):
         monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
         worker, engine = self._seeded_decode_worker(
