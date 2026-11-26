@@ -1045,3 +1045,26 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
     assert programs() == before, (
         f"{builder} builder compiled a program per request count"
     )
+
+
+def test_moe_free_draft_leaves_the_target_padding_mask():
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.draft_model = mock.MagicMock()
+    proposer._draft_has_moe_cache = False
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        mesh=None,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+    )
+    proposer._build_attn_metadata_for_draft = mock.MagicMock(return_value={})
+    with mock.patch.object(dflash_module, "synchronize_tensors"):
+        mask = _padding_mask_at_draft_forward(
+            proposer,
+            lambda: proposer._dummy_draft_forward(
+                num_tokens=8, use_max_model_len=True, sync=False
+            ),
+            num_rows=8,
+        )
+    # The target step's mask (3 real rows of 16) is untouched.
+    assert mask == [False] * 3 + [True] * 5

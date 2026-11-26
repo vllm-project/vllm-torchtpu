@@ -211,3 +211,14 @@ def test_mask_router_logits_for_padding():
     finally:
         token_padding.set_padding_state(None)
     assert token_padding.mask_router_logits_for_padding(logits) is logits
+
+
+def test_repeated_update_keeps_contents_and_rewrites_on_change():
+    state = TokenPaddingState(local_padding_mask=torch.zeros(16, dtype=torch.bool))
+    state.update(7, 8)
+    state.update(7, 8)
+    assert state.get_local_padding_mask(8).tolist() == [False] * 7 + [True]
+    state.update(8, 8)
+    assert state.get_local_padding_mask(8).sum().item() == 0
+    state.update(5, 8)
+    assert state.get_local_padding_mask(8).tolist() == [False] * 5 + [True] * 3

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -24,6 +24,8 @@ class TokenPaddingState:
     """Track token padding."""
 
     local_padding_mask: torch.Tensor
+    # (valid, padded) rows of the mask's current contents.
+    _written: tuple[int, int] | None = field(default=None, init=False)
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
@@ -33,11 +35,15 @@ class TokenPaddingState:
         return cls(local_padding_mask=local_padding_mask)
 
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
-        """Write this rank's token padding mask."""
+        """Write this rank's token padding mask, unless it already holds it."""
+        key = (local_valid_tokens, local_padded_tokens)
+        if key == self._written:
+            return
         host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
         host[local_valid_tokens:local_padded_tokens] = True
         # Synchronous copy since the host tensor is temporary.
         self.local_padding_mask.copy_(host)
+        self._written = key
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
