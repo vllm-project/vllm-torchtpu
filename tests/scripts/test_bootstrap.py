@@ -352,6 +352,8 @@ class TestBootstrapUnits(unittest.TestCase):
     def test_build_context_properties_and_priorities(self) -> None:
         bp = self.bp
         ctx = bp.BuildContext.from_env
+        # The nightly on main ties with pull requests for agent pods.
+        self.assertEqual(bp.PRIORITIES["nightly"][0], bp.PRIORITIES["pre-merge"][0])
 
         for env, expected_kind, expected_prio in (
             (
@@ -361,13 +363,13 @@ class TestBootstrapUnits(unittest.TestCase):
                     "BUILDKITE_BRANCH": "main",
                 },
                 "nightly",
-                (1, "nightly"),
+                (6, "nightly"),
             ),
             # Started by hand on main: still the nightly.
             (
                 {"NIGHTLY": "1", "BUILDKITE_SOURCE": "ui", "BUILDKITE_BRANCH": "main"},
                 "nightly",
-                (1, "nightly"),
+                (6, "nightly"),
             ),
             # NIGHTLY=1 off main: a manual full suite or a release gate.
             (
@@ -517,7 +519,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     "BUILDKITE_BRANCH": "main",
                     "BUILDKITE_SOURCE": "schedule",
                 },
-                "nightly",
+                "unclassed-nightly",
                 (1, None),
             ),
             (
@@ -526,7 +528,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     "BUILDKITE_BRANCH": "main",
                     "BUILDKITE_SOURCE": "api",
                 },
-                "nightly",
+                "unclassed-nightly",
                 (1, None),
             ),
             (
@@ -535,7 +537,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     "BUILDKITE_BRANCH": "main",
                     "BUILDKITE_SOURCE": "ui",
                 },
-                "nightly",
+                "unclassed-nightly",
                 (1, None),
             ),
             (
@@ -544,7 +546,7 @@ class TestBootstrapUnits(unittest.TestCase):
                     "BUILDKITE_BRANCH": "main",
                     "BUILDKITE_SOURCE": "ui",
                 },
-                "nightly",
+                "unclassed-nightly",
                 (1, None),
             ),
         ):
@@ -1842,7 +1844,7 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertEqual(
             nightly.meta[:3],
             [
-                ("JOB_PRIORITY", "1"),
+                ("JOB_PRIORITY", "6"),
                 ("WORKLOAD_PRIORITY", "nightly"),
                 ("VLLM_COMMIT_HASH", self.pinned),
             ],

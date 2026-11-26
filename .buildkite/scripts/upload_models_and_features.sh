@@ -24,6 +24,10 @@ FEATURE_LIST_KEY="feature-list"
 # SHAPE=${MODEL_SHAPE_MULTI} or ${MODEL_SHAPE_SINGLE}; each generation's group
 # below exports the pod shapes those name before its upload interpolates them.
 
+# The build's job priority, which bootstrap.py records in meta-data: this step
+# runs on the cpu queue without it in its env, and the TPU steps it uploads
+# must queue at the same priority as the rest of the build.
+JOB_PRIORITY="${JOB_PRIORITY:-$(buildkite-agent meta-data get JOB_PRIORITY --default 1)}"
 if [[ ! "${JOB_PRIORITY:-1}" =~ ^-?[0-9]+$ ]]; then
   echo "ERROR: JOB_PRIORITY must be an integer, got: '${JOB_PRIORITY:-}'"
   exit 1

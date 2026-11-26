@@ -103,10 +103,10 @@ _PIPELINE_PROFILES: dict[str, PipelineProfile] = {
         default_suite="vllm-canary", build_kind="other", uses_vllm_head=True
     ),
     "vllm-torchtpu-canary-torchtpu": PipelineProfile(
-        default_suite="default", build_kind="nightly", canary_leg="torch-tpu"
+        default_suite="default", build_kind="unclassed-nightly", canary_leg="torch-tpu"
     ),
     "vllm-torchtpu-canary-tpu-sync": PipelineProfile(
-        default_suite="default", build_kind="nightly", canary_leg="tpu-sync"
+        default_suite="default", build_kind="unclassed-nightly", canary_leg="tpu-sync"
     ),
 }
 _PR_NUM_RE = re.compile(r"^[0-9]+$")
@@ -617,22 +617,23 @@ def tpu_generations_note(ctx: BuildContext, suite: Suite) -> str | None:
 
 
 # Build kind -> (Buildkite job priority, Kueue workload priority class).
-# The nightly on main uses the fleet's `nightly` Kueue class, which the
-# tpu-inference nightly is meant to share and which ties with pre-merge:
-# Kueue admits equal priorities in order of age, so the nightly waits for the
-# pull requests already queued and not for the ones submitted after it.
-# Unclassed, it would wait behind every pull request until the launcher's
-# queue limit failed it.
+# A kube step waits twice. First for a Buildkite agent pod: the fleet runs a
+# fixed number at once, pods that wait for TPU chips count, and Buildkite fills
+# free ones by job priority. Then for TPU chips, which Kueue hands out by class.
+# The nightly on main ties with this repo's pull requests at both: the
+# pre-merge job priority, and the fleet's `nightly` Kueue class, which the
+# tpu-inference nightly is meant to share. Equal priorities go in order of age,
+# so the nightly waits for the pull requests already queued and not for the
+# ones submitted after it. Lower at either step, it waits behind every pull
+# request until its jobs expire or the launcher's queue limit fails them.
 # A NIGHTLY=1 build off main (a release gate, a manual full suite) and the
-# torch-tpu canary are unclassed. The Buildkite job priority is lowest: it
-# orders agent pickup and the bare-metal steps, while Kueue's class orders the
-# steps that wait for TPU chips.
+# torch-tpu and tpu-sync canaries are unclassed, at the lowest job priority.
 PRIORITIES: dict[str, tuple[int, str | None]] = {
     "oncall-fix": (12, "oncall-fix"),
     "post-merge": (11, "post-merge"),
     "pre-merge": (6, "pre-merge"),
     "other": (2, None),
-    "nightly": (1, "nightly"),
+    "nightly": (6, "nightly"),
     "unclassed-nightly": (1, None),
 }
 
@@ -1552,8 +1553,8 @@ def run_bootstrap_dev(
         print(f"Using canary leg: {canary_leg}")
 
     # Dev builds are experiments — they must never outrank real CI on a shared
-    # queue. Default to PRIORITIES["other"][0] (2); override per build with
-    # DEV_JOB_PRIORITY if an experiment needs to jump ahead of nightlies only.
+    # queue. Default to PRIORITIES["other"][0] (2), above only the unclassed
+    # nightlies; override per build with DEV_JOB_PRIORITY.
     raw_priority = _env_or(child_env, "DEV_JOB_PRIORITY", str(PRIORITIES["other"][0]))
     child_env["JOB_PRIORITY"] = raw_priority
     _agent("meta-data", "set", "JOB_PRIORITY", raw_priority, env=child_env)
