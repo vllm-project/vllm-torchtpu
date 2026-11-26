@@ -234,12 +234,21 @@ def test_apply_routes_tagged_o_proj(monkeypatch, keep_vllm_layout):
     layer.weight_scale = torch.nn.Parameter(
         torch.ones((_N,), dtype=torch.float32), requires_grad=False
     )
+    fence_calls = 0
+
+    def fake_fence(x):
+        nonlocal fence_calls
+        fence_calls += 1
+        return x
+
     setattr(layer, ATTN_OUT_HEAD_LAYOUT_ATTR, _LAYOUT)
     setattr(layer, KEEP_VLLM_LAYOUT_ATTR, keep_vllm_layout)
+    setattr(layer, fp8.ATTN_OUT_FENCE_OP_ATTR, fake_fence)
 
     out = method.apply(layer, torch.ones((64, _K), dtype=torch.bfloat16))
     assert out.shape == (64, _N)
     assert calls == [(16, None if keep_vllm_layout else _LAYOUT)]
+    assert fence_calls == (1 if keep_vllm_layout else 0)
 
 
 def test_quantized_matmul_with_head_layout_validation_and_3d_round_trip():

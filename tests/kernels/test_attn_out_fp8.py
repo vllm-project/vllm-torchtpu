@@ -65,9 +65,11 @@ def _entry_body(hlo_text: str) -> str:
 
 
 def _has_relayout_copy(hlo_text: str) -> bool:
-    """True if ENTRY contains a synchronous `copy(...)` instruction."""
+    """True if ENTRY contains a layout-changing op or SparseCore relayout."""
     entry = _entry_body(hlo_text)
-    return bool(re.search(r"\bcopy\(", entry))
+    return bool(
+        re.search(r"\b(?:copy|transpose|reshape)\(|sparse-core-data-format-call", entry)
+    )
 
 
 @pytest.mark.parametrize("layout", _LAYOUTS)
@@ -141,8 +143,9 @@ def test_batched_rpa_pair_cancels_relayout_copy_in_hlo(layout):
     _require_tpu()
     kv, qpk, d = layout
     m, k, n = 2048, kv * qpk * d, 5376
-    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(k), 3)
+    k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(k), 4)
     o5 = _raw_head_major(k1, m, kv, qpk, d)
+    gate = jax.random.normal(k4, (m, k), jnp.float32).astype(jnp.bfloat16)
     w = (jax.random.normal(k2, (k, n), jnp.float32) * 0.05).astype(jnp.float8_e4m3fn)
     ws = jax.random.uniform(k3, (n,), jnp.float32, 0.5, 1.5) * 0.01
 
@@ -161,15 +164,28 @@ def test_batched_rpa_pair_cancels_relayout_copy_in_hlo(layout):
         f"without a relayout copy for {layout=}, got:\n{_entry_body(fused_hlo)}"
     )
 
-    # Must-fail control on multi-KV-head layouts: the unfused path without
-    # quantize_attn_out emits a synchronous relayout copy in ENTRY.
-    if kv > 1:
+    # Fused must-fail control: a token-major multiply between finalize_outputs
+    # and quantize_attn_out prevents cancellation, emitting relayout ops (such
+    # as `copy`, `reshape`, or `sparse-core-data-format-call`) before the kernel.
+    def gated_fused_pair(o5_in, gate_in, w_in, ws_in):
+        x = finalize_outputs(o5_in, qpk, d, (m, k)) * gate_in
+        return xla_quantized_matmul(x, w_in, ws_in, quantize_activation_fn=quantizer)
 
-        def unfused_pair(o5_in, w_in, ws_in):
-            x = finalize_outputs(o5_in, qpk, d, (m, k))
-            return xla_quantized_matmul(x, w_in, ws_in)
+    gated_hlo = jax.jit(gated_fused_pair).lower(o5, gate, w, ws).compile().as_text()
+    assert "attn_out_fp8_quant" in _entry_body(gated_hlo)
+    assert _has_relayout_copy(gated_hlo), (
+        f"Must-fail control expected a relayout on gated fused {layout=}, "
+        f"got:\n{_entry_body(gated_hlo)}"
+    )
 
-        unfused_hlo = jax.jit(unfused_pair).lower(o5, w, ws).compile().as_text()
-        assert _has_relayout_copy(unfused_hlo), (
-            f"Must-fail control expected a relayout copy on unfused {layout=}"
-        )
+    # Unfused must-fail control: without quantize_attn_out, finalize_outputs
+    # leaves a relayout op in ENTRY.
+    def unfused_pair(o5_in, w_in, ws_in):
+        x = finalize_outputs(o5_in, qpk, d, (m, k))
+        return xla_quantized_matmul(x, w_in, ws_in)
+
+    unfused_hlo = jax.jit(unfused_pair).lower(o5, w, ws).compile().as_text()
+    assert _has_relayout_copy(unfused_hlo), (
+        f"Must-fail control expected a relayout on unfused {layout=}, "
+        f"got:\n{_entry_body(unfused_hlo)}"
+    )
