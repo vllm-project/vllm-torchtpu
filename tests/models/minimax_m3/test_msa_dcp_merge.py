@@ -209,3 +209,35 @@ def test_merge_partials_lowers_for_tpu(num_tokens, rotated, pair):
             .lower(lowering_platforms=("tpu",))
         )
     assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize("rotated", [False, True])
+def test_split_merge_matches_pair_merge(rotated):
+    """`merge_split_partials` of the own partial and the peer's is the pair
+    merge of the two, bit for bit, over several blocks and a partial one."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+
+    num_heads, num_tokens, head_dim = 8, 1100, 128
+    rng = np.random.default_rng(5)
+    out = jnp.asarray(
+        rng.normal(size=(2 * num_heads, num_tokens, head_dim)), jnp.bfloat16
+    )
+    peer = jnp.asarray(rng.normal(size=(num_heads, num_tokens, head_dim)), jnp.bfloat16)
+    lse = jnp.asarray(rng.normal(0, 4, size=(2 * num_heads, num_tokens)), jnp.float32)
+    peer_lse = jnp.asarray(rng.normal(0, 4, size=(num_heads, num_tokens)), jnp.float32)
+    hadamard = (
+        jnp.asarray(msa_fp4.hadamard(head_dim), jnp.bfloat16) if rotated else None
+    )
+    got = msa_dcp.merge_split_partials(
+        out, peer, lse, peer_lse, hadamard, interpret=True
+    )
+    want = msa_dcp.merge_pair_partials(
+        jnp.stack([out[:num_heads], peer]),
+        jnp.stack([lse[:num_heads], peer_lse]),
+        hadamard,
+        block_tokens=128,
+        interpret=True,
+    )
+    np.testing.assert_array_equal(
+        np.asarray(got, np.float32), np.asarray(want, np.float32)
+    )

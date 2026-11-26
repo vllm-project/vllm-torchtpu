@@ -2083,6 +2083,23 @@ def msa_attend_dcp(
 
 
 _PARTIALS_BLOCK_TOKENS = 256
+# The pair merges stream their partials: shorter blocks pay a per-step DMA cost.
+_PAIR_PARTIALS_BLOCK_TOKENS = 1024
+# Their double-buffered blocks (two partials in, one output) stay within this
+# at any head count.
+_PAIR_BLOCK_VMEM_BYTES = 16 * 1024 * 1024
+
+
+def _pair_block_tokens(
+    num_tokens: int, num_heads: int, head_dim: int, itemsize: int, block_tokens: int
+) -> int:
+    """A pair merge's token block: `block_tokens`, fewer (whole multiples of
+    `_PARTIALS_BLOCK_TOKENS`) when its buffers would pass
+    `_PAIR_BLOCK_VMEM_BYTES`."""
+    token_bytes = 2 * 3 * num_heads * head_dim * itemsize
+    fit = _PAIR_BLOCK_VMEM_BYTES // (token_bytes * _PARTIALS_BLOCK_TOKENS)
+    fit = max(1, fit) * _PARTIALS_BLOCK_TOKENS
+    return max(1, min(num_tokens, block_tokens, fit))
 
 
 def _merge_partials_kernel(lse_ref, parts_ref, *rest, rotated):
@@ -2202,7 +2219,7 @@ def merge_pair_partials(
     lse: jax.Array,
     hadamard: jax.Array | None = None,
     *,
-    block_tokens: int = _PARTIALS_BLOCK_TOKENS,
+    block_tokens: int = _PAIR_PARTIALS_BLOCK_TOKENS,
     interpret: bool = False,
 ) -> jax.Array:
     """`merge_partials` of a DCP pair with head-major LSEs: ``parts [2, Hl,
@@ -2214,7 +2231,9 @@ def merge_pair_partials(
     took 37-39 us per layer at 8K tokens (twins j-2e5da13f, j-d33c9244), and
     its token-major LSEs a transposing copy."""
     _, num_heads, num_tokens, head_dim = parts.shape
-    block_t = max(1, min(num_tokens, block_tokens))
+    block_t = _pair_block_tokens(
+        num_tokens, num_heads, head_dim, parts.dtype.itemsize, block_tokens
+    )
     rotated = hadamard is not None
     return pl.pallas_call(
         functools.partial(_merge_pair_kernel, rotated=rotated),
@@ -2243,7 +2262,7 @@ def merge_split_partials(
     peer_lse: jax.Array,
     hadamard: jax.Array | None = None,
     *,
-    block_tokens: int = _PARTIALS_BLOCK_TOKENS,
+    block_tokens: int = _PAIR_PARTIALS_BLOCK_TOKENS,
     interpret: bool = False,
 ) -> jax.Array:
     """`merge_pair_partials` of this rank's partial ``out [2 Hl, T, D]``
@@ -2251,7 +2270,9 @@ def merge_split_partials(
     partial of those heads ``peer [Hl, T, D]``, with ``lse [2 Hl, T]`` and
     ``peer_lse [Hl, T]`` f32 -> ``[T, Hl * D]``: no stacking copy of the two."""
     num_heads, num_tokens, head_dim = peer.shape
-    block_t = max(1, min(num_tokens, block_tokens))
+    block_t = _pair_block_tokens(
+        num_tokens, num_heads, head_dim, peer.dtype.itemsize, block_tokens
+    )
     rotated = hadamard is not None
 
     def kernel(lse0_ref, lse1_ref, p0_ref, p1_ref, *rest):
