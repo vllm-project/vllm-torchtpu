@@ -452,17 +452,19 @@ def recurrent_gdn_per_seq(
     beta: jax.Array,  # [num_v_heads, chunk, 1, 1]
     state: jax.Array,  # [num_v_heads, kq_head_dim, v_head_dim]
     cfgs: config.GDNConfig,
+    target_commit: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform recurrent GDN over input [num_heads, chunk, 1, head_dim].
 
     The returned state stacks the post-token state of the last
     `cfgs.window_size` window positions ([window_size, num_v_heads,
-    kq_head_dim, v_head_dim]); with `window_size == 1` that is just the final
-    state.
+    kq_head_dim, v_head_dim]); with `window_size == 1` or
+    `cfgs.single_checkpoint` that is a single state (`[1, ...]`).
     """
 
     out_list = []
     state_list = []
+    committed_state = state
     for c_idx in range(cfgs.chunk_size):
         # [num_v_heads, 1, kq_head_dim]
         q_curr = q_compact[:, c_idx]
@@ -516,9 +518,16 @@ def recurrent_gdn_per_seq(
         # stops changing there and trailing checkpoints simply repeat the state
         # of the last real token. Checkpoints of the positions dropped here are
         # dead code the compiler eliminates.
-        if c_idx >= cfgs.chunk_size - cfgs.window_size:
+        if cfgs.single_checkpoint:
+            assert target_commit is not None
+            committed_state = jnp.where(
+                c_idx + 1 == target_commit, state, committed_state
+            )
+        elif c_idx >= cfgs.chunk_size - cfgs.window_size:
             state_list.append(state)
 
+    if cfgs.single_checkpoint:
+        return jnp.stack(out_list, axis=0), committed_state[jnp.newaxis]
     return jnp.stack(out_list, axis=0), jnp.stack(state_list, axis=0)
 
 
@@ -533,6 +542,7 @@ def recurrent_gdn(
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
+    commit_sizes: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     """Perform recurrent GDN over input [seq, num_heads, chunk, 1, head_dim].
 
@@ -582,6 +592,9 @@ def recurrent_gdn(
     gating_log = fused_transpose_broadcast(gating_log, src_dim=4, dst_dim=1)
     gating_log = gating_log[:, : cfg.num_v_heads]
 
+    target_commits = (
+        real_sizes if commit_sizes is None else jnp.clip(commit_sizes, 0, real_sizes)
+    )
     out_list = []
     new_state_list = []
 
@@ -595,6 +608,7 @@ def recurrent_gdn(
             beta[idx],
             state_prev[idx],
             cfg,
+            target_commit=target_commits[idx] if cfg.single_checkpoint else None,
         )
         out_list.append(out)
         new_state_list.append(state)

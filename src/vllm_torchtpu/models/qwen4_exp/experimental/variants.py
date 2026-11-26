@@ -26,7 +26,10 @@ only where a served setup needs a different choice:
   c48), including main-KV decode context parallelism over rank pairs;
 - c48_stack: the stack served only at c48 (no config value separates it from
   c32, so it is the agentx-c48 profile's choice);
-- pool_budget: the unified KV pool budget (fixed below gpu-util 0.95).
+- pool_budget: the unified KV pool budget (fixed below gpu-util 0.95);
+- gdn_spec_slots: GDN speculative state blocks per request: one per verify
+  position ("per_token"), or two ping-pong blocks plus accepted-token replay
+  ("two_slot", half the GDN speculative state blocks; unified pool and MTP only).
 """
 
 import dataclasses
@@ -182,5 +185,9 @@ VARIANTS: dict[str, dict[str, Variant]] = {
             {"QWEN4_EXP_MAX_POOL_BYTES": 61603840000}, eligible=_below_full_hbm
         ),
         "auto": Variant({"QWEN4_EXP_MAX_POOL_BYTES": 0}),
+    },
+    "gdn_spec_slots": {
+        "two_slot": Variant({"QWEN4_EXP_GDN_TWO_SLOT": True}),
+        "per_token": Variant({"QWEN4_EXP_GDN_TWO_SLOT": False}),
     },
 }

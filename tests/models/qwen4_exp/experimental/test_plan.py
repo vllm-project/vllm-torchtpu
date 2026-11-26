@@ -99,12 +99,49 @@ def test_profile_selection_and_eligibility():
     small = plan.resolve_plan(_config(max_num_seqs=16, gpu_util=0.95))
     assert small["decode_batch"] == "small"
     assert small["pool_budget"] == "auto"
+    assert small["gdn_spec_slots"] == "per_token"
     assert plan.resolve_plan(_config("agentx-c48"))["c48_stack"] == "on"
-    assert set(PROFILES) == {"agentx-mixed-256k", "agentx-c48"}
+    assert (
+        plan.resolve_plan(_config("agentx-mixed-256k-two-slot"))["gdn_spec_slots"]
+        == "two_slot"
+    )
+    assert plan.feature_for_config(_config(), "QWEN4_EXP_GDN_TWO_SLOT") is False
+    assert (
+        plan.feature_for_config(
+            _config("agentx-mixed-256k-two-slot"), "QWEN4_EXP_GDN_TWO_SLOT"
+        )
+        is True
+    )
+    assert set(PROFILES) == {
+        "agentx-mixed-256k",
+        "agentx-c48",
+        "agentx-mixed-256k-two-slot",
+    }
     with pytest.raises(ValueError):
         plan.resolve_plan(_config("nope"))
     with pytest.raises(ValueError):
         plan.profile_name(NS(additional_config={"model_plan": {"x": 1}}))
+
+
+def test_mtp_gdn_two_slot_override_folds_into_plan_and_compile_key(monkeypatch):
+    monkeypatch.setattr(plan, "configure_kernels", lambda p=None: None)
+    cfg_on = _config("agentx-c48")
+    cfg_on.additional_config["qwen4_exp"] = {"mtp_gdn_two_slot": True}
+    cfg_off = _config("agentx-mixed-256k-two-slot")
+    cfg_off.additional_config["qwen4_exp"] = {"mtp_gdn_two_slot": False}
+    try:
+        resolved_on = plan.bind(cfg_on)
+        assert resolved_on["c48_stack"] == "on"
+        assert resolved_on["gdn_spec_slots"] == "two_slot"
+        assert plan.value("QWEN4_EXP_GDN_TWO_SLOT") is True
+        key_on = plan.compile_key_factors()
+
+        resolved_off = plan.bind(cfg_off)
+        assert resolved_off["gdn_spec_slots"] == "per_token"
+        assert plan.value("QWEN4_EXP_GDN_TWO_SLOT") is False
+        assert plan.compile_key_factors() != key_on
+    finally:
+        plan.unbind()
 
 
 def test_bind_sets_value_and_kernel_options(monkeypatch):

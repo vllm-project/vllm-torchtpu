@@ -18,7 +18,7 @@
 #   Ported from main: #2438's power-of-two clip of the static (KDA) mixed tile.
 
 import functools
-from typing import cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -117,6 +117,11 @@ def inner_kernel(
         carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
         cfg=cfg,
     )
+    commit_sizes = (
+        vmem_ldst.load_commit_sizes(metadata_ref, p_id, real_sizes, cfg)
+        if cfg.single_checkpoint
+        else None
+    )
 
     # Step 1: Conv1D.
     # NOTE: Conv1D requires performing sliding window where inputs are slided
@@ -139,6 +144,7 @@ def inner_kernel(
         conv_weight=conv_weight,
         conv_bias=conv_bias,
         cfg=cfg,
+        commit_sizes=commit_sizes,
     )
 
     if cfg.state_plan is None:
@@ -148,7 +154,7 @@ def inner_kernel(
         # through the region's typed view; copy_out pushes the raw bytes
         # of the valid checkpoints back to the source.
         for idx in range(cfg.seq_tile_size):
-            for t in range(cfg.window_size):
+            for t in range(cfg.num_state_checkpoints):
                 args = (
                     conv_state_out_slot_ref.at[idx, t],
                     cfg.state_plan.conv,
@@ -210,6 +216,7 @@ def inner_kernel(
             dt_bias=dt_bias,
             cfg=cfg,
             real_sizes=real_sizes,
+            commit_sizes=commit_sizes,
         )
 
     else:
@@ -245,7 +252,7 @@ def inner_kernel(
         )
     else:
         for idx in range(cfg.seq_tile_size):
-            for t in range(cfg.window_size):
+            for t in range(cfg.num_state_checkpoints):
                 args = (
                     recurrent_out_slot_ref.at[idx, t],
                     cfg.state_plan.recurrent,
@@ -377,6 +384,7 @@ def kernel_metadata(
     ckpt_indices: jax.Array | None,
     per_seq_inputs: tuple[jax.Array, ...] | None = None,
     prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
+    commit_lens: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """The scalar-prefetch metadata of one `fused_conv1d_gdn` kernel call."""
     if cfg.mode != config.GDNMode.PER_SEQ:
@@ -388,6 +396,7 @@ def kernel_metadata(
             read_offsets=read_offsets,
             end_seq=distribution[0],
             ckpt_indices=ckpt_indices,
+            commit_lens=commit_lens if cfg.single_checkpoint else None,
         )
     if per_seq_inputs is not None:
         ps_qsl, ps_seq_lens, ps_state, ps_read, ps_ckpt = per_seq_inputs
@@ -436,6 +445,8 @@ def kernel_metadata(
         "attention_mode",
         "gate_lower_bound",
         "prefill_ckpt_alignment",
+        "single_checkpoint",
+        "interpret",
     ),
 )
 def fused_conv1d_gdn(
@@ -454,6 +465,7 @@ def fused_conv1d_gdn(
     seq_lens: jax.Array,  # [num_seqs]
     read_offsets: jax.Array | None = None,  # [num_seqs]
     ckpt_indices: jax.Array | None = None,  # [num_seqs, num_spec_tokens + 1]
+    commit_lens: jax.Array | None = None,  # [num_seqs]
     *,
     n_kq: int,
     n_v: int,
@@ -466,6 +478,7 @@ def fused_conv1d_gdn(
     state_plan: config.StateSourcePlan | None = None,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    single_checkpoint: bool = False,
     batched_only: bool = False,
     prefill_only: bool = False,
     zero_initialize_out: bool = True,
@@ -476,6 +489,7 @@ def fused_conv1d_gdn(
     per_seq_inputs: tuple[jax.Array, ...] | None = None,
     prefill_ckpt: tuple[jax.Array, jax.Array] | None = None,
     prefill_ckpt_alignment: int = 0,
+    interpret: Any = False,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array] | tuple[jax.Array, jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -629,7 +643,7 @@ def fused_conv1d_gdn(
     assert query_start_loc.shape == (num_seqs + 1,)
     assert state_indices.shape == (num_seqs,)
     assert distribution.shape == (3,)
-    if num_spec_tokens > 0:
+    if num_spec_tokens > 0 and not single_checkpoint:
         assert read_offsets is not None, (
             "read_offsets is required when num_spec_tokens > 0"
         )
@@ -638,28 +652,63 @@ def fused_conv1d_gdn(
     assert read_offsets.shape == (num_seqs,)
     read_offsets = read_offsets.astype(jnp.int32)
     if ckpt_indices is not None:
-        # One source block per checkpoint (vLLM's ssm_state_indices scheme):
-        # checkpoint t of sequence s lives at block ckpt_indices[s, t], so
-        # the pool block only ever has to hold a single state.
-        assert ckpt_indices.shape == (num_seqs, num_spec_tokens + 1), (
-            ckpt_indices.shape,
-            num_seqs,
-            num_spec_tokens,
+        # One source block per checkpoint (vLLM's ssm_state_indices scheme).
+        # Under single_checkpoint=True, allow 1 (in-place single slot), 2
+        # (2-slot ping-pong), or window_size columns.
+        allowed_ckpts = (
+            tuple(dict.fromkeys((1, 2, num_spec_tokens + 1)))
+            if single_checkpoint
+            else (num_spec_tokens + 1,)
         )
+        if (
+            ckpt_indices.ndim != 2
+            or ckpt_indices.shape[0] != num_seqs
+            or ckpt_indices.shape[1] not in allowed_ckpts
+        ):
+            raise ValueError(
+                f"ckpt_indices must have shape ({num_seqs}, {allowed_ckpts}); got "
+                f"{ckpt_indices.shape}."
+            )
         ckpt_indices = ckpt_indices.astype(jnp.int32)
+    if commit_lens is not None:
+        if not single_checkpoint:
+            raise ValueError("commit_lens requires single_checkpoint=True.")
+        if prefill_only:
+            raise ValueError("commit_lens is not supported with prefill_only=True.")
+        if commit_lens.shape != (num_seqs,):
+            raise ValueError(
+                f"commit_lens must have shape ({num_seqs},); got {commit_lens.shape}."
+            )
+        commit_lens = commit_lens.astype(jnp.int32)
     act_in_dtype = jnp.dtype(jnp.float32)
     assert a.dtype == b.dtype == act_in_dtype
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
     padded_batch_size = pl.cdiv(batch_size, packing) * packing
-    decode_tile_size = min(decode_tile_size, batch_size)
+    if single_checkpoint:
+        decode_tile_size = max(1, min(decode_tile_size, num_seqs, batch_size))
+    else:
+        decode_tile_size = min(decode_tile_size, batch_size)
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
     window_size = num_spec_tokens + 1
-    decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+    decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(
+        window_size, single_checkpoint=single_checkpoint
+    )
 
     # KDA stays on static tiles until the VMEM estimate models its gate.
     if not is_kda:
+        if pooled and single_checkpoint:
+            assert state_plan is not None
+            rec_state_dtype = jnp.dtype(
+                jnp.bfloat16
+                if state_plan.recurrent.view_dtype == jnp.uint32
+                else state_plan.recurrent.view_dtype
+            )
+        else:
+            rec_state_dtype = jnp.dtype(
+                jnp.float32 if recurrent_state is None else recurrent_state.dtype
+            )
         decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
             batch_size=batch_size,
             num_seqs=num_seqs,
@@ -671,19 +720,19 @@ def fused_conv1d_gdn(
             kernel_size=kernel_size,
             conv_state_dim_size=dim if conv_state is None else conv_state.shape[-1],
             act_out_dtype=act_out_dtype,
-            recurrent_state_dtype=(
-                jnp.float32 if recurrent_state is None else recurrent_state.dtype
-            ),
+            recurrent_state_dtype=rec_state_dtype,
             num_lanes=num_lanes,
             decode_vmem_limit_bytes=decode_vmem_limit_bytes,
             mixed_vmem_limit_bytes=config.GDNConfig.get_vmem_limit_bytes(),
             window_size=window_size,
+            single_checkpoint=single_checkpoint,
         )
         logger.info_once(
-            "GDN dynamic tiling: num_seqs=%d batch=%d window=%d -> T=%d C=%d",
+            "GDN dynamic tiling: num_seqs=%d batch=%d window=%d s1=%s -> T=%d C=%d",
             num_seqs,
             batch_size,
             window_size,
+            single_checkpoint,
             decode_tile_size,
             mixed_tile_size,
         )
@@ -692,12 +741,11 @@ def fused_conv1d_gdn(
         # non-power-of-two token bucket (e.g. TPU_TOKEN_BUCKET_EXTRA or tiny
         # max_num_batched_tokens) stays divisible by triangular_block_size.
         mixed_tile_size = tiling.clip_mixed_tile_size(mixed_tile_size, batch_size)
-        # Each sequence holds 1 input state slot plus `window` output
-        # checkpoint slots per buffer in VMEM. Shrink the tile so the
-        # double-buffered windows fit in roughly half the scoped-VMEM budget.
+        # Each sequence holds 1 input state slot plus output checkpoint slots
+        # per buffer in VMEM (`1` under `single_checkpoint`, else `window`).
         window = num_spec_tokens + 1
         num_buffers = config.GDNConfig.__dataclass_fields__["num_buffers"].default
-        state_positions = 1 + window
+        state_positions = 1 + (1 if single_checkpoint else window)
         recurrent_bytes_per_seq = state_positions * n_v * d_k * d_v * 4
         bytes_per_seq = (
             # Recurrent checkpoints (fp32) — the dominant term.
@@ -708,9 +756,12 @@ def fused_conv1d_gdn(
             + window * (dim * 4 + 2 * aligned_num_v_heads * 4 + n_v * d_v * 2)
         )
         spec_tile_budget = (decode_vmem_limit_bytes // 2) // num_buffers
-        decode_tile_size = max(
-            1, min(decode_tile_size, spec_tile_budget // bytes_per_seq)
+        decode_tile_cap = (
+            min(decode_tile_size, num_seqs, spec_tile_budget // bytes_per_seq)
+            if single_checkpoint
+            else min(decode_tile_size, spec_tile_budget // bytes_per_seq)
         )
+        decode_tile_size = max(1, decode_tile_cap)
 
     if num_spec_tokens > 0 and is_kda:
         # KDA verify keeps one sequence per tile until multi-sequence KDA
@@ -784,6 +835,7 @@ def fused_conv1d_gdn(
             kernel_size=kernel_size,
             tile_size=tile_size,
             window_size=window_size,
+            single_checkpoint=(single_checkpoint and mode != config.GDNMode.PER_SEQ),
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,
@@ -832,6 +884,7 @@ def fused_conv1d_gdn(
             ckpt_indices=ckpt_indices,
             per_seq_inputs=per_seq_inputs,
             prefill_ckpt=ckpt,
+            commit_lens=commit_lens if cfg.single_checkpoint else None,
         )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
@@ -853,7 +906,9 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[len(metadata_obj) + 3 + num_state_inputs] = 0
 
-        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(
+            window_size, single_checkpoint=cfg.single_checkpoint
+        )
 
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
@@ -875,6 +930,7 @@ def fused_conv1d_gdn(
                 disable_bounds_checks=True,
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
+            interpret=interpret,
             name=cfg.get_kernel_name(),
             # pyrefly: ignore[bad-argument-type]
             metadata=cfg.get_metadata(),

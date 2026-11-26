@@ -7,11 +7,19 @@
   "agentx-c48": {
    "c48_stack": "on",
    "decode_batch": "large",
+   "gdn_spec_slots": "per_token",
    "pool_budget": "fixed_61g"
   },
   "agentx-mixed-256k": {
    "c48_stack": "off",
    "decode_batch": "large",
+   "gdn_spec_slots": "per_token",
+   "pool_budget": "fixed_61g"
+  },
+  "agentx-mixed-256k-two-slot": {
+   "c48_stack": "off",
+   "decode_batch": "large",
+   "gdn_spec_slots": "two_slot",
    "pool_budget": "fixed_61g"
   }
  }

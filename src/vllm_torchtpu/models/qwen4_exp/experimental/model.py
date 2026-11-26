@@ -66,6 +66,7 @@ from .metadata_access import (
 from .ops.gdn_attention_op import (
     GdnStepMetadataCache,
 )
+from .ops.rows_update_op import update_rows_
 from .parallel import PLEParallel
 from .ple import PLEInputs
 from .ple_geometry import ple_state_shape
@@ -262,6 +263,20 @@ def ple_speculative_state(metadata):
 # Row tile of the HC prefill kernels (up, norm and full mix) of the backbone.
 HC_PREFILL_TILE = 128
 
+# TODO: Remove once XLA/libtpu or `qwen4_exp::pooled_qsa_shard_attend` no
+# longer corrupts the donated KV pool when output #2 (`selected`) is unused.
+# In `Qwen4ExpBackboneSP`, `pooled_qsa_shard_attend` donates the unified pool
+# buffer in place; when `selected` is discarded on QSA layers entering the
+# multi-shard merge branch (`max(lengths) // 4 > 512`), XLA dead-output
+# elimination and buffer assignment alias the donated pool and produce NaNs on
+# speculative verification rows. Reducing the leading rows per QSA layer into
+# `_qsa_sel_buf` keeps `selected` live across all QSA layers.
+_QSA_LIVE_SEL_MAX_ROWS = 24
+
+
+def _count_qsa_layers(backbone) -> int:
+    return sum(1 for layer in backbone.layers if layer.layer_type != "linear_attention")
+
 
 def hc_config(config):
     return HyperConnectionConfig(
@@ -407,6 +422,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         ple_raw_embeddings=None,
         sequence_parallel=False,
         gdn_step_metadata_cache=None,
+        qsa_sel_rows: list[torch.Tensor] | None = None,
     ):
         """``sequence_parallel``: ``hidden`` and the result are this TP rank's
         token shard; the token-indexed inputs still cover the whole step."""
@@ -429,7 +445,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 self.linear_attn(block, gdn_step_metadata_cache), sequence_parallel
             )
         else:
-            block = self.self_attn.forward_with_indices(
+            block, selected = self.self_attn.forward_with_indices(
                 block,
                 positions,
                 QSAMetadata(
@@ -447,7 +463,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 decode_token_shard=(
                     not sequence_parallel and self.self_attn.decode_token_shard
                 ),
-            )[0]
+            )
+            if qsa_sel_rows is not None:
+                qsa_sel_rows.append(
+                    selected[: min(_QSA_LIVE_SEL_MAX_ROWS, selected.shape[0])]
+                    .min()
+                    .unsqueeze(0)
+                )
             block = sp.reduce(block, sequence_parallel)
         block, residual = self.attn_hyper_connection.combine_mix(
             block, residual, self.mlp_hyper_connection
@@ -683,6 +705,7 @@ class Qwen4ExpBackbone(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        qsa_sel_buf: torch.Tensor | None = None,
     ):
         # Resolve host lookup before any decoder work so shape arithmetic
         # stays in the main graph and model preparation precedes the D2H wait.
@@ -724,6 +747,7 @@ class Qwen4ExpBackbone(nn.Module):
             if plan.value("VLLM_TPU_GDN_HOIST_METADATA")
             else None
         )
+        sel_rows: list[torch.Tensor] | None = [] if qsa_sel_buf is not None else None
         for index, layer in enumerate(self.layers):
             if ple_token is not None and index == self.host_ple_index:
                 ple_raw_embeddings = ple.lookup_finish(ple_token, ple_inputs, hidden)
@@ -741,7 +765,15 @@ class Qwen4ExpBackbone(nn.Module):
                 ple_raw_embeddings,
                 sequence_parallel=sequence_parallel,
                 gdn_step_metadata_cache=gdn_step_metadata_cache,
+                qsa_sel_rows=sel_rows,
             )
+        if qsa_sel_buf is not None and sel_rows:
+            sel_mat = torch.stack(sel_rows, dim=0).contiguous()
+            if qsa_sel_buf.device.type == "tpu":
+                update_rows_(qsa_sel_buf, sel_mat)
+            else:
+                # Non-TPU fallback for CPU tests; TPU writes through update_rows_.
+                qsa_sel_buf[: sel_mat.shape[0]].copy_(sel_mat)
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
         if sequence_parallel:
             mixed = sp.gather(mixed, num_tokens)
@@ -771,10 +803,23 @@ class Qwen4ExpBackboneSP(nn.Module):
     """
 
     _backbone: Any
+    _qsa_sel_buf: torch.Tensor | None
 
     def __init__(self, *, vllm_config: Any = None, backbone):
         super().__init__()
         object.__setattr__(self, "_backbone", backbone)
+        num_qsa = _count_qsa_layers(backbone)
+        self.register_buffer(
+            "_qsa_sel_buf",
+            torch.zeros(
+                (num_qsa, 1),
+                dtype=torch.int32,
+                device=backbone.embed_tokens.weight.device,
+            )
+            if num_qsa > 0
+            else None,
+            persistent=False,
+        )
 
     def forward(
         self,
@@ -802,6 +847,7 @@ class Qwen4ExpBackboneSP(nn.Module):
             valid_tokens=valid_tokens,
             main_block_table=main_block_table,
             compressed_block_table=compressed_block_table,
+            qsa_sel_buf=self._qsa_sel_buf,
         )
 
 

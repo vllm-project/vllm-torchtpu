@@ -20,6 +20,7 @@ Ported from the tests of #2605 #2607 #2609 #2650 #2651 #2723, pointed at
 import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -45,6 +46,17 @@ NEW_METHODS = {
     "_padded_sampling_params",
     "_spec_seed_copies",
     "_precompile_spec_tail",
+    "_get_two_slot_gdn_layers",
+    "_snapshot_two_slot_gdn_verify_inputs",
+    "_plan_two_slot_boundary_copies",
+    "_two_slot_dist3",
+    "_get_compiled_boundary_meta",
+    "_post_verify_two_slot_gdn_chunk",
+    "_replay_two_slot_gdn_chunk",
+    "_export_two_slot_interior_boundaries",
+    "_copy_two_slot_boundary_states",
+    "_update_ping_pong_mamba_slot_read_offsets",
+    "_precompile_two_slot_runtime",
 }
 
 
@@ -75,11 +87,20 @@ def test_every_override_names_a_runner_method():
 
 def test_overridden_methods_are_called_by_the_runner():
     """Every override and added method is reached from main's runner (or
-    from another override), so none is dead after a refactor on main."""
+    from another override / cache manager), so none is dead after a refactor."""
+    from vllm_torchtpu.models.qwen4_exp.experimental import pooled_cache
+    from vllm_torchtpu.runner import kv_cache_manager
+
     sources = inspect.getsource(TPUModelRunner) + inspect.getsource(qr)
+    cache_sources = inspect.getsource(pooled_cache) + inspect.getsource(
+        kv_cache_manager
+    )
     for name in _own_methods():
-        if name in ("load_model", "sample_tokens"):
+        if name in ("load_model", "execute_model", "sample_tokens"):
             continue  # entry points the worker calls
+        if name == "_build_mamba_copy_plan":
+            assert f"runner.{name}(" in cache_sources, name
+            continue
         assert f"self.{name}(" in sources, name
 
 
@@ -528,3 +549,513 @@ def test_init_swaps_in_the_sink_stage_timing(monkeypatch):
     runner = Qwen38Runner()
     assert isinstance(runner._stage_timing, SinkStageTiming)
     assert runner._stage_timing._rank == "3"
+
+
+# --- Two-slot ping-pong GDN runner methods & precompilation ------------------
+
+
+def _two_slot_runner(*, shared_raw: bool = True, split: int = 1, num_blocks: int = 64):
+    """Build a CPU MagicMock(spec=Qwen38Runner) wired with two-slot methods."""
+    from vllm_torchtpu.models.qwen4_exp.experimental.runner import two_slot
+
+    raw0 = torch.zeros((num_blocks, 4), dtype=torch.float32)
+    raw1 = raw0 if shared_raw else torch.zeros((num_blocks, 4), dtype=torch.float32)
+
+    runner = MagicMock(spec=Qwen38Runner)
+    runner.device = torch.device("cpu")
+    runner.max_num_reqs = 8
+    runner.num_reqs_max_model_len = 4
+    runner.num_reqs_most_model_len = 8
+    runner._mamba_ckpt_window = 4
+    runner._pool_block_split = split
+    runner._mamba_state_block_size = 512
+    runner._mamba_copy_plan = [(0, [raw0]), (1, [raw1])]
+    runner._mamba_copy_ping_pong_gids = {0}
+    runner._mamba_copy_group_windows = {0: 2, 1: 4}
+    runner.mamba_slot_read_offsets = torch.zeros(num_blocks, dtype=torch.int32)
+    runner.cache_config = SimpleNamespace(enable_prefix_caching=True, block_size=512)
+    runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    runner.scheduler_config = SimpleNamespace(async_scheduling=False)
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=3)
+    runner.attn_groups = [
+        [
+            SimpleNamespace(
+                kv_cache_group_id=0,
+                layer_names=["model.layers.0.linear_attn"],
+                kv_cache_spec=None,
+            ),
+            SimpleNamespace(
+                kv_cache_group_id=1,
+                layer_names=["model.layers.1.ple"],
+                kv_cache_spec=None,
+            ),
+        ]
+    ]
+    runner._bucket_len = TPUModelRunner._bucket_len
+    for name in (
+        "_num_reqs_tensor",
+        "_two_slot_dist3",
+        "_get_two_slot_gdn_layers",
+        "_get_compiled_boundary_meta",
+        "_post_verify_two_slot_gdn_chunk",
+        "_replay_two_slot_gdn_chunk",
+        "_export_two_slot_interior_boundaries",
+        "_copy_two_slot_boundary_states",
+        "_update_ping_pong_mamba_slot_read_offsets",
+        "_plan_two_slot_boundary_copies",
+        "_precompile_two_slot_runtime",
+        "_expand_pool_split",
+        "_pad_dev_to_bucket",
+        "_mamba_column_stride",
+    ):
+        setattr(runner, name, getattr(Qwen38Runner, name).__get__(runner))
+
+    events: list[tuple[str, Any]] = []
+    copy_calls: list[tuple[list[torch.Tensor], list[tuple[int, int]]]] = []
+
+    def _record_copy(raws, src_t, dst_t):
+        pairs = [
+            (int(s), int(d))
+            for s, d in zip(src_t.tolist(), dst_t.tolist())
+            if s != 0 or d != 0
+        ]
+        events.append(("boundary_copy", runner.mamba_slot_read_offsets.clone()))
+        copy_calls.append((raws, pairs))
+
+    runner._copy_mamba_state_blocks = _record_copy
+
+    replay_calls: list[dict[str, Any]] = []
+
+    def _record_replay(**kwargs):
+        tag = (
+            "interior_export"
+            if torch.all(kwargs["slot_read_offsets"] == 0)
+            and kwargs["slot_read_offsets"] is not runner.mamba_slot_read_offsets
+            else "replay"
+        )
+        events.append((tag, runner.mamba_slot_read_offsets.clone()))
+        replay_calls.append(
+            {
+                "tag": tag,
+                "state_indices": kwargs["state_indices"].tolist(),
+                "ckpt_indices": kwargs["ckpt_indices"].tolist(),
+                "commit_lens": kwargs["commit_lens"].tolist(),
+                "offsets_at_call": kwargs["slot_read_offsets"].clone(),
+                "staged_inputs": kwargs.get("staged_inputs"),
+            }
+        )
+
+    stub_layer = SimpleNamespace(
+        prefix="model.layers.0.linear_attn",
+        _two_slot_mtp=True,
+        _verify_win_cap=16,
+        kv_cache=(raw0,),
+        gdn_pooled_replay_op=object(),
+        replay_two_slot_state=_record_replay,
+    )
+    runner.model = SimpleNamespace(
+        model=SimpleNamespace(layers=[SimpleNamespace(linear_attn=stub_layer)])
+    )
+    return runner, stub_layer, events, copy_calls, replay_calls, two_slot
+
+
+def test_post_verify_two_slot_ordering_replay_copy_flip():
+    """Verify exact order: replay -> boundary copy -> interior export -> offset flip."""
+    runner, _layer, events, copy_calls, replay_calls, two_slot = _two_slot_runner(
+        shared_raw=True, split=1
+    )
+    # Row 0: interior crossing (510 -> 514, 4 accepted), c_read[11]=0
+    # Row 1: partial reject (2 of 4 accepted), exact boundary 512, c_read[30]=0
+    # Row 2: prefill (outside num_windowed=2), old offset 1 -> reset to 0 on flip
+    runner.mamba_slot_read_offsets[11] = 0
+    runner.mamba_slot_read_offsets[30] = 0
+    runner.mamba_slot_read_offsets[50] = 1
+    initial_offsets = runner.mamba_slot_read_offsets.clone()
+
+    qsl = torch.tensor([0, 4, 8, 16], dtype=torch.int32)
+    seq_lens = torch.tensor([514, 512, 16], dtype=torch.int32)
+    next_tokens = torch.tensor(
+        [
+            [1, 2, 3, 4],  # row 0: all 4 accepted -> interior boundary at 512 (k=2)
+            [5, 6, -1, -1],  # row 1: 2 accepted < 4 -> replay(2), exact boundary at 512
+            [7, -1, -1, -1],  # row 2: non-windowed prefill
+        ],
+        dtype=torch.int32,
+    )
+    entries = torch.tensor(
+        [
+            [0, 512, 4, 10, 11, 12, 0, 0, 20, 21, 22, 23, 24],
+            [1, 512, 2, 30, 31, 0, 0, 0, 40, 41, 42, 43, 44],
+        ],
+        dtype=torch.int32,
+    )
+    plan = two_slot.SpecBoundaryPlan(
+        entries=entries,
+        rows=entries[:, 0].long(),
+        seq_lens=seq_lens.index_select(0, entries[:, 0].long()),
+        block_size=512,
+        host_entries=entries,
+        chunk_seq_lens=seq_lens,
+    )
+    layer_md = SimpleNamespace(
+        mamba_state_indices=torch.tensor([11, 30, 50], dtype=torch.int32),
+        mamba_ckpt_indices=torch.tensor(
+            [[11, 12], [30, 31], [50, 51]], dtype=torch.int32
+        ),
+    )
+    chunk = two_slot.PingPongMambaChunkState(
+        state_indices=[torch.tensor([11, 30, 50], dtype=torch.int32)],
+        attn_metadata={"model.layers.0.linear_attn": layer_md},
+        chunk_num_windowed=2,
+        num_reqs=3,
+        query_start_loc=qsl,
+        seq_lens=seq_lens,
+        staged_verify_inputs=None,
+        staged_ping_pong_state_stack=torch.tensor([[11, 30, 50]], dtype=torch.int32),
+    )
+    md = SimpleNamespace(draft_lengths_cpu=np.array([3, 3, 0], dtype=np.int32))
+
+    runner._post_verify_two_slot_gdn_chunk(chunk, md, next_tokens, plan)
+
+    assert [name for name, _ in events] == [
+        "replay",
+        "boundary_copy",
+        "interior_export",
+    ]
+    # All three pre-flip steps saw the pre-flip read offsets (c_read intact).
+    for _, snap_ro in events:
+        assert torch.equal(snap_ro, initial_offsets)
+    # Replay ran for row 1 with commit_len=2 (row 0 all-accepted -> 0).
+    assert replay_calls[0]["commit_lens"] == [0, 2, 0]
+    # Boundary copy exported exact GDN write slot 31->30 and PLE 22->20, 41->40.
+    assert (31, 30) in copy_calls[0][1]
+    assert (22, 20) in copy_calls[0][1]
+    # Interior export replayed row 0 from read_blk=11 into dst_b=10 for k=2 tokens.
+    assert replay_calls[1]["state_indices"] == [11, 0, 0]
+    assert replay_calls[1]["ckpt_indices"] == [[11, 10], [0, 0], [0, 0]]
+    assert replay_calls[1]["commit_lens"] == [2, 0, 0]
+    # Final flip happened AFTER boundary export: windowed 11,30 flipped 0->1;
+    # non-windowed prefill block 50 reset 1->0.
+    assert runner.mamba_slot_read_offsets[11].item() == 1
+    assert runner.mamba_slot_read_offsets[30].item() == 1
+    assert runner.mamba_slot_read_offsets[50].item() == 0
+
+
+@pytest.mark.parametrize("split", [1, 2])
+@pytest.mark.parametrize("verify", [True, False])
+def test_copy_two_slot_boundary_states_vectorized_matches_eager_fallback(split, verify):
+    """Vectorized shared-pool path and eager distinct-pool fallback agree."""
+    entries = torch.tensor(
+        [
+            [0, 512, 4, 10, 11, 12, 0, 0, 20, 21, 22, 23, 24],
+            [1, 512, 1, 30, 31, 0, 0, 0, 40, 41, 42, 43, 44],
+            [2, 512, 1, 35, 36, 0, 0, 0, 45, 46, 47, 48, 49],
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        ],
+        dtype=torch.int32,
+    )
+    seq_lens = torch.tensor([514, 512, 512], dtype=torch.int32)
+    qsl = torch.tensor([0, 4, 5, 6], dtype=torch.int32)
+    next_tokens = (
+        torch.tensor(
+            [[1, 2, 3, 4], [5, -1, -1, -1], [6, -1, -1, -1]], dtype=torch.int32
+        )
+        if verify
+        else None
+    )
+
+    def _run(shared_raw: bool):
+        runner, _, _, copy_calls, replay_calls, two_slot = _two_slot_runner(
+            shared_raw=shared_raw, split=split
+        )
+        runner.mamba_slot_read_offsets[11] = 0
+        runner.mamba_slot_read_offsets[30] = 0
+        runner.mamba_slot_read_offsets[35] = 1
+        plan = two_slot.SpecBoundaryPlan(
+            entries=entries,
+            rows=entries[:, 0].long(),
+            seq_lens=seq_lens.index_select(0, entries[:, 0].long()),
+            block_size=512,
+            host_entries=entries,
+            chunk_seq_lens=seq_lens,
+        )
+        chunk = two_slot.PingPongMambaChunkState(
+            state_indices=[torch.tensor([11, 30, 35], dtype=torch.int32)],
+            attn_metadata={},
+            chunk_num_windowed=3,
+            num_reqs=3,
+            query_start_loc=qsl,
+            seq_lens=seq_lens,
+        )
+        runner._copy_two_slot_boundary_states(plan, next_tokens, ping_pong_chunk=chunk)
+        all_pairs = sorted(p for _, ps in copy_calls for p in ps)
+        replays = [
+            (r["state_indices"], r["ckpt_indices"], r["commit_lens"])
+            for r in replay_calls
+        ]
+        return all_pairs, replays
+
+    vec_pairs, vec_replays = _run(shared_raw=True)
+    eager_pairs, eager_replays = _run(shared_raw=False)
+    assert vec_pairs == eager_pairs
+    assert vec_replays == eager_replays
+    assert len(vec_pairs) > 0
+    if verify:
+        assert vec_replays == [([11, 0, 0], [[11, 10], [0, 0], [0, 0]], [2, 0, 0])]
+    else:
+        assert vec_replays == []
+
+
+def test_plan_two_slot_boundary_copies_candidates_and_fast_exit():
+    """Verify fast-exit when no boundary crossed and exact candidate packing."""
+    from vllm_torchtpu.models.qwen4_exp.experimental.runner import two_slot
+
+    runner, _, _, _, _, _ = _two_slot_runner(shared_raw=True, split=1)
+    runner._unfenced_h2d_sources = []
+    runner._registered_h2d_sources = set()
+    runner.input_batch = SimpleNamespace(
+        num_computed_tokens_cpu=np.array([100, 511, 510], dtype=np.int32),
+        req_ids=["r0", "r1", "r2"],
+        block_table=[
+            _table([[10, 11, 12, 13, 14], [30, 31, 32, 33, 34], [50, 51, 52, 53, 54]]),
+            _table([[20, 21, 22, 23, 24], [40, 41, 42, 43, 44], [60, 61, 62, 63, 64]]),
+        ],
+    )
+    runner.query_start_loc_np = np.array([0, 4, 5, 9], dtype=np.int32)
+    sched = SimpleNamespace(
+        num_scheduled_tokens={"r0": 4, "r1": 1, "r2": 4},
+        scheduled_spec_decode_tokens={"r0": [1, 2, 3], "r2": [4, 5, 6]},
+    )
+    seq_lens = torch.tensor([104, 512, 514], dtype=torch.int32)
+
+    plan = runner._plan_two_slot_boundary_copies(sched, 0, 3, seq_lens)
+    assert plan is not None
+    assert tuple(plan.entries.shape) == two_slot.two_slot_entries_shape(runner, 2)
+    # r1 (plain 1-token decode 511->512) and r2 (spec 510->514) are staged; r0 skipped.
+    assert plan.host_entries[0, :3].tolist() == [1, 512, 1]
+    assert plan.host_entries[1, :3].tolist() == [2, 512, 4]
+    assert plan.host_entries[0, 3:8].tolist() == [30, 31, 32, 33, 34]
+    assert plan.host_entries[1, 8:13].tolist() == [60, 61, 62, 63, 64]
+
+    # Fast-exit returns None when no request can reach a boundary.
+    runner.input_batch.num_computed_tokens_cpu = np.array([10, 20, 30], dtype=np.int32)
+    assert runner._plan_two_slot_boundary_copies(sched, 0, 3, seq_lens) is None
+
+
+@pytest.mark.parametrize("is_spec_step", [True, False])
+def test_sample_tokens_two_slot_verify_and_non_verify_branches(
+    monkeypatch, is_spec_step
+):
+    """Exercise sample_tokens verify + non-verify chunk routing with two-slot state."""
+    monkeypatch.setattr(
+        qr.AsyncTPUCopyState,
+        "from_device_chunks",
+        staticmethod(lambda *a, **kw: None),
+    )
+    runner, _, _, _, _, two_slot = _two_slot_runner(shared_raw=True, split=1)
+    runner.scheduler_config.async_scheduling = True
+    runner._update_placeholder = lambda *a, **kw: {}
+    runner._sync_replicated_drafts_across_tp = lambda d: d
+    runner._modify_prev_results = lambda: None
+    runner._async_spec_source_rows = lambda: 8
+    runner._assemble_async_spec_substitution = lambda *a, **kw: ([], {}, None, None)
+    runner.is_pooling_model = False
+    runner._pp_is_last = True
+    runner._is_async_drafter = False
+    runner._is_dspark_pd_producer = False
+    runner._adaptive_verification = None
+    runner._fence_spec_kv_under_token_copy = False
+    runner._dp_step_other_decode = False
+    runner.num_prompt_logprobs = {}
+    runner.requests = {}
+    runner._stage_timing = SinkStageTiming(0)
+    runner._stage_timing._sink = False
+    runner.input_batch = SimpleNamespace(
+        max_num_logprobs=None,
+        num_reqs=0,
+        req_ids=[],
+        req_id_to_index={},
+        all_greedy=True,
+        generators={},
+    )
+    runner._min_tokens_batch_state = lambda: None
+    runner._get_sampling_generator = lambda: None
+    runner._update_num_xla_graphs = lambda _tag: None
+    runner.maybe_wait_for_kv_save = lambda _x: None
+    runner._build_kv_connector_output = lambda _so: None
+    runner.sample_tokens = Qwen38Runner.sample_tokens.__get__(runner)
+
+    calls: list[str] = []
+    runner._post_verify_two_slot_gdn_chunk = lambda *a, **kw: calls.append(
+        "post_verify"
+    )
+    runner._copy_two_slot_boundary_states = lambda *a, **kw: calls.append("copy_nv")
+    runner._update_mamba_slot_read_offsets = lambda *a, **kw: calls.append("std_off")
+    runner._update_ping_pong_mamba_slot_read_offsets = lambda *a, **kw: calls.append(
+        "pp_off"
+    )
+    runner._sample_spec_verify_chunk = lambda *a, **kw: torch.zeros(
+        (2, 4), dtype=torch.int32
+    )
+    runner._sample_plain_chunk = lambda *a, **kw: (
+        torch.zeros((2, 1), dtype=torch.int32),
+        None,
+    )
+
+    chunk = two_slot.PingPongMambaChunkState(
+        state_indices=[torch.tensor([1, 2], dtype=torch.int32)],
+        attn_metadata={},
+        chunk_num_windowed=2,
+        num_reqs=2,
+        query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+        seq_lens=torch.tensor([10, 12], dtype=torch.int32),
+    )
+    if is_spec_step:
+        # Chunk 0 = verify (md != None), Chunk 1 = non-verify (md is None).
+        state = SimpleNamespace(
+            scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+            draft_chunks=None,
+            top_tokens=False,
+            logits_list=[torch.zeros((2, 8)), torch.zeros((2, 8))],
+            num_reqs_list=[2, 2],
+            spec_decode_metadata_list=[SimpleNamespace(), None],
+            mamba_state_indices_list=[[torch.tensor([3, 4])], [torch.tensor([5, 6])]],
+            mamba_boundary_plans=[None, None],
+            ping_pong_mamba_chunks=[chunk, chunk],
+            two_slot_boundary_plans=[None, None],
+            kv_save_nan_check=None,
+            prompt_logprobs_chunks=[],
+            pooler_output_list=[],
+        )
+    else:
+        state = SimpleNamespace(
+            scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+            draft_chunks=None,
+            top_tokens=False,
+            logits_list=[torch.zeros((2, 8))],
+            num_reqs_list=[2],
+            spec_decode_metadata_list=[None],
+            mamba_state_indices_list=[[torch.tensor([3, 4])]],
+            mamba_boundary_plans=[None],
+            ping_pong_mamba_chunks=[chunk],
+            two_slot_boundary_plans=[None],
+            kv_save_nan_check=None,
+            prompt_logprobs_chunks=[],
+            pooler_output_list=[],
+        )
+    runner.execute_model_state = state
+    runner.sample_tokens(None)
+    if is_spec_step:
+        assert calls == ["post_verify", "std_off", "copy_nv", "std_off", "pp_off"]
+    else:
+        assert calls == ["copy_nv", "std_off", "pp_off"]
+
+
+def test_precompile_two_slot_runtime_covers_all_shapes(monkeypatch):
+    """Verify _precompile_two_slot_runtime warms all entries/rows/has_win/nt shapes."""
+    from vllm_torchtpu.models.qwen4_exp.experimental.runner import two_slot
+
+    runner, _layer, _events, copy_calls, replay_calls, _ = _two_slot_runner(
+        shared_raw=True, split=2
+    )
+
+    # Pretend TPU device (hashable) for shape/dispatch checks on CPU tensors.
+    class _FakeTpuDevice:
+        type = "tpu"
+
+    tpu_dev = _FakeTpuDevice()
+    orig_zeros = torch.zeros
+    orig_full = torch.full
+    orig_tensor = torch.tensor
+
+    def _cpu_zeros(*args, **kwargs):
+        if kwargs.get("device") is tpu_dev:
+            kwargs["device"] = torch.device("cpu")
+        return orig_zeros(*args, **kwargs)
+
+    def _cpu_full(*args, **kwargs):
+        if kwargs.get("device") is tpu_dev:
+            kwargs["device"] = torch.device("cpu")
+        return orig_full(*args, **kwargs)
+
+    def _cpu_tensor(*args, **kwargs):
+        if kwargs.get("device") is tpu_dev:
+            kwargs["device"] = torch.device("cpu")
+        return orig_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "zeros", _cpu_zeros)
+    monkeypatch.setattr(torch, "full", _cpu_full)
+    monkeypatch.setattr(torch, "tensor", _cpu_tensor)
+    monkeypatch.setattr(qr, "synchronize_tensors", lambda *a, **kw: None)
+
+    runner.device = tpu_dev
+    runner.max_num_reqs = 48
+    runner.num_reqs_max_model_len = 8
+    runner.num_reqs_most_model_len = 48
+    runner._precompile_timed = lambda _label: nullcontext()
+
+    pp_offset_shapes: set[tuple[str, tuple[int, ...]]] = set()
+    nv_calls: set[tuple[tuple[int, int], int, bool, int]] = set()
+    v_calls: set[tuple[tuple[int, int], int, tuple[int, int], int]] = set()
+
+    def _spy_offsets(_ro, groups, _qsl, _w, _n):
+        if len(groups) == 1 and groups[0].ndim == 2:
+            pp_offset_shapes.add(("stack", tuple(groups[0].shape)))
+        else:
+            pp_offset_shapes.add(("list", (len(groups), groups[0].shape[0])))
+
+    def _spy_nv(
+        entries, seq_lens, _ro, _w, _mask, has_win, _bs, _width, _sp, out_bucket
+    ):
+        nv_calls.add((tuple(entries.shape), seq_lens.shape[0], has_win, out_bucket))
+        return orig_zeros(out_bucket, dtype=torch.int32), orig_zeros(
+            out_bucket, dtype=torch.int32
+        )
+
+    def _spy_v(
+        entries, seq_lens, nt, _ro, _w, _mask, _l2p, _bs, _width, _sp, out_bucket
+    ):
+        v_calls.add(
+            (
+                tuple(entries.shape),
+                seq_lens.shape[0],
+                tuple(nt.shape),
+                out_bucket,
+            )
+        )
+        z = orig_zeros(out_bucket, dtype=torch.int32)
+        return z, z, z, z, z
+
+    copy_buckets: set[int] = set()
+    runner._copy_mamba_state_blocks = lambda _raws, s, _d: copy_buckets.add(s.shape[0])
+
+    monkeypatch.setattr(qr, "update_ping_pong_read_offsets_compiled", _spy_offsets)
+    monkeypatch.setattr(qr, "compute_boundary_copy_no_verify_compiled", _spy_nv)
+    monkeypatch.setattr(qr, "compute_boundary_copy_and_interior_compiled", _spy_v)
+
+    runner._precompile_two_slot_runtime()
+
+    expected_shapes = {two_slot.two_slot_entries_shape(runner, n) for n in range(1, 49)}
+    assert len(expected_shapes) == 2  # 32 and 128 candidate rows at max_num_reqs=48
+    # Both [G, rows] stack and list-of-G shapes warmed for both row counts.
+    assert pp_offset_shapes == {
+        ("stack", (1, 8)),
+        ("list", (1, 8)),
+        ("stack", (1, 48)),
+        ("list", (1, 48)),
+    }
+    # Replay op warmed for both row counts.
+    assert {len(r["state_indices"]) for r in replay_calls} == {8, 48}
+    # No-verify warmed for every (entries_shape, rows, has_win in {False, True}).
+    for sh in expected_shapes:
+        ob = runner._bucket_len(len(runner._mamba_copy_plan) * sh[0] * 2)
+        assert ob in copy_buckets
+        for rows in (8, 48):
+            assert (sh, rows, False, ob) in nv_calls
+            assert (sh, rows, True, ob) in nv_calls
+    # Verify+interior warmed for every (entries_shape, rows, nt_rows bucket).
+    for sh in expected_shapes:
+        ob = runner._bucket_len(len(runner._mamba_copy_plan) * sh[0] * 2)
+        assert (sh, 8, (8, 4), ob) in v_calls
+        for nt_rows in (8, 16, 32, 48):
+            assert (sh, 48, (nt_rows, 4), ob) in v_calls

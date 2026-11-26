@@ -71,6 +71,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.utils import fresh_buffer
 
+from ..config import mtp_gdn_two_slot_enabled
 from ..gdn_attention import (
     gdn_step_metadata,
     run_jax_gdn_attention,
@@ -85,6 +86,7 @@ from ..metadata_access import (
     mamba_ckpt_of,
     mamba_state_of,
 )
+from .rows_update_op import update_rows_ as _update_verify_rows_
 
 # Set by the model plan through `configure` before the layers are built (the
 # defaults are the small-batch / non-c48 choices).
@@ -233,6 +235,10 @@ def gdn_attention_pooled_core_tpu(
     conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
     conv_weight_kmajor: bool = False,
+    single_checkpoint: bool = False,
+    batched_only: bool = False,
+    commit_lens: jax.Array | None = None,
+    read_offset_indices: jax.Array | None = None,
     step_metadata: tuple[jax.Array, ...] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
@@ -261,6 +267,10 @@ def gdn_attention_pooled_core_tpu(
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
         conv_weight_kmajor=conv_weight_kmajor,
+        single_checkpoint=single_checkpoint,
+        batched_only=batched_only,
+        commit_lens=commit_lens,
+        read_offset_indices=read_offset_indices,
         step_metadata=step_metadata,
     )
 
@@ -460,6 +470,13 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
     _bm_kernel: bool = False
     _pooled_conv_state_dtype: torch.dtype = torch.bfloat16
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
+    _two_slot_mtp: bool = False
+    _verify_win_cap: int = 0
+    # Type-only annotations for non-persistent buffers registered in __init__
+    # (no class defaults so nn.Module.register_buffer is never shadowed).
+    _verify_qkv_buf: torch.Tensor | None
+    _verify_b_buf: torch.Tensor | None
+    _verify_a_buf: torch.Tensor | None
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
@@ -493,6 +510,27 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
         )
         self.gdn_op = self._build_gdn_op()
         self.gdn_pooled_op = self._build_pooled_gdn_op(block_major=self._bm_kernel)
+        self._two_slot_mtp = vllm_config is not None and mtp_gdn_two_slot_enabled(
+            vllm_config
+        )
+        self.gdn_pooled_single_ckpt_op = (
+            self._build_pooled_gdn_op(
+                block_major=self._bm_kernel,
+                single_checkpoint=True,
+            )
+            if self._two_slot_mtp
+            else None
+        )
+        self.gdn_pooled_replay_op = (
+            self._build_pooled_gdn_op(
+                block_major=self._bm_kernel,
+                single_checkpoint=True,
+                batched_only=True,
+            )
+            if self._two_slot_mtp
+            else None
+        )
+        self._init_verify_input_buffers(vllm_config)
         # Block-major state ids are per layer (pool_index), so only the
         # plain unified pool can share one step's metadata across layers.
         self.gdn_pooled_hoisted_op = (
@@ -529,6 +567,151 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
         assert self._bm_region is not None
         pool_index, layout = self._bm_region
         return flat_manager_ids(ids, pool_index, layout.num_pools)
+
+    def _bm_ckpt_ids(self, ckpt_ids: torch.Tensor) -> torch.Tensor:
+        """Map manager checkpoint block IDs to physical block-major pool IDs.
+
+        Null sentinel entries (``0``) remain ``0`` so inactive checkpoint
+        columns never address layer-0+pool_index physical blocks.
+        """
+        if not self._bm_kernel:
+            return ckpt_ids
+        assert self._bm_region is not None
+        pool_index, layout = self._bm_region
+        if layout.num_pools <= 1:
+            return ckpt_ids
+        mapped = flat_manager_ids(ckpt_ids, pool_index, layout.num_pools)
+        return torch.where(ckpt_ids > 0, mapped, torch.zeros_like(mapped))
+
+    def _init_verify_input_buffers(self, vllm_config: VllmConfig | None) -> None:
+        """Allocate non-persistent verify staging buffers for 2-slot MTP replay."""
+        if not self._two_slot_mtp or vllm_config is None:
+            self._verify_win_cap = 0
+            self.register_buffer("_verify_qkv_buf", None, persistent=False)
+            self.register_buffer("_verify_b_buf", None, persistent=False)
+            self.register_buffer("_verify_a_buf", None, persistent=False)
+            return
+        sched = vllm_config.scheduler_config
+        max_reqs = int(sched.max_num_seqs)
+        max_batched = int(
+            sched.max_num_batched_tokens or max_reqs * (self.num_spec + 1)
+        )
+        win_cap = max(1, min(max_batched, max_reqs * (self.num_spec + 1)))
+        qkv_dim = self.tp_head_geometry.local_conv_dim(self.head_k_dim, self.head_v_dim)
+        local_n_v = self.num_v_heads // self.tp_size
+        act_dtype = self.model_config.dtype
+        assert isinstance(act_dtype, torch.dtype)
+        dev = self.A_log.device
+        self._verify_win_cap = win_cap
+        self.register_buffer(
+            "_verify_qkv_buf",
+            torch.zeros((win_cap, qkv_dim), dtype=act_dtype, device=dev),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_verify_b_buf",
+            torch.zeros((win_cap, local_n_v), dtype=act_dtype, device=dev),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_verify_a_buf",
+            torch.zeros((win_cap, local_n_v), dtype=act_dtype, device=dev),
+            persistent=False,
+        )
+
+    def get_verify_inputs(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Return staged verify ``(qkv, b, a)`` buffers for rejection replay."""
+        qkv_buf = self._verify_qkv_buf
+        b_buf = self._verify_b_buf
+        a_buf = self._verify_a_buf
+        if qkv_buf is None or b_buf is None or a_buf is None:
+            return None
+        return (qkv_buf, b_buf, a_buf)
+
+    def snapshot_verify_inputs(
+        self, max_rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Clone fixed-shape ``(win_cap, ...)`` staged verify buffers across chunks.
+
+        Keeping the full static ``win_cap`` row count matches single-chunk
+        replay so multi-chunk steps never trigger XLA/Pallas recompilations;
+        rows past ``max_rows`` lie outside ``query_start_loc`` for the chunk's
+        windowed sequences and carry ``commit_lens == 0``.
+        """
+        staged = self.get_verify_inputs()
+        if staged is None:
+            return None
+        qkv_b, b_b, a_b = staged
+        rows = max(0, min(int(max_rows), int(qkv_b.shape[0])))
+        if rows == 0:
+            return None
+        return (
+            qkv_b.clone(),
+            b_b.clone(),
+            a_b.clone(),
+        )
+
+    @torch.no_grad()
+    def replay_two_slot_state(
+        self,
+        *,
+        state_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        distribution: torch.Tensor,
+        seq_lens: torch.Tensor,
+        slot_read_offsets: torch.Tensor,
+        ckpt_indices: torch.Tensor,
+        commit_lens: torch.Tensor,
+        staged_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> None:
+        """Re-advance GDN state from `c_read` to `commit_lens` into `1 - c_read`."""
+        kv_cache = self.kv_cache
+        if kv_cache is None or len(kv_cache) != 1 or kv_cache[0].numel() == 0:
+            return
+        if not self._two_slot_mtp:
+            raise RuntimeError(
+                f"replay_two_slot_state called on non-two-slot GDN layer {self.prefix}"
+            )
+        replay_op = self.gdn_pooled_replay_op
+        if replay_op is None:
+            raise RuntimeError(
+                f"Two-slot GDN layer {self.prefix} has no gdn_pooled_replay_op"
+            )
+        inputs = (
+            staged_inputs if staged_inputs is not None else self.get_verify_inputs()
+        )
+        if inputs is None:
+            raise RuntimeError(
+                f"Two-slot GDN layer {self.prefix} has no staged verify inputs "
+                "for replay"
+            )
+        qkv_in, b_in, a_in = inputs
+        win_rows = int(qkv_in.shape[0])
+        qsl_clamped = torch.clamp(query_start_loc.to(torch.int32), 0, win_rows)
+        raw_state = state_indices.to(torch.int32)
+        phys_state = self._bm_state_ids(raw_state)
+        phys_ckpt = self._bm_ckpt_ids(ckpt_indices.to(torch.int32))
+        (recurrent_state,) = kv_cache
+        replay_op(
+            qkv_in,
+            b_in,
+            a_in,
+            recurrent_state,
+            self._pooled_conv_weight(),
+            self.conv1d.bias,
+            self.A_log,
+            self.dt_bias,
+            phys_state,
+            qsl_clamped,
+            distribution.to(torch.int32),
+            seq_lens.to(torch.int32),
+            slot_read_offsets,
+            phys_ckpt,
+            commit_lens.to(torch.int32),
+            raw_state if self._bm_kernel else None,
+        )
 
     @property
     def tp_head_geometry(self) -> GdnHeadGeometry:
@@ -850,6 +1033,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
         *,
         block_major: bool = False,
         hoisted: bool = False,
+        single_checkpoint: bool = False,
+        batched_only: bool = False,
     ):
         """The pooled GDN op. ``hoisted``: the variant taking the step's
         `gdn_step_metadata` outputs (VLLM_TPU_GDN_HOIST_METADATA)."""
@@ -888,13 +1073,19 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
             seq_lens,
             slot_read_offsets,
             ckpt_indices,
+            commit_lens=None,
+            read_offset_indices=None,
             step_metadata=None,
         ):
             # Fold the `(num_blocks, rows_per_block, *page)` block-major pool so
             # pool adapters index flat kernel blocks along dim 0; both reshapes
             # compile to zero-copy bitcasts on the donated buffer.
             pool = kernel_view(recurrent_state) if block_major else recurrent_state
-            prepared_qkv = self._prepare_pooled_gdn_input(mixed_qkv, seq_lens, mesh)
+            prepared_qkv = (
+                mixed_qkv
+                if batched_only
+                else self._prepare_pooled_gdn_input(mixed_qkv, seq_lens, mesh)
+            )
             result = gdn_attention_pooled_core_tpu(
                 prepared_qkv,
                 b,
@@ -927,6 +1118,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                 conv_state_dtype=conv_state_dtype,
                 num_spec_tokens=num_spec_tokens,
                 conv_weight_kmajor=conv_weight_kmajor,
+                single_checkpoint=single_checkpoint,
+                batched_only=batched_only,
+                commit_lens=commit_lens,
+                read_offset_indices=read_offset_indices,
                 step_metadata=step_metadata,
             )
             if not block_major:
@@ -949,6 +1144,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
             seq_lens: jax.Array,
             slot_read_offsets: jax.Array | None = None,
             ckpt_indices: jax.Array | None = None,
+            commit_lens: jax.Array | None = None,
+            read_offset_indices: jax.Array | None = None,
         ) -> tuple[jax.Array, jax.Array]:
             return run(
                 mixed_qkv,
@@ -965,6 +1162,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
+                commit_lens=commit_lens,
+                read_offset_indices=read_offset_indices,
             )
 
         # VLLM_TPU_GDN_HOIST_METADATA: the step's `gdn_step_metadata` outputs
@@ -1037,8 +1236,21 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
             return op
 
         if hoisted:
-            assert not block_major
+            assert not block_major and not single_checkpoint and not batched_only
             kind = "gdn_attention_pooled_hoisted"
+        elif batched_only:
+            assert single_checkpoint
+            kind = (
+                "gdn_attention_pooled_replay_bm"
+                if block_major
+                else "gdn_attention_pooled_replay"
+            )
+        elif single_checkpoint:
+            kind = (
+                "gdn_attention_pooled_s1_bm"
+                if block_major
+                else "gdn_attention_pooled_s1"
+            )
         else:
             kind = "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled"
         gdn_jax_op = _get_shared_gdn_op(
@@ -1056,6 +1268,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                 conv_state_dtype,
                 num_spec_tokens,
                 conv_weight_kmajor,
+                single_checkpoint,
+                batched_only,
             ),
             build_op,
         )
@@ -1075,12 +1289,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
             seq_lens: torch.Tensor,
             slot_read_offsets: torch.Tensor | None = None,
             ckpt_indices: torch.Tensor | None = None,
-            *step_metadata: torch.Tensor,
+            *extra: torch.Tensor | None,
         ) -> torch.Tensor:
             # Hoisted: `slot_read_offsets` / `ckpt_indices` are the step's
-            # read offsets / int32 checkpoint ids, followed by the rolled
+            # read offsets / int32 checkpoint ids, followed by the 5 rolled
             # per-sequence inputs (see gdn_step_metadata).
-            assert len(step_metadata) == (5 if hoisted else 0)
+            # Non-hoisted: optional `(commit_lens, read_offset_indices)`.
+            if hoisted:
+                assert len(extra) == 5
+            else:
+                assert len(extra) <= 2
             new_rec, outputs = gdn_jax_op(
                 mixed_qkv,
                 b,
@@ -1096,7 +1314,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                 seq_lens,
                 slot_read_offsets,
                 ckpt_indices,
-                *step_metadata,
+                *extra,
             )
 
             # Plain donation + copy_ writeback (aliased in-place by XLA).
@@ -1450,7 +1668,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                 (recurrent_state,) = kv_cache
                 md_state = mamba_state_of(attn_metadata)
                 assert md_state is not None
-                state_indices = self._bm_state_ids(md_state.to(torch.int32))
+                raw_state_indices = md_state.to(torch.int32)
+                state_indices = self._bm_state_ids(raw_state_indices)
                 # Speculative decoding: the GDN kernel's windowed segment
                 # covers both 1-token decodes and speculative verify
                 # windows (the batch is ordered [decode][verify][prefill]);
@@ -1471,10 +1690,47 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                         "mamba_slot_read_offsets in the attention metadata."
                     )
                 ckpt_indices = mamba_ckpt_of(attn_metadata)
-                step_metadata: tuple[torch.Tensor, ...] = ()
-                pooled_op = self.gdn_pooled_op
+                use_two_slot = (
+                    self._two_slot_mtp
+                    and self.gdn_pooled_single_ckpt_op is not None
+                    and ckpt_indices is not None
+                    and ckpt_indices.ndim == 2
+                    and ckpt_indices.shape[1] in (1, 2)
+                )
+                if use_two_slot and self._verify_win_cap > 0:
+                    n_save = min(num_tokens, self._verify_win_cap)
+                    if n_save > 0:
+                        qkv_save = mixed_qkv[:n_save]
+                        b_save = b[:n_save]
+                        a_save = a[:n_save]
+                        qkv_buf = self._verify_qkv_buf
+                        b_buf = self._verify_b_buf
+                        a_buf = self._verify_a_buf
+                        if (
+                            qkv_buf is not None
+                            and b_buf is not None
+                            and a_buf is not None
+                        ):
+                            if qkv_buf.device.type == "tpu":
+                                _update_verify_rows_(qkv_buf, qkv_save)
+                                _update_verify_rows_(b_buf, b_save)
+                                _update_verify_rows_(a_buf, a_save)
+                            else:
+                                qkv_buf[:n_save].copy_(qkv_save.to(qkv_buf.dtype))
+                                b_buf[:n_save].copy_(b_save.to(b_buf.dtype))
+                                a_buf[:n_save].copy_(a_save.to(a_buf.dtype))
+                if use_two_slot and ckpt_indices is not None:
+                    ckpt_indices = self._bm_ckpt_ids(ckpt_indices.to(torch.int32))
+                step_metadata: tuple[torch.Tensor | None, ...] = ()
+                pooled_op = (
+                    self.gdn_pooled_single_ckpt_op
+                    if use_two_slot
+                    else self.gdn_pooled_op
+                )
+                assert pooled_op is not None
                 if (
-                    gdn_step_metadata_cache is not None
+                    not use_two_slot
+                    and gdn_step_metadata_cache is not None
                     and self.gdn_pooled_hoisted_op is not None
                     and self.gdn_step_metadata_op is not None
                     and slot_read_offsets is not None
@@ -1498,6 +1754,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention, BlockMajorPoolBinda
                     )
                     step_metadata = tuple(rest)
                     pooled_op = self.gdn_pooled_hoisted_op
+                elif use_two_slot and self._bm_kernel and slot_read_offsets is not None:
+                    # Under merged block-major pools, `slot_read_offsets` is
+                    # indexed by unscaled manager block ID (`raw_state_indices`),
+                    # while `state_indices` / `ckpt_indices` hold physical pool
+                    # block IDs.
+                    step_metadata = (None, raw_state_indices)
                 core_attn_out = pooled_op(
                     mixed_qkv,
                     b,

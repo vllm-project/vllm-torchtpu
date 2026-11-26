@@ -50,6 +50,14 @@ from .config import (
 from .pool_layout import check_packed_compressed_groups, pooled_cache_specs
 
 
+def _mamba_group_window(spec: MambaSpec, window: int) -> int:
+    """Per-group speculative checkpoint count (e.g. 2 for 2-slot GDN, 4 for PLE)."""
+    spec_blocks = int(spec.num_speculative_blocks or 0)
+    if window > 1 and spec_blocks > 0:
+        return min(window, 1 + spec_blocks)
+    return window
+
+
 class Qwen4ExpPooledCache:
     """The unified pool and its binding to the model's layers.
 
@@ -94,7 +102,7 @@ class Qwen4ExpPooledCache:
             if isinstance(spec, CircularBufferSpec):
                 pages += active_rows
             elif isinstance(spec, MambaSpec):
-                pages += active_rows * window
+                pages += active_rows * _mamba_group_window(spec, window)
             else:
                 columns = self._table_columns(spec)
                 pages += sum(
@@ -400,8 +408,9 @@ class Qwen4ExpPooledCache:
             spec = group.kv_cache_spec
             state = isinstance(spec, MambaSpec)
             ring = isinstance(spec, CircularBufferSpec)
+            group_window = _mamba_group_window(spec, window) if state else window
             # A state group's table is read only through its state and
-            # checkpoint indices, so `window` columns trace it. With the tail
+            # checkpoint indices, so `group_window` columns trace it. With the tail
             # fold, serving stages each state group's whole table (the
             # internal prefill checkpoints resolve their block ids from it),
             # so the compiled program (no guards) must trace the row width that
@@ -418,17 +427,19 @@ class Qwen4ExpPooledCache:
                     spec.block_size,
                 )
                 if wide
-                else window
+                else group_window
             )
             if state:
-                columns = max(columns, window)
+                columns = max(columns, group_window)
             table = torch.zeros((rows, columns), dtype=torch.int32, device="cpu")
             for row in range(active_rows):
                 req_blocks = max(
                     1,
                     (int(seq_lens_cpu[row]) + spec.block_size - 1) // spec.block_size,
                 )
-                owned = 1 if ring else window if state else min(columns, req_blocks)
+                owned = (
+                    1 if ring else group_window if state else min(columns, req_blocks)
+                )
                 table[row, :owned] = torch.arange(
                     next_page, next_page + owned, dtype=torch.int32, device="cpu"
                 )
@@ -447,7 +458,9 @@ class Qwen4ExpPooledCache:
                     mamba_state_indices=table[:, 0].clone(),
                     mamba_slot_read_offsets=read_offsets,
                     mamba_ckpt_indices=(
-                        table[:, :window].clone() if columns > window else table.clone()
+                        table[:, :group_window].clone()
+                        if columns > group_window
+                        else table.clone()
                     ),
                     mamba_request_distribution=mamba_distribution,
                 )

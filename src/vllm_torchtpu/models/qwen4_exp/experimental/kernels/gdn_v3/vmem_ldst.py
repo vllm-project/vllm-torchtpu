@@ -316,6 +316,23 @@ def load_and_select_states(
     return real_sizes, prev_conv_state, prev_recurrent_state
 
 
+def load_commit_sizes(
+    metadata_ref: memory_ref.MetadataRef,
+    p_id: jax.Array,
+    real_sizes: jax.Array,
+    cfg: config.GDNConfig,
+) -> jax.Array:
+    """Loads per-slot commit prefix lengths when `single_checkpoint` is active."""
+    commit_lens = metadata_ref.s_idx_to_commit_len
+    if commit_lens is None:
+        return real_sizes
+    commit_list = []
+    for idx in range(cfg.seq_tile_size):
+        s_idx = metadata_ref.p_id_to_s_idx[p_id, idx]
+        commit_list.append(jnp.clip(commit_lens[s_idx], 0, real_sizes[idx]))
+    return jnp.stack(commit_list, axis=0)
+
+
 def load_activation_as_compact(
     qkv_vreg: jax.Array,
     qkv_vmem_ref: jax.Ref,

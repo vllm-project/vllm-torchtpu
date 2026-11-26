@@ -100,6 +100,10 @@ class MetadataRef:
     # also has `p_id_is_last_tile` set, though its sequence goes on. None
     # without internal checkpoints.
     p_id_to_state_override: Any = None
+    # Optional [max_seqs] int32 token prefix length to commit when
+    # `cfg.single_checkpoint` is True (0 skips HBM state write for read-only
+    # verify; >0 writes the single state after `commit_len` tokens).
+    s_idx_to_commit_len: Any = None
 
     @classmethod
     def create(
@@ -116,6 +120,7 @@ class MetadataRef:
         s_idx_to_read_offset: jax.Array,
         s_idx_to_ckpt_indices: jax.Array | None = None,
         p_id_to_state_override: jax.Array | None = None,
+        s_idx_to_commit_len: jax.Array | None = None,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
@@ -135,6 +140,7 @@ class MetadataRef:
                 if p_id_to_state_override is None
                 else SmemWrapper(p_id_to_state_override, shape)
             ),
+            s_idx_to_commit_len=s_idx_to_commit_len,
         )
 
     def state_override(self, p_id, idx, state_idx):
@@ -202,11 +208,14 @@ class InBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
             dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            pltpu.make_async_copy(
-                src_ref.at[pl.ds(r_base, dma_size)],
-                vmem_ref.at[idx, pl.ds(0, dma_size)],
-                sem,
-            ).start()
+
+            @pl.when(dma_size > 0)
+            def _(*, idx=idx, r_base=r_base, dma_size=dma_size):
+                pltpu.make_async_copy(
+                    src_ref.at[pl.ds(r_base, dma_size)],
+                    vmem_ref.at[idx, pl.ds(0, dma_size)],
+                    sem,
+                ).start()
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -220,11 +229,13 @@ class InBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             dma_size += self.metadata_ref.p_id_to_r_size[p_id, idx]
 
-        pltpu.make_async_copy(
-            vmem_ref.at[0, pl.ds(0, dma_size)],
-            vmem_ref.at[0, pl.ds(0, dma_size)],
-            sem,
-        ).wait()
+        @pl.when(dma_size > 0)
+        def _():
+            pltpu.make_async_copy(
+                vmem_ref.at[0, pl.ds(0, dma_size)],
+                vmem_ref.at[0, pl.ds(0, dma_size)],
+                sem,
+            ).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -241,11 +252,14 @@ class OutBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             r_base = self.metadata_ref.p_id_to_r_base[p_id, idx]
             dma_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            pltpu.make_async_copy(
-                vmem_ref.at[idx, pl.ds(0, dma_size)],
-                dst_ref.at[pl.ds(r_base, dma_size)],
-                sem,
-            ).start()
+
+            @pl.when(dma_size > 0)
+            def _(*, idx=idx, r_base=r_base, dma_size=dma_size):
+                pltpu.make_async_copy(
+                    vmem_ref.at[idx, pl.ds(0, dma_size)],
+                    dst_ref.at[pl.ds(r_base, dma_size)],
+                    sem,
+                ).start()
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -259,11 +273,13 @@ class OutBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             dma_size += self.metadata_ref.p_id_to_r_size[p_id, idx]
 
-        pltpu.make_async_copy(
-            vmem_ref.at[0, pl.ds(0, dma_size)],
-            vmem_ref.at[0, pl.ds(0, dma_size)],
-            sem,
-        ).wait()
+        @pl.when(dma_size > 0)
+        def _():
+            pltpu.make_async_copy(
+                vmem_ref.at[0, pl.ds(0, dma_size)],
+                vmem_ref.at[0, pl.ds(0, dma_size)],
+                sem,
+            ).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -287,19 +303,29 @@ class StateInBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
             has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size = jnp.where(should_read, 1, 0)
 
             # Resume from the checkpoint of the last accepted token.
-            state_idx += self.metadata_ref.s_idx_to_read_offset[s_idx]
+            read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
+            ckpt_indices = self.metadata_ref.s_idx_to_ckpt_indices
+            if ckpt_indices is None:
+                raw_state_idx = (
+                    self.metadata_ref.s_idx_to_state_indices[s_idx] + read_ckpt
+                )
+            else:
+                col = jnp.clip(read_ckpt, 0, ckpt_indices.shape[1] - 1)
+                raw_state_idx = ckpt_indices[s_idx, col]
+            state_idx = jnp.where(should_read, raw_state_idx, 0)
 
-            pltpu.make_async_copy(
-                src_ref.at[pl.ds(state_idx, dma_size)],
-                vmem_ref.at[idx, pl.ds(0, dma_size)],
-                sem,
-            ).start()
+            @pl.when(should_read)
+            def _(*, idx=idx, state_idx=state_idx, dma_size=dma_size):
+                pltpu.make_async_copy(
+                    src_ref.at[pl.ds(state_idx, dma_size)],
+                    vmem_ref.at[idx, pl.ds(0, dma_size)],
+                    sem,
+                ).start()
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -320,8 +346,10 @@ class StateInBufferedRef(BaseBufferedRef):
         # NOTE: With bounds checks disabled, the self-copy descriptor may
         # nominally exceed the window row; it is never executed, only used
         # to wait for the same number of bytes `copy_in` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -330,11 +358,11 @@ class StateOutBufferedRef(BaseBufferedRef):
     """Output buffered ref for per-sequence state checkpoints (conv / recurrent).
 
     The VMEM window holds one state per window position,
-    [seq_tile_size, window_size, *state_shape]. After compute, the first
-    `min(r_size, window_size)` checkpoints are written back to
-    `state_indices[s] .. + that many slots`. Keeping loads in a separate
-    window stops the load for tile p + 2, issued during step p + 1, from
-    overwriting the slot that tile p's store is still reading.
+    [seq_tile_size, num_state_checkpoints, *state_shape]. After compute,
+    the valid checkpoints are written back to `state_indices[s] ..` (or
+    `ckpt_indices[s, write_col]`). Keeping loads in a separate window stops
+    the load for tile p + 2, issued during step p + 1, from overwriting the
+    slot that tile p's store is still reading.
     """
 
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
@@ -348,22 +376,83 @@ class StateOutBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            state_idx = self.metadata_ref.state_override(
-                p_id, idx, self.metadata_ref.s_idx_to_state_indices[s_idx]
-            )
+            r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+            ckpt_indices = self.metadata_ref.s_idx_to_ckpt_indices
+            if self.cfg.single_checkpoint:
+                commit_lens = self.metadata_ref.s_idx_to_commit_len
+                target_c = (
+                    r_size
+                    if commit_lens is None
+                    else jnp.clip(commit_lens[s_idx], 0, r_size)
+                )
+                if ckpt_indices is not None and ckpt_indices.shape[1] == 2:
+                    read_col = jnp.clip(
+                        self.metadata_ref.s_idx_to_read_offset[s_idx], 0, 1
+                    )
+                    write_col = 1 - read_col
+                    raw_idx = ckpt_indices[s_idx, write_col]
+                elif ckpt_indices is not None:
+                    raw_idx = ckpt_indices[s_idx, 0]
+                else:
+                    raw_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
+                should_write = jnp.logical_and(is_last_tile, target_c > 0)
+                state_idx = jnp.where(
+                    should_write,
+                    self.metadata_ref.state_override(p_id, idx, raw_idx),
+                    0,
+                )
+
+                @pl.when(should_write)
+                def _(*, idx=idx, state_idx=state_idx):
+                    pltpu.make_async_copy(
+                        vmem_ref.at[idx, pl.ds(0, 1)],
+                        dst_ref.at[pl.ds(state_idx, 1)],
+                        sem,
+                    ).start()
+
+                continue
+
             # Write one checkpoint per valid window position, starting at the
             # group's base slot. `r_size` never exceeds `window_size` for
             # windowed sequences; the clamp is for PER_SEQ tiles, which hold
             # many tokens but keep only the final state.
-            r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size = jnp.where(is_last_tile, num_ckpts, 0)
+            if ckpt_indices is not None:
+                for t in range(self.cfg.window_size):
+                    should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
+                    col = jnp.clip(t, 0, ckpt_indices.shape[1] - 1)
+                    state_idx = jnp.where(
+                        should_write,
+                        self.metadata_ref.state_override(
+                            p_id, idx, ckpt_indices[s_idx, col]
+                        ),
+                        0,
+                    )
 
-            pltpu.make_async_copy(
-                vmem_ref.at[idx, pl.ds(0, dma_size)],
-                dst_ref.at[pl.ds(state_idx, dma_size)],
-                sem,
-            ).start()
+                    @pl.when(should_write)
+                    def _(*, idx=idx, t=t, state_idx=state_idx):
+                        pltpu.make_async_copy(
+                            vmem_ref.at[idx, pl.ds(t, 1)],
+                            dst_ref.at[pl.ds(state_idx, 1)],
+                            sem,
+                        ).start()
+            else:
+                dma_size = jnp.where(is_last_tile, num_ckpts, 0)
+                state_idx = jnp.where(
+                    dma_size > 0,
+                    self.metadata_ref.state_override(
+                        p_id, idx, self.metadata_ref.s_idx_to_state_indices[s_idx]
+                    ),
+                    0,
+                )
+
+                @pl.when(dma_size > 0)
+                def _(*, idx=idx, state_idx=state_idx, dma_size=dma_size):
+                    pltpu.make_async_copy(
+                        vmem_ref.at[idx, pl.ds(0, dma_size)],
+                        dst_ref.at[pl.ds(state_idx, dma_size)],
+                        sem,
+                    ).start()
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -377,14 +466,26 @@ class StateOutBufferedRef(BaseBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size += jnp.where(is_last_tile, num_ckpts, 0)
+            if self.cfg.single_checkpoint:
+                commit_lens = self.metadata_ref.s_idx_to_commit_len
+                s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+                target_c = (
+                    r_size
+                    if commit_lens is None
+                    else jnp.clip(commit_lens[s_idx], 0, r_size)
+                )
+                dma_size += jnp.where(jnp.logical_and(is_last_tile, target_c > 0), 1, 0)
+            else:
+                num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+                dma_size += jnp.where(is_last_tile, num_ckpts, 0)
 
         # NOTE: With bounds checks disabled, the self-copy descriptor may
         # nominally exceed the window row; it is never executed, only used
         # to wait for the same number of bytes `copy_out` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -421,7 +522,8 @@ class ExternalStateInBufferedRef(StateInBufferedRef):
         ckpt_indices = self.metadata_ref.s_idx_to_ckpt_indices
         if ckpt_indices is None:
             return self.metadata_ref.s_idx_to_state_indices[s_idx]
-        return ckpt_indices[s_idx, ckpt]
+        col = jnp.clip(ckpt, 0, ckpt_indices.shape[1] - 1)
+        return ckpt_indices[s_idx, col]
 
     def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
         assert self.cfg.state_plan is not None
@@ -447,17 +549,21 @@ class ExternalStateInBufferedRef(StateInBufferedRef):
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
             has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
-            nblocks = jnp.where(should_read, self.region.nblocks, 0)
 
             # Resume from the checkpoint of the last accepted token.
             read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
-            state_idx = self._ckpt_state_idx(s_idx, read_ckpt)
+            state_idx = jnp.where(
+                should_read, self._ckpt_state_idx(s_idx, read_ckpt), 0
+            )
 
-            pltpu.make_async_copy(
-                self._region_slice(src_ref, state_idx, nblocks),
-                vmem_ref.at[idx, 0, pl.ds(0, nblocks)],
-                sem,
-            ).start()
+            @pl.when(should_read)
+            def _(*, idx=idx, state_idx=state_idx):
+                nblocks = self.region.nblocks
+                pltpu.make_async_copy(
+                    self._region_slice(src_ref, state_idx, nblocks),
+                    vmem_ref.at[idx, 0, pl.ds(0, nblocks)],
+                    sem,
+                ).start()
 
     def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -480,8 +586,10 @@ class ExternalStateInBufferedRef(StateInBufferedRef):
         # disabled, the descriptor may nominally exceed the window row; it is
         # never executed, only used to wait for the same number of bytes
         # `copy_in` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 @jax.tree_util.register_dataclass
@@ -526,7 +634,8 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
         ckpt_indices = self.metadata_ref.s_idx_to_ckpt_indices
         if ckpt_indices is None:
             return self.metadata_ref.s_idx_to_state_indices[s_idx]
-        return ckpt_indices[s_idx, ckpt]
+        col = jnp.clip(ckpt, 0, ckpt_indices.shape[1] - 1)
+        return ckpt_indices[s_idx, col]
 
     def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
         assert self.cfg.state_plan is not None
@@ -565,14 +674,26 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+            if self.cfg.single_checkpoint:
+                commit_lens = self.metadata_ref.s_idx_to_commit_len
+                target_c = (
+                    r_size
+                    if commit_lens is None
+                    else jnp.clip(commit_lens[s_idx], 0, r_size)
+                )
+                num_ckpts = jnp.where(target_c > 0, 1, 0)
+            else:
+                num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
             dma_size = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
 
-            pltpu.make_async_copy(
-                vmem_ref.at[idx, 0, pl.ds(0, dma_size)],
-                self.compact_output_ref.at[s_idx, pl.ds(0, dma_size)],
-                sem,
-            ).start()
+            @pl.when(dma_size > 0)
+            def _(*, idx=idx, s_idx=s_idx, dma_size=dma_size):
+                assert self.compact_output_ref is not None
+                pltpu.make_async_copy(
+                    vmem_ref.at[idx, 0, pl.ds(0, dma_size)],
+                    self.compact_output_ref.at[s_idx, pl.ds(0, dma_size)],
+                    sem,
+                ).start()
 
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         if self.compact_output_ref is not None:
@@ -587,24 +708,66 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+            r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
+            if self.cfg.single_checkpoint:
+                commit_lens = self.metadata_ref.s_idx_to_commit_len
+                target_c = (
+                    r_size
+                    if commit_lens is None
+                    else jnp.clip(commit_lens[s_idx], 0, r_size)
+                )
+                ckpt_indices = self.metadata_ref.s_idx_to_ckpt_indices
+                if ckpt_indices is not None and ckpt_indices.shape[1] == 2:
+                    read_col = jnp.clip(
+                        self.metadata_ref.s_idx_to_read_offset[s_idx], 0, 1
+                    )
+                    write_col = 1 - read_col
+                else:
+                    write_col = 0
+                should_write = jnp.logical_and(is_last_tile, target_c > 0)
+                state_idx = jnp.where(
+                    should_write,
+                    self.metadata_ref.state_override(
+                        p_id, idx, self._ckpt_state_idx(s_idx, write_col)
+                    ),
+                    0,
+                )
+
+                @pl.when(should_write)
+                def _(*, idx=idx, state_idx=state_idx):
+                    nblocks = self.region.nblocks
+                    pltpu.make_async_copy(
+                        vmem_ref.at[idx, 0, pl.ds(0, nblocks)],
+                        self._region_slice(dst_ref, state_idx, nblocks),
+                        sem,
+                    ).start()
+
+                continue
+
             # One checkpoint per valid window position, starting at the
             # slot's checkpoint 0. `r_size` never exceeds `window_size` for
             # windowed sequences; the clamp is for PER_SEQ tiles, which
             # hold many tokens but keep only the final state.
-            r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
 
             for t in range(self.cfg.window_size):
                 should_write = jnp.logical_and(is_last_tile, t < num_ckpts)
-                nblocks = jnp.where(should_write, self.region.nblocks, 0)
-                state_idx = self.metadata_ref.state_override(
-                    p_id, idx, self._ckpt_state_idx(s_idx, t)
+                state_idx = jnp.where(
+                    should_write,
+                    self.metadata_ref.state_override(
+                        p_id, idx, self._ckpt_state_idx(s_idx, t)
+                    ),
+                    0,
                 )
-                pltpu.make_async_copy(
-                    vmem_ref.at[idx, t, pl.ds(0, nblocks)],
-                    self._region_slice(dst_ref, state_idx, nblocks),
-                    sem,
-                ).start()
+
+                @pl.when(should_write)
+                def _(*, idx=idx, t=t, state_idx=state_idx):
+                    nblocks = self.region.nblocks
+                    pltpu.make_async_copy(
+                        vmem_ref.at[idx, t, pl.ds(0, nblocks)],
+                        self._region_slice(dst_ref, state_idx, nblocks),
+                        sem,
+                    ).start()
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -618,15 +781,27 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
         for idx in range(self.cfg.seq_tile_size):
             is_last_tile = self.metadata_ref.p_id_is_last_tile[p_id, idx]
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
-            num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size += jnp.where(is_last_tile, num_ckpts, 0)
+            if self.cfg.single_checkpoint:
+                commit_lens = self.metadata_ref.s_idx_to_commit_len
+                s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+                target_c = (
+                    r_size
+                    if commit_lens is None
+                    else jnp.clip(commit_lens[s_idx], 0, r_size)
+                )
+                dma_size += jnp.where(jnp.logical_and(is_last_tile, target_c > 0), 1, 0)
+            else:
+                num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
+                dma_size += jnp.where(is_last_tile, num_ckpts, 0)
 
         # Each checkpoint's copy covers one full region tile; wait for that
         # many region tiles along the window dim of one sequence row (the
         # descriptor may nominally exceed it, see the NOTE in
         # ExternalStateInBufferedRef.wait_in).
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 def create_allocs(
@@ -708,9 +883,10 @@ def create_allocs(
         metadata_ref=metadata_ref,
     )
 
+    num_ckpts = cfg.num_state_checkpoints
     if cfg.state_plan is None:
         # Initial state needs only 1 slot per sequence; output holds one
-        # checkpoint per window position (1 without speculative decoding).
+        # checkpoint per window position (`1` under `single_checkpoint`).
         conv_in_shape = (
             cfg.seq_tile_size,
             1,
@@ -727,14 +903,14 @@ def create_allocs(
         )
         conv_out_shape = (
             cfg.seq_tile_size,
-            cfg.window_size,
+            num_ckpts,
             cfg.prev_kernel_size,
             1,
             cfg.dim_size,
         )
         recurrent_out_shape = (
             cfg.seq_tile_size,
-            cfg.window_size,
+            num_ckpts,
             cfg.num_v_heads,
             cfg.kq_head_dim,
             cfg.v_head_dim,
@@ -793,13 +969,13 @@ def create_allocs(
             )
             conv_out_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                num_ckpts,
                 plan.conv.nblocks,
                 *conv_state_ref.shape[1:],
             )
             recurrent_out_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                num_ckpts,
                 plan.recurrent.nblocks,
                 *recurrent_state_ref.shape[1:],
             )
@@ -821,14 +997,14 @@ def create_allocs(
             )
             conv_out_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                num_ckpts,
                 plan.conv.nblocks,
                 plan.conv.nrows,
                 *payload,
             )
             recurrent_out_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                num_ckpts,
                 plan.recurrent.nblocks,
                 plan.recurrent.nrows,
                 *payload,
