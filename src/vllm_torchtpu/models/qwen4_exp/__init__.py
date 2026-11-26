@@ -16,3 +16,9 @@
 Kept import-free: plugin registration imports ``config`` at startup, and the
 registry imports ``model`` lazily by its module path.
 """
+
+
+def register() -> None:
+    """No-op for now: `models/vllm.register_models()` still registers the
+    Qwen4Exp architectures and config hook. They move here with the model's
+    experimental tier."""

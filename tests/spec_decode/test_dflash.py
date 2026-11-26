@@ -46,7 +46,7 @@ from vllm_torchtpu.platforms.tpu_platform import _get_token_paddings
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode import dflash as dflash_module
 from vllm_torchtpu.spec_decode import utils as spec_decode_utils
-from vllm_torchtpu.spec_decode.dflash import DFlashProposer
+from vllm_torchtpu.spec_decode.dflash import DFlashProposer, TpuContextKVFromAuxList
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
 
 
@@ -83,6 +83,7 @@ def _make_proposer(
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
             tensor_parallel_size=target_tp,
+            decode_context_parallel_size=1,
             is_moe_model=False,
             use_sequence_parallel_moe=False,
         ),
@@ -617,6 +618,63 @@ def test_tpu_precompute_context_kv_uses_explicit_tpu_hook(device):
     assert result is expected
     tpu_hook.assert_called_once_with(hidden_states, positions, metadata)
     upstream_hook.assert_not_called()
+
+
+class _AuxListDrafter(TpuContextKVFromAuxList):
+    def __init__(self, result):
+        self.model = SimpleNamespace()
+        self.result = result
+        self.calls = []
+
+    def tpu_precompute_and_store_context_kv(
+        self, hidden_states, positions, draft_md_tuple
+    ):
+        self.calls.append((hidden_states, positions, draft_md_tuple))
+        return self.result
+
+
+@pytest.mark.parametrize("container", [list, tuple])
+def test_tpu_precompute_context_kv_passes_aux_list_to_opted_in_drafter(container):
+    proposer = _make_proposer(draft_tp=1)
+    aux = container([torch.randn(3, 8), torch.randn(3, 8)])
+    positions = torch.arange(3)
+    metadata = (SimpleNamespace(),)
+    expected = torch.randn(3, 4)
+    drafter = _AuxListDrafter(expected)
+    proposer.draft_model = drafter
+
+    fn_eager = torch._dynamo.disable(DFlashProposer._tpu_precompute_and_update_kv_cache)
+    result = fn_eager(proposer, aux, positions, metadata)
+
+    assert result is expected
+    [(hidden_states, got_positions, got_metadata)] = drafter.calls
+    assert isinstance(hidden_states, list)
+    assert len(hidden_states) == 2
+    assert all(h is a for h, a in zip(hidden_states, aux, strict=True))
+    assert got_positions is positions
+    assert got_metadata is metadata
+
+
+def test_tpu_precompute_context_kv_concatenates_aux_for_other_drafters():
+    proposer = _make_proposer(draft_tp=1)
+    aux = [torch.randn(3, 8), torch.randn(3, 8)]
+    positions = torch.arange(3)
+    metadata = (SimpleNamespace(),)
+    expected = torch.randn(3, 4)
+    tpu_hook = mock.Mock(return_value=expected)
+    proposer.draft_model = SimpleNamespace(
+        model=SimpleNamespace(), tpu_precompute_and_store_context_kv=tpu_hook
+    )
+
+    fn_eager = torch._dynamo.disable(DFlashProposer._tpu_precompute_and_update_kv_cache)
+    result = fn_eager(proposer, aux, positions, metadata)
+
+    assert result is expected
+    tpu_hook.assert_called_once()
+    (hidden_states, got_positions, got_metadata) = tpu_hook.call_args.args
+    assert torch.equal(hidden_states, torch.cat(aux, dim=-1))
+    assert got_positions is positions
+    assert got_metadata is metadata
 
 
 def _make_chunk(

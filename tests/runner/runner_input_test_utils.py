@@ -450,6 +450,9 @@ def attention_layer_mock(backend=PallasAttentionBackend, **attrs):
     """
     layer = MagicMock(spec=Attention)
     layer.get_attn_backend.return_value = backend
+    # `impl` is set in Attention.__init__, so the spec omits it. An ordinary
+    # layer: KV not sharded over DCP by a drafter hook.
+    layer.impl = SimpleNamespace(sharded_draft_dcp=None)
     if attrs:
         defaults = {
             "attn_type": AttentionType.DECODER,
