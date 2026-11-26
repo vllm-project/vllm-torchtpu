@@ -136,7 +136,7 @@ def _kernel(
     work_page_ref,  # tile page key unions (`msa_attention._work_list`)
     work_meta_ref,  # [groups] union row << _ROW_SHIFT | last and first bits
     work_count_ref,  # [groups] pages in the group (its first slots)
-    page_table_ref,  # page key -> physical page
+    page_table_ref,  # page key -> physical page (int32, or `_pack_table16`)
     head_ref,  # [2] KV head of the cache rows, block of query heads
     tile_offset_ref,  # [1] the call's first tile (read by the index maps only)
     # In
@@ -246,7 +246,7 @@ def _kernel(
         base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
 
         def start(g, queue=0):
-            page = page_table_ref[work_page_ref[base + g]]
+            page = _table_page(page_table_ref, work_page_ref[base + g])
             for copy in page_copies(half, g, page):
                 copy.start(priority=queue)
 
@@ -351,7 +351,9 @@ def _kernel(
             base = msa_attention._slot(work_meta_ref[group], pages_per_step, 0)
             count = jnp.where(valid, work_count_ref[group], 0)
             for g in range(pages_per_step):
-                page = page_table_ref[jnp.maximum(work_page_ref[base + g], 0)]
+                page = _table_page(
+                    page_table_ref, jnp.maximum(work_page_ref[base + g], 0)
+                )
 
                 @pl.when(g < count)
                 def _start(g=g, page=page):
@@ -916,6 +918,35 @@ def _kernel(
 
     jax.lax.fori_loop(0, full, full_unit, 0)
     jax.lax.fori_loop(start + full * unit_groups, end, one, 0)
+
+
+def _pack_table16(page_table: jax.Array) -> jax.Array:
+    """``page_table [N]`` (int32, N even, ids below 2**16) as ``uint32 [N /
+    2]``: key ``k < N / 2`` in the low half of word ``k``, key ``N / 2 + k``
+    in its high half; entries must be page ids (a -1 would read as page
+    0xFFFF). A call copies its scalar-prefetched table into SMEM
+    before it starts, ~16 ns per KiB: an empty 2-call decode layer took
+    6.5 us with the served 128 KiB int32 table, 2.3 us with an 8-entry one
+    (kernel bench)."""
+    half = page_table.shape[0] // 2
+    low = page_table[:half].astype(jnp.uint32) & 0xFFFF
+    return low | (page_table[half:].astype(jnp.uint32) << 16)
+
+
+def _fits_table16(page_table: jax.Array, kv_cache: jax.Array) -> bool:
+    """Whether `_pack_table16` can carry ``page_table`` for ``kv_cache``."""
+    return page_table.shape[0] % 2 == 0 and kv_cache.shape[0] <= 1 << 16
+
+
+def _table_page(page_table_ref, key):
+    """The physical page of page key ``key``: an int32 table's entry, or a
+    `_pack_table16` table's half word."""
+    if page_table_ref.dtype != jnp.uint32:
+        return page_table_ref[key]
+    half = page_table_ref.shape[0]
+    high = key >= half
+    word = page_table_ref[jnp.where(high, key - half, key)]
+    return (jnp.where(high, word >> 16, word) & 0xFFFF).astype(jnp.int32)
 
 
 def _p_at_v(p, v):
@@ -2240,6 +2271,8 @@ def msa_sparse_attention_lse_head_calls(
     q = jnp.pad(q, ((0, 0), (0, pad), (0, 0)))
     local_page = jnp.pad(local_page, (0, pad), constant_values=-1)[:, None]
     local_limit = jnp.pad(local_limit, (0, pad))[:, None]
+    if _fits_table16(page_table, kv_cache):  # half the table's SMEM copy per call
+        page_table = _pack_table16(page_table)
 
     def call(h, after=None):
         head = head_order[h]
