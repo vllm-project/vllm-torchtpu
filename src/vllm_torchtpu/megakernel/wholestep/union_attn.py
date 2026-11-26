@@ -330,20 +330,57 @@ def unpack_union_ids(ids: jax.Array, n: jax.Array, r: int, gpp: int) -> jax.Arra
     return jnp.where(jax.lax.broadcasted_iota(I32, ids.shape, 1) < n, gid, 0)
 
 
-def physical_ids(ids: jax.Array, tab: jax.Array, per_page: int, dcp: int = 1) -> jax.Array:
+def physical_ids(
+    ids: jax.Array, tab: Any, per_page: int, dcp: int = 1, n_tab: Any = None,
+    table_bytes: int | None = None,
+) -> jax.Array:
     """Physical micro-page ids `[1, 128]` of 128 request-local group ids `ids [1, 128]`: what
     `attend_request` computes per copy (`tab[v >> shift] * per_page + (v & (per_page - 1))`), as
     one vector pass against the request's page-table row `tab [1, pps]` (lane select + lane sum:
     exact int32), so each copy issues from a single SMEM load (RPAd's precomputed page ids).
     `dcp` = 2: a table column covers `2 * per_page` groups (main-KV DCP; the row is unchanged).
+    `n_tab` (traced; `wholephysmxu`): `tab` is a `[1, pps]` VMEM ref and only its first `n_tab`
+    128-lane chunks hold the ids' columns, so only those are read. Each chunk is gathered on the
+    MXU with the ids kept lane-major (no transposes or lane reductions): a one-hot `[column,
+    id]` matrix times the chunk's entries split into `table_bytes` bytes (entries < 2^(8 *
+    table_bytes)). Every product sum has at most one nonzero term, a byte (exact in BF16 and
+    F32), so the result equals the vector pass for every id whose column is below `n_tab * 128`;
+    an id past them maps to page 0, as an id past the row does in the vector pass.
     """
     shift = per_page.bit_length() - 1
     cshift = shift + dcp.bit_length() - 1
+    if n_tab is not None:
+        assert table_bytes is not None and 1 <= table_bytes <= 4, table_bytes
+        cols = ids >> cshift
+        byte = jax.lax.broadcasted_iota(I32, (8, 128), 0)  # LHS row k: byte k of each entry
+
+        def chunk(c: Any, acc: Any) -> Any:
+            lo = pl.multiple_of(c * 128, 128)
+            row = jax.lax.broadcasted_iota(I32, (128, 128), 0) + lo
+            hot = (cols == row).astype(F32).astype(BF16)  # [column, id]
+            t = jnp.broadcast_to(tab[:, pl.ds(lo, 128)], (8, 128))
+            b = jnp.where(byte < table_bytes, (t >> (8 * byte)) & 255, 0)
+            return acc + jnp.dot(b.astype(F32).astype(BF16), hot, preferred_element_type=F32)
+
+        acc = jax.lax.fori_loop(0, n_tab, chunk, jnp.zeros((8, 128), F32)).astype(I32)
+        page = acc[0:1]
+        for k in range(1, table_bytes):
+            page = page + (acc[k : k + 1] << (8 * k))
+        return page * per_page + (ids & (per_page - 1))
     col = jnp.transpose(jnp.broadcast_to(ids, (128, 128)))[:, 0:1]
     lane = jax.lax.broadcasted_iota(I32, (1, tab.shape[1]), 1)
     page = jnp.sum(jnp.where((col >> cshift) == lane, tab, 0), axis=1, keepdims=True)
     phys = page * per_page + (col & (per_page - 1))
     return jnp.transpose(jnp.broadcast_to(phys, (128, 128)))[0:1, :]
+
+
+def table_chunks(n_vis: Any, per_page: int, dcp: int, width: int) -> Any:
+    """128-lane chunks of a `width`-column page-table row holding the columns of groups
+    `< n_vis` (at least one)."""
+    assert width % 128 == 0, width
+    cshift = per_page.bit_length() - 1 + dcp.bit_length() - 1
+    last_col = (jnp.maximum(n_vis, 1) - 1) >> cshift
+    return jnp.minimum(last_col // 128 + 1, width // 128)
 
 
 def attend_request(
@@ -373,6 +410,7 @@ def attend_request(
     ids_row: Any = 0,
     stream: Any = None,
     lite: bool = False,
+    phys_rows: bool = False,
 ) -> list[Any]:
     """Gated sparse attention of one request's `T` rows over their union: `T` `[nh, 256]` F32.
 
@@ -401,6 +439,10 @@ def attend_request(
     tile (the tile's half picks its expand matrix first), and under `dcp` > 1 one select for
     V's NaN sanitize and scale, with no length mask: the sanitize leaves every V finite, and a
     slot past `n_union` has `p` = 0 exactly, so its `p * v` adds an exact zero as before.
+    `phys_rows` (with `phys`; `wholephysmxu`): on TPU each copy reads the pool viewed as rows of
+    micro-pages, so its source address is one id times the row stride (same bytes as
+    `pool.at[v >> shift, ...]`; CPU interpret cannot index a reshaped ref and keeps the per-page
+    form).
     """
     sc = sc or (lambda *_: contextlib.nullcontext())
     per_page = pool.shape[1] // MICRO
@@ -411,6 +453,12 @@ def attend_request(
     cshift = shift + dcp.bit_length() - 1
     length = n_union * MICRO
     ntiles = (length + TILE - 1) // TILE
+    assert not phys_rows or phys, "micro-page rows: physical ids"
+    micro_pages = (
+        pool.reshape(pool.shape[0] * per_page, MICRO, *pool.shape[2:])
+        if phys_rows and not interpret
+        else None
+    )
 
     def copies(t: Any, s: Any, row: Any = None, trow: Any = None) -> list[Any]:
         out = []
@@ -418,6 +466,15 @@ def attend_request(
         row = ids_row if row is None else row
         trow = table_row if trow is None else trow
         for j in range(GROUPS_PER_TILE):
+            if micro_pages is not None:  # same bytes as `pool.at[v >> shift, ...]`
+                out.append(
+                    pltpu.make_async_copy(
+                        micro_pages.at[ids[row, base + j]],
+                        ring.at[s, pl.ds(j * MICRO, MICRO)],
+                        sems.at[s],
+                    )
+                )
+                continue
             if phys:
                 v = ids[row, base + j]
             else:

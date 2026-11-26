@@ -128,6 +128,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         nvis_balance: bool = False,
         uattn_lite: bool = False,
         export_ids: bool = False,
+        union_phys_mxu: int = 0,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -278,6 +279,16 @@ class QSAFullIndexedBlock(QSAFullBlock):
         assert not union_phys or (union_attn and hbm_tables), (
             "phys ids: union over HBM tables"
         )
+        # `union_phys_mxu` = N > 0 (`wholephysmxu`, needs `union_phys`): the first N columns
+        # of every request's table row (all a group id below `max_groups` reaches: checked
+        # at trace time) are copied asynchronously when the union attention starts, only the
+        # 128-lane chunks below the request's visible groups are read, each chunk gathered on
+        # the MXU (`union_attn.physical_ids` with `n_tab`), and the tile copies address the
+        # pool as rows of micro-pages (`attend_request`'s `phys_rows`). Same addresses, same
+        # outputs.
+        self.union_phys_mxu = int(union_phys_mxu)
+        assert not union_phys_mxu or union_phys, "phys mxu: physical ids"
+        assert 0 <= self.union_phys_mxu <= pages_per_seq, (union_phys_mxu, pages_per_seq)
         self.loop_requests = loop_requests
         assert not loop_requests or per_request_scores, (
             "the request loop selects per request"

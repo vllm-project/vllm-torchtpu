@@ -85,6 +85,13 @@ LOOP_REQUESTS: bool = False
 # per request, so each attention copy issues from one SMEM load (same addresses; RPAd's
 # recipe).
 UNION_PHYS: bool = False
+# `...,wholephysmxu=1` (with `wholeunion=1`; main whole-step call only, the draft is
+# unchanged): physical ids made cheaply. Every request's table row (the columns group ids
+# below `max_groups` reach) is prefetched when the union attention starts, only the row
+# chunks below its visible groups are read, each gathered on the MXU (byte-split one-hot
+# matmul, exact), and the tile copies address the pool as rows of micro-pages. Same addresses,
+# same outputs.
+UNION_PHYS_MXU: bool = False
 # `...,wholekeymp=N` (N divides the kernel pages of a pool block column: 2 or 4 served): the
 # indexer's key stream copies N consecutive kernel pages per DMA (`manager_pages`) instead of
 # one 16 KiB page per DMA. 0 = per page. Same keys, same scores.
@@ -144,6 +151,18 @@ def indexed_options(B: int | None = None) -> dict:
         **({"uattn_lite": True} if UNION_ATTN and envs.VLLM_TPU_MK_UATTN_LITE else {}),
         **({"ck_lanes": KEY_LANES} if KEY_LANES else {}),
     )
+
+
+def phys_mxu_options(max_groups: int, pool_block: int) -> dict:
+    """`wholephysmxu` options of the main call (empty when off, so the spec is unchanged):
+    physical ids, and the table columns a group id below `max_groups` reaches with
+    `pool_block`-token pool blocks (128-lane aligned, at most the table width)."""
+    if not (UNION_ATTN and UNION_PHYS_MXU):
+        return {}
+    pps = max_groups * 4 // 128
+    groups_per_col = pool_block // 4 * max(main_kv_dcp(), 1)
+    cols = -(-max_groups // groups_per_col)
+    return dict(union_phys=True, union_phys_mxu=min(pps, -(-cols // 128) * 128))
 
 
 _LOGGED_MK_OPTIONS: set[tuple[str, int]] = set()
@@ -541,7 +560,7 @@ def build_wholestep_call(
                 pages_per_seq=pps,
                 carrier="fp8",
                 n_layers=n_layers,
-                **indexed_options(B),
+                **{**indexed_options(B), **phys_mxu_options(max_groups, layout.pool_shape[1])},
                 **main_call_options(B),
                 **({"export_ids": True} if export_ids else {}),
             ),
