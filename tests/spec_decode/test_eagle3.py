@@ -243,6 +243,37 @@ class TestDpLockstepSharded:
             proposer.draft_model = object()
             assert proposer._dp_lockstep_sharded() is True
 
+    def test_moe_runner_without_protocol_pairs(self):
+        # A TPU-native MoE draft without `MixtureOfExperts` still emits EP
+        # collectives and must trigger EP-DP lockstep.
+        from vllm.model_executor.layers.fused_moe import MoERunner
+
+        class _FakeMoERunner(MoERunner):
+            def __init__(self) -> None:
+                torch.nn.Module.__init__(self)
+
+        class _PlainDraftWithMoE(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.mlp = _FakeMoERunner()
+
+        class _PlainDenseDraft(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fc = torch.nn.Linear(4, 4)
+
+        moe_proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
+        moe_proposer.runner._dp_lockstep_enabled.return_value = True
+        moe_proposer.draft_model = _PlainDraftWithMoE()
+        assert moe_proposer._draft_has_moe() is True
+        assert moe_proposer._dp_lockstep_sharded() is True
+
+        dense_proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
+        dense_proposer.runner._dp_lockstep_enabled.return_value = True
+        dense_proposer.draft_model = _PlainDenseDraft()
+        assert dense_proposer._draft_has_moe() is False
+        assert dense_proposer._dp_lockstep_sharded() is False
+
 
 def _make_chunk(
     *,
@@ -3058,3 +3089,60 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
+
+
+def _load_mtp_proposer(monkeypatch, target, *, hc_mult):
+    proposer = _make_proposer(draft_tp=1, target_tp=1, method="mtp")
+    draft_hf_config = SimpleNamespace()
+    if hc_mult is not None:
+        draft_hf_config.hc_mult = hc_mult
+    proposer.speculative_config.draft_model_config = SimpleNamespace(
+        hf_config=draft_hf_config,
+        hf_text_config=SimpleNamespace(hidden_size=256),
+    )
+    proposer.speculative_config.num_speculative_tokens = 1
+    draft, _ = _make_vocab_models()
+    draft.config = SimpleNamespace(hidden_size=256)
+    proposer._load_draft_model = lambda _t: setattr(proposer, "draft_model", draft)
+    monkeypatch.setattr(
+        spec_decode_utils, "gather_sharded_weight", _fake_gather_sharded_weight
+    )
+    with mock.patch(
+        "vllm_torchtpu.spec_decode.eagle3.get_layers_from_vllm_config",
+        return_value={},
+    ):
+        proposer.load_model(target)
+    return proposer
+
+
+def test_mtp_draft_input_is_hc_mult_wide_when_the_target_emits_its_residual(
+    monkeypatch,
+):
+    _, target = _make_vocab_models()
+    target.mtp_emits_aux_hidden_state = True
+    proposer = _load_mtp_proposer(monkeypatch, target, hc_mult=4)
+    assert proposer._draft_hidden_size() == 256
+    assert proposer._draft_input_hidden_size() == 1024
+
+
+def test_mtp_draft_input_stays_hidden_size_for_deepseek_v4(monkeypatch):
+    """DeepSeek-V4 defines upstream's get_mtp_target_hidden_states, but its TPU
+    forward() collapses the HC streams, so the draft takes the collapsed state.
+    """
+    from vllm_torchtpu.models.vllm.deepseek_v4.model import DeepseekV4ForCausalLM
+
+    assert hasattr(DeepseekV4ForCausalLM, "get_mtp_target_hidden_states")
+    assert not hasattr(DeepseekV4ForCausalLM, "mtp_emits_aux_hidden_state")
+    _, target = _make_vocab_models()
+    proposer = _load_mtp_proposer(monkeypatch, target, hc_mult=4)
+    assert proposer._draft_input_hidden_size() == 256
+
+
+@pytest.mark.parametrize("hc_mult", [None, True, 1], ids=["missing", "bool", "one"])
+def test_mtp_residual_target_rejects_a_draft_config_without_hc_mult(
+    monkeypatch, hc_mult
+):
+    _, target = _make_vocab_models()
+    target.mtp_emits_aux_hidden_state = True
+    with pytest.raises(ValueError, match="integer hc_mult >= 2"):
+        _load_mtp_proposer(monkeypatch, target, hc_mult=hc_mult)

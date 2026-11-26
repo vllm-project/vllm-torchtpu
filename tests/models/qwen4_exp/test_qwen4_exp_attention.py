@@ -234,6 +234,7 @@ def test_qwen4_exp_import_hierarchy_is_strictly_top_down_and_independent() -> No
     assert local("attention_plan.py") <= {"layout", "qsa"}
     assert local("attention.py") <= {"attention_plan", "qsa", "quant", "ops.dense_attn"}
     assert local("model.py") <= {"attention", "ple"}
+    assert local("mtp.py") <= {"model"}
 
 
 # ── Real Qwen4ExpAttention / AttentionDesc / Qwen4ExpQSA CPU tests ─────────
