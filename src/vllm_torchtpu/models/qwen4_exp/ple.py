@@ -185,7 +185,9 @@ def ngram_ids(
     ``_ple_ngram_ids_kernel``, reading in-step predecessors as static shifts.
     """
     tokens = input_ids.long()
+    tokens = torch.where(tokens < 0, eos_token_id, tokens)
     context = ngram_context.long()
+    context = torch.where(context < 0, eos_token_id, context)
     num_tokens = tokens.shape[0]
     context_len = context.shape[-1]
 
@@ -694,20 +696,44 @@ class PLEStateCache(nn.Module, MambaBase):
         num_reqs = query_start_loc.numel() - 1
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         has_history = metadata.seq_lens[:num_reqs] - query_lens > 0
+        read_blocks = self._resolve_read_blocks(metadata, num_reqs)
         conv_window, ngram_context = read_ple_state(
             pool,
-            metadata.mamba_state_indices[:num_reqs],
+            read_blocks.clamp(min=0),
             block_size=self._cache_config.block_size,
             is_lbhnc=self._is_lbhnc(),
             window_shape=self._window_shape,
             window_dtype=self._window_dtype,
             context_len=self._context_len,
         )
-        windows = torch.where(has_history.view(-1, 1, 1), conv_window, 0)
+        valid_history = has_history & (read_blocks > 0)
+        windows = torch.where(valid_history.view(-1, 1, 1), conv_window, 0)
         context = torch.where(
-            has_history.view(-1, 1), ngram_context, self._eos_token_id
+            valid_history.view(-1, 1), ngram_context, self._eos_token_id
         )
         return PLEInputs(input_ids, query_start_loc, context), windows
+
+    @staticmethod
+    def _resolve_read_blocks(metadata: Any, num_reqs: int) -> torch.Tensor:
+        """Block each request reads its PLE state from, shape [num_reqs].
+
+        Without speculative decoding that is the request's state block. With
+        it, the block is the checkpoint slot `mamba_slot_read_offsets` points
+        at (the one the last verify accepted). Padding requests (state index 0)
+        read the null block 0.
+        """
+        state_indices = metadata.mamba_state_indices[:num_reqs]
+        read_offsets = metadata.mamba_slot_read_offsets
+        if read_offsets is None:
+            return state_indices
+        assert metadata.mamba_ckpt_indices is not None
+        ckpt_indices = metadata.mamba_ckpt_indices[:num_reqs]
+        max_offset = ckpt_indices.shape[1] - 1
+        offsets = read_offsets[state_indices.clamp(min=0)].clamp(0, max_offset)
+        gathered = ckpt_indices.gather(1, offsets.to(torch.int64).unsqueeze(1)).squeeze(
+            1
+        )
+        return torch.where(state_indices > 0, gathered, torch.zeros_like(gathered))
 
     def write(
         self,
@@ -715,7 +741,7 @@ class PLEStateCache(nn.Module, MambaBase):
         prev_windows: torch.Tensor,
         ple_out: PLEOutput,
     ) -> None:
-        """Writes each request's next state (and any prefill checkpoint) to the pool."""
+        """Writes each request's next state (and any prefill/spec checkpoints)."""
         pool = self.kv_cache[0]
         if pool.numel() == 0:
             return
@@ -724,43 +750,126 @@ class PLEStateCache(nn.Module, MambaBase):
         num_reqs = query_start_loc.numel() - 1
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         token_ids = inputs.input_ids.to(torch.int32)
-        blocks_out = metadata.mamba_state_indices[:num_reqs]
-        windows_out = ple_out.conv_window
-        context_out = ragged_tail(
-            token_ids, inputs.ngram_context, query_start_loc, query_lens
-        )
-        checkpoint_offsets = metadata.mamba_prefill_ckpt_offsets
-        if checkpoint_offsets is not None:
-            offsets = checkpoint_offsets[:num_reqs]
-            blocks_out = torch.cat(
-                [
-                    metadata.mamba_prefill_ckpt_indices[:num_reqs].clamp(min=0),
-                    blocks_out,
-                ]
+        token_ids = torch.where(token_ids < 0, self._eos_token_id, token_ids)
+
+        block_chunks: list[torch.Tensor] = []
+        window_chunks: list[torch.Tensor] = []
+        context_chunks: list[torch.Tensor] = []
+
+        is_spec = metadata.mamba_slot_read_offsets is not None
+        if not is_spec:
+            # K=0: never read mamba_request_distribution (it is None at K=0).
+            self._append_prefill_checkpoints(
+                metadata,
+                num_reqs=num_reqs,
+                query_start_loc=query_start_loc,
+                query_lens=query_lens,
+                token_ids=token_ids,
+                inputs=inputs,
+                prev_windows=prev_windows,
+                ple_out=ple_out,
+                eligible_mask=None,
+                block_chunks=block_chunks,
+                window_chunks=window_chunks,
+                context_chunks=context_chunks,
             )
-            windows_out = torch.cat(
-                [
-                    ragged_tail(
-                        ple_out.conv_input, prev_windows, query_start_loc, offsets
-                    ),
-                    windows_out,
-                ]
+            block_chunks.append(metadata.mamba_state_indices[:num_reqs].clamp(min=0))
+            window_chunks.append(ple_out.conv_window)
+            context_chunks.append(
+                ragged_tail(
+                    token_ids, inputs.ngram_context, query_start_loc, query_lens
+                )
             )
-            context_out = torch.cat(
-                [
-                    ragged_tail(
-                        token_ids, inputs.ngram_context, query_start_loc, offsets
-                    ),
-                    context_out,
-                ]
+        else:
+            assert metadata.mamba_ckpt_indices is not None
+            assert metadata.mamba_request_distribution is not None
+            ckpt_indices = metadata.mamba_ckpt_indices[:num_reqs]
+            window_slots = ckpt_indices.shape[1]
+            num_windowed = metadata.mamba_request_distribution[0]
+            req_idx = torch.arange(
+                num_reqs, device=query_start_loc.device, dtype=num_windowed.dtype
             )
+            is_windowed = req_idx < num_windowed
+
+            # Prepend prefill checkpoints so end-of-step writes always follow.
+            self._append_prefill_checkpoints(
+                metadata,
+                num_reqs=num_reqs,
+                query_start_loc=query_start_loc,
+                query_lens=query_lens,
+                token_ids=token_ids,
+                inputs=inputs,
+                prev_windows=prev_windows,
+                ple_out=ple_out,
+                eligible_mask=~is_windowed,
+                block_chunks=block_chunks,
+                window_chunks=window_chunks,
+                context_chunks=context_chunks,
+            )
+            ones = torch.ones_like(query_lens)
+            for slot in range(window_slots):
+                if slot == 0:
+                    ends = torch.where(
+                        is_windowed, ones.minimum(query_lens), query_lens
+                    )
+                    active = query_lens > 0
+                else:
+                    ends = torch.full_like(query_lens, slot + 1).minimum(query_lens)
+                    active = is_windowed & (slot < query_lens)
+                raw_blocks = ckpt_indices[:, slot]
+                # Slots a request does not fill this step write the pool's null
+                # block 0, the same sink rows that own no block use.
+                block_chunks.append(
+                    torch.where(active & (raw_blocks > 0), raw_blocks, 0)
+                )
+                window_chunks.append(
+                    ragged_tail(ple_out.conv_input, prev_windows, query_start_loc, ends)
+                )
+                context_chunks.append(
+                    ragged_tail(token_ids, inputs.ngram_context, query_start_loc, ends)
+                )
+
         write_ple_state(
             pool,
-            blocks_out,
-            windows_out,
-            context_out,
+            torch.cat(block_chunks),
+            torch.cat(window_chunks),
+            torch.cat(context_chunks),
             block_size=self._cache_config.block_size,
             is_lbhnc=self._is_lbhnc(),
+        )
+
+    @staticmethod
+    def _append_prefill_checkpoints(
+        metadata: Any,
+        *,
+        num_reqs: int,
+        query_start_loc: torch.Tensor,
+        query_lens: torch.Tensor,
+        token_ids: torch.Tensor,
+        inputs: PLEInputs,
+        prev_windows: torch.Tensor,
+        ple_out: PLEOutput,
+        eligible_mask: torch.Tensor | None,
+        block_chunks: list[torch.Tensor],
+        window_chunks: list[torch.Tensor],
+        context_chunks: list[torch.Tensor],
+    ) -> None:
+        checkpoint_offsets = metadata.mamba_prefill_ckpt_offsets
+        if checkpoint_offsets is None:
+            return
+        offsets = checkpoint_offsets[:num_reqs]
+        ckpt_ids = metadata.mamba_prefill_ckpt_indices[:num_reqs]
+        valid = (offsets > 0) & (offsets < query_lens) & (ckpt_ids > 0)
+        if eligible_mask is not None:
+            valid = valid & eligible_mask
+        safe_offsets = torch.where(valid, offsets, torch.zeros_like(offsets))
+        # Rows without a checkpoint this step write the pool's null block 0.
+        block_chunks.append(torch.where(valid, ckpt_ids, 0))
+        window_chunks.append(
+            ragged_tail(ple_out.conv_input, prev_windows, query_start_loc, safe_offsets)
+        )
+        context_chunks.append(
+            ragged_tail(token_ids, inputs.ngram_context, query_start_loc, safe_offsets)
         )
 
     def _is_lbhnc(self) -> bool:
