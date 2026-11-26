@@ -429,8 +429,6 @@ def _validate_routed_experts_config(vllm_config: "VllmConfig") -> None:
         return
     parallel_config = vllm_config.parallel_config
     unsupported = {
-        # Each MoE layer sees the rows of every DP rank.
-        "data_parallel_size > 1": parallel_config.data_parallel_size > 1,
         # Comes with fused EP v2, where SP pays off. With chunk pipelining or
         # FP8 all-gather, `route()` would also see only this rank's tokens.
         "MoE sequence parallelism (TPU_MOE_SEQUENCE_PARALLEL)": (
@@ -444,8 +442,13 @@ def _validate_routed_experts_config(vllm_config: "VllmConfig") -> None:
         ),
         # Placed layers pick expert slots, not checkpoint expert ids.
         "TPU_EXPERT_PLACEMENT": bool(envs.TPU_EXPERT_PLACEMENT),
-        # Rows of rejected drafts are kept.
-        "speculative decoding": vllm_config.speculative_config is not None,
+        # Under async scheduling the next step starts after every scheduled
+        # draft, trimmed ones included, but the step returns no row for a
+        # trimmed draft, so vLLM's connector fails the step.
+        "enable_adaptive_verification": (
+            vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.enable_adaptive_verification
+        ),
         # Untested.
         "kv_transfer_config": vllm_config.kv_transfer_config is not None,
         # vLLM builds a KV transfer config from this flag only after this

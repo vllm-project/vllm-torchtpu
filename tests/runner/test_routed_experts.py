@@ -44,14 +44,14 @@ def on_host(monkeypatch):
     return capture_utils.use_host_events(monkeypatch)
 
 
-def _capture(monkeypatch, model, is_first_rank=True):
+def _capture(monkeypatch, model, is_first_rank=True, data_parallel_rank=0):
     tp_group = SimpleNamespace(is_first_rank=is_first_rank)
     monkeypatch.setattr(aux_output_worker, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(routed_experts, "get_tp_group", lambda: tp_group)
     monkeypatch.setattr(routed_experts, "MoERunner", capture_utils.MoELayer)
     monkeypatch.setattr(routed_experts, "VllmMoERunner", capture_utils.MoELayer)
     return routed_experts.RoutedExpertsCapture(
-        capture_utils.make_vllm_config(),
+        capture_utils.make_vllm_config(data_parallel_rank=data_parallel_rank),
         model,
         SimpleNamespace(num_blocks=1024, kv_cache_groups=[]),
     )
@@ -71,9 +71,9 @@ def build_capture(monkeypatch, on_host):
     after the test."""
     captures = []
 
-    def build(layer_ids=None, is_first_rank=True):
-        model = capture_utils.make_moe_model(layer_ids)
-        captures.append(_capture(monkeypatch, model, is_first_rank))
+    def build(layer_ids=None, is_first_rank=True, data_parallel_rank=0, **layer_kwargs):
+        model = capture_utils.make_moe_model(layer_ids, **layer_kwargs)
+        captures.append(_capture(monkeypatch, model, is_first_rank, data_parallel_rank))
         return captures[-1], model
 
     yield build
@@ -91,10 +91,14 @@ def _forward(capture, model, num_tokens, bucket, seed):
 
 
 def _begin(capture, requests, block_hashes=None):
+    """Begins a step of `requests`: their ids, or a dict of each id's first
+    position that vLLM's connector has not returned yet."""
     capture.begin_step(
         AuxOutputConnectorMetadata(
             generation=0,
-            requests=dict.fromkeys(requests, 0),
+            requests=requests
+            if isinstance(requests, dict)
+            else dict.fromkeys(requests, 0),
             block_hashes=block_hashes or {},
             finished_requests=(),
         )
@@ -117,7 +121,7 @@ def test_every_forward_of_a_step_reaches_its_requests(capture, on_host):
     bc_rows = _forward(capture, model, 9, 16, seed=1)
     token_starts = np.zeros(3, dtype=np.int32)
     pending = capture.prepare_output(
-        ["a", "b", "c"], {"a": 12, "b": 6, "c": 3}, token_starts
+        ["a", "b", "c"], {"a": 12, "b": 6, "c": 3}, {}, token_starts
     )
     # The runner's next step can overwrite this array before the output is
     # processed.
@@ -132,12 +136,60 @@ def test_every_forward_of_a_step_reaches_its_requests(capture, on_host):
 
     _begin(capture, ["a"], {"a": _hashes(3)})
     a_rest = _forward(capture, model, 4, 16, seed=2)
-    pending = capture.prepare_output(["a"], {"a": 4}, np.array([12]))
+    pending = capture.prepare_output(["a"], {"a": 4}, {}, np.array([12]))
     outputs = pending.process_output([[9]])
 
     expected = torch.cat([a_rows, a_rest]).numpy()
     assert np.array_equal(outputs["a"].rows, expected)
     assert all(event.synchronized for event in on_host)
+
+
+@pytest.mark.parametrize("data_parallel_rank", [1, 0])
+@pytest.mark.parametrize("vllm_gathers_dp_rows", [True, False])
+def test_a_dp_rank_returns_its_own_rows(
+    build_capture, vllm_gathers_dp_rows, data_parallel_rank
+):
+    """With DP and EP, vLLM gathers the rows of every DP rank before a MoE
+    layer's hook, in the order of the DP group and each rank padded to the
+    same bucket, unless the MoE method gathers them itself after picking the
+    experts. Either way a request on the rank at position 1 of the DP group
+    gets back that rank's rows, also when the engine's DP index is 0, as when
+    RayDistributedExecutorV2 places the engine with DP index 1 on the first
+    chips."""
+    capture, model = build_capture(
+        data_parallel_rank=data_parallel_rank,
+        dp_size=2,
+        dp_rank=1,
+        vllm_gathers_dp_rows=vllm_gathers_dp_rows,
+    )
+    _begin(capture, ["a"])
+    rows = capture_utils.expert_ids(16, num_experts=PADDING, seed=1)
+    rows[5:] = PADDING
+    if vllm_gathers_dp_rows:
+        other_rank_rows = capture_utils.expert_ids(16, num_experts=PADDING, seed=0)
+        hook_rows = torch.cat([other_rank_rows, rows])
+    else:
+        hook_rows = rows
+    capture_utils.model_forward(model, hook_rows)
+    capture.take_forward(16, 5)
+
+    pending = capture.prepare_output(["a"], {"a": 5}, {}, np.zeros(1, dtype=np.int32))
+    outputs = pending.process_output([[7]])
+
+    assert np.array_equal(outputs["a"].rows, rows[:5].numpy())
+
+
+def test_layers_that_differ_in_who_gathers_are_rejected(monkeypatch, on_host):
+    """The capturer keeps one count of gathered DP ranks for every layer, so a
+    model where vLLM gathers the rows for some MoE layers and the MoE method
+    for the others cannot be captured."""
+    model = capture_utils.make_moe_model(dp_size=2, vllm_gathers_dp_rows=True)
+    model[1].do_naive_dispatch_combine = False
+
+    with pytest.raises(
+        NotImplementedError, match=r"vLLM gathers them before MoE layers \[0, 2\]"
+    ):
+        _capture(monkeypatch, model)
 
 
 def test_a_rank_that_does_not_publish_copies_nothing(build_capture, on_host):
@@ -146,9 +198,76 @@ def test_a_rank_that_does_not_publish_copies_nothing(build_capture, on_host):
     _forward(capture, model, 5, 16, seed=0)
 
     token_starts = np.zeros(1, dtype=np.int32)
-    assert capture.prepare_output(["a"], {"a": 5}, token_starts) is None
+    assert capture.prepare_output(["a"], {"a": 5}, {}, token_starts) is None
     assert not on_host
     assert not capture._capturer._step_copies
+
+
+def test_a_step_without_connector_metadata_leaves_no_rows_behind(capture):
+    """The speculative decoding warmup runs steps that the scheduler did not
+    build. They carry no connector metadata, so vLLM's connector takes no
+    snapshot of them. Their forwards are not copied to the host, so none is
+    left over for the next step's snapshot."""
+    capture, model = capture
+    capture.begin_step(None)
+    _forward(capture, model, 7, 16, seed=0)
+    token_starts = np.zeros(1, dtype=np.int32)
+    assert capture.prepare_output(["w"], {"w": 7}, {}, token_starts) is None
+
+    _begin(capture, ["b"])
+    rows = _forward(capture, model, 3, 16, seed=1)
+    pending = capture.prepare_output(["b"], {"b": 3}, {}, token_starts)
+    outputs = pending.process_output([[7]])
+
+    assert np.array_equal(outputs["b"].rows, rows.numpy())
+
+
+def test_a_step_without_connector_metadata_still_checks_its_forwards(capture):
+    capture, model = capture
+    model[1].capture_fn = None
+    capture.begin_step(None)
+
+    with pytest.raises(RuntimeError, match=r"MoE layers \[1\]"):
+        _forward(capture, model, 7, 16, seed=0)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_rows_of_rejected_drafts_are_dropped(capture, async_scheduling):
+    """`b`, first in the step, runs its last token and 2 drafts and keeps all
+    3 rows. `a` runs its last token and 3 drafts but keeps 1, so its last 2
+    rows are dropped and its next step's row follows the kept ones. The
+    scheduler lists no drafts for `c`, whose 1 sampled token keeps its row.
+    Under async scheduling `a`'s next step is scheduled as if every draft
+    were accepted, 2 positions late, and vLLM's connector puts its row after
+    the kept ones. Each request starts at a block boundary, as after a
+    prefix-cache hit."""
+    capture, model = capture
+    _begin(capture, {"a": 8, "b": 16, "c": 24})
+    rows = _forward(capture, model, 8, 16, seed=0)
+    pending = capture.prepare_output(
+        ["b", "a", "c"],
+        {"a": 4, "b": 3, "c": 1},
+        {"a": [0, 0, 0], "b": [0, 0]},
+        np.array([16, 8, 24], dtype=np.int32),
+    )
+    outputs = pending.process_output([[1, 2, 3], [1, 2], [1]])
+
+    assert outputs["b"].token_start == 16
+    assert np.array_equal(outputs["b"].rows, rows[:3].numpy())
+    assert outputs["a"].token_start == 8
+    assert np.array_equal(outputs["a"].rows, rows[3:5].numpy())
+    assert np.array_equal(outputs["c"].rows, rows[7:].numpy())
+
+    _begin(capture, {"a": 10})
+    next_rows = _forward(capture, model, 1, 16, seed=1)
+    scheduled_start = 12 if async_scheduling else 10
+    pending = capture.prepare_output(
+        ["a"], {"a": 1}, {}, np.array([scheduled_start], dtype=np.int32)
+    )
+    outputs = pending.process_output([[5]])
+
+    assert outputs["a"].token_start == 10
+    assert np.array_equal(outputs["a"].rows, next_rows.numpy())
 
 
 def test_layers_capture_cannot_serve_are_refused(monkeypatch, on_host):
@@ -159,6 +278,56 @@ def test_layers_capture_cannot_serve_are_refused(monkeypatch, on_host):
 
     with pytest.raises(NotImplementedError, match=r"MoE layers \[1\]"):
         _capture(monkeypatch, model)
+
+
+def test_moe_layers_sharing_a_layer_id_are_refused(build_capture):
+    """Two layers with one id would write the same table column, and the
+    record of the layers a forward wrote could not tell them apart."""
+    with pytest.raises(ValueError, match=r"MoE layers have ids \[1\]"):
+        build_capture(layer_ids=(0, 1, 1))
+
+
+@pytest.mark.parametrize("is_first_rank", [True, False])
+def test_the_warmup_check_names_a_layer_without_its_hook(build_capture, is_first_rank):
+    """Every rank checks its own forward."""
+    capture, model = build_capture(is_first_rank=is_first_rank)
+    model[1].capture_fn = None
+    capture_utils.model_forward(model, capture_utils.expert_ids(32))
+
+    with pytest.raises(RuntimeError, match=r"MoE layers \[1\] .* 32-token forward"):
+        capture.check_forward(32)
+
+
+@pytest.mark.parametrize("most_model_len", [None, 64])
+@pytest.mark.parametrize("enabled", [True, False])
+def test_warmup_checks_every_backbone_forward(most_model_len, enabled):
+    """Each warmup forward of every context bucket is checked right after it
+    runs, before the next forward replaces its table."""
+    events = []
+
+    def dummy_run(num_tokens, num_reqs, num_blocks, use_max_model_len):
+        events.append(("forward", num_tokens, num_reqs, num_blocks, use_max_model_len))
+
+    capture = SimpleNamespace(
+        check_forward=lambda num_tokens: events.append(("check", num_tokens))
+    )
+    runner = SimpleNamespace(
+        num_reqs_max_model_len=8,
+        max_num_blocks_per_req=4,
+        most_model_len=most_model_len,
+        num_reqs_most_model_len=16,
+        num_blocks_per_most_len_req=2,
+        _dummy_run=dummy_run,
+        _routed_experts=capture if enabled else None,
+    )
+
+    TPUModelRunner._backbone_dummy_runs(runner, 32)
+
+    contexts = [(8, 4, True)] + ([(16, 2, False)] if most_model_len else [])
+    checks = [("check", 32)] if enabled else []
+    assert events == [
+        event for context in contexts for event in [("forward", 32, *context), *checks]
+    ]
 
 
 def _reserve_config(
@@ -194,12 +363,33 @@ def test_hbm_reserve_covers_the_forward_tables_in_flight(monkeypatch):
     vllm_config = _reserve_config(monkeypatch)
     paddings = capture_utils.TOKEN_PADDINGS
 
-    reserve = routed_experts.hbm_reserve_bytes(vllm_config, paddings)
+    reserve = routed_experts.hbm_reserve_bytes(vllm_config, paddings, 3)
 
     assert reserve == (2 * (2 * 64 + 8 * 16) + 64) * ROW_BYTES
     assert reserve > 64 * 12 * 4
     vllm_config.aux_output_config = AuxOutputConfig()
-    assert routed_experts.hbm_reserve_bytes(vllm_config, paddings) == 0
+    assert routed_experts.hbm_reserve_bytes(vllm_config, paddings, 3) == 0
+
+
+@pytest.mark.parametrize("enable_expert_parallel", [True, False])
+def test_hbm_reserve_under_dp(monkeypatch, enable_expert_parallel):
+    """With EP, every forward of a step is padded to the bucket of the DP
+    engine with the most tokens, so each of a step's 3 forwards can hold the
+    largest bucket's 64 rows. Without EP the engines run on their own, and
+    the single-engine bound holds."""
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
+    vllm_config = capture_utils.make_vllm_config()
+    vllm_config.aux_output_config = AuxOutputConfig(enable_return_routed_experts=True)
+    vllm_config.parallel_config.data_parallel_size = 2
+    vllm_config.parallel_config.enable_expert_parallel = enable_expert_parallel
+
+    reserve = routed_experts.hbm_reserve_bytes(
+        vllm_config, capture_utils.TOKEN_PADDINGS, 3
+    )
+
+    step_rows = 3 * 64 if enable_expert_parallel else 2 * 64 + 8 * 16
+    assert reserve == (2 * step_rows + 64) * ROW_BYTES
 
 
 def test_hbm_reserve_covers_buckets_that_jump_more_than_double(monkeypatch):
@@ -212,7 +402,7 @@ def test_hbm_reserve_covers_buckets_that_jump_more_than_double(monkeypatch):
     scheduler_config = vllm_config.scheduler_config
     num_tokens = scheduler_config.max_num_batched_tokens
 
-    reserve = routed_experts.hbm_reserve_bytes(vllm_config, paddings)
+    reserve = routed_experts.hbm_reserve_bytes(vllm_config, paddings, 3)
 
     rows = reserve // ROW_BYTES
     step_rows = (rows - paddings[-1]) // vllm_config.max_concurrent_batches
@@ -231,7 +421,7 @@ def test_hbm_reserve_of_far_apart_buckets_counts_whole_forwards(monkeypatch):
         monkeypatch, max_num_batched_tokens=8192, max_num_seqs=8
     )
 
-    reserve = routed_experts.hbm_reserve_bytes(vllm_config, [1, 8, 8192])
+    reserve = routed_experts.hbm_reserve_bytes(vllm_config, [1, 8, 8192], 3)
 
     assert reserve == (2 * 8 * 8192 + 8192) * ROW_BYTES
 
@@ -247,7 +437,7 @@ def test_hbm_reserve_bounds_a_step_by_its_scheduled_tokens(monkeypatch):
     )
     vllm_config.scheduler_config.max_num_scheduled_tokens = 256
 
-    reserve = routed_experts.hbm_reserve_bytes(vllm_config, [16, 256])
+    reserve = routed_experts.hbm_reserve_bytes(vllm_config, [16, 256], 3)
 
     assert reserve == max(
         (2 * 8 * 256 + 256) * ROW_BYTES, 16384 * capture_utils.NUM_LAYERS
@@ -265,7 +455,7 @@ def test_hbm_reserve_covers_two_tables_of_the_largest_bucket(monkeypatch):
         max_concurrent_batches=1,
     )  # fmt: skip
 
-    reserve = routed_experts.hbm_reserve_bytes(vllm_config, [16, 32, 64, 128])
+    reserve = routed_experts.hbm_reserve_bytes(vllm_config, [16, 32, 64, 128], 3)
 
     assert reserve == 2 * 128 * ROW_BYTES
 
@@ -300,6 +490,7 @@ def _scheduler_output(num_scheduled_tokens, finished_requests=()):
         total_num_scheduled_tokens=sum(num_scheduled_tokens.values()),
         scheduled_encoder_inputs={},
         num_scheduled_tokens=num_scheduled_tokens,
+        scheduled_spec_decode_tokens={},
         finished_req_ids=set(finished_requests),
         has_structured_output_requests=False,
         aux_output_connector_metadata=AuxOutputConnectorMetadata(

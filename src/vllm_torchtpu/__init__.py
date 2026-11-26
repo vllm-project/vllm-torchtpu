@@ -875,11 +875,17 @@ def _patch_vllm_offload_all_ranks_kv_bytes() -> None:
     keeps its own entry. The Raiden offloading spec sizes the host capacity
     from the bytes behind one block on all ranks, which under pipeline
     parallelism differ between stages, so both places record the sum first.
+    They also record the per-layer KV cache specs, which the scheduler's
+    config folds to one spec per group, so both decide alike whether the KV
+    cache has arrays of several shapes (`has_multi_shapes_kv_caches`).
     """
     from vllm.v1.engine import core as engine_core_module
     from vllm.v1.worker.worker_base import WorkerWrapperBase
 
-    from vllm_torchtpu.offload.raiden_store import record_all_ranks_kv_bytes_per_block
+    from vllm_torchtpu.offload.raiden_store import (
+        record_all_ranks_kv_bytes_per_block,
+        record_all_ranks_leaf_kv_cache_specs,
+    )
 
     marker = "_tpu_all_ranks_kv_bytes_patch"
     original_generate = engine_core_module.generate_scheduler_kv_cache_config
@@ -887,6 +893,7 @@ def _patch_vllm_offload_all_ranks_kv_bytes() -> None:
 
         def generate_scheduler_kv_cache_config_tpu(kv_cache_configs):
             record_all_ranks_kv_bytes_per_block(kv_cache_configs)
+            record_all_ranks_leaf_kv_cache_specs(kv_cache_configs)
             return original_generate(kv_cache_configs)
 
         generate_scheduler_kv_cache_config_tpu.__dict__[marker] = True
@@ -899,6 +906,7 @@ def _patch_vllm_offload_all_ranks_kv_bytes() -> None:
 
         def initialize_from_config_tpu(self, kv_cache_configs):
             record_all_ranks_kv_bytes_per_block(kv_cache_configs)
+            record_all_ranks_leaf_kv_cache_specs(kv_cache_configs)
             return original_initialize(self, kv_cache_configs)
 
         initialize_from_config_tpu.__dict__[marker] = True
@@ -1951,9 +1959,21 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     The set is cleared at `KVCacheManager.new_step_starts`, which
     `Scheduler.schedule` calls once per step before any lookup or allocation,
     and which an engine driving `KVCacheManager` directly calls each step too.
+
+    vLLM's routed-experts connector also calls `get_cached_block`, through
+    `AuxOutputSchedulerConnector._gpu_cached`, but it asks a different
+    question: whether a block is still in the KV cache. When a request
+    finishes, the connector keeps the routing of every block that is, so later
+    prefix hits can read it. The blocks the request's last step hashed are in
+    the cache and later steps hit them, so that lookup skips the set.
+    Otherwise their routing could be evicted while their KV stays cached, and
+    a later hit would fail with `BlockObjectStoreError`.
     """
     import functools
 
+    from vllm.distributed.aux_output_connector.connector import (
+        AuxOutputSchedulerConnector,
+    )
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheManager
 
@@ -1963,6 +1983,7 @@ def _patch_vllm_same_step_prefix_hits() -> None:
     original_insert_block_hash = BlockPool._insert_block_hash
     original_get_cached_block = BlockPool.get_cached_block
     original_new_step_starts = KVCacheManager.new_step_starts
+    original_gpu_cached = AuxOutputSchedulerConnector._gpu_cached
 
     def unwritten_block_ids(pool) -> set[int]:
         return pool.__dict__.setdefault("_tpu_unwritten_block_ids", set())
@@ -1991,11 +2012,25 @@ def _patch_vllm_same_step_prefix_hits() -> None:
         unwritten_block_ids(self.block_pool).clear()
         return original_new_step_starts(self, *args, **kwargs)
 
-    for wrapper in (_insert_block_hash, get_cached_block, new_step_starts):
+    # The connector asks whether a block is still cached, so the set is taken
+    # out of the pool for the call and the filter lets every block through.
+    # Upstream's lookup still runs on the pool's own `get_cached_block`.
+    @functools.wraps(original_gpu_cached)
+    def _gpu_cached(self, block_hash):
+        pool_state = self._manager.block_pool.__dict__
+        unwritten = pool_state.pop("_tpu_unwritten_block_ids", None)
+        try:
+            return original_gpu_cached(self, block_hash)
+        finally:
+            if unwritten is not None:
+                pool_state["_tpu_unwritten_block_ids"] = unwritten
+
+    for wrapper in (_insert_block_hash, get_cached_block, new_step_starts, _gpu_cached):
         wrapper._tpu_same_step_prefix_hit_patch = True
     BlockPool._insert_block_hash = _insert_block_hash
     BlockPool.get_cached_block = get_cached_block
     KVCacheManager.new_step_starts = new_step_starts
+    AuxOutputSchedulerConnector._gpu_cached = _gpu_cached
     logger.info(
         "Applied TPU patch: no prefix-cache hits on blocks the "
         "current step has not written."

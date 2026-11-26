@@ -6028,6 +6028,7 @@ class TPUModelRunner(GPUModelRunner):
             routed_experts_output = self._routed_experts.prepare_output(
                 req_ids,
                 scheduler_output.num_scheduled_tokens,
+                scheduler_output.scheduled_spec_decode_tokens,
                 self.input_batch.num_computed_tokens_cpu[: len(req_ids)],
             )
 
@@ -6539,7 +6540,12 @@ class TPUModelRunner(GPUModelRunner):
             lora_slot_write=self.lora_slot_write_hbm_bytes(),
             pp_handoff=self.pp_handoff_hbm_reserve_bytes(),
             routed_experts=routed_experts.hbm_reserve_bytes(
-                self.vllm_config, self.num_tokens_paddings
+                self.vllm_config,
+                self.num_tokens_paddings,
+                # A max-model-len forward holds the fewest requests.
+                max_forwards_per_step=cdiv(
+                    self.max_num_reqs, self.num_reqs_max_model_len
+                ),
             ),
         )
 
@@ -8232,6 +8238,8 @@ class TPUModelRunner(GPUModelRunner):
             self.max_num_blocks_per_req,
             use_max_model_len=True,
         )
+        if self._routed_experts is not None:
+            self._routed_experts.check_forward(num_tokens)
         if self.most_model_len is not None:
             assert self.num_reqs_most_model_len is not None
             assert self.num_blocks_per_most_len_req is not None
@@ -8241,6 +8249,8 @@ class TPUModelRunner(GPUModelRunner):
                 self.num_blocks_per_most_len_req,
                 use_max_model_len=False,
             )
+            if self._routed_experts is not None:
+                self._routed_experts.check_forward(num_tokens)
 
     def _warmup_handoff_forwards(self) -> None:
         """Run every token bucket once through the pipeline hand-off.
