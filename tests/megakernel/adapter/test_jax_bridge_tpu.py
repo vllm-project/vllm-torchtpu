@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """`build_jax_step_op` with TPU tensors under `torch.compile(backend="tpu",
-fullgraph=True)`: a donated output updates its input in place, and the
-outputs of a sharded spec have the shapes the fake kernel gives them.
+fullgraph=True)`: a donated output updates its input in place without a
+second copy in HBM, and the outputs of a sharded spec have the shapes the
+fake kernel gives them.
 
 Self-contained (no `torch.distributed` group, as a bare `pytest` run has
 none): the mesh is this process's first TPU device. The sharded-shape math
@@ -78,3 +79,37 @@ def test_compiled_step_donates_and_shards_on_tpu() -> None:
     assert torch.equal(state.cpu(), torch.full((4,), float(full.sum())))
     compiled(x, state)
     assert torch.equal(state.cpu(), torch.full((4,), 2.0 * float(full.sum())))
+
+
+@pytest.mark.tpu_test
+def test_compiled_step_holds_no_second_copy_of_the_donated_state() -> None:
+    """The donated state is updated in place: a step allocates no second copy
+    of it next to the input (peak HBM, as in the LoRA slot-update op test)."""
+    mesh = _tpu_mesh()
+
+    def fn(x: jax.Array, state: jax.Array) -> tuple[Any, Any]:
+        return x * 2.0, state + jnp.sum(x).astype(state.dtype)
+
+    step = build_jax_step_op(
+        fn,
+        mesh=mesh,
+        in_specs=(P(), P()),
+        out_specs=(P(), P()),
+        donate={1: 1},
+        name="mk_tests::jax_step_tpu_hbm",
+    )
+    compiled = torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
+    x = torch.ones(8, dtype=torch.float32).to("tpu")
+    # 128 MiB, so a second copy stands out from allocator noise.
+    state = torch.zeros(1 << 25, dtype=torch.float32).to("tpu")
+    compiled(x, state)  # compile and warm up
+    torch.accelerator.synchronize()
+    tpu = state.device
+    before = torch.accelerator.memory_allocated(tpu)
+    torch.accelerator.reset_peak_memory_stats(tpu)
+    compiled(x, state)
+    torch.accelerator.synchronize()
+    extra = torch.accelerator.max_memory_allocated(tpu) - before
+    # A small temporary is allowed; a second copy of the state (128 MiB) is not.
+    assert extra < state.nbytes // 2, extra
+    assert torch.equal(state[:4].cpu(), torch.full((4,), 16.0))

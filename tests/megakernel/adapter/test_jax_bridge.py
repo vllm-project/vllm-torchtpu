@@ -12,12 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """`build_jax_step_op`: a JAX step as a torch callable, run by JAX on CPU;
-its fake kernel's shapes with sharded specs; the typed step wrapper; and a
+its fake kernel's shapes with sharded specs; its operand checks; and a
 toy plugin whose `StepFn` is one, serving through the adapter."""
 
 from __future__ import annotations
 
 import inspect
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +35,7 @@ from vllm_torchtpu.megakernel.adapter import testkit
 from vllm_torchtpu.megakernel.adapter.jax_bridge import (
     build_jax_step_op,
     jax_to_torch_cpu,
-    make_typed_step_wrapper,
+    sharded_jax_callable,
     torch_cpu_to_jax,
 )
 
@@ -187,29 +189,6 @@ def test_every_build_registers_its_own_op() -> None:
     }
 
 
-def test_typed_step_wrapper_signature() -> None:
-    """The wrapper `JaxCallable` inspects: fixed positional `jax.Array`
-    parameters and a tuple of `jax.Array` results, calling the step."""
-    seen: list[tuple[Any, ...]] = []
-
-    def step(*args: Any) -> tuple[Any, ...]:
-        seen.append(args)
-        return args[::-1]
-
-    typed = make_typed_step_wrapper("mk_step_t1_b8", step, 3, 2)
-    sig = inspect.signature(typed, eval_str=True)
-    assert typed.__name__ == "mk_step_t1_b8"
-    assert list(sig.parameters) == ["x0", "x1", "x2"]
-    for param in sig.parameters.values():
-        assert param.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-        assert param.annotation is jax.Array
-        assert param.default is inspect.Parameter.empty
-    assert sig.return_annotation == tuple[jax.Array, jax.Array]
-    assert typed(1, 2, 3) == (3, 2, 1) and seen == [(1, 2, 3)]
-    one = make_typed_step_wrapper("f", step, 1, 1)
-    assert inspect.signature(one, eval_str=True).return_annotation == tuple[jax.Array]
-
-
 @pytest.mark.parametrize(
     "dtype", [torch.float32, torch.bfloat16, torch.float8_e4m3fn, torch.int32]
 )
@@ -233,6 +212,152 @@ def test_cpu_conversion_of_64_bit_dtypes(dtype: torch.dtype) -> None:
     with jax.enable_x64(True):
         back = jax_to_torch_cpu(torch_cpu_to_jax(src), src)
     assert back.dtype == dtype and torch.equal(back, src)
+
+
+def test_jax_to_torch_cpu_rejects_an_array_of_another_dtype() -> None:
+    """The conversion reinterprets bytes: a float32 array read as bfloat16
+    would come back with a doubled last dimension, so it raises."""
+    with pytest.raises(
+        ValueError, match="float32 array can't be read as torch.bfloat16"
+    ):
+        jax_to_torch_cpu(
+            jnp.ones((2, 3), jnp.float32), torch.empty(0, dtype=torch.bfloat16)
+        )
+    with pytest.raises(ValueError, match="int32 array can't be read as torch.float32"):
+        jax_to_torch_cpu(jnp.ones((2,), jnp.int32), torch.empty(0))
+
+
+def test_float64_steps_and_complex64_conversion() -> None:
+    """float64 operands and results go through the op with `jax_enable_x64`;
+    complex64 (two 32-bit floats) converts without it."""
+    step = build_jax_step_op(
+        lambda a: a * 2.0, mesh=_mesh(), in_specs=(P(),), out_specs=P()
+    )
+    src = torch.tensor([0.1, 2.0**60 + 1.0], dtype=torch.float64)
+    with jax.enable_x64(True):
+        out = step(src)
+    assert out.dtype == torch.float64 and torch.equal(out, src * 2.0)
+    c = torch.tensor([1 + 2j, -3.5j], dtype=torch.complex64)
+    with jax.enable_x64(False):
+        arr = torch_cpu_to_jax(c)
+    assert arr.dtype == jnp.complex64
+    assert torch.equal(jax_to_torch_cpu(arr, c), c)
+
+
+@pytest.mark.parametrize(
+    ("fn", "match"),
+    [
+        (lambda s: s.astype(jnp.float32), "donated output 0 is torch.float32"),
+        (lambda s: jnp.concatenate([s, s]), r"donated output 0 is torch.int32\[8\]"),
+    ],
+    ids=["dtype", "shape"],
+)
+def test_donated_output_must_match_its_input(fn: Any, match: str) -> None:
+    """`copy_` would cast or broadcast a mismatched donated output silently."""
+    step = build_jax_step_op(
+        fn, mesh=_mesh(), in_specs=(P(),), out_specs=P(), donate={0: 0}
+    )
+    state = torch.arange(4, dtype=torch.int32)
+    with pytest.raises(ValueError, match=match):
+        step(state)
+    assert state.tolist() == [0, 1, 2, 3]
+
+
+def test_operands_must_share_one_device_in_the_op_and_its_fake() -> None:
+    """A CPU operand among non-CPU ones would take the CPU path and copy the
+    others to the host; the fake kernel makes the op's checks too."""
+    step = build_jax_step_op(
+        lambda a, b: a + b, mesh=_mesh(), in_specs=(P(), P()), out_specs=P()
+    )
+    mixed = [torch.ones(2), torch.ones(2, device="meta")]
+    with pytest.raises(ValueError, match="operands on more than one device"):
+        step.op(mixed)
+    with FakeTensorMode():
+        fake_mixed = [torch.ones(2), torch.ones(2, device="meta")]
+        with pytest.raises(ValueError, match="operands on more than one device"):
+            step.op(fake_mixed)
+        with pytest.raises(ValueError, match="1 operands, in_specs has 2"):
+            step.op([torch.ones(2)])
+    strict = build_jax_step_op(
+        lambda a: a,
+        mesh=_mesh(),
+        in_specs=(P(),),
+        out_specs=P(),
+        interpret_on_cpu=False,
+    )
+    with FakeTensorMode(), pytest.raises(RuntimeError, match="interpret_on_cpu=False"):
+        strict.op([torch.ones(2)])
+
+
+def test_eager_step_with_donation_and_device_tensors_raises() -> None:
+    """Outside `torch.compile`, a donating step with device (non-CPU) tensors
+    would copy each donated input every call; it raises instead. CPU
+    operands (the interpret path) and steps without donation are allowed."""
+    step = build_jax_step_op(
+        lambda s: s + 1, mesh=_mesh(), in_specs=(P(),), out_specs=P(), donate={0: 0}
+    )
+    with pytest.raises(RuntimeError, match="must run under torch.compile"):
+        step(torch.zeros(4, device="meta"))
+    state = torch.zeros(4)
+    step(state)
+    assert state.tolist() == [1.0] * 4
+
+
+def test_sharded_jax_callable_groups_operands_by_spec_and_donation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`pallas.jax_op` gets one `list[jax.Array]` argument per (spec, donated)
+    group, the groups' specs and the donated groups' indices; the step sees
+    its operands in their own order."""
+    seen: dict[str, Any] = {}
+
+    def jax_op(name: str, fn: Any, **kw: Any) -> Any:
+        seen.update(kw, name=name, sig=inspect.signature(fn))
+
+        def run(*groups: list[torch.Tensor]) -> list[torch.Tensor]:
+            arrays = [[torch_cpu_to_jax(t) for t in g] for g in groups]
+            return [jax_to_torch_cpu(a, torch.empty(0)) for a in fn(*arrays)]
+
+        return run
+
+    pallas = types.SimpleNamespace(jax_op=jax_op)
+    internal = types.ModuleType("torch_tpu._internal")
+    internal.pallas = pallas  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch_tpu", types.ModuleType("torch_tpu"))
+    monkeypatch.setitem(sys.modules, "torch_tpu._internal", internal)
+    monkeypatch.setitem(sys.modules, "torch_tpu._internal.pallas", pallas)
+
+    def fn(a: Any, b: Any, pool: Any, c: Any) -> tuple[Any, Any]:
+        return a + 10 * b + 100 * c, pool + 1
+
+    specs = (P(), P("tp"), P("tp"), P())
+    call = sharded_jax_callable(
+        "mk_tests::grouped",
+        fn,
+        mesh=_mesh(),
+        input_partition_specs=specs,
+        output_partition_specs=(P(), P("tp")),
+        donate_argnums=(2,),
+    )
+    assert seen["name"] == "mk_tests::grouped"
+    assert seen["input_partition_specs"] == (P(), P("tp"), P("tp"))
+    assert seen["output_partition_specs"] == (P(), P("tp"))
+    assert seen["donate_argnums"] == (2,)
+    assert [p.annotation for p in seen["sig"].parameters.values()] == [
+        list[jax.Array]
+    ] * 3
+    assert seen["sig"].return_annotation == list[jax.Array]
+    a, b, pool, c = (torch.full((2,), float(v)) for v in (1, 2, 3, 4))
+    out, new_pool = call(a, b, pool, c)
+    assert out.tolist() == [421.0, 421.0] and new_pool.tolist() == [4.0, 4.0]
+    with pytest.raises(ValueError, match="one '::'"):
+        sharded_jax_callable(
+            "bad",
+            fn,
+            mesh=_mesh(),
+            input_partition_specs=specs,
+            output_partition_specs=(P(), P()),
+        )
 
 
 JAX_TOY_PLUGIN = '''
