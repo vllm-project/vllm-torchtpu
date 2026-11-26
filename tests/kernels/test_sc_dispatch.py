@@ -45,6 +45,7 @@ from vllm_torchtpu.kernels.megablox.sc_dispatch import (
     sc_dispatch,
     sc_drain,
     sc_send_plan,
+    sc_send_plan_xla,
 )
 from vllm_torchtpu.layers.core.ragged_a2a_moe import DP_AXIS, TP_AXIS, _fp8_scales
 
@@ -76,8 +77,9 @@ def _mesh(dp):
 def _routing(rng, dp, tp, kind):
     """Packed routing [D, K, S]: bf16 weights in the low half (a fifth zero,
     some subnormal or NaN). ``skewed``: most routes on the first ranks;
-    ``padded``: the last tokens' ids -1 with weight 0; ``repeated``: some
-    tokens name one expert three times."""
+    ``hot_rank``: rank 0's experts first in every token; ``padded``: the last
+    tokens' ids -1 with weight 0; ``repeated``: some tokens name one expert
+    three times; ``hot_expert``: every route on one expert of rank 1."""
     slots = dp * tp * LOCAL
     count = dp * TOKENS
     if kind == "skewed":
@@ -88,6 +90,14 @@ def _routing(rng, dp, tp, kind):
                 for _ in range(count)
             ]
         )
+    elif kind == "hot_rank":
+        ids = np.stack([
+            np.r_[rng.permutation(LOCAL)[:TOPK],
+                  rng.permutation(np.arange(LOCAL, slots))[:TOPK - min(TOPK, LOCAL)]]
+            for _ in range(count)
+        ])  # fmt: skip
+    elif kind == "hot_expert":
+        ids = np.full((count, TOPK), LOCAL + 3)
     else:
         ids = np.stack([rng.permutation(slots)[:TOPK] for _ in range(count)])
     ids = ids.reshape(dp, TOKENS, TOPK)
@@ -356,3 +366,41 @@ def test_sc_dispatch_without_memory_flags():
     x = _tokens(rng, 4, 8192)[None]
     flags = dict(xla_mosaic_unsafe_allow_multicore_remote_dma=True)
     _check(mesh, words, fits, _run(mesh, x, words, fits, skew=False, flags=flags))
+
+
+@pytest.mark.parametrize("dp, tp", [(16, 4), (8, 1), (4, 2), (2, 4)])
+@pytest.mark.parametrize(
+    "kind", ["uniform", "skewed", "hot_rank", "padded", "repeated", "hot_expert"]
+)
+def test_send_plan_kernel_matches_the_xla_plan(dp, tp, kind):
+    """On one TPU: the kernel's send table, group sizes and sentinels equal
+    the XLA plan's bitwise, at every rank of the 8-device layouts and seven
+    ranks of DP 16 x TP 4, on a step that fits and one that overflows, padded
+    routes skipped or not. ``hot_expert`` lands more than 255 routes in one
+    bin."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("needs a TPU")
+    rng = np.random.default_rng(dp * 10 + tp + len(kind))
+    words = jnp.asarray(_routing(rng, dp, tp, kind))
+    ranks = dp * tp
+    if ranks <= N_DEV:
+        eps = range(ranks)
+    else:
+        eps = sorted({0, 1, tp, ranks - 1, *rng.integers(ranks, size=3).tolist()})
+    for skip in (True, False):
+        kw = dict(
+            local_num_experts=LOCAL,
+            tp_size=tp,
+            skip_padded=skip,
+            recv_rows=dp * TOKENS * TOPK,
+        )
+        for ep in eps:
+            for fits in (1, 0):
+                args = (words, jnp.array([ep], jnp.int32), jnp.array([fits], jnp.int32))
+                where = f"rank {ep}, fits {fits}, skip_padded {skip}"
+                for got, want in zip(
+                    sc_send_plan(*args, **kw),
+                    sc_send_plan_xla(*args, **kw),
+                    strict=True,
+                ):
+                    np.testing.assert_array_equal(got, want, err_msg=where)
