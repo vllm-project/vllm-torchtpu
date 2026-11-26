@@ -116,6 +116,14 @@ _ONEHOT_AUTO_CAP = 512
 # Fixed at import, like the other MoE algorithm selectors.
 _DENSE_EXPERT_THRESHOLD = envs.TPU_MOE_DENSE_EXPERT_THRESHOLD
 _DENSE_FP4_MAX_TOKENS = envs.TPU_MOE_DENSE_FP4_MAX_TOKENS
+# Fixed at import (from r15-merge): steps above _DENSE_FP4_MAX_TOKENS and up
+# to this many tokens run the dense fp4 kernel on each expert's own routes
+# (sparse rows) instead of sort + permute + GMM + combine. 0 = off.
+_DENSE_FP4_SPARSE_MAX_TOKENS = envs.TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS
+# The dense fp4 kernel serves EP ranks; TP-MoE ranks (every expert's slice,
+# all ids local) only while a dense fp4 lever from r15-merge is set, so with
+# those unset the TP-MoE path is unchanged.
+_DENSE_FP4_TP_MOE = _DENSE_FP4_SPARSE_MAX_TOKENS > 0
 # Fixed at import: one-hot permute/combine over the valid prefix only.
 _BOUNDED_ONEHOT = envs.TPU_MOE_BOUNDED_ONEHOT
 # Fixed at import: build the MoE permutation from one packed sort.
@@ -1103,18 +1111,31 @@ def fused_moe_func(
 
     # Decode under EP: a core holds few routed rows per expert and weight
     # streaming binds, so the permutation-free kernel skips the routing sort,
-    # permute and combine around the GMM.
+    # permute and combine around the GMM. Above the dense cap and up to the
+    # sparse one, the kernel evaluates each expert on its own routes' rows
+    # only (16-row tiles).
+    sparse_rows = num_tokens > _DENSE_FP4_MAX_TOKENS
     if (
-        use_ep
-        and 0 < num_tokens <= _DENSE_FP4_MAX_TOKENS
+        (use_ep or _DENSE_FP4_TP_MOE)
+        and 0 < num_tokens <= max(_DENSE_FP4_MAX_TOKENS, _DENSE_FP4_SPARSE_MAX_TOKENS)
         and rhs_quant_dtype is None
         and w1_bias is None
         and w2_bias is None
         and can_use_dense_expert_fp4(
-            hidden_states, w1, w2, w1_scale, w2_scale, activation=activation
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            activation=activation,
+            sparse_rows=sparse_rows,
         )
     ):
-        logger.info_once("Selected dense-expert fp4 decode MoE")
+        logger.info_once(
+            "Selected dense-expert fp4 sparse-rows MoE"
+            if sparse_rows
+            else "Selected dense-expert fp4 decode MoE"
+        )
         return _with_shared(
             dense_expert_moe_fp4(
                 hidden_states,
@@ -1125,6 +1146,7 @@ def fused_moe_func(
                 topk_weights,
                 topk_ids,
                 activation=activation,
+                sparse_rows=sparse_rows,
             ),
             shared,
         )

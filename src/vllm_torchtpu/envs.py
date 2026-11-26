@@ -108,6 +108,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE: bool = False
     TPU_MINIMAX_M3_SP_ATTN_PIECES: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
+    TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -1075,6 +1076,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 disables it.
     "TPU_MOE_DENSE_FP4_MAX_TOKENS": env_nonnegative_int(
         "TPU_MOE_DENSE_FP4_MAX_TOKENS", 16
+    ),
+    # Steps above TPU_MOE_DENSE_FP4_MAX_TOKENS and up to this many tokens run
+    # the same kernel on each expert's own routes only (rows gathered into
+    # 16-row tiles) instead of the routing sort, permute, GMM and combine.
+    # Set (> 0), TP-MoE ranks (every expert's slice) take the dense fp4
+    # kernel too, at both sizes. 0 (default) disables it.
+    "TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS": env_nonnegative_int(
+        "TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS", 0
     ),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
