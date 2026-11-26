@@ -24,7 +24,7 @@ import pytest
 import torch
 from jax import lax
 
-from vllm_torchtpu.kernels.router_topk import MAX_BLOCK_ROWS, select
+from vllm_torchtpu.kernels.router_topk import MAX_BLOCK_ROWS, select, select_values_t
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 EXPERTS = 512
@@ -164,3 +164,20 @@ def test_kernel_ties_and_nan_match_the_reference():
 def test_grid_rounds_up_over_the_tuned_block(rows, grid):
     block = min(MAX_BLOCK_ROWS, rows)
     assert -(-rows // block) == grid
+
+
+@pytest.mark.parametrize("rows", [96, 384, 1024, 1040])
+def test_select_values_t_takes_values_at_select_picks(rows):
+    """Slot-major picks of ``select`` with another array's entries at them
+    (sigmoid scores picked on scores + bias, as MoE routing does), on the
+    transposed kernel (lane-aligned rows) and the fallback alike."""
+    rng = np.random.default_rng(rows)
+    values = 1 / (1 + np.exp(-rng.standard_normal((rows, 128), dtype=np.float32)))
+    choice = values + rng.standard_normal((1, 128), dtype=np.float32) * 0.1
+    w, i = select_values_t(jnp.asarray(choice), jnp.asarray(values), 4, interpret=True)
+    _, ref_i = select(jnp.asarray(choice), 4, interpret=True)
+    ref_i = np.asarray(ref_i)
+    np.testing.assert_array_equal(np.asarray(i), ref_i.T)
+    np.testing.assert_array_equal(
+        np.asarray(w), np.take_along_axis(values, ref_i, axis=1).T
+    )

@@ -1433,16 +1433,17 @@ def test_prepare_routed_counting_sort_eliminates_redundant_sorts(
     if routing == "skewed":
         # Pin the permutation property directly on the rank contraction, not
         # just through the end-to-end comparison above.
-        flat = topk_indices.reshape(-1)
-        sort_keys = jnp.where(flat >= 0, flat, local_num_experts)
+        slot_major = topk_indices.T
+        sort_keys = jnp.where(slot_major >= 0, slot_major, local_num_experts)
         positions, counts = fused_moe_gmm._counting_sort_positions(
             sort_keys, local_num_experts + 1
         )
         assert positions is not None and counts is not None
+        assert positions.shape == sort_keys.shape
         np.testing.assert_array_equal(
-            np.sort(np.asarray(positions)), np.arange(sort_keys.shape[0])
+            np.sort(np.asarray(positions).reshape(-1)), np.arange(sort_keys.size)
         )
-        assert int(np.asarray(counts).sum()) == sort_keys.shape[0]
+        assert int(np.asarray(counts).sum()) == sort_keys.size
         assert int(np.asarray(counts).max()) > fused_moe_gmm._COUNTING_SORT_BLOCK // 2
 
     jaxpr = jax.make_jaxpr(

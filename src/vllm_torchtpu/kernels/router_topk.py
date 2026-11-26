@@ -65,22 +65,35 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk: int, n: int):
     w_ref[...] = jnp.where(w_ref[:, :1] <= NEG, jnp.nan, w_ref[...])
 
 
-def _select_kernel_t(x_ref, w_ref, i_ref, *, topk: int, n: int):
+def _select_kernel_t(x_ref, *refs, topk: int, n: int):
     """`_select_kernel` on the block transposed, rows along lanes: each pass's
     max and min reduce across vregs instead of across lanes, and the
     ``[topk, rows]`` outputs store whole lane rows (tpu7x, 8192 x 128 experts,
-    k=4: 2418 -> 929 bundles per 512-row block, deviceless AOT)."""
+    k=4: 2418 -> 929 bundles per 512-row block, deviceless AOT).
+
+    With a second input (``refs`` = values, weights, indices) the weights are
+    that input's entries at the selected experts instead of the maxima."""
+    v_ref, w_ref, i_ref = refs if len(refs) == 3 else (None, *refs)
     x = x_ref[...].T
     x = jnp.where(x > NEG, x, NEG)
     masked = jnp.finfo(x.dtype).min
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 0)
+    v = None if v_ref is None else v_ref[...].T
     for j in range(topk):
         m = jnp.max(x, axis=0, keepdims=True)
         idx = jnp.min(jnp.where(x == m, iota, n - 1), axis=0, keepdims=True)
-        w_ref[j : j + 1, :] = m
+        hit = iota == idx
+        if v is None:
+            w_ref[j : j + 1, :] = m
+        else:
+            # The one entry at the selected expert, exactly.
+            w_ref[j : j + 1, :] = jnp.max(
+                jnp.where(hit, v, -jnp.inf), axis=0, keepdims=True
+            )
         i_ref[j : j + 1, :] = idx
-        x = jnp.where(iota == idx, masked, x)
-    w_ref[...] = jnp.where(w_ref[:1, :] <= NEG, jnp.nan, w_ref[...])
+        x = jnp.where(hit, masked, x)
+    if v is None:
+        w_ref[...] = jnp.where(w_ref[:1, :] <= NEG, jnp.nan, w_ref[...])
 
 
 def select(
@@ -129,6 +142,34 @@ def select(
         ],
         interpret=interpret,
     )(scores)
+
+
+def select_values_t(
+    choice: jax.Array, values: jax.Array, topk: int, interpret: bool = False
+) -> tuple[jax.Array, jax.Array]:
+    """Top-k of ``[rows, experts]`` f32 ``choice`` as ``select`` picks it, with
+    ``values`` (same shape) at the picked experts in place of the maxima;
+    both ``[topk, rows]`` (expert-slot major). A row whose choice holds no
+    score above the clamp floor keeps its picks, unlike ``select``'s NaN
+    weights: the caller's values decide."""
+    rows, n = choice.shape
+    block = min(MAX_BLOCK_ROWS, rows)
+    if block % _LANES or n % _LANES:
+        _, ids = select(choice, topk, interpret=interpret)
+        return jnp.take_along_axis(values, ids, axis=1).T, ids.T
+    spec = pl.BlockSpec((block, n), lambda b: (b, 0))
+    out = pl.BlockSpec((topk, block), lambda b: (0, b))
+    return pl.pallas_call(
+        functools.partial(_select_kernel_t, topk=topk, n=n),
+        grid=(pl.cdiv(rows, block),),
+        in_specs=[spec, spec],
+        out_specs=[out, out],
+        out_shape=[
+            jax.ShapeDtypeStruct((topk, rows), values.dtype),
+            jax.ShapeDtypeStruct((topk, rows), jnp.int32),
+        ],
+        interpret=interpret,
+    )(choice, values)
 
 
 def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:

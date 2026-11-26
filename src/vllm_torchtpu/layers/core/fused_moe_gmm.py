@@ -48,7 +48,9 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
 )
-from vllm_torchtpu.kernels.router_topk import select as router_topk_select
+from vllm_torchtpu.kernels.router_topk import (
+    select_values_t as router_topk_select_values_t,
+)
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
 )
@@ -347,80 +349,74 @@ def gmm_wrapper(
 def _counting_sort_positions(
     sort_keys: jax.Array, num_buckets: int
 ) -> tuple[jax.Array | None, jax.Array | None]:
-    """Stable counting sort: row -> its position in the sorted order.
+    """Stable counting sort of slot-major keys ``[topk, tokens]``: each
+    route's position in the order a stable sort of the token-major flat keys
+    (route ``t * topk + j``) gives, laid out like the keys, and the bucket
+    totals (which are exactly `group_sizes`).
 
     `jnp.argsort(jnp.argsort(keys))` spends a second comparison sort over M
     distinct values on what is really the inverse of the first permutation.
-    The keys take only `num_buckets` values, so the rank within a bucket comes
-    from a triangular matmul on the one-hot block -- MXU work proportional to
-    M*block*num_buckets instead of a length-M sort -- and the bucket totals
-    fall out of the same histogram, which is exactly `group_sizes`.
+    The keys take only `num_buckets` values, so a route's position is its
+    bucket's offset plus the routes of earlier tokens in that bucket plus
+    the earlier slots of its own token there. The per-token histogram's
+    prefix over tokens is a triangular matmul per token block (MXU work
+    proportional to tokens*block*num_buckets), and everything stays with
+    tokens on lanes: a token-major [tokens * topk] layout of the router's
+    slot-major output costs lane-padded relayouts per array.
     """
-    m = sort_keys.shape[0]
-    block = min(_COUNTING_SORT_BLOCK, m)
-    if num_buckets > block:
-        # XLA miscompiles the rank matmul here on jaxlib 0.10.2 + libtpu
-        # 0.0.44.1: under jit the positions come back not a permutation. Only
-        # num_buckets > block is affected, so that is the excluded region.
+    topk, num_tokens = sort_keys.shape
+    if num_buckets > min(_COUNTING_SORT_BLOCK, topk * num_tokens):
+        # XLA miscompiled the token-major form's rank matmul here on jaxlib
+        # 0.10.2 + libtpu 0.0.44.1 (positions not a permutation under jit);
+        # that region keeps the comparison sorts.
         return None, None
-    pad = -m % block
+    block = min(_COUNTING_SORT_BLOCK, num_tokens)
+    pad = -num_tokens % block
     if pad:
-        # The sentinel bucket sorts after every real one, so padding into it
-        # leaves the real bucket bases untouched; the caller slices the
-        # sentinel off `counts` anyway.
-        sort_keys = jnp.pad(sort_keys, (0, pad), constant_values=num_buckets - 1)
-    onehot = jax.nn.one_hot(
-        sort_keys.reshape(-1, block), num_buckets, dtype=jnp.bfloat16
+        # Padded tokens sort after every real one (last token, sentinel
+        # bucket), so the real positions are unchanged; the caller slices
+        # the sentinel off `counts`.
+        sort_keys = jnp.pad(
+            sort_keys, ((0, 0), (0, pad)), constant_values=num_buckets - 1
+        )
+    buckets = jnp.arange(num_buckets, dtype=jnp.int32)[:, None]
+    onehot = [sort_keys[j][None, :] == buckets for j in range(topk)]  # [B, T]
+    per_token = sum(o.astype(jnp.bfloat16) for o in onehot)
+    blocks = per_token.reshape(num_buckets, -1, block)
+    # Routes of earlier tokens in the block, per bucket: exact (small
+    # integer summands, f32 accumulation).
+    earlier = jnp.triu(jnp.ones((block, block), jnp.bfloat16), 1)
+    rank = jnp.einsum(
+        "ebs,st->ebt", blocks, earlier, preferred_element_type=jnp.float32
     )
-    # The histogram rides along as one more row of the contraction the rank
-    # matmul already performs. Exact: 0/1 summands, at most `block` of them.
-    lower = jnp.concatenate(
-        [
-            jnp.ones((1, block), jnp.bfloat16),
-            jnp.tril(jnp.ones((block, block), jnp.bfloat16), -1),
-        ],
-        axis=0,
-    )
-    both = jnp.einsum("ij,bje->bie", lower, onehot, preferred_element_type=jnp.float32)
-    hist = both[:, 0, :]
-    rank = both[:, 1:, :]
-    # Prefix sums via MXU triangular contractions avoid VPU `reduce-window`
-    # scans (`jnp.cumsum`), and single-block inputs skip the block prefix.
-    upper_buckets = jnp.triu(jnp.ones((num_buckets, num_buckets), jnp.bfloat16), 1)
-    if hist.shape[0] == 1:
-        counts = hist[0]
-        base = jnp.einsum(
-            "e,ef->f",
-            counts,
-            upper_buckets,
-            precision=jax.lax.Precision.HIGHEST,
-            preferred_element_type=jnp.float32,
-        )[None, :]
-    else:
-        counts = hist.sum(axis=0)
-        bucket_offset = jnp.einsum(
-            "e,ef->f",
-            counts,
-            upper_buckets,
+    hist = blocks.astype(jnp.float32).sum(axis=2)  # [B, blocks]
+    counts = hist.sum(axis=1)
+    lower_buckets = jnp.tril(jnp.ones((num_buckets, num_buckets), jnp.float32), -1)
+    base = jnp.einsum(
+        "fe,e->f",
+        lower_buckets,
+        counts,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
+    )[:, None]
+    if hist.shape[1] > 1:
+        earlier_blocks = jnp.triu(jnp.ones((hist.shape[1],) * 2, jnp.float32), 1)
+        base = base + jnp.einsum(
+            "eb,bc->ec",
+            hist,
+            earlier_blocks,
             precision=jax.lax.Precision.HIGHEST,
             preferred_element_type=jnp.float32,
         )
-        if hist.shape[0] <= _COUNTING_SORT_BLOCK:
-            lower_blocks = jnp.tril(
-                jnp.ones((hist.shape[0], hist.shape[0]), jnp.bfloat16), -1
-            )
-            block_offset = jnp.einsum(
-                "ab,be->ae",
-                lower_blocks,
-                hist,
-                precision=jax.lax.Precision.HIGHEST,
-                preferred_element_type=jnp.float32,
-            )
-        else:
-            block_offset = jnp.cumsum(hist, axis=0) - hist
-        base = block_offset + bucket_offset
-    pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
-    return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
+    start = (rank + base[:, :, None]).reshape(num_buckets, -1)
+    positions = []
+    for j in range(topk):
+        # Earlier slots of the same token in the same bucket (the sentinel
+        # can hold several).
+        same = sum((sort_keys[i] == sort_keys[j]).astype(jnp.int32) for i in range(j))
+        pos = jnp.sum(jnp.where(onehot[j], start, 0.0), axis=0).astype(jnp.int32)
+        positions.append(pos + same)
+    return jnp.stack(positions)[:, :num_tokens], counts.astype(jnp.int32)
 
 
 def _zero_non_finite(x: jax.Array) -> jax.Array:
@@ -477,14 +473,21 @@ def prepare_routed_gmm_inputs(
     topk_weights_flat = topk_weights_local.flatten()
     token_indices_flat = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)
 
+    # The masks and keys are built slot-major ([topk, tokens], how the router
+    # lays them out, see route_from_scores) for the counting sort and the
+    # packed sort, which feed the permute; the token-major flat forms are
+    # only consumed after it.
+    indices_t = topk_indices_local.T
     if skip_padded_tokens:
         # Padded tokens keep their selected expert ids, but carry zero
         # expert routing weights. Treat them as invalid to remove them
         # from GMM work.
-        valid_mask = (topk_indices_flat >= 0) & (topk_weights_flat != 0)
+        valid_t = (indices_t >= 0) & (topk_weights_local.T != 0)
     else:
-        valid_mask = topk_indices_flat >= 0
-    sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
+        valid_t = indices_t >= 0
+    sort_keys_t = jnp.where(valid_t, indices_t, local_num_experts)
+    valid_mask = valid_t.T.reshape(-1)
+    sort_keys = sort_keys_t.T.reshape(-1)
     # The keys take only `local_num_experts + 1` values, so a counting sort
     # gives the positions and `group_sizes` without a second comparison sort:
     # on the ragged permute at any row count (as before), and -- unless
@@ -501,11 +504,12 @@ def prepare_routed_gmm_inputs(
     counting_sort = ragged_permute or (
         _COUNTING_SORT and token_indices_flat.shape[0] <= _SINGLE_SORT_MAX_ROWS
     )
-    argsort_revert_indices, bucket_counts = (
-        _counting_sort_positions(sort_keys, local_num_experts + 1)
+    positions_t, bucket_counts = (
+        _counting_sort_positions(sort_keys_t, local_num_experts + 1)
         if counting_sort
         else (None, None)
     )
+    argsort_revert_indices = None if positions_t is None else positions_t.T.reshape(-1)
     token_bits = max(1, (num_tokens_local - 1).bit_length())
     packable = (local_num_experts + 1).bit_length() + token_bits < 31
     flat_bits = max(1, (token_indices_flat.shape[0] - 1).bit_length())
@@ -524,8 +528,11 @@ def prepare_routed_gmm_inputs(
     ):
         token_indices_sorted = (
             jnp.zeros_like(token_indices_flat)
-            .at[argsort_revert_indices]
-            .set(token_indices_flat, unique_indices=True)
+            .at[positions_t.reshape(-1)]
+            .set(
+                jnp.tile(jnp.arange(num_tokens_local, dtype=jnp.int32), topk),
+                unique_indices=True,
+            )
         )
     sorted_indices = (
         jnp.argsort(sort_keys)
@@ -555,9 +562,10 @@ def prepare_routed_gmm_inputs(
         if packable:
             # Packing (key, token) into one int32 keeps the payload out of the sort
             # and drops the follow-up gather. Equal packed values carry the same
-            # token id, so their order cannot matter.
+            # token id, so their order (here slot-major) cannot matter.
             packed = jax.lax.sort(
-                jnp.left_shift(sort_keys, token_bits) | token_indices_flat,
+                jnp.left_shift(sort_keys_t, token_bits).reshape(-1)
+                | jnp.tile(jnp.arange(num_tokens_local, dtype=jnp.int32), topk),
                 is_stable=False,
             )
             token_indices_sorted = jnp.bitwise_and(packed, (1 << token_bits) - 1)
@@ -1022,12 +1030,15 @@ def route_from_scores(
     """``(topk_weights, topk_ids)`` of the [tokens, E] f32 sigmoid ``scores``
     and ``choice`` (scores + correction bias), as moe_routing.select_experts
     computes them with the rowmax top-k."""
-    _, ids = router_topk_select(choice, route.topk)
-    weights = jnp.take_along_axis(scores, ids, axis=1)
-    weights = weights / jnp.maximum(weights.sum(axis=-1, keepdims=True), 1e-20)
+    # Slot-major ([topk, tokens], tokens on lanes) as the kernel writes it:
+    # the transposes below are layout-free views for the routing prep, which
+    # builds its sort keys slot-major (prepare_routed_gmm_inputs); a
+    # token-major [tokens, topk] layout costs a lane-padded relayout per array.
+    weights, ids = router_topk_select_values_t(choice, scores, route.topk)
+    weights = weights / jnp.maximum(weights.sum(axis=0, keepdims=True), 1e-20)
     if route.scale != 1.0:
         weights = weights * route.scale
-    return weights.astype(route.weight_dtype), ids
+    return weights.astype(route.weight_dtype).T, ids.T
 
 
 def _e4m3_routed_rows(
