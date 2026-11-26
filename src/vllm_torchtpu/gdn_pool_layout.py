@@ -49,6 +49,8 @@ QWEN_GDN_ARCHITECTURES = frozenset(
 )
 POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
     {
+        "BailingMoeV3ForCausalLM",
+        "BailingMoeV3VLForConditionalGeneration",
         # Kimi-Linear and Kimi-K3 run their KDA layers through the gather/scatter
         # pooled op (build_kimi_pooled_kda_op, around the fused conv1d + GDN v3
         # kernel). Kimi-K3's TP32 geometry is validated: prefix-cache hits are

@@ -25,7 +25,12 @@ from torch import nn
 from vllm.model_executor.models import bailing_moe_v3 as upstream
 from vllm.utils.torch_utils import set_default_torch_dtype
 
+from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architecture
 from vllm_torchtpu.layers.adapter.custom_ops import kda_attention_op as kda_ops
+from vllm_torchtpu.layers.core.sequence_layout import (
+    PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
+    SequenceLayoutKind,
+)
 from vllm_torchtpu.models.bailing_moe_v3 import attention as bailing
 
 pytestmark = pytest.mark.usefixtures("cpu_model_tests")
@@ -43,7 +48,12 @@ class _CpuLinear(nn.Linear):
 def kda_builders(monkeypatch):
     builder = Mock(return_value=Mock(side_effect=AssertionError("unexpected KDA call")))
     monkeypatch.setattr(bailing, "build_kimi_dispatched_kda_op", builder)
-    return builder
+    pooled_builder = Mock(
+        return_value=Mock(side_effect=AssertionError("unexpected pooled KDA call"))
+    )
+    monkeypatch.setattr(bailing, "build_kimi_pooled_kda_op", pooled_builder)
+
+    return builder, pooled_builder
 
 
 @pytest.fixture
@@ -53,6 +63,7 @@ def make_layer(monkeypatch, kda_builders):
     def make(
         separate=False,
         num_spec=0,
+        pooled=False,
         safe_gate=True,
         *,
         tp_size=1,
@@ -81,12 +92,15 @@ def make_layer(monkeypatch, kda_builders):
         )
         monkeypatch.setattr(upstream, "_is_fp8_module_excluded", lambda *args: separate)
         context = SimpleNamespace(static_forward_context={}, splitting_ops=[])
-        vllm_config = SimpleNamespace(compilation_config=context)
+        vllm_config = SimpleNamespace(
+            compilation_config=context, cache_config=SimpleNamespace(block_size=16)
+        )
         monkeypatch.setattr(
             upstream,
             "get_current_vllm_config",
             lambda: vllm_config,
         )
+        monkeypatch.setattr(bailing, "get_current_vllm_config", lambda: vllm_config)
         config = SimpleNamespace(
             hidden_size=10,
             head_dim=3,
@@ -111,10 +125,14 @@ def make_layer(monkeypatch, kda_builders):
                     torch.arange(param.numel()).reshape(param.shape) / 1000 + i / 100
                 )
         layer.process_weights_after_loading(dtype)
-        layer.kv_cache = tuple(
-            torch.zeros(8, *shape, dtype=state_dtype)
-            for shape, state_dtype in zip(
-                layer.get_state_shape(), layer.get_state_dtype(), strict=True
+        layer.kv_cache = (
+            (torch.zeros(8, 16, 2, 128, dtype=dtype),)
+            if pooled
+            else tuple(
+                torch.zeros(8, *shape, dtype=state_dtype)
+                for shape, state_dtype in zip(
+                    layer.get_state_shape(), layer.get_state_dtype(), strict=True
+                )
             )
         )
         return layer
@@ -142,13 +160,20 @@ def test_constructor_configures_kda_ops_and_state(
     make_layer, kda_builders, safe_gate, num_spec
 ):
     layer = make_layer(safe_gate=safe_gate, num_spec=num_spec)
-    builder = kda_builders
+    builder, pooled_builder = kda_builders
     lower_bound = -5.0 if safe_gate else None
     builder.assert_called_once_with(
         layer.prefix,
         lower_bound=lower_bound,
         eps=1e-6,
         state_dim_first=bailing.is_conv_state_dim_first(),
+        num_spec_tokens=num_spec,
+    )
+    pooled_builder.assert_called_once_with(
+        layer.prefix,
+        lower_bound=lower_bound,
+        eps=1e-6,
+        vllm_config=bailing.get_current_vllm_config(),
         num_spec_tokens=num_spec,
     )
     assert layer.get_state_shape() == ((2, 1, 36), (4, 3, 3))
@@ -194,33 +219,48 @@ def test_forward_projects_local_heads(make_layer, metadata, separate, tp_size, d
     )
     assert norm_weight.dtype == dtype
     torch.testing.assert_close(output, core.flatten(1) @ layer.o_proj.weight.t())
+    layer._tpu_pooled_kda_op.assert_not_called()
 
 
 @pytest.mark.parametrize("num_spec", [0, 2])
+@pytest.mark.parametrize("pooled", [False, True])
 @torch.inference_mode()
-def test_forward_routes_cache_and_metadata(make_layer, metadata, num_spec):
-    layer = make_layer(num_spec=num_spec)
+def test_forward_routes_cache_and_metadata(make_layer, metadata, num_spec, pooled):
+    layer = make_layer(num_spec=num_spec, pooled=pooled)
     if num_spec:
         metadata.mamba_request_distribution = torch.tensor([1, 1, 1], dtype=torch.int32)
         metadata.mamba_slot_read_offsets = torch.tensor(
             [0, 1, 0, 0, 0, 0, 0, 0], dtype=torch.int32
         )
+        metadata.mamba_ckpt_indices = torch.tensor([[1, 3, 5]], dtype=torch.int32)
     op = Mock(return_value=torch.zeros(2, 4, 3, dtype=torch.bfloat16))
-    layer._tpu_kda_op = op
-    window_distribution = (
-        metadata.mamba_request_distribution
-        if num_spec
-        else metadata.request_distribution
-    )
-    read_offsets = (
-        metadata.mamba_slot_read_offsets if num_spec else metadata.mamba_state_indices
-    )
+    if pooled:
+        layer._tpu_pooled_kda_op = op
+        unused = layer._tpu_kda_op
+        window_distribution = metadata.mamba_request_distribution
+        read_offsets = metadata.mamba_slot_read_offsets
+        tail = (metadata.mamba_ckpt_indices,)
+    else:
+        layer._tpu_kda_op = op
+        unused = layer._tpu_pooled_kda_op
+        window_distribution = (
+            metadata.mamba_request_distribution
+            if num_spec
+            else metadata.request_distribution
+        )
+        read_offsets = (
+            metadata.mamba_slot_read_offsets
+            if num_spec
+            else metadata.mamba_state_indices
+        )
+        tail = ()
     layer(
         torch.ones(2, 10, dtype=torch.bfloat16),
         torch.arange(2),
         torch.empty(2, 10, dtype=torch.bfloat16),
     )
     op.assert_called_once()
+    unused.assert_not_called()
     expected = (
         *layer.kv_cache,
         layer.tpu_conv_weight_fused,
@@ -232,6 +272,7 @@ def test_forward_routes_cache_and_metadata(make_layer, metadata, num_spec):
         metadata.request_distribution,
         window_distribution,
         read_offsets,
+        *tail,
     )
     actual = list(op.call_args.args[4:])
     torch.testing.assert_close(
@@ -242,8 +283,11 @@ def test_forward_routes_cache_and_metadata(make_layer, metadata, num_spec):
         assert value is reference
 
 
+@pytest.mark.parametrize("pooled", [False, True])
 @torch.inference_mode()
-def test_forward_compiles_and_writes_back_state(make_layer, metadata, monkeypatch):
+def test_forward_compiles_and_writes_back_state(
+    make_layer, metadata, monkeypatch, pooled
+):
     """Keep the real bridge/fake op; replace only the TPU kernel with a CPU op."""
 
     def dense_kernel(
@@ -268,22 +312,50 @@ def test_forward_compiles_and_writes_back_state(make_layer, metadata, monkeypatc
         output = qkv[:, : heads * dim].reshape(-1, heads, dim).clone()
         return output, conv + 1, recurrent + 2
 
+    def pooled_kernel(
+        qkv: torch.Tensor,
+        gate: torch.Tensor,
+        beta: torch.Tensor,
+        output_gate: torch.Tensor,
+        pool: torch.Tensor,
+        weight: torch.Tensor,
+        a_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        norm: torch.Tensor,
+        starts: torch.Tensor,
+        indices: torch.Tensor,
+        lengths: torch.Tensor,
+        distribution: torch.Tensor,
+        windows: torch.Tensor | None = None,
+        offsets: torch.Tensor | None = None,
+        checkpoints: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        heads, dim = a_log.numel(), norm.numel()
+        output = qkv[:, : heads * dim].reshape(-1, heads, dim).clone()
+        return output, pool + 1
+
     def jax_op(name, function, donate_argnums=()):
-        assert donate_argnums == (4, 5)
-        return torch.library.custom_op(name, mutates_args=())(dense_kernel)
+        is_pooled = "pooled" in name
+        assert donate_argnums == ((4,) if is_pooled else (4, 5))
+        return torch.library.custom_op(name, mutates_args=())(
+            pooled_kernel if is_pooled else dense_kernel
+        )
 
     monkeypatch.setattr(kda_ops.pallas, "jax_op", jax_op)
     monkeypatch.setattr(
         bailing, "build_kimi_dispatched_kda_op", kda_ops.build_kimi_dispatched_kda_op
     )
-    layer = make_layer(prefix="test_bailing_compile")
+    monkeypatch.setattr(
+        bailing, "build_kimi_pooled_kda_op", kda_ops.build_kimi_pooled_kda_op
+    )
+    layer = make_layer(pooled=pooled, prefix=f"test_bailing_compile_{pooled}")
     context = SimpleNamespace(attn_metadata={layer.prefix: metadata})
     monkeypatch.setattr(bailing, "get_forward_context", lambda: context)
     hidden = torch.arange(20, dtype=torch.bfloat16).reshape(2, 10) / 10
     positions = torch.arange(2)
     expected = torch.empty_like(hidden)
     layer(hidden, positions, expected)
-    increments = (1, 2)
+    increments = (1,) if pooled else (1, 2)
     for state, increment in zip(layer.kv_cache, increments, strict=True):
         torch.testing.assert_close(state, torch.full_like(state, increment))
         state.zero_()
@@ -317,9 +389,18 @@ def test_conv_weight_fold_preserves_channels_and_refreshes_after_reload(
     torch.testing.assert_close(fused[:, 0], previous[:, 0] + 1)
 
 
-@pytest.mark.parametrize("missing", ["metadata", "cache", "empty_cache"])
-def test_warmup_does_not_invoke_kda(make_layer, metadata, monkeypatch, missing):
-    layer = make_layer()
+@pytest.mark.parametrize(
+    "missing,pooled",
+    [
+        ("metadata", False),
+        ("metadata", True),
+        ("cache", False),
+        ("empty_cache", False),
+        ("empty_cache", True),
+    ],
+)
+def test_warmup_does_not_invoke_kda(make_layer, metadata, monkeypatch, missing, pooled):
+    layer = make_layer(pooled=pooled)
     if missing == "metadata":
         monkeypatch.setattr(
             bailing,
@@ -329,11 +410,44 @@ def test_warmup_does_not_invoke_kda(make_layer, metadata, monkeypatch, missing):
     elif missing == "cache":
         layer.kv_cache = ()
     else:
-        layer.kv_cache = (torch.empty(0), torch.empty(0))
+        layer.kv_cache = (torch.empty(0),) * (1 if pooled else 2)
     output = torch.full((2, 10), float("nan"), dtype=torch.bfloat16)
     layer(torch.ones(2, 10, dtype=torch.bfloat16), torch.arange(2), output)
     torch.testing.assert_close(output, torch.zeros_like(output))
     layer._tpu_kda_op.assert_not_called()
+    layer._tpu_pooled_kda_op.assert_not_called()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_pooled_forward_rejects_invalid_metadata(make_layer, metadata, streaming):
+    layer = make_layer(pooled=True)
+    if streaming:
+        metadata.sequence_layout_kind = SequenceLayoutKind.PARTIAL.value
+        metadata.sequence_layout_protocol = PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL
+        error, message = NotImplementedError, "PCP streaming"
+    else:
+        metadata.mamba_state_indices = None
+        error, message = RuntimeError, "mamba_state_indices"
+    with pytest.raises(error, match=message):
+        layer(
+            torch.ones(2, 10, dtype=torch.bfloat16),
+            torch.arange(2),
+            torch.empty(2, 10, dtype=torch.bfloat16),
+        )
+    layer._tpu_pooled_kda_op.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    ["BailingMoeV3ForCausalLM", "BailingMoeV3VLForConditionalGeneration"],
+)
+def test_unified_pool_is_enabled_by_default(monkeypatch, architecture):
+    monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+    assert unified_kv_layout_enabled_for_architecture(architecture)
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+    assert unified_kv_layout_enabled_for_architecture(architecture)
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
+    assert not unified_kv_layout_enabled_for_architecture(architecture)
 
 
 def test_forward_rejects_missing_layer_metadata(make_layer, monkeypatch):
@@ -349,6 +463,7 @@ def test_forward_rejects_missing_layer_metadata(make_layer, monkeypatch):
         )
     assert exc_info.value.args == (layer.prefix,)
     layer._tpu_kda_op.assert_not_called()
+    layer._tpu_pooled_kda_op.assert_not_called()
 
 
 def test_registration_keeps_upstream_class_intact(make_layer):

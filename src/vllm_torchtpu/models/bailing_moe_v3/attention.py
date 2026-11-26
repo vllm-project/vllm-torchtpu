@@ -17,7 +17,7 @@ from typing import cast
 
 import torch
 from transformers import PretrainedConfig
-from vllm.config import CacheConfig, ModelConfig
+from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -25,8 +25,12 @@ from vllm.model_executor.models.bailing_moe_v3 import BailingMoeV3KimiDeltaAtten
 
 from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
     build_kimi_dispatched_kda_op,
+    build_kimi_pooled_kda_op,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+from vllm_torchtpu.layers.core.sequence_layout import (
+    is_pcp_streaming_attention_metadata,
+)
 from vllm_torchtpu.utils import fresh_buffer
 
 
@@ -66,6 +70,14 @@ class TpuBailingKimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             lower_bound=self.lower_bound if self.safe_gate else None,
             eps=config.rms_norm_eps,
             state_dim_first=is_conv_state_dim_first(),
+            num_spec_tokens=self.num_speculative_tokens,
+        )
+        self._tpu_pooled_kda_op = build_kimi_pooled_kda_op(
+            self.prefix,
+            lower_bound=self.lower_bound if self.safe_gate else None,
+            eps=config.rms_norm_eps,
+            # The op reads the final manager block size after cache setup.
+            vllm_config=get_current_vllm_config(),
             num_spec_tokens=self.num_speculative_tokens,
         )
 
@@ -125,6 +137,10 @@ class TpuBailingKimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
             core = hidden_states.new_zeros(
                 (hidden_states.shape[0], self.local_num_heads, self.head_dim)
             )
+        elif len(self.kv_cache) == 1:
+            core = self._core_attention_pooled(
+                mixed_qkv, raw_gate, beta, output_gate, self.kv_cache[0], metadata
+            )
         else:
             window_distribution = metadata.mamba_request_distribution
             if window_distribution is None:
@@ -153,3 +169,42 @@ class TpuBailingKimiDeltaAttention(BailingMoeV3KimiDeltaAttention):
                 cast(torch.Tensor, slot_read_offsets),
             )
         output[:] = self.o_proj(core.reshape(hidden_states.shape[0], -1))[0]
+
+    def _core_attention_pooled(
+        self,
+        mixed_qkv: torch.Tensor,
+        raw_gate: torch.Tensor,
+        beta: torch.Tensor,
+        output_gate: torch.Tensor,
+        pool: torch.Tensor,
+        metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        """Read and write conv/recurrent state in the shared attention pool."""
+        if is_pcp_streaming_attention_metadata(metadata):
+            raise NotImplementedError(
+                "Bailing KDA does not support PCP streaming prefill "
+                "with the unified KV pool"
+            )
+        state_indices = metadata.mamba_state_indices
+        if state_indices is None:
+            raise RuntimeError(
+                "Pooled Bailing KDA requires mamba_state_indices in attention metadata"
+            )
+        return self._tpu_pooled_kda_op(
+            mixed_qkv,
+            raw_gate,
+            beta,
+            output_gate,
+            pool,
+            self.tpu_conv_weight_fused,
+            self.A_log.reshape(-1),
+            self.dt_bias,
+            self.o_norm.weight,
+            cast(torch.Tensor, metadata.query_start_loc),
+            cast(torch.Tensor, state_indices),
+            cast(torch.Tensor, metadata.seq_lens),
+            cast(torch.Tensor, metadata.request_distribution),
+            cast(torch.Tensor | None, metadata.mamba_request_distribution),
+            cast(torch.Tensor | None, metadata.mamba_slot_read_offsets),
+            cast(torch.Tensor | None, metadata.mamba_ckpt_indices),
+        )
