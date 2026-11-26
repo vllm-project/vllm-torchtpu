@@ -4110,6 +4110,8 @@ class TPUModelRunner(GPUModelRunner):
             dp_lockstep=True,
         )
 
+    # capture_model warms under no_grad; dynamo guards on grad mode.
+    @torch.no_grad()
     def _run_dp_idle_pairing(self, bucket: int, num_chunks: int) -> None:
         """Pair encoder, target and draft collectives on an idle EP-DP rank."""
         self._execute_dp_mm_encoder()
@@ -5625,6 +5627,8 @@ class TPUModelRunner(GPUModelRunner):
             apply_top_k=self._sampler_applies_top_k(),
         )
 
+    # capture_model warms under no_grad; dynamo guards on grad mode.
+    @torch.no_grad()
     @_pp_step
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
@@ -8111,8 +8115,13 @@ class TPUModelRunner(GPUModelRunner):
             sum(rows),
         )
 
+    @torch.no_grad()
     def capture_model(self) -> None:
-        """Precompile every torch.compile subgraph across all input buckets."""
+        """Precompile every torch.compile subgraph across all input buckets.
+
+        Under no_grad, as serving's execute_model and sample_tokens run:
+        dynamo guards on grad mode, so a graph warmed with grad enabled is
+        traced again on its first serving call."""
         self._add_pipeline_chunk_buckets()
         if self.parallel_config.pipeline_parallel_size > 1 and self._pp_wave is None:
             self._pp_intermediate_tensors(1, zeros=True)
