@@ -291,6 +291,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         cls, vllm_config: VllmConfig
     ) -> tuple[tuple[int, int], tuple[int, int, int]]:
         config = cast(Qwen4ExpTextConfig, vllm_config.model_config.hf_text_config)
+        spec_config = vllm_config.speculative_config
+        num_spec = spec_config.num_speculative_tokens if spec_config is not None else 0
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
             vllm_config.parallel_config.tensor_parallel_size,
             config.linear_num_key_heads,
@@ -298,6 +300,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             config.linear_key_head_dim,
             config.linear_value_head_dim,
             config.linear_conv_kernel_dim,
+            num_spec=num_spec,
         )
 
     @classmethod

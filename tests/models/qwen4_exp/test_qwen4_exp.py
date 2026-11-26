@@ -27,6 +27,7 @@ from vllm.config import CompilationMode
 from vllm.model_executor import parameter as vllm_parameter
 from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers import vocab_parallel_embedding as vpe
+from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
 )
@@ -1096,3 +1097,33 @@ def test_ple_table_finalize_weights_chunks_large_table(
         assert table._weight_chunks is not None
         assert len(table._weight_chunks) > 1
         torch.testing.assert_close(table.local_rows(ids), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4, 8])
+@pytest.mark.parametrize("num_spec", [0, 1, 3])
+def test_mamba_state_shape_includes_num_spec(tp: int, num_spec: int) -> None:
+    text_config = _text_config(
+        linear_num_key_heads=16,
+        linear_num_value_heads=48,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
+    spec = SimpleNamespace(num_speculative_tokens=num_spec) if num_spec > 0 else None
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=text_config),
+        parallel_config=SimpleNamespace(tensor_parallel_size=tp),
+        speculative_config=spec,
+    )
+    got = Qwen4ExpForCausalLM.get_mamba_state_shape_from_config(vllm_config)
+    expected = MambaStateShapeCalculator.gated_delta_net_state_shape(
+        tp,
+        text_config.linear_num_key_heads,
+        text_config.linear_num_value_heads,
+        text_config.linear_key_head_dim,
+        text_config.linear_value_head_dim,
+        text_config.linear_conv_kernel_dim,
+        num_spec=num_spec,
+    )
+    assert got == expected
+    assert got[0][0] == (text_config.linear_conv_kernel_dim - 1) + num_spec
