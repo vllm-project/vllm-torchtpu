@@ -197,6 +197,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_QSA_XMERGE: bool = False
     VLLM_TPU_MK_QSA_UNION_LANEPACK: bool = False
     VLLM_TPU_MK_FP8_DENSE_READ: bool = False
+    VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT: bool = False
     VLLM_TPU_MK_UATTN_LITE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS: str = ""
@@ -1428,6 +1429,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one-row-per-sublane views. Exact: same bytes, same FP8 / BF16 values. Read by
     # `qsa_attn.block.fp8_dense_read` (trace time).
     "VLLM_TPU_MK_FP8_DENSE_READ": env_bool("VLLM_TPU_MK_FP8_DENSE_READ"),
+    # Whole-step megakernel QSA selection: the threshold / tie-break count passes compare int16
+    # halves of the score bit patterns / ids (two groups per 32-bit lane; early exit included),
+    # and the row and union compactions run lane-major over the output slots (in-row ranks
+    # transposed from the MXU, no per-slot lane reductions or output transposes). Exact: same
+    # thresholds, ids, codes and order. Read by `QSAFullIndexedBlock`.
+    "VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT": env_bool("VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT"),
     # Whole-step megakernel union attention: per-tile op cuts (`attend_request`'s `lite`): one
     # code-expand matmul per tile instead of two, and under main-KV DCP one select for V's NaN
     # sanitize + scale with no length mask. Exact: same scores, p and PV terms bit for bit.
