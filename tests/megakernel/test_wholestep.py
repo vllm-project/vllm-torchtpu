@@ -295,7 +295,7 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
            skip_idle: bool = False, xmerge: bool = False, key_mp: int = 0, key_slots: int = 2,
            req_async: int = 0, nvis_balance: bool = False, uattn_lite: bool = False,
            key_lanes: int = 0, export: bool = False, select_nvis: int = 0,
-           nvis_rows: tuple | None = None, phys_mxu: bool = False):
+           nvis_rows: tuple | None = None, phys_mxu: int = 0):
     from vllm_torchtpu.megakernel.wholestep.qsa_full_b import DBG_IDS, DBG_IQ
     from vllm_torchtpu.megakernel.wholestep.qsa_full_c import (
         CK_NEW,
@@ -344,7 +344,8 @@ def _run_c(key: int = 17, T: int = 4, long: bool = False, shard: bool = False, r
                    **(dict(uattn_lite=True) if uattn_lite else {}),
                    **(dict(select_nvis=select_nvis) if select_nvis else {}),
                    **(dict(nvis_rows=nvis_rows) if nvis_rows else {}),
-                   **(dict(union_phys_mxu=pps) if phys_mxu else {}))
+                   **(dict(union_phys_mxu=pps) if phys_mxu else {}),
+                   **(dict(union_phys_one=True) if phys_mxu == 2 else {}))
     spec = wholestep_spec(
         G,
         R,
@@ -804,6 +805,31 @@ def test_physical_ids_scan_only_the_visible_table_chunks():
                 assert not np.array_equal(run(n_tab - 1), want)
 
 
+def test_physical_ids_one_matmul_equals_the_vector_pass():
+    """`wholephysmxu=2`: `physical_ids_one` (one matmul over the whole byte-split row)
+    equals the vector pass for every id below the row's columns, 1-4 byte entries; a row
+    one 128-lane chunk short misses the ids of the last chunk."""
+    from vllm_torchtpu.megakernel.wholestep import union_attn as ua
+
+    rng = np.random.default_rng(2)
+    for per_page, pps, dcp, nbytes in ((128, 512, 1, 3), (128, 256, 2, 3), (32, 384, 1, 4),
+                                       (128, 128, 1, 1), (4, 256, 2, 2)):
+        hi = min(1 << (8 * nbytes), 1 << 30)
+        tab = rng.integers(0, hi, (1, pps)).astype(np.int32)
+        tab[0, :2] = (0, hi - 1)
+        cs = per_page.bit_length() - 1 + dcp.bit_length() - 1
+        ids = rng.integers(0, pps << cs, (1, 128)).astype(np.int32)
+        ids[0, :3] = (0, (pps << cs) - 1, ((pps - 1) << cs))
+        want = np.asarray(ua.physical_ids(jnp.asarray(ids), jnp.asarray(tab), per_page, dcp))
+        tb = ua.table_byte_rows(jnp.asarray(tab), nbytes)
+        got = np.asarray(ua.physical_ids_one(jnp.asarray(ids), tb, per_page, dcp, nbytes))
+        np.testing.assert_array_equal(got, want, err_msg=f"{per_page} {pps} {dcp} {nbytes}")
+        if pps > 128:
+            short = ua.table_byte_rows(jnp.asarray(tab[:, : pps - 128]), nbytes)
+            bad = np.asarray(ua.physical_ids_one(jnp.asarray(ids), short, per_page, dcp, nbytes))
+            assert not np.array_equal(bad, want)
+
+
 # `wholephysmxu` on the full kernel needs a 128-lane-multiple table row: max_groups 4096
 # (pps 128, one chunk) and 8192 with a context past 128 columns of 32 groups (pps 256, two).
 PHYS_MXU_CASES = [
@@ -820,16 +846,17 @@ def test_union_physical_ids_mxu_bit_identical(kw):
     import gc
 
     outs = []
-    for arm in (dict(), dict(phys=True), dict(phys_mxu=True)):
+    for arm in (dict(), dict(phys=True), dict(phys_mxu=1), dict(phys_mxu=2)):
         res = _run_c(long=True, rank_ids=True, union=True, **arm, **kw)
         outs.append([res[i] for i in (0, 3, 4, 7)])
         del res
         jax.clear_caches()  # one compiled step at a time (CPU memory)
         gc.collect()
-    base, phys, run = outs
+    base, phys, run, one = outs
     for j, name in enumerate(("residual", "ck_new", "ring_new", "ids")):
         np.testing.assert_array_equal(run[j], base[j], err_msg=f"{name} {kw}")
         np.testing.assert_array_equal(run[j], phys[j], err_msg=f"{name} phys {kw}")
+        np.testing.assert_array_equal(one[j], base[j], err_msg=f"{name} one {kw}")
 
 
 def test_union_physical_ids_mxu_short_scan_is_caught(monkeypatch):
@@ -840,7 +867,7 @@ def test_union_physical_ids_mxu_short_scan_is_caught(monkeypatch):
     kw = dict(long=True, rank_ids=True, union=True, max_groups=4096)
     base = _run_c(**kw)
     monkeypatch.setattr(ua, "table_chunks", lambda *a, **k: jnp.int32(0))
-    run = _run_c(**kw, phys_mxu=True)
+    run = _run_c(**kw, phys_mxu=1)
     with pytest.raises(AssertionError):
         np.testing.assert_array_equal(run[0], base[0])
 

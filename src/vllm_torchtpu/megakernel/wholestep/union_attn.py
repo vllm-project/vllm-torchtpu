@@ -374,6 +374,32 @@ def physical_ids(
     return jnp.transpose(jnp.broadcast_to(phys, (128, 128)))[0:1, :]
 
 
+def table_byte_rows(tab: jax.Array, table_bytes: int) -> jax.Array:
+    """`[8, K]` BF16 LHS of `physical_ids_one`: row k holds byte k of each entry of the table
+    row `tab [1, K]` (rows past `table_bytes` zero); bytes are exact in BF16."""
+    assert 1 <= table_bytes <= 4, table_bytes
+    byte = jax.lax.broadcasted_iota(I32, (8, tab.shape[1]), 0)
+    t = jnp.broadcast_to(tab, (8, tab.shape[1]))
+    return jnp.where(byte < table_bytes, (t >> (8 * byte)) & 255, 0).astype(F32).astype(BF16)
+
+
+def physical_ids_one(
+    ids: jax.Array, tb: jax.Array, per_page: int, dcp: int, table_bytes: int
+) -> jax.Array:
+    """`physical_ids` of `ids [1, 128]` in one MXU matmul over the whole copied row: `tb` =
+    `table_byte_rows(row [1, K])`, times the one-hot `[column, id]` matrix `[K, 128]` (one
+    nonzero byte term per sum: exact in F32). Equals the vector pass for ids whose column is
+    below `K`."""
+    shift = per_page.bit_length() - 1
+    cshift = shift + dcp.bit_length() - 1
+    hot = (ids >> cshift == jax.lax.broadcasted_iota(I32, (tb.shape[1], 128), 0))
+    acc = jnp.dot(tb, hot.astype(F32).astype(BF16), preferred_element_type=F32).astype(I32)
+    page = acc[0:1]
+    for k in range(1, table_bytes):
+        page = page + (acc[k : k + 1] << (8 * k))
+    return page * per_page + (ids & (per_page - 1))
+
+
 def table_chunks(n_vis: Any, per_page: int, dcp: int, width: int) -> Any:
     """128-lane chunks of a `width`-column page-table row holding the columns of groups
     `< n_vis` (at least one)."""

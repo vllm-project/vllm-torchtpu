@@ -100,9 +100,9 @@ def main():
                     help="per-request work in a fori_loop (VLLM_TPU_MEGAKERNEL wholeloop=1)")
     ap.add_argument("--phys", action="store_true",
                     help="union ids -> physical page ids per request (VLLM_TPU_MEGAKERNEL wholephys=1)")
-    ap.add_argument("--phys-mxu", action="store_true",
+    ap.add_argument("--phys-mxu", type=int, default=0, choices=(0, 1, 2),
                     help="main call: prefetched table rows, MXU physical ids, micro-page rows "
-                    "(VLLM_TPU_MEGAKERNEL wholephysmxu=1)")
+                    "(VLLM_TPU_MEGAKERNEL wholephysmxu=N; 2: one matmul per 128 ids)")
     ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
     ap.add_argument("--key-mp", type=int, default=0,
                     help="key-stream kernel pages per DMA (VLLM_TPU_MEGAKERNEL wholekeymp=N; needs "
