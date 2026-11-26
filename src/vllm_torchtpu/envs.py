@@ -337,6 +337,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG: str = ""
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
+    TPU_MINIMAX_M3_DCP_KV_GATHER_HEAD_MAJOR: bool = False
     TPU_MINIMAX_M3_DCP_HP_ROUND_LADDER: str = ""
     TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A: bool = False
@@ -2279,6 +2280,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # group (one chip's cores). Same outputs bit for bit.
     "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT": env_bool(
         "TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT", default=False
+    ),
+    # MiniMax M3 MSA DCP over several KV heads: gather the group's K/V/index
+    # queries lane-dense ([T, 3 * D] rows) and hand the scoring op the
+    # gathered rows head-major (a free view) instead of three token-major
+    # [T, G, D] copies; the op splits them. Same values bit for bit; drops
+    # the relayout copies at the op boundary (export.py copy_/reshape,
+    # ~0.18 ms per layer at c64 DCP8 8K steps). Default off.
+    "TPU_MINIMAX_M3_DCP_KV_GATHER_HEAD_MAJOR": env_bool(
+        "TPU_MINIMAX_M3_DCP_KV_GATHER_HEAD_MAJOR", default=False
     ),
     # MiniMax M3 DCP attention over several KV heads (`msa_dcp_heads`): steps
     # of at most this many rows merge the ranks' partials by one all-to-all
