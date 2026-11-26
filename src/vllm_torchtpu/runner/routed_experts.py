@@ -15,7 +15,7 @@
 
 import math
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -161,6 +161,8 @@ class PendingRoutedExperts:
 
     pending_aux_output: PendingAuxOutput
     snapshot: HostSnapshot
+    # [num_reqs] draft tokens each request verified this step, in step order.
+    num_drafts: np.ndarray
 
     def process_output(
         self, sampled_token_ids: list[list[int]]
@@ -169,10 +171,7 @@ class PendingRoutedExperts:
         tokens in step order (none for a partial prefill)."""
         self.snapshot.wait()
         num_sampled = np.array([len(tokens) for tokens in sampled_token_ids])
-        # TODO(haotianx): Count each request's draft tokens once speculative
-        # decoding is supported. Until then no request has any.
-        num_drafts = np.zeros_like(num_sampled)
-        num_rejected = num_rejected_rows(num_drafts, num_sampled)
+        num_rejected = num_rejected_rows(self.num_drafts, num_sampled)
         # Called here rather than right after sampling, because the sampled
         # counts are only known now. The rows are already on the host, so its
         # copy to the host does nothing.
@@ -211,6 +210,7 @@ class RoutedExpertsCapture:
             f"{_RESERVED_ID_DTYPE} ids"
         )
         use_capturer(self._connector, model, self._capturer)
+        self._step_has_metadata = False
 
     def check_forward(self, num_padded_tokens: int) -> None:
         """Checks that the warmup forward that just ran wrote every MoE
@@ -224,6 +224,10 @@ class RoutedExpertsCapture:
 
     def begin_step(self, metadata: AuxOutputConnectorMetadata | None) -> None:
         self._connector.begin_step(metadata)
+        # Steps the scheduler did not build, such as those of the speculative
+        # decoding warmup, carry no metadata, and vLLM's connector takes no
+        # snapshot of them.
+        self._step_has_metadata = metadata is not None
 
     def take_forward(self, num_padded_tokens: int, num_tokens: int) -> None:
         """Takes the expert ids of the forward that just ran, which come after
@@ -233,12 +237,19 @@ class RoutedExpertsCapture:
             num_padded_tokens: the forward's token bucket.
             num_tokens: its real tokens.
         """
-        self._capturer.take_forward(num_padded_tokens, num_tokens)
+        if self._step_has_metadata:
+            self._capturer.take_forward(num_padded_tokens, num_tokens)
+        else:
+            # The forward is checked but its table is not copied to the host.
+            # No snapshot would wait for that copy, so the table could be
+            # freed while the copy still reads it.
+            self._capturer.check_forward(num_padded_tokens)
 
     def prepare_output(
         self,
         req_ids: list[str],
         num_scheduled_tokens: Mapping[str, int],
+        scheduled_spec_decode_tokens: Mapping[str, Sequence[int]],
         token_starts: np.ndarray,
     ) -> PendingRoutedExperts | None:
         """Takes the step's snapshot; None on a rank that does not publish.
@@ -246,9 +257,18 @@ class RoutedExpertsCapture:
         Args:
             req_ids: the step's requests, in the order its forwards ran them.
             num_scheduled_tokens: each request's tokens this step.
+            scheduled_spec_decode_tokens: each request's draft tokens this
+                step; a request without drafts may be missing.
             token_starts: [num_reqs] position of each request's first row.
         """
         num_tokens = [num_scheduled_tokens[req_id] for req_id in req_ids]
+        # Counted as the scheduler counts them when it rolls back the rejected
+        # drafts (`Scheduler.update_from_output`), so the rows vLLM's connector
+        # keeps for each request end where the scheduler's next step starts.
+        num_drafts = np.array(
+            [len(scheduled_spec_decode_tokens.get(req_id, ())) for req_id in req_ids],
+            dtype=np.int32,
+        )
         # Start row of each request in the step's snapshot, which holds the
         # rows of every forward in the step.
         query_start_loc = np.cumsum([0, *num_tokens], dtype=np.int32)
@@ -259,7 +279,9 @@ class RoutedExpertsCapture:
         pending_aux_output = self._connector.prepare_output(input_batch)
         if pending_aux_output is None:
             return None
-        return PendingRoutedExperts(pending_aux_output, self._capturer.take_snapshot())
+        return PendingRoutedExperts(
+            pending_aux_output, self._capturer.take_snapshot(), num_drafts
+        )
 
     def close(self) -> None:
         """Closes vLLM's connector, which stops its background writer thread."""
