@@ -2598,15 +2598,19 @@ def _mlp_kernel(
         @pl.when(num_gm > 0)
         def _():
             fetch_rows(0)
+            # The first rows (and the scales) are in before the first weights
+            # start: issued behind them, the first rows' copy completed only
+            # after the first expert's ~25 MB of weights (j-b2022c4a).
+            with jax.named_scope("wave_rows_wait"):
+                wave_rows_copy(0).wait()
+                scale_copy.wait()
             start_first_weights(metadata_ref.gm_id_to_group_id[0])
 
         def step(gm_id, carry):
-            with jax.named_scope("wave_rows_wait"):
-                wave_rows_copy(gm_id).wait()
-
-                @pl.when(gm_id == 0)
-                def _():
-                    scale_copy.wait()
+            @pl.when(gm_id > 0)
+            def _():
+                with jax.named_scope("wave_rows_wait"):
+                    wave_rows_copy(gm_id).wait()
 
             with jax.named_scope("wave_convert"):
                 convert_rows(gm_id)
