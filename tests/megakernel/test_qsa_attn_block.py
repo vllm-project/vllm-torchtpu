@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pytest
 from jax.experimental import pallas as pl
@@ -32,6 +33,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.megakernel.blocks.qsa_attn.block import (
     MICRO,
     TILE,
+    _unpack_kv,
     attend_row,
     reference_rows,
 )
@@ -277,3 +279,103 @@ def test_recent_tokens_merge_like_pool_tokens(fold):
     assert float(np.abs(got[0]).mean()) > 1e-2  # recent only: attended
     np.testing.assert_allclose(got, want, atol=2e-2, rtol=2e-2)
     assert float(np.abs(got - want).mean()) < 2e-3
+
+
+# ----------------------------------------- VLLM_TPU_MK_FP8_DENSE_READ (`_unpack_kv`)
+def _slot_with_all_pairs(off: int, rows: int = TILE) -> np.ndarray:
+    """Raw `[rows, 1, 4, DIM]` bytes: pair `off`'s K / V take every byte pair."""
+    raw = np.random.default_rng(31 + off).integers(0, 256, (rows, 1, 4, DIM), np.uint8)
+    pairs = np.arange(rows * DIM) % 65536
+    raw[:, 0, 2 * off] = (pairs & 0xFF).reshape(rows, DIM)
+    raw[:, 0, 2 * off + 1] = (pairs >> 8).reshape(rows, DIM)
+    return raw
+
+
+def _unpacked(
+    raw: np.ndarray, off: int, unpack, interpret: bool = True
+) -> tuple[np.ndarray, np.ndarray]:
+    def kernel(off_ref, slot_ref, k_ref, v_ref):
+        k8, v8 = unpack(slot_ref, off_ref[0])
+        k_ref[...] = k8.astype(jnp.float32)
+        v_ref[...] = v8.astype(jnp.float32)
+
+    out = jax.ShapeDtypeStruct((raw.shape[0], DIM), jnp.float32)
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    k, v = pl.pallas_call(
+        kernel,
+        out_shape=(out, out),
+        in_specs=[smem, vmem],
+        out_specs=(vmem, vmem),
+        interpret=interpret,
+    )(jnp.asarray([off], jnp.int32), jnp.asarray(raw).view(jnp.float8_e4m3fn))
+    return np.asarray(k), np.asarray(v)
+
+
+@pytest.mark.parametrize("off", [0, 1])
+def test_unpack_kv_dense_bit_identical_over_all_byte_pairs(off):
+    """Every (K, V) FP8 byte pair, NaN included: the dense split is bit-identical to the
+    bytewise unpack and equal to the FP8 values (a traced `off`, as the kernels pass it)."""
+    raw = _slot_with_all_pairs(off)
+    got = _unpacked(raw, off, lambda ref, o: _unpack_kv(ref, o, True, dense=True))
+    old = _unpacked(raw, off, lambda ref, o: _unpack_kv(ref, o, True, dense=False))
+    for c, g, o in zip((2 * off, 2 * off + 1), got, old):
+        np.testing.assert_array_equal(g.view(np.uint32), o.view(np.uint32))
+        want = raw[:, 0, c].view(ml_dtypes.float8_e4m3fn).astype(np.float32)
+        np.testing.assert_array_equal(g, want)  # NaN == NaN here
+
+
+def test_unpack_kv_dense_flag(monkeypatch):
+    """`dense=None` follows VLLM_TPU_MK_FP8_DENSE_READ (default off)."""
+    from vllm_torchtpu.megakernel.blocks.qsa_attn import block
+
+    monkeypatch.delenv("VLLM_TPU_MK_FP8_DENSE_READ", raising=False)
+    assert not block.fp8_dense_read()
+    monkeypatch.setenv("VLLM_TPU_MK_FP8_DENSE_READ", "1")
+    assert block.fp8_dense_read()
+    raw = _slot_with_all_pairs(1)
+    got = _unpacked(raw, 1, lambda ref, o: _unpack_kv(ref, o, True))
+    old = _unpacked(raw, 1, lambda ref, o: _unpack_kv(ref, o, True, dense=False))
+    for g, o in zip(got, old):
+        np.testing.assert_array_equal(g.view(np.uint32), o.view(np.uint32))
+
+
+@pytest.mark.parametrize("off,rows", [(0, TILE), (1, TILE), (1, MICRO)])
+def test_unpack_kv_dense_tpu_path_matches(off, rows):
+    """On device, the strided dense-row read gives the stock read's bits."""
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("needs a TPU")
+    raw = _slot_with_all_pairs(off, rows)
+    got = _unpacked(raw, off, lambda ref, o: _unpack_kv(ref, o, False, dense=True), False)
+    old = _unpacked(raw, off, lambda ref, o: _unpack_kv(ref, o, False, dense=False), False)
+    want = _unpacked(raw, off, lambda ref, o: _unpack_kv(ref, o, True, dense=False))
+    for g, o, w in zip(got, old, want):
+        np.testing.assert_array_equal(g.view(np.uint32), o.view(np.uint32))
+        np.testing.assert_array_equal(g.view(np.uint32), w.view(np.uint32))
+
+
+@pytest.mark.parametrize("W", [128, 256])
+def test_fp8_carrier_dense_key_read_tpu(W):
+    """On device, the key stream's dense read (`QSAFullIndexedBlock._consume` under
+    VLLM_TPU_MK_FP8_DENSE_READ) gives the stock ref-bitcast read's BF16 keys bit for bit."""
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("needs a TPU")
+    CH = 4
+    CG = CH * 32
+    raw = np.random.default_rng(7).integers(0, 256, (CH, 16, 4, W), np.uint8)
+
+    def kernel(slot_ref, old_ref, new_ref):
+        old = slot_ref.bitcast(jnp.bfloat16)[...].reshape(CG, W)[:, :128]
+        wrows = slot_ref.bitcast(jnp.int32).reshape(CG // 2 * (W // 128), 128)
+        words = wrows[pl.ds(0, CG // 2, stride=W // 128)] if W > 128 else wrows[...]
+        old_ref[...] = old
+        new_ref[...] = pltpu.bitcast(words, jnp.bfloat16)
+
+    out = jax.ShapeDtypeStruct((CG, 128), jnp.bfloat16)
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    old, new = pl.pallas_call(
+        kernel, out_shape=(out, out), in_specs=[vmem], out_specs=(vmem, vmem)
+    )(jnp.asarray(raw).view(jnp.float8_e4m3fn))
+    old, new = np.asarray(old).view(np.uint16), np.asarray(new).view(np.uint16)
+    np.testing.assert_array_equal(old, new)
+    assert len(np.unique(old)) > 1000  # random keys: a wrong row order would show

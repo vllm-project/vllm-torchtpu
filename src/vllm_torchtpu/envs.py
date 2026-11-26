@@ -196,6 +196,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_AR_HIER_SMALL: bool = False
     VLLM_TPU_MK_QSA_XMERGE: bool = False
     VLLM_TPU_MK_QSA_UNION_LANEPACK: bool = False
+    VLLM_TPU_MK_FP8_DENSE_READ: bool = False
     VLLM_TPU_MK_UATTN_LITE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE: bool = False
     VLLM_TPU_MK_WHOLE_SKIP_IDLE_BUCKETS: str = ""
@@ -1422,6 +1423,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rows into one (`_nvis_union`), scanning half the rows instead of all of them under an
     # owner mask. Exact: same union ids, codes, order and count. Read by `QSAFullIndexedBlock`.
     "VLLM_TPU_MK_QSA_UNION_LANEPACK": env_bool("VLLM_TPU_MK_QSA_UNION_LANEPACK"),
+    # Whole-step megakernel QSA: FP8 ring slots (union attention K/V, the key stream's FP8
+    # carrier) are read as dense 32-bit word rows and split / bitcast in registers instead of
+    # one-row-per-sublane views. Exact: same bytes, same FP8 / BF16 values. Read by
+    # `qsa_attn.block.fp8_dense_read` (trace time).
+    "VLLM_TPU_MK_FP8_DENSE_READ": env_bool("VLLM_TPU_MK_FP8_DENSE_READ"),
     # Whole-step megakernel union attention: per-tile op cuts (`attend_request`'s `lite`): one
     # code-expand matmul per tile instead of two, and under main-KV DCP one select for V's NaN
     # sanitize + scale with no length mask. Exact: same scores, p and PV terms bit for bit.
