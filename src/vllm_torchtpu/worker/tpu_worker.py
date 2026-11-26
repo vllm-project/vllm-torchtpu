@@ -808,6 +808,9 @@ class TPUWorker(WorkerBase):
         # from scanning those objects mid-step.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
+        # As vLLM's engine core does here: no environment overrides from now on,
+        # so the per-step reads of vllm_torchtpu.envs stop re-parsing os.environ.
+        envs.enable_envs_cache()
         _release_free_host_heap()
         if envs.VLLM_TPU_CPU_PIN != "off":
             from vllm_torchtpu.worker import cpu_pinning
