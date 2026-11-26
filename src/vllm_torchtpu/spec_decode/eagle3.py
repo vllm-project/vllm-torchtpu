@@ -240,6 +240,9 @@ class Eagle3Proposer:
         self._draft_tp_matches_target = draft_tp == target_tp
         # Lazily resolved by _draft_has_moe once the draft model exists.
         self._draft_has_moe_cache: bool | None = None
+        # HC streams in the target hidden state the draft consumes. Above 1 when
+        # an MTP target emits its multi-stream residual; set in load_model.
+        self._hc_mult = 1
         logger.info(
             "%s draft parallelism: %s (draft_tp=%s).",
             self.speculative_config.method,
@@ -347,6 +350,8 @@ class Eagle3Proposer:
             set_eagle3_aux_hidden_state_layers(target_model, self.speculative_config)
 
         if self.speculative_config.method == "mtp":
+            if getattr(target_model, "mtp_emits_aux_hidden_state", False):
+                self._hc_mult = self._target_hc_mult()
             self._setup_gemma4_kv_sharing(target_model, target_attn_layer_names)
 
         self._validate_mtp_layer_count()
@@ -1286,6 +1291,11 @@ class Eagle3Proposer:
                         target_hidden_states = self.draft_model.combine_hidden_states(
                             chunk.hidden_states
                         )
+                elif self._hc_mult > 1:
+                    # The target's one aux tensor is its [T, hc_mult * H]
+                    # residual before the HC mix (upstream's
+                    # get_mtp_target_hidden_states() buffer, returned instead).
+                    (target_hidden_states,) = chunk.aux_hidden_states
                 else:
                     # MTP: does not use combine_hidden_states
                     target_hidden_states = chunk.hidden_states
@@ -2192,6 +2202,25 @@ class Eagle3Proposer:
             )
         return hidden_size
 
+    def _target_hc_mult(self) -> int:
+        """HC stream count of an MTP target that emits its residual.
+
+        vLLM's SpeculativeConfig writes it to the draft's hf_config as
+        `hc_mult` (from the target's `hc_count` for Qwen4Exp).
+        """
+        draft_hf_config = self.speculative_config.draft_model_config.hf_config
+        hc_mult = getattr(draft_hf_config, "hc_mult", None)
+        if not isinstance(hc_mult, int) or hc_mult < 2:
+            raise ValueError(
+                "An MTP target with mtp_emits_aux_hidden_state needs a draft "
+                f"config with an integer hc_mult >= 2, got {hc_mult=}."
+            )
+        return hc_mult
+
+    def _draft_input_hidden_size(self) -> int:
+        """Width of the hidden state fed to the draft forward and loop carry."""
+        return self._draft_hidden_size() * self._hc_mult
+
     def _draft_uses_aux_hidden_state(self) -> bool:
         """Whether this draft checkpoint feeds combine_hidden_states the
         concatenation of several target aux hidden-state layers.
@@ -2387,8 +2416,9 @@ class Eagle3Proposer:
             if runner.uses_mrope
             else token_positions
         )
+        draft_input_hidden = self._draft_input_hidden_size()
         target_hidden_states = torch.zeros(
-            (bucket, self._draft_hidden_size()),
+            (bucket, draft_input_hidden),
             dtype=runner._hidden_states_dtype,
             device=runner.device,
         )
@@ -2466,7 +2496,7 @@ class Eagle3Proposer:
                 device=runner.device,
             ),
             loop_hidden=torch.zeros(
-                (p, draft_hidden), dtype=dtype, device=runner.device
+                (p, draft_input_hidden), dtype=dtype, device=runner.device
             ),
             # Loop-step metadata mirrors propose()'s per-chunk loop tensors.
             loop_query_start_loc=torch.from_numpy(
