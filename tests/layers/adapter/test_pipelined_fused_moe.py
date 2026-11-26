@@ -1422,3 +1422,14 @@ def test_fixed_chunk_buckets_scales_for_sequence_parallel_moe(monkeypatch):
     with pfm.fixed_moe_collection_chunks([16, 32, 64, 512, 4096]):
         assert pfm.collection_chunks(512, 8, is_sequence_parallel=True) == (2, 256)
         assert pfm.collection_chunks(2, 8, is_sequence_parallel=True) == (2, 1)
+
+    # All buckets smaller than tp_size are filtered out -> fall back to 1 chunk.
+    with pfm.fixed_moe_collection_chunks([2, 4]):
+        assert pfm.collection_chunks(4, 8, is_sequence_parallel=True) == (1, 4)
+
+    # DP=2, TP=4, EP=8: scaling uses tp_size (4), not parallel_size (8), so
+    # local shard lengths are [4, 8, ..., 1024] and max global = 8192 -> 4 chunks.
+    monkeypatch.setattr(pfm, "get_tp_group", lambda: _MockCollectiveGroup(4, 0))
+    with pfm.fixed_moe_collection_chunks([16, 32, 64, 512, 4096]):
+        assert pfm.collection_chunks(1024, 8, is_sequence_parallel=True) == (4, 256)
+        assert pfm.collection_chunks(4, 8, is_sequence_parallel=True) == (4, 1)

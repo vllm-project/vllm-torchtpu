@@ -262,7 +262,7 @@ def pipelined_fused_moe_gmm(
         # Each chunk holds rows gathered from several ranks, so one local
         # valid-row count would drop real rows of the other ranks.
         raise NotImplementedError(
-            "pipelined_fused_moe_gmm does not support row_info (chunked DP/PCP "
+            "pipelined_fused_moe_gmm does not support row_info (chunked DP/PCP/EP "
             "layouts cannot reuse a single local valid-row count)."
         )
     collective_group, collective_kind = _get_moe_collective_group(
