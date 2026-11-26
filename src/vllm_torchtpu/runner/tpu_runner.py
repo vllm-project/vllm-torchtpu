@@ -6540,7 +6540,12 @@ class TPUModelRunner(GPUModelRunner):
             lora_slot_write=self.lora_slot_write_hbm_bytes(),
             pp_handoff=self.pp_handoff_hbm_reserve_bytes(),
             routed_experts=routed_experts.hbm_reserve_bytes(
-                self.vllm_config, self.num_tokens_paddings
+                self.vllm_config,
+                self.num_tokens_paddings,
+                # A max-model-len forward holds the fewest requests.
+                max_forwards_per_step=cdiv(
+                    self.max_num_reqs, self.num_reqs_max_model_len
+                ),
             ),
         )
 

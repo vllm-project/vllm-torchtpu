@@ -299,9 +299,10 @@ def _build_mock_cpu_runner(
     runner.pcp_manager = None
     runner.lora_slot_write_hbm_bytes.return_value = 0
     runner.pp_handoff_hbm_reserve_bytes.return_value = 0
-    # Dummy value. post_profile_hbm_reserves reads it to size the
+    # Dummy values. post_profile_hbm_reserves reads them to size the
     # routed-experts reserve, which is 0 because capture is off.
     runner.num_tokens_paddings = []
+    runner.num_reqs_max_model_len = 1
     runner.post_profile_hbm_reserves = TPUModelRunner.post_profile_hbm_reserves.__get__(
         runner
     )

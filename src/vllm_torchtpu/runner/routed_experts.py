@@ -42,6 +42,7 @@ from vllm_torchtpu.layers.adapter.routed_experts_capturer import (
     HostSnapshot,
     TPURoutedExpertsCapturer,
 )
+from vllm_torchtpu.utils import dp_engines_in_lockstep
 
 # The widest dtype vLLM's capturer stores expert ids in.
 _RESERVED_ID_DTYPE = torch.uint16
@@ -56,18 +57,23 @@ def _row_size(vllm_config: VllmConfig) -> int:
     )
 
 
-def hbm_reserve_bytes(vllm_config: VllmConfig, token_paddings: list[int]) -> int:
+def hbm_reserve_bytes(
+    vllm_config: VllmConfig, token_paddings: list[int], max_forwards_per_step: int
+) -> int:
     """HBM the capture takes after the memory profile; 0 without capture.
 
     The larger of two: vLLM's int32 table of `max_num_batched_tokens` rows,
     which lives until `use_capturer` swaps in our capturer, and our forward
     tables. Serving keeps a step's tables until its output is processed, for
-    up to `max_concurrent_batches` steps. On top of those, `device_buffer`
-    keeps the latest forward's table until the next forward returns, which
-    in warmup holds two tables of the largest bucket at once. The tables are
-    counted at the widest output dtype, and on every rank: only the first TP
-    rank keeps them, but vLLM sizes every rank's KV cache by the smallest
-    budget.
+    up to `max_concurrent_batches` steps. When EP couples the DP engines,
+    every forward of a step is padded to the bucket of the engine with the
+    most tokens that step, so each of the step's forwards, at most
+    `max_forwards_per_step`, is counted at the largest bucket. On top of
+    those, `device_buffer` keeps the latest forward's table until the next
+    forward returns, which in warmup holds two tables of the largest bucket
+    at once. The tables are counted at the widest output dtype, and on every
+    rank: only the first TP rank keeps them, but vLLM sizes every rank's KV
+    cache by the smallest budget.
     """
     if not vllm_config.aux_output_config.enabled:
         return 0
@@ -76,31 +82,35 @@ def hbm_reserve_bytes(vllm_config: VllmConfig, token_paddings: list[int]) -> int
     max_num_batched_tokens = scheduler_config.max_num_batched_tokens
     max_num_seqs = scheduler_config.max_num_seqs
     vllm_table_bytes = torch.int32.itemsize * max_num_batched_tokens * row_size
-    # The scheduler stops a step at the smaller of the two token budgets, and
-    # startup checks only that one against `compile_sizes`.
-    step_tokens = max_num_batched_tokens
-    max_num_scheduled_tokens = scheduler_config.max_num_scheduled_tokens
-    if max_num_scheduled_tokens is not None:
-        step_tokens = min(step_tokens, max_num_scheduled_tokens)
-    # A step's tables, bounded two ways, since each forward runs at least one
-    # request. First, each table holds its bucket's rows: the smallest bucket,
-    # or less than R times its tokens, where R is the largest ratio between
-    # neighboring buckets. Rounded up; with one bucket, every forward pads to
-    # it, which `max_num_seqs * token_paddings[0]` already counts.
-    padded_tokens = max(
-        (
-            -(-larger * step_tokens // smaller)
-            for smaller, larger in zip(token_paddings, token_paddings[1:])
-        ),
-        default=0,
-    )
-    rows_by_ratio = padded_tokens + max_num_seqs * token_paddings[0]
-    # Second, no forward has more tokens than the step, so none pads past the
-    # bucket that holds `step_tokens`. This bound is the tighter one when the
-    # buckets are far apart.
-    step_bucket = min(size for size in token_paddings if size >= step_tokens)
-    rows_by_forwards = max_num_seqs * step_bucket
-    step_rows = min(rows_by_ratio, rows_by_forwards)
+    if dp_engines_in_lockstep(vllm_config.parallel_config):
+        step_rows = max_forwards_per_step * token_paddings[-1]
+    else:
+        # The scheduler stops a step at the smaller of the two token budgets,
+        # and startup checks only that one against `compile_sizes`.
+        step_tokens = max_num_batched_tokens
+        max_num_scheduled_tokens = scheduler_config.max_num_scheduled_tokens
+        if max_num_scheduled_tokens is not None:
+            step_tokens = min(step_tokens, max_num_scheduled_tokens)
+        # A step's tables, bounded two ways, since each forward runs at least
+        # one request. First, each table holds its bucket's rows: the smallest
+        # bucket, or less than R times its tokens, where R is the largest
+        # ratio between neighboring buckets. Rounded up; with one bucket,
+        # every forward pads to it, which `max_num_seqs * token_paddings[0]`
+        # already counts.
+        padded_tokens = max(
+            (
+                -(-larger * step_tokens // smaller)
+                for smaller, larger in zip(token_paddings, token_paddings[1:])
+            ),
+            default=0,
+        )
+        rows_by_ratio = padded_tokens + max_num_seqs * token_paddings[0]
+        # Second, no forward has more tokens than the step, so none pads past
+        # the bucket that holds `step_tokens`. This bound is the tighter one
+        # when the buckets are far apart.
+        step_bucket = min(size for size in token_paddings if size >= step_tokens)
+        rows_by_forwards = max_num_seqs * step_bucket
+        step_rows = min(rows_by_ratio, rows_by_forwards)
     largest_bucket = token_paddings[-1]
     rows = (
         max(vllm_config.max_concurrent_batches * step_rows, largest_bucket)
@@ -142,6 +152,39 @@ def _moe_layer_ids(model: torch.nn.Module) -> list[int]:
             "write the same column of the routed-experts table."
         )
     return sorted(layer_ids)
+
+
+def _gathered_dp_rows(model: torch.nn.Module) -> tuple[int, int]:
+    """How many DP ranks' rows each MoE layer's capture hook receives, and
+    which of them are this rank's.
+
+    With DP and EP, vLLM gathers every DP rank's rows before it calls the MoE
+    method, unless the method gathers them itself after `route()`. The
+    capturer keeps one count for all layers, so a model whose layers differ is
+    rejected: under TPU_MOE_FP8_ALL_GATHER the FP8 method gathers the rows
+    itself, but the unquantized method of an FP8 checkpoint's ignored MoE
+    layers does not. The gather follows the DP group, so this rank's rows sit
+    at its position in the group, the `dp_rank` vLLM gives every MoE layer
+    from that group.
+    """
+    runners = [module for module in model.modules() if isinstance(module, MoERunner)]
+    gathered_by_vllm = [
+        runner.layer_id for runner in runners if runner.do_naive_dispatch_combine
+    ]
+    if gathered_by_vllm and len(gathered_by_vllm) < len(runners):
+        raise NotImplementedError(
+            "--enable-return-routed-experts cannot capture a model whose MoE "
+            "layers differ in who gathers the DP ranks' rows: vLLM gathers "
+            f"them before MoE layers {gathered_by_vllm}, and the other "
+            "layers' MoE methods gather them after picking the experts. Unset "
+            "TPU_MOE_FP8_ALL_GATHER."
+        )
+    if not gathered_by_vllm:
+        return 1, 0
+    # Every MoE layer's moe_config comes from the engine's one parallel
+    # config, so the first layer's DP size and rank are every layer's.
+    moe_config = runners[0].moe_config
+    return moe_config.dp_size, moe_config.dp_rank
 
 
 @dataclass
@@ -190,12 +233,17 @@ class RoutedExpertsCapture:
     ) -> None:
         _reject_uncapturable_layers(model)
         moe_layer_ids = _moe_layer_ids(model)
+        num_gathered_dp_ranks, gathered_rows_index = _gathered_dp_rows(model)
         self._connector = get_aux_output_connector(model, vllm_config, kv_cache_config)
         # Every rank runs the same compiled forward, but vLLM's connector takes
         # the step's rows only from the first TP rank, so only that rank copies
         # them to the host.
         self._capturer = TPURoutedExpertsCapturer(
-            vllm_config, moe_layer_ids, copies_to_host=get_tp_group().is_first_rank
+            vllm_config,
+            moe_layer_ids,
+            copies_to_host=get_tp_group().is_first_rank,
+            num_gathered_dp_ranks=num_gathered_dp_ranks,
+            gathered_rows_index=gathered_rows_index,
         )
         # `hbm_reserve_bytes` sizes the tables from the config before the
         # capturer exists, so a row format vLLM changes must fail here.
