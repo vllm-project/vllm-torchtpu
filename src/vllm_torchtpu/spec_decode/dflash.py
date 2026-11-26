@@ -450,6 +450,10 @@ class DFlashProposer:
             buckets.append(min(bucket, max_draft_tokens))
         return buckets
 
+    def draft_bucket(self, num_reqs: int) -> int:
+        """Draft-forward rows a chunk of ``num_reqs`` requests pads to."""
+        return self._get_padded_len(num_reqs * self.block_size)
+
     def _get_padded_len(self, target_len: int) -> int:
         paddings = self._draft_token_paddings()
         for p in paddings:
@@ -604,8 +608,6 @@ class DFlashProposer:
         builders lay ``chunk``'s draft out from."""
         # 1. Calculate static padded shapes
         num_reqs = chunk.num_reqs
-        block_size = self.block_size
-        total_draft_tokens = num_reqs * block_size
 
         # Round up to the nearest static padded length to avoid XLA recompilation
         if self._dp_lockstep_sharded():
@@ -619,7 +621,7 @@ class DFlashProposer:
             # F.pad; dp_lockstep_num_reqs fails loudly instead.
             padded_len = self._dp_draft_bucket(num_reqs)
         else:
-            padded_len = self._get_padded_len(total_draft_tokens)
+            padded_len = self.draft_bucket(num_reqs)
 
         query_start_loc_device = chunk.attn_ctx.query_start_loc
         position_ids_device = chunk.position_ids
@@ -971,7 +973,7 @@ class DFlashProposer:
         block_size = self.block_size
         # Warm draft forwards up to a full chunk (see _max_chunk_reqs), or
         # the first such step compiles XLA mid-serving.
-        max_draft_tokens = self._get_padded_len(self._max_chunk_reqs() * block_size)
+        max_draft_tokens = self.draft_bucket(self._max_chunk_reqs())
         target_buckets = set(runner.num_tokens_paddings)
 
         with runner._precompile_timed("drafter first pass"):
@@ -1164,7 +1166,7 @@ class DFlashProposer:
     def _dp_draft_bucket(self, local_num_reqs: int = 0) -> int:
         """Draft-forward token bucket every lockstep rank runs this step."""
         num_reqs = dp_lockstep_num_reqs(self.runner._dp_step_max_reqs, local_num_reqs)
-        return self._get_padded_len(num_reqs * self.block_size)
+        return self.draft_bucket(num_reqs)
 
     @torch.no_grad()
     def _dp_dummy_kv_update(self) -> None:

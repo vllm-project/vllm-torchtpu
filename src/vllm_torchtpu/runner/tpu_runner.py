@@ -8698,6 +8698,14 @@ class TPUModelRunner(GPUModelRunner):
         def tok_bucket(n: int) -> int:
             return _get_padded_token_len(pads, n) if n <= pads[-1] else pads[-1]
 
+        # Drafts pad to the drafter's own (finer) buckets, not the target's;
+        # a drafter without its own buckets pads to the target's.
+        def draft_bucket(num_reqs: int) -> int:
+            if hasattr(drafter, "draft_bucket"):
+                # A step's requests draft in chunks of at most this many.
+                return drafter.draft_bucket(min(num_reqs, drafter._max_chunk_reqs()))
+            return tok_bucket(num_reqs * block)
+
         seen: set[tuple] = set()
         grid: list[int] = []
         for R in range(1, max_seqs + 1):
@@ -8708,7 +8716,7 @@ class TPUModelRunner(GPUModelRunner):
                         "decode",
                         _get_padded_num_reqs_with_upper_limit(R, max_reqs),
                         tok_bucket(R * (1 + K)),
-                        tok_bucket(R * block),
+                        draft_bucket(R),
                     )
                 )
             if mixed and max_seqs >= R + 1 and budget >= R * (1 + K) + 1:
@@ -8717,7 +8725,7 @@ class TPUModelRunner(GPUModelRunner):
                         "mixed",
                         _get_padded_num_reqs_with_upper_limit(R + 1, max_reqs),
                         tok_bucket(R * (1 + K) + 1),
-                        tok_bucket((R + 1) * block),
+                        draft_bucket(R + 1),
                     )
                 )
             new = [k for k in keys if k not in seen]

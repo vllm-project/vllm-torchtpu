@@ -579,10 +579,25 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     ]
 
 
-def _runner(K: int, block: int, max_seqs: int, budget: int, paddings: list[int]):
+def _runner(
+    K: int,
+    block: int,
+    max_seqs: int,
+    budget: int,
+    paddings: list[int],
+    draft_paddings: list[int] | None = None,
+):
+    drafter = SimpleNamespace(block_size=block)
+    if draft_paddings is not None:
+        # As DFlashProposer.draft_bucket: draft rows pad to the drafter's own
+        # buckets, which can be finer than the target's.
+        drafter.draft_bucket = lambda num_reqs: tpu_runner._get_padded_token_len(
+            draft_paddings, num_reqs * block
+        )
+        drafter._max_chunk_reqs = lambda: max_seqs
     return SimpleNamespace(
         speculative_config=SimpleNamespace(num_speculative_tokens=K),
-        drafter=SimpleNamespace(block_size=block),
+        drafter=drafter,
         scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
         # As in TPUModelRunner.__init__: raised to MIN_NUM_SEQS for padding.
         max_num_reqs=max(max_seqs, tpu_runner.MIN_NUM_SEQS),
@@ -603,6 +618,13 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
     def tok_bucket(n: int) -> int:
         return tpu_runner._get_padded_token_len(pads, n) if n <= pads[-1] else pads[-1]
 
+    def draft_bucket(num_reqs: int) -> int:
+        if hasattr(runner.drafter, "draft_bucket"):
+            return runner.drafter.draft_bucket(
+                min(num_reqs, runner.drafter._max_chunk_reqs())
+            )
+        return tok_bucket(num_reqs * block)
+
     keys = set()
     if runner.max_num_tokens >= R * (1 + K):
         keys.add(
@@ -610,7 +632,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
                 "decode",
                 tpu_runner._get_padded_num_reqs_with_upper_limit(R, max_reqs),
                 tok_bucket(R * (1 + K)),
-                tok_bucket(R * block),
+                draft_bucket(R),
             )
         )
     if mixed and max_seqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
@@ -619,7 +641,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
                 "mixed",
                 tpu_runner._get_padded_num_reqs_with_upper_limit(R + 1, max_reqs),
                 tok_bucket(R * (1 + K) + 1),
-                tok_bucket((R + 1) * block),
+                draft_bucket(R + 1),
             )
         )
     return keys
@@ -634,12 +656,23 @@ TIGHT = dict(K=5, block=5, max_seqs=8, budget=32, paddings=[16, 32])
 # The nightly DSpark bs4 engine: max_num_seqs sits below MIN_NUM_SEQS, so the
 # runner's padded request bound (8) is above any count a step can hold.
 DSPARK_BS4 = dict(K=7, block=7, max_seqs=4, budget=256, paddings=[16, 32, 64, 128, 256])
+# DFlash fine draft buckets (32 rows apart) between target buckets 128 and 512, as
+# served at 64 sequences: counts 17-31 pad to draft buckets the target lacks.
+FINE_DRAFTS = dict(
+    K=7,
+    block=8,
+    max_seqs=64,
+    budget=8192,
+    paddings=[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
+    draft_paddings=[16, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384]
+    + [416, 448, 480, 512, 1024],
+)
 
 
 @pytest.mark.parametrize(
     "cfg",
-    [FLASH, AGENTX, TIGHT, DSPARK_BS4],
-    ids=["flash", "agentx", "tight", "dspark-bs4"],
+    [FLASH, AGENTX, TIGHT, DSPARK_BS4, FINE_DRAFTS],
+    ids=["flash", "agentx", "tight", "dspark-bs4", "fine-drafts"],
 )
 @pytest.mark.parametrize("mixed", [False, True])
 def test_grid_covers_every_bucket_combination_once(cfg, mixed):

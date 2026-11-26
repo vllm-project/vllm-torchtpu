@@ -234,6 +234,25 @@ def test_draft_buckets_cover_a_full_chunk(
         proposer._get_padded_len(draft_paddings[-1] + 1)
 
 
+def test_draft_bucket_is_the_input_layout_padding(monkeypatch):
+    monkeypatch.setenv("TPU_DRAFT_BUCKET_STEP", "32")
+    proposer = _make_precompile_proposer(
+        [16, 32, 64, 128, 256, 512], num_reqs_max_model_len=64
+    )
+    proposer._dp_lockstep_sharded = lambda: False
+
+    for num_reqs in (1, 17, 23, 32, 40):
+        chunk = SimpleNamespace(
+            num_reqs=num_reqs,
+            attn_ctx=SimpleNamespace(query_start_loc=None),
+            position_ids=torch.zeros(1),
+        )
+        padded_len, _, _ = proposer._draft_input_layout(chunk)
+        assert padded_len == proposer.draft_bucket(num_reqs)
+    # 23 requests x 8 rows: a draft-only bucket between the target's 128 and 256.
+    assert proposer.draft_bucket(23) == 192
+
+
 def test_precompile_warms_draft_only_buckets():
     proposer = _make_precompile_proposer([16, 32, 64], num_reqs_max_model_len=16)
 
