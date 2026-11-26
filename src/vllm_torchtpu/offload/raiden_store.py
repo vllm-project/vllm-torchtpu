@@ -84,13 +84,18 @@ import os
 import socket
 import threading
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec, KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheSpec,
+)
 from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     LoadStoreSpec,
@@ -206,6 +211,48 @@ def all_ranks_kv_bytes_per_block() -> int | None:
     return _all_ranks_kv_bytes_per_block
 
 
+# Per-layer KV cache specs of every worker, recorded from the per-worker KV
+# cache configs with the bytes per block (see
+# ``_patch_vllm_offload_all_ranks_kv_bytes``). The scheduler's own config keeps
+# one spec per `UniformTypeKVCacheSpecs` group, so this is where it sees every
+# layer. None until recorded.
+_all_ranks_leaf_kv_cache_specs: tuple[Any, ...] | None = None
+
+
+def record_all_ranks_leaf_kv_cache_specs(
+    kv_cache_configs: Sequence[Any],
+) -> tuple[Any, ...]:
+    """Remember the per-layer specs behind every worker's KV cache groups.
+
+    Called where `record_all_ranks_kv_bytes_per_block` is, from the same list,
+    so the engine core and each worker record the same specs.
+    """
+    global _all_ranks_leaf_kv_cache_specs
+    _all_ranks_leaf_kv_cache_specs = tuple(
+        leaf
+        for cfg in kv_cache_configs
+        for group in cfg.kv_cache_groups
+        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec)
+    )
+    return _all_ranks_leaf_kv_cache_specs
+
+
+def _require_all_ranks_leaf_kv_cache_specs() -> tuple[Any, ...]:
+    """The recorded per-layer specs of all workers; RuntimeError if nothing
+    was recorded. The engine core and every worker record before the
+    offloading spec is built, and the scheduler's own config, which keeps
+    one spec per group, cannot stand in for them."""
+    leaves = _all_ranks_leaf_kv_cache_specs
+    if leaves is None:
+        raise RuntimeError(
+            "TPURaidenOffloadingConnector: the per-layer KV cache specs of the "
+            "workers were not recorded before the KV geometry was resolved, so "
+            "the scheduler, whose KV cache config keeps one spec per group, "
+            "cannot see every layer"
+        )
+    return leaves
+
+
 def iter_leaf_kv_cache_specs(kv_cache_spec):
     """Yield the per-layer specs behind a KV cache group spec."""
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -217,14 +264,52 @@ def iter_leaf_kv_cache_specs(kv_cache_spec):
         yield kv_cache_spec
 
 
-def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
-    """Whether this model's KV cache consists of multiple tensors
-    of different shapes.
+def _attention_geometry_key(spec: Any) -> tuple[Any, ...]:
+    """The fields two attention specs must share to tile one common row:
+    `(block_size, num_kv_heads, head_size, dtype, page_size_bytes)`.
+
+    `resolve_attention_geometry` requires every attention group to agree on
+    them; `has_multi_shapes_kv_caches` takes the per-array path when the
+    MLA-family layers do not.
     """
-    return vllm_config.model_config.architecture in (
-        "DeepseekV4ForCausalLM",
-        "GlmMoeDsaForCausalLM",
+    return (
+        spec.block_size,
+        spec.num_kv_heads,
+        spec.head_size,
+        spec.dtype,
+        spec.page_size_bytes,
     )
+
+
+def has_multi_shapes_kv_caches() -> bool:
+    """Whether the KV cache holds MLA-family arrays of different shapes.
+
+    Such a cache (MLA latents next to indexer keys, compressed or
+    sliding-window MLA states) is registered array by array instead of tiling
+    one common row; see `resolve_kernel_geometry`. Decided from the per-layer
+    specs of all workers as recorded by `record_all_ranks_leaf_kv_cache_specs`,
+    so the scheduler, whose KV cache config keeps one spec per group, and the
+    workers decide alike. Two MLA-family layers differ when their
+    `_attention_geometry_key` differs.
+
+    Only MLA-family layers count. A layout with one MLA geometry and a
+    drafter's full-attention K/V layers (DeepSeek-V3 with an EAGLE drafter)
+    is not multi-shape: it goes down the single-shape path of
+    `resolve_kernel_geometry`, which rejects it, as on main. The per-array
+    path takes full-attention leaves only next to MLA-family layers of two
+    or more geometries (MiniMax M3 with its DSpark drafter).
+
+    Raises RuntimeError when nothing was recorded.
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+
+    leaves = _require_all_ranks_leaf_kv_cache_specs()
+    geometries = {
+        _attention_geometry_key(leaf)
+        for leaf in leaves
+        if isinstance(leaf, (MLAAttentionSpec, SlidingWindowMLASpec))
+    }
+    return len(geometries) > 1
 
 
 class RaidenLoadStoreSpec(LoadStoreSpec):
@@ -1505,7 +1590,7 @@ def derive_offload_namespace(
     vllm_config: VllmConfig,
     *,
     kernel_block_size: int,
-    per_block_shape: tuple[int, ...] | set[tuple[int, ...]],
+    per_block_shape: tuple[int, ...] | set[tuple[object, ...]],
     kv_dtype: object,
     device_block_size: int,
     world_size: int,
@@ -1514,6 +1599,8 @@ def derive_offload_namespace(
     cp_geometry: tuple[int, ...] = (),
     block_major_contract: BlockMajorContract | None = None,
     offloaded_group_ids: tuple[int, ...] | None = None,
+    kv_leaf_counts: tuple[tuple[tuple[int, ...], int], ...] = (),
+    drafter_model: tuple[str | None, str | None] | None = None,
 ) -> bytes:
     """Derive a deterministic compatibility namespace prefixed to every store and
     registry key.
@@ -1521,13 +1608,18 @@ def derive_offload_namespace(
     Ensures cache keys never collide across incompatible engine deployments by
     hashing all configuration parameters that alter binary KV cache layout:
     - Model identity: model name, revision, quantization.
-    - KV cache geometry: KV data type, kernel block size, per-block tensor shape,
-      device block size, cache group/tensor counts, and which groups are
-      offloaded when that is not all of them.
+    - KV cache geometry: KV data type, kernel block size, per-block tensor shape
+      (for a multi-shape layout, the shape, page bytes and KV cache layout of
+      every array kind), device block size, cache group/tensor counts, and
+      which groups are offloaded when that is not all of them.
     - Distributed topology: world size (TP/PP) and context parallelism geometry
       (pcp_size, dcp_size, interleave_size) which alters rank-local token placement.
     - Hash scheme: prefix caching algorithm and namespace version salt.
     - Layout contract: block-major layout version, row bytes, and logical fingerprint.
+    - Multi-shape layouts: the number of full-attention (K/V) layers of each
+      geometry (`multi_shapes_kv_leaf_counts`), when there are any.
+    - Speculative decoding: the drafter model and revision, whose K/V layers
+      are stored with the target's.
 
     Returns:
         A 16-byte SHA-256 digest unique to this engine and layout configuration.
@@ -1579,6 +1671,13 @@ def derive_offload_namespace(
         # a group never stores its keys, so a peer expecting them would miss
         # on every block.
         material_fields += ("tpu-raiden-offload-ns3-groups", offloaded_group_ids)
+    if kv_leaf_counts:
+        # The shape set keeps one entry per distinct array; drafters of other
+        # depths hold other bytes per block.
+        material_fields += ("tpu-raiden-offload-ns4-kv-leaves", kv_leaf_counts)
+    if drafter_model is not None:
+        # Two drafters of one geometry store different K/V.
+        material_fields += ("tpu-raiden-offload-ns5-drafter", drafter_model)
     material = repr(material_fields)
     return hashlib.sha256(material.encode()).digest()[:16]
 
@@ -1586,45 +1685,194 @@ def derive_offload_namespace(
 def is_multi_shapes_geometry(per_block_shape: object) -> bool:
     """True when `resolve_kernel_geometry` resolved a multi-shape KV layout.
 
-    A multi-shape layout answers with the *set* of its per-block shapes
-    rather than one shape.
+    A multi-shape layout answers with the *set* of its array kinds'
+    `(per_block_shape, page_size_bytes, kv_cache_layout)` rather than one
+    shape.
     """
     return isinstance(per_block_shape, (set, frozenset))
 
 
-def _resolve_multi_shapes_kv_geometry(
-    kv_cache_config: KVCacheConfig,
-) -> tuple[int, set[tuple[int, ...]], set[object], int]:
+def _attention_backend_page(
+    vllm_config: VllmConfig,
+    spec: AttentionSpec,
+    *,
+    selector_head_size: int,
+    use_mla: bool,
+    has_sliding_window: bool,
+    kernel_block_size: int | None = None,
+) -> tuple[int, tuple[int, ...]]:
+    """`(kernel_block_size, page_shape)` of an attention cache of `spec`, as
+    the runner lays it out.
+
+    The backend is the one that lays out the plain `Attention` caches in the
+    runner (`TpuPlatform._find_dense_attention_backend`). The engine core
+    instantiates no model, so there it is selected as such a layer selects
+    it, from `selector_head_size`, `use_mla` and `has_sliding_window`.
+    `kernel_block_size` defaults to the block size the backend shares with
+    `spec.block_size`; `page_shape` is one kernel block of the backend's
+    `get_kv_cache_shape`, padding and KV cache layout included.
+    """
+    from vllm.config import set_current_vllm_config
+    from vllm.v1.worker.utils import select_common_block_size
+
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    attn_backend = TpuPlatform._find_dense_attention_backend(vllm_config)
+    # Every call below resolves the KV cache layout, which falls through to
+    # the KV connector and so needs a current config.
+    with set_current_vllm_config(vllm_config):
+        if attn_backend is None:
+            from vllm.v1.attention.selector import get_attn_backend
+
+            attn_backend = get_attn_backend(
+                head_size=selector_head_size,
+                dtype=cast("torch.dtype", vllm_config.model_config.dtype),
+                kv_cache_dtype=vllm_config.cache_config.cache_dtype,
+                use_mla=use_mla,
+                has_sliding_window=has_sliding_window,
+            )
+        assert attn_backend is not None, (
+            "TPURaidenOffloadingConnector: requires a non-SSM attention backend"
+        )
+        assert not attn_backend.is_ssm(), (
+            "TPURaidenOffloadingConnector: resolved attention backend is SSM: "
+            f"{attn_backend.get_name()}"
+        )
+        block_size = (
+            select_common_block_size(spec.block_size, [attn_backend])
+            if kernel_block_size is None
+            else kernel_block_size
+        )
+        full_5d_shape = attn_backend.get_kv_cache_shape(
+            num_blocks=1,
+            block_size=block_size,
+            num_kv_heads=spec.num_kv_heads,
+            head_size=spec.head_size,
+            cache_dtype_str=spec.dtype,
+        )
+    return block_size, tuple(full_5d_shape[1:])
+
+
+def multi_shapes_leaf_block_shape(
+    vllm_config: VllmConfig, leaf: KVCacheSpec
+) -> tuple[int, ...] | None:
+    """Per-block shape one leaf spec adds to a multi-shape KV layout.
+
+    - MLA cache: ``(num_states, num_kv_heads, head_size)``, one row per token.
+    - Any other full-attention cache (a speculative drafter's K/V layers):
+      the attention backend's page shape (`_attention_backend_page`). The
+      TPU attention backends allocate K and V fused in one array whose
+      leading dimension is the block, so the leaf is one array registered as
+      whole pages. The backend shape carries the head and lane padding and
+      the KV cache layout.
+    - Sliding-window MLA caches (DSv4) add no shape: they ride on the MLA
+      anchor block.
+
+    Raises NotImplementedError for a leaf the per-array path cannot register.
+    """
     from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
 
-    groups = kv_cache_config.kv_cache_groups
-    for group in groups:
-        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec):
-            assert isinstance(leaf, (MLAAttentionSpec, SlidingWindowMLASpec)), (
-                "TPURaidenOffloadingConnector: an aliased KV "
-                "layout has only MLA-family layers; got "
-                f"{type(leaf).__name__}"
-            )
+    if isinstance(leaf, SlidingWindowMLASpec):
+        return None
+    if isinstance(leaf, MLAAttentionSpec):
+        return (leaf.num_states, leaf.num_kv_heads, leaf.head_size)
+    if not isinstance(leaf, FullAttentionSpec):
+        raise NotImplementedError(
+            "TPURaidenOffloadingConnector: a multi-shape KV layout supports "
+            "MLA-family and full-attention layers only; got "
+            f"{type(leaf).__name__} (a sliding-window layer needs "
+            "--disable-hybrid-kv-cache-manager to share the full-attention group)"
+        )
+    if leaf.head_size_v != leaf.head_size:
+        raise NotImplementedError(
+            "TPURaidenOffloadingConnector: a full-attention leaf in a multi-shape "
+            f"KV layout needs equal K/V widths; got head_size={leaf.head_size}, "
+            f"head_size_v={leaf.head_size_v}"
+        )
+    _, page_shape = _attention_backend_page(
+        vllm_config,
+        leaf,
+        selector_head_size=leaf.head_size,
+        use_mla=False,
+        has_sliding_window=leaf.sliding_window is not None,
+        kernel_block_size=leaf.block_size,
+    )
+    return page_shape
 
-    mla_leaves = [
-        leaf
-        for group in groups
-        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec)
-        if isinstance(leaf, MLAAttentionSpec)
-    ]
-    assert mla_leaves
-    anchor_block_sizes = sorted({leaf.block_size for leaf in mla_leaves})
-    assert len(anchor_block_sizes) == 1
-    block_size = anchor_block_sizes[0]
 
-    # One entry per full-attention MLA cache.
-    per_block_shapes: set[tuple[int, ...]] = set()
+def _resolve_multi_shapes_kv_geometry(
+    vllm_config: VllmConfig,
+) -> tuple[int, set[tuple[object, ...]], set[object], int]:
+    """Geometry of a multi-shape KV layout:
+    `(block_size, leaf_geometries, kv_dtypes, block_size)`.
+
+    Reads the per-layer specs of all workers
+    (`record_all_ranks_leaf_kv_cache_specs`), so the scheduler, whose KV
+    cache config keeps one spec per `UniformTypeKVCacheSpecs` group, and the
+    workers resolve the same set; only the scheduler's keys the offload
+    namespace. Each entry of `leaf_geometries` is
+    `(multi_shapes_leaf_block_shape, page_size_bytes, kv_cache_layout)` for
+    one distinct array kind: workers register raw pages of `page_size_bytes`
+    (padding included), whose byte order follows the KV cache layout, so two
+    runs that differ in either must not share keys.
+
+    `resolve_kernel_geometry` calls it only when `has_multi_shapes_kv_caches`
+    holds, so full-attention leaves come here only next to MLA-family
+    layers of two or more geometries.
+    """
+    leaves = list(dict.fromkeys(_require_all_ranks_leaf_kv_cache_specs()))
+    kv_cache_layout = str(vllm_config.cache_config.kv_cache_layout)
+    # One entry per full-attention cache (MLA or K/V); validates every leaf.
+    leaf_geometries: set[tuple[object, ...]] = set()
     kv_dtypes: set[object] = set()
-    for leaf in mla_leaves:
-        shape = (leaf.num_states, leaf.num_kv_heads, leaf.head_size)
-        per_block_shapes.add(shape)
-        kv_dtypes.add(leaf.dtype)
-    return block_size, per_block_shapes, kv_dtypes, block_size
+    for leaf in leaves:
+        shape = multi_shapes_leaf_block_shape(vllm_config, leaf)
+        if shape is not None:
+            leaf_geometries.add((shape, leaf.page_size_bytes, kv_cache_layout))
+            kv_dtypes.add(leaf.dtype)
+
+    # Full-attention leaves (MLA ones included) anchor the block size.
+    anchors = [leaf for leaf in leaves if isinstance(leaf, FullAttentionSpec)]
+    if not anchors:
+        raise ValueError(
+            "TPURaidenOffloadingConnector: a multi-shape KV layout has no "
+            "full-attention layer"
+        )
+    anchor_block_sizes = sorted({leaf.block_size for leaf in anchors})
+    if len(anchor_block_sizes) != 1:
+        raise ValueError(
+            "TPURaidenOffloadingConnector: full-attention layers of a multi-shape "
+            f"KV layout disagree on block size: {anchor_block_sizes}"
+        )
+    block_size = anchor_block_sizes[0]
+    return block_size, leaf_geometries, kv_dtypes, block_size
+
+
+def multi_shapes_kv_leaf_counts(
+    vllm_config: VllmConfig,
+) -> tuple[tuple[tuple[int, ...], int], ...]:
+    """How many full-attention (K/V) layers of all workers have each
+    `multi_shapes_leaf_block_shape` geometry, sorted by geometry.
+
+    The shape set of a multi-shape layout keeps one entry per distinct
+    array, so two drafters of the same K/V geometry and different depths
+    give the same set, while a block holds different bytes. The counts key
+    the offload namespace too. Read from the recorded per-layer specs, so
+    the scheduler and the workers count alike.
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+
+    leaves = Counter(
+        leaf
+        for leaf in _require_all_ranks_leaf_kv_cache_specs()
+        if not isinstance(leaf, (MLAAttentionSpec, SlidingWindowMLASpec))
+    )
+    counts: Counter[tuple[int, ...]] = Counter()
+    for leaf, count in leaves.items():
+        shape = multi_shapes_leaf_block_shape(vllm_config, leaf)
+        if shape is not None:
+            counts[shape] += count
+    return tuple(sorted(counts.items()))
 
 
 def resolve_attention_geometry(
@@ -1642,9 +1890,6 @@ def resolve_attention_geometry(
     Multi-kv-shape models are handled by `resolve_kernel_geometry`.
     """
     from vllm.v1.kv_cache_interface import AttentionSpec
-    from vllm.v1.worker.utils import select_common_block_size
-
-    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     groups = kv_cache_config.kv_cache_groups
     assert groups, "TPURaidenOffloadingConnector: no KV cache groups"
@@ -1675,14 +1920,7 @@ def resolve_attention_geometry(
         )
         spec0 = attn_specs[0]
         assert all(
-            (s.block_size, s.num_kv_heads, s.head_size, s.dtype, s.page_size_bytes)
-            == (
-                spec0.block_size,
-                spec0.num_kv_heads,
-                spec0.head_size,
-                spec0.dtype,
-                spec0.page_size_bytes,
-            )
+            _attention_geometry_key(s) == _attention_geometry_key(spec0)
             for s in attn_specs
         ), "TPURaidenOffloadingConnector: attention groups disagree on geometry"
         # Ensure all groups share the unified pool's padded page size.
@@ -1693,58 +1931,30 @@ def resolve_attention_geometry(
             "padded page size"
         )
 
-    from vllm.config import set_current_vllm_config
-
     # Shape spec0 with the backend that lays out the plain `Attention` caches,
     # as the runner does (the first backend when there are none).
-    attn_backend = TpuPlatform._find_dense_attention_backend(vllm_config)
-    if attn_backend is None:
-        # In the EngineCore process, the model is not instantiated, so
-        # _find_dense_attention_backend returns None. Resolve the attention backend
-        # directly via get_attn_backend using the model configuration.
-        from vllm.v1.attention.selector import get_attn_backend
-
-        model_config = vllm_config.model_config
-        with set_current_vllm_config(vllm_config):
-            attn_backend = get_attn_backend(
-                head_size=model_config.get_head_size(),
-                dtype=cast("torch.dtype", model_config.dtype),
-                kv_cache_dtype=vllm_config.cache_config.cache_dtype,
-                use_mla=model_config.use_mla,
-            )
-    assert attn_backend is not None, (
-        "TPURaidenOffloadingConnector: requires a non-SSM attention backend"
+    model_config = vllm_config.model_config
+    kernel_block_size, per_block_shape = _attention_backend_page(
+        vllm_config,
+        spec0,
+        selector_head_size=model_config.get_head_size(),
+        use_mla=model_config.use_mla,
+        has_sliding_window=False,
     )
-    assert not attn_backend.is_ssm(), (
-        "TPURaidenOffloadingConnector: resolved attention backend is SSM: "
-        f"{attn_backend.get_name()}"
-    )
-    # Both calls resolve the KV cache layout, which falls through to the KV
-    # connector and so needs a current config.
-    with set_current_vllm_config(vllm_config):
-        kernel_block_size = select_common_block_size(spec0.block_size, [attn_backend])
-        full_5d_shape = attn_backend.get_kv_cache_shape(
-            num_blocks=1,
-            block_size=kernel_block_size,
-            num_kv_heads=spec0.num_kv_heads,
-            head_size=spec0.head_size,
-            cache_dtype_str=spec0.dtype,
-        )
-    per_block_shape = tuple(full_5d_shape[1:])
     return spec0, kernel_block_size, per_block_shape
 
 
 def resolve_kernel_geometry(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
-) -> tuple[int, tuple[int, ...] | set[tuple[int, ...]], object, int]:
+) -> tuple[int, tuple[int, ...] | set[tuple[object, ...]], object, int]:
     """Resolve physical TPU kernel geometry:
     (kernel_block_size, per_block_shape, kv_dtype, device_block_size).
 
     Shared between the scheduler (capacity sizing, sub-hash factor) and worker ranks
     (device view reconstruction) to guarantee exact geometry parity.
     """
-    if has_multi_shapes_kv_caches(vllm_config):
-        return _resolve_multi_shapes_kv_geometry(kv_cache_config)
+    if has_multi_shapes_kv_caches():
+        return _resolve_multi_shapes_kv_geometry(vllm_config)
     spec0, kernel_block_size, per_block_shape = resolve_attention_geometry(
         vllm_config, kv_cache_config
     )
@@ -1762,6 +1972,45 @@ def resolve_kernel_geometry(
             spec0.block_size,
         )
     return kernel_block_size, per_block_shape, spec0.dtype, spec0.block_size
+
+
+def _check_kv_leaves_registered(
+    vllm_config: VllmConfig,
+    kv_cache_config: KVCacheConfig,
+    leaf_geometries: set[tuple[object, ...]],
+    kv_caches: CanonicalKVCaches,
+) -> None:
+    """Assert that each full-attention (K/V) leaf of this worker is hashed
+    and has a registered array whose page holds its hashed backend page.
+
+    The runner allocates a K/V leaf with the backend page of
+    `TpuPlatform._find_dense_attention_backend`, so a hashed page from any
+    other backend has no array of its bytes.
+    """
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    registered_pages = {tensor.page_size_bytes for tensor in kv_caches.tensors}
+    kv_cache_layout = str(vllm_config.cache_config.kv_cache_layout)
+    for group in kv_cache_config.kv_cache_groups:
+        for leaf in iter_leaf_kv_cache_specs(group.kv_cache_spec):
+            if not isinstance(leaf, FullAttentionSpec) or isinstance(
+                leaf, MLAAttentionSpec
+            ):
+                continue
+            shape = multi_shapes_leaf_block_shape(vllm_config, leaf)
+            assert shape is not None
+            # As `_resolve_multi_shapes_kv_geometry` hashes it.
+            geometry = (shape, leaf.page_size_bytes, kv_cache_layout)
+            assert geometry in leaf_geometries, (
+                f"TPURaidenOffloadingConnector: K/V leaf geometry {geometry} is "
+                f"not in the hashed geometries {sorted(map(repr, leaf_geometries))}"
+            )
+            page_bytes = math.prod(shape) * leaf.dtype.itemsize
+            assert page_bytes in registered_pages, (
+                "TPURaidenOffloadingConnector: no registered array has the "
+                f"{page_bytes}-byte page hashed for K/V leaf {shape}; "
+                f"registered pages: {sorted(registered_pages)}"
+            )
 
 
 class RaidenStoreOffloadingWorker(OffloadingWorker):
@@ -1832,6 +2081,10 @@ class RaidenStoreOffloadingWorker(OffloadingWorker):
                     f"rows={int8_view.shape[0]}, page={page_size_bytes}"
                 )
                 device_tensors.append(int8_view)
+            assert isinstance(per_block_shape, set)
+            _check_kv_leaves_registered(
+                vllm_config, kv_cache_config, per_block_shape, kv_caches
+            )
             self._init_registration(
                 device_tensors, host_blocks_to_allocate, controller_address, rank
             )
@@ -2585,6 +2838,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         # Generate the compatibility namespace hash to isolate global registry
         # entries across incompatible engine configurations.
+        speculative_config = vllm_config.speculative_config
         self.key_namespace = derive_offload_namespace(
             vllm_config,
             kernel_block_size=kernel_block_size,
@@ -2597,6 +2851,16 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
             cp_geometry=cp_geometry,
             block_major_contract=self.block_major_contract,
             offloaded_group_ids=tuple(group.group_id for group in config.groups),
+            kv_leaf_counts=(
+                multi_shapes_kv_leaf_counts(vllm_config)
+                if is_multi_shapes_geometry(per_block_shape)
+                else ()
+            ),
+            drafter_model=(
+                None
+                if speculative_config is None
+                else (speculative_config.model, speculative_config.revision)
+            ),
         )
 
         # Shared-memory host pools (RAIDEN_SHM_KEY) are currently unsupported.
