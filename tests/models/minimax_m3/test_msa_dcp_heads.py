@@ -239,6 +239,32 @@ def test_exchange_head_pages(live, lanes):
                 np.testing.assert_array_equal(got[rank, j, src, :n], want)
 
 
+def test_block_all_to_all_matches_xla():
+    # Interpret mode cannot carry semaphores out of a call.
+    if jax.default_backend() != "tpu" or len(jax.devices()) < DCP:
+        pytest.skip("needs 8 TPU devices")
+    rng = np.random.default_rng(0)
+    x = rng.integers(0, 1 << 16, (DCP * DCP, 3, 16, 128), np.uint16)
+    mesh = Mesh(np.asarray(jax.devices()[:DCP]), ("dcp",))
+
+    def body(x, rank):
+        started = msa_dcp_heads.start_block_all_to_all(
+            x, rank, axis="dcp", dcp=DCP
+        )
+        got = msa_dcp_heads.finish_block_all_to_all(started, dcp=DCP)
+        return got, jax.lax.all_to_all(x, "dcp", 0, 0, tiled=True)
+
+    f = jax.shard_map(
+        body,
+        mesh=mesh,
+        in_specs=(P("dcp"), P("dcp")),
+        out_specs=(P("dcp"), P("dcp")),
+        check_vma=False,
+    )
+    got, want = f(jnp.asarray(x), jnp.arange(DCP, dtype=jnp.int32))
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 def test_swap_with_row_crosses_bits():
     """A pair swaps 16-bit rows and a 32-bit extra bit for bit (-inf, NaN and
     a subnormal included)."""

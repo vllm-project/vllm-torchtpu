@@ -578,22 +578,15 @@ def _merge_unrotate(out, keep, o2, o3, l1, l2, l3, *, interpret=False):
     )
 
 
-def merge_partials_all_to_all(
-    out: jax.Array,
-    lse: jax.Array,
-    axis: str,
-    *,
-    dcp: int,
-    interpret: bool = False,
-) -> jax.Array:
-    """`merge_partials` by one all-to-all: each rank's head block of the
-    partial goes to its owner, its LSEs riding as one more 16-bit head row,
-    and `msa_dcp.merge_partials` weighs, sums in f32 and unrotates in one
-    pass. For the decode rows of a head-parallel step, whose LSE all-gather
-    and reduce-scatter waited out late ranks (c64 mixed twin, j-741c6acc vs
-    j-613b69cd: 288.6 -> 282.0 ms per step); a decode step keeps the
-    reduce-scatter, which moves its partial faster than an all-to-all
-    (30 vs 47 us per layer at c64 b46)."""
+def partials_send_buffer(out: jax.Array, lse: jax.Array, dcp: int) -> jax.Array:
+    """The all-to-all send buffer ``[dcp, Hl + 1, T, D]`` uint16 of
+    head-major partials ``out [H, T, D]`` and ``lse [H, T]`` for
+    `merge_received_partials`: block ``r`` goes to rank ``r``, its LSEs
+    riding as one more head row. For the decode rows of a head-parallel
+    step, whose LSE all-gather and reduce-scatter waited out late ranks
+    (c64 mixed twin, j-741c6acc vs j-613b69cd: 288.6 -> 282.0 ms per step);
+    a decode step keeps the reduce-scatter, which moves its partial faster
+    than an all-to-all (30 vs 47 us per layer at c64 b46)."""
     num_heads, num_tokens, head_dim = out.shape
     heads = num_heads // dcp
     width = 2 * heads
@@ -605,7 +598,7 @@ def merge_partials_all_to_all(
     lse = lse.astype(jnp.float32).T.reshape(num_tokens, dcp, heads).transpose(1, 0, 2)
     bits = msa_dcp.words_to_u16_planes(lse)[:, None]  # [dcp, 1, T, 2 Hl]
     bits = jnp.pad(bits, ((0, 0), (0, 0), (0, 0), (0, head_dim - width)))
-    send = jnp.concatenate(
+    return jnp.concatenate(
         [
             jax.lax.bitcast_convert_type(out, jnp.uint16).reshape(
                 dcp, heads, num_tokens, head_dim
@@ -613,13 +606,127 @@ def merge_partials_all_to_all(
             bits,
         ],
         axis=1,
-    )  # [dcp, Hl + 1, T, D]: block r goes to rank r
-    got = jax.lax.all_to_all(send, axis, 0, 0, tiled=True)
-    parts = jax.lax.bitcast_convert_type(got[:, :heads], out.dtype)
+    )
+
+
+def merge_received_partials(
+    got: jax.Array, dtype, *, interpret: bool = False
+) -> jax.Array:
+    """This rank's merged heads ``[T, Hl, D]`` (unrotated) from every rank's
+    `partials_send_buffer` block for it, ``got [dcp, Hl + 1, T, D]``:
+    `msa_dcp.merge_partials` weighs, sums in f32 and unrotates in one pass."""
+    _, rows, num_tokens, head_dim = got.shape
+    heads = rows - 1
+    parts = jax.lax.bitcast_convert_type(got[:, :heads], dtype)
     lses = msa_dcp.u16_planes_to_words(got[:, heads], heads, jnp.float32)
-    hadamard = jnp.asarray(msa_fp4.hadamard(head_dim), out.dtype)
+    hadamard = jnp.asarray(msa_fp4.hadamard(head_dim), dtype)
     merged = msa_dcp.merge_partials(parts, lses, hadamard, interpret=interpret)
     return merged.reshape(num_tokens, heads, head_dim)
+
+
+# The block all-to-all's barrier semaphore (the page exchange's is 0).
+_BLOCKS_COLLECTIVE_ID = 1
+
+
+class BlockExchange(NamedTuple):
+    """`start_block_all_to_all`'s blocks in flight, for
+    `finish_block_all_to_all`."""
+
+    out: jax.Array
+    send_sem: jax.Array
+    recv_sem: jax.Array
+    # The start's copy of the blocks being sent: an input of the finish, so
+    # XLA keeps it until the copies reading it are done.
+    source: jax.Array
+
+
+def start_block_all_to_all(
+    x: jax.Array, rank: jax.Array, *, axis: str, dcp: int, interpret: bool = False
+) -> BlockExchange:
+    """``jax.lax.all_to_all(x, axis, 0, 0, tiled=True)`` of ``x [dcp, ...]``
+    by remote DMA, returned in flight: block ``d`` goes to slot ``rank`` of
+    rank ``d``'s output. XLA issues its own all-to-all just ahead of the
+    result's first use, so one feeding work that runs much later stays
+    exposed however early its operand is ready; these copies start where
+    the call is ordered (by data or a barrier), and
+    `finish_block_all_to_all` waits for them."""
+
+    def kernel(rank_ref, x_ref, out_ref, source_ref, send_sem, recv_sem, copy_sem):
+        # The copies read the blocks from this call's own output: XLA may keep
+        # an operand that fits in VMEM and reuse that VMEM right after the
+        # call, while the copies still read it.
+        local = pltpu.make_async_copy(x_ref, source_ref, copy_sem)
+        local.start()
+        me = rank_ref[0]
+        barrier = pltpu.get_barrier_semaphore()
+        for d in range(dcp):
+            pl.semaphore_signal(
+                barrier,
+                inc=1,
+                device_id={axis: jnp.int32(d)},
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+        # Every rank has entered the call: its output buffer is live.
+        pl.semaphore_wait(barrier, dcp)
+        local.wait()
+        for d in range(dcp):
+            _remote(
+                source_ref.at[d], out_ref.at[me], send_sem, recv_sem, d, axis
+            ).start()
+
+    any_ = pl.BlockSpec(memory_space=pl.ANY)
+    sem = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+    started = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1,),
+            in_specs=[any_],
+            out_specs=(any_, any_, sem, sem),
+            scratch_shapes=[pltpu.SemaphoreType.DMA(())],
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct(x.shape, x.dtype),
+            jax.ShapeDtypeStruct(x.shape, x.dtype),
+            pltpu.SemaphoreType.DMA(()),
+            pltpu.SemaphoreType.DMA(()),
+        ),
+        # No side-effect flag: the finish consumes every output (as
+        # `start_head_page_exchange`).
+        compiler_params=pltpu.CompilerParams(collective_id=_BLOCKS_COLLECTIVE_ID),
+        interpret=_interpret_params(interpret),
+        name="minimax_m3_msa_dcp_block_all_to_all_start",
+    )(rank.reshape(1), x)
+    out, source, send_sem, recv_sem = started
+    return BlockExchange(out, send_sem, recv_sem, source)
+
+
+def finish_block_all_to_all(
+    started: BlockExchange, *, dcp: int, interpret: bool = False
+) -> jax.Array:
+    """The all-to-all result of `start_block_all_to_all`: waits for this
+    rank's ``dcp`` blocks and its own sends (equal-sized copies: any wait
+    retires one)."""
+
+    def kernel(buf_ref, send_ref, recv_ref, source_ref, out_ref):
+        del buf_ref, source_ref  # aliased to out_ref; held for the sends
+        block = out_ref.at[0]
+        for sem in (recv_ref, send_ref):
+            for _ in range(dcp):
+                pltpu.make_async_copy(block, block, sem).wait()
+
+    any_ = pl.BlockSpec(memory_space=pl.ANY)
+    sem = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+    return pl.pallas_call(
+        kernel,
+        grid=(1,),
+        in_specs=[any_, sem, sem, any_],
+        out_specs=any_,
+        out_shape=jax.ShapeDtypeStruct(started.out.shape, started.out.dtype),
+        input_output_aliases={0: 0},
+        interpret=_interpret_params(interpret),
+        name="minimax_m3_msa_dcp_block_all_to_all_finish",
+    )(*started)
 
 
 _WEIGH_BLOCK_TOKENS = 64
@@ -680,11 +787,12 @@ def _dcp_attend(
     topk,
     rs_out_precision,
     interpret,
-    all_to_all=False,
+    partials=False,
 ):
     """The DCP attention of rows ``q [R, Hl, D]`` (this rank's rotated query
     heads) with this rank's packed ``candidates [R, G * 2 * topk]``, merged
-    by `merge_partials` or, with `all_to_all`, `merge_partials_all_to_all`."""
+    by `merge_partials`, or with `partials` its unmerged head-major ``(out,
+    lse)`` for `partials_send_buffer`."""
     q_all = jax.lax.all_gather(q, axis, axis=1, tiled=True)
     cand_all = jax.lax.all_gather(candidates, axis, axis=0)
     attend = functools.partial(
@@ -707,7 +815,7 @@ def _dcp_attend(
         PAIR_FIRST_HEAD_CALLS
         and dcp == 4
         and kv_heads == 2
-        and not all_to_all
+        and not partials
         and q.shape[0] <= msa_dcp.DCP_SMALL_BATCH_TOKENS
     ):
         # [T, Hl * D], unrotated
@@ -719,8 +827,8 @@ def _dcp_attend(
             interpret,
         )
     out, lse = attend()
-    if all_to_all:
-        return merge_partials_all_to_all(out, lse, axis, dcp=dcp, interpret=interpret)
+    if partials:
+        return out, lse
     return merge_partials(
         out,
         lse,
@@ -1644,7 +1752,7 @@ def attend_and_merge(
     _, hp_req = _request_classes(cu_q_lens, distribution, decode_rows)
     cu_d, src_row, prefix = _decode_rows(cu_q_lens, distribution, decode_rows)
     rows = src_row.shape[0]
-    dcp_out = _dcp_attend(
+    dcp_partials = _dcp_attend(
         q.decode,
         kv_cache,
         scale_cache,
@@ -1653,9 +1761,18 @@ def attend_and_merge(
         block_tables,
         cu_d,
         rs_out_precision=rs_out_precision,
-        all_to_all=True,
+        partials=True,
         **common,
     )
+    # The decode rows attend first and their merge's all-to-all crosses
+    # under the head-parallel attention, which never reads it: as XLA ops
+    # they ran after it, the all-to-all and gathers exposed (~140 us per
+    # layer, c64 mixed twin j-723bdab2).
+    send = partials_send_buffer(*dcp_partials, dcp)
+    in_flight = start_block_all_to_all(
+        send, rank, axis=axis, dcp=dcp, interpret=interpret
+    )
+    in_flight, q = jax.lax.optimization_barrier((in_flight, q))
     tokens = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
     hp_out = _head_parallel_attend(
         q,
@@ -1671,7 +1788,11 @@ def attend_and_merge(
         first_exchange=page_exchange,
         **common,
     )
-    dcp_out = dcp_out.reshape(rows, -1)
+    hp_out, in_flight = jax.lax.optimization_barrier((hp_out, in_flight))
+    got = finish_block_all_to_all(in_flight, dcp=dcp, interpret=interpret)
+    dcp_out = merge_received_partials(
+        got, dcp_partials[0].dtype, interpret=interpret
+    ).reshape(rows, -1)
     p = jnp.arange(rows, dtype=jnp.int32)
     num_decode = cu_d[-1]
 
