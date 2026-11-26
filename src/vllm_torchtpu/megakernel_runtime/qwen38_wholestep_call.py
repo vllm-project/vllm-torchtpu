@@ -173,6 +173,7 @@ _MK_BLOCK_FIELDS = (
     ("export_ids", "export_ids"),  # VLLM_TPU_MK_WHOLE_EXPORT_SELECTION
     ("union_lanepack", "union_lanepack"),  # VLLM_TPU_MK_QSA_UNION_LANEPACK
     ("fp8_dense_read", "fp8_dense_read"),  # VLLM_TPU_MK_FP8_DENSE_READ
+    ("lane_major_select", "lane_major_select"),  # VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT
 )
 _MK_TILE_FIELDS = ("hier", "rel_fetch", "nbe", "nbd", "vmem_mib")
 

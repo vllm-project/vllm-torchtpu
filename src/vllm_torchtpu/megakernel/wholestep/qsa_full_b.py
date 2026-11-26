@@ -342,6 +342,17 @@ class QSAFullIndexedBlock(QSAFullBlock):
                             os.environ.get("VLLM_TPU_MK_QSA_THR_EXIT", "19,2").split(","))
         self.thr_kw = dict(tie_skip="t" in fast,
                            early_exit=(ex_bit, ex_every) if "e" in fast else ())
+        # VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT (default off; exact): the selection's count passes
+        # compare int16 keys (`ix.thresholds` `packed16`, early exit included), and the row /
+        # union compactions run lane-major over the output slots (`ix.compact_sel`,
+        # `union_attn.compact_union` / `compact_union_chunk` `lane_major`). Same thresholds,
+        # ids, codes and order.
+        self.lane_major_select = os.environ.get(
+            "VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if self.lane_major_select:
+            self.thr_kw["packed16"] = True
+            _log_once("MK QSA lane-major select active: int16 count passes, lane-major compaction")
         # Tiers for the thresholds (h) / the compaction (c) / both (r); "2": tiers S/2, S only
         # (each tier is one more static copy of the scan: code size).
         # `nvis_balance` (VLLM_TPU_MK_QSA_NVIS_BALANCE_BUCKETS, per row bucket; exact): the
@@ -795,7 +806,8 @@ class QSAFullIndexedBlock(QSAFullBlock):
         scr["qi_th"][...] = jnp.broadcast_to(thr, (MB, 1, 128))
         scr["qi_tm"][...] = jnp.broadcast_to(tmax, (MB, 1, 128))
         scr["qi_nv"][...] = jnp.broadcast_to(nv, (MB, 1, 128))
-        consts = ix.compact_consts(S, K)
+        lm = self.lane_major_select
+        consts = ix.compact_consts(S, K, lm)
         lid = consts[-1]
         scr["qi_z"][...] = jnp.zeros((1, 128), I32)
 
@@ -805,7 +817,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
                 lid < nvr, pltpu.bitcast(scr["qi_s"][r].reshape(S, 128), I32), -1
             )
             scr["qi_id"][r] = ix.compact_row(
-                b, scr["qi_th"][r][:, :1], scr["qi_tm"][r][:, :1], nvr, K, consts
+                b, scr["qi_th"][r][:, :1], scr["qi_tm"][r][:, :1], nvr, K, consts, lm
             )
             # Columns past K are read by the last tile's copies: keep them at group 0.
             cs = [
