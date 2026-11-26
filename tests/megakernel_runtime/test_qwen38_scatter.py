@@ -179,3 +179,36 @@ def test_auto_ring_follows_the_checkpoint_count(monkeypatch):
     a = np.asarray(jax.lax.bitcast_convert_type(auto, jnp.uint8)).reshape(NMB, 512, -1)
     b = np.asarray(jax.lax.bitcast_convert_type(ref, jnp.uint8)).reshape(NMB, 512, -1)
     np.testing.assert_array_equal(a[1:, :399], b[1:, :399])
+
+
+@pytest.mark.parametrize("t8,hr", [(4, 8), (8, 16), (5, 9)])
+def test_fast_scatter_window_cut_from_history(t8, hr):
+    """The in-kernel window cut (hist=True, one static-offset branch per t) writes the
+    bytes of the region adapter and of the XLA-stacked windows. T = 8 (history of
+    rup(3 + 8, 8) = 16 rows): windows t + 1 .. t + 3 start past the first 8-row tile
+    and straddle it; T = 5 with 9 rows leaves the window cut unaligned to any tile."""
+    nl, ns = 1, 2
+    nmb = 1 + nl * ns * t8
+    SHAPE = (nmb * 4, 128, 1, 4, 256)
+    LAYOUT = gs.Qwen38GdnPoolLayout(pool_shape=SHAPE, pool_dtype="float8_e4m3fn")
+    rng = np.random.default_rng(3 + t8)
+    pool = jax.lax.bitcast_convert_type(
+        jnp.asarray(rng.integers(0, 256, size=SHAPE, dtype=np.uint8)), jnp.float8_e4m3fn
+    )
+    conv = jnp.asarray(rng.standard_normal((nl, ns, hr, 1280)), jnp.float32)
+    rec = jnp.asarray(
+        rng.standard_normal((nl, ns * t8 * 6, 128, 128)), jnp.float32
+    ).astype(jnp.bfloat16)
+    wb = jnp.asarray(1 + np.arange(nl * ns * t8, dtype=np.int32).reshape(nl, ns, t8))
+    ref = gs.scatter_gdn_ckpts(pool, conv, rec, wb, layout=LAYOUT, interpret=True)
+    kw = dict(layout=LAYOUT, interpret=True, ring=4, prefetch=1)
+    stacked = scatter_gdn_ckpts_fast(pool, conv, rec, wb, hist=False, **kw)
+    cut = scatter_gdn_ckpts_fast(pool, conv, rec, wb, hist=True, **kw)
+    a, b, c = (
+        np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint8)).reshape(nmb, 512, -1)
+        for x in (ref, stacked, cut)
+    )
+    np.testing.assert_array_equal(b[1:, :399], a[1:, :399])
+    np.testing.assert_array_equal(c[1:, :399], a[1:, :399])
+    # Every byte of the written blocks, padding rows included, matches the stacked path.
+    np.testing.assert_array_equal(c[1:], b[1:])

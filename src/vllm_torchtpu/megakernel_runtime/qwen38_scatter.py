@@ -95,7 +95,8 @@ def scatter_gdn_ckpts_fast(
     there would carry FP8 NaN encodings.
 
     `hist` (default: VLLM_TPU_MK_IO_LEAN=conv): the kernel reads each request's whole
-    conv history `[HR, QKV]` and picks the window of checkpoint t (rows t+1..t+3) itself,
+    conv history `[HR, QKV]` and cuts the window of checkpoint t (rows t+1..t+3) itself,
+    one static-offset branch per t,
     instead of taking `[n, 3, QKV]` windows stacked by XLA before the call (xprof
     j-3d2506a9: a slice / pad / relayout chain of ~8 us at 8 rows, ~16 us at 16, per call).
     Same bytes in the pool; each checkpoint loads HR - 3 more conv rows.
@@ -189,28 +190,32 @@ def scatter_gdn_ckpts_fast(
                 _store_typed(
                     vout.at[slot, j], vals[j * rows : (j + 1) * rows], interpret
                 )
-            cv = cin[slot]
+
+            def store_window(cv):
+                # 256-lane rows of the conv window in row-major order, padded to 16.
+                crow = jnp.concatenate(
+                    [
+                        cv[r : r + 1, c * 256 : (c + 1) * 256]
+                        for r in range(3)
+                        for c in range(per)
+                    ]
+                    + [jnp.zeros((CONV_ROWS - 3 * per, 256), jnp.float32)],
+                    axis=0,
+                )
+                _store_typed(cout.at[slot], crow, interpret)
+
             if hist:  # checkpoint t's window: history rows t+1 .. t+3 (`_conv_windows`)
                 t = lax.rem(i, T)
+                # One branch per t, so the window's unaligned sublane offset is static
+                # and only its 3 rows are loaded (no select over the T offsets).
+                for tt in range(T):
 
-                def hist_row(r):  # row t + 1 + r, by selection over the T static rows
-                    row = cv[1 + r : 2 + r]
-                    for k in range(1, T):
-                        row = jnp.where(t == k, cv[k + 1 + r : k + 2 + r], row)
-                    return row
+                    @pl.when(t == tt)
+                    def _(tt=tt):
+                        store_window(cin[slot, tt + 1 : tt + 4])
 
-                cv = jnp.concatenate([hist_row(r) for r in range(3)], axis=0)
-            # 256-lane rows of the conv history in row-major order, padded to 16.
-            crow = jnp.concatenate(
-                [
-                    cv[r : r + 1, c * 256 : (c + 1) * 256]
-                    for r in range(3)
-                    for c in range(per)
-                ]
-                + [jnp.zeros((CONV_ROWS - 3 * per, 256), jnp.float32)],
-                axis=0,
-            )
-            _store_typed(cout.at[slot], crow, interpret)
+            else:
+                store_window(cin[slot])
 
             @pl.when(ids_ref[i] != 0)
             def _():
