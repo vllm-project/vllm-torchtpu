@@ -100,40 +100,21 @@ def paged_fp8_indexer(
     (the last may undercount trailing padding rows). None derives them from
     ``requests``, which costs a rows x requests comparison.
     """
-    if (
-        sparse_logits
-        and stage_cache is not None
-        and q.shape[0] > 0
-        and block_size in (8, 16, 32, 64, 128)
-        and 0 < candidates.shape[1] * block_size < score_width
+    if sparse_logits and uses_prepared_candidates(
+        q.shape[0], candidates, block_size, score_width, stage_cache
     ):
-        assert candidate_source is not None
-        key = (
-            "packed_fp8_candidate_keys",
-            source_prefix,
-            stage_cache.get(("candidate_index_version", source_prefix), 0),
-            candidate_source,
-            stage_cache.get(("candidate_publication", candidate_source), 0),
-            # This cache lives within one batch. Hashing its symbolic row count
-            # would force Dynamo to specialize the dynamic token dimension.
-            candidates.shape[1],
-            block_size,
-            score_width,
-            cache.layout,
+        assert candidate_source is not None and stage_cache is not None
+        gathered_candidates = prepared_candidates(
+            cache,
+            page_table,
+            candidates,
+            requests,
+            block_size=block_size,
+            score_width=score_width,
+            stage_cache=stage_cache,
+            source_prefix=source_prefix,
+            candidate_source=candidate_source,
         )
-        gathered_candidates = stage_cache.get(key)
-        if gathered_candidates is None:
-            assert _prepare_op is not None
-            gathered_candidates = _prepare_op(
-                cache.banks,
-                page_table.int(),
-                candidates.int(),
-                requests.int(),
-                cache._layout_args(),
-                block_size,
-                score_width,
-            )
-            stage_cache[key] = gathered_candidates
         assert _prepared_select_op is not None
         selected = _prepared_select_op(
             q,
@@ -171,6 +152,64 @@ def paged_fp8_indexer(
         unordered,
         score_width,
     )
+
+
+def uses_prepared_candidates(
+    rows: int,
+    candidates: torch.Tensor,
+    block_size: int,
+    score_width: int,
+    stage_cache: dict[Any, Any] | None,
+) -> bool:
+    """Whether candidate layers score K gathered once per stage."""
+    return (
+        stage_cache is not None
+        and rows > 0
+        and block_size in (8, 16, 32, 64, 128)
+        and 0 < candidates.shape[1] * block_size < score_width
+    )
+
+
+def prepared_candidates(
+    cache: "PackedFP8IndexCacheRows",
+    page_table: torch.Tensor,
+    candidates: torch.Tensor,
+    requests: torch.Tensor,
+    *,
+    block_size: int,
+    score_width: int,
+    stage_cache: dict[Any, Any],
+    source_prefix: str,
+    candidate_source: int,
+) -> tuple[torch.Tensor, ...]:
+    """Candidate K and metadata, gathered once per Index-K and candidate version."""
+    key = (
+        "packed_fp8_candidate_keys",
+        source_prefix,
+        stage_cache.get(("candidate_index_version", source_prefix), 0),
+        candidate_source,
+        stage_cache.get(("candidate_publication", candidate_source), 0),
+        # This cache lives within one batch. Hashing its symbolic row count
+        # would force Dynamo to specialize the dynamic token dimension.
+        candidates.shape[1],
+        block_size,
+        score_width,
+        cache.layout,
+    )
+    gathered = stage_cache.get(key)
+    if gathered is None:
+        assert _prepare_op is not None
+        gathered = _prepare_op(
+            cache.banks,
+            page_table.int(),
+            candidates.int(),
+            requests.int(),
+            cache._layout_args(),
+            block_size,
+            score_width,
+        )
+        stage_cache[key] = gathered
+    return gathered
 
 
 def initialize_fp8_indexer() -> None:
