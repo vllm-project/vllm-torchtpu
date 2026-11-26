@@ -254,13 +254,13 @@ def patch_mtp_draft_verify_as_one_stage() -> bool | None:
     and the DeepSeek-style MTP draft (``deepseek_mtp``) does not implement
     SupportsPP. Under TPU_PP_MTP_PREFILL_KV the draft is built whole on the
     last stage only, so it is checked with a pipeline size of 1. The API
-    server's create_engine_config needs it, so register_tpu_platform installs
-    it as well as the patch registry.
+    server's create_engine_config builds that config before platform
+    activation, so TpuPlatform.pre_register_and_update installs it there.
     """
     try:
         from vllm.config.model import ModelConfig
     except ImportError:
-        # vllm.config mid-import (platform resolved from inside it): retry.
+        # vllm.config mid-import: retry at a later boundary.
         return False
     if getattr(ModelConfig, "_tpu_pp_mtp_draft_patch", False):
         return None

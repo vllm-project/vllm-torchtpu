@@ -655,6 +655,18 @@ class TpuPlatform(Platform):
         return {}
 
     @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        """Called by create_engine_config before it builds any config."""
+        super().pre_register_and_update(parser)
+        from vllm_torchtpu.platforms.pp_validation import (
+            patch_mtp_draft_verify_as_one_stage,
+        )
+
+        # The draft's SpeculativeConfig is verified before platform activation.
+        if patch_mtp_draft_verify_as_one_stage() is False:
+            raise RuntimeError("could not patch ModelConfig for MTP under PP")
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         assert "sharding" not in cast(dict, vllm_config.additional_config), (
             "Legacy additional_config['sharding'] is no longer supported. "
