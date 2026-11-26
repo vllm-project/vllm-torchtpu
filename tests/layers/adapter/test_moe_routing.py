@@ -162,6 +162,38 @@ def test_router_topk_op_is_registered_at_import():
 
     assert router_topk._op is not None
     assert hasattr(torch.ops.pallas, "moe_router_topk")
+    assert router_topk._values_op is not None
+    assert hasattr(torch.ops.pallas, "moe_router_topk_values")
+
+
+def test_select_experts_rowmax_bias_matches_sort(monkeypatch):
+    """With a correction bias the rowmax path takes the weights from the
+    kernel's picks (rowmax_select_values); same result as the sort path's
+    top-k on scores + bias and gather of the scores."""
+    torch = pytest.importorskip("torch")
+    torch.manual_seed(1)
+    hidden = torch.randn(48, 8, dtype=torch.bfloat16)
+    logits = torch.randn(48, 128)
+    layer = _routing_layer()
+    layer.e_score_correction_bias = torch.randn(128) * 0.1
+
+    def run():
+        return moe_routing.select_experts(
+            hidden_states=hidden,
+            router_logits=logits,
+            topk=4,
+            renormalize=True,
+            scoring_fn="sigmoid",
+            layer=layer,
+        )
+
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "sort")
+    ref_w, ref_i = run()
+    monkeypatch.setattr(moe_routing, "_ROUTER_TOPK", "rowmax")
+    got_w, got_i = run()
+
+    assert torch.equal(got_w, ref_w)
+    assert torch.equal(got_i, ref_i.to(torch.int32))
 
 
 @pytest.mark.tpu_test

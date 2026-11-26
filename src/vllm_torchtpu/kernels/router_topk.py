@@ -172,6 +172,15 @@ def select_values_t(
     )(choice, values)
 
 
+def router_topk_values(
+    choice: jax.Array, values: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array]:
+    """``select_values_t`` as ``[rows, topk]``, with a jax_op-compatible
+    signature (arrays, then statics)."""
+    weights, ids = select_values_t(choice, values, topk)
+    return weights.T, ids.T
+
+
 def router_topk(scores: jax.Array, topk: int) -> tuple[jax.Array, jax.Array]:
     """``select`` with a jax_op-compatible signature (arrays, then statics)."""
     return select(scores, topk)

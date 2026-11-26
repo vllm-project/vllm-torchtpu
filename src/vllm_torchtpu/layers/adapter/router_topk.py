@@ -21,7 +21,7 @@ elsewhere as the identical plain-torch algorithm in
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.router_topk import router_topk
+from vllm_torchtpu.kernels.router_topk import router_topk, router_topk_values
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 
@@ -37,6 +37,32 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
 # forward, and Dynamo cannot trace a lock-guarded registration there.
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
+
+
+def _fake_router_topk_values(choice: torch.Tensor, values: torch.Tensor, topk: int):
+    return _fake_router_topk(choice, topk)
+
+
+_values_op = pallas.jax_op("pallas::moe_router_topk_values", router_topk_values)
+_values_op.register_fake(_fake_router_topk_values)
+
+
+def rowmax_select_values(
+    choice: torch.Tensor, values: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``rowmax_select`` of ``choice`` with ``values`` (same shape) at the
+    picked experts as the weights: ``values.gather(-1, ids)``, from the
+    kernel's own picks instead of a separate gather over the scores (a
+    SparseCore round trip at prefill sizes)."""
+    if choice.device.type != "tpu":
+        _, ids = rowmax_topk(choice, topk)
+        return values.gather(-1, ids.long()), ids
+    if choice.dim() != 2 or values.shape != choice.shape:
+        raise ValueError(
+            "router top-k kernel expects [rows, experts] choice and values, got "
+            f"{choice.shape} and {values.shape}"
+        )
+    return _values_op(choice.float(), values.float(), topk)
 
 
 def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
