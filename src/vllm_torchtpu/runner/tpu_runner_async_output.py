@@ -182,6 +182,16 @@ class AsyncPreResults:
         return self.copy_state.sampled_token_ids_cpu
 
 
+def valid_token_lists(tokens_cpu: torch.Tensor) -> list[list[int]]:
+    """Each row's tokens with the INVALID_TOKEN_ID padding dropped.
+
+    One ``tolist`` and a Python filter: for the few short rows of a decode
+    step this is several times cheaper than masking, summing and splitting
+    the CPU tensor.
+    """
+    return [[t for t in row if t != INVALID_TOKEN_ID] for row in tokens_cpu.tolist()]
+
+
 class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
     """Holds asynchronous model output specifically from a TPU runner."""
 
@@ -214,14 +224,11 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             for i in self.discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[i].clear()
         else:
-            valid_mask = selected_token_ids != INVALID_TOKEN_ID
-            gen_lens = valid_mask.sum(dim=1).tolist()
-            valid_sampled_token_ids = [
-                seq.tolist() for seq in selected_token_ids[valid_mask].split(gen_lens)
-            ]
+            valid_sampled_token_ids = valid_token_lists(selected_token_ids)
             if self.copy_state.spec_logprobs:
                 self._model_runner_output.logprobs = spec_logprobs_lists(
-                    self.copy_state.spec_logprobs, gen_lens
+                    self.copy_state.spec_logprobs,
+                    [len(row) for row in valid_sampled_token_ids],
                 )
             for i in self.discard_sampled_tokens_req_indices:
                 valid_sampled_token_ids[i].clear()

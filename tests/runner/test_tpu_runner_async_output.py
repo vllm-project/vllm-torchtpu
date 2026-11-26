@@ -28,6 +28,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     extract_draft_token_ids,
     spec_logprobs_lists,
     subtract_num_rejected_tokens,
+    valid_token_lists,
 )
 
 
@@ -239,3 +240,18 @@ def test_get_output_attaches_spec_logprobs():
         1,
     ]
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
+
+
+def test_valid_token_lists_matches_mask_and_split():
+    tokens = torch.tensor(
+        [
+            [5, 6, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+            [7, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],
+            [1, 2, 3, 4],
+            [INVALID_TOKEN_ID] * 4,
+        ],
+        dtype=torch.int32,
+    )
+    mask = tokens != INVALID_TOKEN_ID
+    expected = [seq.tolist() for seq in tokens[mask].split(mask.sum(dim=1).tolist())]
+    assert valid_token_lists(tokens) == expected == [[5, 6], [7], [1, 2, 3, 4], []]

@@ -197,6 +197,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
     draft_token_positions,
+    valid_token_lists,
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
@@ -2798,11 +2799,7 @@ class TPUModelRunner(GPUModelRunner):
         if max_gen_len == 1:
             valid_sampled_token_ids = pre_next_tokens_cpu.tolist()
         else:
-            valid_mask = pre_next_tokens_cpu != INVALID_TOKEN_ID
-            gen_lens = valid_mask.sum(dim=1).tolist()
-            valid_sampled_token_ids = [
-                seq.tolist() for seq in pre_next_tokens_cpu[valid_mask].split(gen_lens)
-            ]
+            valid_sampled_token_ids = valid_token_lists(pre_next_tokens_cpu)
 
         for i in pre_discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
