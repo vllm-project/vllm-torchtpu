@@ -307,6 +307,11 @@ def test_ple_state_cache_speculative_rollback_protocol(
         .to(torch.bfloat16)
         .eval()
     )
+    # The layer allocates its parameters uninitialized; NaN garbage in them
+    # would fail the comparisons below for reasons unrelated to rollback.
+    with torch.no_grad():
+        for param in ple_layer.parameters():
+            param.normal_(0.0, 0.5)
 
     window_shape = (
         ple_layer.conv_state_len,

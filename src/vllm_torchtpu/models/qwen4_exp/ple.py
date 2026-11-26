@@ -715,6 +715,13 @@ class PLEStateCache(nn.Module, MambaBase):
 
     @staticmethod
     def _resolve_read_blocks(metadata: Any, num_reqs: int) -> torch.Tensor:
+        """Block each request reads its PLE state from, shape [num_reqs].
+
+        Without speculative decoding that is the request's state block. With
+        it, the block is the checkpoint slot `mamba_slot_read_offsets` points
+        at (the one the last verify accepted). Padding requests (state index 0)
+        read the null block 0.
+        """
         state_indices = metadata.mamba_state_indices[:num_reqs]
         read_offsets = metadata.mamba_slot_read_offsets
         if read_offsets is None:
