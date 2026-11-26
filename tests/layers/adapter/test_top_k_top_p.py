@@ -154,18 +154,17 @@ def test_sampler_topk_candidates_gating(monkeypatch):
     runner.vocab_size = 248320
     monkeypatch.setattr(envs, "TPU_SAMPLER_TOPK_CANDIDATES", 64)
 
-    input_batch = SimpleNamespace(
-        top_k_cpu_tensor=torch.tensor([20, 20, 20, 20], dtype=torch.int64)
-    )
+    # InputBatch.top_k_cpu is the numpy view of top_k_cpu_tensor.
+    input_batch = SimpleNamespace(top_k_cpu=np.array([20, 20, 20, 20], dtype=np.int64))
     runner.input_batch = input_batch
 
     assert runner._sampler_topk_candidates(0, 4, None) == 64
     assert runner._sampler_topk_candidates(0, 4, object()) == 0
 
-    input_batch.top_k_cpu_tensor = torch.tensor([40, 20, 20, 20], dtype=torch.int64)
+    input_batch.top_k_cpu = np.array([40, 20, 20, 20], dtype=np.int64)
     assert runner._sampler_topk_candidates(0, 4, None) == 0
 
-    input_batch.top_k_cpu_tensor = torch.tensor([0, 20, 20, 20], dtype=torch.int64)
+    input_batch.top_k_cpu = np.array([0, 20, 20, 20], dtype=np.int64)
     assert runner._sampler_topk_candidates(0, 4, None) == 0
 
 
