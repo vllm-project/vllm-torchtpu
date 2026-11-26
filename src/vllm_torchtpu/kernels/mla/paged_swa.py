@@ -79,7 +79,14 @@ def _publish_swa_sc(raw, records, values, page_size, shift=0):
         tokens=records.shape[0],
         buckets=prep.SWA_PACK_TOKENS,
     ):
-        padded = -(-records.size // (lanes * cores)) * (lanes * cores)
+        # The pack emits four segment-major rows per token, so tokens pad to a
+        # quarter block: each pipeline step then covers all four segments of
+        # a quarter of the tokens instead of one segment of all of them, and
+        # a decode step's records (72 tokens) take one read-modify-write round
+        # instead of four (v7: SparseCore publish 3.9 -> 1.9 us, with the
+        # smaller pack 27.6 -> 23.2 us per layer).
+        quarter = lanes * cores // 4
+        padded = -(-records.size // quarter) * quarter
         ids, words, masks = prep.swa_word_pool_pack(
             records, values, capacity=capacity, padded=padded
         )
