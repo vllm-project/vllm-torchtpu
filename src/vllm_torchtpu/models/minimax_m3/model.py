@@ -236,7 +236,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 attn = self.self_attn(positions, normed)
                 shard = _reduce_scatter_rows(attn + hidden_states / self.tp_size)
         else:
-            shard, normed = self._norm_gather(
+            gather = (
+                self._norm_gather_pieces
+                if envs.TPU_MINIMAX_M3_SP_ATTN_PIECES
+                else self._norm_gather
+            )
+            shard, normed = gather(
                 self.input_layernorm,
                 shard,
                 update,
@@ -246,7 +251,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
             layer_input = shard
             if sp_o_proj.applies(o_proj):
                 attn = self.self_attn(positions, normed, project=False)
-                update = sp_o_proj.sp_o_proj(o_proj, attn)
+                pieces = (
+                    _ffn_pieces(shard.shape[0], self.tp_size)
+                    if envs.TPU_MINIMAX_M3_SP_ATTN_PIECES
+                    else 1
+                )
+                update = sp_o_proj.sp_o_proj(o_proj, attn, pieces)
             else:
                 attn = self.self_attn(positions, normed)
                 update = _reduce_scatter_rows(attn)
@@ -462,11 +472,13 @@ class MiniMaxM3Model(nn.Module):
             if envs.TPU_MINIMAX_M3_SP_FFN_PIECES > 1:
                 logger.info(
                     "MiniMax-M3 SP row pieces: %d on steps of >= %d tokens "
-                    "(FFN gather pieces %s, dense FFN per piece %s)",
+                    "(FFN gather pieces %s, dense FFN per piece %s, attention "
+                    "pieces %s)",
                     envs.TPU_MINIMAX_M3_SP_FFN_PIECES,
                     envs.TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS,
                     envs.TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES,
                     envs.TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE,
+                    envs.TPU_MINIMAX_M3_SP_ATTN_PIECES,
                 )
         # Residual-stream entries of these layers (k = output of layer k-1,
         # residual added, before the next norm) are also returned; set by

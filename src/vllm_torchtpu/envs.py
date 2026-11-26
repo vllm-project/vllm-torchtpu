@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS: int = 4096
     TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES: bool = True
     TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE: bool = False
+    TPU_MINIMAX_M3_SP_ATTN_PIECES: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -984,6 +985,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # reduce-scatter overlaps the next piece's FFN. MoE layers keep one pass.
     "TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE": env_bool(
         "TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE", default=False
+    ),
+    # With TPU_MINIMAX_M3_SP_FFN_PIECES: the attention input is gathered in the
+    # same row pieces and qkv_proj runs on each piece as it lands; o_proj's
+    # e4m3 all-to-all (TPU_MINIMAX_M3_SP_A2A_OPROJ + _A2A_E4M3) and
+    # projection run per piece. Row-local math only: same bits.
+    "TPU_MINIMAX_M3_SP_ATTN_PIECES": env_bool(
+        "TPU_MINIMAX_M3_SP_ATTN_PIECES", default=False
     ),
     # "full" SP: instead of reduce-scattering o_proj's per-rank partial sums
     # (bf16 [T, hidden]), all-to-all the attention output (bf16 [T, heads/TP x

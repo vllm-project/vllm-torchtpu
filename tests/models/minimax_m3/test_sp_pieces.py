@@ -32,6 +32,7 @@ from tests.models.minimax_m3 import test_sp_mode as base  # noqa: E402
 from vllm_torchtpu import envs  # noqa: E402
 from vllm_torchtpu.distributed import pallas_all_reduce  # noqa: E402
 from vllm_torchtpu.layers.adapter import token_padding  # noqa: E402
+from vllm_torchtpu.models.minimax_m3 import attention as attn_mod  # noqa: E402
 from vllm_torchtpu.models.minimax_m3 import model as mm  # noqa: E402
 
 BIG_T = 256  # TP 4: 64-row shards, two 32-row pieces
@@ -42,6 +43,7 @@ _PIECES_ENV = {
     "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES": True,
     "TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE": False,
     "TPU_MINIMAX_M3_SP_E4M3_SHARED": False,
+    "TPU_MINIMAX_M3_SP_ATTN_PIECES": False,
 }
 
 
@@ -301,3 +303,111 @@ def test_mlp_list_input_matches_block(monkeypatch):
     pieces = [(q8[:64], scale[:64]), (q8[64:], scale[64:])]
     torch.testing.assert_close(mlp(pieces), mlp((q8, scale)), rtol=0, atol=0)
     torch.testing.assert_close(mlp([x[:64], x[64:]]), mlp(x), rtol=0, atol=0)
+
+
+# ------------------------------------------------------ attention pieces
+class _PieceAttn(base._Attn):
+    """The stand-in attention, also given gathered row pieces: their rows
+    back in step order (attention.py `_step_rows`), as qkv_proj's output is."""
+
+    def __call__(self, positions, x, index_reuse=None, project=True):
+        if not isinstance(x, list):
+            return super().__call__(positions, x, index_reuse, project)
+        deq = [(p[0].float() * p[1]).to(torch.bfloat16) for p in x]
+        out = super().__call__(
+            positions, attn_mod._step_rows(deq), index_reuse, project
+        )
+        self.calls[-1] = ("list", index_reuse, project)
+        return out
+
+
+@pytest.fixture
+def piece_attn(monkeypatch):
+    monkeypatch.setattr(base, "_Attn", _PieceAttn)
+    monkeypatch.setattr(
+        attn_mod, "get_tensor_model_parallel_world_size", lambda: base.TP
+    )
+
+
+_ATTN_CONFIGS = {
+    # The r15-merge job's SP flags: e4m3 gathers, fused norm, e4m3 qkv,
+    # e4m3 all-to-all o_proj, FFN and attention pieces.
+    "target": base._TARGET,
+    "rs-o_proj": dict(base._TARGET, TPU_MINIMAX_M3_SP_A2A_OPROJ="off"),
+}
+
+
+@pytest.mark.parametrize("name", list(_ATTN_CONFIGS))
+def test_attn_pieces_bit_exact(tp, monkeypatch, piece_attn, name):
+    """The attention input gathered in pieces (qkv per piece) and o_proj's
+    e4m3 all-to-all + projection per piece: same bits as one piece."""
+    cfg = _ATTN_CONFIGS[name]
+    want, calls1, _ = _run(tp, monkeypatch, **cfg)
+    outs, calls2, models = _run(
+        tp, monkeypatch, **cfg, **_pieces(TPU_MINIMAX_M3_SP_ATTN_PIECES=True)
+    )
+    _assert_same(outs, want)
+    base._flags_restored(models)
+    # Layers 1-3 get their attention input as pieces (layer 0 attends to
+    # the embedding, which is not gathered).
+    kinds = [
+        c[0] for m in models[:1] for layer in m.layers for c in layer.self_attn.calls
+    ]
+    assert kinds == ["Tensor", "list", "list", "list"]
+    a2a = [c for c in calls2 if c.startswith("a2a")]
+    if cfg["TPU_MINIMAX_M3_SP_A2A_OPROJ"] != "off":
+        # q and scales per piece on layers 1-3, once on layer 0.
+        assert len(a2a) == 2 + 3 * 2 * 2
+    else:
+        assert not a2a
+    # Gathers: one per piece on both sides of layers 1-3.
+    assert calls2.count("ag:torch.float8_e4m3fn") > calls1.count(
+        "ag:torch.float8_e4m3fn"
+    )
+
+
+def test_attn_pieces_without_ffn_gather_pieces(tp, monkeypatch, piece_attn):
+    want, _, _ = _run(tp, monkeypatch, **base._TARGET)
+    outs, _, _ = _run(
+        tp,
+        monkeypatch,
+        **base._TARGET,
+        **_pieces(
+            TPU_MINIMAX_M3_SP_ATTN_PIECES=True,
+            TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES=False,
+        ),
+    )
+    _assert_same(outs, want)
+
+
+def test_attention_projects_each_piece(monkeypatch):
+    """The real attention forward given gathered pieces runs qkv_proj on each
+    piece and hands the step-ordered rows on."""
+    seen = []
+
+    def stop(qkv, *a):
+        seen.append(qkv)
+        raise base._Stop
+
+    monkeypatch.setattr(attn_mod, "norm_rope_heads", stop)
+    monkeypatch.setattr(attn_mod, "get_tensor_model_parallel_world_size", lambda: 2)
+    _jax_e4m3_matmul(monkeypatch)
+    attn = object.__new__(attn_mod.MiniMaxM3SparseAttention)
+    torch.nn.Module.__init__(attn)
+    attn.qkv_proj = base._Linear(base.H, 96, ("qkv",))
+    for name in ("num_heads", "num_kv_heads", "head_dim", "rotary_emb", "norm_rope_op"):
+        object.__setattr__(attn, name, None)
+    for name in ("q_norm", "k_norm", "index_q_norm", "index_k_norm"):
+        object.__setattr__(attn, name, None)
+    x = base._input()[:64]
+    q8, scale = mm._quantize_rows(x)
+    # TP 2, two pieces of 16 rows: piece i = (rank 0 block i, rank 1 block i).
+    blocks = [(q8[i : i + 16], scale[i : i + 16]) for i in range(0, 64, 16)]
+    pieces = [
+        tuple(torch.cat([blocks[r * 2 + i][j] for r in range(2)]) for j in range(2))
+        for i in range(2)
+    ]
+    for hidden in ((q8, scale), pieces):
+        with pytest.raises(base._Stop):
+            attn.forward(torch.arange(64), hidden)
+    torch.testing.assert_close(seen[1], seen[0], rtol=0, atol=0)

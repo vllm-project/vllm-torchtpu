@@ -254,6 +254,15 @@ def norm_rope_heads(
     return op(qkv, cos_sin, weight)
 
 
+def _step_rows(pieces: list[torch.Tensor]) -> torch.Tensor:
+    """Rows of the all-gathered pieces (piece i: every rank's i-th row block
+    of its shard) back in step order."""
+    tp = get_tensor_model_parallel_world_size()
+    x = torch.stack(pieces)
+    n, rows = x.shape[:2]
+    return x.view(n, tp, rows // tp, -1).transpose(0, 1).reshape(n * rows, -1)
+
+
 class MiniMaxM3SparseAttention(nn.Module):
     """GQA attention over the KV blocks the lightning indexer selects.
 
@@ -503,10 +512,24 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.q_norm.weight, self.k_norm.weight, self.head_dim, rounding
         )
 
+    def _qkv(
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ) -> torch.Tensor:
+        if isinstance(hidden_states, tuple):
+            e4m3_apply = getattr(self.qkv_proj.quant_method, "apply_e4m3_rows", None)
+            if e4m3_apply is None:
+                q8, row_scale = hidden_states
+                qkv, _ = self.qkv_proj((q8.float() * row_scale).to(torch.bfloat16))
+                return qkv
+            # qkv_proj is bias-free and keeps the linear's forward = apply.
+            return e4m3_apply(self.qkv_proj, *hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
+        return qkv
+
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list,
         index_reuse: dict | None = None,
         project: bool = True,
     ) -> torch.Tensor:
@@ -515,18 +538,15 @@ class MiniMaxM3SparseAttention(nn.Module):
         the Shared layers after it.
 
         ``hidden_states`` may come as e4m3 rows with per-row f32 scales
-        (an SP step's e4m3 all-gather), which qkv_proj contracts as e4m3.
+        (an SP step's e4m3 all-gather), which qkv_proj contracts as e4m3, or
+        as a list of such gathered row pieces (model.py `_norm_gather_pieces`).
         ``project=False`` returns this rank's heads before o_proj."""
-        if isinstance(hidden_states, tuple):
-            e4m3_apply = getattr(self.qkv_proj.quant_method, "apply_e4m3_rows", None)
-            if e4m3_apply is None:
-                q8, row_scale = hidden_states
-                qkv, _ = self.qkv_proj((q8.float() * row_scale).to(torch.bfloat16))
-            else:
-                # qkv_proj is bias-free and keeps the linear's forward = apply.
-                qkv = e4m3_apply(self.qkv_proj, *hidden_states)
+        if isinstance(hidden_states, list):
+            # An SP step's gathered row pieces (TPU_MINIMAX_M3_SP_ATTN_PIECES):
+            # project each as it lands, then put the rows in step order.
+            qkv = _step_rows([self._qkv(p) for p in hidden_states])
         else:
-            qkv, _ = self.qkv_proj(hidden_states)
+            qkv = self._qkv(hidden_states)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,
@@ -538,8 +558,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.norm_rope_op,
             getattr(self, norm_hoist.QK_TABLE, None),
         )
-        rows = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
-        num_tokens = rows.shape[0]
+        num_tokens = qkv.shape[0]
         if not self.q_head_major:
             q = q.view(num_tokens, self.num_heads, self.head_dim)
         metadata = get_forward_context().attn_metadata

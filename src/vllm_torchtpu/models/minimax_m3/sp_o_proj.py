@@ -197,11 +197,14 @@ _o_proj_e4m3_op.register_fake(
 )
 
 
-def sp_o_proj(o_proj: nn.Module, attn: torch.Tensor) -> torch.Tensor:
+def sp_o_proj(o_proj: nn.Module, attn: torch.Tensor, pieces: int = 1) -> torch.Tensor:
     """o_proj(attn) summed over TP, for this rank's row shard: ``attn`` is
     this rank's heads for all T rows, bf16 [T, K/TP]; returns [T/TP, N].
     TPU_MINIMAX_M3_SP_A2A_E4M3 sends the heads as e4m3 rows (power-of-two
-    row scales) and contracts e4m3 x e4m3."""
+    row scales) and contracts e4m3 x e4m3, one all-to-all and o_proj per
+    row piece of the shard (``pieces``, TPU_MINIMAX_M3_SP_ATTN_PIECES), so a
+    piece's o_proj can run while the next piece crosses (row-local: same
+    bits as one piece); the bf16 path ignores ``pieces``."""
     tp = get_tp_group().world_size
     rows, k = attn.shape
     w = _full_weight(o_proj, tp)
@@ -209,11 +212,24 @@ def sp_o_proj(o_proj: nn.Module, attn: torch.Tensor) -> torch.Tensor:
     order = _rotate_blocks if o_proj.weight.dim() == 3 else (lambda x: x)
     if envs.TPU_MINIMAX_M3_SP_A2A_E4M3:
         q, r = _quantize_op(attn)
-        q = order(all_to_all_rows(q).view(tp, rows // tp, k))
-        r = order(all_to_all_rows(r).view(tp, rows // tp, 1))
-        # The weight is the op's first reader of o_proj's parameters, as in the
-        # plain trace (placeholders follow first use; shape_variants compares).
-        return _o_proj_e4m3_op(q, r, w, o_proj.weight_scale)
+        if pieces == 1:
+            q = order(all_to_all_rows(q).view(tp, rows // tp, k))
+            r = order(all_to_all_rows(r).view(tp, rows // tp, 1))
+            # The weight is the op's first reader of o_proj's parameters, as in
+            # the plain trace (placeholders follow first use; shape_variants
+            # compares).
+            return _o_proj_e4m3_op(q, r, w, o_proj.weight_scale)
+        # Piece i: row block i of every destination's shard.
+        q = q.view(tp, pieces, -1, k)
+        r = r.view(tp, pieces, -1, 1)
+        out = []
+        for i in range(pieces):
+            qi, ri = q[:, i], r[:, i]
+            piece_rows = qi.shape[1]
+            qi = order(all_to_all_rows(qi.reshape(-1, k)).view(tp, piece_rows, k))
+            ri = order(all_to_all_rows(ri.reshape(-1, 1)).view(tp, piece_rows, 1))
+            out.append(_o_proj_e4m3_op(qi, ri, w, o_proj.weight_scale))
+        return torch.cat(out)
     heads = order(all_to_all_rows(attn).view(tp, rows // tp, k))
     weight = w.to(torch.bfloat16) * o_proj.weight_scale.to(torch.bfloat16)
     return torch.einsum("eti,eio->to", heads, weight)
