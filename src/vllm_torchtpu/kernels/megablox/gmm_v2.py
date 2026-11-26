@@ -24,6 +24,12 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.megablox.row_copy import (
+    FP8_ROW_SUBLANES,
+    fp8_row_value,
+    matmul_rows,
+)
+
 # Util.
 
 
@@ -1696,6 +1702,24 @@ class ScatterRefs:
     dest_copies: tuple = ()
 
 
+@dataclasses.dataclass(frozen=True)
+class WaveRefs:
+    """Refs of `gmm_v2_mlp_scatter`'s rows as they land (see `wave_lhs`
+    there)."""
+
+    recv: jax.Array  # HBM uint32[size_m, 8, size_k / 32], fp8 row words
+    sems: jax.Array  # DMA[>= size_lhs_group]: wave e counts lhs group e's rows
+    scale_hbm: jax.Array  # HBM float32[size_m]
+    scale: jax.Array  # SMEM float32[size_m], valid after `scale_copy`
+    rows: jax.Array  # VMEM uint32[tile_m, 8, size_k / 32]
+    lhs: jax.Array  # VMEM [tile_m / sub, sub, size_k]
+    copy_sems: jax.Array  # DMA[2]: the tile's rows, the scales
+    waited: jax.Array  # SMEM int32[1]: the waves waited for so far
+
+    def scale_copy(self):
+        return pltpu.make_async_copy(self.scale_hbm, self.scale, self.copy_sems.at[1])
+
+
 def _axes(axis, num_members):
     if isinstance(axis, str):
         return (axis,), (num_members,)
@@ -2038,6 +2062,7 @@ def _mlp_kernel(
     out_ref,
     partial_out_ref,
     scatter: ScatterRefs | None,
+    wave: WaveRefs | None = None,
 ):
     up, down = cfgs.up, cfgs.down
     dims = up.dims
@@ -2088,10 +2113,20 @@ def _mlp_kernel(
         for c in copies:
             c.start()
 
+    def start_first_weights(group_id):
+        for p in range(cfgs.num_parts):
+            start(up_copies(p, group_id))
+        for q in range(cfgs.down_parts):
+            start(down_copies(q, group_id))
+
     def wait(copies):
         for c in copies:
             c.wait()
 
+    if wave is not None:
+        # The scales are read from the first tile on.
+        wave.scale_copy().start()
+        wave.waited[0] = 0
 
     if scatter is not None:
         # No row may land in a member's receive buffer before that member runs
@@ -2236,8 +2271,57 @@ def _mlp_kernel(
                 send_extra_rows(sc, sc.extra)
             sc.in_flight[4] = 1
 
-    def body(tiled_lhs_ref, tiled_out_ref=None):
-        gm_id = pl.program_id(0)
+    def wave_rows_copy(gm_id):
+        """The copy of tile `gm_id`'s rows to their sublane block positions."""
+        assert wave is not None
+        m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+        size = metadata_ref.gm_id_to_m_offset[gm_id + 1] - m_start
+        return pltpu.make_async_copy(
+            wave.recv.at[pl.ds(m_start, size)],
+            wave.rows.at[pl.ds(m_start % sub, size)],
+            wave.copy_sems.at[0],
+        )
+
+    def wait_waves(end):
+        """Wait for every row of the waves before `end` not yet waited for."""
+        assert wave is not None
+
+        def one(e, carry):
+            wait_rows(wave.sems.at[e], wave.recv, lhs_group_sizes_ref[e])
+            return carry
+
+        lax.fori_loop(wave.waited[0], end, one, 0)
+        wave.waited[0] = jnp.maximum(wave.waited[0], end)
+
+    def fetch_rows(gm_id):
+        """Start copying tile `gm_id`'s rows once its expert's wave (and every
+        earlier one) has landed whole."""
+        wait_waves(group_offset_ref[0] + metadata_ref.gm_id_to_group_id[gm_id] + 1)
+        wave_rows_copy(gm_id).start()
+
+    def convert_rows(gm_id):
+        """The tile's landed fp8 rows as `gather_rows` gives them (bf16, the
+        same bits), rows of other tiles zeros."""
+        assert wave is not None
+        m_start = metadata_ref.gm_id_to_m_offset[gm_id]
+        m_offset = m_start - m_start % sub
+        lo = m_start - m_offset
+        hi = metadata_ref.gm_id_to_m_offset[gm_id + 1] - m_offset
+        last = wave.scale.shape[0] - 1
+        for c in range(tile_m // sub):
+
+            @pl.when(jnp.logical_and(c * sub < hi, lo < (c + 1) * sub))
+            def _(c=c):
+                rows = []
+                for j in range(sub):
+                    scale = wave.scale[jnp.minimum(m_offset + c * sub + j, last)]
+                    rows.append(fp8_row_value(wave.rows[c * sub + j], scale))
+                x = jnp.stack(rows).reshape(sub, size_k)
+                wave.lhs[c] = matmul_rows(x, hi - c * sub, lo - c * sub)
+
+    def body(tiled_lhs_ref, tiled_out_ref=None, gm_id=None):
+        if gm_id is None:
+            gm_id = pl.program_id(0)
         slot = lax.rem(gm_id, 2) if scatter is not None else None
         group_id = metadata_ref.gm_id_to_group_id[gm_id]
         prev_group_id = metadata_ref.gm_id_to_group_id[jnp.maximum(gm_id - 1, 0)]
@@ -2252,13 +2336,13 @@ def _mlp_kernel(
         # fetched its rows: started before the pipeline, the ~25 MB of weight
         # copies hold back the rows' copy (~8 us at the decode shapes), while
         # from here the first part arrives a third of the way in and the
-        # others load behind the first matmuls.
-        @pl.when(gm_id == 0)
-        def _():
-            for p in range(cfgs.num_parts):
-                start(up_copies(p, group_id))
-            for q in range(cfgs.down_parts):
-                start(down_copies(q, group_id))
+        # others load behind the first matmuls. With `wave`, they start
+        # behind the first rows' copy (`wave_tiles`).
+        if wave is None:
+
+            @pl.when(gm_id == 0)
+            def _():
+                start_first_weights(group_id)
 
         m_start = metadata_ref.gm_id_to_m_offset[gm_id]
         m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
@@ -2328,6 +2412,14 @@ def _mlp_kernel(
             @pl.when(fetch_next)
             def _(p=p):
                 start(up_copies(p, next_group_id))
+
+        if wave is not None:
+            # The next tile's rows copy behind the down projection. A wave
+            # still landing holds back this tile's down projection and sends,
+            # not the next tile, which needs it anyway.
+            @pl.when(has_next)
+            def _():
+                fetch_rows(gm_id + 1)
 
         # The gate/up kernel stores its rows with `out[0] += partial` in each of
         # its gm tiles, and the next tile adds this tile's last partial sublane
@@ -2402,10 +2494,46 @@ def _mlp_kernel(
     index_maps = MlpIndexMaps(metadata_ref, sub)
     bounded = pl.BoundedSlice(tile_m // sub)
     lhs_spec = pl.BlockSpec((bounded, sub, size_k), index_maps.lhs_index_map)
-    lhs_in = lhs_ref.reshape(-1, sub, lhs_ref.shape[-1])
+
+    def wave_tiles():
+        """The tiles of `body` on rows that land while it runs."""
+        assert wave is not None
+
+        @pl.when(num_gm > 0)
+        def _():
+            fetch_rows(0)
+            start_first_weights(metadata_ref.gm_id_to_group_id[0])
+
+        def step(gm_id, carry):
+            wave_rows_copy(gm_id).wait()
+
+            @pl.when(gm_id == 0)
+            def _():
+                wave.scale_copy().wait()
+
+            convert_rows(gm_id)
+            body(wave.lhs, gm_id=gm_id)
+            return carry
+
+        lax.fori_loop(0, num_gm, step, 0)
+
+        @pl.when(num_gm == 0)
+        def _():
+            wave.scale_copy().wait()
+
+        # Every wave semaphore ends balanced, the waves of experts without
+        # tiles included.
+        wait_waves(lhs_group_sizes_ref.shape[0])
+
     if scatter is not None:
-        pipeline_fn = pltpu.emit_pipeline(body, grid=(num_gm,), in_specs=(lhs_spec,))
-        pipeline_fn(lhs_in)
+        if wave is None:
+            lhs_in = lhs_ref.reshape(-1, sub, lhs_ref.shape[-1])
+            pipeline_fn = pltpu.emit_pipeline(
+                body, grid=(num_gm,), in_specs=(lhs_spec,)
+            )
+            pipeline_fn(lhs_in)
+        else:
+            wave_tiles()
         # No tile at all: the barrier and the extra rows still go.
         open_sends()
         # Every row sent from here has left, and every row bound here has landed.
@@ -2423,6 +2551,8 @@ def _mlp_kernel(
         with jax.named_scope("mlp_exit_barrier"):
             pl.semaphore_wait(scatter.entered, _num_members(scatter.num_members))
         return
+    assert wave is None
+    lhs_in = lhs_ref.reshape(-1, sub, lhs_ref.shape[-1])
     out_spec = pl.BlockSpec((bounded, sub, size_n), index_maps.out_index_map)
     pipeline_fn = pltpu.emit_pipeline(
         body, grid=(num_gm,), in_specs=(lhs_spec,), out_specs=out_spec
@@ -2643,10 +2773,12 @@ def mlp_scatter_kernel_main(
     num_members,
     extra: bool,
     tail: tuple[int, int] | None = None,
+    wave: bool = False,
 ):
     """Entry point of `gmm_v2_mlp_scatter` (refs: scalar prefetch, inputs,
     outputs, scratch; the `extra` ones present when `extra`, the owner tail's
-    when `tail` = (TP ranks, tokens per chunk))."""
+    when `tail` = (TP ranks, tokens per chunk), the landing rows' when
+    `wave`, lhs then being the fp8 row words)."""
     refs = list(refs)
 
     def take(n):
@@ -2658,6 +2790,7 @@ def mlp_scatter_kernel_main(
     extra_prefetch = take(3) if extra else []
     tail_prefetch = take(5) if tail else []
     lhs, w1, s1, w2, s2, dest_member_hbm, dest_row_hbm = take(7)
+    wave_inputs = take(2) if wave else []
     extra_inputs = take(1) if extra else []
     recv = take(1)[0]
     extra_outputs = take(1) if extra else []
@@ -2685,7 +2818,22 @@ def mlp_scatter_kernel_main(
     ) = take(19)
     extra_scratch = take(2) if extra else []
     tail_scratch = take(2) if tail else []
+    wave_scratch = take(5) if wave else []
     assert not refs
+    wave_refs = None
+    if wave:
+        scale_hbm, wave_sems = wave_inputs
+        wave_rows, wave_lhs, wave_scale, copy_sems, waited = wave_scratch
+        wave_refs = WaveRefs(
+            recv=lhs,
+            sems=wave_sems,
+            scale_hbm=scale_hbm,
+            scale=wave_scale,
+            rows=wave_rows,
+            lhs=wave_lhs,
+            copy_sems=copy_sems,
+            waited=waited,
+        )
     extra_refs = None
     if extra:
         extra_member, extra_row, extra_expected = extra_prefetch
@@ -2759,6 +2907,7 @@ def mlp_scatter_kernel_main(
             extra=extra_refs,
             tail=tail_refs,
         ),
+        wave=wave_refs,
     )
 
 
@@ -2790,7 +2939,7 @@ def scatter_rows_supported(dtype, size_n: int) -> bool:
     ]
 )
 def gmm_v2_mlp_scatter(
-    lhs: jax.Array,  # [size_m, size_k]
+    lhs: jax.Array | None,  # [size_m, size_k]; None with `wave_lhs`
     w1: jax.Array,  # [size_group, size_k, 2 * size_inter]
     w2: jax.Array,  # [size_group, size_inter, size_n]
     group_sizes: jax.Array,  # int32[size_lhs_group]
@@ -2803,6 +2952,7 @@ def gmm_v2_mlp_scatter(
     expected: jax.Array,  # int32[1]
     extra: tuple[jax.Array, ...] | None = None,
     tail: tuple[jax.Array, ...] | None = None,
+    wave_lhs: tuple[jax.Array, jax.Array, jax.Array] | None = None,
     *,
     num_recv_rows: int,
     num_extra_recv_rows: int = 0,
@@ -2849,21 +2999,51 @@ def gmm_v2_mlp_scatter(
     Then the result is the engine's sums `[tp * blk, 16, size_n / 16]`, owned
     block by owned block, returned once this member's copies have left and
     the other ranks' blocks have landed. `fits[0]` = 0: no sums, no copies.
+
+    `wave_lhs` = (recv, row_scale, wave_sems), lhs None: the rows come as
+    they land. recv uint32 [size_m, 8, size_k / 32] holds fp8 row words
+    (`row_copy.fp8_row_words`) and row `j` stands for bf16 ``recv[j] *
+    row_scale[j]`` (row_scale float32 [size_m]) as `gather_rows` makes it.
+    wave_sems: DMA semaphores of this core, from another kernel; semaphore
+    `e` counts lhs group `e`'s rows (8 KB each at size_k 8192) as they land.
+    Before its first tile the kernel waits for all of an expert's rows (for
+    `group_sizes[e]` rows of each wave up to it, every wave once, in order),
+    and before it exits for every wave's rows. The result is bitwise lhs =
+    `gather_rows`' rows. size_m must be a multiple of 16.
     """
 
-    size_m = lhs.shape[0]
-    size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
-    padded_size_m = align_to(size_m, size_lhs_sublane)
-    if padded_size_m != size_m:
-        lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
-        dest_member = jnp.pad(dest_member, (0, padded_size_m - size_m))
-        dest_row = jnp.pad(dest_row, (0, padded_size_m - size_m))
+    wave = wave_lhs is not None
+    if wave:
+        recv, row_scale, wave_sems = wave_lhs
+        size_m, words_sub, lanes = recv.shape
+        if (
+            lhs is not None
+            or recv.dtype != jnp.uint32
+            or words_sub != FP8_ROW_SUBLANES
+            or size_m % 16
+            or row_scale.shape != (size_m,)
+            or wave_sems.shape[0] < group_sizes.shape[0]
+        ):
+            raise ValueError("gmm_v2_mlp_scatter does not support these landing rows")
+        lhs = recv
+        lhs_aval = jax.ShapeDtypeStruct((size_m, words_sub * lanes * 4), jnp.bfloat16)
+        padded_size_m = size_m
+    else:
+        assert lhs is not None
+        size_m = lhs.shape[0]
+        size_lhs_sublane = _get_lhs_sublane_size(lhs.dtype, size_m)
+        padded_size_m = align_to(size_m, size_lhs_sublane)
+        if padded_size_m != size_m:
+            lhs = jnp.pad(lhs, ((0, padded_size_m - size_m), (0, 0)))
+            dest_member = jnp.pad(dest_member, (0, padded_size_m - size_m))
+            dest_row = jnp.pad(dest_row, (0, padded_size_m - size_m))
+        lhs_aval = lhs
 
     if vmem_limit_bytes is None:
         vmem_limit_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.96)
 
     cfgs = make_mlp_configs(
-        lhs,
+        lhs_aval,
         w1,
         w1_scale,
         w2,
@@ -2878,11 +3058,14 @@ def gmm_v2_mlp_scatter(
         maybe_quantize_lhs=maybe_quantize_lhs,
         rhs_quant_dtype=rhs_quant_dtype,
     )
-    if cfgs is None or not scatter_rows_supported(lhs.dtype, cfgs.down.dims.size_n):
+    dtype = lhs_aval.dtype
+    if cfgs is None or not scatter_rows_supported(dtype, cfgs.down.dims.size_n):
         raise ValueError("gmm_v2_mlp_scatter does not support these inputs")
     up, down = cfgs.up, cfgs.down
     dims = up.dims
     sub = dims.size_lhs_sublane
+    if wave and sub != 16:
+        raise ValueError("gmm_v2_mlp_scatter converts landing rows 16 at a time")
     part = cfgs.part_size
     size_n = down.dims.size_n
     row_sub = SCATTER_ROW_SUBLANES
@@ -2930,7 +3113,7 @@ def gmm_v2_mlp_scatter(
         ),
         pltpu.SMEM((1,), jnp.int32),
         pltpu.SemaphoreType.DMA((num_parts + 1,)),
-        pltpu.VMEM((2, stage_rows, row_sub, size_n // row_sub), lhs.dtype),
+        pltpu.VMEM((2, stage_rows, row_sub, size_n // row_sub), dtype),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((1,)),
@@ -2955,20 +3138,34 @@ def gmm_v2_mlp_scatter(
         f"-bm_{'_'.join(map(str, cfgs.bucket_ms))}-p_{num_parts}-c{collective_id}"
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    recv_shape = pltpu.HBM((num_recv_rows, row_sub, size_n // row_sub), lhs.dtype)
+    recv_shape = pltpu.HBM((num_recv_rows, row_sub, size_n // row_sub), dtype)
     prefetch = [group_sizes, group_offset, me, expected]
     # The rows' destinations are read only when rows leave: the kernel copies
     # them to SMEM itself behind the first tile instead of before it starts
     # (scalar prefetch of 2 x size_m words, ~2 us at whole-group sizes).
     inputs = [lhs, w1, w1_scale, w2, w2_scale] + [
-        pltpu.with_memory_space_constraint(a, pltpu.HBM) for a in (dest_member, dest_row)
+        pltpu.with_memory_space_constraint(a, pltpu.HBM)
+        for a in (dest_member, dest_row)
     ]
+    in_specs = [hbm] * len(inputs)
+    if wave:
+        # The landing rows are read where the other kernel's copies write
+        # them, while they land.
+        inputs += [
+            pltpu.with_memory_space_constraint(
+                row_scale.astype(jnp.float32), pltpu.HBM
+            ),
+            wave_sems,
+        ]
+        in_specs += [hbm, pl.BlockSpec(memory_space=pltpu.SEMAPHORE)]
+        name += "-w"
     out_shape = recv_shape
     out_specs = hbm
     if extra is not None:
         extra_rows, extra_member, extra_row, extra_expected = extra
         prefetch += [extra_member, extra_row, extra_expected]
         inputs += [pltpu.with_memory_space_constraint(extra_rows, pltpu.HBM)]
+        in_specs += [hbm]
         out_shape = (
             recv_shape,
             pltpu.HBM((num_extra_recv_rows,) + extra_rows.shape[1:], extra_rows.dtype),
@@ -2979,7 +3176,7 @@ def gmm_v2_mlp_scatter(
         tp_size, chunk = tail_cfg
         blk = tail[0].shape[1]
         prefetch += list(tail)
-        result = pltpu.HBM((tp_size * blk, row_sub, size_n // row_sub), lhs.dtype)
+        result = pltpu.HBM((tp_size * blk, row_sub, size_n // row_sub), dtype)
         out_shape = (out_shape, result) if extra is None else (*out_shape, result)
         out_specs = (hbm,) * len(out_shape)
         scratch_shapes += [
@@ -2987,6 +3184,14 @@ def gmm_v2_mlp_scatter(
             pltpu.SemaphoreType.DMA((1 + pl.cdiv(blk, chunk),)),
         ]
         name += "-t"
+    if wave:
+        scratch_shapes += [
+            pltpu.VMEM((cfgs.tile_m,) + recv.shape[1:], recv.dtype),
+            pltpu.VMEM((cfgs.tile_m // sub, sub, dims.size_k), dtype),
+            pltpu.SMEM((size_m,), jnp.float32),
+            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SMEM((1,), jnp.int32),
+        ]
     # The receive buffers and the owner tail's result are pinned to HBM: other
     # members write into them.
     out = pl.pallas_call(
@@ -2997,11 +3202,12 @@ def gmm_v2_mlp_scatter(
             num_members=num_members,
             extra=extra is not None,
             tail=tail_cfg,
+            wave=wave,
         ),
         out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(prefetch),
-            in_specs=[hbm] * len(inputs),
+            in_specs=in_specs,
             out_specs=out_specs,
             scratch_shapes=scratch_shapes,
         ),
