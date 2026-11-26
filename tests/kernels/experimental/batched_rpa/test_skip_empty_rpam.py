@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
+from jax.extend import core as jax_core
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
@@ -90,7 +91,8 @@ def test_rpa_kernel_guards_vmem_init_on_actual_steps():
         inner = eqn.params["jaxpr"]
         scoped = [e for e in inner.eqns if e.primitive.name == "run_scoped"]
         assert len(scoped) == 1
-        scoped_eqns = scoped[0].params["jaxpr"].eqns
+        scoped_jaxpr = scoped[0].params["jaxpr"]
+        scoped_eqns = scoped_jaxpr.eqns
 
         # No unconditional VMEM stores may execute outside the init cond or loop.
         top_prims = {e.primitive.name for e in scoped_eqns}
@@ -101,6 +103,25 @@ def test_rpa_kernel_guards_vmem_init_on_actual_steps():
 
         conds = [e for e in scoped_eqns if e.primitive.name == "cond"]
         assert len(conds) >= 1
+
+        # Verify the init cond predicate is strictly `actual_steps > 0`, where
+        # `actual_steps` is loaded from the scalar SMEM ref `actual_steps_ref[0]`.
+        scoped_producer = {e.outvars[0]: e for e in scoped_eqns if len(e.outvars) == 1}
+        pred_eqn = scoped_producer[conds[0].invars[0]]
+        if pred_eqn.primitive.name == "convert_element_type":
+            pred_eqn = scoped_producer[pred_eqn.invars[0]]
+        assert pred_eqn.primitive.name == "gt", (
+            f"{eqn.params['name']} init cond predicate is {pred_eqn.primitive.name}, "
+            "expected 'gt' (actual_steps > 0)"
+        )
+        lhs, rhs = pred_eqn.invars
+        assert isinstance(rhs, jax_core.Literal) and rhs.val == 0
+        constvar_to_outer = dict(zip(scoped_jaxpr.constvars, scoped[0].invars))
+        inner_producer = {e.outvars[0]: e for e in inner.eqns if len(e.outvars) == 1}
+        load_eqn = inner_producer[constvar_to_outer[lhs]]
+        assert load_eqn.primitive.name == "get"
+        assert load_eqn.invars[0].aval.shape == (1,)
+
         false_branch, true_branch = conds[0].params["branches"]
         assert not any(e.primitive.name == "swap" for e in false_branch.jaxpr.eqns)
         assert any(e.primitive.name == "swap" for e in true_branch.jaxpr.eqns)
@@ -133,7 +154,7 @@ def test_rpa_metadata_schedule_empty_count_writes_only_actual_steps():
 
 
 @pytest.mark.tpu_test
-def test_tpu_schedule_exact_chunk_boundary_matches_reference():
+def test_tpu_schedule_exact_chunk_boundary_matches_closed_form():
     """Exact max_steps_ub * batch_size boundary (count==0, hbm_offset>0) is exact.
 
     Uses uniform attention (K = 0) over block-indicator V channels where channel
