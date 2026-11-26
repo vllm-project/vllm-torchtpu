@@ -643,6 +643,7 @@ class TPUWorker(WorkerBase):
         kv_connector_hbm_reserve_gb = round(reserves.kv_connector / utils.GBYTES, 2)
         lora_slot_write_hbm_gb = round(reserves.lora_slot_write / utils.GBYTES, 2)
         pp_handoff_hbm_reserve_gb = round(reserves.pp_handoff / utils.GBYTES, 2)
+        routed_experts_hbm_reserve_gb = round(reserves.routed_experts / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
         logger.info(
             "Memory statistics | "
@@ -652,6 +653,7 @@ class TPUWorker(WorkerBase):
             "kv_connector_hbm_reserve_gb=%rGiB | "
             "lora_slot_write_hbm_gb=%rGiB | "
             "pp_handoff_hbm_reserve_gb=%rGiB | "
+            "routed_experts_hbm_reserve_gb=%rGiB | "
             "total_hbm_avail_gb=%rGiB | "
             "profile_run=%s",
             total_hbm_limit_gb,
@@ -660,6 +662,7 @@ class TPUWorker(WorkerBase):
             kv_connector_hbm_reserve_gb,
             lora_slot_write_hbm_gb,
             pp_handoff_hbm_reserve_gb,
+            routed_experts_hbm_reserve_gb,
             total_hbm_avail_gb,
             "skipped" if profile_skipped else "ran",
         )
@@ -671,11 +674,17 @@ class TPUWorker(WorkerBase):
             )
             if reserves.lora_slot_write > 0:
                 fix += ", or lowering --max-loras or --max-lora-rank"
+            if reserves.routed_experts > 0:
+                fix += (
+                    ", or lowering --max-num-batched-tokens or --max-num-seqs, "
+                    "or dropping compile_sizes above --max-num-batched-tokens"
+                )
             raise ValueError(
                 f"{total_hbm_used_gb=}GiB plus the HBM reserved after the "
                 f"memory profile ({kv_connector_hbm_reserve_gb=}GiB, "
                 f"{lora_slot_write_hbm_gb=}GiB, "
-                f"{pp_handoff_hbm_reserve_gb=}GiB) exceeds "
+                f"{pp_handoff_hbm_reserve_gb=}GiB, "
+                f"{routed_experts_hbm_reserve_gb=}GiB) exceeds "
                 f"{total_hbm_limit_cap_gb=}GiB by "
                 f"{-total_hbm_avail_gb}GiB. Please consider {fix}."
             )
@@ -1009,3 +1018,9 @@ class TPUWorker(WorkerBase):
         if metadata is None:
             return None
         return {_get_kv_connector_handshake_metadata_key(metadata): metadata}
+
+    def shutdown(self) -> None:
+        # None until init_device builds it.
+        if self.model_runner is not None:
+            self.model_runner.close_routed_experts()
+        super().shutdown()

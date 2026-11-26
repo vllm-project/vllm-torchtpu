@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.config import CacheConfig, VllmConfig
+from vllm.config.aux_output import AuxOutputConfig
 
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
@@ -41,6 +42,7 @@ def vllm_config():
     config.scheduler_config.max_num_batched_tokens = 32
     config.speculative_config = None
     config.lora_config = None
+    config.aux_output_config = AuxOutputConfig()
     config.parallel_config.nnodes = 1
     config.parallel_config.data_parallel_size = 1
     config.parallel_config.prefill_context_parallel_size = 1

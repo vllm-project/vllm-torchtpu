@@ -25,6 +25,10 @@ from vllm.model_executor.layers.fused_moe.runner import moe_runner as moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
+    vllm_adapter as adaptive_moe,
+)
+from vllm_torchtpu.layers.adapter import moe_tp_decode
 from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 from vllm_torchtpu.layers.adapter.fused_moe_ep import FUSED_MOE_EP_OP_ATTR
 
@@ -153,6 +157,26 @@ def test_fused_output_is_reduced_under_torch_compile(fused_ep_kernel, armed, exp
         torch._dynamo.reset()
         compiled = torch.compile(reduce_unless_reduced, backend="eager", fullgraph=True)
         torch.testing.assert_close(compiled(x), x if expected else x * 2)
+
+
+@pytest.mark.parametrize(
+    ("armed_attr", "expected"),
+    [
+        (None, True),
+        (FUSED_MOE_EP_OP_ATTR, False),
+        (adaptive_moe.FUSED_MOE_EP_OP_ATTR, False),
+        (moe_tp_decode._OP_ATTR, False),
+    ],
+)
+def test_picks_experts_in_route_unless_a_fused_kernel_is_armed(armed_attr, expected):
+    quant_method = SimpleNamespace()
+    if armed_attr is not None:
+        setattr(quant_method, armed_attr, "op")
+    runner = VllmMoERunner.__new__(VllmMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_experts = SimpleNamespace(quant_method=quant_method)
+
+    assert runner.picks_experts_in_route is expected
 
 
 def test_routing_simulation_keeps_real_logits_for_tpu_methods(monkeypatch):

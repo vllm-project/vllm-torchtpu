@@ -86,6 +86,7 @@ def _make_runner(
     runner._pp_is_last = True
     runner._pp_handoff = None
     runner._adaptive_verification = None
+    runner._routed_experts = None
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
@@ -363,6 +364,7 @@ def _make_sample_runner(
             async_scheduling=async_scheduling,
             speculative_decoding=spec_k is not None,
         ),
+        _routed_experts=None,
         _greedy_head_owner=object() if top_tokens else None,
         speculative_config=spec_cfg,
         rejection_sampler=(

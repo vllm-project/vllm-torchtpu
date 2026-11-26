@@ -19,7 +19,8 @@ import os
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from typing import Any, cast
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 import torch
@@ -32,6 +33,7 @@ from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
+from vllm_torchtpu.runner.routed_experts import RoutedExpertsCapture
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.tpu_worker import (
     TPUWorker,
@@ -511,7 +513,7 @@ def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     worker.model_runner = MagicMock(is_pooling_model=False)
     # No KV connector, no LoRA and no buffered hand-off, so nothing is reserved.
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=0, pp_handoff=0
+        kv_connector=0, lora_slot_write=0, pp_handoff=0, routed_experts=0
     )
     return worker
 
@@ -552,7 +554,7 @@ def test_determine_available_memory_leaves_room_for_lora_slot_write(monkeypatch)
         peer=7 * utils.GBYTES,
     )
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=utils.GBYTES, pp_handoff=0
+        kv_connector=0, lora_slot_write=utils.GBYTES, pp_handoff=0, routed_experts=0
     )
 
     assert worker.determine_available_memory() == 6 * utils.GBYTES
@@ -565,7 +567,7 @@ def test_determine_available_memory_reserves_the_pp_hand_off_buffers(monkeypatch
         monkeypatch, dp_size=1, expert_parallel=False, local=7 * utils.GBYTES, peer=0
     )
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=0, pp_handoff=utils.GBYTES
+        kv_connector=0, lora_slot_write=0, pp_handoff=utils.GBYTES, routed_experts=0
     )
 
     assert worker.determine_available_memory() == 6 * utils.GBYTES
@@ -586,7 +588,10 @@ def test_out_of_memory_error_shows_the_lora_reserve(monkeypatch):
     )
     monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=2 * utils.GBYTES, pp_handoff=0
+        kv_connector=0,
+        lora_slot_write=2 * utils.GBYTES,
+        pp_handoff=0,
+        routed_experts=0,
     )
 
     with pytest.raises(ValueError) as error:
@@ -598,6 +603,51 @@ def test_out_of_memory_error_shows_the_lora_reserve(monkeypatch):
     assert "pp_handoff_hbm_reserve_gb=0.0GiB" in message
     assert "by 1.0GiB" in message
     assert "--max-loras" in message
+    assert "--max-num-seqs" not in message
+
+
+def test_out_of_memory_error_shows_the_routed_experts_reserve(monkeypatch):
+    """Only the routed-experts reserve pushes the budget below zero, so the
+    error must show it and the flags that shrink it."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=0, peer=0
+    )
+    budget = utils.HbmBudget(
+        total_limit=32 * utils.GBYTES,
+        total_used=18 * utils.GBYTES,
+        cap=19 * utils.GBYTES,
+        available=utils.GBYTES,
+    )
+    monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
+    worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
+        kv_connector=0,
+        lora_slot_write=0,
+        pp_handoff=0,
+        routed_experts=2 * utils.GBYTES,
+    )
+
+    with pytest.raises(ValueError) as error:
+        worker.determine_available_memory()
+
+    message = str(error.value)
+    assert "routed_experts_hbm_reserve_gb=2.0GiB" in message
+    assert "by 1.0GiB" in message
+    assert "--max-num-batched-tokens or --max-num-seqs" in message
+
+
+def test_shutdown_stops_the_routed_experts_connector():
+    """Shutdown closes the connector, whose writer thread would otherwise
+    outlive the engine. A worker without capture, or one that failed before
+    building its runner, also shuts down."""
+    capture = create_autospec(RoutedExpertsCapture, instance=True)
+    capturing = TPUModelRunner.__new__(TPUModelRunner)
+    capturing._routed_experts = capture
+    for runner in (capturing, TPUModelRunner.__new__(TPUModelRunner), None):
+        worker = TPUWorker.__new__(TPUWorker)
+        worker.model_runner = cast(Any, runner)
+        worker.shutdown()
+
+    capture.close.assert_called_once_with()
 
 
 def test_determine_available_memory_profiles_an_unpinned_kv_cache(monkeypatch):

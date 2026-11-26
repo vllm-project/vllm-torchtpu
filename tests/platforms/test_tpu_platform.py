@@ -31,6 +31,7 @@ from vllm.config import (
     ParallelConfig,
     VllmConfig,
 )
+from vllm.config.aux_output import AuxOutputConfig
 from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -49,6 +50,7 @@ from vllm_torchtpu.platforms.tpu_platform import (
     _validate_lora_config,
     _validate_peer_replay_config,
     _validate_phased_profiling_config,
+    _validate_routed_experts_config,
     get_tpu_multihost_topology,
 )
 
@@ -311,6 +313,7 @@ class TestTpuPlatform:
         vllm_config.scheduler_config.async_scheduling = False
         vllm_config.speculative_config = None
         vllm_config.lora_config = None
+        vllm_config.aux_output_config = AuxOutputConfig()
         vllm_config.parallel_config = MagicMock()
         vllm_config.parallel_config.prefill_context_parallel_size = 1
         vllm_config.parallel_config.nnodes = 1
@@ -1237,6 +1240,78 @@ class TestLoRAConfigValidation:
 
         assert "tensor_parallel_size > 1" in str(excinfo.value)
         assert "lora_dtype torch.float16" in str(excinfo.value)
+
+
+class TestRoutedExpertsConfigValidation:
+    """Startup rejects each setting that routed-experts capture does not
+    support yet, and names it in the error."""
+
+    @staticmethod
+    def _config(
+        *,
+        enabled=True,
+        data_parallel_size=1,
+        use_sequence_parallel_moe=False,
+        speculative_config=None,
+        kv_transfer_config=None,
+        kv_offloading_size=None,
+    ):
+        return SimpleNamespace(
+            aux_output_config=AuxOutputConfig(enable_return_routed_experts=enabled),
+            parallel_config=SimpleNamespace(
+                data_parallel_size=data_parallel_size,
+                use_sequence_parallel_moe=use_sequence_parallel_moe,
+            ),
+            speculative_config=speculative_config,
+            kv_transfer_config=kv_transfer_config,
+            cache_config=SimpleNamespace(kv_offloading_size=kv_offloading_size),
+        )
+
+    def test_a_supported_config_passes(self):
+        _validate_routed_experts_config(self._config())
+
+    def test_without_capture_nothing_is_checked(self):
+        _validate_routed_experts_config(
+            self._config(enabled=False, data_parallel_size=2)
+        )
+
+    @pytest.mark.parametrize(
+        "kwargs,env,setting",
+        [
+            ({"data_parallel_size": 2}, {}, "data_parallel_size > 1"),
+            (
+                {"use_sequence_parallel_moe": True},
+                {},
+                "MoE sequence parallelism",
+            ),
+            ({}, {"TPU_K3_SP_PREFILL": "1"}, "TPU_K3_SP_PREFILL"),
+            (
+                {},
+                {"MOE_FUSED_EP_KERNEL_IMPL": "adaptive"},
+                "MOE_FUSED_EP_KERNEL_IMPL=adaptive",
+            ),
+            ({}, {"TPU_EXPERT_PLACEMENT": "/tmp/p.json"}, "TPU_EXPERT_PLACEMENT"),
+            ({"speculative_config": object()}, {}, "speculative decoding"),
+            ({"kv_transfer_config": object()}, {}, "kv_transfer_config"),
+            ({"kv_offloading_size": 4.0}, {}, "--kv-offloading-size"),
+        ],
+    )
+    def test_unsupported_setting_is_named(self, monkeypatch, kwargs, env, setting):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+
+        with pytest.raises(NotImplementedError, match=setting):
+            _validate_routed_experts_config(self._config(**kwargs))
+
+    def test_fused_ep_v2_is_left_to_the_loaded_layers(self, monkeypatch):
+        """Setting MOE_FUSED_EP_KERNEL_IMPL=v2 alone does not fail startup: it
+        only allows the fused EP kernel, and each MoE layer decides when its
+        weights load whether to use it. A layer that does not use the kernel
+        still picks its experts in `route()`. Layers that use it are rejected
+        after the model loads."""
+        monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
+
+        _validate_routed_experts_config(self._config())
 
 
 def test_config_hook_registers_tpu_kv_connectors_by_name():
