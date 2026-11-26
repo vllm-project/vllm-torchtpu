@@ -117,6 +117,17 @@ def torchrun_worker_env(world_size: int) -> dict[str, str]:
     return env
 
 
+# A rank whose TPU runtime cannot start a session on the host reports this; the
+# other ranks then wait for it in TPU initialization until the launch times out.
+# On the CI hosts it happens to a launch that starts right after another one
+# ended, so the launch is retried once after a pause.
+_SESSION_FAILURE = "START_SESSION failed"
+_SESSION_RETRY_PAUSE_S = 30.0
+# Time a relaunch needs, start-up included, for a retry to be worth it.
+_SESSION_RETRY_MIN_S = 150.0
+_POLL_S = 2.0
+
+
 def launch_torchrun_workers(
     script: Any,
     result_dir: Any,
@@ -128,15 +139,69 @@ def launch_torchrun_workers(
 ) -> Any:
     """Runs `script --worker` on `world_size` ranks; returns the completed
     process. Keep `timeout` under pytest's, so that this, not pytest, ends a
-    hung launch and the workers are reaped."""
+    hung launch and the workers are reaped.
+
+    A launch in which a rank's TPU runtime fails to start a session (see
+    _SESSION_FAILURE) is stopped at once and, if enough of `timeout` is left,
+    run again after a pause; its output is kept ahead of the retry's."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    outputs = []
+    while True:
+        completed, session_failed = _launch_torchrun_once(
+            script, result_dir, world_size, env, cwd, deadline
+        )
+        outputs.append(completed.stdout)
+        remaining = deadline - time.monotonic()
+        if (
+            not session_failed
+            or remaining < _SESSION_RETRY_PAUSE_S + _SESSION_RETRY_MIN_S
+        ):
+            break
+        outputs.append(
+            f"\n=== a rank could not start a TPU session ({_SESSION_FAILURE}); "
+            f"relaunching in {_SESSION_RETRY_PAUSE_S:.0f}s ===\n"
+        )
+        print(outputs[-1], flush=True)
+        for stale in result_dir.glob("rank_*.json"):
+            stale.unlink()
+        time.sleep(_SESSION_RETRY_PAUSE_S)
+    completed.stdout = "".join(outputs)
+    return completed
+
+
+def _session_failed(result_dir: Any) -> bool:
+    """Whether a rank reported that its TPU runtime could not start a session."""
+    for path in result_dir.glob("rank_*.json"):
+        try:
+            if _SESSION_FAILURE in path.read_text():
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def _launch_torchrun_once(
+    script: Any,
+    result_dir: Any,
+    world_size: int,
+    env: dict[str, str],
+    cwd: Any,
+    deadline: float,
+) -> tuple[Any, bool]:
+    """One torchrun launch, ended at `deadline` or as soon as a rank reports a
+    session failure; returns the completed process and whether one did."""
     import os
     import signal
     import subprocess
     import sys
+    import time
 
     # Workers dump their Python stacks shortly before the launch times out, so
     # a hang shows where each rank is stuck (see run_torchrun_worker).
-    env = {**env, _STACK_DUMP_ENV: str(max(timeout - 45, 1))}
+    remaining = deadline - time.monotonic()
+    env = {**env, _STACK_DUMP_ENV: str(max(remaining - 45, 1))}
     process = subprocess.Popen(
         [
             sys.executable,
@@ -159,20 +224,39 @@ def launch_torchrun_workers(
         start_new_session=True,
     )
     output = ""
+    session_failed = False
     try:
-        output, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        # Bytes even in text mode: the partial output is not decoded.
-        output = exc.output or ""
-        if isinstance(output, bytes):
-            output = output.decode(errors="replace")
+        while True:
+            try:
+                # communicate() can be called again after a timeout; it keeps
+                # what it has read so far.
+                output, _ = process.communicate(
+                    timeout=max(0.0, min(_POLL_S, deadline - time.monotonic()))
+                )
+                break
+            except subprocess.TimeoutExpired as exc:
+                if time.monotonic() < deadline and not _session_failed(result_dir):
+                    continue
+                session_failed = _session_failed(result_dir)
+                # Bytes even in text mode: the partial output is not decoded.
+                output = exc.output or ""
+                if isinstance(output, bytes):
+                    output = output.decode(errors="replace")
+                break
     finally:
         # Also on pytest's own timeout, which raises out of communicate(): the
         # workers run in their own session and would keep holding the chips.
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=60)
-    return subprocess.CompletedProcess(process.args, process.returncode, output, "")
+            try:
+                process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=60)
+    completed = subprocess.CompletedProcess(
+        process.args, process.returncode, output, ""
+    )
+    return completed, session_failed
 
 
 def read_worker_results(result_dir: Any, world_size: int, completed: Any) -> list:
