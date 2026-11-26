@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
 import torch
 
-_padding_state: "TokenPaddingState | None" = None
+_padding_state: "TokenPaddingState | _RowSubsetPadding | None" = None
 _SPARE_ROWS = 128
 
 
@@ -65,6 +67,44 @@ class TokenPaddingState:
 def set_padding_state(state: "TokenPaddingState | None") -> None:
     global _padding_state
     _padding_state = state
+
+
+class _RowSubsetPadding:
+    """A TokenPaddingState's mask seen through a row selection, read lazily so
+    a forward that never reads the mask does not trace it. Its mask has the
+    subset's rows only, not the base state's allocated length."""
+
+    def __init__(
+        self, base: TokenPaddingState, select: Callable[[torch.Tensor], torch.Tensor]
+    ) -> None:
+        self._base, self._select = base, select
+
+    @property
+    def local_padding_mask(self) -> torch.Tensor:
+        return self._select(self._base.local_padding_mask)
+
+    def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
+        return self.local_padding_mask[:num_tokens]
+
+    def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
+        self._base.update(local_valid_tokens, local_padded_tokens)
+
+
+@contextlib.contextmanager
+def padding_of_rows(select: Callable[[torch.Tensor], torch.Tensor]) -> Iterator[None]:
+    """Inside, a forward over a reordering or subset of the step's rows sees
+    those rows' padding: ``select`` maps the step's per-row mask to the rows'
+    mask, in their order (traced, so it may index the device mask). Used by
+    the MiniMax-M3 SP row pieces (TPU_MINIMAX_M3_SP_FFN_PIECES), whose FFN
+    sees the gathered rows piece-major."""
+    global _padding_state
+    saved = _padding_state
+    if isinstance(saved, TokenPaddingState):
+        _padding_state = _RowSubsetPadding(saved, select)
+    try:
+        yield
+    finally:
+        _padding_state = saved
 
 
 def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:

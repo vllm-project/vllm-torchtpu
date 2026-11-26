@@ -31,6 +31,23 @@ from vllm_torchtpu.kernels.megablox import tc_combine
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
 _DEFAULT_SWIGLU_BETA = 1.0
 
+# An SP step's gathered rows: bf16, or e4m3 with per-row f32 scales.
+Rows = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+
+def cat_rows(pieces: "Rows | list[Rows]") -> Rows:
+    """One row block from an SP step's gathered row pieces
+    (TPU_MINIMAX_M3_SP_FFN_PIECES); a single block passes through."""
+    if not isinstance(pieces, list):
+        return pieces
+    if isinstance(pieces[0], tuple):
+        return (torch.cat([p[0] for p in pieces]), torch.cat([p[1] for p in pieces]))
+    return torch.cat(pieces)
+
+
+def _dequant(x: Rows) -> torch.Tensor:
+    return (x[0].float() * x[1]).to(torch.bfloat16) if isinstance(x, tuple) else x
+
 
 def swiglu_params(config: PreTrainedConfig) -> tuple[float, float, float]:
     """``(limit, alpha, beta)`` of the SwiGLU-OAI activation."""
@@ -73,18 +90,16 @@ class MiniMaxM3MLP(nn.Module):
         limit, alpha, beta = swiglu_params(config)
         self.act_fn = SiluAndMulWithClamp(swiglu_limit=limit, alpha=alpha, beta=beta)
 
-    def forward(
-        self, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-    ) -> torch.Tensor:
+    def forward(self, x: Rows | list[Rows]) -> torch.Tensor:
         """``x`` may come as e4m3 rows with per-row f32 scales (an SP step's
-        e4m3 all-gather), which gate_up_proj contracts as e4m3."""
+        e4m3 all-gather), which gate_up_proj contracts as e4m3, or as a list
+        of such gathered row pieces, joined in order."""
         x, _ = self.down_proj(self.activation(x))
         return x
 
-    def activation(
-        self, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-    ) -> torch.Tensor:
+    def activation(self, x: Rows | list[Rows]) -> torch.Tensor:
         """``act_fn(gate_up_proj(x))``: the down projection's input."""
+        x = cat_rows(x)
         if isinstance(x, tuple):
             e4m3_apply = getattr(self.gate_up_proj.quant_method, "apply_e4m3_rows", None)
             if e4m3_apply is None:
@@ -156,19 +171,23 @@ class MiniMaxM3MoE(nn.Module):
             prefix=f"{prefix}.experts",
         )
 
-    def forward(
-        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: Rows | list[Rows]) -> torch.Tensor:
         """``hidden_states`` may come as e4m3 rows with per-row f32 scales (an
         SP step's e4m3 all-gather): the router and the experts (shared expert
-        included) take them dequantized to bf16."""
+        included) take them dequantized to bf16. An SP step with row pieces
+        (TPU_MINIMAX_M3_SP_FFN_PIECES) hands the gathered pieces as a list
+        (`_join_pieces`)."""
         rows = None
-        if isinstance(hidden_states, tuple):
+        router_logits = None
+        if isinstance(hidden_states, list):
+            hidden_states, rows, router_logits = self._join_pieces(hidden_states)
+        elif isinstance(hidden_states, tuple):
             q8, row_scale = hidden_states
             hidden_states = (q8.float() * row_scale).to(torch.bfloat16)
             if envs.TPU_MINIMAX_M3_SP_E4M3_SHARED:
                 rows = (q8, row_scale)
-        router_logits, _ = self.gate(hidden_states)
+        if router_logits is None:
+            router_logits, _ = self.gate(hidden_states)
         if self._shared_in_combine(hidden_states.shape[0]):
             return self._forward_shared_in_combine(hidden_states, router_logits, rows)
         if rows is None:
@@ -180,6 +199,24 @@ class MiniMaxM3MoE(nn.Module):
             return self.experts(hidden_states=hidden_states, router_logits=router_logits)
         finally:
             self.shared_experts.__dict__.pop("_e4m3_rows", None)
+
+    def _join_pieces(
+        self, pieces: list[Rows]
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None, torch.Tensor]:
+        """An SP step's gathered row pieces (piece-major rows; the layer sets
+        their padding mask, model.py `_ffn_sp`) as (bf16 rows, the e4m3 rows
+        for TPU_MINIMAX_M3_SP_E4M3_SHARED or None, router logits). Each piece
+        is dequantized and routed on its own, so that work can start on a
+        piece while the next one lands; every step is row-local (same bits
+        as one block). This is the hook where the whole MoE sees the pieces:
+        an op that wants them separately can take ``pieces`` here."""
+        rows_bf16 = [_dequant(p) for p in pieces]
+        router_logits = torch.cat([self.gate(x)[0] for x in rows_bf16])
+        hidden_states = torch.cat(rows_bf16)
+        rows = None
+        if envs.TPU_MINIMAX_M3_SP_E4M3_SHARED and isinstance(pieces[0], tuple):
+            rows = cat_rows(pieces)
+        return hidden_states, rows, router_logits
 
     def _shared_in_combine(self, num_tokens: int) -> bool:
         """TPU_MINIMAX_M3_SHARED_IN_COMBINE on a step whose layer reduces the

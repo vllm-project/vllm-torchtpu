@@ -14,7 +14,8 @@
 """MiniMax M3 (text) on TPU."""
 
 import contextlib
-from collections.abc import Iterable, Iterator
+import functools
+from collections.abc import Callable, Iterable, Iterator
 
 import torch
 from torch import nn
@@ -44,6 +45,7 @@ from vllm.model_executor.models.utils import (
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import pallas_all_reduce
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.minimax_m3 import norm_hoist, quant, sp_o_proj
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
@@ -248,15 +250,73 @@ class MiniMaxM3DecoderLayer(nn.Module):
             else:
                 attn = self.self_attn(positions, normed)
                 update = _reduce_scatter_rows(attn)
+        shard, update = self._ffn_sp(shard, update)
+        return layer_input, shard, update
+
+    def _ffn_sp(
+        self, shard: torch.Tensor, update: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """(shard + update, reduce-scattered FFN(all-gathered norm of it)).
+        With row pieces (`_ffn_pieces`, TPU_MINIMAX_M3_SP_FFN_PIECES) each
+        piece of the shard is normed and all-gathered on its own and the FFN
+        gets the gathered pieces as a list (its row-local entry work can
+        start on a piece while the next lands); it runs once over the rows in
+        piece-major order and its output is reduce-scattered per piece."""
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        shard, normed = self._norm_gather(
+        tp = self.tp_size
+        n = (
+            _ffn_pieces(shard.shape[0], tp)
+            if envs.TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES
+            else 1
+        )
+        gather = self._norm_gather_pieces if n > 1 else self._norm_gather
+        shard, gathered = gather(
             self.post_attention_layernorm,
             shard,
             update,
             envs.TPU_MINIMAX_M3_SP_FP8_GATHER,
             envs.TPU_MINIMAX_M3_SP_E4M3_QKV,
         )
-        return layer_input, shard, _reduce_scatter_rows(ffn(normed))
+        if n == 1:
+            return shard, _reduce_scatter_rows(ffn(gathered))
+        # The MoE's padding mask is indexed by row: give it piece-major rows.
+        tokens = shard.shape[0] * tp
+        rows = functools.partial(_piece_major_rows, tokens, tp, n)
+        if envs.TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE and not self.is_moe_layer:
+            per = tokens // n
+            out_updates = []
+            for i, piece in enumerate(gathered):
+                piece_rows = functools.partial(_rows_slice, rows, i * per, per)
+                with token_padding.padding_of_rows(piece_rows):
+                    out = ffn(piece)
+                out_updates.append(_reduce_scatter_rows(out))
+            return shard, torch.cat(out_updates)
+        with token_padding.padding_of_rows(rows):
+            out = ffn(gathered)
+        return shard, torch.cat([_reduce_scatter_rows(o) for o in out.chunk(n)])
+
+    def _norm_gather_pieces(
+        self,
+        norm: GemmaRMSNorm,
+        shard: torch.Tensor,
+        update: torch.Tensor | None,
+        fp8: bool,
+        e4m3_out: bool,
+    ) -> tuple[torch.Tensor, object]:
+        """`_norm_gather` per row piece of the shard (`_ffn_pieces`): the
+        gathered pieces come as a list (piece i: every rank's i-th row block
+        of its shard), so their consumer can start on a piece while the next
+        lands; one piece gives `_norm_gather`'s result."""
+        n = _ffn_pieces(shard.shape[0], self.tp_size)
+        if n == 1:
+            return self._norm_gather(norm, shard, update, fp8, e4m3_out)
+        updates = (None,) * n if update is None else update.chunk(n)
+        shards, gathered = [], []
+        for piece, piece_update in zip(shard.chunk(n), updates):
+            piece, normed = self._norm_gather(norm, piece, piece_update, fp8, e4m3_out)
+            shards.append(piece)
+            gathered.append(normed)
+        return torch.cat(shards), gathered
 
 
 def _sp_mode() -> str:
@@ -276,6 +336,42 @@ def _sp_step(num_tokens: int, tp_size: int) -> bool:
         and num_tokens >= envs.TPU_MINIMAX_M3_SP_MIN_TOKENS
         and num_tokens % tp_size == 0
     )
+
+
+def _ffn_pieces(shard_rows: int, tp_size: int) -> int:
+    """Row pieces of an SP layer's gathers (TPU_MINIMAX_M3_SP_FFN_PIECES on
+    steps of at least TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS tokens); 1
+    unless every piece keeps whole 32-row e4m3 tiles (a piece that does not
+    fill whole sp_norm blocks takes the unfused norm, as such a shard does)."""
+    pieces = envs.TPU_MINIMAX_M3_SP_FFN_PIECES
+    if (
+        pieces <= 1
+        or shard_rows * tp_size < envs.TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS
+        or shard_rows % (pieces * _PIECE_ROW_TILE)
+    ):
+        return 1
+    return pieces
+
+
+_PIECE_ROW_TILE = 32
+
+
+def _piece_major_rows(
+    tokens: int, tp_size: int, pieces: int, x: torch.Tensor
+) -> torch.Tensor:
+    """A step-row tensor ``x`` (at least ``tokens`` rows) in the gathered
+    pieces' order: piece i holds every rank's i-th row block of its shard."""
+    x = x[:tokens].view(tp_size, pieces, -1, *x.shape[1:])
+    return x.transpose(0, 1).flatten(0, 2)
+
+
+def _rows_slice(
+    rows: Callable[[torch.Tensor], torch.Tensor],
+    start: int,
+    length: int,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    return rows(x)[start : start + length]
 
 
 def _reduce_scatter_rows(x: torch.Tensor) -> torch.Tensor:
@@ -363,6 +459,15 @@ class MiniMaxM3Model(nn.Module):
                 envs.TPU_MINIMAX_M3_SP_A2A_OPROJ,
                 envs.TPU_MINIMAX_M3_SP_A2A_E4M3,
             )
+            if envs.TPU_MINIMAX_M3_SP_FFN_PIECES > 1:
+                logger.info(
+                    "MiniMax-M3 SP row pieces: %d on steps of >= %d tokens "
+                    "(FFN gather pieces %s, dense FFN per piece %s)",
+                    envs.TPU_MINIMAX_M3_SP_FFN_PIECES,
+                    envs.TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS,
+                    envs.TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES,
+                    envs.TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE,
+                )
         # Residual-stream entries of these layers (k = output of layer k-1,
         # residual added, before the next norm) are also returned; set by
         # the DSpark drafter before the first trace.

@@ -102,6 +102,10 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_HIER_RS_MIN_TOKENS: int = 8192
     TPU_MINIMAX_M3_SHARED_IN_COMBINE: bool = False
     TPU_MINIMAX_M3_SHARED_IN_COMBINE_MIN_TOKENS: int = 4096
+    TPU_MINIMAX_M3_SP_FFN_PIECES: int = 1
+    TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS: int = 4096
+    TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES: bool = True
+    TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
@@ -957,6 +961,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # -30 at 4096, +6..+15 at 1024-2048).
     "TPU_MINIMAX_M3_SHARED_IN_COMBINE_MIN_TOKENS": env_nonnegative_int(
         "TPU_MINIMAX_M3_SHARED_IN_COMBINE_MIN_TOKENS", 4096
+    ),
+    # "full" SP steps of at least TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS
+    # tokens norm and all-gather each layer's FFN input per row piece of the
+    # token shard (the FFN's entry work, e.g. the router, starts on a piece as
+    # it lands), run the FFN once on the pieces' rows, and reduce-scatter its
+    # output per piece (through the SP row reduce-scatter, so QRS / HIER_RS
+    # still apply). Row-local math only: same bits as one piece. 1 = off.
+    "TPU_MINIMAX_M3_SP_FFN_PIECES": env_nonnegative_int(
+        "TPU_MINIMAX_M3_SP_FFN_PIECES", 1
+    ),
+    "TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS", 4096
+    ),
+    # With TPU_MINIMAX_M3_SP_FFN_PIECES: gather the FFN input in pieces (off:
+    # only the attention side, TPU_MINIMAX_M3_SP_ATTN_PIECES, runs per piece).
+    "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES": env_bool(
+        "TPU_MINIMAX_M3_SP_FFN_GATHER_PIECES", default=True
+    ),
+    # With TPU_MINIMAX_M3_SP_FFN_PIECES: run a dense layer's FFN once per
+    # gathered piece instead of once over all pieces, so a piece's
+    # reduce-scatter overlaps the next piece's FFN. MoE layers keep one pass.
+    "TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE": env_bool(
+        "TPU_MINIMAX_M3_SP_DENSE_FFN_PER_PIECE", default=False
     ),
     # "full" SP: instead of reduce-scattering o_proj's per-rank partial sums
     # (bf16 [T, hidden]), all-to-all the attention output (bf16 [T, heads/TP x

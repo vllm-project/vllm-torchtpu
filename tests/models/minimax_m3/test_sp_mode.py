@@ -178,6 +178,10 @@ class _TP:
 
 @pytest.fixture
 def tp(monkeypatch):
+    return _install_tp(monkeypatch)
+
+
+def _install_tp(monkeypatch):
     g = _TP(TP)
     monkeypatch.setattr(mm, "tensor_model_parallel_reduce_scatter", g.reduce_scatter)
     monkeypatch.setattr(mm, "tensor_model_parallel_all_gather", g.all_gather)
