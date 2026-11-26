@@ -257,9 +257,12 @@ def _kernel(
                     # A slot no row sees gets p = 0, so only a NaN value (fp8
                     # has no infinities) could reach p @ v: zeroing NaNs keeps
                     # a reduction over the page's limits off the critical path.
+                    # Zeroed on the whole [K | V] rows (a NaN key's score is
+                    # masked anyway): on the value half alone the select took a
+                    # relayout of each page (~5% of a 16-page step, AOT).
                     rows = kv_ref[0].reshape(page_size, -1).astype(jnp.bfloat16)
-                    v_rows = rows[:, head_dim:]
-                    values.append(jnp.where(jnp.isnan(v_rows), 0, v_rows))
+                    rows = jnp.where(jnp.isnan(rows), 0, rows)
+                    values.append(rows[:, head_dim:])
                 else:
                     rows = msa_attention._page_rows(kv_ref, jnp.max(limit))
                     values.append(rows[:, head_dim:])
