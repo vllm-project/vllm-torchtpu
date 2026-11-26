@@ -30,11 +30,13 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
+    install_draft_embed_shard,
     install_vocab_parallel_draft_argmax,
     iter_mtp_shared_heads,
     maybe_share_embeddings,
     maybe_share_lm_head,
     shard_draft_eh_proj,
+    target_embed_on_another_stage,
     vocab_parallel_argmax,
     with_device_vocab_start,
 )
@@ -287,9 +289,20 @@ class Eagle3Proposer:
         self._validate_dsa_draft(all_attn_layers, draft_attn_layer_names)
 
         assert self.draft_model is not None
-        maybe_share_embeddings(
-            self.draft_model, target_model, self._draft_tp_matches_target
-        )
+        if target_embed_on_another_stage(target_model):
+            # Pipeline: the first stage handed its embedding shard over at load.
+            shard = getattr(self.runner, "_pp_draft_embed_shard", None)
+            if shard is None:
+                raise RuntimeError(
+                    "The target's embedding is on another pipeline stage and "
+                    "no copy of it reached the draft's stage."
+                )
+            install_draft_embed_shard(self.draft_model, shard)
+            self.runner._pp_draft_embed_shard = None
+        else:
+            maybe_share_embeddings(
+                self.draft_model, target_model, self._draft_tp_matches_target
+            )
         maybe_share_lm_head(
             self.draft_model,
             target_model,

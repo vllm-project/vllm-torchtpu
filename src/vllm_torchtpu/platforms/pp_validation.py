@@ -100,6 +100,46 @@ def _stage_starting_on_shared_topk(vllm_config: Any) -> str | None:
     return None
 
 
+def _speculative_refusal(vllm_config: Any) -> tuple[str, str] | None:
+    """Why the pipeline refuses this speculative config, or None.
+
+    One case is served: a KV producer running MTP only for its drafter's KV,
+    opted into with TPU_PP_MTP_PREFILL_KV. The drafter lives on the last stage
+    and never proposes, so no step verifies drafts and no draft token crosses
+    a stage. kv_both counts as a producer, and such a server may still decode
+    a request itself; it decodes without speculation.
+    """
+    from vllm_torchtpu import envs
+
+    spec = vllm_config.speculative_config
+    transfer = vllm_config.kv_transfer_config
+    if not envs.TPU_PP_MTP_PREFILL_KV:
+        reason = "speculative decoding"
+    elif spec.method != "mtp":
+        reason = f"speculative decoding with method {spec.method!r}"
+    elif spec.num_speculative_tokens != 1:
+        # Drafts are discarded, so steps past the first write KV for nothing.
+        reason = "MTP for prefill KV with num_speculative_tokens != 1"
+    elif transfer is None or not transfer.is_kv_producer:
+        # Without a producer connector nothing reads the drafter's KV.
+        reason = "MTP for prefill KV without a KV producer connector"
+    else:
+        return None
+    return reason, (
+        " Under a pipeline only MTP that writes the drafter's prefill KV is "
+        "served: set TPU_PP_MTP_PREFILL_KV=1 with method mtp, "
+        "num_speculative_tokens 1 and a kv_producer or kv_both connector."
+    )
+
+
+def pp_mtp_prefill_kv_only(vllm_config: Any) -> bool:
+    """Whether this config runs the drafter for its KV only (validated above)."""
+    return (
+        vllm_config.parallel_config.pipeline_parallel_size > 1
+        and vllm_config.speculative_config is not None
+    )
+
+
 def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     """Reject configurations the TPU pipeline-parallel path does not serve.
 
@@ -159,8 +199,10 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         # placeholder substitution reads from the device.
         unsupported = "async scheduling"
         remedy = " Pass --no-async-scheduling."
-    elif vllm_config.speculative_config is not None:
-        unsupported = "speculative decoding"
+    elif vllm_config.speculative_config is not None and (
+        refusal := _speculative_refusal(vllm_config)
+    ):
+        unsupported, remedy = refusal
     elif vllm_config.kv_transfer_config is not None and (
         others := _non_raiden_connectors(vllm_config.kv_transfer_config)
     ):

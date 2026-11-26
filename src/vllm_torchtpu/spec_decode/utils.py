@@ -155,6 +155,88 @@ def populate_draft_embed_from_target(
     )
 
 
+def _target_embed_tokens(target_model: torch.nn.Module) -> Any:
+    target_lm = (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+    return getattr(getattr(target_lm, "model", None), "embed_tokens", None)
+
+
+def target_embed_on_another_stage(target_model: torch.nn.Module) -> bool:
+    """Whether a pipeline placed the target's embedding on another stage."""
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    return isinstance(_target_embed_tokens(target_model), PPMissingLayer)
+
+
+# Wire codes for the embedding hand-off; gloo carries 16-bit floats as int16.
+_EMBED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+
+def hand_embedding_to_last_stage(
+    target_model: torch.nn.Module, is_first: bool, is_last: bool
+) -> torch.Tensor | None:
+    """Send the first stage's embedding shard to the last stage's same TP rank.
+
+    An MTP draft embeds its input tokens with the target's embedding, which a
+    pipeline keeps on the first stage while the draft runs on the last. Each
+    TP rank of the first stage sends its vocab shard over the pipeline group's
+    CPU group; the last stage's rank of the same TP index returns it (host
+    tensor), every other stage returns None. Call it on every stage.
+    """
+    from vllm.distributed.parallel_state import get_pp_group
+
+    group = get_pp_group()
+    if is_first == is_last:
+        return None
+    src, dst = group.ranks[0], group.ranks[-1]
+    if is_first:
+        embed = _target_embed_tokens(target_model)
+        weight = cast(torch.Tensor, embed.weight).data.cpu().contiguous()
+        code = _EMBED_DTYPES.index(weight.dtype)
+        meta = torch.tensor([weight.shape[0], weight.shape[1], code])
+        dist.send(meta, dst=dst, group=group.cpu_group)
+        wire = weight.view(torch.int16) if weight.element_size() == 2 else weight
+        dist.send(wire, dst=dst, group=group.cpu_group)
+        return None
+    if not is_last:
+        return None
+    meta = torch.empty(3, dtype=torch.int64)
+    dist.recv(meta, src=src, group=group.cpu_group)
+    rows, dim, code = (int(x) for x in meta)
+    dtype = _EMBED_DTYPES[code]
+    wire_dtype = torch.int16 if dtype.itemsize == 2 else dtype
+    wire = torch.empty(rows, dim, dtype=wire_dtype)
+    dist.recv(wire, src=src, group=group.cpu_group)
+    logger.info(
+        "Received the first stage's embedding shard (%d x %d) for the draft.",
+        rows,
+        dim,
+    )
+    return wire.view(dtype)
+
+
+def install_draft_embed_shard(
+    draft_model: torch.nn.Module, shard: torch.Tensor
+) -> None:
+    """Give the draft's own embed_tokens the target's shard for this TP rank."""
+    embed = draft_model.model.embed_tokens
+    weight = cast(torch.Tensor, embed.weight)
+    if tuple(weight.shape) != tuple(shard.shape):
+        raise RuntimeError(
+            f"The draft's embedding shard is {tuple(weight.shape)} but the "
+            f"first stage sent {tuple(shard.shape)}; under pipeline "
+            "parallelism the draft must use the target's tensor parallel size."
+        )
+    embed.weight = Parameter(
+        shard.to(dtype=weight.dtype, device=weight.device), requires_grad=False
+    )
+    if weight.device.type == "tpu":
+        synchronize_tensors(embed.weight)
+
+
 def maybe_share_embeddings(
     draft_model: torch.nn.Module,
     target_model: torch.nn.Module,

@@ -125,6 +125,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
+from vllm_torchtpu.platforms.pp_validation import pp_mtp_prefill_kv_only
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
 from vllm_torchtpu.runner import greedy_top_tokens, spec_precompile_shapes
 from vllm_torchtpu.runner import utils as runner_utils
@@ -552,6 +553,20 @@ _TOPK_BUFFER_ATTRIBUTE = "topk_indices_buffer"
 _PP_CARRIED_FILL: dict[str, int] = {_TOPK_INDICES: -1}
 
 
+def _refuse_pp_spec_tokens(scheduler_output: "SchedulerOutput") -> None:
+    """Raise on a step that verifies drafts under a pipeline.
+
+    The MTP drafter of a pipeline runs for its KV only and hands the scheduler
+    no drafts, so a draft here came from somewhere this path does not serve.
+    """
+    spec = {r: t for r, t in scheduler_output.scheduled_spec_decode_tokens.items() if t}
+    if spec:
+        raise RuntimeError(
+            "Pipeline parallelism serves MTP for prefill KV only and never "
+            f"verifies drafts, but this step schedules drafts for {sorted(spec)}."
+        )
+
+
 def _find_topk_indices_buffer(model: torch.nn.Module) -> torch.Tensor | None:
     """The one top-k table this process's layers share, or None."""
     found: dict[int, torch.Tensor] = {}
@@ -624,6 +639,9 @@ class TPUModelRunner(GPUModelRunner):
     @property
     def _is_async_drafter(self) -> bool:
         if not self.speculative_config:
+            return False
+        if getattr(self, "_pp_mtp_kv_only", False) and self.drafter is None:
+            # A pipeline stage before the last holds no drafter.
             return False
         return (
             self.speculative_config.use_eagle()
@@ -1022,6 +1040,9 @@ class TPUModelRunner(GPUModelRunner):
         self._h2d_reuse: dict[str, tuple[tuple, torch.Tensor, torch.Tensor]] = {}
 
         self.speculative_config = self.vllm_config.speculative_config
+        # TPU_PP_MTP_PREFILL_KV: under a pipeline the MTP drafter lives on the
+        # last stage and writes its layer's KV, but never proposes.
+        self._pp_mtp_kv_only = pp_mtp_prefill_kv_only(self.vllm_config)
         # Maximum query length to be considered a decode.
         self.reorder_batch_threshold = 1
         self.spec_decode_manager = SpeculativeDecodingManager(self)
@@ -1353,6 +1374,10 @@ class TPUModelRunner(GPUModelRunner):
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
         self.rejection_sampler = None
+        if self._pp_mtp_kv_only and not pp_rank_flags(self.parallel_config)[1]:
+            # The drafter reads the final hidden states, which only the last
+            # pipeline stage has; earlier stages neither load nor run it.
+            return
         if self.speculative_config:
             self.rejection_sampler = RejectionSampler(
                 self.speculative_config, self.device
@@ -3688,6 +3713,8 @@ class TPUModelRunner(GPUModelRunner):
             pinner.maybe_pin()
         if getattr(self, "_host_levers_pending", False):
             self._host_levers_first_step()
+        if self._pp_mtp_kv_only:
+            _refuse_pp_spec_tokens(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
@@ -4214,7 +4241,12 @@ class TPUModelRunner(GPUModelRunner):
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self.spec_decode_manager is None:
             return None
-        return self.spec_decode_manager.take_draft_token_ids()
+        drafts = self.spec_decode_manager.take_draft_token_ids()
+        if getattr(self, "_pp_mtp_kv_only", False):
+            # The drafter ran for its KV only: hand the scheduler no drafts,
+            # so no step ever verifies one across the pipeline.
+            return None
+        return drafts
 
     def _get_sampling_generator(self) -> torch.Generator:
         """Return the dedicated non-greedy sampling generator, seeded once.
@@ -4965,6 +4997,9 @@ class TPUModelRunner(GPUModelRunner):
         # keeps proposing from the host-materialized output in the sync block
         # below.
         is_async = bool(self.scheduler_config.async_scheduling)
+        # MTP for prefill KV under a pipeline discards the drafts: keep them on
+        # the device rather than wait on a host copy nothing reads.
+        return_device = is_async or self._pp_mtp_kv_only
         eagle3_drafts = None
         if self._is_async_drafter and combined_selected_tokens:
             if is_spec_step:
@@ -4974,7 +5009,7 @@ class TPUModelRunner(GPUModelRunner):
                         discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
                         num_rejected_tokens_np=None,
                         scheduler_output=scheduler_output,
-                        return_device=is_async,
+                        return_device=return_device,
                         next_tokens_per_chunk=next_tokens_per_chunk,
                     )
             else:
@@ -4995,9 +5030,14 @@ class TPUModelRunner(GPUModelRunner):
                         discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
                         num_rejected_tokens_np=None,
                         scheduler_output=scheduler_output,
-                        return_device=is_async,
+                        return_device=return_device,
                         device_seed=device_seed,
                     )
+
+        if self._pp_mtp_kv_only and isinstance(eagle3_drafts, torch.Tensor):
+            # Enqueue the drafter's graph through its output, so its KV
+            # writes run before the connector saves below.
+            synchronize_tensors([eagle3_drafts], wait=False)
 
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target
@@ -5254,6 +5294,15 @@ class TPUModelRunner(GPUModelRunner):
         ):
             self._greedy_head_owner = greedy_top_tokens.resolve_head_owner(
                 self.model, self._dp_lockstep_enabled()
+            )
+
+        if self._pp_mtp_kv_only:
+            # The MTP draft on the last stage embeds with the target's
+            # embedding, which the pipeline put on the first stage.
+            from vllm_torchtpu.spec_decode.utils import hand_embedding_to_last_stage
+
+            self._pp_draft_embed_shard = hand_embedding_to_last_stage(
+                self.model, self._pp_is_first, self._pp_is_last
             )
 
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
@@ -6147,8 +6196,10 @@ class TPUModelRunner(GPUModelRunner):
                 logger.info("  -- num_seqs: %d", num_reqs)
             # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
             # we skip it here as well.
-            if self.speculative_config is None or (
-                self._pcp_enabled and self._mtp_enabled
+            if (
+                self.speculative_config is None
+                or (self._pcp_enabled and self._mtp_enabled)
+                or self._pp_mtp_kv_only
             ):
                 return
             # For spec decoding, target logits have padded_logits_length rows.
@@ -6739,7 +6790,16 @@ class TPUModelRunner(GPUModelRunner):
             # bucket shape it may see at runtime.
             if self._is_async_drafter:
                 self._async_drafter.precompile()
-                if self._pcp_enabled and self._mtp_enabled:
+                if self._pp_mtp_kv_only:
+                    # The real-path warmups run the target forward on this
+                    # stage alone, which would wait on a hand-off no other
+                    # stage sends; and no step verifies drafts here. The
+                    # draft forward compiles on the first prefill.
+                    logger.info(
+                        "Skipping rejection and spec-decode warmups for MTP "
+                        "prefill KV under pipeline parallelism"
+                    )
+                elif self._pcp_enabled and self._mtp_enabled:
                     logger.info(
                         "Skipping rejection replay and decode/verify warmup "
                         "for prefill-only PCP MTP K1"

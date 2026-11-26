@@ -82,6 +82,75 @@ def test_rejects_speculative_decoding():
         validate_pipeline_parallel_config(_config(pp=2, speculative=object()))
 
 
+MTP1 = SimpleNamespace(method="mtp", num_speculative_tokens=1)
+
+
+@pytest.fixture
+def pp_mtp_flag(monkeypatch):
+    from vllm_torchtpu import envs
+
+    monkeypatch.setattr(envs, "TPU_PP_MTP_PREFILL_KV", True)
+
+
+def test_admits_mtp_for_prefill_kv_on_a_producer(pp_mtp_flag):
+    config = _config(pp=2, speculative=MTP1, kv_transfer=OFFLOAD)
+    validate_pipeline_parallel_config(config)
+    assert pp_validation.pp_mtp_prefill_kv_only(config)
+
+
+def test_admits_mtp_for_prefill_kv_on_the_disaggregation_producer(pp_mtp_flag):
+    validate_pipeline_parallel_config(
+        _config(pp=2, speculative=MTP1, kv_transfer=RAIDEN)
+    )
+
+
+def test_mtp_without_the_flag_is_refused_and_names_it():
+    with pytest.raises(
+        NotImplementedError, match="speculative decoding.*TPU_PP_MTP_PREFILL_KV=1"
+    ):
+        validate_pipeline_parallel_config(
+            _config(pp=2, speculative=MTP1, kv_transfer=OFFLOAD)
+        )
+
+
+@pytest.mark.parametrize(
+    "speculative, kv_transfer, match",
+    [
+        (
+            SimpleNamespace(method="eagle3", num_speculative_tokens=1),
+            OFFLOAD,
+            "method 'eagle3'",
+        ),
+        (
+            SimpleNamespace(method="mtp", num_speculative_tokens=3),
+            OFFLOAD,
+            "num_speculative_tokens != 1",
+        ),
+        (MTP1, None, "without a KV producer connector"),
+        (MTP1, RAIDEN_CONSUMER, "without a KV producer connector"),
+    ],
+)
+def test_flagged_mtp_is_refused_outside_prefill_kv(
+    pp_mtp_flag, speculative, kv_transfer, match
+):
+    with pytest.raises(NotImplementedError, match=match):
+        validate_pipeline_parallel_config(
+            _config(pp=2, speculative=speculative, kv_transfer=kv_transfer)
+        )
+
+
+def test_flagged_mtp_still_refuses_async_scheduling(pp_mtp_flag):
+    with pytest.raises(NotImplementedError, match="async scheduling"):
+        validate_pipeline_parallel_config(
+            _config(pp=2, async_scheduling=True, speculative=MTP1, kv_transfer=OFFLOAD)
+        )
+
+
+def test_single_stage_mtp_is_not_prefill_kv_only():
+    assert not pp_validation.pp_mtp_prefill_kv_only(_config(pp=1, speculative=MTP1))
+    assert not pp_validation.pp_mtp_prefill_kv_only(_config(pp=2))
+
+
 def test_rejects_kv_transfer_connectors_other_than_raiden():
     other = SimpleNamespace(kv_connector="TPUConnectorHMA")
     with pytest.raises(NotImplementedError, match="TPURaidenConnector"):

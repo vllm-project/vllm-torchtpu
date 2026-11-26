@@ -299,6 +299,7 @@ if TYPE_CHECKING:
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_MTP_ONEHOT_AR: bool = True
     TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: int = 0
+    TPU_PP_MTP_PREFILL_KV: bool = False
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = True
     TPU_SAMPLER_FUSED_CHAIN: bool = True
@@ -2012,6 +2013,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS": env_nonnegative_int(
         "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", 0
     ),
+    # Admit an MTP speculative config under pipeline parallelism on a KV
+    # producer: the drafter lives on the last stage and writes its layer's KV
+    # for every scheduled token, but never proposes, so the server decodes
+    # without speculation and the consumer receives the drafter KV with the
+    # target's (platforms/pp_validation.py).
+    "TPU_PP_MTP_PREFILL_KV": env_bool("TPU_PP_MTP_PREFILL_KV"),
     # Bits of the float32 threshold bisection resolved per vocab pass in
     # top-k/top-p masking (2**bits - 1 candidate thresholds per pass, same
     # result as 1 bit/pass since the predicate is monotonic). 0 = 1. Measured
