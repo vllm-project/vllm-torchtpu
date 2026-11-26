@@ -100,6 +100,9 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
         ),
         _min_tokens_batch_state=lambda: {},
         _repetition_penalty=SimpleNamespace(begin_step=lambda _batch: False),
+        _output_penalties=SimpleNamespace(
+            begin_step=lambda _batch: False, active=lambda _batch: False
+        ),
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda x: torch.argmax(x, dim=-1),
         _update_mamba_slot_read_offsets=lambda *_args: None,
@@ -274,6 +277,9 @@ def step_runner(chunks, bucket, forward_model, **overrides):
         _greedy_top_tokens_this_step=lambda: False,
         _min_tokens_batch_state=lambda: {},
         _repetition_penalty=SimpleNamespace(begin_step=lambda _batch: False),
+        _output_penalties=SimpleNamespace(
+            begin_step=lambda _batch: False, active=lambda _batch: False
+        ),
         vllm_config=SimpleNamespace(),
         maybe_setup_kv_connector=lambda *_args, **_kwargs: None,
         input_batch=SimpleNamespace(

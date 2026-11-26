@@ -772,6 +772,7 @@ def test_runner_sampling_precompile_bypassed_for_pooling(is_pooling):
         "_precompile_min_tokens_mask",
         "_precompile_thinking_budget",
         "_precompile_repetition_penalty",
+        "_precompile_output_penalties",
         "_precompile_sample_from_logits",
         "_precompile_gather_logprobs",
     )

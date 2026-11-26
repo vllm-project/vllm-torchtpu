@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 import pytest
 import torch
+from runner_input_test_utils import _input_batch, _request
 from runner_output_test_utils import (
     _host_copy_state,
     plain_step_runner,
@@ -27,7 +28,6 @@ from runner_output_test_utils import (
 )
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
-from vllm.v1.sample.logits_processor import LogitsProcessors
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.runner import min_tokens
@@ -35,10 +35,6 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
     AsyncTPUCopyState,
-)
-from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
-    CachedRequestState,
-    InputBatch,
 )
 from vllm_torchtpu.runner.vllm_v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_torchtpu.structured_decoding.structured_decoding_manager import (
@@ -258,19 +254,6 @@ class TestMask:
         assert torch.isneginf(out[0, 2]) and torch.isneginf(out).sum() == 1
 
 
-def _request(req_id, params, output):
-    return CachedRequestState(
-        req_id=req_id,
-        prompt_token_ids=list(range(4)),
-        mm_features=[],
-        sampling_params=params,
-        generator=None,
-        block_ids=([0],),
-        num_computed_tokens=4,
-        output_token_ids=output,
-    )
-
-
 def _runner(input_batch, requests=(), tracked=()):
     """A runner with `requests` (CachedRequestState) of which `tracked` asked
     for min_tokens."""
@@ -283,20 +266,6 @@ def _runner(input_batch, requests=(), tracked=()):
         if r.req_id in tracked:
             runner._min_tokens.add(r.req_id, r.sampling_params)
     return runner
-
-
-def _input_batch():
-    return InputBatch(
-        max_num_reqs=4,
-        max_model_len=64,
-        max_num_batched_tokens=16,
-        device=torch.device("cpu"),
-        vocab_size=16,
-        block_sizes=[16],
-        max_num_blocks_per_req=[4],
-        logitsprocs=LogitsProcessors(),
-        logitsprocs_need_output_token_ids=True,
-    )
 
 
 @pytest.mark.usefixtures("eager")
@@ -561,6 +530,7 @@ def test_top_tokens_step_needs_the_full_logits_below_min_tokens():
     runner.requests = {"r0": SimpleNamespace(sampling_params=params)}
     runner._min_tokens = min_tokens.MinTokensTracker()
     runner._repetition_penalty = SimpleNamespace(active=lambda _batch: False)
+    runner._output_penalties = SimpleNamespace(active=lambda _batch: False)
     batch = SimpleNamespace(
         all_greedy=True,
         max_num_logprobs=None,
