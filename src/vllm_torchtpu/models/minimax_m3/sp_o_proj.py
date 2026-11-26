@@ -135,6 +135,28 @@ def _rotate_blocks(x: torch.Tensor) -> torch.Tensor:
     return torch.index_select(x, 0, torch.remainder(order, tp))
 
 
+def gathers_with_attention(attention: nn.Module, num_tokens: int) -> bool:
+    """Whether `attention`'s MSA op gathers its o_proj's weight blocks under
+    its attention (the ``weight_block`` of the 4-bit DCP op over several KV
+    heads) for an SP step of ``num_tokens`` tokens, in place of
+    `sp_o_proj`'s all-gather, which XLA issued only after the attention."""
+    o_proj = attention.o_proj
+    return (
+        mode() == "gather"
+        and getattr(attention.msa_op, "gathers_weight", False)
+        and applies(o_proj, num_tokens)
+        and o_proj.weight.dim() == 2
+        # The op gathers over the whole world, in TP rank order.
+        and get_tp_group().world_size == torch.distributed.get_world_size()
+    )
+
+
+def weight_block(o_proj: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
+    """This rank's e4m3 [K/TP, N] weight block and its TP index (int32 [1]),
+    for an op that gathers every rank's (`gathers_with_attention`)."""
+    return local_weight(o_proj), _rank().view(1)
+
+
 def local_weight(o_proj: nn.Module) -> torch.Tensor:
     """This rank's e4m3 [K/TP, N] block of a prepared o_proj's weight."""
     w = o_proj.weight
@@ -207,6 +229,7 @@ def sp_o_proj(
     attn: torch.Tensor,
     pieces: int = 1,
     after: torch.Tensor | None = None,
+    weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """o_proj(attn) summed over TP, for this rank's row shard: ``attn`` is
     this rank's heads for all T rows, bf16 [T, K/TP]; returns [T/TP, N].
@@ -215,10 +238,12 @@ def sp_o_proj(
     row piece of the shard (``pieces``), so a piece's o_proj can run while
     the next piece crosses; the bf16 path ignores ``pieces``. The projection
     of the received rows runs after ``after`` is computed (a data
-    dependence), so the all-to-all can cross under the work producing it."""
+    dependence), so the all-to-all can cross under the work producing it.
+    ``weight``: every rank's blocks [TP, K/TP, N], already gathered
+    (`gathers_with_attention`)."""
     tp = get_tp_group().world_size
     rows, k = attn.shape
-    w = _full_weight(o_proj, tp)
+    w = _full_weight(o_proj, tp) if weight is None else weight
     # A replicated weight starts at this rank's block: rotate the heads alike.
     order = _rotate_blocks if o_proj.weight.dim() == 3 else (lambda x: x)
     if envs.TPU_MINIMAX_M3_SP_A2A_E4M3:

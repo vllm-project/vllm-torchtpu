@@ -260,9 +260,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 shard = update + _halves_rows(hidden_states, self.tp_size)
                 update = None
             elif sp_o_proj.applies(o_proj, hidden_states.shape[0]):
-                attn = self.self_attn(positions, normed, project=False, half=whole)
+                attn, weight = self._sp_attention(positions, normed, whole)
                 rows = sp_o_proj.local_rows(hidden_states)
-                shard = sp_o_proj.sp_o_proj(o_proj, attn) + rows
+                shard = sp_o_proj.sp_o_proj(o_proj, attn, weight=weight) + rows
             else:
                 attn = self.self_attn(positions, normed, half=whole)
                 shard = tensor_model_parallel_reduce_scatter(
@@ -285,18 +285,34 @@ class MiniMaxM3DecoderLayer(nn.Module):
             if halves is not None:
                 update = self._attention_halves(positions, normed, halves)
             elif sp_o_proj.applies(o_proj, shard.shape[0] * self.tp_size):
-                attn = self.self_attn(positions, normed, project=False, half=whole)
+                attn, weight = self._sp_attention(positions, normed, whole)
                 pieces = (
                     _ffn_pieces(shard.shape[0], self.tp_size)
                     if envs.TPU_MINIMAX_M3_SP_ATTN_PIECES
                     else 1
                 )
-                update = sp_o_proj.sp_o_proj(o_proj, attn, pieces)
+                update = sp_o_proj.sp_o_proj(o_proj, attn, pieces, weight=weight)
             else:
                 attn = self.self_attn(positions, normed, half=whole)
                 update = tensor_model_parallel_reduce_scatter(attn, 0)
         shard, update = self._ffn_sp(shard, update, halves is not None)
         return layer_input, shard, update
+
+    def _sp_attention(
+        self,
+        positions: torch.Tensor,
+        normed: torch.Tensor | tuple | list,
+        whole: tuple[StepHalves, None] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """This rank's heads of an SP step's attention for o_proj's
+        all-to-all path, and o_proj's gathered weight blocks when the
+        attention op gathers them (`sp_o_proj.gathers_with_attention`)."""
+        num_tokens = positions.shape[0]
+        if sp_o_proj.gathers_with_attention(self.self_attn, num_tokens):
+            return self.self_attn(
+                positions, normed, project=False, half=whole, gather_o_proj=True
+            )
+        return self.self_attn(positions, normed, project=False, half=whole), None
 
     def _attention_halves(
         self, positions: torch.Tensor, rows: list, halves: StepHalves

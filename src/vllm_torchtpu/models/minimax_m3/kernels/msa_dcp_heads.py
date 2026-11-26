@@ -34,7 +34,8 @@ normalizes in one pass instead of merging bf16 partials.
 """
 
 import functools
-from typing import NamedTuple
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -624,13 +625,14 @@ def merge_received_partials(
     return merged.reshape(num_tokens, heads, head_dim)
 
 
-# The block all-to-all's barrier semaphore (the page exchange's is 0).
+# The block exchanges' barrier semaphores (the page exchange's is 0).
 _BLOCKS_COLLECTIVE_ID = 1
+_GATHER_COLLECTIVE_ID = 2
 
 
 class BlockExchange(NamedTuple):
-    """`start_block_all_to_all`'s blocks in flight, for
-    `finish_block_all_to_all`."""
+    """`start_block_all_to_all`'s or `start_block_all_gather`'s blocks in
+    flight, for `finish_block_exchange`."""
 
     out: jax.Array
     send_sem: jax.Array
@@ -649,7 +651,7 @@ def start_block_all_to_all(
     result's first use, so one feeding work that runs much later stays
     exposed however early its operand is ready; these copies start where
     the call is ordered (by data or a barrier), and
-    `finish_block_all_to_all` waits for them."""
+    `finish_block_exchange` waits for them."""
 
     def kernel(rank_ref, x_ref, out_ref, source_ref, send_sem, recv_sem, copy_sem):
         # The copies read the blocks from this call's own output: XLA may keep
@@ -701,18 +703,84 @@ def start_block_all_to_all(
     return BlockExchange(out, send_sem, recv_sem, source)
 
 
-def finish_block_all_to_all(
-    started: BlockExchange, *, dcp: int, interpret: bool = False
+def start_block_all_gather(
+    x: jax.Array,
+    index: jax.Array,
+    *,
+    axes: tuple[str, str],
+    shape: tuple[int, int],
+    interpret: bool = False,
+) -> BlockExchange:
+    """``x`` gathered to every device of the ``axes`` mesh of ``shape``
+    ``(lanes, ranks)`` by remote DMA, returned in flight, as
+    `start_block_all_to_all` does an all-to-all: device ``(l, r)``'s output
+    ``[lanes * ranks, *x.shape]`` gets it at slot ``index`` (``int32[1]``,
+    this device's ``l * ranks + r``). `finish_block_exchange` waits."""
+    lanes, ranks = shape
+    copies = lanes * ranks
+
+    def kernel(index_ref, x_ref, out_ref, source_ref, send_sem, recv_sem, copy_sem):
+        devices = [
+            {axes[0]: jnp.int32(lane), axes[1]: jnp.int32(r)}
+            for lane in range(lanes)
+            for r in range(ranks)
+        ]
+        # As `start_block_all_to_all`: the copies read this call's own output.
+        local = pltpu.make_async_copy(x_ref, source_ref, copy_sem)
+        local.start()
+        barrier = pltpu.get_barrier_semaphore()
+        for device in devices:
+            pl.semaphore_signal(
+                barrier, inc=1, device_id=device, device_id_type=pl.DeviceIdType.MESH
+            )
+        pl.semaphore_wait(barrier, copies)
+        local.wait()
+        for device in devices:
+            pltpu.make_async_remote_copy(
+                source_ref,
+                out_ref.at[index_ref[0]],
+                send_sem,
+                recv_sem,
+                device_id=device,
+                device_id_type=pl.DeviceIdType.MESH,
+            ).start()
+
+    any_ = pl.BlockSpec(memory_space=pl.ANY)
+    sem = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+    out, source, send_sem, recv_sem = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1,),
+            in_specs=[any_],
+            out_specs=(any_, any_, sem, sem),
+            scratch_shapes=[pltpu.SemaphoreType.DMA(())],
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct((copies, *x.shape), x.dtype),
+            jax.ShapeDtypeStruct(x.shape, x.dtype),
+            pltpu.SemaphoreType.DMA(()),
+            pltpu.SemaphoreType.DMA(()),
+        ),
+        compiler_params=pltpu.CompilerParams(collective_id=_GATHER_COLLECTIVE_ID),
+        interpret=_interpret_params(interpret),
+        name="minimax_m3_msa_dcp_block_all_gather_start",
+    )(index.reshape(1), x)
+    return BlockExchange(out, send_sem, recv_sem, source)
+
+
+def finish_block_exchange(
+    started: BlockExchange, copies: int, *, interpret: bool = False
 ) -> jax.Array:
-    """The all-to-all result of `start_block_all_to_all`: waits for this
-    rank's ``dcp`` blocks and its own sends (equal-sized copies: any wait
-    retires one)."""
+    """The result of `start_block_all_to_all` or `start_block_all_gather`
+    over ``copies`` devices: waits for this device's ``copies`` blocks and
+    its own sends (equal-sized copies: any wait retires one)."""
 
     def kernel(buf_ref, send_ref, recv_ref, source_ref, out_ref):
         del buf_ref, source_ref  # aliased to out_ref; held for the sends
         block = out_ref.at[0]
         for sem in (recv_ref, send_ref):
-            for _ in range(dcp):
+            for _ in range(copies):
                 pltpu.make_async_copy(block, block, sem).wait()
 
     any_ = pl.BlockSpec(memory_space=pl.ANY)
@@ -725,7 +793,7 @@ def finish_block_all_to_all(
         out_shape=jax.ShapeDtypeStruct(started.out.shape, started.out.dtype),
         input_output_aliases={0: 0},
         interpret=_interpret_params(interpret),
-        name="minimax_m3_msa_dcp_block_all_to_all_finish",
+        name="minimax_m3_msa_dcp_block_exchange_finish",
     )(*started)
 
 
@@ -1460,6 +1528,7 @@ def _head_parallel_attend(
     topk,
     interpret,
     first_exchange=None,
+    alongside=None,
 ):
     """Token-major ``[T, Hl * D]`` attention of this rank's query heads
     (`StepQueries`, ``rows`` or ``pair``) for the rows of the requests in
@@ -1470,7 +1539,10 @@ def _head_parallel_attend(
     blocks (one max-length request): each round exchanges the live pages
     of one page buffer and attends the round's rows in windows of one
     kernel call. `first_exchange` (`start_first_round_exchange`) has the
-    first round's pages in flight."""
+    first round's pages in flight. `alongside` (`attend_and_merge`) starts
+    right before the first round's attention, after its page exchange and
+    selection, whose collectives its copies would delay; the result is then
+    ``(out, in flight)``."""
     num_tokens = tokens[0].shape[0]
     head_dim = (queries.rows if queries.pair is None else queries.pair[0]).shape[-1]
     block_size = msa.page_size(kv_cache)
@@ -1518,7 +1590,10 @@ def _head_parallel_attend(
     def plan_round(first):
         return _plan_round(first, hp_req, blocks, capacity)
 
+    more = None
+
     def attend_round(plan, acc, merge, started=None):
+        nonlocal more
         _, in_round, base, total, _ = plan
         num_pages = part * replicas
         pages = _round_pages(plan, block_tables_2d, replicas)
@@ -1569,6 +1644,10 @@ def _head_parallel_attend(
             interpret=interpret,
         )
         if not merge:
+            if alongside is not None:
+                more, kv, keys = jax.lax.optimization_barrier(
+                    (alongside((kv, keys)), kv, keys)
+                )
             # One call over every row: the kernel chunks the rows and writes
             # its output in place; rows outside the round see no page and
             # come back zero (cheap empty tiles).
@@ -1607,8 +1686,10 @@ def _head_parallel_attend(
     if split:
         heads = queries.pair[0].shape[0]
         other = jax.lax.ppermute(acc[heads:], axis, pair)
-        return unrotate_replica_rows(acc, other, rank, interpret=interpret)
-    return unrotate_to_rows(acc, interpret=interpret)
+        out = unrotate_replica_rows(acc, other, rank, interpret=interpret)
+    else:
+        out = unrotate_to_rows(acc, interpret=interpret)
+    return out if alongside is None else (out, more)
 
 
 class StepQueries(NamedTuple):
@@ -1710,14 +1791,19 @@ def attend_and_merge(
     rs_out_precision: bool,
     head_parallel_min_tokens: int = HEAD_PARALLEL_MIN_TOKENS,
     page_exchange: PageExchange | None = None,
+    alongside: Callable[[jax.Array], Any] | None = None,
     interpret: bool = False,
-) -> jax.Array:
+) -> jax.Array | tuple[jax.Array, Any]:
     """This rank's (``rank``, ``int32[1]``) attention output ``[T, Hl * D]``
     (unrotated) for its query heads ``q [T, Hl, D]`` (unrotated: this op
     rotates them, `msa_fp4.rotate_queries`; or `prepare_queries` of them)
     and its packed ``candidates [T, G * 2 * topk]``
     (`msa_dcp.msa_write_and_candidates_dcp`); 4-bit caches. `page_exchange`:
-    `start_first_round_exchange` of this step.
+    `start_first_round_exchange` of this step. `alongside(ready)` starts
+    work (a `BlockExchange`) to keep under the attention, once ``ready`` is
+    computed (the step's last work ahead of the attention: its copies must
+    not delay that work's collectives); it is returned after the attention:
+    the result is then ``(out, in flight)``.
     Runs inside a ``shard_map`` over `axis` (the DCP group)."""
     num_tokens = candidates.shape[0]
     # The rank is an input: torch_tpu's SPMD partitioner refuses the
@@ -1738,7 +1824,9 @@ def attend_and_merge(
         axis=axis, rank=rank, dcp=dcp, sm_scale=sm_scale, topk=topk, interpret=interpret
     )
     if q.decode is None:  # no head-parallel rounds
-        return _dcp_attend(
+        in_flight = None if alongside is None else alongside(candidates)
+        in_flight, q = jax.lax.optimization_barrier((in_flight, q))
+        out = _dcp_attend(
             q.rows,
             kv_cache,
             scale_cache,
@@ -1749,6 +1837,8 @@ def attend_and_merge(
             rs_out_precision=rs_out_precision,
             **common,
         ).reshape(num_tokens, -1)
+        out, in_flight = jax.lax.optimization_barrier((out, in_flight))
+        return out if in_flight is None else (out, in_flight)
     _, hp_req = _request_classes(cu_q_lens, distribution, decode_rows)
     cu_d, src_row, prefix = _decode_rows(cu_q_lens, distribution, decode_rows)
     rows = src_row.shape[0]
@@ -1786,10 +1876,12 @@ def attend_and_merge(
         tokens,
         kv_head_replicas=kv_head_replicas,
         first_exchange=page_exchange,
+        alongside=alongside,
         **common,
     )
-    hp_out, in_flight = jax.lax.optimization_barrier((hp_out, in_flight))
-    got = finish_block_all_to_all(in_flight, dcp=dcp, interpret=interpret)
+    hp_out, more = hp_out if alongside is not None else (hp_out, None)
+    hp_out, in_flight, more = jax.lax.optimization_barrier((hp_out, in_flight, more))
+    got = finish_block_exchange(in_flight, dcp, interpret=interpret)
     dcp_out = merge_received_partials(
         got, dcp_partials[0].dtype, interpret=interpret
     ).reshape(rows, -1)
@@ -1810,6 +1902,7 @@ def attend_and_merge(
     # The barrier keeps the consumer's ops out of the branches: XLA sank the
     # output projection's f32 convert of the whole output into them (a 32 MB
     # f32 copy, ~20 us per layer at c64's 8K-token steps, twin j-a202588d).
-    return jax.lax.optimization_barrier(
+    out = jax.lax.optimization_barrier(
         jax.lax.cond(prefix, decode_prefix, scatter, hp_out)
     )
+    return out if more is None else (out, more)

@@ -725,16 +725,20 @@ def _get_msa_dcp_fp4_op(
         f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
     ).replace(".", "p")
     if kv_heads > 1:
-        step_op = _get_msa_dcp_heads_step_op(
-            sm_scale,
-            topk,
-            init_blocks,
-            local_blocks,
-            dcp,
-            kv_head_replicas,
-            decode_rows,
-            suffix,
-        )
+        step_ops = {
+            gather: _get_msa_dcp_heads_step_op(
+                sm_scale,
+                topk,
+                init_blocks,
+                local_blocks,
+                dcp,
+                kv_head_replicas,
+                decode_rows,
+                suffix,
+                gather_weight=gather,
+            )
+            for gather in (False, True)
+        }
 
         def heads_op(
             q: torch.Tensor,
@@ -750,11 +754,17 @@ def _get_msa_dcp_fp4_op(
             scale_cache: torch.Tensor,
             hadamard: torch.Tensor,
             step_tokens: int | None = None,
-        ) -> torch.Tensor:
+            weight_block: tuple[torch.Tensor, torch.Tensor] | None = None,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+            """`weight_block`: (this rank's block of a weight, its rank index
+            ``int32[1]``) to gather under the attention; the result is then
+            ``(out, every rank's blocks)``."""
             # The step op rotates its own query heads; it picks its indexer
             # path itself (no StepHalves on this path).
             del hadamard, step_tokens
-            new_kv_cache, new_index_cache, new_scale_cache, out = step_op(
+            new_kv_cache, new_index_cache, new_scale_cache, out, *gathered = step_ops[
+                weight_block is not None
+            ](
                 dcp_rank,
                 q.contiguous(),
                 k,
@@ -768,12 +778,14 @@ def _get_msa_dcp_fp4_op(
                 metadata.block_tables,
                 metadata.query_start_loc,
                 metadata.request_distribution,
+                *(weight_block or ()),
             )
             kv_cache.copy_(new_kv_cache)
             index_cache.copy_(new_index_cache)
             scale_cache.copy_(new_scale_cache)
-            return out
+            return (out, *gathered) if gathered else out
 
+        heads_op.gathers_weight = True
         return heads_op
 
     # One KV head per rank: the norm + rope kernel rotates the queries
@@ -1003,6 +1015,7 @@ def _get_msa_dcp_heads_step_op(
     kv_head_replicas: int,
     decode_rows: int,
     suffix: str,
+    gather_weight: bool = False,
 ) -> Callable[..., torch.Tensor]:
     """The whole 4-bit DCP op over several KV heads as one SPMD op over the
     DCP mesh: the cache write, the indexer and candidates
@@ -1015,17 +1028,30 @@ def _get_msa_dcp_heads_step_op(
     the group's K/V and index queries are gathered in it
     (`msa_dcp_heads.gather_group_kv`) beside the query rotation. Takes this
     rank's KV head's ``k``/``v``/``index_q [T, 1, D]``; returns the written
-    caches and this rank's unrotated output ``[T, Hl * D]``."""
+    caches and this rank's unrotated output ``[T, Hl * D]``.
+
+    With `gather_weight` it also takes this rank's block of a weight and its
+    index in rank order (``int32[1]``) and returns every rank's blocks,
+    gathered by remote DMA under the attention (`start_block_all_gather`):
+    the SP o_proj weight, whose XLA all-gather was issued after the
+    attention and left exposed (~85 us per layer, c64 mixed twin)."""
     from jax.sharding import NamedSharding, PartitionSpec
 
-    from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
+    from vllm_torchtpu.distributed.dcp import (
+        DCP_AXIS_NAME,
+        DCP_LANE_AXIS_NAME,
+        get_or_create_dcp_mesh,
+    )
 
     mesh = get_or_create_dcp_mesh()
     sharded, replicated = PartitionSpec(DCP_AXIS_NAME), PartitionSpec()
     # rank, q, k, v, index_q, index_k, kv_cache, index_cache, scale_cache |
     # seq_lens, block_tables, query_start_loc, request_distribution
-    specs = (sharded,) * 9 + (replicated,) * 4
+    # | (weight block, its index)
+    specs = (sharded,) * 9 + (replicated,) * 4 + (sharded,) * (2 * gather_weight)
+    num_outputs = 4 + gather_weight
     common = dict(axis=DCP_AXIS_NAME, dcp=dcp, kv_head_replicas=kv_head_replicas)
+    mesh_shape = (mesh.shape[DCP_LANE_AXIS_NAME], mesh.shape[DCP_AXIS_NAME])
 
     def step(
         rank,
@@ -1041,6 +1067,7 @@ def _get_msa_dcp_heads_step_op(
         block_tables,
         cu_q_lens,
         distribution,
+        *weight_block,
     ):
         num_tokens = k.shape[0]
         k, v, index_q = msa_dcp_heads.gather_group_kv(k, v, index_q, rank, **common)
@@ -1095,6 +1122,19 @@ def _get_msa_dcp_heads_step_op(
                 after_write=after_write,
             )
         )
+        alongside = None
+        if weight_block:
+            weight, index = weight_block
+
+            def alongside(ready):
+                block, _ = jax.lax.optimization_barrier((weight, ready))
+                return msa_dcp_heads.start_block_all_gather(
+                    block,
+                    index,
+                    axes=(DCP_LANE_AXIS_NAME, DCP_AXIS_NAME),
+                    shape=mesh_shape,
+                )
+
         out = msa_dcp_heads.attend_and_merge(
             rank,
             queries,
@@ -1110,15 +1150,22 @@ def _get_msa_dcp_heads_step_op(
             decode_rows=decode_rows,
             rs_out_precision=envs.TPU_DCP_RS_OUT_PRECISION,
             page_exchange=started[0] if started else None,
+            alongside=alongside,
             **common,
         )
-        return kv_cache, index_cache, scale_cache, out
+        if alongside is None:
+            return kv_cache, index_cache, scale_cache, out
+        out, in_flight = out
+        gathered = msa_dcp_heads.finish_block_exchange(
+            in_flight, mesh_shape[0] * mesh_shape[1]
+        )
+        return kv_cache, index_cache, scale_cache, out, gathered
 
     body = jax.shard_map(
         step,
         mesh=mesh,
         in_specs=specs,
-        out_specs=(sharded,) * 4,
+        out_specs=(sharded,) * num_outputs,
         check_vma=False,
     )
 
@@ -1137,7 +1184,7 @@ def _get_msa_dcp_heads_step_op(
         block_tables: jax.Array,
         query_start_loc: jax.Array,
         request_distribution: jax.Array,
-    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    ) -> tuple[jax.Array, ...]:
         args = (
             dcp_rank,
             q,
@@ -1157,26 +1204,70 @@ def _get_msa_dcp_heads_step_op(
             *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
         )
 
+    # torch_tpu reads the operand types from these annotations.
+    def _step_weight_jax(
+        dcp_rank: jax.Array,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        index_q: jax.Array,
+        index_k: jax.Array,
+        kv_cache: jax.Array,
+        index_cache: jax.Array,
+        scale_cache: jax.Array,
+        seq_lens: jax.Array,
+        block_tables: jax.Array,
+        query_start_loc: jax.Array,
+        request_distribution: jax.Array,
+        weight: jax.Array,
+        weight_index: jax.Array,
+    ) -> tuple[jax.Array, ...]:
+        args = (
+            dcp_rank,
+            q,
+            k,
+            v,
+            index_q,
+            index_k,
+            kv_cache,
+            index_cache,
+            scale_cache,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            weight,
+            weight_index,
+        )
+        return body(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        f"pallas::minimax_m3_msa_dcp_heads_step_{suffix}_r{decode_rows}",
-        _step_jax,
+        f"pallas::minimax_m3_msa_dcp_heads_step_{suffix}_r{decode_rows}"
+        f"{'_w' if gather_weight else ''}",
+        _step_weight_jax if gather_weight else _step_jax,
         mesh=mesh,
         input_partition_specs=specs,
         # A sequence, one spec per output (a bare spec reads as its axes).
-        output_partition_specs=(sharded,) * 4,
+        output_partition_specs=(sharded,) * num_outputs,
         donate_argnums=(6, 7, 8),
     )
 
     def _fake(
-        dcp_rank, q, k, v, index_q, index_k, kv_cache, index_cache, scale_cache, *_
+        dcp_rank, q, k, v, index_q, index_k, kv_cache, index_cache, scale_cache, *rest
     ):
-        return (
+        outs = (
             torch.empty_like(kv_cache),
             torch.empty_like(index_cache),
             torch.empty_like(scale_cache),
             q.new_empty((q.shape[0], q.shape[1] * q.shape[2])),
         )
+        if not gather_weight:
+            return outs
+        weight = rest[-2]
+        return (*outs, weight.new_empty((mesh_shape[0] * mesh_shape[1], *weight.shape)))
 
     op.register_fake(_fake)
     return op

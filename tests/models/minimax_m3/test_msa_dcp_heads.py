@@ -248,10 +248,8 @@ def test_block_all_to_all_matches_xla():
     mesh = Mesh(np.asarray(jax.devices()[:DCP]), ("dcp",))
 
     def body(x, rank):
-        started = msa_dcp_heads.start_block_all_to_all(
-            x, rank, axis="dcp", dcp=DCP
-        )
-        got = msa_dcp_heads.finish_block_all_to_all(started, dcp=DCP)
+        started = msa_dcp_heads.start_block_all_to_all(x, rank, axis="dcp", dcp=DCP)
+        got = msa_dcp_heads.finish_block_exchange(started, DCP)
         return got, jax.lax.all_to_all(x, "dcp", 0, 0, tiled=True)
 
     f = jax.shard_map(
@@ -262,6 +260,29 @@ def test_block_all_to_all_matches_xla():
         check_vma=False,
     )
     got, want = f(jnp.asarray(x), jnp.arange(DCP, dtype=jnp.int32))
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_block_all_gather_matches_xla():
+    # Interpret mode cannot carry semaphores out of a call.
+    if jax.default_backend() != "tpu" or len(jax.devices()) < DCP:
+        pytest.skip("needs 8 TPU devices")
+    lanes, ranks = 2, DCP // 2
+    w = np.random.default_rng(1).integers(-100, 100, (DCP * 64, 512), np.int8)
+    mesh = Mesh(np.asarray(jax.devices()[:DCP]).reshape(lanes, ranks), ("lane", "dcp"))
+    both = P(("lane", "dcp"))
+
+    def body(w, index):
+        started = msa_dcp_heads.start_block_all_gather(
+            w, index, axes=("lane", "dcp"), shape=(lanes, ranks)
+        )
+        got = msa_dcp_heads.finish_block_exchange(started, DCP)
+        return got[None], jax.lax.all_gather(w, ("lane", "dcp"))[None]
+
+    f = jax.shard_map(
+        body, mesh=mesh, in_specs=(both, both), out_specs=(both, both), check_vma=False
+    )
+    got, want = f(jnp.asarray(w), jnp.arange(DCP, dtype=jnp.int32))
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 

@@ -493,14 +493,19 @@ class MiniMaxM3SparseAttention(nn.Module):
         qkv: torch.Tensor | None = None,
         half: tuple[StepHalves, int | None] | None = None,
         after: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        gather_o_proj: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
         """``hidden_states`` may come as e4m3 rows with per-row f32 scales
         (an SP step's e4m3 all-gather), which qkv_proj contracts as e4m3, or
         as a list of such all-gathered row pieces (model.py `_ffn_pieces`).
         ``project=False`` returns this rank's heads before o_proj. ``qkv``
         (with hidden_states None) is qkv_proj's output, already computed.
         ``half`` (step, i): the rows are token half i of the step (i None: all
-        of them), attended with the step's derived metadata (StepHalves)."""
+        of them), attended with the step's derived metadata (StepHalves).
+        ``gather_o_proj`` (with ``project=False``,
+        `sp_o_proj.gathers_with_attention`): also return o_proj's weight
+        blocks of every rank, gathered under the attention (None before the
+        caches are bound)."""
         if half is not None:
             positions = half[0].positions_of(half[1])
         if qkv is None and isinstance(hidden_states, list):
@@ -533,6 +538,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             attn_output = (q.transpose(0, 1) if self.q_head_major else q).reshape(
                 num_tokens, self.q_size
             )
+            gathered = None
         else:
             layer_metadata = metadata[self.kv_cache.prefix]
             assert isinstance(layer_metadata, AttentionMetadata)
@@ -553,6 +559,8 @@ class MiniMaxM3SparseAttention(nn.Module):
                 # are prefill-sized on their own.
                 if half[1] is not None and self.scale_cache is not None:
                     extra["step_tokens"] = half[0].num_tokens
+            if gather_o_proj:
+                extra["weight_block"] = sp_o_proj.weight_block(self.o_proj)
             attn_output = self.msa_op(
                 q,
                 k.view(num_tokens, self.num_kv_heads, self.head_dim),
@@ -563,8 +571,12 @@ class MiniMaxM3SparseAttention(nn.Module):
                 self.index_cache.kv_cache,
                 layer_metadata,
                 **extra,
-            ).reshape(num_tokens, self.q_size)
+            )
+            gathered = None
+            if gather_o_proj:
+                attn_output, gathered = attn_output
+            attn_output = attn_output.reshape(num_tokens, self.q_size)
         if not project:
-            return attn_output
+            return (attn_output, gathered) if gather_o_proj else attn_output
         output, _ = self.o_proj(attn_output)
         return output
