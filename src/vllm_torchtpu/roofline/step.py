@@ -55,6 +55,7 @@ from .modules import (
     _route_matmul_flops,
     activation_wire_bytes,
     pass_costs,
+    routed_moe_min_unpack_vector_flops,
 )
 from .occupancy import ExpertActivationModel
 
@@ -76,6 +77,16 @@ class FloorOptions:
     activation_model: ExpertActivationModel = field(
         default_factory=ExpertActivationModel
     )
+
+
+@dataclass(frozen=True, slots=True)
+class UnpaddedFloorOptions:
+    """Optional dtype, topology, and spec options for unpadded strict ceilings."""
+
+    dtypes: Dtypes = field(default_factory=Dtypes)
+    topology: SliceTopology | None = None
+    spec_k: int = 0
+    zero_weights: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -634,6 +645,13 @@ def _precision_time_s(
     )
 
 
+def _strict_vector_peak(chip: ChipSpec) -> float:
+    """Return strict lower-bound vector peak rate matching the bracket fast end."""
+    if chip.vector_flops_overridden:
+        return chip.vector_flops
+    return max(chip.vector_flops, chip.bf16_flops * VECTOR_TO_BF16_RATIO_BRACKET[1])
+
+
 def module_serial_s(
     module: ModuleCost,
     chip: ChipSpec,
@@ -858,34 +876,52 @@ def combine_modules(
     )
 
 
-@lru_cache(maxsize=STEP_FLOOR_CACHE_MAXSIZE)
-def step_floor(
-    geometry: ModelGeometry,
-    chip: ChipSpec,
-    parallel: Parallel,
-    shape: StepShape,
-    options: FloorOptions | None = None,
-) -> StepFloor:
-    """Compute the floor for one decode, prefill, or mixed forward pass."""
-    opts = options or FloorOptions()
-    fp8_ratio = chip.fp8_flops / chip.bf16_flops if chip.fp8_flops > 0.0 else 0.0
-    return combine_modules(
-        pass_costs(
-            geometry,
-            parallel,
-            shape,
-            opts.dtypes,
-            mxu_m_tile=chip.mxu_m_tile,
-            mxu_lhs_rows_bf16=chip.mxu_lhs_rows_bf16,
-            mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
-            activation_model=opts.activation_model,
-            fp8_to_bf16_ratio=fp8_ratio,
-            chip=chip,
-        ),
-        chip,
-        collective_latency_s=opts.collective_latency_s,
-        topology=opts.topology,
-        parallel=parallel,
+def _scale_opt(val: float | None, spec_k: int) -> float | None:
+    """Scale an optional float metric by ``k`` draft steps."""
+    return None if val is None else val * spec_k
+
+
+def _scale_draft_module(module: ModuleCost, spec_k: int) -> ModuleCost:
+    """Scale one draft module's per-step resources across ``k`` draft steps."""
+    scaled_unique = (
+        None
+        if module.unique_collectives is None
+        else tuple(
+            (collective, cnt * spec_k) for collective, cnt in module.unique_collectives
+        )
+    )
+    scaled_strict = (
+        None
+        if module.strict_collectives is None
+        else tuple(
+            (collective, cnt * spec_k) for collective, cnt in module.strict_collectives
+        )
+    )
+    return ModuleCost(
+        name=f"draft_{module.name}",
+        hbm_bytes=module.hbm_bytes * spec_k,
+        fp8_flops=module.fp8_flops * spec_k,
+        bf16_flops=module.bf16_flops * spec_k,
+        fp4_flops=module.fp4_flops * spec_k,
+        int8_flops=module.int8_flops * spec_k,
+        int4_flops=module.int4_flops * spec_k,
+        collectives=module.collectives * spec_k,
+        hbm_bytes_min=_scale_opt(module.hbm_bytes_min, spec_k),
+        unique_collectives=scaled_unique,
+        fp8_flops_min=_scale_opt(module.fp8_flops_min, spec_k),
+        bf16_flops_min=_scale_opt(module.bf16_flops_min, spec_k),
+        fp4_flops_min=_scale_opt(module.fp4_flops_min, spec_k),
+        int8_flops_min=_scale_opt(module.int8_flops_min, spec_k),
+        int4_flops_min=_scale_opt(module.int4_flops_min, spec_k),
+        vector_flops=module.vector_flops * spec_k,
+        strict_vector_flops=module.strict_vector_flops * spec_k,
+        hbm_bytes_envelope=_scale_opt(module.hbm_bytes_envelope, spec_k),
+        fp8_flops_envelope=_scale_opt(module.fp8_flops_envelope, spec_k),
+        bf16_flops_envelope=_scale_opt(module.bf16_flops_envelope, spec_k),
+        fp4_flops_envelope=_scale_opt(module.fp4_flops_envelope, spec_k),
+        int8_flops_envelope=_scale_opt(module.int8_flops_envelope, spec_k),
+        int4_flops_envelope=_scale_opt(module.int4_flops_envelope, spec_k),
+        strict_collectives=scaled_strict,
     )
 
 
@@ -926,6 +962,295 @@ def _draft_geom_for_spec(geometry: ModelGeometry) -> ModelGeometry:
         mtp_layers=0,
         ple_dim=0,
         ple_layer_ids=(),
+    )
+
+
+def _draft_fc_module(
+    geometry: ModelGeometry,
+    parallel: Parallel,
+    batch_and_spec_k: tuple[int, int],
+    dtypes: Dtypes,
+    *,
+    chip: ChipSpec,
+) -> ModuleCost:
+    """Construct the physics ModuleCost for spec_k speculative draft projections."""
+    batch, spec_k = batch_and_spec_k
+    fc_elems = DRAFT_PROJECTION_HIDDEN_VECTORS * float(
+        geometry.hidden * geometry.hidden // parallel.tp
+    )
+    fc_buckets = _route_matmul_flops(
+        batch, fc_elems, dtypes.w_aux, dtypes.act, chip=chip
+    )
+    eff_ranks = (
+        parallel.ranks_per_chip
+        if parallel.ranks_per_chip is not None
+        else chip.cores_per_chip
+    )
+    coll_cfg = CollectiveConfig(parallel.ar_algo, eff_ranks)
+    act_bytes = activation_wire_bytes(dtypes.act)
+    fc_unit = (
+        make(
+            "draft_fc_ag",
+            "ag",
+            float(batch * geometry.hidden) * act_bytes,
+            parallel.tp,
+            coll_cfg,
+        )
+        if parallel.tp > 1
+        else None
+    )
+    return ModuleCost(
+        name="draft_fc",
+        hbm_bytes=fc_elems * dtypes.w_aux * spec_k,
+        fp8_flops=fc_buckets.fp8 * spec_k,
+        bf16_flops=fc_buckets.bf16 * spec_k,
+        fp4_flops=fc_buckets.fp4 * spec_k,
+        int8_flops=fc_buckets.int8 * spec_k,
+        int4_flops=fc_buckets.int4 * spec_k,
+        collectives=(fc_unit,) * spec_k if fc_unit is not None else (),
+        unique_collectives=((fc_unit, spec_k),) if fc_unit is not None else (),
+    )
+
+
+def _strip_moe_routed_unpack(
+    geometry: ModelGeometry,
+    parallel: Parallel,
+    dtypes: Dtypes,
+    vector_m: float,
+    *,
+    chip: ChipSpec | None = None,
+    layer_scale: float = 1.0,
+    active_rows: int = 1,
+) -> float:
+    """Remove per-step routed expert unpack vector FLOPs when stripping weights."""
+    unpack_min = routed_moe_min_unpack_vector_flops(
+        geometry,
+        parallel,
+        dtypes,
+        chip=chip,
+        layer_scale=layer_scale,
+        active_rows=active_rows,
+    )
+    return max(0.0, vector_m - unpack_min)
+
+
+def _zero_weight_strict_hbm_vector(
+    module: ModuleCost,
+    zero_map: dict[str, ModuleCost],
+    step_ctx: tuple[ModelGeometry, Parallel, Dtypes, ChipSpec, int, int],
+) -> tuple[float, float]:
+    """Return strict (hbm_bytes, vector_flops) with weight-loading work subtracted."""
+    geometry, parallel, dtypes, chip, spec_k, active_rows = step_ctx
+    zero_mod = zero_map.get(module.name)
+    if module.name.removeprefix("draft_") in ("moe", "mlp", "lm_head"):
+        hbm_m = 0.0
+    else:
+        zero_hbm = zero_mod.strict_hbm_bytes if zero_mod is not None else 0.0
+        hbm_m = max(0.0, module.strict_hbm_bytes - zero_hbm)
+    zero_vector = zero_mod.strict_vector_flops if zero_mod is not None else 0.0
+    vector_m = max(0.0, module.strict_vector_flops - zero_vector)
+    if module.name == "moe":
+        vector_m = _strip_moe_routed_unpack(
+            geometry,
+            parallel,
+            dtypes,
+            vector_m,
+            chip=chip,
+            active_rows=active_rows,
+        )
+    elif module.name == "draft_moe":
+        vector_m = _strip_moe_routed_unpack(
+            _draft_geom_for_spec(geometry),
+            replace(parallel, pp=1),
+            dtypes,
+            vector_m,
+            chip=chip,
+            layer_scale=float(max(1, spec_k)),
+            active_rows=active_rows,
+        )
+    return hbm_m, vector_m
+
+
+def _eval_unpadded_modules(
+    geometry: ModelGeometry,
+    chip: ChipSpec,
+    parallel: Parallel,
+    shape: StepShape,
+    opts: UnpaddedFloorOptions,
+) -> tuple[list[ModuleCost], dict[str, ModuleCost]]:
+    """Build unpadded step/draft module list and optional zero-weight baseline map."""
+    fp8_ratio = chip.fp8_flops / chip.bf16_flops if chip.fp8_flops > 0.0 else 0.0
+
+    def _run(
+        target_geom: ModelGeometry,
+        target_parallel: Parallel,
+        target_shape: StepShape,
+    ) -> tuple[ModuleCost, ...]:
+        """Evaluate unpadded module costs for one geometry, parallel, and shape."""
+        return pass_costs(
+            target_geom,
+            target_parallel,
+            target_shape,
+            opts.dtypes,
+            mxu_m_tile=1,
+            mxu_lhs_rows_bf16=1,
+            mxu_lhs_rows_fp8=1,
+            fp8_to_bf16_ratio=fp8_ratio,
+            unpadded_linear=True,
+            chip=chip,
+        )
+
+    mods: list[ModuleCost] = list(_run(geometry, parallel, shape))
+    has_draft = opts.spec_k > 0 and shape.batch > 0 and shape.prefill_tokens == 0
+    draft_parallel = replace(parallel, pp=1)
+    if has_draft:
+        draft_geom = _draft_geom_for_spec(geometry)
+        draft_shape = StepShape(
+            batch=shape.batch,
+            rows_per_seq=1,
+            context=shape.context,
+            state_writes=1,
+            shared_prefix_tokens=shape.shared_prefix_tokens,
+        )
+        mods.extend(
+            _scale_draft_module(module, opts.spec_k)
+            for module in _run(draft_geom, draft_parallel, draft_shape)
+        )
+        mods.append(
+            _draft_fc_module(
+                geometry, parallel, (shape.batch, opts.spec_k), opts.dtypes, chip=chip
+            )
+        )
+    zero_map: dict[str, ModuleCost] = {}
+    if opts.zero_weights:
+        zero_shape = StepShape(batch=0, rows_per_seq=0, context=0, prefill_tokens=0)
+        zero_map = {
+            module.name: module for module in _run(geometry, parallel, zero_shape)
+        }
+        if has_draft:
+            zero_map.update(
+                {
+                    scaled.name: scaled
+                    for module in _run(
+                        _draft_geom_for_spec(geometry), draft_parallel, zero_shape
+                    )
+                    for scaled in (_scale_draft_module(module, opts.spec_k),)
+                }
+            )
+            fc0 = _draft_fc_module(
+                geometry, parallel, (0, opts.spec_k), opts.dtypes, chip=chip
+            )
+            zero_map[fc0.name] = fc0
+    return mods, zero_map
+
+
+@lru_cache(maxsize=STEP_FLOOR_CACHE_MAXSIZE)
+def unpadded_strict_resource_buckets(
+    geometry: ModelGeometry,
+    chip: ChipSpec,
+    parallel: Parallel,
+    shape: StepShape,
+    options: UnpaddedFloorOptions | None = None,
+) -> tuple[float, float, float, LinkCutLoad]:
+    """Return unpadded-linear (hbm_s, matmul_s, vector_s, LinkCutLoad) buckets."""
+    opts = options or UnpaddedFloorOptions()
+    mods, zero_map = _eval_unpadded_modules(geometry, chip, parallel, shape, opts)
+    tot_hbm_min_b = 0.0
+    min_fp8 = 0.0
+    min_bf16 = 0.0
+    min_fp4 = 0.0
+    min_int8 = 0.0
+    min_int4 = 0.0
+    tot_vector_min = 0.0
+    active_rows = shape.batch * shape.rows_per_seq + shape.prefill_tokens
+    for module in mods:
+        if opts.zero_weights:
+            hbm_m, vector_m = _zero_weight_strict_hbm_vector(
+                module,
+                zero_map,
+                (geometry, parallel, opts.dtypes, chip, opts.spec_k, active_rows),
+            )
+        else:
+            hbm_m = module.strict_hbm_bytes
+            vector_m = module.strict_vector_flops
+        tot_hbm_min_b += hbm_m
+        min_fp8 += module.strict_fp8_flops
+        min_bf16 += module.strict_bf16_flops
+        min_fp4 += module.strict_fp4_flops
+        min_int8 += module.strict_int8_flops
+        min_int4 += module.strict_int4_flops
+        tot_vector_min += vector_m
+    tot_min = _MatmulBuckets(
+        fp8=min_fp8,
+        bf16=min_bf16,
+        fp4=min_fp4,
+        int8=min_int8,
+        int4=min_int4,
+    )
+    combined_floor = combine_modules(
+        tuple(mods),
+        chip,
+        collective_latency_s=0.0,
+        topology=opts.topology,
+        parallel=parallel,
+    )
+    return (
+        _div_peak(tot_hbm_min_b, chip.hbm_bw, precision="hbm"),
+        _precision_time_s(tot_min, chip),
+        _div_peak(
+            tot_vector_min,
+            VECTOR_MAX_ELEMENTS_PER_WORD * _strict_vector_peak(chip),
+            precision="vector",
+        ),
+        combined_floor.link_load,
+    )
+
+
+@lru_cache(maxsize=STEP_FLOOR_CACHE_MAXSIZE)
+def unpadded_strict_resource_times(
+    geometry: ModelGeometry,
+    chip: ChipSpec,
+    parallel: Parallel,
+    shape: StepShape,
+    options: UnpaddedFloorOptions | None = None,
+) -> tuple[float, float, float, float]:
+    """Return strict unpadded-linear (hbm_s, matmul_s, vector_s, coll_s) bounds."""
+    opts = options or UnpaddedFloorOptions()
+    hbm_s, matmul_s, vector_s, link_load = unpadded_strict_resource_buckets(
+        geometry, chip, parallel, shape, opts
+    )
+    coll_s = eval_link_subset_bound_s(link_load, chip, opts.topology)
+    return (hbm_s, matmul_s, vector_s, coll_s)
+
+
+@lru_cache(maxsize=STEP_FLOOR_CACHE_MAXSIZE)
+def step_floor(
+    geometry: ModelGeometry,
+    chip: ChipSpec,
+    parallel: Parallel,
+    shape: StepShape,
+    options: FloorOptions | None = None,
+) -> StepFloor:
+    """Compute the floor for one decode, prefill, or mixed forward pass."""
+    opts = options or FloorOptions()
+    fp8_ratio = chip.fp8_flops / chip.bf16_flops if chip.fp8_flops > 0.0 else 0.0
+    return combine_modules(
+        pass_costs(
+            geometry,
+            parallel,
+            shape,
+            opts.dtypes,
+            mxu_m_tile=chip.mxu_m_tile,
+            mxu_lhs_rows_bf16=chip.mxu_lhs_rows_bf16,
+            mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
+            activation_model=opts.activation_model,
+            fp8_to_bf16_ratio=fp8_ratio,
+            chip=chip,
+        ),
+        chip,
+        collective_latency_s=opts.collective_latency_s,
+        topology=opts.topology,
+        parallel=parallel,
     )
 
 
@@ -991,134 +1316,12 @@ def spec_cycle_floor(
         fp8_to_bf16_ratio=fp8_ratio,
         chip=chip,
     )
-
-    fc_elems = DRAFT_PROJECTION_HIDDEN_VECTORS * float(
-        geometry.hidden * geometry.hidden // parallel.tp
-    )
-    fc_buckets = _route_matmul_flops(
-        spec.batch, fc_elems, opts.dtypes.w_aux, opts.dtypes.act, chip=chip
-    )
-    eff_ranks = (
-        parallel.ranks_per_chip
-        if parallel.ranks_per_chip is not None
-        else chip.cores_per_chip
-    )
-    coll_cfg = CollectiveConfig(parallel.ar_algo, eff_ranks)
-    draft_act_bytes = activation_wire_bytes(opts.dtypes.act)
-    fc_unit = (
-        make(
-            "draft_fc_ag",
-            "ag",
-            float(spec.batch * geometry.hidden) * draft_act_bytes,
-            parallel.tp,
-            coll_cfg,
+    verify_mods.extend(_scale_draft_module(module, spec.spec_k) for module in one_draft)
+    verify_mods.append(
+        _draft_fc_module(
+            geometry, parallel, (spec.batch, spec.spec_k), opts.dtypes, chip=chip
         )
-        if parallel.tp > 1
-        else None
     )
-    draft_fc = ModuleCost(
-        name="draft_fc",
-        hbm_bytes=fc_elems * opts.dtypes.w_aux * spec.spec_k,
-        fp8_flops=fc_buckets.fp8 * spec.spec_k,
-        bf16_flops=fc_buckets.bf16 * spec.spec_k,
-        fp4_flops=fc_buckets.fp4 * spec.spec_k,
-        int8_flops=fc_buckets.int8 * spec.spec_k,
-        int4_flops=fc_buckets.int4 * spec.spec_k,
-        collectives=(fc_unit,) * spec.spec_k if fc_unit is not None else (),
-        unique_collectives=((fc_unit, spec.spec_k),) if fc_unit is not None else (),
-    )
-    verify_mods.extend(
-        ModuleCost(
-            name=f"draft_{module.name}",
-            hbm_bytes=module.hbm_bytes * spec.spec_k,
-            fp8_flops=module.fp8_flops * spec.spec_k,
-            bf16_flops=module.bf16_flops * spec.spec_k,
-            fp4_flops=module.fp4_flops * spec.spec_k,
-            int8_flops=module.int8_flops * spec.spec_k,
-            int4_flops=module.int4_flops * spec.spec_k,
-            collectives=module.collectives * spec.spec_k,
-            hbm_bytes_min=(
-                None
-                if module.hbm_bytes_min is None
-                else module.hbm_bytes_min * spec.spec_k
-            ),
-            unique_collectives=(
-                None
-                if module.unique_collectives is None
-                else tuple(
-                    (collective, cnt * spec.spec_k)
-                    for collective, cnt in module.unique_collectives
-                )
-            ),
-            fp8_flops_min=(
-                None
-                if module.fp8_flops_min is None
-                else module.fp8_flops_min * spec.spec_k
-            ),
-            bf16_flops_min=(
-                None
-                if module.bf16_flops_min is None
-                else module.bf16_flops_min * spec.spec_k
-            ),
-            fp4_flops_min=(
-                None
-                if module.fp4_flops_min is None
-                else module.fp4_flops_min * spec.spec_k
-            ),
-            int8_flops_min=(
-                None
-                if module.int8_flops_min is None
-                else module.int8_flops_min * spec.spec_k
-            ),
-            int4_flops_min=(
-                None
-                if module.int4_flops_min is None
-                else module.int4_flops_min * spec.spec_k
-            ),
-            vector_flops=module.vector_flops * spec.spec_k,
-            strict_vector_flops=module.strict_vector_flops * spec.spec_k,
-            hbm_bytes_envelope=(
-                None
-                if module.hbm_bytes_envelope is None
-                else module.hbm_bytes_envelope * spec.spec_k
-            ),
-            fp8_flops_envelope=(
-                None
-                if module.fp8_flops_envelope is None
-                else module.fp8_flops_envelope * spec.spec_k
-            ),
-            bf16_flops_envelope=(
-                None
-                if module.bf16_flops_envelope is None
-                else module.bf16_flops_envelope * spec.spec_k
-            ),
-            fp4_flops_envelope=(
-                None
-                if module.fp4_flops_envelope is None
-                else module.fp4_flops_envelope * spec.spec_k
-            ),
-            int8_flops_envelope=(
-                None
-                if module.int8_flops_envelope is None
-                else module.int8_flops_envelope * spec.spec_k
-            ),
-            int4_flops_envelope=(
-                None
-                if module.int4_flops_envelope is None
-                else module.int4_flops_envelope * spec.spec_k
-            ),
-            strict_collectives=(
-                None
-                if module.strict_collectives is None
-                else tuple(
-                    (collective, cnt * spec.spec_k)
-                    for collective, cnt in module.strict_collectives
-                )
-            ),
-        )
-        for module in one_draft
-    )
-    verify_mods.append(draft_fc)
     return combine_modules(
         tuple(verify_mods),
         chip,

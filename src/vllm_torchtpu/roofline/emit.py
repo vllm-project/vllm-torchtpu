@@ -20,16 +20,26 @@ from collections.abc import Mapping
 from dataclasses import asdict
 from typing import TYPE_CHECKING, TypedDict, Unpack
 
-from .chips import CHIPS, JAX_VERSION, chip_catalog, topologies_for_chip
+from .chips import (
+    CHIPS,
+    JAX_VERSION,
+    chip_catalog,
+    get_solver_assumptions,
+    topologies_for_chip,
+)
 from .constants import (
     DEFAULT_CHIPS_PER_HOST,
     DEFAULT_CORES_PER_CHIP,
+    DEFAULT_HBM_RESERVE_GB,
+    MIN_TOP_LAYOUTS_FOR_BOUND_BEST,
     MIN_TOP_LAYOUTS_FOR_FASTEST,
     PERCENT_SCALE,
+    SLO_VERDICT_ESTIMATE_MEETS,
     SLO_VERDICT_RANK,
     SLO_VERDICT_RULED_OUT,
     SOLVE_SCHEMA,
     UNIT_GIGA,
+    UNIT_MICRO,
 )
 from .families import (
     attach_reference_report,
@@ -39,6 +49,7 @@ from .families import (
     reference_layout_report,
     strict_rank,
 )
+from .occupancy import ExpertActivationModel
 from .schema import (
     CeilingRow,
     ParetoPoint,
@@ -115,6 +126,131 @@ def slice_per_concurrency[T: (ParetoPoint, PoolFloorRecord)](
     return tuple(sliced)
 
 
+def _filter_eligible(points: Sequence[ParetoPoint]) -> list[ParetoPoint]:
+    """Return non-ruled-out points, preferring ``estimate_meets`` when present."""
+    eligible = [
+        point
+        for point in points
+        if effective_slo_verdict(point) != SLO_VERDICT_RULED_OUT
+    ]
+    meets = [
+        point
+        for point in eligible
+        if effective_slo_verdict(point) == SLO_VERDICT_ESTIMATE_MEETS
+    ]
+    return meets if meets else eligible
+
+
+def _supplied_entry(
+    name: str,
+    flag: str,
+    kind: str,
+    value: object,
+    unit: str,
+) -> dict[str, object]:
+    """Build one structured supplied-override provenance record."""
+    return {"name": name, "flag": flag, "kind": kind, "value": value, "unit": unit}
+
+
+def _build_provenance_payload(
+    plan: ServingPlan,
+    *,
+    dtypes: Dtypes | None = None,
+) -> ProvenancePayload:
+    """Build provenance block recording active calibrations and supplied overrides."""
+    active_calibrations: list[str] = []
+    supplied_values: list[dict[str, object]] = []
+    if plan.collective_latency_s > 0.0:
+        supplied_values.append(
+            _supplied_entry(
+                "collective_latency_us",
+                "--collective-latency-us",
+                "calibration",
+                plan.collective_latency_s / UNIT_MICRO,
+                "us",
+            )
+        )
+        active_calibrations.append("collective_latency_s")
+    if plan.hbm_reserve_gb != DEFAULT_HBM_RESERVE_GB:
+        supplied_values.append(
+            _supplied_entry(
+                "hbm_reserve_gb",
+                "--hbm-reserve-gb",
+                "constraint",
+                plan.hbm_reserve_gb,
+                "GB",
+            )
+        )
+    if plan.activation_model.regime != ExpertActivationModel().regime:
+        is_cal = plan.activation_model.prunes_on_envelope
+        supplied_values.append(
+            _supplied_entry(
+                "moe_activation",
+                "--moe-activation",
+                "calibration" if is_cal else "constraint",
+                plan.activation_model.regime,
+                "mode",
+            )
+        )
+        if is_cal:
+            active_calibrations.append("moe_activation")
+    if dtypes is not None:
+        if dtypes.w_dense_source == "flag":
+            supplied_values.append(
+                _supplied_entry(
+                    "weight_dtype",
+                    "--weight-dtype",
+                    "constraint",
+                    dtypes.w_dense_dtype,
+                    "dtype",
+                )
+            )
+        if dtypes.w_expert_source == "flag":
+            supplied_values.append(
+                _supplied_entry(
+                    "expert_weight_dtype",
+                    "--expert-weight-dtype",
+                    "constraint",
+                    dtypes.w_expert_dtype,
+                    "dtype",
+                )
+            )
+        if dtypes.kv_source == "flag":
+            supplied_values.append(
+                _supplied_entry(
+                    "kv_dtype",
+                    "--kv-dtype",
+                    "constraint",
+                    dtypes.kv_dtype,
+                    "dtype",
+                )
+            )
+        if dtypes.state_source == "flag":
+            supplied_values.append(
+                _supplied_entry(
+                    "state_dtype",
+                    "--state-dtype",
+                    "constraint",
+                    dtypes.state_dtype,
+                    "dtype",
+                )
+            )
+    return {
+        "calibrated": bool(active_calibrations),
+        "supplied_values": supplied_values,
+        "ranking_basis": (
+            "modeled serial_estimate_s estimate ordering with ceiling tie-break for "
+            "candidates and top_k; active TPOT floor ordering for bound families"
+        ),
+        "basis": (
+            "Analytical step floors and uncalibrated serial-phase roofline "
+            "estimates; est_* values are modeled estimates, bound_* values are "
+            "physical lower bounds, envelope_* values track the active MoE "
+            "activation envelope, and floor_throughput_per_chip is the ceiling"
+        ),
+    }
+
+
 def _is_2d_dominated(
     point: ParetoPoint,
     peers: Sequence[ParetoPoint],
@@ -132,61 +268,96 @@ def _is_2d_dominated(
     )
 
 
-def _metric_pair(point: ParetoPoint, sort_by: str) -> tuple[float, float]:
-    """Return (primary, secondary) objective values for the active sort_by mode."""
-    if sort_by == "interactivity":
-        return (point.est_interactivity_tok_s, point.token_throughput_per_chip)
-    return (point.token_throughput_per_chip, point.est_interactivity_tok_s)
+def _inject_top_k_anchors(
+    selected: list[ParetoPoint],
+    eligible_cands: list[ParetoPoint],
+    plan: ServingPlan,
+    top_k: int,
+) -> list[ParetoPoint]:
+    """Reserve opposite-metric and lowest-TPOT-bound anchors in bounded Top-K."""
+    is_interactivity = plan.sort_by == "interactivity"
+    protected_indices: set[int] = {0}
+    if top_k >= MIN_TOP_LAYOUTS_FOR_FASTEST:
+        opposite = max(
+            eligible_cands,
+            key=lambda point: (
+                SLO_VERDICT_RANK[effective_slo_verdict(point)],
+                (
+                    point.token_throughput_per_chip
+                    if is_interactivity
+                    else point.est_interactivity_tok_s
+                ),
+                (
+                    point.est_interactivity_tok_s
+                    if is_interactivity
+                    else point.token_throughput_per_chip
+                ),
+            ),
+        )
+        sel_keys = [_point_struct_key(point) for point in selected]
+        opp_key = _point_struct_key(opposite)
+        if opp_key in sel_keys:
+            opp_idx = sel_keys.index(opp_key)
+            if opp_idx > 0:
+                selected[opp_idx] = opposite
+            protected_indices.add(opp_idx)
+        else:
+            selected[-1] = opposite
+            protected_indices.add(len(selected) - 1)
+    if top_k >= MIN_TOP_LAYOUTS_FOR_BOUND_BEST:
+        eligible = _filter_eligible(eligible_cands) or eligible_cands
+        lowest_bound = min(point.bound_tpot_ms for point in eligible)
+        best_bnd = [point for point in eligible if point.bound_tpot_ms == lowest_bound]
+        sel_keys = [_point_struct_key(point) for point in selected]
+        if best_bnd and not any(
+            _point_struct_key(point) in sel_keys for point in best_bnd
+        ):
+            bound_pt = max(
+                best_bnd,
+                key=lambda point: (
+                    point.token_throughput_per_chip,
+                    point.floor_throughput_per_chip,
+                ),
+            )
+            replace_idx = next(
+                (
+                    idx
+                    for idx in range(len(selected) - 1, 0, -1)
+                    if idx not in protected_indices
+                ),
+                None,
+            )
+            if replace_idx is not None:
+                selected[replace_idx] = bound_pt
+    selected.sort(key=lambda point: candidate_sort_key(point, plan.sort_by))
+    return selected
 
 
 def top_layouts(
     plan: ServingPlan,
     top_k: int | None = None,
 ) -> tuple[ParetoPoint, ...]:
-    """Return distinct layouts ordered by plan.sort_by, optionally cut to k."""
+    """Return distinct layouts ordered by verdict, metric, and ceiling, cut to k."""
     if top_k is not None and top_k <= 0:
         return ()
-    slo_cands = [point_item for point_item in plan.candidates if point_item.slo_met]
-    if not slo_cands:
+    eligible_cands = _filter_eligible(plan.candidates)
+    if not eligible_cands:
         return ()
     best: dict[tuple[str, PoolStructKey | None, PoolStructKey | None], ParetoPoint] = {}
-    for point in slo_cands:
+    for point in eligible_cands:
         key = _point_struct_key(point)
         current_best = best.get(key)
-        if current_best is None or _metric_pair(point, plan.sort_by) > _metric_pair(
-            current_best, plan.sort_by
-        ):
+        if current_best is None or candidate_sort_key(
+            point, plan.sort_by
+        ) < candidate_sort_key(current_best, plan.sort_by):
             best[key] = point
     ranked = sorted(
         best.values(),
         key=lambda point_item: candidate_sort_key(point_item, plan.sort_by),
     )
-    if top_k is None:
-        return tuple(ranked)
-    if len(ranked) <= 1 or top_k < MIN_TOP_LAYOUTS_FOR_FASTEST:
-        return tuple(ranked[:top_k])
-    selected = list(ranked[:top_k])
-    opposite = max(
-        slo_cands,
-        key=lambda point_item: (
-            (
-                point_item.token_throughput_per_chip,
-                point_item.est_interactivity_tok_s,
-            )
-            if plan.sort_by == "interactivity"
-            else (
-                point_item.est_interactivity_tok_s,
-                point_item.token_throughput_per_chip,
-            )
-        ),
-    )
-    opp_key = _point_struct_key(opposite)
-    sel_keys = [_point_struct_key(point_item) for point_item in selected]
-    if opp_key not in sel_keys:
-        selected[-1] = opposite
-    elif sel_keys.index(opp_key) > 0:
-        selected[sel_keys.index(opp_key)] = opposite
-    selected.sort(key=lambda point_item: candidate_sort_key(point_item, plan.sort_by))
+    if top_k is None or len(ranked) <= 1 or top_k < MIN_TOP_LAYOUTS_FOR_FASTEST:
+        return tuple(ranked if top_k is None else ranked[:top_k])
+    selected = _inject_top_k_anchors(list(ranked[:top_k]), eligible_cands, plan, top_k)
     return tuple(selected)
 
 
@@ -231,12 +402,31 @@ def top_layout_roles(
         if effective_slo_verdict(point_item) != SLO_VERDICT_RULED_OUT
     ]
     dominance_pool: tuple[ParetoPoint, ...] = (*top_pts, *eligible_frontier)
+    lowest_bound = min(
+        (point_item.bound_tpot_ms for point_item in top_pts), default=0.0
+    )
+    bound_idx = next(
+        (
+            i
+            for i, point_item in enumerate(top_pts)
+            if point_item.bound_tpot_ms == lowest_bound
+        ),
+        -1,
+    )
+    if any(
+        top_pts[i].bound_tpot_ms == lowest_bound
+        for i in (0, fastest_idx)
+        if 0 <= i < len(top_pts)
+    ):
+        bound_idx = -1
     out: list[tuple[ParetoPoint, str, float]] = []
     for idx, point in enumerate(top_pts):
         if idx == 0:
             role = "max_interactivity" if is_interactivity else "max_throughput"
         elif idx == fastest_idx:
             role = "max_throughput" if is_interactivity else "max_interactivity"
+        elif idx == bound_idx:
+            role = "min_tpot_bound"
         elif _is_2d_dominated(point, dominance_pool):
             role = "off_frontier_alt"
         else:
@@ -413,13 +603,7 @@ def build_solve_payload(
         "top_k_limit": top_k,
         "search": asdict(plan.search) if plan.search is not None else None,
         "schema": SOLVE_SCHEMA,
-        "provenance": {
-            "calibrated": False,
-            "basis": (
-                "Analytical step floors and uncalibrated serial-phase "
-                "estimates; modeled, not measured"
-            ),
-        },
+        "provenance": _build_provenance_payload(plan, dtypes=dtypes),
         "chip_spec": chip_dict,
         "model": model,
         "top_k": top_entries,
@@ -482,6 +666,10 @@ def build_solve_payload(
         concurrency_top_k[str(concurrency)] = entries
     payload["concurrency_top_k"] = concurrency_top_k
     payload["bound_families_by_concurrency"] = build_bound_families_by_concurrency(plan)
+    payload["solver_assumptions"] = get_solver_assumptions(chip)
+    payload["activation_regime"] = plan.activation_model.regime
+    payload["spec_tokens"] = plan.spec_tokens
+    payload["mtp_layers"] = plan.mtp_layers
     if dtypes is not None:
         payload["dtypes"] = asdict(dtypes)
     return payload
@@ -506,10 +694,13 @@ def emit_ceiling_rows(
             "output_throughput_per_chip": point.output_throughput_per_chip,
             "est_ttft_ms": point.est_ttft_ms,
             "est_tpot_ms": point.est_tpot_ms,
+            "bound_tpot_ms": point.bound_tpot_ms,
             "concurrency": point.concurrency,
             "total_chips": point.total_chips,
             "mode": point.mode,
             "binding_unit": point.binding,
+            "min_decode_seqs": point.min_decode_seqs,
+            "floor_throughput_per_chip": point.floor_throughput_per_chip,
             "slo_met": point.slo_met,
             "is_pareto": point.is_pareto,
             "decode_topology": point.decode_pool.topology,

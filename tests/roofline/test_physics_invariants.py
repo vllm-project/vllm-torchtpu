@@ -15,19 +15,38 @@
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import replace as dc_replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
-from tests.roofline.conftest import LOCKED_FIXTURE_FILES, load_locked_bundle
+from tests.roofline import regen_golden, render_docs_tables
+from tests.roofline.conftest import (
+    LOCKED_FIXTURE_FILES,
+    load_locked_bundle,
+    load_locked_config,
+)
 from vllm_torchtpu.roofline import (
     CHIPS,
     TOPOLOGIES,
+    FloorOptions,
+    StepShape,
     TrafficScenario,
+    bound_tpot_ms,
+    bound_ttft_ms,
     build_solve_payload,
+    dtypes_from_hf_config,
+    floor_throughput_per_chip,
+    from_hf_config,
+    pool_capacity_bound,
+    request_rate_bound,
     solve_serving_plan,
+    step_floor,
 )
+from vllm_torchtpu.roofline.constants import SLO_VERDICT_RANK
 from vllm_torchtpu.roofline.memory import (
     SeqKvLayout,
     hbm_breakdown_per_core_bytes,
@@ -48,6 +67,7 @@ if TYPE_CHECKING:
     from vllm_torchtpu.roofline.geometry import ModelGeometry
 
 _MIN_EP_RANKS = 2
+_FULL_2X2X1_CORES = 8
 
 
 def _indep_valid_tp(geometry: ModelGeometry, tp: int, *, has_rec: bool) -> bool:
@@ -273,7 +293,10 @@ def test_no_legal_layout_dropped_by_estimate() -> None:
         assert seen == expected_fitting
         assert any(point.is_pareto for point in at_c)
         # Verify SLO-met candidates precede unmet, ordered by throughput descending.
-        keys = [(not point.slo_met, -point.token_throughput_per_chip) for point in at_c]
+        keys = [
+            (-SLO_VERDICT_RANK[point.slo_verdict], -point.token_throughput_per_chip)
+            for point in at_c
+        ]
         assert keys == sorted(keys)
 
 
@@ -477,3 +500,465 @@ def test_kv_bytes_per_core_parts_matches_hbm_breakdown_across_pp(
     assert per_tok * float(ctx_tokens) + fixed_seq == pytest.approx(
         breakdown.kv, rel=1e-9
     )
+
+
+def test_bound_counts_decode_steps_after_first_token() -> None:
+    """At osl=1 prefill emits the only output token so decode steps are zero."""
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    chip = CHIPS["tpu7x"]
+    topology = TOPOLOGIES["2x2x1"]
+    pref_par = Parallel(tp=8)
+    dec_par = Parallel(tp=8)
+    scenario = TrafficScenario(
+        name="osl1-check",
+        isl=2048,
+        osl=1,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1,),
+        kv_working_set_turns=1.0,
+    )
+    b_ttft_s = (
+        bound_ttft_ms(
+            geometry,
+            dtypes,
+            chip,
+            scenario,
+            prefill_par=pref_par,
+            prefill_topo=topology,
+        )
+        / 1000.0
+    )
+    rate_bound = request_rate_bound(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        decode_par=dec_par,
+        decode_topo=topology,
+        replica_batch_cap=1,
+        concurrency=1,
+    )
+    assert rate_bound == pytest.approx(1.0 / b_ttft_s, rel=1e-6)
+
+
+def test_capacity_ceiling_uses_shared_prefix_batch() -> None:
+    """Shared-prefix batch cap raises ceiling above unshared HBM batch cap."""
+    config = load_locked_config("qwen3_5_397b_fp8.json")
+    geometry = from_hf_config(config, model_ref="Qwen/Qwen3.5-397B-A17B-FP8")
+    dtypes = dtypes_from_hf_config(config)
+    chip = CHIPS["tpu7x"]
+    topology = TOPOLOGIES["2x2x1"]
+    scen_h90 = TrafficScenario(
+        name="prefix-h90",
+        isl=32768,
+        osl=2048,
+        prefix_hit_rate=0.90,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(64,),
+        kv_working_set_turns=1.0,
+    )
+    p90 = solve_serving_plan(
+        geometry, dtypes, chip, scen_h90, SolveOptions(mode="mixed", max_chips=4)
+    )
+    pt90 = next(
+        point
+        for point in p90.candidates
+        if point.decode_pool.tp == 1
+        and point.decode_pool.dp == _FULL_2X2X1_CORES
+        and point.decode_pool.ep == _FULL_2X2X1_CORES
+        and point.decode_pool.kv_split == 1
+    )
+    parallel = Parallel(
+        tp=pt90.decode_pool.tp,
+        dp=pt90.decode_pool.dp,
+        ep=pt90.decode_pool.ep,
+        kv_split=pt90.decode_pool.kv_split,
+        moe="ep",
+        moe_dispatch=pt90.decode_pool.moe_dispatch,
+        ranks_per_chip=topology.cores_per_chip,
+    )
+    w_base = hbm_footprint_per_core_bytes(
+        geometry, dtypes, parallel, SeqKvLayout(0, 0), chip=chip
+    )
+    c1 = hbm_footprint_per_core_bytes(
+        geometry,
+        dtypes,
+        parallel,
+        SeqKvLayout(1, scen_h90.isl + scen_h90.osl),
+        chip=chip,
+    )
+    b_unshared = max(1, int((float(chip.hbm_bytes) - w_base) // (c1 - w_base)))
+    unshared_ceil = floor_throughput_per_chip(
+        geometry,
+        dtypes,
+        chip,
+        scen_h90,
+        decode_par=parallel,
+        decode_topo=topology,
+        replica_batch_cap=b_unshared,
+        concurrency=64,
+    )
+    assert pt90.floor_throughput_per_chip > unshared_ceil * 1.15
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+def test_disagg_prefill_batched_soundness_and_dp_scaling(fixture_name: str) -> None:
+    """Disagg prefill ceiling stays sound for batched prompts and scales with dp."""
+    bundle = load_locked_bundle(fixture_name)
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    chip = CHIPS["tpu7x"]
+    topology = TOPOLOGIES["2x2x1"]
+    pref_dp1 = Parallel(tp=2, dp=1)
+    pref_dp2 = Parallel(tp=2, dp=2)
+    dec_par = Parallel(tp=8)
+    for isl, hit in ((512, 0.0), (16384, 0.98)):
+        scenario = TrafficScenario(
+            name=f"disagg-pref-{isl}",
+            isl=isl,
+            osl=1,
+            prefix_hit_rate=hit,
+            accept_len=1.0,
+            think_time_s=None,
+            concurrencies=(16,),
+            kv_working_set_turns=1.0,
+        )
+        capacity_dp1 = pool_capacity_bound(
+            geometry,
+            dtypes,
+            chip,
+            scenario,
+            prefill_par=pref_dp1,
+            prefill_topo=topology,
+            decode_par=dec_par,
+            decode_topo=topology,
+            prefill_instances=1,
+            decode_instances=1,
+            replica_batch_cap=16,
+        )
+        capacity_dp2 = pool_capacity_bound(
+            geometry,
+            dtypes,
+            chip,
+            scenario,
+            prefill_par=pref_dp2,
+            prefill_topo=topology,
+            decode_par=dec_par,
+            decode_topo=topology,
+            prefill_instances=1,
+            decode_instances=1,
+            replica_batch_cap=16,
+        )
+        # 8 prompts packed in one prefill step share weight reads once.
+        batched_floor = step_floor(
+            geometry,
+            chip,
+            pref_dp1,
+            StepShape(
+                batch=0,
+                rows_per_seq=1,
+                context=0,
+                prefill_tokens=8 * isl,
+                prefix_hit_rate=hit,
+            ),
+            FloorOptions(dtypes=dtypes, topology=topology),
+        )
+        batched_rate = 8.0 / batched_floor.hard_floor_s
+        assert math.isfinite(capacity_dp1)
+        assert capacity_dp1 >= batched_rate * (1.0 - 1e-5)
+        assert capacity_dp2 == pytest.approx(2.0 * capacity_dp1, rel=1e-6)
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+def test_mixed_osl_monotonic_and_near_full_hit_finite(fixture_name: str) -> None:
+    """Mixed capacity is non-increasing in osl and finite at near-full prefix hit."""
+    bundle = load_locked_bundle(fixture_name)
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    chip = CHIPS["tpu7x"]
+    topology = TOPOLOGIES["2x2x1"]
+    parallel = Parallel(tp=8, ep=8, moe="ep")
+    for accept_len in (1.0, 2.0, 3.0):
+        caps = [
+            pool_capacity_bound(
+                geometry,
+                dtypes,
+                chip,
+                TrafficScenario(
+                    name=f"mixed-osl-{osl}",
+                    isl=2048,
+                    osl=osl,
+                    prefix_hit_rate=0.5,
+                    accept_len=accept_len,
+                    think_time_s=None,
+                    concurrencies=(16,),
+                    kv_working_set_turns=1.0,
+                ),
+                decode_par=parallel,
+                decode_topo=topology,
+                replica_batch_cap=16,
+            )
+            for osl in (1, 2, 16)
+        ]
+        assert caps[0] >= caps[1] - 1e-6
+        assert caps[1] >= caps[2] - 1e-6
+
+    near_full_cap = pool_capacity_bound(
+        geometry,
+        dtypes,
+        chip,
+        TrafficScenario(
+            name="near-full-hit",
+            isl=4096,
+            osl=1,
+            prefix_hit_rate=0.9999,
+            accept_len=1.0,
+            think_time_s=None,
+            concurrencies=(16,),
+            kv_working_set_turns=1.0,
+        ),
+        decode_par=parallel,
+        decode_topo=topology,
+        replica_batch_cap=16,
+    )
+    assert math.isfinite(near_full_cap)
+    assert near_full_cap > 0.0
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+def test_pp_decode_sound_bound_and_capacity(fixture_name: str) -> None:
+    """PP decode bound charges embed+lm_head once and matches max(T(B//pp), T(B)/pp)."""
+    bundle = load_locked_bundle(fixture_name)
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    chip = CHIPS["tpu7x"]
+    topology = TOPOLOGIES["2x2x2"]
+    pp = 4
+    par_pp4 = Parallel(tp=4, pp=pp, ep=4, moe="ep")
+    par_pp1 = Parallel(tp=4, pp=1, ep=4, moe="ep")
+    scenario = TrafficScenario(
+        name="pp-decode-sound",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=None,
+        concurrencies=(1,),
+        kv_working_set_turns=1.0,
+    )
+    ctx_mid = scenario.isl + scenario.osl // 2
+    sf_b1_full = step_floor(
+        geometry,
+        chip,
+        par_pp1,
+        StepShape(batch=1, context=ctx_mid),
+        FloorOptions(dtypes=dtypes, topology=topology),
+    )
+    bound_b1_ms = bound_tpot_ms(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        decode_par=par_pp4,
+        decode_topo=topology,
+        replica_batch_cap=1,
+        concurrency=1,
+    )
+    assert bound_b1_ms == pytest.approx(sf_b1_full.hard_floor_s * 1000.0, rel=1e-6)
+
+    # Also verify B > pp (B=16, pp=4) exercises max(T(B//pp), T(B)/pp) and capacity.
+    batch_b = 16
+    sf_mb = step_floor(
+        geometry,
+        chip,
+        par_pp1,
+        StepShape(batch=batch_b // pp, context=ctx_mid),
+        FloorOptions(dtypes=dtypes, topology=topology),
+    )
+    sf_full = step_floor(
+        geometry,
+        chip,
+        par_pp1,
+        StepShape(batch=batch_b, context=ctx_mid),
+        FloorOptions(dtypes=dtypes, topology=topology),
+    )
+    expected_pp_cycle_ms = (
+        max(sf_mb.hard_floor_s, sf_full.hard_floor_s / float(pp)) * 1000.0
+    )
+    scen_b16 = TrafficScenario(
+        name="pp-decode-b16",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(batch_b,),
+        kv_working_set_turns=1.0,
+        ttft_slo_ms=10_000.0,
+    )
+    bound_b16_ms = bound_tpot_ms(
+        geometry,
+        dtypes,
+        chip,
+        scen_b16,
+        decode_par=par_pp4,
+        decode_topo=topology,
+        replica_batch_cap=batch_b,
+        concurrency=batch_b,
+    )
+    assert bound_b16_ms > 0.0
+    assert bound_b16_ms <= expected_pp_cycle_ms + 1e-6
+    from vllm_torchtpu.roofline import pool_capacity_bound
+
+    cap_rate = pool_capacity_bound(
+        geometry,
+        dtypes,
+        chip,
+        scen_b16,
+        decode_par=par_pp4,
+        decode_topo=topology,
+        replica_batch_cap=batch_b,
+    )
+    assert math.isfinite(cap_rate)
+    assert cap_rate > 0.0
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+@pytest.mark.parametrize("topo_name", ["2x2x1", "2x2x2", "2x2x4"])
+def test_physics_invariants_hold_for_every_candidate(
+    fixture_name: str,
+    topo_name: str,
+) -> None:
+    """Check floor<=est, ceiling>=tput, HBM fit, and batch monotonicity."""
+    bundle = load_locked_bundle(fixture_name)
+    geometry, dtypes = bundle.geometry, bundle.dtypes
+    chip = CHIPS["tpu7x"]
+    topology = TOPOLOGIES[topo_name]
+    scenario = TrafficScenario(
+        name="invariant-sweep",
+        isl=4096,
+        osl=512,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(1, 16),
+        kv_working_set_turns=1.0,
+    )
+    mixed_plan = solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", topologies=(topology,)),
+    )
+    disagg_opts = (
+        SolveOptions(
+            mode="disagg",
+            max_chips=topology.num_chips * 2,
+            topologies=(topology,),
+            include_pairs=True,
+        )
+        if topo_name == "2x2x1"
+        else SolveOptions(
+            mode="disagg",
+            max_chips=topology.num_chips * 2,
+            topologies=(topology,),
+            include_pairs=False,
+        )
+    )
+    disagg_plan = solve_serving_plan(geometry, dtypes, chip, scenario, disagg_opts)
+    for plan in (mixed_plan, disagg_plan):
+        for point in plan.candidates:
+            assert point.bound_tpot_ms <= point.est_tpot_ms + 1e-6
+            assert point.bound_ttft_ms <= point.est_ttft_ms + 1e-6
+            assert (
+                point.token_throughput_per_chip
+                <= point.floor_throughput_per_chip + 1e-4
+            )
+            assert (
+                point.decode_pool.hbm_used_gb <= point.decode_pool.hbm_limit_gb + 1e-6
+            )
+            if point.prefill_pool is not None:
+                assert (
+                    point.prefill_pool.hbm_used_gb
+                    <= point.prefill_pool.hbm_limit_gb + 1e-6
+                )
+        for concurrency in scenario.concurrencies:
+            at_c = [
+                point_item
+                for point_item in plan.candidates
+                if point_item.concurrency == concurrency
+            ]
+            if at_c:
+                assert any(point_item.is_pareto for point_item in at_c)
+
+    if topo_name in ("2x2x2", "2x2x4") and mixed_plan.candidates:
+        assert any(
+            point_item.decode_pool.pp > 1 for point_item in mixed_plan.candidates
+        )
+        assert all(
+            point_item.decode_pool.pcp == 1 for point_item in mixed_plan.candidates
+        )
+        assert any(record.pool.pcp > 1 for record in disagg_plan.prefill_pools)
+
+    # Batch monotonicity: decode step hard floor at b=16 >= b=1.
+    par_ref = Parallel(tp=topology.num_cores, ep=topology.num_cores, moe="ep")
+    sf_b1 = step_floor(
+        geometry,
+        chip,
+        par_ref,
+        StepShape(batch=1, rows_per_seq=1, context=1024),
+        FloorOptions(dtypes=dtypes, topology=topology),
+    )
+    sf_b16 = step_floor(
+        geometry,
+        chip,
+        par_ref,
+        StepShape(batch=16, rows_per_seq=1, context=1024),
+        FloorOptions(dtypes=dtypes, topology=topology),
+    )
+    assert sf_b16.hard_floor_s >= sf_b1.hard_floor_s - 1e-12
+
+
+def test_golden_scenario_grid_matches() -> None:
+    """Golden grid is compact (<500 KB), 72/72 populated, and matches live CLI."""
+    golden_path = Path(__file__).resolve().parent / "golden" / "scenarios.json"
+    assert golden_path.exists()
+    assert golden_path.stat().st_size < 512_000
+    data = json.loads(golden_path.read_text(encoding="utf-8"))
+    expected_count = (
+        len(regen_golden.GOLDEN_CHECKPOINTS)
+        * len(regen_golden.GOLDEN_SLICES)
+        * len(regen_golden.GOLDEN_MODES)
+        * len(regen_golden.GOLDEN_PRESETS)
+    )
+    assert data["scenario_count"] == expected_count
+    assert len(data["scenarios"]) == expected_count
+    for key, entry in data["scenarios"].items():
+        assert entry["candidate_count"] > 0, f"Empty golden scenario: {key}"
+
+    sample_cases = (
+        ("qwen3_5_397b_fp8", "qwen3_5_397b_fp8.json", "2x2x1", 4, "mixed", "chat-8k1k"),
+        (
+            "qwen3_5_397b_nvfp4",
+            "qwen3_5_397b_nvfp4.json",
+            "2x2x2",
+            8,
+            "disagg",
+            "coding-agent",
+        ),
+        ("glm_5_2_fp8", "glm_5_2_fp8.json", "2x2x2", 8, "mixed", "reasoning-1k8k"),
+        ("glm_5_2_nvfp4", "glm_5_2_nvfp4.json", "2x2x4", 16, "disagg", "chat-8k1k"),
+    )
+    for ckpt_id, fixture_name, slice_name, max_chips, mode, preset in sample_cases:
+        key = f"{ckpt_id}__{slice_name}__{mode}__{preset}"
+        live = regen_golden.run_one_scenario(
+            ckpt_id, fixture_name, slice_name, max_chips, (mode, preset)
+        )
+        assert live == data["scenarios"][key], f"Golden drift on {key}"
+
+
+def test_docs_tables_match_generator() -> None:
+    """Generated doc tables file matches render_docs_tables.py --check."""
+    assert render_docs_tables.main(["--check"]) == 0

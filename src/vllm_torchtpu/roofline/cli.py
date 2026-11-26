@@ -61,6 +61,7 @@ from .families import (
 from .geometry import ModelGeometry, UnsupportedArchitectureError, from_hf_config
 from .hf_loader import dtypes_from_hf_config, load_hf_config_with_identity
 from .modules import Dtypes, Parallel, StepShape
+from .occupancy import ExpertActivationModel, parse_activation_spec
 from .report import write_html
 from .schema import ReferenceLayoutReport
 from .serving import ServingRequest, plan
@@ -187,6 +188,16 @@ def _add_scenario_args(parser: argparse.ArgumentParser) -> None:
         "--hbm-reserve-gb",
         type=float,
         default=DEFAULT_HBM_RESERVE_GB,
+    )
+    parser.add_argument(
+        "--collective-latency-us",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--moe-activation",
+        default="bernoulli",
+        help="MoE expert activation regime: bernoulli, pigeonhole, or hull:<path>.",
     )
     parser.add_argument(
         "--sort-by",
@@ -424,6 +435,18 @@ def _parse_pd_ratio(
     return (prefill_instances, decode_instances)
 
 
+def _parse_cli_activation(
+    spec: str,
+    parser: argparse.ArgumentParser,
+    geometry: ModelGeometry,
+) -> ExpertActivationModel:
+    """Parse --moe-activation CLI spec, reporting usage errors via parser."""
+    try:
+        return parse_activation_spec(spec, geometry)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+
 def _write_solve_text_output(
     serving_plan: ServingPlan,
     ref_report: ReferenceLayoutReport | None = None,
@@ -528,11 +551,14 @@ def _dispatch_solve(
         except ValueError as err:
             parser.error(f"invalid --reference-layout: {err}")
     geometry = from_hf_config(config, model_ref=model_ref)
+    activation_model = _parse_cli_activation(args.moe_activation, parser, geometry)
     solve_opts = SolveOptions(
         mode=args.mode,
         max_chips=args.max_chips,
         max_instances=args.max_instances,
         hbm_reserve_gb=args.hbm_reserve_gb,
+        collective_latency_s=args.collective_latency_us * UNIT_MICRO,
+        activation_model=activation_model,
         topologies=tuple(custom_topos.values()) if custom_topos else None,
         sort_by=args.sort_by,
         include_pairs=include_pairs,
@@ -586,7 +612,12 @@ def _build_reference_report_for_cli(
     if ref_layout is None:
         return None
     resolved_ref = parsed_ref if parsed_ref is not None else parse_layout(ref_layout)
-    topos = _resolve_solve_topologies(solve_opts, chip=chip)
+    ref_opts = (
+        replace(solve_opts, max_chips=serving_plan.budget)
+        if solve_opts.max_chips is None and serving_plan.budget > 0
+        else solve_opts
+    )
+    topos = _resolve_solve_topologies(ref_opts, chip=chip)
     rejected_by = explain_layout_rejection(geometry, resolved_ref, topos, solve_opts)
     return reference_layout_report(
         serving_plan,
@@ -599,6 +630,11 @@ def _build_reference_report_for_cli(
 def _write_reference_summary(ref_report: ReferenceLayoutReport | None) -> None:
     """Write reference-layout summary line to stdout in text mode."""
     if ref_report is None:
+        return
+    if bool(ref_report.get("ruled_out")):
+        sys.stdout.write(
+            f"reference {ref_report['layout']}: enumerated, ruled out by SLO\n"
+        )
         return
     if ref_report["found"]:
         concurrency = ref_report["concurrency"]
