@@ -656,12 +656,18 @@ def _kernel_v3(
         tails = {s - chunk + t for s in scored for t in _TAIL_PAGES if t < chunk}
         scored = sorted({chunk} | set(scored) | {s for s in tails if s > chunk})
     group_live = jnp.minimum(live, pages_per_step)
-    for slot in range(slots):
+
+    def slot_bodies(slot):
         for i, n in enumerate(scored):
             lo = scored[i - 1] if i else 0
-            pl.when((step % slots == slot) & (group_live > lo) & (group_live <= n))(
+            pl.when((group_live > lo) & (group_live <= n))(
                 functools.partial(body, slot, n)
             )
+
+    # Slot first, then count: a step skips the other slots' bodies with one
+    # branch each.
+    for slot in range(slots):
+        pl.when(step % slots == slot)(functools.partial(slot_bodies, slot))
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
