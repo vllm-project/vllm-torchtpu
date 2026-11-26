@@ -1227,16 +1227,74 @@ class TestTpuCompilerCache:
     def test_the_in_process_result_is_kept_when_the_reload_fails(
         self, tmp_path, monkeypatch
     ):
+        from vllm_torchtpu.compilation import tpu_compiler
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
 
         (a,), compile, compiled, replayed = self._peer_compilers(
             tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+
+        def cannot_rebuild(entry):
+            raise TypeError("unsupported entry")
+
+        monkeypatch.setattr(
+            tpu_compiler, "_rebuild_sharing_executables", cannot_rebuild
         )
         monkeypatch.setattr(TpuCompilerAdaptor, "_replay", lambda *args, **kw: None)
         fn, handle = compile(a)
 
         assert compiled == [0]
         assert fn() == 0
+        assert handle is not None
+
+    def test_a_compiled_bucket_reuses_its_executable_instead_of_reloading(
+        self, tmp_path, monkeypatch
+    ):
+        """The runnable is rebuilt from the in-process entry, so the saved
+        artifact is not read back: torch_tpu's Tier-1 cache keeps the
+        executable the backend returned, and loading the artifact would add a
+        second copy of it."""
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+        read_back = []
+        real_replay = TpuCompilerAdaptor._replay
+
+        def replay(self, path, *args, **kwargs):
+            read_back.append(path)
+            return real_replay(self, path, *args, **kwargs)
+
+        monkeypatch.setattr(TpuCompilerAdaptor, "_replay", replay)
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert read_back == []
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
+        assert handle is not None
+
+    def test_a_bucket_that_cannot_be_rebuilt_replays_its_artifact(
+        self, tmp_path, monkeypatch
+    ):
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        (a,), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=1, peer_replay="0"
+        )
+
+        def cannot_rebuild(entry):
+            raise TypeError("unsupported entry")
+
+        monkeypatch.setattr(
+            tpu_compiler, "_rebuild_sharing_executables", cannot_rebuild
+        )
+        fn, handle = compile(a)
+
+        assert compiled == [0]
+        assert replayed == ["entry-from-rank-0"]
+        assert fn() == "entry-from-rank-0"
         assert handle is not None
 
     def test_nothing_is_reloaded_without_a_saved_artifact(self, tmp_path, monkeypatch):
@@ -1518,3 +1576,623 @@ def test_deserialize_entry_does_not_copy_the_entry():
             raise AssertionError("replay must not deepcopy the entry")
 
     assert _deserialize_entry(Entry())(2, 3, 7) == 12
+
+
+def test_rebuild_sharing_executables_gives_new_leaves_on_the_same_executable(
+    monkeypatch,
+):
+    """Every object of the entry is new except each leaf's loaded executable,
+    which is neither serialized nor loaded again."""
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    class Executable:
+        def __reduce__(self):
+            raise AssertionError("the executable must not be serialized")
+
+    executable = Executable()
+    leaf = TorchTpuCompiledExecutable(
+        executable=executable,
+        reconstruct_fx_outputs_fn=None,
+        updates_default_generator_state=True,
+        dynamic_outputs=[False],
+        unique_output_indices=[0],
+    )
+    other = TorchTpuCompiledExecutable(
+        executable=Executable(),
+        reconstruct_fx_outputs_fn=None,
+        updates_default_generator_state=False,
+    )
+    entry = SimpleNamespace(fw=leaf, same_fw=leaf, bw=other, meta={"k": [1, 2]})
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda e: e)
+
+    rebuilt = tpu_compiler._rebuild_sharing_executables(entry)
+
+    assert rebuilt is not entry
+    assert rebuilt.meta == entry.meta and rebuilt.meta is not entry.meta
+    assert rebuilt.fw is not leaf and rebuilt.fw is rebuilt.same_fw
+    assert rebuilt.fw._executable is executable
+    assert rebuilt.fw._updates_default_generator_state is True
+    assert rebuilt.fw._dynamic_outputs == [False]
+    assert rebuilt.fw._unique_output_indices == [0]
+    assert rebuilt.bw is not other and rebuilt.bw._executable is other._executable
+    assert rebuilt.bw._updates_default_generator_state is False
+
+
+def test_rebuild_sharing_executables_matches_pickle_leaf_attributes(monkeypatch):
+    """A rebuilt `TorchTpuCompiledExecutable` carries the exact same attribute
+    set and values as `pickle.loads(pickle.dumps(leaf))`, except `_executable`
+    is shared instead of reloaded from serialized bytes."""
+    import pickle
+
+    from torch_tpu._internal.compile import tpu_torch_compile
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    monkeypatch.setattr(
+        tpu_torch_compile,
+        "serialize_executable",
+        lambda ex: ex.serialize_executable(),
+    )
+    monkeypatch.setattr(
+        tpu_torch_compile,
+        "load_serialized_executable",
+        lambda serialized, subslice_origin=None: _FakePjrtExecutable("reloaded"),
+    )
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda e: e)
+
+    leaf = TorchTpuCompiledExecutable(
+        executable=_FakePjrtExecutable("original"),
+        reconstruct_fx_outputs_fn=_passthrough_fx_outputs,
+        updates_default_generator_state=True,
+        dynamic_outputs=[False, True],
+        unique_output_indices=[0, 1],
+    )
+    unpickled = pickle.loads(pickle.dumps(leaf))
+    rebuilt = tpu_compiler._rebuild_sharing_executables(leaf)
+
+    assert rebuilt is not leaf
+    assert rebuilt._executable is leaf._executable
+    assert unpickled._executable is not leaf._executable
+    assert set(rebuilt.__dict__) == set(unpickled.__dict__)
+    for name in rebuilt.__dict__:
+        if name == "_executable":
+            continue
+        actual = getattr(rebuilt, name)
+        expected = getattr(unpickled, name)
+        if name == "_cached_dynamic_output_shapes":
+            assert [(s.dimensions, s.is_dynamic) for s in actual] == [
+                (s.dimensions, s.is_dynamic) for s in expected
+            ]
+        else:
+            assert actual == expected, name
+
+
+def _rebuild_subclass_marker(tag: str) -> tuple[str, str]:
+    return ("subclass-reduced", tag)
+
+
+def test_rebuild_sharing_executables_keeps_subclass_reduce(monkeypatch):
+    """Subclasses of `TorchTpuCompiledExecutable` bypass `persistent_id` and
+    keep their own `__reduce__`, while exact instances still share their
+    loaded executable."""
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    class Executable:
+        def __reduce__(self):
+            raise AssertionError("exact leaf executable must not be serialized")
+
+    reduced = []
+
+    class SubLeaf(TorchTpuCompiledExecutable):
+        def __init__(self, tag: str):
+            super().__init__(
+                executable=Executable(),
+                reconstruct_fx_outputs_fn=None,
+                updates_default_generator_state=False,
+            )
+            self.tag = tag
+
+        def __reduce__(self):
+            reduced.append(self.tag)
+            return (_rebuild_subclass_marker, (self.tag,))
+
+    executable = Executable()
+    plain = TorchTpuCompiledExecutable(
+        executable=executable,
+        reconstruct_fx_outputs_fn=None,
+        updates_default_generator_state=False,
+    )
+    entry = SimpleNamespace(plain=plain, sub=SubLeaf("custom"))
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda e: e)
+
+    rebuilt = tpu_compiler._rebuild_sharing_executables(entry)
+
+    assert rebuilt.plain is not plain
+    assert rebuilt.plain._executable is executable
+    assert reduced == ["custom"]
+    assert rebuilt.sub == ("subclass-reduced", "custom")
+
+
+def _rebuild_on_loaded_executable_on_tpu(root: str) -> None:
+    """Child-process body of `test_compiled_bucket_reuses_its_executable_on_tpu`."""
+    import torch
+    from torch_tpu._internal.compile.split_compiler import _SplitCompiledExecutable
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+    from vllm.config.utils import Range
+
+    from vllm_torchtpu import patch_registry
+    from vllm_torchtpu.compilation import tpu_compiler
+    from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+    from vllm_torchtpu.tpu_info import get_num_chips
+
+    if get_num_chips() == 0:
+        pytest.skip("TPU hardware required")
+    patch_registry.apply("worker_init")
+
+    def leaves_of(entry):
+        result = entry.compiled_fw.result
+        subs = (
+            result.compiled_executables
+            if isinstance(result, _SplitCompiledExecutable)
+            else [result]
+        )
+        return [sub for sub in subs if isinstance(sub, TorchTpuCompiledExecutable)]
+
+    built = []
+    real_backend = tpu_compiler._tpu_backend
+
+    def tracked_backend(graph, example_inputs):
+        compiled_fn = real_backend(graph, example_inputs)
+        leaves = leaves_of(compiled_fn.serialize())
+        built.append([(leaf, leaf._executable) for leaf in leaves])
+        return compiled_fn
+
+    rebuilt = []
+    real_deserialize = tpu_compiler._deserialize_entry
+
+    def tracked_deserialize(entry):
+        rebuilt.append([(leaf, leaf._executable) for leaf in leaves_of(entry)])
+        return real_deserialize(entry)
+
+    read_back = []
+    real_replay = TpuCompilerAdaptor._replay
+
+    def tracked_replay(self, path, *args, **kwargs):
+        read_back.append(path)
+        return real_replay(self, path, *args, **kwargs)
+
+    tpu_compiler._tpu_backend = tracked_backend
+    tpu_compiler._deserialize_entry = tracked_deserialize
+    TpuCompilerAdaptor._replay = tracked_replay
+
+    cache_dir = os.path.join(root, "cache")
+    compiler = TpuCompilerAdaptor()
+    compiler.initialize_cache(cache_dir=cache_dir)
+    compiled = []
+
+    def adaptor_backend(graph, example_inputs):
+        fn, handle = compiler.compile(
+            graph, example_inputs, {}, Range(start=8, end=8), key="bucket_8"
+        )
+        assert fn is not None and handle is not None
+        compiled.append((graph, example_inputs, handle))
+        return fn
+
+    compiled_step = torch.compile(
+        lambda x: x * 2.0 + 1.0, backend=adaptor_backend, fullgraph=True, dynamic=False
+    )
+    x = torch.arange(8, dtype=torch.float32, device="tpu")
+    expected = torch.arange(8, dtype=torch.float32) * 2.0 + 1.0
+    assert torch.equal(compiled_step(x).cpu(), expected)
+
+    # The cold compile ran the runnable rebuilt from the in-process entry: new
+    # leaves on the very executables the backend returned, no artifact read.
+    assert read_back == []
+    assert len(built) == 1 and len(rebuilt) == 1
+    assert len(built[0]) >= 1 and len(rebuilt[0]) == len(built[0])
+    for (old_leaf, old_exe), (new_leaf, new_exe) in zip(built[0], rebuilt[0]):
+        assert new_leaf is not old_leaf
+        assert new_exe is old_exe
+
+    # A warm start still replays the artifact the cold start saved.
+    graph, example_inputs, handle = compiled[0]
+    before = torch.tpu._get_cache_stats().num_compilations
+    warm = TpuCompilerAdaptor()
+    warm.initialize_cache(cache_dir=cache_dir)
+    (out,) = warm.load(handle, graph, example_inputs, 0, Range(start=8, end=8))(x)
+    assert torch.equal(out.cpu(), expected)
+    assert torch.tpu._get_cache_stats().num_compilations == before
+    assert read_back == [handle[1]]
+
+
+@pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
+def test_compiled_bucket_reuses_its_executable_on_tpu(tmp_path, monkeypatch):
+    """Real TpuBackend: a cold compile runs a runnable rebuilt on the loaded
+    executable the backend returned (no second load of the saved artifact),
+    computes the right result, and the artifact still warm-loads."""
+    from functools import partial
+
+    from tests.distributed.tpu_test_utils import run_in_isolated_process
+
+    monkeypatch.setenv("TORCH_TPU_TIER2_COMPILATION_CACHE", "disabled")
+    monkeypatch.delenv("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", raising=False)
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", str(tmp_path / "inductor"))
+    monkeypatch.setenv("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
+
+    run_in_isolated_process(
+        partial(_rebuild_on_loaded_executable_on_tpu, str(tmp_path)), timeout=180
+    )
+
+
+class _FakePjrtExecutable:
+    """A loaded executable, as far as `TorchTpuCompiledExecutable` reads one."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+    def serialize_executable(self) -> bytes:
+        return f"pjrt:{self.tag}".encode()
+
+    def subslice_origin(self) -> None:
+        return None
+
+    def fingerprint_executable(self) -> str:
+        return f"fp:{self.tag}"
+
+
+def _passthrough_fx_outputs(orig_args, tpu_outputs):
+    return tpu_outputs
+
+
+def _fake_execute(executable, args, *rest):
+    """Runs `_double` for whichever leaf calls it, boxed inputs or not."""
+    import torch
+    from torch.utils._pytree import tree_leaves
+
+    (x,) = [a for a in tree_leaves(args) if isinstance(a, torch.Tensor)]
+    return (x * 2,)
+
+
+def _fake_leaf(tag: str = "leaf"):
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+
+    return TorchTpuCompiledExecutable(
+        executable=_FakePjrtExecutable(tag),
+        reconstruct_fx_outputs_fn=_passthrough_fx_outputs,
+        updates_default_generator_state=False,
+    )
+
+
+class _FakeBaseCompiler:
+    """torch_tpu's per-graph compiler minus XLA: each graph it is handed
+    becomes a leaf on a fake loaded executable."""
+
+    compilation_context = None
+    _debug = None
+
+    def execute_pre_grad_passes(self, graph_module) -> None:
+        pass
+
+    def __call__(self, graph_module, example_inputs, is_fwd=True, **kwargs):
+        return _fake_leaf(str(kwargs.get("module_name")))
+
+
+def _double(x):
+    return x * 2
+
+
+def _leaves_of(result):
+    from torch_tpu._internal.compile.split_compiler import _SplitCompiledExecutable
+
+    if isinstance(result, _SplitCompiledExecutable):
+        return list(result.compiled_executables)
+    return [result]
+
+
+@pytest.fixture(params=[True, False], ids=["split", "single-leaf"])
+def cpu_tpu_backend(request, monkeypatch):
+    """The real TpuBackend and aot_autograd, compiling each graph -- whole, or
+    split by torch_tpu's SplitCompiler -- to leaves on fake executables, so
+    `compile` and `load` handle the very objects they do on a TPU host.
+
+    Records what each backend call built, and the executables of the leaves
+    each runnable is deserialized on. `loads` lists every executable loaded
+    back from serialized bytes, the second copy a replay costs."""
+    import torch
+    from torch._functorch._aot_autograd.autograd_cache import AOTAutogradCache
+    from torch_tpu._internal.compile import _backend, tpu_torch_compile
+    from torch_tpu._internal.compile.split_compiler import SplitCompiler
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    split = request.param
+    state = SimpleNamespace(split=split, loads=[], built=[], deserialized=[])
+
+    def load_serialized_executable(serialized, subslice_origin=None):
+        state.loads.append(serialized)
+        return _FakePjrtExecutable("loaded")
+
+    monkeypatch.setattr(AOTAutogradCache, "save", staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(
+        tpu_torch_compile, "serialize_executable", lambda ex: ex.serialize_executable()
+    )
+    monkeypatch.setattr(
+        tpu_torch_compile, "load_serialized_executable", load_serialized_executable
+    )
+    monkeypatch.setattr(tpu_torch_compile, "execute", _fake_execute)
+    monkeypatch.setattr(
+        tpu_torch_compile, "get_handshake_stage_env_var_once", lambda: 0
+    )
+    monkeypatch.setattr(
+        _backend,
+        "make_backend_compiler",
+        lambda *a, **kw: (
+            SplitCompiler(_FakeBaseCompiler()) if split else _FakeBaseCompiler()
+        ),
+    )
+    real_backend = _backend.TpuBackend()
+
+    def backend(graph, example_inputs):
+        fn = real_backend(graph, example_inputs)
+        entry = fn.serialize()
+        result = entry.compiled_fw.result
+        leaves = _leaves_of(result)
+        tracked = {
+            "fn": weakref.ref(fn),
+            "entry": weakref.ref(entry),
+            "result": weakref.ref(result),
+        }
+        tracked.update({f"leaf{i}": weakref.ref(leaf) for i, leaf in enumerate(leaves)})
+        if split:
+            constant = torch.zeros(16)
+            result._split_gm.sunk_constant = constant
+            tracked["split_gm"] = weakref.ref(result._split_gm)
+            tracked["constant"] = weakref.ref(constant)
+        state.built.append(
+            SimpleNamespace(
+                tracked=tracked,
+                executables=[leaf._executable for leaf in leaves],
+            )
+        )
+        return fn
+
+    real_deserialize = tpu_compiler._deserialize_entry
+
+    def deserialize(entry):
+        leaves = _leaves_of(entry.compiled_fw.result)
+        state.deserialized.append([leaf._executable for leaf in leaves])
+        return real_deserialize(entry)
+
+    monkeypatch.setattr(tpu_compiler, "_tpu_backend", backend)
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", deserialize)
+    return state
+
+
+class TestInProcessResultReclaim:
+    """A compiled bucket runs a runnable rebuilt on the executables the backend
+    returned, without loading a second copy from disk."""
+
+    @staticmethod
+    def _graph():
+        import torch
+
+        return torch.fx.symbolic_trace(_double)
+
+    @staticmethod
+    def _compile(tmp_path, graph):
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(cache_dir=str(tmp_path / "cache"))
+        return compiler.compile(
+            graph, [torch.tensor([3, 4])], {}, Range(start=2, end=2), key="bucket"
+        )
+
+    @staticmethod
+    def _load_stale(tmp_path, graph):
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(cache_dir=str(tmp_path / "cache"))
+        stale = tmp_path / "cache" / "bucket"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_bytes(b"stale")
+        fn = compiler.load(
+            ("bucket", str(stale), True),
+            graph,
+            [torch.tensor([3, 4])],
+            0,
+            Range(start=2, end=2),
+        )
+        assert stale.read_bytes() != b"stale"
+        return fn
+
+    @staticmethod
+    def _assert_reclaimed(backend):
+        (built,) = backend.built
+        alive = {name for name, ref in built.tracked.items() if ref() is not None}
+        assert alive == set()
+
+    @staticmethod
+    def _assert_runs(fn):
+        import torch
+
+        assert torch.equal(fn(torch.tensor([3, 4])), torch.tensor([6, 8]))
+
+    @pytest.mark.parametrize("path", ["compile", "load"])
+    def test_runs_on_the_same_executables_and_reclaims(
+        self, tmp_path, cpu_tpu_backend, path
+    ):
+        """The rebuilt runnable runs on the executables the backend returned
+        (none is loaded again), and the in-process compile result is reclaimed."""
+        graph = self._graph()
+        if path == "compile":
+            fn, handle = self._compile(tmp_path, graph)
+            assert handle is not None
+        else:
+            fn = self._load_stale(tmp_path, graph)
+
+        assert cpu_tpu_backend.loads == []
+        (built,) = cpu_tpu_backend.built
+        (deserialized,) = cpu_tpu_backend.deserialized
+        assert len(deserialized) == len(built.executables) >= 1
+        assert all(new is old for new, old in zip(deserialized, built.executables))
+        self._assert_reclaimed(cpu_tpu_backend)
+        self._assert_runs(fn)
+
+    @pytest.mark.parametrize("path", ["compile", "load"])
+    def test_a_changed_leaf_constructor_replays_the_artifact(
+        self, tmp_path, monkeypatch, cpu_tpu_backend, path
+    ):
+        """If torch_tpu's leaf constructor no longer takes the arguments a
+        leaf is rebuilt from, the bucket replays its artifact (a second load)
+        instead of building leaves that miss one."""
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        monkeypatch.setattr(tpu_compiler, "_TORCH_TPU_EXEC_INIT_MATCHES", False)
+        graph = self._graph()
+        with TestTpuCompilerCache._capture_vllm_info() as messages:
+            if path == "compile":
+                fn, handle = self._compile(tmp_path, graph)
+                assert handle is not None
+            else:
+                fn = self._load_stale(tmp_path, graph)
+
+        assert any(
+            "Could not rebuild the runnable on its loaded executable" in m
+            and "TorchTpuCompiledExecutable.__init__ takes" in m
+            for m in messages
+        )
+        (built,) = cpu_tpu_backend.built
+        assert len(cpu_tpu_backend.loads) == len(built.executables)
+        (deserialized,) = cpu_tpu_backend.deserialized
+        assert all(new is not old for new, old in zip(deserialized, built.executables))
+        self._assert_reclaimed(cpu_tpu_backend)
+        self._assert_runs(fn)
+
+    def test_a_changed_leaf_constructor_is_reported_once(
+        self, tmp_path, monkeypatch, cpu_tpu_backend
+    ):
+        """A changed leaf constructor fails the rebuild of every bucket the
+        same way, so it is reported once per process, not once per bucket."""
+        import torch
+        from vllm.config.utils import Range
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+
+        monkeypatch.setattr(tpu_compiler, "_TORCH_TPU_EXEC_INIT_MATCHES", False)
+        compiler = TpuCompilerAdaptor()
+        compiler.initialize_cache(cache_dir=str(tmp_path / "cache"))
+        with TestTpuCompilerCache._capture_vllm_info() as messages:
+            for key in ("bucket_a", "bucket_b"):
+                fn, handle = compiler.compile(
+                    self._graph(),
+                    [torch.tensor([3, 4])],
+                    {},
+                    Range(start=2, end=2),
+                    key=key,
+                )
+                assert handle is not None
+                self._assert_runs(fn)
+
+        assert (
+            sum("TorchTpuCompiledExecutable.__init__ takes" in m for m in messages) == 1
+        )
+        assert len(cpu_tpu_backend.built) == 2
+        assert len(cpu_tpu_backend.loads) == sum(
+            len(built.executables) for built in cpu_tpu_backend.built
+        )
+
+
+def test_the_pinned_torch_tpu_leaf_constructor_is_the_one_rebuilt_from():
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    assert tpu_compiler._TORCH_TPU_EXEC_INIT_MATCHES
+
+
+def _tag_first_outputs(orig_args, tpu_outputs):
+    return ("first", tpu_outputs)
+
+
+def _tag_second_outputs(orig_args, tpu_outputs):
+    return ("second", tpu_outputs)
+
+
+def test_rebuild_sharing_executables_keeps_distinct_leaves_on_shared_executable(
+    monkeypatch,
+):
+    """Two distinct leaves backed by the same Tier-1-cached `_executable` keep
+    their own output reconstruction and flags while sharing `_executable`."""
+    from torch_tpu._internal.compile.torch_tpu_compiled_executable import (
+        TorchTpuCompiledExecutable,
+    )
+
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    class Executable:
+        def __reduce__(self):
+            raise AssertionError("the executable must not be serialized")
+
+    shared = Executable()
+    first = TorchTpuCompiledExecutable(
+        executable=shared,
+        reconstruct_fx_outputs_fn=_tag_first_outputs,
+        updates_default_generator_state=False,
+        dynamic_outputs=[False],
+        unique_output_indices=[0],
+    )
+    second = TorchTpuCompiledExecutable(
+        executable=shared,
+        reconstruct_fx_outputs_fn=_tag_second_outputs,
+        updates_default_generator_state=True,
+        dynamic_outputs=[True, False],
+        unique_output_indices=[1, 0],
+    )
+    entry = SimpleNamespace(a=first, same_a=first, b=second)
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda e: e)
+
+    rebuilt = tpu_compiler._rebuild_sharing_executables(entry)
+
+    assert rebuilt.a is not first and rebuilt.a is rebuilt.same_a
+    assert rebuilt.b is not second and rebuilt.b is not rebuilt.a
+    assert rebuilt.a._executable is shared and rebuilt.b._executable is shared
+    assert rebuilt.a._reconstruct_fx_outputs_fn([], ["x"]) == ("first", ["x"])
+    assert rebuilt.b._reconstruct_fx_outputs_fn([], ["x"]) == ("second", ["x"])
+    assert rebuilt.a._updates_default_generator_state is False
+    assert rebuilt.b._updates_default_generator_state is True
+    assert rebuilt.a._dynamic_outputs == [False]
+    assert rebuilt.b._dynamic_outputs == [True, False]
+    assert rebuilt.a._unique_output_indices == [0]
+    assert rebuilt.b._unique_output_indices == [1, 0]
+
+
+def test_rebuild_sharing_executables_refuses_a_changed_leaf_constructor(monkeypatch):
+    from vllm_torchtpu.compilation import tpu_compiler
+
+    monkeypatch.setattr(tpu_compiler, "_TORCH_TPU_EXEC_INIT_MATCHES", False)
+    monkeypatch.setattr(tpu_compiler, "_deserialize_entry", lambda e: e)
+    with pytest.raises(TypeError, match=r"TorchTpuCompiledExecutable.__init__ takes"):
+        tpu_compiler._rebuild_sharing_executables(SimpleNamespace(fw=_fake_leaf()))
