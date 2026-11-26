@@ -1683,7 +1683,10 @@ class ScatterRefs:
     send_sems: jax.Array  # DMA[2]
     local_sems: jax.Array  # DMA[2]
     recv_sem: jax.Array  # DMA[1]
-    in_flight: jax.Array  # SMEM int32[4]: rows in flight (remote x2, local x2)
+    # SMEM int32[5]: rows in flight (remote x2, local x2), then 1 once the
+    # sends are open (see `open_sends` in `_mlp_kernel`)
+    in_flight: jax.Array
+    entered: jax.Array  # REGULAR semaphore: the barrier's second round
     axis: str | tuple[str, ...]
     num_members: int | tuple[int, ...]
     extra: ExtraRowRefs | None = None
@@ -1708,11 +1711,17 @@ def member_device(index, axis, num_members) -> dict:
     return coords
 
 
-def _signal_all(sem, axis, num_members) -> None:
-    axes, sizes = _axes(axis, num_members)
+def _num_members(num_members) -> int:
     total = 1
-    for n in sizes:
+    for n in num_members if isinstance(num_members, tuple) else (num_members,):
         total *= n
+    return total
+
+
+def _signal_members(sem, axis, num_members) -> None:
+    """Signal `sem` once on every member (this one included)."""
+    axes, sizes = _axes(axis, num_members)
+    total = _num_members(num_members)
     for i in range(total):
         coords, rest = {}, i
         for a, n in zip(reversed(axes), reversed(sizes)):
@@ -1721,17 +1730,6 @@ def _signal_all(sem, axis, num_members) -> None:
         pl.semaphore_signal(
             sem, 1, device_id=coords, device_id_type=pl.DeviceIdType.MESH
         )
-    pl.semaphore_wait(sem, total)
-
-
-def member_barrier(axis, num_members) -> None:
-    """Every member has entered the kernel. A second round on a scoped
-    semaphore keeps back-to-back kernels from consuming each other's signals."""
-    _signal_all(pltpu.get_barrier_semaphore(), axis, num_members)
-
-    @functools.partial(pl.run_scoped, second=pltpu.SemaphoreType.REGULAR)
-    def _(second):
-        _signal_all(second, axis, num_members)
 
 
 # Rows of one semaphore wait: a wait names a row-sized block of the receive
@@ -2112,9 +2110,13 @@ def _mlp_kernel(
 
     if scatter is not None:
         # No row may land in a member's receive buffer before that member runs
-        # this kernel.
-        member_barrier(scatter.axis, scatter.num_members)
-        for i in range(4):
+        # this kernel: the barrier is signalled here and waited for only
+        # before this member's first row leaves (`open_sends`), so the first
+        # tile computes while the other members arrive.
+        _signal_members(
+            pltpu.get_barrier_semaphore(), scatter.axis, scatter.num_members
+        )
+        for i in range(5):
             scatter.in_flight[i] = 0
 
     tiled = dataclasses.replace(up, tiles=dataclasses.replace(up.tiles, tile_m=tile_m))
@@ -2225,6 +2227,25 @@ def _mlp_kernel(
         )
         sc.in_flight[slot] = remote
         sc.in_flight[2 + slot] = local
+
+    def open_sends():
+        """Once, before this member's first row leaves: wait until every
+        member has entered (the barrier's first round), then signal the second
+        round, which every member waits for at exit, so no member can leave
+        and signal the next call's barrier before every member has passed this
+        one's. The `extra` rows go now, overlapping the following tiles."""
+        sc = scatter
+        assert sc is not None
+
+        @pl.when(sc.in_flight[4] == 0)
+        def _():
+            pl.semaphore_wait(
+                pltpu.get_barrier_semaphore(), _num_members(sc.num_members)
+            )
+            _signal_members(sc.entered, sc.axis, sc.num_members)
+            if sc.extra is not None:
+                send_extra_rows(sc, sc.extra)
+            sc.in_flight[4] = 1
 
     def body(tiled_lhs_ref, tiled_out_ref=None):
         gm_id = pl.program_id(0)
@@ -2358,6 +2379,8 @@ def _mlp_kernel(
                 start(down_copies(q, next_group_id))
 
         if scatter is not None:
+            with jax.named_scope("mlp_open_sends"):
+                open_sends()
             with jax.named_scope("mlp_send_rows"):
                 send_tile_rows(slot, m_offset, m_start_local, m_end_local)
             return
@@ -2380,10 +2403,10 @@ def _mlp_kernel(
     lhs_spec = pl.BlockSpec((bounded, sub, size_k), index_maps.lhs_index_map)
     lhs_in = lhs_ref.reshape(-1, sub, lhs_ref.shape[-1])
     if scatter is not None:
-        if scatter.extra is not None:
-            send_extra_rows(scatter, scatter.extra)
         pipeline_fn = pltpu.emit_pipeline(body, grid=(num_gm,), in_specs=(lhs_spec,))
         pipeline_fn(lhs_in)
+        # No tile at all: the barrier and the extra rows still go.
+        open_sends()
         # Every row sent from here has left, and every row bound here has landed.
         for i in range(2):
             wait_rows(scatter.send_sems.at[i], scatter.recv, scatter.in_flight[i])
@@ -2396,6 +2419,8 @@ def _mlp_kernel(
             wait_rows(ex.sems.at[2], ex.recv, ex.expected[0])
         if scatter.tail is not None:
             _owner_tail(scatter, scatter.tail)
+        with jax.named_scope("mlp_exit_barrier"):
+            pl.semaphore_wait(scatter.entered, _num_members(scatter.num_members))
         return
     out_spec = pl.BlockSpec((bounded, sub, size_n), index_maps.out_index_map)
     pipeline_fn = pltpu.emit_pipeline(
@@ -2652,7 +2677,8 @@ def mlp_scatter_kernel_main(
         local_sems,
         recv_sem,
         in_flight_ref,
-    ) = take(15)
+        entered_sem,
+    ) = take(16)
     extra_scratch = take(2) if extra else []
     tail_scratch = take(2) if tail else []
     assert not refs
@@ -2719,6 +2745,7 @@ def mlp_scatter_kernel_main(
             local_sems=local_sems,
             recv_sem=recv_sem,
             in_flight=in_flight_ref,
+            entered=entered_sem,
             axis=axis,
             num_members=num_members,
             extra=extra_refs,
@@ -2899,7 +2926,8 @@ def gmm_v2_mlp_scatter(
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((2,)),
         pltpu.SemaphoreType.DMA((1,)),
-        pltpu.SMEM((4,), jnp.int32),
+        pltpu.SMEM((5,), jnp.int32),
+        pltpu.SemaphoreType.REGULAR,
     ]
     if extra is not None:
         scratch_shapes += [pltpu.SemaphoreType.DMA((3,)), pltpu.SMEM((2,), jnp.int32)]
