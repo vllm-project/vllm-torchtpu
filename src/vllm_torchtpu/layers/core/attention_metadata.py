@@ -222,8 +222,9 @@ def _staged_walk_products_compiled(
     order; `mamba_geom` is `((table_geom_index, num_blocks, block_size),
     ...)`; both are static per padding bucket. Returns `tables... +
     states... + (ckpts... if ckpt_window > 1)`. Issued for every staged walk
-    (dummy runs included) so warmup and lockstep ranks dispatch the same
-    program sequence.
+    (dummy runs included) so warmup compiles what serving dispatches, except a
+    walk whose stager hands back an unchanged device copy, which reuses the
+    last outputs (`BlockTableDeltaStager.cached_products`).
     """
     return _staged_walk_products(
         staged_dev, seq_lens, table_geom, mamba_geom, ckpt_window
@@ -711,22 +712,29 @@ def stage_block_table_uploads(
         ctx.staged_block_tables = {gid: staged_dev[:length]}
         return
 
-    if staged_dev.device.type == "tpu":
-        products = _staged_walk_products_compiled(
+    # Table-only products depend on nothing but the staged buffer, so an
+    # unchanged device copy gets the last walk's outputs back.
+    geom = tuple(table_geom)
+    reuse = stager is not None and delta_key is not None and not mamba_geom
+    products = None
+    if reuse:
+        assert stager is not None and delta_key is not None
+        products = stager.cached_products(delta_key, staged_dev, geom)
+    if products is None:
+        products = (
+            _staged_walk_products_compiled
+            if staged_dev.device.type == "tpu"
+            else _staged_walk_products
+        )(
             staged_dev,
             ctx.seq_lens,
-            tuple(table_geom),
+            geom,
             tuple(mamba_geom),
             ctx.mamba_ckpt_window,
         )
-    else:
-        products = _staged_walk_products(
-            staged_dev,
-            ctx.seq_lens,
-            tuple(table_geom),
-            tuple(mamba_geom),
-            ctx.mamba_ckpt_window,
-        )
+        if reuse:
+            assert stager is not None and delta_key is not None
+            stager.keep_products(delta_key, staged_dev, geom, products)
 
     n_tables = len(entries)
     n_mamba = len(mamba_geom)

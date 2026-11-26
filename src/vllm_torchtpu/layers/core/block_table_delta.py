@@ -26,7 +26,9 @@ only writers of the host table: no `vllm_torchtpu` code writes it directly.
 The device tensor is only ever read by `_staged_walk_products_compiled`, whose
 outputs are fresh buffers, so reusing it across steps is safe. The scatter
 program is functional (clone + index_put), so the previous buffer is never
-written in place.
+written in place. Those outputs are only read too, so a walk that gets back
+the same device copy reuses the last walk's outputs instead of rerunning the
+program (`cached_products`).
 """
 
 from __future__ import annotations
@@ -174,6 +176,8 @@ class _Layout:
     dev: torch.Tensor
     mirror: np.ndarray  # int32, equal to `dev` element for element
     entries: list[_EntryState]
+    # (source buffer, split geometry, outputs) of the last products program.
+    products: tuple[torch.Tensor, tuple, tuple[torch.Tensor, ...]] | None = None
 
 
 class BlockTableDeltaStager:
@@ -325,6 +329,30 @@ class BlockTableDeltaStager:
         while len(self._layouts) > MAX_LAYOUTS:
             self._layouts.popitem(last=False)
         self.num_full += 1
+
+    def cached_products(
+        self, key: tuple, staged_dev: torch.Tensor, geom: tuple
+    ) -> tuple[torch.Tensor, ...] | None:
+        """The products program's outputs for `staged_dev`, if already run."""
+        layout = self._layouts.get(key)
+        if layout is None or layout.products is None:
+            return None
+        source, kept_geom, outputs = layout.products
+        if source is not staged_dev or kept_geom != geom:
+            return None
+        return outputs
+
+    def keep_products(
+        self,
+        key: tuple,
+        staged_dev: torch.Tensor,
+        geom: tuple,
+        outputs: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Remember the products program's outputs for the current device copy."""
+        layout = self._layouts.get(key)
+        if layout is not None and layout.dev is staged_dev:
+            layout.products = (staged_dev, geom, outputs)
 
     def warm(self, staged_dev: torch.Tensor) -> None:
         """Compile the scatter for this layout during dummy runs (no-op update)."""

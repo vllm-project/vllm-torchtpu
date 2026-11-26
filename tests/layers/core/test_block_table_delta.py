@@ -371,3 +371,33 @@ def test_warm_reuses_zero_update_and_device_copy_not_cloned(builders):
     assert stager._layouts[key].dev is dev
     assert btd.DELTA_CAPACITY == 8192
     assert btd.DELTA_CAPACITY >= 128 * 51
+
+
+def test_unchanged_walk_reuses_products(builders, monkeypatch):
+    monkeypatch.setenv("TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD", "1")
+    monkeypatch.setenv("TPU_VERIFY_INCREMENTAL_BLOCK_TABLE", "0")
+    import vllm_torchtpu.layers.core.attention_metadata as am
+
+    calls = []
+    real = am._staged_walk_products
+
+    def counted(*args):
+        calls.append(1)
+        return real(*args)
+
+    monkeypatch.setattr(am, "_staged_walk_products", counted)
+    runner = _make_runner(builders)
+    for b in builders:
+        b.bt.append_row([7], 0)
+    first = _stage(runner, 1, [3, 0, 0, 0], 4)
+    second = _stage(runner, 1, [3, 0, 0, 0], 4)
+    assert len(calls) == 2  # full upload, then the first walk on the kept copy
+    third = _stage(runner, 1, [3, 0, 0, 0], 4)
+    assert len(calls) == 2
+    assert all(third[g] is second[g] for g in second)
+    builders[0].bt.append_row([9], 0)
+    fourth = _stage(runner, 1, [5, 0, 0, 0], 4)
+    assert len(calls) == 3
+    want = _reference(builders, 1, [5, 0, 0, 0], 4, 0)
+    assert all(torch.equal(fourth[g], want[g]) for g in want)
+    assert all(torch.equal(first[g], second[g]) for g in first)
