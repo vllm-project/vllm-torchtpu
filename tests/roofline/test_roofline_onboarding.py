@@ -15,31 +15,48 @@
 
 from __future__ import annotations
 
+import argparse
+import inspect
 import json
+import re
 from pathlib import Path
 
 import pytest
 
+from tests.roofline import render_docs_tables
 from tests.roofline.conftest import (
     load_locked_bundle,
     load_locked_config,
     override_locked_config,
 )
 from vllm_torchtpu.roofline import (
+    SUPPORTED_MODELS,
+    ChipOverrides,
+    ChipSpec,
+    ConfigAudit,
     Dtypes,
     KeyTracker,
+    ModelGeometry,
+    ModelSpec,
     Parallel,
     SeqKvLayout,
+    SliceTopology,
     audit_hf_config,
     cli,
     count_layer_types,
     from_hf_config,
+    load_hf_config_with_identity,
     param_counts,
     pass_costs,
+    resolve_model_identity,
+    scale_pp_stage_floor,
+    supports,
 )
+from vllm_torchtpu.roofline.chips import from_jax
 from vllm_torchtpu.roofline.constants import (
     GLU_MATMUL_COUNT,
     NON_GATED_MATMUL_COUNT,
+    VALID_CHIP_PROVENANCE,
 )
 from vllm_torchtpu.roofline.geometry import _from_hf_config_dry_run
 from vllm_torchtpu.roofline.memory import (
@@ -669,3 +686,185 @@ def test_cli_inspect_text_output_and_fail_closed_tier2_blocker(
     out_blocked = capsys.readouterr().out
     assert "onboarding_tier: tier2_primitive_needed" in out_blocked
     assert "model_type_status: unlisted_blocked" in out_blocked
+
+
+_GENERATED_TABLES_START = "<!-- BEGIN GENERATED: roofline-doc-tables -->"
+_GENERATED_TABLES_END = "<!-- END GENERATED -->"
+_DOC_FLAG_PATTERN = re.compile(r"(?<![A-Za-z0-9_-])--[a-z][a-z0-9-]+")
+_HELPER_SCRIPT_CHECK_PATTERN = re.compile(r"\S+\.py\s+--check\b")
+
+
+def _read_onboarding_doc_or_skip() -> str:
+    """Read roofline_onboarding.md or skip when docs/ is excluded from CI images."""
+    repo_root = Path(__file__).resolve().parents[2]
+    docs_dir = repo_root / "docs"
+    if not docs_dir.is_dir():
+        pytest.skip("docs/ directory is absent in packaged container builds.")
+    doc_path = docs_dir / "user_guide" / "roofline_onboarding.md"
+    return doc_path.read_text(encoding="utf-8")
+
+
+def _collect_parser_long_flags(parser: argparse.ArgumentParser) -> set[str]:
+    """Collect every registered --long-option across parser and all subparsers."""
+    flags: set[str] = set()
+    for action in parser._actions:  # noqa: SLF001
+        for option in action.option_strings:
+            if option.startswith("--"):
+                flags.add(option)
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            for subparser in action.choices.values():
+                if isinstance(subparser, argparse.ArgumentParser):
+                    flags.update(_collect_parser_long_flags(subparser))
+    return flags
+
+
+def test_onboarding_doc_provenance_flags_populate_supplied_values(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify every flag documented in roofline_onboarding populates supplied_values."""
+    q35_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+    rc = cli.main(
+        [
+            "solve",
+            "--config",
+            str(q35_path),
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--isl",
+            "4096",
+            "--osl",
+            "512",
+            "--prefix-hit-rate",
+            "0.5",
+            "--accept-len",
+            "1.0",
+            "--think-time-s",
+            "0.0",
+            "--concurrency",
+            "16",
+            "--hbm-reserve-gb",
+            "8",
+            "--collective-latency-us",
+            "5",
+            "--moe-activation",
+            "pigeonhole",
+            "--kv-offload-gb",
+            "64",
+            "--dcn-gbit-per-s",
+            "200",
+            "--weight-dtype",
+            "bf16",
+            "--expert-weight-dtype",
+            "fp8",
+            "--kv-dtype",
+            "fp8",
+            "--state-dtype",
+            "bf16",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    supplied_flags = {
+        entry["flag"] for entry in payload["provenance"]["supplied_values"]
+    }
+    expected_flags = {
+        "--hbm-reserve-gb",
+        "--collective-latency-us",
+        "--moe-activation",
+        "--kv-offload-gb",
+        "--dcn-gbit-per-s",
+        "--weight-dtype",
+        "--expert-weight-dtype",
+        "--kv-dtype",
+        "--state-dtype",
+    }
+    assert expected_flags.issubset(supplied_flags)
+    doc_text = _read_onboarding_doc_or_skip()
+    for flag in expected_flags:
+        assert flag in doc_text
+
+
+def test_onboarding_doc_tables_match_generator() -> None:
+    """Verify embedded onboarding doc tables stay in sync with render_docs_tables."""
+    doc_text = _read_onboarding_doc_or_skip()
+    rendered = render_docs_tables.render_doc_tables()
+    anchor = "## Supported Basis Models"
+    expected_block = rendered[rendered.index(anchor) :].strip()
+    start_idx = doc_text.index(_GENERATED_TABLES_START) + len(_GENERATED_TABLES_START)
+    end_idx = doc_text.index(_GENERATED_TABLES_END, start_idx)
+    actual_block = doc_text[start_idx:end_idx].strip()
+    assert actual_block == expected_block
+
+
+def test_onboarding_doc_flags_exist_in_cli_parser() -> None:
+    """Verify every CLI flag referenced in roofline_onboarding exists in cli parser."""
+    doc_text = _read_onboarding_doc_or_skip()
+    registered_flags = _collect_parser_long_flags(cli.build_parser())
+    cleaned_doc = _HELPER_SCRIPT_CHECK_PATTERN.sub("", doc_text)
+    documented_flags = set(_DOC_FLAG_PATTERN.findall(cleaned_doc))
+    assert documented_flags
+    unknown_flags = sorted(documented_flags - registered_flags)
+    assert not unknown_flags, (
+        f"Documented flags missing from CLI parser: {unknown_flags}"
+    )
+
+
+def test_onboarding_doc_symbols_importable() -> None:
+    """Verify every public Python symbol and signature documented in onboarding doc."""
+    documented_callables = (
+        supports,
+        from_hf_config,
+        audit_hf_config,
+        resolve_model_identity,
+        load_hf_config_with_identity,
+        scale_pp_stage_floor,
+        from_jax,
+    )
+    for fn in documented_callables:
+        assert callable(fn)
+    documented_types = (
+        ConfigAudit,
+        ChipOverrides,
+        ChipSpec,
+        SliceTopology,
+        ModelGeometry,
+        Dtypes,
+        ModelSpec,
+    )
+    for cls in documented_types:
+        assert isinstance(cls, type)
+    assert {"qwen3_5_moe", "glm_moe_dsa"}.issubset(SUPPORTED_MODELS)
+    assert tuple(inspect.signature(from_jax).parameters) == (
+        "name",
+        "version",
+        "overrides",
+    )
+    assert set(VALID_CHIP_PROVENANCE) == {
+        "public_spec",
+        "jax_tpu_info",
+        "measured_microbench",
+        "projected",
+    }
+    doc_text = _read_onboarding_doc_or_skip()
+    for symbol_name in (
+        "supports",
+        "from_hf_config",
+        "audit_hf_config",
+        "ConfigAudit",
+        "resolve_model_identity",
+        "load_hf_config_with_identity",
+        "SUPPORTED_MODELS",
+        "scale_pp_stage_floor",
+        "from_jax",
+        "ChipOverrides",
+        "ChipSpec",
+        "SliceTopology",
+        "ModelGeometry",
+        "Dtypes",
+        "ModelSpec",
+        "VALID_CHIP_PROVENANCE",
+    ):
+        assert symbol_name in doc_text
