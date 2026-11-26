@@ -508,40 +508,9 @@ def _top_of_sorted(a, b):
     return x
 
 
-# `_network_picks` sorts and merges the lists of this many rows at a time:
-# two 128-row blocks in flight (anvil, prefill candidates of the c4 / c64
-# mixed steps: 53.6 -> 51.9 / 294.3 -> 287.7 us per call against 128).
+# `_prefill_candidates_kernel` merges each sublane's lists across this many
+# rows at a time: two 128-row blocks in flight.
 _NETWORK_ROWS = 256
-
-
-def _network_picks(key_ref, num_cols, topk, col_bits) -> jax.Array:
-    """`_insert_picks` with each sublane's lists built `topk` key vregs (8 *
-    `topk` columns, `num_cols` a multiple) at a time: the group sorted by a
-    merge network and merged into the lists by `_top_of_sorted`, ~13 ops per
-    key vreg at `topk` 16 (a power of 2) against an insertion's 31."""
-    offset, _ = _float_key_range(col_bits)
-    rows = key_ref.shape[1]
-    width = min(rows, _NETWORK_ROWS)
-    network = _merge_sort_network(topk)
-    group_cols = 8 * topk
-    blocks = []
-    for b in range(rows // width):
-        lanes = pl.ds(b * width, width)
-
-        def group(g, lanes=lanes):
-            first = pl.multiple_of(g * group_cols, group_cols)
-            keys = [key_ref[pl.ds(first + 8 * i, 8), lanes] for i in range(topk)]
-            return _compare_exchange(keys, network)
-
-        lists = jax.lax.fori_loop(
-            1,
-            num_cols // group_cols,
-            lambda g, lists: tuple(_top_of_sorted(list(lists), group(g))),
-            tuple(group(0)),
-        )
-        blocks.append(_merge_sublane_lists(list(lists)))
-    keys = blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks, axis=1)
-    return pltpu.bitcast(keys, jnp.int32) - offset
 
 
 def _column_keys(
@@ -1366,7 +1335,8 @@ def _prefill_candidates_kernel(
     # Scratch
     buf,  # `msa_indexer._kernel_v3`'s ring and semaphores
     sems,
-    keys_ref,  # [P, Bq] f32 the tile's pick keys (`_float_keys`)
+    keys_ref,  # [pages per step, Bq] f32 the step's pick keys (`_float_keys`)
+    lists_ref,  # [topk, 8, Bq] f32 each sublane's best keys so far, descending
     pad_scores,  # [32, 128] f32 and int32: the picks of position 0
     pad_keys,
     rows_ref,  # [rows + Bq, 2 * topk] f32 the candidates being assembled
@@ -1378,10 +1348,12 @@ def _prefill_candidates_kernel(
 ):
     """`msa_indexer._kernel_v3` over the large (prefill-chunk) tiles with each
     tile's pick keys built from its block maxima as they are scored, in
-    VMEM, and its rows' picks (`_network_picks`) at the tile's last page
-    group: the scores never round-trip through HBM. (Spreading a tile's
-    scan over the next tile's scoring bodies made them slower than the scan
-    alone: they have no free vector registers.)
+    VMEM, and merged into each sublane's `topk` best by groups of `topk` key
+    vregs (a merge network and `_top_of_sorted`) among the next chunks'
+    matmuls; at the tile's last page group the sublanes' lists merge into
+    its rows' picks: the scores never round-trip through HBM. (A tile's
+    whole scan spread over the next tile's scoring bodies made them slower
+    than the scan alone: they have no free vector registers.)
 
     The picks land at their query rows (rows of other requests, from
     aligned tile starts and past a request's end, are left to their own
@@ -1397,7 +1369,6 @@ def _prefill_candidates_kernel(
     tile = entry >> tile_shift
     group = entry & msa_indexer._GROUP_MASK
     pages_per_step = buf.shape[1]
-    num_cols = keys_ref.shape[0]
     rank = rank_ref[0]
     small_copy = pltpu.make_async_copy(small_ref, small_buf, copy_sems.at[0])
 
@@ -1407,9 +1378,33 @@ def _prefill_candidates_kernel(
 
     num_visible = pos_ref[...] // pick["block_size"] + 1  # [1, Bq]
 
+    group_cols = 8 * topk
+    network = _merge_sort_network(topk)
+
+    @pl.when(step == 0)
+    def _():
+        lists_ref[...] = jnp.zeros(lists_ref.shape, jnp.float32)
+
+    def merge_keys(first, num_keys):
+        """Merge the step's pick keys ``[first, first + num_keys)`` (at most
+        a group of `topk` key vregs, the rest read as 0) into the lists."""
+        for b in range(lists_ref.shape[2] // _LANES):
+            lanes = pl.ds(b * _LANES, _LANES)
+            zeros = jnp.zeros((8, _LANES), jnp.float32)
+            keys = [
+                keys_ref[pl.ds(first + 8 * i, 8), lanes] if 8 * i < num_keys else zeros
+                for i in range(topk)
+            ]
+            lists = [lists_ref[i, :, lanes] for i in range(topk)]
+            merged = _top_of_sorted(lists, _compare_exchange(keys, network))
+            for i in range(topk):
+                lists_ref[i, :, lanes] = merged[i]
+
     def store(first, m, rows_major):
+        """Pick keys of the chunk's maxima, merged into the lists by groups
+        of `topk` key vregs among the next chunks' matmuls."""
         m = m.T if rows_major else m
-        col0 = pl.multiple_of(group * pages_per_step + first, m.shape[0])
+        col0 = group * pages_per_step + first
         cols = col0 + jax.lax.broadcasted_iota(jnp.int32, m.shape, 0)
         keys = _column_keys(
             m,
@@ -1422,7 +1417,16 @@ def _prefill_candidates_kernel(
             col_bits=col_bits,
             real_cols=pick["real_cols"],
         )
-        keys_ref[pl.ds(col0, m.shape[0]), :] = _float_keys(keys, col_bits)
+        keys_ref[pl.ds(first, m.shape[0]), :] = _float_keys(keys, col_bits)
+        end = first + m.shape[0]
+        if end % group_cols == 0:
+            merge_keys(end - group_cols, group_cols)
+
+    def after_body(scored):
+        # Columns past the scored chunks are past the request's pages.
+        end = scored * chunk
+        if end % group_cols:
+            merge_keys(end - end % group_cols, end % group_cols)
 
     def cached(w):
         # A request's tiles are consecutive: all but its first find its
@@ -1442,6 +1446,7 @@ def _prefill_candidates_kernel(
         buf,
         sems,
         store=store,
+        after_body=after_body,
         slot_bodies=False,
         key_cache=key_cache[0] if key_cache else None,
         cached=cached,
@@ -1464,21 +1469,19 @@ def _prefill_candidates_kernel(
 
     @pl.when((step == last) | (next_tile != tile))
     def _():
-        # The columns its rows can see (`_pick_t`), in whole network groups.
-        width = 8 * topk
-        needed = (jnp.max(num_visible) + dcp - 1) // dcp
-        scanned = jnp.clip(-(-needed // width), 1, num_cols // width) * width
-        # Those past the scored pages (stale VMEM): 0, below every key.
+        # The lists hold every scored column's key: those past the columns
+        # its rows can see key below them all.
+        width = min(lists_ref.shape[2], _NETWORK_ROWS)
+        blocks = []
+        for b in range(lists_ref.shape[2] // width):
+            lanes = pl.ds(b * width, width)
+            blocks.append(
+                _merge_sublane_lists([lists_ref[i, :, lanes] for i in range(topk)])
+            )
+        lists_ref[...] = jnp.zeros(lists_ref.shape, jnp.float32)
+        keys = pltpu.bitcast(jnp.concatenate(blocks, axis=1), jnp.int32)
+        keys = keys - _float_key_range(col_bits)[0]
         info = tile_info_ref[tile]
-        scored = -(-seq_pages_ref[info & seq_mask] // chunk)
-
-        def floor(c, carry):
-            rows = pl.ds(pl.multiple_of(c * chunk, chunk), chunk)
-            keys_ref[rows, :] = jnp.zeros((chunk, keys_ref.shape[1]), jnp.float32)
-            return carry
-
-        jax.lax.fori_loop(scored, scanned // chunk, floor, 0)
-        keys = _network_picks(keys_ref, scanned, topk, col_bits)
         score, block = _picked(
             [keys[i : i + 1] for i in range(topk)], rank, col_bits=col_bits, dcp=dcp
         )
@@ -1536,11 +1539,13 @@ _PREFILL_PAGES_PER_STEP = 256
 _PREFILL_VMEM_BYTES = 40 << 20
 
 
-def _prefill_vmem_bytes(plan, index_cache, small_rows: int, num_rows: int) -> int:
+def _prefill_vmem_bytes(
+    plan, index_cache, small_rows: int, num_rows: int, topk: int
+) -> int:
     """VMEM of `_prefill_candidates`: the page ring, the request's fp8 keys,
-    the tile's pick keys, the query tile (double-buffered), the assembled
-    output and the small class's picks, whose [rows, 2 * topk] f32 pad to 128
-    lanes."""
+    the step's pick keys and the lists, the query tile (double-buffered), the
+    assembled output and the small class's picks, whose [rows, 2 * topk] f32
+    pad to 128 lanes."""
     _, rows_per_page, _, head_dim = index_cache.shape
     block_q = plan.large_block_q
     ring = msa_indexer._RING_SLOTS * plan.large_pages_per_step * rows_per_page
@@ -1549,7 +1554,7 @@ def _prefill_vmem_bytes(plan, index_cache, small_rows: int, num_rows: int) -> in
     key_cache = plan.large_pages * page_size * head_dim if cacheable else 0
     return key_cache + 4 * (
         ring * head_dim
-        + plan.large_pages * block_q
+        + (plan.large_pages_per_step + 8 * topk) * block_q
         + 2 * block_q * head_dim
         + (num_rows + block_q + small_rows) * _LANES
     )
@@ -1572,9 +1577,9 @@ def _prefill_fits(plan, index_cache, small_rows: int, num_rows: int, topk: int) 
         plan.large_tile_major
         and plan.token_major
         and topk & (topk - 1) == 0
-        and plan.large_pages % step_cols == 0
+        and plan.large_pages_per_step % step_cols == 0
         and step_cols % _prefill_chunk(plan, index_cache) == 0
-        and _prefill_vmem_bytes(plan, index_cache, small_rows, num_rows)
+        and _prefill_vmem_bytes(plan, index_cache, small_rows, num_rows, topk)
         <= _PREFILL_VMEM_BYTES
     )
 
@@ -1636,7 +1641,8 @@ def _prefill_candidates(
     scratch = [
         pltpu.VMEM(ring, jnp.uint32),
         pltpu.SemaphoreType.DMA((msa_indexer._RING_SLOTS,)),
-        pltpu.VMEM((num_cols, block_q), jnp.float32),
+        pltpu.VMEM((pages_per_step, block_q), jnp.float32),
+        pltpu.VMEM((pick["topk"], 8, block_q), jnp.float32),
         pltpu.VMEM((_KEY_CHUNK[True], _LANES), jnp.float32),
         pltpu.VMEM((_KEY_CHUNK[True], _LANES), jnp.int32),
         pltpu.VMEM((assembled_rows, width), jnp.float32),
@@ -1645,7 +1651,9 @@ def _prefill_candidates(
     ]
     if msa_indexer.keys_cacheable(block_q, rows_per_page, index_cache.dtype):
         scratch.append(pltpu.VMEM((num_cols, page_size // 4, head_dim), jnp.uint32))
-    vmem_bytes = _prefill_vmem_bytes(plan, index_cache, small_packed.shape[0], num_rows)
+    vmem_bytes = _prefill_vmem_bytes(
+        plan, index_cache, small_packed.shape[0], num_rows, pick["topk"]
+    )
     return pl.pallas_call(
         functools.partial(_prefill_candidates_kernel, pick=pick, chunk=chunk),
         grid_spec=pltpu.PrefetchScalarGridSpec(

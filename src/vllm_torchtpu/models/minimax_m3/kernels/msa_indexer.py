@@ -400,6 +400,7 @@ def _kernel_v3(
     transposed=False,
     store=None,
     after_wait=None,
+    after_body=None,
     slot_bodies=True,
     key_cache=None,
     cached=None,
@@ -424,7 +425,8 @@ def _kernel_v3(
     ``first + i`` of the group) in place of `o_ref`, as scored: ``m [Bq,
     chunk]`` if `rows_major` (`_scores_transposed`), else ``[chunk, Bq]``;
     `after_wait(slot)`
-    runs once the step's pages are in ring slot `slot`, before they are scored.
+    runs once the step's pages are in ring slot `slot`, before they are scored;
+    `after_body(scored)` at the end of a body that scored `scored` chunks.
     Without `slot_bodies` the bodies index the ring slot dynamically, one per
     count of scored chunks rather than per slot and count: a third of the
     code, for groups of many chunks.
@@ -634,6 +636,8 @@ def _kernel_v3(
                 score_chunk(slot, c * chunk, pages, hit)
             else:
                 start(next_base, next_live, pages, (slot + ahead) % slots)
+        if after_body is not None:
+            after_body(scored)
 
     # One straight-line body per slot and count of scored chunks, so that a
     # chunk's matmuls overlap the previous chunk's maxima.
