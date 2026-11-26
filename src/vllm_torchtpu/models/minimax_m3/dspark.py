@@ -269,6 +269,11 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
         # One write op for every layer's sharded context K/V
         # (`cp_draft_attention.write_layers_op`), set by `prepare_draft_kv_write`.
         self._one_kv_write_op = None
+        # TPU_MINIMAX_M3_DSPARK_CONTEXT_KV_CAT: every layer's K/V columns of
+        # qkv_proj side by side ([hidden, layers * 2 * kv_size]), set by
+        # `prepare_draft_kv_write` when each is a plain matrix: one matmul for
+        # all layers' context K/V.
+        self.register_buffer("context_kv_weight", None, persistent=False)
 
     def prepare_draft_kv_write(self) -> None:
         """With TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE, build the all-layer sharded
@@ -304,13 +309,39 @@ class MiniMaxM3DSparkModel(Qwen3DSparkModel):
             "MiniMax DSpark: one sharded context K/V write for %d draft layers.",
             len(self.layers),
         )
+        if envs.TPU_MINIMAX_M3_DSPARK_CONTEXT_KV_CAT:
+            weights = []
+            for layer in self.layers:
+                attn = layer.self_attn
+                weight = _flipped_weight(attn.qkv_proj, torch.bfloat16)
+                if weight is None:
+                    return
+                weights.append(weight[:, attn.q_size :])
+            self.context_kv_weight = torch.cat(weights, dim=1)
+            logger.info(
+                "MiniMax DSpark: one context K/V matmul for %d draft layers "
+                "(TPU_MINIMAX_M3_DSPARK_CONTEXT_KV_CAT).",
+                len(self.layers),
+            )
+
+    def _layers_context_kv(self, context: torch.Tensor) -> list:
+        """Each layer's context ``(k, v)``, from one matmul when
+        `context_kv_weight` is set."""
+        weight = self.context_kv_weight
+        if weight is None or weight.dtype != context.dtype:
+            return [_context_kv(layer.self_attn, context) for layer in self.layers]
+        kv = torch.matmul(context, weight)
+        sizes = [layer.self_attn.kv_size for layer in self.layers for _ in "kv"]
+        parts = kv.split(sizes, dim=-1)
+        return list(zip(parts[0::2], parts[1::2], strict=True))
 
     def _write_context_kv_one_op(self, context, positions, metadata) -> None:
         """Every layer's own-head context K/V through the one all-layer write."""
         keys, values = [], []
-        for layer in self.layers:
+        for layer, (k, v) in zip(
+            self.layers, self._layers_context_kv(context), strict=True
+        ):
             attn = layer.self_attn
-            k, v = _context_kv(attn, context)
             k = _per_head_norm(k, attn.k_norm, attn.head_dim)
             k, _ = attn.rotary_emb(positions, k, None)
             impl = attn.attn.impl

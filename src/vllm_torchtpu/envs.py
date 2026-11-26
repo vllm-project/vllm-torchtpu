@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_FP8_W8A8_MAX_ROWS: int = 0
     TPU_MINIMAX_M3_FP8_W8A8_MIN_ROWS: int = 0
     TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE: bool = False
+    TPU_MINIMAX_M3_DSPARK_CONTEXT_KV_CAT: bool = False
     TPU_MINIMAX_M3_FP8_SPLIT_MAX_ROWS: int = 0
     TPU_MINIMAX_M3_FP8_SPLIT_MIN_ROWS: int = 0
     TPU_MINIMAX_M3_SP_MODE: str = "off"
@@ -865,6 +866,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # metadata; otherwise the per-layer writes run. Default off.
     "TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE": env_bool(
         "TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE", default=False
+    ),
+    # With TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE armed: compute every draft
+    # layer's context K/V with one matmul against their qkv_proj K/V columns
+    # concatenated at load (instead of one matmul per layer). Same products.
+    "TPU_MINIMAX_M3_DSPARK_CONTEXT_KV_CAT": env_bool(
+        "TPU_MINIMAX_M3_DSPARK_CONTEXT_KV_CAT", default=False
     ),
     # MiniMax-M3 e4m3 linears: token buckets of at most this many rows split
     # the bf16 activations into two e4m3 terms (x ~ s * (hi + lo / 16), one

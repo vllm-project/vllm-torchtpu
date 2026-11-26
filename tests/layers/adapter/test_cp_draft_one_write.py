@@ -109,9 +109,11 @@ def _model(dspark, layers, hidden, seen):
         fc=lambda x: x[:, :hidden],
         hidden_norm=_Norm(),
         _one_kv_write_op=None,
+        context_kv_weight=None,
     )
     for name in (
         "prepare_draft_kv_write",
+        "_layers_context_kv",
         "_write_context_kv_one_op",
         "store_context_kv",
     ):
@@ -212,3 +214,37 @@ def test_write_layers_op_fake_symbolic(dcp, layers):
     outs = outs if isinstance(outs, tuple) else (outs,)
     assert len(outs) == layers
     assert all(o.shape == cache.shape for o in outs)
+
+
+def test_context_kv_cat_matches_per_layer(monkeypatch):
+    """TPU_MINIMAX_M3_DSPARK_CONTEXT_KV_CAT: one matmul against the layers'
+    concatenated K/V columns gives each layer's context K/V exactly."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+    from vllm_torchtpu.models.minimax_m3 import dspark
+
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_DSPARK_ONE_KV_WRITE", True, raising=False)
+    monkeypatch.setattr(envs, "TPU_MINIMAX_M3_DSPARK_CONTEXT_KV_CAT", True, raising=False)
+    monkeypatch.setattr(
+        dspark.cp_draft_attention, "write_layers_op", lambda *cfg: ("op", cfg)
+    )
+    torch.manual_seed(0)
+    hidden, layers = 64, 3
+    model = _model(dspark, layers, hidden, {"per_layer": [], "op": None})
+    for layer in model.layers:
+        linear = torch.nn.Module()
+        linear.weight = torch.nn.Parameter(
+            torch.randn(hidden, 3 * HEAD_DIM).to(torch.bfloat16), requires_grad=False
+        )
+        linear.bias = None
+        setattr(linear, WEIGHT_FLIPPED_ATTR, True)
+        layer.self_attn.qkv_proj = linear
+    context = torch.randn(9, hidden).to(torch.bfloat16)
+    want = model._layers_context_kv(context)
+    model.prepare_draft_kv_write()
+    assert model.context_kv_weight is not None
+    assert model.context_kv_weight.shape == (hidden, layers * 2 * HEAD_DIM)
+    got = model._layers_context_kv(context)
+    for (gk, gv), (wk, wv) in zip(got, want, strict=True):
+        torch.testing.assert_close(gk, wk, rtol=0, atol=0)
+        torch.testing.assert_close(gv, wv, rtol=0, atol=0)
