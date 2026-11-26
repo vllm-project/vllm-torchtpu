@@ -39,6 +39,14 @@ def _l2_norm_f32(x: jax.Array, eps: float = 1e-6) -> jax.Array:
     return (x_f32 * inv_norm).astype(x.dtype)
 
 
+def activate_beta(b: jax.Array, cfg: config.GDNConfig) -> jax.Array:
+    """Delta-rule step size: `beta_scale * sigmoid(b)`, in [0, beta_scale)."""
+    beta = jax.nn.sigmoid(b.astype(jnp.float32))
+    if cfg.beta_scale != 1.0:
+        beta = beta * cfg.beta_scale
+    return beta
+
+
 def activate_gate(
     a: jax.Array,
     a_log: jax.Array,
@@ -332,7 +340,7 @@ def chunked_kda(
     k_large = _l2_norm_f32(k_large)
 
     # (seqs, 1, chunk, num_v_heads)
-    beta = jax.nn.sigmoid(b_large.astype(jnp.float32))
+    beta = activate_beta(b_large, cfg)
     beta = jnp.where(mask, beta, 0.0)
 
     a_log_kda = a_log.reshape(1, -1, 1, 1).astype(jnp.float32)
@@ -396,8 +404,9 @@ def recurrent_kda(
     q = _l2_norm_f32(q) * (cfg.kq_head_dim**-0.5)
     k = _l2_norm_f32(k)
 
-    # Delta rule step-size beta in [0, 1]
-    beta = jnp.where(mask, jax.nn.sigmoid(b_compact.astype(jnp.float32)), 0.0)
+    # Delta rule step-size beta in [0, beta_scale]
+    beta = activate_beta(b_compact, cfg)
+    beta = jnp.where(mask, beta, 0.0)
     beta = compute_gdn.fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)
     beta = beta[:, : cfg.num_v_heads]
 

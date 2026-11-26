@@ -337,22 +337,35 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
+    row_info: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """Prepare the local-only routing layout using already-local expert ids.
 
-    For non-EP runs `topk_indices_local` is always non-negative, so the
-    valid-mask path computed below is a no-op (jnp.where on an all-True
-    mask). For EP, the caller applies the expert-map remap upstream
-    (inside this JIT) and marks non-local entries with a negative id which
-    the mask filters out. Always running the masked branch keeps a single
-    code path.
+    With ``skip_padded_tokens=True`` the valid mask also drops the padded rows'
+    routes. With ``row_info`` (BF16 MoE: a 1-element int32 array holding the
+    number of valid prefix rows), rows at index ``>= row_info[0]`` are padding,
+    and real rows keep stock dispatch even if a routing weight is zero. Without
+    ``row_info`` (FP8 / MXFP4 MoE), the caller zeroed the padded rows' routing
+    weights and routes whose weight is zero are dropped. ``row_info`` is
+    ignored without ``skip_padded_tokens``.
+
+    For non-EP runs `topk_indices_local` is always non-negative, so without
+    ``skip_padded_tokens`` the valid-mask path computed below is a no-op
+    (jnp.where on an all-True mask). For EP, the caller applies the expert-map
+    remap upstream (inside this JIT) and marks non-local entries with a
+    negative id which the mask filters out. Always running the masked branch
+    keeps a single code path.
     """
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
     topk_weights_flat = topk_weights_local.flatten()
     token_indices_flat = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)
 
-    if skip_padded_tokens:
+    if skip_padded_tokens and row_info is not None:
+        valid_mask = (topk_indices_flat >= 0) & (
+            token_indices_flat < row_info.reshape(-1)[0]
+        )
+    elif skip_padded_tokens:
         # Padded tokens keep their selected expert ids, but carry zero
         # expert routing weights. Treat them as invalid to remove them
         # from GMM work.
@@ -510,8 +523,10 @@ def moe_gmm(
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens.
 
-    The valid-mask gating below is a no-op for non-EP runs (mask is all
-    True) and keeps the single code path uniform for both EP and non-EP.
+    The valid-mask gating below is a no-op for non-EP runs without
+    padded-token skipping (mask is all True); with skipping it also zeroes
+    the contributions of the dropped padded routes. It keeps the single code
+    path uniform for both EP and non-EP.
     EP uses SparseCore ragged_gather + ragged_gather_reduce for token movement.
     """
     group_offset = jnp.array([0], dtype=jnp.int32)
@@ -679,6 +694,7 @@ def fused_moe_func(
     topk_weights: jax.Array,
     topk_ids: jax.Array,
     experts_start: jax.Array | None = None,
+    row_info: jax.Array | None = None,
     topk: int = 1,
     activation: str = "silu",
     use_ep: bool = False,
@@ -750,17 +766,25 @@ def fused_moe_func(
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
-    if 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD and can_use_dense_expert(
-        hidden_states,
-        w1,
-        w2,
-        w1_scale,
-        w2_scale,
-        w1_bias,
-        w2_bias,
-        activation=activation,
-        rhs_quant_dtype=rhs_quant_dtype,
-        skip_padded_tokens=skip_padded_tokens,
+    # The row-count filter (``row_info``) is implemented only in the routed
+    # path below; BF16 does not reach the dense-expert kernel today (it admits
+    # FP8 weights only), and the first condition keeps it that way if that
+    # changes.
+    if (
+        row_info is None
+        and 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD
+        and can_use_dense_expert(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            w1_bias,
+            w2_bias,
+            activation=activation,
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+        )
     ):
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
@@ -784,6 +808,7 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
+        row_info=row_info,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
     x = moe_gmm(

@@ -51,7 +51,7 @@ from vllm_torchtpu.layers.adapter.sample import repetition_penalty as penalty_op
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu_input_batch import InputBatch
+    from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import InputBatch
 
 logger = init_logger(__name__)
 

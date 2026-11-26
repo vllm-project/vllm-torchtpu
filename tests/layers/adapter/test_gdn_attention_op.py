@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -549,9 +550,14 @@ class TestVllmGatedDeltaNetAttention:
         )
         gdn_impl(*operands)
 
-        # Nothing silently dropped on the way to the kernel.
+        # Nothing silently dropped on the way to the kernel, and mismatched
+        # operand counts fail on CPU rather than slipping through `*args`.
         assert len(captured["args"]) == len(operands)
         assert captured["args"][-1] is operands[-1]
+        with pytest.raises(TypeError):
+            gdn_impl(*operands, torch.zeros(1))
+        with pytest.raises(TypeError):
+            gdn_impl(*operands[:11])
 
     def test_pooled_op_is_shared_by_layers_with_one_kernel_config(
         self, cpu_vllm_config_context
@@ -1938,3 +1944,224 @@ def test_flipped_qkvz_fp8_block_weight_is_the_kept_one_transposed(
     assert kept_weight.shape == weight.shape
     torch.testing.assert_close(flipped_weight, kept_weight.T, rtol=0, atol=0)
     torch.testing.assert_close(flipped_scale, kept_scale, rtol=0, atol=0)
+
+
+def test_get_shared_mamba_jax_op_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify cache keys, fake-op shapes, writeback, and arity checks."""
+    from vllm_torchtpu.layers.adapter.custom_ops import mamba_op_utils
+
+    with pytest.raises(TypeError):
+        # `donate_argnums` is required keyword-only (no Mamba-only default).
+        mamba_op_utils.get_shared_mamba_jax_op(  # type: ignore[call-arg]
+            "test_op", (1,), lambda x, s: (s, x), 4
+        )
+
+    calls: list[tuple[str, tuple[int, ...]]] = []
+    fakes: list = []
+
+    class _FakeOp:
+        def __init__(self, donate_argnums: tuple[int, ...]) -> None:
+            self._donate_argnums = donate_argnums
+
+        def __call__(self, *args: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            x = args[0]
+            updated = tuple(args[idx] + 1.0 for idx in self._donate_argnums)
+            return (*updated, x * 2.0)
+
+        def register_fake(self, fake_fn) -> None:
+            fakes.append(fake_fn)
+
+    def _fake_pallas_jax_op(name: str, fn, donate_argnums: tuple[int, ...] = ()):
+        del fn
+        calls.append((name, donate_argnums))
+        return _FakeOp(donate_argnums)
+
+    monkeypatch.setattr(mamba_op_utils.pallas, "jax_op", _fake_pallas_jax_op)
+
+    # 1. Single donated operand, tuple out_shape_tail, cache reuse on exact key.
+    op1 = mamba_op_utils.get_shared_mamba_jax_op(
+        "test_pooled", (8,), lambda x, p: (p, x), (2, 4), donate_argnums=(1,)
+    )
+    op2 = mamba_op_utils.get_shared_mamba_jax_op(
+        "test_pooled", (8,), lambda x, p: (p, x), (2, 4), donate_argnums=(1,)
+    )
+    assert len(calls) == 1 and calls[0][1] == (1,)
+    x_t = torch.ones((3, 2, 4))
+    pool_t = torch.zeros((2, 4))
+    out_t = op1(x_t, pool_t)
+    assert torch.equal(out_t, torch.full((3, 2, 4), 2.0))
+    assert torch.equal(pool_t, torch.ones((2, 4)))
+    fake_pool, fake_out_tuple = fakes[0](x_t, pool_t)
+    assert fake_pool.shape == pool_t.shape and fake_pool.dtype == pool_t.dtype
+    assert fake_out_tuple.shape == (3, 2, 4) and fake_out_tuple.dtype == x_t.dtype
+
+    # Arity mismatch caught via unified positional bounds check.
+    with pytest.raises(TypeError, match="expected 2 positional operands, got 1"):
+        op2(x_t)
+    with pytest.raises(TypeError, match="expected 2 positional operands, got 3"):
+        op2(x_t, pool_t, pool_t)
+
+    # Required keyword-only parameter is rejected before caching/registration.
+    def _bad_kwonly(x, p, *, flag):
+        del flag
+        return p, x
+
+    cached_before = dict(mamba_op_utils._shared_mamba_ops)
+    with pytest.raises(TypeError, match="required keyword-only parameter 'flag'"):
+        mamba_op_utils.get_shared_mamba_jax_op(
+            "test_bad_kwonly", (99,), _bad_kwonly, (2, 4), donate_argnums=(1,)
+        )
+    assert len(calls) == 1
+    assert mamba_op_utils._shared_mamba_ops == cached_before
+
+    # functools.partial-bound keyword-only parameters and optional/varargs work.
+    op_partial = mamba_op_utils.get_shared_mamba_jax_op(
+        "test_partial",
+        (1,),
+        functools.partial(_bad_kwonly, flag=True),
+        (2, 4),
+        donate_argnums=(1,),
+    )
+    assert torch.equal(op_partial(x_t, pool_t), torch.full((3, 2, 4), 2.0))
+
+    op_varargs = mamba_op_utils.get_shared_mamba_jax_op(
+        "test_varargs",
+        (1,),
+        lambda x, p, *rest: (p, x),
+        (2, 4),
+        donate_argnums=(1,),
+    )
+    with pytest.raises(
+        TypeError, match="expected at least 2 positional operands, got 1"
+    ):
+        op_varargs(x_t)
+    assert torch.equal(op_varargs(x_t, pool_t, x_t), torch.full((3, 2, 4), 2.0))
+
+    op_optional = mamba_op_utils.get_shared_mamba_jax_op(
+        "test_optional",
+        (1,),
+        lambda x, p, opt=None: (p, x),
+        (2, 4),
+        donate_argnums=(1,),
+    )
+    with pytest.raises(TypeError, match="expected 2..3 positional operands, got 1"):
+        op_optional(x_t)
+    with pytest.raises(TypeError, match="expected 2..3 positional operands, got 4"):
+        op_optional(x_t, pool_t, x_t, x_t)
+    assert torch.equal(op_optional(x_t, pool_t), torch.full((3, 2, 4), 2.0))
+
+    calls_before_tail = len(calls)
+
+    # 2. Different out_shape_tail (int tail) with same (op_prefix, key) creates a
+    # distinct cached op and registers an int-tail fake.
+    op_int_tail = mamba_op_utils.get_shared_mamba_jax_op(
+        "test_pooled", (8,), lambda x, p: (p, x), 16, donate_argnums=(1,)
+    )
+    assert len(calls) == calls_before_tail + 1
+    fake_pool2, fake_out_int = fakes[-1](x_t, pool_t)
+    assert fake_pool2.shape == pool_t.shape
+    assert fake_out_int.shape == (3, 16) and fake_out_int.dtype == x_t.dtype
+    _ = op_int_tail
+
+    # 3. Different donate_argnums (two donated states) creates a distinct cached
+    # op and writes back both donated operands in order.
+    op_two_states = mamba_op_utils.get_shared_mamba_jax_op(
+        "test_pooled",
+        (8,),
+        lambda x, c, s: (c, s, x),
+        (2, 4),
+        donate_argnums=(1, 2),
+    )
+    assert len(calls) == calls_before_tail + 2 and calls[-1][1] == (1, 2)
+    conv_t = torch.full((4, 3, 8), 2.0)
+    ssm_t = torch.full((4, 2, 4, 4), 5.0)
+    out_two = op_two_states(x_t, conv_t, ssm_t)
+    assert torch.equal(out_two, torch.full((3, 2, 4), 2.0))
+    assert torch.equal(conv_t, torch.full((4, 3, 8), 3.0))
+    assert torch.equal(ssm_t, torch.full((4, 2, 4, 4), 6.0))
+    fake_c, fake_s, fake_out_two = fakes[-1](x_t, conv_t, ssm_t)
+    assert fake_c.shape == conv_t.shape and fake_s.shape == ssm_t.shape
+    assert fake_out_two.shape == (3, 2, 4)
+
+
+def test_extract_mamba_step_metadata_contracts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify all state-index and distribution combinations in step metadata."""
+    from vllm_torchtpu.layers.adapter.custom_ops import mamba_op_utils
+
+    qsl_t = torch.tensor([0, 3, 5], dtype=torch.int32)
+    dist_t = torch.tensor([0, 2, 2], dtype=torch.int32)
+    mamba_dist_t = torch.tensor([1, 1, 2], dtype=torch.int32)
+    seq_t = torch.tensor([3, 2], dtype=torch.int32)
+    bt_1d = torch.tensor([7, 9, 4, 5], dtype=torch.int32)
+    state_idx_i64 = torch.tensor([11, 13], dtype=torch.int64)
+
+    # 1. Uniform fallback (mamba_state_indices=None) + spec distribution.
+    meta_uniform_spec = SimpleNamespace(
+        mamba_state_indices=None,
+        block_tables=bt_1d,
+        query_start_loc=qsl_t,
+        request_distribution=dist_t,
+        mamba_request_distribution=mamba_dist_t,
+        seq_lens=seq_t,
+    )
+    slots, qsl, dist, slens = mamba_op_utils.extract_mamba_step_metadata(
+        "layers.0", meta_uniform_spec
+    )
+    assert slots.dtype == torch.int32
+    assert torch.equal(slots, torch.tensor([7, 4], dtype=torch.int32))
+    assert torch.equal(qsl, qsl_t)
+    assert torch.equal(dist, mamba_dist_t)
+    assert torch.equal(slens, seq_t)
+
+    # 2. Compact/unified (mamba_state_indices set) + default distribution.
+    meta_compact_nospec = SimpleNamespace(
+        mamba_state_indices=state_idx_i64,
+        block_tables=None,
+        query_start_loc=qsl_t,
+        request_distribution=dist_t,
+        mamba_request_distribution=None,
+        seq_lens=seq_t,
+    )
+    slots2, _, dist2, _ = mamba_op_utils.extract_mamba_step_metadata(
+        "layers.0", meta_compact_nospec
+    )
+    assert slots2.dtype == torch.int32
+    assert torch.equal(slots2, torch.tensor([11, 13], dtype=torch.int32))
+    assert torch.equal(dist2, dist_t)
+
+    # 3. Compact/unified (mamba_state_indices set) + spec distribution.
+    meta_compact_spec = SimpleNamespace(
+        mamba_state_indices=state_idx_i64,
+        block_tables=bt_1d,
+        query_start_loc=qsl_t,
+        request_distribution=dist_t,
+        mamba_request_distribution=mamba_dist_t,
+        seq_lens=seq_t,
+    )
+    slots3, _, dist3, _ = mamba_op_utils.extract_mamba_step_metadata(
+        "layers.0", meta_compact_spec
+    )
+    assert torch.equal(slots3, torch.tensor([11, 13], dtype=torch.int32))
+    assert torch.equal(dist3, mamba_dist_t)
+
+    # 4. Uniform fallback + default distribution, resolved via forward context.
+    meta_uniform_nospec = SimpleNamespace(
+        mamba_state_indices=None,
+        block_tables=bt_1d,
+        query_start_loc=qsl_t,
+        request_distribution=dist_t,
+        mamba_request_distribution=None,
+        seq_lens=seq_t,
+    )
+    monkeypatch.setattr(
+        mamba_op_utils,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"layers.0": meta_uniform_nospec}),
+    )
+    slots_fc, _, dist_fc, _ = mamba_op_utils.extract_mamba_step_metadata("layers.0")
+    assert torch.equal(slots_fc, torch.tensor([7, 4], dtype=torch.int32))
+    assert torch.equal(dist_fc, dist_t)

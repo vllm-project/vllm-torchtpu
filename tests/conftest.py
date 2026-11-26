@@ -84,6 +84,40 @@ def _reset_warning_once():
     vllm.logger._print_warning_once.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _empty_shared_mamba_ops():
+    """Isolate the shared recurrent `pallas.jax_op` cache across tests."""
+    mod_name = "vllm_torchtpu.layers.adapter.custom_ops.mamba_op_utils"
+    mod = sys.modules.get(mod_name)
+    if mod is not None:
+        mod._shared_mamba_ops.clear()
+    yield
+    mod_after = sys.modules.get(mod_name)
+    if mod_after is not None:
+        mod_after._shared_mamba_ops.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_ep_device_placement():
+    """Any compile hash marks the EP placement key as read for the rest of the
+    process, and `ep_device_ids` then raises on a placement it has not seen.
+    Start every test with no placement recorded and the key unread.
+
+    Resets directly instead of through `monkeypatch`: an autouse fixture that
+    requests `monkeypatch` sets it up before every module fixture, so its undo
+    would run after their teardown, while their patches are still in place."""
+
+    def reset():
+        ep_mesh = sys.modules.get("vllm_torchtpu.distributed.ep_mesh")
+        if ep_mesh is not None:
+            ep_mesh._GATHERED_DEVICE_IDS.clear()
+            ep_mesh._PLACEMENT_KEY_READ = False
+
+    reset()
+    yield
+    reset()
+
+
 @pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""

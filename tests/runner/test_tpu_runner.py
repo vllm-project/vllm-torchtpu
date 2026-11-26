@@ -50,7 +50,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
@@ -82,6 +81,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
     AsyncTPUModelRunnerOutput,
 )
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 
@@ -3513,6 +3513,39 @@ def test_relayout_tables_reaches_the_draft_model(monkeypatch):
     assert seen == []
 
 
+def test_patch_rope_in_graph_skips_none_and_counts_shared_tier1_once(
+    monkeypatch, caplog
+):
+    import logging
+
+    from vllm_torchtpu import rope_patch
+
+    seen: list[torch.nn.Module] = []
+
+    def fake_patch(model: torch.nn.Module, *, allow_table_recovery: bool) -> int:
+        # Serving converts only classes with a spec, never recovered tables.
+        assert allow_table_recovery is False
+        seen.append(model)
+        return 1
+
+    monkeypatch.setattr(rope_patch, "patch_in_graph_rotary_embedding", fake_patch)
+    runner = MagicMock(spec=TPUModelRunner)
+    shared_tier1 = torch.nn.Module()
+    shared_tier1._tpu_in_graph_tier1 = True
+    target_model = torch.nn.ModuleDict({"shared": shared_tier1})
+    draft_model = torch.nn.ModuleDict({"shared": shared_tier1})
+
+    with caplog.at_level(logging.INFO, logger="vllm.vllm_torchtpu.runner.tpu_runner"):
+        TPUModelRunner._patch_rope_in_graph(runner, target_model, None, draft_model)
+
+    assert seen == [target_model, draft_model]
+    assert "1 Tier-1 and 2 Tier-2 rotary module(s)" in caplog.text
+
+    seen.clear()
+    TPUModelRunner._patch_rope_in_graph(runner, None)
+    assert seen == []
+
+
 def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
     from vllm_torchtpu.runner.tpu_runner import _torch_tpu_wrapper
 
@@ -3539,14 +3572,30 @@ def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
         assert torch.cuda.synchronize() == "synchronized"
 
 
-def test_flush_keeps_zero_token_async_results_until_waited():
-    """A step that committed no tokens still leaves its D2H copy in flight.
+@pytest.mark.parametrize(
+    "prev_req, cur_req, committed, mapped, output, row",
+    [
+        # A partial prefill chunk: nothing committed, nothing to roll back.
+        ("req-prefill", "req-prefill", False, {}, [-1], [0, 0, 0, 0]),
+        # The previous request left: unmapped, not rolled back (vLLM rebuilds
+        # its outputs if it returns), and the new request's row is untouched.
+        ("req-done", "req-new", True, {}, [-1], [0, 0, 0, 0]),
+        # Continued: stays mapped and is rolled back, row included.
+        ("req-a", "req-a", True, {"req-a": 0}, [7], [7, 0, 0, 0]),
+    ],
+    ids=["committed_nothing", "left_the_batch", "continues"],
+)
+def test_unmap_keeps_async_results_until_sample_tokens_waits(
+    prev_req, cur_req, committed, mapped, output, row
+):
+    """The previous step's D2H copy may still be in flight.
 
     On TP ranks other than the executor's output rank, vLLM may drop the
     AsyncTPUModelRunnerOutput when the RPC returns, so _pre_async_results is
     the copy's only owner. execute_model() must neither free it before the
-    copy is waited on (#985) nor block on it ahead of the forward;
-    sample_tokens() waits on it in _modify_prev_results() before replacing it.
+    copy is waited on nor block on it ahead of the forward; only a request this
+    step continues stays mapped and keeps its rollback. sample_tokens() waits
+    on the copy in _modify_prev_results() and rolls back what is left.
     """
     events = []
 
@@ -3556,43 +3605,38 @@ def test_flush_keeps_zero_token_async_results_until_waited():
         def wait(self):
             events.append("wait")
 
+    req_state = SimpleNamespace(output_token_ids=[-1])  # the optimistic placeholder
     copy_state = FakeCopyState()
     weakref.finalize(copy_state, events.append, "freed")
     runner = SimpleNamespace(
-        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-prefill"]),
+        input_batch=SimpleNamespace(
+            num_reqs=1,
+            req_ids=[cur_req],
+            req_id_to_index={cur_req: 0},
+            num_tokens_no_spec=np.ones(1, dtype=np.int64),
+            token_ids_cpu=np.zeros((1, 4), dtype=np.int32),
+        ),
         _pre_async_results=AsyncPreResults(
-            req_ids=["req-prefill"],
+            req_ids=[prev_req],
             next_tokens_tpu=torch.tensor([7], dtype=torch.int32),
-            request_seq_lens=[],
-            discard_sampled_tokens_req_indices=[0],
-            req_id_to_index_copy={},
+            request_seq_lens=[(0, req_state, 1, prev_req)] if committed else [],
+            discard_sampled_tokens_req_indices=[] if committed else [0],
+            req_id_to_index_copy={prev_req: 0} if committed else {},
             copy_state=copy_state,
         ),
     )
-    # A flush that rolls back calls self._modify_prev_results().
-    runner._modify_prev_results = lambda: TPUModelRunner._modify_prev_results(runner)
     del copy_state  # The runner now holds the only reference.
 
     # execute_model(): neither wait on the copy nor free it.
-    TPUModelRunner._flush_disjoint_async_results(runner)
+    TPUModelRunner._unmap_disjoint_async_results(runner)
     assert events == []
+    assert runner._pre_async_results.req_id_to_index_copy == mapped
 
-    # sample_tokens(): wait on the copy before the results are replaced.
+    # sample_tokens(): wait on the copy, then roll back.
     TPUModelRunner._modify_prev_results(runner)
     assert events == ["wait"]
-
-
-def test_flush_disjoint_async_results_still_flushes_nonempty_prev_batch():
-    """A disjoint previous batch that sampled tokens must still be rolled back."""
-    runner = SimpleNamespace(
-        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-new"]),
-        _pre_async_results=SimpleNamespace(req_id_to_index_copy={"req-old": 0}),
-        _modify_prev_results=MagicMock(),
-    )
-
-    TPUModelRunner._flush_disjoint_async_results(runner)
-    runner._modify_prev_results.assert_called_once()
-    assert runner._pre_async_results is None
+    assert req_state.output_token_ids == output
+    assert runner.input_batch.token_ids_cpu[0].tolist() == row
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -4252,6 +4296,204 @@ def test_truncate_rope_caches_keeps_speculative_slack(monkeypatch):
         draft_model["draft_rope"].cos_sin_cache[draft_positions],
         untruncated[draft_positions],
     )
+
+
+def test_precompile_timed_and_sample_tokens_share_dynamo_trace():
+    """A graph traced inside _precompile_timed is reused by sample_tokens.
+
+    Both run under no_grad even when the caller has grad enabled, so Dynamo's
+    grad mode guard matches and the graph is not traced again.
+    """
+    from torch._dynamo.testing import CompileCounter
+
+    counter = CompileCounter()
+    compiled_add = torch.compile(lambda x: x + 1, backend=counter, fullgraph=True)
+    x = torch.zeros(4)
+    grad_states = []
+    runner = SimpleNamespace(
+        execute_model_state=None,
+        _pp_is_last=False,
+        _sample_tokens_pp_intermediate_stage=lambda: (
+            grad_states.append(torch.is_grad_enabled()),
+            compiled_add(x),
+        )[-1],
+        _update_num_xla_graphs=lambda _name: None,
+    )
+    with torch.enable_grad():
+        with TPUModelRunner._precompile_timed(runner, "test_pass"):
+            assert not torch.is_grad_enabled()
+            compiled_add(x)
+        TPUModelRunner.sample_tokens(runner, None)
+        assert torch.is_grad_enabled()
+    assert grad_states == [False]
+    assert counter.frame_count == 1
+
+
+def test_precompile_substitute_placeholder_token_matches_2d_sampled_tokens(monkeypatch):
+    """_precompile_substitute_placeholder_token warms [num_reqs, 1] int64
+    next_tokens matching selected_token_ids parked by non-spec sample_tokens,
+    so _apply_async_token_substitution reuses the trace with no view or recompile.
+    """
+    from torch._dynamo.testing import CompileCounter
+
+    from vllm_torchtpu.runner import tpu_runner as tpu_runner_mod
+
+    counter = CompileCounter()
+    orig_fn = tpu_runner_mod._substitute_placeholder_token._torchdynamo_orig_callable
+    compiled_sub = torch.compile(
+        orig_fn, backend=counter, fullgraph=True, dynamic=False
+    )
+    monkeypatch.setattr(tpu_runner_mod, "_substitute_placeholder_token", compiled_sub)
+    monkeypatch.setattr(tpu_runner_mod, "synchronize_tensors", lambda _out: None)
+
+    runner = SimpleNamespace(
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        num_reqs_paddings=[8],
+        num_tokens_paddings=[16],
+        _is_async_drafter=False,
+        speculative_config=None,
+        max_num_reqs=8,
+        device=torch.device("cpu"),
+        _fast_token_substitution=False,
+        _update_num_xla_graphs=lambda _name: None,
+    )
+    runner._precompile_timed = TPUModelRunner._precompile_timed.__get__(runner)
+
+    with torch.enable_grad():
+        TPUModelRunner._precompile_substitute_placeholder_token(runner)
+        assert counter.frame_count == 1
+
+        selected = torch.tensor(
+            [[101], [202], [0], [0], [0], [0], [0], [0]], dtype=torch.int64
+        )
+        runner._pre_async_results = SimpleNamespace(next_tokens_tpu=selected)
+        input_ids = torch.zeros(16, dtype=torch.int32)
+        input_ids[0] = -1
+        input_ids[5] = -1
+        with torch.no_grad():
+            out = TPUModelRunner._apply_async_token_substitution(
+                runner,
+                input_ids,
+                np.array([0, 5], dtype=np.int32),
+                np.array([0, 1], dtype=np.int32),
+            )
+
+    assert counter.frame_count == 1
+    assert int(out[0].item()) == 101
+    assert int(out[5].item()) == 202
+
+
+def test_load_model_eagerly_initializes_sampling_generator_before_transfers(
+    monkeypatch,
+):
+    """load_model allocates and seeds _sampling_generator before weight loading
+    so Step 0's sample_tokens never calls THPGenerator_pynew while async H2D
+    transfers from _prepare_inputs are in flight.
+    """
+    from vllm_torchtpu.runner import tpu_runner as tpu_runner_mod
+
+    events: list[str] = []
+    real_device = torch.device
+
+    # CPU-only CI runs without torch_tpu registering the "tpu" device backend.
+    monkeypatch.setattr(
+        torch,
+        "device",
+        lambda dev, *args, **kwargs: (
+            real_device("cpu") if dev == "tpu" else real_device(dev, *args, **kwargs)
+        ),
+    )
+
+    class _StopAfterModelLoad(RuntimeError):
+        pass
+
+    def spy_get_sampling_generator(self):
+        events.append("init_sampling_generator")
+        return TPUModelRunner._get_sampling_generator(self)
+
+    def fake_get_tpu_quantization_config(_vllm_config):
+        events.append("get_tpu_quantization_config")
+        raise _StopAfterModelLoad
+
+    monkeypatch.setattr(
+        tpu_runner_mod,
+        "get_tpu_quantization_config",
+        fake_get_tpu_quantization_config,
+    )
+
+    runner = SimpleNamespace(
+        device_config=SimpleNamespace(device=real_device("cpu")),
+        device=real_device("cpu"),
+        vllm_config=SimpleNamespace(device_config=None, quant_config=None),
+        model_config=SimpleNamespace(quantization=None, seed=42),
+        is_pooling_model=False,
+        _sampling_generator=None,
+    )
+    runner._get_sampling_generator = spy_get_sampling_generator.__get__(runner)
+
+    with pytest.raises(_StopAfterModelLoad):
+        TPUModelRunner.load_model(runner)
+
+    assert events == ["init_sampling_generator", "get_tpu_quantization_config"]
+    assert isinstance(runner._sampling_generator, torch.Generator)
+    assert runner._sampling_generator.initial_seed() == 42
+    assert TPUModelRunner._get_sampling_generator(runner) is runner._sampling_generator
+
+
+def test_truncate_rope_caches_suppresses_warning_when_in_graph_enabled(
+    monkeypatch, caplog
+):
+    """When `tpu_rope_in_graph` removes raw tensor caches, skip the warning."""
+    import logging
+
+    from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+
+    from vllm_torchtpu import rope_in_graph
+
+    rope = _bare_rope(RotaryEmbedding, 128)
+    rope._buffers.pop("cos_sin_cache", None)
+    rope.cos_sin_cache = rope_in_graph.InGraphCosSinCache(
+        [rope_in_graph.CosSinSegment(0, 128, (1.0, 0.5, 0.25, 0.125))],
+        torch.float32,
+        128,
+        8,
+    )
+    model = torch.nn.ModuleDict({"rope": rope})
+
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.model = model
+    runner.speculative_config = None
+    runner.model_config = SimpleNamespace(
+        is_multimodal_model=False, multimodal_config=None, max_model_len=32
+    )
+
+    runner.vllm_config = SimpleNamespace(additional_config={"tpu_rope_in_graph": True})
+    with caplog.at_level(
+        logging.WARNING, logger="vllm.vllm_torchtpu.runner.tpu_runner"
+    ):
+        runner._truncate_rope_caches(model)
+    assert "no position-indexed rope cache" not in caplog.text
+
+    caplog.clear()
+    runner.vllm_config = SimpleNamespace(additional_config={})
+    with caplog.at_level(
+        logging.WARNING, logger="vllm.vllm_torchtpu.runner.tpu_runner"
+    ):
+        runner._truncate_rope_caches(model)
+    assert "no position-indexed rope cache" in caplog.text
+
+
+def test_iter_unique_modules_visits_shared_modules_once():
+    shared = torch.nn.Linear(2, 2, bias=False)
+    a = torch.nn.ModuleDict({"shared": shared, "only_a": torch.nn.Identity()})
+    b = torch.nn.ModuleDict({"shared": shared, "only_b": torch.nn.Identity()})
+
+    visited = list(runner_utils_module.iter_unique_modules(a, b))
+    ids = [id(mod) for _, mod in visited]
+    assert len(ids) == len(set(ids))
+    assert id(shared) in ids
+    assert id(a["only_a"]) in ids
+    assert id(b["only_b"]) in ids
 
 
 class TestLogitsAtDpVocabRows:

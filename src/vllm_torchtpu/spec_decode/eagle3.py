@@ -45,6 +45,7 @@ from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
+    disable_ep_weight_filter_for_replicated_draft,
     dp_lockstep_num_reqs,
     iter_mtp_shared_heads,
     maybe_share_embeddings,
@@ -869,6 +870,8 @@ class Eagle3Proposer:
             _force_draft_tp1() if self._draft_replicated else contextlib.nullcontext()
         )
         self.draft_vllm_config = copy.copy(self.vllm_config)
+        if self._draft_replicated and not self._draft_tp_matches_target:
+            disable_ep_weight_filter_for_replicated_draft(self.draft_vllm_config)
         draft_model_config = copy.copy(self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"
         draft_compilation_config = copy.copy(self.vllm_config.compilation_config)
