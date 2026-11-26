@@ -374,3 +374,79 @@ def test_worker_start_load_kv_packs_urgent_rows_first():
     ):
         c.start_load_kv(None)
     assert len(order) == 3
+
+
+def test_hold_all_chunks_needs_block_granularity():
+    with pytest.raises(ValueError):
+        WriteBackPolicy.from_extra_config(
+            {"store_policy": {"mode": "write_back", "hold_all_chunks": True}}
+        )
+
+
+def _host_load_holder(s, hold_all):
+    """A finished turn that hit chunks 0-1 in HBM, loaded chunk 2 from the
+    host and computed chunk 3: vLLM's CHUNK_LEVEL policy left
+    next_stored_chunk_idx at 3 (all cached chunks)."""
+    s._write_back = WriteBackPolicy(
+        window_blocks=s._write_back.window_blocks,
+        granularity="block",
+        hold_all_chunks=hold_all,
+    )
+    keys, gs = _held_unregistered(s, "r", [11, 12, 13, 14], next_stored=3)
+    assert s._wb_register("r")
+    return keys, gs
+
+
+def _held_unregistered(s, req_id, block_ids, next_stored):
+    keys = [f"{req_id}-k{i}" for i in range(len(block_ids))]
+    gs = SimpleNamespace(
+        next_stored_chunk_idx=next_stored, offload_keys=keys, block_ids=block_ids
+    )
+    s._req_status[req_id] = SimpleNamespace(
+        req=SimpleNamespace(num_prompt_tokens=10_000),
+        req_context=object(),
+        group_states=[gs],
+        transfer_jobs=set(),
+    )
+    return keys, gs
+
+
+def test_host_load_turn_holds_its_hbm_hit_chunks_with_hold_all():
+    s, pool = _scheduler(window_blocks=2)
+    _host_load_holder(s, hold_all=False)
+    assert s._wb_blocks["r"] == {14}  # the HBM-hit chunks 0-1 have no holder
+    s2, pool2 = _scheduler(window_blocks=2)
+    _host_load_holder(s2, hold_all=True)
+    assert s2._wb_blocks["r"] == {11, 12, 13, 14}
+
+
+def test_hold_all_partial_store_offers_chunks_below_next_stored():
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+
+    s, pool = _scheduler(window_blocks=16)
+    keys, gs = _host_load_holder(s, hold_all=True)
+    # Block 11 (an HBM-hit chunk) reaches the window.
+    s._wb_owners = {11: {"r"}}
+    s._wb_blocks["r"] = {11}
+    out = _step(s)
+    assert s._wb_allowed == {"r": {keys[0]}}
+    seen = []
+    s.manager.prepare_store = lambda ks, ctx: seen.append(list(ks)) or "ok"
+
+    def fake_base(self, scheduler_output):
+        # Like the base: offer the chunks from next_stored_chunk_idx on.
+        for req_id in scheduler_output.num_scheduled_tokens:
+            st = self._req_status[req_id]
+            g = st.group_states[0]
+            self.manager.prepare_store(
+                g.offload_keys[g.next_stored_chunk_idx :], st.req_context
+            )
+            g.next_stored_chunk_idx = 4
+        return "meta"
+
+    with patch.object(OffloadingConnectorScheduler, "build_connector_meta", fake_base):
+        s._wb_build_partial(out)
+    assert seen == [[keys[0]]]
+    assert gs.next_stored_chunk_idx == 3  # restored
