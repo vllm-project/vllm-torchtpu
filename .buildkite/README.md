@@ -68,14 +68,15 @@ release's scripts, on the `cpu_64_core` agents that build the CI image, and
 checks that they resolve together from PyPI (`release/check_wheels.sh`). vLLM
 is built at the ref the CI image is built from: the `pyproject.toml` pin,
 unless the build uses another vLLM (upstream HEAD in the
-`vllm-torchtpu-integration` pipeline, or `VLLM_COMMIT_HASH_OVERRIDE`). The lane
+`vllm-torchtpu-canary-vllm` pipeline, or `VLLM_COMMIT_HASH_OVERRIDE`). The lane
 runs beside the image build in every suite but `perf`. No step of another lane
 depends on it. On a build with two stages the TPU lanes still go up only after
 every stage-0 step passes, this lane included; on a one-stage build a failed
-wheel step fails the build and holds back no TPU step. In the integration
-pipeline the LKG promotion runs after a `wait`, so it needs this lane to pass
-too. The files are artifacts of the build and are uploaded nowhere else: their
-version, `0.0.0+g<commit>`, is a local version, which PyPI rejects.
+wheel step fails the build and holds back no TPU step. In the
+`vllm-torchtpu-canary-vllm` pipeline the LKG promotion runs after a `wait`, so
+it needs this lane to pass too. The files are artifacts of the build and are
+uploaded nowhere else: their version, `0.0.0+g<commit>`, is a local version,
+which PyPI rejects.
 
 By default, the `tests` lane's TPU steps run only on TPU v7x. A build picks
 other chips with one of these extras in `CI_EXTRAS` (set it in the Buildkite UI

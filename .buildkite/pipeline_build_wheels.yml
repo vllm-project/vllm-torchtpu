@@ -18,15 +18,15 @@
 # build. No step of another lane depends on these steps. On a build with a
 # second stage (PR, merge queue, /ci run) the TPU lanes go up only after every
 # stage-0 step passes, these included; on a one-stage build a failure here
-# fails the build and holds back no TPU step. In the integration pipeline the
-# LKG promotion (pipeline_promote.yml) runs after a `wait`, so it needs these
-# steps to pass too.
+# fails the build and holds back no TPU step. In the
+# vllm-torchtpu-canary-vllm pipeline the LKG promotion (pipeline_promote.yml)
+# runs after a `wait`, so it needs these steps to pass too.
 #
 # The files stay artifacts of this build and go nowhere else. Their version,
 # 0.0.0+g<commit> (release/set_test_wheel_version.sh), is a local version,
 # which PyPI rejects. vLLM is built at the ref the CI image is built from (the
 # VLLM_COMMIT_HASH meta-data): this commit's pyproject.toml pin, unless the
-# build uses another vLLM (upstream HEAD in the vllm-torchtpu-integration
+# build uses another vLLM (upstream HEAD in the vllm-torchtpu-canary-vllm
 # pipeline, or VLLM_COMMIT_HASH_OVERRIDE).
 
 x-wheel-step: &wheel_step
