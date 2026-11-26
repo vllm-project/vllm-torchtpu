@@ -61,6 +61,25 @@ def get_tpu_type() -> str:
     return tpu_type
 
 
+def parse_chip_version(accelerator_type: str) -> pltpu.ChipVersion:
+    """The chip an accelerator type names ("tpu7x-8", "v6e").
+
+    Raises ValueError for a type that names no chip. For a caller that must
+    not guess the chip; `get_chip_version` falls back to TPU7x instead.
+    """
+    # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
+    # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
+    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
+    # v5litepod and v7x are the only two that still differ after stripping.
+    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
+    try:
+        return pltpu.ChipVersion(name)
+    except ValueError:
+        raise ValueError(
+            f"Unrecognized TPU accelerator type {accelerator_type!r}"
+        ) from None
+
+
 @functools.cache
 def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     """Resolves the TPU chip version without initializing a TPU client.
@@ -71,13 +90,8 @@ def get_chip_version(accelerator_type: str | None = None) -> pltpu.ChipVersion:
     warning when the accelerator type is unrecognized.
     """
     accelerator_type = accelerator_type or get_tpu_type() or ""
-    # ChipVersion's values are bare chip names ("7x", "v6e"); accelerator types
-    # add a chip-count suffix and sometimes a "tpu" prefix ("tpu7x", "v6e-8").
-    name = accelerator_type.strip().lower().split("-")[0].removeprefix("tpu")
-    # v5litepod and v7x are the only two that still differ after stripping.
-    name = {"v5litepod": "v5e", "v7x": "7x"}.get(name, name)
     try:
-        return pltpu.ChipVersion(name)
+        return parse_chip_version(accelerator_type)
     except ValueError:
         logger.warning(
             "Unrecognized TPU accelerator type %r; defaulting to TPU7x "

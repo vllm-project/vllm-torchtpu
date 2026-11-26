@@ -72,6 +72,9 @@ steps:
         <<: *perf_step
         env:
           SHAPE: *shape_2_core
+          # run_eval_flow.sh picks the chip's perf baselines with it, and stops
+          # when it cannot read the chip.
+          TPU_ACCELERATOR_TYPE: "tpu7x"
           BENCHMARK_WARMUP_RUNS: "1"
         plugins:
           - *kube_plugin
