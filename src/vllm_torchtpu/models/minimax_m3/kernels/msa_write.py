@@ -54,12 +54,17 @@ class Rows(NamedTuple):
     ``bits=4`` (the 4-bit caches of `msa_fp4`, 8 slots per 32-bit word).
     `scales` (f32 ``[T]``) go to the last word row of a page with folded
     scales (`msa_fp4.scales_in_page`), lane = slot.
+
+    With `dim_major` the cache keeps its pages ``[W / p (+ 1), p, S]``: a
+    token's row is the slot's lane, ``p`` of its values per 32-bit word
+    (the index cache, `msa_indexer.dim_major_rows`).
     """
 
     cache: jax.Array
     rows: jax.Array
     bits: int | None = None
     scales: jax.Array | None = None
+    dim_major: bool = False
 
 
 class SlotValues(NamedTuple):
@@ -80,8 +85,9 @@ class SlotValues(NamedTuple):
 class _RowsSpec(NamedTuple):
     bits: int
     folds: int  # 128-lane blocks of a row
-    data_rows: int  # word rows holding slots
+    data_rows: int  # word rows holding slots (dim-major: a slot's words)
     scale_lane: int | None  # lane of the lane values holding folded scales
+    dim_major: bool = False  # slot = lane; a token's row comes packed in words
 
 
 class _ValuesSpec(NamedTuple):
@@ -192,7 +198,7 @@ def _run_ops(
                 continue
             raw, buf = next(windows_left)
             new_rows = raw[slot].astype(jnp.uint32)
-            if spec.bits == 4:
+            if spec.bits == 4 and not spec.dim_major:
                 new_rows = new_rows & 0xF
             for f in range(spec.folds):
                 buf[f, pl.ds(page_size, window)] = new_rows[
@@ -202,7 +208,15 @@ def _run_ops(
             rows, width = words.shape
             packing = 32 // spec.bits
             row = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 0)
-            for j in range(packing):
+            lane = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
+            if spec.dim_major:
+                # [slot, word] of the run's packed rows -> [word, slot].
+                by_lane = buf[0, pl.ds(row0, page_size), :].T
+                data = row < spec.data_rows
+                words = jnp.where(data & (lane >= lo) & (lane < hi), by_lane[:rows], words)
+                # Slots past the run are zeroed, as below.
+                words = jnp.where(data & (lane >= hi), 0, words)
+            for j in range(0 if spec.dim_major else packing):
                 slot_j = row * packing + j  # past the data rows: >= S, never taken
                 take = (slot_j >= lo) & (slot_j < hi)
                 keep = jnp.uint32(
@@ -228,7 +242,6 @@ def _run_ops(
                 bits = by_slot[spec.scale_lane : spec.scale_lane + 1]
                 if width > _LANES:
                     bits = jnp.pad(bits, ((0, 0), (0, width - _LANES)))
-                lane = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
                 take = (row == rows - 1) & (lane >= lo) & (lane < hi)
                 words = jnp.where(take, bits[:, :width], words)
             out_buf.bitcast(jnp.uint32)[slot, :, 0, :] = words
@@ -304,6 +317,7 @@ def _slot_words(target: Rows) -> tuple[jax.Array, _RowsSpec, int]:
     _, rows_per_page, word_bytes, width = cache.shape
     bits = target.bits or 32 // word_bytes
     folded = target.scales is not None
+    data_rows = rows_per_page - 1 if folded else rows_per_page
     if folded and not (
         bits == 4 and msa_fp4.scales_in_page(rows_per_page, cache.dtype)
     ):
@@ -312,13 +326,36 @@ def _slot_words(target: Rows) -> tuple[jax.Array, _RowsSpec, int]:
         )
     if width % _LANES:
         raise ValueError(f"cache rows must be whole 128-lane blocks, got {cache.shape}")
+    if target.dim_major:
+        if width != _LANES:
+            raise ValueError(f"dim-major pages hold {_LANES} slots, got {cache.shape}")
+        words = _packed_words(target.rows, bits)
+        return words, _RowsSpec(bits, 1, data_rows, None, True), width
     if bits == 4:
         words = target.rows.astype(jnp.uint8)
     else:
         words = jax.lax.bitcast_convert_type(target.rows, _UINT_BY_BITS[bits])
-    data_rows = rows_per_page - 1 if folded else rows_per_page
     spec = _RowsSpec(bits, width // _LANES, data_rows, None)
     return words, spec, data_rows * 32 // bits
+
+
+def _packed_words(rows: jax.Array, bits: int) -> jax.Array:
+    """Token rows ``[T, W]`` (uint8 nibbles for 4 bits) -> uint32 ``[T,
+    128]``: value ``i`` in bits ``bits * (i % p)`` of word ``i // p`` (``p =
+    32 / bits``), the words of a dim-major page column; lanes past the
+    row's words are zero."""
+    num_tokens, width = rows.shape
+    packing = 32 // bits
+    if bits != 4:
+        rows = jax.lax.bitcast_convert_type(rows, _UINT_BY_BITS[bits])
+    # Shifts and ors: one elementwise fusion (a reshaping bitcast to 32 bits
+    # became one slice per packed value, ~15 us each for 3K fp8 rows).
+    values = rows.astype(jnp.uint32).reshape(num_tokens, width // packing, packing)
+    shifts = jnp.arange(packing, dtype=jnp.uint32) * bits
+    words = jnp.bitwise_or.reduce(values << shifts, axis=-1)
+    if words.shape[1] > _LANES:
+        raise ValueError(f"a dim-major column holds {_LANES} words, got {words.shape}")
+    return jnp.pad(words, ((0, 0), (0, _LANES - words.shape[1])))
 
 
 class WriteOperands(NamedTuple):
@@ -519,7 +556,9 @@ def token_runs(pages: jax.Array, slots: jax.Array, num_pages: int, max_runs: int
     return num_runs, pages[first].astype(jnp.int32), run_lo, run_lo + count, run_tok0
 
 
-@functools.partial(jax.jit, static_argnames=("max_runs", "bits", "interpret"))
+@functools.partial(
+    jax.jit, static_argnames=("max_runs", "bits", "dim_major", "interpret")
+)
 def write_rows(
     cache: jax.Array,
     rows: jax.Array,
@@ -529,11 +568,12 @@ def write_rows(
     max_runs: int,
     bits: int | None = None,
     scales: jax.Array | None = None,
+    dim_major: bool = False,
     interpret: bool = False,
 ) -> jax.Array:
     """`write_runs` of one packed cache's `Rows`."""
     return write_runs(
-        [Rows(cache, rows, bits, scales)],
+        [Rows(cache, rows, bits, scales, dim_major)],
         pages,
         slots,
         max_runs=max_runs,

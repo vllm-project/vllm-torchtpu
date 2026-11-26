@@ -20,10 +20,18 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from tests.models.minimax_m3.packing import CACHE_DTYPES, pack, rounded, unpack
+from tests.models.minimax_m3.packing import (
+    CACHE_DTYPES,
+    pack,
+    pack_index,
+    rounded,
+    unpack,
+    unpack_index,
+)
 from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_indexer, msa_select
 
-BLOCK = 16
+# Index pages are square (`msa_indexer.check_square_pages`): 128 slots.
+BLOCK = 128
 HEAD_DIM = 128
 Q_PER_KV = 4
 TOPK = 4
@@ -66,9 +74,9 @@ def _reference(q, k, v, iq, ik, ctx_k, ctx_v, ctx_ik, q_lens, ctx_lens, sm_scale
 @pytest.mark.parametrize(
     "q_lens,ctx_lens",
     [
-        ([1, 1, 1], [70, 5, 200]),  # decode
+        ([1, 1, 1], [560, 40, 1600]),  # decode
         ([40], [0]),  # first prefill chunk
-        ([1, 37, 3], [129, 60, 17]),  # mixed batch
+        ([1, 37, 3], [1032, 480, 136]),  # mixed batch
     ],
 )
 def test_msa_forward_matches_dense_reference(
@@ -95,9 +103,9 @@ def test_msa_forward_matches_dense_reference(
     v = rng.standard_normal((num_tokens, 1, HEAD_DIM)).astype(f32)
     iq = rng.standard_normal((num_tokens, 1, HEAD_DIM)).astype(f32)
     ik = rng.standard_normal((num_tokens, HEAD_DIM)).astype(f32)
-    ctx_k = rng.standard_normal((num_seqs, 256, HEAD_DIM)).astype(f32)
-    ctx_v = rng.standard_normal((num_seqs, 256, HEAD_DIM)).astype(f32)
-    ctx_ik = rng.standard_normal((num_seqs, 256, HEAD_DIM)).astype(f32)
+    ctx_k = rng.standard_normal((num_seqs, 2048, HEAD_DIM)).astype(f32)
+    ctx_v = rng.standard_normal((num_seqs, 2048, HEAD_DIM)).astype(f32)
+    ctx_ik = rng.standard_normal((num_seqs, 2048, HEAD_DIM)).astype(f32)
     # Queries stay bf16; keys and values are what the caches store.
     q, iq = (rounded(x, BF16) for x in (q, iq))
     k, v, ik, ctx_k, ctx_v, ctx_ik = (
@@ -137,7 +145,7 @@ def test_msa_forward_matches_dense_reference(
     new_kv, new_idx, out = forward(
         *(jnp.asarray(x).astype(BF16) for x in (q, k, v, iq, ik)),
         pack(kv_rows, dtype),
-        pack(index_rows, dtype),
+        pack_index(index_rows, dtype),
         *(jnp.asarray(x) for x in (seq_lens, block_tables.reshape(-1), cu_q, dist)),
     )
 
@@ -146,7 +154,7 @@ def test_msa_forward_matches_dense_reference(
     )
     out = np.asarray(out.astype(jnp.float32))
     np.testing.assert_allclose(out[:num_real], expected, atol=3e-2)
-    new_kv, new_idx = unpack(new_kv), unpack(new_idx)
+    new_kv, new_idx = unpack(new_kv), unpack_index(new_idx)
     np.testing.assert_array_equal(out[num_real:], 0)
     start = 0
     for r in range(num_seqs):

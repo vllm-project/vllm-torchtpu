@@ -27,6 +27,7 @@ import pytest
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from tests.models.minimax_m3.packing import pack_index_fp4
 from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_fp4
 
 PAGE, HEAD_DIM, TOPK, DCP, HL = 128, 128, 16, 2, 8
@@ -50,7 +51,7 @@ def _caches(rng, num_pages, fp4):
         kv = msa_fp4.pack_rows(
             jnp.asarray(rng.integers(0, 16, (num_pages, PAGE, 2 * HEAD_DIM)), jnp.uint8)
         )
-        index = msa_fp4.pack_rows(
+        index = pack_index_fp4(
             jnp.asarray(rng.integers(0, 16, (num_pages, PAGE, HEAD_DIM)), jnp.uint8),
             jnp.asarray(rng.uniform(0.5, 1.5, (num_pages, HEAD_DIM)), jnp.float32),
         )

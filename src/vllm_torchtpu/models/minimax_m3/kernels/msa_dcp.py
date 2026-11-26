@@ -963,6 +963,7 @@ def decode_candidates(
     requests and positions (`msa.token_positions`)."""
     num_tokens, heads, head_dim = index_q.shape
     _, rows_per_page, _, _ = index_cache.shape
+    msa_indexer.check_square_pages(index_cache)
     if heads > 1:
         if write is not None:
             raise NotImplementedError("a folded write takes one index head")
@@ -1922,7 +1923,7 @@ def msa_write_and_candidates_dcp(
         kv_rows = jnp.concatenate([k, v], axis=-1).reshape(num_tokens, -1)
         targets = [
             msa_write.Rows(kv_cache, kv_rows),
-            msa_write.Rows(index_cache, index_k),
+            msa_write.Rows(index_cache, index_k, dim_major=True),
         ]
     # A decode step of one KV head writes its caches inside the indexer kernel
     # (`decode_candidates`).

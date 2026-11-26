@@ -38,3 +38,29 @@ def unpack(cache: jnp.ndarray) -> np.ndarray:
     """``[pages, S / p, p, W]`` cache -> float32 ``[pages, S, W]``."""
     pages, rows, packing, width = cache.shape
     return np.asarray(cache.astype(jnp.float32)).reshape(pages, rows * packing, width)
+
+
+def pack_index(keys: np.ndarray, dtype) -> jnp.ndarray:
+    """``[pages, S, D]`` index keys -> the index cache's dim-major pages
+    ``[pages, D / p, p, S]`` (`msa_indexer.dim_major_rows`)."""
+    keys = np.asarray(keys)
+    packing = PACKING[dtype]
+    pages, page_size, dim = keys.shape
+    return jnp.asarray(
+        keys.transpose(0, 2, 1).reshape(pages, dim // packing, packing, page_size)
+    ).astype(dtype)
+
+
+def pack_index_fp4(nibbles, scales=None) -> jnp.ndarray:
+    """``[pages, S, D]`` 4-bit index nibbles (and ``[pages, S]`` folded slot
+    scales) -> dim-major uint8 pages ``[pages, D / 8 (+ 1), 4, S]``."""
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+
+    return msa_fp4.pack_rows(jnp.swapaxes(jnp.asarray(nibbles), 1, 2), scales)
+
+
+def unpack_index(cache: jnp.ndarray) -> np.ndarray:
+    """Dim-major ``[pages, D / p, p, S]`` index pages -> float32 ``[pages, S, D]``."""
+    pages, rows, packing, slots = cache.shape
+    keys = np.asarray(cache.astype(jnp.float32)).reshape(pages, rows * packing, slots)
+    return keys.transpose(0, 2, 1)

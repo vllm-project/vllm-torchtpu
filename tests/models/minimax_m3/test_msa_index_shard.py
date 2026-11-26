@@ -21,6 +21,11 @@ import pytest
 from tests.models.minimax_m3.packing import CACHE_DTYPES, pack, rounded, unpack
 from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_write
 
+pytestmark = pytest.mark.skip(
+    reason="the indexer reads dim-major index pages of whole blocks; a shard "
+    "page holds 1 / S of a block (attention.shard_index_cache_enabled raises)"
+)
+
 PAGE = 128
 HEAD_DIM = 128
 PAGES_PER_SEQ = 8

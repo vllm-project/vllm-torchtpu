@@ -167,6 +167,13 @@ def shard_index_cache_enabled(vllm_config: VllmConfig) -> bool:
     enabled = config.get(SHARD_INDEX_CACHE_KEY, False)
     if not isinstance(enabled, bool):
         raise ValueError(f"additional_config.{SHARD_INDEX_CACHE_KEY} must be a bool")
+    if enabled:
+        # `kernels.msa_indexer` reads dim-major index pages of a whole block
+        # (as many slots as key dims); a 1 / tp shard of a block is not one.
+        raise NotImplementedError(
+            f"additional_config.{SHARD_INDEX_CACHE_KEY}: the indexer needs whole "
+            "index pages (dim-major, one slot per lane)."
+        )
     return enabled
 
 

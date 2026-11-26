@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from tests.models.minimax_m3.packing import pack
+from tests.models.minimax_m3.packing import pack, pack_index, pack_index_fp4
 from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_fp4, msa_indexer
 
 PAGE = 128
@@ -33,14 +33,14 @@ def _caches(dtype, num_pages, rng, heads=1):
                 rng.integers(0, 16, (num_pages, PAGE, heads * 2 * HEAD_DIM)), jnp.uint8
             )
         )
-        index = msa_fp4.pack_rows(
+        index = pack_index_fp4(
             jnp.asarray(rng.integers(0, 16, (num_pages, PAGE, HEAD_DIM)), jnp.uint8),
             jnp.asarray(rng.uniform(0.5, 1.5, (num_pages, HEAD_DIM)), jnp.float32),
         )
         scales = jnp.asarray(rng.uniform(0.5, 1.5, (num_pages, 8, PAGE)), jnp.float32)
         return kv, index, scales
     kv = pack(rng.standard_normal((num_pages, PAGE, heads * 2 * HEAD_DIM)), dtype)
-    index = pack(rng.standard_normal((num_pages, PAGE, HEAD_DIM)), dtype)
+    index = pack_index(rng.standard_normal((num_pages, PAGE, HEAD_DIM)), dtype)
     return kv, index, None
 
 

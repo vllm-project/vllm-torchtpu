@@ -18,9 +18,14 @@ page is the max over its tokens of ``index_q . index_k`` (no scale: only the
 order matters). Each request's tokens are cut into query tiles of
 `block_q` rows; a grid step scores one tile against `pages_per_step` pages
 read straight from the paged index cache, so a request's index keys are read
-once per tile. The cache packs consecutive tokens into 32-bit words
-(`packed_page`); each packing slot is scored separately, which a max does not
-mind.
+once per tile.
+
+The index cache keeps each page dim-major (`dim_major_rows`): word row ``r``
+of a page ``[D / p, p, S]`` holds key dims ``r * p .. r * p + p - 1`` of
+every slot, lane = slot, so a page bitcasts to ``[D, S]`` keys, the operand
+the MXU takes as weights as stored. Token-major pages entered it through
+transposed weight pushes, at more than twice the cycles per vreg (AOT: 7 vs
+3 for fp8), which bound the decode tiles.
 
 Long (prefill) requests' scores are produced transposed,
 ``[pages, tiles * block_q]``, so each output block is lane-aligned, and
@@ -40,7 +45,6 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 from vllm_torchtpu.models.minimax_m3.kernels.packed_page import (
     check_page_dtype,
-    unpack_page,
 )
 
 DEFAULT_BLOCK_Q = 128
@@ -84,21 +88,20 @@ def _kernel_v1(
     block_tables_ref,  # [max_num_seqs * pages_per_seq]
     # In
     q_ref,  # [Bq, D]
-    *refs,  # G x [1, S / p, p, D] index-cache pages, then the output
+    *refs,  # G x [1, D / p, p, S] index-cache pages, then the output
 ):
     pages_per_step = len(refs) - 1
     page_refs, o_ref = refs[:pages_per_step], refs[pages_per_step]
     q = q_ref[...].astype(jnp.bfloat16)
     maxima = []
     for page_ref in page_refs:
-        page_max = None
-        for keys in unpack_page(page_ref):
-            s = jax.lax.dot_general(
-                keys, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-            )
-            m = jnp.max(s, axis=0, keepdims=True)
-            page_max = m if page_max is None else jnp.maximum(page_max, m)
-        maxima.append(page_max)
+        s = jax.lax.dot_general(
+            _page_keys(page_ref),
+            q,
+            (((1,), (1,)), ((), ())),
+            preferred_element_type=jnp.float32,
+        )
+        maxima.append(jnp.max(s, axis=0, keepdims=True))
     o_ref[...] = jnp.concatenate(maxima, axis=0)
 
 
@@ -107,12 +110,23 @@ def _kernel_v1(
 _MAX_SCORE_ELEMS = 512 * 1024
 
 
-def _page_keys(page_ref) -> jax.Array:
-    """``[1, S / p, p, D]`` page -> bf16 ``[S, D]`` keys in packing order.
+def dim_major_rows(rows: jax.Array, packing: int) -> jax.Array:
+    """Pages of token rows ``[..., S, D]`` -> their dim-major storage order
+    ``[..., D / p, p, S]`` (`p` key dims per 32-bit word): the index cache's
+    page layout (XLA, for references and tests)."""
+    *lead, page_size, dim = rows.shape
+    swapped = jnp.swapaxes(rows, -1, -2)  # [..., D, S]
+    return swapped.reshape(*lead, dim // packing, packing, page_size)
 
-    One width-changing bitcast of the packed 32-bit words: the token order
-    inside the page changes, which a max over the page does not see.
-    """
+
+def token_rows(pages: jax.Array) -> jax.Array:
+    """Inverse of `dim_major_rows`: ``[..., D / p, p, S]`` -> ``[..., S, D]``."""
+    *lead, words, packing, page_size = pages.shape
+    return jnp.swapaxes(pages.reshape(*lead, words * packing, page_size), -1, -2)
+
+
+def _page_keys(page_ref) -> jax.Array:
+    """``[1, D / p, p, S]`` page -> bf16 token-major ``[S, D]`` keys."""
     words = page_ref.bitcast(jnp.uint32)[0, :, 0, :]
     return _words_keys(words, page_ref.dtype)
 
@@ -125,9 +139,9 @@ SCALE_KEYS = True
 
 def _folded_keys(words: jax.Array) -> tuple[jax.Array, jax.Array]:
     """A 4-bit page with its scales folded in (`msa_fp4.scales_in_page`):
-    ``[S / 8 + 1, D]`` words -> (unscaled bf16 keys ``[S, D]``, the per-slot
+    ``[D / 8 + 1, S]`` words -> (unscaled bf16 keys ``[S, D]``, the per-slot
     scales of the last word row as a ``[1, S]`` f32 lane vector)."""
-    keys = pltpu.bitcast(words[:-1], jnp.int4).astype(jnp.bfloat16)
+    keys = pltpu.bitcast(words[:-1], jnp.int4).astype(jnp.bfloat16).T
     return keys, pltpu.bitcast(words[-1:], jnp.float32)
 
 
@@ -143,11 +157,11 @@ def _scale_rows_to_column(rows: list[jax.Array]) -> jax.Array:
 
 
 def _words_keys(words: jax.Array, dtype) -> jax.Array:
-    """Packed ``[S / p, D]`` words -> bf16 ``[S, D]`` keys. A 4-bit (uint8)
-    cache's int4 values come out unscaled, in slot order (`msa_fp4`)."""
+    """Dim-major ``[D / p, S]`` words -> bf16 token-major ``[S, D]`` keys. A
+    4-bit (uint8) cache's int4 values come out unscaled (`msa_fp4`)."""
     if dtype == jnp.uint8:
-        return pltpu.bitcast(words, jnp.int4).astype(jnp.bfloat16)
-    return pltpu.bitcast(words, dtype).astype(jnp.bfloat16)
+        return pltpu.bitcast(words, jnp.int4).astype(jnp.bfloat16).T
+    return pltpu.bitcast(words, dtype).astype(jnp.bfloat16).T
 
 
 def _scale_column(scale_page: jax.Array, row: int) -> jax.Array:
@@ -164,7 +178,7 @@ def _kernel_v2(
     block_tables_ref,  # [max_num_seqs * pages_per_seq]
     # In
     q_ref,  # [Bq, D]
-    *refs,  # G x [1, S / p, p, D] index-cache pages, [G x [1, 8, 128] scale pages], out
+    *refs,  # G x [1, D / p, p, S] index-cache pages, [G x [1, 8, 128] scale pages], out
     scale_row: int | None = None,
 ):
     """`_kernel_v1` with the pages' keys unpacked by one bitcast each and
@@ -211,11 +225,23 @@ def _kernel_v2(
 
 
 def _page_tokens(rows_per_page: int, dtype) -> int:
-    """Tokens per page: 4-bit (uint8) caches hold 8 per 32-bit word (a folded
-    page's extra word row holds scales, not tokens)."""
+    """Values per lane of a page's data word rows: 8 per 32-bit word in 4-bit
+    (uint8) caches (a folded page's extra word row holds scales). Index pages
+    are square (`check_square_pages`), so this is also their tokens."""
     if dtype == jnp.uint8:
         return msa_fp4.data_rows(rows_per_page) * msa_fp4.TOKENS_PER_WORD
     return rows_per_page * (4 // jnp.dtype(dtype).itemsize)
+
+
+def check_square_pages(index_cache: jax.Array) -> None:
+    """Dim-major index pages ``[D / p, p, S]`` must hold as many key dims as
+    slots: the kernels read a page's tokens off its word rows."""
+    _, rows_per_page, _, slots = index_cache.shape
+    if _page_tokens(rows_per_page, index_cache.dtype) != slots:
+        raise NotImplementedError(
+            f"index pages of {slots} slots need as many key dims, got "
+            f"{index_cache.shape}"
+        )
 
 
 # Pages per dot in `_kernel_v3`: 2 x 64 pages, paired along the contraction
@@ -306,7 +332,7 @@ FP8_MXU_QUERIES = True
 
 
 def _transposed_keys(buf, p, live, dtype, folded, masked):
-    """Page `p` of `buf` as ``[S, D]`` MXU keys: 4-bit keys unscaled, fp8 keys
+    """Page `p` of `buf` as ``[D, S]`` MXU keys: 4-bit keys unscaled, fp8 keys
     of a page past the request's end (`masked`) zeroed, as stale VMEM may hold
     NaN, which would reach the paired page's scores through the zero half of
     the paired query."""
@@ -325,9 +351,10 @@ def _chunk_maxima_t(
 ) -> jax.Array:
     """``[Bq, chunk]`` block maxima of the pages ``buf[first : first + chunk]``
     with the scores computed transposed, ``[2 Bq, tokens]``: the MXU result
-    is ``2 Bq`` rows rather than ``chunk * S / 2``. A folded 4-bit page's
-    per-token scales are a lane vector (the page's last word row), applied by
-    a sublane broadcast. `issue(j)` runs among the keys of page pair ``j``.
+    is ``2 Bq`` rows rather than ``chunk * S / 2``, the dim-major keys its
+    weights. A folded 4-bit page's per-token scales are a lane vector (the
+    page's last word row), applied by a sublane broadcast. `issue(j)` runs
+    among the keys of page pair ``j``.
     """
     rows = buf.shape[1]
     half = chunk // 2
@@ -344,19 +371,28 @@ def _chunk_maxima_t(
                 s = pltpu.bitcast(buf[p, rows - 1 :], jnp.float32)  # [1, S]
                 # Stale VMEM past the request's end, unwritten slots: scale 0.
                 scale_rows[side].append(jnp.where(jnp.isfinite(s) & (p < live), s, 0.0))
-        keys.append(jnp.concatenate(pair, axis=1))
-    page_size = keys[0].shape[0]
+        keys.append(jnp.concatenate(pair, axis=0))  # [2 D, S]
+    page_size = keys[0].shape[1]
     s = jax.lax.dot_general(
         q_pair,
-        jnp.concatenate(keys, axis=0),
-        (((1,), (1,)), ((), ())),
+        jnp.concatenate(keys, axis=1),
+        (((1,), (0,)), ((), ())),
         preferred_element_type=jnp.float32,
     )  # [2 Bq, half * S]
     if folded:
         left, right = (jnp.concatenate(r, axis=1) for r in scale_rows)
         row = jax.lax.broadcasted_iota(jnp.int32, s.shape, 0)
         s = s * jnp.where(row < block_q, left, right)
-    m = jnp.max(s.reshape(2 * block_q, half, page_size), axis=2)  # [2 Bq, half]
+    # A lane maximum per page, joined into lanes: one reshape to [2 Bq, half,
+    # S] kept every page's scores live and spilled (AOT c64 decode body 2,390
+    # -> 2,038 bundles, anvil c64 b46 78.6 -> 63.6 us).
+    m = jnp.concatenate(
+        [
+            jnp.max(s[:, i * page_size : (i + 1) * page_size], axis=1, keepdims=True)
+            for i in range(half)
+        ],
+        axis=1,
+    )  # [2 Bq, half]
     return jnp.concatenate([m[:block_q], m[block_q:]], axis=1)
 
 
@@ -390,7 +426,7 @@ def _kernel_v3(
     seq_pages_ref,  # [max_num_seqs] pages of each request
     # In
     q_ref,  # [Bq, D]
-    cache_ref,  # [pages, S / p, p, D] index cache, left in HBM
+    cache_ref,  # [pages, D / p, p, S] index cache (dim-major pages), left in HBM
     # Out
     o_ref,  # [G, Bq], or [Bq, G] if `transposed`
     # Scratch
@@ -418,7 +454,7 @@ def _kernel_v3(
     group's matmuls. A wait between chunks would drain the MXU pipeline, so
     all of the group's pages are waited for first.
 
-    A folded 4-bit page (`msa_fp4.scales_in_page`) is ``S / 8`` word rows of
+    A folded 4-bit page (`msa_fp4.scales_in_page`) is ``D / 8`` word rows of
     int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
 
     `store(first, m, rows_major)`, if given, takes each chunk's maxima (pages
@@ -448,7 +484,7 @@ def _kernel_v3(
     pages_per_seq = block_tables_ref.shape[0] // seq_pages_ref.shape[0]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
     # The pages as 32-bit words: a dense VMEM layout, so each key vreg is one
-    # load (a packed [S / p, p, D] page tiles VMEM in (p, D) tiles).
+    # load (a packed [D / p, p, S] page tiles VMEM in (p, S) tiles).
     words = cache_ref.bitcast(jnp.uint32).reshape(cache_ref.shape[0], rows, head_dim)
 
     def group(w):
@@ -575,22 +611,6 @@ def _kernel_v3(
             put(first, m, rows_major=True)
             return
 
-        if folded:
-            # Each page's slot scales as a column of one transpose for the
-            # chunk; stale VMEM past the request's end and unwritten slots
-            # get scale 0.
-            scale_rows = jnp.concatenate(
-                [
-                    pltpu.bitcast(buf[slot, first + j, rows - 1 :], jnp.float32)
-                    for j in range(chunk)
-                ],
-                axis=0,
-            )  # [chunk, S]
-            page = first + jax.lax.broadcasted_iota(jnp.int32, scale_rows.shape, 0)
-            scale_cols = jnp.where(
-                jnp.isfinite(scale_rows) & (page < live), scale_rows, 0.0
-            ).T.astype(jnp.bfloat16)  # [S, chunk]
-
         def page_keys(j):
             k = keys_of(j)
             if key_cache is not None:
@@ -598,18 +618,25 @@ def _kernel_v3(
             return k
 
         def keys_of(j):
+            """Page ``first + j``'s keys, token-major (the streamed operand),
+            transposed from the page's dim-major ``[D, S]``."""
             issue(j)
+            p = first + j
             if folded:
-                k = pltpu.bitcast(buf[slot, first + j, : rows - 1], jnp.int4)
-                k = k.astype(jnp.bfloat16) * scale_cols[:, j : j + 1]
+                # Stale VMEM past the request's end and unwritten slots: scale 0.
+                scale = pltpu.bitcast(buf[slot, p, rows - 1 :], jnp.float32)  # [1, S]
+                scale = jnp.where(jnp.isfinite(scale) & (p < live), scale, 0.0)
+                k = pltpu.bitcast(buf[slot, p, : rows - 1], jnp.int4)
+                k = k.astype(jnp.bfloat16) * scale.astype(jnp.bfloat16)
                 if fp8_mxu:  # saturate: e4m3 has no inf (a cast past 448 is NaN)
-                    return jnp.clip(k, -448, 448).astype(jnp.float8_e4m3fn)
-                return k
+                    # Transposed as fp8: half the vregs of bf16 keys.
+                    return jnp.clip(k, -448, 448).astype(jnp.float8_e4m3fn).T
+                return k.T
             # A page past the request's end was never copied: its stale words
             # may be NaN or inf, which would reach its pair's score through
             # the zero half of q_pair.
-            w = jnp.where(first + j < live, buf[slot, first + j], 0)
-            k = pltpu.bitcast(w, cache_ref.dtype)
+            w = jnp.where(p < live, buf[slot, p], 0)
+            k = pltpu.bitcast(w, cache_ref.dtype).T
             return k if fp8_mxu else k.astype(jnp.bfloat16)
 
         if fp8_mxu:
@@ -1072,6 +1099,7 @@ def class_plan(
     else:
         check_page_dtype(index_cache.shape[2], index_cache.dtype)
         scale_row = None
+    check_square_pages(index_cache)
     max_num_seqs = seq_lens.shape[0]
     seq_ids = jnp.arange(max_num_seqs, dtype=jnp.int32)
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
@@ -1229,7 +1257,8 @@ def block_scores(
 
     Args:
       index_q: ``[T, 1, D]`` index queries (one index head per rank).
-      index_cache: ``[pages, S / p, p, D]`` key-only cache (bf16 or fp8).
+      index_cache: ``[pages, D / p, p, S]`` key-only cache (bf16 or fp8),
+        dim-major pages (`dim_major_rows`).
       seq_lens, block_tables, cu_q_lens, num_seqs: ragged batch metadata.
       kernel: ``"v2"`` (bitcast unpack, query latched across pages), ``"v3"``
         (v2 with a hand-written DMA ring for the pages) or the original

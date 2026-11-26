@@ -147,13 +147,14 @@ def write_rows(
     *,
     max_num_seqs: int | None = None,
     scales: jax.Array | None = None,
+    dim_major: bool = False,
     interpret: bool = False,
 ) -> jax.Array:
     """`write_caches` of one cache (`msa_write.Rows`: `scales` only for a
-    4-bit cache with folded scales)."""
+    4-bit cache with folded scales, `dim_major` for the index cache)."""
     bits = 4 if msa_fp4.is_fp4(cache) else None
     return write_caches(
-        [msa_write.Rows(cache, rows, bits, scales)],
+        [msa_write.Rows(cache, rows, bits, scales, dim_major)],
         pages,
         pos,
         max_num_seqs=max_num_seqs,
@@ -240,7 +241,7 @@ def fp4_targets(
         i_nib, i_scale = msa_fp4.quantize(msa_fp4.rotate_keys(index_k))
     return [
         msa_write.Rows(kv_cache, kv_rows, 4),
-        msa_write.Rows(index_cache, i_nib, 4, i_scale),
+        msa_write.Rows(index_cache, i_nib, 4, i_scale, dim_major=True),
         msa_write.SlotValues(scale_cache, scales, lanes),
     ]
 
@@ -506,7 +507,7 @@ def msa_forward(
         kv_cache, index_cache = write_caches(
             [
                 msa_write.Rows(kv_cache, jnp.concatenate([k, v], axis=-1)[:, 0]),
-                msa_write.Rows(index_cache, index_k),
+                msa_write.Rows(index_cache, index_k, dim_major=True),
             ],
             pages,
             pos,
@@ -566,30 +567,12 @@ def write_index_shard(
     max_num_seqs: int,
     interpret: bool = False,
 ) -> jax.Array:
-    """Write the index keys of this rank's tokens into its shard cache.
-
-    The token at position ``p`` (``p % shards == rank``) lands at slot
-    ``(p % block_size) // shards`` of its page. This rank's tokens are first
-    compacted, so a request's rows stay consecutive with consecutive slots,
-    as `msa_write.write_rows` needs.
-    """
-    num_tokens = index_k.shape[0]
-    shard_page = page_size(index_cache)
-    block_size = shard_page * shards
-    # A request of q tokens owns at most ceil(q / shards) of them.
-    size = min(num_tokens, num_tokens // shards + max_num_seqs)
-    (idx,) = jnp.nonzero(
-        valid & (pos % shards == rank), size=size, fill_value=num_tokens
-    )
-    take = jnp.minimum(idx, num_tokens - 1)
-    own_pages = jnp.where(idx < num_tokens, pages[take], _DROPPED_PAGE)
-    return msa_write.write_rows(
-        index_cache,
-        _cache_rows(index_cache, index_k[take]),
-        own_pages,
-        (pos[take] % block_size) // shards,
-        max_runs=msa_write.max_write_runs(size, max_num_seqs, shard_page),
-        interpret=interpret,
+    """The index keys of this rank's tokens in its index-cache shard: not
+    supported, as the indexer reads dim-major pages of whole blocks
+    (`msa_indexer.check_square_pages`) and a shard page holds 1 / shards of
+    one."""
+    raise NotImplementedError(
+        "index-cache shards: the indexer reads dim-major pages of whole blocks"
     )
 
 

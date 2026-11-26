@@ -21,7 +21,13 @@ import numpy as np
 import pytest
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
-from tests.models.minimax_m3.packing import CACHE_DTYPES, PACKING, pack, rounded
+from tests.models.minimax_m3.packing import (
+    CACHE_DTYPES,
+    PACKING,
+    pack_index,
+    pack_index_fp4,
+    rounded,
+)
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, msa_indexer
 from vllm_torchtpu.models.minimax_m3.kernels.msa_indexer import block_scores
 
@@ -60,7 +66,7 @@ def test_matches_reference(
         : num_seqs * PAGES_PER_SEQ
     ].reshape(num_seqs, PAGES_PER_SEQ)
     keys = rounded(rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM)), dtype)
-    cache = pack(keys, dtype)
+    cache = pack_index(keys, dtype)
     index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(
         jnp.bfloat16
     )
@@ -109,11 +115,11 @@ def _served_case(q_lens, ctx_lens, cache_kind, seed):
     raw = rng.standard_normal((num_pages, PAGE, HEAD_DIM))
     if cache_kind == "fp4":
         nib, scale = msa_fp4.quantize(jnp.asarray(raw, jnp.float32))
-        cache = msa_fp4.pack_rows(nib, scale)
+        cache = pack_index_fp4(nib, scale)
         keys = np.asarray(msa_fp4.dequantize(nib, scale))
     else:
         keys = rounded(raw, cache_kind)
-        cache = pack(keys, cache_kind)
+        cache = pack_index(keys, cache_kind)
     index_q = jnp.asarray(rng.standard_normal((num_real + 5, 1, HEAD_DIM))).astype(
         jnp.bfloat16
     )
@@ -232,7 +238,7 @@ def test_fp4_folded_matches_reference(
     nib, scale = msa_fp4.quantize(
         jnp.asarray(rng.standard_normal((NUM_PAGES, PAGE, HEAD_DIM)), jnp.float32)
     )
-    cache = msa_fp4.pack_rows(nib, scale)
+    cache = pack_index_fp4(nib, scale)
     keys = np.asarray(msa_fp4.dequantize(nib, scale))
     index_q = jnp.asarray(rng.standard_normal((num_tokens, 1, HEAD_DIM))).astype(
         jnp.bfloat16
@@ -296,7 +302,7 @@ def test_fp4_folded_prefill_tiles_close_to_reference(pages_per_step):
     )
     scores = block_scores(
         index_q,
-        msa_fp4.pack_rows(nib, scale),
+        pack_index_fp4(nib, scale),
         jnp.asarray(seq_lens),
         jnp.asarray(tables.reshape(-1)),
         jnp.asarray(cu_q),

@@ -25,7 +25,7 @@ import pytest
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from tests.models.minimax_m3.packing import pack
+from tests.models.minimax_m3.packing import pack, pack_index, pack_index_fp4
 from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp, msa_fp4
 
 PAGE, HEAD_DIM, TOPK, DCP, Q_PER_KV = 128, 128, 16, 2, 16
@@ -60,7 +60,7 @@ def _step(rng, q_lens, ctx_lens, pages_per_seq, num_tokens, fp4):
                     rng.integers(0, 16, (num_pages, PAGE, 2 * HEAD_DIM)), jnp.uint8
                 )
             )
-            index = msa_fp4.pack_rows(
+            index = pack_index_fp4(
                 jnp.asarray(
                     rng.integers(0, 16, (num_pages, PAGE, HEAD_DIM)), jnp.uint8
                 ),
@@ -77,7 +77,7 @@ def _step(rng, q_lens, ctx_lens, pages_per_seq, num_tokens, fp4):
         else:
             dt = jnp.float8_e4m3fn
             kv = pack(rng.standard_normal((num_pages, PAGE, 2 * HEAD_DIM)), dt)
-            index = pack(rng.standard_normal((num_pages, PAGE, HEAD_DIM)), dt)
+            index = pack_index(rng.standard_normal((num_pages, PAGE, HEAD_DIM)), dt)
             sc = None
             kv, _, cand = msa_dcp.msa_write_and_candidates_dcp(
                 *x, ik, kv, index, *meta, topk=TOPK, init_blocks=1, local_blocks=1,

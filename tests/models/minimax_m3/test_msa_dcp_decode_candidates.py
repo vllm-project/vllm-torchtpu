@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from tests.models.minimax_m3.packing import pack, rounded
+from tests.models.minimax_m3.packing import pack, pack_index, pack_index_fp4, rounded
 from vllm_torchtpu.models.minimax_m3.kernels import msa, msa_dcp, msa_fp4, msa_indexer
 
 PAGE = 128
@@ -41,9 +41,9 @@ def _case(q_lens, ctx_lens, pages_per_seq, cache_kind, pad, seed, max_seqs=MAX_S
     raw = rng.standard_normal((num_pages, PAGE, HEAD_DIM))
     if cache_kind == "fp4":
         nib, scale = msa_fp4.quantize(jnp.asarray(raw, jnp.float32))
-        cache = msa_fp4.pack_rows(nib, scale)
+        cache = pack_index_fp4(nib, scale)
     else:
-        cache = pack(rounded(raw, cache_kind), cache_kind)
+        cache = pack_index(rounded(raw, cache_kind), cache_kind)
     index_q = jnp.asarray(rng.standard_normal((num_real + pad, 1, HEAD_DIM))).astype(
         jnp.bfloat16
     )
@@ -177,7 +177,7 @@ def _write_caches(cache_kind, num_pages, rng):
     if cache_kind == "fp4":
         nibbles = rng.integers(0, 16, (num_pages, PAGE, 3 * HEAD_DIM))
         kv = msa_fp4.pack_rows(jnp.asarray(nibbles[..., : 2 * HEAD_DIM], jnp.uint8))
-        index = msa_fp4.pack_rows(
+        index = pack_index_fp4(
             jnp.asarray(nibbles[..., 2 * HEAD_DIM :], jnp.uint8),
             jnp.asarray(rng.uniform(0.5, 1.5, (num_pages, PAGE)), jnp.float32),
         )
@@ -190,7 +190,7 @@ def _write_caches(cache_kind, num_pages, rng):
     kv = pack(
         rounded(rng.standard_normal((num_pages, PAGE, 2 * HEAD_DIM)), dtype), dtype
     )
-    index = pack(
+    index = pack_index(
         rounded(rng.standard_normal((num_pages, PAGE, HEAD_DIM)), dtype), dtype
     )
     return kv, index, None

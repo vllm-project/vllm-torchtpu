@@ -21,7 +21,14 @@ import numpy as np
 import pytest
 from jax.sharding import AbstractDevice, AbstractMesh, use_abstract_mesh
 
-from tests.models.minimax_m3.packing import CACHE_DTYPES, PACKING, pack
+from tests.models.minimax_m3.packing import (
+    CACHE_DTYPES,
+    PACKING,
+    pack,
+    pack_index,
+    pack_index_fp4,
+    unpack,
+)
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa,
     msa_fp4,
@@ -91,6 +98,49 @@ def test_matches_xla_scatter(q_lens, ctx_lens, pad_tokens, width, dtype):
     )
     np.testing.assert_array_equal(
         np.asarray(got.astype(jnp.float32)), np.asarray(expected.astype(jnp.float32))
+    )
+
+
+@pytest.mark.parametrize("dtype", CACHE_DTYPES + ["int4"])
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens,pad_tokens",
+    [
+        ([1, 1, 1], [5, 130, 255], 2),
+        ([8, 8, 8], [124, 40, 250], 8),
+        ([300], [70], 0),
+        ([1, 200, 3], [127, 0, 125], 4),
+    ],
+)
+def test_dim_major_matches_token_major(q_lens, ctx_lens, pad_tokens, dtype):
+    """A dim-major write (the index cache's, `Rows.dim_major`) leaves the
+    pages a token-major write leaves, transposed: written slots, zeroed
+    slots past each run, untouched pages."""
+    rng = np.random.default_rng(sum(q_lens) + 7)
+    num_tokens = sum(q_lens) + pad_tokens
+    pages, pos = _batch(q_lens, ctx_lens, rng, pad_tokens)
+    write = functools.partial(
+        msa.write_rows, pages=pages, pos=pos, max_num_seqs=3, interpret=True
+    )
+    if dtype == "int4":
+        init = rng.integers(0, 16, (NUM_PAGES, PAGE, PAGE), dtype=np.uint8)
+        init_scales = rng.random((NUM_PAGES, PAGE)).astype(np.float32)
+        rows = jnp.asarray(rng.integers(0, 16, (num_tokens, PAGE)), jnp.uint8)
+        scales = jnp.asarray(rng.random(num_tokens), jnp.float32)
+        token_major = write(msa_fp4.pack_rows(init, init_scales), rows, scales=scales)
+        got = write(
+            pack_index_fp4(init, init_scales), rows, scales=scales, dim_major=True
+        )
+        want = pack_index_fp4(
+            msa_fp4.unpack_rows(token_major), msa_fp4.folded_scales(token_major)
+        )
+    else:
+        init = rng.standard_normal((NUM_PAGES, PAGE, PAGE)).astype(np.float32)
+        rows = jnp.asarray(rng.standard_normal((num_tokens, PAGE))).astype(dtype)
+        token_major = write(pack(init, dtype), rows)
+        got = write(pack_index(init, dtype), rows, dim_major=True)
+        want = pack_index(unpack(token_major), dtype)
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint8), np.asarray(want).view(np.uint8)
     )
 
 
@@ -389,7 +439,7 @@ def test_fp4_targets_quantize_kernel_matches_xla(heads):
         msa_write.Rows(
             caches[0], jnp.concatenate([k_nib, v_nib], -1).reshape(num_tokens, -1), 4
         ),
-        msa_write.Rows(caches[1], i_nib, 4, i_scale),
+        msa_write.Rows(caches[1], i_nib, 4, i_scale, dim_major=True),
         msa_write.SlotValues(
             caches[2], jnp.stack([k_scale, v_scale], -1).reshape(num_tokens, -1)
         ),
