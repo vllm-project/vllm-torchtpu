@@ -49,7 +49,13 @@ def _reference(qkv, cos_sin, weight, nq, nkv):
 @pytest.mark.parametrize("q_head_major", [False, True])
 @pytest.mark.parametrize(
     "num_tokens,nq,nkv,block_tokens",
-    [(8, 8, 1, 256), (24, 8, 1, 256), (512, 8, 1, 256), (300, 4, 2, 128)],
+    [
+        (8, 8, 1, 256),
+        (24, 8, 1, 256),
+        (512, 8, 1, 256),
+        (300, 4, 2, 128),
+        (1100, 8, 1, 1024),  # sub-blocks, a partial last block
+    ],
 )
 def test_matches_reference(num_tokens, nq, nkv, block_tokens, q_head_major, rotate):
     rng = np.random.default_rng(num_tokens + nq)

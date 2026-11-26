@@ -41,7 +41,10 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
 
-DEFAULT_BLOCK_TOKENS = 256
+DEFAULT_BLOCK_TOKENS = 1024
+SUB_BLOCK_TOKENS = 256
+# Double-buffered input and output blocks stay within this at any head count.
+BLOCK_VMEM_BYTES = 16 * 1024 * 1024
 
 
 def _rope_matrices(head_dim: int, rotary_dim: int) -> tuple[np.ndarray, np.ndarray]:
@@ -82,41 +85,54 @@ def _kernel(
 ):
     dtype = qkv_ref.dtype
     dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
-    cos_sin = cos_sin_ref[...].astype(jnp.bfloat16)
-    cos = dot(cos_sin, factors_ref[0])
-    sin = dot(cos_sin, factors_ref[1])
-    lane = jax.lax.broadcasted_iota(jnp.int32, cos.shape, 1)
-
-    def norm_rope(col, w_row):
-        x = qkv_ref[:, col * head_dim : (col + 1) * head_dim].astype(jnp.float32)
-        variance = jnp.mean(x * x, axis=1, keepdims=True)
-        x = x * jax.lax.rsqrt(variance + eps) * weight_ref[pl.ds(w_row, 1), :]
-        n = x.astype(dtype)
-        partner = dot(n.astype(jnp.bfloat16), partner_ref[...])
-        n = n.astype(jnp.float32)
-        return jnp.where(lane < rotary_dim, n * cos + partner * sin, n).astype(dtype)
-
-    def rotated(x):
-        # msa_fp4.rotate_queries: one bf16 pass, f32 accumulation, then 1 / D.
-        if hadamard_ref is None:
-            return x
-        return (dot(x, hadamard_ref[...]) * (1.0 / head_dim)).astype(dtype)
-
     nq, nkv, d = num_heads, num_kv_heads, head_dim
-    for h in range(nq):
-        if q_head_major:
-            q_ref[h] = rotated(norm_rope(h, h))
-        else:
-            q_ref[:, h * d : (h + 1) * d] = rotated(norm_rope(h, h))
-    for h in range(nkv):
-        k_ref[:, h * d : (h + 1) * d] = norm_rope(nq + h, nq + h)
-        v_ref[:, h * d : (h + 1) * d] = qkv_ref[
-            :, (nq + nkv + h) * d : (nq + nkv + h + 1) * d
-        ]
-        iq_ref[:, h * d : (h + 1) * d] = rotated(
-            norm_rope(nq + 2 * nkv + h, nq + nkv + h)
-        )
-    ik_ref[...] = norm_rope(nq + 3 * nkv, nq + 2 * nkv)
+
+    def rows(r):
+        cos_sin = cos_sin_ref[r, :].astype(jnp.bfloat16)
+        cos = dot(cos_sin, factors_ref[0])
+        sin = dot(cos_sin, factors_ref[1])
+        lane = jax.lax.broadcasted_iota(jnp.int32, cos.shape, 1)
+
+        def norm_rope(col, w_row):
+            x = qkv_ref[r, col * d : (col + 1) * d].astype(jnp.float32)
+            variance = jnp.mean(x * x, axis=1, keepdims=True)
+            x = x * jax.lax.rsqrt(variance + eps) * weight_ref[pl.ds(w_row, 1), :]
+            n = x.astype(dtype)
+            partner = dot(n.astype(jnp.bfloat16), partner_ref[...])
+            n = n.astype(jnp.float32)
+            return jnp.where(lane < rotary_dim, n * cos + partner * sin, n).astype(
+                dtype
+            )
+
+        def rotated(x):
+            # msa_fp4.rotate_queries: one bf16 pass, f32 accumulation, then 1 / D.
+            if hadamard_ref is None:
+                return x
+            return (dot(x, hadamard_ref[...]) * (1.0 / d)).astype(dtype)
+
+        for h in range(nq):
+            if q_head_major:
+                q_ref[h, r, :] = rotated(norm_rope(h, h))
+            else:
+                q_ref[r, h * d : (h + 1) * d] = rotated(norm_rope(h, h))
+        for h in range(nkv):
+            k_ref[r, h * d : (h + 1) * d] = norm_rope(nq + h, nq + h)
+            v_ref[r, h * d : (h + 1) * d] = qkv_ref[
+                r, (nq + nkv + h) * d : (nq + nkv + h + 1) * d
+            ]
+            iq_ref[r, h * d : (h + 1) * d] = rotated(
+                norm_rope(nq + 2 * nkv + h, nq + nkv + h)
+            )
+        ik_ref[r, :] = norm_rope(nq + 3 * nkv, nq + 2 * nkv)
+
+    # Straight-line sub-blocks: one body over a whole large block keeps too
+    # many values live and spills; a loop over them serializes their latency.
+    # A block that is not a multiple runs whole (at 384-416 rows that beat
+    # a 256-row sub-block and a tail).
+    block_t = qkv_ref.shape[0]
+    sub = block_t if block_t % SUB_BLOCK_TOKENS else SUB_BLOCK_TOKENS
+    for start in range(0, block_t, sub):
+        rows(pl.ds(start, sub))
 
 
 @functools.partial(
@@ -168,7 +184,9 @@ def qk_norm_rope(
     rotary_dim = cos_sin.shape[1]
     # Whole-array blocks for small batches (any row count); else multiples
     # of the 16-row bf16 tile, the last block partial.
-    block_t = max(1, min(num_tokens, block_tokens))
+    row_bytes = 4 * qkv.shape[1] * qkv.dtype.itemsize  # in + out, two buffers
+    fit = max(1, BLOCK_VMEM_BYTES // (row_bytes * SUB_BLOCK_TOKENS)) * SUB_BLOCK_TOKENS
+    block_t = max(1, min(num_tokens, block_tokens, fit))
     rows = lambda i: (i, 0)  # noqa: E731
     kv_shape = jax.ShapeDtypeStruct((num_tokens, nkv * d), qkv.dtype)
     if q_head_major:
