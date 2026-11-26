@@ -7215,14 +7215,24 @@ class TPURaidenConnectorWorker:
             if req_ids <= finished:
                 return
             if time.time() >= deadline:
-                if any(
-                    req_id in self._stage3_pending_controller_failures
-                    for req_id in req_ids - finished
-                ):
-                    self._poll_finished(engine)
-                    finished = self._done_recving | self._failed_recving
-                    if req_ids <= finished:
-                        return
+                # The forward reads these blocks next, and a decode request
+                # frees its blocks without delay, so no receive may stay armed
+                # past the inline deadline: cancel every accepted or uncertain
+                # load (even before its own RPC deadline) so it drains below
+                # and surfaces as a load error for recompute.
+                for req_id in sorted(req_ids - finished):
+                    if (
+                        req_id in self._stage3_submitted_loads
+                        and req_id not in self._stage3_terminal_loads
+                        and req_id not in self._stage3_draining_cancelled_loads
+                        and req_id not in self._stage3_inflight_submits
+                        and req_id not in self._stage3_tp_submits
+                        and req_id not in self._stage3_pending_submits
+                    ):
+                        self._cancel_or_drain_stage3_load(engine, req_id)
+                finished = self._done_recving | self._failed_recving
+                if req_ids <= finished:
+                    return
                 draining = sorted(
                     req_id
                     for req_id in req_ids - finished

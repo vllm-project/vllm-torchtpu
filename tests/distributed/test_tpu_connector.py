@@ -9348,6 +9348,62 @@ class TestStage3DmaDrainSafety:
         assert warn_log.call_count == 1
         assert "waiting past inline-load deadline" in warn_log.call_args.args[0]
 
+    @pytest.mark.parametrize("pending_failure_deadline", [None, 1e9])
+    @pytest.mark.parametrize("settle_on_cancel", [True, False])
+    def test_decode_inline_wait_deadline_cancels_unterminated_accepted_load(
+        self, monkeypatch, settle_on_cancel, pending_failure_deadline
+    ):
+        """An inline wait never returns while an accepted receive is armed.
+
+        The model forward runs right after _wait_for_recving returns, and a
+        decode-side request frees its blocks without any delay, so at the
+        inline deadline the receive must be cancelled and drained and its
+        blocks reported for recompute, whether the load was accepted or its
+        uncertain-RPC deadline has not elapsed yet.
+        """
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        worker, engine = self._seeded_decode_worker(
+            dst_req_id="dst-inline-armed",
+            src_req_id="src-inline-armed",
+            uuid=611,
+            blocks=[30, 31],
+        )
+        worker._stage3_controller_accepted.add("dst-inline-armed")
+        if pending_failure_deadline is not None:
+            worker._stage3_pending_controller_failures["dst-inline-armed"] = (
+                pending_failure_deadline
+            )
+        engine.cancel_receive_settled = settle_on_cancel
+        engine.receive_settled = settle_on_cancel
+
+        now_s = [100.0]
+
+        def _fake_time():
+            now_s[0] += 1.0
+            return now_s[0]
+
+        def _fake_sleep(_s):
+            # The in-flight H2D lands while the wait loop drains it.
+            engine.receive_settled = True
+
+        monkeypatch.setattr(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", lambda: 2.0)
+        monkeypatch.setattr(f"{_MOD}.time.time", _fake_time)
+        monkeypatch.setattr(f"{_MOD}.time.sleep", _fake_sleep)
+
+        worker._wait_for_recving({"dst-inline-armed"})
+
+        assert engine.cancel_receive_calls == [611]
+        assert "dst-inline-armed" in worker._failed_recving
+        assert "dst-inline-armed" in worker._stage3_terminal_loads
+        assert worker._stage3_draining_cancelled_loads == {}
+        assert worker._stage3_pending_controller_failures == {}
+        assert worker.get_block_ids_with_load_errors() == {30, 31}
+        # A native terminal replayed after the drain is not re-reported.
+        engine.poll_results.append((["src-inline-armed"], [], []))
+        worker._poll_finished(engine)
+        assert "dst-inline-armed" not in worker._done_recving
+        assert worker.get_block_ids_with_load_errors() == set()
+
     def test_decode_windowed_load_drains_using_root_uuid(self, monkeypatch):
         monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
         worker = _make_raiden_worker(
