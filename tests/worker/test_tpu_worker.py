@@ -492,10 +492,12 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
             patch(
                 "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
             ) as gc_debug,
+            patch("vllm_torchtpu.envs.enable_envs_cache") as envs_cache,
         ):
             result = TPUWorker.compile_or_warm_up_model(worker)
         freeze.assert_called_once_with()
         gc_debug.assert_called_once_with()
+        envs_cache.assert_called_once_with()
         # Speculative decoding warms up at the serving thread count; other
         # models keep the startup count during warm-up.
         assert warmup_threads == [runtime_threads if speculative else 2]
