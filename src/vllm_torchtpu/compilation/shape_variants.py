@@ -372,7 +372,7 @@ def attach_decode_only_runnables(
 _decode_only_runnables: weakref.WeakKeyDictionary[
     Any, dict[int, Callable[..., Any]]
 ] = weakref.WeakKeyDictionary()
-_base_compile_prefixes: weakref.WeakKeyDictionary[torch.nn.Module, str] = (
+_base_compile_prefixes: weakref.WeakKeyDictionary[Any, str] = (
     weakref.WeakKeyDictionary()
 )
 

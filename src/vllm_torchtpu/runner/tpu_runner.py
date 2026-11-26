@@ -990,9 +990,6 @@ class TPUModelRunner(GPUModelRunner):
         # Whether another DP rank ran a decode this step; SrptPrefillScheduler
         # applies VLLM_TPU_SRPT_ATTN_WORK_CAP only while some rank decodes.
         self._dp_step_other_decode = False
-        self._dp_step_has_rpa_mixed = False
-        self._chunk_is_rpa_decode_only = False
-        self._has_rpa_decode_only_graph = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 

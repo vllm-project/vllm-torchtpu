@@ -769,6 +769,7 @@ def test_execute_model_rpa_decode_only_gate(
     )
 
     sched = _scheduler_output(scheduled)
+    sched.scheduled_encoder_inputs = {}
     with pytest.raises(_StopAfterForward):
         TPUModelRunner.execute_model(runner, sched)
 
