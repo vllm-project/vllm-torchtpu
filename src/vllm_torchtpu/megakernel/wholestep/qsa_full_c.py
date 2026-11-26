@@ -261,7 +261,16 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qu_sem", pltpu.SemaphoreType.DMA((3,))),
             ScratchReq("qu_st", pltpu.VMEM((1, 128), I32)),
         ]
-        if self.union_phys:
+        if self.union_phys_mxu:
+            out += [
+                # Every request's main-table row (its first `union_phys_mxu` columns), copied
+                # when the union attention starts: one [1, cols] tile row per request (a
+                # dynamic single-row load of a [nreq, cols] buffer does not lower).
+                ScratchReq("qu_tab", pltpu.VMEM((nreq, 1, self.union_phys_mxu), I32)),
+                ScratchReq("qu_tab_sem", pltpu.SemaphoreType.DMA((nreq,))),
+                ScratchReq("qu_pv", pltpu.VMEM((1, KU), I32)),
+            ]
+        elif self.union_phys:
             out += [
                 ScratchReq("qu_tab", pltpu.VMEM((1, self.pps), I32)),
                 ScratchReq("qu_pv", pltpu.VMEM((1, KU), I32)),
@@ -1554,6 +1563,23 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         rasync = self.req_async_ids
         rbank = self.req_async_bank
 
+        pmxu = self.union_phys_mxu
+        if pmxu:  # the copied columns hold every column a group id below max_groups reaches
+            per_page = ctx.extra[POOL].shape[1] // ua.MICRO
+            assert pmxu == self.pps or pmxu * per_page * self.dcp >= self.max_groups, (
+                pmxu, self.pps, per_page, self.dcp, self.max_groups
+            )
+
+        def tab_copy(q: Any) -> Any:
+            """`union_phys_mxu`: request `q`'s main-table row (first `union_phys_mxu`
+            columns) -> `qu_tab[q]` (started before the request loop, waited in
+            `stage_ids`)."""
+            o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
+            return pltpu.make_async_copy(
+                ctx.extra[MTAB].at[o, pl.ds(q, 1), pl.ds(0, pmxu)], scr["qu_tab"].at[q],
+                scr["qu_tab_sem"].at[q],
+            )
+
         def stage_ids(q: Any, bank: Any, wait: bool = True) -> None:
             """Request `q`'s union ids (physical with `union_phys`) into `qu_row[bank]`.
             `wait=False` (`req_async`): the copies into `qu_row` are left in flight
@@ -1563,7 +1589,37 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             src = scr["qu_id"].at[q, :, pl.ds(uoff, KU)]
             n_u = scr["qu_n"][q, rk]
             with sc("qsa_u_ids", 2):
-                if self.union_phys:
+                if pmxu:
+                    # The request's main-table row (`tab_copy`, in flight since the loop
+                    # began), then its union ids -> physical micro-page ids for every slot a
+                    # tile reads (< ceil(n / 64) * 64 <= ceil(n / 128) * 128).
+                    tab_copy(q).wait()
+                    per_page = ctx.extra[POOL].shape[1] // ua.MICRO
+                    # Table entries are pool block ids: this many bytes hold them.
+                    blocks = ctx.extra[POOL].shape[0]
+                    table_bytes = max(1, -(-(blocks - 1).bit_length() // 8))
+                    # Union ids are groups below the request's last row's visible count:
+                    # only the table chunks those reach are read.
+                    row = scr["qu_tab"].at[q]
+                    if pmxu % 128 == 0:
+                        tab = row
+                        n_tab = ua.table_chunks(
+                            ctx.extra[NVIS][q * T + T - 1], per_page, self.dcp, pmxu
+                        )
+                    else:
+                        tab, n_tab = row[...], None
+
+                    def chunk(c: Any, carry: Any) -> Any:
+                        lo = pl.multiple_of(c * 128, 128)
+                        scr["qu_pv"][:, pl.ds(lo, 128)] = ua.physical_ids(
+                            src[:, pl.ds(lo, 128)], tab, per_page, self.dcp, n_tab,
+                            table_bytes=table_bytes,
+                        )
+                        return carry
+
+                    jax.lax.fori_loop(0, (n_u + 127) // 128, chunk, 0)
+                    src = scr["qu_pv"]
+                elif self.union_phys:
                     # The request's main-table row, then its union ids -> physical micro-page ids for
                     # every slot a tile reads (< ceil(n / 64) * 64 <= ceil(n / 128) * 128).
                     o = ctx.stream.sp.block_ord(l, self.name) if self.n_layers else 0
@@ -1675,6 +1731,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     **(dict(ids_row=bank, stream=stream) if xreq else {}),
                     **(dict(ids_row=bank) if rbank else {}),
                     **(dict(lite=True) if self.uattn_lite else {}),
+                    **(dict(phys_rows=True) if pmxu else {}),
                 )
             if rasync and not rbank:  # request q's ids are read: the next request's go into `qu_row`
 
@@ -1717,6 +1774,9 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return sbase + (n_u * ua.MICRO + ua.TILE - 1) // ua.TILE
 
         n_loop = self._n_live(ctx) if self.skip_idle else nreq
+        if pmxu:  # the table rows of the requests the loop visits, each waited in `stage_ids`
+            for q in range(nreq):
+                pl.when(q < n_loop)(lambda q=q: tab_copy(q).start())
         if rasync:
 
             @pl.when(n_loop > 0)
