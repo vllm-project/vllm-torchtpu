@@ -15,7 +15,9 @@
 
 Every pipeline column traces the same permute program; only the device
 assignment differs, and torch_tpu's compile cache does not key on it. A shared
-cache then hands one column another column's executable.
+cache then hands one column another column's executable. The two stages of a
+column trace it for different local devices, and a restart can swap which host
+holds which stage, so the name also carries the device it runs on.
 """
 
 from types import SimpleNamespace
@@ -28,9 +30,11 @@ pytest.importorskip("torch_tpu")
 from vllm_torchtpu.distributed import pp_shift  # noqa: E402
 
 
-def _built_names(monkeypatch, device_ids):
+def _built_names(monkeypatch, device_ids, local=None):
     calls = []
     monkeypatch.setattr(pp_shift, "_OPS", {})
+    local = device_ids[0] if local is None else local
+    monkeypatch.setattr(pp_shift, "_get_tpu_global_device_id", lambda: local)
     monkeypatch.setattr(pp_shift, "pp_positions", lambda: (0, 1))
     monkeypatch.setattr(
         pp_shift,
@@ -50,9 +54,20 @@ def test_columns_get_distinct_program_names(monkeypatch):
     second = _built_names(monkeypatch, (3, 11))
 
     assert first == [
-        ("vllm_torchtpu::pp_permute_dev2_10", "pp_permute1_dev2_10"),
-        ("vllm_torchtpu::pp_permute2_dev2_10", "pp_permute2_dev2_10"),
+        ("vllm_torchtpu::pp_permute_dev2_10_on2", "pp_permute1_dev2_10_on2"),
+        ("vllm_torchtpu::pp_permute2_dev2_10_on2", "pp_permute2_dev2_10_on2"),
     ]
     assert not {name for pair in first for name in pair} & {
         name for pair in second for name in pair
+    }
+
+
+def test_stages_of_a_column_get_distinct_program_names(monkeypatch):
+    # j-883084e3: restarts warm from the first attempt's per-host cache died
+    # in the hand-off warmup; this name was one cache key on both hosts.
+    first = _built_names(monkeypatch, (6, 14), local=6)
+    last = _built_names(monkeypatch, (6, 14), local=14)
+
+    assert not {name for pair in first for name in pair} & {
+        name for pair in last for name in pair
     }

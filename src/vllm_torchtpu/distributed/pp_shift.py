@@ -130,11 +130,14 @@ def pp_permute_op(mesh: Mesh, num_tensors: int = 1):
     # assignment differs, which torch_tpu's compile cache does not key on: a
     # column restored from a shared cache would load another column's
     # executable ("local device count is 0"). Name the program after its
-    # devices so each column's cache entry is its own.
+    # devices so each column's cache entry is its own. Both stages of a
+    # column trace that program, each for its own device, and a restart may
+    # swap which host holds which stage: also name this process's device.
     devices = "_".join(str(int(d.id)) for d in mesh.devices.flat)
-    shift.__name__ = f"pp_permute{num_tensors}_dev{devices}"
+    tag = f"dev{devices}_on{_get_tpu_global_device_id()}"
+    shift.__name__ = f"pp_permute{num_tensors}_{tag}"
     op = jax_op(
-        f"{name}_dev{devices}",
+        f"{name}_{tag}",
         shift,
         mesh=mesh,
         input_partition_specs=(spec,) * num_tensors,
