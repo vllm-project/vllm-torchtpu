@@ -565,9 +565,20 @@ def _pallas_rpa_kernel_batched(
     decode_query_size: int = 1,
     block_major: bool = False,
     subpage_split: int = 1,
+    decode_only: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Batched-RPA Pallas kernel entry — used by
     `PallasBatchedRPAAttentionBackendImpl`."""
+    rpa_kwargs: dict[str, Any] = {}
+    if decode_query_size > 1:
+        rpa_kwargs["decode_query_size"] = decode_query_size
+    if decode_only:
+        rpa_kwargs["decode_only"] = True
+    rpa_func = (
+        functools.partial(ragged_paged_attention_batched, **rpa_kwargs)
+        if rpa_kwargs
+        else ragged_paged_attention_batched
+    )
     return _pallas_rpa_kernel_impl(
         kv_cache,
         query,
@@ -584,13 +595,7 @@ def _pallas_rpa_kernel_batched(
         mesh=mesh,
         sliding_window=sliding_window,
         skip_kv_update=skip_kv_update,
-        rpa_func=(
-            functools.partial(
-                ragged_paged_attention_batched, decode_query_size=decode_query_size
-            )
-            if decode_query_size > 1
-            else ragged_paged_attention_batched
-        ),
+        rpa_func=rpa_func,
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
@@ -996,6 +1001,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
             and self.kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
         )
         self.rpa_kernel = None
+        # Pre-built in initialize_kernel() when TPU_RPA_DECODE_ONLY_GRAPH is on
+        # and this layer's kernel entry supports static decode_only=True.
+        self.rpa_kernel_decode_only = None
         # Populated by initialize_kernel() before torch.compile traces the
         # model. Forward can then reuse the custom op without resolving a PCP
         # mesh from inside Dynamo's fullgraph capture.
@@ -1050,6 +1058,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         use_pcp_streaming: bool = False,
         cp_kv_cache_interleave_size: int = 0,
         block_major: bool = False,
+        decode_only: bool = False,
     ):
         ctx = get_vllm_model_wrapper_context()
         vllm_config = cast("VllmConfig | None", ctx.vllm_config)
@@ -1076,6 +1085,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             block_major,
             self._subpage_split,
+            decode_only,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1119,6 +1129,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             block_major,
             self._subpage_split,
+            decode_only,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1159,6 +1170,13 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 )
             if "decode_query_size" in entry_params:
                 entry_kwargs["decode_query_size"] = self.decode_query_size
+            if decode_only:
+                if "decode_only" not in entry_params:
+                    raise NotImplementedError(
+                        f"{type(self).__name__} kernel {self._kernel_entry.__name__} "
+                        "does not support decode_only"
+                    )
+                entry_kwargs["decode_only"] = True
             if block_major:
                 if "block_major" not in entry_params:
                     raise NotImplementedError(
@@ -1530,6 +1548,27 @@ class PallasAttentionBackendImpl(AttentionImpl):
             skip_kv_update=skip_kv_update,
             block_major=self._bm_kernel,
         )
+        # Pre-build the decode-only op ahead of torch.compile tracing (and ahead
+        # of warm-start AOT artifact loading) so forward() never registers a new
+        # pallas.jax_op inside Dynamo's fullgraph capture.
+        self.rpa_kernel_decode_only = None
+        if (
+            envs.TPU_RPA_DECODE_ONLY_GRAPH
+            and self.head_size != 64
+            and "decode_only" in inspect.signature(self._kernel_entry).parameters
+        ):
+            self.rpa_kernel_decode_only = self._build_rpa_kernel(
+                q_scale,
+                k_scale,
+                v_scale,
+                skip_kv_update=skip_kv_update,
+                block_major=self._bm_kernel,
+                decode_only=True,
+            )
+
+    def has_rpa_decode_only_kernel(self) -> bool:
+        """Return whether this layer pre-built a decode-only batched RPA op."""
+        return self.rpa_kernel_decode_only is not None
 
     def runs_batched_rpa_schedule(self) -> bool:
         return False
@@ -1704,15 +1743,22 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self._validate_pcp_streaming_support(skip_kv_update)
             assert parallel_config is not None
             cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
-        rpa_kernel = self._build_rpa_kernel(
-            None,
-            layer._k_scale_float if self.kv_cache_quantized_dtype else None,
-            layer._v_scale_float if self.kv_cache_quantized_dtype else None,
-            skip_kv_update=skip_kv_update,
-            use_pcp_streaming=use_pcp_streaming,
-            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
-            block_major=self._bm_kernel,
-        )
+        if (
+            ctx.rpa_decode_only
+            and not use_pcp_streaming
+            and self.rpa_kernel_decode_only is not None
+        ):
+            rpa_kernel = self.rpa_kernel_decode_only
+        else:
+            rpa_kernel = self._build_rpa_kernel(
+                None,
+                layer._k_scale_float if self.kv_cache_quantized_dtype else None,
+                layer._v_scale_float if self.kv_cache_quantized_dtype else None,
+                skip_kv_update=skip_kv_update,
+                use_pcp_streaming=use_pcp_streaming,
+                cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+                block_major=self._bm_kernel,
+            )
 
         # TODO (geyuhao) the support of this API is pending discussion.
         # This line will only influence performance, not functionality

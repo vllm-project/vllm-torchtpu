@@ -133,6 +133,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_PRECOMPILE_PEER_WAIT_S: float = 600.0
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
+    TPU_RPA_DECODE_ONLY_GRAPH: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
@@ -1086,6 +1087,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     or env_bool("USE_PIPELINED_DMA_STAGING")(),
     "USE_PIPELINED_DMA_STAGING": lambda: env_bool("USE_PIPELINED_DMA_STAGING")()
     or env_bool("USE_RPA_PIPELINED_DMA_STAGING")(),
+    # Compile a decode-only backbone graph variant (statically omitting the
+    # batched RPA RpaCase.MIXED / RPAm schedule and kernel launch while
+    # preserving kv_cache input-output aliasing) for pure-decode token buckets
+    # when using --attention-backend CUSTOM. Off by default because each decode
+    # bucket holds a second compiled program in HBM and adds precompile time;
+    # flip default or remove once TPU A/B benchmarks against the always-on
+    # in-kernel empty-step skip settle the net decode-vs-HBM tradeoff.
+    "TPU_RPA_DECODE_ONLY_GRAPH": env_bool("TPU_RPA_DECODE_ONLY_GRAPH"),
     # Enables the block-major KV cache layout for Raiden offloading. Bundles all
     # attention layer fragments into a single contiguous array in HBM, collapsing
     # per-block transfers from F independent DMAs into a single hardware DMA.

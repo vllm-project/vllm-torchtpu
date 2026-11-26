@@ -129,6 +129,24 @@ class FlatModel(nn.Module):
         return WAVE(x)
 
 
+@support_torch_compile(dynamic_arg_dims={"x": 0})
+class DecodeOnlyModel(nn.Module):
+    """Emits 1 WAVE when rpa_decode_only is active, 2 WAVEs otherwise."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            is_rpa_decode_only_active,
+        )
+
+        out = WAVE(x)
+        if not is_rpa_decode_only_active():
+            out = WAVE(out)
+        return out
+
+
 @dataclasses.dataclass
 class FakeExecutable:
     """Picklable stand-in for torch_tpu's compiled executable.
@@ -679,7 +697,8 @@ def test_precompile_backbone_trace_first_env_guards(
         vllm_config=None,
         _pp_handoff=None,
         pcp_manager=None,
-        _backbone_dummy_runs=dummy_runs.append,
+        _backbone_dummy_runs=lambda n, **_kw: dummy_runs.append(n),
+        _rpa_decode_only_buckets=lambda: [],
     )
     runner._backbone_token_paddings = TPUModelRunner._backbone_token_paddings.__get__(
         runner
@@ -699,3 +718,69 @@ def test_precompile_backbone_trace_first_env_guards(
         else:
             assert dummy_runs == [16, 32]
             assert compiled_batches == []
+
+
+def _decode_only_two_pass(cache_root, expect_warm: bool):
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    config, backend = prepare(cache_root)
+    model = build(DecodeOnlyModel, config)
+    decode_buckets = [BUCKETS[0]]
+
+    def run_variant(num_tokens: int, *, rpa_decode_only: bool) -> None:
+        with set_vllm_model_wrapper_context(
+            mesh=None,  # type: ignore[arg-type]
+            vllm_config=config,
+            rpa_decode_only=rpa_decode_only,
+        ):
+            run(model, config, num_tokens)
+
+    with set_current_vllm_config(config):
+        shape_variants.retrace(model, config, prefix_suffix="_decode_only")
+        with shape_variants.warmup(
+            allowed_sizes=frozenset(decode_buckets),
+            cache_tag="decode_only",
+        ) as decode_session:
+            for size in decode_buckets:
+                run_variant(size, rpa_decode_only=True)
+        decode_runnables = shape_variants.collect_variant_runnables(
+            decode_session, prefix_suffix="_decode_only"
+        )
+        shape_variants.retrace(model, config)
+
+        with shape_variants.warmup() as mixed_session:
+            for size in BUCKETS:
+                run_variant(size, rpa_decode_only=False)
+
+    attached = shape_variants.attach_decode_only_runnables(
+        mixed_session, decode_runnables
+    )
+    assert attached == len(decode_buckets)
+
+    if expect_warm:
+        assert backend.compiled == []
+    else:
+        assert backend.compiled == [
+            (BUCKETS[0], 1),
+            *((bucket, 2) for bucket in BUCKETS),
+        ]
+
+    CALLS.clear()
+    run_variant(BUCKETS[0], rpa_decode_only=True)
+    run_variant(BUCKETS[0], rpa_decode_only=False)
+    run_variant(BUCKETS[1], rpa_decode_only=True)
+    run_variant(BUCKETS[2], rpa_decode_only=False)
+    assert [
+        (BUCKETS[0], 1),
+        (BUCKETS[0], 2),
+        (BUCKETS[1], 2),
+        (BUCKETS[2], 2),
+    ] == CALLS
+
+
+def test_decode_only_graph_two_pass_cold_and_warm(tmp_path):
+    """Real vLLM pipeline compiles, caches, reloads, and dispatches decode-only."""
+    in_child(partial(_decode_only_two_pass, str(tmp_path), False))
+    in_child(partial(_decode_only_two_pass, str(tmp_path), True))

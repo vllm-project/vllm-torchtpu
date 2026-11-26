@@ -29,10 +29,13 @@ to build only the buckets its guards accept, and a bucket it refuses is compiled
 by a later trace and handed back through :class:`BucketExecutables`. The graph
 that stays live therefore ends up with one executable per bucket.
 
-Nothing here runs at serving time: dispatch stays vLLM's own
-(``PiecewiseBackend.__call__`` picks ``range_entries[Range(n, n)].runnable``),
-and each bucket is still compiled exactly once, so the number of TPU programs --
-each holding an HBM program region for the life of the process -- is unchanged.
+Nothing here runs at serving time for standard shape specialization: dispatch
+stays vLLM's own (``PiecewiseBackend.__call__`` picks
+``range_entries[Range(n, n)].runnable``), and each bucket is compiled once.
+An opt-in variant overlay (``TPU_RPA_DECODE_ONLY_GRAPH=1``) may additionally
+attach a second, decode-only executable onto decode-sized buckets (dispatched
+via :func:`decode_only_runnable` when the wrapper context requests it), which
+adds one TPU program region per covered decode bucket.
 Only the Dynamo traces multiply, by one per structurally distinct group.
 
 The partition follows from the guards alone, so every DP/TP rank derives the
@@ -65,7 +68,7 @@ class ShapeSpecializationError(RuntimeError):
 
 
 class _UncompiledRunnable:
-    """Placeholder for a bucket refused by a trace; never executed."""
+    """Placeholder for a bucket refused or skipped by a trace; never executed."""
 
     def __init__(self, message: str) -> None:
         self._message = message
@@ -203,12 +206,20 @@ class BucketExecutables:
     executable, and so one HBM program region, per bucket.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        allowed_sizes: frozenset[int] | None = None,
+        cache_tag: str | None = None,
+    ) -> None:
         self._runnables: dict[
             tuple[str | None, str], tuple[Callable[..., Any], tuple]
         ] = {}
         self.refused: set[int] = set()
         self.traces = 0
+        self.allowed_sizes = allowed_sizes
+        self.cache_tag = cache_tag
+        self.backends: list[tuple[int, Any]] = []
 
     def get(
         self, cache_dir: str | None, key: str, graph: fx.GraphModule
@@ -255,15 +266,121 @@ _session: BucketExecutables | None = None
 
 
 @contextlib.contextmanager
-def warmup() -> Iterator[BucketExecutables]:
+def warmup(
+    *,
+    allowed_sizes: frozenset[int] | None = None,
+    cache_tag: str | None = None,
+) -> Iterator[BucketExecutables]:
     """Scope in which traces of one model may hand buckets to one another."""
     global _session
     assert _session is None, "nested shape-specialization warmups"
-    _session = BucketExecutables()
+    _session = BucketExecutables(allowed_sizes=allowed_sizes, cache_tag=cache_tag)
     try:
         yield _session
     finally:
         _session = None
+
+
+def skipped_runnable(key: str, size: int | None, tag: str | None) -> Callable[..., Any]:
+    """Placeholder for a bucket excluded by a variant's allowed_sizes."""
+    return _UncompiledRunnable(f"{key} (bucket {size}) was skipped by variant {tag!r}")
+
+
+def register_backend(backend: Any) -> None:
+    """Record a PiecewiseBackend instantiated during an active warmup session."""
+    if _session is not None:
+        _session.backends.append((_session.traces, backend))
+
+
+def collect_variant_runnables(
+    session: BucketExecutables,
+    *,
+    prefix_suffix: str = "",
+) -> dict[tuple[str, int, int], tuple[Callable[..., Any], tuple]]:
+    """Collect compiled `(base_prefix, subgraph_idx, size)` variant entries."""
+    collected: dict[tuple[str, int, int], tuple[Callable[..., Any], tuple]] = {}
+    for _, backend in session.backends:
+        assert backend.graph is not None, (
+            "collect_variant_runnables requires an FX graph (mega-AOT is unsupported)"
+        )
+        prefix = backend.vllm_backend.prefix
+        base_prefix = prefix.removesuffix(prefix_suffix) if prefix_suffix else prefix
+        sig = _signature(backend.graph)
+        for entry in backend.range_entries.values():
+            if not entry.compiled or not entry.compile_range.is_single_size():
+                continue
+            runnable = entry.runnable
+            if runnable is None or isinstance(runnable, _UncompiledRunnable):
+                continue
+            size = entry.compile_range.start
+            if session.allowed_sizes is not None and size not in session.allowed_sizes:
+                continue
+            collected[(base_prefix, backend.piecewise_compile_index, size)] = (
+                runnable,
+                sig,
+            )
+    return collected
+
+
+def attach_decode_only_runnables(
+    session: BucketExecutables,
+    decode_runnables: dict[tuple[str, int, int], tuple[Callable[..., Any], tuple]],
+) -> int:
+    """Attach decode-only runnables onto live PiecewiseBackends with sig check."""
+    attached = 0
+    for trace_idx, backend in session.backends:
+        if trace_idx != session.traces:
+            continue
+        assert backend.graph is not None, (
+            "attach_decode_only_runnables requires an FX graph "
+            "(mega-AOT is unsupported)"
+        )
+        prefix = backend.vllm_backend.prefix
+        sig = _signature(backend.graph)
+        per_size: dict[int, Callable[..., Any]] = {}
+        for entry in backend.range_entries.values():
+            if not entry.compile_range.is_single_size():
+                continue
+            size = entry.compile_range.start
+            found = decode_runnables.get(
+                (prefix, backend.piecewise_compile_index, size)
+            )
+            if found is None:
+                continue
+            runnable, decode_sig = found
+            if decode_sig != sig:
+                raise ShapeSpecializationError(
+                    f"decode-only graph for subgraph {backend.piecewise_compile_index} "
+                    f"bucket {size} has mismatched inputs ({decode_sig} vs {sig})"
+                )
+            per_size[size] = runnable
+            attached += 1
+        if per_size:
+            backend._tpu_decode_only_runnables = per_size
+    if attached != len(decode_runnables):
+        raise ShapeSpecializationError(
+            f"attached {attached} decode-only entries out of "
+            f"{len(decode_runnables)} compiled"
+        )
+    return attached
+
+
+def decode_only_runnable(
+    backend: Any, runtime_shape: int | None
+) -> Callable[..., Any] | None:
+    """Return `backend`'s decode-only runnable for `runtime_shape` when active."""
+    if runtime_shape is None:
+        return None
+    decode_runnables = getattr(backend, "_tpu_decode_only_runnables", None)
+    if decode_runnables is None:
+        return None
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        is_rpa_decode_only_active,
+    )
+
+    if not is_rpa_decode_only_active():
+        return None
+    return decode_runnables.get(runtime_shape)
 
 
 def runnable_for(
@@ -278,6 +395,14 @@ def runnable_for(
     Refusing here leaves the bucket to the trace that owns it, which is the
     only one that can rebuild a wrapper matching the executable.
     """
+    if (
+        _session is not None
+        and _session.allowed_sizes is not None
+        and size is not None
+        and size not in _session.allowed_sizes
+    ):
+        return skipped_runnable(key, size, _session.cache_tag)
+
     ready = _session.get(cache_dir, key, graph) if _session else None
     if ready is not None:
         logger.info("[shape-variants] %s handed over by an earlier trace", key)
@@ -325,10 +450,19 @@ def aot_cache_tag() -> str | None:
     warm start. None outside a warmup, which keeps the key of every other
     compiled module exactly as it was.
     """
-    return f"trace{_session.traces}" if _session is not None else None
+    if _session is None:
+        return None
+    if _session.cache_tag:
+        return f"{_session.cache_tag}_trace{_session.traces}"
+    return f"trace{_session.traces}"
 
 
-def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
+def retrace(
+    model: torch.nn.Module,
+    vllm_config: VllmConfig,
+    *,
+    prefix_suffix: str = "",
+) -> None:
     """Give the model's compiled modules a fresh, untraced torch.compile wrapper.
 
     ``VllmBackend`` refuses a second call ("VllmBackend can only be called
@@ -362,6 +496,13 @@ def retrace(model: torch.nn.Module, vllm_config: VllmConfig) -> None:
     )
     for wrapper in wrappers:
         wrapper.cleanup()  # drop its bytecode hook before replacing it
+        base_prefix = getattr(
+            wrapper, "_tpu_base_compile_prefix", wrapper._compile_prefix
+        )
+        wrapper._tpu_base_compile_prefix = base_prefix
+        wrapper._compile_prefix = (
+            f"{base_prefix}{prefix_suffix}" if prefix_suffix else base_prefix
+        )
 
     # reset_compile_wrapper blanks the cache dirs, which the next backend call
     # recomputes from the files Dynamo inlined -- a trace that inlines a
@@ -454,6 +595,16 @@ def defer(backend: Any) -> None:
         size = (
             entry.compile_range.start if entry.compile_range.is_single_size() else None
         )
+        if (
+            _session.allowed_sizes is not None
+            and size is not None
+            and size not in _session.allowed_sizes
+        ):
+            entry._tpu_deferred = "skip"
+            entry._tpu_skip_tag = _session.cache_tag
+            entry.runnable = placeholder(size)
+            entry.compiled = True
+            continue
         subgraph_bucket = (
             (backend.piecewise_compile_index, size) if size is not None else None
         )

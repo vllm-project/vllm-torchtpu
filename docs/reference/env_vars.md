@@ -115,6 +115,7 @@ Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_
 | `TPU_SPARSE_MLA_ROPE_LAYOUT` | `"sparsecore"` | Memory layout for Sparse MLA RoPE KV cache (`"sparsecore"` or `"tc"`). |
 | `TPU_SPARSE_MLA_CHUNK_TOKENS` | `None` | Query-token chunk size for Sparse MLA attention (each chunk gathers its tokens' top-k KV rows into one buffer and attends over it; unset keeps the kernel default of `64`). |
 | `USE_RPA_PIPELINED_DMA_STAGING` | `False` | Enables pipelined DMA staging in Ragged Paged Attention. |
+| `TPU_RPA_DECODE_ONLY_GRAPH` | `False` | Precompiles a second, decode-only backbone graph variant (omitting `RpaCase.MIXED` / `RPAm` while keeping `kv_cache` aliasing) for decode-sized buckets when `--attention-backend CUSTOM` is active. Opt-in while evaluating HBM/startup overhead vs. the always-on in-kernel empty-step skip. Incompatible with `VLLM_USE_MEGA_AOT_ARTIFACT=1`; self-disables with a warning under eager mode, `TPU_KERNEL_ITER_MODE=1`, PCP, block-major KV bundles, or models with no eligible batched-RPA layers. |
 
 ---
 
