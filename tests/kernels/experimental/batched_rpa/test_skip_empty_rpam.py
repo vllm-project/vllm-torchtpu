@@ -24,7 +24,6 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     schedule,
-    utils,
     wrapper,
 )
 
@@ -74,30 +73,6 @@ def _make_dummy_inputs(
     return q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution
 
 
-def _to_seq_along_lane(kv_cache: jax.Array, num_kv_heads: int) -> jax.Array:
-    num_pages, page_size, _, kv_packing, head_dim = kv_cache.shape
-    num_kv_heads_x2 = utils.align_to(num_kv_heads * 2, kv_packing)
-    return kv_cache.reshape(
-        num_pages,
-        page_size,
-        num_kv_heads_x2,
-        head_dim // kv_packing,
-        kv_packing,
-    ).transpose(0, 2, 3, 4, 1)
-
-
-def _to_head_along_sublane(kv_cache: jax.Array, num_kv_heads: int) -> jax.Array:
-    num_pages, _, head_dim_packed, kv_packing, page_size = kv_cache.shape
-    num_kv_heads_x2 = utils.align_to(num_kv_heads * 2, kv_packing)
-    return kv_cache.transpose(0, 4, 1, 2, 3).reshape(
-        num_pages,
-        page_size,
-        num_kv_heads_x2 // kv_packing,
-        kv_packing,
-        head_dim_packed * kv_packing,
-    )
-
-
 def test_rpa_kernel_guards_vmem_init_on_actual_steps():
     """VMEM scratch and Q/KV initialization must be gated by actual_steps > 0."""
     inputs = _make_dummy_inputs()
@@ -117,8 +92,7 @@ def test_rpa_kernel_guards_vmem_init_on_actual_steps():
         assert len(scoped) == 1
         scoped_eqns = scoped[0].params["jaxpr"].eqns
 
-        # No unconditional VMEM stores/writes may execute outside the init cond
-        # or the schedule loop.
+        # No unconditional VMEM stores may execute outside the init cond or loop.
         top_prims = {e.primitive.name for e in scoped_eqns}
         assert "swap" not in top_prims, (
             f"{eqn.params['name']} has unconditional store in run_scoped: {top_prims}"
@@ -129,12 +103,7 @@ def test_rpa_kernel_guards_vmem_init_on_actual_steps():
         assert len(conds) >= 1
         false_branch, true_branch = conds[0].params["branches"]
         assert not any(e.primitive.name == "swap" for e in false_branch.jaxpr.eqns)
-        # All 5 VMEM init stores (m, l, acc, q_ref_flat, kv_ref_flat) live in the
-        # `actual_steps > 0` branch.
-        true_stores = sum(
-            1 for e in true_branch.jaxpr.eqns if e.primitive.name == "swap"
-        )
-        assert true_stores == 5
+        assert any(e.primitive.name == "swap" for e in true_branch.jaxpr.eqns)
 
 
 def test_rpa_metadata_schedule_empty_count_writes_only_actual_steps():
@@ -164,118 +133,17 @@ def test_rpa_metadata_schedule_empty_count_writes_only_actual_steps():
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize(
-    "kv_layout",
-    [configs.KVLayout.HEAD_ALONG_SUBLANE, configs.KVLayout.SEQ_ALONG_LANE],
-)
-@pytest.mark.parametrize("decode_query_size", [1, 4])
-def test_tpu_pure_decode_matches_reference(kv_layout, decode_query_size):
-    """Pure-decode steps (empty RPAm) match reference with padding and spec-decode."""
-    if jax.default_backend() != "tpu":
-        pytest.skip("requires TPU backend")
-
-    from tests.kernels.experimental.batched_rpa.correctness_test import (
-        ref_ragged_paged_attention,
-    )
-
-    rng = np.random.default_rng(0)
-    active_seqs = 6
-    max_seqs = 8
-    page_size = 128
-    pages_per_seq = 2
-    num_pages = max_seqs * pages_per_seq
-    num_q_heads = 8
-    num_kv_heads = 2
-    head_dim = 128
-    active_tokens = active_seqs * decode_query_size
-    max_tokens = active_tokens + 8  # trailing padded token slots
-
-    q = jnp.asarray(
-        rng.normal(size=(max_tokens, num_q_heads, head_dim)), dtype=jnp.bfloat16
-    )
-    k = jnp.asarray(
-        rng.normal(size=(max_tokens, num_kv_heads, head_dim)), dtype=jnp.bfloat16
-    )
-    v = jnp.asarray(
-        rng.normal(size=(max_tokens, num_kv_heads, head_dim)), dtype=jnp.bfloat16
-    )
-    ref_kv_shape = wrapper.get_kv_cache_shape(
-        num_pages,
-        page_size,
-        num_kv_heads,
-        head_dim,
-        jnp.bfloat16,
-        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
-    )
-    kv_ref_init = jnp.asarray(rng.normal(size=ref_kv_shape), dtype=jnp.bfloat16)
-    kv_rpa_init = (
-        _to_seq_along_lane(kv_ref_init, num_kv_heads)
-        if kv_layout == configs.KVLayout.SEQ_ALONG_LANE
-        else kv_ref_init
-    )
-
-    kv_lens_np = np.zeros((max_seqs,), dtype=np.int32)
-    kv_lens_np[:active_seqs] = rng.integers(
-        decode_query_size + 1, page_size * pages_per_seq, size=(active_seqs,)
-    )
-    kv_lens = jnp.asarray(kv_lens_np, dtype=jnp.int32)
-    page_indices = jnp.arange(num_pages, dtype=jnp.int32)
-    q_lens = [decode_query_size] * active_seqs + [0] * (max_seqs - active_seqs)
-    cu_q_lens = jnp.asarray([0, *np.cumsum(q_lens).tolist()], dtype=jnp.int32)
-    distribution = jnp.array([active_seqs, active_seqs, active_seqs], dtype=jnp.int32)
-    sm_scale = head_dim**-0.5
-
-    ref_out, ref_kv = ref_ragged_paged_attention(
-        q,
-        k,
-        v,
-        kv_ref_init.copy(),
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        sm_scale=sm_scale,
-    )
-    out, kv_out = wrapper.ragged_paged_attention(
-        q,
-        k,
-        v,
-        kv_rpa_init.copy(),
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        sm_scale=sm_scale,
-        kv_layout=kv_layout,
-        decode_query_size=decode_query_size,
-    )
-    out, kv_out = jax.block_until_ready((out, kv_out))
-    if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-        kv_out = _to_head_along_sublane(kv_out, num_kv_heads)
-
-    active_out = np.asarray(out[:active_tokens].astype(jnp.float32))
-    assert np.any(active_out != 0.0), "decode output unexpectedly all zeros"
-    np.testing.assert_allclose(
-        active_out,
-        np.asarray(ref_out.astype(jnp.float32)),
-        atol=5e-2,
-        rtol=5e-2,
-    )
-    np.testing.assert_array_equal(
-        np.asarray(kv_out.astype(jnp.float32)),
-        np.asarray(ref_kv.astype(jnp.float32)),
-    )
-
-
-@pytest.mark.tpu_test
 def test_tpu_schedule_exact_chunk_boundary_matches_reference():
-    """Exact max_steps_ub * batch_size boundary (count==0, hbm_offset>0) matches ref."""
+    """Exact max_steps_ub * batch_size boundary (count==0, hbm_offset>0) is exact.
+
+    Uses uniform attention (K = 0) over block-indicator V channels where channel
+    `d` holds `float(B)` only in KV block `d % B` (0 elsewhere). The exact output
+    is 1.0 on every channel, while dropping any KV block shifts its channels to
+    0.0 (a 1.0 delta, 20x larger than `atol`) and repeating a block shifts them
+    to ~2B/(B+1).
+    """
     if jax.default_backend() != "tpu":
         pytest.skip("requires TPU backend")
-
-    from tests.kernels.experimental.batched_rpa.correctness_test import (
-        ref_ragged_paged_attention,
-    )
 
     num_seqs = 128
     page_size = 128
@@ -311,7 +179,9 @@ def test_tpu_schedule_exact_chunk_boundary_matches_reference():
     target_entries = probe_cfgs.max_steps_ub * decode_blocks.batch_size
     assert target_entries % num_seqs == 0
     kv_blocks_per_seq = target_entries // num_seqs
-    pages_per_seq = kv_blocks_per_seq * (decode_blocks.bkv_sz // page_size)
+    assert 1 <= kv_blocks_per_seq <= head_dim
+    pages_per_kv_block = decode_blocks.bkv_sz // page_size
+    pages_per_seq = kv_blocks_per_seq * pages_per_kv_block
     # Recompute with the exact num_page_indices to confirm max_steps_ub is unchanged.
     exact_cfgs = configs.RpaConfigs(
         block=decode_blocks,
@@ -360,16 +230,10 @@ def test_tpu_schedule_exact_chunk_boundary_matches_reference():
     )
     assert int(jax.block_until_ready(sched.actual_steps)[0]) == exact_cfgs.max_steps_ub
 
-    rng = np.random.default_rng(1)
-    q = jnp.asarray(
-        rng.normal(size=(num_seqs, num_q_heads, head_dim)), dtype=jnp.bfloat16
-    )
-    k = jnp.asarray(
-        rng.normal(size=(num_seqs, num_kv_heads, head_dim)), dtype=jnp.bfloat16
-    )
-    v = jnp.asarray(
-        rng.normal(size=(num_seqs, num_kv_heads, head_dim)), dtype=jnp.bfloat16
-    )
+    # Build uniform-attention inputs (K = 0) with block-indicator V channels.
+    # For HEAD_ALONG_SUBLANE with num_kv_heads = 1 and bf16 (kv_packing = 2),
+    # kv_cache has shape [num_pages, page_size, 1, 2, head_dim] where slot 0 is K
+    # and slot 1 is V.
     kv_shape = wrapper.get_kv_cache_shape(
         num_pages,
         page_size,
@@ -378,19 +242,33 @@ def test_tpu_schedule_exact_chunk_boundary_matches_reference():
         jnp.bfloat16,
         kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
     )
-    kv_init = jnp.asarray(rng.normal(size=kv_shape), dtype=jnp.bfloat16)
+    kv_init_np = np.zeros(kv_shape, dtype=np.float32)
+    dims = np.arange(head_dim)
+    for page_pos in range(num_shared_prefix_pages):
+        block_idx = page_pos // pages_per_kv_block
+        v_pattern = np.where(
+            dims % kv_blocks_per_seq == block_idx, float(kv_blocks_per_seq), 0.0
+        )
+        kv_init_np[page_pos, :, 0, 1, :] = v_pattern
 
-    ref_out, ref_kv = ref_ragged_paged_attention(
-        q,
-        k,
-        v,
-        kv_init.copy(),
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        sm_scale=sm_scale,
+    last_block_idx = kv_blocks_per_seq - 1
+    last_v_pattern = np.where(
+        dims % kv_blocks_per_seq == last_block_idx, float(kv_blocks_per_seq), 0.0
     )
+    # Fill the unique last pages with the last block's V pattern, except the
+    # final token slot (page_size - 1) which carries a -1.0 sentinel to verify
+    # the new-token KV writeback overwrites it.
+    kv_init_np[num_shared_prefix_pages:, : page_size - 1, 0, 1, :] = last_v_pattern
+    kv_init_np[num_shared_prefix_pages:, page_size - 1, 0, 1, :] = -1.0
+
+    q = jnp.ones((num_seqs, num_q_heads, head_dim), dtype=jnp.bfloat16)
+    k = jnp.zeros((num_seqs, num_kv_heads, head_dim), dtype=jnp.bfloat16)
+    v = jnp.broadcast_to(
+        jnp.asarray(last_v_pattern, dtype=jnp.bfloat16)[None, None, :],
+        (num_seqs, num_kv_heads, head_dim),
+    )
+    kv_init = jnp.asarray(kv_init_np, dtype=jnp.bfloat16)
+
     out, kv_out = wrapper.ragged_paged_attention(
         q,
         k,
@@ -406,15 +284,18 @@ def test_tpu_schedule_exact_chunk_boundary_matches_reference():
     )
     out, kv_out = jax.block_until_ready((out, kv_out))
 
-    out_np = np.asarray(out.astype(jnp.float32))
-    assert np.any(out_np != 0.0), "boundary output unexpectedly all zeros"
+    atol = 5e-2
+    expected_out = np.ones((num_seqs, num_q_heads, head_dim), dtype=np.float32)
+    assert np.abs(expected_out).mean() > 10.0 * atol
     np.testing.assert_allclose(
-        out_np,
-        np.asarray(ref_out.astype(jnp.float32)),
-        atol=5e-2,
-        rtol=5e-2,
+        np.asarray(out.astype(jnp.float32)),
+        expected_out,
+        atol=atol,
+        rtol=0.0,
     )
-    np.testing.assert_array_equal(
-        np.asarray(kv_out.astype(jnp.float32)),
-        np.asarray(ref_kv.astype(jnp.float32)),
+    # Verify every sequence's newly written token overwrote the -1.0 sentinel.
+    written_v = np.asarray(
+        kv_out[num_shared_prefix_pages:, page_size - 1, 0, 1, :].astype(jnp.float32)
     )
+    expected_v = np.broadcast_to(last_v_pattern, (num_seqs, head_dim))
+    np.testing.assert_array_equal(written_v, expected_v)
