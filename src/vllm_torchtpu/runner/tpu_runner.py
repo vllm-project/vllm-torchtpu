@@ -1112,6 +1112,8 @@ class TPUModelRunner(GPUModelRunner):
         # Last upload per `_upload_unless_unchanged` slot:
         # (key, device tensor, host source).
         self._h2d_reuse: dict[str, tuple[tuple, torch.Tensor, torch.Tensor]] = {}
+        # `_padded_sampling_params`: (key, device uploads, their host sources).
+        self._sampling_params_upload: tuple[tuple, tuple, tuple] | None = None
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config
@@ -8752,6 +8754,20 @@ class TPUModelRunner(GPUModelRunner):
         dtype: torch.dtype,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Steady decode repeats the same requests' parameters step after step;
+        # reuse the last upload while they match (consumers only read them).
+        batch = self.input_batch
+        key = (
+            padded_num_reqs,
+            dtype,
+            device,
+            batch.temperature_cpu[cur_start_idx:cur_end_idx].tobytes(),
+            batch.top_k_cpu[cur_start_idx:cur_end_idx].tobytes(),
+            batch.top_p_cpu[cur_start_idx:cur_end_idx].tobytes(),
+        )
+        cached = self._sampling_params_upload
+        if cached is not None and cached[0] == key:
+            return cached[1]
         # Stage [padded_num_reqs] on CPU with neutral padding, then use one
         # fixed-shape H2D copy per tensor to keep decode shape-stable.
         num_active_reqs = cur_end_idx - cur_start_idx
@@ -8774,11 +8790,15 @@ class TPUModelRunner(GPUModelRunner):
             self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
         )
 
-        return (
+        uploads = (
             temps_cpu.unsqueeze(1).to(device, non_blocking=True),
             top_k_cpu.unsqueeze(1).to(device, non_blocking=True),
             top_p_cpu.unsqueeze(1).to(device, non_blocking=True),
         )
+        # The host tensors stay referenced while their non-blocking uploads
+        # may still read them.
+        self._sampling_params_upload = (key, uploads, (temps_cpu, top_k_cpu, top_p_cpu))
+        return uploads
 
     def _topk_candidate_blocks(self) -> int:
         """Returns TPU_SAMPLER_TOPK_CANDIDATES if the vocab allows it, else 0."""
