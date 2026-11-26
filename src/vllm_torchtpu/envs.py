@@ -178,6 +178,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_HC_FP8: bool = False
     VLLM_TPU_MK_ALLOW_FALLBACK: bool = False
     VLLM_TPU_MK_SCATTER_DEEP: bool = False
+    VLLM_TPU_VOCAB_BOUNDS_INT32: bool = False
     VLLM_TPU_MK_STACKED_MAMBA_OPERANDS: bool = False
     VLLM_TPU_MK_IO_LEAN: str = ""
     VLLM_TPU_MK_IO_LEAN_MAX_ROWS: int = 48
@@ -1323,6 +1324,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whole-step GDN checkpoint scatter: 16 staging slots / 12 loads in flight from 64
     # checkpoints (the default deep ring starts at 144). Same pool bytes.
     "VLLM_TPU_MK_SCATTER_DEEP": env_bool("VLLM_TPU_MK_SCATTER_DEEP"),
+    # VocabParallelEmbedding's five shard bounds registered as int32 buffers instead of
+    # int64. Each int64 buffer is an s64 scalar operand of every program that embeds
+    # (target forward, MTP draft programs), split serially before the first op. The
+    # bounds are vocab indices (< 2**31) and the masked ids are the same; off by default
+    # because the operand dtypes, and so the compiled programs, change.
+    "VLLM_TPU_VOCAB_BOUNDS_INT32": env_bool("VLLM_TPU_VOCAB_BOUNDS_INT32"),
     # Whole-step megakernel with VLLM_TPU_STAGED_WALK_STACKED: the GDN layers' metadata go
     # to the call as the walk's two stacks + a row index + the shared read offsets /
     # query_start_loc / seq_lens (6 operands instead of 5 per GDN layer). Same values.
