@@ -273,6 +273,13 @@ class WriteBackPolicy:
     # stored before HBM evicted them. Resident chunks are only refreshed when
     # offered (prepare_store dedup), which is the victim-cache behaviour.
     hold_all_chunks: bool = False
+    # Per-block only: keep the host tier exclusive of HBM. Once a load from
+    # the host lands in HBM, the host copy is erased (Raiden
+    # `KVCacheStore.erase`), so the host holds only blocks HBM does not. The
+    # loaded chunk is stored again when HBM evicts it, which needs every
+    # referenced chunk held: implies `hold_all_chunks`. A Raiden wheel without
+    # `erase` logs a warning and keeps the host copies (inclusive tier).
+    exclusive: bool = False
 
     @classmethod
     def from_extra_config(cls, extra_config: Mapping) -> WriteBackPolicy | None:
@@ -302,6 +309,10 @@ class WriteBackPolicy:
             raise ValueError(
                 f"store_policy hold_all_chunks needs granularity 'block': {policy!r}"
             )
+        if written.exclusive and written.granularity != "block":
+            raise ValueError(
+                f"store_policy exclusive needs granularity 'block': {policy!r}"
+            )
         if written.late_store and written.granularity != "block":
             raise ValueError(
                 f"store_policy late_store needs granularity 'block': {policy!r}"
@@ -311,6 +322,10 @@ class WriteBackPolicy:
     @property
     def per_block(self) -> bool:
         return self.granularity == "block"
+
+    @property
+    def holds_all_chunks(self) -> bool:
+        return self.per_block and (self.hold_all_chunks or self.exclusive)
 
 
 def _allocated_block_ids(scheduler_output: SchedulerOutput) -> set[int]:
@@ -376,6 +391,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._fence_pending: dict[int, _ParkedStore] = {}
         extra_config = getattr(spec, "extra_config", None) or {}
         self._write_back = WriteBackPolicy.from_extra_config(extra_config)
+        if self._write_back is not None and self._write_back.exclusive:
+            self._raiden_manager.enable_exclusive()
         # How deep into the oldest free blocks an allocation of n blocks may
         # look for consecutive ids (`contiguous_alloc`); <= 1 turns it off.
         self._contiguous_alloc_scan_factor = int(
@@ -545,7 +562,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             self.config, "offload_prompt_only", False
         )
         policy = self._write_back
-        hold_all = policy is not None and policy.per_block and policy.hold_all_chunks
+        hold_all = policy is not None and policy.holds_all_chunks
         blocks: set[int] = set()
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
@@ -633,7 +650,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 "Raiden offload stats: drop blocks hit=%d fresh=%d | lookups "
                 "partial=%d stale_head=%d (%d tokens behind a missing head) | "
                 "store keys offered=%d resident=%d new=%d | jobs ok=%d failed=%d "
-                "cancelled=%d (%d keys) | refreshed entries=%d",
+                "cancelled=%d (%d keys) | refreshed entries=%d | exclusive erase "
+                "calls=%d entries=%d",
                 c["drop_blocks_hit"],
                 c["drop_blocks_fresh"],
                 c["lookup_partial"],
@@ -647,6 +665,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 mgr_stats.get("store_jobs_cancelled", 0),
                 mgr_stats.get("store_keys_cancelled", 0),
                 mgr_stats.get("refreshed_entries", 0),
+                mgr_stats.get("exclusive_erase_calls", 0),
+                mgr_stats.get("exclusive_erased_entries", 0),
             )
             logger.info(
                 "Raiden offload flush stats: drains %d calls %d jobs %.1f ms | "
@@ -849,7 +869,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         restored afterwards (later chunks of the same holder still store)."""
         allowed = getattr(self, "_wb_allowed", None) or {}
         policy = self._write_back
-        hold_all = policy is not None and policy.per_block and policy.hold_all_chunks
+        hold_all = policy is not None and policy.holds_all_chunks
         by_ctx: dict[int, set] = {}
         saved: list[tuple[Any, int]] = []
         for req_id, keys in allowed.items():
