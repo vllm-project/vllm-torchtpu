@@ -6281,6 +6281,11 @@ class TPUModelRunner(GPUModelRunner):
 
             arm_topp_kernel()
 
+        if envs.TPU_SAMPLER_TOP_P_KERNEL:
+            from vllm_torchtpu.layers.adapter.sample import top_p_sample
+
+            top_p_sample.arm()
+
         # After the drafter, which shares the target's LM head.
         if envs.TPU_LM_HEAD_E4M3:
             from vllm_torchtpu.layers.adapter import lm_head_e4m3

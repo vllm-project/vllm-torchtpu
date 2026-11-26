@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
+from vllm_torchtpu.layers.adapter.sample import top_p_sample
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 
@@ -513,6 +514,22 @@ def _recover_tokens(
     may pass any subset of rows. `target_probs` and `target_logits_argmax`
     are recomputed from `target_logits` when not given.
     """
+    if (
+        draft_probs is None
+        and target_probs is None
+        and target_logits_argmax is None
+        and topk_candidates == 0
+        and not (apply_topk_topp and apply_top_k)
+        and top_p_sample.applies(target_logits)
+    ):
+        # TPU_SAMPLER_TOP_P_KERNEL: the dense-row Pallas kernel.
+        return top_p_sample.recover(
+            target_logits,
+            draft_token_ids,
+            temperatures,
+            top_p if apply_topk_topp else None,
+            recover_u,
+        )
     if target_logits_argmax is None:
         target_logits_argmax = torch.argmax(target_logits, dim=-1).to(torch.int32)
     if target_probs is None:
