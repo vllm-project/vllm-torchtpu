@@ -304,6 +304,13 @@ def subtract_num_rejected_tokens(
     return seq_lens, positions
 
 
+def draft_token_positions(
+    logits_indices: torch.Tensor, target_logits_indices: torch.Tensor
+) -> torch.Tensor:
+    """Rows of ``input_ids`` holding the drafts the target verifies."""
+    return logits_indices[target_logits_indices + 1]
+
+
 def extract_draft_token_ids(
     input_ids: torch.Tensor,
     logits_indices: torch.Tensor,
@@ -312,7 +319,7 @@ def extract_draft_token_ids(
     """Gather the draft tokens the target just verified, from the (post-async-
     substitution) device ``input_ids``.
     """
-    return input_ids[logits_indices[target_logits_indices + 1]]
+    return input_ids[draft_token_positions(logits_indices, target_logits_indices)]
 
 
 def compute_num_rejected(

@@ -196,6 +196,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
     SpecLogprobsChunk,
+    draft_token_positions,
 )
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
@@ -1114,6 +1115,10 @@ class TPUModelRunner(GPUModelRunner):
         self._h2d_reuse: dict[str, tuple[tuple, torch.Tensor, torch.Tensor]] = {}
         # `_padded_sampling_params`: (key, device uploads, their host sources).
         self._sampling_params_upload: tuple[tuple, tuple, tuple] | None = None
+        # `_draft_token_positions`: (logits indices, target indices, positions).
+        self._draft_token_positions_cache: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
 
         self.speculative_config = self.vllm_config.speculative_config
         speculative_config = self.speculative_config
@@ -3647,6 +3652,27 @@ class TPUModelRunner(GPUModelRunner):
                 release_cb()
             self._fenced_h2d_sources.clear()
 
+    def _draft_token_positions(self, md: SpecDecodeMetadata) -> torch.Tensor:
+        """`draft_token_positions` of ``md``, reused while the speculative
+        decoding manager hands out the same cached index tensors (steady
+        decode), which saves two eager device ops per step."""
+        logits_indices = md.final_logits_indices
+        target_logits_indices = md.target_logits_indices
+        cached = self._draft_token_positions_cache
+        if (
+            cached is not None
+            and cached[0] is logits_indices
+            and cached[1] is target_logits_indices
+        ):
+            return cached[2]
+        positions = draft_token_positions(logits_indices, target_logits_indices)
+        self._draft_token_positions_cache = (
+            logits_indices,
+            target_logits_indices,
+            positions,
+        )
+        return positions
+
     def _upload_unless_unchanged(self, slot: str, host: torch.Tensor) -> torch.Tensor:
         """`host.to(self.device)`, reusing `slot`'s previous upload when the
         values have not changed.
@@ -4166,15 +4192,9 @@ class TPUModelRunner(GPUModelRunner):
                 and spec_decode_metadata is not None
                 and len(cur_input_indices) > 0
             ):
-                from vllm_torchtpu.runner.tpu_runner_async_output import (
-                    extract_draft_token_ids,
-                )
-
-                spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
-                    input_ids,
-                    spec_decode_metadata.final_logits_indices,
-                    spec_decode_metadata.target_logits_indices,
-                )
+                spec_decode_metadata.draft_token_ids = input_ids[
+                    self._draft_token_positions(spec_decode_metadata)
+                ]
             elif (
                 spec_decode_metadata is not None
                 and spec_decode_metadata.draft_token_ids is None
