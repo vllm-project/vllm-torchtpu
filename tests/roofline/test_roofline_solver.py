@@ -2365,7 +2365,7 @@ def test_dcn_cli_override_updates_host_gbit_and_provenance() -> None:
     """Verify --dcn-gbit-per-s updates host rate, rejects 0, and sets provenance."""
     bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
     base_chip = rf.CHIPS["tpu7x"]
-    parser = cli._build_parser()
+    parser = cli.build_parser()
     zero_args = parser.parse_args(
         [
             "solve",

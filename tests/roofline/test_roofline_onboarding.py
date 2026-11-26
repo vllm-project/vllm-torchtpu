@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from tests.roofline.conftest import (
@@ -28,6 +31,7 @@ from vllm_torchtpu.roofline import (
     Parallel,
     SeqKvLayout,
     audit_hf_config,
+    cli,
     count_layer_types,
     from_hf_config,
     param_counts,
@@ -620,3 +624,48 @@ def test_audit_hf_config_blocked_tier_returns_none_payload_fields() -> None:
     assert audit.dtypes is None
     assert audit.layer_counts is None
     assert audit.param_counts is None
+
+
+def test_cli_inspect_text_output_and_fail_closed_tier2_blocker(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify inspect text output for locked configs and fail-closed unlisted."""
+    expected_error_rc = 2
+    fixtures_dir = Path(__file__).resolve().parent / "fixtures"
+    q35_path = fixtures_dir / "qwen3_5_397b_fp8.json"
+    rc_ok = cli.main(["inspect", "--config", str(q35_path)])
+    assert rc_ok == 0
+    out_ok = capsys.readouterr().out
+    assert "onboarding_tier: tier0_ready" in out_ok
+    assert "canonical_id: qwen3_5_moe" in out_ok
+    assert "param_counts:" in out_ok
+
+    rc_json = cli.main(["inspect", "--config", str(q35_path), "--json"])
+    assert rc_json == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["schema_version"] == "vllm_torchtpu.roofline.inspect/v1"
+    assert payload["onboarding_tier"] == "tier0_ready"
+
+    unlisted_path = tmp_path / "unsupported_synthetic_arch.json"
+    unlisted_path.write_text(
+        json.dumps(
+            {
+                "model_type": "unsupported_synthetic_arch",
+                "architectures": ["UnsupportedSyntheticForCausalLM"],
+                "hidden_size": 4096,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "vocab_size": 64000,
+                "torch_dtype": "bfloat16",
+                "o_lora_rank": 16,
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc_blocked = cli.main(["inspect", "--config", str(unlisted_path)])
+    assert rc_blocked == expected_error_rc
+    out_blocked = capsys.readouterr().out
+    assert "onboarding_tier: tier2_primitive_needed" in out_blocked
+    assert "model_type_status: unlisted_blocked" in out_blocked
