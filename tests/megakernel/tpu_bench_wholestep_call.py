@@ -100,6 +100,9 @@ def main():
                     help="per-request work in a fori_loop (VLLM_TPU_MEGAKERNEL wholeloop=1)")
     ap.add_argument("--phys", action="store_true",
                     help="union ids -> physical page ids per request (VLLM_TPU_MEGAKERNEL wholephys=1)")
+    ap.add_argument("--phys-mxu", action="store_true",
+                    help="main call: prefetched table rows, MXU physical ids, micro-page rows "
+                    "(VLLM_TPU_MEGAKERNEL wholephysmxu=1)")
     ap.add_argument("--slots", type=int, default=0, help="union attention ring slots (0: default)")
     ap.add_argument("--key-mp", type=int, default=0,
                     help="key-stream kernel pages per DMA (VLLM_TPU_MEGAKERNEL wholekeymp=N; needs "
@@ -157,6 +160,7 @@ def main():
         pltpu.get_tpu_info = lambda: chip
     wsc.SHARD_INDEX, wsc.UNION_ATTN, wsc.LOOP_REQUESTS = a.shard, a.union, a.loop
     wsc.UNION_PHYS = a.phys
+    wsc.UNION_PHYS_MXU = a.phys_mxu
     wsc.KEY_MP, wsc.KEY_SLOTS, wsc.KEY_LANES = a.key_mp, a.key_slots, a.key_lanes
     if a.score_arm:
         from vllm_torchtpu.megakernel.wholestep import qsa_full_b
@@ -205,6 +209,7 @@ def main():
         # (a 90K-token context would otherwise need 11 x 1.4K blocks per request).
         NB = 1 + nreq * (n_gdn * 4 + n_qsa + 2 * n_used) + 8
         if a.rand_pool and not (a.trace_only or a.aot):
+            pool = args = res = None  # the previous bucket's pool: freed before the new one
 
             def rand_pool(nb=NB, per=per, kb=kb):
                 k = jax.random.fold_in(jax.random.PRNGKey(5), jax.lax.axis_index("tp"))
