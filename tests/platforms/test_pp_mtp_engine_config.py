@@ -7,11 +7,11 @@ TPU_PP_MTP_PREFILL_KV makes it verify as one stage; without it the upstream
 refusal stands. Uses the real GLM-5.2-FP8 config.json; no weights are read.
 """
 
-import json
 import os
 import shutil
 
 import pytest
+from vllm.config import KVTransferConfig
 from vllm.engine.arg_utils import EngineArgs
 
 import vllm_torchtpu  # noqa: F401  (applies the import-stage patches)
@@ -40,8 +40,8 @@ def _engine_args(model_dir):
         max_num_batched_tokens=4096,
         block_size=256,
         speculative_config={"method": "mtp", "num_speculative_tokens": 1},
-        kv_transfer_config=json.dumps(
-            {
+        kv_transfer_config=KVTransferConfig(
+            **{
                 "kv_connector": "TPURaidenOffloadingConnector",
                 "kv_connector_module_path": "vllm_torchtpu.offload.raiden_connector",
                 "kv_role": "kv_both",
