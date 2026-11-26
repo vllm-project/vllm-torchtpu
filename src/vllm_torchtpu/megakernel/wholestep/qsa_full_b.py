@@ -41,12 +41,31 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..blocks.qsa_attn.block import MICRO, attend_row
+from ..blocks.qsa_attn.block import MICRO, attend_row, fp8_dense_read
 from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, I32, rnd
 from ..spec import ExtraInput, ScratchReq, SmallField, StateDecl, WeightDecl
 from . import indexer as ix
 from .qsa_full import OFFSET, POOL, ROPE, SCALES, QSAFullBlock
+
+_LOGGED: set[str] = set()
+
+
+def _log_once(msg: str) -> None:
+    """One INFO line per message and process, on TP rank 0 (kernel build time)."""
+    if msg in _LOGGED:
+        return
+    _LOGGED.add(msg)
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        if get_tensor_model_parallel_rank() != 0:
+            return
+    except Exception:  # no TP group (CPU tests, tools): log
+        pass
+    from vllm_torchtpu.logger import init_logger
+
+    init_logger(__name__).info(msg)
 
 CK = "qsa_ck"
 CKTAB = "qsa_cktab"  # [requests, max_groups // 32] kernel pages of the FP8 carrier
@@ -301,6 +320,12 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.union_lanepack = os.environ.get(
             "VLLM_TPU_MK_QSA_UNION_LANEPACK", "0"
         ).strip().lower() in ("1", "true", "yes", "on")
+        # VLLM_TPU_MK_FP8_DENSE_READ (default off; exact): the FP8 key carrier slot is read as
+        # dense int32 word rows and bitcast in registers (`_consume`), and the union attention
+        # unpacks K / V ring slots from dense word rows (`qsa_attn.block._unpack_kv`).
+        self.fp8_dense_read = fp8_dense_read()
+        if self.fp8_dense_read:
+            _log_once("MK FP8 dense read active: K/V and key ring slots as dense word rows")
         # VLLM_TPU_MK_QSA_THR_FAST (default off; exact): the full-scan selection's
         # thresholds skip the id passes unless a tie is truncated (t), stop the value
         # passes once the count at `lo` is exactly the budget (e), and scan only the
@@ -672,9 +697,18 @@ class QSAFullIndexedBlock(QSAFullBlock):
         if SCORE_ARM == "dma":
             scr["qi_s"][rows, col] = jnp.zeros((T, CG // 128, 128), F32)
             return
-        # Stock BF16KeyReader read: ref bitcast FP8 -> BF16 when carrier == "fp8".
-        keys = ring.at[s].bitcast(BF16)[...] if self.carrier == "fp8" else ring[s]
-        keys = keys.reshape(CG, W)[:, : ix.IDX_DIM]
+        if self.carrier == "fp8" and self.fp8_dense_read:
+            # The slot is row-major words `[CG / 2 * W / 128, 128]`, two BF16 keys per word
+            # (key 2i in the low half, as the ref bitcast FP8 -> BF16 reads it): whole-vreg
+            # reads of the first 128 lanes, then an in-register bitcast with the same row
+            # order. A `[CH, 16, 2, W]` BF16 read loads two rows per vreg and relayouts.
+            wrows = ring.at[s].bitcast(I32).reshape(CG // 2 * (W // 128), 128)
+            words = wrows[pl.ds(0, CG // 2, stride=W // 128)] if W > 128 else wrows[...]
+            keys = pltpu.bitcast(words, BF16)
+        else:
+            # Stock BF16KeyReader read: ref bitcast FP8 -> BF16 when carrier == "fp8".
+            keys = ring.at[s].bitcast(BF16)[...] if self.carrier == "fp8" else ring[s]
+            keys = keys.reshape(CG, W)[:, : ix.IDX_DIM]
         st = ix.score_rows(qr, keys)  # [T, CG]
         scr["qi_s"][rows, col] = st.reshape(T, CG // 128, 128)
 
