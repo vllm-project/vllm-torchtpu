@@ -43,7 +43,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..blocks.qsa_attn.block import MICRO, TILE, _unpack_kv
 from ..ops import BF16, F32, I32
-from .indexer import exclusive_prefix
+from .indexer import exclusive_prefix, sum_rows
 
 GROUPS_PER_TILE = TILE // MICRO  # one group = one micro-page of 4 tokens
 
@@ -55,11 +55,20 @@ UNION_CHUNK = 256  # output slots compacted per pass (bounds the [slots, S] temp
 STACK_ROWS = os.environ.get("VLLM_TPU_MK_UNION_STACK", "1") != "0"
 
 
-def union_consts(S: int, KU: int) -> tuple:
+def union_consts(S: int, KU: int, lane_major: bool = False) -> tuple:
     """Constants of `compact_union` (`compact_consts` at the per-pass slot width)."""
     W = min(KU, UNION_CHUNK)
     li = jax.lax.broadcasted_iota(I32, (128, 128), 0)
     lj = jax.lax.broadcasted_iota(I32, (128, 128), 1)
+    if lane_major:  # `compact_union(..., lane_major=True)`
+        return (
+            (li >= lj).astype(BF16),
+            (li < lj).astype(BF16),  # `indexer.exclusive_prefix`'s 128-lane strict triangle
+            (li == lj).astype(BF16),
+            jax.lax.broadcasted_iota(I32, (1, W), 1),
+            jax.lax.broadcasted_iota(I32, (S, 1), 0),
+            jax.lax.broadcasted_iota(I32, (128, 1), 0),
+        )
     return (
         (li <= lj).astype(BF16),
         (li < lj).astype(BF16),  # `indexer.exclusive_prefix`'s 128-lane strict triangle
@@ -69,13 +78,22 @@ def union_consts(S: int, KU: int) -> tuple:
     )
 
 
-def union_chunk_consts(CR: int, KU: int) -> tuple:
+def union_chunk_consts(CR: int, KU: int, lane_major: bool = False) -> tuple:
     """Constants of `compact_union_chunk` for `CR`-row chunks."""
     W = min(KU, UNION_CHUNK)
     li = jax.lax.broadcasted_iota(I32, (128, 128), 0)
     lj = jax.lax.broadcasted_iota(I32, (128, 128), 1)
     si = jax.lax.broadcasted_iota(I32, (CR, CR), 0)
     sj = jax.lax.broadcasted_iota(I32, (CR, CR), 1)
+    if lane_major:  # `compact_union_chunk(..., lane_major=True)`
+        return (
+            (li >= lj).astype(BF16),
+            (si < sj).astype(BF16),
+            (li == lj).astype(BF16),
+            jax.lax.broadcasted_iota(I32, (1, W), 1),
+            jax.lax.broadcasted_iota(I32, (CR, 1), 0),
+            jax.lax.broadcasted_iota(I32, (128, 1), 0),
+        )
     return (
         (li <= lj).astype(BF16),
         (si < sj).astype(BF16),
@@ -86,7 +104,7 @@ def union_chunk_consts(CR: int, KU: int) -> tuple:
 
 
 def compact_union(
-    code: jax.Array, KU: int, consts: tuple
+    code: jax.Array, KU: int, consts: tuple, lane_major: bool = False
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Ascending union of the groups with a nonzero row code, as lane-major `[1, KU]`
     ids and
@@ -99,8 +117,11 @@ def compact_union(
     62.1 MiB at
     16 rows, j-c89e9978; 512 per pass still 62.4, j-bfd3a7f8); each slot's code is
     gathered from its group's sublane row by the
-    same one-hot matmul (codes <= 15 are exact in BF16).
+    same one-hot matmul (codes <= 15 are exact in BF16). `lane_major`
+    (VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT): `_compact_union_lm`, same ids, codes and count.
     """
+    if lane_major:
+        return _compact_union_lm(code, KU, consts)
     U, Us, jcol0, srow, lane = consts
     S, W = code.shape[0], jcol0.shape[0]
     sel = code > 0
@@ -136,8 +157,68 @@ def compact_union(
     return cat(ids_out), cat(codes_out), n
 
 
+def _union_lhs(code: jax.Array, consts: tuple, O_row=None) -> tuple:
+    """Lane-major union compaction operands of `code [S, 128]`: the transposed in-row ranks
+    `PT` and codes `CT` (`[128, S]` from the MXU), the per-row count `c_row [1, S]`, the
+    per-row end slots `E [S, W]` (each row's value broadcast over the slot lanes), and the
+    one-hot gather's LHS `[PT; CT; O_hi; O_lo; 0] [272, S]` (row offsets split into bytes:
+    exact in BF16). `O_row` (f32 `[1, S]`): the rows' exclusive offsets, else
+    `exclusive_prefix` of the counts."""
+    Ut, Us, eye, jcol0 = consts[:4]
+    S, W = code.shape[0], jcol0.shape[1]
+    dn = (((1,), (1,)), ((), ()))
+    PT = jax.lax.dot_general(  # PT[l, r]: coded lanes <= l of row r
+        Ut, (code > 0).astype(F32).astype(BF16), dn, preferred_element_type=F32
+    )
+    CT = jax.lax.dot_general(eye, code.astype(F32).astype(BF16), dn, preferred_element_type=F32)
+    c_row = PT[127:128, :]
+    if O_row is None:
+        O_row = exclusive_prefix(c_row, Us)
+    else:
+        O_row = O_row(c_row)
+    E_col = jnp.transpose(jnp.broadcast_to(O_row + c_row, (128, S)))  # [S, 128]: E[r]
+    E = jnp.concatenate([E_col] * -(-W // 128), axis=1)[:, :W]
+    O_hi = jnp.floor(O_row * (1.0 / 256.0))
+    lhs = jnp.concatenate(
+        [PT, CT, O_hi, O_row - 256.0 * O_hi, jnp.zeros((14, S), F32)], axis=0
+    ).astype(BF16)  # [272, S]
+    return c_row, E, lhs
+
+
+def _union_slots(jf: jax.Array, E: jax.Array, lhs: jax.Array, consts: tuple) -> tuple:
+    """Sublane row `r_j`, lane `lane_j` and code `code_j` (`[1, W]`) of union slots `jf`."""
+    scol, lcol = consts[4], consts[5]
+    r_j = sum_rows((E <= jf).astype(I32))
+    oh = (scol == r_j).astype(F32).astype(BF16)  # [S, W]
+    g = jnp.dot(lhs, oh, preferred_element_type=F32)  # [272, W]
+    O_rj = 256.0 * g[256:257] + g[257:258]
+    lane_j = sum_rows((g[:128] <= jf - O_rj).astype(I32))
+    code_j = sum_rows(jnp.where(lcol == lane_j, g[128:256], 0.0))
+    return r_j, lane_j, code_j
+
+
+def _compact_union_lm(code: jax.Array, KU: int, consts: tuple) -> tuple:
+    """`compact_union` lane-major over the slots: the in-row ranks and codes come transposed
+    from the MXU, each slot's row and lane are sums over sublanes, and its in-row ranks, code
+    and row offset are gathered by one one-hot matmul (no per-slot lane reductions, no
+    transposes of the outputs). Same integers: same ids, codes and count."""
+    W = consts[3].shape[1]
+    c_row, E, lhs = _union_lhs(code, consts)
+    n = jnp.sum(c_row, axis=1, keepdims=True)
+    ids_out, codes_out = [], []
+    assert KU % W == 0, f"union window {W} must divide KU={KU} (a partial last window overruns the store)"
+    for j0 in range(0, KU, W):
+        jf = (consts[3] + j0).astype(F32)
+        r_j, lane_j, code_j = _union_slots(jf, E, lhs, consts)
+        live = jf < n
+        ids_out.append(jnp.where(live, r_j * 128 + lane_j, 0))
+        codes_out.append(jnp.where(live, code_j, 0.0).astype(I32))
+    cat = lambda xs: xs[0] if len(xs) == 1 else jnp.concatenate(xs, axis=1)  # noqa: E731
+    return cat(ids_out), cat(codes_out), n.astype(I32)
+
+
 def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts: tuple,
-                        store, id_of=None) -> tuple:
+                        store, id_of=None, lane_major: bool = False) -> tuple:
     """One row chunk of `compact_union` (`VLLM_TPU_MK_QSA_SELECT_NVIS`): the coded lanes of
     `code [CR, 128]` take union slots `[tot, tot + count)` (`tot`: scalar int32 count of the
     chunks before it, which hold lower ids). For each `UNION_CHUNK` slot window that meets
@@ -145,7 +226,12 @@ def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts
     outside the range; chunks add up). `row_of(r)`: sublane row of the chunk's row `r`.
     `id_of(r, l)` (optional): group id of the chunk's row `r`, lane `l` (default `row_of(r)
     * 128 + l`), for chunks whose lanes are not their groups' lanes (`_nvis_union`'s lane
-    pack). Same integer arithmetic as `compact_union`. Returns the new `tot`."""
+    pack). Same integer arithmetic as `compact_union`. Returns the new `tot`. `lane_major`
+    (VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT; `union_chunk_consts(..., lane_major=True)`): the
+    lane-major compaction of `_compact_union_lm` (`row_of` / `id_of` get `[1, W]` rows /
+    lanes), same ids and codes."""
+    if lane_major:
+        return _compact_union_chunk_lm(code, tot, row_of, KU, consts, store, id_of)
     U, tri, jcol0, srow, lane = consts
     CR, W = code.shape[0], jcol0.shape[0]
     sel = code > 0
@@ -180,6 +266,31 @@ def compact_union_chunk(code: jax.Array, tot: jax.Array, row_of, KU: int, consts
                 jnp.transpose(jnp.broadcast_to(ids, (W, 128)))[0:1, :].astype(I32),
                 jnp.transpose(jnp.broadcast_to(codes, (W, 128)))[0:1, :].astype(I32),
             )
+
+    return tot + n
+
+
+def _compact_union_chunk_lm(code, tot, row_of, KU: int, consts: tuple, store, id_of) -> Any:
+    """`compact_union_chunk`, lane-major over the slots (`_compact_union_lm` with the chunk's
+    offsets `tot + c_row . tri`)."""
+    tri, jcol0 = consts[1], consts[3]
+    W = jcol0.shape[1]
+    totf = jnp.zeros((1, 1), F32) + tot.astype(F32)
+    c_row, E, lhs = _union_lhs(
+        code, consts,
+        lambda c: jnp.dot(c.astype(BF16), tri, preferred_element_type=F32) + totf,
+    )
+    n = jnp.sum((code > 0).astype(I32))
+    assert KU % W == 0, f"union window {W} must divide KU={KU} (a partial last window overruns the store)"
+    for j0 in range(0, KU, W):
+
+        @pl.when((j0 < tot + n) & (j0 + W > tot))
+        def _(j0=j0):
+            jcol = jcol0 + j0
+            r_j, lane_j, code_j = _union_slots(jcol.astype(F32), E, lhs, consts)
+            live = (jcol >= tot) & (jcol < tot + n)
+            gid = row_of(r_j) * 128 + lane_j if id_of is None else id_of(r_j, lane_j)
+            store(j0, jnp.where(live, gid, 0), jnp.where(live, code_j, 0.0).astype(I32))
 
     return tot + n
 

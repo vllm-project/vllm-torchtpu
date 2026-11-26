@@ -561,7 +561,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         q = lo // T
         m, base_of = self._nvis_plan(ctx, nv_max, CM)
         at = pl.multiple_of(r * KU, 128) if self.compressed_dcp else r * KU
-        consts = ua.union_chunk_consts(2 * CM, KU)
+        lm = self.lane_major_select
+        consts = ua.union_chunk_consts(2 * CM, KU, lm)
         scr["qu_id"][q, :, pl.ds(at, KU)] = jnp.zeros((1, KU), I32)
         scr["qu_cd"][q, :, pl.ds(at, KU)] = jnp.zeros((1, KU), I32)
 
@@ -588,7 +589,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 return jnp.where(rj < CM, bases[0] + rj, bases[1] + rj - CM)
 
             return ua.compact_union_chunk(
-                jnp.concatenate(codes, axis=0), tot, row_of, KU, consts, store
+                jnp.concatenate(codes, axis=0), tot, row_of, KU, consts, store, lane_major=lm
             )
 
         H = CM // 2
@@ -627,7 +628,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
                 return ua.compact_union_chunk(
                     jnp.concatenate(codes, axis=0), tot, row_of, KU, consts, store,
-                    None if rows_own else id_of,
+                    None if rows_own else id_of, lane_major=lm,
                 )
 
             n = jax.lax.fori_loop(0, (m + 3) // 4, itp, jnp.zeros((), I32))
@@ -1006,7 +1007,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 scr["qi_th"][pl.ds(lo, n)] = jnp.broadcast_to(thr, (n, 1, 128))
                 scr["qi_tm"][pl.ds(lo, n)] = jnp.broadcast_to(tmax, (n, 1, 128))
             scr["qi_nv"][pl.ds(lo, n)] = jnp.broadcast_to(nv, (n, 1, 128))
-            consts = ix.compact_consts(S, K)
+            lm = self.lane_major_select
+            consts = ix.compact_consts(S, K, lm)
             lid = consts[-1]
             if cdcp:  # selection masks by group id; compaction yields positions (mapped below)
                 lid = self._cdcp_gid(ctx, lid)
@@ -1037,7 +1039,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     return scan_row(r, S, consts, lid)
 
                 def scan(Sx: int) -> Any:
-                    cx = ix.compact_consts(Sx, K)
+                    cx = ix.compact_consts(Sx, K, lm)
                     return scan_row(r, Sx, cx, cx[-1])
 
                 return self._by_tier(ctx.extra[NVIS][r], ctiers, scan)
@@ -1070,10 +1072,14 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     scr["qu_code"][rows] = scr["qu_code"][rows] | jnp.where(
                         sel & (lid < ga), jnp.left_shift(1, r - lo), 0
                     )
-                pos = ix.compact_row(
-                    b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
-                    jnp.zeros((1, 1), I32) + kept, K, consts,
-                )
+                if lm:  # the pool-path set compacted whole (at most K groups)
+                    pos = ix.compact_sel(sel & (lid < ga), jnp.zeros((1, 1), I32) + kept, K,
+                                         consts)
+                else:
+                    pos = ix.compact_row(
+                        b2, jnp.zeros((1, 1), I32), jnp.zeros((1, 1), I32) + G,
+                        jnp.zeros((1, 1), I32) + kept, K, consts,
+                    )
                 return pos, kept
 
             def tail(r: Any, pos: Any, kept: Any, carry: Any) -> Any:
@@ -1121,7 +1127,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                                     r, gpp, pltpu.roll,
                                 )
                             ids, codes, nu = ua.compact_union(
-                                code, KU, ua.union_consts(S // 2, KU)
+                                code, KU, ua.union_consts(S // 2, KU, lm), lm
                             )
                             ids = ua.unpack_union_ids(ids, nu, r, gpp)
                         else:
@@ -1129,7 +1135,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                                 jax.lax.rem(gidx // gpp, D) == r, code_all, 0
                             )
                             ids, codes, nu = ua.compact_union(
-                                code, KU, ua.union_consts(S, KU)
+                                code, KU, ua.union_consts(S, KU, lm), lm
                             )
                         if cdcp:
                             ids = self._cdcp_gid(ctx, ids)

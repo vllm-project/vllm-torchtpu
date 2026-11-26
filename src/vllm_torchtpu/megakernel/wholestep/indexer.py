@@ -42,6 +42,7 @@ import numpy as np
 from ..ops import BF16, F32, I32, rmsnorm, rnd
 
 IDX_HEADS, IDX_DIM = 4, 128
+I16 = jnp.int16
 
 
 def _next_toward(x: jax.Array, up: jax.Array, bitcast: Any) -> jax.Array:
@@ -107,7 +108,7 @@ def score_rows(qr: jax.Array, ck: jax.Array) -> jax.Array:
 
 
 def thresholds(bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int,
-               tie_skip: bool = False, early_exit: tuple = ()):
+               tie_skip: bool = False, early_exit: tuple = (), packed16: bool = False):
     """Per-row `(thr, tmax)` [R, 1, 1] for bit patterns `bits [R, S, 128]` (-1 =
     invisible).
 
@@ -117,12 +118,22 @@ def thresholds(bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int,
     once every row over `K` has `cnt(bits >= lo) == K`: `{bits >= lo}` is then exactly the
     top-K set, no tie is truncated (`tmax = G`), and the compaction's `b >= lo` selects the
     same groups in the same order as `b >= thr` (a stopped `lo` may sit below the K-th
-    value; nothing lies in between). Both: same selection as the plain passes."""
+    value; nothing lies in between). Both: same selection as the plain passes.
+
+    `packed16` (VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT; needs `S % 16 == 0` and `G <= 65536`):
+    the count passes compare int16 keys (`_value_passes16`, the id passes on `ids - 32768`),
+    two groups per 32-bit lane: same counts, same results (same early-exit trips)."""
     cnt = lambda m: jnp.sum(m.astype(I32), axis=(1, 2), keepdims=True)  # noqa: E731
     over = nv > K
     lo = jnp.zeros(nv.shape, I32)
+    packed = packed16 and bits.shape[1] % 16 == 0 and G <= 1 << 16
     if early_exit:
-        lo = _value_passes_early(bits, cnt, over, K, *early_exit)
+        if packed and _packed_early_ok(*early_exit):
+            lo = _value_passes16_early(bits, over, K, *early_exit)
+        else:
+            lo = _value_passes_early(bits, cnt, over, K, *early_exit)
+    elif packed:
+        lo = _value_passes16(bits, K)
     else:
         for b in range(30, -1, -1):
             cand = lo | (1 << b)
@@ -133,9 +144,15 @@ def thresholds(bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int,
 
     def ties() -> jax.Array:
         t = jnp.zeros(nv.shape, I32)
+        if packed:  # ids - 32768 where tied at thr, else 32767 (below no candidate)
+            key = jnp.where(eq, (ids - 32768).astype(I16), I16(32767))
         for b in range(int(G - 1).bit_length() - 1, -1, -1):
             cand = t | (1 << b)
-            t = jnp.where(cnt(eq & (ids < cand)) < need, cand, t)
+            if packed:
+                n = _count16(key < (cand - 32768).astype(I16))
+            else:
+                n = cnt(eq & (ids < cand))
+            t = jnp.where(n < need, cand, t)
         return t
 
     if not (tie_skip or early_exit):
@@ -149,6 +166,87 @@ def thresholds(bits: jax.Array, ids: jax.Array, nv: jax.Array, K: int, G: int,
     else:
         t = ties()
     return thr, jnp.where(trunc, t, G)
+
+
+def _count16(m: jax.Array) -> jax.Array:
+    """Per-row counts `[R, 1, 1]` int32 of a mask `[R, S, 128]` of int16 compares: int16 sums
+    of whole (16, 128) tiles (at most S / 16 per lane; Mosaic has no int16 reduction), then
+    int32."""
+    R, S, L = m.shape
+    p = jnp.where(m, I16(1), I16(0)).reshape(R, S // 16, 16, L)
+    parts = [p[:, i] for i in range(S // 16)]
+    while len(parts) > 1:
+        odd = parts[len(parts) - len(parts) % 2 :]
+        parts = [a + b for a, b in zip(parts[::2], parts[1::2])] + odd
+    return jnp.sum(parts[0].astype(I32), axis=(1, 2), keepdims=True)
+
+
+def _value_passes16(bits: jax.Array, K: int) -> jax.Array:
+    """`thresholds`' value bisection (`lo`) on int16 halves of `bits` (-1 or >= 0). Bits 30..16:
+    a candidate's low half is 0, so `bits >= cand` iff `bits >> 16 >= cand >> 16`. Bits 15..0,
+    with the high half `p` settled: `bits >= cand` iff `hi > p`, or `hi == p` and the low half
+    is `>= cand & 0xFFFF` (compared biased by -32768; `-32768` for `hi != p` is below every
+    candidate, whose low half is >= 1)."""
+    hi = (bits >> 16).astype(I16)
+    lo = jnp.zeros((bits.shape[0], 1, 1), I32)
+    for b in range(30, 15, -1):
+        cand = lo | (1 << b)
+        lo = jnp.where(_count16(hi >= (cand >> 16).astype(I16)) >= K, cand, lo)
+    p = (lo >> 16).astype(I16)
+    low = jnp.where(hi == p, ((bits & 0xFFFF) - 32768).astype(I16), I16(-32768))
+    k = K - _count16(hi > p)
+    for b in range(15, -1, -1):
+        cand = lo | (1 << b)
+        lo = jnp.where(_count16(low >= ((cand & 0xFFFF) - 32768).astype(I16)) >= k, cand, lo)
+    return lo
+
+
+def _packed_early_ok(bit: int, every: int) -> bool:
+    """`_value_passes16_early` keeps the int32 early exit's trips: the static passes stay in
+    the high half (`bit >= 15`) and no trip straddles bit 16 (`every` divides 16)."""
+    return bit >= 15 and 16 % every == 0 and (bit + 1) % every == 0
+
+
+def _value_passes16_early(bits: jax.Array, over, K: int, bit: int, every: int) -> jax.Array:
+    """`_value_passes_early` on `_value_passes16`'s int16 keys: the same exact counts per
+    candidate, so the same `lo` updates and the same stopping trip. One `while_loop` for the
+    high-half bits `[bit, 16]`, then the low-half keys against the settled high half `p`, and
+    one for bits `[15, 0]` (counts `count(hi > p) + count(low >= cand's low half)`)."""
+    hi = (bits >> 16).astype(I16)
+    lo = jnp.zeros(over.shape, I32)
+    n_ge = jnp.full(over.shape, -1, I32)  # unknown count: never "done"
+    for b in range(30, bit, -1):
+        cand = lo | (1 << b)
+        n = _count16(hi >= (cand >> 16).astype(I16))
+        lo, n_ge = jnp.where(n >= K, cand, lo), jnp.where(n >= K, n, n_ge)
+
+    def pending(n_ge: Any) -> Any:
+        return jnp.max((over & jnp.logical_not(_exact_top(n_ge, K))).astype(I32)) > 0
+
+    def body_hi(c: Any) -> Any:
+        b, lo, n_ge = c
+        for i in range(every):
+            cand = lo | jnp.left_shift(jnp.int32(1), b - i)
+            n = _count16(hi >= (cand >> 16).astype(I16))
+            lo, n_ge = jnp.where(n >= K, cand, lo), jnp.where(n >= K, n, n_ge)
+        return b - every, lo, n_ge
+
+    c = jax.lax.while_loop(
+        lambda c: (c[0] >= 16) & pending(c[2]), body_hi, (jnp.int32(bit), lo, n_ge)
+    )
+    p = (c[1] >> 16).astype(I16)
+    low = jnp.where(hi == p, ((bits & 0xFFFF) - 32768).astype(I16), I16(-32768))
+    above = _count16(hi > p)
+
+    def body_lo(c: Any) -> Any:
+        b, lo, n_ge = c
+        for i in range(every):
+            cand = lo | jnp.left_shift(jnp.int32(1), b - i)
+            n = above + _count16(low >= ((cand & 0xFFFF) - 32768).astype(I16))
+            lo, n_ge = jnp.where(n >= K, cand, lo), jnp.where(n >= K, n, n_ge)
+        return b - every, lo, n_ge
+
+    return jax.lax.while_loop(lambda c: (c[0] >= 0) & pending(c[2]), body_lo, c)[1]
 
 
 def _exact_top(n_ge: jax.Array, K: int) -> jax.Array:
@@ -185,12 +283,19 @@ def _value_passes_early(bits, cnt, over, K: int, bit: int, every: int) -> jax.Ar
     return jax.lax.while_loop(cond, body, (jnp.int32(bit), lo, n_ge))[1]
 
 
-def compact_row(b, th, tm, nv, K: int, consts: tuple) -> jax.Array:
+def compact_row(b, th, tm, nv, K: int, consts: tuple, lane_major: bool = False) -> jax.Array:
     """Selected group ids of one row as a lane-major `[1, K]` int32 (slots past the
     count: 0).
 
-    `b [S, 128]` bit patterns (-1 = invisible), `th / tm / nv` `[1, 1]`.
+    `b [S, 128]` bit patterns (-1 = invisible), `th / tm / nv` `[1, 1]`. `lane_major`
+    (VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT; `consts` from `compact_consts(..., lane_major=True)`):
+    `compact_sel`'s lane-major compaction, same ids.
     """
+    lid = consts[-1]
+    if lane_major:
+        ov = nv > K
+        sel = (ov & ((b > th) | ((b == th) & (lid <= tm)))) | (~ov & (b >= 0))
+        return compact_sel(sel, nv, K, consts)
     U, Us, jcol, srow, lid = consts
     S = b.shape[0]
     ov = nv > K
@@ -210,6 +315,50 @@ def compact_row(b, th, tm, nv, K: int, consts: tuple) -> jax.Array:
     # Slots past the row's count hold group 0, so DMAs issued for them stay in bounds.
     idc = jnp.where(jcol < jnp.minimum(nv, K), r_j * 128 + lane_j, 0).astype(F32)
     return jnp.transpose(jnp.broadcast_to(idc, (K, 128)))[0:1, :].astype(I32)
+
+
+def compact_sel(sel: jax.Array, nv: jax.Array, K: int, consts: tuple) -> jax.Array:
+    """`compact_row` of the selection mask `sel [S, 128]` (holding `nv` groups if `nv <= K`,
+    else `K`), lane-major over the slots (`consts`: `compact_consts(..., lane_major=True)`).
+
+    Slot `j` comes from sublane row `r_j` (rows ending at or before `j`) and lane `lane_j`
+    (lanes of row `r_j` whose in-row rank is at or below `j - O[r_j]`). The in-row ranks come
+    transposed `PT [128, S]` from the MXU, `r_j` and `lane_j` are sums over sublanes, and
+    `P[r_j, :]` with `O[r_j]` is gathered by one one-hot matmul (no lane reductions, no final
+    transpose). Integer-valued f32 throughout (counts <= 128 and offsets split into bytes are
+    exact in BF16): the same ids as the sublane-major compaction."""
+    Ut, Us, jrow, scol, _ = consts
+    S = sel.shape[0]
+    selb = sel.astype(F32).astype(BF16)
+    PT = jax.lax.dot_general(  # PT[l, r]: selected lanes <= l of row r
+        Ut, selb, (((1,), (1,)), ((), ())), preferred_element_type=F32
+    )
+    c_row = PT[127:128, :]
+    O_row = exclusive_prefix(c_row, Us)
+    E_col = jnp.transpose(jnp.broadcast_to(O_row + c_row, (128, S)))  # [S, 128]: E[r]
+    jf = jrow.astype(F32)
+    E = jnp.concatenate([E_col] * -(-K // 128), axis=1)[:, :K]
+    r_j = sum_rows((E <= jf).astype(I32))
+    oh = (scol == r_j).astype(F32).astype(BF16)  # [S, K]
+    O_hi = jnp.floor(O_row * (1.0 / 256.0))
+    lhs = jnp.concatenate([PT, O_hi, O_row - 256.0 * O_hi, jnp.zeros((6, S), F32)], axis=0)
+    g = jnp.dot(lhs.astype(BF16), oh, preferred_element_type=F32)  # [136, K]
+    O_rj = 256.0 * g[128:129] + g[129:130]
+    lane_j = sum_rows((g[:128] <= jf - O_rj).astype(I32))
+    # Slots past the row's count hold group 0, so DMAs issued for them stay in bounds.
+    return jnp.where(jrow < jnp.minimum(nv, K), r_j * 128 + lane_j, 0)
+
+
+def sum_rows(x: jax.Array) -> jax.Array:
+    """`[1, W]` sum over the rows of `x [N, W]`: adds of whole 8-row tiles, then 8 rows."""
+    n = x.shape[0]
+    if n % 8 == 0 and n > 8:
+        parts = [x[i : i + 8] for i in range(0, n, 8)]
+        while len(parts) > 1:
+            odd = parts[len(parts) - len(parts) % 2 :]
+            parts = [a + c for a, c in zip(parts[::2], parts[1::2])] + odd
+        x = parts[0]
+    return jnp.sum(x, axis=0, keepdims=True)
 
 
 def exclusive_prefix(c_row: jax.Array, us: jax.Array) -> jax.Array:
@@ -237,9 +386,18 @@ def exclusive_prefix(c_row: jax.Array, us: jax.Array) -> jax.Array:
     return out[0] if len(out) == 1 else jnp.concatenate(out, axis=1)
 
 
-def compact_consts(S: int, K: int) -> tuple:
+def compact_consts(S: int, K: int, lane_major: bool = False) -> tuple:
     li = jax.lax.broadcasted_iota(I32, (128, 128), 0)
     lj = jax.lax.broadcasted_iota(I32, (128, 128), 1)
+    if lane_major:  # `compact_sel`
+        return (
+            (li >= lj).astype(BF16),  # transposed in-row prefix: PT = Ut . sel^T
+            (li < lj).astype(BF16),  # 128-lane strict triangle of `exclusive_prefix`
+            jax.lax.broadcasted_iota(I32, (1, K), 1),
+            jax.lax.broadcasted_iota(I32, (S, 1), 0),
+            jax.lax.broadcasted_iota(I32, (S, 128), 0) * 128
+            + jax.lax.broadcasted_iota(I32, (S, 128), 1),
+        )
     return (
         (li <= lj).astype(BF16),
         (li < lj).astype(BF16),  # 128-lane strict triangle of `exclusive_prefix`
