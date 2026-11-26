@@ -733,10 +733,13 @@ def test_cli_solve_and_ceiling_support_chip_spec_and_dtype_overrides(
             "output_throughput_per_chip": cand["output_throughput_per_chip"],
             "est_ttft_ms": cand["est_ttft_ms"],
             "est_tpot_ms": cand["est_tpot_ms"],
+            "bound_tpot_ms": cand["bound_tpot_ms"],
             "concurrency": cand["concurrency"],
             "total_chips": cand["total_chips"],
             "mode": cand["mode"],
             "binding_unit": cand["binding"],
+            "min_decode_seqs": cand["min_decode_seqs"],
+            "floor_throughput_per_chip": cand["floor_throughput_per_chip"],
             "slo_met": cand["slo_met"],
             "is_pareto": cand["is_pareto"],
             "decode_topology": cand["decode_pool"]["topology"],
@@ -753,3 +756,81 @@ def test_cli_solve_and_ceiling_support_chip_spec_and_dtype_overrides(
             assert row["prefill_parallelism"] is None
         else:
             assert row["prefill_parallelism"]
+
+
+def test_cli_moe_activation_and_ruled_out_reference_text(
+    locked_config_path: Callable[[str], Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify --moe-activation valid/invalid flags and ruled-out reference summary."""
+    cfg_path = locked_config_path("qwen3_5_397b_fp8.json")
+
+    rc_pig = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--concurrency",
+            "1",
+            "--moe-activation",
+            "pigeonhole",
+            "--json",
+        ]
+    )
+    assert rc_pig == 0
+    pig_payload = json.loads(capsys.readouterr().out)
+    supplied = {
+        entry["name"]: entry["value"]
+        for entry in pig_payload["provenance"]["supplied_values"]
+    }
+    assert supplied["moe_activation"] == "pigeonhole"
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "solve",
+                "--config",
+                str(cfg_path),
+                "--example-scenario",
+                "chat-8k1k",
+                "--mode",
+                "mixed",
+                "--max-chips",
+                "4",
+                "--concurrency",
+                "1",
+                "--moe-activation",
+                "bogus",
+            ]
+        )
+    assert exc_info.value.code == 2
+    capsys.readouterr()
+
+    rc_ruled = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--example-scenario",
+            "chat-8k1k",
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--concurrency",
+            "1",
+            "--tpot-slo-ms",
+            "0.001",
+            "--reference-layout",
+            "TP8 x EP8",
+        ]
+    )
+    assert rc_ruled == 0
+    text_out = capsys.readouterr().out
+    assert "enumerated, ruled out by SLO" in text_out

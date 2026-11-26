@@ -47,10 +47,13 @@ _CEILING_KEYS = [
     "output_throughput_per_chip",
     "est_ttft_ms",
     "est_tpot_ms",
+    "bound_tpot_ms",
     "concurrency",
     "total_chips",
     "mode",
     "binding_unit",
+    "min_decode_seqs",
+    "floor_throughput_per_chip",
     "slo_met",
     "is_pareto",
     "decode_topology",
@@ -1554,3 +1557,102 @@ def test_top_k_one_preserves_reference_and_interactivity_roles(
     assert rc_text == 0
     text_out = capsys.readouterr().out
     assert f"reference {ref_layout}: c=" in text_out
+
+
+def test_top_layouts_bounded_top_k_preserves_fastest_and_min_bound_anchors() -> None:
+    """Bounded top_k keeps fastest at slot -1 and injects min_tpot_bound."""
+    from dataclasses import replace
+
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    base_plan = rf_pkg.solve_serving_plan(
+        bundle.geometry,
+        bundle.dtypes,
+        rf_pkg.CHIPS["tpu7x"],
+        rf_pkg.TrafficScenario(
+            name="anchor-collision",
+            isl=2048,
+            osl=256,
+            prefix_hit_rate=0.0,
+            accept_len=1.0,
+            think_time_s=0.0,
+            concurrencies=(16,),
+            kv_working_set_turns=1.0,
+        ),
+        rf_pkg.SolveOptions(mode="mixed", max_chips=8),
+    )
+    assert len(base_plan.candidates) >= 5
+    base_pts = list(base_plan.candidates[:5])
+
+    # Case 1: fastest already sits at ranked[top_k - 1] (index 2 for top_k=3),
+    # while index 4 has the lowest bound_tpot_ms -> min_tpot_bound must replace
+    # index 1 (NOT index 2) so both fastest and min_tpot_bound survive.
+    p0 = replace(
+        base_pts[0],
+        token_throughput_per_chip=500.0,
+        est_interactivity_tok_s=50.0,
+        bound_tpot_ms=10.0,
+        slo_met=True,
+        slo_verdict="estimate_meets",
+    )
+    p1 = replace(
+        base_pts[1],
+        token_throughput_per_chip=400.0,
+        est_interactivity_tok_s=60.0,
+        bound_tpot_ms=9.0,
+        slo_met=True,
+        slo_verdict="estimate_meets",
+    )
+    p2_fastest = replace(
+        base_pts[2],
+        token_throughput_per_chip=300.0,
+        est_interactivity_tok_s=200.0,
+        bound_tpot_ms=8.0,
+        slo_met=True,
+        slo_verdict="estimate_meets",
+    )
+    p3 = replace(
+        base_pts[3],
+        token_throughput_per_chip=200.0,
+        est_interactivity_tok_s=70.0,
+        bound_tpot_ms=7.0,
+        slo_met=True,
+        slo_verdict="estimate_meets",
+    )
+    p4_min_bound = replace(
+        base_pts[4],
+        token_throughput_per_chip=100.0,
+        est_interactivity_tok_s=80.0,
+        bound_tpot_ms=2.0,
+        slo_met=True,
+        slo_verdict="estimate_meets",
+    )
+    syn_plan = replace(
+        base_plan,
+        candidates=(p0, p1, p2_fastest, p3, p4_min_bound),
+        frontier=(p0, p2_fastest),
+        sort_by="throughput",
+    )
+    top3 = rf_pkg.top_layouts(syn_plan, top_k=3)
+    assert len(top3) == 3
+    tputs = {pt.token_throughput_per_chip for pt in top3}
+    assert tputs == {500.0, 300.0, 100.0}
+    roles = {
+        pt.token_throughput_per_chip: role
+        for pt, role, _ in rf_pkg.top_layout_roles(
+            top3, syn_plan.frontier, sort_by="throughput"
+        )
+    }
+    assert roles[500.0] == "max_throughput"
+    assert roles[300.0] == "max_interactivity"
+    assert roles[100.0] == "min_tpot_bound"
+
+    # Case 2: both fastest (index 3) and min_tpot_bound (index 4) are outside top 3.
+    p2_mid = replace(p2_fastest, est_interactivity_tok_s=65.0)
+    p3_fastest = replace(p3, est_interactivity_tok_s=220.0)
+    syn_both = replace(
+        syn_plan,
+        candidates=(p0, p1, p2_mid, p3_fastest, p4_min_bound),
+        frontier=(p0, p3_fastest),
+    )
+    top3_both = rf_pkg.top_layouts(syn_both, top_k=3)
+    assert {pt.token_throughput_per_chip for pt in top3_both} == {500.0, 200.0, 100.0}

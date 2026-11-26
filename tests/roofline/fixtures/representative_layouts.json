@@ -1,0 +1,237 @@
+{
+  "schema_version": "vllm_torchtpu.roofline.representative_layouts/v1",
+  "concurrencies": [
+    8,
+    32,
+    64,
+    256
+  ],
+  "cases": [
+    {
+      "id": "qwen3_5_397b_fp8_mixed_2x2x1",
+      "checkpoint": "qwen3_5_397b_fp8.json",
+      "mode": "mixed",
+      "topology": "2x2x1",
+      "max_chips": 4,
+      "isl": 4096,
+      "osl": 512,
+      "expected_layouts": [
+        {
+          "role": "mixed",
+          "label": "TP8 x EP8",
+          "tp": 8,
+          "dp": 1,
+          "ep": 8,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 1
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5_397b_fp8_disagg_2x2x1",
+      "checkpoint": "qwen3_5_397b_fp8.json",
+      "mode": "disagg",
+      "topology": "2x2x1",
+      "max_chips": 8,
+      "isl": 4096,
+      "osl": 512,
+      "expected_layouts": [
+        {
+          "role": "prefill",
+          "label": "PP8",
+          "tp": 1,
+          "dp": 1,
+          "ep": 1,
+          "pp": 8,
+          "pcp": 1,
+          "kv_split": 1
+        },
+        {
+          "role": "prefill",
+          "label": "EP2 x PP4 x PCP2",
+          "tp": 1,
+          "dp": 1,
+          "ep": 2,
+          "pp": 4,
+          "pcp": 2,
+          "kv_split": 1
+        },
+        {
+          "role": "decode",
+          "label": "TP8 x EP8 x DCP4",
+          "tp": 8,
+          "dp": 1,
+          "ep": 8,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 4
+        },
+        {
+          "role": "decode",
+          "label": "TP2 x DP4 x EP8",
+          "tp": 2,
+          "dp": 4,
+          "ep": 8,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 1
+        }
+      ]
+    },
+    {
+      "id": "glm_5_2_fp8_mixed_2x2x2",
+      "checkpoint": "glm_5_2_fp8.json",
+      "mode": "mixed",
+      "topology": "2x2x2",
+      "max_chips": 8,
+      "isl": 4096,
+      "osl": 512,
+      "expected_layouts": [
+        {
+          "role": "mixed",
+          "label": "TP16 x DCP8",
+          "tp": 16,
+          "dp": 1,
+          "ep": 1,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 8
+        },
+        {
+          "role": "mixed",
+          "label": "TP16 x EP16 x DCP16",
+          "tp": 16,
+          "dp": 1,
+          "ep": 16,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 16
+        }
+      ]
+    },
+    {
+      "id": "glm_5_2_fp8_disagg_2x2x2",
+      "checkpoint": "glm_5_2_fp8.json",
+      "mode": "disagg",
+      "topology": "2x2x2",
+      "max_chips": 16,
+      "isl": 4096,
+      "osl": 512,
+      "expected_layouts": [
+        {
+          "role": "prefill",
+          "label": "TP16 x EP16 x DCP8",
+          "tp": 16,
+          "dp": 1,
+          "ep": 16,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 8
+        },
+        {
+          "role": "decode",
+          "label": "TP16 x EP16 x DCP8",
+          "tp": 16,
+          "dp": 1,
+          "ep": 16,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 8
+        },
+        {
+          "role": "decode",
+          "label": "TP16 x DCP8",
+          "tp": 16,
+          "dp": 1,
+          "ep": 1,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 8
+        },
+        {
+          "role": "decode",
+          "label": "TP16 x EP16 x DCP16",
+          "tp": 16,
+          "dp": 1,
+          "ep": 16,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 16
+        }
+      ]
+    },
+    {
+      "id": "glm_5_2_nvfp4_mixed_2x2x1",
+      "checkpoint": "glm_5_2_nvfp4.json",
+      "mode": "mixed",
+      "topology": "2x2x1",
+      "max_chips": 4,
+      "isl": 4096,
+      "osl": 512,
+      "expected_layouts": [
+        {
+          "role": "mixed",
+          "label": "TP8 x DCP4",
+          "tp": 8,
+          "dp": 1,
+          "ep": 1,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 4
+        },
+        {
+          "role": "mixed",
+          "label": "TP8 x EP8 x DCP4",
+          "tp": 8,
+          "dp": 1,
+          "ep": 8,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 4
+        },
+        {
+          "role": "mixed",
+          "label": "TP8 x EP8 x DCP8",
+          "tp": 8,
+          "dp": 1,
+          "ep": 8,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 8
+        }
+      ]
+    },
+    {
+      "id": "qwen3_5_397b_nvfp4_mixed_2x2x1",
+      "checkpoint": "qwen3_5_397b_nvfp4.json",
+      "mode": "mixed",
+      "topology": "2x2x1",
+      "max_chips": 4,
+      "isl": 4096,
+      "osl": 512,
+      "expected_layouts": [
+        {
+          "role": "mixed",
+          "label": "TP8 x EP8",
+          "tp": 8,
+          "dp": 1,
+          "ep": 8,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 1
+        },
+        {
+          "role": "mixed",
+          "label": "TP8 x EP8 x DCP4",
+          "tp": 8,
+          "dp": 1,
+          "ep": 8,
+          "pp": 1,
+          "pcp": 1,
+          "kv_split": 4
+        }
+      ]
+    }
+  ]
+}
