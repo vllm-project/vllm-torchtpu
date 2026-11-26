@@ -99,6 +99,8 @@ def _kernel(
     union_page_ref=None,
     words: bool = False,
     pair_rank_ref=None,
+    q_peer_ref=None,
+    first_issued: bool = False,
 ):
     """`msa_attention._kernel_v2` that also writes ``lse = m + log(l)``
     (``-inf`` for a row that sees no slot; its output is 0). Scores, the
@@ -135,7 +137,10 @@ def _kernel(
     bitcast's slot order, and enter the MXU as fp8.
 
     With `pair_rank_ref` (a DCP pair's rank, the heads in rank order) the
-    outputs are the pair's packs (`_write_pair_packs`), not ``out, lse``."""
+    outputs are the pair's packs (`_write_pair_packs`), not ``out, lse``.
+    With `q_peer_ref`, the query heads are `q_ref`'s then `q_peer_ref`'s.
+    With `first_issued`, the caller has started group 0's page copies (into
+    ring slot 0, on its semaphore)."""
     fp4 = fp4_rows is not None
     if transposed:  # a group's masked scores (`attend_t`)
         *refs, s_scr = refs
@@ -156,6 +161,7 @@ def _kernel(
     def group(
         w,
         q_ref=q_ref,
+        q_peer_ref=q_peer_ref,
         o_ref=o_ref,
         lse_ref=lse_ref,
         selected_ref=selected_ref,
@@ -169,6 +175,8 @@ def _kernel(
             start = tile % tiles_per_step * bq
             rows = pl.ds(pl.multiple_of(start, bq), bq)
             q_ref = q_ref.at[:, rows, :]
+            if q_peer_ref is not None:
+                q_peer_ref = q_peer_ref.at[:, rows, :]
             # A pack's 8-row stores at a run-time offset lower (tpu7x AOT, Hl
             # = 8, 2 to 4 tiles per step: 16 to 256 tokens).
             packed = (
@@ -192,6 +200,15 @@ def _kernel(
         meta = work_meta_ref[w]
         count = work_count_ref[w]
         num_heads, block_q, head_dim = q_ref.shape
+        if q_peer_ref is not None:
+            num_heads += q_peer_ref.shape[0]
+
+        def read_q():  # [H * Bq, D]
+            q = q_ref[...]
+            if q_peer_ref is not None:
+                q = jnp.concatenate([q, q_peer_ref[...]])
+            return q.reshape(num_heads * block_q, head_dim)
+
         if words:
             rows_per_page, row_width = buf_ref.shape[2] // 2, 2 * buf_ref.shape[3]
             packing = _WORD_PACKING
@@ -260,7 +277,7 @@ def _kernel(
 
         @pl.when(w == 0)
         def _first():
-            for d in range(ring - 1):
+            for d in range(int(first_issued), ring - 1):
                 pl.when(d < num_groups)(functools.partial(start_group, d, d))
 
         @pl.when(w + ring - 1 < num_groups)
@@ -341,7 +358,7 @@ def _kernel(
             k = jnp.concatenate(keys, axis=0)
             v = jnp.concatenate(values, axis=0)
             mask = jnp.concatenate(masks, axis=0)
-            q = q_ref[...].reshape(num_heads * block_q, head_dim)
+            q = read_q()
             q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
             s = jax.lax.dot_general(
                 k, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
@@ -428,7 +445,7 @@ def _kernel(
             mask = jnp.concatenate([slots < limit for limit in limits], axis=1)
             # Rows are head-major (h * Bq + t): every head shares a token's mask.
             mask = jnp.concatenate([mask] * num_heads, axis=0)
-            q = q_ref[...].reshape(num_heads * block_q, head_dim)
+            q = read_q()
             q = (q.astype(jnp.float32) * (sm_scale * _LOG2_E)).astype(q.dtype)
             blocks = 2 if width >= _WORDS_SPLIT_WIDTH and num_heads % 2 == 0 else 1
             rows = num_heads * block_q // blocks
@@ -569,7 +586,7 @@ def _kernel(
             mask = jnp.concatenate([mask] * num_heads, axis=0)
 
             scale = sm_scale * _LOG2_E
-            q = q_ref[...].reshape(num_heads * block_q, head_dim)
+            q = read_q()
             if not fp4:
                 q = (q.astype(jnp.float32) * scale).astype(q.dtype)
             s = jax.lax.dot_general(
@@ -977,6 +994,57 @@ def _tile_group_words(
     words_ref[start_at + num_tiles // tiles_per_step] = total
 
 
+def _ring_scratch(
+    kv_cache, scale_cache, *, words, transposed, rows, pages_per_step, head_dim
+):
+    """`_kernel`'s scratch after its outputs, and the bytes of its page ring:
+    m, l, acc for `rows` query rows (rows on sublanes for `attend`, m and l
+    lane-replicated for `attend_words`; lanes for `attend_t`), the ring of
+    `pages_per_step`-page groups and its semaphores, a 4-bit cache's scale
+    ring, and `attend_t`'s masked scores of a group (8 MiB at 32 pages of
+    32-token tiles, within `_VMEM_LIMIT_BYTES` with the ring)."""
+    fp4 = scale_cache is not None
+    _, rows_per_page, packing, _ = kv_cache.shape
+    row_width = 2 * head_dim
+    ring = 1 + (_FP4_PREFETCH if fp4 else _WORDS_PREFETCH if words else 1)
+    ml_lanes = _WORD_ROW_LANES if words and _ATTEND_WORDS else 1
+    if transposed:
+        state = [(1, rows), (1, rows), (head_dim, rows)]
+    else:
+        state = [(rows, ml_lanes), (rows, ml_lanes), (rows, head_dim)]
+    scratch = [pltpu.VMEM(shape, jnp.float32) for shape in state]
+    if words:
+        buf = pltpu.VMEM(
+            (ring, pages_per_step, 2 * rows_per_page, row_width // 2), jnp.uint32
+        )
+    else:
+        buf = pltpu.VMEM(
+            (ring, pages_per_step, 1, rows_per_page, packing, row_width),
+            kv_cache.dtype,
+        )
+    scratch += [buf, pltpu.SemaphoreType.DMA((ring, 1))]
+    held = ring * pages_per_step * rows_per_page * packing * row_width
+    held *= jnp.dtype(kv_cache.dtype).itemsize
+    if fp4:
+        scale_shape = (ring, pages_per_step, 1) + scale_cache.shape[1:]
+        scratch += [
+            pltpu.VMEM(scale_shape, jnp.float32),
+            pltpu.SemaphoreType.DMA((ring, 1)),
+        ]
+        held += math.prod(scale_shape) * 4
+    if transposed:
+        scores = (pages_per_step * rows_per_page * packing, rows)
+        scratch.append(pltpu.VMEM(scores, jnp.float32))
+    return scratch, held
+
+
+def _pair_packs(half, num_tokens, head_dim):
+    """A pair call's packs (this rank's, the other rank's, the one received:
+    `_write_pair_packs`) and the semaphores of their exchange."""
+    pack = pltpu.VMEM((half + 1, num_tokens, head_dim), jnp.uint16)
+    return [pack, pack, pack, pltpu.SemaphoreType.DMA((2,))]
+
+
 def _attention_call(
     q,
     kv_cache,
@@ -1165,9 +1233,7 @@ def _attention_call(
         if rotated:
             pair_inputs = [hadamard]
             pair_specs = [pl.BlockSpec((head_dim, head_dim), lambda w, *_: (0, 0))]
-        # This rank's and the other rank's packs, the other rank's of ours.
-        pack = pltpu.VMEM((half + 1, num_tokens, head_dim), jnp.uint16)
-        pair_scratch = [pack, pack, pack, pltpu.SemaphoreType.DMA((2,))]
+        pair_scratch = _pair_packs(half, num_tokens, head_dim)
         out_specs = pl.BlockSpec((num_tokens, half * head_dim), lambda w, *_: (0, 0))
         out_shape = jax.ShapeDtypeStruct((num_tokens, half * head_dim), q.dtype)
     else:
@@ -1190,15 +1256,14 @@ def _attention_call(
             ),
         ]
     scale_inputs = (scale_cache,) if fp4 else ()
-    ring = 1 + (_FP4_PREFETCH if fp4 else _WORDS_PREFETCH if words else 1)
-    ml_lanes = _WORD_ROW_LANES if words and _ATTEND_WORDS else 1
-    scale_scratch = (
-        (
-            pltpu.VMEM((ring, pages_per_step, 1) + scale_cache.shape[1:], jnp.float32),
-            pltpu.SemaphoreType.DMA((ring, 1)),
-        )
-        if fp4
-        else ()
+    ring_scratch, held = _ring_scratch(
+        kv_cache,
+        scale_cache if fp4 else None,
+        words=words,
+        transposed=transposed,
+        rows=num_heads * block_q,
+        pages_per_step=pages_per_step,
+        head_dim=head_dim,
     )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=4 + pair,
@@ -1217,47 +1282,7 @@ def _attention_call(
         ],
         out_specs=out_specs,
         scratch_shapes=[
-            # m, l, acc: rows on sublanes for `attend` (m and l lane-replicated
-            # for `attend_words`), lanes for `attend_t`.
-            *(
-                [
-                    pltpu.VMEM((num_heads * block_q, ml_lanes), jnp.float32),
-                    pltpu.VMEM((num_heads * block_q, ml_lanes), jnp.float32),
-                    pltpu.VMEM((num_heads * block_q, head_dim), jnp.float32),
-                ]
-                if not transposed
-                else [
-                    pltpu.VMEM((1, num_heads * block_q), jnp.float32),
-                    pltpu.VMEM((1, num_heads * block_q), jnp.float32),
-                    pltpu.VMEM((head_dim, num_heads * block_q), jnp.float32),
-                ]
-            ),
-            (
-                pltpu.VMEM(
-                    (ring, pages_per_step, 2 * rows_per_page, row_width // 2),
-                    jnp.uint32,
-                )
-                if words
-                else pltpu.VMEM(
-                    (ring, pages_per_step, 1, rows_per_page, packing, row_width),
-                    kv_cache.dtype,
-                )
-            ),
-            pltpu.SemaphoreType.DMA((ring, 1)),
-            *scale_scratch,
-            # `attend_t`'s masked scores of a group: pages_per_step * page_size *
-            # rows f32 (8 MiB at 32 pages of 32-token tiles), within
-            # `_VMEM_LIMIT_BYTES` with the page ring.
-            *(
-                [
-                    pltpu.VMEM(
-                        (pages_per_step * rows_per_page * packing, num_heads * block_q),
-                        jnp.float32,
-                    )
-                ]
-                if transposed
-                else []
-            ),
+            *ring_scratch,
             *([pltpu.SMEM((words_len + 1,), jnp.int32)] if in_kernel else []),
             *pair_scratch,
         ],
@@ -1265,10 +1290,6 @@ def _attention_call(
     num_inputs = 4 + pair + 5 + len(scale_inputs) + len(pair_inputs)
     # VMEM the call holds: its page (and scale) ring, double-buffered blocks.
     rows = tiles_per_step * block_q
-    held = ring * pages_per_step * rows_per_page * packing * row_width
-    held *= jnp.dtype(kv_cache.dtype).itemsize
-    if fp4:
-        held += ring * pages_per_step * math.prod(scale_cache.shape[1:]) * 4
     held += 2 * (2 * num_heads * rows * head_dim * q.dtype.itemsize + rows * topk * 4)
     if pair:  # three packs, the merged output, the hadamard
         held += 3 * (num_heads // 2 + 1) * num_tokens * head_dim * 2
@@ -1319,6 +1340,247 @@ def _attention_call(
         *scale_inputs,
         *pair_inputs,
         *(out if aliased else ()),
+    )
+
+
+def pair_attention(
+    q: tuple[jax.Array, jax.Array],
+    kv_cache: jax.Array,
+    local_page: jax.Array,
+    local_limit: jax.Array,
+    work_inputs: tuple[jax.Array, ...],
+    build_work,
+    *,
+    rank: jax.Array,
+    axis: str,
+    sm_scale: float,
+    topk: int,
+    pages_per_step: int,
+    scale_cache: jax.Array | None = None,
+    scale_rows: tuple[int, int] | None = None,
+    hadamard: jax.Array | None = None,
+    interpret: bool = False,
+) -> jax.Array:
+    """A DCP pair's decode attention (`_attention_call`'s pair call over
+    one KV head's 8-token tiles) that builds its own work list.
+
+    ``q = (own, peer)``: this rank's and the other rank's head-major query
+    heads ``[Hl, T, D]``, 16-bit, ``T`` a multiple of
+    `msa_attention.SMALL_BATCH_BLOCK_Q`; ``local_page`` and ``local_limit
+    [T, 1]``. At the first grid step ``build_work(*work_input_refs, keys_ref,
+    work_ref, on_first=...)`` writes each token's selected page keys ``[T,
+    topk]`` and the call's work row ``[1, W]`` (`msa_dcp.pair_work`'s
+    layout, with the unions' physical pages) in VMEM, and calls
+    ``on_first(pages, count)`` with the first tile's physical pages ``[1,
+    128]`` and page count as soon as it has them. The row is copied into
+    SMEM there; a `words` ring's first group copies its pages from the
+    vector registers meanwhile. A separate work-list kernel cost its own
+    launch, and the attention a scalar-prefetch copy of the row before its
+    first page copy (twin b8: pair_work 0.57 us, block select end -> attention
+    start 2.0 us). The only scalar operand is `rank` (``int32[1]``).
+
+    Returns this rank's heads merged over the pair, ``[T, Hl * D]``,
+    unrotated by a 4-bit cache's `hadamard`; both ranks must make the call
+    (inside a ``shard_map`` over `axis`)."""
+    q_own, q_peer = q
+    half, num_tokens, head_dim = q_own.shape
+    num_heads = 2 * half
+    block_q = msa_attention.SMALL_BATCH_BLOCK_Q
+    if (
+        num_tokens % block_q
+        or q_peer.shape != q_own.shape
+        or q_own.dtype.itemsize != 2
+        or num_heads > head_dim
+    ):
+        raise ValueError(
+            f"a pair's 16-bit query halves of whole {block_q}-token tiles, 2 * Hl "
+            f"<= D, got {q_own.dtype} {q_own.shape} and {q_peer.shape}"
+        )
+    msa_attention.check_cache(kv_cache, scale_cache)
+    _check_rows(kv_cache, head_dim, 0)
+    fp4 = scale_rows is not None
+    rotated = hadamard is not None
+    words = _words_ring(kv_cache, block_q, fp4, 2 * head_dim)
+    tiles = num_tokens // block_q
+    # Pair packs are stored tile by tile (no `_store_unaligned_rows` windows),
+    # so a step takes the most tiles that divide the call.
+    tiles_per_step = _tiles_per_step(tiles)
+    num_steps = tiles // tiles_per_step
+    step_rows = tiles_per_step * block_q
+    groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    max_groups = tiles * groups_per_tile
+    union_len = max_groups * pages_per_step
+    # One tile's row carries its group words; several tiles' carry their page
+    # counts, from which the first step builds the words (`_tile_group_words`).
+    in_kernel = tiles > 1
+    words_len = 2 * max_groups + num_steps + 1
+    physical_at = union_len + (tiles if in_kernel else words_len)
+    # The row's VMEM copy tiles whole 128-lane rows; its SMEM copy takes them all.
+    width = -(-(physical_at + union_len) // 128) * 128
+    ring_scratch, held = _ring_scratch(
+        kv_cache,
+        scale_cache if fp4 else None,
+        words=words,
+        transposed=False,
+        rows=num_heads * block_q,
+        pages_per_step=pages_per_step,
+        head_dim=head_dim,
+    )
+
+    def kernel(
+        rank_ref, q_own_ref, q_peer_ref, local_page_ref, local_limit_ref, kv_ref, *refs
+    ):
+        it = iter(refs)
+        scale_ref = next(it) if fp4 else None
+        hadamard_ref = next(it) if rotated else None
+        work_refs = [next(it) for _ in work_inputs]
+        o_ref = next(it)
+        keys, work_vmem, work_smem, zeros, copy_sem = (next(it) for _ in range(5))
+        words_smem = next(it) if in_kernel else None
+        m_ref, l_ref, acc_ref, buf, sems = (next(it) for _ in range(5))
+        scale_scratch = [next(it), next(it)] if fp4 else []
+        own_pack, peer_pack, recv_pack, pair_sems = (next(it) for _ in range(4))
+        row = work_smem.at[0]
+        b = pl.program_id(0)
+
+        @pl.when(b == 0)
+        def _first_step():
+            _signal_pair(rank_ref, axis)
+
+            def issue_first(pages, count):
+                """Group 0: the first tile's first pages (`_kernel`'s copies)."""
+                kv_words = kv_ref.bitcast(jnp.uint32).reshape(
+                    kv_ref.shape[0], -1, _WORD_ROW_LANES
+                )
+                live = jnp.minimum(count[0, 0], pages_per_step)
+                for g in range(pages_per_step):
+                    start = functools.partial(
+                        pltpu.make_async_copy(
+                            kv_words.at[pl.ds(pages[0, g], 1)],
+                            buf.at[0, pl.ds(g, 1)],
+                            sems.at[0, 0],
+                        ).start,
+                        priority=g % 2,
+                    )
+                    pl.when(g < live)(start)
+
+            build_work(
+                *work_refs, keys, work_vmem, on_first=issue_first if words else None
+            )
+            copy = pltpu.make_async_copy(work_vmem, work_smem, copy_sem)
+            copy.start()
+            zeros[0] = 0
+            zeros[1] = 0
+            copy.wait()
+            if in_kernel:
+                _tile_group_words(
+                    row.at[pl.ds(union_len, tiles)],
+                    words_smem,
+                    groups_per_tile=groups_per_tile,
+                    pages_per_step=pages_per_step,
+                    tiles_per_step=tiles_per_step,
+                )
+
+        words_ref = words_smem if in_kernel else row.at[pl.ds(union_len, words_len)]
+        rows = pl.ds(pl.multiple_of(b * step_rows, step_rows), step_rows)
+        _kernel(
+            row.at[pl.ds(0, union_len)],
+            words_ref.at[pl.ds(0, max_groups)],
+            words_ref.at[pl.ds(max_groups, max_groups)],
+            zeros,  # no page table: the row holds the physical pages
+            zeros,  # KV head 0, query block 0
+            zeros,  # no tile offset
+            q_own_ref.at[:, rows],
+            keys.at[rows],
+            local_page_ref.at[rows],
+            local_limit_ref.at[rows],
+            kv_ref,
+            *([scale_ref] if fp4 else []),
+            own_pack.at[:, rows],
+            peer_pack.at[:, rows],
+            m_ref,
+            l_ref,
+            acc_ref,
+            buf,
+            sems,
+            *scale_scratch,
+            sm_scale=sm_scale,
+            tiles_per_step=tiles_per_step,
+            groups_per_tile=groups_per_tile,
+            words=words,
+            block_start_ref=words_ref.at[pl.ds(2 * max_groups, num_steps + 1)],
+            union_page_ref=row.at[pl.ds(physical_at, union_len)],
+            # The heads in rank 0's order (this rank's first), so its own
+            # pack comes from the first head block (`_write_pair_packs`).
+            pair_rank_ref=zeros,
+            q_peer_ref=q_peer_ref.at[:, rows],
+            first_issued=words,
+            **({"fp4_rows": scale_rows} if fp4 else {}),
+        )
+        pl.when(b == num_steps - 1)(
+            functools.partial(
+                _exchange_and_merge,
+                rank_ref,
+                own_pack,
+                peer_pack,
+                recv_pack,
+                pair_sems,
+                o_ref,
+                hadamard_ref,
+                axis,
+            )
+        )
+
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    hbm = pl.BlockSpec(memory_space=pl.ANY)
+    scale_inputs = [scale_cache] if fp4 else []
+    scratch = [
+        pltpu.VMEM((num_tokens, topk), jnp.int32),
+        pltpu.VMEM((1, width), jnp.int32),
+        pltpu.SMEM((1, width), jnp.int32),
+        pltpu.SMEM((2,), jnp.int32),
+        pltpu.SemaphoreType.DMA(()),
+        *([pltpu.SMEM((words_len + 1,), jnp.int32)] if in_kernel else []),
+        *ring_scratch,
+        *_pair_packs(half, num_tokens, head_dim),
+    ]
+    held += num_heads * num_tokens * head_dim * q_own.dtype.itemsize
+    held += 3 * (half + 1) * num_tokens * head_dim * 2
+    held += num_tokens * half * head_dim * q_own.dtype.itemsize
+    held += sum(x.size * x.dtype.itemsize for x in work_inputs)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(num_steps,),
+            in_specs=[vmem] * 4
+            + [hbm] * (1 + fp4)
+            + [vmem] * rotated
+            + [vmem] * len(work_inputs),
+            out_specs=vmem,
+            scratch_shapes=scratch,
+        ),
+        out_shape=jax.ShapeDtypeStruct((num_tokens, half * head_dim), q_own.dtype),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            vmem_limit_bytes=max(_SMALL_BATCH_VMEM_LIMIT_BYTES, held + (4 << 20)),
+            disable_bounds_checks=True,
+            disable_semaphore_checks=True,
+            collective_id=_PAIR_COLLECTIVE_ID,
+        ),
+        # Remote copies and the barrier need the TPU interpreter.
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name="minimax_m3_msa_sparse_attention_lse",
+    )(
+        rank,
+        q_own,
+        q_peer,
+        local_page,
+        local_limit,
+        kv_cache,
+        *scale_inputs,
+        *([hadamard] if rotated else []),
+        *work_inputs,
     )
 
 

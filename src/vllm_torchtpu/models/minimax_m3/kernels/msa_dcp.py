@@ -1083,12 +1083,16 @@ def _union_pages(union, table_ref):
     return jnp.where(union >= 0, pages, -1)
 
 
-def _pair_work_kernel(own_ref, peer_ref, base_ref, *refs, single, groups, pages, heads):
+def _pair_work_kernel(
+    own_ref, peer_ref, base_ref, *refs, single, groups, pages, heads, on_first=None
+):
     """`pair_work` in VMEM: this rank's kept candidates' page keys
     (`_kept_keys_t`), then each tile's page union (`_tile_union`) and, with
     `pages`, its physical pages (`_union_pages`). With `heads`, the pair's
     query heads go to their rank-ordered places in HBM by two copies that run
-    under the ranking."""
+    under the ranking. With `on_first` (and `pages`), ``on_first(pages,
+    count)`` runs once the first tile's physical pages ``[1, 128]`` and page
+    count (on every lane) are known, ahead of the other tiles' unions."""
     table_ref = None
     if pages:
         table_ref, *refs = refs
@@ -1121,7 +1125,10 @@ def _pair_work_kernel(own_ref, peer_ref, base_ref, *refs, single, groups, pages,
         work_ref[:, t * union_len : (t + 1) * union_len] = union
         if table_ref is not None:
             at = pages_at + t * union_len
-            work_ref[:, at : at + union_len] = _union_pages(union, table_ref)
+            physical = _union_pages(union, table_ref)
+            work_ref[:, at : at + union_len] = physical
+            if t == 0 and on_first is not None:
+                on_first(physical, count)
         counts = jnp.where(lane == t, count, counts)
     if not single:  # `_tile_page_lists`' tile counts after the unions
         work_ref[:, tiles * union_len : pages_at] = counts[:, :tiles]
@@ -1182,6 +1189,52 @@ def _pair_work_pages(page_table: jax.Array | None) -> bool:
     )
 
 
+def _pair_work_operands(own, peer, key_base, pages_per_step, page_table):
+    """`pair_work`'s VMEM operands ``(own, peer, key_base[, table])``, tokens
+    padded to whole tiles, its kernel body (`_pair_work_kernel` with its
+    statics, `heads` left to the caller) and its work row's width."""
+    num_tokens, width = own.shape
+    topk = width // 2
+    if topk * _TILE_ROWS != _TILE_KEYS:
+        raise ValueError(
+            f"pair_work tiles {_TILE_ROWS} rows of {_TILE_KEYS // _TILE_ROWS} keys"
+        )
+    pad = -num_tokens % _TILE_ROWS
+    if num_tokens + pad > _TILE_KEYS:
+        raise ValueError(f"pair_work takes up to {_TILE_KEYS} tokens, got {num_tokens}")
+    if pad:
+        own = jnp.pad(own, ((0, pad), (0, 0)), constant_values=_NEG_INF)
+        peer = jnp.pad(peer, ((0, pad), (0, 0)), constant_values=_NEG_INF)
+        key_base = jnp.pad(key_base, ((0, pad), (0, 0)), constant_values=-1)
+    tiles = (num_tokens + pad) // _TILE_ROWS
+    groups = msa_attention._groups_per_tile(_TILE_ROWS, topk, pages_per_step)
+    if groups * pages_per_step != _TILE_KEYS:
+        raise ValueError(
+            f"{pages_per_step} pages per step do not tile {_TILE_KEYS} keys"
+        )
+    single = tiles == 1
+    # `_packed_work`'s row: [union | meta words | counts | step bounds] for one
+    # tile, [unions | tile counts] for several (`in_kernel`); then the pages.
+    pages = page_table is not None
+    width = (2 * groups + 2 if single else tiles) + (1 + pages) * tiles * _TILE_KEYS
+    operands = (own, peer, key_base)
+    if pages:
+        if not _pair_work_pages(page_table):
+            raise ValueError(
+                f"pair_work looks pages up in at most {_PAIR_WORK_MAX_TABLE_VREGS} "
+                f"vregs of a packed table, got {page_table.shape}"
+            )
+        vregs = -(-page_table.shape[0] // _TABLE_VREG_WORDS)
+        table = jnp.pad(
+            page_table, (0, vregs * _TABLE_VREG_WORDS - page_table.shape[0])
+        )
+        operands += (table.reshape(vregs, 8, _LANES),)
+    build = functools.partial(
+        _pair_work_kernel, single=single, groups=groups, pages=pages
+    )
+    return operands, build, width
+
+
 def pair_work(
     own: jax.Array,
     peer: jax.Array,
@@ -1208,51 +1261,21 @@ def pair_work(
     head-major query heads ``[Hl, T, D]``) it also returns the pair's heads
     in rank order ``[2 * Hl, T, D]``, which XLA otherwise concatenates in an
     op of its own before the attention."""
-    num_tokens, width = own.shape
-    topk = width // 2
-    if topk * _TILE_ROWS != _TILE_KEYS:
-        raise ValueError(
-            f"pair_work tiles {_TILE_ROWS} rows of {_TILE_KEYS // _TILE_ROWS} keys"
-        )
-    pad = -num_tokens % _TILE_ROWS
-    if num_tokens + pad > _TILE_KEYS:
-        raise ValueError(f"pair_work takes up to {_TILE_KEYS} tokens, got {num_tokens}")
-    if pad:
-        own = jnp.pad(own, ((0, pad), (0, 0)), constant_values=_NEG_INF)
-        peer = jnp.pad(peer, ((0, pad), (0, 0)), constant_values=_NEG_INF)
-        key_base = jnp.pad(key_base, ((0, pad), (0, 0)), constant_values=-1)
-    tiles = (num_tokens + pad) // _TILE_ROWS
-    groups = msa_attention._groups_per_tile(_TILE_ROWS, topk, pages_per_step)
-    if groups * pages_per_step != _TILE_KEYS:
-        raise ValueError(
-            f"{pages_per_step} pages per step do not tile {_TILE_KEYS} keys"
-        )
-    single = tiles == 1
-    # `_packed_work`'s row: [union | meta words | counts | step bounds] for one
-    # tile, [unions | tile counts] for several (`in_kernel`); then the pages.
-    pages = page_table is not None
-    width = (2 * groups + 2 if single else tiles) + (1 + pages) * tiles * _TILE_KEYS
+    num_tokens = own.shape[0]
+    operands, build, width = _pair_work_operands(
+        own, peer, key_base, pages_per_step, page_table
+    )
+    topk = own.shape[1] // 2
+    pad = operands[0].shape[0] - num_tokens
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
-    in_specs = [vmem] * 3
+    in_specs = [vmem] * len(operands)
     out_specs = [vmem] * 2
     out_shape = [
         jax.ShapeDtypeStruct((num_tokens + pad, topk), jnp.int32),
         jax.ShapeDtypeStruct((1, width), jnp.int32),
     ]
     scratch_shapes = []
-    operands = [own, peer, key_base]
-    if pages:
-        if not _pair_work_pages(page_table):
-            raise ValueError(
-                f"pair_work looks pages up in at most {_PAIR_WORK_MAX_TABLE_VREGS} "
-                f"vregs of a packed table, got {page_table.shape}"
-            )
-        vregs = -(-page_table.shape[0] // _TABLE_VREG_WORDS)
-        table = jnp.pad(
-            page_table, (0, vregs * _TABLE_VREG_WORDS - page_table.shape[0])
-        )
-        in_specs.append(vmem)
-        operands.append(table.reshape(vregs, 8, _LANES))
+    operands = list(operands)
     if heads is not None:
         rank, q, q_peer = heads
         hbm = pl.BlockSpec(memory_space=pl.ANY)
@@ -1262,13 +1285,7 @@ def pair_work(
         scratch_shapes.append(pltpu.SemaphoreType.DMA((2,)))
         operands += [rank_array(rank), q, q_peer]
     keys, work, *q_all = pl.pallas_call(
-        functools.partial(
-            _pair_work_kernel,
-            single=single,
-            groups=groups,
-            pages=pages,
-            heads=heads is not None,
-        ),
+        functools.partial(build, heads=heads is not None),
         in_specs=in_specs,
         out_specs=out_specs,
         out_shape=out_shape,
@@ -1642,8 +1659,10 @@ def msa_attend_dcp(
     attention kernel exchanges the partials and merges
     (`msa_attention_lse.msa_sparse_attention_lse`). A pair (``dcp == 2``,
     `q_head_major`) may pass ``q = (own, peer)``, this rank's heads and the
-    other rank's, ``[Hl, T, D]`` each: they are placed in rank order by the
-    decode work-list kernel (`pair_work`) or else concatenated.
+    other rank's, ``[Hl, T, D]`` each: a decode step that merges over the
+    pair hands them to an attention kernel that also builds its work list
+    (`msa_attention_lse.pair_attention`); otherwise they are placed in rank
+    order by the decode work-list kernel (`pair_work`) or concatenated.
     """
     halves = isinstance(q, tuple)
     if halves and not (q_head_major and dcp == 2):
@@ -1669,9 +1688,37 @@ def msa_attend_dcp(
     work = None
     page_table = msa_attention.pack_table16(block_tables.reshape(-1), kv_cache.shape[0])
     work_pages = _pair_work_pages(page_table)
-    if _takes_pair_work(
+    takes_pair_work = _takes_pair_work(
         own_first, num_heads, dcp, num_tokens, topk, max_num_seqs * pages_per_seq
-    ):
+    )
+    if takes_pair_work and halves and work_pages and pair_axis is not None:
+        # One kernel: the attention builds its work list itself (`pair_work`'s
+        # body at its first step) and reads both query halves.
+        key_base = jnp.where(valid, seq_id * pages_per_seq, -1)[:, None]
+        pages_per_step = _small_pages_per_step(num_tokens)
+        operands, build, _ = _pair_work_operands(
+            candidates[0], candidates[1], key_base, pages_per_step, page_table
+        )
+        pad = operands[0].shape[0] - num_tokens
+        out = msa_attention_lse.pair_attention(
+            tuple(jnp.pad(x, ((0, 0), (0, pad), (0, 0))) for x in q),
+            kv_cache,
+            jnp.pad(local_key, (0, pad), constant_values=-1)[:, None],
+            jnp.pad(pos % block_size + 1, (0, pad))[:, None],
+            operands,
+            functools.partial(build, heads=False),
+            rank=rank_array(rank),
+            axis=pair_axis,
+            sm_scale=sm_scale,
+            topk=topk,
+            pages_per_step=pages_per_step,
+            scale_cache=scale_cache,
+            scale_rows=None if scale_cache is None else (0, 1),
+            hadamard=hadamard,
+            interpret=interpret,
+        )
+        return out[:num_tokens]
+    if takes_pair_work:
         # One kernel: kept page keys and the attention's work list (with its
         # physical pages, and the pair's query heads in rank order).
         key_base = jnp.where(valid, seq_id * pages_per_seq, -1)[:, None]
