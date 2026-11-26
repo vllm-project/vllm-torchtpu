@@ -8932,6 +8932,8 @@ class _DmaDrainEngine(_FakeRaidenEngine):
         self.cancel_receive_calls = []
         self.cancel_receive_settled = False
         self.receive_settled = False
+        self.cancel_send_calls = []
+        self.cancel_send_settled: bool | None = None
         self.send_settled = False
 
     def cancel_receive(self, uuid):
@@ -8941,6 +8943,12 @@ class _DmaDrainEngine(_FakeRaidenEngine):
     def is_receive_settled(self, uuid):
         self.calls.append(("is_receive_settled", int(uuid)))
         return self.receive_settled
+
+    def cancel_send(self, uuid):
+        self.cancel_send_calls.append(int(uuid))
+        if self.cancel_send_settled is not None:
+            return self.cancel_send_settled
+        return self.send_settled
 
     def is_send_settled(self, uuid):
         self.calls.append(("is_send_settled", int(uuid)))
@@ -9696,6 +9704,7 @@ class TestStage3DmaDrainSafety:
         worker2._stage3_draining_sends["send-restart-drain"] = "cancelled"
         worker2._stage3_draining_send_since["send-restart-drain"] = 1.0
         worker2._stage3_draining_send_logged.add("send-restart-drain")
+        worker2._stage3_cancelled_sends.add("send-restart-drain")
 
         worker2._stage3_registered_sends["send-release-drain"] = _Stage3RegisteredSend(
             uuid=704,
@@ -9707,6 +9716,7 @@ class TestStage3DmaDrainSafety:
         worker2._stage3_draining_sends["send-release-drain"] = "cancelled"
         worker2._stage3_draining_send_since["send-release-drain"] = 2.0
         worker2._stage3_draining_send_logged.add("send-release-drain")
+        worker2._stage3_cancelled_sends.add("send-release-drain")
 
         worker2.process_send_load(
             TPUConnectorMetadata(reqs_to_release={"send-release-drain": 704})
@@ -9714,13 +9724,110 @@ class TestStage3DmaDrainSafety:
         assert "send-restart-drain" not in worker2._stage3_draining_sends
         assert "send-restart-drain" not in worker2._stage3_draining_send_since
         assert "send-restart-drain" not in worker2._stage3_draining_send_logged
+        assert "send-restart-drain" not in worker2._stage3_cancelled_sends
         assert "send-release-drain" not in worker2._stage3_draining_sends
         assert "send-release-drain" not in worker2._stage3_draining_send_since
         assert "send-release-drain" not in worker2._stage3_draining_send_logged
+        assert "send-release-drain" not in worker2._stage3_cancelled_sends
         assert "send-release-drain" not in worker2._stage3_registered_sends
         assert facade2.release_request_blocks_calls == [
             {"req_id": "send-release-drain", "uuid": 704}
         ]
+
+    def test_prefill_cancel_send_unblocks_stalled_drain_and_skips_done(
+        self, monkeypatch
+    ):
+        from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+            RaidenSendOutcome,
+        )
+
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        monkeypatch.setattr(
+            f"{_MOD}.dist_utils.get_stage3_status_probe_s", lambda: 1e-9
+        )
+
+        # Case 1: Stalled expired send only settles once cancel_send(uuid) runs.
+        class _StalledUntilCancelEngine(_DmaDrainEngine):
+            def __init__(self):
+                super().__init__()
+                self._cancelled_uuids: set[int] = set()
+
+            def cancel_send(self, uuid):
+                self.cancel_send_calls.append(int(uuid))
+                self._cancelled_uuids.add(int(uuid))
+                return False
+
+            def is_send_settled(self, uuid):
+                self.calls.append(("is_send_settled", int(uuid)))
+                return int(uuid) in self._cancelled_uuids
+
+        worker1, _, _ = self._seeded_prefill_worker(
+            req_id="send-stalled-cancel", uuid=777, expiration_time=0.0
+        )
+        engine1 = _StalledUntilCancelEngine()
+        worker1._raiden_transfer_engine = engine1
+
+        assert worker1.get_finished() == (set(), set())
+        assert engine1.cancel_send_calls == [777]
+        assert worker1._stage3_draining_sends == {"send-stalled-cancel": "cancelled"}
+
+        assert worker1.get_finished() == ({"send-stalled-cancel"}, set())
+        assert engine1.cancel_send_calls == [777]
+        assert worker1._stage3_cancelled_sends == set()
+        results1 = worker1.take_pd_send_results()
+        assert results1 is not None
+        assert results1.outcomes == {
+            "send-stalled-cancel": RaidenSendOutcome.UNCLAIMED_TIMEOUT
+        }
+
+        # Case 2: Failed send calls cancel_send once (not spammed across polls).
+        worker2, engine2, _ = self._seeded_prefill_worker(
+            req_id="send-failed-cancel", uuid=778
+        )
+        engine2.poll_results.append(([], [], ["send-failed-cancel"]))
+        assert worker2.get_finished() == (set(), set())
+        assert worker2.get_finished() == (set(), set())
+        assert engine2.cancel_send_calls == [778]
+
+        engine2.send_settled = True
+        assert worker2.get_finished() == ({"send-failed-cancel"}, set())
+        assert engine2.cancel_send_calls == [778]
+        assert worker2._stage3_cancelled_sends == set()
+        results2 = worker2.take_pd_send_results()
+        assert results2 is not None
+        assert results2.outcomes == {
+            "send-failed-cancel": RaidenSendOutcome.SEND_FAILURE
+        }
+
+        # Case 3: Healthy done_sending draining D2H must NOT call cancel_send.
+        worker3, engine3, _ = self._seeded_prefill_worker(
+            req_id="send-done-drain", uuid=779
+        )
+        engine3.poll_results.append((["send-done-drain"], [], []))
+        assert worker3.get_finished() == (set(), set())
+        assert engine3.cancel_send_calls == []
+        assert worker3._stage3_draining_sends == {"send-done-drain": "done"}
+
+        engine3.send_settled = True
+        assert worker3.get_finished() == ({"send-done-drain"}, set())
+        assert engine3.cancel_send_calls == []
+        results3 = worker3.take_pd_send_results()
+        assert results3 is not None
+        assert results3.outcomes == {"send-done-drain": RaidenSendOutcome.SUCCESS}
+
+        # Case 4: Unclaimed STATUS_CANCELLED still calls cancel_send once even
+        # when already settled, poisoning late sub-plan dispatches.
+        worker4, engine4, facade4 = self._seeded_prefill_worker(
+            req_id="send-probe-poison", uuid=780
+        )
+        engine4.send_settled = True
+        facade4.request_block_statuses[("send-probe-poison", 780)] = (
+            _STAGE3_REGISTRY_STATUS_CANCELLED
+        )
+        assert worker4.get_finished() == (set(), set())
+        assert worker4.get_finished() == ({"send-probe-poison"}, set())
+        assert engine4.cancel_send_calls == [780]
+        assert worker4._stage3_cancelled_sends == set()
 
     def test_missing_drain_apis_warns_once_and_caches_per_engine(self, monkeypatch):
         monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
@@ -9741,9 +9848,9 @@ class TestStage3DmaDrainSafety:
         assert warn_once.call_count == 1
         assert "cancel_receive, is_receive_settled" in warn_once.call_args.args[1]
         assert decode_worker._stage3_drain_engine_ref is legacy_decode_engine
-        assert decode_worker._stage3_drain_apis == (None, None, None)
+        assert decode_worker._stage3_drain_apis == (None, None, None, None)
 
-        # Prefill worker with legacy engine lacking is_send_settled.
+        # Prefill worker with legacy engine lacking cancel_send/is_send_settled.
         prefill_worker, _, _ = self._seeded_prefill_worker(
             req_id="send-legacy", uuid=730, expiration_time=0.0
         )
@@ -9755,6 +9862,6 @@ class TestStage3DmaDrainSafety:
             assert prefill_worker.get_finished() == ({"send-legacy"}, set())
             assert prefill_worker.get_finished() == (set(), set())
         assert warn_once.call_count == 1
-        assert warn_once.call_args.args[1] == "is_send_settled"
+        assert warn_once.call_args.args[1] == "cancel_send, is_send_settled"
         assert prefill_worker._stage3_drain_engine_ref is legacy_prefill_engine
-        assert prefill_worker._stage3_drain_apis == (None, None, None)
+        assert prefill_worker._stage3_drain_apis == (None, None, None, None)

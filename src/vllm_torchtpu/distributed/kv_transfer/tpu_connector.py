@@ -2715,6 +2715,7 @@ class TPURaidenConnectorWorker:
         self._stage3_draining_sends: dict[str, str] = {}
         self._stage3_draining_send_since: dict[str, float] = {}
         self._stage3_draining_send_logged: set[str] = set()
+        self._stage3_cancelled_sends: set[str] = set()
         # req_id -> next registry status probe time (Unix seconds).
         self._stage3_status_probe_next: dict[str, float] = {}
         # vLLM independently randomizes the internal request ID on the
@@ -2741,10 +2742,12 @@ class TPURaidenConnectorWorker:
         self._stage3_draining_cancelled_load_since: dict[str, float] = {}
         self._stage3_draining_cancelled_load_logged: set[str] = set()
         # Cached native Stage-3 DMA drain bindings resolved once per engine
-        # instance: (cancel_receive, is_receive_settled, is_send_settled).
+        # instance:
+        # (cancel_receive, is_receive_settled, cancel_send, is_send_settled).
         self._stage3_drain_engine_ref: Any = None
         self._stage3_drain_apis: (
             tuple[
+                Callable[[int], Any] | None,
                 Callable[[int], Any] | None,
                 Callable[[int], Any] | None,
                 Callable[[int], Any] | None,
@@ -5070,6 +5073,7 @@ class TPURaidenConnectorWorker:
         Callable[[int], Any] | None,
         Callable[[int], Any] | None,
         Callable[[int], Any] | None,
+        Callable[[int], Any] | None,
     ]:
         """Resolves and caches Stage-3 DMA drain bindings once per engine instance.
 
@@ -5083,6 +5087,7 @@ class TPURaidenConnectorWorker:
         ):
             cancel_receive = getattr(engine, "cancel_receive", None)
             is_receive_settled = getattr(engine, "is_receive_settled", None)
+            cancel_send = getattr(engine, "cancel_send", None)
             is_send_settled = getattr(engine, "is_send_settled", None)
             cancel_fn = (
                 cast(Callable[[int], Any], cancel_receive)
@@ -5092,6 +5097,11 @@ class TPURaidenConnectorWorker:
             recv_settled_fn = (
                 cast(Callable[[int], Any], is_receive_settled)
                 if callable(is_receive_settled)
+                else None
+            )
+            cancel_send_fn = (
+                cast(Callable[[int], Any], cancel_send)
+                if callable(cancel_send)
                 else None
             )
             send_settled_fn = (
@@ -5105,8 +5115,11 @@ class TPURaidenConnectorWorker:
                     missing.append("cancel_receive")
                 if recv_settled_fn is None:
                     missing.append("is_receive_settled")
-            elif send_settled_fn is None:
-                missing.append("is_send_settled")
+            else:
+                if cancel_send_fn is None:
+                    missing.append("cancel_send")
+                if send_settled_fn is None:
+                    missing.append("is_send_settled")
             if missing and engine is not None:
                 logger.warning_once(
                     "Stage-3 DMA drain gate disabled: transfer engine lacks %s "
@@ -5115,7 +5128,12 @@ class TPURaidenConnectorWorker:
                     ", ".join(missing),
                 )
             self._stage3_drain_engine_ref = engine
-            self._stage3_drain_apis = (cancel_fn, recv_settled_fn, send_settled_fn)
+            self._stage3_drain_apis = (
+                cancel_fn,
+                recv_settled_fn,
+                cancel_send_fn,
+                send_settled_fn,
+            )
         return self._stage3_drain_apis
 
     def _clear_stage3_draining_cancelled_load(self, req_id: str) -> None:
@@ -5127,6 +5145,7 @@ class TPURaidenConnectorWorker:
         self._stage3_draining_sends.pop(req_id, None)
         self._stage3_draining_send_since.pop(req_id, None)
         self._stage3_draining_send_logged.discard(req_id)
+        self._stage3_cancelled_sends.discard(req_id)
 
     def _cancel_stage3_receive(self, engine: Any, uuid: int | None) -> bool:
         """Cancels an armed/pending native receive and returns whether DMA is
@@ -5137,7 +5156,7 @@ class TPURaidenConnectorWorker:
         ``tpu_sync`` propagates ``root_uuid`` across the sub-plan chain and
         cancels/blocks all sub-plans under that root UUID.
         """
-        cancel_fn, _, _ = self._stage3_engine_drain_apis(engine)
+        cancel_fn, _, _, _ = self._stage3_engine_drain_apis(engine)
         if uuid is None or cancel_fn is None:
             return True
         return bool(cancel_fn(int(uuid)))
@@ -5145,7 +5164,7 @@ class TPURaidenConnectorWorker:
     def _is_stage3_receive_settled(self, engine: Any, uuid: int | None) -> bool:
         """Returns True iff no native H2D/receive op remains in flight for the
         request's root ``uuid`` (covering all windowed sub-plans in ``tpu_sync``)."""
-        _, recv_settled_fn, _ = self._stage3_engine_drain_apis(engine)
+        _, recv_settled_fn, _, _ = self._stage3_engine_drain_apis(engine)
         if uuid is None or recv_settled_fn is None:
             return True
         return bool(recv_settled_fn(int(uuid)))
@@ -5171,11 +5190,25 @@ class TPURaidenConnectorWorker:
         self._stage3_draining_cancelled_load_since.setdefault(req_id, time.time())
         return False
 
+    def _cancel_stage3_send(self, engine: Any, uuid: int) -> bool:
+        """Cancels an armed/pending native send and returns whether D2H/push is
+        already settled.
+
+        For windowed transfers (``dst_window_blocks``), passing the request's
+        root ``uuid`` covers every sub-plan (``SubPlanUuid(uuid, k)``) because
+        ``tpu_sync`` propagates ``root_uuid`` across the sub-plan chain and
+        cancels/blocks all sub-plans under that root UUID.
+        """
+        _, _, cancel_send_fn, _ = self._stage3_engine_drain_apis(engine)
+        if cancel_send_fn is None:
+            return True
+        return bool(cancel_send_fn(int(uuid)))
+
     def _is_stage3_send_settled(self, engine: Any, uuid: int) -> bool:
         """Returns True iff no native D2H/push send op remains in flight for
         the request's root ``uuid`` (covering all windowed sub-plans in
         ``tpu_sync``)."""
-        _, _, send_settled_fn = self._stage3_engine_drain_apis(engine)
+        _, _, _, send_settled_fn = self._stage3_engine_drain_apis(engine)
         if send_settled_fn is None:
             return True
         return bool(send_settled_fn(int(uuid)))
@@ -5475,29 +5508,36 @@ class TPURaidenConnectorWorker:
         drain_timeout_s = float(dist_utils.get_p2p_wait_pull_timeout())
         for req_id, outcome in pending_outcomes.items():
             registration = self._stage3_registered_sends.get(req_id)
-            if registration is not None and not self._is_stage3_send_settled(
-                engine, registration.uuid
-            ):
-                self._stage3_draining_sends[req_id] = outcome
-                parked_at = self._stage3_draining_send_since.setdefault(req_id, now)
+            if registration is not None:
+                settled = True
                 if (
-                    now - parked_at > drain_timeout_s
-                    and req_id not in self._stage3_draining_send_logged
+                    outcome in ("cancelled", "failed")
+                    and req_id not in self._stage3_cancelled_sends
                 ):
-                    self._stage3_draining_send_logged.add(req_id)
-                    logger.error(
-                        "Stage-3 producer send still draining past "
-                        "p2p_wait_pull_timeout (%.1fs) req_id=%s uuid=%d "
-                        "blocks=%d outcome=%s",
-                        drain_timeout_s,
-                        req_id,
-                        registration.uuid,
-                        len(registration.local_block_ids),
-                        outcome,
-                    )
-                continue
-            self._stage3_draining_send_since.pop(req_id, None)
-            self._stage3_draining_send_logged.discard(req_id)
+                    self._stage3_cancelled_sends.add(req_id)
+                    settled = self._cancel_stage3_send(engine, registration.uuid)
+                if not settled or not self._is_stage3_send_settled(
+                    engine, registration.uuid
+                ):
+                    self._stage3_draining_sends[req_id] = outcome
+                    parked_at = self._stage3_draining_send_since.setdefault(req_id, now)
+                    if (
+                        now - parked_at > drain_timeout_s
+                        and req_id not in self._stage3_draining_send_logged
+                    ):
+                        self._stage3_draining_send_logged.add(req_id)
+                        logger.error(
+                            "Stage-3 producer send still draining past "
+                            "p2p_wait_pull_timeout (%.1fs) req_id=%s uuid=%d "
+                            "blocks=%d outcome=%s",
+                            drain_timeout_s,
+                            req_id,
+                            registration.uuid,
+                            len(registration.local_block_ids),
+                            outcome,
+                        )
+                    continue
+            self._clear_stage3_draining_send(req_id)
             outcomes[req_id] = outcome
         if self._pd_send_results is not None:
             result_by_native_outcome = {
@@ -6995,7 +7035,7 @@ class TPURaidenConnectorWorker:
             for req_id in expired_uncertain:
                 if self._cancel_or_drain_stage3_load(engine, req_id):
                     failed_recving.append(req_id)
-            cancel_receive_fn, _, _ = self._stage3_engine_drain_apis(engine)
+            cancel_receive_fn, _, _, _ = self._stage3_engine_drain_apis(engine)
             if cancel_receive_fn is not None:
                 aborted_active = [
                     req_id
