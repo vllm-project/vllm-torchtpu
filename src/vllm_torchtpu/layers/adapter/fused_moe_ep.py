@@ -355,7 +355,6 @@ def _build_op(
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
-        + ((spec,) if has_shared_partial else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -367,20 +366,29 @@ def _build_op(
         fn = moe_with_score_bias
     elif has_hash_ids:
         fn = moe_with_hash_ids
-    elif has_shared_partial:
-        fn = moe_with_shared
     else:
         fn = moe
-    op = jax_op(
-        name,
-        fn,
-        mesh=mesh,
-        # x, w1, w2, w1_scale, w2_scale, gating, rank
-        # [, score_bias | hash_ids | shared]
-        # -- and the single output is sharded on axis 0 like x.
-        input_partition_specs=input_specs,
-        output_partition_specs=spec,
-    )
+    if has_shared_partial:
+        # jax_op annotates the specs as tuple[tuple[str, ...], ...]; it takes
+        # PartitionSpecs. x, w1, w2, w1_scale, w2_scale, gating, rank, shared.
+        # pyrefly: ignore[no-matching-overload]
+        op = jax_op(
+            name,
+            moe_with_shared,
+            mesh=mesh,
+            input_partition_specs=input_specs + (spec,),
+            output_partition_specs=spec,
+        )
+    else:
+        op = jax_op(
+            name,
+            fn,
+            mesh=mesh,
+            # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
+            # -- and the single output is sharded on axis 0 like x.
+            input_partition_specs=input_specs,
+            output_partition_specs=spec,
+        )
 
     # Replaces the fake jax_op installs, which resolves the output aval by
     # running a real `jax.export` every time Dynamo traces the op. This kernel
