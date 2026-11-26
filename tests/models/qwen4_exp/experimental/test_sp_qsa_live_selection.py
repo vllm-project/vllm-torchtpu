@@ -190,6 +190,7 @@ def test_qsa_sel_buf_registration_and_apply_lifecycle(transition: str):
         parent: Any = nn.Module()
         meta_bb: Any = nn.Module()
         meta_bb.embed_tokens = nn.Embedding(VOCAB, HIDDEN)
+        meta_bb.register_shared_gdn_verify_buffers = lambda _owner: False
         layers = [nn.Module(), nn.Module(), nn.Module()]
         object.__setattr__(layers[0], "layer_type", "linear_attention")
         object.__setattr__(layers[1], "layer_type", "full_attention")

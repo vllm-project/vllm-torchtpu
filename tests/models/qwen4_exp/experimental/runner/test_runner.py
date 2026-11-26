@@ -50,6 +50,7 @@ NEW_METHODS = {
     "_snapshot_two_slot_gdn_verify_inputs",
     "_plan_two_slot_boundary_copies",
     "_two_slot_dist3",
+    "_two_slot_win_and_reqs",
     "_get_compiled_boundary_meta",
     "_post_verify_two_slot_gdn_chunk",
     "_replay_two_slot_gdn_chunk",
@@ -711,7 +712,10 @@ def test_post_verify_two_slot_ordering_replay_copy_flip():
         query_start_loc=qsl,
         seq_lens=seq_lens,
         staged_verify_inputs=None,
-        staged_ping_pong_state_stack=torch.tensor([[11, 30, 50]], dtype=torch.int32),
+        staged_ping_pong_stacks=(
+            torch.tensor([[11, 30, 50]], dtype=torch.int32),
+            torch.tensor([[[11, 12], [30, 31], [50, 51]]], dtype=torch.int32),
+        ),
     )
     md = SimpleNamespace(draft_lengths_cpu=np.array([3, 3, 0], dtype=np.int32))
 

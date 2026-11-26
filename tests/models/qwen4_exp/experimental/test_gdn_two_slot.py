@@ -1135,11 +1135,11 @@ def test_staged_walk_products_heterogeneous_gdn_and_ple():
     out = exp_md._staged_walk_products(
         staged, seq_lens, tuple(table_geom), mamba_geom, ckpt_window=4
     )
-    # 4 tables + 4 states + 4 ckpts + 1 tail stack (pp_s) = 13
-    assert len(out) == 13
+    # 4 tables + 4 states + 4 ckpts + 3 tail stacks (pp_s, pp_c, ple_s) = 15
+    assert len(out) == 15
     states = out[4:8]
     ckpts = out[8:12]
-    pp_s = out[12]
+    pp_s, pp_c, ple_s = out[12], out[13], out[14]
 
     assert tuple(ckpts[0].shape) == (2, 2)
     assert tuple(ckpts[1].shape) == (2, 4)
@@ -1151,8 +1151,14 @@ def test_staged_walk_products_heterogeneous_gdn_and_ple():
         torch.tensor([[101, 102, 103, 104], [200, 201, 202, 203]], dtype=torch.int32),
     )
     assert tuple(pp_s.shape) == (2, 2)
+    assert tuple(pp_c.shape) == (2, 2, 2)
+    assert tuple(ple_s.shape) == (2, 2)
     assert torch.equal(pp_s[0], states[0])
     assert torch.equal(pp_s[1], states[2])
+    assert torch.equal(pp_c[0], ckpts[0])
+    assert torch.equal(pp_c[1], ckpts[2])
+    assert torch.equal(ple_s[0], states[1])
+    assert torch.equal(ple_s[1], states[3])
 
 
 def test_build_group_partitions_ping_pong_vs_ple_state_indices():

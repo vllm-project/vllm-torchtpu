@@ -39,7 +39,7 @@ class ConvWeightsRef:
 @dataclasses.dataclass(frozen=True)
 class GDNWeightsRef:
     a_log: Any
-    dt_bias: Any
+    dt_bias: Any | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -104,6 +104,8 @@ class MetadataRef:
     # `cfg.single_checkpoint` is True (0 skips HBM state write for read-only
     # verify; >0 writes the single state after `commit_len` tokens).
     s_idx_to_commit_len: Any = None
+    # Optional [num_tiles] int32 layer ordinal for multi-layer single-launch replay.
+    p_id_to_layer: Any = None
 
     @classmethod
     def create(
@@ -121,6 +123,7 @@ class MetadataRef:
         s_idx_to_ckpt_indices: jax.Array | None = None,
         p_id_to_state_override: jax.Array | None = None,
         s_idx_to_commit_len: jax.Array | None = None,
+        p_id_to_layer: jax.Array | None = None,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
@@ -141,6 +144,7 @@ class MetadataRef:
                 else SmemWrapper(p_id_to_state_override, shape)
             ),
             s_idx_to_commit_len=s_idx_to_commit_len,
+            p_id_to_layer=p_id_to_layer,
         )
 
     def state_override(self, p_id, idx, state_idx):
@@ -242,6 +246,8 @@ class InBufferedRef(BaseBufferedRef):
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class OutBufferedRef(BaseBufferedRef):
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        if self.cfg.skip_out_write:
+            return
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
@@ -262,6 +268,8 @@ class OutBufferedRef(BaseBufferedRef):
                 ).start()
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        if self.cfg.skip_out_write:
+            return
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_wait_out_slot

@@ -422,6 +422,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         ple_raw_embeddings=None,
         sequence_parallel=False,
         gdn_step_metadata_cache=None,
+        gdn_verify_collector: (
+            list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None
+        ) = None,
         qsa_sel_rows: list[torch.Tensor] | None = None,
     ):
         """``sequence_parallel``: ``hidden`` and the result are this TP rank's
@@ -442,7 +445,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
             block = sp.gather(block, num_tokens)
         if self.layer_type == "linear_attention":
             block = sp.reduce(
-                self.linear_attn(block, gdn_step_metadata_cache), sequence_parallel
+                self.linear_attn(
+                    block,
+                    gdn_step_metadata_cache,
+                    **(
+                        {}
+                        if gdn_verify_collector is None
+                        else {"verify_collector": gdn_verify_collector}
+                    ),
+                ),
+                sequence_parallel,
             )
         else:
             block, selected = self.self_attn.forward_with_indices(
@@ -659,6 +671,147 @@ class Qwen4ExpBackbone(nn.Module):
             prefill_norm_tile=hc_tile,
             prefill_full_tile=hc_tile,
         )
+        self._init_shared_gdn_verify_flat_buffers()
+
+    def _two_slot_gdn_layers(self) -> list[Any]:
+        """Return 2-slot MTP GDN layers on this backbone in layer order."""
+        return [
+            layer.linear_attn
+            for layer in cast(list[Any], list(self.layers))
+            if getattr(layer, "layer_type", None) == "linear_attention"
+            and getattr(layer.linear_attn, "_two_slot_mtp", False)
+            and getattr(layer.linear_attn, "_verify_win_cap", 0) > 0
+        ]
+
+    def _init_shared_gdn_verify_flat_buffers(self) -> None:
+        """Allocate non-SP shared verify flat buffers across all 2-slot GDN layers.
+
+        - Non-SP backbone (`16..1024` buckets): `[L * win_stride, dim]` (`dim=0`)
+          eliminates per-layer cross-lane `dim=-1` shifts on narrow TP shards.
+        - SP backbone (`2048..8192` buckets): `[win_cap, L * dim]` (`dim=-1`)
+          is allocated lazily in `register_shared_gdn_verify_buffers` only when
+          `Qwen4ExpBackboneSP` is created (`sp.enabled(tp_size)`).
+        """
+        gdn_layers = self._two_slot_gdn_layers()
+        self.register_buffer("_gdn_verify_qkv_sp_flat", None, persistent=False)
+        self.register_buffer("_gdn_verify_b_sp_flat", None, persistent=False)
+        self.register_buffer("_gdn_verify_a_sp_flat", None, persistent=False)
+        self._last_verify_flat_from_sp = False
+        if not gdn_layers:
+            self.register_buffer("_gdn_verify_qkv_flat", None, persistent=False)
+            self.register_buffer("_gdn_verify_b_flat", None, persistent=False)
+            self.register_buffer("_gdn_verify_a_flat", None, persistent=False)
+            return
+        l0 = gdn_layers[0]
+        n_gdn = len(gdn_layers)
+        win_cap = int(l0._verify_win_cap)
+        win_stride = ((win_cap + 7) // 8) * 8
+        qd = int(l0._verify_qkv_dim)
+        vd = int(l0._verify_local_n_v)
+        dt = l0._verify_act_dtype
+        dev = l0.A_log.device
+        qkv_flat = torch.zeros((n_gdn * win_stride, qd), dtype=dt, device=dev)
+        b_flat = torch.zeros((n_gdn * win_stride, vd), dtype=dt, device=dev)
+        a_flat = torch.zeros((n_gdn * win_stride, vd), dtype=dt, device=dev)
+        self.register_buffer("_gdn_verify_qkv_flat", qkv_flat, persistent=False)
+        self.register_buffer("_gdn_verify_b_flat", b_flat, persistent=False)
+        self.register_buffer("_gdn_verify_a_flat", a_flat, persistent=False)
+        for ord_idx, lin in enumerate(gdn_layers):
+            lin.bind_shared_verify_flat(
+                qkv_flat,
+                b_flat,
+                a_flat,
+                ord_idx,
+                win_stride=win_stride,
+                sp_flat_tensors=None,
+                backbone_ref=self,
+            )
+
+    def _apply(self, fn, recurse=True):
+        ret = nn.Module._apply(self, fn, recurse=recurse)
+        buffers = self._buffers
+        qkv_f = buffers.get("_gdn_verify_qkv_flat")
+        b_f = buffers.get("_gdn_verify_b_flat")
+        a_f = buffers.get("_gdn_verify_a_flat")
+        if qkv_f is not None and b_f is not None and a_f is not None:
+            gdn_layers = self._two_slot_gdn_layers()
+            if gdn_layers:
+                win_stride = qkv_f.shape[0] // len(gdn_layers)
+                sp_q = buffers.get("_gdn_verify_qkv_sp_flat")
+                sp_b = buffers.get("_gdn_verify_b_sp_flat")
+                sp_a = buffers.get("_gdn_verify_a_sp_flat")
+                sp_flat = (
+                    (sp_q, sp_b, sp_a)
+                    if (sp_q is not None and sp_b is not None and sp_a is not None)
+                    else None
+                )
+                for ord_idx, lin in enumerate(gdn_layers):
+                    lin.bind_shared_verify_flat(
+                        qkv_f,
+                        b_f,
+                        a_f,
+                        ord_idx,
+                        win_stride=win_stride,
+                        sp_flat_tensors=sp_flat,
+                        backbone_ref=self,
+                    )
+        return ret
+
+    def register_shared_gdn_verify_buffers(self, owner: nn.Module) -> bool:
+        """Lazily allocate SP (`dim=-1`) verify staging buffers and bind to `owner`."""
+        gdn_layers = self._two_slot_gdn_layers()
+        if not gdn_layers:
+            return False
+        buffers = self._buffers
+        qkv_f = buffers.get("_gdn_verify_qkv_flat")
+        b_f = buffers.get("_gdn_verify_b_flat")
+        a_f = buffers.get("_gdn_verify_a_flat")
+        if not (
+            isinstance(qkv_f, torch.Tensor)
+            and isinstance(b_f, torch.Tensor)
+            and isinstance(a_f, torch.Tensor)
+        ):
+            return False
+        sp_q = buffers.get("_gdn_verify_qkv_sp_flat")
+        sp_b = buffers.get("_gdn_verify_b_sp_flat")
+        sp_a = buffers.get("_gdn_verify_a_sp_flat")
+        if not (
+            isinstance(sp_q, torch.Tensor)
+            and isinstance(sp_b, torch.Tensor)
+            and isinstance(sp_a, torch.Tensor)
+        ):
+            l0 = gdn_layers[0]
+            n_gdn = len(gdn_layers)
+            win_cap = int(l0._verify_win_cap)
+            qd = int(l0._verify_qkv_dim)
+            vd = int(l0._verify_local_n_v)
+            sp_q = torch.zeros(
+                (win_cap, n_gdn * qd), dtype=qkv_f.dtype, device=qkv_f.device
+            )
+            sp_b = torch.zeros(
+                (win_cap, n_gdn * vd), dtype=b_f.dtype, device=b_f.device
+            )
+            sp_a = torch.zeros(
+                (win_cap, n_gdn * vd), dtype=a_f.dtype, device=a_f.device
+            )
+            self.register_buffer("_gdn_verify_qkv_sp_flat", sp_q, persistent=False)
+            self.register_buffer("_gdn_verify_b_sp_flat", sp_b, persistent=False)
+            self.register_buffer("_gdn_verify_a_sp_flat", sp_a, persistent=False)
+            win_stride = qkv_f.shape[0] // n_gdn
+            for ord_idx, lin in enumerate(gdn_layers):
+                lin.bind_shared_verify_flat(
+                    qkv_f,
+                    b_f,
+                    a_f,
+                    ord_idx,
+                    win_stride=win_stride,
+                    sp_flat_tensors=(sp_q, sp_b, sp_a),
+                    backbone_ref=self,
+                )
+        owner.register_buffer("_gdn_verify_qkv_flat", sp_q, persistent=False)
+        owner.register_buffer("_gdn_verify_b_flat", sp_b, persistent=False)
+        owner.register_buffer("_gdn_verify_a_flat", sp_a, persistent=False)
+        return True
 
     def forward(
         self,
@@ -676,6 +829,17 @@ class Qwen4ExpBackbone(nn.Module):
     ):
         """The replicated-TP backbone; sequence-parallel steps go to
         ``Qwen4ExpBackboneSP``, a separate compiled graph over the same layers."""
+        if not torch.compiler.is_compiling():
+            self._last_verify_flat_from_sp = False
+        buffers = getattr(self, "_buffers", None) or {}
+        qkv_f = buffers.get("_gdn_verify_qkv_flat")
+        b_f = buffers.get("_gdn_verify_b_flat")
+        a_f = buffers.get("_gdn_verify_a_flat")
+        flat_bufs = (
+            (qkv_f, b_f, a_f)
+            if (qkv_f is not None and b_f is not None and a_f is not None)
+            else None
+        )
         return Qwen4ExpBackbone._forward_impl(
             self,
             input_ids,
@@ -689,6 +853,7 @@ class Qwen4ExpBackbone(nn.Module):
             valid_tokens=valid_tokens,
             main_block_table=main_block_table,
             compressed_block_table=compressed_block_table,
+            gdn_verify_flat_bufs=flat_bufs,
         )
 
     def _forward_impl(
@@ -705,6 +870,9 @@ class Qwen4ExpBackbone(nn.Module):
         valid_tokens,
         main_block_table,
         compressed_block_table,
+        gdn_verify_flat_bufs: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None,
         qsa_sel_buf: torch.Tensor | None = None,
     ):
         # Resolve host lookup before any decoder work so shape arithmetic
@@ -747,6 +915,9 @@ class Qwen4ExpBackbone(nn.Module):
             if plan.value("VLLM_TPU_GDN_HOIST_METADATA")
             else None
         )
+        gdn_collector: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None = (
+            [] if gdn_verify_flat_bufs is not None else None
+        )
         sel_rows: list[torch.Tensor] | None = [] if qsa_sel_buf is not None else None
         for index, layer in enumerate(self.layers):
             if ple_token is not None and index == self.host_ple_index:
@@ -765,8 +936,57 @@ class Qwen4ExpBackbone(nn.Module):
                 ple_raw_embeddings,
                 sequence_parallel=sequence_parallel,
                 gdn_step_metadata_cache=gdn_step_metadata_cache,
+                gdn_verify_collector=gdn_collector,
                 qsa_sel_rows=sel_rows,
             )
+        if gdn_verify_flat_bufs is not None and gdn_collector:
+            qkv_f, b_f, a_f = gdn_verify_flat_bufs
+            if sequence_parallel:
+                qkv_cat = torch.cat([x[0] for x in gdn_collector], dim=-1).contiguous()
+                b_cat = torch.cat([x[1] for x in gdn_collector], dim=-1).contiguous()
+                a_cat = torch.cat([x[2] for x in gdn_collector], dim=-1).contiguous()
+            else:
+                n_gdn = len(gdn_collector)
+                w_stride = qkv_f.shape[0] // n_gdn
+                n_r = gdn_collector[0][0].shape[0]
+                r_pad = w_stride - n_r
+                if r_pad > 0:
+                    qkv_cat = torch.cat(
+                        [
+                            torch.nn.functional.pad(x[0], (0, 0, 0, r_pad))
+                            for x in gdn_collector
+                        ],
+                        dim=0,
+                    ).contiguous()
+                    b_cat = torch.cat(
+                        [
+                            torch.nn.functional.pad(x[1], (0, 0, 0, r_pad))
+                            for x in gdn_collector
+                        ],
+                        dim=0,
+                    ).contiguous()
+                    a_cat = torch.cat(
+                        [
+                            torch.nn.functional.pad(x[2], (0, 0, 0, r_pad))
+                            for x in gdn_collector
+                        ],
+                        dim=0,
+                    ).contiguous()
+                else:
+                    qkv_cat = torch.cat(
+                        [x[0] for x in gdn_collector], dim=0
+                    ).contiguous()
+                    b_cat = torch.cat([x[1] for x in gdn_collector], dim=0).contiguous()
+                    a_cat = torch.cat([x[2] for x in gdn_collector], dim=0).contiguous()
+            if qkv_f.device.type == "tpu":
+                update_rows_(qkv_f, qkv_cat.to(qkv_f.dtype))
+                update_rows_(b_f, b_cat.to(b_f.dtype))
+                update_rows_(a_f, a_cat.to(a_f.dtype))
+            else:
+                n_rows = qkv_cat.shape[0]
+                qkv_f[:n_rows].copy_(qkv_cat.to(qkv_f.dtype))
+                b_f[:n_rows].copy_(b_cat.to(b_f.dtype))
+                a_f[:n_rows].copy_(a_cat.to(a_f.dtype))
         if qsa_sel_buf is not None and sel_rows:
             sel_mat = torch.stack(sel_rows, dim=0).contiguous()
             if qsa_sel_buf.device.type == "tpu":
@@ -804,10 +1024,13 @@ class Qwen4ExpBackboneSP(nn.Module):
 
     _backbone: Any
     _qsa_sel_buf: torch.Tensor | None
+    _has_shared_gdn_verify: bool = False
 
     def __init__(self, *, vllm_config: Any = None, backbone):
+        del vllm_config
         super().__init__()
         object.__setattr__(self, "_backbone", backbone)
+        self._has_shared_gdn_verify = backbone.register_shared_gdn_verify_buffers(self)
         num_qsa = _count_qsa_layers(backbone)
         self.register_buffer(
             "_qsa_sel_buf",
@@ -820,6 +1043,22 @@ class Qwen4ExpBackboneSP(nn.Module):
             else None,
             persistent=False,
         )
+
+    def _apply(self, fn, recurse=True):
+        # Shared SP verify buffers are owned by `_backbone`; clear aliases before
+        # `super()._apply` so `fn` (e.g. `to_empty`) avoids duplicate allocation,
+        # then re-bind the transformed tensors from `_backbone`.
+        for key in (
+            "_gdn_verify_qkv_flat",
+            "_gdn_verify_b_flat",
+            "_gdn_verify_a_flat",
+        ):
+            self._buffers.pop(key, None)
+        ret = super()._apply(fn, recurse=recurse)
+        self._has_shared_gdn_verify = self._backbone.register_shared_gdn_verify_buffers(
+            self
+        )
+        return ret
 
     def forward(
         self,
@@ -835,6 +1074,19 @@ class Qwen4ExpBackboneSP(nn.Module):
         main_block_table,
         compressed_block_table,
     ):
+        if not torch.compiler.is_compiling():
+            self._backbone._last_verify_flat_from_sp = True
+        buffers = self._buffers
+        flat_bufs = (
+            (
+                buffers["_gdn_verify_qkv_flat"],
+                buffers["_gdn_verify_b_flat"],
+                buffers["_gdn_verify_a_flat"],
+            )
+            if self._has_shared_gdn_verify
+            and buffers.get("_gdn_verify_qkv_flat") is not None
+            else None
+        )
         return self._backbone._forward_impl(
             input_ids,
             positions,
@@ -847,6 +1099,7 @@ class Qwen4ExpBackboneSP(nn.Module):
             valid_tokens=valid_tokens,
             main_block_table=main_block_table,
             compressed_block_table=compressed_block_table,
+            gdn_verify_flat_bufs=flat_bufs,
             qsa_sel_buf=self._qsa_sel_buf,
         )
 
@@ -898,12 +1151,15 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def forward(self, input_ids, positions, inputs_embeds=None, **kwargs):
         # The route reads the padded bucket size outside both compiled graphs.
         if self.model_sp is None:
+            self.model._last_verify_flat_from_sp = False
             return self.model(input_ids, positions, inputs_embeds, **kwargs)
         serves_sp = bucket_filter.assigned(self.model_sp)
         assert serves_sp is not None
         if serves_sp(input_ids.shape[0]):
+            self.model._last_verify_flat_from_sp = True
             with bucket_filter.serving(serves_sp), set_model_tag("backbone_sp"):
                 return self.model_sp(input_ids, positions, inputs_embeds, **kwargs)
+        self.model._last_verify_flat_from_sp = False
         serves_main = bucket_filter.assigned(self.model)
         assert serves_main is not None
         with bucket_filter.serving(serves_main):

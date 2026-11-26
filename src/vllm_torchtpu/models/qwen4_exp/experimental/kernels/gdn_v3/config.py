@@ -130,6 +130,8 @@ class GDNConfig:
     # Write at most 1 committed state checkpoint per sequence instead of
     # `window_size` checkpoints (used by MTP 2-slot ping-pong state replay).
     single_checkpoint: bool = False
+    # Skip output-activation DMAs (state-only multi-layer rejection replay).
+    skip_out_write: bool = False
     # PER_SEQ chunked GDN only: the tile holds two chunks of the same
     # sequence (tile_size = 2 * sub_chunk_size), whose state-independent
     # work is batched over heads (TPU_GDN_CHUNK_PAIR).

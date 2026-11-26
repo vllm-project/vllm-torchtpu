@@ -109,8 +109,10 @@ from .two_slot import (
     compute_boundary_copy_no_verify_impl,
     compute_replay_commit_lens,
     expand_split_masked,
+    get_or_build_multi_layer_two_slot_replay,
     has_ping_pong_copy_groups,
     is_ping_pong_copy_gid,
+    ping_pong_layers_match_group_order,
     spec_boundary_pairs_compiled,
     spec_boundary_pairs_impl,
     two_slot_entries_shape,
@@ -522,8 +524,11 @@ class Qwen38Runner(TPUModelRunner):
                     "query_start_loc": ctx.query_start_loc,
                     "seq_lens": ctx.seq_lens,
                     "staged_verify_inputs": None,
-                    "staged_ping_pong_state_stack": getattr(
-                        ctx, "staged_ping_pong_state_stack", None
+                    "staged_ping_pong_stacks": getattr(
+                        ctx, "staged_ping_pong_stacks", None
+                    ),
+                    "staged_std_mamba_stack": getattr(
+                        ctx, "staged_std_mamba_stack", None
                     ),
                     "boundary_plan": boundary_plan,
                 }
@@ -555,9 +560,8 @@ class Qwen38Runner(TPUModelRunner):
                                 query_start_loc=rec["query_start_loc"],
                                 seq_lens=rec["seq_lens"],
                                 staged_verify_inputs=rec["staged_verify_inputs"],
-                                staged_ping_pong_state_stack=rec[
-                                    "staged_ping_pong_state_stack"
-                                ],
+                                staged_ping_pong_stacks=rec["staged_ping_pong_stacks"],
+                                staged_std_mamba_stack=rec["staged_std_mamba_stack"],
                             )
                         )
                     else:
@@ -633,6 +637,15 @@ class Qwen38Runner(TPUModelRunner):
         self._compiled_boundary_meta_cache = (cache_key, res)
         return res
 
+    def _two_slot_win_and_reqs(self, w: int, n: int, dev: torch.device) -> torch.Tensor:
+        cache = self.__dict__.setdefault("_two_slot_win_reqs_device", {})
+        key = (int(w), int(n), dev)
+        t = cache.get(key)
+        if t is None:
+            t = torch.tensor([int(w), int(n)], dtype=torch.int32, device=dev)
+            cache[key] = t
+        return t
+
     @torch.no_grad()
     def _post_verify_two_slot_gdn_chunk(
         self,
@@ -640,13 +653,125 @@ class Qwen38Runner(TPUModelRunner):
         md: Any,
         next_tokens: torch.Tensor,
         boundary_plan: Any,
-    ) -> None:
-        """Per-layer 2-slot rejection replay, boundary export, and slot flip."""
+        mamba_indices: list[torch.Tensor] | None = None,
+    ) -> bool:
+        """Fused post-verify 2-slot GDN replay + boundary export + offset update.
+
+        Returns True when non-ping-pong Mamba groups (`mamba_indices`, e.g. 12
+        PLE groups) also had their `slot_read_offsets` updated inside
+        `replay_and_flip`, allowing `sample_tokens` to skip the separate
+        `_update_mamba_slot_read_offsets` dispatch.
+        """
+        if (
+            chunk is not None
+            and chunk.chunk_num_windowed > 0
+            and chunk.staged_verify_inputs is None
+            and chunk.staged_ping_pong_stacks is not None
+            and self.mamba_slot_read_offsets is not None
+            and chunk.query_start_loc.device.type == "tpu"
+            and bool(md.draft_lengths_cpu[: chunk.num_reqs].any())
+        ):
+            layers = self._get_two_slot_gdn_layers()
+            if layers:
+                s_st, c_st = chunk.staged_ping_pong_stacks
+                if (
+                    s_st.shape[0] in (1, len(layers))
+                    and c_st.shape[0] == s_st.shape[0]
+                    and ping_pong_layers_match_group_order(
+                        self, layers, is_ping_pong_spec=is_ping_pong_mamba_spec
+                    )
+                ):
+                    multi_runner = get_or_build_multi_layer_two_slot_replay(
+                        self, layers
+                    )
+                    if (
+                        multi_runner is not None
+                        and multi_runner.can_replay_and_flip_fast()
+                    ):
+                        dev = chunk.query_start_loc.device
+                        w = chunk.chunk_num_windowed
+                        ple_st = (
+                            chunk.staged_std_mamba_stack
+                            if (
+                                chunk.staged_std_mamba_stack is not None
+                                and mamba_indices is not None
+                                and chunk.staged_std_mamba_stack.shape[0]
+                                == len(mamba_indices)
+                            )
+                            else None
+                        )
+                        ple_done = ple_st is not None or not mamba_indices
+                        dist = self._two_slot_dist3(w, dev)
+                        wr_vec = self._two_slot_win_and_reqs(w, chunk.num_reqs, dev)
+                        if boundary_plan is None:
+                            multi_runner.replay_and_flip(
+                                state_stack=s_st,
+                                ckpt_stack=c_st,
+                                query_start_loc=chunk.query_start_loc,
+                                next_tokens=next_tokens,
+                                win_and_reqs=wr_vec,
+                                distribution=dist,
+                                seq_lens=chunk.seq_lens,
+                                slot_read_offsets=self.mamba_slot_read_offsets,
+                                ple_state_stack=ple_st,
+                            )
+                            return ple_done
+                        bmeta = self._get_compiled_boundary_meta(layers, dev)
+                        if bmeta is not None:
+                            raws0, is_pp_mask, layer_to_plan_idx, zero_offsets = bmeta
+                            width = self._mamba_ckpt_window + 1
+                            split = max(1, self._pool_block_split)
+                            out_bucket = self._bucket_len(
+                                len(self._mamba_copy_plan)
+                                * int(boundary_plan.entries.shape[0])
+                                * split
+                            )
+                            # Compute boundary copy & interior replay targets BEFORE
+                            # `replay_and_flip` flips `mamba_slot_read_offsets`.
+                            c_src, c_dst, s_int, ckpt_int, cl_int = (
+                                compute_boundary_copy_and_interior_compiled(
+                                    boundary_plan.entries,
+                                    chunk.seq_lens,
+                                    next_tokens,
+                                    self.mamba_slot_read_offsets,
+                                    self._num_reqs_tensor(w),
+                                    is_pp_mask,
+                                    layer_to_plan_idx,
+                                    boundary_plan.block_size,
+                                    width,
+                                    split,
+                                    out_bucket,
+                                )
+                            )
+                            multi_runner.replay_and_flip(
+                                state_stack=s_st,
+                                ckpt_stack=c_st,
+                                query_start_loc=chunk.query_start_loc,
+                                next_tokens=next_tokens,
+                                win_and_reqs=wr_vec,
+                                distribution=dist,
+                                seq_lens=chunk.seq_lens,
+                                slot_read_offsets=self.mamba_slot_read_offsets,
+                                ple_state_stack=ple_st,
+                            )
+                            self._copy_mamba_state_blocks(raws0, c_src, c_dst)
+                            multi_runner(
+                                raw_state_indices_stack=s_int,
+                                raw_ckpt_indices_stack=ckpt_int,
+                                commit_lens_stack=cl_int,
+                                query_start_loc=chunk.query_start_loc,
+                                distribution=dist,
+                                seq_lens=chunk.seq_lens,
+                                slot_read_offsets=zero_offsets,
+                            )
+                            return ple_done
+
         self._replay_two_slot_gdn_chunk(chunk, md, next_tokens)
         self._copy_two_slot_boundary_states(
             boundary_plan, next_tokens, ping_pong_chunk=chunk
         )
         self._update_ping_pong_mamba_slot_read_offsets(chunk)
+        return False
 
     @torch.no_grad()
     def _replay_two_slot_gdn_chunk(
@@ -673,6 +798,58 @@ class Qwen38Runner(TPUModelRunner):
             return
         dev = chunk.query_start_loc.device
         dist = self._two_slot_dist3(chunk.chunk_num_windowed, dev)
+        multi_runner = get_or_build_multi_layer_two_slot_replay(self, layers)
+        if multi_runner is not None:
+            if chunk.staged_ping_pong_stacks is not None and dev.type == "tpu":
+                s_st, c_st = chunk.staged_ping_pong_stacks
+                if (
+                    s_st.shape[0] in (1, len(layers))
+                    and c_st.shape[0] == s_st.shape[0]
+                    and ping_pong_layers_match_group_order(
+                        self, layers, is_ping_pong_spec=is_ping_pong_mamba_spec
+                    )
+                ):
+                    multi_runner(
+                        raw_state_indices_stack=s_st,
+                        raw_ckpt_indices_stack=c_st,
+                        commit_lens_stack=commit_lens.unsqueeze(0),
+                        query_start_loc=chunk.query_start_loc,
+                        distribution=dist,
+                        seq_lens=chunk.seq_lens,
+                        slot_read_offsets=self.mamba_slot_read_offsets,
+                        staged_inputs=chunk.staged_verify_inputs,
+                    )
+                    return
+            per_layer_sc: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for layer in layers:
+                layer_md = chunk.attn_metadata.get(layer.prefix)
+                if layer_md is None:
+                    per_layer_sc = []
+                    break
+                s_ids = mamba_state_of(layer_md)
+                c_ids = mamba_ckpt_of(layer_md)
+                if s_ids is None or c_ids is None:
+                    per_layer_sc = []
+                    break
+                per_layer_sc.append((s_ids, c_ids))
+            if len(per_layer_sc) == len(layers):
+                s_stack = torch.stack(
+                    [s.to(torch.int32) for s, _ in per_layer_sc], dim=0
+                )
+                c_stack = torch.stack(
+                    [c.to(torch.int32) for _, c in per_layer_sc], dim=0
+                )
+                multi_runner(
+                    raw_state_indices_stack=s_stack,
+                    raw_ckpt_indices_stack=c_stack,
+                    commit_lens_stack=commit_lens.unsqueeze(0),
+                    query_start_loc=chunk.query_start_loc,
+                    distribution=dist,
+                    seq_lens=chunk.seq_lens,
+                    slot_read_offsets=self.mamba_slot_read_offsets,
+                    staged_inputs=chunk.staged_verify_inputs,
+                )
+                return
         for layer in layers:
             layer_md = chunk.attn_metadata.get(layer.prefix)
             if layer_md is None:
@@ -712,6 +889,19 @@ class Qwen38Runner(TPUModelRunner):
         dev = chunk.seq_lens.device
         dist = self._two_slot_dist3(chunk.chunk_num_windowed, dev)
         if cl_int.device.type == "cpu" and not bool((cl_int > 0).any()):
+            return
+        multi_runner = get_or_build_multi_layer_two_slot_replay(self, layers)
+        if multi_runner is not None:
+            multi_runner(
+                raw_state_indices_stack=s_int,
+                raw_ckpt_indices_stack=ckpt_int,
+                commit_lens_stack=cl_int,
+                query_start_loc=chunk.query_start_loc,
+                distribution=dist,
+                seq_lens=chunk.seq_lens,
+                slot_read_offsets=zero_offsets,
+                staged_inputs=chunk.staged_verify_inputs,
+            )
             return
         for l_idx, layer in enumerate(layers):
             cl_l = cl_int[l_idx]
@@ -1001,8 +1191,8 @@ class Qwen38Runner(TPUModelRunner):
         ):
             return
         groups = (
-            [chunk.staged_ping_pong_state_stack]
-            if chunk.staged_ping_pong_state_stack is not None
+            [chunk.staged_ping_pong_stacks[0]]
+            if chunk.staged_ping_pong_stacks is not None
             else list(chunk.state_indices)
         )
         fn = (
@@ -1943,15 +2133,17 @@ class Qwen38Runner(TPUModelRunner):
                             if two_slot_plan is not None
                             else boundary_plan
                         )
-                        self._post_verify_two_slot_gdn_chunk(
+                        ple_handled = self._post_verify_two_slot_gdn_chunk(
                             ping_pong_chunk,
                             md,
                             next_tokens,
                             active_plan,
+                            mamba_indices,
                         )
-                        self._update_mamba_slot_read_offsets(
-                            mamba_indices, next_tokens, num_reqs
-                        )
+                        if not ple_handled:
+                            self._update_mamba_slot_read_offsets(
+                                mamba_indices, next_tokens, num_reqs
+                            )
                     else:
                         read_offsets = self._update_mamba_slot_read_offsets(
                             mamba_indices, next_tokens, num_reqs

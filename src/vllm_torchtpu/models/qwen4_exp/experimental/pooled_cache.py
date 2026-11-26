@@ -360,9 +360,354 @@ class Qwen4ExpPooledCache:
                 config.num_blocks, dtype=torch.int32
             ).to(runner.device)
         runner._precompile_mamba_state_seed_copies()
+        self._precompile_two_slot_gdn_replay(runner, materialized)
         if not runner.enforce_eager:
             runner._precompile_substitute_placeholder_token()
         return materialized.kv_caches
+
+    def _precompile_two_slot_gdn_replay(self, runner, materialized) -> None:
+        """Quiescent precompile of 2-slot multi-layer replay & boundary export.
+
+        Runs in `initialize` while the unified pool is quiescent so first-step
+        draft rejection never triggers mid-serving compilation spikes.
+        """
+        if (
+            runner.enforce_eager
+            or runner.device.type != "tpu"
+            or getattr(runner, "mamba_slot_read_offsets", None) is None
+        ):
+            return
+        gdn_layers = tuple(
+            layer.linear_attn
+            for layer in self.model.model.layers
+            if layer.layer_type == "linear_attention"
+            and layer.linear_attn._two_slot_mtp
+        )
+        if not gdn_layers:
+            return
+        import contextlib
+
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            set_vllm_model_wrapper_context,
+        )
+        from vllm_torchtpu.runner.tpu_runner import (
+            _get_padded_num_reqs_with_upper_limit,
+        )
+
+        from .runner.metadata import is_ping_pong_mamba_spec
+        from .runner.two_slot import (
+            compute_boundary_copy_and_interior_compiled,
+            compute_boundary_copy_no_verify_compiled,
+            count_mamba_group_classes,
+            get_or_build_multi_layer_two_slot_replay,
+            two_slot_entries_shape,
+            update_ping_pong_read_offsets_compiled,
+        )
+
+        req_pads = sorted(
+            {
+                int(p)
+                for p in (
+                    getattr(runner, "num_reqs_paddings", None) or [runner.max_num_reqs]
+                )
+                if int(p) > 0
+            }
+        )
+        # Serving sizes seq_lens, query_start_loc, and staged mamba stacks to
+        # target_num_reqs ({num_reqs_max_model_len, num_reqs_most_model_len}),
+        # while RejectionSampler pads next_tokens to padded_num_reqs from
+        # num_reqs_paddings (<= _get_padded_num_reqs_with_upper_limit(target, max)).
+        target_req_counts = sorted(
+            {
+                int(r)
+                for r in (
+                    getattr(runner, "num_reqs_max_model_len", None),
+                    getattr(runner, "num_reqs_most_model_len", None),
+                )
+                if r is not None and int(r) > 0
+            }
+        )
+        if not target_req_counts:
+            target_req_counts = req_pads
+        spec_k = int(num_speculative_tokens(runner.vllm_config))
+        num_pp_groups, num_std_mamba_groups = count_mamba_group_classes(
+            runner,
+            len(gdn_layers),
+            is_ping_pong_spec=is_ping_pong_mamba_spec,
+        )
+        num_total_mamba_groups = len(getattr(runner, "_mamba_copy_plan", ()) or ())
+        wrapper_ctx = (
+            set_vllm_model_wrapper_context(
+                vllm_config=runner.vllm_config, mesh=runner.mesh
+            )
+            if getattr(runner, "mesh", None) is not None
+            else contextlib.nullcontext()
+        )
+        with wrapper_ctx, torch.no_grad():
+            multi_runner = get_or_build_multi_layer_two_slot_replay(runner, gdn_layers)
+            dist = torch.tensor([1, 1, 1], dtype=torch.int32, device=runner.device)
+            w_scalar = torch.tensor(1, dtype=torch.int64, device=runner.device)
+            wr_vec = torch.tensor([0, 0], dtype=torch.int32, device=runner.device)
+            bmeta = runner._get_compiled_boundary_meta(gdn_layers, runner.device)
+            b_width = runner._mamba_ckpt_window + 1
+            b_split = max(1, runner._pool_block_split)
+            b_block_size = (
+                runner._mamba_column_stride()
+                if getattr(runner, "_mamba_state_block_size", None) is not None
+                else 512
+            )
+            has_sp_flat = gdn_layers[0]._shared_verify_sp_flat_tensors is not None
+            modes = (False, True) if has_sp_flat else (False,)
+            for target_reqs in target_req_counts:
+                nt_upper = _get_padded_num_reqs_with_upper_limit(
+                    target_reqs, runner.max_num_reqs
+                )
+                nt_pads = [p for p in req_pads if p <= nt_upper] or [nt_upper]
+                entries_shapes = sorted(
+                    {
+                        two_slot_entries_shape(runner, k)
+                        for k in range(1, target_reqs + 1)
+                    }
+                )
+                sids = torch.zeros(
+                    (target_reqs,), dtype=torch.int32, device=runner.device
+                )
+                qsl = torch.zeros(
+                    (target_reqs + 1,), dtype=torch.int32, device=runner.device
+                )
+                slens = torch.zeros(
+                    (target_reqs,), dtype=torch.int32, device=runner.device
+                )
+                ckpt = torch.zeros(
+                    (target_reqs, 2), dtype=torch.int32, device=runner.device
+                )
+                clens = torch.zeros(
+                    (target_reqs,), dtype=torch.int32, device=runner.device
+                )
+                pp_s = torch.zeros(
+                    (num_pp_groups, target_reqs),
+                    dtype=torch.int32,
+                    device=runner.device,
+                )
+                pp_c = torch.zeros(
+                    (num_pp_groups, target_reqs, 2),
+                    dtype=torch.int32,
+                    device=runner.device,
+                )
+                ple_s = (
+                    torch.zeros(
+                        (num_std_mamba_groups, target_reqs),
+                        dtype=torch.int32,
+                        device=runner.device,
+                    )
+                    if num_std_mamba_groups > 0
+                    else None
+                )
+                pp_list = [sids.clone() for _ in range(num_pp_groups)]
+                sync_list = [
+                    *materialized.raw_tensors,
+                    runner.mamba_slot_read_offsets,
+                    dist,
+                    w_scalar,
+                    wr_vec,
+                    sids,
+                    qsl,
+                    slens,
+                    ckpt,
+                    clens,
+                    pp_s,
+                    pp_c,
+                    *pp_list,
+                ]
+                if ple_s is not None:
+                    sync_list.append(ple_s)
+                synchronize_tensors(sync_list)
+                if multi_runner is not None:
+                    last_interior: (
+                        tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+                    ) = None
+                    for nt_pad in nt_pads:
+                        nt = torch.full(
+                            (nt_pad, spec_k + 1),
+                            -1,
+                            dtype=torch.int32,
+                            device=runner.device,
+                        )
+                        synchronize_tensors([nt])
+                        if multi_runner.can_replay_and_flip_fast():
+                            for sp_mode in modes:
+                                multi_runner.replay_and_flip(
+                                    state_stack=pp_s,
+                                    ckpt_stack=pp_c,
+                                    query_start_loc=qsl,
+                                    next_tokens=nt,
+                                    win_and_reqs=wr_vec,
+                                    distribution=dist,
+                                    seq_lens=slens,
+                                    slot_read_offsets=runner.mamba_slot_read_offsets,
+                                    ple_state_stack=ple_s,
+                                    force_sp=sp_mode,
+                                )
+                                if ple_s is not None:
+                                    multi_runner.replay_and_flip(
+                                        state_stack=pp_s,
+                                        ckpt_stack=pp_c,
+                                        query_start_loc=qsl,
+                                        next_tokens=nt,
+                                        win_and_reqs=wr_vec,
+                                        distribution=dist,
+                                        seq_lens=slens,
+                                        slot_read_offsets=runner.mamba_slot_read_offsets,
+                                        ple_state_stack=None,
+                                        force_sp=sp_mode,
+                                    )
+                            synchronize_tensors(
+                                [
+                                    *materialized.raw_tensors,
+                                    runner.mamba_slot_read_offsets,
+                                ]
+                            )
+                        if bmeta is not None and num_total_mamba_groups > 0:
+                            raws0, is_pp_mask, layer_to_plan_idx, zero_offsets = bmeta
+                            synchronize_tensors([zero_offsets])
+                            for shape in entries_shapes:
+                                dummy_entries = torch.zeros(
+                                    shape,
+                                    dtype=torch.int32,
+                                    device=runner.device,
+                                )
+                                synchronize_tensors([dummy_entries])
+                                out_bucket = runner._bucket_len(
+                                    num_total_mamba_groups * shape[0] * b_split
+                                )
+                                _, _, s_int, ckpt_int, cl_int = (
+                                    compute_boundary_copy_and_interior_compiled(
+                                        dummy_entries,
+                                        slens,
+                                        nt,
+                                        runner.mamba_slot_read_offsets,
+                                        w_scalar,
+                                        is_pp_mask,
+                                        layer_to_plan_idx,
+                                        b_block_size,
+                                        b_width,
+                                        b_split,
+                                        out_bucket,
+                                    )
+                                )
+                                last_interior = (s_int, ckpt_int, cl_int)
+                    if bmeta is not None and num_total_mamba_groups > 0:
+                        raws0, is_pp_mask, _layer_to_plan_idx, zero_offsets = bmeta
+                        synchronize_tensors([zero_offsets])
+                        for shape in entries_shapes:
+                            dummy_entries = torch.zeros(
+                                shape,
+                                dtype=torch.int32,
+                                device=runner.device,
+                            )
+                            synchronize_tensors([dummy_entries])
+                            out_bucket = runner._bucket_len(
+                                num_total_mamba_groups * shape[0] * b_split
+                            )
+                            c_src = c_dst = None
+                            for has_win in (True, False):
+                                c_src, c_dst = compute_boundary_copy_no_verify_compiled(
+                                    dummy_entries,
+                                    slens,
+                                    runner.mamba_slot_read_offsets,
+                                    w_scalar,
+                                    is_pp_mask,
+                                    has_win,
+                                    b_block_size,
+                                    b_width,
+                                    b_split,
+                                    out_bucket,
+                                )
+                            assert c_src is not None and c_dst is not None
+                            runner._copy_mamba_state_blocks(raws0, c_src, c_dst)
+                        assert last_interior is not None
+                        s_int, ckpt_int, cl_int = last_interior
+                        for sp_mode in modes:
+                            multi_runner(
+                                raw_state_indices_stack=s_int,
+                                raw_ckpt_indices_stack=ckpt_int,
+                                commit_lens_stack=cl_int,
+                                query_start_loc=qsl,
+                                distribution=dist,
+                                seq_lens=slens,
+                                slot_read_offsets=zero_offsets,
+                                force_sp=sp_mode,
+                            )
+                    cl_1d = clens.unsqueeze(0)
+                    l_s = (
+                        sids.unsqueeze(0).expand(len(gdn_layers), -1).contiguous()
+                        if num_pp_groups != len(gdn_layers)
+                        else None
+                    )
+                    l_c = (
+                        ckpt.unsqueeze(0).expand(len(gdn_layers), -1, -1).contiguous()
+                        if num_pp_groups != len(gdn_layers)
+                        else None
+                    )
+                    if l_s is not None and l_c is not None:
+                        synchronize_tensors([l_s, l_c])
+                    for sp_mode in modes:
+                        multi_runner(
+                            raw_state_indices_stack=pp_s,
+                            raw_ckpt_indices_stack=pp_c,
+                            commit_lens_stack=cl_1d,
+                            query_start_loc=qsl,
+                            distribution=dist,
+                            seq_lens=slens,
+                            slot_read_offsets=runner.mamba_slot_read_offsets,
+                            force_sp=sp_mode,
+                        )
+                        if l_s is not None and l_c is not None:
+                            multi_runner(
+                                raw_state_indices_stack=l_s,
+                                raw_ckpt_indices_stack=l_c,
+                                commit_lens_stack=cl_1d,
+                                query_start_loc=qsl,
+                                distribution=dist,
+                                seq_lens=slens,
+                                slot_read_offsets=runner.mamba_slot_read_offsets,
+                                force_sp=sp_mode,
+                            )
+                    update_ping_pong_read_offsets_compiled(
+                        runner.mamba_slot_read_offsets,
+                        [pp_s],
+                        qsl,
+                        w_scalar,
+                        w_scalar,
+                    )
+                    update_ping_pong_read_offsets_compiled(
+                        runner.mamba_slot_read_offsets,
+                        pp_list,
+                        qsl,
+                        w_scalar,
+                        w_scalar,
+                    )
+                    synchronize_tensors(
+                        [*materialized.raw_tensors, runner.mamba_slot_read_offsets]
+                    )
+                gdn_layers[0].replay_two_slot_state(
+                    state_indices=sids,
+                    query_start_loc=qsl,
+                    distribution=dist,
+                    seq_lens=slens,
+                    slot_read_offsets=runner.mamba_slot_read_offsets,
+                    ckpt_indices=ckpt,
+                    commit_lens=clens,
+                )
+                synchronize_tensors(materialized.raw_tensors)
+        logger.info(
+            "Qwen4Exp precompiled %d-layer 2-slot GDN replay+flip for "
+            "target_reqs=%s, req_paddings=%s, sp_modes=%s",
+            len(gdn_layers),
+            target_req_counts,
+            req_pads,
+            modes,
+        )
 
     def dummy_metadata(self, metadata, active_rows):
         """Disjoint owner pages even before runner cache initialization.

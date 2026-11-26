@@ -49,7 +49,8 @@ class PingPongMambaChunkState(NamedTuple):
     staged_verify_inputs: (
         dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None
     ) = None
-    staged_ping_pong_state_stack: torch.Tensor | None = None
+    staged_ping_pong_stacks: tuple[torch.Tensor, torch.Tensor] | None = None
+    staged_std_mamba_stack: torch.Tensor | None = None
 
 
 def two_slot_entries_shape(runner: Any, num_candidates: int) -> tuple[int, int]:
@@ -432,6 +433,141 @@ def compute_replay_commit_lens(
     is_win = row_idx < num_windowed
     rejected = is_win & (num_valid < q_lens) & (num_valid > 0)
     return torch.where(rejected, num_valid, torch.zeros_like(q_lens))
+
+
+def get_or_build_multi_layer_two_slot_replay(
+    runner: Any, layers: tuple[Any, ...]
+) -> Any:
+    """Return cached `MultiLayerPooledReplayRunner` keyed on layer/pool identities."""
+    if not layers:
+        return None
+    kv0 = getattr(layers[0], "kv_cache", None)
+    if not kv0 or len(kv0) != 1 or kv0[0].numel() == 0:
+        return None
+    cache_key = (tuple(id(layer) for layer in layers), id(kv0[0]))
+    cached = getattr(runner, "_two_slot_multi_replay_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+    # Function-local imports break the two_slot <-> ops.gdn_attention_op cycle
+    # and keep pure-PyTorch callers free of vLLM wrapper context dependencies.
+    import contextlib
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    from ..ops.gdn_attention_op import build_multi_layer_pooled_replay_runner
+
+    wrapper_ctx = (
+        set_vllm_model_wrapper_context(vllm_config=runner.vllm_config, mesh=runner.mesh)
+        if (
+            getattr(runner, "vllm_config", None) is not None
+            and getattr(runner, "mesh", None) is not None
+        )
+        else contextlib.nullcontext()
+    )
+    with wrapper_ctx:
+        multi_runner = build_multi_layer_pooled_replay_runner(layers)
+    runner._two_slot_multi_replay_cache = (cache_key, multi_runner)
+    return multi_runner
+
+
+def ping_pong_layers_match_group_order(
+    runner: Any,
+    layers: tuple[Any, ...],
+    *,
+    is_ping_pong_spec: Any,
+) -> bool:
+    """Return True when staged ping-pong group rows match `layers` in order.
+
+    Caches the check by `(id(attn_groups), layer ids)` so steady-state decode
+    pays O(1). When `runner.attn_groups` is absent (minimal stubs), assumes the
+    caller constructed matching stacks directly.
+    """
+    attn_groups = getattr(runner, "attn_groups", None)
+    if not attn_groups:
+        return True
+    cache_key = (id(attn_groups), tuple(id(layer) for layer in layers))
+    cached = getattr(runner, "_pp_layer_order_cache", None)
+    if cached is not None and cached[0] == cache_key:
+        return bool(cached[1])
+    # Function-local import keeps two_slot.py importable without vLLM kv_cache specs.
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    vllm_config = getattr(runner, "vllm_config", None)
+    seen: set[int] = set()
+    pp_group_layers: list[frozenset[str]] = []
+    for group_list in attn_groups:
+        for group in group_list:
+            gid = getattr(group, "kv_cache_group_id", None)
+            if gid is not None:
+                if gid in seen:
+                    continue
+                seen.add(gid)
+            spec = getattr(group, "kv_cache_spec", None)
+            first_spec = getattr(spec, "first_spec", spec)
+            if not isinstance(first_spec, MambaSpec):
+                continue
+            if is_ping_pong_spec(spec, vllm_config):
+                pp_group_layers.append(frozenset(group.layer_names))
+    if len(pp_group_layers) == 1:
+        ok = all(layer.prefix in pp_group_layers[0] for layer in layers)
+    elif len(pp_group_layers) == len(layers):
+        ok = all(
+            layer.prefix in group_names
+            for layer, group_names in zip(layers, pp_group_layers)
+        )
+    else:
+        ok = False
+    runner._pp_layer_order_cache = (cache_key, ok)
+    return ok
+
+
+def count_mamba_group_classes(
+    runner: Any,
+    num_gdn_layers: int,
+    *,
+    is_ping_pong_spec: Any,
+) -> tuple[int, int]:
+    """Return ``(num_ping_pong_groups, num_std_mamba_groups)`` for warmup.
+
+    Counts unique KV cache groups directly from ``runner.attn_groups`` so
+    ``mamba_cache_mode='none'`` (where ``_mamba_copy_plan`` is empty) still
+    warms the exact ``[G_pp, req_pad]`` and ``[G_std, req_pad]`` shapes that
+    serving dispatches. Falls back to ``_mamba_copy_ping_pong_gids`` /
+    ``num_gdn_layers`` when ``attn_groups`` is unavailable.
+    """
+    # Function-local import keeps two_slot.py importable without vLLM kv_cache specs.
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    attn_groups = getattr(runner, "attn_groups", None)
+    vllm_config = getattr(runner, "vllm_config", None)
+    if attn_groups:
+        seen: set[int] = set()
+        num_pp = 0
+        num_std = 0
+        for group_list in attn_groups:
+            for group in group_list:
+                gid = getattr(group, "kv_cache_group_id", None)
+                if gid is not None:
+                    if gid in seen:
+                        continue
+                    seen.add(gid)
+                spec = getattr(group, "kv_cache_spec", None)
+                first_spec = getattr(spec, "first_spec", spec)
+                if not isinstance(first_spec, MambaSpec):
+                    continue
+                if is_ping_pong_spec(spec, vllm_config):
+                    num_pp += 1
+                else:
+                    num_std += 1
+        if num_pp > 0 or num_std > 0:
+            return max(1, num_pp), num_std
+    pp_gids = getattr(runner, "_mamba_copy_ping_pong_gids", ()) or ()
+    total_copy = len(getattr(runner, "_mamba_copy_plan", ()) or ())
+    if pp_gids:
+        return len(pp_gids), max(0, total_copy - len(pp_gids))
+    return max(1, num_gdn_layers), 0
 
 
 def _tpu_compile_fn(fn):

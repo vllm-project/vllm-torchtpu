@@ -205,6 +205,7 @@ def _staged_walk_products(
     ckpts_by_j: dict[int, torch.Tensor] = {}
     prefill_ckpts = []
     pp_indices: list[int] = []
+    std_indices: list[int] = []
     if mamba_geom:
         active = seq_lens > 0
         device = seq_lens.device
@@ -219,8 +220,11 @@ def _staged_walk_products(
             ew = entry[4] if len(entry) > 4 else ckpt_window
             pp = entry[5] if len(entry) > 5 else int(1 < ew < ckpt_window)
             classes.setdefault((t, bs, ew, pp), []).append(j)
-            if ckpt_window > 1 and pp and ew == 2:
-                pp_indices.append(j)
+            if ckpt_window > 1:
+                if pp and ew == 2:
+                    pp_indices.append(j)
+                else:
+                    std_indices.append(j)
         for (t, bs, ew, _pp), members in classes.items():
             n = table_geom[mamba_geom[members[0]][0]][1]
             # Flat offset of row r of member g: table offset + r * t.
@@ -291,6 +295,9 @@ def _staged_walk_products(
         # Preserve original `mamba_geom` order even if ping-pong groups span
         # multiple `(t, bs)` geometry classes.
         tail.append(torch.stack([states[j] for j in pp_indices], dim=0))
+        tail.append(torch.stack([ckpts_by_j[j] for j in pp_indices], dim=0))
+        if std_indices:
+            tail.append(torch.stack([states[j] for j in std_indices], dim=0))
     return (
         tuple(outs)
         + tuple(states)
@@ -864,6 +871,7 @@ def _issue_walk_products(
         has_ckpt = ctx.mamba_ckpt_window > 1
         ckpt_cursor = 0
         has_pp_2col = False
+        has_std = False
         ckpts_per_group: list[torch.Tensor | None] = []
         for entry in mamba_geom_6:
             ew, pp = entry[4], entry[5]
@@ -872,8 +880,12 @@ def _issue_walk_products(
                 ckpt_cursor += 1
                 if pp and ew == 2:
                     has_pp_2col = True
+                else:
+                    has_std = True
             else:
                 ckpts_per_group.append(None)
+                if has_ckpt:
+                    has_std = True
         rest = rest[ckpt_cursor:]
         # Prefill checkpoint ids follow, one per group that declares them.
         num_prefill_ckpts = (
@@ -896,10 +908,14 @@ def _issue_walk_products(
                 ckpts_per_group[j],
                 prefill_ckpt,
             )
-        if has_heterogeneous_pp and has_pp_2col and len(tail) >= 1:
-            ctx.staged_ping_pong_state_stack = tail[0]  # type: ignore[attr-defined]
+        if has_heterogeneous_pp and has_pp_2col and len(tail) >= 2:
+            ctx.staged_ping_pong_stacks = (tail[0], tail[1])  # type: ignore[attr-defined]
+            ctx.staged_std_mamba_stack = (  # type: ignore[attr-defined]
+                tail[2] if (has_std and len(tail) >= 3) else None
+            )
         else:
-            ctx.staged_ping_pong_state_stack = None  # type: ignore[attr-defined]
+            ctx.staged_ping_pong_stacks = None  # type: ignore[attr-defined]
+            ctx.staged_std_mamba_stack = None  # type: ignore[attr-defined]
 
 
 def build_attention_metadata(
