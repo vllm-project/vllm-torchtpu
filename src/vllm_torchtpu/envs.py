@@ -221,6 +221,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MEGAKERNEL: str = ""
     VLLM_TPU_EXPERIMENTAL_USE_RUST: bool = False
     VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY: str = ""
+    TPU_SUBSPACE_RPA: bool = False
 
 
 def env_with_choices(
@@ -1356,6 +1357,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY": env_str(
         "VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY", default=""
     ),
+    # Opt-in Subspace-RPA KV storage for Gemma 4 global attention layers
+    # (attention_k_eq_v=True, head dim 512, num_kv_shared_layers=0) with
+    # --attention-backend CUSTOM and an FP8 KV cache.
+    "TPU_SUBSPACE_RPA": env_bool("TPU_SUBSPACE_RPA", default=False),
 }
 
 
