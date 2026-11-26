@@ -186,7 +186,7 @@ def make_fp8_experts(monkeypatch):
     """CPU `RoutedExperts` under `quant`, holding TP rank `tp_rank` of the experts."""
     # Here rather than in tests/layers/adapter/quantization/: see dist_ctx.
 
-    def make(quant, shard_size, *, tp_size=2, tp_rank=1):
+    def make(quant, shard_size, *, tp_size=2, tp_rank=1, load_format=None):
         from types import SimpleNamespace
 
         from vllm.config import set_current_vllm_config
@@ -250,6 +250,7 @@ def make_fp8_experts(monkeypatch):
         quant.vllm_config = SimpleNamespace(
             parallel_config=SimpleNamespace(enable_expert_parallel=False),
             model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp8")),
+            load_config=SimpleNamespace(load_format=load_format),
         )
         with set_current_vllm_config(quant.vllm_config):
             return RoutedExperts(
