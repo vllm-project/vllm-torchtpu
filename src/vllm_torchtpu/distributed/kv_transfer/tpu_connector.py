@@ -5218,7 +5218,11 @@ class TPURaidenConnectorWorker:
         _, _, cancel_send_fn, _ = self._stage3_engine_drain_apis(engine)
         if cancel_send_fn is None:
             return True
-        return bool(cancel_send_fn(int(uuid)))
+        try:
+            return bool(cancel_send_fn(int(uuid)))
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Stage-3 cancel_send failed for uuid=%d: %s", int(uuid), exc)
+            return False
 
     def _is_stage3_send_settled(self, engine: Any, uuid: int) -> bool:
         """Returns True iff no native D2H/push send op remains in flight for

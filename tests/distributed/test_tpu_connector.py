@@ -10215,6 +10215,83 @@ class TestStage3DmaDrainSafety:
         assert engine4.cancel_send_calls == [780]
         assert worker4._stage3_cancelled_sends == set()
 
+    def test_prefill_cancel_send_runtime_error_preserves_batch_and_prewarms_engine(
+        self, monkeypatch
+    ):
+        from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+            RaidenSendOutcome,
+        )
+
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        worker, engine, _ = self._seeded_prefill_worker(req_id="send-err", uuid=751)
+        worker._stage3_registered_sends["send-ok"] = _Stage3RegisteredSend(
+            uuid=752,
+            local_block_ids=(1,),
+            num_tokens=1024,
+            expiration_time=1e20,
+            finish_pending=False,
+        )
+
+        settled_by_uuid = {751: False, 752: True}
+        cancel_send_calls: list[int] = []
+
+        def _raising_cancel_send(uuid):
+            cancel_send_calls.append(int(uuid))
+            if int(uuid) == 751:
+                raise RuntimeError("injected native cancel_send failure")
+            return True
+
+        def _is_send_settled(uuid):
+            engine.calls.append(("is_send_settled", int(uuid)))
+            return settled_by_uuid[int(uuid)]
+
+        engine.cancel_send = _raising_cancel_send
+        engine.is_send_settled = _is_send_settled
+        worker._stage3_send_outcomes["send-err"] = "failed"
+        worker._stage3_send_outcomes["send-ok"] = "done"
+
+        # Poll 1: cancel_send(751) raising RuntimeError must log an error, keep
+        # send-err parked in _stage3_draining_sends, and still report send-ok.
+        with patch(f"{_MOD}.logger.error") as err_log:
+            assert worker.get_finished() == ({"send-ok"}, set())
+        assert cancel_send_calls == [751]
+        assert any(
+            "Stage-3 cancel_send failed" in call.args[0]
+            for call in err_log.call_args_list
+        )
+        assert worker._stage3_draining_sends == {"send-err": "failed"}
+        results1 = worker.take_pd_send_results()
+        assert results1 is not None
+        assert results1.outcomes == {"send-ok": RaidenSendOutcome.SUCCESS}
+
+        # Poll 2: once uuid 751 settles natively, send-err retires as SEND_FAILURE.
+        settled_by_uuid[751] = True
+        assert worker.get_finished() == ({"send-err"}, set())
+        results2 = worker.take_pd_send_results()
+        assert results2 is not None
+        assert results2.outcomes == {"send-err": RaidenSendOutcome.SEND_FAILURE}
+        assert worker._stage3_draining_sends == {}
+
+        # Also verify _ensure_raiden_transfer_engine pre-warms Stage-3 drain APIs
+        # at engine construction time (covering the cold-engine path).
+        cold_worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, dp_size=4, pcp_size=1
+        )
+        cold_worker.runner = SimpleNamespace(kv_caches=[])
+        cold_engine = _FakeRaidenEngine()
+        with (
+            patch.object(
+                cold_worker,
+                "_construct_raiden_transfer_engine",
+                return_value=cold_engine,
+            ),
+            patch(f"{_MOD}.logger.warning_once") as prewarm_warn,
+        ):
+            built = cold_worker._ensure_raiden_transfer_engine()
+        assert built is cold_engine
+        assert cold_worker._stage3_drain_engine_ref is cold_engine
+        assert prewarm_warn.call_count == 1
+
     def test_missing_drain_apis_warns_once_and_caches_per_engine(self, monkeypatch):
         monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
 
