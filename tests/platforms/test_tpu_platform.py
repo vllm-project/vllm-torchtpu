@@ -31,6 +31,7 @@ from vllm.config import (
     ParallelConfig,
     VllmConfig,
 )
+from vllm.config.aux_output import AuxOutputConfig
 from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -49,6 +50,7 @@ from vllm_torchtpu.platforms.tpu_platform import (
     _validate_lora_config,
     _validate_peer_replay_config,
     _validate_phased_profiling_config,
+    _validate_routed_experts_config,
     get_tpu_multihost_topology,
 )
 
@@ -291,6 +293,9 @@ class TestTpuPlatform:
         vllm_config.model_config.hf_config = None
         # Set in ModelConfig.__post_init__, so the spec has no such attribute.
         vllm_config.model_config.runner_type = "generate"
+        arch_config = MagicMock(total_num_hidden_layers=1)
+        arch_config.__getitem__.return_value.head_size = 128
+        vllm_config.model_config.model_arch_config = arch_config
         vllm_config.cache_config = CacheConfig()
         vllm_config.cache_config.block_size = None
         vllm_config.cache_config.enable_prefix_caching = False
@@ -308,6 +313,7 @@ class TestTpuPlatform:
         vllm_config.scheduler_config.async_scheduling = False
         vllm_config.speculative_config = None
         vllm_config.lora_config = None
+        vllm_config.aux_output_config = AuxOutputConfig()
         vllm_config.parallel_config = MagicMock()
         vllm_config.parallel_config.prefill_context_parallel_size = 1
         vllm_config.parallel_config.nnodes = 1
@@ -477,7 +483,11 @@ class TestTpuPlatform:
             with pytest.raises(NotImplementedError, match=message):
                 TpuPlatform.check_and_update_config(vllm_config)
 
-    @pytest.mark.parametrize("head_size,refused", [(64, True), (128, False)])
+    @pytest.mark.parametrize("layout", ["HND", "NHD"])
+    @pytest.mark.parametrize(
+        "swa_head_dim,global_head_dim,refused_under_hnd",
+        [(64, None, True), (128, None, False), (256, 64, True), (256, 512, False)],
+    )
     @patch("vllm_torchtpu.patch_registry.apply")
     @patch(
         "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
@@ -488,17 +498,32 @@ class TestTpuPlatform:
         mock_apply_patches,
         vllm_config,
         monkeypatch,
-        head_size,
-        refused,
+        layout,
+        swa_head_dim,
+        global_head_dim,
+        refused_under_hnd,
     ):
-        """The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND."""
+        """The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND,
+        including heterogeneous models whose `ModelArchitectureConfig[i]` mixes
+        a 64-dim layer with wider layers."""
+        from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+        from vllm.transformers_utils.model_arch_config_convertor import (
+            ModelArchConfigConvertorBase,
+        )
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        glob_hd = global_head_dim or swa_head_dim
+        cfg = Gemma4TextConfig(
+            head_dim=swa_head_dim, global_head_dim=glob_hd, num_hidden_layers=6
+        )
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", layout)
         vllm_config.attention_config.backend = AttentionBackendEnum.CUSTOM
-        vllm_config.model_config.get_head_size = lambda: head_size
+        vllm_config.model_config.get_head_size = lambda: max(swa_head_dim, glob_hd)
+        vllm_config.model_config.model_arch_config = ModelArchConfigConvertorBase(
+            cfg, cfg
+        ).convert()
 
-        if refused:
+        if layout == "HND" and refused_under_hnd:
             with pytest.raises(NotImplementedError, match="head_dim==64"):
                 TpuPlatform.check_and_update_config(vllm_config)
         else:
@@ -1217,6 +1242,78 @@ class TestLoRAConfigValidation:
         assert "lora_dtype torch.float16" in str(excinfo.value)
 
 
+class TestRoutedExpertsConfigValidation:
+    """Startup rejects each setting that routed-experts capture does not
+    support yet, and names it in the error."""
+
+    @staticmethod
+    def _config(
+        *,
+        enabled=True,
+        data_parallel_size=1,
+        use_sequence_parallel_moe=False,
+        speculative_config=None,
+        kv_transfer_config=None,
+        kv_offloading_size=None,
+    ):
+        return SimpleNamespace(
+            aux_output_config=AuxOutputConfig(enable_return_routed_experts=enabled),
+            parallel_config=SimpleNamespace(
+                data_parallel_size=data_parallel_size,
+                use_sequence_parallel_moe=use_sequence_parallel_moe,
+            ),
+            speculative_config=speculative_config,
+            kv_transfer_config=kv_transfer_config,
+            cache_config=SimpleNamespace(kv_offloading_size=kv_offloading_size),
+        )
+
+    def test_a_supported_config_passes(self):
+        _validate_routed_experts_config(self._config())
+
+    def test_without_capture_nothing_is_checked(self):
+        _validate_routed_experts_config(
+            self._config(enabled=False, data_parallel_size=2)
+        )
+
+    @pytest.mark.parametrize(
+        "kwargs,env,setting",
+        [
+            ({"data_parallel_size": 2}, {}, "data_parallel_size > 1"),
+            (
+                {"use_sequence_parallel_moe": True},
+                {},
+                "MoE sequence parallelism",
+            ),
+            ({}, {"TPU_K3_SP_PREFILL": "1"}, "TPU_K3_SP_PREFILL"),
+            (
+                {},
+                {"MOE_FUSED_EP_KERNEL_IMPL": "adaptive"},
+                "MOE_FUSED_EP_KERNEL_IMPL=adaptive",
+            ),
+            ({}, {"TPU_EXPERT_PLACEMENT": "/tmp/p.json"}, "TPU_EXPERT_PLACEMENT"),
+            ({"speculative_config": object()}, {}, "speculative decoding"),
+            ({"kv_transfer_config": object()}, {}, "kv_transfer_config"),
+            ({"kv_offloading_size": 4.0}, {}, "--kv-offloading-size"),
+        ],
+    )
+    def test_unsupported_setting_is_named(self, monkeypatch, kwargs, env, setting):
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+
+        with pytest.raises(NotImplementedError, match=setting):
+            _validate_routed_experts_config(self._config(**kwargs))
+
+    def test_fused_ep_v2_is_left_to_the_loaded_layers(self, monkeypatch):
+        """Setting MOE_FUSED_EP_KERNEL_IMPL=v2 alone does not fail startup: it
+        only allows the fused EP kernel, and each MoE layer decides when its
+        weights load whether to use it. A layer that does not use the kernel
+        still picks its experts in `route()`. Layers that use it are rejected
+        after the model loads."""
+        monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "v2")
+
+        _validate_routed_experts_config(self._config())
+
+
 def test_config_hook_registers_tpu_kv_connectors_by_name():
     """Verify TPU KV connectors are registered in the factory by name idempotently.
 
@@ -1694,3 +1791,117 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
     with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()
+
+
+def _make_ep_filter_vllm_config(
+    *,
+    is_moe: bool = True,
+    enable_expert_parallel: bool = True,
+    enable_ep_weight_filter: bool = False,
+) -> VllmConfig:
+    parallel_config = ParallelConfig(
+        tensor_parallel_size=8 if enable_expert_parallel else 1,
+        enable_expert_parallel=enable_expert_parallel,
+        enable_ep_weight_filter=enable_ep_weight_filter,
+    )
+    with _device_left_unset():
+        vllm_config = VllmConfig(parallel_config=parallel_config)
+    model_config = MagicMock(spec=ModelConfig)
+    model_config.is_moe = is_moe
+    model_config.dtype = torch.bfloat16
+    model_config.is_hybrid = False
+    model_config.is_attention_free = False
+    model_config.is_mla = False
+    model_config.hf_config = None
+    model_config.architectures = []
+    model_config.runner_type = "generate"
+    model_config.get_head_size.return_value = 128
+    model_config.multimodal_config = None
+    vllm_config.model_config = model_config
+    return vllm_config
+
+
+@pytest.mark.parametrize(
+    "cli_args, expected",
+    [
+        ([], True),
+        (["--disable-ep-weight-filter"], False),
+        (["--no-enable-ep-weight-filter"], False),
+        (["--disable_ep_weight_filter"], False),
+        (["--no_enable_ep_weight_filter"], False),
+        (["--disable-ep-weight-filter", "--enable-ep-weight-filter"], True),
+        (["--no-enable-ep-weight-filter", "--enable-ep-weight-filter"], True),
+        (["--enable-ep-weight-filter", "--disable-ep-weight-filter"], False),
+        (["--enable-ep-weight-filter", "--no-enable-ep-weight-filter"], False),
+    ],
+)
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_pre_register_and_update_defaults_ep_weight_filter_and_honors_cli_opt_out(
+    mock_prepare_env, mock_apply_patches, monkeypatch, cli_args, expected
+):
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    with _device_left_unset():
+        parser = AsyncEngineArgs.add_cli_args(FlexibleArgumentParser())
+    parsed = parser.parse_args(cli_args)
+    engine_args = AsyncEngineArgs.from_cli_args(parsed)
+    assert engine_args.enable_ep_weight_filter is expected
+
+    # Re-entering check_and_update_config in a spawned EngineCore/worker child
+    # (with no CLI args in sys.argv) must preserve the parsed opt-out.
+    monkeypatch.setattr(sys, "argv", ["python"])
+    vllm_config = _make_ep_filter_vllm_config(
+        enable_ep_weight_filter=engine_args.enable_ep_weight_filter,
+    )
+    TpuPlatform.check_and_update_config(vllm_config)
+    TpuPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.parallel_config.enable_ep_weight_filter is expected
+
+
+@pytest.mark.parametrize(
+    "yaml_body, expected",
+    [
+        ("enable-ep-weight-filter: false\n", False),
+        ("disable-ep-weight-filter: true\n", False),
+        ("enable-ep-weight-filter: true\n", True),
+        ("tensor-parallel-size: 8\n", True),
+    ],
+)
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_pre_register_and_update_respects_config_yaml_opt_out(
+    mock_prepare_env, mock_apply_patches, monkeypatch, tmp_path, yaml_body, expected
+):
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+
+    cfg_path = tmp_path / "serve.yaml"
+    cfg_path.write_text(yaml_body, encoding="utf-8")
+    with _device_left_unset():
+        parser = AsyncEngineArgs.add_cli_args(FlexibleArgumentParser())
+    parsed = parser.parse_args(["--config", str(cfg_path)])
+    engine_args = AsyncEngineArgs.from_cli_args(parsed)
+    assert engine_args.enable_ep_weight_filter is expected
+
+    # Spawned children re-run check_and_update_config without re-parsing YAML.
+    monkeypatch.setattr(sys, "argv", ["python"])
+    vllm_config = _make_ep_filter_vllm_config(
+        enable_ep_weight_filter=engine_args.enable_ep_weight_filter,
+    )
+    TpuPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.parallel_config.enable_ep_weight_filter is expected
+
+
+@pytest.mark.parametrize("initial_filter", [False, True])
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_check_and_update_config_preserves_programmatic_ep_weight_filter(
+    mock_prepare_env, mock_apply_patches, initial_filter
+):
+    """Programmatic configs (e.g. LLM(...)) keep upstream's explicit setting."""
+    TpuPlatform.pre_register_and_update(None)
+    vllm_config = _make_ep_filter_vllm_config(enable_ep_weight_filter=initial_filter)
+    TpuPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.parallel_config.enable_ep_weight_filter is initial_filter

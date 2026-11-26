@@ -16,7 +16,7 @@ import dataclasses
 import functools
 import inspect
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, ClassVar, cast
 
 import jax
@@ -98,6 +98,7 @@ from vllm_torchtpu.layers.core.attention_interface import (
     mla_attention,
     ragged_paged_attention,
     ragged_paged_attention_batched,
+    uses_seq_along_lane_kv_page,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.pcp_workspace import pcp_chunk_pages
@@ -293,17 +294,14 @@ def _pallas_rpa_kernel_impl(
         kv_cache = kernel_view(kv_cache)
     packed_pool_shape = None
     if kv_cache.ndim == 4:
-        if (
-            kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-            and query.shape[2] != 64
-        ):
+        if uses_seq_along_lane_kv_page(kv_layout, query.shape[2]):
             native_shape = rpa_batched_wrapper.get_kv_cache_shape(
                 total_num_pages=1,
-                page_size=pool_shape[1],
+                page_size=pool_shape[3],
                 actual_num_kv_heads=key.shape[1],
                 actual_head_dim=query.shape[2],
                 kv_dtype=kv_cache.dtype,
-                kv_layout=kv_layout,
+                kv_layout=batched_rpa_configs.KVLayout.SEQ_ALONG_LANE,
                 chip_version=get_chip_version(),
             )
         else:
@@ -670,6 +668,19 @@ class PallasAttentionBackend(AttentionBackend):
         )
 
     @classmethod
+    def get_shared_pool_shape(
+        cls,
+        num_blocks: int,
+        kernel_block_size: int,
+        packing: int,
+        words_per_token: int,
+        head_sizes: Sequence[int],
+    ) -> tuple[int, int, int, int]:
+        """Return the 4D shape of a shared KV cache pool."""
+        del head_sizes
+        return (num_blocks, kernel_block_size, packing, words_per_token)
+
+    @classmethod
     def get_kv_cache_page_size_bytes(
         cls,
         block_size: int,
@@ -813,6 +824,34 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
     def supported_kv_cache_layouts(cls) -> tuple[VllmKVCacheLayout, ...]:
         return (VllmKVCacheLayout.LBNHC, VllmKVCacheLayout.LBHNC)
 
+    @classmethod
+    def get_shared_pool_shape(
+        cls,
+        num_blocks: int,
+        kernel_block_size: int,
+        packing: int,
+        words_per_token: int,
+        head_sizes: Sequence[int],
+    ) -> tuple[int, int, int, int]:
+        if not head_sizes or all(head_size == 64 for head_size in head_sizes):
+            return (num_blocks, kernel_block_size, packing, words_per_token)
+        kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[
+            get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
+        ]
+        per_layer = [
+            uses_seq_along_lane_kv_page(kv_layout, head_size)
+            for head_size in head_sizes
+        ]
+        if any(per_layer) and not all(per_layer):
+            raise NotImplementedError(
+                "Shared 4D KV cache pools under SEQ_ALONG_LANE "
+                "(VLLM_KV_CACHE_LAYOUT=HND) cannot mix head_dim==64 with "
+                "other head sizes."
+            )
+        if all(per_layer):
+            return (num_blocks, words_per_token, packing, kernel_block_size)
+        return (num_blocks, kernel_block_size, packing, words_per_token)
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
@@ -827,14 +866,14 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         )
         # Resolve the layout last: the dtype-less probe and hd64 callers
         # do not need a current vLLM config.
-        if (
-            head_size == 64
-            or is_auto
-            or KV_LAYOUT_BY_VLLM_LAYOUT[
-                get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
-            ]
-            is not batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
-        ):
+        if head_size == 64 or is_auto:
+            return PallasAttentionBackend.get_kv_cache_shape(
+                num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
+            )
+        kv_layout = KV_LAYOUT_BY_VLLM_LAYOUT[
+            get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
+        ]
+        if not uses_seq_along_lane_kv_page(kv_layout, head_size):
             return PallasAttentionBackend.get_kv_cache_shape(
                 num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
             )
@@ -848,9 +887,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
             actual_num_kv_heads=num_kv_heads,
             actual_head_dim=head_size,
             kv_dtype=pallas.pallas.TORCH_TO_JAX_DTYPE_MAP[torch_dtype],
-            kv_layout=KV_LAYOUT_BY_VLLM_LAYOUT[
-                get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
-            ],
+            kv_layout=kv_layout,
             chip_version=get_chip_version(),
         )
 
@@ -1532,6 +1569,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 or, under SEQ_ALONG_LANE,
                 [num_blocks, num_kv_heads_x2, padded_head_size // kv_packing,
                  kv_packing, block_size]
+                or a shared packed pool
+                [num_blocks, words_per_token, kv_packing, block_size]
                 or, on the block-major unified pool, the merged 6D pool
                 [num_blocks, num_pools * split, *page] that `kernel_view`
                 folds to one of the above inside the compiled op

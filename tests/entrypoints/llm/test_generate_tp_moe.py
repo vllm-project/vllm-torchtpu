@@ -21,6 +21,7 @@ module-scoped fixture conflicts with single-device tests.
 Run with: pytest tests/entrypoints/llm/test_generate_tp_moe.py -v
 """
 
+import numpy as np
 import pytest
 from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
@@ -54,7 +55,11 @@ def _print_generation_outputs(test_name: str, outputs) -> None:
         print(f"Generated: {output.outputs[0].text!r}")
 
 
-def _run_moe_generation(async_scheduling: bool, enable_expert_parallel: bool = False):
+def _run_moe_generation(
+    async_scheduling: bool,
+    enable_expert_parallel: bool = False,
+    enable_return_routed_experts: bool = False,
+):
     tp_size = _get_local_tpu_chip_count()
     if tp_size < 8:
         pytest.skip(
@@ -76,7 +81,14 @@ def _run_moe_generation(async_scheduling: bool, enable_expert_parallel: bool = F
         enforce_eager=False,
         disable_log_stats=False,
         seed=0,
+        # vLLM requires prefix caching to return routed experts.
+        **(
+            {"enable_return_routed_experts": True, "enable_prefix_caching": True}
+            if enable_return_routed_experts
+            else {}
+        ),
     )
+    model_config = llm.llm_engine.model_config
 
     try:
         outputs = llm.generate(
@@ -89,7 +101,7 @@ def _run_moe_generation(async_scheduling: bool, enable_expert_parallel: bool = F
         del llm
         cleanup_dist_env_and_memory()
 
-    return tp_size, outputs
+    return tp_size, outputs, model_config
 
 
 @pytest.mark.timeout(1800)
@@ -101,7 +113,7 @@ def _run_moe_generation(async_scheduling: bool, enable_expert_parallel: bool = F
     ],
 )
 def test_moe_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
-    tp_size, outputs = _run_moe_generation(async_scheduling=async_scheduling)
+    tp_size, outputs, _ = _run_moe_generation(async_scheduling=async_scheduling)
     _print_generation_outputs(
         f"MoE TP ({'async' if async_scheduling else 'sync'})", outputs
     )
@@ -126,7 +138,7 @@ def test_moe_generate_with_tp_equal_local_tpu_count(async_scheduling: bool):
     ],
 )
 def test_moe_generate_with_ep_equal_local_tpu_count(async_scheduling: bool):
-    tp_size, outputs = _run_moe_generation(
+    tp_size, outputs, _ = _run_moe_generation(
         async_scheduling=async_scheduling,
         enable_expert_parallel=True,
     )
@@ -141,3 +153,36 @@ def test_moe_generate_with_ep_equal_local_tpu_count(async_scheduling: bool):
     assert "paris" in outputs[0].outputs[0].text.lower(), (
         f"incoherent MoE output: {outputs[0].outputs[0].text!r}"
     )
+
+
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    "async_scheduling",
+    [
+        pytest.param(False, marks=pytest.mark.nightly, id="sync"),
+        pytest.param(True, marks=pytest.mark.nightly, id="async"),
+    ],
+)
+def test_moe_generate_returns_routed_experts(async_scheduling: bool):
+    """Every request gets one row of expert ids for each token it ran: its
+    prompt and each output token but the last. A row holds k distinct experts
+    in every MoE layer, so a layer whose ids the forward did not capture,
+    which come back as zeros, fails the check."""
+    _, outputs, model_config = _run_moe_generation(
+        async_scheduling=async_scheduling,
+        enable_expert_parallel=True,
+        enable_return_routed_experts=True,
+    )
+    num_layers = model_config.get_total_num_hidden_layers()
+    k = model_config.get_num_experts_per_tok()
+
+    assert len(outputs) == len(MOE_PROMPTS)
+    for output in outputs:
+        completion = output.outputs[0]
+        rows = completion.routed_experts
+        num_tokens = len(output.prompt_token_ids) + len(completion.token_ids) - 1
+        assert rows is not None, output.prompt
+        assert rows.shape == (num_tokens, num_layers, k), output.prompt
+        assert int(rows.max()) < model_config.get_num_experts(), output.prompt
+        ids = np.sort(rows, axis=-1)
+        assert np.all(ids[..., 1:] != ids[..., :-1]), output.prompt

@@ -28,8 +28,6 @@ from runner_output_test_utils import (
 from vllm import SamplingParams
 from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.runner import min_tokens
@@ -38,6 +36,11 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncPreResults,
     AsyncTPUCopyState,
 )
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
+    CachedRequestState,
+    InputBatch,
+)
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_torchtpu.structured_decoding.structured_decoding_manager import (
     StructuredDecodingManager,
 )

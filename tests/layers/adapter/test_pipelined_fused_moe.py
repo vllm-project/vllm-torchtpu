@@ -513,6 +513,27 @@ class TestMoEForwardPrecisionBranches:
             f"and pipelined_fused_moe_gmm ({list(sig_pipelined.parameters.keys())})."
         )
 
+    def test_pipelined_fused_moe_rejects_row_info(self):
+        """row_info must raise, never be silently ignored or reused across
+        chunked DP/PCP calls."""
+        with pytest.raises(NotImplementedError):
+            pipelined_fused_moe_gmm(
+                hidden_states=torch.randn(4, 64, dtype=torch.bfloat16),
+                w1=torch.empty(0),
+                w2=torch.empty(0),
+                w1_scale=None,
+                w2_scale=None,
+                w1_bias=None,
+                w2_bias=None,
+                topk_weights=torch.ones(4, 2, dtype=torch.bfloat16) * 0.5,
+                topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+                experts_start=None,
+                topk=2,
+                activation="silu",
+                skip_padded_tokens=True,
+                row_info=torch.tensor([2], dtype=torch.int32),
+            )
+
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_fp8_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):
         """Verify FP8 apply_monolithic passes identical valid
@@ -587,6 +608,7 @@ class TestMoEForwardPrecisionBranches:
 
         method = MagicMock()
         method._tpu_activation_str = "silu"
+        method._skip_padded_tokens = False
         x = torch.randn(4, 64, dtype=torch.bfloat16)
         router_logits = torch.randn(4, 8, dtype=torch.bfloat16)
         topk_weights = torch.ones(4, 2, dtype=torch.bfloat16) * 0.5
@@ -625,6 +647,8 @@ class TestMoEForwardPrecisionBranches:
         bound = inspect.signature(target_fn).bind(**call_kwargs)
         assert bound.arguments["hidden_states"] is x
         assert bound.arguments["w1"] is layer.w13_weight
+        assert bound.arguments["skip_padded_tokens"] is False
+        assert bound.arguments["row_info"] is None
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_mxfp4_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):

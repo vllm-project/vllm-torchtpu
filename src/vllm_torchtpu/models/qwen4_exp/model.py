@@ -45,10 +45,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
 from vllm.model_executor.models.qwen3_5 import Qwen3_5Model
-from vllm.model_executor.models.qwen3_next import (
-    Qwen3NextAttention,
-    Qwen3NextSparseMoeBlock,
-)
+from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     WeightsMapper,
@@ -60,7 +57,15 @@ from vllm.models.qwen4_exp.common.hyperconnection import (
     HyperConnectionConfig,
 )
 
-from vllm_torchtpu.models.qwen4_exp.ple import Qwen4ExpPLELayer
+from vllm_torchtpu.models.qwen4_exp.ple import (
+    PLEStateCache,
+    Qwen4ExpPLELayer,
+    Qwen4ExpPLETable,
+)
+from vllm_torchtpu.models.qwen4_exp.qsa import (
+    Qwen4ExpQSAAttention,
+    Qwen4ExpQSAIndexer,
+)
 
 
 def _hc_config(vllm_config: VllmConfig) -> HyperConnectionConfig:
@@ -92,20 +97,6 @@ class Qwen4ExpDecoderLayer(nn.Module):
         layer_index = extract_layer_index(prefix)
         self.layer_type = layer_types[layer_index]
 
-        # ple_layer_ids is one-indexed; each PLE layer's hash layout follows
-        # its rank among them.
-        ple_layer_ids = config.ple_layer_ids or []
-        self.ple = (
-            Qwen4ExpPLELayer(
-                config,
-                sorted(set(ple_layer_ids)).index(layer_index + 1),
-                vllm_config.quant_config,
-                prefix=f"{prefix}.ple",
-            )
-            if layer_index + 1 in ple_layer_ids
-            else None
-        )
-
         # The Qwen3-Next layers read only fields the Qwen4Exp text config also
         # has; the transformers class just does not subclass Qwen3NextConfig.
         layer_config = cast(Qwen3NextConfig, config)
@@ -118,9 +109,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
         elif self.layer_type == "indexed_attention":
             # The checkpoint's full_attention (QSA) layers; see config.py.
-            # TODO(QSA): add the indexer and attend over the selected blocks.
-            self.self_attn = Qwen3NextAttention(
-                layer_config,
+            self.self_attn = Qwen4ExpQSAAttention(
+                config,
                 model_config=vllm_config.model_config,
                 cache_config=vllm_config.cache_config,
                 quant_config=vllm_config.quant_config,
@@ -129,22 +119,52 @@ class Qwen4ExpDecoderLayer(nn.Module):
         else:
             raise ValueError(f"Unsupported Qwen4Exp layer type {self.layer_type!r}")
 
+        # ple_layer_ids is one-indexed; each PLE layer's hash layout follows
+        # its rank among them. Its state shares this layer's GDN state spec
+        # (config.py admits PLE only on GDN layers).
+        ple_layer_ids = config.ple_layer_ids or []
+        if layer_index + 1 in ple_layer_ids:
+            self.ple: Qwen4ExpPLELayer | None = Qwen4ExpPLELayer(
+                config,
+                sorted(set(ple_layer_ids)).index(layer_index + 1),
+                vllm_config.quant_config,
+                prefix=f"{prefix}.ple",
+            )
+            self.ple_cache: PLEStateCache | None = PLEStateCache(
+                prefix=f"{prefix}.ple",
+                vllm_config=vllm_config,
+                state_spec_layer=self.linear_attn,
+                window_shape=(
+                    self.ple.conv_state_len,
+                    config.hidden_size * config.hc_count,
+                ),
+                window_dtype=self.ple.conv1d.weight.dtype,
+                context_len=self.ple.ple_embedding.ngram_size - 1,
+                eos_token_id=self.ple.ple_embedding.eos_token_id,
+            )
+        else:
+            self.ple = None
+            self.ple_cache = None
+
         self.mlp = Qwen3NextSparseMoeBlock(vllm_config, prefix=f"{prefix}.mlp")
         hc_config = _hc_config(vllm_config)
         self.attn_hyper_connection = GatedResidual(hc_config)
         self.mlp_hyper_connection = GatedResidual(hc_config)
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.ple is not None:
-            # TODO(PLE): read and write the conv windows in the unified pool,
-            # take the PLE inputs from the TPU runner, and add the PLE term to
-            # hidden_states here, before the attention mix.
-            raise NotImplementedError(
-                "Qwen4Exp n-gram PLE needs its inputs and conv state from the "
-                "TPU runner, which does not provide them yet."
-            )
+            assert self.ple_cache is not None
+            if input_ids is None:
+                raise ValueError("Qwen4Exp n-gram PLE needs the input token ids.")
+            ple_inputs, prev_windows = self.ple_cache.read(hidden_states, input_ids)
+            ple_out = self.ple(hidden_states, ple_inputs, prev_windows)
+            self.ple_cache.write(ple_inputs, prev_windows, ple_out)
+            hidden_states = hidden_states + ple_out.output
         block_input, residuals = self.attn_hyper_connection.mix(hidden_states)
         if self.layer_type == "linear_attention":
             block_output = self.linear_attn(hidden_states=block_input)
@@ -200,7 +220,7 @@ class Qwen4ExpModel(nn.Module):
             inputs_embeds = self.embed_input_ids(input_ids)
         hidden_states = inputs_embeds.repeat(1, self.hc_count)
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states)
+            hidden_states = layer(positions, hidden_states, input_ids)
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
         return hidden_states
 
@@ -218,9 +238,6 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
     # projections that Qwen4Exp checkpoints use as well.
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | WeightsMapper(
         orig_to_new_substr={
-            # TODO(QSA): load the indexer weights once the QSA indexer lands;
-            # dense attention does not use them.
-            ".self_attn.indexer.": None,
             # PLE hash statistics, which upstream skips as well.
             "hashstats_": None,
             "token_lookup": None,
@@ -294,8 +311,19 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         mapper = self.hf_to_vllm_mapper
-        if not any(isinstance(module, Qwen4ExpPLELayer) for module in self.modules()):
+        modules = list(self.modules())
+        if not any(isinstance(module, Qwen4ExpPLELayer) for module in modules):
             # The checkpoint keeps its PLE weights when ple_layer_ids is
             # overridden to [].
             mapper = mapper | WeightsMapper(orig_to_new_substr={".ple.": None})
-        return AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
+        if not any(isinstance(module, Qwen4ExpQSAIndexer) for module in modules):
+            # Within dense_max_model_len QSA is dense attention (see
+            # Qwen4ExpQSAAttention) and needs no indexer.
+            mapper = mapper | WeightsMapper(
+                orig_to_new_substr={".self_attn.indexer.": None}
+            )
+        loaded = AutoWeightsLoader(self).load_weights(weights, mapper=mapper)
+        for module in self.modules():
+            if isinstance(module, Qwen4ExpPLETable):
+                module.finalize_weights()
+        return loaded

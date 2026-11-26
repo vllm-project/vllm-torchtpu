@@ -102,7 +102,7 @@ def get_or_create_pcp_mesh(
     ranks follow those of the stages before it.
     """
     import torch.distributed as dist
-    from torch_tpu._internal.pallas import get_pallas_mesh
+    from torch.tpu.pallas import get_pallas_mesh
 
     layout = get_pcp_group_layout()
     group = get_pcp_group()

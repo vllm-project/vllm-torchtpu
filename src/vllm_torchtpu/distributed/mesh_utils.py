@@ -99,7 +99,7 @@ def _collect_rank_to_device_id(
     rank_to_device_id: dict[int, int] = {}
     for item in gathered:
         if item is None:
-            raise RuntimeError("CP device id gather returned an empty entry.")
+            raise RuntimeError("Group device id gather returned an empty entry.")
         rank, gathered_device_id = item
         rank_to_device_id[int(rank)] = int(gathered_device_id)
     return rank_to_device_id
@@ -138,7 +138,7 @@ def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
     missing = [rank for rank in ranks if rank not in rank_to_device_id]
     if missing:
         raise RuntimeError(
-            "Could not map all CP ranks to TPU global device ids: "
+            "Could not map all group ranks to TPU global device ids: "
             f"missing={missing}, ranks={ranks}, gathered={rank_to_device_id}"
         )
     device_ids = tuple(rank_to_device_id[rank] for rank in ranks)
@@ -180,7 +180,7 @@ def get_stage_mesh(
       group: the stage's process group.
       device_ids: the TPU device ids of `group`, in rank order.
     """
-    from torch_tpu._internal.pallas import get_pallas_mesh
+    from torch.tpu.pallas import get_pallas_mesh
 
     # pp_validation turns stages of several devices away until a TPU test
     # serves one, so only unit tests reach this for now.

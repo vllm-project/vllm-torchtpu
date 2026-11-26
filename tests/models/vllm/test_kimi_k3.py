@@ -69,28 +69,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
-@pytest.fixture(autouse=True)
-def _cpu_model_tests(monkeypatch):
-    # These model tests use CPU tensors and stubbed custom ops. Dynamo still
-    # queries registered devices; keep it from opening a distributed TPU
-    # client merely to inspect the current device while tracing CPU code.
-    #
-    # torch.tpu is registered by importing torch_tpu, which the CPU test job
-    # never does: tests/conftest.py imports it only under --use-tpu, and
-    # importing it here would claim the accelerator in the pytest parent and
-    # lock out every spawned child. With no device module registered there is
-    # nothing for Dynamo to query, so there is nothing to stub either.
-    tpu = getattr(torch, "tpu", None)
-    if tpu is not None:
-        monkeypatch.setattr(tpu, "is_available", lambda: False)
-        monkeypatch.setattr(tpu, "current_device", lambda: 0)
-        monkeypatch.setattr(tpu, "device_count", lambda: 0)
-        monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
-
-    if hasattr(torch, "accelerator"):
-        monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
-        monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
-        monkeypatch.setattr(torch.accelerator, "device_count", lambda: 0)
+pytestmark = pytest.mark.usefixtures("cpu_model_tests")
 
 
 def test_kimi_architectures_are_registered() -> None:

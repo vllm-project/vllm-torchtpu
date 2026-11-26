@@ -127,19 +127,19 @@ def test_tp_mesh_without_torch_tpu_uses_runner_mesh_then_jax_devices(
     assert _ids(mesh) == [int(d.id) for d in devs[:4]]
 
 
-_TORCH_TPU_MODULES = ("torch_tpu", "torch_tpu._internal", "torch_tpu._internal.pallas")
+_TORCH_TPU_MODULES = ("torch.tpu", "torch.tpu.pallas")
 
 
 def _fake_torch_tpu(monkeypatch: pytest.MonkeyPatch, get_pallas_mesh: Any) -> None:
-    """An importable `torch_tpu` whose `_internal.pallas` has `get_pallas_mesh`
-    (every level is set, so a real, already imported `torch_tpu` is shadowed)."""
+    """An importable `torch.tpu.pallas` that has `get_pallas_mesh` (every
+    level is set, so a real, already imported `torch.tpu` is shadowed)."""
     import sys
     import types
 
     for name in _TORCH_TPU_MODULES:
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
     monkeypatch.setattr(
-        sys.modules["torch_tpu._internal.pallas"],
+        sys.modules["torch.tpu.pallas"],
         "get_pallas_mesh",
         get_pallas_mesh,
         raising=False,

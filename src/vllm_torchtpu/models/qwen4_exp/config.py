@@ -19,6 +19,9 @@ from typing import TYPE_CHECKING
 
 from vllm.model_executor.models.config import Qwen4ExpForCausalLMConfig
 
+from vllm_torchtpu.block_major_pool import unified_block_major_enabled
+from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architecture
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -32,24 +35,29 @@ class TPUQwen4ExpConfig(Qwen4ExpForCausalLMConfig):
         model_config = vllm_config.model_config
         text_config = model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
-        if text_config.ple_layer_ids:
-            # TODO(PLE): pass the PLE inputs and per-request conv state from
-            # the TPU runner.
-            # Vision-language checkpoints nest the field under text_config.
-            if model_config.hf_config is text_config:
-                override = '{"ple_layer_ids": []}'
-            else:
-                override = '{"text_config": {"ple_layer_ids": []}}'
+        # Each PLE layer keeps its state in a unified-pool block of its GDN
+        # layer's spec (see Qwen4ExpPLELayer; transformers admits PLE only on
+        # linear_attention layers).
+        has_ple = bool(text_config.ple_layer_ids)
+        has_sparse_qsa = (
+            text_config.indexer_budget is not None
+            and model_config.max_model_len > text_config.indexer_budget
+            and "indexed_attention" in (text_config.layer_types or ())
+        )
+        if has_ple and not unified_kv_layout_enabled_for_architecture(
+            model_config.architecture
+        ):
             raise NotImplementedError(
-                "Qwen4Exp n-gram PLE (ple_layer_ids="
-                f"{text_config.ple_layer_ids}) is not supported on TPU yet. "
-                f"To run without PLE for bring-up, pass --hf-overrides "
-                f"'{override}'; outputs then differ from the released model."
+                "Qwen4Exp n-gram PLE keeps its state in the unified KV pool; "
+                "unset TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0."
+            )
+        if (has_ple or has_sparse_qsa) and unified_block_major_enabled(vllm_config):
+            raise NotImplementedError(
+                "Qwen4Exp PLE/QSA does not support block-major unified KV pools; "
+                "unset VLLM_TPU_BLOCK_MAJOR_KV."
             )
         # transformers (>=5.18, see pyproject.toml) labels the checkpoint's
-        # full_attention (QSA) layers indexed_attention. TPU runs them as
-        # dense attention, which matches QSA within the max_model_len bound
-        # below.
+        # full_attention (QSA) layers indexed_attention.
         unsupported_layer_types = sorted(
             set(text_config.layer_types or ())
             - {"linear_attention", "indexed_attention"}
@@ -58,19 +66,6 @@ class TPUQwen4ExpConfig(Qwen4ExpForCausalLMConfig):
             raise NotImplementedError(
                 f"Qwen4Exp layer types {unsupported_layer_types} are not "
                 "supported on TPU yet."
-            )
-        # Configs without the QSA fields run dense attention by design. With
-        # them, QSA attends over the indexer_budget / indexer_compress_ratio
-        # highest-scoring complete blocks plus the open tail block. A sequence
-        # of at most indexer_budget tokens has no more complete blocks than
-        # that, so every block is selected and QSA equals dense attention.
-        indexer_budget = getattr(text_config, "indexer_budget", None)
-        if indexer_budget is not None and model_config.max_model_len > indexer_budget:
-            # TODO(QSA): lift once the QSA indexer and sparse attention land.
-            raise NotImplementedError(
-                "Qwen4Exp full attention runs dense on TPU, which matches QSA "
-                f"only up to indexer_budget={indexer_budget} tokens. Pass "
-                f"--max-model-len {indexer_budget} or less."
             )
         if vllm_config.speculative_config is not None:
             raise NotImplementedError(

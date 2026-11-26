@@ -151,6 +151,19 @@ class VllmMoERunner(MoERunner):
             or _upstream_fused_output_is_reduced(self)
         )
 
+    @property
+    def picks_experts_in_route(self) -> bool:
+        """Whether `route()` picks this layer's experts, so routed-experts
+        capture sees them. A layer armed with the fused EP, adaptive or
+        TP-decode kernel picks them inside the kernel instead. Arming is per
+        layer, so this is asked of each layer."""
+        quant_method = self._quant_method
+        return not (
+            fused_moe_ep_supported(quant_method)
+            or adaptive_fused_moe_supported(quant_method)
+            or moe_tp_decode_supported(quant_method)
+        )
+
     def _fused_ep_owns_pcp_collectives(self) -> bool:
         # The fused EP kernel is armed per layer after checking that layer's
         # weights, routing and device resources, so an armed layer suppresses

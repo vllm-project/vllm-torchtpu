@@ -33,6 +33,7 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from vllm_torchtpu import rope_in_graph
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 
 if TYPE_CHECKING:
@@ -195,6 +196,11 @@ class VllmDeepseekV4MLAAttention(
             dsv4_attention.DeepseekCompressor = orig_compressor
             dsv4_attention.DeepseekV4SWACache = orig_swa_cache
             torch.cuda.Event = orig_cuda_event
+
+        # The Pallas rope, indexer, compressor and o-projection ops take the
+        # table as an operand.
+        rope_in_graph.require_cos_sin_table(self.rotary_emb)
+        rope_in_graph.require_cos_sin_table(self.indexer_rotary_emb)
 
         # Bind compressor key-cache reference to SWA or main layer depending on
         # compression ratio.

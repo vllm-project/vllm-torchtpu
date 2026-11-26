@@ -252,9 +252,10 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         dict(routed_scaling_factor=scale + 1.0),
         dict(w1_scales_expert_second_minor=True),
         dict(w2_scales_expert_second_minor=True),
+        dict(agq_min_local_tokens=2048),
     ):
         assert bridge._build_op(*args, **(options | changed)) is not replicated
-    assert len(closures) == 7
+    assert len(closures) == 8
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     bias = jnp.arange(4, dtype=jnp.bfloat16)
     operands = (

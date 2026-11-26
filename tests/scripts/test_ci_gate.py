@@ -110,9 +110,16 @@ class TestCiGate(unittest.TestCase):
         statuses = [
             build(10, "success"),
             {
-                "context": "buildkite/vllm-torchtpu-torchtpu-nightly",
+                "context": (
+                    "buildkite/vllm-torchtpu-canary-torchtpu/unit-tests-general-nightly"
+                ),
                 "state": "success",
                 "target_url": f"{BUILDS}10#x",
+            },
+            {
+                "context": "buildkite/vllm-torchtpu-torchtpu-nightly",
+                "state": "success",
+                "target_url": f"{BUILDS}10#y",
             },
         ]
         url, _ = ci_gate.check(SHA, statuses)

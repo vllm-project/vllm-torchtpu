@@ -370,7 +370,9 @@ def calculate_block_sizes(
         return batch_size * num_muls
 
     def find_best_block_sizes(
-        max_batch_size: int, fixed_bq_sz: int | None = None
+        max_batch_size: int,
+        fixed_bq_sz: int | None = None,
+        max_bkv_sz: int | None = None,
     ) -> configs.BlockSizes:
         """Loop through different block sizes to find the most optimal one."""
 
@@ -378,12 +380,9 @@ def calculate_block_sizes(
         # costs. Therefore, we conservatively only use 80% of the VMEM budget.
         capped_vmem_limit_bytes = vmem_limit_bytes * 0.8
 
-        # To maximize MXU, we want bkv_sz to be at least MXU size.
-        bkv_default = mxu_column_size
-        if serve_cfgs.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            # SEQ-ALONG-LANE does not support intra-page DMA offset.
-            # TODO(kyuyeunk): Reduce granularity to lane size.
-            bkv_default = utils.align_to(bkv_default, serve_cfgs.page_size)
+        # To maximize MXU, we want bkv_sz to be at least MXU size, and always a
+        # multiple of page_size so k_idx * bkv_sz aligns with k_idx * bkv_p.
+        bkv_default = utils.align_to(mxu_column_size, serve_cfgs.page_size)
         bkv_sz = bkv_stride = bkv_default
         if fixed_bq_sz is None:
             bq_sz = bq_stride = bkv_sz
@@ -431,6 +430,12 @@ def calculate_block_sizes(
             if fixed_bq_sz is None:
                 bq_sz -= bq_stride
 
+        # Apply the caller's cap after rollback (a multiple of bkv_stride).
+        if max_bkv_sz is not None and bkv_sz > max_bkv_sz:
+            bkv_sz = max_bkv_sz
+            if fixed_bq_sz is None:
+                bq_sz = max_bkv_sz
+
         # Indicates OOM was triggered from the starting bkv size.
         if bkv_sz == 0:
             raise ValueError("Cannot find block sizes that fit within VMEM limit.")
@@ -438,8 +443,6 @@ def calculate_block_sizes(
         # Step 3: Given current tile size, calculate compute tile size.
 
         # Threshold value based on hardware generation and precision.
-        tpu_info = pltpu.get_tpu_info()
-
         is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1
 
         match tpu_info.generation:
@@ -477,7 +480,20 @@ def calculate_block_sizes(
     decode_batch_size = 8
     prefill_batch_size = 2
 
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
+    # Decode visits about bkv_sz + W - 1 KV rows per sequence, so growing decode
+    # bkv_sz past W // 2 mostly adds masked MXU rows. Gated to the measured
+    # case: TPU v7x with W=1024 (Gemma 4).
+    decode_max_bkv_sz: int | None = None
+    if tpu_info.generation == 7 and model_cfgs.sliding_window == 1024:
+        decode_bkv_stride = utils.align_to(mxu_column_size, serve_cfgs.page_size)
+        decode_max_bkv_sz = utils.align_to(
+            max(decode_bkv_stride, model_cfgs.sliding_window // 2),
+            decode_bkv_stride,
+        )
+
+    decode_block_sizes = find_best_block_sizes(
+        decode_batch_size, decode_query_size, max_bkv_sz=decode_max_bkv_sz
+    )
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
 
     return decode_block_sizes, prefill_block_sizes

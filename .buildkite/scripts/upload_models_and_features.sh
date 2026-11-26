@@ -40,6 +40,13 @@ failure_handler() {
 
 # Catch ERR signals
 trap 'failure_handler $LINENO' ERR
+
+# Each generation's pod shapes, "<single> <multi>", from tpu_generations.py.
+# Asked here, outside any pipe or process substitution, so a failure stops the
+# script through the trap above.
+SCRIPTS="$(dirname "${BASH_SOURCE[0]}")"
+V6E_SHAPES="$(python3 "${SCRIPTS}/bootstrap.py" tpu-shapes v6e)"
+V7X_SHAPES="$(python3 "${SCRIPTS}/bootstrap.py" tpu-shapes v7x)"
 declare -a TARGET_FOLDERS=()
 
 # Append the kernel_microbenchmarks subdirectories
@@ -135,8 +142,8 @@ fi
 if [[ "${#pipeline_v6e_fragments[@]}" -gt 0 ]]; then
   echo "--- Uploading TPU v6e Pipeline Group"
   # Export v6e specific variables
-  export MODEL_SHAPE_SINGLE="ct6e-standard-1t/1x1"
-  export MODEL_SHAPE_MULTI="ct6e-standard-8t/2x4"
+  read -r MODEL_SHAPE_SINGLE MODEL_SHAPE_MULTI <<< "${V6E_SHAPES}"
+  export MODEL_SHAPE_SINGLE MODEL_SHAPE_MULTI
   export TPU_VERSION="tpu6e"
   export TENSOR_PARALLEL_SIZE_SINGLE=1
   export TENSOR_PARALLEL_SIZE_MULTI=8
@@ -158,8 +165,8 @@ fi
 if [[ "${#pipeline_v7x_fragments[@]}" -gt 0 ]]; then
   echo "--- Uploading TPU v7x Pipeline Group"
   # Export v7x specific variables
-  export MODEL_SHAPE_SINGLE="tpu7x-standard-1t/1x1x1"
-  export MODEL_SHAPE_MULTI="tpu7x-standard-4t/2x2x1"
+  read -r MODEL_SHAPE_SINGLE MODEL_SHAPE_MULTI <<< "${V7X_SHAPES}"
+  export MODEL_SHAPE_SINGLE MODEL_SHAPE_MULTI
   export TPU_VERSION="tpu7x"
   export TENSOR_PARALLEL_SIZE_SINGLE=2
   export TENSOR_PARALLEL_SIZE_MULTI=8

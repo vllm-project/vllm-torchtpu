@@ -18,9 +18,16 @@
 # combo, saves results locally.
 #
 # Usage:
-#   ./scripts/vllm/benchmarking/run_benchmarks.sh [--config CONFIG_NAME] [--dry-run] [--keep-alive] [--serve-only]
+#   ./scripts/vllm/benchmarking/run_benchmarks.sh [--config CONFIG_NAME] [--mode MODE] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--skip-bench-cells] [--host HOST] [--port PORT] [--base-url URL] [--served-model-name NAME]
 #
-#   --serve-only  start the config's server and wait on it, running no benchmark
+#   --serve-only       start the config's server and wait on it, running no benchmark
+#   --skip-bench-cells start the server (if local) and write config.json without running bench cells
+#   --base-url URL     API root of a running server (cannot be combined with --host or --port)
+#   --served-model-name NAME
+#                      model name sent in requests to a running server. Direct
+#                      --host/--base-url runs do not query /v1/models and send
+#                      the name unchecked; use run_eval_flow.sh to validate it
+#                      against the endpoint's model list first.
 #
 # Examples:
 #   ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-0.6b-smoke
@@ -67,17 +74,34 @@ DRY_RUN=0
 RESULTS_DIR_OVERRIDE="${RESULTS_DIR:-}"
 KEEP_ALIVE=0
 SERVE_ONLY=0
+SKIP_BENCH_CELLS=0
 HOST=""
+HOST_PORT_CLI=0
 PORT="${PORT:-8000}"
+BASE_URL=""
+BASE_URL_CLI=""
+BASE_URL_CLI_SET=0
+SERVED_MODEL_NAME_CLI=""
+SERVED_MODEL_NAME_CLI_SET=0
 START_SERVER=1
+
+# A value never starts with "--", so "--config --dry-run" is a missing value.
+require_arg() {
+    if [ "$#" -lt 2 ] || [[ "$2" == --* ]]; then
+        echo "ERROR: $1 requires a value"
+        exit 1
+    fi
+}
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --config)
+            require_arg "$@"
             CONFIG_NAME="$2"
             shift 2
             ;;
         --results-dir)
+            require_arg "$@"
             RESULTS_DIR_OVERRIDE="$2"
             shift 2
             ;;
@@ -94,26 +118,75 @@ while [[ $# -gt 0 ]]; do
             SERVE_ONLY=1
             shift
             ;;
+        --skip-bench-cells)
+            SKIP_BENCH_CELLS=1
+            shift
+            ;;
         --host)
+            require_arg "$@"
             HOST="$2"
+            HOST_PORT_CLI=1
             START_SERVER=0
             shift 2
             ;;
         --mode)
+            require_arg "$@"
             BENCHMARK_MODE_CLI="$2"
             shift 2
             ;;
+        # A running server by its API root (the URL without /v1), for one
+        # that --host and --port cannot name: https, or a path prefix.
+        --base-url)
+            require_arg "$@"
+            BASE_URL_CLI="$2"
+            BASE_URL_CLI_SET=1
+            shift 2
+            ;;
+        # The name the server serves the model under, when it is not MODEL.
+        # MODEL still names the tokenizer.
+        --served-model-name)
+            require_arg "$@"
+            SERVED_MODEL_NAME_CLI="$2"
+            SERVED_MODEL_NAME_CLI_SET=1
+            shift 2
+            ;;
         --port)
+            require_arg "$@"
             PORT="$2"
+            HOST_PORT_CLI=1
             shift 2
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--config CONFIG_NAME] [--mode MODE] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--host HOST] [--port PORT]"
+            echo "Usage: $0 [--config CONFIG_NAME] [--mode MODE] [--results-dir DIR] [--dry-run] [--keep-alive] [--serve-only] [--skip-bench-cells] [--host HOST] [--port PORT] [--base-url URL] [--served-model-name NAME]"
             exit 1
             ;;
     esac
 done
+
+if [ "$BASE_URL_CLI_SET" = "1" ]; then
+    if [ -z "$BASE_URL_CLI" ]; then
+        echo "ERROR: --base-url cannot be empty"
+        exit 1
+    fi
+    if [ "$HOST_PORT_CLI" = "1" ]; then
+        echo "ERROR: --base-url cannot be combined with --host or --port"
+        exit 1
+    fi
+    BASE_URL=$(python3 "$SCRIPT_DIR/endpoint_url.py" normalize "$BASE_URL_CLI")
+    START_SERVER=0
+fi
+
+if [ "$SERVED_MODEL_NAME_CLI_SET" = "1" ]; then
+    if [ -z "$SERVED_MODEL_NAME_CLI" ]; then
+        echo "ERROR: --served-model-name cannot be empty"
+        exit 1
+    fi
+    if [ "$START_SERVER" = "1" ]; then
+        echo "ERROR: --served-model-name needs a running server (--base-url, or --host and --port)"
+        exit 1
+    fi
+fi
 
 if [ -z "$HOST" ]; then
     HOST="localhost"
@@ -206,6 +279,13 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-}"
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"
 
+# Where vllm bench serve sends requests.
+if [ -n "$BASE_URL" ]; then
+    BENCH_ENDPOINT_ARGS=(--base-url "$BASE_URL")
+else
+    BENCH_ENDPOINT_ARGS=(--host "$HOST" --port "$PORT")
+fi
+
 if [ -n "${BENCHMARK_MODE_CLI:-}" ]; then
     BENCHMARK_MODE="$BENCHMARK_MODE_CLI"
 fi
@@ -253,7 +333,11 @@ if [ "$BENCHMARK_MODE" != "spec_bench" ]; then
     fi
 else
     if [ "$START_SERVER" != "1" ]; then
-        echo "ERROR: --host is not supported in spec_bench mode because each (BS, K) cell restarts vllm serve."
+        echo "ERROR: --host and --base-url are not supported in spec_bench mode because each (BS, K) cell restarts vllm serve."
+        exit 1
+    fi
+    if [ "$SKIP_BENCH_CELLS" = "1" ]; then
+        echo "ERROR: --skip-bench-cells is not supported in spec_bench mode because the (BS, K) sweep starts and stops its own servers."
         exit 1
     fi
     if [ -z "${SPEC_K_LIST// /}" ]; then
@@ -539,6 +623,12 @@ run_benchmark_once() {
     local tokenizer_arg=()
     set_tokenizer_arg
 
+    # Only the flag: a config's SERVED_MODEL_NAME is for spec_bench mode.
+    local served_model_arg=()
+    if [ -n "$SERVED_MODEL_NAME_CLI" ]; then
+        served_model_arg=(--served-model-name "$SERVED_MODEL_NAME_CLI")
+    fi
+
     local extra_body_arg=()
     if [ -n "$BENCHMARK_EXTRA_BODY" ]; then
         extra_body_arg=(--extra-body "$BENCHMARK_EXTRA_BODY")
@@ -572,10 +662,10 @@ run_benchmark_once() {
     vllm bench serve \
         --backend vllm \
         --model "$MODEL" \
+        "${served_model_arg[@]}" \
         "${tokenizer_arg[@]}" \
         --trust-remote-code \
-        --host "$HOST" \
-        --port "$PORT" \
+        "${BENCH_ENDPOINT_ARGS[@]}" \
         "${dataset_args[@]}" \
         --num-prompts "$num_prompts" \
         --max-concurrency "$concurrency" \
@@ -618,8 +708,7 @@ run_spec_bench_client() {
         "${served_model_arg[@]}" \
         "${tokenizer_arg[@]}" \
         --trust-remote-code \
-        --host "$HOST" \
-        --port "$PORT" \
+        "${BENCH_ENDPOINT_ARGS[@]}" \
         --dataset-name spec_bench \
         --dataset-path "$SPEC_BENCH_DATASET" \
         --spec-bench-category "$SPEC_BENCH_CATEGORY" \
@@ -760,7 +849,7 @@ run_spec_benchmarks() {
 # the client falls back to MODEL.
 PULLED_TOKENIZER_DIR=""
 if [ -z "${TOKENIZER:-}" ] && [ -n "$MODEL_URI" ]; then
-    PULLED_TOKENIZER_DIR=$(python3 -c 'import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)' "$MODEL_URI" 2>/dev/null | tail -1)
+    PULLED_TOKENIZER_DIR=$(python3 -c 'import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)' "$MODEL_URI" 2>/dev/null | tail -1 || true)
 fi
 
 bench_tokenizer_dir() {
@@ -940,6 +1029,11 @@ if [ "$START_SERVER" = "1" ]; then
 fi
 
 exit_code=0
+
+if [ "$SKIP_BENCH_CELLS" = "1" ]; then
+    echo "Skipping vllm bench serve cells (--skip-bench-cells)."
+    ISL_OSL_CONFIGS=""
+fi
 
 for isl_osl_config in $ISL_OSL_CONFIGS; do
     IFS=':' read -r input_len output_len <<< "$isl_osl_config"

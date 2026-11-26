@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 from types import SimpleNamespace
 from unittest import mock
 
@@ -145,6 +146,70 @@ def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypa
         )
         assert draft.lm_head is not target.lm_head
         assert torch.equal(draft.lm_head.weight, target.lm_head.weight)
+
+
+@pytest.mark.parametrize(
+    "draft_tp, target_tp, draft_filter",
+    [
+        (1, 8, False),
+        (8, 8, True),
+        (1, 1, True),
+    ],
+)
+def test_replicated_draft_load_disables_ep_weight_filter(
+    monkeypatch, draft_tp, target_tp, draft_filter
+):
+    """A draft replicated below target TP (draft_tp=1, target_tp>1) forces tp=1
+    while parallel_config stays at target TP, so loading must disable
+    enable_ep_weight_filter on the active draft config without mutating the
+    target config. Sharded drafts and target_tp=1 drafts keep the filter."""
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp)
+    proposer.vllm_config.parallel_config.enable_ep_weight_filter = True
+    proposer.vllm_config.load_config = object()
+    active_config = [None]
+    observed = {}
+
+    @contextlib.contextmanager
+    def _fake_set_current_vllm_config(cfg):
+        prev = active_config[0]
+        active_config[0] = cfg
+        try:
+            yield
+        finally:
+            active_config[0] = prev
+
+    class _Loader:
+        def load_model(self, *, vllm_config, model_config):
+            observed["current_vllm_config"] = active_config[0]
+            observed["arg_vllm_config"] = vllm_config
+            return object()
+
+    monkeypatch.setattr(dflash_module, "get_model_loader", lambda _cfg: _Loader())
+    monkeypatch.setattr(
+        dflash_module, "set_model_tag", lambda _tag: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        dflash_module, "set_current_vllm_config", _fake_set_current_vllm_config
+    )
+    monkeypatch.setattr(
+        dflash_module,
+        "set_vllm_model_wrapper_context",
+        lambda **_kw: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        dflash_module, "_force_draft_tp1", lambda: contextlib.nullcontext()
+    )
+
+    proposer._load_draft_model()
+
+    # Both model loaders read enable_ep_weight_filter via get_current_vllm_config().
+    assert observed["current_vllm_config"] is not None
+    assert observed["current_vllm_config"] is observed["arg_vllm_config"]
+    assert (
+        observed["current_vllm_config"].parallel_config.enable_ep_weight_filter
+        is draft_filter
+    )
+    assert proposer.vllm_config.parallel_config.enable_ep_weight_filter is True
 
 
 def test_propose_empty_batch():

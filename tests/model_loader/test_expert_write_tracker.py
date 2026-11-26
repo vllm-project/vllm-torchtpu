@@ -125,6 +125,75 @@ def test_flush_all_drops_the_buffers_flushes_left_behind():
     assert not stager._pool
 
 
+def test_process_weights_after_loading_resets_stager_for_subsequent_loads(monkeypatch):
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.model_loader import base_loader
+
+    from vllm_torchtpu import model_loader_patches
+
+    monkeypatch.setattr(model_loader_patches, "_MAX_STAGED", 1)
+    monkeypatch.setattr(RoutedExperts, "weight_loader", RoutedExperts.weight_loader)
+    monkeypatch.setattr(
+        RoutedExperts, "_tpu_expert_staging_patch", False, raising=False
+    )
+    monkeypatch.setattr(
+        base_loader,
+        "process_weights_after_loading",
+        lambda model, model_config, target_device: None,
+    )
+
+    stagers: list[ExpertParamStager] = []
+    real_stager_cls = model_loader_patches.ExpertParamStager
+
+    def _make_stager():
+        instance = real_stager_cls()
+        stagers.append(instance)
+        return instance
+
+    logged: list[tuple[int, int]] = []
+    orig_info = model_loader_patches.logger.info
+
+    def _record_info(msg, *args, **kwargs):
+        if "Expert parameters written to the device:" in msg:
+            logged.append((args[0], args[1]))
+        return orig_info(msg, *args, **kwargs)
+
+    monkeypatch.setattr(model_loader_patches, "ExpertParamStager", _make_stager)
+    monkeypatch.setattr(model_loader_patches.logger, "info", _record_info)
+    model_loader_patches.patch_moe_expert_write_staging()
+
+    # Load 1: staging `second` evicts `first` early while leaving partial
+    # tracker records for both parameters.
+    first, second = _param(2, 4, 4), _param(2, 4, 4)
+    stagers[0].host_param(first)[0] = 1
+    assert not stagers[0].written(first, 0, "w2")
+    stagers[0].host_param(second)[0] = 2
+    assert not stagers[0].written(second, 0, "w2")
+    assert not stagers[0].staging(first)
+
+    base_loader.process_weights_after_loading(None, None, None)
+    assert len(stagers) == 2
+    assert stagers[1] is not stagers[0]
+    assert not stagers[0]._pool
+    assert logged[-1] == (1, 1)
+
+    # Load 2: reusing the same parameter id after process_weights_after_loading
+    # must stage cleanly, must not complete early from load 1's tracker state,
+    # and must report only load 2's flushed counts.
+    assert stagers[1].staging(first)
+    host = stagers[1].host_param(first)
+    host[1] = 4
+    assert not stagers[1].written(first, 1, "w2")
+    host[0] = 3
+    assert stagers[1].written(first, 0, "w2")
+    assert torch.equal(first.data[0], torch.full((4, 4), 3.0))
+    assert torch.equal(first.data[1], torch.full((4, 4), 4.0))
+
+    base_loader.process_weights_after_loading(None, None, None)
+    assert len(stagers) == 3
+    assert logged[-1] == (1, 0)
+
+
 def test_flush_uploads_in_chunks(monkeypatch):
     from vllm_torchtpu import model_loader_patches
 

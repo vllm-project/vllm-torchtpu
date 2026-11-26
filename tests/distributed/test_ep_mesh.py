@@ -18,15 +18,18 @@ from unittest.mock import Mock
 import jax
 import numpy as np
 import pytest
+import torch
 from vllm.distributed import parallel_state
 
 from vllm_torchtpu.distributed import ep_mesh as ep
+from vllm_torchtpu.distributed import mesh_utils
 
 
 @pytest.fixture(autouse=True)
 def mesh_cache(monkeypatch):
     monkeypatch.setattr(ep, "_MESH_CACHE", {})
     monkeypatch.setattr(ep, "_TOKEN_GROUP_CACHE", {})
+    monkeypatch.setattr(mesh_utils, "_LAYOUT_CACHE", {})
     monkeypatch.setattr(ep, "get_pcp_world_size", lambda: 1)
     monkeypatch.setattr(ep, "get_dcp_world_size", lambda: 1)
 
@@ -62,28 +65,67 @@ def test_disabled_ep_helpers(monkeypatch):
     assert ep.ep_rank_order() is None
     assert ep.ep_mesh_index() is None
     assert ep.build_ep_mesh() is None
+    assert ep.ep_device_placement_key() == ()
 
 
 @pytest.fixture
 def group(monkeypatch):
-    group = SimpleNamespace(world_size=4, ranks=[2, 4, 6, 8])
+    group = SimpleNamespace(world_size=4, ranks=[2, 4, 6, 8], rank_in_group=2)
     monkeypatch.setattr(ep, "get_ep_group", lambda: group)
     monkeypatch.setattr(ep, "_get_current_global_rank", lambda: 6)
-    monkeypatch.setattr(ep, "_get_tpu_global_device_id", lambda: 10)
+    monkeypatch.setattr(mesh_utils, "_get_current_global_rank", lambda: 6)
+    monkeypatch.setattr(mesh_utils, "_get_tpu_global_device_id", lambda: 10)
     return group
 
 
 def test_ep_rank_mapping_and_mesh_index(monkeypatch, group):
     """The mesh is in ascending device-id order, so mesh index i holds the
     EP rank whose device sorts i-th, and this rank's index is where its own
-    device sorts."""
+    device sorts. The device ids are gathered once and reused."""
     gather = Mock(return_value={8: 30, 2: 40, 6: 10, 4: 20})
-    monkeypatch.setattr(ep, "_collect_rank_to_device_id", gather)
+    monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id", gather)
     assert ep.ep_device_ids() == (40, 20, 10, 30)
-    gather.assert_called_once_with(group, 6, 10)
     # Devices 10, 20, 30, 40 belong to EP ranks 2, 1, 3, 0.
     assert ep.ep_rank_order() == (2, 1, 3, 0)
     assert ep.ep_mesh_index() == 0
+    gather.assert_called_once_with(group, 6, 10)
+
+
+def test_device_placement_key_holds_the_gathered_device_ids(monkeypatch, group):
+    monkeypatch.setattr(
+        mesh_utils,
+        "_collect_rank_to_device_id",
+        lambda *a: {2: 40, 4: 20, 6: 10, 8: 30},
+    )
+    ep.ep_device_ids()
+    assert ep.ep_device_placement_key() == (((2, 4, 6, 8), (40, 20, 10, 30)),)
+
+
+def test_placement_gathered_after_the_key_raises(monkeypatch, group):
+    """Gathering the same placement again is fine; a new one would be missing
+    from a compile cache key already in use."""
+    placement = {2: 40, 4: 20, 6: 10, 8: 30}
+    monkeypatch.setattr(mesh_utils, "_collect_rank_to_device_id", lambda *a: placement)
+    ep.ep_device_ids()
+    ep.ep_device_placement_key()
+    assert ep.ep_device_ids() == (40, 20, 10, 30)
+    placement = {2: 10, 4: 20, 6: 30, 8: 40}
+    mesh_utils._LAYOUT_CACHE.clear()
+    with pytest.raises(RuntimeError, match="after the compile cache key"):
+        ep.ep_device_ids()
+
+
+def test_first_placement_gathered_after_the_key_raises(monkeypatch, group):
+    """The key was read before this group's placement was gathered, so the
+    key in use does not cover it."""
+    monkeypatch.setattr(
+        mesh_utils,
+        "_collect_rank_to_device_id",
+        lambda *a: {2: 40, 4: 20, 6: 10, 8: 30},
+    )
+    assert ep.ep_device_placement_key() == ()
+    with pytest.raises(RuntimeError, match="after the compile cache key"):
+        ep.ep_device_ids()
 
 
 @_RANK_ORDERED_CP
@@ -103,7 +145,7 @@ def test_cp_keeps_rank_order(monkeypatch, group, cp_size_fn, cp_size):
 
 def test_missing_rank_mapping(monkeypatch, group):
     monkeypatch.setattr(
-        ep, "_collect_rank_to_device_id", lambda *args: {2: 40, 4: 20, 8: 30}
+        mesh_utils, "_collect_rank_to_device_id", lambda *args: {2: 40, 4: 20, 8: 30}
     )
     with pytest.raises(RuntimeError, match=r"missing=\[6\]"):
         ep.ep_device_ids()
@@ -137,7 +179,6 @@ def test_mesh_sorts_pallas_devices_by_id_and_caches_by_axis_and_ids(monkeypatch)
     order: that order is the kernel's DeviceAssignment, and the fused MoE's
     all-gathers are slower over the rank-ordered one."""
     import torch.distributed as dist
-    from torch_tpu._internal import pallas as pallas_module
 
     monkeypatch.setattr(
         jax,
@@ -151,7 +192,7 @@ def test_mesh_sorts_pallas_devices_by_id_and_caches_by_axis_and_ids(monkeypatch)
             _pallas_devices(rank_device_ids), axis_names
         )
     )
-    monkeypatch.setattr(pallas_module, "get_pallas_mesh", made)
+    monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", made)
     monkeypatch.setattr(jax.sharding, "Mesh", _fake_mesh)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: rank_device_ids)
 
@@ -179,13 +220,12 @@ def test_mesh_keeps_pallas_rank_order_under_cp(monkeypatch, cp_size_fn, cp_size)
     [0, 1, 4, 5, 6, 7, 2, 3]. Sorting them here is what failed to compile with
     "Disjoint or conflicting device assignments" on PCP + fused EP."""
     import torch.distributed as dist
-    from torch_tpu._internal import pallas as pallas_module
 
     monkeypatch.setattr(ep, cp_size_fn, lambda: cp_size)
     monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
     rank_device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
     monkeypatch.setattr(
-        pallas_module,
+        torch.tpu.pallas,
         "get_pallas_mesh",
         lambda axis_names: _fake_mesh(_pallas_devices(rank_device_ids), axis_names),
     )
@@ -202,11 +242,10 @@ def test_mesh_rejects_pallas_ids_that_are_not_the_groups(monkeypatch):
     """The mesh's ids become the DeviceAssignment and ep_rank_order indexes
     them as the gathered device ids, so any other set must fail at startup."""
     import torch.distributed as dist
-    from torch_tpu._internal import pallas as pallas_module
 
     monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 4)
     monkeypatch.setattr(
-        pallas_module,
+        torch.tpu.pallas,
         "get_pallas_mesh",
         lambda axis_names: _fake_mesh(_pallas_devices((0, 1, 2, 3)), axis_names),
     )
@@ -222,7 +261,6 @@ def test_mesh_covers_the_stage_under_pipeline_parallelism(monkeypatch):
     """An EP group that is one pipeline stage gets a mesh of its own devices,
     built from its process group."""
     import torch.distributed as dist
-    from torch_tpu._internal import pallas as pallas_module
 
     monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
     monkeypatch.setattr(
@@ -237,7 +275,7 @@ def test_mesh_covers_the_stage_under_pipeline_parallelism(monkeypatch):
         devices=SimpleNamespace(flat=[SimpleNamespace(id=2), SimpleNamespace(id=3)])
     )
     made = Mock(return_value=mesh)
-    monkeypatch.setattr(pallas_module, "get_pallas_mesh", made)
+    monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", made)
     monkeypatch.setattr(jax.sharding, "Mesh", _fake_mesh)
 
     assert [d.id for d in ep.build_ep_mesh().devices.flat] == [2, 3]
@@ -252,11 +290,10 @@ def test_mesh_rejects_a_group_smaller_than_the_world(monkeypatch):
     describe a sub-group, so a smaller EP group has to fail rather than build
     a mesh of the wrong size."""
     import torch.distributed as dist
-    from torch_tpu._internal import pallas as pallas_module
 
     monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
     made = Mock()
-    monkeypatch.setattr(pallas_module, "get_pallas_mesh", made)
+    monkeypatch.setattr(torch.tpu.pallas, "get_pallas_mesh", made)
     monkeypatch.setattr(ep, "ep_device_ids", lambda: (10, 20))
     with pytest.raises(NotImplementedError, match="spans 2 devices"):
         ep.build_ep_mesh()

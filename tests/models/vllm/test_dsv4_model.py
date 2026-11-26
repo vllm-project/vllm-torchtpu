@@ -165,18 +165,7 @@ def _tiny_hf_config():
     )
 
 
-@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
-def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio):
-    """Exercise upstream construction, including its SWA backend argument."""
-    from vllm.platforms import current_platform
-
-    # CPU CI has no TPU device registered with PyTorch. Keep both the Gloo
-    # group and the compressor's parameter allocations on CPU.
-    monkeypatch.setattr(current_platform, "device_name", "cpu")
-    monkeypatch.setattr(current_platform, "device_type", "cpu")
-    request.getfixturevalue("dist_ctx")
-    # Only skip Pallas op registration, which needs the worker's TPU mesh.
-    monkeypatch.setattr(VllmDeepseekV4Indexer, "_build_indexer_op", lambda self: None)
+def _dsv4_attention_config(compress_ratio: int) -> tuple[VllmConfig, str]:
     hf_config = DeepseekV4Config(
         hidden_size=128,
         num_attention_heads=2,
@@ -211,7 +200,22 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio
         max_num_seqs=1,
         max_num_batched_tokens=128,
     )
-    prefix = "model.layers.0.self_attn"
+    return config, "model.layers.0.self_attn"
+
+
+@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
+def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio):
+    """Exercise upstream construction, including its SWA backend argument."""
+    from vllm.platforms import current_platform
+
+    # CPU CI has no TPU device registered with PyTorch. Keep both the Gloo
+    # group and the compressor's parameter allocations on CPU.
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    request.getfixturevalue("dist_ctx")
+    # Only skip Pallas op registration, which needs the worker's TPU mesh.
+    monkeypatch.setattr(VllmDeepseekV4Indexer, "_build_indexer_op", lambda self: None)
+    config, prefix = _dsv4_attention_config(compress_ratio)
     with set_current_vllm_config(config):
         attention = VllmDeepseekV4MLAAttention(config, prefix=prefix)
     cache = attention.swa_cache_layer
@@ -224,6 +228,60 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio
     assert spec.block_size == 128
     assert spec.sliding_window == 128
     assert spec.dtype == torch.uint8
+
+
+def test_attention_keeps_real_cos_sin_table_when_in_graph_enabled(monkeypatch, request):
+    """DSv4 Pallas ops read the table as an operand even with `tpu_rope_in_graph`."""
+    from vllm.model_executor.layers import rotary_embedding as rope_lib
+    from vllm.platforms import current_platform
+
+    import vllm_torchtpu.layers.adapter.rotary_embedding  # noqa: F401
+    from vllm_torchtpu import rope_in_graph_flag, rope_patch
+
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    request.getfixturevalue("dist_ctx")
+    monkeypatch.setattr(VllmDeepseekV4Indexer, "_build_indexer_op", lambda self: None)
+
+    monkeypatch.setattr(rope_lib, "_ROPE_DICT", {})
+    ref_config, ref_prefix = _dsv4_attention_config(4)
+    ref_config.additional_config[rope_in_graph_flag.KEY] = False
+    with set_current_vllm_config(ref_config):
+        ref_attention = VllmDeepseekV4MLAAttention(ref_config, prefix=ref_prefix)
+
+    monkeypatch.setattr(rope_lib, "_ROPE_DICT", {})
+    config, prefix = _dsv4_attention_config(4)
+    config.additional_config[rope_in_graph_flag.KEY] = True
+    with set_current_vllm_config(config):
+        attention = VllmDeepseekV4MLAAttention(config, prefix=prefix)
+
+    assert attention.rotary_emb._tpu_rope_table_required
+    assert attention.indexer_rotary_emb._tpu_rope_table_required
+    assert isinstance(attention.rotary_emb.cos_sin_cache, torch.Tensor)
+    assert "cos_sin_cache" in attention.rotary_emb._buffers
+    assert isinstance(ref_attention.rotary_emb.cos_sin_cache, torch.Tensor)
+    assert torch.equal(
+        attention.rotary_emb.cos_sin_cache, ref_attention.rotary_emb.cos_sin_cache
+    )
+    assert isinstance(attention.indexer_rotary_emb.cos_sin_cache, torch.Tensor)
+    assert isinstance(ref_attention.indexer_rotary_emb.cos_sin_cache, torch.Tensor)
+    assert torch.equal(
+        attention.indexer_rotary_emb.cos_sin_cache,
+        ref_attention.indexer_rotary_emb.cos_sin_cache,
+    )
+    assert (
+        rope_patch.patch_in_graph_rotary_embedding(
+            attention, allow_table_recovery=False
+        )
+        == 0
+    )
+    assert torch.equal(
+        attention.rotary_emb.cos_sin_cache, ref_attention.rotary_emb.cos_sin_cache
+    )
+    assert torch.equal(
+        attention.indexer_rotary_emb.cos_sin_cache,
+        ref_attention.indexer_rotary_emb.cos_sin_cache,
+    )
 
 
 @pytest.fixture()

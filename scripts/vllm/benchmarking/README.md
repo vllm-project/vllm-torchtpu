@@ -54,8 +54,18 @@ live server: once for performance, and once for each accuracy task.
 
 ### Performance (`--mode perf`)
 
-Compares the benchmark JSON to `baselines/perf/<config>.baseline.json`, with a
-5% tolerance. Gated metrics:
+Compares the benchmark JSON to `baselines/perf/<chip>/<config>.baseline.json`,
+with a 5% tolerance. Baselines are per TPU chip. `run_eval_flow.sh` reads the
+chip from `TPU_ACCELERATOR_TYPE`, or from the GCE metadata when unset
+(`tpu7x-8` is chip `v7x`; `v6e-8` is `v6e`):
+
+- A chip with no baseline for the config reports its numbers without the gate
+  and prints a `::warning::` saying so. Check in a calibrated baseline to gate
+  it, or pass `--skip-perf-check` to report on purpose.
+- A run that cannot read its chip stops before the server starts, unless it
+  passes `--skip-perf-check`.
+
+Gated metrics:
 
 - Median TPOT
 - Total token throughput
@@ -72,7 +82,7 @@ it.
 python3 scripts/vllm/benchmarking/check_regression.py \
   --mode perf \
   --results-dir <DIR> \
-  --baseline scripts/vllm/benchmarking/baselines/perf/<config>.baseline.json
+  --baseline scripts/vllm/benchmarking/baselines/perf/<chip>/<config>.baseline.json
 ```
 
 ### Accuracy (`--mode eval`)
@@ -80,6 +90,11 @@ python3 scripts/vllm/benchmarking/check_regression.py \
 Compares `lm_eval` accuracy to `baselines/eval/<config>.<task>.baseline.json`.
 The default tolerance is 1.5pp; a config can override it with `EVAL_TOLERANCE`.
 Only keys present in the baseline are gated.
+
+Each task is compared on the accuracy metric of its baseline entry, the first
+in the script's `ACC_KEYS` order when the entry has several. A task whose
+results lack that metric fails as `(no result)`. No other accuracy metric of
+the task stands in for it.
 
 Where the baseline carries a standard error (`exact_match_stderr`), the allowed
 drop becomes a one-sided 95% significance test:
@@ -109,14 +124,37 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --baseline scripts/vllm/benchmarking/baselines/eval/<config>.<task>.baseline.json
 ```
 
+`--calibrate` writes a baseline as the median of the runs, one `--results-dir`
+per run:
+
+```bash
+python3 scripts/vllm/benchmarking/check_regression.py \
+  --mode eval --calibrate --task-filter <task> \
+  --results-dir <RUN1> --results-dir <RUN2> --results-dir <RUN3>
+```
+
+`--task-filter` selects the tasks that go into the baseline. It takes
+comma-separated tasks, or `all` for every task in the runs. Its default is
+`mmlu_llama`, `mmlu_llama_humanities`, `mmlu_llama_stem`,
+`mmlu_llama_social_sciences`, `mmlu_llama_other`, `mmlu_pro`,
+`humaneval_plus_tpu`, and `mbpp_plus_tpu`. Any other task, such as `mmmu_pro`,
+needs the flag.
+
+`--calibrate` exits `2` instead of writing a baseline when a run has no
+selected task or lacks an accuracy metric that another run has. A run may lack
+a standard error. The baseline then takes the median of the standard errors
+that the other runs reported.
+
 ## Accuracy Evaluation (`lm_eval`)
 
 ### Tasks
 
 | Task | Enabled by | Endpoint | Gated metric |
 |------|------------|----------|--------------|
-| `mmlu_llama`, `mmlu_pro` | `--run-lm-eval` | chat completions | `exact_match` |
-| `humaneval_plus_tpu`, `mbpp_plus_tpu` | `--run-code-eval` (nightly only) | chat completions | pass@1 |
+| `mmlu_llama`, `mmlu_pro` | `--run-lm-eval` or `--eval-suites` | chat completions | `exact_match` |
+| `gsm8k` | `--eval-suites gsm8k` (or `all`) | chat completions | `exact_match` |
+| `humaneval_plus_tpu`, `mbpp_plus_tpu` | `--run-code-eval` or `--eval-suites` | chat completions | pass@1 |
+| `mmmu_pro` | `--run-mm-eval` or `--eval-suites` (via `evalscope`) | chat completions | `acc` |
 
 - `--run-lm-eval` walks `LM_EVAL_TASKS` (default `mmlu_llama mmlu_pro`; configs
   may narrow it).
@@ -151,6 +189,13 @@ A generation cap goes in `LM_EVAL_GEN_KWARGS` as `max_gen_toks`: the
 > a different flag ignores it silently and the model reasons anyway — Kimi-K2.6
 > wants `thinking`. Check the checkpoint's `chat_template.jinja` before assuming
 > the default lands.
+
+### `run_eval_flow.sh` flags
+
+- `--base-url URL`: API root URL (not a full route like `/v1/chat/completions`) with optional scheme, port, and path prefix. Bare host defaults to `:8000`; trailing `/` and `/v1` on the path are stripped, and paths beneath `/v1/` are rejected. Cannot be combined with `--host` or `--port`. Connects to the endpoint instead of starting a local server.
+- `--served-model-name NAME`: Model name sent in requests to a running server (`--base-url`, `--host`, or `--skip-benchmark` with the server already on `localhost`) when it differs from the config's `MODEL`. Before a run sends a request to a server it did not start (`--base-url`, `--host`, or `--skip-benchmark` with the server on `localhost`), it reads `<server>/v1/models` (sending `OPENAI_API_KEY` as a bearer token when set) and stops unless the name it will send is listed there. That name is `--served-model-name` when given, otherwise the config's `MODEL`. A lookup that fails (connection error, HTTP error, or a response that is not a model list) also stops the run.
+- `--eval-suites LIST`: Comma-separated list of accuracy suites (`mmlu_llama`, `mmlu_pro`, `gsm8k`, `humaneval_plus_tpu`, `mbpp_plus_tpu`, `mmmu_pro`, `all`, or `none`). `all` covers whichever of `mmlu_llama` and `mmlu_pro` the config's `LM_EVAL_TASKS` lists (both by default; a config that narrows the list to `mmlu_pro` gets no `mmlu_llama`), then `gsm8k`, `humaneval_plus_tpu`, and `mbpp_plus_tpu`, plus `mmmu_pro` for `*multimodal*` configs. Precedence is `--eval-suites` > legacy `--run-*-eval` flags > config `EVAL_SUITES` > none.
+- `--perf-suites LIST`: Comma-separated list of performance suites (`bench_serve`, `all`, or `none`; `all` currently runs `bench_serve`). Precedence matches eval suites: `--perf-suites` > legacy `--skip-benchmark` (which removes `bench_serve`) > config `PERF_SUITES` > `bench_serve`. Runs without `bench_serve` skip the perf regression check and the `ci.vllm.ai` dashboard publish. `--skip-benchmark` also decides which server the evals use: unless `--perf-suites` selects `bench_serve`, it never starts a server (even next to `--perf-suites none`) and sends the evals to the one already on `localhost:$PORT`, while `--perf-suites none` without `--skip-benchmark` runs `cleanup_server.sh` and starts a server for the evals. A `spec_bench` config cannot run eval-only on a server the script starts, because its servers exist only inside its `(BS, K)` sweep; the script rejects that before the cleanup, so point it at a running server with `--host`, `--base-url`, or `--skip-benchmark`.
 
 ## Speculative Decoding (`run_benchmarks.sh --mode spec_bench`)
 
@@ -218,6 +263,7 @@ prints the rows without posting them.
 | `PORT` | `8000` | Server port |
 | `BENCHMARK_MODE` | `serving` | Runner mode: `serving` or `spec_bench` (also `--mode`) |
 | `BENCHMARK_WARMUP_RUNS` | `0` | Full benchmark passes to discard before writing each gated result |
+| `TPU_ACCELERATOR_TYPE` | GCE metadata | The TPU's accelerator type (`tpu7x`, `v6e-8`). `run_eval_flow.sh` reads the chip from it to pick the perf baselines. It reads the machine that runs the script, so a `--host` run must set it to the server's type |
 | `EVAL_SOFT_FAIL` | `0` | `1` downgrades an eval regression to a `::warning` instead of failing the step. Perf regressions still fail. For a config whose eval baseline is new and whose run-to-run spread is not yet known — prefer it to `soft_fail` on the Buildkite step, which would mask the perf gate too. Forwarded into the pod by `.buildkite/kubernetes/common.sh` |
 | `RANGE_RATIO_STYLE` (config var) | `symmetric` | How `RANDOM_RANGE_RATIO` is interpreted: `symmetric` = vllm bench serve native `[(1-r)L, (1+r)L]`; `min` = benchmark_serving.py-style `[rL, L]`, translated for vllm bench serve |
 | `SPEC_METHOD` (config var) | (empty) | Speculative decoding method (`ngram`, `eagle3`, `mtp`, `dflash`, `dspark`); required when any `K > 0` |
@@ -227,3 +273,6 @@ prints the rows without posting them.
 | `SPEC_BENCH_DATASET` / `SPEC_BENCH_CATEGORY` (config var) | auto-download / `summarization` | Path to Spec-Bench `question.jsonl` and category filter |
 | `SPEC_NUM_PROMPTS` / `SPEC_WARMUP_PROMPTS` / `SPEC_REPS` (config var) | `100` / `20` / `2` | Prompts per measured pass, warmup prompts per cell, and measured repetitions per cell |
 | `SERVED_MODEL_NAME` (config var) | (empty) | Optional `--served-model-name` passed in `spec_bench` mode |
+| `EVAL_SUITES` (config var) | (empty) | Default comma-separated accuracy suites when neither `--eval-suites` nor `--run-*-eval` is passed |
+| `PERF_SUITES` (config var) | (empty) | Default comma-separated performance suites (`bench_serve`, `all`, or `none`) when `--perf-suites` is omitted; legacy `--skip-benchmark` still removes `bench_serve` |
+| `OPENAI_API_KEY` | (empty) | Sent as a bearer token to `/v1/models` and as `--api-key` to `evalscope` (in addition to `lm_eval` and `vllm bench serve`). `FORWARD` in `.buildkite/kubernetes/common.sh` does not name it, so a key set on a Buildkite kube step does not reach the pod; a gateway that requires the key then answers the `/v1/models` lookup with 401 and the run stops |

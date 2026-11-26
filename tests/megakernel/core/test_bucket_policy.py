@@ -21,6 +21,7 @@ from __future__ import annotations
 import inspect
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -56,6 +57,8 @@ from vllm_torchtpu.megakernel.core.runtime.stats import BatchShape, inspect_batc
 @pytest.mark.parametrize(
     "module, blocked",
     [
+        # _parsing is framework-free: no jax either.
+        ("_parsing", ("jax", "jaxlib", "torch", "vllm")),
         # constants is framework-free: no jax either.
         ("constants", ("jax", "jaxlib", "torch", "vllm")),
         # policy is framework-free: no jax either.
@@ -138,8 +141,8 @@ def test_bucket_policy_resolve_select_and_out_rows() -> None:
         BucketPolicy((8, 8), ())
     with pytest.raises(ValueError, match="verify_buckets"):
         BucketPolicy((8,), (6,))
-    bad_prof = Profile(name="t-bad-verify", numerics="exact", verify_buckets=(6,))
-    with pytest.raises(ValueError, match="verify_buckets"):
+    bad_prof = Profile(name="t-bad-verify", numerics="exact", verify_buckets=(65,))
+    with pytest.raises(ValueError, match="invalid verify_buckets"):
         BucketPolicy.resolve(bad_prof, speculative_tokens=0)
 
     pol_pad = BucketPolicy((8, 16), (16, 32), token_paddings=(64, 16, 32))
@@ -436,10 +439,10 @@ def test_verify_tokens_eight_bucket_policy_and_eligibility() -> None:
     pol_spec7 = BucketPolicy.resolve(prof_8, speculative_tokens=7, verify_tokens=(8,))
     assert (pol_spec7.buckets, pol_spec7.verify_buckets) == ((), (8, 16))
     pol_spec7_implicit = BucketPolicy.resolve(prof_8, speculative_tokens=7)
-    assert pol_spec7_implicit.verify_tokens == (8,)
+    assert pol_spec7_implicit.verify_tokens == (4,)
     assert (pol_spec7_implicit.buckets, pol_spec7_implicit.verify_buckets) == (
+        (2,),
         (),
-        (8, 16),
     )
 
     pol_4_8 = BucketPolicy.resolve(
@@ -589,3 +592,98 @@ def test_parse_mk_verify_buckets_custom_widths() -> None:
     assert mk_runtime.MIN_VERIFY_TOKENS == runtime_constants.MIN_VERIFY_TOKENS
     assert mk_runtime.MAX_BUCKET_ROWS == runtime_constants.MAX_BUCKET_ROWS
     assert mk_runtime.constants is runtime_constants
+
+
+@pytest.mark.parametrize("spec_k", [1, 7, 10, 64])
+def test_resolve_decouples_speculative_tokens_from_verify_tokens(
+    spec_k: int,
+) -> None:
+    """Unsupported draft lengths drop verify buckets and keep decode without raising."""
+    prof = Profile(name="test_decouple", numerics="exact")
+    pol = BucketPolicy.resolve(prof, speculative_tokens=spec_k)
+    assert pol.verify_tokens == (MTP_VERIFY_TOKENS,)
+    assert (pol.buckets, pol.verify_buckets) == (DEFAULT_BUCKETS, ())
+
+    pol_no_decode = BucketPolicy.resolve(prof, buckets=(), speculative_tokens=spec_k)
+    assert (pol_no_decode.buckets, pol_no_decode.verify_buckets) == ((), ())
+    dec = check_post_mesh_eligibility(tp_size=8, bucket_policy=pol_no_decode)
+    assert not dec.eligible and dec.code == "empty_buckets"
+
+
+def test_resolve_verify_tokens_none_and_empty_verify_multiples() -> None:
+    """`verify_tokens=None` uses `(MTP_VERIFY_TOKENS,)`; unrepresented widths empty."""
+    prof = Profile(name="test_none_vt", numerics="exact")
+    pol_none = BucketPolicy.resolve(prof, verify_tokens=None)
+    assert pol_none.verify_tokens == (MTP_VERIFY_TOKENS,)
+    assert (pol_none.buckets, pol_none.verify_buckets) == (
+        DEFAULT_BUCKETS,
+        DEFAULT_VERIFY_BUCKETS,
+    )
+
+    pol_spec7_none = BucketPolicy.resolve(
+        prof, speculative_tokens=7, verify_tokens=None
+    )
+    assert pol_spec7_none.verify_tokens == (MTP_VERIFY_TOKENS,)
+    assert (pol_spec7_none.buckets, pol_spec7_none.verify_buckets) == (
+        DEFAULT_BUCKETS,
+        (),
+    )
+    assert parse_mk_verify_buckets("8, 16", verify_tokens=None) == (8, 16)
+
+    none_vt: Any = None
+    with pytest.raises(ValueError, match="invalid verify_tokens"):
+        BucketPolicy((8,), (), verify_tokens=none_vt)
+    for bad_spec in (-1, -4, True, False, 1.5, "3"):
+        bad_k: Any = bad_spec
+        with pytest.raises(ValueError, match="invalid speculative_tokens"):
+            BucketPolicy.resolve(prof, speculative_tokens=bad_k)
+
+    pol_no_mult = BucketPolicy.resolve(prof, speculative_tokens=10, verify_tokens=(11,))
+    assert pol_no_mult.verify_tokens == (11,)
+    assert (pol_no_mult.buckets, pol_no_mult.verify_buckets) == ((), ())
+    dec_no_mult = check_post_mesh_eligibility(tp_size=8, bucket_policy=pol_no_mult)
+    assert not dec_no_mult.eligible and dec_no_mult.code == "empty_buckets"
+
+
+def test_resolve_profile_verify_buckets_filtering_and_range_errors() -> None:
+    """Non-explicit verify_buckets filter uniformly; out-of-range entries raise."""
+    prof_def_v = Profile(
+        name="test_prof_def_v",
+        numerics="exact",
+        buckets=(8, 16),
+        verify_buckets=DEFAULT_VERIFY_BUCKETS,
+    )
+    expected_8 = (8, 16, 24, 32, 40, 48, 56, 64)
+    pol = BucketPolicy.resolve(prof_def_v, verify_tokens=(8,))
+    assert pol.verify_tokens == (8,)
+    assert (pol.buckets, pol.verify_buckets) == ((8, 16), expected_8)
+
+    pol_spec7 = BucketPolicy.resolve(
+        prof_def_v, speculative_tokens=7, verify_tokens=(8,)
+    )
+    assert (pol_spec7.buckets, pol_spec7.verify_buckets) == ((), expected_8)
+
+    prof_6_8 = Profile(
+        name="test_prof_6_8", numerics="exact", buckets=(2,), verify_buckets=(6, 8)
+    )
+    assert BucketPolicy.resolve(prof_6_8, verify_tokens=(8,)).verify_buckets == (8,)
+    assert BucketPolicy.resolve(prof_6_8, verify_tokens=(6,)).verify_buckets == (6,)
+
+    pol_non_exp_12 = BucketPolicy.resolve(
+        prof_def_v,
+        verify_buckets=(6, 12),
+        verify_buckets_explicit=False,
+        verify_tokens=(12,),
+    )
+    assert pol_non_exp_12.verify_buckets == (12,)
+
+    for out_of_range in ((0, 8), (1,), (1, 8), (68,), (-4,)):
+        prof_oor = Profile(
+            name="test_prof_oor", numerics="exact", verify_buckets=out_of_range
+        )
+        with pytest.raises(ValueError, match="invalid verify_buckets"):
+            BucketPolicy.resolve(prof_oor, verify_tokens=(8,))
+        with pytest.raises(ValueError, match="invalid verify_buckets"):
+            BucketPolicy.resolve(
+                prof_def_v, verify_buckets=out_of_range, verify_tokens=(8,)
+            )

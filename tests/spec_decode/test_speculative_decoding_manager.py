@@ -18,12 +18,12 @@ import numpy as np
 import pytest
 import torch
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
 )
+from vllm_torchtpu.runner.vllm_v1.spec_decode.ngram_proposer import NgramProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 

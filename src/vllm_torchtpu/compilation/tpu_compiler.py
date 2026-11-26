@@ -50,6 +50,7 @@ from vllm.config.utils import Range
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.compilation.graph_fingerprint import _graph_fingerprint
+from vllm_torchtpu.distributed.ep_mesh import ep_device_placement_key
 from vllm_torchtpu.gdn_pool_layout import prefill_checkpoint_enabled
 from vllm_torchtpu.logger import init_logger
 
@@ -227,8 +228,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
-    # local-rank offsets, which move a worker to a different chip without
-    # changing the executable it runs.
+    # local-rank offsets, which move a worker to a different chip. The device
+    # each EP rank runs on, which EP mesh programs compile in, is hashed on its
+    # own (`ep_device_placement`).
     "DEBUG_TPU_LOCAL_RANK_OFFSET",
     "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
     "RAIDEN_DISABLE_SINGLETON_WORKER",
@@ -312,7 +314,6 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # padded layouts can share pool and block-table shapes.
     "vllm_torchtpu/kv_cache_spec_normalizer.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
-    "vllm_torchtpu/layers/adapter/routed_experts_capturer.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
@@ -325,6 +326,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    # Qwen4Exp PLE state and QSA custom ops.
+    "vllm_torchtpu/models/qwen4_exp/ops",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
@@ -338,12 +341,41 @@ _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
     "vllm_torchtpu/omni/rope.py",
 )
 
+# Model directories may hold copy-on-write specializations of the reference
+# kernels (`kernels/`) and the custom-op bridges that call them (`ops/`), e.g.
+# `models/<model>/kernels/` or `models/vllm/<model>/ops/`. Both sit behind the
+# same custom-op boundaries as `vllm_torchtpu/kernels`, so they are hashed the
+# same way. They are discovered rather than listed, so a model that adds one is
+# covered without editing this file. Only directories with one of these names
+# are discovered: a custom-op wrapper anywhere else in a model directory is
+# hashed only if it is listed in _RUNTIME_CACHE_KEY_PATHS.
+_MODEL_KERNELS_ROOT = "vllm_torchtpu/models"
+_MODEL_CACHE_KEY_DIRNAMES = ("kernels", "ops")
+
+
+def _model_cache_key_relpaths(repo_root: Path) -> list[str]:
+    """Repo-relative paths of every `kernels/` and `ops/` dir under models."""
+    # TODO: (1) Hash only the served model's directories once a vllm_config ->
+    # model-directory mapping exists; today every model's dirs share one key.
+    # (2) Keep megakernel folders (e.g. `models/kimi_k3/megakernel/kernels/`,
+    # planned in #2595) out of the key: megakernel steps compile with
+    # `serializable=False` outside this cache, so hashing them only forces
+    # recompiles.
+    models_root = repo_root / _MODEL_KERNELS_ROOT
+    return [
+        path.relative_to(repo_root).as_posix()
+        for dirname in _MODEL_CACHE_KEY_DIRNAMES
+        for path in models_root.rglob(dirname)
+        # A plain file named `ops` or `kernels` is not a package directory.
+        if path.is_dir()
+    ]
+
 
 def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
     """Return runtime source files that affect TPU custom-op lowering."""
     files_by_relpath: dict[str, Path] = {}
 
-    for rel_path in _RUNTIME_CACHE_KEY_PATHS:
+    for rel_path in (*_RUNTIME_CACHE_KEY_PATHS, *_model_cache_key_relpaths(repo_root)):
         path = repo_root / rel_path
         if path.is_file():
             files_by_relpath[rel_path] = path
@@ -380,7 +412,8 @@ def _reloadable_kernel_relpaths(repo_root: Path) -> list[str]:
     pieces (splitting_ops in tpu_platform.py) and are re-lowered from source
     per process / per reload, so their bytes no longer affect the cached
     executables and are dropped from the cache key. Everything else in
-    _RUNTIME_CACHE_KEY_PATHS stays hashed.
+    _RUNTIME_CACHE_KEY_PATHS and in the discovered `models/**/kernels/` and
+    `models/**/ops/` directories (_model_cache_key_relpaths) stays hashed.
     """
     from vllm_torchtpu.compilation import kernel_reload
 
@@ -439,6 +472,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
                 vllm_config.parallel_config
             ),
         },
+        "ep_device_placement": ep_device_placement_key(),
         # TPU AOT graphs embed the KV tensor extent as a literal. Hash the
         # resolved block count, which every rank shares via kv_cache_config.
         # The raw per-worker num_gpu_blocks_override is a pre-alignment HBM
@@ -600,10 +634,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         # from 1 within it, so the HLO, and with it torch_tpu's cache key, does
         # not depend on what this process compiled before: every rank then
         # builds the same key for a bucket and can hit an executable another
-        # rank already put in the Tier-2 cache.
-        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+        # rank already put in the Tier-2 cache. Every kernel, reference or
+        # per-model copy, takes its ids from the one process-wide counter.
+        from vllm_torchtpu.kernels import scheduling_groups
 
-        config.reset_scheduling_group_ids()
+        scheduling_groups.reset_scheduling_group_ids()
         with torch._guards.tracing(tracing_ctx):
             compiled_fn = _tpu_backend(graph, example_inputs)
 

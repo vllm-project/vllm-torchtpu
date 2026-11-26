@@ -67,7 +67,7 @@ def test_execute_model_pcp_mtp_prefill_only_boundary(
     runner.scheduler_config.async_scheduling = async_scheduling
     # The fixture already represents the batch after the scheduler update.
     runner._update_states = lambda _: None
-    runner._flush_disjoint_async_results = lambda: None
+    runner._unmap_disjoint_async_results = lambda: None
 
     class ForwardBoundaryReached(Exception):
         pass
@@ -746,10 +746,12 @@ def test_pcp_streaming_does_not_use_batched_smem_capacity(
 def test_prepare_inputs_pcp_ignores_unmapped_async_spec_results(
     monkeypatch, uses_mrope
 ):
-    """Zero-token async spec results kept for their copy must not be applied.
+    """Async spec results that no request continues, kept for their copy, must
+    not be applied.
 
-    _flush_disjoint_async_results() keeps results whose req_id_to_index_copy is
-    empty until sample_tokens() waits on their D2H copy. A PCP prefill step that
+    _unmap_disjoint_async_results() keeps results whose req_id_to_index_copy is
+    empty (nothing committed, or every request left the batch) until
+    sample_tokens() waits on their D2H copy. A PCP prefill step that
     follows must skip the rejected-token subtraction: no request maps, and its
     index arrays are sized by the global padded token count while position_ids
     holds only this rank's shard (qwen35-pcp4-dp4-disagg-correctness crashed

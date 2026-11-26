@@ -33,10 +33,11 @@ experts. Skipped tensors are never fetched from storage at all.
 
 The DefaultModelLoader patch below fixes the matching gap in vLLM 0.27.0's
 local-files path: ``should_skip_weight`` only matches names ending in
-``.weight``, so for an MXFP4 checkpoint it keeps every expert's
-``.weight_packed`` and ``.weight_scale`` and the filter is a no-op for all
-per-expert tensors. The patch replaces the predicate with one whose suffix
-allowlist also covers ``.weight_packed`` and ``.weight_scale``.
+``.weight``, so for quantized MoE checkpoints it keeps every expert's
+packed/scale tensors (such as ``.weight_packed``, ``.weight_scale``,
+``.weight_scale_inv``, ``.weight_scale_2``, and ``.scale``). The patch
+replaces the predicate with one whose suffix allowlist
+(``_EXPERT_WEIGHT_SUFFIXES``) covers all of those per-expert suffixes.
 
 Divergence from upstream noted: upstream deliberately keeps every expert's
 scale tensors because some GPU backends reduce a global activation-scale
@@ -67,10 +68,20 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 # Suffixes of per-expert tensors that are safe to skip for non-local
-# experts. Anything else (dense, shared experts, gate, norms) is fetched by
-# every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
-# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts.
-_EXPERT_WEIGHT_SUFFIXES = (".weight", ".weight_packed", ".weight_scale", ".scale")
+# experts. Anything else (dense, shared experts, gate, norms, and NVFP4
+# ``.input_scale`` scalars needed for global activation-scale reductions) is
+# fetched by every rank. ``.scale`` is DeepSeek-V4's per-expert block scale
+# (``ffn.experts.<e>.w1.scale``), 47 GiB across all 384 experts;
+# ``.weight_scale_inv`` is block-scaled FP8's per-expert inverse scale; and
+# ``.weight_scale_2`` is ModelOpt NVFP4's per-expert global weight scale.
+_EXPERT_WEIGHT_SUFFIXES = (
+    ".weight",
+    ".weight_packed",
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".weight_scale_2",
+    ".scale",
+)
 
 # Set to ``source.is_unused_weight`` while ``DefaultModelLoader._get_weights_iterator``
 # runs, so ``_should_skip_weight_tpu`` skips those tensors before ``get_tensor``.
@@ -103,10 +114,11 @@ def _should_skip_weight_tpu(
     """Drop-in replacement for vLLM's ``should_skip_weight``.
 
     Same contract as upstream (``local_expert_ids=None`` means no
-    filtering), but the suffix allowlist also covers the compressed-tensors
-    MXFP4 ``.weight_packed`` and ``.weight_scale`` names, so non-local
-    experts are skipped before their bytes are read. Also skips weights
-    marked unused by the loading model's ``is_unused_checkpoint_weight``.
+    filtering), but the suffix allowlist (``_EXPERT_WEIGHT_SUFFIXES``) also
+    covers ``.weight_packed``, ``.weight_scale``, ``.weight_scale_inv``,
+    ``.weight_scale_2``, and ``.scale``, so non-local experts are skipped
+    before their bytes are read. Also skips weights marked unused by the
+    loading model's ``is_unused_checkpoint_weight``.
     """
     if _unused_weight_predicate is not None and _unused_weight_predicate(weight_name):
         # Unused by the loading model (e.g. MTP draft). Used tensors still
@@ -517,15 +529,16 @@ def patch_runai_sharded_expert_streaming() -> None:
 
 
 def patch_default_loader_ep_weight_filter() -> None:
-    """Widen ``DefaultModelLoader``'s EP weight filter to MXFP4 names.
+    """Widen ``DefaultModelLoader``'s EP weight filter to ``_EXPERT_WEIGHT_SUFFIXES``.
 
     vLLM 0.27.0's ``should_skip_weight`` only skips names ending in
-    ``.weight``; a compressed-tensors MXFP4 checkpoint stores per-expert
-    tensors as ``.weight_packed``/``.weight_scale``, so the stock filter
-    reads all 896 experts on every rank. ``weight_utils`` imports the
-    predicate by value, so both module references are replaced. Inert when
-    the EP weight filter is off: ``safetensors_weights_iterator`` then
-    passes ``local_expert_ids=None`` and the predicate keeps everything.
+    ``.weight``; quantized MoE checkpoints store per-expert packed weights
+    and scales under ``.weight_packed``, ``.weight_scale``,
+    ``.weight_scale_inv``, ``.weight_scale_2``, or ``.scale``, so the stock
+    filter reads every expert's tensors on every rank. ``weight_utils``
+    imports the predicate by value, so both module references are replaced.
+    Inert when the EP weight filter is off: ``safetensors_weights_iterator``
+    then passes ``local_expert_ids=None`` and the predicate keeps everything.
 
     The same predicate also skips tensors the loading model marks unused
     (``model.is_unused_checkpoint_weight``, e.g. an MTP draft's main-model
@@ -613,10 +626,10 @@ def patch_default_loader_ep_weight_filter() -> None:
     default_loader.DefaultModelLoader._get_weights_iterator = _get_weights_iterator
     weight_utils._tpu_ep_filter_patch = True
     logger.info(
-        "Applied TPU patch: EP weight filter covers "
-        ".weight_packed/.weight_scale/.scale, skips unused checkpoint "
-        "tensors before read, and prefetch reads only "
-        "local tensors (DefaultModelLoader)."
+        "Applied TPU patch: EP weight filter covers %s, skips unused "
+        "checkpoint tensors before read, and prefetch reads only local "
+        "tensors (DefaultModelLoader).",
+        "/".join(_EXPERT_WEIGHT_SUFFIXES),
     )
 
 
@@ -1026,6 +1039,7 @@ def patch_moe_expert_write_staging() -> None:
         return result
 
     def process_weights_after_loading(model, model_config, target_device):
+        nonlocal stager
         during_load = stager.flushed
         stager.flush_all()
         logger.info(
@@ -1034,6 +1048,13 @@ def patch_moe_expert_write_staging() -> None:
             during_load,
             stager.flushed - during_load,
         )
+        # Weight post-processing replaces the expert parameters (e.g.
+        # layers/adapter/quantization/unquantized.py), so id(param) keys in the
+        # stager go stale once orig_process runs. Swap in a fresh stager so a
+        # later load (e.g. a draft model) starts with clean state and its own
+        # flushed count.
+        stager = ExpertParamStager()
+        calls[0] = 0
         return orig_process(model, model_config, target_device)
 
     RoutedExperts.weight_loader = weight_loader
@@ -1071,4 +1092,33 @@ def patch_expert_placement_routers() -> None:
     typing.cast(
         typing.Any, process_weights_after_loading
     )._tpu_renumbers_expert_routers = True
+    base_loader.process_weights_after_loading = process_weights_after_loading
+
+
+def patch_attn_out_relayout_tags() -> None:
+    """Tag FP8 attention `o_proj` layers after every model's weights load."""
+    from vllm.model_executor.model_loader import base_loader
+
+    orig_process = base_loader.process_weights_after_loading
+    if getattr(orig_process, "_tpu_tags_attn_out_relayout", False):
+        return
+
+    @functools.wraps(orig_process)
+    def process_weights_after_loading(model, model_config, target_device):
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            tag_attn_out_relayout_projections,
+        )
+
+        result = orig_process(model, model_config, target_device)
+        tagged = tag_attn_out_relayout_projections(model)
+        logger.info(
+            "Fenced the input of %d FP8 attention o_proj layers to keep "
+            "the attention-output relayout in bf16.",
+            tagged,
+        )
+        return result
+
+    typing.cast(
+        typing.Any, process_weights_after_loading
+    )._tpu_tags_attn_out_relayout = True
     base_loader.process_weights_after_loading = process_weights_after_loading

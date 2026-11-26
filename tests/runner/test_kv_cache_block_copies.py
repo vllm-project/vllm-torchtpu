@@ -20,12 +20,12 @@ import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 import vllm_torchtpu
 import vllm_torchtpu.runner.tpu_runner as runner_mod
 from vllm_torchtpu.runner.min_tokens import MinTokensTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_model_runner import GPUModelRunner
 from vllm_torchtpu.utils import tpu_bind_kv_cache
 
 
@@ -59,7 +59,7 @@ def test_update_states_routes_pooled_copies_away_from_generic_path(monkeypatch):
     result_marker = object()
 
     def base_update(_runner, scheduler_output):
-        events.append("base_zero_and_state")
+        events.append("base_state_update")
         base_outputs.append(scheduler_output)
         return result_marker
 
@@ -87,7 +87,7 @@ def test_update_states_routes_pooled_copies_away_from_generic_path(monkeypatch):
     assert base_outputs[0].new_block_ids_to_zero == [7]
     assert scheduler_output.kv_cache_block_copies == copies
     assert local_copies == [copies]
-    assert events == ["base_zero_and_state", "page_local_copy"]
+    assert events == ["base_state_update", "page_local_copy"]
 
 
 def test_update_states_keeps_generic_copy_for_non_pooled_layout(monkeypatch):
@@ -328,7 +328,7 @@ def test_update_states_routes_dense_copies_for_attention_only(monkeypatch):
 
     DCP fine-grained prefix hits on an attention-only model (GLM-5 MLA +
     indexer) emit CoW copies without a unified pool. The base advanced-index
-    copy must be hidden and the dense per-layer copy run after base zeroing.
+    copy must be hidden and the dense per-layer copy run instead.
     """
     events = []
     base_outputs = []

@@ -201,3 +201,17 @@ def test_fit_rows_returns_slices_or_pads_the_leading_dim():
     out = utils.fit_rows(t, 6, value=-1)
     assert out.dtype == torch.int32 and out.shape == (6, 2)
     assert torch.equal(out[:4], t) and out[4:].eq(-1).all()
+
+
+def test_disable_ep_weight_filter_for_replicated_draft_copies_parallel_config():
+    import copy
+
+    target_pc = SimpleNamespace(tensor_parallel_size=8, enable_ep_weight_filter=True)
+    target_cfg = SimpleNamespace(parallel_config=target_pc)
+    draft_cfg = copy.copy(target_cfg)
+
+    utils.disable_ep_weight_filter_for_replicated_draft(draft_cfg)
+
+    assert draft_cfg.parallel_config is not target_pc
+    assert draft_cfg.parallel_config.enable_ep_weight_filter is False
+    assert target_cfg.parallel_config.enable_ep_weight_filter is True

@@ -34,6 +34,7 @@ from vllm_torchtpu.gdn_pool_layout import (
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
+from vllm_torchtpu.layers.core.causal_conv1d import ragged_causal_conv1d
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -50,36 +51,6 @@ def _guard_kda_verify_window(
     return jax.lax.cond(num_window_reqs > 0, run_verify_window, skip_verify_window)
 
 
-def _token_sequence_ids(
-    query_start_loc: jax.Array,
-    num_tokens: int,
-    num_seqs: int,
-) -> jax.Array:
-    """Map each token row to the 0-indexed sequence that owns it.
-
-    A token's sequence index is the number of interior sequence starts
-    (``query_start_loc[1:num_seqs]``) lying at or below its row, so marking each
-    start and taking an inclusive cumsum computes the whole mapping in one pass
-    over the token axis.
-
-    ``jnp.searchsorted`` expresses the same thing more directly, but XLA lowers
-    it to a vectorised O(num_tokens * num_seqs) comparison below a request
-    bucket of about 64 and to a binary search above, which puts the bucket sizes
-    production actually uses on the expensive side of the threshold: at 2048
-    tokens it costs 0.74ms per layer at a bucket of 64 against 0.23ms at 68.
-    This form is flat in the bucket at 0.14ms, which is the dispatch floor.
-
-    ``mode="drop"`` discards starts at or past the token bucket instead of
-    clamping them onto the last row -- dummy AOT runs describe more requests
-    than fit. Scatter-add accumulates duplicates, so empty sequences correctly
-    advance the index by more than one. Total marks cannot exceed
-    ``num_seqs - 1``, so the clamp only restates that bound.
-    """
-    starts = query_start_loc[1:num_seqs]
-    marks = jnp.zeros((num_tokens,), jnp.int32).at[starts].add(1, mode="drop")
-    return jnp.minimum(jnp.cumsum(marks), num_seqs - 1)
-
-
 def kimi_short_conv_scan(
     x: jax.Array,
     conv_state: jax.Array,
@@ -87,159 +58,17 @@ def kimi_short_conv_scan(
     query_start_loc: jax.Array,
     state_indices: jax.Array,
     seq_lens: jax.Array,
-    start_seq: jax.Array | int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """Kimi short convolution over a ragged batch, without a token loop.
-
-    The shared Pallas ragged-convolution kernel can halt the TPU when many
-    donated recurrent buffers are embedded in Kimi's compiled hybrid graph.
-    Keep this model-local fallback until that kernel interaction is fixed.
-
-    ``start_seq`` restricts the work to the tokens of segments at or after that
-    index; earlier tokens keep a zero output row and their convolution state is
-    left untouched. That is how a caller can hand the decode part of a batch to
-    a decode kernel that does its own convolution.
-
-    The kernel width is static, so the whole convolution is ``kernel_size``
-    shifted multiply-accumulates over the token axis with no loop at all. Only
-    the taps reaching back past a sequence's first token need care, and those
-    come from that sequence's carried window. Selecting per tap between ``x`` and
-    a gather from the window table means there is no special-cased path for the
-    first few tokens of a sequence.
-
-    This replaced a per-token loop. Two things made that loop expensive and
-    neither was arithmetic: each token gathered from and scattered into the whole
-    state pool, which XLA lowers to a dynamic-slice / dynamic-update-slice pair
-    over a buffer more than a megabyte wide, and the loop machinery plus the
-    per-token output scatter cost about 2us per token on their own. Together they
-    came to 13.3us per token, or 27ms for a 2048-token prefill; this form does
-    the same 2048 tokens in 0.36ms and is bitwise identical on every live slot.
-
-    The ``lax.cond`` matters for decode. Where the old loop's device-valued trip
-    count made a fully restricted batch free, fixed work over the token axis
-    would pay full price to produce a result that is then entirely masked away --
-    which is exactly what every pure-decode step does. This is a branch on a
-    device value inside one traced graph, not a host branch on batch
-    composition, so it is safe under the no-guards compile wrapper.
-    """
-    num_tokens = x.shape[0]
-    num_seqs = state_indices.shape[0]
-    # Dummy AOT runs may describe more one-token requests than fit in the
-    # current token bucket; normal runtime metadata instead repeats the true
-    # token total in its padded request tail.
-    total_tokens = jnp.minimum(query_start_loc[-1], num_tokens)
-    if start_seq is None:
-        first_seq = jnp.zeros((), jnp.int32)
-    else:
-        first_seq = jnp.minimum(jnp.asarray(start_seq, jnp.int32), num_seqs)
-    first_token = jnp.minimum(query_start_loc[first_seq], total_tokens)
-
-    return jax.lax.cond(
-        first_token < total_tokens,
-        lambda: _short_conv_tokens(
-            x,
-            conv_state,
-            conv_weight,
-            query_start_loc,
-            state_indices,
-            seq_lens,
-            first_seq,
-            first_token,
-            total_tokens,
-        ),
-        lambda: (jnp.zeros_like(x), conv_state),
+    """Kimi short convolution over a ragged batch, delegating to ``causal_conv1d``."""
+    return ragged_causal_conv1d(
+        x,
+        conv_state,
+        conv_weight,
+        None,
+        query_start_loc,
+        state_indices,
+        seq_lens=seq_lens,
     )
-
-
-def _short_conv_tokens(
-    x: jax.Array,
-    conv_state: jax.Array,
-    conv_weight: jax.Array,
-    query_start_loc: jax.Array,
-    state_indices: jax.Array,
-    seq_lens: jax.Array,
-    first_seq: jax.Array,
-    first_token: jax.Array,
-    total_tokens: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    """The loop-free convolution body. See ``kimi_short_conv_scan``."""
-    num_tokens = x.shape[0]
-    num_seqs = state_indices.shape[0]
-    kernel_size = conv_weight.shape[0]
-    history = kernel_size - 1
-
-    sequence_ids = _token_sequence_ids(query_start_loc, num_tokens, num_seqs)
-    query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    has_initial_state = seq_lens > query_lens
-
-    # Each sequence's carried window, zeroed where there is no history to carry.
-    state_broadcast = has_initial_state.reshape(
-        (num_seqs,) + (1,) * (conv_state.ndim - 1)
-    )
-    windows = jnp.where(state_broadcast, conv_state[state_indices], 0)
-    windows_2d = windows.reshape(num_seqs, history, -1)
-    windows_flat = windows_2d.reshape(num_seqs * history, -1)
-
-    token_ids = jnp.arange(num_tokens, dtype=jnp.int32)
-    position = token_ids - query_start_loc[sequence_ids]
-
-    # Tap j reads the row `history - j` places behind the current token. That row
-    # lies inside the sequence once the position is far enough in, and is window
-    # row `position + j` otherwise -- which is in range exactly when it is
-    # needed, since the fallback only applies while position < history - j. The
-    # clip keeps the masked-away lanes in bounds; padded token rows can compute a
-    # negative position and are dropped by `walked` below.
-    taps = []
-    for j in range(kernel_size):
-        shift = history - j
-        from_x = jnp.pad(x, ((shift, 0), (0, 0)))[:num_tokens]
-        flat = sequence_ids * history + position + j
-        from_window = windows_flat[jnp.clip(flat, 0, num_seqs * history - 1)]
-        taps.append(jnp.where((position >= shift)[:, None], from_x, from_window))
-
-    # Reduced over the tap axis the way the per-token loop reduced over its
-    # stacked window, so the two agree bit for bit.
-    output = jnp.sum(
-        jnp.stack(taps, axis=0).astype(jnp.float32)
-        * conv_weight[:, None, :].astype(jnp.float32),
-        axis=0,
-    ).astype(x.dtype)
-    walked = (token_ids >= first_token) & (token_ids < total_tokens)
-    output = jnp.where(walked[:, None], output, 0)
-
-    # The outgoing window is a sequence's last `history` source rows. Those come
-    # from `x`, except for a sequence shorter than the window, whose older rows
-    # are still the incoming window's.
-    rows = jnp.arange(history, dtype=jnp.int32)
-    local = query_lens[:, None] - history + rows
-    from_x = x[jnp.clip(query_start_loc[:-1][:, None] + local, 0, num_tokens - 1)]
-    from_window = jnp.take_along_axis(
-        windows_2d,
-        jnp.clip(query_lens[:, None] + rows, 0, history - 1)[..., None],
-        axis=1,
-    )
-    new_window = jnp.where((local >= 0)[..., None], from_x, from_window)
-    if conv_state.ndim > 3:
-        new_window = new_window.reshape(num_seqs, history, *conv_state.shape[2:])
-
-    # Only sequences that were walked and hold tokens may advance their slot.
-    # Everything else would wipe a live slot, so point it at the null block --
-    # and hand it what slot 0 already holds, so that write is a no-op. Routing
-    # the index alone would leave scratch in slot 0, which `decode_kda` and the
-    # per-token loop this replaced both leave strictly alone.
-    sequence_all = jnp.arange(num_seqs, dtype=jnp.int32)
-    keep = (
-        (query_lens > 0)
-        & (sequence_all >= first_seq)
-        & (query_start_loc[:-1] < total_tokens)
-    )
-    write_indices = jnp.where(keep, state_indices, 0)
-    keep_broadcast = keep.reshape((num_seqs,) + (1,) * (conv_state.ndim - 1))
-    written = jnp.where(
-        keep_broadcast, new_window.astype(conv_state.dtype), conv_state[0]
-    )
-    new_state = conv_state.at[write_indices].set(written)
-    return output, new_state
 
 
 # ===========================================================================
@@ -248,9 +77,9 @@ def _short_conv_tokens(
 
 
 def _gated_output_norm(
-    output: jax.Array,  # [num_rows, H, D]
-    output_gate: jax.Array,  # [num_rows, H * D] raw gate
-    norm_weight: jax.Array,  # [D]
+    output: jax.Array,  # [num_rows, H, V]
+    output_gate: jax.Array,  # [num_rows, H * V] raw gate
+    norm_weight: jax.Array,  # [V]
     eps: float,
     activation_dtype,
 ) -> jax.Array:
@@ -273,28 +102,30 @@ def _check_kda_abi(
     query_start_loc: jax.Array,
     state_indices: jax.Array,
     seq_lens: jax.Array,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     """Validate the shared KDA operand contract; return the shape tuple.
 
-    Deliberately the same contract `ragged_kda` enforces, so swapping ops cannot
-    silently change what a caller is allowed to pass.
+    Mirrors the contract `ragged_kda` enforces, except that the value head
+    size may differ from the key head size: it comes from the recurrent
+    state's last axis (equal to the key head size for Kimi, twice as wide for
+    OLMo 3.5). `ragged_kda` still requires the two to match.
     """
     num_tokens, mixed_dim = mixed_qkv.shape
-    num_heads, head_dim, state_v_dim = recurrent_state.shape[1:]
-    if state_v_dim != head_dim or mixed_dim != 3 * num_heads * head_dim:
+    num_heads, head_dim, head_v_dim = recurrent_state.shape[1:]
+    if mixed_dim != num_heads * (2 * head_dim + head_v_dim):
         raise ValueError("Incompatible KDA activation and state shapes")
     if raw_gate.shape != (num_tokens, num_heads * head_dim):
         raise ValueError("Incompatible KDA gate shape")
     if beta.shape != (num_tokens, num_heads):
         raise ValueError("Incompatible KDA beta shape")
-    if output_gate.shape != (num_tokens, num_heads * head_dim):
+    if output_gate.shape != (num_tokens, num_heads * head_v_dim):
         raise ValueError("Incompatible KDA output-gate shape")
     num_sequences = state_indices.shape[0]
     if a_log.shape != (num_heads,):
         raise ValueError("KDA A_log shape does not match the head count")
     if dt_bias.shape != (num_heads * head_dim,):
         raise ValueError("KDA dt_bias shape does not match the projection")
-    if norm_weight.shape != (head_dim,):
+    if norm_weight.shape != (head_v_dim,):
         raise ValueError("KDA norm weight shape does not match the head size")
     if query_start_loc.shape != (num_sequences + 1,):
         raise ValueError("KDA query starts and state indices disagree")
@@ -316,10 +147,15 @@ def _check_kda_abi(
         or seq_lens.dtype != jnp.int32
     ):
         raise TypeError("KDA metadata tensors must be int32")
-    return num_tokens, num_sequences, num_heads, head_dim
+    return num_tokens, num_sequences, num_heads, head_dim, head_v_dim
 
 
-def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: int = 0):
+def _build_fused_core(
+    lower_bound: float | None,
+    eps: float,
+    num_spec_tokens: int = 0,
+    beta_scale: float = 1.0,
+):
     """The same op, on the fused conv1d + GDN v3 kernel.
 
     The fused kernel replaces the four-stage manual pipeline and
@@ -333,16 +169,16 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
     """
 
     def fused_core(
-        mixed_qkv: jax.Array,  # [T, 3 * H * D], pre-convolution
+        mixed_qkv: jax.Array,  # [T, H * (2 * D + V)], pre-convolution
         raw_gate: jax.Array,  # [T, H * D]
         beta: jax.Array,  # [T, H]
-        output_gate: jax.Array,  # [T, H * D]
-        conv_state: jax.Array,  # [num_slots, K - 1, 1, 3 * H * D] or flat 3-D
-        recurrent_state: jax.Array,  # [num_slots, H, K, V]
-        conv_weight: jax.Array,  # [kernel_size, 3, H, D], fused at load time
+        output_gate: jax.Array,  # [T, H * V]
+        conv_state: jax.Array,  # [num_slots, K - 1, 1, H * (2D + V)] or flat
+        recurrent_state: jax.Array,  # [num_slots, H, D, V]
+        conv_weight: jax.Array,  # [kernel_size, ...], channels in qkv order
         a_log: jax.Array,  # [H]
         dt_bias: jax.Array,  # [H * D]
-        norm_weight: jax.Array,  # [D]
+        norm_weight: jax.Array,  # [V]
         query_start_loc: jax.Array,  # [N + 1]
         state_indices: jax.Array,  # [N]
         seq_lens: jax.Array,  # [N]
@@ -350,7 +186,7 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         window_distribution: jax.Array | None = None,
         slot_read_offsets: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        num_tokens, _, num_heads, head_dim = _check_kda_abi(
+        num_tokens, _, num_heads, head_dim, head_v_dim = _check_kda_abi(
             mixed_qkv,
             raw_gate,
             beta,
@@ -367,11 +203,12 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         if window_distribution is None:
             window_distribution = distribution
 
-        # `mixed_qkv` and `conv_weight` lay their channels out as (3, H, D) in
-        # row-major order, which is exactly the flat `dim` axis the fused
-        # kernel indexes -- the reshapes are free. The dense `conv_state`
-        # cache is declared in the kernel's (K - 1, 1, dim) slot layout so it
-        # is read in place; the pooled path hands in its gathered slots flat.
+        # `mixed_qkv` and `conv_weight` lay their channels out as
+        # (q: H * D, k: H * D, v: H * V) in row-major order, which is exactly
+        # the flat `dim` axis the fused kernel indexes -- the reshapes are
+        # free. The dense `conv_state` cache is declared in the kernel's
+        # (K - 1, 1, dim) slot layout so it is read in place; the pooled path
+        # hands in its gathered slots flat.
         # The kernel wants the weight transposed to [dim, 1, kernel_size].
         conv_weight_flat = conv_weight.reshape(kernel_size, -1)
         conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
@@ -406,10 +243,11 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
                 n_kq=num_heads,
                 n_v=num_heads,
                 d_k=head_dim,
-                d_v=head_dim,
+                d_v=head_v_dim,
                 kernel_size=kernel_size,
                 attention_mode=gdn_config.AttentionMode.KDA,
                 gate_lower_bound=lower_bound,
+                beta_scale=beta_scale,
                 num_spec_tokens=num_spec_tokens,
                 batched_only=batched_only,
                 prefill_only=prefill_only,
@@ -417,7 +255,7 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
 
         if num_spec_tokens > 0:
             window_end = window_distribution[0]
-            empty_out = jnp.zeros((num_tokens, num_heads * head_dim), mixed_qkv.dtype)
+            empty_out = jnp.zeros((num_tokens, num_heads * head_v_dim), mixed_qkv.dtype)
             (verify_states, verify_out) = _guard_kda_verify_window(
                 window_end,
                 lambda: run_kernel(conv_state, recurrent_state, batched_only=True),
@@ -438,7 +276,7 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         else:
             (new_conv_state, new_pool), out = run_kernel(conv_state, recurrent_state)
 
-        output = out.reshape(num_tokens, num_heads, head_dim)
+        output = out.reshape(num_tokens, num_heads, head_v_dim)
         output = _gated_output_norm(
             output, output_gate, norm_weight, eps, mixed_qkv.dtype
         )
@@ -454,10 +292,14 @@ def build_kimi_dispatched_kda_op(
     eps: float,
     state_dim_first: bool,
     num_spec_tokens: int = 0,
+    beta_scale: float = 1.0,
 ):
     """Build fused KDA with separately guarded speculative and prefill segments."""
-    core = _build_fused_core(lower_bound, eps, num_spec_tokens)
+    core = _build_fused_core(lower_bound, eps, num_spec_tokens, beta_scale)
     variant = "fused_window" if num_spec_tokens else "fused"
+    # The scale is baked into the traced core, and ops dispatch by name.
+    if beta_scale != 1.0:
+        variant += f"_beta{beta_scale:g}".replace(".", "p")
     logger.info("KDA op %s: using the %s GDN v3 path.", prefix, variant)
     op_name = f"pallas::kimi_dispatched_kda_{variant}_{prefix.replace('.', '_')}"
     dispatched_op = pallas.jax_op(op_name, core, donate_argnums=(4, 5))
@@ -472,9 +314,9 @@ def build_kimi_dispatched_kda_op(
         *args,
         **kwargs,
     ):
-        num_heads, head_dim = recurrent_state.shape[1:3]
+        num_heads, head_v_dim = recurrent_state.shape[1], recurrent_state.shape[3]
         output = torch.empty(
-            (mixed_qkv.size(0), num_heads, head_dim),
+            (mixed_qkv.size(0), num_heads, head_v_dim),
             dtype=mixed_qkv.dtype,
             device=mixed_qkv.device,
         )
@@ -573,6 +415,13 @@ def _pooled_kda_core(
         state_indices = ckpt_indices.reshape(-1)
     num_heads = a_log.shape[0]
     head_dim = norm_weight.shape[0]
+    # The pooled path uses one head width for both state axes and the conv;
+    # d_v != d_k is only supported by the dispatched (dense) op.
+    if dt_bias.shape[0] != num_heads * head_dim:
+        raise NotImplementedError(
+            "Pooled KDA requires equal key and value head widths; got key width "
+            f"{dt_bias.shape[0] // num_heads} and value width {head_dim}."
+        )
     kernel_size = conv_weight.shape[0]
     # The pool dtype is the attention KV dtype. The state regions keep the
     # dtypes gdn_pool_layout fixes for every reader of pool bytes (block
@@ -740,6 +589,7 @@ def build_kimi_pooled_kda_op(
     eps: float,
     vllm_config: VllmConfig,
     num_spec_tokens: int = 0,
+    beta_scale: float = 1.0,
 ):
     """Build the KDA op that reads and writes its state through the pool.
 
@@ -757,7 +607,15 @@ def build_kimi_pooled_kda_op(
     adjusted value exists), so a value captured at build time is the
     pre-adjustment one (16) and the op would size its regions against the
     wrong manager block.
+
+    `beta_scale` and a value head wider than the key head are only supported
+    by the dispatched op; both raise here rather than fail at trace time.
     """
+    if beta_scale != 1.0:
+        raise NotImplementedError(
+            f"Pooled KDA does not support beta_scale (got {beta_scale}); use the "
+            "dispatched op (TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0)."
+        )
 
     conv_shard_heads = None
     if (

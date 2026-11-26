@@ -37,9 +37,8 @@ from vllm.distributed import parallel_state
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.dcp import get_dcp_world_size
 from vllm_torchtpu.distributed.mesh_utils import (
-    _collect_rank_to_device_id,
     _get_current_global_rank,
-    _get_tpu_global_device_id,
+    get_cp_group_layout,
     get_pipeline_stage,
     get_stage_mesh,
 )
@@ -58,6 +57,10 @@ EP_AXIS_NAME = "d"
 _MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
 _TOKEN_GROUP_CACHE: dict[tuple, tuple[tuple[int, ...], ...]] = {}
 _SORTED_GATHER_CACHE: dict[tuple, tuple[Any, tuple[int, ...]]] = {}
+# EP group ranks -> the device ids `ep_device_ids` gathered for them.
+_GATHERED_DEVICE_IDS: dict[tuple[int, ...], tuple[int, ...]] = {}
+# Set once `ep_device_placement_key` has been read.
+_PLACEMENT_KEY_READ = False
 
 
 def ep_token_replica_groups(
@@ -134,22 +137,46 @@ def ep_device_ids() -> tuple[int, ...] | None:
 
     This is the natural order -- mesh index i would be EP rank i -- but it is
     NOT the order `build_ep_mesh` uses; see `ep_rank_order` for why. Returns
-    None when EP is off.
+    None when EP is off. The gather is `get_cp_group_layout`'s, cached there.
+    Records the result for `ep_device_placement_key`.
     """
     group = get_ep_group()
     if group is None:
         return None
-    ranks = tuple(int(r) for r in group.ranks)
-    rank_to_device_id = _collect_rank_to_device_id(
-        group, _get_current_global_rank(), _get_tpu_global_device_id()
-    )
-    missing = [r for r in ranks if r not in rank_to_device_id]
-    if missing:
+    layout = get_cp_group_layout(group)
+    ranks, device_ids = layout.ranks, layout.device_ids
+    if _PLACEMENT_KEY_READ and _GATHERED_DEVICE_IDS.get(ranks) != device_ids:
         raise RuntimeError(
-            "Could not map all EP ranks to TPU global device ids: "
-            f"missing={missing}, ranks={ranks}, gathered={rank_to_device_id}"
+            "EP device placement gathered after the compile cache key was taken, "
+            "so the key does not cover it. Either an EP mesh is built after "
+            "weight load, or the compile cache key is read before weight load. "
+            f"ranks={ranks}, device_ids={device_ids}"
         )
-    return tuple(rank_to_device_id[r] for r in ranks)
+    _GATHERED_DEVICE_IDS[ranks] = device_ids
+    return device_ids
+
+
+def ep_device_placement_key() -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
+    """Every (EP ranks, device ids) pair `ep_device_ids` has gathered here.
+
+    Programs built over the EP mesh have the EP device placement (which device
+    each EP rank runs on) compiled in as constants: the mesh's device order,
+    the expert relabelling of `ep_rank_order` and the token replica groups all
+    follow from it. That placement can differ between two starts of one
+    deployment (on a multi-host slice, the host running EP ranks 0-7 does not
+    always hold the lowest device ids), and a fused EP MoE program built for
+    one placement sends tokens to the wrong experts under another. The compile
+    cache therefore keys on this, so each placement compiles once and has its
+    own cache directory (see docs/user_guide/compilation_cache.md).
+
+    Reads only what was gathered, with no collective of its own, so every EP
+    mesh user must make its first `ep_device_ids` call at weight load, before
+    anything compiles. A new placement gathered after this has been read
+    raises in `ep_device_ids`.
+    """
+    global _PLACEMENT_KEY_READ
+    _PLACEMENT_KEY_READ = True
+    return tuple(sorted(_GATHERED_DEVICE_IDS.items()))
 
 
 def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
@@ -304,7 +331,7 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
 
     import numpy as np
     from jax.sharding import Mesh
-    from torch_tpu._internal.pallas import get_pallas_mesh
+    from torch.tpu.pallas import get_pallas_mesh
 
     if stages > 1:
         # The EP group is one pipeline stage.

@@ -41,6 +41,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
+    disable_ep_weight_filter_for_replicated_draft,
     dp_lockstep_num_reqs,
     fit_rows,
     maybe_share_embeddings,
@@ -279,6 +280,8 @@ class DFlashProposer:
             _force_draft_tp1() if self._draft_replicated else contextlib.nullcontext()
         )
         draft_vllm_config = copy.copy(self.vllm_config)
+        if self._draft_replicated and not self._draft_tp_matches_target:
+            disable_ep_weight_filter_for_replicated_draft(draft_vllm_config)
         draft_model_config = copy.copy(self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"
         with (

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import contextlib
+import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -37,6 +38,7 @@ from vllm_torchtpu.utils import synchronize_tensors
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm.config import VllmConfig
     from vllm.model_executor.models.interfaces import SupportsMultiModal
 
     from vllm_torchtpu.layers.core.attention_metadata import (
@@ -138,6 +140,23 @@ def _force_draft_tp1():
     finally:
         tp.world_size = saved_ws
         tp.rank_in_group = saved_rank
+
+
+def disable_ep_weight_filter_for_replicated_draft(
+    draft_vllm_config: "VllmConfig",
+) -> None:
+    """Disable EP weight filtering on a replicated draft's VllmConfig copy.
+
+    When a draft is replicated below the target's TP (``draft_tp == 1`` with
+    ``target_tp > 1``), ``_force_draft_tp1()`` collapses the TP group to
+    world_size=1 / rank=0 while ``parallel_config.tensor_parallel_size`` stays
+    at the target's width; leaving ``enable_ep_weight_filter=True`` causes both
+    model loaders to slice a replicated MoE draft down to TP-rank-0's experts
+    only.
+    """
+    draft_parallel_config = copy.copy(draft_vllm_config.parallel_config)
+    draft_parallel_config.enable_ep_weight_filter = False
+    draft_vllm_config.parallel_config = draft_parallel_config
 
 
 def handoff_seed_tokens(
@@ -491,12 +510,6 @@ def normalize_draft_config(hf_config) -> dict:
     DFlashProposer and DSparkProposer read dflash_config.mask_token_id and
     load_model reads dflash_config.target_layer_ids; feed both the
     resolved values so the whole base machinery applies unchanged.
-
-    This must also run BEFORE GPUModelRunner.__init__: the upstream V1
-    runner transiently constructs its own EagleProposer for any
-    use_eagle() method (the TPU runner replaces it afterwards), and its
-    _init_parallel_drafting_params only knows pard_token / ptd_token_id /
-    dflash_config.mask_token_id — not dspark_noise_token_id.
     """
     hf_dict = hf_config.to_dict() if hasattr(hf_config, "to_dict") else {}
 

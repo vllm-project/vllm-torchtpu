@@ -73,6 +73,18 @@ ACC_KEYS = (
     "pass_at_1,none",
 )
 
+# The tasks that eval calibration selects when --task-filter is not given.
+DEFAULT_TASK_FILTER = (
+    "mmlu_llama",
+    "mmlu_llama_humanities",
+    "mmlu_llama_stem",
+    "mmlu_llama_social_sciences",
+    "mmlu_llama_other",
+    "mmlu_pro",
+    "humaneval_plus_tpu",
+    "mbpp_plus_tpu",
+)
+
 
 def stderr_key(metric: str) -> str:
     base, sep, filter_ = metric.partition(",")
@@ -383,16 +395,18 @@ def check_eval(
             "gated": b is not None,
         }
 
-        if task not in results:
+        # The baseline's own metric must be in the results: another accuracy
+        # key of the same task is a different quantity, not a fallback.
+        if task not in results or (b is not None and b.name not in results[task]):
             rows.append(EvalRow(task, "(no result)", "FAIL", **defaults))
             continue
 
-        r = primary_metric(results[task])
-        if b is None or r is None:
+        if b is None:
             rows.append(EvalRow(task, "(no acc)", "SKIP", **defaults))
             continue
 
-        delta = r.value - b.value
+        actual = results[task][b.name]
+        delta = actual - b.value
         # Epsilon guards the exactly-at-tolerance case against binary
         # floating-point error (e.g. 0.88 - 0.90 = -0.020000000000000018).
         status = "PASS" if delta >= -allowed_drop - FLOAT_EPSILON else "FAIL"
@@ -401,7 +415,7 @@ def check_eval(
                 task,
                 metric_name,
                 status,
-                actual=r.value,
+                actual=actual,
                 baseline=b.value,
                 delta=delta,
                 **defaults,
@@ -430,14 +444,39 @@ def check_eval(
 def calibrate_eval(
     results_dirs: list[Path], task_filter: set[str] | None
 ) -> dict[str, dict]:
+    """Build an eval baseline as the median of the runs in `results_dirs`.
+
+    Raises ValueError when a run has no selected task or lacks an accuracy
+    metric that another run has, so a broken run cannot shrink the baseline or
+    shift its median.
+    """
     collected: dict[str, dict[str, list[float]]] = {}
     for d in results_dirs:
-        for task, metrics in load_eval_results(d).items():
+        run = load_eval_results(d)
+        selected = False
+        for task, metrics in run.items():
             if task_filter is not None and task not in task_filter:
                 continue
+            selected = True
             slot = collected.setdefault(task, {})
             for k, v in metrics.items():
                 slot.setdefault(k, []).append(float(v))
+        if not selected:
+            found = ", ".join(sorted(run)) or "none"
+            raise ValueError(
+                f"no selected eval results under {d} (tasks found: {found}); "
+                "--task-filter takes comma-separated tasks or 'all' and defaults "
+                f"to {', '.join(DEFAULT_TASK_FILTER)}"
+            )
+
+    missing = sorted(
+        f"{task} {k}"
+        for task, metrics in collected.items()
+        for k, vs in metrics.items()
+        if k in ACC_KEYS and len(vs) < len(results_dirs)
+    )
+    if missing:
+        raise ValueError(f"not in every run: {'; '.join(missing)}")
 
     baseline = {}
     for task, metrics in collected.items():
@@ -503,17 +542,12 @@ def main() -> int:
                     s.strip() for s in args.task_filter.split(",") if s.strip()
                 )
             else:
-                task_filter = {
-                    "mmlu_llama",
-                    "mmlu_llama_humanities",
-                    "mmlu_llama_stem",
-                    "mmlu_llama_social_sciences",
-                    "mmlu_llama_other",
-                    "mmlu_pro",
-                    "humaneval_plus_tpu",
-                    "mbpp_plus_tpu",
-                }
-            baseline = calibrate_eval(args.results_dir, task_filter)
+                task_filter = set(DEFAULT_TASK_FILTER)
+            try:
+                baseline = calibrate_eval(args.results_dir, task_filter)
+            except ValueError as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                return 2
         json.dump(baseline, sys.stdout, indent=2, sort_keys=True)
         sys.stdout.write("\n")
         return 0

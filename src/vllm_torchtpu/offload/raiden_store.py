@@ -1695,10 +1695,12 @@ def resolve_attention_geometry(
 
     from vllm.config import set_current_vllm_config
 
-    attn_backend = TpuPlatform._find_non_ssm_backend(vllm_config)
+    # Shape spec0 with the backend that lays out the plain `Attention` caches,
+    # as the runner does (the first backend when there are none).
+    attn_backend = TpuPlatform._find_dense_attention_backend(vllm_config)
     if attn_backend is None:
         # In the EngineCore process, the model is not instantiated, so
-        # _find_non_ssm_backend returns None. Resolve the attention backend
+        # _find_dense_attention_backend returns None. Resolve the attention backend
         # directly via get_attn_backend using the model configuration.
         from vllm.v1.attention.selector import get_attn_backend
 

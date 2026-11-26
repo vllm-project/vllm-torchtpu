@@ -22,7 +22,6 @@ from vllm.config.reasoning import ReasoningConfig
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
@@ -31,6 +30,7 @@ from vllm_torchtpu.layers.core.sequence_layout import create_sequence_layout_pla
 from vllm_torchtpu.runner import min_tokens, repetition_penalty
 from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import CachedRequestState
 from vllm_torchtpu.structured_decoding.structured_decoding_manager import (
     StructuredDecodingManager,
 )
@@ -86,6 +86,7 @@ def _make_runner(
     runner._pp_is_last = True
     runner._pp_handoff = None
     runner._adaptive_verification = None
+    runner._routed_experts = None
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
@@ -363,6 +364,7 @@ def _make_sample_runner(
             async_scheduling=async_scheduling,
             speculative_decoding=spec_k is not None,
         ),
+        _routed_experts=None,
         _greedy_head_owner=object() if top_tokens else None,
         speculative_config=spec_cfg,
         rejection_sampler=(

@@ -235,11 +235,13 @@ class HbmReserves(NamedTuple):
                        H2D staging pool.
       lora_slot_write: what an adapter swap holds while it runs.
       pp_handoff:      what the buffered pipeline hand-off's buffers take.
+      routed_experts:  what the routed-experts capture tables take.
     """
 
     kv_connector: int
     lora_slot_write: int
     pp_handoff: int
+    routed_experts: int
 
 
 def compute_hbm_budget(devices: Any, gpu_memory_utilization: float) -> HbmBudget:

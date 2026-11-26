@@ -27,12 +27,15 @@ from vllm import SamplingParams
 from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.logits_processor import LogitsProcessors
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_torchtpu.layers.adapter.sample import repetition_penalty as penalty_op
 from vllm_torchtpu.runner import greedy_top_tokens, min_tokens
 from vllm_torchtpu.runner import repetition_penalty as rep_pen
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
+    CachedRequestState,
+    InputBatch,
+)
 
 NEG_INF = float("-inf")
 

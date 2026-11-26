@@ -33,6 +33,10 @@ that needs it:
 - `experimental/`: hill-climbing kernels and features that are not yet part of
   the production configs.
 
+The compile cache key covers the paths in `_RUNTIME_CACHE_KEY_PATHS` plus
+every `kernels/` and `ops/` directory under `vllm_torchtpu/models/`, so keep
+custom-op bridges and kernel copies in those directories.
+
 ## Production Configs
 
 | Config | Layout | Current entry |

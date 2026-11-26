@@ -17,6 +17,7 @@ import datetime
 import gc
 import json
 import os
+from collections.abc import Iterator
 from enum import Enum
 from typing import Any
 
@@ -546,3 +547,17 @@ def _install_entry_layout_pin() -> None:
 
     tt_compiler.StaticCompiler.__call__ = _call_with_pinned_layouts
     _entry_pin_installed = True
+
+
+def iter_unique_modules(
+    *models: torch.nn.Module,
+) -> Iterator[tuple[str, torch.nn.Module]]:
+    """Yields `named_modules()` across `models`, visiting shared modules once."""
+    seen: set[int] = set()
+    for model in models:
+        for name, module in model.named_modules():
+            mod_id = id(module)
+            if mod_id in seen:
+                continue
+            seen.add(mod_id)
+            yield name, module

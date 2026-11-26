@@ -157,6 +157,11 @@ def derive_params(
             f"and NH={g.NH} % NKV == 0"
         )
     nh = g.NH // ex.R
+    if nh > 8:
+        raise MegakernelConfigError(
+            f"GQA requires nh = NH // R <= 8 (8-row tile), got nh={nh} "
+            f"(NH={g.NH}, R={ex.R}); increase tensor-parallel R"
+        )
     nai = (2 * nh + 2) * g.HD
     G = ex.R // g.NKV
     BLK = tt.kv_blk
@@ -251,6 +256,10 @@ def derive_params(
         raise MegakernelConfigError(
             f"GQA split attention requires G = R // NKV to be a power of two, "
             f"got G={G} (R={ex.R}, NKV={g.NKV})"
+        )
+    if SPLIT and (g.HD <= 0 or g.HD % 128 != 0):
+        raise MegakernelConfigError(
+            f"GQA split attention requires HD ({g.HD}) to be a positive multiple of 128"
         )
     TS = G if SPLIT else 1
     QR = round_up(G * nh, 8) if SPLIT else 8
@@ -413,7 +422,9 @@ def gqa_scratch(ex: ExecSpec, ap: GQAParams) -> dict[str, Any]:
     elif ex.VER:
         scr["qg"] = pltpu.VMEM((1, ex.B, 8, ap.HD), F32)
     if ap.QV:
-        scr["rope"] = pltpu.VMEM((2, ex.MR, 128), F32)  # QV-only cos / sin table
+        scr["rope"] = pltpu.VMEM(
+            (2, ex.MR, round_up(ap.ROT // 2, 128)), F32
+        )  # QV-only cos / sin table
         scr["qg"] = pltpu.VMEM(
             (ap.G if ap.SPLIT and not ap.GQ else 1, ap.NHH, ap.QVR, 128), F32
         )

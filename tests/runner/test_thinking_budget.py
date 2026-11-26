@@ -36,8 +36,6 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.logits_processor.interface import BatchUpdate
 from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder
-from vllm.v1.worker import gpu_model_runner
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from vllm_torchtpu.layers.adapter.sample import (
     thinking_budget as tb_kernels,
@@ -80,6 +78,11 @@ from vllm_torchtpu.runner.thinking_budget_tracker import (
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
+from vllm_torchtpu.runner.vllm_v1.worker import gpu_model_runner
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
+    CachedRequestState,
+    InputBatch,
+)
 from vllm_torchtpu.utils import synchronize_tensors
 
 QWEN3_START, QWEN3_END = (151667,), (151668,)

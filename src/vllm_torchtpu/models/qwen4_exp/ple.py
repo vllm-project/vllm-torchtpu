@@ -28,13 +28,17 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen4ExpTextConfig
+from vllm.config import VllmConfig
 from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.models.qwen4_exp.common.hyperconnection import GroupedGemmaRMSNorm
 from vllm.models.qwen4_exp.common.ngram_embedding import (
@@ -42,6 +46,15 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEFp8EmbeddingMethod,
 )
 from vllm.models.qwen4_exp.common.ple import PLEVocabParallelEmbedding
+from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.kv_cache_layout import KVCacheLayout
+
+from vllm_torchtpu.models.qwen4_exp.ops.ple_state import (
+    read_ple_state,
+    write_ple_state,
+)
 
 _MASK64 = (1 << 64) - 1
 _MAX_INT64 = (1 << 63) - 1
@@ -50,6 +63,32 @@ _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PLE_LAYER_PRIME = 10007
 _DEFAULT_SEED = 1234
+
+# TPU gather overflows 32-bit element offsets when a single table exceeds ~2B
+# elements (e.g. 40M x 160 = 6.4B in FP8), returning out-of-bounds memory.
+_MAX_GATHER_ELEMENTS = 1 << 30
+
+
+@dataclass(frozen=True)
+class PLEInputs:
+    """Per-step token inputs for one batch.
+
+    Attributes:
+        input_ids: [num_tokens] token ids of this step.
+        query_start_loc: [num_reqs + 1] chunk boundaries in ``input_ids``.
+        ngram_context: [num_reqs, ngram_size - 1] tokens before each chunk,
+            oldest first, with EOS where the request has none.
+    """
+
+    input_ids: torch.Tensor
+    query_start_loc: torch.Tensor
+    ngram_context: torch.Tensor
+
+
+class PLEOutput(NamedTuple):
+    output: torch.Tensor
+    conv_window: torch.Tensor
+    conv_input: torch.Tensor
 
 
 def _splitmix64(value: int) -> int:
@@ -174,6 +213,33 @@ def ngram_ids(
     return torch.cat(blocks, dim=-1)
 
 
+def ragged_tail(
+    rows: torch.Tensor,
+    history: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    ends: torch.Tensor,
+) -> torch.Tensor:
+    """Each request's last ``history.shape[1]`` rows of its history followed
+    by the first ``ends[r]`` rows of its chunk.
+
+    ``rows`` is [num_tokens, ...] and ``history`` [num_reqs, length, ...],
+    oldest first. With ``ends`` the query lengths this is the history the
+    next chunk starts from.
+    """
+    num_tokens = rows.shape[0]
+    num_reqs, length = history.shape[:2]
+    starts = query_start_loc[:-1].to(torch.int32)
+    steps = torch.arange(length, dtype=torch.int32, device=rows.device)
+    source = ends.to(torch.int32).unsqueeze(1) - length + steps
+    from_step = rows[(starts.unsqueeze(1) + source).clamp(0, num_tokens - 1)]
+    from_history = history[
+        torch.arange(num_reqs, dtype=torch.int32, device=rows.device).unsqueeze(1),
+        (length + source).clamp(0, length - 1),
+    ]
+    valid = (source >= 0).view(*source.shape, *([1] * (rows.dim() - 1)))
+    return torch.where(valid, from_step.to(history.dtype), from_history)
+
+
 def dilated_short_conv(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -214,34 +280,8 @@ def dilated_short_conv(
         rows = torch.where((source >= 0).unsqueeze(-1), from_step, from_window)
         out = out + rows.float() * weight[:, tap].float()
 
-    # The new window is each request's last `history` inputs.
-    starts = query_start_loc[:-1]
-    query_lens = query_start_loc[1:] - starts
-    steps = torch.arange(history, dtype=torch.int32, device=x.device)
-    source = query_lens.unsqueeze(1) - history + steps
-    from_step = x[(starts.unsqueeze(1) + source).clamp(0, num_tokens - 1)]
-    from_window = windows[
-        torch.arange(num_reqs, dtype=torch.int32, device=x.device).unsqueeze(1),
-        (history + source).clamp(0, history - 1),
-    ]
-    new_windows = torch.where((source >= 0).unsqueeze(-1), from_step, from_window)
-    return out.to(x.dtype), new_windows
-
-
-@dataclass(frozen=True)
-class PLEInputs:
-    """Per-step token inputs for one batch.
-
-    Attributes:
-        input_ids: [num_tokens] token ids of this step.
-        query_start_loc: [num_reqs + 1] chunk boundaries in ``input_ids``.
-        ngram_context: [num_reqs, ngram_size - 1] tokens before each chunk,
-            oldest first, with EOS where the request has none.
-    """
-
-    input_ids: torch.Tensor
-    query_start_loc: torch.Tensor
-    ngram_context: torch.Tensor
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    return out.to(x.dtype), ragged_tail(x, windows, query_start_loc, query_lens)
 
 
 class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
@@ -269,6 +309,21 @@ class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
         )
         self.embedding_method = embedding_method
         self.output_dtype = torch.get_default_dtype()
+        self._weight_chunks: nn.ParameterList | None = None
+
+    def finalize_weights(self, max_elements: int = _MAX_GATHER_ELEMENTS) -> None:
+        """Splits tables over ``max_elements``: TPU gather offsets are 32-bit."""
+        weight = self._parameters.get("weight")
+        if weight is None or weight.numel() <= max_elements:
+            return
+        chunk_rows = max(1, max_elements // self.embedding_dim)
+        chunks = [
+            nn.Parameter(chunk.clone(), requires_grad=False)
+            for chunk in weight.split(chunk_rows, dim=0)
+        ]
+        self._weight_chunks = nn.ParameterList(chunks)
+        # Drop the monolithic 6.4 GB parameter so only the chunks stay in HBM.
+        self.register_parameter("weight", None)
 
     def allocate_embedding_weight(
         self, num_embeddings: int, embedding_dim: int, dtype: torch.dtype
@@ -293,11 +348,32 @@ class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
             )
             owned = (flat >= start) & (flat < end)
             flat = torch.where(owned, flat - start, 0)
-        rows = self.embedding_method.embedding(self, flat)
-        rows = self.embedding_method.dequantize(self, rows, self.output_dtype)
+        rows = self._gather_rows(flat)
         if owned is not None:
             rows = rows.masked_fill(~owned.unsqueeze(-1), 0)
         return rows.reshape(*ids.shape, self.embedding_dim)
+
+    def _gather_rows(self, flat: torch.Tensor) -> torch.Tensor:
+        """Look up and dequantize local rows, using chunked gather for large tables."""
+        if self._weight_chunks is None:
+            rows = self.embedding_method.embedding(self, flat)
+            return self.embedding_method.dequantize(self, rows, self.output_dtype)
+        rows = torch.zeros(
+            (flat.shape[0], self.embedding_dim),
+            dtype=self.output_dtype,
+            device=flat.device,
+        )
+        offset = 0
+        for chunk in self._weight_chunks:
+            end_chunk = offset + chunk.shape[0]
+            in_chunk = (flat >= offset) & (flat < end_chunk)
+            chunk_rows = F.embedding(torch.where(in_chunk, flat - offset, 0), chunk)
+            chunk_rows = self.embedding_method.dequantize(
+                self, chunk_rows, self.output_dtype
+            )
+            rows = rows + chunk_rows.masked_fill(~in_chunk.unsqueeze(-1), 0)
+            offset = end_chunk
+        return rows
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         rows = self.local_rows(input_)
@@ -528,9 +604,8 @@ class Qwen4ExpPLELayer(nn.Module):
         hidden_states: torch.Tensor,
         inputs: PLEInputs,
         conv_windows: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns the term to add to the hc_count * hidden_size residual, and
-        each request's new conv window (see dilated_short_conv)."""
+    ) -> PLEOutput:
+        """Returns (PLE delta, new conv windows, conv inputs for checkpointing)."""
         num_tokens = hidden_states.shape[0]
         if inputs.input_ids.shape[0] != num_tokens:
             raise ValueError(
@@ -552,8 +627,9 @@ class Qwen4ExpPLELayer(nn.Module):
         gate = dot / math.sqrt(self.hidden_size)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         gated_value = (torch.sigmoid(gate) * value.unsqueeze(-2)).flatten(-2)
+        conv_input = self.norm_conv(gated_value)
         conv_output, new_windows = dilated_short_conv(
-            self.norm_conv(gated_value),
+            conv_input,
             self.conv1d.weight[:, 0, :],
             self.conv_dilation,
             conv_windows,
@@ -561,4 +637,155 @@ class Qwen4ExpPLELayer(nn.Module):
             request,
             chunk_pos,
         )
-        return gated_value + F.silu(conv_output), new_windows
+        return PLEOutput(gated_value + F.silu(conv_output), new_windows, conv_input)
+
+
+class PLEStateCache(nn.Module, MambaBase):
+    """Owns one PLE layer's mamba cache slot and pooled state read/write.
+
+    Joins the GDN cache group by forwarding ``state_spec_layer``'s MambaBase
+    spec (config.py admits PLE only on GDN layers).
+    """
+
+    def __init__(
+        self,
+        *,
+        prefix: str,
+        vllm_config: VllmConfig,
+        state_spec_layer: MambaBase,
+        window_shape: tuple[int, int],
+        window_dtype: torch.dtype,
+        context_len: int,
+        eos_token_id: int,
+    ) -> None:
+        super().__init__()
+        self.prefix = prefix
+        # Tuple keeps state_spec_layer out of named_modules() / state_dict().
+        self._state_spec_layer = (state_spec_layer,)
+        self._cache_config = vllm_config.cache_config
+        self._window_shape = window_shape
+        self._window_dtype = window_dtype
+        self._context_len = context_len
+        self._eos_token_id = eos_token_id
+        self.kv_cache = (torch.tensor([]),)
+        vllm_config.compilation_config.static_forward_context[prefix] = self
+
+    def read(
+        self, hidden_states: torch.Tensor, input_ids: torch.Tensor
+    ) -> tuple[PLEInputs, torch.Tensor]:
+        """Returns (PLEInputs, prev_conv_windows) for the current batch."""
+        pool = self.kv_cache[0]
+        if pool.numel() == 0:
+            # Memory profiling runs before any KV cache exists: one request, no history.
+            query_start_loc = hidden_states.shape[0] * torch.arange(
+                2, dtype=torch.int32, device=hidden_states.device
+            )
+            windows = hidden_states.new_zeros(1, *self._window_shape)
+            context = torch.full(
+                (1, self._context_len),
+                self._eos_token_id,
+                dtype=torch.int32,
+                device=input_ids.device,
+            )
+            return PLEInputs(input_ids, query_start_loc, context), windows
+
+        metadata = self._attn_metadata()
+        query_start_loc = metadata.query_start_loc
+        num_reqs = query_start_loc.numel() - 1
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        has_history = metadata.seq_lens[:num_reqs] - query_lens > 0
+        conv_window, ngram_context = read_ple_state(
+            pool,
+            metadata.mamba_state_indices[:num_reqs],
+            block_size=self._cache_config.block_size,
+            is_lbhnc=self._is_lbhnc(),
+            window_shape=self._window_shape,
+            window_dtype=self._window_dtype,
+            context_len=self._context_len,
+        )
+        windows = torch.where(has_history.view(-1, 1, 1), conv_window, 0)
+        context = torch.where(
+            has_history.view(-1, 1), ngram_context, self._eos_token_id
+        )
+        return PLEInputs(input_ids, query_start_loc, context), windows
+
+    def write(
+        self,
+        inputs: PLEInputs,
+        prev_windows: torch.Tensor,
+        ple_out: PLEOutput,
+    ) -> None:
+        """Writes each request's next state (and any prefill checkpoint) to the pool."""
+        pool = self.kv_cache[0]
+        if pool.numel() == 0:
+            return
+        metadata = self._attn_metadata()
+        query_start_loc = inputs.query_start_loc
+        num_reqs = query_start_loc.numel() - 1
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        token_ids = inputs.input_ids.to(torch.int32)
+        blocks_out = metadata.mamba_state_indices[:num_reqs]
+        windows_out = ple_out.conv_window
+        context_out = ragged_tail(
+            token_ids, inputs.ngram_context, query_start_loc, query_lens
+        )
+        checkpoint_offsets = metadata.mamba_prefill_ckpt_offsets
+        if checkpoint_offsets is not None:
+            offsets = checkpoint_offsets[:num_reqs]
+            blocks_out = torch.cat(
+                [
+                    metadata.mamba_prefill_ckpt_indices[:num_reqs].clamp(min=0),
+                    blocks_out,
+                ]
+            )
+            windows_out = torch.cat(
+                [
+                    ragged_tail(
+                        ple_out.conv_input, prev_windows, query_start_loc, offsets
+                    ),
+                    windows_out,
+                ]
+            )
+            context_out = torch.cat(
+                [
+                    ragged_tail(
+                        token_ids, inputs.ngram_context, query_start_loc, offsets
+                    ),
+                    context_out,
+                ]
+            )
+        write_ple_state(
+            pool,
+            blocks_out,
+            windows_out,
+            context_out,
+            block_size=self._cache_config.block_size,
+            is_lbhnc=self._is_lbhnc(),
+        )
+
+    def _is_lbhnc(self) -> bool:
+        return self._cache_config.get_resolved_kv_cache_layout() is KVCacheLayout.LBHNC
+
+    def _attn_metadata(self) -> Any:
+        attn_metadata = get_forward_context().attn_metadata
+        assert isinstance(attn_metadata, dict)
+        return attn_metadata[self.prefix]
+
+    @property
+    def mamba_type(self) -> MambaAttentionBackendEnum:
+        return self._state_spec_layer[0].mamba_type
+
+    def get_state_shape(self) -> Iterable[tuple[int, ...]]:
+        return self._state_spec_layer[0].get_state_shape()
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        return self._state_spec_layer[0].get_state_dtype()
+
+    def get_prefill_checkpoint_alignment(self) -> int | None:
+        return self._state_spec_layer[0].get_prefill_checkpoint_alignment()
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        return self._state_spec_layer[0].get_kv_cache_spec(vllm_config)
+
+    def get_attn_backend(self) -> type[AttentionBackend]:
+        return self._state_spec_layer[0].get_attn_backend()

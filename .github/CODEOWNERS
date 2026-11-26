@@ -35,8 +35,8 @@
 /support_matrices/verified_commit_hashes.csv @QiliangCui @CienetStingLin @theminghuang @charlesli640
 
 # Platform Support & Envs
-/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @wenxindongwork @weiyu0824 @maxwillzq @brianseung-google
-/tests/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @wenxindongwork @weiyu0824 @maxwillzq @brianseung-google
+/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @wenxindongwork @weiyu0824 @maxwillzq @brianseung-google @Nanfang-Li
+/tests/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @wenxindongwork @weiyu0824 @maxwillzq @brianseung-google @Nanfang-Li
 /src/vllm_torchtpu/envs.py @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw @wenxindongwork @weiyu0824 @maxwillzq @brianseung-google
 
 # TPU Worker
@@ -77,10 +77,10 @@
 /tests/distributed/test_zmq_*.py @harutmov @sixiang-google @Nanfang-Li @richardsliu @mrjunwan-lang @aman2930 @yinlin09 @benliangw
 
 # Model Layers
-/src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen
+/src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @wenxindongwork
 /src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @pritha90 @m-liu @aaronndx
 /src/vllm_torchtpu/layers/core/dcp_indexer_cache.py @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @pritha90 @m-liu @aaronndx
-/tests/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen
+/tests/layers/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin @lk-chen @wenxindongwork
 
 # Model Implementations & Model Loader
 /src/vllm_torchtpu/models/ @kyuyeunk @qizzzh @Nanfang-Li @jrplatin
@@ -136,14 +136,14 @@
 
 # Context Parallelism
 /src/vllm_torchtpu/distributed/pcp*.py @wenxindongwork @weiyu0824
-/src/vllm_torchtpu/platforms/pcp_validation.py @wenxindongwork @weiyu0824
+/src/vllm_torchtpu/platforms/pcp_validation.py @wenxindongwork @weiyu0824 @Nanfang-Li
 /src/vllm_torchtpu/layers/core/pcp_sequence_layout.py @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/layers/adapter/cp_attention.py @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/layers/adapter/cp_mla_attention.py @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/kernels/experimental/gdn_pcp_fused/ @wenxindongwork @weiyu0824
 /src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/ @wenxindongwork @weiyu0824
 /tests/runner/test_pcp_*.py @wenxindongwork @weiyu0824
-/tests/platforms/test_*pcp*.py @wenxindongwork @weiyu0824
+/tests/platforms/test_*pcp*.py @wenxindongwork @weiyu0824 @Nanfang-Li
 /tests/distributed/test_pcp_*.py @wenxindongwork @weiyu0824
 /tests/layers/core/test_*pcp*.py @wenxindongwork @weiyu0824
 /tests/layers/adapter/test_cp_*.py @wenxindongwork @weiyu0824
@@ -183,16 +183,15 @@
 
 # Models: Qwen4 Experimental
 /src/vllm_torchtpu/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
+/tests/models/qwen4_exp/ @kyuyeunk @BirdsOfAFthr
+
+# Models: Qwen4 Experimental (experimental tier)
+/src/vllm_torchtpu/models/qwen4_exp/experimental/ @caojx-google @DRZDONG @benliangw @mshrihari3
+/tests/models/qwen4_exp/experimental/ @caojx-google @DRZDONG @benliangw @mshrihari3
 
 # Models: Qwen4 Experimental (Alibaba)
 /src/vllm_torchtpu/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 /tests/models/qwen4_exp/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
-
-# Models: Qwen3.8 Flash
-/src/vllm_torchtpu/models/qwen38_flash/ @DRZDONG @caojx-google
-/tests/models/qwen38_flash/ @DRZDONG @caojx-google
-/src/vllm_torchtpu/models/qwen38_flash/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
-/tests/models/qwen38_flash/alibaba/ @HandsomeHow @zwzmzd @acczz @zhubin086 @enkidu-214
 
 # Megakernel (root package and shared test setup)
 /src/vllm_torchtpu/megakernel/ @caojx-google @annyan09023 @weinan1997 @hhb @brianseung-google @mshrihari3

@@ -788,6 +788,10 @@ def _build_fused_ep_moe_kernel(
     # kernel converts between them with a shift.
     tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
     tile_shift = host.pow2_shift(tile_m, "tile_m")
+    # A tile's sublane of the scale mirrors is this many rows of mirror_lanes
+    # (host.mirror_rows_per_tile): one row at up to a lane block.
+    mirror_rows = host.mirror_rows_per_tile(tile_m)
+    mirror_lanes = tile_m // mirror_rows
     height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
     # The contribution slab exists for one reason: to give the push an HBM
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
@@ -916,7 +920,7 @@ def _build_fused_ep_moe_kernel(
         w2b_vm = next(it) if has_w2_bias else None
         ls_vm = next(it) if has_act_scale else None
         out_vm = next(it)
-        oscl_vm = next(it)  # [parities, tile blocks, ROWBLK] f32
+        oscl_vm = next(it)  # [parities, mirror rows, tile_m / mirror rows] f32
         token_gather_sem0, token_gather_sem1 = (next(it) for _ in range(2))
         lhs_sems, w1_sems, w2_sems = (next(it) for _ in range(3))
         w1s_sems = next(it) if has_scales else None
@@ -1325,6 +1329,16 @@ def _build_fused_ep_moe_kernel(
             """
             return jnp.right_shift(expert_base_sm[e], tile_shift) + 2 * e
 
+        def _mirror_at(ref, sub, n):
+            """`n` tiles' sublanes of a scale mirror from tile `sub`, as rows."""
+            if mirror_rows == 1:
+                return ref.at[pl.ds(sub, n)]
+            return ref.at[pl.ds(sub * mirror_rows, n * mirror_rows)]
+
+        def _mirror_count(sublanes):
+            """A sublane count of a scale mirror in its rows."""
+            return sublanes if mirror_rows == 1 else sublanes * mirror_rows
+
         def _run_tiles(e, d, region_blocks):
             """A run's mirror sublanes: (source, destination, count).
 
@@ -1346,7 +1360,7 @@ def _build_fused_ep_moe_kernel(
             assert commit_sems is not None and commit_scl_sems is not None
             _rows_wait(commit_sems.at[parity], contrib_hbm, live_blocks * ROWBLK)
             # One tile committed one mirror sublane, whatever its row count.
-            _rows_wait(commit_scl_sems.at[parity], cscl_hbm, 1)
+            _rows_wait(commit_scl_sems.at[parity], cscl_hbm, mirror_rows)
 
         def wait_shipped(parity, rows, subs):
             """Wait until the wire has read `parity`'s staging slot.
@@ -1365,7 +1379,7 @@ def _build_fused_ep_moe_kernel(
 
             @pl.when(subs > 0)
             def _():
-                _rows_wait(send_scl_sems.at[parity], cscl_hbm, subs)
+                _rows_wait(send_scl_sems.at[parity], cscl_hbm, _mirror_count(subs))
 
         def n_groups_of(e):
             """Index-window groups expert ``e``'s routed rows span."""
@@ -1522,7 +1536,7 @@ def _build_fused_ep_moe_kernel(
                 # went, so they commit once, outside the per-dest loop.
                 pltpu.make_async_copy(
                     oscl_vm.at[parity],
-                    cscl_hbm.at[pl.ds(_mirror_base(e) + t, 1)],
+                    _mirror_at(cscl_hbm, _mirror_base(e) + t, 1),
                     commit_scl_sems.at[parity],
                 ).start()
 
@@ -1604,7 +1618,7 @@ def _build_fused_ep_moe_kernel(
                     def _(dst_sub=dst_sub, parity=parity, d=d):
                         pltpu.make_async_remote_copy(
                             src_ref=oscl_vm.at[parity],
-                            dst_ref=rscl_hbm.at[pl.ds(dst_sub, 1)],
+                            dst_ref=_mirror_at(rscl_hbm, dst_sub, 1),
                             send_sem=send_scl_sems.at[parity],
                             recv_sem=recv_scl_sem,
                             device_id=(jnp.int32(d),),
@@ -1615,7 +1629,7 @@ def _build_fused_ep_moe_kernel(
                     def _(dst_sub=dst_sub, parity=parity):
                         pltpu.make_async_copy(
                             oscl_vm.at[parity],
-                            rscl_hbm.at[pl.ds(dst_sub, 1)],
+                            _mirror_at(rscl_hbm, dst_sub, 1),
                             send_scl_sems.at[parity],
                         ).start()
 
@@ -1842,12 +1856,28 @@ def _build_fused_ep_moe_kernel(
                         slot."""
                         if full:
                             out_vm[static_parity] = wire_rows_staged
-                            oscl_vm[static_parity] = wire_scales_staged
                         else:
                             out_vm[static_parity, pl.ds(0, height)] = wire_rows_staged
+                        if mirror_rows == 1 and full:
+                            oscl_vm[static_parity] = wire_scales_staged
+                        elif mirror_rows == 1:
                             oscl_vm[static_parity, :, pl.ds(0, height)] = (
                                 wire_scales_staged
                             )
+                        else:
+                            # The sublane as rows of mirror_lanes: whole rows,
+                            # then the part of the next one the height covers.
+                            whole, part = divmod(height, mirror_lanes)
+                            for r in range(whole):
+                                oscl_vm[static_parity, r : r + 1, :] = (
+                                    wire_scales_staged[
+                                        :, r * mirror_lanes : (r + 1) * mirror_lanes
+                                    ]
+                                )
+                            if part:
+                                oscl_vm[
+                                    static_parity, whole : whole + 1, pl.ds(0, part)
+                                ] = wire_scales_staged[:, whole * mirror_lanes :]
 
                     # Store slots must be static, so these branches stay
                     # static.
@@ -1981,8 +2011,8 @@ def _build_fused_ep_moe_kernel(
                     # plan gave the run.
                     src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
                     pltpu.make_async_remote_copy(
-                        src_ref=cscl_hbm.at[pl.ds(src_sub, n_sub)],
-                        dst_ref=rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                        src_ref=_mirror_at(cscl_hbm, src_sub, n_sub),
+                        dst_ref=_mirror_at(rscl_hbm, dst_sub, n_sub),
                         send_sem=send_scl_sem,
                         recv_sem=recv_scl_sem,
                         device_id=(jnp.int32(d),),
@@ -2001,8 +2031,8 @@ def _build_fused_ep_moe_kernel(
                     ).start()
                     src_sub, dst_sub, n_sub = _run_tiles(e, d, region_blocks)
                     pltpu.make_async_copy(
-                        cscl_hbm.at[pl.ds(src_sub, n_sub)],
-                        rscl_hbm.at[pl.ds(dst_sub, n_sub)],
+                        _mirror_at(cscl_hbm, src_sub, n_sub),
+                        _mirror_at(rscl_hbm, dst_sub, n_sub),
                         mehop_scl_sem,
                     ).start()
 
@@ -2028,7 +2058,9 @@ def _build_fused_ep_moe_kernel(
                 # because a peer signals them whatever parity it sent from.
                 drain_shipped(carry_end)
                 _rows_wait(recv_sem, recv_hbm, count(host.COUNT_RECV_ROWS))
-                _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
+                _rows_wait(
+                    recv_scl_sem, rscl_hbm, _mirror_count(count(host.COUNT_RECV_MIRROR))
+                )
                 return
             # The per-tile head waits consume every commit but the last one
             # per parity; the drains below consume those.
@@ -2037,15 +2069,21 @@ def _build_fused_ep_moe_kernel(
             # The mirror moves whole sublanes, one per tile a run spans,
             # so its counts are their own rows of the count table rather
             # than a division of the row counts.
-            _rows_wait(send_scl_sem, cscl_hbm, count(host.COUNT_SEND_MIRROR))
-            _rows_wait(recv_scl_sem, rscl_hbm, count(host.COUNT_RECV_MIRROR))
+            _rows_wait(
+                send_scl_sem, cscl_hbm, _mirror_count(count(host.COUNT_SEND_MIRROR))
+            )
+            _rows_wait(
+                recv_scl_sem, rscl_hbm, _mirror_count(count(host.COUNT_RECV_MIRROR))
+            )
             # Deferred own-destination drain: the total sums my own-dest
             # region lengths, and a skipped pair owes exactly zero rows.
             self_blocks = commit_len_sm[0, me]
             for g in range(1, g_local):
                 self_blocks = self_blocks + commit_len_sm[g, me]
             _rows_wait(mehop_sem, recv_hbm, self_blocks * ROWBLK)
-            _rows_wait(mehop_scl_sem, rscl_hbm, count(host.COUNT_SELF_MIRROR))
+            _rows_wait(
+                mehop_scl_sem, rscl_hbm, _mirror_count(count(host.COUNT_SELF_MIRROR))
+            )
 
         drain_transport()
         _all_pairs_barrier(ep)
@@ -2158,12 +2196,20 @@ def _build_fused_ep_moe_kernel(
         out_shape = [
             jax.ShapeDtypeStruct((recv_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
             jax.ShapeDtypeStruct(
-                (host.arrival_mirror_rows(recv_rows, ep * g_local, tile_m), tile_m),
+                (
+                    host.arrival_mirror_rows(recv_rows, ep * g_local, tile_m)
+                    * mirror_rows,
+                    mirror_lanes,
+                ),
                 jnp.float32,
             ),
             jax.ShapeDtypeStruct((contrib_rows, lane_blocks, HIDDEN_LANE_BLOCK), wire),
             jax.ShapeDtypeStruct(
-                (host.contrib_mirror_rows(contrib_rows, g_local, tile_m), tile_m),
+                (
+                    host.contrib_mirror_rows(contrib_rows, g_local, tile_m)
+                    * mirror_rows,
+                    mirror_lanes,
+                ),
                 jnp.float32,
             ),
         ]
@@ -2298,6 +2344,11 @@ def _build_fused_ep_moe_kernel(
             *biases,
         )
         recv, rscl, _contrib, _contrib_scl = res
+        # The arrival mirror goes out as stored, rows of mirror_lanes. Its
+        # reader takes a flat position (sublane * tile_m + offset), which picks
+        # the same f32 at either grouping, whereas regrouping it to
+        # [sublanes, tile_m] would be a relayout in HBM on every call: the
+        # (8, 128) tiles of a 256-lane array hold different elements.
         return recv, rscl
 
     return fn

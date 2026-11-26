@@ -15,6 +15,7 @@
 `TPUModelRunner.sample_tokens` reads, a stand-in for the async copy of its
 sampled tokens and logprobs, and references for the logprobs it returns."""
 
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +23,10 @@ import numpy as np
 import torch
 from vllm.v1.outputs import LogprobsLists, LogprobsTensors
 
+from vllm_torchtpu.layers.core.sequence_layout import (
+    DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+    SequenceLayoutPlan,
+)
 from vllm_torchtpu.runner import min_tokens, repetition_penalty
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import AsyncTPUCopyState
@@ -87,6 +92,7 @@ def _sample_tokens_runner(logits_list, num_reqs_list, **overrides):
         _fence_spec_kv_under_token_copy=False,
         _adaptive_verification=None,
         _thinking_budget=None,
+        _routed_experts=None,
         is_pooling_model=False,
         drafter=SimpleNamespace(),
         spec_decode_manager=SimpleNamespace(
@@ -206,3 +212,138 @@ def _assert_same_logprobs_lists(actual, expected):
         a, e = getattr(actual, field), getattr(expected, field)
         assert a.dtype == e.dtype, field
         assert np.array_equal(a, e), field
+
+
+def step_runner(chunks, bucket, forward_model, **overrides):
+    """A runner stand-in that runs one step as `chunks` forwards through the
+    real `execute_model` and `sample_tokens`, on the last PP stage by
+    default.
+
+    Args:
+        chunks: one list per forward of (request id, scheduled tokens).
+        bucket: the token bucket every forward pads to.
+        forward_model: stands in for the backbone; returns (hidden states,
+            None) for each forward.
+        overrides: runner attributes to set instead of the defaults.
+    """
+    req_ids = [req_id for chunk in chunks for req_id, _ in chunk]
+    chunk_starts = list(np.cumsum([0, *map(len, chunks)]))
+
+    def prepare_inputs(_so, start_index, _num_decode, _num_windowed):
+        chunk = chunks[chunk_starts.index(start_index)]
+        counts = [n for _, n in chunk]
+        runner.query_start_loc_np[: len(chunk) + 1] = np.cumsum([0, *counts])
+        runner._last_sequence_layout_plan = SequenceLayoutPlan(
+            descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+            token_slice=slice(0, bucket),
+            global_num_tokens=sum(counts),
+            global_padded_num_tokens=bucket,
+            local_num_tokens=sum(counts),
+            local_padded_num_tokens=bucket,
+            _packed_to_request_major_token_indices=None,
+        )
+        empty = torch.empty(0, dtype=torch.int32)
+        logits_indices = torch.tensor(np.cumsum(counts) - 1)
+        end_index = start_index + len(chunk)
+        return (None, logits_indices, len(chunk), len(chunk), end_index, empty,
+                empty, None, None, None)  # fmt: skip
+
+    num_reqs = len(req_ids)
+    attributes = dict(
+        _routed_experts=None,
+        _pp_handoff=None,
+        _dp_step_other_decode=False,
+        _pp_is_first=True,
+        _pp_is_last=True,
+        _pp_pending_scheduler_output=None,
+        _pp_pending_kv_save_nan_check=None,
+        execute_model_state=None,
+        _update_states=lambda _so: None,
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        _mtp_prefill_only=False,
+        _reorder_batch_for_rpa=lambda _so: (0, 0),
+        _count_input_chunks=lambda _so: (len(chunks), max(map(len, chunks))),
+        _dp_coordinated_step=lambda *_args, **_kwargs: (bucket, len(chunks)),
+        _dp_local_prompt_logprob_rows=lambda _so: 0,
+        _dp_step_prompt_logprob_rows=0,
+        _thinking_budget=None,
+        _dp_num_tokens_across_dp=lambda _n: None,
+        supports_mm_inputs=False,
+        phase_based_profiler=None,
+        _is_async_drafter=False,
+        _greedy_top_tokens_this_step=lambda: False,
+        _min_tokens_batch_state=lambda: {},
+        _repetition_penalty=SimpleNamespace(begin_step=lambda _batch: False),
+        vllm_config=SimpleNamespace(),
+        maybe_setup_kv_connector=lambda *_args, **_kwargs: None,
+        input_batch=SimpleNamespace(
+            num_reqs=num_reqs,
+            req_ids=req_ids,
+            req_id_to_index={req_id: i for i, req_id in enumerate(req_ids)},
+            max_num_logprobs=None,
+            all_greedy=True,
+            num_tokens_no_spec=[n for chunk in chunks for _, n in chunk],
+            num_computed_tokens_cpu=np.zeros(num_reqs, dtype=np.int32),
+            token_ids_cpu=np.zeros((num_reqs, 2 * bucket), dtype=np.int32),
+        ),
+        requests={
+            req_id: SimpleNamespace(
+                num_computed_tokens=0, num_tokens=n, output_token_ids=[]
+            )
+            for chunk in chunks
+            for req_id, n in chunk
+        },
+        num_prompt_logprobs={},
+        query_start_loc_np=np.zeros(num_reqs + 1, dtype=np.int32),
+        _last_sequence_layout_plan=None,
+        position_ids=torch.zeros(bucket, dtype=torch.int32),
+        _flush_mamba_state_seed_copies=lambda: None,
+        _reset_read_offsets_for_new_requests=lambda *_args: None,
+        input_ids=torch.zeros(bucket, dtype=torch.int32),
+        _apply_async_token_substitution=lambda ids, *_args: ids,
+        _record_input_staging_fence=lambda: None,
+        _get_model_inputs=lambda ids, _mm: (ids, None),
+        _token_padding_update=lambda _n: None,
+        mesh=None,
+        _kv_cache_bundle=None,
+        _stage_timing=MagicMock(),
+        is_pooling_model=False,
+        pcp_manager=None,
+        sequence_layout_planner=SimpleNamespace(
+            maybe_select_logits_hidden_states=lambda hs, _plan, idx: hs[idx]
+        ),
+        compute_logits_from_hidden_states=lambda hs: torch.zeros(hs.shape[0], 8),
+        _attn_metadata_builder_ctx=SimpleNamespace(
+            mamba_state_indices=None, unified_mamba_state_indices=None, seq_lens=None
+        ),
+        mamba_slot_read_offsets=None,
+        speculative_config=None,
+        _fence_spec_kv_under_token_copy=False,
+        _is_dspark_pd_producer=False,
+        _adaptive_verification=None,
+        _get_sampling_generator=lambda: None,
+        _greedy_sample=lambda logits: torch.full((logits.shape[0],), 7),
+        _update_mamba_slot_read_offsets=lambda *_args: None,
+        _update_num_xla_graphs=lambda *_args: None,
+        _prepare_inputs=prepare_inputs,
+        forward_model=forward_model,
+    )
+    attributes.update(overrides)
+    runner = SimpleNamespace(**attributes)
+    runner._stage_timing.stage.return_value = contextlib.nullcontext()
+    runner._stage_timing.take_samples.return_value = ([], [])
+    for name in (
+        "_any_decode",
+        "_readmit_trimmed_drafts",
+        "_sample_chunk_logits",
+        "_sample_plain_chunk",
+        "maybe_wait_for_kv_save",
+        "get_finished_kv_transfers",
+        "_build_kv_connector_output",
+        "_sample_tokens_pp_intermediate_stage",
+        "sample_tokens",
+        "execute_model",
+        "_maybe_select_logits_hidden_states",
+    ):
+        setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+    return runner

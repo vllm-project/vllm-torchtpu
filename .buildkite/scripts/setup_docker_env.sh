@@ -55,6 +55,22 @@ if [[ -n "${CI_IMAGE:-}" && -z "${IMAGE_SUFFIX}" ]]; then
   exit 0
 fi
 
+# A single-leg build accepts at most one wheel version override.
+if [[ -n "${TORCH_TPU_VERSION_OVERRIDE:-}" && -n "${TPU_SYNC_TORCH_VERSION_OVERRIDE:-}" ]]; then
+  echo "[FATAL] Both TORCH_TPU_VERSION_OVERRIDE and TPU_SYNC_TORCH_VERSION_OVERRIDE are set; set only one version override per build." >&2
+  exit 1
+fi
+
+# bootstrap.py (and bootstrap_dev.sh) resolves, normalizes, and validates the
+# canary leg once and publishes only 'torch-tpu' or 'tpu-sync' to meta-data.
+CANARY_LEG="$(buildkite-agent meta-data get "TORCHTPU_NIGHTLY_LEG" --default "")"
+if [ -z "${CANARY_LEG}" ]; then
+  if [[ -n "${TORCH_TPU_VERSION_OVERRIDE:-}" || -n "${TPU_SYNC_TORCH_VERSION_OVERRIDE:-}" ]]; then
+    echo "[FATAL] Wheel version override is set without TORCHTPU_NIGHTLY_LEG metadata; run via bootstrap.py." >&2
+    exit 1
+  fi
+fi
+
 # A rerun of a commit - a retried build, or a second build of the same commit -
 # finds its image in the registry already: publish it and skip the build, as
 # build_k3_engine_image.sh does for the engine image. The tag names this commit
@@ -63,21 +79,21 @@ fi
 # package registries, either of which can fail a build with nothing new to
 # build. CI_IMAGE_REBUILD=1 builds anyway. The nightly canary below layers
 # fresh wheels over the base image, so it always builds.
-if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" && "${CI_IMAGE_REBUILD:-0}" != "1" ]] \
+if [[ -z "${CANARY_LEG}" && "${CI_IMAGE_REBUILD:-0}" != "1" ]] \
     && docker manifest inspect "${BASE_IMAGE_TAG}" >/dev/null 2>&1; then
   echo "--- ${BASE_IMAGE_TAG} is already in the registry; reusing it"
-  buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX:-}" "${BASE_IMAGE_TAG}"
+  buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX}" "${BASE_IMAGE_TAG}"
   echo "--- Done setup_docker_env.sh"
   exit 0
 fi
 
-if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" ]]; then
+if [ -z "${CANARY_LEG}" ]; then
   echo "--- Building Docker Image: ${BASE_IMAGE_TAG} (target: ${TARGET})"
   # Run build_image.sh and pass VLLM_COMMIT_HASH directly as a build argument
   ./docker/build_image.sh --target "${TARGET}" -t "${BASE_IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}"
 
   # Publish image tag metadata for downstream test steps
-  buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX:-}" "${BASE_IMAGE_TAG}"
+  buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX}" "${BASE_IMAGE_TAG}"
 
   echo "--- Pushing Docker Image to Registry"
   docker push "${BASE_IMAGE_TAG}"
@@ -90,8 +106,39 @@ if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" ]]; then
 fi
 
 # ==============================================================================
-# Nightly Canary Build: Two-Stage Layered Override (Option 2)
+# Nightly Canary Build: Single-Leg Layered Override
 # ==============================================================================
+case "${CANARY_LEG}" in
+  torch-tpu)
+    if [ -n "${TPU_SYNC_TORCH_VERSION_OVERRIDE:-}" ]; then
+      echo "[FATAL] TPU_SYNC_TORCH_VERSION_OVERRIDE is set, but selected canary leg is '${CANARY_LEG}' (expected tpu-sync)." >&2
+      exit 1
+    fi
+    OVERRIDE_PACKAGE="torch-tpu"
+    WHEEL_PREFIX="torch_tpu"
+    TAG_PREFIX="torch-tpu"
+    EXTRA_TAG_PREFIX=""
+    OVERRIDE_VERSION="${TORCH_TPU_VERSION_OVERRIDE:-}"
+    VERSION_META_KEY="TORCH_TPU_VERSION"
+    ;;
+  tpu-sync)
+    if [ -n "${TORCH_TPU_VERSION_OVERRIDE:-}" ]; then
+      echo "[FATAL] TORCH_TPU_VERSION_OVERRIDE is set, but selected canary leg is '${CANARY_LEG}' (expected torch-tpu)." >&2
+      exit 1
+    fi
+    OVERRIDE_PACKAGE="tpu-sync-torch"
+    WHEEL_PREFIX="tpu_sync_torch"
+    TAG_PREFIX="tpu-sync"
+    EXTRA_TAG_PREFIX="tpu-sync-torch"
+    OVERRIDE_VERSION="${TPU_SYNC_TORCH_VERSION_OVERRIDE:-}"
+    VERSION_META_KEY="TPU_SYNC_TORCH_VERSION"
+    ;;
+  *)
+    echo "[FATAL] Unsupported TORCHTPU_NIGHTLY_LEG '${CANARY_LEG}'; expected torch-tpu or tpu-sync." >&2
+    exit 1
+    ;;
+esac
+
 echo "--- Ensuring Base Docker Image is available: ${BASE_IMAGE_TAG}"
 if ! docker pull "${BASE_IMAGE_TAG}" 2>/dev/null; then
   echo "Base image not found in registry. Building base image: ${BASE_IMAGE_TAG}"
@@ -102,7 +149,7 @@ else
   echo "Reusing prebuilt base image from registry: ${BASE_IMAGE_TAG}"
 fi
 
-echo "--- Resolving latest torch-tpu and tpu-sync-torch nightly wheels for Python 3.12"
+echo "--- Resolving ${OVERRIDE_PACKAGE} nightly wheel for Python 3.12 (leg: ${CANARY_LEG})"
 REGISTRY_URL="https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple"
 
 # Acquire registry access token from VM metadata server if not already provided
@@ -123,7 +170,7 @@ if [ -z "${ACCESS_TOKEN:-}" ]; then
 fi
 
 if [ -z "${ACCESS_TOKEN:-}" ]; then
-  echo "[FATAL] TORCHTPU_NIGHTLY is enabled, but missing ACCESS_TOKEN and failed to obtain one via metadata server." >&2
+  echo "[FATAL] Canary leg '${CANARY_LEG}' is enabled, but missing ACCESS_TOKEN and failed to obtain one via metadata server." >&2
   exit 1
 fi
 
@@ -140,90 +187,58 @@ resolve_latest_cp312_wheel_version() {
   # '-' inside the version segment so -cp312-cp312- is not partially kept.
   version="$({ echo "${raw_html}" | grep -oE "${wheel_prefix}-[0-9a-zA-Z.+_]+-cp312" || true; } | sed "s/^${wheel_prefix}-//;s/-cp312\$//" | sort -V | tail -n 1)"
   if [ -z "${version}" ]; then
-    echo "[FATAL] TORCHTPU_NIGHTLY is enabled, but failed to resolve a cp312 wheel for ${dist_pkg}!" >&2
+    echo "[FATAL] Canary leg '${CANARY_LEG}' is enabled, but failed to resolve a cp312 wheel for ${dist_pkg}!" >&2
     exit 1
   fi
   echo "${version}"
 }
 
-TORCH_TPU_VERSION="${TORCH_TPU_VERSION_OVERRIDE:-}"
-TPU_SYNC_TORCH_VERSION="${TPU_SYNC_TORCH_VERSION_OVERRIDE:-}"
-
-if [ -z "${TORCH_TPU_VERSION}" ]; then
-  TORCH_TPU_VERSION="$(resolve_latest_cp312_wheel_version "torch-tpu" "torch_tpu")" || exit 1
+if [ -z "${OVERRIDE_VERSION}" ]; then
+  OVERRIDE_VERSION="$(resolve_latest_cp312_wheel_version "${OVERRIDE_PACKAGE}" "${WHEEL_PREFIX}")" || exit 1
 fi
 
-if [ -z "${TPU_SYNC_TORCH_VERSION}" ]; then
-  TPU_SYNC_TORCH_VERSION="$(resolve_latest_cp312_wheel_version "tpu-sync-torch" "tpu_sync_torch")" || exit 1
-fi
-
-echo "Resolved torch-tpu version: ${TORCH_TPU_VERSION}"
-echo "Resolved tpu-sync-torch version: ${TPU_SYNC_TORCH_VERSION}"
+echo "Resolved ${OVERRIDE_PACKAGE} version: ${OVERRIDE_VERSION}"
 
 # Docker tag names forbid '+'; sanitize '+' to '_' for image tagging
-TORCH_TPU_TAG_VERSION="${TORCH_TPU_VERSION//+/_}"
-TPU_SYNC_TAG_VERSION="${TPU_SYNC_TORCH_VERSION//+/_}"
+OVERRIDE_TAG_VERSION="${OVERRIDE_VERSION//+/_}"
 
-# Image tag names following ${BASE_TAG}-${DEP_REPO}_${VERSION} convention
-TORCH_TPU_IMAGE_TAG="${IMAGE_REPO}:${BASE_TAG}-torch-tpu_${TORCH_TPU_TAG_VERSION}"
-TPU_SYNC_IMAGE_TAG="${IMAGE_REPO}:${BASE_TAG}-tpu-sync_${TPU_SYNC_TAG_VERSION}"
-TPU_SYNC_FULL_IMAGE_TAG="${IMAGE_REPO}:${BASE_TAG}-tpu-sync-torch_${TPU_SYNC_TAG_VERSION}"
+# Image tag names follow the ${BASE_TAG}-${TAG_PREFIX}_${VERSION} convention.
+OVERRIDE_IMAGE_TAG="${IMAGE_REPO}:${BASE_TAG}-${TAG_PREFIX}_${OVERRIDE_TAG_VERSION}"
+DOCKER_TAG_ARGS=(-t "${OVERRIDE_IMAGE_TAG}")
+IMAGES_TO_PUSH=("${OVERRIDE_IMAGE_TAG}")
+if [ -n "${EXTRA_TAG_PREFIX}" ]; then
+  EXTRA_IMAGE_TAG="${IMAGE_REPO}:${BASE_TAG}-${EXTRA_TAG_PREFIX}_${OVERRIDE_TAG_VERSION}"
+  DOCKER_TAG_ARGS+=(-t "${EXTRA_IMAGE_TAG}")
+  IMAGES_TO_PUSH+=("${EXTRA_IMAGE_TAG}")
+fi
 
-# Leg 1: Build delta image overriding torch-tpu
-echo "--- Building Delta Image for Leg 1 (torch-tpu): ${TORCH_TPU_IMAGE_TAG}"
+echo "--- Building Delta Image (${OVERRIDE_PACKAGE}): ${OVERRIDE_IMAGE_TAG}"
 DOCKER_BUILDKIT=1 docker build \
   --progress=plain \
   -f "docker/Dockerfile.override" \
-  -t "${TORCH_TPU_IMAGE_TAG}" \
+  "${DOCKER_TAG_ARGS[@]}" \
   --build-arg BASE_IMAGE="${BASE_IMAGE_TAG}" \
-  --build-arg OVERRIDE_PACKAGE="torch-tpu" \
-  --build-arg OVERRIDE_VERSION="${TORCH_TPU_VERSION}" \
+  --build-arg OVERRIDE_PACKAGE="${OVERRIDE_PACKAGE}" \
+  --build-arg OVERRIDE_VERSION="${OVERRIDE_VERSION}" \
   --secret "id=gcloud_token,env=ACCESS_TOKEN" \
   .
 
-echo "--- Pushing Delta Image for Leg 1 to Registry"
-docker push "${TORCH_TPU_IMAGE_TAG}"
+echo "--- Pushing Delta Image (${OVERRIDE_PACKAGE}) to Registry"
+for image_tag in "${IMAGES_TO_PUSH[@]}"; do
+  docker push "${image_tag}"
+done
 
-# Leg 2: Build delta image overriding tpu-sync-torch
-echo "--- Building Delta Image for Leg 2 (tpu-sync-torch): ${TPU_SYNC_IMAGE_TAG}"
-DOCKER_BUILDKIT=1 docker build \
-  --progress=plain \
-  -f "docker/Dockerfile.override" \
-  -t "${TPU_SYNC_IMAGE_TAG}" \
-  -t "${TPU_SYNC_FULL_IMAGE_TAG}" \
-  --build-arg BASE_IMAGE="${BASE_IMAGE_TAG}" \
-  --build-arg OVERRIDE_PACKAGE="tpu-sync-torch" \
-  --build-arg OVERRIDE_VERSION="${TPU_SYNC_TORCH_VERSION}" \
-  --secret "id=gcloud_token,env=ACCESS_TOKEN" \
-  .
+# Publish image tag metadata for downstream test steps without overwriting
+# non-omni keys when building TARGET=omni.
+buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX}" "${OVERRIDE_IMAGE_TAG}"
+buildkite-agent meta-data set "${VERSION_META_KEY}" "${OVERRIDE_VERSION}"
 
-echo "--- Pushing Delta Image for Leg 2 to Registry"
-docker push "${TPU_SYNC_IMAGE_TAG}"
-docker push "${TPU_SYNC_FULL_IMAGE_TAG}"
-
-# Determine primary CI image based on TORCHTPU_NIGHTLY_LEG if specified
-PRIMARY_IMAGE_TAG="${TORCH_TPU_IMAGE_TAG}"
-if [[ "${TORCHTPU_NIGHTLY_LEG:-}" =~ ^(tpu-sync|tpu_sync|tpu-sync-torch)$ ]]; then
-  PRIMARY_IMAGE_TAG="${TPU_SYNC_IMAGE_TAG}"
-fi
-
-# Publish image tag metadata for downstream test steps
-buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX:-}" "${PRIMARY_IMAGE_TAG}"
-buildkite-agent meta-data set "CI_IMAGE_TAG_TORCH_TPU${IMAGE_SUFFIX:-}" "${TORCH_TPU_IMAGE_TAG}"
-buildkite-agent meta-data set "CI_IMAGE_TAG_TPU_SYNC${IMAGE_SUFFIX:-}" "${TPU_SYNC_IMAGE_TAG}"
-buildkite-agent meta-data set "CI_IMAGE_TAG_TPU_SYNC_TORCH${IMAGE_SUFFIX:-}" "${TPU_SYNC_IMAGE_TAG}"
-if [ -n "${IMAGE_SUFFIX:-}" ]; then
-  # Also set default keys if not already present
-  buildkite-agent meta-data set "CI_IMAGE_TAG_TORCH_TPU" "${TORCH_TPU_IMAGE_TAG}" || true
-  buildkite-agent meta-data set "CI_IMAGE_TAG_TPU_SYNC" "${TPU_SYNC_IMAGE_TAG}" || true
-  buildkite-agent meta-data set "CI_IMAGE_TAG_TPU_SYNC_TORCH" "${TPU_SYNC_IMAGE_TAG}" || true
-fi
-buildkite-agent meta-data set "TORCH_TPU_VERSION" "${TORCH_TPU_VERSION}"
-buildkite-agent meta-data set "TPU_SYNC_TORCH_VERSION" "${TPU_SYNC_TORCH_VERSION}"
-
-buildkite-agent annotate ":rocket: Canary testing torch-tpu \`${TORCH_TPU_VERSION}\` and tpu-sync-torch \`${TPU_SYNC_TORCH_VERSION}\`" --style "info" || true
+buildkite-agent annotate \
+  ":rocket: Canary testing ${OVERRIDE_PACKAGE} \`${OVERRIDE_VERSION}\`" \
+  --style "info" \
+  --context "canary-${TAG_PREFIX}" || true
 
 echo "--- Cleaning up local built images"
-docker rmi "${TORCH_TPU_IMAGE_TAG}" "${TPU_SYNC_IMAGE_TAG}" "${TPU_SYNC_FULL_IMAGE_TAG}" || true
+docker rmi "${IMAGES_TO_PUSH[@]}" || true
 
 echo "--- Done setup_docker_env.sh"

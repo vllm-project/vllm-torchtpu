@@ -31,7 +31,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import numpy as np
-from vllm.v1.worker.block_table import BlockTable, MultiGroupBlockTable
+
+from vllm_torchtpu.runner.vllm_v1.worker.block_table import (
+    BlockTable,
+    MultiGroupBlockTable,
+)
 
 
 class KernelBlockTable(BlockTable):

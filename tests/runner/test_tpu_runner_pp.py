@@ -414,6 +414,7 @@ class TestBufferedStepPosting:
             _dp_local_prompt_logprob_rows=lambda _so: 0,
             _dp_coordinated_step=lambda *_a, **_kw: (None, 2),
             _adaptive_verification=None,
+            _routed_experts=None,
             _readmit_trimmed_drafts=lambda *_a: None,
             _pp_handoff=handoff,
             _pp_is_first=first,

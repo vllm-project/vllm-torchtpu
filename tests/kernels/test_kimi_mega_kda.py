@@ -58,7 +58,9 @@ def test_fused_kda_segment_dispatch(
         return states, jnp.full((8, 2), increment, jnp.float32)
 
     monkeypatch.setattr(kda_attention_op.gdn_wrapper, "fused_conv1d_gdn", fake_kernel)
-    monkeypatch.setattr(kda_attention_op, "_check_kda_abi", lambda *args: (8, 2, 1, 2))
+    monkeypatch.setattr(
+        kda_attention_op, "_check_kda_abi", lambda *args: (8, 2, 1, 2, 2)
+    )
     monkeypatch.setattr(
         kda_attention_op, "_gated_output_norm", lambda output, *args: output
     )

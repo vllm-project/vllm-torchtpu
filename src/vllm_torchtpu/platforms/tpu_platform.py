@@ -31,7 +31,7 @@ from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
-from vllm_torchtpu import envs, patch_registry
+from vllm_torchtpu import envs, patch_registry, rope_in_graph_flag
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -419,6 +420,48 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
         )
 
 
+def _validate_routed_experts_config(vllm_config: "VllmConfig") -> None:
+    """Rejects `--enable-return-routed-experts` with the settings TPU capture
+    does not handle yet; vLLM rejects others itself
+    (`VllmConfig._verify_aux_output_compatibility`). `RoutedExpertsCapture`
+    rejects MoE layers armed with a fused kernel once they load."""
+    if not vllm_config.aux_output_config.enabled:
+        return
+    parallel_config = vllm_config.parallel_config
+    unsupported = {
+        # Each MoE layer sees the rows of every DP rank.
+        "data_parallel_size > 1": parallel_config.data_parallel_size > 1,
+        # Comes with fused EP v2, where SP pays off. With chunk pipelining or
+        # FP8 all-gather, `route()` would also see only this rank's tokens.
+        "MoE sequence parallelism (TPU_MOE_SEQUENCE_PARALLEL)": (
+            parallel_config.use_sequence_parallel_moe
+        ),
+        # Experts are picked on this rank's share of the tokens.
+        "TPU_K3_SP_PREFILL": envs.TPU_K3_SP_PREFILL,
+        # The kernel picks experts itself, without `route()`.
+        "MOE_FUSED_EP_KERNEL_IMPL=adaptive": (
+            envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        ),
+        # Placed layers pick expert slots, not checkpoint expert ids.
+        "TPU_EXPERT_PLACEMENT": bool(envs.TPU_EXPERT_PLACEMENT),
+        # Rows of rejected drafts are kept.
+        "speculative decoding": vllm_config.speculative_config is not None,
+        # Untested.
+        "kv_transfer_config": vllm_config.kv_transfer_config is not None,
+        # vLLM builds a KV transfer config from this flag only after this
+        # check runs, so the check above cannot see it.
+        "--kv-offloading-size": (
+            vllm_config.cache_config.kv_offloading_size is not None
+        ),
+    }
+    rejected = [setting for setting, hit in unsupported.items() if hit]
+    if rejected:
+        raise NotImplementedError(
+            "--enable-return-routed-experts on TPU does not support "
+            f"{'; '.join(rejected)} yet. Change these settings or disable it."
+        )
+
+
 def _register_tpu_kv_connectors() -> None:
     """Register TPU-specific KV connectors in vLLM's factory name registry.
 
@@ -498,6 +541,7 @@ class TpuPlatform(Platform):
         "TPU_KERNEL_RELOAD_MODULES",
         "TPU_MOE_ROUTER_TOPK",
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
+        "MOE_FUSED_EP_V2_AGQ_MIN_LOCAL_TOKENS",
         "TPU_DP_VOCAB_PARALLEL",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
@@ -512,6 +556,18 @@ class TpuPlatform(Platform):
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
     ]
+
+    @classmethod
+    def pre_register_and_update(
+        cls, parser: "FlexibleArgumentParser | None" = None
+    ) -> None:
+        if parser is not None:
+            # Default EP weight filtering on for CLI entry points (`vllm serve`).
+            # Both model loaders gate on MoE + EP (+ non-EPLB for Run:AI), so
+            # this is a no-op for dense or non-EP runs while letting
+            # --disable-ep-weight-filter / --config YAML opt-outs travel cleanly
+            # through EngineArgs and pickled VllmConfig into spawned children.
+            parser.set_defaults(enable_ep_weight_filter=True)
 
     # The "Platform" base class has import_kernels() that tries to import
     # vllm._C, which is not available in the TPU Platform setup.
@@ -861,6 +917,8 @@ class TpuPlatform(Platform):
             )
         # Rejects non-bool MoE reference-parity values before any worker starts.
         get_moe_reference_parity(vllm_config)
+        # Likewise for a non-bool in-graph RoPE value.
+        rope_in_graph_flag.in_graph_enabled(vllm_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
@@ -919,16 +977,20 @@ class TpuPlatform(Platform):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
         # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
-        if (
-            layout is VllmKVCacheLayout.LBHNC
-            and vllm_config.model_config is not None
-            and vllm_config.model_config.get_head_size() == 64
-        ):
-            raise NotImplementedError(
-                "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
-                "layout, which the head_dim==64 RPA kernel does not "
-                "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
+        # ModelConfig.get_head_size() collapses differing layers with max(), so
+        # also check each layer's typed ModelArchitectureConfig view.
+        if layout is VllmKVCacheLayout.LBHNC and vllm_config.model_config is not None:
+            arch_config = vllm_config.model_config.model_arch_config
+            has_hd64_layer = vllm_config.model_config.get_head_size() == 64 or any(
+                arch_config[i].head_size == 64
+                for i in range(arch_config.total_num_hidden_layers)
             )
+            if has_hd64_layer:
+                raise NotImplementedError(
+                    "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
+                    "layout, which the head_dim==64 RPA kernel does not "
+                    "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
+                )
         kv_cache_layout = get_flashinfer_layout_string(layout)
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
@@ -1089,6 +1151,7 @@ class TpuPlatform(Platform):
         # After the bfloat16 switch, so lora_dtype is checked against the
         # dtype the model runs in.
         _validate_lora_config(vllm_config)
+        _validate_routed_experts_config(vllm_config)
 
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
@@ -1340,6 +1403,32 @@ class TpuPlatform(Platform):
         """
         backends = cls._find_non_ssm_backends(vllm_config)
         return backends[0] if backends else None
+
+    @classmethod
+    def _find_dense_attention_backend(
+        cls, vllm_config: VllmConfig
+    ) -> "type[AttentionBackend] | None":
+        """Backend that lays out the plain `Attention` caches, or None.
+
+        `_find_non_ssm_backend` returns the first backend in layer order. When
+        the target's layers declare an MLA-family backend (e.g. caches that
+        the model owns) and a drafter adds plain `Attention` layers, the
+        drafter's pages would take the MLA geometry. With an fp8 cache, a
+        128-token block becomes a 32-token page, so the RPA kernel indexes the
+        block table at 4x the block count and, past a quarter of
+        max_model_len, beyond the table. A bf16 cache packs two tokens per
+        word, so the page is 64 tokens and the factor is 2x.
+
+        Returns the backend of the first plain `Attention` layer. Without one
+        (e.g. pure MLA, or caches that the model owns), returns
+        `_find_non_ssm_backend`.
+        """
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention import Attention
+
+        for layer in get_layers_from_vllm_config(vllm_config, Attention).values():
+            return layer.get_attn_backend()
+        return cls._find_non_ssm_backend(vllm_config)
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:

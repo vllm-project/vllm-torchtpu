@@ -11,17 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import pytest
 import torch
 
-from .tpu_test_utils import prepare_tpu_environment
+from .tpu_test_utils import prepare_tpu_environment, torchrun_worker_env
 
 
-def test_prepare_tpu_environment_prefers_public_api(monkeypatch):
-    """When torch.tpu.distributed.set_tpu_launch_env is available (torch_tpu >= 0.1.2),
-    prepare_tpu_environment should dispatch to it.
+def test_prepare_tpu_environment(monkeypatch):
+    """Verify prepare_tpu_environment dispatches to
+    torch.tpu.distributed.set_tpu_launch_env.
     """
     mock_set_tpu_launch_env = MagicMock()
     mock_dist = SimpleNamespace(set_tpu_launch_env=mock_set_tpu_launch_env)
@@ -33,15 +35,10 @@ def test_prepare_tpu_environment_prefers_public_api(monkeypatch):
     mock_set_tpu_launch_env.assert_called_once_with(nproc_per_node=8)
 
 
-def test_prepare_tpu_environment_falls_back_to_legacy_singlehost_wrapper(monkeypatch):
-    """When running on torch_tpu <= 0.1.1, dispatch to legacy singlehost_wrapper."""
-    monkeypatch.setattr(torch, "tpu", SimpleNamespace(distributed=None), raising=False)
+def test_torchrun_worker_env_skips_without_torch_tpu(monkeypatch):
+    """A missing TorchTPU skips the test instead of failing it."""
+    # A None entry makes `import torch_tpu` raise ImportError.
+    monkeypatch.setitem(sys.modules, "torch_tpu", None)
 
-    mock_legacy_prepare = MagicMock()
-    legacy_mod_name = "torch_tpu._internal.distributed.launchers.singlehost_wrapper"
-    mock_legacy_module = ModuleType(legacy_mod_name)
-    mock_legacy_module.prepare_tpu_environment = mock_legacy_prepare
-
-    with patch.dict("sys.modules", {legacy_mod_name: mock_legacy_module}):
-        prepare_tpu_environment(world_size=8)
-        mock_legacy_prepare.assert_called_once_with(world_size=8)
+    with pytest.raises(pytest.skip.Exception, match="TorchTPU is unavailable"):
+        torchrun_worker_env(world_size=8)

@@ -18,6 +18,7 @@ they cover; see vllm-project/vllm-torchtpu#713.
 """
 
 import dataclasses
+import re
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +26,7 @@ import pytest
 import torch
 from vllm.config import (
     CacheConfig,
+    DeviceConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -32,6 +34,7 @@ from vllm.config import (
     get_current_vllm_config_or_none,
 )
 from vllm.model_executor.layers.attention import Attention, MLAAttention
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
@@ -43,6 +46,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -55,6 +59,7 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasBatchedRPAAttentionBackend,
     PallasMLAttentionBackend,
+    VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     RunLocalStateSpec,
@@ -233,86 +238,328 @@ def test_get_kv_cache_spec_sparse_mla(monkeypatch, layout):
     assert spec.num_head_slots == 1
 
 
+def _build_mock_cpu_runner(
+    *,
+    block_size: int = 16,
+    kv_cache_dtype: torch.dtype = torch.bfloat16,
+    kv_cache_layout: str = "LBNHC",
+) -> MagicMock:
+    """Construct a CPU-backed `TPUModelRunner` mock wired to a real `KVCacheManager`."""
+    model_config = ModelConfig(
+        tokenizer_mode="auto",
+        trust_remote_code=False,
+        seed=0,
+        dtype=torch.bfloat16,
+    )
+    cache_config = CacheConfig(
+        block_size=block_size,
+        gpu_memory_utilization=0.9,
+        cache_dtype="auto",
+    )
+    cache_config.kv_cache_layout = kv_cache_layout
+    scheduler_config = SchedulerConfig(
+        max_num_seqs=16,
+        max_model_len=1024,
+        is_encoder_decoder=False,
+    )
+    parallel_config = ParallelConfig(
+        pipeline_parallel_size=1,
+        tensor_parallel_size=1,
+    )
+    vllm_config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        model_config=model_config,
+        cache_config=cache_config,
+        scheduler_config=scheduler_config,
+        parallel_config=parallel_config,
+        observability_config={},
+        additional_config={},
+    )
+
+    runner = MagicMock(spec=TPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.block_size = block_size
+    runner.kv_cache_dtype = kv_cache_dtype
+    runner.use_spmd = False
+    runner.vllm_config = vllm_config
+    runner.cache_config = vllm_config.cache_config
+    runner.scheduler_config = vllm_config.scheduler_config
+    runner.parallel_config = vllm_config.parallel_config
+    runner._hybrid_uniform_page_size_bytes = None
+    runner._subpage_kernel_block_size = None
+    runner.max_num_reqs = 16
+    runner.max_model_len = 1024
+    runner.max_num_tokens = 2048
+    runner.pin_memory = False
+    runner.model_config = vllm_config.model_config
+    runner.shared_kv_cache_layers = {}
+    runner.runner_only_attn_layers = set()
+    runner.enforce_eager = False
+    runner.speculative_config = None
+    runner.pcp_manager = None
+    runner.lora_slot_write_hbm_bytes.return_value = 0
+    runner.pp_handoff_hbm_reserve_bytes.return_value = 0
+    # Dummy value. post_profile_hbm_reserves reads it to size the
+    # routed-experts reserve, which is 0 because capture is off.
+    runner.num_tokens_paddings = []
+    runner.post_profile_hbm_reserves = TPUModelRunner.post_profile_hbm_reserves.__get__(
+        runner
+    )
+    runner._mamba_slot_stride = 1
+    runner.kv_cache_manager = KVCacheManager(runner)
+    runner._mamba_num_blocks = None
+    runner._uniform_mamba_layout = vllm_config.kv_transfer_config is not None
+    runner._unified_kv_layout = False
+    runner.kv_cache_raw_tensors = []
+    runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(runner)
+    runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(runner)
+    return runner
+
+
+@pytest.mark.parametrize(
+    "layout,backend,block_size,full_page_bytes,sliding_heads,sliding_page_bytes,shared",
+    [
+        ("LBNHC", PallasAttentionBackend, 256, 524288, 4, 524288, True),
+        ("LBNHC", PallasAttentionBackend, 256, 524288, 8, 1048576, True),
+        ("LBNHC", PallasAttentionBackend, 256, 524288, 6, 786432, False),
+        ("LBHNC", PallasBatchedRPAAttentionBackend, 128, 131072, 2, 131072, True),
+        ("LBHNC", PallasBatchedRPAAttentionBackend, 128, 131072, 4, 262144, True),
+        ("LBHNC", PallasBatchedRPAAttentionBackend, 128, 131072, 3, 196608, False),
+    ],
+)
+def test_gemma_hma_native_geometries_fit_scheduler_budget(
+    layout,
+    backend,
+    block_size,
+    full_page_bytes,
+    sliding_heads,
+    sliding_page_bytes,
+    shared,
+):
+    """Compatible shapes share 4D regions; other shapes retain native arrays."""
+    from vllm.v1.core.kv_cache_planning import (
+        get_kv_cache_config_from_groups,
+        get_kv_cache_groups,
+    )
+
+    assert get_current_vllm_config_or_none() is None
+    runner = _build_mock_cpu_runner(
+        block_size=block_size,
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_layout=layout,
+    )
+    runner.scheduler_config.disable_hybrid_kv_cache_manager = False
+    layers = {}
+    for prefix, count, heads, head_size, window in [
+        ("full", 2, 1, 512, None),
+        ("swa", 6, sliding_heads, 256, 1024),
+    ]:
+        for index in range(count):
+            layer = _attention_layer_mock()
+            layer.attn_type = AttentionType.DECODER
+            layer.num_kv_heads = heads
+            layer.head_size = head_size
+            layer.sliding_window = window
+            layer.kv_sharing_target_layer_name = None
+            layers[f"{prefix}.{index}"] = layer
+    with (
+        patch.object(TpuPlatform, "_find_non_ssm_backend", return_value=backend),
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+            return_value=layers,
+        ),
+    ):
+        specs = runner.get_kv_cache_spec()
+    groups = get_kv_cache_groups(runner.vllm_config, specs)
+    assert len(groups) == 4
+    assert (
+        sum(isinstance(group.kv_cache_spec, SlidingWindowSpec) for group in groups) == 3
+    )
+    num_blocks = 4
+    page_bytes = (
+        max(full_page_bytes, sliding_page_bytes)
+        if shared
+        else full_page_bytes + sliding_page_bytes
+    )
+    budget = num_blocks * 2 * page_bytes
+    config = get_kv_cache_config_from_groups(runner.vllm_config, groups, budget)
+    runner.vllm_config.compilation_config.static_forward_context = {}
+    runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+    runner.input_batch = SimpleNamespace(
+        block_table=[
+            SimpleNamespace(
+                max_num_blocks_per_req=4,
+                get_cpu_tensor=lambda: runner.block_table_cpu,
+            )
+            for _ in groups
+        ]
+    )
+    with (
+        patch.object(TpuPlatform, "_find_non_ssm_backend", return_value=backend),
+        patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+            return_value=False,
+        ),
+    ):
+        runner.initialize_kv_cache(config)
+    caches = bind.call_args.args[0]
+    unique = {id(cache): cache for cache in caches.values()}
+    assert config.num_blocks == num_blocks
+    assert len(unique) == (2 if shared else 4)
+    assert sum(cache.nbytes for cache in unique.values()) == budget
+    words_per_token = page_bytes // (block_size * 4)
+    if shared:
+        assert caches["full.0"] is caches["swa.0"]
+        assert caches["full.0"].shape == (
+            (num_blocks, words_per_token, 4, block_size)
+            if layout == "LBHNC"
+            else (num_blocks, block_size, 4, words_per_token)
+        )
+    else:
+        assert caches["full.0"].shape == (
+            (num_blocks, 2, 128, 4, block_size)
+            if layout == "LBHNC"
+            else (num_blocks, block_size, 1, 4, 512)
+        )
+        assert caches["swa.0"].shape == (
+            (num_blocks, sliding_heads * 2, 64, 4, block_size)
+            if layout == "LBHNC"
+            else (num_blocks, block_size, sliding_heads // 2, 4, 256)
+        )
+        assert caches["full.0"] is not caches["swa.0"]
+    assert caches["swa.0"] is caches["swa.1"] is caches["swa.2"]
+    assert caches["swa.3"] is caches["swa.4"] is caches["swa.5"]
+    caches["swa.0"][-1].fill_(7)
+    assert torch.all(caches["swa.2"][-1].float() == 7)
+    assert torch.count_nonzero(caches["swa.0"][:-1].float()) == 0
+    assert torch.count_nonzero(caches["swa.3"].float()) == 0
+    if not shared:
+        assert torch.count_nonzero(caches["full.0"].float()) == 0
+
+
+@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC"])
+@pytest.mark.parametrize(
+    "attn_type,shared_target,refused_under_hnd",
+    [
+        (AttentionType.DECODER, None, True),
+        (AttentionType.DECODER, "target.0", True),
+        (AttentionType.ENCODER_ONLY, None, False),
+    ],
+)
+def test_get_kv_cache_spec_refuses_hd64_decoder_layer_under_hnd(
+    layout, attn_type, shared_target, refused_under_hnd
+):
+    """Refuse 64-dim decoder/draft layers under HND; allow encoder-only and NHD."""
+    runner = _build_mock_cpu_runner(block_size=128, kv_cache_layout=layout)
+    layers = {}
+    if shared_target is not None:
+        target = _attention_layer_mock(num_kv_heads=2, head_size=64)
+        target.attn_type = AttentionType.DECODER
+        target.kv_sharing_target_layer_name = None
+        target.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+        layers[shared_target] = target
+    draft = _attention_layer_mock(num_kv_heads=2, head_size=64)
+    draft.attn_type = attn_type
+    draft.kv_sharing_target_layer_name = shared_target
+    draft.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+    layers["draft.0"] = draft
+    with (
+        patch.object(
+            TpuPlatform,
+            "_find_non_ssm_backend",
+            return_value=PallasBatchedRPAAttentionBackend,
+        ),
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
+            return_value=layers,
+        ),
+    ):
+        if layout == "LBHNC" and refused_under_hnd:
+            with pytest.raises(NotImplementedError, match="head_dim==64"):
+                runner.get_kv_cache_spec()
+        else:
+            runner.get_kv_cache_spec()
+
+
+@pytest.mark.parametrize("layout", ["LBHNC", "LBNHC"])
+def test_shared_attention_pool_rejects_mixed_hd64_under_hnd(layout):
+    """Mixing head_size 64 and 128 in one shared pool raises under HND only."""
+    runner = _build_mock_cpu_runner(block_size=128, kv_cache_layout=layout)
+    page_b = 2 * 128 * 2 * 128 * torch.bfloat16.itemsize
+    groups = [
+        KVCacheGroupSpec(
+            layer_names=["full.0"],
+            kv_cache_spec=FullAttentionSpec(
+                block_size=128,
+                num_kv_heads=2,
+                head_size=128,
+                dtype=torch.bfloat16,
+                page_size_padded=page_b,
+            ),
+        ),
+        KVCacheGroupSpec(
+            layer_names=["swa.0"],
+            kv_cache_spec=SlidingWindowSpec(
+                block_size=128,
+                num_kv_heads=2,
+                head_size=64,
+                dtype=torch.bfloat16,
+                sliding_window=512,
+                page_size_padded=page_b,
+            ),
+        ),
+    ]
+    config = KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=4 * page_b,
+                layers=["full.0", "swa.0"],
+                layer_stride=0,
+                block_stride=page_b,
+            )
+        ],
+        kv_cache_groups=groups,
+    )
+    runner.vllm_config.compilation_config.static_forward_context = {}
+    runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
+    runner.input_batch = SimpleNamespace(
+        block_table=[
+            SimpleNamespace(
+                max_num_blocks_per_req=4,
+                get_cpu_tensor=lambda: runner.block_table_cpu,
+            )
+            for _ in groups
+        ]
+    )
+    with (
+        patch.object(
+            TpuPlatform,
+            "_find_non_ssm_backend",
+            return_value=PallasBatchedRPAAttentionBackend,
+        ),
+        patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
+        patch(
+            "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+            return_value=False,
+        ),
+    ):
+        if layout == "LBHNC":
+            with pytest.raises(NotImplementedError, match="head_dim==64"):
+                runner.initialize_kv_cache(config)
+        else:
+            runner.initialize_kv_cache(config)
+            caches = bind.call_args.args[0]
+            assert caches["full.0"] is caches["swa.0"]
+            assert caches["full.0"].shape == (4, 128, 2, 256)
+
+
 @pytest.mark.tpu_test
 class TestKVCacheManager:
     def setup_method(self):
         self.mock_device = torch.device("cpu")
-
-        model_config = ModelConfig(
-            tokenizer_mode="auto",
-            trust_remote_code=False,
-            seed=0,
-            dtype=torch.bfloat16,
-        )
-        cache_config = CacheConfig(
-            block_size=16,
-            gpu_memory_utilization=0.9,
-            cache_dtype="auto",
-        )
-        scheduler_config = SchedulerConfig(
-            max_num_seqs=16,
-            max_model_len=1024,
-            is_encoder_decoder=False,
-        )
-        parallel_config = ParallelConfig(
-            pipeline_parallel_size=1,
-            tensor_parallel_size=1,
-        )
-        vllm_config = VllmConfig(
-            model_config=model_config,
-            cache_config=cache_config,
-            scheduler_config=scheduler_config,
-            parallel_config=parallel_config,
-            observability_config={},
-            additional_config={},
-        )
-
-        self.runner = MagicMock(spec=TPUModelRunner)
-        self.runner.device = self.mock_device
-        self.runner.block_size = 16
-        self.runner.kv_cache_dtype = torch.bfloat16
-        self.runner.use_spmd = False
-        self.runner.vllm_config = vllm_config
-        self.runner.cache_config = vllm_config.cache_config
-        self.runner.scheduler_config = vllm_config.scheduler_config
-        self.runner._hybrid_uniform_page_size_bytes = None
-        self.runner._subpage_kernel_block_size = None
-        self.runner.max_num_reqs = 16
-        self.runner.max_model_len = 1024
-        self.runner.max_num_tokens = 2048
-        self.runner.pin_memory = False
-        self.runner.model_config = vllm_config.model_config
-        self.runner.shared_kv_cache_layers = {}
-        self.runner.runner_only_attn_layers = set()
-        self.runner.enforce_eager = False
-        self.runner.speculative_config = None
-        self.runner.pcp_manager = None
-        # No LoRA, so adapter swaps reserve no HBM.
-        self.runner.lora_slot_write_hbm_bytes.return_value = 0
-        # No buffered hand-off, so no buffers are reserved for it.
-        self.runner.pp_handoff_hbm_reserve_bytes.return_value = 0
-        self.runner.post_profile_hbm_reserves = (
-            TPUModelRunner.post_profile_hbm_reserves.__get__(self.runner)
-        )
-        # Slots per request in the mamba pool (1 without spec decode).
-        self.runner._mamba_slot_stride = 1
-
-        # Bind the actual methods to our mock. The KV-cache spec/sizing bodies
-        # live on KVCacheManager, which reads all of its state back off the
-        # runner, so a real manager over the mock exercises the real code.
-        self.runner.kv_cache_manager = KVCacheManager(self.runner)
-        # Compact-mamba state starts unset (matches real __init__).
-        self.runner._mamba_num_blocks = None
-        self.runner._uniform_mamba_layout = vllm_config.kv_transfer_config is not None
-        self.runner._unified_kv_layout = False
-        self.runner.kv_cache_raw_tensors = []
-        self.runner.get_kv_cache_spec = TPUModelRunner.get_kv_cache_spec.__get__(
-            self.runner
-        )
-        self.runner.initialize_kv_cache = TPUModelRunner.initialize_kv_cache.__get__(
-            self.runner
-        )
-
+        self.runner = _build_mock_cpu_runner()
         self._find_non_ssm_backend_patcher = patch.object(
             TpuPlatform, "_find_non_ssm_backend", return_value=PallasAttentionBackend
         )
@@ -593,7 +840,7 @@ class TestKVCacheManager:
         "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
         return_value=False,
     )
-    @patch("vllm.v1.worker.gpu_input_batch.InputBatch")
+    @patch("vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch.InputBatch")
     def test_initialize_kv_cache_hybrid_duplication(
         self,
         mock_input_batch,
@@ -701,7 +948,7 @@ class TestKVCacheManager:
         "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
         return_value=False,
     )
-    @patch("vllm.v1.worker.gpu_input_batch.InputBatch")
+    @patch("vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch.InputBatch")
     def test_initialize_kv_cache_compact_mamba(
         self,
         mock_input_batch,
@@ -1150,7 +1397,7 @@ class TestKVCacheManager:
         "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
         return_value=False,
     )
-    @patch("vllm.v1.worker.gpu_input_batch.InputBatch")
+    @patch("vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch.InputBatch")
     def test_initialize_kv_cache_binds_shared_layer_to_target_cache(
         self, mock_input_batch, mock_has_kv_transfer, mock_bind_kv_cache, mock_get_shape
     ):
@@ -1200,7 +1447,7 @@ class TestKVCacheManager:
         "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
         return_value=False,
     )
-    @patch("vllm.v1.worker.gpu_input_batch.InputBatch")
+    @patch("vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch.InputBatch")
     def test_initialize_kv_cache_rejects_missing_shared_target(
         self, mock_input_batch, mock_has_kv_transfer
     ):
@@ -1234,7 +1481,7 @@ class TestKVCacheManager:
         "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
         return_value=False,
     )
-    @patch("vllm.v1.worker.gpu_input_batch.InputBatch")
+    @patch("vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch.InputBatch")
     def test_initialize_kv_cache_rejects_duplicate_shared_allocation(
         self, mock_input_batch, mock_has_kv_transfer
     ):
@@ -1324,8 +1571,6 @@ class TestKVCacheManager:
         mock_input_batch.block_table = mock_block_tables
         self.runner.input_batch = mock_input_batch
 
-        cross_layer_connector = MagicMock()
-        cross_layer_connector.prefer_cross_layer_blocks = True
         with (
             patch(
                 "vllm_torchtpu.runner.tpu_runner.PallasAttentionBackend.get_kv_cache_shape",
@@ -1335,14 +1580,6 @@ class TestKVCacheManager:
             patch(
                 "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
                 return_value=False,
-            ),
-            patch(
-                "vllm.v1.worker.kv_connector_model_runner_mixin.has_kv_transfer_group",
-                return_value=True,
-            ),
-            patch(
-                "vllm.v1.worker.kv_connector_model_runner_mixin.get_kv_transfer_group",
-                return_value=cross_layer_connector,
             ),
             patch("vllm_torchtpu.envs.VLLM_TPU_BLOCK_MAJOR_KV", True),
         ):
@@ -1527,101 +1764,6 @@ class TestKVCacheManager:
         assert torch.count_nonzero(caches["full.0"][: num_blocks - 1]) == 0
         assert torch.count_nonzero(caches["full.1"]) == 0
 
-    @pytest.mark.parametrize(
-        "sliding_heads, sliding_page_bytes, shared",
-        [
-            (4, 524288, True),
-            (8, 1048576, True),
-            (6, 786432, False),
-        ],
-    )
-    def test_gemma_hma_native_geometries_fit_scheduler_budget(
-        self, sliding_heads, sliding_page_bytes, shared
-    ):
-        """Compatible shapes share regions; other shapes retain native arrays."""
-        from vllm.v1.core.kv_cache_planning import (
-            get_kv_cache_config_from_groups,
-            get_kv_cache_groups,
-        )
-        from vllm.v1.kv_cache_interface import SlidingWindowSpec
-
-        self.runner.block_size = 256
-        self.runner.cache_config.block_size = 256
-        self.runner.cache_config.kv_cache_layout = "LBNHC"
-        self.runner.kv_cache_dtype = torch.float8_e4m3fn
-        self.runner.scheduler_config.disable_hybrid_kv_cache_manager = False
-        layers = {}
-        for prefix, count, heads, head_size, window in [
-            ("full", 2, 1, 512, None),
-            ("swa", 6, sliding_heads, 256, 1024),
-        ]:
-            for index in range(count):
-                layer = _attention_layer_mock()
-                layer.attn_type = AttentionType.DECODER
-                layer.num_kv_heads = heads
-                layer.head_size = head_size
-                layer.sliding_window = window
-                layer.kv_sharing_target_layer_name = None
-                layers[f"{prefix}.{index}"] = layer
-        with patch(
-            "vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config",
-            return_value=layers,
-        ):
-            specs = self.runner.get_kv_cache_spec()
-        groups = get_kv_cache_groups(self.runner.vllm_config, specs)
-        assert len(groups) == 4
-        assert (
-            sum(isinstance(group.kv_cache_spec, SlidingWindowSpec) for group in groups)
-            == 3
-        )
-        num_blocks = 4
-        page_bytes = (
-            max(524288, sliding_page_bytes) if shared else 524288 + sliding_page_bytes
-        )
-        budget = num_blocks * 2 * page_bytes
-        config = get_kv_cache_config_from_groups(
-            self.runner.vllm_config, groups, budget
-        )
-        self.runner.vllm_config.compilation_config.static_forward_context = {}
-        self.runner.block_table_cpu = torch.zeros((1, 1), dtype=torch.int32)
-        self.runner.input_batch = SimpleNamespace(
-            block_table=[
-                SimpleNamespace(
-                    max_num_blocks_per_req=4,
-                    get_cpu_tensor=lambda: self.runner.block_table_cpu,
-                )
-                for _ in groups
-            ]
-        )
-        with (
-            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as bind,
-            patch(
-                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
-                return_value=False,
-            ),
-        ):
-            self.runner.initialize_kv_cache(config)
-        caches = bind.call_args.args[0]
-        unique = {id(cache): cache for cache in caches.values()}
-        assert config.num_blocks == num_blocks
-        assert len(unique) == (2 if shared else 4)
-        assert sum(cache.nbytes for cache in unique.values()) == budget
-        if shared:
-            assert caches["full.0"] is caches["swa.0"]
-            assert caches["full.0"].shape == (4, 256, 4, page_bytes // 1024)
-        else:
-            assert caches["full.0"].shape == (4, 256, 1, 4, 512)
-            assert caches["swa.0"].shape == (4, 256, sliding_heads // 2, 4, 256)
-            assert caches["full.0"] is not caches["swa.0"]
-        assert caches["swa.0"] is caches["swa.1"] is caches["swa.2"]
-        assert caches["swa.3"] is caches["swa.4"] is caches["swa.5"]
-        caches["swa.0"][-1].fill_(7)
-        assert torch.all(caches["swa.2"][-1].float() == 7)
-        assert torch.count_nonzero(caches["swa.0"][:-1].float()) == 0
-        assert torch.count_nonzero(caches["swa.3"].float()) == 0
-        if not shared:
-            assert torch.count_nonzero(caches["full.0"].float()) == 0
-
     @pytest.mark.usefixtures("vllm_config_context")
     @pytest.mark.parametrize(
         "full_heads,full_head_size,dtype,backend",
@@ -1733,6 +1875,267 @@ class TestKVCacheManager:
         assert first.stride(0) * dtype.itemsize == page_bytes
         caches["attn.0"][kv_cache_config.num_blocks - 1].fill_(1)
         assert torch.all(caches["attn.1"][-1] == 1)
+
+    def _owned_mla_cache_then_drafter(self):
+        """A model-owned MLA cache registers first; a drafter adds a plain
+        `Attention` layer. `_find_non_ssm_backend` returns the MLA backend."""
+        owned = MagicMock(spec=AttentionLayerBase)
+        owned.get_attn_backend.return_value = PallasMLAttentionBackend
+        drafter = _attention_layer_mock(num_kv_heads=8, head_size=128)
+        drafter.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+        self.runner.vllm_config.compilation_config.static_forward_context = {
+            "target.cache": owned,
+            "draft.attn": drafter,
+        }
+        return drafter
+
+    @patch.object(
+        TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend
+    )
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    def test_get_kv_cache_spec_sizes_drafter_with_dense_backend(
+        self, mock_get_layers, _mock_first_backend
+    ):
+        drafter = self._owned_mla_cache_then_drafter()
+        mock_get_layers.return_value = {"draft.attn": drafter}
+
+        spec = self.runner.get_kv_cache_spec()["draft.attn"]
+
+        dense_page = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 8, 128, torch.bfloat16
+        )
+        assert dense_page != PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 8, 128, torch.bfloat16
+        )
+        assert type(spec) is FullAttentionSpec
+        assert spec.page_size_bytes == dense_page
+
+    @pytest.mark.parametrize(
+        ("with_mamba", "hint"),
+        [
+            (True, "not supported with Mamba layers"),
+            (
+                False,
+                r"per-layer KV cache layout \(TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0\)",
+            ),
+        ],
+    )
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    def test_get_kv_cache_spec_rejects_unified_pool_mixing_mla_and_attention(
+        self, mock_get_layers, with_mamba, hint
+    ):
+        mla = MagicMock(spec=MLAAttention)
+        mla.head_size = 576
+        layers = {
+            "target.mla": mla,
+            "draft.attn": _attention_layer_mock(num_kv_heads=8, head_size=128),
+        }
+        if with_mamba:
+            layers["mamba_0"] = DummyMamba()
+        mock_get_layers.return_value = layers
+        self.runner._unified_kv_layout = True
+
+        with pytest.raises(NotImplementedError, match="unified KV block pool") as exc:
+            self.runner.get_kv_cache_spec()
+        assert re.search(hint, str(exc.value))
+        assert ("per-layer" in str(exc.value)) is not with_mamba
+
+    @pytest.mark.usefixtures("vllm_config_context")
+    def test_initialize_kv_cache_allocates_drafter_with_dense_backend(self):
+        self._owned_mla_cache_then_drafter()
+        dtype = torch.bfloat16
+        page_bytes = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 8, 128, dtype
+        )
+        spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=dtype,
+            page_size_padded=page_bytes,
+        )
+        kv_cache_config = KVCacheConfig(
+            num_blocks=4,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=page_bytes * 4,
+                    layers=["draft.attn"],
+                    layer_stride=page_bytes * 4,
+                    block_stride=page_bytes,
+                ),
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(layer_names=["draft.attn"], kv_cache_spec=spec)
+            ],
+        )
+        self.runner.block_table_cpu = torch.zeros((1, 4), dtype=torch.int32)
+        self.runner.kv_caches = []
+        mock_bt = MagicMock()
+        mock_bt.max_num_blocks_per_req = 4
+        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 4), dtype=torch.int32)
+        self.runner.input_batch = MagicMock()
+        self.runner.input_batch.block_table = [mock_bt]
+
+        with (
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as mock_bind,
+            patch.object(
+                TpuPlatform,
+                "_find_non_ssm_backend",
+                return_value=PallasMLAttentionBackend,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=False,
+            ),
+        ):
+            self.runner.initialize_kv_cache(kv_cache_config)
+
+        cache = mock_bind.call_args.args[0]["draft.attn"]
+        assert cache.shape == PallasAttentionBackend.get_kv_cache_shape(
+            4, 16, 8, 128, dtype
+        )
+        assert cache.dim() == 5
+        assert cache.stride(0) * dtype.itemsize == page_bytes
+
+    def _mla_target_then_drafter(self):
+        """Two `MLAAttention` target layers register first; a drafter adds a
+        plain `Attention` layer."""
+        layers = {}
+        for i in range(2):
+            mla = MagicMock(spec=MLAAttention)
+            mla.head_size = 576
+            mla.use_sparse = False
+            mla.get_attn_backend.return_value = PallasMLAttentionBackend
+            layers[f"target.mla.{i}"] = mla
+        drafter = _attention_layer_mock(num_kv_heads=8, head_size=128)
+        drafter.impl = SimpleNamespace(kv_cache_quantized_dtype=None)
+        layers["draft.attn"] = drafter
+        self.runner.vllm_config.compilation_config.static_forward_context = layers
+        self.runner._unified_kv_layout = False
+        self.runner._uniform_mamba_layout = False
+        return layers
+
+    @patch.object(
+        TpuPlatform, "_find_non_ssm_backend", return_value=PallasMLAttentionBackend
+    )
+    @patch("vllm_torchtpu.runner.kv_cache_manager.get_layers_from_vllm_config")
+    def test_get_kv_cache_spec_keeps_native_pages_for_mla_and_drafter(
+        self, mock_get_layers, _mock_first_backend
+    ):
+        mock_get_layers.return_value = self._mla_target_then_drafter()
+
+        specs = self.runner.get_kv_cache_spec()
+
+        mla_page = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 1, 576, torch.bfloat16
+        )
+        dense_page = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 8, 128, torch.bfloat16
+        )
+        assert mla_page != dense_page
+        for i in range(2):
+            assert type(specs[f"target.mla.{i}"]) is MLAAttentionSpec
+            assert specs[f"target.mla.{i}"].page_size_bytes == mla_page
+        assert type(specs["draft.attn"]) is FullAttentionSpec
+        assert specs["draft.attn"].page_size_bytes == dense_page
+        assert self.runner._hybrid_uniform_page_size_bytes is None
+        # vLLM puts the layers in one group that keeps per-layer pages.
+        assert UniformTypeKVCacheSpecs.is_uniform_type(specs)
+
+    @pytest.mark.usefixtures("vllm_config_context")
+    def test_initialize_kv_cache_allocates_mla_and_drafter_caches(self):
+        self._mla_target_then_drafter()
+        dtype = torch.bfloat16
+        num_blocks = 4
+        mla_page = PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 1, 576, dtype
+        )
+        dense_page = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            16, 8, 128, dtype
+        )
+        mla_spec = MLAAttentionSpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=576,
+            dtype=dtype,
+            page_size_padded=mla_page,
+        )
+        dense_spec = FullAttentionSpec(
+            block_size=16,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=dtype,
+            page_size_padded=dense_page,
+        )
+        group_spec = UniformTypeKVCacheSpecs(
+            block_size=16,
+            kv_cache_specs={
+                "target.mla.0": mla_spec,
+                "target.mla.1": mla_spec,
+                "draft.attn": dense_spec,
+            },
+        )
+        size = (2 * mla_page + dense_page) * num_blocks
+        kv_cache_config = KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=size,
+                    layers=["target.mla.0", "target.mla.1"],
+                    layer_stride=mla_page * num_blocks,
+                    block_stride=mla_page,
+                ),
+                KVCacheTensor(
+                    size=size,
+                    layers=["draft.attn"],
+                    layer_stride=dense_page * num_blocks,
+                    block_stride=dense_page,
+                    offset=2 * mla_page * num_blocks,
+                ),
+            ],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=["target.mla.0", "target.mla.1", "draft.attn"],
+                    kv_cache_spec=group_spec,
+                )
+            ],
+        )
+        self.runner.block_table_cpu = torch.zeros((1, 4), dtype=torch.int32)
+        self.runner.kv_caches = []
+        mock_bt = MagicMock()
+        mock_bt.max_num_blocks_per_req = 4
+        mock_bt.get_cpu_tensor.return_value = torch.zeros((1, 4), dtype=torch.int32)
+        self.runner.input_batch = MagicMock()
+        self.runner.input_batch.block_table = [mock_bt]
+
+        with (
+            patch("vllm_torchtpu.utils.tpu_bind_kv_cache") as mock_bind,
+            patch.object(
+                TpuPlatform,
+                "_find_non_ssm_backend",
+                return_value=PallasMLAttentionBackend,
+            ),
+            patch(
+                "vllm_torchtpu.runner.kv_cache_manager.has_kv_transfer_group",
+                return_value=False,
+            ),
+        ):
+            self.runner.initialize_kv_cache(kv_cache_config)
+
+        caches = mock_bind.call_args.args[0]
+        for i in range(2):
+            mla_cache = caches[f"target.mla.{i}"]
+            assert mla_cache.shape == PallasMLAttentionBackend.get_kv_cache_shape(
+                num_blocks, 16, 1, 576, dtype
+            )
+            assert mla_cache.dim() == 4
+            assert mla_cache.nbytes == mla_page * num_blocks
+        drafter_cache = caches["draft.attn"]
+        assert drafter_cache.shape == PallasAttentionBackend.get_kv_cache_shape(
+            num_blocks, 16, 8, 128, dtype
+        )
+        assert drafter_cache.dim() == 5
+        assert drafter_cache.nbytes == dense_page * num_blocks
 
     def test_initialize_kv_cache_composite_specs(self):
         """Verify composite kv_cache_specs unpacking when a group's spec wraps
@@ -2673,6 +3076,157 @@ class TestUpdateAttentionPageSizePadded:
         )
 
 
+class _DsV4SWABackend(PallasMLAttentionBackend):
+    """Stands in for `VllmDeepseekSparseSWABackend`."""
+
+
+class _DsV4AttentionBackend(PallasAttentionBackend):
+    """Stands in for `DeepseekV4TPUAttentionBackend`, a
+    `PallasAttentionBackend` subclass."""
+
+
+class TestDenseAttentionBackend:
+    """Plain `Attention` caches take the backend of the plain layers, also
+    behind an MLA-family first backend (model-owned caches, a drafter)."""
+
+    _attn = staticmethod(TestUpdateAttentionPageSizePadded._attn)
+
+    @staticmethod
+    def _layer(spec, backend):
+        layer = MagicMock(spec=spec)
+        layer.get_attn_backend.return_value = backend
+        return layer
+
+    @staticmethod
+    def _config(layers):
+        return SimpleNamespace(
+            compilation_config=SimpleNamespace(static_forward_context=layers)
+        )
+
+    def _stub(self, layers):
+        stub = TestUpdateAttentionPageSizePadded._stub(stale_block_size=128)
+        stub._mamba_num_blocks = None
+        stub.vllm_config.cache_config = stub.cache_config
+        stub.vllm_config.compilation_config.static_forward_context = layers
+        return stub
+
+    def test_helper_skips_dsv4_cache_backends(self):
+        """DSv4 registers its SWA cache before its attention layer; neither is
+        a plain `Attention`, so a plain drafter keeps its own backend."""
+        from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+        from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+
+        layers = {
+            "layers.0.swa_cache": self._layer(DeepseekV4SWACache, _DsV4SWABackend),
+            "layers.0.attn": self._layer(DeepseekV4Attention, _DsV4AttentionBackend),
+            "draft.attn": self._layer(Attention, PallasBatchedRPAAttentionBackend),
+        }
+        assert (
+            TpuPlatform._find_dense_attention_backend(self._config(layers))
+            is PallasBatchedRPAAttentionBackend
+        )
+
+    def test_helper_keeps_first_backend_without_plain_attention(self):
+        layers = {"mla": self._layer(MLAAttention, PallasMLAttentionBackend)}
+        with patch.object(
+            TpuPlatform,
+            "_find_non_ssm_backends",
+            return_value=[PallasMLAttentionBackend],
+        ):
+            assert (
+                TpuPlatform._find_dense_attention_backend(self._config(layers))
+                is PallasMLAttentionBackend
+            )
+
+    def test_mamba_padding_sizes_plain_first_layer_with_dense_backend(self):
+        """A plain first layer behind an MLA-first backend list takes the
+        dense page, not the MLA formula."""
+        drafter = self._attn(num_kv_heads=8, head_size=128)
+        drafter.get_attn_backend.return_value = PallasAttentionBackend
+        owned = self._layer(AttentionLayerBase, PallasMLAttentionBackend)
+        layers = {"draft.attn": drafter, **{f"m{i}": DummyMamba() for i in range(3)}}
+        stub = self._stub({"target.cache": owned, "draft.attn": drafter})
+        manager = KVCacheManager(stub)
+
+        with (
+            patch.object(
+                TpuPlatform,
+                "_find_non_ssm_backend",
+                return_value=PallasMLAttentionBackend,
+            ),
+            patch.object(manager, "_maybe_select_compact_mamba_layout") as compact,
+            patch.object(manager, "_maybe_set_num_blocks_override"),
+        ):
+            manager._update_mamba_page_size_padded(layers, 128)
+
+        dense_page = PallasAttentionBackend.get_kv_cache_page_size_bytes(
+            128, 8, 128, torch.bfloat16
+        )
+        assert dense_page != PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            128, 8, 128, torch.bfloat16
+        )
+        assert compact.call_args.args[0] == dense_page
+        # 1 attention + 3 mamba layers: 1 attention group, 3 mamba groups of
+        # (4 * 128 * 2) + (8 * 64 * 32 * 4) = 66560 bytes.
+        assert stub._hybrid_uniform_page_size_bytes == dense_page + 3 * 66560
+
+    def test_mamba_padding_sizes_first_mla_layer_with_mla_backend(self):
+        """An indexer cache registers before its MLA sibling; the MLA page
+        still takes `PallasMLAttentionBackend`."""
+        mla = MagicMock(spec=MLAAttention)
+        mla.head_size = 576
+        mla.use_sparse = False
+        layers = {"mla": mla, **{f"m{i}": DummyMamba() for i in range(3)}}
+        stub = self._stub({})
+        manager = KVCacheManager(stub)
+
+        with (
+            patch.object(
+                TpuPlatform,
+                "_find_non_ssm_backend",
+                return_value=VllmTPUDeepseekV32IndexerBackend,
+            ),
+            patch.object(manager, "_maybe_select_compact_mamba_layout") as compact,
+            patch.object(manager, "_maybe_set_num_blocks_override"),
+        ):
+            manager._update_mamba_page_size_padded(layers, 128)
+
+        assert compact.call_args.args[
+            0
+        ] == PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+            128, 1, 576, torch.bfloat16
+        )
+
+    def test_mamba_padding_rejects_mla_with_plain_attention(self):
+        mla = MagicMock(spec=MLAAttention)
+        mla.head_size = 576
+        mla.use_sparse = False
+        drafter = self._attn(num_kv_heads=8, head_size=128)
+        drafter.get_attn_backend.return_value = PallasAttentionBackend
+        layers = {
+            "target.mla": mla,
+            "draft.attn": drafter,
+            **{f"m{i}": DummyMamba() for i in range(3)},
+        }
+        manager = KVCacheManager(self._stub(layers))
+
+        with pytest.raises(NotImplementedError, match="MLA and plain"):
+            manager._update_mamba_page_size_padded(layers, 128)
+
+    def test_mamba_padding_rejects_different_attention_pages(self):
+        layers = {
+            "a": self._attn(num_kv_heads=2, head_size=256),
+            "b": self._attn(num_kv_heads=2, head_size=512),
+            **{f"m{i}": DummyMamba() for i in range(3)},
+        }
+        for name in ("a", "b"):
+            layers[name].get_attn_backend.return_value = PallasAttentionBackend
+        manager = KVCacheManager(self._stub(layers))
+
+        with pytest.raises(NotImplementedError, match="one attention page size"):
+            manager._update_mamba_page_size_padded(layers, 128)
+
+
 def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
     monkeypatch.setattr(
         TpuPlatform, "_find_non_ssm_backend", lambda *_: PallasAttentionBackend
@@ -2723,7 +3277,10 @@ def test_get_kv_cache_spec_propagates_is_draft_layer_cpu(monkeypatch):
             is_hybrid=False,
         ),
         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
-        vllm_config=SimpleNamespace(cache_config=cache_config),
+        vllm_config=SimpleNamespace(
+            cache_config=cache_config,
+            compilation_config=SimpleNamespace(static_forward_context=layers),
+        ),
         shared_kv_cache_layers={},
         runner_only_attn_layers=set(),
         _hybrid_uniform_page_size_bytes=None,
