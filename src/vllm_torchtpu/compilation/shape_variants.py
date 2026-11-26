@@ -65,7 +65,7 @@ class ShapeSpecializationError(RuntimeError):
 
 
 class _UncompiledRunnable:
-    """Placeholder for a bucket refused or skipped by a trace; never executed."""
+    """Placeholder for a bucket refused by a trace; never executed."""
 
     def __init__(self, message: str) -> None:
         self._message = message

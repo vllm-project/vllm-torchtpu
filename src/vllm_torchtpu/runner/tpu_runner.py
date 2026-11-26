@@ -8074,6 +8074,7 @@ class TPUModelRunner(GPUModelRunner):
         *,
         trace_first: bool,
     ) -> shape_variants.BucketExecutables:
+        """Run one backbone warmup pass over `token_paddings` and return its session."""
         with shape_variants.warmup() as buckets:
             with (
                 shape_variants.trace_only() if trace_first else contextlib.nullcontext()
