@@ -165,6 +165,7 @@ def _combine_arrivals_fs(
     out_dtype,
     decode=True,
     fold=None,
+    routes=None,
 ):
     """v2's `_combine_arrivals`, with the arrival-scale lookup done inside the
     combine kernel (see kernel._build_combine_fs_kernel) where that kernel
@@ -173,7 +174,11 @@ def _combine_arrivals_fs(
 
     `fold` = (keep [t_local] bool, addend [t_local, hidden], scale) returns
     kernel.fold_scaled_add(combined zeroed where not keep, addend, scale)
-    instead, inside the fs kernel where it applies."""
+    instead, inside the fs kernel where it applies.
+
+    `routes` [t_local] bool marks the tokens that route (None: all). The
+    decode combine skips the rest and returns zero rows for them; the other
+    paths still read them, and their rows are left for the caller to zero."""
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
@@ -190,7 +195,9 @@ def _combine_arrivals_fs(
             wire_dtype=arrivals.dtype,
             out_dtype=out_dtype,
         )
-        combined = combine(arrivals, arrival_scales, scl, topk_weights, rows)
+        if routes is None:
+            routes = jnp.ones((t_local,), jnp.bool_)
+        combined = combine(arrivals, arrival_scales, scl, topk_weights, rows, routes)
         return combined if fold is None else _fold(combined, *fold)
     # v2's step rule keeps its COMBINE_MIN_TOKENS floor; the fs kernel tiles
     # by its own chunk.
@@ -1164,6 +1171,7 @@ def fused_ep_moe_push(
             out_dtype,
             decode=decode_combine,
             fold=fold,
+            routes=row_routes.reshape(-1),
         )
         if fold is None:
             combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))

@@ -442,11 +442,17 @@ def test_tc_exchange_all_gather_equals_lax_all_gather(width):
     np.testing.assert_array_equal(np.asarray(tc)[0], np.asarray(data).reshape(-1))
 
 
-@pytest.mark.parametrize("t_local,topk", [(16, 6), (64, 6), (16, 3)])
-def test_decode_combine_matches_xla_epilogue(t_local, topk):
+@pytest.mark.parametrize(
+    "t_local,topk,n_valid",
+    [(16, 6, None), (64, 6, None), (16, 3, None), (16, 6, 6), (16, 6, 12), (64, 6, 37)],
+)
+def test_decode_combine_matches_xla_epilogue(t_local, topk, n_valid):
     """At decode sizes the combine is the one-pass kernel; it gives v2's XLA
     epilogue bit for bit, unwritten (NaN) mirror entries and repeated arrival
-    rows included."""
+    rows included. With `n_valid`, the tokens past it and one before it route
+    nowhere, as a bucket's padding does (weight 0, position past the arrivals,
+    clamped onto an unwritten NaN row): the routed rows stay bit for bit, and
+    the rest are the zeros the layer would make of them."""
     from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
         decode_combine_applies,
     )
@@ -458,19 +464,35 @@ def test_decode_combine_matches_xla_epilogue(t_local, topk):
     recv_rows, lane_blocks, sublanes, tile_m = 480, 40, 773, 128
     assert decode_combine_applies(t_local)
     rng = np.random.default_rng(t_local * 10 + topk)
-    arrivals = jnp.asarray(
-        rng.normal(0, 4, (recv_rows, lane_blocks, 128)), jnp.float32
-    ).astype(FP8)
+    rows = rng.normal(0, 4, (recv_rows, lane_blocks, 128))
+    rows[-1] = np.nan
+    arrivals = jnp.asarray(rows, jnp.float32).astype(FP8)
     scales = rng.uniform(0.01, 2, (sublanes, tile_m)).astype(np.float32)
     scales[rng.random(scales.shape) < 0.3] = np.nan
-    pos = rng.integers(0, recv_rows, (t_local, topk), dtype=np.int32)
+    pos = rng.integers(0, recv_rows - 1, (t_local, topk), dtype=np.int32)
     mirror_pos = rng.integers(0, sublanes * tile_m, (t_local, topk), dtype=np.int32)
     finite = np.isfinite(scales.reshape(-1)[mirror_pos])
     mirror_pos = np.where(finite, mirror_pos, mirror_pos[finite][0])
-    weights = jnp.asarray(rng.uniform(0, 1, (t_local, topk)), jnp.float32)
+    weights = rng.uniform(0, 1, (t_local, topk)).astype(np.float32)
+    routes = np.ones(t_local, bool)
+    if n_valid is not None:
+        routes[n_valid:] = False
+        routes[n_valid // 2] = False
+        pos[~routes] = recv_rows + 5
+        weights[~routes] = 0
     args = (arrivals, jnp.asarray(scales), jnp.asarray(pos), jnp.asarray(mirror_pos))
-    got = jax.jit(_combine_arrivals_fs, static_argnums=5)(*args, weights, jnp.bfloat16)
-    want = jax.jit(_combine_arrivals, static_argnums=5)(*args, weights, jnp.bfloat16)
+    args += (jnp.asarray(weights),)
+
+    def fs(*a):
+        routed = None if n_valid is None else jnp.asarray(routes)
+        return _combine_arrivals_fs(*a, jnp.bfloat16, routes=routed)
+
+    def xla(*a):
+        out = _combine_arrivals(*a, jnp.bfloat16)
+        return jnp.where(jnp.asarray(routes)[:, None], out, jnp.zeros_like(out))
+
+    got = jax.jit(fs)(*args)
+    want = jax.jit(xla)(*args)
     assert np.isfinite(np.asarray(got, np.float32)).all()
     np.testing.assert_array_equal(
         np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)

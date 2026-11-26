@@ -20,6 +20,7 @@ module does not redefine -- the expert FFN bodies, the wire epilogue, the
 barrier, the table counts -- is v2's, imported unchanged.
 """
 
+import functools
 import threading
 from typing import cast
 
@@ -2214,7 +2215,9 @@ def _build_combine_decode_kernel(
     and reads the whole scale mirror to look up t_local * topk values.
 
     `sub`/`lane` split the clamped mirror position; the sublane's 128 scales
-    land in SMEM and the lane is read there.
+    land in SMEM and the lane is read there. `keep` (one 0/1 a token) marks
+    the tokens that route: the rest (a bucket's padding) fetch nothing and
+    come out zero, and a kept token's terms are unchanged.
     """
     n = t_local * topk
     gt = COMBINE_GROUP
@@ -2225,15 +2228,26 @@ def _build_combine_decode_kernel(
         sub_sm,
         lane_sm,
         tw_sm,
+        keep_sm,
         scales_hbm,
         arr_hbm,
         out_ref,
         rows_vm,
         scl_sm,
         tile_vm,
+        kept_sm,
+        pad_sm,
         sems,
     ):
-        def start(i, carry):
+        def compact(i, kept):
+            # Both written every token; each kept only where its count
+            # advances past it.
+            kept_sm[kept] = i
+            pad_sm[i - kept] = i
+            return kept + keep_sm[i]
+
+        def start(c, carry):
+            i = kept_sm[c]
             for k in range(topk):
                 j = i * topk + k
                 # Alternate queues by slot, as the pipelined combine does.
@@ -2247,12 +2261,30 @@ def _build_combine_decode_kernel(
                 ).start()
             return carry
 
-        lax.fori_loop(0, t_local, start, jnp.int32(0))
-        # DMA semaphores count bytes: one wait the size of each buffer.
-        pltpu.make_async_copy(scl_sm, scl_sm, sems.at[1]).wait()
-        pltpu.make_async_copy(rows_vm, rows_vm, sems.at[0]).wait()
+        def wait_tokens(tokens):
+            # DMA semaphores count bytes: one wait the size of `tokens`
+            # tokens' topk rows, and one for their sublanes; this holds while
+            # `start` issues exactly topk of each for every kept token.
+            w = tokens * topk
+            pltpu.make_async_copy(
+                scl_sm.at[pl.ds(0, w)], scl_sm.at[pl.ds(0, w)], sems.at[1]
+            ).wait()
+            pltpu.make_async_copy(
+                rows_vm.at[pl.ds(0, w)], rows_vm.at[pl.ds(0, w)], sems.at[0]
+            ).wait()
 
-        def reduce_token(i, carry):
+        # Loops over the compacted ids rather than guarded loops over every
+        # token: the compiler predicates a guarded DMA body, which still
+        # issues every token's scalar work, and a guarded reduce body adds
+        # its branches to every routed token.
+        kept = lax.fori_loop(0, t_local, compact, jnp.int32(0))
+        lax.fori_loop(0, kept, start, jnp.int32(0))
+        # The kept count, waited as a sum of static powers of two.
+        for b in reversed(range(t_local.bit_length())):
+            pl.when((kept & (1 << b)) != 0)(functools.partial(wait_tokens, 1 << b))
+
+        def reduce_token(c, carry):
+            i = kept_sm[c]
             acc = None
             for k in range(topk):
                 j = i * topk + k
@@ -2262,7 +2294,12 @@ def _build_combine_decode_kernel(
             tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
             return carry
 
-        lax.fori_loop(0, t_local, reduce_token, jnp.int32(0))
+        def zero_token(c, carry):
+            tile_vm[pad_sm[c]] = jnp.zeros((lane_blocks, HIDDEN_LANE_BLOCK), out_dtype)
+            return carry
+
+        lax.fori_loop(0, kept, reduce_token, jnp.int32(0))
+        lax.fori_loop(0, t_local - kept, zero_token, jnp.int32(0))
         for g in range(t_local // gt):
             out_ref[pl.ds(g * gt, gt)] = tile_vm[pl.ds(g * gt, gt)].reshape(gt, hidden)
 
@@ -2271,13 +2308,15 @@ def _build_combine_decode_kernel(
     call = pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=4,
+            num_scalar_prefetch=5,
             in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)] * 2,
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
             scratch_shapes=(
                 pltpu.VMEM((n, lane_blocks, HIDDEN_LANE_BLOCK), wire_dtype),
                 pltpu.SMEM((n, mirror_lanes), jnp.float32),
                 pltpu.VMEM((t_local, lane_blocks, HIDDEN_LANE_BLOCK), out_dtype),
+                pltpu.SMEM((t_local,), jnp.int32),
+                pltpu.SMEM((t_local,), jnp.int32),
                 pltpu.SemaphoreType.DMA((2,)),
             ),
             grid=(),
@@ -2295,7 +2334,7 @@ def _build_combine_decode_kernel(
     # One jit around the call: the HBM pins below are only for the pallas_call
     # to read, and an eager shard_map would hand them to other primitives.
     @jax.jit
-    def pinned_call(pos, sub, lane, tw, arrival_scales, arrivals):
+    def pinned_call(pos, sub, lane, tw, keep, arrival_scales, arrivals):
         # Left in HBM: only t_local * topk rows and sublanes are read, and
         # otherwise XLA stages both whole buffers into VMEM ahead of the call.
         return call(
@@ -2303,11 +2342,12 @@ def _build_combine_decode_kernel(
             sub,
             lane,
             tw,
+            keep,
             pltpu.with_memory_space_constraint(arrival_scales, pltpu.HBM),
             pltpu.with_memory_space_constraint(arrivals, pltpu.HBM),
         )
 
-    def fn(arrivals, arrival_scales, scl, topk_weights, pos):
+    def fn(arrivals, arrival_scales, scl, topk_weights, pos, keep):
         # Token-major tables, like the fs combine.
         scl = scl.astype(jnp.int32).reshape(-1)
         return pinned_call(
@@ -2315,6 +2355,7 @@ def _build_combine_decode_kernel(
             scl // mirror_lanes,
             scl % mirror_lanes,
             topk_weights.astype(jnp.float32).reshape(-1),
+            keep.astype(jnp.int32).reshape(-1),
             arrival_scales.astype(jnp.float32),
             arrivals,
         )
