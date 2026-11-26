@@ -196,6 +196,8 @@ _MK_BLOCK_FIELDS = (
     ("union_lanepack", "union_lanepack"),  # VLLM_TPU_MK_QSA_UNION_LANEPACK
     ("fp8_dense_read", "fp8_dense_read"),  # VLLM_TPU_MK_FP8_DENSE_READ
     ("lane_major_select", "lane_major_select"),  # VLLM_TPU_MK_QSA_LANE_MAJOR_SELECT
+    ("phys_mxu", "union_phys_mxu"),  # wholephysmxu: copied table columns (0 = off)
+    ("phys_one", "union_phys_one"),  # wholephysmxu=2: one matmul per 128 ids
 )
 _MK_TILE_FIELDS = ("hier", "rel_fetch", "nbe", "nbd", "vmem_mib")
 
