@@ -125,6 +125,7 @@ if TYPE_CHECKING:
     TPU_TP_AR_QDQ_MIN_TOKENS: int = 0
     TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
+    TPU_MOE_TC_COMBINE_PIECES: int = 1
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     TPU_MOE_TC_COMBINE_MIN_TOKENS: int = 0
     TPU_MOE_V3_PAYLOAD_SORT: bool = False
@@ -1184,6 +1185,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
     # gather-reduce, where its shape admits it.
     "TPU_MOE_TC_COMBINE": env_bool("TPU_MOE_TC_COMBINE"),
+    # TPU_MOE_TC_COMBINE on steps of at least 4096 tokens: combine the tokens
+    # in this many consecutive row pieces (one kernel call each, without the
+    # out-of-order gather fallback), so a consumer of the first piece (an SP
+    # piece's reduce-scatter, TPU_MINIMAX_M3_SP_FFN_PIECES) can start while
+    # the next is combined. Per-token math unchanged: same bits. 1 = off.
+    "TPU_MOE_TC_COMBINE_PIECES": env_nonnegative_int("TPU_MOE_TC_COMBINE_PIECES", 1),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

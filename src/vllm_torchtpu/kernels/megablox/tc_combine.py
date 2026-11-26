@@ -324,7 +324,7 @@ def _kernel(
         )
 
 
-@functools.partial(jax.jit, static_argnames=("topk", "interpret"))
+@functools.partial(jax.jit, static_argnames=("topk", "fallback", "interpret"))
 def tc_combine(
     x: jax.Array,
     pos: jax.Array,
@@ -333,17 +333,28 @@ def tc_combine(
     group_sizes: jax.Array,
     *,
     topk: int,
+    fallback: bool = True,
     interpret=False,
 ) -> jax.Array:
     """out[t] = sum_j where(valid, weights * x[pos], 0) over j < topk, f32
     accumulation, bf16 out. `x` rows [0, sum(group_sizes)) are the GMM output
     grouped by local expert (sizes `group_sizes`), tokens ascending within a
-    group; `pos`, `weights`, `valid` are flat [T * topk] in token-major order."""
-    return _tc_combine(x, pos, weights, valid, group_sizes, None, topk, interpret)
+    group; `pos`, `weights`, `valid` are flat [T * topk] in token-major order.
+    The tokens may be any whole-block run of a step's tokens (a row piece:
+    `pos` still indexes the step's `x`).
+
+    ``fallback=False`` drops the gather fallback for rows out of token order
+    (a caller whose routes come from a stable sort by expert never takes
+    it): the plain kernel call lets XLA overlap an async collective with it,
+    which it does not across the conditional."""
+    return _tc_combine(
+        x, pos, weights, valid, group_sizes, None, topk, interpret, fallback
+    )
 
 
 @functools.partial(
-    jax.jit, static_argnames=("topk", "routed_scale", "early", "interpret")
+    jax.jit,
+    static_argnames=("topk", "routed_scale", "early", "fallback", "interpret"),
 )
 def tc_combine_shared(
     x: jax.Array,
@@ -358,6 +369,7 @@ def tc_combine_shared(
     topk: int,
     routed_scale: float = 1.0,
     early: bool | None = None,
+    fallback: bool = True,
     interpret=False,
 ) -> jax.Array:
     """`tc_combine` with the shared expert's down projection in its output
@@ -374,7 +386,9 @@ def tc_combine_shared(
         float(routed_scale),
         _SHARED_EARLY if early is None else bool(early),
     )
-    return _tc_combine(x, pos, weights, valid, group_sizes, shared, topk, interpret)
+    return _tc_combine(
+        x, pos, weights, valid, group_sizes, shared, topk, interpret, fallback
+    )
 
 
 def _shared_epilogue(routed, shared):
@@ -387,7 +401,9 @@ def _shared_epilogue(routed, shared):
     return (r.astype(jnp.float32) + s.astype(jnp.float32)).astype(jnp.bfloat16)
 
 
-def _tc_combine(x, pos, weights, valid, group_sizes, shared, topk, interpret):
+def _tc_combine(
+    x, pos, weights, valid, group_sizes, shared, topk, interpret, fallback=True
+):
     num_tokens = pos.shape[0] // topk
     hidden = x.shape[1]
     num_experts = group_sizes.shape[0]
@@ -452,7 +468,10 @@ def _tc_combine(x, pos, weights, valid, group_sizes, shared, topk, interpret):
         name="tc_moe_combine" if shared is None else "tc_moe_combine_shared",
     )
 
-    def fallback():
+    if not fallback:
+        return combine(*operands)
+
+    def gather():
         out = _gather_combine(x, pos, weights, valid, topk)
         return out if shared is None else _shared_epilogue(out, shared)
 
@@ -460,7 +479,7 @@ def _tc_combine(x, pos, weights, valid, group_sizes, shared, topk, interpret):
     # rows are not in token order; then take the plain gather.
     return lax.cond(
         jnp.any(counts > maxt),
-        fallback,
+        gather,
         lambda: combine(*operands),
     )
 

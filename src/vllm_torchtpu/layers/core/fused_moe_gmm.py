@@ -838,31 +838,43 @@ def moe_gmm(
                 axis=1
             )
             return (combine @ gmm2_res).astype(x.dtype)
-        if shared is not None:
-            act, ws, wscale, routed_scale = shared
-            return tc_combine_mod.tc_combine_shared(
-                gmm2_res,
-                argsort_revert_indices,
-                topk_weights_flat,
-                valid_mask_flat,
-                group_sizes,
-                act,
-                ws,
-                wscale,
-                topk=topk,
-                routed_scale=routed_scale,
-            ).astype(x.dtype)
-        if envs.TPU_MOE_TC_COMBINE and tc_combine_mod.supported(
-            num_tokens, gmm2_res.shape[-1], topk, group_sizes.shape[0], gmm2_res.dtype
+        tc_args = (gmm2_res.shape[-1], topk, group_sizes.shape[0], gmm2_res.dtype)
+        if shared is not None or (
+            envs.TPU_MOE_TC_COMBINE and tc_combine_mod.supported(num_tokens, *tc_args)
         ):
-            return tc_combine_mod.tc_combine(
-                gmm2_res,
-                argsort_revert_indices,
-                topk_weights_flat,
-                valid_mask_flat,
-                group_sizes,
-                topk=topk,
-            ).astype(x.dtype)
+            pieces = _combine_pieces(num_tokens, tc_args)
+            per = num_tokens // pieces
+            out = []
+            for i in range(pieces):
+                routes = slice(i * per * topk, (i + 1) * per * topk)
+                common = (
+                    gmm2_res,
+                    argsort_revert_indices[routes],
+                    topk_weights_flat[routes],
+                    valid_mask_flat[routes],
+                    group_sizes,
+                )
+                # The routes are sorted stably by expert, so each expert's
+                # rows are in token order and a piece never needs the gather
+                # fallback; dropping its conditional lets XLA overlap a
+                # piece's consumer (an SP reduce-scatter) with the next.
+                if shared is None:
+                    routed = tc_combine_mod.tc_combine(
+                        *common, topk=topk, fallback=pieces == 1
+                    )
+                else:
+                    act, ws, wscale, routed_scale = shared
+                    routed = tc_combine_mod.tc_combine_shared(
+                        *common,
+                        act[i * per : (i + 1) * per],
+                        ws,
+                        wscale,
+                        topk=topk,
+                        routed_scale=routed_scale,
+                        fallback=pieces == 1,
+                    )
+                out.append(routed.astype(x.dtype))
+            return out[0] if pieces == 1 else jnp.concatenate(out)
 
         def sc_combine():
             return ragged_gather_reduce(
@@ -903,6 +915,26 @@ def moe_gmm(
     token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
+
+
+# Mixed / prefill-sized steps only: decode and drafter buckets keep one
+# combine call, and with 2 pieces every piece keeps >= 2048 tokens, like the
+# SP row pieces it feeds (TPU_MINIMAX_M3_SP_FFN_PIECES_MIN_TOKENS).
+_COMBINE_PIECES_MIN_TOKENS = 4096
+
+
+def _combine_pieces(num_tokens: int, tc_args: tuple) -> int:
+    """TPU_MOE_TC_COMBINE_PIECES on steps of at least 4096 tokens whose
+    pieces the TensorCore combine takes (whole token blocks); else 1."""
+    pieces = envs.TPU_MOE_TC_COMBINE_PIECES
+    if (
+        pieces <= 1
+        or num_tokens < _COMBINE_PIECES_MIN_TOKENS
+        or num_tokens % pieces
+        or not tc_combine_mod.supported(num_tokens // pieces, *tc_args)
+    ):
+        return 1
+    return pieces
 
 
 def _tc_shared_applies(
