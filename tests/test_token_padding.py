@@ -1,3 +1,6 @@
+from types import SimpleNamespace
+
+import pytest
 import torch
 
 from vllm_torchtpu.layers.adapter import token_padding
@@ -106,5 +109,45 @@ def test_zero_routing_weights_for_padding_is_local_tensor(monkeypatch):
         assert torch.equal(ids2, ids)
         assert w2[0].tolist() == [0.5, 0.5]
         assert float(w2[1].abs().sum()) == 0.0
+    finally:
+        token_padding.set_padding_state(None)
+
+
+def test_local_padding_rows_reads_runner_mask_for_matching_rows():
+    provider = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
+    token_padding.set_padding_state(provider)
+    try:
+        provider.update(3, 6)
+        assert token_padding.local_padding_rows(6).tolist() == [
+            False,
+            False,
+            False,
+            True,
+            True,
+            True,
+        ]
+        assert token_padding.local_padding_rows(9) is None
+    finally:
+        token_padding.set_padding_state(None)
+    assert token_padding.local_padding_rows(6) is None
+
+
+@pytest.mark.parametrize(
+    "stage_mask,expected",
+    [
+        (torch.tensor([False, True, True, True]), [False, True, True, True]),
+        (torch.tensor([False, True]), None),
+    ],
+)
+def test_local_padding_rows_prefers_the_stage_mask(monkeypatch, stage_mask, expected):
+    provider = TokenPaddingState(local_padding_mask=torch.zeros(8, dtype=torch.bool))
+    token_padding.set_padding_state(provider)
+    context = SimpleNamespace(additional_kwargs={"token_padding_mask": stage_mask})
+    monkeypatch.setattr(token_padding, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(token_padding, "get_forward_context", lambda: context)
+    try:
+        provider.update(3, 4)
+        rows = token_padding.local_padding_rows(4)
+        assert (rows if rows is None else rows.tolist()) == expected
     finally:
         token_padding.set_padding_state(None)
