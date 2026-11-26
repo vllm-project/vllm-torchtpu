@@ -332,19 +332,14 @@ def _transposed_keys(buf, p, live, dtype, folded, masked):
     return k if k.dtype == key_dtype else k.astype(key_dtype)
 
 
-def _chunk_maxima_t(
-    q_pair, buf, first, chunk, live, issue, *, dtype, folded
-) -> jax.Array:
-    """``[Bq, chunk]`` block maxima of the pages ``buf[first : first + chunk]``
-    with the scores computed transposed, ``[2 Bq, tokens]``: the MXU result
-    is ``2 Bq`` rows rather than ``chunk * S / 2``. A folded 4-bit page's
-    per-token scales are a lane vector (the page's last word row), applied by
-    a sublane broadcast. `issue(j)` runs among the keys of page pair ``j``.
-    Columns of pages past the request's end hold garbage (callers mask them).
-    """
+def _chunk_scores_t(q_pair, buf, first, chunk, live, issue, *, dtype, folded):
+    """The scores of `_chunk_maxima_t`, ``[2 Bq, chunk / 2 * S]`` (page ``j``
+    of the chunk in rows ``[0, Bq)``, columns ``[j S, (j + 1) S)``, page
+    ``chunk / 2 + j`` in rows ``[Bq, 2 Bq)``), and with folded pages their
+    slot scales (``[1, S]`` each, unwritten slots 0) in page order, else
+    None."""
     rows = buf.shape[1]
     half = chunk // 2
-    block_q = q_pair.shape[0] // 2
     keys, scale_rows = [], [[], []]
     for j in range(half):
         issue(j)
@@ -359,24 +354,28 @@ def _chunk_maxima_t(
                 # scales only its own column, which callers mask.
                 scale_rows[side].append(jnp.where(jnp.isfinite(s), s, 0.0))
         keys.append(jnp.concatenate(pair, axis=1))
-    page_size = keys[0].shape[0]
     s = jax.lax.dot_general(
         q_pair,
         jnp.concatenate(keys, axis=0),
         (((1,), (1,)), ((), ())),
         preferred_element_type=jnp.float32,
     )  # [2 Bq, half * S]
+    return s, (scale_rows[0] + scale_rows[1] if folded else None)
+
+
+def _page_maxima(page_scores, scale, chunk):
+    """``[Bq, chunk]``: page ``p``'s block maximum on lane ``p``, from its
+    ``[Bq, S]`` `page_scores(p)` times its ``[1, S]`` slot scales `scale(p)`
+    (if given). The maxima go to their lanes by selects, in a balanced tree: a
+    reshape of the scores for one max took ~6 relayout ops per page, and a
+    chain of selects through every page serialized them (bench j-08540f0e)."""
     maxima = []
-    for side in range(2):
-        side_scores = s[side * block_q : (side + 1) * block_q]
-        for j in range(half):
-            page = side_scores[:, j * page_size : (j + 1) * page_size]
-            if folded:
-                page = page * scale_rows[side][j]
-            maxima.append(jnp.max(page, axis=1, keepdims=True))  # [Bq, 1]
-    # Each page's maxima go to their lane by selects, in a balanced tree: a
-    # reshape of the scores for one max took ~6 relayout ops per page, and
-    # a chain of selects through every page serialized them (bench j-08540f0e).
+    for p in range(chunk):
+        page = page_scores(p)
+        if scale is not None:
+            page = page * scale(p)
+        maxima.append(jnp.max(page, axis=1, keepdims=True))  # [Bq, 1]
+    block_q = maxima[0].shape[0]
     lane = jax.lax.broadcasted_iota(jnp.int32, (block_q, chunk), 1)
 
     def merge(lo, hi):
@@ -387,6 +386,34 @@ def _chunk_maxima_t(
         return jnp.where(lane < mid, merge(lo, mid), merge(mid, hi))
 
     return merge(0, chunk)
+
+
+def _chunk_maxima_t(
+    q_pair, buf, first, chunk, live, issue, *, dtype, folded
+) -> jax.Array:
+    """``[Bq, chunk]`` block maxima of the pages ``buf[first : first + chunk]``
+    with the scores computed transposed, ``[2 Bq, tokens]``: the MXU result
+    is ``2 Bq`` rows rather than ``chunk * S / 2``. A folded 4-bit page's
+    per-token scales are a lane vector (the page's last word row), applied by
+    a sublane broadcast. `issue(j)` runs among the keys of page pair ``j``.
+    Columns of pages past the request's end hold garbage (callers mask them).
+    """
+    s, scales = _chunk_scores_t(
+        q_pair, buf, first, chunk, live, issue, dtype=dtype, folded=folded
+    )
+    half = chunk // 2
+    block_q = s.shape[0] // 2
+    page_size = s.shape[1] // half
+
+    def page_scores(p):
+        side, j = divmod(p, half)
+        return s[
+            side * block_q : (side + 1) * block_q, j * page_size : (j + 1) * page_size
+        ]
+
+    return _page_maxima(
+        page_scores, None if scales is None else scales.__getitem__, chunk
+    )
 
 
 def _v3_chunk(pages_per_step: int, block_q: int, page_size: int) -> int:
@@ -414,9 +441,15 @@ def _kernel_v3(
     sems,  # DMA semaphores [R], one per ring slot
     tables,  # SMEM [W * table_len]: block-table windows of W work items
     table_sems,  # DMA semaphores [W], one per window
-    *,
+    # With `defer`:
+    #   out_buf [2, G / 128, Bq, 128] f32: two steps' maxima of their other chunks
+    #   raw_buf [chunk, Bq, S] f32: a step's last chunk's scores, page-major
+    #   raw_scale [chunk, S] f32: their slot scales (folded pages)
+    #   meta SMEM [1]: their chunk's lane tile
+    *deferred,
     pages_per_seq,
     transposed=False,
+    defer=False,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -437,6 +470,12 @@ def _kernel_v3(
     The block table stays in HBM: each work item's window of it is copied
     into SMEM a step before its pages are issued, so the call does not start
     with a copy of the whole table into SMEM.
+
+    With `defer` (transposed tiles), a step's last chunk leaves its scores
+    in VMEM, and the next step takes their maxima among its own matmuls and
+    writes the finished block: step ``s`` writes work item ``s - 1``'s
+    output block, and one more grid step writes the last item's. A step no
+    longer ends on its last chunk's lane maxima.
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     table_slots = table_sems.shape[0]
@@ -447,6 +486,10 @@ def _kernel_v3(
     page_size = _page_tokens(rows, cache_ref.dtype)
     chunk = _v3_chunk(pages_per_step, block_q, page_size)
     step, num_steps = pl.program_id(0), pl.num_programs(0)
+    # Work items: the grid's steps, but for the extra step of `defer`.
+    num_items = num_steps - 1 if defer else num_steps
+    if defer:
+        out_buf, raw_buf, raw_scale, meta = deferred
     # The pages as 32-bit words: a dense VMEM layout, so each key vreg is one
     # load (a packed [S / p, p, D] page tiles VMEM in (p, D) tiles).
     words = cache_ref.bitcast(jnp.uint32).reshape(cache_ref.shape[0], rows, head_dim)
@@ -464,7 +507,7 @@ def _kernel_v3(
 
     def table_copy(k):
         """The copy of work item `k`'s block-table window into its slot."""
-        base, _ = group(jnp.minimum(k, num_steps - 1))
+        base, _ = group(jnp.minimum(k, num_items - 1))
         slot = k % table_slots
         return pltpu.make_async_copy(
             block_tables_ref.at[
@@ -516,26 +559,26 @@ def _kernel_v3(
     def ahead_group(k):
         """(first entry, live pages, table slot) of work item `k`; no live
         pages past the grid."""
-        k_base, k_live = group(jnp.minimum(k, num_steps - 1))
-        return k_base, jnp.where(k < num_steps, k_live, 0), k % table_slots
+        k_base, k_live = group(jnp.minimum(k, num_items - 1))
+        return k_base, jnp.where(k < num_items, k_live, 0), k % table_slots
 
     lead = table_slots - ahead - 1
 
     @pl.when(step == 0)
     def _():
         for k in range(ahead + lead):
-            pl.when(k < num_steps)(table_copy(k).start)
+            pl.when(k < num_items)(table_copy(k).start)
         for k in range(ahead):
-            pl.when(k < num_steps)(table_copy(k).wait)
+            pl.when(k < num_items)(table_copy(k).wait)
             start(ahead_group(k), range(pages_per_step), k)
 
     # The ahead group's table window is needed for its copies below; the
     # one `lead` steps later starts now.
-    pl.when(step + ahead < num_steps)(table_copy(step + ahead).wait)
-    pl.when(step + ahead + lead < num_steps)(
+    pl.when(step + ahead < num_items)(table_copy(step + ahead).wait)
+    pl.when(step + ahead + lead < num_items)(
         lambda: table_copy(step + ahead + lead).start()
     )
-    base, live = group(step)
+    base, live = group(jnp.minimum(step, num_items - 1))
     next_item = ahead_group(step + ahead)
     q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
     # Prefill-chunk tiles only (`FP8_MXU_QUERIES`); decode-sized tiles keep bf16.
@@ -552,7 +595,21 @@ def _kernel_v3(
     issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
     per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
-    def score_chunk(slot, first, share, size=chunk):
+    if defer:
+        lane_tiles, lanes = out_buf.shape[1], out_buf.shape[-1]
+        parity = step % 2
+
+        def write_previous():
+            """Work item ``step - 1``'s output block (`o_ref`): the maxima of
+            its last chunk, left in `raw_buf`, and of its other chunks."""
+            scale = (lambda p: raw_scale[p : p + 1]) if folded else None
+            last = _page_maxima(lambda p: raw_buf[p], scale, chunk)
+            for t in range(lane_tiles):
+                o_ref[:, t * lanes : (t + 1) * lanes] = jnp.where(
+                    meta[0] == t, last, out_buf[1 - parity, t]
+                )
+
+    def score_chunk(slot, first, share, size=chunk, last=False):
         """Score pages ``[first, first + size)``, issuing the ahead group's
         descriptors `share` among the first page pairs (`start`); a partial
         chunk (transposed tiles only) issues the rest of its share after."""
@@ -566,20 +623,26 @@ def _kernel_v3(
                 )
 
         if scores_transposed:
-            m = _chunk_maxima_t(
-                q_pair,
-                buf.at[slot],
-                first,
-                size,
-                live,
-                issue,
-                dtype=cache_ref.dtype,
-                folded=folded,
-            )  # [Bq, size]
-            if transposed:
-                o_ref[:, pl.ds(first, size)] = m
+            args = (q_pair, buf.at[slot], first, size, live, issue)
+            kwargs = dict(dtype=cache_ref.dtype, folded=folded)
+            if defer and last:
+                s, scales = _chunk_scores_t(*args, **kwargs)
+                half, page_size = size // 2, s.shape[1] // (size // 2)
+                for p in range(size):
+                    side, j = divmod(p, half)
+                    raw_buf[p] = s[
+                        side * block_q : (side + 1) * block_q,
+                        j * page_size : (j + 1) * page_size,
+                    ]
+                if folded:
+                    raw_scale[:size] = jnp.concatenate(scales)
+                meta[0] = first // lanes
+            elif defer:  # a full chunk, one lane tile
+                out_buf[parity, first // lanes] = _chunk_maxima_t(*args, **kwargs)
+            elif transposed:
+                o_ref[:, pl.ds(first, size)] = _chunk_maxima_t(*args, **kwargs)
             else:
-                o_ref[pl.ds(first, size), :] = m.T
+                o_ref[pl.ds(first, size), :] = _chunk_maxima_t(*args, **kwargs).T
             if size < chunk:
                 rest = share[size // 2 * per_pair :]
                 start(next_item, rest, (slot + ahead) % slots)
@@ -635,13 +698,15 @@ def _kernel_v3(
         request's last page (their scores are never read) and only issue
         their share of the ahead group's descriptors."""
         wait_pages(live, slot)
+        if defer:  # among this step's matmuls
+            write_previous()
         for c in range(num_chunks):
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
             )
             size = min(chunk, scored - c * chunk)
             if size > 0:
-                score_chunk(slot, c * chunk, pages, size)
+                score_chunk(slot, c * chunk, pages, size, (c + 1) * chunk >= scored)
             else:
                 start(next_item, pages, (slot + ahead) % slots)
 
@@ -667,7 +732,11 @@ def _kernel_v3(
     # Slot first, then count: a step skips the other slots' bodies with one
     # branch each.
     for slot in range(slots):
-        pl.when(step % slots == slot)(functools.partial(slot_bodies, slot))
+        pl.when((step % slots == slot) & (step < num_items))(
+            functools.partial(slot_bodies, slot)
+        )
+    if defer:
+        pl.when(step == num_items)(write_previous)
 
 
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
@@ -890,15 +959,54 @@ def _class_scores(
         last_base = (max_num_seqs - 1) * pages_per_seq + padded_pages - pages_per_step
         table_end = last_base // _TABLE_ALIGN * _TABLE_ALIGN + table_len
         tables = jnp.pad(block_tables, (0, max(0, table_end - block_tables.shape[0])))
+        # Transposed token-major tiles defer each step's last chunk's maxima
+        # (`_kernel_v3`), whole 128-lane chunks only.
+        defer = (
+            token_major
+            and _scores_transposed(block_q, rows_per_page, index_cache.dtype)
+            and chunk == 128
+        )
+        grid, q_spec, deferred = grid_spec.grid, grid_spec.in_specs[0], []
+        if defer:
+            # One more step, and the output block of the item a step back.
+            grid = (grid[0] + 1,)
+            last_work = work.shape[0] - 1
+            q_spec = pl.BlockSpec(
+                q_spec.block_shape,
+                lambda w, work, tile_info, *_: (
+                    pl.multiple_of(
+                        tile_info[work[jnp.minimum(w, last_work)] >> _TILE_SHIFT]
+                        >> _ROW_SHIFT,
+                        _ROW_ALIGN,
+                    ),
+                    0,
+                ),
+            )
+            out_specs = pl.BlockSpec(
+                (block_q, pages_per_step),
+                lambda w, work, *_: (
+                    work[jnp.maximum(w - 1, 0)] >> _TILE_SHIFT,
+                    work[jnp.maximum(w - 1, 0)] & _GROUP_MASK,
+                ),
+            )
+            deferred = [
+                pltpu.VMEM((2, pages_per_step // 128, block_q, 128), jnp.float32),
+                pltpu.VMEM((chunk, block_q, page_size), jnp.float32),
+                pltpu.VMEM((chunk, head_dim), jnp.float32),
+                pltpu.SMEM((1,), jnp.int32),
+            ]
         scores_t = pl.pallas_call(
             functools.partial(
-                _kernel_v3, pages_per_seq=pages_per_seq, transposed=token_major
+                _kernel_v3,
+                pages_per_seq=pages_per_seq,
+                transposed=token_major,
+                defer=defer,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=3,
-                grid=grid_spec.grid,
+                grid=grid,
                 in_specs=[
-                    grid_spec.in_specs[0],
+                    q_spec,
                     pl.BlockSpec(memory_space=pl.ANY),
                     pl.BlockSpec(memory_space=pl.ANY),
                 ],
@@ -911,6 +1019,7 @@ def _class_scores(
                     pltpu.SemaphoreType.DMA((_RING_SLOTS,)),
                     pltpu.SMEM((_TABLE_SLOTS * table_len,), jnp.int32),
                     pltpu.SemaphoreType.DMA((_TABLE_SLOTS,)),
+                    *deferred,
                 ],
             ),
             out_shape=out_shape,
