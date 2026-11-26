@@ -31,6 +31,14 @@ from .constants import (
     SOLVE_SCHEMA,
     UNIT_GIGA,
 )
+from .families import (
+    attach_reference_report,
+    build_bound_families_by_concurrency,
+    ordered_candidates_by_concurrency,
+    parse_layout,
+    reference_layout_report,
+    strict_rank,
+)
 from .schema import (
     CeilingRow,
     ParetoPoint,
@@ -42,6 +50,7 @@ from .schema import (
     SortBy,
     TopKEntry,
     _point_struct_key,
+    candidate_sort_key,
     effective_slo_verdict,
     format_host_count,
     format_parallelism,
@@ -61,14 +70,20 @@ __all__ = [
     "ProvenancePayload",
     "SolvePayload",
     "TopKEntry",
+    "attach_reference_report",
+    "build_bound_families_by_concurrency",
     "build_solve_payload",
     "emit_ceiling_rows",
     "format_host_count",
     "format_parallelism",
     "format_solve_json",
     "format_submodule_parallelism",
+    "ordered_candidates_by_concurrency",
+    "parse_layout",
     "pool_label",
     "pool_slice_summary",
+    "reference_layout_report",
+    "strict_rank",
     "top_layout_roles",
     "top_layouts",
 ]
@@ -144,11 +159,7 @@ def top_layouts(
             best[key] = point
     ranked = sorted(
         best.values(),
-        key=lambda point_item: (
-            -_metric_pair(point_item, plan.sort_by)[0],
-            -_metric_pair(point_item, plan.sort_by)[1],
-            point_item.total_chips,
-        ),
+        key=lambda point_item: candidate_sort_key(point_item, plan.sort_by),
     )
     if top_k is None:
         return tuple(ranked)
@@ -175,13 +186,7 @@ def top_layouts(
         selected[-1] = opposite
     elif sel_keys.index(opp_key) > 0:
         selected[sel_keys.index(opp_key)] = opposite
-    selected.sort(
-        key=lambda point_item: (
-            -_metric_pair(point_item, plan.sort_by)[0],
-            -_metric_pair(point_item, plan.sort_by)[1],
-            point_item.total_chips,
-        )
-    )
+    selected.sort(key=lambda point_item: candidate_sort_key(point_item, plan.sort_by))
     return tuple(selected)
 
 
@@ -440,6 +445,43 @@ def build_solve_payload(
             "pd_ratio": pins_map.get("pd_ratio", pins_map.get("pd")),
         },
     }
+    ordered_by_conc = ordered_candidates_by_concurrency(plan, top_k)
+    concurrency_top_k: dict[str, list[TopKEntry]] = {}
+    for concurrency, conc_pts in ordered_by_conc.items():
+        eligible_conc = tuple(
+            pt
+            for pt in conc_pts
+            if effective_slo_verdict(pt) != SLO_VERDICT_RULED_OUT and pt.slo_met
+        )
+        ruled_conc = [
+            pt
+            for pt in conc_pts
+            if effective_slo_verdict(pt) == SLO_VERDICT_RULED_OUT or not pt.slo_met
+        ]
+        conc_frontier = [
+            pt for pt in eligible_conc if not _is_2d_dominated(pt, eligible_conc)
+        ]
+        entries: list[TopKEntry] = [
+            {
+                "frontier_role": role,
+                "margin_vs_rank1_pct": margin,
+                "point": asdict(point),
+            }
+            for point, role, margin in top_layout_roles(
+                eligible_conc, conc_frontier, sort_by=plan.sort_by
+            )
+        ]
+        entries.extend(
+            {
+                "frontier_role": effective_slo_verdict(point),
+                "margin_vs_rank1_pct": 0.0,
+                "point": asdict(point),
+            }
+            for point in ruled_conc
+        )
+        concurrency_top_k[str(concurrency)] = entries
+    payload["concurrency_top_k"] = concurrency_top_k
+    payload["bound_families_by_concurrency"] = build_bound_families_by_concurrency(plan)
     if dtypes is not None:
         payload["dtypes"] = asdict(dtypes)
     return payload
