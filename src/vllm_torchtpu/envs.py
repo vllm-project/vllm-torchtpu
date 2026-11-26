@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     TPU_MOE_RAGGED_A2A: bool = True
     TPU_MOE_A2A_CAPACITY: float | None = None
     TPU_MOE_A2A_FP8_DISPATCH: bool = False
+    TPU_MOE_ROUTE_PLAN_KERNEL: bool = False
     TPU_MOE_A2A_ROUTE_CAPACITY: float | None = None
     TPU_DECODE_FAST_PATHS_OFF: str = ""
     PCP_FA_KERNEL_BLOCK_SIZE: int | None = None
@@ -791,6 +792,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-gather, and dequantize to bf16 in the row gather. Halves the
     # exchange's bytes; changes the expert inputs by fp8 rounding.
     "TPU_MOE_A2A_FP8_DISPATCH": env_bool("TPU_MOE_A2A_FP8_DISPATCH", default=False),
+    # Ragged all-to-all capacity exchange with the plan kernel: order the
+    # local routes (and place the fp8 rows' scales) with one counting-sort
+    # kernel over the gathered routing instead of XLA's sort and scatters.
+    # Same arrays; shortens the work that runs under the all-to-all.
+    "TPU_MOE_ROUTE_PLAN_KERNEL": env_bool("TPU_MOE_ROUTE_PLAN_KERNEL", default=False),
     # Comma-separated paths of decode_switches.PATHS to leave off although their
     # parent switch is on. Unknown names refuse to start.
     "TPU_DECODE_FAST_PATHS_OFF": env_str("TPU_DECODE_FAST_PATHS_OFF", ""),

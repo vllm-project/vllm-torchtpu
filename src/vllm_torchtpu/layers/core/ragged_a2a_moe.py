@@ -59,6 +59,11 @@ from vllm_torchtpu.kernels.megablox.exchange_plan import (
     exchange_plan_supported,
 )
 from vllm_torchtpu.kernels.megablox.gmm_v2 import owner_token_sum
+from vllm_torchtpu.kernels.megablox.route_plan import (
+    OwnerPlan,
+    local_route_plan,
+    local_route_plan_supported,
+)
 from vllm_torchtpu.kernels.megablox.row_copy import (
     copy_send_rows,
     copy_send_rows_fp8,
@@ -818,6 +823,7 @@ def _capacity_exchange(
     send_index_rows_minor=False,
     planned=None,
     fp8=None,
+    route_kernel=None,
 ):
     """Send and receive buffers of ``rows`` rows, filled without gaps.
 
@@ -844,6 +850,10 @@ def _capacity_exchange(
     rows to fp8 and the exchange moves them as uint32 words (`fp8_row_words`:
     a 32-bit transport type keeps the all-to-all offloaded); the row gather
     dequantizes each with its token's scale.
+    ``route_kernel`` (with ``planned``): `local_route_plan` bound to the
+    gathered routing, which computes the routes `route_plan` gives (and the
+    fp8 receive rows' scales, and the owner combine's `owner_plan`) in one
+    kernel.
     """
     num_tokens, hidden = x.shape
     local_num_experts = w1.shape[0]
@@ -893,32 +903,48 @@ def _capacity_exchange(
             send_start, send_sizes = planned.send_start, planned.send_sizes
             send_landing, recv_sizes = planned.send_landing, planned.recv_sizes
             send_index, in_row = planned.send_index, planned.in_row
-        dests, gathered_weights = plan
-        routes_plan = route_plan(
-            gathered_ids,
-            in_row,
-            fits,
-            experts_start,
-            dests,
-            local_num_experts=local_num_experts,
-            routes=routes,
-            rows=rows,
-            gathered_weights=gathered_weights,
+        fp8_rows = (
+            fp8 is not None and row_scatter and row_gather and planned is not None
         )
         row_scale = None
-        if fp8 is not None and row_scatter and row_gather and planned is not None:
+        extra = {}
+        if route_kernel is not None:
+            local_plan = route_kernel(
+                fits=fits.astype(jnp.int32)[None],
+                scale=fp8[1] if fp8_rows else None,
+            )
+            routes_plan = local_plan[:4]
+            row_scale = local_plan.row_scale
+            if local_plan.owner is not None:
+                extra["owner_arrays"] = local_plan.owner
+        else:
+            dests, gathered_weights = plan
+            routes_plan = route_plan(
+                gathered_ids,
+                in_row,
+                fits,
+                experts_start,
+                dests,
+                local_num_experts=local_num_experts,
+                routes=routes,
+                rows=rows,
+                gathered_weights=gathered_weights,
+            )
+        if fp8_rows:
             inv_scale, gathered_scale = fp8
             sent = copy_send_rows_fp8(x, inv_scale, send_index, planned.count, rows)
-            # Each receive row's token scale: the tokens that reach this rank
-            # land at their planned rows (the others write past the end).
-            reach = (
-                (gathered_ids >= 0) & (gathered_ids // local_num_experts == ep_rank)
-            ).any(axis=2)
-            row_scale = (
-                jnp.ones((rows + 1,), jnp.float32)
-                .at[jnp.where(reach, in_row, rows)]
-                .set(gathered_scale)[:rows]
-            )
+            if row_scale is None:
+                # Each receive row's token scale: the tokens that reach this
+                # rank land at their planned rows (the others write past the
+                # end).
+                reach = (
+                    (gathered_ids >= 0) & (gathered_ids // local_num_experts == ep_rank)
+                ).any(axis=2)
+                row_scale = (
+                    jnp.ones((rows + 1,), jnp.float32)
+                    .at[jnp.where(reach, in_row, rows)]
+                    .set(gathered_scale)[:rows]
+                )
         elif row_scatter and planned is not None:
             sent = copy_send_rows(x, send_index, planned.count, rows)
         elif row_scatter:
@@ -952,7 +978,8 @@ def _capacity_exchange(
         src_rows = jnp.sum(recv_sizes, dtype=jnp.int32)[None]
         if planned is not None:
             src_rows = planned.src_rows
-        extra = {} if row_scale is None else {"row_scale": row_scale}
+        if row_scale is not None:
+            extra["row_scale"] = row_scale
         return streamed(
             received,
             None,
@@ -1178,6 +1205,63 @@ def _owner_routes(topk_ids, topk_weights, *, skip_padded_tokens, dtype, **mesh):
     return tp_s, dp_s, sent_s, weight_s
 
 
+def owner_plan(
+    topk_ids,
+    topk_weights,
+    fits,
+    ep_rank,
+    *,
+    skip_padded_tokens,
+    dtype,
+    dp_size,
+    tp_size,
+    local_num_experts,
+) -> OwnerPlan:
+    """The owner combine's arrays of EP rank ``ep_rank`` from its engine's
+    routing [S, K]: per owner-order position of its owned tokens (TP rank
+    ``ep_rank % tp`` owns tokens ``[my_tp * blk, (my_tp + 1) * blk)``, padded
+    with empty routes) their `_owner_routes`, the rows other ranks send here,
+    and where its shared-expert partials go (`_owner_combine`)."""
+    num_tokens = topk_ids.shape[0]
+    mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local_num_experts)
+    blk = -(-num_tokens // tp_size)
+    my_tp = ep_rank % tp_size
+    dp_pos = ep_rank // tp_size
+    pad = blk * tp_size - num_tokens
+    ids = jnp.pad(topk_ids, ((0, pad), (0, 0)), constant_values=-1)
+    weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
+    owned_ids = jax.lax.dynamic_slice_in_dim(ids, my_tp * blk, blk)
+    owned_weights = jax.lax.dynamic_slice_in_dim(weights, my_tp * blk, blk)
+    valid, _, _, _ = owner_route_key(owned_ids, **mesh)
+    w = owned_weights.astype(dtype)
+    w = jnp.where(jnp.isfinite(w), w, 0)
+    if skip_padded_tokens:
+        valid = valid & (w != 0)
+    remote = valid & (owned_ids // local_num_experts != ep_rank)
+    tp_s, dp_s, sent_s, weight_s = _owner_routes(
+        owned_ids,
+        owned_weights,
+        skip_padded_tokens=skip_padded_tokens,
+        dtype=dtype,
+        **mesh,
+    )
+    t = jnp.arange(blk * tp_size, dtype=jnp.int32)
+    return OwnerPlan(
+        tp_rank=tp_s,
+        dp_pos=dp_s,
+        sent=sent_s.astype(jnp.int32),
+        weight=weight_s,
+        expected=jnp.where(fits, remote.sum(dtype=jnp.int32), 0)[None],
+        shared_member=dp_pos * tp_size + t // blk,
+        shared_row=my_tp * blk + t % blk,
+        # An overflowing step sends and expects nothing (the caller runs the
+        # full-size exchange).
+        shared_counts=jnp.where(
+            fits, jnp.array([(tp_size - 1) * blk, blk * tp_size]), 0
+        ).astype(jnp.int32),
+    )
+
+
 def _owner_sum_ref(
     recv, topk_ids, topk_weights, *, skip_padded_tokens, dtype, shared=None, **mesh
 ):
@@ -1368,6 +1452,7 @@ def _owner_combine(
     src_rows=None,
     owner_tail=False,
     row_scale=None,
+    owner_arrays=None,
 ):
     """The expert kernel sends each output row to its token's OWNER rank: TP rank
     ``t // ceil(S / tp)`` of the token's engine owns token ``t``. The owner sums
@@ -1378,7 +1463,8 @@ def _owner_combine(
     it, all below ``src_rows`` [1]. ``owner_tail``: the expert kernel also sums
     the owned tokens and copies them to the engine's TP ranks in its tail (see
     `gmm_v2_mlp_scatter`), instead of `owner_sum_kernel` and the all-gather:
-    same sums, same rows."""
+    same sums, same rows. ``owner_arrays``: this rank's `owner_plan`, when
+    the route plan kernel computed it."""
     num_tokens = x.shape[0]
     local = w1.shape[0]
     mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
@@ -1387,48 +1473,35 @@ def _owner_combine(
     my_tp = ep_rank % tp_size
     me = dp_pos * tp_size + my_tp
     pad = blk * tp_size - num_tokens
-    ids = jnp.pad(topk_ids, ((0, pad), (0, 0)), constant_values=-1)
-    weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
-    owned_ids = jax.lax.dynamic_slice_in_dim(ids, my_tp * blk, blk)
-    owned_weights = jax.lax.dynamic_slice_in_dim(weights, my_tp * blk, blk)
-    valid, _, _, _ = owner_route_key(owned_ids, **mesh)
-    w = owned_weights.astype(x.dtype)
-    w = jnp.where(jnp.isfinite(w), w, 0)
-    if skip_padded_tokens:
-        valid = valid & (w != 0)
-    remote = valid & (owned_ids // local != ep_rank)
-    expected = jnp.where(fits, remote.sum(dtype=jnp.int32), 0)
-    extra = None
-    if shared is not None:
-        # This rank's shared-expert partial of every engine token goes to the
-        # token's owner (row my_tp * blk + t % blk there), during the experts.
-        t = jnp.arange(blk * tp_size, dtype=jnp.int32)
-        rows = jnp.pad(shared, ((0, pad), (0, 0)))
-        rows = rows.reshape(blk * tp_size, 16, -1)
-        extra = (
-            rows,
-            dp_pos * tp_size + t // blk,
-            my_tp * blk + t % blk,
-            # An overflowing step sends and expects nothing (the caller runs
-            # the full-size exchange).
-            jnp.where(fits, jnp.array([(tp_size - 1) * blk, blk * tp_size]), 0).astype(
-                jnp.int32
-            ),
-        )
-    tail = None
-    if owner_tail:
-        tp_s, dp_s, sent_s, weight_s = _owner_routes(
-            owned_ids,
-            owned_weights,
+    if owner_arrays is None:
+        owner_arrays = owner_plan(
+            topk_ids,
+            topk_weights,
+            fits,
+            ep_rank,
             skip_padded_tokens=skip_padded_tokens,
             dtype=x.dtype,
             **mesh,
         )
+    extra = None
+    if shared is not None:
+        # This rank's shared-expert partial of every engine token goes to the
+        # token's owner, during the experts.
+        rows = jnp.pad(shared, ((0, pad), (0, 0)))
+        rows = rows.reshape(blk * tp_size, 16, -1)
+        extra = (
+            rows,
+            owner_arrays.shared_member,
+            owner_arrays.shared_row,
+            owner_arrays.shared_counts,
+        )
+    tail = None
+    if owner_tail:
         tail = (
-            tp_s,
-            dp_s,
-            sent_s.astype(jnp.int32),
-            weight_s,
+            owner_arrays.tp_rank,
+            owner_arrays.dp_pos,
+            owner_arrays.sent,
+            owner_arrays.weight,
             jnp.asarray(fits, jnp.int32)[None],
         )
     if plan is not None:
@@ -1440,7 +1513,7 @@ def _owner_combine(
             w2_scale,
             *plan,
             jnp.asarray(me, jnp.int32)[None],
-            expected[None],
+            owner_arrays.expected,
             extra,
             src_rows=src_rows,
             tail=tail,
@@ -1469,7 +1542,7 @@ def _owner_combine(
             dest.astype(jnp.int32),
             row_dest.astype(jnp.int32),
             jnp.asarray(me, jnp.int32)[None],
-            expected[None],
+            owner_arrays.expected,
             extra,
             tail,
             topk=topk,
@@ -1488,10 +1561,12 @@ def _owner_combine(
     shared_recv = None
     if shared is not None:
         recv, shared_recv = recv
+    ids = jnp.pad(topk_ids, ((0, pad), (0, 0)), constant_values=-1)
+    weights = jnp.pad(topk_weights, ((0, pad), (0, 0)))
     owned = owner_sum_kernel(
         recv,
-        owned_ids,
-        owned_weights,
+        jax.lax.dynamic_slice_in_dim(ids, my_tp * blk, blk),
+        jax.lax.dynamic_slice_in_dim(weights, my_tp * blk, blk),
         skip_padded_tokens=skip_padded_tokens,
         dtype=x.dtype,
         shared=shared_recv,
@@ -1532,6 +1607,7 @@ def ragged_a2a_moe_local(
     plan_kernel: bool = False,
     whole_group: bool = False,
     fp8_dispatch: bool = False,
+    route_plan_kernel: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
@@ -1599,6 +1675,12 @@ def ragged_a2a_moe_local(
     scale per token, the scales riding along with the routing all-gather, and
     the row gather dequantizes them to bf16 (NOT bitwise: the expert inputs
     carry fp8 rounding). The full-size fallback stays bf16.
+    ``route_plan_kernel`` (with ``plan_kernel``): where the plan kernel runs
+    and `local_route_plan_supported` holds, one kernel computes the local
+    routes `route_plan` gives (and the fp8 receive rows' scales and the owner
+    combine's `owner_plan`) from the gathered routing with a counting sort,
+    instead of XLA's sort over the group's every route and its scatters
+    (same arrays).
     """
     assert shared is None or owner_combine
     assert not owner_tail or owner_combine
@@ -1818,7 +1900,7 @@ def ragged_a2a_moe_local(
         # The capacity exchange runs outside the conditional, so the schedule
         # around it (weight prefetches for the following layers) is unchanged.
         capacity_streamed = streamed(rows, routes, 2)
-    planned = None
+    planned = route_kernel = None
     if plan_kernel and capacity_streamed is not None and plan is not None and plan_ok:
         planned = exchange_plan(
             gathered_words,
@@ -1829,6 +1911,29 @@ def ragged_a2a_moe_local(
             routes=routes,
         )
         overflow = planned.overflow
+        supported = functools.partial(
+            local_route_plan_supported,
+            num_members=dp_size,
+            num_tokens=num_tokens,
+            topk=topk,
+            local_num_experts=local_num_experts,
+            tp_size=tp_size,
+            rows=rows,
+            owner=owner_combine,
+        )
+        if route_plan_kernel and supported():
+            route_kernel = functools.partial(
+                local_route_plan,
+                gathered_words,
+                ep_rank=(experts_start // local_num_experts).astype(jnp.int32),
+                local_num_experts=local_num_experts,
+                tp_size=tp_size,
+                owner=owner_combine,
+                skip_padded=skip_padded_tokens,
+                rows=rows,
+                routes=routes,
+                owner_plan=x.dtype == jnp.bfloat16 and supported(owner_plan=True),
+            )
     else:
         overflow = _capacity_overflow(
             gathered_ids,
@@ -1858,6 +1963,7 @@ def ragged_a2a_moe_local(
         send_index_rows_minor=send_index_rows_minor,
         planned=planned,
         fp8=fp8 if planned is not None else None,
+        route_kernel=route_kernel,
     )
     out = finish(out, capacity_streamed is not None)
     if whole:
@@ -1896,6 +2002,7 @@ def ragged_a2a_moe(
     plan_kernel: bool = False,
     whole_group: bool = False,
     fp8_dispatch: bool = False,
+    route_plan_kernel: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
@@ -1927,6 +2034,7 @@ def ragged_a2a_moe(
         plan_kernel=plan_kernel,
         whole_group=whole_group,
         fp8_dispatch=fp8_dispatch,
+        route_plan_kernel=route_plan_kernel,
     )
 
     scaled = w1_scale is not None

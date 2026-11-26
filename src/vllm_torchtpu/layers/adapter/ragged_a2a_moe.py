@@ -157,6 +157,7 @@ def _get_op(
         capacity_factor=capacity_factor,
         route_factor=route_factor,
         fp8_dispatch=envs.TPU_MOE_A2A_FP8_DISPATCH,
+        route_plan_kernel=envs.TPU_MOE_ROUTE_PLAN_KERNEL,
         **keywords,
     )
 
@@ -251,7 +252,7 @@ def _get_op(
         "streamed combine %s, owner combine %s, row gather %s, row scatter %s, "
         "owner tail %s, "
         "routing dma %s, send index rows minor %s, plan kernel %s, whole group %s, "
-        "fp8 dispatch %s",
+        "fp8 dispatch %s, route plan kernel %s",
         topk,
         activation,
         mesh.shape[DP_AXIS],
@@ -268,6 +269,7 @@ def _get_op(
         "on" if keywords["plan_kernel"] else "off",
         "on" if keywords["whole_group"] else "off",
         "on" if envs.TPU_MOE_A2A_FP8_DISPATCH else "off",
+        "on" if envs.TPU_MOE_ROUTE_PLAN_KERNEL else "off",
     )
     _log_capacity(
         mesh, topk, onehot_threshold, step_routed_rows, capacity_factor, route_factor

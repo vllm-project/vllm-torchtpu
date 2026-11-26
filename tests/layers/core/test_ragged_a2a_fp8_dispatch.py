@@ -13,7 +13,8 @@
 # limitations under the License.
 """Capacity exchange that moves fp8 token rows with a float32 scale per token
 (``fp8_dispatch``): close to the bf16 exchange (the expert inputs carry fp8
-rounding)."""
+rounding). The route plan kernel (``route_plan_kernel``) leaves either
+exchange's result bitwise unchanged."""
 
 import functools
 import re
@@ -33,8 +34,9 @@ from vllm_torchtpu.layers.core.ragged_a2a_moe import DP_AXIS, TP_AXIS, ragged_a2
 # fp8 rows travel as uint32 words [8, H / 32] of whole tiles: H % 4096 == 0.
 HIDDEN = 4096
 INTER = 512
-# The fp8 row gather in a lowered program.
+# The fp8 row gather and the route plan kernel in a lowered program.
 FP8_GATHER = re.compile(r"row_copy_gather-[A-Za-z0-9_\-]*-f8\b")
+ROUTE_PLAN = re.compile(r"local_route_plan-")
 
 
 def _require_eight_tpu_devices():
@@ -84,14 +86,9 @@ LAYOUTS = [
 ]
 
 
-@pytest.mark.multichip
-@pytest.mark.parametrize("whole_group", [False, True])
-@pytest.mark.parametrize("layout", range(len(LAYOUTS)))
-def test_fp8_dispatch_is_close_to_bf16(layout, whole_group):
-    """Every rank's result within fp8 rounding of the bf16 exchange: TP 1 / 2
-    / 4, top-10 and top-2, padded tokens skipped, owner (with the shared
-    expert and the owner tail) and streamed combine, and a step that
-    overflows into the (bf16) full-size exchange."""
+def _setup(layout, whole_group):
+    """The stacked operands, the exchange's keywords and the shared-expert
+    keyword of one layout."""
     dp_size, tp_size, num_tokens, topk, factor, route_factor, padded, skew, combine = (
         LAYOUTS[layout]
     )
@@ -137,6 +134,18 @@ def test_fp8_dispatch_is_close_to_bf16(layout, whole_group):
             rng.standard_normal((dp_size, tp_size, num_tokens, HIDDEN)) / 8,
             jnp.bfloat16,
         )
+    return stacked, common, kwargs
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("whole_group", [False, True])
+@pytest.mark.parametrize("layout", range(len(LAYOUTS)))
+def test_fp8_dispatch_is_close_to_bf16(layout, whole_group):
+    """Every rank's result within fp8 rounding of the bf16 exchange: TP 1 / 2
+    / 4, top-10 and top-2, padded tokens skipped, owner (with the shared
+    expert and the owner tail) and streamed combine, and a step that
+    overflows into the (bf16) full-size exchange."""
+    stacked, common, kwargs = _setup(layout, whole_group)
     run = jax.jit(functools.partial(ragged_a2a_moe, fp8_dispatch=True, **common))
     lowered = run.lower(*stacked, **kwargs).as_text()
     assert FP8_GATHER.search(lowered)
@@ -151,3 +160,22 @@ def test_fp8_dispatch_is_close_to_bf16(layout, whole_group):
     # averaged down by the matmuls.
     err = np.linalg.norm(got - base) / np.linalg.norm(base)
     assert err < 0.05, err
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("fp8_dispatch", [False, True])
+@pytest.mark.parametrize("whole_group", [False, True])
+@pytest.mark.parametrize("layout", range(len(LAYOUTS)))
+def test_route_plan_kernel_is_bitwise(layout, whole_group, fp8_dispatch):
+    """Every rank's result with the route plan kernel equals the XLA route
+    plan's bitwise, with bf16 and fp8 rows, in every layout above."""
+    stacked, common, kwargs = _setup(layout, whole_group)
+    common["fp8_dispatch"] = fp8_dispatch
+    run = jax.jit(functools.partial(ragged_a2a_moe, route_plan_kernel=True, **common))
+    assert ROUTE_PLAN.search(run.lower(*stacked, **kwargs).as_text())
+    base = jax.jit(functools.partial(ragged_a2a_moe, **common))(*stacked, **kwargs)
+    got = run(*stacked, **kwargs)
+    assert np.abs(np.asarray(base).astype(np.float32)).max() > 0
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(base).view(np.uint16)
+    )
