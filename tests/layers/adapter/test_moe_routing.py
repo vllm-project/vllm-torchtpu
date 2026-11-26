@@ -161,7 +161,58 @@ def test_router_topk_op_is_registered_at_import():
     from vllm_torchtpu.layers.adapter import router_topk
 
     assert router_topk._op is not None
+    assert router_topk._softmax_op is not None
     assert hasattr(torch.ops.pallas, "moe_router_topk")
+    assert hasattr(torch.ops.pallas, "moe_router_softmax_topk")
+
+
+@pytest.mark.parametrize(
+    "change,fused",
+    [
+        ({}, True),
+        ({"_ROUTER_TOPK": "sort"}, False),
+        ({"scoring_fn": "sigmoid"}, False),
+        ({"renormalize": False}, False),
+        ({"e_score_correction_bias": True}, False),
+        ({"routed_scaling_factor": 2.5}, True),
+    ],
+)
+def test_select_experts_selects_on_logits_only_where_exact(monkeypatch, change, fused):
+    """The logit top-k names the softmax's experts and gives their
+    renormalized weights only with softmax scoring, renormalization and no
+    selection bias; a routed scaling factor still applies after it."""
+    torch = pytest.importorskip("torch")
+    calls = []
+    real = moe_routing.softmax_rowmax_select
+
+    def spy(logits, topk):
+        calls.append(topk)
+        return real(logits, topk)
+
+    monkeypatch.setattr(moe_routing, "softmax_rowmax_select", spy)
+    monkeypatch.setattr(
+        moe_routing, "_ROUTER_TOPK", change.get("_ROUTER_TOPK", "rowmax")
+    )
+    layer = _routing_layer(topk=4)
+    if change.get("e_score_correction_bias"):
+        layer.e_score_correction_bias = torch.zeros(16)
+    layer.routed_scaling_factor = change.get("routed_scaling_factor", 1.0)
+    logits = torch.randn(8, 16)
+    weights, ids = moe_routing.select_experts(
+        hidden_states=torch.ones(8, 4),
+        router_logits=logits,
+        topk=4,
+        renormalize=change.get("renormalize", True),
+        scoring_fn=change.get("scoring_fn", "softmax"),
+        layer=layer,
+    )
+    assert calls == ([4] if fused else [])
+    assert ids.dtype == torch.int32 and ids.shape == (8, 4)
+    if fused:
+        ref_w, ref_i = torch.topk(logits.softmax(dim=-1), 4, dim=-1)
+        ref_w = ref_w / ref_w.sum(dim=-1, keepdim=True)
+        assert torch.equal(ids, ref_i.to(torch.int32))
+        torch.testing.assert_close(weights, ref_w * layer.routed_scaling_factor)
 
 
 @pytest.mark.parametrize("impl", ["sort", "rowmax"])

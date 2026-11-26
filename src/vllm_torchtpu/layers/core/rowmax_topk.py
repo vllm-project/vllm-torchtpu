@@ -59,3 +59,13 @@ def rowmax_topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tenso
     # poisonous so the caller's renormalization propagates it.
     weights = torch.where(weights[..., :1] <= NEG, torch.nan, weights)
     return weights, ids
+
+
+def softmax_rowmax_topk(
+    logits: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``rowmax_topk`` of the f32 softmax of ``logits``, the weights divided by
+    their sum: softmax scoring with renormalization. The kernel in
+    ``kernels/router_topk.py`` computes it from the logits directly."""
+    weights, ids = rowmax_topk(logits.float().softmax(dim=-1), k)
+    return weights / weights.sum(dim=-1, keepdim=True), ids

@@ -13,16 +13,15 @@
 # limitations under the License.
 """Torch bridge for the sort-free MoE router top-k.
 
-On TPU the selection runs as the Pallas kernel in ``kernels/router_topk.py``,
-elsewhere as the identical plain-torch algorithm in
-``layers/core/rowmax_topk.py``.
+On TPU the selection runs as the Pallas kernels in ``kernels/router_topk.py``,
+elsewhere as their plain-torch twins in ``layers/core/rowmax_topk.py``.
 """
 
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.router_topk import router_topk
-from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
+from vllm_torchtpu.kernels.router_topk import router_softmax_topk, router_topk
+from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk, softmax_rowmax_topk
 
 
 def _fake_router_topk(scores: torch.Tensor, topk: int):
@@ -37,6 +36,8 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
 # forward, and Dynamo cannot trace a lock-guarded registration there.
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
+_softmax_op = pallas.jax_op("pallas::moe_router_softmax_topk", router_softmax_topk)
+_softmax_op.register_fake(_fake_router_topk)
 
 
 def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -48,3 +49,17 @@ def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.
             f"router top-k kernel expects [rows, experts], got {scores.shape}"
         )
     return _op(scores.float(), topk)
+
+
+def softmax_rowmax_select(
+    logits: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``rowmax_select`` of ``logits.softmax(-1)``, renormalized: f32 weights
+    summing to 1 per row and int32 ids, from ``[rows, experts]`` logits."""
+    if logits.device.type != "tpu":
+        return softmax_rowmax_topk(logits, topk)
+    if logits.dim() != 2:
+        raise ValueError(
+            f"router top-k kernel expects [rows, experts], got {logits.shape}"
+        )
+    return _softmax_op(logits, topk)

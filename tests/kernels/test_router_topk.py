@@ -11,20 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pallas router top-k kernel vs its torch reference.
+"""Pallas router top-k kernels vs their references.
 
 ``interpret=True`` runs the kernel body on the host, so block splitting, the
 clamp and the tie rule are gated without a TPU. It does not gate Mosaic
-lowering.
+lowering; the ``tpu`` cases of the softmax kernel do, where a TPU is present.
 """
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
 from jax import lax
 
-from vllm_torchtpu.kernels.router_topk import MAX_BLOCK_ROWS, select
+from vllm_torchtpu.kernels.router_topk import (
+    MAX_BLOCK_ROWS,
+    select,
+    select_softmax_renormalized,
+)
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
 
 EXPERTS = 512
@@ -164,3 +169,100 @@ def test_kernel_ties_and_nan_match_the_reference():
 def test_grid_rounds_up_over_the_tuned_block(rows, grid):
     block = min(MAX_BLOCK_ROWS, rows)
     assert -(-rows // block) == grid
+
+
+SOFTMAX_EXPERTS = 768
+MODES = [pytest.param(True, id="interpret"), pytest.param(False, id="tpu")]
+
+
+def _softmax_both(logits, interpret):
+    """The fused kernel and what routing ran before it: the f32 softmax,
+    ``select``, then division by the selected scores' sum."""
+    # At run time: a backend touched at collection claims the TPU.
+    if not interpret and jax.devices()[0].platform != "tpu":
+        pytest.skip("Mosaic lowering needs a TPU")
+
+    def softmax_path(x):
+        w, i = select(jax.nn.softmax(x.astype(jnp.float32), axis=-1), TOPK, interpret)
+        return w / w.sum(axis=-1, keepdims=True), i
+
+    fused = jax.jit(lambda x: select_softmax_renormalized(x, TOPK, interpret))
+    logits = jnp.asarray(logits)
+    return (
+        tuple(np.asarray(a) for a in fused(logits)),
+        tuple(np.asarray(a) for a in jax.jit(softmax_path)(logits)),
+    )
+
+
+def _bf16_ulps(a, b):
+    """Per-element distance in bf16 ulps of two positive f32 arrays, after
+    the cast routing applies to the weights."""
+    bits = [
+        np.asarray(jnp.asarray(x).astype(jnp.bfloat16).view(jnp.int16), np.int32)
+        for x in (a, b)
+    ]
+    return np.abs(bits[0] - bits[1])
+
+
+@pytest.mark.parametrize("interpret", MODES)
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+@pytest.mark.parametrize("rows", [48, 1040])
+def test_softmax_select_matches_the_softmax_path(rows, dtype, interpret):
+    """Same experts, weights within f32 rounding. bf16 logits tie often at
+    768 experts, so this also gates the lowest-id rule through the packed
+    key."""
+    rng = np.random.default_rng(rows)
+    logits = jnp.asarray(
+        rng.standard_normal((rows, SOFTMAX_EXPERTS), dtype=np.float32) * 2.0, dtype
+    )
+    (fw, fi), (rw, ri) = _softmax_both(logits, interpret)
+    np.testing.assert_array_equal(fi, ri)
+    rel = np.abs(fw - rw) / rw
+    ulps = _bf16_ulps(fw, rw)
+    print(
+        f"softmax select {jnp.dtype(dtype).name} rows={rows}: max rel f32 diff "
+        f"{rel.max():.2e}, bf16 weights differing {(ulps > 0).mean():.2%} "
+        f"(max {ulps.max()} ulp)"
+    )
+    assert rel.max() < 1e-5
+    assert ulps.max() <= 1
+
+
+@pytest.mark.parametrize("interpret", MODES)
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_softmax_select_ties_and_padded_tokens(dtype, interpret):
+    logits = np.full((5, SOFTMAX_EXPERTS), -1.0, dtype=np.float32)
+    logits[0] = 0.0  # padded token: every expert tied
+    logits[1, 200:212] = 4.0  # tie across the boundary
+    logits[2, 100:120:2] = -0.0  # -0.0 ties +0.0: lowest ids win
+    logits[2, 101:121:2] = 0.0
+    logits[3, :] = -np.inf  # five finite experts, the rest score exactly 0
+    logits[3, 400:405] = np.arange(5)
+    logits[4, 700:] = 3.0  # the tie at the top of the id range
+    (fw, fi), (rw, ri) = _softmax_both(jnp.asarray(logits, dtype), interpret)
+    np.testing.assert_array_equal(fi, ri)
+    np.testing.assert_allclose(fw, rw, rtol=1e-6, atol=0)
+    assert fi[0].tolist() == list(range(TOPK))
+    np.testing.assert_allclose(fw[0], 1.0 / TOPK, rtol=1e-6)
+    assert fi[2].tolist() == list(range(100, 100 + TOPK))
+    assert (fw[3, 5:] == 0).all()
+
+
+@pytest.mark.parametrize("interpret", MODES)
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_softmax_select_poisons_rows_as_the_softmax_does(dtype, interpret):
+    """NaN anywhere (either sign), +inf, or a row of -inf: every weight NaN,
+    and still ``TOPK`` distinct real experts."""
+    neg_nan = np.array(0xFFC00000, np.uint32).view(np.float32)
+    rng = np.random.default_rng(3)
+    logits = rng.standard_normal((4, SOFTMAX_EXPERTS), dtype=np.float32)
+    logits[0, 37] = np.nan
+    logits[1, 600] = neg_nan
+    logits[2, 5] = np.inf
+    logits[3] = -np.inf
+    (fw, fi), (rw, _) = _softmax_both(jnp.asarray(logits, dtype), interpret)
+    assert np.isnan(rw).all()
+    assert np.isnan(fw).all()
+    for row in fi:
+        assert len(set(row.tolist())) == TOPK
+        assert all(0 <= e < SOFTMAX_EXPERTS for e in row)
