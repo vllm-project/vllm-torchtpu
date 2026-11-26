@@ -87,7 +87,7 @@ class _RowsSpec(NamedTuple):
     folds: int  # 128-lane blocks of a row
     data_rows: int  # word rows holding slots (dim-major: a slot's words)
     scale_lane: int | None  # lane of the lane values holding folded scales
-    dim_major: bool = False  # slot = lane; a token's row comes packed in words
+    dim_major: bool = False  # slot = lane, a token's values packed down the word rows
 
 
 class _ValuesSpec(NamedTuple):
@@ -198,7 +198,7 @@ def _run_ops(
                 continue
             raw, buf = next(windows_left)
             new_rows = raw[slot].astype(jnp.uint32)
-            if spec.bits == 4 and not spec.dim_major:
+            if spec.bits == 4:
                 new_rows = new_rows & 0xF
             for f in range(spec.folds):
                 buf[f, pl.ds(page_size, window)] = new_rows[
@@ -210,10 +210,19 @@ def _run_ops(
             row = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 0)
             lane = jax.lax.broadcasted_iota(jnp.int32, (rows, width), 1)
             if spec.dim_major:
-                # [slot, word] of the run's packed rows -> [word, slot].
+                # [slot, value] of the run's rows -> [value, slot], then `packing`
+                # consecutive values per word: one 8-row tile holds a word row's
+                # values at 4 bits, two at 8 bits.
                 by_lane = buf[0, pl.ds(row0, page_size), :].T
+                values = by_lane.reshape(spec.data_rows, packing, page_size)
+                by_lane = functools.reduce(
+                    jnp.bitwise_or,
+                    [values[:, j] << jnp.uint32(spec.bits * j) for j in range(packing)],
+                )
+                if spec.data_rows < rows:
+                    by_lane = jnp.pad(by_lane, ((0, rows - spec.data_rows), (0, 0)))
                 data = row < spec.data_rows
-                words = jnp.where(data & (lane >= lo) & (lane < hi), by_lane[:rows], words)
+                words = jnp.where(data & (lane >= lo) & (lane < hi), by_lane, words)
                 # Slots past the run are zeroed, as below.
                 words = jnp.where(data & (lane >= hi), 0, words)
             for j in range(0 if spec.dim_major else packing):
@@ -329,36 +338,19 @@ def _slot_words(target: Rows) -> tuple[jax.Array, _RowsSpec, int]:
         )
     if width % _LANES:
         raise ValueError(f"cache rows must be whole 128-lane blocks, got {cache.shape}")
-    if target.dim_major:
-        if width != _LANES:
-            raise ValueError(f"dim-major pages hold {_LANES} slots, got {cache.shape}")
-        words = _packed_words(target.rows, bits)
-        return words, _RowsSpec(bits, 1, data_rows, None, True), width
+    if target.dim_major and (width != _LANES or target.rows.shape[1] != _LANES):
+        raise ValueError(
+            f"dim-major pages take {_LANES}-value rows into {_LANES} slots, got "
+            f"{target.rows.shape} rows for {cache.shape}"
+        )
     if bits == 4:
         words = target.rows.astype(jnp.uint8)
     else:
         words = jax.lax.bitcast_convert_type(target.rows, _UINT_BY_BITS[bits])
+    if target.dim_major:
+        return words, _RowsSpec(bits, 1, data_rows, None, True), width
     spec = _RowsSpec(bits, width // _LANES, data_rows, None)
     return words, spec, data_rows * 32 // bits
-
-
-def _packed_words(rows: jax.Array, bits: int) -> jax.Array:
-    """Token rows ``[T, W]`` (uint8 nibbles for 4 bits) -> uint32 ``[T,
-    128]``: value ``i`` in bits ``bits * (i % p)`` of word ``i // p`` (``p =
-    32 / bits``), the words of a dim-major page column; lanes past the
-    row's words are zero."""
-    num_tokens, width = rows.shape
-    packing = 32 // bits
-    if bits != 4:
-        rows = jax.lax.bitcast_convert_type(rows, _UINT_BY_BITS[bits])
-    # Shifts and ors: one elementwise fusion (a reshaping bitcast to 32 bits
-    # became one slice per packed value, ~15 us each for 3K fp8 rows).
-    values = rows.astype(jnp.uint32).reshape(num_tokens, width // packing, packing)
-    shifts = jnp.arange(packing, dtype=jnp.uint32) * bits
-    words = jnp.bitwise_or.reduce(values << shifts, axis=-1)
-    if words.shape[1] > _LANES:
-        raise ValueError(f"a dim-major column holds {_LANES} words, got {words.shape}")
-    return jnp.pad(words, ((0, 0), (0, _LANES - words.shape[1])))
 
 
 class WriteOperands(NamedTuple):
