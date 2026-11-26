@@ -429,10 +429,11 @@ def test_fp4_lse_wide_groups(
     _check(got, want)
 
 
+@pytest.mark.parametrize("block_q", [32, 64])
 @pytest.mark.parametrize("union", [5, 12, 20, 40])
-def test_fp4_lse_prefill_tiles_match_reference(union, monkeypatch):
-    """4-bit 64-token tiles of 16 query heads in 32-page groups (the c48
-    prefill calls): every token of a tile selects among the same `union`
+def test_fp4_lse_prefill_tiles_match_reference(union, block_q, monkeypatch):
+    """4-bit 32- or 64-token tiles of 16 query heads in 32-page groups (the
+    c48 prefill calls): every token of a tile selects among the same `union`
     pages, so its tile runs one group at width 8, 12 or 24, or two groups
     (the second carrying the first's sums), in the one-body form
     (`_STEP_WIDTHS_4BIT_T`)."""
@@ -444,9 +445,9 @@ def test_fp4_lse_prefill_tiles_match_reference(union, monkeypatch):
     q, _, _, table, keys, local_key, local_limit = _inputs(
         rng, num_tokens, num_tokens, 1, jnp.bfloat16
     )
-    for t0 in range(0, num_tokens, 64):
+    for t0 in range(0, num_tokens, block_q):
         pool = rng.choice(PAGES, union, replace=False)
-        for t in range(t0, t0 + 64):
+        for t in range(t0, t0 + block_q):
             picked = rng.choice(pool, min(union, TOPK), replace=False)
             keys[t, 0] = np.pad(picked, (0, TOPK - len(picked)), constant_values=-1)
             local_key[t] = pool[t % union]
@@ -459,7 +460,7 @@ def test_fp4_lse_prefill_tiles_match_reference(union, monkeypatch):
         jnp.asarray(local_limit),
         jnp.asarray(table),
         sm_scale=SCALE,
-        block_q=64,
+        block_q=block_q,
         pages_per_step=32,
         scale_cache=jnp.asarray(scales),
         interpret=True,

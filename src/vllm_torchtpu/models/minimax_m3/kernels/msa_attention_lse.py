@@ -37,16 +37,17 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 # ms, j-492a1bb9).
 _STEP_WIDTHS = (4, 8, 16, 24, 32, 48)
 # 4-bit `attend_t` groups (prefill-size calls) also run at 12 pages, the
-# union of a 64-token tile whose tokens select much the same blocks, in one
-# body per width (`_one_body`). Kernel bench, c48 2048-token call at
-# locality .999: 96.5 -> 85.3 us; tiles of 12 fixed pages 91.5 -> 74.8 us.
+# union of a tile whose tokens select much the same blocks, in one body per
+# width (`attend_t_any`). Kernel bench, c48 2048-token call of 64-token tiles
+# at locality .999: 96.5 -> 85.3 us; tiles of 12 fixed pages 91.5 -> 74.8 us.
 # Their bodies are many and large: with the single-group copies as well,
 # 12 bodies ran a c48 call 8 % slower and 16 bodies 8x slower.
-_STEP_WIDTHS_4BIT_T = (4, 8, 12, 16, 24, 48)
+_STEP_WIDTHS_4BIT_T = (4, 8, 12, 16, 24, 32, 48)
 # Units also run at 12 pages, the width of c48-like decode groups (one KV
-# head, 22-34 requests, locality .97: -8..-9 % per call). Calls that run
-# groups alone do not take it: a 64-page head-parallel prefill call
-# (64-token tiles) ran ~5x slower with it in its step bodies.
+# head, 22-34 requests, locality .97: -8..-9 % per call). Other calls that
+# run groups alone do not take it (a 64-page head-parallel prefill call ran
+# ~5x slower with it among two bodies per width), except 4-bit `attend_t`
+# groups, which have one body per width (`_STEP_WIDTHS_4BIT_T`).
 _UNIT_STEP_WIDTHS = (4, 8, 12, 16, 24, 32, 48)
 # Tiles per grid step: a step runs the groups of this many tiles in a loop.
 # One step per group paid a per-step cost worth ~2-3% of the call (pool48
@@ -498,13 +499,16 @@ def _kernel(
                 acc_ref[...] = acc_new
 
         def attend_t_parts(width, single):
-            """`attend` for 8/16-bit caches on transposed scores ``s^T [keys,
+            """`attend_t`'s ``(m_prev, m_new, l_cur, pv)`` over the group's first
+            `width` slots (`single` only matters without `MAX_FREE`).
+
+            `attend` for 8/16-bit caches on transposed scores ``s^T [keys,
             rows]``: the max and sum over keys are sublane reductions, the
             output accumulates as ``acc^T [D, rows]`` across the p @ v
             contraction, and ``m``, ``l`` are lane vectors over rows (fewer
             spills and pops: bench j-9081937a, c4 pool48 -5.4%). 4-bit pages
-            (`FP4_TRANSPOSED`) fold their K / V scales into the bf16 rows, a
-            scale column per page: worth it from 16-token tiles on; 8-token
+            (`FP4_TRANSPOSED`) fold their K scales into the bf16 rows and
+            their V scales into v^T: worth it from 16-token tiles on; 8-token
             (decode) tiles keep `attend` (c4 b3 decode +0.4 ms per step
             transposed, twin j-fa6121d0 vs glue-only j-2abe5011; 4-bit 8-token
             body 2,055 -> 3,977 bundles for 32 pages)."""
