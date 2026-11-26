@@ -484,7 +484,7 @@ def _write_solve_text_output(
 ) -> int:
     """Write solve warnings to stderr and formatted table rows to stdout."""
     _write_warnings(serving_plan.warnings)
-    visible_candidates = slice_per_concurrency(serving_plan.candidates, top_k)
+    visible_candidates = top_layouts(serving_plan, top_k)
     if visible_candidates:
         sys.stdout.write(
             f"{'mode':<7}  {'c':>5}  {'chips':>5}  {'pareto':>6}  {'pools':<32}  "
@@ -501,7 +501,7 @@ def _write_solve_text_output(
                 )
             else:
                 pools = (
-                    f"1x{point.decode_pool.topology}"
+                    f"{point.decode_pool.instances}x{point.decode_pool.topology}"
                     f"({_format_pool_axes(point.decode_pool)})"
                 )
             mark = "*" if point.is_pareto else ""
@@ -647,12 +647,19 @@ def _build_reference_report_for_cli(
         else solve_opts
     )
     topos = _resolve_solve_topologies(ref_opts, chip=chip)
-    rejected_by = explain_layout_rejection(geometry, resolved_ref, topos, solve_opts)
+    rejected_by = explain_layout_rejection(
+        geometry,
+        resolved_ref,
+        topos,
+        ref_opts,
+        concurrencies=serving_plan.scenario.concurrencies,
+    )
     return reference_layout_report(
         serving_plan,
         top_layouts(serving_plan, args.top_k),
         ref_layout,
         rejected_by,
+        top_k=args.top_k,
     )
 
 

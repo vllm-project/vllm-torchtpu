@@ -651,3 +651,57 @@ def test_disagg_offload_uses_custom_chip_spec() -> None:
         and cand.decode_pool.moe_dispatch == fast_rec.decode_pool.moe_dispatch
     )
     assert slow_same.est_ttft_ms > fast_rec.est_ttft_ms
+
+
+def test_unpadded_strict_and_crossover_preserve_five_matmul_buckets() -> None:
+    """Verify unpadded strict times and crossover scaling keep fp4 matmul work."""
+    fp4_payload = _make_base_spec_payload(name="fp4_bucket_chip")
+    fp4_payload["fp4_flops"] = _SYNTH_FP4_FLOPS
+    fp4_chip, topos = rf.load_chip_spec(fp4_payload)
+    nvfp4_config = load_locked_config("qwen3_5_397b_nvfp4.json")
+    geometry = from_hf_config(nvfp4_config)
+    dt_fp4 = rf.dtypes_from_hf_config(nvfp4_config)
+    ep_ranks = 4
+    batch_sz = 4
+    ctx_len = 256
+    global_toks = 16
+    parallel = Parallel(tp=1, moe="ep", ep=ep_ranks)
+    shape = StepShape(batch=batch_sz, rows_per_seq=1, context=ctx_len)
+    topology = topos["2x2"]
+
+    _hbm_s, matmul_fp4_s, _vector_s, _coll_s = rf.unpadded_strict_resource_times(
+        geometry,
+        fp4_chip,
+        parallel,
+        shape,
+        rf.UnpaddedFloorOptions(dtypes=dt_fp4, topology=topology),
+    )
+    no_fp4_chip, _ = rf.load_chip_spec(_make_base_spec_payload(name="bf16_fallback"))
+    _hbm_fb, matmul_fb_s, _vector_fb, _coll_fb = rf.unpadded_strict_resource_times(
+        geometry,
+        no_fp4_chip,
+        parallel,
+        shape,
+        rf.UnpaddedFloorOptions(dtypes=dt_fp4, topology=topology),
+    )
+    assert matmul_fp4_s > 0.0
+    assert matmul_fp4_s < matmul_fb_s
+
+    compute_shape = StepShape(batch=0, rows_per_seq=0, context=0, prefill_tokens=4096)
+    sf_even = rf.step_floor(
+        geometry,
+        fp4_chip,
+        parallel,
+        compute_shape,
+        rf.FloorOptions(dtypes=dt_fp4, topology=topology),
+    )
+    ep_serial_s = rf.scaled_ep_serial_s(
+        sf_even,
+        fp4_chip,
+        geometry,
+        parallel,
+        global_toks,
+    )
+    moe_even = next(mod for mod in sf_even.modules if mod.name == "moe")
+    assert moe_even.fp4_flops > 0.0
+    assert ep_serial_s > sf_even.serial_estimate_s

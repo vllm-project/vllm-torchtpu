@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from .chips import ChipSpec, SliceTopology
+    from .geometry import ModelGeometry
 
 type SortBy = Literal["throughput", "interactivity"]
 
@@ -293,6 +294,9 @@ class ServingPlan:
         default_factory=ExpertActivationModel
     )
     ruled_out_candidates: tuple[ParetoPoint, ...] = ()
+    sweep_candidates: tuple[ParetoPoint, ...] = ()
+    winner_prefix_hit_range: tuple[float, float] | None = None
+    prefix_hit_crossover_rate: float | None = None
 
 
 class ProvenancePayload(TypedDict):
@@ -339,7 +343,16 @@ class ReferenceLayoutReport(TypedDict):
     rank_by_estimated_throughput: int | None
     in_top_k: bool
     point: Mapping[str, object] | None
+    family_in_ordered_top_k: bool
+    ordered_family_peer: str | None
     rejected_by: str
+    rejection_reason: str
+    slo_verdict: SloVerdict | None
+    bound_tpot_ms: float | None
+    bound_ttft_ms: float | None
+    floor_throughput_per_chip: float | None
+    hbm_used_gb: float | None
+    min_decode_seqs: float | None
 
 
 class SolvePayload(TypedDict):
@@ -558,6 +571,27 @@ def _point_struct_key(
 ) -> tuple[str, PoolStructKey | None, PoolStructKey | None]:
     """Build composite structural identity key across mixed or prefill/decode pools."""
     return (point.mode, _pool_key(point.prefill_pool), _pool_key(point.decode_pool))
+
+
+def shared_prefix_tokens(scenario: TrafficScenario) -> int:
+    """Return rounded shared-prefix token count for one traffic scenario."""
+    return round(scenario.prefix_hit_rate * scenario.isl)
+
+
+def resolve_spec_k(
+    geometry: ModelGeometry,
+    scenario: TrafficScenario,
+    spec_k: int | None = None,
+) -> int:
+    """Resolve effective speculative draft step count for a scenario."""
+    if spec_k is not None:
+        return spec_k
+    if scenario.spec_tokens is not None:
+        return scenario.spec_tokens
+    effective_accept_len = max(1.0, scenario.accept_len)
+    if effective_accept_len > 1.0:
+        return max(geometry.mtp_layers, math.ceil(effective_accept_len) - 1)
+    return 0
 
 
 def candidate_sort_key(

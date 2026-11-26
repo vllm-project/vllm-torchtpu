@@ -18,6 +18,7 @@ from __future__ import annotations
 import itertools
 import math
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from typing import TYPE_CHECKING, Final, Literal, TypedDict, Unpack
 
 from .chips import TOPOLOGIES, ChipSpec, SliceTopology, topologies_for_chip
@@ -46,6 +47,7 @@ from .constants import (
     UNIT_MILLIS_PER_SECOND,
     UNKNOWN_THINK_TIME_WARNING,
 )
+from .crossover import prune_sweep_candidates, sweep_prefix_hit_crossovers
 from .memory import (
     HbmBreakdown,
     KvFitInput,
@@ -75,6 +77,8 @@ from .schema import (
     TrafficScenario,
     candidate_sort_key,
     effective_slo_verdict,
+    resolve_spec_k,
+    shared_prefix_tokens,
 )
 from .step import (
     FloorOptions,
@@ -650,6 +654,50 @@ def _count_disagg_ratio_slots(
     )
 
 
+_SOLVER_CACHE_MAXSIZE: Final[int] = 8192
+
+
+@lru_cache(maxsize=_SOLVER_CACHE_MAXSIZE)
+def _hbm_linear_terms(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    parallel: Parallel,
+    ctx_full: int,
+    chip: ChipSpec,
+) -> tuple[float, float, float]:
+    """Return (weight_bytes, kv_bytes_per_seq, state_bytes_per_seq) on one core."""
+    bd0 = hbm_breakdown_per_core_bytes(
+        geometry, dtypes, parallel, SeqKvLayout(0, 0), chip=chip
+    )
+    bd1 = hbm_breakdown_per_core_bytes(
+        geometry, dtypes, parallel, SeqKvLayout(1, ctx_full), chip=chip
+    )
+    return (bd0.weights, bd1.kv, bd1.state)
+
+
+def _mixed_max_instances(eval_context: _SolveContext, topology: SliceTopology) -> int:
+    """Return max mixed-pool identical slice replicas permitted within budgets."""
+    if eval_context.max_instances is not None and eval_context.max_instances < 1:
+        return 0
+    if eval_context.max_chips is None:
+        return 1
+    if eval_context.max_chips < topology.num_chips:
+        return 0
+    cap = (
+        eval_context.max_instances
+        if eval_context.max_instances is not None
+        else DEFAULT_MAX_INSTANCES
+    )
+    return max(1, min(cap, eval_context.max_chips // max(1, topology.num_chips)))
+
+
+def _mixed_instance_counts(max_instances: int, concurrency: int) -> tuple[int, ...]:
+    """Return feasible replica counts in 1..max_instances for one concurrency."""
+    return tuple(
+        inst for inst in range(1, max_instances + 1) if inst == 1 or inst <= concurrency
+    )
+
+
 def _count_core_grid(
     eval_context: _SolveContext,
     topologies: Sequence[SliceTopology],
@@ -674,9 +722,14 @@ def _count_core_grid(
                 and topology.num_chips > eval_context.max_chips
             ):
                 continue
+            max_instances = _mixed_max_instances(eval_context, topology)
+            conc_inst_slots = sum(
+                len(_mixed_instance_counts(max_instances, concurrency))
+                for concurrency in eval_context.scenario.concurrencies
+            )
             total += (
                 _count_core_valid_layouts(topology.num_cores, has_moe=has_moe)
-                * conc_count
+                * conc_inst_slots
             )
     if eval_context.mode in ("auto", "disagg") and include_pairs:
         for d_topo in topologies:
@@ -1123,7 +1176,7 @@ class _BoundDecodeInput:
 
 def _shared_prefix_tokens(scenario: TrafficScenario) -> int:
     """Return rounded shared-prefix token count for one scenario."""
-    return round(scenario.prefix_hit_rate * scenario.isl)
+    return shared_prefix_tokens(scenario)
 
 
 def _resolve_spec_k(
@@ -1132,14 +1185,7 @@ def _resolve_spec_k(
     spec_k: int | None = None,
 ) -> int:
     """Resolve effective speculative draft step count without touching estimates."""
-    if spec_k is not None:
-        return spec_k
-    if scenario.spec_tokens is not None:
-        return scenario.spec_tokens
-    effective_accept_len = max(1.0, scenario.accept_len)
-    if effective_accept_len > 1.0:
-        return max(geometry.mtp_layers, math.ceil(effective_accept_len) - 1)
-    return 0
+    return resolve_spec_k(geometry, scenario, spec_k)
 
 
 def _steady_state_batch_cap_phys(
@@ -1550,11 +1596,12 @@ def _eval_unpadded_decode_buckets(
     )
 
 
-def _mixed_capacity_work_bound(
+@lru_cache(maxsize=_SOLVER_CACHE_MAXSIZE)
+def _mixed_capacity_unit_rate(
     bound_in: _BoundDecodeInput,
     replica_batch_cap: int,
 ) -> float:
-    """Return mixed-pool capacity ceiling (req/s) with link-axis cuts."""
+    """Return single-instance mixed-pool capacity ceiling (req/s)."""
     dec_steps = _decode_steps_per_req(
         bound_in.scenario.osl, bound_in.effective_accept_len
     )
@@ -1587,6 +1634,17 @@ def _mixed_capacity_work_bound(
         coll_req_s,
     )
     return float(max(1, bound_in.decode_par.dp)) / max(_CAP_DENOM_EPS, req_time_s)
+
+
+def _mixed_capacity_work_bound(
+    bound_in: _BoundDecodeInput,
+    replica_batch_cap: int,
+    *,
+    instances: int = 1,
+) -> float:
+    """Return mixed-pool capacity ceiling (req/s) with link-axis cuts."""
+    unit_rate = _mixed_capacity_unit_rate(bound_in, replica_batch_cap)
+    return float(max(1, instances)) * unit_rate
 
 
 def _disagg_capacity_work_bound(
@@ -1771,12 +1829,15 @@ def _resolve_pool_capacity_context(
             prefill_instances,
             decode_instances,
         )
+    decode_instances = max(1, opts.get("decode_instances", 1))
     return (
-        _mixed_capacity_work_bound(bound_in, replica_batch_cap),
+        _mixed_capacity_work_bound(
+            bound_in, replica_batch_cap, instances=decode_instances
+        ),
         bound_in.decode_par,
         bound_in.decode_topo,
         1,
-        1,
+        decode_instances,
     )
 
 
@@ -1942,7 +2003,8 @@ def floor_throughput_per_chip(
                 + decode_instances * dec_topo.num_chips
             )
         else:
-            total_chips = dec_topo.num_chips
+            decode_instances = max(1, opts.get("decode_instances", 1))
+            total_chips = decode_instances * dec_topo.num_chips
     return (x_rate_bound * float(scenario.isl + scenario.osl)) / float(
         max(1, total_chips)
     )
@@ -2202,26 +2264,33 @@ def _clamp_resident_batch(
     b_start: int,
 ) -> tuple[int, HbmBreakdown] | None:
     """Decrease resident batch until HBM usage fits within hbm_limit_b."""
-    resident_batch = b_start
-    hbm_bd = hbm_breakdown_per_core_bytes(
+    w_bytes, kv_per_seq, state_per_seq = _hbm_linear_terms(
         eval_context.geometry,
         eval_context.dtypes,
         parallel,
-        SeqKvLayout(resident_batch, eval_context.ctx_full),
-        chip=eval_context.chip,
+        eval_context.ctx_full,
+        eval_context.chip,
     )
-    while resident_batch > 1 and hbm_bd.total > eval_context.hbm_limit_b:
-        resident_batch -= 1
-        hbm_bd = hbm_breakdown_per_core_bytes(
-            eval_context.geometry,
-            eval_context.dtypes,
-            parallel,
-            SeqKvLayout(resident_batch, eval_context.ctx_full),
-            chip=eval_context.chip,
-        )
-    if hbm_bd.total > eval_context.hbm_limit_b:
+    per_seq = kv_per_seq + state_per_seq
+    limit = eval_context.hbm_limit_b
+    if w_bytes + per_seq > limit:
         return None
-    return resident_batch, hbm_bd
+    resident_batch = (
+        min(b_start, max(1, int((limit - w_bytes) // per_seq)))
+        if per_seq > 0.0
+        else b_start
+    )
+    while resident_batch > 1 and (w_bytes + resident_batch * per_seq) > limit:
+        resident_batch -= 1
+    total_b = w_bytes + resident_batch * per_seq
+    if total_b > limit:
+        return None
+    return resident_batch, HbmBreakdown(
+        weights=w_bytes,
+        kv=resident_batch * kv_per_seq,
+        state=resident_batch * state_per_seq,
+        total=total_b,
+    )
 
 
 def _prefill_stage_step_floor(
@@ -2365,6 +2434,8 @@ def _find_prefill_options(
     topos: list[SliceTopology],
 ) -> tuple[list[_PrefillOption], float]:
     """Enumerate all legal, HBM-feasible prefill configurations, collapsing residual."""
+    if eval_context.mode == "mixed":
+        return ([], math.inf)
     prefill_options: list[_PrefillOption] = []
     min_req_ttft_ms = math.inf
     eff_isl_floor = max(
@@ -2428,14 +2499,16 @@ def _solve_mixed_think_batch(
     eval_context: _SolveContext,
     topology: SliceTopology,
     parallel: Parallel,
-    concurrency: int,
+    conc_and_idp: tuple[int, int],
     prefill_step_floor: StepFloor,
 ) -> int:
     """Resolve Little's-law active local batch size under non-zero think time."""
+    concurrency, raw_idp = conc_and_idp
     dec_steps_per_req = _decode_steps_per_req(
         eval_context.scenario.osl, eval_context.effective_accept_len
     )
-    local_batch = max(1, math.ceil(concurrency / max(1, parallel.dp)))
+    eff_idp = max(1, raw_idp)
+    local_batch = max(1, math.ceil(concurrency / eff_idp))
     think_s = eval_context.scenario.think_time_s
     if think_s is None or think_s <= 0.0:
         return local_batch
@@ -2451,7 +2524,7 @@ def _solve_mixed_think_batch(
         active_concurrency = (
             float(concurrency) * service_time_s / (service_time_s + (think_s or 0.0))
         )
-        local_batch = max(1, math.ceil(active_concurrency / max(1, parallel.dp)))
+        local_batch = max(1, math.ceil(active_concurrency / eff_idp))
     return local_batch
 
 
@@ -2559,13 +2632,19 @@ def _compute_mixed_bounds(
     eval_context: _SolveContext,
     topology: SliceTopology,
     parallel: Parallel,
-    concurrency: int,
+    conc_and_inst: tuple[int, int],
     bounds: _MixedPointBounds,
 ) -> tuple[float, float, float, StepFloor, float, float, float, float]:
     """Compute mixed-pool capacity ceiling, floor throughput, and latency bounds."""
+    concurrency, instances = conc_and_inst
+    eff_inst = max(1, instances)
+    idp = eff_inst * max(1, parallel.dp)
+    total_chips = eff_inst * topology.num_chips
     replica_batch_cap = max(1, bounds.physical_batch_cap)
     bound_in = _context_to_bound_input(eval_context, topology, parallel)
-    capacity_rate_bound = _mixed_capacity_work_bound(bound_in, replica_batch_cap)
+    capacity_rate_bound = _mixed_capacity_work_bound(
+        bound_in, replica_batch_cap, instances=eff_inst
+    )
     bound_ttft_val = bounds.sf_ttft.hard_floor_s * UNIT_MILLIS_PER_SECOND
     envelope_ttft_val = bounds.sf_ttft.envelope_floor_s * UNIT_MILLIS_PER_SECOND
     think_s = eval_context.scenario.think_time_s
@@ -2593,12 +2672,12 @@ def _compute_mixed_bounds(
     floor_tput = (
         request_rate_limit
         * float(eval_context.scenario.isl + eval_context.scenario.osl)
-    ) / float(topology.num_chips)
+    ) / float(total_chips)
     min_decode_seqs, bound_sf_dec = _solve_fixed_point_residency(
         bound_in,
         concurrency,
         replica_batch_cap,
-        max(1, parallel.dp),
+        idp,
         capacity_rate_bound,
     )
     bound_tpot_val = (
@@ -2634,6 +2713,7 @@ class _MixedServiceInput:
     decode_serial_s: float
     mix_verify_serial_s: float
     mix_serial_s: float
+    instances: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -2697,11 +2777,13 @@ def _compute_mixed_service_metrics(
         ) * state.decode_serial_s + p_mix * state.mix_serial_s
     replica_req_time_s += state.pcie_read_s
     total_req_work_s = float(state.resident_batch) * replica_req_time_s
-    idp = max(1, parallel.dp)
+    eff_inst = max(1, state.instances)
+    idp = eff_inst * max(1, parallel.dp)
+    total_chips = eff_inst * topology.num_chips
     res_cap = float(state.resident_batch * idp)
     c_served = min(float(state.concurrency), res_cap)
     server_cap_rate = res_cap / max(_RATE_FLOOR_EPS, total_req_work_s)
-    mix_step_wait_s = state.mix_verify_serial_s if state.concurrency > 1 else 0.0
+    mix_step_wait_s = state.mix_verify_serial_s if state.local_batch > 1 else 0.0
     ttft_in_server_s = max(
         state.sf_ttft_c.serial_estimate_s * pp_factor
         + state.pcie_read_s
@@ -2728,11 +2810,11 @@ def _compute_mixed_service_metrics(
     )
     est_ttft_ms = (ttft_in_server_s + queue_wait_s) * UNIT_MILLIS_PER_SECOND
     interactivity = UNIT_MILLIS_PER_SECOND / max(1e-6, est_tpot_ms)
-    out_tput = rate_req_s * float(eval_context.scenario.osl) / float(topology.num_chips)
+    out_tput = rate_req_s * float(eval_context.scenario.osl) / float(total_chips)
     tot_tput = (
         rate_req_s
         * float(eval_context.scenario.isl + eval_context.scenario.osl)
-        / float(topology.num_chips)
+        / float(total_chips)
     )
     return _MixedServiceMetrics(
         est_ttft_ms=est_ttft_ms,
@@ -2786,12 +2868,16 @@ def _evaluate_mixed_point(
     eval_context: _SolveContext,
     topology: SliceTopology,
     parallel: Parallel,
-    concurrency: int,
+    conc_and_inst: tuple[int, int],
     bounds: _MixedPointBounds,
 ) -> ParetoPoint | None:
-    """Evaluate one concurrency target for a single-pool mixed serving configuration."""
+    """Evaluate one (concurrency, instances) mixed serving configuration."""
     if bounds.b_hbm_max < 1:
         return None
+    concurrency, raw_instances = conc_and_inst
+    eff_instances = max(1, raw_instances)
+    idp = eff_instances * max(1, parallel.dp)
+    total_chips = eff_instances * topology.num_chips
     dec_steps_per_req = _decode_steps_per_req(
         eval_context.scenario.osl, eval_context.effective_accept_len
     )
@@ -2799,14 +2885,14 @@ def _evaluate_mixed_point(
         eval_context.scenario.kv_offload_gb, topology.num_cores
     )
     local_batch = _solve_mixed_think_batch(
-        eval_context, topology, parallel, concurrency, bounds.sf_ttft
+        eval_context, topology, parallel, (concurrency, idp), bounds.sf_ttft
     )
     b_start = min(local_batch, bounds.b_hbm_max)
     clamped = _clamp_resident_batch(eval_context, parallel, b_start)
     if clamped is None:
         return None
     resident_batch, hbm_bd = clamped
-    working_set_batch = max(1, math.ceil(concurrency / max(1, parallel.dp)))
+    working_set_batch = max(1, math.ceil(concurrency / idp))
     cap_tok, eff_hit_rate = kv_capacity_and_hit_rate(
         eval_context.geometry,
         eval_context.dtypes,
@@ -2864,6 +2950,7 @@ def _evaluate_mixed_point(
             decode_serial_s=decode_serial_s,
             mix_verify_serial_s=mix_verify_serial_s,
             mix_serial_s=mix_serial_s,
+            instances=eff_instances,
         ),
     )
     est_ttft_ms = metrics.est_ttft_ms
@@ -2881,7 +2968,9 @@ def _evaluate_mixed_point(
         envelope_tpot_val,
         bound_ttft_val,
         envelope_ttft_val,
-    ) = _compute_mixed_bounds(eval_context, topology, parallel, concurrency, bounds)
+    ) = _compute_mixed_bounds(
+        eval_context, topology, parallel, (concurrency, eff_instances), bounds
+    )
     use_env = eval_context.activation_model.prunes_on_envelope
     verdict = _resolve_slo_verdict(
         eval_context.scenario,
@@ -2899,7 +2988,7 @@ def _evaluate_mixed_point(
     pool = _build_pool_mesh_plan(
         _PoolPlanInput(
             role="mixed",
-            instances=1,
+            instances=eff_instances,
             topology=topology,
             parallel=parallel,
             hbm_bd=hbm_bd,
@@ -2914,7 +3003,7 @@ def _evaluate_mixed_point(
     return ParetoPoint(
         mode="mixed",
         concurrency=concurrency,
-        total_chips=topology.num_chips,
+        total_chips=total_chips,
         prefill_pool=None,
         decode_pool=pool,
         est_ttft_ms=est_ttft_ms,
@@ -2989,11 +3078,15 @@ def _evaluate_mixed_candidates(
             and topology.name != eval_context.decode_topology
         ):
             continue
+        max_m = _mixed_max_instances(eval_context, topology)
         for base_parallel in _candidate_decode_parallels(
             eval_context.geometry, topology
         ):
-            if eval_context.mode in ("auto", "mixed"):
-                eval_context.enumerated += len(eval_context.scenario.concurrencies)
+            if eval_context.mode in ("auto", "mixed") and max_m >= 1:
+                eval_context.enumerated += sum(
+                    len(_mixed_instance_counts(max_m, concurrency))
+                    for concurrency in eval_context.scenario.concurrencies
+                )
             fitting_modes: list[tuple[Parallel, _MixedPointBounds]] = []
             for parallel in _candidate_residual_parallels(
                 eval_context.geometry, base_parallel
@@ -3015,7 +3108,11 @@ def _evaluate_mixed_candidates(
                         * UNIT_MILLIS_PER_SECOND
                         / eval_context.effective_accept_len,
                     )
-                if eval_context.mode not in ("auto", "mixed") or b_hbm_max < 1:
+                if (
+                    eval_context.mode not in ("auto", "mixed")
+                    or max_m < 1
+                    or b_hbm_max < 1
+                ):
                     continue
                 prefill_step_floor = _prefill_step_floor(
                     eval_context,
@@ -3047,32 +3144,37 @@ def _evaluate_mixed_candidates(
                 continue
             use_env = eval_context.activation_model.prunes_on_envelope
             for concurrency in eval_context.scenario.concurrencies:
-                mode_points: list[ParetoPoint] = []
-                for parallel, bounds in fitting_modes:
-                    point = _evaluate_mixed_point(
-                        eval_context, topology, parallel, concurrency, bounds
-                    )
-                    if point is not None:
-                        mode_points.append(point)
-                if not mode_points:
-                    continue
-                best_point = mode_points[0]
-                for point in mode_points[1:]:
-                    if _is_strictly_better_point(
-                        point, best_point, eval_context.sort_by
-                    ):
-                        best_point = point
-                merged_point = best_point
-                for other_point in mode_points:
-                    if other_point is not best_point:
-                        merged_point = _merge_collapsed_point_bounds(
-                            merged_point,
-                            other_point,
-                            eval_context.scenario,
-                            use_envelope=use_env,
+                for instances in _mixed_instance_counts(max_m, concurrency):
+                    mode_points: list[ParetoPoint] = []
+                    for parallel, bounds in fitting_modes:
+                        point = _evaluate_mixed_point(
+                            eval_context,
+                            topology,
+                            parallel,
+                            (concurrency, instances),
+                            bounds,
                         )
-                eval_context.hbm_fit += 1
-                candidates.append(merged_point)
+                        if point is not None:
+                            mode_points.append(point)
+                    if not mode_points:
+                        continue
+                    best_point = mode_points[0]
+                    for point in mode_points[1:]:
+                        if _is_strictly_better_point(
+                            point, best_point, eval_context.sort_by
+                        ):
+                            best_point = point
+                    merged_point = best_point
+                    for other_point in mode_points:
+                        if other_point is not best_point:
+                            merged_point = _merge_collapsed_point_bounds(
+                                merged_point,
+                                other_point,
+                                eval_context.scenario,
+                                use_envelope=use_env,
+                            )
+                    eval_context.hbm_fit += 1
+                    candidates.append(merged_point)
     return candidates, min_c1_tpot_ms, min_req_ttft_ms
 
 
@@ -4593,7 +4695,10 @@ def solve_serving_plan(
         if opts.max_chips is not None
         else ("pins" if eff_max_chips is not None else "max_instances")
     )
-    return ServingPlan(
+    pruned_sweep = prune_sweep_candidates(
+        geometry, dtypes, chip, scenario, ordered_candidates
+    )
+    base_plan = ServingPlan(
         model_layers=geometry.num_layers,
         chip=chip.name,
         scenario=scenario,
@@ -4623,6 +4728,20 @@ def solve_serving_plan(
             for point in all_candidates
             if point.slo_verdict == SLO_VERDICT_RULED_OUT
         ),
+        sweep_candidates=pruned_sweep,
+    )
+    sweep_topos = (
+        eff_opts.topologies
+        if eff_opts.topologies is not None
+        else topologies_for_chip(chip)
+    )
+    win_range, cross_rate = sweep_prefix_hit_crossovers(
+        geometry, dtypes, chip, base_plan, topologies=sweep_topos
+    )
+    return replace(
+        base_plan,
+        winner_prefix_hit_range=win_range,
+        prefix_hit_crossover_rate=cross_rate,
     )
 
 
@@ -4751,14 +4870,153 @@ def _min_matching_chips(
     return min(chips) if chips else None
 
 
+def _resolve_rejection_budget_chips(
+    options: SolveOptions,
+    topologies: Sequence[SliceTopology],
+) -> int | None:
+    """Resolve effective chip budget for rejection checks from pins or max_chips."""
+    if options.max_chips is not None:
+        return options.max_chips
+    if (
+        options.pd_ratio is None
+        or options.prefill_topology is None
+        or options.decode_topology is None
+    ):
+        return None
+    topo_map = {topology.name: topology for topology in topologies}
+    if (
+        options.prefill_topology not in topo_map
+        or options.decode_topology not in topo_map
+    ):
+        return None
+    prefill_instances, decode_instances = options.pd_ratio
+    return (
+        prefill_instances * topo_map[options.prefill_topology].num_chips
+        + decode_instances * topo_map[options.decode_topology].num_chips
+    )
+
+
+def _explain_mixed_instance_budget(
+    layout: Mapping[str, Mapping[str, int]],
+    decode_topologies: Sequence[SliceTopology],
+    options: SolveOptions,
+    *,
+    effective_max_chips: int | None,
+    concurrencies: Sequence[int] | None = None,
+) -> str | None:
+    """Return budget rejection reason when explicit Nx mixed instances exceed limits."""
+    if "prefill" in layout or options.mode == "disagg":
+        return None
+    decode_axes = layout["decode"]
+    instances = decode_axes.get("instances")
+    if instances is None or instances <= 1:
+        return None
+    if concurrencies and instances > max(concurrencies):
+        return (
+            f"requested {instances}x mixed instances exceeds max concurrency "
+            f"{max(concurrencies)}"
+        )
+    if effective_max_chips is None:
+        return (
+            f"requested {instances}x mixed instances requires max_chips to exceed "
+            "1 instance"
+        )
+    max_cap = (
+        options.max_instances
+        if options.max_instances is not None
+        else DEFAULT_MAX_INSTANCES
+    )
+    if instances > max_cap:
+        return f"requested {instances}x instances exceeds max_instances={max_cap}"
+    needed_cores = (
+        decode_axes.get("tp", 1)
+        * decode_axes.get("dp", 1)
+        * decode_axes.get("pp", 1)
+        * decode_axes.get("pcp", 1)
+    )
+    matching_topos = [t for t in decode_topologies if t.num_cores == needed_cores]
+    if matching_topos and all(
+        instances * t.num_chips > effective_max_chips for t in matching_topos
+    ):
+        return f"{instances}x slice footprint exceeds max_chips={effective_max_chips}"
+    return None
+
+
+def _explain_disagg_instance_budget(
+    layout: Mapping[str, Mapping[str, int]],
+    min_prefill_chips: int | None,
+    min_decode_chips: int | None,
+    options: SolveOptions,
+    *,
+    effective_max_chips: int | None,
+) -> str | None:
+    """Return budget or pin mismatch reason for disaggregated instance counts."""
+    req_prefill_inst = layout["prefill"].get("instances")
+    req_decode_inst = layout["decode"].get("instances")
+    if options.pd_ratio is not None:
+        pin_p, pin_d = options.pd_ratio
+        if (req_prefill_inst is not None and req_prefill_inst != pin_p) or (
+            req_decode_inst is not None and req_decode_inst != pin_d
+        ):
+            return (
+                f"requested {req_prefill_inst or '?'}P:{req_decode_inst or '?'}D "
+                f"conflicts with --pd {pin_p}:{pin_d}"
+            )
+    max_cap = (
+        options.max_instances
+        if options.max_instances is not None
+        else DEFAULT_MAX_INSTANCES
+    )
+    if req_prefill_inst is not None and req_prefill_inst > max_cap:
+        return (
+            f"requested {req_prefill_inst}x prefill instances exceeds "
+            f"max_instances={max_cap}"
+        )
+    if req_decode_inst is not None and req_decode_inst > max_cap:
+        return (
+            f"requested {req_decode_inst}x decode instances exceeds "
+            f"max_instances={max_cap}"
+        )
+    if (
+        effective_max_chips is not None
+        and min_decode_chips is not None
+        and min_prefill_chips is not None
+    ):
+        if options.pd_ratio is not None:
+            prefill_inst, decode_inst = options.pd_ratio
+            needed_chips = (
+                prefill_inst * min_prefill_chips + decode_inst * min_decode_chips
+            )
+            if needed_chips > effective_max_chips:
+                return (
+                    f"disaggregated layout with --pd {prefill_inst}:{decode_inst} "
+                    f"needs at least {needed_chips} chips, exceeding "
+                    f"max_chips={effective_max_chips}"
+                )
+        else:
+            p_cnt = req_prefill_inst if req_prefill_inst is not None else 1
+            d_cnt = req_decode_inst if req_decode_inst is not None else 1
+            needed_chips = p_cnt * min_prefill_chips + d_cnt * min_decode_chips
+            if needed_chips > effective_max_chips:
+                return (
+                    "disaggregated layout needs at least "
+                    f"{needed_chips} chips ({p_cnt}P+{d_cnt}D), "
+                    f"exceeding max_chips={effective_max_chips}"
+                )
+    return None
+
+
 def explain_layout_rejection(
     geometry: ModelGeometry,
     layout: Mapping[str, Mapping[str, int]],
     topologies: Sequence[SliceTopology],
     opts: SolveOptions | None = None,
+    *,
+    concurrencies: Sequence[int] | None = None,
 ) -> str:
     """Name the first physical rule that leaves a reference layout absent."""
     options = opts or SolveOptions()
+    effective_max_chips = _resolve_rejection_budget_chips(options, topologies)
     mode_reason = _explain_mode_rejection(layout, options.mode)
     if mode_reason is not None:
         return mode_reason
@@ -4784,6 +5042,15 @@ def explain_layout_rejection(
     if decode_reason is not None:
         return decode_reason
     min_decode_chips = _min_matching_chips(layout["decode"], decode_topologies)
+    instance_reason = _explain_mixed_instance_budget(
+        layout,
+        decode_topologies,
+        options,
+        effective_max_chips=effective_max_chips,
+        concurrencies=concurrencies,
+    )
+    if instance_reason is not None:
+        return instance_reason
     if is_disagg:
         prefill_reason = _explain_pool_rejection(
             geometry,
@@ -4811,41 +5078,28 @@ def explain_layout_rejection(
                     f"max_instances={options.max_instances}"
                 )
         min_prefill_chips = _min_matching_chips(layout["prefill"], prefill_topologies)
-        if (
-            options.max_chips is not None
-            and min_decode_chips is not None
-            and min_prefill_chips is not None
-        ):
-            if options.pd_ratio is not None:
-                prefill_inst, decode_inst = options.pd_ratio
-                needed_chips = (
-                    prefill_inst * min_prefill_chips + decode_inst * min_decode_chips
-                )
-                if needed_chips > options.max_chips:
-                    return (
-                        f"disaggregated layout with --pd {prefill_inst}:{decode_inst} "
-                        f"needs at least {needed_chips} chips, exceeding "
-                        f"max_chips={options.max_chips}"
-                    )
-            elif min_prefill_chips + min_decode_chips > options.max_chips:
-                return (
-                    "disaggregated layout needs at least "
-                    f"{min_prefill_chips + min_decode_chips} chips (1P+1D), "
-                    f"exceeding max_chips={options.max_chips}"
-                )
+        disagg_budget_reason = _explain_disagg_instance_budget(
+            layout,
+            min_prefill_chips,
+            min_decode_chips,
+            options,
+            effective_max_chips=effective_max_chips,
+        )
+        if disagg_budget_reason is not None:
+            return disagg_budget_reason
         if not options.include_pairs and options.pd_ratio is None:
             return (
                 "disaggregated pair candidates are off by default; "
                 "pass --pairs or --pd to evaluate pairs"
             )
     elif (
-        options.max_chips is not None
+        effective_max_chips is not None
         and min_decode_chips is not None
-        and min_decode_chips > options.max_chips
+        and min_decode_chips > effective_max_chips
     ):
         return (
             f"decode layout needs at least {min_decode_chips} chips, "
-            f"exceeding max_chips={options.max_chips}"
+            f"exceeding max_chips={effective_max_chips}"
         )
     return (
         "enumerated, but no searched point with this layout passed the "

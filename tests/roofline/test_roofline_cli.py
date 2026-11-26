@@ -834,3 +834,124 @@ def test_cli_moe_activation_and_ruled_out_reference_text(
     assert rc_ruled == 0
     text_out = capsys.readouterr().out
     assert "enumerated, ruled out by SLO" in text_out
+
+
+def test_cli_solve_mixed_instances_text_and_reference_top_k(
+    locked_config_path: Callable[[str], Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify mixed text prints decode instances and reference honors --top-k."""
+    qwen35_path = locked_config_path("qwen3_5_397b_fp8.json")
+    base_argv = [
+        "solve",
+        "--config",
+        str(qwen35_path),
+        "--isl",
+        "4096",
+        "--osl",
+        "512",
+        "--prefix-hit-rate",
+        "0.5",
+        "--accept-len",
+        "1.0",
+        "--think-time-s",
+        "0.0",
+        "--concurrency",
+        "32",
+        "--mode",
+        "mixed",
+        "--decode-topology",
+        "2x2x1",
+        "--max-chips",
+        "8",
+    ]
+    assert cli.main([*base_argv, "--top-k", "20"]) == 0
+    table_text = capsys.readouterr().out
+    assert "2x2x2x1(" in table_text
+
+    assert cli.main([*base_argv, "--top-k", "10", "--json"]) == 0
+    full_payload = json.loads(capsys.readouterr().out)
+    top_candidates = full_payload["candidates"]
+    assert len(top_candidates) >= 2
+    first_pool = top_candidates[0]["decode_pool"]
+    first_sig = (
+        first_pool["instances"],
+        first_pool["tp"],
+        first_pool["dp"],
+        first_pool["ep"],
+        first_pool["pp"],
+        first_pool["pcp"],
+    )
+    second_pool = next(
+        cand["decode_pool"]
+        for cand in top_candidates[1:]
+        if (
+            cand["decode_pool"]["instances"],
+            cand["decode_pool"]["tp"],
+            cand["decode_pool"]["dp"],
+            cand["decode_pool"]["ep"],
+            cand["decode_pool"]["pp"],
+            cand["decode_pool"]["pcp"],
+        )
+        != first_sig
+    )
+    prefix = f"{second_pool['instances']}x " if second_pool["instances"] > 1 else ""
+    parts = [
+        f"{name}{second_pool[key]}"
+        for name, key in (
+            ("TP", "tp"),
+            ("DP", "dp"),
+            ("EP", "ep"),
+            ("PP", "pp"),
+            ("PCP", "pcp"),
+        )
+        if second_pool[key] > 1
+    ]
+    ref_spec = f"{prefix}{' x '.join(parts)}"
+
+    assert (
+        cli.main([*base_argv, "--top-k", "1", "--reference-layout", ref_spec, "--json"])
+        == 0
+    )
+    narrow_payload = json.loads(capsys.readouterr().out)
+    assert narrow_payload["reference"]["found"] is True
+    assert narrow_payload["reference"]["family_in_ordered_top_k"] is False
+
+    assert (
+        cli.main(
+            [*base_argv, "--top-k", "10", "--reference-layout", ref_spec, "--json"]
+        )
+        == 0
+    )
+    wide_payload = json.loads(capsys.readouterr().out)
+    assert wide_payload["reference"]["found"] is True
+    assert wide_payload["reference"]["family_in_ordered_top_k"] is True
+
+    conc1_argv = [
+        "solve",
+        "--config",
+        str(qwen35_path),
+        "--isl",
+        "4096",
+        "--osl",
+        "512",
+        "--prefix-hit-rate",
+        "0.5",
+        "--accept-len",
+        "1.0",
+        "--think-time-s",
+        "0.0",
+        "--concurrency",
+        "1",
+        "--mode",
+        "mixed",
+        "--max-chips",
+        "8",
+        "--reference-layout",
+        "2x TP8 x EP8",
+        "--json",
+    ]
+    assert cli.main(conc1_argv) == 0
+    conc1_payload = json.loads(capsys.readouterr().out)
+    assert conc1_payload["reference"]["found"] is False
+    assert "exceeds max concurrency 1" in conc1_payload["reference"]["rejected_by"]
