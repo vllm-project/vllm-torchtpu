@@ -78,8 +78,10 @@ def test_startup_rejects_topk_weights_float32_env(monkeypatch, vllm_config, valu
         TpuPlatform.check_and_update_config(vllm_config)
 
 
-@pytest.mark.parametrize("key", ["tpu_moe_silu_bf16", "tpu_moe_topk_weights_float32"])
-def test_startup_rejects_non_bool_moe_reference_parity(monkeypatch, vllm_config, key):
+@pytest.mark.parametrize(
+    "key", ["tpu_moe_silu_bf16", "tpu_moe_topk_weights_float32", "tpu_rope_in_graph"]
+)
+def test_startup_rejects_non_bool_additional_config(monkeypatch, vllm_config, key):
     monkeypatch.delenv(REMOVED, raising=False)
     monkeypatch.delenv("TPU_MOE_TOPK_WEIGHTS_FLOAT32", raising=False)
     vllm_config.additional_config = {key: "true"}

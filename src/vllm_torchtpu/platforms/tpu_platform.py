@@ -31,7 +31,7 @@ from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
-from vllm_torchtpu import envs, patch_registry
+from vllm_torchtpu import envs, patch_registry, rope_in_graph_flag
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
@@ -875,6 +875,8 @@ class TpuPlatform(Platform):
             )
         # Rejects non-bool MoE reference-parity values before any worker starts.
         get_moe_reference_parity(vllm_config)
+        # Likewise for a non-bool in-graph RoPE value.
+        rope_in_graph_flag.in_graph_enabled(vllm_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )

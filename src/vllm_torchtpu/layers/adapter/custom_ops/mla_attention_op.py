@@ -42,7 +42,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, rope_in_graph
 from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
@@ -1365,7 +1365,15 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             super().process_weights_after_loading(act_dtype)
         if self.rotary_emb is not None and hasattr(self.rotary_emb, "cos_sin_cache"):
             device = torch.device("tpu")
-            self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache.to(device)
+            if isinstance(self.rotary_emb.cos_sin_cache, torch.Tensor):
+                self.rotary_emb.cos_sin_cache = self.rotary_emb.cos_sin_cache.to(device)
+            elif isinstance(
+                self.rotary_emb.cos_sin_cache, rope_in_graph.InGraphCosSinCache
+            ):
+                rope_in_graph.apply_in_graph_cache_transform(
+                    self.rotary_emb,
+                    lambda t: torch.empty_like(t, device=device),
+                )
 
     def forward(
         self,
@@ -1512,7 +1520,9 @@ VllmMultiHeadLatentAttentionWrapper = VllmTPUMultiHeadLatentAttentionWrapper
 
 
 @DeepseekScalingRotaryEmbedding.register_oot
-class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
+class VllmDeepseekScalingRotaryEmbedding(
+    rope_in_graph.Tier1InGraphRopeMixin, DeepseekScalingRotaryEmbedding
+):
     """TPU-compatible DeepSeek Scaling RoPE implementation."""
 
     def forward_native(
@@ -1527,7 +1537,13 @@ class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         key_rot = key[..., : self.rotary_dim]
 
         pos = torch.add(positions, offsets) if offsets is not None else positions
-        cos_sin = self.cos_sin_cache.index_select(0, pos)
+        spec = self._in_graph_spec
+        if spec is not None:
+            cos_sin = rope_in_graph.eval_spec_cos_sin(
+                spec, pos, self.cos_sin_cache.dtype
+            )
+        else:
+            cos_sin = self.cos_sin_cache.index_select(0, pos)
         cos, sin = cos_sin.chunk(2, dim=-1)
         if self.is_neox_style:
             cos = torch.cat((cos, cos), dim=-1).unsqueeze(-2)
