@@ -265,6 +265,14 @@ class WriteBackPolicy:
     # (its contents were written steps ago), and drained before the step's
     # forward can overwrite it. Turns the host into a victim cache of HBM.
     late_store: bool = False
+    # Per-block only: hold every keyed chunk a finished request references,
+    # not just those from `next_stored_chunk_idx`. vLLM's CHUNK_LEVEL policy
+    # moves that index past all cached chunks whenever the request loaded
+    # anything from the host, so the chunks it hit in HBM (whose previous
+    # holder let go of them at the hit) had no holder left and were never
+    # stored before HBM evicted them. Resident chunks are only refreshed when
+    # offered (prepare_store dedup), which is the victim-cache behaviour.
+    hold_all_chunks: bool = False
 
     @classmethod
     def from_extra_config(cls, extra_config: Mapping) -> WriteBackPolicy | None:
@@ -289,6 +297,10 @@ class WriteBackPolicy:
         if written.granularity not in ("request", "block"):
             raise ValueError(
                 f"store_policy granularity must be 'request' or 'block': {policy!r}"
+            )
+        if written.hold_all_chunks and written.granularity != "block":
+            raise ValueError(
+                f"store_policy hold_all_chunks needs granularity 'block': {policy!r}"
             )
         if written.late_store and written.granularity != "block":
             raise ValueError(
@@ -532,13 +544,17 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         prompt_only = bool(tpu_envs.VLLM_TPU_EVICT_DECODE_FIRST) and getattr(
             self.config, "offload_prompt_only", False
         )
+        policy = self._write_back
+        hold_all = policy is not None and policy.per_block and policy.hold_all_chunks
         blocks: set[int] = set()
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
         ):
             # Only blocks of keyed (full) chunks can be stored; the partial
             # tail block has no hash, so the pool reuses it first.
-            start = group_state.next_stored_chunk_idx * blocks_per_chunk
+            start = (
+                0 if hold_all else group_state.next_stored_chunk_idx * blocks_per_chunk
+            )
             num_chunks = len(group_state.offload_keys)
             if prompt_only:
                 num_chunks = min(
@@ -832,6 +848,8 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         allowed chunks of the per-block holders, whose stored-chunk index is
         restored afterwards (later chunks of the same holder still store)."""
         allowed = getattr(self, "_wb_allowed", None) or {}
+        policy = self._write_back
+        hold_all = policy is not None and policy.per_block and policy.hold_all_chunks
         by_ctx: dict[int, set] = {}
         saved: list[tuple[Any, int]] = []
         for req_id, keys in allowed.items():
@@ -842,6 +860,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             saved.extend(
                 (gs, gs.next_stored_chunk_idx) for gs in req_status.group_states
             )
+            if hold_all:
+                # The base offers chunks from next_stored_chunk_idx only; the
+                # allowed set alone decides what this holder stores.
+                for gs in req_status.group_states:
+                    gs.next_stored_chunk_idx = 0
         manager = self.manager
         prepare_store = manager.prepare_store
 
