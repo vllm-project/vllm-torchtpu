@@ -23,8 +23,6 @@ import subprocess
 
 import pytest
 
-pytestmark = pytest.mark.cpu_test
-
 _BENCH_DIR = (
     pathlib.Path(__file__).resolve().parents[2] / "scripts" / "vllm" / "benchmarking"
 )

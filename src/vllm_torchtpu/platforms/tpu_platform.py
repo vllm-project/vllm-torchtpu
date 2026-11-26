@@ -1249,6 +1249,7 @@ class TpuPlatform(Platform):
         )
 
         check_attention_backend_config(vllm_config)
+        _configure_glm_dsa_dcp_defaults(vllm_config)
         _validate_prefill_first_scheduler_config(vllm_config)
 
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
@@ -1548,6 +1549,60 @@ def _validate_prefill_first_scheduler_config(vllm_config: VllmConfig) -> None:
             "PrefillFirstScheduler requires long_prefill_token_threshold == 0, "
             f"got {threshold}."
         )
+
+
+def apply_glm_dsa_sc_all_gather_floor(vllm_config: object) -> None:
+    """Lower the default SparseCore all-gather offload floor to 6 MiB on GLM-DSA DCP."""
+    from vllm_torchtpu import env_override
+    from vllm_torchtpu.models.vllm.glm_dsa_dispatch import (
+        GLM_DSA_SC_ALL_GATHER_OFFLOAD_MIN_BYTES,
+        is_glm_dsa_model,
+    )
+
+    par_cfg = getattr(vllm_config, "parallel_config", None)
+    dcp = getattr(par_cfg, "decode_context_parallel_size", 1)
+    model_cfg = getattr(vllm_config, "model_config", None)
+    if not isinstance(dcp, int) or dcp <= 1 or not is_glm_dsa_model(model_cfg):
+        return
+    sc_ag_flag = "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"
+    default_bytes = env_override._sc_offload_bytes  # noqa: SLF001 -- rewrite auto-injected default
+    if (
+        envs.SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES is None
+        and not env_override._user_has_flag(sc_ag_flag)  # noqa: SLF001 -- preserve user LIBTPU_INIT_ARGS
+        and default_bytes is not None
+        and default_bytes > GLM_DSA_SC_ALL_GATHER_OFFLOAD_MIN_BYTES
+    ):
+        default_tok = f"{sc_ag_flag}={default_bytes}"
+        target_tok = f"{sc_ag_flag}={GLM_DSA_SC_ALL_GATHER_OFFLOAD_MIN_BYTES}"
+        tokens = env_override.experimental_libtpu_init_args()
+        if default_tok in tokens:
+            tokens = [target_tok if tok == default_tok else tok for tok in tokens]
+        elif not any(
+            tok == sc_ag_flag or tok.startswith(f"{sc_ag_flag}=") for tok in tokens
+        ):
+            tokens.append(target_tok)
+        os.environ["LIBTPU_INIT_ARGS"] = " ".join(tokens)
+
+
+def _configure_glm_dsa_dcp_defaults(vllm_config: VllmConfig) -> None:
+    from vllm_torchtpu.models.vllm.glm_dsa_dispatch import is_glm_dsa_model
+
+    par_cfg = getattr(vllm_config, "parallel_config", None)
+    dcp = getattr(par_cfg, "decode_context_parallel_size", 1)
+    if (
+        not isinstance(dcp, int)
+        or dcp <= 1
+        or not is_glm_dsa_model(vllm_config.model_config)
+    ):
+        return
+    if par_cfg is not None and par_cfg.cp_kv_cache_interleave_size == 1:
+        par_cfg.cp_kv_cache_interleave_size = 4
+        par_cfg.dcp_kv_cache_interleave_size = 4
+    cache_cfg = vllm_config.cache_config
+    if getattr(cache_cfg, "user_specified_block_size", False) is False:
+        cache_cfg.block_size = 256
+        cache_cfg.user_specified_block_size = True
+    apply_glm_dsa_sc_all_gather_floor(vllm_config)
 
 
 def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:

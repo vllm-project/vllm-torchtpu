@@ -55,6 +55,7 @@ from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.utils import TPU_PHYSICAL_LOCAL_RANK_BY_RANK_KEY
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
 
@@ -394,8 +395,35 @@ class TPUWorker(WorkerBase):
                 local_world = os.environ.get("LOCAL_WORLD_SIZE") or pc.world_size
                 local_rank_for_init = int(self.local_rank)
                 debug_local_rank_offset = envs.DEBUG_TPU_LOCAL_RANK_OFFSET
-                tpu_local_rank_env = local_rank_for_init + debug_local_rank_offset
+                add_cfg = getattr(self.vllm_config, "additional_config", None)
+                phys_map = (
+                    add_cfg.get(TPU_PHYSICAL_LOCAL_RANK_BY_RANK_KEY)
+                    if isinstance(add_cfg, dict)
+                    else None
+                )
+                raw_phys = (
+                    phys_map.get(self.rank, phys_map.get(str(self.rank)))
+                    if isinstance(phys_map, dict)
+                    else None
+                )
+                physical_local_rank = int(raw_phys) if raw_phys is not None else None
+                base_local_rank = (
+                    physical_local_rank
+                    if physical_local_rank is not None
+                    else local_rank_for_init
+                )
+                tpu_local_rank_env = base_local_rank + debug_local_rank_offset
                 tpu_local_world = int(local_world)
+                if physical_local_rank is not None:
+                    logger.info(
+                        "Ascending TPU device binding | rank=%d "
+                        "engine_local_rank=%d -> physical_local_rank=%d "
+                        "tpu_local_world=%d",
+                        self.rank,
+                        local_rank_for_init,
+                        tpu_local_rank_env,
+                        tpu_local_world,
+                    )
                 if debug_local_rank_offset:
                     tpu_local_world = max(
                         tpu_local_world, debug_local_rank_offset + pc.world_size
@@ -428,12 +456,20 @@ class TPUWorker(WorkerBase):
                     binding.local_world_size,
                 )
 
-        if not self.devices:
-            self.devices = [torch.device("tpu")]
-
         from vllm.platforms import current_platform
 
-        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+        from vllm_torchtpu.platforms.tpu_platform import (
+            TpuPlatform,
+            apply_glm_dsa_sc_all_gather_floor,
+        )
+
+        # RayWorkerProc imports env_override (setting the 64 MiB default) before
+        # initialize_worker runs, and applies driver_env_vars via setdefault.
+        # Rewrite the worker's LIBTPU_INIT_ARGS here prior to PjRt creation.
+        apply_glm_dsa_sc_all_gather_floor(self.vllm_config)
+
+        if not self.devices:
+            self.devices = [torch.device("tpu")]
 
         tpu_platform = cast(TpuPlatform, current_platform)
         dist_backend = tpu_platform.get_worker_distributed_backend(dist_world_size)

@@ -22,8 +22,6 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm_torchtpu.core import pp_lazy_step
 from vllm_torchtpu.distributed import pp_push
 
-pytestmark = pytest.mark.cpu_test
-
 
 @pytest.fixture(autouse=True)
 def fake_rings(monkeypatch):

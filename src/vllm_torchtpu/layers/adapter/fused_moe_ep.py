@@ -48,7 +48,6 @@ import jax
 import jax.numpy as jnp
 import torch
 from jax.sharding import PartitionSpec
-from torch_tpu._internal.pallas import jax_op
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import (
@@ -68,6 +67,12 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
+
+jax_op: Any
+try:
+    from torch_tpu._internal.pallas import jax_op
+except ModuleNotFoundError:
+    jax_op = None
 
 logger = init_logger(__name__)
 
@@ -181,6 +186,7 @@ def _build_op(
     *,
     token_replica_groups=None,
     sorted_gather=None,
+    ep_tp_size: int = 1,
 ):
     """The op for this closure, built once per distinct closure and reused.
 
@@ -203,6 +209,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         None if sorted_gather is None else sorted_gather[1],
+        ep_tp_size,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -213,9 +220,11 @@ def _build_op(
     # dispatch entry, and the second closure would then serve the first.
     name = FUSED_MOE_EP_OP_NAME if not _OPS else f"{FUSED_MOE_EP_OP_NAME}_{len(_OPS)}"
 
-    routing_kw = dict(
+    routing_kw: dict[str, Any] = dict(
         scoring_fn=scoring_fn, routed_scaling_factor=routed_scaling_factor
     )
+    if ep_tp_size != 1:
+        routing_kw["ep_tp_size"] = ep_tp_size
 
     # Any: the layer, route or compute result depending on bias_kw's stage;
     # each wrapper below declares the one it returns.
@@ -330,6 +339,7 @@ def _build_op(
         fn = moe_with_hash_ids
     else:
         fn = moe
+    assert jax_op is not None
     op = jax_op(
         name,
         fn,
@@ -360,6 +370,7 @@ def _build_op(
             has_hash_ids,
             token_replica_groups,
             sorted_gather,
+            ep_tp_size=ep_tp_size,
         )
     _OPS[key] = op
     return op
@@ -400,6 +411,8 @@ def _build_split_ops(
     has_hash_ids,
     token_replica_groups,
     sorted_gather,
+    *,
+    ep_tp_size: int = 1,
 ):
     """`_SortedGatherOp` for the closure `call` was built for."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat
@@ -408,7 +421,7 @@ def _build_split_ops(
     from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import replica_wire_rows
 
     group, positions = sorted_gather
-    ep = mesh.shape[EP_AXIS_NAME]
+    ep = mesh.shape[EP_AXIS_NAME] // ep_tp_size
     quantized = weight_form(WeightFormat(weight_format)).quantized_activations
 
     def extra_kw(extra):
@@ -504,7 +517,8 @@ def _build_split_ops(
         )
 
     has_extra = has_score_bias or has_hash_ids
-    route_op = jax_op(
+    sharded_jax_op: Any = jax_op
+    route_op = sharded_jax_op(
         f"{name}_route",
         route_extra if has_extra else route,
         mesh=mesh,
@@ -513,7 +527,7 @@ def _build_split_ops(
     )
     # q_g is the whole gather on every rank: one block of mesh-wide rows per
     # shard, so it is sharded on axis 0 like the rest.
-    compute_op = jax_op(
+    compute_op = sharded_jax_op(
         f"{name}_compute",
         compute_extra if has_extra else compute,
         mesh=mesh,
@@ -796,14 +810,8 @@ def prebuild_fused_moe_ep(
     if weight_format == "fp4" and not envs.MOE_FUSED_EP_ENABLE_W4A8:
         return None
 
-    # The experts have to actually be expert-parallel. vLLM builds an EP group
-    # for every MoE model whether or not `--enable-expert-parallel` was passed
-    # (`initialize_model_parallel` gates only on `model_config.is_moe`), so the
-    # mesh alone does not answer this. With the experts replicated, each rank
-    # holds the WHOLE expert set, and the kernel would read its shard as one
-    # 1/ep block of a global set ep times too large -- a mis-addressed expert
-    # lookup, or a late shape error, never a clear refusal.
-    if not layer.moe_config.moe_parallel_config.use_ep:
+    par = layer.moe_config.moe_parallel_config
+    if not par.use_ep:
         logger.info_once(
             "Fused EP MoE not engaged: the experts are replicated rather than "
             "expert-parallel, so each shard would hold the whole expert set."
@@ -826,9 +834,17 @@ def prebuild_fused_moe_ep(
             "the grouped-matmul path serves every step."
         )
         return None
-    ep = mesh.shape[EP_AXIS_NAME]
-    # Collective over the world, so before any refusal that could differ by
-    # rank; cached after the first layer.
+    mesh_size = mesh.shape[EP_AXIS_NAME]
+    ep_tp = int(getattr(par, "tp_size", 1))
+    if ep_tp < 1 or mesh_size % ep_tp:
+        logger.warning_once(
+            "Fused EP MoE not engaged: EP mesh size %d is not divisible by "
+            "MoE tp_size=%d.",
+            mesh_size,
+            ep_tp,
+        )
+        return None
+    ep = mesh_size // ep_tp
     sorted_gather = (
         ep_sorted_gather_group() if envs.MOE_FUSED_EP_SORTED_GATHER else None
     )
@@ -855,7 +871,14 @@ def prebuild_fused_moe_ep(
     _RANK_BUFFER = torch.tensor(
         [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
     )
-    mesh_expert_order = _mesh_expert_order(ep)
+    mesh_expert_order = _mesh_expert_order(mesh_size)
+    if ep_tp > 1 and mesh_expert_order is not None:
+        logger.warning_once(
+            "Fused EP MoE not engaged: ep_tp_size=%d > 1 requires a rank-ordered "
+            "EP mesh.",
+            ep_tp,
+        )
+        return None
 
     if weights is None:
         if weight_format == "fp4":
@@ -872,18 +895,11 @@ def prebuild_fused_moe_ep(
                 layer.w13_weight_scale_inv,
                 layer.w2_weight_scale_inv,
             )
-    w1, w2, w1_scale, w2_scale = weights
+    w1 = weights[0]
     local_experts, hidden = w1.shape[0], w1.shape[1]
-    # Torch stores two FP4 output elements per byte; JAX sees the logical
-    # width after the bridge converts the native FP4 tensor.
-    inter = w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2
+    inter = (w1.shape[2] if weight_format == "fp4" else w1.shape[2] // 2) * ep_tp
 
-    # The threshold is applied here rather than per step: the op is shape
-    # agnostic, so the only place a token count is known outside the traced
-    # forward is the scheduler's cap. A deployment whose largest batch is below
-    # the threshold never builds the op at all; one above it uses the kernel
-    # for every step, decode included.
-    max_node_tokens = _max_node_tokens(ep, pcp)
+    max_node_tokens = _max_node_tokens(mesh_size, pcp)
     if max_node_tokens < envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS:
         logger.info_once(
             "Fused EP MoE not engaged: the largest node-wide batch is %d "
@@ -927,7 +943,7 @@ def prebuild_fused_moe_ep(
 
     sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
     token_replica_groups = ep_token_replica_groups(
-        is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
+        is_sequence_parallel=par.is_sequence_parallel
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
@@ -946,9 +962,10 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         sorted_gather=sorted_gather,
+        ep_tp_size=ep_tp,
     )
     logger.info_once(
-        "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
+        "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d ep_tp=%d "
         "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
         "token_replica_groups=%s",
@@ -956,6 +973,7 @@ def prebuild_fused_moe_ep(
         inter,
         local_experts,
         ep,
+        ep_tp,
         pcp,
         topk,
         _TILE_M,
@@ -980,6 +998,97 @@ def prebuild_fused_moe_ep(
             envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
         )
     return op
+
+
+def build_sequence_parallel_op(layer, topk: int, renormalize: bool, activation: str):
+    """Build the fused EP op over this rank's own rows for ``moe_prefill_sp``."""
+    global _RANK_BUFFER
+    par = layer.moe_config.moe_parallel_config
+    if not par.use_ep:
+        raise ValueError("the experts are not expert-parallel")
+    mesh = build_ep_mesh()
+    if mesh is None:
+        raise ValueError("there is no EP group")
+    mesh_size = mesh.shape[EP_AXIS_NAME]
+    ep_tp = int(getattr(par, "tp_size", 1))
+    if ep_tp < 1 or mesh_size % ep_tp:
+        raise ValueError(
+            f"EP mesh size {mesh_size} is not divisible by MoE tp_size={ep_tp}"
+        )
+    ep = mesh_size // ep_tp
+    needed_smem = _SMEM_OVERHEAD_BYTES + token_gather_smem_bytes(_TILE_M)
+    if needed_smem > _smem_capacity_bytes():
+        raise ValueError(
+            f"the routing working set needs {needed_smem} B of SMEM, the chip "
+            f"has {_smem_capacity_bytes()} B"
+        )
+    weights = (
+        layer.w13_weight,
+        layer.w2_weight,
+        layer.w13_weight_scale_inv,
+        layer.w2_weight_scale_inv,
+    )
+    if layer.global_num_experts != weights[0].shape[0] * ep:
+        raise ValueError(
+            f"{layer.global_num_experts} global experts do not split into "
+            f"equal blocks of {weights[0].shape[0]} over ep={ep}"
+        )
+    reason = fused_moe_ep_unsupported_reason(layer, weights, activation)
+    if reason is not None:
+        raise ValueError(reason)
+    mesh_expert_order = _mesh_expert_order(mesh_size)
+    if ep_tp > 1 and mesh_expert_order is not None:
+        raise ValueError("ep_tp_size > 1 requires a rank-ordered EP mesh")
+    if _RANK_BUFFER is None:
+        _RANK_BUFFER = torch.tensor(
+            [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
+        )
+    scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
+    return _build_op(
+        mesh,
+        topk,
+        renormalize,
+        activation,
+        mesh_expert_order,
+        True,
+        "fp8",
+        None,
+        scoring_fn,
+        has_score_bias,
+        routed_scale,
+        False,
+        token_replica_groups=ep_token_replica_groups(is_sequence_parallel=True),
+        ep_tp_size=ep_tp,
+    )
+
+
+def rank_operand() -> torch.Tensor:
+    """Return this rank's EP mesh index as an ``int32 [1, 1]`` operand."""
+    assert _RANK_BUFFER is not None, "build the fused EP op first"
+    return _RANK_BUFFER
+
+
+def run_sequence_parallel_op(
+    op,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    router_logits: torch.Tensor,
+    rank: torch.Tensor,
+    score_bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """Execute ``op`` from ``build_sequence_parallel_op`` on this rank's rows."""
+    scales = (
+        _squeeze_channel_scale_checked(w1_scale),
+        _squeeze_channel_scale_checked(w2_scale),
+    )
+    router_logits, score_bias, _ = _simulated_routing_operands(
+        router_logits, score_bias, None
+    )
+    extra = () if score_bias is None else (score_bias,)
+    return op(hidden_states, w1, w2, *scales, router_logits, rank, *extra)
 
 
 def fused_moe_ep_unsupported_reason(

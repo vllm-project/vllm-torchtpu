@@ -13,10 +13,11 @@
 # limitations under the License.
 
 import os
+import subprocess
 import threading
 import time
 import weakref
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 from typing import Any, cast
 
 import ray
@@ -43,8 +44,17 @@ from vllm_torchtpu.executors.kv_block_override import (
     adopt_worker_num_gpu_blocks_override,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.glm_dsa_dispatch import is_glm_dsa_model
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
+from vllm_torchtpu.runner.utils import TPU_PHYSICAL_LOCAL_RANK_BY_RANK_KEY
 from vllm_torchtpu.utils import get_dp_size
+from vllm_torchtpu.worker.tpu_device_order import (
+    AscendingDeviceOrder,
+    plan_ascending_device_order,
+    probe_host_tpu_device_ids,
+    reorder_bundles_by_host_order,
+    should_use_ascending_device_order,
+)
 from vllm_torchtpu.worker.tpu_rank_binding import slice_binding_env
 
 
@@ -192,6 +202,105 @@ class RayDistributedExecutorV2(RayExecutorV2):
         device_key = current_platform.ray_device_key
         return {"num_gpus": 0, "resources": {device_key: 1.0}}
 
+    def _discover_ascending_device_order(
+        self,
+        bundle_to_node_id: list[tuple[int, str, str]],
+        slice_world_size: int,
+    ) -> AscendingDeviceOrder | None:
+        device_key = current_platform.ray_device_key
+        probe_host_order, probe_chips_per_host = self._slice_host_layout(device_key)
+        pg_chips_by_ip = Counter(ip for _, _, ip in bundle_to_node_id)
+        if sum(pg_chips_by_ip.values()) != slice_world_size or any(
+            probe_chips_per_host.get(ip) != cnt for ip, cnt in pg_chips_by_ip.items()
+        ):
+            logger.info(
+                "RayDistributedExecutorV2 | Skipping ascending TPU device order "
+                "(placement group covers %s vs slice layout %s).",
+                dict(pg_chips_by_ip),
+                probe_chips_per_host,
+            )
+            return None
+
+        probe_hosts = [ip for ip in probe_host_order if ip in pg_chips_by_ip]
+        if not probe_hosts:
+            return None
+        max_chips = max(pg_chips_by_ip[ip] for ip in probe_hosts)
+        # Avoid reusing the main worker slicebuilder ports: TIME_WAIT sockets
+        # after os._exit could cause EADDRINUSE during worker bootstrap.
+        probe_sb_base = tpu_envs.TORCH_TPU_BASE_PORT + max_chips + 16
+        probe_sb_addresses = ",".join(
+            f"{ip}:{probe_sb_base + chip}"
+            for ip in probe_hosts
+            for chip in range(pg_chips_by_ip[ip])
+        )
+        probe_master_addr = probe_hosts[0]
+        probe_master_port = (
+            get_open_port()
+            if probe_master_addr == get_ip()
+            else probe_sb_base + max_chips + 8
+        )
+        probe_topology = get_tpu_multihost_topology(slice_world_size)
+        platform_any: Any = current_platform
+        probe_backend = platform_any.get_worker_distributed_backend(slice_world_size)
+        probe_xprof_id = str(time.time_ns())
+        probe_fn: Any = probe_host_tpu_device_ids
+
+        try:
+            probe_refs = []
+            offset = 0
+            for node_rank, ip in enumerate(probe_hosts):
+                local_count = pg_chips_by_ip[ip]
+                probe_task = ray.remote(
+                    num_cpus=0,
+                    num_gpus=0,
+                    resources={f"node:{ip}": 0.001},
+                )(probe_fn)
+                probe_refs.append(
+                    probe_task.remote(
+                        rank_offset=offset,
+                        local_world_size=local_count,
+                        world_size=slice_world_size,
+                        num_nodes=len(probe_hosts),
+                        node_rank=node_rank,
+                        master_addr=probe_master_addr,
+                        master_port=probe_master_port,
+                        topology=probe_topology,
+                        slicebuilder_addresses=probe_sb_addresses,
+                        backend=probe_backend,
+                        xprof_session_id=probe_xprof_id,
+                    )
+                )
+                offset += local_count
+            probed_lists = ray.get(probe_refs)
+        except (RuntimeError, ValueError, OSError, subprocess.SubprocessError) as exc:
+            logger.warning(
+                "RayDistributedExecutorV2 | Ascending TPU device-order discovery "
+                "failed (%s); falling back to native rank order.",
+                exc,
+            )
+            return None
+
+        host_devices = dict(zip(probe_hosts, probed_lists))
+        order = plan_ascending_device_order(
+            host_devices, observed_host_order=probe_hosts
+        )
+        if order is None:
+            logger.warning(
+                "RayDistributedExecutorV2 | Probed TPU device IDs %s do not "
+                "form contiguous per-host blocks for ascending ordering; "
+                "falling back to native rank order.",
+                host_devices,
+            )
+            return None
+        logger.info(
+            "RayDistributedExecutorV2 | Ascending TPU device order resolved | "
+            "observed_device_ids=%s | host_order=%s | local_rank_by_host=%s",
+            list(order.observed_device_ids),
+            list(order.host_order),
+            {ip: list(lrs) for ip, lrs in order.local_rank_by_host.items()},
+        )
+        return order
+
     def _init_executor(self) -> None:
         """Initialize the RayDistributedExecutorV2 executor.
 
@@ -255,9 +364,54 @@ class RayDistributedExecutorV2(RayExecutorV2):
         if bundle_to_node_id is None:
             bundle_to_node_id = get_bundles_sorted_by_node(placement_group)
 
+        ascending_order: AscendingDeviceOrder | None = None
+        _asc_mode = (
+            "auto" if is_glm_dsa_model(getattr(self, "model_config", None)) else "0"
+        )
+        if should_use_ascending_device_order(
+            mode=_asc_mode,
+            world_size=self.world_size,
+            dp_size=dp_size,
+            pp_size=pp_size,
+            pcp_size=pcp_size,
+            dcp_size=int(
+                getattr(self.parallel_config, "decode_context_parallel_size", 1)
+            ),
+            has_explicit_bundle_indices=bool(envs.VLLM_RAY_BUNDLE_INDICES),
+            has_explicit_device_override=bool(
+                tpu_envs.VLLM_TPU_DEVICE_ORDER
+                or tpu_envs.TPU_LOCAL_RANK_OFFSET
+                or tpu_envs.DEBUG_TPU_LOCAL_RANK_OFFSET
+            ),
+        ):
+            ascending_order = self._discover_ascending_device_order(
+                bundle_to_node_id, slice_world_size
+            )
+            if ascending_order is not None:
+                bundle_to_node_id = reorder_bundles_by_host_order(
+                    bundle_to_node_id, ascending_order.host_order
+                )
+
         bundle_assignments = self._get_bundle_assignments(
             placement_group, bundle_to_node_id
         )
+        if ascending_order is not None:
+            host_slot_counts: dict[str, int] = defaultdict(int)
+            phys_by_rank: dict[int, int] = {}
+            for bundle in bundle_assignments:
+                b_node_id = bundle["node_id"]
+                slot = host_slot_counts[b_node_id]
+                host_slot_counts[b_node_id] = slot + 1
+                phys_by_rank[int(bundle["rank"])] = int(
+                    ascending_order.local_rank_by_host[bundle["node_ip"]][slot]
+                )
+            add_cfg = getattr(self.vllm_config, "additional_config", None)
+            if isinstance(add_cfg, dict):
+                add_cfg[TPU_PHYSICAL_LOCAL_RANK_BY_RANK_KEY] = phys_by_rank
+            else:
+                self.vllm_config.additional_config = {
+                    TPU_PHYSICAL_LOCAL_RANK_BY_RANK_KEY: phys_by_rank
+                }
         driver_node = ray.get_runtime_context().get_node_id()
 
         # Step 4: Create broadcast MessageQueue.
@@ -366,6 +520,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
         host_order, chips_per_host = self._slice_host_layout(
             current_platform.ray_device_key
         )
+        if ascending_order is not None:
+            host_order = list(ascending_order.host_order)
         if dp_size > 1 and sum(chips_per_host.values()) != slice_world_size:
             # Only meaningful under DP, where the slice is by definition every
             # chip in the cluster. A single engine may legitimately occupy

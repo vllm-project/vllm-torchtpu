@@ -29,10 +29,12 @@ from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
     PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+    TPU_PHYSICAL_LOCAL_RANK_BY_RANK_KEY,
 )
 
 KEY = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY
 PREFILL_KEY = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY
+PHYS_RANK_KEY = TPU_PHYSICAL_LOCAL_RANK_BY_RANK_KEY
 
 # Class attributes the patch stamps onto VllmConfig, which monkeypatch cannot
 # roll back on its own because they did not exist beforehand.
@@ -199,5 +201,14 @@ def test_patch_is_idempotent(patched_compute_hash):
     assert VllmConfig.compute_hash is patched_compute_hash
 
 
+def test_physical_local_rank_map_does_not_alter_hash(patched_compute_hash):
+    baseline = patched_compute_hash(_StubVllmConfig({}))
+    perm_a = _StubVllmConfig({PHYS_RANK_KEY: {0: 1, 1: 0, 2: 3, 3: 2}})
+    perm_b = _StubVllmConfig({PHYS_RANK_KEY: {0: 3, 1: 2, 2: 1, 3: 0}})
+
+    assert patched_compute_hash(perm_a) == baseline
+    assert patched_compute_hash(perm_b) == baseline
+
+
 def test_ignored_keys_match_the_keys_the_runner_reads():
-    assert {KEY, PREFILL_KEY} == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+    assert {KEY, PREFILL_KEY, PHYS_RANK_KEY} == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS

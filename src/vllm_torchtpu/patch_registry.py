@@ -102,6 +102,11 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_abort_on_preemption", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_raiden_pd_completion", _ENGINE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
+    Patch(
+        "vllm_torchtpu.core.token_parallel_page_budget:"
+        "install_token_parallel_page_budget",
+        _ENGINE,
+    ),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
@@ -131,6 +136,10 @@ PATCHES = (
     # Out-of-tree FP32 rotary embedding (CUDA numerics). Must be registered
     # before any RotaryEmbedding is constructed at model load.
     Patch("vllm_torchtpu.layers.adapter.rotary_embedding", _ACTIVE),
+    # Segment-cached prompt rendering for ultra-long contexts.
+    Patch(
+        "vllm_torchtpu.core.segment_tokenize:patch_renderer_segment_tokenize", _ACTIVE
+    ),
     # Platform runtime configuration.
     Patch(
         "vllm_torchtpu.platforms.tpu_platform:_configure_torchtpu_eager_mode", _ACTIVE
@@ -165,6 +174,11 @@ PATCHES = (
     ),
     Patch(
         "vllm_torchtpu.models.vllm.gemma4:maybe_patch_gemma4",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
+    Patch(
+        "vllm_torchtpu.models.vllm.glm_dsa_patch:maybe_patch_glm_dsa",
         ("platform_activation", "model_load"),
         model_config=True,
     ),

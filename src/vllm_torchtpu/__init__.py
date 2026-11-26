@@ -488,10 +488,15 @@ def _patch_vllm_compile_all_ranges() -> None:
 
         range_entry.compiled = True
 
+    def _biggest_first_enabled() -> bool:
+        from vllm_torchtpu.models.vllm.glm_dsa_dispatch import glm_dsa_v7x_active
+
+        return bool(envs.TPU_PRECOMPILE_BIGGEST_FIRST or glm_dsa_v7x_active())
+
     def compile_rotated(pairs, local_rank: int) -> None:
         """Compile every range here, each local rank starting on a different
         one: the order without peer replay."""
-        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
+        if _biggest_first_enabled():
             # Biggest first: local rank 0 starts on the biggest range, which
             # takes far longer than the others and so bounds startup, instead
             # of reaching it only after the smallest one.
@@ -555,7 +560,7 @@ def _patch_vllm_compile_all_ranges() -> None:
         # startup, and a rank whose first range is small gets the next one.
         # TPU_PRECOMPILE_BIGGEST_FIRST=0 deals them in vLLM's order instead.
         entries = [(b, e) for b, e in pairs if not e.compiled]
-        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
+        if _biggest_first_enabled():
             entries.sort(key=lambda p: p[1].compile_range.end, reverse=True)
         mine, others = [], []
         for i, (backend, range_entry) in enumerate(entries):
@@ -2008,6 +2013,10 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
 
     original_init = vpe.VocabParallelEmbedding.__init__
 
+    from vllm_torchtpu.layers.adapter import (  # noqa: PLC0415 -- lazy like this hook's other imports
+        replicated_embedding,
+    )
+
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         if not hasattr(self, "org_vocab_start_index"):
@@ -2046,6 +2055,9 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
 
     def patched_forward(self, input_):
+        replica_rows = replicated_embedding.decode_lookup(self, input_)
+        if replica_rows is not None:
+            return replica_rows
         input_mask = None
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
@@ -2082,7 +2094,12 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             from vllm.distributed import tensor_model_parallel_all_reduce
 
-            return tensor_model_parallel_all_reduce(output_parallel)
+            output = tensor_model_parallel_all_reduce(output_parallel)
+            # Avoid an unmasked lookup in the replicated table here: short
+            # prompts prefilled in decode buckets came back with wrong tokens
+            # through it (decode_lookup above masks out-of-vocabulary ids).
+            # Keep the table lifted for bucket hand-over.
+            return replicated_embedding.retain_table(self, output)
         return output_parallel
 
     def patched_get_masked_input_and_mask(

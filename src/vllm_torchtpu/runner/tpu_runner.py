@@ -113,7 +113,7 @@ from vllm_torchtpu.gdn_pool_layout import (
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs as rpa_configs
 from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as rpa_batched
 from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
-from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter import moe_prefill_sp, token_padding
 from vllm_torchtpu.layers.adapter.attention import (
     KV_LAYOUT_BY_VLLM_LAYOUT,
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
@@ -842,6 +842,7 @@ class TPUModelRunner(GPUModelRunner):
 
         self.original_parallel_config = vllm_config.parallel_config
         self.device_config = vllm_config.device_config
+        self._configure_glm_dsa_dispatch()
 
         # Set by `_update_*_page_size_padded` for hybrid attention
         # models so vLLM sees a uniform page size across groups.
@@ -1242,6 +1243,26 @@ class TPUModelRunner(GPUModelRunner):
             ),
         )
 
+    def _configure_glm_dsa_dispatch(self) -> bool:
+        from vllm_torchtpu.layers.adapter import (
+            dcp_token_parallel_op,
+            moe_routing,
+            moe_tp_decode,
+        )
+        from vllm_torchtpu.models.vllm.glm_dsa_dispatch import (
+            glm_dsa_v7x_active,
+            set_active_model_config,
+        )
+
+        set_active_model_config(self.model_config)
+        dcp_token_parallel_op.configure_for(self.vllm_config)
+        moe_tp_decode.set_speculative_decoding(
+            self.vllm_config.speculative_config is not None
+        )
+        active = glm_dsa_v7x_active(self.model_config)
+        moe_routing.set_rowmax_bias_enabled(active)
+        return active
+
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
 
@@ -1498,9 +1519,13 @@ class TPUModelRunner(GPUModelRunner):
         """
         if model is None:
             return
+        from vllm_torchtpu.models.vllm.glm_dsa_dispatch import glm_dsa_v7x_active
+
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches(model)
-        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
+        if envs.TPU_ROPE_CACHE_ROW_MAJOR or glm_dsa_v7x_active(
+            getattr(self, "model_config", None)
+        ):
             runner_utils.relayout_rope_caches(model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(model)
@@ -3529,6 +3554,15 @@ class TPUModelRunner(GPUModelRunner):
         )
         self._last_sequence_layout_plan = layout_plan
         padded_total_num_scheduled_tokens = layout_plan.global_padded_num_tokens
+        from vllm_torchtpu.layers.adapter import dcp_token_parallel_op
+
+        dcp_token_parallel_op.check_step_capacity(
+            self.vllm_config,
+            padded_total_num_scheduled_tokens,
+            self.query_start_loc_np,
+            self.seq_lens_np,
+            num_reqs,
+        )
         request_major_input_ids = None
         if self._pcp_enabled and self._mtp_enabled:
             assert request_major_input_ids_cpu is not None
@@ -4622,7 +4656,19 @@ class TPUModelRunner(GPUModelRunner):
                         hidden_states,
                         layout_plan,
                     )
-                    if top_tokens:
+                    if hidden_states.shape[0] != num_tokens_padded:
+                        tp_size, zigzag_bands = self._sp_deferred_logits_meta(
+                            num_tokens_padded, hidden_states.shape[0]
+                        )
+                        if top_tokens:
+                            logits = self.compute_selected_top_tokens_sp(
+                                hidden_states, logits_indices, tp_size, zigzag_bands
+                            )
+                        else:
+                            logits = self.compute_selected_logits_sp(
+                                hidden_states, logits_indices, tp_size, zigzag_bands
+                            )
+                    elif top_tokens:
                         logits = self.compute_selected_top_tokens(
                             hidden_states, logits_indices
                         )
@@ -5850,6 +5896,7 @@ class TPUModelRunner(GPUModelRunner):
 
         from vllm_torchtpu.compilation import aot_guard_skip, foreach_epilogue
 
+        is_glm_dsa = self._configure_glm_dsa_dispatch()
         logger.info(
             "Setting TPU quantization config for: %s", self.model_config.quantization
         )
@@ -5892,9 +5939,13 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_topk_buffer is not None:
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
+        from vllm_torchtpu.models.vllm.glm_dsa_dispatch import glm_dsa_v7x_active
+
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches(self.model)
-        if envs.TPU_ROPE_CACHE_ROW_MAJOR:
+        if envs.TPU_ROPE_CACHE_ROW_MAJOR or glm_dsa_v7x_active(
+            getattr(self, "model_config", None)
+        ):
             runner_utils.relayout_rope_caches(self.model)
         if envs.TPU_MOE_HASH_TABLE_ROW_MAJOR:
             runner_utils.relayout_hash_tables(self.model)
@@ -5965,7 +6016,10 @@ class TPUModelRunner(GPUModelRunner):
             )
             for module in self.model.modules()
         )
-        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
+        glm_pad = is_glm_dsa and (
+            self.speculative_config is None or isinstance(self.drafter, DFlashProposer)
+        )
+        if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe or glm_pad:
             max_padded_tokens = self.max_num_tokens
             if isinstance(self.drafter, DFlashProposer):
                 # A DFlash draft forward can outgrow the largest target
@@ -5979,12 +6033,48 @@ class TPUModelRunner(GPUModelRunner):
             )
             token_padding.set_padding_state(self._token_padding_state)
 
-        # Last: arming needs the drafter's MTP layer and the padding mask.
-        if envs.USE_MOE_TP_DECODE_KERNEL:
-            from vllm_torchtpu.layers.adapter.moe_tp_decode import arm
+        if is_glm_dsa:
+            from vllm_torchtpu.layers.adapter.rmsnorm import arm_prequant
 
+            n_pairs = arm_prequant(self.model)
+            if n_pairs:
+                logger.info(
+                    "Armed fused RMSNorm + FP8 quant on %d norm -> fp8 linear pairs",
+                    n_pairs,
+                )
+
+        # Last: arming needs the drafter's MTP layer and the padding mask.
+        from vllm_torchtpu.layers.adapter import moe_tp_decode
+        from vllm_torchtpu.models.vllm.glm_dsa_dispatch import (
+            MLA_SPLIT_QKV_A_CHUNK,
+            glm_dsa_v7x_active,
+        )
+
+        if moe_tp_decode.should_arm():
             draft = self._async_drafter.draft_model if self._is_async_drafter else None
-            arm(self.model, draft)
+            moe_tp_decode.arm(self.model, draft)
+        glm_active = glm_dsa_v7x_active(self.model_config)
+        defer_final_ag = (
+            glm_active
+            and not self.is_pooling_model
+            and self.speculative_config is None
+            and self._pp_is_last
+            and getattr(self.parallel_config, "prefill_context_parallel_size", 1) == 1
+        )
+        moe_prefill_sp.maybe_arm(
+            self.model, self.vllm_config, defer_final_ag=defer_final_ag
+        )
+        if glm_active:
+            from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+                arm_split_qkv_a_proj,
+            )
+
+            n_split = arm_split_qkv_a_proj(self.model)
+            logger.info(
+                "Split %d MLA fused_qkv_a_proj layers (chunk=%d)",
+                n_split,
+                MLA_SPLIT_QKV_A_CHUNK,
+            )
 
     def load_lora_model(
         self,
@@ -6028,8 +6118,11 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     def _initialize_pallas_kernels(self):
+        from vllm_torchtpu.layers.adapter import small_all_reduce_op
+
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
+        small_all_reduce_op.prebuild()
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (
@@ -6446,7 +6539,20 @@ class TPUModelRunner(GPUModelRunner):
                 # Idle DP engines must issue the same TP logits collective as
                 # busy engines before the next DP synchronization.
                 _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
-                _ = self.compute_selected_logits(out, _idx)
+                _model = getattr(self, "model", None)
+                if (
+                    out.shape[0] != num_tokens
+                    and _model is not None
+                    and moe_prefill_sp.is_final_ag_deferred_for_bucket(
+                        _model, num_tokens
+                    )
+                ):
+                    _tp, _bands = self._sp_deferred_logits_meta(
+                        num_tokens, out.shape[0]
+                    )
+                    _ = self.compute_selected_logits_sp(out, _idx, _tp, _bands)
+                else:
+                    _ = self.compute_selected_logits(out, _idx)
             if not dp_lockstep:
                 synchronize_tensors(out)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -6758,6 +6864,35 @@ class TPUModelRunner(GPUModelRunner):
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_selected_logits"):
             for num_tokens in self.num_tokens_paddings:
+                if moe_prefill_sp.is_final_ag_deferred_for_bucket(
+                    self.model, num_tokens
+                ):
+                    tp_size = self.parallel_config.tensor_parallel_size
+                    local_rows = num_tokens // tp_size
+                    zigzag_bands = self._sp_deferred_logits_meta(
+                        num_tokens, local_rows
+                    )[1]
+                    dummy_hidden = torch.zeros(
+                        (local_rows, hsize),
+                        dtype=self._hidden_states_dtype,
+                    ).to(self.device)
+                    for num_reqs in self.num_reqs_paddings:
+                        indices = torch.zeros(num_reqs, dtype=torch.int32).to(
+                            self.device
+                        )
+                        out = self.compute_selected_logits_sp(
+                            dummy_hidden, indices, tp_size, zigzag_bands
+                        )
+                        synchronize_tensors(out)
+                        logger.info(
+                            "  -- num_tokens(sp): %d (local=%d), num_seqs: %d",
+                            num_tokens,
+                            local_rows,
+                            num_reqs,
+                        )
+                        if num_reqs >= min(num_tokens, self.max_num_reqs):
+                            break
+                    continue
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
                     dtype=self._hidden_states_dtype,
@@ -6790,6 +6925,29 @@ class TPUModelRunner(GPUModelRunner):
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_selected_top_tokens"):
             for num_tokens in self.num_tokens_paddings:
+                if moe_prefill_sp.is_final_ag_deferred_for_bucket(
+                    self.model, num_tokens
+                ):
+                    tp_size = self.parallel_config.tensor_parallel_size
+                    local_rows = num_tokens // tp_size
+                    zigzag_bands = self._sp_deferred_logits_meta(
+                        num_tokens, local_rows
+                    )[1]
+                    dummy_hidden = torch.zeros(
+                        (local_rows, hsize),
+                        dtype=self._hidden_states_dtype,
+                    ).to(self.device)
+                    for num_reqs in self.num_reqs_paddings:
+                        indices = torch.zeros(num_reqs, dtype=torch.int32).to(
+                            self.device
+                        )
+                        out = self.compute_selected_top_tokens_sp(
+                            dummy_hidden, indices, tp_size, zigzag_bands
+                        )
+                        synchronize_tensors(out)
+                        if num_reqs >= min(num_tokens, self.max_num_reqs):
+                            break
+                    continue
                 dummy_hidden = torch.zeros(
                     (num_tokens, hsize),
                     dtype=self._hidden_states_dtype,
@@ -8981,6 +9139,32 @@ class TPUModelRunner(GPUModelRunner):
         )
         return num_blocks
 
+    def _sp_deferred_logits_meta(
+        self, num_tokens_padded: int, local_rows: int
+    ) -> tuple[int, int]:
+        cache: dict[int, tuple[int, int]] | None = getattr(
+            self, "_sp_logits_meta_cache", None
+        )
+        if cache is None:
+            cache = {}
+            self._sp_logits_meta_cache = cache
+        key = num_tokens_padded
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        if local_rows <= 0 or num_tokens_padded % local_rows != 0:
+            raise ValueError(
+                f"Invalid SP hidden_states row count {local_rows} for "
+                f"num_tokens_padded={num_tokens_padded}"
+            )
+        tp_size = num_tokens_padded // local_rows
+        zigzag_bands = moe_prefill_sp.step_zigzag_bands_for_model(
+            self.model, num_tokens_padded
+        )
+        meta = (tp_size, zigzag_bands)
+        cache[key] = meta
+        return meta
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
@@ -8989,6 +9173,27 @@ class TPUModelRunner(GPUModelRunner):
             return torch.empty((0,), device=hidden_states.device)
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
         return self.model.compute_logits(selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_logits_sp(
+        self,
+        hidden_states: torch.Tensor,
+        indices_do_sample: torch.Tensor,
+        tp_size: int,
+        zigzag_bands: int,
+    ) -> torch.Tensor:
+        if self.is_pooling_model:
+            return torch.empty((0,), device=hidden_states.device)
+        num_tokens = hidden_states.shape[0] * tp_size
+        selected = moe_prefill_sp.select_sp_hidden_states(
+            hidden_states,
+            indices_do_sample,
+            num_tokens=num_tokens,
+            tp=tp_size,
+            zigzag_bands=zigzag_bands,
+        )
+        model_any: Any = self.model
+        return model_any.compute_logits(selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_logits_from_hidden_states(
@@ -9013,6 +9218,26 @@ class TPUModelRunner(GPUModelRunner):
         if self._greedy_head_owner is None:
             raise RuntimeError("greedy top-token path requires a greedy head owner")
         selected = torch.index_select(hidden_states, 0, indices_do_sample)
+        return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_selected_top_tokens_sp(
+        self,
+        hidden_states: torch.Tensor,
+        indices_do_sample: torch.Tensor,
+        tp_size: int,
+        zigzag_bands: int,
+    ) -> torch.Tensor:
+        if self._greedy_head_owner is None:
+            raise RuntimeError("greedy top-token path requires a greedy head owner")
+        num_tokens = hidden_states.shape[0] * tp_size
+        selected = moe_prefill_sp.select_sp_hidden_states(
+            hidden_states,
+            indices_do_sample,
+            num_tokens=num_tokens,
+            tp=tp_size,
+            zigzag_bands=zigzag_bands,
+        )
         return greedy_top_tokens.top_tokens(self._greedy_head_owner, selected)
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)

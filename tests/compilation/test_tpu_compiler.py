@@ -25,6 +25,7 @@ from tests.compilation.test_graph_fingerprint import (
     _trace_all_reduce_graph,
     install_group_stand_ins,
 )
+from vllm_torchtpu import env_override
 from vllm_torchtpu.env_override import _TPU_VMEM_BYTES_PER_TENSOR_CORE
 
 
@@ -279,12 +280,17 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/compilation/aot_guard_skip.py",
             "vllm_torchtpu/compilation/shape_variants.py",
             "vllm_torchtpu/distributed/dcp_comm.py",
+            "vllm_torchtpu/distributed/tpu_communicator.py",
             "vllm_torchtpu/gdn_pool_layout.py",
+            "vllm_torchtpu/models/vllm/glm_dsa_dispatch.py",
+            "vllm_torchtpu/models/vllm/glm_dsa_patch.py",
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
             "vllm_torchtpu/layers/adapter/cp_mla_attention.py",
             "vllm_torchtpu/layers/adapter/cp_prefill_attention.py",
+            "vllm_torchtpu/layers/adapter/dcp_token_parallel_op.py",
             "vllm_torchtpu/layers/adapter/moe_hierarchical.py",
+            "vllm_torchtpu/layers/adapter/moe_prefill_sp.py",
             "vllm_torchtpu/layers/adapter/moe_routing.py",
             "vllm_torchtpu/models/vllm/gemma4/cp_prefill.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
@@ -470,6 +476,62 @@ class TestTpuCompilerCache:
                     for op in ("all_reduce", "all_gather")
                 ]
             )
+            assert self._sc_offload_flags() == expected
+
+    @pytest.mark.parametrize(
+        "arch,dcp,extra_env,all_reduce,all_gather",
+        [
+            ("GlmMoeDsaForCausalLM", 16, {}, 64 << 20, 6 << 20),
+            ("Gemma4ForCausalLM", 16, {}, 64 << 20, 64 << 20),
+            ("GlmMoeDsaForCausalLM", 1, {}, 64 << 20, 64 << 20),
+            (
+                "GlmMoeDsaForCausalLM",
+                16,
+                {"SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": "12345"},
+                12345,
+                12345,
+            ),
+            (
+                "GlmMoeDsaForCausalLM",
+                16,
+                {"TPU_ACCELERATOR_TYPE": "unknown-8"},
+                None,
+                None,
+            ),
+        ],
+    )
+    def test_should_lower_all_gather_floor_only_for_glm_dsa_dcp(
+        self, arch, dcp, extra_env, all_reduce, all_gather
+    ):
+        from types import SimpleNamespace
+
+        from vllm_torchtpu import envs as tpu_envs
+        from vllm_torchtpu.platforms.tpu_platform import _configure_glm_dsa_dcp_defaults
+
+        env_mock = {
+            "TPU_ACCELERATOR_TYPE": "tpu7x-16",
+            **extra_env,
+        }
+        with patch.dict(os.environ, env_mock, clear=True):
+            importlib.reload(tpu_envs)
+            importlib.reload(env_override)
+            fake_cfg = SimpleNamespace(
+                model_config=SimpleNamespace(architectures=[arch]),
+                parallel_config=SimpleNamespace(
+                    decode_context_parallel_size=dcp,
+                    cp_kv_cache_interleave_size=1,
+                    dcp_kv_cache_interleave_size=1,
+                ),
+                cache_config=SimpleNamespace(
+                    block_size=16, user_specified_block_size=False
+                ),
+            )
+            _configure_glm_dsa_dcp_defaults(fake_cfg)
+            expected = [
+                f"--xla_tpu_sparse_core_{op}_offload_min_size_in_bytes={n}"
+                for op, n in (("all_reduce", all_reduce), ("all_gather", all_gather))
+                if n is not None
+            ]
             assert self._sc_offload_flags() == expected
 
     @pytest.mark.parametrize("value", ["banana", "-1"])

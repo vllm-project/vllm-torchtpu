@@ -23,6 +23,7 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.router_topk import (
     router_topk,
+    router_topk_bias,
     router_topk_scaled,
 )
 from vllm_torchtpu.layers.core.rowmax_topk import rowmax_topk
@@ -36,6 +37,11 @@ def _fake_router_topk(scores: torch.Tensor, topk: int):
     )
 
 
+def _fake_router_topk_bias(scores: torch.Tensor, bias: torch.Tensor, topk: int):
+    del bias
+    return _fake_router_topk(scores, topk)
+
+
 def _fake_router_topk_scaled(scores: torch.Tensor, scale: torch.Tensor, topk: int):
     del scale
     weights, ids = _fake_router_topk(scores, topk)
@@ -46,6 +52,9 @@ def _fake_router_topk_scaled(scores: torch.Tensor, scale: torch.Tensor, topk: in
 # forward, and Dynamo cannot trace a lock-guarded registration there.
 _op = pallas.jax_op("pallas::moe_router_topk", router_topk)
 _op.register_fake(_fake_router_topk)
+
+_bias_op = pallas.jax_op("pallas::moe_router_topk_bias", router_topk_bias)
+_bias_op.register_fake(_fake_router_topk_bias)
 
 _op_scaled = pallas.jax_op("pallas::moe_router_topk_scaled", router_topk_scaled)
 _op_scaled.register_fake(_fake_router_topk_scaled)
@@ -60,6 +69,20 @@ def rowmax_select(scores: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.
             f"router top-k kernel expects [rows, experts], got {scores.shape}"
         )
     return _op(scores.float(), topk)
+
+
+def rowmax_select_bias(
+    scores: torch.Tensor, bias: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k ids of ``scores + bias``, returning ``scores`` at those ids."""
+    if scores.device.type != "tpu":
+        _, ids = rowmax_topk(scores + bias.view(1, -1), topk)
+        return scores.gather(-1, ids.long()), ids
+    if scores.dim() != 2:
+        raise ValueError(
+            f"router top-k kernel expects [rows, experts], got {scores.shape}"
+        )
+    return _bias_op(scores.float(), bias.float().reshape(1, -1), topk)
 
 
 def rowmax_select_scaled(

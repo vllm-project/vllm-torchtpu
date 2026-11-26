@@ -58,8 +58,6 @@ from vllm_torchtpu.runner.tpu_pooling import (
     unpack_static_pool_output,
 )
 
-pytestmark = pytest.mark.cpu_test
-
 HIDDEN = 32
 POOLING_METHODS = {"LAST": LastPool, "CLS": CLSPool, "MEAN": MeanPool}
 
