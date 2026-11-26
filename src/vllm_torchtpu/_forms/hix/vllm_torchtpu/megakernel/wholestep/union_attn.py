@@ -291,13 +291,14 @@ def attend_request(
         ).astype(I32)
         tok = t * TILE + jax.lax.broadcasted_iota(I32, (1, TILE), 1)
         k8, v8 = _unpack_kv(ring.at[s], off, interpret)
-        tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
         if stock_kv:  # q38 HIX-KERN K6: FP8 operands straight to the MXU, scales after the dots (stock RPA order; kern_stock_kv below)
+            tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
             key, value = k8, _kern_value_f8(v8, tok_col < length, dcp > 1)
             if interpret:  # CPU interpret has no mixed f32 x f8 dot: the exact f32 values (the device pushes the FP8 codes)
                 key, value = key.astype(F32), value.astype(F32)
-        else:
+        else:  # q38 BK-K6OFF: key before tok_col, H's exact key-off op order (bkpp1 j-d8bfdff8 FLAGOFF)
             key = k8.astype(F32) * scale_k
+            tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
             value = v8.astype(F32)
             if dcp > 1:  # unowned slots hold the pair rank's rows (FP8: may be NaN)
                 value = jnp.where(value == value, value, 0.0)
@@ -316,11 +317,17 @@ def attend_request(
             alpha = jnp.where(
                 m == -jnp.inf, jnp.where(m_new == -jnp.inf, 1.0, 0.0), jnp.exp(m - safe)
             )
-            pv = jnp.dot(p, value, preferred_element_type=F32)
-            return (
+            if stock_kv:  # q38 HIX-KERN K6
+                pv = jnp.dot(p, value, preferred_element_type=F32)
+                return (
+                    m_new,
+                    l * alpha + jnp.sum(p, axis=-1, keepdims=True),
+                    acc * alpha + pv * scale_v,
+                )
+            return (  # q38 BK-K6OFF: the pv dot inlined after the l term, H's exact key-off op order
                 m_new,
                 l * alpha + jnp.sum(p, axis=-1, keepdims=True),
-                acc * alpha + (pv * scale_v if stock_kv else pv),
+                acc * alpha + jnp.dot(p, value, preferred_element_type=F32),
             )
         out = []
         for r in range(T):
