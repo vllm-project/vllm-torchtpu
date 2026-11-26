@@ -234,6 +234,9 @@ def gmm_wrapper(
 # Largest routed-row count (static GMM rows) that runs gate/up and down as one
 # kernel: decode and verify steps. Prefill chunks keep the two kernels.
 _MLP_KERNEL_MAX_ROWS = 4096
+# Row buckets of the scattering expert kernel below its 64-row tile: decode
+# steps route ~10 rows to an expert, so a 16-row body covers most tiles.
+_SCATTER_MLP_BUCKETS = (16, 32)
 
 
 def expert_mlp(
@@ -1006,6 +1009,7 @@ def fused_moe_scatter_planned(
         num_members=num_members,
         collective_id=collective_id,
         fuse_act=activation,
+        buckets=_SCATTER_MLP_BUCKETS,
         maybe_quantize_lhs=not _is_fp4_weight(w1),
         rhs_quant_dtype=rhs_quant_dtype,
     )
