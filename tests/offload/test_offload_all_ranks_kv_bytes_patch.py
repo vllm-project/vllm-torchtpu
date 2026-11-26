@@ -13,8 +13,9 @@
 # limitations under the License.
 """Unit tests for _patch_vllm_offload_all_ranks_kv_bytes.
 
-The patch records the sum of every worker's KV bytes per block where the
-per-worker KV cache configs pass by: the engine core's scheduler-config
+The patch records the sum of every worker's KV bytes per block, and every
+worker's per-layer KV cache specs, where the per-worker KV cache configs pass
+by: the engine core's scheduler-config
 derivation and the worker wrapper's config hand-off.
 """
 
@@ -29,22 +30,30 @@ from vllm_torchtpu.offload import raiden_store
 
 
 def _worker_config(bytes_per_block, num_blocks=2):
+    leaf = SimpleNamespace(name=f"leaf-{bytes_per_block}")
     return SimpleNamespace(
         num_blocks=num_blocks,
         hisparse_host_num_blocks=None,
         kv_cache_tensors=[SimpleNamespace(size=bytes_per_block * num_blocks)],
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=leaf)],
     )
+
+
+def _leaves(configs):
+    return tuple(cfg.kv_cache_groups[0].kv_cache_spec for cfg in configs)
 
 
 def test_engine_core_records_before_deriving_the_scheduler_config():
     configs = [_worker_config(1024), _worker_config(3072)]
     with (
         patch.object(raiden_store, "_all_ranks_kv_bytes_per_block", None),
+        patch.object(raiden_store, "_all_ranks_leaf_kv_cache_specs", None),
         patch.object(engine_core_module, "generate_scheduler_kv_cache_config") as orig,
     ):
         _patch_vllm_offload_all_ranks_kv_bytes()
         engine_core_module.generate_scheduler_kv_cache_config(configs)
         assert raiden_store.all_ranks_kv_bytes_per_block() == 4096
+        assert raiden_store.all_ranks_leaf_kv_cache_specs() == _leaves(configs)
         orig.assert_called_once_with(configs)
 
 
@@ -58,10 +67,12 @@ def test_worker_wrapper_records_before_handing_over_its_config():
     wrapper.worker = SimpleNamespace(initialize_from_config=seen.append)
     with (
         patch.object(raiden_store, "_all_ranks_kv_bytes_per_block", None),
+        patch.object(raiden_store, "_all_ranks_leaf_kv_cache_specs", None),
         patch("vllm.v1.worker.worker_base.set_current_vllm_config"),
     ):
         wrapper.initialize_from_config(configs)
         assert raiden_store.all_ranks_kv_bytes_per_block() == 4096
+        assert raiden_store.all_ranks_leaf_kv_cache_specs() == _leaves(configs)
     assert seen == [configs[1]]
 
 

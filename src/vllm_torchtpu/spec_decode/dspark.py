@@ -34,6 +34,7 @@ drafts with the checkpoint's confidence head (``adaptive_verification.py``).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import NamedTuple
 
 import torch
@@ -53,6 +54,39 @@ class DraftConfidences(NamedTuple):
 
     chunks: list[torch.Tensor]
     spans: list[tuple[int, int]]
+
+
+class DraftMarkovArgmax:
+    """Mixin for a draft model that supplies its own greedy Markov argmax,
+    e.g. a drafter with a vocab-sharded head that takes the argmax on
+    each shard instead of all-gathering the full-vocab draft logits.
+
+    ``DSparkProposer.load_model`` calls ``enable_markov_argmax()`` once the
+    draft is loaded. When it returns True, the compiled draft step takes the
+    block's logits from ``markov_logits()`` and each slot's draft-vocab ids
+    from ``markov_argmax()``. Overrides must give the same ids as the
+    defaults below, which are the proposer's own path. Draft models without
+    the mixin, or whose ``enable_markov_argmax()`` returns False, keep that
+    path. Off by default.
+    """
+
+    # Provided by the draft model this mixes into.
+    compute_draft_logits: Callable[[torch.Tensor], torch.Tensor]
+    markov_bias: Callable[[torch.Tensor], torch.Tensor]
+
+    def enable_markov_argmax(self) -> bool:
+        """Whether the draft step uses markov_logits()/markov_argmax()."""
+        return False
+
+    def markov_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Draft logits for every slot, as markov_argmax() takes them."""
+        return self.compute_draft_logits(hidden_states)
+
+    def markov_argmax(
+        self, logits: torch.Tensor, markov_embed: torch.Tensor
+    ) -> torch.Tensor:
+        """One slot's draft-vocab ids: argmax of logits plus Markov bias."""
+        return (logits + self.markov_bias(markov_embed)).argmax(dim=-1)
 
 
 class DSparkProposer(DFlashProposer):
@@ -83,6 +117,10 @@ class DSparkProposer(DFlashProposer):
         # this. Set by load_model once the checkpoint's heads are known.
         self.use_confidence_head = False
         self._draft_confidences: DraftConfidences | None = None
+        # Whether the draft model supplies the greedy Markov argmax
+        # (DraftMarkovArgmax); set by load_model. The compiled draft step
+        # traces on it.
+        self._draft_markov_argmax = False
         # The query block follows K, not the block length the checkpoint was
         # trained at; upstream vLLM likewise only enforces K == block for
         # Qwen3-Omni DSpark. The checkpoint's block is a query-block length in
@@ -148,6 +186,15 @@ class DSparkProposer(DFlashProposer):
                     "every draft.",
                     type(self.draft_model).__name__,
                 )
+        draft = self.draft_model
+        self._draft_markov_argmax = (
+            isinstance(draft, DraftMarkovArgmax) and draft.enable_markov_argmax()
+        )
+        if self._draft_markov_argmax:
+            logger.info(
+                "Greedy Markov argmax supplied by the draft model %s.",
+                type(draft).__name__,
+            )
 
     def _observe_draft_aux(
         self, aux: torch.Tensor, chunk_index: int, chunk: DraftChunkInputs
@@ -198,7 +245,11 @@ class DSparkProposer(DFlashProposer):
 
         # Draft-vocab logits for every slot; the Markov bias is added in
         # draft space and ids are remapped to target vocab after argmax.
-        logits = self.draft_model.compute_draft_logits(valid_hidden)
+        draft_argmax = self._draft_markov_argmax
+        if draft_argmax:
+            logits = self.draft_model.markov_logits(valid_hidden)
+        else:
+            logits = self.draft_model.compute_draft_logits(valid_hidden)
         logits_3d = logits.view(padded_num_reqs, block_size, logits.shape[-1])
 
         ids_3d = input_ids[: padded_num_reqs * block_size].view(
@@ -210,10 +261,14 @@ class DSparkProposer(DFlashProposer):
         sample_start = 0 if self.sample_from_anchor else 1
         for i in range(sample_start, block_size):
             markov_embed = self.draft_model.markov_embed(prev)
-            bias = self.draft_model.markov_bias(markov_embed)
-            step = self.draft_model.map_draft_to_target(
-                (logits_3d[:, i] + bias).argmax(dim=-1)
-            )
+            if draft_argmax:
+                draft_ids = self.draft_model.markov_argmax(
+                    logits_3d[:, i], markov_embed
+                )
+            else:
+                bias = self.draft_model.markov_bias(markov_embed)
+                draft_ids = (logits_3d[:, i] + bias).argmax(dim=-1)
+            step = self.draft_model.map_draft_to_target(draft_ids)
             draft_tokens.append(step)
             markov_embeds.append(markov_embed)
             prev = step
