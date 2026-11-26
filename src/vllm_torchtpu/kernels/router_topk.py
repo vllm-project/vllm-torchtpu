@@ -65,9 +65,10 @@ def _select_kernel(x_ref, *refs, topk: int, n: int, pick: bool, lanes_are_rows: 
         axis = 0
     x = jnp.where(x > NEG, x, NEG)
     masked = jnp.finfo(x.dtype).min
-    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, axis)
+    # Column ids as f32 (exact below 2**24): the min is then one f32 op.
+    iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, axis).astype(jnp.float32)
     picked = []
-    for _ in range(topk):
+    for j in range(topk):
         m = jnp.max(x, axis=axis, keepdims=True)
         # Lowest column attaining the max; the rest fill with the last expert
         # so the min never selects a phantom.
@@ -75,8 +76,9 @@ def _select_kernel(x_ref, *refs, topk: int, n: int, pick: bool, lanes_are_rows: 
         hit = iota == idx
         if pick:
             m = jnp.max(jnp.where(hit, y, -jnp.inf), axis=axis, keepdims=True)
-        picked.append((m, idx))
-        x = jnp.where(hit, masked, x)
+        picked.append((m, idx.astype(jnp.int32)))
+        if j + 1 < topk:
+            x = jnp.where(hit, masked, x)
     if lanes_are_rows:
         # Back to [rows, topk]: one lane-dense row per pass, transposed once.
         w_ref[...] = jnp.concatenate([m for m, _ in picked], axis=0).T
