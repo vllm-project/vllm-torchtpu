@@ -470,11 +470,13 @@ def test_gmm_v2_int4_packed_matches_reference():
 
 
 @pytest.mark.tpu_test
-def test_gmm_fp4_fp8_w8a8_matches_reference(monkeypatch):
+# 8 scale blocks take the dense requant ratio, 12 the replicated-load one.
+@pytest.mark.parametrize("in_size", [1024, 1536])
+def test_gmm_fp4_fp8_w8a8_matches_reference(monkeypatch, in_size):
     """TPU_GMM_FP8_W8A8 prefill buffer: fp8 x fp8 within e4m3 rounding."""
     _require_tpu()
 
-    in_size, out_size, num_groups, block_size = 1024, 512, 16, 128
+    out_size, num_groups, block_size = 512, 16, 128
     group_sizes = jnp.asarray(
         [300, 0, 17, 64, 1, 250, 0, 0, 512, 3, 0, 90, 0, 200, 0, 40], jnp.int32
     )

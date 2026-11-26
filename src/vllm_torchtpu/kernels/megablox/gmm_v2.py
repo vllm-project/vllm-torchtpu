@@ -187,6 +187,11 @@ class RhsRef(ABC):
     @abstractmethod
     def get_bias(self) -> jax.Array: ...
 
+    @abstractmethod
+    def get_dense_scale(self) -> jax.Array:
+        """Returns the [num_blocks, tile_n] scales, blocks along sublanes."""
+        ...
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -211,6 +216,11 @@ class WeightsRef(RhsRef):
         assert self.bias is not None
         return self.bias[...]
 
+    def get_dense_scale(self) -> jax.Array:
+        assert self.scale is not None
+        num_blocks, _, tile_n = self.scale.shape
+        return self.scale.reshape(num_blocks, tile_n)[...]
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
@@ -234,6 +244,11 @@ class FusedWeightsRef(RhsRef):
         b_gate = self.gate.get_bias()
         b_up = self.up.get_bias()
         return interleave_lane(b_gate, b_up)
+
+    def get_dense_scale(self) -> jax.Array:
+        s_gate = self.gate.get_dense_scale()
+        s_up = self.up.get_dense_scale()
+        return interleave_lane(s_gate, s_up)
 
 
 @jax.tree_util.register_dataclass
@@ -330,28 +345,59 @@ def fp8_rhs_feed_dtype(
     return None
 
 
+def requant_ratio_is_dense(num_blocks: int, work_dtype: jnp.dtype) -> bool:
+    """Whether requantize_fp8_colscale computes its ratio on dense
+    [num_blocks, tile_n] scales: the blocks fill whole f32 vregs, and a u32
+    word holds two work_dtype ratios."""
+    sublanes = pltpu.get_tpu_info().get_sublane_tiling(jnp.float32)
+    return num_blocks % sublanes == 0 and jax.dtypes.itemsize_bits(work_dtype) == 16
+
+
 def requantize_fp8_colscale(
     w: jax.Array,  # fp4 [tile_k, tile_n]
-    block_scale: jax.Array,  # f32 [tile_k // qbs, 1, tile_n]
+    block_scale: jax.Array,  # f32 [nb, tile_n] or [nb, f32 sublanes, tile_n]
     qbs: int,
     work_dtype: jnp.dtype,
+    ratio_ref: jax.Array | None,  # u32 [tile_k // qbs, tile_n] VMEM, dense only
 ) -> tuple[jax.Array, jax.Array]:
     """Re-expresses per-K-block scaled fp4 as e4m3 with one scale per column.
 
     Returns (w8, col_scale [1, tile_n] f32) with w8 * col_scale ~= w * block_scale,
     so the tile is a single full-depth fp8 matmul scaled once at the end,
     without the per-block f32 accumulate of the per-block fp8 feed.
+
+    block_scale is either dense (requant_ratio_is_dense) or each block's row
+    replicated over the f32 sublanes (a stride-0 load). Either way the
+    per-block ratio reaches the multiply as a full work_dtype tile without
+    sublane shuffles; both give the same values.
     """
     fp8 = jnp.float8_e4m3fn
     w_max = float(jnp.finfo(w.dtype).max)
-    col_max = jnp.max(block_scale, axis=0)  # [1, tile_n]
+    col_max = jnp.max(block_scale, axis=0, keepdims=True)
     col_scale = col_max * (w_max / float(jnp.finfo(fp8).max))
-    ratio = (block_scale / jnp.where(col_scale == 0, 1.0, col_scale)).astype(
-        work_dtype
-    )
-    num_blocks, tile_n = block_scale.shape[0], w.shape[1]
-    w_blocks = w.astype(work_dtype).reshape(num_blocks, qbs, tile_n) * ratio
-    return w_blocks.reshape(-1, tile_n).astype(fp8), col_scale
+    ratio = block_scale / jnp.where(col_scale == 0, 1.0, col_scale)
+    num_blocks, tile_n = block_scale.shape[0], block_scale.shape[-1]
+    rows32 = pltpu.get_tpu_info().get_sublane_tiling(jnp.uint32)
+    rows = rows32 * 32 // jax.dtypes.itemsize_bits(work_dtype)
+    assert rows % rows32 == 0 and qbs % rows == 0, (work_dtype, qbs)
+    assert block_scale.ndim == (2 if ratio_ref is not None else 3), block_scale.shape
+
+    def ratio_tile(b):  # [rows, tile_n] work_dtype, every row ratio[b]
+        if ratio_ref is not None:
+            return pltpu.bitcast(ratio_ref[pl.ds(b, rows32, stride=0), :], work_dtype)
+        return jnp.concatenate([ratio[b]] * (rows // rows32)).astype(work_dtype)
+
+    if ratio_ref is not None:
+        # Each u32 word holds its block's work_dtype ratio twice, so a stride-0
+        # load of row b is a work_dtype tile whose every row is ratio[b].
+        bits = pltpu.bitcast(ratio.astype(work_dtype).astype(jnp.float32), jnp.uint32)
+        ratio_ref[...] = bits | (bits >> 16)
+    w8 = []
+    for b in range(num_blocks):
+        r = jnp.broadcast_to(ratio_tile(b)[None], (qbs // rows, rows, tile_n))
+        w_b = w[b * qbs : (b + 1) * qbs].astype(work_dtype)
+        w8.append((w_b * r.reshape(qbs, tile_n)).astype(fp8))
+    return jnp.concatenate(w8, axis=0), col_scale.reshape(-1, tile_n)[:1]
 
 
 def quantize_rows_fp8(x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -404,6 +450,17 @@ class GmmConfigs:
         MXU's lhs stream, which fp8 halves (fp8 rhs alone does not help)."""
         return bucket_m > FP8_RHS_MAX_BUCKET_M and fp8_w8a8_enabled(
             self.dims, self.lhs_cfgs, self.rhs_cfgs
+        )
+
+    def uses_dense_requant_ratio(self, bucket_m: int) -> bool:
+        """Whether this bucket's fp8 x fp8 requant stages a dense ratio in VMEM
+        (requant_ratio_is_dense)."""
+        return (
+            self.fp8_rhs_dtype(bucket_m) is None
+            and self.uses_fp8_w8a8(bucket_m)
+            and requant_ratio_is_dense(
+                self.num_quant_blocks_per_tile_k, self.lhs_cfgs.dtype
+            )
         )
 
     @property
@@ -569,7 +626,12 @@ def inner_kernel(
     m_start_local = m_start - m_offset
     m_end_local = m_end - m_offset
 
-    def _matmul(is_first_k_step: bool, is_last_k_step: bool, bucket_m: int):
+    def _matmul_step(
+        is_first_k_step: bool,
+        is_last_k_step: bool,
+        bucket_m: int,
+        ratio_ref: jax.Array | None = None,
+    ):
         tpu_info = pltpu.get_tpu_info()
         mxu_size = tpu_info.mxu_column_size
 
@@ -586,7 +648,11 @@ def inner_kernel(
         fp8_rhs = cfgs.fp8_rhs_dtype(bucket_m)
         col_scale = row_scale = None
         if fp8_rhs is None and cfgs.uses_fp8_w8a8(bucket_m):
-            block_scale = tiled_rhs_ref.get_scale()
+            if ratio_ref is not None:
+                block_scale = tiled_rhs_ref.get_dense_scale()
+            else:
+                rows32 = tpu_info.get_sublane_tiling(jnp.float32)
+                block_scale = tiled_rhs_ref.get_scale(replicate_size=rows32)
             valid_k = cfgs.dims.size_k % cfgs.tiles.tile_k
             if is_last_k_step and valid_k != 0:
                 # Rows past size_k are stale VMEM; keep them out of both amaxes.
@@ -595,7 +661,7 @@ def inner_kernel(
                 blk = lax.broadcasted_iota(jnp.int32, block_scale.shape, 0)
                 block_scale = jnp.where(blk * rhs_qbs < valid_k, block_scale, 0)
             tiled_rhs, col_scale = requantize_fp8_colscale(
-                tiled_rhs, block_scale, rhs_qbs, cfgs.lhs_cfgs.dtype
+                tiled_rhs, block_scale, rhs_qbs, cfgs.lhs_cfgs.dtype, ratio_ref
             )
             tiled_lhs, row_scale = quantize_rows_fp8(tiled_lhs)
             rhs_qbs = cfgs.tiles.tile_k
@@ -767,6 +833,21 @@ def inner_kernel(
             )
         else:
             acc_ref[:acc_m] = acc
+
+    def _matmul(is_first_k_step: bool, is_last_k_step: bool, bucket_m: int):
+        step = functools.partial(
+            _matmul_step, is_first_k_step, is_last_k_step, bucket_m
+        )
+        if not cfgs.uses_dense_requant_ratio(bucket_m):
+            step()
+            return
+        # Not in gmm_vmem_estimate: tile_k * tile_n / 32 bytes, ~2% of the
+        # triple-buffered fp4 weight blocks.
+        ratio_shape = (cfgs.num_quant_blocks_per_tile_k, acc_ref.shape[-1])
+        pl.run_scoped(
+            lambda ratio_ref: step(ratio_ref=ratio_ref),
+            pltpu.VMEM(ratio_shape, jnp.uint32),
+        )
 
     bucket_sizes = cfgs.tiles.bucket_sizes
 
