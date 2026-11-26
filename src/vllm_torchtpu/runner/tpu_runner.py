@@ -86,7 +86,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, rope_in_graph_flag, rope_patch, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -113,6 +113,7 @@ from vllm_torchtpu.kernels.mla import dispatch as mla_dispatch
 from vllm_torchtpu.layers.adapter import (
     dp_vocab_parallel,
     expert_placement,
+    moe_skip_policy,
     token_padding,
 )
 from vllm_torchtpu.layers.adapter.attention import (
@@ -129,8 +130,12 @@ from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_rows,
     copy_pool_blocks,
 )
+from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
+    enable_pipelined_collective_and_compute,
+)
 from vllm_torchtpu.layers.adapter.quantization import get_tpu_quantization_config
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online_fp8
+from vllm_torchtpu.layers.adapter.quantization.unquantized import VllmUnquantizedConfig
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
@@ -166,6 +171,7 @@ from vllm_torchtpu.runner import (
     chunk_processors,
     greedy_top_tokens,
     prompt_logprobs,
+    routed_experts,
     spec_boundary_state,
     thinking_budget_tracker,
 )
@@ -715,6 +721,7 @@ class TPUModelRunner(GPUModelRunner):
     _dp_step_other_decode: bool = False
     _adaptive_verification: AdaptiveVerificationManager | None = None
     _thinking_budget: thinking_budget_tracker.ThinkingBudgetTracker | None = None
+    _routed_experts: routed_experts.RoutedExpertsCapture | None = None
     # 1.0 on TP rank 0, else 0.0; set when TP > 1. Kept apart from the draft
     # pin's mask, whose dtype follows the draft tokens.
     _tp_rank0_confidence_mask: torch.Tensor | None = None
@@ -1270,6 +1277,9 @@ class TPUModelRunner(GPUModelRunner):
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
+        # BF16 MoE padded-token skipping policy, resolved before model loading
+        # and MoE kernel prebuild.
+        self._bf16_moe_skip_policy = moe_skip_policy.Bf16MoeSkipPolicy(enabled=False)
         # Set at load when TPU_GREEDY_TOP_TOKENS is on.
         self._greedy_head_owner: torch.nn.Module | None = None
 
@@ -1523,6 +1533,27 @@ class TPUModelRunner(GPUModelRunner):
                     f"{self.speculative_config.method}"
                 )
 
+    def _patch_rope_in_graph(self, *models: torch.nn.Module | None) -> None:
+        """Replace position-indexed rotary cache buffers on ``models`` in-graph."""
+        live_models = [m for m in models if m is not None]
+        if not live_models:
+            return
+        patched = sum(
+            rope_patch.patch_in_graph_rotary_embedding(m, allow_table_recovery=False)
+            for m in live_models
+        )
+        tier1_count = sum(
+            1
+            for _, sub in runner_utils.iter_unique_modules(*live_models)
+            if getattr(sub, "_tpu_in_graph_tier1", False)
+        )
+        if tier1_count or patched:
+            logger.info(
+                "Enabled in-graph RoPE on %d Tier-1 and %d Tier-2 rotary module(s).",
+                tier1_count,
+                patched,
+            )
+
     def _relayout_tables(self, model: torch.nn.Module | None) -> None:
         """Give ``model`` the table shapes and row-major layouts the env knobs ask for.
 
@@ -1609,7 +1640,7 @@ class TPUModelRunner(GPUModelRunner):
                 num_eligible,
                 len(truncated_by_id),
             )
-        else:
+        elif not rope_in_graph_flag.in_graph_enabled(self.vllm_config):
             logger.warning(
                 "TPU_ROPE_CACHE_TRUNCATE is set but the model has no "
                 "position-indexed rope cache, nothing was truncated"
@@ -1988,6 +2019,18 @@ class TPUModelRunner(GPUModelRunner):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
         if self.pcp_manager is not None:
             self.pcp_manager.set_page_size(mla_kv_page_size(kv_cache_config))
+        if self.vllm_config.aux_output_config.enabled:
+            # Before warmup traces the backbone: a compiled forward keeps the
+            # hooks bound when it was traced.
+            self._routed_experts = routed_experts.RoutedExpertsCapture(
+                self.vllm_config, self.model, kv_cache_config
+            )
+
+    def close_routed_experts(self) -> None:
+        """Closes the routed-experts connector at shutdown, as vLLM's runner
+        does."""
+        if self._routed_experts is not None:
+            self._routed_experts.close()
 
     def _init_prefill_checkpoint_units(self, kv_cache_config: KVCacheConfig) -> None:
         """Initializes the units the worker places prefill checkpoints with.
@@ -4390,6 +4433,14 @@ class TPUModelRunner(GPUModelRunner):
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
+        if self._routed_experts is not None:
+            # Before the zero-token return below: a step that schedules no
+            # tokens can still be the only one that reports some requests as
+            # finished, and the connector releases a request only when it sees
+            # that report.
+            self._routed_experts.begin_step(
+                scheduler_output.aux_output_connector_metadata
+            )
         if self.scheduler_config.async_scheduling:
             self._unmap_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
@@ -4712,6 +4763,10 @@ class TPUModelRunner(GPUModelRunner):
                     positions=self.position_ids,
                     inputs_embeds=inputs_embeds,
                     intermediate_tensors=intermediate_tensors,
+                )
+            if self._routed_experts is not None:
+                self._routed_experts.take_forward(
+                    num_tokens_padded, int(self.query_start_loc_np[num_reqs])
                 )
 
             if nan_check is not None:
@@ -5968,6 +6023,13 @@ class TPUModelRunner(GPUModelRunner):
                     combined_selected_tokens_real_lens,
                     logprobs=logprobs_chunks,
                 )
+        routed_experts_output = None
+        if self._routed_experts is not None:
+            routed_experts_output = self._routed_experts.prepare_output(
+                req_ids,
+                scheduler_output.num_scheduled_tokens,
+                self.input_batch.num_computed_tokens_cpu[: len(req_ids)],
+            )
 
         if self.scheduler_config.async_scheduling:
             self._modify_prev_results()
@@ -6211,6 +6273,7 @@ class TPUModelRunner(GPUModelRunner):
                 model_runner_output=model_runner_output,
                 copy_state=copy_state,
                 discard_sampled_tokens_req_indices=discard_sampled_tokens_req_indices,
+                routed_experts=routed_experts_output,
             )
 
         if not self.scheduler_config.async_scheduling:
@@ -6271,6 +6334,9 @@ class TPUModelRunner(GPUModelRunner):
             "Setting TPU quantization config for: %s", self.model_config.quantization
         )
         self.vllm_config.quant_config = get_tpu_quantization_config(self.vllm_config)
+        # Resolve BF16 MoE padded-token skipping before model loading so the
+        # MoE layers, kernel prebuild and TokenPaddingState share one mode.
+        self._bf16_moe_skip_policy = self._resolve_bf16_moe_skip_policy()
 
         # No placed layers or target depth left over from an earlier load.
         expert_placement.reset_model_state()
@@ -6282,6 +6348,7 @@ class TPUModelRunner(GPUModelRunner):
                 mesh=self.mesh, vllm_config=self.vllm_config
             ),
             set_current_vllm_config(self.vllm_config),
+            moe_skip_policy.bf16_policy_scope(self._bf16_moe_skip_policy),
         ):
             load_model = cast(Callable[..., torch.nn.Module], model_loader.load_model)
             model = load_model(
@@ -6331,7 +6398,7 @@ class TPUModelRunner(GPUModelRunner):
         # If using eagle3/mtp or dflash speculative decoding, load the draft model and
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
-            self._async_drafter.load_model(self.model)
+            self._load_async_drafter()
             # The draft reuses the target's Pallas ops (cached by op name),
             # which were traced against the target's relayouted tables. Its
             # own rope caches and hash tables need the same layout, or the
@@ -6360,6 +6427,13 @@ class TPUModelRunner(GPUModelRunner):
                         dtype=torch.float32,
                         device=self.device,
                     )
+
+        if rope_in_graph_flag.in_graph_enabled(self.vllm_config):
+            # After any draft loads, so the sweep also covers the draft model.
+            self._patch_rope_in_graph(
+                self.model,
+                self._async_drafter.draft_model if self._is_async_drafter else None,
+            )
 
         # After the drafter: every placed MoE layer, the drafter's too, must
         # have had its router renumbered with its experts.
@@ -6400,7 +6474,9 @@ class TPUModelRunner(GPUModelRunner):
                     max_padded_tokens, self.max_num_reqs * self.drafter.block_size
                 )
             self._token_padding_state = token_padding.TokenPaddingState.create(
-                max_padded_tokens, self.device
+                max_padded_tokens,
+                self.device,
+                track_valid_tokens=self._bf16_moe_skip_policy.enabled,
             )
             token_padding.set_padding_state(self._token_padding_state)
 
@@ -6462,6 +6538,9 @@ class TPUModelRunner(GPUModelRunner):
             kv_connector=utils.estimate_kv_connector_hbm_reserve(self.vllm_config),
             lora_slot_write=self.lora_slot_write_hbm_bytes(),
             pp_handoff=self.pp_handoff_hbm_reserve_bytes(),
+            routed_experts=routed_experts.hbm_reserve_bytes(
+                self.vllm_config, self.num_tokens_paddings
+            ),
         )
 
     def _initialize_pallas_kernels(self):
@@ -8111,6 +8190,39 @@ class TPUModelRunner(GPUModelRunner):
                 self._backbone_dummy_runs(num_tokens)
         if self._pp_handoff is not None:
             self._warmup_handoff_forwards()
+
+    def _resolve_bf16_moe_skip_policy(self) -> moe_skip_policy.Bf16MoeSkipPolicy:
+        """Resolve BF16 MoE padded-token skipping before model loading.
+
+        Gated here, ahead of ``VllmUnquantizedFusedMoEMethod`` construction,
+        GMM kernel prebuild, and the first backbone trace. The BF16 MoE layers
+        log a fallback when they are built.
+        """
+        return moe_skip_policy.resolve_bf16_moe_skip_policy(
+            skip_flag=bool(envs.TPU_MOE_SKIP_PADDED_TOKENS),
+            parallel_config=self.parallel_config,
+            pipelined_collective=enable_pipelined_collective_and_compute(),
+            fused_decode_kernel=bool(
+                envs.USE_MOE_TP_DECODE_KERNEL or envs.FUSED_MOE_DECODE_KERNEL
+            ),
+            has_speculative=(
+                self.speculative_config is not None or self.drafter is not None
+            ),
+            has_lora=self.lora_config is not None,
+            is_unquantized_model=isinstance(
+                self.vllm_config.quant_config, VllmUnquantizedConfig
+            ),
+        )
+
+    def _load_async_drafter(self) -> None:
+        """Load the draft model under the target's BF16 MoE skipping policy.
+
+        The draft's BF16 MoE layers must take the runner's policy: it is off
+        under speculative decoding, so TokenPaddingState tracks no valid-token
+        count for them to read.
+        """
+        with moe_skip_policy.bf16_policy_scope(self._bf16_moe_skip_policy):
+            self._async_drafter.load_model(self.model)
 
     def _backbone_dummy_runs(self, num_tokens: int) -> None:
         """One warmup forward of the backbone per context bucket."""

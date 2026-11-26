@@ -70,6 +70,45 @@ _VALID_CI_EXTRAS = frozenset(
     (*_LABEL_EXTRAS.values(), *tpu_generations.TPU_GENERATION_EXTRAS)
 )
 _VALID_MERGE_EXTRAS = frozenset((*_LABEL_EXTRAS.values(), "precheck-only"))
+_CANARY_LEGS: dict[str, str] = {
+    "torch-tpu": "torch-tpu",
+    "torch_tpu": "torch-tpu",
+    "tpu-sync": "tpu-sync",
+    "tpu_sync": "tpu-sync",
+    "tpu-sync-torch": "tpu-sync",
+}
+
+
+@dataclass(frozen=True)
+class PipelineProfile:
+    """Default suite, build kind, and canary role for a Buildkite pipeline slug."""
+
+    default_suite: str | None = None
+    build_kind: str | None = None
+    uses_vllm_head: bool = False
+    # Canonical leg ("torch-tpu" or "tpu-sync") published to Buildkite
+    # meta-data (TORCHTPU_NIGHTLY_LEG) for setup_docker_env.sh.
+    canary_leg: str | None = None
+
+
+# Single mapping of standard (and legacy) canary Buildkite pipeline slugs to
+# their default suite, build kind, and canary leg.
+# TODO: Remove `vllm-torchtpu-integration` once Buildkite schedules and
+# triggers migrate to `vllm-torchtpu-canary-vllm`.
+_PIPELINE_PROFILES: dict[str, PipelineProfile] = {
+    "vllm-torchtpu-canary-vllm": PipelineProfile(
+        default_suite="vllm-canary", build_kind="other", uses_vllm_head=True
+    ),
+    "vllm-torchtpu-integration": PipelineProfile(
+        default_suite="vllm-canary", build_kind="other", uses_vllm_head=True
+    ),
+    "vllm-torchtpu-canary-torchtpu": PipelineProfile(
+        default_suite="default", build_kind="nightly", canary_leg="torch-tpu"
+    ),
+    "vllm-torchtpu-canary-tpu-sync": PipelineProfile(
+        default_suite="default", build_kind="nightly", canary_leg="tpu-sync"
+    ),
+}
 _PR_NUM_RE = re.compile(r"^[0-9]+$")
 _MQ_BRANCH_PR_RE = re.compile(r"^gh-readonly-queue/.+/pr-([0-9]+)-[^/]+$")
 _CI_MERGE_MARKER_RE = re.compile(
@@ -127,6 +166,58 @@ def _lanes_phrase(lanes: Sequence[str]) -> str:
     return f"{_and_list(lanes)} lane{'s' if len(lanes) > 1 else ''}"
 
 
+def resolve_canary_leg(
+    env: Mapping[str, str], *, profile_leg: str | None = None
+) -> str | None:
+    """Resolve, normalize, and validate the wheel-canary leg (`torch-tpu`,
+    `tpu-sync`, or `None`).
+
+    Precedence:
+    1. `TORCHTPU_NIGHTLY_LEG` env override (normalized via `_CANARY_LEGS`).
+    2. `profile_leg` from `_PIPELINE_PROFILES` (`BUILDKITE_PIPELINE_SLUG`).
+    3. `TORCH_TPU_VERSION_OVERRIDE` / `TPU_SYNC_TORCH_VERSION_OVERRIDE` (at most
+       one may be set, and it must match an explicit or profile leg when set).
+    4. `TORCHTPU_NIGHTLY=1` fallback -> `"torch-tpu"`.
+    """
+    torch_tpu_ver = env.get("TORCH_TPU_VERSION_OVERRIDE", "").strip()
+    tpu_sync_ver = env.get("TPU_SYNC_TORCH_VERSION_OVERRIDE", "").strip()
+    if torch_tpu_ver and tpu_sync_ver:
+        raise BootstrapError(
+            "ERROR: both TORCH_TPU_VERSION_OVERRIDE and "
+            "TPU_SYNC_TORCH_VERSION_OVERRIDE are set; "
+            "set only one version override per build"
+        )
+    raw_leg = env.get("TORCHTPU_NIGHTLY_LEG", "").strip()
+    env_leg: str | None = None
+    if raw_leg:
+        env_leg = _CANARY_LEGS.get(raw_leg)
+        if env_leg is None:
+            raise BootstrapError(
+                f"ERROR: unsupported TORCHTPU_NIGHTLY_LEG '{raw_leg}'; "
+                "expected torch-tpu or tpu-sync"
+            )
+    leg = env_leg or profile_leg
+    if torch_tpu_ver:
+        if leg == "tpu-sync":
+            raise BootstrapError(
+                "ERROR: TORCH_TPU_VERSION_OVERRIDE is set, but selected "
+                "canary leg is 'tpu-sync' (expected torch-tpu)"
+            )
+        return "torch-tpu"
+    if tpu_sync_ver:
+        if leg == "torch-tpu":
+            raise BootstrapError(
+                "ERROR: TPU_SYNC_TORCH_VERSION_OVERRIDE is set, but selected "
+                "canary leg is 'torch-tpu' (expected tpu-sync)"
+            )
+        return "tpu-sync"
+    if leg is not None:
+        return leg
+    if _env_or(env, "TORCHTPU_NIGHTLY", "0") == "1":
+        return "torch-tpu"
+    return None
+
+
 @dataclass(frozen=True)
 class BuildContext:
     """Immutable snapshot of the build environment read at startup."""
@@ -146,6 +237,7 @@ class BuildContext:
     suite_override: str
     vllm_commit_override: str
     pr_tpu_concurrency_group_env: str
+    canary_leg: str | None = None
     merge_queue_base_branch: str = ""
     merge_queue_base_commit: str = ""
     ci_run_tpu: bool = False
@@ -187,8 +279,22 @@ class BuildContext:
         )
 
     @property
-    def is_integration(self) -> bool:
-        return self.pipeline_slug == "vllm-torchtpu-integration"
+    def pipeline_profile(self) -> PipelineProfile | None:
+        return _PIPELINE_PROFILES.get(self.pipeline_slug)
+
+    @property
+    def resolved_suite_override(self) -> str:
+        return _SUITE_ALIASES.get(self.suite_override, self.suite_override)
+
+    @property
+    def is_vllm_canary(self) -> bool:
+        return self.resolved_suite_override == "vllm-canary" or bool(
+            self.pipeline_profile and self.pipeline_profile.uses_vllm_head
+        )
+
+    @property
+    def is_torchtpu_canary(self) -> bool:
+        return self.torchtpu_nightly_env or self.canary_leg is not None
 
     @property
     def is_oncall_fix(self) -> bool:
@@ -275,6 +381,11 @@ class BuildContext:
                     "v6e alone"
                 )
         ci_extras = _parse_ci_extras(env.get("CI_EXTRAS", ""))
+        pipeline_slug = env.get("BUILDKITE_PIPELINE_SLUG", "")
+        profile = _PIPELINE_PROFILES.get(pipeline_slug)
+        canary_leg = resolve_canary_leg(
+            env, profile_leg=profile.canary_leg if profile else None
+        )
         pr_raw = _env_or(env, "BUILDKITE_PULL_REQUEST", "false")
         pull_request = None if pr_raw == "false" else pr_raw
         mq_base_branch = env.get("BUILDKITE_MERGE_QUEUE_BASE_BRANCH", "")
@@ -304,13 +415,14 @@ class BuildContext:
             message=env.get("BUILDKITE_MESSAGE", ""),
             source=env.get("BUILDKITE_SOURCE", ""),
             tag=env.get("BUILDKITE_TAG", ""),
-            pipeline_slug=env.get("BUILDKITE_PIPELINE_SLUG", ""),
+            pipeline_slug=pipeline_slug,
             pull_request=pull_request,
             pr_base_branch=_env_or(env, "BUILDKITE_PULL_REQUEST_BASE_BRANCH", "main"),
             labels=labels,
             author_email=author,
             nightly_env=_env_or(env, "NIGHTLY", "0") == "1",
             torchtpu_nightly_env=_env_or(env, "TORCHTPU_NIGHTLY", "0") == "1",
+            canary_leg=canary_leg,
             suite_override=suite_override,
             vllm_commit_override=env.get("VLLM_COMMIT_HASH_OVERRIDE", ""),
             pr_tpu_concurrency_group_env=env.get("PR_TPU_CONCURRENCY_GROUP", ""),
@@ -361,12 +473,18 @@ SUITES: dict[str, Suite] = {
             stages=(("build", "perf"),),
         ),
         Suite(
-            "integration",
+            "vllm-canary",
             "full suite against vLLM HEAD, then LKG promotion",
             # pipeline_promote.yml's own `wait` holds it until the tests finish
             stages=((*_ALL_LANES, "promote"),),
         ),
     )
+}
+
+# Backward-compatible CI_SUITE aliases during workflow rename rollout.
+# TODO: Remove once Buildkite schedules and triggers use `vllm-canary`.
+_SUITE_ALIASES: dict[str, str] = {
+    "integration": "vllm-canary",
 }
 
 # Two-stage PR suites (plus cpu-only). `run-perf-eval` and `run-full-ci` share
@@ -399,17 +517,18 @@ _PR_SUITES: dict[str, Suite] = {
 def choose_suite(ctx: BuildContext) -> Suite:
     """Return the `Suite` for `ctx`; `CI_SUITE` takes precedence."""
     if ctx.suite_override:
-        if ctx.suite_override not in SUITES:
+        suite_name = ctx.resolved_suite_override
+        if suite_name not in SUITES:
             raise BootstrapError(
                 f"ERROR: unknown CI_SUITE '{ctx.suite_override}'; "
                 f"suites are: {' '.join(SUITES)}"
             )
-        return SUITES[ctx.suite_override]
+        return SUITES[suite_name]
     ctx.check_suite_labels()
     if not ctx.runs_tpu:
         return _PR_SUITES["cpu-only"]
-    if ctx.is_integration:
-        return SUITES["integration"]
+    if ctx.pipeline_profile and ctx.pipeline_profile.default_suite:
+        return SUITES[ctx.pipeline_profile.default_suite]
     if ctx.is_pr_like:
         if "nightly-suite" in ctx.extras:
             return _PR_SUITES["pr+full"]
@@ -426,7 +545,7 @@ def tpu_generations_note(ctx: BuildContext, suite: Suite) -> str | None:
     adds every other generation the lane lists, and TPU_V6E_EXTRA runs v6e
     alone (see upload_generations).
 
-    Raises BootstrapError on a merge-queue, release or integration build, whose
+    Raises BootstrapError on a merge-queue, release or vLLM-canary build, whose
     failures block a merge, a release (release/ci_gate.py) or the LKG
     promotion (pipeline_promote.yml's `wait`), since v6e's steps do not pass
     yet and are not soft_fail; when no lane of the build can use the extra; or
@@ -440,11 +559,11 @@ def tpu_generations_note(ctx: BuildContext, suite: Suite) -> str | None:
         return None
     # A merge-queue build's extras come from its /ci merge marker, which cannot
     # name this one; checked anyway, so the rule does not rest on that.
-    if ctx.is_merge_queue or ctx.is_release or ctx.is_integration:
+    if ctx.is_merge_queue or ctx.is_release or ctx.is_vllm_canary:
         raise BootstrapError(
             f"ERROR: the {name} extra runs TPU {gens.TPU_V6E.name} steps, which "
             "do not pass yet and are not soft_fail; it is refused on a "
-            "merge-queue, release or integration build"
+            "merge-queue, release or vLLM-canary build"
         )
     files = gens.TPU_GENERATION_FILES
     lanes = [lane for stage in suite.stages for lane in stage]
@@ -510,12 +629,16 @@ PRIORITIES: dict[str, tuple[int, str | None]] = {
 
 def build_kind(ctx: BuildContext) -> str:
     """Classify the build into one of the `PRIORITIES` keys."""
-    if ctx.nightly_env or ctx.torchtpu_nightly_env:
+    if ctx.nightly_env or ctx.is_torchtpu_canary:
         return "nightly"
     if ctx.is_oncall_fix:
         return "oncall-fix"
     if ctx.is_pr or ctx.is_ci_command:
         return "pre-merge"
+    if ctx.pipeline_profile and ctx.pipeline_profile.build_kind:
+        return ctx.pipeline_profile.build_kind
+    if ctx.is_vllm_canary:
+        return "other"
     if ctx.branch == "main" or ctx.is_merge_queue:
         return "post-merge"
     return "other"
@@ -758,7 +881,9 @@ def _changed_files(ctx: BuildContext, *, env: Mapping[str, str]) -> list[str]:
         )
         return [line for line in tree.stdout.splitlines() if line]
 
-    if ctx.source != "schedule" and not (ctx.nightly_env or ctx.torchtpu_nightly_env):
+    if ctx.source != "schedule" and not (
+        ctx.nightly_env or ctx.is_torchtpu_canary or ctx.is_vllm_canary
+    ):
         # Any other build is of a commit, which on main is the squash merge of
         # one PR, so its diff against its parent is the whole change. Not a
         # scheduled or nightly-flagged build: nightlies test main as it stands,
@@ -1256,9 +1381,9 @@ def run_bootstrap(
             return 0
         print("Code files changed. Proceeding with pipeline upload.")
 
-    # 3. vLLM commit.
+    # 3. vLLM commit and canary leg.
     print("--- Starting Buildkite Bootstrap")
-    if ctx.is_integration:
+    if ctx.is_vllm_canary:
         tokens = _git(
             "ls-remote",
             "https://github.com/vllm-project/vllm.git",
@@ -1272,6 +1397,11 @@ def run_bootstrap(
     vllm_commit_hash = ctx.vllm_commit_override or base_vllm_hash
     _agent("meta-data", "set", "VLLM_COMMIT_HASH", vllm_commit_hash, env=child_env)
     print(f"Using vLLM commit: {vllm_commit_hash}")
+    if ctx.canary_leg is not None:
+        _agent(
+            "meta-data", "set", "TORCHTPU_NIGHTLY_LEG", ctx.canary_leg, env=child_env
+        )
+        print(f"Using canary leg: {ctx.canary_leg}")
 
     # 4. Suite selection, NIGHTLY policy, and annotation.
     if (
@@ -1398,9 +1528,16 @@ def run_bootstrap_dev(
 ) -> int:
     """Execute the `vllm-torchtpu-dev` bootstrap flow (`bootstrap_dev.sh`)."""
     child_env = dict(os.environ if env is None else env)
+    profile = _PIPELINE_PROFILES.get(child_env.get("BUILDKITE_PIPELINE_SLUG", ""))
+    canary_leg = resolve_canary_leg(
+        child_env, profile_leg=profile.canary_leg if profile else None
+    )
     vllm_commit_hash = read_pinned_vllm_commit(repo_root)
     _agent("meta-data", "set", "VLLM_COMMIT_HASH", vllm_commit_hash, env=child_env)
     print(f"Using vLLM commit: {vllm_commit_hash}")
+    if canary_leg is not None:
+        _agent("meta-data", "set", "TORCHTPU_NIGHTLY_LEG", canary_leg, env=child_env)
+        print(f"Using canary leg: {canary_leg}")
 
     # Dev builds are experiments — they must never outrank real CI on a shared
     # queue. Default to PRIORITIES["other"][0] (2); override per build with

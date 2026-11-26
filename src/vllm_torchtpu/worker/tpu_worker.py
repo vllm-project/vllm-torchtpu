@@ -20,12 +20,14 @@ import ctypes
 import gc
 import os
 import time
+import types
 from typing import Any, cast
 from urllib.parse import urlparse
 
 import torch
 import torch.profiler
 import torch_tpu  # noqa: F401
+from torch._dynamo.utils import counters as dynamo_counters
 from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
@@ -133,6 +135,48 @@ def _release_free_host_heap() -> None:
     elif hasattr(process, "malloc_trim"):
         process.malloc_trim(0)
         logger.info("Released free host heap via glibc malloc_trim.")
+
+
+# TODO(https://github.com/pytorch/pytorch/issues/206390): Remove this constant,
+# _drop_traced_module_refs(), and its call in compile_or_warm_up_model() once
+# torch's aot_module_simplified stops attaching the traced module's zero_grad,
+# named_parameters and named_buffers to the forward it returns; the
+# graph-liveness check in test_drop_traced_module_refs_frees_compile_time_graphs
+# then fails.
+_AOT_TRACED_MODULE_ATTRS = ("zero_grad", "named_parameters", "named_buffers")
+
+
+def _drop_traced_module_refs() -> None:
+    """Drop the traced modules that aot_autograd leaves on compiled forwards.
+
+    `aot_module_simplified` hangs the traced GraphModule's `zero_grad`,
+    `named_parameters` and `named_buffers` on the forward it returns, and
+    Dynamo's `disable()` wrapper copies them along with the forward's
+    `__qualname__`. Inference never calls them, but they keep every
+    compile-time graph, with its fake tensors and stack traces, in host memory
+    for the life of the worker.
+    """
+    # Every compile path that reaches `aot_module_simplified` increments
+    # `counters["aot_autograd"]["ok"]` in `AotAutograd.__call__`, while cached
+    # artifact replays (`deserialize_bundled_cache_entry`) do not. Skip the
+    # full-heap scan when no fresh AOTAutograd compiles ran in this worker
+    # (including profile_run).
+    if not dynamo_counters["aot_autograd"]["ok"]:
+        return
+    dropped = 0
+    for obj in gc.get_objects():
+        # type(), not isinstance(): isinstance() reads __class__, which some
+        # deprecated torch objects turn into a warning.
+        if type(obj) is not types.FunctionType or not obj.__qualname__.endswith(
+            "aot_module_simplified.<locals>.forward"
+        ):
+            continue
+        attrs = obj.__dict__
+        for name in _AOT_TRACED_MODULE_ATTRS:
+            if name in attrs:
+                del attrs[name]
+                dropped += 1
+    logger.info("Dropped %d traced-module references from compiled forwards.", dropped)
 
 
 class TPUWorker(WorkerBase):
@@ -644,6 +688,7 @@ class TPUWorker(WorkerBase):
         kv_connector_hbm_reserve_gb = round(reserves.kv_connector / utils.GBYTES, 2)
         lora_slot_write_hbm_gb = round(reserves.lora_slot_write / utils.GBYTES, 2)
         pp_handoff_hbm_reserve_gb = round(reserves.pp_handoff / utils.GBYTES, 2)
+        routed_experts_hbm_reserve_gb = round(reserves.routed_experts / utils.GBYTES, 2)
         total_hbm_avail_gb = round(available / utils.GBYTES, 2)
         logger.info(
             "Memory statistics | "
@@ -653,6 +698,7 @@ class TPUWorker(WorkerBase):
             "kv_connector_hbm_reserve_gb=%rGiB | "
             "lora_slot_write_hbm_gb=%rGiB | "
             "pp_handoff_hbm_reserve_gb=%rGiB | "
+            "routed_experts_hbm_reserve_gb=%rGiB | "
             "total_hbm_avail_gb=%rGiB | "
             "profile_run=%s",
             total_hbm_limit_gb,
@@ -661,6 +707,7 @@ class TPUWorker(WorkerBase):
             kv_connector_hbm_reserve_gb,
             lora_slot_write_hbm_gb,
             pp_handoff_hbm_reserve_gb,
+            routed_experts_hbm_reserve_gb,
             total_hbm_avail_gb,
             "skipped" if profile_skipped else "ran",
         )
@@ -672,11 +719,17 @@ class TPUWorker(WorkerBase):
             )
             if reserves.lora_slot_write > 0:
                 fix += ", or lowering --max-loras or --max-lora-rank"
+            if reserves.routed_experts > 0:
+                fix += (
+                    ", or lowering --max-num-batched-tokens or --max-num-seqs, "
+                    "or dropping compile_sizes above --max-num-batched-tokens"
+                )
             raise ValueError(
                 f"{total_hbm_used_gb=}GiB plus the HBM reserved after the "
                 f"memory profile ({kv_connector_hbm_reserve_gb=}GiB, "
                 f"{lora_slot_write_hbm_gb=}GiB, "
-                f"{pp_handoff_hbm_reserve_gb=}GiB) exceeds "
+                f"{pp_handoff_hbm_reserve_gb=}GiB, "
+                f"{routed_experts_hbm_reserve_gb=}GiB) exceeds "
                 f"{total_hbm_limit_cap_gb=}GiB by "
                 f"{-total_hbm_avail_gb}GiB. Please consider {fix}."
             )
@@ -906,6 +959,8 @@ class TPUWorker(WorkerBase):
         # torch records every compile artifact for save_cache_artifacts(), which
         # vLLM never calls; drop the record so its memory can be freed.
         CacheArtifactManager.clear()
+        # Before freeze_gc_heap(), whose collection then frees the graphs.
+        _drop_traced_module_refs()
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
@@ -1008,3 +1063,9 @@ class TPUWorker(WorkerBase):
         if metadata is None:
             return None
         return {_get_kv_connector_handshake_metadata_key(metadata): metadata}
+
+    def shutdown(self) -> None:
+        # None until init_device builds it.
+        if self.model_runner is not None:
+            self.model_runner.close_routed_experts()
+        super().shutdown()

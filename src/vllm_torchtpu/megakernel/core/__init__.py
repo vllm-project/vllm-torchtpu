@@ -38,7 +38,9 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     )
     from .collectives import AllReduceRing
     from .dma import (
+        TwoRing,
         pool_alias,
+        stream,
         vmem,
     )
     from .dma.vmem import fit_default_tiles, fitted_plan
@@ -54,11 +56,13 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     )
     from .modules import (
         GDN,
+        GQA,
         Embedding,
         EmbeddingModule,
         GDNLinInLayout,
         GDNModule,
         GDNParams,
+        GQAModule,
         GQAParams,
         MoEDebug,
         MoEParams,
@@ -162,6 +166,8 @@ _LAZY: dict[str, str] = {
     "default_tiles": ".exec_spec",
     "GDN": ".modules",
     "GDNModule": ".modules",
+    "GQA": ".modules",
+    "GQAModule": ".modules",
     "Embedding": ".modules",
     "EmbeddingModule": ".modules",
     "GDNLinInLayout": ".modules",
@@ -220,6 +226,7 @@ _LAZY: dict[str, str] = {
     "SwitchSlot": ".spec",
     "VLLMAlias": ".spec",
     "WeightDecl": ".spec",
+    "TwoRing": ".dma.stream",
     "fit_default_tiles": ".dma.vmem",
     "fitted_plan": ".dma.vmem",
     "pool_alias": ".dma",
@@ -229,12 +236,14 @@ _LAZY: dict[str, str] = {
     "default_eplb_cores": ".weights",
     "encode_eplb_ecopy": ".weights",
     "pack_spec_logical_weights": ".weights",
+    "stream": ".dma",
     "vmem": ".dma",
 }
 
 __all__ = [
     "DEFAULT_PROFILE",
     "GDN",
+    "GQA",
     "POOL_STATE_NAME",
     "REQUIRED",
     "AllReduceRing",
@@ -251,6 +260,7 @@ __all__ = [
     "GDNLinInLayout",
     "GDNModule",
     "GDNParams",
+    "GQAModule",
     "GQAParams",
     "HFParamDecl",
     "JaxArrayOps",
@@ -281,6 +291,7 @@ __all__ = [
     "TileContext",
     "TileRule",
     "Tiles",
+    "TwoRing",
     "VLLMAlias",
     "WeightDecl",
     "WeightSource",
@@ -322,6 +333,7 @@ __all__ = [
     "round_up",
     "spec",
     "ssm_to_raw_pages",
+    "stream",
     "vmem",
     "weights",
     "with_cache",

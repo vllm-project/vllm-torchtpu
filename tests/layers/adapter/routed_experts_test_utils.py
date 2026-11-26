@@ -43,7 +43,9 @@ def make_vllm_config(num_experts=512):
     vllm_config = SimpleNamespace(
         model_config=model_config,
         scheduler_config=SimpleNamespace(
-            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS, max_num_seqs=8
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
+            max_num_scheduled_tokens=None,
+            max_num_seqs=8,
         ),
         parallel_config=SimpleNamespace(
             data_parallel_rank=0,
@@ -109,12 +111,15 @@ def expert_ids(num_tokens, num_experts=512, seed=0):
 
 
 class MoELayer(torch.nn.Module):
-    """A MoE layer as vLLM's capturer binder finds it."""
+    """A MoE layer as vLLM's capturer binder finds it, with no fused kernel
+    and no expert placement."""
 
     def __init__(self, layer_id):
         super().__init__()
         self.layer_id = layer_id
         self.capture_fn = None
+        self.picks_experts_in_route = True
+        self.routed_experts = SimpleNamespace(quant_method=SimpleNamespace())
 
 
 def make_moe_model(layer_ids=None):

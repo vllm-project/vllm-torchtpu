@@ -2897,6 +2897,50 @@ class TestHybridGeometry(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self._resolve([self._mamba_spec()])
 
+    def test_plain_attention_layer_shapes_behind_mla_first_backend(self):
+        # A model-owned MLA cache registers first; a drafter adds a plain
+        # `Attention` layer. The per-block shape takes the drafter's backend.
+        from vllm.model_executor.layers.attention import Attention
+        from vllm.model_executor.layers.attention_layer_base import (
+            AttentionLayerBase,
+        )
+
+        from vllm_torchtpu.offload import raiden_store as rs
+
+        mla_backend = MagicMock()
+        mla_backend.get_kv_cache_shape.return_value = (1, 64, 1, 576)
+        mla_backend.is_ssm.return_value = False
+        dense_backend = MagicMock()
+        dense_backend.get_kv_cache_shape.return_value = (1, 256, 8, 2, 128)
+        dense_backend.is_ssm.return_value = False
+        owned = MagicMock(spec=AttentionLayerBase)
+        owned.get_attn_backend.return_value = mla_backend
+        drafter = MagicMock(spec=Attention)
+        drafter.get_attn_backend.return_value = dense_backend
+        vllm_config = MagicMock()
+        vllm_config.compilation_config.static_forward_context = {
+            "target.cache": owned,
+            "draft.attn": drafter,
+        }
+        kv_cache_config = SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=self._attn_spec())]
+        )
+        with (
+            patch(
+                "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
+                "_find_non_ssm_backend",
+                return_value=mla_backend,
+            ),
+            patch("vllm.v1.worker.utils.select_common_block_size", return_value=256),
+        ):
+            spec, kernel, shape = rs.resolve_attention_geometry(
+                vllm_config, kv_cache_config
+            )
+
+        self.assertEqual(kernel, 256)
+        self.assertEqual(shape, (256, 8, 2, 128))
+        mla_backend.get_kv_cache_shape.assert_not_called()
+
     def test_scheduler_process_falls_back_to_attn_selector(self):
         # In EngineCore process, resolve attention backend via selector fallback.
         from contextlib import nullcontext

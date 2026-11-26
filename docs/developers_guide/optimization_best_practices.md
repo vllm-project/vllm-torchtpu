@@ -117,6 +117,20 @@ most often in review; for the underlying hardware model, see §3.
   reshaping to TPU-friendly shapes → `apply` dispatching to the kernel →
   unit test that loads and runs a real model. Home:
   `layers/adapter/quantization/`, subclassing the upstream vLLM method (R-3.1).
+  Exception: a format only one model directory uses stays in that directory
+  and calls `register_tpu_quant_config(quant_method, config_cls)` at plugin
+  load (from `register_models()` in `models/vllm/__init__.py`) instead of
+  extending the built-in table. `quant_method` is the name vLLM resolves for
+  the checkpoint (`ModelConfig.quantization`), not the checkpoint's own
+  `quant_method` string: vLLM can rename it (`override_quantization_method`),
+  e.g. a ModelOpt NVFP4 checkpoint declares `modelopt` but resolves to
+  `modelopt_fp4`. A class registered under the checkpoint string then never
+  serves the checkpoint, and nothing reports it. `quant_method` must equal
+  `config_cls.get_name()`. Names vLLM does not list are registered with vLLM
+  too, so the checkpoint passes vLLM's name check. Names a built-in TPU config
+  serves (including `unquantized`) are rejected. The table is keyed by name
+  only: the registered class serves every checkpoint in the process that
+  resolves to that name, whatever the architecture.
 - **Q-3** **Numeric verification is non-negotiable**: before/after eval
   (e.g. MMLU/gsm8k) plus serving benchmark on the identical rig, with exact
   repro commands in the PR, in separate "Numeric validation" and

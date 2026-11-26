@@ -20,21 +20,27 @@ import weakref
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from typing import Any, cast
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 import torch
+from functorch.compile import make_boxed_func
+from torch._dynamo.backends.common import aot_autograd
+from torch._dynamo.utils import counters as dynamo_counters
 from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.pool.late_interaction_runner import LateInteractionRunner
 
 import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
+from vllm_torchtpu.runner.routed_experts import RoutedExpertsCapture
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker import tpu_worker
 from vllm_torchtpu.worker.tpu_worker import (
     TPUWorker,
     _configure_tpu_process_env,
+    _drop_traced_module_refs,
     _reconcile_tpu_visible_device_paths,
 )
 
@@ -532,6 +538,95 @@ class TestProfileCaptureAndMerge:
                 gc.enable()
 
 
+def test_drop_traced_module_refs_frees_compile_time_graphs(monkeypatch):
+    """aot_autograd's convenience methods keep the traced graph alive; dropping
+    only those three attributes frees it while preserving other attributes."""
+    monkeypatch.setitem(dynamo_counters["aot_autograd"], "ok", 0)
+
+    class _Affine(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.w = torch.nn.Parameter(torch.randn(4, 4), requires_grad=False)
+
+        def forward(self, x):
+            return (x @ self.w + 1,)
+
+    graph = torch.fx.symbolic_trace(_Affine())
+    graph_ref = weakref.ref(graph)
+    x = torch.randn(2, 4)
+    with torch.no_grad():
+        compiled = aot_autograd(fw_compiler=lambda gm, _: make_boxed_func(gm.forward))(
+            graph, [x]
+        )
+    assert dynamo_counters["aot_autograd"]["ok"] > 0
+    expected = compiled(x)[0]
+    del graph
+    gc.collect()
+    # Nothing but aot_autograd's convenience methods holds the graph now.
+    assert graph_ref() is not None
+
+    # Unrelated nn.Module-holding attributes on the compiled forwards and
+    # matching attribute names on non-aot_module_simplified functions must stay.
+    unrelated = torch.nn.Linear(2, 2)
+    compiled.extra_module = unrelated
+    compiled.extra_method = unrelated.forward
+    compiled.__wrapped__.extra_method = unrelated.forward
+
+    def _decoy() -> None:
+        return None
+
+    for attr in ("zero_grad", "named_parameters", "named_buffers"):
+        _decoy.__dict__[attr] = getattr(unrelated, attr)
+
+    _drop_traced_module_refs()
+    gc.collect()
+
+    assert graph_ref() is None
+    for fn in (compiled, compiled.__wrapped__):
+        for attr in ("zero_grad", "named_parameters", "named_buffers"):
+            assert attr not in fn.__dict__
+    for attr in ("zero_grad", "named_parameters", "named_buffers"):
+        assert _decoy.__dict__[attr] == getattr(unrelated, attr)
+    assert compiled.extra_module is unrelated
+    assert compiled.extra_method == unrelated.forward
+    assert compiled.__wrapped__.extra_method == unrelated.forward
+    assert torch.equal(compiled(x)[0], expected)
+
+
+def test_drop_traced_module_refs_skips_heap_scan_without_aot_compiles(monkeypatch):
+    """Skip gc.get_objects() when no fresh aot_autograd compiles ran."""
+    monkeypatch.setitem(dynamo_counters["aot_autograd"], "ok", 0)
+
+    with patch("vllm_torchtpu.worker.tpu_worker.gc.get_objects") as get_objects:
+        _drop_traced_module_refs()
+
+    get_objects.assert_not_called()
+
+
+def test_compile_or_warm_up_drops_traced_modules_before_freezing_the_heap():
+    """The dropped graphs must still be collectable when the heap is frozen."""
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(capture_model=lambda: None),
+        compilation_config=SimpleNamespace(compilation_time=0.0),
+    )
+    calls = []
+
+    with (
+        patch(
+            "vllm_torchtpu.worker.tpu_worker._drop_traced_module_refs",
+            side_effect=lambda: calls.append("drop"),
+        ),
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.freeze_gc_heap",
+            side_effect=lambda: calls.append("freeze"),
+        ),
+        patch("vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"),
+    ):
+        TPUWorker.compile_or_warm_up_model(worker)
+
+    assert calls == ["drop", "freeze"]
+
+
 def test_reset_encoder_cache_delegates_to_model_runner():
     worker = TPUWorker.__new__(TPUWorker)
     worker.model_runner = MagicMock()
@@ -632,7 +727,7 @@ def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     worker.model_runner = MagicMock(is_pooling_model=False)
     # No KV connector, no LoRA and no buffered hand-off, so nothing is reserved.
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=0, pp_handoff=0
+        kv_connector=0, lora_slot_write=0, pp_handoff=0, routed_experts=0
     )
     return worker
 
@@ -673,7 +768,7 @@ def test_determine_available_memory_leaves_room_for_lora_slot_write(monkeypatch)
         peer=7 * utils.GBYTES,
     )
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=utils.GBYTES, pp_handoff=0
+        kv_connector=0, lora_slot_write=utils.GBYTES, pp_handoff=0, routed_experts=0
     )
 
     assert worker.determine_available_memory() == 6 * utils.GBYTES
@@ -686,7 +781,7 @@ def test_determine_available_memory_reserves_the_pp_hand_off_buffers(monkeypatch
         monkeypatch, dp_size=1, expert_parallel=False, local=7 * utils.GBYTES, peer=0
     )
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=0, pp_handoff=utils.GBYTES
+        kv_connector=0, lora_slot_write=0, pp_handoff=utils.GBYTES, routed_experts=0
     )
 
     assert worker.determine_available_memory() == 6 * utils.GBYTES
@@ -707,7 +802,10 @@ def test_out_of_memory_error_shows_the_lora_reserve(monkeypatch):
     )
     monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
     worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
-        kv_connector=0, lora_slot_write=2 * utils.GBYTES, pp_handoff=0
+        kv_connector=0,
+        lora_slot_write=2 * utils.GBYTES,
+        pp_handoff=0,
+        routed_experts=0,
     )
 
     with pytest.raises(ValueError) as error:
@@ -719,6 +817,51 @@ def test_out_of_memory_error_shows_the_lora_reserve(monkeypatch):
     assert "pp_handoff_hbm_reserve_gb=0.0GiB" in message
     assert "by 1.0GiB" in message
     assert "--max-loras" in message
+    assert "--max-num-seqs" not in message
+
+
+def test_out_of_memory_error_shows_the_routed_experts_reserve(monkeypatch):
+    """Only the routed-experts reserve pushes the budget below zero, so the
+    error must show it and the flags that shrink it."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=1, expert_parallel=False, local=0, peer=0
+    )
+    budget = utils.HbmBudget(
+        total_limit=32 * utils.GBYTES,
+        total_used=18 * utils.GBYTES,
+        cap=19 * utils.GBYTES,
+        available=utils.GBYTES,
+    )
+    monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
+    worker.model_runner.post_profile_hbm_reserves.return_value = utils.HbmReserves(
+        kv_connector=0,
+        lora_slot_write=0,
+        pp_handoff=0,
+        routed_experts=2 * utils.GBYTES,
+    )
+
+    with pytest.raises(ValueError) as error:
+        worker.determine_available_memory()
+
+    message = str(error.value)
+    assert "routed_experts_hbm_reserve_gb=2.0GiB" in message
+    assert "by 1.0GiB" in message
+    assert "--max-num-batched-tokens or --max-num-seqs" in message
+
+
+def test_shutdown_stops_the_routed_experts_connector():
+    """Shutdown closes the connector, whose writer thread would otherwise
+    outlive the engine. A worker without capture, or one that failed before
+    building its runner, also shuts down."""
+    capture = create_autospec(RoutedExpertsCapture, instance=True)
+    capturing = TPUModelRunner.__new__(TPUModelRunner)
+    capturing._routed_experts = capture
+    for runner in (capturing, TPUModelRunner.__new__(TPUModelRunner), None):
+        worker = TPUWorker.__new__(TPUWorker)
+        worker.model_runner = cast(Any, runner)
+        worker.shutdown()
+
+    capture.close.assert_called_once_with()
 
 
 def test_determine_available_memory_profiles_an_unpinned_kv_cache(monkeypatch):
@@ -921,12 +1064,14 @@ def test_warmup_freezes_heap_and_reports_compilation_time():
     )
     with (
         patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
+        patch("vllm_torchtpu.worker.tpu_worker._drop_traced_module_refs") as drop,
         patch(
             "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
         ) as gc_debug,
     ):
         result = TPUWorker.compile_or_warm_up_model(worker)
     capture_model.assert_called_once_with()
+    drop.assert_called_once_with()
     freeze.assert_called_once_with()
     gc_debug.assert_called_once_with()
     assert result.language_model == worker.compilation_config.compilation_time

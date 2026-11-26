@@ -49,6 +49,7 @@ from vllm.config.utils import Range
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.compilation.graph_fingerprint import _graph_fingerprint
+from vllm_torchtpu.distributed.ep_mesh import ep_device_placement_key
 from vllm_torchtpu.gdn_pool_layout import prefill_checkpoint_enabled
 from vllm_torchtpu.logger import init_logger
 
@@ -229,8 +230,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
-    # local-rank offsets, which move a worker to a different chip without
-    # changing the executable it runs.
+    # local-rank offsets, which move a worker to a different chip. The device
+    # each EP rank runs on, which EP mesh programs compile in, is hashed on its
+    # own (`ep_device_placement`).
     "DEBUG_TPU_LOCAL_RANK_OFFSET",
     "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
     "RAIDEN_DISABLE_SINGLETON_WORKER",
@@ -326,6 +328,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+    # Qwen4Exp PLE state and QSA custom ops.
+    "vllm_torchtpu/models/qwen4_exp/ops",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
@@ -470,6 +474,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
                 vllm_config.parallel_config
             ),
         },
+        "ep_device_placement": ep_device_placement_key(),
         # TPU AOT graphs embed the KV tensor extent as a literal. Hash the
         # resolved block count, which every rank shares via kv_cache_config.
         # The raw per-worker num_gpu_blocks_override is a pre-alignment HBM

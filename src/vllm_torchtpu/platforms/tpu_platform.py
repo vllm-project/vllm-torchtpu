@@ -31,7 +31,7 @@ from torch_tpu._internal import compile as _register_tpu_backend  # noqa: F401
 from torch_tpu._internal.utils import hardware
 from vllm.platforms.interface import Platform, PlatformEnum
 
-from vllm_torchtpu import envs, patch_registry
+from vllm_torchtpu import envs, patch_registry, rope_in_graph_flag
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
@@ -417,6 +417,48 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
         raise ValueError(
             f"LoRA on TPU does not support {'; '.join(rejected)}. Change these "
             "settings or disable LoRA."
+        )
+
+
+def _validate_routed_experts_config(vllm_config: "VllmConfig") -> None:
+    """Rejects `--enable-return-routed-experts` with the settings TPU capture
+    does not handle yet; vLLM rejects others itself
+    (`VllmConfig._verify_aux_output_compatibility`). `RoutedExpertsCapture`
+    rejects MoE layers armed with a fused kernel once they load."""
+    if not vllm_config.aux_output_config.enabled:
+        return
+    parallel_config = vllm_config.parallel_config
+    unsupported = {
+        # Each MoE layer sees the rows of every DP rank.
+        "data_parallel_size > 1": parallel_config.data_parallel_size > 1,
+        # Comes with fused EP v2, where SP pays off. With chunk pipelining or
+        # FP8 all-gather, `route()` would also see only this rank's tokens.
+        "MoE sequence parallelism (TPU_MOE_SEQUENCE_PARALLEL)": (
+            parallel_config.use_sequence_parallel_moe
+        ),
+        # Experts are picked on this rank's share of the tokens.
+        "TPU_K3_SP_PREFILL": envs.TPU_K3_SP_PREFILL,
+        # The kernel picks experts itself, without `route()`.
+        "MOE_FUSED_EP_KERNEL_IMPL=adaptive": (
+            envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        ),
+        # Placed layers pick expert slots, not checkpoint expert ids.
+        "TPU_EXPERT_PLACEMENT": bool(envs.TPU_EXPERT_PLACEMENT),
+        # Rows of rejected drafts are kept.
+        "speculative decoding": vllm_config.speculative_config is not None,
+        # Untested.
+        "kv_transfer_config": vllm_config.kv_transfer_config is not None,
+        # vLLM builds a KV transfer config from this flag only after this
+        # check runs, so the check above cannot see it.
+        "--kv-offloading-size": (
+            vllm_config.cache_config.kv_offloading_size is not None
+        ),
+    }
+    rejected = [setting for setting, hit in unsupported.items() if hit]
+    if rejected:
+        raise NotImplementedError(
+            "--enable-return-routed-experts on TPU does not support "
+            f"{'; '.join(rejected)} yet. Change these settings or disable it."
         )
 
 
@@ -875,6 +917,8 @@ class TpuPlatform(Platform):
             )
         # Rejects non-bool MoE reference-parity values before any worker starts.
         get_moe_reference_parity(vllm_config)
+        # Likewise for a non-bool in-graph RoPE value.
+        rope_in_graph_flag.in_graph_enabled(vllm_config)
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
@@ -1107,6 +1151,7 @@ class TpuPlatform(Platform):
         # After the bfloat16 switch, so lora_dtype is checked against the
         # dtype the model runs in.
         _validate_lora_config(vllm_config)
+        _validate_routed_experts_config(vllm_config)
 
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
@@ -1358,6 +1403,32 @@ class TpuPlatform(Platform):
         """
         backends = cls._find_non_ssm_backends(vllm_config)
         return backends[0] if backends else None
+
+    @classmethod
+    def _find_dense_attention_backend(
+        cls, vllm_config: VllmConfig
+    ) -> "type[AttentionBackend] | None":
+        """Backend that lays out the plain `Attention` caches, or None.
+
+        `_find_non_ssm_backend` returns the first backend in layer order. When
+        the target's layers declare an MLA-family backend (e.g. caches that
+        the model owns) and a drafter adds plain `Attention` layers, the
+        drafter's pages would take the MLA geometry. With an fp8 cache, a
+        128-token block becomes a 32-token page, so the RPA kernel indexes the
+        block table at 4x the block count and, past a quarter of
+        max_model_len, beyond the table. A bf16 cache packs two tokens per
+        word, so the page is 64 tokens and the factor is 2x.
+
+        Returns the backend of the first plain `Attention` layer. Without one
+        (e.g. pure MLA, or caches that the model owns), returns
+        `_find_non_ssm_backend`.
+        """
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.attention import Attention
+
+        for layer in get_layers_from_vllm_config(vllm_config, Attention).values():
+            return layer.get_attn_backend()
+        return cls._find_non_ssm_backend(vllm_config)
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
