@@ -34,6 +34,9 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs, patch_registry, rope_in_graph_flag
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.model_loader_patches import (
+    apply_default_runai_streamer_memory_limit,
+)
 from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
@@ -1353,6 +1356,7 @@ class TpuPlatform(Platform):
         )
 
         check_attention_backend_config(vllm_config)
+        apply_default_runai_streamer_memory_limit(vllm_config)
 
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"

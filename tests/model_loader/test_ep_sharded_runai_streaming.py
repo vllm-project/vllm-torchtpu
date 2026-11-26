@@ -486,3 +486,156 @@ def test_ep_rank_is_dp_major_over_dp_pcp_tp():
         for t in range(3)
     ]
     assert ranks == list(range(12))
+
+
+def _config_with_auto_runai_limit(limit: int | None) -> SimpleNamespace:
+    from vllm.config import LoadConfig, ParallelConfig
+
+    from vllm_torchtpu.model_loader_patches import TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY
+
+    return SimpleNamespace(
+        load_config=LoadConfig(load_format="runai_streamer"),
+        parallel_config=ParallelConfig(tensor_parallel_size=8),
+        additional_config=(
+            {} if limit is None else {TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY: limit}
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "auto_limit, caller_limit, expected",
+    [
+        (4096, None, 4096),  # the largest tensor fits: the cap is kept
+        (None, None, None),  # no automatic cap: the streamer's own default applies
+        (4096, 2048, 2048),  # a caller's own limit is never replaced
+    ],
+)
+def test_file_streamer_patch_fills_in_only_a_missing_memory_limit(
+    monkeypatch, auto_limit, caller_limit, expected
+):
+    """The branches that the real streamer test below does not reach."""
+    rfs = pytest.importorskip("runai_model_streamer.file_streamer.file_streamer")
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    forwarded = []
+
+    def record(self, file_stream_requests, credentials, device, memory_limit):
+        forwarded.append(memory_limit)
+
+    monkeypatch.delenv("RUNAI_STREAMER_MEMORY_LIMIT", raising=False)
+    monkeypatch.setattr(rfs.FileStreamer, "stream_files", record)
+    monkeypatch.setattr(
+        rfs.FileStreamer, "_tpu_memory_limit_patch", False, raising=False
+    )
+    mlp.patch_runai_file_streamer_memory_limit()
+
+    request = SimpleNamespace(sizes=[1024], max_chunk_size=lambda: 1024)
+    kwargs = {} if caller_limit is None else {"memory_limit": caller_limit}
+    with patch(
+        "vllm.config.get_current_vllm_config_or_none",
+        return_value=_config_with_auto_runai_limit(auto_limit),
+    ):
+        rfs.FileStreamer.stream_files(None, [request], None, "cpu", **kwargs)
+    assert forwarded == [expected]
+
+
+@pytest.mark.parametrize(
+    "tp, dp, dp_size_env, uses_ray, extra_config, expected",
+    [
+        (1, 16, None, True, {}, 5 << 30),  # 2-host DP=16: min(8, 16) ranks here
+        (1, 1, "16", True, {}, 5 << 30),  # per-engine config: DP size from the env
+        (2, 1, None, True, {}, 20 << 30),  # 2-rank job on an 8-chip host
+        (1, 1, None, True, {}, None),  # single-rank job on an 8-chip host
+        (8, 1, None, False, {}, None),  # mp workers write LOCAL_WORLD_SIZE themselves
+        (1, 16, None, True, {"memory_limit": 2 << 30}, None),  # operator limit wins
+    ],
+)
+def test_ray_worker_derives_runai_memory_limit_from_local_world_size(
+    monkeypatch, tp, dp, dp_size_env, uses_ray, extra_config, expected
+):
+    """Under Ray, ParallelConfig.nnodes stays 1 and config time records no cap,
+    so each worker reads LOCAL_WORLD_SIZE clamped to the job's rank count
+    (world_size * dp_size)."""
+    from vllm.config import LoadConfig, ParallelConfig
+    from vllm.v1.executor.abstract import Executor
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    class FakeRayExecutor(Executor):
+        uses_ray = True
+
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
+    monkeypatch.delenv("RUNAI_STREAMER_MEMORY_LIMIT", raising=False)
+    monkeypatch.delenv("TORCH_TPU_DP_SIZE", raising=False)
+    if dp_size_env is not None:
+        monkeypatch.setenv("TORCH_TPU_DP_SIZE", dp_size_env)
+    with patch("vllm.v1.executor.ray_utils.assert_ray_available"):
+        parallel_config = ParallelConfig(
+            tensor_parallel_size=tp,
+            data_parallel_size=dp,
+            data_parallel_size_local=dp,
+            distributed_executor_backend=FakeRayExecutor if uses_ray else "mp",
+        )
+    vllm_config = SimpleNamespace(
+        load_config=LoadConfig(
+            load_format="runai_streamer", model_loader_extra_config=extra_config
+        ),
+        parallel_config=parallel_config,
+        additional_config={},
+    )
+
+    assert mlp._resolve_auto_runai_memory_limit(vllm_config) == expected
+
+
+def test_real_safetensors_streamer_uses_floored_auto_memory_limit(
+    monkeypatch, tmp_path
+):
+    """Stream a real local safetensors file through SafetensorsStreamer with
+    the FileStreamer patch installed and an automatic cap smaller than the
+    largest tensor, verifying both call compatibility and real ring sizing."""
+    pytest.importorskip("runai_model_streamer")
+    import torch
+    from runai_model_streamer import SafetensorsStreamer
+    from runai_model_streamer.file_streamer import file_streamer as rfs
+    from safetensors.torch import save_file
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    # Two 16 KiB tensors (32 KiB total); largest tensor is 16 KiB.
+    tensor_a = torch.arange(4096, dtype=torch.float32)
+    tensor_b = torch.arange(4096, 8192, dtype=torch.float32)
+    path = tmp_path / "weights.safetensors"
+    save_file({"a": tensor_a, "b": tensor_b}, str(path))
+    largest_bytes = tensor_a.numel() * tensor_a.element_size()
+    total_bytes = largest_bytes * 2
+
+    monkeypatch.delenv("RUNAI_STREAMER_MEMORY_LIMIT", raising=False)
+    monkeypatch.setattr(rfs.FileStreamer, "stream_files", rfs.FileStreamer.stream_files)
+    monkeypatch.setattr(
+        rfs.FileStreamer, "_tpu_memory_limit_patch", False, raising=False
+    )
+    mlp.patch_runai_file_streamer_memory_limit()
+
+    # Auto limit (8 KiB) is below the 16 KiB tensor: without flooring this
+    # raises RunaiStreamerMemoryLimitException; with flooring it caps the ring
+    # to 1 x 16 KiB (< 32 KiB total, unlike the 40 GB default).
+    with (
+        patch(
+            "vllm.config.get_current_vllm_config_or_none",
+            return_value=_config_with_auto_runai_limit(largest_bytes // 2),
+        ),
+        SafetensorsStreamer() as streamer,
+    ):
+        streamer.stream_files([str(path)], device="cpu", is_distributed=False)
+        loaded = dict(streamer.get_tensors())
+        ring = streamer.file_streamer.ring_info()
+
+    assert set(loaded) == {"a", "b"}
+    assert torch.equal(loaded["a"], tensor_a)
+    assert torch.equal(loaded["b"], tensor_b)
+    assert ring is not None
+    num_buffers, buffer_size = ring[1], ring[2]
+    assert buffer_size == largest_bytes
+    assert num_buffers == 1
+    assert num_buffers * buffer_size < total_bytes

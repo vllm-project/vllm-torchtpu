@@ -473,6 +473,7 @@ class TestTpuCompilerCache:
             "TORCH_TPU_MP_RENDEZVOUS_PORT",
             "TPU_LOCAL_RANK_OFFSET",
             "TPU_SHARDED_LOAD_SYNC_EVERY",
+            "RUNAI_STREAMER_MEMORY_LIMIT",
             "VLLM_TORCHTPU_IPC_KEY",
             "VLLM_TPU_DEBUG_PCP_LAYOUT",
             "VLLM_TPU_OFFLOAD_SAVE_RETRIES",

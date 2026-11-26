@@ -29,10 +29,12 @@ from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
     PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+    TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY,
 )
 
 KEY = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY
 PREFILL_KEY = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY
+RUNAI_MEM_KEY = TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY
 
 # Class attributes the patch stamps onto VllmConfig, which monkeypatch cannot
 # roll back on its own because they did not exist beforehand.
@@ -199,5 +201,8 @@ def test_patch_is_idempotent(patched_compute_hash):
     assert VllmConfig.compute_hash is patched_compute_hash
 
 
-def test_ignored_keys_match_the_keys_the_runner_reads():
-    assert {KEY, PREFILL_KEY} == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+def test_ignored_keys_match_the_keys_the_runner_reads(patched_compute_hash):
+    assert {KEY, PREFILL_KEY, RUNAI_MEM_KEY} == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+    assert patched_compute_hash(_StubVllmConfig({})) == patched_compute_hash(
+        _StubVllmConfig({RUNAI_MEM_KEY: 5 << 30})
+    )

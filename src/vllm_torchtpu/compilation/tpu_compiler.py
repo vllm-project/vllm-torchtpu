@@ -213,6 +213,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     # The HBM reserve that feeds block-count sizing comes from
     # kv_transfer_config, not from this variable.
     "TPU_USE_RAIDEN_CONNECTOR",
+    # Run:AI streamer host buffer cap; changes CPU streaming buffers during
+    # weight load. Any downstream shift in post-load HBM fragmentation and
+    # KV block count is already hashed through cache_config.num_gpu_blocks below.
+    "RUNAI_STREAMER_MEMORY_LIMIT",
     # Pipeline chunk sizing: scheduling and the extra token buckets, which
     # are keyed by shape inside the same cache.
     "TPU_PP_LONE_PROMPT_CHUNKS",

@@ -63,9 +63,88 @@ from concurrent.futures import ThreadPoolExecutor
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.tpu_mp_multihost import local_tpu_worker_count
 from vllm_torchtpu.logger import init_logger
 
+if typing.TYPE_CHECKING:
+    from vllm.config import LoadConfig, VllmConfig
+
 logger = init_logger(__name__)
+
+# Aggregate host memory budget across local TPU workers for Run:AI streaming
+# buffers when neither memory_limit nor RUNAI_STREAMER_MEMORY_LIMIT is set.
+# Shares a 40 GiB per-host budget across local ranks instead of letting each
+# rank allocate runai-model-streamer's 40 GB default
+# (DEFAULT_MEMORY_LIMIT_STRING), floored at the largest checkpoint tensor at
+# load time so large-tensor checkpoints still load.
+# TODO(https://github.com/dsx-ai-factory/model-streamer/issues/389): Remove
+# once runai-model-streamer bounds non-distributed multi-rank loads to a
+# node-shared limit by default, matching rank_memory_limit().
+_RUNAI_HOST_MEMORY_BUDGET_BYTES = 40 << 30
+_RUNAI_STREAMER_LOAD_FORMATS = ("runai_streamer", "runai_streamer_sharded")
+# Key in VllmConfig.additional_config (listed in
+# runner.utils.HASH_IGNORED_ADDITIONAL_CONFIG_KEYS) carrying the automatic
+# per-rank cap from check_and_update_config to the load-time FileStreamer patch.
+TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY = "tpu_auto_runai_memory_limit"
+
+
+def _default_runai_memory_limit(local_ranks: int) -> int:
+    return _RUNAI_HOST_MEMORY_BUDGET_BYTES // local_ranks
+
+
+def _is_runai_load_without_memory_limit(load_config: "LoadConfig") -> bool:
+    """Whether this is a Run:AI streamer load whose operator set no memory limit."""
+    if load_config.load_format not in _RUNAI_STREAMER_LOAD_FORMATS:
+        return False
+    if envs.RUNAI_STREAMER_MEMORY_LIMIT is not None:
+        return False
+    extra_config = load_config.model_loader_extra_config
+    return not (isinstance(extra_config, dict) and "memory_limit" in extra_config)
+
+
+def apply_default_runai_streamer_memory_limit(vllm_config: "VllmConfig") -> None:
+    """Record a default per-rank Run:AI streamer cap when multiple ranks share a host.
+
+    Must run after executor backend selection in ``TpuPlatform.check_and_update_config``
+    so ``parallel_config.use_ray`` reflects the resolved TPU executor. Stores the
+    default in ``vllm_config.additional_config`` (ignored by config hashing) rather
+    than ``load_config.model_loader_extra_config`` so the cap is only applied by
+    the load-time ``FileStreamer`` wrapper together with its largest-tensor floor.
+    """
+    load_config = vllm_config.load_config
+    if not _is_runai_load_without_memory_limit(load_config):
+        return
+    additional_config = vllm_config.additional_config
+    if (
+        not isinstance(additional_config, dict)
+        or TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY in additional_config
+    ):
+        return
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.use_ray:
+        # Under Ray, ParallelConfig.nnodes stays 1 and does not reflect per-host
+        # worker count. RayDistributedExecutorV2 exports LOCAL_WORLD_SIZE into
+        # each worker, where the FileStreamer wrapper derives the cap at load time.
+        return
+    local_ranks = local_tpu_worker_count(parallel_config)
+    if local_ranks <= 1:
+        return
+    memory_limit = _default_runai_memory_limit(local_ranks)
+    vllm_config.additional_config = {
+        **additional_config,
+        TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY: memory_limit,
+    }
+    logger.info_once(
+        "Defaulting %s memory_limit to %d bytes (%.2f GiB) per "
+        "rank across %d local TPU ranks (override via "
+        "--model-loader-extra-config '{\"memory_limit\": ...}' or "
+        "RUNAI_STREAMER_MEMORY_LIMIT).",
+        load_config.load_format,
+        memory_limit,
+        memory_limit / (1 << 30),
+        local_ranks,
+    )
+
 
 # Suffixes of per-expert tensors that are safe to skip for non-local
 # experts. Anything else (dense, shared experts, gate, norms, and NVFP4
@@ -447,6 +526,129 @@ def _patch_runai_local_rank_discovery() -> None:
 
     params_cls.find_local_ranks = find_local_ranks
     params_cls._tpu_discovery_patch = True
+
+
+def _resolve_auto_runai_memory_limit(vllm_config: "VllmConfig") -> int | None:
+    """Return the automatic per-rank memory limit for ``vllm_config``, or ``None``.
+
+    Returns ``None`` when the operator supplied ``memory_limit`` or
+    ``RUNAI_STREAMER_MEMORY_LIMIT``, when the load format is not a Run:AI
+    streamer loader, or when only one TPU rank loads on the host.
+    """
+    load_config = vllm_config.load_config
+    if not _is_runai_load_without_memory_limit(load_config):
+        return None
+    additional_config = vllm_config.additional_config
+    if (
+        isinstance(additional_config, dict)
+        and TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY in additional_config
+    ):
+        return int(additional_config[TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY])
+
+    parallel_config = vllm_config.parallel_config
+    if not parallel_config.use_ray:
+        return None
+
+    raw_local_world = os.environ.get("LOCAL_WORLD_SIZE", "")
+    if not raw_local_world:
+        return None
+    from vllm_torchtpu import utils
+
+    job_ranks = parallel_config.world_size * utils.get_dp_size(parallel_config)
+    local_ranks = min(int(raw_local_world), job_ranks)
+    if local_ranks <= 1:
+        return None
+    ray_limit = _default_runai_memory_limit(local_ranks)
+    logger.info_once(
+        "Defaulting %s memory_limit to %d bytes (%.2f GiB) per "
+        "rank across %d local Ray TPU ranks (override via "
+        "--model-loader-extra-config '{\"memory_limit\": ...}' or "
+        "RUNAI_STREAMER_MEMORY_LIMIT).",
+        load_config.load_format,
+        ray_limit,
+        ray_limit / (1 << 30),
+        local_ranks,
+    )
+    return ray_limit
+
+
+def patch_runai_file_streamer_memory_limit() -> None:
+    """Apply and floor the automatic per-rank memory limit at the largest tensor.
+
+    Wraps ``FileStreamer.stream_files``, which every Run:AI load reaches
+    (``runai_streamer`` with or without the EP weight filter, and
+    ``runai_streamer_sharded``).
+
+    ``runai-model-streamer`` raises ``RunaiStreamerMemoryLimitException`` when
+    a positive ``memory_limit`` is smaller than the largest chunk in the
+    stream. Applying the automatic default (and flooring it at the largest
+    tensor in ``file_stream_requests``) here lets large-tensor checkpoints keep
+    loading without overriding an explicit operator limit or any caller that
+    supplies a non-``None`` ``memory_limit`` (such as ``rank_memory_limit()``
+    on an NCCL distributed path).
+    """
+    try:
+        from runai_model_streamer.file_streamer import file_streamer as rfs
+
+        file_streamer_cls = rfs.FileStreamer
+    except (ImportError, AttributeError):
+        logger.info_once(
+            "[runai-memory-limit] runai_model_streamer without FileStreamer; "
+            "nothing to patch."
+        )
+        return
+    if getattr(file_streamer_cls, "_tpu_memory_limit_patch", False):
+        return
+    original_stream_files = file_streamer_cls.stream_files
+
+    @functools.wraps(original_stream_files)
+    def stream_files(
+        self,
+        file_stream_requests,
+        credentials=None,
+        device="cpu",
+        memory_limit=None,
+        *args,
+        **kwargs,
+    ):
+        if memory_limit is None:
+            from vllm.config import get_current_vllm_config_or_none
+
+            vllm_config = get_current_vllm_config_or_none()
+            auto_limit = (
+                _resolve_auto_runai_memory_limit(vllm_config)
+                if vllm_config is not None
+                else None
+            )
+            if auto_limit is not None:
+                largest_chunk = max(
+                    (fc.max_chunk_size() for fc in file_stream_requests if fc.sizes),
+                    default=0,
+                )
+                effective_limit = max(auto_limit, largest_chunk)
+                if effective_limit > auto_limit:
+                    logger.info_once(
+                        "Raising automatic runai_streamer memory_limit from %d "
+                        "bytes (%.2f GiB) to %d bytes (%.2f GiB) to fit the "
+                        "largest checkpoint tensor.",
+                        auto_limit,
+                        auto_limit / (1 << 30),
+                        effective_limit,
+                        effective_limit / (1 << 30),
+                    )
+                memory_limit = effective_limit
+        return original_stream_files(
+            self,
+            file_stream_requests,
+            credentials,
+            device,
+            memory_limit,
+            *args,
+            **kwargs,
+        )
+
+    file_streamer_cls.stream_files = stream_files
+    file_streamer_cls._tpu_memory_limit_patch = True
 
 
 def patch_runai_sharded_expert_streaming() -> None:

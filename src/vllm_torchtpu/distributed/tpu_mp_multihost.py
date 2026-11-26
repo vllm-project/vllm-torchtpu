@@ -200,6 +200,11 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     )
 
 
+def local_tpu_worker_count(parallel_config) -> int:
+    """Number of TPU worker processes this engine owns on the local host."""
+    return parallel_config.data_parallel_size_local * parallel_config.local_world_size
+
+
 def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     """Set TORCH_TPU_* env vars for genuine multi-host DP without Ray.
 
@@ -274,8 +279,7 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     # slot). This matches the global-rank order tpu_rank_binding.py computes
     # for DP workers (dp_rank * world_size + rank), since data_parallel_rank
     # increases in host-major order under --data-parallel-start-rank.
-    world_size = parallel_config.world_size
-    local_chip_count = world_size * dp_size_local
+    local_chip_count = local_tpu_worker_count(parallel_config)
     base_port = envs.TORCH_TPU_BASE_PORT
     sb_addresses = [
         f"{ip}:{base_port + local_slot}"

@@ -26,6 +26,7 @@ from vllm.config import (
     CacheConfig,
     CompilationConfig,
     KVTransferConfig,
+    LoadConfig,
     LoRAConfig,
     ModelConfig,
     ParallelConfig,
@@ -41,6 +42,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 import vllm_torchtpu as plugin
 import vllm_torchtpu.platforms.tpu_platform as tpu_platform
 from vllm_torchtpu import patch_registry
+from vllm_torchtpu.model_loader_patches import TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY
 from vllm_torchtpu.platforms.tpu_platform import (
     TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP,
     TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP,
@@ -1926,3 +1928,165 @@ def test_check_and_update_config_preserves_programmatic_ep_weight_filter(
     vllm_config = _make_ep_filter_vllm_config(enable_ep_weight_filter=initial_filter)
     TpuPlatform.check_and_update_config(vllm_config)
     assert vllm_config.parallel_config.enable_ep_weight_filter is initial_filter
+
+
+@pytest.fixture
+def runai_default_env(monkeypatch):
+    """Unset every env var the Run:AI ``memory_limit`` default depends on.
+
+    Each name is set before it is deleted so that monkeypatch also restores
+    the ``TORCH_TPU_DP_*`` values ``check_and_update_config`` writes for DP > 1.
+    """
+    for name in (
+        "RUNAI_STREAMER_MEMORY_LIMIT",
+        "TPU_MULTIHOST_BACKEND",
+        "TORCH_TPU_DP_SIZE",
+        "TORCH_TPU_DP_MASTER_ADDR",
+        "TORCH_TPU_DP_MASTER_PORT",
+    ):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+def _runai_vllm_config(
+    load_format: str, pc_kwargs: dict, extra_config: dict
+) -> VllmConfig:
+    with _device_left_unset():
+        return VllmConfig(
+            load_config=LoadConfig(
+                load_format=load_format,
+                model_loader_extra_config=dict(extra_config),
+            ),
+            parallel_config=ParallelConfig(**pc_kwargs),
+        )
+
+
+@pytest.mark.parametrize(
+    "load_format, pc_kwargs, extra_config, expected_limit",
+    [
+        # 16 ranks share the 40 GiB budget: there is no per-rank minimum.
+        (
+            "runai_streamer",
+            {"tensor_parallel_size": 16},
+            {"concurrency": 8},
+            (40 << 30) // 16,
+        ),
+        (
+            "runai_streamer_sharded",
+            {"tensor_parallel_size": 8},
+            {"pattern": "shard-{rank}.safetensors"},
+            5 << 30,
+        ),
+        # distributed=True still streams once per rank on TPU.
+        ("runai_streamer", {"tensor_parallel_size": 8}, {"distributed": True}, 5 << 30),
+        # vLLM sets distributed_executor_backend="ray" inside a Ray placement
+        # group. Without TPU_MULTIHOST_BACKEND=ray the platform runs
+        # TpuMultiprocExecutor, so the mp default applies.
+        (
+            "runai_streamer",
+            {"tensor_parallel_size": 8, "distributed_executor_backend": "ray"},
+            {},
+            5 << 30,
+        ),
+    ],
+)
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_default_runai_streamer_memory_limit_splits_the_host_budget(
+    mock_prepare_env,
+    mock_apply_patches,
+    runai_default_env,
+    load_format,
+    pc_kwargs,
+    extra_config,
+    expected_limit,
+):
+    vllm_config = _runai_vllm_config(load_format, pc_kwargs, extra_config)
+
+    assert vllm_config.additional_config == {
+        TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY: expected_limit
+    }
+    # The default stays out of the loader config and the env: either would
+    # apply it without the load-time floor at the largest tensor.
+    assert vllm_config.load_config.model_loader_extra_config == extra_config
+    assert "RUNAI_STREAMER_MEMORY_LIMIT" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "load_format, pc_kwargs, extra_config, env_limit, multihost_backend",
+    [
+        ("runai_streamer", {"tensor_parallel_size": 1}, {}, None, None),
+        # A node without a local engine has no rank to cap.
+        (
+            "runai_streamer",
+            {
+                "tensor_parallel_size": 8,
+                "data_parallel_size": 8,
+                "data_parallel_size_local": 0,
+            },
+            {},
+            None,
+            None,
+        ),
+        ("safetensors", {"tensor_parallel_size": 8}, {}, None, None),
+        # Any memory_limit counts as set, including 0 (the largest range).
+        (
+            "runai_streamer",
+            {"tensor_parallel_size": 8},
+            {"memory_limit": 0},
+            None,
+            None,
+        ),
+        ("runai_streamer", {"tensor_parallel_size": 8}, {}, "8589934592", None),
+        # Under Ray each worker derives the cap at load time instead.
+        ("runai_streamer", {"tensor_parallel_size": 8}, {}, None, "ray"),
+    ],
+)
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_default_runai_streamer_memory_limit_skips_when_unneeded_or_overridden(
+    mock_prepare_env,
+    mock_apply_patches,
+    runai_default_env,
+    monkeypatch,
+    load_format,
+    pc_kwargs,
+    extra_config,
+    env_limit,
+    multihost_backend,
+):
+    if env_limit is not None:
+        monkeypatch.setenv("RUNAI_STREAMER_MEMORY_LIMIT", env_limit)
+    if multihost_backend is not None:
+        monkeypatch.setenv("TPU_MULTIHOST_BACKEND", multihost_backend)
+
+    vllm_config = _runai_vllm_config(load_format, pc_kwargs, extra_config)
+
+    assert TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY not in vllm_config.additional_config
+    assert vllm_config.load_config.model_loader_extra_config == extra_config
+    assert os.environ.get("RUNAI_STREAMER_MEMORY_LIMIT") == env_limit
+
+
+@patch("vllm_torchtpu.patch_registry.apply")
+@patch("vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env")
+def test_default_runai_streamer_memory_limit_survives_dp_collapse_reentry(
+    mock_prepare_env, mock_apply_patches, runai_default_env
+):
+    """EngineCore re-runs check_and_update_config after collapsing non-MoE DP
+    to 1; the front-end cap must not grow from 5 GiB to 20 GiB."""
+    vllm_config = _runai_vllm_config(
+        "runai_streamer",
+        {
+            "tensor_parallel_size": 2,
+            "data_parallel_size": 4,
+            "data_parallel_size_local": 4,
+        },
+        {},
+    )
+    assert vllm_config.additional_config == {TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY: 5 << 30}
+    vllm_config.parallel_config.reconfigure_for_independent_dp_rank()
+    assert vllm_config.parallel_config.data_parallel_size == 1
+    assert vllm_config.parallel_config.data_parallel_size_local == 1
+    with _device_left_unset():
+        TpuPlatform.check_and_update_config(vllm_config)
+    assert vllm_config.additional_config == {TPU_AUTO_RUNAI_MEMORY_LIMIT_KEY: 5 << 30}

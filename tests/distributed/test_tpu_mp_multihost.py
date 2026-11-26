@@ -168,6 +168,7 @@ def test_dp_bootstrap_sets_slice_and_reapplies_master_ports(
         data_parallel_rpc_port=9000,
         data_parallel_master_ip="10.0.0.1",
         world_size=2,
+        local_world_size=2,
     )
     assert mp.prepare_mp_multihost_dp_env(config, 8)
     rendezvous.assert_called_once_with(
@@ -208,3 +209,25 @@ def test_failed_bootstrap_can_retry(bootstrap):
     rendezvous.side_effect = None
     mp.prepare_mp_multihost_env(config)
     assert os.environ[mp._DONE_SENTINEL] == "2"
+
+
+@pytest.mark.parametrize(
+    "tp_size, dp_size, dp_local, nnodes, expected",
+    [
+        (1, 1, 1, 1, 1),  # single rank
+        (2, 4, 4, 1, 8),  # TP ranks of every local DP engine
+        (16, 1, 1, 2, 8),  # nnodes > 1: only this node's TP ranks
+        (8, 8, 0, 1, 0),  # no local DP engine
+    ],
+)
+def test_local_tpu_worker_count(tp_size, dp_size, dp_local, nnodes, expected):
+    from vllm.config import ParallelConfig
+
+    pc = ParallelConfig(
+        tensor_parallel_size=tp_size,
+        data_parallel_size=dp_size,
+        data_parallel_size_local=dp_local,
+        nnodes=nnodes,
+        distributed_executor_backend="mp" if nnodes > 1 else None,
+    )
+    assert mp.local_tpu_worker_count(pc) == expected
