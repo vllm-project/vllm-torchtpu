@@ -17,9 +17,8 @@ from types import SimpleNamespace
 import pytest
 from vllm.v1.core.sched.scheduler import Scheduler
 
-from vllm_torchtpu import (
-    _patch_vllm_mamba_split_scheduler_block_size,
-)
+import vllm_torchtpu
+from vllm_torchtpu import _patch_vllm_mamba_split_scheduler_block_size
 
 
 @pytest.fixture(autouse=True)
@@ -40,22 +39,30 @@ def _request(prompt_len: int):
     )
 
 
-def _scheduler():
-    physical_cache_config = SimpleNamespace(block_size=768)
+def _scheduler(page: int = 768, block: int = 3072, budget: int = 16384):
+    physical_cache_config = SimpleNamespace(block_size=page)
     scheduler = SimpleNamespace(
+        vllm_config=SimpleNamespace(),
         cache_config=physical_cache_config,
-        block_size=3072,
+        block_size=block,
         use_eagle=True,
         use_eagle_block_drop=False,
         num_hash_lookahead_tokens=0,
-        max_num_scheduled_tokens=16384,
+        max_num_scheduled_tokens=budget,
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
         mamba_shared_prefix_checkpoint=False,
-        hash_block_size=3072,
+        hash_block_size=block,
     )
     return scheduler, physical_cache_config
+
+
+@pytest.fixture(autouse=True)
+def _no_page_aligned_program(monkeypatch):
+    monkeypatch.setattr(
+        vllm_torchtpu, "_model_needs_page_aligned_chunks", lambda vllm_config: False
+    )
 
 
 def test_mamba_split_uses_scheduler_block_size_and_restores_cache_config():
@@ -99,6 +106,148 @@ def test_mamba_split_patch_is_idempotent():
     _patch_vllm_mamba_split_scheduler_block_size()
 
     assert Scheduler._mamba_block_aligned_split is patched_split
+
+
+@pytest.mark.parametrize("pages", [True, False])
+def test_sub_block_chunk_ends_stay_on_pages_for_programs_that_need_it(
+    monkeypatch, pages
+):
+    # DCP 32: 8192-token scheduler blocks, 256-token pages, a 4096-token
+    # prefill budget. A shared budget cut at 942 tokens ends mid-page; a
+    # program that writes whole pages (Capabilities.page_aligned_chunks) gets
+    # the chunk cut back to 768.
+    monkeypatch.setattr(
+        vllm_torchtpu, "_model_needs_page_aligned_chunks", lambda vllm_config: pages
+    )
+    _patch_vllm_mamba_split_scheduler_block_size()
+    scheduler, _ = _scheduler(page=256, block=8192, budget=4096)
+
+    split = Scheduler._mamba_block_aligned_split(
+        scheduler,
+        _request(prompt_len=9000),
+        num_new_tokens=942,
+    )
+
+    assert split == (768 if pages else 942)
+
+
+def test_serial_prefill_two_slot_tail_packing_and_skip_guard(monkeypatch):
+    monkeypatch.setattr(
+        vllm_torchtpu, "_model_needs_page_aligned_chunks", lambda vllm_config: True
+    )
+    monkeypatch.setattr(vllm_torchtpu.envs, "K3_SERIAL_PREFILL", True)
+    monkeypatch.setattr(vllm_torchtpu.envs, "K3_MAX_PREFILL_STEP_TOKENS", 16384)
+    _patch_vllm_mamba_split_scheduler_block_size()
+
+    scheduler, _ = _scheduler(page=512, block=16384, budget=16448)
+    scheduler.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=163840)
+    )
+    scheduler.scheduler_config = SimpleNamespace(
+        long_prefill_token_threshold=0, max_num_seqs=64
+    )
+    scheduler._tpu_unfinished_prefill_ids = {"r0"}
+    scheduler._tpu_step_prefill_info = {}
+    scheduler._tpu_effective_start = {"r0": 65536}
+
+    r0 = _request(prompt_len=80128)
+    r0.request_id = "r0"
+    r0.num_computed_tokens = 65536
+    s0 = Scheduler._mamba_block_aligned_split(scheduler, r0, num_new_tokens=14592)
+    assert s0 == 14592
+
+    r_short = _request(prompt_len=12000)
+    r_short.request_id = "r_short"
+    assert (
+        Scheduler._mamba_block_aligned_split(scheduler, r_short, num_new_tokens=12000)
+        == 0
+    )
+
+    r1 = _request(prompt_len=80128)
+    r1.request_id = "r1"
+    s1 = Scheduler._mamba_block_aligned_split(scheduler, r1, num_new_tokens=1792)
+    assert s1 == 1536
+    assert scheduler.max_num_scheduled_tokens == 16448
+
+    r2 = _request(prompt_len=80128)
+    r2.request_id = "r2"
+    assert Scheduler._mamba_block_aligned_split(scheduler, r2, num_new_tokens=512) == 0
+
+    scheduler._tpu_unfinished_prefill_ids = {"r1"}
+    scheduler._tpu_step_prefill_info = {}
+    r1.num_computed_tokens = 1536
+    s1_next = Scheduler._mamba_block_aligned_split(scheduler, r1, num_new_tokens=16448)
+    assert s1_next == 14848
+    s2_next = Scheduler._mamba_block_aligned_split(scheduler, r2, num_new_tokens=1599)
+    assert s2_next == 1536
+
+
+def test_serial_prefill_aggregate_target_and_step_cap(monkeypatch):
+    monkeypatch.setattr(
+        vllm_torchtpu, "_model_needs_page_aligned_chunks", lambda vllm_config: True
+    )
+    monkeypatch.setattr(vllm_torchtpu.envs, "K3_SERIAL_PREFILL", True)
+    _patch_vllm_mamba_split_scheduler_block_size()
+
+    scheduler, _ = _scheduler(page=512, block=16384, budget=16448)
+    scheduler.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=163840)
+    )
+    scheduler.scheduler_config = SimpleNamespace(
+        long_prefill_token_threshold=0, max_num_seqs=64
+    )
+    scheduler._tpu_is_aggregate = True
+    scheduler._tpu_decoding_ids = set()
+
+    monkeypatch.setattr(vllm_torchtpu.envs, "K3_MAX_PREFILL_STEP_TOKENS", 8192)
+    scheduler._tpu_unfinished_prefill_ids = set()
+    scheduler._tpu_step_prefill_info = {}
+    scheduler._tpu_effective_start = {}
+
+    r_seed = _request(prompt_len=80128)
+    r_seed.request_id = "r_seed"
+    r_seed.num_computed_tokens = 80127
+    assert (
+        Scheduler._mamba_block_aligned_split(scheduler, r_seed, num_new_tokens=1) == 1
+    )
+    assert "r_seed" in scheduler._tpu_decoding_ids
+    assert scheduler._tpu_step_prefill_info == {}
+
+    r_one = _request(prompt_len=1)
+    r_one.request_id = "r_one"
+    assert Scheduler._mamba_block_aligned_split(scheduler, r_one, num_new_tokens=1) == 1
+    assert scheduler._tpu_step_prefill_info == {}
+
+    ra = _request(prompt_len=80128)
+    ra.request_id = "ra"
+    rb = _request(prompt_len=80128)
+    rb.request_id = "rb"
+    assert (
+        Scheduler._mamba_block_aligned_split(scheduler, ra, num_new_tokens=16448)
+        == 8192
+    )
+    assert (
+        Scheduler._mamba_block_aligned_split(scheduler, rb, num_new_tokens=16448)
+        == 8192
+    )
+
+    monkeypatch.setattr(vllm_torchtpu.envs, "K3_MAX_PREFILL_STEP_TOKENS", 0)
+    scheduler._tpu_step_prefill_info = {}
+    scheduler._tpu_effective_start = {"rc": 65536}
+    scheduler._tpu_unfinished_prefill_ids = {"rc"}
+    rc = _request(prompt_len=80128)
+    rc.request_id = "rc"
+    rc.num_computed_tokens = 65536
+    assert (
+        Scheduler._mamba_block_aligned_split(scheduler, rc, num_new_tokens=14592)
+        == 14592
+    )
+    assert scheduler._tpu_step_prefill_info["rc"] == (14848, 65536)
+    rd = _request(prompt_len=80128)
+    rd.request_id = "rd"
+    assert (
+        Scheduler._mamba_block_aligned_split(scheduler, rd, num_new_tokens=2048) == 1536
+    )
 
 
 def _pp4pcp8_scheduler(checkpoint_blocks: bool, drop_eagle_block: bool):
