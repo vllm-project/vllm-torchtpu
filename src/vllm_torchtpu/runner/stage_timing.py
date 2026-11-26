@@ -22,6 +22,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 from torch_tpu._internal.stream.streams import TpuEvent
+from vllm.distributed.kv_transfer import has_kv_transfer_group
 
 
 @dataclass
@@ -42,15 +43,31 @@ class RunnerStageTiming:
         self._cpu_samples: list[tuple[str, str, float]] = []
         # Includes active stages; saturation keeps CPU samples only.
         self._pending: deque[_PendingTiming] = deque()
+        self._sink = False
+
+    def _has_sink(self) -> bool:
+        """Samples reach the metrics only through a KV connector's stats
+        (`TPUModelRunner.get_finished_kv_transfers`); without one they would
+        be dropped every step, so nothing is recorded. Re-checked until true:
+        warmup can run before the connector exists."""
+        if not self._sink:
+            self._sink = has_kv_transfer_group()
+        return self._sink
 
     @contextlib.contextmanager
     def host_stage(self, stage: str) -> Iterator[None]:
+        if not self._has_sink():
+            yield
+            return
         cpu_start = time.perf_counter()
         yield
         self._cpu_samples.append((self._rank, stage, time.perf_counter() - cpu_start))
 
     @contextlib.contextmanager
     def stage(self, stage: str) -> Iterator[None]:
+        if not self._has_sink():
+            yield
+            return
         if len(self._pending) >= self.MAX_IN_FLIGHT_DEVICE_TIMINGS:
             with self.host_stage(stage):
                 yield

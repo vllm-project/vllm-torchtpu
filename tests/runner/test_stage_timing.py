@@ -36,7 +36,25 @@ def events(monkeypatch):
     factory = MagicMock(side_effect=make_event)
     factory.events = created
     monkeypatch.setattr(stage_timing, "TpuEvent", factory)
+    monkeypatch.setattr(stage_timing, "has_kv_transfer_group", lambda: True)
     return factory
+
+
+def test_no_sink_records_nothing(events, monkeypatch):
+    sink = [False]
+    monkeypatch.setattr(stage_timing, "has_kv_transfer_group", lambda: sink[0])
+    timing = stage_timing.RunnerStageTiming(0)
+    with timing.stage("main_forward"):
+        pass
+    with timing.host_stage("output_assembly"):
+        pass
+    events.assert_not_called()
+    assert timing.take_samples() == ([], [])
+    # A connector created after warmup turns recording on.
+    sink[0] = True
+    with timing.stage("sample"):
+        pass
+    assert len(events.events) == 2
 
 
 @pytest.mark.parametrize("milliseconds", [0.0, 12.5])
