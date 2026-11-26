@@ -272,6 +272,33 @@ BOUNDARY_SYNC_HOP_FACTOR = 2.0
 SUBLAYER_BOUNDARIES_PER_LAYER = 2
 DCP_COLLECTIVES_PER_ATTN_LAYER = 2
 QUANTILE_DECIMALS = 4
+CONSERVED_GAP_DECIMALS = 10
+PS_PER_US = 1_000_000.0
+NS_PER_US = 1_000.0
+# Gaps above 500 us reflect idle pauses rather than kernel launch overhead.
+MAX_INTRA_STEP_GAP_US = 500.0
+MIN_STEPS_FOR_WARMUP_DROP = 3
+MIN_WARMUP_DROP_STEPS = 2
+MIN_STEP_OPS_FOR_EXPLICIT_NORM = 2
+WARMUP_OUTLIER_RATIO = 2.0
+MIN_EVENTS_FOR_WARMUP_DROP = 4
+CONSERVED_GAP_UNIT = "us_per_sublayer_boundary"
+STEP_COVERAGE_BASIS = "trace"
+DEFAULT_PHASE = "decode"
+XPLANE_DEVICE_PLANE_PREFIX = "/device:"
+XPLANE_SPARSE_FILTER = "sparse"
+COLLECTIVE_IGNORE_SUFFIXES: tuple[str, ...] = ("-done", ".done")
+XLA_MODULE_MARKERS: tuple[str, ...] = ("xla module", "xla_module")
+COLLECTIVE_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("all-reduce", "all-reduce"),
+    ("allreduce", "all-reduce"),
+    ("all-gather", "all-gather"),
+    ("allgather", "all-gather"),
+    ("reduce-scatter", "reduce-scatter"),
+    ("reducescatter", "reduce-scatter"),
+    ("all-to-all", "all-to-all"),
+    ("alltoall", "all-to-all"),
+)
 COLLECTIVE_PATH_IN_KERNEL = "in_kernel"
 COLLECTIVE_OP_ALL_REDUCE = "all-reduce"
 # 128-byte HBM burst/cacheline alignment for scattered sparse-KV row gathers.

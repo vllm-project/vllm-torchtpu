@@ -30,6 +30,9 @@ python -m vllm_torchtpu.megakernel.advisor estimate \
 python -m vllm_torchtpu.megakernel.advisor --model qwen3.5-397b --regime-sweep
 python -m vllm_torchtpu.megakernel.advisor --model qwen3.5-397b --tp 8 --ep 8 --search-layer-groups
 python -m vllm_torchtpu.megakernel.advisor --list-models
+python -m vllm_torchtpu.megakernel.advisor calibrate \
+  --trace path/to/trace.xplane.pb --out measurements.json \
+  --chip tpu7x --model qwen3.5-397b --phase decode
 ```
 
 ## Key CLI Flags
