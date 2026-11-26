@@ -9958,6 +9958,68 @@ class TestStage3DmaDrainSafety:
         assert results.outcomes == {"send-fail-drain": RaidenSendOutcome.SEND_FAILURE}
         assert worker._stage3_draining_sends == {}
 
+    def test_prefill_release_and_terminal_cleanup_ignore_stale_send_outcomes(
+        self, monkeypatch
+    ):
+        from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+            RaidenSendOutcome,
+        )
+
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+
+        # Case 1: reqs_to_release purges stale _stage3_send_outcomes and
+        # _stage3_terminal_cleanup so no spurious finished_sending is reported.
+        worker1, engine1, facade1 = self._seeded_prefill_worker(
+            req_id="send-rel-outcome", uuid=790
+        )
+        engine1.send_settled = True
+        worker1._stage3_send_outcomes["send-rel-outcome"] = "done"
+        worker1._stage3_terminal_cleanup["send-rel-outcome"] = True
+        worker1.process_send_load(
+            TPUConnectorMetadata(reqs_to_release={"send-rel-outcome": 790})
+        )
+        assert "send-rel-outcome" not in worker1._stage3_send_outcomes
+        assert "send-rel-outcome" not in worker1._stage3_terminal_cleanup
+        assert worker1.get_finished() == (set(), set())
+        assert worker1.take_pd_send_results() is None
+        assert facade1.release_request_blocks_calls == [
+            {"req_id": "send-rel-outcome", "uuid": 790}
+        ]
+
+        # Case 2: Replayed native terminal while complete_request_blocks retry
+        # is pending in _stage3_terminal_cleanup must not re-enter draining
+        # sends or emit a follow-up failure on a retired registration.
+        worker2, engine2, facade2 = self._seeded_prefill_worker(
+            req_id="send-cleanup-retry", uuid=791
+        )
+        engine2.send_settled = True
+        fail_once = [True]
+        orig_complete = facade2.complete_request_blocks
+
+        def _flaky_complete(**kwargs):
+            if fail_once[0]:
+                fail_once[0] = False
+                raise RuntimeError("transient controller RPC error")
+            return orig_complete(**kwargs)
+
+        facade2.complete_request_blocks = _flaky_complete
+        engine2.poll_results.append((["send-cleanup-retry"], [], []))
+        with pytest.raises(RuntimeError, match="transient controller RPC error"):
+            worker2.get_finished()
+        assert worker2._stage3_terminal_cleanup == {"send-cleanup-retry": True}
+
+        engine2.send_settled = False
+        engine2.poll_results.append(([], [], ["send-cleanup-retry"]))
+        assert worker2.get_finished() == ({"send-cleanup-retry"}, set())
+        assert worker2._stage3_draining_sends == {}
+        assert worker2._stage3_send_outcomes == {}
+        assert worker2._stage3_terminal_cleanup == {}
+        results2 = worker2.take_pd_send_results()
+        assert results2 is not None
+        assert results2.outcomes == {"send-cleanup-retry": RaidenSendOutcome.SUCCESS}
+        assert worker2.get_finished() == (set(), set())
+        assert worker2.take_pd_send_results() is None
+
     def test_prefill_send_drain_gate_holds_cancelled_and_expired_sends(
         self, monkeypatch
     ):

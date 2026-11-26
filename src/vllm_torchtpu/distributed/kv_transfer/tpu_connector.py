@@ -4357,7 +4357,8 @@ class TPURaidenConnectorWorker:
                 continue
             del self._stage3_registered_sends[req_id]
             self._stage3_status_probe_next.pop(req_id, None)
-            self._clear_stage3_draining_send(req_id)
+            self._stage3_terminal_cleanup.pop(req_id, None)
+            self._stage3_prune_state_send_tracking(req_id)
             facade.release_request_blocks(req_id=req_id, uuid=int(uuid))
             logger.info(
                 "%s",
@@ -5491,6 +5492,8 @@ class TPURaidenConnectorWorker:
         for req_id, failed in [(str(req_id), False) for req_id in done_sending] + [
             (str(req_id), True) for req_id in failed_sending
         ]:
+            if req_id in self._stage3_terminal_cleanup:
+                continue
             if req_id in self._stage3_registered_sends:
                 if failed:
                     self._stage3_send_outcomes[req_id] = "failed"
