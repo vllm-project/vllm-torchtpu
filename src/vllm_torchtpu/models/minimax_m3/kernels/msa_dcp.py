@@ -448,19 +448,98 @@ def _insert_picks(key_ref, num_cols, topk, col_bits) -> jax.Array:
 
         zeros = jnp.zeros((8, width), jnp.float32)
         lists = jax.lax.fori_loop(0, num_cols // (8 * unroll), insert, (zeros,) * topk)
-        lists, picks = list(lists), []
-        for i in range(topk):
-            best = lists[0]
-            for shift in (4, 2, 1):  # across sublanes: every sublane gets the max
-                best = jnp.maximum(best, pltpu.roll(best, shift, 0))
-            picks.append(best[:1])
-            # Keys are distinct: one sublane holds the pick; pop its list.
-            hit = lists[0] == best
-            depth = topk - i
-            lists[: depth - 1] = [
-                jnp.where(hit, lists[j + 1], lists[j]) for j in range(depth - 1)
-            ]
-        blocks.append(jnp.concatenate(picks))
+        blocks.append(_merge_sublane_lists(list(lists)))
+    keys = blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks, axis=1)
+    return pltpu.bitcast(keys, jnp.int32) - offset
+
+
+def _merge_sublane_lists(lists) -> jax.Array:
+    """Each sublane's descending lists ``topk x [8, rows]`` -> the `topk`
+    largest of all ``[topk, rows]``, best first."""
+    topk, picks = len(lists), []
+    for i in range(topk):
+        best = lists[0]
+        for shift in (4, 2, 1):  # across sublanes: every sublane gets the max
+            best = jnp.maximum(best, pltpu.roll(best, shift, 0))
+        picks.append(best[:1])
+        # Keys are distinct: one sublane holds the pick; pop its list.
+        hit = lists[0] == best
+        depth = topk - i
+        lists[: depth - 1] = [
+            jnp.where(hit, lists[j + 1], lists[j]) for j in range(depth - 1)
+        ]
+    return jnp.concatenate(picks)
+
+
+def _merge_sort_network(n: int) -> list[tuple[int, int]]:
+    """Batcher's odd-even merge sort of `n` (a power of 2) items: the
+    compare-exchange pairs, in order (63 for 16 items)."""
+    pairs, p = [], 1
+    while p < n:
+        k = p
+        while k >= 1:
+            for j in range(k % p, n - k, 2 * k):
+                for i in range(min(k, n - j - k)):
+                    if (i + j) // (2 * p) == (i + j + k) // (2 * p):
+                        pairs.append((i + j, i + j + k))
+            k //= 2
+        p *= 2
+    return pairs
+
+
+def _compare_exchange(x, pairs):
+    """Apply compare-exchange `pairs` to list `x`, larger first."""
+    x = list(x)
+    for a, b in pairs:
+        x[a], x[b] = jnp.maximum(x[a], x[b]), jnp.minimum(x[a], x[b])
+    return x
+
+
+def _top_of_sorted(a, b):
+    """The ``len(a)`` largest of descending lists `a` and `b`, descending:
+    the maxima of `a` and reversed `b` (a bitonic list), then a bitonic
+    sort."""
+    n = len(a)
+    x = [jnp.maximum(u, v) for u, v in zip(a, b[::-1])]
+    d = n // 2
+    while d:
+        x = _compare_exchange(x, [(i, i + d) for i in range(n) if not i & d])
+        d //= 2
+    return x
+
+
+# `_network_picks` sorts and merges the lists of this many rows at a time:
+# two 128-row blocks in flight (anvil, prefill candidates of the c4 / c64
+# mixed steps: 53.6 -> 51.9 / 294.3 -> 287.7 us per call against 128).
+_NETWORK_ROWS = 256
+
+
+def _network_picks(key_ref, num_cols, topk, col_bits) -> jax.Array:
+    """`_insert_picks` with each sublane's lists built `topk` key vregs (8 *
+    `topk` columns, `num_cols` a multiple) at a time: the group sorted by a
+    merge network and merged into the lists by `_top_of_sorted`, ~13 ops per
+    key vreg at `topk` 16 (a power of 2) against an insertion's 31."""
+    offset, _ = _float_key_range(col_bits)
+    rows = key_ref.shape[1]
+    width = min(rows, _NETWORK_ROWS)
+    network = _merge_sort_network(topk)
+    group_cols = 8 * topk
+    blocks = []
+    for b in range(rows // width):
+        lanes = pl.ds(b * width, width)
+
+        def group(g, lanes=lanes):
+            first = pl.multiple_of(g * group_cols, group_cols)
+            keys = [key_ref[pl.ds(first + 8 * i, 8), lanes] for i in range(topk)]
+            return _compare_exchange(keys, network)
+
+        lists = jax.lax.fori_loop(
+            1,
+            num_cols // group_cols,
+            lambda g, lists: tuple(_top_of_sorted(list(lists), group(g))),
+            tuple(group(0)),
+        )
+        blocks.append(_merge_sublane_lists(list(lists)))
     keys = blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks, axis=1)
     return pltpu.bitcast(keys, jnp.int32) - offset
 
@@ -1299,7 +1378,7 @@ def _prefill_candidates_kernel(
 ):
     """`msa_indexer._kernel_v3` over the large (prefill-chunk) tiles with each
     tile's pick keys built from its block maxima as they are scored, in
-    VMEM, and its rows' picks (`_pick_t`'s scan) at the tile's last page
+    VMEM, and its rows' picks (`_network_picks`) at the tile's last page
     group: the scores never round-trip through HBM. (Spreading a tile's
     scan over the next tile's scoring bodies made them slower than the scan
     alone: they have no free vector registers.)
@@ -1375,8 +1454,8 @@ def _prefill_candidates_kernel(
 
     @pl.when((step == last) | (next_tile != tile))
     def _():
-        # The columns its rows can see (`_pick_t`), in whole insert steps.
-        width = 8 * _INSERT_UNROLL
+        # The columns its rows can see (`_pick_t`), in whole network groups.
+        width = 8 * topk
         needed = (jnp.max(num_visible) + dcp - 1) // dcp
         scanned = jnp.clip(-(-needed // width), 1, num_cols // width) * width
         # Those past the scored pages (stale VMEM): 0, below every key.
@@ -1389,7 +1468,7 @@ def _prefill_candidates_kernel(
             return carry
 
         jax.lax.fori_loop(scored, scanned // chunk, floor, 0)
-        keys = _insert_picks(keys_ref, scanned, topk, col_bits)
+        keys = _network_picks(keys_ref, scanned, topk, col_bits)
         score, block = _picked(
             [keys[i : i + 1] for i in range(topk)], rank, col_bits=col_bits, dcp=dcp
         )
@@ -1465,14 +1544,15 @@ def _prefill_chunk(plan, index_cache) -> int:
     )
 
 
-def _prefill_fits(plan, index_cache, small_rows: int, num_rows: int) -> bool:
+def _prefill_fits(plan, index_cache, small_rows: int, num_rows: int, topk: int) -> bool:
     """Whether `_prefill_candidates` takes the step: tile-major large and
-    token-major small tiles, key columns in whole insert steps (whole dots
-    each) and VMEM within `_PREFILL_VMEM_BYTES`."""
-    step_cols = 8 * _INSERT_UNROLL
+    token-major small tiles, key columns in whole `_network_picks` groups
+    (whole dots each) and VMEM within `_PREFILL_VMEM_BYTES`."""
+    step_cols = 8 * topk
     return (
         plan.large_tile_major
         and plan.token_major
+        and topk & (topk - 1) == 0
         and plan.large_pages % step_cols == 0
         and step_cols % _prefill_chunk(plan, index_cache) == 0
         and _prefill_vmem_bytes(plan, index_cache, small_rows, num_rows)
@@ -1659,7 +1739,9 @@ def _class_candidates(
 
     small = plan.small()
     small_picks = class_picks(small, plan.small_block_q, not plan.token_major)
-    if _prefill_fits(plan, index_cache, small_picks.shape[0], num_tokens * num_heads):
+    if _prefill_fits(
+        plan, index_cache, small_picks.shape[0], num_tokens * num_heads, topk
+    ):
         packed = _prefill_candidates(
             plan,
             index_cache,
