@@ -251,6 +251,25 @@ def _expand(payloads, extra, distinct, total, *, topk):
     return payloads
 
 
+def _staged_kernel(*refs, num_ins, num_outs, **kwargs):
+    """`_kernel` writing its outputs to VMEM / SMEM stages, then copying them
+    to the HBM outputs."""
+    ins = refs[:num_ins]
+    outs = refs[num_ins : num_ins + num_outs]
+    stages = refs[num_ins + num_outs : num_ins + 2 * num_outs]
+    scratch = refs[num_ins + 2 * num_outs : -1]
+    sem = refs[-1]
+    _kernel(*ins, *stages, *scratch, **kwargs)
+    copies = [
+        pltpu.make_async_copy(stage, out, sem.at[0])
+        for stage, out in zip(stages, outs)
+    ]
+    for c in copies:
+        c.start()
+    for c in copies:
+        c.wait()
+
+
 def _kernel(
     ep_ref,
     fits_ref,
@@ -748,9 +767,24 @@ def local_route_plan(
             jax.ShapeDtypeStruct((2,), I32),
         ]
         out_specs += [vmem] * 4 + [smem] + [vmem] * 2 + [smem]
+    # The outputs are staged in VMEM / SMEM and copied to HBM by the kernel
+    # itself: left to XLA, each small output lands in VMEM and is copied to
+    # HBM for the expert kernel one after the other (~0.6 us each, ~7 us).
+    stage_shapes = [
+        (pltpu.SMEM if spec is smem else pltpu.VMEM)(o.shape, o.dtype)
+        for o, spec in zip(out_shape, out_specs)
+    ]
+    num_outs = len(out_shape)
+    if interpret:
+        out_specs = [pl.BlockSpec(memory_space=pl.ANY)] * num_outs
+    else:
+        out_shape = [pltpu.HBM(o.shape, o.dtype) for o in out_shape]
+        out_specs = [pl.BlockSpec(memory_space=pltpu.HBM)] * num_outs
     outs = pl.pallas_call(
         functools.partial(
-            _kernel,
+            _staged_kernel,
+            num_ins=len(operands),
+            num_outs=num_outs,
             num_members=num_members,
             topk=topk,
             num_tokens=num_tokens,
@@ -766,7 +800,8 @@ def local_route_plan(
         out_shape=out_shape,
         in_specs=[smem, smem] + [vmem] * (len(operands) - 2),
         out_specs=out_specs,
-        scratch_shapes=[
+        scratch_shapes=stage_shapes
+        + [
             pltpu.VMEM((topk, members, _LANES), I32),
             pltpu.VMEM((1, members, _LANES), I32),
             pltpu.VMEM((local_num_experts * sort_rows, _LANES), I32),
@@ -786,7 +821,8 @@ def local_route_plan(
             ]
             if route_scale
             else []
-        ),
+        )
+        + [pltpu.SemaphoreType.DMA((1,))],
         interpret=interpret,
         name=(
             f"local_route_plan-d_{num_members}-s_{num_tokens}-k_{topk}"
