@@ -1900,6 +1900,52 @@ def owner_token_sum(
     return out
 
 
+def staged_token_sum(
+    tp_ref, dp_ref, sent_ref, weight_ref, t, rows, i: int, *, topk: int, tp_size: int
+) -> jax.Array:
+    """`owner_token_sum` of owned token ``t`` with shared partials, bitwise,
+    from its rows in VMEM: ``rows[:, i]`` of ``rows`` [>= topk + tp_size + 1,
+    n, *row_shape] holds its route rows in owner order, each TP rank's shared
+    partial, then a free row. Overwrites the route rows and the free row.
+
+    The same ops on the same values, except that the TP ranks' partials are
+    not kept under selects at every route: each route's spent row takes its
+    rank's partial so far, and as owner order keeps a rank's routes together,
+    the row of the rank's last route holds the rank's partial."""
+    f32 = jnp.float32
+    dtype = rows.dtype
+    zeros = jnp.zeros(rows.shape[2:], f32)
+    free = topk + tp_size
+    # The partial of a rank without routes.
+    rows[free, i] = zeros.astype(dtype)
+    last = [free] * tp_size  # per TP rank, the row of its partial
+    acc_m = acc_r = zeros
+    for j in range(topk):
+        r, d = tp_ref[j, t], dp_ref[j, t]
+        x = rows[j, i].astype(f32)
+        prod = jnp.where(sent_ref[j, t] != 0, weight_ref[j, t] * x, 0.0)
+        if j:
+            new_r = r != tp_ref[j - 1, t]
+            new_m = jnp.logical_or(new_r, d != dp_ref[j - 1, t])
+            acc_r = jnp.where(new_r, 0.0, acc_r)
+            acc_m = jnp.where(new_m, 0.0, acc_m)
+        acc_m = acc_m + prod
+        if j + 1 < topk:
+            end_m = jnp.logical_or(tp_ref[j + 1, t] != r, dp_ref[j + 1, t] != d)
+        else:
+            end_m = True
+        part = acc_m.astype(dtype).astype(f32)
+        ends = jnp.logical_and(r < tp_size, end_m)
+        acc_r = acc_r + jnp.where(ends, part, 0.0)
+        rows[j, i] = acc_r.astype(dtype)
+        last = [jnp.where(r == rr, j, last[rr]) for rr in range(tp_size)]
+    out = zeros
+    for rr in range(tp_size):
+        x = rows[topk + rr, i].astype(f32) + rows[last[rr], i].astype(f32)
+        out = out + x.astype(dtype).astype(f32)
+    return out
+
+
 def _owner_tail(sc: ScatterRefs, tl: OwnerTailRefs) -> None:
     """`gmm_v2_mlp_scatter`'s owner tail, once every row bound here has landed:
     sums this member's owned tokens in chunks and copies each summed chunk to
@@ -2000,19 +2046,21 @@ def _owner_tail(sc: ScatterRefs, tl: OwnerTailRefs) -> None:
 
     def compute(c0, n, slot):
         for i in range(n):
-            out = owner_token_sum(
-                tl.tp_rank,
-                tl.dp_pos,
-                tl.sent,
-                tl.weight,
-                c0 + i,
-                lambda j, i=i: groups[slot, j, i],
-                None if shared is None else (lambda r, i=i: groups[slot, topk + r, i]),
-                topk=topk,
-                tp_size=tp,
-                dtype=dtype,
-                row_shape=row_shape,
-            )
+            tables = (tl.tp_rank, tl.dp_pos, tl.sent, tl.weight, c0 + i)
+            if shared is None:
+                out = owner_token_sum(
+                    *tables,
+                    lambda j, i=i: groups[slot, j, i],
+                    None,
+                    topk=topk,
+                    tp_size=tp,
+                    dtype=dtype,
+                    row_shape=row_shape,
+                )
+            else:
+                out = staged_token_sum(
+                    *tables, groups.at[slot], i, topk=topk, tp_size=tp
+                )
             groups[slot, sums, i] = out.astype(dtype)
 
     @pl.when(tl.fits[0] != 0)
