@@ -28,6 +28,7 @@ output zero. The gated output follows the stock contract:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import jax
@@ -52,17 +53,48 @@ TILE = 256  # tokens per ring slot
 SLOTS = 8  # ring slots: SLOTS - 1 tiles in flight ahead of the one being read
 
 
-def _unpack_kv(slot_ref: Any, off: Any, interpret: bool) -> tuple[jax.Array, jax.Array]:
+def fp8_dense_read() -> bool:
+    """VLLM_TPU_MK_FP8_DENSE_READ (default off; exact): FP8 ring slots are read as dense
+    32-bit word rows (`_unpack_kv`, the QSA key stream) instead of one-row-per-sublane views."""
+    return os.environ.get("VLLM_TPU_MK_FP8_DENSE_READ", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _unpack_kv(
+    slot_ref: Any, off: Any, interpret: bool, dense: bool | None = None
+) -> tuple[jax.Array, jax.Array]:
     """FP8 K / V `[TILE, 256]` of head pair `off` from a `[TILE, 1, 4, 256]` slot.
 
     Four pack rows form one 32-bit word per lane, row `c` in byte `c`; K and V of
     pair `off` are bytes `2 * off` and `2 * off + 1`.
+
+    `dense` (default `fp8_dense_read()`): the slot's bytes are row-major words
+    `[n * halves, 128]` (token `i`'s 128-lane half `h` at row `i * halves + h`), read with
+    stride-`halves` row reads that fill whole vregs (a `[n, lanes]` read loads one sublane
+    per vreg and relayouts); K and V split by one shift and u16 / u8 truncations. Same
+    bytes, same FP8 values.
     """
+    if dense is None:
+        dense = fp8_dense_read()
+    n, lanes = slot_ref.shape[0], slot_ref.shape[-1]
     if interpret:
         raw = slot_ref[...]
-        words = pltpu.bitcast(raw.reshape(-1, raw.shape[-1]), jnp.uint32)
+        words = pltpu.bitcast(raw.reshape(-1, lanes), jnp.uint32)
+    elif dense:
+        halves = lanes // 128
+        rows = slot_ref.bitcast(jnp.uint32).reshape(n * halves, 128)
+        words = jnp.concatenate(
+            [rows[pl.ds(h, n, stride=halves), :] for h in range(halves)], axis=1
+        )
     else:
-        words = slot_ref.bitcast(jnp.uint32).reshape(-1, slot_ref.shape[-1])[...]
+        words = slot_ref.bitcast(jnp.uint32).reshape(-1, lanes)[...]
+
+    if dense:
+        sh = (16 * off).astype(jnp.uint32) if hasattr(off, "astype") else 16 * off
+        pair = (words >> sh).astype(jnp.uint16)  # K | V << 8; the casts truncate
+        k8 = pltpu.bitcast(pair.astype(jnp.uint8), jnp.float8_e4m3fn)
+        v8 = pltpu.bitcast((pair >> 8).astype(jnp.uint8), jnp.float8_e4m3fn)
+        return k8, v8
 
     def byte(c: Any) -> jax.Array:
         sh = (8 * c).astype(jnp.uint32) if hasattr(c, "astype") else 8 * c
