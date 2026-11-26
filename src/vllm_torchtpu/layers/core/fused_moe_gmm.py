@@ -900,8 +900,9 @@ def moe_gmm(
             )
             pieces = _combine_pieces(num_tokens, tc_args[1:], gmm2_res.dtype)
             per = num_tokens // pieces
-            # Slot-major [topk, tokens]: the routing prep builds them so
-            # (prepare_routed_gmm_inputs), and these transposes cancel its.
+            # Slot-major [topk, tokens]: when the counting sort ran, the
+            # routing prep built them so (prepare_routed_gmm_inputs) and these
+            # transposes cancel its; on its argsort path they are relayouts.
             pos_t, weights_t, valid_t = (
                 a.reshape(num_tokens, topk).T
                 for a in (argsort_revert_indices, topk_weights_flat, valid_mask_flat)

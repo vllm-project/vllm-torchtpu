@@ -244,9 +244,11 @@ def _hash_moe_select(
     return topk_weights, topk_ids
 
 
-# Up to this many tokens the routing weights are selected with a one-hot
-# compare instead of an XLA gather (c48 192-token decode: a 4 us gather per
-# layer); larger steps keep the gather, which they offload to SparseCore.
+# TPU_MOE_ROUTER_TOPK=sort with a correction bias (the rowmax path takes the
+# weights from the top-k kernel's picks): up to this many tokens the routing
+# weights are selected with a one-hot compare instead of an XLA gather (c48
+# 192-token decode: a 4 us gather per layer); larger steps keep the gather,
+# which they offload to SparseCore.
 _SELECT_SCORES_MAX_TOKENS = 512
 
 

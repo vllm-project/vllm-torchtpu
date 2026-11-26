@@ -169,7 +169,8 @@ def test_router_topk_op_is_registered_at_import():
 def test_select_experts_rowmax_bias_matches_sort(monkeypatch):
     """With a correction bias the rowmax path takes the weights from the
     kernel's picks (rowmax_select_values); same result as the sort path's
-    top-k on scores + bias and gather of the scores."""
+    top-k on scores + bias and gather of the scores. Off TPU this runs the
+    torch fallback; tests/kernels/test_router_topk.py covers the kernel."""
     torch = pytest.importorskip("torch")
     torch.manual_seed(1)
     hidden = torch.randn(48, 8, dtype=torch.bfloat16)

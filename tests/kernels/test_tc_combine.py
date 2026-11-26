@@ -13,6 +13,7 @@
 # limitations under the License.
 """TensorCore MoE combine against a NumPy reference (Pallas interpret mode)."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -221,22 +222,45 @@ def test_token_pieces_equal_the_whole():
 
 
 @pytest.mark.parametrize(
-    "num_tokens, skew, padded, w_dtype",
-    [(512, 0.0, 0, jnp.bfloat16), (768, 2.0, 7, jnp.float32)],
+    "num_tokens, skew, padded, w_dtype, shared",
+    [
+        (512, 0.0, 0, jnp.bfloat16, False),
+        (1024, 2.0, 7, jnp.float32, False),
+        (1024, 0.5, 9, jnp.bfloat16, True),
+    ],
 )
-def test_slot_major_routes_match_token_major(num_tokens, skew, padded, w_dtype):
+def test_slot_major_routes_match_token_major(num_tokens, skew, padded, w_dtype, shared):
     """[topk, T] route arrays (the routing prep's layout) give bit-identical
-    output to the flat token-major ones."""
-    x, pos, w, valid, group_sizes = _routes(num_tokens, 256, skew, padded, seed=4)
+    output to the flat token-major ones, whole and in two token pieces
+    without the gather fallback (as moe_gmm calls it)."""
+    x, pos, w, valid, group_sizes = _routes(num_tokens, 512, skew, padded, seed=4)
     xb = jnp.asarray(x, jnp.bfloat16)
     wj = jnp.asarray(w, w_dtype)
+    rng = np.random.default_rng(5)
+    shared_down = (
+        (
+            jnp.asarray(rng.standard_normal((num_tokens, 128)), jnp.bfloat16),
+            jnp.asarray(rng.standard_normal((128, 512)), jnp.float8_e4m3fn),
+            jnp.asarray(rng.random((1, 512)), jnp.float32),
+        )
+        if shared
+        else None
+    )
 
-    def run(*routes):
+    def run(pos_, w_, valid_, tokens=None, fallback=True):
+        act = None
+        if shared_down is not None:
+            rows = shared_down[0] if tokens is None else shared_down[0][tokens]
+            act = (rows, *shared_down[1:])
         return tc_combine.tc_combine(
             xb,
-            *routes,
+            pos_,
+            w_,
+            valid_,
             jnp.asarray(group_sizes),
             topk=TOPK,
+            shared_down=act,
+            fallback=fallback,
             interpret=pltpu.InterpretParams(),
         )
 
@@ -244,7 +268,17 @@ def test_slot_major_routes_match_token_major(num_tokens, skew, padded, w_dtype):
         return jnp.asarray(a).reshape(num_tokens, TOPK).T
 
     flat = run(jnp.asarray(pos), wj, jnp.asarray(valid))
-    slots = run(slot_major(pos), slot_major(wj), slot_major(valid))
-    np.testing.assert_array_equal(
-        np.asarray(flat.astype(jnp.float32)), np.asarray(slots.astype(jnp.float32))
+    pos_t, w_t, valid_t = slot_major(pos), slot_major(wj), slot_major(valid)
+    whole = run(pos_t, w_t, valid_t)
+    half = num_tokens // 2
+    pieces = jnp.concatenate(
+        [
+            run(pos_t[:, t], w_t[:, t], valid_t[:, t], tokens=t, fallback=False)
+            for t in (slice(0, half), slice(half, num_tokens))
+        ]
     )
+    for got in (whole, pieces):
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(flat, jnp.int16)),
+            np.asarray(jax.lax.bitcast_convert_type(got, jnp.int16)),
+        )
