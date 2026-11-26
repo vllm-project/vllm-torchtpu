@@ -71,3 +71,41 @@ class SparseMQAIndexer(torch.nn.Module):
             candidate_source=self.candidate_source_layer,
             query_start_loc=query_start_loc,
         )
+
+    def prefetch_candidates(
+        self,
+        cache: PackedFP8IndexCacheRows,
+        records: torch.Tensor,
+        requests: torch.Tensor,
+        *,
+        candidates: torch.Tensor,
+        score_width: int,
+        stage_cache: dict[Any, Any] | None,
+    ) -> None:
+        """Gather the candidate K that `forward` will score, ahead of it.
+
+        Issue it before the layer's in-place KV writes: the gather then reads
+        the same Index-K under the previous layer's work instead of stalling
+        this layer's scoring.
+        """
+        block_size = max(1, self.candidate_block_size)
+        if (
+            self.candidate_blocks is None
+            or self.candidate_write
+            or not indexer_fp8.uses_prepared_candidates(
+                requests.shape[0], candidates, block_size, score_width, stage_cache
+            )
+        ):
+            return
+        assert self.candidate_source_layer is not None and stage_cache is not None
+        indexer_fp8.prepared_candidates(
+            cache,
+            records,
+            candidates,
+            requests,
+            block_size=block_size,
+            score_width=score_width,
+            stage_cache=stage_cache,
+            source_prefix=self.k_cache.prefix,
+            candidate_source=self.candidate_source_layer,
+        )

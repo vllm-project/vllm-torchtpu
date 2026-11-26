@@ -320,10 +320,16 @@ def block_topk(
                     fetch_sem,
                 )
 
-            @pl.loop(0, count)
-            def start(b):
-                owner = plsc.load_gather(block_ids, [jnp.full(lanes, b, jnp.int32)])
-                copy(b, owner[0]).start()
+            # One vector load of `lanes` owners per group instead of one
+            # broadcast gather per block (528 blocks: 57.9 -> 52.3 us a row).
+            @pl.loop(0, pl.cdiv(count, lanes))
+            def start(group):
+                owners = block_ids[pl.ds(group * lanes, lanes)]
+                for j in range(lanes):
+
+                    @pl.when(group * lanes + j < count)
+                    def _(j=j):
+                        copy(group * lanes + j, owners[j]).start()
 
             @pl.loop(0, count)
             def land(b):

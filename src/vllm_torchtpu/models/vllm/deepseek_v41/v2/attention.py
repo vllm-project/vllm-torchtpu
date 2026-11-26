@@ -1598,6 +1598,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # FP8/NVFP4 cache numerics must not be imposed on BF16 cache rows.
         if not self._fused_preprocess:
             kv = self._rotate(kv, positions)
+        self._prefetch_candidate_keys(metadata, positions, requests, stage_cache)
         if self._csa2:
             assert csa2_write_records is not None
             if not swa_published:
@@ -1855,6 +1856,35 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         )[:, 0]
         output.copy_(result.masked_fill(swa_invalid_3d, 0))
         return None
+
+    def _prefetch_candidate_keys(self, metadata, positions, requests, stage_cache):
+        """Gather a candidate layer's Index-K ahead of its in-place KV writes.
+
+        Index-K is final at layer entry when the layer writes none itself.
+        XLA must finish a pool read before the next in-place write to the
+        pool, so a gather issued after this layer's SWA publish would wait in
+        front of this layer's scoring; issued before, it runs under the
+        previous layer.
+        """
+        indexer = self.indexer
+        if (
+            indexer is None
+            or self._all_indices_fit
+            or not self.compress_ratio
+            or indexer.indexer_op.candidate_blocks is None
+            or (self.compressor is not None and not self._ced_global_from_encoder)
+            # Split ranks score row parts without the stage cache.
+            or get_tensor_model_parallel_world_size() > 1
+        ):
+            return
+        indexer.indexer_op.prefetch_candidates(
+            indexer.k_cache.kv_cache,
+            _block_table(metadata[indexer.k_cache.prefix]),
+            requests,
+            candidates=self.candidate_block_buffer[: positions.shape[0]],
+            score_width=max(1, self._max_model_len // self.compress_ratio),
+            stage_cache=stage_cache,
+        )
 
     @property
     def _source_attends(self):
