@@ -74,6 +74,10 @@ class _Armed:
     rs_op: Any = None
     # Small 32-bit all-gather op (TPU_TP_PALLAS_SMALL_ALL_GATHER), or None.
     gather_op: Any = None
+    # The op's mesh and byte cap, for kernels that run over the same mesh
+    # (`armed_for`).
+    mesh: Any = None
+    max_bytes: int = 0
 
 
 _ARMED: _Armed | None = None
@@ -571,6 +575,8 @@ def arm(hidden: int, device: torch.device) -> bool:
         rank_ordered=rank_ordered,
         rs_op=rs_op,
         gather_op=gather_op,
+        mesh=mesh,
+        max_bytes=max_bytes,
     )
     logger.info(
         "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B views"
@@ -676,3 +682,10 @@ def tp_all_gather(x: torch.Tensor, dim: int = 0) -> torch.Tensor:
     blocks = gathered.view(x.dtype).view(-1, *x.shape)  # [n, *x.shape]
     dim = dim % x.dim()
     return torch.cat(blocks.unbind(0), dim=dim) if dim else blocks.flatten(0, 1)
+def armed_for(ranks) -> _Armed | None:
+    """The armed op's record (mesh, mesh index, byte cap) when it serves the
+    group of `ranks`, else None: for kernels that run over its mesh."""
+    armed = _ARMED
+    if armed is None or tuple(ranks) != armed.ranks:
+        return None
+    return armed

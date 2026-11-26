@@ -62,6 +62,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels import tight_vmem
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 _NEG_INF = float("-inf")
@@ -1369,10 +1372,13 @@ def forward_with_dcp(
     k_scale: float | None,
     v_scale: float | None,
     ops: dict[str, Any],
+    pair_meta: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The drafter's attention of its query block (``query [T, H, D]``, own
     heads; ``key``/``value [T, 1, D]``, own KV head) over the window of a
-    DCP-sharded cache plus the block itself. The block is not written."""
+    DCP-sharded cache plus the block itself. The block is not written.
+    ``pair_meta``: set by `arm_pair_merge`, the partials merge through
+    ``ops["pair_merge"]`` (one exchange with the head's other rank)."""
     from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 
     del dcp, kv_head_replicas  # shared layer args (the cache spec uses them)
@@ -1389,7 +1395,12 @@ def forward_with_dcp(
         attn_metadata.query_start_loc,
         dcp_rank,
     )
-    ctx_out, ctx_lse = cp_lse_ag_out_rs(ctx_out, ctx_lse, head_group, return_lse=True)
+    if pair_meta is not None:
+        ctx_out, ctx_lse = ops["pair_merge"](ctx_out, ctx_lse, pair_meta)
+    else:
+        ctx_out, ctx_lse = cp_lse_ag_out_rs(
+            ctx_out, ctx_lse, head_group, return_lse=True
+        )
     # The block's K/V as the cache would hold them (quantized), own KV head.
     if kv_cache.dtype != key.dtype and k_scale is not None:
         key = (key.float() / k_scale).to(kv_cache.dtype).float() * k_scale
@@ -1403,3 +1414,166 @@ def forward_with_dcp(
         ctx_out,
         ctx_lse,
     )
+
+
+# ---------------------------------------------------------------------------
+# Pair merge (TPU_DRAFT_DCP_PAIR_MERGE): the partials of a two-rank head group
+# merge in one exchange (kernels/collectives/pair_lse_merge.py) instead of
+# cp_lse_ag_out_rs's all-gather + reduce-scatter. Armed once after load, over
+# the mesh of the armed Pallas all-reduce.
+# ---------------------------------------------------------------------------
+SELFTEST_TIMEOUT_S = 300
+
+
+@functools.cache
+def _pair_merge_op(mesh: Any, perm: tuple[tuple[int, int], ...]):
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+    from torch_tpu._internal import pallas
+
+    from vllm_torchtpu.kernels.collectives import pair_lse_merge
+
+    axis = mesh.axis_names[0]
+
+    def body(out, lse, meta):
+        if pair_lse_merge.supported(out.shape, out.dtype):
+            return pair_lse_merge.exchange(out, lse, meta)
+        block = meta.reshape(-1)[1]
+        return pair_lse_merge.exchange_xla(out, lse, block, axis, list(perm))
+
+    specs = (P(axis),) * 3
+    out_specs = (P(axis), P(axis))
+    sharded = jax.shard_map(
+        body, mesh=mesh, in_specs=specs, out_specs=out_specs, check_vma=False
+    )
+
+    # torch_tpu reads the operand types from these annotations.
+    def fn(
+        out: jax.Array, lse: jax.Array, meta: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        args = (out, lse, meta)
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        "pallas::dcp_draft_pair_merge",
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=out_specs,
+    )
+    op.register_fake(
+        lambda out, lse, meta: (
+            out.new_empty((out.shape[0], out.shape[1] // 2, out.shape[2])),
+            lse.new_empty((lse.shape[0], lse.shape[1] // 2), dtype=torch.float32),
+        )
+    )
+    return op
+
+
+def _pair_selftest(
+    op, meta: torch.Tensor, head_group: Any, shape, shape_rows, device
+) -> bool:
+    """Whether the pair merge gives this rank cp_lse_ag_out_rs's result to a
+    bf16 rounding, at each of ``shape_rows`` rows of ``[2H, D]``. Collective;
+    a wrong peer hangs, so a timeout dumps every stack and exits."""
+    import faulthandler
+
+    from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+
+    gen = torch.Generator().manual_seed(7 + int(head_group.rank_in_group))
+    ok = True
+    faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
+    try:
+        for rows in shape_rows:
+            dims = (rows, *shape)
+            out = torch.randn(dims, generator=gen).to(torch.bfloat16).to(device)
+            lse = (torch.randn(dims[:2], generator=gen) * 3).to(device)
+            want, want_lse = cp_lse_ag_out_rs(out, lse, head_group, return_lse=True)
+            got, got_lse = op(out, lse, meta)
+            ok &= bool(
+                torch.allclose(
+                    got.float().cpu(), want.float().cpu(), rtol=2**-7, atol=1e-3
+                )
+                and torch.allclose(got_lse.cpu(), want_lse.float().cpu(), atol=1e-5)
+            )
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+    return ok
+
+
+def _pair_perm(pairs, tp_ranks) -> tuple[tuple[int, int], ...]:
+    """The collective-permute pairs (mesh indices, both directions) of the
+    two-rank head groups ``pairs`` (global ranks) over the TP group whose
+    global ranks are ``tp_ranks`` (mesh index = TP rank)."""
+    index = {int(g): i for i, g in enumerate(tp_ranks)}
+    return tuple(
+        (index[pair[k]], index[pair[1 - k]])
+        for pair in sorted(set(pairs))
+        for k in range(2)
+    )
+
+
+def arm_pair_merge(model: torch.nn.Module) -> int:
+    """Route every DCP-sharded draft attention layer of `model` whose head
+    group has two ranks through the pair merge; returns how many. Collective
+    over the TP group (every rank must call it)."""
+    from vllm.distributed import get_tp_group
+
+    from vllm_torchtpu.distributed import pallas_all_reduce
+    from vllm_torchtpu.kernels.collectives import pair_lse_merge
+
+    layers = [
+        m
+        for m in model.modules()
+        if getattr(getattr(m, "impl", None), "sharded_draft_dcp", None) is not None
+    ]
+    tp = get_tp_group()
+    groups = {id(m.impl.sharded_draft_dcp["head_group"]) for m in layers}
+    head_group = layers[0].impl.sharded_draft_dcp["head_group"] if layers else None
+    armed = pallas_all_reduce.armed_for(tp.ranks)
+    refusal = None
+    if not layers:
+        refusal = "no DCP-sharded draft layer"
+    elif armed is None or armed.mesh is None or not armed.rank_ordered:
+        refusal = "the Pallas all-reduce is not armed in rank order"
+    elif len(groups) != 1 or head_group is None or head_group.world_size != 2:
+        refusal = "the draft head group does not have two ranks"
+    seen = [None] * tp.world_size
+    mine = None if refusal else tuple(int(r) for r in head_group.ranks)
+    torch.distributed.all_gather_object(seen, (refusal, mine), group=tp.cpu_group)
+    refusals = {r for r, _ in seen if r}
+    if refusals:
+        logger.info("DCP draft pair merge not armed: %s", sorted(refusals))
+        return 0
+    perm = _pair_perm([g for _, g in seen], tp.ranks)
+    index = {int(g): i for i, g in enumerate(tp.ranks)}
+    me = int(tp.rank_in_group)
+    peer = index[mine[1 - int(head_group.rank_in_group)]]
+    device = layers[0].draft_dcp_rank.device
+    meta = torch.tensor([[peer, int(head_group.rank_in_group)]], dtype=torch.int32)
+    meta = meta.to(device)
+    op = _pair_merge_op(armed.mesh, perm)
+    impl = layers[0].impl
+    shape = (impl.num_heads * 2, impl.head_size)
+    # A decode block on the kernel, and one past its cap on the permute.
+    over = pair_lse_merge.MAX_BYTES // (shape[0] * shape[1] * 2) + 8
+    selftest = _pair_selftest(op, meta, head_group, shape, (24, over), device)
+    ok = [None] * tp.world_size
+    torch.distributed.all_gather_object(ok, selftest, group=tp.cpu_group)
+    if not all(ok):
+        logger.warning("DCP draft pair merge not armed: self-test failed %s", ok)
+        return 0
+    for layer in layers:
+        ops = dict(layer.impl.sharded_draft_dcp["ops"], pair_merge=op)
+        layer.impl.sharded_draft_dcp["ops"] = ops
+        layer.register_buffer("draft_pair_meta", meta, persistent=False)
+    logger.info(
+        "DCP draft pair merge armed on %d layers (rank %d, peer %d).",
+        len(layers),
+        me,
+        peer,
+    )
+    return len(layers)

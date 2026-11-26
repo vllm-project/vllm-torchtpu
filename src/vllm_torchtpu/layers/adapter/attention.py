@@ -1233,7 +1233,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
     def _sharded_draft_dcp_args(self, layer: AttentionLayer) -> dict[str, Any]:
         assert self.sharded_draft_dcp is not None
-        return dict(dcp_rank=layer.draft_dcp_rank, **self.sharded_draft_dcp)
+        return dict(
+            dcp_rank=layer.draft_dcp_rank,
+            # Set by `cp_draft_attention.arm_pair_merge` (TPU_DRAFT_DCP_PAIR_MERGE).
+            pair_meta=getattr(layer, "draft_pair_meta", None),
+            **self.sharded_draft_dcp,
+        )
 
     def write_sharded_draft_kv(
         self,

@@ -6341,6 +6341,13 @@ class TPUModelRunner(GPUModelRunner):
             from vllm_torchtpu.distributed import pallas_all_reduce
 
             pallas_all_reduce.arm(self.model_config.get_hidden_size(), self.device)
+        if envs.TPU_DRAFT_DCP_PAIR_MERGE and self._is_async_drafter:
+            # After the Pallas all-reduce: the exchange runs over its mesh.
+            from vllm_torchtpu.layers.adapter.cp_draft_attention import (
+                arm_pair_merge,
+            )
+
+            arm_pair_merge(self._async_drafter.draft_model)
 
     def load_lora_model(
         self,
