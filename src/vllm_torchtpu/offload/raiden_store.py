@@ -544,6 +544,9 @@ class RaidenOffloadingManager(OffloadingManager):
     _key_events: dict | None = None
     _key_refreshed: dict | None = None
     _key_stored_at: dict | None = None
+    # store_policy.exclusive: erase the host copy of every load that lands
+    # (`enable_exclusive`). Class-level for instances built without __init__.
+    _exclusive: bool = False
 
     def __init__(
         self,
@@ -854,6 +857,53 @@ class RaidenOffloadingManager(OffloadingManager):
         return to_save
 
     # -- OffloadingManager contract --------------------------------------
+
+    def enable_exclusive(self) -> bool:
+        """store_policy.exclusive: erase the host copy of each load that lands.
+
+        Needs `KVCacheStore.erase` (a patched or newer Raiden wheel). An older
+        wheel keeps the tier inclusive and says so. Returns whether it is on.
+        """
+        if not callable(getattr(self._store, "erase", None)):
+            logger.warning(
+                "TPURaidenOffloadingConnector: store_policy exclusive requested but "
+                "this Raiden wheel has no KVCacheStore.erase(); the host tier "
+                "stays inclusive (host copies are kept after a load)."
+            )
+            self._exclusive = False
+            return False
+        self._exclusive = True
+        logger.info(
+            "TPURaidenOffloadingConnector: exclusive host tier on: a load that "
+            "lands erases its host copy (KVCacheStore.erase)"
+        )
+        return True
+
+    def _erase_loaded(self, admission: Admission) -> None:
+        """Exclusive tier: drop the host copy of a load that landed.
+
+        Only while the request is live: vLLM caches the destination blocks
+        once the load is reported, and a request finished before that (abort)
+        may leave them uncached, so its host copy is the only one. Erase skips
+        pinned entries (another request's lookup or transfer), and absent or
+        peer-only hashes, so the whole batch can be passed. A store-published
+        storage recall is host-resident too and is erased the same way.
+        """
+        if admission.req_id not in self._live_req_ids:
+            return
+        try:
+            erased = self._store.erase(admission.sub_hashes)
+        except Exception:  # noqa: BLE001 - a broken erase must not stop serving
+            logger.exception(
+                "TPURaidenOffloadingConnector: KVCacheStore.erase failed; "
+                "exclusive host tier turned off"
+            )
+            self._exclusive = False
+            return
+        self._trace(admission.keys, "erased")
+        if self._stats is not None:
+            self._stats["exclusive_erase_calls"] += 1
+            self._stats["exclusive_erased_entries"] += int(erased or 0)
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         self._live_req_ids.add(req_context.req_id)
@@ -1723,6 +1773,8 @@ class RaidenOffloadingManager(OffloadingManager):
         else:
             if admission.failed:
                 self._mark_unloadable(admission)
+            elif success and self._exclusive:
+                self._erase_loaded(admission)
             self._finished.append(
                 FinishedJob(
                     job_id=admission.job_id,
