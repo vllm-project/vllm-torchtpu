@@ -134,16 +134,20 @@ def _vllm_config_for_checks(
             max_model_len=max_model_len,
             is_hybrid=True,
         ),
-        cache_config=SimpleNamespace(mamba_ssm_cache_dtype="auto"),
+        cache_config=SimpleNamespace(
+            mamba_ssm_cache_dtype="auto", mamba_cache_mode="none"
+        ),
         parallel_config=SimpleNamespace(
             enable_dbo=False,
             ubatch_size=1,
+            tensor_parallel_size=1,
             pipeline_parallel_size=pipeline_parallel_size,
             use_sequence_parallel_moe=use_sequence_parallel_moe,
             prefill_context_parallel_size=prefill_context_parallel_size,
             decode_context_parallel_size=decode_context_parallel_size,
         ),
         speculative_config=speculative_config,
+        kv_transfer_config=None,
     )
 
 
@@ -191,7 +195,7 @@ def test_config_rejects_unknown_layer_type() -> None:
     [
         (
             {},
-            {"speculative_config": SimpleNamespace(method="mtp")},
+            {"speculative_config": SimpleNamespace(method="eagle3")},
             "speculative decoding",
         ),
         ({}, {"pipeline_parallel_size": 2}, "pipeline_parallel_size=1"),
@@ -199,7 +203,7 @@ def test_config_rejects_unknown_layer_type() -> None:
         ({}, {"prefill_context_parallel_size": 2}, "context parallelism"),
         ({}, {"decode_context_parallel_size": 2}, "context parallelism"),
     ],
-    ids=["mtp", "pp", "sp_moe", "pcp", "dcp"],
+    ids=["eagle3", "pp", "sp_moe", "pcp", "dcp"],
 )
 def test_config_rejects_unsupported_features(
     text_overrides, config_overrides, match
@@ -294,6 +298,7 @@ def _model_vllm_config(text_config: Qwen4ExpTextConfig) -> SimpleNamespace:
         model_config=SimpleNamespace(hf_text_config=text_config),
         cache_config=SimpleNamespace(block_size=16),
         quant_config=None,
+        speculative_config=None,
         compilation_config=SimpleNamespace(
             mode=CompilationMode.NONE, static_forward_context={}
         ),

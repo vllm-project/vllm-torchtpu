@@ -22,7 +22,7 @@ gated attention and sparse MoE layers that Qwen3.5 runs on TPU.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import cast
+from typing import ClassVar, cast
 
 import torch
 from torch import nn
@@ -86,13 +86,23 @@ class Qwen4ExpDecoderLayer(nn.Module):
     input and post-attention norms.
     """
 
-    def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        prefix: str,
+        *,
+        layer_type: str | None = None,
+        enable_ple: bool = True,
+    ) -> None:
         super().__init__()
         config = cast(Qwen4ExpTextConfig, vllm_config.model_config.hf_text_config)
-        layer_types = config.layer_types
-        assert layer_types is not None
         layer_index = extract_layer_index(prefix)
-        self.layer_type = layer_types[layer_index]
+        if layer_type is None:
+            layer_types = config.layer_types
+            assert layer_types is not None
+            self.layer_type = layer_types[layer_index]
+        else:
+            self.layer_type = layer_type
 
         # The Qwen3-Next layers read only fields the Qwen4Exp text config also
         # has; the transformers class just does not subclass Qwen3NextConfig.
@@ -120,7 +130,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         # its rank among them. Its state shares this layer's GDN state spec
         # (config.py admits PLE only on GDN layers).
         ple_layer_ids = config.ple_layer_ids or []
-        if layer_index + 1 in ple_layer_ids:
+        if enable_ple and layer_index + 1 in ple_layer_ids:
             self.ple: Qwen4ExpPLELayer | None = Qwen4ExpPLELayer(
                 config,
                 sorted(set(ple_layer_ids)).index(layer_index + 1),
@@ -188,6 +198,8 @@ class Qwen4ExpModel(nn.Module):
         super().__init__()
         config = cast(Qwen4ExpTextConfig, vllm_config.model_config.hf_text_config)
         self.hc_count = config.hc_count
+        spec_config = vllm_config.speculative_config
+        self._emit_mtp_hidden = spec_config is not None and spec_config.method == "mtp"
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -211,19 +223,26 @@ class Qwen4ExpModel(nn.Module):
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.embed_input_ids(input_ids)
         hidden_states = inputs_embeds.repeat(1, self.hc_count)
         for layer in self.layers:
             hidden_states = layer(positions, hidden_states, input_ids)
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
-        return hidden_states
+        multi_hidden = hidden_states
+        sample_hidden, _ = self.hyper_connection_mixer.mix(multi_hidden)
+        if self._emit_mtp_hidden:
+            return sample_hidden, [multi_hidden]
+        return sample_hidden
 
 
 class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
     """Text-only Qwen4Exp on TPU, also used for the vision-language arch."""
+
+    # Opts into Eagle3Proposer's wide HC-residual handoff: under method="mtp",
+    # forward() returns (sample_hidden, [multi_hidden]) directly.
+    mtp_emits_aux_hidden_state: ClassVar[bool] = True
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -268,7 +287,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         positions: torch.Tensor,
         intermediate_tensors: object | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         if intermediate_tensors is not None:
             raise NotImplementedError("Qwen4Exp on TPU does not support PP")
         return self.model(input_ids, positions, inputs_embeds)
