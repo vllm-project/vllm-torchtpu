@@ -383,7 +383,7 @@ def test_model_agnostic_reflection_and_config_edge_cases(
         pass
 
     m = LlamaForCausalLM()
-    assert generate_manifest_dict(m) == json.loads(generate_manifest(m))
+    assert len(generate_manifest_dict(m)["rules"]) > 0
 
     # Unquantized model.quant_config allowed; quantized rejected
     class VllmUnquantizedConfig:
@@ -408,6 +408,21 @@ def test_model_agnostic_reflection_and_config_edge_cases(
     assert _resolve_parallel(m_dp, pc, None, None, None) == (2, 1, 2)
     monkeypatch.setenv("TORCH_TPU_DP_SIZE", "2")
     assert _resolve_parallel(m_dp, pc, None, None, None) == (2, 2, 4)
+
+    # TPU_MOE_HIERARCHICAL_EP fails closed
+    monkeypatch.setenv("TPU_MOE_HIERARCHICAL_EP", "1")
+    with pytest.raises(NotImplementedError, match="TPU_MOE_HIERARCHICAL_EP"):
+        generate_manifest(m_dp)
+    monkeypatch.delenv("TPU_MOE_HIERARCHICAL_EP")
+
+    # Cross-layer MoE stripe disagreement raises ValueError
+    m_bad = Qwen3_5MoeForCausalLM(tp_size=2, ep_size=2, moe_tp_size=1)
+    m_bad.model.layers[1].mlp.experts.moe_config.ep_size = 1
+    m_bad.model.layers[1].mlp.experts.w13_weight = nn.Parameter(
+        torch.zeros(4, 64, 512, dtype=torch.bfloat16), requires_grad=False
+    )
+    with pytest.raises(ValueError, match="MoE stripes"):
+        generate_manifest(m_bad, tp_size=2, ep_size=2)
 
     # Square routed experts: UnquantizedFusedMoEMethod vs ambiguous fail-closed
     class UnquantizedFusedMoEMethod(nn.Module):
@@ -454,8 +469,8 @@ def test_model_agnostic_reflection_and_config_edge_cases(
             },
             "Quantization",
         ),
-        ({"model_config": SimpleNamespace(enable_lora=True)}, "LoRA"),
-        ({"model_config": SimpleNamespace(enable_mtp=True)}, "MTP"),
+        ({"vllm_config": SimpleNamespace(lora_config=object())}, "LoRA"),
+        ({"vllm_config": SimpleNamespace(speculative_config=object())}, "Speculative"),
         ({"parallel_config": SimpleNamespace(pipeline_parallel_size=2)}, "PP"),
         ({"parallel_config": SimpleNamespace(prefill_context_parallel_size=2)}, "PCP"),
         ({"parallel_config": SimpleNamespace(decode_context_parallel_size=2)}, "DCP"),

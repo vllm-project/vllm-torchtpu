@@ -32,6 +32,7 @@ from vllm_torchtpu.rl.weight_conversion import validate_manifest
 __all__ = [
     "ShardingCoords",
     "extract_sharding_map",
+    "resolve_sharding_coords",
     "slice_tensor_for_shard",
     "stage_converted_weights",
 ]
@@ -39,10 +40,12 @@ __all__ = [
 
 @dataclass(frozen=True)
 class ShardingCoords:
-    """Local ``(rank, world_size)`` coordinates for ``tp``, ``ep``, ``moe_tp``."""
+    """Local ``(rank, world_size)`` coordinates for ``tp/dp/ep/moe_tp``."""
 
     tp_rank: int = 0
     tp_size: int = 1
+    dp_rank: int = 0
+    dp_size: int = 1
     ep_rank: int = 0
     ep_size: int = 1
     moe_tp_rank: int = 0
@@ -54,6 +57,54 @@ class ShardingCoords:
             "ep": (self.ep_rank, self.ep_size),
             "moe_tp": (self.moe_tp_rank, self.moe_tp_size),
         }
+
+
+def resolve_sharding_coords(
+    *,
+    parallel_config: Any,
+    tp_rank: int,
+    tp_size: int,
+    dp_rank: int = 0,
+    dp_size: int = 1,
+    ep_group: Any = None,
+) -> ShardingCoords:
+    """Single source of truth for worker ``ShardingCoords`` (lazy utils import)."""
+    from vllm_torchtpu.utils import ep_rank as compute_ep_rank
+    from vllm_torchtpu.utils import get_dp_size
+
+    eff_dp_size = max(int(dp_size), int(get_dp_size(parallel_config)))
+    eff_dp_rank = 0 if eff_dp_size <= 1 else int(dp_rank)
+    if parallel_config.enable_expert_parallel:
+        ep_size = (
+            int(ep_group.world_size)
+            if ep_group is not None
+            else eff_dp_size * int(tp_size)
+        )
+        ep_rank = (
+            int(ep_group.rank_in_group)
+            if ep_group is not None
+            else compute_ep_rank(
+                dp_rank=eff_dp_rank, tp_rank=int(tp_rank), tp_size=int(tp_size)
+            )
+        )
+        moe_tp_size = max(1, (eff_dp_size * int(tp_size)) // ep_size)
+        global_rank = compute_ep_rank(
+            dp_rank=eff_dp_rank, tp_rank=int(tp_rank), tp_size=int(tp_size)
+        )
+        moe_tp_rank = global_rank % moe_tp_size
+    else:
+        ep_size, ep_rank = 1, 0
+        moe_tp_size, moe_tp_rank = int(tp_size), int(tp_rank)
+    return ShardingCoords(
+        tp_rank=int(tp_rank),
+        tp_size=int(tp_size),
+        dp_rank=eff_dp_rank,
+        dp_size=eff_dp_size,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        moe_tp_rank=moe_tp_rank,
+        moe_tp_size=moe_tp_size,
+    )
 
 
 def extract_sharding_map(

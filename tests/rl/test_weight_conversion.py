@@ -104,10 +104,15 @@ def test_all_12_ops_round_trip() -> None:
     assert dst["b"].shape == (8, 4) and torch.equal(dst["b"][1:6], p)
     assert torch.all(dst["b"][:1] == 0) and torch.all(dst["b"][6:] == 0)
 
-    # repeat / mean_pool
+    # repeat / unrepeat (first-copy strided slice, preserves dtype without averaging)
     r = torch.randn(2, 4, generator=g, dtype=torch.bfloat16)
     dst, _ = _round_trip(_op_m({"repeat": {"axis": 0, "times": 3}}), {"a": r})
     assert torch.equal(dst["b"], r.repeat_interleave(3, dim=0))
+    non_uniform = torch.tensor([[1.0, 2.0], [99.0, 99.0]], dtype=torch.bfloat16)
+    unrep = execute_manifest(
+        _op_m({"unrepeat": {"axis": 0, "times": 2}}), {"a": non_uniform}
+    )["b"]
+    assert unrep.dtype == torch.bfloat16 and torch.equal(unrep, non_uniform[:1])
 
     # scale (bf16 via fp32 compute + fp64 precision preserved)
     sbf = torch.randn(4, 4, generator=g, dtype=torch.bfloat16)
@@ -200,6 +205,18 @@ def test_cardinalities_and_api_wrappers() -> None:
     dst, _ = _round_trip(m, {"a": a, "b": b})
     assert dst["c"].shape == (2, 4) and dst["d"].shape == (6, 4)
     assert torch.equal(from_hf(json.dumps(m), {"a": a, "b": b})["c"], dst["c"])
+    sharded_m = _m(
+        [
+            {
+                "source_keys": ["a"],
+                "target_keys": ["a"],
+                "ops": [],
+                "sharding": ["tp", None],
+            }
+        ]
+    )
+    shard1 = from_hf(json.dumps(sharded_m), {"a": a}, mesh={"tp": (1, 2)})["a"]
+    assert torch.equal(shard1, a[2:])
     inv = invert_manifest(m)
     assert torch.equal(execute_manifest(inv, dst)["a"], a)
     with pytest.raises(TypeError, match="from_hf expects dst_rule to be str"):
@@ -383,10 +400,20 @@ def test_validate_manifest_strict_edge_cases() -> None:
         _op_m({"repeat": {"axis": 0, "times": 0}}),
         _op_m({"concat": {"axis": 0, "sizes": [0, 2]}}),
         _op_m({"stack": {"axis": 0, "extra": 1}}),
+        _op_m({"slice": {"axis": 0, "sizes": [0, 1]}}),
+        _op_m({"mean_pool": {"axis": 0, "times": 2}}),
+        _m(
+            [
+                {"source_keys": ["a"], "target_keys": ["b"], "ops": []},
+                {"source_keys": ["c"], "target_keys": ["b"], "ops": []},
+            ]
+        ),
+        _m([{"source_keys": ["__tmp__:x"], "target_keys": ["b"], "ops": []}]),
+        _m([{"source_keys": ["a"], "target_keys": ["__tmp__:dangling"], "ops": []}]),
     ],
 )
 def test_validate_manifest_rejects_invalid_schemas(bad: Any) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r".+"):
         validate_manifest(bad)
 
 

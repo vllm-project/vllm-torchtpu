@@ -42,7 +42,7 @@ from vllm_torchtpu.rl.weight_conversion import (
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 DP_VOCAB_ATTR = "_tpu_dp_vocab"
 
-_ALLOWED_DTYPES = frozenset({torch.bfloat16, torch.float16, torch.float32})
+ALLOWED_SYNC_DTYPES = frozenset({torch.bfloat16, torch.float16, torch.float32})
 _ALLOWED_QUANT_METHODS = frozenset(
     {
         "UnquantizedLinearMethod",
@@ -68,7 +68,6 @@ _NORM_CLASSES = frozenset(
     {
         "RMSNorm",
         "GemmaRMSNorm",
-        "Qwen3NextRMSNormGated",
         "RMSNormGated",
         "LayerNorm",
     }
@@ -262,6 +261,8 @@ def _check_supported(
         raise NotImplementedError(
             f"TPU_EXPERT_PLACEMENT={envs.TPU_EXPERT_PLACEMENT!r} is not supported."
         )
+    if envs.TPU_MOE_HIERARCHICAL_EP:
+        raise NotImplementedError("TPU_MOE_HIERARCHICAL_EP is not supported.")
 
     if model_config is not None:
         quant = getattr(model_config, "quantization", None)
@@ -270,12 +271,6 @@ def _check_supported(
         hf_cfg = getattr(model_config, "hf_config", None)
         if hf_cfg is not None and getattr(hf_cfg, "quantization_config", None):
             raise NotImplementedError("Quantization (hf_config) is not supported.")
-        if getattr(model_config, "enable_lora", False) or getattr(
-            model_config, "lora_config", None
-        ):
-            raise NotImplementedError("LoRA is not supported.")
-        if getattr(model_config, "enable_mtp", False):
-            raise NotImplementedError("MTP is not supported.")
 
     if vllm_config is not None:
         if getattr(vllm_config, "lora_config", None) is not None:
@@ -324,7 +319,7 @@ def _check_supported(
         parts = name.split(".")
         if "lora" in name.lower() or "base_layer" in parts:
             raise NotImplementedError(f"LoRA parameter {name!r} is not supported.")
-        if param.dtype not in _ALLOWED_DTYPES:
+        if param.dtype not in ALLOWED_SYNC_DTYPES:
             raise NotImplementedError(
                 f"Unsupported dtype {param.dtype} on {name!r}; "
                 "only unquantized bf16/fp16/fp32 are supported."
@@ -356,17 +351,19 @@ def _resolve_parallel(
     )
     if dp_size is not None:
         dp = int(dp_size)
+    elif parallel_config is not None:
+        from vllm_torchtpu.utils import get_dp_size
+
+        dp = int(get_dp_size(parallel_config))
     else:
-        env_dp = int(os.environ.get("TORCH_TPU_DP_SIZE", "0") or 0)
-        dp = env_dp or int(getattr(parallel_config, "data_parallel_size", 1) or 1)
+        dp = int(os.environ.get("TORCH_TPU_DP_SIZE", "0") or 0) or 1
 
     if ep_size is not None:
         ep = int(ep_size)
     elif parallel_config is not None and getattr(
         parallel_config, "enable_expert_parallel", False
     ):
-        cfg_ep = getattr(parallel_config, "expert_parallel_size", None)
-        ep = int(cfg_ep) if isinstance(cfg_ep, int) and cfg_ep > 0 else tp * dp
+        ep = tp * dp
     elif parallel_config is None:
         ep = 1
         for mod in model.modules():
@@ -880,8 +877,7 @@ def generate_manifest_dict(
         elif cls_name in _REPLICATED_LINEAR_CLASSES:
             rules.extend(_linear_rule(name, leaf, mod, tp, to_hf, shard_dim=None))
         elif cls_name in _ROUTED_EXPERTS_CLASSES:
-            has_moe = True
-            exp_rules, resolved_ep, resolved_moe_tp = _routed_experts_rule(
+            exp_rules, layer_ep, layer_moe_tp = _routed_experts_rule(
                 name,
                 leaf,
                 param,
@@ -892,6 +888,12 @@ def generate_manifest_dict(
                 to_hf,
                 expert_axis_grouped=expert_axis_grouped,
             )
+            if has_moe and (layer_ep, layer_moe_tp) != (resolved_ep, resolved_moe_tp):
+                raise ValueError(
+                    f"{name!r}: MoE stripes ({layer_ep}, {layer_moe_tp}) != "
+                    f"({resolved_ep}, {resolved_moe_tp}) from earlier layer."
+                )
+            has_moe, resolved_ep, resolved_moe_tp = True, layer_ep, layer_moe_tp
             rules.extend(exp_rules)
         elif cls_name in _NORM_CLASSES:
             _check_leaf(name, leaf, ("weight", "bias"))

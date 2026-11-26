@@ -13,10 +13,15 @@
 # limitations under the License.
 """Pure-PyTorch 12-op executor, validator, and inverter for ``weight_mapping``.
 
-Implements the Distributed RL Weight Conversion Protocol (zero JAX imports)
-with sequential rule chaining via temporary ``__tmp__:*`` intermediate keys
-so per-segment transforms can feed a final rule for heterogeneous fused TP
-layers.
+Contract summary (zero JAX imports):
+- ``stripes`` records parallel axis sizes (e.g. ``tp_size``, ``ep_size``,
+  ``moe_tp_size``) baked into the manifest; each rule's ``sharding`` names the
+  axis (or ``None``) per output dimension.
+- Rules run left-to-right; only ``__tmp__:*`` target keys may be consumed by a
+  later rule, and ``__tmp__:*`` keys are pruned before returning.
+- ``dropped_keys`` skips any rule reading a dropped source (transitively).
+- ``tied_keys`` lists ``[src, dst]`` alias pairs copied after rule execution.
+- ``invert_manifest`` reverses rules/ops for checkpoint export and round-trips.
 """
 
 from __future__ import annotations
@@ -40,10 +45,10 @@ class OpName(str, Enum):
     CONCAT = "concat"
     STACK = "stack"
     UNSTACK = "unstack"
-    SLICE = "slice"
+    UNPAD = "unpad"
     PAD = "pad"
     REPEAT = "repeat"
-    MEAN_POOL = "mean_pool"
+    UNREPEAT = "unrepeat"
     SCALE = "scale"
     CAST = "cast"
 
@@ -135,7 +140,7 @@ def _validate_op(op: Any, ctx: str) -> None:
         _check_keys(kw, {"axis"}, f"{ctx}.{op_name}")
         if not _is_int(kw["axis"]):
             raise ValueError(f"{ctx}.{op_name}.axis: expected int")
-    elif op_name in (OpName.SLICE, OpName.PAD):
+    elif op_name in (OpName.UNPAD, OpName.PAD):
         _check_keys(kw, {"axis", "sizes"}, f"{ctx}.{op_name}")
         if not _is_int(kw["axis"]):
             raise ValueError(f"{ctx}.{op_name}.axis: expected int")
@@ -146,7 +151,7 @@ def _validate_op(op: Any, ctx: str) -> None:
             or not all(_is_int(v) and v >= 0 for v in sizes)
         ):
             raise ValueError(f"{ctx}.{op_name}.sizes: expected [left, right] >= 0")
-    elif op_name in (OpName.REPEAT, OpName.MEAN_POOL):
+    elif op_name in (OpName.REPEAT, OpName.UNREPEAT):
         _check_keys(kw, {"axis", "times"}, f"{ctx}.{op_name}")
         if not _is_int(kw["axis"]) or not (_is_int(kw["times"]) and kw["times"] > 0):
             raise ValueError(f"{ctx}.{op_name}: expected int axis and times > 0")
@@ -260,6 +265,26 @@ def _parse_manifest(manifest: RuleSpec) -> dict[str, Any]:
             entry["sharding"] = list(sh)
         rules.append(entry)
 
+    produced: set[str] = set()
+    consumed_tmp: set[str] = set()
+    for idx, entry in enumerate(rules):
+        for sk in entry["source_keys"]:
+            if sk.startswith(TMP_KEY_PREFIX):
+                if sk not in produced:
+                    raise ValueError(
+                        f"rules[{idx}]: {sk!r} consumed before being produced"
+                    )
+                consumed_tmp.add(sk)
+        for tk in entry["target_keys"]:
+            if tk in produced:
+                raise ValueError(f"rules[{idx}]: duplicate target key {tk!r}")
+            produced.add(tk)
+    dangling = sorted(
+        k for k in produced if k.startswith(TMP_KEY_PREFIX) and k not in consumed_tmp
+    )
+    if dangling:
+        raise ValueError(f"Unconsumed temporary target key(s): {dangling}")
+
     return {
         "schema_version": SCHEMA_VERSION,
         "expert_axis_grouped": eag,
@@ -294,13 +319,13 @@ def _apply_unary(op_name: str, kw: Mapping[str, Any], t: torch.Tensor) -> torch.
         if len(axes) != t.ndim:
             raise ValueError(f"transpose: len(axes)={len(axes)} != ndim={t.ndim}")
         return t.permute(*axes)
-    if op_name == OpName.SLICE:
+    if op_name == OpName.UNPAD:
         axis = _norm_axis(kw["axis"], t.ndim, op_name)
         left, right = kw["sizes"]
         length = int(t.shape[axis]) - left - right
         if length <= 0:
             raise ValueError(
-                f"slice: invalid [{left}, {right}] for dim={t.shape[axis]}"
+                f"unpad: invalid [{left}, {right}] for dim={t.shape[axis]}"
             )
         return t.narrow(axis, left, length)
     if op_name == OpName.PAD:
@@ -316,19 +341,14 @@ def _apply_unary(op_name: str, kw: Mapping[str, Any], t: torch.Tensor) -> torch.
     if op_name == OpName.REPEAT:
         axis = _norm_axis(kw["axis"], t.ndim, op_name)
         return t.repeat_interleave(int(kw["times"]), dim=axis)
-    if op_name == OpName.MEAN_POOL:
+    if op_name == OpName.UNREPEAT:
         axis = _norm_axis(kw["axis"], t.ndim, op_name)
         times = int(kw["times"])
         if int(t.shape[axis]) % times != 0:
-            raise ValueError(f"mean_pool: dim={t.shape[axis]} not divisible by {times}")
-        new_shape = [
-            *t.shape[:axis],
-            int(t.shape[axis]) // times,
-            times,
-            *t.shape[axis + 1 :],
-        ]
-        compute_dt = torch.float64 if t.dtype == torch.float64 else torch.float32
-        return t.reshape(new_shape).to(compute_dt).mean(dim=axis + 1).to(t.dtype)
+            raise ValueError(f"unrepeat: dim={t.shape[axis]} not divisible by {times}")
+        idx = [slice(None)] * t.ndim
+        idx[axis] = slice(0, int(t.shape[axis]), times)
+        return t[tuple(idx)].contiguous()
     if op_name == OpName.SCALE:
         compute_dt = torch.float64 if t.dtype == torch.float64 else torch.float32
         return (t.to(compute_dt) * float(kw["factor"])).to(t.dtype)
@@ -397,12 +417,12 @@ def _invert_op(op: Mapping[str, Any]) -> OpSpec:
     if op_name == OpName.UNSTACK:
         return {"stack": {"axis": kw["axis"]}}
     if op_name == OpName.PAD:
-        return {"slice": {"axis": kw["axis"], "sizes": list(kw["sizes"])}}
-    if op_name == OpName.SLICE:
+        return {"unpad": {"axis": kw["axis"], "sizes": list(kw["sizes"])}}
+    if op_name == OpName.UNPAD:
         return {"pad": {"axis": kw["axis"], "sizes": list(kw["sizes"])}}
     if op_name == OpName.REPEAT:
-        return {"mean_pool": {"axis": kw["axis"], "times": kw["times"]}}
-    if op_name == OpName.MEAN_POOL:
+        return {"unrepeat": {"axis": kw["axis"], "times": kw["times"]}}
+    if op_name == OpName.UNREPEAT:
         return {"repeat": {"axis": kw["axis"], "times": kw["times"]}}
     if op_name == OpName.SCALE:
         return {"scale": {"factor": 1.0 / float(kw["factor"])}}
@@ -450,13 +470,10 @@ def execute_manifest(
     spec = _parse_manifest(manifest)
     dropped = set(spec["dropped_keys"])
     out: dict[str, torch.Tensor] = {}
-    intermediates: set[str] = set()
+    tmp: dict[str, torch.Tensor] = {}
 
     for idx, rule in enumerate(spec["rules"]):
         if any(k in dropped for k in rule["source_keys"]):
-            for k in rule["source_keys"]:
-                if k not in src_weights and k in out:
-                    intermediates.add(k)
             dropped.update(rule["target_keys"])
             continue
 
@@ -464,9 +481,8 @@ def execute_manifest(
         for k in rule["source_keys"]:
             if k in src_weights:
                 tensors.append(src_weights[k])
-            elif k in out:
-                tensors.append(out[k])
-                intermediates.add(k)
+            elif k.startswith(TMP_KEY_PREFIX) and k in tmp:
+                tensors.append(tmp[k])
             else:
                 raise KeyError(f"rules[{idx}]: missing source weight key {k!r}")
 
@@ -480,12 +496,10 @@ def execute_manifest(
                 f"{len(rule['target_keys'])} target key(s)"
             )
         for tk, tensor in zip(rule["target_keys"], tensors, strict=True):
-            out[tk] = tensor
-
-    for k in intermediates:
-        out.pop(k, None)
-    for k in [k for k in out if k.startswith(TMP_KEY_PREFIX)]:
-        out.pop(k, None)
+            if tk.startswith(TMP_KEY_PREFIX):
+                tmp[tk] = tensor
+            else:
+                out[tk] = tensor
 
     for src_k, dst_k in spec["tied_keys"]:
         if src_k in out and dst_k not in out and dst_k not in dropped:
@@ -496,20 +510,37 @@ def execute_manifest(
 def from_hf(
     dst_rule: str,
     hf_weights: Mapping[str, torch.Tensor],
+    mesh: Any = None,
 ) -> dict[str, torch.Tensor]:
-    """Convert HuggingFace weights using a serialized JSON ``dst_rule`` string."""
+    """Convert HuggingFace weights using a serialized JSON ``dst_rule`` string.
+
+    When ``mesh`` (``ShardingCoords`` or axis-map ``Mapping``) is provided,
+    slices each output tensor to the local rank's shard.
+    """
     if not isinstance(dst_rule, str):
         raise TypeError(
             f"from_hf expects dst_rule to be str, got {type(dst_rule).__name__}"
         )
-    return execute_manifest(dst_rule, hf_weights)
+    spec = _parse_manifest(dst_rule)
+    out = execute_manifest(spec, hf_weights)
+    if mesh is not None:
+        from vllm_torchtpu.rl.weight_installer import (
+            extract_sharding_map,
+            slice_tensor_for_shard,
+        )
+
+        smap = extract_sharding_map(spec)
+        out = {
+            k: slice_tensor_for_shard(k, t, smap.get(k), mesh) for k, t in out.items()
+        }
+    return out
 
 
 def to_hf(
     src_rule: str,
     src_weights: Mapping[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Convert target-framework weights back to HF format using a JSON rule string."""
+    """Execute a framework-to-HF JSON manifest (e.g. ``invert_manifest(dst_rule)``)."""
     if not isinstance(src_rule, str):
         raise TypeError(
             f"to_hf expects src_rule to be str, got {type(src_rule).__name__}"

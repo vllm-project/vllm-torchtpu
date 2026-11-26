@@ -151,6 +151,8 @@ def _make_worker(
     worker = TPUWorker.__new__(TPUWorker)
     worker.rank = rank
     worker.local_rank = rank
+    worker._dp_rank = dp_rank or 0
+    worker._dp_size = dp_size
     worker.parallel_config = SimpleNamespace(
         tensor_parallel_size=tp_size,
         pipeline_parallel_size=1,
@@ -461,6 +463,9 @@ def test_resolve_sharding_coords_bijective(
             ep_rank=ep_rank,
         ):
             coords = _TW_MOD._resolve_sharding_coords(worker)
+            assert coords.ep_rank == ep_rank
+            assert coords.moe_tp_rank == g_rank % moe_tp_size
+            assert coords.dp_rank == dp_rank and coords.dp_size == dp_size
             seen.add((coords.ep_rank, coords.moe_tp_rank))
             assert coords.ep_size == ep_size and coords.moe_tp_size == moe_tp_size
     assert len(seen) == world_size

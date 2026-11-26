@@ -100,38 +100,30 @@ def _release_free_host_heap() -> None:
 
 
 def _resolve_sharding_coords(worker: "TPUWorker"):
-    """Return local ``ShardingCoords`` for ``tp``, ``ep``, and ``moe_tp``."""
-    from vllm_torchtpu.rl.weight_installer import ShardingCoords
+    """Return local ``ShardingCoords`` for ``tp``, ``dp``, ``ep``, and ``moe_tp``."""
+    from vllm_torchtpu.rl.weight_installer import resolve_sharding_coords
 
     pc = worker.parallel_config
     tp_size = int(get_tensor_model_parallel_world_size())
     tp_rank = int(get_tensor_model_parallel_rank())
-
+    dp_size = int(worker._dp_size)
+    dp_rank = int(worker._dp_rank)
+    ep_group = None
     if pc.enable_expert_parallel:
         ep_group = get_ep_group()
-        ep_size = int(ep_group.world_size)
-        ep_rank = int(ep_group.rank_in_group)
         dp_group = get_dp_group()
-        dp_rank = int(dp_group.rank_in_group)
-        dp_size = int(dp_group.world_size)
-        if dp_size <= 1:
-            dp_size = int(utils.get_dp_size(pc))
-        moe_tp_size = max(1, (dp_size * tp_size) // ep_size)
-        global_rank = dp_rank * tp_size + tp_rank
-        moe_tp_rank = global_rank % moe_tp_size
-    else:
-        ep_size = 1
-        ep_rank = 0
-        moe_tp_size = tp_size
-        moe_tp_rank = tp_rank
-
-    return ShardingCoords(
+        if int(dp_group.world_size) > 1:
+            dp_size = int(dp_group.world_size)
+            dp_rank = int(dp_group.rank_in_group)
+    elif dp_size <= 1 and int(utils.get_dp_size(pc)) > 1:
+        dp_rank = int(pc.data_parallel_index)
+    return resolve_sharding_coords(
+        parallel_config=pc,
         tp_rank=tp_rank,
         tp_size=tp_size,
-        ep_rank=ep_rank,
-        ep_size=ep_size,
-        moe_tp_rank=moe_tp_rank,
-        moe_tp_size=moe_tp_size,
+        dp_rank=dp_rank,
+        dp_size=dp_size,
+        ep_group=ep_group,
     )
 
 
@@ -221,6 +213,8 @@ class TPUWorker(WorkerBase):
             logger.info(
                 "Profiling enabled. Traces will be saved to: %s", self.profile_dir
             )
+        self._dp_rank: int = 0
+        self._dp_size: int = 1
 
     def set_kv_cache_layout(
         self, kv_cache_layout: str, cp_kv_cache_interleave_size: int
@@ -269,6 +263,8 @@ class TPUWorker(WorkerBase):
         # takes these at construction time.
         self.profile_rank = binding.rank
         self.profile_world_size = binding.world_size
+        self._dp_rank = int(binding.dp_rank)
+        self._dp_size = int(binding.dp_size)
         if dp_size > 1:
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
@@ -1012,7 +1008,7 @@ class TPUWorker(WorkerBase):
         converted_weights: Mapping[str, torch.Tensor],
         manifest_json: str | None = None,
     ) -> None:
-        """Install pre-converted global tensors in-place into live model buffers.
+        """Local test/debug RPC: install pre-converted global tensors in place.
 
         Delegates manifest validation, rank slicing, and exact key/shape/dtype
         checks to :func:`vllm_torchtpu.rl.weight_installer.stage_converted_weights`,
