@@ -945,7 +945,7 @@ def synthetic_sample_rows_and_assemble(
     of ``tp``, full vocabulary). Each rank samples its block, the ranks
     all-gather the sampled tokens and every rank lays out the whole batch.
     Same tokens: sampling is row-wise and every row sees the same inputs."""
-    from vllm.distributed import tensor_model_parallel_all_gather
+    from vllm_torchtpu.distributed.pallas_all_reduce import tp_all_gather
 
     per_rank = logit_rows.shape[0]
 
@@ -969,7 +969,8 @@ def synthetic_sample_rows_and_assemble(
     )
     # Exchanged as float32, which holds every id below 2**24 exactly, as the
     # vocab-parallel argmax exchanges its ids.
-    sampled = tensor_model_parallel_all_gather(sampled_rows.float(), dim=0)
+    # TPU_TP_PALLAS_SMALL_ALL_GATHER: one Pallas call when armed.
+    sampled = tp_all_gather(sampled_rows.float(), dim=0)
     sampled = sampled.to(torch.int32)
     return _assemble_synthetic(
         sampled,

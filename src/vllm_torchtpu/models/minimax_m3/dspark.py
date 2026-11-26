@@ -58,6 +58,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.transformers_utils.configs.minimax_m3 import MiniMaxM3TextConfig
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed import pallas_all_reduce
 from vllm_torchtpu.layers.adapter import cp_draft_attention
 from vllm_torchtpu.layers.core.quant_methods import get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
@@ -231,7 +232,9 @@ def _column_parallel(linear: nn.Module, x: torch.Tensor) -> torch.Tensor:
     cols = weight.shape[1] // tp
     start = get_tensor_model_parallel_rank() * cols
     part = torch.matmul(x, weight[:, start : start + cols])
-    return tensor_model_parallel_all_gather(part, dim=-1)
+    # Compiled per shape (dynamic=False): `tp_all_gather` picks the Pallas
+    # small all-gather (TPU_TP_PALLAS_SMALL_ALL_GATHER) per traced size.
+    return pallas_all_reduce.tp_all_gather(part, dim=-1)
 
 
 def _context_kv(attn: nn.Module, context: torch.Tensor):

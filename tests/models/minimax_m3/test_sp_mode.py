@@ -1101,3 +1101,37 @@ def test_shared_in_combine_keeps_trace_input_order(monkeypatch):
     combined = signature(lambda x, logits: moe._forward_shared_in_combine(x, logits))
     assert len(plain) == len(combined) == 1
     assert combined == plain
+
+
+def test_small_all_gather_takes_every_scale_gather(tp, monkeypatch):
+    """TPU_TP_PALLAS_SMALL_ALL_GATHER: every e4m3 row-scale gather goes through
+    the armed small all-gather (none through XLA's f32 all-gather), with the
+    same bits; key off never asks for it."""
+    _set_env(monkeypatch, **_TARGET)
+    monkeypatch.setattr(mm, "get_tp_group", tp.group)
+    monkeypatch.setattr(envs, "TPU_TP_PALLAS_SMALL_ALL_GATHER", False, raising=False)
+    monkeypatch.setattr(pallas_all_reduce, "all_gather_small", _boom)
+    tp.calls.clear()
+    want, _ = _forward(tp, monkeypatch, "full")
+    xla_f32 = tp.calls.count("ag:torch.float32")
+    assert xla_f32 > 0
+
+    def small(ranks, x):
+        assert x.dtype == torch.float32
+        if tp.rank == 0:
+            tp.calls.append("small")
+        return torch.cat(tp._exchange(x), 0)
+
+    monkeypatch.setattr(envs, "TPU_TP_PALLAS_SMALL_ALL_GATHER", True, raising=False)
+    monkeypatch.setattr(pallas_all_reduce, "all_gather_small", small)
+    tp.calls.clear()
+    got, _ = _forward(tp, monkeypatch, "full")
+    assert tp.calls.count("small") == xla_f32
+    assert tp.calls.count("ag:torch.float32") == 0
+    for g, w in zip(got, want):
+        torch.testing.assert_close(g[0], w[0], rtol=0, atol=0)
+    # Unarmed (None): XLA's all-gather as before.
+    monkeypatch.setattr(pallas_all_reduce, "all_gather_small", lambda ranks, x: None)
+    tp.calls.clear()
+    _forward(tp, monkeypatch, "full")
+    assert tp.calls.count("ag:torch.float32") == xla_f32

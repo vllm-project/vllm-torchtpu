@@ -135,6 +135,76 @@ def _call(n: int, m: int, h: int):
     )
 
 
+@functools.cache
+def _gather_call(n: int, m: int, w: int, dtype):
+    def kernel(rank_ref, x_ref, out_ref, send_sem, recv_sem):
+        me = rank_ref[0]
+        barrier = pltpu.get_barrier_semaphore()
+        for d in range(n):
+            pl.semaphore_signal(barrier, inc=1, device_id=(d,), device_id_type=_MESH)
+        pl.semaphore_wait(barrier, n)
+
+        def block(t):
+            return out_ref.at[pl.ds(pl.multiple_of(t * m, m), m)]
+
+        sends = []
+        for step in range(1, n):
+            copy = pltpu.make_async_remote_copy(
+                x_ref,
+                block(me),
+                send_sem.at[step],
+                recv_sem.at[me],
+                device_id=(lax.rem(me + step, n),),
+                device_id_type=_MESH,
+            )
+            copy.start()
+            sends.append(copy)
+        out_ref[pl.ds(pl.multiple_of(me * m, m), m)] = x_ref[...]
+        for step in range(1, n):
+            t = lax.rem(me + n - step, n)
+            pltpu.make_async_copy(block(t), block(t), recv_sem.at[t]).wait_recv()
+        for copy in sends:
+            copy.wait_send()
+
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    return pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((n * m, w), dtype),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[vmem],
+            out_specs=vmem,
+            scratch_shapes=[pltpu.SemaphoreType.DMA((n,)) for _ in range(2)],
+        ),
+        compiler_params=pltpu.CompilerParams(collective_id=COLLECTIVE_ID),
+        name=f"tp_all_gather_small-m_{m}-w_{w}-n_{n}",
+    )
+
+
+def gather_view(numel: int, itemsize: int) -> tuple[int, int] | None:
+    """(rows, lanes) of the 32-bit [rows, 128] view one rank sends, rows a
+    multiple of 8 (zero padded), or None when the tensor does not fit it."""
+    if itemsize != 4:
+        return None
+    rows = -(-numel // (8 * _LANES)) * 8
+    return rows, _LANES
+
+
+def all_gather_small(x: jax.Array, rank: jax.Array, n: int) -> jax.Array:
+    """Concatenation over the n ranks (rank order) of a small 32-bit x
+    [rows, ...] along rows: one barrier and one direct copy to every peer, a
+    latency-bound replacement for XLA's TensorCore all-gather of a few KiB
+    (16 KiB of row scales: ~20 us there). Call under shard_map."""
+    m, w = gather_view(x.size, x.dtype.itemsize)
+    flat = x.reshape(-1)
+    flat = jnp.pad(flat, (0, m * w - flat.size))
+    out = _gather_call(n, m, w, x.dtype)(
+        rank.reshape(1).astype(jnp.int32), flat.reshape(m, w)
+    )
+    out = out.reshape(n, m * w)[:, : x.size]
+    return out.reshape(n * x.shape[0], *x.shape[1:])
+
+
 def direct_ok(rows: int, hidden: int, n: int, direct_rows: int) -> bool:
     """Whether `all_reduce` runs on x's own [rows, hidden] layout: direct_rows
     > 0 divides rows and every rank's column chunk is whole lane tiles."""

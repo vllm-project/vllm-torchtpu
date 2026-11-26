@@ -318,10 +318,14 @@ def _quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 def _gather_rows_e4m3(
     q: torch.Tensor, scale: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        tensor_model_parallel_all_gather(q, 0),
-        tensor_model_parallel_all_gather(scale, 0),
-    )
+    # TPU_TP_PALLAS_SMALL_ALL_GATHER: the f32 row scales (a few KiB) in one
+    # Pallas call (None when it is not armed: XLA's all-gather as before).
+    scales = None
+    if envs.TPU_TP_PALLAS_SMALL_ALL_GATHER:
+        scales = pallas_all_reduce.all_gather_small(get_tp_group().ranks, scale)
+    if scales is None:
+        scales = tensor_model_parallel_all_gather(scale, 0)
+    return tensor_model_parallel_all_gather(q, 0), scales
 
 
 @support_torch_compile(

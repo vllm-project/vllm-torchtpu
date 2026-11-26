@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     TPU_MOE_BOUNDED_ONEHOT: bool = True
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_TP_PALLAS_SMALL_ALL_GATHER: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS: int = 0
     TPU_TP_AR_QDQ_ROWS: int = 0
     TPU_TP_QAR_MIN_TOKENS: int = 0
@@ -1079,6 +1080,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # buckets up to 40 rows of 6144, where the two still differ.
     "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES", 0
+    ),
+    # With the Pallas TP all-reduce armed (rank-ordered mesh): all-gather
+    # small 32-bit tensors (an SP step's e4m3 row scales, the DSpark draft's
+    # context fc columns, the row-split synthetic sampler's tokens) with one
+    # Pallas call (kernels/collectives/tp_all_reduce.py `all_gather_small`)
+    # instead of XLA's TensorCore all-gather. Same bits.
+    "TPU_TP_PALLAS_SMALL_ALL_GATHER": env_bool(
+        "TPU_TP_PALLAS_SMALL_ALL_GATHER", default=False
     ),
     # Pallas TP all-reduce on the activation's own [rows, hidden] layout when
     # rows is a multiple of this value (0, default: off). Off, the kernel runs
