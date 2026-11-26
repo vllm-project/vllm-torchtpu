@@ -2741,6 +2741,7 @@ class TPURaidenConnectorWorker:
         self._stage3_draining_cancelled_loads: dict[str, int | None] = {}
         self._stage3_draining_cancelled_load_since: dict[str, float] = {}
         self._stage3_draining_cancelled_load_logged: set[str] = set()
+        self._stage3_draining_load_recancel: set[str] = set()
         # Cached native Stage-3 DMA drain bindings resolved once per engine
         # instance:
         # (cancel_receive, is_receive_settled, cancel_send, is_send_settled).
@@ -5140,6 +5141,7 @@ class TPURaidenConnectorWorker:
         self._stage3_draining_cancelled_loads.pop(req_id, None)
         self._stage3_draining_cancelled_load_since.pop(req_id, None)
         self._stage3_draining_cancelled_load_logged.discard(req_id)
+        self._stage3_draining_load_recancel.discard(req_id)
 
     def _clear_stage3_draining_send(self, req_id: str) -> None:
         self._stage3_draining_sends.pop(req_id, None)
@@ -5159,7 +5161,13 @@ class TPURaidenConnectorWorker:
         cancel_fn, _, _, _ = self._stage3_engine_drain_apis(engine)
         if uuid is None or cancel_fn is None:
             return True
-        return bool(cancel_fn(int(uuid)))
+        try:
+            return bool(cancel_fn(int(uuid)))
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error(
+                "Stage-3 cancel_receive failed for uuid=%d: %s", int(uuid), exc
+            )
+            return False
 
     def _is_stage3_receive_settled(self, engine: Any, uuid: int | None) -> bool:
         """Returns True iff no native H2D/receive op remains in flight for the
@@ -5174,20 +5182,21 @@ class TPURaidenConnectorWorker:
         load failure (if DMA is settled) or parks it until DMA drains."""
         self._stage3_pending_controller_failures.pop(req_id, None)
         uuid = self._stage3_submitted_loads.get(req_id)
+        submit_pending = (
+            req_id in self._stage3_inflight_submits or req_id in self._stage3_tp_submits
+        )
         settled = self._cancel_stage3_receive(
             engine, uuid
         ) and self._is_stage3_receive_settled(engine, uuid)
-        if (
-            settled
-            and req_id not in self._stage3_inflight_submits
-            and req_id not in self._stage3_tp_submits
-        ):
+        if settled and not submit_pending:
             self._record_stage3_load_failure(
                 req_id, self._load_block_ids.get(req_id, [])
             )
             return True
         self._stage3_draining_cancelled_loads[req_id] = uuid
         self._stage3_draining_cancelled_load_since.setdefault(req_id, time.time())
+        if submit_pending:
+            self._stage3_draining_load_recancel.add(req_id)
         return False
 
     def _cancel_stage3_send(self, engine: Any, uuid: int) -> bool:
@@ -6999,10 +7008,13 @@ class TPURaidenConnectorWorker:
                     if (
                         req_id not in self._stage3_inflight_submits
                         and req_id not in self._stage3_tp_submits
-                        and self._is_stage3_receive_settled(engine, uuid)
                     ):
-                        settled_cancelled.append(req_id)
-                        continue
+                        if req_id in self._stage3_draining_load_recancel:
+                            self._stage3_draining_load_recancel.discard(req_id)
+                            self._cancel_stage3_receive(engine, uuid)
+                        if self._is_stage3_receive_settled(engine, uuid):
+                            settled_cancelled.append(req_id)
+                            continue
                     parked_at = self._stage3_draining_cancelled_load_since.setdefault(
                         req_id, now
                     )

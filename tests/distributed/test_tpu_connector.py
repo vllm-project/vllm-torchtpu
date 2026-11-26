@@ -9135,6 +9135,191 @@ class TestStage3DmaDrainSafety:
         assert worker_now.get_block_ids_with_load_errors() == {11}
         assert worker_now._load_block_ids == {}
 
+    def test_decode_inflight_abort_recancels_after_submit_resolves(self, monkeypatch):
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+
+        class _PostSubmitArmEngine(_DmaDrainEngine):
+            def __init__(self):
+                super().__init__()
+                self.armed = False
+                self.draining_polls_left = 0
+
+            def arm_post_prearm_cancel(self, draining_polls=1):
+                self.armed = True
+                self.draining_polls_left = draining_polls
+
+            def cancel_receive(self, uuid):
+                self.cancel_receive_calls.append(int(uuid))
+                if self.armed:
+                    self.armed = False
+                    return self.draining_polls_left == 0
+                return True
+
+            def is_receive_settled(self, uuid):
+                self.calls.append(("is_receive_settled", int(uuid)))
+                if self.armed:
+                    return False
+                if self.draining_polls_left > 0:
+                    self.draining_polls_left -= 1
+                    return False
+                return True
+
+        # Case 1 (TP=1): abort while start_transfer is in flight, then RPC arms
+        # the receiver and succeeds; post-RPC poll must re-issue cancel_receive
+        # and hold blocks until the cancelled session finishes draining.
+        worker1, _ = self._seeded_decode_worker(
+            dst_req_id="dst-recancel-tp1",
+            src_req_id="src-recancel-tp1",
+            uuid=608,
+            blocks=[16, 17],
+        )
+        eng1 = _PostSubmitArmEngine()
+        worker1._raiden_transfer_engine = eng1
+        worker1._stage3_inflight_submits.add("dst-recancel-tp1")
+
+        assert worker1.get_finished({"dst-recancel-tp1"}) == (set(), set())
+        assert eng1.cancel_receive_calls == [608]
+
+        eng1.arm_post_prearm_cancel(draining_polls=1)
+        pending1 = SimpleNamespace(
+            destination_req_id="dst-recancel-tp1",
+            source_req_id="src-recancel-tp1",
+            uuid=608,
+            num_tokens=1024,
+            local_blocks=[16, 17],
+            defer_deadline=None,
+            req_meta=SimpleNamespace(src_controller_address="src:27000"),
+            wait_logged=False,
+            first_attempt_s=1.0,
+        )
+        task1 = SimpleNamespace(
+            pending=pending1, skip_tokens=0, fa_skip_bytes=0, source_units=1
+        )
+        worker1._stage3_submit_outcomes.append(
+            _Stage3SubmitOutcome(
+                task=task1, error=None, submit_ms=1.0, attempted_at=1.0
+            )
+        )
+
+        # Post-RPC poll re-cancels (clearing armed), sees 1 draining poll left.
+        assert worker1.get_finished() == (set(), set())
+        assert eng1.cancel_receive_calls == [608, 608]
+        assert not eng1.armed
+        assert worker1._load_block_ids == {"dst-recancel-tp1": [16, 17]}
+
+        # Next poll observes settled DMA and releases the aborted load cleanly.
+        assert worker1.get_finished() == (set(), {"dst-recancel-tp1"})
+        assert worker1.get_block_ids_with_load_errors() == {16, 17}
+        assert worker1._load_block_ids == {}
+
+        # Case 2 (TP=2 sharded consumer): both leader and follower must re-cancel
+        # once TP submit sync releases them after the leader RPC arms both ranks.
+        leader, _ = self._seeded_decode_worker(
+            dst_req_id="dst-recancel-tp2",
+            src_req_id="src-recancel-tp2",
+            uuid=609,
+            blocks=[18],
+            tp_rank=0,
+            tp_size=2,
+        )
+        follower, _ = self._seeded_decode_worker(
+            dst_req_id="dst-recancel-tp2",
+            src_req_id="src-recancel-tp2",
+            uuid=609,
+            blocks=[19],
+            tp_rank=1,
+            tp_size=2,
+        )
+        leader_eng = _PostSubmitArmEngine()
+        follower_eng = _PostSubmitArmEngine()
+        leader._raiden_transfer_engine = leader_eng
+        follower._raiden_transfer_engine = follower_eng
+        for rank_worker in (leader, follower):
+            rank_worker._stage3_inflight_submits.add("dst-recancel-tp2")
+            rank_worker._stage3_tp_submits.add("dst-recancel-tp2")
+
+        bcast_box: dict[str, Any] = {"states": {}}
+
+        def _leader_bcast(obj, src=0):
+            assert src == 0
+            bcast_box["states"] = dict(obj)
+            return bcast_box["states"]
+
+        def _follower_bcast(_obj, src=0):
+            assert src == 0
+            return dict(bcast_box["states"])
+
+        leader_group = SimpleNamespace(broadcast_object=_leader_bcast)
+        follower_group = SimpleNamespace(broadcast_object=_follower_bcast)
+
+        with patch(f"{_MOD}.get_tp_group", return_value=leader_group):
+            assert leader.get_finished({"dst-recancel-tp2"}) == (set(), set())
+        with patch(f"{_MOD}.get_tp_group", return_value=follower_group):
+            assert follower.get_finished({"dst-recancel-tp2"}) == (set(), set())
+        assert leader_eng.cancel_receive_calls == [609]
+        assert follower_eng.cancel_receive_calls == [609]
+
+        leader_eng.arm_post_prearm_cancel(draining_polls=0)
+        follower_eng.arm_post_prearm_cancel(draining_polls=1)
+        pending2 = SimpleNamespace(
+            destination_req_id="dst-recancel-tp2",
+            source_req_id="src-recancel-tp2",
+            uuid=609,
+            num_tokens=1024,
+            local_blocks=[18],
+            defer_deadline=None,
+            req_meta=SimpleNamespace(src_controller_address="src:27000"),
+            wait_logged=False,
+            first_attempt_s=1.0,
+        )
+        task2 = SimpleNamespace(
+            pending=pending2, skip_tokens=0, fa_skip_bytes=0, source_units=1
+        )
+        leader._stage3_submit_outcomes.append(
+            _Stage3SubmitOutcome(
+                task=task2, error=None, submit_ms=1.0, attempted_at=1.0
+            )
+        )
+
+        with patch(f"{_MOD}.get_tp_group", return_value=leader_group):
+            assert leader.get_finished() == (set(), {"dst-recancel-tp2"})
+        with patch(f"{_MOD}.get_tp_group", return_value=follower_group):
+            assert follower.get_finished() == (set(), set())
+        assert leader_eng.cancel_receive_calls == [609, 609]
+        assert follower_eng.cancel_receive_calls == [609, 609]
+        assert not follower_eng.armed
+        assert follower._load_block_ids == {"dst-recancel-tp2": [19]}
+
+        with patch(f"{_MOD}.get_tp_group", return_value=follower_group):
+            assert follower.get_finished() == (set(), {"dst-recancel-tp2"})
+        assert follower.get_block_ids_with_load_errors() == {19}
+        assert follower._load_block_ids == {}
+
+        # Case 3: native cancel_receive raising RuntimeError logs error and parks
+        # safely until is_receive_settled becomes True rather than crashing.
+        worker_err, eng_err = self._seeded_decode_worker(
+            dst_req_id="dst-cancel-err",
+            src_req_id="src-cancel-err",
+            uuid=611,
+            blocks=[22],
+        )
+        worker_err._stage3_controller_accepted.add("dst-cancel-err")
+
+        def _raising_cancel(uuid):
+            eng_err.cancel_receive_calls.append(int(uuid))
+            raise RuntimeError("injected native cancel_receive failure")
+
+        eng_err.cancel_receive = _raising_cancel
+        with patch(f"{_MOD}.logger.error") as err_log:
+            assert worker_err.get_finished({"dst-cancel-err"}) == (set(), set())
+        assert eng_err.cancel_receive_calls == [611]
+        assert err_log.call_count == 1
+        assert worker_err._load_block_ids == {"dst-cancel-err": [22]}
+        eng_err.receive_settled = True
+        assert worker_err.get_finished() == (set(), {"dst-cancel-err"})
+        assert worker_err.get_block_ids_with_load_errors() == {22}
+        assert worker_err._load_block_ids == {}
+
     def test_decode_tp2_inflight_abort_syncs_and_drains_per_rank(self, monkeypatch):
         monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
         leader, leader_engine = self._seeded_decode_worker(
