@@ -9639,8 +9639,8 @@ class TPUModelRunner(GPUModelRunner):
         num_blocks = self._topk_candidate_blocks()
         if num_blocks == 0 or grammar_output is not None:
             return 0
-        top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
-        if not bool(((top_k >= 1) & (top_k <= num_blocks // 2)).all()):
+        top_k = self.input_batch.top_k_cpu[cur_start_idx:cur_end_idx]
+        if not ((top_k >= 1) & (top_k <= num_blocks // 2)).all():
             return 0
         logger.info_once(
             "Sampler top-k filters vocab to %d candidate blocks of %d logits.",
