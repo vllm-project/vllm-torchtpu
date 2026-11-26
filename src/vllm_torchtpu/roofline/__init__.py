@@ -23,6 +23,7 @@ from .chips import (
     ChipOverrides,
     ChipSpec,
     SliceTopology,
+    count_hosts,
     load_chip_spec,
     override_chip_ici_bw,
     register_chip,
@@ -116,6 +117,7 @@ from .occupancy import (
     min_experts_per_ep_shard,
     parse_activation_spec,
 )
+from .report import render_html, write_html
 from .schema import (
     FloorTimes,
     ParetoPoint,
@@ -211,6 +213,7 @@ __all__ = [
     "build_solve_payload",
     "collective_axis_cut_bytes",
     "collective_cut_bound_s",
+    "count_hosts",
     "count_layer_types",
     "dsa_indexer_layer_weight_elems",
     "dtypes_from_hf_config",
@@ -239,6 +242,7 @@ __all__ = [
     "pool_slice_summary",
     "pp_stage_layer_scale",
     "register_chip",
+    "render_html",
     "resolve_model_identity",
     "solve_serving_plan",
     "spec_cycle_floor",
@@ -247,4 +251,5 @@ __all__ = [
     "top_layouts",
     "topologies_for_chip",
     "torus_collective_s",
+    "write_html",
 ]

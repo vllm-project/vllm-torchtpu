@@ -830,6 +830,22 @@ def from_jax(
     return _build_chip_from_jax(name, version, overrides_cfg)
 
 
+def count_hosts(
+    num_chips: int,
+    chip: ChipSpec | None = None,
+    *,
+    chips_per_host: int | None = None,
+) -> int:
+    """Return physical host count for ``num_chips`` using ceiling division."""
+    per_host = (
+        chips_per_host
+        if chips_per_host is not None
+        else (chip.chips_per_host if chip is not None else DEFAULT_CHIPS_PER_HOST)
+    )
+    per_host = max(1, per_host)
+    return max(1, (num_chips + per_host - 1) // per_host)
+
+
 @dataclass(frozen=True, slots=True)
 class SliceTopology:
     """Physical 3D chip slice topology and torus wraparound rules."""
