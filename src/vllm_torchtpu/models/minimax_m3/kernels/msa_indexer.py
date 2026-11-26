@@ -441,6 +441,8 @@ def _kernel_v3(
     pair_issue=False,
     issue_chunks=_DMA_ISSUE_CHUNKS,
     last=None,
+    ahead_rows=None,
+    after_ahead=None,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     groups (``buf.shape[0]``: `_RING_SLOTS`, the select call's
@@ -479,6 +481,11 @@ def _kernel_v3(
     store were the step's exposed tail (~500 of a 128-page step's ~1,950
     bundles, AOT). `count` (SMEM) holds the deferring step's scored chunks.
     `last()`, if given, runs at the last step, after the deferred maxima.
+
+    With `ahead_rows`, the first step's ahead groups take their (paired)
+    table words from vector registers: ``ahead_rows(base)`` is a ``[1, 128]``
+    row holding the group's words from lane 0; `after_ahead()` then runs
+    (`_kernel_v3_select_vmem_table`).
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -546,14 +553,17 @@ def _kernel_v3(
         and (pages_per_seq | pages_per_step) % 2 == 0
     )
 
-    def start(base, live, pages, slot, predicated=True):
+    def start(base, live, pages, slot, predicated=True, row=None):
         """Start the copies of a group's `pages` that are below its `live`
         pages (all, if not `predicated`), alternate pages on the second DMA
-        queue (priority 1)."""
+        queue (priority 1); with `row`, the paired words are its lanes."""
         word = None
         for g in pages:
             if paired and (g % 2 == 0 or word is None):
-                word = block_tables_ref[(base >> 1) + g // 2]
+                if row is None:
+                    word = block_tables_ref[(base >> 1) + g // 2]
+                else:
+                    word = row[0, g // 2]
             copy_start = functools.partial(
                 copy(base, g, slot, word if paired else None).start,
                 priority=g % 2,
@@ -575,15 +585,26 @@ def _kernel_v3(
             if not paired:
                 start(k_base, k_live, range(pages_per_step), k)
                 continue
+            row = None if ahead_rows is None else ahead_rows(k_base)
             whole = k_live >= pages_per_step
             pl.when(whole)(
                 functools.partial(
-                    start, k_base, k_live, range(pages_per_step), k, predicated=False
+                    start,
+                    k_base,
+                    k_live,
+                    range(pages_per_step),
+                    k,
+                    predicated=False,
+                    row=row,
                 )
             )
             pl.when(jnp.logical_not(whole))(
-                functools.partial(start, k_base, k_live, range(pages_per_step), k)
+                functools.partial(
+                    start, k_base, k_live, range(pages_per_step), k, row=row
+                )
             )
+        if after_ahead is not None:
+            after_ahead()
 
     if prologue is not None:
         pl.when(step == 0)(prologue)
@@ -827,6 +848,8 @@ def _kernel_v3_select(
     writes: msa_write.RunWrites | None = None,
     table_width: int | None = None,
     pair_issue: bool = False,
+    ahead_rows=None,
+    after_ahead=None,
 ):
     """`_kernel_v3` with token-major scores kept in VMEM, by page group and
     token row, then reduced by `select` at the last step: a separate kernel
@@ -844,7 +867,7 @@ def _kernel_v3_select(
     positions ``[T, 1]``, [`writes`' other caches' inputs and its inputs],
     out ``[T, width]``, [`writes`' caches out], the page ring and its
     semaphores, the scores ``[page groups, T + Bq, pages_per_step]`` f32,
-    [`writes`' scratch]."""
+    [`writes`' scratch]. `ahead_rows` and `after_ahead` are `_kernel_v3`'s."""
     max_num_seqs = seq_pages_ref.shape[0]
     meta = _select_meta_views(select_ref, max_num_seqs, writes)
     it = iter(refs)
@@ -975,6 +998,69 @@ def _kernel_v3_select(
         issue_chunks=_SELECT_DMA_ISSUE_CHUNKS,
         # In the last step's branch, behind the deferred chunk's maxima.
         last=_select,
+        ahead_rows=ahead_rows,
+        after_ahead=after_ahead,
+    )
+
+
+def _vmem_table(pages_per_seq: int, pages_per_step: int) -> bool:
+    """Whether `_select_call` takes its packed block table in VMEM
+    (`_kernel_v3_select_vmem_table`): a group's 16-bit table words pair up
+    within it (`_kernel_v3`'s paired issue) and lie in one 128-word row."""
+    return (
+        pages_per_seq % pages_per_step == 0
+        and (pages_per_seq | pages_per_step) % 2 == 0
+        and 128 % (pages_per_step // 2) == 0
+    )
+
+
+def _table_rows(table: jax.Array) -> jax.Array:
+    """A packed block table as ``[R, 128]`` int32 rows, R a multiple of 8: a
+    row-major (8, 128) tiling, which an in-kernel copy moves into SMEM whole."""
+    return jnp.pad(table, (0, -table.shape[0] % (8 * 128))).reshape(-1, 128)
+
+
+def _kernel_v3_select_vmem_table(
+    work_ref,
+    tile_seq_ref,
+    seq_pages_ref,
+    select_ref,
+    table_vec,
+    *refs,
+    table_len,
+    **kwargs,
+):
+    """`_kernel_v3_select` with the packed block table in VMEM (`table_vec`,
+    `_table_rows`) rather than scalar-prefetched: a scalar-prefetch copy into
+    SMEM runs before the kernel starts (~17 ns per KiB, the served 32 KiB
+    table's ahead of every page copy, `msa_attention.pack_table16`). The
+    first step starts the ahead groups' page copies from the table words in
+    vector registers (`_kernel_v3`'s `ahead_rows`), and copies the table into
+    SMEM (the last two scratch refs) under them; `table_len` is the table's
+    length before its rows' padding."""
+    *refs, table_smem, table_sem = refs
+    copy = pltpu.make_async_copy(
+        table_vec.reshape(table_smem.shape[0]), table_smem, table_sem
+    )
+    pl.when(pl.program_id(0) == 0)(copy.start)
+
+    def ahead_rows(base):
+        """The 128-word row holding the words of the group at entry `base`,
+        rotated to start at its first word."""
+        at = base >> 1
+        row = table_vec[pl.ds(at >> 7, 1), :]
+        return pltpu.roll(row, (128 - (at & 127)) & 127, 1)
+
+    _kernel_v3_select(
+        work_ref,
+        tile_seq_ref,
+        table_smem.at[pl.ds(0, table_len)],
+        seq_pages_ref,
+        select_ref,
+        *refs,
+        ahead_rows=ahead_rows,
+        after_ahead=copy.wait,
+        **kwargs,
     )
 
 
@@ -1314,24 +1400,62 @@ def _select_call(
         q_at = len(prefetch) + 1
         aliases = {q_at + 3 + i: 1 + i for i in range(len(writes.caches) - 1)}
         aliases[q_at + 1] = len(writes.caches)
+    vmem_table = table_width is not None and _vmem_table(
+        block_tables.shape[0] // seq_pages.shape[0], ring[1]
+    )
+    kernel = functools.partial(
+        _kernel_v3_select,
+        select=select,
+        writes=None if writes is None else writes.layout_only(),
+        table_width=table_width,
+        # -0.2 .. -0.42 us per layer at 24 / 48 tokens (kbench j-4c8cb3c1).
+        pair_issue=True,
+    )
+    in_specs = [
+        q_spec,
+        any_spec,
+        pl.BlockSpec((num_tokens, 1), lambda *_: (0, 0)),
+        *[any_spec] * len(write_inputs),
+    ]
+    operands = (
+        *prefetch,
+        select_meta,
+        q_rows,
+        index_cache,
+        pos.astype(jnp.int32)[:, None],
+    )
+    num_prefetch = len(prefetch) + 1
+    if vmem_table:
+        work, tile_info, table, seq_pages = prefetch
+        table_vec = _table_rows(table)
+        kernel = functools.partial(
+            _kernel_v3_select_vmem_table,
+            table_len=table.shape[0],
+            **kernel.keywords,
+        )
+        operands = (
+            work,
+            tile_info,
+            seq_pages,
+            select_meta,
+            table_vec,
+            *operands[num_prefetch:],
+        )
+        in_specs = [pl.BlockSpec(memory_space=pltpu.VMEM), *in_specs]
+        scratch += [
+            pltpu.SMEM((table_vec.size,), jnp.int32),
+            pltpu.SemaphoreType.DMA(()),
+        ]
+        vmem_bytes += table_vec.size * 4
+        # The table leaves the scalar prefetch: one more input, one fewer
+        # prefetch operand (the aliases count both).
+        num_prefetch -= 1
     out = pl.pallas_call(
-        functools.partial(
-            _kernel_v3_select,
-            select=select,
-            writes=None if writes is None else writes.layout_only(),
-            table_width=table_width,
-            # -0.2 .. -0.42 us per layer at 24 / 48 tokens (kbench j-4c8cb3c1).
-            pair_issue=True,
-        ),
+        kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=len(prefetch) + 1,
+            num_scalar_prefetch=num_prefetch,
             grid=grid,
-            in_specs=[
-                q_spec,
-                any_spec,
-                pl.BlockSpec((num_tokens, 1), lambda *_: (0, 0)),
-                *[any_spec] * len(write_inputs),
-            ],
+            in_specs=in_specs,
             out_specs=[
                 pl.BlockSpec((num_tokens, select.width), lambda *_: (0, 0)),
                 *[any_spec] * len(cache_shapes),
@@ -1350,14 +1474,7 @@ def _select_call(
         ),
         interpret=interpret,
         name="minimax_m3_msa_block_select",
-    )(
-        *prefetch,
-        select_meta,
-        q_rows,
-        index_cache,
-        pos.astype(jnp.int32)[:, None],
-        *write_inputs,
-    )
+    )(*operands, *write_inputs)
     return Selected(out[0], tuple(out[1:]))
 
 
