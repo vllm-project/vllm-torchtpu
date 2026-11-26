@@ -166,10 +166,9 @@ def _kernel(
             ),
         )
 
-    def issue(k):
-        for copy in copies(k % _RING, blocks_ref[order_ref[k]]):
+    def issue(k, slot):
+        for copy in copies(slot, blocks_ref[order_ref[k]]):
             copy.start()
-        return k + 1
 
     sums_ref[...] = jnp.zeros_like(sums_ref)
 
@@ -224,11 +223,20 @@ def _kernel(
         v = jnp.concatenate([values, jnp.ones_like(values)], axis=1)
         return targets, jnp.dot(p, v, preferred_element_type=jnp.float32)
 
-    def unit(width, blocks):
-        """Blocks side by side: each is one chain of MXU and EUP latencies,
-        which the others' fill. A block's tokens are distinct, so its adds
-        into acc load a group of rows before storing any; blocks add in order
-        (a token can be in several of them)."""
+    def unit(width, k, base):
+        """Blocks ``k .. k + _UNIT - 1`` (ring slots ``base ..``) side by side:
+        each is one chain of MXU and EUP latencies, which the others' fill.
+        Past the last block, blocks of no pair: they see no slot of the page
+        their ring slot holds (zeros or a copied page) and add zeros. A
+        block's tokens are distinct, so its adds into acc load a group of rows
+        before storing any; blocks add in order (a token can be in several of
+        them)."""
+        blocks = []
+        for b in range(_UNIT):
+            real = k + b < num_blocks
+            at = jnp.where(real, order_ref[k + b], 0)
+            n = jnp.where(real, blocks_ref[at] >> _KEY_BITS, 0)
+            blocks.append((at, n, base + b))
         terms = [attend(width, *b) for b in blocks]
         # Head h's l is lane h of its row's l columns: a token's heads fold
         # into one 8-row tile, head h in row h % 8.
@@ -248,37 +256,44 @@ def _kernel(
                         -1, 8, head_dim
                     ).sum(axis=0)
 
-    def body(u, issued):
+    def body(u, carry):
         k = u * _UNIT
-        issued = jax.lax.while_loop(
-            lambda b: (b < k + _RING) & (b < num_blocks), issue, issued
-        )
-        # The unit's blocks; past the last one, blocks of no pair: they see
-        # no slot of the page their ring slot holds (zeros or a copied page)
-        # and add zeros.
-        blocks = []
+        # A unit's blocks take one half of the ring, the next unit's the other:
+        # their copies start here, unrolled (a loop of them cost ~24 bundles a
+        # block, serial with the unit).
+        base = (u % 2) * _UNIT
         for b in range(_UNIT):
-            real = k + b < num_blocks
-            at = jnp.where(real, order_ref[k + b], 0)
-            n = jnp.where(real, blocks_ref[at] >> _KEY_BITS, 0)
-            slot = (k + b) % _RING
+            nxt = k + _UNIT + b
 
-            @pl.when(n > 0)
-            def _wait(slot=slot):
+            @pl.when(nxt < num_blocks)
+            def _issue(nxt=nxt, slot=_UNIT - base + b):
+                issue(nxt, slot)
+
+        for b in range(_UNIT):
+
+            @pl.when(k + b < num_blocks)
+            def _wait(slot=base + b):
                 for copy in copies(slot, 0):
                     copy.wait()
 
-            blocks.append((at, n, slot))
-        widest = functools.reduce(jnp.maximum, [n for _, n, _ in blocks])
+        # Blocks run narrowest width first: the unit's widest is its last.
+        last = jnp.minimum(k + _UNIT, num_blocks) - 1
+        widest = blocks_ref[order_ref[last]] >> _KEY_BITS
         for w, width in enumerate(_WIDTHS):
             fits = widest <= width
             if w:
                 fits &= widest > _WIDTHS[w - 1]
-            pl.when(fits)(functools.partial(unit, width, blocks))
-        return issued
+            pl.when(fits)(functools.partial(unit, width, k, base))
+        return carry
+
+    for b in range(_UNIT):  # the first unit's copies
+
+        @pl.when(b < num_blocks)
+        def _first(b=b):
+            issue(b, b)
 
     q_copy.wait()
-    jax.lax.fori_loop(0, -(-num_blocks // _UNIT), body, jnp.int32(0))
+    jax.lax.fori_loop(0, -(-num_blocks // _UNIT), body, 0)
 
     # Head-major output: each head's rows are every (H + 8)-th sums row.
     tokens = o_buf.shape[2]
