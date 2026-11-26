@@ -848,14 +848,27 @@ def moe_gmm(
             if topk_weights.dtype == gmm2_res.dtype and _use_bounded_onehot(
                 num_tokens, argsort_revert_indices.size, gmm2_res
             ):
+                # The kernel adds the shared expert's down projection, so the
+                # routed sum does not round-trip HBM through a separate add.
+                fuse = (
+                    shared_down is not None
+                    and gmm2_res.dtype == out_dtype
+                    and can_use_bounded_onehot(
+                        num_tokens,
+                        argsort_revert_indices.size,
+                        gmm2_res.shape[1],
+                        shared_inter=shared_down[0].shape[1],
+                    )
+                )
                 return _add_shared_down(
                     bounded_onehot_combine(
                         gmm2_res,
                         argsort_revert_indices,
                         jnp.where(valid_mask, topk_weights, 0),
                         valid_count,
+                        shared_down if fuse else None,
                     ).astype(out_dtype),
-                    shared_down,
+                    None if fuse else shared_down,
                 )
             # Rows past the computed prefix (non-local experts under EP,
             # skipped padded tokens) are never written by the GMM; zero them

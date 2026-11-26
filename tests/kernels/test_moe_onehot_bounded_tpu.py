@@ -113,3 +113,34 @@ def test_nan_token_stays_local_and_empty_prefix_is_zero():
         routed, revert, jnp.zeros_like(weights), empty
     )
     np.testing.assert_array_equal(np.asarray(combined, np.float32), 0.0)
+
+
+@pytest.mark.parametrize("num_tokens,real_tokens", [(256, 216), (384, 368)])
+def test_shared_down_matches_separate_add(num_tokens, real_tokens):
+    revert, weights, valid = _routing(num_tokens, real_tokens, num_tokens + 1)
+    routed = jax.random.normal(jax.random.PRNGKey(2), (revert.size, HIDDEN)) * 0.1
+    routed = jnp.where(
+        (jnp.arange(revert.size) < valid[0])[:, None], routed, jnp.nan
+    ).astype(jnp.bfloat16)
+    act = (jax.random.normal(jax.random.PRNGKey(3), (num_tokens, 384)) * 0.5).astype(
+        jnp.bfloat16
+    )
+    w2 = (jax.random.normal(jax.random.PRNGKey(4), (384, HIDDEN)) * 2).astype(
+        jnp.float8_e4m3fn
+    )
+    s2 = jax.random.uniform(jax.random.PRNGKey(5), (1, HIDDEN), jnp.float32) * 0.01
+
+    fused = moe_onehot_bounded.bounded_onehot_combine(
+        routed, revert, weights, valid, (act, w2, s2)
+    )
+    plain = moe_onehot_bounded.bounded_onehot_combine(routed, revert, weights, valid)
+    # One rounding of the f32 sum, as XLA compiles the separate add
+    # (fused_moe_gmm._add_shared_down) in the decode graph.
+    shared = jnp.matmul(
+        act, w2.astype(jnp.bfloat16), preferred_element_type=jnp.float32
+    )
+    expected = (plain.astype(jnp.float32) + shared * s2).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(
+        np.asarray(jax.lax.bitcast_convert_type(fused, jnp.int16)),
+        np.asarray(jax.lax.bitcast_convert_type(expected, jnp.int16)),
+    )

@@ -36,15 +36,29 @@ _SLOT_BLOCK = 128
 _COL_CHUNKS = (3072, 1536, 1024, 512)
 
 
-def _vmem_bytes(num_tokens: int, num_slots: int, hidden_size: int, chunk: int) -> int:
+# Output columns per shared-expert product (bounds its f32 temporary).
+_SHARED_COLS = 512
+
+
+def _vmem_bytes(
+    num_tokens: int, num_slots: int, hidden_size: int, chunk: int, shared_inter: int
+) -> int:
     # Permute: resident hidden block + double-buffered 128-slot output blocks.
     permute = (num_tokens + 2 * _SLOT_BLOCK) * hidden_size * 2
     # Combine: one-hot scratch + double-buffered input and output column chunks.
     combine = num_slots * num_tokens * 2 + 2 * (num_slots + num_tokens) * chunk * 2
+    if shared_inter:
+        # The shared expert's activation, double-buffered e4m3 weight and
+        # (8-sublane padded) f32 scale column chunks, the f32 routed sum of a
+        # chunk and the f32 temporaries of one _SHARED_COLS product.
+        combine += num_tokens * shared_inter * 2 + 2 * (shared_inter + 32) * chunk
+        combine += num_tokens * (chunk + 2 * _SHARED_COLS) * 4
     return max(permute, combine)
 
 
-def _col_chunk(num_tokens: int, num_slots: int, hidden_size: int) -> int | None:
+def _col_chunk(
+    num_tokens: int, num_slots: int, hidden_size: int, shared_inter: int = 0
+) -> int | None:
     try:
         budget = pltpu.get_tpu_info().vmem_capacity_bytes * 0.8
     except ValueError:  # not a TPU (CPU tests)
@@ -54,7 +68,9 @@ def _col_chunk(num_tokens: int, num_slots: int, hidden_size: int) -> int | None:
             c
             for c in _COL_CHUNKS
             if hidden_size % c == 0
-            and _vmem_bytes(num_tokens, num_slots, hidden_size, c) <= budget
+            and (not shared_inter or c % _SHARED_COLS == 0)
+            and _vmem_bytes(num_tokens, num_slots, hidden_size, c, shared_inter)
+            <= budget
         ),
         None,
     )
@@ -69,15 +85,19 @@ def _slot_caps(num_slots: int) -> list[int]:
     return [*caps, num_slots]
 
 
-def can_use_bounded_onehot(num_tokens: int, num_slots: int, hidden_size: int) -> bool:
+def can_use_bounded_onehot(
+    num_tokens: int, num_slots: int, hidden_size: int, shared_inter: int = 0
+) -> bool:
     """Shapes both kernels lay out, within VMEM: whole 128-token lanes, or
     past 256 tokens whole bf16 sublane tiles (Mosaic masks the lane padding:
     the 320/416-token c48/c64 decode buckets; at c48's 192 the bounded form
-    gained nothing in the twin), and whole 128-slot blocks."""
+    gained nothing in the twin), and whole 128-slot blocks. ``shared_inter``:
+    the intermediate size of a shared expert the combine adds, 0 for none."""
     return (
         (num_tokens % 128 == 0 or (num_tokens > 256 and num_tokens % 16 == 0))
         and num_slots % _SLOT_BLOCK == 0
-        and _col_chunk(num_tokens, num_slots, hidden_size) is not None
+        and shared_inter % 128 == 0
+        and _col_chunk(num_tokens, num_slots, hidden_size, shared_inter) is not None
     )
 
 
@@ -156,12 +176,18 @@ def bounded_onehot_permute(
     )(valid_count, revert_t, hidden)
 
 
-def _combine_kernel(
-    valid_ref, revert_t_ref, weights_t_ref, routed_hbm_ref, out_hbm_ref, combine_ref
-):
+def _combine_kernel(valid_ref, revert_t_ref, weights_t_ref, routed_hbm_ref, *refs):
+    shared = len(refs) == 5
+    if shared:
+        # [T, i_s] bf16 (VMEM), [i_s, H] e4m3 and [1, H] f32 (HBM).
+        act_ref, w2s_hbm_ref, s2s_hbm_ref, out_hbm_ref, combine_ref = refs
+    else:
+        out_hbm_ref, combine_ref = refs
     topk, num_tokens = revert_t_ref.shape
     num_slots, hidden_size = routed_hbm_ref.shape
-    chunk = _col_chunk(num_tokens, num_slots, hidden_size)
+    chunk = _col_chunk(
+        num_tokens, num_slots, hidden_size, act_ref.shape[1] if shared else 0
+    )
     valid = valid_ref[0]
 
     def branch(cap):
@@ -180,22 +206,53 @@ def _combine_kernel(
                 combine_ref.dtype
             )
 
-        def body(routed_ref, out_ref):
+        def routed_sum(routed_ref):
             rows = routed_ref[...]
             # The GMM leaves rows past the valid prefix unwritten: clear them so
             # a stale NaN cannot reach a token through a zero weight.
             row_slot = lax.broadcasted_iota(jnp.int32, rows.shape, 0)
             rows = jnp.where(row_slot < valid, rows, jnp.zeros_like(rows))
-            out_ref[...] = jnp.dot(
+            return jnp.dot(
                 combine_ref[:, :cap], rows, preferred_element_type=jnp.float32
-            ).astype(out_ref.dtype)
+            )
 
+        def body(routed_ref, out_ref):
+            out_ref[...] = routed_sum(routed_ref).astype(out_ref.dtype)
+
+        def shared_body(routed_ref, w2s_ref, s2s_ref, out_ref):
+            # Rounded as the unfused decode graph is: XLA's fusion of
+            # fused_moe_gmm._add_shared_down keeps the projection in f32 up to
+            # the one rounding of the sum (its excess precision drops the
+            # bf16 converts). tc_combine rounds each step as SharedExpert
+            # specifies; the two differ by at most one bf16 ulp.
+            total = routed_sum(routed_ref)
+            act = act_ref[...]
+            for c0 in range(0, chunk, _SHARED_COLS):
+                cols = slice(c0, c0 + _SHARED_COLS)
+                y = jnp.dot(act, w2s_ref[:, cols], preferred_element_type=jnp.float32)
+                routed = total[:, cols].astype(out_ref.dtype).astype(jnp.float32)
+                out_ref[:, cols] = (routed + y * s2s_ref[:, cols]).astype(out_ref.dtype)
+
+        routed_spec = pl.BlockSpec((cap, chunk), lambda c: (0, c))
+        out_spec = pl.BlockSpec((num_tokens, chunk), lambda c: (0, c))
+        if not shared:
+            pltpu.emit_pipeline(
+                body,
+                grid=(hidden_size // chunk,),
+                in_specs=(routed_spec,),
+                out_specs=(out_spec,),
+            )(routed_hbm_ref, out_hbm_ref)
+            return
         pltpu.emit_pipeline(
-            body,
+            shared_body,
             grid=(hidden_size // chunk,),
-            in_specs=(pl.BlockSpec((cap, chunk), lambda c: (0, c)),),
-            out_specs=(pl.BlockSpec((num_tokens, chunk), lambda c: (0, c)),),
-        )(routed_hbm_ref, out_hbm_ref)
+            in_specs=(
+                routed_spec,
+                pl.BlockSpec((w2s_hbm_ref.shape[0], chunk), lambda c: (0, c)),
+                pl.BlockSpec((1, chunk), lambda c: (0, c)),
+            ),
+            out_specs=(out_spec,),
+        )(routed_hbm_ref, w2s_hbm_ref, s2s_hbm_ref, out_hbm_ref)
 
     _run_capped(valid_ref, num_slots, branch)
 
@@ -206,27 +263,38 @@ def bounded_onehot_combine(
     argsort_revert_indices: jax.Array,  # int32[tokens * topk]
     weights: jax.Array,  # [tokens, topk], zero for non-local routes
     valid_count: jax.Array,  # int32[1]
+    shared_down: tuple[jax.Array, jax.Array, jax.Array] | None = None,
 ) -> jax.Array:
     """out[t] = sum_k weights[t, k] * routed_out[revert[t, k]], over the valid prefix.
 
     The matmul runs in ``routed_out.dtype`` with f32 accumulation.
+    ``shared_down`` (activation [T, i_s] bf16, w2 [i_s, H] e4m3, s2 [1, H]
+    f32) adds (act @ w2) * s2 in f32 to the bf16 sum before its one bf16
+    rounding, as XLA evaluates the separate add: the routed sum is not
+    written to HBM and read back.
     """
     num_slots, hidden_size = routed_out.shape
     num_tokens = weights.shape[0]
     revert_t = argsort_revert_indices.reshape(num_tokens, -1).T
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    shared_operands, shared_specs = (), []
+    if shared_down is not None:
+        act, w2s, s2s = shared_down
+        shared_operands = (act, w2s, s2s.astype(jnp.float32).reshape(1, hidden_size))
+        shared_specs = [vmem, hbm, hbm]
     return pl.pallas_call(
         _combine_kernel,
         out_shape=jax.ShapeDtypeStruct((num_tokens, hidden_size), routed_out.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[vmem, vmem, hbm],
+            in_specs=[vmem, vmem, hbm, *shared_specs],
             out_specs=hbm,
             scratch_shapes=[pltpu.VMEM((num_tokens, num_slots), routed_out.dtype)],
         ),
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=int(pltpu.get_tpu_info().vmem_capacity_bytes * 0.9),
         ),
-        name=f"bounded_onehot_combine-s_{num_slots}-t_{num_tokens}",
-    )(valid_count, revert_t, weights.T, routed_out)
+        name=f"bounded_onehot_combine-s_{num_slots}-t_{num_tokens}"
+        + ("-shared" if shared_down is not None else ""),
+    )(valid_count, revert_t, weights.T, routed_out, *shared_operands)

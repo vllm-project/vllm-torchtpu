@@ -62,8 +62,21 @@ def test_minimax_decode_shapes_trace_on_cpu():
             _shape((512, 4), jnp.bfloat16),
             _shape((1,), jnp.int32),
         )
+        fused = jax.eval_shape(
+            moe_onehot_bounded.bounded_onehot_combine,
+            _shape((2048, 6144), jnp.bfloat16),
+            _shape((2048,), jnp.int32),
+            _shape((512, 4), jnp.bfloat16),
+            _shape((1,), jnp.int32),
+            (
+                _shape((512, 384), jnp.bfloat16),
+                _shape((384, 6144), jnp.float8_e4m3fn),
+                _shape((1, 6144), jnp.float32),
+            ),
+        )
     assert (routed.shape, routed.dtype) == ((2048, 6144), jnp.bfloat16)
     assert (out.shape, out.dtype) == ((512, 6144), jnp.bfloat16)
+    assert (fused.shape, fused.dtype) == ((512, 6144), jnp.bfloat16)
 
 
 def test_admission():
@@ -76,5 +89,9 @@ def test_admission():
         # tiles of tokens or 128-slot blocks stay dense.
         assert not moe_onehot_bounded.can_use_bounded_onehot(192, 768, 6144)
         assert not moe_onehot_bounded.can_use_bounded_onehot(24, 96, 6144)
+        # The decode buckets with MiniMax-M3's shared expert (384 per rank).
+        assert moe_onehot_bounded.can_use_bounded_onehot(384, 1536, 6144, 384)
+        assert moe_onehot_bounded.can_use_bounded_onehot(256, 1024, 6144, 384)
+        assert not moe_onehot_bounded.can_use_bounded_onehot(256, 1024, 6144, 200)
         # An f32 owner the size of a prefill chunk does not fit VMEM.
         assert not moe_onehot_bounded.can_use_bounded_onehot(4096, 16384, 6144)
