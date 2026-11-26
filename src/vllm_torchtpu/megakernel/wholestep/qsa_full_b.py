@@ -129,6 +129,7 @@ class QSAFullIndexedBlock(QSAFullBlock):
         uattn_lite: bool = False,
         export_ids: bool = False,
         union_phys_mxu: int = 0,
+        union_phys_one: bool = False,
         **kw: Any,
     ) -> None:
         """`carrier`: "" = prototype contiguous keys `[requests, max_groups, 128]`;
@@ -289,6 +290,13 @@ class QSAFullIndexedBlock(QSAFullBlock):
         self.union_phys_mxu = int(union_phys_mxu)
         assert not union_phys_mxu or union_phys, "phys mxu: physical ids"
         assert 0 <= self.union_phys_mxu <= pages_per_seq, (union_phys_mxu, pages_per_seq)
+        # `union_phys_one` (`wholephysmxu=2`): the ids of each 128 slots in one matmul over
+        # the whole copied row (bytes split once per request) instead of a loop over the
+        # visible chunks (`union_attn.physical_ids_one`). Same ids.
+        self.union_phys_one = bool(union_phys_one)
+        assert not union_phys_one or (union_phys_mxu and union_phys_mxu % 128 == 0), (
+            "one-matmul ids: a 128-lane copied row"
+        )
         self.loop_requests = loop_requests
         assert not loop_requests or per_request_scores, (
             "the request loop selects per request"

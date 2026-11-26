@@ -91,7 +91,7 @@ UNION_PHYS: bool = False
 # chunks below its visible groups are read, each gathered on the MXU (byte-split one-hot
 # matmul, exact), and the tile copies address the pool as rows of micro-pages. Same addresses,
 # same outputs.
-UNION_PHYS_MXU: bool = False
+UNION_PHYS_MXU: int = 0  # 1: chunk loop over the visible chunks; 2: one matmul per 128 ids
 # `...,wholekeymp=N` (N divides the kernel pages of a pool block column: 2 or 4 served): the
 # indexer's key stream copies N consecutive kernel pages per DMA (`manager_pages`) instead of
 # one 16 KiB page per DMA. 0 = per page. Same keys, same scores.
@@ -162,7 +162,10 @@ def phys_mxu_options(max_groups: int, pool_block: int) -> dict:
     pps = max_groups * 4 // 128
     groups_per_col = pool_block // 4 * max(main_kv_dcp(), 1)
     cols = -(-max_groups // groups_per_col)
-    return dict(union_phys=True, union_phys_mxu=min(pps, -(-cols // 128) * 128))
+    out = dict(union_phys=True, union_phys_mxu=min(pps, -(-cols // 128) * 128))
+    if UNION_PHYS_MXU == 2:  # `wholephysmxu=2`: one matmul over the copied row per 128 ids
+        out["union_phys_one"] = True
+    return out
 
 
 _LOGGED_MK_OPTIONS: set[tuple[str, int]] = set()

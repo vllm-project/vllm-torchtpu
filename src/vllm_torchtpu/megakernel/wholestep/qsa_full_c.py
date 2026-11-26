@@ -1601,23 +1601,35 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     # Union ids are groups below the request's last row's visible count:
                     # only the table chunks those reach are read.
                     row = scr["qu_tab"].at[q]
-                    if pmxu % 128 == 0:
-                        tab = row
-                        n_tab = ua.table_chunks(
-                            ctx.extra[NVIS][q * T + T - 1], per_page, self.dcp, pmxu
-                        )
+                    if self.union_phys_one:
+                        tb = ua.table_byte_rows(row[...], table_bytes)
+
+                        def chunk1(c: Any, carry: Any) -> Any:
+                            lo = pl.multiple_of(c * 128, 128)
+                            scr["qu_pv"][:, pl.ds(lo, 128)] = ua.physical_ids_one(
+                                src[:, pl.ds(lo, 128)], tb, per_page, self.dcp, table_bytes
+                            )
+                            return carry
+
+                        jax.lax.fori_loop(0, (n_u + 127) // 128, chunk1, 0)
                     else:
-                        tab, n_tab = row[...], None
+                        if pmxu % 128 == 0:
+                            tab = row
+                            n_tab = ua.table_chunks(
+                                ctx.extra[NVIS][q * T + T - 1], per_page, self.dcp, pmxu
+                            )
+                        else:
+                            tab, n_tab = row[...], None
 
-                    def chunk(c: Any, carry: Any) -> Any:
-                        lo = pl.multiple_of(c * 128, 128)
-                        scr["qu_pv"][:, pl.ds(lo, 128)] = ua.physical_ids(
-                            src[:, pl.ds(lo, 128)], tab, per_page, self.dcp, n_tab,
-                            table_bytes=table_bytes,
-                        )
-                        return carry
+                        def chunk(c: Any, carry: Any) -> Any:
+                            lo = pl.multiple_of(c * 128, 128)
+                            scr["qu_pv"][:, pl.ds(lo, 128)] = ua.physical_ids(
+                                src[:, pl.ds(lo, 128)], tab, per_page, self.dcp, n_tab,
+                                table_bytes=table_bytes,
+                            )
+                            return carry
 
-                    jax.lax.fori_loop(0, (n_u + 127) // 128, chunk, 0)
+                        jax.lax.fori_loop(0, (n_u + 127) // 128, chunk, 0)
                     src = scr["qu_pv"]
                 elif self.union_phys:
                     # The request's main-table row, then its union ids -> physical micro-page ids for
