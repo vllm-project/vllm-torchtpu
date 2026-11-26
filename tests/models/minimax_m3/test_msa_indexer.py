@@ -217,9 +217,11 @@ def test_transposed_partial_chunks_match_reference(cache_kind, monkeypatch):
 def test_deferred_last_chunks_match_reference(cache_kind):
     """Decode tiles over 256-page groups (`msa._wide_decode_scores`) take each
     step's last chunk's maxima in the next step (`_kernel_v3`'s `defer`):
-    requests of 100 pages (one chunk), 200 (a 96-page tail) and 300 (a full
-    group, then 44 pages of a group the 384-page row cuts short)."""
-    q_lens, ctx_lens = [8, 8, 8], [100 * PAGE - 8, 200 * PAGE - 8, 300 * PAGE - 8]
+    requests of 200 pages (an 80-page tail), 220 (a 96-page tail) and 300 (a
+    full group, then 44 pages, one chunk, of a group the 384-page row cuts
+    short)."""
+    q_lens = [8, 8, 8]
+    ctx_lens = [p * PAGE - 8 for p in (200, 220, 300)]
     index_q, cache, keys, seq_lens, tables, cu_q, num_seqs = _served_case(
         q_lens, ctx_lens, cache_kind, 11
     )

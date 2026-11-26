@@ -235,10 +235,14 @@ _PAGES_PER_CHUNK = 128
 # 128-page dots measured faster with this spreading collapsed, j-3fb5ff45).
 _DMA_ISSUE_CHUNKS = 8
 # Partial last chunks (pages) the transposed tiles score in `_kernel_v3`, so
-# that a 256-page group with 129-224 live pages skips its last 32 pages.
-# More sizes cost more code than they save (bench j-3bcdf4d5: (64, 96)
-# slower than (96,) at every decode shape).
-_TAIL_PAGES = (96,)
+# that a 256-page group with 129-208 live pages skips its last 48 pages and
+# one with 209-224 its last 32. Each size adds a body per ring slot, paid in
+# code and a branch per step (with one body per slot and count, (64, 96) was
+# slower than (96,) at every decode shape, bench j-3bcdf4d5; with the slot
+# dispatched first, b46 decode at 196 pages per request: (96,) 63.7, (80, 96)
+# 60.6, (64, 80, 96) 60.7 us; ragged 100-256 pages 61.6, 60.8, 60.5 us;
+# anvil sweeps 20261126-175749-14ef, 20261126-180005-0367).
+_TAIL_PAGES = (80, 96)
 assert all(t % 2 == 0 for t in _TAIL_PAGES), "tails pair their pages"
 # Page groups in `_kernel_v3`'s DMA ring.
 _RING_SLOTS = 3
