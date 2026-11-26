@@ -875,12 +875,16 @@ class Qwen38SegmentDriver:
 
             qwen38_wholestep_call.UNION_PHYS = True
             logger.info_once("MK wholephys active: union ids -> physical pages")
-        if _parse_flag(raw, "wholephysmxu", False):
+        physmxu = _parse_int(raw, "wholephysmxu")
+        if physmxu:
             from . import qwen38_wholestep_call
 
-            qwen38_wholestep_call.UNION_PHYS_MXU = True
+            assert physmxu in (1, 2), physmxu
+            qwen38_wholestep_call.UNION_PHYS_MXU = physmxu
+            ids = "one matmul" if physmxu == 2 else "visible chunks"
             logger.info_once(
-                "MK wholephys mxu active: prefetched table rows, MXU physical ids, micro-page rows"
+                f"MK wholephys mxu active: prefetched table rows, MXU physical ids ({ids}), "
+                "micro-page rows"
             )
         keymp = _parse_int(raw, "wholekeymp")
         auto_slots = "wholekeyslots=auto" in raw.split(",")
