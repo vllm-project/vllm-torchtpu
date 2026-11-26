@@ -25,7 +25,7 @@ from .errors import MegakernelConfigError
 from .exec_spec import MAX_BATCH_ROWS, ExecSpec
 from .modules.gdn import GDNModule
 from .modules.gdn.gate import validate_gdn_gate
-from .ops import col_chunk
+from .modules.moe.params import validate_moe_geometry
 from .pool.config import cache_exec, resolved_max_pages_per_seq
 
 _KNOWN_FROM_HF_KEYS = frozenset(
@@ -168,43 +168,43 @@ class ModelGeometry:
 
     def check(self, ex: ExecSpec) -> None:
         R, B, T, M = ex.R, ex.B, ex.T, ex.M
-        pc = col_chunk(self.H) if self.H > 0 and self.H % 128 == 0 else 1024
-        min_slots = self.E if self.moe_tp else self.ER(R)
         for cond, msg in (
             (
-                self.L % self.att_every == 0,
+                self.att_every >= 1 and self.L >= 1 and self.L % self.att_every == 0,
                 f"L={self.L} must be divisible by att_every={self.att_every}",
             ),
             (
-                self.NH % R == 0 and R % self.NKV == 0,
+                self.ROT >= 0 and self.ROT % 2 == 0 and R >= 1 and (R & (R - 1) == 0),
+                f"ROT={self.ROT} must be even and R={R} a power of 2",
+            ),
+            (
+                self.NH >= 1
+                and self.NKV >= 1
+                and self.NH % R == 0
+                and R % self.NKV == 0,
                 f"NH={self.NH} and NKV={self.NKV} incompatible with R={R}",
             ),
             (
-                # Routing tables are sized from B and MR; the hard walls are the
-                # 128-lane rows-on-lanes top-k and hits table (TOPK <= 128) and
-                # the paged scatter's `page_size >= MR` (asserted there).
-                self.E % R == 0 and self.TOPK <= 128 and 1 <= B <= M <= MAX_BATCH_ROWS,
-                f"Invalid E={self.E}, R={R}, B={B}, M={M}, TOPK={self.TOPK}",
-            ),
-            (
-                self.E % 128 == 0
-                and self.E <= 1024
-                and self.H % pc == 0
-                and self.nh(R) <= 8,
-                f"Invalid E={self.E}, H={self.H}, nh={self.nh(R)}",
-            ),
-            (
-                self.ROT % 2 == 0 and (R & (R - 1) == 0),
-                f"ROT={self.ROT} must be even and R={R} a power of 2",
+                1 <= B <= M <= MAX_BATCH_ROWS,
+                f"Invalid B={B}, M={M} (expected 1 <= B <= M <= {MAX_BATCH_ROWS})",
             ),
             (T >= 1 and B % T == 0, f"Invalid B={B}, T={T}"),
-            (
-                self.e_slots == 0 or self.e_slots >= min_slots,
-                f"e_slots={self.e_slots} must be 0 or >= {min_slots}",
-            ),
         ):
             if not cond:
                 raise MegakernelConfigError(msg)
+        _, isr, ir, _ = validate_moe_geometry(
+            E=self.E,
+            R=R,
+            TOPK=self.TOPK,
+            IS=self.IS,
+            I=self.I,
+            moe_tp=self.moe_tp,
+            e_slots=self.e_slots,
+        )
+        if not (self.E % 128 == 0 and self.E <= 1024 and self.nh(R) <= 8):
+            raise MegakernelConfigError(
+                f"Invalid E={self.E}, H={self.H}, nh={self.nh(R)}"
+            )
         cx = cache_exec(ex)
         if cx.paged_kv and not (
             cx.page_size == 128
@@ -216,12 +216,20 @@ class ModelGeometry:
                 f"Invalid paged_kv config: page_size={cx.page_size}, ctx={ex.ctx}, "
                 f"num_pages={cx.num_pages}, max_pages={resolved_max_pages_per_seq(ex)}"
             )
-        for n in (self.H, self.HD, self.IR(R), self.ISR(R)):
-            if n % 128 != 0:
-                raise MegakernelConfigError(f"Dimension {n} must be a multiple of 128")
+        for n in (self.H, self.HD, ir, isr):
+            if n <= 0 or n % 128 != 0:
+                raise MegakernelConfigError(
+                    f"Dimension {n} must be a positive multiple of 128"
+                )
         if self.NGDN > 0:
             validate_gdn_gate(self.gdn_gate, MegakernelConfigError)
-            if not (self.KH % R == 0 and self.VH % R == 0 and self.VH % self.KH == 0):
+            if not (
+                self.KH > 0
+                and self.VH > 0
+                and self.KH % R == 0
+                and self.VH % R == 0
+                and self.VH % self.KH == 0
+            ):
                 raise MegakernelConfigError(
                     f"Invalid GDN heads KH={self.KH}, VH={self.VH}, R={R}"
                 )
@@ -229,9 +237,9 @@ class ModelGeometry:
             if lay.vh > 64:
                 raise MegakernelConfigError(f"GDN vh={lay.vh} exceeds 64")
             for n in (lay.KD, lay.VD, lay.QKV, lay.Z):
-                if n % 128 != 0:
+                if n <= 0 or n % 128 != 0:
                     raise MegakernelConfigError(
-                        f"GDN dimension {n} must be a multiple of 128"
+                        f"GDN dimension {n} must be a positive multiple of 128"
                     )
 
     def shrink(
@@ -271,11 +279,12 @@ class ModelGeometry:
         if self.e_slots == 0:
             e_slots = 0
         elif self.moe_tp:
-            e_slots = e_tiny + max(0, self.e_slots - self.E)
+            e_slots = e_tiny
         else:
             base_er = self.E // R if self.e_slots >= self.E // R else self.E // 8
             e_slots = e_tiny // R + max(0, self.e_slots - base_er)
         i_min = 128 * R if self.moe_tp else 128
+        is_min = 128 * R
         shrunk = dataclasses.replace(
             self,
             L=periods * self.att_every,
@@ -286,8 +295,8 @@ class ModelGeometry:
             VH=vh,
             E=e_tiny,
             TOPK=min(self.TOPK, 4),
-            I=max(i_min, min(self.I, 512)),
-            IS=max(128 * R, min(self.IS, 512)),
+            I=max(i_min, min(self.I, 512) // i_min * i_min),
+            IS=max(is_min, min(self.IS, 512) // is_min * is_min),
             e_slots=e_slots,
         )
         for k, v in vars(self).items():

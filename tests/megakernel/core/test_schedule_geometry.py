@@ -29,6 +29,7 @@ from vllm_torchtpu.megakernel.core.geometry import FromHF, ModelGeometry
 from vllm_torchtpu.megakernel.core.module import Module
 from vllm_torchtpu.megakernel.core.modules.gdn import GDN, GDNModule
 from vllm_torchtpu.megakernel.core.modules.norm import Norm
+from vllm_torchtpu.megakernel.core.pool.config import CacheExec
 from vllm_torchtpu.megakernel.core.schedule import Every, FromHFLayerTypes, Schedule
 
 
@@ -108,7 +109,7 @@ def test_from_hf_strict_resolution_and_nested_text_config():
         decl.resolve({"hidden": 2048, "custom_num_layers": 8, "rms_norm_eps": 1e-5})
 
     nested_cfg = {
-        "model_type": " wrapper",
+        "model_type": "wrapper",
         "text_config": {
             "custom_hidden_size": 2048,
             "custom_num_layers": 8,
@@ -164,11 +165,94 @@ def test_model_geometry_properties_shrink_check_and_pool_backend():
         assert mg_diff != mg, f"ModelGeometry equality ignored field {f.name!r}"
         assert hash(mg_diff) != hash(mg), f"ModelGeometry hash ignored field {f.name!r}"
 
-    object.__setattr__(mg, "_extra_tag", "preserved")
-    mg_shrunk = mg.shrink(R=2)
+    mg_large = ModelGeometry(
+        L=32,
+        att_every=4,
+        H=4096,
+        NH=32,
+        NKV=4,
+        HD=256,
+        ROT=64,
+        KH=16,
+        VH=64,
+        KD=128,
+        VD=128,
+        E=512,
+        TOPK=8,
+        I=2048,
+        IS=2048,
+    )
+    object.__setattr__(mg_large, "_extra_tag", "preserved")
+    mg_shrunk = mg_large.shrink(R=2)
     assert getattr(mg_shrunk, "_extra_tag", None) == "preserved"
-    assert (mg_shrunk.L, mg_shrunk.att_every) == (8, 4)
+    assert (
+        mg_shrunk.L,
+        mg_shrunk.att_every,
+        mg_shrunk.H,
+        mg_shrunk.NH,
+        mg_shrunk.NKV,
+        mg_shrunk.KH,
+        mg_shrunk.VH,
+        mg_shrunk.E,
+        mg_shrunk.TOPK,
+        mg_shrunk.I,
+        mg_shrunk.IS,
+        mg_shrunk.e_slots,
+    ) == (8, 4, 1024, 8, 2, 8, 16, 128, 4, 512, 512, 0)
     mg_shrunk.check(ExecSpec(R=2, B=2, T=1, ctx=128))
+    mg_shrunk_ex = mg_large.shrink(ex=ExecSpec(R=4, B=4, T=1, ctx=128))
+    assert (mg_shrunk_ex.NH, mg_shrunk_ex.NKV, mg_shrunk_ex.KH) == (8, 2, 8)
+    mg_shrunk_ex.check(ExecSpec(R=4, B=4, T=1, ctx=128))
+
+    # `moe_tp=True` with `e_slots == E` shrinks `e_slots` to `e_tiny`, while
+    # `e_slots > E` is rejected by `check()` (`validate_moe_geometry`).
+    mg_tp_slots = dataclasses.replace(mg_large, moe_tp=True, e_slots=512)
+    mg_tp_slots.check(ExecSpec(R=8, B=8, T=1, ctx=128))
+    mg_tp_slots_shrunk = mg_tp_slots.shrink(R=2)
+    assert (mg_tp_slots_shrunk.E, mg_tp_slots_shrunk.e_slots) == (128, 128)
+    mg_tp_slots_shrunk.check(ExecSpec(R=2, B=2, T=1, ctx=128))
+    assert (
+        dataclasses.replace(mg_large, moe_tp=True, e_slots=520).shrink(R=2).e_slots
+        == 128
+    )
+    with pytest.raises(MegakernelConfigError, match="moe_tp=True does not support"):
+        dataclasses.replace(mg, moe_tp=True, e_slots=136).check(
+            ExecSpec(R=2, B=2, T=1, ctx=128)
+        )
+
+    # `moe_tp=False` / `e_slots` (valid EP + EPLB slots, `shrink()`, and `< ER` error).
+    mg_ep = dataclasses.replace(mg_large, moe_tp=False, e_slots=80)
+    assert (mg_ep.ER(8), mg_ep.EW(8), mg_ep.IR(8)) == (64, 80, 2048)
+    mg_ep.check(ExecSpec(R=8, B=8, T=1, ctx=128))
+    mg_ep_shrunk = mg_ep.shrink(R=2)
+    assert (mg_ep_shrunk.E, mg_ep_shrunk.e_slots) == (128, 80)
+    mg_ep_shrunk.check(ExecSpec(R=2, B=2, T=1, ctx=128))
+    with pytest.raises(MegakernelConfigError, match="e_slots=8 must be 0 or >= ER=16"):
+        dataclasses.replace(mg, moe_tp=False, e_slots=8).check(
+            ExecSpec(R=8, B=8, T=1, ctx=128)
+        )
+
+    # Clamped `I=384` / `IS=384` rounds down to a valid multiple of `i_min` / `128 * R`.
+    mg_384 = dataclasses.replace(mg, NKV=1, I=384, IS=384)
+    mg_384.check(ExecSpec(R=1, B=1, T=1, ctx=128))
+    for r_val in (1, 2, 4, 8):
+        s_tp = mg_384.shrink(R=r_val)
+        s_tp.check(ExecSpec(R=r_val, B=r_val, T=1, ctx=128))
+        s_ep = dataclasses.replace(mg_384, moe_tp=False).shrink(R=r_val)
+        s_ep.check(ExecSpec(R=r_val, B=r_val, T=1, ctx=128))
+    assert (mg_384.shrink(R=2).I, mg_384.shrink(R=2).IS) == (256, 256)
+    assert (
+        dataclasses.replace(mg_384, moe_tp=False).shrink(R=2).I,
+        dataclasses.replace(mg_384, moe_tp=False).shrink(R=2).IS,
+    ) == (384, 256)
+
+    # Attention-only (`att_every=1`, `NGDN == 0`) geometry and `shrink()`.
+    mg_att_only = dataclasses.replace(mg_large, att_every=1, KH=0, VH=0, KD=0, VD=0)
+    assert (mg_att_only.NGDN, mg_att_only.NATT) == (0, 32)
+    mg_att_only.check(ExecSpec(R=8, B=8, T=1, ctx=128))
+    s_att = mg_att_only.shrink(periods=3, R=2)
+    assert (s_att.L, s_att.NGDN, s_att.KH, s_att.VH) == (3, 0, 0, 0)
+    s_att.check(ExecSpec(R=2, B=2, T=1, ctx=128))
 
     rec_decl = GDNModule(geometry=mg).cache_decl(mg)
     assert rec_decl is not None
@@ -179,10 +263,67 @@ def test_model_geometry_properties_shrink_check_and_pool_backend():
     assert pb1 != pb2
     assert pb1.layout == pb2.layout
 
+    # `paged_kv=True` valid and invalid configurations.
+    mg.check(
+        ExecSpec(
+            R=2,
+            B=2,
+            T=1,
+            ctx=256,
+            cache=CacheExec(paged_kv=True, page_size=128, num_pages=8),
+        )
+    )
+    for bad_cache, bad_ctx in (
+        (CacheExec(paged_kv=True, page_size=64, num_pages=8), 256),
+        (CacheExec(paged_kv=True, page_size=128, num_pages=8), 200),
+        (CacheExec(paged_kv=True, page_size=128, num_pages=0), 256),
+        (
+            CacheExec(paged_kv=True, page_size=128, num_pages=8, max_pages_per_seq=1),
+            256,
+        ),
+    ):
+        with pytest.raises(MegakernelConfigError, match="Invalid paged_kv config"):
+            mg.check(ExecSpec(R=2, B=2, T=1, ctx=bad_ctx, cache=bad_cache))
+
+    # `check()` validation errors (MoE divisibility/bounds, `% 128` > 0, and GDN).
     with pytest.raises(MegakernelConfigError, match="divisible by att_every"):
         dataclasses.replace(mg, L=5).check(ExecSpec(R=2, B=2, T=1, ctx=128))
     with pytest.raises(MegakernelConfigError, match="Invalid B=3, T=2"):
         mg.check(ExecSpec(R=2, B=3, T=2, ctx=128))
+    with pytest.raises(MegakernelConfigError, match="divisible by R=8"):
+        dataclasses.replace(mg, I=1028).check(ExecSpec(R=8, B=8, T=1, ctx=128))
+    with pytest.raises(MegakernelConfigError, match="positive multiple of R=8"):
+        dataclasses.replace(mg, IS=68).check(ExecSpec(R=8, B=8, T=1, ctx=128))
+    with pytest.raises(MegakernelConfigError, match="positive multiple of 128"):
+        dataclasses.replace(mg, IS=64).check(ExecSpec(R=8, B=8, T=1, ctx=128))
+    with pytest.raises(MegakernelConfigError, match="positive multiple of 128"):
+        dataclasses.replace(mg, H=0).check(ExecSpec(R=2, B=2, T=1, ctx=128))
+    with pytest.raises(MegakernelConfigError, match="gate"):
+        dataclasses.replace(mg, gdn_gate="relu").check(ExecSpec(R=2, B=2, T=1, ctx=128))
+    with pytest.raises(MegakernelConfigError, match="Invalid GDN heads"):
+        dataclasses.replace(mg, KH=6).check(ExecSpec(R=4, B=4, T=1, ctx=128))
+    with pytest.raises(MegakernelConfigError, match="Invalid GDN heads"):
+        dataclasses.replace(mg, KH=0).check(ExecSpec(R=2, B=2, T=1, ctx=128))
+    with pytest.raises(MegakernelConfigError, match="GDN vh=128 exceeds 64"):
+        dataclasses.replace(mg, KH=128, VH=256).check(ExecSpec(R=2, B=2, T=1, ctx=128))
+    with pytest.raises(
+        MegakernelConfigError, match="GDN dimension .* positive multiple of 128"
+    ):
+        dataclasses.replace(mg, KD=64).check(ExecSpec(R=2, B=2, T=1, ctx=128))
+    with pytest.raises(
+        MegakernelConfigError, match="GDN dimension 0 must be a positive multiple"
+    ):
+        dataclasses.replace(mg, VD=0).check(ExecSpec(R=2, B=2, T=1, ctx=128))
+
+    # `shrink()` argument validation errors (`periods` and `R`).
+    for bad_periods in (0, -1, True):
+        with pytest.raises(MegakernelConfigError, match="shrink periods"):
+            mg.shrink(periods=bad_periods, R=2)  # type: ignore[arg-type]
+    for bad_r in (0, 3, 16, True):
+        with pytest.raises(MegakernelConfigError, match="shrink R"):
+            mg.shrink(R=bad_r)  # type: ignore[arg-type]
+    with pytest.raises(MegakernelConfigError, match="shrink R"):
+        mg.shrink(ex=ExecSpec(R=16, B=16, T=1, ctx=128))
 
 
 def test_schedule_every_and_from_hf_layer_types_resolution_and_errors():
@@ -339,5 +480,14 @@ def test_schedule_every_and_from_hf_layer_types_resolution_and_errors():
         ffn=moe,
         overrides={6: {"ffn": moe}},
     )
+    sched_seq_norms = Schedule(
+        mixer=[gdn, attn],
+        ffn=[moe, alt_moe],
+        pre_norm=[in_norm, None],
+        post_norm=[None, post_norm],
+    ).resolve({}, 2)
+    assert sched_seq_norms.pre_norm == (in_norm, None)
+    assert sched_seq_norms.post_norm == (None, post_norm)
+
     with pytest.raises(MegakernelConfigError, match=r"layer index 6.*num_layers=4"):
         sched_oob.resolve({}, 4)
