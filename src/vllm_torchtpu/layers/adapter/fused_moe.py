@@ -24,6 +24,7 @@ import torch
 from torch_tpu._internal import pallas
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import SharedExpert
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
     quantize_to_native_fp4_kmajor,
@@ -33,7 +34,9 @@ from vllm_torchtpu.layers.core.fused_moe_gmm import (
 )
 
 _kernel_instance_counter = 0
-_fused_moe_kernel_cache: dict[tuple[int, str, bool, Any, bool], Callable] = {}
+_fused_moe_kernel_cache: dict[tuple, Callable] = {}
+# Row-piece counts the shared-expert op variant takes (SHARED_ROWS_ATTR).
+_SHARED_ROWS_PIECE_COUNTS = (0, 1, 2)
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
 _quantize_native_fp4_kmajor_ops: dict[tuple[int, bool], Callable] = {}
@@ -159,6 +162,8 @@ def _build_fused_moe_custom_op(
     use_ep: bool,
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
+    with_shared: bool = False,
+    with_shared_rows: int = 0,
 ):
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -185,6 +190,20 @@ def _build_fused_moe_custom_op(
         skip_padded_tokens=skip_padded_tokens,
     )
 
+    if with_shared:
+        wrapped_fn = _shared_variant(
+            with_shared_rows,
+            topk=topk,
+            activation=activation,
+            use_ep=use_ep,
+            use_sparse_core=use_sparse_core,
+            onehot_moe_permute_threshold=resolve_onehot_permute_threshold(),
+            rhs_quant_dtype=rhs_quant_dtype,
+            skip_padded_tokens=skip_padded_tokens,
+        )
+    else:
+        assert not with_shared_rows
+
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
 
     # We must overwrite the default fake implementation as vLLM uses dynamic
@@ -195,6 +214,8 @@ def _build_fused_moe_custom_op(
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
 
     cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    if with_shared:
+        cache_key += (with_shared, with_shared_rows)
     _fused_moe_kernel_cache[cache_key] = fused_moe_kernel_impl
     return fused_moe_kernel_impl
 
@@ -206,10 +227,14 @@ def _get_fused_moe_custom_op(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    with_shared: bool = False,
+    with_shared_rows: int = 0,
 ):
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
     cache_key = (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens)
+    if with_shared:
+        cache_key += (with_shared, with_shared_rows)
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is not None:
         return kernel
@@ -219,6 +244,8 @@ def _get_fused_moe_custom_op(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        with_shared=with_shared,
+        with_shared_rows=with_shared_rows,
     )
 
 
@@ -229,6 +256,8 @@ def prebuild_fused_moe_kernel(
     use_ep: bool,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    with_shared: bool = False,
+    with_shared_rows: int = 0,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing."""
     _get_fused_moe_custom_op(
@@ -237,6 +266,8 @@ def prebuild_fused_moe_kernel(
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        with_shared=with_shared,
+        with_shared_rows=with_shared_rows,
     )
 
 
@@ -255,8 +286,16 @@ def fused_moe_gmm(
     activation: str,
     rhs_quant_dtype=None,
     skip_padded_tokens: bool | None = None,
+    shared: tuple[torch.Tensor, ...] | None = None,
+    shared_rows: tuple[tuple[torch.Tensor, torch.Tensor], ...] | None = None,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
+
+    ``shared`` holds an armed shared expert's tensors in SharedExpert's order
+    (TPU_MOE_DENSE_FP4_SHARED); its output is then added to the routed
+    output. ``shared_rows`` are the tokens' gathered e4m3 row pieces,
+    (rows, f32 row scales) each, its gate_up contracts as e4m3 on steps the
+    dense fp4 kernel does not serve (fused_moe_func).
 
     ``experts_start`` is the first global expert id owned by this shard under
     linear EP placement (or ``None`` for non-EP) -- see
@@ -269,12 +308,15 @@ def fused_moe_gmm(
     the sparse-core parity path dispatches ragged gather/gather-reduce.
     """
     use_ep = experts_start is not None
+    assert shared_rows is None or shared is not None
     fused_moe = _get_fused_moe_custom_op(
         topk=topk,
         activation=activation,
         use_ep=use_ep,
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
+        with_shared=shared is not None,
+        with_shared_rows=len(shared_rows or ()),
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand
@@ -292,7 +334,101 @@ def fused_moe_gmm(
         topk_weights,
         topk_ids,
         experts_start,
+        *(shared or ()),
+        *(t for piece in shared_rows or () for t in piece),
     )
+
+
+def _shared_variant(pieces: int, **static) -> Callable:
+    """The op function with an armed shared expert (SharedExpert's four
+    tensors after the routed operands, then ``pieces`` (rows, scales) pairs).
+    Annotated per arity: jax_op builds the op schema from the annotations,
+    and torch_tpu takes only arrays as op arguments."""
+    assert pieces in _SHARED_ROWS_PIECE_COUNTS, pieces
+
+    def call(routed, extra):
+        rows = extra[4:]
+        return fused_moe_func(
+            *routed,
+            shared_expert=SharedExpert(*extra[:4]),
+            shared_rows=tuple(zip(rows[::2], rows[1::2])) or None,
+            **static,
+        )
+
+    def shared_only(
+        hidden_states: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array | None,
+        w2_scale: jax.Array | None,
+        w1_bias: jax.Array | None,
+        w2_bias: jax.Array | None,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array | None,
+        shared_w1: jax.Array,
+        shared_s1: jax.Array,
+        shared_w2: jax.Array,
+        shared_s2: jax.Array,
+    ) -> jax.Array:
+        return call(
+            (hidden_states, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias)
+            + (topk_weights, topk_ids, experts_start),
+            (shared_w1, shared_s1, shared_w2, shared_s2),
+        )
+
+    def shared_1_piece(
+        hidden_states: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array | None,
+        w2_scale: jax.Array | None,
+        w1_bias: jax.Array | None,
+        w2_bias: jax.Array | None,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array | None,
+        shared_w1: jax.Array,
+        shared_s1: jax.Array,
+        shared_w2: jax.Array,
+        shared_s2: jax.Array,
+        rows0: jax.Array,
+        scales0: jax.Array,
+    ) -> jax.Array:
+        return call(
+            (hidden_states, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias)
+            + (topk_weights, topk_ids, experts_start),
+            (shared_w1, shared_s1, shared_w2, shared_s2, rows0, scales0),
+        )
+
+    def shared_2_pieces(
+        hidden_states: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array | None,
+        w2_scale: jax.Array | None,
+        w1_bias: jax.Array | None,
+        w2_bias: jax.Array | None,
+        topk_weights: jax.Array,
+        topk_ids: jax.Array,
+        experts_start: jax.Array | None,
+        shared_w1: jax.Array,
+        shared_s1: jax.Array,
+        shared_w2: jax.Array,
+        shared_s2: jax.Array,
+        rows0: jax.Array,
+        scales0: jax.Array,
+        rows1: jax.Array,
+        scales1: jax.Array,
+    ) -> jax.Array:
+        return call(
+            (hidden_states, w1, w2, w1_scale, w2_scale, w1_bias, w2_bias)
+            + (topk_weights, topk_ids, experts_start),
+            (shared_w1, shared_s1, shared_w2, shared_s2)
+            + (rows0, scales0, rows1, scales1),
+        )
+
+    return (shared_only, shared_1_piece, shared_2_pieces)[pieces]
 
 
 # Shared-expert-in-combine variant (TPU_MINIMAX_M3_SHARED_IN_COMBINE): the op

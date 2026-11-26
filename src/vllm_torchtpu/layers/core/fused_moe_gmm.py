@@ -24,8 +24,10 @@ from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
     dense_expert_moe,
 )
 from vllm_torchtpu.kernels.experimental.moe_dense_expert_fp4 import (
+    SharedExpert,
     can_use_dense_expert_fp4,
     dense_expert_moe_fp4,
+    shared_activation,
 )
 from vllm_torchtpu.kernels.megablox import tc_combine as tc_combine_mod
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
@@ -123,7 +125,7 @@ _DENSE_FP4_SPARSE_MAX_TOKENS = envs.TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS
 # The dense fp4 kernel serves EP ranks; TP-MoE ranks (every expert's slice,
 # all ids local) only while a dense fp4 lever from r15-merge is set, so with
 # those unset the TP-MoE path is unchanged.
-_DENSE_FP4_TP_MOE = _DENSE_FP4_SPARSE_MAX_TOKENS > 0
+_DENSE_FP4_TP_MOE = _DENSE_FP4_SPARSE_MAX_TOKENS > 0 or envs.TPU_MOE_DENSE_FP4_SHARED
 # Fixed at import: one-hot permute/combine over the valid prefix only.
 _BOUNDED_ONEHOT = envs.TPU_MOE_BOUNDED_ONEHOT
 # Fixed at import: build the MoE permutation from one packed sort.
@@ -970,6 +972,75 @@ def _tc_shared_applies(
     )
 
 
+# MiniMaxM3Mxfp8LinearMethod materializes the bf16 weight from this many rows.
+_SHARED_UPCAST_MIN_ROWS = 4096
+
+
+def _shared_projection(v: jax.Array, w: jax.Array, scale: jax.Array) -> jax.Array:
+    """``bf16(bf16(v @ bf16(w)) * scale)``: a shared-expert linear (e4m3
+    weight, f32 [1, n] per-channel scale) as torch_tpu rounds it."""
+    w = w.astype(jnp.bfloat16)
+    if v.shape[0] >= _SHARED_UPCAST_MIN_ROWS:
+        w = jax.lax.optimization_barrier(w)
+    y = jnp.matmul(v, w).astype(jnp.float32) * scale
+    return y.astype(jnp.bfloat16)
+
+
+def shared_expert_act(x: jax.Array, shared: SharedExpert) -> jax.Array:
+    """`shared`'s gate_up and activation on the bf16 tokens ``x``: the down
+    projection's bf16 input. From r15-merge (TPU_MOE_DENSE_FP4_SHARED)."""
+    gate, up = jnp.split(_shared_projection(x, shared.w1, shared.s1), 2, axis=-1)
+    act = shared_activation(gate.astype(jnp.float32), up.astype(jnp.float32))
+    return act.astype(jnp.bfloat16)
+
+
+def shared_activation_e4m3(
+    q: jax.Array, row_scale: jax.Array, w1: jax.Array, s1: jax.Array
+) -> jax.Array:
+    """`shared_expert_act` on e4m3 rows ``q`` with f32 row scales (an SP
+    step's gathered rows): gate_up contracts e4m3 x e4m3 on the MXU's fp8
+    rate, rounded where `_shared_projection` rounds, from the rows before
+    their bf16 dequantization."""
+    acc = jax.lax.dot(q, w1, preferred_element_type=jnp.float32)
+    y = (acc * row_scale).astype(jnp.bfloat16).astype(jnp.float32) * s1
+    gate, up = jnp.split(y.astype(jnp.bfloat16), 2, axis=-1)
+    return shared_activation(gate.astype(jnp.float32), up.astype(jnp.float32)).astype(
+        jnp.bfloat16
+    )
+
+
+def _shared_act(
+    x: jax.Array,
+    shared: SharedExpert,
+    rows: tuple[tuple[jax.Array, jax.Array], ...] | None,
+) -> jax.Array:
+    """`shared_expert_act` on the bf16 tokens ``x``, or on their gathered e4m3
+    row pieces ``rows`` (in token order) when given."""
+    if rows is None:
+        return shared_expert_act(x, shared)
+    return jnp.concatenate(
+        [shared_activation_e4m3(q, scale, shared.w1, shared.s1) for q, scale in rows]
+    )
+
+
+def _armed_shared_in_combine(num_tokens: int) -> bool:
+    """Whether an armed shared expert's down projection may run inside the
+    TensorCore combine at this step size (TPU_MINIMAX_M3_SHARED_IN_COMBINE)."""
+    return (
+        envs.TPU_MINIMAX_M3_SHARED_IN_COMBINE
+        and num_tokens >= envs.TPU_MINIMAX_M3_SHARED_IN_COMBINE_MIN_TOKENS
+    )
+
+
+def shared_expert_mlp(
+    x: jax.Array, shared: SharedExpert, routed: jax.Array
+) -> jax.Array:
+    """``routed`` plus `shared` on the bf16 tokens ``x``, rounded as
+    SharedExpert describes (a bf16 add)."""
+    act = shared_expert_act(x, shared)
+    return _shared_projection(act, shared.w2, shared.s2) + routed.astype(jnp.bfloat16)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -1005,8 +1076,22 @@ def fused_moe_func(
     shared_w: jax.Array | None = None,
     shared_scale: jax.Array | None = None,
     shared_routed_scale: float = 1.0,
+    shared_expert: SharedExpert | None = None,
+    shared_rows: tuple[tuple[jax.Array, jax.Array], ...] | None = None,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
+
+    With ``shared_expert`` (TPU_MOE_DENSE_FP4_SHARED, from r15-merge), an
+    always-on expert's output (rounded to bf16) is added to the routed
+    output, as vLLM's MoERunner adds a separately computed shared expert: the
+    dense fp4 kernel evaluates it in the same call where it serves the step;
+    other steps compute its gate_up and activation here (on the gathered e4m3
+    ``shared_rows`` pieces when given) and add its down projection after the
+    routed output: inside the TensorCore combine on steps of at least
+    TPU_MINIMAX_M3_SHARED_IN_COMBINE_MIN_TOKENS with
+    TPU_MINIMAX_M3_SHARED_IN_COMBINE set, where the combine takes it (that
+    lever's fusion; the model then leaves an armed layer's shared expert to
+    this op), else with XLA. Exclusive with ``shared_act``.
 
     With ``shared_act`` [T, Ks], ``shared_w`` [Ks, H] and ``shared_scale``
     [H], the result is ``bf16(routed) * shared_routed_scale`` plus the shared
@@ -1041,6 +1126,9 @@ def fused_moe_func(
         w2_scale = jnp.expand_dims(w2_scale, 2)
 
     num_tokens, hidden_size = hidden_states.shape
+    assert shared_expert is None or shared_act is None
+    if shared_expert is not None and activation != "swigluoai":
+        raise NotImplementedError(f"shared experts take swigluoai, not {activation}")
     shared = None
     if shared_act is not None:
         shared = (
@@ -1084,6 +1172,23 @@ def fused_moe_func(
 
     if skip_padded_tokens and num_tokens * topk < _SKIP_PADDED_MIN_ROUTES:
         skip_padded_tokens = False
+
+    # Steps the dense fp4 kernel does not serve: the armed shared expert's
+    # down projection follows the routed output (fused into the TensorCore
+    # combine only on TPU_MINIMAX_M3_SHARED_IN_COMBINE's steps). Unused (and
+    # dropped by XLA) on the kernel's steps.
+    shared_fp32_scale = None
+    if shared_expert is not None:
+        act = _shared_act(hidden_states, shared_expert, shared_rows)
+        shared_fp32_scale = shared_expert.s2
+        shared = (
+            act,
+            shared_expert.w2.astype(jnp.bfloat16),
+            # Exact for MiniMax-M3's power-of-two channel scales; only the
+            # combine kernel reads it (the XLA add uses the f32 scale).
+            shared_expert.s2.astype(jnp.bfloat16).reshape(1, -1),
+            1.0,
+        )
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
@@ -1129,6 +1234,7 @@ def fused_moe_func(
             w2_scale,
             activation=activation,
             sparse_rows=sparse_rows,
+            shared=shared_expert,
         )
     ):
         logger.info_once(
@@ -1147,8 +1253,9 @@ def fused_moe_func(
                 topk_ids,
                 activation=activation,
                 sparse_rows=sparse_rows,
+                shared=shared_expert,
             ),
-            shared,
+            None if shared_expert is not None else shared,
         )
     if (
         _FLAT_ROUTING_MIN_TOKENS
@@ -1190,7 +1297,10 @@ def fused_moe_func(
         with_valid_count=_VALID_COUNT_FROM_SORT,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
-    tc_shared = shared is not None and _tc_shared_applies(
+    tc_shared = (
+        shared is not None
+        and (shared_expert is None or _armed_shared_in_combine(num_tokens))
+    ) and _tc_shared_applies(
         num_tokens,
         padded_hidden_size,
         topk,
@@ -1225,6 +1335,9 @@ def fused_moe_func(
         valid_count=sorted_valid_count[0] if sorted_valid_count else None,
     )
     x = x[:num_tokens, :hidden_size]
+    if shared_fp32_scale is not None and not tc_shared:
+        act, w, _, _ = shared
+        return _shared_projection(act, w, shared_fp32_scale) + x.astype(jnp.bfloat16)
     return x if tc_shared else _with_shared(x, shared)
 
 

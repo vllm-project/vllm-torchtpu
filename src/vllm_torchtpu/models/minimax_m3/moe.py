@@ -27,6 +27,19 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.megablox import tc_combine
+from vllm_torchtpu.layers.adapter.dense_fp4_shared import (
+    SHARED_ROWS_ATTR,
+    SHARED_ROWS_PIECES,
+    model_side_shared,
+    shared_operands,
+)
+from vllm_torchtpu.models.minimax_m3.quant import (
+    _KERNEL_SWIGLU,
+    MiniMaxM3Mxfp8LinearMethod,
+    _e4m3_matmul,
+    _materialized_bf16,
+)
+from vllm_torchtpu.utils import fresh_buffer
 
 # The checkpoint config may omit swiglu_beta; SwiGLU-OAI's up-bias is 1.
 _DEFAULT_SWIGLU_BETA = 1.0
@@ -117,6 +130,60 @@ class MiniMaxM3MLP(nn.Module):
         return self.act_fn(gate_up)
 
 
+def e4m3_mlp_operands(mlp: MiniMaxM3MLP) -> tuple[torch.Tensor, ...] | None:
+    """``(w_gu, s_gu, w_d, s_d)`` of a bias-free SwiGLU-OAI MLP (the kernels'
+    `_KERNEL_SWIGLU`) on per-channel e4m3 linears, for kernels that evaluate it
+    whole (TPU_MOE_DENSE_FP4_SHARED): e4m3 ``w_gu [h, 2i]`` ([gate | up]) and
+    ``w_d [i, h]``, f32 scales ``[1, 2i]`` / ``[1, h]``. None for any other
+    MLP."""
+    act = mlp.act_fn
+    if not isinstance(act, SiluAndMulWithClamp) or (
+        (act.alpha, act.swiglu_limit, act.beta) != _KERNEL_SWIGLU
+    ):
+        return None
+    linears = (mlp.gate_up_proj, mlp.down_proj)
+    for linear in linears:
+        if (
+            not isinstance(linear.quant_method, MiniMaxM3Mxfp8LinearMethod)
+            or linear.weight.dtype != torch.float8_e4m3fn
+            or linear.weight.dim() != 2
+            or linear.weight_scale.dim() != 1
+            or getattr(linear, "bias", None) is not None
+        ):
+            return None
+    (w1, s1), (w2, s2) = ((m.weight.data, m.weight_scale.data) for m in linears)
+    h, two_i = w1.shape
+    if two_i % 2 or tuple(w2.shape) != (two_i // 2, h):
+        return None
+    # Weights as the parameters themselves (a view would be re-materialized on
+    # every call); the f32 [1, n] scales are buffers of their own.
+    return (
+        w1,
+        fresh_buffer(s1.float().reshape(1, -1)),
+        w2,
+        fresh_buffer(s2.float().reshape(1, -1)),
+    )
+
+
+def _shared_expert(
+    act_fn: nn.Module,
+    x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    w1: torch.Tensor,
+    s1: torch.Tensor,
+    w2: torch.Tensor,
+    s2: torch.Tensor,
+) -> torch.Tensor:
+    """An armed shared expert (dense_fp4_shared: e4m3 [H, 2I] / [I, H]
+    weights, f32 [1, n] channel scales) as `fused_moe_gmm.shared_expert_mlp`
+    rounds it; e4m3 rows ``x`` contract as e4m3 x e4m3."""
+    if isinstance(x, tuple):
+        gate_up = _e4m3_matmul(x[0], x[1], w1, s1)
+    else:
+        gate_up = (torch.matmul(x, _materialized_bf16(w1)).float() * s1).to(x.dtype)
+    act = act_fn(gate_up)
+    return (torch.matmul(act, _materialized_bf16(w2)).float() * s2).to(act.dtype)
+
+
 class MiniMaxM3MoE(nn.Module):
     """Sigmoid-routed experts plus one always-on shared expert.
 
@@ -179,6 +246,7 @@ class MiniMaxM3MoE(nn.Module):
         (`_join_pieces`)."""
         rows = None
         router_logits = None
+        pieces = hidden_states if isinstance(hidden_states, list) else None
         if isinstance(hidden_states, list):
             hidden_states, rows, router_logits = self._join_pieces(hidden_states)
         elif isinstance(hidden_states, tuple):
@@ -188,6 +256,11 @@ class MiniMaxM3MoE(nn.Module):
                 rows = (q8, row_scale)
         if router_logits is None:
             router_logits, _ = self.gate(hidden_states)
+        routed_layer = getattr(self.experts, "routed_experts", None)
+        if routed_layer is not None and shared_operands(routed_layer) is not None:
+            return self._forward_armed_shared(
+                routed_layer, hidden_states, router_logits, rows, pieces
+            )
         if self._shared_in_combine(hidden_states.shape[0]):
             return self._forward_shared_in_combine(hidden_states, router_logits, rows)
         if rows is None:
@@ -217,6 +290,42 @@ class MiniMaxM3MoE(nn.Module):
         if envs.TPU_MINIMAX_M3_SP_E4M3_SHARED and isinstance(pieces[0], tuple):
             rows = cat_rows(pieces)
         return hidden_states, rows, router_logits
+
+    def _forward_armed_shared(
+        self,
+        routed_layer: nn.Module,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        rows: tuple[torch.Tensor, torch.Tensor] | None,
+        pieces: list[Rows] | None = None,
+    ) -> torch.Tensor:
+        """A layer whose shared expert TPU_MOE_DENSE_FP4_SHARED handed to the
+        routed op (from r15-merge). Exactly one place runs it: the model on
+        steps `model_side_shared` gives it, else the routed op (which also
+        owns TPU_MINIMAX_M3_SHARED_IN_COMBINE's fusion for such a layer). With
+        TPU_MINIMAX_M3_SP_E4M3_SHARED, an SP step's e4m3 ``rows`` feed its
+        gate_up either way (one piece to the routed op, SHARED_ROWS_ATTR).
+        An SP step's SHARED_ROWS_PIECES gathered e4m3 ``pieces``
+        (TPU_MINIMAX_M3_SP_FFN_PIECES) go to the routed op as separate pieces,
+        in the joined rows' (piece-major) order."""
+        if model_side_shared(routed_layer, hidden_states.shape[0]):
+            out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+            shared = shared_operands(routed_layer)
+            x = hidden_states if rows is None else rows
+            return out + _shared_expert(self.shared_experts.act_fn, x, *shared)
+        if rows is None:
+            return self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        shared_rows = (rows,)
+        if (
+            pieces is not None
+            and len(pieces) == SHARED_ROWS_PIECES
+            and all(isinstance(p, tuple) for p in pieces)
+        ):
+            shared_rows = tuple(pieces)
+        setattr(routed_layer, SHARED_ROWS_ATTR, shared_rows)
+        out = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        setattr(routed_layer, SHARED_ROWS_ATTR, None)
+        return out
 
     def _shared_in_combine(self, num_tokens: int) -> bool:
         """TPU_MINIMAX_M3_SHARED_IN_COMBINE on a step whose layer reduces the

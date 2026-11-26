@@ -109,6 +109,8 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_SP_ATTN_PIECES: bool = False
     TPU_MOE_DENSE_FP4_MAX_TOKENS: int = 16
     TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS: int = 0
+    TPU_MOE_DENSE_FP4_SHARED: bool = False
+    TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -1084,6 +1086,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel too, at both sizes. 0 (default) disables it.
     "TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS": env_nonnegative_int(
         "TPU_MOE_DENSE_FP4_SPARSE_MAX_TOKENS", 0
+    ),
+    # Eligible MoE layers hand their shared expert to the routed experts' op
+    # (layers/adapter/dense_fp4_shared.py): the dense fp4 kernel evaluates it
+    # in the same call, other steps add it with XLA inside the op (inside the
+    # TensorCore combine on TPU_MINIMAX_M3_SHARED_IN_COMBINE's steps). Armed
+    # once after load. Set, TP-MoE ranks take the dense fp4 kernel too.
+    "TPU_MOE_DENSE_FP4_SHARED": env_bool("TPU_MOE_DENSE_FP4_SHARED", default=False),
+    # Steps of at least this many tokens whose MoE reduction the model owns
+    # (MiniMax-M3 SP steps) leave a shared expert armed by
+    # TPU_MOE_DENSE_FP4_SHARED to the model (on the e4m3-gathered rows with
+    # TPU_MINIMAX_M3_SP_E4M3_SHARED, models/minimax_m3/moe.py) instead of the
+    # routed op. 0 keeps it in the routed op at every size.
+    "TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MOE_SHARED_MODEL_SIDE_MIN_TOKENS", 0
     ),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
