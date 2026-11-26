@@ -1697,9 +1697,59 @@ class ScatterRefs:
     num_members: int | tuple[int, ...]
     extra: ExtraRowRefs | None = None
     tail: OwnerTailRefs | None = None
-    # The HBM -> SMEM copies of dest_member and dest_row, started at entry
-    # and waited for before the first row leaves.
+    # (HBM, SMEM, semaphore) of dest_member and dest_row: their routed rows
+    # copy at entry (`PrefixCopy`) and are waited for before the first row
+    # leaves.
     dest_copies: tuple = ()
+
+
+# Most words per chunk of a `PrefixCopy` (a whole tile of a 1-D 32-bit array).
+_PREFIX_CHUNK = 1024
+
+
+@dataclasses.dataclass(frozen=True)
+class PrefixCopy:
+    """Copy of the first `count` words of 1-D `src` (HBM) to `dst` (SMEM), in
+    whole chunks: the routed rows' entries of a whole-group sized table only.
+    HBM -> SMEM copies are slow (~90 KB took ~8 us at entry), and ~120 of the
+    7680 entries are read at the decode shapes."""
+
+    src: Any
+    dst: Any
+    sem: Any
+    count: Any  # int32 scalar, the same at start and wait
+
+    def _chunk(self):
+        # Chunks at whole multiples of their size (aligned slices): the
+        # largest power of two up to _PREFIX_CHUNK that divides the length,
+        # else the whole array.
+        size = self.src.shape[0]
+        chunk = _PREFIX_CHUNK
+        while chunk >= 128 and size % chunk:
+            chunk //= 2
+        return chunk if chunk >= 128 else size
+
+    def _copy(self, c):
+        chunk = self._chunk()
+        begin = c * chunk
+        return pltpu.make_async_copy(
+            self.src.at[pl.ds(begin, chunk)], self.dst.at[pl.ds(begin, chunk)], self.sem
+        )
+
+    def _each(self, op):
+        chunk = self._chunk()
+        lax.fori_loop(
+            0,
+            (self.count + chunk - 1) // chunk,
+            lambda c, carry: (getattr(self._copy(c), op)(), carry)[1],
+            0,
+        )
+
+    def start(self):
+        self._each("start")
+
+    def wait(self):
+        self._each("wait")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1721,8 +1771,6 @@ class WaveRefs:
     # copy has started
     waited: jax.Array
 
-    def scale_copy(self):
-        return pltpu.make_async_copy(self.scale_hbm, self.scale, self.copy_sems.at[1])
 
 
 def _axes(axis, num_members):
@@ -2128,9 +2176,22 @@ def _mlp_kernel(
         for c in copies:
             c.wait()
 
+    # The routed rows: dest_member, dest_row and the wave scales are read
+    # for these only.
+    num_routed = lhs_group_sizes_ref[0]
+    for g in range(1, lhs_group_sizes_ref.shape[0]):
+        num_routed = num_routed + lhs_group_sizes_ref[g]
+    scale_copy = dest_copies = None
+    if wave is not None:
+        scale_copy = PrefixCopy(
+            wave.scale_hbm, wave.scale, wave.copy_sems.at[1], num_routed
+        )
+    if scatter is not None:
+        dest_copies = [PrefixCopy(*c, num_routed) for c in scatter.dest_copies]
+
     if wave is not None:
         # The scales are read from the first tile on.
-        wave.scale_copy().start()
+        scale_copy.start()
         wave.waited[0] = 0
         wave.waited[1] = -1
 
@@ -2144,7 +2205,7 @@ def _mlp_kernel(
         )
         for i in range(5):
             scatter.in_flight[i] = 0
-        for c in scatter.dest_copies:
+        for c in dest_copies:
             c.start()
 
     tiled = dataclasses.replace(up, tiles=dataclasses.replace(up.tiles, tile_m=tile_m))
@@ -2267,7 +2328,7 @@ def _mlp_kernel(
 
         @pl.when(sc.in_flight[4] == 0)
         def _():
-            for c in sc.dest_copies:
+            for c in dest_copies:
                 c.wait()
             pl.semaphore_wait(
                 pltpu.get_barrier_semaphore(), _num_members(sc.num_members)
@@ -2545,7 +2606,7 @@ def _mlp_kernel(
 
                 @pl.when(gm_id == 0)
                 def _():
-                    wave.scale_copy().wait()
+                    scale_copy.wait()
 
             with jax.named_scope("wave_convert"):
                 convert_rows(gm_id)
@@ -2556,7 +2617,7 @@ def _mlp_kernel(
 
         @pl.when(num_gm == 0)
         def _():
-            wave.scale_copy().wait()
+            scale_copy.wait()
 
         # Every wave semaphore ends balanced, the waves of experts without
         # tiles and the sentinels included.
@@ -2932,8 +2993,8 @@ def mlp_scatter_kernel_main(
             dest_member=dest_member,
             dest_row=dest_row,
             dest_copies=(
-                pltpu.make_async_copy(dest_member_hbm, dest_member, dest_sem.at[0]),
-                pltpu.make_async_copy(dest_row_hbm, dest_row, dest_sem.at[0]),
+                (dest_member_hbm, dest_member, dest_sem.at[0]),
+                (dest_row_hbm, dest_row, dest_sem.at[0]),
             ),
             me=me,
             expected=expected,
