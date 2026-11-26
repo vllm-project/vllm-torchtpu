@@ -88,7 +88,6 @@ def _canonical_bits(w):
 
 
 def _gather_kernel(
-    index_ref,
     sizes_ref,
     filled_ref,
     *refs,
@@ -100,8 +99,20 @@ def _gather_kernel(
         scale_ref, *refs = refs
     else:
         scale_ref = None
+    index_hbm, *refs, index_ref, index_sem = refs
+    # The index (one word per route, whole-group sized) copies to SMEM while
+    # the source rows copy to VMEM, instead of before the kernel starts.
+    index_copy = pltpu.make_async_copy(index_hbm, index_ref, index_sem.at[0])
+    index_copy.start()
     _gather_body(
-        index_ref, sizes_ref, filled_ref, scale_ref, *refs, tile=tile, num_rows=num_rows
+        index_ref,
+        sizes_ref,
+        filled_ref,
+        scale_ref,
+        *refs,
+        tile=tile,
+        num_rows=num_rows,
+        index_copy=index_copy,
     )
 
 
@@ -119,6 +130,7 @@ def _gather_body(
     *,
     tile: int,
     num_rows: int,
+    index_copy=None,
 ):
     n = sizes_ref[0]
     for i in range(1, sizes_ref.shape[0]):
@@ -141,8 +153,11 @@ def _gather_body(
         )
 
     pieces = jnp.where(num_tiles > 0, (filled_ref[0] + chunk - 1) // chunk, 0)
-    lax.fori_loop(0, pieces, lambda k, c: (copy(k).start(), c)[1], 0)
-    lax.fori_loop(0, pieces, lambda k, c: (copy(k).wait(), c)[1], 0)
+    with jax.named_scope("gather_copy_in"):
+        lax.fori_loop(0, pieces, lambda k, c: (copy(k).start(), c)[1], 0)
+        lax.fori_loop(0, pieces, lambda k, c: (copy(k).wait(), c)[1], 0)
+        if index_copy is not None:
+            index_copy.wait()
 
     def store(t, slot, size):
         return pltpu.make_async_copy(
@@ -206,7 +221,8 @@ def _gather_body(
         store_op(t, slot, "start")
         return carry
 
-    lax.fori_loop(0, num_tiles, step, 0)
+    with jax.named_scope("gather_rows"):
+        lax.fori_loop(0, num_tiles, step, 0)
 
     @pl.when(num_tiles >= 2)
     def _():
@@ -265,7 +281,8 @@ def gather_rows(src, index, sizes, filled, scale=None, *, tile: int = _GATHER_TI
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     # The kernel copies the rows itself: XLA must not stage them in VMEM.
     src = pltpu.with_memory_space_constraint(src, pltpu.HBM)
-    prefetch = (index, sizes, filled) + ((scale.astype(jnp.float32),) if scaled else ())
+    prefetch = (sizes, filled) + ((scale.astype(jnp.float32),) if scaled else ())
+    index = pltpu.with_memory_space_constraint(index.astype(jnp.int32), pltpu.HBM)
     return pl.pallas_call(
         functools.partial(_gather_kernel, tile=tile, num_rows=num_rows, scaled=scaled),
         # In HBM, where the expert kernel reads it. Left to XLA, the result
@@ -275,13 +292,15 @@ def gather_rows(src, index, sizes, filled, scale=None, *, tile: int = _GATHER_TI
         out_shape=pltpu.HBM((num_rows, hidden), out_dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(prefetch),
-            in_specs=[hbm],
+            in_specs=[hbm, hbm],
             out_specs=hbm,
             scratch_shapes=[
                 pltpu.VMEM((num_src, sub, lanes), src.dtype),
                 pltpu.VMEM((2, tile, hidden), out_dtype),
                 pltpu.SemaphoreType.DMA((1,)),
                 pltpu.SemaphoreType.DMA((2,)),
+                pltpu.SMEM((num_rows,), jnp.int32),
+                pltpu.SemaphoreType.DMA((1,)),
             ],
         ),
         compiler_params=pltpu.CompilerParams(
@@ -289,7 +308,7 @@ def gather_rows(src, index, sizes, filled, scale=None, *, tile: int = _GATHER_TI
         ),
         name=f"row_copy_gather-p_{num_rows}-r_{num_src}-h_{hidden}-t_{tile}"
         + ("-f8" if scaled else ""),
-    )(*prefetch, src)
+    )(*prefetch, index, src)
 
 
 def _send_kernel(
