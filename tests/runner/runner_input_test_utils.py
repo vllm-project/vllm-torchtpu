@@ -86,6 +86,9 @@ def _make_runner(
     runner._pp_is_last = True
     runner._pp_handoff = None
     runner._adaptive_verification = None
+    runner._has_rpa_decode_only_graph = False
+    runner._chunk_is_rpa_decode_only = False
+    runner._dp_step_has_rpa_mixed = False
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,

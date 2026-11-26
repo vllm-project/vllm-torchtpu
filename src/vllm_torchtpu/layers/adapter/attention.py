@@ -541,6 +541,11 @@ def _pallas_rpa_kernel_default_bundled(
     return new_bundle, outputs
 
 
+def _uses_hd64_rpa_kernel(head_size: int) -> bool:
+    """Whether `head_size` is rerouted to the dedicated hd64 RPA kernel."""
+    return head_size == 64
+
+
 def _pallas_rpa_kernel_batched(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -1553,11 +1558,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # of warm-start AOT artifact loading) so forward() never registers a new
         # pallas.jax_op inside Dynamo's fullgraph capture.
         self.rpa_kernel_decode_only = None
-        if (
-            envs.TPU_RPA_DECODE_ONLY_GRAPH
-            and self.head_size != 64
-            and "decode_only" in inspect.signature(self._kernel_entry).parameters
-        ):
+        if envs.TPU_RPA_DECODE_ONLY_GRAPH and self._supports_rpa_decode_only():
             self.rpa_kernel_decode_only = self._build_rpa_kernel(
                 q_scale,
                 k_scale,
@@ -1566,6 +1567,10 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 block_major=self._bm_kernel,
                 decode_only=True,
             )
+
+    def _supports_rpa_decode_only(self) -> bool:
+        """Whether this impl's kernel entry supports the static decode-only op."""
+        return False
 
     def has_rpa_decode_only_kernel(self) -> bool:
         """Return whether this layer pre-built a decode-only batched RPA op."""
@@ -1841,8 +1846,11 @@ class PallasBatchedRPAAttentionBackendImpl(PallasAttentionBackendImpl):
         spec = vllm_config.speculative_config if vllm_config else None
         # Run K + 1 verify tokens in the DECODE stage.
         # head_dim 64 is rerouted to the hd64 kernel.
-        if spec is not None and self.head_size != 64:
+        if spec is not None and not _uses_hd64_rpa_kernel(self.head_size):
             self.decode_query_size = spec.num_speculative_tokens + 1
+
+    def _supports_rpa_decode_only(self) -> bool:
+        return not _uses_hd64_rpa_kernel(self.head_size)
 
 
 @register_backend(AttentionBackendEnum.FLASH_ATTN_MLA)

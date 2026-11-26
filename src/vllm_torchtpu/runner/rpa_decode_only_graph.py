@@ -21,7 +21,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 import vllm.envs as vllm_envs
 from vllm.config import get_layers_from_vllm_config
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.distributed import parallel_state
+from vllm.model_executor.layers.attention import Attention
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
@@ -41,9 +42,7 @@ def _min_top_bucket_across_pp(top_bucket: int, pipeline_parallel_size: int) -> i
     """Agree on a single covering bucket (0 = disabled) across all PP stages."""
     if pipeline_parallel_size <= 1:
         return top_bucket
-    from vllm.distributed.parallel_state import get_pp_group
-
-    return utils.min_over_group(top_bucket, get_pp_group().cpu_group)
+    return utils.min_over_group(top_bucket, parallel_state.get_pp_group().cpu_group)
 
 
 def resolve_decode_only_buckets(
@@ -88,13 +87,10 @@ def resolve_decode_only_buckets(
     elif not token_paddings:
         disable_reason = "no backbone token buckets configured"
     else:
-        layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+        layers = get_layers_from_vllm_config(vllm_config, Attention)
         has_eligible_layer = any(
-            isinstance(
-                (impl := getattr(layer, "impl", None)),
-                PallasAttentionBackendImpl,
-            )
-            and impl.has_rpa_decode_only_kernel()
+            isinstance(layer.impl, PallasAttentionBackendImpl)
+            and layer.impl.has_rpa_decode_only_kernel()
             for layer in layers.values()
         )
         if not has_eligible_layer:

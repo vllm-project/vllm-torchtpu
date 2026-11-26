@@ -564,6 +564,15 @@ MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
 
 
+def _rpa_num_decode_reqs(
+    reorder_batch_threshold: int | None,
+    num_decode_reqs: int,
+    num_windowed_reqs: int,
+) -> int:
+    assert reorder_batch_threshold is not None
+    return num_windowed_reqs if reorder_batch_threshold > 1 else num_decode_reqs
+
+
 def _compute_num_reqs_in_chunk(
     runner: Any,
     start_index: int,
@@ -3481,12 +3490,6 @@ class TPUModelRunner(GPUModelRunner):
             hidden_states, layout_plan, logits_indices
         )
 
-    def _rpa_num_decode_reqs(self, num_decode_reqs: int, num_windowed_reqs: int) -> int:
-        assert self.reorder_batch_threshold is not None
-        return (
-            num_windowed_reqs if self.reorder_batch_threshold > 1 else num_decode_reqs
-        )
-
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3496,8 +3499,8 @@ class TPUModelRunner(GPUModelRunner):
     ):
         if num_windowed_reqs is None:
             num_windowed_reqs = num_decode_reqs
-        rpa_num_decode_reqs = self._rpa_num_decode_reqs(
-            num_decode_reqs, num_windowed_reqs
+        rpa_num_decode_reqs = _rpa_num_decode_reqs(
+            self.reorder_batch_threshold, num_decode_reqs, num_windowed_reqs
         )
         assert scheduler_output.total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
@@ -3856,9 +3859,7 @@ class TPUModelRunner(GPUModelRunner):
             self._request_distribution_cpu[0] = chunk_num_decode
             self._request_distribution_cpu[1] = chunk_static_verify_end
             self._request_distribution_cpu[2] = rd_num_reqs
-            self._chunk_is_rpa_decode_only = bool(
-                self._request_distribution_cpu[0] == self._request_distribution_cpu[2]
-            )
+            self._chunk_is_rpa_decode_only = chunk_num_decode == rd_num_reqs
 
         if (
             can_cache_decode_metadata
@@ -3935,7 +3936,7 @@ class TPUModelRunner(GPUModelRunner):
             combined[0] = chunk_num_decode
             combined[1] = chunk_num_decode
             combined[2] = num_reqs
-            self._chunk_is_rpa_decode_only = bool(combined[0] == combined[2])
+            self._chunk_is_rpa_decode_only = chunk_num_decode == num_reqs
             combined[3] = chunk_num_windowed
             combined[4] = chunk_num_windowed
             combined[5] = num_reqs
@@ -4456,16 +4457,24 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks, local_max_chunk_reqs = self._count_input_chunks(
             scheduler_output
         )
-        rpa_num_decode_reqs_step = self._rpa_num_decode_reqs(
-            num_decode_reqs, num_windowed_reqs
-        )
-        # `_readmit_trimmed_drafts` runs after `_dp_coordinated_step` and, when
-        # `reorder_batch_threshold == 1`, turns 1-token decodes into mixed rows;
-        # force mixed across DP ranks in that case so all ranks stay in lockstep.
-        local_has_rpa_mixed = rpa_num_decode_reqs_step < self.input_batch.num_reqs or (
-            self._adaptive_verification is not None
-            and (self.reorder_batch_threshold or 1) == 1
-        )
+        if self._has_rpa_decode_only_graph:
+            rpa_num_decode_reqs_step = _rpa_num_decode_reqs(
+                self.reorder_batch_threshold, num_decode_reqs, num_windowed_reqs
+            )
+            # Keep every EP-lockstep DP rank on the exact same compiled program
+            # (avoiding cross-executable collective scheduling/fusion divergence
+            # when another DP rank executes mixed/prefill). Also force mixed
+            # when `_readmit_trimmed_drafts` can turn 1-token decodes into mixed
+            # rows after `_dp_coordinated_step`.
+            local_has_rpa_mixed = (
+                rpa_num_decode_reqs_step < self.input_batch.num_reqs
+                or (
+                    self._adaptive_verification is not None
+                    and self.reorder_batch_threshold == 1
+                )
+            )
+        else:
+            local_has_rpa_mixed = False
         self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
             scheduler_output.total_num_scheduled_tokens,
             local_num_chunks,

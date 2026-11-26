@@ -15,16 +15,23 @@
 
 Covers:
 - batched RPA wrapper JAXPR (`decode_only=True` omits `RPAm` and keeps aliasing);
-- `PallasAttentionBackendImpl` decode-only op pre-build, dispatch, and invalidation;
+- `PallasAttentionBackendImpl` decode-only op pre-build, forwarding, dispatch,
+  and invalidation;
 - `PiecewiseBackend` patch registration and decode-only overlay dispatch;
-- runner bucket planning, self-disable guards, PP agreement, and DP lockstep.
+- runner bucket planning, self-disable guards, `_prepare_inputs` / `execute_model`
+  decode-only gate (with mamba on/off and DP mixed override), PP agreement, and
+  DP lockstep propagation.
 
 Reference-backed TPU functional coverage for `decode_only=True` lives in
 `tests/kernels/experimental/batched_rpa/correctness_test.py`, and cold/warm
-two-pass precompile pipeline coverage lives in
-`tests/compilation/test_shape_variants.py`.
+two-pass precompile pipeline coverage (both serial and `trace_first=True`) lives
+in `tests/compilation/test_shape_variants.py`.
 """
 
+import contextlib
+import functools
+import types
+import weakref
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest import mock
@@ -35,6 +42,7 @@ import jax.numpy as jnp
 import pytest
 import torch
 from jax.experimental.pallas import tpu as pltpu
+from runner_input_test_utils import _make_runner, _scheduler_output
 from vllm.compilation.piecewise_backend import PiecewiseBackend
 from vllm.distributed import parallel_state
 
@@ -48,9 +56,10 @@ from vllm_torchtpu.layers.adapter.attention import (
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    is_rpa_decode_only_active,
     set_vllm_model_wrapper_context,
 )
-from vllm_torchtpu.runner import rpa_decode_only_graph
+from vllm_torchtpu.runner import rpa_decode_only_graph, tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner, _get_padded_token_len
 
 _TPU_7X_INFO = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
@@ -146,7 +155,7 @@ def test_wrapper_decode_only_omits_mixed_and_preserves_aliasing(kv_layout, retur
 
 
 # ---------------------------------------------------------------------------
-# 2. Attention adapter: pre-build, forward dispatch, invalidation, eligibility
+# 2. Attention adapter: pre-build, forwarding, dispatch, invalidation
 # ---------------------------------------------------------------------------
 
 
@@ -171,8 +180,9 @@ def _install_fake_jax_op(monkeypatch: pytest.MonkeyPatch):
         calls: list[Any] = []
 
         def _invoke(kv_cache: torch.Tensor, query: torch.Tensor, *args, **kw):
+            del kv_cache, args, kw
             calls.append((op_name, query.shape))
-            return kv_cache.clone(), torch.zeros_like(query)
+            return torch.zeros_like(query)
 
         op = MagicMock(side_effect=_invoke)
         built.append((op_name, fn, calls))
@@ -198,6 +208,53 @@ def _dummy_forward_args(num_tokens: int = 16, head_size: int = 128):
         request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
     )
     return q, k, v, kv_cache, md
+
+
+@pytest.mark.parametrize("decode_only", [False, True])
+@pytest.mark.parametrize("decode_query_size", [1, 4])
+def test_pallas_rpa_kernel_batched_forwards_decode_only(
+    monkeypatch: pytest.MonkeyPatch, decode_only: bool, decode_query_size: int
+):
+    """_pallas_rpa_kernel_batched binds decode_only onto rpa_func when True."""
+    captured: dict[str, Any] = {}
+
+    def _fake_impl(*args, **kwargs):
+        captured["rpa_func"] = kwargs["rpa_func"]
+        return ("out", "kv")
+
+    monkeypatch.setattr(attn_module, "_pallas_rpa_kernel_impl", _fake_impl)
+    dummy = cast(Any, None)
+    attn_module._pallas_rpa_kernel_batched(
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        dummy,
+        None,
+        None,
+        None,
+        None,
+        mesh=dummy,
+        sliding_window=None,
+        skip_kv_update=False,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        decode_query_size=decode_query_size,
+        decode_only=decode_only,
+    )
+    rpa_func = captured["rpa_func"]
+    if decode_only or decode_query_size > 1:
+        assert isinstance(rpa_func, functools.partial)
+        assert rpa_func.func is attn_module.ragged_paged_attention_batched
+        assert rpa_func.keywords.get("decode_only", False) is decode_only
+        if decode_query_size > 1:
+            assert rpa_func.keywords["decode_query_size"] == decode_query_size
+        else:
+            assert "decode_query_size" not in rpa_func.keywords
+    else:
+        assert rpa_func is attn_module.ragged_paged_attention_batched
 
 
 def test_initialize_kernel_prebuilds_decode_only_op_and_forward_reuses_it(
@@ -362,63 +419,67 @@ def test_default_impl_build_rpa_kernel_rejects_decode_only(
 # ---------------------------------------------------------------------------
 
 
+class _FakePiecewiseBackend:
+    """Weak-referenceable stand-in matching PiecewiseBackend's dispatch fields."""
+
+    def __init__(self, *, sym_shape_indices: list[int], sizes: tuple[int, ...]):
+        self.sym_shape_indices = sym_shape_indices
+        self.range_entries = {
+            n: SimpleNamespace(
+                compiled=True,
+                compile_range=SimpleNamespace(
+                    start=n, end=n, is_single_size=lambda: True
+                ),
+                runnable=lambda *a, n=n, **k: n,
+            )
+            for n in sizes
+        }
+        self.compile_sizes = list(sizes)
+        self.compile_ranges = [(n, n) for n in sizes]
+        self._find_range_for_shape = self.range_entries.get
+
+
 def _patched_piecewise_backend(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(PiecewiseBackend, "__init__", PiecewiseBackend.__init__)
     monkeypatch.setattr(PiecewiseBackend, "__call__", PiecewiseBackend.__call__)
+    monkeypatch.setattr(
+        shape_variants, "_decode_only_runnables", weakref.WeakKeyDictionary()
+    )
     _patch_vllm_piecewise_backend()
 
 
+@pytest.mark.parametrize("sym_shape_indices", [[], [0]])
 def test_piecewise_backend_decode_only_overlay_dispatch_and_fallback(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, sym_shape_indices: list[int]
 ):
-    """Decode-only overlay dispatches attached buckets and falls back otherwise."""
+    """Decode-only overlay dispatches attached buckets for both tensor and SymInt."""
     _patched_piecewise_backend(monkeypatch)
-    entries = {
-        n: SimpleNamespace(
-            compiled=True,
-            compile_range=SimpleNamespace(start=n, end=n, is_single_size=lambda: True),
-            runnable=lambda *a, n=n, **k: n,
-        )
-        for n in (16, 128)
-    }
-    backend = SimpleNamespace(
-        sym_shape_indices=[],
-        range_entries=entries,
-        compile_sizes=[16, 128],
-        compile_ranges=[(16, 16), (128, 128)],
-        _find_range_for_shape=entries.get,
-        _tpu_decode_only_runnables={16: lambda *a, **k: "decode_16"},
+    backend = _FakePiecewiseBackend(
+        sym_shape_indices=sym_shape_indices, sizes=(16, 128)
     )
+    shape_variants._decode_only_runnables[backend] = {
+        16: lambda *a, **k: "decode_16",
+    }
 
-    assert PiecewiseBackend.__call__(backend, torch.zeros(16, 4)) == 16
+    def _call(b: Any, n: int):
+        if sym_shape_indices:
+            return PiecewiseBackend.__call__(b, n, torch.zeros(n, 4))
+        return PiecewiseBackend.__call__(b, torch.zeros(n, 4))
+
+    assert _call(backend, 16) == 16
     with set_vllm_model_wrapper_context(mesh=cast(Any, None), rpa_decode_only=True):
-        assert PiecewiseBackend.__call__(backend, torch.zeros(16, 4)) == "decode_16"
+        assert _call(backend, 16) == "decode_16"
         # Bucket without a decode-only entry falls back to the mixed runnable.
-        assert PiecewiseBackend.__call__(backend, torch.zeros(128, 4)) == 128
+        assert _call(backend, 128) == 128
         with set_vllm_model_wrapper_context(
             mesh=cast(Any, None), rpa_decode_only=False
         ):
-            assert PiecewiseBackend.__call__(backend, torch.zeros(16, 4)) == 16
+            assert _call(backend, 16) == 16
 
     # Single-bucket backend also dispatches decode-only when attached.
-    single_entry = {
-        32: SimpleNamespace(
-            compiled=True,
-            compile_range=SimpleNamespace(
-                start=32, end=32, is_single_size=lambda: True
-            ),
-            runnable=lambda *a, **k: "mixed_32",
-        )
-    }
-    single = SimpleNamespace(
-        sym_shape_indices=[],
-        range_entries=single_entry,
-        compile_sizes=[32],
-        compile_ranges=[(32, 32)],
-        _find_range_for_shape=single_entry.get,
-        _tpu_decode_only_runnables={32: lambda *a, **k: "decode_32"},
-    )
-    assert PiecewiseBackend.__call__(single, torch.zeros(32, 4)) == "mixed_32"
+    single = _FakePiecewiseBackend(sym_shape_indices=[], sizes=(32,))
+    shape_variants._decode_only_runnables[single] = {32: lambda *a, **k: "decode_32"}
+    assert PiecewiseBackend.__call__(single, torch.zeros(32, 4)) == 32
     with set_vllm_model_wrapper_context(mesh=cast(Any, None), rpa_decode_only=True):
         assert PiecewiseBackend.__call__(single, torch.zeros(32, 4)) == "decode_32"
 
@@ -443,7 +504,7 @@ def test_piecewise_backend_init_registers_in_shape_variants_session(
 
 
 # ---------------------------------------------------------------------------
-# 4. Runner bucket planning, self-disable guards, PP and DP agreement
+# 4. Runner bucket planning, self-disable guards, runtime gate, PP & DP
 # ---------------------------------------------------------------------------
 
 
@@ -601,3 +662,116 @@ def test_dp_coordinated_step_propagates_rpa_mixed(monkeypatch, mixed_ranks, expe
     for rank, runner in enumerate(runners):
         _run_rank(rank, runner, lambda t, op=None, group=None: t.copy_(reduced))
     assert [runner._dp_step_has_rpa_mixed for runner in runners] == expected
+
+
+@pytest.mark.parametrize(
+    (
+        "scheduled",
+        "computed",
+        "prompts",
+        "hybrid",
+        "dp_step_mixed",
+        "adaptive_verif",
+        "expect_local_mixed",
+        "expect_chunk_decode_only",
+        "expect_ctx_decode_only",
+    ),
+    [
+        # Pure decode, non-mamba -> decode-only graph active.
+        ([1, 1], [8, 8], [8, 8], False, False, False, False, True, True),
+        # Pure decode, mamba combined-distribution path -> decode-only graph active.
+        ([1, 1], [8, 8], [8, 8], True, False, False, False, True, True),
+        # Mixed chunk (1 decode + 1 prefill), non-mamba -> mixed graph.
+        ([1, 4], [8, 0], [8, 4], False, False, False, True, False, False),
+        # Mixed chunk, mamba combined-distribution path -> mixed graph.
+        ([1, 4], [8, 0], [8, 4], True, False, False, True, False, False),
+        # Pure decode locally, but a DP peer has mixed work -> mixed graph.
+        ([1, 1], [8, 8], [8, 8], False, True, False, False, True, False),
+        # Adaptive verification with threshold=1 forces local_has_rpa_mixed=True.
+        ([1, 1], [8, 8], [8, 8], False, True, True, True, True, False),
+    ],
+)
+def test_execute_model_rpa_decode_only_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduled: list[int],
+    computed: list[int],
+    prompts: list[int],
+    hybrid: bool,
+    dp_step_mixed: bool,
+    adaptive_verif: bool,
+    expect_local_mixed: bool,
+    expect_chunk_decode_only: bool,
+    expect_ctx_decode_only: bool,
+):
+    """execute_model + _prepare_inputs gate rpa_decode_only on chunk & DP state."""
+
+    class _StopAfterForward(Exception):
+        pass
+
+    runner = _make_runner(
+        num_computed_tokens=computed,
+        prompt_tokens=prompts,
+        scheduled_tokens=scheduled,
+        token_paddings=[16],
+        max_num_reqs=4,
+        pcp_size=1,
+    )
+    runner._has_rpa_decode_only_graph = True
+    runner._adaptive_verification = object() if adaptive_verif else None
+    if hybrid:
+        runner.mamba_slot_read_offsets = torch.zeros(8, dtype=torch.int32)
+        runner._combined_request_distribution_cpu = torch.zeros(6, dtype=torch.int32)
+
+    recorded_local_mixed: list[bool] = []
+    recorded_ctx_decode_only: list[bool] = []
+
+    def _dp_step(*_args, local_has_rpa_mixed: bool = False, **_kwargs):
+        recorded_local_mixed.append(local_has_rpa_mixed)
+        runner._dp_step_has_rpa_mixed = dp_step_mixed
+        return None, 1
+
+    def _capture_forward(**_kwargs):
+        recorded_ctx_decode_only.append(is_rpa_decode_only_active())
+        raise _StopAfterForward
+
+    runner.execute_model_state = None
+    runner._update_states = lambda _so: None
+    runner._reorder_batch_for_rpa = types.MethodType(
+        TPUModelRunner._reorder_batch_for_rpa, runner
+    )
+    runner._count_input_chunks = lambda _so: (1, len(scheduled))
+    runner._any_decode = lambda _so: True
+    runner._dp_local_prompt_logprob_rows = lambda _so: 0
+    runner._dp_coordinated_step = _dp_step
+    runner._readmit_trimmed_drafts = lambda *_a: None
+    runner.phase_based_profiler = None
+    runner._is_async_drafter = False
+    runner._greedy_top_tokens_this_step = lambda: False
+    runner.maybe_setup_kv_connector = lambda *_a, **_kw: None
+    runner._prepare_inputs = types.MethodType(TPUModelRunner._prepare_inputs, runner)
+    runner._flush_mamba_state_seed_copies = lambda: None
+    runner._reset_read_offsets_for_new_requests = lambda *_a: None
+    runner._record_input_staging_fence = lambda: None
+    runner.input_ids = torch.zeros(16, dtype=torch.int32)
+    runner.position_ids = torch.zeros(16, dtype=torch.int32)
+    runner._apply_async_token_substitution = lambda ids, *_a: ids
+    runner._get_model_inputs = lambda ids, _mm: (ids, None)
+    runner._token_padding_update = lambda _n: None
+    runner._dp_num_tokens_across_dp = lambda _n: None
+    runner._stage_timing.stage.return_value = contextlib.nullcontext()
+    runner.forward_model = _capture_forward
+
+    monkeypatch.setattr(tpu_runner, "has_kv_transfer_group", lambda: False)
+    monkeypatch.setattr(
+        tpu_runner,
+        "set_forward_context",
+        lambda *_a, **_kw: contextlib.nullcontext(),
+    )
+
+    sched = _scheduler_output(scheduled)
+    with pytest.raises(_StopAfterForward):
+        TPUModelRunner.execute_model(runner, sched)
+
+    assert recorded_local_mixed == [expect_local_mixed]
+    assert runner._chunk_is_rpa_decode_only is expect_chunk_decode_only
+    assert recorded_ctx_decode_only == [expect_ctx_decode_only]

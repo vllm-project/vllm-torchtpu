@@ -1646,10 +1646,6 @@ def _patch_vllm_reset_compile_wrapper() -> None:
     )
 
 
-def _mark_patched(fn: object, sentinel: str) -> None:
-    setattr(fn, sentinel, True)
-
-
 def _patch_vllm_piecewise_backend() -> None:
     """Register PiecewiseBackends for variant warmup and patch bucket dispatch.
 
@@ -1666,13 +1662,13 @@ def _patch_vllm_piecewise_backend() -> None:
     from vllm_torchtpu.compilation import shape_variants
 
     original_init = PiecewiseBackend.__init__
-    if not getattr(original_init, "_tpu_piecewise_backend_init_patch", False):
+    if not original_init.__dict__.get("_tpu_piecewise_backend_init_patch", False):
 
         def patched_init(self, *args, **kwargs):
             original_init(self, *args, **kwargs)
             shape_variants.register_backend(self)
 
-        _mark_patched(patched_init, "_tpu_piecewise_backend_init_patch")
+        patched_init.__dict__["_tpu_piecewise_backend_init_patch"] = True
         PiecewiseBackend.__init__ = patched_init
 
     original_call = PiecewiseBackend.__call__

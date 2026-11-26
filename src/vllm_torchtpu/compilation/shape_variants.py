@@ -29,13 +29,13 @@ to build only the buckets its guards accept, and a bucket it refuses is compiled
 by a later trace and handed back through :class:`BucketExecutables`. The graph
 that stays live therefore ends up with one executable per bucket.
 
-Nothing here runs at serving time for standard shape specialization: dispatch
-stays vLLM's own (``PiecewiseBackend.__call__`` picks
-``range_entries[Range(n, n)].runnable``), and each bucket is compiled once.
-An opt-in variant overlay (``TPU_RPA_DECODE_ONLY_GRAPH=1``) may additionally
-attach a second, decode-only executable onto decode-sized buckets (dispatched
-via :func:`decode_only_runnable` when the wrapper context requests it), which
-adds one TPU program region per covered decode bucket.
+Standard shape specialization does no serving-time dispatch: vLLM's own
+``PiecewiseBackend.__call__`` picks ``range_entries[Range(n, n)].runnable``,
+and each bucket is compiled once. When the opt-in decode-only overlay
+(``TPU_RPA_DECODE_ONLY_GRAPH=1``) is attached to decode-sized buckets,
+:func:`decode_only_runnable` checks at serving dispatch whether the active
+wrapper context requests the decode-only executable for that bucket, adding
+one TPU program region per covered decode bucket.
 Only the Dynamo traces multiply, by one per structurally distinct group.
 
 The partition follows from the guards alone, so every DP/TP rank derives the
@@ -48,14 +48,18 @@ ShapeEnv, vLLM drops that guard, and nothing here can see it.
 from __future__ import annotations
 
 import contextlib
+import weakref
 from collections.abc import Callable, Iterator, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import sympy
 import torch
 import torch.fx as fx
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    is_rpa_decode_only_active,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -356,7 +360,7 @@ def attach_decode_only_runnables(
             per_size[size] = runnable
             attached += 1
         if per_size:
-            backend._tpu_decode_only_runnables = per_size
+            _decode_only_runnables[backend] = per_size
     if attached != len(decode_runnables):
         raise ShapeSpecializationError(
             f"attached {attached} decode-only entries out of "
@@ -365,20 +369,22 @@ def attach_decode_only_runnables(
     return attached
 
 
+_decode_only_runnables: weakref.WeakKeyDictionary[
+    Any, dict[int, Callable[..., Any]]
+] = weakref.WeakKeyDictionary()
+_base_compile_prefixes: weakref.WeakKeyDictionary[torch.nn.Module, str] = (
+    weakref.WeakKeyDictionary()
+)
+
+
 def decode_only_runnable(
     backend: Any, runtime_shape: int | None
 ) -> Callable[..., Any] | None:
     """Return `backend`'s decode-only runnable for `runtime_shape` when active."""
-    if runtime_shape is None:
+    if runtime_shape is None or not _decode_only_runnables:
         return None
-    decode_runnables = getattr(backend, "_tpu_decode_only_runnables", None)
-    if decode_runnables is None:
-        return None
-    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-        is_rpa_decode_only_active,
-    )
-
-    if not is_rpa_decode_only_active():
+    decode_runnables = _decode_only_runnables.get(backend)
+    if decode_runnables is None or not is_rpa_decode_only_active():
         return None
     return decode_runnables.get(runtime_shape)
 
@@ -496,13 +502,14 @@ def retrace(
     )
     for wrapper in wrappers:
         wrapper.cleanup()  # drop its bytecode hook before replacing it
-        base_prefix = getattr(
-            wrapper, "_tpu_base_compile_prefix", wrapper._compile_prefix
-        )
-        wrapper._tpu_base_compile_prefix = base_prefix
-        wrapper._compile_prefix = (
-            f"{base_prefix}{prefix_suffix}" if prefix_suffix else base_prefix
-        )
+        if prefix_suffix or wrapper in _base_compile_prefixes:
+            wrapper_any = cast(Any, wrapper)
+            base_prefix = _base_compile_prefixes.setdefault(
+                wrapper, cast(str, wrapper_any._compile_prefix)
+            )
+            wrapper_any._compile_prefix = (
+                f"{base_prefix}{prefix_suffix}" if prefix_suffix else base_prefix
+            )
 
     # reset_compile_wrapper blanks the cache dirs, which the next backend call
     # recomputes from the files Dynamo inlined -- a trace that inlines a

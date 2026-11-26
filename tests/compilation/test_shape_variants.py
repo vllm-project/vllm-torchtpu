@@ -720,13 +720,23 @@ def test_precompile_backbone_trace_first_env_guards(
             assert compiled_batches == []
 
 
-def _decode_only_two_pass(cache_root, expect_warm: bool):
+def _decode_only_two_pass(cache_root, expect_warm: bool, trace_first: bool):
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
         set_vllm_model_wrapper_context,
     )
     from vllm_torchtpu.runner import rpa_decode_only_graph
 
+    if trace_first:
+        os.environ.update(
+            TPU_PARALLEL_PRECOMPILE="1",
+            TPU_PRECOMPILE_BIGGEST_FIRST="0",
+            TPU_PRECOMPILE_PEER_REPLAY="0",
+            LOCAL_RANK="0",
+        )
     config, backend = prepare(cache_root)
+    vllm_torchtpu._patch_vllm_piecewise_backend()
+    if trace_first:
+        vllm_torchtpu._patch_vllm_compile_all_ranges()
     model = build(DecodeOnlyModel, config)
     decode_buckets = [BUCKETS[0]]
 
@@ -747,14 +757,27 @@ def _decode_only_two_pass(cache_root, expect_warm: bool):
         prefix_suffix: str = "",
         rpa_decode_only: bool = False,
     ) -> shape_variants.BucketExecutables:
-        del trace_first
         with shape_variants.warmup(
             allowed_sizes=allowed_sizes, cache_tag=cache_tag
         ) as session:
-            for size in token_paddings:
-                if session.needs_retrace(size):
-                    shape_variants.retrace(model, config, prefix_suffix=prefix_suffix)
-                run_variant(size, rpa_decode_only=rpa_decode_only)
+            if trace_first:
+                with shape_variants.trace_only() as deferred:
+                    for size in token_paddings:
+                        if session.needs_retrace(size):
+                            shape_variants.retrace(
+                                model, config, prefix_suffix=prefix_suffix
+                            )
+                        run_variant(size, rpa_decode_only=rpa_decode_only)
+                deferred.compile()
+                for size in token_paddings:
+                    run_variant(size, rpa_decode_only=rpa_decode_only)
+            else:
+                for size in token_paddings:
+                    if session.needs_retrace(size):
+                        shape_variants.retrace(
+                            model, config, prefix_suffix=prefix_suffix
+                        )
+                    run_variant(size, rpa_decode_only=rpa_decode_only)
         return session
 
     with set_current_vllm_config(config):
@@ -762,10 +785,10 @@ def _decode_only_two_pass(cache_root, expect_warm: bool):
             model=model,
             vllm_config=config,
             decode_buckets=decode_buckets,
-            trace_first=False,
+            trace_first=trace_first,
             run_pass=run_pass,
         )
-        mixed_session = run_pass(BUCKETS, trace_first=False)
+        mixed_session = run_pass(BUCKETS, trace_first=trace_first)
 
     attached = shape_variants.attach_decode_only_runnables(
         mixed_session, decode_runnables
@@ -793,7 +816,8 @@ def _decode_only_two_pass(cache_root, expect_warm: bool):
     ] == CALLS
 
 
-def test_decode_only_graph_two_pass_cold_and_warm(tmp_path):
+@pytest.mark.parametrize("trace_first", [False, True])
+def test_decode_only_graph_two_pass_cold_and_warm(tmp_path, trace_first):
     """Real vLLM pipeline compiles, caches, reloads, and dispatches decode-only."""
-    in_child(partial(_decode_only_two_pass, str(tmp_path), False))
-    in_child(partial(_decode_only_two_pass, str(tmp_path), True))
+    in_child(partial(_decode_only_two_pass, str(tmp_path), False, trace_first))
+    in_child(partial(_decode_only_two_pass, str(tmp_path), True, trace_first))

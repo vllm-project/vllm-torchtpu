@@ -1091,9 +1091,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # batched RPA RpaCase.MIXED / RPAm schedule and kernel launch while
     # preserving kv_cache input-output aliasing) for pure-decode token buckets
     # when using --attention-backend CUSTOM. Off by default because each decode
-    # bucket holds a second compiled program in HBM and adds precompile time;
-    # flip default or remove once TPU A/B benchmarks against the always-on
-    # in-kernel empty-step skip settle the net decode-vs-HBM tradeoff.
+    # bucket holds a second compiled program in HBM and adds precompile time.
+    # Raises with VLLM_USE_MEGA_AOT_ARTIFACT=1; self-disables with a warning
+    # under enforce_eager, TPU_KERNEL_ITER_MODE=1, PCP, block-major KV bundles,
+    # or models with no eligible batched-RPA layers.
     "TPU_RPA_DECODE_ONLY_GRAPH": env_bool("TPU_RPA_DECODE_ONLY_GRAPH"),
     # Enables the block-major KV cache layout for Raiden offloading. Bundles all
     # attention layer fragments into a single contiguous array in HBM, collapsing
