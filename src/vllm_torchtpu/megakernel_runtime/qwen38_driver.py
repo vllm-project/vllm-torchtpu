@@ -874,6 +874,7 @@ class Qwen38SegmentDriver:
             from . import qwen38_wholestep_call
 
             qwen38_wholestep_call.UNION_PHYS = True
+            logger.info_once("MK wholephys active: union ids -> physical pages")
         keymp = _parse_int(raw, "wholekeymp")
         auto_slots = "wholekeyslots=auto" in raw.split(",")
         keyslots = None if auto_slots else _parse_int(raw, "wholekeyslots")
