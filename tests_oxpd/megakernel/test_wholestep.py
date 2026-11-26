@@ -673,7 +673,7 @@ def test_union_attention_matches_per_row(monkeypatch):
     close(_run_c(long=True, rank_ids=True, union=True, shard=True))
     orig = ua.compact_union
 
-    def broken(code, KU, consts):  # noqa: ANN001
+    def broken(code, KU, consts, **kw):  # noqa: ANN001
         ids, codes, n = orig(code, KU, consts)
         return ids, codes | 1, n
 
