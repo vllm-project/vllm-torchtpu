@@ -171,6 +171,14 @@ def test_hier_reduce_scatter_on_real_collectives(tmp_path, wire):
         cwd=REPO_ROOT,
         timeout=LAUNCH_TIMEOUT_SECONDS,
     )
+    # Rank 0's timings, also on success: how close the launch came to timing out.
+    print(
+        "".join(
+            f"\n  {line}"
+            for line in completed.stdout.splitlines()
+            if line.startswith("rank 0:")
+        )
+    )
     results = read_worker_results(result_dir, WORLD_SIZE, completed)
     for r in results:
         check = r["check"]

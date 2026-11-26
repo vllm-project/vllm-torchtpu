@@ -162,7 +162,10 @@ def launch_torchrun_workers(
     try:
         output, _ = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        # Bytes even in text mode: the partial output is not decoded.
         output = exc.output or ""
+        if isinstance(output, bytes):
+            output = output.decode(errors="replace")
     finally:
         # Also on pytest's own timeout, which raises out of communicate(): the
         # workers run in their own session and would keep holding the chips.
