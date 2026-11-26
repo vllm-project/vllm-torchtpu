@@ -121,7 +121,7 @@ class GDNModule(Module):
             opts["gate"] = self.gate
         if weight_dtypes is not None:
             opts["weight_dtypes"] = self.weight_dtypes
-        self._validate_options(opts)
+        self._validate_options(opts)  # kept to match GQAModule
         self.options = FrozenDict(opts)
 
     @classmethod
@@ -138,7 +138,7 @@ class GDNModule(Module):
         g_gate = _geom_gate(g if g is not None else self.geometry)
         return validate_gdn_gate(g_gate) if g_gate is not None else self.gate
 
-    def conv_dtype(self, g: Any = None) -> Any:
+    def conv_dtype(self, g: Any) -> Any:
         """Pooled conv window dtype (`pool_layout.conv_dtype` when bound)."""
         if self.pool_layout is not None:
             return self.pool_layout.conv_dtype

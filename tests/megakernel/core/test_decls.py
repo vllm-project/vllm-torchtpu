@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 
+from tests.megakernel.core.megakernel_fakes import FakeGeometry
 from vllm_torchtpu.megakernel.core.decls import (
     REQUIRED,
     FrozenDict,
@@ -35,6 +36,14 @@ from vllm_torchtpu.megakernel.core.decls import (
     VLLMAlias,
     apply_decl_overrides,
     combined_hf_param_shapes,
+)
+from vllm_torchtpu.megakernel.core.derive import instantiate_spec_module
+from vllm_torchtpu.megakernel.core.modules import (
+    EmbeddingModule,
+    GDNModule,
+    GQAModule,
+    MoEModule,
+    NormModule,
 )
 from vllm_torchtpu.megakernel.core.ops import BF16, F32, FP8
 from vllm_torchtpu.megakernel.core.spec import Module
@@ -349,16 +358,6 @@ def test_rename_transforms_validation_and_reference_lookup():
 
 def test_builtin_modules_options_consistent_across_init_bind_and_instantiate():
     """All built-in `Module`s normalize `.options` identically across entry points."""
-    from tests.megakernel.core.megakernel_fakes import FakeGeometry
-    from vllm_torchtpu.megakernel.core.derive import instantiate_spec_module
-    from vllm_torchtpu.megakernel.core.modules import (
-        EmbeddingModule,
-        GDNModule,
-        GQAModule,
-        MoEModule,
-        NormModule,
-    )
-
     hf_cfg = {
         "vocab_size": 1024,
         "hidden_size": 256,
@@ -414,3 +413,17 @@ def test_builtin_modules_options_consistent_across_init_bind_and_instantiate():
             == b_wd.to_module(hf_cfg).options
             == instantiate_spec_module(b_wd, g=g).options
         )
+
+    # A non-default GDN gate from the geometry / HF config is recorded the same
+    # way as an explicit one.
+    b_gate = GDNModule.bind("linear_attn")
+    res_gate = b_gate.resolve(hf_cfg | {"gdn_gate": "sigmoid"})
+    g_gate = FakeGeometry(L=2, att_every=2, H=256, gdn_gate="sigmoid")
+    m_geom_gate = GDNModule(prefix="linear_attn", geometry=g_gate)
+    m_from_res_gate = b_gate.to_module(hf_cfg | {"gdn_gate": "sigmoid"})
+    assert (
+        m_geom_gate.options
+        == res_gate.options
+        == m_from_res_gate.options
+        == {"gate": "sigmoid"}
+    )
