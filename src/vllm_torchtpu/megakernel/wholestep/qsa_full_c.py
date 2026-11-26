@@ -196,11 +196,12 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ScratchReq("qc_irq", pltpu.VMEM((nreq, ex.T, ix.IDX_DIM), F32)),
             ScratchReq("qc_kvq", pltpu.VMEM((nreq, ex.T, 2 * g.HD), F32)),
         ] if self.loop_requests else []) + ([
-            # `xreq_loads`: the request loop's loads, banked by request parity (q mod 2).
-            ScratchReq("qx_ring", pltpu.VMEM((2, 8, ix.IDX_DIM), BF16)),
-            ScratchReq("qx_rope", pltpu.VMEM((2, 1, 128), F32)),
-            ScratchReq("qx_old", pltpu.VMEM((2, MICRO, 1, 4, 256), f8)),
-            ScratchReq("qx_sem", pltpu.SemaphoreType.DMA((6,))),
+            # `xreq_loads`: the request loop's loads, one bank per request, all issued
+            # before the loop.
+            ScratchReq("qx_ring", pltpu.VMEM((nreq, 8, ix.IDX_DIM), BF16)),
+            ScratchReq("qx_rope", pltpu.VMEM((nreq, 1, 128), F32)),
+            ScratchReq("qx_old", pltpu.VMEM((nreq, MICRO, 1, 4, 256), f8)),
+            ScratchReq("qx_sem", pltpu.SemaphoreType.DMA((3 * nreq,))),
         ] if self.xreq_loads else []) + ([
             # `early_loads` with the request loop's async DMAs: each request's completed key
             # and ring rows keep their own slot until the loop's end (`_store_waits`).
@@ -773,6 +774,15 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         qb = self.tab_base(ctx, l) + q
         return self.tables(ctx)[1][qb, ga >> cshift] * per_page + (ga & (per_page - 1))
 
+    def _issue_xreq_loads(self, ctx: Any, l: Any, n_loop: Any) -> None:  # noqa: E741
+        """Start every live request's `xreq_loads`, request `q` into bank `q`."""
+        for q in range(ctx.ex.MB // ctx.ex.T):
+
+            @pl.when(q < n_loop)
+            def _(q=q):
+                for cp in self._xreq_loads(ctx, l, q, q):
+                    cp.start()
+
     def _xreq_loads(self, ctx: Any, l: Any, q: Any, bank: Any) -> list:
         """`xreq_loads`: request `q`'s loads of the request loop (raw ring row, RoPE row for
         `_new_group`; `g_a`'s pool rows for `_recent_tile`) into `bank`."""
@@ -1171,18 +1181,8 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
 
             xl = self.xreq_loads
 
-            def issue_loads(q: Any, b: Any) -> None:
-                for cp in self._xreq_loads(ctx, l, q, b):
-                    cp.start()
-
             def req(q: Any, carry: Any) -> Any:
-                bank = jax.lax.rem(q, 2) if xl else None
-                if xl:  # the next request's loads go out before this request's work
-
-                    @pl.when(q + 1 < n_loop)
-                    def _():
-                        issue_loads(jnp.minimum(q + 1, nreq - 1), 1 - bank)
-
+                bank = q if xl else None
                 ck, gc = self._new_group(ctx, l, q, scr["qc_irq"][q], bank)
 
                 def own() -> None:
@@ -1203,10 +1203,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                 return carry
 
             if xl and not self._early_now:  # else issued in `_early_loads`
-
-                @pl.when(n_loop > 0)
-                def _():
-                    issue_loads(0, 0)
+                self._issue_xreq_loads(ctx, l, n_loop)
 
             self._late_stores = self._early_now and self.async_dma
             jax.lax.fori_loop(0, n_loop, req, 0)
@@ -1813,21 +1810,17 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
     @_scoped("qsa_early")
     def _early_loads(self, ctx: Any, l: Any) -> None:  # noqa: E741
         """Wait for the table rows `prefetch` copied, then issue the request loop's first
-        loads: request 0's `xreq_loads` (bank 0), the union attention's main-table rows
-        (`union_phys`) and this rank's first owned request's key chunks 0..KS-2 (ring slots
-        0..KS-2: its stream starts the layer, `first`), as the loop, `_attend_unions` and
-        `_score_deep` would have issued them."""
+        loads: every live request's `xreq_loads` (its own bank), the union attention's
+        main-table rows (`union_phys`) and this rank's first owned request's key chunks
+        0..KS-2 (ring slots 0..KS-2: its stream starts the layer, `first`), as the loop,
+        `_attend_unions` and `_score_deep` would have issued them."""
         ex, T, KS = ctx.ex, ctx.ex.T, self.key_slots
         nreq = ex.MB // T
         for c in self._table_copies(ctx, l):
             c.wait()
         n_loop = self._n_live(ctx) if self.skip_idle else nreq
 
-        @pl.when(n_loop > 0)
-        def _():
-            for cp in self._xreq_loads(ctx, l, 0, 0):
-                cp.start()
-
+        self._issue_xreq_loads(ctx, l, n_loop)
         if self.union_phys:  # the union attention's table rows (`_attend_unions`)
             for q in range(nreq):
                 pl.when(q < n_loop)(lambda q=q: self._tab_copy(ctx, l, q).start())
