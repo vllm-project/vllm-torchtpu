@@ -273,12 +273,14 @@ class WriteBackPolicy:
     # stored before HBM evicted them. Resident chunks are only refreshed when
     # offered (prepare_store dedup), which is the victim-cache behaviour.
     hold_all_chunks: bool = False
-    # Per-block only: keep the host tier exclusive of HBM. Once a load from
-    # the host lands in HBM, the host copy is erased (Raiden
-    # `KVCacheStore.erase`), so the host holds only blocks HBM does not. The
-    # loaded chunk is stored again when HBM evicts it, which needs every
-    # referenced chunk held: implies `hold_all_chunks`. A Raiden wheel without
-    # `erase` logs a warning and keeps the host copies (inclusive tier).
+    # Per-block only: keep the host tier exclusive of HBM. Once a request
+    # whose load from the host landed is scheduled (its blocks are hittable in
+    # HBM), the host copy is erased (Raiden `KVCacheStore.erase`), so the host
+    # holds only blocks HBM does not. An erased chunk is stored again when HBM
+    # evicts it: a finished request also holds the chunks whose keys were
+    # erased (not only those past `next_stored_chunk_idx`). Independent of
+    # `hold_all_chunks`. A Raiden wheel without `erase` logs a warning and
+    # keeps the host copies (inclusive tier).
     exclusive: bool = False
 
     @classmethod
@@ -325,7 +327,12 @@ class WriteBackPolicy:
 
     @property
     def holds_all_chunks(self) -> bool:
-        return self.per_block and (self.hold_all_chunks or self.exclusive)
+        return self.per_block and self.hold_all_chunks
+
+    @property
+    def holds_erased_chunks(self) -> bool:
+        """Exclusive tier: hold chunks whose host copy was erased."""
+        return self.per_block and self.exclusive and not self.hold_all_chunks
 
 
 def _allocated_block_ids(scheduler_output: SchedulerOutput) -> set[int]:
@@ -563,6 +570,14 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         )
         policy = self._write_back
         hold_all = policy is not None and policy.holds_all_chunks
+        # Exclusive: chunks below next_stored_chunk_idx (loaded, or HBM hits)
+        # are held too when their host copy was erased; HBM is their only copy.
+        manager = self._raiden_manager
+        hold_erased = (
+            policy is not None
+            and policy.holds_erased_chunks
+            and bool(getattr(manager, "_erased_keys", None))
+        )
         blocks: set[int] = set()
         for group_config, group_state in zip(
             self.config.kv_group_configs, req_status.group_states
@@ -580,6 +595,18 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 )
             end = num_chunks * blocks_per_chunk
             blocks.update(b for b in group_state.block_ids[start:end] if b != 0)
+            if hold_erased:
+                block_ids = group_state.block_ids
+                offload_keys = group_state.offload_keys
+                for ci in range(min(start // blocks_per_chunk, num_chunks)):
+                    if manager.is_erased(offload_keys[ci]):
+                        blocks.update(
+                            b
+                            for b in block_ids[
+                                ci * blocks_per_chunk : (ci + 1) * blocks_per_chunk
+                            ]
+                            if b != 0
+                        )
         if not blocks:
             return False
         self._wb_blocks[req_id] = blocks
@@ -668,6 +695,19 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 mgr_stats.get("exclusive_erase_calls", 0),
                 mgr_stats.get("exclusive_erased_entries", 0),
             )
+            if self._write_back is not None and self._write_back.exclusive:
+                logger.info(
+                    "Raiden exclusive tier stats: loads queued for erase %d, "
+                    "dropped before scheduling %d | erased keys awaiting "
+                    "re-store %d | requests missing a key erased <%.0fs ago "
+                    "%d (%d tokens)",
+                    mgr_stats.get("exclusive_erase_deferred", 0),
+                    mgr_stats.get("exclusive_erase_dropped", 0),
+                    len(getattr(self._raiden_manager, "_erased_keys", None) or ()),
+                    self._RECENT_ERASE_S,
+                    c["miss_erased_2s"],
+                    c["miss_erased_2s_tokens"],
+                )
             logger.info(
                 "Raiden offload flush stats: drains %d calls %d jobs %.1f ms | "
                 "hit-only flushes skipped: parked %d (%d keys) launched %d | "
@@ -811,13 +851,21 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         # A held block handed out again lost its contents (reallocation) or is
         # now held by a running request that registers it at its own finish
         # (prefix hit): either way its old holder no longer stores it.
-        reused = allocated & self._wb_owners.keys()
+        fresh = self._fresh_block_ids
+        policy = self._write_back
+        if policy is not None and policy.exclusive and fresh:
+            # Exclusive: an async load's destination blocks are popped now
+            # (`fresh`) but the request is listed only when scheduled, steps
+            # later, when they would look like prefix hits. Treat them as
+            # reallocated now, so late_store offers their held chunks before
+            # the load overwrites them.
+            reused = (allocated | fresh) & self._wb_owners.keys()
+        else:
+            reused = allocated & self._wb_owners.keys()
         c["blocks_left_queue"] += len(reused)
         bpc = self.config.blocks_per_chunk
         picked = self._wb_window_blocks() if self._block_pool is not None else {}
         urgent: set[str] = set()
-        fresh = self._fresh_block_ids
-        policy = self._write_back
         if policy is not None and policy.late_store and fresh:
             # Reallocated this step before the window reached them: store now.
             # Holders registered this step are skipped (their last forward may
@@ -869,7 +917,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         restored afterwards (later chunks of the same holder still store)."""
         allowed = getattr(self, "_wb_allowed", None) or {}
         policy = self._write_back
-        hold_all = policy is not None and policy.holds_all_chunks
+        hold_all = policy is not None and (
+            policy.holds_all_chunks or policy.holds_erased_chunks
+        )
         by_ctx: dict[int, set] = {}
         saved: list[tuple[Any, int]] = []
         for req_id, keys in allowed.items():
@@ -908,9 +958,31 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._wb_to_release = set()
         return meta
 
+    def _release_scheduled_erases(self, scheduler_output: SchedulerOutput) -> None:
+        """Exclusive tier: erase the host copy of the landed loads of the
+        requests this step schedules. Their loaded blocks were cached when
+        they left WAITING_FOR_REMOTE_KVS and are hittable from the next
+        `schedule()` on (the same-step patch clears per `schedule()`), so the
+        prefix stays in at least one tier. A request preempted in this step is
+        skipped (and keeps its host copy)."""
+        manager = self._raiden_manager
+        if not getattr(manager, "_pending_erase", None):
+            return
+        preempted = scheduler_output.preempted_req_ids or ()
+        for req_id in preempted:
+            manager.drop_pending_erase(req_id)
+        scheduled = [r.req_id for r in scheduler_output.scheduled_new_reqs]
+        cached = scheduler_output.scheduled_cached_reqs
+        resumed = getattr(cached, "resumed_req_ids", None)
+        if resumed:
+            scheduled.extend(resumed)
+        manager.release_pending_erase(r for r in scheduled if r not in preempted)
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        if self._write_back is not None and self._write_back.exclusive:
+            self._release_scheduled_erases(scheduler_output)
         if self._write_back is not None and self._write_back.per_block:
             scheduler_output = self._write_back_output_blocks(scheduler_output)
             meta = self._wb_build_partial(scheduler_output)
@@ -1111,7 +1183,47 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             self._count_stale_head(request, num_computed_tokens, result[0])
         if self._loss_trace and result[0] is not None:
             self._trace_miss(request, num_computed_tokens, result[0])
+        if (
+            self._offload_stats
+            and result[0] is not None
+            and self._write_back is not None
+            and self._write_back.exclusive
+        ):
+            self._count_recent_erase_miss(request, num_computed_tokens, result[0])
         return result
+
+    # A miss on a key erased less than this long ago is counted as a miss in
+    # the exclusive tier's erase window (TPU_RAIDEN_OFFLOAD_STATS).
+    _RECENT_ERASE_S = 2.0
+    _erase_miss_req_ids: set[str] | None = None
+
+    def _count_recent_erase_miss(
+        self, request: Request, num_computed_tokens: int, num_hit_tokens: int
+    ) -> None:
+        """Stats only, exclusive tier: once per request, a lookup whose first
+        missing key was erased less than `_RECENT_ERASE_S` ago (the prefix
+        left the host while HBM could not serve it yet, or HBM lost it)."""
+        if not getattr(self._raiden_manager, "_erased_keys", None):
+            return
+        seen = self._erase_miss_req_ids
+        if seen is None:
+            seen = self._erase_miss_req_ids = set()
+        req_id = request.request_id
+        if req_id in seen:
+            return
+        stop = num_computed_tokens + num_hit_tokens
+        missing = request.num_prompt_tokens - stop
+        if missing <= 0:
+            return
+        found = self._prefix_offload_keys(request, stop)
+        if found is None or not found[1]:
+            return
+        age = self._raiden_manager.erased_age(found[1][0])
+        if not 0.0 <= age < self._RECENT_ERASE_S:
+            return
+        seen.add(req_id)
+        self.wb_counters["miss_erased_2s"] += 1
+        self.wb_counters["miss_erased_2s_tokens"] += missing
 
     _LOSS_TRACE_MIN_TOKENS = 8192
 
@@ -1138,6 +1250,10 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         c = self.wb_counters
         c["miss8k_" + event] += 1
         c["miss8k_tok_" + event] += missing
+        if event == "erased" and 0.0 <= age < self._RECENT_ERASE_S:
+            # Exclusive tier: erased less than 2 s ago (the erase window).
+            c["miss8k_erased_lt2s"] += 1
+            c["miss8k_tok_erased_lt2s"] += missing
         logger.info(
             "Raiden loss trace: req %s prompt %d local %d host %d missing %d: "
             "first missing key %s %.0fs ago (refreshed %.0fs, stored %.0fs ago)",
@@ -1177,6 +1293,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         traced = getattr(self, "_traced_req_ids", None)
         if traced:
             traced.discard(request.request_id)
+        if self._write_back is not None and self._write_back.exclusive:
+            # Finished (aborted) before it was scheduled: keep the host copy.
+            self._raiden_manager.drop_pending_erase(request.request_id)
+            if self._erase_miss_req_ids:
+                self._erase_miss_req_ids.discard(request.request_id)
         if self._lru_refresh_on_finish:
             self._refresh_chain(request.request_id)
         elif tpu_envs.VLLM_TPU_OFFLOAD_TOUCH_ON_FINISH and self._write_back is None:
@@ -1456,6 +1577,14 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         return self.connector_scheduler.peek_external_prefix_tokens(
             request, num_local_tokens
         )
+
+    def take_erased_block_hashes(self) -> set[bytes] | None:
+        """`ExternalPrefixProbe` (optional): block hashes whose host copy the
+        exclusive tier erased since the last call, so cached warmth estimates
+        covering them are dropped; None means drop every estimate."""
+        if self.connector_scheduler is None:
+            return set()
+        return self.connector_scheduler._raiden_manager.take_erased_block_hashes()
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(

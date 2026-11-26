@@ -112,6 +112,7 @@ from vllm.v1.kv_offload.base import (
     RequestOffloadingContext,
     ScheduleEndContext,
     TransferResult,
+    get_offload_block_hash,
     get_offload_group_idx,
 )
 from vllm.v1.kv_offload.config import OffloadingConfig
@@ -626,6 +627,19 @@ class RaidenOffloadingManager(OffloadingManager):
     # store_policy.exclusive: erase the host copy of every load that lands
     # (`enable_exclusive`). Class-level for instances built without __init__.
     _exclusive: bool = False
+    # Exclusive tier state (set by `enable_exclusive`, None otherwise):
+    # - per live request, the keys and sub-hashes of its loads that landed,
+    #   erased once the request is scheduled (`release_pending_erase`);
+    # - erased keys not stored again since, with their monotonic erase time
+    #   (write-back holds their chunks; the stats count misses on them);
+    # - block hashes erased since the last `take_erased_block_hashes`, for
+    #   the scheduler's external-warmth cache (None: too many, drop it all).
+    _pending_erase: dict[str, tuple[list, list]] | None = None
+    _erased_keys: collections.OrderedDict | None = None
+    _erased_block_hashes: set[bytes] | None = None
+    _ERASED_KEYS_CAP = 1 << 19
+    _ERASED_BLOCK_HASHES_CAP = 1 << 16
+    _erased_overflow: bool = False
 
     def __init__(
         self,
@@ -965,37 +979,127 @@ class RaidenOffloadingManager(OffloadingManager):
             self._exclusive = False
             return False
         self._exclusive = True
+        self._pending_erase = {}
+        self._erased_keys = collections.OrderedDict()
+        self._erased_block_hashes = set()
         logger.info(
             "TPURaidenOffloadingConnector: exclusive host tier on: a load that "
-            "lands erases its host copy (KVCacheStore.erase)"
+            "lands erases its host copy (KVCacheStore.erase) once its request "
+            "is scheduled"
         )
         return True
 
     def _erase_loaded(self, admission: Admission) -> None:
-        """Exclusive tier: drop the host copy of a load that landed.
+        """Exclusive tier: queue the host copy of a load that landed for erase.
 
-        Only while the request is live: vLLM caches the destination blocks
-        once the load is reported, and a request finished before that (abort)
-        may leave them uncached, so its host copy is the only one. Erase skips
-        pinned entries (another request's lookup or transfer), and absent or
-        peer-only hashes, so the whole batch can be passed. A store-published
-        storage recall is host-resident too and is erased the same way.
+        The erase waits for `release_pending_erase`, i.e. for the request to
+        be scheduled: until then vLLM cannot hit the loaded blocks (they are
+        cached when the request leaves WAITING_FOR_REMOTE_KVS, and the
+        same-step patch hides them for that `schedule()`), so erasing on
+        landing left the prefix in neither tier and a sibling retrying in that
+        window prefilled it again. Only while the request is live: a request
+        finished before that (abort) may leave its blocks uncached, so its
+        host copy is the only one.
         """
         if admission.req_id not in self._live_req_ids:
             return
+        pending = self._pending_erase
+        if pending is None:
+            pending = self._pending_erase = {}
+        keys, sub_hashes = pending.setdefault(admission.req_id, ([], []))
+        keys.extend(admission.keys)
+        sub_hashes.extend(admission.sub_hashes)
+        if self._stats is not None:
+            self._stats["exclusive_erase_deferred"] += 1
+
+    def release_pending_erase(self, req_ids: Iterable[str]) -> None:
+        """Erase the landed loads of `req_ids`, which this step scheduled.
+
+        Their loaded blocks are cached in HBM and hittable from the next
+        `schedule()` on. Erase skips pinned entries (another request's lookup
+        or transfer, which erases them when its own load is scheduled), and
+        absent or peer-only hashes, so the whole batch can be passed. A
+        store-published storage recall is host-resident too and is erased the
+        same way.
+        """
+        pending = self._pending_erase
+        if not pending:
+            return
+        for req_id in req_ids:
+            entry = pending.pop(req_id, None)
+            if entry is None or not self._exclusive:
+                continue
+            if req_id not in self._live_req_ids:
+                continue
+            self._erase_now(*entry)
+
+    def drop_pending_erase(self, req_id: str) -> None:
+        """The request finished or was preempted before it was scheduled: its
+        loaded blocks may never be hit, so keep the host copy."""
+        pending = self._pending_erase
+        if pending and pending.pop(req_id, None) is not None:
+            if self._stats is not None:
+                self._stats["exclusive_erase_dropped"] += 1
+
+    def _erase_now(self, keys: list[OffloadKey], sub_hashes: list[bytes]) -> None:
         try:
-            erased = self._store.erase(admission.sub_hashes)
+            erased = self._store.erase(sub_hashes)
         except Exception:  # noqa: BLE001 - a broken erase must not stop serving
             logger.exception(
                 "TPURaidenOffloadingConnector: KVCacheStore.erase failed; "
                 "exclusive host tier turned off"
             )
             self._exclusive = False
+            if self._pending_erase:
+                self._pending_erase.clear()
             return
-        self._trace(admission.keys, "erased")
+        self._trace(keys, "erased")
         if self._stats is not None:
             self._stats["exclusive_erase_calls"] += 1
             self._stats["exclusive_erased_entries"] += int(erased or 0)
+        now = time.monotonic()
+        erased_keys = self._erased_keys
+        if erased_keys is None:
+            erased_keys = self._erased_keys = collections.OrderedDict()
+        for key in keys:
+            erased_keys[key] = now
+            erased_keys.move_to_end(key)
+        while len(erased_keys) > self._ERASED_KEYS_CAP:
+            erased_keys.popitem(last=False)
+        hashes = self._erased_block_hashes
+        if hashes is not None:
+            hashes.update(get_offload_block_hash(key) for key in keys)
+            if len(hashes) > self._ERASED_BLOCK_HASHES_CAP:
+                # Not drained (no warmth cache, or a long gap): stop tracking
+                # and tell the next taker to drop every estimate.
+                self._erased_block_hashes = None
+                self._erased_overflow = True
+
+    def take_erased_block_hashes(self) -> set[bytes] | None:
+        """Block hashes erased since the last call (empty when none, or when
+        the tier is inclusive); None when too many were erased to track, so
+        the caller must treat every cached host-warmth estimate as stale."""
+        if self._erased_overflow:
+            self._erased_overflow = False
+            self._erased_block_hashes = set()
+            return None
+        hashes = self._erased_block_hashes
+        if not hashes:
+            return set()
+        self._erased_block_hashes = set()
+        return hashes
+
+    def is_erased(self, key: OffloadKey) -> bool:
+        """Whether the exclusive tier erased `key` and nothing stored it since."""
+        erased = self._erased_keys
+        return bool(erased) and key in erased
+
+    def erased_age(self, key: OffloadKey) -> float:
+        """Seconds since the exclusive tier erased `key` (-1: not erased, or
+        stored again since)."""
+        erased = self._erased_keys
+        at = erased.get(key) if erased else None
+        return -1.0 if at is None else time.monotonic() - at
 
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         self._live_req_ids.add(req_context.req_id)
@@ -1003,6 +1107,8 @@ class RaidenOffloadingManager(OffloadingManager):
 
     def on_request_finished(self, req_context: ReqContext) -> None:
         self._live_req_ids.discard(req_context.req_id)
+        if self._pending_erase:
+            self.drop_pending_erase(req_context.req_id)
         self._unloadable.pop(req_context.req_id, None)
 
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -1862,6 +1968,9 @@ class RaidenOffloadingManager(OffloadingManager):
             self._store.release(held)
         if admission.op == AdmissionOp.STORE:
             self._inflight_store_keys.difference_update(admission.keys)
+            if success and self._erased_keys:
+                for key in admission.keys:
+                    self._erased_keys.pop(key, None)
             self._trace(admission.keys, "stored" if success else "store_failed")
             if self._stats is not None:
                 self._stats["store_jobs_ok" if success else "store_jobs_failed"] += 1

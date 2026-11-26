@@ -363,7 +363,39 @@ class PrefixAwareScheduler(AsyncScheduler):
             self._promote_warmest(queue)
         return queue
 
+    def _drop_erased_external_warmth(self) -> None:
+        """Forget cached connector warmth that covers host blocks the
+        connector has since erased (exclusive host tier), so admission and
+        sibling hold do not count on a load that would miss. A connector
+        without `take_erased_block_hashes` never erases: nothing to do."""
+        take = getattr(self._paw_probe, "take_erased_block_hashes", None)
+        cache = self._paw_external_cache
+        if take is None:
+            return
+        erased = take()
+        if erased is not None and not erased:
+            return
+        if not cache:
+            return
+        if erased is None:
+            cache.clear()
+            return
+        reqs = getattr(self, "requests", None) or {}
+        hash_bs = int(getattr(self, "hash_block_size", 0) or self.block_size)
+        for req_id, (local, _, external, _) in list(cache.items()):
+            if external <= 0:
+                continue
+            request = reqs.get(req_id)
+            if request is None:
+                del cache[req_id]
+                continue
+            lo = local // hash_bs
+            hi = (local + external) // hash_bs + 1
+            if not erased.isdisjoint(request.block_hashes[lo:hi]):
+                del cache[req_id]
+
     def schedule(self, throttle_prefills: bool = False):
+        self._drop_erased_external_warmth()
         queue = getattr(self, "kv_holding_waiting", None) or getattr(
             self, "waiting", None
         )
