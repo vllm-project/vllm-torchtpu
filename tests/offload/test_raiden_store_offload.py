@@ -2844,6 +2844,7 @@ class TestHybridGeometry(unittest.TestCase):
         backend.get_kv_cache_shape.return_value = (1, 256, 8, 2, 128)
         backend.is_ssm.return_value = False
         with (
+            patch.object(rs, "_all_ranks_leaf_kv_cache_specs", tuple(groups)),
             patch(
                 "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
                 "_find_non_ssm_backend",
@@ -2954,6 +2955,7 @@ class TestHybridGeometry(unittest.TestCase):
         backend.get_kv_cache_shape.return_value = (1, 256, 8, 2, 128)
         backend.is_ssm.return_value = False
         with (
+            patch.object(rs, "_all_ranks_leaf_kv_cache_specs", (self._attn_spec(),)),
             patch(
                 "vllm_torchtpu.platforms.tpu_platform.TpuPlatform."
                 "_find_non_ssm_backend",

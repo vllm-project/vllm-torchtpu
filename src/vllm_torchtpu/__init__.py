@@ -875,11 +875,17 @@ def _patch_vllm_offload_all_ranks_kv_bytes() -> None:
     keeps its own entry. The Raiden offloading spec sizes the host capacity
     from the bytes behind one block on all ranks, which under pipeline
     parallelism differ between stages, so both places record the sum first.
+    They also record the per-layer KV cache specs, which the scheduler's
+    config folds to one spec per group, so both decide alike whether the KV
+    cache has arrays of several shapes (`has_multi_shapes_kv_caches`).
     """
     from vllm.v1.engine import core as engine_core_module
     from vllm.v1.worker.worker_base import WorkerWrapperBase
 
-    from vllm_torchtpu.offload.raiden_store import record_all_ranks_kv_bytes_per_block
+    from vllm_torchtpu.offload.raiden_store import (
+        record_all_ranks_kv_bytes_per_block,
+        record_all_ranks_leaf_kv_cache_specs,
+    )
 
     marker = "_tpu_all_ranks_kv_bytes_patch"
     original_generate = engine_core_module.generate_scheduler_kv_cache_config
@@ -887,6 +893,7 @@ def _patch_vllm_offload_all_ranks_kv_bytes() -> None:
 
         def generate_scheduler_kv_cache_config_tpu(kv_cache_configs):
             record_all_ranks_kv_bytes_per_block(kv_cache_configs)
+            record_all_ranks_leaf_kv_cache_specs(kv_cache_configs)
             return original_generate(kv_cache_configs)
 
         generate_scheduler_kv_cache_config_tpu.__dict__[marker] = True
@@ -899,6 +906,7 @@ def _patch_vllm_offload_all_ranks_kv_bytes() -> None:
 
         def initialize_from_config_tpu(self, kv_cache_configs):
             record_all_ranks_kv_bytes_per_block(kv_cache_configs)
+            record_all_ranks_leaf_kv_cache_specs(kv_cache_configs)
             return original_initialize(self, kv_cache_configs)
 
         initialize_from_config_tpu.__dict__[marker] = True
