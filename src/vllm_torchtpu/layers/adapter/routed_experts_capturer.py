@@ -120,9 +120,15 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
         # row shape and dtype.
         super().__init__(max_num_batched_tokens=0, vllm_config=vllm_config)
         self._first_moe_layer_id = moe_layer_ids[0]
+        self._moe_layer_ids = tuple(moe_layer_ids)
         # Callers pass True only on the first TP rank, the one whose rows
         # vLLM's connector publishes.
         self._copies_to_host = copies_to_host
+        # The MoE layers that wrote expert ids in the latest forward;
+        # `check_forward` reads and clears it. A compiled forward sets it after
+        # every call, to the ids collected while torch.compile traced the
+        # forward.
+        self._written_layer_ids: tuple[int, ...] = ()
         # Copies of this step's forwards, in the order they ran.
         self._step_copies: list[_ForwardCopy] = []
         self._latest_snapshot: HostSnapshot | None = None
@@ -137,7 +143,11 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
                 dtype=self.output_dtype,
                 device=topk_ids.device,
             )
+            # Starts this forward's record, so that it holds no ids of an
+            # earlier forward.
+            self._written_layer_ids = ()
         super().capture(layer_id, topk_ids)
+        self._written_layer_ids = (*self._written_layer_ids, layer_id)
 
     def _restore_local_topk_ids(
         self, topk_ids: torch.Tensor, ctx: ForwardContext
@@ -152,13 +162,33 @@ class TPURoutedExpertsCapturer(RoutedExpertsCapturer):
         return topk_ids
 
     def check_forward(self, num_padded_tokens: int) -> torch.Tensor:
-        """Returns the table of the forward that just ran, after checking its
-        shape and dtype.
+        """Returns the table of the forward that just ran, after checking that
+        every MoE layer wrote its expert ids.
+
+        It fails if the compiled forward was traced before the hooks were
+        bound, was loaded from a compile cache built without them, or picks a
+        layer's experts in a kernel that skips `route()`.
 
         Args:
             num_padded_tokens: the forward's token bucket.
         """
-        table = self.device_buffer
+        written, table = self._written_layer_ids, self.device_buffer
+        # Cleared, so a next forward whose program calls no hook fails here
+        # instead of passing on this record.
+        self._written_layer_ids = ()
+        missing = sorted(set(self._moe_layer_ids) - set(written))
+        if missing:
+            raise RuntimeError(
+                f"--enable-return-routed-experts: MoE layers {missing} did not "
+                f"write expert ids in the {num_padded_tokens}-token forward. The "
+                "compiled forward does not call their capture hook."
+            )
+        # No layer is missing by now, so this only catches a layer id that was
+        # written twice or that belongs to no bound MoE layer.
+        assert sorted(written) == sorted(self._moe_layer_ids), (
+            f"the {num_padded_tokens}-token forward wrote the expert ids of MoE "
+            f"layers {sorted(written)}, not {sorted(self._moe_layer_ids)}"
+        )
         expected_shape = (num_padded_tokens, *self.shape_per_token)
         assert table.shape == expected_shape and table.dtype == self.output_dtype, (
             f"the {num_padded_tokens}-token forward returned a routed-experts "

@@ -142,6 +142,40 @@ def test_a_model_without_moe_layers_is_rejected(on_host):
         make_capturer(moe_layer_ids=[])
 
 
+@pytest.mark.parametrize("flaw", ["missing_hook", "traced_before_binding"])
+def test_a_forward_missing_hooks_fails_the_check(on_host, flaw):
+    """vLLM drops the guards, so a forward traced before the hooks are bound
+    keeps running without them; the check names every layer it misses."""
+    capturer = make_capturer()
+    model = make_moe_model()
+    forward = _compile_like_vllm(model, [])
+    if flaw == "missing_hook":
+        bind_routed_experts_capturer(model, capturer)
+        model[1].capture_fn = None
+        missing = r"\[1\]"
+    else:
+        _run(forward, expert_ids(16))
+        bind_routed_experts_capturer(model, capturer)
+        missing = r"\[0, 1, 2\]"
+    _run(forward, expert_ids(16))
+
+    with pytest.raises(
+        RuntimeError, match=rf"MoE layers {missing} did not write .* 16-token"
+    ):
+        capturer.check_forward(16)
+
+
+def test_a_forward_is_checked_once(on_host):
+    """Checking a forward clears its record, so a forward whose program lacks
+    the hooks cannot pass on the record of the one before it."""
+    capturer = make_capturer()
+    model_forward(_bound_model(capturer), expert_ids(16))
+    capturer.check_forward(16)
+
+    with pytest.raises(RuntimeError, match=r"MoE layers \[0, 1, 2\] did not"):
+        capturer.check_forward(16)
+
+
 def test_capture_rejects_a_layer_past_the_table(on_host):
     capturer = make_capturer()
     with (
