@@ -256,7 +256,9 @@ def _kernel(
                 if packing == 4:
                     # A slot no row sees gets p = 0, so only a NaN value (fp8
                     # has no infinities) could reach p @ v: zeroing NaNs keeps
-                    # a reduction over the page's limits off the critical path.
+                    # a reduction over the page's limits off the critical path
+                    # (a NaN in a seen slot, never written by the cache, would
+                    # read as 0, as `_fp8_page` reads it for decode tiles).
                     # Zeroed on the whole [K | V] rows (a NaN key's score is
                     # masked anyway): on the value half alone the select took a
                     # relayout of each page (~5% of a 16-page step, AOT).
@@ -523,7 +525,8 @@ def _attention_call(
 
     Writes those heads' and tokens' rows of ``(out [G * Hg, T, D], lse
     [G, T / Bq, 1, Hg * Bq])`` (a tile's lse a lane-dense row, ``h * Bq +
-    t``): into `out` in place when given (an earlier call's
+    t``; ``[G, T / Bq, Hg, Bq]`` for `attend`'s tiles, see ``lse_tile``):
+    into `out` in place when given (an earlier call's
     result), else into new arrays whose other rows are unset. A 4-bit
     `kv_cache` takes its `scale_cache` and `scale_rows` (`_kernel`'s
     `fp4_rows`)."""
