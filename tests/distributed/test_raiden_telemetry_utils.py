@@ -13,6 +13,12 @@
 # limitations under the License.
 """Unit tests for TPU Raiden telemetry utility functions."""
 
+from functools import partial
+
+import pytest
+from prometheus_client import CollectorRegistry, Gauge, Histogram
+
+from vllm_torchtpu.distributed.kv_transfer.raiden import telemetry_utils
 from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
     _UNESCAPE_PATTERN,
     RAIDEN_METRIC_PREFIX,
@@ -159,3 +165,59 @@ def test_normalize_raiden_metric_name():
         normalize_raiden_metric_name("sent_bytes_total")
         == "tpu_raiden_sent_bytes_total"
     )
+
+
+class TestRaidenCollectorCache:
+    def test_invalid_collector_definition_is_not_swallowed(self) -> None:
+        registry = CollectorRegistry()
+        # `le` is reserved for histograms, so construction raises ValueError.
+        with pytest.raises(ValueError):
+            telemetry_utils._get_or_create_collector(
+                metric_cls=partial(Histogram, registry=registry),
+                mtype_str="histogram",
+                name="tpu_raiden_bad_histogram",
+                documentation="reserved label",
+                labelnames=["le"],
+            )
+
+    def test_gauge_uses_mostrecent_multiprocess_mode(self) -> None:
+        registry = CollectorRegistry()
+        gauge = telemetry_utils._get_or_create_collector(
+            metric_cls=partial(Gauge, registry=registry),
+            mtype_str="gauge",
+            name="tpu_raiden_test_gauge",
+            documentation="test gauge",
+            labelnames=["model_name"],
+        )
+        assert gauge is not None
+        assert gauge._multiprocess_mode == "mostrecent"
+
+    def test_cached_collector_reused_on_same_registry(self) -> None:
+        registry = CollectorRegistry()
+        first = telemetry_utils._get_or_create_collector(
+            metric_cls=partial(Gauge, registry=registry),
+            mtype_str="gauge",
+            name="tpu_raiden_cached_gauge",
+            documentation="cached gauge",
+            labelnames=["x"],
+        )
+        second = telemetry_utils._get_or_create_collector(
+            metric_cls=partial(Gauge, registry=registry),
+            mtype_str="gauge",
+            name="tpu_raiden_cached_gauge",
+            documentation="cached gauge",
+            labelnames=["x"],
+        )
+        assert first is second
+
+    def test_foreign_duplicate_raises_value_error(self) -> None:
+        registry = CollectorRegistry()
+        Gauge("tpu_raiden_foreign", "foreign", ["x"], registry=registry)
+        with pytest.raises(ValueError):
+            telemetry_utils._get_or_create_collector(
+                metric_cls=partial(Gauge, registry=registry),
+                mtype_str="gauge",
+                name="tpu_raiden_foreign",
+                documentation="foreign",
+                labelnames=["x"],
+            )

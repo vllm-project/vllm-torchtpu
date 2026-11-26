@@ -47,11 +47,14 @@ from vllm.v1.request import RequestStatus
 from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
-from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
+from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
     DEFAULT_LABEL_VALUE,
     METRIC_TYPE_COUNTER,
     METRIC_TYPE_GAUGE,
     METRIC_TYPE_HISTOGRAM,
+    RaidenDynamicPromMetrics,
+)
+from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorPromMetrics,
     TpuKVConnectorStats,
 )
@@ -6985,7 +6988,10 @@ class TestTPUConnectorStats(unittest.TestCase):
 
             gauge_obj = metrics.dynamic_metrics["tpu_raiden_buffer_allocated_bytes"][1]
             host_gauge = gauge_obj.labels(
-                model_name="my_model", engine="0", buffer_type="host_dram"
+                model_name="my_model",
+                engine="0",
+                buffer_type="host_dram",
+                local_rank="",
             )
             assert host_gauge._value.get() == 4096.0
 
@@ -6998,7 +7004,7 @@ class TestTPUConnectorStats(unittest.TestCase):
             metrics.observe(mock_data_extra, engine_idx=0)
             assert push_counter._value.get() == 1124.0
 
-    def test_get_raiden_metric_definitions_with_none_labelnames(self):
+    def test_raiden_metric_definitions_with_none_labelnames(self):
         mock_telemetry = MagicMock()
         mock_desc1 = MagicMock()
         mock_desc1.name = "unlabeled_metric"
@@ -7032,17 +7038,23 @@ class TestTPUConnectorStats(unittest.TestCase):
             ),
             patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry"),
         ):
-            self.metrics.labelnames = None
-            self.metrics._labelnames = None
-
-            defs = self.metrics._get_raiden_metric_definitions(labelnames=None)
+            registry = CollectorRegistry()
+            defs = RaidenDynamicPromMetrics(
+                metric_types={
+                    Gauge: partial(Gauge, registry=registry),
+                    Counter: partial(Counter, registry=registry),
+                    Histogram: partial(Histogram, registry=registry),
+                },
+                labelnames=None,
+                per_engine_labelvalues={0: ["my_model", "0"]},
+            ).dynamic_metrics
             assert "tpu_raiden_unlabeled_metric" in defs
             assert "tpu_raiden_labeled_metric" in defs
             assert "tpu_raiden_hist_metric" in defs
             assert isinstance(defs["tpu_raiden_unlabeled_metric"][1], dict)
             assert 0 in defs["tpu_raiden_unlabeled_metric"][1]
             assert defs["tpu_raiden_unlabeled_metric"][2] == []
-            assert defs["tpu_raiden_labeled_metric"][2] == ["dim"]
+            assert defs["tpu_raiden_labeled_metric"][2] == ["dim", "local_rank"]
             assert defs["tpu_raiden_hist_metric"][2] == []
 
 

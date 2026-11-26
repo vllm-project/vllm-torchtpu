@@ -17,6 +17,7 @@ from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from vllm_torchtpu.distributed import utils as dist_utils
@@ -120,6 +121,19 @@ class TestRaidenTelemetryUtils:
 
         dist_utils.configure_raiden_telemetry(backends={"single_backend"})
         mock_telemetry.configure_telemetry.assert_called_with({"single_backend"})
+
+    def test_configure_raiden_telemetry_idempotent_for_same_backends(self, monkeypatch):
+        monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
+        monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED_BACKENDS", None)
+        mock_telemetry = MagicMock()
+        monkeypatch.setattr(
+            dist_utils, "get_raiden_telemetry_module", lambda: mock_telemetry
+        )
+
+        dist_utils.configure_raiden_telemetry(backends=["buffered"])
+        dist_utils.configure_raiden_telemetry(backends=[" BUFFERED "])
+        dist_utils.configure_raiden_telemetry()
+        mock_telemetry.configure_telemetry.assert_called_once_with(["buffered"])
 
     def test_configure_raiden_telemetry_telemetry_none(self, monkeypatch):
         monkeypatch.setattr(dist_utils, "_RAIDEN_TELEMETRY_CONFIGURED", False)
@@ -325,7 +339,9 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
         assert counter._value.get() == 30.0
 
         # Verify gauge observation (last value wins: set(4) then set(7))
-        gauge = metrics.dynamic_metrics["tpu_raiden_buffer_allocated_bytes"][1][0]
+        gauge = metrics.dynamic_metrics["tpu_raiden_buffer_allocated_bytes"][1].labels(
+            model_name="my_model", engine="0", local_rank=""
+        )
         assert gauge._value.get() == 7.0
 
     def test_dynamic_metric_telemetry_exception_handled(self):
@@ -366,12 +382,263 @@ class TestTpuKVConnectorPromMetricsDynamicMetrics:
             }
         )
 
+    def test_configure_exception_does_not_raise_unbound_local(self):
+        registry = CollectorRegistry()
+        metric_types = {
+            Gauge: partial(Gauge, registry=registry),
+            Counter: partial(Counter, registry=registry),
+            Histogram: partial(Histogram, registry=registry),
+        }
+        with patch(
+            "vllm_torchtpu.distributed.utils.configure_raiden_telemetry",
+            side_effect=RuntimeError("configure boom"),
+        ):
+            metrics = TpuKVConnectorPromMetrics(
+                vllm_config=MagicMock(),
+                metric_types=metric_types,
+                labelnames=["model_name", "engine"],
+                per_engine_labelvalues={0: ["my_model", "0"]},
+            )
+        assert metrics.dynamic_metrics == {}
+
+    def test_prometheus_only_mode_skips_dynamic_collector_registration(self):
+        registry = CollectorRegistry()
+        metric_types = {
+            Gauge: partial(Gauge, registry=registry),
+            Counter: partial(Counter, registry=registry),
+            Histogram: partial(Histogram, registry=registry),
+        }
+        vllm_config = MagicMock()
+        vllm_config.additional_config = {"raiden_telemetry_backends": ["prometheus"]}
+        with patch(
+            "vllm_torchtpu.distributed.utils.configure_raiden_telemetry"
+        ) as mock_conf:
+            metrics = TpuKVConnectorPromMetrics(
+                vllm_config=vllm_config,
+                metric_types=metric_types,
+                labelnames=["model_name", "engine"],
+                per_engine_labelvalues={0: ["my_model", "0"]},
+            )
+            mock_conf.assert_not_called()
+        assert metrics.dynamic_metrics == {}
+
+
+class TestRaidenBufferedTelemetryGating:
+    """Tests for additional_config Raiden telemetry gating and worker rank tagging."""
+
+    @pytest.mark.parametrize(
+        ("additional_config", "expected"),
+        [
+            (None, ["buffered"]),
+            ({}, ["buffered"]),
+            ({"raiden_telemetry_backends": None}, ["buffered"]),
+            ({"raiden_telemetry_backends": ["buffered"]}, ["buffered"]),
+            ({"raiden_telemetry_backends": [" BUFFERED "]}, ["buffered"]),
+            (
+                {"raiden_telemetry_backends": ["prometheus", "buffered"]},
+                ["prometheus", "buffered"],
+            ),
+            ({"raiden_telemetry_backends": []}, []),
+        ],
+    )
+    def test_get_raiden_telemetry_backends(self, additional_config, expected):
+        cfg = MagicMock()
+        cfg.additional_config = additional_config
+        assert dist_utils.get_raiden_telemetry_backends(cfg) == expected
+
+    @pytest.mark.parametrize("bad_value", ["buffered", [123], [""], ["  "]])
+    def test_get_raiden_telemetry_backends_rejects_invalid_values(self, bad_value):
+        cfg = MagicMock()
+        cfg.additional_config = {"raiden_telemetry_backends": bad_value}
+        with pytest.raises(ValueError, match="raiden_telemetry_backends"):
+            dist_utils.get_raiden_telemetry_backends(cfg)
+
+    @pytest.mark.parametrize(
+        ("backends", "expected"),
+        [
+            (None, True),
+            (["buffered"], True),
+            (["BUFFERED"], True),
+            (["prometheus", "buffered"], True),
+            ([], False),
+            (["prometheus"], False),
+            (["cloud_logging"], False),
+            # cloud_logging drains the same C++ buffer, so vLLM must not.
+            (["buffered", "cloud_logging"], False),
+        ],
+    )
+    def test_is_raiden_buffered_telemetry_enabled(self, backends, expected):
+        assert dist_utils.is_raiden_buffered_telemetry_enabled(backends) is expected
+
+    def test_drain_skips_non_buffered_modes(self, monkeypatch):
+        mock_telemetry = MagicMock()
+        monkeypatch.setattr(
+            dist_utils, "get_raiden_telemetry_module", lambda: mock_telemetry
+        )
+        for backends in (
+            ["prometheus"],
+            ["cloud_logging"],
+            ["buffered", "cloud_logging"],
+        ):
+            assert dist_utils.drain_raiden_metric_samples(backends=backends) == {}
+        mock_telemetry.get_and_reset_metric_samples.assert_not_called()
+
+    def test_drain_tags_worker_gauges_without_rank_label(self, monkeypatch):
+        mock_telemetry = MagicMock()
+        mock_telemetry.get_metric_metadata.return_value = [
+            SimpleNamespace(name="buffer_allocated_bytes", type="GAUGE"),
+            SimpleNamespace(name="host_memory_breakdown_bytes", type="GAUGE"),
+            SimpleNamespace(name="host_numa_memory_bytes", type="GAUGE"),
+            SimpleNamespace(name="host_pool_blocks", type="GAUGE"),
+            SimpleNamespace(name="d2h_bytes_total", type="COUNTER"),
+        ]
+        mock_telemetry.get_and_reset_metric_samples.return_value = {
+            "tpu_raiden_buffer_allocated_bytes": [2048.0],
+            'tpu_raiden_host_memory_breakdown_bytes{component="kv_pool"}': [4096.0],
+            'tpu_raiden_host_numa_memory_bytes{local_rank="1",numa_node="0"}': [8192.0],
+            # `dp_rank` must not be mistaken for `rank`.
+            'tpu_raiden_host_pool_blocks{dp_rank="0",state="used"}': [16.0],
+            'tpu_raiden_d2h_bytes_total{host_ip="10.0.0.1"}': [512.0],
+        }
+        monkeypatch.setattr(
+            dist_utils, "get_raiden_telemetry_module", lambda: mock_telemetry
+        )
+
+        samples = dist_utils.drain_raiden_metric_samples(
+            backends=["buffered"], worker_rank=1
+        )
+        breakdown_key = (
+            'tpu_raiden_host_memory_breakdown_bytes{component="kv_pool",local_rank="1"}'
+        )
+        pool_key = (
+            'tpu_raiden_host_pool_blocks{dp_rank="0",state="used",local_rank="1"}'
+        )
+        assert samples == {
+            'tpu_raiden_buffer_allocated_bytes{local_rank="1"}': [2048.0],
+            breakdown_key: [4096.0],
+            'tpu_raiden_host_numa_memory_bytes{local_rank="1",numa_node="0"}': [8192.0],
+            pool_key: [16.0],
+            'tpu_raiden_d2h_bytes_total{host_ip="10.0.0.1"}': [512.0],
+        }
+
+    @pytest.mark.parametrize(
+        ("parallel_config", "expected"),
+        [
+            (None, None),
+            (SimpleNamespace(world_size=1, rank=0), None),
+            (
+                SimpleNamespace(
+                    tensor_parallel_size=1,
+                    pipeline_parallel_size=1,
+                    prefill_context_parallel_size=1,
+                    rank=0,
+                ),
+                None,
+            ),
+            (SimpleNamespace(world_size=2, rank=1), 1),
+            (
+                SimpleNamespace(
+                    tensor_parallel_size=1,
+                    pipeline_parallel_size=1,
+                    prefill_context_parallel_size=2,
+                    rank=1,
+                ),
+                1,
+            ),
+        ],
+    )
+    def test_get_raiden_worker_telemetry_rank(self, parallel_config, expected):
+        cfg = SimpleNamespace(parallel_config=parallel_config)
+        assert dist_utils.get_raiden_worker_telemetry_rank(cfg) == expected
+
+    def test_pcp_workers_with_same_tp_rank_emit_distinct_gauge_series(
+        self, monkeypatch
+    ):
+        # Two PCP ranks both have tp_rank=0, so tagging must use
+        # parallel_config.rank rather than tp_rank.
+        mock_telemetry = MagicMock()
+        mock_telemetry.get_metric_metadata.return_value = [
+            SimpleNamespace(
+                name="buffer_allocated_bytes",
+                type="GAUGE",
+                label_names=[],
+                description="Allocated host staging bytes",
+            )
+        ]
+        monkeypatch.setattr(
+            dist_utils, "get_raiden_telemetry_module", lambda: mock_telemetry
+        )
+
+        def make_pcp_worker(global_rank: int) -> TPURaidenConnectorWorker:
+            w = object.__new__(TPURaidenConnectorWorker)
+            w.vllm_config = SimpleNamespace(
+                parallel_config=SimpleNamespace(
+                    world_size=2,
+                    tensor_parallel_size=1,
+                    pipeline_parallel_size=1,
+                    prefill_context_parallel_size=2,
+                    rank=global_rank,
+                )
+            )
+            w.tp_rank = 0
+            w.owns_raiden_telemetry_drain = True
+            w._raiden_telemetry_backends = ["buffered"]
+            w._worker_telemetry_rank = dist_utils.get_raiden_worker_telemetry_rank(
+                w.vllm_config
+            )
+            w.transfer_stats = TpuKVConnectorStats()
+            return w
+
+        w0 = make_pcp_worker(0)
+        w1 = make_pcp_worker(1)
+
+        mock_telemetry.get_and_reset_metric_samples.return_value = {
+            "tpu_raiden_buffer_allocated_bytes": [1024.0]
+        }
+        w0._get_raiden_stats()
+
+        mock_telemetry.get_and_reset_metric_samples.return_value = {
+            "tpu_raiden_buffer_allocated_bytes": [2048.0]
+        }
+        w1._get_raiden_stats()
+
+        agg = w0.transfer_stats.aggregate(w1.transfer_stats)
+        registry = CollectorRegistry()
+        metric_types = {
+            Gauge: partial(Gauge, registry=registry),
+            Counter: partial(Counter, registry=registry),
+            Histogram: partial(Histogram, registry=registry),
+        }
+        with patch("vllm_torchtpu.distributed.utils.configure_raiden_telemetry"):
+            prom = TpuKVConnectorPromMetrics(
+                vllm_config=MagicMock(),
+                metric_types=metric_types,
+                labelnames=["model_name", "engine"],
+                per_engine_labelvalues={0: ["my_model", "0"]},
+            )
+        prom.observe(agg.to_dict(), engine_idx=0)
+        assert (
+            registry.get_sample_value(
+                "tpu_raiden_buffer_allocated_bytes",
+                {"model_name": "my_model", "engine": "0", "local_rank": "0"},
+            )
+            == 1024.0
+        )
+        assert (
+            registry.get_sample_value(
+                "tpu_raiden_buffer_allocated_bytes",
+                {"model_name": "my_model", "engine": "0", "local_rank": "1"},
+            )
+            == 2048.0
+        )
+
 
 class TestTPURaidenConnectorWorkerTelemetry:
     """Tests for TPURaidenConnectorWorker telemetry collection and stats reporting."""
 
     def _create_mock_worker(self, is_producer=True, tp_rank=0):
         worker = MagicMock(spec=TPURaidenConnectorWorker)
+        worker.owns_raiden_telemetry_drain = True
         worker._get_raiden_stats = TPURaidenConnectorWorker._get_raiden_stats.__get__(
             worker
         )

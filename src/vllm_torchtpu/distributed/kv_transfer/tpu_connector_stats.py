@@ -28,22 +28,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.v1.metrics.utils import create_metric_per_engine
 
-import vllm_torchtpu.distributed.utils as dist_utils
+from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.raiden.telemetry_utils import (
-    normalize_raiden_metric_name,
-    parse_raiden_metric_key,
+    RaidenDynamicPromMetrics,
 )
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
-
-# Prometheus metric type constants
-METRIC_TYPE_HISTOGRAM = "histogram"
-METRIC_TYPE_COUNTER = "counter"
-METRIC_TYPE_GAUGE = "gauge"
-
-# Default fallback value for missing label dimensions
-DEFAULT_LABEL_VALUE = ""
 RUNNER_TIMING_BUCKETS_SECONDS = (
     0.00001,
     0.000025,
@@ -322,73 +313,16 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             gauge_tpu_decode_queue_length, self.per_engine_labelvalues
         )
 
-        self.dynamic_metrics: dict[str, tuple[str, Any, list[str]]] = (
-            self._get_raiden_metric_definitions(labelnames)
+        self._raiden_metrics = RaidenDynamicPromMetrics(
+            metric_types=metric_types,
+            labelnames=labelnames,
+            per_engine_labelvalues=self.per_engine_labelvalues,
+            backends=dist_utils.get_raiden_telemetry_backends(vllm_config),
         )
 
-    def _get_raiden_metric_definitions(self, labelnames: list[str] | None = None):
-        if labelnames is None:
-            labelnames = getattr(self, "labelnames", None) or getattr(
-                self, "_labelnames", None
-            )
-        base_labels = list(labelnames) if labelnames is not None else []
-        # Dynamically load TPU Raiden C++ metric schema descriptors
-        metric_defs = {}
-        try:
-            # Without this call, get_metric_metadata won't return the correct
-            # metrics definitions
-            dist_utils.configure_raiden_telemetry()
-            telemetry = dist_utils.get_raiden_telemetry_module()
-            descriptors = []
-            if telemetry is not None and hasattr(telemetry, "get_metric_metadata"):
-                descriptors = telemetry.get_metric_metadata()
-        except Exception as e:
-            logger.warning("Failed to load TPU Raiden telemetry descriptors: %s", e)
-
-        for desc in descriptors:
-            # Construct prometheus metric objects based on the definition.
-            name = normalize_raiden_metric_name(desc.name)
-            help_str = getattr(desc, "description", getattr(desc, "help", ""))
-            mtype = desc.type
-            mtype_str = getattr(mtype, "name", str(mtype)).split(".")[-1].lower()
-            metric_label_names = list(getattr(desc, "label_names", None) or [])
-            combined_labels = base_labels + metric_label_names
-
-            if mtype_str == METRIC_TYPE_HISTOGRAM:
-                buckets_val = desc.buckets if desc.buckets else [1.0, 10.0, 100.0]
-                metric_obj = self._histogram_cls(
-                    name=name,
-                    documentation=help_str,
-                    buckets=buckets_val,
-                    labelnames=combined_labels,
-                )
-            elif mtype_str == METRIC_TYPE_COUNTER:
-                metric_obj = self._counter_cls(
-                    name=name,
-                    documentation=help_str,
-                    labelnames=combined_labels,
-                )
-            elif mtype_str == METRIC_TYPE_GAUGE:
-                metric_obj = self._gauge_cls(
-                    name=name,
-                    documentation=help_str,
-                    labelnames=combined_labels,
-                )
-            else:
-                continue
-
-            if metric_label_names:
-                per_engine_obj = metric_obj
-            elif base_labels and self.per_engine_labelvalues:
-                per_engine_obj = create_metric_per_engine(
-                    metric_obj, self.per_engine_labelvalues
-                )
-            else:
-                per_engine_obj = {
-                    idx: metric_obj for idx in (self.per_engine_labelvalues or [0])
-                }
-            metric_defs[name] = (mtype_str, per_engine_obj, metric_label_names)
-        return metric_defs
+    @property
+    def dynamic_metrics(self) -> dict[str, tuple[str, Any, list[str]]]:
+        return self._raiden_metrics.dynamic_metrics
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         engine_labels = self.per_engine_labelvalues[engine_idx]
@@ -442,48 +376,4 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             for list_item in transfer_stats_data.get(gauge_item_key, []):
                 cast(Gauge, gauge_obj[engine_idx]).set(list_item)
 
-        # Dynamic metric observations
-        base_labels = (
-            getattr(self, "labelnames", None)
-            or getattr(self, "_labelnames", None)
-            or []
-        )
-        engine_labels = dict(
-            zip(base_labels, (self.per_engine_labelvalues or {}).get(engine_idx, ()))
-        )
-
-        for raw_key, values in transfer_stats_data.items():
-            if not values:
-                continue
-            base_name, parsed_labels = parse_raiden_metric_key(raw_key)
-            info = self.dynamic_metrics.get(normalize_raiden_metric_name(base_name))
-            if info is None:
-                continue
-
-            mtype, per_engine_obj, metric_label_names = info
-            if metric_label_names:
-                label_names = getattr(per_engine_obj, "_labelnames", None)
-                if not isinstance(label_names, (tuple, list)):
-                    label_names = list(base_labels) + metric_label_names
-                call_labels = {
-                    k: parsed_labels.get(k, engine_labels.get(k, DEFAULT_LABEL_VALUE))
-                    for k in label_names
-                }
-                target_obj = per_engine_obj.labels(**call_labels)
-            else:
-                target_obj = (
-                    per_engine_obj.get(engine_idx)
-                    if isinstance(per_engine_obj, dict)
-                    else per_engine_obj
-                )
-
-            if target_obj is None:
-                continue
-
-            for val in values:
-                if mtype == METRIC_TYPE_HISTOGRAM:
-                    target_obj.observe(val)
-                elif mtype == METRIC_TYPE_COUNTER:
-                    target_obj.inc(val)
-                elif mtype == METRIC_TYPE_GAUGE:
-                    target_obj.set(val)
+        self._raiden_metrics.observe(transfer_stats_data, engine_idx=engine_idx)

@@ -338,23 +338,21 @@ case "${ROLE}" in
     fi
 
     # --- Raiden telemetry --------------------------------------------------
-    # With the buffered backend, vLLM exports Raiden's samples as labeled
-    # tpu_raiden_* series; without a backend Raiden records nothing, so at
-    # least one series per engine shows the samples reached /metrics.
+    # vLLM defaults to the buffered Raiden backend and exports samples as
+    # labeled tpu_raiden_* series, so at least one series per engine shows
+    # the samples reached /metrics.
     TELEMETRY_EXIT_CODE=0
-    if [[ ",${TPU_RAIDEN_TELEMETRY_BACKENDS:-}," == *,buffered,* ]]; then
-      for endpoint in "${target_prefill_host}:${PREFILL_PORT}" "${target_decode_host}:${DECODE_PORT}"; do
-        raiden_series="$(curl -fsS "http://${endpoint}/metrics" 2>/dev/null |
-          grep -cE '^tpu_raiden_[A-Za-z0-9_:]+\{' || true)"
-        echo "RAIDEN_TELEMETRY_SERIES ${endpoint} ${raiden_series:-0}"
-        if [[ "${raiden_series:-0}" -le 0 ]]; then
-          echo "ERROR: No tpu_raiden_* series on ${endpoint}/metrics" >&2
-          TELEMETRY_EXIT_CODE=1
-        fi
-      done
-      if [[ "${TELEMETRY_EXIT_CODE}" -eq 0 ]]; then
-        echo "RAIDEN_TELEMETRY_OK 1"
+    for endpoint in "${target_prefill_host}:${PREFILL_PORT}" "${target_decode_host}:${DECODE_PORT}"; do
+      raiden_series="$(curl -fsS "http://${endpoint}/metrics" 2>/dev/null |
+        grep -cE '^tpu_raiden_[A-Za-z0-9_:]+\{' || true)"
+      echo "RAIDEN_TELEMETRY_SERIES ${endpoint} ${raiden_series:-0}"
+      if [[ "${raiden_series:-0}" -le 0 ]]; then
+        echo "ERROR: No tpu_raiden_* series on ${endpoint}/metrics" >&2
+        TELEMETRY_EXIT_CODE=1
       fi
+    done
+    if [[ "${TELEMETRY_EXIT_CODE}" -eq 0 ]]; then
+      echo "RAIDEN_TELEMETRY_OK 1"
     fi
     set -e
 

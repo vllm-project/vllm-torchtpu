@@ -29,10 +29,12 @@ from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
     PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
+    RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY,
 )
 
 KEY = PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY
 PREFILL_KEY = PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY
+RAIDEN_TELEMETRY_KEY = RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY
 
 # Class attributes the patch stamps onto VllmConfig, which monkeypatch cannot
 # roll back on its own because they did not exist beforehand.
@@ -200,4 +202,6 @@ def test_patch_is_idempotent(patched_compute_hash):
 
 
 def test_ignored_keys_match_the_keys_the_runner_reads():
-    assert {KEY, PREFILL_KEY} == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+    assert {KEY, PREFILL_KEY, RAIDEN_TELEMETRY_KEY} == (
+        HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+    )

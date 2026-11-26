@@ -51,7 +51,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -60,6 +60,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorTransferResults,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
     config as offloading_config_module,
@@ -90,8 +96,11 @@ from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.metrics import (
+    RaidenOffloadingConnectorStats,
+    TPURaidenOffloadingPromMetrics,
     compute_load_tokens_by_source,
     split_external_hit,
 )
@@ -416,6 +425,12 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
 
         return _prefix_aware_load_enabled()
 
+    # Whether this connector drains the process-wide Raiden C++ sample buffer
+    # in `get_kv_connector_stats`. Every drain resets the buffer, so exactly one
+    # connector per process may drain it; `TPUMultiConnector` clears the flag on
+    # the other children.
+    owns_raiden_telemetry_drain: bool = True
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -437,6 +452,15 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "was explicitly set to off. Unset it or set it to '1'."
             )
         os.environ["RAIDEN_DISABLE_SINGLETON_WORKER"] = "1"
+        self._raiden_telemetry_backends = dist_utils.get_raiden_telemetry_backends(
+            vllm_config
+        )
+        dist_utils.configure_raiden_telemetry(backends=self._raiden_telemetry_backends)
+        self._worker_rank: int | None = (
+            dist_utils.get_raiden_worker_telemetry_rank(vllm_config)
+            if role == KVConnectorRole.WORKER
+            else None
+        )
 
         # Call through module to preserve PCP-aware patch on build_offloading_config.
         offloading_config = offloading_config_module.build_offloading_config(
@@ -620,3 +644,50 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         self._completed_jobs = {}
         self._fenced_jobs = {}
         return meta
+
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        backends = getattr(self, "_raiden_telemetry_backends", None)
+        worker_rank = (
+            getattr(self, "_worker_rank", None)
+            if self.connector_worker is not None
+            else None
+        )
+        samples = (
+            dist_utils.drain_raiden_metric_samples(
+                backends=backends,
+                worker_rank=worker_rank,
+            )
+            if self.owns_raiden_telemetry_drain
+            else {}
+        )
+        if self.connector_scheduler is not None:
+            base_stats = self.connector_scheduler.get_stats()
+            return RaidenOffloadingConnectorStats.from_base_stats(base_stats, samples)
+        if self.connector_worker is not None:
+            return RaidenOffloadingConnectorStats.from_base_stats(None, samples)
+        return None
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls, data: dict[str, Any] | None = None
+    ) -> KVConnectorStats | None:
+        # `data` is inherited from vLLM's KVConnectorStats dataclass, which a
+        # static checker cannot see through vllm's editable install.
+        if data is not None:
+            return RaidenOffloadingConnectorStats(
+                # pyrefly: ignore[unexpected-keyword]
+                data=data,
+            )
+        return RaidenOffloadingConnectorStats()
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return TPURaidenOffloadingPromMetrics(
+            vllm_config, metric_types, labelnames, per_engine_labelvalues
+        )
