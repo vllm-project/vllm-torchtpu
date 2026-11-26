@@ -4207,7 +4207,13 @@ class TPURaidenConnectorWorker:
             # Inline mode waits for the loads below, so the coordination RPCs
             # must have run before the wait loop starts polling.
             self._submit_stage3_loads(metadata, engine, synchronous=wait_for_completion)
-            submitted_loads = set(metadata.reqs_to_load)
+            # A release-only entry arms no receiver and reports (or not) by
+            # its own report_completion, like the legacy empty read below.
+            submitted_loads = {
+                req_id
+                for req_id, req_meta in metadata.reqs_to_load.items()
+                if not getattr(req_meta, "release_only", False)
+            }
             if wait_for_completion:
                 self._wait_for_recving(submitted_loads)
                 if not report_completion:

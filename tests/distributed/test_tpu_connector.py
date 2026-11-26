@@ -4595,6 +4595,69 @@ class TestTPURaidenConnectorWorker:
 
         assert worker._done_recving == {"dst"}
 
+    @pytest.mark.parametrize("meta_report_completion", [False, True])
+    def test_stage3_inline_load_does_not_wait_on_release_only_entries(
+        self, monkeypatch, meta_report_completion
+    ):
+        # A release-only entry arms no receiver and never reaches the native
+        # manager, so (as on the legacy path) the inline wait must not block
+        # the model step on it, nor leave a suppression record behind.
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=False)
+        worker._raiden_work_unit = MagicMock()
+        worker._raiden_transfer_engine = _FakeRaidenEngine()
+        worker._raiden_transfer_engine.poll_results = []
+        facade = MagicMock()
+        facade.cancel_request_blocks_if_unclaimed.return_value = True
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["dst-release"] = _Stage3LoadMeta(
+            uuid=999,
+            source_req_id="src-release",
+            local_block_ids=[],
+            num_tokens=2047,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=8,
+            release_only=True,
+            report_completion=meta_report_completion,
+        )
+        now_s = [100.0]
+
+        def _fake_time():
+            now_s[0] += 1.0
+            return now_s[0]
+
+        monkeypatch.setattr(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", lambda: 2.0)
+        monkeypatch.setattr(f"{_MOD}.time.time", _fake_time)
+        monkeypatch.setattr(f"{_MOD}.time.sleep", lambda _s: None)
+
+        with (
+            patch.object(
+                worker,
+                "_require_stage3_controller",
+                return_value=(MagicMock(), "10.0.0.2:28000"),
+            ),
+            patch(f"{_MOD}.logger.warning") as warn_log,
+        ):
+            worker.process_send_load(
+                meta, wait_for_completion=True, report_completion=False
+            )
+
+        assert warn_log.call_count == 0
+        facade.cancel_request_blocks_if_unclaimed.assert_called_once_with(
+            req_id="src-release", uuid=999
+        )
+        # Only the entry's own report_completion governs its terminal.
+        assert worker._suppress_done_recving == set()
+        assert worker.get_finished() == (
+            set(),
+            {"dst-release"} if meta_report_completion else set(),
+        )
+        assert worker._suppress_done_recving == set()
+
     @staticmethod
     def _make_stage3_load_meta(
         destination_req_id, source_req_id, uuid, local_block_ids
