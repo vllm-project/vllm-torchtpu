@@ -19,9 +19,12 @@ import copy
 import math
 from types import SimpleNamespace
 
+import jax
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from jax.sharding import Mesh
 from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 from vllm.config import (
     CacheConfig,
@@ -34,7 +37,7 @@ from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rop
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasAttentionBackendImpl,
@@ -45,8 +48,12 @@ from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
     _format_linear_scale_for_runtime,
 )
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.models.vllm import gemma4_subrpa_patch as gsub
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    set_vllm_model_wrapper_context,
+)
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 
@@ -489,6 +496,11 @@ def _make_gemma4_model_cfg(
     )
     return SimpleNamespace(
         architectures=["Gemma4ForConditionalGeneration"],
+        dtype=torch.bfloat16,
+        is_hybrid=False,
+        is_attention_free=False,
+        max_model_len=8192,
+        enable_return_routed_experts=False,
         hf_config=text_cfg,
         hf_text_config=text_cfg,
     )
@@ -648,6 +660,25 @@ def test_subspace_rpa_kv_cache_shape_unification_and_gates(monkeypatch) -> None:
         TpuPlatform.check_and_update_config(bad_model_cfg)
 
 
+def test_platform_gate_accepts_eligible_config(monkeypatch) -> None:
+    """TpuPlatform.check_and_update_config accepts an eligible Gemma 4 config."""
+    monkeypatch.setattr(envs, "VLLM_TPU_BLOCK_MAJOR_KV", False)
+    monkeypatch.setattr(patch_registry, "apply", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        TpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda *_args, **_kwargs: None),
+    )
+    cfg = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
+        cache_config=CacheConfig(cache_dtype="fp8"),
+    )
+    cfg.model_config = _make_gemma4_model_cfg()
+    monkeypatch.setattr(envs, "TPU_SUBSPACE_RPA", True)
+    TpuPlatform.check_and_update_config(cfg)
+
+
 @pytest.mark.parametrize(
     "case, match",
     [
@@ -660,7 +691,6 @@ def test_subspace_rpa_kv_cache_shape_unification_and_gates(monkeypatch) -> None:
 )
 def test_platform_gate_rejects_unsupported_modes(monkeypatch, case: str, match: str):
     """TpuPlatform.check_and_update_config rejects unsupported Subspace-RPA modes."""
-    monkeypatch.setattr(envs, "TPU_SUBSPACE_RPA", False)
     monkeypatch.setattr(envs, "VLLM_TPU_BLOCK_MAJOR_KV", False)
     cfg = VllmConfig(
         device_config=DeviceConfig(device="cpu"),
@@ -686,7 +716,7 @@ def test_platform_gate_rejects_unsupported_modes(monkeypatch, case: str, match: 
 
 
 def test_maybe_patch_gemma4_subspace_rpa_hook_and_forward_dispatch(
-    monkeypatch, python_attention
+    monkeypatch,
 ) -> None:
     """Eligible maybe_patch_gemma4_subspace_rpa hooks loader and dispatches forward."""
     from vllm.model_executor.model_loader import base_loader
@@ -706,7 +736,9 @@ def test_maybe_patch_gemma4_subspace_rpa_hook_and_forward_dispatch(
         return hidden_states
 
     monkeypatch.setattr(Gemma4Attention, "forward", _orig_forward)
-    monkeypatch.delattr(Gemma4Attention, gsub._PATCHED_ATTN_CLS_ATTR, raising=False)
+    monkeypatch.setattr(
+        Gemma4Attention, gsub._PATCHED_ATTN_CLS_ATTR, False, raising=False
+    )
 
     gemma4_cfg = _make_gemma4_model_cfg()
     assert gsub.maybe_patch_gemma4_subspace_rpa(gemma4_cfg) is True
@@ -819,15 +851,6 @@ def test_batched_rpa_impl_forward_subspace_rpa_both_layouts(
     prefill and decode, verifying V-only quantization for HEAD_ALONG_SUBLANE
     and K_rot+V quantization for SEQ_ALONG_LANE against an independent reference.
     """
-    import jax
-    import numpy as np
-    from jax.sharding import Mesh
-
-    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
-    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-        set_vllm_model_wrapper_context,
-    )
-
     monkeypatch.setattr(envs, "TPU_SUBSPACE_RPA", True)
     monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
     gemma4_cfg = _make_gemma4_model_cfg()
@@ -856,9 +879,9 @@ def test_batched_rpa_impl_forward_subspace_rpa_both_layouts(
             alibi_slopes=None,
             sliding_window=None,
             kv_cache_dtype="fp8",
-            kv_cache_quantized_dtype=torch.float8_e4m3fn,
         )
 
+    assert impl.kv_cache_quantized_dtype == torch.float8_e4m3fn
     assert impl._pool_is_seq_along_lane is (layout_env == "HND")
 
     prefill_len = page_size + 24

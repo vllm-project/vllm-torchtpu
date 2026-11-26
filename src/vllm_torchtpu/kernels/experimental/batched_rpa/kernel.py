@@ -520,7 +520,8 @@ def rpa_body(
     # We want to load k, v from (batch, bkv_sz, bkv_stride, kv_packing, d)
     # where bkv_stride ~= num_kv_heads * 2 // kv_packing (or num_kv_heads in
     # Subspace-RPA mode, plus optional bank-conflict pad) to 2x
-    # (batch, num_kv_heads, bkv_sz, d) (with D_k = rot_dim for Subspace-RPA).
+    # (batch, num_kv_heads, bkv_sz, d) (with K's last dim = rot_dim in
+    # Subspace-RPA mode).
     # We use strided_load to avoid the expensive transpose.
     k_b = []
     v_b = []

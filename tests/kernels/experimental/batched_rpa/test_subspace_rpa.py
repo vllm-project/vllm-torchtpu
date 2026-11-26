@@ -291,9 +291,9 @@ def test_subspace_rpa_prefill_decode_and_mixed_parity(
         rtol=2e-2,
     )
 
-    # Step 3: Mixed batch (seq 0 decode q_len=1, seq 1 chunked prefill q_len=37
-    # crossing into a third page).
-    mixed_q_lens = (1, 37)
+    # Step 3: Mixed batch (seq 0 decode q_len=1, seq 1 chunked prefill q_len=120
+    # crossing from page 2 into page 3: 141 + 120 = 261 > 2 * 128).
+    mixed_q_lens = (1, 120)
     mixed_kv_lens = (
         decode_kv_lens[0] + mixed_q_lens[0],
         decode_kv_lens[1] + mixed_q_lens[1],

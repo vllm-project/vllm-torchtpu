@@ -1305,11 +1305,41 @@ def test_batched_rpa_subspace_on_shared_packed_pool_matches_separate_5d(
         sep_cache, sep_bt, slice(prefill_len, total_len), total_len, True
     )
 
-    for got, want in ((pre_shared, pre_sep), (dec_shared, dec_sep)):
+    v_deq = np.asarray(v_all.astype(jnp.float32)) * v_scale
+    if kv_layout == batched_rpa_configs.KVLayout.SEQ_ALONG_LANE:
+        k_rot_deq = np.asarray(k_all.astype(jnp.float32)) * k_scale
+    else:
+        k_rot_deq = np.asarray(k_all.astype(jnp.float32))
+    k_full = np.concatenate([k_rot_deq, v_deq[..., rot_dim:]], axis=-1)
+    q_f32 = np.asarray(q_all.astype(jnp.float32))
+
+    for got, want, q_offset, kv_len in (
+        (pre_shared, pre_sep, 0, prefill_len),
+        (dec_shared, dec_sep, prefill_len, total_len),
+    ):
         got_f32 = np.asarray(got.astype(jnp.float32))
         want_f32 = np.asarray(want.astype(jnp.float32))
         assert np.abs(got_f32).max() > 0
         np.testing.assert_array_equal(got_f32, want_f32)
+        ref = _ref_causal_gqa_attention(
+            q_f32[q_offset:kv_len],
+            k_full[:kv_len],
+            v_deq[:kv_len],
+            q_offset=q_offset,
+            scale=head_dim**-0.5,
+            sliding_window=None,
+        )
+        np.testing.assert_allclose(got_f32, ref, atol=2.5e-2, rtol=2e-2)
+
+    # Compare written pool bytes against the separate 5D cache after remapping.
+    packed_5d = shared_pool.reshape(
+        pool_shape[0], pool_shape[1], 1, packing, pool_shape[3]
+    )
+    shared_native = attn_module._reshape_packed_kv_cache(packed_5d, native_5d)
+    shared_u8 = np.asarray(jax.lax.bitcast_convert_type(shared_native, jnp.uint8))
+    sep_u8 = np.asarray(jax.lax.bitcast_convert_type(sep_cache, jnp.uint8))
+    written_ids = np.asarray(sep_bt)
+    np.testing.assert_array_equal(shared_u8[written_ids], sep_u8[written_ids])
 
     # Unused pool blocks [0, 2, 3] remain untouched zeros.
     unused = jax.lax.bitcast_convert_type(shared_pool, jnp.uint8)[

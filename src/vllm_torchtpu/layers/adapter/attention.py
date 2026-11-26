@@ -169,6 +169,7 @@ def is_8bit_float_dtype(dtype: torch.dtype | None) -> bool:
 
 
 def is_fp8_kv_cache_dtype(cache_dtype_str: str) -> bool:
+    """Return True for FP8 KV cache dtype strings (excludes uint8 like fp8_ds_mla)."""
     dtype = TPU_STR_DTYPE_TO_TORCH_DTYPE.get(cache_dtype_str.lower().strip())
     return is_8bit_float_dtype(dtype)
 
