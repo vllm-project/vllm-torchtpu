@@ -46,10 +46,13 @@ from math import gcd
 from typing import TYPE_CHECKING, Literal, cast
 
 import torch
+from jax.experimental.pallas import tpu as pltpu
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
 from vllm.model_executor.layers.linear import (
     LinearBase,
+    QKVParallelLinear,
+    RowParallelLinear,
     UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method,
 )
@@ -80,6 +83,9 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (
+    optimization_barrier_op,
+)
 from vllm_torchtpu.layers.adapter.fused_moe import (
     TpuMoEActivationMixin,
     fused_moe_gmm,
@@ -106,6 +112,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
 from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
@@ -126,6 +133,16 @@ if hasattr(torch, "float8_e5m2"):
     _MOE_REQUANT_WEIGHT_DTYPES["float8_e5m2"] = torch.float8_e5m2
 
 LinearQuantConfig = tuple[str, torch.dtype, int | None, bool]
+
+# Marks an FP8 attention `o_proj` whose input is the attention-output relayout,
+# and holds the fence op for it. `tag_attn_out_relayout_projections` sets it
+# once the weights are loaded (`patch_attn_out_relayout_tags` runs it after
+# every model load), and `VllmFp8LinearMethodTPU.apply` reads it at trace time
+# and passes the layer input through the op. The op is built when the layer is
+# tagged because Dynamo cannot trace building it. It changes XLA fusion only:
+# the relayout stays in `bf16` instead of being widened to `f32`, and the
+# quantized values are the same.
+ATTN_OUT_FENCE_OP_ATTR = "_tpu_attn_out_fence_op"
 
 
 def _dequantize_fp8_linear(
@@ -1688,6 +1705,9 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Prevent the quantization of activations to FP8 (W8A16).
             out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
         else:
+            fence = getattr(layer, ATTN_OUT_FENCE_OP_ATTR, None)
+            if fence is not None:
+                x = fence(x)
             out = quantized_matmul(
                 x,
                 weight,
@@ -1711,6 +1731,56 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         layer.weight_scale = embed_tokens.weight_scale
         setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
         return layer
+
+
+def _only_child(module: torch.nn.Module, cls: type) -> torch.nn.Module | None:
+    """Return the direct child of type `cls` when there is exactly one."""
+    found = [child for child in module.children() if isinstance(child, cls)]
+    return found[0] if len(found) == 1 else None
+
+
+# Measured on TPU7x (kernel + serving) and v6e (prefill/decode kernel bench).
+_FENCED_ATTN_OUT_CHIPS = frozenset(
+    {pltpu.ChipVersion.TPU_7X, pltpu.ChipVersion.TPU_V6E}
+)
+
+
+def tag_attn_out_relayout_projections(model: torch.nn.Module) -> int:
+    """Tag the FP8 `o_proj` layers that read an attention-output relayout.
+
+    A module that directly owns exactly one `Attention` and exactly one
+    `RowParallelLinear` is an attention block, and that linear is its output
+    projection. The layers are matched by type, so a renamed attribute cannot
+    hide them. Only measured on TPU7x and v6e, so other chips are left untagged.
+
+    Returns the number of tagged layers.
+    """
+    tagged = 0
+    for module in model.modules():
+        attn = _only_child(module, Attention)
+        o_proj = _only_child(module, RowParallelLinear)
+        if attn is None or o_proj is None:
+            continue
+        if hasattr(o_proj, ATTN_OUT_FENCE_OP_ATTR):
+            delattr(o_proj, ATTN_OUT_FENCE_OP_ATTR)
+        if (
+            not isinstance(o_proj.quant_method, VllmFp8LinearMethodTPU)
+            or not isinstance(o_proj.weight, torch.Tensor)
+            or not o_proj.weight.dtype.is_floating_point
+        ):
+            continue
+        if get_chip_version() not in _FENCED_ATTN_OUT_CHIPS:
+            continue
+        # Extra query-side heads carry an output gate that is multiplied into
+        # the attention output before `o_proj`. XLA fuses that multiply into
+        # the quantization and leaves no `f32` relayout to remove, so a fence
+        # there only adds a pass that writes the gated `bf16` tensor to HBM.
+        qkv_proj = _only_child(module, QKVParallelLinear)
+        if qkv_proj is not None and qkv_proj.num_heads != attn.num_heads:
+            continue
+        setattr(o_proj, ATTN_OUT_FENCE_OP_ATTR, optimization_barrier_op())
+        tagged += 1
+    return tagged
 
 
 def resolve_online_fp8(
