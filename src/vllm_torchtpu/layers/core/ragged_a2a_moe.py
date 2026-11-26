@@ -68,7 +68,14 @@ from vllm_torchtpu.kernels.megablox.row_copy import (
     copy_send_rows,
     copy_send_rows_fp8,
     fp8_rows_supported,
+    fp8_source_rows,
     row_copies_fit,
+)
+from vllm_torchtpu.kernels.megablox.sc_dispatch import (
+    sc_dispatch,
+    sc_dispatch_supported,
+    sc_drain,
+    sc_send_plan,
 )
 from vllm_torchtpu.layers.core.fused_moe_gmm import (
     fused_moe_func,
@@ -85,6 +92,9 @@ _ROUTE_TILE = 128
 # Largest factor used where the full-size exchange stays on the one-hot path:
 # its rerun is cheap there, so larger buffers cost more than they save.
 _ONEHOT_FALLBACK_FACTOR = 2.0
+# The SC dispatch's barrier semaphore: the expert kernels take 1 and 2,
+# `dma_all_gather` 6.
+_SC_DISPATCH_COLLECTIVE_ID = 8
 
 
 def _member_index(
@@ -824,6 +834,7 @@ def _capacity_exchange(
     planned=None,
     fp8=None,
     route_kernel=None,
+    sc_send=None,
 ):
     """Send and receive buffers of ``rows`` rows, filled without gaps.
 
@@ -854,6 +865,12 @@ def _capacity_exchange(
     gathered routing, which computes the routes `route_plan` gives (and the
     fp8 receive rows' scales, and the owner combine's `owner_plan`) in one
     kernel.
+    ``sc_send`` (with ``fp8``, ``route_kernel`` and the owner combine's
+    ``streamed``): `sc_send_plan` bound to the gathered routing, taking
+    ``fits``. A SparseCore kernel then sends each route's fp8 row straight to
+    its row of the receiver's route order (`sc_dispatch`), and the expert
+    kernel computes on each local expert's rows as they land, instead of the
+    send copy, the all-to-all and the row gather (same rows, same result).
     """
     num_tokens, hidden = x.shape
     local_num_experts = w1.shape[0]
@@ -908,6 +925,20 @@ def _capacity_exchange(
         )
         row_scale = None
         extra = {}
+        if sc_send is not None:
+            assert fp8_rows and route_kernel is not None
+            return _sc_exchange(
+                x,
+                fits,
+                dp_pos,
+                fp8=fp8,
+                route_kernel=route_kernel,
+                sc_send=sc_send,
+                streamed=streamed,
+                dp_size=dp_size,
+                local_num_experts=local_num_experts,
+                routes=routes,
+            )
         if route_kernel is not None:
             local_plan = route_kernel(
                 fits=fits.astype(jnp.int32)[None],
@@ -1051,6 +1082,64 @@ def _capacity_exchange(
     back = jnp.concatenate([back, jnp.zeros((1, hidden), back.dtype)], axis=0)
     partials = back[out_row.T]  # [D, S, H]; tokens that skipped d read the zero row
     return partials.astype(jnp.float32).sum(axis=0).astype(x.dtype)
+
+
+def _sc_exchange(
+    x,
+    fits,
+    dp_pos,
+    *,
+    fp8,
+    route_kernel,
+    sc_send,
+    streamed,
+    dp_size,
+    local_num_experts,
+    routes,
+):
+    """`_capacity_exchange` with the SC dispatch (see ``sc_send`` there).
+
+    The dispatch's receive buffer, landing in `local_route_plan` order, is
+    the expert kernel's lhs, route ``j`` scaled by the route plan's
+    ``route_scale[j]``. The dispatch kernel exits once its copies are issued;
+    `sc_drain` waits for them while the TensorCore runs the route plan and
+    the experts."""
+    inv_scale, gathered_scale = fp8
+    fits_word = fits.astype(jnp.int32)[None]
+    send = sc_send(fits_word)
+    src = fp8_source_rows(x, inv_scale)
+    recv, wave_sems, send_sem = sc_dispatch(
+        src,
+        send.table,
+        axis=DP_AXIS,
+        num_members=dp_size,
+        num_waves=local_num_experts,
+        recv_rows=routes,
+        collective_id=_SC_DISPATCH_COLLECTIVE_ID,
+    )
+    drained = sc_drain(send_sem, src, send.table, axis=DP_AXIS)
+    local_plan = route_kernel(fits=fits_word, scale=gathered_scale, route_scale=True)
+    extra = {}
+    if local_plan.owner is not None:
+        extra["owner_arrays"] = local_plan.owner
+    out = streamed(
+        recv,
+        None,
+        None,
+        None,
+        None,
+        dp_pos,
+        fits,
+        plan=local_plan[:4],
+        wave_lhs=(recv, local_plan.route_scale, wave_sems, send.sentinels),
+        **extra,
+    )
+    # The drain's result must have a reader, or XLA drops the drain and frees
+    # the source rows under the copies. Tied to the MoE result, it neither
+    # holds back the expert kernel (which would wait for this member's sends
+    # instead of its own rows) nor lets the next layer's dispatch, which
+    # reads this result, start before this one's sends are done.
+    return jax.lax.optimization_barrier((out, drained))[0]
 
 
 def _streamed_combine(
@@ -1453,6 +1542,7 @@ def _owner_combine(
     owner_tail=False,
     row_scale=None,
     owner_arrays=None,
+    wave_lhs=None,
 ):
     """The expert kernel sends each output row to its token's OWNER rank: TP rank
     ``t // ceil(S / tp)`` of the token's engine owns token ``t``. The owner sums
@@ -1464,7 +1554,9 @@ def _owner_combine(
     the owned tokens and copies them to the engine's TP ranks in its tail (see
     `gmm_v2_mlp_scatter`), instead of `owner_sum_kernel` and the all-gather:
     same sums, same rows. ``owner_arrays``: this rank's `owner_plan`, when
-    the route plan kernel computed it."""
+    the route plan kernel computed it. ``wave_lhs`` (with ``plan``): the
+    routes' rows land in route order while the expert kernel runs (see
+    `fused_moe_scatter_planned`); ``received`` is not read."""
     num_tokens = x.shape[0]
     local = w1.shape[0]
     mesh = dict(dp_size=dp_size, tp_size=tp_size, local_num_experts=local)
@@ -1518,6 +1610,7 @@ def _owner_combine(
             src_rows=src_rows,
             tail=tail,
             row_scale=row_scale,
+            wave_lhs=wave_lhs,
             activation=activation,
             rhs_quant_dtype=rhs_quant_dtype,
             num_recv_rows=blk * topk,
@@ -1608,6 +1701,7 @@ def ragged_a2a_moe_local(
     whole_group: bool = False,
     fp8_dispatch: bool = False,
     route_plan_kernel: bool = False,
+    sc_dispatch: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Per-rank body (inside shard_map over the (dp, tp) mesh).
@@ -1681,6 +1775,13 @@ def ragged_a2a_moe_local(
     combine's `owner_plan`) from the gathered routing with a counting sort,
     instead of XLA's sort over the group's every route and its scatters
     (same arrays).
+    ``sc_dispatch`` (with ``fp8_dispatch``, ``whole_group``, ``owner_combine``
+    and ``route_plan_kernel``): where those run and `sc_dispatch_supported`
+    holds, a SparseCore kernel sends each route's fp8 row to its row of the
+    receiver's route order and the expert kernel computes on each local
+    expert's rows as they land, instead of the send copy, the all-to-all and
+    the row gather (same result). Its remote copies need libtpu's
+    ``--xla_mosaic_unsafe_allow_multicore_remote_dma=true``.
     """
     assert shared is None or owner_combine
     assert not owner_tail or owner_combine
@@ -1942,6 +2043,31 @@ def ragged_a2a_moe_local(
             rows=rows,
             routes=routes,
         )
+    sc_send = None
+    if (
+        sc_dispatch
+        and whole
+        and fp8 is not None
+        and owner_combine
+        and route_kernel is not None
+        and x.dtype == jnp.bfloat16
+        and routes % 16 == 0
+        and sc_dispatch_supported(
+            num_members=dp_size,
+            num_tokens=num_tokens,
+            local_num_experts=local_num_experts,
+            recv_rows=routes,
+        )
+    ):
+        sc_send = functools.partial(
+            sc_send_plan,
+            gathered_words,
+            (experts_start // local_num_experts).astype(jnp.int32),
+            local_num_experts=local_num_experts,
+            tp_size=tp_size,
+            skip_padded=skip_padded_tokens,
+            recv_rows=routes,
+        )
     out = _capacity_exchange(
         x,
         w1,
@@ -1964,6 +2090,7 @@ def ragged_a2a_moe_local(
         planned=planned,
         fp8=fp8 if planned is not None else None,
         route_kernel=route_kernel,
+        sc_send=sc_send,
     )
     out = finish(out, capacity_streamed is not None)
     if whole:
@@ -2003,6 +2130,7 @@ def ragged_a2a_moe(
     whole_group: bool = False,
     fp8_dispatch: bool = False,
     route_plan_kernel: bool = False,
+    sc_dispatch: bool = False,
     shared: jax.Array | None = None,
 ) -> jax.Array:
     """Global-view entry: every operand is the ranks' local arrays stacked on
@@ -2035,6 +2163,7 @@ def ragged_a2a_moe(
         whole_group=whole_group,
         fp8_dispatch=fp8_dispatch,
         route_plan_kernel=route_plan_kernel,
+        sc_dispatch=sc_dispatch,
     )
 
     scaled = w1_scale is not None

@@ -14,7 +14,10 @@
 """Capacity exchange that moves fp8 token rows with a float32 scale per token
 (``fp8_dispatch``): close to the bf16 exchange (the expert inputs carry fp8
 rounding). The route plan kernel (``route_plan_kernel``) leaves either
-exchange's result bitwise unchanged."""
+exchange's result bitwise unchanged, and so does the SparseCore dispatch
+(``sc_dispatch``).
+
+A broken SC dispatch protocol hangs rather than fails: its tests time out."""
 
 import functools
 import re
@@ -37,6 +40,11 @@ INTER = 512
 # The fp8 row gather and the route plan kernel in a lowered program.
 FP8_GATHER = re.compile(r"row_copy_gather-[A-Za-z0-9_\-]*-f8\b")
 ROUTE_PLAN = re.compile(r"local_route_plan-")
+SC_DISPATCH = re.compile(r"\bsc_dispatch\b(?!_)")
+# The SC dispatch's remote copies from the SparseCore into TensorCore memory.
+# A global flag (Mosaic's per-kernel flags do not take it); production passes
+# it in LIBTPU_INIT_ARGS.
+SC_FLAGS = dict(xla_mosaic_unsafe_allow_multicore_remote_dma=True)
 
 
 def _require_eight_tpu_devices():
@@ -179,3 +187,66 @@ def test_route_plan_kernel_is_bitwise(layout, whole_group, fp8_dispatch):
     np.testing.assert_array_equal(
         np.asarray(got).view(np.uint16), np.asarray(base).view(np.uint16)
     )
+
+
+def _sc_layouts():
+    """The owner-combine layouts: the SC dispatch takes those with at most 64
+    tokens per engine."""
+    return [i for i, layout in enumerate(LAYOUTS) if layout[-1] == "owner"]
+
+
+def _sc_run(common, compiler_options, layers=1):
+    """``layers`` exchanges back to back in one jit, each layer's routing the
+    previous one's with the expert ids shifted (whole local blocks plus one)
+    and its tokens the previous layer's result."""
+    num_experts = 64
+
+    def run(x, w1, w2, s1, s2, weights, ids, es, **kwargs):
+        outs = []
+        for layer in range(layers):
+            shifted = (ids + layer * (num_experts // 8 + 1)) % num_experts
+            x = ragged_a2a_moe(
+                x, w1, w2, s1, s2, weights, shifted, es, **common, **kwargs
+            )
+            outs.append(x)
+        return jnp.stack(outs)
+
+    return jax.jit(run, compiler_options=compiler_options)
+
+
+def _check_sc_bitwise(layout, *, layers, compiler_options):
+    stacked, common, kwargs = _setup(layout, whole_group=True)
+    common.update(fp8_dispatch=True, route_plan_kernel=True)
+    run = _sc_run(dict(common, sc_dispatch=True), compiler_options, layers)
+    lowered = run.lower(*stacked, **kwargs).as_text()
+    num_tokens = LAYOUTS[layout][2]
+    taken = num_tokens <= 64
+    assert bool(SC_DISPATCH.search(lowered)) == taken
+    assert bool(FP8_GATHER.search(lowered)) != taken
+    base = _sc_run(common, None, layers)(*stacked, **kwargs)
+    got = run(*stacked, **kwargs)
+    assert np.abs(np.asarray(base).astype(np.float32)).max() > 0
+    np.testing.assert_array_equal(
+        np.asarray(got).view(np.uint16), np.asarray(base).view(np.uint16)
+    )
+
+
+@pytest.mark.multichip
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("layout", _sc_layouts())
+def test_sc_dispatch_is_bitwise(layout):
+    """Every rank's result with the SC dispatch equals the fp8 exchange's
+    bitwise with whole-group sizes and the owner combine: TP 1 / 2 / 4, top-10
+    and top-2, padded tokens skipped and routing skewed onto one DP member
+    (an engine with more tokens falls back to the all-to-all)."""
+    _check_sc_bitwise(layout, layers=1, compiler_options=SC_FLAGS)
+
+
+@pytest.mark.multichip
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize("layout", [1, 4, 7])
+def test_sc_dispatch_layers_back_to_back(layout):
+    """Three layers in one jit, each routing differently, every one bitwise
+    the fp8 exchange's: the dispatch's barrier and wave semaphores are reused
+    from layer to layer."""
+    _check_sc_bitwise(layout, layers=3, compiler_options=SC_FLAGS)
