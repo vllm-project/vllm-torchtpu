@@ -231,13 +231,24 @@ def _gather_sc_banked_deep(words, scales, records):
     assert info is not None
     lanes = info.num_lanes
     cores = info.num_cores * info.num_subcores
-    streams, subchunks, slots = (4 if len(words) == 1 else 2), 512 // lanes, 3
+    streams, slots = (4 if len(words) == 1 else 2), 3
+    # A smaller per-subcore strip covers the 48-row decode chunk without
+    # scheduling pad-only stripes through the sparse DMA and the HBM stores.
+    strip_rows = 512
+    if records.shape[0] == 48:
+        while (
+            records.size % (cores * strip_rows)
+            and strip_rows // 2 >= 2 * streams * lanes
+        ):
+            strip_rows //= 2
+    subchunks = strip_rows // lanes
     block = cores * lanes * subchunks
     count = records.size
     padding = -count % block
     indices = jnp.pad(records.reshape(-1), (0, padding), constant_values=-1)
-    zero_words = jnp.zeros((8, 128), jnp.int32)
-    zero_scales = jnp.zeros((8,), jnp.float32)
+    zero_rows = cores * streams * lanes
+    zero_words = jnp.zeros((zero_rows, 128), jnp.int32)
+    zero_scales = jnp.zeros((zero_rows,), jnp.float32)
     mesh = plsc.VectorSubcoreMesh(
         num_cores=info.num_cores,
         num_subcores=info.num_subcores,
@@ -282,8 +293,17 @@ def _gather_sc_banked_deep(words, scales, records):
                                 jnp.where(own, local, -1),
                             )
                         )
+                    # Distinct zero-source rows avoid routing every masked
+                    # lane through a single physical DMA address.
+                    zero_ids = (core * streams + stream) * lanes + jnp.arange(
+                        lanes, dtype=jnp.int32
+                    )
                     targets.append(
-                        (zero_word_ref, zero_scale_ref, jnp.where(selected < 0, 0, -1))
+                        (
+                            zero_word_ref,
+                            zero_scale_ref,
+                            jnp.where(selected < 0, zero_ids, -1),
+                        )
                     )
                     for word_src, scale_src, rows in targets:
                         indexed = plsc.Indices(rows, ignored_value=-1)
