@@ -351,6 +351,7 @@ if TYPE_CHECKING:
     TPU_SKIP_DEVICE_SAMPLING_METADATA: bool = False
     TPU_REUSE_UNCHANGED_BLOCK_TABLES: bool = False
     TPU_SAMPLER_TOP_P_KERNEL: bool = False
+    TPU_MOE_ONEHOT_BOUNDED_SUBLANE_TOKENS: bool = False
     TPU_MINIMAX_M3_KV4_INDEXER_LARGE_BLOCK_Q: int = 0
 
 
@@ -2391,6 +2392,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sums run in another order. Takes precedence over
     # TPU_SAMPLER_TOPP_CANDIDATES on the steps it serves.
     "TPU_SAMPLER_TOP_P_KERNEL": env_bool("TPU_SAMPLER_TOP_P_KERNEL", default=False),
+    # The bounded one-hot MoE permute/unpermute kernels also take token counts
+    # past 256 that are whole bf16 sublane tiles (multiples of 16), not only
+    # multiples of 128: the 320/352/416/448/480-token decode buckets. Exact.
+    "TPU_MOE_ONEHOT_BOUNDED_SUBLANE_TOKENS": env_bool(
+        "TPU_MOE_ONEHOT_BOUNDED_SUBLANE_TOKENS", default=False
+    ),
     # MiniMax M3 4-bit index caches (--kv-cache-dtype int4_per_token_head):
     # query rows per tile of the MSA indexer's large (prefill) class, instead
     # of its default 512, on steps of at least twice that many query rows.
