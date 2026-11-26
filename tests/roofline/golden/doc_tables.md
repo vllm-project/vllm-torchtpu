@@ -17,7 +17,7 @@ TPU serving cache policy: `--kv-dtype fp8` for all checkpoints and `--state-dtyp
 
 | Model | Slice | Legal Candidates | Top Layout | TPOT Floor (ms) | Est. Tput (tok/s/chip) | Ceiling (tok/s/chip) |
 | :--- | :--- | ---: | :--- | ---: | ---: | ---: |
-| `glm_5_2_fp8` | `2x2x1` | 102 | `TP2 x DP2 x EP4 x PP2 x DCP2` | 4.28 | 3,412.7 | 33,057.2 |
+| `glm_5_2_fp8` | `2x2x1` | 102 | `TP2 x DP2 x EP4 x PP2 x DCP2` | 4.28 | 3,412.7 | 33,053.6 |
 | `glm_5_2_fp8` | `2x2x2` | 429 | `TP2 x DP8 x EP16 x DCP2` | 3.52 | 4,047.4 | 19,611.6 |
 | `glm_5_2_fp8` | `2x2x4` | 1134 | `TP2 x DP8 x EP16 x DCP2` | 3.52 | 4,047.4 | 19,611.6 |
 | `glm_5_2_nvfp4` | `2x2x1` | 120 | `TP2 x DP4 x EP8 x DCP2` | 5.59 | 5,012.3 | 24,794.0 |

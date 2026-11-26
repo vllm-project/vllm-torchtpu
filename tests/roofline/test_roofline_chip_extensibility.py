@@ -568,3 +568,86 @@ def test_count_hosts_rounds_up_partial_hosts(
             assert (
                 count_hosts(num_chips, chips_per_host=chips_per_host) == expected_hosts
             )
+
+
+def test_disagg_offload_uses_custom_chip_spec() -> None:
+    """Verify disagg offload PCIe latency and PP breakdowns honor custom ChipSpec."""
+    config = load_locked_config("qwen3_5_397b_fp8.json")
+    geometry = from_hf_config(config)
+    dtypes = rf.dtypes_from_hf_config(config)
+    base_chip = CHIPS["tpu7x"]
+    fast_pcie = _build_spec_chip(
+        {
+            "name": "fast_pcie_test",
+            "provenance": "public_spec",
+            "hbm_bytes": base_chip.hbm_bytes,
+            "hbm_bw": base_chip.hbm_bw,
+            "bf16_flops": base_chip.bf16_flops,
+            "fp8_flops": base_chip.fp8_flops,
+            "ici_bw": base_chip.ici_bw,
+            "d2d_bw": base_chip.d2d_bw,
+            "pcie_bw": 64.0e9,
+            "dcn_bw": base_chip.dcn_bw,
+        },
+        base_chip,
+    )
+    slow_pcie = _build_spec_chip(
+        {
+            "name": "slow_pcie_test",
+            "provenance": "public_spec",
+            "hbm_bytes": base_chip.hbm_bytes,
+            "hbm_bw": base_chip.hbm_bw,
+            "bf16_flops": base_chip.bf16_flops,
+            "fp8_flops": base_chip.fp8_flops,
+            "ici_bw": base_chip.ici_bw,
+            "d2d_bw": base_chip.d2d_bw,
+            "pcie_bw": 2.0e9,
+            "dcn_bw": base_chip.dcn_bw,
+        },
+        base_chip,
+    )
+    scen = rf.TrafficScenario(
+        name="custom-pcie-offload",
+        isl=16384,
+        osl=256,
+        prefix_hit_rate=0.95,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=30.0,
+        kv_offload_gb=64.0,
+    )
+    topo_set = (rf.TOPOLOGIES["2x2x1"],)
+    opts = rf.SolveOptions(
+        mode="disagg",
+        max_chips=8,
+        topologies=topo_set,
+        prefill_topology="2x2x1",
+        decode_topology="2x2x1",
+        pd_ratio=(1, 1),
+        include_pairs=True,
+    )
+    plan_fast = rf.solve_serving_plan(geometry, dtypes, fast_pcie, scen, opts)
+    plan_slow = rf.solve_serving_plan(geometry, dtypes, slow_pcie, scen, opts)
+    assert plan_fast.recommended is not None
+    assert plan_slow.recommended is not None
+    fast_rec = plan_fast.recommended
+    assert fast_rec.prefill_pool is not None
+    slow_same = next(
+        cand
+        for cand in plan_slow.candidates
+        if cand.prefill_pool is not None
+        and cand.prefill_pool.tp == fast_rec.prefill_pool.tp
+        and cand.prefill_pool.dp == fast_rec.prefill_pool.dp
+        and cand.prefill_pool.pp == fast_rec.prefill_pool.pp
+        and cand.prefill_pool.ep == fast_rec.prefill_pool.ep
+        and cand.prefill_pool.pcp == fast_rec.prefill_pool.pcp
+        and cand.prefill_pool.moe_dispatch == fast_rec.prefill_pool.moe_dispatch
+        and cand.decode_pool.tp == fast_rec.decode_pool.tp
+        and cand.decode_pool.dp == fast_rec.decode_pool.dp
+        and cand.decode_pool.pp == fast_rec.decode_pool.pp
+        and cand.decode_pool.ep == fast_rec.decode_pool.ep
+        and cand.decode_pool.kv_split == fast_rec.decode_pool.kv_split
+        and cand.decode_pool.moe_dispatch == fast_rec.decode_pool.moe_dispatch
+    )
+    assert slow_same.est_ttft_ms > fast_rec.est_ttft_ms

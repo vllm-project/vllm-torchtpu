@@ -31,6 +31,7 @@ from .chips import (
     override_chip_ici_bw,
 )
 from .constants import (
+    BITS_PER_BYTE,
     DEFAULT_HBM_RESERVE_GB,
     EXAMPLE_CONCURRENCIES,
     EXAMPLE_SLO_TIERS,
@@ -151,7 +152,13 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
         choices=("one_shot", "two_shot", "ring"),
     )
     _add_dtype_override_args(parser)
-    parser.add_argument("--ici-bw-gbps", type=float, default=None)
+    parser.add_argument(
+        "--ici-bw-gbytes-per-s",
+        "--ici-bw-gbps",
+        dest="ici_bw_gbps",
+        type=float,
+        default=None,
+    )
     parser.add_argument("--collective-latency-us", type=float, default=None)
     parser.add_argument("--json", action="store_true")
 
@@ -183,7 +190,27 @@ def _add_scenario_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--accept-len", type=float, default=None)
     parser.add_argument("--think-time-s", type=float, default=None)
     _add_dtype_override_args(parser)
-    parser.add_argument("--ici-bw-gbps", type=float, default=None)
+    parser.add_argument(
+        "--ici-bw-gbytes-per-s",
+        "--ici-bw-gbps",
+        dest="ici_bw_gbps",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--dcn-gbit-per-s",
+        "--dcn-gbps",
+        dest="dcn_gbps",
+        type=float,
+        default=None,
+        help="Override per-chip DCN bandwidth in Gbit/s.",
+    )
+    parser.add_argument(
+        "--kv-offload-gb",
+        type=float,
+        default=None,
+        help="Host DRAM KV cache offloading capacity per instance in GiB.",
+    )
     parser.add_argument(
         "--hbm-reserve-gb",
         type=float,
@@ -344,6 +371,7 @@ def _resolve_scenario(
                 think_time_s=args.think_time_s,
                 ttft_slo_ms=args.ttft_slo_ms,
                 tpot_slo_ms=args.tpot_slo_ms,
+                kv_offload_gb=vars(args).get("kv_offload_gb"),
             ),
         )
     if (
@@ -369,6 +397,7 @@ def _resolve_scenario(
         kv_working_set_turns=1.0,
         ttft_slo_ms=args.ttft_slo_ms,
         tpot_slo_ms=args.tpot_slo_ms,
+        kv_offload_gb=vars(args).get("kv_offload_gb") or 0.0,
     )
 
 
@@ -656,7 +685,16 @@ def _write_reference_summary(ref_report: ReferenceLayoutReport | None) -> None:
 def _apply_chip_overrides(chip: ChipSpec, args: argparse.Namespace) -> ChipSpec:
     """Apply explicit CLI bandwidth overrides to a ChipSpec."""
     if args.ici_bw_gbps is not None:
-        return override_chip_ici_bw(chip, args.ici_bw_gbps * UNIT_GIGA)
+        chip = override_chip_ici_bw(chip, args.ici_bw_gbps * UNIT_GIGA)
+    dcn_gbps = vars(args).get("dcn_gbps")
+    if dcn_gbps is not None:
+        _require_positive_finite("--dcn-gbit-per-s", dcn_gbps)
+        chip = replace(
+            chip,
+            dcn_bw=(dcn_gbps * UNIT_GIGA) / BITS_PER_BYTE,
+            dcn_host_gbit_per_s=dcn_gbps * float(max(1, chip.chips_per_host)),
+            dcn_bw_overridden=True,
+        )
     return chip
 
 
