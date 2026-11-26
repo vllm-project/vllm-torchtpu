@@ -36,6 +36,13 @@ from vllm_torchtpu.models.minimax_m3.kernels import msa_attention, msa_fp4
 # (standalone 4-bit 8-token tiles at served-c48-like dispersion: 2.00 -> 1.83
 # ms, j-492a1bb9).
 _STEP_WIDTHS = (4, 8, 16, 24, 32, 48)
+# 4-bit `attend_t` groups (prefill-size calls) also run at 12 pages, the
+# union of a 64-token tile whose tokens select much the same blocks, in one
+# body per width (`_one_body`). Kernel bench, c48 2048-token call at
+# locality .999: 96.5 -> 85.3 us; tiles of 12 fixed pages 91.5 -> 74.8 us.
+# Their bodies are many and large: with the single-group copies as well,
+# 12 bodies ran a c48 call 8 % slower and 16 bodies 8x slower.
+_STEP_WIDTHS_4BIT_T = (4, 8, 12, 16, 24, 48)
 # Units also run at 12 pages, the width of c48-like decode groups (one KV
 # head, 22-34 requests, locality .97: -8..-9 % per call). Calls that run
 # groups alone do not take it: a 64-page head-parallel prefill call
@@ -378,7 +385,11 @@ def _kernel(
             ]
         else:
             kv_refs = [buf_ref.at[half, g] for g in range(pages_per_step)]
-        widths = [n for n in _STEP_WIDTHS if n < pages_per_step] + [pages_per_step]
+        # 4-bit `attend_t` groups run one body per width whether or not their
+        # tile has other groups (`attend_t_any`): half the code.
+        one_body = fp4 and transposed and MAX_FREE
+        step_widths = _STEP_WIDTHS_4BIT_T if one_body else _STEP_WIDTHS
+        widths = [n for n in step_widths if n < pages_per_step] + [pages_per_step]
 
         def zero_to(span):
             """Zeroes the value rows of the ring slots from the group's pages
@@ -412,7 +423,7 @@ def _kernel(
             l_ref[...] = jnp.zeros_like(l_ref)
             acc_ref[...] = jnp.zeros_like(acc_ref)
 
-        if not unit:
+        if not unit and not one_body:
             pl.when(first & jnp.logical_not(last))(init_state)
 
         def put(out):  # [H * Bq, D] or [H, Bq, D]
@@ -486,7 +497,7 @@ def _kernel(
                 l_ref[...] = l_new
                 acc_ref[...] = acc_new
 
-        def attend_t(width, single):
+        def attend_t_parts(width, single):
             """`attend` for 8/16-bit caches on transposed scores ``s^T [keys,
             rows]``: the max and sum over keys are sublane reductions, the
             output accumulates as ``acc^T [D, rows]`` across the p @ v
@@ -593,7 +604,27 @@ def _kernel(
                 preferred_element_type=jnp.float32,
             )  # [D + _SUM_ROWS, rows]
             l_cur, pv = pv[head_dim : head_dim + 1], pv[:head_dim]
-            update(m_prev, m_new, l_cur, pv, single, finish_t)
+            return m_prev, m_new, l_cur, pv
+
+        def attend_t(width, single):
+            update(*attend_t_parts(width, single), single, finish_t)
+
+        def attend_t_any(width):
+            """`attend_t` (`MAX_FREE`) for a group whether or not it is its
+            tile's only one: a first group carries nothing in, a last one
+            writes the output."""
+            _, _, l_cur, pv = attend_t_parts(width, False)
+            l_new = jnp.where(first, l_cur, l_ref[...] + l_cur)
+            acc_new = jnp.where(first, pv, acc_ref[...] + pv)
+
+            @pl.when(last)
+            def _finalize():
+                finish_t(0.0, l_new, acc_new)
+
+            @pl.when(jnp.logical_not(last))
+            def _carry():
+                l_ref[...] = l_new
+                acc_ref[...] = acc_new
 
         def finish_t(m, denom, acc_t):
             """`finish` for `attend_t`'s lane-vector state."""
@@ -788,6 +819,9 @@ def _kernel(
             fits = count > (widths[i - 1] if i else 0)
             if width < pages_per_step:
                 fits = fits & (count <= width)
+            if one_body:
+                pl.when(fits)(functools.partial(attend_t_any, width))
+                continue
             body = attend_t if transposed else attend
             pl.when(fits & single)(functools.partial(body, width, True))
             pl.when(fits & jnp.logical_not(single))(

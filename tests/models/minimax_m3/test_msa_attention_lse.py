@@ -429,6 +429,53 @@ def test_fp4_lse_wide_groups(
     _check(got, want)
 
 
+@pytest.mark.parametrize("union", [5, 12, 20, 40])
+def test_fp4_lse_prefill_tiles_match_reference(union, monkeypatch):
+    """4-bit 64-token tiles of 16 query heads in 32-page groups (the c48
+    prefill calls): every token of a tile selects among the same `union`
+    pages, so its tile runs one group at width 8, 12 or 24, or two groups
+    (the second carrying the first's sums), in the one-body form
+    (`_STEP_WIDTHS_4BIT_T`)."""
+    monkeypatch.setitem(globals(), "Q_PER_KV", 16)
+    monkeypatch.setitem(globals(), "PAGES", 96)
+    monkeypatch.setitem(globals(), "TOPK", 16)
+    rng = np.random.default_rng(31 + union)
+    num_tokens = 128
+    q, _, _, table, keys, local_key, local_limit = _inputs(
+        rng, num_tokens, num_tokens, 1, jnp.bfloat16
+    )
+    for t0 in range(0, num_tokens, 64):
+        pool = rng.choice(PAGES, union, replace=False)
+        for t in range(t0, t0 + 64):
+            picked = rng.choice(pool, min(union, TOPK), replace=False)
+            keys[t, 0] = np.pad(picked, (0, TOPK - len(picked)), constant_values=-1)
+            local_key[t] = pool[t % union]
+    kv, scales, rows = _fp4_cache(rng, 1)
+    got = msa_sparse_attention_lse(
+        q,
+        kv,
+        jnp.asarray(keys[:, 0]),
+        jnp.asarray(local_key),
+        jnp.asarray(local_limit),
+        jnp.asarray(table),
+        sm_scale=SCALE,
+        block_q=64,
+        pages_per_step=32,
+        scale_cache=jnp.asarray(scales),
+        interpret=True,
+    )
+    want = _reference(
+        np.asarray(q.astype(jnp.float32)),
+        rows,
+        keys[:, 0],
+        local_key,
+        local_limit,
+        table,
+        0,
+    )
+    _check(got, want)
+
+
 @pytest.mark.parametrize("dtype", [*CACHE_DTYPES, "int4"])
 @pytest.mark.parametrize(
     "num_tokens,num_real,pages_per_step,most_tiles",
