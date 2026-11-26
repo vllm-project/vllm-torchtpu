@@ -735,11 +735,12 @@ def moe_gmm(
         if envs.TPU_MOE_TC_COMBINE and tc_combine.supported(
             num_tokens, gmm2_res.shape[-1], topk, group_sizes.shape[0], gmm2_res.dtype
         ):
+            # Non-local routes sort after the valid prefix, so the positions
+            # alone mark them.
             return tc_combine.tc_combine(
                 gmm2_res,
                 argsort_revert_indices,
                 topk_weights_flat,
-                valid_mask_flat,
                 group_sizes,
                 topk=topk,
             ).astype(x.dtype)

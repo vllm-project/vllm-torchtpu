@@ -13,9 +13,9 @@
 # limitations under the License.
 """TensorCore MoE combine for expert-sorted GMM output (EP, large batches).
 
-out[t] = sum_j w[t, j] * x[pos[t, j]] over the token's valid (local) routes,
-where x holds the routed rows grouped by local expert and, within an expert,
-in ascending token order (the stable sorts in fused_moe_gmm guarantee it). So
+out[t] = sum_j w[t, j] * x[pos[t, j]] over the token's local routes, where x
+holds the routed rows grouped by local expert and, within an expert, in
+ascending token order (the stable sorts in fused_moe_gmm guarantee it). So
 for a block of TB tokens, expert e's rows are one contiguous range of x. Each
 block DMAs the 16-row tiles covering its ranges (aligned: bf16 rows are packed
 in pairs, so a single row is not a DMA unit) into VMEM, and an MXU product
@@ -77,57 +77,113 @@ def supported(num_tokens: int, hidden: int, topk: int, num_experts: int, dtype) 
     return pick_token_block(num_tokens, hidden, topk, num_experts) > 0
 
 
-def _plan(pos, valid, group_sizes, num_tokens: int, topk: int, token_block: int):
-    """Per block: the x tiles to load (in buffer order) and their count, and
-    each route's row in the block's buffer (-1: not a local route)."""
-    num_experts = group_sizes.shape[0]
-    nb = num_tokens // token_block
-    ends = jnp.cumsum(group_sizes)
-    expert = jnp.sum(pos[:, None] >= ends[None, :], axis=1, dtype=jnp.int32)
-    valid = valid & (expert < num_experts)
+def plan_stride(maxt: int) -> int:
+    """Entries per block in the plan table: `maxt` tile slots, then the
+    block's tile count in the last entry, padded to whole lane rows."""
+    return -(-(maxt + 1) // 128) * 128
+
+
+def _plan_kernel(sizes_ref, pos_ref, plan_ref, row_ref):
+    """A block per row, its routes along the lanes, 8 blocks per step; the
+    local experts along the lanes of the per-block tables.
+
+    Per local expert e: the block's routes in group e's rows (pos in
+    [start_e, end_e)) span one contiguous range [lo, hi) of x, since a group
+    holds its tokens in ascending order; routes past the last group are not
+    local. The range's 16-row tiles go into the buffer after those of the
+    experts before e, and a route's buffer row is its pos shifted by where
+    its expert's tiles landed.
+    """
+    num_experts = sizes_ref.shape[0]
+    nb, stride = plan_ref.shape
+    step = 8 if nb % 8 == 0 else nb
     big = jnp.int32(2**30)
-    eid = jnp.arange(num_experts, dtype=jnp.int32)
-    hit = valid[:, None] & (expert[:, None] == eid[None, :])  # [T*k, E]
-    hit = hit.reshape(nb, token_block * topk, num_experts)
-    pos_b = pos.reshape(nb, token_block * topk, 1)
-    lo = jnp.min(jnp.where(hit, pos_b, big), axis=1)  # [nb, E]
-    hi = jnp.max(jnp.where(hit, pos_b + 1, 0), axis=1)
-    present = hi > 0
-    first = jnp.where(present, lo // TILE_ROWS, 0)
-    ntiles = jnp.where(present, -(-hi // TILE_ROWS) - first, 0)
-    tile_end = jnp.cumsum(ntiles, axis=1)  # [nb, E]
-    tile_off = tile_end - ntiles
-    total = tile_end[:, -1]
-    maxt = max_tiles(token_block, topk, num_experts)
-    slot = jnp.arange(maxt, dtype=jnp.int32)
-    slot_expert = jnp.sum(
-        slot[None, :, None] >= tile_end[:, None, :], axis=2, dtype=jnp.int32
+    starts = [jnp.int32(0)]
+    for e in range(num_experts):
+        starts.append(starts[-1] + sizes_ref[e])
+    lane = lax.broadcasted_iota(jnp.int32, (step, 128), 1)
+    slot = lax.broadcasted_iota(jnp.int32, (step, stride), 1)
+    # Inclusive prefix over the expert lanes as a triangular matmul: exact,
+    # the counts are small integers.
+    upper = (
+        lax.broadcasted_iota(jnp.int32, (128, 128), 0)
+        <= lax.broadcasted_iota(jnp.int32, (128, 128), 1)
+    ).astype(jnp.bfloat16)
+
+    def group(g, carry):
+        r0 = pl.multiple_of(g * step, step)
+        pos = pos_ref[pl.ds(r0, step), :]
+        expert = jnp.full(pos.shape, -1, jnp.int32)
+        lo = jnp.full((step, 128), big, jnp.int32)
+        hi = jnp.zeros((step, 128), jnp.int32)
+        for e in range(num_experts):
+            hit = (pos >= starts[e]) & (pos < starts[e + 1])
+            expert = jnp.where(hit, e, expert)
+            lo_e = jnp.min(jnp.where(hit, pos, big), axis=1, keepdims=True)
+            hi_e = jnp.max(jnp.where(hit, pos + 1, 0), axis=1, keepdims=True)
+            lo = jnp.where(lane == e, lo_e, lo)
+            hi = jnp.where(lane == e, hi_e, hi)
+        present = hi > 0
+        first = jnp.where(present, lo // TILE_ROWS, 0)
+        ntiles = jnp.where(present, -(-hi // TILE_ROWS) - first, 0)
+        tile_end = jnp.dot(
+            ntiles.astype(jnp.bfloat16), upper, preferred_element_type=jnp.float32
+        ).astype(jnp.int32)
+        tile_off = tile_end - ntiles
+        total = jnp.max(tile_end, axis=1, keepdims=True)
+        shift = first - tile_off
+
+        # Slot s holds tile s + first[e] - tile_off[e] of the expert e whose
+        # slots [tile_off[e], tile_end[e]) contain it.
+        tiles = slot
+        row = pos
+        for e in range(num_experts):
+            own = (slot >= tile_off[:, e : e + 1]) & (slot < tile_end[:, e : e + 1])
+            tiles = tiles + jnp.where(own, shift[:, e : e + 1], 0)
+            row = row - jnp.where(expert == e, shift[:, e : e + 1] * TILE_ROWS, 0)
+        tiles = jnp.where(slot < total, tiles, 0)
+        plan_ref[pl.ds(r0, step), :] = jnp.where(slot == stride - 1, total, tiles)
+        row_ref[pl.ds(r0, step), :] = jnp.where(expert >= 0, row, -1)
+        return carry
+
+    lax.fori_loop(0, nb // step, group, 0)
+
+
+def _plan(pos, group_sizes, num_tokens: int, topk: int, token_block: int, interpret):
+    """Per block: the x tiles to load (in buffer order) and their count, in
+    one flat table of `plan_stride` entries per block, and each route's row
+    in the block's buffer (-1: not a local route)."""
+    if group_sizes.shape[0] > 128:
+        raise ValueError("the plan holds one local expert per lane")
+    nb = num_tokens // token_block
+    maxt = max_tiles(token_block, topk, group_sizes.shape[0])
+    stride = plan_stride(maxt)
+    routes = token_block * topk
+    plan, rows = pl.pallas_call(
+        _plan_kernel,
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.SMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+        ],
+        out_specs=[
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+            pl.BlockSpec(memory_space=pltpu.VMEM),
+        ],
+        out_shape=[
+            jax.ShapeDtypeStruct((nb, stride), jnp.int32),
+            jax.ShapeDtypeStruct((nb, routes), jnp.int32),
+        ],
+        name="tc_moe_combine_plan",
+        interpret=interpret,
+    )(
+        group_sizes.astype(jnp.int32),
+        pos.reshape(nb, routes),
     )
-    slot_expert = jnp.minimum(slot_expert, num_experts - 1)
-    # Gathers along these small axes lower to slow XLA gathers; one-hot
-    # contractions over the local experts do the same selection.
-    slot_hot = slot_expert[..., None] == eid  # [nb, maxt, E]
-    tiles = (
-        jnp.sum(jnp.where(slot_hot, (first - tile_off)[:, None, :], 0), axis=2)
-        + slot[None, :]
-    )
-    tiles = jnp.where(slot[None, :] < total[:, None], tiles, 0)
-    # A route's buffer row: its expert's buffer offset plus its offset from
-    # the first loaded tile of that expert.
-    shift = (tile_off - first) * TILE_ROWS  # [nb, E]
-    route_shift = jnp.sum(jnp.where(hit, shift[:, None, :], 0), axis=2)
-    row = route_shift + pos.reshape(nb, -1)
-    row = jnp.where(valid.reshape(nb, -1), row, -1)
-    return (
-        tiles.reshape(-1).astype(jnp.int32),
-        total.astype(jnp.int32),
-        row.reshape(num_tokens, topk).astype(jnp.int32),
-    )
+    return plan.reshape(-1), rows.reshape(num_tokens, topk)
 
 
 def _kernel(
-    tiles_ref,  # SMEM [nb * maxt]
-    count_ref,  # SMEM [nb]
+    plan_ref,  # SMEM [nb * stride]: per block, tile slots then the count
     valid_rows_ref,  # SMEM [1]: rows of x the GMM wrote
     row_ref,  # VMEM [TB, k]
     w_ref,  # VMEM [TB, k]
@@ -137,14 +193,17 @@ def _kernel(
     acc,  # VMEM [TB, H] f32
     sems,  # DMA [2]
     *,
-    maxt: int,
+    stride: int,
     topk: int,
 ):
     b = pl.program_id(0)
     nb = pl.num_programs(0)
 
+    def count(block):
+        return plan_ref[block * stride + stride - 1]
+
     def tile_copy(block, i, parity):
-        t = tiles_ref[block * maxt + i]
+        t = plan_ref[block * stride + i]
         return pltpu.make_async_copy(
             x_hbm.at[pl.ds(pl.multiple_of(t * TILE_ROWS, TILE_ROWS), TILE_ROWS)],
             buf.at[parity, pl.ds(pl.multiple_of(i * TILE_ROWS, TILE_ROWS), TILE_ROWS)],
@@ -158,7 +217,7 @@ def _kernel(
             tile_copy(block, i, parity).start()
             return c
 
-        lax.fori_loop(0, count_ref[block], body, 0)
+        lax.fori_loop(0, count(block), body, 0)
 
     @pl.when(b == 0)
     def _():
@@ -169,7 +228,7 @@ def _kernel(
         issue(b + 1)
 
     parity = b % 2
-    n = count_ref[b]
+    n = count(b)
 
     def wait(i, c):
         tile_copy(b, 0, parity).wait()
@@ -195,7 +254,7 @@ def _kernel(
     edge = valid_rows // TILE_ROWS
 
     def mask_edge(i, c):
-        @pl.when((tiles_ref[b * maxt + i] == edge) & (valid_rows % TILE_ROWS != 0))
+        @pl.when((plan_ref[b * stride + i] == edge) & (valid_rows % TILE_ROWS != 0))
         def _():
             start = pl.multiple_of(i * TILE_ROWS, TILE_ROWS)
             tile = buf[parity, pl.ds(start, TILE_ROWS), :]
@@ -251,24 +310,26 @@ def tc_combine(
     x: jax.Array,
     pos: jax.Array,
     weights: jax.Array,
-    valid: jax.Array,
     group_sizes: jax.Array,
     *,
     topk: int,
     interpret=False,
 ) -> jax.Array:
-    """out[t] = sum_j where(valid, weights * x[pos], 0) over j < topk, f32
+    """out[t] = sum_j weights * x[pos] over the local routes j < topk, f32
     accumulation, bf16 out. `x` rows [0, sum(group_sizes)) are the GMM output
     grouped by local expert (sizes `group_sizes`), tokens ascending within a
-    group; `pos`, `weights`, `valid` are flat [T * topk] in token-major order."""
+    group (as the stable sorts in fused_moe_gmm leave them: a block's routes
+    then never need more than `max_tiles` tiles); a route whose `pos` is past
+    them is not local. `pos` and `weights` are flat [T * topk] in token-major
+    order."""
     num_tokens = pos.shape[0] // topk
     hidden = x.shape[1]
     num_experts = group_sizes.shape[0]
     block = pick_token_block(num_tokens, hidden, topk, num_experts)
     nb = num_tokens // block
     maxt = max_tiles(block, topk, num_experts)
-    tiles, counts, rows = _plan(
-        pos.astype(jnp.int32), valid, group_sizes, num_tokens, topk, block
+    plan, rows = _plan(
+        pos.astype(jnp.int32), group_sizes, num_tokens, topk, block, interpret
     )
     if x.shape[0] % TILE_ROWS:
         x = jnp.pad(x, ((0, TILE_ROWS - x.shape[0] % TILE_ROWS), (0, 0)))
@@ -277,7 +338,7 @@ def tc_combine(
     if w.dtype != jnp.bfloat16:
         w = w.astype(jnp.float32)
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=3,
+        num_scalar_prefetch=2,
         grid=(nb,),
         in_specs=[
             pl.BlockSpec((block, topk), lambda b, *_: (b, 0)),
@@ -291,8 +352,8 @@ def tc_combine(
             pltpu.SemaphoreType.DMA((2,)),
         ],
     )
-    combine = pl.pallas_call(
-        functools.partial(_kernel, maxt=maxt, topk=topk),
+    return pl.pallas_call(
+        functools.partial(_kernel, stride=plan_stride(maxt), topk=topk),
         grid_spec=grid_spec,
         out_shape=jax.ShapeDtypeStruct((num_tokens, hidden), jnp.bfloat16),
         compiler_params=pltpu.CompilerParams(
@@ -301,17 +362,4 @@ def tc_combine(
         ),
         interpret=interpret,
         name="tc_moe_combine",
-    )
-    # A block needs more tiles than the buffer holds only if some expert's
-    # rows are not in token order; then take the plain gather.
-    return lax.cond(
-        jnp.any(counts > maxt),
-        lambda: _gather_combine(x, pos, weights, valid, topk),
-        lambda: combine(tiles, counts, valid_rows, rows, w, x),
-    )
-
-
-def _gather_combine(x, pos, weights, valid, topk):
-    rows = x[pos].astype(jnp.float32) * weights.astype(jnp.float32)[:, None]
-    rows = jnp.where(valid[:, None], rows, 0.0)
-    return rows.reshape(-1, topk, x.shape[1]).sum(axis=1).astype(jnp.bfloat16)
+    )(plan, valid_rows, rows, w, x)
