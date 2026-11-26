@@ -510,6 +510,10 @@ class TpuPlatform(Platform):
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
+        "TPU_RAIDEN_DATA_NICS",
+        "WEIGHT_SYNC_PARALLEL_H2H",
+        "RAIDEN_PARALLELISM",
+        "VERIFY_WEIGHTS",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import

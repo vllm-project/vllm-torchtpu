@@ -57,6 +57,11 @@ def _make_vllm_config(profiler_torch_dir=None):
     cfg.model_config.dtype = torch.bfloat16
     cfg.cache_config.cache_dtype = "auto"
     cfg.parallel_config.pipeline_parallel_size = 1
+    cfg.parallel_config.prefill_context_parallel_size = 1
+    cfg.parallel_config.decode_context_parallel_size = 1
+    cfg.parallel_config.data_parallel_index = 0
+    cfg.lora_config = None
+    cfg.speculative_config = None
     cfg.compilation_config.compile_ranges_endpoints = []
     cfg.profiler_config.torch_profiler_dir = profiler_torch_dir
     cfg.additional_config = {}
@@ -808,6 +813,363 @@ def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
 if __name__ == "__mp_main__":
     # The constructor is the boundary preceding executor and TPU initialization.
     EngineCoreProc.__init__ = _engine_init
+
+
+class TestRaidenRLWeightSync:
+    """Verify TPUWorker's Raiden RL weight sync hooks and DP rank preservation."""
+
+    @staticmethod
+    def _make_raiden_worker(tp_size: int = 2):
+        cfg = _make_vllm_config()
+        cfg.parallel_config.tensor_parallel_size = tp_size
+        cfg.parallel_config.data_parallel_size = 1
+        cfg.parallel_config.data_parallel_rank = 0
+        cfg.parallel_config.enable_expert_parallel = False
+        cfg.parallel_config.enable_eplb = False
+        cfg.parallel_config.eplb_config = None
+        cfg.model_config.quantization = None
+        cfg.model_config.hf_config = None
+        worker = _build_worker(cfg)
+        worker.model_runner = MagicMock()
+        worker.model_runner.get_model.return_value = MagicMock()
+        return cfg, worker
+
+    def test_bind_lifecycle_rpcs_and_shutdown(self):
+        from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+        assert "RAIDEN_BIND_IP" not in TpuPlatform.additional_env_vars
+        _, worker = self._make_raiden_worker(tp_size=4)
+        worker._dp_rank = 1
+        worker._dp_size = 2
+
+        assert not worker.has_incomplete_weight_update()
+        with pytest.raises(RuntimeError, match="start_weight_update"):
+            worker.update_weights({})
+        # Idempotent finish_weight_update when inactive does not raise.
+        worker.finish_weight_update()
+        assert not worker.has_incomplete_weight_update()
+
+        fake_sync = MagicMock()
+        fake_sync.matches_binding.return_value = True
+        fake_sync.metadata_dict.return_value = {"unit": {"job_replica_id": "6"}}
+        with (
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_world_size",
+                return_value=4,
+            ),
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.rl.raiden_worker_sync.RaidenWorkerSync",
+                return_value=fake_sync,
+            ) as mock_sync_cls,
+        ):
+            meta = worker.bind_raiden_sync(
+                worker_index=0,
+                parallelism=8,
+                job_name="replica_0",
+            )
+
+        mock_sync_cls.assert_called_once_with(
+            job_name="replica_0",
+            worker_index=0,
+            tp_rank=2,
+            tp_size=4,
+            dp_rank=1,
+            dp_size=2,
+            parallelism=8,
+            auto_h2d=None,
+        )
+        assert meta == {"unit": {"job_replica_id": "6"}}
+
+        with pytest.raises(RuntimeError, match="start_weight_update"):
+            worker.raiden_h2d(uuid=5)
+        worker.start_weight_update(free_kv_cache=True)
+        assert worker.has_incomplete_weight_update()
+        # Idempotent start_weight_update when already active does not raise.
+        worker.start_weight_update()
+        assert worker.has_incomplete_weight_update()
+        with pytest.raises(RuntimeError, match="weight update"):
+            worker.shutdown_weight_transfer_engine()
+        worker.update_weights({"step": 1})
+        assert worker.raiden_h2d(uuid=5) == {}
+        fake_sync.h2d.assert_called_once_with(uuid=5)
+        worker.finish_weight_update()
+        assert not worker.has_incomplete_weight_update()
+
+        assert worker.get_raiden_metadata() == {"unit": {"job_replica_id": "6"}}
+        fake_sync.metrics.return_value = {"last_h2d_time_ms": 1.0}
+        assert worker.raiden_metrics() == {"last_h2d_time_ms": 1.0}
+        worker.refresh_model_state_leaves()
+
+        worker.shutdown_weight_transfer_engine()
+        fake_sync.shutdown.assert_called_once()
+        assert worker._raiden_rl_weight_sync is None
+
+    def test_bind_raiden_sync_falls_back_to_data_parallel_index(self):
+        cfg, worker = self._make_raiden_worker(tp_size=2)
+        cfg.parallel_config.data_parallel_index = 1
+        fake_sync = MagicMock(
+            metadata_dict=MagicMock(return_value={"unit": {"job_replica_id": "3"}})
+        )
+        with (
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank",
+                return_value=1,
+            ),
+            patch("vllm_torchtpu.worker.tpu_worker.utils.get_dp_size", return_value=2),
+            patch(
+                "vllm_torchtpu.rl.raiden_worker_sync.RaidenWorkerSync",
+                return_value=fake_sync,
+            ) as mock_cls,
+        ):
+            worker.bind_raiden_sync(
+                worker_index=0,
+                parallelism=4,
+                job_name="rollout",
+            )
+        assert mock_cls.call_args.kwargs["dp_rank"] == 1
+        assert mock_cls.call_args.kwargs["dp_size"] == 2
+
+        worker._raiden_rl_weight_sync = None
+        cfg.parallel_config.data_parallel_index = 3
+        with (
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            patch("vllm_torchtpu.worker.tpu_worker.utils.get_dp_size", return_value=1),
+            patch(
+                "vllm_torchtpu.rl.raiden_worker_sync.RaidenWorkerSync",
+                return_value=fake_sync,
+            ) as mock_single,
+        ):
+            worker.bind_raiden_sync(
+                worker_index=0,
+                parallelism=4,
+                job_name="rollout",
+            )
+        assert mock_single.call_args.kwargs["dp_rank"] == 0
+        assert mock_single.call_args.kwargs["dp_size"] == 1
+
+    def test_bind_raiden_sync_reuses_sync_when_env_parallelism_set(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from vllm_torchtpu.rl import raiden_worker_sync
+
+        _, worker = self._make_raiden_worker(tp_size=2)
+
+        class RMSNorm(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.ones(8, dtype=torch.bfloat16),
+                    requires_grad=False,
+                )
+
+        model = torch.nn.Module()
+        model.norm = RMSNorm()
+        worker.model_runner.get_model.return_value = model
+
+        ws_inst = MagicMock()
+        ws_inst.num_shards = 1
+        ws_inst.local_port = 19500
+        ws_inst.listener_port = 29500
+        ws_inst.get_local_endpoints.return_value = [
+            {"endpoint": "10.0.0.1:19500", "shards": [0]}
+        ]
+        ws_cls = MagicMock(return_value=ws_inst)
+
+        monkeypatch.setenv("RAIDEN_PARALLELISM", "8")
+        with (
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            patch.object(
+                raiden_worker_sync,
+                "_ws_lib",
+                SimpleNamespace(WeightSynchronizer=ws_cls),
+            ),
+            patch.object(raiden_worker_sync, "_check_bindable"),
+        ):
+            worker.bind_raiden_sync(parallelism=4)
+            first_sync = worker._raiden_rl_weight_sync
+            assert first_sync is not None
+            assert ws_cls.call_args.kwargs["parallelism"] == 8
+            # Re-binding with default parallelism=4 must reuse the sync when
+            # RAIDEN_PARALLELISM=8 overrides it.
+            worker.bind_raiden_sync(parallelism=4)
+            assert worker._raiden_rl_weight_sync is first_sync
+            assert ws_cls.call_count == 1
+            ws_inst.shutdown.assert_not_called()
+
+            # Without env override, changing parallelism recreates the sync.
+            monkeypatch.delenv("RAIDEN_PARALLELISM", raising=False)
+            worker.start_weight_update(free_kv_cache=False)
+            with pytest.raises(RuntimeError, match="active weight update"):
+                worker.bind_raiden_sync(parallelism=4)
+            worker.finish_weight_update()
+
+            worker.bind_raiden_sync(parallelism=4)
+            assert worker._raiden_rl_weight_sync is not first_sync
+            assert ws_cls.call_args.kwargs["parallelism"] == 4
+            assert ws_cls.call_count == 2
+            ws_inst.shutdown.assert_called_once()
+
+    def test_bind_raiden_sync_cleans_up_on_failure_and_forwards_auto_h2d(self):
+        _, worker = self._make_raiden_worker(tp_size=2)
+        failing_sync = MagicMock()
+        failing_sync.metadata_dict.side_effect = RuntimeError("meta failed")
+        with (
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "vllm_torchtpu.rl.raiden_worker_sync.RaidenWorkerSync",
+                return_value=failing_sync,
+            ) as mock_cls,
+            pytest.raises(RuntimeError, match="meta failed"),
+        ):
+            worker.init_weight_transfer_engine(
+                {"job_name": "rollout", "auto_h2d": False}
+            )
+        assert mock_cls.call_args.kwargs["auto_h2d"] is False
+        failing_sync.shutdown.assert_called_once()
+        assert worker._raiden_rl_weight_sync is None
+
+        # Failed rebind on matching sync does not shut down the existing sync.
+        existing = MagicMock()
+        existing.matches_binding.return_value = True
+        existing.bind.side_effect = RuntimeError("rebind failed")
+        worker._raiden_rl_weight_sync = existing
+        with (
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            pytest.raises(RuntimeError, match="rebind failed"),
+        ):
+            worker.bind_raiden_sync()
+        existing.shutdown.assert_not_called()
+
+    def test_shutdown_releases_raiden_sync_and_clears_update_state(self):
+        from vllm.v1.worker.worker_base import WorkerBase
+
+        _, worker = self._make_raiden_worker(tp_size=2)
+        fake_sync = MagicMock()
+        worker._raiden_rl_weight_sync = fake_sync
+        worker.start_weight_update(free_kv_cache=False)
+        assert worker.has_incomplete_weight_update() is True
+
+        with patch.object(WorkerBase, "shutdown") as mock_base_shutdown:
+            worker.shutdown()
+
+        fake_sync.shutdown.assert_called_once()
+        mock_base_shutdown.assert_called_once_with()
+        assert worker._raiden_rl_weight_sync is None
+        assert worker.has_incomplete_weight_update() is False
+
+    def test_bind_raiden_sync_rejects_rebind_during_active_update_and_none_parallelism(
+        self,
+    ):
+        from vllm_torchtpu.rl.raiden_worker_sync import DEFAULT_RAIDEN_PARALLELISM
+
+        _, worker = self._make_raiden_worker(tp_size=2)
+        fake_sync = MagicMock()
+        fake_sync.matches_binding.return_value = True
+        fake_sync.metadata_dict.return_value = {"unit": {"job_replica_id": "0"}}
+
+        # init_weight_transfer_engine accepts parallelism=None and uses default.
+        with (
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "vllm_torchtpu.rl.raiden_worker_sync.RaidenWorkerSync",
+                return_value=fake_sync,
+            ) as mock_cls,
+        ):
+            worker.init_weight_transfer_engine(
+                {"job_name": "rollout", "parallelism": None}
+            )
+        assert mock_cls.call_args.kwargs["parallelism"] == DEFAULT_RAIDEN_PARALLELISM
+
+        # Even when matches_binding() is True, bind_raiden_sync must reject
+        # rebinding while a weight update is active.
+        worker.start_weight_update(free_kv_cache=False)
+        with pytest.raises(RuntimeError, match="active weight update"):
+            worker.bind_raiden_sync()
+        worker.finish_weight_update()
+
+    @pytest.mark.parametrize(
+        "target, attr, value, match",
+        [
+            ("parallel", "pipeline_parallel_size", 2, "PP"),
+            ("parallel", "prefill_context_parallel_size", 2, "PCP"),
+            ("parallel", "decode_context_parallel_size", 2, "DCP"),
+            ("vllm", "lora_config", SimpleNamespace(max_loras=1), "LoRA"),
+            (
+                "vllm",
+                "speculative_config",
+                SimpleNamespace(method="mtp"),
+                "Speculative",
+            ),
+        ],
+    )
+    def test_bind_raiden_sync_rejects_unsupported_modes(
+        self, target: str, attr: str, value: object, match: str
+    ):
+        from vllm_torchtpu.rl import raiden_worker_sync
+
+        cfg, worker = self._make_raiden_worker(tp_size=2)
+        setattr(cfg.parallel_config if target == "parallel" else cfg, attr, value)
+        with (
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_world_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            patch.object(
+                raiden_worker_sync,
+                "_ws_lib",
+                SimpleNamespace(WeightSynchronizer=MagicMock()),
+            ),
+            pytest.raises(NotImplementedError, match=match),
+        ):
+            worker.bind_raiden_sync()
 
 
 def _run_spawn_probes():
