@@ -30,3 +30,32 @@ def all_to_all(x: torch.Tensor, group: "GroupCoordinator") -> torch.Tensor:
     if isinstance(out, funcol.AsyncCollectiveTensor):
         return funcol.wait_tensor(out)
     return out
+
+
+def quantized_all_gather(x: torch.Tensor, group: "GroupCoordinator") -> torch.Tensor:
+    """All-gather `x` along its leading axis as per-row FP8 with float32 scales.
+
+    Args:
+        x: Activations this rank holds, rows on the leading axis.
+        group: Group whose `all_gather` joins the ranks' rows.
+
+    Returns:
+        The gathered rows, restored to `x.dtype`.
+    """
+    # Lazy import: importing layers.core.quantization runs layers/__init__.py,
+    # which loads cp_mla_attention -> distributed.collectives (import cycle).
+    from vllm_torchtpu.layers.core.quantization import (  # noqa: PLC0415
+        dequantize_tensor,
+        quantize_tensor,
+    )
+
+    # Promote float16 to float32 before quantizing so small per-row scales do
+    # not overflow 1.0 / scale to inf (turning zeros into NaN) or underflow.
+    work_x = x.to(torch.float32) if x.dtype == torch.float16 else x
+    quantized, scale = quantize_tensor(work_x, quant_dtype=torch.float8_e4m3fn, axis=-1)
+    # The FP8 payload travels as int8, which every collective group carries.
+    rows = group.all_gather(quantized.view(torch.int8), dim=0)
+    scales = group.all_gather(scale, dim=0)
+    return dequantize_tensor(
+        rows.view(torch.float8_e4m3fn), scales, axis=-1, out_dtype=x.dtype
+    )

@@ -27,10 +27,10 @@ import torch
 from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.collectives import quantized_all_gather
 from vllm_torchtpu.distributed.hier_reduce_scatter import moe_combine_reduce_scatter
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
-from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -105,22 +105,6 @@ def enable_pipelined_collective_and_compute() -> bool:
 
 # Alias for alternative naming convention
 enable_pipeline_collective_and_compute = enable_pipelined_collective_and_compute
-
-
-def _quantized_all_gather(
-    collective_group, hidden_states: torch.Tensor
-) -> torch.Tensor:
-    """All-gather activations in fp8, restored on arrival."""
-    out_dtype = hidden_states.dtype
-    quantized, scale = quantize_tensor(
-        hidden_states, quant_dtype=torch.float8_e4m3fn, axis=-1
-    )
-    ag_rows = collective_group.all_gather(quantized.view(torch.int8), dim=0)
-    ag_scale = collective_group.all_gather(scale, dim=0)
-    ag_hidden_states = dequantize_tensor(
-        ag_rows.view(torch.float8_e4m3fn), ag_scale, axis=-1, out_dtype=out_dtype
-    )
-    return ag_hidden_states
 
 
 def calculate_moe_chunks(
@@ -269,9 +253,7 @@ def pipelined_fused_moe_gmm(
             # parallel_size > 1 only when collective_group is set.
             assert collective_group is not None
             if quantize_ag:
-                ag_hidden_states = _quantized_all_gather(
-                    collective_group, hidden_states
-                )
+                ag_hidden_states = quantized_all_gather(hidden_states, collective_group)
             else:
                 ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
             ag_topk_weights = (
@@ -340,7 +322,7 @@ def pipelined_fused_moe_gmm(
 
     def _all_gather_hs(hs_slice):
         if quantize_ag:
-            return _quantized_all_gather(collective_group, hs_slice)
+            return quantized_all_gather(hs_slice, collective_group)
         return collective_group.all_gather(hs_slice, dim=0)
 
     # Prime pipeline with initial all-gather for chunk 0
