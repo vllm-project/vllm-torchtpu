@@ -46,6 +46,7 @@ from vllm_torchtpu.platforms.tpu_platform import (
     TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP,
     TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP,
     TPU_8I_MULTIHOST_TOPOLOGY_MAP,
+    TPU_8T_MULTIHOST_TOPOLOGY_MAP,
     TpuPlatform,
     _validate_lora_config,
     _validate_peer_replay_config,
@@ -1078,6 +1079,14 @@ class TestTpuPlatform:
         assert get_tpu_multihost_topology(64, device_name="TPU8i") == "4,8,2"
         assert get_tpu_multihost_topology(1024, device_name="TPU v8i") == "4,8,32"
 
+        # Test TPU v8t 3D Torus (1 device per chip) lookup.
+        assert get_tpu_multihost_topology(1, device_name="TPU v8t") == "1,1,1"
+        assert get_tpu_multihost_topology(4, device_name="TPU v8t") == "2,2,1"
+        assert get_tpu_multihost_topology(8, device_name="TPU8t") == "2,2,2"
+        assert get_tpu_multihost_topology(16, device_name="TPU v8t") == "2,2,4"
+        assert get_tpu_multihost_topology(32, device_name="TPU8t") == "2,4,4"
+        assert get_tpu_multihost_topology(64, device_name="TPU v8t") == "4,4,4"
+
         # A mesh must describe exactly as many devices as were asked for,
         # otherwise the slice builder sizes its worker address list against a
         # world that does not exist. Devices per chip is what separates the
@@ -1087,12 +1096,13 @@ class TestTpuPlatform:
             (TPU_3D_TORUS_MULTIHOST_TOPOLOGY_MAP, 1),
             (TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP, 2),
             (TPU_8I_MULTIHOST_TOPOLOGY_MAP, 1),
+            (TPU_8T_MULTIHOST_TOPOLOGY_MAP, 1),
         ):
             for world_size, topo in topo_map.items():
                 dims = [int(d) for d in topo.split(",")]
                 # For 4D torus topologies, the trailing T dimension is cores per chip,
-                # never devices. For 3D topologies (2D Torus X,Y,T and TPU 8i C,B,G),
-                # total chips is the full product.
+                # never devices. For 3D topologies (2D Torus X,Y,T, TPU 8i C,B,G,
+                # and TPU 8t X,Y,Z), total chips is the full product.
                 chips = math.prod(dims[:-1]) if len(dims) == 4 else math.prod(dims)
                 assert chips * devices_per_chip == world_size
 
@@ -1109,6 +1119,8 @@ class TestTpuPlatform:
             ("TPU7x", "TPU v7"),
             ("TPU8i", "TPU v8i"),
             ("TPU v8i", "TPU v8i"),
+            ("TPU8t", "TPU v8t"),
+            ("TPU v8t", "TPU v8t"),
         ],
     )
     @patch("jax.local_devices")

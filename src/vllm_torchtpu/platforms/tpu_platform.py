@@ -88,6 +88,8 @@ logger = init_logger(__name__)
 #     devices, so key == X*Y*Z*T, twice the chip count.
 #   - Hierarchical BoardFly (TPU v8i): 4 chips per board,
 #     up to 8 boards per group, up to 32 groups per slice, so key == C*B*G.
+#   - 3D Torus (TPU v8t): one core per chip exposed as a single device,
+#     so key == X*Y*Z.
 #
 # Multi-host TPU slice mesh topologies for 2D Torus architectures.
 TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP = {
@@ -143,6 +145,18 @@ TPU_8I_MULTIHOST_TOPOLOGY_MAP = {
     1024: "4,8,32",
 }
 
+# TPU slice mesh topologies for TPU v8t (3D Torus X,Y,Z with 1 device per
+# chip: single-host 1/2/4-chip slices plus multi-host meshes).
+TPU_8T_MULTIHOST_TOPOLOGY_MAP = {
+    1: "1,1,1",
+    2: "1,2,1",
+    4: "2,2,1",
+    8: "2,2,2",
+    16: "2,2,4",
+    32: "2,4,4",
+    64: "4,4,4",
+}
+
 # TPU generations with a 2D Torus interconnect (3-tuple mesh geometry: X,Y,T).
 # TPU v4, v5p, and v7 (Ironwood) use 3D Torus interconnects
 # (4-tuple mesh geometry: X,Y,Z,T).
@@ -155,6 +169,9 @@ _TPU_DUAL_DEVICE_GENERATIONS = ("v7", "tpu7x")
 
 # TPU v8i / TPU8i generations.
 _TPU_8I_GENERATIONS = ("v8i", "tpu8i")
+
+# TPU v8t / TPU8t generations.
+_TPU_8T_GENERATIONS = ("v8t", "tpu8t")
 
 
 def get_tpu_multihost_topology(
@@ -187,6 +204,8 @@ def get_tpu_multihost_topology(
         topo_map = TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP
     elif any(gen in device_name for gen in _TPU_8I_GENERATIONS):
         topo_map = TPU_8I_MULTIHOST_TOPOLOGY_MAP
+    elif any(gen in device_name for gen in _TPU_8T_GENERATIONS):
+        topo_map = TPU_8T_MULTIHOST_TOPOLOGY_MAP
     elif any(gen in device_name for gen in _TPU_DUAL_DEVICE_GENERATIONS):
         topo_map = TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP
     else:
