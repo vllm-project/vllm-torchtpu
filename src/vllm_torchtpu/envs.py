@@ -753,7 +753,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
     # load. Steps above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens run the GMM
     # MoE path; arming refuses a cap whose buffers do not fit in VMEM, and
-    # stands down on layers a fused EP MoE kernel serves.
+    # stands down on layers a fused EP MoE kernel serves or that take vLLM's
+    # collectives (TPU_MOE_COLLECTION_CHUNK_SIZE > 0 or TPU_MOE_FP8_ALL_GATHER).
     "FUSED_MOE_DECODE_KERNEL": env_bool("FUSED_MOE_DECODE_KERNEL"),
     "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
         "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256

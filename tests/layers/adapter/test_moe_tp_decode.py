@@ -154,10 +154,9 @@ class _Log:
 def harness(monkeypatch, fp8_moe_runner_kit):
     torch.manual_seed(0)
     h = _Harness(fp8_moe_runner_kit)
-    # Set the attribute, not the environment: a test that monkeypatched this
-    # attribute earlier in the session leaves it set on the module, where it
-    # shadows envs.__getattr__ and with it any environment value.
-    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+    # Set the module dict entry, not the environment: undo then deletes it (or
+    # restores an earlier test's leftover), so envs.__getattr__ is not shadowed.
+    monkeypatch.setitem(vars(envs), "TPU_MOE_SKIP_PADDED_TOKENS", True)
     # The unarmed path's grouped matmul (a TPU kernel): a stand-in.
     monkeypatch.setattr(
         fp8_mod, "fused_moe_gmm", lambda hidden_states, **kw: hidden_states * 0.25
@@ -331,21 +330,21 @@ def test_refuses_topk_weights_float32(harness):
 
 
 def test_refuses_without_the_padding_mask(harness, monkeypatch):
-    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
+    monkeypatch.setitem(vars(envs), "TPU_MOE_SKIP_PADDED_TOKENS", False)
     model = harness.model({})
     assert moe_tp_decode.arm(model) == 0
     assert "TPU_MOE_SKIP_PADDED_TOKENS" in harness.logs[-1]
 
 
 def test_refuses_when_the_moe_path_owns_its_collectives(harness, monkeypatch):
-    monkeypatch.setattr(envs, "TPU_MOE_FP8_ALL_GATHER", True)
+    monkeypatch.setitem(vars(envs), "TPU_MOE_FP8_ALL_GATHER", True)
     model = harness.model({})
     assert moe_tp_decode.arm(model) == 0
     assert "owns its collectives" in harness.logs[-1]
 
 
 def test_stands_down_when_fused_moe_decode_is_on(harness, monkeypatch):
-    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL", True)
+    monkeypatch.setitem(vars(envs), "FUSED_MOE_DECODE_KERNEL", True)
     model = harness.model({})
     assert moe_tp_decode.arm(model) == 0
     assert not _armed(model.layers[0]) and harness.selftest_calls == 0
