@@ -447,18 +447,21 @@ class Suite:
     nightly: bool = False
 
 
-_CPU_STAGE = ("build", "cpu")  # cpu steps wait on build_docker themselves
+# Stage 0: the image builds, the CPU checks and the test wheels. cpu steps wait
+# on build_docker themselves; build_wheels depends on no other lane, and no
+# step of another lane depends on it.
+_CPU_STAGE = ("build", "cpu", "build_wheels")
 _DEFAULT_TPU = ("tests", "integration", "verify")
 _FULL_TPU = ("tests", "integration", "perf", "verify")
 _ALL_LANES = (*_CPU_STAGE, *_FULL_TPU)
 
-# Builds that don't wait for CPU: everything is one stage.
+# Builds that don't wait for stage 0: everything is one stage.
 SUITES: dict[str, Suite] = {
     s.name: s
     for s in (
         Suite(
             "default",
-            "CPU checks, TPU tests, integration, verify (no perf)",
+            "CPU checks, test wheels, TPU tests, integration, verify (no perf)",
             stages=((*_CPU_STAGE, *_DEFAULT_TPU),),
         ),
         Suite(
@@ -492,22 +495,22 @@ _SUITE_ALIASES: dict[str, str] = {
 _PR_SUITES: dict[str, Suite] = {
     "cpu-only": Suite(
         "pr+cpu-only",
-        "CPU checks only, no TPU",
+        "CPU checks and test wheels only, no TPU",
         stages=(_CPU_STAGE,),
     ),
     "pr": Suite(
         "pr",
-        "PR: TPU waits for the CPU checks",
+        "PR: TPU waits for the CPU checks and the test wheels",
         stages=(_CPU_STAGE, _DEFAULT_TPU),
     ),
     "pr+perf": Suite(
         "pr+perf-eval",
-        "PR: TPU and perf/eval wait for the CPU checks",
+        "PR: TPU and perf/eval wait for the CPU checks and the test wheels",
         stages=(_CPU_STAGE, _FULL_TPU),
     ),
     "pr+full": Suite(
         "pr+nightly-suite",
-        "PR: full nightly suite waits for the CPU checks",
+        "PR: full nightly suite waits for the CPU checks and the test wheels",
         stages=(_CPU_STAGE, _FULL_TPU),
         nightly=True,
     ),
@@ -1174,8 +1177,9 @@ def upload_stages(
     """Upload `stages[0]`'s lane files and, if more stages remain, `wait` + uploader.
 
     The `wait` step gates `rest` on every step uploaded in `stages[0]` (including
-    both Docker image builds in `pipeline_build.yml`, such as `-omni`, and all
-    `pipeline_cpu.yml` checks); a retried uploader skips lanes it already uploaded.
+    both Docker image builds in `pipeline_build.yml`, such as `-omni`, all
+    `pipeline_cpu.yml` checks and the test wheels of `pipeline_build_wheels.yml`);
+    a retried uploader skips lanes it already uploaded.
     A file in TPU_GENERATION_FILES goes up once per generation the build's
     CI_EXTRAS picks (see upload_generations).
     """

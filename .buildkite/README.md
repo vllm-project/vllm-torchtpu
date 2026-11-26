@@ -53,14 +53,30 @@ nightly-image cut-over in `.buildkite/release/README.md` completes.
 `pipeline_tests.yml` runs tests marked `tpu_test` (or `multichip`) on TPU v7x
 slices (1x1x1 and 2x2x1). PR steps exclude `nightly` tests; nightly steps
 include them. Both use the CI image built by `pipeline_build.yml`. On PR builds,
-`bootstrap.py` uploads stage 0 (`pipeline_build.yml` and `pipeline_cpu.yml`)
-followed by a `wait` and an `upload-stages` step that uploads the TPU lanes
-(`tests`, `integration`, `verify`, plus `perf` with `run-perf-eval` or
-`run-full-ci`) only after every stage-0 step (both image builds, including
-`-omni`, and the CPU checks) passes. Retrying a failed stage-0 step in Buildkite
-releases the `wait` once the retry passes and runs the uploader step. The
-`oncall-fix` label raises job and Kueue workload priority without changing the
-suite.
+`bootstrap.py` uploads stage 0 (`pipeline_build.yml`, `pipeline_cpu.yml` and
+`pipeline_build_wheels.yml`) followed by a `wait` and an `upload-stages` step that
+uploads the TPU lanes (`tests`, `integration`, `verify`, plus `perf` with
+`run-perf-eval` or `run-full-ci`) only after every stage-0 step (both image
+builds, including `-omni`, the CPU checks and the test wheels) passes. Retrying a
+failed stage-0 step in Buildkite releases the `wait` once the retry passes and
+runs the uploader step. The `oncall-fix` label raises job and Kueue workload
+priority without changing the suite.
+
+`pipeline_build_wheels.yml` builds the `vllm-torchtpu-core` and `vllm-torchtpu`
+wheels (and the `vllm-torchtpu` sdist) from the build's commit with the
+release's scripts, on the `cpu_64_core` agents that build the CI image, and
+checks that they resolve together from PyPI (`release/check_wheels.sh`). vLLM
+is built at the ref the CI image is built from: the `pyproject.toml` pin,
+unless the build uses another vLLM (upstream HEAD in the
+`vllm-torchtpu-canary-vllm` pipeline, or `VLLM_COMMIT_HASH_OVERRIDE`). The lane
+runs beside the image build in every suite but `perf`. No step of another lane
+depends on it. On a build with two stages the TPU lanes still go up only after
+every stage-0 step passes, this lane included; on a one-stage build a failed
+wheel step fails the build and holds back no TPU step. In the
+`vllm-torchtpu-canary-vllm` pipeline the LKG promotion runs after a `wait`, so
+it needs this lane to pass too. The files are artifacts of the build and are
+uploaded nowhere else: their version, `0.0.0+g<commit>`, is a local version,
+which PyPI rejects.
 
 By default, the `tests` lane's TPU steps run only on TPU v7x. A build picks
 other chips with one of these extras in `CI_EXTRAS` (set it in the Buildkite UI
@@ -118,11 +134,12 @@ the hours the nightly's perf steps take. The `vllm-torchtpu-canary-vllm`
 pipeline also runs the lane, because its LKG promotion waits on two of its
 steps.
 
-A PR labeled `skip-tpu-ci` (it still needs `ready`) uploads only the `cpu` lane
-and the image build (skipping the `-omni` image and every TPU lane), so what
-runs is the image build, the type check, and the CPU unit tests. The post-merge
-build of such a PR does the same: `bootstrap.py` reads the merged PR's labels
-from GitHub (ignoring `run-perf-eval` and `run-full-ci` post-merge). On a PR,
+A PR labeled `skip-tpu-ci` (it still needs `ready`) uploads only the `cpu` lane,
+the image build and the test wheels (skipping the `-omni` image and every TPU
+lane), so what runs is the image build, the type check, the CPU unit tests and
+the wheel build and check. The post-merge build of such a PR does the same:
+`bootstrap.py` reads the merged PR's labels from GitHub (ignoring
+`run-perf-eval` and `run-full-ci` post-merge). On a PR,
 the suite labels `skip-tpu-ci`, `run-perf-eval`, and `run-full-ci` are mutually
 exclusive (`bootstrap.py` fails the build if more than one is set; `ready` and
 `oncall-fix` are orthogonal).

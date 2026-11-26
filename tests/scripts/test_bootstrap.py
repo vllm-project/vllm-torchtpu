@@ -867,31 +867,37 @@ class TestBootstrapUnits(unittest.TestCase):
             (
                 "ready",
                 "pr",
-                (("build", "cpu"), ("tests", "integration", "verify")),
+                (("build", "cpu", "build_wheels"), ("tests", "integration", "verify")),
                 False,
             ),
             (
                 "ready,oncall-fix",
                 "pr",
-                (("build", "cpu"), ("tests", "integration", "verify")),
+                (("build", "cpu", "build_wheels"), ("tests", "integration", "verify")),
                 False,
             ),
             (
                 "ready,oncall-fix,skip-tpu-ci",
                 "pr+cpu-only",
-                (("build", "cpu"),),
+                (("build", "cpu", "build_wheels"),),
                 False,
             ),
             (
                 "ready,oncall-fix,run-perf-eval",
                 "pr+perf-eval",
-                (("build", "cpu"), ("tests", "integration", "perf", "verify")),
+                (
+                    ("build", "cpu", "build_wheels"),
+                    ("tests", "integration", "perf", "verify"),
+                ),
                 False,
             ),
             (
                 "ready,oncall-fix,run-full-ci",
                 "pr+nightly-suite",
-                (("build", "cpu"), ("tests", "integration", "perf", "verify")),
+                (
+                    ("build", "cpu", "build_wheels"),
+                    ("tests", "integration", "perf", "verify"),
+                ),
                 True,
             ),
         ):
@@ -1537,7 +1543,8 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(rec.uploads, [])
 
-        # PR default: priority 6, stage 0 uploads upload_stages + cpu + build;
+        # PR default: priority 6, stage 0 uploads upload_stages + build_wheels +
+        # cpu + build;
         # stage 1 uploads verify + integration + tests with concurrency group.
         pr = self._run_bootstrap(
             {
@@ -1552,6 +1559,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 ("JOB_PRIORITY", "6"),
                 ("WORKLOAD_PRIORITY", "pre-merge"),
                 ("VLLM_COMMIT_HASH", self.pinned),
+                ("upload-stages:upload_stage_0:build_wheels", "1"),
                 ("upload-stages:upload_stage_0:cpu", "1"),
                 ("upload-stages:upload_stage_0:build", "1"),
             ],
@@ -1562,7 +1570,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(
             [u[0] for u in pr.uploads],
-            ["upload_stages", "cpu", "build"],
+            ["upload_stages", "build_wheels", "cpu", "build"],
         )
         self.assertIn(
             ":pipeline: Upload tests, integration, verify",
@@ -1571,8 +1579,8 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertEqual(
             json.loads(pr.uploads[0][1])["steps"][1]["env"]["CI_FLEET"], "kube"
         )
-        self.assertEqual(pr.uploads[2][2]["OMNI_IMAGE_SKIP"], "")
-        self.assertNotIn("tpu-pr/alice@example.com", pr.uploads[1][1])
+        self.assertEqual(pr.uploads[3][2]["OMNI_IMAGE_SKIP"], "")
+        self.assertNotIn("tpu-pr/alice@example.com", pr.uploads[2][1])
         self.assertEqual(pr.stderr, "")
         for expected_line in (
             "--- Determining job priority",
@@ -1718,7 +1726,8 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertNotIn('build.env("NIGHTLY")', content)
 
     def test_orchestration_single_stage_and_skip_flows(self) -> None:
-        # PR skip-tpu-ci & post-merge main webhook upload ONLY ["cpu", "build"].
+        # PR skip-tpu-ci & post-merge main webhook upload ONLY the CPU stage:
+        # ["build_wheels", "cpu", "build"].
         for fx, prio, wprio in (
             (
                 self._run_bootstrap(
@@ -1746,9 +1755,11 @@ class TestBootstrapUnits(unittest.TestCase):
             self.assertIn(("JOB_PRIORITY", prio), fx.meta)
             self.assertIn(("WORKLOAD_PRIORITY", wprio), fx.meta)
             self.assertTrue(fx.annotations[0][2].startswith("CI suite: pr+cpu-only: "))
-            self.assertEqual([u[0] for u in fx.uploads], ["cpu", "build"])
-            self.assertTrue(bool(fx.uploads[1][2]["OMNI_IMAGE_SKIP"]))
-            self.assertLessEqual(len(fx.uploads[1][2]["OMNI_IMAGE_SKIP"]), 70)
+            self.assertEqual(
+                [u[0] for u in fx.uploads], ["build_wheels", "cpu", "build"]
+            )
+            self.assertTrue(bool(fx.uploads[2][2]["OMNI_IMAGE_SKIP"]))
+            self.assertLessEqual(len(fx.uploads[2][2]["OMNI_IMAGE_SKIP"]), 70)
 
         # main post-merge (even when merged PR had run-full-ci / run-perf-eval)
         # runs default suite in one stage without NIGHTLY.
@@ -1765,7 +1776,7 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertTrue(main_pm.annotations[0][2].startswith("CI suite: default: "))
         self.assertEqual(
             [u[0] for u in main_pm.uploads],
-            ["verify", "integration", *_TESTS, "cpu", "build"],
+            ["verify", "integration", *_TESTS, "build_wheels", "cpu", "build"],
         )
         self.assertNotIn("NIGHTLY", main_pm.uploads[0][2])
 
@@ -1816,7 +1827,15 @@ class TestBootstrapUnits(unittest.TestCase):
             )
             self.assertEqual(
                 [u[0] for u in fx.uploads],
-                ["verify", "perf", "integration", *_TESTS, "cpu", "build"],
+                [
+                    "verify",
+                    "perf",
+                    "integration",
+                    *_TESTS,
+                    "build_wheels",
+                    "cpu",
+                    "build",
+                ],
             )
             for _, content, _ in fx.uploads:
                 self.assertNotIn('build.env("NIGHTLY")', content)
@@ -1840,7 +1859,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(
             [u[0] for u in canary_torchtpu.uploads],
-            ["verify", "integration", *_TESTS, "cpu", "build"],
+            ["verify", "integration", *_TESTS, "build_wheels", "cpu", "build"],
         )
 
         torchtpu_nightly = self._run_bootstrap(
@@ -1858,7 +1877,7 @@ class TestBootstrapUnits(unittest.TestCase):
         self.assertIn(("TORCHTPU_NIGHTLY_LEG", "torch-tpu"), torchtpu_nightly.meta)
         self.assertEqual(
             [u[0] for u in torchtpu_nightly.uploads],
-            ["verify", "integration", *_TESTS, "cpu", "build"],
+            ["verify", "integration", *_TESTS, "build_wheels", "cpu", "build"],
         )
 
         # Standalone version overrides and non-canonical TORCHTPU_NIGHTLY_LEG
@@ -1903,7 +1922,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 self.assertIn(("TORCHTPU_NIGHTLY_LEG", expected_leg), rec_leg.meta)
                 self.assertEqual(
                     [u[0] for u in rec_leg.uploads],
-                    ["verify", "integration", *_TESTS, "cpu", "build"],
+                    ["verify", "integration", *_TESTS, "build_wheels", "cpu", "build"],
                 )
 
         # vLLM HEAD canary (canonical slug, legacy slug, and CI_SUITE=vllm-canary
@@ -1960,6 +1979,7 @@ class TestBootstrapUnits(unittest.TestCase):
                         "perf",
                         "integration",
                         *_TESTS,
+                        "build_wheels",
                         "cpu",
                         "build",
                     ],
@@ -1988,7 +2008,7 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertEqual(
             [u[0] for u in api_torchtpu_nightly.uploads],
-            ["verify", "integration", *_TESTS, "cpu", "build"],
+            ["verify", "integration", *_TESTS, "build_wheels", "cpu", "build"],
         )
         api_nightly = self._run_bootstrap(
             {
@@ -2031,8 +2051,8 @@ class TestBootstrapUnits(unittest.TestCase):
         )
         self.assertIn(("JOB_PRIORITY", "6"), pre.meta)
         self.assertTrue(pre.annotations[0][2].startswith("CI suite: pr+cpu-only: "))
-        self.assertEqual([u[0] for u in pre.uploads], ["cpu", "build"])
-        self.assertTrue(bool(pre.uploads[1][2]["OMNI_IMAGE_SKIP"]))
+        self.assertEqual([u[0] for u in pre.uploads], ["build_wheels", "cpu", "build"])
+        self.assertTrue(bool(pre.uploads[2][2]["OMNI_IMAGE_SKIP"]))
 
         # Merge queue on main: priority 11 (post-merge), ignores PR labels and
         # CI_PR_PUSH_CPU_ONLY, diffs against BUILDKITE_MERGE_QUEUE_BASE_COMMIT, and
@@ -2112,7 +2132,10 @@ class TestBootstrapUnits(unittest.TestCase):
             ],
         )
         self.assertTrue(mq_pre.annotations[0][2].startswith("CI suite: pr+cpu-only: "))
-        self.assertEqual([u[0] for u in mq_pre.uploads], ["cpu", "build", "precommit"])
+        self.assertEqual(
+            [u[0] for u in mq_pre.uploads],
+            ["build_wheels", "cpu", "build", "precommit"],
+        )
 
         # Merge queue fail-open: if base fetch or diff fails even when the queue
         # head commit is docs-only, never fall back to diff-tree on the head commit
@@ -2137,7 +2160,7 @@ class TestBootstrapUnits(unittest.TestCase):
                 )
                 self.assertEqual(
                     [u[0] for u in mq_fail_open.uploads],
-                    ["upload_stages", "cpu", "build", "precommit"],
+                    ["upload_stages", "build_wheels", "cpu", "build", "precommit"],
                 )
 
         # An unreadable /ci merge marker (API failure or >5000 comments) is retried,
@@ -2223,14 +2246,18 @@ class TestBootstrapUnits(unittest.TestCase):
         # After cutover a PR push runs it next to the CPU stage; a docs-only PR
         # runs only it.
         self.assertEqual(
-            lanes(self._run_bootstrap({**pr, **cutover})), ["cpu", "build", "precommit"]
+            lanes(self._run_bootstrap({**pr, **cutover})),
+            ["build_wheels", "cpu", "build", "precommit"],
         )
         docs = self._run_bootstrap({**pr, **cutover}, files=["README.md"])
         self.assertEqual(lanes(docs), ["precommit"])
 
         # /ci run puts it in stage 0, so the TPU stage waits for it too.
         ci_run = self._run_bootstrap({**pr, **cutover, "CI_RUN_TPU": "1"})
-        self.assertEqual(lanes(ci_run), ["upload_stages", "cpu", "build", "precommit"])
+        self.assertEqual(
+            lanes(ci_run),
+            ["upload_stages", "build_wheels", "cpu", "build", "precommit"],
+        )
         self.assertNotIn("precommit", lanes(self._run_next_stage(ci_run)))
 
         # The lane needs no image: it runs on a cpu agent with no depends_on.
@@ -2525,12 +2552,20 @@ class TestBootstrapUnits(unittest.TestCase):
         # v7x alone: _TESTS in the tests above.) A PR build passes it on to its
         # second stage's uploader, whose uploads these are.
         both = ("tests:v6e", "tests:v7x")
-        with_both = ["verify", "integration", *both, "cpu", "build"]
+        with_both = ["verify", "integration", *both, "build_wheels", "cpu", "build"]
         for env, uploads in (
             ({}, with_both),
             (
                 {"NIGHTLY": "1"},
-                ["verify", "perf", "integration", *both, "cpu", "build"],
+                [
+                    "verify",
+                    "perf",
+                    "integration",
+                    *both,
+                    "build_wheels",
+                    "cpu",
+                    "build",
+                ],
             ),
             ({"BUILDKITE_PULL_REQUEST": "42"}, ["verify", "integration", *both]),
         ):
@@ -2593,7 +2628,10 @@ class TestBootstrapUnits(unittest.TestCase):
         # these are.
         v6e_extra = gens.TPU_V6E_EXTRA
         for env, uploads in (
-            ({}, ["verify", "integration", "tests:v6e", "cpu", "build"]),
+            (
+                {},
+                ["verify", "integration", "tests:v6e", "build_wheels", "cpu", "build"],
+            ),
             ({"BUILDKITE_PULL_REQUEST": "42"}, ["verify", "integration", "tests:v6e"]),
         ):
             with self.subTest(env=env):

@@ -14,12 +14,15 @@
 # limitations under the License.
 #
 # ------------------------------------------------------
-# Build the vllm-torchtpu-core release wheel.
+# Build the vllm-torchtpu-core wheel, for a release or for CI.
 #
 # Version (resolved by release_version in .buildkite/release/lib.sh):
 #   - Set once by preflight.sh in Buildkite meta-data (release-version), or
 #     resolved on the spot from RELEASE_VERSION / BUILDKITE_BRANCH
 #     (RELEASE_BRANCH_REGEX in .buildkite/release/lib.sh).
+#   - In the wheel lane (.buildkite/pipeline_build_wheels.yml),
+#     release/set_test_wheel_version.sh sets it first: 0.0.0+g<commit>, which
+#     PyPI rejects.
 #   - Forced onto setuptools-scm, so a shallow CI checkout without tags still
 #     gets it.
 #
@@ -27,7 +30,13 @@
 #   dist/<core>-<version>-py3-none-any.whl, uploaded as a Buildkite artifact.
 #   Build meta-data CORE_WHEEL_NAME for later steps.
 #
-# CI only: runs inside a Buildkite release build (see bootstrap.sh).
+# Usage:
+#   build_core_wheel.sh [--skip-pypi-check]
+#
+#   --skip-pypi-check  Do not check that the version is absent from PyPI: for a
+#                      build that publishes nothing (the wheel lane).
+#
+# Buildkite only: runs inside a release build, or a CI build's build_wheels lane.
 # ------------------------------------------------------
 
 set -euo pipefail
@@ -40,18 +49,29 @@ WHEEL_UTILS="${SCRIPT_DIR}/wheel_utils.py"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/../release/lib.sh"
 
+CHECK_PYPI=1
+for arg in "$@"; do
+    case "${arg}" in
+        --skip-pypi-check) CHECK_PYPI=0 ;;
+        *) die "unknown argument '${arg}' (usage: build_core_wheel.sh [--skip-pypi-check])." ;;
+    esac
+done
+
 command -v buildkite-agent >/dev/null 2>&1 \
     || die "buildkite-agent not found: this script only runs in Buildkite."
 
-# --- Resolve the release version ---------------------------------------------
-echo "--- :label: Resolving release version"
+# --- Resolve the version -----------------------------------------------------
+echo "--- :label: Resolving version"
 VERSION="$(release_version)"
-echo "Release version: ${VERSION}"
+echo "Version: ${VERSION}"
 
 # Stop before building if this version is already on PyPI (versions can't be
 # reused). PUBLISH_PYPI comes from the step's env in .buildkite/release/pipeline.yml.
-[[ -n "${PUBLISH_PYPI:-}" ]] || die "PyPI project (PUBLISH_PYPI) is not set."
-check_not_published "${PUBLISH_PYPI}" "${VERSION}"
+# A build that publishes nothing passes --skip-pypi-check.
+if [[ "${CHECK_PYPI}" == "1" ]]; then
+    [[ -n "${PUBLISH_PYPI:-}" ]] || die "PyPI project (PUBLISH_PYPI) is not set."
+    check_not_published "${PUBLISH_PYPI}" "${VERSION}"
+fi
 
 # --- Private build venv ------------------------------------------------------
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/core-build.XXXXXX")"
@@ -82,7 +102,7 @@ shopt -u nullglob
     || die "expected exactly one wheel in dist/, found ${#WHEELS[@]}."
 WHEEL="${WHEELS[0]}"
 
-# The file name must carry exactly the release version; anything else means
+# The file name must carry exactly the resolved version; anything else means
 # the version override did not take effect.
 "$PY" "$WHEEL_UTILS" verify_built_wheel "$WHEEL" "$VERSION"
 

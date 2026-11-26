@@ -1,0 +1,76 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Test wheels: build the vllm-torchtpu-core and vllm-torchtpu wheels (and the
+# vllm-torchtpu sdist) from this commit with the release's own scripts, and
+# check that they resolve together from PyPI. Stage 0, beside the CI image
+# build. No step of another lane depends on these steps. On a build with a
+# second stage (PR, merge queue, /ci run) the TPU lanes go up only after every
+# stage-0 step passes, these included; on a one-stage build a failure here
+# fails the build and holds back no TPU step. In the
+# vllm-torchtpu-canary-vllm pipeline the LKG promotion (pipeline_promote.yml)
+# runs after a `wait`, so it needs these steps to pass too.
+#
+# The files stay artifacts of this build and go nowhere else. Their version,
+# 0.0.0+g<commit> (release/set_test_wheel_version.sh), is a local version,
+# which PyPI rejects. vLLM is built at the ref the CI image is built from (the
+# VLLM_COMMIT_HASH meta-data): this commit's pyproject.toml pin, unless the
+# build uses another vLLM (upstream HEAD in the vllm-torchtpu-canary-vllm
+# pipeline, or VLLM_COMMIT_HASH_OVERRIDE).
+
+x-wheel-step: &wheel_step
+  # The agents the CI image is built on.
+  agents:
+    queue: cpu_64_core
+  timeout_in_minutes: 60
+  # The steps fetch from GitHub, PyPI and download.pytorch.org; one retry
+  # covers a failed fetch.
+  retry:
+    automatic:
+      - exit_status: 1
+        limit: 1
+
+steps:
+  - group: "Build Wheels"
+    key: "build_wheels_group"
+    steps:
+      - label: ":package: Build the vllm-torchtpu-core wheel"
+        key: "build_core_wheel"
+        <<: *wheel_step
+        commands:
+          # The version every wheel step reads (release_version), set once, as
+          # preflight.sh does in a release.
+          - bash .buildkite/release/set_test_wheel_version.sh
+          - bash .buildkite/scripts/build_core_wheel.sh --skip-pypi-check
+
+      # After the core, in the same order as the release
+      # (release/pipeline.yml); it uses only the core's version, not its wheel.
+      - label: ":package: Build the vllm-torchtpu wheel"
+        key: "build_vllm_torchtpu_wheel"
+        depends_on: "build_core_wheel"
+        <<: *wheel_step
+        commands:
+          # The vLLM the CI image is built from (setup_docker_env.sh).
+          - |
+            set -euo pipefail
+            VLLM_REF_OVERRIDE="$$(buildkite-agent meta-data get VLLM_COMMIT_HASH)"
+            export VLLM_REF_OVERRIDE
+            bash .buildkite/release/build_vllm_torchtpu_wheel.sh
+
+      - label: ":mag: Check the wheels resolve from PyPI"
+        key: "check_wheels"
+        depends_on: "build_vllm_torchtpu_wheel"
+        <<: *wheel_step
+        commands:
+          - bash .buildkite/release/check_wheels.sh --annotation-context test-wheels

@@ -55,9 +55,11 @@
 #
 # Environment:
 #   VLLM_REPO          vLLM git remote (default: upstream vllm-project/vllm).
-#   VLLM_REF_OVERRIDE  Dev only: build this vLLM branch, tag or full SHA
-#                      instead of the pyproject.toml pin. Never set it for a
-#                      release; the result was not tested with this core.
+#   VLLM_REF_OVERRIDE  Build this vLLM branch, tag or full SHA instead of the
+#                      pyproject.toml pin: for dev builds, and for the wheel
+#                      lane, which passes the ref the CI image is built from.
+#                      Never set it for a release; the result was not tested
+#                      with this core.
 #   OUTPUT_DIR         Output directory (default: <repo-root>/dist). Old
 #                      vllm_torchtpu-* files are removed; core files are kept.
 #   KEEP_VLLM_SRC      Set to 1 to keep the patched clone for debugging.
@@ -103,7 +105,7 @@ usage() {
     echo "              e.g. X.Y.ZrcN -> both X.Y.ZrcN."
     echo ""
     echo "vLLM is built at the ref pinned in pyproject.toml (tag or full commit SHA)"
-    echo "(VLLM_REF_OVERRIDE=<ref> for dev builds only)."
+    echo "(VLLM_REF_OVERRIDE=<ref> for dev builds and the wheel lane; never a release)."
     echo ""
     echo "Examples: $0 X.Y.Z        # official release"
     echo "          $0 X.Y.ZrcN     # pre-release"

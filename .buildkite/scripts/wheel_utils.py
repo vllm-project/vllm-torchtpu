@@ -38,7 +38,7 @@ def verify_built_wheel(wheel_path: str, expected_version: str) -> None:
     name, version, _, tags = parse_wheel_filename(os.path.basename(wheel_path))
     if str(version) != expected_version:
         sys.exit(
-            f"ERROR: wheel version {version} != release version {expected_version}"
+            f"ERROR: wheel version {version} != expected version {expected_version}"
         )
     if {str(t) for t in tags} != {"py3-none-any"}:
         print(
