@@ -1721,29 +1721,33 @@ class PrefixCopy:
 
     def _chunk(self):
         # Chunks at whole multiples of their size (aligned slices): the
-        # largest power of two up to _PREFIX_CHUNK that divides the length,
-        # else the whole array.
+        # largest power of two from 512 to _PREFIX_CHUNK that divides the
+        # length, else None (one static copy of the whole array).
         size = self.src.shape[0]
         chunk = _PREFIX_CHUNK
-        while chunk >= 128 and size % chunk:
+        while chunk >= 512 and size % chunk:
             chunk //= 2
-        return chunk if chunk >= 128 else size
-
-    def _copy(self, c):
-        chunk = self._chunk()
-        begin = c * chunk
-        return pltpu.make_async_copy(
-            self.src.at[pl.ds(begin, chunk)], self.dst.at[pl.ds(begin, chunk)], self.sem
-        )
+        return chunk if chunk >= 512 else None
 
     def _each(self, op):
         chunk = self._chunk()
-        lax.fori_loop(
-            0,
-            (self.count + chunk - 1) // chunk,
-            lambda c, carry: (getattr(self._copy(c), op)(), carry)[1],
-            0,
-        )
+        if chunk is None:
+            getattr(pltpu.make_async_copy(self.src, self.dst, self.sem), op)()
+            return
+
+        def one(c, carry):
+            begin = pl.multiple_of(c * chunk, chunk)
+            getattr(
+                pltpu.make_async_copy(
+                    self.src.at[pl.ds(begin, chunk)],
+                    self.dst.at[pl.ds(begin, chunk)],
+                    self.sem,
+                ),
+                op,
+            )()
+            return carry
+
+        lax.fori_loop(0, (self.count + chunk - 1) // chunk, one, 0)
 
     def start(self):
         self._each("start")
