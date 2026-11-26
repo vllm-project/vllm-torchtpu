@@ -82,6 +82,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorOutput
 from vllm_torchtpu import envs, expert_relayout, gc_policy, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation.direct_call import direct_compile
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.tpu_connector_stats import (
     TpuKVConnectorStats,
@@ -337,7 +338,7 @@ def _upload_unchanged(runner, slot: str, values: np.ndarray) -> torch.Tensor:
     return device
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@direct_compile(backend="tpu")
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
     token_in_tpu_cur_input_indices: torch.Tensor,

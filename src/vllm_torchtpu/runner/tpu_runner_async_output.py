@@ -11,6 +11,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm_torchtpu.compilation.direct_call import DirectCompiled
 from vllm_torchtpu.layers.core import table_lookup
 
 INVALID_TOKEN_ID = -1
@@ -338,11 +339,12 @@ def _spec_chunk_next_inputs(
     return src, num_rejected
 
 
-_tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
-_subtract_num_rejected_tokens_lookup_compiled = _tpu_compile(
-    _subtract_num_rejected_tokens_lookup
+_subtract_num_rejected_tokens_lookup_compiled = DirectCompiled(
+    _subtract_num_rejected_tokens_lookup, backend="tpu"
 )
-_spec_chunk_next_inputs_compiled = _tpu_compile(_spec_chunk_next_inputs)
+_spec_chunk_next_inputs_compiled = DirectCompiled(
+    _spec_chunk_next_inputs, backend="tpu"
+)
 
 
 def subtract_num_rejected_tokens_fused(

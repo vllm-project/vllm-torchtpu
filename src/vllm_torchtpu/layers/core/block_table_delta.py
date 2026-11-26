@@ -42,6 +42,7 @@ import numpy as np
 import torch
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation.direct_call import DirectCompiled
 
 # Changed entries one delta upload carries. Larger walks take the full path.
 # 128 requests crossing a block boundary together in every one of 51 groups is
@@ -147,8 +148,8 @@ def _apply_block_table_delta(
     return out
 
 
-_apply_block_table_delta_compiled = torch.compile(
-    _apply_block_table_delta, backend="tpu", fullgraph=True, dynamic=False
+_apply_block_table_delta_compiled = DirectCompiled(
+    _apply_block_table_delta, backend="tpu"
 )
 
 

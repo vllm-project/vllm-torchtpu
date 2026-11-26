@@ -15,6 +15,7 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation.direct_call import direct_compile
 from vllm_torchtpu.layers.core.block_table_delta import (
     BlockTableDeltaStager,
     get_stager,
@@ -207,7 +208,7 @@ def _staged_walk_products(
     return tuple(outs) + tuple(states) + tuple(ckpts)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@direct_compile(backend="tpu")
 def _staged_walk_products_compiled(
     staged_dev: torch.Tensor,
     seq_lens: torch.Tensor,
