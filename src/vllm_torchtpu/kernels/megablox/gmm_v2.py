@@ -2089,24 +2089,6 @@ def _mlp_kernel(
         for c in copies:
             c.wait()
 
-    # The first tile's weights start copying before the metadata loop: the
-    # first local group with rows, which fill_metadata assigns to tile 0.
-    group_offset = group_offset_ref[0]
-    max_num_group = group_offset + dims.size_group
-
-    def is_empty(lhs_group_id):
-        size = lhs_group_sizes_ref[jnp.minimum(lhs_group_id, max_num_group - 1)]
-        return jnp.logical_and(lhs_group_id < max_num_group, size <= 0)
-
-    first_lhs_group = lax.while_loop(is_empty, lambda i: i + 1, group_offset)
-
-    @pl.when(first_lhs_group < max_num_group)
-    def _():
-        group_id = first_lhs_group - group_offset
-        for p in range(cfgs.num_parts):
-            start(up_copies(p, group_id))
-        for q in range(cfgs.down_parts):
-            start(down_copies(q, group_id))
 
     if scatter is not None:
         # No row may land in a member's receive buffer before that member runs
@@ -2258,6 +2240,18 @@ def _mlp_kernel(
             jnp.minimum(gm_id + 1, num_gm - 1)
         ]
         fetch_next = jnp.logical_and(has_next, next_group_id != group_id)
+
+        # The first tile's weights start copying here, once the pipeline has
+        # fetched its rows: started before the pipeline, the ~25 MB of weight
+        # copies hold back the rows' copy (~8 us at the decode shapes), while
+        # from here the first part arrives a third of the way in and the
+        # others load behind the first matmuls.
+        @pl.when(gm_id == 0)
+        def _():
+            for p in range(cfgs.num_parts):
+                start(up_copies(p, group_id))
+            for q in range(cfgs.down_parts):
+                start(down_copies(q, group_id))
 
         m_start = metadata_ref.gm_id_to_m_offset[gm_id]
         m_end = metadata_ref.gm_id_to_m_offset[gm_id + 1]
