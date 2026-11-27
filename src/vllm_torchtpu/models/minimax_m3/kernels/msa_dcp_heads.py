@@ -547,6 +547,8 @@ def replica_rows(
     in place: as XLA ops, a transpose of the rotation's head-major output,
     the half picks and the concatenation cost ~5 copies of q (c64's
     8K-token steps: 56 us per layer, twin j-5c900b89)."""
+    if q.dtype != jnp.bfloat16:
+        raise ValueError(f"packs and rotates bf16 queries, got {q.dtype}")
     num_tokens, heads, head_dim = q.shape
     rows = num_tokens // 2
     per_step, steps = _replica_grid(rows, block)
@@ -557,16 +559,22 @@ def replica_rows(
 
     def kernel(j_ref, mine_ref, theirs_ref, h_ref, o_ref):
         del j_ref
-        out = []
+        bits = []
         for src in (mine_ref, theirs_ref):
             for h in range(heads):
                 x = src[:, :, h * head_dim : (h + 1) * head_dim]
                 x = x.reshape(tokens, head_dim)
                 if rotate:
                     x = jnp.dot(x, h_ref[...], preferred_element_type=jnp.float32)
-                    x = (x * (1.0 / head_dim)).astype(o_ref.dtype)
-                out.append(x)
-        o_ref[...] = jnp.stack(out, axis=1)
+                    x = (x * (1.0 / head_dim)).astype(jnp.bfloat16)
+                bits.append(
+                    jax.lax.bitcast_convert_type(x, jnp.uint16).astype(jnp.uint32)
+                )
+        # A token's heads 2k and 2k + 1 share a 32-bit row of its bf16 tile
+        # (the even head in the low half): interleaving 16 rows of 32 bits
+        # per token cost 31 us at 8K tokens, 16 bf16 rows 54 us (tpu7x).
+        pairs = [bits[2 * k] | (bits[2 * k + 1] << 16) for k in range(heads)]
+        o_ref.bitcast(jnp.uint32)[...] = jnp.stack(pairs, axis=1)
 
     return pl.pallas_call(
         kernel,
@@ -609,6 +617,8 @@ def replica_rows_out(
     (this rank's heads over the partner's rows): this rank's heads over every
     row, unrotated as `unrotate_to_rows`, written token-major ``[T, Hl * D]``
     in step order. Reads ``out``'s first ``Hl`` heads in place."""
+    if out.dtype != jnp.bfloat16:
+        raise ValueError(f"unrotates a bf16 output (one MXU pass), got {out.dtype}")
     _, rows, head_dim = out.shape
     heads = theirs.shape[0]
     per_step, steps = _replica_grid(rows, block)

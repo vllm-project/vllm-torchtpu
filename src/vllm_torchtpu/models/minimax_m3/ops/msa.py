@@ -846,9 +846,9 @@ def _get_msa_dcp_fp4_op(
     heads_op, late_heads_op = (
         (
             _get_msa_dcp_heads_op(
-                sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix, rotated
+                sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix, q_in
             )
-            for rotated in (True, False)
+            for q_in in (True, False)
         )
         if kv_heads > 1
         else (None, None)
@@ -875,6 +875,7 @@ def _get_msa_dcp_fp4_op(
             k, v, index_q = gather_group_kv(
                 k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
             )
+        # The heads op's own test, at its (default) head-parallel size.
         late = late_heads_op is not None and msa_dcp_heads.head_parallel(
             q.shape[0], metadata.seq_lens.shape[0], decode_rows
         )

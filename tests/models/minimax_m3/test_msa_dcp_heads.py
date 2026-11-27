@@ -192,6 +192,74 @@ def test_attend_and_merge_matches_dcp_reference(
         )
 
 
+@pytest.mark.parametrize(
+    "q_lens,ctx_lens,num_tokens,min_tokens",
+    [
+        # Head-parallel, the replicas' alternate 64-token blocks: the decode
+        # rows are rotated after their gather, the rest by `replica_rows`.
+        ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 384, 64),
+        # A decode after a prefill: the decode rows are no prefix.
+        ([8, 200, 8, 100], [3000, 8800, 5000, 3900], 384, 64),
+        # Below the head-parallel size: DCP attention of rotated queries.
+        ([8, 8, 200, 100], [3000, 5000, 8800, 3900], 320, 1 << 20),
+    ],
+)
+def test_attend_and_merge_rotates_queries(q_lens, ctx_lens, num_tokens, min_tokens):
+    """``q_rotated=False``: the op rotates the queries itself."""
+    if len(jax.devices()) < DCP:
+        pytest.skip(
+            "needs 8 devices (XLA_FLAGS=--xla_force_host_platform_device_count=8)"
+        )
+    rng = np.random.default_rng(1)
+    raw, *rest, num_real = _step(rng, q_lens, ctx_lens, 12, num_tokens)
+    want = _reference([msa_fp4.rotate_queries(x) for x in raw], *rest)
+    got = _spmd(
+        raw,
+        *rest,
+        decode_rows=8,
+        head_parallel_min_tokens=min_tokens,
+        q_rotated=False,
+    )
+    for r in range(DCP):
+        np.testing.assert_allclose(
+            got[r][:num_real], np.asarray(want[r])[:num_real], rtol=2e-2, atol=2e-2
+        )
+
+
+def test_replica_rows_round_trip():
+    """`replica_rows_out` puts each replica's blocks back in step order."""
+    heads, block, num_tokens = HL, 64, 512
+    rng = np.random.default_rng(2)
+    q = jnp.asarray(rng.standard_normal((num_tokens, heads, HEAD_DIM)), jnp.bfloat16)
+    halves = q.reshape(-1, 2, block, heads, HEAD_DIM)
+    for j in (0, 1):
+        theirs = halves[:, 1 - j].reshape(num_tokens // 2, heads, HEAD_DIM)
+        rows = msa_dcp_heads.replica_rows(
+            q, theirs, jnp.int32(j), block=block, rotate=False, interpret=True
+        )
+        mine = halves[:, j].reshape(num_tokens // 2, heads, HEAD_DIM)
+        np.testing.assert_array_equal(
+            np.asarray(rows, np.float32),
+            np.asarray(jnp.concatenate([mine, theirs], axis=1), np.float32),
+        )
+        # Attention output stand-in: the rows' heads, head-major.
+        out = msa_fp4.rotate_keys(rows).astype(jnp.bfloat16).transpose(1, 0, 2)
+        back = msa_dcp_heads.replica_rows_out(
+            out,
+            msa_fp4.rotate_keys(theirs).astype(jnp.bfloat16).transpose(1, 0, 2),
+            jnp.int32(j),
+            block=block,
+            interpret=True,
+        )
+        want = msa_dcp_heads.unrotate_to_rows(
+            msa_fp4.rotate_keys(q).astype(jnp.bfloat16).transpose(1, 0, 2),
+            interpret=True,
+        )
+        np.testing.assert_array_equal(
+            np.asarray(back, np.float32), np.asarray(want, np.float32)
+        )
+
+
 @pytest.mark.parametrize("live,lanes", [(0, 1), (5, 1), (11, 1), (12, 1), (5, 0)])
 def test_exchange_head_pages(live, lanes):
     """`lanes = 0`: the served (lane, dcp) mesh, with a lane axis of size 1."""
