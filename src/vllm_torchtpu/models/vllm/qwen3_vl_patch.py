@@ -415,3 +415,74 @@ def maybe_patch_qwen3_vl(model_config: Optional["ModelConfig"] = None) -> bool |
     _patch_qwen3_vl_vision_attention(modeling)
     _patch_qwen3_vl_vision_transformer(modeling)
     return None
+
+
+def _qwen3_vl_configs() -> tuple[type, ...]:
+    """Configs of the models built on the Qwen3-VL vision tower and processor."""
+    from transformers import Cosmos3OmniConfig, Qwen3VLConfig, Qwen3VLMoeConfig
+
+    return (Qwen3VLConfig, Qwen3VLMoeConfig, Cosmos3OmniConfig)
+
+
+def _has_qwen3_vl_vision(model_config: Optional["ModelConfig"]) -> bool:
+    """Whether the model is Qwen3-VL, Qwen3-VL-MoE or Cosmos3."""
+    return model_config is not None and isinstance(
+        model_config.hf_config, _qwen3_vl_configs()
+    )
+
+
+def _collapse_video_placeholders(prompt: list[int], hf_config) -> list[int]:
+    """Collapse each full video placeholder to the bare ``<|video_pad|>`` token."""
+    video = hf_config.video_token_id
+    full = [hf_config.vision_start_token_id, video, hf_config.vision_end_token_id]
+    collapsed = []
+    i = 0
+    while i < len(prompt):
+        if prompt[i : i + 3] == full:
+            collapsed.append(video)
+            i += 3
+        else:
+            collapsed.append(prompt[i])
+            i += 1
+    return collapsed
+
+
+def maybe_patch_qwen3_vl_video_prompt(
+    model_config: Optional["ModelConfig"] = None,
+) -> bool | None:
+    """Expand Qwen3-VL videos in the prompt format the models were trained on.
+
+    The chat template writes a video as ``<|vision_start|><|video_pad|><|vision_end|>``.
+    The processor Qwen3-VL and Cosmos3 were trained with (transformers < 5.10)
+    replaces that whole triple with ``<t seconds><|vision_start|>...<|vision_end|>``
+    per frame group (temporal patch). vLLM 0.33.0 follows transformers >= 5.10,
+    which replaces only the bare video token and so leaves an outer
+    ``<|vision_start|>``/``<|vision_end|>`` pair around every video, two tokens
+    the model never saw. Collapsing the triple to the bare token before that
+    replacement gives the trained layout for both prompt forms. Models with other
+    configs that share the processor class, such as Qwen3.5, keep the stock one.
+
+    TODO(https://github.com/vllm-project/vllm/issues/69473): delete this whole
+    patch once vLLM expands these videos in the trained format, which the strict
+    xfail ``test_upstream_expands_trained_video_layout`` reports by passing.
+    """
+    if not _has_qwen3_vl_vision(model_config):
+        return False
+    trained_configs = _qwen3_vl_configs()
+    from vllm.model_executor.models import qwen3_vl
+
+    processor_cls = qwen3_vl.Qwen3VLMultiModalProcessor
+    postprocess_prompt = processor_cls._postprocess_prompt
+
+    def _postprocess_prompt(self, prompt: list[int]) -> list[int]:
+        prompt = postprocess_prompt(self, prompt)
+        hf_config = self.info.get_hf_config()
+        if not isinstance(hf_config, trained_configs):
+            return prompt
+        return _collapse_video_placeholders(prompt, hf_config)
+
+    processor_cls._postprocess_prompt = _postprocess_prompt
+    logger.info(
+        "Applied TPU patch: Qwen3-VL videos expand in the trained prompt format."
+    )
+    return None
