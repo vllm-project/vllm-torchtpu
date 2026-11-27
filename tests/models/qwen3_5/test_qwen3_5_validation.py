@@ -173,6 +173,17 @@ def test_point_connector_options_are_known(path):
             connector_options.read_options(options_cls, extra)
 
 
+@pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
+def test_point_late_poll_legs_are_async_consumers(path):
+    """The connector refuses late_poll anywhere else."""
+    for leg_name, leg in _load(path)["legs"].items():
+        raw = _serve_arg(leg, "--kv-transfer-config")
+        for config in _connector_configs(json.loads(raw)):
+            if config.get("kv_connector_extra_config", {}).get("late_poll"):
+                assert config["kv_role"] == "kv_consumer", leg_name
+                assert "--async-scheduling" in leg["serve_args"], leg_name
+
+
 def _qwen3_5_sections(entry: dict):
     for leg in entry.get("legs", {}).values():
         if "additional_config" in leg:

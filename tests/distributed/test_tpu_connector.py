@@ -390,6 +390,8 @@ def _make_raiden_worker(
     send_completion: bool = False,
     load_failure_policy: str = "recompute",
     extra_config: dict[str, Any] | None = None,
+    async_scheduling: bool = True,
+    kv_role: str | None = None,
 ) -> TPURaidenConnectorWorker:
     cfg = _make_vllm_config(
         is_producer=is_producer,
@@ -406,6 +408,9 @@ def _make_raiden_worker(
     cfg.kv_transfer_config.kv_connector = "TPURaidenConnector"
     cfg.kv_transfer_config.kv_load_failure_policy = load_failure_policy
     cfg.kv_transfer_config.kv_connector_extra_config = dict(extra_config or {})
+    cfg.scheduler_config.async_scheduling = async_scheduling
+    if kv_role is not None:
+        cfg.kv_transfer_config.kv_role = kv_role
     with (
         patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=tp_rank),
         patch(f"{_MOD}.get_tensor_model_parallel_world_size", return_value=tp_size),
@@ -8963,6 +8968,48 @@ def test_late_poll_is_refused_with_inline_load(monkeypatch):
         )
     worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=False)
     assert worker.late_poll_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("is_producer", "kv_role", "async_scheduling", "refusal"),
+    [
+        (True, None, True, "not to kv_role 'kv_producer'"),
+        # kv_both is a producer too (is_kv_producer).
+        (True, "kv_both", True, "not to kv_role 'kv_both'"),
+        (False, None, False, "needs async scheduling"),
+        (True, None, False, "applies to a KV consumer"),
+    ],
+)
+def test_late_poll_is_refused_where_it_cannot_report(
+    is_producer, kv_role, async_scheduling, refusal, monkeypatch
+):
+    monkeypatch.setattr(f"{_MOD}.dist_utils.get_raiden_inline_load", lambda: False)
+    with pytest.raises(ValueError, match=refusal):
+        _make_raiden_worker(
+            tp_rank=0,
+            tp_size=1,
+            is_producer=is_producer,
+            kv_role=kv_role,
+            async_scheduling=async_scheduling,
+            extra_config={"late_poll": True},
+        )
+    # Without the option, the same engines start.
+    worker = _make_raiden_worker(
+        tp_rank=0,
+        tp_size=1,
+        is_producer=is_producer,
+        kv_role=kv_role,
+        async_scheduling=async_scheduling,
+    )
+    assert worker.late_poll_enabled is False
+
+
+def test_late_poll_starts_on_an_async_consumer(monkeypatch):
+    monkeypatch.setattr(f"{_MOD}.dist_utils.get_raiden_inline_load", lambda: False)
+    worker = _make_raiden_worker(
+        tp_rank=0, tp_size=1, is_producer=False, extra_config={"late_poll": True}
+    )
+    assert worker.late_poll_enabled is True
 
 
 class TestStage3AsyncRegister:

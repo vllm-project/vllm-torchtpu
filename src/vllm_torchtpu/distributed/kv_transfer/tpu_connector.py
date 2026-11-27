@@ -2728,6 +2728,19 @@ class TPURaidenConnectorWorker:
         self._async_register = options.async_register
         # Public: TPUWorker reads it to find the connectors it late-polls.
         self.late_poll_enabled = options.late_poll
+        if self.late_poll_enabled and self.is_producer:
+            # A producer loads nothing, so late_poll_finished_recving would
+            # always answer an empty set.
+            raise ValueError(
+                "kv_connector_extra_config['late_poll'] applies to a KV "
+                f"consumer, not to kv_role {self.config.kv_role!r}"
+            )
+        if self.late_poll_enabled and not vllm_config.scheduler_config.async_scheduling:
+            # TPUWorker late-polls only an asynchronous step output.
+            raise ValueError(
+                "kv_connector_extra_config['late_poll'] needs async scheduling "
+                "(--async-scheduling)"
+            )
         if self.late_poll_enabled and dist_utils.get_raiden_inline_load():
             # The inline-load wait polls for its own loads before the first
             # forward; a late poll on the async output thread could take
