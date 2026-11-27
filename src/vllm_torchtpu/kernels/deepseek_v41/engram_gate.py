@@ -24,6 +24,22 @@ from jax.experimental.pallas import tpu as pltpu
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = 448.0
 LANES = 128
+ROW_TILE = 8
+
+
+def _rows(index, size, real, run):
+    """``run(n)`` for block ``index`` of ``size`` rows over ``real`` rows: n is
+    ``size``, or the last block's tail. Each size is a fixed DMA shape, so
+    rows past the input are never read or written, only left as scratch."""
+    blocks = -(-real // size)
+    tail = real - (blocks - 1) * size
+    if tail == size:
+        run(size)
+    elif blocks == 1:
+        run(tail)
+    else:
+        pl.when(index < blocks - 1)(lambda: run(size))
+        pl.when(index == blocks - 1)(lambda: run(tail))
 
 
 def _kernel(
@@ -59,8 +75,8 @@ def _kernel(
     clamp: float,
     block_size: int | None,
 ):
-    tokens = q.shape[0]
-    tiles = tokens // token_tile
+    real = hidden.shape[0]
+    tiles = q.shape[0] // token_tile
     per_head = dim // window
     key_windows = heads * per_head
     windows = key_windows + per_head
@@ -69,10 +85,19 @@ def _kernel(
         return pl.ds(pl.multiple_of(offset, size), size)
 
     if block_size is None:
-        _quantize_rows(*rows, *stage, x_sem, q, x_scale, quant_rows=quant_rows)
+        _quantize_rows(
+            *rows, *stage, x_sem, q, x_scale, quant_rows=quant_rows, real=real
+        )
     else:
         _quantize_packed(
-            *rows, *stage, x_sem, q, x_scale, quant_rows=quant_rows, block=block_size
+            *rows,
+            *stage,
+            x_sem,
+            q,
+            x_scale,
+            quant_rows=quant_rows,
+            block=block_size,
+            real=real,
         )
 
     def w_copy(i):
@@ -102,12 +127,17 @@ def _kernel(
 
     # Key units stream hidden tiles through the second value group's first
     # two slots, free until the value phase.
-    def k_load(n):
-        slot = heads + n % 2
-        cell = hidden.at[
-            at(n % tiles * token_tile, token_tile), at(n // tiles * window, window)
-        ]
-        return pltpu.make_async_copy(cell, hb.at[slot], h_sem.at[slot])
+    def k_load(n, op):
+        def run(size):
+            slot = heads + n % 2
+            row = pl.multiple_of(n % tiles * token_tile, token_tile)
+            cell = hidden.at[pl.ds(row, size), at(n // tiles * window, window)]
+            copy = pltpu.make_async_copy(
+                cell, hb.at[slot, pl.ds(0, size)], h_sem.at[slot]
+            )
+            getattr(copy, op)()
+
+        _rows(n % tiles, token_tile, real, run)
 
     # Value groups g = j * tiles + t own heads slots each, two groups in
     # turn: a group's hidden tiles load while the unit before it is
@@ -115,17 +145,29 @@ def _kernel(
     def v_slot(g, s):
         return (g % 2) * heads + s
 
-    def v_cell(ref, g, s):
-        j, t = g // tiles, g % tiles
-        return ref.at[at(t * token_tile, token_tile), at(s * dim + j * window, window)]
+    def v_copy(g, s, op, load):
+        def run(size):
+            slot = v_slot(g, s)
+            row = pl.multiple_of(g % tiles * token_tile, token_tile)
+            col = at(s * dim + g // tiles * window, window)
+            local = hb.at[slot, pl.ds(0, size)]
+            if load:
+                copy = pltpu.make_async_copy(
+                    hidden.at[pl.ds(row, size), col], local, h_sem.at[slot]
+                )
+            else:
+                copy = pltpu.make_async_copy(
+                    local, out.at[pl.ds(row, size), col], o_sem.at[slot]
+                )
+            getattr(copy, op)()
 
-    def v_load(g, s):
-        slot = v_slot(g, s)
-        return pltpu.make_async_copy(v_cell(hidden, g, s), hb.at[slot], h_sem.at[slot])
+        _rows(g % tiles, token_tile, real, run)
 
-    def v_store(g, s):
-        slot = v_slot(g, s)
-        return pltpu.make_async_copy(hb.at[slot], v_cell(out, g, s), o_sem.at[slot])
+    def v_load(g, s, op):
+        v_copy(g, s, op, True)
+
+    def v_store(g, s, op):
+        v_copy(g, s, op, False)
 
     key_units = key_windows * tiles
     units = windows * tiles
@@ -162,7 +204,7 @@ def _kernel(
 
         @pl.when(n + 1 < key_units)
         def _():
-            k_load(n + 1).start()
+            k_load(n + 1, "start")
 
         @pl.when(n + 1 >= key_units)
         def _():
@@ -171,9 +213,9 @@ def _kernel(
 
                 @pl.when(g >= 2)
                 def _(*, s=s):
-                    v_store(g - 2, s).wait()
+                    v_store(g - 2, s, "wait")
 
-                v_load(g, s).start()
+                v_load(g, s, "start")
 
         @pl.when((n + 1) % tiles == 0)
         def _():
@@ -181,17 +223,17 @@ def _kernel(
 
     def consume_waits(n, key):
         if key:
-            k_load(n).wait()
+            k_load(n, "wait")
         else:
             for s in range(heads):
-                v_load(n - key_units, s).wait()
+                v_load(n - key_units, s, "wait")
 
     # Software pipeline: unit n's vector work and unit n + 1's projection
     # share one basic block, free to overlap; DMA waits and starts sit
     # outside it.
     w_copy(0).start()
     w_copy(1).start()
-    k_load(0).start()
+    k_load(0, "start")
     w_copy(0).wait()
     project(0)
     projected(0)
@@ -226,7 +268,7 @@ def _kernel(
     # Value windows: out = BF16(hidden + gate * value).
     def store(n):
         for s in range(heads):
-            v_store(n - key_units, s).start()
+            v_store(n - key_units, s, "start")
 
     @pl.loop(key_units, units - 1)
     def _(n):
@@ -243,18 +285,24 @@ def _kernel(
     groups = per_head * tiles
     for g in range(max(0, groups - 2), groups):
         for s in range(heads):
-            v_store(g, s).wait()
+            v_store(g, s, "wait")
 
 
-def _quantize_rows(x, xb, x_sem, q, x_scale, *, quant_rows):
+def _quantize_rows(x, xb, x_sem, q, x_scale, *, quant_rows, real):
     """Per-token FP8 activation quantization, as quantize_block does it."""
 
-    def x_copy(block, slot):
-        rows = pl.ds(pl.multiple_of(block * quant_rows, quant_rows), quant_rows)
-        return pltpu.make_async_copy(x.at[rows], xb.at[slot], x_sem.at[slot])
+    def x_copy(block, slot, op):
+        def run(size):
+            rows = pl.ds(pl.multiple_of(block * quant_rows, quant_rows), size)
+            copy = pltpu.make_async_copy(
+                x.at[rows], xb.at[slot, pl.ds(0, size)], x_sem.at[slot]
+            )
+            getattr(copy, op)()
 
-    blocks = q.shape[0] // quant_rows
-    x_copy(0, 0).start()
+        _rows(block, quant_rows, real, run)
+
+    blocks = -(-real // quant_rows)
+    x_copy(0, 0, "start")
 
     @pl.loop(0, blocks)
     def _(block):
@@ -262,9 +310,9 @@ def _quantize_rows(x, xb, x_sem, q, x_scale, *, quant_rows):
 
         @pl.when(block + 1 < blocks)
         def _():
-            x_copy(block + 1, 1 - slot).start()
+            x_copy(block + 1, 1 - slot, "start")
 
-        x_copy(block, slot).wait()
+        x_copy(block, slot, "wait")
         _store_quantized(xb[slot].astype(jnp.float32), block, q, x_scale, quant_rows)
 
 
@@ -276,7 +324,9 @@ def _store_quantized(a, block, q, x_scale, quant_rows):
     x_scale[rows, :] = scale
 
 
-def _quantize_packed(raw, scales, rb, sb, xt, x_sem, q, x_scale, *, quant_rows, block):
+def _quantize_packed(
+    raw, scales, rb, sb, xt, x_sem, q, x_scale, *, quant_rows, block, real
+):
     """``_quantize_rows`` of the BF16 rows ``dequant_fp8_rows`` builds from
     packed staging, unpacked here instead of in XLA glue.
 
@@ -294,16 +344,20 @@ def _quantize_packed(raw, scales, rb, sb, xt, x_sem, q, x_scale, *, quant_rows, 
     word_of_lane = lane // (block // 4) // 4
     shift = (lane // (block // 4)) % 4 * 8
 
-    def copies(index, slot):
-        rows = pl.ds(pl.multiple_of(index * quant_rows, quant_rows), quant_rows)
-        return (
-            pltpu.make_async_copy(raw.at[rows], rb.at[slot], x_sem.at[0, slot]),
-            pltpu.make_async_copy(scales.at[rows], sb.at[slot], x_sem.at[1, slot]),
-        )
+    def copies(index, slot, op):
+        def run(size):
+            rows = pl.ds(pl.multiple_of(index * quant_rows, quant_rows), size)
+            local = pl.ds(0, size)
+            for k, (src, dst) in enumerate(((raw, rb), (scales, sb))):
+                copy = pltpu.make_async_copy(
+                    src.at[rows], dst.at[slot, local], x_sem.at[k, slot]
+                )
+                getattr(copy, op)()
 
-    blocks = q.shape[0] // quant_rows
-    for copy in copies(0, 0):
-        copy.start()
+        _rows(index, quant_rows, real, run)
+
+    blocks = -(-real // quant_rows)
+    copies(0, 0, "start")
 
     @pl.loop(0, blocks)
     def _(index):
@@ -311,11 +365,9 @@ def _quantize_packed(raw, scales, rb, sb, xt, x_sem, q, x_scale, *, quant_rows, 
 
         @pl.when(index + 1 < blocks)
         def _():
-            for copy in copies(index + 1, 1 - slot):
-                copy.start()
+            copies(index + 1, 1 - slot, "start")
 
-        for copy in copies(index, slot):
-            copy.wait()
+        copies(index, slot, "wait")
         # dequant_fp8_rows, plane by plane: FP8 value times the power of two
         # built from the scale byte's exponent bits, +0 for byte 255, BF16.
         amax = jnp.zeros((quant_rows, LANES), jnp.float32)
@@ -402,8 +454,9 @@ def engram_gate(
     """Engram's gated residual from rows ``x`` [T, K] and ``hidden`` [T, H, D].
 
     ``w`` is the canonical [K, (H + 1) * D] FP8 weight with per-column FP32
-    ``w_scale``; ``mask`` [T] gates padded tokens shut. Any T: rows are
-    padded to whole token tiles internally. Returns [T, H, D] BF16.
+    ``w_scale``; ``mask`` [T] gates padded tokens shut. Any T: the kernel
+    computes whole token tiles but reads and writes only T rows (rounded up
+    to ROW_TILE). Returns [T, H, D] BF16.
 
     With ``block_size``, ``x`` is the packed staging instead: int32 words of
     the FP8 bytes [T, K / 4] and of the E8M0 scale bytes, one per
@@ -451,13 +504,14 @@ def engram_gate(
         )
     if w.shape != (k_dim, (heads + 1) * dim) or dim % window or token_tile % quant_rows:
         raise ValueError("Unsupported Engram gate shapes")
-    # Zero rows pad the tokens to whole tiles; their gate is masked shut.
+    # The kernel computes whole token tiles but moves only the input's rows,
+    # whole HBM row tiles of ROW_TILE; rows past them stay in VMEM.
     token_tile = min(token_tile, -(-tokens // quant_rows) * quant_rows)
     padded = -(-tokens // token_tile) * token_tile
-    pad = ((0, padded - tokens), (0, 0))
+    pad = ((0, -tokens % ROW_TILE), (0, 0))
     # Zero packed bytes dequantize to the zero rows of the BF16 input.
     x = jax.tree.map(lambda a: jnp.pad(a, pad), x)
-    mask = jnp.pad(mask.astype(jnp.float32), pad[:1])
+    mask = jnp.pad(mask.astype(jnp.float32), (0, padded - tokens))
     hidden = jnp.pad(hidden.reshape(tokens, heads * dim), pad)
     hbm, vmem = (pl.BlockSpec(memory_space=s) for s in (pltpu.HBM, pltpu.VMEM))
     kernel = functools.partial(
@@ -485,7 +539,7 @@ def engram_gate(
         stage_sem = pltpu.SemaphoreType.DMA((2, 2))
     flat = pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((padded, heads * dim), hidden.dtype),
+        out_shape=jax.ShapeDtypeStruct(hidden.shape, hidden.dtype),
         in_specs=(rows_spec, hbm, vmem, hbm, vmem, vmem, vmem),
         out_specs=hbm,
         scratch_shapes=(
