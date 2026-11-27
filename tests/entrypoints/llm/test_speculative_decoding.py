@@ -861,21 +861,11 @@ def test_qwen35_mtp_logprobs_greedy(
     )
 
 
-def _fast_dispatch_counts(self) -> tuple[int, list[str]]:
-    """This worker's direct calls through ``tpu_compile``'s wrappers, and the
-    functions it dispatched directly at least once."""
-    import gc
-    import types
-
+def _direct_calls(self) -> int:
+    """This worker's direct calls through ``tpu_compile``'s wrappers so far."""
     from vllm_torchtpu.compilation import fast_dispatch
 
-    dispatched = sorted(
-        obj.__qualname__
-        for obj in gc.get_objects()
-        if isinstance(obj, types.FunctionType)
-        and obj.__dict__.get("_fast_dispatch_state", {}).get("logged")
-    )
-    return fast_dispatch._STATS[0], dispatched
+    return fast_dispatch._STATS[0]
 
 
 @pytest.mark.timeout(1800)
@@ -908,17 +898,26 @@ def test_qwen35_mtp_fast_compiled_call_keeps_greedy_tokens(
         mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
         for arm, engine_kwargs in (("off", kwargs), ("on", armed)):
             with _engine(QWEN35_MTP_MODEL, speculative_config, engine_kwargs) as engine:
+                # The warm-up already dispatches directly; count generation only.
+                before = engine.collective_rpc(_direct_calls)
                 outputs = engine.generate_outputs(prompts, sampling_config)
+                after = engine.collective_rpc(_direct_calls)
                 results[arm] = (
                     [list(output.outputs[0].token_ids) for output in outputs],
-                    engine.collective_rpc(_fast_dispatch_counts),
+                    [b - a for a, b in zip(before, after, strict=True)],
                 )
-    off_tokens, off_counts = results["off"]
-    on_tokens, on_counts = results["on"]
-    assert all(fast == 0 for fast, _ in off_counts), off_counts
-    # The option took effect: every worker dispatched compiled code directly.
-    assert all(fast > 0 and dispatched for fast, dispatched in on_counts), on_counts
+    off_tokens, off_direct = results["off"]
+    on_tokens, on_direct = results["on"]
     assert on_tokens == off_tokens
+    assert all(n == 0 for n in off_direct), (
+        f"the default engine dispatched directly during generation (the tokens "
+        f"matched): {off_direct}"
+    )
+    # The option took effect while serving: every worker dispatched directly.
+    assert on_direct and all(n > 0 for n in on_direct), (
+        f"the armed engine did not dispatch directly during generation (the tokens "
+        f"matched): {on_direct}"
+    )
 
 
 def _test_performance_helper(
