@@ -267,6 +267,43 @@ def test_dense_work_list_matches_unique(
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+@pytest.mark.parametrize("union_size,num_tiles", [(512, 130), (128, 64)])
+def test_kernel_unions_match_sorted_unions(union_size, num_tiles):
+    """`kernel_unions` equals the XLA sorts' unions (-1 past each): tiles
+    of no page, of one page repeated, of all-distinct pages, of few pages
+    repeated with gaps, keys up to `MAX_UNION_KEYS`; a tile count that is
+    not a multiple of a grid step's."""
+    rng = np.random.default_rng(union_size + num_tiles)
+    keys = rng.integers(-1, 60, size=(num_tiles, union_size)).astype(np.int32)
+    keys[rng.random(num_tiles) < 0.1] = -1
+    keys[1] = 7
+    keys[2] = rng.choice(msa_attention.MAX_UNION_KEYS, union_size, replace=False)
+    keys[3] = rng.integers(-1, msa_attention.MAX_UNION_KEYS, union_size)
+    keys[4, : union_size // 2] = -1
+    union = msa_attention._sorted_unions(
+        jnp.where(keys < 0, msa_attention._NO_PAGE, jnp.asarray(keys))
+    )
+    want = jnp.where(union == msa_attention._NO_PAGE, -1, union)
+    got = msa_attention.kernel_unions(jnp.asarray(keys), interpret=True)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def test_packed_work_kernel_unions_match_xla():
+    """`_packed_work`'s rows for four 2,048-token calls of 32-token tiles
+    (decode rows first, padding tiles of no page) are the same whether the
+    unions come from `kernel_unions` or the XLA sorts."""
+    rng = np.random.default_rng(3)
+    selected = rng.integers(-1, 900, size=(4, 2048, 16)).astype(np.int32)
+    selected[:, :152] = rng.integers(-1, 49152, size=(4, 152, 16))
+    selected[:, -96:] = -1
+    got = msa_attention_lse._packed_work(
+        jnp.asarray(selected), 32, 32, num_keys=49152, interpret=True
+    )
+    want = msa_attention_lse._packed_work(jnp.asarray(selected), 32, 32)
+    np.testing.assert_array_equal(np.asarray(got[0]), np.asarray(want[0]))
+    assert got[1] == want[1]
+
+
 def test_fp4_lse_small_tiles_match_default_tiles():
     """The DCP attention's 8-token tiles (small batches) on a 4-bit cache give
     the 16-token tiles' output and lse."""

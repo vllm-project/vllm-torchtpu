@@ -1583,19 +1583,40 @@ def fits_work_row(block_q, topk, pages_per_step) -> bool:
     return block_q * topk == _LANES and groups_per_tile * pages_per_step == _LANES
 
 
-def _packed_work(selected, block_q, pages_per_step, align=1, most=None):
+def _packed_work(
+    selected,
+    block_q,
+    pages_per_step,
+    align=1,
+    most=None,
+    num_keys=None,
+    interpret=False,
+):
     """`msa_attention._work_list` of each call's ``selected [C, T, K]`` as
     one int32 row per call, ``[unions | meta words | counts | step
     starts]``, and the tiles each grid step takes: a call then takes one
     slice of its work list, not one per array (each an XLA op of ~1.3 us,
     x 4 calls x G per layer). Step ``b``'s first group is its
-    ``tiles_per_step * b``-th tile's; the last entry is the group count."""
-    pages, meta, ends, counts = jax.vmap(
-        functools.partial(
-            msa_attention._work_list, block_q=block_q, pages_per_step=pages_per_step
+    ``tiles_per_step * b``-th tile's; the last entry is the group count.
+    With `num_keys` (page keys are below it), sorted unions come from
+    `msa_attention.kernel_unions` where it fits."""
+    num_calls, num_tokens, topk = selected.shape
+    num_tiles = num_tokens // block_q
+    work_list = functools.partial(
+        msa_attention._work_list, block_q=block_q, pages_per_step=pages_per_step
+    )
+    union_size = block_q * topk
+    if msa_attention.dense_unions(num_tiles, union_size) or not (
+        num_keys is not None and msa_attention.fits_kernel_unions(union_size, num_keys)
+    ):
+        pages, meta, ends, counts = jax.vmap(work_list)(selected)
+    else:  # every call's tiles sorted in one kernel
+        unions = msa_attention.kernel_unions(
+            selected.reshape(num_calls * num_tiles, union_size), interpret
         )
-    )(selected)
-    num_tiles = selected.shape[1] // block_q
+        pages, meta, ends, counts = jax.vmap(
+            lambda keys, union: work_list(keys, union=union)
+        )(selected, unions.reshape(num_calls, num_tiles, -1))
     tiles_per_step = _tiles_per_step(num_tiles, block_q, align, most)
     groups_per_tile = msa_attention._groups_per_tile(
         block_q, selected.shape[2], pages_per_step
@@ -1830,7 +1851,14 @@ def _chunked_call(
     )
     dtype = (q[0] if isinstance(q, tuple) else q).dtype
     step, num_chunks, pad, selected, (packed, tiles_per_step) = _chunk_work(
-        selected, num_q_heads, dtype, block_q, pages_per_step, scale_rows is not None
+        selected,
+        num_q_heads,
+        dtype,
+        block_q,
+        pages_per_step,
+        scale_rows is not None,
+        num_keys=page_table.size,
+        interpret=interpret,
     )
     q = jax.tree.map(lambda x: jnp.pad(x, ((0, 0), (0, pad), (0, 0))), q)
     local_page = jnp.pad(local_page, (0, pad), constant_values=-1)[:, None]
@@ -1909,7 +1937,15 @@ def _chunked_call(
 
 
 def _chunk_work(
-    selected, num_q_heads, dtype, block_q, pages_per_step, fp4=False, packed=False
+    selected,
+    num_q_heads,
+    dtype,
+    block_q,
+    pages_per_step,
+    fp4=False,
+    packed=False,
+    num_keys=None,
+    interpret=False,
 ):
     """`_chunked_call`'s calls over ``selected [T, G, K]``: ``(step,
     chunks, pad, selected [G, chunks * step, K], (packed, tiles_per_step))``
@@ -1937,6 +1973,8 @@ def _chunk_work(
             and num_tokens > msa_attention.SMALL_BATCH_TOKENS
             else None
         ),
+        num_keys=num_keys,
+        interpret=interpret,
     )
     return step, num_chunks, pad, selected, packed
 
@@ -2402,7 +2440,15 @@ def msa_sparse_attention_lse_head_calls(
         )
     else:
         step, num_chunks, pad, selected, (packed, tiles_per_step) = _chunk_work(
-            selected, num_q_heads, q.dtype, block_q, pages_per_step, True, packed=True
+            selected,
+            num_q_heads,
+            q.dtype,
+            block_q,
+            pages_per_step,
+            True,
+            packed=True,
+            num_keys=page_table.size,
+            interpret=interpret,
         )
     if num_chunks != 1:
         raise ValueError(f"one chunk per head, got {num_chunks} of {step} tokens")

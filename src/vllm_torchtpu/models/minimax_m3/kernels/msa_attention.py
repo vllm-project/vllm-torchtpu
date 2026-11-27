@@ -386,6 +386,11 @@ _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 _DENSE_WORK_LIST_ELEMS = 1 << 18
 
 
+def dense_unions(num_tiles: int, union_size: int) -> bool:
+    """Whether `_work_list` builds unions by `_dense_unions`."""
+    return num_tiles * union_size**2 <= _DENSE_WORK_LIST_ELEMS
+
+
 def _dense_unions(per_tile: jax.Array) -> jax.Array:
     """Each row's distinct pages, ascending, `_NO_PAGE` filled, from pairwise
     compares and one-hot selects only.
@@ -420,7 +425,189 @@ def _sorted_unions(per_tile: jax.Array) -> jax.Array:
     return sort(jnp.where(dup, _NO_PAGE, s))
 
 
-def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
+# Tiles a `kernel_unions` grid step sorts, one per lane.
+_UNION_TILES = 128
+# `kernel_unions` sorts page keys as f32: exact below this.
+MAX_UNION_KEYS = 1 << 24
+# Rows of a column block `_sort_columns` exchanges in registers.
+_SORT_ROWS = 128
+_SUBLANES = 8
+
+
+def _sort_columns(ref):
+    """Each column of ``ref [n, L]`` (``n`` a power of two, at least
+    `_SUBLANES`) sorted ascending in place by a bitonic network. Exchanges
+    between rows under `_SORT_ROWS` apart run on a block of that many rows
+    held as sublane tiles in registers (every such stage of a merge level in
+    one pass): between tiles a min and a max, within a tile two sublane
+    rotations, a min, a max and a select. Wider exchanges pair whole blocks.
+    Blocks sorting down run in a loop of their own, so every tile's direction
+    is static."""
+    n, lanes = ref.shape
+    rows = min(_SORT_ROWS, n)
+    blocks = n // rows
+    sub = jax.lax.broadcasted_iota(jnp.int32, (_SUBLANES, lanes), 0)
+
+    def exchange(tiles, k, j, up):
+        """Stage ``(k, j)`` on a block's tiles; `up`: the block's direction
+        when runs of `k` span blocks."""
+
+        def ascending(t):  # a sublane mask below a tile, else a bool
+            if k < _SUBLANES:
+                return (sub & k) == 0
+            return (t * _SUBLANES) & k == 0 if k < rows else up
+
+        if j >= _SUBLANES:
+            apart = j // _SUBLANES
+            for t in range(len(tiles)):
+                if not t & apart:
+                    x0, x1 = tiles[t], tiles[t + apart]
+                    pair = jnp.minimum(x0, x1), jnp.maximum(x0, x1)
+                    if not ascending(t):
+                        pair = pair[::-1]
+                    tiles[t], tiles[t + apart] = pair
+            return
+        lower = (sub & j) == 0
+        for t, x in enumerate(tiles):
+            above = pltpu.roll(x, _SUBLANES - j, 0)  # row i + j
+            below = pltpu.roll(x, j, 0)  # row i - j
+            up_t = ascending(t)
+            if isinstance(up_t, bool):
+                first, second = (
+                    (jnp.minimum, jnp.maximum) if up_t else (jnp.maximum, jnp.minimum)
+                )
+                tiles[t] = jnp.where(lower, first(x, above), second(x, below))
+            else:
+                partner = jnp.where(lower, above, below)
+                tiles[t] = jnp.where(
+                    lower == up_t, jnp.minimum(x, partner), jnp.maximum(x, partner)
+                )
+
+    def in_block(stages):
+        """`stages` on every block: the blocks whose runs of the widest
+        level ascend, then those that descend."""
+        k = max(kk for kk, _ in stages)
+
+        def run(up, block, count):
+            def body(p, carry):
+                at = pl.ds(pl.multiple_of(block(p) * rows, rows), rows)
+                x = ref[at, :]
+                tiles = [x[t : t + _SUBLANES] for t in range(0, rows, _SUBLANES)]
+                for kk, j in stages:
+                    exchange(tiles, kk, j, up)
+                ref[at, :] = jnp.concatenate(tiles, axis=0)
+                return carry
+
+            jax.lax.fori_loop(0, count, body, 0)
+
+        if k == n:
+            run(True, lambda p: p, blocks)
+            return
+        per = k // rows  # blocks per run of k
+        for up, first in ((True, 0), (False, per)):
+
+            def block(p, first=first):
+                return p // per * 2 * per + first + p % per
+
+            run(up, block, blocks // 2)
+
+    def across(k, j):  # blocks b and b + j / rows
+        apart = j // rows
+
+        def body(p, carry):
+            b = p // apart * 2 * apart + p % apart
+            lo = pl.ds(pl.multiple_of(b * rows, rows), rows)
+            hi = pl.ds(pl.multiple_of((b + apart) * rows, rows), rows)
+            x, y = ref[lo, :], ref[hi, :]
+            small, large = jnp.minimum(x, y), jnp.maximum(x, y)
+            ascending = (b * rows) & k == 0
+            ref[lo, :] = jnp.where(ascending, small, large)
+            ref[hi, :] = jnp.where(ascending, large, small)
+            return carry
+
+        jax.lax.fori_loop(0, blocks // 2, body, 0)
+
+    def stages(k, top):
+        j = top
+        while j:
+            yield k, j
+            j //= 2
+
+    in_block([s for k in _powers(2, rows) for s in stages(k, k // 2)])
+    for k in _powers(2 * rows, n):
+        j = k // 2
+        while j >= rows:
+            across(k, j)
+            j //= 2
+        in_block(list(stages(k, rows // 2)))
+
+
+def _powers(lo, hi):
+    """Powers of two from `lo` to `hi`, inclusive."""
+    while lo <= hi:
+        yield lo
+        lo *= 2
+
+
+def _unions_kernel(keys_ref, union_ref, sort_ref):
+    """`_work_list`'s unions (-1 past each) of `_UNION_TILES` rows of page
+    keys (-1 for none), a tile per column of ``sort_ref``."""
+    # As f32 (exact below `MAX_UNION_KEYS`; no page is +inf): a min and a
+    # max are one op each, an s32 one a compare and a select.
+    keys = keys_ref[...].T  # [union_size, tiles]
+    sort_ref[...] = jnp.where(keys < 0, jnp.inf, keys.astype(jnp.float32))
+    _sort_columns(sort_ref)
+    s = sort_ref[...]
+    row = jax.lax.broadcasted_iota(jnp.int32, s.shape, 0)
+    dup = (row > 0) & (s == pltpu.roll(s, 1, 0))
+    sort_ref[...] = jnp.where(dup, jnp.inf, s)
+    _sort_columns(sort_ref)
+    s = sort_ref[...]
+    union_ref[...] = jnp.where(s == jnp.inf, -1, s.astype(jnp.int32)).T
+
+
+def fits_kernel_unions(union_size: int, num_keys: int) -> bool:
+    """Whether `kernel_unions` takes unions of `union_size` keys below
+    `num_keys`."""
+    return (
+        union_size >= _SUBLANES
+        and union_size & (union_size - 1) == 0
+        and num_keys <= MAX_UNION_KEYS
+    )
+
+
+def kernel_unions(tile_keys: jax.Array, interpret: bool = False) -> jax.Array:
+    """`_work_list`'s unions of ``tile_keys [tiles, union_size]`` (page keys
+    below `MAX_UNION_KEYS`, -1 for none; `fits_kernel_unions`), ascending,
+    -1 past each, in a kernel that sorts `_UNION_TILES` tiles a grid step,
+    one per lane, so each compare-exchange is a few ops over whole vregs.
+    The four 2,048-token calls of a c48 mixed step (s32[4, 64, 512]): two
+    XLA row sorts 26.2 us, this kernel ~6 us (anvil)."""
+    num_tiles, union_size = tile_keys.shape
+    if not fits_kernel_unions(union_size, 0):
+        raise ValueError(f"union size {union_size} is not a power of two >= 8")
+    pad = -num_tiles % _UNION_TILES
+    keys = jnp.pad(tile_keys, ((0, pad), (0, 0)), constant_values=-1)
+    block = pl.BlockSpec((_UNION_TILES, union_size), lambda i: (i, 0))
+    return pl.pallas_call(
+        _unions_kernel,
+        grid=(keys.shape[0] // _UNION_TILES,),
+        in_specs=[block],
+        out_specs=block,
+        out_shape=jax.ShapeDtypeStruct(keys.shape, keys.dtype),
+        scratch_shapes=[pltpu.VMEM((union_size, _UNION_TILES), jnp.float32)],
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        interpret=interpret,
+        name="minimax_m3_msa_tile_unions",
+    )(keys)[:num_tiles]
+
+
+def _work_list(
+    selected: jax.Array,
+    block_q: int,
+    pages_per_step: int,
+    union: jax.Array | None = None,
+):
     """Each tile's sorted page union, cut into groups of `pages_per_step`.
 
     Returns the unions as ``[tiles * groups_per_tile * pages_per_step]``
@@ -430,20 +617,23 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
     the unions directly, so no [groups, pages_per_step] gather builds a
     per-group list (a SparseCore offload of ~65 us per 2,048-token call in
     the c4 prefill twin, j-3c651507).
+
+    `union`, when given, holds the tiles' unions as returned, ``[tiles,
+    union_size]`` (`kernel_unions`).
     """
     num_tokens, topk = selected.shape
     num_tiles = num_tokens // block_q
     union_size = block_q * topk
-    per_tile = jnp.where(selected < 0, _NO_PAGE, selected).reshape(
-        num_tiles, union_size
-    )
-    if num_tiles * union_size**2 <= _DENSE_WORK_LIST_ELEMS:
-        union = _dense_unions(per_tile)
-    else:
-        union = _sorted_unions(per_tile)
+    if union is None:
+        per_tile = jnp.where(selected < 0, _NO_PAGE, selected).reshape(
+            num_tiles, union_size
+        )
+        dense = dense_unions(num_tiles, union_size)
+        union = (_dense_unions if dense else _sorted_unions)(per_tile)
+        union = jnp.where(union == _NO_PAGE, -1, union)
     groups_per_tile = _groups_per_tile(block_q, topk, pages_per_step)
     # A tile with no page still gets one all-masked group so its output is set.
-    pages_in_tile = jnp.sum(union != _NO_PAGE, axis=1, dtype=jnp.int32)
+    pages_in_tile = jnp.sum(union >= 0, axis=1, dtype=jnp.int32)
     groups_in_tile = jnp.maximum(-(-pages_in_tile // pages_per_step), 1)
     ends = jnp.cumsum(groups_in_tile)
     starts = ends - groups_in_tile
@@ -466,7 +656,7 @@ def _work_list(selected: jax.Array, block_q: int, pages_per_step: int):
         | jnp.where(w + 1 == end, _LAST_BIT, 0)
     )
     union = jnp.pad(
-        jnp.where(union == _NO_PAGE, -1, union),
+        union,
         ((0, 0), (0, groups_per_tile * pages_per_step - union_size)),
         constant_values=-1,
     )
