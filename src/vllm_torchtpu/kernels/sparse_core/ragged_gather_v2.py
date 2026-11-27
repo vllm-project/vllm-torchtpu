@@ -49,8 +49,9 @@ def calculate_col_size(hidden_size: int, packing: int) -> int:
     return max_safe_col
 
 
-# Columns one inner-loop step unpacks.
-_UNPACK_COL_CHUNK = 128
+# Columns one inner-loop step unpacks: narrower steps than 128 ran the e4m3
+# row unpack 13% faster on tpu7x (other dtypes and chips not measured).
+_UNPACK_COL_CHUNK = 32
 
 
 def main_kernel_v2(
