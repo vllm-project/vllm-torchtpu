@@ -159,6 +159,7 @@ def validate_environment(policy: DeepseekV41Config) -> None:
             not in (
                 "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD",
                 "TPU_DEEPSEEK_V41_ENGRAM_HBM",
+                "TPU_DEEPSEEK_V41_VOCAB_PARALLEL_HEADS",
             )
         ):
             logger.warning_once(
