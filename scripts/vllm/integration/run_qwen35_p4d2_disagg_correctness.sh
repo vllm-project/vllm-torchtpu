@@ -308,10 +308,13 @@ else
       awk -v want="^$2_total" '$0 ~ want { sum += $2 } END { printf "%.0f", sum + 0 }'
   }
   # Summed over the decode ports: each multi-port rank reports its own engine.
+  # A failed /metrics fetch fails the function (set -e does not apply inside
+  # the caller's command substitution), and so the script.
   read_decode_counter() {
-    local port total=0
+    local port count total=0
     for port in "${decode_ports[@]}"; do
-      total=$((total + $(read_spec_counter "${port}" "$1")))
+      count="$(read_spec_counter "${port}" "$1")" || return $?
+      total=$((total + count))
     done
     echo "${total}"
   }
