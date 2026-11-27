@@ -117,6 +117,8 @@ def hp_prefill_kernel_kwargs() -> dict:
     )
     if widths:
         kw["step_widths"] = tuple(sorted(int(w) for w in widths.split("/")))
+    elif "w56" in msa_attention_lse.k1_levers():
+        kw["step_widths"] = msa_attention_lse.K1_HP_WIDTHS
     if int(slots or 0):
         kw["page_cache_slots"] = int(slots)
         kw["page_cache_bf16"] = msa_attention_lse.PREFILL_PAGE_CACHE_BF16

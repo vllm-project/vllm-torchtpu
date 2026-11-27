@@ -23,6 +23,7 @@ import functools
 import logging
 import math
 import os
+import re
 import types
 
 import jax
@@ -339,6 +340,38 @@ def configure_max_free(
     return MAX_FREE
 
 
+K1_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_K1"
+# K1 levers ("+"-separated; "1" = `_K1_DEFAULT`):
+#   split<N>: 4-bit max-free prefill groups wider than N pages run their
+#     softmax in ceil(W / N) equal page chunks, the chunks' p @ v and row
+#     sums added in order: shorter live ranges than one [rows, W * S] score
+#     slab (fewer spills). Same values; bitwise on TPU7x (bench k1 b1/b2).
+#   w56: head-parallel prefill calls whose TPU_MINIMAX_M3_DCP_HP_PREFILL_CONFIG
+#     gives no widths run 64-page groups at widths 4/8/16/24/32/40/48/56/64
+#     instead of 4/8/16/24/32/48/64 (`msa_dcp_heads.hp_prefill_kernel_kwargs`):
+#     fewer empty score columns for 33-56-page unions. Bitwise (b2).
+_K1_DEFAULT = "split32+w56"
+K1_HP_WIDTHS = (4, 8, 16, 24, 32, 40, 48, 56)
+
+
+def k1_levers(spec: str | None = None) -> frozenset:
+    """TPU_MINIMAX_M3_MSA_PREFILL_K1 (or `spec`; read when a program is
+    traced): empty when unset or "0", else ``{"k1", <levers>}``."""
+    if spec is None:
+        spec = os.environ.get(K1_ENV, "0")
+    spec = spec.strip()
+    if spec in ("", "0"):
+        return frozenset()
+    if spec == "1":
+        spec = _K1_DEFAULT
+    levers = {x.strip() for x in spec.split("+") if x.strip()}
+    for x in levers:
+        if x != "w56" and not re.fullmatch(r"split\d+", x):
+            raise ValueError(f"{K1_ENV}={spec!r}: unknown lever {x!r}")
+    _proof(K1_ENV, f"MSA prefill attention K1 levers {sorted(levers)}")
+    return frozenset({"k1"} | levers)
+
+
 def max_free_levers() -> frozenset:
     """``{"maxfree"[, "mxumask"]}`` per the configured state (empty when off),
     for a kernel's `precision`; read when the program is traced."""
@@ -636,6 +669,10 @@ def _kernel(
     # A first-page shift may sit above a row's max: l can be below 1.
     mshift_t = mdot_t or msub_t
     mxu_mask_on = max_free and "mxumask" in precision
+    # K1 levers (`k1_levers`) of 4-bit max-free calls.
+    k1_split = next(
+        (int(x[5:]) for x in precision if x.startswith("split")), 0
+    ) if (fp4 and max_free and not pv8 and "k1" in precision) else 0
     # The least softmax sum a tile divides by: a row that saw no slot has 0
     # (and a zero output). Against a true max a seen row's sum is >= 1;
     # against max-free's 0 it is only positive.
@@ -1195,6 +1232,51 @@ def _kernel(
             for part in range(row_split):
                 heads = slice(part * part_heads, (part + 1) * part_heads)
                 rows_at = pl.ds(part * part_rows, part_rows)
+                if k1_split and width > k1_split:
+                    q = q_ref[heads].reshape(part_rows, head_dim)
+                    if qk8:
+                        q = q.astype(jnp.float8_e4m3fn)
+                    pv = p_sum = None
+                    parts = -(-width // k1_split)
+                    chunk = -(-width // parts)
+                    for g0 in range(0, width, chunk):
+                        g1 = min(width, g0 + chunk)
+                        k_c = jnp.concatenate(keys[g0:g1], axis=0)
+                        v_c = jnp.concatenate(values[g0:g1], axis=0)
+                        cols = slice(g0 * page_size, g1 * page_size)
+                        s_c = jax.lax.dot_general(
+                            q, k_c, (((1,), (1,)), ((), ())),
+                            preferred_element_type=jnp.float32,
+                        )
+                        s_c = s_c * k_scale[:, cols]
+                        tm = jnp.concatenate([token_mask[:, cols]] * part_heads, axis=0)
+                        p_c = jnp.exp2(jnp.where(tm, s_c, -jnp.inf))
+                        for j in range(g1 - g0):
+                            piece = p_c[:, j * page_size : (j + 1) * page_size]
+                            p_sum = piece if p_sum is None else p_sum + piece
+                        pv_c = jax.lax.dot_general(
+                            (p_c * v_scale[:, cols]).astype(v_c.dtype),
+                            v_c,
+                            (((1,), (0,)), ((), ())),
+                            preferred_element_type=jnp.float32,
+                        )
+                        pv = pv_c if pv is None else pv + pv_c
+                    l_cur = jnp.sum(p_sum, axis=1, keepdims=True)
+                    if single:
+                        finish(0.0, l_cur, pv, part, row_split)
+                        continue
+                    l_new = l_ref[rows_at] + l_cur
+                    acc_new = acc_ref[rows_at] + pv
+                    pl.when(last)(
+                        functools.partial(finish, 0.0, l_new, acc_new, part, row_split)
+                    )
+
+                    def _carry_k1(rows_at=rows_at, l_new=l_new, acc_new=acc_new):
+                        l_ref[rows_at] = l_new
+                        acc_ref[rows_at] = acc_new
+
+                    pl.when(jnp.logical_not(last))(_carry_k1)
+                    continue
                 mask = jnp.concatenate([token_mask] * part_heads, axis=0)
                 q = q_ref[heads].reshape(part_rows, head_dim)
                 if not fp4:
@@ -1669,7 +1751,8 @@ def _attention_call(
             row_split=row_split,
             tiles_per_head=tiles_per_head,
             precision=(precision if fp4 else precision & frozenset(_FP8_LEVERS))
-            | max_free_levers(),
+            | max_free_levers()
+            | (k1_levers() if fp4 else frozenset()),
             pair=pair,
             **({"fp4_rows": scale_rows} if fp4 else {}),
         ),
