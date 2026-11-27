@@ -19,7 +19,6 @@ must schedule exactly as main's scheduler does, under each setting of main's
 lone-prompt and equal-cost chunking; each option turns on one lever.
 """
 
-import inspect
 import itertools
 import json
 import math
@@ -37,6 +36,7 @@ from vllm_torchtpu import additional_config_sections, config_section
 from vllm_torchtpu.core import (
     pp_chunk_scheduler,
     pp_scheduler_options,
+    prefix_change_log,
     scheduler_options,
 )
 from vllm_torchtpu.core.pp_chunk_scheduler import (
@@ -44,10 +44,7 @@ from vllm_torchtpu.core.pp_chunk_scheduler import (
     TpuPipelineChunkScheduler,
 )
 from vllm_torchtpu.core.pp_chunks import StepCostModel, step_limit
-from vllm_torchtpu.core.prefix_aware_scheduler import (
-    PrefixAwareAdmission,
-    PrefixAwareScheduler,
-)
+from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 from vllm_torchtpu.models import qwen3_5
 from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
@@ -782,44 +779,103 @@ def test_the_prefill_legs_are_kv_producers_not_consumers():
         assert not s._is_kv_consumer and s._is_kv_producer, name
 
 
-# -- the prefix-aware admission's promotion, free-block count and estimate -----
+# -- the prefix-aware admission's promotion and free-block count -------------
 
 
-_SHARED_ADMISSION = (
-    "_enable_memo_xstep",
-    "_memo_trim_log",
-    "_memo_still_exact",
-    "_memo_get",
-    "_memo_compute",
-    "_get_block_size",
-    "_get_prefix_cache_epoch",
-    "_prefix_warmth",
-    "_select_waiting_queue_for_scheduling",
-    "_promote_warmest",
-    "_maybe_pack_prompt_ids",
-)
+def _admission(cls, warmth, lookups, holding=()):
+    """A ``cls`` scheduler built without __init__; the pipeline scheduler as
+    ``_sched`` builds it (no option: no aging, the token-count cost) on a KV
+    consumer, where it ranks a window by uncached tokens as
+    PrefixAwareScheduler does. Its waiting queue holds r0 to r3 (r0 oldest)
+    and its kv_holding_waiting ``holding``, each of 1,000 tokens; each
+    prefix-cache lookup returns ``warmth[request_id]`` and appends the id to
+    ``lookups``. Its block pool is at prefix-cache epoch 1."""
+    if cls is TpuPipelineChunkScheduler:
+        s = _sched(_is_kv_consumer=True)
+    else:
+        s = cls.__new__(cls)
+
+    def request(request_id, arrival_time):
+        return SimpleNamespace(
+            request_id=request_id,
+            num_tokens=1_000,
+            num_computed_tokens=0,
+            num_preemptions=0,
+            arrival_time=arrival_time,
+            skip_reading_prefix_cache=False,
+            block_hashes=[request_id],
+        )
+
+    s.waiting = FCFSRequestQueue()
+    for i in range(4):
+        s.waiting.add_request(request(f"r{i}", float(i)))
+    s.kv_holding_waiting = FCFSRequestQueue()
+    for i, request_id in enumerate(holding):
+        s.kv_holding_waiting.add_request(request(request_id, float(i)))
+    s.running = []
+    s.policy = SchedulingPolicy.FCFS
+    s._paw_n = s._paw_cold_tokens = s._paw_prompt_tokens = 0
+    s._paw_scoring_broken = False
+    s._memo_xstep = False
+
+    def find_longest_cache_hit(block_hashes, max_len):
+        lookups.append(block_hashes[0])
+        return ((), warmth[block_hashes[0]], 0)
+
+    s.kv_cache_manager = SimpleNamespace(
+        enable_caching=True,
+        coordinator=SimpleNamespace(find_longest_cache_hit=find_longest_cache_hit),
+        block_pool=SimpleNamespace(**{prefix_change_log.EPOCH: 1}),
+    )
+    return s
 
 
-def test_both_schedulers_inherit_one_prefix_aware_admission():
-    """The memo, warmth, promotion and packing code exists once, in
-    PrefixAwareAdmission, which both schedulers inherit (no copies, no
-    attributes taken from PrefixAwareScheduler); each ranks its own window,
-    and PrefixAwareScheduler keeps nothing only the pipeline scheduler
-    reads."""
-    for cls in (TpuPipelineChunkScheduler, PrefixAwareScheduler):
-        assert issubclass(cls, PrefixAwareAdmission)
-        for name in _SHARED_ADMISSION:
-            assert name not in vars(cls), (cls.__name__, name)
-            assert getattr(cls, name) is vars(PrefixAwareAdmission)[name]
-        assert "_rank_window" in vars(cls)
-    for name in ("_now", "_free_blocks_for_fit"):
-        assert not hasattr(PrefixAwareScheduler, name)
-    assert list(
-        inspect.signature(PrefixAwareScheduler._rank_and_warmth).parameters
-    ) == [
-        "self",
-        "request",
+def _three_promotions(cls):
+    """Promotes the waiting queues of a ``cls`` scheduler (``_admission``)
+    on three steps; before the third, r1's cached prefix grows and the
+    prefix-cache epoch moves. Returns, per step, the waiting and
+    kv_holding_waiting orders, the requests looked up in the prefix cache
+    and the promotion counters."""
+    warmth = {"r0": 0, "r1": 600, "r2": 900, "r3": 0, "h0": 0, "h1": 500}
+    lookups: list[str] = []
+    s = _admission(cls, warmth, lookups, holding=("h0", "h1"))
+    pool = s.kv_cache_manager.block_pool
+    steps = []
+    with patch.object(prefix_change_log, "epoch_installed", return_value=True):
+        for grows in (False, False, True):
+            if grows:
+                warmth["r1"] = 990
+                setattr(pool, prefix_change_log.EPOCH, 2)
+            lookups.clear()
+            assert s._select_waiting_queue_for_scheduling() is s.kv_holding_waiting
+            steps.append(
+                (
+                    [r.request_id for r in s.waiting],
+                    [r.request_id for r in s.kv_holding_waiting],
+                    sorted(lookups),
+                    (s._paw_n, s._paw_cold_tokens, s._paw_prompt_tokens),
+                )
+            )
+    return steps
+
+
+def test_both_schedulers_promote_and_memoise_alike():
+    """PrefixAwareScheduler and the pipeline chunk scheduler, run on the same
+    queues and prefix cache, promote the same requests, answer the same
+    lookups from the memo and keep the same promotion counters on every
+    step."""
+    every = ["h0", "h1", "r0", "r1", "r2", "r3"]
+    expected = [
+        # Each request looked up once; each queue's warmest request first.
+        (["r2", "r0", "r1", "r3"], ["h1", "h0"], every, (2, 600, 2_000)),
+        # The same epoch: the memo answers every lookup; the heads stay.
+        (["r2", "r0", "r1", "r3"], ["h1", "h0"], [], (4, 1_200, 4_000)),
+        # The epoch moved: every request looked up again; r1 (10 uncached
+        # tokens) goes first.
+        (["r1", "r2", "r0", "r3"], ["h1", "h0"], every, (6, 1_710, 6_000)),
     ]
+    assert _three_promotions(PrefixAwareScheduler) == expected
+    assert _three_promotions(TpuPipelineChunkScheduler) == expected
 
 
 def _promote(head, other, warmth, free_blocks, step_time, aging=3_000.0, blocks=None):
