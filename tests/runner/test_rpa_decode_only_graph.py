@@ -257,6 +257,7 @@ def test_pallas_rpa_kernel_batched_forwards_decode_only(
         assert rpa_func is attn_module.ragged_paged_attention_batched
 
 
+@pytest.mark.usefixtures("vllm_config_context")
 def test_initialize_kernel_prebuilds_decode_only_op_and_forward_reuses_it(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -293,6 +294,7 @@ def test_initialize_kernel_prebuilds_decode_only_op_and_forward_reuses_it(
     assert len(mixed_calls) == 1
 
 
+@pytest.mark.usefixtures("vllm_config_context")
 def test_set_subpage_split_clears_stale_decode_only_op(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -317,6 +319,7 @@ def test_set_subpage_split_clears_stale_decode_only_op(
         assert built[-1][1].keywords["decode_only"] is True
 
 
+@pytest.mark.usefixtures("vllm_config_context")
 @pytest.mark.parametrize(
     ("flag", "cls", "head_size"),
     [
@@ -342,6 +345,7 @@ def test_ineligible_layers_do_not_build_decode_only_op(
     assert "decode_only" not in built[0][1].keywords
 
 
+@pytest.mark.usefixtures("vllm_config_context")
 def test_pcp_and_dcp_do_not_build_decode_only_op(monkeypatch: pytest.MonkeyPatch):
     """PCP streaming and DCP return early before building a decode-only op."""
     monkeypatch.setenv("TPU_RPA_DECODE_ONLY_GRAPH", "1")
@@ -401,6 +405,7 @@ def test_pcp_and_dcp_do_not_build_decode_only_op(monkeypatch: pytest.MonkeyPatch
     assert dcp_impl.has_rpa_decode_only_kernel() is False
 
 
+@pytest.mark.usefixtures("vllm_config_context")
 def test_default_impl_build_rpa_kernel_rejects_decode_only(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -717,7 +722,9 @@ def test_execute_model_rpa_decode_only_gate(
         pcp_size=1,
     )
     runner._has_rpa_decode_only_graph = True
-    runner._adaptive_verification = object() if adaptive_verif else None
+    runner._adaptive_verification = (
+        SimpleNamespace(trim=lambda so: so) if adaptive_verif else None
+    )
     if hybrid:
         runner.mamba_slot_read_offsets = torch.zeros(8, dtype=torch.int32)
         runner._combined_request_distribution_cpu = torch.zeros(6, dtype=torch.int32)
