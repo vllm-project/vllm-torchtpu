@@ -272,7 +272,7 @@ def test_new_prompts_travel_as_int32_arrays_and_engine_copy_keeps_lists():
     prompt = [0, 7, 200063, 2**31 - 1]
     original = _scheduler_output(_new_req("a", prompt))
 
-    sent = _compacting_executor()._compact_new_prompts(original)
+    sent = _compacting_executor()._worker_copy(original)
 
     ids = sent.scheduled_new_reqs[0].prompt_token_ids
     assert isinstance(ids, np.ndarray) and ids.dtype == np.int32
@@ -286,7 +286,7 @@ def test_new_prompts_travel_as_int32_arrays_and_engine_copy_keeps_lists():
 )
 def test_requests_whose_ids_are_read_as_lists_keep_their_list(sampling):
     prompt = [1, 2, 3]
-    out = _compacting_executor()._compact_new_prompts(
+    out = _compacting_executor()._worker_copy(
         _scheduler_output(_new_req("a", prompt, **sampling), _new_req("b", [4, 5]))
     )
     assert out.scheduled_new_reqs[0].prompt_token_ids is prompt
@@ -303,7 +303,7 @@ def test_requests_whose_ids_are_read_as_lists_keep_their_list(sampling):
 )
 def test_configs_that_read_prompt_ids_on_the_worker_send_lists(config):
     original = _scheduler_output(_new_req("a", [1, 2, 3]))
-    assert _compacting_executor(**config)._compact_new_prompts(original) is original
+    assert _compacting_executor(**config)._worker_copy(original) is original
 
 
 def test_array_prompt_fills_the_input_batch_row_like_the_list():
@@ -319,7 +319,7 @@ def test_array_prompt_fills_the_input_batch_row_like_the_list():
     for compact in (False, True):
         so = _scheduler_output(_new_req("a", prompt))
         if compact:
-            so = _compacting_executor()._compact_new_prompts(so)
+            so = _compacting_executor()._worker_copy(so)
         req = pickle.loads(pickle.dumps(so, protocol=5)).scheduled_new_reqs[0]
         batch = InputBatch(
             max_num_reqs=2,
@@ -344,3 +344,39 @@ def test_array_prompt_fills_the_input_batch_row_like_the_list():
         assert state.num_prompt_tokens == len(prompt)
         rows.append(batch.token_ids_cpu[index, : len(prompt)].tolist())
     assert rows[0] == rows[1] == prompt
+
+
+def test_cached_all_token_ids_are_cut_to_the_output_tail_the_worker_reads():
+    """GPUModelRunner._update_states reads `all_token_ids[req_id][-n:]` with
+    n = num_output_tokens, and only when n > 0; the tail gives the same slice."""
+    from vllm.v1.core.sched.output import CachedRequestData
+
+    prompt_then_out = list(range(1000)) + [7, 8, 9]
+    held_prefill = list(range(5000))
+    short = [1, 2]  # async placeholders count toward n, which can exceed the list
+    full = {"dec": prompt_then_out, "pre": held_prefill, "short": short}
+    num_output = {"dec": 3, "pre": 0, "short": 4}
+    cached = CachedRequestData(
+        req_ids=list(full),
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids=dict(full),
+        new_block_ids=[None] * 3,
+        num_computed_tokens=[1002, 4096, 2],
+        num_output_tokens=list(num_output.values()),
+    )
+    original = _scheduler_output()
+    original.scheduled_cached_reqs = cached
+
+    sent = _compacting_executor()._worker_copy(original).scheduled_cached_reqs
+
+    assert sent.all_token_ids == {"dec": [7, 8, 9], "pre": [], "short": [1, 2]}
+    for req_id, n in num_output.items():
+        if n > 0:
+            assert sent.all_token_ids[req_id][-n:] == full[req_id][-n:]
+    assert original.scheduled_cached_reqs.all_token_ids["pre"] is held_prefill
+
+
+def test_output_without_token_lists_is_sent_as_is():
+    original = _scheduler_output()
+    assert _compacting_executor()._worker_copy(original) is original

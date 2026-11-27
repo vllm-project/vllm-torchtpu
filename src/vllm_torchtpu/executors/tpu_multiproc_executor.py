@@ -17,15 +17,19 @@ Splits H2D Pallas kernel prewarm into one collective_rpc call per power-of-2
 shape so each shape gets its own 60-second shm_broadcast window (~4s per shape)
 instead of all 14 shapes sharing a single window and timing out.
 
-It also broadcasts a new request's prompt token ids as an int32 array (see
-`_compact_new_prompts`).
+It also broadcasts the workers a copy of each SchedulerOutput without the
+O(context) token-id lists they do not need as lists (see `_worker_copy`).
 """
 
 import dataclasses
 from array import array
 
 import numpy as np
-from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
+from vllm.v1.core.sched.output import (
+    CachedRequestData,
+    NewRequestData,
+    SchedulerOutput,
+)
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
@@ -49,38 +53,33 @@ class TpuMultiprocExecutor(MultiprocExecutor):
 
     def execute_model(self, scheduler_output: SchedulerOutput, *args, **kwargs):
         return super().execute_model(
-            self._compact_new_prompts(scheduler_output), *args, **kwargs
+            self._worker_copy(scheduler_output), *args, **kwargs
         )
 
-    def _compact_new_prompts(
-        self, scheduler_output: SchedulerOutput
-    ) -> SchedulerOutput:
-        """Copy of `scheduler_output` whose new requests carry their prompt
-        token ids as int32 numpy arrays instead of lists.
+    def _worker_copy(self, scheduler_output: SchedulerOutput) -> SchedulerOutput:
+        """Copy of `scheduler_output` without the O(context) token-id lists the
+        workers do not need as lists.
 
-        A list of N ids costs O(N) Python work three times on the path from
-        scheduling a request to the forward that prefills it: pickling it into
-        the broadcast here, unpickling one int object per id in every worker,
-        and converting it element by element into the worker's input-batch
-        row. An array is copied as raw bytes at each of those steps. Every id
-        of the prompt travels, including the prefix-cache hit, so an agentic
-        prompt of 10^5 tokens pays this in full on every turn.
-
-        The engine core keeps its own `scheduler_output`, so scheduler-side
-        consumers (KV connectors, `update_from_output`) still see lists. On the
-        workers the arrays reach `InputBatch.add_request` and the cached
-        request state. Configs and requests whose ids are read as lists
-        elsewhere on the worker keep their lists; the readers checked against
-        vLLM 0.32 are M-RoPE position init, prompt logprobs, pooling, logits
-        processors (`BatchUpdate.added`) and the thinking-budget state.
+        Token-id lists cost O(N) Python work on the path from scheduling to the
+        forward: pickling into the broadcast here, unpickling one int object
+        per id in every worker, and for prompts converting element by element
+        into the worker's input-batch row. The engine core keeps its own
+        `scheduler_output`, so scheduler-side consumers (KV connectors,
+        `update_from_output`) still see the full lists.
         """
-        if not scheduler_output.scheduled_new_reqs or not self._can_compact_prompts():
+        new_reqs = scheduler_output.scheduled_new_reqs
+        if new_reqs and self._can_compact_prompts():
+            new_reqs = [_with_array_prompt(req) for req in new_reqs]
+        cached = scheduler_output.scheduled_cached_reqs
+        if cached.all_token_ids:
+            cached = _with_output_tails(cached)
+        if (
+            new_reqs is scheduler_output.scheduled_new_reqs
+            and cached is scheduler_output.scheduled_cached_reqs
+        ):
             return scheduler_output
         return dataclasses.replace(
-            scheduler_output,
-            scheduled_new_reqs=[
-                _with_array_prompt(req) for req in scheduler_output.scheduled_new_reqs
-            ],
+            scheduler_output, scheduled_new_reqs=new_reqs, scheduled_cached_reqs=cached
         )
 
     def _can_compact_prompts(self) -> bool:
@@ -121,6 +120,12 @@ class TpuMultiprocExecutor(MultiprocExecutor):
 
 
 def _with_array_prompt(req: NewRequestData) -> NewRequestData:
+    """A new request's prompt ids as an int32 array, which the worker copies as
+    raw bytes into its input batch. Requests whose ids are read as lists
+    elsewhere on the worker keep their lists; the readers checked against vLLM
+    0.32 are M-RoPE position init, prompt logprobs, pooling, logits processors
+    (`BatchUpdate.added`) and the thinking-budget state.
+    """
     ids = req.prompt_token_ids
     params = req.sampling_params
     if (
@@ -141,3 +146,21 @@ def _with_array_prompt(req: NewRequestData) -> NewRequestData:
     return dataclasses.replace(
         req, prompt_token_ids=np.frombuffer(array("i", ids), dtype=np.int32)
     )
+
+
+def _with_output_tails(cached: CachedRequestData) -> CachedRequestData:
+    """`all_token_ids` cut to what the worker reads of it.
+
+    The scheduler sends every token of a running request that was not scheduled
+    in the previous step, such as a long prefill held back for decode steps.
+    The worker only re-reads the last `num_output_tokens` of them, to restore
+    the request's outputs when it re-adds it to the batch
+    (`GPUModelRunner._update_states`, the only worker-side reader in vLLM
+    0.32); its prompt is already cached there.
+    """
+    num_output = dict(zip(cached.req_ids, cached.num_output_tokens))
+    tails = {
+        req_id: ids[-n:] if (n := num_output.get(req_id, 0)) > 0 else []
+        for req_id, ids in cached.all_token_ids.items()
+    }
+    return dataclasses.replace(cached, all_token_ids=tails)
