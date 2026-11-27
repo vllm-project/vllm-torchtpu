@@ -2446,28 +2446,20 @@ def combine_prefetch_bytes(t_local: int, topk: int) -> int:
     )
 
 
-def combine_smem_budget(info=None) -> int:
-    """SMEM the combine kernel's scalar-prefetched tables may take: the chip's
-    SMEM less host.SMEM_HEADROOM_BYTES."""
-    if info is None:
-        info = pltpu.get_tpu_info()
-    return info.smem_capacity_bytes - host.SMEM_HEADROOM_BYTES
-
-
 def combine_tables_fit(t_local: int, topk: int, info=None) -> bool:
     """Whether the combine kernel's scalar-prefetched tables fit SMEM.
 
-    Where the tables exceed `combine_smem_budget`, the layer keeps the fused
+    Where the tables exceed `host.smem_budget`, the layer keeps the fused
     XLA gather epilogue instead of failing Mosaic SMEM allocation.
     """
-    return combine_prefetch_bytes(t_local, topk) <= combine_smem_budget(info)
+    return combine_prefetch_bytes(t_local, topk) <= host.smem_budget(info)
 
 
 def combine_uses_kernel(t_local: int, topk: int, info=None) -> bool:
     """Whether combine dispatches to the Pallas kernel instead of XLA.
 
     Requires both an aligned token step (`combine_step_tokens(t_local) > 0`)
-    and scalar-prefetch tables within `combine_smem_budget`. Checks the token
+    and scalar-prefetch tables within `host.smem_budget`. Checks the token
     count first so below-threshold shapes never query the device.
     """
     return bool(combine_step_tokens(t_local)) and combine_tables_fit(
@@ -2524,7 +2516,7 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
     info = pltpu.get_tpu_info()
     if not combine_tables_fit(t_local, topk, info=info):
         need = combine_prefetch_bytes(t_local, topk)
-        budget = combine_smem_budget(info)
+        budget = host.smem_budget(info)
         raise ValueError(
             f"combine kernel scalar prefetch for t_local={t_local}, "
             f"topk={topk} needs {need} bytes, exceeding the {budget}-byte "

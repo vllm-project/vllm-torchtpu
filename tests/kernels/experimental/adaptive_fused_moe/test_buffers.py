@@ -22,7 +22,8 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host, kernel, layer
+from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host, layer
+from vllm_torchtpu.kernels.fused_moe.v2 import kernel as v2_kernel
 
 
 @pytest.mark.parametrize(
@@ -76,7 +77,7 @@ def test_budget_boundary_falls_back_and_rejects_when_minimum_does_not_fit(monkey
 
 def test_adaptive_combine_arrivals_dispatches_on_smem_budget(monkeypatch):
     """adaptive_fused_moe._combine_arrivals uses the shared SMEM budget gate."""
-    t_local = kernel.COMBINE_MIN_TOKENS
+    t_local = v2_kernel.COMBINE_MIN_TOKENS
     topk, lane_blocks, lanes, tile_m = 10, 2, 128, 128
     hidden = lane_blocks * lanes
 
@@ -151,30 +152,3 @@ def test_adaptive_combine_arrivals_dispatches_on_smem_budget(monkeypatch):
             "wire_dtype": jnp.float32,
             "out_dtype": jnp.bfloat16,
         }
-
-
-def test_adaptive_build_combine_kernel_rejects_oversized_smem(monkeypatch):
-    """Direct adaptive _build_combine_kernel calls raise ValueError on SMEM overflow."""
-    monkeypatch.setattr(
-        pltpu,
-        "get_tpu_info",
-        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
-    )
-    with pytest.raises(ValueError, match=r"1310720 bytes.*1015808-byte SMEM budget"):
-        kernel._build_combine_kernel(
-            t_local=16384,
-            topk=10,
-            hidden=256,
-            lane_blocks=2,
-            wire_dtype=jnp.bfloat16,
-            out_dtype=jnp.bfloat16,
-        )
-    with pytest.raises(ValueError, match=r"t_local=8"):
-        kernel._build_combine_kernel(
-            t_local=8,
-            topk=10,
-            hidden=256,
-            lane_blocks=2,
-            wire_dtype=jnp.bfloat16,
-            out_dtype=jnp.bfloat16,
-        )

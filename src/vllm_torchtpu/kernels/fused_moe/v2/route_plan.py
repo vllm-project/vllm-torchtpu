@@ -48,10 +48,10 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     HIDDEN_LANE_BLOCK,
     ROWBLK,
     ROWBLK_SHIFT,
-    SMEM_HEADROOM_BYTES,
     act_scale_slab_rows,
     align_up,
     pow2_shift,
+    smem_budget,
     token_gather_window_rows,
 )
 
@@ -68,8 +68,9 @@ F32_EXACT_MAX = 1 << 24
 WORD_BITS = 32
 # The kernel's SMEM scratch (the gathered pairs and the two slab tables) grows
 # with ep * t_local * topk; a shape over the chip's SMEM fails to compile, so
-# route_plan_supported refuses it and the layer keeps XLA. SMEM_HEADROOM_BYTES
-# covers what route_plan_smem_bytes leaves out (the rank prefetch among it).
+# route_plan_supported refuses it and the layer keeps XLA. host.smem_budget's
+# headroom covers what route_plan_smem_bytes leaves out (the rank prefetch
+# among it).
 
 # DMA semaphore slots.
 _SEM_SEND, _SEM_RECV, _SEM_OWN, _SEM_ZERO, _SEM_PAIRS, _SEM_STAGE, _SEM_OUT = range(7)
@@ -125,11 +126,6 @@ def route_plan_supported(
     given, which is read only once every other condition holds.
     """
     T = ep * t_local
-
-    def smem_budget():
-        chip = info if info is not None else pltpu.get_tpu_info()
-        return chip.smem_capacity_bytes - SMEM_HEADROOM_BYTES
-
     return bool(
         1 < ep <= LANES
         and e_total % ep == 0
@@ -153,7 +149,7 @@ def route_plan_supported(
             topk=topk,
             shard_stride=shard_stride,
         )
-        <= smem_budget()
+        <= smem_budget(info)
     )
 
 

@@ -1522,6 +1522,14 @@ def vmem_limit(info=None):
     return int(info.vmem_capacity_bytes * VMEM_FRACTION)
 
 
+def smem_budget(info=None):
+    """SMEM a kernel may size its own arrays to: this generation's capacity
+    less SMEM_HEADROOM_BYTES. Takes the device record like vmem_limit."""
+    if info is None:
+        info = pltpu.get_tpu_info()
+    return info.smem_capacity_bytes - SMEM_HEADROOM_BYTES
+
+
 # The oldest chip generation this kernel has been built and measured on.
 # Everything below reads its geometry off the device record, so an earlier
 # generation produces a kernel that compiles and runs and has never been

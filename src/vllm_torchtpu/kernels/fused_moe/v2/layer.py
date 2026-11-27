@@ -57,6 +57,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     slab_run_copy_runs,
     slab_scatter,
     slab_tables_on_tensorcore,
+    smem_budget,
     token_gather_sort_fits,
     token_gather_window_rows,
     weight_form,
@@ -70,7 +71,6 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     build_fused_ep_moe_kernel,
     build_slab_run_copy,
     combine_prefetch_bytes,
-    combine_smem_budget,
     combine_step_tokens,
     combine_uses_kernel,
     rowquant_fp8,
@@ -180,7 +180,7 @@ def _combine_arrivals(
             combine_prefetch_bytes(t_local, topk),
             t_local,
             topk,
-            combine_smem_budget(),
+            smem_budget(),
         )
     rows_fp8 = arrivals[pos.T.reshape(-1)]  # f8 [K*t, lane blocks, 128]
     coef_k = coef.T.reshape(-1)  # k-major [K*t_local]
