@@ -30,6 +30,9 @@ ROWS = 16
 # slower.
 MXU_COLUMNS = 256
 ROW_TILE = 8
+# A value group's output stores start as its unit ends; with three slot sets
+# the next group's loads wait on stores a whole unit old.
+VALUE_SETS = 3
 
 
 def _rows(index, size, real, run):
@@ -159,11 +162,11 @@ def _kernel(
 
         _rows(n % tiles, token_tile, real, run)
 
-    # Value groups g = j * tiles + t own heads slots each, two groups in
-    # turn: a group's hidden tiles load while the unit before it is
+    # Value groups g = j * tiles + t own heads slots each, VALUE_SETS groups
+    # in turn: a group's hidden tiles load while the unit before it is
     # consumed, and the output overwrites them in place.
     def v_slot(g, s):
-        return (g % 2) * heads + s
+        return (g % VALUE_SETS) * heads + s
 
     def v_copy(g, s, op, load):
         def run(size):
@@ -238,9 +241,9 @@ def _kernel(
             g = n + 1 - key_units
             for s in range(heads):
 
-                @pl.when(g >= 2)
+                @pl.when(g >= VALUE_SETS)
                 def _(*, s=s):
-                    v_store(g - 2, s, "wait")
+                    v_store(g - VALUE_SETS, s, "wait")
 
                 v_load(g, s, "start")
 
@@ -308,7 +311,7 @@ def _kernel(
     value_vpu(units - 1, range(0, token_tile, ROWS))
     store(units - 1)
     groups = per_head * tiles
-    for g in range(max(0, groups - 2), groups):
+    for g in range(max(0, groups - VALUE_SETS), groups):
         for s in range(heads):
             v_store(g, s, "wait")
 
@@ -572,7 +575,7 @@ def engram_gate(
             pltpu.VMEM((padded, k_dim), FP8),
             pltpu.VMEM((padded, 1), jnp.float32),
             pltpu.VMEM((2, k_dim, window), w.dtype),
-            pltpu.VMEM((heads + max(heads, 2), token_tile, window), hidden.dtype),
+            pltpu.VMEM((VALUE_SETS * heads, token_tile, window), hidden.dtype),
             pltpu.VMEM((2, token_tile, window), jnp.bfloat16),
             pltpu.VMEM((padded, LANES), jnp.float32),
             pltpu.VMEM((padded, LANES), jnp.float32),
@@ -580,8 +583,8 @@ def engram_gate(
             pltpu.VMEM((heads, padded, 1), jnp.float32),
             stage_sem,
             pltpu.SemaphoreType.DMA((2,)),
-            pltpu.SemaphoreType.DMA((heads + max(heads, 2),)),
-            pltpu.SemaphoreType.DMA((2 * heads,)),
+            pltpu.SemaphoreType.DMA((VALUE_SETS * heads,)),
+            pltpu.SemaphoreType.DMA((VALUE_SETS * heads,)),
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=62 * 2**20),
         interpret=pltpu.InterpretParams() if interpret else False,
