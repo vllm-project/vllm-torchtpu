@@ -65,6 +65,7 @@ from .constants import (
 
 _TORUS_AXES_LEN: int = 3
 _TPU_7X_VERSION: pltpu.ChipVersion = pltpu.ChipVersion.TPU_7X
+_TPU_V6E_VERSION: pltpu.ChipVersion = pltpu.ChipVersion.TPU_V6E
 JAX_VERSION: str = jax.__version__
 
 
@@ -908,6 +909,22 @@ CHIPS: dict[str, ChipSpec] = {
         _TPU_7X_VERSION,
         ChipOverrides(),
     ),
+    "tpu6e": from_jax(
+        "tpu6e",
+        _TPU_V6E_VERSION,
+        ChipOverrides(
+            cores_per_chip=1,
+            # Cloud TPU v6e is a 2D torus with 4 physical ICI links per chip
+            # (+/-X, +/-Y): https://cloud.google.com/tpu/docs/v6e.
+            ici_links_per_chip=4,
+            ici_link_bw=100.0e9,
+            # Single TensorCore per chip: no intra-chip die-to-die (D2D) bridge.
+            d2d_bw=0.0,
+            # 4 links x 100 GB/s per link = 400 GB/s egress per chip/core.
+            ici_bw=400.0e9,
+            ici_hop_latency_s=1.0e-6,
+        ),
+    ),
 }
 
 # Live read-only set view over CHIPS so register_chip stays synchronized globally.
@@ -917,8 +934,24 @@ TOPOLOGIES: dict[str, SliceTopology] = {
     name: SliceTopology(name, axes) for name, axes in TOPOLOGY_AXES.items()
 }
 
+TPU6E_TOPOLOGIES: dict[str, SliceTopology] = {
+    # Cloud TPU v6e (Trillium) 2D torus slice shapes up to a 16x16 full pod
+    # (https://cloud.google.com/tpu/docs/v6e#slice-shapes). Slices up to 8x8
+    # are open meshes (no wraparound). Torus wraparound applies exclusively
+    # along axes of extent 16: axis 1 (Y) for 8x16, and axes 0 and 1 (X & Y) for 16x16.
+    "1x1": SliceTopology("1x1", (1, 1, 1), 1, (False, False, False)),
+    "2x2": SliceTopology("2x2", (2, 2, 1), 1, (False, False, False)),
+    "2x4": SliceTopology("2x4", (2, 4, 1), 1, (False, False, False)),
+    "4x4": SliceTopology("4x4", (4, 4, 1), 1, (False, False, False)),
+    "4x8": SliceTopology("4x8", (4, 8, 1), 1, (False, False, False)),
+    "8x8": SliceTopology("8x8", (8, 8, 1), 1, (False, False, False)),
+    "8x16": SliceTopology("8x16", (8, 16, 1), 1, (False, True, False)),
+    "16x16": SliceTopology("16x16", (16, 16, 1), 1, (True, True, False)),
+}
+
 CHIP_TOPOLOGIES: dict[str, dict[str, SliceTopology]] = {
     "tpu7x": TOPOLOGIES,
+    "tpu6e": TPU6E_TOPOLOGIES,
 }
 
 
