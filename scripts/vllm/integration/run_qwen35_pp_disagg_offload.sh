@@ -20,7 +20,15 @@
 # proxy in front. Speculative decoding and async scheduling are off: pipeline
 # parallelism refuses both.
 #
+# The prefill engine runs the opt-in Raiden connector options a prefill leg
+# uses (docs/user_guide/disaggregated_serving.md): async_complete and
+# async_register on the transfer child, host_tier_recency and max_async_loads
+# on the offloading child. producer_divergent_hits is not set: it needs
+# TPU_RAIDEN_PREFIX_AWARE_LOAD and the pipeline chunk scheduler's
+# prefix-aware admission, which this job does not run.
+#
 # Gates, all functional:
+#   * the prefill engine's --kv-transfer-config carries those options;
 #   * every engine log carries the Raiden store line, and the prefill engine
 #     admits the pp4 producer topology;
 #   * disagg: the known-answer prefix-cache smokes through the proxy, so a
@@ -72,6 +80,8 @@ export MAMBA_CACHE_MODE="${MAMBA_CACHE_MODE:-align}"
 export VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-0}"
 export TPU_PREMAPPED_BUFFER_SIZE="${TPU_PREMAPPED_BUFFER_SIZE:-8589934592}"
 export NUM_GPU_BLOCKS_OVERRIDE="${NUM_GPU_BLOCKS_OVERRIDE-}"
+export PREFILL_TRANSFER_OPTIONS='"async_complete":true,"async_register":true'
+export PREFILL_OFFLOAD_OPTIONS='"host_tier_recency":true,"max_async_loads":16'
 export GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.85}"
 export MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 export MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
@@ -109,6 +119,23 @@ cd "${repo_root}" || exit 1
 
 bash examples/disagg/launch_qwen35_p4d2_v2_baseline.sh 2>&1 | tee "${RUN_DIR}/logs/launch.log"
 [[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "the P/D pair did not come up (see ${RUN_DIR}/logs)"
+
+python3 - "${RUN_DIR}/prefill_vllm_args.quoted" <<'PY' \
+  || fail "the prefill engine did not get the Raiden connector options"
+import json
+import shlex
+import sys
+
+args = shlex.split(open(sys.argv[1]).read())
+config = json.loads(args[args.index("--kv-transfer-config") + 1])
+transfer, offload = config["kv_connector_extra_config"]["connectors"]
+assert transfer["kv_connector_extra_config"] == {
+    "async_complete": True,
+    "async_register": True,
+}, transfer
+extra = offload["kv_connector_extra_config"]
+assert extra["host_tier_recency"] is True and extra["max_async_loads"] == 16, extra
+PY
 
 for role in prefill decode; do
   grep -m1 "KVCacheStore up" "${RUN_DIR}/logs/${role}.log" \

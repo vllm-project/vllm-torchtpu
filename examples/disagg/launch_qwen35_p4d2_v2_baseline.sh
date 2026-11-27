@@ -118,6 +118,12 @@ PREFILL_OFFLOAD_CONTROLLER_PORT="${PREFILL_OFFLOAD_CONTROLLER_PORT:-27800}"
 DECODE_OFFLOAD_CONTROLLER_PORT="${DECODE_OFFLOAD_CONTROLLER_PORT:-28800}"
 PREFILL_CPU_BYTES_TO_USE="${PREFILL_CPU_BYTES_TO_USE:-68719476736}"
 DECODE_CPU_BYTES_TO_USE="${DECODE_CPU_BYTES_TO_USE:-8589934592}"
+# Connector options of the prefill engine's TPURaidenConnector and
+# TPURaidenOffloadingConnector children, as JSON object members added to each
+# child's kv_connector_extra_config, for example '"async_complete":true'
+# (docs/user_guide/disaggregated_serving.md). Empty adds none.
+PREFILL_TRANSFER_OPTIONS="${PREFILL_TRANSFER_OPTIONS:-}"
+PREFILL_OFFLOAD_OPTIONS="${PREFILL_OFFLOAD_OPTIONS:-}"
 PREFILL_SB_PORT_BASE="${PREFILL_SB_PORT_BASE:-29500}"
 DECODE_SB_PORT_BASE="${DECODE_SB_PORT_BASE:-29510}"
 DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29520}"
@@ -332,7 +338,12 @@ else
   common_args+=(--no-async-scheduling)
 fi
 
-p_kv='{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"kv_producer","kv_connector_extra_config":{"connectors":[{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":'"${KV_PORT}"'},{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${PREFILL_CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${PREFILL_OFFLOAD_CONTROLLER_PORT}"'}}]}}'
+p_transfer_extra=""
+if [[ -n "${PREFILL_TRANSFER_OPTIONS}" ]]; then
+  p_transfer_extra=',"kv_connector_extra_config":{'"${PREFILL_TRANSFER_OPTIONS}"'}'
+fi
+p_offload_extra="${PREFILL_OFFLOAD_OPTIONS:+,${PREFILL_OFFLOAD_OPTIONS}}"
+p_kv='{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"kv_producer","kv_connector_extra_config":{"connectors":[{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":'"${KV_PORT}${p_transfer_extra}"'},{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${PREFILL_CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${PREFILL_OFFLOAD_CONTROLLER_PORT}${p_offload_extra}"'}}]}}'
 d_kv='{"kv_connector":"TPUMultiConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector","kv_role":"kv_consumer","kv_connector_extra_config":{"connectors":[{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":'"${KV_PORT}"'},{"kv_connector":"TPURaidenOffloadingConnector","kv_connector_module_path":"vllm_torchtpu.offload.raiden_connector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":'"${DECODE_CPU_BYTES_TO_USE}"',"raiden_controller_port":'"${DECODE_OFFLOAD_CONTROLLER_PORT}"'}}]}}'
 
 prefill_namespace="prefill_p4d2_baseline_$(date +%Y%m%d_%H%M%S)"
@@ -386,6 +397,8 @@ PREFILL_OFFLOAD_CONTROLLER_PORT=${PREFILL_OFFLOAD_CONTROLLER_PORT}
 DECODE_OFFLOAD_CONTROLLER_PORT=${DECODE_OFFLOAD_CONTROLLER_PORT}
 PREFILL_CPU_BYTES_TO_USE=${PREFILL_CPU_BYTES_TO_USE}
 DECODE_CPU_BYTES_TO_USE=${DECODE_CPU_BYTES_TO_USE}
+PREFILL_TRANSFER_OPTIONS=${PREFILL_TRANSFER_OPTIONS}
+PREFILL_OFFLOAD_OPTIONS=${PREFILL_OFFLOAD_OPTIONS}
 TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}
 ATTENTION_BACKEND=${ATTENTION_BACKEND}
 PREFILL_MOE_FUSED_EP_KERNEL_IMPL=${PREFILL_MOE_FUSED_EP_KERNEL_IMPL}
