@@ -45,13 +45,14 @@ class TPUMultiConnector(MultiConnector):
     """
 
     def __init__(self, vllm_config, role, kv_cache_config):
-        super().__init__(vllm_config, role, kv_cache_config)
         # Opt-in: on a producer, report divergent local hybrid hits when any
         # child can complete them. See supports_divergent_local_hybrid_hits.
+        # Read before the children are built, so a wrong option fails first.
         options = read_options(
             MultiConnectorOptions,
             vllm_config.kv_transfer_config.kv_connector_extra_config,
         )
+        super().__init__(vllm_config, role, kv_cache_config)
         self._producer_divergent_hits = (
             options.producer_divergent_hits
             and vllm_config.kv_transfer_config.is_kv_producer

@@ -111,6 +111,7 @@ def _sched(cost=None, running=(), waiting=(), **attrs) -> TpuPipelineChunkSchedu
     s._step_wall_time = None
     s._transfer_poller = None
     s._hit_resolver = None
+    s._poll_failures = 0
     s.kv_cache_manager = SimpleNamespace(enable_caching=False)
     s.connector = None
     s._is_kv_consumer = False
@@ -432,8 +433,11 @@ def test_kv_both_is_not_a_kv_consumer(kv_role, consumer):
 
 
 class _HookedConnector:
-    """A connector with the two hooks the prefix-aware admission calls, as
+    """A connector with the three hooks the prefix-aware admission calls, as
     the multi-connector and the Raiden offloading connector define them."""
+
+    def estimate_external_hit_tokens(self, request, num_local_tokens):
+        return 0
 
     def poll_and_complete_transfers(self, idle):
         return None
@@ -459,7 +463,10 @@ def test_a_connector_without_the_hooks_is_named_in_a_warning(caplog):
     with caplog.at_level("WARNING"):
         s, _ = _built({"tpu_pp_scheduler": {"prefix_aware": True}}, connector=object())
     assert s._transfer_poller is None and s._hit_resolver is None
-    assert "has no poll_and_complete_transfers or" in caplog.text
+    assert (
+        "has no estimate_external_hit_tokens or poll_and_complete_transfers or "
+        "resolve_divergent_local_hit_tokens" in caplog.text
+    )
     caplog.clear()
     # Without the prefix-aware admission nothing calls them, so nothing is said.
     with caplog.at_level("WARNING"):
@@ -1085,6 +1092,29 @@ def test_a_waiting_host_tier_hit_counts_as_done_under_quadratic_cost():
     # Without quadratic_cost the pending work is computed tokens only.
     quad._quadratic_cost = False
     assert quad._waiting_warmth(_req(0, 16_384)) == 0
+
+
+def test_a_failing_poll_is_logged_once(caplog):
+    def poll(idle):
+        raise RuntimeError("store down")
+
+    connector = SimpleNamespace(
+        poll_and_complete_transfers=poll, supports_divergent_local_hybrid_hits=False
+    )
+    s = _sched(
+        cost=_model(),
+        connector=connector,
+        _transfer_poller=connector,
+        _prefix_aware=True,
+        _paw_aging_tok_per_s=0.0,
+    )
+    s._maybe_pack_prompt_ids = lambda out: None
+    with caplog.at_level("ERROR"):
+        for _ in range(3):
+            with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+                s.schedule()
+    assert [r.levelname for r in caplog.records].count("ERROR") == 1
+    assert s._poll_failures == 3
 
 
 def test_promotion_ranks_with_the_free_block_fit():

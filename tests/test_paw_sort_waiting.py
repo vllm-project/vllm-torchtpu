@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The pipeline chunk scheduler's waiting-queue sort (``_init_paw_sort``,
-``_paw_sort_key``, ``_sort_waiting_queue``).
+``_paw_sort_key``, ``_sort_waiting_queue``) and the host-tier hit it counts
+(``_external_warmth``, the connector's ``ExternalHitEstimator`` interface).
 
 The prefix-aware admission sorts the waiting queue of a KV producer at the
 start of its schedule(); these tests check the order one sort leaves, with the
@@ -235,6 +236,16 @@ def test_the_fit_tier_counts_blocks_as_allocate_slots_does():
     assert _order_seen_by_base_schedule(s) == ["mid", "small"]
 
 
+def _dram_small_estimator():
+    """A connector that expects to load 88,000 tokens of "dram_small" from its
+    host tier and nothing of any other request."""
+    return SimpleNamespace(
+        estimate_external_hit_tokens=lambda r, local: 88_000
+        if r.request_id == "dram_small"
+        else 0
+    )
+
+
 def test_external_hit_counts_when_it_fits():
     now = time.time()
     reqs = [
@@ -242,20 +253,12 @@ def test_external_hit_counts_when_it_fits():
         _req("dram_small", 100_000, now - 1),  # 2,000 uncached after a DRAM load
     ]
     s = _scheduler(reqs, {"hbm_mid": 22_000, "dram_small": 10_000})
-    s._hit_estimator = SimpleNamespace(
-        estimate_external_hit_tokens=lambda r, local: 88_000
-        if r.request_id == "dram_small"
-        else 0
-    )
+    s._hit_estimator = _dram_small_estimator()
     assert _order_seen_by_base_schedule(s) == ["dram_small", "hbm_mid"]
     # Without room for the loaded blocks the DRAM hit does not count.
     reqs = [_req("hbm_mid", 30_000, now - 2), _req("dram_small", 100_000, now - 1)]
     s = _scheduler(reqs, {"hbm_mid": 22_000, "dram_small": 10_000})
-    s._hit_estimator = SimpleNamespace(
-        estimate_external_hit_tokens=lambda r, local: 88_000
-        if r.request_id == "dram_small"
-        else 0
-    )
+    s._hit_estimator = _dram_small_estimator()
     s.kv_cache_manager.block_pool = SimpleNamespace(get_num_free_blocks=lambda: 45)
     s._inflight_prefill_reserved_blocks = lambda: 30  # 15 left < 41 to load
     assert _order_seen_by_base_schedule(s) == ["hbm_mid", "dram_small"]
@@ -270,11 +273,7 @@ def test_the_blocks_retention_pins_are_no_room_for_a_host_tier_load():
     now = time.time()
     reqs = [_req("hbm_mid", 30_000, now - 2), _req("dram_small", 100_000, now - 1)]
     s = _scheduler(reqs, {"hbm_mid": 22_000, "dram_small": 10_000})
-    s._hit_estimator = SimpleNamespace(
-        estimate_external_hit_tokens=lambda r, local: 88_000
-        if r.request_id == "dram_small"
-        else 0
-    )
+    s._hit_estimator = _dram_small_estimator()
     s.kv_cache_manager.block_pool = SimpleNamespace(get_num_free_blocks=lambda: 45)
     s._retention = SimpleNamespace(num_pinned_blocks=lambda: 30)
     s._inflight_prefill_reserved_blocks = lambda: 10

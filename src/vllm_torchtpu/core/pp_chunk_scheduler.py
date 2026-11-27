@@ -258,7 +258,9 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
             options.prefix_aware
             and scheduler_options.get(self.vllm_config).promote_warmest
         )
-        # The connector's host-tier estimate, read by _external_warmth.
+        # The connector's host-tier estimate, read by _external_warmth: in the
+        # prefix-aware sort and promotion, and under quadratic_cost in the
+        # pending-work estimate (_waiting_warmth).
         self._hit_estimator: ExternalHitEstimator | None = (
             self.connector if isinstance(self.connector, ExternalHitEstimator) else None
         )
@@ -270,10 +272,12 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         self._hit_resolver: DivergentHitResolver | None = (
             self.connector if isinstance(self.connector, DivergentHitResolver) else None
         )
+        self._poll_failures = 0
         if self._prefix_aware and self.connector is not None:
             missing = [
                 name
                 for name, hook in (
+                    ("estimate_external_hit_tokens", self._hit_estimator),
                     ("poll_and_complete_transfers", self._transfer_poller),
                     ("resolve_divergent_local_hit_tokens", self._hit_resolver),
                 )
@@ -793,8 +797,18 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
             try:
                 finished = poller.poll_and_complete_transfers(not self.running)
             except Exception:
-                logger.exception(
-                    "Pipeline chunk scheduler: poll_and_complete_transfers failed."
+                # Scheduling goes on without the poll's transfers this step;
+                # the traceback is logged once.
+                if self._poll_failures == 0:
+                    logger.exception(
+                        "Pipeline chunk scheduler: poll_and_complete_transfers "
+                        "failed; later failures are counted at debug level."
+                    )
+                self._poll_failures += 1
+                logger.debug(
+                    "Pipeline chunk scheduler: poll_and_complete_transfers "
+                    "failures: %d",
+                    self._poll_failures,
                 )
             else:
                 if finished is not None:

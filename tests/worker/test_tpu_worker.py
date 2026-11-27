@@ -873,7 +873,7 @@ class TestDeferredNoForwardOutput:
 
     def _worker(self):
         worker = object.__new__(TPUWorker)
-        worker._dummy_batch_cv = __import__("threading").Condition()
+        worker._dummy_batch_cv = threading.Condition()
         worker._dummy_batch_count = 0
         worker._stage3_late_poller_list = None
         return worker

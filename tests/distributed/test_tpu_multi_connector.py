@@ -22,7 +22,7 @@ the real children). No TPU or network access is required.
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.config.kv_transfer import KVTransferConfig
@@ -381,7 +381,13 @@ class TestProducerDivergentHitsOption:
 
     @pytest.mark.parametrize("value", ["true", 1, "1"])
     def test_option_must_be_a_json_boolean(self, value):
-        with pytest.raises(ValueError, match="producer_divergent_hits"):
+        # Refused before upstream's __init__ builds the children.
+        with (
+            patch.object(
+                MultiConnector, "__init__", side_effect=AssertionError("built")
+            ),
+            pytest.raises(ValueError, match="producer_divergent_hits"),
+        ):
             TPUMultiConnector(
                 self._config("kv_producer", value),
                 KVConnectorRole.SCHEDULER,
