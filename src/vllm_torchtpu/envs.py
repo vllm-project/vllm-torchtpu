@@ -346,6 +346,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_EXCHANGE_IN_FLIGHT: int = 8
     TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
     TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC: bool = False
+    TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES: bool = False
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
@@ -2339,6 +2340,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (a start / wait pair of kernels), so the exchange overlaps that work.
     "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC": env_bool(
         "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC", default=False
+    ),
+    # SCALES=1: the (synchronous) page exchange also copies each live page's
+    # K/V scale rows of the destination's KV head by remote DMA, in place of
+    # the XLA gather + all-to-all + all-gather + pad of the whole page
+    # buffer's scales. Same values (bit-exact); ignored with ASYNC=1.
+    "TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES": env_bool(
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES", default=False
     ),
     # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
     # how its sorts run. Empty keeps three stable sorts (two of two operands);
