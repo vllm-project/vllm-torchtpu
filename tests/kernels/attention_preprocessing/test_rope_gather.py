@@ -18,3 +18,13 @@ def test_blocked_rope_gather_matches_one_gather(rows):
     ref = table[inside]
     got = rope_gather.by_row_blocks(lambda r: table[r], inside, True)
     np.testing.assert_array_equal(np.asarray(ref), np.asarray(got))
+
+
+@pytest.mark.parametrize("rows", [5, 60, 72, 512, 513, 2048])
+def test_paired_rows_device_matches_gather_rows(rows):
+    table = jax.random.normal(jax.random.PRNGKey(0), (4097, 64), jnp.float32)
+    pairs = jnp.concatenate((table, table[-1:])).reshape(-1, 128)
+    positions = jax.random.randint(jax.random.PRNGKey(1), (rows,), -8, 4105)
+    ref = rope_gather.gather_rows(table, positions)
+    got = jax.jit(rope_gather.gather_paired_rows_device)(pairs, positions)
+    np.testing.assert_array_equal(np.asarray(ref), np.asarray(got))

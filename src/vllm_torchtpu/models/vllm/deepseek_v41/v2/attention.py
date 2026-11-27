@@ -799,7 +799,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # Set at load (runner.utils.relayout_rope_tables) for 64-wide tables.
         pairs = getattr(self, "_tpu_rope_pairs", None)
         if pairs is not None:
-            rows = preprocess_ops.rope_paired_rows_sc()(pairs, positions)
+            rows = preprocess_ops.rope_paired_rows()(pairs, positions)
         else:
             rows = preprocess_ops.rope_rows()(table, positions)
         if stage_cache is not None:
@@ -1691,7 +1691,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                                     starts=swa.query_start_loc,
                                     positions=positions,
                                     sink=self.attn_sink,
-                                    cos_sin=self._tpu_rope_cache,
+                                    rope_rows=self._rope_rows(positions),
                                     metadata=csa2_metadata,
                                     bounds=csa2_bounds,
                                     topk=indexer.indexer_op.topk_tokens,
@@ -1814,7 +1814,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     swa.query_start_loc,
                     positions,
                     self.attn_sink,
-                    self._tpu_rope_cache,
+                    self._rope_rows(positions),
                     csa2_metadata,
                     csa2_bounds,
                     self.compress_ratio,
@@ -2120,7 +2120,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             # Register before TorchDynamo captures the first model forward.
             eps = self.kv_norm.variance_epsilon
             preprocess_ops.rope_rows()
-            preprocess_ops.rope_paired_rows_sc()
+            preprocess_ops.rope_paired_rows()
             preprocess_ops.qa_rope(True, eps)
             preprocess_ops.qa_rope(False, eps)  # DSpark context KV
             preprocess_ops.qb_rope()

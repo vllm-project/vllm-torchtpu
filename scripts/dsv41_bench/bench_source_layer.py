@@ -104,7 +104,9 @@ metadata, bounds, _ = prepare_swa_metadata(
     row_offset=0,
 )
 angles = rng.standard_normal((PREFIX + T, 32)).astype(np.float32)
-cos_sin = jnp.asarray(np.concatenate((np.cos(angles), np.sin(angles)), axis=1))
+rope_rows = jnp.asarray(np.concatenate((np.cos(angles), np.sin(angles)), axis=1))[
+    positions
+]
 
 args = dict(
     index_q=jnp.asarray(rng.normal(size=(T, 32, 128)), jnp.float8_e4m3fn),
@@ -130,7 +132,7 @@ args = dict(
     starts=starts,
     positions=jnp.asarray(positions),
     sink=jnp.linspace(-1, 1, HEADS, dtype=jnp.float32),
-    cos_sin=cos_sin,
+    rope_rows=rope_rows,
     metadata=metadata,
     bounds=bounds,
 )
@@ -173,7 +175,7 @@ def unfused(a):
         a["starts"],
         a["positions"],
         a["sink"],
-        a["cos_sin"],
+        a["rope_rows"],
         a["metadata"],
         a["bounds"],
         MPAGE,

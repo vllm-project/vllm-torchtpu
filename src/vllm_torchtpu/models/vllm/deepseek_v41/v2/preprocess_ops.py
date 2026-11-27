@@ -92,13 +92,13 @@ def rope_rows() -> Any:
     )
 
 
-def rope_paired_rows_sc() -> Any:
-    """``(pairs, positions) -> [T, rotary_dim]`` rows of a two-row-packed table,
-    fetched on SparseCore (async offload) where the chip has one."""
+def rope_paired_rows() -> Any:
+    """``(pairs, positions) -> [T, rotary_dim]`` rows of a two-row-packed table
+    (``rope_gather.gather_paired_rows_device``)."""
     return _get(
-        "rope_paired_rows_sc",
+        "rope_paired_rows",
         lambda: (
-            rope_gather.gather_paired_rows_sc,
+            rope_gather.gather_paired_rows_device,
             lambda pairs, pos: pairs.new_empty((pos.shape[0], pairs.shape[1] // 2)),
         ),
     )

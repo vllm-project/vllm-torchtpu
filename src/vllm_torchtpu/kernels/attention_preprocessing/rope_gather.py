@@ -12,6 +12,8 @@ non-contiguous positions cost up to 2-3x the kernel itself.
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 _LANE = 128
 
@@ -94,28 +96,74 @@ def gather_paired_rows(pairs: jax.Array, positions: jax.Array) -> jax.Array:
     return _select_half(jnp.take(pairs, clamped >> 1, axis=0), clamped)
 
 
-def gather_paired_rows_sc(pairs: jax.Array, positions: jax.Array) -> jax.Array:
-    """``gather_paired_rows`` with the row gather on SparseCore.
+# A row DMA costs about 11 ns to issue on tpu7x (paired 128-lane FP32 rows,
+# random positions: 72 rows 2.0 us, 288 rows 4.2, 2048 rows 23.4), while a
+# SparseCore gather pays ~21 us of latency at decode sizes (72 rows) and slows
+# concurrent TensorCore DMAs (DSpark main_proj 29.4 -> 46.8 us). Row DMAs are
+# used while the rows fit one SparseCore gather block (512 rows, ~6.8 us).
+_DMA_ROWS_UP_TO = 512
 
-    The paired-row fetch runs as one SparseCore row-DMA program
-    (``ragged_gather_v2``), an async offload the TensorCore does not wait on
-    until the rows are consumed, so it can overlap TensorCore work that does
-    not depend on it (the DSpark main_proj). The even/odd half select stays
-    on the TensorCore. Falls back to ``gather_paired_rows`` without
-    SparseCore. Bit-exact.
+
+def gather_paired_rows_device(pairs: jax.Array, positions: jax.Array) -> jax.Array:
+    """``gather_paired_rows`` with the row fetch on the fastest exact engine.
+
+    Up to ``_DMA_ROWS_UP_TO`` tokens (decode and draft steps) the TensorCore
+    issues one DMA per pair row. Larger counts run as one SparseCore row-DMA
+    program (``ragged_gather_v2``), an async offload the TensorCore does not
+    wait on until the rows are consumed. Falls back to ``gather_paired_rows``
+    off TPU. The even/odd half select stays an XLA fusion. Bit-exact.
     """
-    from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
-
-    if not _has_sparse_core():
+    if not _on_tpu():
         return gather_paired_rows(pairs, positions)
     clamped = _clamp_paired(pairs, positions)
-    rows = ragged_gather_v2(
-        pairs,
-        clamped >> 1,
-        jnp.zeros((1,), jnp.int32),
-        jnp.full((1,), positions.shape[0], jnp.int32),
-    )
+    if positions.shape[0] <= _DMA_ROWS_UP_TO:
+        rows = _dma_rows(pairs, clamped >> 1)
+    elif _has_sparse_core():
+        from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+
+        rows = ragged_gather_v2(
+            pairs,
+            clamped >> 1,
+            jnp.zeros((1,), jnp.int32),
+            jnp.full((1,), positions.shape[0], jnp.int32),
+        )
+    else:
+        return gather_paired_rows(pairs, positions)
     return _select_half(rows, clamped)
+
+
+def _dma_rows_kernel(rows_ref, table_ref, out_ref, sem):
+    def issue(t, carry):
+        pltpu.make_async_copy(
+            table_ref.at[pl.ds(rows_ref[t], 1)], out_ref.at[pl.ds(t, 1)], sem.at[0]
+        ).start()
+        return carry
+
+    def wait(t, carry):
+        pltpu.make_async_copy(
+            table_ref.at[pl.ds(0, 1)], out_ref.at[pl.ds(0, 1)], sem.at[0]
+        ).wait()
+        return carry
+
+    jax.lax.fori_loop(0, out_ref.shape[0], issue, 0, unroll=8)
+    jax.lax.fori_loop(0, out_ref.shape[0], wait, 0, unroll=8)
+
+
+def _dma_rows(table: jax.Array, rows: jax.Array) -> jax.Array:
+    """``table[rows]`` as one TensorCore DMA per row; ``rows`` in bounds."""
+    count, width = rows.shape[0], table.shape[1]
+    return pl.pallas_call(
+        _dma_rows_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(1,),
+            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+            out_specs=pl.BlockSpec((count, width), lambda i, rows: (0, 0)),
+            scratch_shapes=[pltpu.SemaphoreType.DMA((1,))],
+        ),
+        out_shape=jax.ShapeDtypeStruct((count, width), table.dtype),
+        name="rope_row_dma",
+    )(rows, table)
 
 
 def _clamp_paired(pairs: jax.Array, positions: jax.Array) -> jax.Array:
@@ -129,15 +177,14 @@ def _select_half(rows: jax.Array, clamped: jax.Array) -> jax.Array:
     return jnp.where(even, rows[:, :half], rows[:, half:])
 
 
-def _has_sparse_core() -> bool:
-    from jax.experimental.pallas import tpu as pltpu
+def _on_tpu() -> bool:
+    return jax.devices()[0].platform == "tpu"
 
+
+def _has_sparse_core() -> bool:
     # Check the device, not only the backend name: host-traced TPU branches
     # have no TPU device kind to query (same check as cache._sparse_core_rows).
-    return (
-        jax.devices()[0].platform == "tpu"
-        and pltpu.get_tpu_info().sparse_core is not None
-    )
+    return _on_tpu() and pltpu.get_tpu_info().sparse_core is not None
 
 
 def coefficients(cos_sin):

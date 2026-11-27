@@ -79,7 +79,14 @@ def _publish_swa_sc(raw, records, values, page_size, shift=0):
         tokens=records.shape[0],
         buckets=prep.SWA_PACK_TOKENS,
     ):
-        padded = -(-records.size // (lanes * cores)) * (lanes * cores)
+        # The pack emits four segment-major rows per token, so tokens pad to a
+        # quarter block: each pipeline step then covers all four segments of
+        # a quarter of the tokens instead of one segment of all of them, and
+        # a decode step's records (72 tokens) take one read-modify-write round
+        # instead of four (v7: SparseCore publish 3.9 -> 1.9 us, with the
+        # smaller pack 27.6 -> 23.2 us per layer).
+        quarter = lanes * cores // 4
+        padded = -(-records.size // quarter) * quarter
         ids, words, masks = prep.swa_word_pool_pack(
             records, values, capacity=capacity, padded=padded
         )
@@ -89,10 +96,8 @@ def _publish_swa_sc(raw, records, values, page_size, shift=0):
         ids = jnp.pad(ids, (0, padding), constant_values=-1)
         words = jnp.pad(words, ((0, padding), (0, 0)))
         masks = jnp.pad(masks, ((0, padding), (0, 0)))
-    if shift:
-        # A token pair spans four 128-word rows.
-        ids = jnp.where(ids >= 0, ids + 2 * shift, ids)
-    return _publish_packed(banks, ids, words, masks, info, raw)
+    # A token pair spans four 128-word rows.
+    return _publish_packed(banks, ids, words, masks, info, raw, offset=2 * shift)
 
 
 def _pack_native(records, values, capacity, page_size):
@@ -125,11 +130,13 @@ def _pack_native(records, values, capacity, page_size):
     return physical, words, masks
 
 
-def _publish_packed(banks, ids, words, masks, info, raw):
+def _publish_packed(banks, ids, words, masks, info, raw, offset=0):
     """Read-modify-write packed SWA rows into the word pool on SparseCore.
 
     Row r's mask is ``masks[r % len(masks)]``: the fused pack shares one mask
     row across a pair's four segment-major rows; native masks are per row.
+    Each valid id lands ``offset`` rows further on (applied in the kernel, so
+    a shifted layer needs no extra pass over the ids).
     """
     lanes, cores = info.num_lanes, info.num_cores * info.num_subcores
     if ids.size % masks.shape[0] or masks.shape[0] % lanes:
@@ -147,13 +154,14 @@ def _publish_packed(banks, ids, words, masks, info, raw):
         core = jax.lax.axis_index((mesh.core_axis_name, mesh.subcore_axis_name))
 
         def store(selected, word, mask):
+            rows = selected[...]
+            if offset:
+                rows = jnp.where(rows >= 0, rows + offset, rows)
             base = 0
             for bank in range(len(banks)):
-                valid = (selected[...] >= base) & (
-                    selected[...] < base + banks[bank].shape[0]
-                )
+                valid = (rows >= base) & (rows < base + banks[bank].shape[0])
                 indices = plsc.Indices(
-                    jnp.where(valid, selected[...] - base, -1), ignored_value=-1
+                    jnp.where(valid, rows - base, -1), ignored_value=-1
                 )
                 read = pltpu.make_async_copy(
                     out_refs[bank].at[indices], old_ref, sem.at[bank]
