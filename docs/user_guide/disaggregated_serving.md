@@ -188,3 +188,18 @@ Capacity-preemption abort follows `kv_load_failure_policy` by default (`"fail"` 
 | `TPU_RAIDEN_TRANSFER_PARALLELISM` | `8` | Number of concurrent DMA transfer streams per worker. |
 | `TPU_RAIDEN_RESHARD_IMPL` | `"controller"` | KV resharding implementation (`controller` or `host`) when Prefill and Decode shardings differ. |
 | `TPU_KV_RESHARD_TRANSPORT` | `"zmq"` | Transport protocol for host-side KV resharding (`zmq` or `tcp`). |
+
+---
+
+## 7. Raiden Connector Options
+
+These opt-in options go in a connector's own `kv_connector_extra_config` in `--kv-transfer-config` (for a `TPUMultiConnector`, in the child's entry of `connectors`). Unset, each connector behaves as it does without the option. `vllm_torchtpu/distributed/kv_transfer/connector_options.py` reads them: a value must be a JSON boolean or a non-negative JSON integer as listed, and an option set on another connector than the one below is refused at start-up. Other keys of `kv_connector_extra_config` (such as `cpu_bytes_to_use`) belong to their own readers.
+
+| Option | Connector | Default | Role | Effect | Limits |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `async_complete` | `TPURaidenConnector` | `false` | KV producer | Issues the post-transfer `complete_request_blocks` RPC on a background thread instead of inside the engine step. | A failed call is retried on that thread, up to 5 attempts 0.1 s apart; the next poll raises a call that failed every attempt. |
+| `async_register` | `TPURaidenConnector` | `false` | KV producer | Registers a step's request blocks on a side thread that starts once the forward is dispatched (or after 10 ms). | Only the default admission path; DSv4, GLM and Kimi-K3 admission register synchronously. |
+| `late_poll` | `TPURaidenConnector` | `false` | KV consumer | Reports Stage-3 loads that land during a step with that step's output instead of the next one's. | Refused at start-up on a `kv_producer` or `kv_both` engine, without `--async-scheduling`, and with `TPU_RAIDEN_INLINE_LOAD`. Under DP, a zero-token step's output waits for the next DP dummy batch, at most 50 ms. |
+| `host_tier_recency` | `TPURaidenOffloadingConnector` | `false` | Any | Refreshes a request's host-tier keys on every lookup and store (FullAttention tail to chunk 0, then the recurrent and sliding-window state, then partial tails), skips partial tails at or below the local HBM hit, offers FullAttention chunks for storing from chunk 0 again, and launches fence-acknowledged stores largest first. | Scheduler side only; lookups and stores are upstream's either way. |
+| `max_async_loads` | `TPURaidenOffloadingConnector` | `0` (no cap) | Any | Defers a request with a host-tier hit to a later step while this many host-tier loads are in flight. | Non-negative integer. |
+| `producer_divergent_hits` | `TPUMultiConnector` | `false` | KV producer | Reports divergent local hybrid hits (FullAttention deeper than the recurrent state) when any child can complete them, instead of upstream's every-child rule, which is false on a producer. | No effect on a consumer. The offloading child completes them only with `TPU_RAIDEN_PREFIX_AWARE_LOAD=1`; the pipeline chunk scheduler with `tpu_pp_scheduler.prefix_aware` asks that child how much of the hit to keep. |
