@@ -242,16 +242,18 @@ def _selftest_inputs(n: int, rows: int, hidden: int) -> np.ndarray:
     return (((d + 1) * 3 + r * 5 + c * 7) % 11 - 5).astype(np.float32)
 
 
-def _selftest_carry(mesh_index: int, hidden: int) -> list[torch.Tensor]:
-    """CPU tensors shaped and typed as the model carries (a 1-D f32 norm weight
-    and a 2-D e4m3 projection weight), different per rank and per element."""
+def _selftest_carries(mesh_index: int, hidden: int) -> list[list[torch.Tensor]]:
+    """CPU tensor pairs shaped and typed as the model carries: a 1-D f32 norm
+    weight with a 2-D e4m3 projection weight or a 2-D f32 router weight,
+    different per rank and per element."""
     norm = np.arange(hidden, dtype=np.float32) * 0.5 + mesh_index
     # e4m3 bytes below 0x7f: no NaN codes.
     codes = (np.arange(256 * 512) * 7 + mesh_index * 13) % 0x7F
-    weight = codes.astype(np.uint8).reshape(256, 512)
+    e4m3 = torch.from_numpy(codes.astype(np.uint8).reshape(256, 512))
+    router = np.arange(128 * 512, dtype=np.float32).reshape(128, 512) - mesh_index
     return [
-        torch.from_numpy(norm),
-        torch.from_numpy(weight).view(torch.float8_e4m3fn),
+        [torch.from_numpy(norm), e4m3.view(torch.float8_e4m3fn)],
+        [torch.from_numpy(norm), torch.from_numpy(router)],
     ]
 
 
@@ -271,17 +273,17 @@ def _selftest(
 ) -> list:
     """Rows whose all-reduce (either op) or carried copies came back wrong."""
     failures = []
-    carry = _selftest_carry(mesh_index, hidden)
-    carry_t = [c.to(device) for c in carry]
+    carries = _selftest_carries(mesh_index, hidden)
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
-        for rows in _SELFTEST_ROWS:
+        for i, rows in enumerate(_SELFTEST_ROWS):
             if kernel.view_bytes(rows, hidden, n) > max_bytes:
                 continue
             x = _selftest_inputs(n, rows, hidden)
             mine = torch.from_numpy(x[mesh_index]).to(torch.bfloat16).to(device)
             got = op(mine, rank).to(torch.float32).cpu().numpy()
-            total, *copied = carrying_op(mine, rank, *carry_t)
+            carry = carries[i % len(carries)]
+            total, *copied = carrying_op(mine, rank, *(c.to(device) for c in carry))
             if not (
                 np.array_equal(got, x.sum(0))
                 and np.array_equal(total.to(torch.float32).cpu().numpy(), x.sum(0))

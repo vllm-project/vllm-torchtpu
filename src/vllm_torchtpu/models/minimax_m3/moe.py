@@ -14,6 +14,7 @@
 """MiniMax M3 feed-forward blocks."""
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from transformers import PreTrainedConfig
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
@@ -22,6 +23,7 @@ from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
@@ -175,6 +177,34 @@ class MiniMaxM3MoE(nn.Module):
         )
         routed.expert_replica_groups = placement.groups
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        router_logits, _ = self.gate(hidden_states)
+    def carries_router_weight(self) -> bool:
+        """Whether `forward` with a ``gate_weight`` copy computes what
+        `self.gate` does: GateLinear's plain unquantized linear in the
+        weight's dtype, which it runs when no specialized router GEMM tier
+        applies (always on TPU)."""
+        gate = self.gate
+        tiers = (
+            "allow_ll_bf16_gemm",
+            "allow_rocm_bf16x3_router_gemm",
+            "allow_fp32_router_gemm",
+            "allow_bf16x3_router_gemm",
+            "allow_cublas_router_gemm",
+        )
+        return (
+            type(gate.quant_method) is UnquantizedLinearMethod
+            and gate.bias is None
+            and gate.out_dtype == gate.weight.dtype
+            and not any(getattr(gate, tier, False) for tier in tiers)
+        )
+
+    def forward(
+        self, hidden_states: torch.Tensor, gate_weight: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``gate_weight``: a copy of the router weight placed for this call
+        (an all-reduce carried it into VMEM), else None."""
+        if gate_weight is None:
+            router_logits, _ = self.gate(hidden_states)
+        else:
+            # GateLinear's path when `carries_router_weight`.
+            router_logits = F.linear(hidden_states.to(gate_weight.dtype), gate_weight)
         return self.experts(hidden_states=hidden_states, router_logits=router_logits)

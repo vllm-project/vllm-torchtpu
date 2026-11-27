@@ -113,20 +113,22 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
 
     @contextlib.contextmanager
-    def _layer_owned_reductions(self, attention: bool = True) -> Iterator[None]:
-        """o_proj and the FFN return per-rank partial sums and the layer
-        reduces them: in a sequence-parallel step both, and with
-        ``attention=False`` (a step whose FFN all-reduce carries the next QKV
-        weight) the FFN's alone. Other traces keep their own all-reduces."""
+    def _layer_owned_reductions(
+        self, attention: bool = True, ffn: bool = True
+    ) -> Iterator[None]:
+        """o_proj (``attention``) and the FFN (``ffn``) return per-rank
+        partial sums and the layer reduces them: both in a sequence-parallel
+        step, the ones whose all-reduce carries weights in a decode step.
+        Other traces keep their own all-reduces."""
         o_proj = self.self_attn.o_proj
         if self.is_moe_layer:
             cfg = self.block_sparse_moe.experts.moe_config
             saved = (o_proj.reduce_results, cfg.skip_final_all_reduce)
-            cfg.skip_final_all_reduce = True
+            cfg.skip_final_all_reduce = cfg.skip_final_all_reduce or ffn
         else:
             down = self.mlp.down_proj
             saved = (o_proj.reduce_results, down.reduce_results)
-            down.reduce_results = False
+            down.reduce_results = down.reduce_results and not ffn
         if attention:
             o_proj.reduce_results = False
         try:
@@ -145,14 +147,17 @@ class MiniMaxM3DecoderLayer(nn.Module):
         attn_rs: bool = False,
         carried: tuple[torch.Tensor, torch.Tensor] | None = None,
         carry: tuple[torch.Tensor, torch.Tensor] | None = None,
+        carry_router: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...] | None]:
         """Residual-deferred layer; ``attn_rs`` (large steps) reduce-scatters
         the attention output instead of all-reducing it.
 
-        ``carry`` (not with ``attn_rs``): the next layer's (input norm, QKV)
-        weights (`MiniMaxM3Model._qkv_carries`), which the FFN all-reduce
-        copies into VMEM while it runs; the copies are returned third, for
-        the next layer's ``carried`` (None when nothing is carried)."""
+        Not with ``attn_rs``: ``carry`` is the next layer's (input norm, QKV)
+        weights (`MiniMaxM3Model._carries`), which the FFN all-reduce copies
+        into VMEM while it runs; the copies are returned third, for the next
+        layer's ``carried`` (None when nothing is carried). ``carry_router``
+        has a MoE layer's attention all-reduce carry its post-attention norm
+        and router weights the same way."""
         norm_weight, qkv_weight = carried or (None, None)
         if residual is None:
             residual = hidden_states
@@ -162,23 +167,34 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 hidden_states, residual, weight=norm_weight
             )
         if not attn_rs:
-            hidden_states = self.self_attn(positions, hidden_states, qkv_weight)
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
+            router = (
+                carry_router
+                and self.is_moe_layer
+                and self.block_sparse_moe.carries_router_weight()
             )
-            ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
+            with self._layer_owned_reductions(
+                attention=router, ffn=carry is not None
+            ):
+                hidden_states = self.self_attn(positions, hidden_states, qkv_weight)
+                post_norm = gate = None
+                if router:
+                    moe = self.block_sparse_moe
+                    hidden_states, (post_norm, gate) = _reduce_carrying(
+                        hidden_states,
+                        (self.post_attention_layernorm.folded_weight, moe.gate.weight),
+                    )
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual, weight=post_norm
+                )
+                if self.is_moe_layer:
+                    out = self.block_sparse_moe(hidden_states, gate_weight=gate)
+                else:
+                    out = self.mlp(hidden_states)
             if carry is None:
-                return ffn(hidden_states), residual, None
-            with self._layer_owned_reductions(attention=False):
-                partial = ffn(hidden_states)
-            reduced = pallas_all_reduce.all_reduce_carrying(
-                get_tp_group().ranks, partial, carry
-            )
-            if reduced is None:
-                raise RuntimeError("the FFN output is not a tensor the op reduces")
-            out, copies = reduced
+                return out, residual, None
+            out, copies = _reduce_carrying(out, carry)
             return out, residual, copies
-        assert carry is None
+        assert carry is None and not carry_router
         with self._layer_owned_reductions():
             return *self._attn_rs(positions, hidden_states, residual), None
 
@@ -240,6 +256,17 @@ class MiniMaxM3DecoderLayer(nn.Module):
             self.post_attention_layernorm(shard), envs.TPU_MINIMAX_M3_SP_FP8_GATHER
         )
         return shard + tensor_model_parallel_reduce_scatter(ffn(normed), 0)
+
+
+def _reduce_carrying(
+    x: torch.Tensor, carry: tuple[torch.Tensor, ...]
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    """The TP all-reduce of x, with VMEM copies of ``carry``
+    (pallas_all_reduce.all_reduce_carrying)."""
+    reduced = pallas_all_reduce.all_reduce_carrying(get_tp_group().ranks, x, carry)
+    if reduced is None:
+        raise RuntimeError("the TP all-reduce does not carry for this tensor")
+    return reduced
 
 
 def _sp_mode() -> str:
@@ -336,7 +363,7 @@ class MiniMaxM3Model(nn.Module):
             hidden_states = tensor_model_parallel_all_gather(self.norm(shard), 0)
         else:
             hidden_states, residual, carried = inputs_embeds, None, None
-            carries = self._qkv_carries(sp_step)
+            carries = self._carries(sp_step)
             for idx, layer in enumerate(self.layers):
                 hidden_states, residual, carried = layer(
                     positions,
@@ -344,7 +371,8 @@ class MiniMaxM3Model(nn.Module):
                     residual,
                     sp_step,
                     carried,
-                    carries[idx],
+                    carries[idx] if carries else None,
+                    carry_router=bool(carries),
                 )
                 if idx + 1 in self.aux_hidden_state_layers:
                     aux_hidden_states.append(hidden_states + residual)
@@ -353,12 +381,13 @@ class MiniMaxM3Model(nn.Module):
             return hidden_states, aux_hidden_states
         return hidden_states
 
-    def _qkv_carries(
+    def _carries(
         self, sp_step: bool
-    ) -> list[tuple[torch.Tensor, torch.Tensor] | None]:
+    ) -> list[tuple[torch.Tensor, torch.Tensor] | None] | None:
         """Per layer, the next layer's (input norm, QKV) weights for its FFN
         all-reduce to carry into VMEM (`MiniMaxM3DecoderLayer.forward`), or
-        None.
+        None per layer; None when this step carries nothing, else MoE layers
+        also carry their router weights in their attention all-reduce.
 
         `fp8_linear` reads the QKV weight from VMEM; XLA's own prefetch of it
         cannot start before the FFN all-reduce (the MoE kernel holds VMEM
@@ -369,11 +398,11 @@ class MiniMaxM3Model(nn.Module):
         the next layer reads first, rides along so that this trace takes its
         weights in the order the traces without a carry do (sequence-parallel
         steps): traces hand compiled buckets to one another only when their
-        inputs match (compilation/shape_variants.py)."""
-        none = [None] * len(self.layers)
+        inputs match (compilation/shape_variants.py); likewise the
+        post-attention norm weight beside the router weight."""
         rows = pallas_all_reduce.carry_rows(get_tp_group().ranks)
         if sp_step or not rows or self.dtype != torch.bfloat16:
-            return none
+            return None
         carries = []
         for layer in self.layers[1:]:
             qkv = layer.self_attn.qkv_proj
@@ -382,7 +411,7 @@ class MiniMaxM3Model(nn.Module):
             weight = method.vmem_weight(qkv, rows) if fp8 else None
             norm = layer.input_layernorm.folded_weight
             carries.append(None if weight is None else (norm, weight))
-        return carries + [None]
+        return carries + [None] if any(carries) else None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # (param, checkpoint shard, shard id). Leading dots keep `.q_proj`
