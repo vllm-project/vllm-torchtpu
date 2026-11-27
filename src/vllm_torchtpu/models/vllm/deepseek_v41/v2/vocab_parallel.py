@@ -154,6 +154,12 @@ class VocabParallelHeads:
             self.world * num_reqs * block_size, self.width
         )
 
+    @staticmethod
+    def supports_world(world: int, vocab_size: int) -> bool:
+        """Whether one Markov kernel tile's key packing covers a slice."""
+        markov = vph.markov_rows(vph.shard_rows(vocab_size, world))
+        return 16 + (markov - 1).bit_length() <= 31
+
     def dspark_samples(
         self, hidden: torch.Tensor, anchors: torch.Tensor, markov_embed: torch.Tensor
     ) -> torch.Tensor:

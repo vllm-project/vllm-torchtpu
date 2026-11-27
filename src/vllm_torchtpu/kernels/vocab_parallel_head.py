@@ -46,10 +46,8 @@ def markov_rows(shard: int) -> int:
     return -(-shard // 512) * 512
 
 
-def _gather_rows(x: jax.Array, world: int, all_gather: bool = False) -> jax.Array:
+def _gather_rows(x: jax.Array, world: int) -> jax.Array:
     """[n, ...] on every rank -> [world, n, ...], rank-ordered, on every rank."""
-    if all_gather:
-        return jax.lax.all_gather(x, AXIS)
     copies = jnp.broadcast_to(x[None], (world, *x.shape))
     return jax.lax.all_to_all(copies, AXIS, 0, 0, tiled=True)
 
@@ -61,7 +59,6 @@ def target_logits(
     world: int,
     vocab_size: int,
     chunks: int = 1,
-    all_gather: bool = False,
 ) -> jax.Array:
     """[R, K] rows and this rank's [S, K] head slice -> [R, vocab] logits.
 
@@ -70,7 +67,7 @@ def target_logits(
     rows, width = hidden.shape
     shard = weight_shard.shape[0]
     tiles = shard // SLICE_TILE
-    every_row = _gather_rows(hidden, world, all_gather).reshape(world * rows, width)
+    every_row = _gather_rows(hidden, world).reshape(world * rows, width)
     parts = []
     start = 0
     for c in range(chunks):
@@ -96,7 +93,6 @@ def dspark_samples(
     *,
     world: int,
     vocab_size: int,
-    all_gather: bool = False,
 ) -> jax.Array:
     """Greedy DSpark block tokens for this rank's requests.
 
@@ -116,7 +112,7 @@ def dspark_samples(
     shard = weight_shard.shape[0]
     # [rank, slot, n, K] -> [slot, rank, n, K]: slot-major over every rank.
     every_row = jnp.transpose(
-        _gather_rows(hidden.reshape(slots, n, width), world, all_gather),
+        _gather_rows(hidden.reshape(slots, n, width), world),
         (1, 0, 2, 3),
     ).reshape(slots * world * n, width)
     base = logits_head_slice(every_row, weight_shard, num_tiles=shard // SLICE_TILE)
@@ -139,7 +135,7 @@ def dspark_samples(
         )
         index = jnp.where(index == no_index, no_index, index + me * shard)
         both = jnp.stack([jax.lax.bitcast_convert_type(value, jnp.int32), index])
-        every = _gather_rows(both, world, all_gather)  # [world, 2, tiles, W*n]
+        every = _gather_rows(both, world)  # [world, 2, tiles, W*n]
         prev = reduce_candidates(
             jax.lax.bitcast_convert_type(every[:, 0], jnp.float32).reshape(
                 -1, world * n

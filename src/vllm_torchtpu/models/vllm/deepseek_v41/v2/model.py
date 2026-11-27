@@ -1789,12 +1789,26 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         weight = self.lm_head.weight
         processor = self.logits_processor
         parallel = self._parallel_config
+        group = get_ep_group()
         reasons = [
             reason
             for reason, bad in (
                 ("data parallelism is 1", parallel.data_parallel_size <= 1),
                 ("tensor parallelism is > 1", parallel.tensor_parallel_size != 1),
-                ("there is no expert-parallel group", get_ep_group() is None),
+                ("there is no expert-parallel group", group is None),
+                (
+                    "the EP group is too small for the slices' Markov kernel tile",
+                    group is not None
+                    and not vocab_parallel.VocabParallelHeads.supports_world(
+                        int(group.world_size), weight.shape[0]
+                    ),
+                ),
+                (
+                    "TPU_DEEPSEEK_V41_PALLAS_LOGITS or _DSPARK_PALLAS_LOGITS is off "
+                    "(the sharded heads are the Pallas heads)",
+                    not envs.TPU_DEEPSEEK_V41_PALLAS_LOGITS
+                    or not envs.TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS,
+                ),
                 (
                     "the LM head or its logits are not BF16",
                     weight.dtype != torch.bfloat16

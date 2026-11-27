@@ -7850,6 +7850,8 @@ class TPUModelRunner(GPUModelRunner):
             )
         # Every rank must take the same head each step; a greedy-only batch
         # on one rank cannot use a rank-local fused head while others shard.
+        if self._fused_greedy_head is not None:
+            logger.info("Greedy head: the vocab-parallel head replaces the fused one")
         self._fused_greedy_head = None
 
     def _dp_logits_rows(self, local_rows: int) -> int | None:
