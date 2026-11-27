@@ -116,6 +116,9 @@ def test_window_fits_vmem_and_sort_key():
     assert window(16, HEAD_DIM, 128, 8192, window=152) % 8 == 0
     assert msa_attention_pairs.supports(32, HEAD_DIM, 128, 2048)
     assert not msa_attention_pairs.supports(4096, HEAD_DIM, 128, 2048)
+    # Every page's scale rows stay in VMEM: a large cache takes window room.
+    assert window(16, HEAD_DIM, 128, 2048, num_pages=16384) < msa_attention_pairs.WINDOW
+    assert not msa_attention_pairs.supports(16, HEAD_DIM, 128, 2048, num_pages=48000)
 
 
 def test_pairs_many_blocks_of_mixed_sizes():
