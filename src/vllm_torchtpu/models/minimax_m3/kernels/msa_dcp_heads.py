@@ -1641,6 +1641,8 @@ def _head_parallel_attend(
             v_scale_row=1,
             head_major=True,
             q_head_major=split,
+            # XLA's sorts (`msa_attention_lse._KERNEL_UNIONS_MIN_BLOCK_Q`).
+            kernel_unions=False,
             interpret=interpret,
         )
         if not merge:

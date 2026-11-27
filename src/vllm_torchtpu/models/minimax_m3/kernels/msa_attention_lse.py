@@ -1583,6 +1583,14 @@ def fits_work_row(block_q, topk, pages_per_step) -> bool:
     return block_q * topk == _LANES and groups_per_tile * pages_per_step == _LANES
 
 
+# Decode-row tiles (8 tokens) and the head-parallel calls (`kernel_unions`)
+# keep the XLA sorts: with the unions kernel on c64's head-parallel mixed step,
+# XLA issued the selection's all-to-all after the decode rows' attention and
+# waited on it (30-64 us per layer); without it the c64 twin ran 1.0021x
+# against 0.9999x (j-cd546d86).
+_KERNEL_UNIONS_MIN_BLOCK_Q = 16
+
+
 def _packed_work(
     selected,
     block_q,
@@ -1599,7 +1607,8 @@ def _packed_work(
     x 4 calls x G per layer). Step ``b``'s first group is its
     ``tiles_per_step * b``-th tile's; the last entry is the group count.
     With `num_keys` (page keys are below it), sorted unions come from
-    `msa_attention.kernel_unions` where it fits."""
+    `msa_attention.kernel_unions` where it fits (prefill-size tiles,
+    `_KERNEL_UNIONS_MIN_BLOCK_Q`)."""
     num_calls, num_tokens, topk = selected.shape
     num_tiles = num_tokens // block_q
     work_list = functools.partial(
@@ -1607,7 +1616,9 @@ def _packed_work(
     )
     union_size = block_q * topk
     if msa_attention.dense_unions(num_tiles, union_size) or not (
-        num_keys is not None and msa_attention.fits_kernel_unions(union_size, num_keys)
+        num_keys is not None
+        and block_q >= _KERNEL_UNIONS_MIN_BLOCK_Q
+        and msa_attention.fits_kernel_unions(union_size, num_keys)
     ):
         pages, meta, ends, counts = jax.vmap(work_list)(selected)
     else:  # every call's tiles sorted in one kernel
@@ -1806,6 +1817,7 @@ def _chunked_call(
     scale_rows=None,
     head_major=False,
     q_head_major=False,
+    kernel_unions=True,
 ):
     """`_attention_call` per KV head and chunk of at most
     `MAX_TOKENS_PER_CALL` tokens (the work list lives in SMEM).
@@ -1857,7 +1869,7 @@ def _chunked_call(
         block_q,
         pages_per_step,
         scale_rows is not None,
-        num_keys=page_table.size,
+        num_keys=page_table.size if kernel_unions else None,
         interpret=interpret,
     )
     q = jax.tree.map(lambda x: jnp.pad(x, ((0, 0), (0, pad), (0, 0))), q)
@@ -2162,6 +2174,7 @@ def _check_rows(kv_cache, head_dim, head=None):
         "interpret",
         "head_major",
         "q_head_major",
+        "kernel_unions",
     ),
 )
 def msa_sparse_attention_lse(
@@ -2182,6 +2195,7 @@ def msa_sparse_attention_lse(
     interpret: bool = False,
     head_major: bool = False,
     q_head_major: bool = False,
+    kernel_unions: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
     """`msa_attention.msa_sparse_attention` (kernel v2, page keys translated
     by `page_table`) returning ``(out [T, H, D], lse [T, H] f32)``.
@@ -2193,6 +2207,8 @@ def msa_sparse_attention_lse(
     A 4-bit cache takes its `scale_cache` (`msa_attention.msa_sparse_attention`).
     With `head_major`, the results come back head-major: ``out [H, T, D]``,
     ``lse [H, T]``; with `q_head_major`, q comes head-major, ``[H, T, D]``.
+    `kernel_unions`: work-list unions from `msa_attention.kernel_unions`
+    where it fits (`_KERNEL_UNIONS_MIN_BLOCK_Q`), else the XLA sorts.
     """
     num_tokens, head_dim = selected.shape[0], jax.tree.leaves(q)[0].shape[2]
     msa_attention.check_cache(kv_cache, scale_cache)
@@ -2221,6 +2237,7 @@ def msa_sparse_attention_lse(
         scale_rows=None if scale_cache is None else (k_scale_row, v_scale_row),
         head_major=head_major,
         q_head_major=q_head_major,
+        kernel_unions=kernel_unions,
     )
     if head_major:
         return out[:, :num_tokens], lse[:, :num_tokens]
