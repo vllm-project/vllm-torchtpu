@@ -579,10 +579,22 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     ]
 
 
-def _runner(K: int, block: int, max_seqs: int, budget: int, paddings: list[int]):
+def _runner(
+    K: int,
+    block: int,
+    max_seqs: int,
+    budget: int,
+    paddings: list[int],
+    draft_paddings: list[int] | None = None,
+):
+    drafter = SimpleNamespace(block_size=block)
+    if draft_paddings is not None:
+        # As DFlashProposer: buckets up to one chunk; a longer draft raises.
+        drafter._max_chunk_reqs = lambda: draft_paddings[-1] // block
+        drafter._get_padded_len = lambda n: next(p for p in draft_paddings if p >= n)
     return SimpleNamespace(
         speculative_config=SimpleNamespace(num_speculative_tokens=K),
-        drafter=SimpleNamespace(block_size=block),
+        drafter=drafter,
         scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
         # As in TPUModelRunner.__init__: raised to MIN_NUM_SEQS for padding.
         max_num_reqs=max(max_seqs, tpu_runner.MIN_NUM_SEQS),
@@ -603,6 +615,12 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
     def tok_bucket(n: int) -> int:
         return tpu_runner._get_padded_token_len(pads, n) if n <= pads[-1] else pads[-1]
 
+    def draft_bucket(n: int) -> int:
+        drafter = runner.drafter
+        if not hasattr(drafter, "_get_padded_len"):
+            return tok_bucket(n)
+        return drafter._get_padded_len(min(n, drafter._max_chunk_reqs() * block))
+
     keys = set()
     if runner.max_num_tokens >= R * (1 + K):
         keys.add(
@@ -610,7 +628,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
                 "decode",
                 tpu_runner._get_padded_num_reqs_with_upper_limit(R, max_reqs),
                 tok_bucket(R * (1 + K)),
-                tok_bucket(R * block),
+                draft_bucket(R * block),
             )
         )
     if mixed and max_seqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
@@ -619,7 +637,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
                 "mixed",
                 tpu_runner._get_padded_num_reqs_with_upper_limit(R + 1, max_reqs),
                 tok_bucket(R * (1 + K) + 1),
-                tok_bucket((R + 1) * block),
+                draft_bucket((R + 1) * block),
             )
         )
     return keys
@@ -634,12 +652,26 @@ TIGHT = dict(K=5, block=5, max_seqs=8, budget=32, paddings=[16, 32])
 # The nightly DSpark bs4 engine: max_num_seqs sits below MIN_NUM_SEQS, so the
 # runner's padded request bound (8) is above any count a step can hold.
 DSPARK_BS4 = dict(K=7, block=7, max_seqs=4, budget=256, paddings=[16, 32, 64, 128, 256])
+# DSpark at max_num_seqs 64 with draft buckets 32 apart from 96 (TPU_DRAFT_BUCKET_STEP),
+# finer than the target's token buckets.
+_TOKEN_BUCKETS = [4, 8, 16, 24, 32, 48, 64, 96, 128, 256, 320, 352, 384, 416, 448, 480]
+_TOKEN_BUCKETS += [512, 1024, 2048, 3072, 4096, 7680, 8192]
+DSPARK_FINE = dict(
+    K=7,
+    block=7,
+    max_seqs=64,
+    budget=8192,
+    paddings=_TOKEN_BUCKETS,
+    draft_paddings=sorted(set(_TOKEN_BUCKETS) | set(range(96, 449, 32))),
+)
+# A long max_model_len caps a chunk at 16 requests, below max_num_seqs.
+DSPARK_SHORT_CHUNK = dict(DSPARK_FINE, draft_paddings=[16, 32, 64, 96, 112])
 
 
 @pytest.mark.parametrize(
     "cfg",
-    [FLASH, AGENTX, TIGHT, DSPARK_BS4],
-    ids=["flash", "agentx", "tight", "dspark-bs4"],
+    [FLASH, AGENTX, TIGHT, DSPARK_BS4, DSPARK_FINE, DSPARK_SHORT_CHUNK],
+    ids=["flash", "agentx", "tight", "dspark-bs4", "dspark-fine", "dspark-short-chunk"],
 )
 @pytest.mark.parametrize("mixed", [False, True])
 def test_grid_covers_every_bucket_combination_once(cfg, mixed):
@@ -660,6 +692,13 @@ def test_grid_covers_every_bucket_combination_once(cfg, mixed):
         keys = _step_keys(runner, R, mixed)
         assert keys - seen, f"count {R} adds no new bucket"
         seen |= keys
+
+
+def test_grid_reaches_draft_buckets_finer_than_token_buckets():
+    # 23..27 decoders draft 161..189 rows, all in the 192 draft bucket, while their
+    # target steps share token buckets with 22 or 28 decoders.
+    grid = TPUModelRunner._spec_warmup_bucket_grid(_runner(**DSPARK_FINE), mixed=True)
+    assert any(23 <= R <= 27 for R in grid)
 
 
 @pytest.mark.parametrize("R", [1, 2, 3])
