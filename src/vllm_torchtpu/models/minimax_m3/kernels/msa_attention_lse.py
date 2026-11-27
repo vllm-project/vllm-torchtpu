@@ -1623,11 +1623,10 @@ _WORK_KERNEL_MAX_TILES = 128
 
 def _work_kernel_fits(num_tiles, block_q, topk, pages_per_step, tiles_per_step):
     """Whether `_work_kernel` builds a call's work list: a tile's keys and its
-    union row are one 128-lane row each, and its group and step counts fit."""
-    groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    union row are one 128-lane row each (so `pages_per_step` is a power of
+    two), and its group and step counts fit."""
     return (
-        block_q * topk == _LANES
-        and groups_per_tile * pages_per_step == _LANES
+        fits_work_row(block_q, topk, pages_per_step)
         and num_tiles <= _WORK_KERNEL_MAX_TILES
         and num_tiles // tiles_per_step + 1 <= _LANES
     )
@@ -1742,6 +1741,7 @@ def _call_work(
     x = unions[:num_tiles]
 
     pages_c = jnp.sum(jnp.where(x != no_page, 1, 0), axis=1, keepdims=True)
+    # A ceiling division: `pages_per_step` is a power of two (`_work_kernel_fits`).
     groups_c = jnp.maximum(
         (pages_c + pages_per_step - 1) >> (pages_per_step.bit_length() - 1), 1
     )
