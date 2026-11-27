@@ -328,6 +328,8 @@ def exchange_head_pages(
     direct: bool = False,
     scale_cache: jax.Array | None = None,
     scale_row0: int = 0,
+    group_direct: bool = False,
+    fwd_chunk: int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Inside a ``shard_map`` over `axis`: every rank's pages of the KV head
     this rank (``rank``, ``int32[1]``) owns, ``[replicas, dcp, L / replicas,
@@ -354,9 +356,14 @@ def exchange_head_pages(
     destination's head into rows 0 / 1 of a second output ``[replicas, dcp,
     L / replicas, SCALE_ROWS, lanes]`` (same slots, same live pages; its
     other rows and slots are left unset). Returns ``(pages, scales)``
-    then."""
+    then.
+
+    `group_direct` / `fwd_chunk` (TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE; not
+    with `direct`): see `_coalesced_exchange_kernel`. Same buffer contents in
+    every live slot."""
     _, rows, packing, _ = kv_cache.shape
     with_scales = scale_cache is not None
+    coalesce = (group_direct or fwd_chunk > 0) and not direct and replicas > 1
     num_pages = pages.shape[0]
     part = num_pages // replicas
     # Slots past the live pages stay unset: harmless while no key reaches
@@ -478,10 +485,27 @@ def exchange_head_pages(
         sc_fwd = sc_fwd_sem if with_scales else None
         jax.lax.fori_loop(0, theirs * dcp, page_wait(fwd_sem, sc_fwd), 0)
 
+    if coalesce:
+        kernel = functools.partial(
+            _coalesced_exchange_kernel,
+            axis=axis,
+            dcp=dcp,
+            replicas=replicas,
+            part=part,
+            head_width=head_width,
+            in_flight=in_flight,
+            with_scales=with_scales,
+            scale_row0=scale_row0,
+            group_direct=group_direct,
+            fwd_chunk=min(max(fwd_chunk, 1), part),
+        )
     out_shape = jax.ShapeDtypeStruct(
         (replicas, dcp, part, rows, packing, head_width), kv_cache.dtype
     )
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    # The coalesced kernel's forwarding copies have their own send
+    # semaphores (chunk-sized copies).
+    extra_sems = (2 if with_scales else 1) if coalesce else 0
     if not with_scales:
         return pl.pallas_call(
             kernel,
@@ -490,12 +514,13 @@ def exchange_head_pages(
                 grid=(1,),
                 in_specs=[any_spec],
                 out_specs=any_spec,
-                scratch_shapes=[pltpu.SemaphoreType.DMA(())] * 3,
+                scratch_shapes=[pltpu.SemaphoreType.DMA(())] * (3 + extra_sems),
             ),
             out_shape=out_shape,
             compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
             interpret=pltpu.InterpretParams() if interpret else False,
-            name="minimax_m3_msa_dcp_exchange_head_pages",
+            name="minimax_m3_msa_dcp_exchange_head_pages"
+            + ("_coalesced" if coalesce else ""),
         )(pages, live, rank, kv_cache)
     if scale_cache.dtype != jnp.float32 or scale_cache.shape[1] < scale_row0 + 2 * (
         dcp // replicas
@@ -511,13 +536,187 @@ def exchange_head_pages(
             grid=(1,),
             in_specs=[any_spec, any_spec],
             out_specs=(any_spec, any_spec),
-            scratch_shapes=[pltpu.SemaphoreType.DMA(())] * 6,
+            scratch_shapes=[pltpu.SemaphoreType.DMA(())] * (6 + extra_sems),
         ),
         out_shape=(out_shape, sc_shape),
         compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
         interpret=pltpu.InterpretParams() if interpret else False,
-        name="minimax_m3_msa_dcp_exchange_head_pages_scales",
+        name="minimax_m3_msa_dcp_exchange_head_pages_scales"
+        + ("_coalesced" if coalesce else ""),
     )(pages, live, rank, kv_cache, scale_cache)
+
+
+def _coalesced_exchange_kernel(
+    pages_ref,
+    live_ref,
+    rank_ref,
+    kv_ref,
+    *refs,
+    axis,
+    dcp,
+    replicas,
+    part,
+    head_width,
+    in_flight,
+    with_scales,
+    scale_row0,
+    group_direct,
+    fwd_chunk,
+):
+    """`exchange_head_pages`'s kernel with fewer, larger forwarding copies
+    (TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE).
+
+    `group_direct`: rank ``src`` copies the pages of every part of its own
+    KV head's columns straight to every replica of its own head (the ranks
+    of its replica group: one chip's cores), and part ``j`` of the other
+    heads to replica ``j`` as before. Only the pages from other groups'
+    sources are forwarded, half the forwarding stage at DCP 4.
+
+    `fwd_chunk`: a rank forwards its received part of each source in
+    copies of `fwd_chunk` consecutive slots (``[replica, src, i:i + chunk]``
+    is contiguous), instead of one copy per page. The last chunk of a
+    source is clamped to end at the part's end, so it may re-copy slots of
+    the previous chunk (same bytes) or carry unset slots past the live
+    pages; on the receiver only this rank writes those slots. Same contents
+    in every live slot as the per-page kernel."""
+    if with_scales:
+        sc_ref, out_ref, sc_out_ref = refs[:3]
+        send_sem, recv_sem, fwd_sem, sc_send_sem, sc_recv_sem, sc_fwd_sem = refs[3:9]
+        fwd_send_sem, sc_fwd_send_sem = refs[9:]
+    else:
+        out_ref, send_sem, recv_sem, fwd_sem, fwd_send_sem = refs
+    chunk = fwd_chunk
+    me = rank_ref[0]
+    replica = me % replicas
+    my_head = me // replicas
+    others = dcp - replicas  # sources outside this rank's replica group
+    counts = [live_part(live_ref[0], j, replicas, part) for j in range(replicas)]
+    mine = jnp.where(replica == 0, counts[0], counts[-1])
+    for j in range(1, replicas - 1):
+        mine = jnp.where(replica == j, counts[j], mine)
+
+    def remote(src, dst, send, recv, device):
+        return pltpu.make_async_remote_copy(
+            src,
+            dst,
+            send,
+            recv,
+            device_id={axis: device},
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    barrier = pltpu.get_barrier_semaphore()
+    for d in range(dcp):
+        pl.semaphore_signal(
+            barrier,
+            inc=1,
+            device_id={axis: jnp.int32(d)},
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+    # Every rank has entered the call: its output buffer is live.
+    pl.semaphore_wait(barrier, dcp)
+
+    def pipelined(n, copies):
+        """Start ``copies(i, op)`` for ``i < n``, a bounded number in flight
+        (equal-sized copies per semaphore: any wait retires one)."""
+        ahead = in_flight
+
+        def step(i, carry):
+            copies(i, lambda c: c.start())
+            pl.when(i >= ahead)(lambda: copies(i - ahead, lambda c: c.wait_send()))
+            return carry
+
+        def drain(i, carry):
+            copies(i, lambda c: c.wait_send())
+            return carry
+
+        jax.lax.fori_loop(0, n, step, 0)
+        jax.lax.fori_loop(jnp.maximum(n - ahead, 0), n, drain, 0)
+
+    def sends(i, op):
+        for d in range(dcp):
+            head, jd = divmod(d, replicas)
+            for jj in range(replicas):
+
+                def send(d=d, head=head, jj=jj):
+                    columns = pl.ds(head * head_width, head_width)
+                    page = pages_ref[jj * part + i]
+                    src = kv_ref.at[page, :, :, columns]
+                    op(remote(src, out_ref.at[jj, me, i], send_sem, recv_sem, d))
+                    if with_scales:
+                        kv_rows = pl.ds(scale_row0 + 2 * head, 2)
+                        op(
+                            remote(
+                                sc_ref.at[page, kv_rows],
+                                sc_out_ref.at[jj, me, i, pl.ds(0, 2)],
+                                sc_send_sem,
+                                sc_recv_sem,
+                                d,
+                            )
+                        )
+
+                live = i < counts[jj]
+                if jj != jd:
+                    if not group_direct:
+                        continue
+                    live = live & (head == my_head)
+                pl.when(live)(send)
+
+    def waits(n, sem, sc_sem, slots):
+        def wait(i, carry):
+            buf = out_ref.at[0, 0, pl.ds(0, slots)]
+            pltpu.make_async_copy(buf, buf, sem).wait()
+            if sc_sem is not None:
+                rows = sc_out_ref.at[0, 0, pl.ds(0, slots), pl.ds(0, 2)]
+                pltpu.make_async_copy(rows, rows, sc_sem).wait()
+            return carry
+
+        jax.lax.fori_loop(0, n, wait, 0)
+
+    pipelined(counts[0], sends)
+    # Received: every part from the group's sources (group_direct), this
+    # replica's part from the others.
+    total = sum(counts)
+    group_n = total if group_direct else mine
+    recv_n = replicas * group_n + others * mine
+    waits(recv_n, recv_sem, sc_recv_sem if with_scales else None, 1)
+
+    def forwarded(src):
+        """Whether this rank forwards (and its peers expect) source `src`'s
+        part."""
+        if not group_direct:
+            return None
+        return src // replicas != my_head
+
+    def fwd_chunks(c, op):
+        start = jnp.minimum(c * chunk, part - chunk)
+        for k in range(1, replicas):
+            peer = me - replica + (replica + k) % replicas
+            for src in range(dcp):
+
+                def fwd(src=src, peer=peer):
+                    buf = out_ref.at[replica, src, pl.ds(start, chunk)]
+                    op(remote(buf, buf, fwd_send_sem, fwd_sem, peer))
+                    if with_scales:
+                        rows = sc_out_ref.at[replica, src, pl.ds(start, chunk), pl.ds(0, 2)]
+                        op(remote(rows, rows, sc_fwd_send_sem, sc_fwd_sem, peer))
+
+                cond = forwarded(src)
+                if cond is None:
+                    fwd()
+                else:
+                    pl.when(cond)(fwd)
+
+    nchunks = lambda n: (n + chunk - 1) // chunk
+    pipelined(nchunks(mine), fwd_chunks)
+    fwd_sources = others if group_direct else dcp
+    theirs = sum(nchunks(counts[j]) for j in range(replicas)) - nchunks(mine)
+    waits(
+        theirs * fwd_sources,
+        fwd_sem,
+        sc_fwd_sem if with_scales else None,
+        chunk,
+    )
 
 
 EXCHANGE_ASYNC_ENV = "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC"
@@ -558,6 +757,50 @@ def exchange_scales() -> bool:
             "gather / all-to-all / all-gather)."
         )
     return on
+
+
+EXCHANGE_COALESCE_ENV = "TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE"
+# Default forwarding chunk (slots per copy) of EXCHANGE_COALESCE=1.
+_EXCHANGE_FWD_CHUNK = 32
+_exchange_coalesce_logged = False
+
+
+def exchange_coalesce() -> tuple[bool, int]:
+    """``(group_direct, fwd_chunk)`` from TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE
+    (read at trace time via `envs`): empty / "0" -> off; "1" ->
+    `_EXCHANGE_FWD_CHUNK`-slot forwarding copies; else ':'-separated tokens
+    "g" (group-direct) and "c<slots>" (forwarding chunk). TPU microbench
+    (c48 DCP4, exchange alone, 128K-token context): c32 -8%, group-direct
+    +30% (the sources' extra on-chip copies cost more than the forwarding
+    they remove)."""
+    global _exchange_coalesce_logged
+    from vllm_torchtpu import envs
+
+    spec = envs.TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE.strip()
+    if spec in ("", "0"):
+        return False, 0
+    if spec == "1":
+        group, chunk = False, _EXCHANGE_FWD_CHUNK
+    else:
+        group, chunk = False, 0
+        for tok in filter(None, spec.split(":")):
+            if tok == "g":
+                group = True
+            elif tok.startswith("c") and tok[1:].isdigit():
+                chunk = int(tok[1:])
+            else:
+                raise ValueError(f"{EXCHANGE_COALESCE_ENV}={spec!r}: want 1 or g:c<slots>")
+    if not _exchange_coalesce_logged:
+        _exchange_coalesce_logged = True
+        init_logger(__name__).warning(
+            "%s=%s: MSA DCP page exchange group-direct=%s, forwarding in "
+            "%d-slot copies (synchronous exchange, not with _DIRECT).",
+            EXCHANGE_COALESCE_ENV,
+            spec,
+            group,
+            chunk,
+        )
+    return group, chunk
 
 
 def exchange_direct(replicas: int) -> bool:
@@ -810,6 +1053,13 @@ def _exchange_pages(
             in_flight,
             direct,
         )
+    group_direct, fwd_chunk = exchange_coalesce()
+    # Off -> no extra kwargs: the exchange call is unchanged.
+    coalesce = (
+        dict(group_direct=group_direct, fwd_chunk=fwd_chunk)
+        if group_direct or fwd_chunk
+        else {}
+    )
     if future is not None:
         future, _ = jax.lax.optimization_barrier((future, deps))
         recv = exchange_head_pages_wait(
@@ -842,6 +1092,7 @@ def _exchange_pages(
             direct=direct,
             scale_cache=pages_of,
             scale_row0=row0,
+            **coalesce,
         )
         recv = recv.reshape(num_pages * dcp, rows, packing, head_width)
         return recv, recv_sc.reshape(num_pages * dcp, *recv_sc.shape[3:])
@@ -858,6 +1109,7 @@ def _exchange_pages(
             interpret=interpret,
             in_flight=in_flight,
             direct=direct,
+            **coalesce,
         )
     # Destination rank d = h * replicas + j gets part j of head h.
     scale_cache, row0 = msa_fp4.split_scales(scale_cache)
