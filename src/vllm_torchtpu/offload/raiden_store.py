@@ -1717,10 +1717,18 @@ def resolve_attention_geometry(
     from vllm.v1.kv_cache_interface import AttentionSpec
     from vllm.v1.worker.utils import select_common_block_size
 
+    from vllm_torchtpu.kv_cache_materializer import compresses_rows
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     groups = kv_cache_config.kv_cache_groups
     assert groups, "TPURaidenOffloadingConnector: no KV cache groups"
+    # The geometry below is derived from the full `block_size`, while a
+    # row-compressing spec's page stores block_size // tokens_per_state rows.
+    if any(compresses_rows(g.kv_cache_spec) for g in groups):
+        raise NotImplementedError(
+            "TPURaidenOffloadingConnector does not support attention specs whose "
+            "page stores block_size // tokens_per_state rows"
+        )
 
     if len(groups) == 1:
         spec0 = groups[0].kv_cache_spec

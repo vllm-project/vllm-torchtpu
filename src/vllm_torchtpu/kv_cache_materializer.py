@@ -13,13 +13,14 @@
 # limitations under the License.
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 import torch
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
+    FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
@@ -135,6 +136,37 @@ def format_kv_cache_layout_summary(
     return "\n".join(lines)
 
 
+def compresses_rows(spec: KVCacheSpec) -> bool:
+    """Whether ``spec``'s page stores ``block_size // tokens_per_state`` rows.
+
+    True for a non-MLA full-attention spec with an int ``tokens_per_state``
+    above 1, whatever packs several tokens into one stored row (a KV split
+    over rank pairs, or a compressed cache). MLA specs are left out: their
+    page geometry comes from the MLA backend.
+    """
+    return (
+        isinstance(spec, FullAttentionSpec)
+        and not isinstance(spec, MLAAttentionSpec)
+        and isinstance(spec.tokens_per_state, int)
+        and spec.tokens_per_state > 1
+    )
+
+
+def stored_rows(spec: AttentionSpec) -> int:
+    """Rows a page of ``spec`` stores: ``block_size``, or vLLM's
+    ``spec.num_states`` (``block_size // tokens_per_state``) when
+    :func:`compresses_rows`."""
+    if not compresses_rows(spec):
+        return spec.block_size
+    tokens_per_state = cast(int, spec.tokens_per_state)
+    if spec.block_size % tokens_per_state:
+        raise ValueError(
+            f"block_size {spec.block_size} is not a multiple of "
+            f"tokens_per_state {tokens_per_state}"
+        )
+    return spec.num_states
+
+
 def _pool_attention_geometry(
     kv_cache_config: KVCacheConfig,
     attn_groups: Sequence[Sequence[AttentionGroup]],
@@ -148,17 +180,52 @@ def _pool_attention_geometry(
     )
     if not has_mamba:
         return None
-    for group_list in attn_groups:
-        for group in group_list:
-            spec = group.kv_cache_spec
-            if isinstance(spec, AttentionSpec) and not isinstance(
-                spec, EncoderOnlyAttentionSpec
-            ):
-                kernel_block_size = kernel_block_size_by_gid.get(
-                    group.kv_cache_group_id, spec.block_size
-                )
-                return spec, group.backend, kernel_block_size
-    return None
+    candidates = [
+        group
+        for group_list in attn_groups
+        for group in group_list
+        if isinstance(group.kv_cache_spec, AttentionSpec)
+        and not isinstance(group.kv_cache_spec, EncoderOnlyAttentionSpec)
+    ]
+    if not candidates:
+        return None
+
+    geometry_group = candidates[0]
+    spec = cast(AttentionSpec, geometry_group.kv_cache_spec)
+    kernel_block_size = kernel_block_size_by_gid.get(
+        geometry_group.kv_cache_group_id, spec.block_size
+    )
+    if compresses_rows(spec):
+        # Describe the page by a one-row-per-token full-attention group if
+        # there is one (for example an unsplit draft group), else by the
+        # spec's stored rows.
+        unsplit = next(
+            (
+                g
+                for g in candidates
+                if isinstance(g.kv_cache_spec, FullAttentionSpec)
+                and not isinstance(g.kv_cache_spec, MLAAttentionSpec)
+                and g.kv_cache_spec.tokens_per_state == 1
+            ),
+            None,
+        )
+        if unsplit is not None:
+            geometry_group = unsplit
+            spec = cast(AttentionSpec, unsplit.kv_cache_spec)
+            kernel_block_size = kernel_block_size_by_gid.get(
+                unsplit.kv_cache_group_id, spec.block_size
+            )
+        else:
+            # The runner's kernel block size counts tokens; the page stores
+            # one row per `tokens_per_state` tokens of a block.
+            tokens_per_state = cast(int, spec.tokens_per_state)
+            assert kernel_block_size % tokens_per_state == 0, (
+                kernel_block_size,
+                tokens_per_state,
+            )
+            kernel_block_size = spec.get_num_kernel_states(kernel_block_size)
+            spec = replace(spec, block_size=stored_rows(spec), tokens_per_state=1)
+    return spec, geometry_group.backend, kernel_block_size
 
 
 def layer_to_pool_index(kv_cache_config: KVCacheConfig) -> dict[str, int]:
@@ -214,11 +281,20 @@ def resolve_block_major_pool_layout(
     pool registration so that the scheduler process (which never allocates
     device memory) and worker processes agree on exact pool geometry.
     """
-    spec = next(
+    attention_specs = [
         group.kv_cache_spec
         for group in kv_cache_config.kv_cache_groups
         if isinstance(group.kv_cache_spec, AttentionSpec)
-    )
+    ]
+    # This layout is derived from the first attention spec's block size, while
+    # a pool with a row-compressing spec is allocated from its stored rows
+    # (_pool_attention_geometry); the two would disagree on `split`.
+    if any(compresses_rows(s) for s in attention_specs):
+        raise NotImplementedError(
+            "the block-major pool does not support attention specs whose page "
+            "stores block_size // tokens_per_state rows"
+        )
+    spec = attention_specs[0]
     assert spec.block_size % kernel_block_size == 0, (
         spec.block_size,
         kernel_block_size,
