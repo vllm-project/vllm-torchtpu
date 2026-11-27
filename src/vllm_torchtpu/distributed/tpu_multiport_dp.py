@@ -151,19 +151,20 @@ def prepare_multiport_dp_env(vllm_config) -> bool:
         return False
     parallel_config = vllm_config.parallel_config
 
+    from vllm_torchtpu.distributed.tpu_mp_multihost import (
+        _rendezvous_port,
+        dp_master_port_list,
+    )
+
     # Every child picks its own random DP-init ports in ParallelConfig; the
-    # engines' DP group would never form. Same fix and same ports as
-    # prepare_mp_multihost_dp_env.
+    # engines' DP group would never form. Same fix as
+    # prepare_mp_multihost_dp_env, through the same helper.
     rpc_port = parallel_config.data_parallel_rpc_port
-    parallel_config._data_parallel_master_port_list = [
-        rpc_port + 100 + i for i in range(5)
-    ]
+    parallel_config._data_parallel_master_port_list = dp_master_port_list(rpc_port)
 
     # torch_tpu's slice rendezvous (tpu_worker.py exports it as MASTER_PORT).
     # The port the multi-host DP TCPStore rendezvous would use: free here,
     # because this path never runs that rendezvous.
-    from vllm_torchtpu.distributed.tpu_mp_multihost import _rendezvous_port
-
     os.environ.setdefault("TORCH_TPU_DP_MASTER_PORT", str(_rendezvous_port(rpc_port)))
 
     # One address per device of the N*TP slice, the same in every child.

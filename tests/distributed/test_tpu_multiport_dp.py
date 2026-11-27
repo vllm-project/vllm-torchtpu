@@ -133,6 +133,25 @@ def test_children_derive_one_shared_bootstrap(monkeypatch):
     assert ports == (29650, 29651, 29652, 29653, 29654)
 
 
+def test_dp_group_ports_come_from_the_multi_host_dp_helper(monkeypatch):
+    """vLLM's DP group ports come from tpu_mp_multihost.dp_master_port_list,
+    the helper prepare_mp_multihost_dp_env calls (tested there), so the two
+    bootstraps cannot drift apart."""
+    from vllm_torchtpu.distributed import tpu_mp_multihost
+
+    calls = []
+
+    def ports(rpc_port):
+        calls.append(rpc_port)
+        return [rpc_port, -1]
+
+    monkeypatch.setattr(tpu_mp_multihost, "dp_master_port_list", ports)
+    pc = _child_config(1)
+    assert mpdp.prepare_multiport_dp_env(_vllm_config(pc, ON)) is True
+    assert calls == [29550]
+    assert pc._data_parallel_master_port_list == [29550, -1]
+
+
 def test_bootstrap_honours_overrides(monkeypatch):
     monkeypatch.setenv("TORCH_TPU_BASE_PORT", "9000")
     monkeypatch.setenv("TORCH_TPU_MP_RENDEZVOUS_PORT", "9500")

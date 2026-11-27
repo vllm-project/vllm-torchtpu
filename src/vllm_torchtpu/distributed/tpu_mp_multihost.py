@@ -200,6 +200,15 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     )
 
 
+def dp_master_port_list(data_parallel_rpc_port: int) -> list[int]:
+    """vLLM's DP group ports (``ParallelConfig._data_parallel_master_port_list``)
+    computed from ``--data-parallel-rpc-port`` alone: ``rpc_port + 100`` to
+    ``rpc_port + 104``. Every process that builds its own ParallelConfig from
+    the same arguments gets the same five ports. A new list on every call:
+    vLLM pops ports off it."""
+    return [data_parallel_rpc_port + 100 + i for i in range(5)]
+
+
 def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     """Set TORCH_TPU_* env vars for genuine multi-host DP without Ray.
 
@@ -235,10 +244,9 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     # Work around it by overwriting the list with ports computed identically
     # on every host from data_parallel_rpc_port (already CLI-identical), so
     # every host agrees without needing coordination of its own.
-    dp_rpc_port = parallel_config.data_parallel_rpc_port
-    parallel_config._data_parallel_master_port_list = [
-        dp_rpc_port + 100 + i for i in range(5)
-    ]
+    parallel_config._data_parallel_master_port_list = dp_master_port_list(
+        parallel_config.data_parallel_rpc_port
+    )
 
     if os.environ.get(_DP_DONE_SENTINEL) == str(dp_size):
         return True
