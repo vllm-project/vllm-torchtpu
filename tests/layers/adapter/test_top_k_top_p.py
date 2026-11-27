@@ -180,3 +180,10 @@ def test_rejection_sampler_topk_candidates_cpu_parity():
     expected = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_candidates=0)
     result = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_candidates=64)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_gumbel_noise_from_uniform_stays_finite_at_endpoints():
+    u = torch.tensor([0.0, 0.5, 1.0], dtype=torch.float32)
+    g = sampling.gumbel_noise_from_uniform(u)
+    assert torch.isfinite(g).all()
+    assert float(g[0]) < float(g[1]) < float(g[2])

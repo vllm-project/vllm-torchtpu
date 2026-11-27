@@ -366,6 +366,7 @@ def _make_sample_runner(
         ),
         _routed_experts=None,
         _greedy_head_owner=object() if top_tokens else None,
+        _distributed_sampling_owner=None,
         speculative_config=spec_cfg,
         rejection_sampler=(
             None
@@ -408,6 +409,7 @@ def _make_sample_runner(
         TPUModelRunner._settle_draft_placeholders_for_min_tokens,
         TPUModelRunner._num_output_tokens,
         TPUModelRunner._greedy_top_tokens_this_step,
+        TPUModelRunner._distributed_sampling_step_eligible,
         TPUModelRunner._apply_temperature,
         TPUModelRunner._sampler_applies_topk_topp,
         TPUModelRunner._modify_prev_results,

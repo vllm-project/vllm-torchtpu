@@ -155,3 +155,34 @@ The in-graph `cos`/`sin` are not bit-identical to the table, and K is rotated be
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
+
+---
+
+## 7. Sampling & Logits
+
+### Vocab-parallel sampling
+
+`--additional-config '{"tpu_vocab_parallel_sampling": "<mode>"}'` selects
+vocabulary-parallel LM-head sampling (off by default, `"off"`):
+
+- `"greedy"` enables vocabulary-parallel argmax on all-greedy steps without
+  logprobs, structured outputs, `min_tokens`, or `repetition_penalty`.
+- `"all"` enables both `"greedy"` and non-greedy sampling directly from each TP
+  rank's LM head shard (`layers/adapter/sample/distributed_sampling.py`),
+  avoiding the `[batch, vocab]` logit `all-gather` and full-vocabulary uniform
+  RNG draw on eligible chunks:
+  - `1 <= top_k <= 100` (with or without `top_p`): each rank extracts its top
+    128 candidates via a two-stage block-max filter + `torch.topk`, matching
+    full-vocabulary `apply_top_k_top_p` unless more than `128 - top_k + 1`
+    tokens tie at the `top_k`-th logit on one shard.
+  - Pure temperature (`top_k` unset, `top_p = 1.0`): exact two-level Gumbel-max
+    per shard plus cross-shard logsumexp sampling.
+  - Mixed chunks combining `top_k` (`1 <= top_k <= 100`), pure-temperature, and
+    greedy rows run both paths and select per row.
+
+Chunks with `top_p` without `top_k` or `top_k > 100`, and steps with logprobs,
+structured outputs, `min_tokens`, `repetition_penalty`, or
+`thinking_token_budget` fall back to full logits. Ineligible model/parallelism
+configs (`TP == 1`, speculative decoding, LoRA LM heads,
+`TPU_DP_VOCAB_PARALLEL`, EP lockstep, added vocab, or custom `compute_logits`)
+log one warning at load and fall back to full logits.
