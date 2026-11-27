@@ -33,9 +33,13 @@ reduce-scatter: 3/4, a third of it over two hops). Chunks are pipelined:
 chunk t's pair stage, chunk t-1's second hop and chunk t-2's sum per step.
 The input and the partner's partials stay in HBM; the hops land in VMEM.
 
-`wire` is how the sums cross chips: "bf16", or "int8" with one f32 scale
-per row and 128 columns (amax / 127), which halves the cross-chip bytes.
-Either way the bits differ from an f32 sum of the 8 partials.
+Partial sums are added in f32 and kept in bf16 between the steps (the own
+block's running sum, the kept far halves). `wire` is how the sums cross
+chips: "bf16", or "int8" with one f32 scale per row and 128 columns
+(amax / 127), which halves the cross-chip bytes. Either way the bits differ
+from an f32 sum of the 8 partials. A rank's whole block is held in VMEM, so
+blocks past the budget (about 600 rows of 6144 on the bf16 wire, 900 on
+int8) are not taken.
 """
 
 import functools
@@ -56,9 +60,9 @@ _LANES = 128
 _INT8_MAX = 127.0
 # int8 sublane tiling (bf16 needs 16 rows).
 _TILE_ROWS = 32
-# Rows per pipelined chunk by default (64 where 32 leaves VMEM short).
+# Rows per pipelined chunk (more costs VMEM and measured no faster).
 CHUNK_ROWS = _TILE_ROWS
-# VMEM a call may plan (its buffers and the own block's f32 chip sum), below
+# VMEM a call may plan (its buffers and the whole block's sums), below
 # tpu7x's 64 MiB per TensorCore with room for Mosaic's own.
 _VMEM_BUDGET = 48 << 20
 # Columns of `topology_table`: the die-to-die partner, then the four devices
@@ -140,9 +144,7 @@ def _vmem_bytes(block: int, hidden: int, chunk: int, wire: str) -> int:
     )
 
 
-def supported(
-    rows: int, hidden: int, n: int, chunk: int = CHUNK_ROWS, wire: str = "int8"
-) -> bool:
+def supported(rows: int, hidden: int, n: int, chunk: int, wire: str) -> bool:
     """Whether bf16 [rows, hidden] over n ranks fits the kernel: 8 ranks,
     every rank's block whole chunks of whole 32-row tiles, column halves of
     whole lane tiles (at most 128 per half: their int8 scales share a lane
@@ -160,12 +162,9 @@ def supported(
     )
 
 
-def chunk_rows(rows: int, hidden: int, n: int, wire: str = "int8") -> int | None:
+def chunk_rows(rows: int, hidden: int, n: int, wire: str) -> int | None:
     """The pipelined chunk the kernel takes for this shape, else None."""
-    for chunk in (CHUNK_ROWS, 2 * CHUNK_ROWS):
-        if supported(rows, hidden, n, chunk, wire):
-            return chunk
-    return None
+    return CHUNK_ROWS if supported(rows, hidden, n, CHUNK_ROWS, wire) else None
 
 
 @functools.cache
@@ -427,8 +426,8 @@ def reduce_scatter(
     x: jax.Array,
     rank: jax.Array,
     table,
-    chunk: int = CHUNK_ROWS,
-    wire: str = "int8",
+    chunk: int,
+    wire: str,
     interpret=False,
 ) -> jax.Array:
     """Reduce-scatter of bf16 x [rows, hidden] (`supported`) over the 8 ranks

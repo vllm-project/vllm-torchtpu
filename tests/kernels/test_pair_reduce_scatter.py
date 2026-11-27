@@ -55,15 +55,17 @@ def test_topology_table_refuses_other_shapes():
         pair_reduce_scatter.topology_table(range(4))
 
 
-def test_chunk_rows():
-    assert pair_reduce_scatter.chunk_rows(8 * 512, 6144, 8) == 32
-    assert pair_reduce_scatter.chunk_rows(8 * 480, 6144, 8) == 32
-    assert pair_reduce_scatter.chunk_rows(8 * 48, 6144, 8) is None
-    assert pair_reduce_scatter.chunk_rows(8 * 512, 6144, 4) is None
+@pytest.mark.parametrize("wire", WIRES)
+def test_chunk_rows(wire):
+    rows = pair_reduce_scatter.chunk_rows
+    assert rows(8 * 512, 6144, 8, wire) == 32
+    assert rows(8 * 480, 6144, 8, wire) == 32
+    assert rows(8 * 48, 6144, 8, wire) is None
+    assert rows(8 * 512, 6144, 4, wire) is None
     # Columns must split into halves of whole lane tiles.
-    assert pair_reduce_scatter.chunk_rows(8 * 512, 6016, 8) is None
-    # Past the VMEM budget (the own block's sums grow with the block).
-    assert pair_reduce_scatter.chunk_rows(8 * 2048, 6144, 8) is None
+    assert rows(8 * 512, 6016, 8, wire) is None
+    # Past the VMEM budget (the block's sums grow with the block).
+    assert rows(8 * 2048, 6144, 8, wire) is None
 
 
 def _worker():
