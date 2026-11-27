@@ -289,8 +289,9 @@ class PrefixAwareAdmission(Scheduler):
             fresh = self._memo_compute(request, epoch, max_len)
             if _hit_signature(fresh[2]) != _hit_signature(cached[2]):
                 logger.error(
-                    "PrefixAwareScheduler: cross-step memo mismatch for %s "
+                    "%s: cross-step memo mismatch for %s "
                     "(memo=%s fresh=%s); disabling the cross-step memo.",
+                    type(self).__name__,
                     getattr(request, "request_id", "?"),
                     _hit_signature(cached[2])[:2],
                     _hit_signature(fresh[2])[:2],
@@ -378,7 +379,8 @@ class PrefixAwareAdmission(Scheduler):
             if not self._paw_scoring_broken:
                 self._paw_scoring_broken = True
                 logger.exception(
-                    "PrefixAwareScheduler: warmth scoring failed; falling back to FCFS."
+                    "%s: warmth scoring failed; falling back to FCFS.",
+                    type(self).__name__,
                 )
             return 0, None
 
@@ -444,7 +446,7 @@ class PrefixAwareAdmission(Scheduler):
             pack_new_request_prompt_ids(out, self._pack_ids_min)
         except Exception:
             logger.exception(
-                "PrefixAwareScheduler: prompt-id packing failed; disabling it."
+                "%s: prompt-id packing failed; disabling it.", type(self).__name__
             )
             self._pack_ids = False
 

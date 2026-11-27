@@ -313,8 +313,9 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
     # priced quadratically under the option quadratic_cost, minus the aging
     # rate x seconds waited, which bounds how long a large prompt can be
     # overtaken. Requests that already hold computed tokens or were
-    # preempted go first, and requests whose uncached tokens do not fit the
-    # free HBM blocks go last, so they cannot stall the head.
+    # preempted go first, and requests whose admission takes more blocks
+    # than are free (``_blocks_to_admit``) go last, so they cannot stall the
+    # head.
     # ------------------------------------------------------------------
     _PAW_SORT_LOG_INTERVAL_S = 60.0
     _PAW_SORT_WINDOW = 128
@@ -462,9 +463,10 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         ]
 
     def _free_blocks_for_fit(self, head: Any) -> int | None:
-        """The free HBM blocks when the uncached tokens of ``head`` (the
-        queue's head) do not fit them, else None: the input of the fit tier
-        of ``_rank_and_warmth`` in the promotion (``_rank_window``)."""
+        """The free HBM blocks when admitting ``head`` (the queue's head)
+        takes more of them than are free (``_blocks_to_admit``), else None:
+        the input of the fit tier of ``_rank_and_warmth`` in the promotion
+        (``_rank_window``)."""
         if self._is_kv_consumer:
             return None
         free_blocks = self._get_num_free_blocks()

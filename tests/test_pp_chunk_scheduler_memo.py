@@ -14,8 +14,8 @@
 """The pipeline chunk scheduler's prefix-hit memo on a real hybrid KV cache.
 
 The scheduler is built over a real vLLM KVCacheManager (full attention and two
-Mamba "align" groups, prefix caching on) as a Qwen3.5 MoE KV producer, so
-hybrid-state retention and the cross-step memo work on the same BlockPool.
+Mamba "align" groups, prefix caching on) as a KV producer, so hybrid-state
+retention and the cross-step memo work on the same BlockPool.
 Every test starts from vLLM's own BlockPool and KVCacheManager methods with
 the patches an engine process applies at start (main's same-step patch, then
 the registry's prefix-cache epoch and change log), and restores the classes
@@ -149,9 +149,8 @@ def _scheduler(
     kvm: KVCacheManager, options: dict, retention: bool = True
 ) -> TpuPipelineChunkScheduler:
     """Runs TpuPipelineChunkScheduler.__init__ over a stub base __init__ on a
-    Qwen3.5 MoE KV producer with ``kvm`` as its KV cache manager and, with
-    ``retention``, hybrid-state retention on (as the Qwen3.5 config hook sets
-    it)."""
+    KV producer with ``kvm`` as its KV cache manager and, with ``retention``,
+    hybrid-state retention on (as the Qwen3.5 config hook sets it)."""
     section = {"hybrid_state_retention": True, **options} if retention else options
 
     def base_init(self, *args, **kwargs):
@@ -161,9 +160,6 @@ def _scheduler(
                 kv_role="kv_producer", is_kv_producer=True, is_kv_consumer=False
             ),
             parallel_config=SimpleNamespace(pipeline_parallel_size=8),
-            model_config=SimpleNamespace(
-                architectures=["Qwen3_5MoeForConditionalGeneration"]
-            ),
         )
         self.need_mamba_block_aligned_split = True
         self.kv_cache_manager = kvm

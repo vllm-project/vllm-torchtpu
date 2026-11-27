@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import pathlib
 from types import SimpleNamespace
@@ -123,7 +124,14 @@ def _vllm_config(
             enable_expert_parallel=ep,
         ),
         kv_transfer_config=(
-            None if kv_role is None else SimpleNamespace(kv_role=kv_role)
+            None
+            if kv_role is None
+            else SimpleNamespace(
+                kv_role=kv_role,
+                # vLLM's role properties: kv_both is both.
+                is_kv_producer=kv_role in ("kv_producer", "kv_both"),
+                is_kv_consumer=kv_role in ("kv_consumer", "kv_both"),
+            )
         ),
         load_config=SimpleNamespace(load_format="auto"),
         additional_config={} if additional is None else additional,
@@ -382,7 +390,7 @@ def test_a_pp4_prefill_leg_of_another_checkpoint_keeps_no_snapshots():
 
 
 def test_other_device_keeps_no_hybrid_state_snapshots(monkeypatch):
-    monkeypatch.setattr(hooks, "_chip_family", lambda: "6e")
+    monkeypatch.setattr(hooks, "_chip_family", lambda: "v6e")
     assert _retention(_run_hook(_measured_prefill_leg())) is None
 
 
@@ -522,7 +530,8 @@ def _flag(args: list[str], name: str, default: str | None) -> str | None:
 
 
 def _leg_config(leg: dict) -> SimpleNamespace:
-    """The hook's view of one validation-entry leg, from its serve arguments."""
+    """The hook's view of one validation-entry leg, from its serve arguments
+    and its additional_config."""
     args = leg["serve_args"]
     transfer = _flag(args, "--kv-transfer-config", None)
     explicit = _flag(args, "--kv-cache-memory-bytes", None)
@@ -536,6 +545,7 @@ def _leg_config(leg: dict) -> SimpleNamespace:
         pp=int(_flag(args, "--pipeline-parallel-size", "1")),
         ep="--enable-expert-parallel" in args,
         max_num_seqs=int(_flag(args, "--max-num-seqs", None)),
+        additional=copy.deepcopy(leg.get("additional_config", {})),
     )
 
 
@@ -551,11 +561,13 @@ def test_validation_points_keep_their_defaults(path):
     decode = _run_hook(_leg_config(legs["decode"]))
     assert prefill.kv_transfer_config.kv_role == "kv_producer"
     assert prefill.cache_config.prefix_match_unit == 128
-    # The prefill legs keep hybrid-state snapshots, as they ran; the decode
-    # legs do not.
+    # The prefill legs keep hybrid-state snapshots, as they ran, next to the
+    # options their section sets; the decode legs' sections are unchanged.
     assert prefill.additional_config["tpu_pp_scheduler"] == {
-        "hybrid_state_retention": True
+        **legs["prefill"].get("additional_config", {}).get("tpu_pp_scheduler", {}),
+        "hybrid_state_retention": True,
     }
+    assert decode.additional_config == legs["decode"].get("additional_config", {})
     assert "tpu_pp_scheduler" not in decode.additional_config
     assert prefill.cache_config.kv_cache_memory_bytes is None
     assert decode.kv_transfer_config.kv_role == "kv_consumer"

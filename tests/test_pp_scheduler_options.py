@@ -185,19 +185,26 @@ def test_get_applies_the_section_checks():
         pp_scheduler_options.get(cfg)
 
 
-@pytest.mark.parametrize("module", [pp_scheduler_options, scheduler_options])
-def test_the_sections_parse_with_the_shared_parser(module):
+@pytest.mark.parametrize(
+    "module, options_cls",
+    [
+        (pp_scheduler_options, pp_scheduler_options.PPSchedulerOptions),
+        (scheduler_options, scheduler_options.SchedulerOptions),
+    ],
+)
+def test_the_sections_parse_with_the_shared_parser(module, options_cls):
     """Both scheduler sections go through ``config_section.parse``, the one
-    strict section parser, instead of a copy of it."""
+    strict section parser, instead of a copy of it, each with its own
+    options class."""
     calls = []
 
-    def shared(options_cls, section, raw):
-        calls.append((options_cls, section, raw))
-        return options_cls()
+    def shared(cls, section, raw):
+        calls.append((cls, section, raw))
+        return cls()
 
     with patch.object(config_section, "parse", shared):
         module.parse({"x": 1})
-    assert calls == [(calls[0][0], module.SECTION, {"x": 1})]
+    assert calls == [(options_cls, module.SECTION, {"x": 1})]
 
 
 def test_section_is_registered_and_kept_out_of_the_compile_cache_key():

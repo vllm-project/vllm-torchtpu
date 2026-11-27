@@ -45,6 +45,7 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm.model_executor.models.config import Qwen3_5ForConditionalGenerationConfig
 
 from vllm_torchtpu import additional_config_sections, tpu_info
+from vllm_torchtpu.core.scheduler_utils import kv_roles
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.qwen3_5 import settings
 
@@ -114,8 +115,7 @@ def _apply_hybrid_state_retention(vllm_config: VllmConfig, calibrated: bool) -> 
     # Only the measured prefill legs: a kv_producer pipeline without context
     # parallelism that gets the pipeline chunk scheduler, which keeps the
     # snapshots. Every other engine keeps the option's default, false.
-    kv_cfg = vllm_config.kv_transfer_config
-    if kv_cfg is None or kv_cfg.kv_role != "kv_producer" or not calibrated:
+    if not kv_roles(vllm_config.kv_transfer_config).producer or not calibrated:
         return
     parallel_config = vllm_config.parallel_config
     if (
