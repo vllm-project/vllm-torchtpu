@@ -25,6 +25,7 @@ import pytest
 from vllm.config import VllmConfig
 
 from vllm_torchtpu import _patch_vllm_config_hash_ignore_diagnostics
+from vllm_torchtpu.compilation import compile_options
 from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
@@ -141,6 +142,16 @@ def test_non_diagnostic_keys_still_change_the_hash(patched_compute_hash):
             }
         )
     )
+
+
+def test_tpu_compile_section_changes_the_hash(patched_compute_hash):
+    """``tpu_compile`` is not one of the diagnostics-only keys the patch
+    carves out, so turning one of its options on changes the compile-cache
+    key, as any other section does."""
+    assert compile_options.SECTION not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
+    assert patched_compute_hash(
+        _StubVllmConfig({compile_options.SECTION: {"fast_compiled_call": True}})
+    ) != patched_compute_hash(_StubVllmConfig({}))
 
 
 def test_untouched_configs_keep_their_upstream_hash(patched_compute_hash):
