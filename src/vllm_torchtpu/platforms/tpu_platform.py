@@ -376,6 +376,14 @@ def _num_tokens_across_dp_on_device(
     return torch.tensor(sizes, dtype=dtype).to("tpu")
 
 
+def uniform_num_tokens_across_dp(like: torch.Tensor, num_tokens: int) -> torch.Tensor:
+    """``torch.full_like(like, num_tokens)``; on TPU the cached upload, so a
+    stage's DP metadata costs no device program per step."""
+    if like.device.type != "tpu":
+        return torch.full_like(like, num_tokens)
+    return _num_tokens_across_dp_on_device((num_tokens,) * like.numel(), like.dtype)
+
+
 class TpuPlatform(Platform):
     # Registered via the `vllm.platform_plugins` entry point in pyproject.toml.
     _enum = PlatformEnum.OOT

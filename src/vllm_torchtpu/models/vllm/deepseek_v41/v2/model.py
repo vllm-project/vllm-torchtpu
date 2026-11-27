@@ -28,6 +28,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op im
 from vllm_torchtpu.layers.adapter.fused_moe_ep import mark_split_exchange_moe
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.platforms.tpu_platform import uniform_num_tokens_across_dp
 from vllm_torchtpu.utils import synchronize_tensors
 
 from ..common.mhc import (
@@ -1176,7 +1177,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             dp_metadata=(
                 replace(
                     context.dp_metadata,
-                    num_tokens_across_dp_cpu=torch.full_like(
+                    num_tokens_across_dp_cpu=uniform_num_tokens_across_dp(
                         context.dp_metadata.num_tokens_across_dp_cpu,
                         decoder_positions.shape[0],
                     ),
