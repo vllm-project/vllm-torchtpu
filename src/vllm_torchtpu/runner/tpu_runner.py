@@ -591,6 +591,9 @@ class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
+    # The language model whose vocab-parallel heads compute the target's
+    # logits, set after load (`_init_vocab_parallel_logits`).
+    _vocab_parallel_model: torch.nn.Module | None = None
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -4212,7 +4215,7 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         )
                     else:
-                        logits = self.compute_selected_logits(
+                        logits = self._compute_target_logits(
                             hidden_states, logits_indices
                         )
                 else:
@@ -4225,9 +4228,7 @@ class TPUModelRunner(GPUModelRunner):
                             self.compute_greedy_ids(sample_hidden_states)
                         )
                     else:
-                        logits = self.compute_logits_from_hidden_states(
-                            sample_hidden_states
-                        )
+                        logits = self._compute_target_logits(sample_hidden_states)
 
             logits_list.append(logits)
             num_reqs_list.append(num_reqs)
@@ -5265,6 +5266,7 @@ class TPUModelRunner(GPUModelRunner):
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
         self._init_fused_greedy_head()
+        self._init_vocab_parallel_logits()
         if self._is_deepseek_v41:
             depth = getattr(model, "token_lookback_depth", 0)
             self.lookback_token_ids = (
@@ -5605,9 +5607,15 @@ class TPUModelRunner(GPUModelRunner):
                 self._pp_wave.end_forward(None, num_tokens)
             if dp_lockstep:
                 # Idle DP engines must issue the same TP logits collective as
-                # busy engines before the next DP synchronization.
-                _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
-                _ = self.compute_selected_logits(out, _idx)
+                # busy engines before the next DP synchronization; with the
+                # vocab-parallel head, at the busy ranks' row count.
+                dp_rows = self._dp_logits_rows(0)
+                if dp_rows is None:
+                    _idx = torch.zeros(num_reqs, dtype=torch.int32, device=out.device)
+                    _ = self.compute_selected_logits(out, _idx)
+                else:
+                    _idx = torch.zeros(dp_rows, dtype=torch.int32, device=out.device)
+                    _ = self.compute_logits_vocab_parallel(out, _idx, dp_rows)
             if not dp_lockstep:
                 synchronize_tensors(out)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
@@ -6065,6 +6073,59 @@ class TPUModelRunner(GPUModelRunner):
                     )
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
+        if self._vocab_parallel_model is not None:
+            self._precompile_compute_logits_vocab_parallel()
+
+    def _precompile_compute_logits_vocab_parallel(self) -> None:
+        """Every (hidden bucket, local rows, DP-wide rows) the vocab-parallel
+        head can see. Each call runs the head's collectives, so every rank
+        runs this same sequence."""
+        assert self._vocab_parallel_model is not None
+        heads = self._vocab_parallel_model.vocab_parallel_heads
+        hsize = self.model_config.get_hidden_size()
+        dp_rows_ladder = [
+            r for r in self.num_tokens_paddings if heads.supports_target_rows(r)
+        ]
+        # Local rows: padded request counts (non-spec) or logits counts (spec).
+        local_ladder = sorted({*self.num_reqs_paddings, *self.num_tokens_paddings})
+        with self._precompile_timed("compute_logits_vocab_parallel"):
+            for num_tokens in self.num_tokens_paddings:
+                dummy_hidden = torch.zeros(
+                    (num_tokens, hsize), dtype=self._hidden_states_dtype
+                ).to(self.device)
+                for dp_rows in dp_rows_ladder:
+                    for rows in local_ladder:
+                        # An idle rank's replay selects dp_rows rows of any
+                        # bucket; a busy rank's rows fit its bucket.
+                        if rows > dp_rows or (rows > num_tokens and rows != dp_rows):
+                            continue
+                        indices = torch.zeros(rows, dtype=torch.int32).to(self.device)
+                        out = self.compute_logits_vocab_parallel(
+                            dummy_hidden, indices, dp_rows
+                        )
+                        synchronize_tensors(out)
+                        logger.info(
+                            "  -- num_tokens: %d, rows: %d, DP-wide rows: %d",
+                            num_tokens,
+                            rows,
+                            dp_rows,
+                        )
+            if not _get_sequence_layout_planner_for_runner(
+                self
+            ).uses_selected_logits_hidden_states:
+                return
+            # Rows the layout planner selected inside the model.
+            for dp_rows in dp_rows_ladder:
+                for rows in local_ladder:
+                    if rows > dp_rows:
+                        continue
+                    dummy_hidden = torch.zeros(
+                        (rows, hsize), dtype=self._hidden_states_dtype
+                    ).to(self.device)
+                    out = self.compute_logits_vocab_parallel(
+                        dummy_hidden, None, dp_rows
+                    )
+                    synchronize_tensors(out)
 
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
@@ -7769,6 +7830,90 @@ class TPUModelRunner(GPUModelRunner):
     def compute_greedy_ids(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self._fused_greedy_head is not None
         return self._fused_greedy_head(hidden_states)
+
+    def _init_vocab_parallel_logits(self) -> None:
+        # A multimodal wrapper computes logits with its language model's head.
+        model = (
+            self.model.get_language_model()
+            if supports_multimodal(self.model)
+            else self.model
+        )
+        self._vocab_parallel_model = (
+            model if getattr(model, "vocab_parallel_heads", None) is not None else None
+        )
+        if self._vocab_parallel_model is None:
+            return
+        if not self._dp_lockstep_enabled():
+            raise ValueError(
+                "Vocab-parallel heads need EP-DP lockstep (DP > 1 with expert "
+                "parallelism): every rank must run the head's collectives"
+            )
+        # Every rank must take the same head each step; a greedy-only batch
+        # on one rank cannot use a rank-local fused head while others shard.
+        self._fused_greedy_head = None
+
+    def _dp_logits_rows(self, local_rows: int) -> int | None:
+        """Rows every lockstep rank's vocab-parallel target head runs this
+        step, or None for the replicated head.
+
+        Bounded by the step's DP-wide max per-chunk request count: times the
+        rows a request samples (a spec-decode logits count), or padded like a
+        request count (a non-spec step's logits rows), whichever is larger,
+        then padded like a logits count; that covers every rank's rows."""
+        if self._vocab_parallel_model is None:
+            return None
+        spec = self.speculative_config
+        per_req = 1 + (spec.num_speculative_tokens if spec is not None else 0)
+        max_reqs = max(1, self._dp_step_max_reqs)
+        bound = max(
+            max_reqs * per_req,
+            _get_padded_num_reqs_with_upper_limit(max_reqs, self.max_num_reqs),
+        )
+        if bound > self.num_tokens_paddings[-1]:
+            return None
+        rows = _get_padded_token_len(self.num_tokens_paddings, bound)
+        heads = self._vocab_parallel_model.vocab_parallel_heads
+        if not heads.supports_target_rows(rows):
+            return None
+        assert local_rows <= rows, (
+            f"{local_rows} logits rows exceed the DP-wide head rows {rows}"
+        )
+        return rows
+
+    def _compute_target_logits(
+        self, hidden_states: torch.Tensor, indices: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """The target's logits of ``hidden_states[indices]`` (all rows when
+        ``indices`` is None), through the vocab-parallel head when it runs."""
+        rows = hidden_states.shape[0] if indices is None else indices.shape[0]
+        dp_rows = self._dp_logits_rows(rows)
+        if indices is None:
+            if dp_rows is None:
+                return self.compute_logits_from_hidden_states(hidden_states)
+            return self.compute_logits_vocab_parallel(hidden_states, None, dp_rows)
+        if dp_rows is None:
+            return self.compute_selected_logits(hidden_states, indices)
+        return self.compute_logits_vocab_parallel(hidden_states, indices, dp_rows)
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def compute_logits_vocab_parallel(
+        self,
+        hidden_states: torch.Tensor,
+        indices: torch.Tensor | None,
+        dp_rows: int,
+    ) -> torch.Tensor:
+        """Logits of the selected rows, padded to the DP-wide ``dp_rows`` for
+        the vocab-parallel head's collectives, then cut back."""
+        selected = (
+            hidden_states
+            if indices is None
+            else torch.index_select(hidden_states, 0, indices)
+        )
+        rows = selected.shape[0]
+        selected = torch.nn.functional.pad(selected, (0, 0, 0, dp_rows - rows))
+        assert self._vocab_parallel_model is not None
+        logits = self._vocab_parallel_model.compute_logits_vocab_parallel(selected)
+        return logits[:rows]
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(

@@ -73,6 +73,7 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from ..common.host_transfer import EngramHashDownload, PreparedEngramUpload
+    from .vocab_parallel import VocabParallelHeads
 
 
 @dataclass
@@ -1773,7 +1774,55 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         # before the KV cache is sized from what remains.
         for engram in self.model._hbm_engrams():
             engram.upload_hbm_table()
+        if envs.TPU_DEEPSEEK_V41_VOCAB_PARALLEL_HEADS:
+            if self.vocab_parallel_heads is None:
+                self._build_vocab_parallel_heads()
+            else:  # A weight reload: the slices are copies.
+                self.vocab_parallel_heads.reload(self.lm_head.weight)
         return loaded
+
+    def _build_vocab_parallel_heads(self) -> None:
+        from vllm_torchtpu.distributed.ep_mesh import get_ep_group
+
+        from . import vocab_parallel
+
+        weight = self.lm_head.weight
+        processor = self.logits_processor
+        parallel = self._parallel_config
+        reasons = [
+            reason
+            for reason, bad in (
+                ("data parallelism is 1", parallel.data_parallel_size <= 1),
+                ("tensor parallelism is > 1", parallel.tensor_parallel_size != 1),
+                ("there is no expert-parallel group", get_ep_group() is None),
+                (
+                    "the LM head or its logits are not BF16",
+                    weight.dtype != torch.bfloat16
+                    or processor.head_dtype not in (None, torch.bfloat16),
+                ),
+                (
+                    "the logits processor scales, caps or pads the logits",
+                    processor.scale != 1.0
+                    or processor.soft_cap is not None
+                    or processor.logits_as_input
+                    or processor.org_vocab_size != weight.shape[0],
+                ),
+            )
+            if bad
+        ]
+        if reasons:
+            raise ValueError(
+                "TPU_DEEPSEEK_V41_VOCAB_PARALLEL_HEADS=1 cannot apply: "
+                + "; ".join(reasons)
+            )
+        self.vocab_parallel_heads = vocab_parallel.build(weight)
+
+    def compute_logits_vocab_parallel(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """Logits of rows every EP rank passes with this same row count."""
+        assert self.vocab_parallel_heads is not None
+        return self.vocab_parallel_heads.target_logits(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         weight = self.lm_head.weight
@@ -1853,6 +1902,9 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         self._logits_head = (
             initialize_logits_head() if envs.TPU_DEEPSEEK_V41_PALLAS_LOGITS else None
         )
+        # Built after the weights load (TPU_DEEPSEEK_V41_VOCAB_PARALLEL_HEADS).
+        self.vocab_parallel_heads: VocabParallelHeads | None = None
+        self._parallel_config = parallel
 
 
 class DeepseekV41VLForCausalLM(upstream_vl.DeepseekV41ForCausalLM):

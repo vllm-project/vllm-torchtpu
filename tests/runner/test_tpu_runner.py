@@ -215,6 +215,32 @@ def test_dp_step_max_reduces_through_shared_memory_on_one_host(one_host):
     assert gloo.call_count == 2 * int(not one_host)
 
 
+def test_dp_logits_rows_cover_every_rank_with_a_supported_head_shape():
+    """The vocab-parallel head runs one DP-wide row count: the step's max
+    per-chunk requests x (1 + K) sampled rows, padded like a logits count."""
+    heads = SimpleNamespace(supports_target_rows=lambda rows: rows in (8, 16, 32, 64))
+    runner = SimpleNamespace(
+        _vocab_parallel_model=SimpleNamespace(vocab_parallel_heads=heads),
+        speculative_config=SimpleNamespace(num_speculative_tokens=5),
+        num_tokens_paddings=[16, 32, 64, 128, 144, 256, 512, 1024],
+        max_num_reqs=64,
+        _dp_step_max_reqs=2,
+    )
+    rows = TPUModelRunner._dp_logits_rows
+    assert rows(runner, 16) == 16
+    runner._dp_step_max_reqs = 0  # an all-idle step still pairs one row
+    assert rows(runner, 0) == 16
+    runner._dp_step_max_reqs = 3
+    assert rows(runner, 8) == 32
+    runner._dp_step_max_reqs = 11  # 128 rows: the replicated head on every rank
+    assert rows(runner, 64) is None
+    runner._dp_step_max_reqs = 2
+    with pytest.raises(AssertionError):
+        rows(runner, 32)
+    runner._vocab_parallel_model = None
+    assert rows(runner, 16) is None
+
+
 def test_non_lockstep_partial_prefill_skips_proposals():
     runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
     assert TPUModelRunner._dp_coordinated_step(
@@ -2413,6 +2439,7 @@ class TestInputStagingFence:
             _dp_lockstep_enabled=lambda: False,
             forward_model=forward_model,
             compute_selected_logits=lambda out, idx: out,
+            _dp_logits_rows=lambda rows: None,
         )
         for name in (
             "_build_attention_metadata",

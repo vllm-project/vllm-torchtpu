@@ -445,6 +445,7 @@ def _run_dummy_run(monkeypatch, runner, *, num_tokens=256, dp_lockstep=False):
     )
 
     runner.compute_selected_logits = MagicMock()
+    runner._dp_logits_rows = lambda rows: None
     TPUModelRunner._dummy_run(
         runner,
         num_tokens,

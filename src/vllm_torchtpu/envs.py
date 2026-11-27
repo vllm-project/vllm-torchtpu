@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_MHC_SHIFTED_T16: bool = True
     TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS: bool = True
     TPU_DEEPSEEK_V41_PALLAS_LOGITS: bool = True
+    TPU_DEEPSEEK_V41_VOCAB_PARALLEL_HEADS: bool = False
     TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER: bool = True
     TPU_DEEPSEEK_V41_QB_ROPE_EXACT_ROWS: bool = True
     TPU_DEEPSEEK_V41_CSA2_DEEP_GATHER: bool = True
@@ -586,6 +587,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the logits' rounding (FP32 accumulation order).
     "TPU_DEEPSEEK_V41_PALLAS_LOGITS": env_bool(
         "TPU_DEEPSEEK_V41_PALLAS_LOGITS", default=True
+    ),
+    # DP>1 / EP / TP1: shard the LM head (target logits and the DSpark draft
+    # head with its Markov head) by vocabulary over the EP ranks, so a lockstep
+    # step streams the head once across the ranks instead of once per rank
+    # (kernels/vocab_parallel_head.py). Same logits and draft tokens as the
+    # replicated Pallas heads (TPU_DEEPSEEK_V41_PALLAS_LOGITS /
+    # _DSPARK_PALLAS_LOGITS); costs one 1/8 head slice of HBM per rank.
+    "TPU_DEEPSEEK_V41_VOCAB_PARALLEL_HEADS": env_bool(
+        "TPU_DEEPSEEK_V41_VOCAB_PARALLEL_HEADS", default=False
     ),
     # Gather RoPE table rows (attention preprocessing, CSA2 inverse RoPE) as
     # 256-row gathers when a step has 257..1024 rows

@@ -35,7 +35,8 @@ def _pipelined_kernel(x, w, base, vo, io, *, group, vocab_size):
     cross-lane max per tile, and are built with fewer VALU ops.
     """
     m = x.shape[0]
-    key_shift = group.bit_length() - 1
+    key_shift = (group - 1).bit_length()
+    low_bits = (1 << key_shift) - 1
     chunks = group // 512
     lhs = x[...]
     acc = [
@@ -96,7 +97,7 @@ def _pipelined_kernel(x, w, base, vo, io, *, group, vocab_size):
     lane = keys(chunks - 1, lane)
     packed = jnp.max(lane, axis=1, keepdims=True).astype(jnp.uint32)
     best_rank = packed >> jnp.uint32(key_shift)
-    winner = (jnp.uint32(group - 1) - (packed & jnp.uint32(group - 1))).astype(
+    winner = (jnp.uint32(group - 1) - (packed & jnp.uint32(low_bits))).astype(
         jnp.int32
     ) + tile0
     bits = jnp.where(
@@ -111,19 +112,23 @@ def _pipelined_kernel(x, w, base, vo, io, *, group, vocab_size):
     io[0, :, :] = winner
 
 
-def sample_slot(
+def slot_candidates(
     x: jax.Array,
     w: jax.Array,
     base: jax.Array,
     *,
     slot: int,
-) -> jax.Array:
-    assert x.shape[0] in SLOT_ROWS and x.shape[1] == 256
-    assert w.shape == (129280, 256)
-    assert base.shape == (5 * x.shape[0], 129280) and 0 <= slot < 5
-    assert x.dtype == w.dtype == base.dtype == jnp.bfloat16
-    group = 16384
+    group: int = 16384,
+) -> tuple[jax.Array, jax.Array]:
+    """Each ``group``-column tile's top-1 (value, index) of one slot's
+    ``base + x @ w.T`` scores: two [tiles, rows] arrays (``reduce_candidates``
+    picks the winner). A tile with no column below ``w.shape[0]`` reports
+    -inf at the int32 max index."""
     m = x.shape[0]
+    assert m % 16 == 0 and x.shape[1] == w.shape[1] == 256
+    assert base.shape == (5 * m, w.shape[0]) and 0 <= slot < 5
+    assert x.dtype == w.dtype == base.dtype == jnp.bfloat16
+    assert group % 512 == 0 and 16 + (group - 1).bit_length() <= 31
     vocab_size = w.shape[0]
     nt = (vocab_size + group - 1) // group
 
@@ -166,13 +171,27 @@ def sample_slot(
             ),
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
-        name="markov_pipelined_n16384_key",
+        name=f"markov_pipelined_n{group}_key",
     )(x, w, base)
-    value = value[:, :, 0]
-    index = index[:, :, 0]
+    return value[:, :, 0], index[:, :, 0]
+
+
+def reduce_candidates(value: jax.Array, index: jax.Array) -> jax.Array:
+    """[candidates, rows] (value, index) -> [rows] int32 winners: any NaN
+    first, else the largest value; the lowest index among equals."""
     anynan = jnp.any(jnp.isnan(value), axis=0)
     vmax = jnp.max(jnp.where(jnp.isnan(value), -jnp.inf, value), axis=0)
     eligible = jnp.where(anynan[None, :], jnp.isnan(value), value == vmax[None, :])
-    return jnp.min(jnp.where(eligible, index, jnp.iinfo(jnp.int32).max), axis=0).astype(
-        jnp.int64
-    )
+    return jnp.min(jnp.where(eligible, index, jnp.iinfo(jnp.int32).max), axis=0)
+
+
+def sample_slot(
+    x: jax.Array,
+    w: jax.Array,
+    base: jax.Array,
+    *,
+    slot: int,
+) -> jax.Array:
+    assert x.shape[0] in SLOT_ROWS
+    assert w.shape == (129280, 256)
+    return reduce_candidates(*slot_candidates(x, w, base, slot=slot)).astype(jnp.int64)

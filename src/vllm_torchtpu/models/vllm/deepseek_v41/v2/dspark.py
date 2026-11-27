@@ -354,6 +354,8 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         # Aliased to the target's lm_head by the proposer's sharing utility.
         self.lm_head: nn.Module | None = None
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
+        # The target's vocab-parallel heads (`prepare_tpu_draft_sampler`).
+        self._vocab_parallel = None
 
     # --- Hooks consumed by DFlashProposer / DSparkProposer -----------------
 
@@ -398,10 +400,12 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         from vllm_torchtpu.kernels.logits_head import is_supported_shape
         from vllm_torchtpu.kernels.markov_sampling import slot_rows
 
+        from . import vocab_parallel
         from .dspark_sampling import initialize_logits_head, initialize_samples
 
         self._decode_samples = None
         self._decode_logits = None
+        self._vocab_parallel = None
         self._slot_rows = slot_rows
         self._pallas_logits_shape = is_supported_shape
         if not (tp_size == 1 and sample_from_anchor and block_size == 5):
@@ -421,6 +425,10 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         self._decode_samples = initialize_samples()
         if envs.TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS:
             self._decode_logits = initialize_logits_head()
+        # The target built them on its LM head, which this draft shares.
+        self._vocab_parallel = vocab_parallel.heads()
+        if self._vocab_parallel is not None:
+            self._vocab_parallel.enable_dspark(markov.markov_w2.weight)
         return self._sample_decode
 
     def _sample_decode(
@@ -435,12 +443,23 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         ):
             return None
         num_reqs = rows // block_size
+        # Slot-major rows.
+        slot_hidden = hidden.view(num_reqs, block_size, width).transpose(0, 1)
+        anchors = input_ids[:rows].view(num_reqs, block_size)[:, 0]
+        markov = self.model.markov_head
+        heads = self._vocab_parallel
+        # The proposer pads draft rows to the step's DP-wide request count, so
+        # every rank takes this branch together, as the heads' collectives need.
+        if heads is not None and heads.supports_dspark(num_reqs, block_size):
+            return heads.dspark_samples(
+                self.model.norm(slot_hidden.reshape(rows, width)),
+                anchors,
+                markov.markov_w1.weight,
+            ).to(torch.int64)
         slot_reqs = self._slot_rows(num_reqs)
         if slot_reqs is None:
             return None
-        # Slot-major rows, each slot zero-padded to the kernel's request rows.
-        slot_hidden = hidden.view(num_reqs, block_size, width).transpose(0, 1)
-        anchors = input_ids[:rows].view(num_reqs, block_size)[:, 0]
+        # Each slot zero-padded to the kernel's request rows.
         if slot_reqs != num_reqs:
             slot_hidden = F.pad(slot_hidden, (0, 0, 0, slot_reqs - num_reqs))
             anchors = F.pad(anchors, (0, slot_reqs - num_reqs))
@@ -457,7 +476,6 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
             logits = self.compute_logits(slot_hidden)
         if logits.shape != (padded_rows, 129280) or logits.dtype != torch.bfloat16:
             return None
-        markov = self.model.markov_head
         assert self._decode_samples is not None
         tokens = self._decode_samples(
             logits,
@@ -621,6 +639,8 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
         for layer in self.model.layers:
             layer.ffn.finalize_mega_moe_weights()
         self.model.finalize_mhc_broadcast_weights()
+        if self._vocab_parallel is not None:  # A reload: the slice is a copy.
+            self._vocab_parallel.enable_dspark(self.model.markov_head.markov_w2.weight)
 
     def _remap_dspark_name(self, name: str) -> str | None:
         return _remap_dspark_name(
