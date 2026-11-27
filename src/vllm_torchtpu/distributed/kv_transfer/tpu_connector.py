@@ -1067,14 +1067,18 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         self, finished_req_ids: set[str]
     ) -> KVConnectorTransferResults:
         assert self.connector_worker is not None
-        if isinstance(self.connector_worker, TPURaidenConnectorWorker):
+        if isinstance(
+            self.connector_worker,
+            (TPURaidenConnectorWorker, ZmqShmKvConnectorBase),
+        ):
             return self.connector_worker.get_transfer_results(finished_req_ids)
         return super().get_transfer_results(finished_req_ids)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        # Surface KV-load failures so the scheduler recomputes the affected
-        # blocks instead of running with absent KV. Only the Raiden worker
-        # tracks these; other backends fall back to the base (no errors).
+        # Surface KV-load failures so the scheduler recomputes or fails the
+        # request per kv_load_failure_policy instead of running with
+        # absent/stale KV. Both Raiden and shm/ZMQ workers track these;
+        # other backends fall back to empty.
         worker = self.connector_worker
         fn = getattr(worker, "get_block_ids_with_load_errors", None)
         return fn() if fn is not None else set()
