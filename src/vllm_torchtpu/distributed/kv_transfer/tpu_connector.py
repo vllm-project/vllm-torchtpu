@@ -36,7 +36,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
@@ -140,9 +140,21 @@ _DONE_FUTURE = _DoneFuture()
 _STAGE3_FINISH_DEDUP_LIMIT = 4096
 _STAGE3_D5_REGISTRATION_WAIT_S = 5.0
 # tpu_sync GetRequestBlockStatusResponse.Status values reported by the
-# reshard client's get_request_block_status probe.
+# reshard client's get_request_block_status probe. STATUS_UNKNOWN (1) stays
+# defined alongside STATUS_CANCELLED (4) as a named protocol constant and is
+# exercised by tests to confirm the probe never treats unknown/expired rows
+# as atomic pre-claim cancellations.
 _STAGE3_REGISTRY_STATUS_UNKNOWN = 1
 _STAGE3_REGISTRY_STATUS_CANCELLED = 4
+# Monotonic producer send-outcome priority matching
+# raiden_pd_completion._OUTCOME_PRIORITY (SEND_FAILURE > UNCLAIMED_TIMEOUT >
+# SUCCESS): a lower-priority late native terminal must never downgrade a
+# higher-priority outcome while draining.
+_STAGE3_SEND_OUTCOME_PRIORITY = {
+    "done": 0,
+    "cancelled": 1,
+    "failed": 2,
+}
 # Deferred-submit re-attempts ride cheap no-forward steps, which can cycle at
 # kHz while a load waits; rate-limit the controller RPCs per parked request.
 _STAGE3_REGISTRATION_REATTEMPT_MIN_INTERVAL_S = 0.05
@@ -2733,6 +2745,12 @@ class TPURaidenConnectorWorker:
         # native terminal (or was cancelled unclaimed) and is drained into
         # the scheduler report exactly once.
         self._stage3_send_outcomes: dict[str, str] = {}
+        # Cancelled/expired sends held until native D2H/push ops settle
+        # (engine.is_send_settled(uuid) == True).
+        self._stage3_draining_sends: dict[str, str] = {}
+        self._stage3_draining_send_since: dict[str, float] = {}
+        self._stage3_draining_send_logged: set[str] = set()
+        self._stage3_cancelled_sends: set[str] = set()
         # req_id -> next registry status probe time (Unix seconds).
         self._stage3_status_probe_next: dict[str, float] = {}
         # vLLM independently randomizes the internal request ID on the
@@ -2753,6 +2771,25 @@ class TPURaidenConnectorWorker:
         # native manager reports a terminal state, or until a full manager
         # timeout has elapsed after the RPC returned.
         self._stage3_pending_controller_failures: dict[str, float] = {}
+        # Cancelled/timed-out receives held until native H2D DMA settles
+        # (engine.is_receive_settled(uuid) == True).
+        self._stage3_draining_cancelled_loads: dict[str, int | None] = {}
+        self._stage3_draining_cancelled_load_since: dict[str, float] = {}
+        self._stage3_draining_cancelled_load_logged: set[str] = set()
+        self._stage3_draining_load_recancel: set[str] = set()
+        # Cached native Stage-3 DMA drain bindings resolved once per engine
+        # instance:
+        # (cancel_receive, is_receive_settled, cancel_send, is_send_settled).
+        self._stage3_drain_engine_ref: Any = None
+        self._stage3_drain_apis: (
+            tuple[
+                Callable[[int], Any] | None,
+                Callable[[int], Any] | None,
+                Callable[[int], Any] | None,
+                Callable[[int], Any] | None,
+            ]
+            | None
+        ) = None
         # Loads parked for per-step re-attempt while their producer
         # request-block registrations are in flight (_Stage3PendingSubmit).
         self._stage3_pending_submits: dict[str, _Stage3PendingSubmit] = {}
@@ -4215,7 +4252,13 @@ class TPURaidenConnectorWorker:
             # Inline mode waits for the loads below, so the coordination RPCs
             # must have run before the wait loop starts polling.
             self._submit_stage3_loads(metadata, engine, synchronous=wait_for_completion)
-            submitted_loads = set(metadata.reqs_to_load)
+            # A release-only entry arms no receiver and reports (or not) by
+            # its own report_completion, like the legacy empty read below.
+            submitted_loads = {
+                req_id
+                for req_id, req_meta in metadata.reqs_to_load.items()
+                if not getattr(req_meta, "release_only", False)
+            }
             if wait_for_completion:
                 self._wait_for_recving(submitted_loads)
                 if not report_completion:
@@ -4359,6 +4402,8 @@ class TPURaidenConnectorWorker:
                 continue
             del self._stage3_registered_sends[req_id]
             self._stage3_status_probe_next.pop(req_id, None)
+            self._stage3_terminal_cleanup.pop(req_id, None)
+            self._stage3_prune_state_send_tracking(req_id)
             facade.release_request_blocks(req_id=req_id, uuid=int(uuid))
             logger.info(
                 "%s",
@@ -5075,6 +5120,171 @@ class TPURaidenConnectorWorker:
         self._failed_block_ids.update(block_ids)
         self._stage3_terminal_loads.add(req_id)
 
+    def _stage3_engine_drain_apis(
+        self, engine: Any
+    ) -> tuple[
+        Callable[[int], Any] | None,
+        Callable[[int], Any] | None,
+        Callable[[int], Any] | None,
+        Callable[[int], Any] | None,
+    ]:
+        """Resolves and caches Stage-3 DMA drain bindings once per engine instance.
+
+        Logs a single warning when the installed ``tpu-sync-torch`` wheel lacks
+        the native cancel/settle methods so a missing drain gate never silently
+        no-ops while waiting for a newer ``tpu-sync-torch`` pin.
+        """
+        if (
+            engine is not self._stage3_drain_engine_ref
+            or self._stage3_drain_apis is None
+        ):
+            cancel_receive = getattr(engine, "cancel_receive", None)
+            is_receive_settled = getattr(engine, "is_receive_settled", None)
+            cancel_send = getattr(engine, "cancel_send", None)
+            is_send_settled = getattr(engine, "is_send_settled", None)
+            cancel_fn = (
+                cast(Callable[[int], Any], cancel_receive)
+                if callable(cancel_receive)
+                else None
+            )
+            recv_settled_fn = (
+                cast(Callable[[int], Any], is_receive_settled)
+                if callable(is_receive_settled)
+                else None
+            )
+            cancel_send_fn = (
+                cast(Callable[[int], Any], cancel_send)
+                if callable(cancel_send)
+                else None
+            )
+            send_settled_fn = (
+                cast(Callable[[int], Any], is_send_settled)
+                if callable(is_send_settled)
+                else None
+            )
+            missing: list[str] = []
+            if not self.is_producer:
+                if cancel_fn is None:
+                    missing.append("cancel_receive")
+                if recv_settled_fn is None:
+                    missing.append("is_receive_settled")
+            else:
+                if cancel_send_fn is None:
+                    missing.append("cancel_send")
+                if send_settled_fn is None:
+                    missing.append("is_send_settled")
+            if missing and engine is not None:
+                logger.warning_once(
+                    "Stage-3 DMA drain gate disabled: transfer engine lacks %s "
+                    "(upgrade tpu-sync-torch to enable native DMA drain "
+                    "barriers before KV block release).",
+                    ", ".join(missing),
+                )
+            self._stage3_drain_engine_ref = engine
+            self._stage3_drain_apis = (
+                cancel_fn,
+                recv_settled_fn,
+                cancel_send_fn,
+                send_settled_fn,
+            )
+        return self._stage3_drain_apis
+
+    def _clear_stage3_draining_cancelled_load(self, req_id: str) -> None:
+        self._stage3_draining_cancelled_loads.pop(req_id, None)
+        self._stage3_draining_cancelled_load_since.pop(req_id, None)
+        self._stage3_draining_cancelled_load_logged.discard(req_id)
+        self._stage3_draining_load_recancel.discard(req_id)
+
+    def _clear_stage3_draining_send(self, req_id: str) -> None:
+        self._stage3_draining_sends.pop(req_id, None)
+        self._stage3_draining_send_since.pop(req_id, None)
+        self._stage3_draining_send_logged.discard(req_id)
+        self._stage3_cancelled_sends.discard(req_id)
+
+    def _cancel_stage3_receive(self, engine: Any, uuid: int | None) -> bool | None:
+        """Cancels an armed/pending native receive.
+
+        Returns True iff DMA is already settled, False if cancel was accepted
+        and DMA is still draining, or None if the native call raised and should
+        be retried on a subsequent poll.
+
+        For windowed loads (``dst_window_blocks``), passing the request's root
+        ``uuid`` covers every sub-plan (``SubPlanUuid(uuid, k)``) because
+        ``tpu_sync`` propagates ``root_uuid`` across the sub-plan chain and
+        cancels/blocks all sub-plans under that root UUID.
+        """
+        cancel_fn, _, _, _ = self._stage3_engine_drain_apis(engine)
+        if uuid is None or cancel_fn is None:
+            return True
+        try:
+            return bool(cancel_fn(int(uuid)))
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error(
+                "Stage-3 cancel_receive failed for uuid=%d: %s", int(uuid), exc
+            )
+            return None
+
+    def _is_stage3_receive_settled(self, engine: Any, uuid: int | None) -> bool:
+        """Returns True iff no native H2D/receive op remains in flight for the
+        request's root ``uuid`` (covering all windowed sub-plans in ``tpu_sync``)."""
+        _, recv_settled_fn, _, _ = self._stage3_engine_drain_apis(engine)
+        if uuid is None or recv_settled_fn is None:
+            return True
+        return bool(recv_settled_fn(int(uuid)))
+
+    def _cancel_or_drain_stage3_load(self, engine: Any, req_id: str) -> bool:
+        """Cancels a Stage-3 load's native receive and either records immediate
+        load failure (if DMA is settled) or parks it until DMA drains."""
+        self._stage3_pending_controller_failures.pop(req_id, None)
+        uuid = self._stage3_submitted_loads.get(req_id)
+        submit_pending = (
+            req_id in self._stage3_inflight_submits or req_id in self._stage3_tp_submits
+        )
+        cancel_settled = self._cancel_stage3_receive(engine, uuid)
+        settled = cancel_settled is True and self._is_stage3_receive_settled(
+            engine, uuid
+        )
+        if settled and not submit_pending:
+            self._record_stage3_load_failure(
+                req_id, self._load_block_ids.get(req_id, [])
+            )
+            return True
+        self._stage3_draining_cancelled_loads[req_id] = uuid
+        self._stage3_draining_cancelled_load_since.setdefault(req_id, time.time())
+        if submit_pending or cancel_settled is None:
+            self._stage3_draining_load_recancel.add(req_id)
+        return False
+
+    def _cancel_stage3_send(self, engine: Any, uuid: int) -> bool | None:
+        """Cancels an armed/pending native send.
+
+        Returns True iff D2H/push is already settled, False if cancel was
+        accepted and D2H/push is still draining, or None if the native call
+        raised and should be retried on a subsequent poll.
+
+        For windowed transfers (``dst_window_blocks``), passing the request's
+        root ``uuid`` covers every sub-plan (``SubPlanUuid(uuid, k)``) because
+        ``tpu_sync`` propagates ``root_uuid`` across the sub-plan chain and
+        cancels/blocks all sub-plans under that root UUID.
+        """
+        _, _, cancel_send_fn, _ = self._stage3_engine_drain_apis(engine)
+        if cancel_send_fn is None:
+            return True
+        try:
+            return bool(cancel_send_fn(int(uuid)))
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Stage-3 cancel_send failed for uuid=%d: %s", int(uuid), exc)
+            return None
+
+    def _is_stage3_send_settled(self, engine: Any, uuid: int) -> bool:
+        """Returns True iff no native D2H/push send op remains in flight for
+        the request's root ``uuid`` (covering all windowed sub-plans in
+        ``tpu_sync``)."""
+        _, _, _, send_settled_fn = self._stage3_engine_drain_apis(engine)
+        if send_settled_fn is None:
+            return True
+        return bool(send_settled_fn(int(uuid)))
+
     def _stage3_fa_token_bytes(self, page_tokens: int) -> int:
         """Bytes per token of the admitted FA pools, measured from the
         manifest (live bytes per block over the page geometry)."""
@@ -5329,6 +5539,18 @@ class TPURaidenConnectorWorker:
     def _stage3_prune_state_send_tracking(self, base_req_id: str) -> None:
         """Drops producer terminal tracking with the base tombstone."""
         self._stage3_send_outcomes.pop(base_req_id, None)
+        self._clear_stage3_draining_send(base_req_id)
+
+    @staticmethod
+    def _merge_stage3_send_outcome(current: str | None, candidate: str) -> str:
+        """Merges producer send outcomes monotonically (failed > cancelled > done)."""
+        if (
+            current is None
+            or _STAGE3_SEND_OUTCOME_PRIORITY[candidate]
+            > _STAGE3_SEND_OUTCOME_PRIORITY[current]
+        ):
+            return candidate
+        return current
 
     def _stage3_record_producer_send_terminals(
         self, done_sending, failed_sending
@@ -5337,11 +5559,16 @@ class TPURaidenConnectorWorker:
         for req_id, failed in [(str(req_id), False) for req_id in done_sending] + [
             (str(req_id), True) for req_id in failed_sending
         ]:
+            if req_id in self._stage3_terminal_cleanup:
+                continue
             if req_id in self._stage3_registered_sends:
-                if failed:
-                    self._stage3_send_outcomes[req_id] = "failed"
-                else:
-                    self._stage3_send_outcomes.setdefault(req_id, "done")
+                existing = self._stage3_send_outcomes.get(
+                    req_id, self._stage3_draining_sends.get(req_id)
+                )
+                candidate = "failed" if failed else "done"
+                merged = self._merge_stage3_send_outcome(existing, candidate)
+                if merged != existing:
+                    self._stage3_send_outcomes[req_id] = merged
                 continue
             # Replayed native terminals after the base moved to its tombstone
             # are harmless and must not become duplicate scheduler reports.
@@ -5354,10 +5581,56 @@ class TPURaidenConnectorWorker:
                 )
 
     def _stage3_ready_producer_send_terminals(
-        self,
+        self, engine: Any
     ) -> tuple[set[str], set[str], set[str]]:
-        """Returns terminal base requests (T3.1: no sibling aggregation)."""
-        outcomes, self._stage3_send_outcomes = self._stage3_send_outcomes, {}
+        """Returns terminal base requests whose native D2H/push has settled."""
+        pending_outcomes = self._stage3_draining_sends
+        for req_id, outcome in self._stage3_send_outcomes.items():
+            pending_outcomes[req_id] = self._merge_stage3_send_outcome(
+                pending_outcomes.get(req_id), outcome
+            )
+        self._stage3_send_outcomes = {}
+        self._stage3_draining_sends = {}
+        outcomes: dict[str, str] = {}
+        now = time.time()
+        drain_timeout_s = float(dist_utils.get_p2p_wait_pull_timeout())
+        for req_id, outcome in pending_outcomes.items():
+            registration = self._stage3_registered_sends.get(req_id)
+            if registration is not None:
+                settled = True
+                if (
+                    outcome in ("cancelled", "failed")
+                    and req_id not in self._stage3_cancelled_sends
+                ):
+                    cancel_settled = self._cancel_stage3_send(engine, registration.uuid)
+                    if cancel_settled is None:
+                        settled = False
+                    else:
+                        self._stage3_cancelled_sends.add(req_id)
+                        settled = cancel_settled
+                if not settled or not self._is_stage3_send_settled(
+                    engine, registration.uuid
+                ):
+                    self._stage3_draining_sends[req_id] = outcome
+                    parked_at = self._stage3_draining_send_since.setdefault(req_id, now)
+                    if (
+                        now - parked_at > drain_timeout_s
+                        and req_id not in self._stage3_draining_send_logged
+                    ):
+                        self._stage3_draining_send_logged.add(req_id)
+                        logger.error(
+                            "Stage-3 producer send still draining past "
+                            "p2p_wait_pull_timeout (%.1fs) req_id=%s uuid=%d "
+                            "blocks=%d outcome=%s",
+                            drain_timeout_s,
+                            req_id,
+                            registration.uuid,
+                            len(registration.local_block_ids),
+                            outcome,
+                        )
+                    continue
+            self._clear_stage3_draining_send(req_id)
+            outcomes[req_id] = outcome
         if self._pd_send_results is not None:
             result_by_native_outcome = {
                 "done": RaidenSendOutcome.SUCCESS,
@@ -5385,9 +5658,10 @@ class TPURaidenConnectorWorker:
         probe the registration (and vLLM's delayed block free that waits on
         every rank's send terminal) would sit until p2p_wait_pull_timeout.
         Registrations older than the probe interval and still without a
-        terminal are batch-queried at most once per interval; a cancelled
-        (or vanished) row is recorded as a cancelled terminal, exactly what
-        the TTL sweep records for its own cancellation."""
+        terminal are batch-queried at most once per interval; only an explicit
+        STATUS_CANCELLED row proves atomic pre-claim cancellation (never
+        STATUS_UNKNOWN, which also arises on TTL sweep or store restart while
+        D2H DMA may still be reading source HBM)."""
         probe_s = dist_utils.get_stage3_status_probe_s()
         probe = getattr(facade, "get_request_block_status", None)
         if probe_s <= 0 or probe is None:
@@ -5400,6 +5674,7 @@ class TPURaidenConnectorWorker:
             if (
                 req_id in self._stage3_terminal_cleanup
                 or req_id in self._stage3_send_outcomes
+                or req_id in self._stage3_draining_sends
                 or self._stage3_registered_sends[req_id].finish_pending
             ):
                 continue
@@ -5433,10 +5708,7 @@ class TPURaidenConnectorWorker:
                 f"{len(statuses)} statuses for {len(keys)} keys"
             )
         for req_id, status in zip(due, statuses):
-            if status not in (
-                _STAGE3_REGISTRY_STATUS_CANCELLED,
-                _STAGE3_REGISTRY_STATUS_UNKNOWN,
-            ):
+            if status != _STAGE3_REGISTRY_STATUS_CANCELLED:
                 continue
             self._stage3_send_outcomes[req_id] = "cancelled"
             logger.info(
@@ -6197,6 +6469,9 @@ class TPURaidenConnectorWorker:
                 outcome.error,
             )
             return
+        if destination_req_id in self._stage3_draining_cancelled_loads:
+            self._stage3_controller_accepted.add(destination_req_id)
+            return
         if outcome.error is not None:
             exc = outcome.error
             missing_registration = "Missing producer block registration" in str(exc)
@@ -6374,7 +6649,10 @@ class TPURaidenConnectorWorker:
             for req_id in self._stage3_tp_submits:
                 if req_id in self._stage3_terminal_loads:
                     states[req_id] = "failed"
-                elif req_id in self._stage3_pending_controller_failures:
+                elif req_id in self._stage3_pending_controller_failures or (
+                    req_id in self._stage3_draining_cancelled_loads
+                    and req_id not in self._stage3_inflight_submits
+                ):
                     states[req_id] = "uncertain"
                 elif req_id in self._stage3_controller_accepted:
                     states[req_id] = "accepted"
@@ -6388,7 +6666,10 @@ class TPURaidenConnectorWorker:
                 self._record_stage3_load_failure(req_id, self._load_block_ids[req_id])
             else:
                 self._stage3_controller_accepted.add(req_id)
-                if state == "uncertain":
+                if (
+                    state == "uncertain"
+                    and req_id not in self._stage3_draining_cancelled_loads
+                ):
                     self._stage3_pending_controller_failures[req_id] = (
                         time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
                     )
@@ -6577,8 +6858,8 @@ class TPURaidenConnectorWorker:
             for req_id in finished_req_ids:
                 if (
                     req_id in self._stage3_submitted_loads
-                    and req_id not in self._stage3_terminal_loads
-                ):
+                    or req_id in self._stage3_draining_cancelled_loads
+                ) and req_id not in self._stage3_terminal_loads:
                     self._stage3_finished_loads_pending_cleanup.add(req_id)
                 else:
                     cleanup_req_ids.add(req_id)
@@ -6619,7 +6900,7 @@ class TPURaidenConnectorWorker:
             recv_finished - self._suppress_done_recving - self._reported_recving
         )
         self._suppress_done_recving.difference_update(recv_finished)
-        self._reported_recving.update(done_recving)
+        self._reported_recving.update(recv_finished)
         self._pending_failed_recving = self._failed_recving & done_recving
         self._pending_failed_block_ids = {
             block_id
@@ -6671,6 +6952,7 @@ class TPURaidenConnectorWorker:
             self._stage3_load_start_times.pop(req_id, None)
             self._stage3_controller_accepted.discard(req_id)
             self._stage3_pending_controller_failures.pop(req_id, None)
+            self._clear_stage3_draining_cancelled_load(req_id)
             self._stage3_pending_submits.pop(req_id, None)
             self._stage3_tp_submits.discard(req_id)
             self._stage3_deferred_native_failures.pop(req_id, None)
@@ -6778,35 +7060,102 @@ class TPURaidenConnectorWorker:
                         done_recving.append(req_id)
             for req_id in done_recving:
                 if req_id in self._stage3_inflight_submits:
-                    self._stage3_deferred_native_failures[req_id] = False
+                    self._stage3_deferred_native_failures.setdefault(req_id, False)
             for req_id in failed_recving:
                 if req_id in self._stage3_inflight_submits:
                     self._stage3_deferred_native_failures[req_id] = True
+            native_failed_recvs = list(
+                dict.fromkeys(
+                    req_id
+                    for req_id in failed_recving
+                    if req_id in self._stage3_controller_accepted
+                    and req_id not in self._stage3_inflight_submits
+                    and req_id not in self._stage3_terminal_loads
+                    and req_id not in self._stage3_draining_cancelled_loads
+                )
+            )
+            native_failed_set = set(native_failed_recvs)
             done_recving = [
                 req_id
                 for req_id in done_recving
                 if req_id in self._stage3_controller_accepted
                 and req_id not in self._stage3_inflight_submits
+                and req_id not in self._stage3_terminal_loads
+                and req_id not in self._stage3_draining_cancelled_loads
+                and req_id not in native_failed_set
             ]
-            failed_recving = [
-                req_id
-                for req_id in failed_recving
-                if req_id in self._stage3_controller_accepted
-                and req_id not in self._stage3_inflight_submits
-            ]
-            terminal_recvs = set(done_recving) | set(failed_recving)
+            failed_recving = []
+            terminal_recvs = set(done_recving) | native_failed_set
             for req_id in terminal_recvs:
                 self._stage3_pending_controller_failures.pop(req_id, None)
             now = time.time()
-            expired_uncertain = {
+            if self._stage3_draining_cancelled_loads:
+                drain_timeout_s = float(dist_utils.get_p2p_wait_pull_timeout())
+                settled_cancelled: list[str] = []
+                for req_id, uuid in self._stage3_draining_cancelled_loads.items():
+                    if (
+                        req_id not in self._stage3_inflight_submits
+                        and req_id not in self._stage3_tp_submits
+                    ):
+                        if (
+                            req_id in self._stage3_draining_load_recancel
+                            and self._cancel_stage3_receive(engine, uuid) is not None
+                        ):
+                            self._stage3_draining_load_recancel.discard(req_id)
+                        if (
+                            req_id not in self._stage3_draining_load_recancel
+                            and self._is_stage3_receive_settled(engine, uuid)
+                        ):
+                            settled_cancelled.append(req_id)
+                            continue
+                    parked_at = self._stage3_draining_cancelled_load_since.setdefault(
+                        req_id, now
+                    )
+                    if (
+                        now - parked_at > drain_timeout_s
+                        and req_id not in self._stage3_draining_cancelled_load_logged
+                    ):
+                        self._stage3_draining_cancelled_load_logged.add(req_id)
+                        logger.error(
+                            "Stage-3 cancelled receive still draining past "
+                            "p2p_wait_pull_timeout (%.1fs) req_id=%s "
+                            "destination_req_id=%s uuid=%s blocks=%d",
+                            drain_timeout_s,
+                            self._stage3_source_request_id(req_id),
+                            req_id,
+                            uuid if uuid is not None else "unknown",
+                            len(self._load_block_ids.get(req_id, ())),
+                        )
+                for req_id in settled_cancelled:
+                    self._clear_stage3_draining_cancelled_load(req_id)
+                    self._record_stage3_load_failure(
+                        req_id, self._load_block_ids.get(req_id, [])
+                    )
+                    failed_recving.append(req_id)
+            for req_id in native_failed_recvs:
+                if self._cancel_or_drain_stage3_load(engine, req_id):
+                    failed_recving.append(req_id)
+            expired_uncertain = [
                 req_id
                 for req_id, deadline in self._stage3_pending_controller_failures.items()
                 if deadline <= now
-            }
-            if expired_uncertain:
-                failed_recving = list(set(failed_recving) | expired_uncertain)
-                for req_id in expired_uncertain:
-                    self._stage3_pending_controller_failures.pop(req_id, None)
+            ]
+            for req_id in expired_uncertain:
+                if self._cancel_or_drain_stage3_load(engine, req_id):
+                    failed_recving.append(req_id)
+            cancel_receive_fn, _, _, _ = self._stage3_engine_drain_apis(engine)
+            if cancel_receive_fn is not None:
+                aborted_active = [
+                    req_id
+                    for req_id in self._stage3_finished_loads_pending_cleanup
+                    if req_id not in terminal_recvs
+                    and req_id not in self._stage3_terminal_loads
+                    and req_id not in self._stage3_draining_cancelled_loads
+                    and req_id not in self._stage3_pending_submits
+                ]
+                for req_id in aborted_active:
+                    if self._cancel_or_drain_stage3_load(engine, req_id):
+                        failed_recving.append(req_id)
             self._stage3_terminal_loads.update(done_recving)
             self._stage3_terminal_loads.update(failed_recving)
         if self.is_producer and self._raiden_stage3_enabled():
@@ -6819,6 +7168,7 @@ class TPURaidenConnectorWorker:
                 if registration.expiration_time <= now
                 and req_id not in self._stage3_terminal_cleanup
                 and req_id not in self._stage3_send_outcomes
+                and req_id not in self._stage3_draining_sends
             }
             if expired_candidates:
                 for req_id in expired_candidates:
@@ -6830,7 +7180,7 @@ class TPURaidenConnectorWorker:
                         # cancellation is the whole cancellation.
                         self._stage3_send_outcomes[req_id] = "cancelled"
             done_sending, sender_failures, cancelled_sends = (
-                self._stage3_ready_producer_send_terminals()
+                self._stage3_ready_producer_send_terminals(engine)
             )
             if cancelled_sends:
                 logger.warning(
@@ -7003,6 +7353,7 @@ class TPURaidenConnectorWorker:
             return
         engine = self._ensure_raiden_transfer_engine()
         deadline = time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
+        logged_drain_wait = False
         while True:
             finished = self._done_recving | self._failed_recving
             if req_ids <= finished:
@@ -7012,6 +7363,41 @@ class TPURaidenConnectorWorker:
             if req_ids <= finished:
                 return
             if time.time() >= deadline:
+                # The forward reads these blocks next, and a decode request
+                # frees its blocks without delay, so no receive may stay armed
+                # past the inline deadline: cancel every accepted or uncertain
+                # load (even before its own RPC deadline) so it drains below
+                # and surfaces as a load error for recompute.
+                for req_id in sorted(req_ids - finished):
+                    if (
+                        req_id in self._stage3_submitted_loads
+                        and req_id not in self._stage3_terminal_loads
+                        and req_id not in self._stage3_draining_cancelled_loads
+                        and req_id not in self._stage3_inflight_submits
+                        and req_id not in self._stage3_tp_submits
+                        and req_id not in self._stage3_pending_submits
+                    ):
+                        self._cancel_or_drain_stage3_load(engine, req_id)
+                finished = self._done_recving | self._failed_recving
+                if req_ids <= finished:
+                    return
+                draining = sorted(
+                    req_id
+                    for req_id in req_ids - finished
+                    if req_id in self._stage3_draining_cancelled_loads
+                )
+                if draining:
+                    if not logged_drain_wait:
+                        logged_drain_wait = True
+                        logger.warning(
+                            "TPURaidenConnectorWorker rank%d --> waiting past "
+                            "inline-load deadline for cancelled Stage-3 "
+                            "receives to settle req_ids=%s",
+                            self.tp_rank,
+                            draining,
+                        )
+                    time.sleep(0.001)
+                    continue
                 pending = sorted(req_ids - finished)
                 logger.warning(
                     "TPURaidenConnectorWorker rank%d --> timed out waiting "
@@ -7041,6 +7427,8 @@ class TPURaidenConnectorWorker:
             self._flattened_kv_cache_tensors()
         )
         self._raiden_transfer_engine = engine
+        if self._raiden_stage3_enabled():
+            self._stage3_engine_drain_apis(engine)
         return engine
 
     def _construct_raiden_transfer_engine(
