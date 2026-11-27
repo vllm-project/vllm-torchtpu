@@ -85,7 +85,7 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --baseline scripts/vllm/benchmarking/baselines/perf/<chip>/<config>.baseline.json
 ```
 
-#### Roofline report (`--roofline-targets`)
+#### Roofline and AgentX speed gates
 
 `baselines/perf/<chip>/roofline_targets.json` (for example
 `baselines/perf/v7x/roofline_targets.json`) holds modeled output throughput per
@@ -98,27 +98,48 @@ appear in both maps. The other fields describe the model run and are not read.
 
 Pass `--roofline-targets <file>` and `--config-name <config>` in perf check mode
 to print each measured cell as a percentage of its target. `--baseline` is then
-optional, so one run can check the baseline, print the report, or do both. The
-report is advisory: a ratio never changes the exit code.
+optional, so one run can check the baseline, check speed targets, or do both.
+Speed checks stay advisory (`exit 0`) until a ratio flag is passed.
 
 - The measured value is the cell's `output_throughput` divided by the physical
   chip count. That count is `--chips <N>`, or `--prefill-chips <P>` plus
   `--decode-chips <D>` for disaggregated serving, or else the config's
   `num_chips`. When an explicit chip count differs from the modeled
   `num_chips`, a `NOTE:` line is printed to stderr.
-- A cell whose target has `status` `unverified` is marked
-  `ADVISORY (unverified)`.
+- Add `--min-roofline-ratio <float>` (for example `0.8`) to turn the roofline
+  report into a blocking gate on `status == "ok"` cells. Cells with
+  `status == "unverified"` stay advisory unless `--enforce-unverified-rooflines`
+  is also passed. A gated cell with missing or negative `output_throughput`
+  fails the gate; if no non-`oom` measured cell matches a target cell in
+  blocking mode, the run exits `2` before printing any table.
 - A measured cell is listed as `SKIP` when the config has no target for it,
-  when its target has `status` `oom`, or when its result has no
-  `output_throughput`. A target cell that was not measured is not listed.
+  when its target has `status` `oom`, or (in advisory mode) when its result has
+  no non-negative `output_throughput`. A target cell that was not measured is
+  not listed.
 - A config under `not_modeled` prints its reason instead of a table. Such a
   run needs no result files unless `--baseline` is also given.
 
-The run exits `2` when the targets file is malformed, when the config is in
-neither map, when a chip flag is invalid, or when no chip count is known.
-`--roofline-targets` needs `--config-name`, and `--config-name` and the chip
-flags need `--roofline-targets`. All five flags are usage errors outside perf
-check mode.
+For AgentX runs (`profile_export_aiperf.json` or top-level
+`<label>_c<N>.json`), pass `--agentx-gpu-reference <json>`
+(`[{"p90_interactivity", "out_tok_s_per_gpu"}, ...]` or `{"points": [...]}`)
+with `--chips` or `--prefill-chips` and `--decode-chips` to linearly
+interpolate the GPU reference at each point's P90 interactivity
+(`request_metrics.latency.intvty.p90`, `p90_interactivity`, or
+`1000.0 / p90_tpot_ms`, with explicit latency unit conversion for `ms`, `s`,
+`us`/`µs`, and `ns`). Add `--min-gpu-ratio <float>` to require at least that
+fraction of the interpolated GPU per-chip output throughput. Points marked with
+`was_cancelled=true` or a `HARD_TIMEOUT` marker (including truncated JSON after
+a timeout) fail the gate when `--min-gpu-ratio` is set; if every point is
+outside the reference curve range in blocking mode, the gate fails.
+
+The run exits `2` when a targets or GPU reference file is malformed, when the
+config is in neither roofline map, when a chip or ratio flag is invalid, or when
+no chip count is known. `--roofline-targets` needs `--config-name`;
+`--min-roofline-ratio` needs `--roofline-targets`;
+`--enforce-unverified-rooflines` needs `--min-roofline-ratio`;
+`--min-gpu-ratio` needs `--agentx-gpu-reference`; and `--config-name` and the
+chip flags need `--roofline-targets` or `--agentx-gpu-reference`. All nine speed
+and chip flags are usage errors outside perf check mode.
 
 ```bash
 python3 scripts/vllm/benchmarking/check_regression.py \
@@ -126,7 +147,8 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --results-dir <DIR> \
   --roofline-targets scripts/vllm/benchmarking/baselines/perf/v7x/roofline_targets.json \
   --config-name qwen3.5-397b-fp8-tp1-dp8-ep \
-  --chips 4
+  --chips 4 \
+  --min-roofline-ratio 0.8
 ```
 
 ### Accuracy (`--mode eval`)
@@ -244,7 +266,7 @@ a malformed `_policy` block.
 
 Each mode accepts only the flags it reads: update mode takes `--baseline` and
 `--previous-baseline`; eval check mode takes `--results-dir`, `--baseline`,
-and `--tolerance`; perf check mode adds the roofline and chip flags above;
+and `--tolerance`; perf check mode adds the speed-gate and chip flags above;
 `--mode perf --calibrate` takes `--results-dir` and
 `--gate-ttft-max-concurrency`; and `--mode eval --calibrate` takes
 `--results-dir` and `--task-filter`. Any other flag is a usage error (exit

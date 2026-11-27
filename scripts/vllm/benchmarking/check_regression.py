@@ -16,7 +16,8 @@
 
 Usage:
     check_regression.py --mode <perf|eval> --results-dir <dir> --baseline <baseline.json> [--tolerance 0.05]
-    check_regression.py --mode perf --results-dir <dir> --roofline-targets <targets.json> --config-name <config> [--chips <N>]
+    check_regression.py --mode perf --results-dir <dir> --roofline-targets <targets.json> --config-name <config> [--chips <N>] [--min-roofline-ratio 0.8]
+    check_regression.py --mode perf --results-dir <dir> --agentx-gpu-reference <gpu.json> --chips <N> [--min-gpu-ratio 0.8]
     check_regression.py --mode <perf|eval> --calibrate --results-dir <dir> [<dir2> ...]
     check_regression.py --mode update --baseline <new.json> [--previous-baseline <old.json>]
 """  # noqa: E501
@@ -38,6 +39,7 @@ _SCRIPT_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
+import agentx_gate  # noqa: E402
 import baseline_policy  # noqa: E402
 import roofline_gate  # noqa: E402
 
@@ -58,10 +60,23 @@ RooflineCellTarget = roofline_gate.RooflineCellTarget
 RooflineConfigTarget = roofline_gate.RooflineConfigTarget
 NotModeledEntry = roofline_gate.NotModeledEntry
 RooflineTargets = roofline_gate.RooflineTargets
+RooflineRow = roofline_gate.RooflineRow
+RooflineCheckResult = roofline_gate.RooflineCheckResult
 ResolvedRoofline = roofline_gate.ResolvedRoofline
 resolve_physical_chips = roofline_gate.resolve_physical_chips
 load_roofline_targets = roofline_gate.load_roofline_targets
 check_roofline = roofline_gate.check_roofline
+
+AGENTX_AGGREGATE_RE = agentx_gate.AGENTX_AGGREGATE_RE
+CONC_DIR_RE = agentx_gate.CONC_DIR_RE
+AgentxPoint = agentx_gate.AgentxPoint
+GpuReferencePoint = agentx_gate.GpuReferencePoint
+AgentxGpuRow = agentx_gate.AgentxGpuRow
+AgentxGpuCheckResult = agentx_gate.AgentxGpuCheckResult
+load_agentx_results = agentx_gate.load_agentx_results
+load_gpu_reference = agentx_gate.load_gpu_reference
+interpolate_gpu_reference = agentx_gate.interpolate_gpu_reference
+check_agentx_gpu = agentx_gate.check_agentx_gpu
 
 
 class Metric(NamedTuple):
@@ -521,6 +536,7 @@ UPDATE_MODE_ARGS = frozenset({"mode", "baseline", "previous_baseline"})
 PERF_CHECK_ARGS = (
     frozenset({"mode", "results_dir", "baseline", "tolerance"})
     | roofline_gate.ROOFLINE_ARG_NAMES
+    | agentx_gate.AGENTX_ARG_NAMES
 )
 PERF_CALIBRATE_ARGS = frozenset(
     {"mode", "calibrate", "results_dir", "gate_ttft_max_concurrency"}
@@ -605,72 +621,117 @@ def _run_eval_check(args: argparse.Namespace, tolerance: float) -> int:
 def _run_perf_check(
     parser: argparse.ArgumentParser, args: argparse.Namespace, tolerance: float
 ) -> int:
-    if args.roofline_targets is None:
-        for flag, value in (
-            ("--config-name", args.config_name),
-            ("--chips", args.chips),
-            ("--prefill-chips", args.prefill_chips),
-            ("--decode-chips", args.decode_chips),
-        ):
-            if value is not None:
-                parser.error(f"{flag} requires --roofline-targets")
-    elif not args.config_name:
-        parser.error("--config-name is required with --roofline-targets")
+    roofline_gate.validate_perf_speed_flags(parser, args)
 
     baseline = None
     not_modeled = None
     resolved_roofline: ResolvedRoofline | None = None
+    chips: int | None = None
+    gpu_ref: list[GpuReferencePoint] | None = None
+    agentx_points: list[AgentxPoint] = []
     try:
         if args.baseline is not None:
             baseline = gated_entries(load_json_object(args.baseline))
-        if args.roofline_targets is not None:
+        if args.roofline_targets is not None or args.agentx_gpu_reference is not None:
             chips = resolve_physical_chips(
                 args.chips, args.prefill_chips, args.decode_chips
             )
+        if args.min_roofline_ratio is not None:
+            roofline_gate.positive_ratio(
+                args.min_roofline_ratio, "--min-roofline-ratio"
+            )
+        if args.min_gpu_ratio is not None:
+            roofline_gate.positive_ratio(args.min_gpu_ratio, "--min-gpu-ratio")
+        if args.roofline_targets is not None:
             roofline = load_roofline_targets(args.roofline_targets)
             not_modeled, resolved_roofline = roofline_gate.resolve_roofline_config(
                 roofline, args.config_name, chips
             )
+        if args.agentx_gpu_reference is not None:
+            gpu_ref = load_gpu_reference(args.agentx_gpu_reference)
+            if chips is None:
+                raise ValueError(
+                    "--chips or --prefill-chips/--decode-chips is required with "
+                    "--agentx-gpu-reference"
+                )
+        results = load_perf_results(args.results_dir[0])
+        # A config that is not modeled only prints a note, which needs no results.
+        if not results and (baseline is not None or resolved_roofline is not None):
+            raise ValueError(
+                f"no isl*_osl*_c*.json files found in {args.results_dir[0]}"
+            )
+        if resolved_roofline is not None:
+            roofline_gate.validate_roofline_matches(
+                results,
+                resolved_roofline.cells,
+                resolved_roofline.config_name,
+                min_ratio=args.min_roofline_ratio,
+            )
+        if gpu_ref is not None:
+            agentx_points = agentx_gate.load_agentx_points_checked(args.results_dir[0])
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
-        return 2
-
-    results = load_perf_results(args.results_dir[0])
-    # A config that is not modeled only prints a note, which needs no results.
-    if not results and (baseline is not None or resolved_roofline is not None):
-        print(
-            f"ERROR: no isl*_osl*_c*.json files found in {args.results_dir[0]}",
-            file=sys.stderr,
-        )
         return 2
 
     if resolved_roofline is not None:
         roofline_gate.warn_if_chip_count_differs(resolved_roofline)
 
-    perf_failed = 0
+    failures: list[str] = []
     if baseline is not None:
         perf_failed = check_perf(results, baseline, tolerance)
+        if perf_failed:
+            failures.append(
+                f"FAILED: {perf_failed} metric(s) regressed beyond "
+                f"{tolerance * 100:.2f}%"
+            )
 
+    roofline_result: RooflineCheckResult | None = None
     if not_modeled is not None:
         roofline_gate.print_not_modeled_note(args.config_name, not_modeled)
     elif resolved_roofline is not None:
-        check_roofline(
+        roofline_result = check_roofline(
             results,
             resolved_roofline.cells,
             resolved_roofline.config_name,
             resolved_roofline.num_chips,
+            min_ratio=args.min_roofline_ratio,
+            enforce_unverified=args.enforce_unverified_rooflines,
         )
+        if roofline_result:
+            assert args.min_roofline_ratio is not None
+            failures.extend(
+                roofline_gate.format_roofline_failures(
+                    roofline_result, args.min_roofline_ratio
+                )
+            )
 
-    if perf_failed:
-        print(
-            f"FAILED: {perf_failed} metric(s) regressed beyond {tolerance * 100:.2f}%",
-            file=sys.stderr,
+    if gpu_ref is not None:
+        assert chips is not None
+        label = args.config_name or args.results_dir[0].name
+        agentx_result = check_agentx_gpu(
+            agentx_points,
+            gpu_ref,
+            chips,
+            config_name=label,
+            min_ratio=args.min_gpu_ratio,
         )
+        if agentx_result:
+            assert args.min_gpu_ratio is not None
+            failures.extend(
+                agentx_gate.format_agentx_failures(agentx_result, args.min_gpu_ratio)
+            )
+
+    if failures:
+        for line in failures:
+            print(line, file=sys.stderr)
         return 1
-    if baseline is not None:
+    roofline_gated = roofline_result is not None and any(
+        r.status.startswith(("PASS", "FAIL")) for r in roofline_result.rows
+    )
+    if baseline is not None or roofline_gated or args.min_gpu_ratio is not None:
         print("PASS: all gated metrics within tolerance.")
     else:
-        print("PASS: advisory roofline check complete.")
+        print("PASS: advisory speed checks complete.")
     return 0
 
 
@@ -723,6 +784,7 @@ def main() -> int:
         "0 ungates TTFT for every cell.",
     )
     roofline_gate.add_roofline_args(parser)
+    agentx_gate.add_agentx_args(parser)
     args = parser.parse_args()
 
     accepted = _MODE_ALLOWED_ARGS[(args.mode, args.calibrate)]
@@ -745,8 +807,16 @@ def main() -> int:
         parser.error("--results-dir is required in perf and eval modes")
     if args.calibrate:
         return _run_calibrate(args)
-    if args.baseline is None and args.roofline_targets is None:
-        either = " or --roofline-targets" if args.mode == "perf" else ""
+    if (
+        args.baseline is None
+        and args.roofline_targets is None
+        and args.agentx_gpu_reference is None
+    ):
+        either = (
+            ", --roofline-targets, or --agentx-gpu-reference"
+            if args.mode == "perf"
+            else ""
+        )
         parser.error(f"--baseline{either} is required unless --calibrate is set")
     if len(args.results_dir) != 1:
         parser.error("--results-dir may only be given once in check mode")

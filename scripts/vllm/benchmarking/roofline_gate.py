@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Roofline target loading and speed reporting for check_regression.py."""
+"""Roofline target loading and speed gating for check_regression.py."""
 
 from __future__ import annotations
 
@@ -28,9 +28,20 @@ if _SCRIPT_DIR not in sys.path:
 
 import baseline_policy  # noqa: E402
 
+# Guards exact-threshold ratio checks against binary floating-point error.
+FLOAT_EPSILON = 1e-9
+
 ROOFLINE_CELL_STATUSES = ("ok", "unverified", "oom")
 ROOFLINE_ARG_NAMES = frozenset(
-    {"roofline_targets", "config_name", "chips", "prefill_chips", "decode_chips"}
+    {
+        "roofline_targets",
+        "config_name",
+        "chips",
+        "prefill_chips",
+        "decode_chips",
+        "min_roofline_ratio",
+        "enforce_unverified_rooflines",
+    }
 )
 
 
@@ -44,14 +55,16 @@ def add_roofline_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--config-name",
-        help="The config to look up in --roofline-targets.",
+        help="The config to look up in --roofline-targets, or the label for "
+        "--agentx-gpu-reference.",
     )
     parser.add_argument(
         "--chips",
         type=int,
         default=None,
-        help="Physical chips serving the run, for --roofline-targets. "
-        "Default: the config's num_chips in that file.",
+        help="Physical chips serving the run, for --roofline-targets or "
+        "--agentx-gpu-reference. Default for roofline: the config's num_chips "
+        "in that file.",
     )
     parser.add_argument(
         "--prefill-chips",
@@ -66,6 +79,44 @@ def add_roofline_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Physical decode chips of a disaggregated run.",
     )
+    parser.add_argument(
+        "--min-roofline-ratio",
+        type=float,
+        default=None,
+        help="Perf check mode: minimum fraction of roofline throughput required "
+        "(for example 0.8). Advisory when omitted.",
+    )
+    parser.add_argument(
+        "--enforce-unverified-rooflines",
+        action="store_true",
+        help="Perf check mode: enforce --min-roofline-ratio on status=='unverified' "
+        "roofline cells too.",
+    )
+
+
+def validate_perf_speed_flags(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Enforce companion-flag requirements for roofline and AgentX speed flags."""
+    if args.roofline_targets is None and args.agentx_gpu_reference is None:
+        for flag, value in (
+            ("--config-name", args.config_name),
+            ("--chips", args.chips),
+            ("--prefill-chips", args.prefill_chips),
+            ("--decode-chips", args.decode_chips),
+        ):
+            if value is not None:
+                parser.error(
+                    f"{flag} requires --roofline-targets or --agentx-gpu-reference"
+                )
+    if args.roofline_targets is not None and not args.config_name:
+        parser.error("--config-name is required with --roofline-targets")
+    if args.min_roofline_ratio is not None and args.roofline_targets is None:
+        parser.error("--min-roofline-ratio requires --roofline-targets")
+    if args.enforce_unverified_rooflines and args.min_roofline_ratio is None:
+        parser.error("--enforce-unverified-rooflines requires --min-roofline-ratio")
+    if args.min_gpu_ratio is not None and args.agentx_gpu_reference is None:
+        parser.error("--min-gpu-ratio requires --agentx-gpu-reference")
 
 
 class RooflineCellTarget(NamedTuple):
@@ -86,6 +137,31 @@ class NotModeledEntry(NamedTuple):
 class RooflineTargets(NamedTuple):
     targets: dict[str, RooflineConfigTarget]
     not_modeled: dict[str, NotModeledEntry]
+
+
+class RooflineRow(NamedTuple):
+    cell: str
+    metric: str
+    actual_per_chip: float
+    target_per_chip: float
+    ratio: float
+    status: str
+    failure_reason: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class RooflineCheckResult:
+    """Outcome of a roofline speed check; truthy when any cell failed."""
+
+    config_name: str
+    rows: list[RooflineRow]
+
+    @property
+    def failed_rows(self) -> list[RooflineRow]:
+        return [r for r in self.rows if r.status.startswith("FAIL")]
+
+    def __bool__(self) -> bool:
+        return bool(self.failed_rows)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -111,6 +187,14 @@ def positive_int(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer, got {value!r}")
     return value
+
+
+def positive_ratio(value: Any, name: str) -> float:
+    """Validate that value is a strictly positive finite float (not bool)."""
+    num = finite_number(value)
+    if num is None or num <= 0:
+        raise ValueError(f"{name} must be a positive finite number, got {value!r}")
+    return num
 
 
 def resolve_physical_chips(
@@ -223,6 +307,22 @@ def resolve_roofline_config(
     )
 
 
+def validate_roofline_matches(
+    results: dict[str, dict[str, Any]],
+    cells: dict[str, RooflineCellTarget],
+    config_name: str,
+    *,
+    min_ratio: float | None = None,
+) -> None:
+    """Require at least one non-oom matched cell when blocking roofline gating."""
+    if min_ratio is not None and not any(
+        k in cells and cells[k].status != "oom" for k in results
+    ):
+        raise ValueError(
+            f"no non-oom measured cells match roofline targets for {config_name!r}"
+        )
+
+
 def print_not_modeled_note(config_name: str, entry: NotModeledEntry) -> None:
     """Print the advisory note for a config in `not_modeled`."""
     print(f"\n## Roofline speed check (`{config_name}`: not modeled)\n")
@@ -251,62 +351,121 @@ def check_roofline(
     cells: dict[str, RooflineCellTarget],
     config_name: str,
     num_chips: int,
-) -> None:
-    """Print measured output throughput per physical chip as a % of roofline."""
-    rows: list[tuple[str, str, float, float, str, str]] = []
+    *,
+    min_ratio: float | None = None,
+    enforce_unverified: bool = False,
+) -> RooflineCheckResult:
+    """Compare measured output throughput per physical chip against roofline."""
+    validate_roofline_matches(results, cells, config_name, min_ratio=min_ratio)
+
+    rows: list[RooflineRow] = []
     for key in sorted(results):
         if key not in cells:
-            rows.append((key, "(no roofline cell)", 0.0, 0.0, "-", "SKIP"))
+            rows.append(RooflineRow(key, "(no roofline cell)", 0.0, 0.0, 0.0, "SKIP"))
             continue
         cell = cells[key]
         if cell.status == "oom":
             rows.append(
-                (
+                RooflineRow(
                     key,
                     "output_token_throughput_per_chip",
                     0.0,
                     cell.output_token_throughput_per_chip,
-                    "-",
+                    0.0,
                     "SKIP (oom)",
                 )
             )
             continue
+        unverified = cell.status == "unverified"
+        gated = min_ratio is not None and (not unverified or enforce_unverified)
         measured = finite_number(results[key].get("output_throughput"))
         if measured is None or measured < 0:
+            reason = (
+                "missing output_throughput"
+                if measured is None
+                else "negative output_throughput"
+            )
             rows.append(
-                (
+                RooflineRow(
                     key,
                     "output_token_throughput_per_chip",
                     0.0,
                     cell.output_token_throughput_per_chip,
-                    "-",
-                    "SKIP",
+                    0.0,
+                    f"FAIL ({reason})" if gated else "SKIP",
+                    reason if gated else None,
                 )
             )
             continue
         actual_per_chip = measured / num_chips
         ratio = actual_per_chip / cell.output_token_throughput_per_chip
-        status = "ADVISORY (unverified)" if cell.status == "unverified" else "ADVISORY"
+        if not gated:
+            status = "ADVISORY (unverified)" if unverified else "ADVISORY"
+        else:
+            assert min_ratio is not None
+            ok = ratio + FLOAT_EPSILON >= min_ratio
+            suffix = " (unverified)" if unverified else ""
+            status = f"{'PASS' if ok else 'FAIL'}{suffix}"
         rows.append(
-            (
+            RooflineRow(
                 key,
                 "output_token_throughput_per_chip",
                 actual_per_chip,
                 cell.output_token_throughput_per_chip,
-                f"{ratio * 100:.2f}%",
+                ratio,
                 status,
             )
         )
 
+    mode_desc = (
+        "advisory" if min_ratio is None else f"min ratio: {min_ratio * 100:.2f}%"
+    )
     print(
         f"\n## Roofline speed check (`{config_name}`, "
-        f"{num_chips} physical chips, advisory)\n"
+        f"{num_chips} physical chips, {mode_desc})\n"
     )
     print("| key | metric | actual/chip | roofline/chip | % of roofline | status |")
     print("|---|---|---:|---:|---:|---|")
-    for cell_key, metric, actual, target, pct, status in rows:
+    for row in rows:
+        pct_str = (
+            "-"
+            if (
+                row.target_per_chip <= 0
+                or row.status.startswith("SKIP")
+                or row.failure_reason is not None
+            )
+            else f"{row.ratio * 100:.2f}%"
+        )
         print(
-            f"| `{cell_key}` | {metric} | {actual:.2f} | "
-            f"{target:.2f} | {pct} | {status} |"
+            f"| `{row.cell}` | {row.metric} | {row.actual_per_chip:.2f} | "
+            f"{row.target_per_chip:.2f} | {pct_str} | {row.status} |"
         )
     print()
+    return RooflineCheckResult(config_name, rows)
+
+
+def format_roofline_failures(
+    result: RooflineCheckResult, min_ratio: float
+) -> list[str]:
+    """Build stderr FAILED diagnostic lines for a failing roofline gate."""
+    lines: list[str] = []
+    for row in result.failed_rows:
+        min_target = row.target_per_chip * min_ratio
+        if row.failure_reason is not None:
+            lines.append(
+                f"FAILED: config={result.config_name} cell={row.cell} "
+                f"metric={row.metric} "
+                f"measured=invalid ({row.failure_reason}) "
+                f"target>={min_target:.2f} tok/s/chip "
+                f"({min_ratio * 100:.2f}% of {row.target_per_chip:.2f})"
+            )
+        else:
+            lines.append(
+                f"FAILED: config={result.config_name} cell={row.cell} "
+                f"metric={row.metric} "
+                f"measured={row.actual_per_chip:.2f} tok/s/chip "
+                f"({row.ratio * 100:.2f}%) "
+                f"target>={min_target:.2f} tok/s/chip "
+                f"({min_ratio * 100:.2f}% of {row.target_per_chip:.2f})"
+            )
+    return lines
