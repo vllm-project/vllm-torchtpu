@@ -285,6 +285,7 @@ def _pallas_rpa_kernel_impl(
     kv_layout: batched_rpa_configs.KVLayout | None = None,
     block_major: bool = False,
     subpage_split: int = 1,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     pool_shape = kv_cache.shape
     # Fold the block-major pool's `(num_blocks, rows_per_block, *page)` layout so
@@ -358,6 +359,7 @@ def _pallas_rpa_kernel_impl(
         shard=shard,
         kv_block_cap=kv_block_cap,
         use_causal_mask=use_causal_mask,
+        scoped_vmem_sizing=scoped_vmem_sizing,
         kv_layout=kv_layout,
     )
     if len(pool_shape) == 4:
@@ -392,6 +394,7 @@ def _pallas_rpa_kernel_default(
     skip_kv_update: bool,
     use_causal_mask: bool = True,
     block_major: bool = False,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Default Pallas RPA kernel entry — used by `PallasAttentionBackendImpl`.
 
@@ -418,6 +421,7 @@ def _pallas_rpa_kernel_default(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
+        scoped_vmem_sizing=scoped_vmem_sizing,
         block_major=block_major,
     )
 
@@ -449,6 +453,7 @@ def _pallas_rpa_kernel_local(
     soft_cap: float | None = None,
     skip_kv_update: bool,
     use_causal_mask: bool = True,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Local (non-shard_map) RPA entry for the tp=1 eagle3 draft.
 
@@ -479,6 +484,7 @@ def _pallas_rpa_kernel_local(
         shard=False,
         kv_block_cap=_DRAFT_KV_BLOCK_CAP,
         use_causal_mask=use_causal_mask,
+        scoped_vmem_sizing=scoped_vmem_sizing,
     )
 
 
@@ -502,6 +508,7 @@ def _pallas_rpa_kernel_default_bundled(
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     use_causal_mask: bool = True,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Default bundled Pallas RPA kernel entry for block-major execution.
 
@@ -537,6 +544,7 @@ def _pallas_rpa_kernel_default_bundled(
         sm_scale=sm_scale,
         soft_cap=soft_cap,
         use_causal_mask=use_causal_mask,
+        scoped_vmem_sizing=scoped_vmem_sizing,
     )
     return new_bundle, outputs
 
@@ -956,6 +964,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         self.logits_soft_cap = logits_soft_cap
         self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
         self.use_causal_mask = kwargs.get("use_causal_mask", True)
+        self._scoped_vmem_sizing = envs.TPU_ATTN_SCOPED_VMEM_SIZING
 
         if alibi_slopes is not None:
             raise NotImplementedError("Alibi slopes is not supported.")
@@ -1058,6 +1067,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             if use_pcp_streaming and vllm_config is not None
             else None
         )
+        scoped_vmem_sizing = self._scoped_vmem_sizing
         pcp_kv_layout = (
             self.kv_layout
             if use_pcp_streaming
@@ -1076,6 +1086,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             block_major,
             self._subpage_split,
+            scoped_vmem_sizing,
         )
         existing = self._kernel_config_cache.get(config_key)
         if existing is not None:
@@ -1119,6 +1130,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             self.decode_query_size,
             block_major,
             self._subpage_split,
+            scoped_vmem_sizing,
         )
         existing = self._kernel_registry.get(registry_key)
         if existing is not None:
@@ -1147,6 +1159,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
         else:
             entry_params = inspect.signature(self._kernel_entry).parameters
             entry_kwargs: dict[str, Any] = {}
+            if "scoped_vmem_sizing" in entry_params:
+                entry_kwargs["scoped_vmem_sizing"] = scoped_vmem_sizing
             if "kv_layout" in entry_params:
                 entry_kwargs["kv_layout"] = self.kv_layout
             elif self._pool_is_seq_along_lane:
@@ -1361,6 +1375,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             )
         ctx = get_vllm_model_wrapper_context()
         mesh = ctx.mesh
+        scoped_vmem_sizing = self._scoped_vmem_sizing
         registry_key = (
             self._kernel_op_prefix_bundled,
             self.sliding_window,
@@ -1371,6 +1386,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             k_scale,
             v_scale,
             self.use_causal_mask,
+            scoped_vmem_sizing,
         )
         existing = self._bundled_kernel_registry.get(registry_key)
         if existing is not None:
@@ -1378,6 +1394,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         kernel_instance_id = self._allocate_kernel_instance_id()
         op_name = f"{self._kernel_op_prefix_bundled}_{kernel_instance_id}"
+        entry_kwargs: dict[str, Any] = {}
+        if (
+            "scoped_vmem_sizing"
+            in inspect.signature(self._kernel_entry_bundled).parameters
+        ):
+            entry_kwargs["scoped_vmem_sizing"] = scoped_vmem_sizing
         wrapped_fn = functools.partial(
             self._kernel_entry_bundled,
             mesh=mesh,
@@ -1388,6 +1410,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             sm_scale=self.scale,
             soft_cap=self.logits_soft_cap,
             use_causal_mask=self.use_causal_mask,
+            **entry_kwargs,
         )
 
         # Eager kernel iteration mode runs without JAX tracing; omit donation

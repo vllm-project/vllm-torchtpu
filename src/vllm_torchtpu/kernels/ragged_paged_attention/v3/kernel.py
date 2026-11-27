@@ -240,6 +240,12 @@ def get_smem_estimate_bytes(max_num_seqs, pages_per_seq):
     return cdiv(total_bits, 8)
 
 
+_MIB = 1024 * 1024
+# Base compile headroom above explicit scratch for Mosaic internal scratch and
+# register spills, matching collectives/all_gather_matmul.py.
+SCOPED_VMEM_MARGIN_BYTES = 8 * _MIB
+
+
 def get_vmem_estimate_bytes(
     actual_num_kv_heads,
     actual_num_q_heads_per_kv_head,
@@ -248,9 +254,11 @@ def get_vmem_estimate_bytes(
     bkv_sz,
     q_dtype,
     kv_dtype,
+    out_dtype=jnp.float32,
 ):
     q_packing = get_dtype_packing(q_dtype)
     kv_packing = get_dtype_packing(kv_dtype)
+    out_bits = 32 // get_dtype_packing(out_dtype)
     num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head, q_packing)
     bkv_stride = cdiv(actual_num_kv_heads * 2, kv_packing)
     if has_bank_conflicts(bkv_stride):
@@ -267,12 +275,156 @@ def get_vmem_estimate_bytes(
         * (32 // q_packing)
         +
         # l_ref + m_ref
-        2 * (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * 32
+        2 * (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * out_bits
         +
         # acc_ref
-        (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * 32
+        (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * head_dim) * out_bits
     )
     return cdiv(total_bits, 8)
+
+
+def get_scoped_vmem_limit_bytes(
+    actual_num_kv_heads: int,
+    actual_num_q_heads_per_kv_head: int,
+    actual_head_dim: int,
+    bq_sz: int,
+    bkv_sz: int,
+    bq_csz: int,
+    bkv_csz: int,
+    q_dtype: Any,
+    kv_dtype: Any,
+    out_dtype: Any,
+    vmem_capacity_bytes: int,
+    *,
+    has_soft_cap: bool = False,
+    has_sliding_window: bool = False,
+    margin_bytes: int | None = None,
+) -> int:
+    """Size per-launch RPA v3 scoped VMEM from scratch plus compute headroom.
+
+    Accounts for explicit scratch allocations (``get_vmem_estimate_bytes``),
+    sub-16-bit packed KV unpack spill tiles (pipelined across up to 2 KV heads
+    in ``attention_loop``), and implicit float32 logits/softmax working tiles
+    during a compute step, rounded up to 1 MiB and capped at
+    ``vmem_capacity_bytes``.
+    """
+    margin = SCOPED_VMEM_MARGIN_BYTES if margin_bytes is None else margin_bytes
+    scratch_bytes = get_vmem_estimate_bytes(
+        actual_num_kv_heads,
+        actual_num_q_heads_per_kv_head,
+        actual_head_dim,
+        bq_sz,
+        bkv_sz,
+        q_dtype,
+        kv_dtype,
+        out_dtype,
+    )
+    q_packing = get_dtype_packing(q_dtype)
+    kv_packing = get_dtype_packing(kv_dtype)
+    head_dim = align_to(actual_head_dim, 128)
+    num_q_per_kv = align_to(actual_num_q_heads_per_kv_head, q_packing)
+    # In load_bkv, sub-16-bit packed KV (e.g. fp8/int8, kv_packing > 2) is
+    # loaded as uint32[bkv_csz, head_dim] and bit-unpacked into k/v compute
+    # tiles on Mosaic's VMEM stack. Because attention_loop pipelines
+    # step1_qk_softmax(head i) with step2_pv(head i-1), up to
+    # min(2, actual_num_kv_heads) heads' unpacked tiles are live simultaneously.
+    kv_unpack_bytes = (
+        min(2, actual_num_kv_heads) * bkv_csz * head_dim * 4 if kv_packing > 2 else 0
+    )
+    # Implicit f32 logits tile [bq_csz * num_q_per_kv, bkv_csz] plus live
+    # softmax/masking temporaries (soft_cap / sliding_window keep extra tiles).
+    logits_tile_bytes = bq_csz * num_q_per_kv * bkv_csz * 4
+    live_tiles = 6 if (has_soft_cap or has_sliding_window) else 4
+    headroom = kv_unpack_bytes + max(margin, live_tiles * logits_tile_bytes)
+    return min(vmem_capacity_bytes, align_to(scratch_bytes + headroom, _MIB))
+
+
+def get_cost_estimate(
+    max_num_tokens: int,
+    max_num_seqs: int,
+    page_size: int,
+    pages_per_seq: int,
+    actual_num_q_heads: int,
+    actual_num_kv_heads: int,
+    actual_head_dim: int,
+    q_dtype: Any,
+    kv_dtype: Any,
+    *,
+    bq_sz: int,
+    bq_csz: int,
+    bkv_sz: int,
+    bkv_csz: int,
+    static_q_len: int | None = None,
+    skip_kv_update: bool = False,
+    use_causal_mask: bool = True,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+) -> pl.CostEstimate:
+    """Estimate attention work and HBM traffic from bucket and tile shapes."""
+    max_num_tokens = int(max_num_tokens)
+    max_num_seqs = int(max_num_seqs)
+    page_size = int(page_size)
+    pages_per_seq = int(pages_per_seq)
+    actual_num_q_heads = int(actual_num_q_heads)
+    actual_num_kv_heads = int(actual_num_kv_heads)
+    actual_head_dim = int(actual_head_dim)
+    bq_sz = int(bq_sz)
+    bq_csz = int(bq_csz)
+    bkv_sz = int(bkv_sz)
+    bkv_csz = int(bkv_csz)
+    if static_q_len is None:
+        active_seqs = min(max_num_tokens, max_num_seqs)
+        # Each nonempty request can spend a whole tile on its first token.
+        q_blocks = active_seqs + (max_num_tokens - active_seqs) // bq_sz
+    else:
+        static_q_len = int(static_q_len)
+        bq_sz = min(bq_sz, static_q_len)
+        active_seqs = min(max_num_seqs, max_num_tokens // static_q_len)
+        q_blocks = active_seqs * cdiv(static_q_len, bq_sz)
+    q_tile_rows = align_to(bq_sz, min(bq_csz, bq_sz))
+
+    max_kv_len = pages_per_seq * page_size
+    kv_compute_tokens = kv_dma_tokens = max_kv_len
+    if sliding_window is not None and use_causal_mask:
+        # The first DMA can start before the window. For prefill the last DMA
+        # can extend past the causal cutoff, even though compute stops there.
+        window_span = int(sliding_window) + bq_sz
+        kv_compute_tokens = min(max_kv_len, window_span + bkv_sz - 1)
+        dma_tail = 0 if static_q_len == 1 else bkv_sz - 1
+        kv_dma_tokens = min(max_kv_len, window_span + bkv_sz - 1 + dma_tail)
+    # A continuation prefill may attend to the full cache bucket. There is
+    # no triangular discount. A fresh KV subtile is rounded within each DMA block.
+    full_blocks, tail = divmod(kv_compute_tokens, bkv_sz)
+    kv_tile_rows = full_blocks * align_to(bkv_sz, bkv_csz) + align_to(tail, bkv_csz)
+    head_dim = align_to(actual_head_dim, 128)
+    q_packing = get_dtype_packing(q_dtype)
+    q_heads = actual_num_kv_heads * align_to(
+        actual_num_q_heads // actual_num_kv_heads, q_packing
+    )
+
+    scores = q_blocks * q_tile_rows * q_heads * kv_tile_rows
+    flops = 4 * scores * head_dim
+    transcendentals = scores * (2 if soft_cap is not None else 1)
+
+    # The output aliases the query buffer, so both DMAs move the query dtype;
+    # out_dtype only sets the accumulator.
+    qo_bytes = 2 * max_num_tokens * q_heads * head_dim * jnp.dtype(q_dtype).itemsize
+    kv_packing = get_dtype_packing(kv_dtype)
+    kv_token_bytes = (
+        align_to(2 * actual_num_kv_heads, kv_packing)
+        * head_dim
+        * jnp.dtype(kv_dtype).itemsize
+    )
+    kv_update_bytes = 0 if skip_kv_update else 2 * max_num_tokens * kv_token_bytes
+    # Each query block fetches its own pages, including shared prefixes. The
+    # physical page pool (which can also be a flattened bundle) is irrelevant.
+    kv_read_bytes = q_blocks * kv_dma_tokens * kv_token_bytes
+
+    return pl.CostEstimate(
+        flops=flops,
+        transcendentals=transcendentals,
+        bytes_accessed=qo_bytes + kv_update_bytes + kv_read_bytes,
+    )
 
 
 def get_kv_cache_shape(
@@ -1624,6 +1776,8 @@ def get_default_block_sizes(
         "p_block_sizes",
         "m_block_sizes",
         "vmem_limit_bytes",
+        "use_scoped_vmem_limit",
+        "use_cost_estimate",
         "debug_mode",
         "disable_bounds_checks",
         "disable_semaphore_checks",
@@ -1664,6 +1818,8 @@ def ragged_paged_attention(
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
+    use_scoped_vmem_limit: bool = False,
+    use_cost_estimate: bool = False,
     # Debug params.
     debug_mode: bool = False,
     disable_bounds_checks: bool = True,
@@ -1700,7 +1856,12 @@ def ragged_paged_attention(
       d_block_sizes: the block sizes for the decode case.
       p_block_sizes: the block sizes for the prefill case.
       m_block_sizes: the block sizes for the mixed case.
-      vmem_limit_bytes: the vmem limit for the pallas kernel.
+      vmem_limit_bytes: the vmem limit for the pallas kernel. Explicit values
+        always override ``use_scoped_vmem_limit``.
+      use_scoped_vmem_limit: if true and ``vmem_limit_bytes`` is None, size each
+        launch's scoped VMEM limit from ``get_scoped_vmem_limit_bytes``.
+      use_cost_estimate: if true, attach an analytical ``pl.CostEstimate`` to
+        each launch's ``pallas_call``.
       debug_mode: if true, RPA does not issue any DMAs or run flash attention but
         print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
       disable_bounds_checks: if true, disable bounds checks.
@@ -1719,10 +1880,7 @@ def ragged_paged_attention(
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
         mask_value = cast(float, jnp.finfo(out_dtype).min)
 
-    if vmem_limit_bytes is None:
-        # TODO(jevinjiang, jacobplatin): change this to use
-        # `get_vmem_estimate_bytes` when VREG spilling is fixed.
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
+    vmem_capacity_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
 
     static_validate_inputs(
         q,
@@ -1851,6 +2009,52 @@ def ragged_paged_attention(
             init_bkv_update_ids,
         )
 
+        if vmem_limit_bytes is not None:
+            launch_vmem_limit = vmem_limit_bytes
+        elif use_scoped_vmem_limit:
+            launch_vmem_limit = get_scoped_vmem_limit_bytes(
+                actual_num_kv_heads,
+                actual_num_q_heads_per_kv_head,
+                actual_head_dim,
+                bq_sz,
+                bkv_sz,
+                bq_csz,
+                bkv_csz,
+                q.dtype,
+                kv_cache.dtype,
+                out_dtype,
+                vmem_capacity_bytes,
+                has_soft_cap=soft_cap is not None,
+                has_sliding_window=sliding_window is not None,
+            )
+        else:
+            launch_vmem_limit = vmem_capacity_bytes
+
+        cost_estimate = (
+            get_cost_estimate(
+                max_num_tokens=max_num_tokens,
+                max_num_seqs=max_num_seqs,
+                page_size=page_size,
+                pages_per_seq=pages_per_seq,
+                actual_num_q_heads=actual_num_q_heads,
+                actual_num_kv_heads=actual_num_kv_heads,
+                actual_head_dim=actual_head_dim,
+                q_dtype=q.dtype,
+                kv_dtype=kv_cache.dtype,
+                bq_sz=bq_sz,
+                bq_csz=bq_csz,
+                bkv_sz=bkv_sz,
+                bkv_csz=bkv_csz,
+                static_q_len=static_q_len,
+                skip_kv_update=skip_kv_update,
+                use_causal_mask=use_causal_mask,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+            )
+            if use_cost_estimate
+            else None
+        )
+
         scope_name = (
             f"RPA{case.symbol}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
         )
@@ -1888,7 +2092,7 @@ def ragged_paged_attention(
                 # TODO(jevinjiang): since each sequence depends on the previous
                 # one, we need some extra work to support Megacore mode.
                 dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_bytes,
+                vmem_limit_bytes=launch_vmem_limit,
                 # Paged attention invokes multiple small DMAs for each pages
                 # instead of a single large DMA. Therefore, the overhead of bounds
                 # checking becomes too significant so we disable it.
@@ -1906,6 +2110,7 @@ def ragged_paged_attention(
                 jax.ShapeDtypeStruct(shape=kv_cache.shape, dtype=kv_cache.dtype),
             ],
             input_output_aliases={7: 0, 9: 1},
+            cost_estimate=cost_estimate,
             name=scope_name,
         )
 
@@ -2002,6 +2207,8 @@ def ragged_paged_attention(
         "p_block_sizes",
         "m_block_sizes",
         "vmem_limit_bytes",
+        "use_scoped_vmem_limit",
+        "use_cost_estimate",
         "debug_mode",
         "disable_bounds_checks",
         "disable_semaphore_checks",

@@ -400,6 +400,7 @@ def sharded_ragged_paged_attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    scoped_vmem_sizing: bool = False,
 ):
     """Shards along KV heads."""
 
@@ -475,6 +476,10 @@ def sharded_ragged_paged_attention(
         if attention_chunk_size is not None:
             block_kwargs["p_block_sizes"] = _capped(rpa_default.RpaCase.PREFILL)
 
+    if not use_hd64 and rpa_func is ragged_paged_attention and scoped_vmem_sizing:
+        block_kwargs["use_scoped_vmem_limit"] = True
+        block_kwargs["use_cost_estimate"] = True
+
     def _ragged_paged_attention(*args):
         return func(
             *args,
@@ -519,6 +524,7 @@ def attention_bundled(
     sm_scale: float | None = None,
     soft_cap: float | None = None,
     use_causal_mask: bool = True,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Dispatches ragged paged attention over the bundled block-major KV cache
     across the TPU mesh.
@@ -585,6 +591,8 @@ def attention_bundled(
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            use_scoped_vmem_limit=scoped_vmem_sizing,
+            use_cost_estimate=scoped_vmem_sizing,
         )
         return new_bundle, output
 
@@ -652,6 +660,7 @@ def attention(
     kv_block_cap: int | None = None,
     use_causal_mask: bool = True,
     kv_layout: batched_rpa_configs.KVLayout | None = None,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -693,6 +702,7 @@ def attention(
         skip_kv_update=skip_kv_update,
         rpa_func=rpa_func,
         kv_layout=kv_layout,
+        scoped_vmem_sizing=scoped_vmem_sizing,
         soft_cap=soft_cap,
         shard=shard,
         kv_block_cap=kv_block_cap,

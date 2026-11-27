@@ -45,6 +45,12 @@ from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
+from vllm_torchtpu.kernels.ragged_paged_attention.v3 import kernel as rpa_kernel
+from vllm_torchtpu.layers.adapter import attention as rpa_attention
+from vllm_torchtpu.layers.adapter.attention import (
+    PallasAttentionBackendImpl,
+    _pallas_rpa_kernel_local,
+)
 from vllm_torchtpu.layers.adapter.custom_ops import (
     gdn_attention_op,
     kda_attention_op,
@@ -399,3 +405,108 @@ def test_kda_pooled_op_flag_reaches_kernel(monkeypatch, scoped_flag, enabled):
         jnp.asarray([1, 3, 3], _I32),
     )
     assert seen == [(enabled, enabled)]
+
+
+def _rpa_mesh():
+    return AbstractMesh(
+        (1, 1, 1),
+        ("attn_dp", "expert", "model"),
+        (AxisType.Auto,) * 3,
+        abstract_device=AbstractDevice("TPU v6 lite", 1, "tpu"),
+    )
+
+
+def _rpa_impl(monkeypatch):
+    # Fresh op registries, so each build reaches pallas.jax_op.
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_kernel_registry", {})
+    monkeypatch.setattr(PallasAttentionBackendImpl, "_bundled_kernel_registry", {})
+    return PallasAttentionBackendImpl(
+        num_heads=4,
+        head_size=128,
+        scale=128**-0.5,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="bf16",
+    )
+
+
+def _rpa_args(*, num_layers: int | None = None):
+    tokens, seqs, pages_per_seq, page_size = 16, 4, 4, 128
+    kv_shape = rpa_kernel.get_kv_cache_shape(
+        seqs * pages_per_seq + 1, page_size, 1, 128, jnp.bfloat16
+    )
+    if num_layers is None:
+        cache = (_sds(kv_shape, _BF16),)
+    else:
+        bundle = (kv_shape[0], num_layers, *kv_shape[1:])
+        cache = (_sds(bundle, _BF16), _sds((), _I32))
+    return (
+        *cache,
+        _sds((tokens, 4, 128), _BF16),
+        _sds((tokens, 1, 128), _BF16),
+        _sds((tokens, 1, 128), _BF16),
+        _sds((seqs,), _I32),
+        _sds((seqs * pages_per_seq,), _I32),
+        _sds((seqs + 1,), _I32),
+        _sds((3,), _I32),
+        None,
+    )
+
+
+def _lower_rpa(fn, args):
+    """Abstract TPU v6e launches; flag on gives estimated limits and costs."""
+    with (
+        use_abstract_mesh(_rpa_mesh()),
+        patch.object(rpa_kernel, "get_tpu_version", return_value=6),
+    ):
+        capacity = pltpu.get_tpu_info().vmem_capacity_bytes
+        calls = _extract_tpu_custom_calls(fn, args)
+    assert calls
+    return capacity, calls
+
+
+@on_off
+@pytest.mark.parametrize("local", [False, True], ids=["sharded", "local-draft"])
+def test_rpa_op_flag_reaches_lowered_launches(
+    monkeypatch, scoped_flag, cpu_vllm_config_context, enabled, local
+):
+    scoped_flag(enabled)
+    impl = _rpa_impl(monkeypatch)
+    if local:
+        # The tp=1 eagle3 draft rebinds the entry the same way.
+        impl._kernel_entry = _pallas_rpa_kernel_local
+    captured = {}
+    with (
+        set_vllm_model_wrapper_context(mesh=_rpa_mesh(), vllm_config=None),
+        patch.object(
+            rpa_attention.pallas, "jax_op", side_effect=_capture_jax_op(captured)
+        ),
+    ):
+        impl._build_rpa_kernel(None, None, None)
+
+    capacity, calls = _lower_rpa(captured["fn"], _rpa_args())
+    for name, cfg in calls:
+        assert ("cost_estimate" in cfg["custom_call_config"]) == enabled, name
+        assert (_scoped_vmem_bytes(cfg) < capacity) == enabled, name
+
+
+@on_off
+def test_rpa_bundled_op_flag_reaches_lowered_launches(
+    monkeypatch, scoped_flag, cpu_vllm_config_context, enabled
+):
+    scoped_flag(enabled)
+    impl = _rpa_impl(monkeypatch)
+    captured = {}
+    with (
+        set_vllm_model_wrapper_context(mesh=_rpa_mesh(), vllm_config=None),
+        patch.object(
+            rpa_attention.pallas, "jax_op", side_effect=_capture_jax_op(captured)
+        ),
+    ):
+        impl._build_bundled_kernel(None, None, None)
+
+    capacity, calls = _lower_rpa(captured["fn"], _rpa_args(num_layers=2))
+    for name, cfg in calls:
+        assert ("cost_estimate" in cfg["custom_call_config"]) == enabled, name
+        assert (_scoped_vmem_bytes(cfg) < capacity) == enabled, name
