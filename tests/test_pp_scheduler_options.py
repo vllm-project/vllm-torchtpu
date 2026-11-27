@@ -1001,6 +1001,51 @@ def _waiting(request_id: str, arrival_time: float) -> SimpleNamespace:
     )
 
 
+def _host_tier_sched(estimates):
+    """A scheduler with an estimating connector: ``estimates`` maps a request
+    id to its host-tier hit; HBM warmth comes from the request id."""
+    s = _sched()
+    s._prefix_warmth = lambda r: 4_000 if r.request_id == "warm" else 0
+    s._get_block_size = lambda: 2_176
+    s._blocks_to_admit = lambda r: 3
+    s._hit_estimator = SimpleNamespace(
+        estimate_external_hit_tokens=lambda r, n: estimates.get(r.request_id, 0)
+    )
+    return s
+
+
+def test_a_host_tier_hit_ranks_between_warm_and_cold_when_its_load_fits():
+    s = _host_tier_sched({"host": 6_000})
+    reqs = {rid: _waiting(rid, 1_000.0) for rid in ("warm", "host", "cold")}
+    room = (10, 10)
+    ranks = {
+        rid: s._rank_and_warmth(r, now=1_000.0, ext_room=room)
+        for rid, r in reqs.items()
+    }
+    assert ranks["warm"][0] < ranks["host"][0] < ranks["cold"][0]
+    # Its warmth is the estimate; the cold request's is 0.
+    assert ranks["host"][1] == 6_000
+    assert ranks["cold"][1] == 0
+    # No room to admit it (3 blocks), or no room for the load (6,000 tokens
+    # are 3 blocks of 2,176): vLLM would refuse it, so it ranks as cold.
+    for no_room in ((2, 10), (10, 2)):
+        demoted = s._rank_and_warmth(reqs["host"], now=1_000.0, ext_room=no_room)
+        assert demoted == ranks["cold"]
+
+
+def test_the_promotion_counts_a_host_tier_hit_only_if_its_load_fits():
+    s = _host_tier_sched({"host": 6_000})
+    head, host = _waiting("cold", 1_000.0), _waiting("host", 1_000.0)
+    s._get_num_free_blocks = lambda: 10
+    s._free_blocks_for_ext = lambda: 10
+    ranked = s._rank_window([head, host])
+    assert ranked[1][0] < ranked[0][0] and ranked[1][1] == 6_000
+    # Two free blocks for the load: the promotion ranks it as cold.
+    s._free_blocks_for_ext = lambda: 2
+    ranked = s._rank_window([head, host])
+    assert ranked[1] == ranked[0]
+
+
 def test_promotion_ranks_with_the_free_block_fit():
     # The head (old, so aged ahead) does not fit the free blocks; a warm
     # request that fits takes the free-block-fit tier and is promoted. Without

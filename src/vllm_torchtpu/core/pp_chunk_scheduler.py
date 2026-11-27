@@ -406,16 +406,7 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
             return
         window = list(islice(queue, self._paw_sort_window))
         free_blocks = self._get_num_free_blocks()
-        # The sort runs on a KV producer only (_init_paw_sort), whose async
-        # loads reserve blocks before the host-tier hit can land. vLLM refuses
-        # such a load for that reservation, and retention evicts only on a
-        # real shortage, so the blocks retention pins (free_blocks counts
-        # them) are not room for a host-tier load.
-        free_blocks_for_ext = max(
-            0,
-            self.kv_cache_manager.block_pool.get_num_free_blocks()
-            - self._inflight_prefill_reserved_blocks(),
-        )
+        free_blocks_for_ext = self._free_blocks_for_ext()
         # The step's wall time, the clock _promote_warmest ages on.
         now = self._now()
         keys = [
@@ -465,6 +456,7 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         if ext_warmth > 0 and not (
             fits_hbm and math.ceil(ext_warmth / block_size) <= free_blocks_for_ext
         ):
+            # vLLM would refuse the load: rank the request by its local hit.
             ext_warmth = 0
         warmth = local_warmth + ext_warmth
         uncached = max(num_tokens - warmth, 0)
@@ -472,6 +464,19 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         aged = eff_uncached - self._get_paw_aging_rate() * _wait_seconds(request, now)
         started = request.num_preemptions > 0 or request.num_computed_tokens > 0
         return (0 if fits_hbm else 1, 0 if started else 1, aged, request.arrival_time)
+
+    def _free_blocks_for_ext(self) -> int:
+        """Free blocks a host-tier load can take: the pool's free blocks less
+        the async-load reservation. The sort and the promotion run on a KV
+        producer, whose async loads reserve blocks before the host-tier hit can
+        land; vLLM refuses such a load for that reservation, and retention
+        evicts only on a real shortage, so the blocks retention pins
+        (``_get_num_free_blocks`` counts them) are not room for the load."""
+        return max(
+            0,
+            self.kv_cache_manager.block_pool.get_num_free_blocks()
+            - self._inflight_prefill_reserved_blocks(),
+        )
 
     def _get_paw_aging_rate(self) -> float:
         """Uncached prompt tokens credited per second a request has waited
@@ -520,8 +525,13 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         request: Any,
         free_blocks_for_fit: int | None = None,
         now: float | None = None,
+        ext_room: tuple[int, int] | None = None,
     ) -> tuple[tuple[int, float, float], int]:
-        """Return (sort_key, warmth) by (effective) uncached tokens."""
+        """Return (sort_key, warmth) by (effective) uncached tokens.
+
+        ``ext_room`` is (free blocks, free blocks for a host-tier load): with
+        it, a host-tier hit counts only when vLLM would admit the request and
+        take the load, as in the waiting-queue sort (``_paw_sort_key``)."""
         local_warmth = self._prefix_warmth(request)
         hbm_cold_tokens = max(request.num_tokens - local_warmth, 0)
         hbm_eff_cost = self._quad_cost(hbm_cold_tokens, local_warmth)
@@ -556,6 +566,15 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
                 local_warmth,
             )
         ext_warmth = self._external_warmth(request, 0)
+        if ext_warmth > 0 and ext_room is not None:
+            free_blocks, free_blocks_for_ext = ext_room
+            if not (
+                self._blocks_to_admit(request) <= free_blocks
+                and math.ceil(ext_warmth / self._get_block_size())
+                <= free_blocks_for_ext
+            ):
+                # vLLM would refuse the load: rank the request as cold.
+                ext_warmth = 0
         if ext_warmth > 0:
             ext_cold_tokens = max(request.num_tokens - ext_warmth, 0)
             ext_eff_cost = self._quad_cost(ext_cold_tokens, ext_warmth)
@@ -576,10 +595,16 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         does not fit them (``_free_blocks_for_fit``)."""
         now = self._now()
         head = window[0]
-        head_scored = self._rank_and_warmth(head, now=now)
+        # The room a host-tier hit needs to count (see _rank_and_warmth).
+        ext_room = None
+        if self._hit_estimator is not None:
+            ext_room = (self._get_num_free_blocks(), self._free_blocks_for_ext())
+        head_scored = self._rank_and_warmth(head, now=now, ext_room=ext_room)
         free_blocks_for_fit = self._free_blocks_for_fit(head)
         return [head_scored] + [
-            self._rank_and_warmth(r, free_blocks_for_fit=free_blocks_for_fit, now=now)
+            self._rank_and_warmth(
+                r, free_blocks_for_fit=free_blocks_for_fit, now=now, ext_room=ext_room
+            )
             for r in window[1:]
         ]
 
