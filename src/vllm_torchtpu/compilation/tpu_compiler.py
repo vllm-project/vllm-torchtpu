@@ -771,6 +771,11 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
             return None
 
+    def _artifact_path(self, key: str) -> str:
+        """Where `compile` saves the artifact for `key` and `load` reads it."""
+        assert self.cache_dir is not None
+        return os.path.join(self.cache_dir, key)
+
     def _peer_paths(self, key: str) -> list[str]:
         """Where the other ranks have saved their artifact for `key`.
 
@@ -792,7 +797,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             glob.escape(prefix),
             glob.escape(key),
         )
-        mine = os.path.join(own, key)
+        mine = os.path.normpath(self._artifact_path(key))
         return sorted(p for p in glob.glob(pattern) if p != mine)
 
     def _mark_failed(self, key: str, fingerprint: str) -> None:
@@ -929,7 +934,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         save_path = (
-            os.path.join(self.cache_dir, key)
+            self._artifact_path(key)
             if key is not None
             and self.cache_dir is not None
             and not self._disable_cache
@@ -1056,6 +1061,10 @@ class TpuCompilerAdaptor(CompilerInterface):
         """
         assert isinstance(handle, tuple) and len(handle) == 3
         key, path, _saved_was_wrapped = handle
+        # The recorded path is absolute and goes stale when the cache root is
+        # moved or mounted elsewhere.
+        if self.cache_dir is not None:
+            path = self._artifact_path(key)
         size = _single_size(compile_range)
         # Screened on the load path too, and for a second reason beyond
         # "unsupported bucket": vLLM's key is (subgraph, bucket) with no graph
