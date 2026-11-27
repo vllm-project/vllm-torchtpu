@@ -291,10 +291,10 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
         if isinstance(layer, RoutedExperts):
             if self.is_layer_excluded(prefix):
                 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                    VllmUnquantizedFusedMoEMethod,
+                    VllmUnquantizedConfig,
                 )
 
-                return VllmUnquantizedFusedMoEMethod(self.get_moe_config(layer))
+                return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
             return VllmNvfp4MoEMethod(self, self.get_moe_config(layer))
         return None
 

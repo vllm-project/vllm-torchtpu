@@ -29,7 +29,7 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
 )
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-    VllmUnquantizedFusedMoEMethod,
+    VllmUnquantizedConfig,
 )
 
 if TYPE_CHECKING:
@@ -74,7 +74,11 @@ class VllmCompressedTensorsMoEMethod(CompressedTensorsMoEMethod):
             )
 
         if scheme_dict is None:  # ignored layer
-            return VllmUnquantizedFusedMoEMethod(quant_config.get_moe_config(layer))
+            method = VllmUnquantizedConfig.get_quant_method(
+                quant_config, layer, layer_name
+            )
+            assert isinstance(method, FusedMoEMethodBase)
+            return method
 
         weight_quant = cast("QuantizationArgs", scheme_dict.get("weights"))
         input_quant = cast(

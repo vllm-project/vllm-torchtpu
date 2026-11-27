@@ -15,7 +15,6 @@
 | `awq` | `int4` (packed) | `bf16` | Linear | Weight-only 4-bit AWQ checkpoints. |
 | `gptq` | `int4` / `int8` | `bf16` | Linear | Weight-only GPTQ checkpoints. |
 | `deepseek_v4_fp8` | `float8_e4m3fn` (with optional `fp4` MoE requantization) | `float8_e4m3fn` | Linear, MLA, Fused MoE | Specialized FP8 + W4A8 MoE path for `DeepSeek-V4`. |
-| `online_fp8` | `bf16` checkpoint -> quantized to `float8_e4m3fn` at load time | `float8_e4m3fn` | Linear, Fused MoE | Quantizes unquantized `bf16` checkpoints to FP8 on the fly during weight loading. |
 
 > [!TIP]
 > **Self-Describing Checkpoints**: When a Hugging Face checkpoint's `config.json` already contains a `quantization_config` section (such as `compressed-tensors`, `fp8`, or `mxfp4`), vLLM detects the format automatically—you do not need to pass `--quantization` unless overriding or enabling online load-time quantization.
@@ -65,4 +64,30 @@ vllm serve deepseek-ai/DeepSeek-V4-Pro-0813 \
   --enable-expert-parallel \
   --quantization deepseek_v4_fp8 \
   --kv-cache-dtype fp8_e4m3
+```
+
+---
+
+## 4. Selective Load-Time FP8 Quantization
+
+To quantize layers that a checkpoint stores in `bfloat16` (an unquantized checkpoint or layers left unquantized via `ignored_layers` / `exclude_modules`) to FP8 at load time, `vllm-torchtpu` provides two mechanisms:
+
+| Aspect | `--additional-config '{"tpu_online_fp8": ...}'` | `QUANTIZE_ON_LOAD_PREFIXES` |
+| :--- | :--- | :--- |
+| **Checkpoint formats** | `fp8`, `nvfp4` (`modelopt_fp4`), `modelopt_mixed` | Unquantized BF16, `compressed-tensors`, `modelopt_mixed`, `nvfp4`, `fp8`, `mxfp4`, `deepseek_v4_fp8` |
+| **Supported layers** | Unquantized `LinearBase` only | Unquantized `LinearBase` (always skips MLA `kv_b_proj`), unquantized `RoutedExperts` (without expert bias), and `VocabParallelEmbedding` / `ParallelLMHead` (`unquantized`, `compressed-tensors`, `modelopt_mixed` only) |
+| **Selection syntax** | `targets` / `exclude` (`fnmatch` globs or exact names; `hf_to_vllm_mapper` applied; rejects partial fused-layer matches) | Comma-separated dot-bounded prefix tokens (e.g., `"self_attn,shared_experts,layers.0.mlp"`) |
+| **Format knobs** | Always `float8_e4m3fn`; `weight_scheme`: `per_channel` (default), `per_tensor`, or `per_block` (`weight_block_size: [N_out, K_in]`, `K_in % 128 == 0`, dividing each TP-sharded `[N, K]` weight) | Fixed per-channel `float8_e4m3fn` for `LinearBase` and embeddings (ignores `REQUANTIZE_*`); `MOE_REQUANTIZE_WEIGHT_DTYPE` / `MOE_REQUANTIZE_BLOCK_SIZE` (default per-channel `float8_e4m3fn`) for `RoutedExperts` |
+| **Load & validation** | Layerwise conversion during sharded weight load (lower peak load HBM) + post-load audit (`validate_online_fp8`) | Converts in `process_weights_after_loading` without `validate_online_fp8` or layerwise sharded conversion |
+
+> [!WARNING]
+> Do not target the same `LinearBase` layer with both `tpu_online_fp8` and `QUANTIZE_ON_LOAD_PREFIXES`: doing so raises a `ValueError` during quantization dispatch. Use only one mechanism per prefix.
+
+```bash
+# Layerwise online FP8 for unquantized Linear layers on NVFP4 / FP8 checkpoints
+vllm serve nvidia/Qwen3-30B-A3B-NVFP4 \
+  --additional-config '{"tpu_online_fp8": {"enabled": true, "targets": ["*self_attn.*_proj"], "weight_scheme": "per_channel"}}'
+
+# Env-var prefix selection (covers excluded LinearBase and RoutedExperts)
+QUANTIZE_ON_LOAD_PREFIXES="self_attn,experts" vllm serve nvidia/Qwen3-30B-A3B-NVFP4
 ```

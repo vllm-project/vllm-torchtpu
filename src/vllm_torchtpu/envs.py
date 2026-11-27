@@ -1183,7 +1183,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Load remote KV before the first forward, not in a no-forward step.
     "TPU_RAIDEN_INLINE_LOAD": env_bool("TPU_RAIDEN_INLINE_LOAD", default=False),
-    # Comma-separated dot-bounded module prefix names to quantize to FP8 on load.
+    # Comma-separated dot-bounded module prefix names for checkpoint-unquantized
+    # layers to quantize on load: LinearBase and embeddings/LM head (on
+    # unquantized, compressed-tensors, and modelopt_mixed) use fixed per-channel
+    # float8_e4m3fn (REQUANTIZE_* does not apply); RoutedExperts use
+    # MOE_REQUANTIZE_*. Do not overlap with additional_config["tpu_online_fp8"].
+    # See docs/user_guide/quantization.md.
     # Examples: QUANTIZE_ON_LOAD_PREFIXES="self_attn,shared_experts,layers.0.mlp"
     "QUANTIZE_ON_LOAD_PREFIXES": lambda: [
         p.strip()

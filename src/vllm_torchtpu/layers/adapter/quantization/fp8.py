@@ -736,11 +736,10 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 fused_mapping=self.packed_modules_mapping,
             ):
                 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
-                    VllmUnquantizedFusedMoEMethod,
+                    VllmUnquantizedConfig,
                 )
 
-                moe_config = self.get_moe_config(layer)
-                return VllmUnquantizedFusedMoEMethod(moe_config)
+                return VllmUnquantizedConfig.get_quant_method(self, layer, prefix)
             moe_config = self.get_moe_config(layer)
             return VllmFp8MoEMethodTPU(self, moe_config)
 
