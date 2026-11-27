@@ -326,7 +326,9 @@ def exchange_head_pages(
     interpret: bool = False,
     in_flight: int = _EXCHANGE_PAGES_IN_FLIGHT,
     direct: bool = False,
-) -> jax.Array:
+    scale_cache: jax.Array | None = None,
+    scale_row0: int = 0,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Inside a ``shard_map`` over `axis`: every rank's pages of the KV head
     this rank (``rank``, ``int32[1]``) owns, ``[replicas, dcp, L / replicas,
     R, P, head_width]``: ``[j, src, i]`` is rank ``src``'s page ``pages[j *
@@ -344,8 +346,17 @@ def exchange_head_pages(
 
     `in_flight`: pages whose copies a rank keeps in flight. `direct`: rank
     ``src`` copies every part straight to every replica of the head (no
-    forwarding stage, ``replicas`` times the source's sends)."""
+    forwarding stage, ``replicas`` times the source's sends).
+
+    `scale_cache` (``[pages, SCALE_ROWS, lanes]`` f32, the K / V rows of
+    head ``h`` at ``scale_row0 + 2h`` / ``+ 1``; TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES):
+    each page's copy is joined by a copy of those two rows of the
+    destination's head into rows 0 / 1 of a second output ``[replicas, dcp,
+    L / replicas, SCALE_ROWS, lanes]`` (same slots, same live pages; its
+    other rows and slots are left unset). Returns ``(pages, scales)``
+    then."""
     _, rows, packing, _ = kv_cache.shape
+    with_scales = scale_cache is not None
     num_pages = pages.shape[0]
     part = num_pages // replicas
     # Slots past the live pages stay unset: harmless while no key reaches
@@ -363,9 +374,12 @@ def exchange_head_pages(
             device_id_type=pl.DeviceIdType.MESH,
         )
 
-    def kernel(
-        pages_ref, live_ref, rank_ref, kv_ref, out_ref, send_sem, recv_sem, fwd_sem
-    ):
+    def kernel(pages_ref, live_ref, rank_ref, kv_ref, *refs):
+        if with_scales:
+            sc_ref, out_ref, sc_out_ref, send_sem, recv_sem, fwd_sem = refs[:6]
+            sc_send_sem, sc_recv_sem, sc_fwd_sem = refs[6:]
+        else:
+            out_ref, send_sem, recv_sem, fwd_sem = refs
         me = rank_ref[0]
         replica = me % replicas
         counts = [live_part(live_ref[0], j, replicas, part) for j in range(replicas)]
@@ -387,8 +401,21 @@ def exchange_head_pages(
 
                 def send(d=d, head=head, jj=jj):
                     columns = pl.ds(head * head_width, head_width)
-                    src = kv_ref.at[pages_ref[jj * part + i], :, :, columns]
+                    page = pages_ref[jj * part + i]
+                    src = kv_ref.at[page, :, :, columns]
                     op(remote(src, out_ref.at[jj, me, i], send_sem, recv_sem, d))
+                    if with_scales:
+                        # Equal-sized copies on their own semaphores.
+                        kv_rows = pl.ds(scale_row0 + 2 * head, 2)
+                        op(
+                            remote(
+                                sc_ref.at[page, kv_rows],
+                                sc_out_ref.at[jj, me, i, pl.ds(0, 2)],
+                                sc_send_sem,
+                                sc_recv_sem,
+                                d,
+                            )
+                        )
 
                 pl.when(i < counts[jj])(send)
 
@@ -410,26 +437,30 @@ def exchange_head_pages(
             jax.lax.fori_loop(0, n, step, 0)
             jax.lax.fori_loop(jnp.maximum(n - ahead, 0), n, drain, 0)
 
-        def page_wait(sem):
+        def page_wait(sem, sc_sem=None):
             def wait(i, carry):
                 page = out_ref.at[0, 0, 0]
                 pltpu.make_async_copy(page, page, sem).wait()
+                if sc_sem is not None:
+                    rows = sc_out_ref.at[0, 0, 0, pl.ds(0, 2)]
+                    pltpu.make_async_copy(rows, rows, sc_sem).wait()
                 return carry
 
             return wait
 
+        sc_recv = sc_recv_sem if with_scales else None
         if direct:
             # Every part to every replica of its head: no forwarding stage.
             for j in range(replicas):
                 pipelined(counts[j], functools.partial(sends, j=j))
-            jax.lax.fori_loop(0, sum(counts) * dcp, page_wait(recv_sem), 0)
+            jax.lax.fori_loop(0, sum(counts) * dcp, page_wait(recv_sem, sc_recv), 0)
             return
         pipelined(counts[0], sends)
 
         mine = jnp.where(replica == 0, counts[0], counts[-1])
         for j in range(1, replicas - 1):
             mine = jnp.where(replica == j, counts[j], mine)
-        jax.lax.fori_loop(0, mine * dcp, page_wait(recv_sem), 0)
+        jax.lax.fori_loop(0, mine * dcp, page_wait(recv_sem, sc_recv), 0)
 
         # Forward the received pages to the head's other replicas.
         def forwards(i, op):
@@ -438,27 +469,55 @@ def exchange_head_pages(
                 for src in range(dcp):
                     page = out_ref.at[replica, src, i]
                     op(remote(page, page, send_sem, fwd_sem, peer))
+                    if with_scales:
+                        rows = sc_out_ref.at[replica, src, i, pl.ds(0, 2)]
+                        op(remote(rows, rows, sc_send_sem, sc_fwd_sem, peer))
 
         pipelined(mine, forwards)
         theirs = sum(counts) - mine
-        jax.lax.fori_loop(0, theirs * dcp, page_wait(fwd_sem), 0)
+        sc_fwd = sc_fwd_sem if with_scales else None
+        jax.lax.fori_loop(0, theirs * dcp, page_wait(fwd_sem, sc_fwd), 0)
 
+    out_shape = jax.ShapeDtypeStruct(
+        (replicas, dcp, part, rows, packing, head_width), kv_cache.dtype
+    )
+    any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    if not with_scales:
+        return pl.pallas_call(
+            kernel,
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=3,
+                grid=(1,),
+                in_specs=[any_spec],
+                out_specs=any_spec,
+                scratch_shapes=[pltpu.SemaphoreType.DMA(())] * 3,
+            ),
+            out_shape=out_shape,
+            compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
+            interpret=pltpu.InterpretParams() if interpret else False,
+            name="minimax_m3_msa_dcp_exchange_head_pages",
+        )(pages, live, rank, kv_cache)
+    if scale_cache.dtype != jnp.float32 or scale_cache.shape[1] < scale_row0 + 2 * (
+        dcp // replicas
+    ):
+        raise ValueError(f"scale pages {scale_cache.shape} miss K/V rows")
+    sc_shape = jax.ShapeDtypeStruct(
+        (replicas, dcp, part, *scale_cache.shape[1:]), jnp.float32
+    )
     return pl.pallas_call(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             grid=(1,),
-            in_specs=[pl.BlockSpec(memory_space=pl.ANY)],
-            out_specs=pl.BlockSpec(memory_space=pl.ANY),
-            scratch_shapes=[pltpu.SemaphoreType.DMA(())] * 3,
+            in_specs=[any_spec, any_spec],
+            out_specs=(any_spec, any_spec),
+            scratch_shapes=[pltpu.SemaphoreType.DMA(())] * 6,
         ),
-        out_shape=jax.ShapeDtypeStruct(
-            (replicas, dcp, part, rows, packing, head_width), kv_cache.dtype
-        ),
+        out_shape=(out_shape, sc_shape),
         compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
         interpret=pltpu.InterpretParams() if interpret else False,
-        name="minimax_m3_msa_dcp_exchange_head_pages",
-    )(pages, live, rank, kv_cache)
+        name="minimax_m3_msa_dcp_exchange_head_pages_scales",
+    )(pages, live, rank, kv_cache, scale_cache)
 
 
 EXCHANGE_ASYNC_ENV = "TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC"
@@ -477,6 +536,26 @@ def exchange_async() -> bool:
             "%s=1: head-parallel MSA page exchange started ahead of the "
             "decode-row attention and the selection merge, retired after them.",
             EXCHANGE_ASYNC_ENV,
+        )
+    return on
+
+
+_exchange_scales_logged = False
+
+
+def exchange_scales() -> bool:
+    """TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES, read at trace time via `envs`
+    (the synchronous exchange only)."""
+    global _exchange_scales_logged
+    from vllm_torchtpu import envs
+
+    on = bool(envs.TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES)
+    if on and not _exchange_scales_logged:
+        _exchange_scales_logged = True
+        init_logger(__name__).warning(
+            "TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES=1: the MSA DCP page exchange "
+            "copies the pages' K/V scale rows by remote DMA (no scale "
+            "gather / all-to-all / all-gather)."
         )
     return on
 
@@ -746,6 +825,26 @@ def _exchange_pages(
         )
         # The scales' XLA collectives run after the page copies retire.
         recv, scale_cache = jax.lax.optimization_barrier((recv, scale_cache))
+    elif exchange_scales():
+        # The scale rows ride the page copies: no gather, collectives or pad.
+        pages_of, row0 = msa_fp4.split_scales(scale_cache)
+        recv, recv_sc = exchange_head_pages(
+            kv_cache,
+            pages,
+            live.reshape(1),
+            rank.reshape(1),
+            axis=axis,
+            dcp=dcp,
+            replicas=replicas,
+            head_width=head_width,
+            interpret=interpret,
+            in_flight=in_flight,
+            direct=direct,
+            scale_cache=pages_of,
+            scale_row0=row0,
+        )
+        recv = recv.reshape(num_pages * dcp, rows, packing, head_width)
+        return recv, recv_sc.reshape(num_pages * dcp, *recv_sc.shape[3:])
     else:
         recv = exchange_head_pages(
             kv_cache,
