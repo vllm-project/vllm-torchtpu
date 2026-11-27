@@ -375,6 +375,9 @@ def k1_levers(spec: str | None = None) -> frozenset:
 K8_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_K8"
 # K8 levers ("+"-separated; "1" = `_K8_DEFAULT`): glue around the
 # head-parallel MSA prefill attention (`msa_dcp_heads.attend_and_merge`).
+# TPU7x bench (k8 mb1, served c48 T8192 DCP4 shapes, attend_and_merge per
+# layer, 60 instances, all bitwise): merge -39 us, scat -5 us, cmp -3 us,
+# merge+scat -41 us (of 2381 us); "1" = merge+scat.
 #   merge: the decode rows' outputs go into the head-parallel output by one
 #     in-place scatter (sorted, unique indices; the non-decode slots point
 #     past the end and are dropped) instead of a `lax.cond` between an
@@ -388,7 +391,7 @@ K8_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_K8"
 #     plus a scatter that drops every row when the decode rows lead.
 #   scat: like cmp, by two scatters (the distinct keys to their slots, the
 #     sorted entries' slots back to their positions) instead of the two sorts.
-_K8_DEFAULT = "merge+cmp"
+_K8_DEFAULT = "merge+scat"
 _K8_LEVERS = ("merge", "mergedus", "cmp", "scat")
 
 

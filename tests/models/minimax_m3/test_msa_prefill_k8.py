@@ -14,12 +14,12 @@
 """TPU_MINIMAX_M3_MSA_PREFILL_K8: the glue around the head-parallel MSA
 prefill attention keeps its bits.
 
-- unset / "0": no lever; "1" = "merge+cmp"; unknown levers raise;
+- unset / "0": no lever; "1" = "merge+scat"; unknown levers raise;
 - cmp / scat: the packed page cache tables equal the default sorts' tables;
 - merge / mergedus: the decode rows' merge into the head-parallel output
   equals the cond's, with the decode rows leading or not;
 - (host devices, interpret) `attend_and_merge` at DCP 4 with row split and a
-  packed page cache: K8 "1" / "mergedus+scat" give the incumbent's bits."""
+  packed page cache: K8 "1" / "mergedus+scat" / "merge+cmp" give the incumbent's bits."""
 
 import os
 import subprocess
@@ -41,7 +41,7 @@ def test_levers(monkeypatch):
     monkeypatch.delenv(ENV, raising=False)
     assert msa_attention_lse.k8_levers() == frozenset()
     assert msa_attention_lse.k8_levers("0") == frozenset()
-    assert msa_attention_lse.k8_levers("1") == {"merge", "cmp"}
+    assert msa_attention_lse.k8_levers("1") == {"merge", "scat"}
     assert msa_attention_lse.k8_levers("mergedus+scat") == {"mergedus", "scat"}
     monkeypatch.setenv(ENV, "merge")
     assert msa_attention_lse.k8_levers() == {"merge"}
@@ -193,7 +193,7 @@ _E2E = textwrap.dedent(
                             rep(dist)).astype(jnp.float32))
     a = run("0")
     assert np.abs(a).sum() > 0
-    for k8 in ("1", "mergedus+scat"):
+    for k8 in ("1", "mergedus+scat", "merge+cmp"):
         b = run(k8)
         assert np.array_equal(a, b), (k8, float(np.abs(a - b).max()))
     print("OK")
