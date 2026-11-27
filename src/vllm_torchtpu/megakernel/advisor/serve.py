@@ -34,17 +34,24 @@ from vllm_torchtpu.megakernel.core import errors
 from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import ChipSpec, resolve_chip_spec
 from .constants import DEFAULT_CHIP, MEASUREMENTS_SCHEMA
-from .models import MODEL_PRESETS, ModelProfile, resolve_model_profile
+from .models import (
+    MODEL_PRESETS,
+    VALID_EXECUTION_MODES,
+    ModelProfile,
+    resolve_model_profile,
+)
 from .regimes import RegimeSweepOptions, advise_regimes
 from .specs import (
     DispatchRegime,
     EfficiencySpec,
+    ExecutionMode,
     MeasurementsData,
     Phase,
     WorkloadSpec,
     as_mapping,
     as_scalar_number,
     load_measurements,
+    parse_host_table_hbm_overrides,
     scalar_bool,
     scalar_int,
 )
@@ -180,6 +187,21 @@ def _workload_from_json(payload: Mapping[str, object]) -> WorkloadSpec:
         if raw_alias is None
         else scalar_bool(raw_alias, "vmem_alias")
     )
+    raw_execution = payload.get("execution")
+    execution = (
+        cast(
+            "ExecutionMode",
+            _opt_enum_str(payload, "execution", "full", VALID_EXECUTION_MODES),
+        )
+        if raw_execution is not None
+        else defaults.execution
+    )
+    raw_table_overrides = payload.get("host_table_hbm_overrides")
+    host_table_hbm_overrides = (
+        parse_host_table_hbm_overrides(raw_table_overrides)
+        if raw_table_overrides is not None
+        else defaults.host_table_hbm_overrides
+    )
     return WorkloadSpec(
         phase=phase,
         batch=_opt_int(payload, "batch", defaults.batch),
@@ -199,6 +221,11 @@ def _workload_from_json(payload: Mapping[str, object]) -> WorkloadSpec:
         vmem_alias=vmem_alias,
         dispatch_regime=dispatch_regime,
         efficiency=efficiency,
+        execution=execution,
+        host_table_hbm_overrides=host_table_hbm_overrides,
+        layout_execution=defaults.layout_execution,
+        layout_host_table_hbm_overrides=defaults.layout_host_table_hbm_overrides,
+        kv_page_size=_opt_int(payload, "kv_page_size", defaults.kv_page_size),
     )
 
 

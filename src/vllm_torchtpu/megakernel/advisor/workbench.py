@@ -33,6 +33,7 @@ from .report import build_bucket_schedule, render_advisor_html
 from .specs import (
     DispatchRegime,
     EfficiencySpec,
+    ExecutionMode,
     MoEMode,
     ObjectiveMode,
     Phase,
@@ -41,6 +42,7 @@ from .specs import (
     as_mapping,
     as_scalar_number,
     as_sequence,
+    parse_host_table_hbm_overrides,
     scalar_bool,
     scalar_float,
     scalar_int,
@@ -188,6 +190,30 @@ def _coerce_workload(workload: WorkloadSpec | Mapping[str, object]) -> WorkloadS
         if raw_groups is not None
         else ()
     )
+    raw_table_overrides = workload_map.get("host_table_hbm_overrides")
+    host_table_hbm_overrides = (
+        parse_host_table_hbm_overrides(raw_table_overrides)
+        if raw_table_overrides is not None
+        else defaults.host_table_hbm_overrides
+    )
+    raw_layout_overrides = workload_map.get("layout_host_table_hbm_overrides")
+    layout_host_table_hbm_overrides = (
+        parse_host_table_hbm_overrides(raw_layout_overrides)
+        if raw_layout_overrides is not None
+        else defaults.layout_host_table_hbm_overrides
+    )
+    raw_execution = workload_map.get("execution")
+    execution = (
+        cast("ExecutionMode", scalar_str(raw_execution, "execution"))
+        if raw_execution is not None
+        else defaults.execution
+    )
+    raw_layout_exec = workload_map.get("layout_execution")
+    layout_execution = (
+        cast("ExecutionMode", scalar_str(raw_layout_exec, "layout_execution"))
+        if raw_layout_exec is not None
+        else defaults.layout_execution
+    )
     return WorkloadSpec(
         phase=cast(
             "Phase",
@@ -272,6 +298,11 @@ def _coerce_workload(workload: WorkloadSpec | Mapping[str, object]) -> WorkloadS
         latent_proj_tp=_map_opt_int(
             workload_map, "latent_proj_tp", defaults.latent_proj_tp
         ),
+        execution=execution,
+        host_table_hbm_overrides=host_table_hbm_overrides,
+        layout_execution=layout_execution,
+        layout_host_table_hbm_overrides=layout_host_table_hbm_overrides,
+        kv_page_size=_map_opt_int(workload_map, "kv_page_size", defaults.kv_page_size),
     )
 
 
@@ -307,14 +338,7 @@ def build_phase_map_payload(
     reference_workload = map_options.base_workload or WorkloadSpec(
         phase=phase,
         batch=RECOMMEND_DEFAULT_BATCH,
-        tp=parallelism.tp,
-        ep=parallelism.ep,
-        dp=parallelism.dp,
-        pp=parallelism.pp,
-        dcp=parallelism.dcp,
-        pcp=parallelism.pcp,
-        layer_groups=parallelism.layer_groups,
-    )
+    ).with_layout(parallelism, align_batch=True)
     dp_size = max(1, reference_workload.dp)
     t_grid = PHASE_PREFILL_TOKEN_GRID if phase == "prefill" else PHASE_T_GRID
     cells: list[dict[str, object]] = []
@@ -396,14 +420,7 @@ def build_workbench_seed(
         fallback_workload = WorkloadSpec(
             phase="decode",
             batch=RECOMMEND_DEFAULT_BATCH,
-            tp=parallelism.tp,
-            ep=parallelism.ep,
-            dp=parallelism.dp,
-            pp=parallelism.pp,
-            dcp=parallelism.dcp,
-            pcp=parallelism.pcp,
-            layer_groups=parallelism.layer_groups,
-        )
+        ).with_layout(parallelism, align_batch=True)
         default_eval = evaluate_workbench_payload(
             profile, fallback_workload, chip_spec, measurements=measurements
         )

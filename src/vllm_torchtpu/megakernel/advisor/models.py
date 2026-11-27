@@ -29,32 +29,53 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from math import ceil, gcd
 from pathlib import Path
-from typing import NoReturn, TypedDict, Unpack, cast
+from typing import NoReturn, TypedDict, Unpack, cast, get_args
 
 from vllm_torchtpu.megakernel.core import errors
 
 from .constants import (
+    BF16_BYTES,
     BITS_FP8,
+    CED_HALF_DEPTH_MODEL_TYPES,
     DTYPE_BYTES,
+    ENGRAM_SCALE_BLOCK_SIZE,
     FP8_DTYPES,
+    FP32_BYTES,
+    FP32_RECURRENT_STATE_MODEL_TYPES,
+    HC_SUBLAYERS_PER_LAYER,
     INDEXER_SCALE_BLOCK_SIZE,
     KDA_MODEL_TYPES,
+    MHC_DYNAMIC_PROJ_TERMS,
     MIN_HEAD_DIM,
     MIN_INTERVAL,
     MULTIMODAL_KEYS,
+    MXFP4_BLOCK_K,
     PRESETS_DIR,
     STRUCTURAL_LAYER_TAGS,
     SUPPORTED_ONCHIP_FAMILIES,
     VALID_LAYER_TOKENS,
     WORD_ALIGN_BYTES,
+    DcpSpan,
+    ExecutionMode,
+    HostTableShardAxis,
+    HyperConnectionKind,
+    SparseAttnKind,
+    SparseCacheReplication,
+    canonical_kv_dtype,
 )
 from .specs import (
+    HostTableBreakSpec,
+    HyperConnectionSpec,
+    SparseAttnSpec,
+    SparseCacheOwner,
     _checked_int,
     as_mapping,
     as_scalar_number,
     as_sequence,
     format_parallel_layout_label,
     int_tuple,
+    parse_host_table_hbm_overrides,
+    scalar_bool,
     scalar_float,
     scalar_int,
 )
@@ -84,6 +105,7 @@ QUANT_SUB_8BIT_WEIGHT_DTYPES: frozenset[str] = FP8_DTYPES | frozenset(
 )
 DTYPE_BASIS_PHRASES: Mapping[str, str] = {"config": "dtypes from the cited config"}
 PRESET_DTYPE_BASES: frozenset[str] = frozenset(DTYPE_BASIS_PHRASES)
+VALID_EXECUTION_MODES: frozenset[str] = frozenset(get_args(ExecutionMode))
 PRESET_REQUIRED_INT_KEYS: tuple[str, ...] = (
     "num_layers",
     "hidden_size",
@@ -114,6 +136,10 @@ PRESET_OPTIONAL_INT_DEFAULTS: Mapping[str, int] = {
     "num_indexer_layers": 0,
     "routed_expert_hidden_size": 0,
     "weight_block_k": 0,
+    "expert_weight_block_k": 0,
+    "o_lora_rank": 0,
+    "o_groups": 1,
+    "ced_boundary": 0,
     "residual_streams": 1,
 }
 
@@ -148,6 +174,10 @@ class _ProfileIntFields(TypedDict):
     num_indexer_layers: int
     routed_expert_hidden_size: int
     weight_block_k: int
+    expert_weight_block_k: int
+    o_lora_rank: int
+    o_groups: int
+    ced_boundary: int
     residual_streams: int
 
 
@@ -171,9 +201,11 @@ class _QuantFields:
     raw_expert_dtype: str
     raw_activation_dtype: str
     weight_block_k: int
+    expert_weight_block_k: int
     has_quant_config: bool
     has_explicit_torch_dtype: bool
     dense_unquantized: bool
+    act_scheme: str
 
 
 @dataclass(frozen=True)
@@ -214,6 +246,7 @@ class ModelProfile:
     expert_dtype: str = ""
     act_dtype: str = ""
     weight_block_k: int = 0
+    expert_weight_block_k: int = 0
     kv_dtype: str = "fp8"
     state_dtype: str = "bf16"
     model_type: str = ""
@@ -222,6 +255,34 @@ class ModelProfile:
     kv_compress_factor: float = 1.0
     residual_streams: int = 1
     dtype_source: str = ""
+    o_lora_rank: int = 0
+    o_groups: int = 1
+    ced_boundary: int = 0
+    dcp_span: DcpSpan = "kv_heads"
+    expert_act_dtype: str = ""
+    sparse_attn: SparseAttnSpec | None = None
+    hyper_connection: HyperConnectionSpec | None = None
+    host_tables: tuple[HostTableBreakSpec, ...] = ()
+
+
+def hyper_connection_total_params(profile: ModelProfile) -> int:
+    """Return unsharded total hyper-connection parameter count across all layers."""
+    hc = profile.hyper_connection
+    if hc is None or hc.num_streams <= 1:
+        return 0
+    streams = hc.num_streams
+    hidden = profile.hidden_size
+    if hc.kind == "lowrank":
+        rank = hc.lowrank_dim
+        per_sublayer = 2 * streams * hidden * rank + streams * streams * hidden
+        total = profile.num_layers * HC_SUBLAYERS_PER_LAYER * per_sublayer
+        if hc.has_final_mixer:
+            total += 2 * streams * hidden * rank
+        return total
+    per_sublayer = (streams * streams + MHC_DYNAMIC_PROJ_TERMS * streams) * (
+        streams * hidden
+    )
+    return profile.num_layers * HC_SUBLAYERS_PER_LAYER * per_sublayer
 
 
 def _arch_err(msg: str) -> NoReturn:
@@ -248,7 +309,9 @@ def _first_str(
 
 
 def has_dsa_profile(profile: ModelProfile) -> bool:
-    """Return whether `profile` carries sparse attention and indexer geometry."""
+    """Return whether `profile` carries legacy DSA sparse attention geometry."""
+    if profile.sparse_attn is not None:
+        return False
     return (
         profile.index_topk > 0
         and profile.index_n_heads > 0
@@ -270,11 +333,12 @@ def _derive_layer_families(
     """Derive canonical layer families from resolved model layer counts."""
     families: list[str] = []
     if attn_layers > 0:
-        families.append(
-            "dsa"
-            if has_dsa_profile(profile)
-            else ("mla" if profile.kv_lora_rank > 0 else "gqa")
-        )
+        if profile.sparse_attn is not None:
+            families.append(profile.sparse_attn.kind)
+        elif has_dsa_profile(profile):
+            families.append("dsa")
+        else:
+            families.append("mla" if profile.kv_lora_rank > 0 else "gqa")
     if profile.num_linear_layers > 0:
         normalized_model_type = profile.model_type.strip().lower()
         families.append("kda" if normalized_model_type in KDA_MODEL_TYPES else "gdn")
@@ -282,8 +346,18 @@ def _derive_layer_families(
         families.append("moe")
     if moe_layers < profile.num_layers and profile.intermediate_size > 0:
         families.append("dense_mlp")
+    if profile.hyper_connection is not None:
+        families.append(
+            "mhc" if profile.hyper_connection.kind == "mhc" else "hyper_connection"
+        )
+    elif profile.residual_streams > 1:
+        families.append("hyper_connection")
     if 0 < moe_layers < profile.num_layers:
         families.append("dense_prefix_moe")
+    if any(not tbl.hbm_resident for tbl in profile.host_tables) or (
+        profile.ced_boundary > 0
+    ):
+        families.append("fusion_break")
     return tuple(families)
 
 
@@ -303,6 +377,7 @@ def _validate_dtype_fields(profile: ModelProfile) -> None:
         "weight_dtype",
         "expert_dtype",
         "act_dtype",
+        "expert_act_dtype",
         "kv_dtype",
         "state_dtype",
     ):
@@ -312,6 +387,24 @@ def _validate_dtype_fields(profile: ModelProfile) -> None:
 
 def finalize_model_profile(profile: ModelProfile) -> ModelProfile:
     """Return an immutable ModelProfile with derived layer metadata populated."""
+    if profile.sparse_attn is not None:
+        profile = replace(
+            profile,
+            index_topk=0,
+            index_head_dim=0,
+            index_n_heads=0,
+            num_indexer_layers=0,
+            kv_compress_factor=1.0,
+        )
+    profile = replace(
+        profile,
+        residual_streams=(
+            profile.hyper_connection.num_streams
+            if profile.hyper_connection is not None
+            else profile.residual_streams
+        ),
+        kv_dtype=canonical_kv_dtype(profile.kv_dtype),
+    )
     num_layers = profile.num_layers
     if not (0 <= profile.num_linear_layers <= num_layers):
         _cfg_err(
@@ -350,6 +443,7 @@ def finalize_model_profile(profile: ModelProfile) -> ModelProfile:
         weight_dtype=w_dtype,
         expert_dtype=(profile.expert_dtype or w_dtype).strip().lower(),
         act_dtype=(profile.act_dtype or default_act_dtype).strip().lower(),
+        expert_act_dtype=profile.expert_act_dtype.strip().lower(),
         kv_dtype=profile.kv_dtype.strip().lower(),
         state_dtype=profile.state_dtype.strip().lower(),
         layer_families=profile.layer_families
@@ -383,16 +477,16 @@ def _int_field(
     return default
 
 
-def _default_serving_state_dtype(model_type: str) -> str:
+def default_serving_state_dtype(model_type: str) -> str:
     """Return the default TPU serving recurrent cache dtype for `model_type`.
 
     HuggingFace checkpoints record training/reference SSM precision (such as
     `mamba_ssm_dtype: "float32"` on Qwen3.5), not the serving cache layout.
-    `megakernel/core` stores GDN recurrent state in `bf16`, whereas KDA
-    (`KDA_MODEL_TYPES`) uses `fp32` recurrent state.
+    `megakernel/core` stores GDN recurrent state in `bf16`, whereas model types
+    in `FP32_RECURRENT_STATE_MODEL_TYPES` (KDA and `qwen4_exp`) use `fp32`.
     """
     normalized = model_type.strip().lower().removesuffix("_text")
-    return "fp32" if normalized in KDA_MODEL_TYPES else "bf16"
+    return "fp32" if normalized in FP32_RECURRENT_STATE_MODEL_TYPES else "bf16"
 
 
 def _extract_text_subconfig(raw_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -582,11 +676,13 @@ def _extract_quant_fields(
     torch_dtype = _first_str(cfg_pair, ("dtype", "torch_dtype"), "bf16")
     bits, group_size = _extract_compressed_tensors_weights(quant_map)
     raw_act = _first_str((quant_map, text_config, raw_config), ("act_dtype",)).lower()
-    if (
-        not raw_act
-        and str(quant_map.get("activation_scheme") or "").strip().lower() == "none"
-    ):
+    act_scheme = str(quant_map.get("activation_scheme") or "").strip().lower()
+    if not raw_act and act_scheme == "none":
         raw_act = "bf16"
+    raw_ed = _first_str((quant_map, text_config, raw_config), ("expert_dtype",)).lower()
+    moe_q_algo = str(quant_map.get("moe_quant_algo") or "").strip().lower()
+    if not raw_ed and moe_q_algo == "nvfp4":
+        raw_ed = "nvfp4"
     block_size_seq = as_sequence(
         quant_map.get("weight_block_size") or quant_map.get("block_size")
     )
@@ -607,20 +703,26 @@ def _extract_quant_fields(
         and group_size > 0
     ):
         block_k = group_size
+    scale_fmt = str(quant_map.get("scale_fmt") or "").strip().lower()
+    if raw_ed == "fp4" and scale_fmt == "ue8m0" and block_k == MXFP4_BLOCK_K:
+        raw_ed = "mxfp4"
+    expert_block_k = _int_field(quant_map, ("expert_weight_block_k",)) or _int_field(
+        text_config, ("expert_weight_block_k",)
+    )
     return _QuantFields(
         torch_dtype=torch_dtype,
         quant_method=q_method,
         raw_weight_dtype=_first_str(cfg_pair, ("weight_dtype",)).lower(),
-        raw_expert_dtype=_first_str(
-            (quant_map, text_config, raw_config), ("expert_dtype",)
-        ).lower(),
+        raw_expert_dtype=raw_ed,
         raw_activation_dtype=raw_act,
         weight_block_k=block_k,
+        expert_weight_block_k=expert_block_k,
         has_quant_config=bool(quant_map),
         has_explicit_torch_dtype=has_torch_dtype,
         dense_unquantized=_quant_skips_attention(
             quant_map, num_layers, full_attn_layers
         ),
+        act_scheme=act_scheme,
     )
 
 
@@ -739,33 +841,304 @@ def _extract_moe_dims(
     text_config: Mapping[str, object], num_layers: int, hidden_size: int
 ) -> tuple[int, int, int, int, int, int]:
     """Return MoE layer and hidden-dimension tuple from `text_config`."""
-    num_experts = _int_field(text_config, ("num_experts", "n_routed_experts"))
-    mlp_only = as_sequence(text_config.get("mlp_only_layers"))
-    dense_prefix_layers = _int_field(text_config, ("first_k_dense_replace",)) or (
-        len(mlp_only) if mlp_only is not None else 0
+    num_experts = _int_field(
+        text_config, ("num_experts", "n_routed_experts", "num_local_experts")
     )
+    mlp_only = as_sequence(text_config.get("mlp_only_layers"))
+    moe_freq_seq = as_sequence(text_config.get("moe_layer_freq"))
+    if moe_freq_seq is not None and len(moe_freq_seq) == num_layers:
+        moe_layer_count = sum(
+            1 for entry in moe_freq_seq if bool(as_scalar_number(entry))
+        )
+        dense_prefix_layers = max(0, num_layers - moe_layer_count)
+    else:
+        dense_prefix_layers = _int_field(text_config, ("first_k_dense_replace",)) or (
+            len(mlp_only) if mlp_only is not None else 0
+        )
     moe_layers = max(0, num_layers - dense_prefix_layers) * (num_experts > 0)
     default_ffn_size = (
         0 if (num_layers > 0 and moe_layers == num_layers) else 4 * hidden_size
     )
-    intermediate_size = _int_field(
+    raw_inter = _int_field(
         text_config, ("intermediate_size",), default=default_ffn_size
     )
     moe_inter = _int_field(
         text_config,
-        ("moe_intermediate_size",),
-        default=intermediate_size * (num_experts > 0),
+        ("moe_intermediate_size", "latent_moe_dim"),
+        default=raw_inter * (num_experts > 0),
+    )
+    intermediate_size = _int_field(
+        text_config, ("dense_intermediate_size",), default=raw_inter
     )
     n_shared = _int_field(text_config, ("n_shared_experts", "num_shared_experts"))
     shared_inter = _int_field(
         text_config,
-        ("shared_expert_intermediate_size",),
+        ("shared_expert_intermediate_size", "shared_intermediate_size"),
         default=n_shared * moe_inter,
     )
     top_k = _int_field(
         text_config, ("num_experts_per_tok", "num_experts_per_token")
     ) * (num_experts > 0)
     return num_experts, top_k, intermediate_size, moe_inter, shared_inter, moe_layers
+
+
+def _int_seq(raw: object) -> list[int]:
+    """Extract a list of integers from an optional JSON or HF sequence."""
+    return [int(as_scalar_number(item) or 0) for item in (as_sequence(raw) or ())]
+
+
+def _build_csa_owners(
+    sources: Sequence[int],
+    ratios: Sequence[int],
+    num_layers: int,
+    elems_and_cand: tuple[int, int, int],
+) -> tuple[SparseCacheOwner, ...]:
+    """Construct CSA2 KV or index owner descriptors across consumer layer ranges."""
+    record_elems, cand_src, cand_cap = elems_and_cand
+    sorted_srcs = sorted(src for src in sources if 0 <= src < num_layers)
+    owners: list[SparseCacheOwner] = []
+    for pos, src in enumerate(sorted_srcs):
+        stop = sorted_srcs[pos + 1] if pos + 1 < len(sorted_srcs) else num_layers
+        users = tuple(
+            lyr
+            for lyr in range(src, stop)
+            if not ratios or (lyr < len(ratios) and ratios[lyr] > 0)
+        )
+        ratio = float(ratios[src]) if src < len(ratios) and ratios[src] > 0 else 1.0
+        scan_cap = cand_cap if (cand_cap > 0 and src > cand_src) else None
+        owners.append(
+            SparseCacheOwner(
+                layer=src,
+                record_tokens=ratio,
+                record_elems=record_elems,
+                elem_bytes=1.0,
+                record_overhead_bytes=float(WORD_ALIGN_BYTES),
+                replication="per_rank",
+                users=users,
+                max_scan_records=scan_cap,
+            )
+        )
+    return tuple(owners)
+
+
+def _parse_hf_sparse_attn(
+    text_config: Mapping[str, object],
+    attn_geom: tuple[int, int, int, int],
+    *,
+    model_type: str = "",
+) -> tuple[SparseAttnSpec | None, DcpSpan, int]:
+    """Parse QSA, CSA2+SWA, or MSA sparse attention geometry from HF config."""
+    num_layers, num_kv_heads, head_dim, o_lora_rank = attn_geom
+    idx_budget = _int_field(text_config, ("indexer_budget",))
+    if idx_budget > 0:
+        ratio = max(1, _int_field(text_config, ("indexer_compress_ratio",), default=4))
+        return (
+            SparseAttnSpec(
+                kind="qsa",
+                window_tokens=0,
+                select_tokens=(idx_budget // ratio + 1) * ratio - 1,
+                index_heads=_int_field(text_config, ("indexer_n_heads",), default=4),
+                index_kv_heads=_int_field(
+                    text_config, ("indexer_kv_heads",), default=1
+                ),
+                index_dim=_int_field(text_config, ("indexer_head_dim",), default=128),
+                index_compress_ratio=ratio,
+            ),
+            "kv_heads",
+            0,
+        )
+    kv_srcs = _int_seq(text_config.get("kv_source_layer_ids"))
+    if kv_srcs:
+        idx_srcs = _int_seq(text_config.get("index_source_layer_ids"))
+        ratios = _int_seq(text_config.get("compress_ratios"))[:num_layers]
+        shared_mqa = num_kv_heads == 1 and o_lora_rank > 0
+        kv_elems = (1 if shared_mqa else 2) * max(1, num_kv_heads) * head_dim
+        idx_dim = _int_field(text_config, ("index_head_dim",), default=128)
+        cand_src = _int_field(text_config, ("candidate_source_layer_id",))
+        cand_cap = _int_field(text_config, ("candidate_topk_blocks",)) * _int_field(
+            text_config, ("candidate_block_size",)
+        )
+        kv_owners = _build_csa_owners(kv_srcs, ratios, num_layers, (kv_elems, 0, 0))
+        idx_owners = _build_csa_owners(
+            idx_srcs, ratios, num_layers, (idx_dim, cand_src, cand_cap)
+        )
+        swa_win = _int_field(text_config, ("sliding_window",))
+        win_b = float(kv_elems * BF16_BYTES) if swa_win > 0 else 0.0
+        ring_b = (
+            sum(1 for owner in kv_owners if owner.record_tokens > 1.0)
+            * 2
+            * head_dim
+            * FP32_BYTES
+        )
+        ced_lyr = _int_field(text_config, ("ced_boundary",))
+        if ced_lyr <= 0:
+            raw_mt = model_type or str(text_config.get("model_type") or "")
+            base_mt = raw_mt.strip().lower().removesuffix("_text")
+            ced_lyr = (
+                num_layers // 2
+                if (num_layers > 0 and base_mt in CED_HALF_DEPTH_MODEL_TYPES)
+                else 0
+            )
+        return (
+            SparseAttnSpec(
+                kind="csa",
+                window_tokens=swa_win,
+                window_bytes_per_token=win_b,
+                window_layers=tuple(range(num_layers)) if swa_win > 0 else (),
+                select_tokens=_int_field(text_config, ("index_topk",)),
+                index_heads=_int_field(text_config, ("index_n_heads",)),
+                index_dim=idx_dim,
+                kv_owners=kv_owners,
+                index_owners=idx_owners,
+                shared_kv_mqa=shared_mqa,
+                kv_owner_ring_bytes_per_req=ring_b,
+            ),
+            "kv_heads",
+            ced_lyr,
+        )
+    sp_map = as_mapping(text_config.get("sparse_attention_config"))
+    if sp_map is not None and bool(sp_map.get("use_sparse_attention", False)):
+        blk_sz = _int_field(sp_map, ("sparse_block_size",), default=128)
+        return (
+            SparseAttnSpec(
+                kind="msa",
+                window_tokens=_int_field(sp_map, ("sparse_local_block",), default=1)
+                * blk_sz,
+                select_tokens=_int_field(sp_map, ("sparse_topk_blocks",), default=16)
+                * blk_sz,
+                index_heads=_int_field(sp_map, ("sparse_num_index_heads",), default=4),
+                index_dim=_int_field(sp_map, ("sparse_index_dim",), default=128),
+            ),
+            "tp_group",
+            0,
+        )
+    return None, "kv_heads", 0
+
+
+def _parse_hf_hyper_connection(
+    text_config: Mapping[str, object],
+) -> HyperConnectionSpec | None:
+    """Parse low-rank HyperConnection or Sinkhorn mHC spec from HF `text_config`."""
+    hc_count = _int_field(text_config, ("hc_count",))
+    hc_lowrank = _int_field(text_config, ("hc_lowrank",))
+    if hc_count > 1 and hc_lowrank > 0:
+        return HyperConnectionSpec(
+            kind="lowrank",
+            num_streams=hc_count,
+            lowrank_dim=hc_lowrank,
+            has_final_mixer=True,
+        )
+    hc_mult = _int_field(text_config, ("hc_mult",))
+    sinkhorn_iters = _int_field(text_config, ("hc_sinkhorn_iters",))
+    if hc_mult > 1 and sinkhorn_iters > 0:
+        return HyperConnectionSpec(
+            kind="mhc",
+            num_streams=hc_mult,
+            sinkhorn_iters=sinkhorn_iters,
+        )
+    return None
+
+
+def _is_prime(value: int) -> bool:
+    """Return True when integer `value` is prime."""
+    first_prime = 2
+    first_odd_prime = 3
+    if value < first_prime:
+        return False
+    if value == first_prime:
+        return True
+    if value % first_prime == 0:
+        return False
+    return all(
+        value % divisor
+        for divisor in range(first_odd_prime, math.isqrt(value) + 1, first_prime)
+    )
+
+
+def compute_ple_table_bytes(
+    text_config: Mapping[str, object], ple_layer_count: int, ple_dim: int
+) -> int:
+    """Derive total PLE embedding table bytes from HF n-gram config fields."""
+    if ple_layer_count <= 0 or ple_dim <= 0:
+        return 0
+    base = _int_field(text_config, ("ngram_vocab_size_base",))
+    if base <= 0:
+        return 0
+    ngram_size = _int_field(text_config, ("ngram_size",), default=3)
+    heads_per_ngram = _int_field(text_config, ("heads_per_ngram",), default=8)
+    ngram_heads = max(1, (ngram_size - 1) * heads_per_ngram)
+    divisor = max(
+        1,
+        _int_field(text_config, ("make_ngram_vocab_size_divisible_by",), default=128),
+    )
+    shard_dim = max(1, ple_dim // ngram_heads)
+    total_rows = 0
+    prime = base - 1
+    for _ in range(ple_layer_count):
+        layer_sum = 0
+        for _ in range(ngram_heads):
+            prime += 1
+            while not _is_prime(prime):
+                prime += 1
+            layer_sum += prime
+        total_rows += ceil(layer_sum / divisor) * divisor
+    return total_rows * shard_dim
+
+
+def _parse_hf_host_tables(
+    text_config: Mapping[str, object], num_layers: int, hidden_size: int
+) -> tuple[HostTableBreakSpec, ...]:
+    """Parse PLE and Engram embedding lookup tables from HF `text_config`."""
+    tables: list[HostTableBreakSpec] = []
+    ple_ids = _int_seq(text_config.get("ple_layer_ids"))
+    if ple_ids:
+        ple_layers = tuple(
+            sorted({idx - 1 for idx in ple_ids if 1 <= idx <= num_layers})
+        )
+        ple_dim = _int_field(text_config, ("ple_embed_dim",), default=hidden_size)
+        ple_conv = _int_field(text_config, ("ple_conv_kernel_size",), default=4)
+        streams = max(1, _int_field(text_config, ("hc_count",), default=1))
+        state_b = max(0, ple_conv - 1) * (streams + 2) * ple_dim * FP32_BYTES
+        proj_p = hidden_size * (streams * hidden_size) + hidden_size * ple_dim
+        tables.append(
+            HostTableBreakSpec(
+                name="ple",
+                layers=ple_layers,
+                table_bytes_total=compute_ple_table_bytes(
+                    text_config, len(ple_layers), ple_dim
+                ),
+                h2d_bytes_per_token=float(ple_dim),
+                hbm_resident=True,
+                shard_axis="tp",
+                state_bytes_per_request=state_b,
+                dense_proj_params=proj_p,
+            )
+        )
+    eng_ids = _int_seq(text_config.get("engram_layer_ids"))
+    if eng_ids:
+        rows_seq = _int_seq(text_config.get("engram_num_embeddings"))
+        orders = max(
+            1, _int_field(text_config, ("engram_max_ngram_size",), default=4) - 1
+        )
+        eng_heads = _int_field(text_config, ("engram_n_heads",), default=8)
+        eng_dim = _int_field(text_config, ("engram_head_dim",), default=256)
+        row_b = (eng_dim * (ENGRAM_SCALE_BLOCK_SIZE + 1)) // ENGRAM_SCALE_BLOCK_SIZE
+        h2d_b = float(
+            orders * eng_heads * eng_dim * (1.0 + 1.0 / ENGRAM_SCALE_BLOCK_SIZE)
+        )
+        for idx, lyr in enumerate(eng_ids):
+            rows = rows_seq[idx] if idx < len(rows_seq) else 0
+            tables.append(
+                HostTableBreakSpec(
+                    name=f"engram_l{lyr}",
+                    layers=(lyr,),
+                    table_bytes_total=rows * row_b,
+                    h2d_bytes_per_token=h2d_b,
+                    hbm_resident=False,
+                    shard_axis="dp_local",
+                )
+            )
+    return tuple(tables)
 
 
 def _validate_hf_profile(
@@ -852,23 +1225,50 @@ def parse_hf_config_profile(
     ) = _extract_moe_dims(text_config, num_layers, hidden_size)
     attn_layers = max(0, num_layers - num_lin)
     quant = _extract_quant_fields(text_config, raw_config, num_layers, attn_layers)
-    idx_topk, index_head_dim, idx_nheads, idx_layers = _resolve_dsa_fields(
-        text_config, num_layers, attn_layers
+    num_kv_heads = _int_field(text_config, ("num_key_value_heads",), default=num_heads)
+    head_dim = _int_field(
+        text_config,
+        ("v_head_dim", "head_dim"),
+        default=hidden_size // num_heads if num_heads else 0,
+    )
+    o_lora_rank = _int_field(text_config, ("o_lora_rank",))
+    o_groups = _int_field(text_config, ("o_groups",), default=1)
+    sparse_attn, dcp_span, ced_boundary = _parse_hf_sparse_attn(
+        text_config,
+        (num_layers, num_kv_heads, head_dim, o_lora_rank),
+        model_type=model_type,
+    )
+    hyper_conn = _parse_hf_hyper_connection(text_config)
+    host_tables = _parse_hf_host_tables(text_config, num_layers, hidden_size)
+    idx_topk, index_head_dim, idx_nheads, idx_layers = (
+        (0, 0, 0, 0)
+        if sparse_attn is not None
+        else _resolve_dsa_fields(text_config, num_layers, attn_layers)
     )
     w_dtype, exp_dtype, dtype_src = _infer_quant_dtypes_with_source(quant)
+    out_gate_str = str(text_config.get("output_gate_type") or "").strip().lower()
+    has_attn_gate = bool(
+        text_config.get("attn_output_gate", False)
+        or text_config.get("mla_use_output_gate", False)
+    ) or out_gate_str not in ("", "none", "null", "false")
+    resolved_exp_act_dt = (
+        "fp8"
+        if (
+            not quant.raw_activation_dtype
+            and quant.dense_unquantized
+            and w_dtype in ("bf16", "fp16", "fp32")
+            and exp_dtype == "fp8"
+            and quant.act_scheme == "dynamic"
+        )
+        else ""
+    )
     profile = ModelProfile(
         name=name,
         num_layers=num_layers,
         hidden_size=hidden_size,
         num_attention_heads=num_heads,
-        num_kv_heads=_int_field(
-            text_config, ("num_key_value_heads",), default=num_heads
-        ),
-        head_dim=_int_field(
-            text_config,
-            ("v_head_dim", "head_dim"),
-            default=hidden_size // num_heads if num_heads else 0,
-        ),
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
         intermediate_size=intermediate_size,
         num_linear_layers=num_lin,
         linear_key_heads=_int_field(
@@ -915,14 +1315,20 @@ def parse_hf_config_profile(
         expert_dtype=exp_dtype,
         act_dtype=str(quant.raw_activation_dtype or "").lower(),
         weight_block_k=quant.weight_block_k,
+        expert_weight_block_k=quant.expert_weight_block_k,
         # Apply TPU serving cache policy rather than HF mamba_ssm_dtype.
-        state_dtype=_default_serving_state_dtype(model_type),
+        state_dtype=default_serving_state_dtype(model_type),
         model_type=model_type,
-        has_attn_output_gate=bool(
-            text_config.get("attn_output_gate", False)
-            or text_config.get("mla_use_output_gate", False)
-        ),
+        has_attn_output_gate=has_attn_gate,
         dtype_source=dtype_src,
+        o_lora_rank=o_lora_rank,
+        o_groups=o_groups,
+        ced_boundary=ced_boundary,
+        dcp_span=dcp_span,
+        expert_act_dtype=resolved_exp_act_dt,
+        sparse_attn=sparse_attn,
+        hyper_connection=hyper_conn,
+        host_tables=host_tables,
     )
     _validate_hf_profile(profile, raw_layer_types)
     return finalize_model_profile(profile)
@@ -931,6 +1337,134 @@ def parse_hf_config_profile(
 def supports_hf_config(raw_config: Mapping[str, object]) -> None:
     """Validate that a HuggingFace config mapping matches a shipped preset."""
     _adopt_matching_preset_name(parse_hf_config_profile(raw_config, name="model"))
+
+
+def _parse_preset_owner(raw: Mapping[str, object]) -> SparseCacheOwner:
+    """Parse one `SparseCacheOwner` entry from `models.json`."""
+    elem_raw = raw.get("elem_bytes")
+    max_scan_raw = raw.get("max_scan_records")
+    return SparseCacheOwner(
+        layer=scalar_int(raw["layer"], "owner.layer"),
+        record_tokens=scalar_float(
+            raw.get("record_tokens", 1.0), "owner.record_tokens"
+        ),
+        record_elems=scalar_int(raw.get("record_elems", 0), "owner.record_elems"),
+        elem_bytes=(
+            scalar_float(elem_raw, "owner.elem_bytes") if elem_raw is not None else None
+        ),
+        record_overhead_bytes=scalar_float(
+            raw.get("record_overhead_bytes", 0.0), "owner.record_overhead_bytes"
+        ),
+        replication=cast(
+            "SparseCacheReplication", str(raw.get("replication", "per_rank"))
+        ),
+        users=int_tuple(raw.get("users"), "owner.users"),
+        max_scan_records=(
+            scalar_int(max_scan_raw, "owner.max_scan_records")
+            if max_scan_raw is not None
+            else None
+        ),
+    )
+
+
+def _parse_preset_sparse_attn(raw: object) -> SparseAttnSpec | None:
+    """Parse optional `SparseAttnSpec` dictionary from `models.json`."""
+    mapping = as_mapping(raw)
+    if mapping is None:
+        return None
+    kv_seq = as_sequence(mapping.get("kv_owners")) or ()
+    idx_seq = as_sequence(mapping.get("index_owners")) or ()
+    return SparseAttnSpec(
+        kind=cast("SparseAttnKind", str(mapping["kind"])),
+        window_tokens=scalar_int(
+            mapping.get("window_tokens", 0), "sparse_attn.window_tokens"
+        ),
+        window_bytes_per_token=scalar_float(
+            mapping.get("window_bytes_per_token", 0.0),
+            "sparse_attn.window_bytes_per_token",
+        ),
+        window_layers=int_tuple(
+            mapping.get("window_layers"), "sparse_attn.window_layers"
+        ),
+        select_tokens=scalar_int(
+            mapping.get("select_tokens", 0), "sparse_attn.select_tokens"
+        ),
+        index_heads=scalar_int(
+            mapping.get("index_heads", 0), "sparse_attn.index_heads"
+        ),
+        index_kv_heads=scalar_int(
+            mapping.get("index_kv_heads", 1), "sparse_attn.index_kv_heads"
+        ),
+        index_dim=scalar_int(mapping.get("index_dim", 0), "sparse_attn.index_dim"),
+        index_compress_ratio=scalar_int(
+            mapping.get("index_compress_ratio", 1),
+            "sparse_attn.index_compress_ratio",
+        ),
+        kv_owners=tuple(
+            _parse_preset_owner(owner_map)
+            for item in kv_seq
+            if (owner_map := as_mapping(item)) is not None
+        ),
+        index_owners=tuple(
+            _parse_preset_owner(owner_map)
+            for item in idx_seq
+            if (owner_map := as_mapping(item)) is not None
+        ),
+        shared_kv_mqa=bool(mapping.get("shared_kv_mqa", False)),
+        kv_owner_ring_bytes_per_req=scalar_int(
+            mapping.get("kv_owner_ring_bytes_per_req", 0),
+            "sparse_attn.kv_owner_ring_bytes_per_req",
+        ),
+    )
+
+
+def _parse_preset_hyper_connection(raw: object) -> HyperConnectionSpec | None:
+    """Parse optional `HyperConnectionSpec` dictionary from `models.json`."""
+    mapping = as_mapping(raw)
+    if mapping is None:
+        return None
+    return HyperConnectionSpec(
+        kind=cast("HyperConnectionKind", str(mapping["kind"])),
+        num_streams=scalar_int(
+            mapping.get("num_streams", 4), "hyper_connection.num_streams"
+        ),
+        lowrank_dim=scalar_int(
+            mapping.get("lowrank_dim", 0), "hyper_connection.lowrank_dim"
+        ),
+        sinkhorn_iters=scalar_int(
+            mapping.get("sinkhorn_iters", 0), "hyper_connection.sinkhorn_iters"
+        ),
+        has_final_mixer=bool(mapping.get("has_final_mixer", False)),
+    )
+
+
+def _parse_preset_host_tables(raw: object) -> tuple[HostTableBreakSpec, ...]:
+    """Parse optional `HostTableBreakSpec` entries from `models.json`."""
+    return tuple(
+        HostTableBreakSpec(
+            name=str(tbl_map["name"]),
+            layers=int_tuple(tbl_map.get("layers"), "host_table.layers"),
+            table_bytes_total=scalar_int(
+                tbl_map["table_bytes_total"], "host_table.table_bytes_total"
+            ),
+            h2d_bytes_per_token=scalar_float(
+                tbl_map.get("h2d_bytes_per_token", 0.0),
+                "host_table.h2d_bytes_per_token",
+            ),
+            hbm_resident=bool(tbl_map.get("hbm_resident", False)),
+            shard_axis=cast("HostTableShardAxis", str(tbl_map.get("shard_axis", "tp"))),
+            state_bytes_per_request=scalar_int(
+                tbl_map.get("state_bytes_per_request", 0),
+                "host_table.state_bytes_per_request",
+            ),
+            dense_proj_params=scalar_int(
+                tbl_map.get("dense_proj_params", 0),
+                "host_table.dense_proj_params",
+            ),
+        )
+        for item in (as_sequence(raw) or ())
+        if (tbl_map := as_mapping(item)) is not None
+    )
 
 
 def _preset_to_model_profile(slug: str, entry: Mapping[str, object]) -> ModelProfile:
@@ -943,7 +1477,8 @@ def _preset_to_model_profile(slug: str, entry: Mapping[str, object]) -> ModelPro
     for key, default in PRESET_OPTIONAL_INT_DEFAULTS.items():
         ints[key] = scalar_int(entry.get(key, default), f"{slug}.{key}")
     model_type = str(entry.get("model_type", ""))
-    default_state_dtype = _default_serving_state_dtype(model_type)
+    default_state_dtype = default_serving_state_dtype(model_type)
+    dcp_span_val = str(entry.get("dcp_span", "kv_heads")).strip().lower()
     profile = finalize_model_profile(
         ModelProfile(
             name=slug,
@@ -951,6 +1486,7 @@ def _preset_to_model_profile(slug: str, entry: Mapping[str, object]) -> ModelPro
             weight_dtype=str(entry.get("weight_dtype", "fp8")).lower(),
             expert_dtype=str(entry.get("expert_dtype", "")).lower(),
             act_dtype=str(entry.get("act_dtype", "")).lower(),
+            expert_act_dtype=str(entry.get("expert_act_dtype", "")).lower(),
             kv_dtype=str(entry.get("kv_dtype", "fp8")).lower(),
             state_dtype=str(entry.get("state_dtype", default_state_dtype)).lower(),
             model_type=model_type,
@@ -962,6 +1498,12 @@ def _preset_to_model_profile(slug: str, entry: Mapping[str, object]) -> ModelPro
                 str(item) for item in (as_sequence(entry.get("layer_families")) or ())
             ),
             dtype_source=f"preset ({slug})",
+            dcp_span=cast("DcpSpan", dcp_span_val),
+            sparse_attn=_parse_preset_sparse_attn(entry.get("sparse_attn")),
+            hyper_connection=_parse_preset_hyper_connection(
+                entry.get("hyper_connection")
+            ),
+            host_tables=_parse_preset_host_tables(entry.get("host_tables")),
         )
     )
     allowed = SUPPORTED_ONCHIP_FAMILIES | STRUCTURAL_LAYER_TAGS
@@ -1034,14 +1576,26 @@ class ParallelLayout:
     pcp: int = 1
     spec_tokens: int = 0
     layer_groups: tuple[int, ...] = ()
+    execution: ExecutionMode = "full"
+    host_table_hbm_overrides: tuple[tuple[str, bool], ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate positive mesh degrees, non-negative spec tokens, and groups."""
+        """Validate mesh degrees, spec tokens, groups, execution mode, overrides."""
         for name in ("tp", "ep", "dp", "pp", "dcp", "pcp"):
             _checked_int(getattr(self, name), f"ParallelLayout.{name}", lo=1)
         _checked_int(self.spec_tokens, "ParallelLayout.spec_tokens", lo=0)
         for idx, count in enumerate(self.layer_groups):
             _checked_int(count, f"ParallelLayout.layer_groups[{idx}]", lo=1)
+        if self.execution not in VALID_EXECUTION_MODES:
+            valid = sorted(VALID_EXECUTION_MODES)
+            msg = f"ParallelLayout.execution must be in {valid}, got {self.execution!r}"
+            _cfg_err(msg)
+        for idx, (table_name, flag) in enumerate(self.host_table_hbm_overrides):
+            if not str(table_name).strip():
+                _cfg_err(
+                    f"ParallelLayout.host_table_hbm_overrides[{idx}] has empty name"
+                )
+            scalar_bool(flag, f"ParallelLayout.host_table_hbm_overrides[{idx}]")
 
     def label(self) -> str:
         """Return the layout as `TP8 x EP8 x DCP4`, omitting degree-1 axes."""
@@ -1078,9 +1632,22 @@ class DeploymentPreset:
 def parse_parallel_layout(raw: Mapping[str, object]) -> ParallelLayout:
     """Parse a 6-axis `ParallelLayout` mapping from `deployments.json`."""
     axes = ("tp", "ep", "dp", "pp", "dcp", "pcp")
+    execution_raw = raw.get("execution", "full")
+    execution_str = str(execution_raw).strip().lower()
+    if execution_str not in VALID_EXECUTION_MODES:
+        valid = sorted(VALID_EXECUTION_MODES)
+        _cfg_err(f"execution must be one of {valid}, got {execution_raw!r}")
+    raw_overrides = raw.get("host_table_hbm_overrides")
+    overrides = (
+        parse_host_table_hbm_overrides(raw_overrides)
+        if raw_overrides is not None
+        else ()
+    )
     return ParallelLayout(
         spec_tokens=scalar_int(raw.get("spec_tokens", 0), "spec_tokens"),
         layer_groups=int_tuple(raw.get("layer_groups"), "layer_groups"),
+        execution=cast("ExecutionMode", execution_str),
+        host_table_hbm_overrides=overrides,
         **{k: scalar_int(raw.get(k, 1), k) for k in axes},
     )
 
@@ -1115,9 +1682,11 @@ def _identity_view(profile: ModelProfile) -> ModelProfile:
         weight_dtype="",
         expert_dtype="",
         act_dtype="",
+        expert_act_dtype="",
         kv_dtype="",
         state_dtype="",
         weight_block_k=0,
+        expert_weight_block_k=0,
         dtype_source="",
         layer_families=(),
         model_type=profile.model_type.strip().lower().removesuffix("_text"),
@@ -1163,7 +1732,11 @@ def _apply_preset_dtype_overrides(
         ("state_dtype", overrides.get("state_dtype")),
         ("act_dtype", overrides.get("act_dtype")),
     )
-    normalized_overrides = {k: v.strip().lower() for k, v in pairs if v is not None}
+    normalized_overrides = {
+        k: (canonical_kv_dtype(v) if k == "kv_dtype" else v.strip().lower())
+        for k, v in pairs
+        if v is not None
+    }
     for field_name in ("weight_dtype", "expert_dtype"):
         if (
             dtype_val := normalized_overrides.get(field_name)

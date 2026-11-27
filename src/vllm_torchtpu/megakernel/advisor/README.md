@@ -54,6 +54,8 @@ python -m vllm_torchtpu.megakernel.advisor calibrate \
 | `--per-op-step-us` / `--step-coverage` | Measured baseline `per_op` E2E step latency (`us`) and fused-eligible step fraction `(0, 1]`. |
 | `--max-rows-per-call` | Most decode or verify rows served per fused call (`0` defaults to `CORE_LIMITS.max_batch_rows`). |
 | `--objective` | Optimization objective (`step`, `throughput`, or `both`). |
+| `--execution` | Step execution mode (`full` or `ced` Chunked Encoder-Decoder split). |
+| `--host-table-hbm` | Repeatable `<table_name>=hbm\|cpu` override placing host/HBM lookup tables. |
 | `--regime-sweep` / `--no-deployment-preset` | Evaluate the canonical phase, context, and batch regime table (optionally ignoring presets). |
 | `--search-layer-groups` | Compare candidate `layer_group` partitions against `per_op`. |
 | `--explain` / `--unresolved` | Print provenance tags and unresolved `ASSUMED` inputs ranked by sensitivity. |

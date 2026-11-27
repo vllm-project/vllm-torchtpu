@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, TypedDict, get_args
 
@@ -40,9 +40,16 @@ from .constants import (
     PUBLIC_MEASUREMENT_ALIASES,
     STRUCTURAL_LAYER_TAGS,
     SUPPORTED_ONCHIP_FAMILIES,
+    TURBOQUANT_DEFAULT_PAGE_SIZE,
     VALID_COLLECTIVE_PATHS,
     VALID_DMA_BUFFERS,
+    ExecutionMode,
+    FusionScope,
     GainBasis,
+    HostTableShardAxis,
+    HyperConnectionKind,
+    SparseAttnKind,
+    SparseCacheReplication,
 )
 
 if TYPE_CHECKING:
@@ -51,7 +58,6 @@ if TYPE_CHECKING:
     from .chips import ChipSpec
     from .models import ModelProfile, ParallelLayout
 
-FusionScope = Literal["per_op", "single_layer", "layer_group", "whole_step"]
 Phase = Literal["decode", "verify", "prefill", "mixed"]
 MoEMode = Literal["masked_on_chip", "grouped_on_chip", "grouped_in_hbm", "dense_mlp"]
 ProvenanceTag = Literal["DERIVED", "ASSUMED", "MEASURED"]
@@ -79,8 +85,11 @@ __all__ = [
     "DisaggHandoffSpec",
     "DispatchRegime",
     "EfficiencySpec",
+    "ExecutionMode",
     "FusionScope",
     "GainBasis",
+    "HostTableBreakSpec",
+    "HyperConnectionSpec",
     "LayerGroupCandidate",
     "LayerGroupSearchReport",
     "MeasurementsData",
@@ -94,8 +103,11 @@ __all__ = [
     "RegimeEntry",
     "RingPlan",
     "ScopeEstimate",
+    "SparseAttnSpec",
+    "SparseCacheOwner",
     "SupportStatus",
     "WorkloadSpec",
+    "align_batch_to_dp",
     "as_mapping",
     "as_scalar_number",
     "as_sequence",
@@ -103,11 +115,116 @@ __all__ = [
     "format_parallel_layout_label",
     "int_tuple",
     "load_measurements",
+    "parse_host_table_hbm_overrides",
     "public_calibration_path",
     "scalar_bool",
     "scalar_float",
     "scalar_int",
 ]
+
+
+PAIR_LENGTH = 2
+
+
+def parse_host_table_hbm_overrides(
+    raw_overrides: object, label: str = "host_table_hbm_overrides"
+) -> tuple[tuple[str, bool], ...]:
+    """Parse and validate `(table_name, hbm_resident)` override entries."""
+    if raw_overrides is None:
+        return ()
+    mapping = as_mapping(raw_overrides)
+    if mapping is not None:
+        pairs: list[tuple[str, bool]] = []
+        for key, val in mapping.items():
+            if type(key) is not str or not key.strip():
+                msg = f"{label} keys must be non-empty strings, got {key!r}"
+                raise errors.MegakernelConfigError(msg)
+            pairs.append((key.strip(), scalar_bool(val, f"{label}[{key!r}]")))
+        return tuple(pairs)
+    seq = as_sequence(raw_overrides)
+    if seq is not None:
+        pairs = []
+        for idx, item in enumerate(seq):
+            pair = as_sequence(item)
+            if pair is None or len(pair) != PAIR_LENGTH:
+                msg = f"{label}[{idx}] must be a (name, bool) pair, got {item!r}"
+                raise errors.MegakernelConfigError(msg)
+            raw_name, raw_flag = pair[0], pair[1]
+            if type(raw_name) is not str or not raw_name.strip():
+                msg = f"{label}[{idx}][0] must be a non-empty string, got {raw_name!r}"
+                raise errors.MegakernelConfigError(msg)
+            pairs.append(
+                (raw_name.strip(), scalar_bool(raw_flag, f"{label}[{idx}][1]"))
+            )
+        return tuple(pairs)
+    msg = f"{label} must be a mapping or sequence of (name, bool) pairs"
+    raise errors.MegakernelConfigError(msg)
+
+
+@dataclass(frozen=True)
+class SparseCacheOwner:
+    """Shared or per-layer sparse KV or indexer cache owner geometry."""
+
+    layer: int
+    record_tokens: float = 1.0
+    record_elems: int = 0
+    elem_bytes: float | None = None
+    record_overhead_bytes: float = 0.0
+    replication: SparseCacheReplication = "per_rank"
+    users: tuple[int, ...] = ()
+    max_scan_records: int | None = None
+
+
+@dataclass(frozen=True)
+class SparseAttnSpec:
+    """Unified sparse-attention specification across QSA, CSA, and MSA.
+
+    Covers Query-Selected Sparse Attention (`qsa`), Compressed Sparse
+    Attention (`csa`), and Multi-Scale Sparse Attention (`msa`).
+    """
+
+    kind: SparseAttnKind
+    window_tokens: int = 0
+    window_bytes_per_token: float = 0.0
+    window_layers: tuple[int, ...] = ()
+    select_tokens: int = 0
+    index_heads: int = 0
+    index_kv_heads: int = 1
+    index_dim: int = 0
+    index_compress_ratio: int = 1
+    kv_owners: tuple[SparseCacheOwner, ...] = ()
+    index_owners: tuple[SparseCacheOwner, ...] = ()
+    shared_kv_mqa: bool = False
+    kv_owner_ring_bytes_per_req: int = 0
+
+
+@dataclass(frozen=True)
+class HyperConnectionSpec:
+    """Multi-stream residual hyper-connection specification.
+
+    Covers low-rank projections (`lowrank`) and Sinkhorn
+    Manifold-Constrained Hyper-Connections (`mhc`).
+    """
+
+    kind: HyperConnectionKind
+    num_streams: int = 4
+    lowrank_dim: int = 0
+    sinkhorn_iters: int = 0
+    has_final_mixer: bool = False
+
+
+@dataclass(frozen=True)
+class HostTableBreakSpec:
+    """Large host-offloaded or HBM-resident embedding lookup table specification."""
+
+    name: str
+    layers: tuple[int, ...]
+    table_bytes_total: int
+    h2d_bytes_per_token: float
+    hbm_resident: bool = False
+    shard_axis: HostTableShardAxis = "tp"
+    state_bytes_per_request: int = 0
+    dense_proj_params: int = 0
 
 
 def as_mapping(val: object) -> Mapping[str, object] | None:
@@ -548,6 +665,12 @@ class EfficiencySpec:
             )
 
 
+def align_batch_to_dp(batch: int, dp: int) -> int:
+    """Round `batch` up to the smallest positive multiple of `dp`."""
+    dp_ranks = max(1, dp)
+    return dp_ranks * max(1, (batch + dp_ranks - 1) // dp_ranks)
+
+
 @dataclass(frozen=True)
 class WorkloadSpec:
     """Serving request geometry, VMEM budget, and multi-buffering configuration."""
@@ -594,6 +717,51 @@ class WorkloadSpec:
     # True when the caller explicitly fixed moe_mode rather than leaving it unpinned.
     moe_mode_explicit: bool = False
     latent_proj_tp: int = 0
+    # Optional explicit step execution override (`None` inherits `layout_execution`).
+    execution: ExecutionMode | None = None
+    # Optional explicit per-table HBM overrides (`None` inherits layout overrides;
+    # `()` explicitly clears layout overrides).
+    host_table_hbm_overrides: tuple[tuple[str, bool], ...] | None = None
+    # Layout-level execution default set by `with_layout`.
+    layout_execution: ExecutionMode = "full"
+    # Layout-level host-table HBM defaults set by `with_layout`.
+    layout_host_table_hbm_overrides: tuple[tuple[str, bool], ...] = ()
+    kv_page_size: int = TURBOQUANT_DEFAULT_PAGE_SIZE
+
+    @property
+    def effective_execution(self) -> ExecutionMode:
+        """Return explicit user execution override if set, else layout default."""
+        return self.execution if self.execution is not None else self.layout_execution
+
+    @property
+    def effective_host_table_hbm_overrides(self) -> tuple[tuple[str, bool], ...]:
+        """Return effective host-table HBM overrides merged over layout defaults."""
+        if self.host_table_hbm_overrides is None:
+            return self.layout_host_table_hbm_overrides
+        if not self.host_table_hbm_overrides:
+            return ()
+        merged = dict(self.layout_host_table_hbm_overrides)
+        merged.update(self.host_table_hbm_overrides)
+        return tuple(merged.items())
+
+    @staticmethod
+    def _validate_table_overrides(overrides: object, field_name: str) -> None:
+        """Validate `tuple[tuple[str, bool], ...]` host-table override pairs."""
+        if type(overrides) is not tuple:
+            msg = f"{field_name} must be a tuple"
+            raise errors.MegakernelConfigError(msg)
+        for idx, entry in enumerate(overrides):
+            if type(entry) is not tuple or len(entry) != PAIR_LENGTH:
+                msg = f"{field_name}[{idx}] must be a (str, bool) tuple, got {entry!r}"
+                raise errors.MegakernelConfigError(msg)
+            table_name, is_hbm = entry
+            if type(table_name) is not str or not table_name.strip():
+                msg = (
+                    f"{field_name}[{idx}][0] must be a non-empty string, "
+                    f"got {table_name!r}"
+                )
+                raise errors.MegakernelConfigError(msg)
+            scalar_bool(is_hbm, f"{field_name}[{idx}][1]")
 
     def _validate_literals_and_bools(self) -> None:
         """Enforce exact string literals and strict boolean flags."""
@@ -602,12 +770,22 @@ class WorkloadSpec:
             ("moe_mode", get_args(MoEMode)),
             ("objective", get_args(ObjectiveMode)),
             ("dispatch_regime", get_args(DispatchRegime)),
+            ("layout_execution", get_args(ExecutionMode)),
         )
         for name, allowed in literal_checks:
             val = getattr(self, name)
             if type(val) is not str or val not in allowed:
                 msg = f"WorkloadSpec.{name} must be one of {list(allowed)}, got {val!r}"
                 raise errors.MegakernelConfigError(msg)
+        allowed_exec = get_args(ExecutionMode)
+        if self.execution is not None and (
+            type(self.execution) is not str or self.execution not in allowed_exec
+        ):
+            msg = (
+                f"WorkloadSpec.execution must be one of {list(allowed_exec)}, "
+                f"got {self.execution!r}"
+            )
+            raise errors.MegakernelConfigError(msg)
         for name in (
             "vmem_alias",
             "vmem_fit_headroom",
@@ -616,11 +794,29 @@ class WorkloadSpec:
             "moe_mode_explicit",
         ):
             scalar_bool(getattr(self, name), f"WorkloadSpec.{name}")
+        if self.host_table_hbm_overrides is not None:
+            self._validate_table_overrides(
+                self.host_table_hbm_overrides, "WorkloadSpec.host_table_hbm_overrides"
+            )
+        self._validate_table_overrides(
+            self.layout_host_table_hbm_overrides,
+            "WorkloadSpec.layout_host_table_hbm_overrides",
+        )
 
     def __post_init__(self) -> None:
         """Enforce single-field literal, bool, integer, and finite float invariants."""
         self._validate_literals_and_bools()
-        pos_ints = ("batch", "tp", "pp", "dp", "ep", "kv_split", "dcp", "pcp")
+        pos_ints = (
+            "batch",
+            "tp",
+            "pp",
+            "dp",
+            "ep",
+            "kv_split",
+            "dcp",
+            "pcp",
+            "kv_page_size",
+        )
         nonneg_ints = (
             "isl",
             "osl",
@@ -668,6 +864,29 @@ class WorkloadSpec:
                 _checked_float(
                     val, f"WorkloadSpec.{name}", lo=lo, hi=hi, strict_lo=strict_lo
                 )
+
+    def with_layout(
+        self,
+        layout: ParallelLayout | ParallelismRecommendation,
+        *,
+        align_batch: bool = False,
+    ) -> WorkloadSpec:
+        """Return a copy with layout parallelism and execution defaults applied."""
+        return replace(
+            self,
+            batch=(
+                align_batch_to_dp(self.batch, layout.dp) if align_batch else self.batch
+            ),
+            tp=layout.tp,
+            ep=layout.ep,
+            dp=layout.dp,
+            pp=layout.pp,
+            dcp=layout.dcp,
+            pcp=layout.pcp,
+            layer_groups=layout.layer_groups or self.layer_groups,
+            layout_execution=layout.execution,
+            layout_host_table_hbm_overrides=layout.host_table_hbm_overrides,
+        )
 
 
 @dataclass(frozen=True)
@@ -863,6 +1082,8 @@ class ParallelismRecommendation:
     pcp: int = 1
     source: str = ""
     layer_groups: tuple[int, ...] = ()
+    execution: ExecutionMode = "full"
+    host_table_hbm_overrides: tuple[tuple[str, bool], ...] = ()
 
     def label(self) -> str:
         """Return the layout as `TP8 x EP8 x DCP4`, omitting degree-1 axes."""

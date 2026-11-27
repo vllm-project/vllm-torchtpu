@@ -20,6 +20,8 @@ from dataclasses import dataclass, replace
 from math import ceil, gcd
 from typing import TYPE_CHECKING
 
+from vllm_torchtpu.megakernel.core import errors
+
 from .chips import ChipSpec, resolve_chip_spec
 from .constants import (
     AR_BYTE_MATCH_MAX_RATIO,
@@ -48,32 +50,45 @@ from .constants import (
     GDN_STREAMED_HEADS_CAP,
     GROUPED_MOE_MODES,
     HBM_CACHELINE_BYTES,
+    HC_SUBLAYERS_PER_LAYER,
     INDEXER_HEAD_REDUCE_VEC_OPS,
     INDEXER_RADIX_BUCKETS,
     INDEXER_RADIX_PASS_VEC_OPS,
     INDEXER_RADIX_PASSES,
     INDEXER_SCALE_VEC_OPS,
+    INT4_INDEX_SCALE_OVERHEAD_BYTES,
+    INT4_SCALE_PAGE_BYTES_PER_TOK,
     LSE_SCALARS_PER_HEAD,
     MEGACORE_CORES,
+    MHC_DYNAMIC_PROJ_TERMS,
     MIN_FIRST_DMA_SLOT_BYTES,
+    MULTI_LAYER_FUSED_SCOPES,
     PER_OP_COLLECTIVE_CALL_FACTOR,
     PER_OP_DSA_KV_ROUNDTRIP_FACTOR,
     PER_OP_INDEXER_SCORE_ROUNDTRIP_BYTES,
     RECURRENT_STATE_RW_PASSES,
     RMSNORM_RESIDUAL_VEC_OPS_PER_ELEM,
+    SINKHORN_VEC_OPS_PER_ENTRY_ITER,
     SUB_BYTE_EXPERT_DTYPES,
     SUB_BYTE_UNPACK_VEC_OPS_PER_ELEM,
     SUBCHANNEL_BLOCK_K_THRESHOLD,
     SUBCHANNEL_VPU_OPS_PER_BLOCK,
     SUBLAYER_BOUNDARIES_PER_LAYER,
     SWIGLU_ACT_VEC_OPS_PER_ELEM,
+    TURBOQUANT_DEFAULT_PAGE_SIZE,
+    TURBOQUANT_HEADER_BYTES,
+    TURBOQUANT_SUBLANE_WORDS,
+    TURBOQUANT_SUPPORTED_PAGE_SIZES,
+    TURBOQUANT_WORD_BYTES,
     UNFUSED_EAGER_GAP_US,
     VECTOR_MAX_ELEMENTS_PER_WORD,
     VECTOR_SUB_BYTE_ELEMENTS_PER_WORD,
+    canonical_kv_dtype,
 )
 from .models import (
     ModelProfile,
     has_dsa_profile,
+    hyper_connection_total_params,
     indexer_record_bytes,
     resolve_model_profile,
 )
@@ -81,6 +96,8 @@ from .specs import (
     FusionScope,
     MeasurementsData,
     ScopeEstimate,
+    SparseAttnSpec,
+    SparseCacheOwner,
     WorkloadSpec,
     default_double_buffer_ring_plan,
 )
@@ -88,15 +105,19 @@ from .vmem import (
     CoreLegalityContext,
     _scope_vmem_and_ops,
     _ScopeVmemBudget,
+    active_fusion_break_layers,
     collect_validation_reasons,
     compute_all_reduce_transfer_cost,
     compute_per_token_vmem_bytes,
     dsa_query_gather_dim,
+    effective_host_table_hbm_resident,
     effective_pcp,
     effective_tp,
     evaluate_core_legality,
     fit_vmem_budget_bytes,
+    fusion_break_layer_groups,
     validate_advise_inputs,
+    wide_dcp_kv_heads_per_rank,
 )
 
 if TYPE_CHECKING:
@@ -167,6 +188,7 @@ class _ScopeEvalConfig:
     bf16_attention_upper: bool = True
     upper_boundary_fill: bool = True
     upper_per_op_coll_factor: bool = True
+    measurements: MeasurementsData | None = None
 
 
 @dataclass(frozen=True)
@@ -268,6 +290,8 @@ class _ScopeContext:
     dcp_post_attn_transfer_s: float = 0.0
     dcp_post_attn_hops: int = 0
     dcp_hops: int = 0
+    has_fusion_break: bool = False
+    host_h2d_s: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -447,7 +471,7 @@ def can_group_moe_in_scope(
         True when tokens can be grouped within the chip or host topology.
     """
     return (
-        scope not in ("whole_step", "layer_group")
+        scope not in MULTI_LAYER_FUSED_SCOPES
         or ep_dp == 1
         or (
             effective_tp_ranks * ep_dp <= CORES_PER_HOST
@@ -494,36 +518,174 @@ def validate_workload(
     return tuple(reasons)
 
 
-def _compute_layer_parts(
+def turboquant_slot_bytes(
+    head_dim: int, kv_page_size: int = TURBOQUANT_DEFAULT_PAGE_SIZE
+) -> float:
+    """Return packed 4-bit TurboQuant KV bytes per token per KV head."""
+    if kv_page_size not in TURBOQUANT_SUPPORTED_PAGE_SIZES:
+        msg = (
+            "turboquant_4bit_nc requires kv_page_size in "
+            f"{TURBOQUANT_SUPPORTED_PAGE_SIZES}, got {kv_page_size}"
+        )
+        raise errors.MegakernelConfigError(msg)
+    page_sz = max(1, kv_page_size)
+    slot_size = head_dim + TURBOQUANT_HEADER_BYTES
+    raw_words = ceil(page_sz * slot_size / TURBOQUANT_WORD_BYTES)
+    aligned_words = (
+        (raw_words + TURBOQUANT_SUBLANE_WORDS - 1) // TURBOQUANT_SUBLANE_WORDS
+    ) * TURBOQUANT_SUBLANE_WORDS
+    return float(aligned_words * TURBOQUANT_WORD_BYTES) / float(page_sz)
+
+
+def compute_hadamard_kv_bf16_flops(
+    kv_dtype: str,
+    head_dims: tuple[int, int, int],
+    active_tokens: int,
+    l_attn: int,
+) -> float:
+    """Return MXU BF16 Hadamard rotation FLOPs for 4-bit KV cache dtypes."""
+    nh_local, kvh_local, head_dim = head_dims
+    dt = canonical_kv_dtype(kv_dtype)
+    if dt == "int4_per_token_head":
+        heads_rot = 2 * nh_local + 2 * kvh_local
+    elif dt == "turboquant_4bit_nc":
+        heads_rot = nh_local + kvh_local
+    else:
+        return 0.0
+    return float(2 * head_dim * head_dim * heads_rot * active_tokens * l_attn)
+
+
+def compute_hyper_connection_terms(
     profile: ModelProfile,
-    tp_ranks: int,
-    kv_split: int,
-    ep: int,
-    eff_latent_tp: int,
-) -> _LayerParamParts:
-    """Compute sharded layer head counts, FFN/MoE dimensions, and parameter totals."""
+    layers_local: int,
+    eff_tp: int,
+    active_tokens: int,
+) -> tuple[int, float, float]:
+    """Return per-rank HC BF16 parameter count, matmul FLOPs, and Sinkhorn ops."""
+    hc = profile.hyper_connection
+    if hc is None or hc.num_streams <= 1 or layers_local <= 0:
+        return 0, 0.0, 0.0
+    tp = max(1, eff_tp)
+    streams = hc.num_streams
+    hidden_local = ceil(profile.hidden_size / tp)
+    if hc.kind == "lowrank":
+        rank = hc.lowrank_dim
+        per_sub = 2 * streams * hidden_local * rank + streams * streams * hidden_local
+        params_local = layers_local * HC_SUBLAYERS_PER_LAYER * per_sub
+        if hc.has_final_mixer:
+            params_local += 2 * streams * hidden_local * rank
+        return params_local, 2.0 * float(params_local) * float(active_tokens), 0.0
+    per_sub = (streams * streams + MHC_DYNAMIC_PROJ_TERMS * streams) * (
+        streams * hidden_local
+    )
+    params_local = layers_local * HC_SUBLAYERS_PER_LAYER * per_sub
+    flops = 2.0 * float(params_local) * float(active_tokens) + 2.0 * float(
+        HC_SUBLAYERS_PER_LAYER * layers_local * active_tokens
+    ) * float(streams * streams * hidden_local)
+    vec_ops = float(
+        HC_SUBLAYERS_PER_LAYER
+        * layers_local
+        * active_tokens
+        * streams
+        * streams
+        * SINKHORN_VEC_OPS_PER_ENTRY_ITER
+        * hc.sinkhorn_iters
+    )
+    return params_local, flops, vec_ops
+
+
+def compute_attention_params(
+    profile: ModelProfile, eff_tp: int, kv_split: int, dcp: int = 1
+) -> tuple[int, int, int, float]:
+    """Compute local head counts, Q projection dim, and attention parameter count."""
     head_dim = profile.head_dim
     kv_lora = profile.kv_lora_rank
     qk_nope = profile.qk_nope_head_dim or head_dim
     qk_rope = profile.qk_rope_head_dim
-    local_attn_heads = max(1, ceil(profile.num_attention_heads / tp_ranks))
-    local_kv_heads = max(1, ceil(profile.num_kv_heads / max(1, tp_ranks // kv_split)))
+    local_attn_heads = max(1, ceil(profile.num_attention_heads / eff_tp))
+    local_kv_heads = (
+        wide_dcp_kv_heads_per_rank(profile.num_kv_heads, eff_tp, dcp, "tp_group")
+        if profile.dcp_span == "tp_group"
+        else max(1, ceil(profile.num_kv_heads / max(1, eff_tp // kv_split)))
+    )
+    local_kv_weight_heads = (
+        max(1, ceil(profile.num_kv_heads / eff_tp))
+        if profile.dcp_span == "tp_group"
+        else local_kv_heads
+    )
     q_dim = local_attn_heads * head_dim
     hidden = profile.hidden_size
     attn_gate_params = hidden * q_dim if profile.has_attn_output_gate else 0
+    if profile.o_lora_rank > 0 and kv_lora == 0:
+        q_in = (
+            profile.q_lora_rank * hidden + q_dim * profile.q_lora_rank
+            if profile.q_lora_rank > 0
+            else q_dim * hidden
+        )
+        shared_mqa = bool(
+            profile.sparse_attn is not None and profile.sparse_attn.shared_kv_mqa
+        )
+        wkv = (1 if shared_mqa else 2) * local_kv_weight_heads * head_dim * hidden
+        wo_a = profile.o_lora_rank * q_dim
+        wo_b = hidden * max(1, ceil(profile.o_groups * profile.o_lora_rank / eff_tp))
+        return (
+            local_attn_heads,
+            local_kv_heads,
+            q_dim,
+            float(q_in + wkv + wo_a + wo_b + attn_gate_params),
+        )
     total_q_dim = local_attn_heads * (qk_nope + qk_rope)
     mla_proj_params = (
         profile.q_lora_rank * (hidden + total_q_dim)
         if profile.q_lora_rank
         else hidden * total_q_dim
     ) + hidden * (kv_lora + qk_rope + q_dim)
-    attn_params = float(
+    attn_params = (
         mla_proj_params
         + kv_lora * local_attn_heads * (qk_nope + head_dim)
         + attn_gate_params
         if kv_lora
-        else hidden * 2 * (q_dim + local_kv_heads * head_dim) + attn_gate_params
+        else hidden * 2 * (q_dim + local_kv_weight_heads * head_dim) + attn_gate_params
     )
+    return local_attn_heads, local_kv_heads, q_dim, float(attn_params)
+
+
+def _sparse_indexer_proj_params(
+    sp: SparseAttnSpec, profile: ModelProfile, eff_tp: int, local_attn: int
+) -> tuple[float, float]:
+    """Return `(query_proj_params_per_layer, key_weight_bf16_params_per_layer)`."""
+    if sp.index_heads <= 0 or sp.index_dim <= 0 or local_attn <= 0:
+        return 0.0, 0.0
+    if sp.kind in ("qsa", "msa"):
+        proj = float(
+            ceil((sp.index_heads + sp.index_kv_heads) * sp.index_dim / eff_tp)
+            * profile.hidden_size
+        )
+        return (0.0, proj) if sp.kind == "qsa" else (proj, 0.0)
+    q_params = float(
+        ceil(sp.index_heads * sp.index_dim / eff_tp)
+        * (profile.q_lora_rank or profile.hidden_size)
+    )
+    kw_params = float(
+        round(
+            (len(sp.index_owners) / max(1, profile.num_layers))
+            * profile.hidden_size
+            * ceil((sp.index_dim + sp.index_heads) / eff_tp)
+        )
+    )
+    return q_params, kw_params
+
+
+def _compute_layer_parts(
+    profile: ModelProfile,
+    sharding: tuple[int, int, int, int, int],
+) -> _LayerParamParts:
+    """Compute sharded layer head counts, FFN/MoE dimensions, and parameter totals."""
+    tp_ranks, kv_split, ep, eff_latent_tp, dcp = sharding
+    local_attn_heads, local_kv_heads, q_dim, attn_params = compute_attention_params(
+        profile, tp_ranks, kv_split, dcp
+    )
+    hidden = profile.hidden_size
     has_linear = profile.num_linear_layers > 0
     local_key_heads = (
         max(1, ceil(profile.linear_key_heads / tp_ranks)) if has_linear else 0
@@ -607,13 +769,25 @@ def compute_decoder_param_count(profile: ModelProfile) -> int:
     local_attn = profile.num_attention_layers
     local_moe = max(0, profile.num_moe_layers)
     local_lin = profile.num_linear_layers
+    sparse = profile.sparse_attn
     local_indexer = (
-        min(local_attn, profile.num_indexer_layers) if has_dsa_profile(profile) else 0
+        local_attn
+        if (sparse is not None and sparse.index_dim > 0)
+        else (
+            min(local_attn, profile.num_indexer_layers)
+            if has_dsa_profile(profile)
+            else 0
+        )
     )
-    parts = _compute_layer_parts(profile, 1, 1, 1, 1)
+    parts = _compute_layer_parts(profile, (1, 1, 1, 1, 1))
+    idx_q_params, idx_kw_params = (
+        _sparse_indexer_proj_params(sparse, profile, 1, local_attn)
+        if sparse is not None
+        else (parts.indexer_query_proj_params, parts.indexer_key_weight_proj_params)
+    )
     base_dense = (
         local_attn * parts.attn_params
-        + local_indexer * parts.indexer_query_proj_params
+        + local_indexer * idx_q_params
         + local_lin * parts.linear_attn_params
         + (profile.num_layers - local_moe) * parts.dense_ffn_params
         + local_moe * (parts.shared_expert_params + parts.latent_proj_params)
@@ -622,9 +796,178 @@ def compute_decoder_param_count(profile: ModelProfile) -> int:
         base_dense
         + local_moe * profile.num_experts * parts.routed_expert_params
         + local_moe * profile.hidden_size * profile.num_experts
-        + local_indexer * parts.indexer_key_weight_proj_params
+        + local_indexer * idx_kw_params
+        + hyper_connection_total_params(profile)
+        + sum(tbl.dense_proj_params for tbl in profile.host_tables)
     )
     return round(total)
+
+
+def _owner_record_bytes(
+    owner: SparseCacheOwner,
+    profile: ModelProfile,
+    workload: WorkloadSpec,
+    kv_cfg: tuple[str, float, int, int, bool],
+) -> float:
+    """Return per-record bytes on one rank for a KV or index `SparseCacheOwner`."""
+    kv_dt, bw_kv, eff_tp, kv_group_heads, is_index = kv_cfg
+    rep_mult = (
+        float(kv_group_heads)
+        if owner.replication == "kv_head_group"
+        else (1.0 / max(1, eff_tp) if owner.replication == "tp_sharded" else 1.0)
+    )
+    if owner.elem_bytes is not None:
+        return (
+            owner.record_elems * owner.elem_bytes + owner.record_overhead_bytes
+        ) * rep_mult
+    if is_index:
+        if kv_dt == "int4_per_token_head":
+            return (
+                owner.record_elems * 0.5 + INT4_INDEX_SCALE_OVERHEAD_BYTES
+            ) * rep_mult + owner.record_overhead_bytes
+        elem_w = 1.0 if kv_dt == "turboquant_4bit_nc" else bw_kv
+        return owner.record_elems * elem_w * rep_mult + owner.record_overhead_bytes
+    if kv_dt == "turboquant_4bit_nc":
+        heads_rec = owner.record_elems / max(1, 2 * profile.head_dim)
+        return (
+            heads_rec
+            * turboquant_slot_bytes(profile.head_dim, workload.kv_page_size)
+            * rep_mult
+            + owner.record_overhead_bytes
+        )
+    if kv_dt == "int4_per_token_head":
+        return (
+            owner.record_elems * 0.5 * rep_mult
+            + INT4_SCALE_PAGE_BYTES_PER_TOK
+            + owner.record_overhead_bytes
+        )
+    return owner.record_elems * bw_kv * rep_mult + owner.record_overhead_bytes
+
+
+def _synthesize_homogeneous_owners(
+    sp: SparseAttnSpec, profile: ModelProfile, l_attn: int
+) -> tuple[tuple[SparseCacheOwner, ...], tuple[SparseCacheOwner, ...]]:
+    """Return `(kv_owners, idx_owners)` for homogeneous QSA/MSA specs."""
+    if sp.kv_owners or sp.index_owners:
+        return sp.kv_owners, sp.index_owners
+    if sp.kind not in ("qsa", "msa"):
+        return (), ()
+    kv_own = tuple(
+        SparseCacheOwner(
+            lyr, 1.0, 2 * profile.head_dim, None, 0.0, "kv_head_group", (lyr,)
+        )
+        for lyr in range(l_attn)
+    )
+    if sp.index_dim <= 0:
+        return kv_own, ()
+    ratio = float(max(1, sp.index_compress_ratio)) if sp.kind == "qsa" else 1.0
+    elem_b = float(FP32_BYTES) if sp.kind == "qsa" else None
+    idx_own = tuple(
+        SparseCacheOwner(lyr, ratio, sp.index_dim, elem_b, 0.0, "per_rank", (lyr,))
+        for lyr in range(l_attn)
+    )
+    return kv_own, idx_own
+
+
+def _ced_token_scale(
+    profile: ModelProfile,
+    workload: WorkloadSpec,
+    layers_local: int,
+    active_tokens: int,
+    chunk_tokens: int,
+) -> float:
+    """Return stack-average active token fraction under Chunked Encoder-Decoder."""
+    if (
+        workload.effective_execution != "ced"
+        or profile.ced_boundary <= 0
+        or workload.phase not in ("prefill", "mixed")
+        or active_tokens <= 0
+        or layers_local <= 0
+    ):
+        return 1.0
+    t_prefill_part = active_tokens if workload.phase == "prefill" else chunk_tokens
+    t_decode_part = max(0, active_tokens - t_prefill_part)
+    win_cap = (
+        profile.sparse_attn.window_tokens
+        if (profile.sparse_attn is not None and profile.sparse_attn.window_tokens > 0)
+        else t_prefill_part
+    )
+    dec_tokens = t_decode_part + min(t_prefill_part, win_cap)
+    enc_layers = min(
+        layers_local,
+        ceil(profile.ced_boundary * layers_local / max(1, profile.num_layers)),
+    )
+    dec_layers = max(0, layers_local - enc_layers)
+    return float(enc_layers * active_tokens + dec_layers * dec_tokens) / float(
+        layers_local * active_tokens
+    )
+
+
+def _host_table_shard_divisor(shard_axis: str, eff_tp: int, dp: int) -> int:
+    """Return per-core HBM shard divisor for a host or HBM lookup table."""
+    tp = max(1, eff_tp)
+    if shard_axis == "tp":
+        return tp
+    if shard_axis == "dp_local":
+        return max(1, min(dp, max(1, CORES_PER_HOST // tp)))
+    return max(1, min(tp * dp, CORES_PER_HOST))
+
+
+def _compute_host_table_context_terms(
+    profile: ModelProfile,
+    workload: WorkloadSpec,
+    rank_dims: tuple[int, int, int],
+    pcie_h2d_bw_bytes_per_s: float,
+) -> tuple[float, float, float]:
+    """Return `(hbm_table_and_state_bytes, hbm_gather_read_bytes, host_h2d_s)`."""
+    if not profile.host_tables:
+        return 0.0, 0.0, 0.0
+    eff_tp, batch_local, active_tokens = rank_dims
+    hbm_resident_b = 0.0
+    hbm_read_b = 0.0
+    offloaded_h2d_b = 0.0
+    for tbl in profile.host_tables:
+        hbm_resident_b += float(tbl.state_bytes_per_request * batch_local)
+        step_lookup_b = float(active_tokens) * tbl.h2d_bytes_per_token
+        if effective_host_table_hbm_resident(tbl, workload):
+            div = _host_table_shard_divisor(tbl.shard_axis, eff_tp, workload.dp)
+            hbm_resident_b += float(tbl.table_bytes_total) / float(div)
+            hbm_read_b += step_lookup_b
+        else:
+            offloaded_h2d_b += step_lookup_b
+    return hbm_resident_b, hbm_read_b, offloaded_h2d_b / pcie_h2d_bw_bytes_per_s
+
+
+def _kv_bytes_per_token(
+    profile: ModelProfile,
+    workload: WorkloadSpec,
+    kvh_local: int,
+    kv_bytes: float,
+    tok_split: int,
+) -> tuple[str, float]:
+    """Return normalized `kv_dtype` and per-token KV cache bytes per layer."""
+    kv_dt = canonical_kv_dtype(profile.kv_dtype)
+    if profile.kv_lora_rank == 0 and kv_dt == "turboquant_4bit_nc":
+        per_tok = (
+            kvh_local
+            * turboquant_slot_bytes(profile.head_dim, workload.kv_page_size)
+            * profile.kv_compress_factor
+            / tok_split
+        )
+        return kv_dt, per_tok
+    if profile.kv_lora_rank == 0 and kv_dt == "int4_per_token_head":
+        per_tok = (
+            (2.0 * kvh_local * profile.head_dim * 0.5 + INT4_SCALE_PAGE_BYTES_PER_TOK)
+            * profile.kv_compress_factor
+            / tok_split
+        )
+        return kv_dt, per_tok
+    raw_elems = (
+        (profile.kv_lora_rank + profile.qk_rope_head_dim)
+        if profile.kv_lora_rank
+        else 2.0 * kvh_local * profile.head_dim
+    )
+    return kv_dt, raw_elems * kv_bytes * profile.kv_compress_factor / tok_split
 
 
 class _ScopeContextBuilder:
@@ -703,14 +1046,20 @@ class _ScopeContextBuilder:
             ceil(profile.num_linear_layers * self.layers_local / profile.num_layers),
         )
         self.local_indexer = (
-            min(
-                self.local_attn,
-                ceil(
-                    profile.num_indexer_layers * self.layers_local / profile.num_layers
-                ),
+            self.local_attn
+            if (profile.sparse_attn is not None and profile.sparse_attn.index_dim > 0)
+            else (
+                min(
+                    self.local_attn,
+                    ceil(
+                        profile.num_indexer_layers
+                        * self.layers_local
+                        / profile.num_layers
+                    ),
+                )
+                if has_dsa_profile(profile)
+                else 0
             )
-            if has_dsa_profile(profile)
-            else 0
         )
         cores_per_chip = chip_spec.cores_per_device * chip_spec.devices_per_chip
         eff_latent_tp = (
@@ -723,11 +1072,159 @@ class _ScopeContextBuilder:
             )
         )
         self.parts = _compute_layer_parts(
-            profile, self.eff_tp, self.kv_split, workload.ep, eff_latent_tp
+            profile,
+            (
+                self.eff_tp,
+                self.kv_split,
+                workload.ep,
+                eff_latent_tp,
+                max(1, workload.dcp),
+            ),
         )
         self.token_residual_bytes = (
             self.active_tokens * profile.hidden_size * float(BF16_BYTES)
         )
+
+    def _build_sparse_attn_terms(
+        self, kv_bytes_per_elem: float, raw_attn_ctx: float
+    ) -> tuple[dict[str, float | bool], dict[str, int | float]]:
+        """Price QSA, CSA2+SWA, and MSA sparse caches, scans, and attended tokens."""
+        profile, workload, parts = self.profile, self.workload, self.parts
+        sp = profile.sparse_attn
+        zero_dcp: dict[str, int | float] = {
+            "query_s": 0.0,
+            "query_hops": 0,
+            "post_s": 0.0,
+            "post_hops": 0,
+            "dcp_hops": 0,
+        }
+        if sp is None:
+            return {}, zero_dcp
+        kv_dt = canonical_kv_dtype(profile.kv_dtype)
+        cap_tok = sp.window_tokens + sp.select_tokens
+        attn_ctx = min(raw_attn_ctx, float(cap_tok)) if cap_tok > 0 else raw_attn_ctx
+        is_gather = cap_tok > 0 and raw_attn_ctx > float(cap_tok)
+        tok_div = float(
+            max(1, workload.dcp) if profile.dcp_span == "tp_group" else self.kv_split
+        )
+        pp_scale = (
+            float(self.layers_local) / max(1, profile.num_layers)
+            if (sp.kv_owners or sp.index_owners)
+            else 1.0
+        )
+        kv_owners, idx_owners = _synthesize_homogeneous_owners(
+            sp, profile, self.local_attn
+        )
+        kv_cfg = (kv_dt, kv_bytes_per_elem, self.eff_tp, parts.kvh_local, False)
+        idx_cfg = (kv_dt, kv_bytes_per_elem, self.eff_tp, parts.kvh_local, True)
+        win_l = (
+            ceil(len(sp.window_layers) / max(1, workload.pp))
+            if sp.window_layers
+            else (self.local_attn if sp.window_bytes_per_token > 0 else 0)
+        )
+        swa_res = (
+            self.batch_local
+            * win_l
+            * min(self.eff_ctx, sp.window_tokens)
+            * (sp.window_bytes_per_token / max(1, self.eff_tp))
+        )
+        ring_res = float(self.batch_local * sp.kv_owner_ring_bytes_per_req) * pp_scale
+        kv_res, kv_read_strict, kv_read_gather = self._accumulate_sparse_kv_owners(
+            kv_owners, kv_cfg, (attn_ctx, tok_div, pp_scale), is_gather=is_gather
+        )
+        idx_res, idx_read, flops_idx = self._accumulate_sparse_index_owners(
+            sp, idx_owners, idx_cfg, (raw_attn_ctx, tok_div, pp_scale)
+        )
+        idx_q_params, idx_kw_params = _sparse_indexer_proj_params(
+            sp, profile, self.eff_tp, self.local_attn
+        )
+        return {
+            "has_dsa": True,
+            "is_sparse_gather": is_gather,
+            "indexer_ctx_local": raw_attn_ctx / tok_div,
+            "attn_ctx": attn_ctx,
+            "indexer_query_proj_params": idx_q_params,
+            "indexer_key_weight_proj_params": idx_kw_params,
+            "indexer_k_read_bytes": idx_read,
+            "indexer_k_resident_bytes": swa_res + ring_res + kv_res + idx_res,
+            "dsa_kv_gather_bytes": swa_res + kv_read_gather,
+            "dsa_kv_strict_bytes": swa_res + kv_read_strict,
+            "flops_indexer_score": flops_idx,
+            "vec_ops_pre_dsa_extra": 0.0,
+            "vec_ops_dsa": 0.0,
+            "vec_ops_indexer_radix": 0.0,
+        }, zero_dcp
+
+    def _accumulate_sparse_kv_owners(
+        self,
+        kv_owners: tuple[SparseCacheOwner, ...],
+        kv_cfg: tuple[str, float, int, int, bool],
+        scale_terms: tuple[float, float, float],
+        *,
+        is_gather: bool,
+    ) -> tuple[float, float, float]:
+        """Accumulate resident, strict-read, and gather-read sparse KV owner bytes."""
+        attn_ctx, tok_div, pp_scale = scale_terms
+        kv_res = kv_read_strict = kv_read_gather = 0.0
+        for owner in kv_owners:
+            rec_b = _owner_record_bytes(owner, self.profile, self.workload, kv_cfg)
+            rec_tok = max(1.0, owner.record_tokens)
+            kv_res += (
+                self.batch_local
+                * ((self.eff_ctx / rec_tok) / tok_div)
+                * rec_b
+                * pp_scale
+            )
+            sel_r = (attn_ctx / rec_tok) / tok_div
+            users_n = max(1, len(owner.users))
+            strict_b = users_n * self.batch_local * sel_r * rec_b * pp_scale
+            kv_read_strict += strict_b
+            kv_read_gather += (
+                users_n
+                * self.active_tokens
+                * sel_r
+                * _align_up(rec_b, HBM_CACHELINE_BYTES)
+                * pp_scale
+                if is_gather
+                else strict_b
+            )
+        return kv_res, kv_read_strict, kv_read_gather
+
+    def _accumulate_sparse_index_owners(
+        self,
+        sp: SparseAttnSpec,
+        idx_owners: tuple[SparseCacheOwner, ...],
+        idx_cfg: tuple[str, float, int, int, bool],
+        scale_terms: tuple[float, float, float],
+    ) -> tuple[float, float, float]:
+        """Accumulate resident, read, and scoring FLOP terms across index owners."""
+        raw_attn_ctx, tok_div, pp_scale = scale_terms
+        idx_res = idx_read = flops_idx = 0.0
+        for owner in idx_owners:
+            rec_b = _owner_record_bytes(owner, self.profile, self.workload, idx_cfg)
+            rec_tok = max(1.0, owner.record_tokens)
+            idx_res += (
+                self.batch_local
+                * ((self.eff_ctx / rec_tok) / tok_div)
+                * rec_b
+                * pp_scale
+            )
+            scan_r = raw_attn_ctx / rec_tok
+            if owner.max_scan_records is not None:
+                scan_r = min(scan_r, float(owner.max_scan_records))
+            loc_scan = scan_r / tok_div
+            users_n = max(1, len(owner.users))
+            idx_read += users_n * self.batch_local * loc_scan * rec_b * pp_scale
+            flops_idx += (
+                users_n
+                * 2.0
+                * self.active_tokens
+                * sp.index_heads
+                * sp.index_dim
+                * loc_scan
+                * pp_scale
+            )
+        return idx_res, idx_read, flops_idx
 
     def _build_dsa_terms(
         self, kv_bytes_per_elem: float
@@ -740,6 +1237,8 @@ class _ScopeContextBuilder:
             if workload.phase == "prefill" and self.prefill_tokens_per_req > 1
             else float(self.eff_ctx)
         )
+        if profile.sparse_attn is not None:
+            return self._build_sparse_attn_terms(kv_bytes_per_elem, raw_attn_ctx)
         if not has_dsa_profile(profile):
             dsa_fields: dict[str, float | bool] = {
                 "has_dsa": False,
@@ -926,12 +1425,27 @@ class _ScopeContextBuilder:
         )
         w_bytes = DTYPE_BYTES[profile.weight_dtype.lower()]
         e_bytes = DTYPE_BYTES[(profile.expert_dtype or profile.weight_dtype).lower()]
-        kv_bytes = DTYPE_BYTES[profile.kv_dtype.lower()]
+        kv_alias = canonical_kv_dtype(profile.kv_dtype)
+        kv_bytes = DTYPE_BYTES[kv_alias]
         st_bytes = DTYPE_BYTES[profile.state_dtype.lower()]
         dsa, dsa_dcp = self._build_dsa_terms(kv_bytes)
+        idx_q_params = float(
+            dsa.get("indexer_query_proj_params", parts.indexer_query_proj_params)
+        )
+        idx_kw_params = float(
+            dsa.get(
+                "indexer_key_weight_proj_params", parts.indexer_key_weight_proj_params
+            )
+        )
+        hc_params, hc_flops, hc_vec_ops = compute_hyper_connection_terms(
+            profile, self.layers_local, self.eff_tp, self.active_tokens
+        )
+        tbl_proj_local = sum(
+            ceil(tbl.dense_proj_params / self.eff_tp) for tbl in profile.host_tables
+        )
         base_dense_params = (
             self.local_attn * parts.attn_params
-            + self.local_indexer * parts.indexer_query_proj_params
+            + self.local_indexer * idx_q_params
             + self.local_lin * parts.linear_attn_params
             + (self.layers_local - self.local_moe) * parts.dense_ffn_params
             + self.local_moe * (parts.shared_expert_params + parts.latent_proj_params)
@@ -942,21 +1456,17 @@ class _ScopeContextBuilder:
             * profile.hidden_size
             * profile.num_experts
             * float(BF16_BYTES)
-            + self.local_indexer
-            * parts.indexer_key_weight_proj_params
-            * float(BF16_BYTES)
+            + self.local_indexer * idx_kw_params * float(BF16_BYTES)
+            + (hc_params + tbl_proj_local) * float(BF16_BYTES)
         )
         exp_bytes = parts.routed_expert_params * e_bytes
-        tok_split = max(1, self.kv_split, self.eff_pcp)
-        kv_bytes_per_tok = (
-            (
-                (profile.kv_lora_rank + profile.qk_rope_head_dim)
-                if profile.kv_lora_rank
-                else 2.0 * parts.kvh_local * profile.head_dim
-            )
-            * kv_bytes
-            * profile.kv_compress_factor
-            / tok_split
+        tok_split = max(
+            1,
+            max(1, workload.dcp) if profile.dcp_span == "tp_group" else self.kv_split,
+            self.eff_pcp,
+        )
+        kv_dt, kv_bytes_per_tok = _kv_bytes_per_token(
+            profile, workload, parts.kvh_local, kv_bytes, tok_split
         )
         full_kv_resident = (
             self.local_attn * self.batch_local * self.eff_ctx * kv_bytes_per_tok
@@ -964,9 +1474,14 @@ class _ScopeContextBuilder:
         full_kv_read = (
             self.local_attn * self.kv_read_batches * self.eff_ctx * kv_bytes_per_tok
         )
-        resident_kv_bytes = full_kv_resident + (
-            float(dsa["indexer_k_resident_bytes"]) if dsa["has_dsa"] else 0.0
-        )
+        if profile.sparse_attn is not None:
+            resident_kv_bytes = float(dsa["indexer_k_resident_bytes"])
+        elif dsa["has_dsa"]:
+            resident_kv_bytes = full_kv_resident + float(
+                dsa["indexer_k_resident_bytes"]
+            )
+        else:
+            resident_kv_bytes = full_kv_resident
         kv_cache_read_bytes = (
             float(dsa["indexer_k_read_bytes"]) + float(dsa["dsa_kv_gather_bytes"])
             if dsa["has_dsa"]
@@ -984,15 +1499,16 @@ class _ScopeContextBuilder:
             )
             * st_bytes
         )
+        hc_per_layer_bf16 = (
+            ceil(hc_params / max(1, self.layers_local)) * float(BF16_BYTES)
+            if hc_params > 0
+            else 0.0
+        )
         layer_dense_weight_bytes = int(
             (
                 max(
                     parts.attn_params
-                    + (
-                        parts.indexer_query_proj_params
-                        if self.local_indexer > 0
-                        else 0.0
-                    ),
+                    + (idx_q_params if self.local_indexer > 0 else 0.0),
                     parts.linear_attn_params,
                 )
                 + (
@@ -1002,17 +1518,20 @@ class _ScopeContextBuilder:
                 )
             )
             * w_bytes
-            + (
-                parts.indexer_key_weight_proj_params * float(BF16_BYTES)
-                if self.local_indexer > 0
-                else 0.0
-            )
+            + (idx_kw_params * float(BF16_BYTES) if self.local_indexer > 0 else 0.0)
+            + hc_per_layer_bf16
         )
         kv_lora = profile.kv_lora_rank
         qk_nope = profile.qk_nope_head_dim or profile.head_dim
         mla_attn_dim = self.decode_tokens * (
             2 * kv_lora + profile.qk_rope_head_dim
         ) + self.prefill_rows * (qk_nope + profile.qk_rope_head_dim + profile.head_dim)
+        hadamard_flops = compute_hadamard_kv_bf16_flops(
+            kv_dt,
+            (parts.nh_local, parts.kvh_local, profile.head_dim),
+            self.active_tokens,
+            self.local_attn,
+        )
         flops_kv = (
             2.0
             * self.local_attn
@@ -1022,6 +1541,7 @@ class _ScopeContextBuilder:
                 if kv_lora
                 else 2.0 * self.active_tokens * parts.q_dim
             )
+            + hadamard_flops
         )
         flops_dense = (
             2.0
@@ -1029,10 +1549,12 @@ class _ScopeContextBuilder:
             * (
                 base_dense_params
                 + self.local_moe * profile.hidden_size * profile.num_experts
-                + self.local_indexer * parts.indexer_key_weight_proj_params
+                + self.local_indexer * idx_kw_params
             )
             + flops_kv
             + float(dsa["flops_indexer_score"])
+            + hc_flops
+            + 2.0 * self.active_tokens * tbl_proj_local
         )
         flops_moe = (
             2.0
@@ -1046,6 +1568,13 @@ class _ScopeContextBuilder:
             if parts.experts_local > 0
             else 0.0
         )
+        ced_scale = _ced_token_scale(
+            profile, workload, self.layers_local, self.active_tokens, self.chunk_tokens
+        )
+        if ced_scale < 1.0:
+            flops_kv *= ced_scale
+            flops_dense *= ced_scale
+            flops_moe *= ced_scale
         gqa_scratch = (
             2 * ATTN_TILE_TOKENS * (FP32_BYTES * max(profile.head_dim, kv_lora))
             + 2 * ATTN_TILE_TOKENS * ATTN_TILE_TOKENS * FP32_BYTES
@@ -1128,6 +1657,17 @@ class _ScopeContextBuilder:
             else profile.weight_dtype
         )
         buf_slots = workload.dma_buffers
+        breaks = active_fusion_break_layers(profile, workload)
+        has_fusion_break = bool(breaks)
+        eff_layer_groups = workload.layer_groups or fusion_break_layer_groups(
+            profile.num_layers, breaks
+        )
+        tbl_hbm_b, tbl_read_b, host_h2d_s = _compute_host_table_context_terms(
+            profile,
+            workload,
+            (self.eff_tp, self.batch_local, self.active_tokens),
+            chip_spec.pcie_h2d_bw_bytes_per_s,
+        )
         return _ScopeContext(
             vmem_budget=vmem_budget,
             single_layer_dense_staging_bytes=min(
@@ -1143,10 +1683,8 @@ class _ScopeContextBuilder:
             layers_local=self.layers_local,
             num_segments=num_segments,
             num_layer_groups=(
-                ceil(
-                    len(workload.layer_groups) * self.layers_local / profile.num_layers
-                )
-                if workload.layer_groups
+                ceil(len(eff_layer_groups) * self.layers_local / profile.num_layers)
+                if eff_layer_groups
                 else 0
             ),
             local_moe_layers=self.local_moe,
@@ -1208,12 +1746,13 @@ class _ScopeContextBuilder:
             flops_moe=flops_moe,
             peak_w=chip_spec.peak_flops(profile.weight_dtype, profile.act_dtype),
             peak_e=chip_spec.peak_flops(
-                profile.expert_dtype or profile.weight_dtype, profile.act_dtype
+                profile.expert_dtype or profile.weight_dtype,
+                profile.expert_act_dtype or profile.act_dtype,
             ),
             bf16_peak=chip_spec.bf16_flops_per_s,
             attn_is_bf16=profile.act_dtype.lower() not in FP8_DTYPES
-            or profile.kv_dtype.lower() not in FP8_DTYPES,
-            kv_cache_read_bytes=kv_cache_read_bytes,
+            or kv_dt not in FP8_DTYPES,
+            kv_cache_read_bytes=kv_cache_read_bytes + tbl_read_b,
             recurrent_state_rw_bytes=recurrent_state_rw_bytes,
             bw_hbm=chip_spec.hbm_bw_bytes_per_s,
             hbm_used=(
@@ -1221,11 +1760,13 @@ class _ScopeContextBuilder:
                 + self.local_moe * parts.experts_local * exp_bytes
                 + resident_kv_bytes
                 + recurrent_state_rw_bytes / RECURRENT_STATE_RW_PASSES
+                + tbl_hbm_b
             ),
             no_whole_step=(
                 workload.pp > 1
                 or num_segments > 1
                 or len(workload.layer_groups) > 1
+                or has_fusion_break
                 or profile.num_layers == 1
                 or bool(plan_error)
             ),
@@ -1243,7 +1784,7 @@ class _ScopeContextBuilder:
             indexer_ctx_local=float(dsa["indexer_ctx_local"]),
             dsa_kv_gather_bytes=float(dsa["dsa_kv_gather_bytes"]),
             dsa_kv_strict_bytes=float(dsa["dsa_kv_strict_bytes"]),
-            vec_ops_pre_dsa_extra=float(dsa["vec_ops_pre_dsa_extra"]),
+            vec_ops_pre_dsa_extra=float(dsa["vec_ops_pre_dsa_extra"]) + hc_vec_ops,
             vec_ops_dsa=float(dsa["vec_ops_dsa"]),
             vec_ops_indexer_radix=float(dsa["vec_ops_indexer_radix"]),
             dcp_query_all_gather_transfer_s=float(dsa_dcp["query_s"]),
@@ -1251,6 +1792,8 @@ class _ScopeContextBuilder:
             dcp_post_attn_transfer_s=float(dsa_dcp["post_s"]),
             dcp_post_attn_hops=int(dsa_dcp["post_hops"]),
             dcp_hops=int(dsa_dcp["dcp_hops"]),
+            has_fusion_break=has_fusion_break,
+            host_h2d_s=host_h2d_s,
         )
 
 
@@ -1290,7 +1833,7 @@ class _ScopePricer:
         )
         self.n_ops = self.vmem_budget.ops_per_step
         self.n_splits = self.vmem_budget.num_vmem_splits
-        self.is_fused_multi = scope in ("whole_step", "layer_group")
+        self.is_fused_multi = scope in MULTI_LAYER_FUSED_SCOPES
         self.overlapped_comm = self.is_fused_multi and self.n_splits == 1
         self.tiled = self.is_fused_multi and self.n_splits > 1
         self.boundary_count = max(0, self.n_ops - 1)
@@ -1467,9 +2010,11 @@ class _ScopePricer:
             and weight_bytes < float(BF16_BYTES)
             else 0.0
         )
+        hc = profile.hyper_connection
+        streams = max(1, hc.num_streams if hc is not None else profile.residual_streams)
         vec_ops_dense = (
             RMSNORM_RESIDUAL_VEC_OPS_PER_ELEM
-            * max(1, profile.residual_streams)
+            * streams
             * tokens
             * (profile.hidden_size / eff_tp)
             * ctx.layers_local
@@ -1579,7 +2124,7 @@ class _ScopePricer:
         """Compute non-DSA cross-DCP gather transfer seconds and hops on egress ICI."""
         ctx, profile, workload = self.ctx, self.profile, self.workload
         has_non_dsa_dcp = (
-            not ctx.has_dsa
+            not (ctx.has_dsa and profile.sparse_attn is None)
             and ctx.local_attn_layers > 0
             and workload.dcp > 1
             and (workload.dcp & (workload.dcp - 1)) == 0
@@ -1742,15 +2287,13 @@ class _ScopePricer:
             VECTOR_MAX_ELEMENTS_PER_WORD * self.vec_rate if strict else self.vec_rate
         )
         expert_bytes = DTYPE_BYTES[expert_dt]
-        if (
-            0 < self.profile.weight_block_k < SUBCHANNEL_BLOCK_K_THRESHOLD
-            and expert_bytes < float(BF16_BYTES)
+        moe_block_k = self.profile.expert_weight_block_k or self.profile.weight_block_k
+        if 0 < moe_block_k < SUBCHANNEL_BLOCK_K_THRESHOLD and expert_bytes < float(
+            BF16_BYTES
         ):
             streamed = max(0.0, routed_bytes) / expert_bytes
             strat_a_s = streamed / (VECTOR_MAX_ELEMENTS_PER_WORD * self.vec_rate)
-            strat_b_s = (
-                routed_scale * self.ctx.flops_moe / self.profile.weight_block_k
-            ) / base_rate
+            strat_b_s = (routed_scale * self.ctx.flops_moe / moe_block_k) / base_rate
             subchannel_s = min(strat_a_s, strat_b_s)
         else:
             subchannel_s = 0.0
@@ -1793,9 +2336,11 @@ class _ScopePricer:
             if apply_eff
             else 0.0
         )
-        hbm_s = (
-            (w_used + eff_state + self.act_bytes + extra_routed) / self.ctx.bw_hbm
-        ) / eta_hbm
+        hbm_s = max(
+            ((w_used + eff_state + self.act_bytes + extra_routed) / self.ctx.bw_hbm)
+            / eta_hbm,
+            self.ctx.host_h2d_s,
+        )
         routed_hbm_s = (routed_bytes / self.ctx.bw_hbm) / eta_hbm
 
         dense_vec_rate = (
@@ -2154,14 +2699,14 @@ def _build_scope_estimate(
     )
 
 
-def _evaluate_whole_step_microbatched(
+def _evaluate_fused_scope_microbatched(
+    scope: FusionScope,
     scope_context: _ScopeContext,
     profile: ModelProfile,
     workload: WorkloadSpec,
     scope_cfg: _ScopeEvalConfig,
-    measurements: MeasurementsData | None = None,
 ) -> tuple[ScopeEstimate, float, float]:
-    """Price whole_step above its single-call row limit using unrounded sums."""
+    """Price a multi-layer fused scope above its single-call row limit."""
     tokens_per_req = scope_context.active_tokens // scope_context.batch_local
     per_call = scope_context.single_call_rows // tokens_per_req
     full_calls = scope_context.batch_local // per_call
@@ -2176,7 +2721,7 @@ def _evaluate_whole_step_microbatched(
             sub_wl,
             scope_context.chip_spec,
             scope_context.plan_error,
-            meas=measurements,
+            meas=scope_cfg.measurements,
         )
         sub_ctx = replace(
             built_sub,
@@ -2189,9 +2734,7 @@ def _evaluate_whole_step_microbatched(
             ),
             launch_gap_upper_us=scope_context.launch_gap_upper_us,
         )
-        parts.append(
-            _ScopePricer("whole_step", sub_ctx, profile, sub_wl).price(scope_cfg)
-        )
+        parts.append(_ScopePricer(scope, sub_ctx, profile, sub_wl).price(scope_cfg))
 
     full_est, full_step_us, sub_pure_us, full_raw = parts[0]
     rest_est, rest_step_us, _, rest_raw = (
@@ -2255,7 +2798,7 @@ def _evaluate_whole_step_microbatched(
         else ("ep" if workload.ep > 1 else "tp")
     )
     combined = _build_scope_estimate(
-        "whole_step",
+        scope,
         scope_context,
         profile,
         workload,
@@ -2303,13 +2846,14 @@ def _evaluate_scopes(
             sub_pure_us=sub_pure_us,
             upper_boundary_fill=upper_boundary_fill,
             upper_per_op_coll_factor=upper_per_op_coll_factor,
+            measurements=measurements,
         )
         if (
-            scope == "whole_step"
+            scope in MULTI_LAYER_FUSED_SCOPES
             and 0 < scope_context.single_call_rows < scope_context.active_tokens
         ):
-            scope_est, step_us, sub_pure_us = _evaluate_whole_step_microbatched(
-                scope_context, profile, workload, cfg, measurements=measurements
+            scope_est, step_us, sub_pure_us = _evaluate_fused_scope_microbatched(
+                scope, scope_context, profile, workload, cfg
             )
         else:
             scope_est, step_us, sub_pure_us, _ = _ScopePricer(

@@ -37,6 +37,7 @@ from .constants import (
     SATURATION_BASE_BATCH,
     SATURATION_BATCH_CAP,
     TP_CANDIDATE_DEGREES,
+    canonical_kv_dtype,
 )
 from .models import (
     DEPLOYMENT_PRESETS,
@@ -58,7 +59,9 @@ from .specs import (
     ParallelismRecommendation,
     Phase,
     RegimeEntry,
+    ScopeEstimate,
     WorkloadSpec,
+    align_batch_to_dp,
     format_parallel_layout_label,
     load_measurements,
 )
@@ -251,14 +254,9 @@ def _reference_regime_specs() -> tuple[_RegimeSpec, ...]:
     )
 
 
-def _round_dp_batch(raw_batch: int, dp: int) -> int:
-    """Round `raw_batch` up to the smallest positive multiple of `dp`."""
-    return dp * max(1, (raw_batch + dp - 1) // dp)
-
-
 def _saturation_batch(raw_batch: int, dp: int) -> int:
     """Cap saturation batch at the sweep max while keeping `dp` alignment."""
-    return _round_dp_batch(min(SATURATION_BATCH_CAP, raw_batch), dp)
+    return align_batch_to_dp(min(SATURATION_BATCH_CAP, raw_batch), dp)
 
 
 def _supports_tp_heads(profile: ModelProfile, tp_degree: int) -> bool:
@@ -302,6 +300,16 @@ def _build_parallelism_recommendation(
     source: str,
 ) -> ParallelismRecommendation:
     """Build a `ParallelismRecommendation` from a layout and evaluated report."""
+    exec_mode = (
+        layout.effective_execution
+        if isinstance(layout, WorkloadSpec)
+        else layout.execution
+    )
+    table_overrides = (
+        layout.effective_host_table_hbm_overrides
+        if isinstance(layout, WorkloadSpec)
+        else layout.host_table_hbm_overrides
+    )
     return ParallelismRecommendation(
         tp=layout.tp,
         ep=layout.ep,
@@ -316,22 +324,8 @@ def _build_parallelism_recommendation(
         auto_selected=auto_selected,
         source=source,
         layer_groups=layout.layer_groups,
-    )
-
-
-def _with_layout(
-    workload: WorkloadSpec, layout: ParallelLayout | ParallelismRecommendation
-) -> WorkloadSpec:
-    """Apply the six parallelism axes and optional layer groups onto `workload`."""
-    return replace(
-        workload,
-        tp=layout.tp,
-        ep=layout.ep,
-        dp=layout.dp,
-        pp=layout.pp,
-        dcp=layout.dcp,
-        pcp=layout.pcp,
-        layer_groups=layout.layer_groups or workload.layer_groups,
+        execution=exec_mode,
+        host_table_hbm_overrides=table_overrides,
     )
 
 
@@ -355,7 +349,7 @@ def _evaluate_parallelism_candidate(
         profile,
         replace(
             workload,
-            batch=_round_dp_batch(RECOMMEND_HIGH_BATCH, workload.dp),
+            batch=align_batch_to_dp(RECOMMEND_HIGH_BATCH, workload.dp),
             isl=RECOMMEND_HIGH_CTX,
             context=RECOMMEND_HIGH_CTX,
         ),
@@ -408,7 +402,7 @@ def recommend_parallelism(
         for dcp_degree in dcp_candidates:
             workload = WorkloadSpec(
                 phase=search.phase,
-                batch=_round_dp_batch(RECOMMEND_DEFAULT_BATCH, search.dp),
+                batch=align_batch_to_dp(RECOMMEND_DEFAULT_BATCH, search.dp),
                 spec_tokens=spec_tokens,
                 tp=tp_degree,
                 ep=ep_degree,
@@ -443,18 +437,20 @@ def _layout_recommendation(
     source: str = "deployment preset",
 ) -> ParallelismRecommendation:
     """Evaluate a fixed layout HBM fit at the reference decode workload."""
-    base_report = advise(
-        profile,
-        replace(
-            _with_layout(base, layout),
-            phase="decode",
-            batch=_round_dp_batch(RECOMMEND_DEFAULT_BATCH, layout.dp),
-        ),
-        chip_spec,
+    effective_workload = replace(
+        base.with_layout(layout),
+        phase="decode",
+        batch=align_batch_to_dp(RECOMMEND_DEFAULT_BATCH, layout.dp),
     )
+    base_report = advise(profile, effective_workload, chip_spec)
     active_pcp = layout.pcp if source else effective_pcp(base)
-    return _build_parallelism_recommendation(
+    effective_layout = replace(
         layout,
+        execution=effective_workload.effective_execution,
+        host_table_hbm_overrides=effective_workload.effective_host_table_hbm_overrides,
+    )
+    return _build_parallelism_recommendation(
+        effective_layout,
         base_report,
         _slice_topology(chip_spec, layout, active_pcp),
         auto_selected=False,
@@ -509,7 +505,8 @@ def _select_layouts(
 
 def _disagg_wire_payload_bytes(profile: ModelProfile, isl: int) -> tuple[float, float]:
     """Return `(kv_wire_bytes, state_wire_bytes)` per request for P/D handoff."""
-    kv_bytes = DTYPE_BYTES[profile.kv_dtype.lower()]
+    kv_dt = canonical_kv_dtype(profile.kv_dtype)
+    kv_bytes = DTYPE_BYTES[kv_dt]
     state_bytes = DTYPE_BYTES[profile.state_dtype.lower()]
     kv_per_tok = (
         (profile.kv_lora_rank + profile.qk_rope_head_dim) * kv_bytes
@@ -583,7 +580,7 @@ def _with_preset_prefill(
     if layout_preset is None:
         return workloads
     prefill_layout, saturation_layout = layout_preset.prefill, layout_preset.saturation
-    decode_base = _with_layout(workloads[0][1], prefill_layout)
+    decode_base = workloads[0][1].with_layout(prefill_layout)
     windows = tuple(
         (
             f"Preset Prefill Window (W={window_tokens})",
@@ -601,12 +598,13 @@ def _with_preset_prefill(
         )
         for window_tokens in layout_preset.prefill_windows
     )
+    decode_dp = max(1, layout_preset.decode.dp)
     saturation_batch = (
         _saturation_batch(
             SATURATION_BASE_BATCH * saturation_layout.dp, saturation_layout.dp
         )
         if saturation_layout is not None
-        else SATURATION_BASE_BATCH
+        else align_batch_to_dp(SATURATION_BASE_BATCH, decode_dp)
     )
     saturation_spec_tokens = layout_preset.decode.spec_tokens or DEFAULT_SPEC_TOKENS
     moved: list[tuple[str, WorkloadSpec]] = []
@@ -616,8 +614,7 @@ def _with_preset_prefill(
                 (
                     label,
                     replace(
-                        _with_layout(workload, prefill_layout),
-                        batch=_round_dp_batch(workload.batch, prefill_layout.dp),
+                        workload.with_layout(prefill_layout, align_batch=True),
                         layer_groups=prefill_layout.layer_groups,
                     ),
                 )
@@ -631,7 +628,7 @@ def _with_preset_prefill(
                 (
                     entry_label,
                     replace(
-                        _with_layout(workload, saturation_layout),
+                        workload.with_layout(saturation_layout),
                         batch=saturation_batch,
                         layer_groups=saturation_layout.layer_groups,
                     ),
@@ -647,13 +644,27 @@ def _with_preset_prefill(
                 (
                     entry_label,
                     replace(
-                        _with_layout(workload, saturation_layout),
+                        workload.with_layout(saturation_layout),
                         phase="verify",
                         batch=saturation_batch,
                         spec_tokens=saturation_spec_tokens,
                         layer_groups=saturation_layout.layer_groups,
                         moe_mode="grouped_on_chip",
                         moe_mode_explicit=True,
+                    ),
+                )
+            )
+        elif (
+            saturation_layout is None
+            and decode_dp > 1
+            and label.startswith("Decode Saturated")
+        ):
+            moved.append(
+                (
+                    label,
+                    replace(
+                        workload,
+                        batch=align_batch_to_dp(workload.batch, decode_dp),
                     ),
                 )
             )
@@ -668,7 +679,7 @@ def _build_reference_workloads(
     """Build the standard 12 reference request regimes with DP-divisible batches."""
     built: list[tuple[str, WorkloadSpec]] = []
     for spec in _reference_regime_specs():
-        batch_size = _round_dp_batch(spec.raw_batch, base.dp)
+        batch_size = align_batch_to_dp(spec.raw_batch, base.dp)
         label = spec.template.format(batch=batch_size, spec=spec_tokens)
         workload = replace(
             base,
@@ -714,7 +725,13 @@ def _evaluate_sweep_workloads(
             if scope_est.scope == advisor_report.recommended_scope
         )
         workload_dict = asdict(
-            replace(workload, context=advisor_report.effective_context, tiles=None)
+            replace(
+                workload,
+                context=advisor_report.effective_context,
+                tiles=None,
+                execution=workload.effective_execution,
+                host_table_hbm_overrides=workload.effective_host_table_hbm_overrides,
+            )
         )
         workload_dict["layer_groups"] = list(workload.layer_groups)
         entries.append(
@@ -760,6 +777,16 @@ def _evaluate_sweep_workloads(
     return entries, reports
 
 
+def _select_vmem_reference_scope(decode_report: AdvisorReport) -> ScopeEstimate:
+    """Return deepest feasible scope among whole_step, layer_group, single_layer."""
+    scopes = {scope_est.scope: scope_est for scope_est in decode_report.scopes}
+    if scopes["whole_step"].feasible:
+        return scopes["whole_step"]
+    if scopes["layer_group"].feasible:
+        return scopes["layer_group"]
+    return scopes["single_layer"]
+
+
 def _build_tailoring_guide(
     profile: ModelProfile,
     chip_spec: ChipSpec,
@@ -778,9 +805,7 @@ def _build_tailoring_guide(
         for scope_est in decode_report.scopes
         if scope_est.scope == "single_layer"
     )
-    reference_scope = (
-        whole_step_scope if whole_step_scope.feasible else single_layer_scope
-    )
+    reference_scope = _select_vmem_reference_scope(decode_report)
     max_tokens, ridge_tokens = (
         reference_scope.max_vmem_tokens,
         decode_report.ridge_tokens,
@@ -815,6 +840,11 @@ def _build_tailoring_guide(
         )
     )
     ridge_intensity = decode_report.ridge_dense_flop_per_byte
+    mid_scope_hint = (
+        "scope='single_layer'"
+        if reference_scope.scope == "layer_group"
+        else "scope='single_layer' or 'layer_group'"
+    )
     return (
         f"Small/Med Decode & Spec Verify (T <= {max_tokens} active tokens): use "
         f"scope='{reference_scope.scope}'{core_limits_note} with {low_batch_moe_hint} "
@@ -825,7 +855,7 @@ def _build_tailoring_guide(
         f"{CORE_LIMITS.default_verify_bucket_top} verify rows; "
         "a larger call needs a custom bucket list.",
         f"High-Batch Decode & Chunked Prefill {mid_regime_band}: use "
-        f"scope='single_layer' or 'layer_group' (single-layer VMEM ceiling "
+        f"{mid_scope_hint} (single-layer VMEM ceiling "
         f"max_vmem_tokens={single_layer_scope.max_vmem_tokens}) so activations fit "
         "a single pass without multi-layer weight staging.",
         f"Saturated Decode & Compute-Bound Prefill (T > {ridge_tokens} tokens, "
@@ -908,7 +938,7 @@ def advise_regimes(
         else None
     )
     base_workload = replace(
-        _with_layout(base_workload, selected_layouts.decode), batch_explicit=True
+        base_workload.with_layout(selected_layouts.decode), batch_explicit=True
     )
     spec_tokens = (
         preset.decode.spec_tokens
@@ -925,19 +955,7 @@ def advise_regimes(
     vmem_parts = compute_per_token_vmem_bytes(
         model_profile, workloads[DECODE_MED_REF_INDEX][1]
     )
-    whole_step_scope = next(
-        scope_est
-        for scope_est in decode_report.scopes
-        if scope_est.scope == "whole_step"
-    )
-    single_layer_scope = next(
-        scope_est
-        for scope_est in decode_report.scopes
-        if scope_est.scope == "single_layer"
-    )
-    reference_scope = (
-        whole_step_scope if whole_step_scope.feasible else single_layer_scope
-    )
+    reference_scope = _select_vmem_reference_scope(decode_report)
     return AdvisorSweepReport(
         model=model_profile.name,
         chip=chip_spec.name,
@@ -1042,9 +1060,9 @@ def _sweep_layer_group_search(
             else DEFAULT_PREFILL_ISL
         )
         search_workload = replace(
-            _with_layout(base_workload, prefill_layout),
+            base_workload.with_layout(prefill_layout),
             phase="prefill",
-            batch=_round_dp_batch(1, prefill_layout.dp),
+            batch=align_batch_to_dp(1, prefill_layout.dp),
             isl=window_tokens,
             osl=DEFAULT_PREFILL_OSL,
             context=window_tokens,
@@ -1052,9 +1070,9 @@ def _sweep_layer_group_search(
         )
     else:
         search_workload = replace(
-            _with_layout(base_workload, decode_layout),
+            base_workload.with_layout(decode_layout),
             phase="decode",
-            batch=_round_dp_batch(max(1, base_workload.batch), decode_layout.dp),
+            batch=align_batch_to_dp(max(1, base_workload.batch), decode_layout.dp),
         )
     return search_layer_groups(
         model_profile, search_workload, chip_spec, measurements=measurements

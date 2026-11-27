@@ -23,6 +23,11 @@ from pathlib import Path
 
 import pytest
 
+from tests.megakernel.advisor_test_helpers import (
+    build_preset_workload,
+    expected_scope_feasibility,
+    minimal_valid_core_layout,
+)
 from tests.megakernel.test_advisor_bounds import (
     case_chips,
     case_layouts,
@@ -172,21 +177,17 @@ def _small_dense_profile() -> advisor.ModelProfile:
 def test_floor_ordering_and_monotonicity_across_models(model_slug: str) -> None:
     """Verify band ordering and batch/context monotonicity across shipped presets."""
     decode_layout = advisor.DEPLOYMENT_PRESETS[model_slug].decode
-    small_batch = 4
-    large_batch = 32
+    small_batch = specs.align_batch_to_dp(4, decode_layout.dp)
+    large_batch = specs.align_batch_to_dp(max(32, small_batch * 2), decode_layout.dp)
     short_context = 8192
     long_context = 32768
-    workload_small = advisor.WorkloadSpec(
-        phase="decode",
+    workload_small = build_preset_workload(
+        model_slug,
+        "decode",
+        use_decode_layout=True,
         batch=small_batch,
         context=short_context,
         osl=1,
-        tp=decode_layout.tp,
-        ep=decode_layout.ep,
-        dp=decode_layout.dp,
-        pp=decode_layout.pp,
-        dcp=decode_layout.dcp,
-        pcp=decode_layout.pcp,
     )
     workload_large_batch = dataclasses.replace(workload_small, batch=large_batch)
     workload_long_context = dataclasses.replace(workload_small, context=long_context)
@@ -227,25 +228,33 @@ def test_all_scopes_satisfy_band_ordering_and_empirical_bracket(
     )
     chunk_size = 1024 if phase in ("prefill", "mixed") else 0
     pcp = 2 if phase in ("prefill", "mixed") else 1
-    workload = advisor.WorkloadSpec(
-        phase=phase,
-        batch=1 if phase == "prefill" else 16,
+    batch_size = (
+        decode_layout.dp
+        if phase == "prefill"
+        else specs.align_batch_to_dp(16, decode_layout.dp)
+    )
+    workload = build_preset_workload(
+        model_slug,
+        phase,
+        use_decode_layout=True,
+        batch=batch_size,
         isl=4096,
         chunk_size=chunk_size,
         spec_tokens=spec_tokens,
-        tp=decode_layout.tp,
-        ep=decode_layout.ep,
-        dp=decode_layout.dp,
-        pp=decode_layout.pp,
-        dcp=decode_layout.dcp,
         pcp=pcp,
         layer_groups=(profile.num_layers,),
     )
     report = advisor.advise(profile, workload, "tpu7x")
     assert report.ranking_metric == "step_bound_us"
     assert tuple(scope_est.scope for scope_est in report.scopes) == ALL_SCOPES
-    assert all(scope_est.feasible for scope_est in report.scopes)
+    expected_feasible = expected_scope_feasibility(profile, workload)
+    assert {
+        scope_est.scope: scope_est.feasible for scope_est in report.scopes
+    } == expected_feasible
     for scope_est in report.scopes:
+        if not scope_est.feasible:
+            assert scope_est.reason
+            continue
         assert (
             scope_est.step_floor_strict_us
             <= scope_est.step_bound_us
@@ -1632,29 +1641,13 @@ def test_scope_assumption_sensitivities_match_roofline_upper_deltas(
             phase="decode", batch=16, tp=1, ep=1, pp=fitting_pp
         )
     elif mode == "prefill":
-        layout = preset.prefill
-        workload = advisor.WorkloadSpec(
-            phase="prefill",
-            batch=1,
-            isl=4096,
-            tp=layout.tp,
-            ep=layout.ep,
-            dp=layout.dp,
-            pp=layout.pp,
-            dcp=layout.dcp,
-            pcp=layout.pcp,
+        workload = build_preset_workload(
+            model_slug, "prefill", per_replica_batch=1, isl=4096
         )
     else:
-        layout = preset.decode
-        workload = advisor.WorkloadSpec(
-            phase="decode",
-            batch=16,
-            tp=layout.tp,
-            ep=layout.ep,
-            dp=layout.dp,
-            pp=layout.pp,
-            dcp=layout.dcp,
-            pcp=layout.pcp,
+        decode_batch = specs.align_batch_to_dp(16, preset.decode.dp)
+        workload = build_preset_workload(
+            model_slug, "decode", use_decode_layout=True, batch=decode_batch
         )
 
     report = advisor.advise(profile, workload, chip_tpu7x)
@@ -1970,11 +1963,13 @@ def test_entry_points_reject_same_inputs() -> None:
     max_core_rank = 16
     for slug in sorted(advisor.MODEL_PRESETS):
         profile = advisor.resolve_model_profile(slug)
-        dec = advisor.DEPLOYMENT_PRESETS[slug].decode
+        core_layout = minimal_valid_core_layout(
+            advisor.DEPLOYMENT_PRESETS[slug].decode, max_rank=max_core_rank
+        )
         core_axes = {
-            "tp": min(dec.tp, max_core_rank),
-            "ep": min(dec.ep, max_core_rank),
-            "dp": 1,
+            "tp": core_layout.tp,
+            "ep": core_layout.ep,
+            "dp": core_layout.dp,
             "pp": 1,
             "dcp": 1,
             "pcp": 1,
@@ -1995,11 +1990,13 @@ def test_unused_axis_keeps_throughput_per_chip() -> None:
     violations: list[str] = []
     for slug in sorted(advisor.MODEL_PRESETS):
         profile = advisor.resolve_model_profile(slug)
-        dec = advisor.DEPLOYMENT_PRESETS[slug].decode
+        core_layout = minimal_valid_core_layout(
+            advisor.DEPLOYMENT_PRESETS[slug].decode, max_rank=max_core_rank
+        )
         core_axes = {
-            "tp": min(dec.tp, max_core_rank),
-            "ep": min(dec.ep, max_core_rank),
-            "dp": 1,
+            "tp": core_layout.tp,
+            "ep": core_layout.ep,
+            "dp": core_layout.dp,
             "pp": 1,
             "dcp": 1,
             "pcp": 1,
@@ -2027,8 +2024,12 @@ def test_unused_axis_keeps_throughput_per_chip() -> None:
             tput2 = float(rep_pcp2.metrics["throughput_tok_s_per_chip"]["value"])
             if abs(tput1 - tput2) > _TWO_FIELD_ROUND_TOL_US:
                 violations.append(f"{label} advise tput: {tput1} vs {tput2}")
-            lay1 = advisor.ParallelLayout(tp=core_axes["tp"], ep=core_axes["ep"], pcp=1)
-            lay2 = advisor.ParallelLayout(tp=core_axes["tp"], ep=core_axes["ep"], pcp=2)
+            lay1 = advisor.ParallelLayout(
+                tp=core_layout.tp, ep=core_layout.ep, dp=core_layout.dp, pcp=1
+            )
+            lay2 = advisor.ParallelLayout(
+                tp=core_layout.tp, ep=core_layout.ep, dp=core_layout.dp, pcp=2
+            )
             comp = advisor.compare_parallelism_candidates(
                 profile, [lay1, lay2], chip=chip_default, base_workload=wl_pcp1
             )

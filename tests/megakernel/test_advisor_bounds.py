@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.megakernel.advisor_test_helpers import minimal_valid_core_layout
 from tests.megakernel.core.megakernel_fakes import TINY_TILES
 from vllm_torchtpu.megakernel import advisor
 from vllm_torchtpu.megakernel.advisor import (
@@ -639,33 +640,59 @@ def test_attention_flops_conserved_under_dcp_while_kv_bytes_shrink(
             "per_op",
         )
 
+    sp = profile.sparse_attn
+    if sp is not None and sp.kind == "csa":
+        for dcp in (4, 8):
+            with pytest.raises(MegakernelConfigError):
+                _eval_per_op(chip, dcp, 32768)
+        return
+
+    cap_tok = (
+        (sp.window_tokens + sp.select_tokens) if sp is not None else profile.index_topk
+    )
+    has_idx = models.has_dsa_profile(profile) or (sp is not None and sp.index_dim > 0)
+
     def _attn_compute_us(dcp: int) -> float:
         """Isolate attention matmul compute microseconds across context delta."""
         hi_ctx = 32768
-        if models.has_dsa_profile(profile):
-            topk = profile.index_topk
+        if has_idx and cap_tok > 0:
             c_lo = _eval_per_op(fast_io, dcp, 1).compute_us
-            c_mid = _eval_per_op(fast_io, dcp, topk).compute_us
+            c_mid = _eval_per_op(fast_io, dcp, cap_tok).compute_us
             c_hi = _eval_per_op(fast_io, dcp, hi_ctx).compute_us
-            idx_slope = (c_hi - c_mid) / (hi_ctx - topk)
-            return (c_mid - c_lo) - (topk - 1) * idx_slope
+            idx_slope = (c_hi - c_mid) / (hi_ctx - cap_tok)
+            return (c_mid - c_lo) - (cap_tok - 1) * idx_slope
         return (
             _eval_per_op(fast_io, dcp, hi_ctx).compute_us
             - _eval_per_op(fast_io, dcp, 1).compute_us
         )
 
+    def _kv_hbm_delta_us(dcp: int) -> float:
+        """Isolate KV-gather HBM microseconds across context delta under DCP."""
+        hi_ctx = 32768
+        if sp is not None and cap_tok > 0 and sp.index_dim > 0:
+            h_lo = _eval_per_op(chip, dcp, 1).hbm_us
+            h_mid = _eval_per_op(chip, dcp, cap_tok).hbm_us
+            h_hi = _eval_per_op(chip, dcp, hi_ctx).hbm_us
+            idx_slope = (h_hi - h_mid) / (hi_ctx - cap_tok)
+            return (h_mid - h_lo) - (cap_tok - 1) * idx_slope
+        return (
+            _eval_per_op(chip, dcp, hi_ctx).hbm_us - _eval_per_op(chip, dcp, 1).hbm_us
+        )
+
     round_tol = 4.0 * _REPORT_ROUND_TOL_US
     base_compute_us = _attn_compute_us(1)
-    base_hbm_delta_us = (
-        _eval_per_op(chip, 1, 32768).hbm_us - _eval_per_op(chip, 1, 1).hbm_us
-    )
+    base_hbm_delta_us = _kv_hbm_delta_us(1)
     for dcp in (4, 8):
         assert _attn_compute_us(dcp) == pytest.approx(base_compute_us, abs=round_tol)
-        dcp_hbm_delta_us = (
-            _eval_per_op(chip, dcp, 32768).hbm_us - _eval_per_op(chip, dcp, 1).hbm_us
-        )
+        dcp_hbm_delta_us = _kv_hbm_delta_us(dcp)
         if profile.kv_lora_rank > 0:
             expected_kv_ratio = 1.0 / dcp
+        elif profile.dcp_span == "tp_group":
+            kvh_base = max(1, math.ceil(profile.num_kv_heads / tp))
+            kvh_dcp = vmem.wide_dcp_kv_heads_per_rank(
+                profile.num_kv_heads, tp, dcp, "tp_group"
+            )
+            expected_kv_ratio = (kvh_dcp / kvh_base) / dcp
         else:
             kvh_base = max(1, math.ceil(profile.num_kv_heads / tp))
             kvh_dcp = max(1, math.ceil(profile.num_kv_heads / max(1, tp // dcp)))
@@ -774,10 +801,14 @@ def test_dtype_hbm_scaling_across_all_supported_dtypes() -> None:
     )
     ref_hbm_weights_us = ref_est.hbm_us - act_us
     ref_bytes_per_elem = constants.DTYPE_BYTES["fp8"]
-    for dtype_name, bytes_per_elem in constants.DTYPE_BYTES.items():
+    for dtype_name, bytes_per_elem in sorted(constants.DTYPE_BYTES.items()):
         prof_dt = dataclasses.replace(
             base_dense, weight_dtype=dtype_name, expert_dtype=dtype_name
         )
+        if dtype_name in constants.KV_ONLY_DTYPES:
+            with pytest.raises(MegakernelConfigError):
+                advisor.evaluate_scopes(prof_dt, wl, fast_compute)
+            continue
         est = _scope_by_name(
             advisor.evaluate_scopes(prof_dt, wl, fast_compute), "whole_step"
         )
@@ -3075,6 +3106,9 @@ def case_layouts(slug: str, phase: str) -> tuple[tuple[str, dict[str, int]], ...
     """
     preset = advisor.DEPLOYMENT_PRESETS[slug]
     layout = preset.prefill if phase in _MIXED_PREFILL_PHASES else preset.decode
+    tp_ep_layout = minimal_valid_core_layout(
+        preset.decode, max_rank=max(preset.decode.tp, preset.decode.ep)
+    )
     return (
         (
             "preset",
@@ -3091,9 +3125,9 @@ def case_layouts(slug: str, phase: str) -> tuple[tuple[str, dict[str, int]], ...
         (
             "tp_ep_only",
             {
-                "tp": preset.decode.tp,
-                "ep": preset.decode.ep,
-                "dp": 1,
+                "tp": tp_ep_layout.tp,
+                "ep": tp_ep_layout.ep,
+                "dp": tp_ep_layout.dp,
                 "pp": 1,
                 "dcp": 1,
                 "pcp": 1,
@@ -3435,6 +3469,35 @@ def _check_scaled_per_op(
     return issues
 
 
+def _strip_non_homogeneous_primitives(
+    profile: advisor.ModelProfile,
+) -> advisor.ModelProfile:
+    """Clear fixed per-stack metadata so homogeneous layer scaling holds linearly."""
+    hc = (
+        dataclasses.replace(profile.hyper_connection, has_final_mixer=False)
+        if profile.hyper_connection is not None
+        else None
+    )
+    sp = (
+        dataclasses.replace(
+            profile.sparse_attn,
+            kv_owners=(),
+            index_owners=(),
+            window_layers=(),
+            kv_owner_ring_bytes_per_req=0,
+        )
+        if profile.sparse_attn is not None
+        else None
+    )
+    return dataclasses.replace(
+        profile,
+        host_tables=(),
+        ced_boundary=0,
+        hyper_connection=hc,
+        sparse_attn=sp,
+    )
+
+
 def _check_gcd_scaling_for_preset(
     slug: str,
     profile: advisor.ModelProfile,
@@ -3445,21 +3508,22 @@ def _check_gcd_scaling_for_preset(
     Returns:
         List of gcd-unit scaling violations.
     """
+    homog_profile = _strip_non_homogeneous_primitives(profile)
     counts: dict[str, int] = {
-        "num_layers": profile.num_layers,
-        "num_linear_layers": profile.num_linear_layers,
-        "num_attention_layers": profile.num_attention_layers,
-        "num_indexer_layers": profile.num_indexer_layers,
+        "num_layers": homog_profile.num_layers,
+        "num_linear_layers": homog_profile.num_linear_layers,
+        "num_attention_layers": homog_profile.num_attention_layers,
+        "num_indexer_layers": homog_profile.num_indexer_layers,
     }
-    if profile.num_moe_layers > 0:
-        counts["num_moe_layers"] = profile.num_moe_layers
+    if homog_profile.num_moe_layers > 0:
+        counts["num_moe_layers"] = homog_profile.num_moe_layers
     layer_gcd = 0
     for count in counts.values():
         layer_gcd = math.gcd(layer_gcd, count)
     if layer_gcd <= 1:
         return []
     unit_profile = dataclasses.replace(
-        profile, **{name: val // layer_gcd for name, val in counts.items()}
+        homog_profile, **{name: val // layer_gcd for name, val in counts.items()}
     )
     issues: list[str] = []
     for phase in CASE_PHASES:
@@ -3471,7 +3535,7 @@ def _check_gcd_scaling_for_preset(
                 advisor.evaluate_scopes(unit_profile, wl, default_chip), "per_op"
             )
             full_est = _scope_by_name(
-                advisor.evaluate_scopes(profile, wl, default_chip), "per_op"
+                advisor.evaluate_scopes(homog_profile, wl, default_chip), "per_op"
             )
             issues.extend(
                 _check_scaled_per_op(
@@ -3491,8 +3555,9 @@ def _check_one_layer_anchor_for_preset(
     Returns:
         List of 1-layer anchor scaling violations.
     """
+    homog_profile = _strip_non_homogeneous_primitives(profile)
     kinds: list[tuple[str, dict[str, int]]] = []
-    if profile.num_linear_layers > 0:
+    if homog_profile.num_linear_layers > 0:
         kinds.append(
             (
                 "linear",
@@ -3503,29 +3568,31 @@ def _check_one_layer_anchor_for_preset(
                 },
             )
         )
-    if profile.num_attention_layers > 0:
+    if homog_profile.num_attention_layers > 0:
         kinds.append(
             (
                 "attention",
                 {
                     "num_linear_layers": 0,
                     "num_attention_layers": 1,
-                    "num_indexer_layers": 1 if profile.num_indexer_layers > 0 else 0,
+                    "num_indexer_layers": 1
+                    if homog_profile.num_indexer_layers > 0
+                    else 0,
                 },
             )
         )
-    layer_count = profile.num_layers
+    layer_count = homog_profile.num_layers
     issues: list[str] = []
     for phase in ("decode", "prefill"):
         tp_ep_axes = dict(case_layouts(slug, phase))["tp_ep_only"]
         wl = case_workload(phase, tp_ep_axes)
         for kind_name, base_fields in kinds:
             one_fields = dict(base_fields)
-            if profile.num_moe_layers != 0:
+            if homog_profile.num_moe_layers != 0:
                 one_fields["num_moe_layers"] = 1
-            one_prof = dataclasses.replace(profile, num_layers=1, **one_fields)
+            one_prof = dataclasses.replace(homog_profile, num_layers=1, **one_fields)
             stack_prof = dataclasses.replace(
-                profile,
+                homog_profile,
                 num_layers=layer_count,
                 **{name: val * layer_count for name, val in one_fields.items()},
             )
@@ -3570,20 +3637,26 @@ def test_microbatched_step_equals_sum_of_calls() -> None:
     violations: list[str] = []
     for slug in sorted(advisor.MODEL_PRESETS):
         profile = advisor.resolve_model_profile(slug)
-        dec = advisor.DEPLOYMENT_PRESETS[slug].decode
+        core_layout = minimal_valid_core_layout(
+            advisor.DEPLOYMENT_PRESETS[slug].decode, max_rank=max_core_rank
+        )
+        dp_val = core_layout.dp
         base_axes = {
-            "tp": min(dec.tp, max_core_rank),
-            "ep": min(dec.ep, max_core_rank),
-            "dp": 1,
+            "tp": core_layout.tp,
+            "ep": core_layout.ep,
+            "dp": dp_val,
             "pp": 1,
             "dcp": 1,
             "pcp": 1,
         }
         for pp_size in (1, 2):
             axes = {**base_axes, "pp": pp_size}
-            wl_one = case_workload("decode", axes, batch=single_batch)
+            wl_one = case_workload("decode", axes, batch=single_batch * dp_val)
             wl_four = case_workload(
-                "decode", axes, batch=quad_batch, max_rows_per_call=single_batch
+                "decode",
+                axes,
+                batch=quad_batch * dp_val,
+                max_rows_per_call=single_batch,
             )
             w_one = _scope_by_name(
                 advisor.evaluate_scopes(profile, wl_one, default_chip), "whole_step"
@@ -3675,17 +3748,23 @@ def test_core_legality_follows_rows_per_call() -> None:
         profile = dataclasses.replace(
             advisor.resolve_model_profile(slug), state_dtype="bf16"
         )
-        dec = advisor.DEPLOYMENT_PRESETS[slug].decode
+        core_layout = minimal_valid_core_layout(
+            advisor.DEPLOYMENT_PRESETS[slug].decode, max_rank=max_core_rank
+        )
+        dp_val = core_layout.dp
         core_axes = {
-            "tp": min(dec.tp, max_core_rank),
-            "ep": min(dec.ep, max_core_rank),
-            "dp": 1,
+            "tp": core_layout.tp,
+            "ep": core_layout.ep,
+            "dp": dp_val,
             "pp": 1,
             "dcp": 1,
             "pcp": 1,
         }
         wl_over = case_workload(
-            "decode", core_axes, batch=over_batch, max_rows_per_call=over_cap
+            "decode",
+            core_axes,
+            batch=over_batch * dp_val,
+            max_rows_per_call=over_cap,
         )
         whole_over = _scope_by_name(
             advisor.evaluate_scopes(profile, wl_over, default_chip), "whole_step"
@@ -3697,7 +3776,7 @@ def test_core_legality_follows_rows_per_call() -> None:
         wl_split = case_workload(
             "verify",
             core_axes,
-            batch=split_batch,
+            batch=split_batch * dp_val,
             spec_tokens=split_spec,
             max_rows_per_call=split_cap,
         )

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
@@ -87,6 +88,8 @@ class ChipSpec:
     collective_latency_us_bracket: tuple[float, float] = (1.0, 5.0)
     dcn_bw_gbps: float = 100.0
     dcn_bw_gbps_bracket: tuple[float, float] = (50.0, 200.0)
+    pcie_h2d_bw_bytes_per_s: float = 64.0e9
+    pcie_h2d_bw_bracket_bytes_per_s: tuple[float, float] = (32.0e9, 64.0e9)
     min_slice_cores: int = 1
     devices_per_chip: int = 1
     supports_megacore: bool = False
@@ -156,6 +159,8 @@ class _BuiltinExtras(TypedDict):
     collective_latency_us_bracket: tuple[float, float]
     dcn_bw_gbps: float
     dcn_bw_gbps_bracket: tuple[float, float]
+    pcie_h2d_bw_bytes_per_s: float
+    pcie_h2d_bw_bracket_bytes_per_s: tuple[float, float]
     min_slice_cores: int
     topologies: Mapping[int, str]
     vmem_fit_headroom_bytes: NotRequired[int]
@@ -189,6 +194,8 @@ BUILTIN_CHIP_PARAMS: Mapping[
             "collective_latency_us_bracket": DEFAULT_COLLECTIVE_LATENCY_US_BRACKET,
             "dcn_bw_gbps": 100.0,
             "dcn_bw_gbps_bracket": (50.0, 200.0),
+            "pcie_h2d_bw_bytes_per_s": 64.0e9,
+            "pcie_h2d_bw_bracket_bytes_per_s": (32.0e9, 64.0e9),
             "min_slice_cores": 8,
             "topologies": TPU7X_TOPOLOGIES,
             "vmem_fit_headroom_bytes": CORE_LIMITS.fit_vmem_headroom_mib << 20,
@@ -207,6 +214,8 @@ BUILTIN_CHIP_PARAMS: Mapping[
             "collective_latency_us_bracket": DEFAULT_COLLECTIVE_LATENCY_US_BRACKET,
             "dcn_bw_gbps": 100.0,
             "dcn_bw_gbps_bracket": (50.0, 200.0),
+            "pcie_h2d_bw_bytes_per_s": 64.0e9,
+            "pcie_h2d_bw_bracket_bytes_per_s": (32.0e9, 64.0e9),
             "min_slice_cores": 1,
             "topologies": TPU6E_TOPOLOGIES,
         },
@@ -370,6 +379,15 @@ def resolve_chip_spec(
             msg = (
                 "Custom ChipSpec requires positive vector_f32_ops_per_s, "
                 f"got {chip.vector_f32_ops_per_s}"
+            )
+            raise errors.MegakernelConfigError(msg)
+        if (
+            not math.isfinite(chip.pcie_h2d_bw_bytes_per_s)
+            or chip.pcie_h2d_bw_bytes_per_s <= 0.0
+        ):
+            msg = (
+                "Custom ChipSpec requires finite positive pcie_h2d_bw_bytes_per_s, "
+                f"got {chip.pcie_h2d_bw_bytes_per_s}"
             )
             raise errors.MegakernelConfigError(msg)
         base = chip
