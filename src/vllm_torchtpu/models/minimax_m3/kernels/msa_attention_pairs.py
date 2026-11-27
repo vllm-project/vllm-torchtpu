@@ -72,7 +72,9 @@ _PLACE_UNROLL = 4
 # Slots of a block whose accumulator rows are loaded before any is stored.
 _RMW_GROUP = 8
 # Blocks whose page (and scale page) copies are in flight, the running ones
-# included: a unit runs while the next one's copies land.
+# included: a unit runs while the next one's copies land. A unit's copies
+# signal one semaphore per kind and are waited for together: waiting for
+# each copy cost 2.3 % of a 4,096-row call (op bench, uniform selections).
 _RING = 2 * _UNIT
 _NO_PAIR = jnp.iinfo(jnp.int32).max
 # A sort key: (page key << `_token_bits` | token) << 8 | visible slots: page
@@ -108,7 +110,7 @@ def _kernel(
     #   slots last
     kv_buf,  # [ring, 1, S / 8, 4, 2D] uint8
     scale_buf,  # [ring, 1, R, S] f32
-    sem_ref,  # DMA [2, ring]
+    sem_ref,  # DMA [2, 2]: page and scale copies of each ring half
     order_ref,  # SMEM [P]: the window's blocks' first pairs, by width
     place_ref,  # SMEM [widths]: each width's next place in order_ref
     q_ref,  # [W, H, D]: the window's queries
@@ -158,24 +160,30 @@ def _kernel(
         page = page_table_ref[word & _KEY_MASK]
         src = kv_hbm_ref.at[pl.ds(page, 1), :, :, pl.ds(head * row_width, row_width)]
         return (
-            pltpu.make_async_copy(src, kv_buf.at[slot], sem_ref.at[0, slot]),
+            pltpu.make_async_copy(src, kv_buf.at[slot], sem_ref.at[0, slot // _UNIT]),
             pltpu.make_async_copy(
                 scale_hbm_ref.at[pl.ds(page, 1)],
                 scale_buf.at[slot],
-                sem_ref.at[1, slot],
+                sem_ref.at[1, slot // _UNIT],
             ),
         )
 
     def issue(k, slot):
+        """Block k's copies into ring slot ``slot``; past the last block, the
+        last block's again: every slot of a unit gets its copies (`wait`)."""
+        k = jnp.minimum(k, num_blocks - 1)
         for copy in copies(slot, blocks_ref[order_ref[k]]):
             copy.start()
 
-    sums_ref[...] = jnp.zeros_like(sums_ref)
+    def wait(half):
+        """The copies of a ring half's `_UNIT` slots, one wait per kind."""
+        at = pl.ds(half * _UNIT, _UNIT)
+        pltpu.make_async_copy(kv_buf.at[at], kv_buf.at[at], sem_ref.at[0, half]).wait()
+        pltpu.make_async_copy(
+            scale_buf.at[at], scale_buf.at[at], sem_ref.at[1, half]
+        ).wait()
 
-    @pl.when(pl.program_id(0) == 0)
-    def _clear_ring():  # a block of no pair may read a slot no copy wrote
-        kv_buf[...] = jnp.zeros_like(kv_buf)
-        scale_buf[...] = jnp.zeros_like(scale_buf)
+    sums_ref[...] = jnp.zeros_like(sums_ref)
 
     def attend(width, i, n, slot):
         """Pairs ``i .. i + n - 1`` of one page (``n <= width``): their
@@ -227,7 +235,7 @@ def _kernel(
         """Blocks ``k .. k + _UNIT - 1`` (ring slots ``base ..``) side by side:
         each is one chain of MXU and EUP latencies, which the others' fill.
         Past the last block, blocks of no pair: they see no slot of the page
-        their ring slot holds (zeros or a copied page) and add zeros. A
+        their ring slot holds (the last block's page) and add zeros. A
         block's tokens are distinct, so its adds into acc load a group of rows
         before storing any; blocks add in order (a token can be in several of
         them)."""
@@ -262,19 +270,13 @@ def _kernel(
         # their copies start here, unrolled (a loop of them cost ~24 bundles a
         # block, serial with the unit).
         base = (u % 2) * _UNIT
-        for b in range(_UNIT):
-            nxt = k + _UNIT + b
 
-            @pl.when(nxt < num_blocks)
-            def _issue(nxt=nxt, slot=_UNIT - base + b):
-                issue(nxt, slot)
+        @pl.when(k + _UNIT < num_blocks)
+        def _issue():
+            for b in range(_UNIT):
+                issue(k + _UNIT + b, _UNIT - base + b)
 
-        for b in range(_UNIT):
-
-            @pl.when(k + b < num_blocks)
-            def _wait(slot=base + b):
-                for copy in copies(slot, 0):
-                    copy.wait()
+        wait(u % 2)
 
         # Blocks run narrowest width first: the unit's widest is its last.
         last = jnp.minimum(k + _UNIT, num_blocks) - 1
@@ -286,10 +288,9 @@ def _kernel(
             pl.when(fits)(functools.partial(unit, width, k, base))
         return carry
 
-    for b in range(_UNIT):  # the first unit's copies
-
-        @pl.when(b < num_blocks)
-        def _first(b=b):
+    @pl.when(num_blocks > 0)
+    def _first():  # the first unit's copies
+        for b in range(_UNIT):
             issue(b, b)
 
     q_copy.wait()
@@ -719,7 +720,7 @@ def msa_sparse_attention_pairs(
                     (_RING, 1, rows_per_page, packing, 2 * head_dim), kv_cache.dtype
                 ),
                 pltpu.VMEM((_RING, 1) + scale_cache.shape[1:], jnp.float32),
-                pltpu.SemaphoreType.DMA((2, _RING)),
+                pltpu.SemaphoreType.DMA((2, 2)),
                 pltpu.SMEM((blocks.shape[0] // windows,), jnp.int32),
                 pltpu.SMEM((len(_WIDTHS),), jnp.int32),
                 pltpu.VMEM((window, num_heads, head_dim), q.dtype),
