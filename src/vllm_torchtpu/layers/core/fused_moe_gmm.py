@@ -48,6 +48,14 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
 from vllm_torchtpu.logger import init_logger
 
+
+def _get_topk_weights_dtype(default_dtype: jnp.dtype) -> jnp.dtype:
+    """Returns jnp.float32 if TPU_MOE_TOPK_WEIGHTS_FLOAT32 is enabled,
+    else default_dtype.
+    """
+    return jnp.float32 if envs.TPU_MOE_TOPK_WEIGHTS_FLOAT32 else default_dtype
+
+
 logger = init_logger(__name__)
 
 
@@ -700,10 +708,10 @@ def fused_moe_func(
     assert topk_weights.shape == (num_tokens, topk)
     assert topk_ids.shape == (num_tokens, topk)
 
-    # Pin topk_weights to hidden_states.dtype so the EP mask, GMM
-    # reduce, and `where` propagate in BF16 — some custom_routing_fn
-    # callers return FP32 weights and would otherwise promote downstream.
-    topk_weights = topk_weights.astype(hidden_states.dtype)
+    # Pin topk_weights to hidden_states.dtype (or float32 if
+    # TPU_MOE_TOPK_WEIGHTS_FLOAT32 is enabled) so the EP mask, GMM reduce,
+    # and `where` propagate appropriately.
+    topk_weights = topk_weights.astype(_get_topk_weights_dtype(hidden_states.dtype))
 
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
