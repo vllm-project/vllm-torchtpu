@@ -351,10 +351,12 @@ def test_fused_routing_matches_routing_first(monkeypatch, m, i, use_ep, topk):
 @pytest.mark.parametrize("m", [24, 32])
 def test_one_tile_experts_match_both_tiles(m):
     """Experts routed only from rows 0-15, only from rows 16+, and from both:
-    the kernel's one-tile skip is bit-identical to evaluating every row."""
+    the kernel's one-tile skip is bit-identical to evaluating every row. The
+    skip applies to chunked units (i=2048: two 1024-column units per expert);
+    whole units are pipelined and evaluate every row."""
     if jax.default_backend() != "tpu":
         pytest.skip("requires TPU")
-    h, i, e, topk = 512, 1024, 12, 4
+    h, i, e, topk = 512, 2048, 12, 4
     x, w1, w2, s1, s2, weights, _ = _inputs(m, h, i, e, topk, seed=m)
     ids = np.zeros((m, topk), np.int32)
     for t in range(m):
@@ -403,4 +405,25 @@ def test_vector_expert_selection_matches_scalar_loops(monkeypatch, m, fused_rout
     scalar = kernel.dense_expert_moe_fp4(*args, shared=shared, **kwargs)
     np.testing.assert_array_equal(
         np.asarray(vector, np.float32), np.asarray(scalar, np.float32)
+    )
+
+
+@pytest.mark.parametrize("m", [8, 32])
+def test_pipelined_whole_units_with_a_shallow_ring(monkeypatch, m):
+    """Whole units pipelined with the 3-slot ring (copies one unit ahead) are
+    bit-identical to the default ring."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    h, i, e, topk = 512, 256, 16, 4
+    x, w1, w2, s1, s2, weights, ids = _inputs(m, h, i, e, topk, seed=m)
+    local = jnp.asarray(np.where(np.asarray(ids) >= e, np.asarray(ids) - e, -1))
+    args = (x, w1, w2, s1, s2, weights, local.astype(jnp.int32))
+    shared = _shared(h, 128, seed=m)
+    deep = kernel.dense_expert_moe_fp4(*args, shared=shared)
+    monkeypatch.setattr(kernel, "_PIPELINED_BUFFERS", 3)
+    monkeypatch.setattr(kernel, "_WHOLE_UNIT_BUFFERS", 3)
+    jax.clear_caches()
+    shallow = kernel.dense_expert_moe_fp4(*args, shared=shared)
+    np.testing.assert_array_equal(
+        np.asarray(shallow, np.float32), np.asarray(deep, np.float32)
     )

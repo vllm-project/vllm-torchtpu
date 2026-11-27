@@ -51,6 +51,13 @@ _QUANT_BLOCK = 128
 # -3.5 % kernel time; 6 slots no better), where the width allows it.
 _NUM_BUFFERS = 3
 _WHOLE_UNIT_BUFFERS = 4
+# Dense steps over whole units are software-pipelined (`_kernel`): a unit's
+# slot stays in use one iteration longer, so one more slot keeps as many units
+# in flight.
+_PIPELINED_BUFFERS = 5
+# Output columns per block of a pipelined unit's down projection: each block
+# is added to the routed sum as it lands (no [rows, h] f32 temporary).
+_DOWN_COLS = 512
 _ACTIVATIONS = ("silu", "swigluoai")
 # Rows of the in-kernel token buffer: bf16 MXU operands pack 16 sublanes.
 _ROW_ALIGN = 16
@@ -597,7 +604,12 @@ def _kernel(
             ),
         ]
 
-    for initial in range(slots - 1):
+    # Dense steps over whole units overlap a unit's down projection with the
+    # next unit's gate/up (`gate_up_act`, `down_finish`): the slot of unit u-1
+    # is read in iteration u, so copies run slots - 2 units ahead.
+    pipelined = whole and not sparse
+    ahead = slots - 2 if pipelined else slots - 1
+    for initial in range(ahead):
 
         @pl.when(units > initial)
         def prime(*, initial=initial):
@@ -853,7 +865,82 @@ def _kernel(
         compute(unit)
         return carry
 
-    lax.fori_loop(0, units, body, 0)
+    def gate_up_act(slot):
+        """The whole unit's activation on every row, bf16 [mp, chunk]."""
+        x = x_pad_ref[...]
+        gu = jnp.zeros((mp, 2 * chunk), f32)
+        for k in range(0, h, _QUANT_BLOCK):
+            gu += (
+                jnp.matmul(
+                    x[:, k : k + _QUANT_BLOCK],
+                    wg_ref[slot, k : k + _QUANT_BLOCK, :].astype(fp8),
+                    preferred_element_type=f32,
+                )
+                * sg_ref[slot, k // _QUANT_BLOCK]
+            )
+        gate_up = interleave_lane(gu[:, :chunk], gu[:, chunk:])
+        return apply_act_fn(gate_up, activation).astype(jnp.bfloat16)
+
+    def down_finish(act, unit):
+        """The whole unit's down projection from ``act``, added to the routed
+        sum column block by column block (rounded as `compute` rounds)."""
+        slot = unit % slots
+        columns = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
+        coeff = jnp.sum(
+            jnp.where(columns == active_id(unit // num_chunks), coeff_ref[...], 0),
+            axis=1,
+            keepdims=True,
+        )
+        for c0 in range(0, h, _DOWN_COLS):
+            cols = slice(c0, min(c0 + _DOWN_COLS, h))
+            down = jnp.zeros((mp, cols.stop - c0), f32)
+            for k in range(0, chunk, _QUANT_BLOCK):
+                down += (
+                    jnp.matmul(
+                        act[:, k : k + _QUANT_BLOCK],
+                        wd_ref[slot, k : k + _QUANT_BLOCK, cols].astype(fp8),
+                        preferred_element_type=f32,
+                    )
+                    * sd_ref[slot, k // _QUANT_BLOCK, :, cols]
+                )
+            out_e = down.astype(out_ref.dtype).astype(f32)
+            acc_ref[:, cols] += jnp.where(coeff != 0, out_e * coeff, 0)
+
+    if pipelined:
+
+        def wait(unit):
+            for copy in transfers(unit):
+                copy.wait()
+
+        def start_ahead(unit):
+            @pl.when(unit + ahead < units)
+            def prefetch():
+                for copy in transfers(unit + ahead):
+                    copy.start()
+
+        def first(act):
+            wait(jnp.int32(0))
+            start_ahead(jnp.int32(0))
+            return gate_up_act(0)
+
+        def step(unit, act_prev):
+            wait(unit)
+            start_ahead(unit)
+            act = gate_up_act(unit % slots)
+            down_finish(act_prev, unit - 1)
+            return act
+
+        act = lax.cond(
+            units > 0, first, lambda a: a, jnp.zeros((mp, chunk), jnp.bfloat16)
+        )
+        act = lax.fori_loop(1, units, step, act)
+
+        @pl.when(units > 0)
+        def last():
+            down_finish(act, units - 1)
+
+    else:
+        lax.fori_loop(0, units, body, 0)
 
     if sparse:
         # Column blocks: no [m, h] temporary.
@@ -911,9 +998,15 @@ def dense_expert_moe_fp4(
     whole = chunk == i
     slots = _NUM_BUFFERS
     budget = info.vmem_capacity_bytes - _VMEM_HEADROOM
-    deeper = _vmem_bytes(m, h, chunk, i_s, _WHOLE_UNIT_BUFFERS, sparse_rows)
-    if whole and deeper <= budget:
-        slots = _WHOLE_UNIT_BUFFERS
+    ring = (
+        (_WHOLE_UNIT_BUFFERS,)
+        if sparse_rows
+        else (_PIPELINED_BUFFERS, _WHOLE_UNIT_BUFFERS)
+    )
+    for deeper in ring:
+        if whole and _vmem_bytes(m, h, chunk, i_s, deeper, sparse_rows) <= budget:
+            slots = deeper
+            break
     # Whole f32 sublane tiles of tokens; the kernel pads to _ROW_ALIGN itself.
     pad = -m % 8
     if pad:
