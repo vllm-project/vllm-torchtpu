@@ -74,6 +74,11 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     scale_slab_fits,
     slab_run_copy_pays,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.moonep import (
+    build_pallas_moonep_planner,
+    moonep_local_first_visit_list,
+    remap_topk_to_phys,
+)
 from vllm_torchtpu.kernels.fused_moe.v2.route_plan import (
     RoutePlan,
     build_route_plan,
@@ -609,6 +614,10 @@ def fused_ep_moe_v2(
     w1_scales_expert_second_minor=False,
     w2_scales_expert_second_minor=False,
     use_route_kernel=False,
+    moonep_slots=0,
+    moonep_min_mig_frac=0.05,
+    moonep_min_local_tokens=256,
+    moonep_h_hot=16,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -799,7 +808,17 @@ def fused_ep_moe_v2(
     t_wire = replica_wire_rows(T // ep, len(token_layout.groups[0]), U32_SUBLANE_TILE)
     T = ep * t_local
     P = jax.sharding.PartitionSpec
-    stride_bound = ragged_stride_bound(T, topk, e_total, capacity)
+    use_moonep = bool(
+        moonep_slots > 0
+        and stage == "fused"
+        and t_local >= moonep_min_local_tokens
+        and weight_format is WeightFormat.FP8
+        and not w1_scales_expert_second_minor
+        and not w2_scales_expert_second_minor
+    )
+    g_phys = g_local + moonep_slots if use_moonep else g_local
+    e_phys = ep * g_phys
+    stride_bound = ragged_stride_bound(T, topk, e_phys, capacity)
     if ragged_stride is None:
         ragged_stride = stride_bound
     if block is None:
@@ -838,7 +857,9 @@ def fused_ep_moe_v2(
                 f"got {jnp.dtype(hash_topk_ids.dtype).name}"
             )
     kfn = build_fused_ep_moe_kernel(
-        g_local=g_local,
+        g_local=g_phys,
+        g_mig=moonep_slots if use_moonep else 0,
+        overlapped_mig=use_moonep,
         capacity=capacity,
         hidden=hidden,
         inter=inter,
@@ -851,6 +872,18 @@ def fused_ep_moe_v2(
         has_w2_bias=has_w2_bias,
         w1s_expert_second_minor=w1_scales_expert_second_minor,
         w2s_expert_second_minor=w2_scales_expert_second_minor,
+    )
+    moonep_planner = (
+        build_pallas_moonep_planner(
+            ep=ep,
+            e_total=e_total,
+            b_slots=moonep_slots,
+            h_hot=moonep_h_hot,
+            cap=t_local * topk,
+            min_mig_tokens=int(t_local * topk * moonep_min_mig_frac),
+        )
+        if use_moonep
+        else None
     )
     # How the two slab tables are built, read off the same device record as
     # the kernel's VMEM budget: on a chip whose small SparseCore does not take
@@ -871,7 +904,7 @@ def fused_ep_moe_v2(
     # The token-gather table by sort (shard_token_gather_sorted): where the
     # sort keys fit in int32.
     gather_by_sort = bool(
-        tables_on_tensorcore and token_gather_sort_fits(T, topk, e_total=e_total, ep=ep)
+        tables_on_tensorcore and token_gather_sort_fits(T, topk, e_total=e_phys, ep=ep)
     )
     # Both tables by one run copy (build_slab_run_copy) where the step routes
     # enough pairs per expert for it to beat the sort and the lookup
@@ -888,7 +921,7 @@ def fused_ep_moe_v2(
         and form.quantized_activations
         and sharded_plan
         and stage == "fused"
-        and slab_run_copy_pays(T, topk, e_total=e_total)
+        and slab_run_copy_pays(T, topk, e_total=e_phys)
         and slab_run_copy_fits(t_local, topk, ep, ragged_stride)
     )
     if tables_by_run_copy:
@@ -912,9 +945,9 @@ def fused_ep_moe_v2(
         )
 
     layout = _exchange_layout(
-        t_local, topk, e_total, form.quantized_activations, per_pair=tables_by_run_copy
+        t_local, topk, e_phys, form.quantized_activations, per_pair=tables_by_run_copy
     )
-    wire_width = _exchange_layout(t_wire, topk, e_total, form.quantized_activations)[-1]
+    wire_width = _exchange_layout(t_wire, topk, e_phys, form.quantized_activations)[-1]
     # The routing exchange and plan as one TensorCore kernel (route_plan.py):
     # the same tables either plan builds, where the kernel's shape conditions
     # hold. Only the fused stage's body reads it; everything else keeps the
@@ -922,10 +955,11 @@ def fused_ep_moe_v2(
     # sender-sorted pairs in a per-pair layout the kernel does not read.
     route_kernel = bool(
         use_route_kernel
+        and not use_moonep
         and not tables_by_run_copy
         and route_plan_supported(
             ep=ep,
-            e_total=e_total,
+            e_total=e_phys,
             t_local=t_local,
             topk=topk,
             block=block,
@@ -994,7 +1028,7 @@ def fused_ep_moe_v2(
         q_l = q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK)
         return gate_l, hash_l, q_l, row_scale_l
 
-    def select_local(gate_l, hash_l, score_bias_l, row_scale_l, me=None):
+    def select_routes(gate_l, hash_l, score_bias_l):
         """Top-k, router weights, and this shard's routing payload.
 
         Returns the router weights [t_local, topk], the flat routing payload
@@ -1048,20 +1082,16 @@ def fused_ep_moe_v2(
             topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
         topk_weights = jnp.where(row_routes, topk_weights, 0.0)
         topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
-        # A count of the masked rows would be the other half of this: an
-        # incident today is degraded output against a completely clean log.
-        # It is not added here because the only in-trace channel for it,
-        # jax.debug.print, makes the program refuse to lower for TPU from a
-        # host, which is how this repository verifies that a change served
-        # the same program. A counter belongs in a metrics channel outside
-        # the trace.
-        # One all-gather carries the indices, the row scales where the rows
-        # were quantized, and the per-expert pair counts the routing plan
-        # would otherwise exchange in a collective of its own.
-        local_blocks = topk_idx.astype(jnp.int32).reshape(
-            t_local * topk // block, block
-        )
-        block_hist = pair_block_hist(local_blocks, e_total)
+        return topk_weights, topk_idx, row_routes
+
+    def select_local(gate_l, hash_l, score_bias_l, row_scale_l, me=None):
+        """Route one shard'''s tokens and pack the gather / sort tables."""
+        topk_weights, topk_idx, row_routes = select_routes(gate_l, hash_l, score_bias_l)
+        return pack_selected(topk_idx, topk_weights, row_scale_l, row_routes, me=me)
+
+    def pack_selected(eff_idx, topk_weights, row_scale_l, row_routes, me=None):
+        local_blocks = eff_idx.astype(jnp.int32).reshape(t_local * topk // block, block)
+        block_hist = pair_block_hist(local_blocks, e_phys)
         scale_bits_l = (
             None
             if row_scale_l is None
@@ -1097,20 +1127,71 @@ def fused_ep_moe_v2(
         w2s_l,
         bias_it,
         out_dtype,
+        *,
+        mig_tables=None,
+        mig_recv_ge=None,
+        any_migrated=None,
     ):
-        """The fused expert kernel and the combine, over one shard's routing plan.
-
-        The kernel gathers each local expert's routed rows out of q_g, runs
-        the FFN, and pushes each result row back to the shard that owns its
-        token; the combine then sums each token's topk arrivals by weight.
-        `planned` is a RoutePlan from either builder: the route-plan kernel
-        (build_route_plan) or the XLA one (xla_route_plan).
-        """
-        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_total, ROWBLK)
-        # The bias tables are per expert and per output channel on every
-        # weight format, so they take one layout: [G, N].
+        """The fused expert kernel and the combine, over one shard's routing plan."""
+        recv_rows = align_up(t_local * topk + (ROWBLK - 1) * e_phys, ROWBLK)
         w1b_k = next(bias_it).reshape(g_local, 2 * inter) if has_w1_bias else None
         w2b_k = next(bias_it).reshape(g_local, hidden) if has_w2_bias else None
+        if use_moonep and mig_recv_ge is not None:
+            has_mig = (
+                any_migrated[0] != jnp.int32(0)
+                if any_migrated is not None
+                else jnp.bool_(True)
+            )
+            if has_w1_bias and w1b_k is not None:
+                b1_base = w1b_k
+                b1_mig = lax.cond(
+                    has_mig,
+                    lambda _: lax.all_gather(b1_base, ax, axis=0, tiled=True)[
+                        mig_recv_ge
+                    ],
+                    lambda _: jnp.zeros(
+                        (moonep_slots, *b1_base.shape[1:]), dtype=b1_base.dtype
+                    ),
+                    operand=None,
+                )
+                w1b_k = jnp.concatenate([b1_base, b1_mig], axis=0)
+            if has_w2_bias and w2b_k is not None:
+                b2_base = w2b_k
+                b2_mig = lax.cond(
+                    has_mig,
+                    lambda _: lax.all_gather(b2_base, ax, axis=0, tiled=True)[
+                        mig_recv_ge
+                    ],
+                    lambda _: jnp.zeros(
+                        (moonep_slots, *b2_base.shape[1:]), dtype=b2_base.dtype
+                    ),
+                    operand=None,
+                )
+                w2b_k = jnp.concatenate([b2_base, b2_mig], axis=0)
+        visit_order = (
+            moonep_local_first_visit_list(
+                planned.expert_rows, epn=g_local, g_local=g_phys
+            )
+            if use_moonep
+            else planned.visit
+        )
+        if use_moonep and mig_tables is not None:
+            r0_sle_m, r0_dr_m, r0_ds_m, r1_ss_m, r1_dr_m, r1_ds_m, cnt4 = mig_tables
+            n_local_active = jnp.sum(
+                (planned.expert_rows[:g_local] > 0).astype(jnp.int32)
+            )
+            mid_trigger = jnp.minimum(jnp.int32(4), jnp.right_shift(n_local_active, 1))
+            mig_tables_full = (
+                r0_sle_m,
+                r0_dr_m,
+                r0_ds_m,
+                r1_ss_m,
+                r1_dr_m,
+                r1_ds_m,
+                jnp.concatenate([cnt4, mid_trigger.reshape(1)], axis=0),
+            )
+        else:
+            mig_tables_full = None
         arrivals, arrival_scales = kfn(
             planned.kernel_tables,
             planned.token_gather,
@@ -1124,8 +1205,9 @@ def fused_ep_moe_v2(
             w2s_l,
             w1b_k,
             w2b_k,
+            mig_tables=mig_tables_full,
             recv_rows=recv_rows,
-            visit=planned.visit,
+            visit=visit_order,
             counts=planned.counts,
             rank=rank_l,
         )
@@ -1156,6 +1238,10 @@ def fused_ep_moe_v2(
         w2s_l,
         bias_it,
         out_dtype,
+        *,
+        mig_tables=None,
+        mig_recv_ge=None,
+        any_migrated=None,
     ):
         """Plan, kernel and combine over the gathered rows and payload."""
         planned, q_g = xla_route_plan(
@@ -1164,7 +1250,7 @@ def fused_ep_moe_v2(
             block_hist,
             rank_l[0, 0],
             ep=ep,
-            e_total=e_total,
+            e_total=e_phys,
             t_local=t_local,
             topk=topk,
             block=block,
@@ -1193,6 +1279,9 @@ def fused_ep_moe_v2(
             w2s_l,
             bias_it,
             out_dtype,
+            mig_tables=mig_tables,
+            mig_recv_ge=mig_recv_ge,
+            any_migrated=any_migrated,
         )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -1202,9 +1291,93 @@ def fused_ep_moe_v2(
         )
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
         q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
-        topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
-            gate_l, hash_l, score_bias_l, row_scale_l, me=rank_l[0, 0]
-        )
+        if use_moonep:
+            assert moonep_planner is not None
+            me = rank_l[0, 0]
+            topk_weights, topk_idx, row_routes = select_routes(
+                gate_l, hash_l, score_bias_l
+            )
+            # Exclude masked/padded rows (sentinel == e_total) from load counts.
+            tpe_local = (
+                jnp.zeros((e_total + 1,), dtype=jnp.int32)
+                .at[topk_idx.reshape(-1)]
+                .add(1)[:e_total]
+            )
+            tpe_all = lax.all_gather(tpe_local, ax)
+            tpe_prefix = jnp.cumsum(tpe_all, axis=0) - tpe_all
+            expert_count = jnp.sum(tpe_all, axis=0)
+            group_tokens = jnp.sum(expert_count.reshape(ep, g_local), axis=1)
+            (
+                split_e_ids,
+                split_alloc_end,
+                split_phys_id,
+                rdma_recv_ge,
+                r0_sle,
+                r0_dr,
+                r0_ds,
+                r1_ss,
+                r1_dr,
+                r1_ds,
+                r0_ns,
+                r0_nr,
+                r1_ns,
+                r1_nr,
+                any_migrated,
+            ) = moonep_planner(expert_count, group_tokens)
+            mig_recv_ge = rdma_recv_ge[me]
+            has_mig = any_migrated[0] != jnp.int32(0)
+            if form.has_scales:
+                assert w1s_l is not None and w2s_l is not None
+                s1_base, s2_base = w1s_l, w2s_l
+                s1_mig, s2_mig = lax.cond(
+                    has_mig,
+                    lambda _: (
+                        lax.all_gather(s1_base, ax, axis=0, tiled=True)[mig_recv_ge],
+                        lax.all_gather(s2_base, ax, axis=0, tiled=True)[mig_recv_ge],
+                    ),
+                    lambda _: (
+                        jnp.zeros(
+                            (moonep_slots, *s1_base.shape[1:]), dtype=s1_base.dtype
+                        ),
+                        jnp.zeros(
+                            (moonep_slots, *s2_base.shape[1:]), dtype=s2_base.dtype
+                        ),
+                    ),
+                    operand=None,
+                )
+                w1s_l = jnp.concatenate([s1_base, s1_mig], axis=0)
+                w2s_l = jnp.concatenate([s2_base, s2_mig], axis=0)
+            phys_idx = remap_topk_to_phys(
+                topk_idx,
+                tpe_prefix[me],
+                split_e_ids,
+                split_alloc_end,
+                split_phys_id,
+                any_migrated,
+                epn=g_local,
+                b_slots=moonep_slots,
+                e_total=e_total,
+                e_phys=e_phys,
+            )
+            topk_weights, packed, local_blocks, block_hist, row_routes = pack_selected(
+                phys_idx, topk_weights, row_scale_l, row_routes, me=me
+            )
+            mig_tables = (
+                r0_sle[me],
+                r0_dr[me],
+                r0_ds[me],
+                r1_ss[me],
+                r1_dr[me],
+                r1_ds[me],
+                jnp.stack([r0_ns[me], r0_nr[me], r1_ns[me], r1_nr[me]]),
+            )
+        else:
+            mig_tables = None
+            mig_recv_ge = None
+            any_migrated = None
+            topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
+                gate_l, hash_l, score_bias_l, row_scale_l, me=rank_l[0, 0]
+            )
         if route_kernel:
             planned = build_route_plan(
                 ep=ep,
@@ -1247,6 +1420,9 @@ def fused_ep_moe_v2(
             w2s_l,
             bias_it,
             x_l.dtype,
+            mig_tables=mig_tables,
+            mig_recv_ge=mig_recv_ge,
+            any_migrated=any_migrated,
         )
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -1381,6 +1557,10 @@ def fused_ep_moe_v2(
         tables_by_run_copy,
         agq_min_local_tokens,
         route_kernel,
+        use_moonep,
+        moonep_slots,
+        float(moonep_min_mig_frac),
+        moonep_h_hot,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),

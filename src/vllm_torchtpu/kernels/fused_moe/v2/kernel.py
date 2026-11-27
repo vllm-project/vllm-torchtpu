@@ -489,6 +489,44 @@ def _slot_copy(src, vm, sems, slot):
     return pltpu.make_async_copy(src, vm.at[slot], sems.at[slot])
 
 
+class _SplitWeightCopy:
+    """MoonEP lazy split-weight DMA: local_hbm (< g_home) or mig_hbm (>= g_home)."""
+
+    def __init__(
+        self,
+        expert,
+        make_local_cp,
+        make_mig_cp,
+        g_home: int,
+        on_mig_before_start=None,
+    ):
+        self.expert = expert
+        self.make_local_cp = make_local_cp
+        self.make_mig_cp = make_mig_cp
+        self.g_home = jnp.int32(g_home)
+        self.on_mig_before_start = on_mig_before_start
+
+    def start(self, **kwargs):
+        @pl.when(self.expert < self.g_home)
+        def _loc():
+            self.make_local_cp().start(**kwargs)
+
+        @pl.when(self.expert >= self.g_home)
+        def _mig():
+            if self.on_mig_before_start is not None:
+                self.on_mig_before_start()
+            self.make_mig_cp().start(**kwargs)
+
+    def wait(self):
+        @pl.when(self.expert < self.g_home)
+        def _loc():
+            self.make_local_cp().wait()
+
+        @pl.when(self.expert >= self.g_home)
+        def _mig():
+            self.make_mig_cp().wait()
+
+
 def _rows_wait(sem, ref, rows):
     """Block until `rows` rows' worth of DMAs on `sem` have landed."""
     pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)], sem).wait()
@@ -538,7 +576,11 @@ def _build_fused_ep_moe_kernel(
     has_w2_bias=False,
     w1s_expert_second_minor=False,
     w2s_expert_second_minor=False,
+    g_mig=0,
+    overlapped_mig=False,
 ):
+    if overlapped_mig and g_mig <= 0:
+        raise ValueError("overlapped_mig=True requires g_mig > 0")
     """Build the pallas_call and the function that invokes it.
 
     `w1s_expert_second_minor` / `w2s_expert_second_minor` take that
@@ -844,6 +886,19 @@ def _build_fused_ep_moe_kernel(
         # This shard's expert-parallel index, as data rather than
         # `lax.axis_index` -- see N_RANK_TABLES.
         rank_sm = next(it)
+        if overlapped_mig:
+            (
+                r0_src_le_sm,
+                r0_dst_r_sm,
+                r0_dst_s_sm,
+                r1_src_s_sm,
+                r1_dst_r_sm,
+                r1_dst_s_sm,
+                mig_counts_sm,
+            ) = (next(it) for _ in range(7))
+        else:
+            r0_src_le_sm = r0_dst_r_sm = r0_dst_s_sm = None
+            r1_src_s_sm = r1_dst_r_sm = r1_dst_s_sm = mig_counts_sm = None
 
         def count(row):
             """Close one count's reduction on the scalar core.
@@ -872,6 +927,11 @@ def _build_fused_ep_moe_kernel(
         # The activation row scale exists only where the rows were quantized.
         ls_hbm = next(it) if has_act_scale else None
         w1_hbm, w2_hbm = (next(it) for _ in range(2))
+        w1_mig_hbm, w2_mig_hbm = (
+            (next(it) for _ in range(2))
+            if (g_mig > 0 and not overlapped_mig)
+            else (None, None)
+        )
         # The weight scale tables exist only where the weights carry scales.
         w1s_hbm = next(it) if has_scales else None
         w2s_hbm = next(it) if has_scales else None
@@ -905,6 +965,8 @@ def _build_fused_ep_moe_kernel(
         # for their row geometry, which the send waits count bytes against.
         contrib_hbm = next(it)
         cscl_hbm = next(it)
+        if overlapped_mig:
+            w1_mig_hbm, w2_mig_hbm = (next(it) for _ in range(2))
         # Two independent refs (rather than a leading slot dimension) let the
         # scalar core branch once per activation tile and then use static SMEM
         # indexing for all of that tile's token rows.
@@ -947,6 +1009,22 @@ def _build_fused_ep_moe_kernel(
             mehop_sem = next(it)
             mehop_scl_sem = next(it)
         w1c_sems, w2c_sems = (next(it), next(it)) if chunked_stream else (None, None)
+        if overlapped_mig:
+            (
+                mig_state_sm,
+                r0_sw1,
+                r0_rw1,
+                r0_sw2,
+                r0_rw2,
+                r1_sw1,
+                r1_rw1,
+                r1_sw2,
+                r1_rw2,
+            ) = (next(it) for _ in range(9))
+        else:
+            mig_state_sm = None
+            r0_sw1 = r0_rw1 = r0_sw2 = r0_rw2 = None
+            r1_sw1 = r1_rw1 = r1_sw2 = r1_rw2 = None
 
         me = rank_sm[0, 0]
 
@@ -956,12 +1034,129 @@ def _build_fused_ep_moe_kernel(
             copy.start()
             copy.wait()
 
+        g_home = g_local - g_mig
+
+        def launch_r1_if_needed():
+            """Wait for my Round-0 receives and fire Round-1 peer forwards once."""
+            assert mig_state_sm is not None
+            assert mig_counts_sm is not None
+            assert w1_mig_hbm is not None and w2_mig_hbm is not None
+            assert r1_src_s_sm is not None
+            assert r1_dst_r_sm is not None and r1_dst_s_sm is not None
+
+            @pl.when(mig_state_sm[0] == jnp.int32(0))
+            def _do_r1():
+                r0_nr = mig_counts_sm[1]
+                r1_ns = mig_counts_sm[2]
+
+                def _wr0(_i, _):
+                    pltpu.make_async_remote_copy(
+                        src_ref=w1_hbm.at[pl.ds(0, 1)],
+                        dst_ref=w1_mig_hbm.at[pl.ds(0, 1)],
+                        send_sem=r0_sw1,
+                        recv_sem=r0_rw1,
+                        device_id=(me,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).wait_recv()
+                    pltpu.make_async_remote_copy(
+                        src_ref=w2_hbm.at[pl.ds(0, 1)],
+                        dst_ref=w2_mig_hbm.at[pl.ds(0, 1)],
+                        send_sem=r0_sw2,
+                        recv_sem=r0_rw2,
+                        device_id=(me,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).wait_recv()
+                    return jnp.int32(0)
+
+                lax.fori_loop(0, r0_nr, _wr0, jnp.int32(0))
+
+                def _send_r1(op, _):
+                    ss_m = r1_src_s_sm[op]
+                    dr = r1_dst_r_sm[op]
+                    ds_m = r1_dst_s_sm[op]
+                    pltpu.make_async_remote_copy(
+                        src_ref=w1_mig_hbm.at[pl.ds(ss_m, 1)],
+                        dst_ref=w1_mig_hbm.at[pl.ds(ds_m, 1)],
+                        send_sem=r1_sw1,
+                        recv_sem=r1_rw1,
+                        device_id=(dr,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+                    pltpu.make_async_remote_copy(
+                        src_ref=w2_mig_hbm.at[pl.ds(ss_m, 1)],
+                        dst_ref=w2_mig_hbm.at[pl.ds(ds_m, 1)],
+                        send_sem=r1_sw2,
+                        recv_sem=r1_rw2,
+                        device_id=(dr,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).start()
+                    return jnp.int32(0)
+
+                lax.fori_loop(0, r1_ns, _send_r1, jnp.int32(0))
+                mig_state_sm[0] = jnp.int32(1)
+
+        def ensure_mig_recv_ready():
+            """Ensure Round-0 and Round-1 migrated weights have landed in HBM."""
+            assert mig_state_sm is not None and mig_counts_sm is not None
+            assert w1_mig_hbm is not None and w2_mig_hbm is not None
+            launch_r1_if_needed()
+
+            @pl.when(mig_state_sm[1] == jnp.int32(0))
+            def _wait_r1():
+                r1_nr = mig_counts_sm[3]
+
+                def _wr1(_i, _):
+                    pltpu.make_async_remote_copy(
+                        src_ref=w1_mig_hbm.at[pl.ds(0, 1)],
+                        dst_ref=w1_mig_hbm.at[pl.ds(0, 1)],
+                        send_sem=r1_sw1,
+                        recv_sem=r1_rw1,
+                        device_id=(me,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).wait_recv()
+                    pltpu.make_async_remote_copy(
+                        src_ref=w2_mig_hbm.at[pl.ds(0, 1)],
+                        dst_ref=w2_mig_hbm.at[pl.ds(0, 1)],
+                        send_sem=r1_sw2,
+                        recv_sem=r1_rw2,
+                        device_id=(me,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    ).wait_recv()
+                    return jnp.int32(0)
+
+                lax.fori_loop(0, r1_nr, _wr1, jnp.int32(0))
+                mig_state_sm[1] = jnp.int32(1)
+
+        _mig_hook = ensure_mig_recv_ready if overlapped_mig else None
+
         def w1_copy(expert, slot):
             """The gate/up weight slab of `expert`, into weight slot `slot`."""
+            if g_mig > 0:
+                assert w1_mig_hbm is not None
+                loc_e = jnp.minimum(expert, jnp.int32(g_home - 1))
+                mig_e = jnp.maximum(expert - jnp.int32(g_home), jnp.int32(0))
+                return _SplitWeightCopy(
+                    expert,
+                    lambda: _slot_copy(w1_hbm.at[loc_e], w1_vm, w1_sems, slot),
+                    lambda: _slot_copy(w1_mig_hbm.at[mig_e], w1_vm, w1_sems, slot),
+                    g_home,
+                    on_mig_before_start=_mig_hook,
+                )
             return _slot_copy(w1_hbm.at[expert], w1_vm, w1_sems, slot)
 
         def w2_copy(expert, slot):
             """The down weight slab of `expert`, into weight slot `slot`."""
+            if g_mig > 0:
+                assert w2_mig_hbm is not None
+                loc_e = jnp.minimum(expert, jnp.int32(g_home - 1))
+                mig_e = jnp.maximum(expert - jnp.int32(g_home), jnp.int32(0))
+                return _SplitWeightCopy(
+                    expert,
+                    lambda: _slot_copy(w2_hbm.at[loc_e], w2_vm, w2_sems, slot),
+                    lambda: _slot_copy(w2_mig_hbm.at[mig_e], w2_vm, w2_sems, slot),
+                    g_home,
+                    on_mig_before_start=_mig_hook,
+                )
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
         def scale_table(hbm, expert, expert_second_minor):
@@ -971,6 +1166,25 @@ def _build_fused_ep_moe_kernel(
             """Gate/up column chunk `c` of `expert`, into weight slot `slot`."""
             assert w1c_sems is not None
             cols = pl.ds(c * w1_chunk, w1_chunk)
+            if g_mig > 0:
+                assert w1_mig_hbm is not None
+                loc_e = jnp.minimum(expert, jnp.int32(g_home - 1))
+                mig_e = jnp.maximum(expert - jnp.int32(g_home), jnp.int32(0))
+                return _SplitWeightCopy(
+                    expert,
+                    lambda: pltpu.make_async_copy(
+                        w1_hbm.at[loc_e, :, cols],
+                        w1_vm.at[slot, :, cols],
+                        w1c_sems.at[c],
+                    ),
+                    lambda: pltpu.make_async_copy(
+                        w1_mig_hbm.at[mig_e, :, cols],
+                        w1_vm.at[slot, :, cols],
+                        w1c_sems.at[c],
+                    ),
+                    g_home,
+                    on_mig_before_start=_mig_hook,
+                )
             return pltpu.make_async_copy(
                 w1_hbm.at[expert, :, cols], w1_vm.at[slot, :, cols], w1c_sems.at[c]
             )
@@ -979,6 +1193,25 @@ def _build_fused_ep_moe_kernel(
             """Down column chunk `c` of `expert`, into weight slot `slot`."""
             assert w2c_sems is not None
             cols = pl.ds(c * w2_chunk, w2_chunk)
+            if g_mig > 0:
+                assert w2_mig_hbm is not None
+                loc_e = jnp.minimum(expert, jnp.int32(g_home - 1))
+                mig_e = jnp.maximum(expert - jnp.int32(g_home), jnp.int32(0))
+                return _SplitWeightCopy(
+                    expert,
+                    lambda: pltpu.make_async_copy(
+                        w2_hbm.at[loc_e, :, cols],
+                        w2_vm.at[slot, :, cols],
+                        w2c_sems.at[c],
+                    ),
+                    lambda: pltpu.make_async_copy(
+                        w2_mig_hbm.at[mig_e, :, cols],
+                        w2_vm.at[slot, :, cols],
+                        w2c_sems.at[c],
+                    ),
+                    g_home,
+                    on_mig_before_start=_mig_hook,
+                )
             return pltpu.make_async_copy(
                 w2_hbm.at[expert, :, cols], w2_vm.at[slot, :, cols], w2c_sems.at[c]
             )
@@ -1047,8 +1280,51 @@ def _build_fused_ep_moe_kernel(
                 def _(b=b):
                     weight_starts(visit_sm[b], b)
 
-        prologue()
-        _all_pairs_barrier(ep)
+        if overlapped_mig:
+            if has_w1_bias:
+                sync(w1b_hbm, w1b_vm)
+            if has_w2_bias:
+                sync(w2b_hbm, w2b_vm)
+            assert mig_state_sm is not None and mig_counts_sm is not None
+            assert w1_mig_hbm is not None and w2_mig_hbm is not None
+            assert r0_src_le_sm is not None
+            assert r0_dst_r_sm is not None and r0_dst_s_sm is not None
+            _all_pairs_barrier(ep)
+            mig_state_sm[0] = jnp.int32(0)
+            mig_state_sm[1] = jnp.int32(0)
+            r0_ns = mig_counts_sm[0]
+
+            def _issue_r0_send(op, _):
+                le = r0_src_le_sm[op]
+                dr = r0_dst_r_sm[op]
+                ds_m = r0_dst_s_sm[op]
+                pltpu.make_async_remote_copy(
+                    src_ref=w1_hbm.at[pl.ds(le, 1)],
+                    dst_ref=w1_mig_hbm.at[pl.ds(ds_m, 1)],
+                    send_sem=r0_sw1,
+                    recv_sem=r0_rw1,
+                    device_id=(dr,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+                pltpu.make_async_remote_copy(
+                    src_ref=w2_hbm.at[pl.ds(le, 1)],
+                    dst_ref=w2_mig_hbm.at[pl.ds(ds_m, 1)],
+                    send_sem=r0_sw2,
+                    recv_sem=r0_rw2,
+                    device_id=(dr,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).start()
+                return jnp.int32(0)
+
+            lax.fori_loop(0, r0_ns, _issue_r0_send, jnp.int32(0))
+            for b in range(min(prefetch_distance, g_local)):
+
+                @pl.when(jnp.int32(b) < n_visit)
+                def _(b=b):
+                    weight_starts(visit_sm[b], b)
+        else:
+            prologue()
+            _all_pairs_barrier(ep)
 
         def _start_next_gate_up(visit_i, slot, last_tile):
             """`() -> ()`: start the NEXT expert's gate/up slab, called from
@@ -2038,6 +2314,13 @@ def _build_fused_ep_moe_kernel(
 
         def visit_step(visit_i, carry):
             """One step of the visit list: compute, then drain and push."""
+            if overlapped_mig:
+                assert mig_counts_sm is not None
+
+                @pl.when(visit_i == mig_counts_sm[4])
+                def _mid_launch_r1():
+                    launch_r1_if_needed()
+
             e = visit_sm[visit_i]
             carry = expert_tiles(e, visit_i, carry)
             if push_from_vmem:
@@ -2085,7 +2368,58 @@ def _build_fused_ep_moe_kernel(
                 mehop_scl_sem, rscl_hbm, _mirror_count(count(host.COUNT_SELF_MIRROR))
             )
 
+        if overlapped_mig:
+            # Guarantee any pending Round-1 peer forwards fire before blocking
+            # on token arrivals in drain_transport() (e.g. if n_visit <= mid_trigger).
+            launch_r1_if_needed()
         drain_transport()
+        if overlapped_mig:
+            assert mig_counts_sm is not None
+            assert w1_mig_hbm is not None and w2_mig_hbm is not None
+            ensure_mig_recv_ready()
+            r0_ns = mig_counts_sm[0]
+            r1_ns = mig_counts_sm[2]
+
+            def _ws0(_i, _):
+                pltpu.make_async_remote_copy(
+                    src_ref=w1_hbm.at[pl.ds(0, 1)],
+                    dst_ref=w1_mig_hbm.at[pl.ds(0, 1)],
+                    send_sem=r0_sw1,
+                    recv_sem=r0_rw1,
+                    device_id=(me,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).wait_send()
+                pltpu.make_async_remote_copy(
+                    src_ref=w2_hbm.at[pl.ds(0, 1)],
+                    dst_ref=w2_mig_hbm.at[pl.ds(0, 1)],
+                    send_sem=r0_sw2,
+                    recv_sem=r0_rw2,
+                    device_id=(me,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).wait_send()
+                return jnp.int32(0)
+
+            def _ws1(_i, _):
+                pltpu.make_async_remote_copy(
+                    src_ref=w1_mig_hbm.at[pl.ds(0, 1)],
+                    dst_ref=w1_mig_hbm.at[pl.ds(0, 1)],
+                    send_sem=r1_sw1,
+                    recv_sem=r1_rw1,
+                    device_id=(me,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).wait_send()
+                pltpu.make_async_remote_copy(
+                    src_ref=w2_mig_hbm.at[pl.ds(0, 1)],
+                    dst_ref=w2_mig_hbm.at[pl.ds(0, 1)],
+                    send_sem=r1_sw2,
+                    recv_sem=r1_rw2,
+                    device_id=(me,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                ).wait_send()
+                return jnp.int32(0)
+
+            lax.fori_loop(0, r0_ns, _ws0, jnp.int32(0))
+            lax.fori_loop(0, r1_ns, _ws1, jnp.int32(0))
         _all_pairs_barrier(ep)
 
     hbm = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
@@ -2165,6 +2499,21 @@ def _build_fused_ep_moe_kernel(
             if chunked_stream
             else []
         )
+        + (
+            [
+                pltpu.SMEM((2,), jnp.int32),  # mig_state_sm [r1_launched, r1_waited]
+                pltpu.SemaphoreType.DMA,  # r0_sw1
+                pltpu.SemaphoreType.DMA,  # r0_rw1
+                pltpu.SemaphoreType.DMA,  # r0_sw2
+                pltpu.SemaphoreType.DMA,  # r0_rw2
+                pltpu.SemaphoreType.DMA,  # r1_sw1
+                pltpu.SemaphoreType.DMA,  # r1_rw1
+                pltpu.SemaphoreType.DMA,  # r1_sw2
+                pltpu.SemaphoreType.DMA,  # r1_rw2
+            ]
+            if overlapped_mig
+            else []
+        )
     )
     # The staging buffer and the two weight slabs are always operands; the
     # activation row scale, the two weight scale tables and the two bias
@@ -2172,6 +2521,7 @@ def _build_fused_ep_moe_kernel(
     n_inputs = (
         N_STAGING_INPUTS
         + N_WEIGHT_SLABS
+        + (N_WEIGHT_SLABS if (g_mig > 0 and not overlapped_mig) else 0)
         + int(has_act_scale)
         + N_SCALE_TABLES * int(has_scales)
         + int(has_w1_bias)
@@ -2213,6 +2563,13 @@ def _build_fused_ep_moe_kernel(
                 jnp.float32,
             ),
         ]
+        if overlapped_mig:
+            out_shape.extend(
+                [
+                    jax.ShapeDtypeStruct((g_mig, hidden, 2 * inter), form.weight_dtype),
+                    jax.ShapeDtypeStruct((g_mig, inter, hidden), form.weight_dtype),
+                ]
+            )
         # Each suffix appears only when its feature is on, so a kernel that
         # fuses silu on eight-bit float weights with no biases keeps the name
         # it had before any of those operands existed, and every fingerprint
@@ -2231,6 +2588,11 @@ def _build_fused_ep_moe_kernel(
         scale_tag = ("_w13s201" if w1s_expert_second_minor else "") + (
             "_w2s201" if w2s_expert_second_minor else ""
         )
+        mig_tag = (
+            f"_ovl2r{g_mig}"
+            if overlapped_mig
+            else (f"_mig{g_mig}" if g_mig > 0 else "")
+        )
         name = (
             f"fused_ep_moe_v2"
             f"{format_tag}"
@@ -2238,11 +2600,12 @@ def _build_fused_ep_moe_kernel(
             f"{bias_tag}"
             f"{scale_tag}"
             f"_g{g_local}_c{capacity}_nb{nbuf}"
+            f"{mig_tag}"
         )
         return pl.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=N_PREFETCH,
+                num_scalar_prefetch=N_PREFETCH + (7 if overlapped_mig else 0),
                 in_specs=[hbm] * n_inputs,
                 out_specs=[hbm] * len(out_shape),
                 scratch_shapes=tuple(scratch),
@@ -2272,6 +2635,9 @@ def _build_fused_ep_moe_kernel(
         w1b=None,
         w2b=None,
         *,
+        w1_mig=None,
+        w2_mig=None,
+        mig_tables=None,
         recv_rows,
         visit,
         counts,
@@ -2335,15 +2701,24 @@ def _build_fused_ep_moe_kernel(
             visit.astype(jnp.int32),
             counts.astype(jnp.int32),
             rank.astype(jnp.int32),
+            *(
+                tuple(t.astype(jnp.int32) for t in mig_tables)
+                if overlapped_mig and mig_tables is not None
+                else ()
+            ),
             token_gather.astype(jnp.int32),
             act_q_gathered.reshape(-1, lane_blocks, HIDDEN_LANE_BLOCK),
             *act_scale_arg,
             w1,
             w2,
+            *((w1_mig, w2_mig) if (g_mig > 0 and not overlapped_mig) else ()),
             *scale_args,
             *biases,
         )
-        recv, rscl, _contrib, _contrib_scl = res
+        if overlapped_mig:
+            recv, rscl, _contrib, _contrib_scl, _w1m_out, _w2m_out = res
+        else:
+            recv, rscl, _contrib, _contrib_scl = res
         # The arrival mirror goes out as stored, rows of mirror_lanes. Its
         # reader takes a flat position (sublane * tile_m + offset), which picks
         # the same f32 at either grouping, whereas regrouping it to
