@@ -58,16 +58,17 @@ def main_kernel_v2(
     start_ref: jax.Ref,
     end_ref: jax.Ref,
     in_hbm_ref: jax.Ref,
-    indices_hbm_ref: jax.Ref,
-    out_hbm_ref: jax.Ref,
-    start_vmem_ref: jax.Ref,
-    end_vmem_ref: jax.Ref,
-    idx_vmem_ref: jax.Ref,
-    sem_ref: jax.Ref,
-    *,
+    *refs: jax.Ref,
     core_axis_name: str,
     subcore_axis_name: str,
+    has_side: bool,
 ):
+    if has_side:
+        side_hbm_ref, indices_hbm_ref, out_hbm_ref, side_out_hbm_ref, *refs = refs
+        start_vmem_ref, end_vmem_ref, idx_vmem_ref, side_vmem_ref, sem_ref = refs
+    else:
+        indices_hbm_ref, out_hbm_ref, *refs = refs
+        start_vmem_ref, end_vmem_ref, idx_vmem_ref, sem_ref = refs
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None
     lanes = sc_info.num_lanes
@@ -135,8 +136,34 @@ def main_kernel_v2(
                     )
                 out_ref[pl.ds(i, 1), col_slice] = packed_row
 
+    def side_in(r):
+        return pltpu.make_async_copy(
+            side_hbm_ref.at[idx_vmem_ref.at[pl.ds(r * lanes, lanes)]],
+            side_vmem_ref,
+            sem_ref.at[1],
+        )
+
+    def side_out(r):
+        return pltpu.make_async_copy(
+            side_vmem_ref,
+            side_out_hbm_ref.at[pl.ds((my_first + r) * lanes, lanes)],
+            sem_ref.at[2],
+        )
+
     def body(gather_ref, out_ref):
-        subchunk_idxs = idx_vmem_ref[pl.ds(pl.program_id(0) * lanes, lanes)]
+        r, c = pl.program_id(0), pl.program_id(1)
+        if has_side:
+            # A sub-chunk's side rows are fetched at its first column block
+            # and written back after its last, behind the row pipeline's DMAs.
+            @pl.when(c == 0)
+            def _():
+                @pl.when(r > 0)
+                def _():
+                    side_out(r - 1).wait()
+
+                side_in(r).start()
+
+        subchunk_idxs = idx_vmem_ref[pl.ds(r * lanes, lanes)]
         # Equivalent to `subchunk_idxs % packing`
         idx_rem = jnp.bitwise_and(subchunk_idxs, packing - 1)
         plsc.parallel_loop(0, col_size, step=_UNPACK_COL_CHUNK)(
@@ -144,6 +171,13 @@ def main_kernel_v2(
                 col_loop, gather_ref=gather_ref, out_ref=out_ref, idx_rem=idx_rem
             )
         )
+
+        if has_side:
+
+            @pl.when(c == num_cols - 1)
+            def _():
+                side_in(r).wait()
+                side_out(r).start()
 
     @pl.when(count > 0)
     def _():
@@ -172,17 +206,17 @@ def main_kernel_v2(
                 (lanes // packing, col_size), lambda r, c: (my_first + r, c)
             ),
         )(in_hbm_i32, out_hbm_i32)
+        if has_side:
+            side_out(count - 1).wait()
 
 
-@jax.jit
-def ragged_gather_v2(
-    x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
-) -> jax.Array:
-    """Row ``i`` of the result is ``x[indices[i]]`` for ``i`` in ``[start, end)``.
-
-    Rows outside ``[start, end)``, rounded out to multiples of the SparseCore
-    lane count, are not written.
-    """
+def _ragged_gather(
+    x: jax.Array,
+    side: jax.Array | None,
+    indices: jax.Array,
+    start: jax.Array,
+    end: jax.Array,
+) -> tuple[jax.Array, jax.Array | None]:
     assert x.ndim == 2, "Ragged gather only supports 2d inputs."
     assert indices.ndim == 1, "Ragged gather only supports 1d indices."
 
@@ -197,10 +231,20 @@ def ragged_gather_v2(
         raise ValueError(
             f"dtype must be f32, bf16, int8, int4 or e4m3, but got {dtype}"
         )
+    if side is not None and (
+        side.ndim != 2
+        or side.shape[0] != x.shape[0]
+        or jax.dtypes.itemsize_bits(side.dtype) != 32
+        or side.shape[1] % 128
+    ):
+        raise ValueError(
+            f"side must be 32-bit [{x.shape[0]}, 128 * n], got {side.dtype}"
+            f"{list(side.shape)}"
+        )
 
     sc_info = get_sparse_core_info()
     if sc_info is None:
-        return x[indices]
+        return x[indices], None if side is None else side[indices]
 
     hidden_size = x.shape[-1]
     out_size = indices.size
@@ -216,9 +260,12 @@ def ragged_gather_v2(
     padded_size = pl.cdiv(out_size, lanes) * lanes
     indices = jnp.pad(indices, (0, padded_size - out_size))
     max_run = pl.cdiv(padded_size // lanes, num_workers)
+    side_words = 0 if side is None else lanes * side.shape[1]
     # Words of subcore VMEM: the double-buffered row pipeline, the run's
-    # indices and the two bound vectors.
-    vmem_words = 2 * (lanes + lanes // packing) * col_size + max_run * lanes + 32
+    # indices, the side rows and the two bound vectors.
+    vmem_words = (
+        2 * (lanes + lanes // packing) * col_size + max_run * lanes + side_words + 32
+    )
     if 4 * vmem_words > sc_info.vmem_capacity_bytes:
         raise ValueError(
             f"{out_size} indices need {4 * vmem_words} B of SparseCore VMEM, "
@@ -231,24 +278,58 @@ def ragged_gather_v2(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    return core_map_helper.kernel(
+    out_type = [jax.ShapeDtypeStruct((padded_size, aligned_hidden_size), dtype)]
+    scratch_types = [
+        pltpu.VMEM((16,), jnp.int32),
+        pltpu.VMEM((16,), jnp.int32),
+        pltpu.VMEM((max_run * lanes,), jnp.int32),
+    ]
+    operands = [start, end, x, indices]
+    if side is not None:
+        out_type.append(jax.ShapeDtypeStruct((padded_size, side.shape[1]), side.dtype))
+        scratch_types.append(pltpu.VMEM((lanes, side.shape[1]), side.dtype))
+        operands.insert(3, side)
+    outs = core_map_helper.kernel(
         functools.partial(
             main_kernel_v2,
             core_axis_name=vector_mesh.core_axis_name,
             subcore_axis_name=vector_mesh.subcore_axis_name,
+            has_side=side is not None,
         ),
-        out_type=jax.ShapeDtypeStruct((padded_size, aligned_hidden_size), dtype),
+        out_type=tuple(out_type),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
             needs_layout_passes=True,
             disable_bounds_checks=True,
         ),
-        scratch_types=[
-            pltpu.VMEM((16,), jnp.int32),
-            pltpu.VMEM((16,), jnp.int32),
-            pltpu.VMEM((max_run * lanes,), jnp.int32),
-            pltpu.SemaphoreType.DMA((1,)),
-        ],
+        scratch_types=[*scratch_types, pltpu.SemaphoreType.DMA((3,))],
         mesh=vector_mesh,
         name="sc_ragged_gather_v2",
-    )(start, end, x, indices)[:out_size, :hidden_size]
+    )(*operands)
+    rows = outs[0][:out_size, :hidden_size]
+    return rows, None if side is None else outs[1][:out_size]
+
+
+@jax.jit
+def ragged_gather_v2(
+    x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
+) -> jax.Array:
+    """Row ``i`` of the result is ``x[indices[i]]`` for ``i`` in ``[start, end)``.
+
+    Rows outside ``[start, end)``, rounded out to multiples of the SparseCore
+    lane count, are not written.
+    """
+    return _ragged_gather(x, None, indices, start, end)[0]
+
+
+@jax.jit
+def ragged_gather_v2_with_side(
+    x: jax.Array,
+    side: jax.Array,
+    indices: jax.Array,
+    start: jax.Array,
+    end: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """`ragged_gather_v2` of ``x`` and of ``side`` (32-bit ``[T, 128 * n]``, e.g.
+    per-row scales) by the same indices, in one SparseCore call."""
+    return _ragged_gather(x, side, indices, start, end)

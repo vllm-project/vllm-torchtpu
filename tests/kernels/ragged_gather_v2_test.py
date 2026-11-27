@@ -22,7 +22,10 @@ from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
 
 from vllm_torchtpu.kernels.sparse_core.ragged_gather import ragged_gather
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
+    ragged_gather_v2,
+    ragged_gather_v2_with_side,
+)
 
 pytestmark = pytest.mark.tpu_test
 
@@ -63,6 +66,25 @@ class GatherTest(jtu.JaxTestCase):
         desired = x[indices][start:end]
 
         self.assertArraysEqual(actual, desired)
+
+    @parameterized.product(
+        start_end=[(0, 1), (3, 338), (0, 4160)],
+        dtype=[jnp.float8_e4m3fn, jnp.bfloat16],
+    )
+    def test_sc_gather_with_side(self, start_end, dtype):
+        in_size, out_size, hidden_size = 2048, 8192, 6144
+        start, end = start_end
+        key_x, key_s, key_i = jax.random.split(jax.random.key(0), 3)
+        x = jax.random.normal(key_x, (in_size, hidden_size), jnp.float32).astype(dtype)
+        side = jax.random.normal(key_s, (in_size, 128), jnp.float32)
+        indices = jax.random.randint(key_i, (out_size,), 0, in_size, jnp.int32)
+
+        rows, side_rows = ragged_gather_v2_with_side(
+            x, side, indices, jnp.array([start]), jnp.array([end])
+        )
+
+        self.assertArraysEqual(rows[start:end], x[indices][start:end])
+        self.assertArraysEqual(side_rows[start:end], side[indices][start:end])
 
     @pytest.mark.nightly
     def test_benchmark(self):

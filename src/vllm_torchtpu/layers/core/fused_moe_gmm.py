@@ -65,7 +65,10 @@ from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce_v3 import (
     token_block_alignment,
 )
-from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import ragged_gather_v2
+from vllm_torchtpu.kernels.sparse_core.ragged_gather_v2 import (
+    ragged_gather_v2,
+    ragged_gather_v2_with_side,
+)
 from vllm_torchtpu.kernels.sparse_core.support import get_sparse_core_info
 from vllm_torchtpu.logger import init_logger
 
@@ -460,7 +463,10 @@ def prepare_routed_gmm_inputs(
     use_sparse_core: bool,
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    side_rows: jax.Array | None = None,
+) -> tuple[
+    jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None
+]:
     """Prepare the local-only routing layout using already-local expert ids.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
@@ -469,6 +475,10 @@ def prepare_routed_gmm_inputs(
     (inside this JIT) and marks non-local entries with a negative id which
     the mask filters out. Always running the masked branch keeps a single
     code path.
+
+    ``side_rows`` (32-bit ``[T, 128 * n]``, per-token data such as the rows'
+    amax) is permuted with the rows in the same SparseCore call and returned
+    last (None without it); only the SparseCore ragged permute takes it.
     """
     num_tokens_local = hidden_states_local.shape[0]
     topk_indices_flat = topk_indices_local.flatten()
@@ -574,6 +584,7 @@ def prepare_routed_gmm_inputs(
         else:
             token_indices_sorted = token_indices_flat[sorted_indices]
 
+    side_out = None
     if use_ep and use_sparse_core:
         if token_indices_sorted.shape[0] <= onehot_moe_permute_threshold:
             # Use one-hot matmul for permutation, which can be faster for small
@@ -615,14 +626,17 @@ def prepare_routed_gmm_inputs(
             # expert prefix through SparseCore ragged_gather. Invalid
             # non-local rows are sorted after the valid prefix.
             valid_count = group_sizes_local.sum(dtype=jnp.int32)
-            x = ragged_gather_v2(
-                hidden_states_local,
-                token_indices_sorted,
-                jnp.array([0], dtype=jnp.int32),
-                valid_count[None],
-            )
+            bounds = (jnp.array([0], dtype=jnp.int32), valid_count[None])
+            if side_rows is None:
+                x = ragged_gather_v2(hidden_states_local, token_indices_sorted, *bounds)
+            else:
+                x, side_out = ragged_gather_v2_with_side(
+                    hidden_states_local, side_rows, token_indices_sorted, *bounds
+                )
     else:
         x = hidden_states_local[token_indices_sorted]
+    if side_rows is not None and side_out is None:
+        raise ValueError("side_rows is permuted only by the SparseCore ragged permute")
     return (
         x,
         group_sizes_local,
@@ -630,6 +644,7 @@ def prepare_routed_gmm_inputs(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
+        side_out,
     )
 
 
@@ -1403,6 +1418,7 @@ def fused_moe_func(
         topk_weights_flat,
         valid_mask,
         token_indices_sorted,
+        x_amax,
     ) = prepare_routed_gmm_inputs(
         hidden_states if e4m3_rows is None else e4m3_rows[0],
         topk_ids,
@@ -1413,17 +1429,10 @@ def fused_moe_func(
         use_sparse_core=use_sparse_core,
         onehot_moe_permute_threshold=onehot_moe_permute_threshold,
         skip_padded_tokens=skip_padded_tokens,
-    )
-    x_amax = None
-    if e4m3_rows is not None:
         # The rows' amax gathered beside them: a TensorCore gather of 32-bit
         # scalars runs at ~5 ns a row (178 us for 32768 rows, tpu7x).
-        x_amax = ragged_gather_v2(
-            e4m3_rows[1],
-            token_indices_sorted,
-            jnp.array([0], dtype=jnp.int32),
-            group_sizes.sum(dtype=jnp.int32)[None],
-        )
+        side_rows=None if e4m3_rows is None else e4m3_rows[1],
+    )
     if shared_down is not None and ragged_permute:
         # The whole shared activation before gate_up: it fills the wait on
         # the SparseCore gather instead of running between combine pieces.
