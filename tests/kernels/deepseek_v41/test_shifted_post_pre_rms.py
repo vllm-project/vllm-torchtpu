@@ -149,3 +149,54 @@ def test_fused_gates_are_bitwise_identical(tokens):
             np.ascontiguousarray(r).view(np.uint8),
             np.ascontiguousarray(g).view(np.uint8),
         )
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU7x mHC kernel")
+def test_one_gate_block_matches_the_wide_form_bitwise():
+    # Gate columns are independent: a 128-column block (one vreg per comb
+    # entry) must equal the same columns of a 256-column [M,M,N] block.
+    ks = jax.random.split(jax.random.PRNGKey(3), 3)
+    mix = jax.random.normal(ks[0], (M * (M + 2), 128)) * 30.0
+    square = jnp.abs(jax.random.normal(ks[1], (1, 128))) * (M * D) + 1.0
+    scale = jnp.array([0.1, 0.2, 0.3], jnp.float32)
+    base = jax.random.normal(ks[2], (M * (M + 2),)) * 0.5
+    narrow = jax.jit(lambda *a: mhc._pre_gates(*a, hidden_size=D))(
+        mix, square, scale, base
+    )
+    wide = jax.jit(lambda *a: mhc._pre_gates(*a, hidden_size=D))(
+        jnp.tile(mix, (1, 2)), jnp.tile(square, (1, 2)), scale, base
+    )
+    for n, w in zip(narrow, wide, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(n).view(np.uint32), np.asarray(w)[:128].view(np.uint32)
+        )
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU7x mHC kernel")
+@pytest.mark.parametrize("tokens", [256, 384])
+def test_multi_tile_rows_match_single_tiles(tokens):
+    # Rows are independent: each 128-token tile of a multi-tile call (even
+    # and odd tile counts) must equal that 128-row block run as its own call.
+    x, flat, post, comb, pre, weight, scale, base, norm = _inputs(tokens)
+    layout = {
+        "unpadded_gates": True,
+        "gate_input_mode": mhc.GateInputMode.HBM,
+        "early_prep": True,
+        "fused_gates": True,
+    }
+
+    def seam(x, flat, post, comb, pre):
+        return mhc.shifted_post_pre_rms(
+            x, flat, post, comb, weight, scale, base, pre, norm_weight=norm, **layout
+        )
+
+    run = jax.jit(seam)
+    full = run(x, flat, post, comb, pre)
+    for start in range(0, tokens, 128):
+        rows = slice(start, start + 128)
+        block = run(x[rows], flat[rows], post[rows], comb[rows], pre[rows])
+        for f, b in zip(full, block, strict=True):
+            np.testing.assert_array_equal(
+                np.ascontiguousarray(f[rows]).view(np.uint8),
+                np.ascontiguousarray(b).view(np.uint8),
+            )

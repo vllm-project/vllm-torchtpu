@@ -176,6 +176,7 @@ def shifted_post_pre_rms(
         projection_buf,
         gate_params,
         gate_sems,
+        gate_wide,
     ):
         if gate_input_mode == GateInputMode.HBM:
             por, cr, pr = gate_scratch
@@ -370,23 +371,29 @@ def shifted_post_pre_rms(
                         columns=columns,
                         eps=norm_eps,
                     )
-            if early_output:
-                output_copy(tile_index, 0).start()
-                output_copy(tile_index, 1).start()
-            prepare(
-                jnp.minimum(tile_index + 1, num_tiles - 1),
-                (tile_index + 1) % 2,
-            )
+            if num_tiles > 1:
+                # Unconditional on the last tile too: a branch here would stop
+                # the scheduler overlapping it with the tile's MXU work.
+                prepare(
+                    jnp.minimum(tile_index + 1, num_tiles - 1),
+                    (tile_index + 1) % 2,
+                )
+
+            store_vector(sbuf[...].T, sh, tile_index * tile)
 
             @pl.when(tile_index == 0)
             def wait_weight():
                 copies[-1].wait()
 
+            if early_output:
+                # Behind the weight read: started earlier, these writes share
+                # the DMA queue with it and delay the projection.
+                output_copy(tile_index, 0).start()
+                output_copy(tile_index, 1).start()
             projection_buf[...] = jax.lax.dot(
                 yr[...], wr[...], preferred_element_type=jnp.float32
             )
             store_projection(previous_projected, jnp.maximum(tile_index - 1, 0))
-            store_vector(sbuf[...].T, sh, tile_index * tile)
 
         for index in range(input_buffers):
             for copy in input_copies(index):
@@ -429,24 +436,30 @@ def shifted_post_pre_rms(
 
             return unused
 
+        if fused_gates:
+            # Lane-broadcast the gate parameters ahead of the tiles, not on the
+            # epilogue's critical path.
+            for copy in param_copies:
+                copy.wait()
+            for param, wide in zip(gate_params, gate_wide, strict=True):
+                wide[...] = jnp.broadcast_to(param[...][:, None], wide.shape)
         jax.lax.fori_loop(0, num_tiles, body, None)
+        store_projection(projection_buf[...], num_tiles - 1)
         if not fused_gates:
             for index in range(num_tiles - output_buffers, num_tiles):
                 for copy in output_copies(index):
                     copy.wait()
-            store_projection(projection_buf[...], num_tiles - 1)
             return
-        store_projection(projection_buf[...], num_tiles - 1)
-        for copy in param_copies:
-            copy.wait()
-        scale_ref, base_ref = gate_params
         block = _gate_block(gate_tokens)
+        scale_value, base_value = (
+            jnp.concatenate([wide[...]] * (block // 128), axis=1) for wide in gate_wide
+        )
         for start in range(0, gate_tokens, block):
             values = _gate_values(
                 mh[:, pl.ds(start, block)],
                 sh[:, pl.ds(start, block)],
-                scale_ref[...],
-                base_ref[...],
+                scale_value,
+                base_value,
                 **gate_constants,
             )
             for output, value in zip(gate_outputs, values, strict=True):
@@ -487,6 +500,7 @@ def shifted_post_pre_rms(
         gate_extra_scratch = [
             tuple(pltpu.VMEM(arg.shape, arg.dtype) for arg in param_args),
             pltpu.SemaphoreType.DMA((len(param_args),)),
+            tuple(pltpu.VMEM((arg.shape[0], 128), arg.dtype) for arg in param_args),
         ]
     else:
         param_args = ()
@@ -495,7 +509,7 @@ def shifted_post_pre_rms(
         ]
         logit_scratch = []
         gate_out_specs, gate_out_shapes = [], []
-        gate_extra_scratch = [(), ()]
+        gate_extra_scratch = [(), (), ()]
 
     def wrapped(*refs):
         # Logits leave as outputs for the separate gate kernel, else stay in scratch.
@@ -689,8 +703,20 @@ def _gate_values(
     mixes, block = mix.shape
     m = math.isqrt(mixes + 1) - 1
     mixed = mix * jax.lax.rsqrt(square / (m * hidden_size) + rms_eps)
-    scales = scale[:, None]
-    bias = base[:, None]
+    # Parameters as [k] or already lane-broadcast to [k, N].
+    scales = scale if scale.ndim == 2 else scale[:, None]
+    bias = base if base.ndim == 2 else base[:, None]
+    if block == 128 and m == 4:
+        return _gate_values_by_entry(
+            mixed,
+            scales,
+            bias,
+            m,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
     pre_logits = mixed[:m, :] * scales[:1, :] + bias[:m, :]
     pre_mix = jax.nn.sigmoid(pre_logits) + hc_pre_eps
     post_logits = mixed[m : 2 * m, :] * scales[1:2, :] + bias[m : 2 * m, :]
@@ -707,4 +733,53 @@ def _gate_values(
         comb_mix = comb_mix / (
             jnp.sum(comb_mix, axis=0, keepdims=True) + hc_sinkhorn_eps
         )
+    return pre_mix, post_mix, comb_mix
+
+
+def _gate_values_by_entry(mixed, scales, bias, m, pre_eps, eps, post_mult, repeat):
+    """`_gate_values` for one 128-column block and M=4, each comb entry in its
+    own vreg: the Sinkhorn sums become vector adds instead of sublane rotations.
+    They keep the association Mosaic gives the [M,M,N] reductions (pairs (0, 2),
+    (1, 3) over the minor axis, in order over the major one), so the gates are
+    bitwise those of the [M,M,N] form; that is lowering behaviour, which
+    test_one_gate_block_matches_the_wide_form_bitwise pins.
+    """
+    block = mixed.shape[1]
+    pre_mix = jax.nn.sigmoid(mixed[:m, :] * scales[:1, :] + bias[:m, :]) + pre_eps
+    post_logits = mixed[m : 2 * m, :] * scales[1:2, :] + bias[m : 2 * m, :]
+    post_mix = jax.nn.sigmoid(post_logits) * post_mult
+    logits = mixed[2 * m :, :] * scales[2:3, :] + bias[2 * m :, :]
+    rows = 8  # one FP32 sublane tile, so every entry sits at the same offset
+    c = [
+        [
+            jnp.broadcast_to(logits[i * m + j : i * m + j + 1, :], (rows, block))
+            for j in range(m)
+        ]
+        for i in range(m)
+    ]
+
+    def minor_sum(v):
+        return (v[0] + v[2]) + (v[1] + v[3])
+
+    def major_sum(v):
+        return functools.reduce(jnp.add, v)
+
+    for i in range(m):
+        top = functools.reduce(jnp.maximum, c[i])
+        e = [jnp.exp(v - top) for v in c[i]]
+        total = minor_sum(e)
+        c[i] = [v / total + eps for v in e]
+
+    def normalize_major(c):
+        denom = [major_sum([c[i][j] for i in range(m)]) + eps for j in range(m)]
+        return [[c[i][j] / denom[j] for j in range(m)] for i in range(m)]
+
+    def normalize_minor(c):
+        denom = [minor_sum(row) + eps for row in c]
+        return [[v / denom[i] for v in row] for i, row in enumerate(c)]
+
+    c = normalize_major(c)
+    for _ in range(repeat - 1):
+        c = normalize_major(normalize_minor(c))
+    comb_mix = jnp.stack([jnp.concatenate([v[:1] for v in row]) for row in c])
     return pre_mix, post_mix, comb_mix
