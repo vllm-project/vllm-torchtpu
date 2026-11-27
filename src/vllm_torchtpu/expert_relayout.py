@@ -208,13 +208,14 @@ class Plan:
 
 def window_rows(delta: np.ndarray, layout: LayerLayout, experts: int) -> np.ndarray:
     """Rows per logical expert from a window's per-slot counts."""
-    rows = np.zeros(experts, dtype=np.float64)
     owner = layout.expert_of_slot()
     n = min(len(owner), len(delta))
-    for s in range(n):
-        if owner[s] != FREE:
-            rows[owner[s]] += float(delta[s])
-    return rows
+    held = owner[:n] != FREE
+    # One pass in C: the trigger runs this for every layer inside the DP
+    # step agreement, where a per-slot loop stalled all EP16 ranks 9 ms.
+    # Integer counts below 2**53 sum exactly in float64 in any order.
+    weights = np.asarray(delta[:n], dtype=np.float64)[held]
+    return np.bincount(owner[:n][held], weights=weights, minlength=experts)
 
 
 def slowest_rank_load(rows: np.ndarray, layout: LayerLayout, experts: int) -> float:
