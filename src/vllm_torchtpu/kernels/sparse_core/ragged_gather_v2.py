@@ -49,6 +49,10 @@ def calculate_col_size(hidden_size: int, packing: int) -> int:
     return max_safe_col
 
 
+# Columns one inner-loop step unpacks.
+_UNPACK_COL_CHUNK = 128
+
+
 def main_kernel_v2(
     start_ref: jax.Ref,
     end_ref: jax.Ref,
@@ -57,75 +61,54 @@ def main_kernel_v2(
     out_hbm_ref: jax.Ref,
     start_vmem_ref: jax.Ref,
     end_vmem_ref: jax.Ref,
+    idx_vmem_ref: jax.Ref,
     sem_ref: jax.Ref,
     *,
     core_axis_name: str,
     subcore_axis_name: str,
-    num_row_subchunks: int,
 ):
-    tpu_info = pltpu.get_tpu_info()
-    sc_info = tpu_info.sparse_core
+    sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None
-    num_simd_lanes = sc_info.num_lanes
+    lanes = sc_info.num_lanes
     hidden_size = in_hbm_ref.shape[-1]
-    dtype_bits = jax.dtypes.itemsize_bits(out_hbm_ref.dtype)
+    dtype = out_hbm_ref.dtype
+    dtype_bits = jax.dtypes.itemsize_bits(dtype)
     packing = 32 // dtype_bits
     col_size = calculate_col_size(hidden_size, packing)
+    num_cols = pl.cdiv(hidden_size, col_size)
+    assert col_size % _UNPACK_COL_CHUNK == 0
 
-    assert isinstance(hidden_size, int), (
-        f"hidden_size must be int, got {type(hidden_size)}"
-    )
-    num_cores = jax.lax.axis_size((core_axis_name, subcore_axis_name))
-    row_subchunk_size = num_simd_lanes
-    row_chunk_size = row_subchunk_size * num_row_subchunks
-    block_size = row_chunk_size * num_cores
-
-    recv_sem = sem_ref.at[0]
-
-    copy_start = pltpu.make_async_copy(start_ref, start_vmem_ref.at[:1], recv_sem)
-    copy_end = pltpu.make_async_copy(end_ref, end_vmem_ref.at[:1], recv_sem)
+    copy_start = pltpu.make_async_copy(start_ref, start_vmem_ref.at[:1], sem_ref.at[0])
+    copy_end = pltpu.make_async_copy(end_ref, end_vmem_ref.at[:1], sem_ref.at[0])
     copy_start.start()
     copy_end.start()
     copy_start.wait()
     copy_end.wait()
-
     start = start_vmem_ref[...][0]
     end = end_vmem_ref[...][0]
 
-    block_start = start // block_size
-    block_end = pl.cdiv(end, block_size)
-    num_blocks = block_end - block_start
-    num_blocks = jnp.where(end <= start, 0, num_blocks)
-
-    num_cols = pl.cdiv(hidden_size, col_size)
-
-    dtype = out_hbm_ref.dtype
-    dtype_bits = jax.dtypes.itemsize_bits(dtype)
-    packing = 32 // dtype_bits
-
-    core_index = lax.axis_index((core_axis_name, subcore_axis_name))
+    # Rows [start, end) go in sub-chunks of `lanes` rows (one index vector),
+    # split over all vector subcores as contiguous runs whose lengths differ by
+    # at most one. A subcore's sub-chunks run one after another, so the call
+    # costs the longest run and follows `end` in steps of lanes * subcores rows.
+    num_workers = lax.axis_size((core_axis_name, subcore_axis_name))
+    worker = lax.axis_index((core_axis_name, subcore_axis_name))
+    first_sub = start // lanes
+    last_sub = jnp.minimum(pl.cdiv(end, lanes), out_hbm_ref.shape[0] // lanes)
+    num_sub = jnp.where(end <= start, 0, jnp.maximum(last_sub - first_sub, 0))
+    base, rem = num_sub // num_workers, num_sub % num_workers
+    count = base + (worker < rem).astype(jnp.int32)
+    my_first = first_sub + worker * base + jnp.minimum(worker, rem)
 
     # SparseCore `.bitcast()` leverages hardware Row-Packing for
     # 16-bit -> 32-bit conversion.
     # The logical row count halves, while physical column dimensions remain unchanged.
     in_hbm_i32 = in_hbm_ref.bitcast(jnp.int32)
     out_hbm_i32 = out_hbm_ref.bitcast(jnp.int32)
+    shift_amount = packing.bit_length() - 1
 
-    num_phys_cols = col_size
-
-    # The outer pipeline runs on the Vector Core, hoisting the integer arithmetic
-    # required to decode the row-packed indices. This prevents scalar-core instruction
-    # starvation during the execution of the indirect `in_specs` block lambdas.
-
-    # TODO(guoweij): The nested `emit_pipeline` design creates a pipeline bubble
-    # (DMA wait) when the inner pipeline empties and restarts with new indices. This is
-    # a known high-level API limitation, currently amortized by setting a large
-    # num_row_subchunks and shouldn't be an issue for most use cases. We should still
-    # monitor the bubble's impact on E2E performance and, if needed, manually
-    # reimplement this using primitive operations to eliminate the bubble entirely.
-
-    def col_loop(col_base, gather_ref, out_ref, idx_rem, unpack_col_chunk):
-        col_slice = pl.ds(col_base, unpack_col_chunk)
+    def col_loop(col_base, gather_ref, out_ref, idx_rem):
+        col_slice = pl.ds(col_base, _UNPACK_COL_CHUNK)
         if packing == 1:
             gather_dt = gather_ref.bitcast(dtype)
             out_dt = out_ref.bitcast(dtype)
@@ -136,8 +119,8 @@ def main_kernel_v2(
             # bf16: 0xFFFF, int8: 0xFF, int4: 0xF
             mask = (1 << dtype_bits) - 1
             shift_multiplier = dtype_bits.bit_length() - 1
-            for i in range(num_simd_lanes // packing):
-                packed_row = jnp.zeros((1, unpack_col_chunk), dtype=jnp.int32)
+            for i in range(lanes // packing):
+                packed_row = jnp.zeros((1, _UNPACK_COL_CHUNK), dtype=jnp.int32)
                 for j in range(packing):
                     k = i * packing + j
                     dynamic_shift = jnp.left_shift(idx_rem[k], shift_multiplier)
@@ -151,71 +134,54 @@ def main_kernel_v2(
                     )
                 out_ref[pl.ds(i, 1), col_slice] = packed_row
 
-    def inner_pipeline(gather_ref, out_ref, idx_ref, unpack_col_chunk):
-        row_slice = pl.ds(pl.program_id(0) * row_subchunk_size, row_subchunk_size)
-        subchunk_idxs = idx_ref[row_slice]
-        if packing > 1:
-            # Equivalent to `subchunk_idxs % packing`
-            idx_rem = jnp.bitwise_and(subchunk_idxs, packing - 1)
-        else:
-            idx_rem = jnp.zeros_like(subchunk_idxs)
-
-        col_loop_fn = functools.partial(
-            col_loop,
-            gather_ref=gather_ref,
-            out_ref=out_ref,
-            idx_rem=idx_rem,
-            unpack_col_chunk=unpack_col_chunk,
-        )
-        plsc.parallel_loop(0, num_phys_cols, step=unpack_col_chunk)(col_loop_fn)
-
-    def outer_pipeline(idx_ref):
-        b = pl.program_id(0)
-        b_global = b + block_start
-
-        unpack_col_chunk = 128
-        assert num_phys_cols % unpack_col_chunk == 0
-        shift_amount = packing.bit_length() - 1
-        pltpu.emit_pipeline(
+    def body(gather_ref, out_ref):
+        subchunk_idxs = idx_vmem_ref[pl.ds(pl.program_id(0) * lanes, lanes)]
+        # Equivalent to `subchunk_idxs % packing`
+        idx_rem = jnp.bitwise_and(subchunk_idxs, packing - 1)
+        plsc.parallel_loop(0, col_size, step=_UNPACK_COL_CHUNK)(
             functools.partial(
-                inner_pipeline, idx_ref=idx_ref, unpack_col_chunk=unpack_col_chunk
-            ),
-            grid=(num_row_subchunks, num_cols),
+                col_loop, gather_ref=gather_ref, out_ref=out_ref, idx_rem=idx_rem
+            )
+        )
+
+    @pl.when(count > 0)
+    def _():
+        idx_copy = pltpu.make_async_copy(
+            indices_hbm_ref.at[
+                pl.ds(pl.multiple_of(my_first * lanes, lanes), count * lanes)
+            ],
+            idx_vmem_ref.at[pl.ds(0, count * lanes)],
+            sem_ref.at[0],
+        )
+        idx_copy.start()
+        idx_copy.wait()
+        pltpu.emit_pipeline(
+            body,
+            grid=(count, num_cols),
             in_specs=pl.BlockSpec(
-                (pl.Indirect(row_subchunk_size), num_phys_cols),
-                lambda r, col_id: (
+                (pl.Indirect(lanes), col_size),
+                lambda r, c: (
                     jnp.bitwise_right_shift(
-                        idx_ref[pl.ds(r * row_subchunk_size, row_subchunk_size)],
-                        shift_amount,
+                        idx_vmem_ref[pl.ds(r * lanes, lanes)], shift_amount
                     ),
-                    col_id,
+                    c,
                 ),
             ),
             out_specs=pl.BlockSpec(
-                (row_subchunk_size // packing, num_phys_cols),
-                lambda r, col_id: (
-                    (b_global * num_cores + core_index) * num_row_subchunks + r,
-                    col_id,
-                ),
+                (lanes // packing, col_size), lambda r, c: (my_first + r, c)
             ),
         )(in_hbm_i32, out_hbm_i32)
-
-    pltpu.emit_pipeline(
-        outer_pipeline,
-        grid=(num_blocks,),
-        in_specs=pl.BlockSpec(
-            (row_chunk_size,),
-            lambda b: ((b + block_start) * num_cores + core_index,),
-        ),
-    )(indices_hbm_ref)
 
 
 @jax.jit
 def ragged_gather_v2(
     x: jax.Array, indices: jax.Array, start: jax.Array, end: jax.Array
 ) -> jax.Array:
-    """Perform gather on indices within dynamic array start and end using BlockSpec."""
+    """Row ``i`` of the result is ``x[indices[i]]`` for ``i`` in ``[start, end)``.
 
+    Rows outside ``[start, end)``, rounded out to multiples of the SparseCore
+    lane count, are not written.
+    """
     assert x.ndim == 2, "Ragged gather only supports 2d inputs."
     assert indices.ndim == 1, "Ragged gather only supports 1d indices."
 
@@ -244,21 +210,19 @@ def ragged_gather_v2(
 
     aligned_hidden_size = ((hidden_size + col_size - 1) // col_size) * col_size
 
-    num_simd_lanes = sc_info.num_lanes
-    num_cores = sc_info.num_cores * sc_info.num_subcores
-    base_block_size = num_simd_lanes * num_cores
-
-    # Calculate ideal num_row_subchunks to avoid too much padding overhead.
-    num_row_subchunks = max(
-        1, min(4, (out_size + base_block_size - 1) // base_block_size)
-    )
-
-    row_subchunk_size = num_simd_lanes
-    row_chunk_size = row_subchunk_size * num_row_subchunks
-    block_size = row_chunk_size * num_cores
-
-    out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
-    indices = jnp.pad(indices, ((0, out_pad_size)))
+    lanes = sc_info.num_lanes
+    num_workers = sc_info.num_cores * sc_info.num_subcores
+    padded_size = pl.cdiv(out_size, lanes) * lanes
+    indices = jnp.pad(indices, (0, padded_size - out_size))
+    max_run = pl.cdiv(padded_size // lanes, num_workers)
+    # Words of subcore VMEM: the double-buffered row pipeline, the run's
+    # indices and the two bound vectors.
+    vmem_words = 2 * (lanes + lanes // packing) * col_size + max_run * lanes + 32
+    if 4 * vmem_words > sc_info.vmem_capacity_bytes:
+        raise ValueError(
+            f"{out_size} indices need {4 * vmem_words} B of SparseCore VMEM, "
+            f"over its {sc_info.vmem_capacity_bytes} B"
+        )
 
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
@@ -271,11 +235,8 @@ def ragged_gather_v2(
             main_kernel_v2,
             core_axis_name=vector_mesh.core_axis_name,
             subcore_axis_name=vector_mesh.subcore_axis_name,
-            num_row_subchunks=num_row_subchunks,
         ),
-        out_type=jax.ShapeDtypeStruct(
-            (out_size + out_pad_size, aligned_hidden_size), dtype
-        ),
+        out_type=jax.ShapeDtypeStruct((padded_size, aligned_hidden_size), dtype),
         compiler_params=pltpu.CompilerParams(
             use_tc_tiling_on_sc=True,
             needs_layout_passes=True,
@@ -284,6 +245,7 @@ def ragged_gather_v2(
         scratch_types=[
             pltpu.VMEM((16,), jnp.int32),
             pltpu.VMEM((16,), jnp.int32),
+            pltpu.VMEM((max_run * lanes,), jnp.int32),
             pltpu.SemaphoreType.DMA((1,)),
         ],
         mesh=vector_mesh,
