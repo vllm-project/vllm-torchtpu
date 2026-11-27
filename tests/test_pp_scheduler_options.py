@@ -852,7 +852,7 @@ def test_both_schedulers_inherit_one_prefix_aware_admission():
     ]
 
 
-def _promote(head, other, warmth, free_blocks, step_time, aging=3_000.0):
+def _promote(head, other, warmth, free_blocks, step_time, aging=3_000.0, blocks=None):
     """Runs the warmest-first promotion over ``[head, other]`` at
     ``step_time`` and returns the request id it leaves first."""
     queue = FCFSRequestQueue()
@@ -862,7 +862,9 @@ def _promote(head, other, warmth, free_blocks, step_time, aging=3_000.0):
     s.policy = SchedulingPolicy.FCFS
     s._paw_n = s._paw_cold_tokens = s._paw_prompt_tokens = 0
     s._prefix_warmth = lambda request: warmth[request.request_id]
-    s._get_block_size = lambda: 2_176
+    s._blocks_to_admit = blocks or (
+        lambda request: -(-(request.num_tokens - warmth[request.request_id]) // 2_176)
+    )
     s._get_num_free_blocks = lambda: free_blocks
     s._promote_warmest(queue)
     return next(iter(queue)).request_id
@@ -886,6 +888,27 @@ def test_promotion_ranks_with_the_free_block_fit():
     assert _promote(head, fits, warmth, free_blocks=3, step_time=1_000.0) == "fits"
     # With room for the head there is no fit input: aging keeps the head first.
     assert _promote(head, fits, warmth, free_blocks=10_000, step_time=1_000.0) == "head"
+
+
+def test_promotion_fits_by_the_blocks_allocate_slots_takes():
+    """The promotion's fit input and fit tier count a request's blocks as
+    vLLM's allocate_slots does (``_blocks_to_admit``), not its uncached
+    tokens over the block size."""
+    head, fits = _waiting("head", 990.0), _waiting("fits", 1_000.0)
+    warmth = {"head": 2_000, "fits": 5_000}
+    # By token count the head (4 blocks) fits 6 free blocks and stays first;
+    # by allocate_slots' count it needs 7, and "fits" needs 5.
+    counts = {"head": 7, "fits": 5}
+    assert (
+        _promote(head, fits, warmth, 6, 1_000.0, blocks=lambda r: counts[r.request_id])
+        == "fits"
+    )
+    # "fits" needs more than the free blocks too: no fit tier, aging wins.
+    counts["fits"] = 7
+    assert (
+        _promote(head, fits, warmth, 6, 1_000.0, blocks=lambda r: counts[r.request_id])
+        == "head"
+    )
 
 
 def test_promotion_ages_the_head_and_the_window_to_the_step_time():

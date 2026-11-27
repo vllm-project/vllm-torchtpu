@@ -23,6 +23,7 @@ afterwards.
 """
 
 import inspect
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -36,6 +37,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_request_block_hasher,
     init_none_hash,
 )
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -85,12 +87,20 @@ def engine_block_pool():
         KVCacheManager.new_step_starts = saved_new_step
 
 
-def _manager(num_blocks: int = 64) -> KVCacheManager:
+def _manager(num_blocks: int = 64, prefill_checkpoint: bool = False) -> KVCacheManager:
+    """A hybrid manager; ``prefill_checkpoint`` gives the Mamba groups one
+    prefill checkpoint block, as pooled GDN declares them by default."""
+    checkpoint = (
+        {"num_prefill_checkpoint_blocks": 1, "prefill_checkpoint_alignment": HASH_BS}
+        if prefill_checkpoint
+        else {}
+    )
     mamba = MambaSpec(
         block_size=BS,
         shapes=(1, 1),
         dtypes=(torch.float32,),
         mamba_cache_mode="align",
+        **checkpoint,
     )
     config = KVCacheConfig(
         num_blocks=num_blocks,
@@ -128,16 +138,18 @@ def _request(request_id: str, token_ids: list[int]) -> Request:
     )
 
 
-def _scheduler(kvm: KVCacheManager, options: dict) -> TpuPipelineChunkScheduler:
+def _scheduler(
+    kvm: KVCacheManager, options: dict, retention: bool = True
+) -> TpuPipelineChunkScheduler:
     """Runs TpuPipelineChunkScheduler.__init__ over a stub base __init__ on a
-    Qwen3.5 MoE KV producer with ``kvm`` as its KV cache manager and
-    hybrid-state retention on (as the Qwen3.5 config hook sets it)."""
+    Qwen3.5 MoE KV producer with ``kvm`` as its KV cache manager and, with
+    ``retention``, hybrid-state retention on (as the Qwen3.5 config hook sets
+    it)."""
+    section = {"hybrid_state_retention": True, **options} if retention else options
 
     def base_init(self, *args, **kwargs):
         self.vllm_config = SimpleNamespace(
-            additional_config={
-                "tpu_pp_scheduler": {"hybrid_state_retention": True, **options}
-            },
+            additional_config={"tpu_pp_scheduler": section},
             kv_transfer_config=SimpleNamespace(
                 kv_role="kv_producer", is_kv_producer=True, is_kv_consumer=False
             ),
@@ -148,6 +160,8 @@ def _scheduler(kvm: KVCacheManager, options: dict) -> TpuPipelineChunkScheduler:
         )
         self.need_mamba_block_aligned_split = True
         self.kv_cache_manager = kvm
+        self.max_model_len = 4096
+        self.num_lookahead_tokens = 0
         self.connector = None
         self.running = []
         self.waiting = []
@@ -200,6 +214,139 @@ def test_retention_on_a_small_pool_pins_at_most_5_percent_of_it(engine_block_poo
         scheduler = _scheduler(_manager(num_blocks=num_blocks), {"prefix_aware": True})
         assert scheduler._retention is not None
         assert scheduler._retention.max_pinned_blocks == cap
+
+
+@pytest.mark.parametrize("lookahead", [0, 4])
+def test_the_fit_tier_counts_what_allocate_slots_takes(engine_block_pool, lookahead):
+    """On a hybrid manager (full attention and two Mamba groups) a returning
+    request's admission takes more blocks than its uncached tokens over the
+    block size, the count the fit tier used before: one per Mamba group too,
+    and a full-attention block for the speculative lookahead slots.
+    ``_blocks_to_admit`` is exactly what allocate_slots then takes from the
+    free blocks, hit blocks in the free queue included."""
+    kvm = _manager()
+    scheduler = _scheduler(kvm, {"prefix_aware": True})
+    prompt = _cached_prompt(kvm)
+    returning = _request("returning", prompt + list(range(200, 220)))
+    warmth = scheduler._prefix_warmth(returning)
+    without_lookahead = scheduler._blocks_to_admit(returning)
+    scheduler.num_lookahead_tokens = lookahead
+    need = scheduler._blocks_to_admit(returning)
+    # 36 prompt tokens fill 9 blocks of 4; 4 lookahead slots need a 10th.
+    assert need == without_lookahead + (1 if lookahead else 0)
+    assert need > -(-(returning.num_tokens - warmth) // BS)
+    blocks, num_hit, _ = kvm.get_computed_blocks(returning)
+    assert num_hit == warmth > 0
+    free = kvm.block_pool.get_num_free_blocks()
+    assert (
+        kvm.allocate_slots(
+            returning,
+            returning.num_tokens - num_hit,
+            num_hit,
+            blocks,
+            num_lookahead_tokens=lookahead,
+        )
+        is not None
+    )
+    assert free - kvm.block_pool.get_num_free_blocks() == need
+
+
+def test_the_fit_count_is_vllms_whole_sequence_check(engine_block_pool):
+    """The count asks vLLM's coordinator what allocate_slots' whole-sequence
+    check asks it: the hit's blocks with its tokens as computed, the prompt
+    plus the lookahead slots, and apply_admission_cap=True."""
+    kvm = _manager()
+    scheduler = _scheduler(kvm, {"prefix_aware": True}, retention=False)
+    scheduler.num_lookahead_tokens = 4
+    prompt = _cached_prompt(kvm)
+    returning = _request("returning", prompt + list(range(200, 220)))
+    seen = []
+    real = kvm.coordinator.get_num_blocks_to_allocate
+
+    def recording(**kwargs):
+        seen.append(kwargs)
+        return real(**kwargs)
+
+    with patch.object(kvm.coordinator, "get_num_blocks_to_allocate", recording):
+        scheduler._blocks_to_admit(returning)
+    blocks, num_hit, _ = kvm.get_computed_blocks(returning)
+    (call,) = seen
+    assert call["total_computed_tokens"] == call["num_local_computed_tokens"] == num_hit
+    assert num_hit > 0
+    assert [[b.block_id for b in group] for group in call["new_computed_blocks"]] == [
+        [b.block_id for b in group] for group in blocks.blocks
+    ]
+    assert call["num_tokens_main_model"] == returning.num_tokens
+    assert call["num_tokens"] == returning.num_tokens + 4
+    assert call["apply_admission_cap"] is True
+
+
+def test_the_fit_tier_keeps_the_watermark_once_a_request_runs(engine_block_pool):
+    """vLLM's allocate_slots keeps watermark_blocks free for a waiting request
+    once another request is scheduled in the step, and it schedules running
+    requests first: the count adds the watermark when a request runs, not on
+    an idle step."""
+    kvm = _manager()
+    kvm.watermark_blocks = 3
+    scheduler = _scheduler(kvm, {"prefix_aware": True}, retention=False)
+    prompt = _cached_prompt(kvm)
+    returning = _request("returning", prompt + list(range(200, 220)))
+    idle = scheduler._blocks_to_admit(returning)
+    scheduler.running = [_request("running", list(range(300, 310)))]
+    assert scheduler._blocks_to_admit(returning) == idle + 3
+
+
+def test_ranking_an_async_load_leaves_its_mamba_checkpoint_alone(engine_block_pool):
+    """The warmest-first promotion ranks the requests whose async KV loads are
+    in flight (kv_holding_waiting). Counting a request's blocks must not record
+    a Mamba prefill checkpoint for its whole prompt: when its load completes,
+    vLLM's cache_blocks would index that checkpoint past the blocks the request
+    holds and assert, and the AssertionError would leave schedule()."""
+    kvm = _manager(prefill_checkpoint=True)
+    scheduler = _scheduler(kvm, {"prefix_aware": True}, retention=False)
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.kv_holding_waiting = FCFSRequestQueue()
+    loads = []
+    for request_id, base in (("head", 1000), ("second", 2000)):
+        request = _request(request_id, list(range(base, base + 40)))
+        # vLLM's waiting loop admits a host-tier load of the first 8 tokens.
+        assert (
+            kvm.allocate_slots(
+                request,
+                0,
+                0,
+                None,
+                num_external_computed_tokens=8,
+                delay_cache_blocks=True,
+            )
+            is not None
+        )
+        request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+        request.num_computed_tokens = 8
+        scheduler.kv_holding_waiting.add_request(request)
+        loads.append(request)
+    mamba = [
+        m for m in kvm.coordinator.single_type_managers if hasattr(m, "_checkpoints")
+    ]
+    assert len(mamba) == 2
+    assert all(m._checkpoints.get("head") is None for m in mamba)
+    counted = []
+    real = TpuPipelineChunkScheduler._blocks_to_admit
+
+    def recording(self, request):
+        counted.append(request.request_id)
+        return real(self, request)
+
+    with patch.object(TpuPipelineChunkScheduler, "_blocks_to_admit", recording):
+        scheduler._step_wall_time = time.time()
+        scheduler._select_waiting_queue_for_scheduling()
+        scheduler._step_wall_time = None
+    assert "head" in counted
+    # The load completes, as vLLM's _update_waiting_for_remote_kv completes it
+    # (with a checkpoint recorded by the count, this asserts in vLLM's Mamba
+    # manager).
+    kvm.cache_blocks(loads[0], loads[0].num_computed_tokens)
+    assert all(m._checkpoints.get("head") is None for m in mamba)
 
 
 def test_a_prefix_cache_reset_clears_the_memo_with_retention_on(engine_block_pool):

@@ -443,9 +443,8 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         tokens; lower is admitted first."""
         local_warmth = self._prefix_warmth(request)
         num_tokens = int(request.num_tokens)
-        hbm_cold_tokens = max(num_tokens - local_warmth, 0)
         block_size = self._get_block_size()
-        fits_hbm = math.ceil(hbm_cold_tokens / block_size) <= free_blocks
+        fits_hbm = self._blocks_to_admit(request) <= free_blocks
         ext_warmth = self._external_warmth(request, local_warmth)
         if ext_warmth > 0 and not (
             fits_hbm and math.ceil(ext_warmth / block_size) <= free_blocks_for_ext
@@ -520,8 +519,7 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         if (
             free_blocks_for_fit is not None
             and local_warmth > 0
-            and math.ceil(hbm_cold_tokens / self._get_block_size())
-            <= free_blocks_for_fit
+            and self._blocks_to_admit(request) <= free_blocks_for_fit
         ):
             return (
                 (
@@ -575,12 +573,47 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         of ``_rank_and_warmth`` in the promotion (``_rank_window``)."""
         if self._is_kv_consumer:
             return None
-        head_local_warmth = self._prefix_warmth(head)
         free_blocks = self._get_num_free_blocks()
-        head_cold_tokens = max(head.num_tokens - head_local_warmth, 0)
-        if free_blocks < math.ceil(head_cold_tokens / self._get_block_size()):
+        if free_blocks < self._blocks_to_admit(head):
             return free_blocks
         return None
+
+    def _blocks_to_admit(self, request: Any) -> int:
+        """Blocks admitting all of ``request``'s uncached prompt takes from the
+        free blocks, counted as ``KVCacheManager.allocate_slots()`` counts
+        them (and ``SrptPrefillScheduler._kv_fits_hold``): the coordinator's
+        count over every KV cache group, which includes the prefix hit's
+        blocks that sit in the free queue and the speculative lookahead
+        slots, plus the watermark.
+
+        The count is made as ``allocate_slots`` makes its whole-sequence check,
+        with ``apply_admission_cap=True``: without it, vLLM's Mamba "align"
+        manager records the request's prefill checkpoint for the counted
+        length, which for a request whose async KV load is in flight
+        (``kv_holding_waiting``) points past the blocks it holds and fails
+        vLLM's ``cache_blocks`` when the load completes. Otherwise the flag
+        changes only sliding-window and chunked-local groups' counts, which it
+        caps as vLLM's whole-sequence check does.
+        vLLM keeps the watermark free for a waiting request only once another
+        request is scheduled in the step, and it schedules ``running`` first,
+        so it is added when a request is running."""
+        kvm = self.kv_cache_manager
+        warmth, hit_blocks = self._prefix_hit(request)
+        if hit_blocks is None:
+            hit_blocks = kvm.empty_kv_cache_blocks.blocks
+        num_tokens = min(request.num_tokens, self.max_model_len)
+        blocks = kvm.coordinator.get_num_blocks_to_allocate(
+            request_id=request.request_id,
+            num_tokens=min(num_tokens + self.num_lookahead_tokens, self.max_model_len),
+            new_computed_blocks=hit_blocks,
+            num_encoder_tokens=0,
+            total_computed_tokens=warmth,
+            num_local_computed_tokens=warmth,
+            num_tokens_main_model=num_tokens,
+            apply_admission_cap=True,
+            prefill_end=_prefill_end(request),
+        )
+        return blocks + (kvm.watermark_blocks if self.running else 0)
 
     def _make_cached_request_data(self, *args, **kwargs):
         cached = super()._make_cached_request_data(*args, **kwargs)

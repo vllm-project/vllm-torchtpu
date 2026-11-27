@@ -49,11 +49,13 @@ the configured class and turns pipeline chunk sizing off.
 
 import time
 from bisect import bisect_right
+from collections.abc import Sequence
 from itertools import islice
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, cast
 
 from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import (
     FCFSRequestQueue,
@@ -350,26 +352,35 @@ class PrefixAwareAdmission(Scheduler):
 
     def _prefix_warmth(self, request: Request) -> int:
         """Prompt tokens of ``request`` resident in the KV cache."""
+        return self._prefix_hit(request)[0]
+
+    def _prefix_hit(
+        self, request: Request
+    ) -> tuple[int, tuple[Sequence[KVCacheBlock], ...] | None]:
+        """(prompt tokens of ``request`` resident in the KV cache, the hit's
+        blocks per KV cache group). The blocks are None without a lookup to
+        take them from: prefix caching off, a request that skips it, one that
+        has computed tokens (it holds its blocks) or a failed lookup."""
         kvm = self.kv_cache_manager
         if not kvm.enable_caching or request.skip_reading_prefix_cache:
-            return 0
+            return 0, None
         if request.num_computed_tokens > 0:
-            return request.num_computed_tokens
+            return request.num_computed_tokens, None
         max_len = max(request.num_tokens - 1, 0)
         epoch = self._get_prefix_cache_epoch()
         try:
             # A memo reuse can recompute the lookup to verify it.
             cached = self._memo_get(request, epoch, max_len)
-            if cached is not None:
-                return cached[3]
-            return self._memo_compute(request, epoch, max_len)[3]
+            if cached is None:
+                cached = self._memo_compute(request, epoch, max_len)
+            return cached[3], cached[2][0]
         except Exception:
             if not self._paw_scoring_broken:
                 self._paw_scoring_broken = True
                 logger.exception(
                     "PrefixAwareScheduler: warmth scoring failed; falling back to FCFS."
                 )
-            return 0
+            return 0, None
 
     def _rank_window(
         self, window: list[Request]

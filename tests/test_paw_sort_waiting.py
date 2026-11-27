@@ -81,9 +81,16 @@ def _waiting(s, requests, warmth):
         return ({}, 0, 0)
 
     coordinator.find_longest_cache_hit.side_effect = find_hit
+    # One full-attention group: the blocks of the uncached tokens. (The
+    # real coordinator's count is tested on a hybrid manager in
+    # test_pp_chunk_scheduler_memo.py.)
+    coordinator.get_num_blocks_to_allocate.side_effect = lambda **kw: -(
+        -max(kw["num_tokens"] - kw["total_computed_tokens"], 0) // 2176
+    )
     kvm = MagicMock()
     kvm.enable_caching = True
     kvm.coordinator = coordinator
+    kvm.watermark_blocks = 0
     # Plenty of free blocks: every request fits unless a test sets fewer.
     kvm.block_pool = SimpleNamespace(get_num_free_blocks=lambda: 1 << 20)
     s.kv_cache_manager = kvm
@@ -111,6 +118,8 @@ def _scheduler(
     s._cost = _cost_model() if quadratic else None
     s._quadratic_cost = quadratic
     s.block_size = 2176
+    s.max_model_len = 262_144
+    s.num_lookahead_tokens = 0
     s._init_paw_sort()
     return s
 
@@ -207,6 +216,23 @@ def test_requests_that_do_not_fit_free_blocks_go_last():
     s = _scheduler(reqs, {"small": 10_000}, aging=3000)
     s._get_num_free_blocks = lambda: 50
     assert _order_seen_by_base_schedule(s) == ["small", "huge"]
+
+
+def test_the_fit_tier_counts_blocks_as_allocate_slots_does():
+    """The fit tier compares the free blocks with the blocks vLLM's
+    allocate_slots would take for the request (``_blocks_to_admit``: every KV
+    cache group, the hit's free blocks, the lookahead, the watermark), not
+    its uncached tokens over the block size."""
+    now = time.time()
+    reqs = [
+        _req("small", 12_000, now - 2),  # 2,000 uncached: 1 block of 2,176
+        _req("mid", 30_000, now - 1),  # 8,000 uncached
+    ]
+    s = _scheduler(reqs, {"small": 10_000, "mid": 22_000})
+    s._get_num_free_blocks = lambda: 10
+    # By token count both fit; by allocate_slots' count "small" does not.
+    s._blocks_to_admit = lambda r: {"small": 11, "mid": 6}[r.request_id]
+    assert _order_seen_by_base_schedule(s) == ["mid", "small"]
 
 
 def test_external_hit_counts_when_it_fits():
