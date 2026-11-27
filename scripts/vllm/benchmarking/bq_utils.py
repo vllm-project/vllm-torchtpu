@@ -31,7 +31,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 DEFAULT_BQ_PROJECT_ID = "cloud-ullm-inference-ci-cd"
 DEFAULT_BQ_TABLE = "cloud-ullm-inference-ci-cd.llm_benchmark_analytics.benchmark_runs"
@@ -108,13 +108,18 @@ def extract_agentx_metrics(export: dict) -> dict:
     """The `agentx` element from one aiperf profile_export_aiperf.json, with
     absent metrics omitted. The scenario and aiperf's verdict on the run sit
     in the export's `metadata`, and only when a scenario was named."""
+    if not isinstance(export, dict):
+        return {}
     out = {}
     for metric, stats in AGENTX_METRIC_FIELDS:
-        block = export.get(metric, {})
+        block = export.get(metric)
+        if not isinstance(block, dict):
+            continue
         for stat in stats:
             if block.get(stat) is not None:
                 out[f"{metric}_{stat}"] = block[stat]
-    metadata = export.get("metadata", {})
+    raw_metadata = export.get("metadata")
+    metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
     for key, source in (
         ("aiperf_version", export),
         ("was_cancelled", export),
@@ -132,16 +137,22 @@ def created_time_sql(date_str) -> str:
     ISO 8601 `end_time` of an aiperf export. Both tools write the client's
     clock without an offset, which is taken as UTC; a time that carries an
     offset is converted."""
-    if date_str:
+    if date_str is not None and date_str != "":
         try:
             try:
                 dt = datetime.strptime(date_str, "%Y%m%d-%H%M%S")
             except ValueError:
-                dt = datetime.fromisoformat(date_str)
+                # Python 3.10's fromisoformat does not accept a trailing 'Z'.
+                iso = (
+                    f"{date_str[:-1]}+00:00"
+                    if date_str.endswith(("Z", "z"))
+                    else date_str
+                )
+                dt = datetime.fromisoformat(iso)
             if dt.tzinfo is not None:
-                dt = dt.astimezone(UTC)
+                dt = dt.astimezone(timezone.utc)  # noqa: UP017
             return f"TIMESTAMP '{dt.strftime('%Y-%m-%dT%H:%M:%SZ')}'"
-        except ValueError:
+        except (ValueError, TypeError):
             print(
                 f"Warning: Could not parse date string: {date_str}. "
                 "Using CURRENT_TIMESTAMP()",

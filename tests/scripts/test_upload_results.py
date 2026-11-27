@@ -626,16 +626,33 @@ def test_run_without_a_speed_grid_writes_its_scores_as_one_accuracy_row(
     assert rows == [{**_ACCURACY_ROW, "metrics": {"lm_eval": scores}}]
 
 
-def test_accuracy_row_needs_the_model_that_config_json_names(
+def test_accuracy_row_without_any_model_source_fails_before_writing(
     tmp_path, monkeypatch, capsys
 ):
-    results_dir = _results_dir(tmp_path, "lm_eval")
+    results_dir = _results_dir(tmp_path, "results_mmmu_pro.json")
 
     returncode, out, err = _run_upload(monkeypatch, capsys, results_dir)
 
     assert returncode == 1
     assert "Error: Missing required config parameter 'model' in config.json" in err
     assert _rows(out) == []
+
+
+def test_configless_lm_eval_run_uses_results_model_name_without_engine_flags(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "lm_eval")
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    assert rows == [
+        {
+            **_ACCURACY_ROW,
+            "model_id": _GKE_MODEL,
+            "config": _BASE_CONFIG,
+        }
+    ]
 
 
 def test_directory_with_nothing_to_upload_is_not_an_error(
@@ -652,6 +669,57 @@ def test_directory_with_nothing_to_upload_is_not_an_error(
         f"Nothing to upload from {results_dir}: no speed-grid cell, AgentX point "
         "or accuracy result.\n"
     )
+
+
+def test_corrupt_only_accuracy_results_exits_nonzero(tmp_path, monkeypatch, capsys):
+    results_dir = _results_dir(tmp_path)
+    broken = results_dir / "results_gsm8k.json"
+    broken.write_text('{"results": {"gsm8k":')
+    monkeypatch.delenv("BUILDKITE_COMMIT")
+
+    returncode, out, err = _run_upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 1
+    assert str(broken) in err
+    assert _rows(out) == []
+
+
+def test_non_cell_isl_backup_file_is_ignored(tmp_path, monkeypatch, capsys):
+    only_bak = tmp_path / "only_bak"
+    only_bak.mkdir()
+    empty_dir = _results_dir(only_bak, "config.json")
+    shutil.copy(
+        _DATA / "isl1024_osl1024_c64.json",
+        empty_dir / "isl1024_osl1024_c64_bak.json",
+    )
+    returncode, out, _ = _run_upload(monkeypatch, capsys, empty_dir)
+    assert returncode == 0
+    assert out.startswith(f"Nothing to upload from {empty_dir}:")
+
+    with_eval = tmp_path / "with_eval"
+    with_eval.mkdir()
+    acc_dir = _results_dir(with_eval, "config.json", "lm_eval")
+    shutil.copy(
+        _DATA / "isl1024_osl1024_c64.json",
+        acc_dir / "isl1024_osl1024_c64_bak.json",
+    )
+    returncode, rows = _upload(monkeypatch, capsys, acc_dir)
+    assert returncode == 0
+    assert rows == [_ACCURACY_ROW]
+
+
+def test_corrupt_speed_grid_cell_does_not_emit_orphan_accuracy_row(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "config.json", "lm_eval")
+    broken_cell = results_dir / "isl1024_osl1024_c64.json"
+    broken_cell.write_text('{"backend":')
+
+    returncode, out, err = _run_upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 1
+    assert f"Error loading {broken_cell}: " in err
+    assert _rows(out) == []
 
 
 _AGENTX_MODEL = "moonshotai/Kimi-K3"
@@ -697,17 +765,7 @@ _AGENTX_ROW = {
     },
     "config": {
         **_BASE_CONFIG,
-        # The directory has no config.json to state them.
-        "engine_flags": {
-            "max_num_seqs": None,
-            "max_num_batched_tokens": None,
-            "tensor_parallel_size": None,
-            "data_parallel_size": 1,
-            "max_model_len": None,
-            "enable_ep": False,
-            "quantization": None,
-            "multihost_backend": None,
-        },
+        # No config.json: engine_flags is omitted instead of fabricating defaults.
         "workload": {
             "scenario": "agentx",
             "dataset": "semianalysis_cc_traces_weka_062126",
@@ -749,6 +807,79 @@ def test_agentx_run_with_config_json_and_scores_writes_a_point_and_an_accuracy_r
     ]
 
 
+def test_configless_agentx_with_gsm8k_uploads_both_rows_cleanly(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "conc_8")
+    gsm8k_dir = results_dir / "gsm8k_c8"
+    gsm8k_dir.mkdir()
+    lm_eval_src = _DATA / "lm_eval" / "results_2026-11-02T01-18-05.218848.json"
+    lm_eval_data = json.loads(lm_eval_src.read_text())
+    lm_eval_data["model_name"] = _AGENTX_MODEL
+    (gsm8k_dir / lm_eval_src.name).write_text(json.dumps(lm_eval_data))
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    assert rows == [
+        _AGENTX_ROW,
+        {
+            **_ACCURACY_ROW,
+            "record_id": _record_id(2),
+            "model_id": _AGENTX_MODEL,
+            "config": _BASE_CONFIG,
+        },
+    ]
+
+
+def test_configless_accuracy_falls_back_to_agentx_model_when_results_omit_model_name(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "conc_8", "results_mmmu_pro.json")
+
+    returncode, rows = _upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    assert rows == [
+        _AGENTX_ROW,
+        {
+            **_ACCURACY_ROW,
+            "record_id": _record_id(2),
+            "model_id": _AGENTX_MODEL,
+            "metrics": {"lm_eval": {"mmmu_pro": 0.61}},
+            "config": _BASE_CONFIG,
+        },
+    ]
+
+
+def test_conflicting_accuracy_models_abort_before_writing_agentx_rows(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(tmp_path, "conc_8")
+    (results_dir / "results_a.json").write_text(
+        json.dumps(
+            {
+                "model_name": "model-a",
+                "results": {"gsm8k": {"acc,none": 0.9}},
+            }
+        )
+    )
+    (results_dir / "results_b.json").write_text(
+        json.dumps(
+            {
+                "model_name": "model-b",
+                "results": {"mmlu": {"acc,none": 0.8}},
+            }
+        )
+    )
+
+    returncode, out, err = _run_upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 1
+    assert "conflicting 'model_name' values across results_*.json" in err
+    assert out == ""
+
+
 def _agentx_results_dir(tmp_path: pathlib.Path, edit) -> pathlib.Path:
     """A results directory holding the fixture point, its export changed by
     `edit`."""
@@ -775,6 +906,56 @@ def test_agentx_point_without_token_latency_has_no_derived_element(
             for name, value in _AGENTX_METRICS.items()
             if not name.startswith("inter_token_latency_")
         }
+    }
+
+
+def test_agentx_point_tolerates_json_null_blocks_and_missing_datasets(
+    tmp_path, monkeypatch, capsys
+):
+    def nullify(export):
+        export["inter_token_latency"] = None
+        export["error_request_count"] = None
+        export["metadata"] = None
+        export["input_config"]["datasets"] = None
+
+    results_dir = _agentx_results_dir(tmp_path, nullify)
+
+    returncode, (row,) = _upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 0
+    assert row["metrics"] == {
+        "agentx": {
+            name: value
+            for name, value in _AGENTX_METRICS.items()
+            if not name.startswith("inter_token_latency_")
+            and name not in ("scenario", "submission_valid")
+        }
+    }
+    assert row["config"]["workload"] == {
+        "scenario": None,
+        "dataset": None,
+        "max_context_length": None,
+        "max_concurrency": 8,
+    }
+
+
+@pytest.mark.parametrize(
+    "export",
+    [
+        {"metadata": None},
+        {"metadata": None, "input_config": None},
+        {"metadata": None, "input_config": {}},
+        {"metadata": None, "input_config": {"datasets": None}},
+        {"metadata": None, "input_config": {"datasets": []}},
+        {"metadata": None, "input_config": {"datasets": [None]}},
+    ],
+)
+def test_agentx_workload_tolerates_missing_or_null_input_config_and_datasets(export):
+    assert upload_results.agentx_workload(export, 8) == {
+        "scenario": None,
+        "dataset": None,
+        "max_context_length": None,
+        "max_concurrency": 8,
     }
 
 
@@ -809,6 +990,30 @@ def test_unreadable_agentx_export_fails_the_upload_but_keeps_the_other_points(
 
     assert returncode == 1
     assert f"Error loading {broken}: " in err
+    assert _rows(out) == [_AGENTX_ROW]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "[]",
+        "{}",
+        json.dumps({"input_config": None}),
+        json.dumps({"input_config": {"models": {"items": [{"name": ""}]}}}),
+    ],
+)
+def test_malformed_agentx_export_fails_gracefully_and_keeps_healthy_points(
+    tmp_path, monkeypatch, capsys, payload
+):
+    results_dir = _results_dir(tmp_path, "conc_8")
+    broken = results_dir / "conc_16/aiperf_artifacts/profile_export_aiperf.json"
+    broken.parent.mkdir(parents=True)
+    broken.write_text(payload)
+
+    returncode, out, err = _run_upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 1
+    assert str(broken) in err
     assert _rows(out) == [_AGENTX_ROW]
 
 
@@ -868,31 +1073,73 @@ def test_aiperf_export_under_no_conc_n_directory_is_named_and_skipped(
     )
 
 
-def test_two_exports_under_one_agentx_point_stop_the_upload_before_any_row(
-    tmp_path, monkeypatch, capsys
+@pytest.mark.parametrize(
+    "duplicate_rel",
+    [
+        "conc_8/retry/profile_export_aiperf.json",
+        "retry/conc_8/aiperf_artifacts/profile_export_aiperf.json",
+    ],
+)
+def test_two_exports_for_same_concurrency_stop_the_upload_before_any_row(
+    tmp_path, monkeypatch, capsys, duplicate_rel
 ):
     results_dir = _results_dir(
         tmp_path, "config.json", "isl1024_osl1024_c64.json", "conc_8"
     )
     first = results_dir / _AGENTX_EXPORT
-    second = results_dir / "conc_8/retry/profile_export_aiperf.json"
-    second.parent.mkdir()
+    second = results_dir / duplicate_rel
+    second.parent.mkdir(parents=True)
     shutil.copy(first, second)
 
     returncode, out, err = _run_upload(monkeypatch, capsys, results_dir)
 
     assert returncode == 1
     assert err == (
-        f"Error: two AgentX exports under one concurrency point "
-        f"{results_dir / 'conc_8'}: {first} and {second}. One point is one row; "
-        "remove the export that is not the point's result.\n"
+        f"Error: two AgentX exports for concurrency 8: {first} and {second}. "
+        "One concurrency is one row; remove the export that is not the point's "
+        "result.\n"
     )
     # Not the speed-grid cell either: the rerun would write it a second time.
     assert out == ""
 
 
-def test_created_time_converts_an_offset_to_utc():
-    assert (
-        upload_results.bq_utils.created_time_sql("2026-11-02T09:18:05+08:00")
-        == "TIMESTAMP '2026-11-02T01:18:05Z'"
+def test_nested_conc_directories_are_rejected_as_ambiguous_before_any_row(
+    tmp_path, monkeypatch, capsys
+):
+    results_dir = _results_dir(
+        tmp_path, "config.json", "isl1024_osl1024_c64.json", "conc_8"
     )
+    nested = (
+        results_dir
+        / "conc_8/nested/conc_16/aiperf_artifacts/profile_export_aiperf.json"
+    )
+    nested.parent.mkdir(parents=True)
+    shutil.copy(results_dir / _AGENTX_EXPORT, nested)
+
+    returncode, out, err = _run_upload(monkeypatch, capsys, results_dir)
+
+    assert returncode == 1
+    assert "ambiguous AgentX export path" in err
+    assert str(nested) in err
+    assert "conc_8, conc_16" in err
+    assert out == ""
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-11-02T09:18:05+08:00", "TIMESTAMP '2026-11-02T01:18:05Z'"),
+        ("2026-10-28T08:35:19.586894Z", "TIMESTAMP '2026-10-28T08:35:19Z'"),
+        ("2026-10-28T08:35:19Z", "TIMESTAMP '2026-10-28T08:35:19Z'"),
+    ],
+)
+def test_created_time_parses_offsets_and_trailing_z(raw, expected):
+    assert upload_results.bq_utils.created_time_sql(raw) == expected
+
+
+@pytest.mark.parametrize("bad_timestamp", [1793582252.74, 0, 12345, {"ts": 1}])
+def test_created_time_falls_back_on_non_string_input(capsys, bad_timestamp):
+    assert (
+        upload_results.bq_utils.created_time_sql(bad_timestamp) == "CURRENT_TIMESTAMP()"
+    )
+    assert "Could not parse date string" in capsys.readouterr().err

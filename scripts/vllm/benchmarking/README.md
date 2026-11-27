@@ -218,8 +218,8 @@ statements without running them.
 | In the directory | Row |
 |------------------|-----|
 | `isl<N>_osl<N>_c<N>.json` | One per cell: the `vllm_bench` metrics, with the run's accuracy scores as `lm_eval`. Also written to Spanner unless `--skip-spanner` is set |
-| `conc_<N>/` with one aiperf `profile_export_aiperf.json` below it | One per AgentX replay point, at concurrency N: the `agentx` metrics, and the interactivity at the median, P90 and P99 inter-token latency as `derived` |
-| `results_*.json` and no cell | One for the run: the accuracy scores as `lm_eval`. `config.json` must name the `model` |
+| `conc_<N>/` with one aiperf `profile_export_aiperf.json` below it | One per AgentX replay point, at concurrency N: the `agentx` metrics, and interactivity only (`median_intvty`, `p90_intvty`, `p99_intvty`) as `derived` (`upload_results.py` does not yet take chip-count flags, so per-chip throughput is not computed) |
+| `results_*.json` and no cell | One for the run: the accuracy scores as `lm_eval`. Resolves `model_id` from `config.json`, falling back to a consistent `model_name` in `results_*.json` or the run's AgentX exports |
 
 A directory with none of these uploads nothing, which is not an error.
 
@@ -229,8 +229,11 @@ directory may sit anywhere under `<DIR>`, and the export anywhere below it.
 
 - An export under no such directory, such as `conc_abc/` or `conc_16_old/`, is
   not a point. It is named on stderr and skipped.
-- Two exports under one `conc_<N>/` stop the upload with an error that names
-  both, before any row is written. One point is one row.
+- A path with nested `conc_<N>/` directories, such as `conc_8/nested/conc_16/`,
+  is rejected as ambiguous before any row is written.
+- Two exports for the same concurrency N anywhere under `<DIR>` stop the upload
+  with an error that names both, before any row is written. One concurrency is
+  one row.
 
 ## Environment Variables
 
