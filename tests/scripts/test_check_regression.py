@@ -993,6 +993,10 @@ _ROOFLINE_FLAGS = [
     ["--chips", "4"],
     ["--prefill-chips", "2"],
     ["--decode-chips", "2"],
+    ["--min-roofline-ratio", "0.8"],
+    ["--enforce-unverified-rooflines"],
+    ["--agentx-gpu-reference", "gpu.json"],
+    ["--min-gpu-ratio", "0.8"],
 ]
 
 
@@ -1015,18 +1019,59 @@ _ROOFLINE_FLAGS = [
         ),
         (
             ["--mode", "perf", "--results-dir", "r"],
-            "--baseline or --roofline-targets is required unless --calibrate is set",
+            "--baseline, --roofline-targets, or --agentx-gpu-reference is "
+            "required unless --calibrate is set",
         ),
         (
             ["--mode", "perf", "--results-dir", "r", "--roofline-targets", "t.json"],
             "--config-name is required with --roofline-targets",
         ),
+        (
+            [
+                "--mode",
+                "perf",
+                "--results-dir",
+                "r",
+                "--baseline",
+                "b.json",
+                "--min-roofline-ratio",
+                "0.8",
+            ],
+            "--min-roofline-ratio requires --roofline-targets",
+        ),
+        (
+            [
+                "--mode",
+                "perf",
+                "--results-dir",
+                "r",
+                "--roofline-targets",
+                "t.json",
+                "--config-name",
+                "cfg",
+                "--enforce-unverified-rooflines",
+            ],
+            "--enforce-unverified-rooflines requires --min-roofline-ratio",
+        ),
+        (
+            [
+                "--mode",
+                "perf",
+                "--results-dir",
+                "r",
+                "--baseline",
+                "b.json",
+                "--min-gpu-ratio",
+                "0.8",
+            ],
+            "--min-gpu-ratio requires --agentx-gpu-reference",
+        ),
         *[
             (
                 ["--mode", "perf", "--results-dir", "r", "--baseline", "b.json", *flag],
-                f"{flag[0]} requires --roofline-targets",
+                f"{flag[0]} requires --roofline-targets or --agentx-gpu-reference",
             )
-            for flag in _ROOFLINE_FLAGS[1:]
+            for flag in _ROOFLINE_FLAGS[1:5]
         ],
     ],
 )
@@ -1097,7 +1142,13 @@ def test_cli_help_renders(monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc_info:
         _run_cli(monkeypatch, "--help")
     assert exc_info.value.code == 0
-    assert "--roofline-targets ROOFLINE_TARGETS" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "--roofline-targets ROOFLINE_TARGETS" in out
+    assert "--min-roofline-ratio MIN_ROOFLINE_RATIO" in out
+    assert "--agentx-gpu-reference AGENTX_GPU_REFERENCE" in out
+    assert "--min-gpu-ratio MIN_GPU_RATIO" in out
+    # --config-name and --chips help both reference --agentx-gpu-reference.
+    assert out.count("--agentx-gpu-reference") >= 3
 
 
 @pytest.mark.parametrize(
@@ -1170,7 +1221,7 @@ _ROOFLINE_TABLE = (
     "| key | metric | actual/chip | roofline/chip | % of roofline | status |\n"
     "|---|---|---:|---:|---:|---|\n"
 )
-_ROOFLINE_PASS = "PASS: advisory roofline check complete.\n"
+_ROOFLINE_PASS = "PASS: advisory speed checks complete.\n"
 # One config with a cell of each status, one without a chip count, and one
 # that is not modeled.
 _TARGETS = {
@@ -1508,3 +1559,780 @@ def test_load_roofline_targets_rejects_malformed(tmp_path, content, error):
     with pytest.raises(ValueError) as exc_info:
         check_regression.load_roofline_targets(path)
     assert str(exc_info.value).startswith(error.format(path=path))
+
+
+# --- Blocking roofline and AgentX GPU speed gates ---
+
+_GPU_REF = [
+    {"p90_interactivity": 64.0, "out_tok_s_per_gpu": 40.0},
+    {"p90_interactivity": 32.0, "out_tok_s_per_gpu": 60.0},
+]
+
+
+def _write_aiperf_export(root, conc, output_tput, itl_p90_ms, *, unit="ms"):
+    out_dir = root / f"conc_{conc}" / "aiperf_artifacts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "output_token_throughput": {"unit": "tokens/sec", "avg": output_tput},
+        "inter_token_latency": {"unit": unit, "p90": itl_p90_ms},
+        "input_config": {"phases": [{"kind": "profiling", "concurrency": conc}]},
+    }
+    (out_dir / "profile_export_aiperf.json").write_text(json.dumps(payload))
+
+
+def _write_agentx_aggregate(root, label, conc, output_tput, p90_intvty):
+    root.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "conc": conc,
+        "request_metrics": {
+            "throughput": {
+                "output": {"tokens_per_second": output_tput},
+                "per_gpu": {"output_tput_tps": 999999.0},
+            },
+            "latency": {"intvty": {"p90": p90_intvty}},
+        },
+    }
+    (root / f"{label}_c{conc}.json").write_text(json.dumps(payload))
+
+
+@pytest.mark.parametrize("ratio", ["0", "-0.5", "nan", "inf"])
+def test_cli_rejects_invalid_speed_ratios(tmp_path, monkeypatch, capsys, ratio):
+    run_dir = tmp_path / "run"
+    _write_perf_cell(run_dir, "isl1024_osl8192_c64", output_throughput=4104.096)
+    ret = _run_cli(
+        monkeypatch,
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(run_dir),
+        "--roofline-targets",
+        str(_ROOFLINE_TARGETS_PATH),
+        "--config-name",
+        "qwen3.5-397b-fp8-tp1-dp8-ep",
+        "--min-roofline-ratio",
+        ratio,
+    )
+    assert ret == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--min-roofline-ratio must be a positive finite number" in captured.err
+
+    ref_file = tmp_path / "gpu_ref.json"
+    ref_file.write_text(json.dumps(_GPU_REF))
+    _write_agentx_aggregate(run_dir, "agentx", conc=4, output_tput=352.0, p90_intvty=40)
+    ret = _run_cli(
+        monkeypatch,
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(run_dir),
+        "--agentx-gpu-reference",
+        str(ref_file),
+        "--chips",
+        "8",
+        "--min-gpu-ratio",
+        ratio,
+    )
+    assert ret == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--min-gpu-ratio must be a positive finite number" in captured.err
+
+
+def test_cli_perf_min_roofline_ratio_and_unverified_gate(tmp_path, monkeypatch, capsys):
+    # qwen3.5-397b-fp8-tp1-dp8-ep isl1024_osl8192_c64 roofline = 1282.53 tok/s/chip.
+    # 4104.096 / 4 = 1026.024 = 80.00% -> exact threshold PASS.
+    run_dir = tmp_path / "qwen"
+    _write_perf_cell(run_dir, "isl1024_osl8192_c64", output_throughput=4104.096)
+    base_argv = [
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(run_dir),
+        "--roofline-targets",
+        str(_ROOFLINE_TARGETS_PATH),
+        "--config-name",
+        "qwen3.5-397b-fp8-tp1-dp8-ep",
+        "--chips",
+        "4",
+        "--min-roofline-ratio",
+        "0.8",
+    ]
+    assert _run_cli(monkeypatch, *base_argv) == 0
+    assert "| 1026.02 | 1282.53 | 80.00% | PASS |" in capsys.readouterr().out
+
+    # 3591.084 / 4 = 897.771 = 70.00% -> FAIL with config, metric, measured, target.
+    _write_perf_cell(run_dir, "isl1024_osl8192_c64", output_throughput=3591.084)
+    assert _run_cli(monkeypatch, *base_argv) == 1
+    err = capsys.readouterr().err
+    assert (
+        "FAILED: config=qwen3.5-397b-fp8-tp1-dp8-ep cell=isl1024_osl8192_c64 "
+        "metric=output_token_throughput_per_chip "
+        "measured=897.77 tok/s/chip (70.00%) "
+        "target>=1026.02 tok/s/chip (80.00% of 1282.53)" in err
+    )
+
+    # kimi-k3-tp32-ep isl8192_osl1024_c1 is status=="unverified" (12.63 tok/s/chip).
+    # 101.04 / 16 = 6.315 = 50.00% stays advisory unless --enforce-unverified-rooflines.
+    kimi_dir = tmp_path / "kimi"
+    _write_perf_cell(kimi_dir, "isl8192_osl1024_c1", output_throughput=101.04)
+    kimi_argv = [
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(kimi_dir),
+        "--roofline-targets",
+        str(_ROOFLINE_TARGETS_PATH),
+        "--config-name",
+        "kimi-k3-tp32-ep",
+        "--chips",
+        "16",
+        "--min-roofline-ratio",
+        "0.8",
+    ]
+    assert _run_cli(monkeypatch, *kimi_argv) == 0
+    assert "ADVISORY (unverified)" in capsys.readouterr().out
+
+    assert _run_cli(monkeypatch, *kimi_argv, "--enforce-unverified-rooflines") == 1
+    err = capsys.readouterr().err
+    assert (
+        "FAILED: config=kimi-k3-tp32-ep cell=isl8192_osl1024_c1 "
+        "metric=output_token_throughput_per_chip "
+        "measured=6.32 tok/s/chip (50.00%) "
+        "target>=10.10 tok/s/chip (80.00% of 12.63)" in err
+    )
+
+
+def test_cli_perf_blocking_roofline_zero_match_and_all_oom_exit_2_without_table(
+    roofline_run, tmp_path
+):
+    # Even when --baseline would print a perf table, exit 2 prints no stdout.
+    baseline_file = tmp_path / "perf.baseline.json"
+    baseline_file.write_text(
+        json.dumps(
+            {
+                "isl512_osl512_c1": {"output_token_throughput": 500.0},
+                "isl1024_osl1024_c4": {"output_token_throughput": 500.0},
+            }
+        )
+    )
+
+    mismatch_dir = tmp_path / "mismatch"
+    _write_perf_cell(mismatch_dir, "isl512_osl512_c1", output_throughput=500.0)
+    ret, out, err = roofline_run(
+        "cfg",
+        "--baseline",
+        str(baseline_file),
+        "--min-roofline-ratio",
+        "0.8",
+        results=mismatch_dir,
+    )
+    assert ret == 2
+    assert out == ""
+    assert "no non-oom measured cells match roofline targets for 'cfg'" in err
+
+    # Only matching an oom cell also exits 2 (never vacuous exit 0).
+    oom_dir = tmp_path / "oom_only"
+    _write_perf_cell(oom_dir, "isl1024_osl1024_c4", output_throughput=500.0)
+    ret, out, err = roofline_run(
+        "cfg",
+        "--baseline",
+        str(baseline_file),
+        "--min-roofline-ratio",
+        "0.8",
+        results=oom_dir,
+    )
+    assert ret == 2
+    assert out == ""
+    assert "no non-oom measured cells match roofline targets for 'cfg'" in err
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(_GPU_REF, id="list"),
+        pytest.param({"points": _GPU_REF, "source": "reference"}, id="points_object"),
+    ],
+)
+def test_interpolate_gpu_reference(tmp_path, payload):
+    ref_file = tmp_path / "gpu_ref.json"
+    ref_file.write_text(json.dumps(payload))
+    curve = check_regression.load_gpu_reference(ref_file)
+    assert [p.p90_interactivity for p in curve] == [32.0, 64.0]
+    assert check_regression.interpolate_gpu_reference(curve, 32.0) == 60.0
+    assert check_regression.interpolate_gpu_reference(curve, 64.0) == 40.0
+    assert check_regression.interpolate_gpu_reference(curve, 40.0) == pytest.approx(
+        55.0, abs=1e-12
+    )
+    assert check_regression.interpolate_gpu_reference(curve, 31.0) is None
+    assert check_regression.interpolate_gpu_reference(curve, 65.0) is None
+
+
+@pytest.mark.parametrize(
+    ("content", "error"),
+    [
+        (None, "cannot read GPU reference {path}: "),
+        ("{not json", "cannot read GPU reference {path}: "),
+        ("[]", "{path} must be a non-empty list of reference points"),
+        ({"points": []}, "{path} must be a non-empty list of reference points"),
+        ('"not-a-list"', "{path} must be a non-empty list of reference points"),
+        (["not-an-object"], "{path}[0] must be an object"),
+        (
+            [{"p90_interactivity": 0, "out_tok_s_per_gpu": 50.0}],
+            "{path}[0].p90_interactivity must be a positive finite number",
+        ),
+        (
+            [{"p90_interactivity": -5.0, "out_tok_s_per_gpu": 50.0}],
+            "{path}[0].p90_interactivity must be a positive finite number",
+        ),
+        (
+            [{"p90_interactivity": True, "out_tok_s_per_gpu": 50.0}],
+            "{path}[0].p90_interactivity must be a positive finite number",
+        ),
+        (
+            [{"p90_interactivity": 40.0, "out_tok_s_per_gpu": 0}],
+            "{path}[0].out_tok_s_per_gpu must be a positive finite number",
+        ),
+        (
+            [{"p90_interactivity": 40.0, "out_tok_s_per_gpu": False}],
+            "{path}[0].out_tok_s_per_gpu must be a positive finite number",
+        ),
+        (
+            '[{"p90_interactivity": NaN, "out_tok_s_per_gpu": 50.0}]',
+            "cannot read GPU reference {path}: non-standard JSON constant 'NaN'",
+        ),
+        (
+            '[{"p90_interactivity": 40.0, "out_tok_s_per_gpu": Infinity}]',
+            "cannot read GPU reference {path}: non-standard JSON constant 'Infinity'",
+        ),
+        (
+            [
+                {"p90_interactivity": 40.0, "out_tok_s_per_gpu": 50.0},
+                {"p90_interactivity": 40.0, "out_tok_s_per_gpu": 60.0},
+            ],
+            "{path}: duplicate p90_interactivity 40.0",
+        ),
+    ],
+)
+def test_load_gpu_reference_rejects_malformed(tmp_path, content, error):
+    path = tmp_path / "gpu_ref.json"
+    if content is not None:
+        path.write_text(content if isinstance(content, str) else json.dumps(content))
+    with pytest.raises(ValueError) as exc_info:
+        check_regression.load_gpu_reference(path)
+    assert str(exc_info.value).startswith(error.format(path=path))
+
+
+@pytest.mark.parametrize(
+    ("unit", "raw_val"),
+    [
+        ("ms", 25.0),
+        ("msec", 25.0),
+        ("milliseconds", 25.0),
+        (" MS ", 25.0),
+        ("s", 0.025),
+        ("sec", 0.025),
+        ("second", 0.025),
+        ("seconds", 0.025),
+        (" S ", 0.025),
+        ("us", 25000.0),
+        ("usec", 25000.0),
+        ("microseconds", 25000.0),
+        ("µs", 25000.0),
+        ("ns", 25_000_000.0),
+        ("nsec", 25_000_000.0),
+        ("nanoseconds", 25_000_000.0),
+    ],
+)
+def test_load_agentx_results_converts_latency_units(tmp_path, unit, raw_val):
+    _write_aiperf_export(
+        tmp_path, conc=4, output_tput=352.0, itl_p90_ms=raw_val, unit=unit
+    )
+    points = check_regression.load_agentx_results(tmp_path)
+    assert len(points) == 1
+    assert points[0].p90_interactivity == pytest.approx(40.0, rel=1e-9)
+
+
+@pytest.mark.parametrize(
+    ("metric_block", "error"),
+    [
+        ({"p90": 25.0}, "requires a latency unit"),
+        ({"p90": 25.0, "unit": ""}, "requires a latency unit"),
+        ({"p90": 25.0, "unit": "minutes"}, "unrecognized latency unit 'minutes'"),
+    ],
+)
+def test_load_agentx_results_rejects_missing_or_unknown_unit(
+    tmp_path, metric_block, error
+):
+    out_dir = tmp_path / "conc_4" / "aiperf_artifacts"
+    out_dir.mkdir(parents=True)
+    payload = {
+        "output_token_throughput": {"unit": "tokens/sec", "avg": 352.0},
+        "inter_token_latency": metric_block,
+    }
+    (out_dir / "profile_export_aiperf.json").write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match=error):
+        check_regression.load_agentx_results(tmp_path)
+
+
+def test_load_agentx_results_edge_cases(tmp_path):
+    # 1) time_per_output_token fallback when inter_token_latency is absent.
+    tpot_dir = tmp_path / "tpot_fallback"
+    out_dir = tpot_dir / "conc_8" / "aiperf_artifacts"
+    out_dir.mkdir(parents=True)
+    (out_dir / "profile_export_aiperf.json").write_text(
+        json.dumps(
+            {
+                "output_token_throughput": {"unit": "tokens/sec", "avg": 320.0},
+                "time_per_output_token": {"unit": "s", "p90": 0.025},
+            }
+        )
+    )
+    points = check_regression.load_agentx_results(tpot_dir)
+    assert len(points) == 1
+    assert points[0].key == "c8"
+    assert points[0].p90_interactivity == pytest.approx(40.0)
+
+    # 2) Top-level-only aggregate matching & c0 / leading-zero rejection.
+    agg_dir = tmp_path / "agg_scope"
+    _write_agentx_aggregate(agg_dir, "agentx", conc=4, output_tput=320.0, p90_intvty=40)
+    # Nested aggregate must be ignored; c0 and c01 must be ignored.
+    _write_agentx_aggregate(
+        agg_dir / "nested", "agentx", conc=8, output_tput=320.0, p90_intvty=40
+    )
+    (agg_dir / "agentx_c0.json").write_text(
+        json.dumps({"output_throughput": 320.0, "p90_interactivity": 40.0})
+    )
+    (agg_dir / "agentx_c01.json").write_text(
+        json.dumps({"output_throughput": 320.0, "p90_interactivity": 40.0})
+    )
+    points = check_regression.load_agentx_results(agg_dir)
+    assert [p.key for p in points] == ["agentx_c4"]
+
+    # 3) Malformed JSON without HARD_TIMEOUT raises ValueError.
+    bad_dir = tmp_path / "bad_json"
+    bad_dir.mkdir()
+    (bad_dir / "agentx_c4.json").write_text("{truncated")
+    with pytest.raises(ValueError, match="cannot read"):
+        check_regression.load_agentx_results(bad_dir)
+
+    # 4) Truncated/empty JSON WITH HARD_TIMEOUT records HARD_TIMEOUT (not ValueError).
+    trunc_export_dir = tmp_path / "trunc_export"
+    export_sub = trunc_export_dir / "conc_16" / "aiperf_artifacts"
+    export_sub.mkdir(parents=True)
+    (trunc_export_dir / "conc_16" / "HARD_TIMEOUT").write_text("")
+    (export_sub / "profile_export_aiperf.json").write_text("{truncated")
+    points = check_regression.load_agentx_results(trunc_export_dir)
+    assert points == [check_regression.AgentxPoint("c16", 16, 0.0, 0.0, "HARD_TIMEOUT")]
+
+    trunc_agg_dir = tmp_path / "trunc_agg"
+    trunc_agg_dir.mkdir()
+    (trunc_agg_dir / "HARD_TIMEOUT").write_text("")
+    (trunc_agg_dir / "agentx_c8.json").write_text("")
+    points = check_regression.load_agentx_results(trunc_agg_dir)
+    assert points == [
+        check_regression.AgentxPoint("agentx_c8", 8, 0.0, 0.0, "HARD_TIMEOUT")
+    ]
+
+    # 5) Unified precedence: HARD_TIMEOUT beats was_cancelled=true for both shapes.
+    both_dir = tmp_path / "both_markers"
+    _write_aiperf_export(both_dir, conc=16, output_tput=396.0, itl_p90_ms=25.0)
+    export_path = both_dir / "conc_16/aiperf_artifacts/profile_export_aiperf.json"
+    payload = json.loads(export_path.read_text())
+    payload["was_cancelled"] = True
+    export_path.write_text(json.dumps(payload))
+    (both_dir / "conc_16" / "HARD_TIMEOUT").write_text("")
+    assert check_regression.load_agentx_results(both_dir)[0].invalid_reason == (
+        "HARD_TIMEOUT"
+    )
+    _write_agentx_aggregate(
+        both_dir, "agentx", conc=16, output_tput=396.0, p90_intvty=40
+    )
+    assert check_regression.load_agentx_results(both_dir)[0].invalid_reason == (
+        "HARD_TIMEOUT"
+    )
+
+    # 6) Per-directory scoping prevents cross-subtree marker bleed.
+    scoped_dir = tmp_path / "scoped"
+    _write_aiperf_export(
+        scoped_dir / "run_a", conc=16, output_tput=396.0, itl_p90_ms=25
+    )
+    (scoped_dir / "run_a" / "conc_16" / "HARD_TIMEOUT").write_text("")
+    _write_aiperf_export(
+        scoped_dir / "run_b", conc=16, output_tput=396.0, itl_p90_ms=25
+    )
+    _write_agentx_aggregate(
+        scoped_dir, "top", conc=16, output_tput=396.0, p90_intvty=40.0
+    )
+    by_key = {p.key: p for p in check_regression.load_agentx_results(scoped_dir)}
+    assert by_key["run_a/c16"].invalid_reason == "HARD_TIMEOUT"
+    assert by_key["run_b/c16"].invalid_reason is None
+    assert by_key["top_c16"].invalid_reason is None
+
+    # 7) Symlink escaping results_dir does not inherit outside HARD_TIMEOUT.
+    outside = tmp_path / "outside"
+    outside_sub = outside / "sub"
+    outside_sub.mkdir(parents=True)
+    (outside / "HARD_TIMEOUT").write_text("")
+    outside_file = outside_sub / "profile_export_aiperf.json"
+    outside_file.write_text("{}")
+    sym_root = tmp_path / "sym_root"
+    sym_root.mkdir()
+    (sym_root / "link").symlink_to(outside_sub)
+    assert not check_regression.agentx_gate._has_hard_timeout_ancestor(
+        sym_root, sym_root / "link" / "profile_export_aiperf.json"
+    )
+
+
+def test_cli_perf_agentx_aiperf_and_aggregate_gates(tmp_path, monkeypatch, capsys):
+    ref_file = tmp_path / "gpu_ref.json"
+    ref_file.write_text(json.dumps({"points": _GPU_REF}))
+
+    # 1) profile_export_aiperf.json: itl p90 = 25.0 ms -> intvty = 40.0 -> gpu ref 55.0.
+    # Disaggregated 4P + 4D = 8 physical chips; 352.0 / 8 = 44.0 tok/s/chip = 80.00%.
+    aiperf_dir = tmp_path / "aiperf_run"
+    _write_aiperf_export(aiperf_dir, conc=16, output_tput=352.0, itl_p90_ms=25.0)
+    base_argv = [
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(aiperf_dir),
+        "--roofline-targets",
+        str(_ROOFLINE_TARGETS_PATH),
+        "--config-name",
+        "kimi-k3-tp8-dp4-ep-agentx",
+        "--agentx-gpu-reference",
+        str(ref_file),
+        "--prefill-chips",
+        "4",
+        "--decode-chips",
+        "4",
+    ]
+    # Advisory (no --min-gpu-ratio) exits 0.
+    assert _run_cli(monkeypatch, *base_argv) == 0
+    out = capsys.readouterr().out
+    assert "not modeled" in out
+    assert "| `c16` | 40.00 | 44.00 | 55.00 | 80.00% | ADVISORY |" in out
+
+    # Blocking at 0.80 passes; blocking at 0.85 fails with clear diagnostic.
+    assert _run_cli(monkeypatch, *base_argv, "--min-gpu-ratio", "0.80") == 0
+    capsys.readouterr()
+    assert _run_cli(monkeypatch, *base_argv, "--min-gpu-ratio", "0.85") == 1
+    err = capsys.readouterr().err
+    assert (
+        "FAILED: config=kimi-k3-tp8-dp4-ep-agentx point=c16 "
+        "metric=out_tok_s_per_chip@p90_interactivity=40.00 "
+        "measured=44.00 tok/s/chip (80.00%) "
+        "target>=46.75 tok/s/chip (85.00% of 55.00)" in err
+    )
+
+    # 2) <label>_c<N>.json wins over conc_<N>/.../profile_export_aiperf.json without
+    # duplicating c16, ignores InferenceX's rank-based per_gpu (999999.0), and handles
+    # an out-of-range c1 point alongside an in-range c16 point.
+    _write_agentx_aggregate(
+        aiperf_dir, "agentx_k3", conc=1, output_tput=160.0, p90_intvty=120.0
+    )
+    _write_agentx_aggregate(
+        aiperf_dir, "agentx_k3", conc=16, output_tput=396.0, p90_intvty=40.0
+    )
+    assert _run_cli(monkeypatch, *base_argv, "--min-gpu-ratio", "0.85") == 0
+    out = capsys.readouterr().out
+    assert "| `agentx_k3_c1` | 120.00 | 20.00 | - | - | SKIP (out of range) |" in out
+    assert "| `agentx_k3_c16` | 40.00 | 49.50 | 55.00 | 90.00% | PASS |" in out
+    assert "`c16`" not in out
+
+
+def test_cli_perf_agentx_all_out_of_range_and_bad_inputs(tmp_path, monkeypatch, capsys):
+    ref_file = tmp_path / "gpu_ref.json"
+    ref_file.write_text(json.dumps(_GPU_REF))
+
+    # Zero AgentX files exits 2.
+    empty_dir = tmp_path / "empty_agentx"
+    empty_dir.mkdir()
+    assert (
+        _run_cli(
+            monkeypatch,
+            "--mode",
+            "perf",
+            "--results-dir",
+            str(empty_dir),
+            "--agentx-gpu-reference",
+            str(ref_file),
+            "--chips",
+            "8",
+        )
+        == 2
+    )
+    assert "no AgentX result files" in capsys.readouterr().err
+
+    # Every point out of range fails when --min-gpu-ratio is set (no vacuous pass).
+    oor_dir = tmp_path / "oor"
+    _write_agentx_aggregate(
+        oor_dir, "agentx_k3", conc=1, output_tput=160.0, p90_intvty=120.0
+    )
+    ret = _run_cli(
+        monkeypatch,
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(oor_dir),
+        "--agentx-gpu-reference",
+        str(ref_file),
+        "--chips",
+        "8",
+        "--min-gpu-ratio",
+        "0.8",
+    )
+    assert ret == 1
+    assert "measured=0 in-range points" in capsys.readouterr().err
+
+    # Missing chip count with --agentx-gpu-reference exits 2.
+    ret = _run_cli(
+        monkeypatch,
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(oor_dir),
+        "--agentx-gpu-reference",
+        str(ref_file),
+    )
+    assert ret == 2
+    assert (
+        "--chips or --prefill-chips/--decode-chips is required"
+        in capsys.readouterr().err
+    )
+
+    # Flat p90_tpot_ms in <label>_c<N>.json (1000.0 / 25.0 = 40.0) also works.
+    flat_dir = tmp_path / "flat"
+    flat_dir.mkdir()
+    (flat_dir / "run_c4.json").write_text(
+        json.dumps({"output_throughput": 352.0, "p90_tpot_ms": 25.0})
+    )
+    assert (
+        _run_cli(
+            monkeypatch,
+            "--mode",
+            "perf",
+            "--results-dir",
+            str(flat_dir),
+            "--agentx-gpu-reference",
+            str(ref_file),
+            "--chips",
+            "8",
+            "--min-gpu-ratio",
+            "0.8",
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reason"),
+    [
+        ({"completed": 0}, "missing output_throughput"),
+        ({"completed": 64, "output_throughput": -5.0}, "negative output_throughput"),
+    ],
+)
+def test_cli_perf_roofline_invalid_output_throughput_fails_gate(
+    tmp_path, monkeypatch, capsys, payload, expected_reason
+):
+    # A cell with missing or negative output_throughput stays SKIP in advisory
+    # mode, and fails with the exact reason when --min-roofline-ratio gates it.
+    broken_dir = tmp_path / "broken"
+    broken_dir.mkdir()
+    (broken_dir / "isl1024_osl8192_c64.json").write_text(json.dumps(payload))
+    argv = [
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(broken_dir),
+        "--roofline-targets",
+        str(_ROOFLINE_TARGETS_PATH),
+        "--config-name",
+        "qwen3.5-397b-fp8-tp1-dp8-ep",
+        "--chips",
+        "4",
+    ]
+    assert _run_cli(monkeypatch, *argv) == 0
+    assert "| SKIP |" in capsys.readouterr().out
+
+    assert _run_cli(monkeypatch, *argv, "--min-roofline-ratio", "0.8") == 1
+    captured = capsys.readouterr()
+    assert f"| FAIL ({expected_reason}) |" in captured.out
+    assert (
+        "FAILED: config=qwen3.5-397b-fp8-tp1-dp8-ep cell=isl1024_osl8192_c64 "
+        "metric=output_token_throughput_per_chip "
+        f"measured=invalid ({expected_reason}) "
+        "target>=1026.02 tok/s/chip (80.00% of 1282.53)" in captured.err
+    )
+
+
+def test_cli_perf_not_modeled_with_min_roofline_ratio_stays_advisory(
+    tmp_path, monkeypatch, capsys
+):
+    # Passing --min-roofline-ratio on a checked-in not_modeled config prints
+    # the advisory completion message instead of claiming gated metrics passed.
+    disagg_dir = tmp_path / "disagg_not_modeled"
+    disagg_dir.mkdir()
+    assert (
+        _run_cli(
+            monkeypatch,
+            "--mode",
+            "perf",
+            "--results-dir",
+            str(disagg_dir),
+            "--roofline-targets",
+            str(_ROOFLINE_TARGETS_PATH),
+            "--config-name",
+            "kimi-k3-tp8-dp4-ep-1p1d",
+            "--min-roofline-ratio",
+            "0.8",
+        )
+        == 0
+    )
+    assert "PASS: advisory speed checks complete." in capsys.readouterr().out
+
+
+def test_cli_perf_agentx_cancelled_and_hard_timeout_fail_gate(
+    tmp_path, monkeypatch, capsys
+):
+    ref_file = tmp_path / "gpu_ref.json"
+    ref_file.write_text(json.dumps(_GPU_REF))
+
+    # 1) profile_export_aiperf.json with was_cancelled=true fails --min-gpu-ratio,
+    # while submission_valid=false on a clean --fast 1 point is allowed.
+    cancelled_dir = tmp_path / "cancelled"
+    _write_aiperf_export(cancelled_dir, conc=4, output_tput=396.0, itl_p90_ms=25.0)
+    fast_meta = json.loads(
+        (
+            cancelled_dir / "conc_4/aiperf_artifacts/profile_export_aiperf.json"
+        ).read_text()
+    )
+    fast_meta["metadata"] = {"submission_valid": False}
+    (cancelled_dir / "conc_4/aiperf_artifacts/profile_export_aiperf.json").write_text(
+        json.dumps(fast_meta)
+    )
+    _write_aiperf_export(cancelled_dir, conc=16, output_tput=396.0, itl_p90_ms=25.0)
+    c16_path = cancelled_dir / "conc_16/aiperf_artifacts/profile_export_aiperf.json"
+    c16_data = json.loads(c16_path.read_text())
+    c16_data["was_cancelled"] = True
+    c16_path.write_text(json.dumps(c16_data))
+
+    argv = [
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(cancelled_dir),
+        "--agentx-gpu-reference",
+        str(ref_file),
+        "--chips",
+        "8",
+    ]
+    assert _run_cli(monkeypatch, *argv) == 0
+    assert "ADVISORY (was_cancelled=true)" in capsys.readouterr().out
+
+    assert _run_cli(monkeypatch, *argv, "--min-gpu-ratio", "0.8") == 1
+    err = capsys.readouterr().err
+    assert "point=c16" in err and "was_cancelled=true" in err
+
+    # 2) <label>_c<N>.json with conc_<N>/HARD_TIMEOUT fails --min-gpu-ratio, and
+    # a conc_<N>/HARD_TIMEOUT dir with no aggregate is not hidden by a passing c4.
+    timeout_dir = tmp_path / "timeout"
+    _write_agentx_aggregate(
+        timeout_dir, "agentx_k3", conc=4, output_tput=396.0, p90_intvty=40.0
+    )
+    (timeout_dir / "conc_16").mkdir(parents=True)
+    (timeout_dir / "conc_16" / "HARD_TIMEOUT").write_text("")
+    t_argv = [
+        "--mode",
+        "perf",
+        "--results-dir",
+        str(timeout_dir),
+        "--agentx-gpu-reference",
+        str(ref_file),
+        "--chips",
+        "8",
+        "--min-gpu-ratio",
+        "0.8",
+    ]
+    assert _run_cli(monkeypatch, *t_argv) == 1
+    err = capsys.readouterr().err
+    assert "point=c16" in err and "HARD_TIMEOUT" in err
+
+    # Even with truncated JSON after HARD_TIMEOUT, blocking mode exits 1 (not 2).
+    (timeout_dir / "agentx_k3_c16.json").write_text("{truncated")
+    assert _run_cli(monkeypatch, *t_argv) == 1
+    err = capsys.readouterr().err
+    assert "point=agentx_k3_c16" in err and "HARD_TIMEOUT" in err
+
+
+@pytest.mark.parametrize(
+    ("base_tput", "roof_ratio", "gpu_ratio", "expected_rc", "expected_err_fragments"),
+    [
+        pytest.param(3200.0, "0.8", "0.8", 0, [], id="all_pass"),
+        pytest.param(
+            4000.0, "0.8", "0.8", 1, ["metric(s) regressed"], id="baseline_only_fails"
+        ),
+        pytest.param(
+            3200.0,
+            "0.9",
+            "0.8",
+            1,
+            ["cell=isl1024_osl1024_c1"],
+            id="roofline_only_fails",
+        ),
+        pytest.param(3200.0, "0.8", "0.9", 1, ["point=agentx_c4"], id="gpu_only_fails"),
+        pytest.param(
+            4000.0,
+            "0.9",
+            "0.9",
+            1,
+            ["metric(s) regressed", "cell=isl1024_osl1024_c1", "point=agentx_c4"],
+            id="all_three_fail",
+        ),
+    ],
+)
+def test_cli_perf_combined_baseline_roofline_and_gpu_gates(
+    roofline_run,
+    tmp_path,
+    base_tput,
+    roof_ratio,
+    gpu_ratio,
+    expected_rc,
+    expected_err_fragments,
+):
+    results_dir = tmp_path / "results"
+    # 4 chips: roofline cell is 3200/4 = 800 (80% of 1000); AgentX is 176/4 = 44
+    # at p90_intvty=40 (80% of GPU ref 55.0).
+    _write_agentx_aggregate(
+        results_dir, "agentx", conc=4, output_tput=176.0, p90_intvty=40.0
+    )
+    baseline_file = tmp_path / "perf.baseline.json"
+    baseline_file.write_text(
+        json.dumps({"isl1024_osl1024_c1": {"output_token_throughput": base_tput}})
+    )
+    ref_file = tmp_path / "gpu_ref.json"
+    ref_file.write_text(json.dumps(_GPU_REF))
+    ret, out, err = roofline_run(
+        "cfg",
+        "--baseline",
+        str(baseline_file),
+        "--chips",
+        "4",
+        "--min-roofline-ratio",
+        roof_ratio,
+        "--agentx-gpu-reference",
+        str(ref_file),
+        "--min-gpu-ratio",
+        gpu_ratio,
+    )
+    assert ret == expected_rc
+    assert "## Perf regression check" in out
+    assert "## Roofline speed check" in out
+    assert "## AgentX GPU reference speed check" in out
+    for fragment in expected_err_fragments:
+        assert fragment in err
+    if expected_rc == 0:
+        assert err == ""
+        assert out.endswith("PASS: all gated metrics within tolerance.\n")

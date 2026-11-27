@@ -46,6 +46,7 @@ _COPIED_FILES = (
     "check_regression.py",
     "baseline_policy.py",
     "roofline_gate.py",
+    "agentx_gate.py",
     "publish_perf_dashboard.py",
 )
 
