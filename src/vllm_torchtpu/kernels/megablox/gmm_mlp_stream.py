@@ -29,6 +29,10 @@ quant block scaled by its block scale, accumulated in K order, activation in
 f32, the activation rounded to bf16 before down. An expert's rows run in
 windows of at most 48 rows; gmm_v2 runs groups that fill more of a tile on
 bf16-dequantized weights instead, so only those groups round differently.
+
+Given the routing's inverse permutation, the kernel gathers the routed rows
+from the tokens itself (no permuted copy in HBM): each routed row's packed bf16
+row pair is one DMA, and the token's half of each word is selected in VMEM.
 """
 
 import functools
@@ -55,6 +59,10 @@ _PASS_WINDOWS = 2
 # Row tiles whose write-back may be in flight at once.
 _OUT_SLOTS = 8
 _ACTIVATIONS = {"swigluoai": swigluoai}
+# Routed rows per block of the in-kernel inverse permutation (one vreg of lanes).
+_SLOT_BLOCK = 128
+# Lanes per step of the routed-row selection (bounds its temporaries).
+_SELECT_COLS = 1024
 
 
 def supported(
@@ -96,12 +104,29 @@ def supported(
     )
 
 
-def _vmem_bytes(i: int, k: int, sub: int) -> int:
+def gathers(num_tokens: int, topk: int, w1: jax.Array) -> bool:
+    """Whether the kernel can gather the routed rows of ``num_tokens`` bf16
+    tokens with ``topk`` routes each itself (``gmm_mlp_stream(revert=...)``):
+    whole row pairs and sublane tiles of tokens, within VMEM."""
+    info = pltpu.get_tpu_info()
+    _, k, two_i = w1.shape
+    sub = info.get_sublane_tiling(jnp.bfloat16)
+    return (
+        num_tokens % sub == 0
+        and topk > 0
+        and _vmem_bytes(two_i // 2, k, sub, num_tokens) <= info.vmem_capacity_bytes
+    )
+
+
+def _vmem_bytes(i: int, k: int, sub: int, tokens: int = 0) -> int:
     """The kernel's scratch, a lower bound on its VMEM (fp4 takes a byte per
-    element in VMEM)."""
+    element in VMEM); ``tokens``: the token count it gathers rows from, 0 for
+    none."""
     win = FP8_RHS_MAX_BUCKET_M
     ring = _SLOTS * (i * k + (i // _QUANT_BLOCK) * k * 4)
-    rows = 2 * _PASS_WINDOWS * win * k * 2  # x_buf
+    # x_buf (gather: one pass's 32-bit row pairs, the same bytes), plus the
+    # lane-padded inverse permutation it gathers by.
+    rows = 2 * _PASS_WINDOWS * win * k * 2 + tokens * 128 * 4
     rows += _PASS_WINDOWS * win * (2 * i * 4 + i * 2)  # acc_buf, h_buf
     rows += (win + (_OUT_SLOTS + 1) * sub) * k * 2  # o_buf, o_ring, p_buf
     return ring + rows
@@ -109,31 +134,50 @@ def _vmem_bytes(i: int, k: int, sub: int) -> int:
 
 def _kernel(
     gs_ref,  # SMEM int32 [G]
-    lhs_hbm,  # [M, K] bf16
-    w1_hbm,  # [G, K, 2I] fp4
-    s1_hbm,  # [G, K / 128, 1, 2I] f32
-    w2_hbm,  # [G, I, K] fp4
-    s2_hbm,  # [G, I / 128, 1, K] f32
-    out_hbm,  # [M, K] bf16
-    w_ring,  # [SLOTS, I, K] fp4 (every chunk is [K / 2, 2I] = [I, K])
-    s_ring,  # [SLOTS, I / 128, 1, K] f32
-    x_buf,  # [2, PW, WIN, K] bf16: rows of the current and the next pair
-    acc_buf,  # [PW, WIN, 2I] f32
-    h_buf,  # [PW, WIN, I] bf16
-    o_buf,  # [WIN, K] bf16
-    o_ring,  # [OUT_SLOTS, SUB, K] bf16: row tiles being written back
-    p_buf,  # [SUB, K] bf16: the last tile of a group that ends inside it
-    tab,  # SMEM int32 [5, max_pairs]: expert, window start, windows, row0, row1
-    st,  # SMEM int32 [2]: pending tile's first row (-1: none), tiles written
-    w_sem,
-    s_sem,
-    x_sem,
-    o_sem,
-    *,
+    *refs,
     groups: int,
     sub: int,
     act: str,
+    gather: bool,
 ):
+    if gather:
+        # VMEM int32 [T, topk]: each route's routed row (the inverse permutation).
+        revert_ref, *refs = refs
+    (
+        lhs_hbm,  # [M, K] bf16 routed rows, or [T, K] bf16 tokens (gather)
+        w1_hbm,  # [G, K, 2I] fp4
+        s1_hbm,  # [G, K / 128, 1, 2I] f32
+        w2_hbm,  # [G, I, K] fp4
+        s2_hbm,  # [G, I / 128, 1, K] f32
+        out_hbm,  # [M, K] bf16
+        w_ring,  # [SLOTS, I, K] fp4 (every chunk is [K / 2, 2I] = [I, K])
+        s_ring,  # [SLOTS, I / 128, 1, K] f32
+        x_buf,  # [2, PW, WIN, K] bf16: rows of the current and the next pair;
+        # gather: [PW, 2, WIN / 2, K] int32, routed row i's token row pair at
+        # [., i % 2, i // 2] (even and odd rows apart, no strided loads), the
+        # even half then overwritten in place by the selected bf16 rows
+        acc_buf,  # [PW, WIN, 2I] f32
+        h_buf,  # [PW, WIN, I] bf16
+        o_buf,  # [WIN, K] bf16
+        o_ring,  # [OUT_SLOTS, SUB, K] bf16: row tiles being written back
+        p_buf,  # [SUB, K] bf16: the last tile of a group that ends inside it
+        tab,  # SMEM int32 [5, max_pairs]: expert, window start, windows, row0, row1
+        st,  # SMEM int32 [2]: pending tile's first row (-1: none), tiles written
+        w_sem,
+        s_sem,
+        x_sem,
+        o_sem,
+        *gather_scratch,
+    ) = refs
+    if gather:
+        (
+            tok_v,  # VMEM int32 [ceil(M / 128) padded to 8, 128]: routed row -> token
+            tok_s,  # SMEM, its copy
+            shift_s,  # SMEM int32 [PW * WIN]: the token's half in its pair (0 / 16)
+            tok_sem,
+        ) = gather_scratch
+        # A packed bf16 row pair is one 32-bit row, the smallest DMA unit.
+        lhs_words = lhs_hbm.bitcast(jnp.int32)
     fp8 = jnp.float8_e4m3fn
     f32 = jnp.float32
     win = FP8_RHS_MAX_BUCKET_M
@@ -161,7 +205,9 @@ def _kernel(
 
         return off + n, lax.fori_loop(0, npass, one, npairs)
 
-    _, npairs = lax.fori_loop(0, groups, plan, (jnp.int32(0), jnp.int32(0)))
+    rows_total, npairs = lax.fori_loop(
+        0, groups, plan, (jnp.int32(0), jnp.int32(0))
+    )
     units = npairs * 3
     st[0] = -1
     st[1] = 0
@@ -203,10 +249,38 @@ def _kernel(
                 for c in pair:
                     getattr(c, method)()
 
-    # A pair's rows: its windows' sublane tiles up to the group's end.
+    def pair_copy(src_pair, w, i):
+        return pltpu.make_async_copy(
+            lhs_words.at[pl.ds(src_pair, 1)],
+            x_buf.at[w, i % 2, pl.ds(i // 2, 1)],
+            x_sem.at[0],
+        )
+
+    # A pair's rows: its windows' sublane tiles up to the group's end (gather:
+    # each of the group's rows as its token's row pair).
     def on_rows(pair, method):
         parity = pair % 2
         start, nwin, row1 = tab[1, pair], tab[2, pair], tab[4, pair]
+        if gather:
+            row0 = tab[3, pair]
+            for w in range(_PASS_WINDOWS):
+                w0 = start + w * win
+
+                def one(r, c, w=w, w0=w0):
+                    if method == "start":
+                        tok = tok_s[r // _SLOT_BLOCK, r % _SLOT_BLOCK]
+                        shift_s[w * win + r - w0] = (tok % 2) * 16
+                        pair_copy(tok // 2, w, r - w0).start()
+                    else:
+                        pair_copy(0, w, 0).wait()
+                    return c
+
+                @pl.when(w < nwin)
+                def _(w0=w0, one=one):
+                    hi = jnp.minimum(w0 + win, row1)
+                    lax.fori_loop(jnp.maximum(w0, row0), hi, one, 0)
+
+            return
         for w in range(_PASS_WINDOWS):
             for t in range(win // sub):
                 t0 = pl.multiple_of(start + w * win + t * sub, sub)
@@ -222,15 +296,42 @@ def _kernel(
                         method,
                     )()
 
-    for u0 in range(_SLOTS - 1):
+    # Gather: the first pair's row pairs queue right behind the first chunk.
+    for u0 in range(1 if gather else _SLOTS - 1):
 
         @pl.when(u0 < units)
         def _(u0=u0):
             on_chunk(jnp.int32(u0), "start")
 
+    if gather:
+        # Routed row -> token for the rows the groups hold, under the first
+        # weight copies: one 128-row block of the inverse permutation at a time.
+        tokens, topk = revert_ref.shape
+        slot = lax.broadcasted_iota(jnp.int32, (tokens, _SLOT_BLOCK), 1)
+        token = lax.broadcasted_iota(jnp.int32, (tokens, _SLOT_BLOCK), 0)
+        for b in range(pl.cdiv(out_hbm.shape[0], _SLOT_BLOCK)):
+
+            @pl.when(b * _SLOT_BLOCK < rows_total)
+            def _(b=b):
+                hit = jnp.zeros((tokens, _SLOT_BLOCK), jnp.int32)
+                for k in range(topk):
+                    route = revert_ref[:, k : k + 1] == slot + b * _SLOT_BLOCK
+                    hit = jnp.where(route, token, hit)
+                tok_v[b : b + 1, :] = jnp.sum(hit, axis=0, keepdims=True)
+
+        tok_copy = pltpu.make_async_copy(tok_v, tok_s, tok_sem.at[0])
+        tok_copy.start()
+        tok_copy.wait()
+
     @pl.when(npairs > 0)
     def _():
         on_rows(jnp.int32(0), "start")
+
+    for u0 in range(1 if gather else _SLOTS - 1, _SLOTS - 1):
+
+        @pl.when(u0 < units)
+        def _(u0=u0):
+            on_chunk(jnp.int32(u0), "start")
 
     def out_copy(slot, t0):
         return pltpu.make_async_copy(
@@ -273,6 +374,24 @@ def _kernel(
                 acc += blk * s_ref[b, :, pl.ds(n0, lanes)]
             acc_ref[pl.ds(0, bm), pl.ds(n0, lanes)] = acc
 
+    def select(w, bm):
+        """Window w's first bm routed rows as bf16 rows, in place of its even
+        row pairs: each pair's half that holds the routed row (a packed bf16
+        word holds rows 2j and 2j + 1 in its low and high half)."""
+        h2 = bm // 2
+        row = lax.broadcasted_iota(jnp.int32, (h2, 1), 0)
+        shifts = [jnp.zeros((h2, 1), jnp.int32), jnp.zeros((h2, 1), jnp.int32)]
+        for j in range(bm):
+            v = shift_s[w * win + j]
+            shifts[j % 2] = jnp.where(row == j // 2, v, shifts[j % 2])
+        for c0 in range(0, x_buf.shape[-1], _SELECT_COLS):
+            c = pl.ds(c0, _SELECT_COLS)
+            even = x_buf[w, 0, pl.ds(0, h2), c]
+            odd = x_buf[w, 1, pl.ds(0, h2), c]
+            lo = lax.shift_right_logical(even, jnp.broadcast_to(shifts[0], even.shape))
+            hi = lax.shift_right_logical(odd, jnp.broadcast_to(shifts[1], odd.shape))
+            x_buf[w, 0, pl.ds(0, h2), c] = (lo & 0xFFFF) | lax.shift_left(hi, 16)
+
     def bucketed(rows, fn):
         """fn(bm) on the smallest row bucket bm >= rows."""
         idx = sum((rows > b).astype(jnp.int32) for b in buckets[:-1])
@@ -305,27 +424,42 @@ def _kernel(
                         st[0] = -1
 
     def body(u, carry):
-        @pl.when(u + _SLOTS - 1 < units)
-        def _():
-            on_chunk(u + _SLOTS - 1, "start")
-
         pair, part, slot = u // 3, u % 3, u % _SLOTS
         parity = pair % 2
         start, nwin, row0, row1 = tab[1, pair], tab[2, pair], tab[3, pair], tab[4, pair]
+
+        if gather:
+            # The next pair's row pairs land in the buffer once this pair's
+            # gate_up is done with it, queued ahead of the next weight chunk.
+            @pl.when((part == 2) & (pair + 1 < npairs))
+            def _():
+                on_rows(pair + 1, "start")
+
+        @pl.when(u + _SLOTS - 1 < units)
+        def _():
+            on_chunk(u + _SLOTS - 1, "start")
 
         @pl.when(part == 0)
         def _():
             on_rows(pair, "wait")
 
-            @pl.when(pair + 1 < npairs)
-            def _():
-                on_rows(pair + 1, "start")
+            if not gather:
+
+                @pl.when(pair + 1 < npairs)
+                def _():
+                    on_rows(pair + 1, "start")
 
         on_chunk(u, "wait")
 
         def window(w, c):
             w0 = pl.multiple_of(start + w * win, sub)
             rows = jnp.minimum(win, row1 - w0)  # window rows up to the group's end
+
+            if gather:
+
+                @pl.when(part == 0)
+                def _():
+                    bucketed(rows, lambda bm: select(w, bm))
 
             @pl.when(part < 2)
             def _():
@@ -334,7 +468,14 @@ def _kernel(
                 bucketed(
                     rows,
                     lambda bm: project(
-                        x_buf.at[parity, w], k0, slot, acc_buf.at[w], part == 0, bm
+                        x_buf.at[w, 0].bitcast(jnp.bfloat16)
+                        if gather
+                        else x_buf.at[parity, w],
+                        k0,
+                        slot,
+                        acc_buf.at[w],
+                        part == 0,
+                        bm,
                     ),
                 )
 
@@ -375,7 +516,7 @@ def _kernel(
 
 @functools.partial(jax.jit, static_argnames=["fuse_act"])
 def gmm_mlp_stream(
-    lhs: jax.Array,  # [M, K] bf16, rows grouped by expert
+    lhs: jax.Array,  # [M, K] bf16, rows grouped by expert (or [T, K] tokens)
     w1: jax.Array,  # [G, K, 2I] fp4, [gate | up]
     w2: jax.Array,  # [G, I, K] fp4
     group_sizes: jax.Array,  # int32 [G]
@@ -383,33 +524,56 @@ def gmm_mlp_stream(
     s2: jax.Array,  # [G, I / 128, 1, K] f32
     *,
     fuse_act: str,
+    revert: jax.Array | None = None,  # int32 [T * topk]
 ) -> jax.Array:
     """down(act(gate_up(lhs))) per group, as gmm_v2_mlp on decode tiles: the
-    first ``sum(group_sizes)`` rows of the [M, K] bf16 result are defined."""
+    first ``sum(group_sizes)`` rows of the [M, K] bf16 result are defined.
+
+    With ``revert`` (fused_moe_gmm's ``argsort_revert_indices``: route k of
+    token t is routed row ``revert[t * topk + k]``), ``lhs`` holds the [T, K]
+    tokens and routed row r is the row of the token whose route maps to r
+    (M = T * topk), gathered in the kernel: bit-identical to permuting first.
+    A non-finite token reaches only its own routed rows."""
     g, k, two_i = w1.shape
     i = two_i // 2
-    m = lhs.shape[0]
+    gather = revert is not None
+    m = revert.size if gather else lhs.shape[0]
     sub = _get_lhs_sublane_size(lhs.dtype, m)
     win = FP8_RHS_MAX_BUCKET_M
     assert win % sub == 0, (win, sub)
     mp = align_to(m, sub)
-    if mp != m:
+    gather_operands, gather_specs, gather_scratch = (), [], []
+    if gather:
+        tokens = lhs.shape[0]
+        assert tokens % sub == 0 and m % tokens == 0, (tokens, m, sub)
+        gather_operands = (revert.reshape(tokens, m // tokens).astype(jnp.int32),)
+        gather_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)]
+        blocks = align_to(pl.cdiv(mp, _SLOT_BLOCK), 8)
+        gather_scratch = [
+            pltpu.VMEM((blocks, _SLOT_BLOCK), jnp.int32),
+            pltpu.SMEM((blocks, _SLOT_BLOCK), jnp.int32),
+            pltpu.SMEM((_PASS_WINDOWS * win,), jnp.int32),
+            pltpu.SemaphoreType.DMA((1,)),
+        ]
+    elif mp != m:
         lhs = jnp.pad(lhs, ((0, mp - m), (0, 0)))
     # Every group but the last can add one window (sublane offset) and a pass.
     max_pairs = g + pl.cdiv(mp + g * win, win * _PASS_WINDOWS)
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     vmem_limit = pltpu.get_tpu_info().vmem_capacity_bytes
     out = pl.pallas_call(
-        functools.partial(_kernel, groups=g, sub=sub, act=fuse_act),
+        functools.partial(_kernel, groups=g, sub=sub, act=fuse_act, gather=gather),
         out_shape=jax.ShapeDtypeStruct((mp, k), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[hbm] * 5,
+            in_specs=[*gather_specs, *[hbm] * 5],
             out_specs=hbm,
             scratch_shapes=[
                 pltpu.VMEM((_SLOTS, i, k), w1.dtype),
                 pltpu.VMEM((_SLOTS, i // _QUANT_BLOCK, 1, k), jnp.float32),
-                pltpu.VMEM((2, _PASS_WINDOWS, win, k), jnp.bfloat16),
+                pltpu.VMEM((_PASS_WINDOWS, 2, win // 2, k), jnp.int32)
+                if gather
+                else pltpu.VMEM((2, _PASS_WINDOWS, win, k), jnp.bfloat16),
                 pltpu.VMEM((_PASS_WINDOWS, win, two_i), jnp.float32),
                 pltpu.VMEM((_PASS_WINDOWS, win, i), jnp.bfloat16),
                 pltpu.VMEM((win, k), jnp.bfloat16),
@@ -421,9 +585,10 @@ def gmm_mlp_stream(
                 pltpu.SemaphoreType.DMA((_SLOTS,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((_OUT_SLOTS,)),
+                *gather_scratch,
             ],
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit),
-        name=f"gmm_mlp_stream-g_{g}-m_{mp}-k_{k}-i_{i}",
-    )(group_sizes.astype(jnp.int32), lhs, w1, s1, w2, s2)
+        name=f"gmm_mlp_stream-g_{g}-m_{mp}-k_{k}-i_{i}" + ("-gather" if gather else ""),
+    )(group_sizes.astype(jnp.int32), *gather_operands, lhs, w1, s1, w2, s2)
     return out[:m]

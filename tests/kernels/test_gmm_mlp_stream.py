@@ -132,3 +132,40 @@ def test_matches_reference(batch_size, group_sizes):
     got = np.asarray(actual[:rows].astype(jnp.float32), np.float64)
     err = np.abs(got - expected).max() / np.abs(expected).max()
     assert err < 1e-2, err
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("num_tokens, topk", [(256, 4), (384, 4), (64, 8)])
+def test_gather_matches_permute_first(num_tokens, topk):
+    """With ``revert`` the stream gathers each routed row from the tokens
+    itself: bit-identical to permuting the rows first."""
+    _require_tpu()
+    tokens, w1, s1, w2, s2 = _operands(num_tokens)
+    rng = np.random.default_rng(num_tokens)
+    experts = np.stack(
+        [rng.choice(4 * _GROUPS, topk, replace=False) for _ in range(num_tokens)]
+    )
+    keys = np.where(experts < _GROUPS, experts, _GROUPS).ravel()
+    order = np.argsort(keys, kind="stable")
+    revert = np.empty_like(order)
+    revert[order] = np.arange(order.size)
+    group_sizes = jnp.asarray(np.bincount(keys, minlength=_GROUPS + 1)[:_GROUPS])
+    rows = int(group_sizes.sum())
+    permuted = tokens[order // topk]
+    expected = gmm_mlp_stream(
+        permuted, w1, w2, group_sizes, s1, s2, fuse_act="swigluoai"
+    )
+    actual = gmm_mlp_stream(
+        tokens,
+        w1,
+        w2,
+        group_sizes,
+        s1,
+        s2,
+        fuse_act="swigluoai",
+        revert=jnp.asarray(revert, jnp.int32),
+    )
+    np.testing.assert_array_equal(
+        np.asarray(actual[:rows].astype(jnp.float32)),
+        np.asarray(expected[:rows].astype(jnp.float32)),
+    )

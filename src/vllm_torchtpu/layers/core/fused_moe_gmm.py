@@ -464,10 +464,14 @@ def prepare_routed_gmm_inputs(
     onehot_moe_permute_threshold: int = 0,
     skip_padded_tokens: bool = False,
     side_rows: jax.Array | None = None,
+    gathers_rows: bool = False,
 ) -> tuple[
     jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None
 ]:
     """Prepare the local-only routing layout using already-local expert ids.
+
+    ``gathers_rows``: the GMM gathers the routed rows from the tokens itself
+    (`moe_gmm`), so on the one-hot EP path ``x`` is the tokens, unpermuted.
 
     For non-EP runs `topk_indices_local` is always non-negative, so the
     valid-mask path computed below is a no-op (jnp.where on an all-True
@@ -595,7 +599,9 @@ def prepare_routed_gmm_inputs(
             # from it so `fused_moe_gmm` does not depend on `token_indices_sorted`
             # (letting XLA DCE its scatter unless owner-output combine uses it).
             # The bounded kernel runs only the valid local prefix of slots.
-            if bucket_counts is not None and _use_bounded_onehot(
+            if gathers_rows:
+                x = hidden_states_local
+            elif bucket_counts is not None and _use_bounded_onehot(
                 num_tokens_local, argsort_revert_indices.size, hidden_states_local
             ):
                 x = bounded_onehot_permute(
@@ -653,6 +659,30 @@ def prepare_routed_gmm_inputs(
 SharedDown = tuple[jax.Array, jax.Array, jax.Array]
 
 
+def _fp4_mlp(w1, w2, w1_bias, w2_bias, rhs_quant_dtype) -> bool:
+    """fp4 experts the fused gate_up/down kernels take as they are."""
+    return (
+        _is_fp4_weight(w1)
+        and _is_fp4_weight(w2)
+        and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
+        and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
+        and w1_bias is None
+        and w2_bias is None
+    )
+
+
+def _decode_mlp_stream(rows, w1, w1_scale, w2, w2_scale, *, activation, x_amax) -> bool:
+    """Whether `_fp4_mlp` experts run the routed ``rows`` (an array or its
+    shape and dtype) through gmm_mlp_stream."""
+    return (
+        envs.TPU_MOE_DECODE_MLP_STREAM
+        and x_amax is None
+        # gmm_v2's decode-tile condition (calculate_tiling).
+        and rows.shape[0] <= min(FP8_DECODE_MAX_M, FP8_DECODE_TILE_M * w1.shape[0])
+        and gmm_mlp_stream.supported(rows, w1, w1_scale, w2, w2_scale, activation)
+    )
+
+
 def moe_gmm(
     x: jax.Array,
     w1: jax.Array,
@@ -676,6 +706,7 @@ def moe_gmm(
     rhs_quant_dtype: jnp.dtype | None = None,
     shared_down: SharedDown | None = None,
     x_amax: jax.Array | None = None,
+    gathers_rows: bool = False,
 ) -> jax.Array:
     """Run grouped GEMM for routed tokens and reduce back to tokens, plus
     the shared expert's down projection when ``shared_down`` is given (the
@@ -683,6 +714,10 @@ def moe_gmm(
 
     ``x_amax``: ``x`` holds e4m3 rows of bf16 rows whose amax it gives, as
     gmm_v2's ``lhs_amax`` takes them; the output is bf16.
+
+    ``gathers_rows``: ``x`` holds the tokens, unpermuted, and gmm_mlp_stream
+    gathers the routed rows itself (the caller checked `_decode_mlp_stream`
+    for them).
 
     The valid-mask gating below is a no-op for non-EP runs (mask is all
     True) and keeps the single code path uniform for both EP and non-EP.
@@ -694,20 +729,20 @@ def moe_gmm(
     topk_weights = topk_weights_flat.reshape((num_tokens, topk))
     valid_mask = valid_mask_flat.reshape((num_tokens, topk))
 
-    if (
-        _is_fp4_weight(w1)
-        and _is_fp4_weight(w2)
-        and get_packing_factor(w1.dtype, rhs_quant_dtype) == 1
-        and get_packing_factor(w2.dtype, rhs_quant_dtype) == 1
-        and w1_bias is None
-        and w2_bias is None
-    ):
-        if (
-            envs.TPU_MOE_DECODE_MLP_STREAM
-            and x_amax is None
-            # gmm_v2's decode-tile condition (calculate_tiling).
-            and x.shape[0] <= min(FP8_DECODE_MAX_M, FP8_DECODE_TILE_M * w1.shape[0])
-            and gmm_mlp_stream.supported(x, w1, w1_scale, w2, w2_scale, activation)
+    if gathers_rows:
+        gmm2_res = gmm_mlp_stream.gmm_mlp_stream(
+            x,
+            w1,
+            w2,
+            group_sizes,
+            w1_scale,
+            w2_scale,
+            fuse_act=activation,
+            revert=argsort_revert_indices,
+        )
+    elif _fp4_mlp(w1, w2, w1_bias, w2_bias, rhs_quant_dtype):
+        if _decode_mlp_stream(
+            x, w1, w1_scale, w2, w2_scale, activation=activation, x_amax=x_amax
         ):
             gmm2_res = gmm_mlp_stream.gmm_mlp_stream(
                 x, w1, w2, group_sizes, w1_scale, w2_scale, fuse_act=activation
@@ -1411,6 +1446,26 @@ def fused_moe_func(
         activation=activation,
         ragged_permute=ragged_permute,
     )
+    # One-hot EP steps whose routed rows gmm_mlp_stream takes: it gathers them
+    # from the tokens, so no permuted copy round-trips HBM.
+    gathers_rows = (
+        use_ep
+        and use_sparse_core
+        and not ragged_permute
+        and padded_hidden_size == hidden_size
+        and hidden_states.dtype == jnp.bfloat16
+        and _fp4_mlp(w1, w2, w1_bias, w2_bias, rhs_quant_dtype)
+        and _decode_mlp_stream(
+            jax.ShapeDtypeStruct((num_tokens * topk, hidden_size), hidden_states.dtype),
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            activation=activation,
+            x_amax=None,
+        )
+        and gmm_mlp_stream.gathers(num_tokens, topk, w1)
+    )
     (
         x,
         group_sizes,
@@ -1432,6 +1487,7 @@ def fused_moe_func(
         # The rows' amax gathered beside them: a TensorCore gather of 32-bit
         # scalars runs at ~5 ns a row (178 us for 32768 rows, tpu7x).
         side_rows=None if e4m3_rows is None else e4m3_rows[1],
+        gathers_rows=gathers_rows,
     )
     if shared_down is not None and ragged_permute:
         # The whole shared activation before gate_up: it fills the wait on
@@ -1461,6 +1517,7 @@ def fused_moe_func(
         rhs_quant_dtype=rhs_quant_dtype,
         shared_down=shared_down if padded_hidden_size == hidden_size else None,
         x_amax=x_amax,
+        gathers_rows=gathers_rows,
     )
     if padded_hidden_size != hidden_size:
         return _add_shared_down(x[:num_tokens, :hidden_size], shared_down)
