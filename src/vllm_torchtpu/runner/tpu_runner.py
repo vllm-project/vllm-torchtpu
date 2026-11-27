@@ -184,11 +184,13 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabl
 from vllm_torchtpu.runner import (
     chunk_processors,
     greedy_top_tokens,
+    host_trims,
     prompt_logprobs,
     runner_options,
     spec_boundary_state,
     thinking_budget_tracker,
 )
+from vllm_torchtpu.runner import fast_forward_context as _ffc
 from vllm_torchtpu.runner import min_tokens as min_tokens_mask
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
@@ -1518,6 +1520,11 @@ class TPUModelRunner(GPUModelRunner):
         )
         logger.info("Runner stage timing: %s", "on" if stage_timing else "off")
         self._stage_timing = RunnerStageTiming(profiler_rank, enabled=stage_timing)
+        # The batch-1 host trims and the process-wide tpu_runner settings.
+        host_trims.configure(self.vllm_config)
+        # Steps since the KV connector's stats were last polled under the
+        # batch-1 rule (`get_finished_kv_transfers`).
+        self._conn_stats_step = 0
 
     @staticmethod
     def _stage_timing_enabled(
@@ -1701,8 +1708,23 @@ class TPUModelRunner(GPUModelRunner):
         # forever -> the engine busy-spins / hangs. Mirrors
         # KVConnectorModelRunnerMixin._get_kv_connector_output.
         worker_meta = kv_connector.build_connector_worker_meta()
-        kv_connector_stats = kv_connector.get_kv_connector_stats()
+        if host_trims.CONN_STATS_EVERY > 1:
+            # Batch-1 rule (runner.host_trims): poll connector stats every N
+            # steps. Samples accumulate in the connector until the next poll,
+            # so the totals the scheduler sees are unchanged; only their
+            # cadence is.
+            self._conn_stats_step += 1
+            stats_due = self._conn_stats_step % host_trims.CONN_STATS_EVERY == 0
+            kv_connector_stats = (
+                kv_connector.get_kv_connector_stats() if stats_due else None
+            )
+        else:
+            stats_due = True
+            kv_connector_stats = kv_connector.get_kv_connector_stats()
         cpu_samples, device_samples = self._stage_timing.take_samples()
+        if not stats_due and (cpu_samples or device_samples):
+            # Runner timings ride on the connector stats: poll them now.
+            kv_connector_stats = kv_connector.get_kv_connector_stats()
         if cpu_samples or device_samples:
             # Preserve connector-owned stats; discard timings without a TPU sink.
             stats_to_visit = [kv_connector_stats]
@@ -5135,6 +5157,8 @@ class TPUModelRunner(GPUModelRunner):
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if host_trims.STEP_HOOK:
+            host_trims.on_step()
         if self._adaptive_verification is not None:
             # Before anything reads the step layout, the DP token sync
             # included: the rest of the step runs on the trimmed copy.
@@ -5465,7 +5489,11 @@ class TPUModelRunner(GPUModelRunner):
                     num_reqs=num_reqs,
                     **trace_kwargs,
                 ),
-                set_forward_context(
+                (
+                    _ffc.fast_set_forward_context
+                    if _ffc.enabled()
+                    else set_forward_context
+                )(
                     attn_metadata,
                     self.vllm_config,
                     num_tokens=num_tokens_padded,

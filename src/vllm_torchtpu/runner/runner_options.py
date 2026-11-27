@@ -15,8 +15,9 @@
 
     --additional-config '{"tpu_runner": {"stage_timing": false}}'
 
-The options only steer host-side telemetry and never change a compiled
-program, so the section stays out of the compile-cache key
+The options only steer the host (telemetry and process-wide interpreter
+settings) and never change a compiled program, so the section stays out of
+the compile-cache key
 (``HASH_IGNORED_ADDITIONAL_CONFIG_KEYS``). Parse once at init with :func:`get`.
 """
 
@@ -39,6 +40,30 @@ class RunnerOptions:
     those connectors' statistics are unchanged; set it to false to save the
     per-stage event records, which cost about 0.4-0.5 ms per decode step at
     batch 1-2 under P/D."""
+
+    gc_freeze: bool = False
+    """After 500 steps, run ``gc.collect()`` and ``gc.freeze()`` and raise the
+    gen-0 collection threshold to 50000, so Python's cyclic GC runs rarely in
+    the decode loop (``runner.host_trims``). A trade-off for small-batch
+    decode, off by default: it applies to every thread of the process, and
+    objects created after the freeze are collected less often."""
+
+    switch_interval_us: int = 0
+    """Python's thread switch interval (``sys.setswitchinterval``) in
+    microseconds, so a background thread (output, connector or submit thread)
+    cannot hold the GIL for long while the step loop waits on it. 0 keeps
+    Python's 5 ms default. A trade-off for small-batch decode: it applies to
+    every thread of the process, and a shorter interval adds switching
+    overhead to busy threads."""
+
+    def __post_init__(self) -> None:
+        # Here, not in parse(): get() builds the options through
+        # config_section without calling parse().
+        if self.switch_interval_us < 0:
+            raise ValueError(
+                f"additional_config.{SECTION}.switch_interval_us must be >= 0, "
+                f"got {self.switch_interval_us}"
+            )
 
 
 def parse(raw: Any) -> RunnerOptions:

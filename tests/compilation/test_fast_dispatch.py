@@ -85,6 +85,17 @@ def test_options_are_strict(raw, message):
         compile_options.parse(raw)
 
 
+def test_get_reads_the_section():
+    on = compile_options.get(_config({"fast_compiled_call": True}))
+    assert on == CompileOptions(fast_compiled_call=True)
+    assert compile_options.get(None) == CompileOptions()
+    # An additional_config that is not a dict gives the defaults, as it does
+    # for every section read through config_section.get.
+    assert compile_options.get(SimpleNamespace(additional_config=None)) == (
+        CompileOptions()
+    )
+
+
 def test_platform_import_leaves_torch_compile_alone():
     """Nothing in the package replaces torch.compile: importing the platform,
     the worker and the runner, which decorate their compiled functions, keeps

@@ -36,7 +36,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
@@ -110,6 +110,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     derive_gdn_head_geometry,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner import host_trims
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -592,8 +593,28 @@ def stage3_fa_raiden_id_fields(
     }
 
 
-def _use_raiden_stage3_transport() -> bool:
+# Under the batch-1 rule (runner.host_trims) the per-step connector hot path
+# asks these process-constant env predicates several times per decode step;
+# cache each one's first answer for the life of the process.
+_env_predicate_cache: dict[str, bool] = {}
+
+
+def _cached_env_predicate(name: str, compute: Callable[[], bool]) -> bool:
+    """`compute()`, answered once per process under the batch-1 rule."""
+    if not host_trims.ENABLED:
+        return compute()
+    v = _env_predicate_cache.get(name)
+    if v is None:
+        v = _env_predicate_cache[name] = compute()
+    return v
+
+
+def _raiden_stage3_transport() -> bool:
     return str(tpu_envs.TPU_KV_RESHARD_TRANSPORT).strip().lower() == "raiden"
+
+
+def _use_raiden_stage3_transport() -> bool:
+    return _cached_env_predicate("stage3", _raiden_stage3_transport)
 
 
 def _use_per_layer_pool_tags() -> bool:
@@ -705,7 +726,7 @@ def _resolved_reshard_controller_address(dp_rank: int) -> str:
 
 
 def _use_raiden_glm_admission() -> bool:
-    return tpu_envs.use_raiden_glm_admission()
+    return _cached_env_predicate("glm", tpu_envs.use_raiden_glm_admission)
 
 
 def _use_raiden_dsv4_admission() -> bool:

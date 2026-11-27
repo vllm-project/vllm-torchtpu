@@ -202,10 +202,11 @@ def test_tail_priming_is_byte_identical(build):
 
 def test_safe_tail_falls_back_on_partial_utf8_and_empty(tok):
     emoji = tok.encode("🚀").ids
+    # A prompt ending inside the character needs it split over several ids.
+    assert len(emoji) > 1, emoji
     prompt = tok.encode("hello world, this is a test ").ids
-    if len(emoji) > 1:
-        p = prompt + emoji[:-1]
-        assert ff.safe_prompt_tail(tok, p, True, 8) is p
+    p = prompt + emoji[:-1]
+    assert ff.safe_prompt_tail(tok, p, True, 8) is p
     eos = tok.token_to_id("<|im_end|>")
     p = prompt + [eos] * 10
     assert ff.safe_prompt_tail(tok, p, True, 8) is p  # tail decodes to ""

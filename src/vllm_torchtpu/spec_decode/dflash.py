@@ -990,7 +990,10 @@ class DFlashProposer:
         for _ in range(num_chunks):
             self._dp_dummy_forward()
 
-    @tpu_compile
+    # The draft layers' attention metadata arrives as arguments, which the
+    # guard memo keys by identity, and the program depends on the block tables
+    # inside them, so every call runs the guard check.
+    @tpu_compile(guard_memo=False)
     def _tpu_precompute_and_update_kv_cache(
         self,
         hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor] | torch.Tensor,
@@ -1102,7 +1105,10 @@ class DFlashProposer:
 
         return hidden_states
 
-    @tpu_compile
+    # The draft model reads its attention metadata from vLLM's forward
+    # context, not from an argument, so a guard-memo hit could run the program
+    # compiled for another block-table width (max_model_len vs most_model_len).
+    @tpu_compile(guard_memo=False)
     def _dflash_forward_and_sample(
         self,
         input_ids: torch.Tensor,
