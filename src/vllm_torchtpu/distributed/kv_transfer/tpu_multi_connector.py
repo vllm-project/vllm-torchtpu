@@ -123,9 +123,10 @@ class TPUMultiConnector(MultiConnector):
         Upstream's MultiConnector requires every child. The offloading child
         restores the lagging recurrent state from the host tier by itself, so
         a disagg producer next to it (which never loads) must not veto the
-        capability. The pipeline chunk scheduler's local-hit lookup, which a
-        follow-up change adds, then asks that child, through
-        ``resolve_divergent_local_hit_tokens``, how much of the hit to keep.
+        capability. The pipeline chunk scheduler's local-hit lookup
+        (``TpuPipelineChunkScheduler._get_local_prefix_cache_hit``) then asks
+        that child, through ``resolve_divergent_local_hit_tokens``, how much
+        of the hit to keep.
 
         This applies only on a producer whose kv_connector_extra_config sets
         producer_divergent_hits; otherwise upstream's every-child rule holds,
@@ -141,7 +142,7 @@ class TPUMultiConnector(MultiConnector):
         requests of all children, and each child's worker metadata in its
         slot, which ``update_connector_output`` hands back to that child.
         None when no child has anything (asked by the pipeline chunk
-        scheduler's prefix-aware admission, which a follow-up change adds)."""
+        scheduler's prefix-aware admission at the start of each step)."""
         finished_recving: set[str] = set()
         metadata: list[KVConnectorWorkerMetadata | None] = []
         polled = False
@@ -171,8 +172,7 @@ class TPUMultiConnector(MultiConnector):
         block_size: int,
     ) -> int | None:
         """Returns the first child's answer; None when no child can serve it
-        (asked by the pipeline chunk scheduler's local-hit lookup, which a
-        follow-up change adds)."""
+        (asked by the pipeline chunk scheduler's local-hit lookup)."""
         for c in self._connectors:
             fn = getattr(c, "resolve_divergent_local_hit_tokens", None)
             if fn is not None:

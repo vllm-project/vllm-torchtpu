@@ -13,9 +13,9 @@
 # limitations under the License.
 """The offloading scheduler's host-tier hit estimate.
 
-A follow-up change makes ``TpuPipelineChunkScheduler._external_warmth`` rank
-waiting requests by it, so a request whose prefix is in the host tier is not
-sorted as a cold prompt. These tests run the real lookup (upstream
+``TpuPipelineChunkScheduler._external_warmth`` ranks waiting requests by
+it, so a request whose prefix is in the host tier is not sorted as a cold
+prompt. These tests run the real lookup (upstream
 OffloadingConnectorScheduler) and the real RaidenOffloadingManager over the
 fake store, on a full-attention group and a Mamba group, as in
 TestDivergedHybridHitLookup.

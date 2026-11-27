@@ -236,8 +236,8 @@ class TestTPUMultiConnectorDivergentHitWarning:
 
 
 class TestTPUMultiConnectorHybridHitForwarding:
-    """The prefix-hit hooks on the connector. No scheduler in this tree calls
-    them yet; a follow-up change makes the pipeline chunk scheduler call them."""
+    """The prefix-hit hooks on the connector, which the pipeline chunk
+    scheduler's prefix-aware admission calls."""
 
     @staticmethod
     def _multi(*children, producer_divergent_hits=True):

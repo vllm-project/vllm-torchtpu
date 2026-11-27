@@ -743,9 +743,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     ) -> int:
         """Host-tier tokens past ``num_local_tokens`` that a lookup would load.
 
-        A follow-up change adds the caller, the pipeline chunk scheduler's
-        ``_external_warmth``, which it uses for its waiting sort, its
-        warmest-first promotion and its pending-work estimate. Without an
+        The pipeline chunk scheduler's ``_external_warmth`` asks it for its
+        waiting sort, its warmest-first promotion and its pending-work
+        estimate. Without an
         answer, a request whose prefix is in the host tier but no longer in HBM
         is ranked as a cold prompt and waits behind cheaper work while its
         host-tier entries age towards eviction.
@@ -817,9 +817,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         in HBM when HBM has a divergent hybrid hit (FullAttention > Mamba), or
         None if Raiden CPU cannot advance past ``num_reconciled``.
 
-        The pipeline chunk scheduler's local-hit lookup, which a follow-up
-        change adds, asks this when the connector reports divergent local
-        hybrid hits."""
+        The pipeline chunk scheduler's local-hit lookup
+        (``TpuPipelineChunkScheduler._get_local_prefix_cache_hit``) asks this
+        when the connector reports divergent local hybrid hits."""
         if getattr(request, "skip_reading_prefix_cache", False):
             return None
         req_status = self._req_status.get(request.request_id)

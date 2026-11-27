@@ -47,6 +47,7 @@ from vllm_torchtpu.core.pp_chunk_scheduler import (
 from vllm_torchtpu.core.pp_chunks import StepCostModel, step_limit
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 from vllm_torchtpu.models import qwen3_5
+from vllm_torchtpu.offload import raiden_connector
 from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
 BUCKETS = [4096, 8192, 12288, 16384]
@@ -778,6 +779,8 @@ def test_prefix_aware_resolves_a_divergent_hit_through_the_connector():
         got = s._get_local_prefix_cache_hit(request, 12288)
     assert got == ("blocks[:4096]", 4096, 0, True)
     assert request._tpu_local_hit_tokens == 4096
+    # The Raiden offloading connector reads the hit under the same name.
+    assert raiden_connector._local_hit_tokens(request) == 4096
     assert seen == [12288]
 
 
