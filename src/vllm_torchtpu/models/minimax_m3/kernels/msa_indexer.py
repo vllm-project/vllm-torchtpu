@@ -1018,6 +1018,268 @@ def _kernel_v3(
         pl.when(step == num_steps - 1)(flush_pending)
 
 
+class FusedSelect(NamedTuple):
+    """A tile class's local top-k picked inside its score kernel
+    (TPU_MINIMAX_M3_INDEXER_FUSED_TOPK, kernel v3, column-major scores).
+
+    The fields are `msa_dcp.local_candidates`' arguments; the selection runs
+    the ops of its pretransposed kernel (`msa_dcp._candidates_kernel_t`) on
+    the tile's ``[pages, block_q]`` scores, kept in VMEM over the tile's page
+    groups, so the picks are bit-identical and the scores never reach HBM.
+    """
+
+    topk: int
+    block_size: int
+    init_blocks: int
+    local_blocks: int
+    dcp: int
+    rank: jax.Array  # int32 [1], traced (one program for every rank)
+    # (tile_seq [tiles], tile_row0 [tiles], block_q) -> int32 [tiles * block_q]
+    # position of each column's query token
+    pos: Callable | None
+    widths: Callable  # padded pages -> static scan widths
+    unrolled_width: int
+    pick_unroll: int
+    block_rows: int  # lanes per selection block (one width each)
+    forced_local: float
+    forced_init: float
+
+
+def _select_tile(
+    scores_ref,  # [P, Bq] f32 VMEM: the tile's block scores
+    pos_ref,  # [1, Bq] each column's token position
+    widths_ref,  # SMEM [tiles * Bq / sub_rows] scan width of each lane block
+    rank_ref,  # SMEM [1]
+    score_out_ref,  # [topk, Bq]
+    block_out_ref,  # [topk, Bq]
+    tile,
+    *,
+    select: FusedSelect,
+    widths: tuple[int, ...],
+    sub_rows: int,
+):
+    """`msa_dcp._candidates_kernel_t` (pretransposed) on each `sub_rows`-lane
+    block of the tile: the same masks, picks and tie order."""
+    block_q = pos_ref.shape[1]
+    num_sub = block_q // sub_rows
+    rank = rank_ref[0]
+    dcp, topk = select.dcp, select.topk
+
+    def run(j, width):
+        lanes = (
+            pl.ds(pl.multiple_of(j * sub_rows, sub_rows), sub_rows)
+            if num_sub > 1
+            else pl.ds(0, block_q)
+        )
+        num_visible = pos_ref[:, lanes] // select.block_size + 1  # [1, rows]
+        s = scores_ref[pl.ds(0, width), lanes]
+        cols = jax.lax.broadcasted_iota(jnp.int32, (width, sub_rows), 0)
+        blocks = cols * dcp + rank
+        visible = blocks < num_visible
+        s = jnp.where(visible, s, -jnp.inf)
+        s = jnp.where(
+            visible & (blocks >= num_visible - select.local_blocks),
+            select.forced_local,
+            s,
+        )
+        s = jnp.where(visible & (blocks < select.init_blocks), select.forced_init, s)
+        col_ids = cols.astype(jnp.float32)
+
+        def pick(k, s):
+            best_score = jnp.max(s, axis=0, keepdims=True)
+            best = jnp.min(
+                jnp.where(s == best_score, col_ids, float(width)),
+                axis=0,
+                keepdims=True,
+            )
+            score_out_ref[pl.ds(k, 1), lanes] = best_score
+            block_out_ref[pl.ds(k, 1), lanes] = jnp.where(
+                best_score > -jnp.inf, best.astype(jnp.int32) * dcp + rank, -1
+            )
+            return jnp.where(col_ids == best, -jnp.inf, s)
+
+        if width <= select.unrolled_width:
+            for k in range(topk):
+                s = pick(k, s)
+        else:
+            jax.lax.fori_loop(0, topk, pick, s, unroll=select.pick_unroll)
+
+    def lane_block(j):
+        width_now = widths_ref[tile * num_sub + j]
+        for width in widths:
+            pl.when(width_now == width)(functools.partial(run, j, width))
+
+    if num_sub == 1:
+        lane_block(0)
+    else:
+
+        def loop_body(j, carry):
+            lane_block(j)
+            return carry
+
+        jax.lax.fori_loop(0, num_sub, loop_body, 0)
+
+
+def _kernel_v3_select(
+    # Scalar prefetch
+    work_ref,
+    tile_seq_ref,
+    block_tables_ref,
+    seq_pages_ref,
+    widths_ref,  # [tiles * Bq / sub_rows] scan width of each lane block
+    rank_ref,  # [1]
+    # In
+    q_ref,
+    cache_ref,
+    pos_ref,  # [1, Bq]
+    # Out
+    score_out_ref,  # [topk, Bq]
+    block_out_ref,  # [topk, Bq]
+    # Scratch
+    buf,
+    sems,
+    scores_ref,  # [P, Bq] f32: the tile's scores, all its page groups
+    *,
+    select: FusedSelect,
+    widths: tuple[int, ...],
+    sub_rows: int,
+    **v3_kwargs,
+):
+    """`_kernel_v3` (column-major scores) writing each group's scores into a
+    VMEM block of the whole tile instead of an HBM output; after the tile's
+    last group, `_select_tile` picks its top-k. The output blocks follow the
+    tile, so they are written back once per tile."""
+    pages_per_step = buf.shape[1]
+    step, num_steps = pl.program_id(0), pl.num_programs(0)
+    entry = work_ref[step]
+    col0 = pl.multiple_of((entry & _GROUP_MASK) * pages_per_step, pages_per_step)
+    _kernel_v3(
+        work_ref,
+        tile_seq_ref,
+        block_tables_ref,
+        seq_pages_ref,
+        q_ref,
+        cache_ref,
+        scores_ref.at[pl.ds(col0, pages_per_step)],
+        buf,
+        sems,
+        **v3_kwargs,
+    )
+    tile = entry >> _TILE_SHIFT
+    next_tile = work_ref[jnp.minimum(step + 1, num_steps - 1)] >> _TILE_SHIFT
+
+    @pl.when((step == num_steps - 1) | (next_tile != tile))
+    def _():
+        _select_tile(
+            scores_ref,
+            pos_ref,
+            widths_ref,
+            rank_ref,
+            score_out_ref,
+            block_out_ref,
+            tile,
+            select=select,
+            widths=widths,
+            sub_rows=sub_rows,
+        )
+
+
+def _fused_select_call(
+    select: FusedSelect,
+    v3_kwargs: dict,
+    *,
+    work,
+    tile_info,
+    tile_seq,
+    tile_row0,
+    table,
+    seq_pages,
+    q_rows,
+    index_cache,
+    q_spec,
+    grid,
+    slots,
+    pages_per_step,
+    padded_pages,
+    block_q,
+    max_tiles,
+    interpret,
+) -> tuple[jax.Array, jax.Array]:
+    """`_kernel_v3_select` over a tile class's work list: ``(picked scores,
+    picked blocks)``, ``[topk, max_tiles * block_q]`` each, as
+    `msa_dcp.local_candidates` returns them for its pretransposed scores
+    (before its transpose). Columns of tiles past the class's live ones are
+    not written."""
+    _, rows_per_page, _, head_dim = index_cache.shape
+    num_cols = max_tiles * block_q
+    pos = select.pos(tile_seq, tile_row0, block_q).astype(jnp.int32)
+    widths = tuple(select.widths(padded_pages))
+    # Lane blocks of `block_rows` (as `local_candidates`' row blocks), or
+    # the whole tile if it does not split into them: the width a block
+    # scans changes its cost, never its picks.
+    sub_rows = select.block_rows if block_q % select.block_rows == 0 else block_q
+    num_sub = num_cols // sub_rows
+    last_pos = jnp.max(pos.reshape(num_sub, sub_rows), axis=1)
+    needed = -(-(last_pos // select.block_size + 1) // select.dcp)
+    w = jnp.asarray(widths, jnp.int32)
+    row_widths = jnp.min(jnp.where(w >= needed[:, None], w, padded_pages), axis=1)
+    topk = select.topk
+
+    def tile_block(w, work, *_):
+        return (0, work[w] >> _TILE_SHIFT)
+
+    out_spec = pl.BlockSpec((topk, block_q), tile_block)
+    scores_bytes = padded_pages * block_q * 4
+    return pl.pallas_call(
+        functools.partial(
+            _kernel_v3_select,
+            select=select,
+            widths=widths,
+            sub_rows=sub_rows,
+            **v3_kwargs,
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=6,
+            grid=grid,
+            in_specs=[
+                q_spec,
+                pl.BlockSpec(memory_space=pl.ANY),
+                pl.BlockSpec((1, block_q), tile_block),
+            ],
+            out_specs=[out_spec, out_spec],
+            scratch_shapes=[
+                pltpu.VMEM(
+                    (slots, pages_per_step, rows_per_page, head_dim),
+                    jnp.uint32,
+                ),
+                pltpu.SemaphoreType.DMA((slots,)),
+                pltpu.VMEM((padded_pages, block_q), jnp.float32),
+            ],
+        ),
+        out_shape=[
+            jax.ShapeDtypeStruct((topk, num_cols), jnp.float32),
+            jax.ShapeDtypeStruct((topk, num_cols), jnp.int32),
+        ],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            disable_bounds_checks=True,
+            vmem_limit_bytes=scores_bytes + (32 << 20),
+        ),
+        interpret=interpret,
+        name="minimax_m3_msa_block_candidates",
+    )(
+        work,
+        tile_info,
+        table,
+        seq_pages,
+        row_widths,
+        select.rank,
+        q_rows,
+        index_cache,
+        pos.reshape(1, num_cols),
+    )
+
+
 _KERNELS = {"v1": _kernel_v1, "v2": _kernel_v2}
 
 
@@ -1090,12 +1352,18 @@ def _class_scores(
     scale_row=None,
     q_pad=None,
     fp8_q=False,
+    select: FusedSelect | None = None,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
     them as ``[tiles * block_q, P]`` instead, so a token's scores are one row.
     The query rows are padded by ``q_pad >= block_q`` rows (default
-    `block_q`): classes sharing it share one padded copy."""
+    `block_q`): classes sharing it share one padded copy.
+
+    With `select` (kernel v3, column-major) the kernel picks each tile's
+    local top-k itself: `scores` is then ``(picked scores [topk, tiles *
+    block_q] f32, picked blocks [topk, tiles * block_q] i32)``, the
+    transposed outputs of `msa_dcp.local_candidates` on the scores."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = _page_tokens(rows_per_page, index_cache.dtype)
@@ -1207,6 +1475,11 @@ def _class_scores(
     params = pltpu.CompilerParams(
         dimension_semantics=("arbitrary",), disable_bounds_checks=kernel == "v3"
     )
+    if select is not None and (kernel != "v3" or token_major or fp4):
+        raise NotImplementedError(
+            "a fused top-k needs kernel v3, column-major scores and pages "
+            "with folded scales (or fp8 / bf16 pages)"
+        )
     if kernel == "v3":
         if fp4:
             raise NotImplementedError(
@@ -1228,6 +1501,7 @@ def _class_scores(
             # The resident output must fit VMEM next to the ring.
             if dopt.defer and (
                 not token_major
+                or select is not None
                 or dopt.quad
                 or dopt.tail
                 or dopt.token_scores
@@ -1250,43 +1524,65 @@ def _class_scores(
                 + ring
                 + (16 << 20),
             )
-        scores_t = pl.pallas_call(
-            functools.partial(
-                _kernel_v3,
-                transposed=token_major,
-                # fp8 x fp8 only for fp8 / 4-bit pages (keys exact in fp8).
-                fp8_q=fp8_q and index_cache.dtype in (jnp.float8_e4m3fn, jnp.uint8),
-                fast_issue=dopt.issue,
-                quad=dopt.quad,
-                noclamp=dopt.noclamp,
-                full_bodies=dopt.full,
-                tail=dopt.tail,
-                every_count=dopt.every_count,
-                token_scores=dopt.token_scores,
-                defer=dopt.defer,
-                lane_maxima=dopt.lanes
-                and token_major
-                and not (dopt.tail or dopt.quad or dopt.token_scores or fp8_q),
-            ),
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=4,
+        v3_kwargs = dict(
+            transposed=token_major,
+            # fp8 x fp8 only for fp8 / 4-bit pages (keys exact in fp8).
+            fp8_q=fp8_q and index_cache.dtype in (jnp.float8_e4m3fn, jnp.uint8),
+            fast_issue=dopt.issue,
+            quad=dopt.quad,
+            noclamp=dopt.noclamp,
+            full_bodies=dopt.full,
+            tail=dopt.tail,
+            every_count=dopt.every_count,
+            token_scores=dopt.token_scores,
+            defer=dopt.defer,
+            lane_maxima=dopt.lanes
+            and token_major
+            and not (dopt.tail or dopt.quad or dopt.token_scores or fp8_q),
+        )
+        if select is not None:
+            scores_t = _fused_select_call(
+                select,
+                v3_kwargs,
+                work=work,
+                tile_info=tile_info,
+                tile_seq=tile_seq,
+                tile_row0=tile_row0,
+                table=table,
+                seq_pages=seq_pages,
+                q_rows=q_rows,
+                index_cache=index_cache,
+                q_spec=grid_spec.in_specs[0],
                 grid=grid_spec.grid,
-                in_specs=[grid_spec.in_specs[0], pl.BlockSpec(memory_space=pl.ANY)],
-                out_specs=out_specs,
-                scratch_shapes=[
-                    pltpu.VMEM(
-                        (dopt.slots, pages_per_step, rows_per_page, head_dim),
-                        jnp.uint32,
-                    ),
-                    pltpu.SemaphoreType.DMA((dopt.slots,)),
-                    *defer_scratch,
-                ],
-            ),
-            out_shape=out_shape,
-            compiler_params=params,
-            interpret=interpret,
-            name="minimax_m3_msa_block_scores",
-        )(work, tile_info, table, seq_pages, q_rows, index_cache)
+                slots=dopt.slots,
+                pages_per_step=pages_per_step,
+                padded_pages=padded_pages,
+                block_q=block_q,
+                max_tiles=max_tiles,
+                interpret=interpret,
+            )
+        else:
+            scores_t = pl.pallas_call(
+                functools.partial(_kernel_v3, **v3_kwargs),
+                grid_spec=pltpu.PrefetchScalarGridSpec(
+                    num_scalar_prefetch=4,
+                    grid=grid_spec.grid,
+                    in_specs=[grid_spec.in_specs[0], pl.BlockSpec(memory_space=pl.ANY)],
+                    out_specs=out_specs,
+                    scratch_shapes=[
+                        pltpu.VMEM(
+                            (dopt.slots, pages_per_step, rows_per_page, head_dim),
+                            jnp.uint32,
+                        ),
+                        pltpu.SemaphoreType.DMA((dopt.slots,)),
+                        *defer_scratch,
+                    ],
+                ),
+                out_shape=out_shape,
+                compiler_params=params,
+                interpret=interpret,
+                name="minimax_m3_msa_block_scores",
+            )(work, tile_info, table, seq_pages, q_rows, index_cache)
     else:
         kernel_fn = _KERNELS[kernel]
         if fp4:

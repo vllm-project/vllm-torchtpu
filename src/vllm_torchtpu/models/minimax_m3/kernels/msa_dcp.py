@@ -585,10 +585,14 @@ def _class_candidates(
     interpret: bool,
     scale_cache: jax.Array | None,
     scale_row: int | None,
+    fused_select: "msa_indexer.FusedSelect | None" = None,
 ) -> jax.Array:
     """Packed candidates ``[T, G * 2 * topk]`` (`pack_candidates` per head,
     head-major) of a prefill-sized step: each `msa_indexer` tile class picks
     in the layout it scored in, and only the picks go back to token order.
+    With `fused_select` (TPU_MINIMAX_M3_INDEXER_FUSED_TOPK) the large class
+    picks inside its score kernel (`msa_indexer.FusedSelect`): the same
+    candidates, bit for bit.
     Gathering the classes' ``[P, columns]`` scores to ``[T, P]`` first (a
     concatenate, column gather and transpose, ~110 us per layer at c48)
     moved 32x the bytes, which the transposing pick kernel then turned back.
@@ -621,25 +625,39 @@ def _class_candidates(
     max_num_seqs = q_lens.shape[0]
     seq_of_token = jnp.minimum(seq_id, max_num_seqs - 1)
     picks, cols = [], []
-    for scored, block_q, transposed in (
-        (plan.small(), plan.small_block_q, not plan.token_major),
-        (plan.large(), plan.large_block_q, True),
-    ):
+
+    def columns_pos(tile_seq, tile_row0, block_q):
         # A column's query row sits at offset o of its request's folded rows,
         # token o mod q_len of it: position = len - q_len + o mod q_len.
-        per_tile = functools.partial(msa_indexer.lookup, index=scored.tile_seq)
-        row = scored.tile_row0[:, None] + jnp.arange(block_q, dtype=jnp.int32)[None, :]
+        per_tile = functools.partial(msa_indexer.lookup, index=tile_seq)
+        row = tile_row0[:, None] + jnp.arange(block_q, dtype=jnp.int32)[None, :]
         offset = row - per_tile(folded_cu[:-1])[:, None]
         q_len = jnp.maximum(per_tile(q_lens), 1)[:, None]
-        col_pos = (per_tile(seq_lens)[:, None] - q_len + offset % q_len).reshape(-1)
-        # A class's scores are padded to its worst-case tile count (the large
-        # class: 66 tiles of 512 at 8K tokens for ~14 real ones); pick in
-        # its live tiles only.
-        s, b = candidates(
-            scored.scores if transposed else scored.scores[:, None, :],
-            col_pos,
-            live_rows=scored.num_tiles * block_q,
-        )
+        return (per_tile(seq_lens)[:, None] - q_len + offset % q_len).reshape(-1)
+
+    small = plan.small()
+    large = (
+        plan.large()
+        if fused_select is None
+        else plan.large(select=fused_select._replace(pos=columns_pos))
+    )
+    for scored, block_q, transposed, fused in (
+        (small, plan.small_block_q, not plan.token_major, False),
+        (large, plan.large_block_q, True, fused_select is not None),
+    ):
+        if fused:
+            # The kernel's picks, transposed as `local_candidates` returns them.
+            s, b = (x.T for x in scored.scores)
+        else:
+            col_pos = columns_pos(scored.tile_seq, scored.tile_row0, block_q)
+            # A class's scores are padded to its worst-case tile count (the
+            # large class: 66 tiles of 512 at 8K tokens for ~14 real ones);
+            # pick in its live tiles only.
+            s, b = candidates(
+                scored.scores if transposed else scored.scores[:, None, :],
+                col_pos,
+                live_rows=scored.num_tiles * block_q,
+            )
         picks.append(pack_candidates(s, b))
         # Each head's and token's column in this class (`_class_scores`).
         start = msa_indexer.lookup(scored.tile_start, seq_of_token)[None]
@@ -831,6 +849,23 @@ def msa_write_and_candidates_dcp(
         interpret=interpret,
     )
     if msa_indexer.is_prefill_step(num_heads * num_tokens, max_num_seqs):
+        fused_select = None
+        if envs.TPU_MINIMAX_M3_INDEXER_FUSED_TOPK:
+            fused_select = msa_indexer.FusedSelect(
+                topk=topk,
+                block_size=block_size,
+                init_blocks=init_blocks,
+                local_blocks=local_blocks,
+                dcp=dcp,
+                rank=rank_array(rank),
+                pos=None,  # set per class (`_class_candidates`)
+                widths=functools.partial(_scan_widths, pretransposed=True),
+                unrolled_width=_UNROLLED_WIDTH,
+                pick_unroll=_PICK_UNROLL,
+                block_rows=msa_select.DEFAULT_BLOCK_ROWS,
+                forced_local=msa_select._FORCED_LOCAL_SCORE,
+                forced_init=msa_select._FORCED_INIT_SCORE,
+            )
         packed = _class_candidates(
             index_q,
             index_cache,
@@ -844,6 +879,7 @@ def msa_write_and_candidates_dcp(
             interpret=interpret,
             scale_cache=scale_cache,
             scale_row=scale_row,
+            fused_select=fused_select,
         )
         if fp4:
             return kv_cache, index_cache, scale_cache, packed

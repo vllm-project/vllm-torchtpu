@@ -338,6 +338,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_HP_ROUND_FACTOR: int = 1
     TPU_MINIMAX_M3_DCP_HP_ROW_SPLIT: bool = False
     TPU_MINIMAX_M3_DCP_KV_GATHER_HEAD_MAJOR: bool = False
+    TPU_MINIMAX_M3_INDEXER_FUSED_TOPK: bool = False
     TPU_MINIMAX_M3_DCP_HP_ROUND_LADDER: str = ""
     TPU_MINIMAX_M3_DCP_HEADS_MERGE_A2A_MAX_TOKENS: int = 0
     TPU_MINIMAX_M3_DCP_HP_DECODE_MERGE_A2A: bool = False
@@ -2289,6 +2290,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ~0.18 ms per layer at c64 DCP8 8K steps). Default off.
     "TPU_MINIMAX_M3_DCP_KV_GATHER_HEAD_MAJOR": env_bool(
         "TPU_MINIMAX_M3_DCP_KV_GATHER_HEAD_MAJOR", default=False
+    ),
+    # MiniMax M3 DCP prefill indexer: the large (prefill) tile class picks
+    # each tile's local top-k inside the block-score kernel
+    # (`msa_indexer` FusedSelect): a tile's scores stay in VMEM and the f32
+    # [pages, rows] score matrix never goes to HBM, and the separate
+    # `msa_dcp_candidates` call of that class is dropped. Bit-identical
+    # candidates (same select ops, same column order and ties). Default off.
+    "TPU_MINIMAX_M3_INDEXER_FUSED_TOPK": env_bool(
+        "TPU_MINIMAX_M3_INDEXER_FUSED_TOPK", default=False
     ),
     # MiniMax M3 DCP attention over several KV heads (`msa_dcp_heads`): steps
     # of at most this many rows merge the ranks' partials by one all-to-all
