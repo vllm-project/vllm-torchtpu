@@ -2179,11 +2179,20 @@ class TestInitializeAttentionKernelsThreshold:
     `reorder_batch_threshold`. Sharded drafts keep their K+1-wide decode tile;
     replicated (`draft_tensor_parallel_size == 1`) drafts relocated to the
     local RPA kernel are pinned to 1, which pulls the shared threshold down
-    to 1. A tp=1 draft on a pipeline stage whose target is also tp=1 is not
-    replicated relative to the target: it keeps the target's kernel and its
-    K+1-wide tile."""
+    to 1. A tp=1 draft under a tp=1 target keeps the target's kernel and its
+    K+1-wide tile on a pipeline stage and on a block-major or seq-along-lane
+    pool, which the local kernel cannot read."""
 
-    def _make_runner(self, widths, draft_names=(), draft_tp=2, target_tp=8, pp=1):
+    def _make_runner(
+        self,
+        widths,
+        draft_names=(),
+        draft_tp=2,
+        target_tp=8,
+        pp=1,
+        block_major=False,
+        seq_along_lane=False,
+    ):
         from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 
         runner = MagicMock(spec=TPUModelRunner)
@@ -2204,6 +2213,9 @@ class TestInitializeAttentionKernelsThreshold:
         for name, width in widths.items():
             impl = MagicMock(spec=PallasAttentionBackendImpl)
             impl.decode_query_size = width
+            # The pool layout the impl resolved at construction.
+            impl._bm_kernel = block_major
+            impl._pool_is_seq_along_lane = seq_along_lane
             layers[name] = SimpleNamespace(impl=impl)
         return runner, layers
 
@@ -2258,10 +2270,46 @@ class TestInitializeAttentionKernelsThreshold:
         assert runner.reorder_batch_threshold == 4
 
     def test_draft_on_a_single_stage_tp1_target_keeps_the_local_kernel(self):
-        """Without a pipeline a tp=1 draft under a tp=1 target keeps the
-        local kernel and its 1-wide tile, as before."""
+        """Without a pipeline, on a pool the local kernel reads, a tp=1 draft
+        under a tp=1 target keeps the local kernel and its 1-wide tile."""
         runner, layers = self._make_runner(
             {"target": 4, "draft": 4}, draft_names=("draft",), draft_tp=1, target_tp=1
+        )
+        self._run(runner, layers)
+        assert layers["draft"].impl.decode_query_size == 1
+        assert "_kernel_entry" in vars(layers["draft"].impl)
+
+    @pytest.mark.parametrize(
+        "pool", [dict(block_major=True), dict(seq_along_lane=True)]
+    )
+    def test_draft_on_a_pool_the_local_kernel_refuses_keeps_the_target_kernel(
+        self, pool
+    ):
+        """A single-stage tp=1 target with a block-major or seq-along-lane
+        (HND) pool: the local kernel takes no block_major or kv_layout and
+        refuses that pool when it is built, so the draft keeps the target's
+        kernel, which reads it."""
+        runner, layers = self._make_runner(
+            {"target": 4, "draft": 4},
+            draft_names=("draft",),
+            draft_tp=1,
+            target_tp=1,
+            **pool,
+        )
+        self._run(runner, layers)
+        assert layers["draft"].impl.decode_query_size == 4
+        assert "_kernel_entry" not in vars(layers["draft"].impl)
+        assert runner.reorder_batch_threshold == 4
+
+    def test_draft_under_a_sharded_target_is_replicated_on_any_pool(self):
+        """Under a sharded target the rule is unchanged: a tp=1 draft moves to
+        the local kernel whatever the pool."""
+        runner, layers = self._make_runner(
+            {"target": 4, "draft": 4},
+            draft_names=("draft",),
+            draft_tp=1,
+            target_tp=2,
+            seq_along_lane=True,
         )
         self._run(runner, layers)
         assert layers["draft"].impl.decode_query_size == 1

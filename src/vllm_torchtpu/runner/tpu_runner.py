@@ -6427,21 +6427,27 @@ class TPUModelRunner(GPUModelRunner):
                     # token) are fine in a K+1 tile.
                     # A REPLICATED (tp=1) draft moves to the LOCAL
                     # (non-shard_map) kernel, which is 1-wide; its width is
-                    # folded into the threshold below. On a pipeline stage
-                    # whose target also runs at tp=1 (the PP8 x TP1 prefill
-                    # legs) the draft shares the target's kernel instead: the
-                    # local kernel cannot read every pool layout a stage
-                    # allocates (it has no block-major path), while the
-                    # target's kernel reads the pool as the stage allocated it.
+                    # folded into the threshold below. Under a tp=1 target the
+                    # draft keeps the target's kernel instead, which reads the
+                    # pool as the stage allocated it: on a block-major or
+                    # seq-along-lane (HND) pool, which the local kernel
+                    # refuses at build (it takes no block_major or kv_layout),
+                    # and on a pipeline stage, as the PP8 x TP1 prefill legs
+                    # of the Qwen3.5 validation entries ran it.
                     replicated_draft = False
                     if is_draft:
                         assert self.speculative_config is not None
+                        keeps_target_kernel = (
+                            self.parallel_config.tensor_parallel_size == 1
+                            and (
+                                self.parallel_config.pipeline_parallel_size > 1
+                                or impl._bm_kernel
+                                or impl._pool_is_seq_along_lane
+                            )
+                        )
                         replicated_draft = (
                             self.speculative_config.draft_tensor_parallel_size == 1
-                            and not (
-                                self.parallel_config.tensor_parallel_size == 1
-                                and self.parallel_config.pipeline_parallel_size > 1
-                            )
+                            and not keeps_target_kernel
                         )
                     if replicated_draft:
                         impl.decode_query_size = 1
