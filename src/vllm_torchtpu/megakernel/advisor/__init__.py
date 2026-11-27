@@ -16,12 +16,14 @@
 from __future__ import annotations
 
 from . import (
+    assets,
     calibrate,
     chips,
     cli,
     constants,
     models,
     regimes,
+    report,
     roofline,
     spec_bridge,
     specs,
@@ -63,11 +65,21 @@ from .regimes import (
     advise_regimes,
     recommend_parallelism,
 )
+from .report import (
+    build_bucket_schedule,
+    render_advisor_html,
+    write_advisor_html,
+    write_bucket_schedule,
+)
 from .roofline import evaluate_scopes, experts_hit_busiest
 from .spec_bridge import verify_core_limits_sync
 from .specs import (
+    BUCKET_CONSUMER_STATUS,
+    BUCKET_SCHEDULE_SCHEMA,
     AdvisorReport,
     AdvisorSweepReport,
+    BucketScheduleEntry,
+    BucketScheduleReport,
     DisaggHandoffSpec,
     EfficiencySpec,
     FusionScope,
@@ -101,12 +113,16 @@ from .vmem import (
 )
 
 __all__ = [
+    "BUCKET_CONSUMER_STATUS",
+    "BUCKET_SCHEDULE_SCHEMA",
     "CORE_LIMITS",
     "DEPLOYMENT_PRESETS",
     "MODEL_PRESETS",
     "TPU7X_TOPOLOGIES",
     "AdvisorReport",
     "AdvisorSweepReport",
+    "BucketScheduleEntry",
+    "BucketScheduleReport",
     "CalibrateOptions",
     "CalibrationPayload",
     "CalibrationSourceMeta",
@@ -137,6 +153,8 @@ __all__ = [
     "XPlaneToolUnavailableError",
     "advise",
     "advise_regimes",
+    "assets",
+    "build_bucket_schedule",
     "build_calibrate_arg_parser",
     "build_parser",
     "calibrate",
@@ -163,6 +181,8 @@ __all__ = [
     "models",
     "recommend_parallelism",
     "regimes",
+    "render_advisor_html",
+    "report",
     "resolve_chip_spec",
     "resolve_model_profile",
     "roofline",
@@ -175,4 +195,6 @@ __all__ = [
     "verdict",
     "verify_core_limits_sync",
     "vmem",
+    "write_advisor_html",
+    "write_bucket_schedule",
 ]

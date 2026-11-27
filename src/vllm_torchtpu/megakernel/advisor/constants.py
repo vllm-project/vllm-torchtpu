@@ -363,3 +363,28 @@ SCOPE_HINTS: Mapping[str, str] = {
     "single_layer": "one call per layer",
     "per_op": "one call per operator; activations hand off through HBM",
 }
+SVG_MIN_FONT_PX = 13
+# Width of one glyph as a fraction of font size, a conservative upper bound for
+# the system sans-serif stack on digits, Latin letters, and punctuation.
+SVG_GLYPH_EM = 0.62
+SVG_TICKS: tuple[int, ...] = (1, 8, 64, 512, 4096, 32768)
+# Okabe-Ito colorblind-safe palette; each scope also has its own marker shape.
+SCOPE_MARKS: Mapping[str, tuple[str, str]] = {
+    "whole_step": ("#009E73", "circle"),
+    "layer_group": ("#56B4E9", "diamond"),
+    "single_layer": ("#E69F00", "triangle"),
+    "per_op": ("#CC79A7", "square"),
+}
+PROVENANCE_TAGS: tuple[str, ...] = ("DERIVED", "ASSUMED", "MEASURED")
+MEGAKERNEL_LABELS: Mapping[str, str] = {
+    "whole_step": "WHOLE-STEP MEGAKERNEL",
+    "layer_group": "LAYER-GROUP MEGAKERNEL",
+}
+DECISION_TABLE_COLS = 12
+BYTES_PER_MIB: float = float(1 << 20)
+PHASE_SORT_ORDER: Mapping[str, int] = {
+    "decode": 0,
+    "verify": 1,
+    "mixed": 2,
+    "prefill": 3,
+}

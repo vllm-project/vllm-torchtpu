@@ -58,6 +58,8 @@ python -m vllm_torchtpu.megakernel.advisor calibrate \
 | `--search-layer-groups` | Compare candidate `layer_group` partitions against `per_op`. |
 | `--explain` / `--unresolved` | Print provenance tags and unresolved `ASSUMED` inputs ranked by sensitivity. |
 | `--json [out.json]` | Emit machine-readable JSON output to stdout (when omitted) or `out.json`. |
+| `--html <out.html>` | Write a self-contained static HTML/SVG audit report (with zero JavaScript) to `out.html`. |
+| `--bucket-schedule <out.json>` | Write an advisory `advisor.bucket_schedule.v1` JSON bucket schedule to `out.json` (or `-` for stdout). |
 
 ## Physics & Drift Gates
 
