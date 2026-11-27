@@ -59,23 +59,47 @@ def program_key(args: object) -> tuple:
     seen: dict[int, int] = {}
 
     def key(x: object) -> object:
-        if isinstance(x, torch.Tensor):
+        kind = _KEY_KINDS.get(type(x))
+        if kind is None:
+            kind = _key_kind(type(x))
+        if kind is _TENSOR:
             first = seen.setdefault(id(x), len(seen))
-            return ("T", tuple(x.shape), x.dtype, x.stride(), first)
-        if isinstance(x, (tuple, list)):
-            return (type(x).__name__, *(key(v) for v in x))
-        if isinstance(x, dict):
-            return ("dict", *((k, key(v)) for k, v in x.items()))
-        if dataclasses.is_dataclass(x) and not isinstance(x, type):
-            return (
-                type(x).__name__,
-                *(key(getattr(x, f.name, None)) for f in dataclasses.fields(x)),
-            )
-        if x is None or isinstance(x, (bool, int, float, str, torch.dtype)):
+            return ("T", x.shape, x.dtype, x.stride(), first)  # type: ignore[attr-defined]
+        if kind is _SCALAR:
             return x
-        return type(x).__name__
+        if kind is _SEQUENCE:
+            return (type(x).__name__, *[key(v) for v in x])  # type: ignore[attr-defined]
+        if kind is _DICT:
+            return ("dict", *[(k, key(v)) for k, v in x.items()])  # type: ignore[attr-defined]
+        if kind is _OTHER:
+            return type(x).__name__
+        # A dataclass: `kind` holds its field names.
+        return (type(x).__name__, *[key(getattr(x, f, None)) for f in kind])
 
     return cast(tuple, key(args))
+
+
+# program_key runs on every decode step, several times; it dispatches on a
+# per-type kind instead of re-running the isinstance chain on each leaf.
+_TENSOR, _SCALAR, _SEQUENCE, _DICT, _OTHER = (object() for _ in range(5))
+_KEY_KINDS: dict[type, object] = {}
+
+
+def _key_kind(t: type) -> object:
+    if issubclass(t, torch.Tensor):
+        kind: object = _TENSOR
+    elif issubclass(t, (tuple, list)):
+        kind = _SEQUENCE
+    elif issubclass(t, dict):
+        kind = _DICT
+    elif dataclasses.is_dataclass(t) and not issubclass(t, type):
+        kind = tuple(f.name for f in dataclasses.fields(t))
+    elif t is type(None) or issubclass(t, (bool, int, float, str, torch.dtype)):
+        kind = _SCALAR
+    else:
+        kind = _OTHER
+    _KEY_KINDS[t] = kind
+    return kind
 
 
 def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:
