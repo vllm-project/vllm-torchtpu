@@ -201,7 +201,7 @@ def test_exchange_coalesce_spec(monkeypatch):
     monkeypatch.delenv("TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE", raising=False)
     assert envs.TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE == ""
     assert H.exchange_coalesce() == (False, 0)
-    for spec, want in (("0", (False, 0)), ("1", (True, H._EXCHANGE_FWD_CHUNK)),
+    for spec, want in (("0", (False, 0)), ("1", (False, H._EXCHANGE_FWD_CHUNK)),
                        ("g", (True, 0)), ("c16", (False, 16)), ("g:c64", (True, 64))):
         monkeypatch.setenv("TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE", spec)
         assert H.exchange_coalesce() == want, spec

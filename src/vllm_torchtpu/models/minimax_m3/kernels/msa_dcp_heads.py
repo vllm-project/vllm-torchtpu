@@ -767,9 +767,12 @@ _exchange_coalesce_logged = False
 
 def exchange_coalesce() -> tuple[bool, int]:
     """``(group_direct, fwd_chunk)`` from TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE
-    (read at trace time via `envs`): empty / "0" -> off; "1" -> group-direct
-    and `_EXCHANGE_FWD_CHUNK`-slot forwarding copies; else ':'-separated
-    tokens "g" (group-direct) and "c<slots>" (forwarding chunk)."""
+    (read at trace time via `envs`): empty / "0" -> off; "1" ->
+    `_EXCHANGE_FWD_CHUNK`-slot forwarding copies; else ':'-separated tokens
+    "g" (group-direct) and "c<slots>" (forwarding chunk). TPU microbench
+    (c48 DCP4, exchange alone, 128K-token context): c32 -8%, group-direct
+    +30% (the sources' extra on-chip copies cost more than the forwarding
+    they remove)."""
     global _exchange_coalesce_logged
     from vllm_torchtpu import envs
 
@@ -777,7 +780,7 @@ def exchange_coalesce() -> tuple[bool, int]:
     if spec in ("", "0"):
         return False, 0
     if spec == "1":
-        group, chunk = True, _EXCHANGE_FWD_CHUNK
+        group, chunk = False, _EXCHANGE_FWD_CHUNK
     else:
         group, chunk = False, 0
         for tok in filter(None, spec.split(":")):

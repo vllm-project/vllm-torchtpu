@@ -2386,8 +2386,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES": env_bool(
         "TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES", default=False
     ),
-    # COALESCE (synchronous exchange, not with DIRECT): "1" = both below with
-    # 32-slot chunks; else ':'-separated "g" (each source copies its own KV
+    # COALESCE (synchronous exchange, not with DIRECT): "1" = 32-slot
+    # forwarding chunks; else ':'-separated "g" (each source copies its own KV
     # head's pages of every part straight to every replica of its own
     # replica group, so only the other groups' pages are forwarded) and
     # "c<slots>" (forward each source's received part in copies of that
