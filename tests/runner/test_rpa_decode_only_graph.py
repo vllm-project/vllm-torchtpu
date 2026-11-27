@@ -44,7 +44,14 @@ import torch
 from jax.experimental.pallas import tpu as pltpu
 from runner_input_test_utils import _make_runner, _scheduler_output
 from vllm.compilation.piecewise_backend import PiecewiseBackend
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.distributed import parallel_state
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 from vllm_torchtpu import _patch_vllm_piecewise_backend
 from vllm_torchtpu.compilation import shape_variants
@@ -159,6 +166,20 @@ def test_wrapper_decode_only_omits_mixed_and_preserves_aliasing(kv_layout, retur
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def _cpu_vllm_config(monkeypatch: pytest.MonkeyPatch):
+    """Set a CPU VllmConfig with resolved KV layout for adapter unit tests."""
+    monkeypatch.setenv("VLLM_TPU_BLOCK_MAJOR_KV", "0")
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    vllm_cfg = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        cache_config=CacheConfig(block_size=128, cache_dtype="auto"),
+    )
+    resolve_kv_cache_layout(vllm_cfg, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(vllm_cfg):
+        yield
+
+
 def _make_impl(
     cls: type[PallasAttentionBackendImpl], *, head_size: int = 128
 ) -> PallasAttentionBackendImpl:
@@ -257,7 +278,7 @@ def test_pallas_rpa_kernel_batched_forwards_decode_only(
         assert rpa_func is attn_module.ragged_paged_attention_batched
 
 
-@pytest.mark.usefixtures("vllm_config_context")
+@pytest.mark.usefixtures("_cpu_vllm_config")
 def test_initialize_kernel_prebuilds_decode_only_op_and_forward_reuses_it(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -294,7 +315,7 @@ def test_initialize_kernel_prebuilds_decode_only_op_and_forward_reuses_it(
     assert len(mixed_calls) == 1
 
 
-@pytest.mark.usefixtures("vllm_config_context")
+@pytest.mark.usefixtures("_cpu_vllm_config")
 def test_set_subpage_split_clears_stale_decode_only_op(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -319,7 +340,7 @@ def test_set_subpage_split_clears_stale_decode_only_op(
         assert built[-1][1].keywords["decode_only"] is True
 
 
-@pytest.mark.usefixtures("vllm_config_context")
+@pytest.mark.usefixtures("_cpu_vllm_config")
 @pytest.mark.parametrize(
     ("flag", "cls", "head_size"),
     [
@@ -345,7 +366,7 @@ def test_ineligible_layers_do_not_build_decode_only_op(
     assert "decode_only" not in built[0][1].keywords
 
 
-@pytest.mark.usefixtures("vllm_config_context")
+@pytest.mark.usefixtures("_cpu_vllm_config")
 def test_pcp_and_dcp_do_not_build_decode_only_op(monkeypatch: pytest.MonkeyPatch):
     """PCP streaming and DCP return early before building a decode-only op."""
     monkeypatch.setenv("TPU_RPA_DECODE_ONLY_GRAPH", "1")
@@ -405,7 +426,7 @@ def test_pcp_and_dcp_do_not_build_decode_only_op(monkeypatch: pytest.MonkeyPatch
     assert dcp_impl.has_rpa_decode_only_kernel() is False
 
 
-@pytest.mark.usefixtures("vllm_config_context")
+@pytest.mark.usefixtures("_cpu_vllm_config")
 def test_default_impl_build_rpa_kernel_rejects_decode_only(
     monkeypatch: pytest.MonkeyPatch,
 ):
