@@ -64,6 +64,25 @@ with fused EP MoE v3 (their `serve_args` pass no `--kv-cache-memory-bytes`);
 the change that adds v3 adds that budget, and until then those legs size
 their KV cache by `--gpu-memory-utilization`.
 
+## Host memory of a prefill replica
+
+Every point's prefill leg gives its offloading connector
+`cpu_bytes_to_use: 720000000000`. `TPURaidenStoreOffloadingSpec` sizes the
+Raiden host tier from that value alone (it divides it by the KV bytes of one
+block over all of the replica's workers), so each prefill replica holds
+720 GB (670.6 GiB) of host memory for the tier, and nothing checks the value
+against the host's memory. The engine's other host memory comes on top: the
+TPU runtime's premapped transfer buffer, Raiden's staging buffers and the
+workers' heap, which grows while the programs compile. On record-tree
+prefill engines in p01's layout (PP8 x TP1) with the same 720 GB tier, a
+prefill pod held about 210 GiB of host memory before the tier registered and
+885 GiB at steady state, which crept up by 4 to 5 GiB over two hours of
+serving; two instances differed by 11 GiB. The tpu7x host allocates 917.9
+GiB to the pod. A prefill replica of these entries therefore needs about
+890 GiB of host memory. On a host with less, lower `cpu_bytes_to_use`, which
+shrinks the host tier and with it the share of returning sessions that hit
+it.
+
 ## Reading a gate entry
 
 `legs` derive from the point named in `base_point`, with one replica each and
