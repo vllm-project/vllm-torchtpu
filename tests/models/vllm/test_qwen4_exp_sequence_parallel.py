@@ -293,6 +293,58 @@ def test_decoder_layer_sequence_parallel_matches_tp(
     assert calls == (expected_calls if split_moe else [])
 
 
+@pytest.mark.parametrize("skip_unrouted", [False, True])
+def test_sequence_parallel_moe_routes_padding_nowhere(tp2, monkeypatch, skip_unrouted):
+    """MOE_ADAPTIVE_SKIP_UNROUTED: the SP MoE gives the adaptive op NaN logits on
+    exactly this rank's padding rows, which the op routes to no expert."""
+    from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
+        vllm_adapter as adaptive_moe,
+    )
+
+    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_MOE", True, raising=False)
+    monkeypatch.setattr(
+        sp.envs, "MOE_ADAPTIVE_SKIP_UNROUTED", skip_unrouted, raising=False
+    )
+    monkeypatch.setattr(sp.envs, "TPU_MOE_SKIP_PADDED_TOKENS", True, raising=False)
+    seen = {}
+
+    def fake_adaptive(method, block, w1, w2, s1, s2, logits, attr):
+        seen[tp2.rank] = logits
+        return block
+
+    monkeypatch.setattr(adaptive_moe, "run_adaptive_fused_moe", fake_adaptive)
+    torch.random.default_generator.manual_seed(0)
+    attn_hc, mlp_hc = hc_module(), hc_module()
+    attn_w = torch.randn(HIDDEN, HIDDEN) / HIDDEN**0.5
+    moe_w = torch.randn(HIDDEN, HIDDEN) / HIDDEN**0.5
+    hidden = torch.randn(TOKENS, HC * HIDDEN).bfloat16()
+    valid = torch.arange(TOKENS) < TOKENS - 5  # trailing padding rows
+
+    def run(rank):
+        layer = make_layer(tp2, "linear_attention", attn_hc, mlp_hc, attn_w, moe_w)
+        layer.mlp = SplitMoE(tp2, moe_w)
+        layer(
+            tp2.shard(hidden),
+            None,
+            torch.zeros(TOKENS, dtype=torch.long),
+            None,
+            None,
+            None,
+            None,
+            valid,
+            None,
+            None,
+            sequence_parallel=True,
+            sp_pad=0,
+        )
+
+    tp2.run(run)
+    for rank, local_valid in enumerate(valid.chunk(tp2.size)):
+        expected = ~local_valid if skip_unrouted else torch.zeros_like(local_valid)
+        assert torch.equal(seen[rank].isnan().all(dim=-1), expected)
+        assert not seen[rank][local_valid].isnan().any()
+
+
 class HeadsAttention(nn.Module):
     """Rank r owns heads [r * d, (r + 1) * d) of ``block @ core_w`` and the
     same rows of the output projection ``out_w``, like a TP attention block."""

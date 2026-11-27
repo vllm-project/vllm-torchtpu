@@ -525,7 +525,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         if sequence_parallel or not kernel_masks_padding(self.mlp):
             block = torch.where(valid_tokens[:, None], block, 0)
         if sequence_parallel:
-            moe = self._sequence_parallel_moe(block, num_tokens)
+            moe = self._sequence_parallel_moe(block, num_tokens, valid_tokens)
         else:
             moe = self.mlp(block)
         return self.mlp_hyper_connection.combine(sp.pad_shard(moe, sp_pad), residual)
@@ -636,7 +636,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             self.self_attn.write_selection_sink(torch.cat(selections))
         return torch.cat(outputs)
 
-    def _sequence_parallel_moe(self, block, num_tokens):
+    def _sequence_parallel_moe(self, block, num_tokens, valid_tokens):
         """The MoE block's output at this rank's rows of a sharded step.
 
         With a token-sharded adaptive EP op (QWEN4_EXP_PREFILL_SP_MOE=1) the
@@ -645,6 +645,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
         MoERunner adds, (all-reduced shared) + (routed). Otherwise the block
         runs on the gathered rows (its EP kernel takes replicated rows and
         returns them reduced) and this rank keeps its rows.
+
+        ``valid_tokens`` marks this rank's real rows; the padding rows of
+        ``block`` are zero.
         """
         mlp = self.mlp
         routed = getattr(getattr(mlp, "experts", None), "routed_experts", None)
@@ -663,6 +666,13 @@ class Qwen4ExpDecoderLayer(nn.Module):
         )
 
         router_logits, _ = mlp.gate(block)
+        if envs.MOE_ADAPTIVE_SKIP_UNROUTED and envs.TPU_MOE_SKIP_PADDED_TOKENS:
+            # Zeroed padding rows tie on every logit and would all route to the
+            # same experts of one rank; NaN logits route them nowhere (the gate
+            # and mask of VllmFp8MoEMethodTPU.apply_monolithic, on this rank's rows).
+            router_logits = torch.where(
+                valid_tokens[:, None], router_logits, float("nan")
+            )
         w1_scale, w2_scale = adaptive_moe.runtime_channel_scales(
             routed, routed.w13_weight_scale_inv, routed.w2_weight_scale_inv
         )
