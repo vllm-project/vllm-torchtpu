@@ -42,6 +42,14 @@ PACKED_FP8_PREPARED_PREFIX_TOKENS = 4096
 # Bound short-output padding to one tile; 4K is the smallest measured choice.
 PACKED_FP8_DENSE_MIN_KEY_TILE = 4096
 
+# Prefill dispatch minimum and HBM window rows on TPU v7.
+PACKED_FP8_PREFILL_ROWS = (128, 256)
+PACKED_FP8_PREFILL_MAX_ROWS = 2048
+PACKED_FP8_PREFILL_MAX_WIDTH = 66048
+# (generation, page records, K tile): (physical Q rows, issue depth, minimum rows).
+# Two six-row groups keep the standalone head tree while sharing QK issue work.
+PACKED_FP8_GROUPED_PREFILL = {(7, 256, 33024): (12, 5, 256)}
+
 
 def paged_mqa_key_tile(width: int, page_size: int, cap: int) -> int:
     """Balance tiles at the device MXU-column granularity."""

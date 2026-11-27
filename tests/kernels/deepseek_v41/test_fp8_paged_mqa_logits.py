@@ -158,3 +158,128 @@ def test_paged_mqa_logits_matches_vllm_reference(batch_size, next_n, page_size):
     np.testing.assert_array_equal(np.isneginf(logits), ~visible)
     diff = _calc_diff(np.where(visible, logits, 0), np.where(visible, ref, 0))
     assert diff < 1e-3, f"{diff=}"
+
+
+@pytest.mark.parametrize(
+    "rows,width,page_size,one_request,unordered,reference_rows",
+    [
+        (129, 4096, 128, False, False, None),
+        (257, 65568, 256, False, False, None),
+        (513, 65568, 128, False, False, None),
+        (512, 65568, 256, True, False, None),
+        (512, 65536, 256, True, False, None),
+        (512, 65536, 256, True, True, None),
+        (512, 65536, 256, True, False, 256),
+        (512, 65536, 256, True, True, 256),
+    ],
+)
+def test_persistent_prefill_preserves_score_bits_and_topk(
+    rows, width, page_size, one_request, unordered, reference_rows, monkeypatch
+):
+    """A window splits a six-row group; request boundaries reset the head tree."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("Persistent packed FP8 scoring requires TPU")
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import streaming_topk
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8 import prefill_topk
+
+    rng = np.random.default_rng(17)
+    page_count = -(-width // page_size)
+    layout = PackedFP8Layout(page_count + 3, page_size=page_size)
+    keys = jnp.asarray(rng.normal(size=(layout.pages * page_size, 128)), jnp.bfloat16)
+    pool, _ = _pack(keys, layout)
+    split = (layout.pages // 2) * layout.page_stride
+    banks = (jnp.asarray(pool[:split]), jnp.asarray(pool[split:]))
+    table = np.stack([rng.permutation(layout.pages)[:page_count] for _ in range(3)])
+    table[2, 1] = -1
+    # An empty request between two nonempty ones also exercises offset lookup.
+    boundary = rows // 2 + 1
+    offsets = jnp.array([0, boundary, boundary, rows], jnp.int32)
+    owners = jnp.where(jnp.arange(rows) < boundary, 0, 2).astype(jnp.int32)
+    lengths = jnp.asarray(rng.integers(width // 3, width, size=rows), jnp.int32)
+    lengths = lengths.at[0].set(0).at[-1].set(17)
+    if one_request:
+        table = table[:1]
+        offsets = jnp.array([0, rows], jnp.int32)
+        owners = jnp.zeros(rows, jnp.int32)
+        lengths = jnp.array([25000, 45000, 65500, 0], jnp.int32)[
+            (jnp.arange(rows) // 6) % 4
+        ]
+    q = jnp.asarray(rng.normal(size=(rows, 32, 128)), jnp.float8_e4m3fn)
+    weights = jnp.asarray(rng.uniform(0.01, 0.1, size=(rows, 32)), jnp.float32)
+    table = jnp.asarray(table, jnp.int32)
+    step = reference_rows or rows
+    expected_scores = jnp.concatenate(
+        [
+            fp8_paged_mqa_logits(
+                q[start : start + step],
+                banks,
+                weights[start : start + step],
+                lengths[start : start + step],
+                table,
+                query_start_loc=jnp.clip(offsets - start, 0, min(step, rows - start)),
+                max_model_len=width,
+                q_scale=jnp.ones_like(weights[start : start + step]),
+                query_size=6,
+                cache_layout=layout,
+            )
+            for start in range(0, rows, step)
+        ]
+    )
+    expected_ids = streaming_topk.streaming_topk(
+        expected_scores,
+        valid_lengths=lengths,
+        k=512,
+        exclude_neg_inf=True,
+        reconstruct_threshold=2048,
+        unordered=unordered,
+    )
+    original = prefill_topk.score_window
+    captured = []
+
+    def recording(*args, **kwargs):
+        scores, state = original(*args, **kwargs)
+        captured.append((scores, kwargs["start"], kwargs["rows"]))
+        return scores, state
+
+    def run(q, banks, weights, lengths, table):
+        return prefill_topk.prefill_topk(
+            q,
+            banks,
+            weights,
+            lengths,
+            table,
+            offsets,
+            owners,
+            layout=layout,
+            width=width,
+            k=512,
+            unordered=unordered,
+            reference_rows=reference_rows,
+        )
+
+    def export(*args):
+        return run(*args), tuple(captured)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(prefill_topk, "score_window", recording)
+        result, windows = jax.jit(export)(q, banks, weights, lengths, table)
+    np.testing.assert_array_equal(result, expected_ids)
+    reference = np.asarray(expected_scores).view(np.uint32)
+    for scores, start, count in windows:
+        start, count = int(start), int(count)
+        owner = int(owners[start])
+        group_start = int(offsets[owner])
+        if reference_rows is not None:
+            group_start = max(group_start, start // reference_rows * reference_rows)
+        skip = (start - group_start) % 6
+        actual = np.asarray(scores)[skip : skip + count, :width]
+        visible = (
+            np.arange(width)[None] < np.asarray(lengths)[start : start + count, None]
+        )
+        actual = np.where(visible, actual, np.float32(-np.inf))
+        np.testing.assert_array_equal(
+            actual.view(np.uint32), reference[start : start + count]
+        )
+    # Exporting scores changes their lifetime: also exercise the production graph.
+    actual_ids = jax.jit(run)(q, banks, weights, lengths, table)
+    np.testing.assert_array_equal(actual_ids, expected_ids)

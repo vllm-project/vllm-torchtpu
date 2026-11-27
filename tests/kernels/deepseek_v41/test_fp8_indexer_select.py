@@ -16,6 +16,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.fp8.dense_logits import 
     fp8_paged_mqa_logits,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.indexer_fp8 import (
+    _select_fp8_indexer_jax,
     select_fp8_indexer_jax,
 )
 
@@ -125,3 +126,71 @@ def test_ragged_requests_select_top_scores(short):
         kth = np.sort(scores[row, : lengths[row]])[-TOPK]
         tolerance = 2e-2 * np.abs(scores[row, : lengths[row]]).max()
         assert scores[row, ids].min() >= kth - tolerance
+
+
+@pytest.mark.parametrize(
+    "rows,score_width,padding_id",
+    [(512, 524288, -1), (512, 524288, 8), (288, 65536, 8)],
+)
+def test_prefill_preserves_score_boundaries_and_padding(rows, score_width, padding_id):
+    """Keep exact IDs for score-budget splits, shared-Q splits, and padding."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("Packed FP8 selection requires TPU")
+    live, visible_width = rows - 4, 65536
+    rng = np.random.default_rng(33)
+    layout = PackedFP8Layout(visible_width // PAGE, page_size=PAGE)
+    keys = jnp.asarray(rng.normal(size=(visible_width, 128)), jnp.bfloat16)
+    pool = _pack(keys, layout)
+    table = jnp.pad(
+        jnp.arange(layout.pages, dtype=jnp.int32)[None],
+        ((0, 7), (0, 0)),
+        constant_values=-1,
+    )
+    q = jnp.asarray(rng.normal(size=(rows, 32, 128)), jnp.float8_e4m3fn)
+    # One weighted head produces many exact BF16 score ties at the cutoff.
+    weights = jnp.zeros((rows, 32), jnp.float32).at[:, 0].set(1)
+    lengths = jnp.where(jnp.arange(rows) < live, 49152, 0).astype(jnp.int32)
+    requests = jnp.where(jnp.arange(rows) < live, 0, padding_id).astype(jnp.int32)
+    offsets = jnp.array([0] + [live] * 8, jnp.int32)
+    if rows == 288:
+        # The old shared-Q scorer restarts at 96 rows, splitting request 1's
+        # six-query group because that request begins at row 73.
+        table = table.at[1].set(jnp.roll(table[0], 1))
+        requests = jnp.where(jnp.arange(rows) < 73, 0, requests)
+        requests = jnp.where(
+            (jnp.arange(rows) >= 73) & (jnp.arange(rows) < live), 1, requests
+        )
+        offsets = jnp.array([0, 73] + [live] * 7, jnp.int32)
+        weights = jnp.asarray(rng.uniform(0.01, 0.1, (rows, 32)), jnp.float32)
+
+    def run(q, weights, lengths, *, reference):
+        arguments = (
+            q,
+            (pool,),
+            table,
+            weights,
+            lengths,
+            jnp.empty((rows, 0), jnp.int32),
+            requests,
+            lengths.max()[None],
+            offsets,
+            (layout.pages, layout.page_stride, layout.page_offset, PAGE),
+            TOPK,
+            8,
+            False,
+            False,
+            True,
+        )
+        if reference:
+            if score_width == visible_width:
+                return _select_fp8_indexer_jax(*arguments, score_width)[0]
+            # The previous wrapper narrows monotone IDs, but not a -1 suffix.
+            width = visible_width if padding_id >= 0 else score_width
+            return _select_fp8_indexer_jax(*arguments, width, prefill_chunk_rows=256)[0]
+        return select_fp8_indexer_jax(*arguments, score_width)[0]
+
+    compiled = jax.jit(run, static_argnames=("reference",))
+    expected = compiled(q, weights, lengths, reference=True)
+    actual = compiled(q, weights, lengths, reference=False)
+    np.testing.assert_array_equal(actual, expected)
+    assert (np.asarray(actual)[live:] == -1).all()

@@ -13,7 +13,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
 
 
 @pytest.mark.parametrize("block,threshold", [(8192, 8192), (16384, 32768)])
-@pytest.mark.parametrize("width", [65536, 65408])
+@pytest.mark.parametrize("width", [65536, 65408, 66048])
 @pytest.mark.parametrize(
     "distribution",
     [
@@ -68,3 +68,46 @@ def test_streaming_topk_contract(block, threshold, width, distribution):
         order = np.lexsort((eligible, ~keys))[:512]
         np.testing.assert_array_equal(np.sort(ids), np.sort(eligible[order]))
         assert np.unique(ids).size == ids.size
+
+
+@pytest.mark.parametrize("width", [65536, 66048])
+@pytest.mark.parametrize("row_start", [0, 3])
+@pytest.mark.parametrize("distribution", ["ties", "subnormal", "infinity"])
+def test_streaming_topk_preserves_order_and_padding(distribution, row_start, width):
+    """HBM windows keep exact FP32 ties, ascending IDs, and a -1 suffix."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("SparseCore selection requires TPU")
+    k, rows = 512, 32
+    if distribution == "ties":
+        values = (np.arange(width) // 4096 % 5).astype(np.float32)
+    else:
+        bits = [0x80000000, 0, 0x80000001, 1, 0x807FFFFF, 0x007FFFFF]
+        if distribution == "infinity":
+            bits += [0xFF800000, 0x7F800000]
+        values = np.resize(np.array(bits, np.uint32).view(np.float32), width)
+    scores = np.broadcast_to(values, (rows, width)).copy()
+    scores[:, ::7] = -np.inf
+    lengths = np.resize(
+        np.array([0, 1, 511, 512, 513, 8191, 8193, 65535, width], np.int32), rows
+    )
+    actual = np.asarray(
+        streaming_topk(
+            jnp.asarray(
+                np.concatenate((np.zeros((row_start, width), np.float32), scores))
+            ),
+            row_start=row_start,
+            row_count=rows,
+            valid_lengths=jnp.asarray(lengths),
+            k=k,
+            reconstruct_threshold=2048,
+            exclude_neg_inf=True,
+        )
+    )
+    expected = np.full((rows, k), -1, np.int32)
+    for row, length in enumerate(lengths):
+        eligible = np.flatnonzero((np.arange(width) < length) & (scores[row] > -np.inf))
+        bits = scores[row, eligible].view(np.uint32)
+        keys = bits ^ np.where(bits >> 31, np.uint32(0xFFFFFFFF), np.uint32(0x80000000))
+        selected = eligible[np.lexsort((eligible, ~keys))[:k]]
+        expected[row, : len(selected)] = np.sort(selected)
+    np.testing.assert_array_equal(actual, expected)
