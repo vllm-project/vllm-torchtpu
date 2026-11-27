@@ -392,7 +392,7 @@ def test_drop_traced_module_refs_skips_heap_scan_without_aot_compiles(monkeypatc
 def test_compile_or_warm_up_drops_traced_modules_before_freezing_the_heap():
     """The dropped graphs must still be collectable when the heap is frozen."""
     worker = SimpleNamespace(
-        model_runner=SimpleNamespace(capture_model=lambda: None),
+        model_runner=SimpleNamespace(capture_model=lambda: None, _megakernel=None),
         compilation_config=SimpleNamespace(compilation_time=0.0),
     )
     calls = []
@@ -845,7 +845,7 @@ def test_load_model_patches_loads_releases_then_sets_runtime_threads(
 def test_warmup_freezes_heap_and_reports_compilation_time():
     capture_model = MagicMock()
     worker = SimpleNamespace(
-        model_runner=SimpleNamespace(capture_model=capture_model),
+        model_runner=SimpleNamespace(capture_model=capture_model, _megakernel=None),
         compilation_config=SimpleNamespace(compilation_time=0.0),
     )
     with (
