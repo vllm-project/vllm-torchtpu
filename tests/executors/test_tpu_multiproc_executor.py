@@ -306,6 +306,14 @@ def test_configs_that_read_prompt_ids_on_the_worker_send_lists(config):
     assert _compacting_executor(**config)._worker_copy(original) is original
 
 
+def test_installed_logits_processor_plugins_keep_lists(monkeypatch):
+    from vllm_torchtpu.executors import tpu_multiproc_executor as module
+
+    monkeypatch.setattr(module, "_logits_processor_plugins_installed", lambda: True)
+    original = _scheduler_output(_new_req("a", [1, 2, 3]))
+    assert _compacting_executor()._worker_copy(original) is original
+
+
 def test_array_prompt_fills_the_input_batch_row_like_the_list():
     """The worker's InputBatch.add_request writes the same row from either form,
     after the round trip through the broadcast's pickling."""

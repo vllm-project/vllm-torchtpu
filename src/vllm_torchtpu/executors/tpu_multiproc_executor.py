@@ -22,7 +22,9 @@ O(context) token-id lists they do not need as lists (see `_worker_copy`).
 """
 
 import dataclasses
+import functools
 from array import array
+from importlib.metadata import entry_points
 
 import numpy as np
 from vllm.v1.core.sched.output import (
@@ -32,11 +34,15 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
 
 from vllm_torchtpu.executors.kv_block_override import reconcile_num_gpu_blocks_override
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+# `_with_array_prompt` views an array("i") as int32.
+assert array("i").itemsize == np.dtype(np.int32).itemsize
 
 
 class TpuMultiprocExecutor(MultiprocExecutor):
@@ -88,6 +94,7 @@ class TpuMultiprocExecutor(MultiprocExecutor):
             model_config.uses_mrope
             or model_config.runner_type == "pooling"
             or model_config.logits_processors
+            or _logits_processor_plugins_installed()
         )
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
@@ -117,6 +124,12 @@ class TpuMultiprocExecutor(MultiprocExecutor):
             return
         for p in shapes[0]:
             self.collective_rpc("prewarm_kv_offload_shape", args=(p,))
+
+
+@functools.cache
+def _logits_processor_plugins_installed() -> bool:
+    # vLLM loads these in every engine, on top of model_config.logits_processors.
+    return bool(entry_points(group=LOGITSPROCS_GROUP))
 
 
 def _with_array_prompt(req: NewRequestData) -> NewRequestData:
