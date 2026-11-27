@@ -130,7 +130,7 @@ launch_replica() {
     export RAGGED_GATED_DELTA_RULE_IMPL=chunked_kernel_v3_pd
     export TPU_GDN_CONV_STATE_TILE_PAD=1
     export LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536 --xla_tpu_enable_latency_hiding_scheduler=false"
-    export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE=disabled
+    export TORCH_TPU_TIER2_COMPILATION_CACHE=disabled
     # Disable persistent compilation caching to conserve ephemeral disk space
     # during single-invocation CI integration runs.
     export VLLM_DISABLE_COMPILE_CACHE=1

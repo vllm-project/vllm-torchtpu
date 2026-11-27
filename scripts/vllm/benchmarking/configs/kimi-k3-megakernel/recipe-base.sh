@@ -316,7 +316,6 @@ export VLLM_XLA_CACHE_PATH="$CACHE_ROOT/$_role"
 export VLLM_CACHE_ROOT="$CACHE_ROOT/$_role/vllm-runtime"
 export VLLM_CONFIG_ROOT="$CACHE_ROOT/$_role/vllm-config"
 export TORCH_TPU_TIER2_COMPILATION_CACHE="${_cache_user}_k3mk_$_role"
-export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="${_cache_user}_k3mk_$_role"
 export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="$CACHE_ROOT/$_role/torch_tpu_tier3"
 if [ "$_role" = prefill ]; then
   export TPU_K3_MOE_REDUCE_DTYPE=bfloat16

@@ -159,7 +159,7 @@ def _prepare_worker_env() -> dict[str, str]:
     env.setdefault("TORCHINDUCTOR_AUTOGRAD_CACHE", "0")
     env.setdefault("TPU_PARALLEL_PRECOMPILE", "1")
     env.setdefault("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", "false")
-    env.setdefault("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE", "disabled")
+    env.setdefault("TORCH_TPU_TIER2_COMPILATION_CACHE", "disabled")
     env.setdefault("VLLM_USE_AOT_COMPILE", "0")
     if env.get("TPU_PCP8_160K_PROFILE_DIR"):
         env["TPU_PCP8_PROFILE_SESSION_KEY"] = (

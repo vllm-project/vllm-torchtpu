@@ -253,14 +253,12 @@ def test_written_list_has_no_stale_names():
 
 
 # Names a normal start sets: the compilation cache (env_override.py writes the
-# TIER2/INTERNAL names when TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT is set), plus
+# TIER2 name when TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT is set), plus
 # GKE/libtpu/Ray names that sit just under the typo cutoff against the registry.
 REAL_START_NAMES = [
     *EXTERNAL_TPU_NAMES,
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     "TORCH_TPU_TIER2_COMPILATION_CACHE",
-    "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE",
-    "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
     "TPU_CHIPS_PER_PROCESS_BOUNDS",
     "RAY_USAGE_STATS_PROMPT_ENABLED",
     # torch_tpu and JAX knobs that no registry lists.

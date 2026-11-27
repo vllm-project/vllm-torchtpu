@@ -661,9 +661,7 @@ class TestTpuCompilerCache:
         """Verify that existing native variables are not overwritten by env_override."""
         env_mock = {
             "VLLM_XLA_CACHE_PATH": "/tmp/test_xla_cache_env",
-            "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT": "/custom/tier3/path",
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT": "/custom/tier3/path",
-            "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE": "custom_tier2",
             "TORCH_TPU_TIER2_COMPILATION_CACHE": "custom_tier2",
         }
         with patch.dict(os.environ, env_mock, clear=True):
@@ -672,18 +670,10 @@ class TestTpuCompilerCache:
             importlib.reload(vllm_torchtpu.env_override)
 
             assert (
-                os.environ.get("TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT")
-                == "/custom/tier3/path"
-            )
-            assert (
                 os.environ.get("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT")
                 == "/custom/tier3/path"
             )
 
-            assert (
-                os.environ.get("TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE")
-                == "custom_tier2"
-            )
             assert os.environ.get("TORCH_TPU_TIER2_COMPILATION_CACHE") == "custom_tier2"
 
     def test_tpu_compilation_handle_serialization(self):

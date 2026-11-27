@@ -25,13 +25,6 @@ logger = init_logger(__name__)
 if envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
     # Enable Tier-2 cache in memory (required by Tier-3)
     os.environ.setdefault("TORCH_TPU_TIER2_COMPILATION_CACHE", "tpu_tier2_cache")
-    os.environ.setdefault(
-        "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
-        envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT,
-    )
-    os.environ.setdefault(
-        "TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE", "tpu_tier2_cache"
-    )
 
 # Default VLLM_CACHE_ROOT to ~/.cache/vllm if unset, ensuring a writable default path
 os.environ.setdefault("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
