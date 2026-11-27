@@ -21,10 +21,10 @@ so the section stays out of the compile-cache key
 (``HASH_IGNORED_ADDITIONAL_CONFIG_KEYS``). Parse once at init with :func:`get`.
 """
 
-import dataclasses
-import typing
 from dataclasses import dataclass
 from typing import Any
+
+from vllm_torchtpu import config_section
 
 SECTION = "tpu_scheduler"
 
@@ -55,37 +55,11 @@ def parse(raw: Any) -> SchedulerOptions:
     """The ``tpu_scheduler`` section as options; None gives the defaults.
 
     Strict: an unknown key, or a value whose type is not exactly the field's
-    (``0`` for a bool, say), raises ``ValueError``.
+    (``0`` for a bool, say), raises ``ValueError`` (``config_section.parse``).
     """
-    if raw is None:
-        return SchedulerOptions()
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"additional_config.{SECTION} must be a JSON object, "
-            f"got {type(raw).__name__}"
-        )
-    hints = typing.get_type_hints(SchedulerOptions)
-    fields = {f.name: hints[f.name] for f in dataclasses.fields(SchedulerOptions)}
-    unknown = sorted(set(raw) - set(fields))
-    if unknown:
-        raise ValueError(
-            f"additional_config.{SECTION} has unknown keys {unknown}; "
-            f"valid keys: {sorted(fields)}"
-        )
-    for name, value in raw.items():
-        field_type = fields[name]
-        if type(value) is not field_type:
-            name_of_type = getattr(field_type, "__name__", str(field_type))
-            raise ValueError(
-                f"additional_config.{SECTION}.{name} must be a "
-                f"{name_of_type}, got {value!r}"
-            )
-    return SchedulerOptions(**raw)
+    return config_section.parse(SchedulerOptions, SECTION, raw)
 
 
 def get(vllm_config: Any) -> SchedulerOptions:
-    """The engine's scheduler options."""
-    additional = vllm_config.additional_config
-    if not isinstance(additional, dict):
-        return SchedulerOptions()
-    return parse(additional.get(SECTION))
+    """The engine's scheduler options (``config_section.get``)."""
+    return config_section.get(SchedulerOptions, SECTION, vllm_config)

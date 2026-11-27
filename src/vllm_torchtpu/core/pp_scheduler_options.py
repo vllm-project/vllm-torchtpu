@@ -30,18 +30,17 @@ chunking (``TPU_PP_LONE_PROMPT_CHUNKS``, ``TPU_PP_EQUAL_COST_CHUNKS``);
 ``quadratic_cost`` refines it and needs the equal-cost cost model.
 """
 
-import dataclasses
-import math
-import typing
 from dataclasses import dataclass
 from typing import Any
+
+from vllm_torchtpu import config_section
 
 SECTION = "tpu_pp_scheduler"
 
 
 @dataclass(frozen=True)
 class PPSchedulerOptions:
-    paw_aging_tok_per_s: float = 0.0
+    paw_aging_tok_per_s: int = 0
     """Uncached prompt tokens credited per second a request has waited, in the
     ``prefix_aware`` orders (waiting-queue sort, running-prefill order,
     warmest-first promotion). 0 is no aging. Only meaningful with
@@ -70,42 +69,17 @@ class PPSchedulerOptions:
 def parse(raw: Any) -> PPSchedulerOptions:
     """The ``tpu_pp_scheduler`` section as options; None gives the defaults.
 
-    Strict: an unknown key, or a value of the wrong type (``0`` for a bool,
-    ``true`` for a number), raises ``ValueError``. A float option also takes a
-    JSON integer.
+    Strict: an unknown key, or a value whose type is not exactly the field's
+    (``0`` for a bool, ``true`` or ``3000.0`` for a whole number), raises
+    ``ValueError`` (``config_section.parse``), and so does a negative aging
+    rate or one set without ``prefix_aware``.
     """
-    if raw is None:
-        return PPSchedulerOptions()
-    if not isinstance(raw, dict):
-        raise ValueError(
-            f"additional_config.{SECTION} must be a JSON object, "
-            f"got {type(raw).__name__}"
-        )
-    hints = typing.get_type_hints(PPSchedulerOptions)
-    fields = {f.name: hints[f.name] for f in dataclasses.fields(PPSchedulerOptions)}
-    unknown = sorted(set(raw) - set(fields))
-    if unknown:
-        raise ValueError(
-            f"additional_config.{SECTION} has unknown keys {unknown}; "
-            f"valid keys: {sorted(fields)}"
-        )
-    values: dict[str, Any] = {}
-    for name, value in raw.items():
-        field_type = fields[name]
-        ok = type(value) is field_type or (field_type is float and type(value) is int)
-        if not ok:
-            name_of_type = getattr(field_type, "__name__", str(field_type))
-            raise ValueError(
-                f"additional_config.{SECTION}.{name} must be a "
-                f"{name_of_type}, got {value!r}"
-            )
-        values[name] = float(value) if field_type is float else value
-    options = PPSchedulerOptions(**values)
+    options = config_section.parse(PPSchedulerOptions, SECTION, raw)
     aging = options.paw_aging_tok_per_s
-    if not math.isfinite(aging) or aging < 0:
+    if aging < 0:
         raise ValueError(
-            f"additional_config.{SECTION}.paw_aging_tok_per_s must be a "
-            f"finite number >= 0, got {aging!r}"
+            f"additional_config.{SECTION}.paw_aging_tok_per_s must be >= 0, "
+            f"got {aging!r}"
         )
     if aging > 0 and not options.prefix_aware:
         raise ValueError(
@@ -116,7 +90,8 @@ def parse(raw: Any) -> PPSchedulerOptions:
 
 
 def get(vllm_config: Any) -> PPSchedulerOptions:
-    """The engine's pipeline chunk scheduler options."""
+    """The engine's pipeline chunk scheduler options (``parse``, so the
+    checks above apply too)."""
     additional = vllm_config.additional_config
     if not isinstance(additional, dict):
         return PPSchedulerOptions()

@@ -32,7 +32,7 @@ import yaml
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 
-from vllm_torchtpu import additional_config_sections
+from vllm_torchtpu import additional_config_sections, config_section
 from vllm_torchtpu.core import (
     pp_chunk_scheduler,
     pp_scheduler_options,
@@ -142,9 +142,8 @@ def test_parse_reads_every_option():
         SimpleNamespace(additional_config={"tpu_pp_scheduler": _ENTRY_PREFILL})
     )
     assert opts.quadratic_cost and opts.prefix_aware
-    # A JSON integer is taken for the float option.
-    assert opts.paw_aging_tok_per_s == 3000.0
-    assert type(opts.paw_aging_tok_per_s) is float
+    assert opts.paw_aging_tok_per_s == 3000
+    assert type(opts.paw_aging_tok_per_s) is int
 
 
 @pytest.mark.parametrize(
@@ -158,11 +157,13 @@ def test_parse_reads_every_option():
         ({"extra_steps_in_flight": 1}, "unknown keys"),
         ({"quadratic_cost": 1}, "must be a bool"),
         ({"prefix_aware": "true"}, "must be a bool"),
-        ({"prefix_aware": True, "paw_aging_tok_per_s": True}, "must be a float"),
-        ({"prefix_aware": True, "paw_aging_tok_per_s": "3000"}, "must be a float"),
-        ({"prefix_aware": True, "paw_aging_tok_per_s": -1.0}, ">= 0"),
-        ({"prefix_aware": True, "paw_aging_tok_per_s": math.inf}, "finite"),
-        ({"prefix_aware": True, "paw_aging_tok_per_s": math.nan}, "finite"),
+        ({"prefix_aware": True, "paw_aging_tok_per_s": True}, "must be a int"),
+        ({"prefix_aware": True, "paw_aging_tok_per_s": "3000"}, "must be a int"),
+        # A whole number of tokens per second: no fraction, infinity or NaN.
+        ({"prefix_aware": True, "paw_aging_tok_per_s": 3000.0}, "must be a int"),
+        ({"prefix_aware": True, "paw_aging_tok_per_s": math.inf}, "must be a int"),
+        ({"prefix_aware": True, "paw_aging_tok_per_s": math.nan}, "must be a int"),
+        ({"prefix_aware": True, "paw_aging_tok_per_s": -1}, ">= 0"),
         ({"paw_aging_tok_per_s": 3000}, "set prefix_aware"),
         ([], "must be a JSON object"),
     ],
@@ -170,6 +171,31 @@ def test_parse_reads_every_option():
 def test_parse_is_strict(raw, match):
     with pytest.raises(ValueError, match=match):
         pp_scheduler_options.parse(raw)
+
+
+def test_get_applies_the_section_checks():
+    """``get`` parses through ``parse``, so the aging checks hold at start-up
+    too, not only the shared parser's type checks."""
+    cfg = SimpleNamespace(
+        additional_config={"tpu_pp_scheduler": {"paw_aging_tok_per_s": 5}}
+    )
+    with pytest.raises(ValueError, match="set prefix_aware"):
+        pp_scheduler_options.get(cfg)
+
+
+@pytest.mark.parametrize("module", [pp_scheduler_options, scheduler_options])
+def test_the_sections_parse_with_the_shared_parser(module):
+    """Both scheduler sections go through ``config_section.parse``, the one
+    strict section parser, instead of a copy of it."""
+    calls = []
+
+    def shared(options_cls, section, raw):
+        calls.append((options_cls, section, raw))
+        return options_cls()
+
+    with patch.object(config_section, "parse", shared):
+        module.parse({"x": 1})
+    assert calls == [(calls[0][0], module.SECTION, {"x": 1})]
 
 
 def test_section_is_registered_and_kept_out_of_the_compile_cache_key():
