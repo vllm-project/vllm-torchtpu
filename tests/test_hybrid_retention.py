@@ -860,7 +860,13 @@ def test_retention_guard_counts_async_admission_and_running_refusals():
 
 def test_retention_is_for_a_kv_producer():
     def cfg(role):
-        kv = None if role is None else SimpleNamespace(kv_role=role)
+        kv = None
+        if role is not None:
+            kv = SimpleNamespace(
+                kv_role=role,
+                is_kv_producer=role in ("kv_producer", "kv_both"),
+                is_kv_consumer=role in ("kv_consumer", "kv_both"),
+            )
         return SimpleNamespace(kv_transfer_config=kv)
 
     assert retention_wanted(cfg("kv_producer"))

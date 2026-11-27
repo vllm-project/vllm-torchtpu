@@ -13,6 +13,9 @@
 # limitations under the License.
 """Helpers shared by the TPU schedulers and hybrid-state retention."""
 
+from typing import NamedTuple
+
+from vllm.config import KVTransferConfig
 from vllm.v1.request import Request, RequestStatus
 
 _WAITING_STATUSES = (RequestStatus.WAITING, RequestStatus.PREEMPTED)
@@ -26,3 +29,30 @@ def is_waiting_status(request: Request) -> bool:
 def format_counts(counts: dict[str, int]) -> str:
     """Formats a reason -> count map as ``a:1,b:2`` for a telemetry field."""
     return ",".join(f"{k}:{v}" for k, v in counts.items()) or "-"
+
+
+class KvRoles(NamedTuple):
+    """An engine's prefill/decode disaggregation roles."""
+
+    producer: bool
+    consumer: bool
+
+
+def kv_roles(kv_transfer_config: KVTransferConfig | None) -> KvRoles:
+    """The engine's roles, from its ``kv_transfer_config`` (None without KV
+    transfer).
+
+    ``producer``: ``kv_role == "kv_producer"``, a prefill leg. ``consumer``:
+    vLLM's ``is_kv_consumer and not is_kv_producer``, a decode leg. vLLM's
+    role properties count ``kv_both`` (an offloading connector on an
+    aggregated engine) as both a producer and a consumer; here it has
+    neither role.
+    """
+    if kv_transfer_config is None:
+        return KvRoles(producer=False, consumer=False)
+    return KvRoles(
+        producer=kv_transfer_config.kv_role == "kv_producer",
+        consumer=bool(
+            kv_transfer_config.is_kv_consumer and not kv_transfer_config.is_kv_producer
+        ),
+    )

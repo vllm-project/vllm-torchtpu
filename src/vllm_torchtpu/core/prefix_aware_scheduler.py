@@ -64,7 +64,11 @@ from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu.core import prefix_change_log, scheduler_options
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
-from vllm_torchtpu.core.scheduler_utils import format_counts, is_waiting_status
+from vllm_torchtpu.core.scheduler_utils import (
+    format_counts,
+    is_waiting_status,
+    kv_roles,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
@@ -192,15 +196,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
-        kv_transfer_config = self.vllm_config.kv_transfer_config
         # The decode-leg levers were measured on the decode legs of
         # prefill/decode disaggregation only. kv_both (an offloading connector
-        # on an aggregated engine) is also a producer and keeps the admission.
-        self._is_kv_consumer = (
-            kv_transfer_config is not None
-            and kv_transfer_config.is_kv_consumer
-            and not kv_transfer_config.is_kv_producer
-        )
+        # on an aggregated engine) is not a consumer and keeps the admission.
+        self._is_kv_consumer = kv_roles(self.vllm_config.kv_transfer_config).consumer
         options = scheduler_options.get(self.vllm_config)
         self._promote_warmest_switch = options.promote_warmest
         if options.kv_prefetch and not (

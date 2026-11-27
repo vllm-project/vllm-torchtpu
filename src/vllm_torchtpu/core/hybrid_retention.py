@@ -87,7 +87,11 @@ from typing import Any, NamedTuple
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 
-from vllm_torchtpu.core.scheduler_utils import format_counts, is_waiting_status
+from vllm_torchtpu.core.scheduler_utils import (
+    format_counts,
+    is_waiting_status,
+    kv_roles,
+)
 
 logger = init_logger("vllm." + __name__)
 
@@ -155,10 +159,7 @@ def retention_wanted(vllm_config: Any) -> bool:
     """Whether a scheduler should keep hybrid-state snapshots: on a KV producer
     (a prefill leg). ``HybridStateRetention.enabled`` then also requires
     a Mamba group, a full-attention group and prefix caching."""
-    kv_transfer_config = vllm_config.kv_transfer_config
-    return (
-        kv_transfer_config is not None and kv_transfer_config.kv_role == "kv_producer"
-    )
+    return kv_roles(vllm_config.kv_transfer_config).producer
 
 
 class HybridStateRetention:

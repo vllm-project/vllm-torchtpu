@@ -69,6 +69,7 @@ from vllm_torchtpu.core.prefix_aware_scheduler import (
     memo_local_prefix_cache_hit,
     trim_resend_token_ids,
 )
+from vllm_torchtpu.core.scheduler_utils import kv_roles
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -205,20 +206,11 @@ class TpuPipelineChunkScheduler(Scheduler):
         # The trimmed token-id resend of the prefix-aware admission, until a
         # trim fails.
         self._trim_resend = True
-        kv_transfer_config = self.vllm_config.kv_transfer_config
-        self._is_kv_producer = (
-            kv_transfer_config is not None
-            and kv_transfer_config.kv_role == "kv_producer"
-        )
-        # As in PrefixAwareScheduler: vLLM's role properties count kv_both (an
-        # offloading connector on an aggregated engine) as a producer too, so
-        # it is not a consumer here; nor is it a producer above, so it has
-        # neither role.
-        self._is_kv_consumer = (
-            kv_transfer_config is not None
-            and kv_transfer_config.is_kv_consumer
-            and not kv_transfer_config.is_kv_producer
-        )
+        # kv_both (an offloading connector on an aggregated engine) has
+        # neither role, as in PrefixAwareScheduler and retention.
+        roles = kv_roles(self.vllm_config.kv_transfer_config)
+        self._is_kv_producer = roles.producer
+        self._is_kv_consumer = roles.consumer
         options = pp_scheduler_options.get(self.vllm_config)
         if options.quadratic_cost and not self._equal_cost:
             # The quadratic pricing runs on the equal-cost step cost model,
