@@ -5205,7 +5205,7 @@ class TPURaidenConnectorWorker:
             req_id in self._stage3_inflight_submits or req_id in self._stage3_tp_submits
         )
         cancel_settled = self._cancel_stage3_receive(engine, uuid)
-        settled = cancel_settled is not False and self._is_stage3_receive_settled(
+        settled = cancel_settled is True and self._is_stage3_receive_settled(
             engine, uuid
         )
         if settled and not submit_pending:
@@ -5567,7 +5567,9 @@ class TPURaidenConnectorWorker:
                     and req_id not in self._stage3_cancelled_sends
                 ):
                     cancel_settled = self._cancel_stage3_send(engine, registration.uuid)
-                    if cancel_settled is not None:
+                    if cancel_settled is None:
+                        settled = False
+                    else:
                         self._stage3_cancelled_sends.add(req_id)
                         settled = cancel_settled
                 if not settled or not self._is_stage3_send_settled(
@@ -6862,7 +6864,7 @@ class TPURaidenConnectorWorker:
             recv_finished - self._suppress_done_recving - self._reported_recving
         )
         self._suppress_done_recving.difference_update(recv_finished)
-        self._reported_recving.update(done_recving)
+        self._reported_recving.update(recv_finished)
         self._pending_failed_recving = self._failed_recving & done_recving
         self._pending_failed_block_ids = {
             block_id
@@ -7064,7 +7066,10 @@ class TPURaidenConnectorWorker:
                             and self._cancel_stage3_receive(engine, uuid) is not None
                         ):
                             self._stage3_draining_load_recancel.discard(req_id)
-                        if self._is_stage3_receive_settled(engine, uuid):
+                        if (
+                            req_id not in self._stage3_draining_load_recancel
+                            and self._is_stage3_receive_settled(engine, uuid)
+                        ):
                             settled_cancelled.append(req_id)
                             continue
                     parked_at = self._stage3_draining_cancelled_load_since.setdefault(

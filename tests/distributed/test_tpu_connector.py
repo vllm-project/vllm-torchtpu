@@ -9434,8 +9434,10 @@ class TestStage3DmaDrainSafety:
         assert follower.get_block_ids_with_load_errors() == {19}
         assert follower._load_block_ids == {}
 
-        # Case 3: native cancel_receive raising RuntimeError logs error and parks
-        # safely until is_receive_settled becomes True rather than crashing.
+        # Case 3: native cancel_receive raising RuntimeError logs error and
+        # keeps the load parked (even if is_receive_settled turns True) until
+        # a native cancel_receive succeeds rather than crashing or releasing
+        # without poisoning late sub-plans.
         worker_err, eng_err = self._seeded_decode_worker(
             dst_req_id="dst-cancel-err",
             src_req_id="src-cancel-err",
@@ -9443,10 +9445,13 @@ class TestStage3DmaDrainSafety:
             blocks=[22],
         )
         worker_err._stage3_controller_accepted.add("dst-cancel-err")
+        fail_cancel = [True]
 
         def _raising_cancel(uuid):
             eng_err.cancel_receive_calls.append(int(uuid))
-            raise RuntimeError("injected native cancel_receive failure")
+            if fail_cancel[0]:
+                raise RuntimeError("injected native cancel_receive failure")
+            return True
 
         eng_err.cancel_receive = _raising_cancel
         with patch(f"{_MOD}.logger.error") as err_log:
@@ -9455,7 +9460,12 @@ class TestStage3DmaDrainSafety:
         assert err_log.call_count == 1
         assert worker_err._load_block_ids == {"dst-cancel-err": [22]}
         eng_err.receive_settled = True
+        assert worker_err.get_finished() == (set(), set())
+        assert eng_err.cancel_receive_calls == [611, 611]
+        assert worker_err._load_block_ids == {"dst-cancel-err": [22]}
+        fail_cancel[0] = False
         assert worker_err.get_finished() == (set(), {"dst-cancel-err"})
+        assert eng_err.cancel_receive_calls == [611, 611, 611]
         assert worker_err.get_block_ids_with_load_errors() == {22}
         assert worker_err._load_block_ids == {}
 
@@ -9735,6 +9745,88 @@ class TestStage3DmaDrainSafety:
         worker._poll_finished(engine)
         assert "dst-inline-armed" not in worker._done_recving
         assert worker.get_block_ids_with_load_errors() == set()
+
+    def test_decode_inline_timeout_report_completion_false_stays_suppressed(
+        self, monkeypatch
+    ):
+        """A timed-out inline load with report_completion=False stays suppressed
+        across subsequent get_finished() steps instead of re-emitting
+        finished_recving from _failed_recving."""
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        worker = _make_raiden_worker(
+            is_producer=False, block_size=1024, tp_rank=0, tp_size=1
+        )
+        worker._raiden_work_unit = MagicMock()
+        engine = _DmaDrainEngine()
+        engine.cancel_receive_settled = True
+        engine.receive_settled = True
+        worker._raiden_transfer_engine = engine
+        facade = MagicMock()
+        facade.start_transfer.return_value = True
+        worker._stage3_source_facades["prefill-controller.test:27000"] = facade
+
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_load["dst-inline-nocomp"] = _Stage3LoadMeta(
+            uuid=612,
+            source_req_id="src-inline-nocomp",
+            local_block_ids=[32, 33],
+            num_tokens=2048,
+            src_controller_address="prefill-controller.test:27000",
+            src_job_name="prefill",
+            src_engine_id="producer-engine",
+            src_data_replica_idx=0,
+            src_parallelism=8,
+        )
+
+        now_s = [100.0]
+
+        def _fake_time():
+            now_s[0] += 1.0
+            return now_s[0]
+
+        monkeypatch.setattr(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", lambda: 2.0)
+        monkeypatch.setattr(f"{_MOD}.time.time", _fake_time)
+        monkeypatch.setattr(f"{_MOD}.time.sleep", lambda _s: None)
+
+        with (
+            patch.object(
+                worker,
+                "_require_stage3_controller",
+                return_value=(MagicMock(), "10.0.0.2:28000"),
+            ),
+            patch.object(
+                worker, "_stage3_source_work_units", return_value=[MagicMock()]
+            ),
+            patch.object(worker, "_raiden_hbm_memory_type", MagicMock(return_value=3)),
+        ):
+            worker.process_send_load(
+                meta, wait_for_completion=True, report_completion=False
+            )
+
+        assert engine.cancel_receive_calls == [612]
+        assert worker.get_block_ids_with_load_errors() == {32, 33}
+
+        # Step 1: suppressed once and recorded in _reported_recving.
+        assert worker.get_finished() == (set(), set())
+        assert worker._suppress_done_recving == set()
+        assert "dst-inline-nocomp" in worker._reported_recving
+
+        # Step 2 (request still RUNNING): must NOT emit finished_recving from
+        # _failed_recving.
+        assert worker.get_finished() == (set(), set())
+        assert worker.get_block_ids_with_load_errors() == set()
+
+        # Step 3 (request finishes): cleanup clears all per-request state and
+        # still never emits finished_recving.
+        assert worker.get_finished(finished_req_ids={"dst-inline-nocomp"}) == (
+            set(),
+            set(),
+        )
+        assert "dst-inline-nocomp" not in worker._reported_recving
+        assert "dst-inline-nocomp" not in worker._failed_recving
+        assert worker._load_block_ids == {}
+        assert worker._stage3_submitted_load_metas == {}
+        assert worker.get_finished() == (set(), set())
 
     def test_decode_windowed_load_drains_using_root_uuid(self, monkeypatch):
         monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
@@ -10263,10 +10355,11 @@ class TestStage3DmaDrainSafety:
 
         settled_by_uuid = {751: False, 752: True}
         cancel_send_calls: list[int] = []
+        fail_cancel_751 = [True]
 
         def _raising_cancel_send(uuid):
             cancel_send_calls.append(int(uuid))
-            if int(uuid) == 751:
+            if int(uuid) == 751 and fail_cancel_751[0]:
                 raise RuntimeError("injected native cancel_send failure")
             return True
 
@@ -10293,9 +10386,19 @@ class TestStage3DmaDrainSafety:
         assert results1 is not None
         assert results1.outcomes == {"send-ok": RaidenSendOutcome.SUCCESS}
 
-        # Poll 2: once uuid 751 settles natively, send-err retires as SEND_FAILURE.
+        # Poll 2: even when is_send_settled(751) is True, a raised cancel_send
+        # must keep send-err parked until a cancel call succeeds (to poison
+        # late windowed sub-plans).
         settled_by_uuid[751] = True
+        assert worker.get_finished() == (set(), set())
+        assert cancel_send_calls == [751, 751]
+        assert worker._stage3_draining_sends == {"send-err": "failed"}
+        assert "send-err" not in worker._stage3_cancelled_sends
+
+        # Poll 3: once cancel_send(751) succeeds, send-err retires as SEND_FAILURE.
+        fail_cancel_751[0] = False
         assert worker.get_finished() == ({"send-err"}, set())
+        assert cancel_send_calls == [751, 751, 751]
         results2 = worker.take_pd_send_results()
         assert results2 is not None
         assert results2.outcomes == {"send-err": RaidenSendOutcome.SEND_FAILURE}
@@ -10443,6 +10546,55 @@ class TestStage3DmaDrainSafety:
         assert async_worker._stage3_draining_cancelled_loads == {}
         assert async_worker._stage3_draining_load_recancel == set()
         assert async_worker.get_block_ids_with_load_errors() == {6}
+
+    def test_raised_cancel_receive_keeps_settled_load_parked_until_cancel_succeeds(
+        self, monkeypatch
+    ):
+        """A raised cancel_receive is treated as not settled even when
+        is_receive_settled already returns True, keeping the load parked on
+        both the initial cancel and retry polls until cancel_receive succeeds."""
+        monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+        monkeypatch.setattr(f"{_MOD}.dist_utils.get_raiden_inline_load", lambda: False)
+        worker, engine = self._seeded_decode_worker(
+            dst_req_id="dst-settled-err",
+            src_req_id="src-settled-err",
+            uuid=805,
+            blocks=[7],
+        )
+        engine.receive_settled = True
+
+        def _flaky_cancel_receive(uuid):
+            engine.cancel_receive_calls.append(int(uuid))
+            if len(engine.cancel_receive_calls) <= 2:
+                raise RuntimeError("transient cancel_receive on settled engine")
+            return True
+
+        engine.cancel_receive = _flaky_cancel_receive
+        worker._stage3_controller_accepted.add("dst-settled-err")
+        worker._stage3_pending_controller_failures["dst-settled-err"] = 0.0
+
+        # Poll 1 (_cancel_or_drain_stage3_load): cancel raises -> parked despite
+        # is_receive_settled(805) == True.
+        assert worker.get_finished() == (set(), set())
+        assert engine.cancel_receive_calls == [805]
+        assert worker._stage3_draining_cancelled_loads == {"dst-settled-err": 805}
+        assert "dst-settled-err" in worker._stage3_draining_load_recancel
+        assert worker.get_block_ids_with_load_errors() == set()
+
+        # Poll 2 (_poll_finished recancel retry): cancel raises again -> still
+        # parked despite is_receive_settled(805) == True.
+        assert worker.get_finished() == (set(), set())
+        assert engine.cancel_receive_calls == [805, 805]
+        assert worker._stage3_draining_cancelled_loads == {"dst-settled-err": 805}
+        assert "dst-settled-err" in worker._stage3_draining_load_recancel
+        assert worker.get_block_ids_with_load_errors() == set()
+
+        # Poll 3: cancel_receive succeeds -> settles and reports failed blocks.
+        assert worker.get_finished() == (set(), {"dst-settled-err"})
+        assert engine.cancel_receive_calls == [805, 805, 805]
+        assert worker._stage3_draining_cancelled_loads == {}
+        assert worker._stage3_draining_load_recancel == set()
+        assert worker.get_block_ids_with_load_errors() == {7}
 
     def test_missing_drain_apis_warns_once_and_caches_per_engine(self, monkeypatch):
         monkeypatch.setitem(vars(tpu_envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
