@@ -117,14 +117,18 @@ def torchrun_worker_env(world_size: int) -> dict[str, str]:
     return env
 
 
-# A rank whose TPU runtime cannot start a session on the host reports this; the
-# other ranks then wait for it in TPU initialization until the launch times out.
-# On the CI hosts it happens to a launch that starts right after another one
-# ended, so the launch is retried once after a pause.
+# On the CI hosts, a launch that starts right after another one ended sometimes
+# stalls in TPU initialization: a rank's TPU runtime cannot start a session on
+# the host (it reports _SESSION_FAILURE after its retries, which can take most
+# of the launch timeout) and the other ranks wait for it. Every rank marks the
+# end of its TPU initialization (rank_<rank>.started); a launch in which a rank
+# reports _SESSION_FAILURE, or not every rank has started within
+# _STARTUP_TIMEOUT_S, is ended and run again after a pause.
 _SESSION_FAILURE = "START_SESSION failed"
-_SESSION_RETRY_PAUSE_S = 30.0
+_STARTUP_TIMEOUT_S = 150.0
+_STARTUP_RETRY_PAUSE_S = 30.0
 # Time a relaunch needs, start-up included, for a retry to be worth it.
-_SESSION_RETRY_MIN_S = 150.0
+_STARTUP_RETRY_MIN_S = 150.0
 _POLL_S = 2.0
 
 
@@ -141,45 +145,51 @@ def launch_torchrun_workers(
     process. Keep `timeout` under pytest's, so that this, not pytest, ends a
     hung launch and the workers are reaped.
 
-    A launch in which a rank's TPU runtime fails to start a session (see
-    _SESSION_FAILURE) is stopped at once and, if enough of `timeout` is left,
-    run again after a pause; its output is kept ahead of the retry's."""
+    A launch that stalls in TPU initialization (see _STARTUP_TIMEOUT_S) is
+    ended and, while enough of `timeout` is left, run again after a pause;
+    each launch's output is kept, in order."""
     import time
 
     deadline = time.monotonic() + timeout
     outputs = []
     while True:
-        completed, session_failed = _launch_torchrun_once(
+        completed, stalled = _launch_torchrun_once(
             script, result_dir, world_size, env, cwd, deadline
         )
         outputs.append(completed.stdout)
         remaining = deadline - time.monotonic()
-        if (
-            not session_failed
-            or remaining < _SESSION_RETRY_PAUSE_S + _SESSION_RETRY_MIN_S
-        ):
+        if stalled is None or remaining < _STARTUP_RETRY_PAUSE_S + _STARTUP_RETRY_MIN_S:
             break
         outputs.append(
-            f"\n=== a rank could not start a TPU session ({_SESSION_FAILURE}); "
-            f"relaunching in {_SESSION_RETRY_PAUSE_S:.0f}s ===\n"
+            f"\n=== TPU start-up failed ({stalled}); "
+            f"relaunching in {_STARTUP_RETRY_PAUSE_S:.0f}s ===\n"
         )
         print(outputs[-1], flush=True)
-        for stale in result_dir.glob("rank_*.json"):
+        for stale in [
+            *result_dir.glob("rank_*.json"),
+            *result_dir.glob("rank_*.started"),
+        ]:
             stale.unlink()
-        time.sleep(_SESSION_RETRY_PAUSE_S)
+        time.sleep(_STARTUP_RETRY_PAUSE_S)
     completed.stdout = "".join(outputs)
     return completed
 
 
-def _session_failed(result_dir: Any) -> bool:
-    """Whether a rank reported that its TPU runtime could not start a session."""
+def _startup_stall(result_dir: Any, world_size: int, elapsed: float) -> str | None:
+    """Why the launch is stuck in TPU initialization, or None if it is not."""
     for path in result_dir.glob("rank_*.json"):
         try:
             if _SESSION_FAILURE in path.read_text():
-                return True
+                return f"a rank reported {_SESSION_FAILURE}"
         except OSError:
             pass
-    return False
+    started = len(list(result_dir.glob("rank_*.started")))
+    if elapsed >= _STARTUP_TIMEOUT_S and started < world_size:
+        return (
+            f"{started} of {world_size} ranks initialized TPU in "
+            f"{_STARTUP_TIMEOUT_S:.0f}s"
+        )
+    return None
 
 
 def _launch_torchrun_once(
@@ -190,8 +200,8 @@ def _launch_torchrun_once(
     cwd: Any,
     deadline: float,
 ) -> tuple[Any, bool]:
-    """One torchrun launch, ended at `deadline` or as soon as a rank reports a
-    session failure; returns the completed process and whether one did."""
+    """One torchrun launch, ended at `deadline` or as soon as it stalls in TPU
+    initialization; returns the completed process and why it stalled, or None."""
     import os
     import signal
     import subprocess
@@ -224,7 +234,8 @@ def _launch_torchrun_once(
         start_new_session=True,
     )
     output = ""
-    session_failed = False
+    stalled = None
+    start = time.monotonic()
     try:
         while True:
             try:
@@ -235,9 +246,11 @@ def _launch_torchrun_once(
                 )
                 break
             except subprocess.TimeoutExpired as exc:
-                if time.monotonic() < deadline and not _session_failed(result_dir):
+                stalled = _startup_stall(
+                    result_dir, world_size, time.monotonic() - start
+                )
+                if time.monotonic() < deadline and stalled is None:
                     continue
-                session_failed = _session_failed(result_dir)
                 # Bytes even in text mode: the partial output is not decoded.
                 output = exc.output or ""
                 if isinstance(output, bytes):
@@ -256,7 +269,7 @@ def _launch_torchrun_once(
     completed = subprocess.CompletedProcess(
         process.args, process.returncode, output, ""
     )
-    return completed, session_failed
+    return completed, stalled
 
 
 def read_worker_results(result_dir: Any, world_size: int, completed: Any) -> list:
@@ -309,6 +322,8 @@ def run_torchrun_worker(result_dir: Any, check: Callable[[int], dict]) -> None:
         dist.init_process_group(backend="tpu_dist")
         initialized = True
         torch.empty((1,), device="tpu").cpu()
+        # TPU initialization is done (see _startup_stall).
+        (result_dir / f"rank_{rank}.started").touch()
         from vllm.distributed.parallel_state import init_distributed_environment
 
         init_distributed_environment(
