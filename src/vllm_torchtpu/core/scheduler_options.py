@@ -16,9 +16,10 @@
     --additional-config '{"tpu_scheduler": {"kv_prefetch": true}}'
 
 Every option defaults to main's behaviour without it. The options only change
-which request a scheduler admits next and never change a compiled program,
-so the section stays out of the compile-cache key
-(``HASH_IGNORED_ADDITIONAL_CONFIG_KEYS``). Parse once at init with :func:`get`.
+which requests a scheduler admits and how many of their tokens a step takes,
+and never change a compiled program, so the section stays out of the
+compile-cache key (``HASH_IGNORED_ADDITIONAL_CONFIG_KEYS``). Parse once at
+init with :func:`get`.
 """
 
 import dataclasses
@@ -60,8 +61,9 @@ class SchedulerOptions:
     ``resolve_divergent_local_hit_tokens`` and claims
     ``supports_divergent_local_hybrid_hits``. A KV consumer runs the levers
     anyway and keeps vLLM's lookup for divergent hits, so there it adds
-    nothing. The cost is host-side: the memo's prefix-cache change log, at
-    most 65536 entries."""
+    nothing but is still what the prefill shaping options below need. The
+    cost is host-side: the memo's prefix-cache change log, at most 65536
+    entries."""
 
     hybrid_state_retention: bool = False
     """Keep the GDN state snapshots a later turn of a conversation hits on
@@ -73,6 +75,47 @@ class SchedulerOptions:
     model, prefix caching off) it logs that retention is off and changes
     nothing. The pipeline chunk scheduler (PP > 1) does not read it and keeps
     snapshots on a KV producer only."""
+
+    prefill_chunk_cap: bool = False
+    """Cap prefill chunks against the step's decoders
+    (``PrefixAwareScheduler``; needs ``prefix_aware_levers``). With at least
+    three quarters of ``max_num_seqs`` (counted up to 16) requests decoding,
+    a cold prefill (more prompt tokens left than the token budget) takes at
+    most a quarter of the budget (at least 512) minus the decode tokens, and
+    a step's later prefills fill it only up to half the budget (at least
+    1024). A running cold prefill is capped with fewer decoders too while any
+    request waits (one whose KV load is in flight included). A request
+    resumed from preemption counts as a prefill until it has replayed its
+    output. A budget of 8192 and 16 or more sequences give 2048 / 4096
+    tokens from 12 decoders. Bounds the decoders' step time, at the cost of
+    more steps per long prompt."""
+
+    srpf_running: bool = False
+    """Schedule running prefills fewest remaining prompt tokens first, behind
+    the decoding requests (``PrefixAwareScheduler``; needs
+    ``prefix_aware_levers``)."""
+
+    admission_tiers: bool = False
+    """Rank waiting requests in four tiers (``PrefixAwareScheduler``; needs
+    ``prefix_aware_levers``): when the head's uncached blocks do not fit the
+    free blocks, warm requests whose do; then preempted requests; then warm
+    ones; then cold ones; fewest uncached tokens first within a tier. Costs
+    a free-block read and a second lookup of the head's prefix hit per
+    promotion."""
+
+    def __post_init__(self) -> None:
+        shaping = {
+            "prefill_chunk_cap": self.prefill_chunk_cap,
+            "srpf_running": self.srpf_running,
+            "admission_tiers": self.admission_tiers,
+        }
+        needs_levers = [name for name, on in shaping.items() if on]
+        if needs_levers and not self.prefix_aware_levers:
+            raise ValueError(
+                f"additional_config.{SECTION}.{needs_levers[0]} shapes the "
+                "prefills of the prefix-aware levers; also set "
+                f"{SECTION}.prefix_aware_levers to true"
+            )
 
 
 def parse(raw: Any) -> SchedulerOptions:
