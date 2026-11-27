@@ -287,12 +287,26 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ]
         return out
 
+    @property
+    def _row_ids(self) -> bool:
+        """Each row's compacted pool-path ids (`qi_id` / `qi_ids`) are read: by the
+        per-row attention and the debug outputs. The union attention reads only the
+        row's count (`qi_kvl`), `g_a` flag (`qc_sga`) and the union, so it skips
+        building and exchanging them."""
+        return not self.union_attn or self.debug
+
+    def _sel_meta_lane(self) -> int:
+        """Lane of a selection exchange row holding `qi_kvl` (`qc_sga` is the next):
+        after the row's `K` ids, or first when the ids are not exchanged
+        (`_row_ids`)."""
+        return self.budget if self._row_ids else 0
+
     def _shard_rows(self, ex: ExecSpec) -> tuple[int, int, int]:
         """(requests per rank, rows per rank, exchange row width) of the sharded
         indexer."""
         nreq = ex.MB // ex.T
         npr = -(-nreq // self._runs(ex))
-        return npr, npr * ex.T, -(-(self.budget + 2) // 128) * 128
+        return npr, npr * ex.T, -(-(self._sel_meta_lane() + 2) // 128) * 128
 
     def _runs(self, ex: ExecSpec) -> int:
         """Request runs of the sharded indexer: one per rank, or per pair (`compressed_dcp`:
@@ -1011,7 +1025,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     def ranged() -> Any:
                         pos, sga, kept = self._nvis_row(ctx, r, lo, s0, ga, nconsts)
                         scr["qc_sga"][r] = sga
-                        return pos, kept
+                        return (pos if self._row_ids else None), kept
 
                     pos, kept = self._nvis_route(
                         ctx.extra[NVIS][r], self.nvis_cut, ranged, lambda: full_row(r)
@@ -1054,23 +1068,21 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
                     scr["qu_code"][rows] = scr["qu_code"][rows] | jnp.where(
                         keep, jnp.left_shift(1, r - lo), 0
                     )
+                if not self._row_ids:
+                    return None, kept
                 pos = ix.compact_sel(keep, jnp.zeros((1, 1), I32) + kept, K, consts)
                 return pos, kept
 
             def tail(r: Any, pos: Any, kept: Any, carry: Any) -> Any:
-                scr["qi_id"][r] = self._cdcp_gid(ctx, pos) if cdcp else pos
-                cs = self._ids_copies(ctx, r)
-                for c in cs:
-                    c.start()
-                if not self.async_dma:
-                    for c in cs:
-                        c.wait()
+                if self._row_ids:
+                    scr["qi_id"][r] = self._cdcp_gid(ctx, pos) if cdcp else pos
+                    self._start_ids_copies(ctx, r)
                 scr["qi_kvl"][r] = 4 * kept
                 return carry
 
             with ctx.stream.sc("qsa_rowsel", 2):
                 jax.lax.fori_loop(lo, lo + n, row, 0)
-                if self.async_dma:
+                if self.async_dma and self._row_ids:
                     self._wait_ids_copies(ctx, n)
             if self.union_attn:  # per-request call: rows [lo, lo + T) are request lo // T
                 KU, D = self._union_width(ex), max(self.dcp, 1)
@@ -1287,6 +1299,15 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             ),
         ]
 
+    def _start_ids_copies(self, ctx: Any, r: Any) -> None:
+        """Start row `r`'s `_ids_copies` (and wait them unless `async_dma`)."""
+        cs = self._ids_copies(ctx, r)
+        for c in cs:
+            c.start()
+        if not self.async_dma:
+            for c in cs:
+                c.wait()
+
     def _wait_ids_copies(self, ctx: Any, n: Any) -> None:
         """`async_dma`: retire `n` rows' `_ids_copies` (equal-sized copies per semaphore; the
         rows' destinations are distinct, so their order is unobservable)."""
@@ -1301,12 +1322,10 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
     @_scoped("qsa_selx")
     def _exchange_selection(self, ctx: Any) -> None:
         """All-gather the sharded indexer's per-row results: pool-path ids (`qi_id` and
-        its
-        SMEM copy `qi_ids`), `qi_kvl` and the `g_a` flag `qc_sga`. Each rank sends its
-        run of
-        rows (lanes `[0, K)` ids, `K` length, `K + 1` flag) to every peer's slot `me`;
-        int32
-        throughout, so the gathered selection is the owner's exactly."""
+        its SMEM copy `qi_ids`, when `_row_ids`), `qi_kvl` and the `g_a` flag `qc_sga`.
+        Each rank sends its run of rows (ids in lanes `[0, K)`, then the length and the
+        flag at `_sel_meta_lane`) to every peer's slot `me`; int32 throughout, so the
+        gathered selection is the owner's exactly."""
         if self.xmerge:
             self._exchange_merged(ctx)
             return
@@ -1317,14 +1336,17 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         lo = self._run(ctx) * rows
         scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
 
+        K0 = self._sel_meta_lane()
+
         def pack(i: Any, carry: Any) -> Any:
             r = jnp.minimum(lo + i, MB - 1)  # past the last request: never read
-            scr["qg_send"][i, :, pl.ds(0, K)] = scr["qi_id"][r]
-            head = jnp.where(lane == K, scr["qi_kvl"][r], 0)
+            if self._row_ids:
+                scr["qg_send"][i, :, pl.ds(0, K)] = scr["qi_id"][r]
+            head = jnp.where(lane == K0, scr["qi_kvl"][r], 0)
             scr["qg_send"][i] = jnp.where(
-                lane < K,
+                lane < K0,
                 scr["qg_send"][i],
-                jnp.where(lane == K + 1, scr["qc_sga"][r], head),
+                jnp.where(lane == K0 + 1, scr["qc_sga"][r], head),
             )
             return carry
 
@@ -1334,19 +1356,15 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         def unpack(r: Any, carry: Any) -> Any:
             o = r // T // npr
             row = scr["qg_recv"][o, r - o * rows]
-            scr["qi_id"][r] = row[:, :K]
-            scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K, row, 0))
-            scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K + 1, row, 0))
-            cs = self._ids_copies(ctx, r)
-            for c in cs:
-                c.start()
-            if not self.async_dma:
-                for c in cs:
-                    c.wait()
+            scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K0, row, 0))
+            scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K0 + 1, row, 0))
+            if self._row_ids:
+                scr["qi_id"][r] = row[:, :K]
+                self._start_ids_copies(ctx, r)
             return carry
 
         jax.lax.fori_loop(0, MB, unpack, 0)
-        if self.async_dma:
+        if self.async_dma and self._row_ids:
             self._wait_ids_copies(ctx, MB)
         if self.union_attn:
             self._exchange_unions(ctx)
@@ -1368,16 +1386,19 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
         send, recv = scr["qm_send"], scr["qm_recv"]
         scr["qi_z"][...] = jnp.zeros((1, 128), I32)  # set by select_rows only on owners
 
+        K0 = self._sel_meta_lane()
+
         def pack(i: Any, carry: Any) -> Any:
             for t in range(T):
                 r = jnp.minimum(run * rows + i * T + t, MB - 1)  # past the last request: never read
                 at = t * WS
-                send[i, :, pl.ds(at, K)] = scr["qi_id"][r]
-                head = jnp.where(lane == K, scr["qi_kvl"][r], 0)
+                if self._row_ids:
+                    send[i, :, pl.ds(at, K)] = scr["qi_id"][r]
+                head = jnp.where(lane == K0, scr["qi_kvl"][r], 0)
                 send[i, :, pl.ds(at, WS)] = jnp.where(
-                    lane < K,
+                    lane < K0,
                     send[i, :, pl.ds(at, WS)],
-                    jnp.where(lane == K + 1, scr["qc_sga"][r], head),
+                    jnp.where(lane == K0 + 1, scr["qc_sga"][r], head),
                 )
             q = jnp.minimum(run * npr + i, nreq - 1)  # past the last request: never read
             send[i, :, pl.ds(u0, W)] = scr["qu_id"][q]
@@ -1397,15 +1418,11 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             for t in range(T):
                 r = q * T + t
                 row = recv[o, j, :, pl.ds(t * WS, WS)]
-                scr["qi_id"][r] = row[:, :K]
-                scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K, row, 0))
-                scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K + 1, row, 0))
-                cs = self._ids_copies(ctx, r)
-                for c in cs:
-                    c.start()
-                if not self.async_dma:
-                    for c in cs:
-                        c.wait()
+                scr["qi_kvl"][r] = jnp.sum(jnp.where(lane == K0, row, 0))
+                scr["qc_sga"][r] = jnp.sum(jnp.where(lane == K0 + 1, row, 0))
+                if self._row_ids:
+                    scr["qi_id"][r] = row[:, :K]
+                    self._start_ids_copies(ctx, r)
             urow = recv[o, j, :, pl.ds(u0, 2 * W + 128)]
             scr["qu_id"][q] = urow[:, :W]
             scr["qu_cd"][q] = urow[:, W : 2 * W]
@@ -1414,7 +1431,7 @@ class QSAFullStepBlock(QSAFullIndexedBlock):
             return carry
 
         jax.lax.fori_loop(0, nreq, unpack, 0)
-        if self.async_dma:
+        if self.async_dma and self._row_ids:
             self._wait_ids_copies(ctx, MB)
 
     @_scoped("qsa_ux")
