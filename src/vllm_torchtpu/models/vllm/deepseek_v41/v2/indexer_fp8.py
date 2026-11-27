@@ -547,13 +547,12 @@ def _select_fp8_indexer_jax(
     chunk_rows = prefill_chunk_rows or indexer_query_rows(tokens, query_tile)
     publish_rows = candidate_write and candidates.shape[1] * block_size < width
     serial_padding = -tokens % rows
-    # The bounded publisher pipeline can use its own row stride even when
-    # the serial path would need padding.
+    # Whole query tiles can use the fixed pipeline's own row stride.
     use_pipeline = (
         stream_select
         and chunk_rows <= rows
         and tokens % chunk_rows == 0
-        and (publish_rows or not serial_padding)
+        and (publish_rows or not serial_padding or chunk_rows % query_tile == 0)
     )
     padded = tokens if use_pipeline else tokens + serial_padding
     # Callers group each request's queries contiguously in ascending request
@@ -743,7 +742,7 @@ def _select_fp8_indexer_jax(
         output = (output, jnp.full(candidates.shape, -1, jnp.int32))
     pipeline = (
         indexer.pipeline_score_topk_bounded
-        if prefill_chunk_rows is not None or publish_rows
+        if prefill_chunk_rows is not None or publish_rows or serial_padding
         else indexer.pipeline_score_topk_unrolled
     )
     selected = pipeline(
