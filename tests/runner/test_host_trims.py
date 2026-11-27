@@ -300,6 +300,33 @@ def test_memo_never_returns_an_entry_freed_by_a_reset(memo_on, monkeypatch):
     assert runs[-3:] == [1, 1, 1]
 
 
+def test_memo_never_skips_the_global_state_guard(memo_on):
+    """A memo hit must not run an entry whose GLOBAL_STATE guard would fail.
+    Here the CPU thread count, then grad mode, changes between calls with the
+    same arguments: each time the call goes through the guard check, which
+    compiles the entry for the new state, as Dynamo does without the memo."""
+    w = _wrapped(_fn_scale)
+    x = torch.arange(6.0)
+    threads = torch.get_num_threads()
+    try:
+        torch.set_num_threads(1)
+        for _ in range(3):
+            torch.testing.assert_close(w(x, 2), _fn_scale(x, 2))
+        assert fd._MEMO_STATS["hit"] == 1
+        torch.set_num_threads(2)
+        for _ in range(3):
+            torch.testing.assert_close(w(x, 2), _fn_scale(x, 2))
+        assert fd._entry_count(_fn_scale.__code__) == 2
+        assert fd._MEMO_STATS["hit"] == 2
+        with torch.no_grad():
+            for _ in range(3):
+                torch.testing.assert_close(w(x, 2), _fn_scale(x, 2))
+    finally:
+        torch.set_num_threads(threads)
+    assert fd._entry_count(_fn_scale.__code__) == 3
+    assert fd._MEMO_STATS["hit"] == 3
+
+
 # --- draft forwards that read the forward context stay out of the memo -------
 
 _DRAFT_LAYER = "draft.model.layers.0.self_attn.attn"

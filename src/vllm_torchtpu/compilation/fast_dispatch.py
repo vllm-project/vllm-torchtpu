@@ -34,8 +34,11 @@ per-call frame evaluation; every guard Dynamo built is kept.
   that entry without re-running ``guard_manager.check``. An entry keeps a weak
   reference to each object it keys by id (a strong one if the object takes no
   weak reference) and is used only while each is still that object, so a
-  recycled id never matches. The memo is dropped whenever the code object's
-  cache entries change (recompile or eviction). A guard on something the
+  recycled id never matches. An entry also keeps the global state (Dynamo's
+  GLOBAL_STATE: grad mode, CPU thread count, autocast, ...) its guard check
+  passed under, and is used only while that state is unchanged. The memo is
+  dropped whenever the code object's cache entries change (recompile or
+  eviction). A guard on something the
   signature does not cover (a global, or an attribute of an argument object)
   is not re-checked on a memo hit, so a function whose compiled program
   depends on such state, and the state can change between calls with the same
@@ -53,8 +56,9 @@ relies on Dynamo internals, checked against torch 2.13.0 (git cf30153c4c13):
 ``_get_total_cache_entry_count``, each cache entry's ``code`` and
 ``guard_manager.check`` and ``cache_entry`` (None once Dynamo invalidates or
 frees the entry), the compiled wrapper's ``_isolate_recompiles_id``,
-``torch._dynamo.eval_frame._stance``, and calling an entry's transformed code
-object directly. A torch upgrade must re-check them.
+``torch._dynamo.eval_frame._stance``, ``torch._C._dynamo.guards.GlobalStateGuard``
+(the guard memo), and calling an entry's transformed code object directly. A
+torch upgrade must re-check them.
 """
 
 from __future__ import annotations
@@ -67,6 +71,7 @@ from typing import Any
 
 import torch
 from torch._C._dynamo import eval_frame as _c_eval_frame
+from torch._C._dynamo.guards import GlobalStateGuard
 
 from vllm_torchtpu.logger import init_logger
 
@@ -204,7 +209,8 @@ def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
         "count": -1,
         "disabled": not simple_sig,
         "logged": False,
-        # signature -> (guard manager, direct fn, refs to its id-keyed objects)
+        # signature -> (guard manager, direct fn, refs to its id-keyed objects,
+        # the global state the guard check passed under)
         "memo": {},
         "memo_count": -1,
         "guard_memo": guard_memo,  # False: this function never uses the memo
@@ -310,7 +316,7 @@ def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
         hit = memo.get(key)
         if hit is None:
             return None
-        guards, direct, refs = hit
+        guards, direct, refs, global_state = hit
         if guards.cache_entry is None:
             # Dynamo dropped the entry (invalidated, or freed by
             # torch._dynamo.reset()) without the entry count changing.
@@ -319,6 +325,12 @@ def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
         if not _memo_live(refs, objs):
             # An object the entry was keyed by is gone and its id now names
             # another one: the guards must run again.
+            del memo[key]
+            return None
+        if not global_state.check():
+            # Grad mode, the thread count or another GLOBAL_STATE field
+            # differs from the state the entry's guard check passed under:
+            # that check must run again.
             del memo[key]
             return None
         _MEMO_STATS["hit"] += 1
@@ -334,7 +346,9 @@ def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
             # an entry holding an object that cannot be weakly referenced
             # never dies, and refusing to store would end the memo's hits.
             for dead in [
-                k for k, (_, _, refs) in memo.items() if any(r() is None for r in refs)
+                k
+                for k, (_, _, refs, _) in memo.items()
+                if any(r() is None for r in refs)
             ]:
                 del memo[dead]
             while len(memo) >= _MEMO_MAX_ENTRIES:
@@ -342,7 +356,7 @@ def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
         objs: list = []
         key = _memo_key(args, objs)
         if key is not None and key not in memo:
-            memo[key] = (guards, direct, _memo_refs(objs))
+            memo[key] = (guards, direct, _memo_refs(objs), GlobalStateGuard())
             _MEMO_STATS["store"] += 1
 
     @functools.wraps(fn)
