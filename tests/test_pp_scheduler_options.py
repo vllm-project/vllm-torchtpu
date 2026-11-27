@@ -31,6 +31,7 @@ import pytest
 import yaml
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import additional_config_sections, config_section
 from vllm_torchtpu.core import (
@@ -433,8 +434,8 @@ class _HookedConnector:
     """A connector with the two hooks the prefix-aware admission calls, as
     the multi-connector and the Raiden offloading connector define them."""
 
-    def poll_and_complete_transfers(self, scheduler):
-        return 0, 0, 0, False
+    def poll_and_complete_transfers(self, idle):
+        return None
 
     def resolve_divergent_local_hit_tokens(
         self, request, num_local, num_reconciled, block_size
@@ -631,7 +632,7 @@ def test_without_options_the_step_limit_is_mains():
 def test_without_options_schedule_runs_none_of_the_prefix_aware_steps():
     polls, packs = [], []
     connector = SimpleNamespace(
-        poll_and_complete_transfers=lambda sched: polls.append(sched),
+        poll_and_complete_transfers=lambda idle: polls.append(idle),
         supports_divergent_local_hybrid_hits=False,
     )
     deep = _req(163840, 163840 + 3800, "deep")
@@ -659,6 +660,36 @@ def test_without_options_schedule_runs_none_of_the_prefix_aware_steps():
         else:
             assert order == ["deep", "shallow"]
     assert len(polls) == 1 and packs == [True]
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_schedule_applies_the_polled_transfers_as_a_step_output(running):
+    """The poll's finished transfers reach the scheduler through
+    _update_from_kv_xfer_finished, as a step's output does, and only when
+    there are any; the poll is told whether any request is running."""
+    output = KVConnectorOutput(finished_recving={"r1"})
+    answers = [output, None]
+    idles, applied = [], []
+    connector = SimpleNamespace(
+        poll_and_complete_transfers=lambda idle: idles.append(idle) or answers.pop(0),
+        supports_divergent_local_hybrid_hits=False,
+    )
+    s = _sched(
+        cost=_model(),
+        running=[_req(0, 4096, "r0")] if running else [],
+        connector=connector,
+        _transfer_poller=connector,
+        _prefix_aware=True,
+        _srpf_running=False,
+        _paw_aging_tok_per_s=0.0,
+    )
+    s._update_from_kv_xfer_finished = applied.append
+    s._maybe_pack_prompt_ids = lambda out: None
+    for _ in range(2):
+        with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+            s.schedule()
+    assert idles == [not running] * 2
+    assert applied == [output]
 
 
 def test_promotion_and_sort_run_when_their_flags_are_set():

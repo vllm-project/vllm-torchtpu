@@ -27,7 +27,11 @@ from unittest.mock import MagicMock
 import pytest
 from vllm.config.kv_transfer import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
-from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiConnector,
+    MultiKVConnectorWorkerMetadata,
+)
+from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu.distributed.kv_transfer import tpu_multi_connector
 from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import TPUMultiConnector
@@ -286,19 +290,63 @@ class TestTPUMultiConnectorHybridHitForwarding:
         assert self._multi(small, large).estimate_external_hit_tokens("req", 0) == 512
         assert self._multi(large, small).estimate_external_hit_tokens("req", 0) == 512
 
-    def test_transfer_polls_are_summed_across_children(self):
-        scheduler = object()
+    def test_transfer_polls_merge_into_one_output_shaped_like_the_echo(self):
+        first_meta, third_meta = object(), object()
         first = SimpleNamespace(
-            poll_and_complete_transfers=MagicMock(return_value=(10, 1, 0, False))
+            poll_and_complete_transfers=MagicMock(
+                return_value=KVConnectorOutput(
+                    finished_recving={"a"}, kv_connector_worker_meta=first_meta
+                )
+            )
         )
-        second = SimpleNamespace(
-            poll_and_complete_transfers=MagicMock(return_value=(5, 0, 2, True))
+        nothing = SimpleNamespace(poll_and_complete_transfers=lambda idle: None)
+        third = SimpleNamespace(
+            poll_and_complete_transfers=MagicMock(
+                return_value=KVConnectorOutput(
+                    finished_recving={"b"}, kv_connector_worker_meta=third_meta
+                )
+            )
         )
 
-        multi = self._multi(first, SimpleNamespace(), second)
-        assert multi.poll_and_complete_transfers(scheduler) == (15, 1, 2, True)
-        first.poll_and_complete_transfers.assert_called_once_with(scheduler)
-        second.poll_and_complete_transfers.assert_called_once_with(scheduler)
+        multi = self._multi(first, SimpleNamespace(), nothing, third)
+        output = multi.poll_and_complete_transfers(True)
+        assert output.finished_recving == {"a", "b"}
+        meta = output.kv_connector_worker_meta
+        assert isinstance(meta, MultiKVConnectorWorkerMetadata)
+        assert meta.metadata == (
+            first_meta,
+            None,
+            None,
+            third_meta,
+        )
+        first.poll_and_complete_transfers.assert_called_once_with(True)
+        third.poll_and_complete_transfers.assert_called_once_with(True)
+        idle_multi = self._multi(SimpleNamespace(), nothing)
+        assert idle_multi.poll_and_complete_transfers(False) is None
+
+    def test_the_merged_poll_reaches_each_child_as_the_echo_does(self):
+        """Applied through upstream's MultiConnector.update_connector_output,
+        the scheduler's single call, each child gets its own metadata."""
+        seen = []
+
+        def child(meta):
+            return SimpleNamespace(
+                poll_and_complete_transfers=lambda idle: (
+                    None
+                    if meta is None
+                    else KVConnectorOutput(
+                        finished_recving={"r1"}, kv_connector_worker_meta=meta
+                    )
+                ),
+                update_connector_output=lambda out: seen.append(
+                    (out.kv_connector_worker_meta, set(out.finished_recving))
+                ),
+            )
+
+        meta = object()
+        multi = self._multi(child(None), child(meta))
+        multi.update_connector_output(multi.poll_and_complete_transfers(False))
+        assert seen == [(None, {"r1"}), (meta, {"r1"})]
 
 
 class TestProducerDivergentHitsOption:

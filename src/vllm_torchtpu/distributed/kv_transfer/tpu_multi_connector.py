@@ -13,8 +13,15 @@
 # limitations under the License.
 """TPU Multi Connector wrapper for combining disagg and offloading."""
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
-from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorRole,
+    KVConnectorWorkerMetadata,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
+    MultiConnector,
+    MultiKVConnectorWorkerMetadata,
+)
+from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu.distributed.kv_transfer.connector_options import (
     MultiConnectorOptions,
@@ -128,23 +135,33 @@ class TPUMultiConnector(MultiConnector):
             return any(c.supports_divergent_local_hybrid_hits for c in self._connectors)
         return super().supports_divergent_local_hybrid_hits
 
-    def poll_and_complete_transfers(self, scheduler) -> tuple[int, int, int, bool]:
-        """Sums every child's schedule-start completion poll (called by the
-        pipeline chunk scheduler's prefix-aware admission, which a follow-up
-        change adds)."""
-        total_ns = 0
-        total_early = 0
-        total_waited = 0
-        any_waited = False
+    def poll_and_complete_transfers(self, idle: bool) -> KVConnectorOutput | None:
+        """The children's finished transfers, from each child's schedule-start
+        poll, in one output shaped like the workers' echo: the finished
+        requests of all children, and each child's worker metadata in its
+        slot, which ``update_connector_output`` hands back to that child.
+        None when no child has anything (asked by the pipeline chunk
+        scheduler's prefix-aware admission, which a follow-up change adds)."""
+        finished_recving: set[str] = set()
+        metadata: list[KVConnectorWorkerMetadata | None] = []
+        polled = False
         for c in self._connectors:
             fn = getattr(c, "poll_and_complete_transfers", None)
-            if callable(fn):
-                ns, early, waited_reqs, waited = fn(scheduler)
-                total_ns += ns
-                total_early += early
-                total_waited += waited_reqs
-                any_waited = any_waited or waited
-        return total_ns, total_early, total_waited, any_waited
+            output = fn(idle) if fn is not None else None
+            if output is None:
+                metadata.append(None)
+                continue
+            polled = True
+            metadata.append(output.kv_connector_worker_meta)
+            finished_recving |= output.finished_recving or set()
+        if not polled:
+            return None
+        return KVConnectorOutput(
+            finished_recving=finished_recving,
+            kv_connector_worker_meta=MultiKVConnectorWorkerMetadata(
+                metadata=tuple(metadata)
+            ),
+        )
 
     def resolve_divergent_local_hit_tokens(
         self,

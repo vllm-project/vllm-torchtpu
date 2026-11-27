@@ -53,6 +53,7 @@ from itertools import islice
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
+from vllm.v1.outputs import KVConnectorOutput
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.core import pp_scheduler_options, scheduler_options
@@ -109,11 +110,12 @@ class ExternalHitEstimator(Protocol):
 
 @runtime_checkable
 class TransferPoller(Protocol):
-    """A KV connector that completes finished async loads when the scheduler
-    polls it at the start of a step (the TPU multi-connector and the Raiden
-    offloading connector)."""
+    """A KV connector whose finished async transfers the scheduler can poll at
+    the start of a step (the TPU multi-connector and the Raiden offloading
+    connector). The poll returns them as a step's output reports them, or
+    None; ``idle`` says that no request is running."""
 
-    def poll_and_complete_transfers(self, scheduler: Any) -> Any: ...
+    def poll_and_complete_transfers(self, idle: bool) -> KVConnectorOutput | None: ...
 
 
 @runtime_checkable
@@ -761,13 +763,17 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         prefix_aware = self._prefix_aware
         poller = self._transfer_poller
         if prefix_aware and poller is not None:
-            # Completed async loads promote their requests this step.
+            # Completed async loads promote their requests this step. The
+            # poll's output is applied as a step's output is.
             try:
-                poller.poll_and_complete_transfers(self)
+                finished = poller.poll_and_complete_transfers(not self.running)
             except Exception:
                 logger.exception(
                     "Pipeline chunk scheduler: poll_and_complete_transfers failed."
                 )
+            else:
+                if finished is not None:
+                    self._update_from_kv_xfer_finished(finished)
         if self._retention is not None:
             try:
                 self._retention.pin_running(self.running)

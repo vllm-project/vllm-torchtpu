@@ -243,7 +243,16 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
-        self._scheduler: Any = None
+        # Set by the first poll_and_complete_transfers: from then on the
+        # scheduler polls at the start of every schedule(), and
+        # build_connector_meta hands the transfers it finds to the next poll
+        # (_unreported_jobs, _unreported_store_ids) instead of the workers.
+        self._scheduler_polls = False
+        self._unreported_jobs: list[Any] = []
+        self._unreported_store_ids: list[int] = []
+        # Failed loads a poll found, for the worker echo of the next
+        # build_connector_meta: vLLM takes load failures only from a step's
+        # output (failed_recving).
         self._pending_failed_jobs: list[Any] = []
         # request id -> (number of block hashes, chunk-aligned local hit, time,
         # host-tier tokens) of the last estimate_external_hit_tokens answer.
@@ -252,20 +261,18 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         self._max_async_load_reqs = options.max_async_loads
         self._host_tier_recency = options.host_tier_recency
 
-    def _complete_jobs_directly(
+    def _collect_finished(
         self,
-        scheduler: Any,
         finished_jobs: Iterable[Any],
-        extra_store_job_ids: Iterable[int] = (),
-    ) -> int:
-        """Complete finished Raiden store/load jobs directly on the scheduler
-        without a 2-step worker echo round-trip."""
-        completed_jobs: dict[int, int] = {}
-        load_req_ids: list[str] = []
+        completed_jobs: dict[int, int],
+        finished_recving: set[str],
+    ) -> None:
+        """Adds finished Raiden jobs to a poll's completed job counts and
+        finished requests, as the worker echo would report them: every
+        worker's count for a job, and a load's request once none of its
+        other loads is pending. A failed job waits for the worker echo."""
         num_workers = self.config.num_workers
-        for jid in extra_store_job_ids:
-            if jid in self._jobs:
-                completed_jobs[jid] = num_workers
+        load_req_ids: list[str] = []
         for finished_job in finished_jobs:
             if finished_job.failed_device_block_ids:
                 self._pending_failed_jobs.append(finished_job)
@@ -274,89 +281,100 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 completed_jobs[finished_job.job_id] = num_workers
             if finished_job.op == AdmissionOp.LOAD and finished_job.req_id is not None:
                 load_req_ids.append(finished_job.req_id)
-
-        finished_recving: set[str] = set()
         for req_id in load_req_ids:
-            if req_id not in scheduler.requests:
-                continue
             req_status = self._req_status.get(req_id)
-            has_other_loads = req_status is not None and any(
-                jid not in completed_jobs
-                and jid in self._jobs
-                and not self._jobs[jid].is_store
+            if req_status is None or not any(
+                self._load_pending(jid, completed_jobs)
                 for jid in req_status.transfer_jobs
-            )
-            if not has_other_loads:
+            ):
                 finished_recving.add(req_id)
 
-        if completed_jobs or finished_recving:
-            kv_out = KVConnectorOutput(
-                finished_recving=finished_recving,
-                kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
-                    # pyrefly: ignore[unexpected-keyword]
-                    completed_jobs=completed_jobs,
-                    fenced_jobs={},
-                ),
-            )
-            self.update_connector_output(kv_out)
-            if finished_recving:
-                scheduler._update_from_kv_xfer_finished(
-                    KVConnectorOutput(finished_recving=finished_recving)
-                )
-        return len(finished_recving)
+    def _load_pending(self, job_id: int, completed_jobs: dict[int, int]) -> bool:
+        job = self._jobs.get(job_id)
+        return job is not None and not job.is_store and job_id not in completed_jobs
 
-    def poll_and_complete_transfers(self, scheduler: Any) -> tuple[int, int, int, bool]:
-        """Poll Raiden C++ transfer completions at the start of ``schedule()``
-        so completed H2D loads promote ``WAITING_FOR_REMOTE_KVS`` requests in
-        the very next step instead of waiting 2 steps for the worker echo.
+    def _load_awaited(self, completed_jobs: dict[int, int]) -> bool:
+        """Whether a request waits for a host-tier load still pending."""
+        for job_id, job in self._jobs.items():
+            if not self._load_pending(job_id, completed_jobs):
+                continue
+            req_status = self._req_status.get(job.req_id)
+            if (
+                req_status is not None
+                and req_status.req.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            ):
+                return True
+        return False
 
-        The pipeline chunk scheduler's prefix-aware admission, which a
-        follow-up change adds, calls it at the start of each step; until then
-        no scheduler does, and the worker echo completes the transfers."""
-        self._scheduler = scheduler
-        t0_ns = time.perf_counter_ns()
+    def poll_and_complete_transfers(self, idle: bool) -> KVConnectorOutput | None:
+        """Host-tier transfers that finished, for the scheduler to apply at
+        the start of ``schedule()``, so a request whose load landed is
+        scheduled in that step instead of after the worker echo.
+
+        Returns them as the worker echo reports them: a ``KVConnectorOutput``
+        whose ``finished_recving`` names each request whose loads have all
+        finished and whose worker metadata counts the completed jobs, or None
+        when nothing finished. The scheduler applies it with
+        ``_update_from_kv_xfer_finished``, the method that applies a step's
+        output; this connector neither keeps nor calls the scheduler. A
+        failed load still goes through the worker echo, which reports it in
+        ``failed_recving``.
+
+        If no request's loads have finished and a request waits for one, the
+        poll waits up to ``_LOAD_WAIT_MS`` for it (at least 5 ms when the
+        scheduler is ``idle``, with no request running).
+
+        The pipeline chunk scheduler's prefix-aware admission calls it at the
+        start of each step."""
+        self._scheduler_polls = True
         manager = self._raiden_manager
-        initial_finished = manager.poll_finished_jobs()
-        early_reqs = (
-            self._complete_jobs_directly(scheduler, initial_finished)
-            if initial_finished
-            else 0
+        completed_jobs = {
+            job_id: self.config.num_workers
+            for job_id in self._unreported_store_ids
+            if job_id in self._jobs
+        }
+        finished_recving: set[str] = set()
+        self._collect_finished(
+            self._unreported_jobs + list(manager.poll_finished_jobs()),
+            completed_jobs,
+            finished_recving,
         )
-        waited_reqs = 0
-        waited = False
-
-        has_pending_loads = any(not js.is_store for js in self._jobs.values())
-        if has_pending_loads and early_reqs == 0:
-            # A request parked on an async load holds its KV blocks, so the
-            # scheduler queues it in kv_holding_waiting.
-            has_waiting_remote = any(
-                r.status == RequestStatus.WAITING_FOR_REMOTE_KVS
-                and r.request_id not in scheduler.finished_recving_kv_req_ids
-                for r in scheduler.kv_holding_waiting
-            )
-            if has_waiting_remote:
-                wait_ms = _LOAD_WAIT_MS
-                if wait_ms > 0.0:
-                    if not getattr(scheduler, "running", None):
-                        wait_ms = max(wait_ms, 5.0)
-                    deadline_ns = time.perf_counter_ns() + int(wait_ms * 1_000_000.0)
-                    waited = True
-                    while time.perf_counter_ns() < deadline_ns:
-                        time.sleep(0.0001)
-                        polled = manager.poll_finished_jobs()
-                        if polled:
-                            waited_reqs += self._complete_jobs_directly(
-                                scheduler, polled
-                            )
-                            if waited_reqs > 0 or not any(
-                                not js.is_store for js in self._jobs.values()
-                            ):
-                                break
-                        elif not manager.has_pending_work():
+        self._unreported_jobs = []
+        self._unreported_store_ids = []
+        if not finished_recving and self._load_awaited(completed_jobs):
+            wait_ms = max(_LOAD_WAIT_MS, 5.0) if idle else _LOAD_WAIT_MS
+            deadline_ns = time.perf_counter_ns() + int(wait_ms * 1_000_000.0)
+            try:
+                while time.perf_counter_ns() < deadline_ns:
+                    time.sleep(0.0001)
+                    polled = manager.poll_finished_jobs()
+                    if polled:
+                        self._collect_finished(polled, completed_jobs, finished_recving)
+                        if finished_recving or not any(
+                            self._load_pending(jid, completed_jobs)
+                            for jid in self._jobs
+                        ):
                             break
-
-        elapsed_ns = time.perf_counter_ns() - t0_ns
-        return elapsed_ns, early_reqs, waited_reqs, waited
+                    elif not manager.has_pending_work():
+                        break
+            except Exception:
+                # The transfers collected so far are taken off the manager
+                # already: return them rather than lose them with the wait.
+                logger.exception(
+                    "TPURaidenOffloadingConnector: waiting for a host-tier load "
+                    "failed; returning the %d finished jobs collected before it",
+                    len(completed_jobs),
+                )
+        if not completed_jobs and not finished_recving:
+            return None
+        return KVConnectorOutput(
+            finished_recving=finished_recving,
+            kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
+                # pyrefly: ignore[unexpected-keyword]
+                completed_jobs=completed_jobs,
+                fenced_jobs={},
+            ),
+        )
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -427,24 +445,25 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
         polled = manager.poll_finished_jobs()
 
-        sched_ref = self._scheduler
-        if sched_ref is not None:
-            self._complete_jobs_directly(
-                sched_ref,
-                list(drained) + polled,
-                extra_store_job_ids=finished_store_ids,
-            )
+        if self._scheduler_polls:
+            # The next poll returns these to the scheduler, at the start of
+            # the next schedule() and before it decides anything; failed
+            # jobs go through the worker echo.
+            for finished_job in list(drained) + polled:
+                if finished_job.failed_device_block_ids:
+                    self._pending_failed_jobs.append(finished_job)
+                else:
+                    self._unreported_jobs.append(finished_job)
+            self._unreported_store_ids.extend(finished_store_ids)
             finished_store_ids = []
-            pending_failed = self._pending_failed_jobs
-            if pending_failed:
-                for failed_job in pending_failed:
-                    if failed_job.op == AdmissionOp.STORE:
-                        finished_store_ids.append(failed_job.job_id)
-                    else:
-                        assert failed_job.req_id is not None
-                        finished_loads[failed_job.job_id] = failed_job.req_id
-                        failed_load_req_ids.add(failed_job.req_id)
-                pending_failed.clear()
+            for failed_job in self._pending_failed_jobs:
+                if failed_job.op == AdmissionOp.STORE:
+                    finished_store_ids.append(failed_job.job_id)
+                else:
+                    assert failed_job.req_id is not None
+                    finished_loads[failed_job.job_id] = failed_job.req_id
+                    failed_load_req_ids.add(failed_job.req_id)
+            self._pending_failed_jobs.clear()
         else:
             # Collect completed/drained jobs for the worker echo channel.
             for finished_job in list(drained) + polled:
@@ -1005,10 +1024,11 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             return self.connector_scheduler.take_events()
         return []
 
-    def poll_and_complete_transfers(self, scheduler: Any) -> tuple[int, int, int, bool]:
-        if isinstance(self.connector_scheduler, TPURaidenOffloadingScheduler):
-            return self.connector_scheduler.poll_and_complete_transfers(scheduler)
-        return (0, 0, 0, False)
+    def poll_and_complete_transfers(self, idle: bool) -> KVConnectorOutput | None:
+        """The scheduler side's finished transfers; None on a worker."""
+        if self.connector_scheduler is None:
+            return None
+        return self.connector_scheduler.poll_and_complete_transfers(idle)
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(

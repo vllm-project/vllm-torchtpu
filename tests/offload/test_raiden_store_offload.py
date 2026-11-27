@@ -1129,7 +1129,9 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         sched.config = SimpleNamespace(num_workers=num_workers)
         sched._raiden_manager = manager
         sched._fence_pending = {}
-        sched._scheduler = None
+        sched._scheduler_polls = False
+        sched._unreported_jobs = []
+        sched._unreported_store_ids = []
         sched._pending_failed_jobs = []
         return sched
 
@@ -1268,50 +1270,116 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         self.assertEqual(meta.finished_load_jobs, {3: "r1"})
         self.assertEqual(meta.failed_load_req_ids, {"r1"})
 
-    def _attach_scheduler(self, sched):
-        scheduler = MagicMock()
-        scheduler.requests = {"r1": object()}
-        sched._scheduler = scheduler
-        sched._jobs = {}
-        sched._req_status = {}
-        sched._pending_failed_jobs = []
-        return scheduler
+    def _track_load(self, sched, job_id=3, req_id="r1"):
+        """The upstream bookkeeping of one load job the scheduler waits for."""
+        from vllm.v1.request import RequestStatus
 
-    def _load_then_finish(self, success):
+        sched._jobs = {job_id: SimpleNamespace(is_store=False, req_id=req_id)}
+        sched._req_status = {
+            req_id: SimpleNamespace(
+                transfer_jobs={job_id},
+                req=SimpleNamespace(status=RequestStatus.WAITING_FOR_REMOTE_KVS),
+            )
+        }
+
+    def _load_then_finish(self, success, scheduler_polls=True):
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        seed_host_entries(store, _key(0))
+        manager.prepare_load([_key(0)], _ctx("r1"))
+        sched = self._make_scheduler(manager)
+        self._track_load(sched)
+        self._build_meta(
+            sched, self._stock_meta(load_jobs={3: self._load_job([_key(0)], [10])})
+        )
+        if scheduler_polls:
+            # The schedule-start poll ran before the load finished.
+            self.assertIsNone(sched.poll_and_complete_transfers(idle=False))
+        store.complete_load(sub_hashes(_key(0)), success=success)
+        meta = self._build_meta(sched, self._stock_meta())
+        return sched, meta
+
+    def test_a_load_finished_at_build_time_goes_to_the_next_poll(self):
+        # Once the scheduler polls, a load build_connector_meta sees finish
+        # reaches the scheduler through the next poll, not the worker echo.
+        sched, meta = self._load_then_finish(success=True)
+        self.assertEqual(meta.finished_load_jobs, {})
+        self.assertEqual(meta.failed_load_req_ids, set())
+        output = sched.poll_and_complete_transfers(idle=False)
+        self.assertEqual(output.finished_recving, {"r1"})
+        self.assertEqual(output.kv_connector_worker_meta.completed_jobs, {3: 2})
+        # Reported once.
+        self.assertIsNone(sched.poll_and_complete_transfers(idle=False))
+
+    def test_without_a_polling_scheduler_a_finished_load_is_echoed(self):
+        sched, meta = self._load_then_finish(success=True, scheduler_polls=False)
+        self.assertEqual(meta.finished_load_jobs, {3: "r1"})
+        self.assertEqual(sched._unreported_jobs, [])
+
+    def test_a_failed_load_is_echoed_by_request(self):
+        # A failed load never goes through the poll: the worker echo reports
+        # it as a failed request (vLLM reads failed_recving from a step's
+        # output only).
+        sched, meta = self._load_then_finish(success=False)
+        self.assertEqual(meta.finished_load_jobs, {3: "r1"})
+        self.assertEqual(meta.failed_load_req_ids, {"r1"})
+        self.assertIsNone(sched.poll_and_complete_transfers(idle=False))
+
+    def test_the_scheduler_applies_a_poll_as_it_applies_the_echo(self):
+        """vLLM's Scheduler._update_from_kv_xfer_finished, which applies a
+        step's output, applies the poll's output: one update_connector_output
+        call with the completed jobs, and the request becomes schedulable."""
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
             OffloadingConnectorScheduler,
         )
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from vllm.v1.request import RequestStatus
 
         store = FakeKVCacheStore()
         manager = make_manager(store)
         seed_host_entries(store, _key(0))
         manager.prepare_load([_key(0)], _ctx("r1"))
         sched = self._make_scheduler(manager)
+        self._track_load(sched)
         self._build_meta(
             sched, self._stock_meta(load_jobs={3: self._load_job([_key(0)], [10])})
         )
-        scheduler = self._attach_scheduler(sched)
-        store.complete_load(sub_hashes(_key(0)), success=success)
-        with patch.object(OffloadingConnectorScheduler, "update_connector_output"):
-            meta = self._build_meta(sched, self._stock_meta())
-        return meta, scheduler
+        store.complete_load(sub_hashes(_key(0)))
+        output = sched.poll_and_complete_transfers(idle=False)
+        engine = SimpleNamespace(
+            connector=sched,
+            requests={
+                "r1": SimpleNamespace(
+                    request_id="r1", status=RequestStatus.WAITING_FOR_REMOTE_KVS
+                )
+            },
+            finished_recving_kv_req_ids=set(),
+            _set_kv_fetch_stage=MagicMock(),
+        )
+        with patch.object(
+            OffloadingConnectorScheduler, "update_connector_output"
+        ) as upstream:
+            Scheduler._update_from_kv_xfer_finished(engine, output)
+        upstream.assert_called_once_with(output)
+        self.assertEqual(output.kv_connector_worker_meta.completed_jobs, {3: 2})
+        self.assertEqual(engine.finished_recving_kv_req_ids, {"r1"})
 
-    def test_direct_completion_finishes_a_load_on_the_scheduler(self):
-        # With the scheduler attached by the schedule-start poll, a finished
-        # load completes on the scheduler at once instead of being echoed.
-        meta, scheduler = self._load_then_finish(success=True)
-        self.assertEqual(meta.finished_load_jobs, {})
-        self.assertEqual(meta.failed_load_req_ids, set())
-        (call,) = scheduler._update_from_kv_xfer_finished.call_args_list
-        self.assertEqual(call.args[0].finished_recving, {"r1"})
-
-    def test_direct_completion_reports_a_failed_load_by_request(self):
-        # A failed load is never completed directly: it travels through the
-        # worker echo and reaches the scheduler as a failed request.
-        meta, scheduler = self._load_then_finish(success=False)
-        self.assertEqual(meta.finished_load_jobs, {3: "r1"})
-        self.assertEqual(meta.failed_load_req_ids, {"r1"})
-        scheduler._update_from_kv_xfer_finished.assert_not_called()
+    def test_a_flushed_store_after_a_poll_completes_with_the_next_poll(self):
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        manager.prepare_store([_key(0)], _ctx())
+        sched = self._make_scheduler(manager)
+        sched._jobs = {7: SimpleNamespace(is_store=True, req_id="r1")}
+        sched._req_status = {}
+        self.assertIsNone(sched.poll_and_complete_transfers(idle=False))
+        self._build_meta(
+            sched, self._stock_meta(store_jobs={7: self._store_job([_key(0)], [5])})
+        )
+        meta = self._build_meta(sched, self._stock_meta(jobs_to_flush={7}))
+        self.assertEqual(meta.finished_store_job_ids, [])
+        output = sched.poll_and_complete_transfers(idle=False)
+        self.assertEqual(output.kv_connector_worker_meta.completed_jobs, {7: 2})
+        self.assertEqual(output.finished_recving, set())
 
     def test_flush_cancels_fence_pending_store(self):
         store = FakeKVCacheStore()
@@ -1440,7 +1508,9 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         sched.manager = manager
         sched._raiden_manager = manager
         sched._fence_pending = {}
-        sched._scheduler = None
+        sched._scheduler_polls = False
+        sched._unreported_jobs = []
+        sched._unreported_store_ids = []
         sched._pending_failed_jobs = []
         sched._max_async_load_reqs = 0
         sched._req_status = {}
@@ -1750,36 +1820,75 @@ class TestSchedulerUpstreamContract(unittest.TestCase):
         from vllm.v1.request import RequestStatus
 
         sched = self._sched()
-        sched._jobs = {5: SimpleNamespace(is_store=False)}
+        sched.config = SimpleNamespace(num_workers=2)
+        sched._jobs = {5: SimpleNamespace(is_store=False, req_id="r1")}
+        sched._req_status = {
+            "r1": SimpleNamespace(
+                transfer_jobs={5},
+                req=SimpleNamespace(
+                    status=RequestStatus.WAITING_FOR_REMOTE_KVS
+                    if waiting
+                    else RequestStatus.WAITING
+                ),
+            )
+        }
+        sched._unreported_jobs = []
+        sched._unreported_store_ids = []
+        sched._pending_failed_jobs = []
         manager = MagicMock()
         manager.poll_finished_jobs.return_value = []
         manager.has_pending_work.return_value = True
         sched._raiden_manager = manager
-        request = SimpleNamespace(
-            request_id="r1",
-            status=RequestStatus.WAITING_FOR_REMOTE_KVS
-            if waiting
-            else RequestStatus.WAITING,
-        )
-        scheduler = SimpleNamespace(
-            kv_holding_waiting=[request],
-            finished_recving_kv_req_ids=set(),
-            running=[object()],
-        )
-        return sched, scheduler
+        return sched, manager
 
-    def test_poll_waits_for_a_load_parked_in_kv_holding_waiting(self):
+    def test_poll_waits_for_a_load_a_request_waits_for(self):
         from vllm_torchtpu.offload import raiden_connector
 
         with patch.object(raiden_connector, "_LOAD_WAIT_MS", 0.5):
-            sched, scheduler = self._poll_sched(waiting=True)
-            _, early, waited_reqs, waited = sched.poll_and_complete_transfers(scheduler)
-            self.assertEqual((early, waited_reqs, waited), (0, 0, True))
-            self.assertIs(sched._scheduler, scheduler)
+            sched, manager = self._poll_sched(waiting=True)
+            self.assertIsNone(sched.poll_and_complete_transfers(idle=False))
+            self.assertGreater(manager.poll_finished_jobs.call_count, 1)
 
-            sched, scheduler = self._poll_sched(waiting=False)
-            _, _, _, waited = sched.poll_and_complete_transfers(scheduler)
-            self.assertFalse(waited)
+            sched, manager = self._poll_sched(waiting=False)
+            self.assertIsNone(sched.poll_and_complete_transfers(idle=False))
+            manager.poll_finished_jobs.assert_called_once_with()
+
+    def test_a_failing_wait_keeps_the_transfers_already_collected(self):
+        """The first poll takes a finished store off the manager; the wait
+        for r1's load then raises. The store's completion is still returned
+        (the manager would not hand it out again)."""
+        from vllm_torchtpu.offload import raiden_connector
+        from vllm_torchtpu.offload.raiden_store import AdmissionOp
+
+        sched, manager = self._poll_sched(waiting=True)
+        sched._jobs[7] = SimpleNamespace(is_store=True, req_id="r2")
+        stored = SimpleNamespace(
+            job_id=7, op=AdmissionOp.STORE, req_id="r2", failed_device_block_ids=[]
+        )
+        manager.poll_finished_jobs.side_effect = [[stored], RuntimeError("store down")]
+        with (
+            patch.object(raiden_connector, "_LOAD_WAIT_MS", 1000.0),
+            self.assertLogs(raiden_connector.logger.name, "ERROR"),
+        ):
+            output = sched.poll_and_complete_transfers(idle=False)
+        self.assertEqual(output.kv_connector_worker_meta.completed_jobs, {7: 2})
+        self.assertEqual(output.finished_recving, set())
+        self.assertEqual(manager.poll_finished_jobs.call_count, 2)
+
+    def test_poll_returns_a_load_that_lands_while_it_waits(self):
+        from vllm_torchtpu.offload import raiden_connector
+        from vllm_torchtpu.offload.raiden_store import AdmissionOp
+
+        sched, manager = self._poll_sched(waiting=True)
+        landed = SimpleNamespace(
+            job_id=5, op=AdmissionOp.LOAD, req_id="r1", failed_device_block_ids=[]
+        )
+        manager.poll_finished_jobs.side_effect = [[], [], [landed]]
+        with patch.object(raiden_connector, "_LOAD_WAIT_MS", 1000.0):
+            output = sched.poll_and_complete_transfers(idle=True)
+        self.assertEqual(output.finished_recving, {"r1"})
+        self.assertEqual(output.kv_connector_worker_meta.completed_jobs, {5: 2})
+        self.assertEqual(manager.poll_finished_jobs.call_count, 3)
 
 
 class TestHostTierRecency(unittest.TestCase):
@@ -2078,7 +2187,9 @@ class TestOffloadConnectorOptions(unittest.TestCase):
         sched._raiden_manager = MagicMock()
         sched._raiden_manager.poll_finished_jobs.return_value = []
         sched._fence_pending = {}
-        sched._scheduler = None
+        sched._scheduler_polls = False
+        sched._unreported_jobs = []
+        sched._unreported_store_ids = []
         sched._pending_failed_jobs = []
         with patch.object(
             OffloadingConnectorScheduler, "get_num_new_matched_tokens"
