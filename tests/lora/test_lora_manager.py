@@ -59,6 +59,7 @@ from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from tests.distributed.tpu_test_utils import run_in_isolated_process
 from vllm_torchtpu.layers.adapter.custom_ops import lora_slot_update_op
 from vllm_torchtpu.lora import lora_manager
+from vllm_torchtpu.lora.layers import TpuRowParallelLinearWithLoRA
 from vllm_torchtpu.lora.lora_manager import (
     TPULoRAModelManager,
     TPUWorkerLoRAManager,
@@ -264,9 +265,15 @@ def _manager(cls, layers):
     needs a whole model and distributed setup, so this sets only the state
     activate_adapter uses."""
     manager = cls.__new__(cls)
+    _set_manager_state(manager, layers)
+    return manager
+
+
+def _set_manager_state(manager, layers, device=CPU):
     manager.lora_config = LoRAConfig(
         max_lora_rank=MAX_RANK, max_loras=NUM_SLOTS, max_cpu_loras=MAX_CPU_LORAS
     )
+    manager.device = device
     manager.modules = layers
     manager.is_pooling_model = False
     manager.lora_index_to_id = [None] * NUM_SLOTS
@@ -274,7 +281,6 @@ def _manager(cls, layers):
         MAX_CPU_LORAS, manager.deactivate_adapter
     )
     manager._active_adapters = AdapterLRUCache(NUM_SLOTS, manager._deactivate_adapter)
-    return manager
 
 
 def _managers(make_layers=_layers, device=CPU):
@@ -502,7 +508,34 @@ def test_every_vllm_lora_layer_class_is_classified():
         if isinstance(cls, type) and issubclass(cls, BaseLayerWithLoRA)
     } - {BaseLayerWithLoRA}
 
-    assert layer_classes == set(lora_manager._SUPPORTED_LAYERS) | takes_vllm_writes
+    # The TPU layer changes only RowParallelLinearWithLoRA's forward.
+    tpu_classes = {TpuRowParallelLinearWithLoRA}
+    assert layer_classes | tpu_classes == (
+        set(lora_manager._SUPPORTED_LAYERS) | takes_vllm_writes
+    )
+
+
+def test_manager_swaps_in_the_tpu_row_parallel_layer(monkeypatch, slot_writes):
+    """TPULoRAModelManager retypes the row-parallel layers vLLM created, and
+    still stages their writes."""
+    layers = _layers()
+    assert type(layers["row"]) is RowParallelLinearWithLoRA
+    # vLLM's __init__ wraps a whole model's layers; this leaves its state over
+    # the hand-built ones.
+    monkeypatch.setattr(
+        LRUCacheLoRAModelManager,
+        "__init__",
+        lambda self: _set_manager_state(self, layers),
+    )
+
+    manager = TPULoRAModelManager()
+
+    assert type(layers["row"]) is TpuRowParallelLinearWithLoRA
+    assert manager._slot_writer is not None
+    vllm_manager = _manager(LRUCacheLoRAModelManager, _layers())
+    _activate((manager, vllm_manager), _adapter(1, layers))
+    assert slot_writes == [0]
+    _assert_same_slots(manager, vllm_manager)
 
 
 def test_worker_without_lora_layers_activates_without_writes(slot_writes):

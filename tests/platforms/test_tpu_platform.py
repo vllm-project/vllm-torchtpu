@@ -41,6 +41,7 @@ from vllm.v1.engine.input_processor import InputProcessor
 import vllm_torchtpu as plugin
 import vllm_torchtpu.platforms.tpu_platform as tpu_platform
 from vllm_torchtpu import patch_registry
+from vllm_torchtpu.gqa_head_padding import update_gqa_head_padding_config
 from vllm_torchtpu.platforms.tpu_platform import (
     TPU_2D_TORUS_MULTIHOST_TOPOLOGY_MAP,
     TPU_3D_TORUS_DUAL_DEVICE_TOPOLOGY_MAP,
@@ -1161,16 +1162,19 @@ class TestPhasedProfilingConfigValidation:
 
 
 class TestLoRAConfigValidation:
-    """LoRA runs on a single chip with a dense generative model and no
-    speculative decoding; any other setting is rejected at startup, by name."""
+    """LoRA runs on a dense generative model with no speculative decoding, on
+    one chip or with tensor parallelism; any other setting is rejected at
+    startup, by name."""
 
     @staticmethod
     def _config(
         *,
         is_moe=False,
+        is_hybrid=False,
         runner_type="generate",
         speculative_config=None,
         lora=None,
+        model=None,
         **parallel,
     ):
         # By the time the platform hook runs, verify_with_model_config has
@@ -1179,7 +1183,11 @@ class TestLoRAConfigValidation:
         return SimpleNamespace(
             lora_config=LoRAConfig(**lora),
             model_config=SimpleNamespace(
-                is_moe=is_moe, runner_type=runner_type, dtype=torch.bfloat16
+                is_moe=is_moe,
+                is_hybrid=is_hybrid,
+                runner_type=runner_type,
+                dtype=torch.bfloat16,
+                **(model or {}),
             ),
             parallel_config=ParallelConfig(**parallel),
             speculative_config=speculative_config,
@@ -1191,6 +1199,33 @@ class TestLoRAConfigValidation:
     def test_single_chip_dense_model_passes(self, lora):
         _validate_lora_config(self._config(lora=lora))
 
+    def test_tensor_parallel_dense_model_passes(self):
+        _validate_lora_config(self._config(tensor_parallel_size=4))
+
+    @pytest.mark.parametrize(("tp_size", "padded"), [(1, False), (4, False), (8, True)])
+    def test_padded_query_heads_are_rejected(self, tp_size, padded):
+        """Qwen2.5-7B has 28 query heads and 4 KV heads, which the model's
+        config hook pads at TP=8."""
+        config = self._config(
+            tensor_parallel_size=tp_size,
+            model={
+                "model_arch_config": SimpleNamespace(total_num_attention_heads=28),
+                "get_total_num_kv_heads": lambda: 4,
+            },
+        )
+        update_gqa_head_padding_config(config.model_config, config.parallel_config)
+
+        if not padded:
+            _validate_lora_config(config)
+            return
+        with pytest.raises(
+            ValueError, match="tensor_parallel_size that pads the query heads"
+        ):
+            _validate_lora_config(config)
+
+    def test_single_chip_hybrid_model_passes(self):
+        _validate_lora_config(self._config(is_hybrid=True))
+
     def test_without_lora_nothing_is_checked(self):
         config = self._config(tensor_parallel_size=2)
         config.lora_config = None
@@ -1200,7 +1235,6 @@ class TestLoRAConfigValidation:
     @pytest.mark.parametrize(
         "kwargs,setting",
         [
-            ({"tensor_parallel_size": 2}, "tensor_parallel_size > 1"),
             ({"data_parallel_size": 2}, "data_parallel_size > 1"),
             ({"pipeline_parallel_size": 2}, "pipeline_parallel_size > 1"),
             (
@@ -1213,6 +1247,10 @@ class TestLoRAConfigValidation:
                 "decode_context_parallel_size > 1",
             ),
             ({"speculative_config": object()}, "speculative decoding"),
+            (
+                {"tensor_parallel_size": 2, "is_hybrid": True},
+                "tensor_parallel_size > 1 on a hybrid model",
+            ),
             ({"is_moe": True}, "MoE models"),
             ({"runner_type": "pooling"}, "pooling models"),
             ({"lora": {"fully_sharded_loras": True}}, "fully_sharded_loras"),
@@ -1232,14 +1270,12 @@ class TestLoRAConfigValidation:
             _validate_lora_config(self._config(**kwargs))
 
     def test_every_unsupported_setting_is_listed(self):
-        config = self._config(
-            tensor_parallel_size=2, lora={"lora_dtype": torch.float16}
-        )
+        config = self._config(data_parallel_size=2, lora={"lora_dtype": torch.float16})
 
         with pytest.raises(ValueError) as excinfo:
             _validate_lora_config(config)
 
-        assert "tensor_parallel_size > 1" in str(excinfo.value)
+        assert "data_parallel_size > 1" in str(excinfo.value)
         assert "lora_dtype torch.float16" in str(excinfo.value)
 
 

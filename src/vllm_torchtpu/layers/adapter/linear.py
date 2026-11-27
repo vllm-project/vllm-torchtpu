@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Callable
+
 import torch
 from torch.nn import Parameter
 from vllm.distributed import (
@@ -19,6 +21,41 @@ from vllm.distributed import (
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.linear import RowParallelLinear
+
+
+def defers_bias(layer: RowParallelLinear) -> bool:
+    """Whether the layer reduces over ranks and has a bias to add to the sum."""
+    return (
+        layer.reduce_results
+        and layer.tp_size > 1
+        and not layer.skip_bias_add
+        and layer.bias is not None
+    )
+
+
+def forward_with_deferred_bias(
+    layer: RowParallelLinear,
+    input_: torch.Tensor,
+    gemm: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+    """RowParallelLinear's forward with the bias added after the all-reduce.
+
+    ``gemm`` computes this rank's product without a bias. Call this only when
+    ``defers_bias(layer)`` holds.
+    """
+    if layer.input_is_parallel:
+        input_parallel = input_
+    else:
+        split_input = split_tensor_along_last_dim(input_, num_partitions=layer.tp_size)
+        input_parallel = split_input[layer.tp_rank].contiguous()
+
+    output = tensor_model_parallel_all_reduce(gemm(input_parallel))
+    output = output + layer.bias
+
+    # skip_bias_add is False here, so there is no bias left to return.
+    if not layer.return_bias:
+        return output
+    return output, None
 
 
 @RowParallelLinear.register_oot
@@ -35,32 +72,14 @@ class TpuRowParallelLinear(RowParallelLinear):
     ``super().forward()``.
     """
 
+    # TODO: drop this override once vLLM adds the bias after the all-reduce:
+    # https://github.com/vllm-project/vllm/issues/70000
     def forward(
         self,
         input_,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
-        defer_bias = (
-            self.reduce_results
-            and self.tp_size > 1
-            and not self.skip_bias_add
-            and self.bias is not None
-        )
-        if not defer_bias:
+        if not defers_bias(self):
             return super().forward(input_)
-
-        if self.input_is_parallel:
-            input_parallel = input_
-        else:
-            split_input = split_tensor_along_last_dim(
-                input_, num_partitions=self.tp_size
-            )
-            input_parallel = split_input[self.tp_rank].contiguous()
-
-        output_parallel = self.quant_method.apply(self, input_parallel, None)
-        output = tensor_model_parallel_all_reduce(output_parallel)
-        output = output + self.bias
-
-        # skip_bias_add is False here, so there is no bias left to return.
-        if not self.return_bias:
-            return output
-        return output, None
+        return forward_with_deferred_bias(
+            self, input_, lambda x: self.quant_method.apply(self, x, None)
+        )

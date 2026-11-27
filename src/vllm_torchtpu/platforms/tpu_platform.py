@@ -33,6 +33,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs, patch_registry, rope_in_graph_flag
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
+from vllm_torchtpu.gqa_head_padding import pads_query_heads
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
@@ -419,8 +420,12 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
 def _validate_lora_config(vllm_config: "VllmConfig") -> None:
     """Rejects LoRA settings that the TPU LoRA path does not support yet.
 
-    LoRA runs on a single chip with a dense generative model without
-    speculative decoding. Other settings fail here with the reason.
+    LoRA runs on a dense generative model without speculative decoding, on
+    one chip or with tensor parallelism. Other settings fail here with the
+    reason.
+
+    The model's config hook has run by now, so padded query heads are already
+    recorded on the model config.
     """
     lora_config = vllm_config.lora_config
     if lora_config is None:
@@ -428,9 +433,17 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
     unsupported = {
-        # RowParallelLinearWithLoRA adds the bias on rank 0 only, so the ranks
-        # would compile different graphs.
-        "tensor_parallel_size > 1": parallel_config.tensor_parallel_size > 1,
+        # vLLM slices q_proj's LoRA B and o_proj's LoRA A by the checkpoint's
+        # head layout. gqa_head_padding inserts zero heads into the layers, so
+        # each rank would take the wrong slice of the adapter.
+        "tensor_parallel_size that pads the query heads": pads_query_heads(
+            model_config
+        ),
+        # vLLM does not wrap a sharded subclass of MergedColumnParallelLinear,
+        # so the adapter weights of the GDN projections would be dropped.
+        "tensor_parallel_size > 1 on a hybrid model": (
+            parallel_config.tensor_parallel_size > 1 and model_config.is_hybrid
+        ),
         # Untested; each DP engine has its own LoRA manager.
         "data_parallel_size > 1": parallel_config.data_parallel_size > 1,
         # Untested.
@@ -455,7 +468,7 @@ def _validate_lora_config(vllm_config: "VllmConfig") -> None:
         # hands vLLM's classification head one row per request, so the head
         # rejects the mapping. Embedding models are untested.
         "pooling models": model_config.runner_type == "pooling",
-        # Only meaningful with tensor parallelism.
+        # Untested; tensor parallelism runs vLLM's default LoRA sharding.
         "fully_sharded_loras": lora_config.fully_sharded_loras,
         # The TPU runner never sets the tower or connector mappings.
         "enable_tower_connector_lora": lora_config.enable_tower_connector_lora,
