@@ -243,6 +243,13 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         return None
 
 
+def is_unquantized_tpu_quant_config(
+    quant_config: QuantizationConfig | None,
+) -> bool:
+    """Return True when ``quant_config`` represents unquantized TPU weights."""
+    return quant_config is None or isinstance(quant_config, VllmUnquantizedConfig)
+
+
 class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMethod):
     """
     TPU-native implementation of unquantized RoutedExperts.
