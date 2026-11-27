@@ -76,6 +76,7 @@ __all__ = [
     "ProvenanceMetric",
     "ProvenanceTag",
     "RingPlan",
+    "ScopeEstimate",
     "SupportStatus",
     "WorkloadSpec",
     "as_mapping",
@@ -572,6 +573,7 @@ class WorkloadSpec:
     per_op_step_us: float | None = None
     step_coverage: float | None = None
     batch_explicit: bool = False
+    latent_proj_tp: int = 0
 
     def _validate_literals_and_bools(self) -> None:
         """Enforce exact string literals and strict boolean flags."""
@@ -607,6 +609,7 @@ class WorkloadSpec:
             "microbatches",
             "segment_layers",
             "max_rows_per_call",
+            "latent_proj_tp",
         )
         for lo, names in ((1, pos_ints), (0, nonneg_ints)):
             for name in names:
@@ -644,3 +647,47 @@ class WorkloadSpec:
                 _checked_float(
                     val, f"WorkloadSpec.{name}", lo=lo, hi=hi, strict_lo=strict_lo
                 )
+
+
+@dataclass(frozen=True)
+class ScopeEstimate:
+    """Roofline and VMEM capacity estimate for one fusion scope."""
+
+    scope: FusionScope
+    feasible: bool
+    reason: str
+    ops_per_step: int
+    vmem_static_mib: float
+    max_vmem_tokens: int
+    num_vmem_splits: int
+    step_weight_gb: float
+    critical_weight_gb: float | None
+    act_hbm_mb: float
+    moe_flop_factor: float
+    roof_floor_us: float
+    step_bound_us: float
+    selected_dense_slots: int = 0
+    selected_expert_slots: int = 0
+    step_achievable_us: float = 0.0
+    break_even_op_overhead_us: float = 0.0
+    step_upper_us: float = 0.0
+    compute_us: float = 0.0
+    hbm_us: float = 0.0
+    comm_us: float = 0.0
+    fill_drain_us: float = 0.0
+    launch_us: float = 0.0
+    step_achievable_upper_us: float = 0.0
+    support: SupportStatus = "outside_core_limits"
+    blockers: tuple[str, ...] = ()
+    step_weight_strict_gb: float = 0.0
+    step_floor_strict_us: float = 0.0
+    # Dense compute plus the routed-expert stage, max(routed HBM, MoE compute).
+    # The core is max(hbm_us, chain_us + comm_us) when collectives overlap
+    # inside one fused call (num_vmem_splits == 1), else
+    # max(hbm_us, chain_us) + comm_us.
+    chain_us: float = 0.0
+    expert_mode: str = "none"
+    host_head_us: float = 0.0
+    break_even_host_head_delta_us: float = 0.0
+    ranking_metric: str = "step_bound_us"
+    binding_unit: str = "hbm"
