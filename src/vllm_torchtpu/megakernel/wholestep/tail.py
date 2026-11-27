@@ -26,6 +26,9 @@ lane 1 = global index); the 8-way argmax over ranks is a tiny XLA op after the c
 The mixer is `HCSublayer._mix` (the same weights format as every HC sublayer; its
 injection columns
 are unused here), so the block is an HC sublayer whose inner block returns no partial.
+
+`fp8=True`: the `lm_head` blocks stream as FP8 E4M3 with per-column (vocab entry) f32
+scales (`tail_lm_s`), applied to the f32 block logits: half the bytes of the BF16 head.
 """
 
 from __future__ import annotations
@@ -40,11 +43,20 @@ from jax.experimental.pallas import tpu as pltpu
 from ..blocks.hc import HCSublayer
 from ..exec_spec import ExecSpec
 from ..models.qwen38 import QWEN38_SEGMENT, Qwen38Geometry, Qwen38ResidualGeometry
-from ..ops import BF16, F32, I32
-from ..spec import Block, LayerType, ModelSpec, ScratchReq, StateDecl, WeightDecl
+from ..ops import BF16, F32, FP8, I32
+from ..spec import (
+    Block,
+    LayerType,
+    ModelSpec,
+    ScratchReq,
+    SmallField,
+    StateDecl,
+    WeightDecl,
+)
 
 TOP = "tail_top"
 LM_HEAD = "lm_head"
+LM_SCALE = "tail_lm_s"
 # Widest lm_head column block (one 128-row BF16 tile of a block must fit the bank).
 VOCAB_CHUNK = 8192
 
@@ -74,14 +86,22 @@ class GreedyHead(Block):
     reduction = "none"
     input_norm = None
 
-    def __init__(self, *, vocab_shard: int) -> None:
+    def __init__(self, *, vocab_shard: int, fp8: bool = False) -> None:
         self.vocab_shard = vocab_shard
+        self.fp8 = fp8
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
+        dt = FP8 if self.fp8 else BF16
         return [
-            WeightDecl(name, K=g.H, N=width, dtype=BF16)
+            WeightDecl(name, K=g.H, N=width, dtype=dt)
             for name, _, width in vocab_chunks(self.vocab_shard, vocab_chunk_width(ex))
         ]
+
+    def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
+        if not self.fp8:
+            return []
+        chunks = vocab_chunks(self.vocab_shard, vocab_chunk_width(ex))
+        return [SmallField(LM_SCALE, sum(w for _, _, w in chunks))]
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
         # The dense accumulator holds one lm_head column block's logits.
@@ -105,6 +125,8 @@ class GreedyHead(Block):
         for name, c0, width in vocab_chunks(self.vocab_shard, vocab_chunk_width(ex)):
             with ctx.stream.segment(lazy=False):
                 logits = ctx.stream.dmatmul(name, scr["xb"], width)  # [MB, width] f32
+            if self.fp8:
+                logits = logits * ctx.sm(slot, LM_SCALE)[:, c0 : c0 + width]
             # The stock lm_head (unquantized BF16 linear) returns BF16 logits and the
             # greedy pick is their argmax: pick on the same BF16-rounded values.
             logits = logits.astype(BF16).astype(F32)
@@ -132,11 +154,13 @@ class GreedyHead(Block):
         return None
 
 
-def tail_spec(g: Qwen38Geometry, R: int, *, vocab_shard: int) -> ModelSpec:
+def tail_spec(
+    g: Qwen38Geometry, R: int, *, vocab_shard: int, fp8: bool = False
+) -> ModelSpec:
     """One-layer kernel: the final HC mixer (no combine) feeding `GreedyHead`."""
     gi = g.inner(R, 1)
     head = HCSublayer(
-        GreedyHead(vocab_shard=vocab_shard),
+        GreedyHead(vocab_shard=vocab_shard, fp8=fp8),
         inner_geometry=gi,
         nhc=g.NHC,
         lowrank=g.LOWRANK,

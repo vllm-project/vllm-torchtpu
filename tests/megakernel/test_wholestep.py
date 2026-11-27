@@ -34,7 +34,7 @@ from vllm_torchtpu.megakernel.blocks.hc import RESIDUAL_OUT
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.models import qwen38
 from vllm_torchtpu.megakernel.models.qwen38_pack import shard_step_inputs
-from vllm_torchtpu.megakernel.ops import BF16, F32
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8
 from vllm_torchtpu.megakernel.wholestep import inputs as wi
 from vllm_torchtpu.megakernel.wholestep.qsa_full import KV_NEW
 from vllm_torchtpu.megakernel.wholestep.spec import wholestep_spec
@@ -955,17 +955,21 @@ def test_qsa_first_layout_matches_reference():
     _assert_within_budget(res, np.asarray(ref, np.float32))
 
 
+@pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("V", [384, 8256])
-def test_tail_greedy_tokens_match_reference(V):
+def test_tail_greedy_tokens_match_reference(V, fp8):
     """Final HC mixer + lm_head + per-rank top token + argmax over ranks = the stock
     greedy
     verify (argmax of the full logits, ties to the lower index). `V = 8256`: two lm_head
-    column blocks (`tail.vocab_chunks`), the second one padded past the vocab shard."""
+    column blocks (`tail.vocab_chunks`), the second one padded past the vocab shard.
+    `fp8`: the head streams as FP8 with per-column scales; the reference multiplies by
+    the same dequantized weights."""
     from vllm_torchtpu.megakernel.models.qwen38_inputs import (
         _hc_params,
         hc_weight_arrays,
     )
     from vllm_torchtpu.megakernel.wholestep.tail import (
+        LM_SCALE,
         TOP,
         greedy_tokens,
         tail_reference,
@@ -979,10 +983,17 @@ def test_tail_greedy_tokens_match_reference(V):
     # Wider vocab, closer top-2 logits: spread them so the pick is decided.
     lm = (jax.random.normal(k[1], (R, G.H, V), F32) * (0.05 if V < 1024 else 0.5)).astype(BF16)
     x = jax.random.normal(k[2], (ex.B, G.NHC * G.H), F32).astype(BF16)
+    if fp8:  # per-column FP8, as `qwen38_wholestep_weights._fp8_columns`
+        amax = jnp.abs(lm.astype(F32)).max(axis=-2, keepdims=True)
+        scale = jnp.where(amax > 0, amax / 448.0, 1.0)
+        lm = (lm.astype(F32) / scale).astype(FP8)
+        ref_lm = lm.astype(F32) * scale
+    else:
+        ref_lm = lm
     want, logits = tail_reference(
-        x, {n: v[0] for n, v in hc.items()}, lm, nhc=G.NHC, eps=G.eps
+        x, {n: v[0] for n, v in hc.items()}, ref_lm, nhc=G.NHC, eps=G.eps
     )
-    spec = tail_spec(G, R, vocab_shard=V)
+    spec = tail_spec(G, R, vocab_shard=V, fp8=fp8)
     from vllm_torchtpu.megakernel.models.qwen38_pack import pack_weights
 
     from vllm_torchtpu.megakernel.wholestep.tail import vocab_chunk_width, vocab_chunks
@@ -992,6 +1003,10 @@ def test_tail_greedy_tokens_match_reference(V):
         blk = lm[:, :, c0 : c0 + width]
         w[name] = jnp.pad(blk, ((0, 0), (0, 0), (0, width - blk.shape[-1])))[:, None]
     sm = {"tail_hcn": jnp.broadcast_to(hc["norm"][None], (R, 1, hc["norm"].shape[-1]))}
+    if fp8:
+        cols = sum(width for _, _, width in vocab_chunks(V, vocab_chunk_width(ex)))
+        s_pad = jnp.pad(scale[:, 0], ((0, 0), (0, cols - V)), constant_values=1.0)
+        sm[LM_SCALE] = s_pad[:, None]
     w_mk = pack_weights(spec, ex, w, sm)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     pos = jnp.zeros((ex.M,), jnp.int32)
@@ -999,12 +1014,15 @@ def test_tail_greedy_tokens_match_reference(V):
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk)
     got = np.asarray(greedy_tokens(outs[TOP], R, ex.M))[: ex.B]
-    # Exact unless the reference's own top-2 gap is within rounding of the kernel's
-    # logits.
-    top2 = np.sort(np.asarray(logits), axis=-1)[:, -2:]
-    clear = (top2[:, 1] - top2[:, 0]) > 1e-2
-    assert clear.sum() >= ex.B - 1
+    # The kernel picks on BF16-rounded logits: exact unless the reference's own top-2
+    # gap is within one BF16 ulp of its maximum; within that ulp everywhere.
+    ref = np.asarray(logits)
+    top2 = np.sort(ref, axis=-1)[:, -2:]
+    ulp = 2.0 ** (np.floor(np.log2(np.abs(top2[:, 1]))) - 7)
+    clear = (top2[:, 1] - top2[:, 0]) > ulp
+    assert clear.sum() >= ex.B // 2
     np.testing.assert_array_equal(got[clear], np.asarray(want)[clear])
+    assert (ref[np.arange(ex.B), got] >= top2[:, 1] - ulp).all()
 
 
 def test_last_layer_with_tail_in_one_call():

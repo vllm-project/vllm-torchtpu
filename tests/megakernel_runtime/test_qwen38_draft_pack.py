@@ -70,7 +70,8 @@ def test_tail_operands_from_served_mixer(use_combine):
     g = NS(NHC=NHC, H=H, LOWRANK=LR)
     ex = ExecSpec(R=1, B=4, T=1, ctx=128, interpret=True,
                   tiles=Tiles(bank=128 * 256 * 2, nbd=10, nbe=8, ebank=512 << 10))
-    w, hcn = pack_tail_operands(mixer, lm, V, g, ex)
+    w, hcn, lm_s = pack_tail_operands(mixer, lm, V, g, ex)
+    assert lm_s is None
 
     W = NHC * H
     down = mixer.input_mix_weight_down.weight.data  # [LR, W]
@@ -94,3 +95,37 @@ def test_tail_operands_from_served_mixer(use_combine):
     assert cols.dtype == torch.bfloat16
     torch.testing.assert_close(cols[:, :V], lm.weight.t(), rtol=0, atol=0)
     assert hcn.dtype == mixer.hc_norm.weight.dtype
+
+
+@pytest.mark.usefixtures("cpu_vllm_config")
+def test_tail_operands_fp8_head():
+    """`fp8=True`: `lm_head` blocks as FP8 E4M3 with one f32 scale per
+    packed column; dequantized, they are the loaded head (padded columns zero)."""
+    from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
+    from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
+    from vllm_torchtpu.megakernel.wholestep.tail import vocab_chunk_width, vocab_chunks
+    from vllm_torchtpu.megakernel_runtime.qwen38_wholestep_weights import (
+        pack_tail_operands,
+    )
+    from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import GatedResidual
+    from vllm_torchtpu.models.vllm.qwen4_exp.model import hc_config
+
+    H, NHC, LR, V = 256, 4, 16, 640
+    text = q4exp_text_config(
+        hidden_size=H, hc_count=NHC, hc_lowrank=LR, vocab_size=V, num_hidden_layers=2
+    )
+    with torch.device("cpu"):
+        mixer = GatedResidual(hc_config(text), use_combine=False)
+    lm = NS(weight=torch.randn(V, H).to(torch.bfloat16))
+    g = NS(NHC=NHC, H=H, LOWRANK=LR)
+    ex = ExecSpec(R=1, B=4, T=1, ctx=128, interpret=True,
+                  tiles=Tiles(bank=128 * 256 * 2, nbd=10, nbe=8, ebank=512 << 10))
+    w, _, lm_s = pack_tail_operands(mixer, lm, V, g, ex, fp8=True)
+    chunks = vocab_chunks(V, vocab_chunk_width(ex))
+    assert lm_s is not None and lm_s.dtype == torch.float32
+    assert tuple(lm_s.shape) == (sum(width for _, _, width in chunks),)
+    q = torch.cat([w[name][0] for name, _, _ in chunks], dim=1)
+    assert q.dtype == torch.float8_e4m3fn
+    deq = q.float() * lm_s
+    torch.testing.assert_close(deq[:, :V], lm.weight.t().float(), rtol=0.07, atol=1e-3)
+    assert not deq[:, V:].any()

@@ -117,12 +117,13 @@ def _hc_fp8(w: dict, row: Any, prefix: str, nhc: int, layer_js: list[int]) -> No
 
 
 def pack_tail_operands(
-    hc: Any, lm: Any, V: int, g: Qwen38Geometry, ex: ExecSpec
-) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    hc: Any, lm: Any, V: int, g: Qwen38Geometry, ex: ExecSpec, fp8: bool = False
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor | None]:
     """The greedy tail's weights (`wholestep_spec(tail=...)`): the final HC mixer
     (`GatedResidual(use_combine=False)`: no injection, zero columns) and `lm_head` in
     bank-sized column blocks (`tail.vocab_chunks`, the last padded), both BF16 as
-    loaded; returns `(weights, tail_hcn row)`."""
+    loaded; `fp8`: `lm_head` as FP8 with per-column scales. Returns `(weights,
+    tail_hcn row, tail_lm_s row or None)`."""
     from vllm_torchtpu.megakernel.wholestep.tail import vocab_chunk_width, vocab_chunks
 
     hdn, ups = _hc_mix_operands(hc, g)
@@ -130,10 +131,15 @@ def pack_tail_operands(
     for b in range(g.NHC):
         w[f"tail_hup{b}"] = ups[b][None]
     lm_kn = kn(lm, g.H, V)
+    scales = []
     for name, c0, width in vocab_chunks(V, vocab_chunk_width(ex)):
         blk = lm_kn[:, c0 : c0 + width]
-        w[name] = F.pad(blk, (0, width - blk.shape[1]))[None]
-    return w, hc.hc_norm.weight.data
+        blk = F.pad(blk, (0, width - blk.shape[1]))
+        if fp8:
+            blk, s = _fp8_columns(blk)
+            scales.append(s)
+        w[name] = blk[None]
+    return w, hc.hc_norm.weight.data, torch.cat(scales) if fp8 else None
 
 
 def pack_wholestep_operands(
@@ -244,9 +250,14 @@ def pack_wholestep_operands(
         row("sh2_s", j, torch.ones(g.H, device=dev))
 
     if tail is not None:  # final HC mixer (last layer's slot) + lm_head [H, V shard]
-        tw, hcn = pack_tail_operands(*tail, g, ex)
+        from vllm_torchtpu.megakernel.wholestep.tail import LM_SCALE
+
+        fp8_head = LM_SCALE in p.smalls_layout  # GreedyHead(fp8=True)
+        tw, hcn, lm_s = pack_tail_operands(*tail, g, ex, fp8=fp8_head)
         w.update(tw)
         row("tail_hcn", L - 1, hcn)
+        if lm_s is not None:
+            row(LM_SCALE, L - 1, lm_s)
 
     if "moe_hdn_s" in p.smalls_layout:  # VLLM_TPU_MK_HC_FP8 (spec hc_fp8)
         _hc_fp8(w, row, "qsa_full", g.NHC, att)
