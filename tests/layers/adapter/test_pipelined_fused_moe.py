@@ -513,10 +513,10 @@ class TestMoEForwardPrecisionBranches:
             f"and pipelined_fused_moe_gmm ({list(sig_pipelined.parameters.keys())})."
         )
 
-    def test_pipelined_fused_moe_rejects_row_info(self):
-        """row_info must raise, never be silently ignored or reused across
-        chunked DP/PCP calls."""
-        with pytest.raises(NotImplementedError):
+    def test_pipelined_fused_moe_rejects_multi_element_row_info(self):
+        """row_info passed to pipelined_fused_moe_gmm must be a 1-element
+        rank-local valid-token count."""
+        with pytest.raises(ValueError, match="1-element local row_info"):
             pipelined_fused_moe_gmm(
                 hidden_states=torch.randn(4, 64, dtype=torch.bfloat16),
                 w1=torch.empty(0),
@@ -531,8 +531,145 @@ class TestMoEForwardPrecisionBranches:
                 topk=2,
                 activation="silu",
                 skip_padded_tokens=True,
-                row_info=torch.tensor([2], dtype=torch.int32),
+                row_info=torch.tensor([2, 1], dtype=torch.int32),
             )
+
+    def test_pipelined_fused_moe_gathers_and_slices_row_info_per_chunk(self):
+        """Multi-chunk pipelined MoE gathers row_info once across ranks and
+        passes clamped per-rank counts to each chunk's fused_moe_gmm call."""
+        # 4 ranks, seq_len=8, chunk_size=16 -> 2 chunks of 4 local rows each.
+        per_rank_counts = [6, 0, 8, 3]
+
+        class _AsymmetricGroup(_MockCollectiveGroup):
+            def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+                self.call_log.append(("all_gather", tensor.shape, tensor.dtype))
+                if tensor.shape == (1,) and tensor.dtype == torch.int32:
+                    return torch.tensor(per_rank_counts, dtype=torch.int32)
+                return torch.cat([tensor] * self.world_size, dim=dim)
+
+        dp_group = _AsymmetricGroup(world_size=4, rank=0)
+        seq_len, hidden_dim, topk = 8, 16, 2
+        hidden_states = torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16)
+        topk_weights = torch.ones(seq_len, topk, dtype=torch.bfloat16) / topk
+        topk_ids = torch.zeros(seq_len, topk, dtype=torch.int32)
+        seen_row_infos: list[list[int]] = []
+
+        def mock_kernel_fn(**kwargs):
+            ri = kwargs["row_info"]
+            assert ri is not None
+            seen_row_infos.append(ri.tolist())
+            return kwargs["hidden_states"]
+
+        with (
+            patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 16),
+            patch(
+                "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_pcp_group",
+                return_value=None,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_dp_group",
+                return_value=dp_group,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.pipelined_fused_moe.fused_moe_gmm",
+                side_effect=mock_kernel_fn,
+            ),
+        ):
+            out = pipelined_fused_moe_gmm(
+                hidden_states=hidden_states,
+                w1=torch.empty(0),
+                w2=torch.empty(0),
+                w1_scale=None,
+                w2_scale=None,
+                w1_bias=None,
+                w2_bias=None,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                experts_start=torch.zeros((), dtype=torch.int32),
+                topk=topk,
+                activation="silu",
+                skip_padded_tokens=True,
+                row_info=torch.tensor([per_rank_counts[0]], dtype=torch.int32),
+            )
+
+        assert out.shape == (seq_len, hidden_dim)
+        # Chunk 0 covers local rows [0, 4): [min(6,4), 0, min(8,4), min(3,4)]
+        # Chunk 1 covers local rows [4, 8): [6-4, 0, 8-4, max(3-4,0)]
+        assert seen_row_infos == [[4, 0, 4, 3], [2, 0, 4, 0]]
+        # row_info is gathered once (not once per chunk).
+        row_info_gathers = [
+            c
+            for c in dp_group.call_log
+            if c[0] == "all_gather" and c[1] == (1,) and c[2] == torch.int32
+        ]
+        assert len(row_info_gathers) == 1
+
+    @pytest.mark.parametrize(
+        "world_size, expected_counts",
+        [(1, [5]), (4, [5, 0, 8, 2])],
+    )
+    def test_pipelined_fused_moe_single_chunk_row_info(
+        self, world_size, expected_counts
+    ):
+        """Single-rank pipelined MoE skips all_gather and forwards the local
+        count; single-chunk multi-rank gathers distinct per-rank counts."""
+
+        class _SingleChunkGroup(_MockCollectiveGroup):
+            def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+                self.call_log.append(("all_gather", tensor.shape, tensor.dtype))
+                if tensor.shape == (1,) and tensor.dtype == torch.int32:
+                    return torch.tensor(expected_counts, dtype=torch.int32)
+                return torch.cat([tensor] * self.world_size, dim=dim)
+
+        dp_group = _SingleChunkGroup(world_size=world_size, rank=0)
+        seq_len, hidden_dim, topk = 8, 16, 2
+        seen_row_infos: list[list[int]] = []
+
+        def mock_kernel_fn(**kwargs):
+            seen_row_infos.append(kwargs["row_info"].tolist())
+            return kwargs["hidden_states"]
+
+        with (
+            patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 1024),
+            patch(
+                "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_pcp_group",
+                return_value=None,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_dp_group",
+                return_value=dp_group,
+            ),
+            patch(
+                "vllm_torchtpu.layers.adapter.pipelined_fused_moe.fused_moe_gmm",
+                side_effect=mock_kernel_fn,
+            ),
+        ):
+            pipelined_fused_moe_gmm(
+                hidden_states=torch.randn(seq_len, hidden_dim, dtype=torch.bfloat16),
+                w1=torch.empty(0),
+                w2=torch.empty(0),
+                w1_scale=None,
+                w2_scale=None,
+                w1_bias=None,
+                w2_bias=None,
+                topk_weights=torch.ones(seq_len, topk, dtype=torch.bfloat16) / topk,
+                topk_ids=torch.zeros(seq_len, topk, dtype=torch.int32),
+                experts_start=torch.zeros((), dtype=torch.int32),
+                topk=topk,
+                activation="silu",
+                skip_padded_tokens=True,
+                row_info=torch.tensor([expected_counts[0]], dtype=torch.int32),
+            )
+
+        assert seen_row_infos == [expected_counts]
+        ag_calls = [c for c in dp_group.call_log if c[0] == "all_gather"]
+        if world_size == 1:
+            assert ag_calls == []
+        else:
+            row_info_gathers = [
+                c for c in ag_calls if c[1] == (1,) and c[2] == torch.int32
+            ]
+            assert len(row_info_gathers) == 1
 
     @pytest.mark.parametrize("pipelined", [False, True])
     def test_fp8_apply_monolithic_dispatches_with_exact_kwargs(self, pipelined):

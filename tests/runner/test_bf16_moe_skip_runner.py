@@ -48,6 +48,7 @@ def _step(runner, valid: int, padded: int) -> None:
 def _supported_runner(monkeypatch):
     monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
     monkeypatch.delenv("TPU_MOE_COLLECTION_CHUNK_SIZE", raising=False)
+    monkeypatch.delenv("TPU_MOE_SEQUENCE_PARALLEL", raising=False)
     monkeypatch.delenv("USE_MOE_TP_DECODE_KERNEL", raising=False)
     monkeypatch.delenv("FUSED_MOE_DECODE_KERNEL", raising=False)
 
@@ -81,8 +82,26 @@ def test_every_step_updates_padding_state_including_full_buckets():
         assert state.local_padding_mask.tolist() == expected_mask
 
 
-def test_resolve_bf16_policy_supported_enables_skipping(monkeypatch):
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda r, mp: None,
+        lambda r, mp: setattr(r.parallel_config, "enable_expert_parallel", True),
+        lambda r, mp: (
+            setattr(r.parallel_config, "enable_expert_parallel", True),
+            setattr(r.parallel_config, "data_parallel_size", 4),
+        ),
+        lambda r, mp: (
+            setattr(r.parallel_config, "enable_expert_parallel", True),
+            setattr(r.parallel_config, "data_parallel_size", 4),
+            mp.setenv("TPU_MOE_COLLECTION_CHUNK_SIZE", "16"),
+        ),
+    ],
+    ids=["tp_only", "tp_ep", "dp_ep", "dp_ep_pipelined"],
+)
+def test_resolve_bf16_policy_supported_enables_skipping(monkeypatch, mutate):
     runner = _supported_runner(monkeypatch)
+    mutate(runner, monkeypatch)
     policy = runner._resolve_bf16_moe_skip_policy()
     assert policy.enabled is True
     assert policy.fallback_reason is None
@@ -95,14 +114,6 @@ def test_resolve_bf16_policy_supported_enables_skipping(monkeypatch):
         (
             lambda r, mp: setattr(r.vllm_config, "quant_config", object()),
             "quantized model",
-        ),
-        (
-            lambda r, mp: setattr(r.parallel_config, "enable_expert_parallel", True),
-            "expert",
-        ),
-        (
-            lambda r, mp: setattr(r.parallel_config, "data_parallel_size", 2),
-            "data_parallel_size",
         ),
         (
             lambda r, mp: setattr(r.parallel_config, "pipeline_parallel_size", 2),
@@ -118,7 +129,13 @@ def test_resolve_bf16_policy_supported_enables_skipping(monkeypatch):
             lambda r, mp: setattr(r.parallel_config, "decode_context_parallel_size", 2),
             "decode_context_parallel_size",
         ),
-        (lambda r, mp: mp.setenv("TPU_MOE_COLLECTION_CHUNK_SIZE", "16"), "pipelined"),
+        (
+            lambda r, mp: (
+                mp.setenv("TPU_MOE_SEQUENCE_PARALLEL", "1"),
+                mp.setenv("TPU_MOE_COLLECTION_CHUNK_SIZE", "16"),
+            ),
+            "sequence-parallel",
+        ),
         (lambda r, mp: mp.setenv("USE_MOE_TP_DECODE_KERNEL", "1"), "fused MoE decode"),
         (lambda r, mp: mp.setenv("FUSED_MOE_DECODE_KERNEL", "1"), "fused MoE decode"),
         (lambda r, mp: setattr(r, "drafter", object()), "speculative"),

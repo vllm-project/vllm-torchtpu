@@ -68,11 +68,29 @@ def set_padding_state(state: "TokenPaddingState | None") -> None:
     _padding_state = state
 
 
-def get_local_valid_tokens() -> torch.Tensor | None:
-    """Return this rank's 1-element int32 valid-row count tensor, or None."""
-    if _padding_state is None:
+def get_valid_tokens_for_padding(
+    *, is_local_tensor: bool = False
+) -> torch.Tensor | None:
+    """Return valid-row counts aligned with the token tensor reaching MoE.
+
+    Returns a 1-D int32 device tensor of shape ``(num_segments,)``:
+    - ``(1,)`` when ``is_local_tensor=True`` or when the DP group has a single
+      rank (TP-only, TP+EP, or uncoupled DP collapsed per engine).
+    - ``(dp_size,)`` when tokens were gathered across DP ranks before the MoE
+      layer.
+    """
+    if _padding_state is None or _padding_state.local_valid_tokens is None:
         return None
-    return _padding_state.local_valid_tokens
+    valid = _padding_state.local_valid_tokens
+    if is_local_tensor:
+        return valid
+    from vllm.distributed.parallel_state import get_dp_group
+
+    dp_group = get_dp_group()
+    dp_size = int(dp_group.world_size) if dp_group is not None else 1
+    if dp_group is not None and dp_size > 1:
+        valid = dp_group.all_gather(valid, dim=0)
+    return valid
 
 
 def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:

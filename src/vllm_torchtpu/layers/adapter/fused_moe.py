@@ -333,8 +333,9 @@ def fused_moe_gmm(
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
-    With ``skip_padded_tokens`` and a ``row_info`` tensor (1-element int32,
-    the valid prefix row count), the kernel excludes padded rows by row index;
+    With ``skip_padded_tokens`` and a ``row_info`` tensor (1-D int32 valid
+    prefix row counts: 1 element for a single batch or ``num_segments`` elements
+    for gathered DP segments), the kernel excludes padded rows by row index;
     without ``row_info`` it drops routes whose routing weight is zero.
 
     ``experts_start`` is the first global expert id owned by this shard under

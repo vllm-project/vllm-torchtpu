@@ -220,7 +220,7 @@ def test_valid_tokens_allocation_is_gated_by_track_valid_tokens():
     try:
         state_off.update(3, 8)
         assert state_off.local_valid_tokens is None
-        assert token_padding.get_local_valid_tokens() is None
+        assert token_padding.get_valid_tokens_for_padding(is_local_tensor=True) is None
     finally:
         token_padding.set_padding_state(None)
 
@@ -231,11 +231,82 @@ def test_valid_tokens_allocation_is_gated_by_track_valid_tokens():
     token_padding.set_padding_state(state_on)
     try:
         state_on.update(5, 8)
-        count = token_padding.get_local_valid_tokens()
+        count = token_padding.get_valid_tokens_for_padding(is_local_tensor=True)
         assert count is state_on.local_valid_tokens
         assert count is not None and count.tolist() == [5]
         state_on.update(0, 8)
         assert count.tolist() == [0]
     finally:
         token_padding.set_padding_state(None)
-    assert token_padding.get_local_valid_tokens() is None
+    assert token_padding.get_valid_tokens_for_padding(is_local_tensor=True) is None
+
+
+def test_get_valid_tokens_for_padding_local_and_single_rank(monkeypatch):
+    state = TokenPaddingState.create(8, "cpu", track_valid_tokens=True)
+    state.update(5, 8)
+    token_padding.set_padding_state(state)
+
+    class _FailGroup:
+        world_size = 2
+
+        @staticmethod
+        def all_gather(t, dim=0):
+            raise AssertionError("all_gather must not be called")
+
+    class _SingleRankGroup:
+        world_size = 1
+
+        @staticmethod
+        def all_gather(t, dim=0):
+            raise AssertionError("all_gather must not be called for world_size=1")
+
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group", lambda: _FailGroup()
+    )
+    try:
+        local = token_padding.get_valid_tokens_for_padding(is_local_tensor=True)
+        assert local is state.local_valid_tokens
+        assert local is not None and local.tolist() == [5]
+
+        monkeypatch.setattr(
+            "vllm.distributed.parallel_state.get_dp_group", lambda: _SingleRankGroup()
+        )
+        single = token_padding.get_valid_tokens_for_padding(is_local_tensor=False)
+        assert single is state.local_valid_tokens
+        assert single is not None and single.tolist() == [5]
+    finally:
+        token_padding.set_padding_state(None)
+    assert token_padding.get_valid_tokens_for_padding() is None
+
+
+def test_get_valid_tokens_for_padding_gathers_across_dp(monkeypatch):
+    state = TokenPaddingState.create(8, "cpu", track_valid_tokens=True)
+    state.update(3, 8)
+    token_padding.set_padding_state(state)
+
+    class _FakeDpGroup:
+        world_size = 4
+
+        @staticmethod
+        def all_gather(t, dim=0):
+            return torch.cat([t, torch.tensor([0, 8, 2], dtype=t.dtype)], dim=dim)
+
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group", lambda: _FakeDpGroup()
+    )
+    try:
+        gathered = token_padding.get_valid_tokens_for_padding(is_local_tensor=False)
+        assert gathered is not None
+        assert gathered.dtype == torch.int32
+        assert gathered.tolist() == [3, 0, 8, 2]
+    finally:
+        token_padding.set_padding_state(None)
+
+
+def test_get_valid_tokens_for_padding_returns_none_when_untracked():
+    state = TokenPaddingState.create(8, "cpu", track_valid_tokens=False)
+    token_padding.set_padding_state(state)
+    try:
+        assert token_padding.get_valid_tokens_for_padding() is None
+    finally:
+        token_padding.set_padding_state(None)

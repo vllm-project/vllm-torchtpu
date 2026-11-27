@@ -342,12 +342,14 @@ def prepare_routed_gmm_inputs(
     """Prepare the local-only routing layout using already-local expert ids.
 
     With ``skip_padded_tokens=True`` the valid mask also drops the padded rows'
-    routes. With ``row_info`` (BF16 MoE: a 1-element int32 array holding the
-    number of valid prefix rows), rows at index ``>= row_info[0]`` are padding,
-    and real rows keep stock dispatch even if a routing weight is zero. Without
-    ``row_info`` (FP8 / MXFP4 MoE), the caller zeroed the padded rows' routing
-    weights and routes whose weight is zero are dropped. ``row_info`` is
-    ignored without ``skip_padded_tokens``.
+    routes. With ``row_info`` (BF16 MoE: a 1-D int32 array of valid prefix row
+    counts — length 1 for a single contiguous batch, or length ``num_segments``
+    for equal-sized rank segments gathered across DP), rows at local segment
+    index ``>= row_info[segment]`` are padding, and real rows keep stock
+    dispatch even if a routing weight is zero. Without ``row_info`` (FP8 / MXFP4
+    MoE), the caller zeroed the padded rows' routing weights and routes whose
+    weight is zero are dropped. ``row_info`` is ignored without
+    ``skip_padded_tokens``.
 
     For non-EP runs `topk_indices_local` is always non-negative, so without
     ``skip_padded_tokens`` the valid-mask path computed below is a no-op
@@ -362,9 +364,21 @@ def prepare_routed_gmm_inputs(
     token_indices_flat = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)
 
     if skip_padded_tokens and row_info is not None:
-        valid_mask = (topk_indices_flat >= 0) & (
-            token_indices_flat < row_info.reshape(-1)[0]
-        )
+        row_counts = row_info.reshape(-1)
+        num_segments = row_counts.shape[0]
+        if num_segments == 1:
+            valid_mask = (topk_indices_flat >= 0) & (token_indices_flat < row_counts[0])
+        else:
+            assert num_tokens_local % num_segments == 0, (
+                f"num_tokens ({num_tokens_local}) must be divisible by "
+                f"row_info segments ({num_segments})"
+            )
+            rows_per_segment = num_tokens_local // num_segments
+            row_valid = (
+                jnp.arange(rows_per_segment, dtype=jnp.int32)[None, :]
+                < row_counts[:, None]
+            ).reshape(-1)
+            valid_mask = (topk_indices_flat >= 0) & row_valid.repeat(topk)
     elif skip_padded_tokens:
         # Padded tokens keep their selected expert ids, but carry zero
         # expert routing weights. Treat them as invalid to remove them

@@ -37,6 +37,7 @@ def _resolve(**overrides):
         "skip_flag": True,
         "parallel_config": _supported_parallel_config(),
         "pipelined_collective": False,
+        "sequence_parallel": False,
         "fused_decode_kernel": False,
         "has_speculative": False,
         "has_lora": False,
@@ -46,8 +47,25 @@ def _resolve(**overrides):
     return msp.resolve_bf16_moe_skip_policy(**kwargs)
 
 
-def test_resolve_policy_supported_enables_skipping():
-    policy = _resolve()
+@pytest.mark.parametrize(
+    "parallel_overrides, extra_overrides",
+    [
+        ({}, {}),
+        ({"enable_expert_parallel": True}, {}),
+        ({"enable_expert_parallel": True}, {"sequence_parallel": True}),
+        ({"enable_expert_parallel": True, "data_parallel_size": 4}, {}),
+        (
+            {"enable_expert_parallel": True, "data_parallel_size": 4},
+            {"pipelined_collective": True},
+        ),
+    ],
+    ids=["tp_only", "tp_ep", "tp_ep_seq_parallel", "dp_ep", "dp_ep_pipelined"],
+)
+def test_resolve_policy_supported_enables_skipping(parallel_overrides, extra_overrides):
+    policy = _resolve(
+        parallel_config=_supported_parallel_config(**parallel_overrides),
+        **extra_overrides,
+    )
     assert policy.enabled is True
     assert policy.fallback_reason is None
 
@@ -61,8 +79,6 @@ def test_resolve_policy_flag_off_is_stock_without_reason():
 @pytest.mark.parametrize(
     "missing",
     [
-        "enable_expert_parallel",
-        "data_parallel_size",
         "pipeline_parallel_size",
         "prefill_context_parallel_size",
         "decode_context_parallel_size",
@@ -81,18 +97,6 @@ def test_resolve_policy_fails_loudly_on_missing_parallel_field(missing):
     "overrides, expected_fragment",
     [
         ({"is_unquantized_model": False}, "quantized model"),
-        (
-            {
-                "parallel_config": _supported_parallel_config(
-                    enable_expert_parallel=True
-                )
-            },
-            "expert",
-        ),
-        (
-            {"parallel_config": _supported_parallel_config(data_parallel_size=2)},
-            "data_parallel_size",
-        ),
         (
             {"parallel_config": _supported_parallel_config(pipeline_parallel_size=2)},
             "pipeline_parallel_size",
@@ -113,7 +117,10 @@ def test_resolve_policy_fails_loudly_on_missing_parallel_field(missing):
             },
             "decode_context_parallel_size",
         ),
-        ({"pipelined_collective": True}, "pipelined"),
+        (
+            {"sequence_parallel": True, "pipelined_collective": True},
+            "sequence-parallel",
+        ),
         ({"fused_decode_kernel": True}, "fused MoE decode"),
         ({"has_speculative": True}, "speculative"),
         ({"has_lora": True}, "LoRA"),

@@ -395,12 +395,29 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             topk_weights_float32=self._tpu_topk_weights_float32,
         )
 
+        use_pipelined = enable_pipelined_collective_and_compute()
         row_info = None
         if self._skip_padded_tokens:
-            # Rows at index >= the local valid-token count are padding. The
-            # runner allocates the count whenever it turns skipping on.
-            row_info = token_padding.get_local_valid_tokens()
+            par = layer.moe_config.moe_parallel_config
+            assert not (use_pipelined and par.is_sequence_parallel), (
+                "BF16 MoE padded-token skipping does not support "
+                "TPU_MOE_SEQUENCE_PARALLEL=1 with TPU_MOE_COLLECTION_CHUNK_SIZE"
+            )
+            # Rows at segment-local index >= valid-token count are padding.
+            # Pipelined mode gathers the local count inside pipelined_fused_moe_gmm
+            # (and slices it per chunk); non-pipelined mode gathers per-rank counts
+            # across DP when DP > 1 to match the DP-gathered token buffer. Under
+            # TPU_MOE_SEQUENCE_PARALLEL=1 (TP+EP, dp_size=1), EP-rank all-gather
+            # rebuilds the original [B] row order so the 1-element count applies.
+            row_info = token_padding.get_valid_tokens_for_padding(
+                is_local_tensor=use_pipelined
+            )
             assert row_info is not None, "TokenPaddingState tracks no valid tokens"
+            expected_segments = 1 if use_pipelined else int(par.dp_size)
+            assert row_info.shape[0] == expected_segments, (
+                f"row_info segments ({row_info.shape[0]}) != expected "
+                f"({expected_segments})"
+            )
         kwargs: dict[str, Any] = {
             "topk_weights_float32": self._tpu_topk_weights_float32,
             "hidden_states": x,
@@ -418,7 +435,7 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             "skip_padded_tokens": self._skip_padded_tokens,
             "row_info": row_info,
         }
-        if enable_pipelined_collective_and_compute():
+        if use_pipelined:
             return pipelined_fused_moe_gmm(**kwargs)
 
         return fused_moe_gmm(**kwargs)

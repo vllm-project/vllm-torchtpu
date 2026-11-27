@@ -8388,6 +8388,7 @@ class TPUModelRunner(GPUModelRunner):
             skip_flag=bool(envs.TPU_MOE_SKIP_PADDED_TOKENS),
             parallel_config=self.parallel_config,
             pipelined_collective=enable_pipelined_collective_and_compute(),
+            sequence_parallel=bool(envs.TPU_MOE_SEQUENCE_PARALLEL),
             fused_decode_kernel=bool(
                 envs.USE_MOE_TP_DECODE_KERNEL or envs.FUSED_MOE_DECODE_KERNEL
             ),

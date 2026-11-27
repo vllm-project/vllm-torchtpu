@@ -224,17 +224,17 @@ def pipelined_fused_moe_gmm(
         activation: Gated activation function string (e.g., "silu" for SwiGLU).
         rhs_quant_dtype: Optional RHS quantization data type.
         skip_padded_tokens: Optional flag to skip padded tokens.
-        row_info: Unsupported in pipelined mode; must be None.
+        row_info: Optional 1-element int32 local valid-row count tensor. When
+            provided, gathered once across the collective group and sliced per
+            chunk for ``fused_moe_gmm``.
 
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
-    if row_info is not None:
-        # Each chunk holds rows gathered from several ranks, so one local
-        # valid-row count would drop real rows of the other ranks.
-        raise NotImplementedError(
-            "pipelined_fused_moe_gmm does not support row_info (chunked DP/PCP "
-            "layouts cannot reuse a single local valid-row count)."
+    if row_info is not None and row_info.numel() != 1:
+        raise ValueError(
+            "pipelined_fused_moe_gmm expects a 1-element local row_info "
+            f"tensor, got shape {tuple(row_info.shape)}."
         )
     collective_group, _ = _get_moe_collective_group()
 
@@ -266,10 +266,16 @@ def pipelined_fused_moe_gmm(
                 if topk_ids is not None
                 else None
             )
+            ag_row_info = (
+                collective_group.all_gather(row_info.reshape(1), dim=0)
+                if row_info is not None
+                else None
+            )
         else:
             ag_hidden_states = hidden_states
             ag_topk_weights = topk_weights
             ag_topk_ids = topk_ids
+            ag_row_info = row_info
 
         out = fused_moe_gmm(
             hidden_states=ag_hidden_states,
@@ -288,6 +294,7 @@ def pipelined_fused_moe_gmm(
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
             topk_weights_float32=topk_weights_float32,
+            row_info=ag_row_info,
         )
 
         if parallel_size > 1:
@@ -297,6 +304,14 @@ def pipelined_fused_moe_gmm(
 
     _log_active_chunk_pipeline()
     assert collective_group is not None
+
+    # Gather per-rank valid-token counts once; each chunk derives its own
+    # per-rank valid counts by shifting and clamping to [0, chunk_size_local].
+    ag_row_info = (
+        collective_group.all_gather(row_info.reshape(1), dim=0)
+        if row_info is not None
+        else None
+    )
 
     # Slice local inputs into num_chunks chunks along dim 0
     hs_slices = [
@@ -359,6 +374,12 @@ def pipelined_fused_moe_gmm(
                 else None
             )
 
+        chunk_row_info = (
+            (ag_row_info - i * chunk_size_local).clamp(0, chunk_size_local)
+            if ag_row_info is not None
+            else None
+        )
+
         # Compute MoE kernel for current gathered chunk
         out_i = fused_moe_gmm(
             hidden_states=ag_hs_curr,
@@ -376,6 +397,7 @@ def pipelined_fused_moe_gmm(
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
             topk_weights_float32=topk_weights_float32,
+            row_info=chunk_row_info,
         )
 
         # Reduce-scatter partial output for current chunk. The group's

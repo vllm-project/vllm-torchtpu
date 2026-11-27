@@ -38,11 +38,17 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
 _TOPK = 2
 
 
-def _moe_cfg(use_ep: bool = False):
+def _moe_cfg(
+    use_ep: bool = False, dp_size: int = 1, is_sequence_parallel: bool = False
+):
     return SimpleNamespace(
         experts_per_token=_TOPK,
         has_bias=False,
-        moe_parallel_config=SimpleNamespace(use_ep=use_ep),
+        moe_parallel_config=SimpleNamespace(
+            use_ep=use_ep,
+            dp_size=dp_size,
+            is_sequence_parallel=is_sequence_parallel,
+        ),
     )
 
 
@@ -53,12 +59,16 @@ def _method(*, skip_padded_tokens: bool) -> VllmUnquantizedFusedMoEMethod:
     return method
 
 
-def _dummy_layer(use_ep: bool = False):
+def _dummy_layer(
+    use_ep: bool = False, dp_size: int = 1, is_sequence_parallel: bool = False
+):
     return SimpleNamespace(
         w13_weight=torch.zeros(4, 128, 256, dtype=torch.bfloat16),
         w2_weight=torch.zeros(4, 128, 128, dtype=torch.bfloat16),
         _experts_start=torch.zeros((), dtype=torch.int32),
-        moe_config=_moe_cfg(use_ep=use_ep),
+        moe_config=_moe_cfg(
+            use_ep=use_ep, dp_size=dp_size, is_sequence_parallel=is_sequence_parallel
+        ),
     )
 
 
@@ -72,6 +82,10 @@ def capture_forward(monkeypatch):
     fused_calls: list[dict] = []
     pipelined_calls: list[dict] = []
 
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
     monkeypatch.setattr(
         module.moe_routing, "route", lambda layer, x, logits, **kwargs: (weights, ids)
     )
@@ -130,6 +144,87 @@ def test_count_forward_passes_count_and_does_not_zero_weights(capture_forward):
     assert int(call["row_info"].item()) == 2
     # Padded rows keep their original non-zero weights (exclusion is by count).
     assert torch.equal(call["topk_weights"], capture_forward.weights)
+
+
+def test_ep_non_pipelined_gathers_valid_tokens_and_pipelined_passes_local(
+    capture_forward, monkeypatch
+):
+    """Under DP+EP, non-pipelined forward gathers per-rank valid counts across
+    DP to match the already-gathered token tensor; pipelined forward passes the
+    rank-local count so pipelined_fused_moe_gmm gathers and slices it."""
+    state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=True)
+    state.update(3, 4)
+    token_padding.set_padding_state(state)
+
+    class _FakeDpGroup:
+        world_size = 2
+
+        @staticmethod
+        def all_gather(t, dim=0):
+            return torch.cat([t, torch.tensor([1], dtype=t.dtype)], dim=dim)
+
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group", lambda: _FakeDpGroup()
+    )
+    try:
+        method = _method(skip_padded_tokens=True)
+        _run_forward(method, layer=_dummy_layer(use_ep=True, dp_size=2))
+
+        monkeypatch.setattr(
+            module, "enable_pipelined_collective_and_compute", lambda: True
+        )
+        _run_forward(method, layer=_dummy_layer(use_ep=True, dp_size=2))
+    finally:
+        token_padding.set_padding_state(None)
+
+    assert capture_forward.zero_calls == []
+    assert len(capture_forward.fused_calls) == 1
+    assert capture_forward.fused_calls[0]["skip_padded_tokens"] is True
+    assert capture_forward.fused_calls[0]["row_info"].tolist() == [3, 1]
+    assert len(capture_forward.pipelined_calls) == 1
+    assert capture_forward.pipelined_calls[0]["skip_padded_tokens"] is True
+    assert capture_forward.pipelined_calls[0]["row_info"] is state.local_valid_tokens
+
+
+def test_sequence_parallel_forward_rejects_pipelined_mode(capture_forward, monkeypatch):
+    """Non-pipelined sequence-parallel TP+EP passes the 1-element count;
+    combining sequence-parallel MoE with pipelined chunking must fail loudly
+    rather than applying the full-batch count to a TP-sharded tensor."""
+    state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=True)
+    state.update(2, 4)
+    token_padding.set_padding_state(state)
+    sp_layer = _dummy_layer(use_ep=True, dp_size=1, is_sequence_parallel=True)
+    try:
+        method = _method(skip_padded_tokens=True)
+        _run_forward(method, layer=sp_layer)
+
+        monkeypatch.setattr(
+            module, "enable_pipelined_collective_and_compute", lambda: True
+        )
+        with pytest.raises(AssertionError, match="TPU_MOE_SEQUENCE_PARALLEL"):
+            _run_forward(method, layer=sp_layer)
+    finally:
+        token_padding.set_padding_state(None)
+
+    assert len(capture_forward.fused_calls) == 1
+    call = capture_forward.fused_calls[0]
+    assert call["skip_padded_tokens"] is True
+    assert call["row_info"] is state.local_valid_tokens
+    assert call["row_info"].tolist() == [2]
+
+
+def test_forward_asserts_if_row_info_segments_disagree_with_dp_size(capture_forward):
+    """If get_dp_group().world_size disagrees with moe_parallel_config.dp_size,
+    fail loudly instead of applying a 1-element count to a DP-gathered buffer."""
+    state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=True)
+    state.update(2, 4)
+    token_padding.set_padding_state(state)
+    try:
+        method = _method(skip_padded_tokens=True)
+        with pytest.raises(AssertionError, match="row_info segments"):
+            _run_forward(method, layer=_dummy_layer(use_ep=True, dp_size=2))
+    finally:
+        token_padding.set_padding_state(None)
 
 
 def test_stock_contract_when_disabled_or_fallback(capture_forward, monkeypatch):
@@ -225,16 +320,18 @@ def test_init_outside_runner_scope_runs_stock(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "skip, expected_keys",
+    "use_ep, skip, expected_keys",
     [
         # (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens,
         #  topk_weights_float32, has_row_info)
-        (False, [(_TOPK, "silu", False, None, False, False, False)]),
-        (True, [(_TOPK, "silu", False, None, True, False, True)]),
+        (False, False, [(_TOPK, "silu", False, None, False, False, False)]),
+        (False, True, [(_TOPK, "silu", False, None, True, False, True)]),
+        (True, False, [(_TOPK, "silu", True, None, False, False, False)]),
+        (True, True, [(_TOPK, "silu", True, None, True, False, True)]),
     ],
 )
 def test_process_weights_after_loading_prebuilds_expected_kernels(
-    monkeypatch, skip, expected_keys
+    monkeypatch, use_ep, skip, expected_keys
 ):
     """process_weights_after_loading prebuilds only the kernels needed by the
     resolved policy via the real prebuild_fused_moe_kernel cache key."""
@@ -256,6 +353,9 @@ def test_process_weights_after_loading_prebuilds_expected_kernels(
 
     monkeypatch.setattr(module, "RoutedExperts", _Experts)
     monkeypatch.setattr(
+        module.moe_routing, "validate_linear_ep_placement", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
         module.moe_routing, "register_experts_start_buffer", lambda *a, **k: None
     )
 
@@ -270,7 +370,7 @@ def test_process_weights_after_loading_prebuilds_expected_kernels(
         w2_weight=torch.nn.Parameter(
             torch.zeros(2, 128, 128, dtype=torch.bfloat16), requires_grad=False
         ),
-        moe_config=_moe_cfg(),
+        moe_config=_moe_cfg(use_ep=use_ep),
     )
     method.process_weights_after_loading(layer)
     assert cache.lookups == expected_keys
@@ -295,14 +395,19 @@ def _xla_cache_entries() -> int:
 
 
 @pytest.mark.tpu_test
-def test_one_compiled_forward_reads_each_steps_row_count():
+def test_one_compiled_forward_reads_each_steps_row_count(monkeypatch):
     """row_info enters the compiled forward through
-    token_padding.get_local_valid_tokens(), not as an argument. One row-count
-    program, compiled for 16 rows, serves a warmup step (count 0) and then
-    counts 3, 16 and 5, which TokenPaddingState.update writes into the same
-    device tensor before each step, as the runner does. Each step's real rows
-    match the stock program bit for bit and its padded rows are zero, and no
-    step after the warmup traces or compiles again, so no count is baked in."""
+    token_padding.get_valid_tokens_for_padding(), not as an argument. One
+    row-count program, compiled for 16 rows, serves a warmup step (count 0) and
+    then counts 3, 16 and 5, which TokenPaddingState.update writes into the
+    same device tensor before each step, as the runner does. Each step's real
+    rows match the stock program bit for bit and its padded rows are zero, and
+    no step after the warmup traces or compiles again, so no count is baked
+    in."""
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group",
+        lambda: SimpleNamespace(world_size=1),
+    )
     num_tokens, experts, hidden, inter, topk = 16, 16, 2048, 768, 8
     dev = torch.device("tpu")
     gen = torch.Generator().manual_seed(0)
@@ -315,7 +420,10 @@ def test_one_compiled_forward_reads_each_steps_row_count():
         w2_weight=w2.to(dev),
         _experts_start=None,
         moe_config=SimpleNamespace(
-            experts_per_token=topk, moe_parallel_config=SimpleNamespace(use_ep=False)
+            experts_per_token=topk,
+            moe_parallel_config=SimpleNamespace(
+                use_ep=False, dp_size=1, is_sequence_parallel=False
+            ),
         ),
         custom_routing_function=_top_logits,
         renormalize=False,
