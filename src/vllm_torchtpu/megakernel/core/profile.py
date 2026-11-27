@@ -50,7 +50,13 @@ from .exec_spec import MAX_BATCH_ROWS, ExecSpec, Tiles, tile_numerics
 
 # Profiles own the pool-I/O mode, so they depend on the pool package's config
 # (its numerics classes and the `CacheExec.pool_gather` a profile resolves).
-from .pool.config import POOL_IO_NUMERICS, cache_exec, with_cache
+from .pool.config import (
+    FUSED_POOL_IO_MAX_B,
+    FUSED_POOL_IO_MIN_B_HI,
+    POOL_IO_NUMERICS,
+    cache_exec,
+    with_cache,
+)
 from .profiles.default import default_tiles
 
 # Name of the model-agnostic library default profile.
@@ -109,8 +115,8 @@ class Profile:
     # policy using `fused_pool_io_max_b` and `fused_pool_io_min_b_hi`). Requires
     # pool donation.
     fused_pool_io: bool | str = False
-    fused_pool_io_max_b: int = 24
-    fused_pool_io_min_b_hi: int = 56
+    fused_pool_io_max_b: int = FUSED_POOL_IO_MAX_B
+    fused_pool_io_min_b_hi: int = FUSED_POOL_IO_MIN_B_HI
     # In-kernel recurrent gather (GPR): False (split) | None (auto: WIDE verify
     # buckets where eligible; exact) | True (every bucket where eligible, never
     # a T=1 bucket; approx, see `pool.POOL_IO_NUMERICS`).
