@@ -173,11 +173,11 @@ steps:
         env:
           SHAPE: *shape_2_core
         <<: *integration_step
-        # TODO(torch_tpu): Remove once torch_tpu > 0.2.0 lands in pyproject.toml
-        # with the upstream Tier-3 cache determinism fix. Until that release and
-        # version bump, Test 5 intermittently hits a transient Tier-3 cache MD5
-        # mismatch between cold and warm runs (exit 1; 64 of 84 failures over
-        # 21 days), so retry exit 1 up to 3 times.
+        # TODO(torch_tpu): Remove once the pinned torch_tpu fixes Tier-3 cache
+        # nondeterminism between cold and warm runs (#1867); no such fix is
+        # identified as of torch_tpu 0.3.0. Until then Test 5 intermittently hits
+        # a transient Tier-3 cache MD5 mismatch between cold and warm runs (exit
+        # 1; 64 of 84 failures over 21 days), so retry exit 1 up to 3 times.
         retry:
           automatic:
             - exit_status: 1

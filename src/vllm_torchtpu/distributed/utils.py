@@ -577,14 +577,17 @@ def _resolve_group_metadata(group_name: str) -> _GroupMetadata:
 def _canonicalize_process_group_name(group_name: str, ordinal: int) -> str:
     """Map a rank-local process-group handle to a canonical token.
 
-    TorchTPU tiles every symmetric subgroup collective's `replica_groups`
-    across all `world_size` partitions via `GatherAllSubgroups`, so ranks in
-    different subgroups compile identical all-device SPMD executables. When a
-    vLLM `GroupCoordinator` is registered for `group_name` (either by
-    `unique_name` or `device_group.group_name`), its full `group_ranks`
-    partition is encoded directly so wrap-around subgroup layouts (such as
-    `tpu7x` topology-aware PCP/TP meshes) match across all subgroups. Raw
-    `c10d` groups fall back to subgroup size and rank-stride geometry.
+    The token names the group's layout, not its own ranks: TorchTPU runs a
+    program that combines the collectives of several groups on every device,
+    with each group's collectives tiled over every subgroup of its layout, so
+    ranks of different subgroups compile the same program. When a vLLM
+    `GroupCoordinator` is registered for `group_name` (either by `unique_name`
+    or `device_group.group_name`), its full `group_ranks` partition is encoded
+    directly so wrap-around subgroup layouts (such as `tpu7x` topology-aware
+    PCP/TP meshes) match across all subgroups. Raw `c10d` groups fall back to
+    subgroup size and rank-stride geometry. A program whose collectives all
+    run on one subgroup is bound to that subgroup's devices instead;
+    `_graph_fingerprint` adds them (see `process_group_ranks`).
     """
     meta = _resolve_group_metadata(group_name)
     strides = (
@@ -602,3 +605,15 @@ def _canonicalize_process_group_name(group_name: str, ordinal: int) -> str:
     if meta.kind == "c10d_pg":
         return f"c10d_pg:{ordinal}:size={meta.size}:strides={strides}"
     raise ValueError(f"Cannot resolve process group {group_name!r}")
+
+
+def process_group_ranks(group_name: str) -> tuple[int, ...]:
+    """World ranks of the process group behind a rank-local handle.
+
+    Raises:
+        ValueError: If `group_name` does not resolve to a process group.
+    """
+    ranks = _resolve_group_metadata(group_name).ranks
+    if not ranks:
+        raise ValueError(f"Cannot resolve process group {group_name!r}")
+    return tuple(ranks)

@@ -112,6 +112,12 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),
     # Process setup and runner selection.
     Patch("vllm_torchtpu:_patch_multiproc_worker_global_rank_env", _ACTIVE),
+    # TODO(vllm-project/vllm#69739): Remove this patch once vLLM lets a
+    #   platform name the device of a parallel group.
+    Patch(
+        "vllm_torchtpu.distributed.group_device:patch_group_coordinator_device",
+        _ACTIVE,
+    ),
     Patch("vllm_torchtpu:_patch_vllm_force_v1_runner_tpu", _ACTIVE),
     Patch("vllm_torchtpu:_patch_dflash_bypass_v2_runner_check", _ACTIVE),
     # Weight loading and embeddings.

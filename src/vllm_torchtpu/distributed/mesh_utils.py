@@ -18,8 +18,8 @@ their process group paired with the TPU device each one sits on. Neither is
 specific to which axis asked -- a layout is just "this group's ranks, in
 order, and where they live"
 
-Every axis builds its own Pallas mesh, because torch_tpu requires one that
-spans the whole world and the axes factor the world differently. `ep_mesh.py`
+Every axis builds its own Pallas mesh, because the axes factor the world
+differently. `ep_mesh.py`
 takes the rank/device helpers from here too, which is why this module is
 named for the job rather than for an axis.
 
@@ -182,9 +182,8 @@ def get_stage_mesh(
     """
     from torch.tpu.pallas import get_pallas_mesh
 
-    # TODO(yinlin): torch_tpu releases refuse a mesh smaller than the world
-    # here, and pp_validation turns such stages away; make the stage group
-    # standalone once the pinned torch_tpu has google-pytorch/torch_tpu#4387.
+    # pp_validation turns stages of several devices away until a TPU test
+    # serves one, so only unit tests reach this for now.
     mesh = get_pallas_mesh(
         axis_names=axis_names,
         mesh_shape=mesh_shape,

@@ -32,6 +32,7 @@ import re
 import shutil
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -103,6 +104,9 @@ _PEER_POLL_S = 0.5
 # so clock skew between the host and a shared cache filesystem does not matter.
 _FAILED_SUFFIX = ".failed"
 _PROCESS_START = time.time()
+# Directory, next to a host's `rank_*` cache dirs, of the claims that make one
+# rank the owner of each (bucket, graph fingerprint); see `_claim`.
+_CLAIM_DIR = "peer_claims"
 
 _peer_wait = threading.local()
 
@@ -771,29 +775,113 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
             return None
 
-    def _peer_paths(self, key: str) -> list[str]:
-        """Where the other ranks have saved their artifact for `key`.
+    def _claim_dir(self) -> str | None:
+        """Where this host's ranks claim buckets, or None without peers.
 
         vLLM gives each rank its own `<hash>/rank_<rank>_<dp_rank>/<prefix>`
-        cache dir, so another rank's artifact for the same bucket sits at the
-        same relative path under its `rank_*` dir. Any DP rank counts: the
-        owner of a bucket can be in another DP group of the host, and the
-        fingerprint check decides whether its artifact fits. Only dirs on this
-        host's disk are seen unless the cache root is shared.
+        cache dir; the claims of `<prefix>` sit next to the `rank_*` dirs, so
+        every rank of the host sees them. Any DP rank counts: the owner of a
+        bucket can be in another DP group of the host, and the fingerprint
+        decides whether its artifact fits. Only dirs on this host's disk are
+        seen unless the cache root is shared.
         """
         assert self.cache_dir is not None
-        own = os.path.normpath(self.cache_dir)
-        rank_dir, prefix = os.path.split(own)
+        rank_dir, prefix = os.path.split(os.path.normpath(self.cache_dir))
         if re.fullmatch(r"rank_\d+_\d+", os.path.basename(rank_dir)) is None:
-            return []
-        pattern = os.path.join(
-            glob.escape(os.path.dirname(rank_dir)),
-            "rank_*_*",
-            glob.escape(prefix),
-            glob.escape(key),
-        )
-        mine = os.path.join(own, key)
-        return sorted(p for p in glob.glob(pattern) if p != mine)
+            return None
+        return os.path.join(os.path.dirname(rank_dir), _CLAIM_DIR, prefix)
+
+    @staticmethod
+    def _read_claim(claim: str) -> str | None:
+        """The artifact path a claim made this run names, or None."""
+        try:
+            if os.path.getmtime(claim) < _PROCESS_START:
+                return None
+            with open(claim) as f:
+                return f.read() or None
+        except OSError:
+            return None
+
+    def _claim(self, key: str, fingerprint: str) -> str:
+        """Claim compiling `key` for `fingerprint` on this host.
+
+        Returns the path of the artifact the owner saves: this rank's own if
+        it won the claim (or there are no peers), another rank's if that one
+        claimed it first this run. A claim is created whole with `os.link`,
+        which fails if it exists, so exactly one rank wins it.
+        """
+        assert self.cache_dir is not None
+        mine = os.path.join(self.cache_dir, key)
+        claim_dir = self._claim_dir()
+        if claim_dir is None:
+            return mine
+        claim = os.path.join(claim_dir, f"{key}.{fingerprint}")
+        # Unique per writer, threads of one process included.
+        tmp = f"{claim}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        try:
+            os.makedirs(claim_dir, exist_ok=True)
+            with open(tmp, "w") as f:
+                f.write(mine)
+            for _ in range(2):
+                try:
+                    os.link(tmp, claim)
+                    return mine
+                except FileExistsError:
+                    owner = self._read_claim(claim)
+                    if owner is not None:
+                        return owner
+                    # Left by an earlier run: take it over.
+                    with contextlib.suppress(OSError):
+                        os.remove(claim)
+        except OSError as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Could not claim %s; compiling it here: %s",
+                claim,
+                e,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+        return mine
+
+    def _earlier_artifact(self, key: str, fingerprint: str) -> str | None:
+        """The artifact that an earlier run's claim for `(key, fingerprint)`
+        names, if it is on disk.
+
+        Ranks that load a range from vLLM's cache make no claim, so a rank
+        whose own entry is missing would otherwise compile the range again,
+        or wait for an owner that never comes. `_replay` still checks the
+        artifact's fingerprint, since it may have been saved over since.
+        """
+        claim_dir = self._claim_dir()
+        if claim_dir is None:
+            return None
+        claim = os.path.join(claim_dir, f"{key}.{fingerprint}")
+        try:
+            if os.path.getmtime(claim) >= _PROCESS_START:
+                return None
+            with open(claim) as f:
+                owner = f.read()
+        except OSError:
+            return None
+        return owner if owner and os.path.exists(owner) else None
+
+    def _claims(self, key: str) -> dict[str, str]:
+        """The owner's artifact path of each claim made this run for `key`,
+        by fingerprint."""
+        claim_dir = self._claim_dir()
+        if claim_dir is None:
+            return {}
+        owners = {}
+        pattern = os.path.join(glob.escape(claim_dir), f"{glob.escape(key)}.*")
+        for claim in glob.glob(pattern):
+            fingerprint = claim[len(os.path.join(claim_dir, key)) + 1 :]
+            if fingerprint.endswith(".tmp"):
+                continue
+            owner = self._read_claim(claim)
+            if owner is not None:
+                owners[fingerprint] = owner
+        return owners
 
     def _mark_failed(self, key: str, fingerprint: str) -> None:
         """Tell this host's waiting ranks that this rank will not save `key`.
@@ -822,16 +910,16 @@ class TpuCompilerAdaptor(CompilerInterface):
         with contextlib.suppress(OSError):
             os.remove(os.path.join(self.cache_dir, key + _FAILED_SUFFIX))
 
-    def _peer_failed(self, key: str, fingerprint: str) -> str | None:
-        """A marker another rank tracing this graph left this run for `key`."""
-        for path in self._peer_paths(key + _FAILED_SUFFIX):
-            with contextlib.suppress(OSError):
-                if os.path.getmtime(path) < _PROCESS_START:
-                    continue
-                with open(path) as f:
-                    if f.read() == fingerprint:
-                        return path
-        return None
+    @staticmethod
+    def _owner_failed(owner: str, fingerprint: str) -> bool:
+        """Whether the owner of `owner` (an artifact path) left a marker this
+        run saying it will not save this graph."""
+        marker = owner + _FAILED_SUFFIX
+        with contextlib.suppress(OSError):
+            if os.path.getmtime(marker) >= _PROCESS_START:
+                with open(marker) as f:
+                    return f.read() == fingerprint
+        return False
 
     def _replay_from_peer(
         self,
@@ -840,31 +928,55 @@ class TpuCompilerAdaptor(CompilerInterface):
         was_wrapped: bool,
         fingerprint: str,
     ) -> tuple[Callable[..., Any], str] | None:
-        """Replay the artifact another rank saved for this bucket.
+        """Replay the artifact the owner of this bucket saved for this graph.
 
-        Waits for one to appear inside `wait_for_peer_artifact`. Returns the
-        runnable and the peer's path, or None to compile: nothing appeared in
-        time, a rank compiling this graph left a marker saying it will not save
-        it, or what appeared was built from a different graph -- then the ranks
-        do not trace the same program and waiting on would not help.
+        One rank of the host owns each `(key, fingerprint)`: the first to
+        claim it (see `_claim`). Outside `wait_for_peer_artifact` a rank claims
+        at once. Inside it, a rank waits for a claim: when the claim for this
+        fingerprint appears, it waits for that owner's artifact only, so it
+        never loads one built from another graph. When only claims for other
+        fingerprints appear (e.g. by a rank of another TP subgroup, whose
+        collectives run on other devices), it claims the bucket itself, and
+        the other ranks of its subgroup replay its artifact. Before any of
+        that, it replays the artifact that an earlier run's claim for this
+        fingerprint names, if that artifact is still on disk. Returns the
+        runnable and the owner's path, or None to compile here: this rank owns
+        the bucket, the owner left a marker saying it will not save it, or
+        nothing came in time.
         """
+        assert self.cache_dir is not None
+        earlier = self._earlier_artifact(key, fingerprint)
+        if earlier is not None:
+            compiled_fn = self._replay(earlier, graph, was_wrapped, fingerprint)
+            if compiled_fn is not None:
+                return compiled_fn, earlier
+        mine = os.path.join(self.cache_dir, key)
         deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
-        paths = self._peer_paths(key)
-        while not paths and time.monotonic() < deadline:
-            failed = self._peer_failed(key, fingerprint)
-            if failed is not None:
+        while True:
+            claims = self._claims(key)
+            owner = claims.get(fingerprint)
+            if owner is None and (claims or time.monotonic() >= deadline):
+                owner = self._claim(key, fingerprint)
+            if owner is not None:
+                break
+            time.sleep(_PEER_POLL_S)
+        if owner == mine:
+            return None
+        while not os.path.exists(owner):
+            if self._owner_failed(owner, fingerprint):
                 logger.info(
                     "[TpuCompilerAdaptor] %s: its owner could not save it; "
                     "compiling it here instead of waiting",
-                    failed,
+                    owner,
                 )
                 return None
+            if time.monotonic() >= deadline:
+                return None
             time.sleep(_PEER_POLL_S)
-            paths = self._peer_paths(key)
-        if not paths:
+        compiled_fn = self._replay(owner, graph, was_wrapped, fingerprint)
+        if compiled_fn is None:
             return None
-        compiled_fn = self._replay(paths[0], graph, was_wrapped, fingerprint)
-        return None if compiled_fn is None else (compiled_fn, paths[0])
+        return compiled_fn, owner
 
     @staticmethod
     def _link_artifact(src: str, dst: str) -> bool:

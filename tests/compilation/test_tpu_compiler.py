@@ -1193,7 +1193,11 @@ class TestTpuCompilerCache:
         key, path, _ = handle
         assert path == os.path.join(b.cache_dir, key)
         assert os.path.samefile(path, os.path.join(a.cache_dir, key))
-        assert sorted(os.listdir(tmp_path / "hash")) == ["rank_0_0", "rank_1_0"]
+        assert sorted(os.listdir(tmp_path / "hash")) == [
+            "peer_claims",
+            "rank_0_0",
+            "rank_1_0",
+        ]
         assert os.listdir(b.cache_dir) == [key]
 
     def test_a_compiled_bucket_runs_from_its_saved_artifact(
@@ -1415,9 +1419,12 @@ class TestTpuCompilerCache:
         assert compiled == [0, 1]
         assert replayed == []
 
-    def test_a_marker_for_another_graph_is_ignored(self, tmp_path, monkeypatch):
-        """A marker from a rank that traced a different graph does not cut the
-        wait short: the rank compiling this graph may still save it."""
+    def test_a_rank_tracing_another_graph_claims_the_bucket_at_once(
+        self, tmp_path, monkeypatch
+    ):
+        """A claim, or a marker, for a different graph does not hold a waiter
+        back: the waiter claims the bucket for its own graph and compiles it
+        at once instead of waiting out the timeout."""
         import time
 
         import torch
@@ -1436,9 +1443,9 @@ class TestTpuCompilerCache:
         compile(a, graph=torch.fx.symbolic_trace(lambda x: x * 3 - 1))
         assert os.path.exists(os.path.join(a.cache_dir, "artifact_bucket.failed"))
         start = time.monotonic()
-        with wait_for_peer_artifact(0.3):
+        with wait_for_peer_artifact(30.0):
             compile(b)
-        assert time.monotonic() - start >= 0.3
+        assert time.monotonic() - start < 10.0
         assert compiled == [0, 1]
 
     def test_a_marker_from_an_earlier_run_is_ignored(self, tmp_path, monkeypatch):
@@ -1505,7 +1512,8 @@ class TestTpuCompilerCache:
         def no_peer_lookup(*args, **kwargs):
             raise AssertionError("looked for a peer artifact")
 
-        monkeypatch.setattr(TpuCompilerAdaptor, "_peer_paths", no_peer_lookup)
+        monkeypatch.setattr(TpuCompilerAdaptor, "_claims", no_peer_lookup)
+        monkeypatch.setattr(TpuCompilerAdaptor, "_claim", no_peer_lookup)
         monkeypatch.setattr(TpuCompilerAdaptor, "_link_artifact", no_peer_lookup)
         monkeypatch.setattr(tpu_compiler, "_graph_fingerprint", no_peer_lookup)
 
@@ -1521,17 +1529,16 @@ class TestTpuCompilerCache:
         with open(path, "rb") as f:
             assert pickle.load(f).fingerprint is None
 
-    def test_a_peer_artifact_is_replayed_across_c10d_subgroups(
+    def test_a_peer_artifact_is_replayed_for_another_handle_of_the_same_group(
         self, tmp_path, monkeypatch, group_stand_ins
     ):
-        """Ranks in distinct DP/TP subgroups trace different rank-local c10d
-        group_name strings for the same collective role, yet replay the first
-        rank's compiled artifact."""
+        """Ranks trace different rank-local c10d group_name strings for the
+        same process group, yet replay the first rank's compiled artifact."""
         (a, b), compile, compiled, replayed = self._peer_compilers(
             tmp_path, monkeypatch
         )
         compile(a, _trace_all_reduce_graph("1"))
-        fn, handle = compile(b, _trace_all_reduce_graph("7"))
+        fn, handle = compile(b, _trace_all_reduce_graph("17"))
 
         assert compiled == [0]
         # Each compiling rank also reloads the artifact it saved.
@@ -1540,6 +1547,171 @@ class TestTpuCompilerCache:
         key, path, _ = handle
         assert a.cache_dir is not None
         assert os.path.samefile(path, os.path.join(a.cache_dir, key))
+
+    def test_another_c10d_subgroup_compiles_its_own_artifact(
+        self, tmp_path, monkeypatch, group_stand_ins
+    ):
+        """torch_tpu >= 0.3.0 compiles a group's collective for the group's own
+        devices, so a TP subgroup on other ranks must not replay the artifact
+        of the first one: it fingerprints differently and compiles."""
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a, _trace_all_reduce_graph("1"))
+        fn, handle = compile(b, _trace_all_reduce_graph("7"))
+
+        assert compiled == [0, 1]
+        # Each compiling rank reloads only the artifact it saved itself.
+        assert replayed == ["entry-from-rank-0", "entry-from-rank-1"]
+        assert fn() == "entry-from-rank-1"
+        key, path, _ = handle
+        assert b.cache_dir is not None
+        assert os.path.samefile(path, os.path.join(b.cache_dir, key))
+
+    def test_a_subgroup_replays_its_own_owner_past_another_subgroups_artifact(
+        self, tmp_path, monkeypatch, group_stand_ins
+    ):
+        """Ranks 1 and 2, of TP subgroup "7", wait while rank 0, of subgroup
+        "1", compiles the bucket: they do not replay rank 0's artifact or wait
+        out the timeout, one of them claims and compiles the bucket for their
+        subgroup, and the other replays that one's artifact."""
+        import threading
+        import time
+
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        (a, b, c), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=3
+        )
+        compile(a, _trace_all_reduce_graph("1"))
+        results = {}
+
+        def waiter(compiler):
+            with wait_for_peer_artifact(30.0):
+                results[compiler.rank] = compile(compiler, _trace_all_reduce_graph("7"))
+
+        start = time.monotonic()
+        threads = [threading.Thread(target=waiter, args=(r,)) for r in (b, c)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30.0)
+        assert time.monotonic() - start < 10.0
+        assert not any(thread.is_alive() for thread in threads)
+
+        assert compiled[0] == 0 and len(compiled) == 2 and compiled[1] in (1, 2)
+        owner = compiled[1]
+        tag = f"entry-from-rank-{owner}"
+        assert replayed.count("entry-from-rank-0") == 1
+        assert replayed.count(tag) == 2
+        for rank in (1, 2):
+            fn, (key, path, _) = results[rank]
+            assert fn() == tag
+            owner_dir = (b, c)[owner - 1].cache_dir
+            assert owner_dir is not None
+            assert os.path.samefile(path, os.path.join(owner_dir, key))
+
+    def test_the_third_rank_replays_the_second_ranks_artifact(
+        self, tmp_path, monkeypatch, group_stand_ins
+    ):
+        """Ranks on groups "1", "7", "7": the third rank does not stop at the
+        first rank's artifact, which is for another subgroup, and replays the
+        second rank's."""
+        (a, b, c), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch, n=3
+        )
+        compile(a, _trace_all_reduce_graph("1"))
+        compile(b, _trace_all_reduce_graph("7"))
+        fn, (key, path, _) = compile(c, _trace_all_reduce_graph("7"))
+
+        assert compiled == [0, 1]
+        assert replayed == [
+            "entry-from-rank-0",
+            "entry-from-rank-1",
+            "entry-from-rank-1",
+        ]
+        assert fn() == "entry-from-rank-1"
+        assert b.cache_dir is not None
+        assert os.path.samefile(path, os.path.join(b.cache_dir, key))
+
+    def test_a_claim_from_an_earlier_run_is_taken_over(self, tmp_path, monkeypatch):
+        """A claim older than this process names an owner of an earlier run:
+        a waiting rank does not wait for that owner's artifact, and once the
+        wait for an owner of this run runs out it claims and compiles the
+        bucket itself."""
+        import time
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a)
+        claims = tmp_path / "hash" / "peer_claims" / "backbone"
+        [claim] = os.listdir(claims)
+        old = tpu_compiler._PROCESS_START - 3600
+        os.utime(claims / claim, (old, old))
+        os.remove(os.path.join(a.cache_dir, "artifact_bucket"))
+        start = time.monotonic()
+        with wait_for_peer_artifact(0.3):
+            compile(b)
+        assert 0.3 <= time.monotonic() - start < 10.0
+        assert compiled == [0, 1]
+        with open(claims / claim) as f:
+            assert f.read() == os.path.join(b.cache_dir, "artifact_bucket")
+
+    def test_an_earlier_runs_artifact_is_replayed_at_once(self, tmp_path, monkeypatch):
+        """When an earlier run's claim names an artifact that is still on disk,
+        a rank whose own entry is missing replays it at once: it neither
+        waits for an owner of this run (the ranks that load the range from
+        vLLM's cache make no claim) nor compiles the range again."""
+        import time
+
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import wait_for_peer_artifact
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a)
+        claims = tmp_path / "hash" / "peer_claims" / "backbone"
+        [claim] = os.listdir(claims)
+        old = tpu_compiler._PROCESS_START - 3600
+        os.utime(claims / claim, (old, old))
+        start = time.monotonic()
+        with wait_for_peer_artifact(30.0):
+            fn, handle = compile(b)
+        assert time.monotonic() - start < 10.0
+        assert compiled == [0]
+        assert fn() == "entry-from-rank-0"
+        assert os.path.samefile(handle[1], os.path.join(a.cache_dir, "artifact_bucket"))
+        # The claim is left as it was: nothing of this run took it over.
+        assert os.path.getmtime(claims / claim) == old
+
+    def test_an_earlier_runs_artifact_of_another_graph_is_not_replayed(
+        self, tmp_path, monkeypatch
+    ):
+        """An earlier claim whose artifact was since saved over by another
+        graph is not replayed: the rank claims and compiles the range."""
+        import torch
+
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        (a, b), compile, compiled, replayed = self._peer_compilers(
+            tmp_path, monkeypatch
+        )
+        compile(a)
+        claims = tmp_path / "hash" / "peer_claims" / "backbone"
+        [claim] = os.listdir(claims)
+        old = tpu_compiler._PROCESS_START - 3600
+        os.utime(claims / claim, (old, old))
+        # Rank 0 saves another graph over the artifact the claim names.
+        compile(a, graph=torch.fx.symbolic_trace(lambda x: x * 3 - 1))
+        for c in os.listdir(claims):
+            os.utime(claims / c, (old, old))
+        compile(b)
+        assert compiled == [0, 0, 1]
 
 
 def test_deserialize_entry_does_not_copy_the_entry():

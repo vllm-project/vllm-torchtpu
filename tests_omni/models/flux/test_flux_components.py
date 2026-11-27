@@ -26,7 +26,6 @@ Tested FLUX Components:
 """
 
 import math
-import re
 from types import SimpleNamespace
 
 import pytest
@@ -45,19 +44,20 @@ pytestmark = [pytest.mark.omni]
 NUMERIC_MISMATCH_PATTERN = r"relative L2 error|max absolute error"
 
 # (TPU fp32, TPU bf16) limits vs the float64 CPU reference, ~3% above the worst
-# observed value across the parametrized attention impls. Production runs every
-# component in the configured dtype (--dtype bfloat16 or float32).
-STANDARD_ATTN_MAX_REL_L2 = (3.2e-3, 4.4e-3)
-STANDARD_ATTN_MAX_ABS = (7.6e-3, 8.6e-3)
-JOINT_ATTN_MAX_REL_L2 = (3.2e-3, 4.5e-3)
-JOINT_ATTN_MAX_ABS = (7.7e-3, 1.4e-2)
-GQA_ATTN_MAX_REL_L2 = (3.1e-3, 4.1e-3)
+# observed value across the parametrized attention impls, measured on torch_tpu
+# 0.3.0. Production runs every component in the configured dtype (--dtype
+# bfloat16 or float32).
+STANDARD_ATTN_MAX_REL_L2 = (3.4e-3, 4.6e-3)
+STANDARD_ATTN_MAX_ABS = (7.6e-3, 1.1e-2)
+JOINT_ATTN_MAX_REL_L2 = (3.4e-3, 4.5e-3)
+JOINT_ATTN_MAX_ABS = (7.7e-3, 1.6e-2)
+GQA_ATTN_MAX_REL_L2 = (3.4e-3, 4.1e-3)
 GQA_ATTN_MAX_ABS = (7.2e-3, 1.3e-2)
 LONG_SEQ_ATTN_MAX_REL_L2 = (3.5e-3, 5.4e-3)
 LONG_SEQ_ATTN_MAX_ABS = (6.9e-4, 2.2e-3)
 # Masked calls run TpuSDPAImpl under sdpa_kernel(MATH); torch_tpu 0.2.0's default
-# SDPA lowering misreads a mask of size 1 along the query dim
-# (google-pytorch/torch_tpu#5677: fp32 rel_l2 0.60, bf16 NaN).
+# SDPA lowering misread a mask of size 1 along the query dim
+# (google-pytorch/torch_tpu#5677: fp32 rel_l2 0.60, bf16 NaN; fixed in 0.3.0).
 MASKED_ATTN_MAX_REL_L2 = (3.6e-3, 4.5e-3)
 MASKED_ATTN_MAX_ABS = (8.0e-3, 6.4e-3)
 # Masked attention over MASKED_SDPA_CASES, bf16 only.
@@ -77,7 +77,7 @@ DTYPES = pytest.mark.parametrize(
 )
 
 # Every mask here has size 1 along the query dim, the layout torch_tpu 0.2.0's
-# default SDPA lowering misreads (google-pytorch/torch_tpu#5677).
+# default SDPA lowering misread (google-pytorch/torch_tpu#5677).
 MASKED_SDPA_CASES = pytest.mark.parametrize(
     "batch_size, q_len, kv_len, valid_len, mask_kind",
     [
@@ -411,51 +411,6 @@ class TestFluxTpuSDPAAttention:
                     max_rel_l2=MASKED_SDPA_BF16_MAX_REL_L2,
                     max_abs=MASKED_SDPA_BF16_MAX_ABS,
                 )
-
-    @MASKED_SDPA_CASES
-    def test_torch_tpu_still_misreads_query_broadcast_attn_mask(
-        self, batch_size, q_len, kv_len, valid_len, mask_kind
-    ):
-        """Canary for google-pytorch/torch_tpu#5677, the bug behind the math pin.
-
-        Runs each masked case as TpuSDPAImpl.forward did before the pin, on
-        torch_tpu's default SDPA lowering. When this fails, torch_tpu reads a
-        mask of size 1 along the query dim correctly: remove the pin in
-        TpuSDPAImpl.forward and this canary.
-        """
-        query_cpu, key_cpu, value_cpu, mask_cpu, keep = _masked_sdpa_case(
-            batch_size, q_len, kv_len, valid_len, mask_kind
-        )
-        scale = 1.0 / math.sqrt(query_cpu.shape[-1])
-        impl = TpuSDPAImpl(
-            num_heads=query_cpu.shape[2],
-            head_size=query_cpu.shape[3],
-            softmax_scale=scale,
-        )
-        ref_out = _sdpa_reference(query_cpu, key_cpu, value_cpu, scale, key_mask=keep)
-
-        unpinned_out = impl._forward_impl(
-            query_cpu.to("tpu"),
-            key_cpu.to("tpu"),
-            value_cpu.to("tpu"),
-            SimpleNamespace(attn_mask=mask_cpu.to("tpu")),
-            mask_mode="broadcast_k",
-        ).cpu()
-        try:
-            assert_parity(
-                unpinned_out,
-                ref_out,
-                name=f"unpinned TpuSDPAImpl {mask_kind} b{batch_size} q{q_len}",
-                max_rel_l2=MASKED_SDPA_BF16_MAX_REL_L2,
-                max_abs=MASKED_SDPA_BF16_MAX_ABS,
-            )
-        except AssertionError as exc:
-            assert re.search(NUMERIC_MISMATCH_PATTERN, str(exc)), str(exc)
-        else:
-            pytest.fail(
-                "torch_tpu#5677 appears fixed: remove the SDPBackend.MATH pin "
-                "in TpuSDPAImpl.forward and delete this canary"
-            )
 
     @DTYPES
     def test_flux_masked_attention_falls_back_to_sdpa_on_tpu(

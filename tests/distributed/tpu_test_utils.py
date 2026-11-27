@@ -81,6 +81,8 @@ def prepare_tpu_environment(world_size: int | None = None) -> None:
 # Multichip tests that launch one worker per device with torchrun. The test
 # file runs as the worker script: `<file> --worker --result-dir DIR`.
 
+_STACK_DUMP_ENV = "TPU_TEST_WORKER_STACK_DUMP_SECONDS"
+
 _LAUNCH_ENV_KEYS = (
     "TORCH_TPU_XPROF_SESSION_ID",
     "TORCH_TPU_SLICEBUILDER_ADDRESSES",
@@ -115,6 +117,26 @@ def torchrun_worker_env(world_size: int) -> dict[str, str]:
     return env
 
 
+# On the CI hosts, a launch that starts right after another one ended sometimes
+# stalls in TPU initialization: a rank's TPU runtime cannot start a session on
+# the host (it reports _SESSION_FAILURE after its retries, which can take most
+# of the launch timeout) and the other ranks wait for it. Every rank marks the
+# end of its TPU initialization (rank_<rank>.started); a launch in which a rank
+# reports _SESSION_FAILURE, or not every rank has started within
+# _STARTUP_TIMEOUT_S, is ended and run again after a pause.
+_SESSION_FAILURE = "START_SESSION failed"
+_STARTUP_TIMEOUT_S = 120.0
+# The workers of the ended launch release the TPUs asynchronously; the same
+# wait test_latent_proj_intra_chip_multichip.py uses for that race.
+_STARTUP_RETRY_PAUSE_S = 60.0
+# Time a relaunch needs, start-up included, for a retry to be worth it.
+_STARTUP_RETRY_MIN_S = 120.0
+# How long the workers of an ended launch get to exit after SIGTERM, and then
+# after SIGKILL.
+_REAP_S = 30.0
+_POLL_S = 2.0
+
+
 def launch_torchrun_workers(
     script: Any,
     result_dir: Any,
@@ -126,12 +148,89 @@ def launch_torchrun_workers(
 ) -> Any:
     """Runs `script --worker` on `world_size` ranks; returns the completed
     process. Keep `timeout` under pytest's, so that this, not pytest, ends a
-    hung launch and the workers are reaped."""
+    hung launch and the workers are reaped.
+
+    A launch that stalls in TPU initialization (see _STARTUP_TIMEOUT_S) is
+    ended and, while enough of `timeout` is left, run again after a pause;
+    each launch's output is kept, in order."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    outputs = []
+    while True:
+        completed, stalled = _launch_torchrun_once(
+            script, result_dir, world_size, env, cwd, deadline
+        )
+        outputs.append(completed.stdout)
+        remaining = deadline - time.monotonic()
+        if stalled is None or remaining < _STARTUP_RETRY_PAUSE_S + _STARTUP_RETRY_MIN_S:
+            break
+        outputs.append(
+            f"\n=== TPU start-up failed ({stalled}); "
+            f"relaunching in {_STARTUP_RETRY_PAUSE_S:.0f}s ===\n"
+        )
+        print(outputs[-1], flush=True)
+        for stale in [
+            *result_dir.glob("rank_*.json"),
+            *result_dir.glob("rank_*.started"),
+        ]:
+            stale.unlink()
+        time.sleep(_STARTUP_RETRY_PAUSE_S)
+    completed.stdout = "".join(outputs)
+    return completed
+
+
+def _startup_stall(result_dir: Any, world_size: int, elapsed: float) -> str | None:
+    """Why the launch is stuck in TPU initialization, or None if it is not."""
+    for path in result_dir.glob("rank_*.json"):
+        try:
+            if _SESSION_FAILURE in path.read_text():
+                return f"a rank reported {_SESSION_FAILURE}"
+        except OSError:
+            pass
+    started = len(list(result_dir.glob("rank_*.started")))
+    if elapsed >= _STARTUP_TIMEOUT_S and started < world_size:
+        return (
+            f"{started} of {world_size} ranks initialized TPU in "
+            f"{_STARTUP_TIMEOUT_S:.0f}s"
+        )
+    return None
+
+
+def _group_alive(pgid: int) -> bool:
+    """Whether a process of process group `pgid` still exists."""
+    import os
+
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _launch_torchrun_once(
+    script: Any,
+    result_dir: Any,
+    world_size: int,
+    env: dict[str, str],
+    cwd: Any,
+    deadline: float,
+) -> tuple[Any, bool]:
+    """One torchrun launch, ended at `deadline` or as soon as it stalls in TPU
+    initialization; returns the completed process and why it stalled, or None."""
+    import contextlib
     import os
     import signal
     import subprocess
     import sys
+    import time
 
+    # Workers dump their Python stacks shortly before the launch times out, so
+    # a hang shows where each rank is stuck (see run_torchrun_worker).
+    remaining = deadline - time.monotonic()
+    env = {**env, _STACK_DUMP_ENV: str(max(remaining - 45, 1))}
     process = subprocess.Popen(
         [
             sys.executable,
@@ -154,17 +253,50 @@ def launch_torchrun_workers(
         start_new_session=True,
     )
     output = ""
+    stalled = None
+    start = time.monotonic()
     try:
-        output, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        output = exc.output or ""
+        while True:
+            try:
+                # communicate() can be called again after a timeout; it keeps
+                # what it has read so far.
+                output, _ = process.communicate(
+                    timeout=max(0.0, min(_POLL_S, deadline - time.monotonic()))
+                )
+                break
+            except subprocess.TimeoutExpired as exc:
+                stalled = _startup_stall(
+                    result_dir, world_size, time.monotonic() - start
+                )
+                if time.monotonic() < deadline and stalled is None:
+                    continue
+                # Bytes even in text mode: the partial output is not decoded.
+                output = exc.output or ""
+                if isinstance(output, bytes):
+                    output = output.decode(errors="replace")
+                break
     finally:
         # Also on pytest's own timeout, which raises out of communicate(): the
         # workers run in their own session and would keep holding the chips.
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(timeout=60)
-    return subprocess.CompletedProcess(process.args, process.returncode, output, "")
+        # Every worker, not just torchrun: a worker stuck in TPU
+        # initialization keeps holding its chip until it is gone.
+        if process.poll() is None or _group_alive(process.pid):
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, sig)
+                reap_deadline = time.monotonic() + _REAP_S
+                while time.monotonic() < reap_deadline:
+                    process.poll()
+                    if process.returncode is not None and not _group_alive(process.pid):
+                        break
+                    time.sleep(0.5)
+                else:
+                    continue
+                break
+    completed = subprocess.CompletedProcess(
+        process.args, process.returncode, output, ""
+    )
+    return completed, stalled
 
 
 def read_worker_results(result_dir: Any, world_size: int, completed: Any) -> list:
@@ -180,13 +312,26 @@ def read_worker_results(result_dir: Any, world_size: int, completed: Any) -> lis
             else {"rank": rank, "error": "missing worker result"}
         )
     errors = [r for r in results if "error" in r]
-    assert not errors, (errors, (completed.stdout or "")[-4000:])
+    assert not errors, (errors, _host_cpus(), (completed.stdout or "")[-24000:])
     return results
+
+
+def _host_cpus() -> str:
+    """The CPUs the workers could use: a starved host compiles slowly."""
+    import os
+    from pathlib import Path
+
+    quota = Path("/sys/fs/cgroup/cpu.max")
+    return (
+        f"cpu_count={os.cpu_count()} affinity={len(os.sched_getaffinity(0))} "
+        f"cgroup cpu.max={quota.read_text().strip() if quota.exists() else None}"
+    )
 
 
 def run_torchrun_worker(result_dir: Any, check: Callable[[int], dict]) -> None:
     """Worker side: joins torch.distributed and vLLM's world, runs
     `check(rank)` and writes the rank's result for read_worker_results."""
+    import faulthandler
     import json
     import os
 
@@ -196,12 +341,16 @@ def run_torchrun_worker(result_dir: Any, check: Callable[[int], dict]) -> None:
 
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
+    if os.environ.get(_STACK_DUMP_ENV):
+        faulthandler.dump_traceback_later(float(os.environ[_STACK_DUMP_ENV]))
     result: dict[str, object] = {"rank": rank, "world": world}
     initialized = False
     try:
         dist.init_process_group(backend="tpu_dist")
         initialized = True
         torch.empty((1,), device="tpu").cpu()
+        # TPU initialization is done (see _startup_stall).
+        (result_dir / f"rank_{rank}.started").touch()
         from vllm.distributed.parallel_state import init_distributed_environment
 
         init_distributed_environment(

@@ -28,6 +28,7 @@ from vllm.config.parallel import ParallelConfig
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu import _patch_sequence_parallel_moe_admission
+from vllm_torchtpu.distributed.group_device import patch_group_coordinator_device
 
 _REGISTRY_PATH = (
     Path(__file__).resolve().parents[2] / "src/vllm_torchtpu/patch_registry.py"
@@ -399,3 +400,75 @@ def test_sequence_parallel_moe_admission(monkeypatch):
         enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
     )
     assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_sp)
+
+
+@pytest.mark.parametrize("use_device_communicator", [True, False])
+def test_group_device_is_the_workers_own(monkeypatch, use_device_communicator):
+    """Runs vLLM's own GroupCoordinator.__init__, with only torch.distributed
+    and the platform stubbed, so a change in how upstream sets `device` or
+    `device_communicator` shows up here."""
+    import torch
+    import vllm.platforms
+    from vllm.distributed import parallel_state
+    from vllm.distributed.parallel_state import GroupCoordinator
+
+    monkeypatch.setattr(parallel_state, "_groups", {})
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda *args: 3)
+    monkeypatch.setattr(
+        torch.distributed, "new_group", lambda ranks, **kwargs: tuple(ranks)
+    )
+
+    class Communicator:
+        def __init__(self, *, cpu_group, device, device_group, **kwargs):
+            self.device = device
+
+    platform = SimpleNamespace(
+        device_name="cpu",
+        is_cuda_alike=lambda: False,
+        is_xpu=lambda: False,
+        is_out_of_tree=lambda: True,
+        is_tpu=lambda: False,
+        is_cpu=lambda: False,
+        use_custom_op_collectives=lambda: False,
+        get_device_communicator_cls=lambda: "communicator",
+    )
+    monkeypatch.setattr(vllm.platforms, "current_platform", platform, raising=False)
+    monkeypatch.setattr(
+        parallel_state, "resolve_obj_by_qualname", lambda name: Communicator
+    )
+
+    # Start from upstream's own __init__, even if the patch is applied.
+    upstream_init = getattr(
+        GroupCoordinator.__init__, "__wrapped__", GroupCoordinator.__init__
+    )
+    monkeypatch.setattr(GroupCoordinator, "__init__", upstream_init)
+    monkeypatch.setattr(
+        GroupCoordinator, "_tpu_group_device_patch", False, raising=False
+    )
+
+    def make_group():
+        return GroupCoordinator(
+            group_ranks=[[0, 1], [2, 3]],
+            local_rank=3,
+            torch_distributed_backend="gloo",
+            use_device_communicator=use_device_communicator,
+            group_name="tp",
+        )
+
+    # Upstream names the device by local rank: the reason for the patch. If
+    # this fails, upstream changed and the patch may no longer be needed.
+    assert make_group().device == torch.device("cpu:3")
+
+    patch_group_coordinator_device()
+    group = make_group()
+    assert group.device == torch.device("cpu")
+    assert group.device.index is None
+    assert group.ranks == [2, 3]
+    if use_device_communicator:
+        assert group.device_communicator.device == group.device
+    else:
+        assert group.device_communicator is None
+    # A second application leaves the one wrapper in place.
+    installed = GroupCoordinator.__init__
+    patch_group_coordinator_device()
+    assert GroupCoordinator.__init__ is installed

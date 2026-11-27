@@ -77,9 +77,12 @@ python3 "$HERE/smoke_prefix_cache_correctness.py" \
   --host localhost --port "$PORT" --model "$MODEL"
 # The one above repeat a single prompt, so a resumed request gets back a slot
 # holding that same prompt's state and a missing restore stays invisible. This
-# interleaves two prefixes so the slot always carries the wrong one.
+# interleaves two prefixes so the slot always carries the wrong one. The
+# 8192-token prefill chunk spans several KV blocks, so a resumed request
+# computes its tail in other chunks than the cold run and greedy tokens can
+# flip at near-ties: compare with a cached run instead (see the script).
 python3 "$HERE/smoke_mamba_state_contamination.py" \
-  --host localhost --port "$PORT" --model "$MODEL"
+  --host localhost --port "$PORT" --model "$MODEL" --reference cached
 
 # A run that never hit the cache would pass both smokes vacuously.
 hits=$(curl -sf "localhost:$PORT/metrics" |

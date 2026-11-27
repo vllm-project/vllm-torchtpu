@@ -25,6 +25,7 @@ Run on one host (4 chips x 2 cores = 8 ranks).
 
 import argparse
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -68,7 +69,14 @@ def _check(rank: int) -> dict:
     parallel_state._EP = ep
     parallel_state._DP = ep
 
+    start = time.monotonic()
+
+    def progress(what: str) -> None:
+        # Shown when the launch fails: how far each rank got, and how fast.
+        print(f"rank {rank}: {what} at {time.monotonic() - start:.1f}s", flush=True)
+
     out: dict = {"armed": hrs.prebuild_hier_reduce_scatter()}
+    progress("armed")
     if not out["armed"]:
         return out
     armed = hrs._ARMED
@@ -134,6 +142,7 @@ def _check(rank: int) -> dict:
                         }
                     )
                 out[key] = {"calls": errs, "kernel_calls": kernel_calls[0] - before}
+                progress(key)
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
                 out[key] = {"error": repr(exc)}
@@ -161,6 +170,14 @@ def test_hier_reduce_scatter_on_real_collectives(tmp_path, wire):
         env=env,
         cwd=REPO_ROOT,
         timeout=LAUNCH_TIMEOUT_SECONDS,
+    )
+    # Rank 0's timings, also on success: how close the launch came to timing out.
+    print(
+        "".join(
+            f"\n  {line}"
+            for line in completed.stdout.splitlines()
+            if line.startswith("rank 0:")
+        )
     )
     results = read_worker_results(result_dir, WORLD_SIZE, completed)
     for r in results:

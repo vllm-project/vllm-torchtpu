@@ -102,24 +102,25 @@ TRANSFORMER_MAX_ABS: dict[str, tuple[float, float]] = {
     "vace": (8.7e-3, 2.0e-2),
 }
 # Keyed by (variant, output); "decode-frame" limits the worst decoded frame.
+# The VAE and UMT5 limits were re-measured on torch_tpu 0.3.0.
 VAE_MAX_REL_L2: dict[tuple[str, str], tuple[float, float]] = {
     ("wan2.1", "mode"): (3.2e-3, 6.2e-3),
     ("wan2.1", "decode"): (1.3e-2, 2.2e-2),
     ("wan2.1", "decode-frame"): (1.6e-2, 2.7e-2),
     ("wan2.2", "mode"): (4.1e-3, 8.1e-3),
     ("wan2.2", "decode"): (6.7e-3, 1.2e-2),
-    ("wan2.2", "decode-frame"): (7.1e-3, 1.4e-2),
+    ("wan2.2", "decode-frame"): (7.4e-3, 1.4e-2),
 }
 VAE_MAX_ABS: dict[tuple[str, str], tuple[float, float]] = {
-    ("wan2.1", "mode"): (5.7e-3, 7.4e-3),
-    ("wan2.1", "decode"): (3.6e-2, 5.0e-2),
-    ("wan2.1", "decode-frame"): (3.6e-2, 5.0e-2),
+    ("wan2.1", "mode"): (5.7e-3, 8.2e-3),
+    ("wan2.1", "decode"): (3.6e-2, 5.7e-2),
+    ("wan2.1", "decode-frame"): (3.6e-2, 5.7e-2),
     ("wan2.2", "mode"): (3.2e-3, 6.2e-3),
-    ("wan2.2", "decode"): (1.2e-2, 1.9e-2),
-    ("wan2.2", "decode-frame"): (1.2e-2, 1.9e-2),
+    ("wan2.2", "decode"): (1.2e-2, 2.2e-2),
+    ("wan2.2", "decode-frame"): (1.2e-2, 2.2e-2),
 }
 UMT5_MAX_REL_L2 = (3.6e-3, 7.0e-3)
-UMT5_MAX_ABS = (1.7e-2, 4.4e-2)
+UMT5_MAX_ABS = (1.9e-2, 4.4e-2)
 CLIP_MAX_REL_L2 = (3.0e-3, 5.6e-3)
 CLIP_MAX_ABS = (1.8e-2, 6.2e-2)
 

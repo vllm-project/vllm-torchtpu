@@ -16,8 +16,23 @@
 Two long prefixes are interleaved, so the recurrent slot a resumed request
 picks up was last written by the *other* prefix. Attention KV comes back from
 the cache either way; only a real state restore makes the continuation match
-the uncached one. Comparing token ids rather than an expected answer means a
+the reference. Comparing token ids rather than an expected answer means a
 wrong state shows up even when it does not change the final answer.
+
+`--reference uncached` (the default) compares every interleaved hit with the
+uncached first run. That is exact when a resumed request computes its tail in
+the same chunks as the cold prefill, e.g. with one prefill chunk per KV block.
+
+`--reference cached` is for engines whose prefill chunk spans several blocks:
+there a resumed request computes only the uncached tail, in different chunks
+than the cold prefill, and that alone shifts logprobs (by up to ~0.2 on
+Qwen3.5), enough to flip a greedy token where the top two are close. Each
+prefix is then sent again right after its cold run, before the other prefix's
+first request, and that hit, resumed from a slot the same prefix just wrote,
+is the reference the interleaved hits must match exactly. A restore that loses
+the saved state, or a later cold prefill that overwrites it, makes them
+differ. How close cached runs stay to the uncached one is checked with a
+tolerance by smoke_prefix_cache_e2e_divergence.py; here it is only reported.
 """
 
 import argparse
@@ -81,6 +96,13 @@ def main() -> int:
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument(
+        "--reference",
+        choices=("uncached", "cached"),
+        default="uncached",
+        help="What interleaved hits must match: the uncached first run, or a "
+        "hit resumed right after the same prefix (see the module docstring).",
+    )
+    p.add_argument(
         "--data-parallel-rank",
         type=int,
         help="Hold every request to this DP rank of the engine, with vLLM's "
@@ -101,44 +123,75 @@ def main() -> int:
         for t in tags
     }
 
+    def send(tag: str) -> dict | None:
+        try:
+            return complete(
+                url, a.model, prompts[tag], a.max_tokens, a.timeout, headers
+            )
+        except (urllib.error.URLError, TimeoutError) as exc:
+            print(f"STATE_CONTAMINATION_REQUEST_FAILED {tag}: {exc}")
+            return None
+
+    def first_diff(x: list[int], y: list[int]) -> int | None:
+        n = next((i for i, (u, v) in enumerate(zip(x, y)) if u != v), None)
+        return n if n is not None or len(x) == len(y) else min(len(x), len(y))
+
+    def show(rnd: int | str, tag: str, r: dict, verdict: str) -> None:
+        print(
+            json.dumps(
+                {
+                    "round": rnd,
+                    "prefix": tag,
+                    "prompt_tokens": r["prompt_tokens"],
+                    "cached_tokens": r["cached_tokens"],
+                    "verdict": verdict,
+                    "uncached_first_diff": first_diff(
+                        r["tokens"], uncached[tag]["tokens"]
+                    )
+                    if tag in uncached
+                    else None,
+                    "text": r["text"][:80],
+                }
+            ),
+            flush=True,
+        )
+
+    uncached: dict[str, dict] = {}
     reference: dict[str, dict] = {}
     failures = 0
     hit_rounds = 0
 
-    for rnd in range(1, a.rounds + 1):
-        for tag in tags:  # interleaved: the slot last held the other prefix
-            try:
-                r = complete(
-                    url, a.model, prompts[tag], a.max_tokens, a.timeout, headers
-                )
-            except (urllib.error.URLError, TimeoutError) as exc:
-                print(f"STATE_CONTAMINATION_REQUEST_FAILED {tag} r{rnd}: {exc}")
-                return 1
+    # Round 1 is uncached. With --reference cached, each prefix is resumed
+    # right after its own cold run, before the other prefix is first sent.
+    for tag in tags:
+        r = send(tag)
+        if r is None:
+            return 1
+        uncached[tag] = r
+        show(1, tag, r, "uncached" if a.reference == "cached" else "reference")
+        if a.reference == "uncached":
+            reference[tag] = r
+            continue
+        r = send(tag)
+        if r is None:
+            return 1
+        if r["cached_tokens"] == 0:
+            print(f"STATE_CONTAMINATION_REFERENCE_NOT_CACHED {tag}")
+            return 1
+        reference[tag] = r
+        show("ref", tag, r, "reference")
 
-            if tag not in reference:
-                # Round 1 is uncached: this is the ground truth.
-                reference[tag] = r
-                verdict = "reference"
-            else:
-                same = r["tokens"] == reference[tag]["tokens"]
-                if r["cached_tokens"] > 0:
-                    hit_rounds += 1
-                    if not same:
-                        failures += 1
-                verdict = "match" if same else "DIVERGED"
-            print(
-                json.dumps(
-                    {
-                        "round": rnd,
-                        "prefix": tag,
-                        "prompt_tokens": r["prompt_tokens"],
-                        "cached_tokens": r["cached_tokens"],
-                        "verdict": verdict,
-                        "text": r["text"][:80],
-                    }
-                ),
-                flush=True,
-            )
+    for rnd in range(2, a.rounds + 1):
+        for tag in tags:  # interleaved: the slot last held the other prefix
+            r = send(tag)
+            if r is None:
+                return 1
+            same = r["tokens"] == reference[tag]["tokens"]
+            if r["cached_tokens"] > 0:
+                hit_rounds += 1
+                if not same:
+                    failures += 1
+            show(rnd, tag, r, "match" if same else "DIVERGED")
 
     print(f"STATE_CONTAMINATION_CACHED_ROUNDS {hit_rounds}")
     print(f"STATE_CONTAMINATION_DIVERGENCES {failures}")
