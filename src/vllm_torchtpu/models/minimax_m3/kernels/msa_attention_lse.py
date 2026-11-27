@@ -1472,6 +1472,7 @@ def _tiles_per_step(
 
 
 _LANES = 128
+_SUBLANES = 8
 
 
 def _work_layout(num_tiles, groups_per_tile, pages_per_step, num_steps, aligned):
@@ -1566,33 +1567,328 @@ def _width_order(meta, counts, live, tile, num_tiles, tiles_per_step, pages_per_
 
 
 def _packed_work(
-    selected, block_q, pages_per_step, align=1, most=None, width_order=False
+    selected,
+    block_q,
+    pages_per_step,
+    align=1,
+    most=None,
+    width_order=False,
+    interpret=False,
 ):
     """`msa_attention._work_list` of each call's ``selected [C, T, K]`` as
     one int32 row per call, ``[unions | meta words | counts | step
     starts]``, and the tiles each grid step takes: a call then takes one
     slice of its work list, not one per array (each an XLA op of ~1.3 us,
     x 4 calls x G per layer). Step ``b``'s first group is its
-    ``tiles_per_step * b``-th tile's; the last entry is the group count."""
-    pages, meta, ends, counts = jax.vmap(
-        functools.partial(
-            msa_attention._work_list, block_q=block_q, pages_per_step=pages_per_step
-        )
-    )(selected)
+    ``tiles_per_step * b``-th tile's; the last entry is the group count.
+    Decode-sized calls build it in one kernel (`_work_kernel`)."""
     num_tiles = selected.shape[1] // block_q
     tiles_per_step = _tiles_per_step(num_tiles, block_q, align, most)
     groups_per_tile = msa_attention._groups_per_tile(
         block_q, selected.shape[2], pages_per_step
     )
+    width_order = width_order and tiles_per_step % 2 == 0
+    if _work_kernel_fits(
+        num_tiles, block_q, selected.shape[2], pages_per_step, tiles_per_step
+    ):
+        packed = _kernel_work(
+            selected,
+            block_q=block_q,
+            pages_per_step=pages_per_step,
+            tiles_per_step=tiles_per_step,
+            width_order=width_order,
+            interpret=interpret,
+        )
+        return packed, tiles_per_step
+    pages, meta, ends, counts = jax.vmap(
+        functools.partial(
+            msa_attention._work_list, block_q=block_q, pages_per_step=pages_per_step
+        )
+    )(selected)
     live = jnp.arange(meta.shape[1], dtype=jnp.int32)[None] < ends[:, None]
     tile = jnp.where(live, msa_attention._meta_tile(meta, groups_per_tile), num_tiles)
     bounds = jnp.arange(0, num_tiles + 1, tiles_per_step, dtype=jnp.int32)
     starts = jnp.sum(tile[:, None, :] < bounds[None, :, None], axis=2, dtype=jnp.int32)
-    if width_order and tiles_per_step % 2 == 0:
+    if width_order:
         meta, counts = _width_order(
             meta, counts, live, tile, num_tiles, tiles_per_step, pages_per_step
         )
     return jnp.concatenate([pages, meta, counts, starts], axis=1), tiles_per_step
+
+
+# `_work_kernel` serves calls of at most this many tiles: its group moves are
+# [groups, groups] selects (groups = 4 x tiles at 32 pages per step).
+_WORK_KERNEL_MAX_TILES = 128
+
+
+def _work_kernel_fits(num_tiles, block_q, topk, pages_per_step, tiles_per_step):
+    """Whether `_work_kernel` builds a call's work list: a tile's keys and its
+    union row are one 128-lane row each, and its group and step counts fit."""
+    groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    return (
+        block_q * topk == _LANES
+        and groups_per_tile * pages_per_step == _LANES
+        and num_tiles <= _WORK_KERNEL_MAX_TILES
+        and num_tiles // tiles_per_step + 1 <= _LANES
+    )
+
+
+def _sorted_columns(x):
+    """Each column of ``x [n, L]`` (n a power of two, at least 8) ascending,
+    by a bitonic network down the sublanes: partners 8+ apart are whole
+    sublane tiles (a min and a max), nearer ones a sublane rotation within a
+    tile. Across the lanes every step was a lane rotation, ~130 cycles of
+    latency each on the network's critical path (AOT schedule)."""
+    n, width = x.shape
+    tiles = n // _SUBLANES
+    iota = functools.partial(jax.lax.broadcasted_iota, jnp.int32)
+    k = 2
+    while k <= n:
+        j = k // 2
+        while j >= 1:
+            if j >= _SUBLANES:  # blocks of 2j elements: halves a, b
+                x4 = x.reshape(n // (2 * j), 2, j, width)
+                a, b = x4[:, 0], x4[:, 1]
+                lo, hi = jnp.minimum(a, b), jnp.maximum(a, b)
+                if k < n:  # ascending where (i & k) == 0, i = block * 2j + ...
+                    up = (iota(lo.shape, 0) * (2 * j)) & k == 0
+                    lo, hi = jnp.where(up, lo, hi), jnp.where(up, hi, lo)
+                x = jnp.stack([lo, hi], axis=1).reshape(n, width)
+            else:
+                x3 = x.reshape(tiles, _SUBLANES, width)
+                sub = iota(x3.shape, 1)
+                first = (sub & j) == 0
+                partner = jnp.where(
+                    first, pltpu.roll(x3, _SUBLANES - j, 1), pltpu.roll(x3, j, 1)
+                )
+                if k == n:
+                    keep = first
+                elif k >= _SUBLANES:
+                    keep = first == ((iota(x3.shape, 0) * _SUBLANES) & k == 0)
+                else:
+                    keep = first == ((sub & k) == 0)
+                x = jnp.where((x3 < partner) == keep, x3, partner).reshape(n, width)
+            j //= 2
+        k *= 2
+    return x
+
+
+def _row_unions(keys):
+    """Each row's distinct keys of ``keys [R, 128]`` (`_NO_PAGE` none; R a
+    multiple of 8), ascending and `_NO_PAGE` filled, as `_sorted_unions`: a
+    row's keys go down the sublanes (one transpose), sort, duplicates become
+    `_NO_PAGE`, sort again."""
+    no_page = msa_attention._NO_PAGE
+    x = _sorted_columns(keys.T)  # [128, R]: a row's keys down the sublanes
+    x3 = x.reshape(-1, _SUBLANES, x.shape[1])
+    rolled = pltpu.roll(x3, 1, 1)  # element i - 1 at sublanes 1..7
+    # ... and at sublane 0, the previous tile's sublane 7 (none for the first).
+    carry = jnp.concatenate([rolled[:1], rolled[:-1]], axis=0)
+    sub = jax.lax.broadcasted_iota(jnp.int32, x3.shape, 1)
+    prev = jnp.where(sub == 0, carry, rolled)
+    first = (sub == 0) & (jax.lax.broadcasted_iota(jnp.int32, x3.shape, 0) == 0)
+    dup = (x3 == prev) & jnp.logical_not(first)
+    x = jnp.where(dup, no_page, x3).reshape(x.shape)
+    return _sorted_columns(x).T
+
+
+def _col_to_row(col, n):
+    """``[n, 1]`` -> ``[1, n]`` by a diagonal select and a sublane sum."""
+    iota = functools.partial(jax.lax.broadcasted_iota, jnp.int32, (n, n))
+    return jnp.sum(jnp.where(iota(0) == iota(1), col, 0), axis=0, keepdims=True)
+
+
+def _work_kernel(keys_ref, unions_ref, meta_ref, counts_ref, starts_ref, **work):
+    """Every call's `_packed_work` sections from its tiles' page keys
+    ``keys_ref [C, R, 128]`` (a tile per row, -1 for no page, rows past the
+    call's tiles too): the unions of all calls' tiles by one sort
+    (`_row_unions`), then each call's groups (`_call_work`)."""
+    no_page = msa_attention._NO_PAGE
+    calls, rows, _ = keys_ref.shape
+    keys = keys_ref[...].reshape(calls * rows, _LANES)
+    unions = _row_unions(jnp.where(keys < 0, no_page, keys))
+    unions_ref[...] = jnp.where(unions == no_page, -1, unions).reshape(keys_ref.shape)
+    for c in range(calls):
+        _call_work(
+            unions[c * rows : (c + 1) * rows],
+            meta_ref.at[c],
+            counts_ref.at[c],
+            starts_ref.at[c],
+            **work,
+        )
+
+
+def _call_work(
+    unions,
+    meta_ref,
+    counts_ref,
+    starts_ref,
+    *,
+    num_tiles,
+    pages_per_step,
+    groups_per_tile,
+    tiles_per_step,
+    width_order,
+):
+    """One call's meta words, counts and step starts (``[1, n]`` rows) from
+    its tiles' unions (`_row_unions`, a tile per row): the same values as
+    `msa_attention._work_list`, the step starts and `_width_order`. A tile's
+    quantities are a column ``[T, 1]`` or a row ``[1, T]``, a group's a
+    column ``[M, 1]``; every gather of the XLA version is a compare and a
+    sum over a small square."""
+    no_page = msa_attention._NO_PAGE
+    num_groups = num_tiles * groups_per_tile
+    iota = functools.partial(jax.lax.broadcasted_iota, jnp.int32)
+    x = unions[:num_tiles]
+
+    pages_c = jnp.sum(jnp.where(x != no_page, 1, 0), axis=1, keepdims=True)
+    groups_c = jnp.maximum(
+        (pages_c + pages_per_step - 1) >> (pages_per_step.bit_length() - 1), 1
+    )
+    t_c, t_r = iota((num_tiles, 1), 0), iota((1, num_tiles), 1)
+    pages_r = _col_to_row(pages_c, num_tiles)
+    groups_r = _col_to_row(groups_c, num_tiles)
+    # Inclusive group sums over tiles: rows (t' <= t down the sublanes).
+    ends_r = jnp.sum(
+        jnp.where(
+            iota((num_tiles, num_tiles), 0) <= iota((num_tiles, num_tiles), 1),
+            groups_c,
+            0,
+        ),
+        axis=0,
+        keepdims=True,
+    )
+    starts_r = ends_r - groups_r
+    total = jnp.sum(groups_r, axis=1, keepdims=True)  # [1, 1]
+
+    # Each group w (a column) against every tile's range (the lanes).
+    w = iota((num_groups, 1), 0)
+    began = starts_r <= w  # [M, T]
+    tile = jnp.sum(jnp.where(began & (t_r >= 1), 1, 0), axis=1, keepdims=True)
+    start = jnp.max(jnp.where(began, starts_r, 0), axis=1, keepdims=True)
+    end = jnp.min(jnp.where(ends_r > w, ends_r, total), axis=1, keepdims=True)
+    tile_pages = jnp.max(
+        jnp.where(began & (ends_r > w), pages_r, 0), axis=1, keepdims=True
+    )
+    group = jnp.clip(w - start, 0, groups_per_tile - 1)
+    count = jnp.clip(tile_pages - group * pages_per_step, 0, pages_per_step)
+    meta = (
+        ((tile * groups_per_tile + group) << msa_attention._ROW_SHIFT)
+        | jnp.where(w == start, msa_attention._FIRST_BIT, 0)
+        | jnp.where(w + 1 == end, msa_attention._LAST_BIT, 0)
+    )
+    live = w < total
+
+    # Step b starts at the groups of the tiles before its first one.
+    bound = iota((1, starts_ref.shape[1]), 1) * tiles_per_step
+    starts_ref[...] = jnp.sum(
+        jnp.where(t_c < bound, groups_c, 0), axis=0, keepdims=True
+    )
+
+    pos = w
+    if width_order:  # `_width_order`, per tile instead of per pair
+        widths = [n for n in _STEP_WIDTHS if n < pages_per_step]
+        pairs = num_tiles // 2
+
+        def width_class(pages):
+            cls = sum(jnp.where(pages > n, 1, 0) for n in widths)
+            cls = jnp.where(pages > pages_per_step, len(widths) + 1, cls)
+            return jnp.where(pages == 0, -1, cls)
+
+        def step_of(t):
+            step = jnp.zeros_like(t)
+            for b in range(1, num_tiles // tiles_per_step):
+                step += jnp.where(t >= b * tiles_per_step, 1, 0)
+            return step
+
+        # A pair's key from its wider tile: t's partner is t ^ 1.
+        cls_c, cls_r = width_class(pages_c), width_class(pages_r)
+        partner = iota((num_tiles, num_tiles), 0) == (
+            iota((num_tiles, num_tiles), 1) ^ 1
+        )
+        key_r = jnp.maximum(
+            cls_r, jnp.sum(jnp.where(partner, cls_c, 0), axis=0, keepdims=True)
+        )
+        key_c = jnp.maximum(
+            cls_c, jnp.sum(jnp.where(partner, cls_r, 0), axis=1, keepdims=True)
+        )
+        key_r = jnp.where(key_r < 0, len(widths) + 2, key_r) * pairs + (t_r >> 1)
+        key_c = jnp.where(key_c < 0, len(widths) + 2, key_c) * pairs + (t_c >> 1)
+        step_c, step_r = step_of(t_c), step_of(t_r)
+        # Rows of [T (t' down the sublanes), T (t across the lanes)] sums.
+        pair_at = jnp.sum(
+            jnp.where((step_c == step_r) & (key_c < key_r), groups_c, 0),
+            axis=0,
+            keepdims=True,
+        )
+        step_at = jnp.sum(
+            jnp.where(step_c < step_r, groups_c, 0), axis=0, keepdims=True
+        )
+        before = jnp.sum(
+            jnp.where((t_c == t_r - 1) & ((t_r & 1) == 1), groups_c, 0),
+            axis=0,
+            keepdims=True,
+        )
+        shift = step_at + pair_at + before - starts_r  # [1, T]
+        moved = jnp.sum(jnp.where(tile == t_r, shift, 0), axis=1, keepdims=True)
+        pos = jnp.where(live, w + moved, w)
+
+    # Group w's words go to lane pos[w] of the output rows.
+    to = iota((1, meta_ref.shape[1]), 1)
+    meta_ref[...] = jnp.sum(jnp.where(pos == to, meta, 0), axis=0, keepdims=True)
+    counts_ref[...] = jnp.sum(jnp.where(pos == to, count, 0), axis=0, keepdims=True)
+
+
+def _kernel_work(
+    selected, *, block_q, pages_per_step, tiles_per_step, width_order, interpret
+):
+    """`_packed_work`'s rows for ``selected [C, T, K]`` by `_work_kernel`."""
+    calls, num_tokens, topk = selected.shape
+    num_tiles = num_tokens // block_q
+    groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
+    num_groups = num_tiles * groups_per_tile
+    num_bounds = num_tiles // tiles_per_step + 1
+    words = -(-num_groups // _LANES) * _LANES
+    rows = -(-num_tiles // _SUBLANES) * _SUBLANES
+    keys = selected.reshape(calls, num_tiles, block_q * topk)
+    keys = jnp.pad(keys, ((0, 0), (0, rows - num_tiles), (0, 0)), constant_values=-1)
+
+    shapes = [
+        (calls, rows, _LANES),
+        (calls, 1, words),
+        (calls, 1, words),
+        (calls, 1, _LANES),
+    ]
+
+    def whole(shape):
+        return pl.BlockSpec(shape, lambda i: (0, 0, 0))
+
+    unions, meta, counts, starts = pl.pallas_call(
+        functools.partial(
+            _work_kernel,
+            num_tiles=num_tiles,
+            pages_per_step=pages_per_step,
+            groups_per_tile=groups_per_tile,
+            tiles_per_step=tiles_per_step,
+            width_order=width_order,
+        ),
+        grid=(1,),
+        in_specs=[whole(shapes[0])],
+        out_specs=[whole(x) for x in shapes],
+        out_shape=[jax.ShapeDtypeStruct(x, jnp.int32) for x in shapes],
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
+        interpret=interpret,
+        name="minimax_m3_msa_work_list",
+    )(keys.astype(jnp.int32))
+    return jnp.concatenate(
+        [
+            unions[:, :num_tiles].reshape(calls, num_tiles * _LANES),
+            meta[:, 0, :num_groups],
+            counts[:, 0, :num_groups],
+            starts[:, 0, :num_bounds],
+        ],
+        axis=1,
+    )
 
 
 def _page_limits(
@@ -1779,7 +2075,13 @@ def _chunked_call(
     )
     dtype = (q[0] if isinstance(q, tuple) else q).dtype
     step, num_chunks, pad, selected, (packed, tiles_per_step) = _chunk_work(
-        selected, num_q_heads, dtype, block_q, pages_per_step, scale_rows is not None
+        selected,
+        num_q_heads,
+        dtype,
+        block_q,
+        pages_per_step,
+        scale_rows is not None,
+        interpret=interpret,
     )
     q = jax.tree.map(lambda x: jnp.pad(x, ((0, 0), (0, pad), (0, 0))), q)
     local_page = jnp.pad(local_page, (0, pad), constant_values=-1)[:, None]
@@ -1858,7 +2160,14 @@ def _chunked_call(
 
 
 def _chunk_work(
-    selected, num_q_heads, dtype, block_q, pages_per_step, fp4=False, packed=False
+    selected,
+    num_q_heads,
+    dtype,
+    block_q,
+    pages_per_step,
+    fp4=False,
+    packed=False,
+    interpret=False,
 ):
     """`_chunked_call`'s calls over ``selected [T, G, K]``: ``(step,
     chunks, pad, selected [G, chunks * step, K], (packed, tiles_per_step))``
@@ -1890,6 +2199,7 @@ def _chunk_work(
             and num_tokens > msa_attention.SMALL_BATCH_TOKENS
             else None
         ),
+        interpret=interpret,
     )
     return step, num_chunks, pad, selected, packed
 
@@ -2264,7 +2574,14 @@ def msa_sparse_attention_lse_head_calls(
     )
     q = q.transpose(1, 0, 2)
     step, num_chunks, pad, selected, (packed, tiles_per_step) = _chunk_work(
-        selected, num_q_heads, q.dtype, block_q, pages_per_step, True, packed=True
+        selected,
+        num_q_heads,
+        q.dtype,
+        block_q,
+        pages_per_step,
+        True,
+        packed=True,
+        interpret=interpret,
     )
     if num_chunks != 1:
         raise ValueError(f"one chunk per head, got {num_chunks} of {step} tokens")

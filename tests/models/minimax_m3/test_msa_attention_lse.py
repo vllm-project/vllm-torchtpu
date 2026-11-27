@@ -516,8 +516,10 @@ def test_width_order_keeps_tiles_and_pairs_whole(num_tokens, most_tiles):
                 selected[c, t * block_q + i, :n] = rng.choice(pool, n, replace=False)
     args = (jnp.asarray(selected), block_q, pages_per_step)
     kw = dict(align=16, most=most_tiles)
-    plain, tiles_per_step = msa_attention_lse._packed_work(*args, **kw)
-    ordered, _ = msa_attention_lse._packed_work(*args, **kw, width_order=True)
+    plain, tiles_per_step = msa_attention_lse._packed_work(*args, **kw, interpret=True)
+    ordered, _ = msa_attention_lse._packed_work(
+        *args, **kw, width_order=True, interpret=True
+    )
     plain, ordered = np.asarray(plain), np.asarray(ordered)
     groups_per_tile = msa_attention._groups_per_tile(block_q, topk, pages_per_step)
     num_groups = num_tiles * groups_per_tile
@@ -666,3 +668,37 @@ def test_adaptive_tiles_match_reference(fp4, mode, max_union, monkeypatch):
         0,
     )
     _check(got, want)
+
+
+@pytest.mark.parametrize("num_tokens", [8, 48, 216, 384, 1024])
+@pytest.mark.parametrize("width_order", [False, True])
+def test_work_kernel_matches_xla_work_list(num_tokens, width_order, monkeypatch):
+    """`_work_kernel`'s packed rows equal the XLA work list's word for word:
+    tiles of shared, dispersed (four 32-page groups) and no pages, padding
+    tiles at the end."""
+    rng = np.random.default_rng(num_tokens)
+    block_q, topk, pages_per_step = 8, 16, 32
+    num_tiles = num_tokens // block_q
+    selected = np.full((2, num_tokens, topk), -1, np.int32)
+    for c in range(2):
+        for t in range(num_tiles - num_tiles // 8):
+            union = rng.choice([0, 1, 4, 5, 9, 17, 33, 128])
+            pool = t * 512 + rng.permutation(512)[: max(union, 1)]
+            for i in range(block_q):
+                n = min(topk, union)
+                selected[c, t * block_q + i, :n] = rng.choice(pool, n, replace=False)
+    args = (jnp.asarray(selected), block_q, pages_per_step)
+    kw = dict(align=16, most=64, width_order=width_order)
+    calls = []
+    kernel_work = msa_attention_lse._kernel_work
+    monkeypatch.setattr(
+        msa_attention_lse,
+        "_kernel_work",
+        lambda *a, **k: calls.append(1) or kernel_work(*a, **k),
+    )
+    got, got_tiles = msa_attention_lse._packed_work(*args, **kw, interpret=True)
+    assert calls, "the work list kernel did not build the work list"
+    monkeypatch.setattr(msa_attention_lse, "_work_kernel_fits", lambda *a: False)
+    want, want_tiles = msa_attention_lse._packed_work(*args, **kw)
+    assert got_tiles == want_tiles
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
