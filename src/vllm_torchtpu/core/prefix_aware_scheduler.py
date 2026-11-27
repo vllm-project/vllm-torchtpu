@@ -40,6 +40,10 @@ how many remote loads it admits (``decode_inflight_throttle``, through the
 async-load block reservation). This scheduler does not sort the waiting
 queue.
 
+For an aggregated engine, ``prefix_aware_levers`` runs the decode-leg levers
+above on an engine that is not a KV consumer, and resolves divergent hybrid
+hits through the KV connector there.
+
 Enable with:
     --scheduler-cls vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler
 
@@ -51,7 +55,7 @@ import time
 from bisect import bisect_right
 from itertools import islice
 from operator import itemgetter
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -181,12 +185,64 @@ def memo_local_prefix_cache_hit(
     return None
 
 
+@runtime_checkable
+class DivergentHitResolver(Protocol):
+    """A KV connector that decides how much of a diverged local hybrid hit to
+    keep: None keeps the reconciled hit, otherwise the number of local tokens
+    to keep. The pipeline chunk scheduler reads the same hook through its
+    own copy of this protocol."""
+
+    def resolve_divergent_local_hit_tokens(
+        self, request: Any, num_local: int, num_reconciled: int, block_size: int
+    ) -> int | None: ...
+
+
+def resolve_divergent_local_hit(
+    scheduler: Any,
+    resolver: DivergentHitResolver,
+    request: Request,
+    max_cache_hit_length: int | None,
+    hit: tuple["KVCacheBlocks", int, int, bool],
+) -> tuple["KVCacheBlocks", int, int, bool]:
+    """The admission lookup ``hit`` with a diverged local hybrid hit resolved
+    through the connector's ``resolver``; any other hit unchanged.
+
+    The connector keeps the reconciled hit (None), none of it (0 or less),
+    or a shorter local hit, as in the pipeline chunk scheduler's
+    prefix-aware admission.
+    """
+    blocks, num_local, shared_prefix_boundary, hit_diverged = hit
+    if not hit_diverged:
+        return hit
+    kvm = scheduler.kv_cache_manager
+    reconciled_blocks, num_reconciled, reconciled_boundary = kvm.get_computed_blocks(
+        request, max_cache_hit_length
+    )
+    target_local = resolver.resolve_divergent_local_hit_tokens(
+        request, num_local, num_reconciled, scheduler._get_block_size()
+    )
+    if target_local is None:
+        return reconciled_blocks, num_reconciled, reconciled_boundary, False
+    if target_local <= 0:
+        return kvm.empty_kv_cache_blocks, 0, reconciled_boundary, False
+    if target_local < num_local:
+        blocks = kvm.truncate_computed_blocks(blocks, target_local)
+        num_local = target_local
+    return blocks, num_local, shared_prefix_boundary, hit_diverged
+
+
 class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
     """Admit ready requests prioritizing fewest uncached prompt tokens."""
 
     #: Lookahead window of ready requests to evaluate for cached prefix length.
     WINDOW = 64
     _retention_log_name = "PrefixAwareScheduler"
+    # Set by __init__ from tpu_scheduler.prefix_aware_levers, on an engine
+    # that is not a KV consumer only: whether the option turns the levers on,
+    # and the connector that resolves divergent hybrid hits (None without
+    # one).
+    _levers_switch = False
+    _hit_resolver: DivergentHitResolver | None = None
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -195,9 +251,10 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
         kv_transfer_config = self.vllm_config.kv_transfer_config
-        # The decode-leg levers were measured on the decode legs of
+        # The decode-leg levers run by default on the decode legs of
         # prefill/decode disaggregation only. kv_both (an offloading connector
-        # on an aggregated engine) is also a producer and keeps the admission.
+        # on an aggregated engine) is also a producer and keeps the admission
+        # unless tpu_scheduler.prefix_aware_levers turns the levers on.
         self._is_kv_consumer = (
             kv_transfer_config is not None
             and kv_transfer_config.is_kv_consumer
@@ -205,6 +262,7 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
         )
         options = scheduler_options.get(self.vllm_config)
         self._promote_warmest_switch = options.promote_warmest
+        self._init_levers_switch(options.prefix_aware_levers)
         if options.kv_prefetch and not (
             self._is_kv_consumer and self.connector is not None
         ):
@@ -223,7 +281,7 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
         self._kv_prefetch_switch = options.kv_prefetch
         self._decode_throttle_switch = options.decode_inflight_throttle
         self._memo_xstep = False
-        if self._is_kv_consumer:
+        if self._levers_on():
             self._enable_memo_xstep()
         self._init_kv_prefetch()
 
@@ -231,9 +289,56 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
             "PrefixAwareScheduler ACTIVE (window=%d, decode-leg levers=%s, "
             "memo_xstep=%s)",
             self.WINDOW,
-            self._is_kv_consumer,
+            self._levers_on(),
             self._memo_xstep,
         )
+
+    def _levers_on(self) -> bool:
+        """Whether this engine runs the decode-leg levers: a KV consumer, or
+        any engine with ``tpu_scheduler.prefix_aware_levers``."""
+        return self._is_kv_consumer or self._levers_switch
+
+    def _init_levers_switch(self, prefix_aware_levers: bool) -> None:
+        """Reads ``tpu_scheduler.prefix_aware_levers``: on an engine that is
+        not a KV consumer it turns the levers on and resolves divergent
+        hybrid hits through a connector that has the hook."""
+        if not prefix_aware_levers:
+            return
+        if self._is_kv_consumer:
+            logger.info(
+                "PrefixAwareScheduler: %s.prefix_aware_levers adds nothing on a "
+                "KV consumer: the levers run anyway, and divergent hybrid hits "
+                "keep vLLM's lookup.",
+                scheduler_options.SECTION,
+            )
+            return
+        self._levers_switch = True
+        connector = self.connector
+        if isinstance(connector, DivergentHitResolver):
+            self._hit_resolver = connector
+            # vLLM's lookup reports a diverged hit only for a connector
+            # that claims them.
+            if getattr(connector, "supports_divergent_local_hybrid_hits", False):
+                logger.info(
+                    "PrefixAwareScheduler: the KV connector %s resolves "
+                    "divergent hybrid hits.",
+                    type(connector).__name__,
+                )
+            else:
+                logger.info(
+                    "PrefixAwareScheduler: the KV connector %s does not claim "
+                    "divergent hybrid hits (supports_divergent_local_hybrid_hits "
+                    "is false): vLLM reconciles every hit and the resolution "
+                    "stays idle.",
+                    type(connector).__name__,
+                )
+        elif connector is not None:
+            logger.info(
+                "PrefixAwareScheduler: the KV connector %s has no "
+                "resolve_divergent_local_hit_tokens; divergent hybrid hits "
+                "keep vLLM's lookup.",
+                type(connector).__name__,
+            )
 
     # ------------------------------------------------------------------
     # Decode KV prefetch past a full running set (option
@@ -559,7 +664,7 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
         """Records why the waiting loop stopped at ``request`` (first stop of
         the step wins; running requests are ignored)."""
         if (
-            self._is_kv_consumer
+            self._levers_on()
             and getattr(self, "_step_wait_event", None) is None
             and is_waiting_status(request)
         ):
@@ -583,7 +688,7 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
 
     def _make_cached_request_data(self, *args, **kwargs):
         cached = super()._make_cached_request_data(*args, **kwargs)
-        if not self._is_kv_consumer:
+        if not self._levers_on():
             return cached
         if getattr(self, "_trim_resend", None) is None:
             self._trim_resend = True
@@ -613,8 +718,8 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
         return cached
 
     def schedule(self, *args, **kwargs):
-        if not self._is_kv_consumer:
-            # Off a decode leg: the warmest-first admission alone, unless
+        if not self._levers_on():
+            # Without the levers: the warmest-first admission alone, unless
             # tpu_scheduler.promote_warmest=false asks for FCFS admission.
             if self._promote_warmest_on():
                 self._promote_warmest(self.kv_holding_waiting or self.waiting)
@@ -890,11 +995,24 @@ class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
         no prefix-cache stats (the scheduler records them at admission), and
         requests whose ``full`` KV-event report mode makes it emit events go
         to it.
+
+        With the levers option off a KV consumer, a diverged hybrid hit is
+        resolved through the connector (``_hit_resolver``,
+        ``resolve_divergent_local_hit``), and the local hit is recorded on
+        the request (``_tpu_local_hit_tokens``) for a connector that reads
+        it, as the pipeline chunk scheduler's prefix-aware admission does.
         """
         hit = memo_local_prefix_cache_hit(self, request, max_cache_hit_length)
-        if hit is not None:
-            return hit
-        return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
+        if hit is None:
+            hit = super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
+            resolver = self._hit_resolver
+            if resolver is not None:
+                hit = resolve_divergent_local_hit(
+                    self, resolver, request, max_cache_hit_length, hit
+                )
+        if self._levers_switch:
+            request._tpu_local_hit_tokens = hit[1]
+        return hit
 
     def _rank_and_warmth(
         self,

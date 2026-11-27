@@ -50,6 +50,19 @@ class SchedulerOptions:
     async-load reservation, 128 blocks and 8 blocks x (running + in flight).
     The validation entries' DCP 4 decode legs set it."""
 
+    prefix_aware_levers: bool = False
+    """Run ``PrefixAwareScheduler``'s decode-leg levers on an engine that is
+    not a KV consumer (no KV transfer, a KV producer, or ``kv_both``):
+    decoding requests ahead of partial prefills, warmest-first promotion of
+    both waiting queues (once per step), the cross-step prefix-hit memo,
+    packed prompt ids, the trimmed token-id resend, and divergent hybrid hits
+    resolved through a KV connector that has
+    ``resolve_divergent_local_hit_tokens`` and claims
+    ``supports_divergent_local_hybrid_hits``. A KV consumer runs the levers
+    anyway and keeps vLLM's lookup for divergent hits, so there it adds
+    nothing. The cost is host-side: the memo's prefix-cache change log, at
+    most 65536 entries."""
+
 
 def parse(raw: Any) -> SchedulerOptions:
     """The ``tpu_scheduler`` section as options; None gives the defaults.
