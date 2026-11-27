@@ -22,8 +22,6 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4.collective_ids import O_FETCH_COLLECTIVE_ID
 from vllm_torchtpu.kernels.deepseek_v4.rope import (
     LANE,
-    CosSinRef,
-    _cos_sin_lanes,
     _rotate_gptj,
 )
 from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX
@@ -41,124 +39,31 @@ def _largest_divisor(x: int, cap: int) -> int:
     return 1
 
 
-def _cos_sin_body(
-    cos_sin_ref: jax.Ref,
-    out_ref: jax.Ref,
-    *,
-    rotary_dim: int,
-    inverse: bool,
-    out_dtype: jnp.dtype,
-) -> None:
-    """Expand a ``(tile_n, rotary_dim)`` block to ``(tile_n, 2 * LANE)``."""
-    cos, sin = _cos_sin_lanes(cos_sin_ref[...], rotary_dim=rotary_dim, inverse=inverse)
-    out_ref[...] = jnp.concatenate([cos, sin], axis=-1).astype(out_dtype)
-
-
-def _cos_sin_kernel(
-    # scalar prefetch
-    positions_ref: jax.Ref,
-    # HBM input
-    cos_sin_cache_hbm_ref: jax.Ref,
-    # HBM output
-    out_hbm_ref: jax.Ref,
-    *,
-    num_tiles: int,
-    tile_n: int,
-    rotary_dim: int,
-    inverse: bool,
-    cos_sin_dtype: jnp.dtype,
-    out_dtype: jnp.dtype,
-) -> None:
-    cos_sin_spec = pl.BlockSpec(
-        block_shape=(tile_n, rotary_dim),
-        memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0),
-    )
-    out_spec = pl.BlockSpec(
-        block_shape=(tile_n, 2 * LANE),
-        memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, 0),
-    )
-    # The per-token row gather; one buffer of lookahead hides its DMAs.
-    cos_sin_alloc = CosSinRef.create(
-        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
-    )
-
-    pipeline = pltpu.emit_pipeline(
-        functools.partial(
-            _cos_sin_body,
-            rotary_dim=rotary_dim,
-            inverse=inverse,
-            out_dtype=out_dtype,
-        ),
-        grid=(num_tiles,),
-        in_specs=[cos_sin_spec],
-        out_specs=[out_spec],
-    )
-    allocations = (
-        cos_sin_alloc,
-        pltpu.BufferedRef.output(out_spec, out_dtype, buffer_count=2),
-    )
-
-    @pl.with_scoped(allocations=allocations)
-    def _run(allocations):
-        pipeline(
-            (cos_sin_cache_hbm_ref, positions_ref),
-            out_hbm_ref,
-            allocations=allocations,
-        )
-
-    _run()
-
-
-@functools.partial(
-    jax.jit,
-    static_argnames=("inverse", "out_dtype", "name"),
-)
-def gather_cos_sin(
-    positions: jax.Array,  # [T] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+def expand_cos_sin(
+    cos_sin: jax.Array,  # [T, rotary_dim] float32
     *,
     inverse: bool = False,
     out_dtype: jnp.dtype = jnp.float32,
-    name: str = "gather_cos_sin",
 ) -> jax.Array:
-    """Builds ``wo_a_projection``'s ``[T, 2 * LANE]`` cos/sin table.
+    """Expands per-token ``[T, rotary_dim]`` cos/sin to ``[T, 2 * LANE]``.
 
-    Gathers ``cos_sin_cache[positions]`` based on the token positions, expands
-    each row to ``[2 * LANE]``
+    Uses repeat/pad instead of ``rope._cos_sin_lanes`` because ``_cos_sin_lanes``
+    uses ``lax.gather`` for Mosaic VREG permutes inside Pallas; outside Pallas,
+    XLA lowers it to an HBM ``gather_fusion`` (6.58% device time on DSv4-Flash).
     """
-    assert positions.ndim == 1
-    assert cos_sin_cache.ndim == 2
-
-    num_tokens = positions.shape[0]
-    rotary_dim = cos_sin_cache.shape[1]
+    assert cos_sin.ndim == 2
+    rotary_dim = cos_sin.shape[1]
     assert rotary_dim % 2 == 0 and rotary_dim <= LANE
-
-    tile_n = _largest_divisor(num_tokens, cap=128)
-
-    return pl.pallas_call(
-        functools.partial(
-            _cos_sin_kernel,
-            num_tiles=num_tokens // tile_n,
-            tile_n=tile_n,
-            rotary_dim=rotary_dim,
-            inverse=inverse,
-            cos_sin_dtype=cos_sin_cache.dtype,
-            out_dtype=out_dtype,
-        ),
-        out_shape=jax.ShapeDtypeStruct((num_tokens, 2 * LANE), out_dtype),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            in_specs=(pl.BlockSpec(memory_space=pltpu.HBM),),
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-        ),
-        compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
-            disable_bounds_checks=True,
-        ),
-        name=name,
-    )(positions, cos_sin_cache)
+    half = rotary_dim // 2
+    nope = LANE - rotary_dim
+    cos = jnp.repeat(cos_sin[:, :half], 2, axis=-1)
+    sin = jnp.repeat(cos_sin[:, half:], 2, axis=-1)
+    if inverse:
+        sin = -sin
+    if nope > 0:
+        cos = jnp.pad(cos, ((0, 0), (nope, 0)), constant_values=1.0)
+        sin = jnp.pad(sin, ((0, 0), (nope, 0)), constant_values=0.0)
+    return jnp.concatenate([cos, sin], axis=-1).astype(out_dtype)
 
 
 def _rope_heads(
@@ -392,8 +297,7 @@ def wo_a_projection(
 )
 def fused_reverse_rope_wo_a_projection(
     x: jax.Array,  # [T, G * H, head_dim] bf16
-    positions: jax.Array,  # [T] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    cos_sin: jax.Array,  # [T, rotary_dim] float32
     wo_a: jax.Array,  # [D, G * R] fp8
     wo_a_scale: jax.Array,  # [G * R] float32
     *,
@@ -408,18 +312,14 @@ def fused_reverse_rope_wo_a_projection(
     """``The RoPE-fused ``wo_a_projection``."""
     assert x.ndim == 3
     assert x.shape[2] == head_dim
+    assert cos_sin.ndim == 2 and cos_sin.shape[0] == x.shape[0]
 
-    cos_sin = gather_cos_sin(
-        positions,
-        cos_sin_cache,
-        inverse=inverse,
-        name=f"{name}_gather_cos_sin",
-    )
+    expanded_cos_sin = expand_cos_sin(cos_sin, inverse=inverse)
     return wo_a_projection(
         x,
         wo_a,
         wo_a_scale,
-        cos_sin,
+        expanded_cos_sin,
         tile_t=tile_t,
         tile_r=tile_r,
         sub_t=sub_t,
@@ -556,8 +456,7 @@ def _o_fetch_kernel(
 @functools.partial(jax.jit, static_argnames=("head_dim", "inverse", "name"))
 def fused_reverse_rope_wo_a_projection_o_fetch(
     o: jax.Array,  # [T, H, head_dim] bf16: current chiplet's tokens, all heads
-    positions: jax.Array,  # [2T] int: chiplet 0's tokens, then chiplet 1's
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    cos_sin: jax.Array,  # [2T, rotary_dim] f32: chiplet 0's tokens, then chiplet 1's
     wo_a: jax.Array,  # [reduction, local_num_groups * lora_rank] fp8: local groups
     wo_a_scale: jax.Array,  # [local_num_groups * lora_rank] float32
     neighbor_mesh_index: jax.Array,  # int32 [1]: neighboring chiplet's mesh index
@@ -583,6 +482,7 @@ def fused_reverse_rope_wo_a_projection_o_fetch(
     assert num_tokens % SUBLANE == 0, f"T = {num_tokens} is not a multiple of 8"
     local_chiplet_heads = num_heads // 2
     total = 2 * num_tokens
+    assert cos_sin.ndim == 2 and cos_sin.shape[0] == total
     reduction, out_features = wo_a.shape
     assert reduction % head_dim == 0
     heads_per_group = reduction // head_dim
@@ -597,9 +497,7 @@ def fused_reverse_rope_wo_a_projection_o_fetch(
     heads_per_step = groups_per_step * heads_per_group
     num_steps = local_num_groups // groups_per_step
     cols_per_step = groups_per_step * lora_rank
-    cos_sin = gather_cos_sin(
-        positions, cos_sin_cache, inverse=inverse, name=f"{name}_gather_cos_sin"
-    )
+    expanded_cos_sin = expand_cos_sin(cos_sin, inverse=inverse)
     return pl.pallas_call(
         functools.partial(
             _o_fetch_kernel,
@@ -642,5 +540,5 @@ def fused_reverse_rope_wo_a_projection_o_fetch(
         o,
         wo_a,
         wo_a_scale.reshape(1, out_features),
-        cos_sin,
+        expanded_cos_sin,
     )

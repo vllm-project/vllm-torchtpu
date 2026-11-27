@@ -357,3 +357,47 @@ def test_tagged_forward_captures_and_keeps_main_output(tiny_fc):
     # reuses its reconstruction: one post-op call per tag, none extra.
     torch.testing.assert_close(hidden, baseline)
     assert tiny_fc.model.mhc_post_op.calls == len(tags)
+
+
+def test_mla_attention_rope_wrappers_gather_positions():
+    """qnorm_rope, kv_rope, and _o_proj look up cos_sin rows at positions."""
+    num_tokens, rotary_dim = 4, 8
+    positions = torch.tensor([0, 3, 7, 12], dtype=torch.int32)
+    table = torch.randn(32, rotary_dim)
+    expected = table.index_select(0, positions)
+
+    attn = VllmDeepseekV4MLAAttention.__new__(VllmDeepseekV4MLAAttention)
+    nn.Module.__init__(attn)
+    attn.prefix = "model.layers.0.self_attn"
+    attn.n_local_heads = 8
+    attn.n_local_groups = 1
+    attn.head_dim = 128
+    attn.q_lora_rank = 4
+    object.__setattr__(attn, "mla_attn", attn)
+    attn.wo_a = SimpleNamespace(
+        weight=torch.zeros((1, 1), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.ones(1),
+    )
+    attn.wo_b = lambda z: z
+    attn.rotary_emb = SimpleNamespace(cos_sin_cache=table, rotary_dim=rotary_dim)
+
+    q_calls, kv_calls, o_calls = [], [], []
+    object.__setattr__(
+        attn, "_qnorm_rope_op_instance", lambda q, cs: q_calls.append(cs) or q
+    )
+    object.__setattr__(
+        attn, "_kv_rope_op_instance", lambda kv, cs: kv_calls.append(cs) or kv
+    )
+    object.__setattr__(
+        attn,
+        "_o_proj_op_instance",
+        lambda o, cs, *_a: o_calls.append(cs) or o[:, 0, :4],
+    )
+
+    attn._assert_o_proj_supported()
+    attn.qnorm_rope(torch.zeros(num_tokens, 8, 128, dtype=torch.bfloat16), positions)
+    attn.kv_rope(torch.zeros(num_tokens, 128, dtype=torch.bfloat16), positions)
+    attn._o_proj(torch.zeros(num_tokens, 8, 128, dtype=torch.bfloat16), positions)
+    assert torch.equal(q_calls[0], expected)
+    assert torch.equal(kv_calls[0], expected)
+    assert torch.equal(o_calls[0], expected)

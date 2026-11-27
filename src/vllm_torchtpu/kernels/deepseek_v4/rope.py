@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import dataclasses
 import functools
 from typing import cast
 
@@ -28,67 +27,6 @@ from vllm_torchtpu.utils import largest_divisor
 LANE = 128
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
-
-
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class CosSinRef(pltpu.BufferedRef):
-    """Per-token gather of ``cos_sin_cache`` rows into a ``(tile_n, rotary_dim)``"""
-
-    tile_n: int = dataclasses.field(metadata=dict(static=True))
-
-    @classmethod
-    def create(
-        cls, *, spec: pl.BlockSpec, dtype: jnp.dtype, buffer_count: int, tile_n: int
-    ) -> "CosSinRef":
-        standard_ref = pltpu.BufferedRef.create(
-            spec=spec,
-            dtype_or_type=dtype,
-            buffer_type=pltpu.BufferType.INPUT,
-            buffer_count=buffer_count,
-            grid_rank=1,
-            use_lookahead=False,
-        )
-        return cls(
-            tile_n=tile_n,
-            **{
-                f.name: getattr(standard_ref, f.name)
-                for f in dataclasses.fields(pltpu.BufferedRef)
-            },
-        )
-
-    def copy_in(
-        self,
-        src_ref: tuple[jax.Ref, jax.Ref],
-        grid_indices: tuple[int | jax.Array, ...],
-    ) -> None:
-        assert self.sem_recvs is not None
-        assert self.window_ref is not None
-        cos_sin_cache_ref, positions_ref = src_ref
-        slot = self.current_copy_in_slot
-        sem = self.sem_recvs.at[slot]
-        pid = grid_indices[0]
-
-        dest_ref = cast(jax.Ref, self.window_ref.at[slot])  # (tile_n, rotary_dim)
-        width = self.window_ref.shape[-1]
-
-        @pl.loop(0, self.tile_n, unroll=True)
-        def _(i):
-            position = positions_ref[pid * self.tile_n + i]
-            src = cos_sin_cache_ref.at[position, pl.ds(0, width)]
-            pltpu.make_async_copy(src, dest_ref.at[i, :], sem).start()
-
-    def wait_in(
-        self,
-        src_ref: tuple[jax.Ref, jax.Ref],
-        grid_indices: tuple[int | jax.Array, ...],
-    ) -> None:
-        del src_ref, grid_indices
-        assert self.sem_recvs is not None
-        assert self.window_ref is not None
-        slot = self.current_wait_in_slot
-        vmem_ref = self.window_ref.at[slot]
-        pltpu.make_async_copy(vmem_ref, vmem_ref, self.sem_recvs.at[slot]).wait()
 
 
 def _lane_gather(operand: jax.Array, indices: jax.Array) -> jax.Array:
@@ -203,11 +141,9 @@ def _rope_body(
 
 
 def _kernel(
-    # scalar prefetch
-    positions_ref: jax.Ref,
     # HBM inputs
     x_hbm_ref: jax.Ref,
-    cos_sin_cache_hbm_ref: jax.Ref,
+    cos_sin_hbm_ref: jax.Ref,
     # HBM outputs: (out,) aliased onto x_hbm_ref, or (q, scales) when quantizing
     *out_hbm_refs: jax.Ref,
     num_tiles: int,
@@ -236,9 +172,7 @@ def _kernel(
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i, 0),
     )
-    cos_sin_alloc = CosSinRef.create(
-        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
-    )
+    cos_sin_alloc = pltpu.BufferedRef.input(cos_sin_spec, cos_sin_dtype, buffer_count=2)
 
     if quant_dtype is None:
         del x_hbm_ref  # aliased to the output; read/written through the latter.
@@ -288,7 +222,7 @@ def _kernel(
     def _run(allocations):
         pipeline(
             *x_ref_args,
-            (cos_sin_cache_hbm_ref, positions_ref),
+            cos_sin_hbm_ref,
             *out_ref_args,
             allocations=allocations,
         )
@@ -359,11 +293,9 @@ def _qnorm_rope_pair_body(
 
 
 def _qnorm_rope_kernel(
-    # scalar prefetch
-    positions_ref: jax.Ref,
     # HBM inputs
     x_hbm_ref: jax.Ref,
-    cos_sin_cache_hbm_ref: jax.Ref,
+    cos_sin_hbm_ref: jax.Ref,
     # HBM output, aliased onto x_hbm_ref
     out_hbm_ref: jax.Ref,
     *,
@@ -386,9 +318,7 @@ def _qnorm_rope_kernel(
         memory_space=pltpu.VMEM,
         index_map=lambda i: (i, 0),
     )
-    cos_sin_alloc = CosSinRef.create(
-        spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
-    )
+    cos_sin_alloc = pltpu.BufferedRef.input(cos_sin_spec, cos_sin_dtype, buffer_count=2)
 
     pipeline = pltpu.emit_pipeline(
         functools.partial(
@@ -412,7 +342,7 @@ def _qnorm_rope_kernel(
     def _run(allocations):
         pipeline(
             x_hbm_ref,
-            (cos_sin_cache_hbm_ref, positions_ref),
+            cos_sin_hbm_ref,
             out_hbm_ref,
             allocations=allocations,
         )
@@ -422,8 +352,7 @@ def _qnorm_rope_kernel(
 
 def _rope_call(
     x: jax.Array,
-    positions: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     *,
     inverse: bool,
     quant_dtype: jnp.dtype | None,
@@ -432,13 +361,12 @@ def _rope_call(
     """Builds the ``pallas_call``; see the public wrappers for the contract."""
     if x.ndim not in (2, 3):
         raise ValueError(f"x must be rank 2 or 3, got {x.shape}")
-    assert positions.ndim == 1 and positions.shape[0] == x.shape[0]
-    assert cos_sin_cache.ndim == 2
+    assert cos_sin.ndim == 2 and cos_sin.shape[0] == x.shape[0]
 
     num_tokens = x.shape[0]
     head_dim = x.shape[-1]
     rows_per_token = x.shape[1] if x.ndim == 3 else 1
-    rotary_dim = cos_sin_cache.shape[1]
+    rotary_dim = cos_sin.shape[1]
 
     assert head_dim % LANE == 0
     assert rotary_dim % 2 == 0 and rotary_dim <= LANE
@@ -465,14 +393,14 @@ def _rope_call(
         inverse=inverse,
         in_dtype=x.dtype,
         out_dtype=x.dtype,
-        cos_sin_dtype=cos_sin_cache.dtype,
+        cos_sin_dtype=cos_sin.dtype,
         quant_dtype=quant_dtype,
     )
 
     if quant_dtype is None:
         out_shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)
-        input_output_aliases = {1: 0}  # x (after the scalar prefetch) -> out
+        input_output_aliases = {0: 0}  # x -> out
     else:
         out_shape = (
             jax.ShapeDtypeStruct(x.shape, quant_dtype),
@@ -484,11 +412,10 @@ def _rope_call(
         )
         input_output_aliases = {}
 
-    grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=1,
+    grid_spec = pl.GridSpec(
         in_specs=(
             pl.BlockSpec(memory_space=pltpu.HBM),  # x
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin_cache
+            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin
         ),
         out_specs=out_specs,
     )
@@ -503,7 +430,7 @@ def _rope_call(
             disable_bounds_checks=True,
         ),
         name=name,
-    )(positions, x, cos_sin_cache)
+    )(x, cos_sin)
 
 
 @functools.partial(
@@ -513,8 +440,7 @@ def _rope_call(
 )
 def rope(
     x: jax.Array,  # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
-    positions: jax.Array,  # [num_tokens] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    cos_sin: jax.Array,  # [num_tokens, rotary_dim] float32
     *,
     inverse: bool = False,
     name: str = "rope",
@@ -523,10 +449,8 @@ def rope(
 
     Args:
       x: ``[num_tokens, head_dim]`` or ``[num_tokens, num_heads, head_dim]``.
-      positions: ``[num_tokens]``, the RoPE position of each token.
-      cos_sin_cache: ``[max_position, rotary_dim]``, ``[cos | sin]`` packed side
-        by side (``rotary_dim // 2`` columns each), as built by
-        ``DeepseekV4ScalingRotaryEmbedding``.
+      cos_sin: ``[num_tokens, rotary_dim]``, per-token ``[cos | sin]`` rows packed
+        side by side (``rotary_dim // 2`` columns each).
       inverse: negate ``sin``, i.e. apply the transposed rotation.
       name: kernel name.
 
@@ -538,8 +462,7 @@ def rope(
         jax.Array,
         _rope_call(
             x,
-            positions,
-            cos_sin_cache,
+            cos_sin,
             inverse=inverse,
             quant_dtype=None,
             name=name,
@@ -554,8 +477,7 @@ def rope(
 )
 def qnorm_rope(
     x: jax.Array,  # [num_tokens, num_heads, head_dim] | [num_tokens, head_dim]
-    positions: jax.Array,  # [num_tokens] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    cos_sin: jax.Array,  # [num_tokens, rotary_dim] float32
     *,
     eps: float = 1e-6,
     inverse: bool = False,
@@ -563,13 +485,12 @@ def qnorm_rope(
 ) -> jax.Array:
     """Per-head RMSNorm (no weight) fused with DeepSeek-V4 RoPE."""
     assert x.ndim == 3
-    assert positions.ndim == 1 and positions.shape[0] == x.shape[0]
-    assert cos_sin_cache.ndim == 2
+    assert cos_sin.ndim == 2 and cos_sin.shape[0] == x.shape[0]
 
     num_tokens = x.shape[0]
     head_dim = x.shape[-1]
     rows_per_token = x.shape[1]
-    rotary_dim = cos_sin_cache.shape[1]
+    rotary_dim = cos_sin.shape[1]
     assert head_dim % LANE == 0
     assert rotary_dim % 2 == 0 and rotary_dim <= LANE
     tile_n = largest_divisor(num_tokens, cap=64)
@@ -584,14 +505,13 @@ def qnorm_rope(
         eps=eps,
         inverse=inverse,
         in_dtype=x.dtype,
-        cos_sin_dtype=cos_sin_cache.dtype,
+        cos_sin_dtype=cos_sin.dtype,
     )
 
-    grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=1,
+    grid_spec = pl.GridSpec(
         in_specs=(
             pl.BlockSpec(memory_space=pltpu.HBM),  # x
-            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin_cache
+            pl.BlockSpec(memory_space=pltpu.HBM),  # cos_sin
         ),
         out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
     )
@@ -600,21 +520,20 @@ def qnorm_rope(
         kernel,
         out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
         grid_spec=grid_spec,
-        input_output_aliases={1: 0},  # x (after the scalar prefetch) -> out
+        input_output_aliases={0: 0},  # x -> out
         compiler_params=pltpu.CompilerParams(
             vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
             disable_bounds_checks=True,
         ),
         name=name,
-    )(positions, x, cos_sin_cache)
+    )(x, cos_sin)
 
 
 def _qnorm_rope_pair_kernel(
-    positions_ref: jax.Ref,
     chiplet_index_ref: jax.Ref,  # SMEM int32 [1]: the current chiplet's index (0 or 1)
     current_heads_hbm_ref: jax.Ref,
     neighbor_heads_hbm_ref: jax.Ref,
-    cos_sin_cache_hbm_ref: jax.Ref,
+    cos_sin_hbm_ref: jax.Ref,
     out_hbm_ref: jax.Ref,
     *,
     num_tiles: int,
@@ -667,9 +586,7 @@ def _qnorm_rope_pair_kernel(
     allocations = (
         pltpu.BufferedRef.input(current_heads_spec, in_dtype, buffer_count=2),
         pltpu.BufferedRef.input(neighbor_heads_spec, in_dtype, buffer_count=2),
-        CosSinRef.create(
-            spec=cos_sin_spec, dtype=cos_sin_dtype, buffer_count=2, tile_n=tile_n
-        ),
+        pltpu.BufferedRef.input(cos_sin_spec, cos_sin_dtype, buffer_count=2),
         pltpu.BufferedRef.output(out_spec, in_dtype, buffer_count=2),
     )
 
@@ -678,7 +595,7 @@ def _qnorm_rope_pair_kernel(
         pipeline(
             current_heads_hbm_ref,
             neighbor_heads_hbm_ref,
-            (cos_sin_cache_hbm_ref, positions_ref),
+            cos_sin_hbm_ref,
             out_hbm_ref,
             allocations=allocations,
         )
@@ -690,8 +607,7 @@ def _qnorm_rope_pair_kernel(
 def qnorm_rope_pair(
     current_heads: jax.Array,  # [2T, half, head_dim]: both chiplets' tokens
     neighbor_heads: jax.Array,  # [T, half, head_dim]: the current chiplet's tokens
-    positions: jax.Array,  # [T] int: the current chiplet's tokens
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    cos_sin: jax.Array,  # [T, rotary_dim] float32: the current chiplet's tokens
     chiplet_index: jax.Array,  # int32 [1]: the current chiplet's index (0 or 1)
     *,
     eps: float = 1e-6,
@@ -706,13 +622,14 @@ def qnorm_rope_pair(
     Returns ``[T, 2 * half, head_dim]``, bit-identical to ``qnorm_rope`` of the
     concatenated q, without building it.
     """
-    num_tokens = positions.shape[0]
+    assert cos_sin.ndim == 2
+    num_tokens = cos_sin.shape[0]
     _, half, head_dim = current_heads.shape
     assert current_heads.shape == (2 * num_tokens, half, head_dim)
     assert neighbor_heads.shape == (num_tokens, half, head_dim)
     assert chiplet_index.shape == (1,)
     assert head_dim % LANE == 0
-    rotary_dim = cos_sin_cache.shape[1]
+    rotary_dim = cos_sin.shape[1]
     assert rotary_dim % 2 == 0 and rotary_dim <= LANE
     tile_n = largest_divisor(num_tokens, cap=64)
     num_tiles = num_tokens // tile_n
@@ -725,16 +642,16 @@ def qnorm_rope_pair(
         rotary_dim=rotary_dim,
         eps=eps,
         in_dtype=current_heads.dtype,
-        cos_sin_dtype=cos_sin_cache.dtype,
+        cos_sin_dtype=cos_sin.dtype,
     )
     grid_spec = pltpu.PrefetchScalarGridSpec(
-        num_scalar_prefetch=2,
+        num_scalar_prefetch=1,
         # The kernel DMAs its tiles itself, so the inputs may stay wherever XLA
         # placed them.
         in_specs=(
             pl.BlockSpec(memory_space=pl.ANY),  # current_heads
             pl.BlockSpec(memory_space=pl.ANY),  # neighbor_heads
-            pl.BlockSpec(memory_space=pl.ANY),  # cos_sin_cache
+            pl.BlockSpec(memory_space=pl.ANY),  # cos_sin
         ),
         out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
     )
@@ -750,19 +667,17 @@ def qnorm_rope_pair(
         ),
         name=name,
     )(
-        positions,
         jnp.asarray(chiplet_index, jnp.int32),
         current_heads,
         neighbor_heads,
-        cos_sin_cache,
+        cos_sin,
     )
 
 
 @functools.partial(jax.jit, static_argnames=("inverse", "quant_dtype", "name"))
 def rope_quant(
     x: jax.Array,  # [num_tokens, head_dim] | [num_tokens, num_heads, head_dim]
-    positions: jax.Array,  # [num_tokens] int
-    cos_sin_cache: jax.Array,  # [max_position, rotary_dim] float32
+    cos_sin: jax.Array,  # [num_tokens, rotary_dim] float32
     *,
     inverse: bool = False,
     quant_dtype: jnp.dtype = jnp.float8_e4m3fn,
@@ -777,8 +692,7 @@ def rope_quant(
         tuple[jax.Array, jax.Array],
         _rope_call(
             x,
-            positions,
-            cos_sin_cache,
+            cos_sin,
             inverse=inverse,
             quant_dtype=quant_dtype,
             name=name,

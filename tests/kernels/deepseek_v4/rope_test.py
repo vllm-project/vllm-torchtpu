@@ -118,8 +118,7 @@ class RopeTest(parameterized.TestCase):
         expected = rope_ref_impl(x, positions, cos_sin_cache, inverse=inverse)
         actual = rope(
             jnp.asarray(x),
-            jnp.asarray(positions),
-            jnp.asarray(cos_sin_cache),
+            jnp.asarray(cos_sin_cache[positions]),
             inverse=inverse,
         )
         return np.asarray(actual), expected
@@ -153,9 +152,7 @@ class RopeTest(parameterized.TestCase):
         positions = rng.integers(0, 4096, size=(64,)).astype(np.int32)
         cos_sin_cache = make_cos_sin_cache(4096, ROTARY_DIM)
 
-        actual = np.asarray(
-            rope(jnp.asarray(x), jnp.asarray(positions), jnp.asarray(cos_sin_cache))
-        )
+        actual = np.asarray(rope(jnp.asarray(x), jnp.asarray(cos_sin_cache[positions])))
         np.testing.assert_array_equal(actual[..., :-ROTARY_DIM], x[..., :-ROTARY_DIM])
 
 
@@ -187,8 +184,7 @@ class RopeQuantTest(parameterized.TestCase):
         )
         q, scales = rope_quant(
             jnp.asarray(x),
-            jnp.asarray(positions),
-            jnp.asarray(cos_sin_cache),
+            jnp.asarray(cos_sin_cache[positions]),
             inverse=inverse,
             quant_dtype=jnp.float8_e4m3fn,
         )
@@ -224,8 +220,7 @@ class QNormRopeTest(parameterized.TestCase):
         expected = qnorm_rope_ref_impl(x, positions, cos_sin_cache, eps, inverse=False)
         actual = qnorm_rope(
             jnp.asarray(x),
-            jnp.asarray(positions),
-            jnp.asarray(cos_sin_cache),
+            cos_sin_cache[positions],
             eps=eps,
             inverse=False,
         )

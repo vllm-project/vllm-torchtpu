@@ -79,28 +79,25 @@ class DeepseekV4TPUAttentionBackend(PallasAttentionBackend):
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
 def _qnorm_rope_jax(
     x: jax.Array,
-    positions: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     *,
     eps: float,
 ) -> jax.Array:
     """Per-head RMSNorm (no weight) fused with RoPE on the query heads."""
-    return rope_kernel.qnorm_rope(x, positions, cos_sin_cache, eps=eps)
+    return rope_kernel.qnorm_rope(x, cos_sin, eps=eps)
 
 
 def _rope_jax(
     x: jax.Array,
-    positions: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
 ) -> jax.Array:
     """RoPE over the trailing `rotary_dim` channels of `x`."""
-    return rope_kernel.rope(x, positions, cos_sin_cache)
+    return rope_kernel.rope(x, cos_sin)
 
 
 def _o_proj_jax(
     x: jax.Array,
-    positions: jax.Array,
-    cos_sin_cache: jax.Array,
+    cos_sin: jax.Array,
     wo_a: jax.Array,
     wo_a_scale: jax.Array,
     *,
@@ -109,8 +106,7 @@ def _o_proj_jax(
     """Inverse RoPE fused into the per-group `wo_a` projection."""
     return fused_reverse_rope_wo_a_projection(
         x,
-        positions,
-        cos_sin_cache,
+        cos_sin,
         wo_a,
         wo_a_scale.reshape(-1),
         head_dim=head_dim,
@@ -119,12 +115,12 @@ def _o_proj_jax(
     )
 
 
-def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
+def _fake_rope(x, cos_sin, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty_like(x)
 
 
-def _fake_o_proj(x, positions, cos_sin_cache, wo_a, wo_a_scale, *args, **kwargs):
+def _fake_o_proj(x, cos_sin, wo_a, wo_a_scale, *args, **kwargs):
     """Abstract implementation for PyTorch Dynamo graph tracing."""
     return torch.empty((x.shape[0], wo_a.shape[-1]), dtype=x.dtype, device=x.device)
 
@@ -490,14 +486,15 @@ class VllmDeepseekV4MLAAttention(
         op_name = f"pallas::deepseek_v4_qnorm_rope_e{_name_float(eps)}"
         op = _pallas_op_cache.get(op_name)
         if op is None:
+            # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+            # pyrefly: ignore[no-matching-overload]
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_qnorm_rope_jax, eps=eps),
                 mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # q
-                    P(),  # positions
-                    P(),  # cos_sin_cache
+                    P(),  # cos_sin
                 ),
             )
             op.register_fake(_fake_rope)
@@ -515,14 +512,15 @@ class VllmDeepseekV4MLAAttention(
         op_name = "pallas::deepseek_v4_kv_rope"
         op = _pallas_op_cache.get(op_name)
         if op is None:
+            # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+            # pyrefly: ignore[no-matching-overload]
             op = pallas.jax_op(
                 op_name,
                 _rope_jax,
                 mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(),  # kv
-                    P(),  # positions
-                    P(),  # cos_sin_cache
+                    P(),  # cos_sin
                 ),
             )
             op.register_fake(_fake_rope)
@@ -536,7 +534,8 @@ class VllmDeepseekV4MLAAttention(
         positions: torch.Tensor,
     ) -> torch.Tensor:
         """Apply RMSNorm and scaling RoPE to query head states."""
-        return self.qnorm_rope_op(q, positions, self.mla_attn.rotary_emb.cos_sin_cache)
+        cos_sin = rope_in_graph.cos_sin_at(self.mla_attn.rotary_emb, positions)
+        return self.qnorm_rope_op(q, cos_sin)
 
     def kv_rope(
         self,
@@ -544,7 +543,8 @@ class VllmDeepseekV4MLAAttention(
         positions: torch.Tensor,
     ) -> torch.Tensor:
         """Apply scaling RoPE to decoupled key states."""
-        return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
+        cos_sin = rope_in_graph.cos_sin_at(self.mla_attn.rotary_emb, positions)
+        return self.kv_rope_op(kv, cos_sin)
 
     def _project_q_rope(
         self, qr: torch.Tensor, positions: torch.Tensor
@@ -769,14 +769,15 @@ class VllmDeepseekV4MLAAttention(
         op_name = f"pallas::deepseek_v4_o_proj_d{head_dim}"
         op = _pallas_op_cache.get(op_name)
         if op is None:
+            # jax_op's stub types partition specs as tuple[tuple[str, ...], ...].
+            # pyrefly: ignore[no-matching-overload]
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_o_proj_jax, head_dim=head_dim),
                 mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # o
-                    P(),  # positions
-                    P(),  # cos_sin_cache
+                    P(),  # cos_sin
                     P(),  # wo_a
                     P(),  # wo_a_scale
                 ),
@@ -854,7 +855,7 @@ class VllmDeepseekV4MLAAttention(
             f"{self.prefix}.wo_a: head_dim {self.head_dim} is not a multiple "
             "of the 128-lane width."
         )
-        rotary_dim = self.rotary_emb.cos_sin_cache.shape[-1]
+        rotary_dim = self.rotary_emb.rotary_dim
         assert rotary_dim % 2 == 0 and rotary_dim <= 128, (
             f"{self.prefix}.wo_a: rotary_dim {rotary_dim} must be even and at most 128."
         )
@@ -872,10 +873,10 @@ class VllmDeepseekV4MLAAttention(
             f"in place and needs [t, {self.n_local_heads}, {self.head_dim}], "
             f"got {list(o.shape)}."
         )
+        cos_sin = rope_in_graph.cos_sin_at(self.rotary_emb, positions)
         z = self.o_proj_op(
             o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
+            cos_sin,
             self.wo_a.weight,
             self.wo_a.weight_scale,
         )
