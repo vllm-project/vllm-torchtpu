@@ -119,6 +119,10 @@ def main():
     ap.add_argument("--rand-pool", action="store_true",
                     help="random FP8 in the whole pool (made before the weights, so its program "
                     "loads into unfragmented HBM): distinct keys and KV, as a prefilled server")
+    ap.add_argument("--row-mix", type=float, default=-1.0,
+                    help="served-like union: each request's 4 rows get hidden = (1 - m) * row0 + "
+                    "m * own row (m = 0: identical inputs, rows differ by position only; m = 1 "
+                    "or < 0: independent rows, a near-disjoint union)")
     ap.add_argument("--fill-keys", action="store_true",
                     help="random FP8 in the requests' compressed-key and main-KV blocks (else "
                     "zeros: equal scores, attention of zeros), so a hash sees the selection")
@@ -337,6 +341,12 @@ def main():
             jnp.zeros((128,), jnp.bfloat16),
         ] * n_qsa
         hidden = rnd((R * B, g.NHC * g.H), jnp.bfloat16)
+        if 0 <= a.row_mix < 1 and not (a.trace_only or a.aot):
+            h4 = hidden.astype(jnp.float32).reshape(R, nreq, 4, -1)
+            hidden = jax.device_put(
+                ((1 - a.row_mix) * h4[:, :, :1] + a.row_mix * h4).reshape(R * B, -1)
+                .astype(jnp.bfloat16), tp)
+            print(f"B={B} ROW_MIX {a.row_mix}", flush=True)
         # Allocated sharded: a host-side zeros of the global pool does not fit.
         if a.trace_only or a.aot:
             pool = rnd((R * NB * per, kb, 1, 4, 256), jnp.float8_e4m3fn)
