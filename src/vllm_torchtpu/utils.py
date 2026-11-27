@@ -448,3 +448,9 @@ def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
         else:
             out = out + 0
     return out
+
+
+class TokenLookbackModel:
+    """Mixin requesting per-step host token lookback windows of width `depth`."""
+
+    token_lookback_depth: int = 0
