@@ -27,8 +27,10 @@ from vllm.model_executor.models.qwen3_5 import (
 )
 from vllm.model_executor.models.qwen3_next import Qwen3NextDecoderLayer
 
+from tests.tp_collective_test_utils import TPCollectiveMock
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.layers.adapter import dense_sequence_parallel
 from vllm_torchtpu.models.vllm import qwen3_5_patch
 
 
@@ -37,49 +39,6 @@ class _CpuRMSNorm(Qwen3_5RMSNorm):
 
     def dispatch_forward(self, compile_native: bool = False):
         return self.forward_native
-
-
-class _TPCollectiveMock:
-    """Barrier-synchronized in-process collective simulator for TP ranks."""
-
-    def __init__(self, tp_size: int) -> None:
-        self.tp_size = tp_size
-        self.barrier = threading.Barrier(tp_size)
-        self.storage: list[torch.Tensor | None] = [None] * tp_size
-
-    def reduce_scatter(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        if self.tp_size == 1:
-            return tensor
-        rank = getattr(threading.current_thread(), "rank", 0)
-        self.storage[rank] = tensor
-        self.barrier.wait(timeout=10.0)
-        total = sum(self.storage)
-        assert total is not None
-        chunk = total.chunk(self.tp_size, dim=dim)[rank].clone()
-        self.barrier.wait(timeout=10.0)
-        return chunk
-
-    def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        if self.tp_size == 1:
-            return tensor
-        rank = getattr(threading.current_thread(), "rank", 0)
-        self.storage[rank] = tensor
-        self.barrier.wait(timeout=10.0)
-        res = torch.cat(self.storage, dim=dim).clone()  # type: ignore[arg-type]
-        self.barrier.wait(timeout=10.0)
-        return res
-
-    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        if self.tp_size == 1:
-            return tensor
-        rank = getattr(threading.current_thread(), "rank", 0)
-        self.storage[rank] = tensor
-        self.barrier.wait(timeout=10.0)
-        total = sum(self.storage)
-        assert total is not None
-        res = total.clone()
-        self.barrier.wait(timeout=10.0)
-        return res
 
 
 def test_maybe_patch_waits_for_model_config(
@@ -277,14 +236,14 @@ def test_forward_matches_upstream(
     )
 
     # Overlap ranks simulation
-    mock = _TPCollectiveMock(tp)
+    mock = TPCollectiveMock(tp)
     monkeypatch.setattr(
         qwen3_5_patch,
         "tensor_model_parallel_reduce_scatter",
         mock.reduce_scatter,
     )
     monkeypatch.setattr(
-        qwen3_5_patch, "tensor_model_parallel_all_gather", mock.all_gather
+        dense_sequence_parallel, "tensor_model_parallel_all_gather", mock.all_gather
     )
     monkeypatch.setattr(
         qwen3_5_patch, "tensor_model_parallel_all_reduce", mock.all_reduce
@@ -296,6 +255,7 @@ def test_forward_matches_upstream(
 
     def worker(rank: int) -> None:
         try:
+            mock.rank.value = rank
             rank_layer = SimpleNamespace()
             rank_layer.uses_sharded_residual = False
             rank_layer.input_layernorm = input_norm
@@ -336,19 +296,17 @@ def test_forward_matches_upstream(
                 assert ret_res is x_in
         except Exception as e:
             errors[rank] = e
+            mock.barrier.abort()
 
-    threads = []
-    for r in range(tp):
-        t = threading.Thread(target=worker, args=(r,))
-        t.rank = r  # type: ignore[attr-defined]
-        threads.append(t)
+    threads = [threading.Thread(target=worker, args=(r,)) for r in range(tp)]
+    for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=10.0)
         assert not t.is_alive()
 
     if any(errors):
-        raise errors[0]  # type: ignore[misc]
+        raise next(e for e in errors if e is not None)
 
     first_rank_out = rank_outs[0]
     assert first_rank_out is not None
@@ -376,7 +334,7 @@ def test_overlap_disabled_when_compiling_outside_shape_variants_warmup(
         lambda x, dim=0: (calls.append("rs"), x)[1],
     )
     monkeypatch.setattr(
-        qwen3_5_patch,
+        dense_sequence_parallel,
         "tensor_model_parallel_all_gather",
         lambda x, dim=0: (calls.append("ag"), x)[1],
     )
@@ -466,7 +424,7 @@ def test_overlap_forward_collective_schedule_by_token_regime(
         lambda x, dim=0: (calls.append("rs"), x[: x.shape[0] // tp_size])[1],
     )
     monkeypatch.setattr(
-        qwen3_5_patch,
+        dense_sequence_parallel,
         "tensor_model_parallel_all_gather",
         lambda x, dim=0: (calls.append("ag"), torch.cat([x] * tp_size, dim=0))[1],
     )
@@ -519,7 +477,7 @@ def test_overlap_forward_narrows_padded_all_gather(
         lambda x, dim=0: x[:4],
     )
     monkeypatch.setattr(
-        qwen3_5_patch,
+        dense_sequence_parallel,
         "tensor_model_parallel_all_gather",
         lambda x, dim=0: torch.cat([x, x], dim=0),  # 8 rows > num_tokens=6
     )

@@ -209,6 +209,35 @@ def test_invalid_stage_is_rejected(registry):
         reg.apply("worker")
 
 
+def test_vllm_config_is_forwarded_when_requested(registry):
+    reg, callbacks = registry
+    callbacks.with_cfg = Mock()
+    callbacks.without_cfg = Mock()
+    _patch(
+        reg,
+        callbacks,
+        "with_cfg",
+        ("platform_activation",),
+        model_config=True,
+        vllm_config=True,
+    )
+    _patch(
+        reg,
+        callbacks,
+        "without_cfg",
+        ("platform_activation",),
+        model_config=True,
+        vllm_config=False,
+    )
+    model_cfg = object()
+    vllm_cfg = object()
+    reg.apply("platform_activation", model_config=model_cfg, vllm_config=vllm_cfg)
+    callbacks.with_cfg.assert_called_once_with(
+        model_config=model_cfg, vllm_config=vllm_cfg
+    )
+    callbacks.without_cfg.assert_called_once_with(model_config=model_cfg)
+
+
 def test_manifest_preserves_lifecycle_dependencies():
     reg = _load_registry()
     targets = [p.target for p in reg.PATCHES]
@@ -246,7 +275,14 @@ def test_manifest_preserves_lifecycle_dependencies():
         "maybe_patch_qwen3_next",
         "maybe_patch_qwen2",
         "maybe_patch_qwen3_5_attn_moe_overlap",
+        "maybe_patch_gemma4_dense_sequence_parallel",
     ]
+    gemma4_patch_entry = next(
+        p
+        for p in reg.PATCHES
+        if p.target.endswith(":maybe_patch_gemma4_dense_sequence_parallel")
+    )
+    assert gemma4_patch_entry.vllm_config is True
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
 
 

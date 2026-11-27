@@ -29,7 +29,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from vllm.config import ModelConfig
+    from vllm.config import ModelConfig, VllmConfig
 
 Stage = Literal[
     "import", "platform_activation", "engine_core", "worker_init", "model_load"
@@ -43,6 +43,7 @@ class Patch:
     target: str
     stages: tuple[Stage, ...]
     model_config: bool = False
+    vllm_config: bool = False
     refresh: str | None = None
 
 
@@ -181,6 +182,12 @@ PATCHES = (
         ("platform_activation", "model_load"),
         model_config=True,
     ),
+    Patch(
+        "vllm_torchtpu.models.vllm.gemma4_patch:maybe_patch_gemma4_dense_sequence_parallel",
+        ("platform_activation", "model_load"),
+        model_config=True,
+        vllm_config=True,
+    ),
 )
 
 _applied: set[str] = set()
@@ -210,7 +217,12 @@ def _invoke(target: str, **kwargs):
     return None
 
 
-def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
+def apply(
+    stage: Stage,
+    *,
+    model_config: "ModelConfig | None" = None,
+    vllm_config: "VllmConfig | None" = None,
+) -> None:
     """Applies a stage once per patch and refreshes late module bindings.
 
     Import-triggered re-entry into the same stage returns immediately: the
@@ -240,9 +252,11 @@ def apply(stage: Stage, *, model_config: "ModelConfig | None" = None) -> None:
                     continue
                 _applying.add(patch.target)
                 try:
-                    kwargs = (
-                        {"model_config": model_config} if patch.model_config else {}
-                    )
+                    kwargs: dict[str, object] = {}
+                    if patch.model_config:
+                        kwargs["model_config"] = model_config
+                    if patch.vllm_config:
+                        kwargs["vllm_config"] = vllm_config
                     result = _invoke(patch.target, **kwargs)
                 finally:
                     _applying.discard(patch.target)

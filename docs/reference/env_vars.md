@@ -79,6 +79,7 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `TPU_MOE_SEQUENCE_PARALLEL` | `False` | Enables sequence parallelism around MoE blocks. |
 | `TPU_ATTN_MOE_OVERLAP` | `False` | Overlaps Qwen3.5 MoE post-attention norm and router gate with TP collectives on token buckets >= 8 MiB per rank. |
 | `TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER` | `False` | Requires `TPU_ATTN_MOE_OVERLAP=True` (`PP=1`). TP-overlap path only (separate from DP/PCP `TPU_MOE_FP8_ALL_GATHER`): keeps the overlapped residual sharded across layers via post-MoE `reduce-scatter` and quantizes pre-attention and pre-MoE TP all-gathers to per-row `fp8` with `float32` scales. Off by default pending accuracy validation on non-FP8 `bfloat16` checkpoints and long-context evaluations. Applies only to token buckets at or above the overlap threshold (8 MiB per TP rank; e.g., 8192 tokens at hidden size 4096, `bfloat16`, `TP8`), so a request's output can differ with the batch it shares. |
+| `TPU_DENSE_SP_HIER_RS` | `"off"` | Opt-in (`"bf16"` or `"fp8"`), requires `--additional-config '{"tpu_dense_sequence_parallel": true}'`. Fuses each dense sequence-parallel reduce-scatter with its residual/RMSNorm/FP8 epilogue in VMEM on dual-core tpu7x TP groups: row-streaming on `TP=4` or `TP=8` for buckets `>= 128 * TP` (`"bf16"` or lossy `"fp8"` inter-chip hops; all-gathers stay XLA's) and single-shot VMEM reduce-scatter + gather on `TP=8` for `256 <= tokens < 1024` (aligned to `128`, always `"bf16"` inter-chip hops). Falls back to XLA collectives elsewhere. Off by default while `"bf16"` is only evaluated on Gemma 4 31B and because `"fp8"` uses a lossy inter-chip payload. |
 | `TPU_MOE_ROUTER_TOPK` | `"rowmax"` | MoE router top-k kernel implementation (`"rowmax"` or standard top-k). |
 | `TPU_MOE_FP8_ALL_GATHER` | `False` | Performs MoE activation all-gather in `fp8` before expert computation. |
 | `ENABLE_QUANTIZED_MATMUL_KERNEL` | `False` | Dispatches quantized linear layers to the custom Pallas quantized matmul kernel. |
@@ -91,6 +92,10 @@ Removed pipeline variables. Startup with pipeline parallelism fails while any of
 | `MOE_REQUANTIZE_BLOCK_SIZE` | `None` | Target block size for load-time MoE expert weight requantization. |
 | `TPU_MOE_REQUANT_CHUNK_BYTES` | `1073741824` (1 GiB) | Float32 bytes one load-time MoE requantization chunk materializes on the device. Must be > 0. Lower it if requantization runs out of device memory after loading. |
 | `VLLM_TPU_MXFP4_DEVICE_DEQUANT` | `True` | Performs MXFP4 weight dequantization on TPU device during load rather than on CPU. |
+
+### Dense sequence parallelism
+
+`--additional-config '{"tpu_dense_sequence_parallel": true}'` (default `false`) enables sequence parallelism for dense tensor-parallel decoder layers (the dense counterpart of `TPU_MOE_SEQUENCE_PARALLEL`), wired for dense Gemma 4 with per-channel or per-tensor FP8 linears. On padded buckets with `>= 128` tokens per TP rank (`>= 1024` at `TP=8`), row-parallel outputs are reduce-scattered along tokens, norms and dynamic FP8 row quantization run on each rank's token shard, and 1-byte FP8 rows plus `float32` row scales are all-gathered into the next linear. A non-bool value fails at startup; startup also rejects `TP=1`, pipeline parallelism, context parallelism (`PCP` / `DCP`), LoRA, and any speculative decoding method other than `ngram`. Non-Gemma 4 models log a warning and ignore the setting. Off by default until KV-shared, MoE, PLE, and unquantized Gemma 4 variants are supported.
 
 ### MoE reference parity
 

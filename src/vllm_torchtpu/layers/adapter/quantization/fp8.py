@@ -83,6 +83,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
     vllm_adapter as adaptive_moe,
 )
 from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+from vllm_torchtpu.layers.adapter.custom_ops import fp8_linear_op
 from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (
     optimization_barrier_op,
 )
@@ -1717,6 +1718,84 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if bias is not None:
             out = out + bias
         return out
+
+    def validate_prequantized_config(self, layer: LinearBase) -> None:
+        """Raises at layer init unless `layer` supports pre-quantized W8A8 FP8."""
+        # Static activation scales are ignored at runtime, matching `apply()`.
+        if self.w8a16_max_rows:
+            raise NotImplementedError(
+                f"{layer.prefix}: pre-quantized FP8 matmul requires "
+                f"w8a16_max_rows=0, got {self.w8a16_max_rows}"
+            )
+        if self.online_fp8:
+            policy = self.online_fp8_policy
+            if policy is not None and policy.weight_scheme == "per_block":
+                raise NotImplementedError(
+                    f"{layer.prefix}: pre-quantized FP8 matmul requires "
+                    "per-channel or per-tensor online FP8, got "
+                    f"weight_scheme={policy.weight_scheme!r}"
+                )
+        else:
+            desired_dtype, requant_dtype, requant_block_size, blockwise_kernel = (
+                self._linear_quant_config
+            )
+            if requant_dtype != torch.float8_e4m3fn:
+                raise NotImplementedError(
+                    f"{layer.prefix}: pre-quantized FP8 matmul requires "
+                    "float8_e4m3fn runtime weights, got "
+                    f"REQUANTIZE_WEIGHT_DTYPE={desired_dtype!r}"
+                )
+            if requant_block_size is not None or blockwise_kernel:
+                raise NotImplementedError(
+                    f"{layer.prefix}: pre-quantized FP8 matmul requires "
+                    "per-channel XLA matmul (REQUANTIZE_BLOCK_SIZE=None, "
+                    "ENABLE_QUANTIZED_MATMUL_KERNEL=0), got "
+                    f"requant_block_size={requant_block_size}, "
+                    f"enable_quantized_matmul_kernel={blockwise_kernel}"
+                )
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False) or isinstance(
+            layer, VocabParallelEmbedding
+        ):
+            raise NotImplementedError(
+                f"{layer.prefix}: pre-quantized FP8 matmul requires canonical "
+                "(k, n) runtime weight layout"
+            )
+        bias = layer.bias
+        if bias is not None:
+            bias_desc = (
+                f"shape {tuple(bias.shape)}"
+                if isinstance(bias, torch.Tensor)
+                else type(bias).__name__
+            )
+            raise NotImplementedError(
+                f"{layer.prefix}: pre-quantized FP8 matmul requires bias=None, "
+                f"got bias {bias_desc}"
+            )
+
+    def apply_prequantized(
+        self, layer: LinearBase, x_q: torch.Tensor, x_scale: torch.Tensor
+    ) -> torch.Tensor:
+        """Applies `layer`'s per-channel FP8 matmul to pre-quantized activations."""
+        tpu_layer = cast("TpuLinear", layer)
+        if not getattr(layer, WEIGHT_FLIPPED_ATTR, False):
+            raise NotImplementedError(
+                f"{layer.prefix}: pre-quantized FP8 matmul requires transposed "
+                f"(k, n) weights ({WEIGHT_FLIPPED_ATTR}=False)"
+            )
+        if tpu_layer.weight.dtype != torch.float8_e4m3fn:
+            raise NotImplementedError(
+                f"{layer.prefix}: pre-quantized FP8 matmul requires "
+                f"float8_e4m3fn weights, got {tpu_layer.weight.dtype}"
+            )
+        if tpu_layer.weight_scale.ndim != 1:
+            raise NotImplementedError(
+                f"{layer.prefix}: pre-quantized FP8 matmul requires 1-D "
+                f"per-channel weight_scale, got shape "
+                f"{tuple(tpu_layer.weight_scale.shape)}"
+            )
+        return fp8_linear_op.prequantized_fp8_matmul(
+            x_q, x_scale, tpu_layer.weight, tpu_layer.weight_scale
+        )
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         layer = cast("TpuLinear", layer)
