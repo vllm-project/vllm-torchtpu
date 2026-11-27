@@ -250,9 +250,9 @@ def sp_o_proj(
     """o_proj(attn) summed over TP, for this rank's row shard: ``attn`` is
     this rank's heads for all T rows, bf16 [T, K/TP]; returns [T/TP, N].
     TPU_MINIMAX_M3_SP_A2A_E4M3 sends the heads as e4m3 rows (power-of-two
-    row scales) and contracts e4m3 x e4m3, one all-to-all and o_proj per
-    row piece of the shard (``pieces``), so a piece's o_proj can run while
-    the next piece crosses; the bf16 path ignores ``pieces``. The projection
+    row scales) and contracts e4m3 x e4m3, one all-to-all for the step and
+    one o_proj per row piece of the shard (``pieces``); the bf16 path
+    ignores ``pieces``. The projection
     of the received rows runs after ``after`` is computed (a data
     dependence), so the all-to-all can cross under the work producing it.
     ``weight``: every rank's blocks [TP, K/TP, N], already gathered
@@ -267,15 +267,15 @@ def sp_o_proj(
     order = _rotate_blocks if o_proj.weight.dim() == 3 else (lambda x: x)
     if envs.TPU_MINIMAX_M3_SP_A2A_E4M3:
         q, r = _quantize_op(attn)
-        # Piece i: row block i of every destination's shard.
-        q = q.view(tp, pieces, -1, k)
-        r = r.view(tp, pieces, -1, 1)
+        # One all-to-all for every piece (XLA runs all-to-alls one at a time,
+        # and a later piece's crossed beside the input all-gather the first
+        # piece's projection released); piece i is row block i of every
+        # source's block.
+        q = order(all_to_all_rows(q).view(tp, pieces, -1, k))
+        r = order(all_to_all_rows(r).view(tp, pieces, -1, 1))
         out = []
         for i in range(pieces):
             qi, ri = q[:, i], r[:, i]
-            piece_rows = qi.shape[1]
-            qi = order(all_to_all_rows(qi.reshape(-1, k)).view(tp, piece_rows, k))
-            ri = order(all_to_all_rows(ri.reshape(-1, 1)).view(tp, piece_rows, 1))
             if after is not None:
                 ri = ri - zero_of(after)
             # The weight is the op's first reader of o_proj's parameters, as in

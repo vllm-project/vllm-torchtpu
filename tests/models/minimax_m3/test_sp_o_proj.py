@@ -208,14 +208,15 @@ def test_all_to_all_pieces_give_each_rank_its_rows(monkeypatch, ranks, pieces):
         sent = [sp_o_proj._quantize_op(a) for a in attn]
         calls = []
 
+        # One all-to-all per part (rows, scales) for every piece: each source's
+        # block r, all its pieces.
         def all_to_all_rows(x, r=r, sent=sent, calls=calls):
             part = 1 if x.shape[-1] == 1 else 0
-            piece = sum(1 for c in calls if c == part)
             calls.append(part)
-            blocks = [s[part].view(TP, pieces, -1, s[part].shape[-1]) for s in sent]
-            return torch.cat([b[r, piece] for b in blocks])
+            return torch.cat([s[part].view(TP, -1, s[part].shape[-1])[r] for s in sent])
 
         monkeypatch.setattr(sp_o_proj, "all_to_all_rows", all_to_all_rows)
         got = sp_o_proj.sp_o_proj(mods[r], attn[r], pieces)
+        assert sorted(calls) == [0, 1]
         assert got.shape == (rows, N)
         assert _rel(got, ref[r * rows : (r + 1) * rows]) < 5e-2
