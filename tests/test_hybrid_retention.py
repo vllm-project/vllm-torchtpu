@@ -241,6 +241,28 @@ def test_spec_groups_are_found_by_type_not_by_name():
     assert not HybridStateRetention(r.kvm).enabled
 
 
+def test_off_reason_names_what_the_engine_lacks():
+    """Retention runs only with a Mamba group, a full-attention group and
+    prefix caching; ``off_reason`` names each one missing (the scheduler's
+    warning quotes it), and is None exactly when retention can run."""
+    r, *_ = _setup()
+    assert r.enabled and r.off_reason is None
+    r, *_ = _setup(mamba=False)
+    assert not r.enabled and r.off_reason == "no Mamba KV cache group"
+    r, *_ = _setup()
+    del r.coordinator.attention_groups[0]
+    ret = HybridStateRetention(r.kvm)
+    assert not ret.enabled and ret.off_reason == "no full-attention KV cache group"
+    r.kvm.enable_caching = False
+    assert HybridStateRetention(r.kvm).off_reason == (
+        "no full-attention KV cache group, prefix caching off"
+    )
+    ret = HybridStateRetention(SimpleNamespace(enable_caching=False, coordinator=None))
+    assert not ret.enabled and ret.off_reason == (
+        "no Mamba KV cache group, no full-attention KV cache group, prefix caching off"
+    )
+
+
 def test_pin_then_release_puts_state_after_attention_and_demotes_output():
     r, pool, req, attn, state, other = _setup(prompt=1000, osl=600)
     r.pin_running([req])

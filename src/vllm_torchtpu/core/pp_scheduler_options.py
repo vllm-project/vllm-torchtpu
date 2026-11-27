@@ -44,7 +44,8 @@ class PPSchedulerOptions:
     """Keep the GDN state snapshots a later turn of a conversation hits on
     (``core/hybrid_retention.py``): on a KV producer only (refused
     elsewhere), and only when the model has a Mamba group, a full-attention
-    group and prefix caching. The Qwen3.5 config hook turns it on, when it
+    group and prefix caching (without them the scheduler logs which is
+    missing and keeps none). The Qwen3.5 config hook turns it on, when it
     is not set, on the engines it was measured on: the validation entries'
     prefill legs (Qwen3.5-397B-A17B on TPU7x, a ``kv_producer`` pipeline
     without context parallelism)."""

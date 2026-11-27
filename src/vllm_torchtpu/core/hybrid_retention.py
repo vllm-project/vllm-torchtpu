@@ -199,11 +199,22 @@ class HybridStateRetention:
             if isinstance(g.spec, FullAttentionSpec)
             for gid in g.group_ids
         ]
-        self.enabled = bool(
-            getattr(kv_cache_manager, "enable_caching", False)
-            and self.mamba_groups
-            and self.attn_group_ids
-        )
+        missing = [
+            reason
+            for reason, present in (
+                ("no Mamba KV cache group", self.mamba_groups),
+                ("no full-attention KV cache group", self.attn_group_ids),
+                (
+                    "prefix caching off",
+                    getattr(kv_cache_manager, "enable_caching", False),
+                ),
+            )
+            if not present
+        ]
+        # Why this engine cannot keep snapshots, or None when it can (the
+        # hook check below can still turn retention off, with its own warning).
+        self.off_reason: str | None = ", ".join(missing) or None
+        self.enabled = self.off_reason is None
         self.block_pool: Any = getattr(coordinator, "block_pool", None)
         if max_conversations is None:
             max_conversations = _MAX_CONVERSATIONS

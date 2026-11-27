@@ -225,6 +225,7 @@ def _built(
     additional=None,
     kv_role="kv_producer",
     retention_enabled=True,
+    retention_off_reason=None,
     architecture="Qwen3_5MoeForConditionalGeneration",
     equal_cost=True,
     connector=None,
@@ -254,6 +255,7 @@ def _built(
             calls.append("retention")
             calls.append({"max_pinned_blocks": max_pinned_blocks})
             self.enabled = retention_enabled
+            self.off_reason = retention_off_reason
             self.max_pinned_blocks = max_pinned_blocks
 
     def memo(self):
@@ -462,6 +464,25 @@ def test_a_pool_too_small_for_one_pin_keeps_no_snapshots(caplog):
         s, calls = _built(_RETAIN, num_gpu_blocks=19)
     assert s._retention is None and "retention" not in calls
     assert "has no room for hybrid-state retention" in caplog.text
+
+
+def test_retention_the_engine_cannot_run_says_why(caplog):
+    """The option on a KV producer whose engine cannot keep snapshots (here
+    prefix caching off) leaves retention off with a warning naming the
+    reason. Retention turned off for a reason of its own (a vLLM without
+    its hook targets, which it reports itself) adds no second warning."""
+    reason = "prefix caching off (a reason only this test sets)"
+    with caplog.at_level("WARNING"):
+        s, calls = _built(_RETAIN, retention_enabled=False, retention_off_reason=reason)
+    assert s._retention is None and "retention" in calls
+    assert f"hybrid_state_retention is on, but this engine has {reason}" in (
+        caplog.text
+    )
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        s, _ = _built(_RETAIN, retention_enabled=False)
+    assert s._retention is None
+    assert "hybrid_state_retention is on" not in caplog.text
 
 
 @pytest.mark.parametrize(

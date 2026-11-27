@@ -227,7 +227,7 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         self._retention: HybridStateRetention | None = None
         # The platform's check refuses the option off a KV producer.
         if options.hybrid_state_retention and self._is_kv_producer:
-            # At most 360 cross-turn pins, and no more than 5% of the pool.
+            # Retention's cross-turn pins, capped by the pool's size.
             pin_cap = pinned_block_cap(self.kv_cache_manager.block_pool.num_gpu_blocks)
             if pin_cap > 0:
                 retention = HybridStateRetention(
@@ -235,11 +235,17 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
                 )
                 if retention.enabled:
                     self._retention = retention
+                elif retention.off_reason is not None:
+                    logger.warning_once(
+                        "Pipeline chunk scheduler: hybrid_state_retention is "
+                        "on, but this engine has %s; retention stays off.",
+                        retention.off_reason,
+                    )
             else:
                 logger.warning(
                     "Pipeline chunk scheduler: a pool of %d blocks has no room "
-                    "for hybrid-state retention (5%% of it is under one "
-                    "block); retention stays off.",
+                    "for hybrid-state retention (its pin cap is 0 blocks); "
+                    "retention stays off.",
                     self.kv_cache_manager.block_pool.num_gpu_blocks,
                 )
         self._memo_xstep = False
