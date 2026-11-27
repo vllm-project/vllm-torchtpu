@@ -1151,7 +1151,11 @@ def test_cli_max_rows_per_call_prices_microbatches(
     assert uncapped["whole_step"].max_vmem_tokens > TEST_ROW_LIMIT
     assert capped["whole_step"].max_vmem_tokens == TEST_ROW_LIMIT
     assert capped["whole_step"].num_vmem_splits > uncapped["whole_step"].num_vmem_splits
-    for scope_name in ("per_op", "single_layer", "layer_group"):
+    assert capped["layer_group"].max_vmem_tokens == TEST_ROW_LIMIT
+    assert (
+        capped["layer_group"].num_vmem_splits > uncapped["layer_group"].num_vmem_splits
+    )
+    for scope_name in ("per_op", "single_layer"):
         assert (
             capped[scope_name].max_vmem_tokens == uncapped[scope_name].max_vmem_tokens
         )

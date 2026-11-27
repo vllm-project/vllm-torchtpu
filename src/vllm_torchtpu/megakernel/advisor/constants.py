@@ -54,10 +54,31 @@ DTYPE_BYTES: Mapping[str, float] = {
     "fp8_e5m2": 1.0,
     "int8": 1.0,
     "int4": 0.5,
+    "int4_per_token_head": 0.5,
+    "turboquant_4bit_nc": 0.5,
     "nvfp4": 0.5625,
     "mxfp4": 0.53125,
     "fp4": 0.5625,
 }
+KV_ONLY_DTYPES: frozenset[str] = frozenset(
+    {"int4_per_token_head", "turboquant_4bit_nc"}
+)
+KV_DTYPE_ALIASES: Mapping[str, str] = {
+    "auto": "bf16",
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "float32": "fp32",
+    "fp8_e4m3": "fp8",
+    "fp8_e4m3fn": "fp8",
+}
+
+
+def canonical_kv_dtype(kv_dtype: str) -> str:
+    """Return the canonical normalized KV cache dtype identifier."""
+    normalized = kv_dtype.strip().lower()
+    return KV_DTYPE_ALIASES.get(normalized, normalized)
+
+
 EFFICIENCY_BRACKETS: Mapping[str, tuple[float, float]] = {
     "eta_hbm": (0.70, 0.90),
     "eta_dense": (0.60, 0.85),
@@ -101,6 +122,13 @@ SHARED_DEFAULT_CHIP_SOURCES: Mapping[str, str] = {
     ),
     "dcn_bw_gbps": "ASSUMED: 100 Gbps/chip nominal host DCN egress prior",
     "dcn_bw_gbps_bracket": "ASSUMED: [50.0, 200.0] Gbps/chip host DCN prior",
+    "pcie_h2d_bw_bytes_per_s": (
+        "ASSUMED: PCIe Gen5 x16 unidirectional host-to-device bandwidth "
+        "64 GB/s (bracket 32-64 GB/s)"
+    ),
+    "pcie_h2d_bw_bracket_bytes_per_s": (
+        "ASSUMED: [32.0, 64.0] GB/s PCIe Gen5 x16 host-to-device bracket"
+    ),
 }
 SCALING_BOOK_VECTOR_URL = (
     "ASSUMED: pre-v7x baseline from How To Scale Your Model, TPU chapter "
@@ -139,6 +167,7 @@ MULTIMODAL_KEYS: tuple[str, ...] = ("vision_config",)
 VALID_LAYER_TOKENS: frozenset[str] = frozenset(
     {
         "attention",
+        "csa",
         "dense_mlp",
         "dsa",
         "dsa_attention",
@@ -146,6 +175,7 @@ VALID_LAYER_TOKENS: frozenset[str] = frozenset(
         "gated_deltanet",
         "gdn",
         "gqa",
+        "indexed_attention",
         "kda",
         "kda_attention",
         "linear_attention",
@@ -153,18 +183,58 @@ VALID_LAYER_TOKENS: frozenset[str] = frozenset(
         "mla_attention",
         "mlp",
         "moe",
+        "msa",
+        "qsa",
     }
 )
 KDA_MODEL_TYPES: frozenset[str] = frozenset({"kimi_linear"})
+# Checkpoint/serving configs storing FP32 recurrent state (see
+# gdn_pool_layout.DEFAULT_POOLED_GDN_SSM_STATE_DTYPE = torch.float32).
+FP32_RECURRENT_STATE_MODEL_TYPES: frozenset[str] = KDA_MODEL_TYPES | frozenset(
+    {"qwen4_exp"}
+)
+# CSA model types deriving ced_boundary = hf_config.num_hidden_layers // 2 in
+# model code (models/vllm/deepseek_v41/v2/model.py) when omitted from config.
+CED_HALF_DEPTH_MODEL_TYPES: frozenset[str] = frozenset({"deepseek_v41"})
 SUPPORTED_ONCHIP_FAMILIES: frozenset[str] = frozenset(
-    {"gqa", "mla", "dsa", "gdn", "kda", "dense_mlp", "moe"}
+    {
+        "gqa",
+        "mla",
+        "dsa",
+        "qsa",
+        "csa",
+        "msa",
+        "gdn",
+        "kda",
+        "dense_mlp",
+        "moe",
+        "hyper_connection",
+        "mhc",
+    }
 )
 # Layer families that megakernel/core ships a module package for.
 CORE_MODULE_FAMILIES: frozenset[str] = frozenset({"gqa", "gdn", "moe"})
 # Weight dtypes the megakernel/core kernels read.
 CORE_SUPPORTED_DTYPES: frozenset[str] = frozenset({"fp8", "bf16"})
 # Entries of `ModelProfile.layer_families` that describe stack structure.
-STRUCTURAL_LAYER_TAGS: frozenset[str] = frozenset({"dense_prefix_moe"})
+STRUCTURAL_LAYER_TAGS: frozenset[str] = frozenset({"dense_prefix_moe", "fusion_break"})
+
+# Sparse attention variants:
+# - qsa: Query-Selected Sparse Attention
+# - csa: Compressed Sparse Attention
+# - msa: Multi-Scale Sparse Attention
+SparseAttnKind = Literal["qsa", "csa", "msa"]
+SparseCacheReplication = Literal["kv_head_group", "per_rank", "tp_sharded"]
+# Hyper-connection variants: lowrank or Manifold-Constrained Hyper-Connections (mhc).
+HyperConnectionKind = Literal["lowrank", "mhc"]
+HostTableShardAxis = Literal["tp", "dp_local", "tp_dp_local"]
+DcpSpan = Literal["kv_heads", "tp_group"]
+# Execution modes: full decoder pass (`full`) or Chunked Encoder-Decoder (`ced`).
+ExecutionMode = Literal["full", "ced"]
+FusionScope = Literal["per_op", "single_layer", "layer_group", "whole_step"]
+MULTI_LAYER_FUSED_SCOPES: frozenset[FusionScope] = frozenset(
+    {"whole_step", "layer_group"}
+)
 
 
 CORE_DEFAULT_TILES: core_exec_spec.Tiles = core_exec_spec.Tiles()
@@ -388,3 +458,21 @@ PHASE_SORT_ORDER: Mapping[str, int] = {
     "mixed": 2,
     "prefill": 3,
 }
+
+# 1 folded FP32 scale word per 128-token index page -> 4 B/token overhead.
+INT4_INDEX_SCALE_OVERHEAD_BYTES: int = 4
+# 8 FP32 scale rows * 128 lanes / 128 tokens per page -> 32 B/stored token.
+INT4_SCALE_PAGE_BYTES_PER_TOK: int = 32
+# Packed 4-bit TurboQuant page header: 3 BF16 metadata scalars (value scale,
+# value zero, key norm) before 128-byte aligned sublane-word pages.
+TURBOQUANT_HEADER_BYTES: int = 3 * BF16_BYTES
+TURBOQUANT_WORD_BYTES: int = 128
+TURBOQUANT_SUBLANE_WORDS: int = 8
+TURBOQUANT_DEFAULT_PAGE_SIZE: int = 64
+TURBOQUANT_SUPPORTED_PAGE_SIZES: tuple[int, ...] = (16, 64)
+# Sinkhorn row/column normalization vector ops per S*S entry per iteration.
+SINKHORN_VEC_OPS_PER_ENTRY_ITER: int = 6
+HC_SUBLAYERS_PER_LAYER: int = 2
+MHC_DYNAMIC_PROJ_TERMS: int = 2
+MXFP4_BLOCK_K: int = 32
+ENGRAM_SCALE_BLOCK_SIZE: int = 32

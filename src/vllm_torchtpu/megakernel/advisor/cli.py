@@ -74,6 +74,7 @@ from .serve import (
 )
 from .specs import (
     DispatchRegime,
+    ExecutionMode,
     MoEMode,
     ObjectiveMode,
     Phase,
@@ -200,6 +201,38 @@ def _parse_layer_groups(raw: str) -> tuple[int, ...]:
     except ValueError as exc:
         msg = f"Invalid --layer-groups value {raw!r}; expected comma-separated ints"
         raise errors.MegakernelConfigError(msg) from exc
+
+
+def _parse_host_table_hbm(
+    raw_items: Sequence[str] | None,
+) -> tuple[tuple[str, bool], ...]:
+    """Parse repeated `--host-table-hbm <name>=hbm|cpu` CLI flags."""
+    if not raw_items:
+        return ()
+    overrides: dict[str, bool] = {}
+    true_tokens = frozenset({"hbm", "true", "1", "yes"})
+    false_tokens = frozenset({"cpu", "host", "false", "0", "no"})
+    for raw in raw_items:
+        if "=" not in raw:
+            msg = f"Invalid --host-table-hbm {raw!r}; expected <table_name>=hbm|cpu"
+            raise errors.MegakernelConfigError(msg)
+        name_raw, val_raw = raw.split("=", 1)
+        name = name_raw.strip()
+        val_tok = val_raw.strip().lower()
+        if not name:
+            msg = f"Empty table name in --host-table-hbm {raw!r}"
+            raise errors.MegakernelConfigError(msg)
+        if val_tok in true_tokens:
+            overrides[name] = True
+        elif val_tok in false_tokens:
+            overrides[name] = False
+        else:
+            msg = (
+                f"Invalid placement {val_raw!r} in --host-table-hbm {raw!r}; "
+                "expected hbm/cpu or true/false"
+            )
+            raise errors.MegakernelConfigError(msg)
+    return tuple(overrides.items())
 
 
 def _format_chip_budget_lines() -> list[str]:
@@ -455,6 +488,18 @@ def _add_mesh_and_tuning_args(parser: argparse.ArgumentParser) -> None:
         choices=get_args(ObjectiveMode),
         default="step",
         help="Optimization objective.",
+    )
+    parser.add_argument(
+        "--execution",
+        choices=get_args(ExecutionMode),
+        default=None,
+        help="Step execution mode (`full` or Chunked Encoder-Decoder `ced`).",
+    )
+    parser.add_argument(
+        "--host-table-hbm",
+        action="append",
+        default=None,
+        help="Override host-table HBM residency as <table_name>=hbm|cpu.",
     )
 
 
@@ -726,6 +771,11 @@ def _resolve_cli_batch(args: argparse.Namespace) -> tuple[int, bool]:
 def _build_base_workload(args: argparse.Namespace) -> WorkloadSpec:
     """Construct shared `WorkloadSpec` defaults for sweep and single evaluation."""
     host_per_op_us, host_fused_us, host_explicit = args.host_head_us
+    host_table_hbm_overrides = (
+        None
+        if args.host_table_hbm is None
+        else _parse_host_table_hbm(args.host_table_hbm)
+    )
     return WorkloadSpec(
         vmem_alias=args.vmem_alias,
         vmem_fit_headroom=args.vmem_fit_headroom,
@@ -741,6 +791,8 @@ def _build_base_workload(args: argparse.Namespace) -> WorkloadSpec:
         hbm_utilization_cap=args.hbm_utilization_cap,
         dispatch_regime=args.dispatch_regime,
         objective=args.objective,
+        execution=args.execution,
+        host_table_hbm_overrides=host_table_hbm_overrides,
     )
 
 

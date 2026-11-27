@@ -37,6 +37,7 @@ from .constants import (
     GAIN_BASIS_CALIBRATED_E2E,
     GAIN_BASIS_DEVICE_ONLY,
     LAYER_GROUP_PRICING_NOTE,
+    MULTI_LAYER_FUSED_SCOPES,
     PER_OP_COLLECTIVE_CALL_FACTOR,
     QUANTILE_DECIMALS,
     SUBLAYER_BOUNDARIES_PER_LAYER,
@@ -1401,7 +1402,7 @@ def _scope_sync_boundaries(
     if not has_any_collectives:
         return 0
     if (
-        estimate.scope == "whole_step"
+        estimate.scope in MULTI_LAYER_FUSED_SCOPES
         and 0 < scope_context.single_call_rows < scope_context.active_tokens
     ):
         num_calls = ceil(scope_context.active_tokens / scope_context.single_call_rows)
@@ -1420,8 +1421,7 @@ def _scope_sync_boundaries(
         (estimate.num_vmem_splits - 1)
         * SUBLAYER_BOUNDARIES_PER_LAYER
         * scope_context.layers_local
-        if estimate.scope in ("whole_step", "layer_group")
-        and estimate.num_vmem_splits > 1
+        if estimate.scope in MULTI_LAYER_FUSED_SCOPES and estimate.num_vmem_splits > 1
         else 0
     )
     return max(0, estimate.ops_per_step - 1) + tiled_sync
@@ -1440,7 +1440,10 @@ def _collective_hop_counts(
         else 0
     )
     a2a_factor_hops = a2a_hops if scope_context.eff_tp > 1 else 0
-    if scope_context.has_dsa:
+    if scope_context.has_dsa and (
+        scope_context.dcp_post_attn_hops > 0
+        or scope_context.dcp_query_all_gather_hops > 0
+    ):
         dcp_total_hops = (
             scope_context.dcp_post_attn_hops + scope_context.dcp_query_all_gather_hops
         )
@@ -1727,18 +1730,18 @@ def _resolve_flags(inputs: _EvalInputs, selection: _ScopeSelection) -> tuple[str
     )
     summed_calls = (
         ceil(scope_context.active_tokens / scope_context.single_call_rows)
-        if selection.fastest.scope == "whole_step" and microbatched
+        if selection.fastest.scope in MULTI_LAYER_FUSED_SCOPES and microbatched
         else 1
     )
-    whole_step_ok = any(
-        estimate.scope == "whole_step" and estimate.feasible
+    fused_multi_layer_ok = any(
+        estimate.scope in MULTI_LAYER_FUSED_SCOPES and estimate.feasible
         for estimate in inputs.estimates
     )
     candidates = (
         (selection.fastest.num_vmem_splits > summed_calls, "multi_call_unmodeled"),
-        (microbatched and whole_step_ok, "microbatch_rerun"),
+        (microbatched and fused_multi_layer_ok, "microbatch_rerun"),
         (
-            whole_step_ok and exceeds_default_buckets(workload, rows_per_call),
+            fused_multi_layer_ok and exceeds_default_buckets(workload, rows_per_call),
             "above_default_buckets",
         ),
         (selection.hbm_pool_overflow, "hbm_pool_overflow"),
@@ -1848,6 +1851,8 @@ def _apply_saturation_comparison(
         dcp=workload.dcp,
         pcp=workload.pcp,
         layer_groups=workload.layer_groups,
+        execution=workload.effective_execution,
+        host_table_hbm_overrides=workload.effective_host_table_hbm_overrides,
     )
     if current_layout.label() == preset.saturation.label():
         return outcome
@@ -2187,15 +2192,9 @@ def _evaluate_layout_row(
     """Evaluate one `ParallelLayout` for `compare_parallelism_candidates`."""
     per_replica_batch = max(1, template.batch)
     workload = replace(
-        template,
+        template.with_layout(layout),
         batch=per_replica_batch * layout.dp,
         isl=template.isl or template.context or WorkloadSpec().isl,
-        tp=layout.tp,
-        ep=layout.ep,
-        dp=layout.dp,
-        pp=layout.pp,
-        dcp=layout.dcp,
-        pcp=layout.pcp,
         layer_groups=layout.layer_groups,
         objective="step",
     )

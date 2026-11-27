@@ -417,14 +417,7 @@ def _vmem_tick_series(sweep: AdvisorSweepReport) -> list[_VmemTickBar]:
         tick_workload = WorkloadSpec(
             phase="decode",
             batch=token_count * recommended_layout.dp,
-            tp=recommended_layout.tp,
-            ep=recommended_layout.ep,
-            dp=recommended_layout.dp,
-            pp=recommended_layout.pp,
-            dcp=recommended_layout.dcp,
-            pcp=recommended_layout.pcp,
             kv_split=kv_split,
-            layer_groups=recommended_layout.layer_groups,
             moe_mode=moe_mode,
             vmem_alias=bool(ref_workload.get("vmem_alias", True)),
             vmem_fit_headroom=fit_headroom,
@@ -432,7 +425,7 @@ def _vmem_tick_series(sweep: AdvisorSweepReport) -> list[_VmemTickBar]:
             dma_buffers=sweep.dma_buffers,
             max_rows_per_call=0,
             batch_explicit=True,
-        )
+        ).with_layout(recommended_layout)
         estimates = evaluate_scopes(profile, tick_workload, chip_spec)
         ref = next(
             (s for s in estimates if s.scope == sweep.vmem_reference_scope),

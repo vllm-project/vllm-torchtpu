@@ -901,8 +901,12 @@ def test_row_tiles_follow_jax_sublane_tiling() -> None:
             assert spec.matmul_row_tile(fp4_label) == expected_fp4_tile
         assert spec.sources is not None
         assert "int4" in spec.sources["matmul_row_tile_by_dtype"]
-        for accepted_dtype in constants.DTYPE_BYTES:
+        for accepted_dtype in sorted(
+            set(constants.DTYPE_BYTES) - constants.KV_ONLY_DTYPES
+        ):
             assert accepted_dtype in spec.matmul_row_tile_by_dtype
+        for kv_only_dtype in sorted(constants.KV_ONLY_DTYPES):
+            assert kv_only_dtype not in spec.matmul_row_tile_by_dtype
 
 
 def test_chip_fields_without_jax_source_are_enumerated() -> None:
@@ -916,6 +920,8 @@ def test_chip_fields_without_jax_source_are_enumerated() -> None:
         "collective_latency_us_bracket",
         "dcn_bw_gbps",
         "dcn_bw_gbps_bracket",
+        "pcie_h2d_bw_bytes_per_s",
+        "pcie_h2d_bw_bracket_bytes_per_s",
         "min_slice_cores",
         "vector_register_bytes",
         "vector_loads_per_cycle",

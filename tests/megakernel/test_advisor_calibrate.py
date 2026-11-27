@@ -24,8 +24,9 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from tests.megakernel.advisor_test_helpers import build_preset_workload
 from vllm_torchtpu.megakernel import advisor
-from vllm_torchtpu.megakernel.advisor import calibrate, constants
+from vllm_torchtpu.megakernel.advisor import calibrate, constants, specs
 from vllm_torchtpu.megakernel.core import errors
 from vllm_torchtpu.tools import xplane_pb2 as _xplane_pb2
 
@@ -1220,7 +1221,11 @@ def test_calibrated_trace_round_trip_conservation_across_models_and_phases(
                 _build_perfetto_trace(xla_module=spec),
             )
         out_json = tmp_path / f"{model_slug}_{phase}_{trace_format}_{idle_scale}.json"
-        batch_size = 1 if phase == "prefill" else 16
+        batch_size = (
+            max(1, decode_layout.dp)
+            if phase == "prefill"
+            else specs.align_batch_to_dp(16, decode_layout.dp)
+        )
         payload = advisor.calibrate_trace(
             trace_file,
             out_json,
@@ -1256,19 +1261,21 @@ def test_calibrated_trace_round_trip_conservation_across_models_and_phases(
 
     out_1x_json = tmp_path / f"{model_slug}_{phase}_{trace_format}_1.0.json"
     calibrated = advisor.load_measurements(out_1x_json)
-    workload = advisor.WorkloadSpec(
-        phase=phase,
-        batch=1 if phase == "prefill" else 16,
+    calib_batch = (
+        max(1, decode_layout.dp)
+        if phase == "prefill"
+        else specs.align_batch_to_dp(16, decode_layout.dp)
+    )
+    workload = build_preset_workload(
+        model_slug,
+        phase,
+        use_decode_layout=True,
+        batch=calib_batch,
         isl=4096,
         chunk_size=1024 if phase in ("prefill", "mixed") else 0,
         spec_tokens=(
             (decode_layout.spec_tokens or 3) if phase in ("verify", "mixed") else 0
         ),
-        tp=decode_layout.tp,
-        ep=decode_layout.ep,
-        dp=decode_layout.dp,
-        pp=decode_layout.pp,
-        dcp=decode_layout.dcp,
         pcp=2 if phase in ("prefill", "mixed") else 1,
         layer_groups=(num_layers,),
     )
@@ -2332,7 +2339,11 @@ def test_calibrated_round_trip_and_strict_step_time_across_presets(
     gap_tol_us = 10.0 ** (-constants.QUANTILE_DECIMALS)
 
     for phase in ("decode", "prefill", "verify", "mixed"):
-        phase_batch = 1 if phase == "prefill" else batch_size
+        phase_batch = (
+            decode_layout.dp
+            if phase == "prefill"
+            else specs.align_batch_to_dp(batch_size, decode_layout.dp)
+        )
         phase_ar_bytes = round(profile.hidden_size * phase_batch * act_bytes)
         trace_path = _write_pp2_round_trip_trace(
             tmp_path,
@@ -2366,8 +2377,10 @@ def test_calibrated_round_trip_and_strict_step_time_across_presets(
             expected_idle_us, abs=gap_tol_us
         )
         loaded = advisor.load_measurements(out_json)
-        workload = advisor.WorkloadSpec(
-            phase=phase,
+        workload = build_preset_workload(
+            model_slug,
+            phase,
+            use_decode_layout=True,
             batch=phase_batch,
             isl=constants.DEFAULT_PREFILL_ISL,
             chunk_size=1024 if phase in ("prefill", "mixed") else 0,
@@ -2376,11 +2389,7 @@ def test_calibrated_round_trip_and_strict_step_time_across_presets(
                 if phase in ("verify", "mixed")
                 else 0
             ),
-            tp=decode_layout.tp,
-            ep=decode_layout.ep,
-            dp=decode_layout.dp,
             pp=pp_degree,
-            dcp=decode_layout.dcp,
             pcp=1,
         )
         report = advisor.advise(profile, workload, "tpu7x", measurements=loaded)
