@@ -225,7 +225,8 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
             and scheduler_options.get(self.vllm_config).promote_warmest
         )
         self._retention: HybridStateRetention | None = None
-        if options.hybrid_state_retention:
+        # The platform's check refuses the option off a KV producer.
+        if options.hybrid_state_retention and self._is_kv_producer:
             # At most 360 cross-turn pins, and no more than 5% of the pool.
             pin_cap = pinned_block_cap(self.kv_cache_manager.block_pool.num_gpu_blocks)
             if pin_cap > 0:
@@ -253,11 +254,13 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
             self._init_paw_sort()
         logger.info(
             "Pipeline chunk scheduler (lone-prompt %s, equal-cost %s): waiting "
-            "for the chunk limits (hybrid_state_retention=%s, quadratic_cost=%s, "
-            "prefix_aware=%s, paw_sort=%s, promote_warmest=%s, memo_xstep=%s)",
+            "for the chunk limits (hybrid_state_retention=%s, max_pinned_blocks=%s, "
+            "quadratic_cost=%s, prefix_aware=%s, paw_sort=%s, promote_warmest=%s, "
+            "memo_xstep=%s)",
             self._lone_prompt,
             self._equal_cost,
             self._retention is not None,
+            None if self._retention is None else self._retention.max_pinned_blocks,
             self._quadratic_cost,
             self._prefix_aware,
             self._paw_sort,

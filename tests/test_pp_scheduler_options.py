@@ -250,10 +250,11 @@ def _built(
         self.connector = connector
 
     class FakeRetention:
-        def __init__(self, kvm, **kwargs):
+        def __init__(self, kvm, max_pinned_blocks=None):
             calls.append("retention")
-            calls.append(kwargs)
+            calls.append({"max_pinned_blocks": max_pinned_blocks})
             self.enabled = retention_enabled
+            self.max_pinned_blocks = max_pinned_blocks
 
     def memo(self):
         calls.append("memo")
@@ -428,8 +429,11 @@ def test_retention_follows_the_option_on_a_kv_producer():
     s, _ = _built(_RETAIN, kv_role="kv_producer", retention_enabled=False)
     assert s._retention is None
     # The option keeps snapshots for a later turn's prefill: refused off a
-    # KV producer, at start-up.
+    # KV producer, at start-up, and never built there.
     _checked(_RETAIN, kv_role="kv_producer")
+    for kv_role in ("kv_consumer", "kv_both", None):
+        s, calls = _built(_RETAIN, kv_role=kv_role)
+        assert s._retention is None and "retention" not in calls
     for kv_role in ("kv_consumer", "kv_both", None):
         with pytest.raises(ValueError, match="hybrid_state_retention"):
             _checked(_RETAIN, kv_role=kv_role)
