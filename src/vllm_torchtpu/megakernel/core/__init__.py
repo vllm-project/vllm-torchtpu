@@ -36,6 +36,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         profiles,
         schedule,
         spec,
+        validate,
         weights,
     )
     from .collectives import AllReduceRing
@@ -47,6 +48,7 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     )
     from .dma.vmem import fit_default_tiles, fitted_plan
     from .errors import (
+        EligibilityResult,
         MegakernelConfigError,
         MegakernelLayoutError,
     )
@@ -170,11 +172,13 @@ _SUBMODULES = frozenset(
         "profiles",
         "schedule",
         "spec",
+        "validate",
         "weights",
     }
 )
 _LAZY: dict[str, str] = {
     "AllReduceRing": ".collectives",
+    "EligibilityResult": ".errors",
     "MegakernelConfigError": ".errors",
     "MegakernelLayoutError": ".errors",
     "DebugOptions": ".exec_spec",
@@ -278,6 +282,7 @@ __all__ = [
     "CacheExec",
     "CompareMode",
     "DebugOptions",
+    "EligibilityResult",
     "Embedding",
     "EmbeddingModule",
     "Every",
@@ -371,6 +376,7 @@ __all__ = [
     "spec",
     "ssm_to_raw_pages",
     "stream",
+    "validate",
     "vmem",
     "weights",
     "with_cache",
