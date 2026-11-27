@@ -104,6 +104,25 @@
         "execution": "ced"
       },
       "prefill_windows": [1024]
+    },
+    "minimax-m3.1-flash": {
+      "source": "MiniMax-M3.1-Flash reference 6-axis serving topologies: Wide-DCP TP8 x EP8 x DCP4 decode with 7 draft tokens, TP8 x EP8 prefill, and TP8 x EP8 x DCP8 high-context saturation",
+      "decode": {
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "spec_tokens": 7
+      },
+      "prefill": {
+        "tp": 8,
+        "ep": 8
+      },
+      "saturation": {
+        "tp": 8,
+        "ep": 8,
+        "dcp": 8
+      },
+      "prefill_windows": [2048]
     }
   }
 }

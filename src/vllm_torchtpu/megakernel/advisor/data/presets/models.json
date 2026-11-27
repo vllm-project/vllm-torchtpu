@@ -341,6 +341,38 @@
           "dense_proj_params": 0
         }
       ]
+    },
+    "minimax-m3.1-flash": {
+      "num_layers": 60,
+      "hidden_size": 6144,
+      "intermediate_size": 12288,
+      "num_attention_heads": 64,
+      "num_kv_heads": 4,
+      "head_dim": 128,
+      "num_experts": 128,
+      "top_k": 4,
+      "moe_intermediate_size": 3072,
+      "shared_expert_intermediate_size": 3072,
+      "num_moe_layers": 57,
+      "weight_dtype": "fp8",
+      "expert_dtype": "nvfp4",
+      "act_dtype": "fp8",
+      "kv_dtype": "fp8",
+      "weight_block_k": 0,
+      "expert_weight_block_k": 16,
+      "dcp_span": "tp_group",
+      "model_type": "minimax_m3_vl",
+      "dtype_basis": "config",
+      "source": "HuggingFace MiniMaxAI/MiniMax-M3.1-Flash config.json",
+      "sparse_attn": {
+        "kind": "msa",
+        "window_tokens": 128,
+        "select_tokens": 2048,
+        "index_heads": 4,
+        "index_kv_heads": 1,
+        "index_dim": 128,
+        "index_compress_ratio": 1
+      }
     }
   },
   "aliases": {
@@ -355,6 +387,8 @@
     "qwen3.8-flash-next-fp8": "qwen3.8-flash-next",
     "qwen3.8-flash": "qwen3.8-flash-next",
     "deepseek-v4.1-flash": "deepseek-v4.1-flash",
-    "deepseek-v41-flash": "deepseek-v4.1-flash"
+    "deepseek-v41-flash": "deepseek-v4.1-flash",
+    "minimax-m3.1-flash": "minimax-m3.1-flash",
+    "minimax-m3.1-flash-fp8": "minimax-m3.1-flash"
   }
 }

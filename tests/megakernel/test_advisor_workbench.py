@@ -138,6 +138,15 @@ def _post_json(
 
 def test_serve_api_advise_matches_python_api() -> None:
     """Verify `POST /api/advise` matches `advisor.advise()` across presets."""
+    expected_presets = {
+        "qwen3.5-397b",
+        "kimi-k3",
+        "glm-5.2",
+        "qwen3.8-flash-next",
+        "deepseek-v4.1-flash",
+        "minimax-m3.1-flash",
+    }
+    assert set(advisor.MODEL_PRESETS) == expected_presets
     for model_slug in sorted(advisor.MODEL_PRESETS):
         profile = advisor.resolve_model_profile(model_slug)
         chip_spec = advisor.resolve_chip_spec("tpu7x")

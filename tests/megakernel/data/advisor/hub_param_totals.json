@@ -69,6 +69,19 @@
         "rmsnorm"
       ],
       "out_of_scope_note": "Decoder-only advisor excludes embed+lm_head, Engram lookup tables, 3-layer dspark MTP draft stack, vision tower, and 1D norms."
+    },
+    "minimax-m3.1-flash": {
+      "repo_id": "MiniMaxAI/MiniMax-M3.1-Flash",
+      "hub_sha": "ce7f4df87d2e05262f5775f373dac4772f134041",
+      "snapshot_revision": "ce7f4df87d2e05262f5775f373dac4772f134041",
+      "safetensors_total": 427051937408,
+      "out_of_scope_components": [
+        "embed_tokens",
+        "lm_head",
+        "vision_encoder",
+        "rmsnorm"
+      ],
+      "out_of_scope_note": "Decoder-only advisor excludes embed+lm_head, CLIP vision tower, and 1D norms; main-model logical non-scale total excludes separate dspark shards."
     }
   }
 }

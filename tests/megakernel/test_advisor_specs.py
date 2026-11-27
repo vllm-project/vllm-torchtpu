@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 SOURCE_PREFIXES = ("FACT:", "DERIVED:", "ASSUMED:", "CHOSEN:")
 
 
-SHIPPED_PRESET_COUNT = 5
+SHIPPED_PRESET_COUNT = 6
 NEGATIVE_CONTROL_SNAPSHOTS = frozenset({"kimi-k3.1-pro", "qwen3.8-2.4t", "deepseek-v3"})
 HF_CONFIG_DIR = Path(__file__).resolve().parent / "data" / "advisor" / "hf_configs"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -237,6 +237,7 @@ def test_preset_models_json_schema() -> None:
         "glm-5.2",
         "qwen3.8-flash-next",
         "deepseek-v4.1-flash",
+        "minimax-m3.1-flash",
     ):
         assert models_data["presets"][moe_slug]["moe_intermediate_size"] > 0
     deployments_data = json.loads(deployments_json.read_text(encoding="utf-8"))
@@ -564,6 +565,7 @@ RUNTIME_DTYPE_OVERRIDES: dict[str, dict[str, str]] = {
     "glm-5.2": {"kv_dtype": "fp8"},
     "qwen3.8-flash-next": {"kv_dtype": "fp8", "state_dtype": "fp32"},
     "deepseek-v4.1-flash": {"kv_dtype": "fp8"},
+    "minimax-m3.1-flash": {"kv_dtype": "fp8"},
 }
 
 
@@ -759,6 +761,7 @@ def test_shipped_presets_are_the_three_validated_models() -> None:
         "glm-5.2",
         "qwen3.8-flash-next",
         "deepseek-v4.1-flash",
+        "minimax-m3.1-flash",
     }
     expected_aliases = {
         "qwen3.5-397b": "qwen3.5-397b",
@@ -773,6 +776,8 @@ def test_shipped_presets_are_the_three_validated_models() -> None:
         "qwen3.8-flash": "qwen3.8-flash-next",
         "deepseek-v4.1-flash": "deepseek-v4.1-flash",
         "deepseek-v41-flash": "deepseek-v4.1-flash",
+        "minimax-m3.1-flash": "minimax-m3.1-flash",
+        "minimax-m3.1-flash-fp8": "minimax-m3.1-flash",
     }
     assert set(models.MODEL_PRESETS) == expected_presets
     assert dict(models.REGISTERED_MODEL_ALIASES) == expected_aliases
@@ -795,6 +800,7 @@ def test_unsupported_authentic_config_fails_closed() -> None:
         "zai-org/GLM-5.2-FP8",
         "Qwen/Qwen3.8-Flash-Next-FP8",
         "deepseek-ai/DeepSeek-V4.1-Flash",
+        "MiniMaxAI/MiniMax-M3.1-Flash",
     )
     for neg_name in ("kimi-k3.1-pro", "qwen3.8-2.4t", "deepseek-v3"):
         snapshot = json.loads(
@@ -1380,7 +1386,7 @@ def test_quant_scheme_without_snapshot_fixture_is_rejected() -> None:
             models.parse_hf_config_profile(cfg, name="x")
 
     for slug in advisor.MODEL_PRESETS:
-        for bad_dtype in ("int8", "int4", "nvfp4", "fp16"):
+        for bad_dtype in ("int8", "int4", "fp16"):
             with pytest.raises(models.UnsupportedArchitectureError):
                 models.resolve_model_profile(slug, weight_dtype=bad_dtype)
             with pytest.raises(models.UnsupportedArchitectureError):

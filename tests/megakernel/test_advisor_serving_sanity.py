@@ -39,6 +39,7 @@ _PRESET_SLUGS: tuple[str, ...] = (
     "glm-5.2",
     "qwen3.8-flash-next",
     "deepseek-v4.1-flash",
+    "minimax-m3.1-flash",
 )
 _MOE_SETTINGS: tuple[str, ...] = ("unpinned", "masked_on_chip", "grouped_on_chip")
 _PINNED_MOE_MODES: dict[str, advisor.MoEMode] = {
