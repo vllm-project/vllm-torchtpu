@@ -17,6 +17,7 @@ import gc
 import multiprocessing
 import os
 import weakref
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -35,11 +36,224 @@ import vllm_torchtpu as plugin
 from vllm_torchtpu import patch_registry, utils
 from vllm_torchtpu.runner.routed_experts import RoutedExpertsCapture
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.worker import tpu_worker
 from vllm_torchtpu.worker.tpu_worker import (
     TPUWorker,
     _configure_tpu_process_env,
     _drop_traced_module_refs,
+    _reconcile_tpu_visible_device_paths,
 )
+
+# A bare-metal device plugin lists one VFIO path per chip (four on a tpu7x host).
+_POD_DEVICE_PATHS = "/dev/vfio/461,/dev/vfio/463,/dev/vfio/460,/dev/vfio/462"
+
+_INIT_DEVICE_ENV_KEYS = (
+    "ALLOW_MULTIPLE_LIBTPU_LOAD",
+    "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "RANK",
+    "TORCH_TPU_DP_MASTER_ADDR",
+    "TORCH_TPU_DP_MASTER_PORT",
+    "TORCH_TPU_DP_SIZE",
+    "TORCH_TPU_SLICE_LOCAL_RANK",
+    "TORCH_TPU_SLICE_LOCAL_WORLD_SIZE",
+    "TORCH_TPU_SLICE_RANK",
+    "TORCH_TPU_SLICE_WORLD_SIZE",
+    "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+    "TORCH_TPU_TOPOLOGY",
+    "TPU_LOCAL_RANK_OFFSET",
+    "TPU_VISIBLE_CHIPS",
+    "TPU_VISIBLE_DEVICE_PATHS",
+    "TPU_VISIBLE_DEVICES",
+    "WORLD_SIZE",
+)
+
+
+@pytest.mark.parametrize("local_world_size", [2, 4, 8])
+def test_reconcile_tpu_visible_device_paths_clears_for_multi_rank(
+    monkeypatch, local_world_size
+):
+    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", _POD_DEVICE_PATHS)
+    with patch.object(tpu_worker.logger, "warning_once") as warn_mock:
+        _reconcile_tpu_visible_device_paths(local_world_size)
+        warn_mock.assert_called_once()
+    assert "TPU_VISIBLE_DEVICE_PATHS" not in os.environ
+
+
+def test_reconcile_tpu_visible_device_paths_keeps_single_rank_single_path(monkeypatch):
+    for key in (
+        "VLLM_TPU_DEVICE_ORDER",
+        "TPU_LOCAL_RANK_OFFSET",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", "/dev/vfio/0")
+    _reconcile_tpu_visible_device_paths(1)
+    assert os.environ["TPU_VISIBLE_DEVICE_PATHS"] == "/dev/vfio/0"
+
+
+def test_reconcile_tpu_visible_device_paths_clears_tp1_with_multiple_paths(monkeypatch):
+    for key in (
+        "VLLM_TPU_DEVICE_ORDER",
+        "TPU_LOCAL_RANK_OFFSET",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", _POD_DEVICE_PATHS)
+    with patch.object(tpu_worker.logger, "warning_once") as warn_mock:
+        _reconcile_tpu_visible_device_paths(1)
+        warn_mock.assert_called_once()
+    assert "TPU_VISIBLE_DEVICE_PATHS" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "env_key,env_val",
+    [
+        ("VLLM_TPU_DEVICE_ORDER", "1,0"),
+        ("TPU_LOCAL_RANK_OFFSET", "2"),
+        ("DEBUG_TPU_LOCAL_RANK_OFFSET", "1"),
+    ],
+)
+def test_reconcile_tpu_visible_device_paths_clears_when_override_set(
+    monkeypatch, env_key, env_val
+):
+    for key in (
+        "VLLM_TPU_DEVICE_ORDER",
+        "TPU_LOCAL_RANK_OFFSET",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", "/dev/vfio/0")
+    monkeypatch.setenv(env_key, env_val)
+    with patch.object(tpu_worker.logger, "warning_once") as warn_mock:
+        _reconcile_tpu_visible_device_paths(1)
+        warn_mock.assert_called_once()
+    assert "TPU_VISIBLE_DEVICE_PATHS" not in os.environ
+
+
+@pytest.mark.parametrize(
+    "case,device_paths,expect_cleared",
+    [
+        ("plain_single_rank", "/dev/vfio/0", False),
+        ("plain_single_rank", _POD_DEVICE_PATHS, True),
+        ("plain_multi_rank", _POD_DEVICE_PATHS, True),
+        ("pcp_multi_rank", _POD_DEVICE_PATHS, True),
+        ("ep_dp_multi_rank", _POD_DEVICE_PATHS, True),
+        ("dense_dp_tp1_multi_replica", _POD_DEVICE_PATHS, True),
+        ("dense_dp_tp1_single_local_replica", "/dev/vfio/0", False),
+    ],
+)
+def test_init_device_reconciles_tpu_visible_device_paths_per_branch(
+    monkeypatch, case, device_paths, expect_cleared
+):
+    """Verify init_device passes binding.slice_local_world_size to reconciliation."""
+    for key in _INIT_DEVICE_ENV_KEYS + (
+        "VLLM_TPU_DEVICE_ORDER",
+        "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    ):
+        monkeypatch.setenv(key, os.environ.get(key, ""))
+        monkeypatch.delenv(key)
+
+    monkeypatch.setenv("TPU_VISIBLE_DEVICE_PATHS", device_paths)
+
+    if case == "plain_single_rank":
+        pc = ParallelConfig(tensor_parallel_size=1, numa_bind=False)
+    elif case == "plain_multi_rank":
+        pc = ParallelConfig(tensor_parallel_size=4, numa_bind=False)
+    elif case == "pcp_multi_rank":
+        pc = ParallelConfig(
+            tensor_parallel_size=2,
+            prefill_context_parallel_size=2,
+            numa_bind=False,
+        )
+    elif case == "ep_dp_multi_rank":
+        pc = ParallelConfig(
+            tensor_parallel_size=2,
+            data_parallel_size=4,
+            data_parallel_size_local=4,
+            enable_expert_parallel=True,
+            numa_bind=False,
+        )
+        pc.data_parallel_index = 1
+        monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29600")
+    elif case == "dense_dp_tp1_multi_replica":
+        pc = ParallelConfig(
+            tensor_parallel_size=1,
+            data_parallel_size=8,
+            data_parallel_size_local=8,
+            enable_expert_parallel=False,
+            numa_bind=False,
+        )
+        pc.data_parallel_index = 2
+        monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29600")
+        monkeypatch.setenv(
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+            ",".join(f"localhost:{8070 + i}" for i in range(8)),
+        )
+    elif case == "dense_dp_tp1_single_local_replica":
+        pc = ParallelConfig(
+            tensor_parallel_size=1,
+            data_parallel_size=2,
+            data_parallel_size_local=1,
+            enable_expert_parallel=False,
+            numa_bind=False,
+        )
+        pc.data_parallel_index = 0
+        monkeypatch.setenv("TORCH_TPU_DP_MASTER_PORT", "29600")
+        monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "host0:8070,host1:8070")
+    else:
+        raise AssertionError(f"Unhandled case {case}")
+
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.vllm_config = MagicMock()
+    worker.parallel_config = pc
+    worker.rank = 0
+    worker.local_rank = 0
+    worker.distributed_init_method = "tcp://127.0.0.1:29500"
+    worker.devices = [torch.device("cpu")]
+    worker.is_driver_worker = True
+    # Newer vLLM-TorchTPU builds the runner via `model_runner_cls`; stub both.
+    worker.model_runner_cls = MagicMock()
+
+    with (
+        patch(
+            "vllm.platforms.current_platform",
+            MagicMock(get_worker_distributed_backend=MagicMock(return_value="gloo")),
+        ),
+        patch(
+            "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._get_tpu_topology",
+            return_value="1,1,1",
+        ),
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.set_current_vllm_config",
+            side_effect=lambda _: nullcontext(),
+        ),
+        patch("vllm_torchtpu.worker.tpu_worker.init_distributed_environment"),
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.pcp_topology_order",
+            side_effect=lambda *_, **__: nullcontext(),
+        ),
+        patch("vllm_torchtpu.worker.tpu_worker.ensure_model_parallel_initialized"),
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.get_pp_group",
+            return_value=SimpleNamespace(is_first_rank=True, is_last_rank=True),
+        ),
+        patch("vllm_torchtpu.worker.tpu_worker.TPUModelRunner"),
+        patch(
+            "vllm_torchtpu.worker.tpu_worker.dist_utils.get_node_id",
+            return_value="node-0",
+        ),
+        patch("vllm_torchtpu.worker.tpu_worker.vllm_utils.report_usage_stats"),
+    ):
+        worker.init_device()
+
+    if expect_cleared:
+        assert "TPU_VISIBLE_DEVICE_PATHS" not in os.environ
+    else:
+        assert os.environ["TPU_VISIBLE_DEVICE_PATHS"] == device_paths
 
 
 def test_configure_tpu_process_env_sets_world_size_only_for_multiple_ranks(monkeypatch):

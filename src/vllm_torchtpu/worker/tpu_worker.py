@@ -86,6 +86,46 @@ def _configure_tpu_process_env(
         os.environ.pop("WORLD_SIZE", None)
 
 
+def _reconcile_tpu_visible_device_paths(local_world_size: int) -> None:
+    """Clear an inherited ``TPU_VISIBLE_DEVICE_PATHS`` when per-rank binding applies.
+
+    ``libtpu`` prioritizes ``TPU_VISIBLE_DEVICE_PATHS`` over ``TPU_VISIBLE_CHIPS``
+    and opens every listed path inside each process, so a pod-wide list breaks
+    per-rank device binding, device-order overrides, and rank offsets. Clear the
+    list when multiple ranks share the host, when more than one path is listed,
+    or when ``VLLM_TPU_DEVICE_ORDER``, ``TPU_LOCAL_RANK_OFFSET``, or
+    ``DEBUG_TPU_LOCAL_RANK_OFFSET`` is set so ``TPU_VISIBLE_CHIPS`` selects the
+    device.
+    """
+    raw_paths = envs.TPU_VISIBLE_DEVICE_PATHS
+    if not raw_paths:
+        return
+    paths = [p.strip() for p in raw_paths.split(",") if p.strip()]
+    reasons: list[str] = []
+    if local_world_size > 1:
+        reasons.append(f"local_world_size={local_world_size}")
+    if len(paths) > 1:
+        reasons.append(f"multiple device paths ({len(paths)})")
+    if envs.VLLM_TPU_DEVICE_ORDER:
+        reasons.append(f"VLLM_TPU_DEVICE_ORDER={envs.VLLM_TPU_DEVICE_ORDER!r}")
+    if envs.TPU_LOCAL_RANK_OFFSET:
+        reasons.append(f"TPU_LOCAL_RANK_OFFSET={envs.TPU_LOCAL_RANK_OFFSET}")
+    if envs.DEBUG_TPU_LOCAL_RANK_OFFSET:
+        reasons.append(
+            f"DEBUG_TPU_LOCAL_RANK_OFFSET={envs.DEBUG_TPU_LOCAL_RANK_OFFSET}"
+        )
+    if not reasons:
+        return
+    os.environ.pop("TPU_VISIBLE_DEVICE_PATHS", None)
+    logger.warning_once(
+        "TPUWorker | Clearing TPU_VISIBLE_DEVICE_PATHS=%r (%s); each rank "
+        "binds its device through TPU_VISIBLE_CHIPS, which needs every TPU "
+        "device node of the host to be visible to this process.",
+        raw_paths,
+        ", ".join(reasons),
+    )
+
+
 def _release_free_host_heap() -> None:
     """Return free allocator pages from model loading and compilation to the OS."""
     process = ctypes.CDLL(None)
@@ -385,6 +425,7 @@ class TPUWorker(WorkerBase):
                 init_rank = binding.init_rank
                 init_world = binding.init_world_size
                 dist_init_method = self.distributed_init_method
+            tpu_device_local_world = binding.slice_local_world_size
             local_rank_for_init = binding.init_local_rank
             dist_world_size = binding.world_size
             logger.info(
@@ -440,6 +481,7 @@ class TPUWorker(WorkerBase):
                 local_rank_for_init = binding.init_local_rank
                 dist_world_size = binding.world_size
                 os.environ.update(binding.as_env())
+                tpu_device_local_world = binding.local_world_size
             else:
                 local_world = os.environ.get("LOCAL_WORLD_SIZE") or pc.world_size
                 local_rank_for_init = int(self.local_rank)
@@ -466,6 +508,7 @@ class TPUWorker(WorkerBase):
                 _configure_tpu_process_env(
                     self.rank, tpu_local_rank_env, pc.world_size, tpu_local_world
                 )
+                tpu_device_local_world = tpu_local_world
             if envs.TPU_LOCAL_RANK_OFFSET:
                 logger.info(
                     "TPU local-rank offset binding | rank=%d local_rank=%d "
@@ -476,6 +519,8 @@ class TPUWorker(WorkerBase):
                     binding.local_rank,
                     binding.local_world_size,
                 )
+
+        _reconcile_tpu_visible_device_paths(tpu_device_local_world)
 
         if not self.devices:
             self.devices = [torch.device("tpu")]

@@ -453,3 +453,104 @@ def test_executor_slice_binding_rejects_pcp():
 
     with pytest.raises(NotImplementedError, match="context parallelism"):
         binding.get_tpu_worker_binding(pc, rank=1, local_rank=1, env=env)
+
+
+def test_slice_local_world_size_prefers_ray_executor_env_for_dense_dp():
+    """Multi-host Ray dense DP workers inherit the driver's data_parallel_size_local.
+
+    Reading TORCH_TPU_SLICE_LOCAL_WORLD_SIZE first ensures a 1-chip host reports
+    slice_local_world_size=1 instead of the cluster-wide DP count.
+    """
+    pc = _parallel_config(
+        world_size=1,
+        local_world_size=1,
+        data_parallel_size=2,
+        data_parallel_size_local=2,
+        data_parallel_index=1,
+        prefill_context_parallel_size=1,
+        enable_expert_parallel=False,
+    )
+    env = {
+        "TORCH_TPU_DP_SIZE": "2",
+        "LOCAL_WORLD_SIZE": "1",
+        **binding.slice_binding_env(
+            rank=1, local_rank=0, world_size=2, local_world_size=1
+        ),
+    }
+    b = binding.get_tpu_worker_binding(pc, rank=0, local_rank=0, env=env)
+    assert b.slice_local_world_size == 1
+    assert b.local_world_size == 1
+
+    # Multi-chip host on Ray dense DP reports the host's chip count (4).
+    env_4chip = {
+        "TORCH_TPU_DP_SIZE": "8",
+        "LOCAL_WORLD_SIZE": "4",
+        **binding.slice_binding_env(
+            rank=5, local_rank=1, world_size=8, local_world_size=4
+        ),
+    }
+    pc_8 = _parallel_config(
+        world_size=1,
+        local_world_size=1,
+        data_parallel_size=8,
+        data_parallel_size_local=8,
+        data_parallel_index=5,
+        prefill_context_parallel_size=1,
+        enable_expert_parallel=False,
+    )
+    b4 = binding.get_tpu_worker_binding(pc_8, rank=0, local_rank=0, env=env_4chip)
+    assert b4.slice_local_world_size == 4
+
+
+def test_slice_local_world_size_dense_dp_mp_and_collapsed_paths():
+    # Uncollapsed single-host dense DP (dp_local=8, world=1).
+    pc_single = _parallel_config(
+        world_size=1,
+        local_world_size=1,
+        data_parallel_size=8,
+        data_parallel_size_local=8,
+        data_parallel_index=2,
+        prefill_context_parallel_size=1,
+        enable_expert_parallel=False,
+    )
+    assert (
+        binding.get_tpu_worker_binding(
+            pc_single, rank=0, local_rank=0, env={}
+        ).slice_local_world_size
+        == 8
+    )
+
+    # Collapsed by run_engine_core (data_parallel_size=1) on multi-host mp:
+    # count entries matching this replica's host in TORCH_TPU_SLICEBUILDER_ADDRESSES.
+    pc_collapsed = _parallel_config(
+        world_size=1,
+        local_world_size=1,
+        data_parallel_size=1,
+        data_parallel_size_local=1,
+        data_parallel_index=1,
+        prefill_context_parallel_size=1,
+        enable_expert_parallel=False,
+    )
+    env_two_hosts = {
+        "TORCH_TPU_DP_SIZE": "2",
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES": "host0:8070,host1:8070",
+    }
+    assert (
+        binding.get_tpu_worker_binding(
+            pc_collapsed, rank=0, local_rank=0, env=env_two_hosts
+        ).slice_local_world_size
+        == 1
+    )
+
+    env_one_host = {
+        "TORCH_TPU_DP_SIZE": "4",
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES": (
+            "host0:8070,host0:8071,host0:8072,host0:8073"
+        ),
+    }
+    assert (
+        binding.get_tpu_worker_binding(
+            pc_collapsed, rank=0, local_rank=0, env=env_one_host
+        ).slice_local_world_size
+        == 4
+    )

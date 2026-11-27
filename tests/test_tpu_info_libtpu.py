@@ -14,6 +14,7 @@
 """libtpu identification when the pip package may be absent."""
 
 import logging
+import os
 from importlib import metadata as importlib_metadata
 
 import pytest
@@ -134,3 +135,35 @@ def test_validate_libtpu_version_still_rejects_old_package(monkeypatch):
 
     with pytest.raises(RuntimeError, match="libtpu < 0.0.35"):
         tpu_runner._validate_libtpu_version()
+
+
+def test_get_node_worker_id_and_name_lws_fallbacks(monkeypatch):
+    for key in (
+        "TPU_WORKER_ID",
+        "CLOUD_TPU_TASK_ID",
+        "LWS_WORKER_INDEX",
+        "LWS_LEADER_ADDRESS",
+        "TPU_NAME",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    def _metadata(key=""):
+        if os.environ.get("LWS_WORKER_INDEX") or os.environ.get("LWS_LEADER_ADDRESS"):
+            raise AssertionError(f"GCE metadata queried for {key!r} on an LWS pod")
+        return {"instance-id": "tpu-vm-0", "agent-worker-number": "3"}[key]
+
+    monkeypatch.setattr(tpu_info, "get_tpu_metadata", _metadata)
+    monkeypatch.setattr(tpu_info.socket, "gethostname", lambda: "vllm-lws-0-2")
+
+    # Outside LWS, both values come from GCE metadata.
+    assert tpu_info.get_node_name() == "tpu-vm-0"
+    assert tpu_info.get_node_worker_id() == 3
+
+    # LWS pods never query metadata.
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", "vllm-lws-0.vllm-lws.default.svc")
+    assert tpu_info.get_node_name() == "vllm-lws-0-2"
+    assert tpu_info.get_node_worker_id() == 0
+    monkeypatch.setenv("LWS_WORKER_INDEX", "2")
+    assert tpu_info.get_node_worker_id() == 2
+    monkeypatch.setenv("TPU_WORKER_ID", "1")
+    assert tpu_info.get_node_worker_id() == 1

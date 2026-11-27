@@ -16,6 +16,7 @@ import glob
 import hashlib
 import importlib.util
 import os
+import socket
 from importlib import metadata as importlib_metadata
 
 import requests
@@ -185,16 +186,23 @@ def get_libtpu_cache_key() -> str:
 
 def get_node_name() -> str:
     tpu_name = envs.TPU_NAME
+    if not tpu_name and (envs.LWS_LEADER_ADDRESS or envs.LWS_WORKER_INDEX is not None):
+        return socket.gethostname()
     if not tpu_name:
         tpu_name = get_tpu_metadata(key="instance-id")
-    return tpu_name
+    return tpu_name or socket.gethostname()
 
 
 def get_node_worker_id() -> int:
     """For multi-host TPU VM, this returns the worker id for the current node."""
     worker_id = envs.TPU_WORKER_ID
-    if worker_id is None:
-        worker_id = get_tpu_metadata(key="agent-worker-number")
+    if worker_id:
+        return int(worker_id)
+    if envs.LWS_WORKER_INDEX is not None:
+        return envs.LWS_WORKER_INDEX
+    if envs.LWS_LEADER_ADDRESS:
+        return 0
+    worker_id = get_tpu_metadata(key="agent-worker-number")
     if worker_id is None:
         return 0
     return int(worker_id)

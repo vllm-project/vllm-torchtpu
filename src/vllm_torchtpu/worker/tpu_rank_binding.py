@@ -91,6 +91,11 @@ class TpuWorkerBinding:
     dp_rank: int = 0
     dp_size: int = 1
     local_rank_offset: int = 0
+    slice_local_world_size: int = 0
+
+    def __post_init__(self) -> None:
+        if self.slice_local_world_size <= 0:
+            self.slice_local_world_size = self.local_world_size
 
     def as_env(self) -> dict[str, str]:
         return {
@@ -99,6 +104,38 @@ class TpuWorkerBinding:
             "WORLD_SIZE": str(self.world_size),
             "LOCAL_WORLD_SIZE": str(self.local_world_size),
         }
+
+
+def _resolve_dense_dp_host_world(
+    parallel_config,
+    *,
+    dp_rank: int,
+    dp_size: int,
+    env: Mapping[str, str],
+) -> int:
+    """Return the number of slice ranks hosted on this worker's host under dense DP."""
+    executor_local_world = _get_int_env(env, SLICE_LOCAL_WORLD_SIZE_ENV, 0)
+    if executor_local_world > 0:
+        return executor_local_world
+
+    world_size = parallel_config.world_size
+    if parallel_config.data_parallel_size > 1:
+        dp_size_local = parallel_config.data_parallel_size_local or dp_size
+        return dp_size_local * world_size
+
+    full_sb = env.get("TORCH_TPU_SLICEBUILDER_ADDRESSES", "")
+    sb_addresses = [addr for addr in full_sb.split(",") if addr]
+    start = dp_rank * world_size
+    my_sb_addresses = sb_addresses[start : start + world_size]
+    if len(my_sb_addresses) == world_size:
+        my_sb_host = my_sb_addresses[0].rsplit(":", 1)[0]
+        host_slots = sum(
+            1 for addr in sb_addresses if addr.rsplit(":", 1)[0] == my_sb_host
+        )
+        if host_slots > 0:
+            return host_slots
+
+    return dp_size * world_size
 
 
 def _get_spawned_pcp_local_rank(
@@ -276,6 +313,9 @@ def get_tpu_worker_binding(
             )
         else:
             tpu_local_rank = native_local_rank
+        # Executor-assigned bindings returned above; this host owns its local
+        # DP replicas' chips.
+        host_world = (parallel_config.data_parallel_size_local or dp_size) * world_size
         return TpuWorkerBinding(
             rank=global_rank,
             local_rank=local_rank_offset + tpu_local_rank,
@@ -288,6 +328,7 @@ def get_tpu_worker_binding(
             dp_rank=dp_rank,
             dp_size=dp_size,
             local_rank_offset=local_rank_offset,
+            slice_local_world_size=local_rank_offset + host_world,
         )
 
     dp_rank = parallel_config.data_parallel_index or 0
@@ -312,11 +353,24 @@ def get_tpu_worker_binding(
         if env.get("LOCAL_RANK")
         else _get_int_env(env, "LOCAL_WORLD_SIZE", parallel_config.local_world_size)
     )
+    local_world_size = local_rank_offset + local_chip_count
+    if dp_size > 1:
+        host_dp_world = _resolve_dense_dp_host_world(
+            parallel_config,
+            dp_rank=dp_rank,
+            dp_size=dp_size,
+            env=env,
+        )
+        slice_local_world_size = max(
+            local_world_size, local_rank_offset + host_dp_world
+        )
+    else:
+        slice_local_world_size = local_world_size
     return TpuWorkerBinding(
         rank=rank,
         local_rank=local_rank_offset + tpu_local_rank,
         world_size=world_size,
-        local_world_size=local_rank_offset + local_chip_count,
+        local_world_size=local_world_size,
         init_rank=rank,
         init_world_size=world_size,
         init_local_rank=tpu_local_rank,
@@ -324,4 +378,5 @@ def get_tpu_worker_binding(
         dp_rank=dp_rank,
         dp_size=dp_size,
         local_rank_offset=local_rank_offset,
+        slice_local_world_size=slice_local_world_size,
     )

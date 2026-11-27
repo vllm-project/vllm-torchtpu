@@ -81,9 +81,12 @@ EXEMPT_PATHS = {
 # Only names actually read in this package are listed. Adding a new bootstrap
 # read fails this hook with a message pointing here, which is the moment to
 # decide whether it belongs in envs.py instead.
+#   slicebuilder_hosts.py   reads LWS_WORKER_INDEX inside a stdlib-only Ray
+#                           probe closure that must not import vllm_torchtpu.
 BOOTSTRAP_VARS = {
     "LOCAL_RANK",
     "LOCAL_WORLD_SIZE",
+    "LWS_WORKER_INDEX",
     "MASTER_PORT",
     "PYTHONHASHSEED",
     "RANK",

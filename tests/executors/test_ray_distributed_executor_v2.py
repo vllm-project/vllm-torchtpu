@@ -12,11 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import socket
 from unittest.mock import MagicMock, patch
 
 import pytest
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from vllm.config import CacheConfig
 
+from vllm_torchtpu.executors import ray_distributed_executor_v2 as rde2
 from vllm_torchtpu.executors.ray_distributed_executor_v2 import (
     RayDistributedExecutorV2,
     get_tpu_bundles_for_indices,
@@ -376,6 +379,16 @@ class TestTpuRayDistributedExecutorV2:
 
             # Run initialization
             executor._init_executor()
+
+            excluded_vars = mock_driver_env.call_args.kwargs["worker_specific_vars"]
+            assert {
+                "TPU_VISIBLE_CHIPS",
+                "TPU_VISIBLE_DEVICES",
+                "TPU_VISIBLE_DEVICE_PATHS",
+                "CLOUD_TPU_TASK_ID",
+                "TPU_WORKER_ID",
+                "LWS_WORKER_INDEX",
+            }.issubset(excluded_vars)
 
             # An explicit bundle permutation can move the local worker away
             # from rank 0. The queue must use its actual rank or remote
@@ -798,6 +811,221 @@ class TestTpuRayDistributedExecutorV2:
 
             executor.ray_worker_handles = []
 
+    @pytest.mark.parametrize(
+        "mode",
+        ["lws_worker_index_probe", "lws_worker_id_multinic", "probe_timeout"],
+    )
+    @patch(
+        "vllm_torchtpu.executors.ray_distributed_executor_v2.get_driver_env_vars",
+        return_value={},
+    )
+    @patch("vllm_torchtpu.executors.ray_distributed_executor_v2.MessageQueue")
+    def test_init_executor_ipv6_slicebuilder_host_resolution(
+        self,
+        mock_mq,
+        mock_driver_env,
+        mock_wait_until_pg_ready,
+        mock_get_ip,
+        mock_platform,
+        mock_ray,
+        monkeypatch,
+        mode,
+    ):
+        for key in (
+            "TORCH_TPU_DP_SIZE",
+            "TORCH_TPU_DP_MASTER_PORT",
+            "TORCH_TPU_BASE_PORT",
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+            "TORCH_TPU_XPROF_SESSION_ID",
+            "VLLM_RAY_BUNDLE_INDICES",
+            "LWS_LEADER_ADDRESS",
+            "LWS_WORKER_INDEX",
+        ):
+            monkeypatch.delenv(key, raising=False)
+
+        # Host 0's IPv6 literal ("2001:db8::b") sorts lexicographically after
+        # host 1 ("2001:db8::2"), verifying both host ordering, layout caching
+        # across _initialize_ray_cluster + _init_executor, and Step 7
+        # self-published hostname substitution.
+        host0_ip, host1_ip = "2001:db8::b", "2001:db8::2"
+        node0_id, node1_id = "0" * 56, "1" * 56
+        leader_dns = "vllm-lws-0.vllm-lws.default.svc.cluster.local"
+        worker1_dns = "vllm-lws-0-1.vllm-lws.default.svc.cluster.local"
+
+        if mode == "lws_worker_index_probe":
+            monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
+            monkeypatch.setenv("LWS_WORKER_INDEX", "0")
+            dns_to_ip = {leader_dns: host0_ip, worker1_dns: host1_ip}
+            expected_hosts = (leader_dns, worker1_dns)
+            remote_probe_result: object = [(1, worker1_dns)]
+            nodes = [
+                {
+                    "NodeID": node1_id,
+                    "NodeManagerAddress": host1_ip,
+                    "Resources": {"TPU": 4.0},
+                },
+                {
+                    "NodeID": node0_id,
+                    "NodeManagerAddress": host0_ip,
+                    "Resources": {"TPU": 4.0},
+                },
+            ]
+        elif mode == "lws_worker_id_multinic":
+            monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
+            monkeypatch.setenv("LWS_WORKER_INDEX", "0")
+            dns_to_ip = {leader_dns: "fd00::10", worker1_dns: "fd00::11"}
+            expected_hosts = (leader_dns, worker1_dns)
+            remote_probe_result = [(1, worker1_dns)]
+            nodes = [
+                {
+                    "NodeID": node1_id,
+                    "NodeManagerAddress": host1_ip,
+                    "NodeManagerHostname": "baremetal-node-b",
+                    "Resources": {"TPU": 4.0},
+                    "labels": {"ray.io/tpu-worker-id": "1"},
+                },
+                {
+                    "NodeID": node0_id,
+                    "NodeManagerAddress": host0_ip,
+                    "NodeManagerHostname": "baremetal-node-a",
+                    "Resources": {"TPU": 4.0},
+                    "labels": {"ray.io/tpu-worker-id": "0"},
+                },
+            ]
+        else:
+            # The driver resolves its own name, but the remote probe times out:
+            # startup must fail rather than guess the other host's name.
+            host0_name, host1_name = "tpu-host-0.internal", "tpu-host-1.internal"
+            monkeypatch.setattr(socket, "getfqdn", lambda: host0_name)
+            dns_to_ip = {host0_name: host0_ip}
+            expected_hosts = (host0_name, host1_name)
+            remote_probe_result = TimeoutError("probe timed out")
+            nodes = [
+                {
+                    "NodeID": node1_id,
+                    "NodeManagerAddress": host1_ip,
+                    "NodeManagerHostname": host1_name,
+                    "Resources": {"TPU": 4.0},
+                    "labels": {"ray.io/tpu-worker-id": "1"},
+                },
+                {
+                    "NodeID": node0_id,
+                    "NodeManagerAddress": host0_ip,
+                    "NodeManagerHostname": host0_name,
+                    "Resources": {"TPU": 4.0},
+                    "labels": {"ray.io/tpu-worker-id": "0"},
+                },
+            ]
+
+        monkeypatch.setattr(
+            socket,
+            "getnameinfo",
+            lambda sockaddr, flags: (_ for _ in ()).throw(socket.gaierror("no PTR")),
+        )
+        monkeypatch.setattr(
+            socket,
+            "getaddrinfo",
+            lambda host, *a, **kw: (
+                [
+                    (
+                        socket.AF_INET6,
+                        socket.SOCK_STREAM,
+                        6,
+                        "",
+                        (dns_to_ip[host], 0, 0, 0),
+                    )
+                ]
+                if host in dns_to_ip
+                else (_ for _ in ()).throw(socket.gaierror(f"unknown {host}"))
+            ),
+        )
+
+        mock_platform.ray_device_key = "TPU"
+        mock_ray.is_initialized.return_value = True
+        mock_placement_group = MagicMock()
+
+        def create_pg(specs, strategy):
+            mock_placement_group.bundle_specs = specs
+            return mock_placement_group
+
+        mock_ray.util.placement_group.side_effect = create_pg
+        mock_ray.nodes.return_value = nodes
+
+        def get_bundles(pg):
+            return [
+                (i, node0_id, next(k[5:] for k in spec if k.startswith("node:")))
+                for i, spec in enumerate(pg.bundle_specs)
+            ]
+
+        with (
+            patch(
+                "vllm_torchtpu.executors.ray_distributed_executor_v2.get_bundles_sorted_by_node",
+                side_effect=get_bundles,
+            ),
+            patch(
+                "vllm_torchtpu.executors.ray_distributed_executor_v2.get_tpu_multihost_topology",
+                return_value="1,2,2,2",
+            ),
+        ):
+            mock_ray.get_runtime_context().get_node_id.return_value = node0_id
+
+            self.parallel_config.world_size = 2
+            self.parallel_config.tensor_parallel_size = 2
+            self.parallel_config.pipeline_parallel_size = 1
+            self.parallel_config.local_world_size = 2
+            self.parallel_config.data_parallel_size = 4
+            self.parallel_config.data_parallel_index = 0
+
+            executor = RayDistributedExecutorV2(self.vllm_config)
+            executor.vllm_config = self.vllm_config
+            executor.parallel_config = self.parallel_config
+
+            probe_remote = MagicMock()
+            probe_remote.options.return_value.remote.return_value = "probe_ref"
+            actors = [MagicMock(), MagicMock()]
+            actor_remote = MagicMock()
+            actor_remote.options.return_value.remote.side_effect = actors
+
+            def _ray_remote(target):
+                if callable(target) and getattr(target, "__name__", "") == "_probe":
+                    return probe_remote
+                return actor_remote
+
+            mock_ray.remote.side_effect = _ray_remote
+            mock_ray.get.side_effect = [
+                remote_probe_result,
+                [(node0_id, [0]), (node0_id, [1])],
+                f"tcp://[{host0_ip}]:9000",
+                [None, None],
+                [
+                    {"status": "READY", "handle": "handle_1"},
+                    {"status": "READY", "handle": "handle_2"},
+                ],
+            ]
+
+            try:
+                if mode == "probe_timeout":
+                    with pytest.raises(RuntimeError, match="timed out"):
+                        executor._init_executor()
+                    mock_ray.util.placement_group.assert_not_called()
+                    return
+                executor._init_executor()
+
+                # Probe ran exactly once (cached between _initialize_ray_cluster
+                # and Step 7).
+                assert probe_remote.options.call_count == 1
+                expected_sb = ",".join(
+                    f"{host}:{8070 + chip}"
+                    for host in expected_hosts
+                    for chip in range(4)
+                )
+                for actor in actors:
+                    env = actor.initialize_worker.remote.call_args[0][1]
+                    assert env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == expected_sb
+                    assert env["MASTER_ADDR"] == host0_ip
+            finally:
+                executor.ray_worker_handles = []
+
     @patch(
         "vllm_torchtpu.executors.ray_distributed_executor_v2.get_driver_env_vars",
         return_value={},
@@ -942,3 +1170,182 @@ def test_ray_distributed_executor_bundle_expansion():
     # Too many bundle indices raises ValueError
     with pytest.raises(ValueError, match="less than or equal to world_size"):
         expand_bundles(list(range(17)), 16)
+
+
+def test_resolve_slice_host_layout_probes_once_with_affinity_and_timeout(monkeypatch):
+    """Verify by-value probe, NodeAffinity node_id, ray.get timeout, and caching."""
+    leader_dns = "vllm-lws-2.vllm-lws.default.svc.cluster.local"
+    worker1_dns = "vllm-lws-2-1.vllm-lws.default.svc.cluster.local"
+    worker2_dns = "vllm-lws-2-2.vllm-lws.default.svc.cluster.local"
+    node0_id, node1_id, node2_id = "0" * 56, "1" * 56, "2" * 56
+
+    monkeypatch.setenv("LWS_LEADER_ADDRESS", leader_dns)
+    monkeypatch.setenv("LWS_WORKER_INDEX", "0")
+    dns_map = {
+        leader_dns: "2001:db8:1::9",
+        worker1_dns: "2001:db8:1::a",
+        worker2_dns: "2001:db8:1::1",
+    }
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda host, *a, **kw: (
+            [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", (dns_map[host], 0, 0, 0))]
+            if host in dns_map
+            else (_ for _ in ()).throw(socket.gaierror(f"unknown {host}"))
+        ),
+    )
+
+    nodes_calls = 0
+
+    def _fake_nodes():
+        nonlocal nodes_calls
+        nodes_calls += 1
+        return [
+            {
+                "NodeID": node2_id,
+                "NodeManagerAddress": "fd00:1::1",
+                "Resources": {"TPU": 8},
+            },
+            {
+                "NodeID": node0_id,
+                "NodeManagerAddress": "fd00:1::9",
+                "Resources": {"TPU": 8},
+            },
+            {
+                "NodeID": node1_id,
+                "NodeManagerAddress": "fd00:1::a",
+                "Resources": {"TPU": 8},
+            },
+        ]
+
+    captured_fns = []
+    probe_remote = MagicMock()
+    probe_remote.options.return_value.remote.side_effect = ["ref_2", "ref_1"]
+
+    def _fake_remote(fn):
+        captured_fns.append(fn)
+        return probe_remote
+
+    ray_get_mock = MagicMock(return_value=[(2, worker2_dns), (1, worker1_dns)])
+
+    monkeypatch.setattr(rde2.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        rde2.ray,
+        "get_runtime_context",
+        lambda: MagicMock(get_node_id=lambda: node0_id),
+    )
+    monkeypatch.setattr(rde2.ray, "nodes", _fake_nodes)
+    monkeypatch.setattr(rde2.ray, "remote", _fake_remote)
+    monkeypatch.setattr(rde2.ray, "get", ray_get_mock)
+
+    executor = RayDistributedExecutorV2.__new__(RayDistributedExecutorV2)
+    layout1 = executor._resolve_slice_host_layout("TPU")
+    layout2 = executor._resolve_slice_host_layout("TPU")
+
+    assert layout1 is layout2
+    assert nodes_calls == 1
+    assert len(captured_fns) == 1
+    assert captured_fns[0].__module__ == "__main__"
+
+    # Assert exact NodeAffinitySchedulingStrategy node IDs on each remote probe.
+    probed_node_ids = [
+        call.kwargs["scheduling_strategy"].node_id
+        for call in probe_remote.options.call_args_list
+    ]
+    assert probed_node_ids == [node2_id, node1_id]
+    for call in probe_remote.options.call_args_list:
+        strategy = call.kwargs["scheduling_strategy"]
+        assert isinstance(strategy, NodeAffinitySchedulingStrategy)
+        assert strategy.soft is False
+
+    # Assert ray.get uses the bounded probe timeout.
+    ray_get_mock.assert_called_once_with(
+        ["ref_2", "ref_1"], timeout=rde2._RAY_NODE_PROBE_TIMEOUT_S
+    )
+
+    assert layout1.host_order == ["fd00:1::9", "fd00:1::a", "fd00:1::1"]
+    assert layout1.chips_per_host == dict.fromkeys(layout1.host_order, 8)
+    assert layout1.sb_host_by_ip == {
+        "fd00:1::9": leader_dns,
+        "fd00:1::a": worker1_dns,
+        "fd00:1::1": worker2_dns,
+    }
+
+
+def test_resolve_slice_host_layout_probe_timeout_and_duplicate_rejection(monkeypatch):
+    """Probe timeout fails startup; duplicate IPv6 slicebuilder hosts fail."""
+    node0_id, node1_id = "0" * 56, "1" * 56
+    monkeypatch.setenv(
+        "LWS_LEADER_ADDRESS", "vllm-lws-0.vllm-lws.default.svc.cluster.local"
+    )
+    monkeypatch.setenv("LWS_WORKER_INDEX", "0")
+    monkeypatch.setattr(rde2.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        rde2.ray,
+        "get_runtime_context",
+        lambda: MagicMock(get_node_id=lambda: node0_id),
+    )
+
+    # Case 1: IPv4 LWS probe timeout raises instead of falling back to IP order,
+    # so DP engines cannot derive different host orders.
+    probe_remote = MagicMock()
+    probe_remote.options.return_value.remote.return_value = "ref_1"
+    monkeypatch.setattr(rde2.ray, "remote", lambda _fn: probe_remote)
+    monkeypatch.setattr(
+        rde2.ray,
+        "get",
+        MagicMock(side_effect=TimeoutError("raylet stuck")),
+    )
+    monkeypatch.setattr(
+        rde2.ray,
+        "nodes",
+        lambda: [
+            {
+                "NodeID": node0_id,
+                "NodeManagerAddress": "10.0.0.2",
+                "Resources": {"TPU": 4},
+            },
+            {
+                "NodeID": node1_id,
+                "NodeManagerAddress": "10.0.0.1",
+                "Resources": {"TPU": 4},
+            },
+        ],
+    )
+    executor = RayDistributedExecutorV2.__new__(RayDistributedExecutorV2)
+    with pytest.raises(RuntimeError, match="timed out.*raylet stuck"):
+        executor._resolve_slice_host_layout("TPU")
+
+    # Case 2: Duplicate self-published IPv6 hostnames are rejected.
+    monkeypatch.setattr(
+        rde2,
+        "resolve_local_slicebuilder_host",
+        lambda _ip: "shared-host.internal",
+    )
+    monkeypatch.setattr(
+        rde2.ray,
+        "get",
+        MagicMock(return_value=[(1, "shared-host.internal")]),
+    )
+    monkeypatch.setattr(
+        rde2.ray,
+        "nodes",
+        lambda: [
+            {
+                "NodeID": node0_id,
+                "NodeManagerAddress": "fd00::1",
+                "Resources": {"TPU": 4},
+                "labels": {"ray.io/tpu-worker-id": "0"},
+            },
+            {
+                "NodeID": node1_id,
+                "NodeManagerAddress": "fd00::2",
+                "Resources": {"TPU": 4},
+                "labels": {"ray.io/tpu-worker-id": "1"},
+            },
+        ],
+    )
+    executor2 = RayDistributedExecutorV2.__new__(RayDistributedExecutorV2)
+    with pytest.raises(ValueError, match="same slicebuilder host"):
+        executor2._resolve_slice_host_layout("TPU")
