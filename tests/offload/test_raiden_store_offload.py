@@ -1940,7 +1940,7 @@ class _RecordingLock:
 
 
 class TestOffloadConnectorOptions(unittest.TestCase):
-    """max_async_loads, fence_after_draft and host_tier_recency are opt-in
+    """max_async_loads and host_tier_recency are opt-in
     kv_connector_extra_config options: unset, the connector behaves as before."""
 
     def test_option_defaults_and_types(self):
@@ -1950,7 +1950,7 @@ class TestOffloadConnectorOptions(unittest.TestCase):
         self.assertEqual(
             _connector_option({"max_async_loads": 16}, "max_async_loads", 0), 16
         )
-        for name in ("fence_after_draft", "host_tier_recency"):
+        for name in ("host_tier_recency",):
             self.assertIs(_connector_option({}, name, False), False)
             self.assertIs(_connector_option({name: True}, name, False), True)
             for bad in ("1", 1, None):
@@ -2016,40 +2016,6 @@ class TestOffloadConnectorOptions(unittest.TestCase):
         self.assertEqual(capped._max_async_load_reqs, 16)
         self.assertIs(unset._host_tier_recency, False)
         self.assertIs(recency._host_tier_recency, True)
-
-    def test_worker_reads_fence_after_draft_off_by_default(self):
-        from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
-        from vllm.distributed.kv_transfer.kv_connector.v1.base import (
-            KVConnectorBase_V1,
-        )
-
-        from vllm_torchtpu.offload import raiden_connector
-
-        def worker_connector(extra_config):
-            spec = SimpleNamespace(extra_config=extra_config)
-            with (
-                patch.object(KVConnectorBase_V1, "__init__", lambda *args: None),
-                patch.object(
-                    raiden_connector.offloading_config_module,
-                    "build_offloading_config",
-                ),
-                patch.object(
-                    raiden_connector,
-                    "TPURaidenStoreOffloadingSpec",
-                    return_value=spec,
-                ),
-                patch.object(raiden_connector, "OffloadingConnectorWorker"),
-                # The connector pins RAIDEN_DISABLE_SINGLETON_WORKER in os.environ.
-                patch.dict(os.environ),
-            ):
-                return raiden_connector.TPURaidenOffloadingConnector(
-                    None, KVConnectorRole.WORKER, None
-                )
-
-        self.assertIs(worker_connector({})._fence_after_draft, False)
-        self.assertIs(
-            worker_connector({"fence_after_draft": True})._fence_after_draft, True
-        )
 
     def test_no_cap_by_default(self):
         self.assertEqual(self._capped(0), ((8, True), True))
@@ -2146,8 +2112,6 @@ class TestWorkerSideConnector(unittest.TestCase):
         conn._completed_jobs = {}
         conn._pool_sync_tensors = []
         conn._pending_fences = []
-        conn._fence_after_draft = False
-        conn._deferred_fence_ids = set()
         return conn
 
     def _meta(self, **kwargs):
@@ -2199,32 +2163,6 @@ class TestWorkerSideConnector(unittest.TestCase):
             conn.get_finished(set())
         self.assertEqual(conn._fenced_jobs, {7: 1, 8: 1})
         self.assertEqual(conn._pending_fences, [])
-
-    def test_fence_after_draft_records_a_step_fence_one_call_later(self):
-        conn = self._make_worker_connector()
-        conn._pool_sync_tensors = [MagicMock()]
-        conn._fence_after_draft = True
-        conn._deferred_fence_ids = set()
-        recorded = []
-        with (
-            patch("vllm_torchtpu.offload.raiden_connector._enqueue_pool_writes"),
-            patch(
-                "vllm_torchtpu.offload.raiden_connector._record_fence_event",
-                side_effect=lambda: recorded.append(1) or object(),
-            ),
-            patch(
-                "vllm_torchtpu.offload.raiden_connector._event_is_retired",
-                return_value=False,
-            ),
-        ):
-            conn._connector_metadata = self._meta(fence_job_ids={7})
-            conn.get_finished(set())
-            # The step's fence waits for the next call (after the draft).
-            self.assertEqual(conn._pending_fences, [])
-            conn._connector_metadata = self._meta()
-            conn.get_finished(set())
-        self.assertEqual([ids for ids, _ in conn._pending_fences], [{7}])
-        self.assertEqual(len(recorded), 1)
 
     def test_event_retirement_propagates_execution_errors(self):
         from vllm_torchtpu.offload.raiden_connector import _event_is_retired

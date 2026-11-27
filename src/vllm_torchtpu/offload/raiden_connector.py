@@ -127,8 +127,6 @@ def _connector_option(extra_config: Mapping[str, Any], key: str, default: Any) -
     Options:
       max_async_loads (int, default 0 = no cap): host-tier loads in flight
         before a request with a host-tier hit is deferred to a later step.
-      fence_after_draft (bool, default false): record a step's store fences
-        one get_finished() call later, after the draft model's KV writes.
       host_tier_recency (bool, default false): the scheduler refreshes a
         request's host-tier keys on every lookup and store (``_touch``),
         probes partial tails only above the local hit, offers FullAttention
@@ -1072,22 +1070,6 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
             # In-flight fence events awaiting device retirement before acknowledging
             # store jobs, recorded as pairs of (fence_job_ids, event).
             self._pending_fences: list[tuple[set[int], torch.Event]] = []
-            # fence_after_draft: the runner calls get_finished() after the
-            # target forward but BEFORE the speculative (MTP/eagle) draft
-            # propose, which writes the draft layer's KV into the same pool
-            # blocks. Deferring the fence for a step's store jobs to the next
-            # get_finished() call orders it after every KV write of that step,
-            # draft included.
-            self._fence_after_draft: bool = _connector_option(
-                spec.extra_config, "fence_after_draft", False
-            )
-            self._deferred_fence_ids: set[int] = set()
-            if self._fence_after_draft:
-                logger.info(
-                    "TPURaidenOffloadingConnector: fence_after_draft: store "
-                    "fences are recorded one get_finished() call later so they "
-                    "order after the step's draft (MTP) KV writes"
-                )
 
     # -- scheduler-side hooks ----------------------------------------------
     def reset_cache(self) -> bool | None:
@@ -1195,14 +1177,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         meta = self._get_connector_metadata()
         assert isinstance(meta, RaidenOffloadingConnectorMetadata)
 
-        fence_job_ids = set(meta.fence_job_ids)
-        if self._fence_after_draft:
-            fence_job_ids, self._deferred_fence_ids = (
-                self._deferred_fence_ids,
-                fence_job_ids,
-            )
-
-        if fence_job_ids:
+        if meta.fence_job_ids:
             # Establish an asynchronous device fence before acknowledging store jobs:
             # 1. Dispatch any deferred pool writes so they precede the fence event.
             # 2. Record a stream event to track completion without host-side blocking.
@@ -1210,7 +1185,9 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 "KV pool tensors must be registered before the save fence"
             )
             _enqueue_pool_writes(self._pool_sync_tensors)
-            self._pending_fences.append((fence_job_ids, _record_fence_event()))
+            self._pending_fences.append(
+                (set(meta.fence_job_ids), _record_fence_event())
+            )
 
         if self._pending_fences:
             # Non-blockingly drain retired events and acknowledge completed fences.
