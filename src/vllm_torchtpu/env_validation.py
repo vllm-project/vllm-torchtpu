@@ -28,18 +28,57 @@ neither there nor in vLLM's registry does nothing. Two cases are reported:
   ``TPU_*`` names: libtpu, JAX and GKE read and inject many of them, and no
   list of those stays current.
 
+Removed variables (``REMOVED_ENV_VARS``) are not reported here. Startup
+fails while one is set, with what replaced it (``reject_removed_env_vars``).
+
 ``PACKAGE_WRITTEN_ENV_VARS`` lists the names this package sets itself;
 ``tests/test_env_validation.py`` checks it against every literal
 ``os.environ`` write under ``src/``.
 """
 
 import difflib
-from collections.abc import Collection, Iterable
+import os
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 
 # High enough that a one- or two-letter slip matches and unrelated names
 # sharing a prefix do not.
 _TYPO_CUTOFF = 0.9
+
+# Variables that are no longer read, with what to do instead. A deployment
+# that still sets one expects a behavior it would not get, so startup
+# (TpuPlatform.check_and_update_config) fails while one is set, even to "" or
+# "0", whatever the model or parallelism.
+REMOVED_ENV_VARS = {
+    "TPU_PP_HANDOFF": "the buffered point-to-point hand-off is the only one. Unset it.",
+    "TPU_PP_RING_DEPTH": "set TPU_PP_HANDOFF_DEPTH instead.",
+    "TPU_PP_LAZY_PUSH": (
+        "it timed the pushes of the removed lockstep hand-off. Unset it."
+    ),
+    "TPU_PP_DYNAMIC_CHUNKS": (
+        "set TPU_PP_LONE_PROMPT_CHUNKS and TPU_PP_EQUAL_COST_CHUNKS instead."
+    ),
+    "USE_MOE_EP_KERNEL": (
+        "it enables nothing. Unset it; the fused expert-parallel MoE kernel is "
+        "USE_MOE_FUSED_EP_KERNEL=1."
+    ),
+    "TPU_MOE_TOPK_WEIGHTS_FLOAT32": (
+        "unset it and pass --additional-config "
+        "'{\"tpu_moe_topk_weights_float32\": true}' instead."
+    ),
+    # The attention backend is the engine argument (AttentionConfig.backend);
+    # the TPU backends differ numerically, so the old name must not be ignored.
+    "VLLM_ATTENTION_BACKEND": "pass --attention-backend instead.",
+}
+
+
+def reject_removed_env_vars(environ: Mapping[str, str] = os.environ) -> None:
+    """Raises ValueError for the first name of ``REMOVED_ENV_VARS`` that is
+    set in ``environ``."""
+    for name, remedy in REMOVED_ENV_VARS.items():
+        if name in environ:
+            raise ValueError(f"{name} has been removed; {remedy}")
+
 
 # Names this package writes into os.environ for itself or for the libraries it
 # drives (torch_tpu, libtpu, vLLM, Ray). They are set on purpose, so they are
@@ -129,6 +168,8 @@ def find_unread_env_vars(
         vllm_names: Names vLLM reads.
         external_prefixes: Prefixes owned by a reader without a registry (for
             example ``VLLM_OMNI_``). Names with them are never reported.
+
+    Names in ``REMOVED_ENV_VARS`` are not reported: startup rejects them.
     """
     known = set(torchtpu_names) | set(vllm_names)
     known_vllm = sorted(n for n in known if n.startswith("VLLM_"))
@@ -139,7 +180,7 @@ def find_unread_env_vars(
 
     unread = []
     for name in sorted(set(set_names) - known):
-        if name.startswith(external_prefixes):
+        if name.startswith(external_prefixes) or name in REMOVED_ENV_VARS:
             continue
         if name.startswith("VLLM_"):
             unread.append(UnreadEnvVar(name, _closest(name, known_vllm)))
