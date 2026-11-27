@@ -36,6 +36,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -419,37 +420,67 @@ def _is_absent_tpu_error(exc: BaseException) -> bool:
     return any(tok in msg for tok in _ABSENT_TPU_SUBSTRINGS)
 
 
-def _probe_tpu_devices() -> list[Any]:
-    """Probe the TPU backend and device 0; skip when absent or busy."""
+# A busy TPU (another process holds it) is waited for, then fails the test:
+# a skip would let a green TPU lane hide that the test never ran.
+_TPU_BUSY_WAIT_S = 120.0
+_TPU_BUSY_FIRST_SLEEP_S = 2.0
+
+
+def _probe_tpu_once() -> list[Any]:
+    """Probe the TPU backend and device 0. Skips when JAX has no TPU backend;
+    raises the busy `RuntimeError` for the caller to retry."""
     import jax
     import jax.numpy as jnp
 
     try:
         devs = list(jax.devices("tpu"))
     except RuntimeError as exc:
-        if _is_absent_tpu_error(exc) or _is_busy_tpu_error(exc):
-            pytest.skip(f"TPU backend absent or busy: {exc}")
+        if _is_absent_tpu_error(exc) and not _is_busy_tpu_error(exc):
+            pytest.skip(f"JAX has no TPU backend: {exc}")
         raise
     if not devs:
-        pytest.skip("No TPU devices available")
-    try:
-        jax.device_put(jnp.zeros((1,), dtype=jnp.int32), devs[0]).block_until_ready()
-    except RuntimeError as exc:
-        if _is_busy_tpu_error(exc):
-            pytest.skip(f"TPU device busy: {exc}")
-        raise
+        pytest.skip("JAX has no TPU devices")
+    jax.device_put(jnp.zeros((1,), dtype=jnp.int32), devs[0]).block_until_ready()
     return devs
+
+
+def _probe_tpu_devices() -> list[Any]:
+    """Probe the TPU; skip when JAX has no TPU backend. A busy TPU is retried
+    with backoff for up to `_TPU_BUSY_WAIT_S`, then fails with the reason."""
+    from jax.extend import backend as jax_backend
+
+    deadline = time.monotonic() + _TPU_BUSY_WAIT_S
+    delay = _TPU_BUSY_FIRST_SLEEP_S
+    while True:
+        try:
+            return _probe_tpu_once()
+        except RuntimeError as exc:
+            if not _is_busy_tpu_error(exc):
+                raise
+            left = deadline - time.monotonic()
+            if left <= 0:
+                pytest.fail(
+                    f"TPU still busy after {_TPU_BUSY_WAIT_S:.0f}s: {exc}",
+                    pytrace=False,
+                )
+            time.sleep(min(delay, left))
+            delay *= 2
+            # JAX caches a failed backend init: drop it so the retry
+            # initializes the TPU backend again.
+            jax_backend.clear_backends()
 
 
 _tpu_probed: bool = False
 _tpu_skip_reason: str | None = None
+_tpu_fail_reason: str | None = None
 _tpu_probe_error: Exception | None = None
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_runtest_call(item: pytest.Item) -> None:
-    """Probe the TPU once per process on `tpu_test` items; skip if absent/busy."""
-    global _tpu_probed, _tpu_skip_reason, _tpu_probe_error
+    """Probe the TPU once per process on `tpu_test` items: skip without a TPU
+    backend, fail when it stays busy."""
+    global _tpu_probed, _tpu_skip_reason, _tpu_fail_reason, _tpu_probe_error
     if (
         item.get_closest_marker("tpu_test") is None
         or item.get_closest_marker("spawns_tpu_workers") is not None
@@ -460,11 +491,15 @@ def pytest_runtest_call(item: pytest.Item) -> None:
         try:
             _probe_tpu_devices()
         except pytest.skip.Exception as exc:
-            _tpu_skip_reason = str(exc) or "TPU unavailable or busy"
+            _tpu_skip_reason = str(exc) or "JAX has no TPU backend"
+        except pytest.fail.Exception as exc:
+            _tpu_fail_reason = str(exc) or "TPU busy"
         except Exception as exc:
             _tpu_probe_error = exc
     if _tpu_skip_reason is not None:
         pytest.skip(_tpu_skip_reason)
+    if _tpu_fail_reason is not None:
+        pytest.fail(_tpu_fail_reason, pytrace=False)
     if _tpu_probe_error is not None:
         raise _tpu_probe_error
 
