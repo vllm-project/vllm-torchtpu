@@ -51,16 +51,47 @@ def _chip_version() -> Any:
     return pltpu.get_tpu_info().chip_version
 
 
+def unsupported_chip_version_reason() -> str | None:
+    """Returns why the chip is not a tpu7x, or `None`."""
+    from jax.experimental.pallas import tpu as pltpu
+
+    chip = _chip_version()
+    if chip != pltpu.ChipVersion.TPU_7X:
+        # The VMEM limits and the kernel selection are measured on tpu7x.
+        return f"the kernel is tuned for tpu7x, not {chip}"
+    return None
+
+
+def unsupported_tpu7x_4x2_chip_topology_reason(
+    *, require_paired_chips: bool = False
+) -> str | None:
+    """Returns why the host is not a 4-chip dual-core tpu7x slice, or `None`."""
+    from vllm_torchtpu.distributed.chip_topology import get_chip_topology
+    from vllm_torchtpu.kernels.collectives.hierrs_tc.wrapper import (
+        supports_chip_topology,
+    )
+
+    topology = get_chip_topology()
+    if topology is None:
+        return "the chip topology is unknown"
+    if not supports_chip_topology(topology.num_chips, topology.cores_per_chip):
+        return (
+            f"the kernel needs 4 chips of 2 TensorCores, not {topology.num_chips} "
+            f"of {topology.cores_per_chip}"
+        )
+    if require_paired_chips:
+        expected_chips = [[2 * c, 2 * c + 1] for c in range(topology.num_chips)]
+        if sorted(topology.chips) != expected_chips:
+            return f"chips are not paired as {expected_chips}: {topology.chips}"
+    return unsupported_chip_version_reason()
+
+
 def _unsupported_world_reason(draft_model: bool) -> str | None:
     import torch.distributed as dist
     from vllm.distributed.parallel_state import get_dp_group
 
-    from vllm_torchtpu.distributed.chip_topology import get_chip_topology
     from vllm_torchtpu.distributed.ep_mesh import get_ep_group
-    from vllm_torchtpu.kernels.collectives.hierrs_tc.wrapper import (
-        supports_chip_topology,
-        supports_num_devices,
-    )
+    from vllm_torchtpu.kernels.collectives.hierrs_tc.wrapper import supports_num_devices
 
     if draft_model:
         # The draft graph is traced once for every bucket, and whether a call
@@ -75,21 +106,7 @@ def _unsupported_world_reason(draft_model: bool) -> str | None:
         return "the EP group does not span the whole torch.distributed world"
     if list(get_dp_group().ranks) != list(ep.ranks):
         return "the DP group's ranks differ from the EP group's"
-    topology = get_chip_topology()
-    if topology is None:
-        return "the chip topology is unknown"
-    if not supports_chip_topology(topology.num_chips, topology.cores_per_chip):
-        return (
-            f"the kernel needs 4 chips of 2 TensorCores, not {topology.num_chips} "
-            f"of {topology.cores_per_chip}"
-        )
-    from jax.experimental.pallas import tpu as pltpu
-
-    chip = _chip_version()
-    if chip != pltpu.ChipVersion.TPU_7X:
-        # The VMEM limits and the kernel selection are measured on tpu7x.
-        return f"the kernel is tuned for tpu7x, not {chip}"
-    return None
+    return unsupported_tpu7x_4x2_chip_topology_reason()
 
 
 def _unordered_mesh_reason(mesh: Any) -> str | None:
@@ -148,7 +165,11 @@ def _gather_reasons(reason: str | None) -> list[str | None]:
     """Every rank's refusal reason, over the world's CPU group."""
     import torch.distributed as dist
 
-    if not dist.is_initialized() or dist.get_world_size() == 1:
+    if (
+        not dist.is_available()
+        or not dist.is_initialized()
+        or dist.get_world_size() == 1
+    ):
         return [reason]
     from vllm.distributed.parallel_state import get_world_group
 
@@ -157,9 +178,8 @@ def _gather_reasons(reason: str | None) -> list[str | None]:
     return seen
 
 
-def _agreed_reason(reason: str | None) -> str | None:
-    """Refuse on every rank if one refuses, so no rank waits on the others in
-    build_ep_mesh or in the kernel."""
+def agreed_refusal_reason(reason: str | None) -> str | None:
+    """Refuses on every rank if any rank refuses, preventing collective hangs."""
     seen = _gather_reasons(reason)
     refused = {r: why for r, why in enumerate(seen) if why is not None}
     if not refused:
@@ -196,7 +216,7 @@ def prebuild_hier_reduce_scatter(draft_model: bool = False) -> bool:
         get_ep_group,
     )
 
-    reason = _agreed_reason(_unsupported_world_reason(draft_model))
+    reason = agreed_refusal_reason(_unsupported_world_reason(draft_model))
     mesh = order = ep = None
     if reason is None:
         mesh = build_ep_mesh(axis_name=EP_AXIS_NAME)

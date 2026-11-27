@@ -81,7 +81,13 @@ def test_startup_rejects_topk_weights_float32_env(monkeypatch, vllm_config, valu
 
 
 @pytest.mark.parametrize(
-    "key", ["tpu_moe_silu_bf16", "tpu_moe_topk_weights_float32", "tpu_rope_in_graph"]
+    "key",
+    [
+        "tpu_moe_silu_bf16",
+        "tpu_moe_topk_weights_float32",
+        "tpu_rope_in_graph",
+        "tpu_dense_sequence_parallel",
+    ],
 )
 def test_startup_rejects_non_bool_additional_config(monkeypatch, vllm_config, key):
     monkeypatch.delenv(REMOVED, raising=False)

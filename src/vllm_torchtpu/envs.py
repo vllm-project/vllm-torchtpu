@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     TPU_ATTN_MOE_OVERLAP: bool = False
     TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER: bool = False
+    TPU_DENSE_SP_HIER_RS: str = "off"
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = 0
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
@@ -462,6 +463,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # checkpoints and long-context evaluations.
     "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER": env_bool(
         "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", default=False
+    ),
+    # With additional_config["tpu_dense_sequence_parallel"]: fuse each dense SP
+    # reduce-scatter and its RMSNorm/residual epilogue in VMEM on dual-core
+    # tpu7x TP groups: row-streaming at TP=4 or TP=8 on >= 128 * TP tokens
+    # ("bf16" or lossy "fp8" inter-chip hops, with XLA all-gathers) and, on FP8
+    # linears, single-shot VMEM reduce-scatter + gather at TP=8 on
+    # 256 <= tokens < 1024 (always bf16 inter-chip hops).
+    "TPU_DENSE_SP_HIER_RS": env_with_choices(
+        "TPU_DENSE_SP_HIER_RS", "off", ["off", "bf16", "fp8"]
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),

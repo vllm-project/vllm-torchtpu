@@ -112,6 +112,11 @@ def _reset_ep_device_placement():
         if ep_mesh is not None:
             ep_mesh._GATHERED_DEVICE_IDS.clear()
             ep_mesh._PLACEMENT_KEY_READ = False
+        tp_mesh = sys.modules.get("vllm_torchtpu.distributed.tp_mesh")
+        if tp_mesh is not None:
+            tp_mesh._MESH_CACHE.clear()
+            tp_mesh._GATHERED_DEVICE_IDS.clear()
+            tp_mesh._PLACEMENT_KEY_READ = False
 
     reset()
     yield
