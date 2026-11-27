@@ -40,7 +40,6 @@ def _kernel(
     x_scale,
     wb,
     hb,
-    ob,
     dot_sum,
     h_sum,
     k_sum,
@@ -97,11 +96,6 @@ def _kernel(
     def k_cell(u):
         return (u % tiles) * token_tile, (u // tiles) * window
 
-    def v_cell(u):
-        t, s = (u // heads) % tiles, u % heads
-        j = u // (heads * tiles)
-        return t * token_tile, s * dim + j * window
-
     def h_copy(cell, u):
         row, col = cell(u)
         return pltpu.make_async_copy(
@@ -110,13 +104,23 @@ def _kernel(
             h_sem.at[u % 2],
         )
 
-    def o_copy(u):
-        row, col = v_cell(u)
-        return pltpu.make_async_copy(
-            ob.at[u % 2],
-            out.at[at(row, token_tile), at(col, window)],
-            o_sem.at[u % 2],
-        )
+    # Value groups g = j * tiles + t own heads slots each, two groups in
+    # turn: a group's hidden tiles all load while its projection runs, and
+    # the output overwrites them in place.
+    def v_slot(g, s):
+        return (g % 2) * heads + s
+
+    def v_cell(ref, g, s):
+        j, t = g // tiles, g % tiles
+        return ref.at[at(t * token_tile, token_tile), at(s * dim + j * window, window)]
+
+    def v_load(g, s):
+        slot = v_slot(g, s)
+        return pltpu.make_async_copy(v_cell(hidden, g, s), hb.at[slot], h_sem.at[slot])
+
+    def v_store(g, s):
+        slot = v_slot(g, s)
+        return pltpu.make_async_copy(hb.at[slot], v_cell(out, g, s), o_sem.at[slot])
 
     w_copy(0).start()
     w_copy(1).start()
@@ -174,9 +178,9 @@ def _kernel(
         signed = jnp.where(dot < 0, -magnitude, magnitude)
         gate[s] = jax.nn.sigmoid(signed) * mask[...]
 
-    h_copy(v_cell, 0).start()
-
     # Value windows: out = BF16(hidden + gate * value), one head at a time.
+    groups = per_head * tiles
+
     @pl.loop(0, per_head)
     def _(j):
         i = key_windows + j
@@ -184,36 +188,33 @@ def _kernel(
 
         @pl.loop(0, tiles)
         def _(t):
+            g = j * tiles + t
+            for s in range(heads):
+
+                @pl.when(g >= 2)
+                def _(*, s=s):
+                    v_store(g - 2, s).wait()
+
+                v_load(g, s).start()
             v = project(i, t)
             rows = at(t * token_tile, token_tile)
             for s in range(heads):
-                u = (j * tiles + t) * heads + s
-
-                @pl.when(u + 1 < per_head * tiles * heads)
-                def _():
-                    h_copy(v_cell, u + 1).start()
-
-                h_copy(v_cell, u).wait()
-
-                @pl.when(u >= 2)
-                def _():
-                    o_copy(u - 2).wait()
-
-                g = gate[s, rows, :]
+                v_load(g, s).wait()
+                slot = v_slot(g, s)
+                gs = gate[s, rows, :]
                 for lane in range(0, window, LANES):
                     part = slice(lane, lane + LANES)
-                    h = hb[u % 2, :, part].astype(jnp.float32)
-                    ob[u % 2, :, part] = (h + g * v[:, part]).astype(ob.dtype)
-                o_copy(u).start()
+                    h = hb[slot, :, part].astype(jnp.float32)
+                    hb[slot, :, part] = (h + gs * v[:, part]).astype(hb.dtype)
+                v_store(g, s).start()
 
         @pl.when(i + 2 < windows)
         def _():
             w_copy(i + 2).start()
 
-    last = per_head * tiles * heads
-    if last >= 2:
-        o_copy(last - 2).wait()
-    o_copy(last - 1).wait()
+    for g in range(max(0, groups - 2), groups):
+        for s in range(heads):
+            v_store(g, s).wait()
 
 
 def _quantize_rows(x, xb, x_sem, q, x_scale, *, quant_rows):
@@ -463,16 +464,15 @@ def engram_gate(
             pltpu.VMEM((padded, k_dim), FP8),
             pltpu.VMEM((padded, 1), jnp.float32),
             pltpu.VMEM((2, k_dim, window), w.dtype),
-            pltpu.VMEM((2, token_tile, window), hidden.dtype),
-            pltpu.VMEM((2, token_tile, window), hidden.dtype),
+            pltpu.VMEM((2 * heads, token_tile, window), hidden.dtype),
             pltpu.VMEM((padded, LANES), jnp.float32),
             pltpu.VMEM((padded, LANES), jnp.float32),
             pltpu.VMEM((padded, LANES), jnp.float32),
             pltpu.VMEM((heads, padded, 1), jnp.float32),
             stage_sem,
             pltpu.SemaphoreType.DMA((2,)),
-            pltpu.SemaphoreType.DMA((2,)),
-            pltpu.SemaphoreType.DMA((2,)),
+            pltpu.SemaphoreType.DMA((2 * heads,)),
+            pltpu.SemaphoreType.DMA((2 * heads,)),
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=62 * 2**20),
         interpret=pltpu.InterpretParams() if interpret else False,
