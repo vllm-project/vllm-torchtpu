@@ -87,7 +87,6 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCaches,
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
-    LookupResult,
     OffloadKey,
 )
 from vllm.v1.outputs import KVConnectorOutput
@@ -118,6 +117,13 @@ _LOAD_WAIT_MS = 1.5
 # request's block hashes and local hit stay the same. The prefix-aware waiting
 # sort asks for every request in its window on every step.
 _EXTERNAL_HIT_ESTIMATE_TTL_S = 0.25
+
+
+def _local_hit_tokens(request: Request) -> int:
+    """The local HBM hit that the pipeline chunk scheduler records on a
+    request (``_tpu_local_hit_tokens``), with the sub-block tail it strips
+    before asking the connector; 0 for a request it did not record."""
+    return getattr(request, "_tpu_local_hit_tokens", 0)
 
 
 def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
@@ -462,75 +468,21 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             failed_load_req_ids=failed_load_req_ids,
         )
 
-    def _lookup(
-        self, req_status: Any, max_num_new_tokens: int | None = None
-    ) -> int | None:
-        """Upstream's lookup, with partial tails probed only above the local hit.
-
-        A partial-tail boundary at or below the local HBM hit
-        (``_tpu_local_hit_tokens``, which keeps the sub-block tail the
-        scheduler strips before asking the connector) loads nothing HBM does
-        not already hold. Without host_tier_recency, upstream's lookup runs.
-        """
-        if not self._host_tier_recency:
-            return super()._lookup(req_status, max_num_new_tokens)
-        complete_hit = self._lookup_complete_chunks(req_status, max_num_new_tokens)
-        req_status.partial_tail_boundary = None
-        if complete_hit is None or not self.config.supports_partial_tail:
-            return complete_hit
-
-        local_tokens = req_status.num_locally_computed_tokens
-        complete_boundary = local_tokens + complete_hit
-        tokens_per_hash = self.config.tokens_per_hash
-        block_end = complete_boundary + self._partial_tail_block_size
-        max_boundary = min(req_status.req.num_prompt_tokens - 1, block_end - 1)
-        if max_num_new_tokens is not None:
-            max_boundary = min(max_boundary, local_tokens + max_num_new_tokens)
-        if req_status.max_load_tokens is not None:
-            max_boundary = min(max_boundary, local_tokens + req_status.max_load_tokens)
-        max_boundary = round_down(max_boundary, tokens_per_hash)
-        min_boundary = complete_boundary
-        if complete_hit == 0:
-            local_hit = int(getattr(req_status.req, "_tpu_local_hit_tokens", 0) or 0)
-            if local_hit > min_boundary:
-                min_boundary = local_hit
-        if max_boundary <= min_boundary:
-            return complete_hit
-
-        pending = False
-        for boundary in range(max_boundary, min_boundary, -tokens_per_hash):
-            boundary_pending = False
-            boundary_missed = False
-            boundary_keys = []
-            for group_config in self.config.kv_group_configs:
-                key = self._make_boundary_key(
-                    req_status.req,
-                    group_config.group_idx,
-                    boundary,
-                    req_status.req_context,
-                )
-                boundary_keys.append(key)
-                result = self.manager.lookup(key, req_status.req_context)
-                if result is LookupResult.MISS:
-                    boundary_missed = True
-                    break
-                if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
-                    boundary_pending = True
-
-            pending |= boundary_pending
-            if not boundary_missed and not boundary_pending:
-                for group_config, key in zip(
-                    self.config.kv_group_configs, boundary_keys
-                ):
-                    self._events_tracker.record_partial_lookup(
-                        req_status.req, group_config, boundary, key
-                    )
-                req_status.partial_tail_boundary = boundary
-                return boundary - local_tokens
-
-        if pending and complete_hit == 0:
-            return None
-        return complete_hit
+    def _lookup_partial_tail(
+        self, req_status: Any, boundary: int, bridge_pending: bool
+    ) -> tuple[bool, bool]:
+        """Upstream's partial-tail lookup, which skips under host_tier_recency
+        a boundary at or below the local HBM hit inside the block that starts
+        at the locally computed tokens: HBM already holds those tokens, so a
+        hit there loads nothing it lacks. ``_local_hit_tokens`` keeps the
+        sub-block tail the scheduler strips before asking the connector, so
+        the hit ends inside that block."""
+        if self._host_tier_recency:
+            local_tokens = req_status.num_locally_computed_tokens
+            in_local_block = boundary < local_tokens + self._partial_tail_block_size
+            if in_local_block and boundary <= _local_hit_tokens(req_status.req):
+                return False, bridge_pending
+        return super()._lookup_partial_tail(req_status, boundary, bridge_pending)
 
     def get_num_new_matched_tokens(
         self,
@@ -593,28 +545,15 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             # did not).
             self._touch(req_status)
         if num_hit_tokens == 0:
-            local_hit = int(getattr(request, "_tpu_local_hit_tokens", 0) or 0)
+            local_hit = _local_hit_tokens(request)
             if local_hit > num_computed_tokens and req_status is not None:
                 req_status.num_locally_computed_tokens = local_hit
                 if (
                     self.config.supports_partial_tail
                     and local_hit % self._partial_tail_block_size != 0
                     and local_hit % self.config.tokens_per_hash == 0
-                    and local_hit // self.config.tokens_per_hash - 1
-                    < len(request.block_hashes)
                 ):
-                    self.manager.touch(
-                        tuple(
-                            self._make_boundary_key(
-                                request,
-                                group.group_idx,
-                                local_hit,
-                                req_status.req_context,
-                            )
-                            for group in self.config.kv_group_configs
-                        ),
-                        req_status.req_context,
-                    )
+                    self._touch_partial_tail(request, req_status.req_context, local_hit)
         return num_hit_tokens, load_async
 
     def update_state_after_alloc(
@@ -657,7 +596,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         what an active conversation loses first under host pressure.
         """
         local_tokens = int(getattr(req_status, "num_locally_computed_tokens", 0) or 0)
-        local_hit = int(getattr(req_status.req, "_tpu_local_hit_tokens", 0) or 0)
+        local_hit = _local_hit_tokens(req_status.req)
         if local_hit > local_tokens:
             local_tokens = local_hit
         shared_boundary = int(getattr(req_status.req, "shared_prefix_boundary", 0) or 0)
@@ -711,21 +650,31 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         ):
             boundaries_to_touch.append(local_tokens)
         for boundary in boundaries_to_touch:
-            if boundary // self.config.tokens_per_hash - 1 < len(
-                req_status.req.block_hashes
-            ):
-                self.manager.touch(
-                    tuple(
-                        self._make_boundary_key(
-                            req_status.req,
-                            group.group_idx,
-                            boundary,
-                            req_status.req_context,
-                        )
-                        for group in self.config.kv_group_configs
-                    ),
-                    req_status.req_context,
-                )
+            self._touch_partial_tail(req_status.req, req_status.req_context, boundary)
+
+    def _touch_partial_tail(
+        self, request: Request, req_context: Any, boundary: int
+    ) -> None:
+        """Refreshes the keys of the partial tail at ``boundary``: one per
+        group, at the token position upstream keys that group's partial tail
+        at in store, load and lookup (``_partial_tail_key_tokens``). Nothing
+        when the request has no block hash at a key's position yet."""
+        positions = [
+            (group, self._partial_tail_key_tokens(group, boundary))
+            for group in self.config.kv_group_configs
+        ]
+        if any(
+            tokens // self.config.tokens_per_hash - 1 >= len(request.block_hashes)
+            for _, tokens in positions
+        ):
+            return
+        self.manager.touch(
+            tuple(
+                self._make_boundary_key(request, group.group_idx, tokens, req_context)
+                for group, tokens in positions
+            ),
+            req_context,
+        )
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         meta = connector_output.kv_connector_worker_meta

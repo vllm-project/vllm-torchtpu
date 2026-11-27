@@ -1677,6 +1677,7 @@ class TestSchedulerUpstreamContract(unittest.TestCase):
             tokens_per_hash=2,
         )
         sched._partial_tail_block_size = 4
+        sched._eagle_proof_margins = {}
         sched.manager = MagicMock()
         sched._make_boundary_key = MagicMock(return_value="tail6")
         req = SimpleNamespace(
@@ -1806,6 +1807,7 @@ class TestHostTierRecency(unittest.TestCase):
             tokens_per_hash=2,
         )
         sched._partial_tail_block_size = 4
+        sched._eagle_proof_margins = {}
         sched.manager = MagicMock()
         sched._make_boundary_key = lambda req, group_idx, boundary, ctx: (
             "tail",
@@ -1837,6 +1839,31 @@ class TestHostTierRecency(unittest.TestCase):
             ],
         )
 
+    def test_touch_keys_an_eagle_groups_partial_tail_at_its_proof_position(self):
+        """The partial-tail keys a touch refreshes are the keys upstream
+        stores and looks up: an EAGLE group's sits ``margin`` tokens past
+        the boundary (_partial_tail_key_tokens)."""
+        sched = self._sched()
+        sched._eagle_proof_margins = {1: 2}
+        req_status = SimpleNamespace(
+            num_locally_computed_tokens=0,
+            req=SimpleNamespace(block_hashes=[0] * 8, shared_prefix_boundary=0),
+            req_context="ctx",
+            partial_tail_boundary=6,
+            group_states=(
+                SimpleNamespace(offload_keys=[], num_hit_chunks=0),
+                SimpleNamespace(offload_keys=[], num_hit_chunks=0),
+            ),
+        )
+        sched._touch(req_status)
+        touched = [list(c.args[0]) for c in sched.manager.touch.call_args_list]
+        self.assertEqual(touched, [[("tail", 0, 6), ("tail", 1, 8)]])
+        # A key position past the request's last block hash is not touched.
+        req_status.req.block_hashes = [0] * 3
+        sched.manager.touch.reset_mock()
+        sched._touch(req_status)
+        sched.manager.touch.assert_not_called()
+
     def test_full_attention_groups_are_offered_from_chunk_zero_again(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
             OffloadingConnectorScheduler,
@@ -1860,28 +1887,21 @@ class TestHostTierRecency(unittest.TestCase):
                 f"host_tier_recency={recency}",
             )
 
-    def test_lookup_without_recency_is_upstreams(self):
+    def test_lookup_is_upstreams_with_or_without_recency(self):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
             OffloadingConnectorScheduler,
         )
 
         req_status = SimpleNamespace(partial_tail_boundary=None)
-        for recency, expected in ((False, 3), (True, 0)):
+        for recency in (False, True):
             sched = self._sched(recency)
-            sched.config.supports_partial_tail = False
-            sched._lookup_complete_chunks = MagicMock(return_value=0)
             # The class attribute as the engine runs it may be the TPU
-            # fine-prefix wrapper; either way the override must defer to it.
+            # fine-prefix wrapper; either way the scheduler runs it.
             with patch.object(
                 OffloadingConnectorScheduler, "_lookup", return_value=3
             ) as base:
-                self.assertEqual(sched._lookup(req_status, 8), expected)
-            if recency:
-                base.assert_not_called()
-                sched._lookup_complete_chunks.assert_called_once_with(req_status, 8)
-            else:
-                base.assert_called_once_with(req_status, 8)
-                sched._lookup_complete_chunks.assert_not_called()
+                self.assertEqual(sched._lookup(req_status, 8), 3)
+            base.assert_called_once_with(req_status, 8)
 
     def test_fence_acknowledged_stores_launch_largest_first(self):
         # With the option; unset, they launch in acknowledgement order.
@@ -5054,12 +5074,15 @@ class TestResolveDivergentLocalHit(unittest.TestCase):
 
 
 class TestPartialTailLookupWithRecency(unittest.TestCase):
-    """_lookup under host_tier_recency: partial-tail boundaries are probed from
-    the top down, only above the local HBM hit, and a pending boundary makes a
-    lookup with no complete hit wait."""
+    """_lookup under host_tier_recency is upstream's: partial-tail boundaries
+    are probed from the top down, a pending boundary makes a lookup with no
+    complete hit wait, and the override of _lookup_partial_tail skips the
+    boundaries at or below the local HBM hit."""
 
-    def _sched(self, results, complete_hit=0, local_hit=0):
-        """``results`` maps a boundary to the store's answer per group."""
+    def _sched(self, results, complete_hit=0, local_hit=0, margins=None):
+        """``results`` maps a boundary to the store's answer per group, or,
+        with EAGLE proof ``margins`` per group, a (group, key position) key to
+        the store's answer."""
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
         sched = object.__new__(TPURaidenOffloadingScheduler)
@@ -5067,22 +5090,34 @@ class TestPartialTailLookupWithRecency(unittest.TestCase):
         sched.config = SimpleNamespace(
             supports_partial_tail=True,
             tokens_per_hash=2,
-            kv_group_configs=(
-                SimpleNamespace(group_idx=0),
-                SimpleNamespace(group_idx=1),
+            kv_group_configs=tuple(
+                SimpleNamespace(
+                    group_idx=i,
+                    tokens_per_chunk=8,
+                    hashes_per_chunk=1,
+                    requires_cow_source=False,
+                )
+                for i in range(2)
             ),
         )
         sched._partial_tail_block_size = 8
+        sched._eagle_proof_margins = dict(margins or {})
+        sched._max_eagle_proof_margin = max(
+            sched._eagle_proof_margins.values(), default=0
+        )
+        sched._chunks_being_loaded = set()
         sched._events_tracker = MagicMock()
         sched._lookup_complete_chunks = MagicMock(return_value=complete_hit)
         sched._make_boundary_key = lambda req, group_idx, boundary, ctx: (
             group_idx,
             boundary,
         )
-        probed: list[tuple[int, int]] = []
+        probed: list = []
 
         def lookup(key, ctx):
             probed.append(key)
+            if margins is not None:
+                return results.get(key, LookupResult.MISS)
             group_idx, boundary = key
             return results.get(boundary, (LookupResult.MISS,) * 2)[group_idx]
 
@@ -5091,10 +5126,32 @@ class TestPartialTailLookupWithRecency(unittest.TestCase):
             num_locally_computed_tokens=0,
             partial_tail_boundary=123,
             max_load_tokens=None,
-            req=SimpleNamespace(num_prompt_tokens=20, _tpu_local_hit_tokens=local_hit),
+            req=SimpleNamespace(
+                num_prompt_tokens=20,
+                block_hashes=[0] * 10,
+                _tpu_local_hit_tokens=local_hit,
+            ),
             req_context=None,
+            group_states=tuple(
+                SimpleNamespace(
+                    offload_keys=[("chunk", i, 0)], lookup_hit_end_chunk_idx=0
+                )
+                for i in range(2)
+            ),
         )
         return sched, req_status, probed
+
+    def test_an_eagle_group_is_looked_up_at_its_proof_position(self):
+        """vLLM keys an EAGLE group's partial tail ``margin`` tokens past the
+        boundary (_partial_tail_key_tokens) when it stores, loads and looks it
+        up; a lookup at the boundary itself misses it."""
+        sched, status, probed = self._sched(
+            {(0, 4): LookupResult.HIT, (1, 6): LookupResult.HIT}, margins={1: 2}
+        )
+        self.assertEqual(sched._lookup(status), 4)
+        self.assertEqual(status.partial_tail_boundary, 4)
+        self.assertIn((1, 6), probed)
+        self.assertNotIn((1, 4), probed)
 
     def test_the_highest_hit_boundary_is_taken(self):
         hit = (LookupResult.HIT, LookupResult.HIT)
@@ -5119,6 +5176,14 @@ class TestPartialTailLookupWithRecency(unittest.TestCase):
         self.assertEqual(sched._lookup(status), 0)
         self.assertIsNone(status.partial_tail_boundary)
         self.assertEqual(probed, [(0, 6)])
+
+    def test_the_local_hit_floor_applies_only_in_the_local_hits_block(self):
+        hit = (LookupResult.HIT, LookupResult.HIT)
+        # Past a complete hit, a boundary at or below a recorded local hit
+        # lies beyond the block HBM holds, so it is probed and loads.
+        sched, status, probed = self._sched({12: hit}, complete_hit=8, local_hit=12)
+        self.assertEqual(sched._lookup(status), 12)
+        self.assertEqual(status.partial_tail_boundary, 12)
 
     def test_a_pending_boundary_without_a_complete_hit_waits(self):
         for pending in (LookupResult.HIT_PENDING, LookupResult.RETRY):
