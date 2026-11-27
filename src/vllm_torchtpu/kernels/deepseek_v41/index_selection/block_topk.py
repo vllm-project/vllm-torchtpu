@@ -22,12 +22,19 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.publication import Radix
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
+    ORDERED_NEG_INF,
     RADIX_BUCKETS,
     _ordered_bits,
 )
 
 # Score keys per streamed read; see `_chunk`.
 _STREAM_CHUNK = 8192
+# Streamed score buffers per subcore; all but one read in flight. The reads,
+# not the maxima, bound a streamed row: decode's 24 x 148,224 publishing rows
+# take 44.3/39.6/36.9/40.4/40.5 us with 2/3/4/5/6 buffers. The read count sets
+# it (4,096- or 16,384-key chunks match 8,192 at equal depth); deeper queues
+# behind the other subcores' reads.
+_STREAM_BUFFERS = 4
 
 
 def default_blocks(k: int, lanes: int, forced: bool = True) -> int:
@@ -54,10 +61,12 @@ def _chunk(width: int) -> int:
 def _vmem_words(
     rows, width, block_width, k, blocks, block_size, buffers, resident, extra=0
 ):
-    # Resident rows keep whole score rows; streamed rows keep two chunks and
+    # Resident rows keep whole score rows; streamed rows keep their read chunks and
     # the chosen blocks' fetched keys.
     rows_words = (
-        buffers * width if resident else 2 * _chunk(width) + blocks * block_size
+        buffers * width
+        if resident
+        else _STREAM_BUFFERS * _chunk(width) + blocks * block_size
     )
     return (
         rows_words
@@ -155,6 +164,7 @@ def block_topk(
         or lengths.shape != (rows,)
         or not is_supported(rows, width, k, block_size)
         or publish % lanes
+        or 0 < publish < default_blocks(k, lanes)
     ):
         raise ValueError("Unsupported block top-k shapes or dtypes")
     blocks = default_blocks(k, lanes, forced=bool(publish))
@@ -175,12 +185,14 @@ def block_topk(
         ):
             raise ValueError("Unsupported block top-k records")
         page_shift = page_size.bit_length() - 1
-    plan = _plan(rows, width, block_width, k, blocks, block_size)
-    assert plan is not None
+    # Publication also stages the published blocks' maxima (`published_maxima`).
+    plan = _plan(rows, width, block_width, k, blocks, block_size, extra=publish)
+    if plan is None:
+        raise ValueError("Unsupported block top-k shapes or dtypes")
     resident, buffers = plan
     chunk = _chunk(width)
-    # Streamed rows read scores in two alternating chunks.
-    score_words = buffers * width if resident else 2 * chunk
+    # Streamed rows rotate score reads through `_STREAM_BUFFERS` chunks.
+    score_words = buffers * width if resident else _STREAM_BUFFERS * chunk
     mesh = plsc.VectorSubcoreMesh(
         core_axis_name="core",
         subcore_axis_name="subcore",
@@ -219,7 +231,8 @@ def block_topk(
             limits=pltpu.VMEM((_length_words(rows),), jnp.int32),
             # Streamed rows: the chosen blocks' keys, fetched from HBM.
             fetched=pltpu.VMEM((lanes if resident else candidates,), jnp.float32),
-            score_sems=pltpu.SemaphoreType.DMA((2,)),
+            published_maxima=pltpu.VMEM((publish or lanes,), jnp.float32),
+            score_sems=pltpu.SemaphoreType.DMA((max(2, _STREAM_BUFFERS),)),
             output_sem=pltpu.SemaphoreType.DMA,
             length_sem=pltpu.SemaphoreType.DMA,
             publish_sem=pltpu.SemaphoreType.DMA,
@@ -241,6 +254,7 @@ def block_topk(
         output,
         limits,
         fetched,
+        published_maxima,
         score_sems,
         output_sem,
         length_sem,
@@ -282,7 +296,7 @@ def block_topk(
                 row_copy(row_id, slot).start()
 
         def stream_maxima(row_id, tokens):
-            """Reduce the visible chunks' block maxima, reading two chunks ahead."""
+            """Reduce the visible chunks' block maxima, reading chunks ahead."""
             reads = pl.cdiv(tokens, chunk)
 
             def offset(c):
@@ -296,13 +310,16 @@ def block_topk(
                     score_sems.at[s],
                 )
 
-            pl.when(reads > 0)(lambda: read(0, 0).start())
+            depth = _STREAM_BUFFERS
+            for c in range(depth - 1):
+                pl.when(c < reads)(lambda c=c: read(c, c).start())
 
             @pl.loop(0, reads)
             def reduce_chunk(c):
-                s = c % 2
+                s = c % depth
                 read(c, s).wait()
-                pl.when(c + 1 < reads)(lambda: read(c + 1, 1 - s).start())
+                ahead = c + depth - 1
+                pl.when(ahead < reads)(lambda: read(ahead, ahead % depth).start())
 
                 @plsc.parallel_loop(0, chunk // span, unroll=8)
                 def reduce(i):
@@ -443,15 +460,35 @@ def block_topk(
                 publish_copy = pltpu.async_copy(
                     published, publish_ref.at[row_id], publish_sem
                 )
-                # The selection consumed the histogram; refill its top byte.
+                # The top `blocks` blocks are the top `blocks` of the published
+                # ones: both rank the same maxima with the lowest IDs winning
+                # ties, and `publish >= blocks`. Ranking the published blocks'
+                # maxima, in their ascending ID order, emits the same IDs
+                # without rescanning every block.
                 radix.clear()
 
-                @plsc.parallel_loop(0, block_chunks, unroll=8)
-                def refill(i):
-                    radix.add(maxima[pl.ds(i * lanes, lanes)].view(jnp.uint32))
+                @plsc.parallel_loop(0, publish // lanes, unroll=8)
+                def stage_published(i):
+                    ids = published[pl.ds(i * lanes, lanes)]
+                    bits = plsc.load_gather(maxima, [jnp.maximum(ids, 0)])
+                    bits = jnp.where(
+                        ids >= 0, bits.view(jnp.uint32), jnp.uint32(ORDERED_NEG_INF)
+                    )
+                    published_maxima[pl.ds(i * lanes, lanes)] = bits.view(jnp.float32)
+                    radix.add(bits)
 
-            chosen = radix.threshold(maxima, block_chunks, blocks)
-            radix.emit(maxima, block_chunks, blocks, chosen, block_ids)
+                chosen = radix.threshold(published_maxima, publish // lanes, blocks)
+                radix.emit(
+                    published_maxima,
+                    publish // lanes,
+                    blocks,
+                    chosen,
+                    block_ids,
+                    lambda i: published[pl.ds(i * lanes, lanes)],
+                )
+            else:
+                chosen = radix.threshold(maxima, block_chunks, blocks)
+                radix.emit(maxima, block_chunks, blocks, chosen, block_ids)
 
             # Stage 2: the chosen blocks' keys, from the resident row or HBM.
             def owners(i):
