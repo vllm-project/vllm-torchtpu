@@ -20,9 +20,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
     from . import (
-        cache_common,
-        cache_flat,
-        cache_hlo,
+        cache,
+        cache_experimental,
         collectives,
         decls,
         derive,
@@ -46,15 +45,24 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         validate,
         weights,
     )
-    from .cache_common import (
-        should_fuse_pool_io,
-    )
-    from .cache_flat import (
-        make_flat_pooled_step,
-    )
-    from .cache_hlo import (
-        check_fused_pooled_step_hlo,
+    from .cache import (
+        CachePipe,
+        DirectHBM,
+        PallasWriter,
         check_pooled_step_hlo,
+        default_pool_layout,
+        gather_gdn_states,
+        make_flat_pooled_step,
+        make_pooled_step,
+        pool_to_states,
+        scatter_pool_states,
+        should_fuse_pool_io,
+        states_to_pool,
+    )
+    from .cache_experimental import (
+        check_fused_pooled_step_hlo,
+        make_flat_fused_pooled_step,
+        make_fused_pooled_step,
     )
     from .collectives import AllReduceRing
     from .dma import (
@@ -188,9 +196,8 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
 # (e.g. `runtime.contract`) doesn't import jax through this package.
 _SUBMODULES = frozenset(
     {
-        "cache_common",
-        "cache_flat",
-        "cache_hlo",
+        "cache",
+        "cache_experimental",
         "collectives",
         "decls",
         "derive",
@@ -320,10 +327,21 @@ _LAZY: dict[str, str] = {
     "fold": ".kernel",
     "make_step": ".kernel",
     "unfold": ".kernel",
-    "should_fuse_pool_io": ".cache_common",
-    "make_flat_pooled_step": ".cache_flat",
-    "check_fused_pooled_step_hlo": ".cache_hlo",
-    "check_pooled_step_hlo": ".cache_hlo",
+    "CachePipe": ".cache",
+    "DirectHBM": ".cache",
+    "PallasWriter": ".cache",
+    "check_pooled_step_hlo": ".cache",
+    "default_pool_layout": ".cache",
+    "gather_gdn_states": ".cache",
+    "make_flat_pooled_step": ".cache",
+    "make_pooled_step": ".cache",
+    "pool_to_states": ".cache",
+    "scatter_pool_states": ".cache",
+    "should_fuse_pool_io": ".cache",
+    "states_to_pool": ".cache",
+    "check_fused_pooled_step_hlo": ".cache_experimental",
+    "make_flat_fused_pooled_step": ".cache_experimental",
+    "make_fused_pooled_step": ".cache_experimental",
 }
 
 __all__ = [
@@ -336,8 +354,10 @@ __all__ = [
     "ArrayOps",
     "Baseline",
     "CacheExec",
+    "CachePipe",
     "CompareMode",
     "DebugOptions",
+    "DirectHBM",
     "EligibilityResult",
     "Embedding",
     "EmbeddingModule",
@@ -372,6 +392,7 @@ __all__ = [
     "Norm",
     "NormModule",
     "OutputRole",
+    "PallasWriter",
     "ParamInit",
     "ParamTransform",
     "PoolBackend",
@@ -395,10 +416,9 @@ __all__ = [
     "WeightSource",
     "allocate_test_layout",
     "build",
-    "cache_common",
+    "cache",
     "cache_exec",
-    "cache_flat",
-    "cache_hlo",
+    "cache_experimental",
     "check_fused_pooled_step_hlo",
     "check_pooled_step_hlo",
     "col_chunk",
@@ -406,6 +426,7 @@ __all__ = [
     "conv_to_raw_page",
     "decls",
     "default_eplb_cores",
+    "default_pool_layout",
     "default_tiles",
     "derive",
     "derive_pool_layout",
@@ -418,6 +439,7 @@ __all__ = [
     "fit_default_tiles",
     "fitted_plan",
     "fold",
+    "gather_gdn_states",
     "geometry",
     "get_model",
     "get_profile",
@@ -425,8 +447,11 @@ __all__ = [
     "kv_to_raw_page",
     "list_models",
     "list_profiles",
+    "make_flat_fused_pooled_step",
     "make_flat_pooled_step",
+    "make_fused_pooled_step",
     "make_pool_backend",
+    "make_pooled_step",
     "make_step",
     "model_def",
     "model_default_profile",
@@ -439,6 +464,7 @@ __all__ = [
     "planner",
     "pool",
     "pool_alias",
+    "pool_to_states",
     "profile",
     "profiles",
     "random_spec_inputs",
@@ -450,10 +476,12 @@ __all__ = [
     "register_model",
     "register_profile",
     "round_up",
+    "scatter_pool_states",
     "schedule",
     "should_fuse_pool_io",
     "spec",
     "ssm_to_raw_pages",
+    "states_to_pool",
     "stream",
     "unfold",
     "validate",
