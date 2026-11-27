@@ -941,6 +941,13 @@ class TpuPlatform(Platform):
 
             patch_executor_for_pp_buffered(vllm_config)
             _configure_pipeline_chunks(vllm_config)
+        # Before the model loads: a tpu_pp_scheduler section this engine
+        # cannot run fails here, not when the scheduler is built.
+        from vllm_torchtpu.core.pp_chunk_scheduler import (
+            check_options as check_pp_scheduler_options,
+        )
+
+        check_pp_scheduler_options(vllm_config)
 
         from vllm.config import CompilationMode
 

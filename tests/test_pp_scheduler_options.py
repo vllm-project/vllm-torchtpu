@@ -39,7 +39,10 @@ from vllm_torchtpu.core import (
     pp_scheduler_options,
     scheduler_options,
 )
-from vllm_torchtpu.core.pp_chunk_scheduler import TpuPipelineChunkScheduler
+from vllm_torchtpu.core.pp_chunk_scheduler import (
+    SCHEDULER_CLS,
+    TpuPipelineChunkScheduler,
+)
 from vllm_torchtpu.core.pp_chunks import StepCostModel, step_limit
 from vllm_torchtpu.core.prefix_aware_scheduler import (
     PrefixAwareAdmission,
@@ -318,16 +321,67 @@ def test_quadratic_cost_opts_the_pool_into_the_memo_without_the_admission():
     assert not s._prefix_aware and not s._paw_sort and not s._promote_waiting
 
 
+def _checked(
+    additional,
+    kv_role="kv_producer",
+    pp=8,
+    scheduler_cls=SCHEDULER_CLS,
+    equal_cost=True,
+):
+    """Runs the platform's start-up check of the section on an engine with
+    ``pp`` stages and ``scheduler_cls`` (the platform sets this scheduler's
+    class when it sizes pipeline chunks)."""
+    cfg = SimpleNamespace(
+        additional_config=additional,
+        kv_transfer_config=None if kv_role is None else _kv(kv_role),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=pp, data_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(
+            scheduler_cls=scheduler_cls, enable_chunked_prefill=True
+        ),
+    )
+    with patch.object(pp_chunk_scheduler.envs, "TPU_PP_EQUAL_COST_CHUNKS", equal_cost):
+        pp_chunk_scheduler.check_options(cfg)
+
+
 def test_quadratic_cost_needs_the_equal_cost_model():
     # Without equal-cost chunking the stages are not timed and no cost model
     # exists to price the attention pairs, so the option is refused.
+    quadratic = {"tpu_pp_scheduler": {"quadratic_cost": True}}
     with pytest.raises(ValueError, match="TPU_PP_EQUAL_COST_CHUNKS"):
-        _built({"tpu_pp_scheduler": {"quadratic_cost": True}}, equal_cost=False)
-    s, _ = _built({"tpu_pp_scheduler": {"quadratic_cost": True}})
-    assert s._quadratic_cost
+        _checked(quadratic, equal_cost=False)
+    _checked(quadratic)
     # The prefix-aware admission needs no cost model.
+    _checked({"tpu_pp_scheduler": {"prefix_aware": True}}, equal_cost=False)
     s, _ = _built({"tpu_pp_scheduler": {"prefix_aware": True}}, equal_cost=False)
     assert s._prefix_aware and not s._quadratic_cost
+
+
+@pytest.mark.parametrize(
+    "pp, scheduler_cls, why",
+    [
+        (1, None, "more than one pipeline stage"),
+        (8, "x.Y", "scheduler x.Y is configured"),
+    ],
+)
+def test_a_section_without_the_chunk_scheduler_fails_at_start_up(
+    pp, scheduler_cls, why
+):
+    """Set on an engine that does not run this scheduler, the section would
+    be ignored; the platform's config check refuses it before the model
+    loads, whatever it holds."""
+    for section in ({}, {"prefix_aware": True}):
+        with pytest.raises(ValueError, match=why):
+            _checked({"tpu_pp_scheduler": section}, pp=pp, scheduler_cls=scheduler_cls)
+    # Without the section nothing is refused.
+    _checked({}, pp=pp, scheduler_cls=scheduler_cls)
+    _checked(None, pp=pp, scheduler_cls=scheduler_cls)
+
+
+def test_a_malformed_section_fails_at_start_up():
+    with pytest.raises(ValueError, match="unknown keys"):
+        _checked({"tpu_pp_scheduler": {"prefix_awre": True}})
 
 
 def test_promotion_needs_prefix_aware_and_follows_promote_warmest():
@@ -408,10 +462,11 @@ def test_retention_follows_the_option_on_a_kv_producer():
     s, _ = _built(_RETAIN, kv_role="kv_producer", retention_enabled=False)
     assert s._retention is None
     # The option keeps snapshots for a later turn's prefill: refused off a
-    # KV producer.
+    # KV producer, at start-up.
+    _checked(_RETAIN, kv_role="kv_producer")
     for kv_role in ("kv_consumer", "kv_both", None):
         with pytest.raises(ValueError, match="hybrid_state_retention"):
-            _built(_RETAIN, kv_role=kv_role)
+            _checked(_RETAIN, kv_role=kv_role)
 
 
 @pytest.mark.parametrize(

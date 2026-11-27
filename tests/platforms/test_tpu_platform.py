@@ -621,6 +621,24 @@ class TestTpuPlatform:
         TpuPlatform.check_and_update_config(vllm_config)
 
     @pytest.mark.parametrize(
+        "section",
+        [{"prefix_aware": True}, {"not_an_option": True}],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_check_and_update_config_refuses_a_pp_scheduler_section_it_cannot_run(
+        self, mock_prepare_env, mock_apply_patches, vllm_config, section
+    ):
+        """The tpu_pp_scheduler section is parsed at the config check, before
+        the model loads: on a one-stage engine (no pipeline chunk scheduler)
+        it is refused, whatever it holds."""
+        vllm_config.additional_config = {"tpu_pp_scheduler": section}
+        with pytest.raises(ValueError, match="tpu_pp_scheduler"):
+            TpuPlatform.check_and_update_config(vllm_config)
+
+    @pytest.mark.parametrize(
         "connector_name",
         [
             "DecodeBenchConnector",

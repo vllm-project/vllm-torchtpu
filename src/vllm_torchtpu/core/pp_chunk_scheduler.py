@@ -154,6 +154,49 @@ def pipeline_chunks_off_reason(vllm_config: Any) -> str | None:
     return None
 
 
+def check_options(vllm_config: Any) -> None:
+    """Parse ``additional_config["tpu_pp_scheduler"]`` at start-up, before
+    the model loads: the platform's config check calls this for every engine,
+    after it has decided whether to install this scheduler.
+
+    Raises ``ValueError`` for a malformed section; for a section set on an
+    engine that does not run this scheduler (``uses_dynamic_chunks`` is
+    false), where it would be ignored; for ``quadratic_cost`` without
+    equal-cost chunking, whose step cost model it prices with; and for
+    ``hybrid_state_retention`` off a KV producer.
+    """
+    options = pp_scheduler_options.get(vllm_config)
+    section = pp_scheduler_options.SECTION
+    additional = vllm_config.additional_config
+    if (
+        isinstance(additional, dict)
+        and section in additional
+        and not uses_dynamic_chunks(vllm_config)
+    ):
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            why = pipeline_chunks_off_reason(vllm_config)
+        else:
+            why = "it runs only with more than one pipeline stage"
+        raise ValueError(
+            f"additional_config.{section} sets options of the pipeline chunk "
+            f"scheduler, which this engine does not run: {why}"
+        )
+    if options.quadratic_cost and not envs.TPU_PP_EQUAL_COST_CHUNKS:
+        # The stages are timed for the step cost model only under equal-cost
+        # chunking.
+        raise ValueError(
+            f"additional_config.{section}.quadratic_cost prices prefill work "
+            "with the equal-cost step cost model; it needs "
+            "TPU_PP_EQUAL_COST_CHUNKS on"
+        )
+    if options.hybrid_state_retention and not retention_wanted(vllm_config):
+        raise ValueError(
+            f"additional_config.{section}.hybrid_state_retention keeps the "
+            "snapshots a later turn hits on a KV producer (a prefill leg); "
+            "this engine's kv_role is not kv_producer"
+        )
+
+
 def _prefill_end(request: Any) -> int:
     return max(request.num_prompt_tokens, request.num_tokens - 1)
 
@@ -195,22 +238,9 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         roles = kv_roles(self.vllm_config.kv_transfer_config)
         self._is_kv_producer = roles.producer
         self._is_kv_consumer = roles.consumer
+        # The platform's config check (check_options) has already refused
+        # a section this engine cannot run.
         options = pp_scheduler_options.get(self.vllm_config)
-        if options.quadratic_cost and not self._equal_cost:
-            # The quadratic pricing runs on the equal-cost step cost model,
-            # which the stages are timed for only under equal-cost chunking.
-            raise ValueError(
-                f"additional_config.{pp_scheduler_options.SECTION}.quadratic_cost "
-                "prices prefill work with the equal-cost step cost model; it "
-                "needs TPU_PP_EQUAL_COST_CHUNKS on"
-            )
-        if options.hybrid_state_retention and not retention_wanted(self.vllm_config):
-            raise ValueError(
-                f"additional_config.{pp_scheduler_options.SECTION}."
-                "hybrid_state_retention keeps the snapshots a later turn hits "
-                "on a KV producer (a prefill leg); this engine's kv_role is "
-                "not kv_producer"
-            )
         self._quadratic_cost = options.quadratic_cost
         self._prefix_aware = options.prefix_aware
         # The aging rate is read only by the prefix-aware orders.
