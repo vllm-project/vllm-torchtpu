@@ -60,7 +60,7 @@ import sys
 from typing import TYPE_CHECKING, Any
 
 from vllm_torchtpu import utils
-from vllm_torchtpu.compilation import fast_dispatch
+from vllm_torchtpu.compilation import compile_options
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner import fast_forward_context, runner_options
 
@@ -108,7 +108,7 @@ def configure(vllm_config: Any) -> None:
     AOT_SKIP_GUARDS = enabled
     CONN_STATS_EVERY = CONN_STATS_EVERY_ON if enabled else 1
     fast_forward_context.set_enabled(enabled)
-    fast_dispatch.configure_guard_memo(enabled)
+    compile_options.set_guard_memo(enabled)
     utils.cache_dp_size(enabled)
     SWITCH_US = options.switch_interval_us
     GC_FREEZE = options.gc_freeze

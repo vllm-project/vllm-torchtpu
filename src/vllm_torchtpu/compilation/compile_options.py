@@ -71,3 +71,12 @@ def apply(vllm_config: "VllmConfig | None") -> CompileOptions:
     options = get(vllm_config)
     fast_dispatch.configure(fast=options.fast_compiled_call)
     return options
+
+
+def set_guard_memo(enabled: bool) -> None:
+    """Turn ``fast_dispatch``'s guard memo on or off for this process.
+    ``runner.host_trims`` calls it under its batch-1 rule; like :func:`apply`,
+    it keeps ``fast_dispatch`` out of every other module's imports."""
+    from vllm_torchtpu.compilation import fast_dispatch
+
+    fast_dispatch.configure_guard_memo(enabled)
