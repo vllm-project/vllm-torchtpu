@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS: str = ""
     TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS: int = 0
     TPU_DCP_MLA_OUT_VMEM_MIB: int = 32
+    TPU_MLA_SEND_LAYOUT_VMEM_CAP: bool = False
     TPU_SMALL_COLL_HBM_OPERAND: bool = True
     TPU_DCP_MERGE_CHUNKED_SMALL: int = 2
     TPU_DCP_MLA_MERGE_PIECES: int = 2
@@ -802,6 +803,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # prefetches it may run under the call). The kernel's scratch is ~13 MiB
     # at T = 64; 32 is the pinned fused small all-to-all calls' limit.
     "TPU_DCP_MLA_OUT_VMEM_MIB": env_int("TPU_DCP_MLA_OUT_VMEM_MIB", 32),
+    # The send-layout decode MLA call without the fused small all-to-all
+    # (TPU_DCP_MLA_SEND_LAYOUT calls that take neither the fused exchange nor
+    # TPU_DCP_MLA_OUT_VMEM_MAX_TOKENS' path) takes a 32 MiB scoped VMEM limit,
+    # never below its own scratch plus 8 MiB, instead of the default, so XLA
+    # can keep o_proj's weight prefetch live across it; its array operands and
+    # its send buffer stay in HBM. Same bits; placement only. Off: unchanged
+    # kernel. The attention layer passes it to the kernel at trace time, so set
+    # it before the process starts. Off by default because its serving gain was
+    # measured only where every smaller decode bucket takes the fused exchange
+    # (TPU_MLA_FUSED_SMALL_A2A_4CHIP_BUCKETS), so one call was capped; without
+    # that, the 8- and 16-token calls are capped too, which was not measured. A
+    # serving A/B in that configuration would decide whether it can default on.
+    "TPU_MLA_SEND_LAYOUT_VMEM_CAP": env_bool(
+        "TPU_MLA_SEND_LAYOUT_VMEM_CAP", default=False
+    ),
     # The DCP small all-gather (TPU_DCP_INDEXER_SMALL_AG) and small all-to-all
     # (TPU_DCP_MLA_SEND_SMALL_A2A) take their data operand constrained to HBM.
     # Unconstrained (pl.ANY), XLA stages it into VMEM with a copy-start/-done
