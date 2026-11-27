@@ -2232,7 +2232,7 @@ def decode_combine_applies(t_local):
 
 
 def _build_combine_decode_kernel(
-    *, t_local, topk, mirror_lanes, lane_blocks, wire_dtype, out_dtype
+    *, t_local, topk, mirror_lanes, lane_blocks, wire_dtype, out_dtype, out_scale=None
 ):
     """out[i] = sum_k scales[scl[i, k]] * w[i, k] * arrivals[pos[i, k]], for a
     decode step's few tokens.
@@ -2247,10 +2247,15 @@ def _build_combine_decode_kernel(
     land in SMEM and the lane is read there. `keep` (one 0/1 a token) marks
     the tokens that route: the rest (a bucket's padding) fetch nothing and
     come out zero, and a kept token's terms are unchanged.
+
+    With `out_scale`, the call also takes an addend of the output's shape and
+    returns `fold_scaled_add(combine, addend, out_scale)` as the fs combine
+    does, the unrouted tokens' combine being zero.
     """
     n = t_local * topk
     gt = COMBINE_GROUP
     hidden = lane_blocks * HIDDEN_LANE_BLOCK
+    fold = out_scale is not None
 
     def kernel(
         pos_sm,
@@ -2260,14 +2265,13 @@ def _build_combine_decode_kernel(
         keep_sm,
         scales_hbm,
         arr_hbm,
-        out_ref,
-        rows_vm,
-        scl_sm,
-        tile_vm,
-        kept_sm,
-        pad_sm,
-        sems,
+        *refs,
     ):
+        if fold:
+            add_ref, out_ref, rows_vm, scl_sm, tile_vm, kept_sm, pad_sm, sems = refs
+        else:
+            out_ref, rows_vm, scl_sm, tile_vm, kept_sm, pad_sm, sems = refs
+
         def compact(i, kept):
             # Both written every token; each kept only where its count
             # advances past it.
@@ -2330,7 +2334,10 @@ def _build_combine_decode_kernel(
         lax.fori_loop(0, kept, reduce_token, jnp.int32(0))
         lax.fori_loop(0, t_local - kept, zero_token, jnp.int32(0))
         for g in range(t_local // gt):
-            out_ref[pl.ds(g * gt, gt)] = tile_vm[pl.ds(g * gt, gt)].reshape(gt, hidden)
+            rows = tile_vm[pl.ds(g * gt, gt)].reshape(gt, hidden)
+            if fold:
+                rows = fold_scaled_add(rows, add_ref[pl.ds(g * gt, gt)], out_scale)
+            out_ref[pl.ds(g * gt, gt)] = rows
 
     rows_bytes = n * lane_blocks * HIDDEN_LANE_BLOCK * jnp.dtype(wire_dtype).itemsize
     tile_bytes = t_local * hidden * jnp.dtype(out_dtype).itemsize
@@ -2338,7 +2345,8 @@ def _build_combine_decode_kernel(
         kernel,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=5,
-            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)] * 2,
+            in_specs=[pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)] * 2
+            + [pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM)] * fold,
             out_specs=pl.BlockSpec(memory_space=pltpu.MemorySpace.VMEM),
             scratch_shapes=(
                 pltpu.VMEM((n, lane_blocks, HIDDEN_LANE_BLOCK), wire_dtype),
@@ -2354,16 +2362,16 @@ def _build_combine_decode_kernel(
         # Only what the call holds (plus slack for Mosaic's own scratch), so
         # XLA can keep the layer's neighbouring values in VMEM around it.
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=rows_bytes + 2 * tile_bytes + (2 << 20),
+            vmem_limit_bytes=rows_bytes + (2 + fold) * tile_bytes + (2 << 20),
             disable_bounds_checks=True,
         ),
-        name=f"moe_combine_decode_t{t_local}_k{topk}",
+        name=f"moe_combine_decode_t{t_local}_k{topk}" + ("_add" if fold else ""),
     )
 
     # One jit around the call: the HBM pins below are only for the pallas_call
     # to read, and an eager shard_map would hand them to other primitives.
     @jax.jit
-    def pinned_call(pos, sub, lane, tw, keep, arrival_scales, arrivals):
+    def pinned_call(pos, sub, lane, tw, keep, arrival_scales, arrivals, *addend):
         # Left in HBM: only t_local * topk rows and sublanes are read, and
         # otherwise XLA stages both whole buffers into VMEM ahead of the call.
         return call(
@@ -2374,9 +2382,12 @@ def _build_combine_decode_kernel(
             keep,
             pltpu.with_memory_space_constraint(arrival_scales, pltpu.HBM),
             pltpu.with_memory_space_constraint(arrivals, pltpu.HBM),
+            *addend,
         )
 
-    def fn(arrivals, arrival_scales, scl, topk_weights, pos, keep):
+    def fn(arrivals, arrival_scales, scl, topk_weights, pos, keep, addend=None):
+        if fold != (addend is not None):
+            raise ValueError("the addend goes with out_scale, and only with it")
         # Token-major tables, like the fs combine.
         scl = scl.astype(jnp.int32).reshape(-1)
         return pinned_call(
@@ -2387,6 +2398,7 @@ def _build_combine_decode_kernel(
             keep.astype(jnp.int32).reshape(-1),
             arrival_scales.astype(jnp.float32),
             arrivals,
+            *(() if addend is None else (addend,)),
         )
 
     return fn

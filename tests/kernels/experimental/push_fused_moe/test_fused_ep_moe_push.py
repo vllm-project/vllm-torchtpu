@@ -442,22 +442,26 @@ def test_tc_exchange_all_gather_equals_lax_all_gather(width):
     np.testing.assert_array_equal(np.asarray(tc)[0], np.asarray(data).reshape(-1))
 
 
+@pytest.mark.parametrize("fold", [False, True], ids=["plain", "fold"])
 @pytest.mark.parametrize(
     "t_local,topk,n_valid",
     [(16, 6, None), (64, 6, None), (16, 3, None), (16, 6, 6), (16, 6, 12), (64, 6, 37)],
 )
-def test_decode_combine_matches_xla_epilogue(t_local, topk, n_valid):
+def test_decode_combine_matches_xla_epilogue(t_local, topk, n_valid, fold):
     """At decode sizes the combine is the one-pass kernel; it gives v2's XLA
     epilogue bit for bit, unwritten (NaN) mirror entries and repeated arrival
     rows included. With `n_valid`, the tokens past it and one before it route
     nowhere, as a bucket's padding does (weight 0, position past the arrivals,
     clamped onto an unwritten NaN row): the routed rows stay bit for bit, and
-    the rest are the zeros the layer would make of them."""
+    the rest are the zeros the layer would make of them. With `fold` the
+    kernel also scales and adds an addend exactly as those ops do compiled
+    after it."""
     from vllm_torchtpu.kernels.experimental.push_fused_moe.kernel import (
         decode_combine_applies,
     )
     from vllm_torchtpu.kernels.experimental.push_fused_moe.layer import (
         _combine_arrivals_fs,
+        _fold,
     )
     from vllm_torchtpu.kernels.fused_moe.v2.layer import _combine_arrivals
 
@@ -482,17 +486,24 @@ def test_decode_combine_matches_xla_epilogue(t_local, topk, n_valid):
         weights[~routes] = 0
     args = (arrivals, jnp.asarray(scales), jnp.asarray(pos), jnp.asarray(mirror_pos))
     args += (jnp.asarray(weights),)
+    extra = ()
+    if fold:
+        addend = rng.normal(0, 1, (t_local, lane_blocks * 128))
+        addend *= rng.choice([1e-39, 1e-3, 1.0, 40.0], addend.shape)
+        extra = (jnp.asarray(routes), jnp.asarray(addend, jnp.bfloat16), 1.5)
 
     def fs(*a):
         routed = None if n_valid is None else jnp.asarray(routes)
-        return _combine_arrivals_fs(*a, jnp.bfloat16, routes=routed)
+        return _combine_arrivals_fs(*a, jnp.bfloat16, fold=extra or None, routes=routed)
 
     def xla(*a):
         out = _combine_arrivals(*a, jnp.bfloat16)
+        if fold:
+            return _fold(out, *extra)
         return jnp.where(jnp.asarray(routes)[:, None], out, jnp.zeros_like(out))
 
-    got = jax.jit(fs)(*args)
-    want = jax.jit(xla)(*args)
+    got = jax.jit(fs, compiler_options=_AS_SERVED)(*args)
+    want = jax.jit(xla, compiler_options=_AS_SERVED)(*args)
     assert np.isfinite(np.asarray(got, np.float32)).all()
     np.testing.assert_array_equal(
         np.asarray(got).view(np.uint16), np.asarray(want).view(np.uint16)

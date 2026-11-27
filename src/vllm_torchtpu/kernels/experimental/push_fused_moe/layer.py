@@ -178,7 +178,8 @@ def _combine_arrivals_fs(
 
     `routes` [t_local] bool marks the tokens that route (None: all). The
     decode combine skips the rest and returns zero rows for them; the other
-    paths still read them, and their rows are left for the caller to zero."""
+    paths still read them, and their rows are left for the caller to zero.
+    With `fold`, the decode combine takes fold's keep as `routes`."""
     t_local, topk = pos.shape
     recv_rows, lane_blocks, lanes = arrivals.shape
     mirror_sublanes, tile_m = arrival_scales.shape
@@ -194,11 +195,17 @@ def _combine_arrivals_fs(
             lane_blocks=lane_blocks,
             wire_dtype=arrivals.dtype,
             out_dtype=out_dtype,
+            out_scale=None if fold is None else fold[2],
         )
-        if routes is None:
+        if fold is not None:
+            # The kernel zeroes the tokens that do not route: fold's keep.
+            routes = fold[0]
+        elif routes is None:
             routes = jnp.ones((t_local,), jnp.bool_)
-        combined = combine(arrivals, arrival_scales, scl, topk_weights, rows, routes)
-        return combined if fold is None else _fold(combined, *fold)
+        addend = None if fold is None else fold[1]
+        return combine(
+            arrivals, arrival_scales, scl, topk_weights, rows, routes, addend
+        )
     # v2's step rule keeps its COMBINE_MIN_TOKENS floor; the fs kernel tiles
     # by its own chunk.
     if combine_step_tokens(t_local) and fs_combine_chunk(t_local, topk):
