@@ -25,12 +25,14 @@ from typing import TYPE_CHECKING, ClassVar, get_args
 
 from vllm_torchtpu.megakernel.core import errors
 
+from .calibrate import CalibrateOptions, calibrate_trace
 from .chips import BUILTIN_CHIP_SPECS, ChipSpec, resolve_chip_spec
 from .constants import (
     CHIP_KIND_MAP,
     CORE_LIMITS,
     DEFAULT_CHIP,
     DEFAULT_DECODE_OSL,
+    DEFAULT_PHASE,
     DEFAULT_PREFILL_ISL,
     DEFAULT_PREFILL_OSL,
     HBM_UTILIZATION_CAP,
@@ -70,6 +72,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
 __all__ = [
+    "build_calibrate_arg_parser",
     "build_parser",
     "derive_decoding_sequences",
     "format_model_listing",
@@ -841,6 +844,81 @@ def _dispatch(args: argparse.Namespace) -> int:
     return _run_single_command(args, profile, chip_spec, args.measurements)
 
 
+def build_calibrate_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser for `advisor calibrate`."""
+    parser = argparse.ArgumentParser(
+        prog="python -m vllm_torchtpu.megakernel.advisor calibrate",
+        description="Calibrate TPU megakernel advisor priors from XPlane/Perfetto.",
+    )
+    parser.add_argument(
+        "--trace",
+        required=True,
+        help="Path to .xplane.pb, profile directory, or Perfetto .json/.json.gz",
+    )
+    parser.add_argument(
+        "--out",
+        required=True,
+        help="Destination path for advisor.measurements.v1 JSON",
+    )
+    parser.add_argument("--chip", default=DEFAULT_CHIP)
+    parser.add_argument("--model", default=None)
+    parser.add_argument(
+        "--num-layers",
+        type=_MinIntArg("--num-layers", 1),
+        default=None,
+        help=(
+            "Per-rank decoder layers for conserved boundary normalization "
+            "(required override over --model when pp > 1)."
+        ),
+    )
+    parser.add_argument(
+        "--phase",
+        choices=get_args(Phase),
+        default=DEFAULT_PHASE,
+    )
+    parser.add_argument("--batch", type=int, default=None)
+    parser.add_argument("--tp", type=int, default=None)
+    return parser
+
+
+def _validate_calibrate_cli_values(args: argparse.Namespace) -> tuple[str, str]:
+    """Validate non-empty paths/names and output destination for `calibrate`."""
+    trace_str = args.trace.strip()
+    if not trace_str:
+        msg = "--trace path must not be empty"
+        raise errors.MegakernelConfigError(msg)
+    out_str = args.out.strip()
+    if not out_str or out_str == "-":
+        msg = "--out must be a non-empty file path"
+        raise errors.MegakernelConfigError(msg)
+    if Path(out_str).is_dir():
+        msg = f"--out path is a directory: {args.out!r}"
+        raise errors.MegakernelConfigError(msg)
+    if not args.chip.strip():
+        msg = "--chip must not be empty"
+        raise errors.MegakernelConfigError(msg)
+    if args.model is not None and not args.model.strip():
+        msg = "--model must not be empty"
+        raise errors.MegakernelConfigError(msg)
+    return trace_str, out_str
+
+
+def _run_calibrate_cli(argv: Sequence[str]) -> int:
+    """Parse arguments and execute the `calibrate` subcommand."""
+    args = build_calibrate_arg_parser().parse_args(list(argv))
+    trace_str, out_str = _validate_calibrate_cli_values(args)
+    calibrate_options = CalibrateOptions(
+        chip=args.chip,
+        model=args.model,
+        phase=args.phase,
+        batch=args.batch,
+        tp=args.tp,
+        num_layers=args.num_layers,
+    )
+    calibrate_trace(trace_str, out_str, options=calibrate_options)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the fusion-scope advisor command-line interface.
 
@@ -848,6 +926,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         Process exit status code.
     """
     argv_list = list(sys.argv[1:] if argv is None else argv)
+    if argv_list and argv_list[0] == "calibrate":
+        return _run_calibrate_cli(argv_list[1:])
     if argv_list and argv_list[0] == "estimate":
         argv_list = argv_list[1:]
     return _dispatch(build_parser().parse_args(argv_list))

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from . import (
+    calibrate,
     chips,
     cli,
     constants,
@@ -28,8 +29,19 @@ from . import (
     verdict,
     vmem,
 )
+from .calibrate import (
+    CalibrateOptions,
+    CalibrationPayload,
+    CalibrationSourceMeta,
+    CollectiveSummary,
+    QuantileSummary,
+    StepCoverageSummary,
+    XPlaneToolUnavailableError,
+    calibrate_trace,
+)
 from .chips import TPU7X_TOPOLOGIES, ChipSpec, resolve_chip_spec
 from .cli import (
+    build_calibrate_arg_parser,
     build_parser,
     derive_decoding_sequences,
     format_model_listing,
@@ -95,7 +107,11 @@ __all__ = [
     "TPU7X_TOPOLOGIES",
     "AdvisorReport",
     "AdvisorSweepReport",
+    "CalibrateOptions",
+    "CalibrationPayload",
+    "CalibrationSourceMeta",
     "ChipSpec",
+    "CollectiveSummary",
     "CoreLimits",
     "DisaggHandoffSpec",
     "EfficiencySpec",
@@ -110,15 +126,21 @@ __all__ = [
     "ParallelismRecommendation",
     "ParallelismSearchOptions",
     "Phase",
+    "QuantileSummary",
     "RegimeEntry",
     "RegimeSweepOptions",
     "RingPlan",
     "ScopeEstimate",
+    "StepCoverageSummary",
     "UnsupportedArchitectureError",
     "WorkloadSpec",
+    "XPlaneToolUnavailableError",
     "advise",
     "advise_regimes",
+    "build_calibrate_arg_parser",
     "build_parser",
+    "calibrate",
+    "calibrate_trace",
     "chips",
     "cli",
     "compare_parallelism_candidates",
