@@ -103,8 +103,24 @@ per rank, for an external load balancer such as llm-d), add
 `--data-parallel-multi-port-external-lb --data-parallel-size-local 4` and
 `--additional-config '{"tpu_multiport_dp": {"enabled": true}}'`. Rank `r`
 then serves on `--port + r`. All ranks must run on one host: the server refuses
-the option with `--nnodes > 1` or `TPU_MULTIHOST_BACKEND=ray`. To spread
-requests over the ranks with the proxy below, list each rank in it:
+the option with `--nnodes > 1` or `TPU_MULTIHOST_BACKEND=ray`, and
+`--data-parallel-size-local` must equal `--data-parallel-size`. Each rank sets
+up the TPU slice of all `--data-parallel-size` ranks, so with a smaller local
+size that slice includes ranks this host never starts; the server cannot check
+this, because vLLM starts every rank with a local size of 1. The ranks also
+use fixed ports on the host, which must be free (`--data-parallel-rpc-port` is
+29550 and `TORCH_TPU_BASE_PORT` 8070 by default):
+
+* `--data-parallel-rpc-port + 1`: the TorchTPU DP master port, unless
+  `TORCH_TPU_DP_MASTER_PORT` is set.
+* `--data-parallel-rpc-port + 100` to `+ 104`: vLLM's DP group ports.
+* `TORCH_TPU_BASE_PORT + i` for each device of the slice, that is
+  `--data-parallel-size` × `--tensor-parallel-size` ×
+  `--pipeline-parallel-size` × `--prefill-context-parallel-size` devices: the
+  slicebuilder addresses, unless `TORCH_TPU_SLICEBUILDER_ADDRESSES` lists one
+  address per device.
+
+To spread requests over the ranks with the proxy below, list each rank in it:
 `--decoder-hosts` once per rank and `--decoder-ports 9400 9401 9402 9403`.
 
 ### Step 4: Launch the Disaggregated Proxy Server
