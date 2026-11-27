@@ -20,8 +20,9 @@ all-gathered the group's new k / v / index_q (ops/msa.py `gather_group_kv`):
 a latency-bound collective on the TensorCore at decode sizes. With the flag,
 qkv_proj also holds the k / v / index_q columns of the group's other KV heads
 (``group_weight`` / ``group_scale``, gathered once after loading). Steps of
-fewer than `MAX_TOKENS` tokens project them too (`project`) and reorder all
-heads into the group's (`group_heads`); larger steps keep the gather: in
+fewer than `MAX_TOKENS` tokens, as bf16 rows or as an SP step's e4m3 rows,
+project them too (`project`) and reorder all heads into the group's
+(`group_heads`); larger steps keep the gather: in
 mixed steps removing it moved the wait for the slowest DCP rank to a later
 collective, where it cost more.
 """
@@ -49,6 +50,7 @@ MAX_TOKENS = msa_dcp_heads.HEAD_PARALLEL_MIN_TOKENS
 # other width: roundings pass, a column block of the wrong head misses by O(1).
 _SELFTEST_REL_TOL = 2**-6
 _SELFTEST_ROWS = 16
+_FP8_MAX = 448.0
 _selftested = False
 
 
@@ -97,9 +99,15 @@ def group_order(
     return torch.where(g == own, 0, g + 1 - (g > own).to(own.dtype))
 
 
-def project(qkv_proj: nn.Module, x: torch.Tensor) -> torch.Tensor:
+def project(
+    qkv_proj: nn.Module, x: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+) -> torch.Tensor:
     """The group's other KV heads' ``k | v | index_q`` of bf16 rows ``x``, as
-    MiniMaxM3Mxfp8LinearMethod projects decode rows."""
+    MiniMaxM3Mxfp8LinearMethod projects decode rows; e4m3 rows with per-row
+    f32 scales (an SP step's all-gather) contract as e4m3 x e4m3, as its
+    `apply_e4m3_rows` projects them."""
+    if isinstance(x, tuple):
+        return _e4m3_rows_matmul_op()(*x, qkv_proj.group_weight, qkv_proj.group_scale)
     return torch.matmul(x, qkv_proj.group_weight.to(x.dtype)) * qkv_proj.group_scale
 
 
@@ -130,44 +138,60 @@ def group_heads(
     )
 
 
+def _e4m3_rows_matmul_op():
+    # Imported on use: quant imports this module.
+    from vllm_torchtpu.models.minimax_m3.quant import _e4m3_matmul
+
+    return _e4m3_matmul
+
+
 def _selftest(group, qkv_proj, nq, d, replicas) -> None:
     """The group heads `group_heads` assembles from the prepared projections
     against every rank's own k / v / index_q projection all-gathered over the
-    DCP group (the path they replace), on rows shared by all ranks.
+    DCP group (the path they replace), on rows shared by all ranks: bf16 rows,
+    and the same rows as e4m3 with per-row scales (an SP step's all-gather).
     Collective over the group; every rank raises when any rank fails."""
     w, s = qkv_proj.weight, qkv_proj.weight_scale
     gen = torch.Generator().manual_seed(0)
     x = torch.randn(_SELFTEST_ROWS, w.shape[0], generator=gen)
     x = x.to(torch.bfloat16).to(w.device)
-    mine = torch.matmul(x, w.to(x.dtype)) * s
-    kvi = mine[:, nq * d : (nq + 3) * d]
-    want = group.all_gather(kvi.unsqueeze(0).contiguous(), dim=0)[::replicas]
-    heads = want.shape[0]
+    row_scale = x.float().abs().amax(dim=-1, keepdim=True) / _FP8_MAX
+    rows8 = ((x.float() / row_scale).to(torch.float8_e4m3fn), row_scale)
     rank = torch.tensor([group.rank_in_group], dtype=torch.int32, device=x.device)
-    got = group_heads(
-        mine,
-        project(qkv_proj, x),
-        nq,
-        d,
-        heads,
-        group_order(qkv_proj, rank, heads, replicas),
-    )
-    got = got[:, nq * d : (nq + 3 * heads) * d].reshape(-1, 3, heads, d)
-    want = want.reshape(heads, -1, 3, d).permute(1, 2, 0, 3)
-    got, want = got.float().cpu(), want.float().cpu()
-    max_abs = float((got - want).abs().max())
-    scale = float(want.abs().max()) or 1.0
-    ok = bool(torch.isfinite(got).all()) and max_abs <= _SELFTEST_REL_TOL * scale
+    max_abs, scales = {}, {}
+    ok = True
+    for name, rows, mine in (
+        ("bf16", x, torch.matmul(x, w.to(x.dtype)) * s),
+        ("e4m3", rows8, _e4m3_rows_matmul_op()(*rows8, w, s)),
+    ):
+        kvi = mine[:, nq * d : (nq + 3) * d]
+        want = group.all_gather(kvi.unsqueeze(0).contiguous(), dim=0)[::replicas]
+        heads = want.shape[0]
+        got = group_heads(
+            mine,
+            project(qkv_proj, rows),
+            nq,
+            d,
+            heads,
+            group_order(qkv_proj, rank, heads, replicas),
+        )
+        got = got[:, nq * d : (nq + 3 * heads) * d].reshape(-1, 3, heads, d)
+        want = want.reshape(heads, -1, 3, d).permute(1, 2, 0, 3)
+        got, want = got.float().cpu(), want.float().cpu()
+        max_abs[name] = float((got - want).abs().max())
+        scales[name] = float(want.abs().max()) or 1.0
+        ok = ok and bool(torch.isfinite(got).all())
+        ok = ok and max_abs[name] <= _SELFTEST_REL_TOL * scales[name]
     seen = [None] * group.world_size
     torch.distributed.all_gather_object(seen, ok, group=group.cpu_group)
     if not all(seen):
         raise RuntimeError(
             f"TPU_MINIMAX_M3_DCP_LOCAL_KV self-test failed (per DCP rank {seen}); "
-            f"here max_abs={max_abs:.3g} scale={scale:.3g}"
+            f"here max_abs={max_abs} scale={scales}"
         )
     logger.info(
-        "MiniMax-M3 DCP local K/V self-test: ok, %s (max_abs=%.3g)",
-        "bit-exact" if max_abs == 0 else "within roundings",
+        "MiniMax-M3 DCP local K/V self-test: ok, %s (max_abs=%s)",
+        "bit-exact" if not any(max_abs.values()) else "within roundings",
         max_abs,
     )
 

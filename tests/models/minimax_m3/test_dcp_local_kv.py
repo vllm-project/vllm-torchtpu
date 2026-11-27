@@ -100,3 +100,29 @@ def test_group_columns_move_bytes():
     )
     assert group_w.dtype == torch.uint8
     assert torch.equal(group_w, w8[0][:, kvi])
+
+
+def test_project_e4m3_rows(monkeypatch):
+    """e4m3 row tuples (an SP step's all-gather) take the e4m3 x e4m3 matmul
+    on the group columns, as qkv_proj's `apply_e4m3_rows` projects them."""
+    from vllm_torchtpu.models.minimax_m3 import dcp_local_kv, quant
+
+    seen = []
+
+    def fake(q, row_scale, w, w_scale):
+        seen.append((q, row_scale, w, w_scale))
+        return (q.float() * row_scale) @ (w.float() * w_scale.float())
+
+    monkeypatch.setattr(quant, "_e4m3_matmul", fake)
+    gen = torch.Generator().manual_seed(2)
+    qkv_proj = nn.Module()
+    qkv_proj.group_weight = torch.randn(K, 3 * D, generator=gen).to(torch.float8_e4m3fn)
+    qkv_proj.group_scale = torch.rand(3 * D, generator=gen)
+    q = torch.randn(5, K, generator=gen).to(torch.float8_e4m3fn)
+    row_scale = torch.rand(5, 1, generator=gen)
+    got = dcp_local_kv.project(qkv_proj, (q, row_scale))
+    assert len(seen) == 1 and seen[0][2] is qkv_proj.group_weight
+    want = (q.float() * row_scale) @ (
+        qkv_proj.group_weight.float() * qkv_proj.group_scale
+    )
+    torch.testing.assert_close(got, want)
