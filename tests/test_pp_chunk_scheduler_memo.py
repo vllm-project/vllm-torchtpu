@@ -130,11 +130,14 @@ def _request(request_id: str, token_ids: list[int]) -> Request:
 
 def _scheduler(kvm: KVCacheManager, options: dict) -> TpuPipelineChunkScheduler:
     """Runs TpuPipelineChunkScheduler.__init__ over a stub base __init__ on a
-    Qwen3.5 MoE KV producer with ``kvm`` as its KV cache manager."""
+    Qwen3.5 MoE KV producer with ``kvm`` as its KV cache manager and
+    hybrid-state retention on (as the Qwen3.5 config hook sets it)."""
 
     def base_init(self, *args, **kwargs):
         self.vllm_config = SimpleNamespace(
-            additional_config={"tpu_pp_scheduler": options},
+            additional_config={
+                "tpu_pp_scheduler": {"hybrid_state_retention": True, **options}
+            },
             kv_transfer_config=SimpleNamespace(
                 kv_role="kv_producer", is_kv_producer=True, is_kv_consumer=False
             ),

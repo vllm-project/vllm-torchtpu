@@ -1530,23 +1530,16 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     from vllm_torchtpu.core.pp_chunk_scheduler import (
         SCHEDULER_CLS,
         patch_engine_core_for_pp_chunks,
+        pipeline_chunks_off_reason,
     )
 
+    reason = pipeline_chunks_off_reason(vllm_config)
+    if reason is not None:
+        # Both policies off is a choice, not a conflict: no warning.
+        if envs.TPU_PP_LONE_PROMPT_CHUNKS or envs.TPU_PP_EQUAL_COST_CHUNKS:
+            logger.warning("Pipeline chunk sizing is off: %s.", reason)
+        return
     scheduler_config = vllm_config.scheduler_config
-    if not (envs.TPU_PP_LONE_PROMPT_CHUNKS or envs.TPU_PP_EQUAL_COST_CHUNKS):
-        return
-    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
-        logger.warning(
-            "Pipeline chunk sizing is off: scheduler %s is configured.",
-            scheduler_config.scheduler_cls,
-        )
-        return
-    if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
-        logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
-        return
-    if not scheduler_config.enable_chunked_prefill:
-        logger.warning("Pipeline chunk sizing is off: chunked prefill is disabled.")
-        return
     if envs.TPU_PP_EQUAL_COST_CHUNKS and envs.TPU_PP_CHUNK_SLACK < 0:
         raise ValueError(
             f"TPU_PP_CHUNK_SLACK must not be negative: {envs.TPU_PP_CHUNK_SLACK}"

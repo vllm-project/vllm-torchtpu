@@ -35,11 +35,11 @@ deep in a very long prompt so the kernel never overruns its SMEM. The
 limits arrive after the engine core has built its executor and scheduler;
 until then chunks are cut by token count alone.
 
-On a Qwen3.5 MoE model (``RETENTION_ARCHITECTURES``) the scheduler also
-keeps the GDN state snapshots a later turn hits on
-(``core/hybrid_retention.py``) on a KV producer: the retention stops are
-applied to a chunk after the step's limits have clipped it. Other hybrid
-models keep no snapshots.
+With the option ``hybrid_state_retention`` (which the Qwen3.5 config hook
+sets on the measured prefill legs) the scheduler also keeps the GDN state
+snapshots a later turn hits on (``core/hybrid_retention.py``) on a KV
+producer: the retention stops are applied to a chunk after the step's
+limits have clipped it. Without it no snapshots are kept.
 
 The quadratic attention cost and the prefix-aware admission it shares with
 ``PrefixAwareScheduler`` (``PrefixAwareAdmission``) are options
@@ -78,14 +78,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 SCHEDULER_CLS = "vllm_torchtpu.core.pp_chunk_scheduler.TpuPipelineChunkScheduler"
-
-# The architectures whose KV producers keep hybrid-state snapshots: the Qwen3.5
-# MoE models, whose prefill runs used them. Other hybrid models keep the
-# scheduler without retention.
-RETENTION_ARCHITECTURES = frozenset(
-    {"Qwen3_5MoeForCausalLM", "Qwen3_5MoeForConditionalGeneration"}
-)
-
 
 # A request whose uncached blocks fit the free blocks while the head's do not
 # ranks ahead of PrefixAwareScheduler's tiers.
@@ -135,14 +127,6 @@ class DivergentHitResolver(Protocol):
     ) -> int | None: ...
 
 
-def _retains_hybrid_state(vllm_config: Any) -> bool:
-    """Whether this engine keeps hybrid-state snapshots: a KV producer
-    (``retention_wanted``) serving one of ``RETENTION_ARCHITECTURES``."""
-    return retention_wanted(vllm_config) and not RETENTION_ARCHITECTURES.isdisjoint(
-        vllm_config.model_config.architectures or ()
-    )
-
-
 def uses_dynamic_chunks(vllm_config: Any) -> bool:
     """Whether this configuration sizes pipeline chunks; the platform
     installs the scheduler class only when it does."""
@@ -151,6 +135,23 @@ def uses_dynamic_chunks(vllm_config: Any) -> bool:
         and vllm_config.parallel_config.pipeline_parallel_size > 1
         and vllm_config.scheduler_config.scheduler_cls == SCHEDULER_CLS
     )
+
+
+def pipeline_chunks_off_reason(vllm_config: Any) -> str | None:
+    """Why the platform leaves pipeline chunk sizing off on this pipeline
+    engine (and does not install this scheduler), or None when it installs
+    it: both chunking policies off, another scheduler class, the DP
+    scheduler, or chunked prefill off."""
+    scheduler_config = vllm_config.scheduler_config
+    if not (envs.TPU_PP_LONE_PROMPT_CHUNKS or envs.TPU_PP_EQUAL_COST_CHUNKS):
+        return "both chunking policies are off"
+    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
+        return f"scheduler {scheduler_config.scheduler_cls} is configured"
+    if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
+        return "the DP scheduler is enabled"
+    if not scheduler_config.enable_chunked_prefill:
+        return "chunked prefill is disabled"
+    return None
 
 
 def _prefill_end(request: Any) -> int:
@@ -203,6 +204,13 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
                 "prices prefill work with the equal-cost step cost model; it "
                 "needs TPU_PP_EQUAL_COST_CHUNKS on"
             )
+        if options.hybrid_state_retention and not retention_wanted(self.vllm_config):
+            raise ValueError(
+                f"additional_config.{pp_scheduler_options.SECTION}."
+                "hybrid_state_retention keeps the snapshots a later turn hits "
+                "on a KV producer (a prefill leg); this engine's kv_role is "
+                "not kv_producer"
+            )
         self._quadratic_cost = options.quadratic_cost
         self._prefix_aware = options.prefix_aware
         # The aging rate is read only by the prefix-aware orders.
@@ -246,7 +254,7 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
                     " or ".join(missing),
                 )
         self._retention: HybridStateRetention | None = None
-        if _retains_hybrid_state(self.vllm_config):
+        if options.hybrid_state_retention:
             retention = HybridStateRetention(self.kv_cache_manager)
             if retention.enabled:
                 self._retention = retention

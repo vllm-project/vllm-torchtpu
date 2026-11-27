@@ -40,6 +40,15 @@ SECTION = "tpu_pp_scheduler"
 
 @dataclass(frozen=True)
 class PPSchedulerOptions:
+    hybrid_state_retention: bool = False
+    """Keep the GDN state snapshots a later turn of a conversation hits on
+    (``core/hybrid_retention.py``): on a KV producer only (refused
+    elsewhere), and only when the model has a Mamba group, a full-attention
+    group and prefix caching. The Qwen3.5 config hook turns it on, when it
+    is not set, on the engines it was measured on: the validation entries'
+    prefill legs (Qwen3.5-397B-A17B on TPU7x, a ``kv_producer`` pipeline
+    without context parallelism)."""
+
     paw_aging_tok_per_s: int = 3000
     """Uncached prompt tokens credited per second a request has waited, in the
     ``prefix_aware`` orders (waiting-queue sort, running-prefill order,

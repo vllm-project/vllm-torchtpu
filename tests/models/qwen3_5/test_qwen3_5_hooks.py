@@ -82,6 +82,7 @@ def _vllm_config(
     ep: bool = False,
     max_num_seqs: int = 8,
     additional: dict | None = None,
+    scheduler_cls: str | None = None,
 ) -> SimpleNamespace:
     """A Qwen3.5-397B-A17B engine config as the hook sees it; by default one
     engine without KV transfer or any parallelism."""
@@ -108,7 +109,11 @@ def _vllm_config(
             prefix_cache_retention_interval=0,
             mamba_ssm_cache_dtype="auto",
         ),
-        scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs, scheduler_cls=None),
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=max_num_seqs,
+            scheduler_cls=scheduler_cls,
+            enable_chunked_prefill=True,
+        ),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=tp,
             data_parallel_size=dp,
@@ -155,6 +160,7 @@ def test_mains_nightly_configs_keep_mains_defaults(name):
     cfg = _run_hook(_vllm_config(**NIGHTLY_CONFIGS[name]))
     assert cfg.cache_config.kv_cache_memory_bytes is None
     assert cfg.cache_config.prefix_match_unit is None
+    assert "tpu_pp_scheduler" not in cfg.additional_config
 
 
 def test_kv_producer_gets_a_128_token_prefix_match_unit():
@@ -323,6 +329,63 @@ def _measured_prefill_leg(**overrides) -> SimpleNamespace:
     return _vllm_config(**leg)
 
 
+def _retention(cfg) -> bool | None:
+    return cfg.additional_config.get("tpu_pp_scheduler", {}).get(
+        "hybrid_state_retention"
+    )
+
+
+def test_measured_prefill_leg_keeps_hybrid_state_snapshots():
+    cfg = _run_hook(_measured_prefill_leg())
+    assert _retention(cfg) is True
+    # The other options of the section are kept.
+    cfg = _run_hook(
+        _measured_prefill_leg(additional={"tpu_pp_scheduler": {"prefix_aware": True}})
+    )
+    assert cfg.additional_config["tpu_pp_scheduler"] == {
+        "prefix_aware": True,
+        "hybrid_state_retention": True,
+    }
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_an_explicit_retention_value_is_kept(value):
+    section = {"hybrid_state_retention": value}
+    cfg = _run_hook(_measured_prefill_leg(additional={"tpu_pp_scheduler": section}))
+    assert _retention(cfg) is value
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(pp=1),
+        dict(pcp=2),
+        dict(dcp=2),
+        dict(kv_role="kv_consumer"),
+        dict(kv_role="kv_both"),
+        dict(kv_role=None),
+        # Another scheduler class: no pipeline chunk scheduler to keep them.
+        dict(scheduler_cls="x.Y"),
+    ],
+)
+def test_other_engines_keep_no_hybrid_state_snapshots(overrides):
+    assert _retention(_run_hook(_measured_prefill_leg(**overrides))) is None
+
+
+def test_a_pp4_prefill_leg_of_another_checkpoint_keeps_no_snapshots():
+    """A PP4 prefill leg of a smaller Qwen3.5 MoE checkpoint (the shape of
+    Qwen3.5-35B-A3B) was not measured with retention."""
+    cfg = _measured_prefill_leg(pp=4)
+    text = cfg.model_config.hf_text_config
+    text.num_experts, text.hidden_size, text.num_hidden_layers = 256, 2048, 40
+    assert _retention(_run_hook(cfg)) is None
+
+
+def test_other_device_keeps_no_hybrid_state_snapshots(monkeypatch):
+    monkeypatch.setattr(hooks, "_chip_family", lambda: "6e")
+    assert _retention(_run_hook(_measured_prefill_leg())) is None
+
+
 @pytest.mark.parametrize("pcp", [2, 4, 8])
 def test_pcp_prefill_leg_keeps_mains_prefix_match_unit(pcp):
     cfg = _run_hook(_measured_prefill_leg(pcp=pcp, pp=1))
@@ -488,6 +551,12 @@ def test_validation_points_keep_their_defaults(path):
     decode = _run_hook(_leg_config(legs["decode"]))
     assert prefill.kv_transfer_config.kv_role == "kv_producer"
     assert prefill.cache_config.prefix_match_unit == 128
+    # The prefill legs keep hybrid-state snapshots, as they ran; the decode
+    # legs do not.
+    assert prefill.additional_config["tpu_pp_scheduler"] == {
+        "hybrid_state_retention": True
+    }
+    assert "tpu_pp_scheduler" not in decode.additional_config
     assert prefill.cache_config.kv_cache_memory_bytes is None
     assert decode.kv_transfer_config.kv_role == "kv_consumer"
     assert decode.cache_config.prefix_match_unit is None

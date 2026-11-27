@@ -31,6 +31,10 @@ entries (``validation/``). Every other engine keeps main's behaviour.
   without prefill or decode context parallelism (the entries' PP8 prefill
   legs). Every other engine keeps the unit unset, so a PCP prefill leg
   resolves its hash block size from its KV cache groups.
+- ``tpu_pp_scheduler.hybrid_state_retention``: true on a prefill
+  (``kv_producer``) leg with more than one pipeline stage, without context
+  parallelism, whose pipeline chunk scheduler the platform installs (the
+  entries' PP8 prefill legs). Every other engine keeps it false.
 """
 
 from __future__ import annotations
@@ -106,10 +110,43 @@ def _apply_prefix_match_unit(vllm_config: VllmConfig, calibrated: bool) -> None:
     cache_config.prefix_match_unit = 128
 
 
+def _apply_hybrid_state_retention(vllm_config: VllmConfig, calibrated: bool) -> None:
+    # Only the measured prefill legs: a kv_producer pipeline without context
+    # parallelism that gets the pipeline chunk scheduler, which keeps the
+    # snapshots. Every other engine keeps the option's default, false.
+    kv_cfg = vllm_config.kv_transfer_config
+    if kv_cfg is None or kv_cfg.kv_role != "kv_producer" or not calibrated:
+        return
+    parallel_config = vllm_config.parallel_config
+    if (
+        parallel_config.pipeline_parallel_size <= 1
+        or parallel_config.prefill_context_parallel_size != 1
+        or parallel_config.decode_context_parallel_size != 1
+    ):
+        return
+    # Lazy: the scheduler modules import vLLM's scheduler.
+    from vllm_torchtpu.core import pp_chunk_scheduler, pp_scheduler_options
+
+    if pp_chunk_scheduler.pipeline_chunks_off_reason(vllm_config) is not None:
+        return
+    additional = vllm_config.additional_config
+    if not isinstance(additional, dict):
+        return
+    section = additional.get(pp_scheduler_options.SECTION, {})
+    # An explicit value wins; a malformed section fails in the parser.
+    if not isinstance(section, dict) or "hybrid_state_retention" in section:
+        return
+    additional[pp_scheduler_options.SECTION] = {
+        **section,
+        "hybrid_state_retention": True,
+    }
+
+
 def apply_serving_defaults(vllm_config: VllmConfig) -> None:
     """Fill the Qwen3.5 TPU serving defaults the user did not set."""
     calibrated = _is_calibrated(vllm_config.model_config)
     _apply_prefix_match_unit(vllm_config, calibrated)
+    _apply_hybrid_state_retention(vllm_config, calibrated)
 
 
 class TPUQwen35MoeConfig(Qwen3_5ForConditionalGenerationConfig):

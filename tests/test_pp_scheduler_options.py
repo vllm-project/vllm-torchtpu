@@ -399,32 +399,36 @@ def test_a_connector_without_the_hooks_is_named_in_a_warning(caplog):
     assert "has no" not in caplog.text
 
 
-def test_retention_follows_the_kv_producer_rule():
-    s, calls = _built(kv_role="kv_producer")
+_RETAIN = {"tpu_pp_scheduler": {"hybrid_state_retention": True}}
+
+
+def test_retention_follows_the_option_on_a_kv_producer():
+    s, calls = _built(_RETAIN, kv_role="kv_producer")
     assert s._retention is not None and "retention" in calls
-    s, calls = _built(kv_role="kv_consumer")
-    assert s._retention is None and "retention" not in calls
-    s, calls = _built(kv_role=None)
+    s, _ = _built(_RETAIN, kv_role="kv_producer", retention_enabled=False)
     assert s._retention is None
-    s, _ = _built(kv_role="kv_producer", retention_enabled=False)
-    assert s._retention is None
+    # The option keeps snapshots for a later turn's prefill: refused off a
+    # KV producer.
+    for kv_role in ("kv_consumer", "kv_both", None):
+        with pytest.raises(ValueError, match="hybrid_state_retention"):
+            _built(_RETAIN, kv_role=kv_role)
 
 
 @pytest.mark.parametrize(
-    "architecture, retained",
+    "architecture",
     [
-        ("Qwen3_5MoeForConditionalGeneration", True),
-        ("Qwen3_5MoeForCausalLM", True),
-        # Other hybrid (GDN or Mamba + attention) models keep main's scheduler.
-        ("Qwen3NextForCausalLM", False),
-        ("Qwen3_5ForConditionalGeneration", False),
-        ("JambaForCausalLM", False),
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3NextForCausalLM",
+        "JambaForCausalLM",
     ],
 )
-def test_retention_is_scoped_to_the_qwen3_5_moe_architectures(architecture, retained):
+def test_retention_is_off_without_the_option(architecture):
+    """No architecture rule: without the option (which the Qwen3.5 config
+    hook sets on the measured prefill legs) no KV producer keeps snapshots,
+    Qwen3.5 MoE models included."""
     s, calls = _built(kv_role="kv_producer", architecture=architecture)
-    assert (s._retention is not None) is retained
-    assert ("retention" in calls) is retained
+    assert s._retention is None and "retention" not in calls
 
 
 # -- default behaviour: every option off -----------------------------------------
