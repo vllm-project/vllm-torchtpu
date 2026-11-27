@@ -21,6 +21,9 @@ from typing import Any
 import torch
 
 from vllm_torchtpu.experimental.export import api, random_sample, tpu_lowering
+from vllm_torchtpu.layers.adapter.sample.output_penalties import (
+    subtract_output_penalties,
+)
 from vllm_torchtpu.layers.adapter.sample.repetition_penalty import scale_seen_logits
 
 
@@ -142,11 +145,11 @@ def penalized_tokens(
     logits = scale_seen_logits(
         logits, seen, repetition_penalty.to(torch.float32).unsqueeze(-1)
     )
-    logits = (
-        logits
-        - presence_penalty.to(torch.float32).unsqueeze(-1)
-        * (counts > 0).to(torch.float32)
-        - frequency_penalty.to(torch.float32).unsqueeze(-1) * counts
+    logits = subtract_output_penalties(
+        logits,
+        counts,
+        presence_penalty.to(torch.float32).unsqueeze(-1),
+        frequency_penalty.to(torch.float32).unsqueeze(-1),
     )
     return stochastic_tokens(logits, temperature, top_k, top_p, min_p, uniform)
 

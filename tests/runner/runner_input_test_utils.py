@@ -22,15 +22,19 @@ from vllm.config.reasoning import ReasoningConfig
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec
+from vllm.v1.sample.logits_processor import LogitsProcessors
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.sequence_layout import create_sequence_layout_planner
-from vllm_torchtpu.runner import min_tokens, repetition_penalty
+from vllm_torchtpu.runner import min_tokens, output_penalties, repetition_penalty
 from vllm_torchtpu.runner.thinking_budget_tracker import ThinkingBudgetTracker
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import CachedRequestState
+from vllm_torchtpu.runner.vllm_v1.worker.gpu_input_batch import (
+    CachedRequestState,
+    InputBatch,
+)
 from vllm_torchtpu.structured_decoding.structured_decoding_manager import (
     StructuredDecodingManager,
 )
@@ -308,8 +312,8 @@ def _make_sample_runner(
     ``_sample_plain_chunk``, ``_sample_spec_verify_chunk``, min_tokens, async
     output, verify gathers) to a CPU ``SimpleNamespace`` with real
     ``MinTokensTracker`` and ``ThinkingBudgetTracker`` instances fed from
-    ``requests``, and a real ``RepetitionPenaltyTracker`` with no penalized
-    request.
+    ``requests``, and real ``RepetitionPenaltyTracker`` and
+    ``OutputPenaltyTracker`` instances with no penalized request.
     """
     tracker = ThinkingBudgetTracker(
         reasoning_cfg, max_num_reqs=max_num_reqs, device=torch.device("cpu")
@@ -351,6 +355,8 @@ def _make_sample_runner(
             ],
             token_ids_cpu=np.zeros((max(len(req_ids), 1), 64), dtype=np.int32),
             repetition_penalties_reqs=set(),
+            presence_penalties_reqs=set(),
+            frequency_penalties_reqs=set(),
         ),
         requests=requests,
         num_prompt_logprobs={},
@@ -361,6 +367,13 @@ def _make_sample_runner(
         _repetition_penalty=repetition_penalty.RepetitionPenaltyTracker(
             vocab_size,
             max_num_reqs,
+            async_scheduling=async_scheduling,
+            speculative_decoding=spec_k is not None,
+        ),
+        _output_penalties=output_penalties.OutputPenaltyTracker(
+            vocab_size,
+            max_num_reqs,
+            torch.device("cpu"),
             async_scheduling=async_scheduling,
             speculative_decoding=spec_k is not None,
         ),
@@ -460,3 +473,36 @@ def attention_layer_mock(backend=PallasAttentionBackend, **attrs):
         for name, value in {**defaults, **attrs}.items():
             setattr(layer, name, value)
     return layer
+
+
+def _request(req_id, params, output):
+    """A ``CachedRequestState`` with a four-token prompt, ``params`` and the
+    ``output`` list so far."""
+    return CachedRequestState(
+        req_id=req_id,
+        prompt_token_ids=list(range(4)),
+        mm_features=[],
+        sampling_params=params,
+        generator=None,
+        block_ids=([0],),
+        num_computed_tokens=4,
+        output_token_ids=output,
+    )
+
+
+def _input_batch(*requests, vocab_size=16, max_model_len=64):
+    """A real CPU ``InputBatch`` of up to four rows holding ``requests``."""
+    batch = InputBatch(
+        max_num_reqs=4,
+        max_model_len=max_model_len,
+        max_num_batched_tokens=16,
+        device=torch.device("cpu"),
+        vocab_size=vocab_size,
+        block_sizes=[16],
+        max_num_blocks_per_req=[4],
+        logitsprocs=LogitsProcessors(),
+        logitsprocs_need_output_token_ids=True,
+    )
+    for request in requests:
+        batch.add_request(request)
+    return batch

@@ -271,6 +271,7 @@ def _runner(weight, speculative_config=None):
     runner.speculative_config = speculative_config
     runner._min_tokens = min_tokens.MinTokensTracker()
     runner._repetition_penalty = SimpleNamespace(active=lambda _batch: False)
+    runner._output_penalties = SimpleNamespace(active=lambda _batch: False)
     return runner
 
 
