@@ -119,6 +119,51 @@ def _reset_ep_device_placement():
 
 
 @pytest.fixture
+def raiden_pd_env(monkeypatch):
+    """Isolate Raiden P/D env vars and enable GLM admission by default.
+
+    Defaults to ``TPU_RAIDEN_GLM_ADMISSION="1"`` so minimal single-chip unit
+    tests pass startup validation without needing a multi-chip Qwen3.5
+    topology. Returns a helper ``configure(**overrides)`` that clears all
+    Raiden P/D and removed legacy KV env vars (plus cached ``envs``
+    attributes) and applies ``overrides`` on top of
+    ``TPU_USE_RAIDEN_KV_CACHE_MANAGER="1"``. Pass ``None`` as a value to leave
+    a variable unset.
+    """
+    from vllm_torchtpu import envs as tpu_envs
+    from vllm_torchtpu.distributed.kv_transfer.raiden_pd_validation import (
+        _REMOVED_KV_TRANSFER_ENVS,
+        RAIDEN_PD_ADMISSION_FLAGS,
+    )
+
+    managed = (
+        "TPU_KV_RESHARD_TRANSPORT",
+        "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+        "TPU_RAIDEN_POOL_TAGS_PER_LAYER",
+        *RAIDEN_PD_ADMISSION_FLAGS,
+        *_REMOVED_KV_TRANSFER_ENVS,
+    )
+
+    def _configure(**overrides: str | None) -> None:
+        for name in managed:
+            monkeypatch.delenv(name, raising=False)
+            monkeypatch.delitem(vars(tpu_envs), name, raising=False)
+        env: dict[str, str | None] = {
+            "TPU_USE_RAIDEN_KV_CACHE_MANAGER": "1",
+            **overrides,
+        }
+        for name, value in env.items():
+            monkeypatch.delitem(vars(tpu_envs), name, raising=False)
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+
+    _configure(TPU_RAIDEN_GLM_ADMISSION="1")
+    return _configure
+
+
+@pytest.fixture
 def vllm_config_context():
     """Run backend helpers with the same resolved layout as worker startup."""
     from vllm.config import VllmConfig, set_current_vllm_config

@@ -20,6 +20,11 @@ from typing import Any
 # `kv_connector_extra_config["connectors"]`: vLLM's and the TPU one.
 MULTI_CONNECTORS = ("MultiConnector", "TPUMultiConnector")
 
+# Names that resolve to the Raiden Stage-3 P/D connector. `TPUConnector` is a
+# deprecated compatibility alias of `TPURaidenConnector`; every check that asks
+# "is this the Raiden P/D connector?" must accept both.
+RAIDEN_PD_CONNECTOR_NAMES: tuple[str, ...] = ("TPURaidenConnector", "TPUConnector")
+
 
 def kv_connector_names(
     kv_transfer_config: Any, multi_connectors: Container[str] = MULTI_CONNECTORS

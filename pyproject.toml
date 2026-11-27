@@ -299,7 +299,6 @@ ignore-missing-imports = [
     "transformers", "transformers.*",
     "vllm", "vllm.*",
     "vllm_omni", "vllm_omni.*",
-    "zmq", "zmq.*",
 ]
 
 [tool.setuptools]

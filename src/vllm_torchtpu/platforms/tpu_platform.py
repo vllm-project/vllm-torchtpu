@@ -33,6 +33,13 @@ from vllm.platforms.interface import Platform, PlatformEnum
 
 from vllm_torchtpu import envs, patch_registry, rope_in_graph_flag
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
+from vllm_torchtpu.distributed.kv_transfer.connector_names import (
+    RAIDEN_PD_CONNECTOR_NAMES,
+    kv_connector_names,
+)
+from vllm_torchtpu.distributed.kv_transfer.raiden_pd_validation import (
+    validate_raiden_pd_config,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.moe_reference_parity import get_moe_reference_parity
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
@@ -539,8 +546,14 @@ def _register_tpu_kv_connectors() -> None:
 
     from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 
+    # Every Raiden P/D name (TPUConnector is an alias) loads the one class.
+    for name in RAIDEN_PD_CONNECTOR_NAMES:
+        KVConnectorFactory.register_connector(
+            name,
+            "vllm_torchtpu.distributed.kv_transfer.tpu_connector",
+            "TPURaidenConnector",
+        )
     for name, module_path in (
-        ("TPURaidenConnector", "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
         (
             "TPUMultiConnector",
             "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
@@ -1434,6 +1447,13 @@ class TpuPlatform(Platform):
                 f"{_TPU_SUPPORTED_KV_CONNECTORS}, but got "
                 f"'{kv_transfer_config.kv_connector}'."
             )
+            if any(
+                name in RAIDEN_PD_CONNECTOR_NAMES
+                for name in kv_connector_names(
+                    kv_transfer_config, ("TPUMultiConnector",)
+                )
+            ):
+                validate_raiden_pd_config(vllm_config)
             is_hybrid_offloading = (
                 kv_transfer_config.kv_connector == "TPURaidenOffloadingConnector"
                 and is_hybrid
