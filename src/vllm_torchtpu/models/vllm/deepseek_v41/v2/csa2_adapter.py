@@ -10,7 +10,6 @@ import jax.numpy as jnp
 import torch
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from vllm_torchtpu.kernels.deepseek_v41 import output_projection
 from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
@@ -137,20 +136,17 @@ def _publish_swa_planned_banked(
     )
 
 
-def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
-    # Q/K already carry RoPE; CSA2 consumes this small inverse-rotation table.
-    table = rope_gather.by_row_blocks(
-        lambda rows: cos_sin[rows],
-        positions,
-        envs.TPU_DEEPSEEK_V41_BLOCKED_ROPE_GATHER,
-    ).astype(jnp.float32)
+def _inverse_rope(rope_rows: jax.Array) -> jax.Array:
+    """CSA2's small inverse-rotation table from the RoPE rows [T, 64] of the
+    query positions (Q/K already carry RoPE)."""
+    table = rope_rows.astype(jnp.float32)
+    tokens = table.shape[0]
     cos = jnp.concatenate(
-        (jnp.ones((positions.shape[0], 64)), jnp.repeat(table[:, :32], 2, axis=1)),
-        axis=1,
+        (jnp.ones((tokens, 64)), jnp.repeat(table[:, :32], 2, axis=1)), axis=1
     )
     sin = jnp.repeat(table[:, 32:], 2, axis=1)
     sin *= jnp.where(jnp.arange(64) % 2 == 0, 1.0, -1.0)
-    sin = jnp.concatenate((jnp.zeros((positions.shape[0], 64)), sin), axis=1)
+    sin = jnp.concatenate((jnp.zeros((tokens, 64)), sin), axis=1)
     return jnp.stack((cos, sin), axis=1)
 
 
@@ -163,7 +159,7 @@ def _attend(
     starts: jax.Array,
     positions: jax.Array,
     sink: jax.Array,
-    cos_sin: jax.Array,
+    rope_rows: jax.Array,
     metadata: jax.Array,
     bounds: jax.Array,
     counts: jax.Array,
@@ -181,7 +177,7 @@ def _attend(
         starts,
         positions,
         sink.astype(jnp.float32),
-        _inverse_rope(cos_sin, positions),
+        _inverse_rope(rope_rows),
         swa_metadata=metadata,
         swa_bounds=bounds if non_causal else None,
         main_lengths=counts,
@@ -198,7 +194,7 @@ def _attend_swa(
     starts: jax.Array,
     positions: jax.Array,
     sink: jax.Array,
-    cos_sin: jax.Array,
+    rope_rows: jax.Array,
     metadata: jax.Array,
     bounds: jax.Array,
     page_size: int,
@@ -215,7 +211,7 @@ def _attend_swa(
         starts,
         positions,
         sink.astype(jnp.float32),
-        _inverse_rope(cos_sin, positions),
+        _inverse_rope(rope_rows),
         swa_metadata=metadata,
         swa_bounds=bounds if non_causal else None,
         scale=scale,
@@ -237,7 +233,7 @@ def _gather_attend(
     starts: jax.Array,
     positions: jax.Array,
     sink: jax.Array,
-    cos_sin: jax.Array,
+    rope_rows: jax.Array,
     metadata: jax.Array,
     bounds: jax.Array,
     main_page_size: int,
@@ -263,7 +259,7 @@ def _gather_attend(
         starts,
         positions,
         sink.astype(jnp.float32),
-        _inverse_rope(cos_sin, positions),
+        _inverse_rope(rope_rows),
         metadata,
         bounds if non_causal else None,
         counts,
@@ -659,7 +655,7 @@ def attention(
     starts: torch.Tensor,
     positions: torch.Tensor,
     sink: torch.Tensor,
-    cos_sin: torch.Tensor,
+    rope_rows: torch.Tensor,
     metadata: torch.Tensor,
     bounds: torch.Tensor,
     ratio: int,
@@ -679,7 +675,7 @@ def attention(
             starts.int(),
             positions.int(),
             sink,
-            cos_sin,
+            rope_rows,
             metadata.int(),
             bounds.int(),
             swa.shape[1],
@@ -719,7 +715,7 @@ def attention(
             starts.int(),
             positions.int(),
             sink,
-            cos_sin,
+            rope_rows,
             metadata.int(),
             bounds.int(),
             page_size,
@@ -743,7 +739,7 @@ def attention(
         starts.int(),
         positions.int(),
         sink,
-        cos_sin,
+        rope_rows,
         metadata.int(),
         bounds.int(),
         cache.valid_counts,

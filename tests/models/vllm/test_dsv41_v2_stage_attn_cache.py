@@ -476,3 +476,26 @@ def test_swa_group_tables_dedupes_by_object_and_shape():
     tables = v2_attn._swa_group_tables(metadata, (3, 4))
     assert len(tables) == 3
     assert tables[0] is a and tables[1] is b
+
+
+@pytest.mark.parametrize("tokens", [1, 16, 300])
+def test_csa2_inverse_rope_from_paired_rope_rows(tokens):
+    """CSA2's inverse-rotation table built from the stage's paired RoPE rows
+    equals the one built from a direct gather of the table."""
+    from vllm_torchtpu.kernels.attention_preprocessing import rope_gather
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import csa2_adapter
+
+    rng = np.random.default_rng(tokens)
+    table = rng.normal(size=(1001, 64)).astype(np.float32)
+    pairs = np.concatenate((table, table[-1:])).reshape(-1, 128)
+    positions = jnp.asarray(rng.integers(0, 1001, tokens).astype(np.int32))
+    got = csa2_adapter._inverse_rope(
+        rope_gather.gather_paired_rows(jnp.asarray(pairs), positions)
+    )
+    rows = table[np.asarray(positions)]
+    cos = np.concatenate((np.ones((tokens, 64)), np.repeat(rows[:, :32], 2, 1)), 1)
+    sin = np.repeat(rows[:, 32:], 2, 1) * np.where(np.arange(64) % 2 == 0, 1.0, -1.0)
+    sin = np.concatenate((np.zeros((tokens, 64)), sin), 1)
+    np.testing.assert_array_equal(
+        np.asarray(got), np.stack((cos, sin), 1).astype(np.float32)
+    )

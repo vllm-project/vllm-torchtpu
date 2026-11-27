@@ -1803,7 +1803,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     swa.query_start_loc,
                     positions,
                     self.attn_sink,
-                    self._tpu_rope_cache,
+                    # The stage's gathered rows (Q/KV RoPE reads the same table
+                    # rows), not the table: no second gather per stage. The
+                    # stage cache hits on int32 positions (`.int()` is then a
+                    # no-op), as the Q/KV RoPE path requires.
+                    self._rope_rows(positions.int()),
                     csa2_metadata,
                     csa2_bounds,
                     self.compress_ratio,
