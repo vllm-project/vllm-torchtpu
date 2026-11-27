@@ -59,15 +59,19 @@ def _torch_compile_names(tree: ast.Module) -> tuple[set[str], set[str]]:
     return modules, functions
 
 
+TPU_COMPILE_KEYWORDS = {"backend": "tpu", "fullgraph": True, "dynamic": False}
+
+
 def _is_tpu_compile_form(
     call: ast.Call, modules: set[str], functions: set[str]
 ) -> bool:
-    """``torch.compile(..., backend="tpu", fullgraph=True, dynamic=False)``
-    with no other keyword: what ``tpu_compile`` builds. ``torch.compile`` is
-    recognized as ``<torch module name>.compile`` or as a name imported from
-    torch (``modules`` and ``functions``, from :func:`_torch_compile_names`).
-    A call that reaches it any other way (an alias assigned in the module,
-    ``getattr``, keywords passed as ``**kwargs``) is not recognized."""
+    """``torch.compile(..., backend="tpu", fullgraph=True, dynamic=False)``,
+    with or without other keywords: what ``tpu_compile`` builds, plus whatever
+    else a site passes. ``torch.compile`` is recognized as ``<torch module
+    name>.compile`` or as a name imported from torch (``modules`` and
+    ``functions``, from :func:`_torch_compile_names`). A call that reaches it
+    any other way (an alias assigned in the module, ``getattr``, keywords
+    passed as ``**kwargs``) is not recognized."""
     func = call.func
     if isinstance(func, ast.Attribute):
         named = (
@@ -79,11 +83,17 @@ def _is_tpu_compile_form(
         named = isinstance(func, ast.Name) and func.id in functions
     if not named:
         return False
-    kwargs = {
-        k.arg: k.value.value if isinstance(k.value, ast.Constant) else k.value
+    constants = {
+        k.arg: k.value.value
         for k in call.keywords
+        if k.arg is not None and isinstance(k.value, ast.Constant)
     }
-    return kwargs == {"backend": "tpu", "fullgraph": True, "dynamic": False}
+    return all(
+        name in constants
+        and type(constants[name]) is type(value)
+        and constants[name] == value
+        for name, value in TPU_COMPILE_KEYWORDS.items()
+    )
 
 
 def _compiles_a_bound_method(call: ast.Call) -> bool:
@@ -96,23 +106,67 @@ def _compiles_a_bound_method(call: ast.Call) -> bool:
     return isinstance(target, ast.Name) and target.id == "self"
 
 
-def test_no_plain_torch_compile_of_a_tpu_function():
+# Sites outside PLAIN_TORCH_COMPILE that stay on plain torch.compile, by (file
+# under the package, enclosing function), with the reason.
+NAMED_EXCEPTIONS = {
+    ("compilation/decorators.py", "tpu_compile"): "the decorator itself",
+    ("megakernel/adapter/driver.py", "ProgramDriver._compile"): (
+        "passes backend options (the step's name, the program's compiled-IR "
+        "check, serializable=False) that tpu_compile does not take; it "
+        "compiles one step per bucket at bind time"
+    ),
+}
+
+
+def _calls_by_enclosing_function(tree: ast.Module):
+    """(call, qualified name of the innermost enclosing class or def, or "")
+    for every call in the module; a decorator belongs to the enclosing
+    scope of the def it decorates."""
     found = []
+
+    def walk(node, scope):
+        if isinstance(node, ast.Call):
+            found.append((node, ".".join(scope)))
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                walk(decorator, scope)
+            for stmt in node.body:
+                walk(stmt, (*scope, node.name))
+            return
+        for child in ast.iter_child_nodes(node):
+            walk(child, scope)
+
+    walk(tree, ())
+    return found
+
+
+def _plain_tpu_compile_sites():
+    """(file, enclosing function, line) of every call in the tpu_compile form
+    outside PLAIN_TORCH_COMPILE, apart from compiles of bound methods."""
     for rel, tree in _sources():
         if rel.parts[0] in PLAIN_TORCH_COMPILE:
             continue
         names = _torch_compile_names(tree)
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and _is_tpu_compile_form(node, *names)
-                and not _compiles_a_bound_method(node)
+        for call, scope in _calls_by_enclosing_function(tree):
+            if _is_tpu_compile_form(call, *names) and not _compiles_a_bound_method(
+                call
             ):
-                found.append(f"{rel}:{node.lineno}")
+                yield rel.as_posix(), scope, call.lineno
+
+
+def test_no_plain_torch_compile_of_a_tpu_function():
+    sites = list(_plain_tpu_compile_sites())
+    found = [
+        f"{rel}:{line} ({scope or 'module'})"
+        for rel, scope, line in sites
+        if (rel, scope) not in NAMED_EXCEPTIONS
+    ]
     assert not found, (
         "compile these with compilation.decorators.tpu_compile, which the "
-        f"tpu_compile options act on: {found}"
+        f"tpu_compile options act on, or name them in NAMED_EXCEPTIONS: {found}"
     )
+    stale = set(NAMED_EXCEPTIONS) - {(rel, scope) for rel, scope, _ in sites}
+    assert not stale, f"NAMED_EXCEPTIONS lists sites that are gone: {stale}"
 
 
 # The modules that may import compilation.fast_dispatch, which is removed once
@@ -192,7 +246,9 @@ from torch import compile as torch_compile
 
 t.compile(f, backend="tpu", fullgraph=True, dynamic=False)
 torch_compile(f, backend="tpu", fullgraph=True, dynamic=False)
+torch.compile(f, backend="tpu", fullgraph=True, dynamic=False, options={})
 torch.compile(f, backend="tpu", fullgraph=True, dynamic=True)
+torch.compile(f, backend="tpu", fullgraph=True)
 compile(source, "<string>", "exec")
 
 @tpu_compile
@@ -218,7 +274,7 @@ def test_the_source_checks_recognize_each_spelling():
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and _is_tpu_compile_form(node, *names)
     ]
-    assert sorted(plain) == ["t.compile", "torch_compile"]
+    assert sorted(plain) == ["t.compile", "torch.compile", "torch_compile"]
     assert list(_decorated_at_import(tree.body)) == [
         ("decorated",),
         ("through_the_module",),
