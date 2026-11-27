@@ -405,9 +405,14 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         window = list(islice(queue, self._paw_sort_window))
         free_blocks = self._get_num_free_blocks()
         # The sort runs on a KV producer only (_init_paw_sort), whose async
-        # loads reserve blocks before the host-tier hit can land.
+        # loads reserve blocks before the host-tier hit can land. vLLM refuses
+        # such a load for that reservation, and retention evicts only on a
+        # real shortage, so the blocks retention pins (free_blocks counts
+        # them) are not room for a host-tier load.
         free_blocks_for_ext = max(
-            0, free_blocks - self._inflight_prefill_reserved_blocks()
+            0,
+            self.kv_cache_manager.block_pool.get_num_free_blocks()
+            - self._inflight_prefill_reserved_blocks(),
         )
         # The step's wall time, the clock _promote_warmest ages on.
         now = self._now()

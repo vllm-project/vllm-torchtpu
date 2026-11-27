@@ -256,9 +256,34 @@ def test_external_hit_counts_when_it_fits():
         if r.request_id == "dram_small"
         else 0
     )
-    s._get_num_free_blocks = lambda: 45
+    s.kv_cache_manager.block_pool = SimpleNamespace(get_num_free_blocks=lambda: 45)
     s._inflight_prefill_reserved_blocks = lambda: 30  # 15 left < 41 to load
     assert _order_seen_by_base_schedule(s) == ["hbm_mid", "dram_small"]
+
+
+def test_the_blocks_retention_pins_are_no_room_for_a_host_tier_load():
+    """vLLM refuses an async host-tier load for the async-load reservation
+    before retention evicts (only a real shortage evicts), so the pinned
+    blocks, which the HBM fit counts as free, do not count as room for the
+    load: here the pool has 45 free blocks, 30 more are pinned, 10 are
+    reserved, and the 41-block load does not fit the 35 left."""
+    now = time.time()
+    reqs = [_req("hbm_mid", 30_000, now - 2), _req("dram_small", 100_000, now - 1)]
+    s = _scheduler(reqs, {"hbm_mid": 22_000, "dram_small": 10_000})
+    s._hit_estimator = SimpleNamespace(
+        estimate_external_hit_tokens=lambda r, local: 88_000
+        if r.request_id == "dram_small"
+        else 0
+    )
+    s.kv_cache_manager.block_pool = SimpleNamespace(get_num_free_blocks=lambda: 45)
+    s._retention = SimpleNamespace(num_pinned_blocks=lambda: 30)
+    s._inflight_prefill_reserved_blocks = lambda: 10
+    assert s._get_num_free_blocks() == 75
+    assert _order_seen_by_base_schedule(s) == ["hbm_mid", "dram_small"]
+    # With the 30 blocks free instead of pinned the load fits and counts.
+    s.kv_cache_manager.block_pool = SimpleNamespace(get_num_free_blocks=lambda: 75)
+    s._retention = None
+    assert _order_seen_by_base_schedule(s) == ["dram_small", "hbm_mid"]
 
 
 def test_the_aging_reads_the_arrival_time_directly():
