@@ -104,10 +104,9 @@ metadata, bounds, _ = prepare_swa_metadata(
 # call (~30 us SparseCore, ~22 us TensorCore), which the model does not pay.
 angles = rng.standard_normal((CONTEXT + 1024, 32)).astype(np.float32)
 rope_rows = csa2_adapter._inverse_rope(
-    jnp.asarray(np.concatenate((np.cos(angles), np.sin(angles)), axis=1)),
-    jnp.asarray(positions),
+    jnp.asarray(np.concatenate((np.cos(angles), np.sin(angles)), axis=1))[positions]
 )
-csa2_adapter._inverse_rope = lambda rows, positions: rows
+csa2_adapter._inverse_rope = lambda rows: rows
 half = records_total // 2
 
 args = dict(
