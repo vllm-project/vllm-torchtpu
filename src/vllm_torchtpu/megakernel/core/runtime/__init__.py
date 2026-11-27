@@ -23,9 +23,11 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         constants,
         contract,
         eligibility,
+        exec_policy,
         layout_facts,
         policy,
         stats,
+        step_meta,
     )
     from .constants import (
         DEFAULT_BUCKETS,
@@ -59,6 +61,15 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         check_startup_eligibility,
         check_step_eligibility,
     )
+    from .exec_policy import (
+        DEFAULT_FUSED_POOL_IO_MAX_B,
+        DEFAULT_FUSED_POOL_IO_MIN_B_HI,
+        align_cache_exec,
+        bucket_exec_spec,
+        explicit_profile_settings,
+        parse_runtime_options,
+        resolve_driver_profile,
+    )
     from .layout_facts import (
         PoolLayoutFacts,
         compare_layout_facts,
@@ -78,6 +89,13 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         check_query_start_loc_uniform,
         inspect_batch_shape,
     )
+    from .step_meta import (
+        JaxStepMetaOps,
+        StepMeta,
+        StepMetaOps,
+        check_ckpt_write_cols_distinct,
+        pack_step_meta,
+    )
 
 # Public names resolve on first access (PEP 562): importing a submodule
 # (e.g. `runtime.contract`) doesn't import jax through this package. The
@@ -90,9 +108,11 @@ _SUBMODULES = frozenset(
         "constants",
         "contract",
         "eligibility",
+        "exec_policy",
         "layout_facts",
         "policy",
         "stats",
+        "step_meta",
     }
 )
 _LAZY: dict[str, str] = {
@@ -128,6 +148,13 @@ _LAZY: dict[str, str] = {
     "check_post_mesh_eligibility": ".eligibility",
     "check_startup_eligibility": ".eligibility",
     "check_step_eligibility": ".eligibility",
+    "DEFAULT_FUSED_POOL_IO_MAX_B": ".exec_policy",
+    "DEFAULT_FUSED_POOL_IO_MIN_B_HI": ".exec_policy",
+    "align_cache_exec": ".exec_policy",
+    "bucket_exec_spec": ".exec_policy",
+    "explicit_profile_settings": ".exec_policy",
+    "parse_runtime_options": ".exec_policy",
+    "resolve_driver_profile": ".exec_policy",
     "PoolLayoutFacts": ".layout_facts",
     "compare_layout_facts": ".layout_facts",
     "facts_from_pool_layout": ".layout_facts",
@@ -135,6 +162,11 @@ _LAZY: dict[str, str] = {
     "parse_mk_buckets": ".policy",
     "parse_mk_verify_buckets": ".policy",
     "select_bucket": ".policy",
+    "JaxStepMetaOps": ".step_meta",
+    "StepMeta": ".step_meta",
+    "StepMetaOps": ".step_meta",
+    "check_ckpt_write_cols_distinct": ".step_meta",
+    "pack_step_meta": ".step_meta",
 }
 
 __all__ = [
@@ -142,11 +174,14 @@ __all__ = [
     "Bucket",
     "BucketPolicy",
     "DEFAULT_BUCKETS",
+    "DEFAULT_FUSED_POOL_IO_MAX_B",
+    "DEFAULT_FUSED_POOL_IO_MIN_B_HI",
     "DEFAULT_VERIFY_BUCKETS",
     "DOMAIN_TP",
     "Decline",
     "EligibilityResult",
     "FALSE_STRS",
+    "JaxStepMetaOps",
     "LayoutDecline",
     "MAX_BUCKET_ROWS",
     "MIN_VERIFY_TOKENS",
@@ -161,11 +196,16 @@ __all__ = [
     "RunnerShape",
     "STARTUP_FLAG_RULES",
     "StepDecision",
+    "StepMeta",
+    "StepMetaOps",
     "StepMixTracker",
     "TpuMonoSpec",
     "UNSUPPORTED_TPU_CHIP",
     "UNSUPPORTED_TP_SIZE",
     "WarmupCase",
+    "align_cache_exec",
+    "bucket_exec_spec",
+    "check_ckpt_write_cols_distinct",
     "check_mrope_uniform",
     "check_post_mesh_eligibility",
     "check_query_start_loc_uniform",
@@ -175,14 +215,20 @@ __all__ = [
     "constants",
     "contract",
     "eligibility",
+    "exec_policy",
+    "explicit_profile_settings",
     "facts_from_pool_layout",
     "inspect_batch_shape",
     "layout_facts",
+    "pack_step_meta",
     "parse_mk_buckets",
     "parse_mk_verify_buckets",
+    "parse_runtime_options",
     "policy",
+    "resolve_driver_profile",
     "select_bucket",
     "stats",
+    "step_meta",
 ]
 
 
