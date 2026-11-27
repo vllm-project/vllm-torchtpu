@@ -1614,7 +1614,7 @@ def _prefill_candidates(
     rows. `positions(tile_seq, tile_row0, block_q)` gives a class's column
     positions."""
     _, rows_per_page, _, head_dim = index_cache.shape
-    work = plan.large_work()
+    work = plan.large_work(whole_later_tiles=key_cache)
     block_q, pages_per_step = plan.large_block_q, plan.large_pages_per_step
     num_cols = plan.large_pages
     pos = positions(work.tile_seq, work.tile_row0, block_q).reshape(1, -1)

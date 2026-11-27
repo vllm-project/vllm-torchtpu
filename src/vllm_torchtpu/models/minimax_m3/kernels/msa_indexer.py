@@ -475,8 +475,9 @@ def _kernel_v3(
     `key_cache` (``[pages, S / 4, D]`` u32 VMEM, packed as fp8 pages) keeps
     the MXU keys of a request's pages (`keys_cacheable`), page group `g` at
     ``g * pages_per_step``, for the tiles after its first: a work item `w`
-    with ``cached(w)`` copies no pages and scores the keys its request's
-    first tile stored, the same keys.
+    with ``cached(w)`` copies no pages and scores all of its request's pages
+    from the keys its request's first tile stored, the same keys (one item
+    per later tile: `class_work`'s `whole_later_tiles`).
     """
     slots, pages_per_step, rows, head_dim = buf.shape
     ahead = slots - 1
@@ -696,30 +697,37 @@ def _kernel_v3(
                 (step + ahead) % slots,
             )
         )
-    # A hit's last group scores its live chunks (rounded up to the smallest
-    # count) as pieces of the counts' bodies, one per set bit, largest first
-    # (the cached keys need no ring slot), where the next count's body
-    # scored up to twice its live chunks (c64 mixed step at 228K: 16 for 12).
-    pieces = key_cache is not None and all(n & (n - 1) == 0 for n in counts)
-    if pieces:
-        whole = -(-live_chunks // counts[0]) * counts[0]
-        for n in counts[::-1]:
-            first = (whole & ~(2 * n - 1)) * chunk
-            if n == num_chunks:
-                in_piece = whole == n
-            else:
-                in_piece = ((whole & n) != 0) & (whole < num_chunks)
-            pl.when(in_piece & hit)(
+    if key_cache is not None:
+        # A hit (one item per tile, `class_work`'s `whole_later_tiles`)
+        # scores all of its request's pages from the cache: whole groups in a
+        # loop over the full body, then its live chunks past them (rounded up
+        # to the smallest count) as pieces of the counts' bodies, one per set
+        # bit, largest first. A grid step per group cost ~0.5 us beyond its
+        # bodies (anvil, c64 mixed step), and the next count's body scored up
+        # to twice a last group's live chunks.
+        if any(n & (n - 1) for n in counts):
+            raise NotImplementedError(f"key_cache: chunk counts {counts}")
+        hit_chunks = -(-live // chunk)
+        hit_chunks = -(-hit_chunks // counts[0]) * counts[0]
+        full, tail = hit_chunks // num_chunks, hit_chunks % num_chunks
+
+        @pl.when(hit)
+        def _():
+            def group_body(g, carry):
+                body(step % slots, num_chunks, True, g * pages_per_step)
+                return carry
+
+            jax.lax.fori_loop(0, full, group_body, 0)
+
+        for n in counts[-2::-1]:
+            first = full * pages_per_step + (tail & ~(2 * n - 1)) * chunk
+            pl.when(hit & ((tail & n) != 0))(
                 functools.partial(body, step % slots, n, True, first)
             )
     for i, n in enumerate(counts):
         lo = counts[i - 1] if i else 0
         in_count = (live_chunks > lo) & (live_chunks <= n)
         if key_cache is not None:
-            if not pieces:
-                pl.when(in_count & hit)(
-                    functools.partial(body, step % slots, n, True)
-                )
             in_count &= jnp.logical_not(hit)
         if not slot_bodies:
             pl.when(in_count)(functools.partial(body, step % slots, n))
@@ -811,9 +819,13 @@ def class_work(
     pages_per_step,
     page_size,
     q_pad=None,
+    whole_later_tiles=False,
 ) -> ClassWork:
     """The tiles of one class and their work list: every page group of every
-    tile's request (arguments as `_class_scores`)."""
+    tile's request (arguments as `_class_scores`), or with
+    `whole_later_tiles` every group of a request's first tile and one item
+    (group 0) per later tile, which scores all of its pages (`_kernel_v3`'s
+    `key_cache`)."""
     num_tokens = index_q.shape[0]
     max_num_seqs = seq_lens.shape[0]
     pages_per_seq = block_tables.shape[0] // max_num_seqs
@@ -839,11 +851,17 @@ def class_work(
 
     # Work list: every page group of every tile's request.
     seq_pages = -(-seq_lens // page_size)
+    tile = jnp.arange(max_tiles)
     groups_per_tile = jnp.where(
-        jnp.arange(max_tiles) < num_tiles,
+        tile < num_tiles,
         jnp.maximum(-(-lookup(seq_pages, tile_seq) // pages_per_step), 1),
         0,
     )
+    if whole_later_tiles:
+        later = tile != lookup(first_tile, tile_seq)
+        groups_per_tile = jnp.where(
+            later, jnp.minimum(groups_per_tile, 1), groups_per_tile
+        )
     group_ends = jnp.cumsum(groups_per_tile)
     # A request's tiles are consecutive and take its group count each, so an
     # item's request, then its tile and group, come from per-request tables:
@@ -851,6 +869,8 @@ def class_work(
     # layer for the c48 mixed step's 816 8-row decode tiles (6,528 items).
     seq_groups = jnp.maximum(-(-seq_pages // pages_per_step), 1)
     items = tiles_per_seq * seq_groups
+    if whole_later_tiles:
+        items = jnp.where(tiles_per_seq > 0, seq_groups + tiles_per_seq - 1, 0)
     item_ends = jnp.cumsum(items)
     w = jnp.arange(max_tiles * num_groups_per_seq, dtype=jnp.int32)
     seq = jnp.minimum(
@@ -864,8 +884,15 @@ def class_work(
     # this fusion in the decode twin, j-b312f26a).
     item = w - lookup(item_ends - items, seq)
     groups = lookup(seq_groups, seq)
-    work_tile = jnp.minimum(lookup(first_tile, seq) + item // groups, max_tiles - 1)
+    work_tile = lookup(first_tile, seq) + item // groups
     work_group = item % groups
+    if whole_later_tiles:
+        later = item >= groups
+        work_tile = jnp.where(
+            later, lookup(first_tile, seq) + item - groups + 1, work_tile
+        )
+        work_group = jnp.where(later, 0, work_group)
+    work_tile = jnp.minimum(work_tile, max_tiles - 1)
     work = (work_tile << _TILE_SHIFT) | jnp.clip(work_group, 0, _GROUP_MASK)
     return ClassWork(
         work,
