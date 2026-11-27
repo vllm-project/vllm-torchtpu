@@ -13,11 +13,12 @@
 # limitations under the License.
 """Rank-ordered 2D ``('dp', 'tp')`` JAX mesh for multi-device SPMD ops.
 
-``ep_mesh.build_ep_mesh`` sorts devices by hardware ``d.id`` by default, which
-does not match ``global_rank = dp_rank * tp_size + tp_rank`` on multi-host TPU
-slices. Reshaping a hardware-sorted 1D mesh to ``(dp_size, tp_size)`` would
-scramble ``('dp', 'tp')`` coordinates relative to vLLM's ``dp_group`` and
-``tp_group``.
+2D SPMD ops over ``('dp', 'tp')`` need mesh coordinates to align with vLLM's
+row-major ``dp_group`` and ``tp_group`` (``global_rank = dp_rank * tp_size +
+tp_rank``). ``ep_mesh.build_ep_mesh`` builds a 1D EP mesh sorted by hardware
+``d.id`` by default, so reshaping a 1D hardware-sorted mesh to
+``(dp_size, tp_size)`` would not match vLLM's ``dp_group`` and ``tp_group``
+coordinates on multi-host TPU slices.
 
 Instead, ``build_dp_tp_mesh`` relies on
 ``torch.tpu.pallas.get_pallas_mesh(axis_names=('dp', 'tp'),

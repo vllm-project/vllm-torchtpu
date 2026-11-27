@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import torch.tpu.pallas as pallas_mod
 
 from vllm_torchtpu.compilation.tpu_compiler import _RUNTIME_CACHE_KEY_PATHS
 from vllm_torchtpu.distributed import dp_tp_mesh
@@ -82,17 +82,22 @@ def test_validate_accepts_rank_ordered_grid(
 
 
 @pytest.mark.parametrize(
-    ("dp_ranks", "tp_ranks"),
+    ("dp_ranks", "tp_ranks", "match"),
     [
-        ([4, 5], [4, 5, 6, 7]),  # dp column scrambled
-        ([1, 5], [5, 4, 6, 7]),  # tp row permuted
-        ([1, 5], [4, 5, 6]),  # tp row short
+        ([4, 5], [4, 5, 6, 7], r"dp_group\.ranks mismatch"),  # dp column scrambled
+        ([1, 5], [5, 4, 6, 7], r"tp_group\.ranks mismatch"),  # tp row permuted
+        (
+            [1, 5],
+            [4, 5, 6],
+            r"world_size == dp_size \* tp_size",
+        ),  # short tp row -> world mismatch
     ],
 )
 def test_build_rejects_mismatched_groups(
     monkeypatch: pytest.MonkeyPatch,
     dp_ranks: list[int],
     tp_ranks: list[int],
+    match: str,
 ) -> None:
     _patch_dist_and_groups(
         monkeypatch,
@@ -101,7 +106,7 @@ def test_build_rejects_mismatched_groups(
         dp_ranks=dp_ranks,
         tp_ranks=tp_ranks,
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=match):
         dp_tp_mesh.build_dp_tp_mesh()
 
 
@@ -114,7 +119,7 @@ def test_build_rejects_world_size_mismatch(monkeypatch: pytest.MonkeyPatch) -> N
         dp_ranks=dp_ranks,
         tp_ranks=tp_ranks,
     )
-    with pytest.raises(ValueError, match="world_size == dp_size \\* tp_size"):
+    with pytest.raises(ValueError, match=r"world_size == dp_size \* tp_size"):
         dp_tp_mesh.build_dp_tp_mesh()
 
 
@@ -140,28 +145,40 @@ def test_build_requires_initialized_parallel_state_and_dp_group(
         dp_tp_mesh.build_dp_tp_mesh()
 
 
-def test_build_dp_tp_mesh_validates_groups_and_caches(
+def test_build_dp_tp_mesh_builds_non_square_grid_and_caches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dp_ranks, tp_ranks = _groups(1, 2, 2)
+    dp_ranks, tp_ranks = _groups(7, 2, 4)
     _patch_dist_and_groups(
         monkeypatch,
-        global_rank=1,
-        world_size=4,
+        global_rank=7,
+        world_size=8,
         dp_ranks=dp_ranks,
         tp_ranks=tp_ranks,
     )
-    rank_ids = (40, 20, 10, 30)
+    rank_ids = (40, 20, 10, 30, 80, 60, 50, 70)
     calls = []
 
     def fake_get_pallas_mesh(*, axis_names, mesh_shape):
         calls.append((axis_names, mesh_shape))
         return _fake_2d_mesh(rank_ids, mesh_shape, axis_names)
 
-    monkeypatch.setattr(pallas_mod, "get_pallas_mesh", fake_get_pallas_mesh)
+    try:
+        import torch.tpu.pallas as pallas_mod
+    except ModuleNotFoundError:
+        pallas_stub = SimpleNamespace(get_pallas_mesh=fake_get_pallas_mesh)
+        monkeypatch.setitem(sys.modules, "torch.tpu.pallas", pallas_stub)
+        if "torch.tpu" not in sys.modules:
+            monkeypatch.setitem(
+                sys.modules, "torch.tpu", SimpleNamespace(pallas=pallas_stub)
+            )
+    else:
+        monkeypatch.setattr(pallas_mod, "get_pallas_mesh", fake_get_pallas_mesh)
 
     mesh = dp_tp_mesh.build_dp_tp_mesh()
-    assert calls == [(("dp", "tp"), (2, 2))]
+    assert calls == [(("dp", "tp"), (2, 4))]
+    assert tuple(int(d.id) for d in mesh.devices.flat) == rank_ids
+    assert mesh.devices[1, 3].id == rank_ids[7]
     assert dp_tp_mesh.build_dp_tp_mesh() is mesh
     assert len(calls) == 1
 
@@ -169,11 +186,11 @@ def test_build_dp_tp_mesh_validates_groups_and_caches(
 def test_build_dp_tp_mesh_inside_compile_requires_cached_entry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    dp_ranks, tp_ranks = _groups(0, 2, 2)
+    dp_ranks, tp_ranks = _groups(0, 2, 4)
     _patch_dist_and_groups(
         monkeypatch,
         global_rank=0,
-        world_size=4,
+        world_size=8,
         dp_ranks=dp_ranks,
         tp_ranks=tp_ranks,
     )
@@ -181,8 +198,8 @@ def test_build_dp_tp_mesh_inside_compile_requires_cached_entry(
 
     with pytest.raises(RuntimeError, match="before torch.compile tracing"):
         dp_tp_mesh.build_dp_tp_mesh()
-    cached = _fake_2d_mesh((0, 1, 2, 3), (2, 2))
-    dp_tp_mesh._MESH_2D_CACHE[(2, 2)] = cached
+    cached = _fake_2d_mesh(tuple(range(8)), (2, 4))
+    dp_tp_mesh._MESH_2D_CACHE[(2, 4)] = cached
     assert dp_tp_mesh.build_dp_tp_mesh() is cached
 
 
