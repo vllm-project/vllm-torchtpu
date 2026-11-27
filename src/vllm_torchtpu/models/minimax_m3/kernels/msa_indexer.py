@@ -653,7 +653,8 @@ def _kernel_v3(
     def body(slot, scored, hit=False):
         """Score the group's first `scored` chunks; the rest are past the
         request's last page (their scores are never read) and only issue
-        their share of the ahead group's descriptors."""
+        their share of the ahead group's descriptors (a `key_cache` hit
+        issues none: see below)."""
         if not hit:
             wait_pages(live, slot)
         if after_wait is not None:
@@ -662,9 +663,11 @@ def _kernel_v3(
             pages = range(
                 min(c * share, pages_per_step), min((c + 1) * share, pages_per_step)
             )
+            if hit:  # issued ahead of the body
+                pages = range(0)
             if c < scored:
                 score_chunk(slot, c * chunk, pages, hit)
-            else:
+            elif not hit:
                 start(next_base, next_live, pages, (slot + ahead) % slots)
         if after_body is not None:
             after_body(scored)
@@ -674,6 +677,21 @@ def _kernel_v3(
     counts = sorted({num_chunks} | {2**k for k in range(1, 8) if 2**k < num_chunks})
     live_chunks = jnp.minimum(-(-live // chunk), num_chunks)
     hit = False if key_cache is None else cached(step)
+    if key_cache is not None:
+        # A hit issues the ahead group's descriptors, if any, ahead of its
+        # body: the item after a hit is mostly a hit, and its predicated-off
+        # descriptors, scheduled after the scoring, idled the vector units
+        # (AOT c64 mixed step: 16- and 2-chunk hit bodies 9,286 -> 8,814 and
+        # 1,747 -> 1,341 bundles).
+        pl.when(hit & (next_live > 0))(
+            functools.partial(
+                start,
+                next_base,
+                next_live,
+                range(pages_per_step),
+                (step + ahead) % slots,
+            )
+        )
     for i, n in enumerate(counts):
         lo = counts[i - 1] if i else 0
         in_count = (live_chunks > lo) & (live_chunks <= n)
