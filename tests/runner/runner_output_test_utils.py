@@ -250,6 +250,7 @@ def step_runner(chunks, bucket, forward_model, **overrides):
 
     num_reqs = len(req_ids)
     attributes = dict(
+        _megakernel=None,
         _routed_experts=None,
         _pp_handoff=None,
         _dp_step_other_decode=False,

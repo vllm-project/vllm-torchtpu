@@ -568,6 +568,7 @@ def test_capture_model_passes_encoder_step_budget_to_precompile(
     runner.scheduler_config = SimpleNamespace(max_num_encoder_input_tokens=16)
     runner._mtp_prefill_only = False
     runner._is_async_drafter = False
+    runner._megakernel = None
     tpu_runner.TPUModelRunner.capture_model(runner)
     encoder_mgr.precompile_vision_encoder.assert_called_once_with(
         max_step_tokens=expected
