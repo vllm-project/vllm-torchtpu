@@ -113,12 +113,14 @@ def sharded_jax_callable(
     )
     # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
     # jax_op takes PartitionSpecs at runtime, as other jax_op call sites pass them.
+    in_specs: Any = tuple(spec for spec, _ in group_keys)
+    out_specs: Any = tuple(_leaf_output_specs(output_partition_specs))
     op: Any = pallas.jax_op(
         name,
         jax_step,
         mesh=mesh,
-        input_partition_specs=tuple(spec for spec, _ in group_keys),
-        output_partition_specs=tuple(_leaf_output_specs(output_partition_specs)),
+        input_partition_specs=in_specs,
+        output_partition_specs=out_specs,
         donate_argnums=tuple(g for g, (_, d) in enumerate(group_keys) if d) or None,
     )
 

@@ -86,7 +86,7 @@ def export_pooled_step(
     """Export `make_flat_pooled_step` to a serialized StableHLO module.
 
     Note: At serving time, `build_pooled_step_op` runs the step through
-    `sharded_jax_callable` (`pallas.jax_op`). This helper is provided for offline
+    `sharded_jax_callable` (a torch_tpu `jax_op`). This helper is provided for offline
     StableHLO inspection and serialization tests.
     """
     step_fn, in_specs, out_specs, donate_argnums = cache.make_flat_pooled_step(
