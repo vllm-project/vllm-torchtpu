@@ -40,12 +40,13 @@ SECTION = "tpu_pp_scheduler"
 
 @dataclass(frozen=True)
 class PPSchedulerOptions:
-    paw_aging_tok_per_s: int = 0
+    paw_aging_tok_per_s: int = 3000
     """Uncached prompt tokens credited per second a request has waited, in the
     ``prefix_aware`` orders (waiting-queue sort, running-prefill order,
-    warmest-first promotion). 0 is no aging. Only meaningful with
-    ``prefix_aware``, so a positive value without it is refused. The
-    validation entries' prefill legs run 3000."""
+    warmest-first promotion), so a large prompt is overtaken for a bounded
+    time; 0 turns the aging off. Read only with ``prefix_aware``, so a
+    positive value set without it is refused. The default is the value the
+    validation entries' prefill legs run (they also set it)."""
 
     prefix_aware: bool = False
     """Borrow ``PrefixAwareScheduler``'s admission on a pipeline: the
@@ -72,7 +73,7 @@ def parse(raw: Any) -> PPSchedulerOptions:
     Strict: an unknown key, or a value whose type is not exactly the field's
     (``0`` for a bool, ``true`` or ``3000.0`` for a whole number), raises
     ``ValueError`` (``config_section.parse``), and so does a negative aging
-    rate or one set without ``prefix_aware``.
+    rate or a positive one set without ``prefix_aware``.
     """
     options = config_section.parse(PPSchedulerOptions, SECTION, raw)
     aging = options.paw_aging_tok_per_s
@@ -81,7 +82,8 @@ def parse(raw: Any) -> PPSchedulerOptions:
             f"additional_config.{SECTION}.paw_aging_tok_per_s must be >= 0, "
             f"got {aging!r}"
         )
-    if aging > 0 and not options.prefix_aware:
+    set_here = isinstance(raw, dict) and "paw_aging_tok_per_s" in raw
+    if not options.prefix_aware and aging > 0 and set_here:
         raise ValueError(
             f"additional_config.{SECTION}.paw_aging_tok_per_s ages the "
             "prefix_aware orders; set prefix_aware to true or leave it at 0"

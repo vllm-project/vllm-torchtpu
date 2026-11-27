@@ -130,7 +130,7 @@ def test_defaults_are_the_schedulers_behaviour_without_options():
         opts.quadratic_cost,
         opts.prefix_aware,
         opts.paw_aging_tok_per_s,
-    ) == (False, False, 0.0)
+    ) == (False, False, 3000)
     assert pp_scheduler_options.get(SimpleNamespace(additional_config=None)) == opts
     # VllmConfig always has additional_config: a config without it is an error.
     with pytest.raises(AttributeError, match="additional_config"):
@@ -283,6 +283,25 @@ def test_prefix_aware_opts_the_pool_into_the_memo():
     assert s._get_paw_aging_rate() == 3000.0
     # The waiting-queue sort runs on a KV producer.
     assert s._paw_sort
+
+
+def test_prefix_aware_ages_its_orders_by_default():
+    """With prefix_aware on and no aging rate set, the orders age at 3000
+    tokens per second, so a large prompt is not overtaken without bound; 0
+    turns the aging off, and without prefix_aware nothing ages."""
+    s, _ = _built({"tpu_pp_scheduler": {"prefix_aware": True}})
+    assert s._get_paw_aging_rate() == 3000.0
+    s, _ = _built(
+        {"tpu_pp_scheduler": {"prefix_aware": True, "paw_aging_tok_per_s": 0}}
+    )
+    assert s._get_paw_aging_rate() == 0.0
+    s, _ = _built({"tpu_pp_scheduler": {"quadratic_cost": True}})
+    assert s._get_paw_aging_rate() == 0.0
+    # An explicit 0 without prefix_aware is accepted, as before, and so is a
+    # missing section or a section without the rate.
+    assert pp_scheduler_options.parse({"paw_aging_tok_per_s": 0}).prefix_aware is False
+    for raw in (None, {}, {"quadratic_cost": True}):
+        assert pp_scheduler_options.parse(raw).paw_aging_tok_per_s == 3000
 
 
 def test_quadratic_cost_opts_the_pool_into_the_memo_without_the_admission():

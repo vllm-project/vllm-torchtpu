@@ -230,7 +230,10 @@ class TpuPipelineChunkScheduler(Scheduler):
             )
         self._quadratic_cost = options.quadratic_cost
         self._prefix_aware = options.prefix_aware
-        self._paw_aging_tok_per_s = options.paw_aging_tok_per_s
+        # The aging rate is read only by the prefix-aware orders.
+        self._paw_aging_tok_per_s = (
+            options.paw_aging_tok_per_s if options.prefix_aware else 0
+        )
         # The wall time of the schedule() call in progress (None between
         # steps), which the prefix-aware ranking ages requests against.
         self._step_wall_time: float | None = None
