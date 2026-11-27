@@ -16,6 +16,7 @@ The recipes below are extracted directly from the repository's active PR and nig
 | `Qwen/Qwen3.5-35B-A3B-FP8` | `v7x-8` (1 host, 8 devices) | `TP=8, DP=1` + EP | `fp8` weights, `fp8` KV | [`qwen3.5-35b-fp8-tp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/qwen3.5-35b-fp8-tp8-ep.sh) |
 | `RedHatAI/gemma-4-31B-it-FP8-Dynamic` | `v7x-8` (1 host, 8 devices) | `TP=2, DP=4` | `compressed-tensors` FP8 | [`gemma-4-31b-fp8-dp4-tp2-multimodal.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/gemma-4-31b-fp8-dp4-tp2-multimodal.sh) |
 | `deepseek-ai/DeepSeek-V4-Flash` | `v7x-8` (1 host, 8 devices) | `TP=1, DP=8` + EP | `deepseek_v4_fp8` (W4A8 MoE), `fp8_e4m3` KV | [`deepseek-v4-flash-dp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/deepseek-v4-flash-dp8-ep.sh) |
+| `reflection/Beam-1.0-501B-A23B-FP8` | `v7x-8` (1 host, 8 devices) | `TP=8, DP=1` + EP | `fp8` weights, `fp8` KV (`VLLM_KV_CACHE_LAYOUT=HND`) | [`beam-1.0-501b-fp8-tp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/beam-1.0-501b-fp8-tp8-ep.sh) |
 | `zai-org/GLM-5.2-FP8` | `v7x-16` (2 hosts, 16 devices) | `TP=1, DP=16` + EP | `fp8` weights, `fp8` KV | [`glm-5.2-fp8-dp16-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/glm-5.2-fp8-dp16-ep.sh) |
 | `deepseek-ai/DeepSeek-V4-Pro-0813` | `v7x-16` (2 hosts, 16 devices) | `TP=1, DP=16` + EP | `deepseek_v4_fp8` (W4A8 MoE), `fp8_e4m3` KV | [`deepseek-v4-pro-dp16-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/deepseek-v4-pro-dp16-ep.sh) |
 | `moonshotai/Kimi-K3` | `v7x-32` (4 hosts, 32 devices) | `TP=32, DP=1` + EP | `compressed-tensors` FP8, `fp8` KV | [`kimi-k3-tp32-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh) |
@@ -139,6 +140,32 @@ vllm bench serve \
   --ignore-eos \
   --skip-chat-template
 ```
+
+### `reflection/Beam-1.0-501B-A23B-FP8` (`TP=8 + EP`)
+
+Validated nightly in [`scripts/vllm/benchmarking/configs/beam-1.0-501b-fp8-tp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/beam-1.0-501b-fp8-tp8-ep.sh):
+
+```bash
+VLLM_KV_CACHE_LAYOUT=HND \
+vllm serve reflection/Beam-1.0-501B-A23B-FP8 \
+  --tensor-parallel-size 8 \
+  --data-parallel-size 1 \
+  --enable-expert-parallel \
+  --enable-ep-weight-filter \
+  --dtype bfloat16 \
+  --kv-cache-dtype fp8 \
+  --attention-backend CUSTOM \
+  --block-size 256 \
+  --max-model-len 8192 \
+  --max-num-batched-tokens 2048 \
+  --max-num-seqs 64 \
+  --gpu-memory-utilization 0.95 \
+  --async-scheduling \
+  --no-enable-prefix-caching \
+  --port 8000
+```
+
+> **Set `VLLM_KV_CACHE_LAYOUT=HND` for the full KV cache.** At `TP=8` each device holds one of Beam's 8 KV heads, and the default layout pads FP8 KV pages to the BF16 size, which halves the KV pool. The HND layout stores them unpadded. Once [#3854](https://github.com/vllm-project/vllm-torchtpu/issues/3854) picks this layout automatically, the variable is no longer needed.
 
 ---
 
