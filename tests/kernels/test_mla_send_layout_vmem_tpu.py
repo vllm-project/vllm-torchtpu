@@ -19,9 +19,13 @@ in-kernel rope, capped windows, fused window prep), compiles and returns the
 same outputs, bit for bit, as with the cap off: the attention output and the
 send buffer. Two shapes: the 32 MiB cap (batch 8, top-k cap 512) and a
 scratch larger than the cap (batch 16, top-k cap 1024), where the limit is the
-call's own VMEM scratch plus the headroom. Positive control: the switch pins
+call's own VMEM scratch plus the headroom. Controls: two cap-off runs agree bit
+for bit (so the comparison is meaningful), and for each shape the switch pins
 the call's operands to HBM and sets its scoped VMEM limit.
 """
+
+import json
+import re
 
 import jax
 import jax.numpy as jnp
@@ -125,28 +129,42 @@ def _bits(result):
     return [np.asarray(x).view(np.uint8) for x in jax.tree.leaves(result)]
 
 
+def _run(arrays, batch, cap, send_vmem_cap):
+    return _bits(
+        jax.block_until_ready(
+            _attention(*arrays, batch=batch, cap=cap, send_vmem_cap=send_vmem_cap)
+        )
+    )
+
+
 @pytest.mark.parametrize(("batch", "cap"), SHAPES)
 def test_capped_send_layout_call_bit_identical(batch, cap):
     _require_tpu()
     arrays = _problem(cap, seed=batch)
-    off = _bits(
-        jax.block_until_ready(
-            _attention(*arrays, batch=batch, cap=cap, send_vmem_cap=False)
-        )
-    )
-    on = _bits(
-        jax.block_until_ready(
-            _attention(*arrays, batch=batch, cap=cap, send_vmem_cap=True)
-        )
-    )
-    assert len(on) == len(off) == 2
+    off = _run(arrays, batch, cap, False)
+    off_again = _run(arrays, batch, cap, False)
+    on = _run(arrays, batch, cap, True)
+    assert len(on) == len(off) == len(off_again) == 2
+    for a, b in zip(off_again, off):
+        assert np.array_equal(a, b), "two cap-off runs differ: no baseline"
     for a, b in zip(on, off):
         assert np.array_equal(a, b)
 
 
-def test_switch_pins_the_call_and_sets_its_limit():
+def _mla_config(text):
+    """The backend config of the lowered program's one MLA call."""
+    configs = [
+        json.loads(m.group(1).replace("\\22", '"'))
+        for line in text.splitlines()
+        if (m := re.search(r'backend_config = "(.*?)".*kernel_name = "MLA-', line))
+    ]
+    assert len(configs) == 1, len(configs)
+    return configs[0]
+
+
+@pytest.mark.parametrize(("batch", "cap"), SHAPES)
+def test_switch_pins_the_call_and_sets_its_limit(batch, cap):
     _require_tpu()
-    batch, cap = SHAPES[0]
     arrays = _problem(cap, seed=batch)
 
     def lowered(send_vmem_cap):
@@ -156,7 +174,15 @@ def test_switch_pins_the_call_and_sets_its_limit():
             .as_text()
         )
 
-    on, off = lowered(True), lowered(False)
-    limit = f"\\22size\\22: {sparse_mla.SEND_LAYOUT_VMEM_LIMIT_BYTES}"
-    assert "input_memory_space_colors" in on and limit in on
-    assert "input_memory_space_colors" not in off and limit not in off
+    on, off = _mla_config(lowered(True)), _mla_config(lowered(False))
+    assert "input_memory_space_colors" in on["custom_call_config"]
+    assert "input_memory_space_colors" not in off["custom_call_config"]
+    capped = sparse_mla.SEND_LAYOUT_VMEM_LIMIT_BYTES
+    default = sparse_mla.DEFAULT_VMEM_LIMIT_BYTES
+    on_size = on["scoped_memory_configs"][0]["size"]
+    assert off["scoped_memory_configs"][0]["size"] == default
+    if (batch, cap) == SHAPES[0]:
+        assert on_size == capped
+    else:
+        # The scratch exceeds the cap: the limit is above it, below the default.
+        assert capped < on_size < default
