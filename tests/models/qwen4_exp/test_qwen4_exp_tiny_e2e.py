@@ -32,6 +32,7 @@ import pytest
 import torch
 from transformers import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
 from vllm import LLM, SamplingParams
+from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.inputs import TokensPrompt
 
 pytestmark = [pytest.mark.tpu_test, pytest.mark.spawns_tpu_workers]
@@ -178,8 +179,12 @@ def reference(tmp_path_factory):
     )
 
 
-@pytest.fixture(scope="module")
-def llm(reference):
+@pytest.fixture(
+    scope="module",
+    params=[{"tpu_rope_in_graph": True}, {"tpu_rope_in_graph": False}],
+    ids=["rope_in_graph", "rope_table"],
+)
+def llm(request, reference):
     path = reference.path
     llm = LLM(
         model=path,
@@ -191,9 +196,11 @@ def llm(reference):
         enable_prefix_caching=True,
         gpu_memory_utilization=0.5,
         disable_log_stats=False,
+        additional_config=request.param,
     )
     yield weakref.proxy(llm)
     del llm
+    cleanup_dist_env_and_memory()
 
 
 def _prompt_logprobs(llm, sequences) -> list[torch.Tensor]:
