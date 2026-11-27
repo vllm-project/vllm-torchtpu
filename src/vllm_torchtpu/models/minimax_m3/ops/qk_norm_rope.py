@@ -31,35 +31,45 @@ def get_qk_norm_rope_op(
     eps: float,
     q_head_major: bool,
     rotate: bool = False,
+    piece_ranks: int = 0,
 ) -> Callable[..., tuple[torch.Tensor, ...]]:
     """`qk_norm_rope.qk_norm_rope` as a torch op, built once per config from
-    module ``__init__`` (as `ops.msa.get_msa_op`)."""
+    module ``__init__`` (as `ops.msa.get_msa_op`). With `piece_ranks` the op
+    takes ``qkv`` as the two row pieces of a sequence-parallel step over that
+    many ranks (`qk_norm_rope.qk_norm_rope`'s pieces), then the rest."""
+    norm_rope = functools.partial(
+        qk_norm_rope.qk_norm_rope,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        eps=eps,
+        q_head_major=q_head_major,
+        rotate=rotate,
+    )
 
     def _norm_rope_jax(
         qkv: jax.Array, cos_sin: jax.Array, weight: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-        return qk_norm_rope.qk_norm_rope(
-            qkv,
-            cos_sin,
-            weight,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            eps=eps,
-            q_head_major=q_head_major,
-            rotate=rotate,
-        )
+        return norm_rope(qkv, cos_sin, weight)
+
+    def _norm_rope_pieces_jax(
+        qkv0: jax.Array, qkv1: jax.Array, cos_sin: jax.Array, weight: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+        return norm_rope((qkv0, qkv1), cos_sin, weight, piece_ranks=piece_ranks)
 
     op = pallas.jax_op(
         f"pallas::minimax_m3_qk_norm_rope_q{num_heads}_kv{num_kv_heads}_d{head_dim}"
-        f"_e{eps!r}_hm{int(q_head_major)}{'_rot' if rotate else ''}".replace(
-            ".", "p"
-        ).replace("-", "m"),
-        _norm_rope_jax,
+        f"_e{eps!r}_hm{int(q_head_major)}{'_rot' if rotate else ''}"
+        f"{f'_pieces{piece_ranks}' if piece_ranks else ''}".replace(".", "p").replace(
+            "-", "m"
+        ),
+        _norm_rope_pieces_jax if piece_ranks else _norm_rope_jax,
     )
 
-    def _fake(qkv, cos_sin, weight):
-        num_tokens = qkv.shape[0]
+    def _fake(*args):
+        pieces = 2 if piece_ranks else 1
+        qkv = args[0]
+        num_tokens = pieces * qkv.shape[0]
         q_shape = (
             (num_heads, num_tokens, head_dim)
             if q_head_major

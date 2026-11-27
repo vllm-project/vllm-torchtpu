@@ -36,6 +36,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
@@ -208,7 +209,7 @@ def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
 
 
 def norm_rope_heads(
-    qkv: torch.Tensor,
+    qkv: torch.Tensor | list[torch.Tensor],
     positions: torch.Tensor,
     num_heads: int,
     num_kv_heads: int,
@@ -219,7 +220,8 @@ def norm_rope_heads(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Split ``[q | k | v | index_q | index_k]`` and norm + rotate all but v
     in one kernel, `op` (`ops.qk_norm_rope.get_qk_norm_rope_op` for these
-    head counts; it also fixes q's layout).
+    head counts; it also fixes q's layout). ``qkv`` may be an SP step's two
+    row pieces, for an op built with ``piece_ranks``.
 
     The four Gemma RMSNorms differ only in their weights and RoPE acts on each
     head alone, so the kernel norms every head with its row of a per-head
@@ -241,9 +243,10 @@ def norm_rope_heads(
         + 1.0
     )
     assert all(n.variance_epsilon == q_norm.variance_epsilon for n in norms)
-    cos_sin = rotary_emb._match_cos_sin_cache_dtype(qkv)
+    pieces = qkv if isinstance(qkv, list) else [qkv]
+    cos_sin = rotary_emb._match_cos_sin_cache_dtype(pieces[0])
     cos_sin = cos_sin.index_select(0, positions.flatten())
-    return op(qkv, cos_sin, weight)
+    return op(*pieces, cos_sin, weight)
 
 
 class StepHalves:
@@ -480,6 +483,26 @@ class MiniMaxM3SparseAttention(nn.Module):
             and self.dcp_size > 1
             and fp4_dcp_rotates_queries(self.dcp_size, self.kv_head_replicas),
         )
+        # An SP step's two gathered row pieces go to the kernel as they are:
+        # their concatenation in step order (`_step_rows`) cost a copy of qkv
+        # (12.7 us per layer at c64's 8K-token steps, twin j-5c900b89).
+        self.pieces_norm_rope_op = None
+        if (
+            tp_size > 1
+            and envs.TPU_MINIMAX_M3_SP_ATTN_PIECES
+            and envs.TPU_MINIMAX_M3_SP_FFN_PIECES == 2
+        ):
+            self.pieces_norm_rope_op = get_qk_norm_rope_op(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                eps,
+                self.q_head_major,
+                rotate=self.fp4
+                and self.dcp_size > 1
+                and fp4_dcp_rotates_queries(self.dcp_size, self.kv_head_replicas),
+                piece_ranks=tp_size,
+            )
         if self.local_kv_heads > 1:
             # Several KV heads per group: q is token-major, nothing rotates.
             self.local_norm_rope_op = get_qk_norm_rope_op(
@@ -539,9 +562,14 @@ class MiniMaxM3SparseAttention(nn.Module):
                 and isinstance(hidden_states, (torch.Tensor, tuple))
                 and positions.shape[0] < dcp_local_kv.MAX_TOKENS
             )
+        kv_heads, norm_rope_op = self.num_kv_heads, self.norm_rope_op
         if qkv is None and isinstance(hidden_states, list):
             # An SP step's gathered row pieces: project each as it lands.
-            qkv = _step_rows([self._qkv(p) for p in hidden_states])
+            qkv = [self._qkv(p) for p in hidden_states]
+            if len(qkv) == 2 and self.pieces_norm_rope_op is not None:
+                norm_rope_op = self.pieces_norm_rope_op
+            else:
+                qkv = _step_rows(qkv)
         elif qkv is None:
             qkv = self._qkv(hidden_states)
         if after is not None:
@@ -549,7 +577,6 @@ class MiniMaxM3SparseAttention(nn.Module):
             # the reads of the call that produced `after` (else XLA copies
             # the caches).
             qkv = qkv + _zero_of(after).to(qkv.dtype)
-        kv_heads, norm_rope_op = self.num_kv_heads, self.norm_rope_op
         if local:
             kv_heads, norm_rope_op = self.local_kv_heads, self.local_norm_rope_op
             qkv = dcp_local_kv.group_heads(
@@ -570,7 +597,9 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.rotary_emb,
             norm_rope_op,
         )
-        num_tokens = qkv.shape[0]
+        num_tokens = (
+            sum(x.shape[0] for x in qkv) if isinstance(qkv, list) else qkv.shape[0]
+        )
         if not self.q_head_major:
             q = q.view(num_tokens, self.num_heads, self.head_dim)
         metadata = get_forward_context().attn_metadata

@@ -129,11 +129,12 @@ def _kernel(
         "q_head_major",
         "rotate",
         "block_tokens",
+        "piece_ranks",
         "interpret",
     ),
 )
 def qk_norm_rope(
-    qkv: jax.Array,
+    qkv: jax.Array | tuple[jax.Array, ...],
     cos_sin: jax.Array,
     weight: jax.Array,
     *,
@@ -144,9 +145,14 @@ def qk_norm_rope(
     q_head_major: bool = False,
     rotate: bool = False,
     block_tokens: int = DEFAULT_BLOCK_TOKENS,
+    piece_ranks: int = 1,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """``(q, k, v, index_q, index_k)`` of ``qkv [T, (nq + 3 * nkv + 1) * D]``.
+
+    ``qkv`` may come as a tuple of row pieces of a sequence-parallel step
+    (`_piece_rows`): piece ``p`` holds row block ``p`` of each of the
+    `piece_ranks` ranks' shards; the outputs are in step order.
 
     ``cos_sin [T, rotary_dim]`` holds each token's ``cos | sin`` (the rotary
     cache rows of its position, in the activation dtype); ``weight [nq + 2 *
@@ -155,7 +161,9 @@ def qk_norm_rope(
     k, v and index_q ``[T, nkv * D]``, index_k ``[T, D]``. `rotate`: q and
     index_q times ``H / D`` (`msa_fp4.rotate_queries`).
     """
-    num_tokens = qkv.shape[0]
+    pieces = tuple(qkv) if isinstance(qkv, (tuple, list)) else (qkv,)
+    qkv = pieces[0]
+    num_tokens = sum(p.shape[0] for p in pieces)
     nq, nkv, d = num_heads, num_kv_heads, head_dim
     if qkv.shape[1] != (nq + 3 * nkv + 1) * d or weight.shape != (nq + 2 * nkv + 1, d):
         raise ValueError(
@@ -170,6 +178,10 @@ def qk_norm_rope(
     # of the 16-row bf16 tile, the last block partial.
     block_t = max(1, min(num_tokens, block_tokens))
     rows = lambda i: (i, 0)  # noqa: E731
+    if len(pieces) > 1:
+        piece_specs, block_t = _piece_rows(pieces, piece_ranks, block_t)
+    else:
+        piece_specs = [pl.BlockSpec((block_t, qkv.shape[1]), rows)]
     kv_shape = jax.ShapeDtypeStruct((num_tokens, nkv * d), qkv.dtype)
     if q_head_major:
         q_spec = pl.BlockSpec((nq, block_t, d), lambda i: (0, i, 0))
@@ -193,6 +205,14 @@ def qk_norm_rope(
                 qkv, cs, w, partner, factors, *outs, hadamard_ref=hadamard, **kw
             )
 
+    if len(pieces) > 1:
+        kernel = functools.partial(
+            _pieces_kernel,
+            kernel,
+            len(pieces),
+            num_tokens // (len(pieces) * piece_ranks) // block_t,
+        )
+
     return pl.pallas_call(
         functools.partial(
             kernel,
@@ -205,7 +225,7 @@ def qk_norm_rope(
         ),
         grid=(pl.cdiv(num_tokens, block_t),),
         in_specs=[
-            pl.BlockSpec((block_t, qkv.shape[1]), rows),
+            *piece_specs,
             pl.BlockSpec((block_t, rotary_dim), rows),
             pl.BlockSpec(weight.shape, lambda i: (0, 0)),
             *mat_specs,
@@ -227,4 +247,47 @@ def qk_norm_rope(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
         name="minimax_m3_qk_norm_rope",
-    )(qkv, cos_sin, weight.astype(jnp.float32), *mats)
+    )(*pieces, cos_sin, weight.astype(jnp.float32), *mats)
+
+
+def _piece_rows(
+    pieces: tuple[jax.Array, ...], ranks: int, block_t: int
+) -> tuple[list[pl.BlockSpec], int]:
+    """Input specs reading step-order row blocks of ``block_t`` rows from
+    the pieces in place (step row block i is in one piece), and the block
+    size: a divisor of a rank's rows per piece. A piece's block index stays
+    put while another piece is read, so no block is fetched twice."""
+    n, rows, width = len(pieces), pieces[0].shape[0], pieces[0].shape[1]
+    if any(p.shape != pieces[0].shape for p in pieces) or rows % ranks:
+        raise ValueError(
+            f"{n} pieces of {[p.shape for p in pieces]} over {ranks} ranks"
+        )
+    per = rows // ranks
+    # The largest 16-row multiple up to block_t dividing a rank's rows: gcd
+    # gave 480 rows (7680-token steps) 32-row blocks, 4x slower (130 vs 33 us,
+    # twin j-6a828fc0).
+    tiles = [b for b in range(min(per, block_t) // 16 * 16, 0, -16) if per % b == 0]
+    if not tiles:
+        raise ValueError(f"{per} rows per rank and piece do not tile 16-row blocks")
+    block_t = tiles[0]
+    bpp = per // block_t  # blocks per rank and piece
+
+    def spec(k):
+        def index(i):
+            r, p, h = i // (n * bpp), i // bpp % n, i % bpp
+            h = jnp.where(p == k, h, jnp.where(p > k, bpp - 1, 0))
+            return r * bpp + h, 0
+
+        return pl.BlockSpec((block_t, width), index)
+
+    return [spec(k) for k in range(n)], block_t
+
+
+def _pieces_kernel(kernel, n, bpp, *refs, **kw):
+    """`kernel` on the piece the grid step's step-order rows are in."""
+    piece = pl.program_id(0) // bpp % n
+    for k in range(n):
+
+        @pl.when(piece == k)
+        def _(k=k):
+            kernel(refs[k], *refs[n:], **kw)

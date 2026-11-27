@@ -110,3 +110,48 @@ def test_lowers_for_tpu(num_tokens, q_head_major, rotate):
     with use_abstract_mesh(tpu7x):
         lowered = jax.jit(fn).trace(*args).lower(lowering_platforms=("tpu",))
     assert "tpu_custom_call" in lowered.as_text()
+
+
+@pytest.mark.parametrize("rotate", [False, True])
+@pytest.mark.parametrize("q_head_major", [False, True])
+@pytest.mark.parametrize(
+    "ranks,rows_per_rank,block_tokens",
+    [(8, 64, 256), (4, 512, 256), (2, 96, 64), (2, 480, 256)],
+)
+def test_pieces_match_step_rows(
+    ranks, rows_per_rank, block_tokens, q_head_major, rotate
+):
+    """Two SP row pieces (piece p: block p of every rank's shard) give the
+    outputs of their rows in step order, bit for bit."""
+    nq, nkv = 4, 2
+    num_tokens = 2 * ranks * rows_per_rank
+    rng = np.random.default_rng(ranks + rows_per_rank)
+    qkv = jnp.asarray(
+        rng.normal(0, 2, (num_tokens, (nq + 3 * nkv + 1) * D)), jnp.bfloat16
+    )
+    ang = rng.uniform(0, 100, (num_tokens, ROT // 2))
+    cos_sin = jnp.asarray(np.concatenate([np.cos(ang), np.sin(ang)], 1), jnp.bfloat16)
+    weight = jnp.asarray(1 + rng.normal(0, 0.3, (nq + 2 * nkv + 1, D)), jnp.float32)
+    # Step rows [rank][piece][row] -> piece p's rows [rank][row].
+    blocks = qkv.reshape(ranks, 2, rows_per_rank, -1)
+    pieces = tuple(blocks[:, p].reshape(ranks * rows_per_rank, -1) for p in range(2))
+    run = functools.partial(
+        qk_norm_rope.qk_norm_rope,
+        cos_sin=cos_sin,
+        weight=weight,
+        num_heads=nq,
+        num_kv_heads=nkv,
+        head_dim=D,
+        eps=EPS,
+        q_head_major=q_head_major,
+        rotate=rotate,
+        block_tokens=block_tokens,
+        interpret=True,
+    )
+    got = run(pieces, piece_ranks=ranks)
+    want = run(qkv)
+    for g, w in zip(got, want):
+        assert g.shape == w.shape
+        np.testing.assert_array_equal(
+            np.asarray(g, np.float32), np.asarray(w, np.float32)
+        )
