@@ -1926,3 +1926,32 @@ def test_check_and_update_config_preserves_programmatic_ep_weight_filter(
     vllm_config = _make_ep_filter_vllm_config(enable_ep_weight_filter=initial_filter)
     TpuPlatform.check_and_update_config(vllm_config)
     assert vllm_config.parallel_config.enable_ep_weight_filter is initial_filter
+
+
+class TestFp8Dtype:
+    """fp8_dtype() is vLLM's generic fp8 type: no log, and the KV cache dtype
+    is not taken from it."""
+
+    @pytest.mark.parametrize(
+        "device, expected",
+        [("TPU v6e", torch.float8_e5m2), ("TPU v7x", torch.float8_e4m3fn)],
+    )
+    def test_returns_the_chip_type_without_logging(self, device, expected):
+        with (
+            patch.object(
+                tpu_platform.TpuPlatform, "get_device_name", return_value=device
+            ),
+            patch.object(tpu_platform.logger, "info") as info,
+            patch.object(tpu_platform.logger, "warning") as warning,
+        ):
+            assert tpu_platform.TpuPlatform.fp8_dtype() == expected
+        info.assert_not_called()
+        warning.assert_not_called()
+
+    def test_fp8_kv_cache_is_e4m3fn_on_every_chip(self):
+        from vllm_torchtpu.layers.adapter.attention import (
+            TPU_STR_DTYPE_TO_TORCH_DTYPE,
+        )
+
+        assert TPU_STR_DTYPE_TO_TORCH_DTYPE["fp8"] == torch.float8_e4m3fn
+        assert TPU_STR_DTYPE_TO_TORCH_DTYPE["fp8_e5m2"] == torch.float8_e5m2

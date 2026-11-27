@@ -788,8 +788,11 @@ class TpuPlatform(Platform):
 
     @classmethod
     def fp8_dtype(cls) -> torch.dtype:
+        # vLLM asks for its generic fp8 type here whatever the KV cache dtype,
+        # so this must not log. It does not choose the KV cache dtype: the TPU
+        # KV cache follows TPU_STR_DTYPE_TO_TORCH_DTYPE ("fp8" is
+        # float8_e4m3fn on every chip).
         if cls.get_device_name().lower() == "tpu v6e":
-            logger.info("Automatically using fp8_e5m2 for FP8 KV cache on TPU v6e.")
             return torch.float8_e5m2
         return torch.float8_e4m3fn
 
