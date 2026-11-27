@@ -169,11 +169,16 @@ def local_rows(x: torch.Tensor) -> torch.Tensor:
     return _rank_block(x.view(tp, x.shape[0] // tp, *x.shape[1:]))
 
 
-def _full_weight(o_proj: nn.Module, tp: int) -> torch.Tensor:
-    """e4m3 [TP, K/TP, N]: every rank's rescaled block."""
+def _full_weight(
+    o_proj: nn.Module, tp: int, after: torch.Tensor | None = None
+) -> torch.Tensor:
+    """e4m3 [TP, K/TP, N]: every rank's rescaled block, gathered once
+    ``after`` is computed (its all-gather then cannot start before)."""
     w = o_proj.weight
     if w.dim() == 3:
         return w
+    if after is not None:
+        w = _after_op(w, after)
     w = tensor_model_parallel_all_gather(w, 0)
     return w.view(tp, -1, w.shape[-1])
 
@@ -218,6 +223,16 @@ _quantize_op.register_fake(
         x.new_empty((*x.shape[:-1], 1), dtype=torch.float32),
     )
 )
+
+
+def _after(x: jax.Array, dep: jax.Array) -> jax.Array:
+    """x, once dep is computed: an XLA optimization barrier over both, no
+    copy."""
+    return jax.lax.optimization_barrier((x, dep))[0]
+
+
+_after_op = pallas.jax_op("pallas::minimax_m3_sp_after", _after)
+_after_op.register_fake(lambda x, dep: torch.empty_like(x))
 _o_proj_e4m3_op = pallas.jax_op("pallas::minimax_m3_sp_o_proj_e4m3", _o_proj_e4m3)
 _o_proj_e4m3_op.register_fake(
     lambda q, r, w, s: q.new_empty((q.shape[1], w.shape[2]), dtype=torch.bfloat16)
@@ -230,6 +245,7 @@ def sp_o_proj(
     pieces: int = 1,
     after: torch.Tensor | None = None,
     weight: torch.Tensor | None = None,
+    weight_after: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """o_proj(attn) summed over TP, for this rank's row shard: ``attn`` is
     this rank's heads for all T rows, bf16 [T, K/TP]; returns [T/TP, N].
@@ -240,10 +256,13 @@ def sp_o_proj(
     of the received rows runs after ``after`` is computed (a data
     dependence), so the all-to-all can cross under the work producing it.
     ``weight``: every rank's blocks [TP, K/TP, N], already gathered
-    (`gathers_with_attention`)."""
+    (`gathers_with_attention`); else they are gathered here, not before
+    ``weight_after`` is computed (the step's last gathered attention input:
+    the weight's all-gather then shares the links with the attention, not
+    with the input gathers that attention waits for)."""
     tp = get_tp_group().world_size
     rows, k = attn.shape
-    w = _full_weight(o_proj, tp) if weight is None else weight
+    w = _full_weight(o_proj, tp, weight_after) if weight is None else weight
     # A replicated weight starts at this rank's block: rotate the heads alike.
     order = _rotate_blocks if o_proj.weight.dim() == 3 else (lambda x: x)
     if envs.TPU_MINIMAX_M3_SP_A2A_E4M3:

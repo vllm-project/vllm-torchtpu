@@ -291,7 +291,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
                     if envs.TPU_MINIMAX_M3_SP_ATTN_PIECES
                     else 1
                 )
-                update = sp_o_proj.sp_o_proj(o_proj, attn, pieces, weight=weight)
+                update = sp_o_proj.sp_o_proj(
+                    o_proj, attn, pieces, weight=weight, weight_after=_last(normed)
+                )
             else:
                 attn = self.self_attn(positions, normed, half=whole)
                 update = tensor_model_parallel_reduce_scatter(attn, 0)
@@ -444,6 +446,15 @@ def _piece_major_rows(
     pieces' order: piece i holds every rank's i-th row block of its shard."""
     x = x[:tokens].view(tp_size, pieces, -1, *x.shape[1:])
     return x.transpose(0, 1).flatten(0, 2)
+
+
+def _last(gathered: object) -> torch.Tensor:
+    """The rows of the last row piece a gather returned: the piece, or of
+    e4m3 rows with their scales the rows (the scales take their own, smaller
+    gather, which can end first)."""
+    while isinstance(gathered, list):
+        gathered = gathered[-1]
+    return gathered[0] if isinstance(gathered, tuple) else gathered
 
 
 def _identity_rows(x: torch.Tensor) -> torch.Tensor:
