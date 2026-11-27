@@ -147,3 +147,22 @@ Sizing:
 
 - `TPU_PCP_KV_WORKSPACE_TOKENS` (default `1048576`): if the prefills in a step need more context tokens than this, the runner runs the step as several forwards. Must be at least `--max-model-len`. A prefill forward allocates a temporary workspace of this many tokens, reused across layers: about 0.6 GB for the MLA latents and 0.27 GB for the indexer K at the default. KV cache sizing does not reserve it yet, so leave room for it in `--gpu-memory-utilization`.
 - `TPU_PCP_KV_CHUNK_TOKENS` (default `65536`): context tokens moved by each all-gather.
+
+---
+
+## 6. Telemetry: Parallel Configuration at Startup
+
+Set `VLLM_TPU_EMIT_PLACEMENT=1` to record how an engine was parallelised. It is off by default. When set, the Python API server that `vllm serve` starts writes one line to its log at startup, before it accepts requests:
+
+```text
+rank_placement {"parallel": {"data_parallel_size": 2, "decode_context_parallel_size": 1, "enable_expert_parallel": false, "nnodes": 1, "pipeline_parallel_size": 1, "prefill_context_parallel_size": 1, "tensor_parallel_size": 4, "world_size": 4}}
+```
+
+The values are vLLM's `ParallelConfig` fields. `world_size` is the number of workers in one engine (`PP` x `TP` x `PCP`); data-parallel replicas are separate engines counted by `data_parallel_size`, `decode_context_parallel_size` does not change `world_size`, and `nnodes` is the total node count configured for the deployment. With several API server processes, each one writes the line.
+
+The line comes from a hook on vLLM's `build_app`, so an entrypoint that does not build that app around an engine writes nothing.
+
+Tested on TPU v6e:
+
+- Writes the line: `vllm serve` with one or several API servers (`--api-server-count`); `TP`, `PP`, `DP` (with and without `--enable-expert-parallel`), `PCP`, and `DCP`; and single-host `--data-parallel-hybrid-lb`, `--data-parallel-rank`, and `--data-parallel-multi-port-external-lb` (the last two on MoE without expert parallelism, with non-overlapping slice-builder ports per replica).
+- Runs unchanged and writes nothing: `vllm run-batch`, `vllm launch render`, and any server with `VLLM_TPU_EMIT_PLACEMENT` unset or `0`.

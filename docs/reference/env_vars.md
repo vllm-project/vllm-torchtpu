@@ -155,3 +155,4 @@ The in-graph `cos`/`sin` are not bit-identical to the table, and K is rotated be
 | `TPU_TRACE_MODE` | `"TRACE_COMPUTE"` | SparseCore trace mode (`"TRACE_COMPUTE"`, `"TRACE_COMPUTE_AND_DMA"`, etc.). |
 | `TPU_NUM_SPARSE_CORES_TO_TRACE` | `1` | Number of SparseCores to trace when SparseCore tracing is active. |
 | `TPU_KERNEL_ITER_MODE` | `False` | Enables fast Pallas kernel hot-reloading without restarting the vLLM server (`TPU_KERNEL_RELOAD_MODULES`). |
+| `VLLM_TPU_EMIT_PLACEMENT` | `False` | When set (`1`/`true`/`yes`/`on`), writes the engine's parallel configuration to the server log as one `rank_placement` JSON line at API-server startup; see [Parallelism & Scaling](../user_guide/parallelism.md). Changing it does not invalidate the compile cache (it is excluded from the cache key). |
