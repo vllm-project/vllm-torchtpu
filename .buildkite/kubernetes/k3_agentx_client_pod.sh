@@ -61,23 +61,28 @@
 set -uo pipefail
 
 REPO_DIR="${REPO_DIR:-/workspace/vllm-torchtpu}"
-IX_DIR="$REPO_DIR/scripts/vllm/benchmark/inferencex"
+IX_DIR="${IX_DIR:-$REPO_DIR/scripts/vllm/benchmark/inferencex}"
 CONFIG_DIR="$REPO_DIR/scripts/vllm/benchmarking/configs"
 CONFIG="${K3_PD_CONFIG:-kimi-k3-tp8-dp4-ep-agentx}"
-PORT=8000
-PROXY_PORT=8100
+PORT="${PORT:-8000}"
+PROXY_PORT="${PROXY_PORT:-8100}"
 
 : "${WORKLOAD_NAME:?the JobSet name is how the engines are addressed}"
-PREFILL_HOST="${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}"
-DECODE_HOST="${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}"
+PREFILL_HOST="${PREFILL_HOST:-${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}}"
+DECODE_HOST="${DECODE_HOST:-${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}}"
 
 # For ix_export_topology; the pod keeps its own log tag.
-# shellcheck source=scripts/vllm/benchmark/inferencex/sweep_lib.sh
+# shellcheck source=/dev/null
 source "$IX_DIR/sweep_lib.sh"
 log() { echo "[k3-agentx-client-pod] $*"; }
 
+if [ -z "${ARTIFACTS_DIR:-}" ]; then
+    ARTIFACTS_DIR="$REPO_DIR/perf_eval_results"
+fi
+mkdir -p "$ARTIFACTS_DIR"
+ARTIFACTS_DIR="$(cd "$ARTIFACTS_DIR" && pwd)"
+export ARTIFACTS_DIR
 cd "$REPO_DIR" || { log "FATAL: no repo at $REPO_DIR"; exit 1; }
-ARTIFACTS_DIR="${ARTIFACTS_DIR:-perf_eval_results}"
 EVAL_ONLY="${AGENTX_EVAL_JOB:-0}"
 case "$EVAL_ONLY" in 0|1) ;; *) log "FATAL: AGENTX_EVAL_JOB must be 0 or 1, not '$EVAL_ONLY'"; exit 2 ;; esac
 if [ "$EVAL_ONLY" = 1 ]; then
@@ -119,7 +124,8 @@ _cfg=$(
         "DECODE_DP_ATTN=${AGENTX_DECODE_DP_ATTN:-}" \
         "DECODE_NUM_WORKERS=${AGENTX_DECODE_NUM_WORKERS:-}" \
         "DURATION=${AGENTX_DURATION:-}" \
-        "FAST=${AGENTX_FAST:-}"
+        "FAST=${AGENTX_FAST:-}" \
+        "EVAL_SUITES=${EVAL_SUITES:-}"
 ) || { log "FATAL: $CONFIG failed to load; the engines would have failed the same way"; exit 2; }
 while IFS='=' read -r _k _v; do
     printf -v "CFG_${_k}" '%s' "$_v"
@@ -192,6 +198,26 @@ POST_EVAL_SUITES="$CFG_POST_EVAL_SUITES"
 # verifier's two-case suite.
 SMOKE="${AGENTX_EVAL_SMOKE:-0}"
 case "$SMOKE" in 0|1) ;; *) log "FATAL: AGENTX_EVAL_SMOKE must be 0 or 1, not '$SMOKE'"; exit 2 ;; esac
+K3_PERF_SUITES_EFFECTIVE="${K3_PERF_SUITES:-none}"
+K3_RUN_BENCH_SERVE=0
+if [ -n "${K3_PERF_SUITES+set}" ]; then
+    if [ -z "${K3_PERF_SUITES// /}" ]; then
+        log "FATAL: K3_PERF_SUITES cannot be empty (expected bench_serve, all, or none)"
+        exit 2
+    fi
+    IFS=',' read -r -a _k3_perf_items <<< "$K3_PERF_SUITES"
+    for _raw_item in "${_k3_perf_items[@]}"; do
+        _item="${_raw_item// /}"
+        case "$_item" in
+            none) ;;
+            all|bench_serve) K3_RUN_BENCH_SERVE=1 ;;
+            *)
+                log "FATAL: unknown K3_PERF_SUITES item '$_item' (expected bench_serve, all, or none)"
+                exit 2
+                ;;
+        esac
+    done
+fi
 EVAL_JOB_SUITES="$CFG_EVAL_JOB_SUITES"
 GSM8K_LIMIT_ARG=""
 if [ "$SMOKE" = 1 ]; then
@@ -214,7 +240,7 @@ cleanup() {
         # whole window. The CSV beside it carries the same series, so drop the
         # JSON rather than upload it every night.
         find "$ARTIFACTS_DIR" -name server_metrics_export.json -delete 2>/dev/null
-        buildkite-agent artifact upload "$ARTIFACTS_DIR/**/*" \
+        (cd "$(dirname "$ARTIFACTS_DIR")" && buildkite-agent artifact upload "$(basename "$ARTIFACTS_DIR")/**/*") \
             || log "ERROR: results were produced but could not be uploaded"
     fi
 }
@@ -284,6 +310,30 @@ fi
 # and the model card comes from its /v1/models. --engine-url is where /metrics is
 # read instead: the proxy has none, and the queue depth and preemption counters
 # are one engine's.
+run_unified_eval_flow() {
+    local eval_suites="${K3_EVAL_SUITES:-${CFG_EVAL_SUITES:-}}"
+    local perf_suites="${1:-none}"
+    local baseline_cfg="${K3_BASELINE_CONFIG:-kimi-k3-tp32-ep}"
+    if { [ -z "$eval_suites" ] || [ "$eval_suites" = "none" ]; } \
+        && { [ -z "$perf_suites" ] || [ "$perf_suites" = "none" ]; }; then
+        return 0
+    fi
+    log "running run_eval_flow.sh (--eval-suites ${eval_suites:-none} --perf-suites ${perf_suites:-none}) against the proxy"
+    local flow_args=(
+        --config "$CONFIG"
+        --baseline-config "$baseline_cfg"
+        --base-url "http://127.0.0.1:$PROXY_PORT"
+        --eval-suites "${eval_suites:-none}"
+        --perf-suites "${perf_suites:-none}"
+        --skip-db-upload
+    )
+    if [ -n "$perf_suites" ] && [ "$perf_suites" != "none" ]; then
+        flow_args+=(--skip-perf-check)
+    fi
+    K3_1P1D_ROLE=decode AGENTX_CHIPS="$CHIPS" \
+        bash "$REPO_DIR/scripts/vllm/benchmarking/run_eval_flow.sh" "${flow_args[@]}"
+}
+
 if [ "$EVAL_ONLY" = 1 ]; then
     # At the top of the ladder: InferenceX evaluates a multi-node deployment at
     # its highest concurrency of 16 or more, else its highest.
@@ -303,50 +353,81 @@ if [ "$EVAL_ONLY" = 1 ]; then
         ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}
     rc=$?
     log "the AgentX eval client finished with rc=$rc"
+    if [ -n "${K3_EVAL_SUITES:-}" ] && [ "${SMOKE:-0}" = "0" ]; then
+        flow_rc=0
+        run_unified_eval_flow "none" || flow_rc=$?
+        [ "$rc" -ne 0 ] || rc=$flow_rc
+    fi
     exit "$rc"
 fi
 
-log "running the AgentX client against the proxy"
-bash "$IX_DIR/agentx_client.sh" \
-    --server-url "http://127.0.0.1:$PROXY_PORT" \
-    --engine-url "http://${DECODE_HOST}:${PORT}" \
-    --conc-list "$CONC_LIST" \
-    --chips "$CHIPS" \
-    --results-dir "$RESULTS_DIR" \
-    --label "agentx_${CONFIG//\//_}" \
-    --spec-method "$CFG_SPEC_METHOD" \
-    --model-prefix "$CFG_MODEL_PREFIX" \
-    --precision "$CFG_PRECISION" \
-    --gsm8k-conc "${AGENTX_GSM8K_CONC:-$MAX_CONC}" \
-    ${DURATION:+--duration "$DURATION"} \
-    ${FAST:+--fast "$FAST"} \
-    ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \
-    ${GSM8K_LIMIT:+--gsm8k-limit "$GSM8K_LIMIT"} \
-    ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}
-rc=$?
-log "the AgentX client finished with rc=$rc"
-if [ "$POST_EVAL_SUITES" = "-" ]; then
-    exit "$rc"
+rc=0
+if [ "$K3_RUN_BENCH_SERVE" = 0 ] && [ "${AGENTX_SKIP_REPLAY:-0}" != "1" ]; then
+    _effective_eval_suites="${K3_EVAL_SUITES:-${CFG_EVAL_SUITES:-}}"
+    _norm_eval_suites=",${_effective_eval_suites//[[:space:]]/},"
+    _replay_gsm8k_limit="$GSM8K_LIMIT"
+    if [ -z "${AGENTX_GSM8K_LIMIT+set}" ] \
+        && { [[ "$_norm_eval_suites" == *",gsm8k,"* ]] || [[ "$_norm_eval_suites" == *",all,"* ]]; }; then
+        _replay_gsm8k_limit="0"
+    fi
+    log "running the AgentX client against the proxy"
+    bash "$IX_DIR/agentx_client.sh" \
+        --server-url "http://127.0.0.1:$PROXY_PORT" \
+        --engine-url "http://${DECODE_HOST}:${PORT}" \
+        --conc-list "$CONC_LIST" \
+        --chips "$CHIPS" \
+        --results-dir "$RESULTS_DIR" \
+        --label "agentx_${CONFIG//\//_}" \
+        --spec-method "$CFG_SPEC_METHOD" \
+        --model-prefix "$CFG_MODEL_PREFIX" \
+        --precision "$CFG_PRECISION" \
+        --gsm8k-conc "${AGENTX_GSM8K_CONC:-$MAX_CONC}" \
+        ${DURATION:+--duration "$DURATION"} \
+        ${FAST:+--fast "$FAST"} \
+        ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \
+        ${_replay_gsm8k_limit:+--gsm8k-limit "$_replay_gsm8k_limit"} \
+        ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}
+    rc=$?
+    log "the AgentX client finished with rc=$rc"
+    # Surface agentx_client.sh's reasoning-patched GSM8K probe as results_gsm8k.json
+    # so GSM8K is recorded once without a second unpatched lm_eval run.
+    python3 -c '
+import pathlib, shutil, sys
+results_dir, eval_dir = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+probe_jsons = sorted(
+    results_dir.glob("gsm8k_c*/**/results*.json"),
+    key=lambda p: p.stat().st_mtime,
+)
+if probe_jsons:
+    for dest_dir in (results_dir, eval_dir):
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(probe_jsons[-1], dest_dir / "results_gsm8k.json")
+' "$RESULTS_DIR" "$ARTIFACTS_DIR/$CONFIG"
 fi
 
-# InferenceX's post-eval for a Kimi K3 point: the tool-call schema suite on the
-# pair the ladder just ran on, after the replay so it never shares the window.
-# A dead pair fails here on its own; a failed point does not skip the suite,
-# since the schema verdict is still worth having.
-log "running the post-replay evals ($POST_EVAL_SUITES) against the proxy"
-bash "$IX_DIR/agentx_eval_client.sh" \
-    --server-url "http://127.0.0.1:$PROXY_PORT" \
-    --engine-url "http://${DECODE_HOST}:${PORT}" \
-    --suites "$POST_EVAL_SUITES" \
-    --eval-conc "$MAX_CONC" \
-    --chips "$CHIPS" \
-    --results-dir "$RESULTS_DIR/post-eval" \
-    --spec-method "$CFG_SPEC_METHOD" \
-    --model-prefix "$CFG_MODEL_PREFIX" \
-    --precision "$CFG_PRECISION" \
-    ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \
-    ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}
-erc=$?
-log "the post-replay evals finished with rc=$erc"
-[ "$rc" -ne 0 ] || rc=$erc
+if [ "$POST_EVAL_SUITES" != "-" ]; then
+    # InferenceX's post-eval for a Kimi K3 point: the tool-call schema suite
+    # on the pair the ladder just ran on, after the replay so it never
+    # shares the window.
+    log "running the post-replay evals ($POST_EVAL_SUITES) against the proxy"
+    bash "$IX_DIR/agentx_eval_client.sh" \
+        --server-url "http://127.0.0.1:$PROXY_PORT" \
+        --engine-url "http://${DECODE_HOST}:${PORT}" \
+        --suites "$POST_EVAL_SUITES" \
+        --eval-conc "$MAX_CONC" \
+        --chips "$CHIPS" \
+        --results-dir "$RESULTS_DIR/post-eval" \
+        --spec-method "$CFG_SPEC_METHOD" \
+        --model-prefix "$CFG_MODEL_PREFIX" \
+        --precision "$CFG_PRECISION" \
+        ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \
+        ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}
+    erc=$?
+    log "the post-replay evals finished with rc=$erc"
+    [ "$rc" -ne 0 ] || rc=$erc
+fi
+
+flow_rc=0
+run_unified_eval_flow "$K3_PERF_SUITES_EFFECTIVE" || flow_rc=$?
+[ "$rc" -ne 0 ] || rc=$flow_rc
 exit "$rc"

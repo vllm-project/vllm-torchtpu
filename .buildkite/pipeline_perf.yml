@@ -251,11 +251,9 @@ steps:
           - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 bash .buildkite/kubernetes/benchmark_with_profile.sh deepseek-v4-pro-dp16-ep --run-lm-eval
 
       # Qwen3.5-397B as one prefill and one decode engine with KV transfer between
-      # them. Its pods load their results into BigQuery (BQ_UPLOAD), in the same
-      # table and through the same parse_gke_results.py as before, tagged
-      # runner=kube by CI_RUNNER. It holds eight chips on 2x2x1, so it queues with
-      # the v7x-8 steps rather than taking chips from them.
-      - label: "Perf: Nightly Qwen3.5-397B 1P1D P/D benchmark"
+      # them, fronted by vllm-router on a chipless client pod that runs both the
+      # speed cells and the unified run_eval_flow.sh accuracy gates.
+      - label: "Perf/Eval: Nightly Qwen3.5-397B 1P1D P/D benchmark"
         depends_on: "build_docker"
         if: 'build.env("NIGHTLY") == "1"'
         timeout_in_minutes: 1440
@@ -268,3 +266,21 @@ steps:
           - *kube_plugin
         commands:
           - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-397b-1p1d.yaml
+
+      # Kimi-K3 1P1D (TP8 x DP4 x EP32 per role on two 2x2x4 slices) driven from
+      # a chipless CPU client pod behind vllm-router: replays AgentX, runs the
+      # Kimi tool-call schema check, and gates unified accuracy suites via
+      # run_eval_flow.sh.
+      - label: "Perf/Eval: Nightly Kimi-K3 1P1D AgentX benchmark (TPU v7x 2x2x4 x2)"
+        depends_on:
+          - "build_docker"
+        concurrency_group: "tpu/v7x-2x2x4"
+        concurrency: 1
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 1440
+        agents:
+          queue: "kube"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml
