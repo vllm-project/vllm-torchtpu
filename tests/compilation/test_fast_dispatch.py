@@ -38,10 +38,10 @@ from vllm_torchtpu.compilation.compile_options import CompileOptions
 @pytest.fixture(autouse=True)
 def _disarmed():
     """Every test starts and ends with the options off (main's default)."""
-    fast_dispatch.configure(fast=False, drop_global_state=False)
+    fast_dispatch.configure(fast=False)
     torch._dynamo.reset()
     yield
-    fast_dispatch.configure(fast=False, drop_global_state=False)
+    fast_dispatch.configure(fast=False)
     torch._dynamo.reset()
 
 
@@ -52,13 +52,7 @@ def _config(section=None):
 
 def _compiled(fn):
     """What tpu_compile builds for a function, on the eager backend."""
-    compiled = torch.compile(
-        fn,
-        backend="eager",
-        fullgraph=True,
-        dynamic=False,
-        options={"guard_filter_fn": fast_dispatch._drop_global_state},
-    )
+    compiled = torch.compile(fn, backend="eager", fullgraph=True, dynamic=False)
     return fast_dispatch._wrap(compiled, fn)
 
 
@@ -80,6 +74,9 @@ def test_options_default_off():
     [
         ({"fast_compiled_call": 1}, "must be a bool"),
         ({"fast_call": True}, "unknown keys"),
+        # Removed: warm-up compiles under serving's global state, so the
+        # GLOBAL_STATE guard stays.
+        ({"drop_global_state_guard": True}, "unknown keys"),
         ("on", "must be a JSON object"),
     ],
 )
@@ -133,26 +130,24 @@ def _stand_in_compile(monkeypatch, result=None):
 TPU_COMPILE_KWARGS = {"backend": "tpu", "fullgraph": True, "dynamic": False}
 
 
-def test_tpu_compile_compiles_with_the_filter_and_wraps(monkeypatch):
+def test_tpu_compile_compiles_as_main_does_and_wraps(monkeypatch):
     calls = _stand_in_compile(monkeypatch)
 
     def f(x):
         return x * 2 + 1
 
     wrapped = fast_dispatch.tpu_compile(f)
-    assert calls == [
-        {
-            **TPU_COMPILE_KWARGS,
-            "options": {"guard_filter_fn": fast_dispatch._drop_global_state},
-        }
-    ]
+    # Main's arguments and nothing else: no guard filter, so Dynamo builds
+    # each compile's guards once (torch 2.13.0 builds them twice when a
+    # guard_filter_fn is given) and keeps all of them.
+    assert calls == [TPU_COMPILE_KWARGS]
     assert wrapped._fast_dispatch_state["entries"] == []
     assert wrapped._torchdynamo_orig_callable is f
     # Decorated before the options are known: disarmed it calls the compiled
     # function; armed, the first call goes through Dynamo and records the
     # entry, and the next ones dispatch directly.
     assert _calls(wrapped, 2) == [0, 0]
-    fast_dispatch.configure(fast=True, drop_global_state=False)
+    fast_dispatch.configure(fast=True)
     assert _calls(wrapped, 3) == [2, 1]
 
 
@@ -311,19 +306,19 @@ def test_fast_dispatch_skips_an_entry_freed_by_a_reset():
     compiled = torch.compile(f, backend=tagging_backend, fullgraph=True, dynamic=False)
     wrapped = fast_dispatch._wrap(compiled, f)
     x = torch.arange(4.0)
-    fast_dispatch.configure(fast=True, drop_global_state=False)
+    fast_dispatch.configure(fast=True)
     for _ in range(2):
         assert torch.equal(wrapped(x), x * 2 + 1)
     assert runs == [0, 0]
     assert wrapped._fast_dispatch_state["count"] == 1
 
     torch._dynamo.reset()
-    fast_dispatch.configure(fast=False, drop_global_state=False)
+    fast_dispatch.configure(fast=False)
     assert torch.equal(wrapped(x), x * 2 + 1)
     assert runs[-1] == 1  # the program compiled after the reset
     assert fast_dispatch._entry_count(f.__code__) == 1  # the count is back
 
-    fast_dispatch.configure(fast=True, drop_global_state=False)
+    fast_dispatch.configure(fast=True)
     before = list(fast_dispatch._STATS)
     for _ in range(3):
         assert torch.equal(wrapped(x), x * 2 + 1)
@@ -352,7 +347,7 @@ def test_fast_dispatch_skips_an_invalidated_entry():
         return C()
 
     wrapped = _compiled(f)
-    fast_dispatch.configure(fast=True, drop_global_state=False)
+    fast_dispatch.configure(fast=True)
     x = torch.arange(4.0)
     o = instance(2)
     for _ in range(2):
@@ -397,7 +392,7 @@ def test_fast_dispatch_runs_each_closure_with_its_own_cells(monkeypatch):
     c = make(2, torch.tensor(7.0))  # a's entry accepts c: the same scale
     assert a.__wrapped__.__code__ is b.__wrapped__.__code__ is c.__wrapped__.__code__
     assert set(a.__wrapped__.__code__.co_freevars) == {"scale", "offset"}
-    fast_dispatch.configure(fast=True, drop_global_state=False)
+    fast_dispatch.configure(fast=True)
     x = torch.arange(4.0)
     before = list(fast_dispatch._STATS)
     for _ in range(3):
@@ -434,7 +429,7 @@ def test_fast_dispatch_binds_self_for_a_decorated_method(monkeypatch):
     a = Scaler(2, torch.tensor(1.0))
     b = Scaler(2, torch.tensor(5.0))  # a's entry accepts b: the same scale
     c = Scaler(3, torch.tensor(7.0))
-    fast_dispatch.configure(fast=True, drop_global_state=False)
+    fast_dispatch.configure(fast=True)
     x = torch.arange(4.0)
     before = list(fast_dispatch._STATS)
     for _ in range(3):
@@ -448,41 +443,29 @@ def test_fast_dispatch_binds_self_for_a_decorated_method(monkeypatch):
     assert not Scaler.apply._fast_dispatch_state["disabled"]
 
 
-def _num_threads_recompiles():
+def test_a_global_state_change_compiles_a_second_entry(monkeypatch):
+    """tpu_compile keeps Dynamo's GLOBAL_STATE guard: a call under another CPU
+    thread count compiles a second entry, as main's plain torch.compile does,
+    and once armed each thread count dispatches directly to its own entry."""
+    _stand_in_compile(monkeypatch)
+
+    @fast_dispatch.tpu_compile
     def g(x):
         return x * 2 + 1
 
-    compiled = _compiled(g)
+    fast_dispatch.configure(fast=True)
     x = torch.arange(4.0)
     threads = torch.get_num_threads()
+    before = list(fast_dispatch._STATS)
     try:
-        torch.set_num_threads(1)
-        compiled(x)
-        torch.set_num_threads(2)
-        compiled(x)
+        for n in (1, 2, 1, 2):
+            torch.set_num_threads(n)
+            assert torch.equal(g(x), x * 2 + 1)
     finally:
         torch.set_num_threads(threads)
-    return fast_dispatch._entry_count(g.__code__)
-
-
-def test_disarmed_filter_keeps_the_global_state_guard():
-    """Off by default: a CPU thread-count change recompiles, as on main."""
-    entries = [
-        SimpleNamespace(guard_type="GLOBAL_STATE"),
-        SimpleNamespace(guard_type="TENSOR_MATCH"),
-    ]
-    assert fast_dispatch._drop_global_state(entries) == [True, True]
-    assert _num_threads_recompiles() == 2
-
-
-def test_drop_global_state_guard_reuses_the_entry_across_threads():
-    compile_options.apply(_config({"drop_global_state_guard": True}))
-    entries = [
-        SimpleNamespace(guard_type="GLOBAL_STATE"),
-        SimpleNamespace(guard_type="TENSOR_MATCH"),
-    ]
-    assert fast_dispatch._drop_global_state(entries) == [False, True]
-    assert _num_threads_recompiles() == 1
+    assert fast_dispatch._entry_count(g.__wrapped__.__code__) == 2
+    fast, slow = (a - b for a, b in zip(fast_dispatch._STATS, before))
+    assert (fast, slow) == (2, 2)
 
 
 def test_worker_arms_the_options_before_anything_else():
@@ -502,7 +485,7 @@ def test_worker_arms_the_options_before_anything_else():
             rank=0,
             distributed_init_method="tcp://127.0.0.1:29500",
         )
-    assert fast_dispatch._CONFIG == {"fast": True, "drop_global_state": False}
+    assert fast_dispatch._CONFIG == {"fast": True}
 
 
 class _HashStub:

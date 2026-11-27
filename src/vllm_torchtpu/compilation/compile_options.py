@@ -13,12 +13,11 @@
 # limitations under the License.
 """Options of compiled-function dispatch, from ``additional_config["tpu_compile"]``.
 
-    --additional-config '{"tpu_compile": {"fast_compiled_call": true,
-        "drop_global_state_guard": true}}'
+    --additional-config '{"tpu_compile": {"fast_compiled_call": true}}'
 
-Every option defaults to off, which is main's behaviour. The options change
-how compiled programs are guarded and called, so the section stays in the
-compile-cache key. They act on the functions compiled with
+Every option defaults to off, which is main's behaviour. The section stays in
+the compile-cache key, as every ``additional_config`` section that is not
+diagnostics-only does. The options act on the functions compiled with
 ``fast_dispatch.tpu_compile``. The worker applies them with :func:`apply` when
 it is built, before any compiled function runs; until then those functions
 behave as plain ``torch.compile`` ones.
@@ -36,12 +35,6 @@ SECTION = "tpu_compile"
 
 @dataclass(frozen=True)
 class CompileOptions:
-    drop_global_state_guard: bool = False
-    """Compile the ``fast_dispatch.tpu_compile`` functions without Dynamo's
-    GLOBAL_STATE guard (grad mode, CPU thread count, default dtype), so
-    entries compiled at warmup are reused by serving threads whose thread
-    count or grad mode differs. Tensor and value guards are kept."""
-
     fast_compiled_call: bool = False
     """Call those functions' compiled code directly when one of their cached
     entries' guards accepts the arguments, instead of going through Dynamo's
@@ -96,8 +89,5 @@ def apply(vllm_config: "VllmConfig | None") -> CompileOptions:
     from vllm_torchtpu.compilation import fast_dispatch
 
     options = get(vllm_config)
-    fast_dispatch.configure(
-        fast=options.fast_compiled_call,
-        drop_global_state=options.drop_global_state_guard,
-    )
+    fast_dispatch.configure(fast=options.fast_compiled_call)
     return options
