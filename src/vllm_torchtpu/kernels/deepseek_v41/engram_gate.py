@@ -40,6 +40,7 @@ def _kernel(
     x_scale,
     wb,
     hb,
+    pb,
     dot_sum,
     h_sum,
     k_sum,
@@ -79,9 +80,10 @@ def _kernel(
             w.at[:, at(i * window, window)], wb.at[i % 2], w_sem.at[i % 2]
         )
 
-    def project(i, t):
-        """BF16 projection of token tile t against weight window i, as FP32."""
-        rows = at(t * token_tile, token_tile)
+    def project(n):
+        """BF16 projection of unit n (weight window n // tiles, token tile
+        n % tiles) into pb[n % 2]."""
+        i, rows = n // tiles, at(n % tiles * token_tile, token_tile)
         z = jax.lax.dot_general(
             q[rows, :],
             wb[i % 2],
@@ -89,24 +91,27 @@ def _kernel(
             preferred_element_type=jnp.float32,
         )
         z = (z * x_scale[rows, :]) * w_scale[at(i * window, window)][None, :]
-        return z.astype(jnp.bfloat16).astype(jnp.float32)
+        pb[n % 2] = z.astype(pb.dtype)
 
-    # Hidden tiles stream in unit order; unit u reads rows/columns of the
-    # flat [T, heads * dim] hidden state.
-    def k_cell(u):
-        return (u % tiles) * token_tile, (u // tiles) * window
+    def projected(m):
+        """After unit m's projection: its window's last frees a weight slot."""
 
-    def h_copy(cell, u):
-        row, col = cell(u)
-        return pltpu.make_async_copy(
-            hidden.at[at(row, token_tile), at(col, window)],
-            hb.at[u % 2],
-            h_sem.at[u % 2],
-        )
+        @pl.when((m % tiles == tiles - 1) & (m // tiles + 2 < windows))
+        def _():
+            w_copy(m // tiles + 2).start()
+
+    # Key units stream hidden tiles through the second value group's first
+    # two slots, free until the value phase.
+    def k_load(n):
+        slot = heads + n % 2
+        cell = hidden.at[
+            at(n % tiles * token_tile, token_tile), at(n // tiles * window, window)
+        ]
+        return pltpu.make_async_copy(cell, hb.at[slot], h_sem.at[slot])
 
     # Value groups g = j * tiles + t own heads slots each, two groups in
-    # turn: a group's hidden tiles all load while its projection runs, and
-    # the output overwrites them in place.
+    # turn: a group's hidden tiles load while the unit before it is
+    # consumed, and the output overwrites them in place.
     def v_slot(g, s):
         return (g % 2) * heads + s
 
@@ -122,9 +127,74 @@ def _kernel(
         slot = v_slot(g, s)
         return pltpu.make_async_copy(hb.at[slot], v_cell(out, g, s), o_sem.at[slot])
 
+    key_units = key_windows * tiles
+    units = windows * tiles
+
+    def key_vpu(n, s):
+        c, rows = n // tiles - s * per_head, at(n % tiles * token_tile, token_tile)
+        cols = at(c * window, window)
+        qw = q_weight[s : s + 1, cols].astype(jnp.float32)
+        kw = k_weight[s : s + 1, cols].astype(jnp.float32)
+        # One 128-lane group at a time keeps the FP32 temporaries in
+        # registers instead of spilling [tile, window] arrays.
+        for lane in range(0, window, LANES):
+            part = slice(lane, lane + LANES)
+            h = hb[heads + n % 2, :, part].astype(jnp.float32)
+            kp = pb[n % 2, :, part].astype(jnp.float32)
+            dot_sum[rows, :] += ((h * qw[:, part]) * kw[:, part]) * kp
+            h_sum[rows, :] += h * h
+            k_sum[rows, :] += kp * kp
+
+    def value_vpu(n):
+        g = n - key_units
+        rows = at(g % tiles * token_tile, token_tile)
+        for s in range(heads):
+            slot = v_slot(g, s)
+            gs = gate[s, rows, :]
+            for lane in range(0, window, LANES):
+                part = slice(lane, lane + LANES)
+                h = hb[slot, :, part].astype(jnp.float32)
+                v = pb[n % 2, :, part].astype(jnp.float32)
+                hb[slot, :, part] = (h + gs * v).astype(hb.dtype)
+
+    def prefetch(n):
+        """DMA starts and waits before unit n is consumed and n + 1 projected."""
+
+        @pl.when(n + 1 < key_units)
+        def _():
+            k_load(n + 1).start()
+
+        @pl.when(n + 1 >= key_units)
+        def _():
+            g = n + 1 - key_units
+            for s in range(heads):
+
+                @pl.when(g >= 2)
+                def _(*, s=s):
+                    v_store(g - 2, s).wait()
+
+                v_load(g, s).start()
+
+        @pl.when((n + 1) % tiles == 0)
+        def _():
+            w_copy((n + 1) // tiles).wait()
+
+    def consume_waits(n, key):
+        if key:
+            k_load(n).wait()
+        else:
+            for s in range(heads):
+                v_load(n - key_units, s).wait()
+
+    # Software pipeline: unit n's vector work and unit n + 1's projection
+    # share one basic block, free to overlap; DMA waits and starts sit
+    # outside it.
     w_copy(0).start()
     w_copy(1).start()
-    h_copy(k_cell, 0).start()
+    k_load(0).start()
+    w_copy(0).wait()
+    project(0)
+    projected(0)
 
     # Key windows, head by head (heads unrolled, so weight rows and gate
     # slots are static): lane-partial sums, reduced once per head.
@@ -133,38 +203,13 @@ def _kernel(
         h_sum[...] = jnp.zeros_like(h_sum)
         k_sum[...] = jnp.zeros_like(k_sum)
 
-        @pl.loop(0, per_head)
-        def _(c, s=s):
-            i = s * per_head + c
-            w_copy(i).wait()
-            cols = at(c * window, window)
-            qw = q_weight[s : s + 1, cols].astype(jnp.float32)
-            kw = k_weight[s : s + 1, cols].astype(jnp.float32)
-
-            @pl.loop(0, tiles)
-            def _(t):
-                u = i * tiles + t
-
-                @pl.when(u + 1 < key_windows * tiles)
-                def _():
-                    h_copy(k_cell, u + 1).start()
-
-                k = project(i, t)
-                h_copy(k_cell, u).wait()
-                rows = at(t * token_tile, token_tile)
-                # One 128-lane group at a time keeps the FP32 temporaries in
-                # registers instead of spilling [tile, window] arrays.
-                for lane in range(0, window, LANES):
-                    part = slice(lane, lane + LANES)
-                    h = hb[u % 2, :, part].astype(jnp.float32)
-                    kp = k[:, part]
-                    dot_sum[rows, :] += ((h * qw[:, part]) * kw[:, part]) * kp
-                    h_sum[rows, :] += h * h
-                    k_sum[rows, :] += kp * kp
-
-            @pl.when(i + 2 < windows)
-            def _():
-                w_copy(i + 2).start()
+        @pl.loop(s * per_head * tiles, (s + 1) * per_head * tiles)
+        def _(n, s=s):
+            prefetch(n)
+            consume_waits(n, True)
+            key_vpu(n, s)
+            project(n + 1)
+            projected(n + 1)
 
         dot = jnp.sum(dot_sum[...], axis=1, keepdims=True)
         dot = dot * jax.lax.rsqrt(
@@ -178,40 +223,24 @@ def _kernel(
         signed = jnp.where(dot < 0, -magnitude, magnitude)
         gate[s] = jax.nn.sigmoid(signed) * mask[...]
 
-    # Value windows: out = BF16(hidden + gate * value), one head at a time.
+    # Value windows: out = BF16(hidden + gate * value).
+    def store(n):
+        for s in range(heads):
+            v_store(n - key_units, s).start()
+
+    @pl.loop(key_units, units - 1)
+    def _(n):
+        prefetch(n)
+        consume_waits(n, False)
+        value_vpu(n)
+        project(n + 1)
+        projected(n + 1)
+        store(n)
+
+    consume_waits(units - 1, False)
+    value_vpu(units - 1)
+    store(units - 1)
     groups = per_head * tiles
-
-    @pl.loop(0, per_head)
-    def _(j):
-        i = key_windows + j
-        w_copy(i).wait()
-
-        @pl.loop(0, tiles)
-        def _(t):
-            g = j * tiles + t
-            for s in range(heads):
-
-                @pl.when(g >= 2)
-                def _(*, s=s):
-                    v_store(g - 2, s).wait()
-
-                v_load(g, s).start()
-            v = project(i, t)
-            rows = at(t * token_tile, token_tile)
-            for s in range(heads):
-                v_load(g, s).wait()
-                slot = v_slot(g, s)
-                gs = gate[s, rows, :]
-                for lane in range(0, window, LANES):
-                    part = slice(lane, lane + LANES)
-                    h = hb[slot, :, part].astype(jnp.float32)
-                    hb[slot, :, part] = (h + gs * v[:, part]).astype(hb.dtype)
-                v_store(g, s).start()
-
-        @pl.when(i + 2 < windows)
-        def _():
-            w_copy(i + 2).start()
-
     for g in range(max(0, groups - 2), groups):
         for s in range(heads):
             v_store(g, s).wait()
@@ -464,14 +493,15 @@ def engram_gate(
             pltpu.VMEM((padded, k_dim), FP8),
             pltpu.VMEM((padded, 1), jnp.float32),
             pltpu.VMEM((2, k_dim, window), w.dtype),
-            pltpu.VMEM((2 * heads, token_tile, window), hidden.dtype),
+            pltpu.VMEM((heads + max(heads, 2), token_tile, window), hidden.dtype),
+            pltpu.VMEM((2, token_tile, window), jnp.bfloat16),
             pltpu.VMEM((padded, LANES), jnp.float32),
             pltpu.VMEM((padded, LANES), jnp.float32),
             pltpu.VMEM((padded, LANES), jnp.float32),
             pltpu.VMEM((heads, padded, 1), jnp.float32),
             stage_sem,
             pltpu.SemaphoreType.DMA((2,)),
-            pltpu.SemaphoreType.DMA((2 * heads,)),
+            pltpu.SemaphoreType.DMA((heads + max(heads, 2),)),
             pltpu.SemaphoreType.DMA((2 * heads,)),
         ),
         compiler_params=pltpu.CompilerParams(vmem_limit_bytes=62 * 2**20),
