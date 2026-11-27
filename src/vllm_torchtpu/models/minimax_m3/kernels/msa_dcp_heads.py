@@ -1388,6 +1388,7 @@ def attend_and_merge(
         )
 
     tokens = msa.token_positions(num_tokens, seq_lens, cu_q_lens)
+    k8 = msa_attention_lse.k8_levers()
     hp_args = (q, kv_cache, scale_cache, candidates, seq_lens, block_tables)
     hp_args += (cu_q_lens, hp_req, tokens)
     if exchange_async():
@@ -1418,5 +1419,25 @@ def attend_and_merge(
         dest = jnp.where(p < num_decode, src_row, num_tokens)
         return out.at[dest].set(dcp_out, mode="drop")
 
+    if "merge" in k8:
+        # One in-place scatter whatever the order: decode row p goes to
+        # src_row[p] (ascending, distinct), the others to distinct slots past
+        # the end (dropped). The rows and values written are those of either
+        # branch below, so the result is the same bits, without the cond's
+        # copies of the whole output.
+        dest = jnp.where(p < num_decode, src_row, num_tokens + p)
+        return hp_out.at[dest].set(
+            dcp_out, mode="drop", indices_are_sorted=True, unique_indices=True
+        )
     prefix = jnp.all((p >= num_decode) | (src_row == p))
+    if "mergedus" in k8:
+        # Both branches, no cond: the update-slice writes the decode rows
+        # when they lead (in place, fused); the scatter writes them otherwise
+        # and drops everything when they lead.
+        head = jnp.where(
+            ((p < num_decode) & prefix)[:, None, None], dcp_out, hp_out[:rows]
+        )
+        out = jax.lax.dynamic_update_slice_in_dim(hp_out, head, 0, 0)
+        dest = jnp.where((p < num_decode) & ~prefix, src_row, num_tokens + p)
+        return out.at[dest].set(dcp_out, mode="drop", unique_indices=True)
     return jax.lax.cond(prefix, decode_prefix, scatter, hp_out)

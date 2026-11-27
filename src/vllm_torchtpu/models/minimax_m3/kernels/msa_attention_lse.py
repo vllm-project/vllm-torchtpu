@@ -372,6 +372,44 @@ def k1_levers(spec: str | None = None) -> frozenset:
     return frozenset({"k1"} | levers)
 
 
+K8_ENV = "TPU_MINIMAX_M3_MSA_PREFILL_K8"
+# K8 levers ("+"-separated; "1" = `_K8_DEFAULT`): glue around the
+# head-parallel MSA prefill attention (`msa_dcp_heads.attend_and_merge`).
+#   merge: the decode rows' outputs go into the head-parallel output by one
+#     in-place scatter (sorted, unique indices; the non-decode slots point
+#     past the end and are dropped) instead of a `lax.cond` between an
+#     update-slice and a scatter, whose branches copy the whole [T, Hl, D]
+#     output (twice per layer: a relayout and the branch result). Same
+#     rows written with the same values: bitwise.
+#   cmp: `_page_cache` (packed modes) finds the distinct keys and each
+#     entry's slot by compare-and-count against the one key sort instead of
+#     two more sorts. The table is a function of the keys only: bitwise.
+#   mergedus: like merge, as an in-place update-slice of the leading rows
+#     plus a scatter that drops every row when the decode rows lead.
+#   scat: like cmp, by two scatters (the distinct keys to their slots, the
+#     sorted entries' slots back to their positions) instead of the two sorts.
+_K8_DEFAULT = "merge+cmp"
+_K8_LEVERS = ("merge", "mergedus", "cmp", "scat")
+
+
+def k8_levers(spec: str | None = None) -> frozenset:
+    """TPU_MINIMAX_M3_MSA_PREFILL_K8 (or `spec`; read when a program is
+    traced): empty when unset or "0", else the levers."""
+    if spec is None:
+        spec = os.environ.get(K8_ENV, "0")
+    spec = spec.strip()
+    if spec in ("", "0"):
+        return frozenset()
+    if spec == "1":
+        spec = _K8_DEFAULT
+    levers = {x.strip() for x in spec.split("+") if x.strip()}
+    for x in levers:
+        if x not in _K8_LEVERS:
+            raise ValueError(f"{K8_ENV}={spec!r}: unknown lever {x!r}")
+    _proof(K8_ENV, f"MSA prefill attention glue K8 levers {sorted(levers)}")
+    return frozenset(levers)
+
+
 def max_free_levers() -> frozenset:
     """``{"maxfree"[, "mxumask"]}`` per the configured state (empty when off),
     for a kernel's `precision`; read when the program is traced."""
@@ -483,7 +521,41 @@ def _page_cache(
             (0, cache_size - distinct.shape[0]),
             constant_values=no_page,
         )
-    if mode in packed_modes:
+    k8 = k8_levers() & {"cmp", "scat"} if mode in packed_modes else frozenset()
+    if k8:
+        # K8 (`k8_levers`): the distinct keys and each entry's slot from the
+        # one sort above. `slot` ascends over the sorted entries and is -1
+        # only before the first key, i.e. only when there is none (padding
+        # sorts last); the slots are used only when every key fits.
+        n = key.shape[0]
+        if "cmp" in k8:
+            # The j-th distinct key is the first sorted entry of slot j:
+            # after count(slot < j) entries.
+            nth = jnp.arange(cache_size, dtype=jnp.int32)
+            at = jnp.sum(
+                (slot[None, :] < nth[:, None]).astype(jnp.int32), axis=1
+            )
+            distinct = jnp.where(
+                nth < num_distinct, key[jnp.minimum(at, n - 1)], no_page
+            )
+            # An entry's slot is the count of distinct keys below its key
+            # (`no_page` padding counts nowhere: it is above every key).
+            k = jnp.where(head < 0, no_page, head)
+            slot = jnp.sum(
+                (distinct[None, :] < k[:, None]).astype(jnp.int32), axis=1
+            )
+        else:
+            # Each distinct key's first entry writes it at its slot (slots past
+            # the table and repeated keys write past the end: dropped); each
+            # sorted entry writes its slot at its position (a permutation).
+            dst = jnp.where(new, slot, cache_size + jnp.arange(n, dtype=jnp.int32))
+            distinct = jnp.full((cache_size,), no_page, jnp.int32).at[dst].set(
+                key, mode="drop", unique_indices=True
+            )
+            slot = jnp.zeros((n,), jnp.int32).at[position].set(
+                slot, unique_indices=True
+            )
+    elif mode in packed_modes:
         if by_position is None:
             by_position = jax.lax.sort(
                 (position << slot_bits) | jnp.minimum(slot + 1, cache_size + 1),
