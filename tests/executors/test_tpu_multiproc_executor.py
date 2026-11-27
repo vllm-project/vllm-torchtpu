@@ -220,3 +220,127 @@ def test_ray_executor_raises_on_real_disagreement():
         pytest.raises(ValueError, match="workers disagree"),
     ):
         executor.get_kv_cache_specs()
+
+
+def _compacting_executor(
+    uses_mrope=False, runner_type="generate", logits_processors=None
+):
+    executor = TpuMultiprocExecutor.__new__(TpuMultiprocExecutor)
+    executor.vllm_config = MagicMock()
+    model_config = executor.vllm_config.model_config
+    model_config.uses_mrope = uses_mrope
+    model_config.runner_type = runner_type
+    model_config.logits_processors = logits_processors
+    return executor
+
+
+def _scheduler_output(*new_reqs):
+    from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+
+    return SchedulerOutput(
+        scheduled_new_reqs=list(new_reqs),
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={r.req_id: 1 for r in new_reqs},
+        total_num_scheduled_tokens=len(new_reqs),
+        scheduled_spec_decode_tokens={},
+        scheduled_encoder_inputs={},
+        num_common_prefix_blocks=[0],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+
+
+def _new_req(req_id, prompt, **sampling):
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.sched.output import NewRequestData
+
+    return NewRequestData(
+        req_id=req_id,
+        prompt_token_ids=prompt,
+        mm_features=[],
+        sampling_params=SamplingParams(**sampling),
+        pooling_params=None,
+        block_ids=([0],),
+        num_computed_tokens=0,
+        lora_request=None,
+    )
+
+
+def test_new_prompts_travel_as_int32_arrays_and_engine_copy_keeps_lists():
+    import numpy as np
+
+    prompt = [0, 7, 200063, 2**31 - 1]
+    original = _scheduler_output(_new_req("a", prompt))
+
+    sent = _compacting_executor()._compact_new_prompts(original)
+
+    ids = sent.scheduled_new_reqs[0].prompt_token_ids
+    assert isinstance(ids, np.ndarray) and ids.dtype == np.int32
+    assert ids.tolist() == prompt
+    # The engine core keeps reading its own object: still the list.
+    assert original.scheduled_new_reqs[0].prompt_token_ids is prompt
+
+
+@pytest.mark.parametrize(
+    "sampling", [{"prompt_logprobs": 1}, {"thinking_token_budget": 16}]
+)
+def test_requests_whose_ids_are_read_as_lists_keep_their_list(sampling):
+    prompt = [1, 2, 3]
+    out = _compacting_executor()._compact_new_prompts(
+        _scheduler_output(_new_req("a", prompt, **sampling), _new_req("b", [4, 5]))
+    )
+    assert out.scheduled_new_reqs[0].prompt_token_ids is prompt
+    assert out.scheduled_new_reqs[1].prompt_token_ids.tolist() == [4, 5]
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"uses_mrope": True},
+        {"runner_type": "pooling"},
+        {"logits_processors": ["my.module:Processor"]},
+    ],
+)
+def test_configs_that_read_prompt_ids_on_the_worker_send_lists(config):
+    original = _scheduler_output(_new_req("a", [1, 2, 3]))
+    assert _compacting_executor(**config)._compact_new_prompts(original) is original
+
+
+def test_array_prompt_fills_the_input_batch_row_like_the_list():
+    """The worker's InputBatch.add_request writes the same row from either form,
+    after the round trip through the broadcast's pickling."""
+    import pickle
+
+    import torch
+    from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+
+    prompt = list(range(100, 1100))
+    rows = []
+    for compact in (False, True):
+        so = _scheduler_output(_new_req("a", prompt))
+        if compact:
+            so = _compacting_executor()._compact_new_prompts(so)
+        req = pickle.loads(pickle.dumps(so, protocol=5)).scheduled_new_reqs[0]
+        batch = InputBatch(
+            max_num_reqs=2,
+            max_model_len=2048,
+            max_num_batched_tokens=2048,
+            device=torch.device("cpu"),
+            vocab_size=200064,
+            block_sizes=[128],
+            max_num_blocks_per_req=[16],
+        )
+        state = CachedRequestState(
+            req_id=req.req_id,
+            prompt_token_ids=req.prompt_token_ids,
+            mm_features=[],
+            sampling_params=req.sampling_params,
+            generator=None,
+            block_ids=req.block_ids,
+            num_computed_tokens=0,
+            output_token_ids=[],
+        )
+        index = batch.add_request(state)
+        assert state.num_prompt_tokens == len(prompt)
+        rows.append(batch.token_ids_cpu[index, : len(prompt)].tolist())
+    assert rows[0] == rows[1] == prompt

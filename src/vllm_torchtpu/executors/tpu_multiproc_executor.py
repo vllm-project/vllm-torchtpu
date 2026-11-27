@@ -16,12 +16,23 @@
 Splits H2D Pallas kernel prewarm into one collective_rpc call per power-of-2
 shape so each shape gets its own 60-second shm_broadcast window (~4s per shape)
 instead of all 14 shapes sharing a single window and timing out.
+
+It also broadcasts a new request's prompt token ids as an int32 array (see
+`_compact_new_prompts`).
 """
 
+import dataclasses
+from array import array
+
+import numpy as np
+from vllm.v1.core.sched.output import NewRequestData, SchedulerOutput
 from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 
 from vllm_torchtpu.executors.kv_block_override import reconcile_num_gpu_blocks_override
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class TpuMultiprocExecutor(MultiprocExecutor):
@@ -31,6 +42,54 @@ class TpuMultiprocExecutor(MultiprocExecutor):
 
         _patch_multiproc_worker_global_rank_env()
         super()._init_executor()
+        logger.info(
+            "New-request prompt token ids broadcast as int32 arrays: %s",
+            self._can_compact_prompts(),
+        )
+
+    def execute_model(self, scheduler_output: SchedulerOutput, *args, **kwargs):
+        return super().execute_model(
+            self._compact_new_prompts(scheduler_output), *args, **kwargs
+        )
+
+    def _compact_new_prompts(
+        self, scheduler_output: SchedulerOutput
+    ) -> SchedulerOutput:
+        """Copy of `scheduler_output` whose new requests carry their prompt
+        token ids as int32 numpy arrays instead of lists.
+
+        A list of N ids costs O(N) Python work three times on the path from
+        scheduling a request to the forward that prefills it: pickling it into
+        the broadcast here, unpickling one int object per id in every worker,
+        and converting it element by element into the worker's input-batch
+        row. An array is copied as raw bytes at each of those steps. Every id
+        of the prompt travels, including the prefix-cache hit, so an agentic
+        prompt of 10^5 tokens pays this in full on every turn.
+
+        The engine core keeps its own `scheduler_output`, so scheduler-side
+        consumers (KV connectors, `update_from_output`) still see lists. On the
+        workers the arrays reach `InputBatch.add_request` and the cached
+        request state. Configs and requests whose ids are read as lists
+        elsewhere on the worker keep their lists; the readers checked against
+        vLLM 0.32 are M-RoPE position init, prompt logprobs, pooling, logits
+        processors (`BatchUpdate.added`) and the thinking-budget state.
+        """
+        if not scheduler_output.scheduled_new_reqs or not self._can_compact_prompts():
+            return scheduler_output
+        return dataclasses.replace(
+            scheduler_output,
+            scheduled_new_reqs=[
+                _with_array_prompt(req) for req in scheduler_output.scheduled_new_reqs
+            ],
+        )
+
+    def _can_compact_prompts(self) -> bool:
+        model_config = self.vllm_config.model_config
+        return not (
+            model_config.uses_mrope
+            or model_config.runner_type == "pooling"
+            or model_config.logits_processors
+        )
 
     def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
         specs = super().get_kv_cache_specs()
@@ -59,3 +118,26 @@ class TpuMultiprocExecutor(MultiprocExecutor):
             return
         for p in shapes[0]:
             self.collective_rpc("prewarm_kv_offload_shape", args=(p,))
+
+
+def _with_array_prompt(req: NewRequestData) -> NewRequestData:
+    ids = req.prompt_token_ids
+    params = req.sampling_params
+    if (
+        not isinstance(ids, list)
+        or req.prompt_embeds is not None
+        or req.prompt_is_token_ids is not None
+        or (
+            params is not None
+            and (
+                params.prompt_logprobs is not None
+                or params.thinking_token_budget is not None
+            )
+        )
+    ):
+        return req
+    # The field is annotated list[int]; on the workers it holds this array.
+    # array("i") converts a list about twice as fast as np.array; the view is free.
+    return dataclasses.replace(
+        req, prompt_token_ids=np.frombuffer(array("i", ids), dtype=np.int32)
+    )
