@@ -6,6 +6,7 @@ Generated from `tests/roofline/fixtures/manifest.json` and `tests/roofline/golde
 
 | Fixture | Repo | Layers | Hidden | Heads (Q/KV) | Experts (Total/Top-K) | Vocab |
 | :--- | :--- | ---: | ---: | :--- | :--- | ---: |
+| `deepseek_v4_1_flash.json` | `deepseek-ai/DeepSeek-V4.1-Flash` | 40 | 5120 | 64/1 | 384/6 | 129280 |
 | `glm_5_2_fp8.json` | `zai-org/GLM-5.2-FP8` | 78 | 6144 | 64/64 | 256/8 | 154880 |
 | `glm_5_2_nvfp4.json` | `nvidia/GLM-5.2-NVFP4` | 78 | 6144 | 64/64 | 256/8 | 154880 |
 | `qwen3_5_397b_fp8.json` | `Qwen/Qwen3.5-397B-A17B-FP8` | 60 | 4096 | 32/2 | 512/10 | 248320 |
@@ -17,6 +18,9 @@ TPU serving cache policy: `--kv-dtype fp8` for all checkpoints and `--state-dtyp
 
 | Model | Slice | Legal Candidates | Top Layout | TPOT Floor (ms) | Est. Tput (tok/s/chip) | Ceiling (tok/s/chip) |
 | :--- | :--- | ---: | :--- | ---: | ---: | ---: |
+| `deepseek_v4_1_flash` | `2x2x1` | 174 | `TP2 x DP4 x EP8` | 1.40 | 7,031.5 | 98,325.2 |
+| `deepseek_v4_1_flash` | `2x2x2` | 689 | `TP2 x DP4 x EP8` | 1.40 | 7,031.5 | 98,325.2 |
+| `deepseek_v4_1_flash` | `2x2x4` | 1964 | `TP2 x DP4 x EP8` | 1.40 | 7,031.5 | 98,325.2 |
 | `glm_5_2_fp8` | `2x2x1` | 102 | `TP2 x DP2 x EP4 x PP2 x DCP2` | 4.28 | 3,412.7 | 33,053.6 |
 | `glm_5_2_fp8` | `2x2x2` | 497 | `TP2 x DP8 x EP16 x DCP2` | 3.52 | 4,047.4 | 19,611.6 |
 | `glm_5_2_fp8` | `2x2x4` | 1556 | `TP2 x DP8 x EP16 x DCP2` | 3.52 | 4,047.4 | 19,611.6 |

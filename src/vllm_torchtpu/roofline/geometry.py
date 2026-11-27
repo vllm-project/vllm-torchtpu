@@ -21,7 +21,13 @@ from functools import lru_cache
 from typing import Literal
 
 from .constants import (
+    BF16_BYTES,
     BLOCK_PARALLEL_ENABLED,
+    CSA2_INDEX_RECORD_BYTES,
+    FP8_BYTES,
+    FP8_UE8M0_32X32_BYTES,
+    FP8_UE8M0_BYTES,
+    FP32_BYTES,
     GLU_MATMUL_COUNT,
     HF_REPO_TO_CANONICAL_ID,
     HYBRID_PATTERN_MAP,
@@ -698,8 +704,200 @@ def _has_gdn_kda_heads(text_cfg: Mapping[str, object]) -> bool:
     )
 
 
-def _validate_modeled_attention_variants(text_config: Mapping[str, object]) -> None:
+def _is_csa2_config(text_config: Mapping[str, object]) -> bool:
+    """Return True when config declares CSA2 sparse KV or index source layers."""
+    return bool(
+        _as_sequence(text_config.get("kv_source_layer_ids"))
+        or _as_sequence(text_config.get("index_source_layer_ids"))
+    )
+
+
+def _parse_layer_id_tuple(
+    raw: object,
+    key_name: str,
+    num_layers: int,
+) -> tuple[int, ...]:
+    """Parse and range-check a sequence of 0-based layer indices."""
+    seq = _as_sequence(raw)
+    if seq is None:
+        return ()
+    ids: list[int] = []
+    for item in seq:
+        idx = _as_int(item, -1)
+        if idx < 0 or idx >= num_layers:
+            msg = f"{key_name} entry {item!r} out of range [0, {num_layers})"
+            raise ValueError(msg)
+        ids.append(idx)
+    return tuple(ids)
+
+
+def _resolve_csa2_sparse_spec(
+    text_config: Mapping[str, object],
+    num_layers: int,
+    head_dim: int,
+    sliding_window: int,
+    *,
+    allow_csa2: bool = False,
+) -> SparseAttnSpec | None:
+    """Build CSA2 SparseAttnSpec when sparse KV/index source layers are declared."""
+    if not _is_csa2_config(text_config):
+        return None
+    if not allow_csa2:
+        msg = (
+            "CSA2 sparse attention keys (kv_source_layer_ids / "
+            "index_source_layer_ids) are only supported for CSA2 models"
+        )
+        raise UnsupportedArchitectureError(msg)
+    kv_sources = _parse_layer_id_tuple(
+        text_config.get("kv_source_layer_ids"),
+        "kv_source_layer_ids",
+        num_layers,
+    )
+    index_sources = _parse_layer_id_tuple(
+        text_config.get("index_source_layer_ids"),
+        "index_source_layer_ids",
+        num_layers,
+    )
+    cand_blocks = _as_int(text_config.get("candidate_topk_blocks"))
+    cand_block_size = _as_int(text_config.get("candidate_block_size"))
+    candidate_scan_cap = (
+        cand_blocks * cand_block_size
+        if (cand_blocks > 0 and cand_block_size > 0)
+        else 0
+    )
+    raw_ced = text_config.get("candidate_source_layer_id")
+    ced_boundary = _as_int(raw_ced) if raw_ced is not None else 0
+    if ced_boundary < 0 or ced_boundary >= num_layers:
+        msg = f"candidate_source_layer_id {raw_ced!r} out of range [0, {num_layers})"
+        raise ValueError(msg)
+    o_lora_rank = _as_int(text_config.get("o_lora_rank"))
+    o_groups = max(1, _as_int(text_config.get("o_groups"), 1))
+    index_head_dim = _as_int(text_config.get("index_head_dim"))
+    index_record_bytes = (
+        float(index_head_dim) * FP8_BYTES + FP32_BYTES
+        if index_head_dim > 0
+        else CSA2_INDEX_RECORD_BYTES
+    )
+    swa_bytes = float(head_dim) * BF16_BYTES if sliding_window > 0 else 0.0
+    return SparseAttnSpec(
+        kind="csa2",
+        kv_source_layer_ids=kv_sources,
+        index_source_layer_ids=index_sources,
+        candidate_scan_cap=candidate_scan_cap,
+        index_record_bytes=index_record_bytes,
+        ced_boundary=ced_boundary,
+        swa_bytes_per_tok=swa_bytes,
+        o_lora_rank=o_lora_rank,
+        o_groups=o_groups,
+    )
+
+
+def _resolve_engram_host_tables(
+    text_config: Mapping[str, object],
+    num_layers: int,
+    hidden: int,
+    hc_mult: int,
+) -> tuple[HostTableSpec, ...]:
+    """Parse Engram host-offloadable embedding tables and dense projections."""
+    layer_ids = _parse_layer_id_tuple(
+        text_config.get("engram_layer_ids"), "engram_layer_ids", num_layers
+    )
+    if not layer_ids:
+        return ()
+    raw_counts = _as_sequence(text_config.get("engram_num_embeddings"))
+    if raw_counts is None or len(raw_counts) != len(layer_ids):
+        msg = (
+            "engram_num_embeddings length must match engram_layer_ids "
+            f"({len(layer_ids)})"
+        )
+        raise ValueError(msg)
+    engram_head_dim = _as_int(text_config.get("engram_head_dim"))
+    engram_n_heads = _as_int(text_config.get("engram_n_heads"))
+    max_ngram_size = _as_int(text_config.get("engram_max_ngram_size"))
+    if engram_head_dim <= 0 or engram_n_heads <= 0:
+        msg = (
+            "Engram config requires positive engram_head_dim and engram_n_heads, "
+            f"got ({engram_head_dim}, {engram_n_heads})"
+        )
+        raise ValueError(msg)
+    ngram_orders = max(1, max_ngram_size - 1)
+    proj_width = ngram_orders * engram_n_heads * engram_head_dim
+    h2d_per_layer = float(proj_width) * FP8_UE8M0_BYTES
+    dense_proj_per_layer = (hc_mult + 1) * hidden * proj_width
+    tables: list[HostTableSpec] = []
+    for layer_id, raw_rows in zip(layer_ids, raw_counts, strict=True):
+        num_rows = _as_int(raw_rows)
+        if num_rows <= 0:
+            msg = f"engram_num_embeddings entry must be positive, got {raw_rows!r}"
+            raise ValueError(msg)
+        tables.append(
+            HostTableSpec(
+                name=f"engram_l{layer_id}",
+                layer_ids=(layer_id,),
+                elem_count=num_rows * engram_head_dim,
+                scale_ratio=FP8_UE8M0_BYTES - FP8_UE8M0_32X32_BYTES,
+                table_dtype_role="w_dense",
+                dense_proj_dtype_role="w_dense",
+                default_hbm_resident=False,
+                shard_axis="dp_local",
+                h2d_bytes_per_tok=h2d_per_layer,
+                dense_proj_params=dense_proj_per_layer,
+            )
+        )
+    return tuple(tables)
+
+
+def _resolve_inline_dspark_spec(
+    text_config: Mapping[str, object],
+    layer_types: tuple[str, ...],
+    dims: tuple[int, int, int, int],
+) -> DraftSpec | None:
+    """Parse inline DSpark draft metadata declared inside main text_config."""
+    mtp_layers, moe_inter, shared_inter, sliding_window = dims
+    if mtp_layers <= 0:
+        return None
+    raw_experts = text_config.get("dspark_n_routed_experts")
+    raw_block = text_config.get("dspark_block_size")
+    raw_targets = _as_sequence(text_config.get("dspark_target_layer_ids"))
+    raw_markov = text_config.get("dspark_markov_rank")
+    if all(v is None for v in (raw_experts, raw_block, raw_targets, raw_markov)):
+        return None
+    draft_experts = _as_int(raw_experts)
+    draft_top_k = _as_int(text_config.get("dspark_num_experts_per_tok"))
+    layer_kind = (
+        "csa2"
+        if _is_csa2_config(text_config)
+        else (layer_types[0] if layer_types else "full_attention")
+    )
+    return DraftSpec(
+        kind="dspark",
+        num_layers=mtp_layers,
+        layer_kind=layer_kind,
+        num_experts=draft_experts,
+        top_k=draft_top_k,
+        moe_inter=moe_inter if draft_experts > 0 else 0,
+        shared_inter=shared_inter if draft_experts > 0 else 0,
+        sliding_window=sliding_window,
+        block_size=max(1, _as_int(raw_block, 1)),
+        fc_in_mult=len(raw_targets) if raw_targets else 1,
+        markov_rank=_as_int(raw_markov),
+    )
+
+
+def _validate_modeled_attention_variants(
+    text_config: Mapping[str, object],
+    *,
+    allow_csa2: bool = False,
+) -> None:
     """Fail closed on unmodeled LoRA output projections or SWA-only DSA configs."""
+    if _is_csa2_config(text_config):
+        if not allow_csa2:
+            msg = (
+                "CSA2 sparse attention keys (kv_source_layer_ids / "
+                "index_source_layer_ids) are only supported for CSA2 models"
+            )
+            raise UnsupportedArchitectureError(msg)
+        return
     if _as_int(text_config.get("o_lora_rank")) > 0:
         msg = "Non-zero o_lora_rank attention output projection is not modeled"
         raise UnsupportedArchitectureError(msg)
@@ -950,7 +1148,11 @@ def resolve_model_identity(
     )
 
 
-def _validate_structural_support(config: Mapping[str, object]) -> None:
+def _validate_structural_support(
+    config: Mapping[str, object],
+    *,
+    allow_csa2: bool | None = None,
+) -> None:
     """Validate attention, recurrence, and layer-type structural support."""
     text_cfg = _validate_text_config(config)
     has_gdn = _has_gdn_kda_heads(text_cfg)
@@ -959,7 +1161,14 @@ def _validate_structural_support(config: Mapping[str, object]) -> None:
     ):
         msg = "Unmodeled state-space config missing attention and GDN/KDA head keys"
         raise UnsupportedArchitectureError(msg)
-    _validate_modeled_attention_variants(text_cfg)
+    if allow_csa2 is None:
+        scopes = (text_cfg, config) if text_cfg is not config else (text_cfg,)
+        model_type = str(_first_non_none(scopes, "model_type") or "").strip().lower()
+        spec = _MODEL_TYPE_TO_SPEC.get(model_type)
+        eff_allow_csa2 = spec is not None and "csa2" in spec.allowed_layer_kinds
+    else:
+        eff_allow_csa2 = allow_csa2
+    _validate_modeled_attention_variants(text_cfg, allow_csa2=eff_allow_csa2)
     _validate_layer_types(text_cfg, has_gdn=has_gdn)
 
 
@@ -995,7 +1204,8 @@ def supports(
 ) -> None:
     """Validate canonical identity and modeled attention/recurrence/FFN families."""
     identity = resolve_model_identity(config, model_ref=model_ref)
-    _validate_structural_support(config)
+    allow_csa2 = "csa2" in SUPPORTED_MODELS[identity.canonical_id].allowed_layer_kinds
+    _validate_structural_support(config, allow_csa2=allow_csa2)
     text_cfg = _validate_text_config(config)
     raw_layers = text_cfg.get("num_hidden_layers")
     if raw_layers is not None:
@@ -1005,7 +1215,9 @@ def supports(
             index_topk = _as_int(text_cfg.get("index_topk"))
             sliding_window = _as_int(text_cfg.get("sliding_window"))
             specs = (kv_lora_rank, index_topk, sliding_window)
-            layer_types = _resolve_layer_types(text_cfg, config, num_layers, specs)
+            layer_types = _resolve_layer_types(
+                text_cfg, config, num_layers, specs, allow_csa2=allow_csa2
+            )
             _validate_family_layer_kinds(
                 identity, layer_types, kv_lora_rank, index_topk
             )
@@ -1066,6 +1278,8 @@ def _infer_pattern_layer_types(
     text_config: Mapping[str, object],
     num_layers: int,
     specs: tuple[int, int, int],
+    *,
+    allow_csa2: bool = False,
 ) -> tuple[str, ...]:
     """Infer layer types from interval, attention list, or override pattern."""
     kv_lora_rank, index_topk, sliding_window = specs
@@ -1116,7 +1330,9 @@ def _infer_pattern_layer_types(
     )
     use_sw = text_config.get("use_sliding_window")
     eff_sliding_window = 0 if use_sw is False else sliding_window
-    if eff_sliding_window > 0:
+    if allow_csa2 and _is_csa2_config(text_config):
+        default_layers = ("csa2",) * num_layers
+    elif eff_sliding_window > 0:
         if sw_pat < 1:
             msg = (
                 "Config specifies sliding_window without explicit layer_types "
@@ -1171,6 +1387,8 @@ def _resolve_layer_types(
     config: Mapping[str, object],
     num_layers: int,
     specs: tuple[int, int, int],
+    *,
+    allow_csa2: bool = False,
 ) -> tuple[str, ...]:
     """Resolve sequence of layer type strings for each transformer layer."""
     kv_lora_rank, _, _ = specs
@@ -1191,7 +1409,9 @@ def _resolve_layer_types(
                 raise ValueError(msg)
         _validate_full_attention_interval(raw_interval, layer_types)
     else:
-        layer_types = _infer_pattern_layer_types(text_config, num_layers, specs)
+        layer_types = _infer_pattern_layer_types(
+            text_config, num_layers, specs, allow_csa2=allow_csa2
+        )
     if dsa_set is not None and kv_lora_rank > 0:
         return tuple(
             ("dsa" if idx in dsa_set else "mla")
@@ -1399,6 +1619,9 @@ def _resolve_compress_ratios(
     text_config: Mapping[str, object],
     config: Mapping[str, object],
     num_layers: int,
+    mtp_layers: int = 0,
+    *,
+    allow_zero: bool = False,
 ) -> tuple[float, ...]:
     """Resolve per-layer KV compression or retention ratios."""
     raw_compress_ratios = _as_sequence(
@@ -1406,6 +1629,8 @@ def _resolve_compress_ratios(
     )
     if raw_compress_ratios is None or not raw_compress_ratios:
         return ()
+    if mtp_layers > 0 and len(raw_compress_ratios) == num_layers + mtp_layers:
+        raw_compress_ratios = raw_compress_ratios[:num_layers]
     if len(raw_compress_ratios) != num_layers:
         msg = (
             f"compress_ratios length {len(raw_compress_ratios)} != "
@@ -1413,7 +1638,11 @@ def _resolve_compress_ratios(
         )
         raise ValueError(msg)
     compress_ratios = tuple(_as_float(item) for item in raw_compress_ratios)
-    if any(ratio <= 0.0 for ratio in compress_ratios):
+    if allow_zero:
+        if any(ratio < 0.0 for ratio in compress_ratios):
+            msg = f"compress_ratios entries must be >= 0, got {compress_ratios}"
+            raise ValueError(msg)
+    elif any(ratio <= 0.0 for ratio in compress_ratios):
         msg = f"compress_ratios entries must be > 0, got {compress_ratios}"
         raise ValueError(msg)
     return compress_ratios
@@ -1502,6 +1731,8 @@ def _extract_extended_fields(
     text_config: Mapping[str, object],
     config: Mapping[str, object],
     num_layers: int,
+    *,
+    allow_csa2: bool = False,
 ) -> _ExtendedGeometryFields:
     """Parse MTP, PLE, IndexShare, HC, vocab, and block-quant dimensions."""
     scopes = (text_config, config) if text_config is not config else (text_config,)
@@ -1545,7 +1776,13 @@ def _extract_extended_fields(
         qsa_budget=_as_int(_first_non_none(scopes, "indexer_budget") or 0),
         hc_lowrank=_as_int(_first_non_none(scopes, "hc_lowrank") or 0),
         first_k=_as_int(_first_non_none(scopes, "first_k_dense_replace") or 0),
-        compress_ratios=_resolve_compress_ratios(text_config, config, num_layers),
+        compress_ratios=_resolve_compress_ratios(
+            text_config,
+            config,
+            num_layers,
+            mtp_layers,
+            allow_zero=allow_csa2 and _is_csa2_config(text_config),
+        ),
         block_parallel=_resolve_block_parallel(text_config, config),
         mtp_inter=_as_int(_first_non_none(scopes, "mtp_intermediate_size") or 0),
         hc_mult=max(1, _as_int(raw_hc, 1)),
@@ -1569,7 +1806,9 @@ def _extract_geometry_for_identity(
     """Extract ModelGeometry from cfg after identity and structural checks."""
     subconfig = _as_mapping(config.get("text_config"))
     text_config: Mapping[str, object] = subconfig if subconfig else config
-    _validate_modeled_attention_variants(text_config)
+    spec = SUPPORTED_MODELS.get(identity.canonical_id)
+    allow_csa2 = spec is not None and "csa2" in spec.allowed_layer_kinds
+    _validate_modeled_attention_variants(text_config, allow_csa2=allow_csa2)
     hidden = _as_int(text_config["hidden_size"])
     num_layers = _as_int(text_config["num_hidden_layers"])
     num_heads = _as_int(text_config["num_attention_heads"])
@@ -1599,7 +1838,11 @@ def _extract_geometry_for_identity(
     global_head_dim = _as_int(text_config.get("global_head_dim"))
 
     layer_types = _resolve_layer_types(
-        text_config, config, num_layers, (kv_lora_rank, index_topk, sliding_window)
+        text_config,
+        config,
+        num_layers,
+        (kv_lora_rank, index_topk, sliding_window),
+        allow_csa2=allow_csa2,
     )
     dense_inter = _as_int(
         _first_present(text_config, "intermediate_size", "dense_intermediate_size")
@@ -1614,7 +1857,22 @@ def _extract_geometry_for_identity(
             text_config, layer_types, (num_heads, num_kv_heads, head_dim)
         )
     )
-    extended = _extract_extended_fields(text_config, config, num_layers)
+    extended = _extract_extended_fields(
+        text_config, config, num_layers, allow_csa2=allow_csa2
+    )
+    sparse_attn = _resolve_csa2_sparse_spec(
+        text_config, num_layers, head_dim, sliding_window, allow_csa2=allow_csa2
+    )
+    host_tables = _resolve_engram_host_tables(
+        text_config, num_layers, hidden, extended.hc_mult
+    )
+    draft = _resolve_draft_spec(draft_config)
+    if draft is None:
+        draft = _resolve_inline_dspark_spec(
+            text_config,
+            layer_types,
+            (extended.mtp_layers, moe_inter, shared_inter, sliding_window),
+        )
 
     return ModelGeometry(
         hidden=hidden,
@@ -1666,7 +1924,9 @@ def _extract_geometry_for_identity(
         hc_lowrank=extended.hc_lowrank,
         ple_layer_ids=extended.ple_layer_ids,
         max_position_embeddings=extended.max_position_embeddings,
-        draft=_resolve_draft_spec(draft_config),
+        sparse_attn=sparse_attn,
+        host_tables=host_tables,
+        draft=draft,
     )
 
 
@@ -1676,12 +1936,16 @@ def _from_hf_config_dry_run(
     draft_config: Mapping[str, object] | None = None,
 ) -> ModelGeometry:
     """Private dry-run extractor for audit_hf_config on blocked unlisted configs."""
-    _validate_structural_support(config)
     text_cfg = _validate_text_config(config)
     scopes = (text_cfg, config) if text_cfg is not config else (text_cfg,)
     model_type = str(_first_non_none(scopes, "model_type") or "").strip().lower()
+    spec = _MODEL_TYPE_TO_SPEC.get(model_type)
+    allow_csa2 = spec is not None and "csa2" in spec.allowed_layer_kinds
+    _validate_structural_support(config, allow_csa2=allow_csa2)
     identity = ModelIdentity(
-        canonical_id=model_type or "unlisted",
+        canonical_id=spec.canonical_id
+        if spec is not None
+        else (model_type or "unlisted"),
         model_type=model_type,
         architectures=_resolve_architectures(config, text_cfg),
         hf_repo=None,
@@ -1697,7 +1961,8 @@ def from_hf_config(
 ) -> ModelGeometry:
     """Build ModelGeometry from a supported HuggingFace config mapping."""
     identity = resolve_model_identity(config, model_ref=model_ref)
-    _validate_structural_support(config)
+    allow_csa2 = "csa2" in SUPPORTED_MODELS[identity.canonical_id].allowed_layer_kinds
+    _validate_structural_support(config, allow_csa2=allow_csa2)
     geometry = _extract_geometry_for_identity(
         config, identity, draft_config=draft_config
     )

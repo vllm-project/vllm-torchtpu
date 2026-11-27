@@ -192,12 +192,15 @@ MXFP4_BYTES: float = 0.5 + 1.0 / 32.0
 NVFP4_BYTES: float = 0.5 + 1.0 / 16.0
 MXFP8_BYTES: float = FP8_BYTES + FP8_BYTES / 32.0
 FP8_UE8M0_BYTES: float = MXFP8_BYTES
+FP8_UE8M0_32X32_BYTES: float = FP8_BYTES + FP8_BYTES / (32.0 * 32.0)
 _INT4_PTH_PARTS: tuple[str, ...] = ("int4", "per", "token", "head")
 INT4_PER_TOKEN_HEAD_KV_DTYPE: str = "_".join(_INT4_PTH_PARTS)
 # Per-token 4-bit KV scale cache stores 8 FP32 scales per rank (32 B/tok)
 # plus one FP32 scale per token for 4-bit sparse index keys (4 B/tok).
 INT4_PER_TOKEN_HEAD_SCALE_BYTES: float = 8.0 * FP32_BYTES
 INT4_INDEX_SCALE_BYTES: float = FP32_BYTES
+# CSA2 packed indexer key cache: 128 B FP8 key plus 4 B UE8M0 scale per token.
+CSA2_INDEX_RECORD_BYTES: float = 128.0 * FP8_BYTES + FP32_BYTES
 
 BASE_DTYPE_BYTES: dict[str, float] = {
     "float32": FP32_BYTES,
@@ -332,6 +335,13 @@ SUPPORTED_MODELS: Mapping[str, ModelSpec] = MappingProxyType(
             architectures=("GlmMoeDsaForCausalLM",),
             allowed_layer_kinds=frozenset({"mla", "dsa"}),
         ),
+        "deepseek_v41": ModelSpec(
+            canonical_id="deepseek_v41",
+            hf_repos=("deepseek-ai/DeepSeek-V4.1-Flash",),
+            model_types=("deepseek_v41", "deepseek_v41_text"),
+            architectures=("DeepseekV41ForCausalLM",),
+            allowed_layer_kinds=frozenset({"csa2", "mla", "dsa"}),
+        ),
     }
 )
 
@@ -367,9 +377,16 @@ BENIGN_HF_METADATA_KEYS: frozenset[str] = frozenset(
         "auto_map",
         "bos_token_id",
         "cls_token_id",
+        "compress_rope_theta",
+        "dspark_noise_token_id",
         "dtype",
+        "engram_compressed_vocab_size",
+        "engram_pad_token_id",
+        "engram_vocab_size",
         "eos_token_id",
         "ep_size",
+        "hc_eps",
+        "hc_sinkhorn_iters",
         "hidden_act",
         "id2label",
         "index_skip_topk_offset",
@@ -399,6 +416,7 @@ BENIGN_HF_METADATA_KEYS: frozenset[str] = frozenset(
         "router_aux_loss_coef",
         "scoring_func",
         "sep_token_id",
+        "swiglu_limit",
         "tokenizer_class",
         "topk_group",
         "topk_method",
