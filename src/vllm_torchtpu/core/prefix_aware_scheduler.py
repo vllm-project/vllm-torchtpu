@@ -64,6 +64,7 @@ from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu.core import prefix_change_log, scheduler_options
 from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
+from vllm_torchtpu.core.retention_scheduler import HybridRetentionScheduler
 from vllm_torchtpu.core.scheduler_utils import format_counts, is_waiting_status
 
 if TYPE_CHECKING:
@@ -180,11 +181,12 @@ def memo_local_prefix_cache_hit(
     return None
 
 
-class PrefixAwareScheduler(AsyncScheduler):
+class PrefixAwareScheduler(HybridRetentionScheduler, AsyncScheduler):
     """Admit ready requests prioritizing fewest uncached prompt tokens."""
 
     #: Lookahead window of ready requests to evaluate for cached prefix length.
     WINDOW = 64
+    _retention_log_name = "PrefixAwareScheduler"
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
