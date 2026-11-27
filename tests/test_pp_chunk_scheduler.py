@@ -82,11 +82,8 @@ def _scheduler(
     scheduler._clips = 0
     scheduler._waits = 0
     scheduler._retention = None
-    scheduler._hit_estimator = None
     scheduler._paw_aging_tok_per_s = 0.0
     scheduler._step_wall_time = None
-    scheduler._transfer_poller = None
-    scheduler._hit_resolver = None
     scheduler.kv_cache_manager = SimpleNamespace(enable_caching=False)
     scheduler.connector = None
     scheduler._is_kv_consumer = False

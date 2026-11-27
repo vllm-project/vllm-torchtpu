@@ -107,11 +107,8 @@ def _sched(cost=None, running=(), waiting=(), **attrs) -> TpuPipelineChunkSchedu
     s._clips = 0
     s._waits = 0
     s._retention = None
-    s._hit_estimator = None
     s._paw_aging_tok_per_s = 0.0
     s._step_wall_time = None
-    s._transfer_poller = None
-    s._hit_resolver = None
     s.kv_cache_manager = SimpleNamespace(enable_caching=False)
     s.connector = None
     s._is_kv_consumer = False
@@ -422,42 +419,6 @@ def test_kv_both_is_not_a_kv_consumer(kv_role, consumer):
     assert s._is_kv_producer is (kv_role == "kv_producer")
 
 
-class _HookedConnector:
-    """A connector with the two hooks the prefix-aware admission calls, as
-    the multi-connector and the Raiden offloading connector define them."""
-
-    def poll_and_complete_transfers(self, scheduler):
-        return 0, 0, 0, False
-
-    def resolve_divergent_local_hit_tokens(
-        self, request, num_local, num_reconciled, block_size
-    ):
-        return None
-
-
-def test_the_connector_hooks_are_read_through_named_interfaces(caplog):
-    connector = _HookedConnector()
-    with caplog.at_level("WARNING"):
-        s, _ = _built({"tpu_pp_scheduler": {"prefix_aware": True}}, connector=connector)
-    assert s._transfer_poller is connector and s._hit_resolver is connector
-    assert "has no" not in caplog.text
-
-
-def test_a_connector_without_the_hooks_is_named_in_a_warning(caplog):
-    """The prefix-aware admission runs without the poll and the divergent-hit
-    decision when the connector has neither, and says so instead of skipping
-    them silently."""
-    with caplog.at_level("WARNING"):
-        s, _ = _built({"tpu_pp_scheduler": {"prefix_aware": True}}, connector=object())
-    assert s._transfer_poller is None and s._hit_resolver is None
-    assert "has no poll_and_complete_transfers or" in caplog.text
-    caplog.clear()
-    # Without the prefix-aware admission nothing calls them, so nothing is said.
-    with caplog.at_level("WARNING"):
-        _built(connector=object())
-    assert "has no" not in caplog.text
-
-
 _RETAIN = {"tpu_pp_scheduler": {"hybrid_state_retention": True}}
 
 
@@ -580,7 +541,6 @@ def test_without_options_the_step_limit_is_mains():
             _quadratic_cost=True,
         )
         q._prefix_warmth = lambda request: 0
-        q._external_warmth = lambda request, local: 0
         q._pp_size = pp
         differs += q._pending_step_limit() != want
         # With lone-prompt chunking off no step limit is set, option or not.
@@ -600,11 +560,7 @@ def test_without_options_the_step_limit_is_mains():
 
 
 def test_without_options_schedule_runs_none_of_the_prefix_aware_steps():
-    polls, packs = [], []
-    connector = SimpleNamespace(
-        poll_and_complete_transfers=lambda sched: polls.append(sched),
-        supports_divergent_local_hybrid_hits=False,
-    )
+    packs = []
     deep = _req(163840, 163840 + 3800, "deep")
     shallow = _req(0, 4096, "shallow")
     step = SimpleNamespace(total_num_scheduled_tokens=0, scheduled_new_reqs=[1])
@@ -612,8 +568,6 @@ def test_without_options_schedule_runs_none_of_the_prefix_aware_steps():
         s = _sched(
             cost=_model(),
             running=[deep, shallow],
-            connector=connector,
-            _transfer_poller=connector,
             _prefix_aware=prefix_aware,
             _srpf_running=prefix_aware,
             _quadratic_cost=True,
@@ -629,7 +583,7 @@ def test_without_options_schedule_runs_none_of_the_prefix_aware_steps():
             assert order == ["shallow", "deep"]
         else:
             assert order == ["deep", "shallow"]
-    assert len(polls) == 1 and packs == [True]
+    assert packs == [True]
 
 
 def test_promotion_and_sort_run_when_their_flags_are_set():
@@ -671,54 +625,46 @@ def test_without_prefix_aware_the_local_hit_is_the_base_schedulers():
         seen.append(max_cache_hit_length)
         return "blocks", 4096, 0, True
 
-    resolve = []
-    connector = SimpleNamespace(
-        supports_divergent_local_hybrid_hits=True,
-        resolve_divergent_local_hit_tokens=lambda *a: resolve.append(a) or 0,
-    )
     request = _req(0, 8192)
-    with patch.object(Scheduler, "_get_local_prefix_cache_hit", base):
-        s = _sched(connector=connector, _hit_resolver=connector)
+    with (
+        patch.object(Scheduler, "_get_local_prefix_cache_hit", base),
+        patch.object(
+            pp_chunk_scheduler,
+            "memo_local_prefix_cache_hit",
+            lambda *a: pytest.fail("memo consulted"),
+        ),
+    ):
         # vLLM passes the cap positionally.
-        assert s._get_local_prefix_cache_hit(request, 2048) == (
+        assert _sched()._get_local_prefix_cache_hit(request, 2048) == (
             "blocks",
             4096,
             0,
             True,
         )
-        assert seen == [2048] and resolve == []
-        assert not hasattr(request, "_tpu_local_hit_tokens")
+        assert seen == [2048]
 
 
-def test_prefix_aware_resolves_a_divergent_hit_through_the_connector():
-    seen = []
+def test_prefix_aware_answers_the_admission_lookup_from_the_memo():
+    memo = []
 
-    def base(self, request, max_cache_hit_length=None):
-        seen.append(max_cache_hit_length)
-        return "blocks", 8192, 0, True
+    def memo_hit(scheduler, request, max_cache_hit_length):
+        memo.append(max_cache_hit_length)
+        return None if max_cache_hit_length == 2048 else ("memo", 8192, 0, False)
 
-    kvm = SimpleNamespace(
-        get_computed_blocks=lambda request, cap: ("reconciled", 2048, 0),
-        truncate_computed_blocks=lambda blocks, n: f"{blocks}[:{n}]",
-        empty_kv_cache_blocks="empty",
-    )
-    connector = SimpleNamespace(
-        supports_divergent_local_hybrid_hits=True,
-        resolve_divergent_local_hit_tokens=lambda req, n, rec, bs: 4096,
-    )
     request = _req(0, 16384)
-    with patch.object(Scheduler, "_get_local_prefix_cache_hit", base):
-        s = _sched(
-            connector=connector,
-            _hit_resolver=connector,
-            _prefix_aware=True,
-            kv_cache_manager=kvm,
-        )
-        s._get_block_size = lambda: 2048
-        got = s._get_local_prefix_cache_hit(request, 12288)
-    assert got == ("blocks[:4096]", 4096, 0, True)
-    assert request._tpu_local_hit_tokens == 4096
-    assert seen == [12288]
+    with (
+        patch.object(
+            Scheduler,
+            "_get_local_prefix_cache_hit",
+            lambda self, r, cap=None: ("base", 4096, 0, True),
+        ),
+        patch.object(pp_chunk_scheduler, "memo_local_prefix_cache_hit", memo_hit),
+    ):
+        s = _sched(_prefix_aware=True)
+        assert s._get_local_prefix_cache_hit(request, 12288) == ("memo", 8192, 0, False)
+        # No still-exact memo: the base scheduler's lookup.
+        assert s._get_local_prefix_cache_hit(request, 2048) == ("base", 4096, 0, True)
+    assert memo == [12288, 2048]
 
 
 def test_without_prefix_aware_the_resend_is_not_trimmed():
@@ -755,7 +701,6 @@ def test_a_waiting_prefix_hit_counts_as_done_only_under_quadratic_cost():
     bare = _sched(kv_cache_manager=kvm, _granularity=2048, _quadratic_cost=True)
     for s in (plain, quad, bare):
         s._prefix_warmth = lambda request: 4096
-        s._external_warmth = lambda request, local: 0
     waiting = _req(0, 8192)
     assert plain._waiting_warmth(waiting) == 0
     assert quad._waiting_warmth(waiting) == 4096
@@ -947,16 +892,3 @@ def test_free_blocks_count_the_blocks_retention_pins():
     assert s._get_num_free_blocks() == 10
     s._retention = SimpleNamespace(num_pinned_blocks=lambda: 5)
     assert s._get_num_free_blocks() == 15
-
-
-def test_the_connector_estimate_is_read_through_the_named_interface():
-    class Estimator:
-        def estimate_external_hit_tokens(self, request, num_local_tokens):
-            return 0
-
-    connector = Estimator()
-    s, _ = _built(connector=connector)
-    assert s._hit_estimator is connector
-    # A connector without the method (main's connectors) gives no estimate.
-    s, _ = _built(connector=SimpleNamespace())
-    assert s._hit_estimator is None
