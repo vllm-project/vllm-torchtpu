@@ -2849,12 +2849,12 @@ class TPUModelRunner(GPUModelRunner):
                     constant_values=-1,
                 )
 
-                cur_input_indices = torch.from_numpy(
-                    padded_token_in_tpu_cur_input_indices
-                ).to(self.device, non_blocking=True)
-                pre_next_tokens_indices = torch.from_numpy(
-                    padded_token_in_tpu_pre_next_tokens_indices
-                ).to(self.device, non_blocking=True)
+                cur_input_indices = stage_h2d_upload(
+                    self, torch.from_numpy(padded_token_in_tpu_cur_input_indices)
+                )
+                pre_next_tokens_indices = stage_h2d_upload(
+                    self, torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
+                )
                 self._cached_subst_key = subst_key
                 self._cached_cur_input_indices = cur_input_indices
                 self._cached_pre_next_tokens_indices = pre_next_tokens_indices
@@ -2874,12 +2874,12 @@ class TPUModelRunner(GPUModelRunner):
                 constant_values=-1,
             )
 
-            cur_input_indices = torch.from_numpy(
-                padded_token_in_tpu_cur_input_indices
-            ).to(self.device, non_blocking=True)
-            pre_next_tokens_indices = torch.from_numpy(
-                padded_token_in_tpu_pre_next_tokens_indices
-            ).to(self.device, non_blocking=True)
+            cur_input_indices = stage_h2d_upload(
+                self, torch.from_numpy(padded_token_in_tpu_cur_input_indices)
+            )
+            pre_next_tokens_indices = stage_h2d_upload(
+                self, torch.from_numpy(padded_token_in_tpu_pre_next_tokens_indices)
+            )
 
         return _substitute_placeholder_token(
             input_ids,
@@ -3909,9 +3909,11 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 # Indices at which we sample (positions of last token in the
                 # sequence). Padded to avoid recompiling when `num_reqs` varies.
-                logits_indices = (
-                    self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
-                ).to(self.device, non_blocking=True)
+                # The subtraction makes a temporary host tensor; staging keeps
+                # it alive until the upload is fenced.
+                logits_indices = stage_h2d_upload(
+                    self, self.query_start_loc_cpu[1 : padded_num_reqs + 1] - 1
+                )
 
             if self.mamba_slot_read_offsets is None:
                 request_distribution = self._request_distribution_cpu.to(

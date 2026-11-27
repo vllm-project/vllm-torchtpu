@@ -4356,6 +4356,8 @@ def test_precompile_substitute_placeholder_token_matches_2d_sampled_tokens(monke
         device=torch.device("cpu"),
         _fast_token_substitution=False,
         _update_num_xla_graphs=lambda _name: None,
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
     )
     runner._precompile_timed = TPUModelRunner._precompile_timed.__get__(runner)
 
