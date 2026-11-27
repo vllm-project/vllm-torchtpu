@@ -861,7 +861,7 @@ def test_compiled_input_builders_compile_no_program_per_request_count(device, bu
             )
         next_tokens = torch.ones(rows, K + 1, dtype=torch.int32).to(device)
         draft_lengths = torch.full((rows,), K, dtype=torch.int32).to(device)
-        return proposer._tpu_build_dflash_inputs_next_tokens(
+        return proposer._build_inputs_next_tokens(
             next_tokens,
             qsl,
             pos,

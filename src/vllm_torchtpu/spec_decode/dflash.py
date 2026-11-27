@@ -14,6 +14,7 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 
+from vllm_torchtpu.compilation.direct_call import DirectCompiled
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.layers.core.attention_metadata import (
@@ -417,7 +418,7 @@ class DFlashProposer:
             draft_lengths = chunk.draft_lengths
             if draft_lengths is None:
                 draft_lengths = self._zero_draft_lengths(num_reqs)
-            input_ids, positions, seq_lens = self._tpu_build_dflash_inputs_next_tokens(
+            input_ids, positions, seq_lens = self._build_inputs_next_tokens(
                 next_tokens_device,
                 query_start_loc_device,
                 position_ids_device,
@@ -1160,7 +1161,25 @@ class DFlashProposer:
         )
         return input_ids, positions, seq_lens
 
-    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _build_inputs_next_tokens(self, *args) -> tuple[torch.Tensor, ...]:
+        """``_tpu_build_dflash_inputs_next_tokens`` as one compiled program called
+        directly (``DirectCompiled``): it runs on every decode step, where the
+        per-call ``torch.compile`` wrapper costs more host time than the call.
+        The program reads ``self._max_model_len``, fixed for the proposer's
+        lifetime; it must read no attribute that changes.
+        """
+        # Built on first use (tests build proposers with __new__).
+        build = self.__dict__.get("_direct_build_inputs_next_tokens")
+        if build is None:
+            proposer = self
+
+            def build_inputs(*inputs):
+                return proposer._tpu_build_dflash_inputs_next_tokens(*inputs)
+
+            build = DirectCompiled(build_inputs, backend="tpu")
+            self._direct_build_inputs_next_tokens = build
+        return build(*args)
+
     def _tpu_build_dflash_inputs_next_tokens(
         self,
         next_tokens_device: torch.Tensor,
