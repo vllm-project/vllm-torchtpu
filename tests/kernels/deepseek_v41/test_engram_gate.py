@@ -54,14 +54,19 @@ def _exact(x, w, w_scale, hidden, q_weight, k_weight, mask):
 
 
 @pytest.mark.parametrize(
-    "tokens,heads,dim,k_dim,window,tile",
+    "tokens,heads,dim,k_dim,window,tile,max_tokens",
     [
-        pytest.param(128, 2, 256, 256, 128, 64, id="small-interpret"),
-        pytest.param(100, 2, 256, 256, 128, 64, id="ragged-interpret"),
-        pytest.param(2048, 4, 5120, 6144, 1280, 512, id="prefill"),
+        pytest.param(128, 2, 256, 256, 128, 64, 64, id="small-interpret"),
+        pytest.param(100, 2, 256, 256, 128, 64, 64, id="ragged-interpret"),
+        # Two token tiles: the first head runs tile-major and quantizes the
+        # second tile under the first, its last block clamped; ragged tail.
+        pytest.param(136, 2, 256, 256, 128, 128, 2048, id="fused-interpret"),
+        pytest.param(2048, 4, 5120, 6144, 1280, 512, 1024, id="prefill"),
     ],
 )
-def test_engram_gate_error_no_worse_than_xla(tokens, heads, dim, k_dim, window, tile):
+def test_engram_gate_error_no_worse_than_xla(
+    tokens, heads, dim, k_dim, window, tile, max_tokens
+):
     interpret = jax.default_backend() != "tpu"
     if not interpret and tokens < 2048 or interpret and tokens >= 2048:
         pytest.skip("small shape interprets on CPU; the prefill shape runs on TPU")
@@ -84,7 +89,7 @@ def test_engram_gate_error_no_worse_than_xla(tokens, heads, dim, k_dim, window, 
         window=window,
         token_tile=tile,
         quant_rows=min(64, tokens),
-        max_tokens=max(64, tokens // 2),
+        max_tokens=max_tokens,
         interpret=interpret,
     )
     xla = jax.jit(_xla_path)(*args)
