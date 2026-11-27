@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 import huggingface_hub.constants as hf_constants
@@ -33,6 +33,28 @@ from vllm_torchtpu.roofline import (
     from_hf_config,
     plan,
 )
+
+
+def _iter_subcommand_options(
+    parser: argparse.ArgumentParser,
+) -> list[tuple[str, tuple[str, ...], str | None]]:
+    """Collect ``(subcommand, option_strings, help)`` across root and subparsers."""
+    items: list[tuple[str, tuple[str, ...], str | None]] = []
+
+    def _walk(cmd_name: str, subparser: argparse.ArgumentParser) -> None:
+        """Walk parser actions via stdlib attributes lacking public accessors."""
+        actions: Sequence[argparse.Action] = getattr(subparser, "_actions", ())
+        for action in actions:
+            if action.option_strings:
+                items.append((cmd_name, tuple(action.option_strings), action.help))
+            choices = getattr(action, "choices", None)
+            if isinstance(choices, Mapping):
+                for sub_name, child in choices.items():
+                    if isinstance(child, argparse.ArgumentParser):
+                        _walk(str(sub_name), child)
+
+    _walk("root", parser)
+    return items
 
 
 def test_cli_plan_json_schema(
@@ -432,7 +454,7 @@ def test_cli_chip_spec_hf_overrides_clean_error_and_dtype_label_preservation(
         aux_dtype=None,
         kv_dtype="bf16",
         state_dtype=None,
-        act=None,
+        act_dtype=None,
     )
     dt_resolved = cli.resolve_dtypes_from_args(parsed, nvfp4_cfg)
     assert dt_resolved.w_expert_dtype == "nvfp4"
@@ -608,7 +630,7 @@ def test_cli_act_flag_accepts_four_bit_aliases(act_flag: str) -> None:
         aux_dtype=None,
         kv_dtype=None,
         state_dtype=None,
-        act=act_flag,
+        act_dtype=act_flag,
     )
     resolved = cli.resolve_dtypes_from_args(
         parsed, load_locked_config("qwen3_5_397b_fp8.json")
@@ -867,7 +889,7 @@ def test_cli_solve_mixed_instances_text_and_reference_top_k(
     ]
     assert cli.main([*base_argv, "--top-k", "20"]) == 0
     table_text = capsys.readouterr().out
-    assert "2x2x2x1(" in table_text
+    assert "2x 2x2x1 " in table_text
 
     assert cli.main([*base_argv, "--top-k", "10", "--json"]) == 0
     full_payload = json.loads(capsys.readouterr().out)
@@ -955,3 +977,177 @@ def test_cli_solve_mixed_instances_text_and_reference_top_k(
     conc1_payload = json.loads(capsys.readouterr().out)
     assert conc1_payload["reference"]["found"] is False
     assert "exceeds max concurrency 1" in conc1_payload["reference"]["rejected_by"]
+
+
+def test_every_cli_flag_has_help() -> None:
+    """Verify every registered CLI flag carries non-empty help text."""
+    parser = cli.build_parser()
+    options = _iter_subcommand_options(parser)
+    assert options
+    subcommands = {cmd for cmd, _, _ in options if cmd != "root"}
+    assert subcommands == {"solve", "ceiling", "plan", "explain", "inspect"}
+    for cmd, opt_strings, help_text in options:
+        assert help_text, f"{cmd} {opt_strings} missing help text"
+
+
+def test_cli_assumptions_and_solve_ascii_ordered_output(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify --assumptions text output and solve aligned ASCII ordered table."""
+    rc_assump = cli.main(["--assumptions"])
+    assert rc_assump == 0
+    assump_out = capsys.readouterr().out
+    assert "Constants catalog for chip=tpu7x" in assump_out
+    assert "Solver assumptions:" in assump_out
+    assert "hbm_bytes" in assump_out
+    assert "bf16_flops" in assump_out
+    assert "hbm_bw" in assump_out
+
+    cfg_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+    rc_solve = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--mode",
+            "mixed",
+            "--max-chips",
+            "4",
+            "--isl",
+            "4096",
+            "--osl",
+            "512",
+            "--prefix-hit-rate",
+            "0.0",
+            "--accept-len",
+            "1.0",
+            "--concurrency",
+            "16",
+            "--top-k",
+            "3",
+        ]
+    )
+    assert rc_solve == 0
+    out = capsys.readouterr().out
+    assert "bound_tpot_ms" in out
+    assert "# Ordered Candidates by Concurrency" in out
+    assert "# c=16:" in out
+    assert "#   #1 " in out
+    assert "#   #3 " in out
+    assert "#   #4 " not in out
+    assert "skyline" not in out.lower()
+
+    # Ceiling accepts --sort-by, --pairs, and --top-k cleanly.
+    rc_ceil = cli.main(
+        [
+            "ceiling",
+            "--config",
+            str(cfg_path),
+            "--mode",
+            "disagg",
+            "--max-chips",
+            "8",
+            "--isl",
+            "4096",
+            "--osl",
+            "256",
+            "--prefix-hit-rate",
+            "0.0",
+            "--accept-len",
+            "1.0",
+            "--concurrency",
+            "8",
+            "--sort-by",
+            "interactivity",
+            "--pairs",
+            "--top-k",
+            "2",
+            "--json",
+        ]
+    )
+    assert rc_ceil == 0
+    ceil_rows = json.loads(capsys.readouterr().out)
+    assert 1 <= len(ceil_rows) <= 2
+
+    # Pool-only disagg text honors --top-k and prints --reference-layout summary.
+    rc_pool = cli.main(
+        [
+            "solve",
+            "--config",
+            str(cfg_path),
+            "--mode",
+            "disagg",
+            "--max-chips",
+            "8",
+            "--isl",
+            "4096",
+            "--osl",
+            "256",
+            "--prefix-hit-rate",
+            "0.0",
+            "--accept-len",
+            "1.0",
+            "--concurrency",
+            "8",
+            "--top-k",
+            "2",
+            "--reference-layout",
+            "P: PP8 / D: TP8 x EP8",
+        ]
+    )
+    assert rc_pool == 0
+    pool_out = capsys.readouterr().out
+    prefill_rows = [ln for ln in pool_out.splitlines() if ln.startswith("prefill ")]
+    decode_rows = [ln for ln in pool_out.splitlines() if ln.startswith("decode  ")]
+    assert 1 <= len(prefill_rows) <= 2
+    assert 1 <= len(decode_rows) <= 2
+    assert "reference P: PP8 / D: TP8 x EP8: not found (" in pool_out
+
+
+def test_cli_default_ascii_rank1_matches_json_top_k_and_preserves_a4(
+    locked_config_path: Callable[[str], Path],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify omitted --top-k ASCII rank 1 matches JSON top_k[0] and --act a4 works."""
+    qwen35_path = locked_config_path("qwen3_5_397b_fp8.json")
+    base_argv = [
+        "solve",
+        "--config",
+        str(qwen35_path),
+        "--mode",
+        "mixed",
+        "--max-chips",
+        "4",
+        "--isl",
+        "4096",
+        "--osl",
+        "512",
+        "--prefix-hit-rate",
+        "0.0",
+        "--accept-len",
+        "1.0",
+        "--think-time-s",
+        "0.0",
+        "--concurrency",
+        "1,64",
+        "--act-dtype",
+        "a4",
+    ]
+    assert cli.main([*base_argv, "--json"]) == 0
+    json_payload = json.loads(capsys.readouterr().out)
+    assert json_payload["dtypes"]["act"] == "a4"
+    rank1_json = json_payload["top_k"][0]["point"]
+
+    assert cli.main(base_argv) == 0
+    ascii_out = capsys.readouterr().out
+    assert "act=a4" in ascii_out
+    assert "state=float32 (4B, config)" in ascii_out
+    rank1_line = next(
+        line for line in ascii_out.splitlines() if line.lstrip().startswith("1  ")
+    )
+    assert str(rank1_json["concurrency"]) in rank1_line
+    assert f"{rank1_json['token_throughput_per_chip']:.1f}" in rank1_line
+
+    assert cli.main([*base_argv, "--state-dtype", "bf16"]) == 0
+    bf16_out = capsys.readouterr().out
+    assert "state=bf16 (2B, flag)" in bf16_out

@@ -265,6 +265,7 @@ FRONTIER_2D_TIE_TOLERANCE: float = 1e-9
 
 # Versioned solve JSON payload and top-K diversity selection constants.
 SOLVE_SCHEMA: str = "vllm_torchtpu.roofline.solve/v2"
+INSPECT_SCHEMA: str = "vllm_torchtpu.roofline.inspect/v1"
 CHIP_SPEC_SCHEMA: str = "vllm_torchtpu.roofline.chip_spec/v1"
 VALID_CHIP_PROVENANCE: frozenset[str] = frozenset(
     {"public_spec", "jax_tpu_info", "measured_microbench", "projected"}

@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
@@ -27,6 +30,7 @@ from vllm_torchtpu.roofline import (
     Parallel,
     SpecShape,
     StepShape,
+    cli,
     from_hf_config,
     pass_costs,
     spec_cycle_floor,
@@ -705,3 +709,45 @@ def test_unpadded_strict_and_crossover_preserve_five_matmul_buckets() -> None:
     moe_even = next(mod for mod in sf_even.modules if mod.name == "moe")
     assert moe_even.fp4_flops > 0.0
     assert ep_serial_s > sf_even.serial_estimate_s
+
+
+def test_load_chip_spec_1core_2d_torus_and_cli_assumptions(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify 1-core 2D torus spec end-to-end across assumptions, explain, solve."""
+    synth_int8_flops = 1.5e15
+    spec_payload = _make_base_spec_payload()
+    spec_payload["int8_flops"] = synth_int8_flops
+    spec_path = tmp_path / "synth_1core.json"
+    spec_path.write_text(json.dumps(spec_payload), encoding="utf-8")
+    cfg_path = Path(__file__).resolve().parent / "fixtures" / "qwen3_5_397b_fp8.json"
+
+    rc_assump = cli.main(["--chip-spec", str(spec_path), "--assumptions", "--json"])
+    assert rc_assump == 0
+    assump_json = json.loads(capsys.readouterr().out)
+    assert assump_json["chip"] == "synth_1core_2d"
+    catalog = assump_json["catalog"]
+    assert catalog
+    assert catalog["hbm_bytes"]["value"] == spec_payload["hbm_bytes"]
+    assert catalog["bf16_flops"]["value"] == pytest.approx(spec_payload["bf16_flops"])
+    assert "synth_1core_2d" in catalog["hbm_bytes"]["source"]
+    assumptions_list = assump_json["solver_assumptions"]
+    assert assumptions_list
+    assert all("name" in item and "source" in item for item in assumptions_list)
+
+    rc_explain = cli.main(
+        [
+            "explain",
+            "--chip-spec",
+            str(spec_path),
+            "--config",
+            str(cfg_path),
+            "--tp",
+            "1",
+        ]
+    )
+    assert rc_explain == 0
+    explain_out = capsys.readouterr().out
+    for col in ("int8_gflops", "fp4_gflops", "int4_gflops", "vector_gflops"):
+        assert col in explain_out
