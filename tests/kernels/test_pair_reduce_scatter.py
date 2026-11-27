@@ -26,7 +26,7 @@ import pytest
 
 from vllm_torchtpu.kernels.collectives import pair_reduce_scatter
 
-HIDDEN = 384
+HIDDEN = 512
 # (rows per rank's block, chunk): several chunks per block, and one.
 CASES = ((64, 32), (96, 32), (32, 32))
 WIRES = pair_reduce_scatter.WIRES
@@ -56,10 +56,14 @@ def test_topology_table_refuses_other_shapes():
 
 
 def test_chunk_rows():
-    assert pair_reduce_scatter.chunk_rows(8 * 512, 6144, 8) == 64
+    assert pair_reduce_scatter.chunk_rows(8 * 512, 6144, 8) == 32
     assert pair_reduce_scatter.chunk_rows(8 * 480, 6144, 8) == 32
     assert pair_reduce_scatter.chunk_rows(8 * 48, 6144, 8) is None
     assert pair_reduce_scatter.chunk_rows(8 * 512, 6144, 4) is None
+    # Columns must split into halves of whole lane tiles.
+    assert pair_reduce_scatter.chunk_rows(8 * 512, 6016, 8) is None
+    # Past the VMEM budget (the own block's sums grow with the block).
+    assert pair_reduce_scatter.chunk_rows(8 * 2048, 6144, 8) is None
 
 
 def _worker():
@@ -146,9 +150,9 @@ def on_8_devices():
 @pytest.mark.parametrize("case", CASES)
 def test_kernel_on_8_devices(on_8_devices, wire, case):
     got = on_8_devices["{}-{}-{}".format(wire, *case)]
-    # Chip sums |s| <= 12: int8 is off by up to 12 / 254 per received one,
-    # and the bf16 output by up to half its spacing (1/8 below 64).
-    bound = 0.0 if wire == "bf16" else 3 * 12 / 254 + 0.125
+    # int8: each hop's sums (|s| <= 24) are off by up to 24 / 254, and the
+    # bf16 partial and output sums (|s| <= 48) by up to 1/8.
+    bound = 0.0 if wire == "bf16" else 3 * 24 / 254 + 2 * 0.125
     assert got["err"] <= bound and not got["races"], got
 
 

@@ -144,7 +144,7 @@ def reduce_scatter_body(n: int, min_bytes: int, axis: str, table, wire: str):
 
     def body(x, rank):
         rows, hidden = x.shape
-        chunk = pair_reduce_scatter.chunk_rows(rows, hidden, n)
+        chunk = pair_reduce_scatter.chunk_rows(rows, hidden, n, wire)
         if chunk is not None and x.size * x.dtype.itemsize >= min_bytes:
             return pair_reduce_scatter.reduce_scatter(x, rank, table, chunk, wire)
         return lax.psum_scatter(x, axis, scatter_dimension=0, tiled=True)
@@ -361,12 +361,12 @@ def arm(hidden: int, device: torch.device) -> bool:
         rs_table = pair_reduce_scatter.topology_table(d.id for d in mesh.devices.flat)
         wire = envs.TPU_TP_PAIR_REDUCE_SCATTER_WIRE
         rs_op = _make_rs_op(mesh, rs_min_bytes, rs_table, wire)
-        # The smallest kernel shape at the byte floor: whole 64-row chunks.
+        # The smallest kernel shape at the byte floor (whole chunks).
         unit = n * pair_reduce_scatter.CHUNK_ROWS
         rows = unit * max(1, -(-rs_min_bytes // (unit * hidden * 2)))
-        # int8 chip sums (|s| <= 10) are off by up to 10 / 254 each, and the
-        # bf16 output by an eighth near 40.
-        tol = 0.0 if wire == "bf16" else 0.5
+        # int8: each hop's sums (|s| <= 20) are off by up to 20 / 254, and the
+        # bf16 partial and output sums (|s| <= 40) by up to 1/8.
+        tol = 0.0 if wire == "bf16" else 0.75
         ok = _rs_selftest(rs_op, rank, mesh_index, n, rows, hidden, device, tol)
         if not all(_gather(ok)):
             raise RuntimeError(f"tp_reduce_scatter: self-test failed at {rows} rows")
