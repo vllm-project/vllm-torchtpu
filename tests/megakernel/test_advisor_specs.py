@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 SOURCE_PREFIXES = ("FACT:", "DERIVED:", "ASSUMED:", "CHOSEN:")
 
 
-SHIPPED_PRESET_COUNT = 4
+SHIPPED_PRESET_COUNT = 5
 NEGATIVE_CONTROL_SNAPSHOTS = frozenset({"kimi-k3.1-pro", "qwen3.8-2.4t", "deepseek-v3"})
 HF_CONFIG_DIR = Path(__file__).resolve().parent / "data" / "advisor" / "hf_configs"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -231,7 +231,13 @@ def test_preset_models_json_schema() -> None:
     models_data = json.loads(models_json.read_text(encoding="utf-8"))
     assert "presets" in models_data
     assert len(models_data["presets"]) == SHIPPED_PRESET_COUNT
-    for moe_slug in ("qwen3.5-397b", "kimi-k3", "glm-5.2", "qwen3.8-flash-next"):
+    for moe_slug in (
+        "qwen3.5-397b",
+        "kimi-k3",
+        "glm-5.2",
+        "qwen3.8-flash-next",
+        "deepseek-v4.1-flash",
+    ):
         assert models_data["presets"][moe_slug]["moe_intermediate_size"] > 0
     deployments_data = json.loads(deployments_json.read_text(encoding="utf-8"))
     assert "deployments" in deployments_data
@@ -557,6 +563,7 @@ RUNTIME_DTYPE_OVERRIDES: dict[str, dict[str, str]] = {
     "kimi-k3": {"kv_dtype": "fp8", "state_dtype": "fp32"},
     "glm-5.2": {"kv_dtype": "fp8"},
     "qwen3.8-flash-next": {"kv_dtype": "fp8", "state_dtype": "fp32"},
+    "deepseek-v4.1-flash": {"kv_dtype": "fp8"},
 }
 
 
@@ -746,7 +753,13 @@ def test_preset_loaders_reject_malformed_fields(
 
 def test_shipped_presets_are_the_three_validated_models() -> None:
     """Verify models.json ships only the validated presets and their aliases."""
-    expected_presets = {"qwen3.5-397b", "kimi-k3", "glm-5.2", "qwen3.8-flash-next"}
+    expected_presets = {
+        "qwen3.5-397b",
+        "kimi-k3",
+        "glm-5.2",
+        "qwen3.8-flash-next",
+        "deepseek-v4.1-flash",
+    }
     expected_aliases = {
         "qwen3.5-397b": "qwen3.5-397b",
         "qwen3.5-397b-a17b": "qwen3.5-397b",
@@ -758,6 +771,8 @@ def test_shipped_presets_are_the_three_validated_models() -> None:
         "qwen3.8-flash-next": "qwen3.8-flash-next",
         "qwen3.8-flash-next-fp8": "qwen3.8-flash-next",
         "qwen3.8-flash": "qwen3.8-flash-next",
+        "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+        "deepseek-v41-flash": "deepseek-v4.1-flash",
     }
     assert set(models.MODEL_PRESETS) == expected_presets
     assert dict(models.REGISTERED_MODEL_ALIASES) == expected_aliases
@@ -779,6 +794,7 @@ def test_unsupported_authentic_config_fails_closed() -> None:
         "moonshotai/Kimi-K3",
         "zai-org/GLM-5.2-FP8",
         "Qwen/Qwen3.8-Flash-Next-FP8",
+        "deepseek-ai/DeepSeek-V4.1-Flash",
     )
     for neg_name in ("kimi-k3.1-pro", "qwen3.8-2.4t", "deepseek-v3"):
         snapshot = json.loads(

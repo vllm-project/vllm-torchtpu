@@ -81,6 +81,29 @@
         "dp": 4
       },
       "prefill_windows": [8192]
+    },
+    "deepseek-v4.1-flash": {
+      "source": "DeepSeek-V4.1-Flash reference 6-axis serving topologies: TP1 x DP8 x EP8 colocated decode, prefill, and saturation with 5 draft tokens and CED execution at layer 20",
+      "decode": {
+        "tp": 1,
+        "dp": 8,
+        "ep": 8,
+        "spec_tokens": 5,
+        "execution": "ced"
+      },
+      "prefill": {
+        "tp": 1,
+        "dp": 8,
+        "ep": 8,
+        "execution": "ced"
+      },
+      "saturation": {
+        "tp": 1,
+        "dp": 8,
+        "ep": 8,
+        "execution": "ced"
+      },
+      "prefill_windows": [1024]
     }
   }
 }

@@ -95,22 +95,24 @@ def _out_of_scope_params(
     if isinstance(vc, dict) and str(vc.get("model_type", "")) in (
         "qwen3_5_moe",
         "qwen4_exp",
+        "deepseek_v41_vision",
     ):
         vh = int(vc["hidden_size"])
         vi = int(vc["intermediate_size"])
-        vd = int(vc["depth"])
+        vd = int(vc.get("depth") or vc.get("num_hidden_layers") or 0)
         in_ch = int(vc.get("in_channels", 3))
-        pt = int(vc.get("temporal_patch_size", 2))
+        is_ds_vis = str(vc.get("model_type", "")) == "deepseek_v41_vision"
+        pt = int(vc.get("temporal_patch_size", 1 if is_ds_vis else 2))
         ps = int(vc.get("patch_size", 16))
-        sm = int(vc.get("spatial_merge_size", 2))
-        oh = int(vc.get("out_hidden_size", profile.hidden_size))
-        m_in = vh * sm * sm
-        extra += (
-            vd * (4 * vh * vh + 3 * vh * vi)
-            + vh * in_ch * pt * ps * ps
-            + m_in * m_in
-            + m_in * oh
-        )
+        extra += vd * (4 * vh * vh + 3 * vh * vi) + vh * in_ch * pt * ps * ps
+        if is_ds_vis:
+            dr = int(vc.get("downsample_ratio", 1))
+            extra += vh * dr * dr * profile.hidden_size
+        else:
+            sm = int(vc.get("spatial_merge_size", 2))
+            oh = int(vc.get("out_hidden_size", profile.hidden_size))
+            m_in = vh * sm * sm
+            extra += m_in * m_in + m_in * oh
     ple_ids = text_config.get("ple_layer_ids")
     ngram_base = int(text_config.get("ngram_vocab_size_base") or 0)
     if isinstance(ple_ids, list) and ple_ids and ngram_base > 0:
@@ -118,14 +120,24 @@ def _out_of_scope_params(
         ple_vocab = ((ngram_base + div - 1) // div) * div
         ple_dim = int(text_config.get("ple_embed_dim") or profile.hidden_size)
         extra += ple_vocab * ple_dim * len(ple_ids)
+    engram_counts = text_config.get("engram_num_embeddings")
+    engram_dim = int(text_config.get("engram_head_dim") or 0)
+    if isinstance(engram_counts, list) and engram_dim > 0:
+        extra += sum(int(val) for val in engram_counts) * engram_dim
     mtp_layers = int(
         text_config.get("mtp_num_hidden_layers")
         or text_config.get("num_nextn_predict_layers")
         or 0
     )
     if mtp_layers:
+        dspark_experts = int(text_config.get("dspark_n_routed_experts") or 0)
+        mtp_profile = (
+            dataclasses.replace(profile, num_experts=dspark_experts, host_tables=())
+            if dspark_experts > 0
+            else profile
+        )
         per_layer_dec = (
-            roofline.compute_decoder_param_count(profile) / profile.num_layers
+            roofline.compute_decoder_param_count(mtp_profile) / mtp_profile.num_layers
         )
         extra += round(
             mtp_layers * (per_layer_dec + 2 * profile.hidden_size * profile.hidden_size)
@@ -1505,7 +1517,7 @@ def test_core_legality_gates(model_slug: str) -> None:
     preset_decode = advisor.DEPLOYMENT_PRESETS[model_slug].decode
     native_wl = advisor.WorkloadSpec(
         phase="decode",
-        batch=4,
+        batch=4 * preset_decode.dp,
         tp=preset_decode.tp,
         ep=preset_decode.ep,
         dp=preset_decode.dp,
@@ -2138,9 +2150,10 @@ def test_scope_subterms_reconstruct_roof_floor(
     """Verify chain_us with hbm_us and comm_us rebuilds every scope's roof_floor_us."""
     preset = advisor.DEPLOYMENT_PRESETS[model_slug]
     layout = preset.prefill if phase in _MIXED_PREFILL_PHASES else preset.decode
+    base_batch = 1 if phase == "prefill" else (4 if phase == "verify" else 16)
     workload = advisor.WorkloadSpec(
         phase=phase,
-        batch=1 if phase == "prefill" else (4 if phase == "verify" else 16),
+        batch=base_batch * layout.dp,
         isl=512 if phase in _MIXED_PREFILL_PHASES else 4096,
         context=4096,
         chunk_size=512 if phase in _MIXED_PREFILL_PHASES else 0,

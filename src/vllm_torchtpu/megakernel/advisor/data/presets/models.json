@@ -143,6 +143,204 @@
           "dense_proj_params": 32768000
         }
       ]
+    },
+    "deepseek-v4.1-flash": {
+      "num_layers": 40,
+      "hidden_size": 5120,
+      "intermediate_size": 0,
+      "num_attention_heads": 64,
+      "num_kv_heads": 1,
+      "head_dim": 512,
+      "num_experts": 384,
+      "top_k": 6,
+      "moe_intermediate_size": 2304,
+      "shared_expert_intermediate_size": 2304,
+      "num_moe_layers": 40,
+      "q_lora_rank": 1280,
+      "qk_rope_head_dim": 64,
+      "o_lora_rank": 1024,
+      "o_groups": 8,
+      "ced_boundary": 20,
+      "weight_dtype": "fp8",
+      "expert_dtype": "mxfp4",
+      "act_dtype": "fp8",
+      "kv_dtype": "fp8",
+      "weight_block_k": 32,
+      "model_type": "deepseek_v41_text",
+      "dtype_basis": "config",
+      "source": "HuggingFace deepseek-ai/DeepSeek-V4.1-Flash config.json",
+      "sparse_attn": {
+        "kind": "csa",
+        "window_tokens": 128,
+        "window_bytes_per_token": 1024.0,
+        "window_layers": [
+          0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+          10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+          20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+          30, 31, 32, 33, 34, 35, 36, 37, 38, 39
+        ],
+        "select_tokens": 512,
+        "index_heads": 32,
+        "index_kv_heads": 1,
+        "index_dim": 128,
+        "index_compress_ratio": 1,
+        "kv_owners": [
+          {
+            "layer": 2,
+            "record_tokens": 2.0,
+            "record_elems": 512,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [2, 3, 4, 5, 6, 7],
+            "max_scan_records": null
+          },
+          {
+            "layer": 8,
+            "record_tokens": 2.0,
+            "record_elems": 512,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [8, 9, 10, 11, 12, 13],
+            "max_scan_records": null
+          },
+          {
+            "layer": 14,
+            "record_tokens": 2.0,
+            "record_elems": 512,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [14, 15, 16, 17, 18, 19],
+            "max_scan_records": null
+          },
+          {
+            "layer": 20,
+            "record_tokens": 1.0,
+            "record_elems": 512,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [
+              20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+              30, 31, 32, 33, 34, 35, 36, 37, 38, 39
+            ],
+            "max_scan_records": null
+          }
+        ],
+        "index_owners": [
+          {
+            "layer": 2,
+            "record_tokens": 2.0,
+            "record_elems": 128,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [2, 3, 4, 5, 6, 7],
+            "max_scan_records": null
+          },
+          {
+            "layer": 8,
+            "record_tokens": 2.0,
+            "record_elems": 128,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [8, 9, 10, 11, 12, 13],
+            "max_scan_records": null
+          },
+          {
+            "layer": 14,
+            "record_tokens": 2.0,
+            "record_elems": 128,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [14, 15, 16, 17, 18, 19],
+            "max_scan_records": null
+          },
+          {
+            "layer": 20,
+            "record_tokens": 1.0,
+            "record_elems": 128,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [20, 21, 22, 23],
+            "max_scan_records": null
+          },
+          {
+            "layer": 24,
+            "record_tokens": 1.0,
+            "record_elems": 128,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [24, 25, 26, 27],
+            "max_scan_records": 16384
+          },
+          {
+            "layer": 28,
+            "record_tokens": 1.0,
+            "record_elems": 128,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [28, 29, 30, 31],
+            "max_scan_records": 16384
+          },
+          {
+            "layer": 32,
+            "record_tokens": 1.0,
+            "record_elems": 128,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [32, 33, 34, 35],
+            "max_scan_records": 16384
+          },
+          {
+            "layer": 36,
+            "record_tokens": 1.0,
+            "record_elems": 128,
+            "elem_bytes": 1.0,
+            "record_overhead_bytes": 4.0,
+            "replication": "per_rank",
+            "users": [36, 37, 38, 39],
+            "max_scan_records": 16384
+          }
+        ],
+        "shared_kv_mqa": true,
+        "kv_owner_ring_bytes_per_req": 12288
+      },
+      "hyper_connection": {
+        "kind": "mhc",
+        "num_streams": 4,
+        "sinkhorn_iters": 20
+      },
+      "host_tables": [
+        {
+          "name": "engram_l1",
+          "layers": [1],
+          "table_bytes_total": 101377628352,
+          "h2d_bytes_per_token": 6336.0,
+          "hbm_resident": false,
+          "shard_axis": "dp_local",
+          "state_bytes_per_request": 0,
+          "dense_proj_params": 0
+        },
+        {
+          "name": "engram_l14",
+          "layers": [14],
+          "table_bytes_total": 101380404048,
+          "h2d_bytes_per_token": 6336.0,
+          "hbm_resident": false,
+          "shard_axis": "dp_local",
+          "state_bytes_per_request": 0,
+          "dense_proj_params": 0
+        }
+      ]
     }
   },
   "aliases": {
@@ -155,6 +353,8 @@
     "glm5.2": "glm-5.2",
     "qwen3.8-flash-next": "qwen3.8-flash-next",
     "qwen3.8-flash-next-fp8": "qwen3.8-flash-next",
-    "qwen3.8-flash": "qwen3.8-flash-next"
+    "qwen3.8-flash": "qwen3.8-flash-next",
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+    "deepseek-v41-flash": "deepseek-v4.1-flash"
   }
 }
