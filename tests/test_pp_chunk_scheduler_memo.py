@@ -192,6 +192,16 @@ def _cached_prompt(kvm: KVCacheManager) -> list[int]:
     return prompt
 
 
+def test_retention_on_a_small_pool_pins_at_most_5_percent_of_it(engine_block_pool):
+    """On a real pool of 100 blocks the scheduler caps retention's cross-turn
+    pins at 5 blocks, not the 360 measured on 8,675-block pools (retention
+    evicts down to its cap: test_hybrid_retention)."""
+    for num_blocks, cap in ((100, 5), (64, 3)):
+        scheduler = _scheduler(_manager(num_blocks=num_blocks), {"prefix_aware": True})
+        assert scheduler._retention is not None
+        assert scheduler._retention.max_pinned_blocks == cap
+
+
 def test_a_prefix_cache_reset_clears_the_memo_with_retention_on(engine_block_pool):
     kvm = _manager()
     scheduler = _scheduler(kvm, {"prefix_aware": True})

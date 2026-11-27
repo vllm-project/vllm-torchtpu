@@ -58,6 +58,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.core import pp_scheduler_options, scheduler_options
 from vllm_torchtpu.core.hybrid_retention import (
     HybridStateRetention,
+    pinned_block_cap,
     retention_wanted,
 )
 from vllm_torchtpu.core.pp_chunks import StepCostModel, chunk_pairs, step_limit
@@ -285,9 +286,21 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
                 )
         self._retention: HybridStateRetention | None = None
         if options.hybrid_state_retention:
-            retention = HybridStateRetention(self.kv_cache_manager)
-            if retention.enabled:
-                self._retention = retention
+            # At most 360 cross-turn pins, and no more than 5% of the pool.
+            pin_cap = pinned_block_cap(self.kv_cache_manager.block_pool.num_gpu_blocks)
+            if pin_cap > 0:
+                retention = HybridStateRetention(
+                    self.kv_cache_manager, max_pinned_blocks=pin_cap
+                )
+                if retention.enabled:
+                    self._retention = retention
+            else:
+                logger.warning(
+                    "Pipeline chunk scheduler: a pool of %d blocks has no room "
+                    "for hybrid-state retention (5%% of it is under one "
+                    "block); retention stays off.",
+                    self.kv_cache_manager.block_pool.num_gpu_blocks,
+                )
         self._memo_xstep = False
         self._paw_sort = False
         if options.prefix_aware or options.quadratic_cost:

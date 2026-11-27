@@ -67,8 +67,9 @@ multi-turn think-time within a strictly bounded HBM pin budget:
    common prefix. "Same conversation" means "extends the retained prefix"
    (chained block-hash match), and fork anchors are keyed by block hash.
    Total pinned Mamba blocks across ``_conv_lru`` and ``_fork_lru`` are
-   strictly capped by
-   ``_MAX_PINNED_BLOCKS`` (360, <= 5% of pool), and
+   strictly capped by ``max_pinned_blocks``: ``_MAX_PINNED_BLOCKS`` (360)
+   by default; the pipeline chunk scheduler passes
+   ``pinned_block_cap(pool size)``, at most 5% of the pool, and
    guards on ``block_pool.get_new_blocks`` / ``allocate_slots`` evict retained
    entries when the pool itself is short of blocks. An ``allocate_slots``
    refusal is classified first (see ``ALLOC_NONE_REASONS``); only a real
@@ -127,6 +128,18 @@ _MAX_PINNED_BLOCKS = 360
 _KEEP_PRIOR_TURNS = 1
 _SMART_FORK = True
 _SAFE_TAIL_OFFSET = 4
+
+
+# The share of the block pool, in percent, retention may pin across turns.
+_MAX_PINNED_POOL_PERCENT = 5
+
+
+def pinned_block_cap(num_gpu_blocks: int) -> int:
+    """The cross-turn pinned-block cap for a pool of ``num_gpu_blocks``:
+    ``_MAX_PINNED_BLOCKS`` (360, the value the measured prefill legs ran,
+    whose pools held 8,675 blocks), and at most 5% of a smaller pool (below
+    7,200 blocks). 0 for a pool under 20 blocks."""
+    return min(_MAX_PINNED_BLOCKS, num_gpu_blocks * _MAX_PINNED_POOL_PERCENT // 100)
 
 
 def _cdiv(a: int, b: int) -> int:

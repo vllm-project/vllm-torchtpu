@@ -231,11 +231,13 @@ def _built(
     architecture="Qwen3_5MoeForConditionalGeneration",
     equal_cost=True,
     connector=None,
+    num_gpu_blocks=8675,
 ):
     """Runs TpuPipelineChunkScheduler.__init__ over a stub base __init__, with
-    main's equal-cost chunking ``equal_cost``; returns the scheduler and the
-    order of the prefix-aware setup calls."""
-    calls: list[str] = []
+    main's equal-cost chunking ``equal_cost`` and a pool of ``num_gpu_blocks``
+    (a measured prefill leg's by default); returns the scheduler and the
+    order of the prefix-aware setup calls (retention's with its arguments)."""
+    calls: list = []
 
     def base_init(self, *args, **kwargs):
         self.vllm_config = SimpleNamespace(
@@ -245,12 +247,15 @@ def _built(
             model_config=SimpleNamespace(architectures=[architecture]),
         )
         self.need_mamba_block_aligned_split = False
-        self.kv_cache_manager = SimpleNamespace()
+        self.kv_cache_manager = SimpleNamespace(
+            block_pool=SimpleNamespace(num_gpu_blocks=num_gpu_blocks)
+        )
         self.connector = connector
 
     class FakeRetention:
-        def __init__(self, kvm):
+        def __init__(self, kvm, **kwargs):
             calls.append("retention")
+            calls.append(kwargs)
             self.enabled = retention_enabled
 
     def memo(self):
@@ -467,6 +472,31 @@ def test_retention_follows_the_option_on_a_kv_producer():
     for kv_role in ("kv_consumer", "kv_both", None):
         with pytest.raises(ValueError, match="hybrid_state_retention"):
             _checked(_RETAIN, kv_role=kv_role)
+
+
+@pytest.mark.parametrize(
+    "num_gpu_blocks, cap",
+    [
+        # The measured prefill legs' pools (8,675 blocks): the measured 360.
+        (8675, 360),
+        (7200, 360),
+        # Smaller pools: 5% of the pool.
+        (7199, 359),
+        (1000, 50),
+        (20, 1),
+    ],
+)
+def test_retention_pins_at_most_5_percent_of_the_pool(num_gpu_blocks, cap):
+    s, calls = _built(_RETAIN, num_gpu_blocks=num_gpu_blocks)
+    assert s._retention is not None
+    assert calls[calls.index("retention") + 1] == {"max_pinned_blocks": cap}
+
+
+def test_a_pool_too_small_for_one_pin_keeps_no_snapshots(caplog):
+    with caplog.at_level("WARNING"):
+        s, calls = _built(_RETAIN, num_gpu_blocks=19)
+    assert s._retention is None and "retention" not in calls
+    assert "has no room for hybrid-state retention" in caplog.text
 
 
 @pytest.mark.parametrize(
