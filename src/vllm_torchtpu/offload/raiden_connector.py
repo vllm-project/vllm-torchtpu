@@ -109,6 +109,7 @@ from vllm_torchtpu.offload.raiden_store import (
     RaidenLoadStoreSpec,
     RaidenOffloadingManager,
     TPURaidenStoreOffloadingSpec,
+    check_kv_leaves_registered,
 )
 
 if TYPE_CHECKING:
@@ -522,7 +523,16 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         each as an `int8` byte view.
         """
         assert self.connector_worker is not None
-        num_blocks = self.connector_worker.kv_cache_config.num_blocks
+        kv_cache_config = self.connector_worker.kv_cache_config
+        num_blocks = kv_cache_config.num_blocks
+
+        # Each single-tensor layer's own array page, to check K/V layers by name.
+        layer_page_bytes = {
+            name: layer_kv_cache.untyped_storage().nbytes() // num_blocks
+            for name, layer_kv_cache in kv_caches.items()
+            if isinstance(layer_kv_cache, torch.Tensor)
+        }
+        check_kv_leaves_registered(self._vllm_config, kv_cache_config, layer_page_bytes)
 
         pool_storages: dict[int, tuple[torch.UntypedStorage, torch.device]] = {}
         for layer_kv_cache in kv_caches.values():
@@ -566,9 +576,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
                 )
                 for idx, pool_tensor in enumerate(pool_tensors)
             ]
-            for _ in offloading_config_module.get_offloading_group_ids(
-                self.connector_worker.kv_cache_config
-            )
+            for _ in offloading_config_module.get_offloading_group_ids(kv_cache_config)
         ]
 
         self.connector_worker._init_worker(

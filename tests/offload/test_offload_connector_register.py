@@ -40,13 +40,17 @@ def _fake_connector(num_groups: int, offloaded_group_ids=None):
     worker = SimpleNamespace(
         kv_cache_config=SimpleNamespace(
             num_blocks=NUM_BLOCKS,
-            kv_cache_groups=[object() for _ in range(num_groups)],
+            # No K/V layers, so the per-layer K/V page check has nothing to do.
+            kv_cache_groups=[
+                SimpleNamespace(layer_names=[], kv_cache_spec=None)
+                for _ in range(num_groups)
+            ],
             hisparse_host_num_blocks=None,
             prefix_cacheable_group_ids=offloaded_group_ids,
         ),
         _init_worker=captured.append,
     )
-    return SimpleNamespace(connector_worker=worker), captured
+    return SimpleNamespace(connector_worker=worker, _vllm_config=None), captured
 
 
 def test_register_kv_caches_canonicalizes_unified_pool():
