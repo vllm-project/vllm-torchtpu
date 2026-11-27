@@ -800,6 +800,7 @@ def _decode_candidates_kernel(
     own = (rows >= cu_ref[seq]) & (rows < cu_ref[seq + 1])
 
     def store(first, m, rows_major, pos):
+        del pos  # `_kernel_v3`'s callback signature; decode tiles store whole groups
         m = m if rows_major else m.T
         cols = pl.ds(
             pl.multiple_of(group * pages_per_step + first, m.shape[1]), m.shape[1]
