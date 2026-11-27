@@ -22,7 +22,7 @@
 #
 #   agentx_eval_client.sh --suites gsm8k[,mmlu_pro,kimi_tool_call_schema_full]
 #       [--eval-conc N] [--chips N] [--model-prefix NAME] [--precision LABEL]
-#       [--server-url URL] [--engine-url URL]
+#       [--server-url URL] [--engine-url URL] [--model NAME] [--max-model-len N]
 #       [--runner-type tpu7x-32] [--spec-method none] [--results-dir DIR]
 #       [--ix-ref SHA] [--gsm8k-limit N] [--mmlu-limit N]
 #       [--gcs-root gs://...] [--port 8000]
@@ -41,6 +41,8 @@ set -uo pipefail
 
 PORT=8000               # only used when --server-url is absent
 IX_SERVER_URL=""
+MODEL_ARG=""
+MAX_MODEL_LEN_ARG=""
 RESULTS_DIR="/perf_eval_results/agentx-evals"
 SUITES=""
 EVAL_CONC=""
@@ -59,6 +61,8 @@ while [[ $# -gt 0 ]]; do
     case $1 in
         --server-url)    IX_SERVER_URL="$2"; shift 2 ;;
         --engine-url)    IX_ENGINE_URL="$2"; shift 2 ;;
+        --model)         MODEL_ARG="$2"; shift 2 ;;
+        --max-model-len) MAX_MODEL_LEN_ARG="$2"; shift 2 ;;
         --suites)        SUITES="$2"; shift 2 ;;
         --eval-conc)     EVAL_CONC="$2"; shift 2 ;;
         --chips)         CHIPS="$2"; shift 2 ;;
@@ -79,12 +83,23 @@ done
 [ -n "$SUITES" ] || { echo "agentx_eval_client.sh: --suites is required" >&2; exit 2; }
 IFS=',' read -r -a _raw_suites <<< "$SUITES"
 SUITE_LIST=()
+NEEDS_INFERENCEX=0
+NEEDS_GSM8K=0
 for _s in "${_raw_suites[@]}"; do
     s="${_s// /}"
     [ -n "$s" ] || continue
     case "$s" in
-        mmlu_pro|gsm8k|kimi_tool_call_schema|kimi_tool_call_schema_full)
+        mmlu_pro)
             SUITE_LIST+=("$s")
+            ;;
+        gsm8k)
+            SUITE_LIST+=("$s")
+            NEEDS_INFERENCEX=1
+            NEEDS_GSM8K=1
+            ;;
+        kimi_tool_call_schema|kimi_tool_call_schema_full)
+            SUITE_LIST+=("$s")
+            NEEDS_INFERENCEX=1
             ;;
         *)
             echo "agentx_eval_client.sh: unknown suite '$s' (mmlu_pro, gsm8k, kimi_tool_call_schema, kimi_tool_call_schema_full)" >&2
@@ -109,10 +124,14 @@ esac
 [[ "$MMLU_LIMIT" =~ ^[1-9][0-9]*$ ]] || {
     echo "agentx_eval_client.sh: --mmlu-limit must be a positive integer, got '$MMLU_LIMIT'" >&2; exit 2
 }
+[ -z "$MAX_MODEL_LEN_ARG" ] || [[ "$MAX_MODEL_LEN_ARG" =~ ^[1-9][0-9]*$ ]] || {
+    echo "agentx_eval_client.sh: --max-model-len must be a positive integer, got '$MAX_MODEL_LEN_ARG'" >&2; exit 2
+}
 RUNNER_TYPE="${RUNNER_TYPE_ARG:-tpu7x-$CHIPS}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENDPOINT_URL_PY="$SCRIPT_DIR/../../benchmarking/endpoint_url.py"
+BENCHMARKING_DIR="$(cd "$SCRIPT_DIR/../../benchmarking" && pwd)"
+ENDPOINT_URL_PY="$BENCHMARKING_DIR/endpoint_url.py"
 
 # Normalize --server-url via the shared endpoint_url.py helper.
 NEEDS_LOCAL_FORWARDER=0
@@ -139,7 +158,9 @@ else:
     print("forward")
 ' "$IX_SERVER_URL")
     if [ "$_loopback_port" = "forward" ]; then
-        NEEDS_LOCAL_FORWARDER=1
+        if [ "$NEEDS_INFERENCEX" = 1 ]; then
+            NEEDS_LOCAL_FORWARDER=1
+        fi
     else
         PORT="$_loopback_port"
     fi
@@ -155,6 +176,23 @@ export IX_SWEEP_TAG="agentx-evals"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/sweep_lib.sh"
 IX_REF="${IX_REF:-$IX_DEFAULT_REF}"
+
+_curl_api() {
+    if [ -n "${OPENAI_API_KEY:-}" ]; then
+        curl -H "Authorization: Bearer ${OPENAI_API_KEY}" "$@"
+    else
+        curl "$@"
+    fi
+}
+server_alive() { _curl_api -sf --max-time 10 "$(ix_server_url)/v1/models" >/dev/null; }
+# shellcheck disable=SC2317  # called indirectly by wait_server_idle in sweep_lib.sh
+ix_engine_queue_depth() {
+    local body
+    body=$(_curl_api -sf --max-time 30 "$(ix_engine_url)/metrics") || return 1
+    [ -n "$body" ] || return 1
+    printf '%s' "$body" \
+        | awk '/^vllm:num_requests_(running|waiting)( |\{)/{s+=$NF} END{print s+0}'
+}
 
 mkdir -p "$RESULTS_DIR"
 RESULTS_DIR="$(cd "$RESULTS_DIR" && pwd)"
@@ -173,7 +211,9 @@ cleanup() {
     log "cleanup"
     log "results dir:"; find "$RESULTS_DIR" -maxdepth 3 2>/dev/null | head -60
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if ! server_alive; then
     log "FATAL: no server answering /v1/models at $(ix_server_url)"
@@ -194,31 +234,58 @@ if [ "$NEEDS_LOCAL_FORWARDER" = 1 ]; then
             export PORT
             break
         fi
+        if ! kill -0 "$_forward_pid" 2>/dev/null; then
+            log "FATAL: local loopback forwarder exited before binding a port"
+            exit 1
+        fi
         sleep 0.1
     done
     # PORT keeps its 8000 default until the port file appears; never probe that.
-    if [ ! -s "$_forward_port_file" ] || ! curl -sf --max-time 10 "http://127.0.0.1:${PORT}/v1/models" >/dev/null; then
+    if [ ! -s "$_forward_port_file" ] || ! _curl_api -sf --max-time 10 "http://127.0.0.1:${PORT}/v1/models" >/dev/null; then
         log "FATAL: local loopback forwarder to $IX_SERVER_URL did not come up"
         exit 1
     fi
 fi
 
 log "server=$(ix_server_url) (local_port=$PORT) suites=${SUITE_LIST[*]} eval_conc=$EVAL_CONC gsm8k_limit=${GSM8K_LIMIT:-all} ix_ref=$IX_REF"
-# The served name and the context window, from the server, as agentx_client.sh
-# reads them: every request carries the name, and the context is run_lm_eval's
+# The served name and the context window, from the server (or explicit CLI
+# overrides): every request carries the name, and the context is run_lm_eval's
 # EVAL_MAX_MODEL_LEN, which sizes GSM8K's output budget.
-_models_json=$(curl -sf --max-time 30 "$(ix_server_url)/v1/models") \
-    || { log "FATAL: cannot read /v1/models from $(ix_server_url)"; exit 1; }
-read -r MODEL CTX <<< "$(printf '%s' "$_models_json" | python3 -c '
+if [ -n "$MODEL_ARG" ] && { [ -n "$MAX_MODEL_LEN_ARG" ] || [ "$NEEDS_GSM8K" = 0 ]; }; then
+    MODEL="$MODEL_ARG"
+    CTX="${MAX_MODEL_LEN_ARG:-0}"
+else
+    _models_json=$(_curl_api -sf --max-time 30 "$(ix_server_url)/v1/models") \
+        || { log "FATAL: cannot read /v1/models from $(ix_server_url)"; exit 1; }
+    _model_info=$(printf '%s' "$_models_json" | python3 -c '
 import json, sys
-card = json.load(sys.stdin)["data"][0]
-print(card["id"], card.get("max_model_len") or 0)
-')" || { log "FATAL: cannot parse /v1/models from $(ix_server_url)"; exit 1; }
-if [ "${CTX:-0}" -le 0 ] 2>/dev/null; then
-    log "FATAL: the server did not report max_model_len"
+wanted = sys.argv[1]
+payload = json.load(sys.stdin)
+data = payload.get("data") if isinstance(payload, dict) else None
+if not isinstance(data, list) or not data:
+    sys.exit("empty /v1/models data list")
+if wanted:
+    card = next((c for c in data if isinstance(c, dict) and c.get("id") == wanted), None)
+    model_id = wanted
+    ctx = (card.get("max_model_len") or 0) if card else 0
+else:
+    card = data[0]
+    if not isinstance(card, dict) or not isinstance(card.get("id"), str) or not card["id"].strip():
+        sys.exit("missing model id in /v1/models")
+    model_id = card["id"]
+    ctx = card.get("max_model_len") or 0
+print(f"{model_id}\t{ctx}")
+' "$MODEL_ARG") || { log "FATAL: cannot parse /v1/models from $(ix_server_url)"; exit 1; }
+    IFS=$'\t' read -r MODEL CTX <<< "$_model_info"
+    if [ -n "$MAX_MODEL_LEN_ARG" ]; then
+        CTX="$MAX_MODEL_LEN_ARG"
+    fi
+fi
+if [ "$NEEDS_GSM8K" = 1 ] && [ "${CTX:-0}" -le 0 ] 2>/dev/null; then
+    log "FATAL: gsm8k requires max_model_len (server did not report it; pass --max-model-len)"
     exit 1
 fi
-log "served model: $MODEL, context $CTX"
+log "served model: $MODEL, context ${CTX:-0}"
 
 if [ -z "$MODEL_PREFIX_ARG" ]; then
     MODEL_PREFIX_ARG=$(python3 -c '
@@ -233,60 +300,117 @@ else:
 fi
 PRECISION_ARG="${PRECISION_ARG:-fp8}"
 
-# ---- Scratch and the InferenceX checkout ------------------------------------
-SCRATCH="${AGENTX_SCRATCH_DIR:-/tmp/.agentx_scratch}"
-mkdir -p "$SCRATCH"
-export TMPDIR="$SCRATCH/tmp"; mkdir -p "$TMPDIR"
-# Sets IX_ROOT and IX_EVALS; the same checkout agentx_client.sh would reuse.
-ix_checkout "$SCRATCH/InferenceX" "$IX_REF" || exit $?
-if [ -d "$SCRATCH/InferenceX/.git" ]; then
-    log "InferenceX $(git -C "$SCRATCH/InferenceX" rev-parse --short HEAD) (tree $IX_ROOT)"
-else
-    log "InferenceX (tree $IX_ROOT)"
-fi
-for f in benchmarks/benchmark_lib.sh benchmarks/runtime_settings.sh \
-         infx/evals/thresholds.yaml infx/evals/validate_scores.py; do
-    [ -f "$IX_ROOT/$f" ] || { log "FATAL: no $f in the InferenceX checkout at $IX_ROOT"; exit 1; }
-done
+# ---- Scratch and the InferenceX checkout (skipped for mmlu_pro-only runs) ---
+if [ "$NEEDS_INFERENCEX" = 1 ]; then
+    SCRATCH="${AGENTX_SCRATCH_DIR:-/tmp/.agentx_scratch}"
+    mkdir -p "$SCRATCH"
+    export TMPDIR="$SCRATCH/tmp"; mkdir -p "$TMPDIR"
+    # Sets IX_ROOT and IX_EVALS; the same checkout agentx_client.sh would reuse.
+    ix_checkout "$SCRATCH/InferenceX" "$IX_REF" || exit $?
+    if [ -d "$SCRATCH/InferenceX/.git" ]; then
+        log "InferenceX $(git -C "$SCRATCH/InferenceX" rev-parse --short HEAD) (tree $IX_ROOT)"
+    else
+        log "InferenceX (tree $IX_ROOT)"
+    fi
+    for f in benchmarks/benchmark_lib.sh benchmarks/runtime_settings.sh \
+             infx/evals/thresholds.yaml infx/evals/validate_scores.py; do
+        [ -f "$IX_ROOT/$f" ] || { log "FATAL: no $f in the InferenceX checkout at $IX_ROOT"; exit 1; }
+    done
 
-# ---- InferenceX's eval library -----------------------------------------------
-# shellcheck disable=SC1091
-source "$IX_ROOT/benchmarks/runtime_settings.sh"
-export INFMAX_CONTAINER_WORKSPACE="$IX_ROOT"
-# shellcheck disable=SC1091
-source "$IX_ROOT/benchmarks/benchmark_lib.sh"
+    # ---- InferenceX's eval library -------------------------------------------
+    # shellcheck disable=SC1091
+    source "$IX_ROOT/benchmarks/runtime_settings.sh"
+    export INFMAX_CONTAINER_WORKSPACE="$IX_ROOT"
+    # shellcheck disable=SC1091
+    source "$IX_ROOT/benchmarks/benchmark_lib.sh"
 
-# Standalone callers need not pre-export topology; default to single-worker.
-if [ -z "${IS_MULTINODE:-}" ]; then
-    ix_export_topology 1 1 1 0
+    # Standalone callers need not pre-export topology; default to single-worker.
+    if [ -z "${IS_MULTINODE:-}" ]; then
+        ix_export_topology 1 1 1 0
+    fi
+    ix_require_topology || exit 2
+    export MODEL MODEL_NAME="$MODEL"
+    export EVAL_ONLY=true IS_AGENTIC=1 IS_MULTINODE
+    export EVAL_CONCURRENT_REQUESTS="$EVAL_CONC" CONC="$EVAL_CONC"
+    export EVAL_MAX_MODEL_LEN="$CTX"
+    export MODEL_PREFIX="$MODEL_PREFIX_ARG" PRECISION="$PRECISION_ARG" FRAMEWORK=vllm
+    export RUNNER_TYPE SPEC_DECODING="$SPEC_METHOD"
+    export IMAGE="${BUILDKITE_COMMIT:-local}"
+    # EVAL_LIMIT is run_lm_eval's smoke slice; the vendor suites ignore it.
+    [ -z "$GSM8K_LIMIT" ] || export EVAL_LIMIT="$GSM8K_LIMIT"
 fi
-ix_require_topology || exit 2
-export MODEL MODEL_NAME="$MODEL"
-export EVAL_ONLY=true IS_AGENTIC=1 IS_MULTINODE
-export EVAL_CONCURRENT_REQUESTS="$EVAL_CONC" CONC="$EVAL_CONC"
-export EVAL_MAX_MODEL_LEN="$CTX"
-export MODEL_PREFIX="$MODEL_PREFIX_ARG" PRECISION="$PRECISION_ARG" FRAMEWORK=vllm
-export RUNNER_TYPE SPEC_DECODING="$SPEC_METHOD"
-export IMAGE="${BUILDKITE_COMMIT:-local}"
-# EVAL_LIMIT is run_lm_eval's smoke slice; the vendor suites ignore it.
-[ -z "$GSM8K_LIMIT" ] || export EVAL_LIMIT="$GSM8K_LIMIT"
 
 normalize_suite_results() {
     local suite="$1" suite_dir="$2" out_json="$3"
     python3 -c '
-import json, pathlib, sys
-suite, suite_dir, out_path = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+import json, math, pathlib, sys
+suite, suite_dir, out_path, bench_dir = (
+    sys.argv[1],
+    pathlib.Path(sys.argv[2]),
+    pathlib.Path(sys.argv[3]),
+    sys.argv[4],
+)
+sys.path.insert(0, bench_dir)
+from check_regression import ACC_KEYS, stderr_key
+
+def is_valid_score(val):
+    return (
+        isinstance(val, (int, float))
+        and not isinstance(val, bool)
+        and math.isfinite(val)
+        and 0.0 <= float(val) <= 1.0
+    )
+
+def ensure_check_regression_metric(metrics):
+    if not isinstance(metrics, dict):
+        return False
+    if any(is_valid_score(metrics.get(k)) for k in ACC_KEYS):
+        return True
+    fallback_keys = [
+        "exact_match,strict-match",
+        "schema_accuracy",
+        "tool_call_f1",
+        "accuracy",
+        "acc",
+        "pass_rate",
+        "score",
+    ]
+    for key in metrics:
+        base, _, _ = key.partition(",")
+        if key not in fallback_keys and not base.endswith("_stderr") and base in ("exact_match", "acc"):
+            fallback_keys.append(key)
+    for key in fallback_keys:
+        val = metrics.get(key)
+        if is_valid_score(val):
+            metrics["acc,none"] = float(val)
+            err_val = metrics.get(stderr_key(key))
+            if is_valid_score(err_val):
+                metrics["acc_stderr,none"] = float(err_val)
+            return True
+    return False
+
 lm_jsons = sorted(
     suite_dir.rglob("results*.json"),
     key=lambda p: p.stat().st_mtime,
 )
-if suite in ("mmlu_pro", "gsm8k") and lm_jsons:
-    payload = json.loads(lm_jsons[-1].read_text())
+if suite in ("mmlu_pro", "gsm8k"):
+    if not lm_jsons:
+        sys.exit(f"No lm_eval results*.json found for {suite} under {suite_dir}")
+    try:
+        payload = json.loads(lm_jsons[-1].read_text())
+    except (OSError, json.JSONDecodeError) as err:
+        sys.exit(f"Failed to read {lm_jsons[-1]} for {suite}: {err}")
+    results = payload.get("results") if isinstance(payload, dict) else None
+    metrics = results.get(suite) if isinstance(results, dict) else None
+    if not ensure_check_regression_metric(metrics):
+        sys.exit(
+            f"{lm_jsons[-1]} does not contain a valid accuracy metric for {suite}"
+        )
     out_path.write_text(json.dumps(payload, indent=2) + "\n")
     sys.exit(0)
 
-# Kimi tool-call schema suites emit a vendor JSON summary; translate it into
-# check_regression.py results_<suite>.json schema.
+# Kimi tool-call schema suites emit either lm-eval-style results JSON (e.g.
+# kimi_vendor_eval.py with exact_match,strict-match) or a flat vendor summary.
 candidates = sorted(
     (
         p for p in suite_dir.rglob("*.json")
@@ -300,17 +424,19 @@ raw_meta = {}
 for path in candidates:
     try:
         doc = json.loads(path.read_text())
-    except Exception:
+    except (OSError, json.JSONDecodeError):
         continue
     if not isinstance(doc, dict):
         continue
     if "results" in doc and isinstance(doc["results"], dict) and suite in doc["results"]:
-        out_path.write_text(json.dumps(doc, indent=2) + "\n")
-        sys.exit(0)
+        if ensure_check_regression_metric(doc["results"][suite]):
+            out_path.write_text(json.dumps(doc, indent=2) + "\n")
+            sys.exit(0)
+        continue
     for key in ("schema_accuracy", "tool_call_f1", "accuracy", "acc", "pass_rate", "score"):
         val = doc.get(key)
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
-            score = float(val) / 100.0 if float(val) > 1.0 else float(val)
+        if is_valid_score(val):
+            score = float(val)
             raw_meta = doc
             break
     if score is None:
@@ -318,8 +444,13 @@ for path in candidates:
         total = doc.get("total_ToolCalls", doc.get("total"))
         if (
             isinstance(ok, (int, float))
+            and not isinstance(ok, bool)
+            and math.isfinite(ok)
             and isinstance(total, (int, float))
+            and not isinstance(total, bool)
+            and math.isfinite(total)
             and total > 0
+            and 0 <= ok <= total
         ):
             score = float(ok) / float(total)
             raw_meta = doc
@@ -342,7 +473,7 @@ normalized = {
     },
 }
 out_path.write_text(json.dumps(normalized, indent=2) + "\n")
-' "$suite" "$suite_dir" "$out_json"
+' "$suite" "$suite_dir" "$out_json" "$BENCHMARKING_DIR"
 }
 
 # ---- Run each suite, then judge it --------------------------------------------
@@ -357,7 +488,7 @@ for idx in "${!SUITE_LIST[@]}"; do
 
     if [ "$suite" = "mmlu_pro" ]; then
         T0=$(date +%s)
-        TORCH_DEVICE_BACKEND_AUTOLOAD=0 OPENAI_API_KEY=EMPTY lm_eval \
+        TORCH_DEVICE_BACKEND_AUTOLOAD=0 OPENAI_API_KEY="${OPENAI_API_KEY:-EMPTY}" lm_eval \
             --tasks mmlu_pro \
             --limit "$MMLU_LIMIT" \
             --seed "0,1234,None,1234" \
