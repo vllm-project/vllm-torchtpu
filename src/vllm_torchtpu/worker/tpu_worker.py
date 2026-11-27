@@ -54,6 +54,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import _leaf_connectors
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -813,13 +814,22 @@ class TPUWorker(WorkerBase):
             return self._stage3_late_poller_list
         pollers: list[Callable[[], set[str]]] = []
         if has_kv_transfer_group():
-            connector = get_kv_transfer_group()
-            children = getattr(connector, "_connectors", None) or [connector]
-            for child in children:
-                worker = getattr(child, "connector_worker", None)
-                fn = getattr(worker, "late_poll_finished_recving", None)
-                if callable(fn) and getattr(worker, "late_poll_enabled", False):
-                    pollers.append(fn)
+            # Deferred: tpu_connector is heavy, and only an engine with a KV
+            # connector gets here.
+            from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+                TPUConnector,
+                TPURaidenConnectorWorker,
+            )
+
+            for leaf in _leaf_connectors(get_kv_transfer_group()):
+                if not isinstance(leaf, TPUConnector):
+                    continue
+                worker = leaf.connector_worker
+                if (
+                    isinstance(worker, TPURaidenConnectorWorker)
+                    and worker.late_poll_enabled
+                ):
+                    pollers.append(worker.late_poll_finished_recving)
         self._stage3_late_poller_list = pollers
         return pollers
 

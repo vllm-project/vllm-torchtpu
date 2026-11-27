@@ -941,24 +941,61 @@ class TestStage3LatePollers:
         worker._stage3_late_poller_list = None
         return worker
 
+    @staticmethod
+    def _raiden(late_poll):
+        """A Raiden connector whose worker has the late_poll option."""
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import (
+            TPURaidenConnector,
+            TPURaidenConnectorWorker,
+        )
+
+        connector = object.__new__(TPURaidenConnector)
+        connector.connector_worker = object.__new__(TPURaidenConnectorWorker)
+        connector.connector_worker.late_poll_enabled = late_poll
+        return connector
+
+    @staticmethod
+    def _multi(*children):
+        from vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector import (
+            TPUMultiConnector,
+        )
+
+        connector = object.__new__(TPUMultiConnector)
+        connector._connectors = list(children)
+        return connector
+
     def test_pollers_follow_the_connector_option(self, monkeypatch):
         import vllm_torchtpu.worker.tpu_worker as tpu_worker_mod
+        from vllm_torchtpu.distributed.kv_transfer.tpu_connector import TPUConnector
 
-        on = SimpleNamespace(
-            connector_worker=SimpleNamespace(
-                late_poll_finished_recving=lambda: set(), late_poll_enabled=True
-            )
+        on, off = self._raiden(True), self._raiden(False)
+        # Connectors whose worker has the same attributes are not polled: one
+        # that is no TPUConnector, and a TPUConnector whose worker is no
+        # TPURaidenConnectorWorker.
+        look_alike = SimpleNamespace(
+            late_poll_finished_recving=lambda: set(), late_poll_enabled=True
         )
-        off = SimpleNamespace(
-            connector_worker=SimpleNamespace(
-                late_poll_finished_recving=lambda: set(), late_poll_enabled=False
-            )
-        )
-        connector = SimpleNamespace(_connectors=[off, on])
+        other = SimpleNamespace(connector_worker=look_alike)
+        other_tpu = object.__new__(TPUConnector)
+        other_tpu.connector_worker = look_alike
         monkeypatch.setattr(tpu_worker_mod, "has_kv_transfer_group", lambda: True)
-        monkeypatch.setattr(tpu_worker_mod, "get_kv_transfer_group", lambda: connector)
+        monkeypatch.setattr(
+            tpu_worker_mod,
+            "get_kv_transfer_group",
+            lambda: self._multi(off, other, other_tpu, on),
+        )
         worker = self._worker()
         assert worker._stage3_late_pollers() == [
+            on.connector_worker.late_poll_finished_recving
+        ]
+
+    def test_a_raiden_connector_alone_is_polled(self, monkeypatch):
+        import vllm_torchtpu.worker.tpu_worker as tpu_worker_mod
+
+        on = self._raiden(True)
+        monkeypatch.setattr(tpu_worker_mod, "has_kv_transfer_group", lambda: True)
+        monkeypatch.setattr(tpu_worker_mod, "get_kv_transfer_group", lambda: on)
+        assert self._worker()._stage3_late_pollers() == [
             on.connector_worker.late_poll_finished_recving
         ]
 
@@ -967,16 +1004,10 @@ class TestStage3LatePollers:
 
         import vllm_torchtpu.worker.tpu_worker as tpu_worker_mod
 
-        off = SimpleNamespace(
-            connector_worker=SimpleNamespace(
-                late_poll_finished_recving=lambda: {"r1"}, late_poll_enabled=False
-            )
-        )
+        off = self._raiden(False)
         monkeypatch.setattr(tpu_worker_mod, "has_kv_transfer_group", lambda: True)
         monkeypatch.setattr(
-            tpu_worker_mod,
-            "get_kv_transfer_group",
-            lambda: SimpleNamespace(_connectors=[off]),
+            tpu_worker_mod, "get_kv_transfer_group", lambda: self._multi(off)
         )
 
         class _Out(AsyncModelRunnerOutput):
