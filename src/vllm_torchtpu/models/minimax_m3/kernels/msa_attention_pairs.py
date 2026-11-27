@@ -41,7 +41,6 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.models.minimax_m3.kernels import (
     msa_attention,
     msa_attention_lse,
-    msa_fp4,
 )
 
 # Tokens one grid step accumulates: a page's selecting tokens are gathered
@@ -71,10 +70,12 @@ _VMEM_MARGIN = 2 * 1024 * 1024
 _PLACE_UNROLL = 4
 # Slots of a block whose accumulator rows are loaded before any is stored.
 _RMW_GROUP = 8
-# Blocks whose page (and scale page) copies are in flight, the running ones
-# included: a unit runs while the next one's copies land. A unit's copies
-# signal one semaphore per kind and are waited for together: waiting for
-# each copy cost 2.3 % of a 4,096-row call (op bench, uniform selections).
+# Blocks whose page copies are in flight, the running ones included: a unit
+# runs while the next one's copies land. A unit's copies signal one semaphore
+# and are waited for together: waiting for each copy cost 2.3 % of a
+# 4,096-row call (op bench, uniform selections). The pages' scale rows are
+# copied once a call (`scale_tab`): a scale-page copy per block cost 0.8 %
+# more.
 _RING = 2 * _UNIT
 _NO_PAIR = jnp.iinfo(jnp.int32).max
 # A sort key: (page key << `_token_bits` | token) << 8 | visible slots: page
@@ -109,13 +110,14 @@ def _kernel(
     #   head h's l in row h % 8, lane h; the spare tokens of a block's empty
     #   slots last
     kv_buf,  # [ring, 1, S / 8, 4, 2D] uint8
-    scale_buf,  # [ring, 1, R, S] f32
-    sem_ref,  # DMA [2, 2]: page and scale copies of each ring half
+    scale_tab,  # [2, pages, S] f32: every page's K, then V scale row, from the
+    #   first window on
+    sem_ref,  # DMA [2]: the page copies of each ring half
     order_ref,  # SMEM [P]: the window's blocks' first pairs, by width
     place_ref,  # SMEM [widths]: each width's next place in order_ref
     q_ref,  # [W, H, D]: the window's queries
     o_buf,  # [2, H, C, D]: output chunks on their way to HBM
-    io_sem,  # DMA [3]: the queries' copy, the output chunks' copies
+    io_sem,  # DMA [4]: the queries' copy, the output chunks' copies, the scales'
     *,
     num_heads: int,
     head: int,
@@ -154,19 +156,33 @@ def _kernel(
     place_ref[0] = 0
     for w in range(1, len(_WIDTHS)):
         place_ref[w] = place_ref[w - 1] + counts[w - 1]
+    # Every page's scale rows, copied once behind the block ordering; later
+    # windows reuse them (the grid runs in order on one core, "arbitrary").
+    scale_copies = [
+        pltpu.make_async_copy(
+            scale_hbm_ref.at[:, row],
+            scale_tab.at[r],
+            io_sem.at[3],
+        )
+        for r, row in enumerate((k_row, v_row))
+    ]
+
+    @pl.when(pl.program_id(0) == 0)
+    def _scales():
+        for copy in scale_copies:
+            copy.start()
+
     jax.lax.while_loop(lambda i: i < num_pairs, place, jnp.int32(0))
+
+    @pl.when(pl.program_id(0) == 0)
+    def _scales_landed():
+        for copy in scale_copies:
+            copy.wait()
 
     def copies(slot, word):
         page = page_table_ref[word & _KEY_MASK]
         src = kv_hbm_ref.at[pl.ds(page, 1), :, :, pl.ds(head * row_width, row_width)]
-        return (
-            pltpu.make_async_copy(src, kv_buf.at[slot], sem_ref.at[0, slot // _UNIT]),
-            pltpu.make_async_copy(
-                scale_hbm_ref.at[pl.ds(page, 1)],
-                scale_buf.at[slot],
-                sem_ref.at[1, slot // _UNIT],
-            ),
-        )
+        return (pltpu.make_async_copy(src, kv_buf.at[slot], sem_ref.at[slot // _UNIT]),)
 
     def issue(k, slot):
         """Block k's copies into ring slot ``slot``; past the last block, the
@@ -176,16 +192,13 @@ def _kernel(
             copy.start()
 
     def wait(half):
-        """The copies of a ring half's `_UNIT` slots, one wait per kind."""
+        """The copies of a ring half's `_UNIT` slots, in one wait."""
         at = pl.ds(half * _UNIT, _UNIT)
-        pltpu.make_async_copy(kv_buf.at[at], kv_buf.at[at], sem_ref.at[0, half]).wait()
-        pltpu.make_async_copy(
-            scale_buf.at[at], scale_buf.at[at], sem_ref.at[1, half]
-        ).wait()
+        pltpu.make_async_copy(kv_buf.at[at], kv_buf.at[at], sem_ref.at[half]).wait()
 
     sums_ref[...] = jnp.zeros_like(sums_ref)
 
-    def attend(width, i, n, slot):
+    def attend(width, i, n, slot, page_id):
         """Pairs ``i .. i + n - 1`` of one page (``n <= width``): their
         accumulator tokens and ``[acc | l]`` terms. The rest of the width (the
         next page's pairs, or padding) sees no slot, and its zero terms go to
@@ -214,8 +227,10 @@ def _kernel(
         col = jax.lax.broadcasted_iota(jnp.int32, shape, 1)
         onehot = jnp.where(col == row // num_heads, 1.0, 0.0).astype(jnp.bfloat16)
         q = jnp.concatenate([jnp.concatenate(rows, axis=0), onehot], axis=1)
-        page, sk, sv = msa_attention._fp4_page(
-            kv_buf.at[slot], scale_buf.at[slot], k_row, v_row
+        page = msa_attention._fp4_rows(kv_buf.at[slot])
+        sk, sv = (
+            msa_attention._finite_scales(scale_tab[r, pl.ds(page_id, 1)])
+            for r in (0, 1)
         )
         k_col = (sk * (sm_scale * msa_attention_lse._LOG2_E)).reshape(page_size, 1)
         keys = (page[:, :head_dim] * k_col).astype(jnp.bfloat16)
@@ -244,7 +259,8 @@ def _kernel(
             real = k + b < num_blocks
             at = jnp.where(real, order_ref[k + b], 0)
             n = jnp.where(real, blocks_ref[at] >> _KEY_BITS, 0)
-            blocks.append((at, n, base + b))
+            page = page_table_ref[blocks_ref[at] & _KEY_MASK]
+            blocks.append((at, n, base + b, page))
         terms = [attend(width, *b) for b in blocks]
         # Head h's l is lane h of its row's l columns: a token's heads fold
         # into one 8-row tile, head h in row h % 8.
@@ -580,14 +596,19 @@ def _work(keys, local_key, local_limit, window, page_size, interpret=False):
     )
 
 
-def _max_window(num_heads, head_dim, page_size, num_keys, window=WINDOW) -> int:
+def _max_window(
+    num_heads, head_dim, page_size, num_keys, window=WINDOW, num_pages=None
+) -> int:
     """`window`, or fewer tokens (a multiple of 8): halved while the sort
     key's fields would not hold its pairs, and cut where its sums and queries
-    would not fit the VMEM limit beside the copy ring, the output chunks and
-    `_VMEM_MARGIN`."""
+    would not fit the VMEM limit beside the copy ring, the scale rows of the
+    cache's ``num_pages`` pages (default: one per page key), the output
+    chunks and `_VMEM_MARGIN`."""
     token_bytes = (num_heads + 8) * head_dim * 4 + num_heads * head_dim * 2
-    # A ring slot: a 4-bit page of [K | V] rows and its scale page.
-    ring_bytes = _RING * page_size * (head_dim + msa_fp4.SCALE_ROWS * 4)
+    # The ring's 4-bit pages of [K | V] rows, and every page's two f32 scale
+    # rows.
+    num_pages = num_keys if num_pages is None else num_pages
+    ring_bytes = _RING * page_size * head_dim + num_pages * 2 * page_size * 4
     out_bytes = 2 * num_heads * 256 * head_dim * 2  # chunks of at most 256 tokens
     budget = (
         msa_attention._VMEM_LIMIT_BYTES
@@ -605,12 +626,14 @@ def _max_window(num_heads, head_dim, page_size, num_keys, window=WINDOW) -> int:
     return min(window, max(budget, 0) // token_bytes) // 8 * 8
 
 
-def supports(num_heads, head_dim, page_size, num_keys, window=WINDOW) -> bool:
+def supports(
+    num_heads, head_dim, page_size, num_keys, window=WINDOW, num_pages=None
+) -> bool:
     """Whether `msa_sparse_attention_pairs` takes calls of this shape: whole
     sublane tiles of query rows per token, a page's slots and a block's
     tokens within the D mask columns, a token's heads' l in one row, the pair
     and block words' fields, and a window of tokens in VMEM."""
-    window = _max_window(num_heads, head_dim, page_size, num_keys, window)
+    window = _max_window(num_heads, head_dim, page_size, num_keys, window, num_pages)
     return (
         window >= 8
         and window < 1 << _TOKEN_BITS
@@ -662,11 +685,12 @@ def msa_sparse_attention_pairs(
     num_tokens, num_heads, head_dim = q.shape
     page_size = msa_attention.page_tokens(kv_cache)
     num_keys = page_table.shape[0]
+    num_pages = scale_cache.shape[0]
     window = min(
-        _max_window(num_heads, head_dim, page_size, num_keys, window),
+        _max_window(num_heads, head_dim, page_size, num_keys, window, num_pages),
         -(-num_tokens // 8) * 8,
     )
-    if not supports(num_heads, head_dim, page_size, num_keys, window):
+    if not supports(num_heads, head_dim, page_size, num_keys, window, num_pages):
         raise ValueError(
             f"{num_heads} heads, D {head_dim}, {page_size}-slot pages, "
             f"{num_keys} page keys, window {window}"
@@ -719,13 +743,13 @@ def msa_sparse_attention_pairs(
                 pltpu.VMEM(
                     (_RING, 1, rows_per_page, packing, 2 * head_dim), kv_cache.dtype
                 ),
-                pltpu.VMEM((_RING, 1) + scale_cache.shape[1:], jnp.float32),
-                pltpu.SemaphoreType.DMA((2, 2)),
+                pltpu.VMEM((2, num_pages, scale_cache.shape[-1]), jnp.float32),
+                pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SMEM((blocks.shape[0] // windows,), jnp.int32),
                 pltpu.SMEM((len(_WIDTHS),), jnp.int32),
                 pltpu.VMEM((window, num_heads, head_dim), q.dtype),
                 pltpu.VMEM((2, num_heads, tokens, head_dim), q.dtype),
-                pltpu.SemaphoreType.DMA((3,)),
+                pltpu.SemaphoreType.DMA((4,)),
             ],
         ),
         out_shape=jax.ShapeDtypeStruct(

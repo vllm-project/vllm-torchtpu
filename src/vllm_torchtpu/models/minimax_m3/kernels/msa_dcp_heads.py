@@ -1146,7 +1146,11 @@ def _attend_head(
     operands = (q, keys, local, limit)
     num_tokens, num_heads, head_dim = q.shape
     fits = msa_attention_pairs.supports(
-        num_heads, head_dim, msa_attention.page_tokens(kv), page_table.shape[0]
+        num_heads,
+        head_dim,
+        msa_attention.page_tokens(kv),
+        page_table.shape[0],
+        num_pages=scale_cache.shape[0],
     )
     if PAGE_MAJOR == "off" or not (fits and msa_attention_lse.MAX_FREE):
         return tiles(operands)
