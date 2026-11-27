@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Callable
+from dataclasses import asdict as dc_asdict
 from dataclasses import replace as dc_replace
 from pathlib import Path
 
@@ -2430,3 +2431,453 @@ def test_dcn_cli_override_updates_host_gbit_and_provenance() -> None:
         entry["flag"] for entry in custom_payload["provenance"]["supplied_values"]
     }
     assert "--dcn-gbit-per-s" not in custom_flags
+
+
+def test_multi_instance_mixed_and_crossover_sweep() -> None:
+    """Verify multi-instance mixed enumeration, Nx reference parsing, and sweep."""
+    config = load_locked_config("qwen3_5_397b_fp8.json")
+    geometry = rf.from_hf_config(config)
+    dtypes = rf.dtypes_from_hf_config(config)
+    chip = rf.CHIPS["tpu7x"]
+    topo = rf.TOPOLOGIES["2x2x1"]
+    expected_instances = 2
+    scenario = rf.TrafficScenario(
+        name="multi-inst-mixed",
+        isl=4096,
+        osl=512,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = rf.solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=8, topologies=(topo,)),
+    )
+    two_inst = [
+        pt
+        for pt in serving_plan.candidates
+        if pt.decode_pool.instances == expected_instances
+    ]
+    assert two_inst
+    expected_chips = 8
+    assert all(pt.total_chips == expected_chips for pt in two_inst)
+    assert serving_plan.sweep_candidates
+    assert serving_plan.winner_prefix_hit_range is not None
+    lo, hi = serving_plan.winner_prefix_hit_range
+    assert 0.0 <= lo <= hi <= 1.0
+
+    parsed = rf.parse_layout("2x TP8 x EP8")
+    assert parsed["decode"]["instances"] == expected_instances
+    ref_rep = rf.reference_layout_report(
+        serving_plan,
+        serving_plan.candidates,
+        "2x TP8 x EP8",
+        "",
+    )
+    assert ref_rep["found"] is True
+    assert ref_rep["concurrency"] == 32
+    ordered_top = rf.ordered_candidates_by_concurrency(serving_plan, top_k=5).get(
+        32, ()
+    )
+    expected_in_top = any(
+        pt.decode_pool.instances == expected_instances
+        and pt.decode_pool.tp == 8
+        and pt.decode_pool.ep == 8
+        for pt in ordered_top
+    )
+    assert ref_rep["family_in_ordered_top_k"] is expected_in_top
+    if expected_in_top:
+        assert isinstance(ref_rep["ordered_family_peer"], str)
+    else:
+        assert ref_rep["ordered_family_peer"] is None
+    assert "bound_tpot_ms" in ref_rep
+
+    assert serving_plan.recommended is not None
+    rec_pool = serving_plan.recommended.decode_pool
+    rec_prefix = f"{rec_pool.instances}x " if rec_pool.instances > 1 else ""
+    rec_spec = f"{rec_prefix}{rf.format_parallelism(dc_asdict(rec_pool))}"
+    rec_ref = rf.reference_layout_report(
+        serving_plan, serving_plan.candidates, rec_spec, ""
+    )
+    assert rec_ref["found"] is True
+    assert rec_ref["family_in_ordered_top_k"] is True
+    assert isinstance(rec_ref["ordered_family_peer"], str)
+
+    rejected = rf.explain_layout_rejection(
+        geometry,
+        rf.parse_layout("4x TP8 x EP8"),
+        (topo,),
+        SolveOptions(mode="mixed", max_chips=8, topologies=(topo,)),
+    )
+    assert "exceeds max_chips=8" in rejected
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+def test_crossover_exact_bit_identity_tie_break_open_loop_and_ruled_out(
+    fixture_name: str,
+) -> None:
+    """Verify bounded crossover matches exact sweep across SLO, think, and spec."""
+    from vllm_torchtpu.roofline import crossover as rf_crossover
+
+    bundle = load_locked_bundle(fixture_name)
+    geometry = bundle.geometry
+    dtypes = bundle.dtypes
+    chip = rf.CHIPS["tpu7x"]
+    topo_1 = rf.TOPOLOGIES["2x2x1"]
+    topo_2 = rf.TOPOLOGIES["2x2x2"]
+    hit_grid = (0.0, 0.25, 0.5, 0.75, 0.95)
+
+    regimes: tuple[
+        tuple[
+            str, float | None, float | None, float | None, float, int | None, rf.SortBy
+        ],
+        ...,
+    ] = (
+        ("no-slo-closed", None, None, 0.0, 1.0, None, "throughput"),
+        ("tight-slo-think", 250.0, 30.0, 2.0, 1.0, None, "throughput"),
+        ("open-loop-spec", None, 40.0, None, 3.0, 3, "throughput"),
+        ("interactivity-sort", 500.0, None, 0.0, 1.0, None, "interactivity"),
+    )
+    for (
+        label,
+        ttft_slo,
+        tpot_slo,
+        think_s,
+        accept_len,
+        spec_tokens,
+        sort_by,
+    ) in regimes:
+        scenario = rf.TrafficScenario(
+            name=f"xover-{label}",
+            isl=4096,
+            osl=256,
+            prefix_hit_rate=0.5,
+            accept_len=accept_len,
+            spec_tokens=spec_tokens,
+            think_time_s=think_s,
+            concurrencies=(16,),
+            kv_working_set_turns=1.0,
+            ttft_slo_ms=ttft_slo,
+            tpot_slo_ms=tpot_slo,
+        )
+        serving_plan = rf.solve_serving_plan(
+            geometry,
+            dtypes,
+            chip,
+            scenario,
+            SolveOptions(
+                mode="auto",
+                max_chips=8,
+                topologies=(topo_1, topo_2),
+                include_pairs=True,
+                sort_by=sort_by,
+            ),
+        )
+        assert serving_plan.recommended is not None
+        cands = (
+            serving_plan.sweep_candidates
+            if serving_plan.sweep_candidates
+            else serving_plan.candidates
+        )
+        pools, eval_ctx = rf_crossover.setup_crossover_sweep(
+            geometry,
+            dtypes,
+            chip,
+            scenario,
+            cands,
+            activation_model=serving_plan.activation_model,
+            collective_latency_s=serving_plan.collective_latency_s,
+            topologies=(topo_1, topo_2),
+            sort_by=sort_by,
+        )
+        seed_keys = {rf_crossover._point_struct_key(serving_plan.recommended)}
+        for frontier_pt in serving_plan.frontier[:6]:
+            seed_keys.add(rf_crossover._point_struct_key(frontier_pt))
+        for hit_rate in hit_grid:
+            bounded = rf_crossover._eval_grid_h_bounded(
+                hit_rate, scenario, pools, eval_ctx, set(seed_keys)
+            )
+            unseeded = rf_crossover._eval_grid_h_bounded(
+                hit_rate, scenario, pools, eval_ctx, set()
+            )
+            assert (bounded is None) == (unseeded is None)
+            if bounded is not None and unseeded is not None:
+                assert bounded[0] == hit_rate
+                assert bounded[1][:4] == unseeded[1][:4]
+                assert rf_crossover._point_struct_key(
+                    bounded[1][4]
+                ) == rf_crossover._point_struct_key(unseeded[1][4])
+        win_range, xover = rf_crossover.sweep_prefix_hit_crossovers(
+            geometry,
+            dtypes,
+            chip,
+            serving_plan,
+            topologies=(topo_1, topo_2),
+        )
+        assert win_range is None or (0.0 <= win_range[0] <= win_range[1] <= 1.0)
+        assert xover is None or (0.0 <= xover <= 1.0)
+
+    # Verify residual mode is preserved in _pool_parallel and dp>1 prefill item.
+    sp_pool = rf.PoolMeshPlan(
+        role="prefill",
+        instances=1,
+        topology="2x2x1",
+        chips_per_instance=4,
+        tp=8,
+        dp=1,
+        ep=8,
+        pp=1,
+        pcp=1,
+        kv_split=1,
+        mesh_axes=(2, 2, 2, 1),
+        hbm_used_gb=50.0,
+        hbm_limit_gb=103.0,
+        residual="sp",
+    )
+    assert rf_crossover._pool_parallel(sp_pool, topo_1).residual == "sp"
+
+    # Verify ruled-out reference_layout_report preserves non-empty rejection_reason.
+    impossible_scen = rf.TrafficScenario(
+        name="ruled-out-ref",
+        isl=4096,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+        tpot_slo_ms=0.001,
+    )
+    ruled_plan = rf.solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        impossible_scen,
+        SolveOptions(mode="mixed", max_chips=4, topologies=(topo_1,)),
+    )
+    assert ruled_plan.ruled_out_candidates
+    sample_ruled = ruled_plan.ruled_out_candidates[0]
+    ruled_spec = rf.format_parallelism(dc_asdict(sample_ruled.decode_pool))
+    ruled_rep = rf.reference_layout_report(
+        ruled_plan, ruled_plan.candidates, ruled_spec, ""
+    )
+    assert ruled_rep["found"] is True
+    assert ruled_rep["ruled_out"] is True
+    assert ruled_rep["rejection_reason"] != ""
+    assert ruled_rep["rejected_by"] == ruled_rep["rejection_reason"]
+
+
+def test_crossover_unknown_topology_and_mixed_concurrency_rejection() -> None:
+    """Verify unknown topology raises ValueError and concurrency cap is explained."""
+    from vllm_torchtpu.roofline import crossover as rf_crossover
+
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    geometry = bundle.geometry
+    dtypes = bundle.dtypes
+    chip = rf.CHIPS["tpu7x"]
+    topo = rf.TOPOLOGIES["2x2x1"]
+    scenario = rf.TrafficScenario(
+        name="unknown-topo-check",
+        isl=4096,
+        osl=512,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=1.0,
+    )
+    serving_plan = rf.solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4, topologies=(topo,)),
+    )
+    assert serving_plan.candidates
+    sample_point = serving_plan.candidates[0]
+    bad_pool = dc_replace(sample_point.decode_pool, topology="9x9x9")
+    bad_point = dc_replace(sample_point, decode_pool=bad_pool)
+    with pytest.raises(ValueError, match="Unknown topology '9x9x9'") as exc_info:
+        rf_crossover.setup_crossover_sweep(
+            geometry,
+            dtypes,
+            chip,
+            scenario,
+            (bad_point,),
+            activation_model=serving_plan.activation_model,
+            collective_latency_s=serving_plan.collective_latency_s,
+            topologies=(topo,),
+        )
+    assert "2x2x1" in str(exc_info.value)
+
+    rejected = rf.explain_layout_rejection(
+        geometry,
+        rf.parse_layout("2x TP8 x EP8"),
+        (topo,),
+        SolveOptions(mode="mixed", max_chips=8, topologies=(topo,)),
+        concurrencies=(1,),
+    )
+    assert "exceeds max concurrency 1" in rejected
+
+    # Disaggregated explicit Nx instance counts and complete-pin chip budgets.
+    disagg_pinned_opts = SolveOptions(
+        mode="auto",
+        prefill_topology="2x2x1",
+        decode_topology="2x2x1",
+        pd_ratio=(1, 1),
+        topologies=(topo,),
+    )
+    rej_mixed_pin = rf.explain_layout_rejection(
+        geometry,
+        rf.parse_layout("3x TP8 x EP8"),
+        (topo,),
+        disagg_pinned_opts,
+        concurrencies=(8,),
+    )
+    assert "exceeds max_chips=8" in rej_mixed_pin
+
+    rej_disagg_ratio = rf.explain_layout_rejection(
+        geometry,
+        rf.parse_layout("P: 2x TP8 x EP8 / D: 2x TP8 x EP8"),
+        (topo,),
+        disagg_pinned_opts,
+        concurrencies=(8,),
+    )
+    assert "conflicts with --pd 1:1" in rej_disagg_ratio
+
+    rej_disagg_budget = rf.explain_layout_rejection(
+        geometry,
+        rf.parse_layout("P: 2x TP8 x EP8 / D: 2x TP8 x EP8"),
+        (topo,),
+        SolveOptions(
+            mode="disagg", max_chips=12, include_pairs=True, topologies=(topo,)
+        ),
+        concurrencies=(8,),
+    )
+    assert "exceeding max_chips=12" in rej_disagg_budget
+
+
+def test_crossover_osl_one_and_pp_mixed_scaling_and_no_slo_pruning() -> None:
+    """Verify osl=1 p_mix=0, PP>1 pp_factor, and no-SLO branch-and-bound pruning."""
+    from vllm_torchtpu.roofline import crossover as rf_crossover
+
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    chip = rf.CHIPS["tpu7x"]
+    topo_4c = rf.TOPOLOGIES["2x2x1"]
+    scen_osl1 = rf.TrafficScenario(
+        name="osl1-crossover",
+        isl=4096,
+        osl=1,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(8,),
+        kv_working_set_turns=1.0,
+    )
+    plan_osl1 = rf.solve_serving_plan(
+        bundle.geometry,
+        bundle.dtypes,
+        chip,
+        scen_osl1,
+        SolveOptions(mode="mixed", max_chips=4, topologies=(topo_4c,)),
+    )
+    assert plan_osl1.candidates
+    pools_osl1, ctx_osl1 = rf_crossover.setup_crossover_sweep(
+        bundle.geometry,
+        bundle.dtypes,
+        chip,
+        scen_osl1,
+        plan_osl1.candidates[:2],
+        topologies=(topo_4c,),
+    )
+    meta_osl1 = pools_osl1.mix_meta[0]
+    cand_osl1, _ = rf_crossover._eval_one_mixed_meta(
+        meta_osl1, 0.5, scen_osl1, ctx_osl1, (1, 2048)
+    )
+    dec_s, _ = ctx_osl1.get_dec_sf(meta_osl1.decode_pool_id, meta_osl1.resident_batch)
+    assert cand_osl1[1] == pytest.approx(1.0 / dec_s, rel=1e-6)
+
+    # PP > 1 mixed sweep includes pp_factor on prefill service time.
+    topo_8c = rf.TOPOLOGIES["2x2x2"]
+    scen_pp = rf.TrafficScenario(
+        name="pp-mixed-crossover",
+        isl=8192,
+        osl=128,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(8,),
+        kv_working_set_turns=1.0,
+    )
+    plan_pp = rf.solve_serving_plan(
+        bundle.geometry,
+        bundle.dtypes,
+        chip,
+        scen_pp,
+        SolveOptions(mode="mixed", max_chips=8, topologies=(topo_8c,)),
+    )
+    pp2_cands = tuple(c for c in plan_pp.candidates if c.decode_pool.pp == 2)
+    assert pp2_cands
+    pools, eval_ctx = rf_crossover.setup_crossover_sweep(
+        bundle.geometry,
+        bundle.dtypes,
+        chip,
+        scen_pp,
+        pp2_cands[:2],
+        topologies=(topo_8c,),
+    )
+    assert pools.mix_meta
+    cand, _ = rf_crossover._eval_one_mixed_meta(
+        pools.mix_meta[0],
+        0.5,
+        scen_pp,
+        eval_ctx,
+        (1, 4096),
+    )
+    assert cand[0] > 0.0
+
+    # No-SLO branch-and-bound records seeds into state.max_slo so pruning activates.
+    dense_geom = dc_replace(
+        bundle.geometry,
+        num_experts=0,
+        top_k=0,
+        n_moe_layers=0,
+        n_dense_layers=bundle.geometry.num_layers,
+        ffn_kinds=("dense",) * bundle.geometry.num_layers,
+    )
+    scen_dense = rf.TrafficScenario(
+        name="no-slo-prune",
+        isl=4096,
+        osl=512,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=1.0,
+    )
+    plan_dense = rf.solve_serving_plan(
+        dense_geom,
+        bundle.dtypes,
+        chip,
+        scen_dense,
+        SolveOptions(mode="mixed", max_chips=4, topologies=(topo_4c,)),
+    )
+    p_dense, ctx_dense = rf_crossover.setup_crossover_sweep(
+        dense_geom,
+        bundle.dtypes,
+        chip,
+        scen_dense,
+        plan_dense.candidates,
+        topologies=(topo_4c,),
+    )
+    state = rf_crossover.CandidateState()
+    seed_keys = {rf_crossover._point_struct_key(p_dense.mix_meta[0].point)}
+    rf_crossover._eval_bounded_mixed_grid(
+        0.5, scen_dense, p_dense.mix_meta, ctx_dense, (state, seed_keys)
+    )
+    assert state.max_slo > 0.0

@@ -692,6 +692,8 @@ def build_solve_payload(
     payload["activation_regime"] = plan.activation_model.regime
     payload["spec_tokens"] = plan.spec_tokens
     payload["mtp_layers"] = plan.mtp_layers
+    payload["winner_prefix_hit_range"] = plan.winner_prefix_hit_range
+    payload["prefix_hit_crossover_rate"] = plan.prefix_hit_crossover_rate
     if dtypes is not None:
         payload["dtypes"] = asdict(dtypes)
     return payload
