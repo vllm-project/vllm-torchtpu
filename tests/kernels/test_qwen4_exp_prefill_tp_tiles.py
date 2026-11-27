@@ -29,12 +29,13 @@ def interpret(monkeypatch):
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
 
 
+@pytest.mark.parametrize("chip", [pltpu.ChipVersion.TPU_7X, pltpu.ChipVersion.TPU_8I])
 @pytest.mark.parametrize("query_heads", [3, 6, 12, 24])
 @pytest.mark.parametrize("page_size", [128, 512, 1664])
-def test_tp_shard_tiles_are_paired(monkeypatch, query_heads, page_size):
+def test_tp_shard_tiles_are_paired(monkeypatch, chip, query_heads, page_size):
     if query_heads == 24 and page_size == 512:
         pytest.skip("Q24/KV2 is tuned for the 128 and 1664 page layouts")
-    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    info = pltpu.get_tpu_info_for_chip(chip, 1)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
     kv_heads = 2 if query_heads == 24 else 1
     query = jax.ShapeDtypeStruct((8192, query_heads, 256), jnp.bfloat16)
