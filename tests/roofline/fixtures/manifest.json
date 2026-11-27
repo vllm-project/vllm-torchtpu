@@ -158,6 +158,46 @@
         "ffn_moe_layers": 75,
         "ffn_dense_layers": 3
       }
+    },
+    {
+      "canonical_id": "deepseek_v41",
+      "hf_repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+      "revision": "314113f8a7dadb388215396ba5fbee2c610a04d6",
+      "fixture": "deepseek_v4_1_flash.json",
+      "sha256_b64": "i+Rc4EdgBKP1Kf2JYRWkougAoSmtLT7AWxYFD1LiGHk=",
+      "geometry": {
+        "num_layers": 40,
+        "hidden": 5120,
+        "num_heads": 64,
+        "num_kv_heads": 1,
+        "head_dim": 512,
+        "kv_lora_rank": 0,
+        "q_lora_rank": 1280,
+        "attn_output_gate": false,
+        "qk_rope_head_dim": 64,
+        "num_experts": 384,
+        "top_k": 6,
+        "moe_inter": 2304,
+        "shared_inter": 2304,
+        "dense_inter": 0,
+        "first_k_dense_replace": 0,
+        "vocab": 129280,
+        "index_topk": 512,
+        "index_head_dim": 128,
+        "index_n_heads": 32,
+        "sliding_window": 128,
+        "hc_mult": 4,
+        "mtp_layers": 3,
+        "index_share_for_mtp_iteration": false,
+        "weight_block_size": [32, 32]
+      },
+      "structure": {
+        "layer_counts": {"gqa": 0, "gdn": 0, "mla": 40, "dsa": 0, "swa": 0, "kda": 0},
+        "indexer_full": 0,
+        "indexer_shared": 0,
+        "ffn_moe_layers": 40,
+        "ffn_dense_layers": 0
+      }
     }
   ]
 }
