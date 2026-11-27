@@ -32,15 +32,56 @@ def gate_act(gate: str) -> Any:
     return {"silu": jax.nn.silu, "sigmoid": jax.nn.sigmoid}[gate]
 
 
+def _qk_norms(x: Any, kh: int, KD: int, l2_eps: float) -> tuple[list, list]:
+    """Per-head L2-normed queries (scaled by `KD**-0.5`) and keys of every row of `x
+    [..., QKV]`: one lane reduction over all rows instead of one per row."""
+
+    def l2n(y):
+        return y * lax.rsqrt(jnp.sum(y * y, axis=-1, keepdims=True) + l2_eps)
+
+    qn = [l2n(x[..., j * KD : (j + 1) * KD]) * KD**-0.5 for j in range(kh)]
+    kn = [l2n(x[..., (kh + j) * KD : (kh + j + 1) * KD]) for j in range(kh)]
+    return qn, kn
+
+
+def _row_order(n: int, T: int, VER: bool) -> list[int]:
+    """Verify rows request-interleaved (every request's row t, then t + 1): consecutive
+    rows are independent state chains, so their updates overlap."""
+    if not VER or n % T:
+        return list(range(n))
+    return [r * T + t for t in range(T) for r in range(n // T)]
+
+
+def _gated_norm(out: Any, zz: Any, gnw: Any, eps: float, gate: str) -> Any:
+    """Gated RMS norm of one head's outputs `out [rows, VD]` (gate input `zz`)."""
+    val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + eps)
+    val = (gnw[None, :] * val.astype(BF16)).astype(F32)
+    return rnd(val * gate_act(gate)(zz))
+
+
+def _head_update(
+    st: Any, src: int, dst: int, eg: Any, kc: Any, qc: Any, v: Any, beta: Any
+) -> Any:
+    """Delta-rule update of one head's state `st[src]` into `st[dst]`, kept in vregs;
+    returns the head's output `[1, VD]`."""
+    s_h = st[src : src + 1].astype(F32) * eg
+    pred = jnp.sum(s_h * kc, axis=1)
+    s_h = s_h + kc * ((v - pred) * beta)[:, None, :]
+    st[dst : dst + 1] = s_h.astype(REC)
+    return jnp.sum(s_h * qc, axis=1)
+
+
 def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
-    """Gated delta rule on key-major `recb [B * vh, KD, VD]` (`GCH=False`)."""
+    """Gated delta rule on key-major `recb [B * vh, KD, VD]` (`GCH=False`).
+
+    Rows run in `_row_order`, each head's update in vregs (`_head_update`); the raw
+    outputs are staged in `mix` and gated-normed for all rows after the loop."""
     ex = ctx.ex
     scr = ctx.scr
     B, T, VER = ex.B, ex.T, ex.VER
     kh, vh, KD, VD = gp.kh, gp.vh, gp.KD, gp.VD
     QKV, Z, BA, A_OFF = gp.QKV, gp.Z, gp.BA, gp.A_OFF
-    l2_eps = gp.l2_eps
-    recb, sb = scr["recb"], scr["sbuf"]
+    recb, mix = scr["recb"], scr["mix"]
     alog = ctx.sm(slot, "alog")[0, :vh]
     dtb = ctx.sm(slot, "dtb")[0, :vh]
     gnw = ctx.sm(slot, "gnorm")[0, :].astype(BF16)
@@ -50,38 +91,47 @@ def gdn_rec(ctx: Any, gp: GDNParams, u: Any, ybuf: Any, slot: Any) -> None:
         xc = jnp.swapaxes(jnp.broadcast_to(x[:, None, :], (kh, VD, KD)), 1, 2)
         return jnp.broadcast_to(xc[:, None], (kh, expand, KD, VD)).reshape(vh, KD, VD)
 
-    for b in range(B):
+    qn, kn = _qk_norms(scr["ub"][:, 0:T, :] if VER else u[0:B], kh, KD, gp.l2_eps)
+    for b in _row_order(B, T, VER):
         src = b
         if VER:
             s_, t_ = divmod(b, T)
-            urow_ = scr["ub"][s_, t_ : t_ + 1, :]
-            q = urow_[0, : kh * KD].reshape(kh, KD)
-            k = urow_[0, kh * KD : 2 * kh * KD].reshape(kh, KD)
-            v = urow_[0, 2 * kh * KD :].reshape(vh, VD)
+            row = (s_, slice(t_, t_ + 1))
+            v = scr["ub"][s_, t_ : t_ + 1, 2 * kh * KD :].reshape(vh, VD)
             src = b if t_ == 0 else b - 1
         else:
-            q = u[b, : kh * KD].reshape(kh, KD)
-            k = u[b, kh * KD : 2 * kh * KD].reshape(kh, KD)
+            row = slice(b, b + 1)
             v = u[b, 2 * kh * KD :].reshape(vh, VD)
-        q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + l2_eps)
-        q = q * KD**-0.5
-        k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
+        q = jnp.concatenate([x[row] for x in qn], axis=0)
+        k = jnp.concatenate([x[row] for x in kn], axis=0)
         qc, kc_ = cols(q), cols(k)
         beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
         a = ybuf[b, A_OFF : A_OFF + vh]
         decay = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
-        sb[...] = (
-            recb[src * vh : (src + 1) * vh].astype(F32) * jnp.exp(decay)[:, None, None]
+        eg = jnp.exp(decay)[:, None, None]
+        outs = [
+            _head_update(
+                recb,
+                src * vh + h,
+                b * vh + h,
+                eg[h : h + 1],
+                kc_[h : h + 1],
+                qc[h : h + 1],
+                v[h : h + 1],
+                beta[h : h + 1, None],
+            )
+            for h in range(vh)
+        ]
+        mix[b, :Z] = rnd(jnp.concatenate(outs, axis=0)).reshape(Z)
+    for h in range(vh):
+        cs = slice(h * VD, (h + 1) * VD)
+        mix[0:B, cs] = _gated_norm(
+            mix[0:B, cs],
+            ybuf[0:B, QKV + h * VD : QKV + (h + 1) * VD],
+            gnw,
+            gp.eps,
+            gp.gate,
         )
-        pred = jnp.sum(sb[...] * kc_, axis=1)
-        delta = (v - pred) * beta[:, None]
-        sb[...] = sb[...] + kc_ * delta[:, None, :]
-        out = rnd(jnp.sum(sb[...] * qc, axis=1))
-        recb[b * vh : (b + 1) * vh] = sb[...].astype(REC)
-        val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
-        val = (gnw[None, :] * val.astype(BF16)).astype(F32)
-        zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-        scr["mix"][b, :Z] = rnd(val * gate_act(gp.gate)(zz)).reshape(Z)
 
 
 def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
@@ -116,7 +166,6 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
     HEAD_MAJOR = gp.head_major
     assert not HEAD_MAJOR or 2 * kh <= vh, (kh, vh)
     NCB = 2 if 4 * kh <= vh else 1
-    hrow = lax.broadcasted_iota(I32, (vh, VD), 0)
 
     def rows(r0, n: int, s):
         n_pad = rup(n, 8)
@@ -126,14 +175,12 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
         st = recb.at[s]
         row_i = lax.broadcasted_iota(I32, (n_pad, 1), 0)
         blk = jnp.zeros((n_pad, Z), F32)
-        for bb in range(n):
+        qn, kn = _qk_norms(uc, kh, KD, l2_eps)
+        for bb in _row_order(n, T, VER):
             h0 = bb * vh
-            q = uc[bb, : kh * KD].reshape(kh, KD)
-            k = uc[bb, kh * KD : 2 * kh * KD].reshape(kh, KD)
+            q = jnp.concatenate([x[bb : bb + 1] for x in qn], axis=0)
+            k = jnp.concatenate([x[bb : bb + 1] for x in kn], axis=0)
             v = uc[bb, 2 * kh * KD :].reshape(vh, VD)
-            q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + l2_eps)
-            q = q * KD**-0.5
-            k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + l2_eps)
             beta = rnd(jax.nn.sigmoid(bac[bb, 0:vh]))
             a = bac[bb, A_REL : A_REL + vh]
             decay = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
@@ -156,25 +203,38 @@ def gdn_rec_chunked(ctx: Any, gp: GDNParams, o: Any, slot: Any) -> None:
                 sb[cb : cb + kh] = colsk(k)
                 sb[cb + kh : cb + 2 * kh] = colsk(q)
                 eg = jnp.exp(decay)[:, None, None]
-                beta2 = beta[:, None]
-                out_acc = jnp.zeros((vh, VD), F32)
+                outs = []
                 for h in range(vh):
                     j = h // expand
-                    kc_h = sb[cb + j : cb + j + 1]
-                    s_h = st[src + h : src + h + 1].astype(F32) * eg[h : h + 1]
-                    pred_h = jnp.sum(s_h * kc_h, axis=1)
-                    delta_h = (v[h : h + 1] - pred_h) * beta2[h : h + 1]
-                    s_h = s_h + kc_h * delta_h[:, None, :]
-                    qc_h = sb[cb + kh + j : cb + kh + j + 1]
-                    out_acc = jnp.where(hrow == h, jnp.sum(s_h * qc_h, axis=1), out_acc)
-                    st[h0 + h : h0 + h + 1] = s_h.astype(REC)
-                out = rnd(out_acc)
-            val = out * lax.rsqrt(jnp.mean(out * out, axis=-1, keepdims=True) + gp.eps)
-            val = (gnw[None, :] * val.astype(BF16)).astype(F32)
-            zz = zc[bb].reshape(vh, VD)
-            row = rnd(val * gate_act(gp.gate)(zz)).reshape(1, Z)
-            blk = jnp.where(row_i == bb, row, blk)
-        scr["mix"][pl.ds(r0, n_pad), 0:Z] = blk
+                    outs.append(
+                        _head_update(
+                            st,
+                            src + h,
+                            h0 + h,
+                            eg[h : h + 1],
+                            sb[cb + j : cb + j + 1],
+                            sb[cb + kh + j : cb + kh + j + 1],
+                            v[h : h + 1],
+                            beta[h : h + 1, None],
+                        )
+                    )
+                out = rnd(jnp.concatenate(outs, axis=0))
+            blk = jnp.where(row_i == bb, out.reshape(1, Z), blk)
+        # The gated norm of every row at once, after the state chains; pad rows stay 0.
+        blk = jnp.concatenate(
+            [
+                _gated_norm(
+                    blk[:, h * VD : (h + 1) * VD],
+                    zc[:, h * VD : (h + 1) * VD],
+                    gnw,
+                    gp.eps,
+                    gp.gate,
+                )
+                for h in range(vh)
+            ],
+            axis=1,
+        )
+        scr["mix"][pl.ds(r0, n_pad), 0:Z] = jnp.where(row_i < n, blk, 0.0)
 
     def chunk(j, carry):
         s = lax.rem(j, NRB)
