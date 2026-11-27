@@ -763,19 +763,35 @@ def test_parse_policy_defaults_to_development():
 
 def test_parse_policy_frozen_with_approval():
     policy = check_regression.parse_policy(
-        {"_policy": {**_FROZEN, "approval": _APPROVAL_1}}
+        {
+            "_policy": {
+                "state": "frozen",
+                "owner": " alice ",
+                "approval": {
+                    "approver": " alice ",
+                    "reference": " https://example.invalid/pull/1 ",
+                },
+            }
+        }
     )
     assert policy == check_regression.BaselinePolicy(
         state="frozen",
         owner="alice",
-        approval=("alice", "https://example.invalid/pull/1"),
+        approval=check_regression.BaselineApproval(
+            "alice", "https://example.invalid/pull/1"
+        ),
     )
 
 
 @pytest.mark.parametrize(
     ("policy", "message"),
     [
+        (None, "_policy must be an object"),
         ("frozen", "_policy must be an object"),
+        (
+            {"status": "frozen", "owner": "alice"},
+            r"unknown _policy field\(s\): 'status'",
+        ),
         ({"state": "golden"}, "_policy.state must be 'development' or 'frozen'"),
         ({"state": "frozen"}, "_policy.owner must be a non-empty string"),
         ({"state": "frozen", "owner": " "}, "_policy.owner must be a non-empty"),
@@ -785,6 +801,16 @@ def test_parse_policy_frozen_with_approval():
         (
             {"approval": {"approver": "alice"}},
             "_policy.approval.reference must be a non-empty string",
+        ),
+        (
+            {
+                "approval": {
+                    "approver": "alice",
+                    "reference": "https://example.invalid/pull/1",
+                    "extra": "nope",
+                }
+            },
+            r"unknown _policy\.approval field\(s\): 'extra'",
         ),
     ],
 )
@@ -828,10 +854,62 @@ def test_parse_policy_rejects_malformed_block(policy, message):
             {**_TASK, "_policy": {"state": "frozen", "owner": "bob"}},
             _NO_APPROVAL,
         ),
-        # An approval that was already in the old file does not count again.
+        # An approval that was already in the old file does not count again,
+        # even with extra whitespace around its fields.
         (
             {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
             {**_RAISED, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            _NO_APPROVAL,
+        ),
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {
+                **_RAISED,
+                "_policy": {
+                    **_FROZEN,
+                    "approval": {
+                        "approver": "alice ",
+                        "reference": "https://example.invalid/pull/1 ",
+                    },
+                },
+            },
+            _NO_APPROVAL,
+        ),
+        # Stripping or mutating an existing approval without a new owner
+        # approval is rejected (blocks two-step strip-then-replay).
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {**_TASK, "_policy": _FROZEN},
+            _NO_APPROVAL,
+        ),
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {
+                **_TASK,
+                "_policy": {
+                    **_FROZEN,
+                    "approval": {
+                        "approver": "bob",
+                        "reference": "https://example.invalid/pull/3",
+                    },
+                },
+            },
+            _WRONG_APPROVER,
+        ),
+        (
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_1}},
+            {**_TASK, "_policy": {**_FROZEN, "approval": _APPROVAL_2}},
+            None,
+        ),
+        # Type-aware gated value equality detects int vs bool substitutions.
+        (
+            {"task": {"acc,none": 1}, "_policy": _FROZEN},
+            {"task": {"acc,none": True}, "_policy": _FROZEN},
+            _NO_APPROVAL,
+        ),
+        (
+            {"task": {"acc,none": 0}, "_policy": _FROZEN},
+            {"task": {"acc,none": False}, "_policy": _FROZEN},
             _NO_APPROVAL,
         ),
         (
@@ -858,6 +936,18 @@ def test_parse_policy_rejects_malformed_block(policy, message):
 )
 def test_check_baseline_update(old, new, expected):
     assert check_regression.check_baseline_update(old, new) == expected
+
+
+def test_format_update_result():
+    path = pathlib.Path("baseline.json")
+    assert (
+        check_regression.format_update_result(path, None)
+        == "PASS: baseline update follows its freeze policy."
+    )
+    assert (
+        check_regression.format_update_result(path, _NO_APPROVAL)
+        == f"FAILED: {path}: {_NO_APPROVAL}"
+    )
 
 
 def test_cli_update_mode(tmp_path, monkeypatch, capsys):
@@ -930,6 +1020,30 @@ _NOT_VALID_CASES = [
         (mode, ["--previous-baseline", "BASELINE"], "--previous-baseline")
         for mode in _RESULT_MODES
     ],
+    *[
+        (mode, flag, flag[0])
+        for mode in ("--mode perf", "--mode eval")
+        for flag in (
+            ["--task-filter", "mmlu_pro"],
+            ["--gate-ttft-max-concurrency", "0"],
+        )
+    ],
+    *[
+        ("--mode perf --calibrate", flag, flag[0])
+        for flag in (
+            ["--baseline", "BASELINE"],
+            ["--tolerance", "0.1"],
+            ["--task-filter", "mmlu_pro"],
+        )
+    ],
+    *[
+        ("--mode eval --calibrate", flag, flag[0])
+        for flag in (
+            ["--baseline", "BASELINE"],
+            ["--tolerance", "0.1"],
+            ["--gate-ttft-max-concurrency", "0"],
+        )
+    ],
 ]
 
 
@@ -953,9 +1067,11 @@ def test_cli_rejects_flags_the_mode_does_not_take(
 @pytest.mark.parametrize(
     ("content", "error"),
     [
-        # A missing file and invalid JSON: the reason follows the file name.
+        # A missing file, invalid JSON, and NaN/Infinity: reason follows file name.
         (None, "ERROR: cannot read {bad}: "),
         ("{not json", "ERROR: cannot read {bad}: "),
+        ('{"mmlu_pro": {"acc,none": NaN}}', "ERROR: cannot read {bad}: "),
+        ('{"mmlu_pro": {"acc,none": Infinity}}', "ERROR: cannot read {bad}: "),
         ("[]", "ERROR: {bad} must hold a JSON object\n"),
     ],
 )
@@ -980,9 +1096,31 @@ def test_cli_update_mode_unreadable_file_exits_2(
         assert captured.err.count("\n") == 1
 
 
+@pytest.mark.parametrize("mode", ["perf", "eval"])
+def test_cli_check_modes_reject_nan_baseline_with_exit_2(
+    tmp_path, monkeypatch, capsys, mode
+):
+    bad = tmp_path / "nan.baseline.json"
+    bad.write_text('{"mmlu_pro": {"acc,none": NaN}}')
+    results = _write_eval_run(tmp_path / "results", _TASK)
+    ret = _run_cli(
+        monkeypatch,
+        "--mode",
+        mode,
+        "--results-dir",
+        str(results),
+        "--baseline",
+        str(bad),
+    )
+    assert ret == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "non-standard JSON constant 'NaN'" in captured.err
+
+
 def test_shipped_baselines_have_valid_policy():
     """Every checked-in perf and eval baseline parses under the policy schema."""
     files = sorted(_BASELINE_DIR.parent.rglob("*.baseline.json"))
     assert files, f"no baselines found under {_BASELINE_DIR.parent}"
     for path in files:
-        check_regression.parse_policy(json.loads(path.read_text()))
+        check_regression.parse_policy(check_regression.load_baseline_file(path))

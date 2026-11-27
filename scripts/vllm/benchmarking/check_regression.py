@@ -33,6 +33,24 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
+_SCRIPT_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+import baseline_policy  # noqa: E402
+
+POLICY_KEY = baseline_policy.POLICY_KEY
+DEVELOPMENT = baseline_policy.DEVELOPMENT
+FROZEN = baseline_policy.FROZEN
+BaselineApproval = baseline_policy.BaselineApproval
+BaselinePolicy = baseline_policy.BaselinePolicy
+check_baseline_update = baseline_policy.check_baseline_update
+format_update_result = baseline_policy.format_update_result
+gated_entries = baseline_policy.gated_entries
+load_json_object = baseline_policy.load_json_object
+load_baseline_file = baseline_policy.load_json_object
+parse_policy = baseline_policy.parse_policy
+
 
 class Metric(NamedTuple):
     result_field: str
@@ -238,115 +256,6 @@ def calibrate_perf(
                 entry.pop("median_ttft_ms", None)
         baseline[key] = entry
     return baseline
-
-
-# Baseline files keep metadata under top-level keys that start with "_"; the
-# gates ignore them. The update policy lives under this one:
-#   "_policy": {
-#     "state": "development" | "frozen",   (absent block means development)
-#     "owner": "<handle>",                 (required when frozen)
-#     "approval": {"approver": "<handle>", "reference": "<PR or issue URL>"}
-#   }
-POLICY_KEY = "_policy"
-DEVELOPMENT = "development"
-FROZEN = "frozen"
-
-
-class Approval(NamedTuple):
-    approver: str
-    reference: str
-
-
-@dataclasses.dataclass(frozen=True)
-class BaselinePolicy:
-    """Who may change a baseline file, and whether it is frozen."""
-
-    state: str = DEVELOPMENT
-    owner: str | None = None
-    approval: Approval | None = None
-
-
-def _policy_str(block: dict, field: str, where: str) -> str:
-    value = block.get(field)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{where}.{field} must be a non-empty string")
-    return value
-
-
-def parse_policy(baseline: dict) -> BaselinePolicy:
-    """Read the `_policy` block; raise ValueError when it is malformed."""
-    raw = baseline.get(POLICY_KEY)
-    if raw is None:
-        return BaselinePolicy()
-    if not isinstance(raw, dict):
-        raise ValueError(f"{POLICY_KEY} must be an object")
-    state = raw.get("state", DEVELOPMENT)
-    if state not in (DEVELOPMENT, FROZEN):
-        raise ValueError(
-            f"{POLICY_KEY}.state must be {DEVELOPMENT!r} or {FROZEN!r}, got {state!r}"
-        )
-    owner = None
-    if state == FROZEN or "owner" in raw:
-        owner = _policy_str(raw, "owner", POLICY_KEY)
-    approval = None
-    if "approval" in raw:
-        block = raw["approval"]
-        where = f"{POLICY_KEY}.approval"
-        if not isinstance(block, dict):
-            raise ValueError(f"{where} must be an object")
-        approval = Approval(
-            _policy_str(block, "approver", where),
-            _policy_str(block, "reference", where),
-        )
-    return BaselinePolicy(state, owner, approval)
-
-
-def load_baseline_file(path: Path) -> dict:
-    """Read a baseline JSON file; raise ValueError when it is not an object."""
-    try:
-        baseline = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        raise ValueError(f"cannot read {path}: {e}") from e
-    if not isinstance(baseline, dict):
-        raise ValueError(f"{path} must hold a JSON object")
-    return baseline
-
-
-def gated_entries(baseline: dict) -> dict:
-    return {k: v for k, v in baseline.items() if not k.startswith("_")}
-
-
-def check_baseline_update(old: dict | None, new: dict) -> str | None:
-    """Return why replacing baseline `old` with `new` is not allowed, or None.
-
-    A development baseline (or a new file, `old` None) changes freely. A frozen
-    baseline changes its gated values, state, or owner only when `new` carries
-    an approval record that the old file did not have and whose approver is the
-    owner named in the old file.
-    """
-    new_policy = parse_policy(new)
-    if old is None:
-        return None
-    old_policy = parse_policy(old)
-    if old_policy.state != FROZEN:
-        return None
-    if gated_entries(old) == gated_entries(new) and (
-        new_policy.state,
-        new_policy.owner,
-    ) == (old_policy.state, old_policy.owner):
-        return None
-    approval = new_policy.approval
-    if approval is None or approval == old_policy.approval:
-        return (
-            "frozen baseline changed without a new "
-            f"{POLICY_KEY}.approval record from owner {old_policy.owner!r}"
-        )
-    if approval.approver != old_policy.owner:
-        return (
-            f"frozen baseline changed with approval from {approval.approver!r}, "
-            f"but its owner is {old_policy.owner!r}"
-        )
-    return None
 
 
 def find_eval_results_jsons(results_dir: Path) -> list[Path]:
@@ -594,21 +503,112 @@ def calibrate_eval(
     return baseline
 
 
-# The argparse destinations each mode takes; perf and eval modes share theirs.
-# A flag given to a mode that does not take it is a usage error, not a setting
-# that is silently ignored.
+# The argparse destinations each (mode, calibrate) combination reads. A flag
+# given to a mode that does not read it is a usage error, not silently ignored.
 UPDATE_MODE_ARGS = frozenset({"mode", "baseline", "previous_baseline"})
-RESULT_MODE_ARGS = frozenset(
-    {
-        "mode",
-        "results_dir",
-        "baseline",
-        "tolerance",
-        "calibrate",
-        "task_filter",
-        "gate_ttft_max_concurrency",
-    }
+PERF_CHECK_ARGS = frozenset({"mode", "results_dir", "baseline", "tolerance"})
+PERF_CALIBRATE_ARGS = frozenset(
+    {"mode", "calibrate", "results_dir", "gate_ttft_max_concurrency"}
 )
+EVAL_CHECK_ARGS = frozenset({"mode", "results_dir", "baseline", "tolerance"})
+EVAL_CALIBRATE_ARGS = frozenset({"mode", "calibrate", "results_dir", "task_filter"})
+
+_MODE_ALLOWED_ARGS: dict[tuple[str, bool], frozenset[str]] = {
+    ("update", False): UPDATE_MODE_ARGS,
+    ("update", True): UPDATE_MODE_ARGS,
+    ("perf", False): PERF_CHECK_ARGS,
+    ("perf", True): PERF_CALIBRATE_ARGS,
+    ("eval", False): EVAL_CHECK_ARGS,
+    ("eval", True): EVAL_CALIBRATE_ARGS,
+}
+
+
+def _run_update(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    if args.baseline is None:
+        parser.error("--baseline is required in update mode")
+    try:
+        old = None
+        if args.previous_baseline is not None:
+            old = load_json_object(args.previous_baseline)
+        violation = check_baseline_update(old, load_json_object(args.baseline))
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    message = format_update_result(args.baseline, violation)
+    if violation:
+        print(message, file=sys.stderr)
+        return 1
+    print(message)
+    return 0
+
+
+def _run_calibrate(args: argparse.Namespace) -> int:
+    if args.mode == "perf":
+        baseline = calibrate_perf(args.results_dir, args.gate_ttft_max_concurrency)
+    else:
+        if args.task_filter == "all":
+            task_filter = None
+        elif args.task_filter:
+            task_filter = {s.strip() for s in args.task_filter.split(",") if s.strip()}
+        else:
+            task_filter = set(DEFAULT_TASK_FILTER)
+        try:
+            baseline = calibrate_eval(args.results_dir, task_filter)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+    json.dump(baseline, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+    return 0
+
+
+def _run_eval_check(args: argparse.Namespace, tolerance: float) -> int:
+    try:
+        baseline = gated_entries(load_json_object(args.baseline))
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    results = load_eval_results(args.results_dir[0])
+    if not results:
+        print(
+            f"ERROR: no results_*.json found under {args.results_dir[0]}",
+            file=sys.stderr,
+        )
+        return 2
+    result = check_eval(results, baseline, tolerance)
+    if result:
+        tol_str = format_drop_range([row.allowed_drop for row in result.failed_rows])
+        print(
+            f"FAILED: {result.failed_count} task(s) regressed beyond {tol_str}",
+            file=sys.stderr,
+        )
+        return 1
+    print("PASS: all evaluated tasks within tolerance.")
+    return 0
+
+
+def _run_perf_check(args: argparse.Namespace, tolerance: float) -> int:
+    try:
+        baseline = gated_entries(load_json_object(args.baseline))
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    results = load_perf_results(args.results_dir[0])
+    if not results:
+        print(
+            f"ERROR: no isl*_osl*_c*.json files found in {args.results_dir[0]}",
+            file=sys.stderr,
+        )
+        return 2
+    failed = check_perf(results, baseline, tolerance)
+    if failed:
+        print(
+            f"FAILED: {failed} metric(s) regressed beyond {tolerance * 100:.2f}%",
+            file=sys.stderr,
+        )
+        return 1
+    print("PASS: all gated metrics within tolerance.")
+    return 0
 
 
 def main() -> int:
@@ -649,7 +649,7 @@ def main() -> int:
     parser.add_argument(
         "--task-filter",
         default="",
-        help="Comma-separated allow-list of tasks/datasets.",
+        help="Calibrate (eval) only: comma-separated allow-list of tasks/datasets.",
     )
     parser.add_argument(
         "--gate-ttft-max-concurrency",
@@ -661,7 +661,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    accepted = UPDATE_MODE_ARGS if args.mode == "update" else RESULT_MODE_ARGS
+    accepted = _MODE_ALLOWED_ARGS[(args.mode, args.calibrate)]
     # A flag whose value equals its default counts as not given.
     rejected = sorted(
         dest
@@ -676,97 +676,22 @@ def main() -> int:
         parser.error(f"{flags}: not valid with {selected}")
 
     if args.mode == "update":
-        if args.baseline is None:
-            parser.error("--baseline is required in update mode")
-        try:
-            old = None
-            if args.previous_baseline is not None:
-                old = load_baseline_file(args.previous_baseline)
-            violation = check_baseline_update(old, load_baseline_file(args.baseline))
-        except ValueError as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            return 2
-        if violation:
-            print(f"FAILED: {args.baseline}: {violation}", file=sys.stderr)
-            return 1
-        print("PASS: baseline update follows its freeze policy.")
-        return 0
+        return _run_update(parser, args)
     if not args.results_dir:
         parser.error("--results-dir is required in perf and eval modes")
-
-    tolerance = args.tolerance
-    if tolerance is None:
-        tolerance = 0.05 if args.mode == "perf" else 0.015
-
     if args.calibrate:
-        if args.mode == "perf":
-            baseline = calibrate_perf(args.results_dir, args.gate_ttft_max_concurrency)
-        elif args.mode == "eval":
-            if args.task_filter == "all":
-                task_filter = None
-            elif args.task_filter:
-                task_filter = set(
-                    s.strip() for s in args.task_filter.split(",") if s.strip()
-                )
-            else:
-                task_filter = set(DEFAULT_TASK_FILTER)
-            try:
-                baseline = calibrate_eval(args.results_dir, task_filter)
-            except ValueError as e:
-                print(f"ERROR: {e}", file=sys.stderr)
-                return 2
-        json.dump(baseline, sys.stdout, indent=2, sort_keys=True)
-        sys.stdout.write("\n")
-        return 0
-
+        return _run_calibrate(args)
     if args.baseline is None:
         parser.error("--baseline is required unless --calibrate is set")
     if len(args.results_dir) != 1:
         parser.error("--results-dir may only be given once in check mode")
 
+    tolerance = args.tolerance
+    if tolerance is None:
+        tolerance = 0.05 if args.mode == "perf" else 0.015
     if args.mode == "perf":
-        results = load_perf_results(args.results_dir[0])
-        if not results:
-            print(
-                f"ERROR: no isl*_osl*_c*.json files found in {args.results_dir[0]}",
-                file=sys.stderr,
-            )
-            return 2
-    else:
-        results = load_eval_results(args.results_dir[0])
-        if not results:
-            print(
-                f"ERROR: no results_*.json found under {args.results_dir[0]}",
-                file=sys.stderr,
-            )
-            return 2
-
-    with args.baseline.open() as fh:
-        baseline = json.load(fh)
-    baseline = gated_entries(baseline)
-
-    if args.mode == "perf":
-        failed = check_perf(results, baseline, tolerance)
-        if failed:
-            print(
-                f"FAILED: {failed} metric(s) regressed beyond {tolerance * 100:.2f}%",
-                file=sys.stderr,
-            )
-            return 1
-        print("PASS: all gated metrics within tolerance.")
-    else:
-        result = check_eval(results, baseline, tolerance)
-        if result:
-            tol_str = format_drop_range(
-                [row.allowed_drop for row in result.failed_rows]
-            )
-            print(
-                f"FAILED: {result.failed_count} task(s) regressed beyond {tol_str}",
-                file=sys.stderr,
-            )
-            return 1
-        print("PASS: all evaluated tasks within tolerance.")
-    return 0
+        return _run_perf_check(args, tolerance)
+    return _run_eval_check(args, tolerance)
 
 
 if __name__ == "__main__":
