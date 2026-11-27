@@ -237,6 +237,52 @@
         "ffn_moe_layers": 57,
         "ffn_dense_layers": 3
       }
+    },
+    {
+      "canonical_id": "qwen4_exp",
+      "hf_repo": "Qwen/Qwen3.8-Flash-Next-FP8",
+      "revision": "7fb48d708ca6cd8eeed8f4db0433be18af96984f",
+      "fixture": "qwen3_8_flash_next_fp8.json",
+      "sha256_b64": "2nCy6gPIlJ2n7o8tLwcTKW4tHPzfork5bMa0EngWEFc=",
+      "geometry": {
+        "num_layers": 48,
+        "hidden": 2560,
+        "num_heads": 24,
+        "num_kv_heads": 2,
+        "head_dim": 256,
+        "kv_lora_rank": 0,
+        "q_lora_rank": 0,
+        "attn_output_gate": true,
+        "num_experts": 512,
+        "top_k": 10,
+        "moe_inter": 640,
+        "shared_inter": 640,
+        "dense_inter": 0,
+        "first_k_dense_replace": 0,
+        "vocab": 248320,
+        "linear_k_heads": 16,
+        "linear_v_heads": 48,
+        "linear_k_dim": 128,
+        "linear_v_dim": 128,
+        "conv_kernel": 4,
+        "hc_mult": 4,
+        "hc_lowrank": 320,
+        "qsa_budget": 2048,
+        "index_n_heads": 4,
+        "index_head_dim": 128,
+        "ple_dim": 2560,
+        "ple_layer_ids": [1],
+        "mtp_layers": 1,
+        "index_share_for_mtp_iteration": false,
+        "weight_block_size": [128, 128]
+      },
+      "structure": {
+        "layer_counts": {"gqa": 12, "gdn": 36, "mla": 0, "dsa": 0, "swa": 0, "kda": 0},
+        "indexer_full": 0,
+        "indexer_shared": 0,
+        "ffn_moe_layers": 48,
+        "ffn_dense_layers": 0
+      }
     }
   ]
 }

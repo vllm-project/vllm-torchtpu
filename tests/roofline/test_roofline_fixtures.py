@@ -41,6 +41,7 @@ SUPPORTED_FIXTURES: tuple[tuple[str, str, str], ...] = (
     ("glm_5_2_nvfp4.json", "glm_moe_dsa", "nvidia/GLM-5.2-NVFP4"),
     ("deepseek_v4_1_flash.json", "deepseek_v41", "deepseek-ai/DeepSeek-V4.1-Flash"),
     ("minimax_m3_1_flash.json", "minimax_m3_vl", "MiniMaxAI/MiniMax-M3.1-Flash"),
+    ("qwen3_8_flash_next_fp8.json", "qwen4_exp", "Qwen/Qwen3.8-Flash-Next-FP8"),
 )
 
 _EXPECTED_FIXTURE_GEOMETRY: dict[str, tuple[int, int, int, int, int, int]] = {
@@ -50,6 +51,7 @@ _EXPECTED_FIXTURE_GEOMETRY: dict[str, tuple[int, int, int, int, int, int]] = {
     "glm_5_2_nvfp4.json": (78, 6144, 64, 64, 192, 256),
     "deepseek_v4_1_flash.json": (40, 5120, 64, 1, 512, 384),
     "minimax_m3_1_flash.json": (60, 6144, 64, 4, 128, 128),
+    "qwen3_8_flash_next_fp8.json": (48, 2560, 24, 2, 256, 512),
 }
 
 SYNTHETIC_NEGATIVE_CONTROLS: tuple[tuple[dict[str, object], str], ...] = (
@@ -62,16 +64,6 @@ SYNTHETIC_NEGATIVE_CONTROLS: tuple[tuple[dict[str, object], str], ...] = (
             "num_attention_heads": 32,
         },
         "unsupported_synthetic_arch",
-    ),
-    (
-        {
-            "model_type": "qwen4_exp",
-            "architectures": ["Qwen4ExpForCausalLM"],
-            "hidden_size": 4096,
-            "num_hidden_layers": 8,
-            "num_attention_heads": 32,
-        },
-        "qwen4_exp",
     ),
     (
         {

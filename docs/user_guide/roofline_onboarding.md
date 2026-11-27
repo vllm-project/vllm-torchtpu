@@ -74,6 +74,7 @@ architectures)` pairs, and allowed layer kinds:
 - `glm_moe_dsa`: MLA + DSA + IndexShare + MoE + MTP (FP8, ModelOpt NVFP4)
 - `deepseek_v41`: CSA2 sparse MLA + SWA + CED + Engram host tables + MoE + DSpark draft (UE8M0 FP8 / MXFP4)
 - `minimax_m3_vl`: MSA sparse GQA + 4-bit KV + MoE (MXFP8 / NVFP4)
+- `qwen4_exp`: Hybrid GDN + QSA sparse GQA + n-gram PLE host tables + MoE + MTP (FP8)
 
 <!-- BEGIN GENERATED: roofline-doc-tables -->
 
@@ -87,6 +88,7 @@ architectures)` pairs, and allowed layer kinds:
 | `minimax_m3_1_flash.json` | `MiniMaxAI/MiniMax-M3.1-Flash` | 60 | 6144 | 64/4 | 128/4 | 200064 |
 | `qwen3_5_397b_fp8.json` | `Qwen/Qwen3.5-397B-A17B-FP8` | 60 | 4096 | 32/2 | 512/10 | 248320 |
 | `qwen3_5_397b_nvfp4.json` | `nvidia/Qwen3.5-397B-A17B-NVFP4` | 60 | 4096 | 32/2 | 512/10 | 248320 |
+| `qwen3_8_flash_next_fp8.json` | `Qwen/Qwen3.8-Flash-Next-FP8` | 48 | 2560 | 24/2 | 512/10 | 248320 |
 
 ## Representative Scenario Summary (`chat-8k1k`, mixed)
 
@@ -112,6 +114,9 @@ TPU serving cache policy: `--kv-dtype fp8` for all checkpoints and `--state-dtyp
 | `qwen3_5_397b_nvfp4` | `2x2x1` | 120 | `TP2 x DP4 x EP8` | 2.68 | 11,226.1 | 52,101.6 |
 | `qwen3_5_397b_nvfp4` | `2x2x2` | 485 | `TP2 x DP4 x EP8` | 2.68 | 11,226.1 | 52,101.6 |
 | `qwen3_5_397b_nvfp4` | `2x2x4` | 1408 | `TP2 x DP4 x EP8` | 2.68 | 11,226.1 | 52,101.6 |
+| `qwen3_8_flash_next_fp8` | `2x2x1` | 132 | `TP2 x DP4 x EP8` | 1.24 | 27,229.5 | 112,849.9 |
+| `qwen3_8_flash_next_fp8` | `2x2x2` | 457 | `TP2 x DP4 x EP8` | 1.24 | 27,229.5 | 112,849.9 |
+| `qwen3_8_flash_next_fp8` | `2x2x4` | 1154 | `TP2 x DP4 x EP8` | 1.24 | 27,229.5 | 112,849.9 |
 
 <!-- END GENERATED -->
 

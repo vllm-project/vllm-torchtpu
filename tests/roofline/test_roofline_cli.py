@@ -374,7 +374,7 @@ def test_cli_chip_spec_hf_overrides_clean_error_and_dtype_label_preservation(
     unknown_arch_path.write_text(
         json.dumps(
             {
-                "model_type": "qwen4_exp",
+                "model_type": "unlisted_example_moe",
                 "hidden_size": 4096,
                 "num_hidden_layers": 4,
                 "num_attention_heads": 32,
@@ -393,7 +393,7 @@ def test_cli_chip_spec_hf_overrides_clean_error_and_dtype_label_preservation(
     )
     expected_error_rc = 2
     assert rc_fail == expected_error_rc
-    assert "qwen4_exp" in capsys.readouterr().err
+    assert "unlisted_example_moe" in capsys.readouterr().err
     rc_missing = cli.main(
         ["plan", "--config", str(tmp_path / "missing.json"), "--tp", "8"]
     )

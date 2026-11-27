@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -24,6 +25,7 @@ from .constants import (
     BF16_BYTES,
     BLOCK_PARALLEL_ENABLED,
     CSA2_INDEX_RECORD_BYTES,
+    DRAFT_PROJECTION_HIDDEN_VECTORS,
     FP8_BYTES,
     FP8_UE8M0_32X32_BYTES,
     FP8_UE8M0_BYTES,
@@ -35,6 +37,7 @@ from .constants import (
     LINEAR_ATTENTION_LAYER_TOKENS,
     MULTIMODAL_KEYS,
     NON_GATED_MATMUL_COUNT,
+    QSA_RAW_RING_TILE_ROWS,
     SUPPORTED_MODELS,
     VALID_LAYER_TOKENS,
     WEIGHT_BLOCK_DIM_LEN,
@@ -1032,6 +1035,169 @@ def _resolve_draft_kv_flags(
     return draft_kv_dtype, skip_offload, single_row
 
 
+def _is_prime(value: int) -> bool:
+    """Return True when integer ``value`` is prime."""
+    min_prime = 2
+    if value < min_prime:
+        return False
+    if value % min_prime == 0:
+        return value == min_prime
+    return all(value % d != 0 for d in range(3, math.isqrt(value) + 1, 2))
+
+
+def _ngram_head_vocab_sizes(
+    vocab_base: int,
+    ngram_heads: int,
+    layer_count: int,
+) -> list[int]:
+    """Return prime-sized n-gram head vocabularies starting at ``vocab_base``."""
+    sizes: list[int] = []
+    candidate = max(1, vocab_base - 1)
+    for _ in range(layer_count * ngram_heads):
+        candidate += 1
+        while not _is_prime(candidate):
+            candidate += 1
+        sizes.append(candidate)
+    return sizes
+
+
+def _resolve_qsa_sparse_spec(
+    scopes: tuple[Mapping[str, object], ...],
+    layer_types: tuple[str, ...],
+    dims: tuple[int, int, int, int, int],
+) -> SparseAttnSpec | None:
+    """Build SparseAttnSpec(kind='qsa') when config declares QSA indexer keys."""
+    kv_lora_rank, head_dim, index_head_dim, num_kv_heads, qsa_budget = dims
+    compress_ratio = _as_int(_first_non_none(scopes, "indexer_compress_ratio") or 0)
+    indexer_kv_heads = _as_int(_first_non_none(scopes, "indexer_kv_heads") or 1, 1)
+    if kv_lora_rank > 0 or (qsa_budget <= 0 and compress_ratio <= 0):
+        return None
+    eff_ratio = max(1, compress_ratio)
+    qsa_layer_ids = tuple(
+        idx
+        for idx, tok in enumerate(layer_types)
+        if tok in ("full_attention", "indexed_attention", "gqa")
+    )
+    if not qsa_layer_ids:
+        return None
+    raw_ring_rows = (
+        (eff_ratio + QSA_RAW_RING_TILE_ROWS - 1) // QSA_RAW_RING_TILE_ROWS
+    ) * QSA_RAW_RING_TILE_ROWS
+    eff_index_hd = index_head_dim if index_head_dim > 0 else head_dim
+    comp_key_bytes = (
+        float(max(1, indexer_kv_heads) * eff_index_hd) * BF16_BYTES / float(eff_ratio)
+    )
+    fixed_ring_bytes = (
+        float(raw_ring_rows * 2 * max(1, num_kv_heads) * head_dim) * FP8_BYTES
+    )
+    return SparseAttnSpec(
+        kind="qsa",
+        kv_source_layer_ids=qsa_layer_ids,
+        index_source_layer_ids=qsa_layer_ids,
+        compressed_key_bytes_per_tok=comp_key_bytes,
+        sparse_block_size=eff_ratio,
+        sparse_topk_blocks=qsa_budget // eff_ratio if qsa_budget > 0 else 0,
+        dcp_span="kv_head_group",
+        fixed_state_page_bytes=fixed_ring_bytes,
+    )
+
+
+def _resolve_ple_host_tables(
+    scopes: tuple[Mapping[str, object], ...],
+    ple_layer_ids: tuple[int, ...],
+    dims: tuple[int, int, int],
+) -> tuple[HostTableSpec, ...]:
+    """Build HostTableSpec entries when config declares n-gram PLE tables."""
+    hidden, hc_mult, ple_dim = dims
+    ngram_size = _as_int(_first_non_none(scopes, "ngram_size") or 0)
+    heads_per_ngram = _as_int(_first_non_none(scopes, "heads_per_ngram") or 0)
+    vocab_base = _as_int(_first_non_none(scopes, "ngram_vocab_size_base") or 0)
+    row_divisor = _as_int(
+        _first_non_none(scopes, "make_ngram_vocab_size_divisible_by") or 1, 1
+    )
+    ple_conv_kernel = _as_int(_first_non_none(scopes, "ple_conv_kernel_size") or 0)
+    raw_split_parts = _first_non_none(scopes, "split_ngram_parts")
+    if raw_split_parts is not None and _as_int(raw_split_parts, 0) <= 0:
+        msg = f"split_ngram_parts must be positive, got {raw_split_parts!r}"
+        raise ValueError(msg)
+    if not ple_layer_ids or ngram_size <= 1 or heads_per_ngram <= 0 or vocab_base <= 0:
+        return ()
+    eff_ple_dim = ple_dim if ple_dim > 0 else hidden
+    ngram_heads = (ngram_size - 1) * heads_per_ngram
+    if eff_ple_dim % ngram_heads != 0:
+        msg = (
+            f"ple_embed_dim ({eff_ple_dim}) must be divisible by "
+            f"{ngram_heads} n-gram heads"
+        )
+        raise ValueError(msg)
+    shard_dim = eff_ple_dim // ngram_heads
+    n_ple_layers = len(ple_layer_ids)
+    all_primes = _ngram_head_vocab_sizes(vocab_base, ngram_heads, n_ple_layers)
+    eff_div = max(1, row_divisor)
+    total_rows = 0
+    for layer_rank in range(n_ple_layers):
+        layer_sum = sum(
+            all_primes[layer_rank * ngram_heads : (layer_rank + 1) * ngram_heads]
+        )
+        total_rows += math.ceil(layer_sum / eff_div) * eff_div
+    hc_hidden = hidden * max(1, hc_mult)
+    conv_params = hc_hidden * max(0, ple_conv_kernel)
+    dense_proj_per_layer = eff_ple_dim * (hc_hidden + hidden) + conv_params
+    state_per_layer = (
+        float(max(0, ple_conv_kernel - 1) * ngram_size * hc_hidden) * BF16_BYTES
+    )
+    return (
+        HostTableSpec(
+            name="ple",
+            layer_ids=ple_layer_ids,
+            elem_count=total_rows * shard_dim,
+            table_dtype_role="w_expert",
+            dense_proj_dtype_role="w_dense",
+            default_hbm_resident=False,
+            shard_axis="tp",
+            h2d_bytes_per_tok=float(n_ple_layers * eff_ple_dim) * FP8_BYTES,
+            state_bytes_per_req=float(n_ple_layers) * state_per_layer,
+            dense_proj_params=n_ple_layers * dense_proj_per_layer,
+        ),
+    )
+
+
+def _resolve_mtp_draft_spec(
+    scopes: tuple[Mapping[str, object], ...],
+    mtp_layers: int,
+    sparse_attn: SparseAttnSpec | None,
+    ffn_dims: tuple[int, int, int, int, int],
+) -> DraftSpec | None:
+    """Build DraftSpec(kind='mtp') when config declares a nested ``mtp`` block."""
+    raw_mtp = _as_mapping(_first_non_none(scopes, "mtp"))
+    if not raw_mtp or mtp_layers <= 0:
+        return None
+    num_experts, top_k, moe_inter, shared_inter, dense_inter = ffn_dims
+    raw_layer_types = _as_sequence(raw_mtp.get("layer_types"))
+    first_tok = str(raw_layer_types[0]) if raw_layer_types else "full_attention"
+    if (
+        sparse_attn is not None
+        and sparse_attn.kind == "qsa"
+        and first_tok in ("full_attention", "indexed_attention")
+    ):
+        layer_kind = "indexed_attention"
+    else:
+        layer_kind = first_tok
+    use_moe = num_experts > 0
+    return DraftSpec(
+        kind="mtp",
+        num_layers=mtp_layers,
+        layer_kind=layer_kind,
+        num_experts=num_experts if use_moe else 0,
+        top_k=top_k if use_moe else 0,
+        moe_inter=moe_inter if use_moe else 0,
+        shared_inter=shared_inter if use_moe else 0,
+        dense_inter=0 if use_moe else dense_inter,
+        fc_in_mult=int(DRAFT_PROJECTION_HIDDEN_VECTORS),
+        fc_replicated=False,
+    )
+
+
 def _resolve_draft_spec(draft_config: Mapping[str, object] | None) -> DraftSpec | None:
     """Parse an optional companion draft model config JSON into a DraftSpec."""
     if draft_config is None:
@@ -1898,7 +2064,11 @@ def _extract_extended_fields(
     return _ExtendedGeometryFields(
         mtp_layers=mtp_layers,
         ple_layer_ids=ple_layer_ids,
-        ple_dim=_as_int(_first_present(text_config, "per_layer_input_dim", "ple_dim")),
+        ple_dim=_as_int(
+            _first_present(
+                text_config, "per_layer_input_dim", "ple_dim", "ple_embed_dim"
+            )
+        ),
         indexer_types=_resolve_indexer_types(text_config, config, num_layers),
         index_share_for_mtp_iteration=bool(
             _first_non_none(scopes, "index_share_for_mtp_iteration") or False
@@ -1961,8 +2131,12 @@ def _extract_geometry_for_identity(
     qk_nope_head_dim = _as_int(text_config.get("qk_nope_head_dim"))
     qk_rope_head_dim = _as_int(text_config.get("qk_rope_head_dim"))
     v_head_dim = _as_int(text_config.get("v_head_dim"))
-    index_n_heads = _as_int(text_config.get("index_n_heads"))
-    index_head_dim = _as_int(text_config.get("index_head_dim"))
+    index_n_heads = _as_int(
+        _first_present(text_config, "index_n_heads", "indexer_n_heads")
+    )
+    index_head_dim = _as_int(
+        _first_present(text_config, "index_head_dim", "indexer_head_dim")
+    )
     index_topk = _as_int(text_config.get("index_topk"))
     sliding_window = _as_int(text_config.get("sliding_window"))
     global_head_dim = _as_int(text_config.get("global_head_dim"))
@@ -1995,14 +2169,28 @@ def _extract_geometry_for_identity(
     extended = _extract_extended_fields(
         text_config, config, num_layers, allow_csa2=allow_csa2
     )
+    scopes = (text_config, config) if text_config is not config else (text_config,)
     sparse_attn = (
         _resolve_csa2_sparse_spec(
             text_config, num_layers, head_dim, sliding_window, allow_csa2=allow_csa2
         )
         or msa_sparse
+        or _resolve_qsa_sparse_spec(
+            scopes,
+            layer_types,
+            (
+                kv_lora_rank,
+                head_dim,
+                index_head_dim,
+                num_kv_heads,
+                extended.qsa_budget,
+            ),
+        )
     )
     host_tables = _resolve_engram_host_tables(
         text_config, num_layers, hidden, extended.hc_mult
+    ) + _resolve_ple_host_tables(
+        scopes, extended.ple_layer_ids, (hidden, extended.hc_mult, extended.ple_dim)
     )
     draft = _resolve_draft_spec(draft_config)
     if draft is None:
@@ -2010,6 +2198,13 @@ def _extract_geometry_for_identity(
             text_config,
             layer_types,
             (extended.mtp_layers, moe_inter, shared_inter, sliding_window),
+        )
+    if draft is None:
+        draft = _resolve_mtp_draft_spec(
+            scopes,
+            extended.mtp_layers,
+            sparse_attn,
+            (num_experts, top_k, moe_inter, shared_inter, dense_inter),
         )
 
     return ModelGeometry(

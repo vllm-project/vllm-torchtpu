@@ -46,6 +46,7 @@ LOCKED_FIXTURE_FILES: tuple[str, ...] = (
     "glm_5_2_nvfp4.json",
     "deepseek_v4_1_flash.json",
     "minimax_m3_1_flash.json",
+    "qwen3_8_flash_next_fp8.json",
 )
 
 

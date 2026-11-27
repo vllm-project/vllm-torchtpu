@@ -201,6 +201,8 @@ INT4_PER_TOKEN_HEAD_SCALE_BYTES: float = 8.0 * FP32_BYTES
 INT4_INDEX_SCALE_BYTES: float = FP32_BYTES
 # CSA2 packed indexer key cache: 128 B FP8 key plus 4 B UE8M0 scale per token.
 CSA2_INDEX_RECORD_BYTES: float = 128.0 * FP8_BYTES + FP32_BYTES
+# QSA raw key ring aligns to 8-row tiles.
+QSA_RAW_RING_TILE_ROWS: int = 8
 
 BASE_DTYPE_BYTES: dict[str, float] = {
     "float32": FP32_BYTES,
@@ -351,6 +353,16 @@ SUPPORTED_MODELS: Mapping[str, ModelSpec] = MappingProxyType(
                 "MiniMaxM3SparseForCausalLM",
             ),
             allowed_layer_kinds=frozenset({"gqa"}),
+        ),
+        "qwen4_exp": ModelSpec(
+            canonical_id="qwen4_exp",
+            hf_repos=("Qwen/Qwen3.8-Flash-Next-FP8",),
+            model_types=("qwen4_exp", "qwen4_exp_text"),
+            architectures=(
+                "Qwen4ExpForConditionalGeneration",
+                "Qwen4ExpForCausalLM",
+            ),
+            allowed_layer_kinds=frozenset({"gqa", "gdn"}),
         ),
     }
 )
