@@ -354,6 +354,15 @@ def _substitute_placeholder_token(
 logger = init_logger(__name__)
 
 
+def _spec_warmup_num_output_tokens(requests: Any, req_ids: list[str]) -> list[int]:
+    """Report each synthetic request's current output length.
+
+    A smaller count truncates the request back to it, which under async
+    scheduling drops the optimistic placeholders the next rollback expects.
+    """
+    return [len(requests[req_id].output_token_ids) for req_id in req_ids]
+
+
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -6849,6 +6858,10 @@ class TPUModelRunner(GPUModelRunner):
         K = self.speculative_config.num_speculative_tokens
         drafter = self.drafter
         block = int(getattr(drafter, "block_size", K + 1))
+        # A step holds at most max_num_seqs requests, and the input batch may
+        # hold no more. self.max_num_reqs is raised to MIN_NUM_SEQS for request
+        # padding, so it caps the pad, as in serving, but not the count.
+        max_seqs = int(self.scheduler_config.max_num_seqs)
         max_reqs = int(self.max_num_reqs)
         budget = int(self.max_num_tokens)
         pads = list(self.num_tokens_paddings)
@@ -6858,7 +6871,7 @@ class TPUModelRunner(GPUModelRunner):
 
         seen: set[tuple] = set()
         grid: list[int] = []
-        for R in range(1, max_reqs + 1):
+        for R in range(1, max_seqs + 1):
             keys = []
             if budget >= R * (1 + K):
                 keys.append(
@@ -6869,7 +6882,7 @@ class TPUModelRunner(GPUModelRunner):
                         tok_bucket(R * block),
                     )
                 )
-            if mixed and max_reqs >= R + 1 and budget >= R * (1 + K) + 1:
+            if mixed and max_seqs >= R + 1 and budget >= R * (1 + K) + 1:
                 keys.append(
                     (
                         "mixed",
@@ -6908,6 +6921,8 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
+        # The most requests one step may hold (see _spec_warmup_bucket_grid).
+        max_seqs = int(self.scheduler_config.max_num_seqs)
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
         max_pos = min(self.max_model_len, P + n_decode * (1 + K))
@@ -6972,7 +6987,9 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None] * R,
                     num_computed_tokens=list(nct),
-                    num_output_tokens=[t + 1] * R,
+                    num_output_tokens=_spec_warmup_num_output_tokens(
+                        self.requests, rids
+                    ),
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
@@ -6985,7 +7002,7 @@ class TPUModelRunner(GPUModelRunner):
                 nct = [x + 1 for x in nct]
             if (
                 mixed
-                and self.max_num_reqs >= R + 1
+                and max_seqs >= R + 1
                 and int(self.max_num_tokens) - R * (1 + K) >= P
             ):
                 # Mixed verify+prefill steps at the full step budget: R verify
@@ -7000,7 +7017,7 @@ class TPUModelRunner(GPUModelRunner):
                     for g in self.kv_cache_config.kv_cache_groups
                 ]
                 variants = [[P_mix]]
-                if self.max_num_reqs >= R + 2 and P_mix >= 2 * P:
+                if max_seqs >= R + 2 and P_mix >= 2 * P:
                     variants.append([P_mix // 2, P_mix - P_mix // 2])
                 prev_ids: list[str] = []
                 for vi, plist in enumerate(variants):
@@ -7044,7 +7061,9 @@ class TPUModelRunner(GPUModelRunner):
                         all_token_ids=all_token_ids,
                         new_block_ids=[None] * R,
                         num_computed_tokens=list(nct),
-                        num_output_tokens=[n_decode + 1 + vi] * R,
+                        num_output_tokens=_spec_warmup_num_output_tokens(
+                            self.requests, rids
+                        ),
                     )
                     so = SchedulerOutput.make_empty()
                     so.scheduled_new_reqs = extras
@@ -7148,7 +7167,9 @@ class TPUModelRunner(GPUModelRunner):
                     all_token_ids=all_token_ids,
                     new_block_ids=[None],
                     num_computed_tokens=[nct],
-                    num_output_tokens=[t + 1],
+                    num_output_tokens=_spec_warmup_num_output_tokens(
+                        self.requests, [rid]
+                    ),
                 )
                 so = SchedulerOutput.make_empty()
                 so.scheduled_cached_reqs = creq
@@ -7816,8 +7837,16 @@ def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
 
 def _get_padded_token_len(paddings: list[int], x: int) -> int:
     """Return the first element in paddings list greater or equal to x."""
+    if not paddings:
+        raise ValueError(
+            f"Cannot determine padded token length for {x}: paddings list is empty"
+        )
     index = bisect.bisect_left(paddings, x)
-    assert index < len(paddings)
+    if index >= len(paddings):
+        raise ValueError(
+            f"Requested token length {x} exceeds the maximum compiled padding "
+            f"bucket {paddings[-1]} (available paddings: {paddings})"
+        )
     return paddings[index]
 
 

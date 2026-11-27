@@ -15,6 +15,7 @@
 import contextlib
 import copy
 import inspect
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -62,6 +63,10 @@ from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+
+
+def _warmup_requests():
+    return defaultdict(lambda: SimpleNamespace(output_token_ids=[]))
 
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():
@@ -309,6 +314,8 @@ def test_spec_warmup_clamps_circular_buffer_group_blocks():
     runner = SimpleNamespace(
         max_model_len=8192,
         max_num_tokens=2048,
+        # _warmup_spec_batch bounds its request counts by max_num_seqs.
+        scheduler_config=SimpleNamespace(max_num_seqs=8),
         speculative_config=SimpleNamespace(num_speculative_tokens=5),
         vllm_config=SimpleNamespace(num_lookahead_tokens=5),
         kv_cache_config=SimpleNamespace(
@@ -319,6 +326,7 @@ def test_spec_warmup_clamps_circular_buffer_group_blocks():
         sample_tokens=MagicMock(),
         take_draft_token_ids=MagicMock(return_value=None),
         _warmup_spec_decode_cleanup=MagicMock(return_value=True),
+        requests=_warmup_requests(),
     )
 
     assert tpu_runner._spec_warmup_group_num_blocks(runner, attn_group, 2060) == 9
@@ -3094,11 +3102,13 @@ def test_init_num_reqs_caps_deepseek_v41_v2_vs_rpa(monkeypatch):
     assert runner.num_reqs_most_model_len is None
 
 
-def _runner(K: int, block: int, max_reqs: int, budget: int, paddings: list[int]):
+def _runner(K: int, block: int, max_seqs: int, budget: int, paddings: list[int]):
     return SimpleNamespace(
         speculative_config=SimpleNamespace(num_speculative_tokens=K),
         drafter=SimpleNamespace(block_size=block),
-        max_num_reqs=max_reqs,
+        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
+        # As in TPUModelRunner.__init__: raised to MIN_NUM_SEQS for padding.
+        max_num_reqs=max(max_seqs, tpu_runner.MIN_NUM_SEQS),
         max_num_tokens=budget,
         num_tokens_paddings=paddings,
     )
@@ -3110,6 +3120,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
     K = runner.speculative_config.num_speculative_tokens
     block = runner.drafter.block_size
     pads = runner.num_tokens_paddings
+    max_seqs = runner.scheduler_config.max_num_seqs
     max_reqs = runner.max_num_reqs
 
     def tok_bucket(n: int) -> int:
@@ -3125,7 +3136,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
                 tok_bucket(R * block),
             )
         )
-    if mixed and max_reqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
+    if mixed and max_seqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
         keys.add(
             (
                 "mixed",
@@ -3138,15 +3149,20 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
 
 
 FLASH = dict(
-    K=5, block=5, max_reqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
+    K=5, block=5, max_seqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
 )
-AGENTX = dict(K=5, block=5, max_reqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
+AGENTX = dict(K=5, block=5, max_seqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
 # 8 decoders x 6 rows = 48 > a 32-token budget: counts above 5 have no step.
-TIGHT = dict(K=5, block=5, max_reqs=8, budget=32, paddings=[16, 32])
+TIGHT = dict(K=5, block=5, max_seqs=8, budget=32, paddings=[16, 32])
+# The nightly DSpark bs4 engine: max_num_seqs sits below MIN_NUM_SEQS, so the
+# runner's padded request bound (8) is above any count a step can hold.
+DSPARK_BS4 = dict(K=7, block=7, max_seqs=4, budget=256, paddings=[16, 32, 64, 128, 256])
 
 
 @pytest.mark.parametrize(
-    "cfg", [FLASH, AGENTX, TIGHT], ids=["flash", "agentx", "tight"]
+    "cfg",
+    [FLASH, AGENTX, TIGHT, DSPARK_BS4],
+    ids=["flash", "agentx", "tight", "dspark-bs4"],
 )
 @pytest.mark.parametrize("mixed", [False, True])
 def test_grid_covers_every_bucket_combination_once(cfg, mixed):
@@ -3154,11 +3170,11 @@ def test_grid_covers_every_bucket_combination_once(cfg, mixed):
     grid = TPUModelRunner._spec_warmup_bucket_grid(runner, mixed=mixed)
 
     assert grid == sorted(set(grid))
-    assert all(1 <= R <= cfg["max_reqs"] for R in grid)
+    assert all(1 <= R <= cfg["max_seqs"] for R in grid)
     # Every bucket combination a serving step can take is warmed ...
     covered = set().union(*(_step_keys(runner, R, mixed) for R in grid))
     needed = set().union(
-        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_reqs"] + 1))
+        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_seqs"] + 1))
     )
     assert covered == needed
     # ... by one count each: every grid entry brings a bucket no earlier one had.
@@ -3167,6 +3183,82 @@ def test_grid_covers_every_bucket_combination_once(cfg, mixed):
         keys = _step_keys(runner, R, mixed)
         assert keys - seen, f"count {R} adds no new bucket"
         seen |= keys
+
+
+@pytest.mark.parametrize("R", [1, 2, 3])
+def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
+    # The input batch holds max_num_seqs requests, below the runner's padded
+    # max_num_reqs here. The mixed steps add one, then two, prefill requests
+    # beside the R decoders; a step past max_num_seqs fails add_request.
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    live: set[str] = set()
+    sizes: list[int] = []
+
+    def execute_model(so):
+        live.difference_update(so.finished_req_ids)
+        live.update(r.req_id for r in so.scheduled_new_reqs)
+        sizes.append(len(live))
+
+    runner = SimpleNamespace(
+        max_model_len=256,
+        max_num_tokens=256,
+        max_num_reqs=tpu_runner.MIN_NUM_SEQS,
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+        ),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=_warmup_requests(),
+    )
+
+    TPUModelRunner._warmup_spec_batch(runner, R, 16, short=True, mixed=True)
+
+    # Each mixed variant that fits ran: the peak is R decoders plus two
+    # prefills, capped at max_num_seqs, so a swallowed failure shows here too.
+    assert max(sizes) == min(R + 2, 4)
+
+
+def test_spec_warmup_keeps_optimistic_output_placeholders():
+    captured = []
+    requests = _warmup_requests()
+    # epic/dsv41 sizes non-ring groups by block_size: one block per request.
+    spec = SimpleNamespace(
+        block_size=256, max_num_blocks_per_req=lambda _config, _max_pos: 1
+    )
+
+    def execute_model(so):
+        if so.scheduled_cached_reqs.req_ids:
+            captured.append(list(so.scheduled_cached_reqs.num_output_tokens))
+        rid = "__spec_warmup_0__"
+        requests[rid].output_token_ids.extend([0] * 8)
+
+    runner = SimpleNamespace(
+        max_model_len=256,
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        # epic/dsv41's warmup also reserves the drafter's lookahead pages.
+        vllm_config=SimpleNamespace(num_lookahead_tokens=0),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+        requests=requests,
+    )
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 1, idx=0)
+
+    assert captured == [[8 * (t + 1)] for t in range(9)]
 
 
 @pytest.mark.parametrize("verify", [False, True])
