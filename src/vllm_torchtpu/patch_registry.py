@@ -136,6 +136,11 @@ PATCHES = (
         _ENGINE,
         refresh="vllm_torchtpu:_patch_vllm_merge_multimodal_embeddings",
     ),
+    # No-op unless TPU_COMPACT_NEW_REQ_TOKENS.
+    Patch(
+        "vllm_torchtpu.core.compact_prompt_tokens:install_compact_prompt_tokens",
+        _ENGINE,
+    ),
     Patch("vllm_torchtpu.layers.adapter.vision_attention", _ACTIVE),
     # Out-of-tree FP32 rotary embedding (CUDA numerics). Must be registered
     # before any RotaryEmbedding is constructed at model load.
