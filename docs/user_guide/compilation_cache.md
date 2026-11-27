@@ -19,6 +19,23 @@ export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="/path/to/persistent_cache"
     - **Scope**: Stores PyTorch Dynamo FX graph bytecode, Guard expressions, AOTAutograd tracing artifacts (`torch_compile_cache/torch_aot_compile`), and `TpuCompilerAdaptor` metadata pickle handles (`artifact_compile_range_*`).
     - **Note**: `VLLM_CACHE_ROOT` manages Python framework artifacts and is completely independent of the C++ PJRT compiled binary executables managed by `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`.
 
+## Compiled helper functions and the `tpu_compile` section
+
+Besides the model forward, the runner calls many small compiled programs every step: logits selection, sampling, rejection sampling, the MTP drafter's helpers, state copies. Each is a plain function compiled with `tpu_compile` (`src/vllm_torchtpu/compilation/decorators.py`), which calls `torch.compile(fn, backend="tpu", fullgraph=True, dynamic=False)` and wraps the result. The `tpu_compile` section of `--additional-config` changes how those functions are called:
+
+| Option | Default | Effect when `true` |
+|---|---|---|
+| `fast_compiled_call` | `false` | Once a function has a compiled entry, each call checks the entries' Dynamo guards against its arguments and calls the matching entry's code directly, skipping Dynamo's per-call frame evaluation. A call that no entry accepts goes through Dynamo, which compiles a new entry if needed. The compiled programs and their guards are the same as with the option off. |
+
+```bash
+vllm serve <model> --additional-config '{"tpu_compile": {"fast_compiled_call": true}}'
+```
+
+- **When it applies**: each TPU worker arms the option when it is built, before any compiled function runs. `TpuPlatform.check_and_update_config` refuses a malformed section (an unknown key, or a value that is not a JSON boolean) at startup.
+- **Compile-cache key**: the section is part of `VllmConfig.compute_hash()`, which keys vLLM's AOT compile cache and piecewise cache directory under `VLLM_CACHE_ROOT`; only the diagnostics keys in `runner.utils.HASH_IGNORED_ADDITIONAL_CONFIG_KEYS` are left out. A start with the option set the other way does not reuse those artifacts.
+- **Calls that still go through Dynamo**: every call of a function whose signature takes `*args` or `**kwargs`, and any call under a non-default `torch.compiler.set_stance`, inside another compiled function, or with `TORCHDYNAMO_DISABLE=1`.
+- **Logs**: with the option on, each worker logs `tpu_compile: fast_compiled_call=True` at startup, `fast_compiled_call: first direct dispatch of <function>` once per function, and `fast_compiled_call: fast=<n> slow=<n>` (direct calls and calls through Dynamo, over the whole process) every 20,000 calls.
+
 ## Compilation Debugging & Telemetry
 
 ### `VLLM_XLA_CHECK_RECOMPILATION` (Runtime Recompilation Detector)

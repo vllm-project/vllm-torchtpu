@@ -191,6 +191,21 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   module strings. Backend names describe functionality (mla/mha), not
   implementation tech.
 
+- **R-3.6** **Compile a plain TPU function with `tpu_compile`.** A new
+  compiled helper, that is, a plain function or method compiled with
+  `torch.compile(backend="tpu", fullgraph=True, dynamic=False)`, uses
+  `@tpu_compile` (or `tpu_compile(fn)`) from `compilation/decorators.py`.
+  It passes exactly those arguments and lets the `tpu_compile` options of
+  `--additional-config` act on the function
+  ([Compilation cache](../user_guide/compilation_cache.md)). Exceptions:
+  `kernels/` (R-2.1 keeps it free of `compilation/`), a compile of a bound
+  method or module (the decorator takes plain functions), and a call that
+  needs more arguments, such as backend `options=`; name such a call in
+  `NAMED_EXCEPTIONS` of `tests/compilation/test_tpu_compile_sites.py`, with
+  the reason. A function whose signature takes `*args` or `**kwargs` is never
+  dispatched directly; list it in that test's `THROUGH_DYNAMO`. The test
+  fails on any other `torch.compile` call that passes those three arguments.
+
 ## 4. Derive, don't declare
 
 - **R-4.1** **No string-based or attribute-probing dispatch.** No model-name
