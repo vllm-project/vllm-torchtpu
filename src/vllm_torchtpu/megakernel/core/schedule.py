@@ -353,27 +353,35 @@ class Schedule:
                     f"for num_layers={num_layers} (0..{num_layers - 1})"
                 )
 
+    def resolve_slot(
+        self,
+        slot_name: str,
+        hf_config: Any,
+        num_layers: int,
+        *,
+        allow_none: bool = False,
+    ) -> list[ModuleOrBinding | None]:
+        """Resolve one schedule slot across `num_layers` layers with `overrides`."""
+        seq = _resolve_slot_spec(
+            getattr(self, slot_name),
+            hf_config,
+            num_layers,
+            slot_name,
+            allow_none=allow_none,
+        )
+        for lyr, ov in self.overrides.items():
+            if 0 <= lyr < num_layers and slot_name in ov:
+                seq[lyr] = ov[slot_name]
+        return seq
+
     def resolve(self, hf_config: Any, num_layers: int) -> ResolvedSchedule:
         """Resolve per-layer bindings for `num_layers` layers against `hf_config`."""
         self.validate_bounds(num_layers)
-        mix_l = _resolve_slot_spec(self.mixer, hf_config, num_layers, "mixer")
-        ffn_l = _resolve_slot_spec(self.ffn, hf_config, num_layers, "ffn")
-        pre_l = _resolve_slot_spec(
-            self.pre_norm, hf_config, num_layers, "pre_norm", allow_none=True
-        )
-        post_l = _resolve_slot_spec(
-            self.post_norm, hf_config, num_layers, "post_norm", allow_none=True
-        )
+        mix_l = self.resolve_slot("mixer", hf_config, num_layers)
+        ffn_l = self.resolve_slot("ffn", hf_config, num_layers)
+        pre_l = self.resolve_slot("pre_norm", hf_config, num_layers, allow_none=True)
+        post_l = self.resolve_slot("post_norm", hf_config, num_layers, allow_none=True)
         decl_p: int | None = self.mixer.n if isinstance(self.mixer, Every) else None
-        for lyr, ov in self.overrides.items():
-            if "mixer" in ov:
-                mix_l[lyr] = ov["mixer"]
-            if "ffn" in ov:
-                ffn_l[lyr] = ov["ffn"]
-            if "pre_norm" in ov:
-                pre_l[lyr] = ov["pre_norm"]
-            if "post_norm" in ov:
-                post_l[lyr] = ov["post_norm"]
         mix_t = tuple(m for m in mix_l if m is not None)
         ffn_t = tuple(m for m in ffn_l if m is not None)
         att_every, b_idx = _derive_att_every_and_branch_indices(
