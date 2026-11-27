@@ -24,6 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = 448.0
 LANES = 128
+ROWS = 16
 # The MXU's output width on v7x: projections split into chunks of it
 # reproduce the whole window's dot bit for bit; other widths do not, and run
 # slower.
@@ -126,11 +127,16 @@ def _kernel(
 
     chunk = MXU_COLUMNS if window % MXU_COLUMNS == 0 else window
 
+    chunks = window // chunk
+    blocks = token_tile // ROWS
+
     def interleaved(vpu, n):
-        """Unit n's vector work and unit n + 1's projection, chunk by chunk."""
-        for c0 in range(0, window, chunk):
-            vpu(n, range(c0, c0 + chunk, LANES))
-            project(n + 1, slice(c0, c0 + chunk))
+        """Unit n's vector work, row blocks in turn, between the column
+        chunks of unit n + 1's projection."""
+        for c in range(chunks):
+            lo, hi = c * blocks // chunks, (c + 1) * blocks // chunks
+            vpu(n, range(lo * ROWS, hi * ROWS, ROWS))
+            project(n + 1, slice(c * chunk, (c + 1) * chunk))
 
     def projected(m):
         """After unit m's projection: its window's last frees a weight slot."""
@@ -186,32 +192,39 @@ def _kernel(
     key_units = key_windows * tiles
     units = windows * tiles
 
-    def key_vpu(n, lanes, s):
-        c, rows = n // tiles - s * per_head, at(n % tiles * token_tile, token_tile)
+    def key_vpu(n, starts, s):
+        c, row0 = n // tiles - s * per_head, n % tiles * token_tile
         cols = at(c * window, window)
         qw = q_weight[s : s + 1, cols].astype(jnp.float32)
         kw = k_weight[s : s + 1, cols].astype(jnp.float32)
-        # One 128-lane group at a time keeps the FP32 temporaries in
-        # registers instead of spilling [tile, window] arrays.
-        for lane in lanes:
-            part = slice(lane, lane + LANES)
-            h = hb[heads + n % 2, :, part].astype(jnp.float32)
-            kp = pb[n % 2, :, part].astype(jnp.float32)
-            dot_sum[rows, :] += ((h * qw[:, part]) * kw[:, part]) * kp
-            h_sum[rows, :] += h * h
-            k_sum[rows, :] += kp * kp
-
-    def value_vpu(n, lanes):
-        g = n - key_units
-        rows = at(g % tiles * token_tile, token_tile)
-        for s in range(heads):
-            slot = v_slot(g, s)
-            gs = gate[s, rows, :]
-            for lane in lanes:
+        # A row block's three lane-partial sums stay in registers across
+        # the window's lane groups: the same additions in the same order as
+        # accumulating in VMEM group by group, a tenth of the traffic.
+        for r in starts:
+            rows = pl.ds(pl.multiple_of(row0 + r, ROWS), ROWS)
+            d, hs, ks = dot_sum[rows, :], h_sum[rows, :], k_sum[rows, :]
+            for lane in range(0, window, LANES):
                 part = slice(lane, lane + LANES)
-                h = hb[slot, :, part].astype(jnp.float32)
-                v = pb[n % 2, :, part].astype(jnp.float32)
-                hb[slot, :, part] = (h + gs * v).astype(hb.dtype)
+                h = hb[heads + n % 2, r : r + ROWS, part].astype(jnp.float32)
+                kp = pb[n % 2, r : r + ROWS, part].astype(jnp.float32)
+                d = d + ((h * qw[:, part]) * kw[:, part]) * kp
+                hs = hs + h * h
+                ks = ks + kp * kp
+            dot_sum[rows, :], h_sum[rows, :], k_sum[rows, :] = d, hs, ks
+
+    def value_vpu(n, starts):
+        g = n - key_units
+        row0 = g % tiles * token_tile
+        for r in starts:
+            rows = pl.ds(pl.multiple_of(row0 + r, ROWS), ROWS)
+            gs = [gate[s, rows, :] for s in range(heads)]
+            for lane in range(0, window, LANES):
+                part = slice(lane, lane + LANES)
+                v = pb[n % 2, r : r + ROWS, part].astype(jnp.float32)
+                for s in range(heads):
+                    slot = v_slot(g, s)
+                    h = hb[slot, r : r + ROWS, part].astype(jnp.float32)
+                    hb[slot, r : r + ROWS, part] = (h + gs[s] * v).astype(hb.dtype)
 
     def prefetch(n):
         """DMA starts and waits before unit n is consumed and n + 1 projected."""
@@ -292,7 +305,7 @@ def _kernel(
         store(n)
 
     consume_waits(units - 1, False)
-    value_vpu(units - 1, range(0, window, LANES))
+    value_vpu(units - 1, range(0, token_tile, ROWS))
     store(units - 1)
     groups = per_head * tiles
     for g in range(max(0, groups - 2), groups):
