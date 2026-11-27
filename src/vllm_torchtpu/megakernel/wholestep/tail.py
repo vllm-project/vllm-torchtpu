@@ -191,7 +191,8 @@ def mesh_greedy_tokens(mesh: Any) -> Any:
     from jax.sharding import PartitionSpec as P
 
     def per_rank(top):
-        t = jax.lax.all_gather(top, "tp")  # [R, M, 128]
+        # Only lanes 0-1 (max, index) cross the ranks: 1/64 of the pair rows' bytes.
+        t = jax.lax.all_gather(top[:, :2], "tp")  # [R, M, 2]
         best = jnp.argmax(t[:, :, 0], axis=0)
         return jnp.take_along_axis(t[:, :, 1], best[None], axis=0)[0].astype(I32)
 
