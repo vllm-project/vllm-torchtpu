@@ -130,7 +130,7 @@ def test_hp_balance_same_bits(dcp, nreq):
     assert r.returncode == 0 and "OK" in r.stdout, r.stdout[-2000:] + r.stderr[-4000:]
 
 
-def test_tile_costs_count_distinct_slots():
+def test_tile_costs_count_fresh_slots():
     import jax.numpy as jnp
 
     from vllm_torchtpu.models.minimax_m3.kernels import msa_dcp_heads as H
@@ -140,8 +140,11 @@ def test_tile_costs_count_distinct_slots():
     keys[8:16] = -1  # an empty tile
     got = np.asarray(H.tile_costs(jnp.asarray(keys), 8, 4.0))
     want = []
-    for t in keys.reshape(8, 32):
-        n = len(np.unique(t[t >= 0]))
+    for t in keys.reshape(8, 8, 4):
+        n, prev = 0, set()
+        for row in t:
+            n += sum(1 for x in row if x >= 0 and x not in prev)
+            prev = set(row.tolist())
         want.append(n + 4.0 if n else 0.0)
     np.testing.assert_array_equal(got, np.array(want, np.float32))
 
