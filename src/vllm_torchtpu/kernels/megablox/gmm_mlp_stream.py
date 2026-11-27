@@ -114,6 +114,7 @@ def gathers(num_tokens: int, topk: int, w1: jax.Array) -> bool:
     return (
         num_tokens % sub == 0
         and topk > 0
+        and k % _SELECT_COLS == 0
         and _vmem_bytes(two_i // 2, k, sub, num_tokens) <= info.vmem_capacity_bytes
     )
 
@@ -205,9 +206,7 @@ def _kernel(
 
         return off + n, lax.fori_loop(0, npass, one, npairs)
 
-    rows_total, npairs = lax.fori_loop(
-        0, groups, plan, (jnp.int32(0), jnp.int32(0))
-    )
+    rows_total, npairs = lax.fori_loop(0, groups, plan, (jnp.int32(0), jnp.int32(0)))
     units = npairs * 3
     st[0] = -1
     st[1] = 0
@@ -390,7 +389,13 @@ def _kernel(
             odd = x_buf[w, 1, pl.ds(0, h2), c]
             lo = lax.shift_right_logical(even, jnp.broadcast_to(shifts[0], even.shape))
             hi = lax.shift_right_logical(odd, jnp.broadcast_to(shifts[1], odd.shape))
-            x_buf[w, 0, pl.ds(0, h2), c] = (lo & 0xFFFF) | lax.shift_left(hi, 16)
+            words = (lo & 0xFFFF) | lax.shift_left(hi, 16)
+            # Zero a non-finite value (all-ones exponent) as the one-hot
+            # permute does: the combine's one-hot matmul would carry it from
+            # its routed row to every token (0 * NaN).
+            for exponent, value in ((0x7F80, 0xFFFF), (0x7F800000, -0x10000)):
+                words = jnp.where((words & exponent) == exponent, words & ~value, words)
+            x_buf[w, 0, pl.ds(0, h2), c] = words
 
     def bucketed(rows, fn):
         """fn(bm) on the smallest row bucket bm >= rows."""
@@ -532,8 +537,8 @@ def gmm_mlp_stream(
     With ``revert`` (fused_moe_gmm's ``argsort_revert_indices``: route k of
     token t is routed row ``revert[t * topk + k]``), ``lhs`` holds the [T, K]
     tokens and routed row r is the row of the token whose route maps to r
-    (M = T * topk), gathered in the kernel: bit-identical to permuting first.
-    A non-finite token reaches only its own routed rows."""
+    (M = T * topk), gathered in the kernel with non-finite values zeroed, as
+    bounded_onehot_permute gives them."""
     g, k, two_i = w1.shape
     i = two_i // 2
     gather = revert is not None

@@ -106,6 +106,7 @@ if TYPE_CHECKING:
     TPU_MOE_DUAL_LAYOUT_MAX_TOKENS: int = 0
     TPU_GMM_FP8_W8A8: bool = False
     TPU_MOE_DECODE_MLP_STREAM: bool = True
+    TPU_MOE_DECODE_STREAM_GATHER: bool = True
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
@@ -967,6 +968,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # selector: 0 restores gmm_v2_mlp bit for bit, including its bf16 rounding
     # of groups past 48 rows; drop it once the stream is the only decode path.
     "TPU_MOE_DECODE_MLP_STREAM": env_bool("TPU_MOE_DECODE_MLP_STREAM", default=True),
+    # One-hot EP decode steps the stream serves gather their routed rows from
+    # the tokens in the kernel (gmm_mlp_stream's revert) instead of after a
+    # separate one-hot permute.
+    "TPU_MOE_DECODE_STREAM_GATHER": env_bool(
+        "TPU_MOE_DECODE_STREAM_GATHER", default=True
+    ),
     # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
     # fused MoE decode kernel: routed experts, shared expert and all-reduce in
     # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after

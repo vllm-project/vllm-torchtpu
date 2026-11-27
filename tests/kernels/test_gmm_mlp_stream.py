@@ -141,6 +141,8 @@ def test_gather_matches_permute_first(num_tokens, topk):
     itself: bit-identical to permuting the rows first."""
     _require_tpu()
     tokens, w1, s1, w2, s2 = _operands(num_tokens)
+    # Non-finite values are zeroed as the one-hot permute zeroes them.
+    tokens = tokens.at[3, 5].set(jnp.nan).at[4, 7].set(-jnp.inf).at[5, 9].set(jnp.inf)
     rng = np.random.default_rng(num_tokens)
     experts = np.stack(
         [rng.choice(4 * _GROUPS, topk, replace=False) for _ in range(num_tokens)]
@@ -151,7 +153,7 @@ def test_gather_matches_permute_first(num_tokens, topk):
     revert[order] = np.arange(order.size)
     group_sizes = jnp.asarray(np.bincount(keys, minlength=_GROUPS + 1)[:_GROUPS])
     rows = int(group_sizes.sum())
-    permuted = tokens[order // topk]
+    permuted = jnp.where(jnp.isfinite(tokens), tokens, 0)[order // topk]
     expected = gmm_mlp_stream(
         permuted, w1, w2, group_sizes, s1, s2, fuse_act="swigluoai"
     )

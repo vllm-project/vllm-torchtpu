@@ -600,6 +600,7 @@ def prepare_routed_gmm_inputs(
             # (letting XLA DCE its scatter unless owner-output combine uses it).
             # The bounded kernel runs only the valid local prefix of slots.
             if gathers_rows:
+                # gmm_mlp_stream gathers (and zeroes non-finite values) itself.
                 x = hidden_states_local
             elif bucket_counts is not None and _use_bounded_onehot(
                 num_tokens_local, argsort_revert_indices.size, hidden_states_local
@@ -1373,8 +1374,9 @@ def fused_moe_func(
         # The one-hot permute and unpermute are matmuls across all tokens, and
         # 0 * NaN == NaN: one token with a non-finite hidden state or routing
         # weight would turn every token's output into NaN. Zero those values
-        # so the damage stays with that token (the permute zeroes the hidden
-        # states, see prepare_routed_gmm_inputs).
+        # so the damage stays with that token (the permute, or gmm_mlp_stream
+        # where it gathers the rows, zeroes the hidden states, see
+        # prepare_routed_gmm_inputs).
         topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
 
     if use_ep and experts_start is not None:
@@ -1449,7 +1451,8 @@ def fused_moe_func(
     # One-hot EP steps whose routed rows gmm_mlp_stream takes: it gathers them
     # from the tokens, so no permuted copy round-trips HBM.
     gathers_rows = (
-        use_ep
+        envs.TPU_MOE_DECODE_STREAM_GATHER
+        and use_ep
         and use_sparse_core
         and not ragged_permute
         and padded_hidden_size == hidden_size
