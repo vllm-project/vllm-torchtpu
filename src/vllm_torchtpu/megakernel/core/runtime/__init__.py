@@ -19,7 +19,14 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # eager imports for type checkers and IDEs
-    from . import constants, contract, eligibility, policy, stats
+    from . import (
+        constants,
+        contract,
+        eligibility,
+        layout_facts,
+        policy,
+        stats,
+    )
     from .constants import (
         DEFAULT_BUCKETS,
         DEFAULT_VERIFY_BUCKETS,
@@ -52,6 +59,11 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
         check_startup_eligibility,
         check_step_eligibility,
     )
+    from .layout_facts import (
+        PoolLayoutFacts,
+        compare_layout_facts,
+        facts_from_pool_layout,
+    )
     from .policy import (
         BucketPolicy,
         parse_mk_buckets,
@@ -70,15 +82,17 @@ if TYPE_CHECKING:  # eager imports for type checkers and IDEs
 # Public names resolve on first access (PEP 562): importing a submodule
 # (e.g. `runtime.contract`) doesn't import jax through this package. The
 # framework-free part is `constants`, `contract`, and `policy` (stdlib) and
-# `stats` (numpy); `eligibility` imports jax through the chip table and loads on
-# first access.
+# `stats` (numpy); `eligibility` imports jax through the chip table and
+# `layout_facts` imports jax (dtype names) and the pool layout, so both load on
+# first access, and the rest is policy- / kernel-bound.
 _SUBMODULES = frozenset(
     {
         "constants",
         "contract",
-        "stats",
         "eligibility",
+        "layout_facts",
         "policy",
+        "stats",
     }
 )
 _LAZY: dict[str, str] = {
@@ -114,6 +128,9 @@ _LAZY: dict[str, str] = {
     "check_post_mesh_eligibility": ".eligibility",
     "check_startup_eligibility": ".eligibility",
     "check_step_eligibility": ".eligibility",
+    "PoolLayoutFacts": ".layout_facts",
+    "compare_layout_facts": ".layout_facts",
+    "facts_from_pool_layout": ".layout_facts",
     "BucketPolicy": ".policy",
     "parse_mk_buckets": ".policy",
     "parse_mk_verify_buckets": ".policy",
@@ -121,42 +138,46 @@ _LAZY: dict[str, str] = {
 }
 
 __all__ = [
-    "DEFAULT_BUCKETS",
-    "DEFAULT_VERIFY_BUCKETS",
-    "DOMAIN_TP",
-    "FALSE_STRS",
-    "MAX_BUCKET_ROWS",
-    "MIN_VERIFY_TOKENS",
-    "MTP_SPECULATIVE_TOKENS",
-    "MTP_VERIFY_TOKENS",
-    "PARALLELISM_UNSUPPORTED",
-    "REQUIRES_KEYS",
-    "REQUIRES_UNMET",
-    "STARTUP_FLAG_RULES",
-    "UNSUPPORTED_TPU_CHIP",
-    "UNSUPPORTED_TP_SIZE",
     "BatchShape",
     "Bucket",
     "BucketPolicy",
+    "DEFAULT_BUCKETS",
+    "DEFAULT_VERIFY_BUCKETS",
+    "DOMAIN_TP",
     "Decline",
     "EligibilityResult",
+    "FALSE_STRS",
     "LayoutDecline",
+    "MAX_BUCKET_ROWS",
+    "MIN_VERIFY_TOKENS",
     "MKABCalibrator",
+    "MTP_SPECULATIVE_TOKENS",
+    "MTP_VERIFY_TOKENS",
     "MonoProgram",
+    "PARALLELISM_UNSUPPORTED",
+    "PoolLayoutFacts",
+    "REQUIRES_KEYS",
+    "REQUIRES_UNMET",
     "RunnerShape",
+    "STARTUP_FLAG_RULES",
     "StepDecision",
     "StepMixTracker",
     "TpuMonoSpec",
+    "UNSUPPORTED_TPU_CHIP",
+    "UNSUPPORTED_TP_SIZE",
     "WarmupCase",
     "check_mrope_uniform",
     "check_post_mesh_eligibility",
     "check_query_start_loc_uniform",
     "check_startup_eligibility",
     "check_step_eligibility",
+    "compare_layout_facts",
     "constants",
     "contract",
     "eligibility",
+    "facts_from_pool_layout",
     "inspect_batch_shape",
+    "layout_facts",
     "parse_mk_buckets",
     "parse_mk_verify_buckets",
     "policy",
