@@ -19,6 +19,7 @@ must schedule exactly as main's scheduler does, under each setting of main's
 lone-prompt and equal-cost chunking; each option turns on one lever.
 """
 
+import inspect
 import itertools
 import json
 import math
@@ -40,6 +41,10 @@ from vllm_torchtpu.core import (
 )
 from vllm_torchtpu.core.pp_chunk_scheduler import TpuPipelineChunkScheduler
 from vllm_torchtpu.core.pp_chunks import StepCostModel, step_limit
+from vllm_torchtpu.core.prefix_aware_scheduler import (
+    PrefixAwareAdmission,
+    PrefixAwareScheduler,
+)
 from vllm_torchtpu.models import qwen3_5
 from vllm_torchtpu.runner.utils import HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
 
@@ -719,6 +724,43 @@ def test_the_prefill_legs_are_kv_producers_not_consumers():
 
 
 # -- the prefix-aware admission's promotion, free-block count and estimate -----
+
+
+_SHARED_ADMISSION = (
+    "_enable_memo_xstep",
+    "_memo_trim_log",
+    "_memo_still_exact",
+    "_memo_get",
+    "_memo_compute",
+    "_get_block_size",
+    "_get_prefix_cache_epoch",
+    "_prefix_warmth",
+    "_select_waiting_queue_for_scheduling",
+    "_promote_warmest",
+    "_maybe_pack_prompt_ids",
+)
+
+
+def test_both_schedulers_inherit_one_prefix_aware_admission():
+    """The memo, warmth, promotion and packing code exists once, in
+    PrefixAwareAdmission, which both schedulers inherit (no copies, no
+    attributes taken from PrefixAwareScheduler); each ranks its own window,
+    and PrefixAwareScheduler keeps nothing only the pipeline scheduler
+    reads."""
+    for cls in (TpuPipelineChunkScheduler, PrefixAwareScheduler):
+        assert issubclass(cls, PrefixAwareAdmission)
+        for name in _SHARED_ADMISSION:
+            assert name not in vars(cls), (cls.__name__, name)
+            assert getattr(cls, name) is vars(PrefixAwareAdmission)[name]
+        assert "_rank_window" in vars(cls)
+    for name in ("_now", "_free_blocks_for_fit"):
+        assert not hasattr(PrefixAwareScheduler, name)
+    assert list(
+        inspect.signature(PrefixAwareScheduler._rank_and_warmth).parameters
+    ) == [
+        "self",
+        "request",
+    ]
 
 
 def _promote(head, other, warmth, free_blocks, step_time, aging=3_000.0):

@@ -49,7 +49,7 @@ class PPSchedulerOptions:
     validation entries' prefill legs run (they also set it)."""
 
     prefix_aware: bool = False
-    """Borrow ``PrefixAwareScheduler``'s admission on a pipeline: the
+    """Run ``PrefixAwareScheduler``'s admission on a pipeline: the
     waiting-queue sort (on a KV producer), shortest-remaining-prefill-first
     order of running prefills, warmest-first promotion (unless
     ``tpu_scheduler.promote_warmest`` is false), the cross-step prefix-hit

@@ -41,9 +41,10 @@ keeps the GDN state snapshots a later turn hits on
 applied to a chunk after the step's limits have clipped it. Other hybrid
 models keep no snapshots.
 
-The quadratic attention cost and the prefix-aware admission it borrows from
-``PrefixAwareScheduler`` are options (``core/pp_scheduler_options.py``), each
-off by default, so a pipeline that sets none of them is scheduled as before.
+The quadratic attention cost and the prefix-aware admission it shares with
+``PrefixAwareScheduler`` (``PrefixAwareAdmission``) are options
+(``core/pp_scheduler_options.py``), each off by default, so a pipeline that
+sets none of them is scheduled as before.
 """
 
 import math
@@ -52,7 +53,6 @@ from itertools import islice
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
-from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.core import pp_scheduler_options, scheduler_options
@@ -64,7 +64,7 @@ from vllm_torchtpu.core.pp_chunks import StepCostModel, chunk_pairs, step_limit
 from vllm_torchtpu.core.prefix_aware_scheduler import (
     _TIER_NORMAL,
     _TIER_PREEMPTED,
-    PrefixAwareScheduler,
+    PrefixAwareAdmission,
     _is_decoding,
     memo_local_prefix_cache_hit,
     trim_resend_token_ids,
@@ -157,27 +157,10 @@ def _prefill_end(request: Any) -> int:
     return max(request.num_prompt_tokens, request.num_tokens - 1)
 
 
-class TpuPipelineChunkScheduler(Scheduler):
-    # The prefix-aware admission (option prefix_aware) borrows these from
-    # PrefixAwareScheduler; none of them calls super().
-    # The ones this class calls are typed Any: their self parameter is a
-    # PrefixAwareScheduler, which this class is not.
-    _MEMO_LOG_CAP = PrefixAwareScheduler._MEMO_LOG_CAP
-    _MEMO_VERIFY_REUSES = PrefixAwareScheduler._MEMO_VERIFY_REUSES
-    WINDOW = PrefixAwareScheduler.WINDOW
-    _enable_memo_xstep: Any = PrefixAwareScheduler._enable_memo_xstep
-    _memo_trim_log: Any = PrefixAwareScheduler._memo_trim_log
-    _memo_still_exact = PrefixAwareScheduler._memo_still_exact
-    _memo_get: Any = PrefixAwareScheduler._memo_get
-    _memo_compute = PrefixAwareScheduler._memo_compute
-    _get_prefix_cache_epoch: Any = PrefixAwareScheduler._get_prefix_cache_epoch
-    _get_block_size: Any = PrefixAwareScheduler._get_block_size
-    _prefix_warmth: Any = PrefixAwareScheduler._prefix_warmth
-    _select_waiting_queue_for_scheduling: Any = (
-        PrefixAwareScheduler._select_waiting_queue_for_scheduling
-    )
-    _promote_warmest = PrefixAwareScheduler._promote_warmest
-    _maybe_pack_prompt_ids: Any = PrefixAwareScheduler._maybe_pack_prompt_ids
+class TpuPipelineChunkScheduler(PrefixAwareAdmission):
+    # The prefix-aware admission (option prefix_aware) is the one
+    # PrefixAwareScheduler runs (PrefixAwareAdmission); this scheduler ranks
+    # its own promotion window (_rank_window).
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -520,10 +503,25 @@ class TpuPipelineChunkScheduler(Scheduler):
             0,
         )
 
+    def _rank_window(
+        self, window: list[Any]
+    ) -> list[tuple[tuple[int, float, float], int]]:
+        """The promotion's ranking: every request aged to the step time, and
+        the rest of the window ranked against the free blocks when the head
+        does not fit them (``_free_blocks_for_fit``)."""
+        now = self._now()
+        head = window[0]
+        head_scored = self._rank_and_warmth(head, now=now)
+        free_blocks_for_fit = self._free_blocks_for_fit(head)
+        return [head_scored] + [
+            self._rank_and_warmth(r, free_blocks_for_fit=free_blocks_for_fit, now=now)
+            for r in window[1:]
+        ]
+
     def _free_blocks_for_fit(self, head: Any) -> int | None:
         """The free HBM blocks when the uncached tokens of ``head`` (the
         queue's head) do not fit them, else None: the input of the fit tier
-        of ``_rank_and_warmth``, for the borrowed ``_promote_warmest``."""
+        of ``_rank_and_warmth`` in the promotion (``_rank_window``)."""
         if self._is_kv_consumer:
             return None
         head_local_warmth = self._prefix_warmth(head)

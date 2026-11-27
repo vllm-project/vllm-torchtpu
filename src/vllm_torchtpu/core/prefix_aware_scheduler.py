@@ -60,6 +60,7 @@ from vllm.v1.core.sched.request_queue import (
     RequestQueue,
     SchedulingPolicy,
 )
+from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu.core import prefix_change_log, scheduler_options
@@ -185,11 +186,260 @@ def memo_local_prefix_cache_hit(
     return None
 
 
-class PrefixAwareScheduler(AsyncScheduler):
-    """Admit ready requests prioritizing fewest uncached prompt tokens."""
+class PrefixAwareAdmission(Scheduler):
+    """The prefix-aware admission PrefixAwareScheduler and the pipeline chunk
+    scheduler's ``prefix_aware`` option share: the cross-step memo of
+    ``find_longest_cache_hit``, a waiting request's prefix warmth, the
+    warmest-first promotion of the waiting queues and packed prompt ids.
+
+    Each scheduler inherits it and ranks its own promotion window
+    (``_rank_window``); it is not a scheduler of its own. Its methods call
+    no ``super()``. The inheriting scheduler's ``__init__`` sets
+    ``_paw_scoring_broken`` and the promotion counters (``_paw_n``,
+    ``_paw_cold_tokens``, ``_paw_prompt_tokens``), and turns the memo on
+    with ``_enable_memo_xstep`` (``_memo_xstep``).
+    """
 
     #: Lookahead window of ready requests to evaluate for cached prefix length.
     WINDOW = 64
+
+    _paw_scoring_broken: bool
+    _paw_n: int
+    _paw_cold_tokens: int
+    _paw_prompt_tokens: int
+    _memo_xstep: bool
+
+    # ------------------------------------------------------------------
+    # Cross-step memo of find_longest_cache_hit.
+    #
+    # Within one prefix-cache epoch a memoised result is reused as is. Any
+    # prefix-cache mutation (a hash insert, an eviction, a step start with
+    # unwritten blocks) moves the epoch, which happens on almost every step,
+    # so reuse across epochs needs the change log.
+    #
+    # find_longest_cache_hit(hashes, max_len) is a deterministic function of
+    # the answers BlockPool.get_cached_block(h, groups) gives for the hashes it
+    # probes. With the memo on, core/prefix_change_log.py records the probed
+    # hashes during the computation and logs every hash whose answer can
+    # change (insert, removal, unwritten-flag flip, reset) on top of the
+    # same-step patch. A memo is reused iff none of its probed hashes was
+    # logged after its epoch, so the reused result equals a fresh lookup
+    # exactly. The first _MEMO_VERIFY_REUSES cross-step reuses are re-checked
+    # against a fresh lookup; any mismatch disables the cross-step memo.
+    # ------------------------------------------------------------------
+    _MEMO_LOG_CAP = 65536
+    _MEMO_VERIFY_REUSES = 64
+
+    def _enable_memo_xstep(self) -> None:
+        """Memoises lookups on this scheduler's block pool: starts its
+        prefix-cache epoch (the same-step memo) and its change log (the
+        cross-step memo), which the patch registry's wrappers keep."""
+        self._memo_hits = 0
+        self._memo_computes = 0
+        self._memo_verified = 0
+        self._memo_verify_left = self._MEMO_VERIFY_REUSES
+        pool = self.kv_cache_manager.block_pool
+        self._memo_xstep = prefix_change_log.enable_epoch(
+            pool
+        ) and prefix_change_log.enable(pool)
+
+    def _memo_trim_log(self) -> None:
+        pool = getattr(self.kv_cache_manager, "block_pool", None)
+        d = getattr(pool, "__dict__", None)
+        log = d.get("_tpu_prefix_change_log") if isinstance(d, dict) else None
+        if isinstance(d, dict) and log is not None and len(log) > self._MEMO_LOG_CAP:
+            cut = len(log) // 2
+            d["_tpu_prefix_change_log_base"] = log[cut - 1][0]
+            del log[:cut]
+
+    def _memo_still_exact(self, cached, epoch: int) -> bool:
+        """True iff no hash probed by ``cached`` changed since its epoch."""
+        if len(cached) < 6 or cached[4] is None:
+            return False
+        d = self.kv_cache_manager.block_pool.__dict__
+        log = d.get("_tpu_prefix_change_log")
+        if log is None:
+            return False
+        e0 = cached[0]
+        if e0 < d.get("_tpu_prefix_change_log_base", 0) or e0 > epoch:
+            return False
+        probes = cached[4]
+        start = bisect_right(log, e0, key=itemgetter(0))
+        return all(log[i][1] not in probes for i in range(start, len(log)))
+
+    def _memo_get(self, request: Request, epoch: int | None, max_len: int):
+        """Return a still-exact memo tuple for ``request`` or None."""
+        if epoch is None:
+            return None
+        cached = getattr(request, "_paw_hit_cache", None)
+        if cached is None or cached[1] != max_len:
+            return None
+        if cached[0] == epoch:
+            return cached
+        if not getattr(self, "_memo_xstep", False):
+            return None
+        if len(cached) < 6 or cached[5] != len(request.block_hashes):
+            return None
+        if not self._memo_still_exact(cached, epoch):
+            return None
+        if self._memo_verify_left > 0:
+            self._memo_verify_left -= 1
+            fresh = self._memo_compute(request, epoch, max_len)
+            if _hit_signature(fresh[2]) != _hit_signature(cached[2]):
+                logger.error(
+                    "PrefixAwareScheduler: cross-step memo mismatch for %s "
+                    "(memo=%s fresh=%s); disabling the cross-step memo.",
+                    getattr(request, "request_id", "?"),
+                    _hit_signature(cached[2])[:2],
+                    _hit_signature(fresh[2])[:2],
+                )
+                self._memo_xstep = False
+                # Nothing trims the change log once the memo is off.
+                prefix_change_log.disable(self.kv_cache_manager.block_pool)
+                return fresh
+            self._memo_verified += 1
+            return fresh
+        cached = (epoch,) + cached[1:]
+        cast(Any, request)._paw_hit_cache = cached
+        self._memo_hits += 1
+        return cached
+
+    def _memo_compute(self, request: Request, epoch: int | None, max_len: int):
+        kvm = self.kv_cache_manager
+        record = epoch is not None and getattr(self, "_memo_xstep", False)
+        probes = None
+        if record:
+            result, probes = prefix_change_log.record_probes(
+                kvm.block_pool,
+                kvm.coordinator.find_longest_cache_hit,
+                request.block_hashes,
+                max_len,
+            )
+            if isinstance(result, tuple) and isinstance(result[0], tuple):
+                result = (tuple(tuple(b) for b in result[0]),) + result[1:]
+        else:
+            result = kvm.coordinator.find_longest_cache_hit(
+                request.block_hashes, max_len
+            )
+        warmth = int(result[1])
+        self._memo_computes = getattr(self, "_memo_computes", 0) + 1
+        cached = (epoch, max_len, result, warmth, probes, len(request.block_hashes))
+        if epoch is not None:
+            cast(Any, request)._paw_hit_cache = cached
+        return cached
+
+    def _get_block_size(self) -> int:
+        """The scheduler's KV cache block size in tokens."""
+        return self.block_size
+
+    def _get_prefix_cache_epoch(self) -> int | None:
+        """Return the prefix-cache mutation epoch of the block pool, or None
+        when the pool does not count mutations (see
+        ``prefix_change_log.enable_epoch``)."""
+        block_pool = getattr(self.kv_cache_manager, "block_pool", None)
+        if block_pool is None:
+            return None
+        d = getattr(block_pool, "__dict__", None)
+        if not isinstance(d, dict):
+            return None
+        # Without the epoch counters the epoch never moves, and a same-epoch
+        # memo would be reused after the cache changed.
+        if not prefix_change_log.epoch_installed():
+            return None
+        return d.get(prefix_change_log.EPOCH)
+
+    def _prefix_warmth(self, request: Request) -> int:
+        """Prompt tokens of ``request`` resident in the KV cache."""
+        kvm = self.kv_cache_manager
+        if not kvm.enable_caching or request.skip_reading_prefix_cache:
+            return 0
+        if request.num_computed_tokens > 0:
+            return request.num_computed_tokens
+        max_len = max(request.num_tokens - 1, 0)
+        epoch = self._get_prefix_cache_epoch()
+        try:
+            # A memo reuse can recompute the lookup to verify it.
+            cached = self._memo_get(request, epoch, max_len)
+            if cached is not None:
+                return cached[3]
+            return self._memo_compute(request, epoch, max_len)[3]
+        except Exception:
+            if not self._paw_scoring_broken:
+                self._paw_scoring_broken = True
+                logger.exception(
+                    "PrefixAwareScheduler: warmth scoring failed; falling back to FCFS."
+                )
+            return 0
+
+    def _rank_window(
+        self, window: list[Request]
+    ) -> list[tuple[tuple[int, float, float], int]]:
+        """(sort key, warmth) of every request of a promotion window, head
+        first; a lower sort key is admitted first."""
+        raise NotImplementedError
+
+    def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
+        """Promotes the warmest request of each waiting queue to its head.
+
+        vLLM's scan drains ``kv_holding_waiting`` (requests holding KV blocks,
+        such as async loads) before ``waiting`` on every step, so ``waiting``
+        is promoted even while ``kv_holding_waiting`` is not empty. Returns
+        the queue the scan reads first.
+        """
+        if self.kv_holding_waiting:
+            self._promote_warmest(self.kv_holding_waiting)
+        if self.waiting:
+            self._promote_warmest(self.waiting)
+        return self.kv_holding_waiting or self.waiting
+
+    def _promote_warmest(self, queue: RequestQueue) -> None:
+        """Promote the request with the fewest uncached tokens within WINDOW."""
+        if len(queue) < 2 or self.policy != SchedulingPolicy.FCFS:
+            return
+
+        window = list(islice(queue, self.WINDOW))
+        head = window[0]
+        scored = list(zip(self._rank_window(window), window, strict=True))
+        (best_rank, best_warmth), best = min(scored, key=lambda t: t[0][0])
+
+        if best is not head and best_rank < scored[0][0][0]:
+            # Only FCFS reaches here (see the early return above).
+            cast(FCFSRequestQueue, queue).remove(best)
+            queue.prepend_request(best)
+
+        self._paw_n += 1
+        self._paw_cold_tokens += max(best.num_tokens - best_warmth, 0)
+        self._paw_prompt_tokens += best.num_tokens
+
+        if self._paw_n % _LOG_EVERY == 0:
+            logger.info(
+                "warmest-first: n=%d mean_cold_tokens=%.0f "
+                "cold_frac=%.3f queue_depth=%d",
+                self._paw_n,
+                self._paw_cold_tokens / self._paw_n,
+                self._paw_cold_tokens / max(self._paw_prompt_tokens, 1),
+                len(queue),
+            )
+
+    def _maybe_pack_prompt_ids(self, out) -> None:
+        """Ship new requests' prompt ids to the workers as packed int32 (see
+        core/packed_ids.py)."""
+        if getattr(self, "_pack_ids", None) is None:
+            self._pack_ids = True
+            self._pack_ids_min = _PACK_PROMPT_IDS_MIN_TOKENS
+        if not self._pack_ids:
+            return
+        try:
+            pack_new_request_prompt_ids(out, self._pack_ids_min)
+        except Exception:
+            logger.exception(
+                "PrefixAwareScheduler: prompt-id packing failed; disabling it."
+            )
+            self._pack_ids = False
+
+
+class PrefixAwareScheduler(PrefixAwareAdmission, AsyncScheduler):
+    """Admit ready requests prioritizing fewest uncached prompt tokens."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -386,125 +636,6 @@ class PrefixAwareScheduler(AsyncScheduler):
             len(self.waiting) + len(self.kv_holding_waiting),
         )
 
-    # ------------------------------------------------------------------
-    # Cross-step memo of find_longest_cache_hit.
-    #
-    # Within one prefix-cache epoch a memoised result is reused as is. Any
-    # prefix-cache mutation (a hash insert, an eviction, a step start with
-    # unwritten blocks) moves the epoch, which happens on almost every step,
-    # so reuse across epochs needs the change log.
-    #
-    # find_longest_cache_hit(hashes, max_len) is a deterministic function of
-    # the answers BlockPool.get_cached_block(h, groups) gives for the hashes it
-    # probes. With the memo on, core/prefix_change_log.py records the probed
-    # hashes during the computation and logs every hash whose answer can
-    # change (insert, removal, unwritten-flag flip, reset) on top of the
-    # same-step patch. A memo is reused iff none of its probed hashes was
-    # logged after its epoch, so the reused result equals a fresh lookup
-    # exactly. The first _MEMO_VERIFY_REUSES cross-step reuses are re-checked
-    # against a fresh lookup; any mismatch disables the cross-step memo.
-    # ------------------------------------------------------------------
-    _MEMO_LOG_CAP = 65536
-    _MEMO_VERIFY_REUSES = 64
-
-    def _enable_memo_xstep(self) -> None:
-        """Memoises lookups on this scheduler's block pool: starts its
-        prefix-cache epoch (the same-step memo) and its change log (the
-        cross-step memo), which the patch registry's wrappers keep."""
-        self._memo_hits = 0
-        self._memo_computes = 0
-        self._memo_verified = 0
-        self._memo_verify_left = self._MEMO_VERIFY_REUSES
-        pool = self.kv_cache_manager.block_pool
-        self._memo_xstep = prefix_change_log.enable_epoch(
-            pool
-        ) and prefix_change_log.enable(pool)
-
-    def _memo_trim_log(self) -> None:
-        pool = getattr(self.kv_cache_manager, "block_pool", None)
-        d = getattr(pool, "__dict__", None)
-        log = d.get("_tpu_prefix_change_log") if isinstance(d, dict) else None
-        if isinstance(d, dict) and log is not None and len(log) > self._MEMO_LOG_CAP:
-            cut = len(log) // 2
-            d["_tpu_prefix_change_log_base"] = log[cut - 1][0]
-            del log[:cut]
-
-    def _memo_still_exact(self, cached, epoch: int) -> bool:
-        """True iff no hash probed by ``cached`` changed since its epoch."""
-        if len(cached) < 6 or cached[4] is None:
-            return False
-        d = self.kv_cache_manager.block_pool.__dict__
-        log = d.get("_tpu_prefix_change_log")
-        if log is None:
-            return False
-        e0 = cached[0]
-        if e0 < d.get("_tpu_prefix_change_log_base", 0) or e0 > epoch:
-            return False
-        probes = cached[4]
-        start = bisect_right(log, e0, key=itemgetter(0))
-        return all(log[i][1] not in probes for i in range(start, len(log)))
-
-    def _memo_get(self, request: Request, epoch: int | None, max_len: int):
-        """Return a still-exact memo tuple for ``request`` or None."""
-        if epoch is None:
-            return None
-        cached = getattr(request, "_paw_hit_cache", None)
-        if cached is None or cached[1] != max_len:
-            return None
-        if cached[0] == epoch:
-            return cached
-        if not getattr(self, "_memo_xstep", False):
-            return None
-        if len(cached) < 6 or cached[5] != len(request.block_hashes):
-            return None
-        if not self._memo_still_exact(cached, epoch):
-            return None
-        if self._memo_verify_left > 0:
-            self._memo_verify_left -= 1
-            fresh = self._memo_compute(request, epoch, max_len)
-            if _hit_signature(fresh[2]) != _hit_signature(cached[2]):
-                logger.error(
-                    "PrefixAwareScheduler: cross-step memo mismatch for %s "
-                    "(memo=%s fresh=%s); disabling the cross-step memo.",
-                    getattr(request, "request_id", "?"),
-                    _hit_signature(cached[2])[:2],
-                    _hit_signature(fresh[2])[:2],
-                )
-                self._memo_xstep = False
-                # Nothing trims the change log once the memo is off.
-                prefix_change_log.disable(self.kv_cache_manager.block_pool)
-                return fresh
-            self._memo_verified += 1
-            return fresh
-        cached = (epoch,) + cached[1:]
-        cast(Any, request)._paw_hit_cache = cached
-        self._memo_hits += 1
-        return cached
-
-    def _memo_compute(self, request: Request, epoch: int | None, max_len: int):
-        kvm = self.kv_cache_manager
-        record = epoch is not None and getattr(self, "_memo_xstep", False)
-        probes = None
-        if record:
-            result, probes = prefix_change_log.record_probes(
-                kvm.block_pool,
-                kvm.coordinator.find_longest_cache_hit,
-                request.block_hashes,
-                max_len,
-            )
-            if isinstance(result, tuple) and isinstance(result[0], tuple):
-                result = (tuple(tuple(b) for b in result[0]),) + result[1:]
-        else:
-            result = kvm.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_len
-            )
-        warmth = int(result[1])
-        self._memo_computes = getattr(self, "_memo_computes", 0) + 1
-        cached = (epoch, max_len, result, warmth, probes, len(request.block_hashes))
-        if epoch is not None:
-            cast(Any, request)._paw_hit_cache = cached
-        return cached
-
     def _promote_warmest_on(self) -> bool:
         """``tpu_scheduler.promote_warmest`` (default on)."""
         return self._promote_warmest_switch
@@ -547,12 +678,6 @@ class PrefixAwareScheduler(AsyncScheduler):
             base, max(min_reserved, per_seq_reserved * (num_running + num_inflight))
         )
 
-    def _now(self) -> float:
-        """The time ``_promote_warmest`` ranks the window at. This scheduler's
-        ranking does not age requests; the pipeline chunk scheduler, which
-        borrows ``_promote_warmest``, answers its step's wall time."""
-        return time.time()
-
     def _note_waiting_stop(self, request: Request, reason: str) -> None:
         """Records why the waiting loop stopped at ``request`` (first stop of
         the step wins; running requests are ignored)."""
@@ -562,22 +687,6 @@ class PrefixAwareScheduler(AsyncScheduler):
             and is_waiting_status(request)
         ):
             self._step_wait_event = reason
-
-    def _maybe_pack_prompt_ids(self, out) -> None:
-        """Ship new requests' prompt ids to the workers as packed int32 (see
-        core/packed_ids.py)."""
-        if getattr(self, "_pack_ids", None) is None:
-            self._pack_ids = True
-            self._pack_ids_min = _PACK_PROMPT_IDS_MIN_TOKENS
-        if not self._pack_ids:
-            return
-        try:
-            pack_new_request_prompt_ids(out, self._pack_ids_min)
-        except Exception:
-            logger.exception(
-                "PrefixAwareScheduler: prompt-id packing failed; disabling it."
-            )
-            self._pack_ids = False
 
     def _make_cached_request_data(self, *args, **kwargs):
         cached = super()._make_cached_request_data(*args, **kwargs)
@@ -807,10 +916,6 @@ class PrefixAwareScheduler(AsyncScheduler):
             self._note_waiting_stop(request, "lookahead0")
         return reserved
 
-    def _get_block_size(self) -> int:
-        """The scheduler's KV cache block size in tokens."""
-        return self.block_size
-
     def _get_num_free_blocks(self) -> int | None:
         """Return free HBM blocks from BlockPool if available as an int."""
         block_pool = getattr(
@@ -828,45 +933,6 @@ class PrefixAwareScheduler(AsyncScheduler):
         if isinstance(free_blocks, int) and not isinstance(free_blocks, bool):
             return free_blocks
         return None
-
-    def _get_prefix_cache_epoch(self) -> int | None:
-        """Return the prefix-cache mutation epoch of the block pool, or None
-        when the pool does not count mutations (see
-        ``prefix_change_log.enable_epoch``)."""
-        block_pool = getattr(self.kv_cache_manager, "block_pool", None)
-        if block_pool is None:
-            return None
-        d = getattr(block_pool, "__dict__", None)
-        if not isinstance(d, dict):
-            return None
-        # Without the epoch counters the epoch never moves, and a same-epoch
-        # memo would be reused after the cache changed.
-        if not prefix_change_log.epoch_installed():
-            return None
-        return d.get(prefix_change_log.EPOCH)
-
-    def _prefix_warmth(self, request: Request) -> int:
-        """Prompt tokens of ``request`` resident in the KV cache."""
-        kvm = self.kv_cache_manager
-        if not kvm.enable_caching or request.skip_reading_prefix_cache:
-            return 0
-        if request.num_computed_tokens > 0:
-            return request.num_computed_tokens
-        max_len = max(request.num_tokens - 1, 0)
-        epoch = self._get_prefix_cache_epoch()
-        try:
-            # A memo reuse can recompute the lookup to verify it.
-            cached = self._memo_get(request, epoch, max_len)
-            if cached is not None:
-                return cached[3]
-            return self._memo_compute(request, epoch, max_len)[3]
-        except Exception:
-            if not self._paw_scoring_broken:
-                self._paw_scoring_broken = True
-                logger.exception(
-                    "PrefixAwareScheduler: warmth scoring failed; falling back to FCFS."
-                )
-            return 0
 
     def _get_local_prefix_cache_hit(
         self, request: Request, max_cache_hit_length: int | None = None
@@ -889,79 +955,15 @@ class PrefixAwareScheduler(AsyncScheduler):
         return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
 
     def _rank_and_warmth(
-        self,
-        request: Request,
-        free_blocks_for_fit: int | None = None,
-        now: float | None = None,
+        self, request: Request
     ) -> tuple[tuple[int, float, float], int]:
-        """Return (sort_key, warmth). Lower sort_key is admitted first.
-
-        ``_promote_warmest`` also passes ``free_blocks_for_fit`` and ``now``,
-        which the pipeline-parallel prefill scheduler's own ranking uses.
-        """
+        """Return (sort_key, warmth). Lower sort_key is admitted first."""
         warmth = self._prefix_warmth(request)
         cold_tokens = float(request.num_tokens - warmth)
         tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
         return (tier, cold_tokens, request.arrival_time), warmth
 
-    def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        """Promotes the warmest request of each waiting queue to its head.
-
-        vLLM's scan drains ``kv_holding_waiting`` (requests holding KV blocks,
-        such as async loads) before ``waiting`` on every step, so ``waiting``
-        is promoted even while ``kv_holding_waiting`` is not empty. Returns
-        the queue the scan reads first.
-        """
-        if self.kv_holding_waiting:
-            self._promote_warmest(self.kv_holding_waiting)
-        if self.waiting:
-            self._promote_warmest(self.waiting)
-        return self.kv_holding_waiting or self.waiting
-
-    def _free_blocks_for_fit(self, head: Request) -> int | None:
-        """The free-block count ``_rank_and_warmth`` ranks the window against
-        when ``head`` does not fit it, else None. This scheduler's ranking
-        does not read it, so it answers None without a lookup; the pipeline
-        chunk scheduler, which borrows ``_promote_warmest``, ranks by fit."""
-        return None
-
-    def _promote_warmest(self, queue: RequestQueue) -> None:
-        """Promote the request with the fewest uncached tokens within WINDOW."""
-        if len(queue) < 2 or self.policy != SchedulingPolicy.FCFS:
-            return
-
-        window = list(islice(queue, self.WINDOW))
-        head = window[0]
-        now = self._now()
-        head_scored = self._rank_and_warmth(head, now=now)
-        free_blocks_for_fit = self._free_blocks_for_fit(head)
-
-        scored = [(head_scored, head)] + [
-            (
-                self._rank_and_warmth(
-                    r, free_blocks_for_fit=free_blocks_for_fit, now=now
-                ),
-                r,
-            )
-            for r in window[1:]
-        ]
-        (best_rank, best_warmth), best = min(scored, key=lambda t: t[0][0])
-
-        if best is not head and best_rank < scored[0][0][0]:
-            # Only FCFS reaches here (see the early return above).
-            cast(FCFSRequestQueue, queue).remove(best)
-            queue.prepend_request(best)
-
-        self._paw_n += 1
-        self._paw_cold_tokens += max(best.num_tokens - best_warmth, 0)
-        self._paw_prompt_tokens += best.num_tokens
-
-        if self._paw_n % _LOG_EVERY == 0:
-            logger.info(
-                "warmest-first: n=%d mean_cold_tokens=%.0f "
-                "cold_frac=%.3f queue_depth=%d",
-                self._paw_n,
-                self._paw_cold_tokens / self._paw_n,
-                self._paw_cold_tokens / max(self._paw_prompt_tokens, 1),
-                len(queue),
-            )
+    def _rank_window(
+        self, window: list[Request]
+    ) -> list[tuple[tuple[int, float, float], int]]:
+        return [self._rank_and_warmth(r) for r in window]
