@@ -125,10 +125,15 @@ def torchrun_worker_env(world_size: int) -> dict[str, str]:
 # reports _SESSION_FAILURE, or not every rank has started within
 # _STARTUP_TIMEOUT_S, is ended and run again after a pause.
 _SESSION_FAILURE = "START_SESSION failed"
-_STARTUP_TIMEOUT_S = 150.0
-_STARTUP_RETRY_PAUSE_S = 30.0
+_STARTUP_TIMEOUT_S = 120.0
+# The workers of the ended launch release the TPUs asynchronously; the same
+# wait test_latent_proj_intra_chip_multichip.py uses for that race.
+_STARTUP_RETRY_PAUSE_S = 60.0
 # Time a relaunch needs, start-up included, for a retry to be worth it.
-_STARTUP_RETRY_MIN_S = 150.0
+_STARTUP_RETRY_MIN_S = 120.0
+# How long the workers of an ended launch get to exit after SIGTERM, and then
+# after SIGKILL.
+_REAP_S = 30.0
 _POLL_S = 2.0
 
 
@@ -192,6 +197,19 @@ def _startup_stall(result_dir: Any, world_size: int, elapsed: float) -> str | No
     return None
 
 
+def _group_alive(pgid: int) -> bool:
+    """Whether a process of process group `pgid` still exists."""
+    import os
+
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _launch_torchrun_once(
     script: Any,
     result_dir: Any,
@@ -202,6 +220,7 @@ def _launch_torchrun_once(
 ) -> tuple[Any, bool]:
     """One torchrun launch, ended at `deadline` or as soon as it stalls in TPU
     initialization; returns the completed process and why it stalled, or None."""
+    import contextlib
     import os
     import signal
     import subprocess
@@ -259,13 +278,21 @@ def _launch_torchrun_once(
     finally:
         # Also on pytest's own timeout, which raises out of communicate(): the
         # workers run in their own session and would keep holding the chips.
-        if process.poll() is None:
-            os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=60)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=60)
+        # Every worker, not just torchrun: a worker stuck in TPU
+        # initialization keeps holding its chip until it is gone.
+        if process.poll() is None or _group_alive(process.pid):
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, sig)
+                reap_deadline = time.monotonic() + _REAP_S
+                while time.monotonic() < reap_deadline:
+                    process.poll()
+                    if process.returncode is not None and not _group_alive(process.pid):
+                        break
+                    time.sleep(0.5)
+                else:
+                    continue
+                break
     completed = subprocess.CompletedProcess(
         process.args, process.returncode, output, ""
     )
