@@ -283,6 +283,7 @@ class ChipSpec:
     has_sparse_core: bool = _DEFAULT_TPU_CAPS.has_sparse_core
     provenance: str = "public_spec"
     vector_flops_overridden: bool = False
+    dcn_bw_overridden: bool = False
 
     def matmul_peak_kind(
         self,

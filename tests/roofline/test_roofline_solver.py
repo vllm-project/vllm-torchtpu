@@ -199,7 +199,8 @@ def _check_pp_prefill_ttft(chip: rf.ChipSpec) -> None:
         pp_pools = [r for r in chk_disagg.prefill_pools if r.pool.pp > 1]
         assert pp_pools
         rec0 = pp_pools[0]
-        sf_st = rf.step_floor(
+        uniform_part = (pp_geom.num_layers // rec0.pool.pp,) * rec0.pool.pp
+        sf_st = rf.scale_pp_stage_floor(
             pp_geom,
             chip,
             rf.Parallel(
@@ -212,13 +213,20 @@ def _check_pp_prefill_ttft(chip: rf.ChipSpec) -> None:
                 ep=rec0.pool.ep,
                 mesh_axes=rec0.pool.mesh_axes,
             ),
-            rf.StepShape(
-                batch=0, rows_per_seq=0, context=0, state_writes=0, prefill_tokens=1024
+            (
+                rf.StepShape(
+                    batch=0,
+                    rows_per_seq=0,
+                    context=0,
+                    state_writes=0,
+                    prefill_tokens=1024,
+                ),
+                FloorOptions(
+                    dtypes=rf.Dtypes(kv=1.0),
+                    topology=rf.TOPOLOGIES[rec0.pool.topology],
+                ),
             ),
-            FloorOptions(
-                dtypes=rf.Dtypes(kv=1.0),
-                topology=rf.TOPOLOGIES[rec0.pool.topology],
-            ),
+            uniform_part,
         )
         bubble_mult = 1.0 + float(rec0.pool.pp - 1) / float(n_chk)
         assert rec0.ttft_ms == pytest.approx(
@@ -1880,3 +1888,545 @@ def test_pp_mixed_step_conserves_prefill_work_across_microbatches() -> None:
     )
     assert pp2_s < 0.75 * pp1_s
     assert pp2_s >= 0.45 * pp1_s
+
+
+def _hybrid_layer_config(
+    fixture_name: str,
+    layer_types: list[str],
+) -> dict[str, object]:
+    """Derive a small hybrid layer-type variant from a locked HF checkpoint."""
+    base_cfg = load_locked_config(fixture_name)
+    raw_text = base_cfg["text_config"]
+    assert isinstance(raw_text, dict)
+    text_cfg = dict(raw_text)
+    text_cfg.pop("full_attention_interval", None)
+    text_cfg["num_hidden_layers"] = len(layer_types)
+    text_cfg["layer_types"] = layer_types
+    return {**base_cfg, "text_config": text_cfg}
+
+
+def test_pp_dp_accounts_for_logit_peak_on_last_stage() -> None:
+    """DP shifts layers off the last stage when logit_peak_b pushes it above limit."""
+    bundle = load_locked_bundle("glm_5_2_fp8.json")
+    geometry = bundle.geometry
+    dtypes = bundle.dtypes
+    parallel = rf.Parallel(tp=1, pp=4, moe="tp_slice", ranks_per_chip=2)
+    part_zero, _bd_zero, last_zero, ok_zero = rf.pp_stage_breakdowns(
+        geometry,
+        dtypes,
+        parallel,
+        (4096, 1),
+        options=rf.PpStageOptions(logit_peak_b=0.0),
+    )
+    assert ok_zero
+    logit_peak_b = 12.0 * float(UNIT_GIGA)
+    part_peak, _bd_peak, last_peak, ok_peak = rf.pp_stage_breakdowns(
+        geometry,
+        dtypes,
+        parallel,
+        (4096, 1),
+        options=rf.PpStageOptions(logit_peak_b=logit_peak_b),
+    )
+    assert ok_peak
+    assert sum(part_peak) == geometry.num_layers
+    assert part_peak[-1] < part_zero[-1]
+    assert last_peak + logit_peak_b < last_zero + logit_peak_b
+
+
+def test_uneven_pp_scales_hybrid_kv_by_exact_stage_attention_layers() -> None:
+    """Uneven PP hybrid KV uses exact stage full-attention layers, not layer ratio."""
+    asym_cfg = _hybrid_layer_config(
+        "qwen3_5_397b_fp8.json",
+        ["linear_attention"] * 6 + ["full_attention"] * 2,
+    )
+    geometry = rf.from_hf_config(asym_cfg)
+    dtypes = rf.dtypes_from_hf_config(asym_cfg)
+    par_pp2 = rf.Parallel(tp=1, pp=2, moe="tp_slice", ranks_per_chip=2)
+    lin_stage, fix_stage = rf.pp_stage_kv_parts(
+        geometry, dtypes, par_pp2, ((7, 1), 4096), chip=rf.CHIPS["tpu7x"]
+    )
+    lin_even, _ = rf.memory.kv_bytes_per_core_parts(
+        geometry, dtypes, par_pp2, 4096, chip=rf.CHIPS["tpu7x"]
+    )
+    assert lin_stage == pytest.approx(lin_even, rel=1e-9)
+    assert fix_stage == 0.0
+    skewed_cfg = _hybrid_layer_config(
+        "qwen3_5_397b_fp8.json",
+        ["full_attention"] * 2 + ["linear_attention"] * 6,
+    )
+    skewed_geom = rf.from_hf_config(skewed_cfg)
+    lin_skewed, _ = rf.pp_stage_kv_parts(
+        skewed_geom, dtypes, par_pp2, ((3, 5), 4096), chip=rf.CHIPS["tpu7x"]
+    )
+    assert lin_skewed == pytest.approx(2.0 * lin_even, rel=1e-9)
+
+
+def test_disagg_dcn_and_pcie_offload_affect_ttft_on_locked_fixtures() -> None:
+    """Verify DCN bandwidth and host PCIe offload affect disagg and mixed TTFT."""
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    geometry = bundle.geometry
+    dtypes = bundle.dtypes
+    chip = rf.CHIPS["tpu7x"]
+    topo = rf.TOPOLOGIES["2x2x1"]
+    scen_off = rf.TrafficScenario(
+        name="q35-offload-dcn",
+        isl=32768,
+        osl=256,
+        prefix_hit_rate=0.9,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(64,),
+        kv_working_set_turns=20.0,
+        kv_offload_gb=128.0,
+    )
+    plan_fast = rf.solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        scen_off,
+        SolveOptions(mode="mixed", max_chips=4, topologies=(topo,)),
+    )
+    plan_slow_pcie = rf.solve_serving_plan(
+        geometry,
+        dtypes,
+        dc_replace(chip, pcie_bw=4.0e9),
+        scen_off,
+        SolveOptions(mode="mixed", max_chips=4, topologies=(topo,)),
+    )
+    assert plan_fast.recommended is not None
+    assert plan_slow_pcie.recommended is not None
+    assert plan_slow_pcie.recommended.est_ttft_ms > plan_fast.recommended.est_ttft_ms
+
+    scen_dcn = rf.TrafficScenario(
+        name="q35-dcn",
+        isl=8192,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(16,),
+        kv_working_set_turns=1.0,
+    )
+    disagg_opts = SolveOptions(
+        mode="disagg",
+        max_chips=8,
+        topologies=(topo,),
+        prefill_topology="2x2x1",
+        decode_topology="2x2x1",
+        pd_ratio=(1, 1),
+        include_pairs=True,
+    )
+    disagg_fast = rf.solve_serving_plan(geometry, dtypes, chip, scen_dcn, disagg_opts)
+    disagg_slow_dcn = rf.solve_serving_plan(
+        geometry, dtypes, dc_replace(chip, dcn_bw=1.0e9), scen_dcn, disagg_opts
+    )
+    assert disagg_fast.recommended is not None
+    assert disagg_slow_dcn.recommended is not None
+    assert disagg_slow_dcn.recommended.est_ttft_ms > disagg_fast.recommended.est_ttft_ms
+
+
+def test_stage_signature_distinguishes_swapped_hybrid_pairings_and_ple() -> None:
+    """Verify per-layer 5-tuple signatures distinguish swapped pairings and PLE."""
+    from vllm_torchtpu.roofline import partition as rf_partition
+
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    geom_a = dc_replace(
+        bundle.geometry,
+        num_layers=4,
+        layer_types=(
+            "full_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention",
+        ),
+        ffn_kinds=("moe", "dense", "moe", "dense"),
+        n_moe_layers=2,
+        n_dense_layers=2,
+        ple_dim=256,
+        ple_layer_ids=(0, 3),
+    )
+    ffn_all = rf.geometry.layer_ffn_kinds(geom_a)
+    ple_set = frozenset(geom_a.ple_layer_ids)
+    sig_stage0 = rf_partition._stage_layer_signature(geom_a, ffn_all, ple_set, 0, 2)
+    sig_stage1 = rf_partition._stage_layer_signature(geom_a, ffn_all, ple_set, 2, 4)
+    assert sig_stage0 != sig_stage1
+
+    slice_mid = rf_partition.stage_slice_geometry(geom_a, 1, 3)
+    assert slice_mid.ple_layer_ids == ()
+    assert slice_mid.ple_dim == 0
+    slice_tail = rf_partition.stage_slice_geometry(geom_a, 2, 4)
+    assert slice_tail.ple_layer_ids == (1,)
+    assert slice_tail.ple_dim == 256
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+def test_uneven_pp_decode_sum_and_max_bounds_and_last_stage_handoff(
+    fixture_name: str,
+) -> None:
+    """Verify uneven PP decode uses sum/max stage floors and skips last-stage P2P."""
+    bundle = load_locked_bundle(fixture_name)
+    geometry = bundle.geometry
+    dtypes = bundle.dtypes
+    chip = rf.CHIPS["tpu7x"]
+    topo = rf.TOPOLOGIES["2x2x2"]
+    pp_part = (
+        geometry.num_layers // 2 + 2,
+        geometry.num_layers - (geometry.num_layers // 2 + 2),
+    )
+    par_pp2 = rf.Parallel(
+        tp=4, pp=2, ep=4, moe="ep", ranks_per_chip=topo.cores_per_chip
+    )
+    scenario = rf.TrafficScenario(
+        name="uneven-pp-decode",
+        isl=2048,
+        osl=256,
+        prefix_hit_rate=0.0,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(8,),
+        kv_working_set_turns=1.0,
+    )
+    opts = FloorOptions(dtypes=dtypes, topology=topo)
+    shape_b1 = rf.StepShape(batch=1, context=2176)
+    shape_b4 = rf.StepShape(batch=4, context=2176)
+    sf_sum_b2 = rf.scale_pp_stage_floor(
+        geometry,
+        chip,
+        par_pp2,
+        (rf.StepShape(batch=2, context=2176), opts),
+        pp_part,
+        reduce="sum",
+    )
+    sf_max_b4 = rf.scale_pp_stage_floor(
+        geometry, chip, par_pp2, (shape_b4, opts), pp_part, reduce="max"
+    )
+    sf_sum_b1 = rf.scale_pp_stage_floor(
+        geometry, chip, par_pp2, (shape_b1, opts), pp_part, reduce="sum"
+    )
+    assert sf_sum_b1.hard_floor_s > sf_max_b4.hard_floor_s / 2.0
+    assert sf_sum_b2.serial_estimate_s > sf_max_b4.serial_estimate_s
+    bound_ms = rf.bound_tpot_ms(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        decode_par=par_pp2,
+        decode_topo=topo,
+        replica_batch_cap=4,
+        concurrency=1,
+        decode_pp_part=pp_part,
+    )
+    expected_b1_ms = (
+        max(
+            sf_sum_b1.hard_floor_s,
+            rf.scale_pp_stage_floor(
+                geometry, chip, par_pp2, (shape_b1, opts), pp_part, reduce="max"
+            ).hard_floor_s,
+        )
+        * 1000.0
+    )
+    assert bound_ms == pytest.approx(expected_b1_ms, rel=1e-9)
+
+    # Last stage sends no activation tensor across PP handoff.
+    stage_shape = rf.StepShape(batch=0, rows_per_seq=0, prefill_tokens=4096)
+    last_heavy_part = (1, geometry.num_layers - 1)
+    sf_last_heavy = rf.scale_pp_stage_floor(
+        geometry, chip, par_pp2, (stage_shape, opts), last_heavy_part, reduce="max"
+    )
+    assert not any(mod.name == "pp_p2p" for mod in sf_last_heavy.modules)
+
+
+@pytest.mark.parametrize("fixture_name", LOCKED_FIXTURE_FILES)
+def test_offload_gibi_unit_consistency_dp_pcie_scaling_and_negative_rejection(
+    fixture_name: str,
+) -> None:
+    """Verify UNIT_GIBI parity across pools, dp PCIe scaling, and invalid offload."""
+    from vllm_torchtpu.roofline import constants as rf_constants
+    from vllm_torchtpu.roofline import solver as rf_solver
+
+    bundle = load_locked_bundle(fixture_name)
+    geometry = bundle.geometry
+    dtypes = bundle.dtypes
+    chip = rf.CHIPS["tpu7x"]
+    topo = rf.TOPOLOGIES["2x2x1"]
+
+    for bad_gb in (-1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="kv_offload_gb"):
+            rf.TrafficScenario(
+                name="bad-offload",
+                isl=4096,
+                osl=128,
+                prefix_hit_rate=0.5,
+                accept_len=1.0,
+                think_time_s=0.0,
+                concurrencies=(4,),
+                kv_working_set_turns=1.0,
+                kv_offload_gb=bad_gb,
+            )
+
+    expected_per_core = 128.0 * rf_constants.UNIT_GIBI / float(topo.num_cores)
+    assert rf_solver._offload_bytes_per_core(128.0, topo.num_cores) == pytest.approx(
+        expected_per_core, rel=1e-12
+    )
+    scenario = rf.TrafficScenario(
+        name="offload-gibi-check",
+        isl=16384,
+        osl=256,
+        prefix_hit_rate=0.95,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(32,),
+        kv_working_set_turns=20.0,
+        kv_offload_gb=128.0,
+    )
+    disagg_plan = rf.solve_serving_plan(
+        geometry,
+        dtypes,
+        chip,
+        scenario,
+        SolveOptions(
+            mode="disagg",
+            max_chips=8,
+            topologies=(topo,),
+            prefill_topology="2x2x1",
+            decode_topology="2x2x1",
+            pd_ratio=(1, 1),
+            include_pairs=True,
+        ),
+    )
+    assert disagg_plan.decode_pools
+    assert all(
+        rec.pool.kv_offload_gb == pytest.approx(128.0)
+        for rec in disagg_plan.decode_pools
+    )
+    assert disagg_plan.candidates
+    assert all(
+        pt.decode_pool.kv_offload_gb == pytest.approx(128.0)
+        for pt in disagg_plan.candidates
+    )
+
+    # Verify dp=2 prefill PCIe offload scales instance throughput 2.0x vs dp=1.
+    slow_pcie_chip = dc_replace(chip, pcie_bw=4.0e9, dcn_bw=1.0e15)
+    scen_dp1 = rf.TrafficScenario(
+        name="offload-dp1",
+        isl=16384,
+        osl=256,
+        prefix_hit_rate=0.95,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(64,),
+        kv_working_set_turns=20.0,
+        kv_offload_gb=128.0,
+    )
+    scen_dp2 = dc_replace(
+        scen_dp1, name="offload-dp2", concurrencies=(128,), kv_offload_gb=256.0
+    )
+    plan_dp1 = rf.solve_serving_plan(
+        geometry,
+        dtypes,
+        slow_pcie_chip,
+        scen_dp1,
+        SolveOptions(
+            mode="disagg",
+            max_chips=8,
+            topologies=(topo,),
+            prefill_topology="2x2x1",
+            decode_topology="2x2x1",
+            pd_ratio=(1, 1),
+            include_pairs=True,
+        ),
+    )
+    topo_2 = rf.TOPOLOGIES["2x2x2"]
+    plan_dp2 = rf.solve_serving_plan(
+        geometry,
+        dtypes,
+        slow_pcie_chip,
+        scen_dp2,
+        SolveOptions(
+            mode="disagg",
+            max_chips=16,
+            topologies=(topo_2,),
+            prefill_topology="2x2x2",
+            decode_topology="2x2x2",
+            pd_ratio=(1, 1),
+            include_pairs=True,
+        ),
+    )
+
+    def _pair_shape_key(pt: rf.ParetoPoint) -> tuple[object, ...]:
+        assert pt.prefill_pool is not None
+        p_pool = pt.prefill_pool
+        d_pool = pt.decode_pool
+        return (
+            p_pool.tp,
+            p_pool.ep,
+            p_pool.pp,
+            p_pool.pcp,
+            p_pool.kv_split,
+            p_pool.moe_dispatch,
+            d_pool.tp,
+            d_pool.ep,
+            d_pool.pp,
+            d_pool.pcp,
+            d_pool.kv_split,
+            d_pool.moe_dispatch,
+        )
+
+    map_dp1 = {
+        _pair_shape_key(pt): pt
+        for pt in plan_dp1.candidates
+        if pt.prefill_pool is not None
+        and pt.prefill_pool.dp == 1
+        and pt.prefill_pool.pp == 1
+        and pt.decode_pool.dp == 1
+        and pt.decode_pool.pp == 1
+    }
+    map_dp2 = {
+        _pair_shape_key(pt): pt
+        for pt in plan_dp2.candidates
+        if pt.prefill_pool is not None
+        and pt.prefill_pool.dp == 2
+        and pt.prefill_pool.pp == 1
+        and pt.decode_pool.dp == 2
+        and pt.decode_pool.pp == 1
+    }
+    common_keys = sorted(set(map_dp1) & set(map_dp2), key=str)
+    assert common_keys
+    sample_key = common_keys[0]
+    cand_dp1 = map_dp1[sample_key]
+    cand_dp2 = map_dp2[sample_key]
+    assert cand_dp2.token_throughput_per_chip == pytest.approx(
+        cand_dp1.token_throughput_per_chip, rel=1e-5
+    )
+
+
+def test_swa_only_pcie_offload_charges_nonzero_read_latency() -> None:
+    """Verify SWA-only models with spilled KV pay nonzero PCIe read time."""
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    swa_geom = dc_replace(
+        bundle.geometry,
+        num_layers=8,
+        layer_types=("sliding_attention",) * 8,
+        sliding_window=1024,
+        ffn_kinds=("dense",) * 8,
+        n_moe_layers=0,
+        n_dense_layers=8,
+    )
+    chip = rf.CHIPS["tpu7x"]
+    topo = rf.TOPOLOGIES["2x2x1"]
+    scenario = rf.TrafficScenario(
+        name="swa-offload",
+        isl=4096,
+        osl=128,
+        prefix_hit_rate=0.95,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(256,),
+        kv_working_set_turns=50.0,
+        kv_offload_gb=128.0,
+    )
+    # Use a constrained HBM budget so SWA fixed-window KV spills to host offload.
+    small_hbm = dc_replace(chip, hbm_bytes=int(4.0 * float(UNIT_GIGA)))
+    plan_fast = rf.solve_serving_plan(
+        swa_geom,
+        bundle.dtypes,
+        dc_replace(small_hbm, pcie_bw=64.0e9),
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4, topologies=(topo,), hbm_reserve_gb=0.0),
+    )
+    plan_slow = rf.solve_serving_plan(
+        swa_geom,
+        bundle.dtypes,
+        dc_replace(small_hbm, pcie_bw=1.0e9),
+        scenario,
+        SolveOptions(mode="mixed", max_chips=4, topologies=(topo,), hbm_reserve_gb=0.0),
+    )
+    assert plan_fast.recommended is not None
+    assert plan_slow.recommended is not None
+    assert plan_slow.recommended.est_ttft_ms > plan_fast.recommended.est_ttft_ms
+
+
+def test_pp_partition_replicates_tied_embeddings_on_last_stage() -> None:
+    """Verify tied embeddings are charged on both first and last stage when pp > 1."""
+    from vllm_torchtpu.roofline import partition as rf_partition
+
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    tied_geom = dc_replace(bundle.geometry, tie_word_embeddings=True, mtp_layers=0)
+    par2 = rf.Parallel(tp=4, pp=2, ep=4, moe="ep", ranks_per_chip=2)
+    prefixes = rf_partition._pp_layer_prefixes(
+        tied_geom, bundle.dtypes, par2, SeqKvLayout(1, 1024), chip=rf.CHIPS["tpu7x"]
+    )
+    assert prefixes.embed_b > 0.0
+    assert prefixes.lm_b == pytest.approx(prefixes.embed_b, rel=1e-9)
+
+
+def test_dcn_cli_override_updates_host_gbit_and_provenance() -> None:
+    """Verify --dcn-gbit-per-s updates host rate, rejects 0, and sets provenance."""
+    bundle = load_locked_bundle("qwen3_5_397b_fp8.json")
+    base_chip = rf.CHIPS["tpu7x"]
+    parser = cli._build_parser()
+    zero_args = parser.parse_args(
+        [
+            "solve",
+            "--model",
+            str(Path("tests/roofline/fixtures/qwen3_5_397b_fp8.json")),
+            "--dcn-gbit-per-s",
+            "0",
+        ]
+    )
+    with pytest.raises(ValueError, match="--dcn-gbit-per-s"):
+        cli._apply_chip_overrides(base_chip, zero_args)
+
+    args = parser.parse_args(
+        [
+            "solve",
+            "--model",
+            str(Path("tests/roofline/fixtures/qwen3_5_397b_fp8.json")),
+            "--dcn-gbit-per-s",
+            "200",
+            "--kv-offload-gb",
+            "64",
+        ]
+    )
+    overridden = cli._apply_chip_overrides(base_chip, args)
+    assert overridden.dcn_bw_overridden is True
+    assert overridden.dcn_host_gbit_per_s == pytest.approx(
+        200.0 * float(base_chip.chips_per_host)
+    )
+    scen = rf.TrafficScenario(
+        name="prov-dcn-offload",
+        isl=4096,
+        osl=128,
+        prefix_hit_rate=0.5,
+        accept_len=1.0,
+        think_time_s=0.0,
+        concurrencies=(8,),
+        kv_working_set_turns=1.0,
+        kv_offload_gb=64.0,
+    )
+    plan_res = rf.solve_serving_plan(
+        bundle.geometry,
+        bundle.dtypes,
+        overridden,
+        scen,
+        SolveOptions(mode="mixed", max_chips=4, topologies=(rf.TOPOLOGIES["2x2x1"],)),
+    )
+    payload = rf.build_solve_payload(plan_res, chip=overridden, dtypes=bundle.dtypes)
+    supplied = {
+        entry["flag"]: entry for entry in payload["provenance"]["supplied_values"]
+    }
+    assert "--kv-offload-gb" in supplied
+    assert supplied["--kv-offload-gb"]["value"] == pytest.approx(64.0)
+    assert "--dcn-gbit-per-s" in supplied
+    assert supplied["--dcn-gbit-per-s"]["value"] == pytest.approx(200.0)
+
+    # Custom chip spec with altered dcn_bw (no CLI flag) must not report CLI override.
+    custom_chip = dc_replace(base_chip, dcn_bw=base_chip.dcn_bw * 0.5)
+    assert custom_chip.dcn_bw_overridden is False
+    custom_payload = rf.build_solve_payload(
+        plan_res, chip=custom_chip, dtypes=bundle.dtypes
+    )
+    custom_flags = {
+        entry["flag"] for entry in custom_payload["provenance"]["supplied_values"]
+    }
+    assert "--dcn-gbit-per-s" not in custom_flags

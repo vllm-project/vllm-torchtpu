@@ -132,6 +132,13 @@ from .occupancy import (
     min_experts_per_ep_shard,
     parse_activation_spec,
 )
+from .partition import (
+    PpStageOptions,
+    partition_pp_layers,
+    pp_stage_breakdowns,
+    pp_stage_kv_parts,
+    scale_pp_stage_floor,
+)
 from .report import render_html, write_html
 from .schema import (
     FloorTimes,
@@ -218,6 +225,7 @@ __all__ = [
     "ParetoPoint",
     "PoolFloorRecord",
     "PoolMeshPlan",
+    "PpStageOptions",
     "ProvenancePayload",
     "ScenarioOverrides",
     "SearchStats",
@@ -279,17 +287,21 @@ __all__ = [
     "param_counts",
     "parse_activation_spec",
     "parse_layout",
+    "partition_pp_layers",
     "pass_costs",
     "plan",
     "pool_capacity_bound",
     "pool_label",
     "pool_slice_summary",
+    "pp_stage_breakdowns",
+    "pp_stage_kv_parts",
     "pp_stage_layer_scale",
     "reference_layout_report",
     "register_chip",
     "render_html",
     "request_rate_bound",
     "resolve_model_identity",
+    "scale_pp_stage_floor",
     "solve_serving_plan",
     "spec_cycle_floor",
     "step_floor",

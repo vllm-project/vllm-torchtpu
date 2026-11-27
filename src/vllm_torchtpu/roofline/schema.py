@@ -150,6 +150,7 @@ class ScenarioOverrides:
     ttft_slo_ms: float | None = None
     tpot_slo_ms: float | None = None
     kv_working_set_turns: float | None = None
+    kv_offload_gb: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +206,8 @@ class PoolMeshPlan:
     hbm_state_gb: float = 0.0
     resident_batch_cap: int | None = None
     residual: Literal["replicated", "sp"] = "replicated"
+    pp_layer_partition: tuple[int, ...] | None = None
+    kv_offload_gb: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,7 +407,9 @@ class CeilingRow(TypedDict):
     prefill_parallelism: str | None
 
 
-type PoolStructKey = tuple[str, int, int, int, int, int, int, int]
+type PoolStructKey = tuple[
+    str, int, int, int, int, int, int, int, tuple[int, ...] | None
+]
 
 
 def effective_slo_verdict(point: ParetoPoint) -> SloVerdict:
@@ -544,6 +549,7 @@ def _pool_key(pool: PoolMeshPlan | None) -> PoolStructKey | None:
         pool.pp,
         pool.pcp,
         pool.kv_split,
+        pool.pp_layer_partition,
     )
 
 

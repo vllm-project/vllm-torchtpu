@@ -584,6 +584,7 @@ def test_bound_ordering_holds_over_generated_inputs() -> None:
                 if pre_par is not None
                 else [None]
             )
+            pre_pp_part = pre_pool.pp_layer_partition if pre_pool is not None else None
             rate_bounds = [
                 rf.request_rate_bound(
                     geometry,
@@ -606,6 +607,7 @@ def test_bound_ordering_holds_over_generated_inputs() -> None:
                     decode_instances=point.decode_pool.instances,
                     spec_k=plan_res.spec_k,
                     activation_model=plan_res.activation_model,
+                    pp_part=pre_pp_part,
                 )
                 for dv in dec_variants
                 for pv in pre_variants
@@ -633,6 +635,7 @@ def test_bound_ordering_holds_over_generated_inputs() -> None:
                     spec_k=plan_res.spec_k,
                     activation_model=plan_res.activation_model,
                     total_chips=point.total_chips,
+                    pp_part=pre_pp_part,
                 )
                 for dv in dec_variants
                 for pv in pre_variants
