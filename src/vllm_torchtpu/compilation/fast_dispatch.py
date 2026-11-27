@@ -204,7 +204,8 @@ def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
         "count": -1,
         "disabled": not simple_sig,
         "logged": False,
-        "memo": {},  # signature -> (direct fn, refs to its id-keyed objects)
+        # signature -> (guard manager, direct fn, refs to its id-keyed objects)
+        "memo": {},
         "memo_count": -1,
         "guard_memo": guard_memo,  # False: this function never uses the memo
     }
@@ -309,7 +310,12 @@ def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
         hit = memo.get(key)
         if hit is None:
             return None
-        direct, refs = hit
+        guards, direct, refs = hit
+        if guards.cache_entry is None:
+            # Dynamo dropped the entry (invalidated, or freed by
+            # torch._dynamo.reset()) without the entry count changing.
+            del memo[key]
+            return None
         if not _memo_live(refs, objs):
             # An object the entry was keyed by is gone and its id now names
             # another one: the guards must run again.
@@ -318,7 +324,7 @@ def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
         _MEMO_STATS["hit"] += 1
         return direct
 
-    def _memo_store(args: tuple, direct: Any, count: int) -> None:
+    def _memo_store(args: tuple, guards: Any, direct: Any, count: int) -> None:
         if state["memo_count"] != count:
             state["memo"] = {}
             state["memo_count"] = count
@@ -328,7 +334,7 @@ def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
             # an entry holding an object that cannot be weakly referenced
             # never dies, and refusing to store would end the memo's hits.
             for dead in [
-                k for k, (_, refs) in memo.items() if any(r() is None for r in refs)
+                k for k, (_, _, refs) in memo.items() if any(r() is None for r in refs)
             ]:
                 del memo[dead]
             while len(memo) >= _MEMO_MAX_ENTRIES:
@@ -336,7 +342,7 @@ def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
         objs: list = []
         key = _memo_key(args, objs)
         if key is not None and key not in memo:
-            memo[key] = (direct, _memo_refs(objs))
+            memo[key] = (guards, direct, _memo_refs(objs))
             _MEMO_STATS["store"] += 1
 
     @functools.wraps(fn)
@@ -378,7 +384,7 @@ def wrap(compiled: Any, fn: types.FunctionType, guard_memo: bool = True) -> Any:
                             continue
                         if gm.check(f_locals):
                             if use_memo:
-                                _memo_store(args, direct, state["count"])
+                                _memo_store(args, gm, direct, state["count"])
                             if idx > 0:
                                 entries.insert(0, entries.pop(idx))
                             if not state["logged"]:

@@ -262,6 +262,44 @@ def test_memo_cleared_when_cache_entries_change(memo_on):
     torch.testing.assert_close(w(x, 2), _fn_scale(x, 2))
 
 
+def test_memo_never_returns_an_entry_freed_by_a_reset(memo_on, monkeypatch):
+    """torch._dynamo.reset() frees the entries without touching the memo, and
+    a compile through the disarmed wrapper brings the entry count back to the
+    one the memo was filled at. A memo hit must not run the discarded entry:
+    the backend tags each compiled program to tell them apart."""
+    compiles, runs = [], []
+
+    def tagging_backend(gm, example_inputs):
+        tag = len(compiles)
+        compiles.append(tag)
+
+        def run(*args):
+            runs.append(tag)
+            return gm.forward(*args)
+
+        return run
+
+    torch._dynamo.reset()
+    compiled = torch.compile(
+        _fn_scale, backend=tagging_backend, fullgraph=True, dynamic=False
+    )
+    w = fd.wrap(compiled, _fn_scale)
+    x = torch.arange(6.0)
+    for _ in range(3):
+        torch.testing.assert_close(w(x, 2), _fn_scale(x, 2))
+    assert runs == [0, 0, 0]
+    assert fd._MEMO_STATS["hit"] == 1
+
+    torch._dynamo.reset()
+    monkeypatch.setitem(fd._CONFIG, "fast", False)
+    torch.testing.assert_close(w(x, 2), _fn_scale(x, 2))
+    assert runs[-1] == 1
+    monkeypatch.setitem(fd._CONFIG, "fast", True)
+    for _ in range(3):
+        torch.testing.assert_close(w(x, 2), _fn_scale(x, 2))
+    assert runs[-3:] == [1, 1, 1]
+
+
 # --- draft forwards that read the forward context stay out of the memo -------
 
 _DRAFT_LAYER = "draft.model.layers.0.self_attn.attn"
