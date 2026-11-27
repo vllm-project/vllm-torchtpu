@@ -5725,8 +5725,8 @@ def sparse_attention_chunk(
 # send_vmem_cap (TPU_MLA_SEND_LAYOUT_VMEM_CAP): the send-layout call without the
 # fused exchange (`send_world` without `send_exchange`; `out_vmem` never comes
 # with `send_world`, sparse_attention_chunk rejects the pair) takes a scoped
-# VMEM limit of SEND_LAYOUT_VMEM_LIMIT_BYTES instead of the default, which
-# leaves XLA no VMEM to keep a prefetch (o_proj's weight) live across the call.
+# VMEM limit of SEND_LAYOUT_VMEM_LIMIT_BYTES instead of the default; in the
+# compiled programs measured, XLA then prefetches o_proj's weight across it.
 # As for the fused exchange, its array operands and its send buffer are pinned
 # to HBM: XLA would otherwise stage the gathered KV into VMEM before the call
 # and evict the send buffer to HBM after it, both with exposed copies.
