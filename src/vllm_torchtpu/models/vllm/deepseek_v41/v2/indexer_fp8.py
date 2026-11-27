@@ -801,7 +801,12 @@ def _select_fp8_indexer_jax(
     tile_consume = consume if unrolled else None
     # The SparseCore selection also resolves the consumer's records: the
     # TensorCore then has no page lookup between a tile's selection and its
-    # gather.
+    # gather. Selected IDs stay below `capacity`, so only that many pages of
+    # the table reach SparseCore VMEM: the server's full table (8 request
+    # slots x 4,096 pages) exceeds the room `block_topk` leaves.
+    if records is not None:
+        table, row_requests, page = records
+        records = (table[:, : -(-capacity // page)], row_requests, page)
     tile_records = (
         records
         if tile_consume is not None
