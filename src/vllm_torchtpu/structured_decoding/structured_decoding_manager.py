@@ -21,7 +21,7 @@ import torch
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import PIN_MEMORY
 
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.layers.adapter.sample.token_bitmask import unpack_token_bitmask
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 

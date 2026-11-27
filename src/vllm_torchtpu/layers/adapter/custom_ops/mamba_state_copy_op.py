@@ -21,7 +21,7 @@ import torch
 from jax.experimental.pallas import tpu as pltpu
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.kernels import pool_adapters
 
 # --- Unified-pool block seeding (block-table-derived state indexing) ---

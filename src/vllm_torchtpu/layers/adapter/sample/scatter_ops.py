@@ -20,7 +20,7 @@ table write them back with ``scatter_slot_rows``.
 
 import torch
 
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 
 
 def scatter_slot_rows(

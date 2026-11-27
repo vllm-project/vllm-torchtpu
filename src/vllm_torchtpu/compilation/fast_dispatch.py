@@ -13,22 +13,23 @@
 # limitations under the License.
 """Guard-checked direct dispatch of this package's compiled TPU functions.
 
-:func:`tpu_compile` is the decorator for them: it compiles a function with
-``torch.compile(backend="tpu", fullgraph=True, dynamic=False)`` and wraps the
-result. The wrapper calls the compiled function and nothing else until the
-worker arms ``fast_compiled_call`` from ``additional_config["tpu_compile"]``
-(``compilation.compile_options``; off by default). It reads the option on
-every call, so a function decorated at import, before the options are known,
-is covered. Armed, it evaluates each cached entry's
-``guard_manager.check(f_locals)`` in MRU order and invokes the transformed
-Python code object directly on a guard hit, skipping Dynamo's per-call frame
-evaluation; every guard Dynamo built is kept.
+``compilation.decorators.tpu_compile`` compiles a function with
+``torch.compile(backend="tpu", fullgraph=True, dynamic=False)`` and calls
+:func:`wrap` on the result. The wrapper calls the compiled function and
+nothing else until the worker arms ``fast_compiled_call`` from
+``additional_config["tpu_compile"]`` (``compilation.compile_options``; off by
+default). It reads the option on every call, so a function decorated at
+import, before the options are known, is covered. Armed, it evaluates each
+cached entry's ``guard_manager.check(f_locals)`` in MRU order and invokes the
+transformed Python code object directly on a guard hit, skipping Dynamo's
+per-call frame evaluation; every guard Dynamo built is kept.
 
 TODO: Remove this module once PyTorch has a public guarded call path for
-``fullgraph`` compiled functions (https://github.com/pytorch/pytorch/issues/206560).
-Until then it relies on Dynamo internals, checked against torch 2.13.0 (git
-cf30153c4c13): ``torch._C._dynamo.eval_frame._get_cache_entries_for_region``
-and ``_get_total_cache_entry_count``, each cache entry's ``code`` and
+``fullgraph`` compiled functions (https://github.com/pytorch/pytorch/issues/206560);
+``tpu_compile`` then calls that path instead of :func:`wrap`. Until then it
+relies on Dynamo internals, checked against torch 2.13.0 (git cf30153c4c13):
+``torch._C._dynamo.eval_frame._get_cache_entries_for_region`` and
+``_get_total_cache_entry_count``, each cache entry's ``code`` and
 ``guard_manager.check`` and ``cache_entry`` (None once Dynamo invalidates or
 frees the entry), the compiled wrapper's ``_isolate_recompiles_id``,
 ``torch._dynamo.eval_frame._stance``, and calling an entry's transformed code
@@ -40,7 +41,6 @@ from __future__ import annotations
 import functools
 import inspect
 import types
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -59,8 +59,8 @@ _CONFIG = {"fast": False}
 
 
 def configure(fast: bool) -> None:
-    """Arm (or disarm) the direct dispatch of every :func:`tpu_compile`
-    function of the process. The worker calls this before any compiled
+    """Arm (or disarm) the direct dispatch of every ``tpu_compile`` function
+    of the process. The worker calls this before any compiled
     function runs; the wrapper checks it on every call."""
     _CONFIG["fast"] = bool(fast)
     if fast:
@@ -78,7 +78,9 @@ def _entry_count(code: types.CodeType) -> int:
     return _c_eval_frame._get_total_cache_entry_count(code)
 
 
-def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
+def wrap(compiled: Any, fn: types.FunctionType) -> Any:
+    """The fast-dispatch wrapper of ``compiled``, ``torch.compile``'s result
+    for the plain function ``fn``."""
     code = fn.__code__
     region = compiled._isolate_recompiles_id
     flags = code.co_flags
@@ -225,26 +227,3 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
     # follows _torchdynamo_orig_callable only from the wrapper it names.
     fast_dispatch_call._torchdynamo_wrapper_id = id(fast_dispatch_call)  # type: ignore[attr-defined]
     return fast_dispatch_call
-
-
-def tpu_compile[F: Callable[..., Any]](fn: F) -> F:
-    """Compile ``fn`` for TPU with ``torch.compile(fn, backend="tpu",
-    fullgraph=True, dynamic=False)`` and wrap the result for fast dispatch.
-    Use it as a decorator, or call it on a function.
-
-    The compile call is main's, so the compiled programs and their guards
-    are those of the plain ``torch.compile`` call. Disarmed (the default) the
-    wrapper calls the compiled function and nothing else. ``fast`` is read on
-    every call, never at decoration.
-    """
-    if not isinstance(fn, types.FunctionType):
-        raise TypeError(
-            f"tpu_compile takes a plain function, got {type(fn).__name__}; "
-            "compile a bound method or a module with torch.compile"
-        )
-    compiled = torch.compile(fn, backend="tpu", fullgraph=True, dynamic=False)
-    if compiled is fn:
-        # Dynamo is disabled (TORCHDYNAMO_DISABLE=1): torch.compile hands back
-        # the function itself, which has no cache entries to dispatch.
-        return fn
-    return _wrap(compiled, fn)

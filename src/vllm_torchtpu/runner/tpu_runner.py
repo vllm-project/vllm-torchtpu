@@ -89,7 +89,7 @@ from vllm.v1.outputs import (
 from vllm_torchtpu import envs, rope_in_graph_flag, rope_patch, utils
 from vllm_torchtpu.block_major_pool import BlockMajorPoolLayout
 from vllm_torchtpu.compilation import shape_variants
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.distributed import utils as dist_utils
 from vllm_torchtpu.distributed.kv_transfer.kv_save_nan_check import (
     KVSaveNanCheck,

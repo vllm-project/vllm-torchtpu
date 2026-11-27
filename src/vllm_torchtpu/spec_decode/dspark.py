@@ -39,7 +39,7 @@ from typing import NamedTuple
 import torch
 from vllm.config import VllmConfig
 
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs

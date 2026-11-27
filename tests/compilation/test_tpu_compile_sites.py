@@ -110,9 +110,40 @@ def test_no_plain_torch_compile_of_a_tpu_function():
             ):
                 found.append(f"{rel}:{node.lineno}")
     assert not found, (
-        "compile these with compilation.fast_dispatch.tpu_compile, which the "
+        "compile these with compilation.decorators.tpu_compile, which the "
         f"tpu_compile options act on: {found}"
     )
+
+
+# The modules that may import compilation.fast_dispatch, which is removed once
+# PyTorch has a public guarded call path (its TODO): the decorator that wraps
+# with it and the options that arm it. Compile sites import the decorator.
+FAST_DISPATCH_IMPORTERS = {
+    pathlib.Path("compilation/decorators.py"),
+    pathlib.Path("compilation/compile_options.py"),
+}
+
+
+def _imports_fast_dispatch(tree: ast.Module) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(
+                a.name == "vllm_torchtpu.compilation.fast_dispatch" for a in node.names
+            ):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if node.module == "vllm_torchtpu.compilation.fast_dispatch":
+                return True
+            if node.module == "vllm_torchtpu.compilation" and any(
+                a.name == "fast_dispatch" for a in node.names
+            ):
+                return True
+    return False
+
+
+def test_only_the_decorator_and_the_options_import_fast_dispatch():
+    importers = {rel for rel, tree in _sources() if _imports_fast_dispatch(tree)}
+    assert importers == FAST_DISPATCH_IMPORTERS, importers ^ FAST_DISPATCH_IMPORTERS
 
 
 def _uses_tpu_compile(node: ast.expr) -> bool:
@@ -167,11 +198,11 @@ compile(source, "<string>", "exec")
 @tpu_compile
 def decorated(x): ...
 
-@fast_dispatch.tpu_compile
+@decorators.tpu_compile
 def through_the_module(x): ...
 
 assigned = tpu_compile(f)
-annotated: Callable = fast_dispatch.tpu_compile(f)
+annotated: Callable = decorators.tpu_compile(f)
 
 class Holder:
     @tpu_compile

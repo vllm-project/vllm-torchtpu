@@ -32,7 +32,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,

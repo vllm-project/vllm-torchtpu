@@ -16,7 +16,7 @@
 Maintains a fixed-shape ``[capacity, 7]`` ``int32`` Knuth-Morris-Pratt (KMP)
 state table on device and shares one transition definition across host sequence
 replay and the plain-decode and speculative-verification kernels, which are
-compiled with ``fast_dispatch.tpu_compile``.
+compiled with ``decorators.tpu_compile``.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Final, cast
 import numpy as np
 import torch
 
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.layers.adapter.sample.scatter_ops import scatter_slot_rows
 
 if TYPE_CHECKING:

@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 import torch
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
 
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import apply_top_k_top_p
 from vllm_torchtpu.logger import init_logger
 
