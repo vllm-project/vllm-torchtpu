@@ -23,6 +23,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
 )
 
+from vllm_torchtpu.compilation.direct_call import DirectCompiled, direct_compile
 from vllm_torchtpu.utils import small_lookup
 
 INVALID_TOKEN_ID = -1
@@ -329,7 +330,7 @@ def compute_num_rejected(
     return (num_draft - num_valid + 1).clamp(min=0).to(torch.int32)
 
 
-@torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+@direct_compile(backend="tpu")
 def spec_chunk_sources(
     next_tokens: torch.Tensor,
     drafts: torch.Tensor,
@@ -351,6 +352,6 @@ def spec_chunk_sources(
 
 
 # `subtract_num_rejected_tokens` as one program (eagerly: three).
-subtract_num_rejected_tokens_compiled = torch.compile(
-    subtract_num_rejected_tokens, backend="tpu", fullgraph=True, dynamic=False
+subtract_num_rejected_tokens_compiled = DirectCompiled(
+    subtract_num_rejected_tokens, backend="tpu"
 )
