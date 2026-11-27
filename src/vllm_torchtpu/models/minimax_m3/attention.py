@@ -473,15 +473,18 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.msa_op = get_msa_op(*msa_config, fp4=self.fp4)
         # A DCP group over one KV head reads q head-major (`get_msa_dcp_op`).
         self.q_head_major = self.dcp_size > 1 and self.dcp_kv_heads == 1
+        rotate = (
+            self.fp4
+            and self.dcp_size > 1
+            and fp4_dcp_rotates_queries(self.dcp_size, self.kv_head_replicas)
+        )
         self.norm_rope_op = get_qk_norm_rope_op(
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
             eps,
             self.q_head_major,
-            rotate=self.fp4
-            and self.dcp_size > 1
-            and fp4_dcp_rotates_queries(self.dcp_size, self.kv_head_replicas),
+            rotate=rotate,
         )
         # An SP step's two gathered row pieces go to the kernel as they are:
         # their concatenation in step order (`_step_rows`) cost a copy of qkv
@@ -498,9 +501,7 @@ class MiniMaxM3SparseAttention(nn.Module):
                 self.head_dim,
                 eps,
                 self.q_head_major,
-                rotate=self.fp4
-                and self.dcp_size > 1
-                and fp4_dcp_rotates_queries(self.dcp_size, self.kv_head_replicas),
+                rotate=rotate,
                 piece_ranks=tp_size,
             )
         if self.local_kv_heads > 1:
@@ -573,6 +574,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         elif qkv is None:
             qkv = self._qkv(hidden_states)
         if after is not None:
+            assert not isinstance(qkv, list), "per-half calls take one row block"
             # The caches are written in place: this call's writes must follow
             # the reads of the call that produced `after` (else XLA copies
             # the caches).

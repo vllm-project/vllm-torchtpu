@@ -145,7 +145,7 @@ def qk_norm_rope(
     q_head_major: bool = False,
     rotate: bool = False,
     block_tokens: int = DEFAULT_BLOCK_TOKENS,
-    piece_ranks: int = 1,
+    piece_ranks: int = 0,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """``(q, k, v, index_q, index_k)`` of ``qkv [T, (nq + 3 * nkv + 1) * D]``.
@@ -258,7 +258,7 @@ def _piece_rows(
     size: a divisor of a rank's rows per piece. A piece's block index stays
     put while another piece is read, so no block is fetched twice."""
     n, rows, width = len(pieces), pieces[0].shape[0], pieces[0].shape[1]
-    if any(p.shape != pieces[0].shape for p in pieces) or rows % ranks:
+    if ranks < 1 or any(p.shape != pieces[0].shape for p in pieces) or rows % ranks:
         raise ValueError(
             f"{n} pieces of {[p.shape for p in pieces]} over {ranks} ranks"
         )

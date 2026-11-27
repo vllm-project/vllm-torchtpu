@@ -571,10 +571,10 @@ def replica_rows(
                     jax.lax.bitcast_convert_type(x, jnp.uint16).astype(jnp.uint32)
                 )
         # A token's heads 2k and 2k + 1 share a 32-bit row of its bf16 tile
-        # (the even head in the low half): interleaving 16 rows of 32 bits
+        # (the even head in the low half): interleaving 8 rows of 32 bits
         # per token cost 31 us at 8K tokens, 16 bf16 rows 54 us (tpu7x).
-        pairs = [bits[2 * k] | (bits[2 * k + 1] << 16) for k in range(heads)]
-        o_ref.bitcast(jnp.uint32)[...] = jnp.stack(pairs, axis=1)
+        words = [bits[2 * k] | (bits[2 * k + 1] << 16) for k in range(heads)]
+        o_ref.bitcast(jnp.uint32)[...] = jnp.stack(words, axis=1)
 
     return pl.pallas_call(
         kernel,
