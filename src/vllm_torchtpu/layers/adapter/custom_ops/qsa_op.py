@@ -16,6 +16,7 @@ from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
     pooled_qsa_shard_pages_step,
     pooled_qsa_shard_select_rows_step,
     pooled_qsa_shard_select_step,
+    pooled_qsa_shared_main_kv_step,
     pooled_qsa_shared_rows_step,
     pooled_qsa_shared_step,
     pooled_qsa_step,
@@ -298,15 +299,20 @@ def build_pooled_qsa_rows_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor
 
 
 @functools.cache
-def build_pooled_qsa_shared_op(with_rows: bool):
+def build_pooled_qsa_shared_op(with_rows: bool, main_kv_only: bool = False):
     """``build_pooled_qsa_op`` (``with_rows``: ``build_pooled_qsa_rows_op``)
     taking a trailing ``shared`` operand: another layer's ``selected`` for
-    the attended rows, used in place of this layer's indexer selection."""
-    suffix = "_rows" if with_rows else ""
+    the attended rows, used in place of this layer's indexer selection.
+    ``main_kv_only`` (all-token only): ``pooled_qsa_shared_main_kv_step``."""
+    assert not (with_rows and main_kv_only)
+    if with_rows:
+        suffix, step = "_rows", pooled_qsa_shared_rows_step
+    elif main_kv_only:
+        suffix, step = "_main_kv_only", pooled_qsa_shared_main_kv_step
+    else:
+        suffix, step = "", pooled_qsa_shared_step
     op = pallas.jax_op(
-        f"qwen4_exp::pooled_qsa_shared{suffix}",
-        pooled_qsa_shared_rows_step if with_rows else pooled_qsa_shared_step,
-        donate_argnums=(10,),
+        f"qwen4_exp::pooled_qsa_shared{suffix}", step, donate_argnums=(10,)
     )
 
     def shapes(qgate, positions, pool, shared, compress_ratio, token_topk):

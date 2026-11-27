@@ -1591,9 +1591,12 @@ def qsa_cache_writes(
     max_query_len: int = 1,
     dcp: tuple[jax.Array, int] | None = None,
     compressed_dcp: tuple[jax.Array, int] | None = None,
+    write_indexer: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """One QSA layer's cache writes for a step's tokens: main K/V, the completed groups'
     compressed keys, ring rows and tags. Returns ``(pool, req, logical, valid)``.
+
+    ``write_indexer=False``: main K/V only (``pooled_qsa_shared_main_kv_step``).
 
     ``dcp=(rank, size)`` (VLLM_TPU_QSA_MAIN_KV_DCP; ``rank`` int32 ``[1]``): a main-KV
     block-table entry covers ``size`` physical pages' worth of tokens and this rank stores
@@ -1627,6 +1630,9 @@ def qsa_cache_writes(
     fp8 = pool.dtype == jnp.float8_e4m3fn
     rows_packed = pack_rows(k, v, fp8=fp8, k_scale=k_scale, v_scale=v_scale)
     slot_kw = {"slot": main_slot} if main_slot >= 0 else {}
+    if not write_indexer:
+        pool = write_main_cache(pool, rows_packed, page, logical, main_valid, **slot_kw)
+        return pool, req, logical, valid
     # Decode/verify-sized steps only; prefill keeps the bulk tile writers.
     fused = (
         envs.VLLM_TPU_QSA_FUSED_KV_WRITE
@@ -1761,8 +1767,12 @@ def _pooled_qsa(
     shared: jax.Array | None = None,
     dcp: tuple[jax.Array, int] | None = None,
     compressed_dcp: bool = False,
+    write_indexer: bool = True,
 ) -> tuple[jax.Array, ...]:
     """One QSA layer over the unified pool.
+
+    ``write_indexer=False`` (with ``shared``): ``qsa_cache_writes`` writes main K/V
+    only.
 
     ``compressed_dcp`` (VLLM_TPU_QSA_COMPRESSED_DCP, with ``dcp``): compressed
     keys are written and scored on their owner only. Without ``shared`` the
@@ -1833,6 +1843,7 @@ def _pooled_qsa(
         max_query_len=max_query_len,
         dcp=dcp,
         **({"compressed_dcp": dcp} if compressed_dcp else {}),
+        write_indexer=write_indexer,
     )
     fp8 = pool.dtype == jnp.float8_e4m3fn
     lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
@@ -3008,6 +3019,71 @@ def pooled_qsa_shared_step(
         main_slot,
         max_query_len=max_query_len,
         shared=shared,
+    )
+
+
+def pooled_qsa_shared_main_kv_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    shared: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shared_step`` writing main K/V only, not the indexer's ring rows,
+    tags and compressed keys: for the MTP draft's loop steps
+    (VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY). They attend a carried selection, so no indexer
+    reads those within the draft, and each position a loop step writes is a verify
+    row of the next step, whose draft step 0 rewrites it before any indexer reads
+    it."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        shared=shared,
+        write_indexer=False,
     )
 
 

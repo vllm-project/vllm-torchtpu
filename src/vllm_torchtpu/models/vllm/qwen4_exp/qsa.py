@@ -554,6 +554,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self._op = partial(build_pooled_qsa_op(), **keywords)
         self._rows_op = partial(build_pooled_qsa_rows_op(), **keywords)
         self._shared_ops = None
+        self._shared_main_kv_op = None
         if vllm_torchtpu_envs.VLLM_TPU_QSA_DRAFT_SHARED_SELECTION:
             from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
                 build_pooled_qsa_shared_op,
@@ -564,6 +565,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 partial(build_pooled_qsa_shared_op(False), **keywords),
                 partial(build_pooled_qsa_shared_op(True), **keywords),
             )
+            if vllm_torchtpu_envs.VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY:
+                self._shared_main_kv_op = partial(
+                    build_pooled_qsa_shared_op(False, main_kv_only=True), **keywords
+                )
         # The select op (`select_for_kernel`) is built here, outside the traced
         # forward (jax_op inspects the step signature, which Dynamo cannot trace),
         # and only when the megakernel is enabled: default serving never
@@ -654,6 +659,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                 self._rows_op = draft(False, True)
                 if self._shared_ops is not None:
                     self._shared_ops = (draft(True, False), draft(True, True))
+                    self._shared_main_kv_op = None  # _attach_mtp_tail refuses DCP
             if getattr(self, "token_shard", False) or getattr(
                 self, "replicated_token_shard", False
             ):
@@ -934,9 +940,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             output = tensor_model_parallel_all_reduce(output)
         return output, selected
 
-    def attend(self, hidden, positions, metadata: QSAMetadata):
-        """Gated attention output before ``o_proj`` (this rank's heads)."""
-        return self.attend_with_indices(hidden, positions, metadata)[0]
+    def attend(self, hidden, positions, metadata: QSAMetadata, main_kv_only=False):
+        """Gated attention output before ``o_proj`` (this rank's heads).
+        ``main_kv_only``: see ``attend_with_indices``."""
+        return self.attend_with_indices(
+            hidden, positions, metadata, main_kv_only=main_kv_only
+        )[0]
 
     def attend_with_indices(
         self,
@@ -949,12 +958,16 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         shared=None,
         decode_token_shard=False,
         write_sink=True,
+        main_kv_only=False,
     ):
         """``forward_with_indices`` without the output projection and all-reduce.
 
         ``shared`` (pooled, VLLM_TPU_QSA_DRAFT_SHARED_SELECTION): another QSA
         layer's ``selected`` for the attended rows (one per ``rows`` entry);
         it replaces this layer's indexer selection.
+        ``main_kv_only`` (an MTP draft loop step on the carried selection,
+        VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY): write main K/V only, not the indexer's
+        ring and compressed keys (``pooled_qsa_shared_main_kv_step``).
         """
         assert len(self.cache_owners) == (1 if self.pooled else 4), (
             "Task4 must bind real or profiling scratch QSA owners"
@@ -1021,6 +1034,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         use_shared = shared is not None and shared_ops is not None and not pick_rows
         if use_shared:
             op = shared_ops[rows is not None]
+        if main_kv_only:
+            assert use_shared and rows is None, "main_kv_only: an all-token shared step"
+            assert self._shared_main_kv_op is not None, (
+                "main_kv_only: VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY unset at pool binding"
+            )
+            op = self._shared_main_kv_op
         assert op is not None
         output, selected = op(
             self.q_proj(hidden),

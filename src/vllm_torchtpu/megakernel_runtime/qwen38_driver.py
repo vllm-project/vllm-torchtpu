@@ -2157,6 +2157,16 @@ class Qwen38SegmentDriver:
                 tuple(o_proj.shape),
             )
             return
+        if envs.VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY and (
+            getattr(draft_attn, "_selection_source", None) is None
+            or getattr(draft_attn, "main_kv_dcp", 1) > 1
+        ):
+            _mk_fail(
+                "Qwen3.8 MTP tail: VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY needs the draft "
+                "bound to the target's selection (VLLM_TPU_QSA_DRAFT_SHARED_SELECTION) "
+                "and whole-page main KV (no VLLM_TPU_QSA_MTP_KV_DCP)"
+            )
+            return
         chunk = min(max(self.buckets), KERNEL_ROWS)
         try:
             kind = MtpTailKind(

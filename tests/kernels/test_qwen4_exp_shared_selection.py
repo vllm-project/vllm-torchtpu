@@ -44,6 +44,32 @@ def test_shared_step_reproduces_the_step_from_its_own_selection(rowwise_attentio
     np.testing.assert_array_equal(np.asarray(got_selected), np.asarray(want_selected))
 
 
+@pytest.mark.parametrize("fp8", [False, True])
+def test_main_kv_only_step_skips_only_the_indexer_writes(rowwise_attention, fp8):
+    """VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY: the same output and selected tokens as the
+    shared step; of the bytes the shared step writes, it writes the main K/V ones
+    (same values) and leaves the rings, tags and compressed keys as they were."""
+    head, pool, tail = _inputs(fp8, STARTS, CONTEXT)
+    full = jax.jit(lambda *a: pooled_qsa.pooled_qsa_step(*a, **SHARED_OPTIONS))
+    _, _, selected = full(*head, pool, *tail)
+    shared = jax.jit(lambda *a: pooled_qsa.pooled_qsa_shared_step(*a, **SHARED_OPTIONS))
+    main_kv = jax.jit(
+        lambda *a: pooled_qsa.pooled_qsa_shared_main_kv_step(*a, **SHARED_OPTIONS)
+    )
+    want_pool, want_out, want_selected = shared(*head, pool, *tail, selected)
+    got_pool, got_out, got_selected = main_kv(*head, pool, *tail, selected)
+    np.testing.assert_array_equal(np.asarray(got_out), np.asarray(want_out))
+    np.testing.assert_array_equal(np.asarray(got_selected), np.asarray(want_selected))
+    before, want, got = _bytes(pool), _bytes(want_pool), _bytes(got_pool)
+    wrote_full, wrote_main = want != before, got != before
+    assert wrote_main.any() and not (wrote_main & ~wrote_full).any()
+    np.testing.assert_array_equal(got[wrote_main], want[wrote_main])
+    assert (wrote_full & ~wrote_main).any()  # ring / tags / compressed keys
+    # The rest of the shared step's writes, applied on top, give its pool.
+    again, _, _ = shared(*head, got_pool, *tail, selected)
+    np.testing.assert_array_equal(_bytes(again), want)
+
+
 @pytest.mark.parametrize("rows", [[2, 6, -1], [1, 6, 6]])
 def test_shared_rows_step_reproduces_the_rows_step(rowwise_attention, rows):
     head, pool, tail = _inputs(False, STARTS, CONTEXT)

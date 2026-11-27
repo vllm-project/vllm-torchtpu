@@ -186,6 +186,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MK_DRAFT: bool = False
     VLLM_TPU_MK_DRAFT_FUSED_LOOP: bool = False
     VLLM_TPU_MK_DRAFT_LOOP: bool = False
+    VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY: bool = False
     VLLM_TPU_MK_QSEL_ASYNC: bool = False
     VLLM_TPU_MK_QSA_XREQ_PREFETCH: int = 0
     VLLM_TPU_MK_QSA_XREQ_STREAM_ROWS: int = 16
@@ -1335,6 +1336,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # device order, and only that flag puts the draft MoE's EP mesh in the MK
     # draft kernel's (rank) order; without it the program fails to compile.
     "VLLM_TPU_MK_DRAFT_FUSED_LOOP": env_bool("VLLM_TPU_MK_DRAFT_FUSED_LOOP"),
+    # With VLLM_TPU_QSA_DRAFT_SHARED_SELECTION and the MTP tail kernel
+    # (VLLM_TPU_MEGAKERNEL=...,mtp=1): the draft's fused-loop steps write main K/V
+    # only, not the indexer's ring rows, tags and compressed keys. Those steps attend
+    # the carried selection, and every position they write is a verify row of the
+    # next step, whose draft step 0 rewrites it before any indexer reads it.
+    "VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY": env_bool("VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY"),
     # Whole-step QSA selection: the per-row id copies into SMEM and the new group's
     # loads / stores are issued together and waited once instead of in start-wait
     # pairs (distinct destinations; same bytes).

@@ -210,9 +210,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
     @staticmethod
     def _tail_attention(hidden, positions, layer, starts, seq_lens, context, tables,
-                        rows=None):
+                        rows=None, loop_step=False):
         """Stock attention (caches written for every token) before the tail kernel:
-        `(hidden at the attended rows, attention)`."""
+        `(hidden at the attended rows, attention)`. `loop_step` (a fused-loop step,
+        VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY): main K/V only."""
         block, _ = layer.attn_hyper_connection.mix(hidden)
         qsa_md = QSAMetadata(
             starts,
@@ -228,7 +229,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                 block, pos, qsa_md, rows=rows
             )[0]
             return hidden[rows.clamp_min(0)], attention
-        return hidden, layer.self_attn.attend(block, pos, qsa_md)
+        main_kv_only = loop_step and vllm_torchtpu_envs.VLLM_TPU_MTP_LOOP_MAIN_KV_ONLY
+        return hidden, layer.self_attn.attend(
+            block, pos, qsa_md, main_kv_only=main_kv_only
+        )
 
     def forward_greedy(self, input_ids, positions, hidden_states, step):
         """`(next hidden carry, greedy tokens int32)` of a fused-loop step through the
@@ -241,7 +245,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             input_ids, positions, hidden_states, None, step
         )
         hidden, attention = self._tail_attention(
-            hidden, positions, layer, starts, seq_lens, context, tables
+            hidden, positions, layer, starts, seq_lens, context, tables,
+            loop_step=step > 0,
         )
         return tail.greedy(hidden, attention)
 
@@ -258,7 +263,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         # all-token path below is the fused loop's (<= request capacity rows).
         if tail is not None:
             hidden, attention = self._tail_attention(
-                hidden, positions, layer, starts, seq_lens, context, tables, rows
+                hidden, positions, layer, starts, seq_lens, context, tables, rows,
+                loop_step=step > 0,
             )
             hidden = tail(hidden, attention)
             return self.hyper_connection_mixer.mix(hidden)[0], hidden
