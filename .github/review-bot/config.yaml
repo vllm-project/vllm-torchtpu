@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Settings for the PR review bot (tpu-oss-review-bot). Every value below is
-# the bot's default, so this file changes nothing until someone edits it.
+# the bot's default except `max_inline_comments`.
 # README.md in this folder explains each setting. REVIEW.md is the guide the
 # bot follows.
 #
@@ -30,7 +30,7 @@ nits: summary
 questions: summary
 
 # Most inline comments in one review: a whole number from 0 to 30.
-max_inline_comments: 15
+max_inline_comments: 20
 
 # Problem labels that get inline comments: "blocking, should-fix" or "blocking".
 inline_labels: "blocking, should-fix"

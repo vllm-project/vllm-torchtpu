@@ -25,7 +25,7 @@ disagree about a code rule, the bot follows `AGENTS.md`.
 
 ## Settings in config.yaml
 
-The values in `config.yaml` today are the defaults.
+The values in `config.yaml` today are the defaults, except `max_inline_comments`, which is 20.
 
 | Setting | Possible values | Default | What it does |
 | --- | --- | --- | --- |
