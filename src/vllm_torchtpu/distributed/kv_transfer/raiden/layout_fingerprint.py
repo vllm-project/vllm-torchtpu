@@ -127,6 +127,7 @@ def measured_fa_layout_fingerprint(
     manifest: PoolManifest,
     *,
     block_major: bool = False,
+    rope_in_graph: bool,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
@@ -197,6 +198,10 @@ def measured_fa_layout_fingerprint(
         "gdn_conv_layout": (
             "qk-pair-v1" if tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT else "legacy-split-qk"
         ),
+        # In-graph RoPE changes cos/sin (not bit-identical to the table), and
+        # K is rotated before KV storage, so disaggregated peers must agree on
+        # the switch.
+        "rope_in_graph": rope_in_graph,
     }
     # The conv and SSM state dtypes are not visible in the layout version or
     # the FA geometry, so a peer on another state dtype would otherwise pair.
@@ -230,6 +235,7 @@ def measured_kimi_k3_layout_fingerprint(
     page_tokens: int,
     state_fragment_heads: int,
     state_fragments: int,
+    rope_in_graph: bool,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
@@ -278,6 +284,7 @@ def measured_kimi_k3_layout_fingerprint(
     payload["gdn_state_layouts"] = state_layouts
     payload["gdn_conv_layout"] = "kda-rank-blocked-tap-qkv-head-dim-fp32-v1"
     payload["state_fragment_heads"] = int(state_fragment_heads)
+    payload["rope_in_graph"] = rope_in_graph
     return canonical_layout_fingerprint(payload), payload
 
 
@@ -285,6 +292,7 @@ def measured_glm_layout_fingerprint(
     manifest: PoolManifest,
     *,
     page_tokens: int,
+    rope_in_graph: bool,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
     hash_indexer: bool = True,
@@ -314,6 +322,7 @@ def measured_glm_layout_fingerprint(
         "libtpu": libtpu_key(package_version),
         "page_tokens": int(page_tokens),
         "layouts": layouts,
+        "rope_in_graph": rope_in_graph,
     }
     return canonical_layout_fingerprint(payload), payload
 
@@ -321,6 +330,7 @@ def measured_glm_layout_fingerprint(
 def measured_dsv4_layout_fingerprint(
     manifest: PoolManifest,
     *,
+    rope_in_graph: bool,
     layout_getter: Callable[[Any], Any] | None = None,
     package_version: Callable[[str], str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
@@ -338,6 +348,7 @@ def measured_dsv4_layout_fingerprint(
         "torch_tpu": version("torch_tpu"),
         "libtpu": libtpu_key(package_version),
         "layouts": layouts,
+        "rope_in_graph": rope_in_graph,
     }
     return canonical_layout_fingerprint(payload), payload
 
