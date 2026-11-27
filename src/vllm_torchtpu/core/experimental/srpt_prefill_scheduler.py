@@ -78,6 +78,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.core.scheduler_utils import run_decoders_first
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -265,12 +266,11 @@ class SrptPrefillScheduler(AsyncScheduler):
         )
 
     def _order_running(self) -> None:
-        decoding = [r for r in self.running if not r.is_prefill_chunk]
-        prefilling = sorted(
-            (r for r in self.running if r.is_prefill_chunk),
-            key=lambda r: (not self._is_stalled(r), self._remaining(r)),
+        run_decoders_first(
+            self.running,
+            lambda r: not r.is_prefill_chunk,
+            lambda r: (not self._is_stalled(r), self._remaining(r)),
         )
-        self.running[:] = decoding + prefilling
 
     def _prune_hold_state(self) -> None:
         prefilling = {r.request_id for r in self.running if r.is_prefill_chunk}

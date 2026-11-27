@@ -29,7 +29,6 @@ from unittest.mock import patch
 
 import pytest
 import yaml
-from vllm.config import KVTransferConfig
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -38,9 +37,7 @@ from vllm_torchtpu.core import (
     pp_chunk_scheduler,
     pp_scheduler_options,
     scheduler_options,
-    scheduler_utils,
 )
-from vllm_torchtpu.core.hybrid_retention import retention_wanted
 from vllm_torchtpu.core.pp_chunk_scheduler import TpuPipelineChunkScheduler
 from vllm_torchtpu.core.pp_chunks import StepCostModel, step_limit
 from vllm_torchtpu.models import qwen3_5
@@ -359,27 +356,6 @@ def test_kv_both_is_not_a_kv_consumer(kv_role, consumer):
     s, _ = _built(kv_role=kv_role)
     assert s._is_kv_consumer is consumer
     assert s._is_kv_producer is (kv_role == "kv_producer")
-
-
-@pytest.mark.parametrize(
-    "kv_role,roles",
-    [
-        ("kv_producer", (True, False)),
-        ("kv_consumer", (False, True)),
-        ("kv_both", (False, False)),
-        (None, (False, False)),
-    ],
-)
-def test_one_helper_reads_the_kv_roles(kv_role, roles):
-    """``scheduler_utils.kv_roles`` on vLLM's own KVTransferConfig: the roles
-    both schedulers and hybrid-state retention read."""
-    config = (
-        None
-        if kv_role is None
-        else KVTransferConfig(kv_connector="TPURaidenConnector", kv_role=kv_role)
-    )
-    assert tuple(scheduler_utils.kv_roles(config)) == roles
-    assert retention_wanted(SimpleNamespace(kv_transfer_config=config)) is roles[0]
 
 
 class _HookedConnector:

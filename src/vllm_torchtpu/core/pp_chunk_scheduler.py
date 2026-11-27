@@ -69,7 +69,7 @@ from vllm_torchtpu.core.prefix_aware_scheduler import (
     memo_local_prefix_cache_hit,
     trim_resend_token_ids,
 )
-from vllm_torchtpu.core.scheduler_utils import kv_roles
+from vllm_torchtpu.core.scheduler_utils import kv_roles, run_decoders_first
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -683,12 +683,13 @@ class TpuPipelineChunkScheduler(Scheduler):
         now_wall = time.time()
         self._step_wall_time = now_wall
         if self._srpf_running and len(self.running) > 1:
-            decoding = [r for r in self.running if _is_decoding(r)]
-            prefilling = [r for r in self.running if not _is_decoding(r)]
-            if len(prefilling) > 1:
-                prefilling.sort(key=lambda r: self._aged_prefill_key(r, now_wall))
-            if prefilling and (decoding or len(prefilling) > 1):
-                self.running[:] = decoding + prefilling
+            # Decoders first, then running prefills shortest remaining (aged)
+            # first.
+            run_decoders_first(
+                self.running,
+                _is_decoding,
+                lambda r: self._aged_prefill_key(r, now_wall),
+            )
         if self._paw_sort:
             try:
                 self._sort_waiting_queue()

@@ -68,6 +68,7 @@ from vllm_torchtpu.core.scheduler_utils import (
     format_counts,
     is_waiting_status,
     kv_roles,
+    run_decoders_first,
 )
 
 if TYPE_CHECKING:
@@ -616,16 +617,10 @@ class PrefixAwareScheduler(AsyncScheduler):
             if self._promote_warmest_on():
                 self._promote_warmest(self.kv_holding_waiting or self.waiting)
             return super().schedule(*args, **kwargs)
-        # Decoders first: vLLM schedules ``running`` in list order and a
-        # partial prefill takes min(remaining, budget), so a prefill ahead of
-        # a decoder can leave it no tokens. Stably move every decoding request
-        # ahead of every prefilling one. vLLM's FCFS preemption takes
-        # running[-1], so under KV pressure a request still prefilling here
-        # is preempted before any decoder.
-        decoding = [r for r in self.running if _is_decoding(r)]
-        prefilling = [r for r in self.running if not _is_decoding(r)]
-        if prefilling and decoding:
-            self.running[:] = decoding + prefilling
+        # Decoders first, prefills in their order: a prefill ahead of a
+        # decoder can leave it no tokens, and preemption takes the last
+        # prefill before any decoder.
+        decoding, prefilling = run_decoders_first(self.running, _is_decoding)
         self._step_wait_event = None
         waiting_at_start = len(self.waiting)
         if getattr(self, "_memo_xstep", False):

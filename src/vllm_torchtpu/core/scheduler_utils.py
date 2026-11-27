@@ -13,7 +13,8 @@
 # limitations under the License.
 """Helpers shared by the TPU schedulers and hybrid-state retention."""
 
-from typing import NamedTuple
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 from vllm.config import KVTransferConfig
 from vllm.v1.request import Request, RequestStatus
@@ -24,6 +25,29 @@ _WAITING_STATUSES = (RequestStatus.WAITING, RequestStatus.PREEMPTED)
 def is_waiting_status(request: Request) -> bool:
     """Whether ``request`` sits in the waiting queue (WAITING or PREEMPTED)."""
     return request.status in _WAITING_STATUSES
+
+
+def run_decoders_first(
+    running: list[Request],
+    is_decoding: Callable[[Request], bool],
+    prefill_key: Callable[[Request], Any] | None = None,
+) -> tuple[list[Request], list[Request]]:
+    """Reorders ``running`` in place: every decoding request first, in its
+    current order, then every prefilling one, stably sorted by
+    ``prefill_key`` (in its current order without a key). Returns the
+    decoding and the prefilling requests.
+
+    vLLM schedules ``running`` in list order, and a partial prefill takes
+    min(remaining, budget), so a prefill ahead of a decoder can leave it no
+    tokens; its FCFS preemption takes ``running[-1]``, so under KV pressure a
+    prefilling request is preempted before any decoder.
+    """
+    decoding = [r for r in running if is_decoding(r)]
+    prefilling = [r for r in running if not is_decoding(r)]
+    if prefill_key is not None:
+        prefilling.sort(key=prefill_key)
+    running[:] = decoding + prefilling
+    return decoding, prefilling
 
 
 def format_counts(counts: dict[str, int]) -> str:
