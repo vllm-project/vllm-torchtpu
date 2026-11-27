@@ -41,7 +41,7 @@ logger = init_logger(__name__)
 
 _kernel_instance_counter = 0
 _fused_moe_kernel_cache: dict[
-    tuple[int, str, bool, Any, bool, bool, bool], Callable
+    tuple[int, str, bool, Any, bool, bool, bool, bool], Callable
 ] = {}
 _load_kmajor_fp4_op = None
 _requant_kmajor_fp4_ops: dict[int, Callable] = {}
@@ -212,6 +212,7 @@ def _build_fused_moe_custom_op(
     skip_padded_tokens: bool,
     rhs_quant_dtype=None,
     topk_weights_float32: bool = False,
+    return_rows: bool = False,
 ) -> Callable:
     kernel_instance_id = _allocate_kernel_instance_id()
     op_name = f"pallas::fused_moe_kernel_{kernel_instance_id}"
@@ -237,6 +238,7 @@ def _build_fused_moe_custom_op(
         rhs_quant_dtype=rhs_quant_dtype,
         skip_padded_tokens=skip_padded_tokens,
         topk_weights_float32=topk_weights_float32,
+        return_rows=return_rows,
     )
 
     fused_moe_kernel_impl = pallas.jax_op(op_name, wrapped_fn)
@@ -244,6 +246,9 @@ def _build_fused_moe_custom_op(
     # We must overwrite the default fake implementation as vLLM uses dynamic
     # dimensions for the hidden_states.
     def _fake_fused_moe(hidden_states, *args, **kwargs):
+        if return_rows:
+            num_tokens, hidden_size = hidden_states.shape
+            return hidden_states.new_empty((num_tokens, topk, hidden_size))
         return torch.empty_like(hidden_states)
 
     fused_moe_kernel_impl.register_fake(_fake_fused_moe)
@@ -259,6 +264,7 @@ def _get_fused_moe_custom_op(
     skip_padded_tokens: bool,
     has_row_info: bool,
     topk_weights_float32: bool = False,
+    return_rows: bool = False,
 ) -> Callable:
     # A custom op is always called with the same operands, so the variant that
     # takes ``row_info`` (the BF16 row-count filter) is a separate op.
@@ -270,6 +276,7 @@ def _get_fused_moe_custom_op(
         skip_padded_tokens,
         topk_weights_float32,
         has_row_info,
+        return_rows,
     )
     kernel = _fused_moe_kernel_cache.get(cache_key)
     if kernel is None:
@@ -280,6 +287,7 @@ def _get_fused_moe_custom_op(
             rhs_quant_dtype=rhs_quant_dtype,
             skip_padded_tokens=skip_padded_tokens,
             topk_weights_float32=topk_weights_float32,
+            return_rows=return_rows,
         )
         _fused_moe_kernel_cache[cache_key] = kernel
     return kernel
@@ -294,6 +302,7 @@ def prebuild_fused_moe_kernel(
     skip_padded_tokens: bool | None = None,
     topk_weights_float32: bool = False,
     has_row_info: bool = False,
+    return_rows: bool = False,
 ) -> None:
     """Prebuild and cache fused MoE custom op outside compile-time tracing.
 
@@ -310,6 +319,7 @@ def prebuild_fused_moe_kernel(
         skip_padded_tokens=skip_padded_tokens,
         has_row_info=has_row_info,
         topk_weights_float32=topk_weights_float32,
+        return_rows=return_rows,
     )
 
 
@@ -330,6 +340,7 @@ def fused_moe_gmm(
     skip_padded_tokens: bool | None = None,
     topk_weights_float32: bool = False,
     row_info: torch.Tensor | None = None,
+    return_rows: bool = False,
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
@@ -346,6 +357,9 @@ def fused_moe_gmm(
     program identical across ranks. The kernel remaps global ids to local ids
     with an elementwise subtract and masks non-local experts. When present,
     the sparse-core parity path dispatches ragged gather/gather-reduce.
+
+    With ``return_rows`` the result is the unweighted expert rows
+    [num_tokens, topk, hidden].
     """
     if skip_padded_tokens is None:
         skip_padded_tokens = envs.TPU_MOE_SKIP_PADDED_TOKENS
@@ -358,6 +372,7 @@ def fused_moe_gmm(
         skip_padded_tokens=skip_padded_tokens,
         has_row_info=row_info is not None,
         topk_weights_float32=topk_weights_float32,
+        return_rows=return_rows,
     )
     if experts_start is None:
         # The compiled program for use_ep=False never reads this operand

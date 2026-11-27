@@ -217,6 +217,48 @@ class TestNvfp4Config:
         assert cfg.get_quant_method(layer, "model.norm") is None
 
 
+class TestNvfp4ModulesToNotConvert:
+    """Checkpoints exported through transformers list their unquantized
+    modules in modules_to_not_convert; from_config adds them to the
+    exclusions."""
+
+    def test_adds_listed_modules_after_existing_exclusions(self):
+        cfg = VllmNvfp4Config.from_config(
+            {
+                "quant_algo": "NVFP4",
+                "ignore": ["lm_head", "model.layers.0.self_attn.o_proj"],
+                "modules_to_not_convert": [
+                    "model.layers.0.self_attn.o_proj",
+                    "model.layers.0.mlp.gate",
+                ],
+            }
+        )
+        assert cfg.exclude_modules == [
+            "lm_head",
+            "model.layers.0.self_attn.o_proj",
+            "model.layers.0.mlp.gate",
+        ]
+
+    @pytest.mark.parametrize("not_converted", [{}, {"modules_to_not_convert": None}])
+    def test_missing_field_keeps_exclusions(self, not_converted):
+        cfg = VllmNvfp4Config.from_config(
+            {"quant_algo": "NVFP4", "ignore": ["lm_head"], **not_converted}
+        )
+        assert cfg.exclude_modules == ["lm_head"]
+
+    def test_listed_linear_dispatches_unquantized(self):
+        cfg = VllmNvfp4Config.from_config(
+            {
+                "quant_algo": "NVFP4",
+                "modules_to_not_convert": ["model.layers.0.mlp.pre_expert_proj"],
+            }
+        )
+        layer = make_linear_layer(64, 32)
+        method = cfg.get_quant_method(layer, "model.layers.0.mlp.pre_expert_proj")
+        assert isinstance(method, VllmUnquantizedLinearMethod)
+        assert not cfg.is_layer_excluded("model.layers.0.mlp.post_expert_proj")
+
+
 class TestNvfp4LinearMethod:
     """Tests for VllmNvfp4LinearMethod weight creation, processing, and apply."""
 

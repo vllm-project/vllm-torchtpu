@@ -262,6 +262,17 @@ class VllmNvfp4Config(ModelOptNvFp4Config, VllmQuantConfig):
     def get_name(cls) -> QuantizationMethods:
         return NVFP4
 
+    @classmethod
+    def from_config(cls, config: dict[str, Any]) -> VllmNvfp4Config:
+        quant_config = cast("VllmNvfp4Config", super().from_config(config))
+        # Checkpoints exported through transformers also list every unquantized
+        # module by full name in modules_to_not_convert.
+        not_converted = config.get("modules_to_not_convert") or []
+        quant_config.exclude_modules = list(
+            dict.fromkeys([*quant_config.exclude_modules, *not_converted])
+        )
+        return quant_config
+
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
         super().apply_vllm_mapper(hf_to_vllm_mapper)
         map_online_fp8(self, hf_to_vllm_mapper)
@@ -311,6 +322,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
 
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+    # False for layers whose model calls gmm_v2 itself: an admitted fused EP op
+    # would requantize the experts to its block size and never run.
+    allow_fused_ep: bool = True
 
     def __init__(self, quant_config: VllmNvfp4Config, moe_config):
         # Skip ModelOptNvFp4FusedMoE.__init__ (it selects a GPU experts backend).
@@ -393,7 +407,9 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             "TPU NVFP4 MoE expects gated (act_and_mul) experts with a "
             "[gate; up] w13 layout and a per-w1/w3 global scale [E, 2]."
         )
-        self._use_adaptive_fused_moe = envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        self._use_adaptive_fused_moe = (
+            self.allow_fused_ep and envs.MOE_FUSED_EP_KERNEL_IMPL == "adaptive"
+        )
         activation_str = self._set_tpu_activation(layer)
 
         # --- fuse E4M3 block scale * FP32 per-tensor global -> FP32 block scale.
@@ -424,8 +440,10 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             op, requant_block = adaptive_moe.prebuild_adaptive_nvfp4(
                 layer, activation_str, configured_block
             )
-        else:
+        elif self.allow_fused_ep:
             op, requant_block = _prebuild_w4a8(layer, activation_str, configured_block)
+        else:
+            op, requant_block = None, configured_block
         weights, mode = _prepare_moe_weights(
             layer, w13_scale_f, w2_scale_f, requant_block
         )

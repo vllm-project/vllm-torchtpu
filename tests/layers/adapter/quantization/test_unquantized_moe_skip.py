@@ -228,9 +228,9 @@ def test_init_outside_runner_scope_runs_stock(monkeypatch):
     "skip, expected_keys",
     [
         # (topk, activation, use_ep, rhs_quant_dtype, skip_padded_tokens,
-        #  topk_weights_float32, has_row_info)
-        (False, [(_TOPK, "silu", False, None, False, False, False)]),
-        (True, [(_TOPK, "silu", False, None, True, False, True)]),
+        #  topk_weights_float32, has_row_info, return_rows)
+        (False, [(_TOPK, "silu", False, None, False, False, False, False)]),
+        (True, [(_TOPK, "silu", False, None, True, False, True, False)]),
     ],
 )
 def test_process_weights_after_loading_prebuilds_expected_kernels(

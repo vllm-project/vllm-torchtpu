@@ -670,6 +670,62 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
+def moe_gmm_rows(
+    x: jax.Array,
+    w1: jax.Array,
+    w1_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2: jax.Array,
+    w2_scale: jax.Array | None,
+    w2_bias: jax.Array | None,
+    group_sizes: jax.Array,
+    argsort_revert_indices: jax.Array,
+    valid_mask_flat: jax.Array,
+    *,
+    activation: str,
+    num_tokens: int,
+    topk: int,
+    rhs_quant_dtype: jnp.dtype | None = None,
+) -> jax.Array:
+    """Run grouped GEMM and return one row per token and selected expert.
+
+    The rows are [num_tokens, topk, N] before the weighted sum, so a model can
+    transform each expert's output first. The activation runs in FP32 between
+    the two GEMMs, whose outputs round to the activation dtype.
+    """
+    if activation != "silu":
+        raise NotImplementedError(f"Expert rows support silu, got {activation}")
+    group_offset = jnp.array([0], dtype=jnp.int32)
+    gate_up = gmm_wrapper(
+        x,
+        w1,
+        w1_scale,
+        w1_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        preferred_element_type=x.dtype,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    gate, up = jnp.split(gate_up, 2, axis=-1)
+    activated = (jax.nn.silu(gate.astype(jnp.float32)) * up.astype(jnp.float32)).astype(
+        x.dtype
+    )
+    rows = gmm_wrapper(
+        activated,
+        w2,
+        w2_scale,
+        w2_bias,
+        group_sizes,
+        group_offset,
+        zero_initialize=False,
+        preferred_element_type=x.dtype,
+        rhs_quant_dtype=rhs_quant_dtype,
+    )
+    rows = jnp.where(valid_mask_flat[:, None], rows[argsort_revert_indices], 0)
+    return rows.reshape(num_tokens, topk, rows.shape[-1])
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -681,6 +737,7 @@ def moe_gmm(
         "rhs_quant_dtype",
         "skip_padded_tokens",
         "topk_weights_float32",
+        "return_rows",
     ),
 )
 def fused_moe_func(
@@ -703,6 +760,7 @@ def fused_moe_func(
     rhs_quant_dtype: jnp.dtype | None = None,
     skip_padded_tokens: bool = False,
     topk_weights_float32: bool = False,
+    return_rows: bool = False,
 ) -> jax.Array:
     """Run MoE with precomputed expert ids and weights.
 
@@ -722,6 +780,10 @@ def fused_moe_func(
     weights. Currently, only INT4 logical weights packed inside INT32 or UINT32 carrier
     containers are supported. Weights must be packed along the contracting dimension
     (K-axis) in LSB-first order.
+
+    With ``return_rows``, the result is the unweighted expert rows
+    [num_tokens, topk, hidden] (see ``moe_gmm_rows``) instead of their
+    weighted sum.
     """
 
     # Convert 3D scale [experts, blocks, N] to 4D [experts, blocks, 1, N]
@@ -772,6 +834,7 @@ def fused_moe_func(
     # changes.
     if (
         row_info is None
+        and not return_rows
         and 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD
         and can_use_dense_expert(
             hidden_states,
@@ -811,6 +874,24 @@ def fused_moe_func(
         row_info=row_info,
     )
     x = jnp.pad(x, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    if return_rows:
+        rows = moe_gmm_rows(
+            x,
+            w1,
+            w1_scale,
+            w1_bias,
+            w2,
+            w2_scale,
+            w2_bias,
+            group_sizes,
+            argsort_revert_indices,
+            valid_mask,
+            activation=activation,
+            num_tokens=num_tokens,
+            topk=topk,
+            rhs_quant_dtype=rhs_quant_dtype,
+        )
+        return rows[..., :hidden_size]
     x = moe_gmm(
         x,
         w1,
