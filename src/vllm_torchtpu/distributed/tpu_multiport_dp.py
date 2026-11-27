@@ -206,6 +206,12 @@ def engine_core_kwargs(kwargs: dict) -> dict:
     kwargs = dict(kwargs)
     kwargs["local_dp_rank"] = dp_rank % local_size
     parallel_config.data_parallel_size_local = local_size
+    # This runs before vLLM's run_engine_core, which configures logging in the
+    # engine-core process first thing; until then a spawned engine core drops
+    # INFO records. Apply the engine's logging config first, as it does.
+    from vllm.logger import configure_logging_if_needed
+
+    configure_logging_if_needed(vllm_config.logging_config)
     logger.info(
         "TPU multi-port DP: engine core dp_rank=%d -> local_dp_rank=%d, "
         "data_parallel_size_local=%d",

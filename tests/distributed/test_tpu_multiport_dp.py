@@ -15,10 +15,15 @@
 that a DPSupervisor child needs, and that nothing changes with the option off."""
 
 import os
+import subprocess
+import sys
+import textwrap
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import vllm.logger as vllm_logger
+from vllm.config.logging import LoggingConfig
 from vllm.platforms.interface import Platform
 from vllm.v1.engine.core import EngineCoreProc
 
@@ -42,6 +47,12 @@ def isolated_environment(monkeypatch):
         # Track absent keys too: the module writes os.environ directly.
         monkeypatch.setenv(key, os.environ.get(key, ""))
         monkeypatch.delenv(key)
+    # engine_core_kwargs records the logging config it applies.
+    monkeypatch.setattr(
+        vllm_logger,
+        "_last_configured_logging_config",
+        vllm_logger._last_configured_logging_config,
+    )
 
 
 ON = {"tpu_multiport_dp": {"enabled": True}}
@@ -49,7 +60,10 @@ ON = {"tpu_multiport_dp": {"enabled": True}}
 
 def _vllm_config(pc, additional=None):
     return SimpleNamespace(
-        parallel_config=pc, additional_config={} if additional is None else additional
+        parallel_config=pc,
+        additional_config={} if additional is None else additional,
+        # Leaves this process's logging as it is.
+        logging_config=LoggingConfig(configure_logging=False),
     )
 
 
@@ -83,6 +97,8 @@ def _bootstrap():
     [{}, None, {"tpu_multiport_dp": {}}, {"tpu_multiport_dp": {"enabled": False}}],
 )
 def test_off_changes_nothing(monkeypatch, additional):
+    configure = Mock()
+    monkeypatch.setattr(vllm_logger, "configure_logging_if_needed", configure)
     pc = _child_config(2)
     cfg = _vllm_config(pc, additional)
     assert mpdp.local_dp_size(cfg) == 0
@@ -92,6 +108,8 @@ def test_off_changes_nothing(monkeypatch, additional):
     kwargs = {"vllm_config": cfg, "dp_rank": 2, "local_dp_rank": 0}
     assert mpdp.engine_core_kwargs(kwargs) is kwargs
     assert pc.data_parallel_size_local == 1
+    # The engine core's logging stays vLLM's to configure.
+    configure.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -206,14 +224,18 @@ def test_validation_is_a_no_op_with_the_option_off(monkeypatch):
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
 def test_engine_core_gets_its_host_slot(monkeypatch, rank):
+    configure = Mock()
+    monkeypatch.setattr(vllm_logger, "configure_logging_if_needed", configure)
     pc = _child_config(rank)
+    cfg = _vllm_config(pc, ON)
     kwargs = {
-        "vllm_config": _vllm_config(pc, ON),
+        "vllm_config": cfg,
         "dp_rank": rank,
         "local_dp_rank": 0,
         "log_stats": True,
     }
     out = mpdp.engine_core_kwargs(kwargs)
+    configure.assert_called_once_with(cfg.logging_config)
     assert out["local_dp_rank"] == rank
     assert out["dp_rank"] == rank and out["log_stats"] is True
     assert pc.data_parallel_size_local == 4
@@ -225,6 +247,67 @@ def test_engine_core_of_internal_lb_is_left_alone(monkeypatch):
     kwargs = {"vllm_config": _vllm_config(pc, ON), "dp_rank": 3, "local_dp_rank": 3}
     assert mpdp.engine_core_kwargs(kwargs) is kwargs
     assert pc.data_parallel_size_local == 1
+
+
+# The engine-core entry point in a fresh interpreter, as vLLM's spawned engine
+# core runs it: vLLM has not configured logging yet there.
+_FRESH_ENGINE_CORE = textwrap.dedent(
+    """
+    from types import SimpleNamespace
+
+    import vllm_torchtpu as plugin
+    import vllm_torchtpu.core.pp_chunk_scheduler as pp_chunks
+    import vllm_torchtpu.distributed.pp_engine as pp_engine
+    from vllm.config.logging import LoggingConfig
+    from vllm.v1.engine.core import EngineCoreProc
+    from vllm_torchtpu import patch_registry
+
+    patch_registry.apply = lambda stage: None
+    pp_engine.patch_executor_for_pp_buffered = lambda cfg: None
+    pp_chunks.patch_engine_core_for_pp_chunks = lambda cfg: None
+    seen = {}
+    EngineCoreProc._tpu_original_run_engine_core = lambda *a, **k: seen.update(k)
+    pc = SimpleNamespace(
+        data_parallel_size=2, data_parallel_size_local=1, data_parallel_rank=1,
+        data_parallel_external_lb=True,
+    )
+    cfg = SimpleNamespace(
+        parallel_config=pc,
+        additional_config={"tpu_multiport_dp": {"enabled": True}},
+        logging_config=LoggingConfig(),
+    )
+    plugin._run_engine_core_with_tpu_patches(
+        vllm_config=cfg, dp_rank=1, local_dp_rank=0
+    )
+    print("LOCAL_DP_RANK", seen["local_dp_rank"], flush=True)
+    """
+)
+
+
+def test_engine_core_rewrite_is_logged_in_a_fresh_engine_process():
+    """The rewrite's log line is the launch's evidence that each engine core
+    took its own slot; vLLM configures logging only inside run_engine_core,
+    after this wrapper, so the line must not depend on an earlier setup."""
+    env = dict(
+        os.environ,
+        VLLM_CONFIGURE_LOGGING="1",
+        VLLM_LOGGING_LEVEL="INFO",
+        VLLM_LOGGING_STREAM="ext://sys.stdout",
+        JAX_PLATFORMS="cpu",
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", _FRESH_ENGINE_CORE],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert "LOCAL_DP_RANK 1" in out.stdout
+    assert (
+        "TPU multi-port DP: engine core dp_rank=1 -> local_dp_rank=1, "
+        "data_parallel_size_local=2"
+    ) in out.stdout
 
 
 def _stub_engine_core_entry(monkeypatch):
