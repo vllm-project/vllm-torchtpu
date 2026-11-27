@@ -97,6 +97,7 @@ SUB_BYTE_QUANT_GROUP_METHOD = "compressed-tensors"
 SUPPORTED_QUANT_SCHEMES: frozenset[tuple[str, str | None]] = frozenset(
     {
         ("fp8", None),
+        ("mxfp8", None),
         (SUB_BYTE_QUANT_GROUP_METHOD, "mxfp4-pack-quantized"),
     }
 )
@@ -709,6 +710,13 @@ def _extract_quant_fields(
     expert_block_k = _int_field(quant_map, ("expert_weight_block_k",)) or _int_field(
         text_config, ("expert_weight_block_k",)
     )
+    if q_method == "mxfp8":
+        # MXFP8 dense linears fold [1, 32] block scales into output channels at load
+        # (block_k = 0), while NVFP4 routed experts keep expert_weight_block_k.
+        moe_group_size = _int_field(quant_map, ("group_size",))
+        if not expert_block_k and raw_ed == "nvfp4" and moe_group_size > 0:
+            expert_block_k = moe_group_size
+        block_k = 0
     return _QuantFields(
         torch_dtype=torch_dtype,
         quant_method=q_method,
@@ -734,7 +742,7 @@ def _infer_quant_dtypes_with_source(quant: _QuantFields) -> tuple[str, str, str]
         if any(token in normalized_torch for token in ("fp32", "float32"))
         else "bf16"
     )
-    if quant.quant_method == "fp8":
+    if quant.quant_method in ("fp8", "mxfp8"):
         inferred = "fp8"
     elif quant.quant_method == SUB_BYTE_QUANT_GROUP_METHOD:
         inferred = "mxfp4"

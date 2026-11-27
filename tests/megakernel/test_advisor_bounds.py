@@ -96,18 +96,23 @@ def _out_of_scope_params(
         "qwen3_5_moe",
         "qwen4_exp",
         "deepseek_v41_vision",
+        "clip_vision_model",
     ):
         vh = int(vc["hidden_size"])
         vi = int(vc["intermediate_size"])
         vd = int(vc.get("depth") or vc.get("num_hidden_layers") or 0)
-        in_ch = int(vc.get("in_channels", 3))
-        is_ds_vis = str(vc.get("model_type", "")) == "deepseek_v41_vision"
-        pt = int(vc.get("temporal_patch_size", 1 if is_ds_vis else 2))
+        in_ch = int(vc.get("in_channels", vc.get("num_channels", 3)))
+        vtype = str(vc.get("model_type", ""))
+        is_ds_vis = vtype == "deepseek_v41_vision"
+        is_clip_vis = vtype == "clip_vision_model"
+        pt = int(vc.get("temporal_patch_size", 1 if (is_ds_vis or is_clip_vis) else 2))
         ps = int(vc.get("patch_size", 16))
         extra += vd * (4 * vh * vh + 3 * vh * vi) + vh * in_ch * pt * ps * ps
         if is_ds_vis:
             dr = int(vc.get("downsample_ratio", 1))
             extra += vh * dr * dr * profile.hidden_size
+        elif is_clip_vis:
+            extra += vh * int(vc.get("projection_dim", profile.hidden_size))
         else:
             sm = int(vc.get("spatial_merge_size", 2))
             oh = int(vc.get("out_hidden_size", profile.hidden_size))
