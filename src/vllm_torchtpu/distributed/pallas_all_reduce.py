@@ -53,6 +53,7 @@ from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_
 from vllm_torchtpu.kernels.collectives import qar_all_reduce as qar
 from vllm_torchtpu.kernels.collectives import qar_reduce_scatter as qrs
 from vllm_torchtpu.kernels.collectives import tp_all_reduce as kernel
+from vllm_torchtpu.kernels.collectives import tp_all_reduce_hier as hier_ar
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -96,7 +97,8 @@ def _qdq(x: jax.Array) -> jax.Array:
 
 def _body(n: int, max_bytes: int, axis: str, direct_rows: int = 0,
           qdq_min_rows: int = 0, qar_min_rows: int = 0,
-          qar_tab: np.ndarray | None = None):
+          qar_tab: np.ndarray | None = None, hier_rows: int = 0,
+          hier_tab: np.ndarray | None = None, hier_mode: str = "ag"):
     def body(x, rank):
         rows, hidden = x.shape
         # Static per bucket: decided at trace time inside the op.
@@ -110,12 +112,28 @@ def _body(n: int, max_bytes: int, axis: str, direct_rows: int = 0,
         if qdq:
             x = _qdq(x)
         if 0 < kernel.view_bytes(rows, hidden, n) <= max_bytes:
-            out = kernel.all_reduce(x, rank, n, direct_rows)
+            if hier_applies_ar(rows, hidden, n, hier_rows, direct_rows) and hier_tab is not None:
+                out = hier_ar.all_reduce(x, rank, hier_tab, direct_rows, hier_mode)
+            else:
+                out = kernel.all_reduce(x, rank, n, direct_rows)
         else:
             out = lax.psum(x, axis)
         return _qdq(out) if qdq else out
 
     return body
+
+
+def hier_applies_ar(rows: int, hidden: int, n: int, hier_rows: int,
+                    direct_rows: int = 0) -> bool:
+    """Whether a Pallas all-reduce of [rows, hidden] runs the two-level kernel
+    (TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS): at most hier_rows rows, 8 ranks, and
+    a kernel layout that splits into 8 lane-aligned chunks."""
+    if not (0 < rows <= hier_rows and n == 8):
+        return False
+    if kernel.direct_ok(rows, hidden, n, direct_rows):
+        return hier_ar.supported(rows, hidden)
+    _, m, w = kernel.view_shape(rows, hidden, n)
+    return hier_ar.supported(m, w)
 
 
 def _qdq_min_rows() -> int:
@@ -170,14 +188,32 @@ def _qar_devices(mesh) -> list[_ChipCore]:
     return out
 
 
+def _hier_table(mesh, n: int, hidden: int) -> np.ndarray | None:
+    """The two-level kernel's layout table when TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS
+    is set and the mesh is 4 chips x 2 cores, else None (flat kernel)."""
+    if envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS <= 0:
+        return None
+    if n != 8:
+        logger.warning("tp_all_reduce_hier: not armed: %d ranks", n)
+        return None
+    try:
+        return hier_ar.layout_table(_qar_devices(mesh))
+    except ValueError as e:
+        logger.warning("tp_all_reduce_hier: not armed: %s", e)
+        return None
+
+
 def _make_op(mesh, max_bytes: int, direct_rows: int = 0,
-             qdq_min_rows: int = 0, qar_min_rows: int = 0):
+             qdq_min_rows: int = 0, qar_min_rows: int = 0,
+             hier_tab: np.ndarray | None = None):
     axis = mesh.axis_names[0]
     qar_tab = qar.layout_table(_qar_devices(mesh)) if qar_min_rows else None
+    hier_rows = max(envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS, 0) if hier_tab is not None else 0
     specs = (P(axis), P(axis))
     sharded = jax.shard_map(
         _body(int(mesh.size), max_bytes, axis, direct_rows, qdq_min_rows,
-              qar_min_rows, qar_tab),
+              qar_min_rows, qar_tab, hier_rows, hier_tab,
+              envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_MODE),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -197,7 +233,8 @@ def _make_op(mesh, max_bytes: int, direct_rows: int = 0,
     op = pallas.jax_op(
         "pallas::tp_all_reduce"
         + ("_qdq" if qdq_min_rows else "")
-        + ("_qar" if qar_min_rows else ""),
+        + ("_qar" if qar_min_rows else "")
+        + (f"_hier_{envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_MODE}" if hier_rows else ""),
         fn,
         mesh=mesh,
         input_partition_specs=specs,
@@ -485,16 +522,29 @@ def arm(hidden: int, device: torch.device) -> bool:
     rank_ordered = all(s["mesh_index"] == i for i, s in enumerate(seen))
     n = int(mesh.size)
     direct_rows = max(envs.TPU_TP_PALLAS_ALL_REDUCE_DIRECT_ROWS, 0)
-    op = _make_op(mesh, max_bytes, direct_rows)
+    hier_tab = _hier_table(mesh, n, hidden)
+    op = _make_op(mesh, max_bytes, direct_rows, hier_tab=hier_tab)
     rank = torch.tensor([[mesh_index]], dtype=torch.int32, device=device)
     failures = _gather(_selftest(op, rank, mesh_index, n, hidden, device))
     if any(failures):
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
         )
+    if hier_tab is not None:
+        hier_test_rows = min(32, envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS) // 8 * 8 or 8
+        seen = _gather(_qar_selftest(op, rank, n, hidden, device, hier_test_rows))
+        if len({r["digest"] for r in seen}) != 1 or max(r["rel"] for r in seen) >= 0.01:
+            raise RuntimeError(f"tp_all_reduce_hier: self-test failed: {seen}")
+        logger.info(
+            "tp_all_reduce: two-level kernel (mode %s) on Pallas all-reduces of <= %d"
+            " rows (TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS); self-test passed: rel %s",
+            envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_MODE, envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS,
+            [round(r["rel"], 5) for r in seen],
+        )
     qar_min_rows = envs.TPU_TP_QAR_MIN_TOKENS
     if qar_min_rows > 0:
-        op = _make_op(mesh, max_bytes, direct_rows, _qdq_min_rows(), qar_min_rows)
+        op = _make_op(mesh, max_bytes, direct_rows, _qdq_min_rows(), qar_min_rows,
+                      hier_tab)
         seen = _gather(_qar_selftest(op, rank, n, hidden, device, qar_min_rows))
         if len({r["digest"] for r in seen}) != 1 or max(r["rel"] for r in seen) >= 0.03:
             raise RuntimeError(f"qar_all_reduce: self-test failed: {seen}")
@@ -507,7 +557,7 @@ def arm(hidden: int, device: torch.device) -> bool:
     if qdq_min_rows and qar_min_rows <= 0:
         # The self-test checks exact sums; the emulation rounds, so it runs on
         # the plain op above and serving gets the rounding one.
-        op = _make_op(mesh, max_bytes, direct_rows, qdq_min_rows)
+        op = _make_op(mesh, max_bytes, direct_rows, qdq_min_rows, hier_tab=hier_tab)
         logger.info(
             "tp_all_reduce: int8 payload emulation ON (TPU_TP_AR_QDQ_ROWS=%d) on"
             " all-reduces of >= %d rows",

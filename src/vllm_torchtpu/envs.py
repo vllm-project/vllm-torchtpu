@@ -125,6 +125,8 @@ if TYPE_CHECKING:
     TPU_TP_QAR_MIN_TOKENS: int = 0
     TPU_TP_AR_QDQ_MIN_TOKENS: int = 0
     TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS: int = 0
+    TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS: int = 0
+    TPU_TP_PALLAS_ALL_REDUCE_HIER_MODE: str = "ag"
     TPU_MOE_TC_COMBINE: bool = False
     TPU_MOE_TC_COMBINE_PIECES: int = 1
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -1191,6 +1193,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of reduce-scatter + all-gather. Same bits. 0 (default) = off.
     "TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS", 0
+    ),
+    # Pallas TP all-reduces (TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES) of at most
+    # this many rows run the two-level kernel on a tpu7x 2x2x1 TP8 group
+    # (kernels/collectives/tp_all_reduce_hier.py), which sends each chip's
+    # data over ICI once instead of once per core. 0 (default) = off.
+    "TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS": env_int(
+        "TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS", 0
+    ),
+    # Which legs of that kernel are two-level. "ag" (default): only the
+    # all-gather (each reduced chunk crosses ICI once per chip, the sibling
+    # core gets a forwarded copy); the reduce-scatter is the flat kernel's,
+    # so the bits are the flat kernel's. "full": the reduce-scatter too (the
+    # two cores of a chip add their halves first): half the ICI bytes in
+    # both legs, but the pair sums are rounded to bf16 before the ICI leg
+    # (two roundings per element instead of one), so not bitwise.
+    "TPU_TP_PALLAS_ALL_REDUCE_HIER_MODE": env_with_choices(
+        "TPU_TP_PALLAS_ALL_REDUCE_HIER_MODE", "ag", ["ag", "full"]
     ),
     # Expert-parallel MoE combine of large batches on the TensorCore
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
