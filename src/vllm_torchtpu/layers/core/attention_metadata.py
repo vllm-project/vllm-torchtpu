@@ -303,15 +303,21 @@ def _stage_unless_unchanged(
 ) -> torch.Tensor:
     """`stage_h2d_upload(runner, host)`, reusing ``walk``'s previous upload
     while its packed block tables repeat: they change only when a request
-    gains or loses a block. The device tables are only read downstream."""
+    gains or loses a block. The device tables are only read downstream.
+
+    Walks over the same groups at different padded sizes (a target forward
+    and its drafter) keep one upload each, or they would replace each
+    other's on every step. The entries are bounded by the request-count
+    buckets."""
+    slot = (walk, host.numel())
     key = (host.dtype, host.numpy().tobytes())
-    prev = runner._staged_block_tables_reuse.get(walk)
+    prev = runner._staged_block_tables_reuse.get(slot)
     if prev is not None and prev[0] == key:
         if id(host) in runner._registered_h2d_sources:
             _recycle_h2d_source(runner, host)
         return prev[1]
     dev = stage_h2d_upload(runner, host)
-    runner._staged_block_tables_reuse[walk] = (key, dev)
+    runner._staged_block_tables_reuse[slot] = (key, dev)
     return dev
 
 

@@ -541,6 +541,28 @@ class TestAttentionMetadataBuilderPlumbing:
         assert walk()[0][0].item() == 77
         assert len(runner._unfenced_h2d_sources) == 3 - (num_groups == 1)
 
+    def test_alternating_padded_sizes_keep_their_own_reuse(self):
+        """A target walk and a drafter walk over the same groups at another
+        padded size, alternating step after step, each upload once."""
+        runner = self._make_runner_mock()
+        self._make_attn_groups(runner, [self._make_builder(runner, 0)])
+
+        def walk(padded):
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=1,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.ones(padded, dtype=torch.int32),
+                query_start_loc=torch.arange(padded + 1, dtype=torch.int32),
+                request_distribution=torch.tensor([1, 1, 1], dtype=torch.int32),
+            )
+            stage_block_table_uploads(runner, ctx, padded)
+
+        for _ in range(3):
+            walk(4)
+            walk(2)
+        assert len(runner._unfenced_h2d_sources) == 2
+
     @pytest.mark.parametrize("num_groups", [1, 3])
     def test_each_staged_walk_owns_its_host_buffer(self, num_groups):
         """TorchTPU reads a non-blocking H2D source until the copy drains, so a
