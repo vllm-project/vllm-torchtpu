@@ -327,6 +327,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
     # Qwen4Exp PLE state and QSA custom ops.
     "vllm_torchtpu/models/qwen4_exp/ops",
+    # The megakernel's torch bridge registers its step with torch_tpu's `jax_op`.
+    "vllm_torchtpu/megakernel/adapter/jax_bridge.py",
 )
 
 # vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
