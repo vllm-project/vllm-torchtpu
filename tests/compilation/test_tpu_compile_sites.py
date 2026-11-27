@@ -178,25 +178,62 @@ FAST_DISPATCH_IMPORTERS = {
 }
 
 
-def _imports_fast_dispatch(tree: ast.Module) -> bool:
+FAST_DISPATCH = "vllm_torchtpu.compilation.fast_dispatch"
+
+
+def _imports_fast_dispatch(tree: ast.Module, rel: pathlib.Path) -> bool:
+    """Whether the module at ``rel`` (under the package) imports
+    ``compilation.fast_dispatch``, absolutely or relatively, as a module or
+    by name from it."""
+    package = ["vllm_torchtpu", *rel.parent.parts]
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             if any(
-                a.name == "vllm_torchtpu.compilation.fast_dispatch" for a in node.names
+                a.name == FAST_DISPATCH or a.name.startswith(FAST_DISPATCH + ".")
+                for a in node.names
             ):
                 return True
         elif isinstance(node, ast.ImportFrom):
-            if node.module == "vllm_torchtpu.compilation.fast_dispatch":
+            if node.level:
+                base = package[: len(package) - node.level + 1]
+                module = ".".join([*base, *([node.module] if node.module else [])])
+            else:
+                module = node.module or ""
+            if module == FAST_DISPATCH:
                 return True
-            if node.module == "vllm_torchtpu.compilation" and any(
-                a.name == "fast_dispatch" for a in node.names
-            ):
+            if any(f"{module}.{a.name}" == FAST_DISPATCH for a in node.names):
                 return True
     return False
 
 
+def test_the_importer_check_sees_each_spelling():
+    runner = pathlib.Path("runner/x.py")
+    compilation = pathlib.Path("compilation/x.py")
+    seen = [
+        "import vllm_torchtpu.compilation.fast_dispatch",
+        "import vllm_torchtpu.compilation.fast_dispatch as fd",
+        "from vllm_torchtpu.compilation import fast_dispatch",
+        "from vllm_torchtpu.compilation.fast_dispatch import wrap",
+        "from ..compilation import fast_dispatch",
+        "from ..compilation.fast_dispatch import wrap",
+    ]
+    for line in seen:
+        assert _imports_fast_dispatch(ast.parse(line), runner), line
+    assert _imports_fast_dispatch(ast.parse("from . import fast_dispatch"), compilation)
+    assert _imports_fast_dispatch(
+        ast.parse("from .fast_dispatch import wrap"), compilation
+    )
+    unseen = [
+        "from vllm_torchtpu.compilation import decorators",
+        "from . import fast_dispatch",  # runner/fast_dispatch, another module
+        "from ..compilation import compile_options",
+    ]
+    for line in unseen:
+        assert not _imports_fast_dispatch(ast.parse(line), runner), line
+
+
 def test_only_the_decorator_and_the_options_import_fast_dispatch():
-    importers = {rel for rel, tree in _sources() if _imports_fast_dispatch(tree)}
+    importers = {rel for rel, tree in _sources() if _imports_fast_dispatch(tree, rel)}
     assert importers == FAST_DISPATCH_IMPORTERS, importers ^ FAST_DISPATCH_IMPORTERS
 
 
