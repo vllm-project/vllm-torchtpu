@@ -423,9 +423,20 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
 
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        qkv_weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        """``qkv_weight``: the QKV weight as the previous all-reduce carried
+        it into VMEM (`MiniMaxM3Mxfp8LinearMethod.apply`), else None."""
+        if qkv_weight is None:
+            qkv, _ = self.qkv_proj(hidden_states)
+        else:
+            # qkv_proj.forward is this apply alone: no bias, no output gather.
+            qkv = self.qkv_proj.quant_method.apply(
+                self.qkv_proj, hidden_states, weight=qkv_weight
+            )
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,

@@ -23,6 +23,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_reduce_scatter,
@@ -43,11 +44,15 @@ from vllm.model_executor.models.utils import (
 
 from vllm_torchtpu import envs, model_loader_patches
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed import pallas_all_reduce
 from vllm_torchtpu.layers.adapter.quantization.fp8_lm_head import Fp8LMHeadMethod
 from vllm_torchtpu.models.minimax_m3.attention import MiniMaxM3SparseAttention
 from vllm_torchtpu.models.minimax_m3.expert_placement import ExpertPlacement
 from vllm_torchtpu.models.minimax_m3.moe import MiniMaxM3MLP, MiniMaxM3MoE
-from vllm_torchtpu.models.minimax_m3.quant import CT_TO_MODELOPT_EXPERT_SUFFIX
+from vllm_torchtpu.models.minimax_m3.quant import (
+    CT_TO_MODELOPT_EXPERT_SUFFIX,
+    MiniMaxM3Mxfp8LinearMethod,
+)
 from vllm_torchtpu.utils import fresh_buffer
 
 # Per-routed-expert rows outside the experts: they follow the expert placement.
@@ -65,12 +70,14 @@ class FoldedGemmaRMSNorm(GemmaRMSNorm):
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
+        weight: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """``weight``: a copy of ``folded_weight`` placed for this call (an
+        all-reduce carried it into VMEM), else None."""
+        weight = self.folded_weight if weight is None else weight
         if residual is None:
-            return ir.ops.rms_norm(x, self.folded_weight, self.variance_epsilon)
-        return ir.ops.fused_add_rms_norm(
-            x, residual, self.folded_weight, self.variance_epsilon
-        )
+            return ir.ops.rms_norm(x, weight, self.variance_epsilon)
+        return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
 
 
 class MiniMaxM3DecoderLayer(nn.Module):
@@ -106,19 +113,22 @@ class MiniMaxM3DecoderLayer(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
 
     @contextlib.contextmanager
-    def _layer_owned_reductions(self) -> Iterator[None]:
-        """While tracing a sequence-parallel step, o_proj and the FFN return
-        per-rank partial sums and the layer reduces them; every other trace
-        keeps their own all-reduces, so decode programs are unchanged."""
+    def _layer_owned_reductions(self, attention: bool = True) -> Iterator[None]:
+        """o_proj and the FFN return per-rank partial sums and the layer
+        reduces them: in a sequence-parallel step both, and with
+        ``attention=False`` (a step whose FFN all-reduce carries the next QKV
+        weight) the FFN's alone. Other traces keep their own all-reduces."""
         o_proj = self.self_attn.o_proj
         if self.is_moe_layer:
             cfg = self.block_sparse_moe.experts.moe_config
             saved = (o_proj.reduce_results, cfg.skip_final_all_reduce)
-            o_proj.reduce_results, cfg.skip_final_all_reduce = False, True
+            cfg.skip_final_all_reduce = True
         else:
             down = self.mlp.down_proj
             saved = (o_proj.reduce_results, down.reduce_results)
-            o_proj.reduce_results = down.reduce_results = False
+            down.reduce_results = False
+        if attention:
+            o_proj.reduce_results = False
         try:
             yield
         finally:
@@ -133,23 +143,44 @@ class MiniMaxM3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         attn_rs: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        carried: tuple[torch.Tensor, torch.Tensor] | None = None,
+        carry: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...] | None]:
         """Residual-deferred layer; ``attn_rs`` (large steps) reduce-scatters
-        the attention output instead of all-reducing it."""
+        the attention output instead of all-reducing it.
+
+        ``carry`` (not with ``attn_rs``): the next layer's (input norm, QKV)
+        weights (`MiniMaxM3Model._qkv_carries`), which the FFN all-reduce
+        copies into VMEM while it runs; the copies are returned third, for
+        the next layer's ``carried`` (None when nothing is carried)."""
+        norm_weight, qkv_weight = carried or (None, None)
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual, weight=norm_weight
+            )
         if not attn_rs:
-            hidden_states = self.self_attn(positions, hidden_states)
+            hidden_states = self.self_attn(positions, hidden_states, qkv_weight)
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual
             )
             ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-            return ffn(hidden_states), residual
+            if carry is None:
+                return ffn(hidden_states), residual, None
+            with self._layer_owned_reductions(attention=False):
+                partial = ffn(hidden_states)
+            reduced = pallas_all_reduce.all_reduce_carrying(
+                get_tp_group().ranks, partial, carry
+            )
+            if reduced is None:
+                raise RuntimeError("the FFN output is not a tensor the op reduces")
+            out, copies = reduced
+            return out, residual, copies
+        assert carry is None
         with self._layer_owned_reductions():
-            return self._attn_rs(positions, hidden_states, residual)
+            return *self._attn_rs(positions, hidden_states, residual), None
 
     def _attn_rs(
         self,
@@ -260,6 +291,7 @@ class MiniMaxM3Model(nn.Module):
         )
         config = vllm_config.model_config.hf_text_config
         self.config = config
+        self.dtype = vllm_config.model_config.dtype
         # Keys this model's compile-artifact cache directory.
         self.prefix = prefix
         self.embed_tokens = VocabParallelEmbedding(
@@ -303,10 +335,16 @@ class MiniMaxM3Model(nn.Module):
                     aux_hidden_states.append(tensor_model_parallel_all_gather(shard, 0))
             hidden_states = tensor_model_parallel_all_gather(self.norm(shard), 0)
         else:
-            hidden_states, residual = inputs_embeds, None
+            hidden_states, residual, carried = inputs_embeds, None, None
+            carries = self._qkv_carries(sp_step)
             for idx, layer in enumerate(self.layers):
-                hidden_states, residual = layer(
-                    positions, hidden_states, residual, sp_step
+                hidden_states, residual, carried = layer(
+                    positions,
+                    hidden_states,
+                    residual,
+                    sp_step,
+                    carried,
+                    carries[idx],
                 )
                 if idx + 1 in self.aux_hidden_state_layers:
                     aux_hidden_states.append(hidden_states + residual)
@@ -314,6 +352,37 @@ class MiniMaxM3Model(nn.Module):
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    def _qkv_carries(
+        self, sp_step: bool
+    ) -> list[tuple[torch.Tensor, torch.Tensor] | None]:
+        """Per layer, the next layer's (input norm, QKV) weights for its FFN
+        all-reduce to carry into VMEM (`MiniMaxM3DecoderLayer.forward`), or
+        None.
+
+        `fp8_linear` reads the QKV weight from VMEM; XLA's own prefetch of it
+        cannot start before the FFN all-reduce (the MoE kernel holds VMEM
+        until then) and lands as a copy just ahead of the QKV projection.
+        Only when every step the op carries for reads the copy: a step that
+        reads the weight from HBM would pay the copy for nothing. The op
+        takes bf16 activations, as `fp8_linear` does. The norm weight, which
+        the next layer reads first, rides along so that this trace takes its
+        weights in the order the traces without a carry do (sequence-parallel
+        steps): traces hand compiled buckets to one another only when their
+        inputs match (compilation/shape_variants.py)."""
+        none = [None] * len(self.layers)
+        rows = pallas_all_reduce.carry_rows(get_tp_group().ranks)
+        if sp_step or not rows or self.dtype != torch.bfloat16:
+            return none
+        carries = []
+        for layer in self.layers[1:]:
+            qkv = layer.self_attn.qkv_proj
+            method = qkv.quant_method
+            fp8 = isinstance(method, MiniMaxM3Mxfp8LinearMethod)
+            weight = method.vmem_weight(qkv, rows) if fp8 else None
+            norm = layer.input_layernorm.folded_weight
+            carries.append(None if weight is None else (norm, weight))
+        return carries + [None]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         # (param, checkpoint shard, shard id). Leading dots keep `.q_proj`

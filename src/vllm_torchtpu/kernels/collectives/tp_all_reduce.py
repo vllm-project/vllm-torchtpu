@@ -36,6 +36,12 @@ both cores of a chip receive the same chunks; the two-level one sends half
 those bytes off chip and adds two on-chip hops. Its sum rounds twice (the pair
 sum, then the total), so its bits differ from the flat kernel's.
 
+`all_reduce_carrying` (the flat kernel) also copies HBM operands into VMEM
+outputs while the protocol runs, for consumers that want them in VMEM next
+(the next layer's weights, such as `fp8_linear`'s e4m3 operand): the copies
+start after the barrier signals and are waited at the end, so they overlap the
+barrier wait and the exchange instead of following the call.
+
 kernels/experimental/moe_tp_decode/all_reduce.py runs the same protocol as a
 fused kernel's epilogue (row paths by n_valid, the own chunk by local DMA);
 its `standalone` on the same views takes 9.0 us at 8 rows and 12.7 at 24, so
@@ -81,16 +87,60 @@ def view_bytes(rows: int, hidden: int, n: int) -> int:
     return m * w * jnp.dtype(BF16).itemsize
 
 
+def _open(n: int, copies: list) -> None:
+    """The barrier round (every peer's scratch is live), with the carried
+    copies started between the signals and the wait."""
+    barrier = pltpu.get_barrier_semaphore()
+    for d in range(n):
+        pl.semaphore_signal(barrier, inc=1, device_id=(d,), device_id_type=_MESH)
+    for copy in copies:
+        copy.start()
+    pl.semaphore_wait(barrier, n)
+
+
+def _carrying(body, n_in: int, k: int):
+    """The Pallas kernel for `body(*refs, copies)`: the k carried HBM inputs
+    (after the n_in others), their VMEM outputs (after the sum) and the
+    copies' semaphores (the last scratch) are taken out of refs into copies,
+    one async copy per carried operand."""
+    if not k:
+        return lambda *refs: body(*refs, [])
+
+    def kernel(*refs):
+        srcs, (out, *rest) = refs[n_in : n_in + k], refs[n_in + k :]
+        dsts, rest, sems = rest[:k], rest[k:-1], rest[-1]
+        copies = [
+            pltpu.make_async_copy(src, dst, sems.at[i])
+            for i, (src, dst) in enumerate(zip(srcs, dsts))
+        ]
+        body(*refs[:n_in], out, *rest, copies)
+
+    return kernel
+
+
+def _specs(carry: tuple, out_shape, scratch: list):
+    """(extra in_specs, out_shape, out_specs, scratch) with the carry added."""
+    vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
+    if not carry:
+        return [], out_shape, vmem, scratch
+    return (
+        [pl.BlockSpec(memory_space=pltpu.HBM)] * len(carry),
+        (out_shape, *(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in carry)),
+        (vmem,) * (1 + len(carry)),
+        [*scratch, pltpu.SemaphoreType.DMA((len(carry),))],
+    )
+
+
 @functools.cache
-def _call(n: int, m: int, h: int):
+def _call(n: int, m: int, h: int, carry: tuple = ()):
+    """carry: (shape, dtype) per operand copied into a VMEM output."""
     w = h // n
 
-    def kernel(rank_ref, x_ref, out_ref, recv, red, rs_send, rs_recv, ag_send, ag_recv):
+    def body(
+        rank_ref, x_ref, out_ref, recv, red, rs_send, rs_recv, ag_send, ag_recv, cps
+    ):
         me = rank_ref[0]
-        barrier = pltpu.get_barrier_semaphore()
-        for d in range(n):
-            pl.semaphore_signal(barrier, inc=1, device_id=(d,), device_id_type=_MESH)
-        pl.semaphore_wait(barrier, n)
+        _open(n, cps)
 
         def chunk(ref, t):
             return ref.at[:, pl.ds(pl.multiple_of(t * w, w), w)]
@@ -128,40 +178,69 @@ def _call(n: int, m: int, h: int):
         recv_all(lambda t: chunk(out_ref, t), ag_recv)
         for copy in sends:
             copy.wait_send()
+        for copy in cps:
+            copy.wait()
 
     vmem = pl.BlockSpec(memory_space=pltpu.VMEM)
     view = m * h * jnp.dtype(BF16).itemsize
+    carry_in, out_shape, out_specs, scratch = _specs(
+        carry,
+        jax.ShapeDtypeStruct((m, h), BF16),
+        [
+            pltpu.VMEM((n, m, w), BF16),
+            pltpu.VMEM((m, w), BF16),
+            *[pltpu.SemaphoreType.DMA((n,)) for _ in range(4)],
+        ],
+    )
     return pl.pallas_call(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct((m, h), BF16),
+        _carrying(body, 2, len(carry)),
+        out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
-            in_specs=[vmem],
-            out_specs=vmem,
-            scratch_shapes=[
-                pltpu.VMEM((n, m, w), BF16),
-                pltpu.VMEM((m, w), BF16),
-                *[pltpu.SemaphoreType.DMA((n,)) for _ in range(4)],
-            ],
+            in_specs=[vmem, *carry_in],
+            out_specs=out_specs,
+            scratch_shapes=scratch,
         ),
         compiler_params=pltpu.CompilerParams(
             collective_id=COLLECTIVE_ID, vmem_limit_bytes=4 * view + (1 << 20)
         ),
-        name=f"tp_all_reduce-m_{m}-h_{h}-n_{n}",
+        name=f"tp_all_reduce-m_{m}-h_{h}-n_{n}" + ("-carry" if carry else ""),
     )
+
+
+def _run(call, x: jax.Array, n: int, *scalars: jax.Array, carry=()):
+    """Run a kernel built by `_call`-like `call(m, w)` on x's [16 k, w] view;
+    returns the sum as [rows, hidden], with the carried VMEM copies if any."""
+    rows, hidden = x.shape
+    padded, m, w = view_shape(rows, hidden, n)
+    xp = jnp.pad(x, ((0, padded - rows), (0, 0))) if padded != rows else x
+    out = call(m, w)(*scalars, xp.reshape(m, w), *carry)
+    out, *copies = out if carry else (out,)
+    # Relayout to [rows, hidden] here: left to XLA, the reshape sinks into the
+    # consumer (the residual add + RMSNorm), which then runs on the [16, w] view
+    # at 0.78 us instead of 0.15 us.
+    total = lax.optimization_barrier(out.reshape(padded, hidden)[:rows])
+    return (total, tuple(copies)) if carry else total
 
 
 def all_reduce(x: jax.Array, rank: jax.Array, n: int) -> jax.Array:
     """Sum of bf16 x [rows, hidden] over the n ranks; call under shard_map over
     the 1-D mesh. rank (int32, one element) must be this device's mesh index."""
-    rows, hidden = x.shape
-    padded, m, w = view_shape(rows, hidden, n)
-    xp = jnp.pad(x, ((0, padded - rows), (0, 0))) if padded != rows else x
-    out = _call(n, m, w)(rank.reshape(1).astype(jnp.int32), xp.reshape(m, w))
-    # Relayout to [rows, hidden] here: left to XLA, the reshape sinks into the
-    # consumer (the residual add + RMSNorm), which then runs on the [16, w] view
-    # at 0.78 us instead of 0.15 us.
-    return lax.optimization_barrier(out.reshape(padded, hidden)[:rows])
+    rank = rank.reshape(1).astype(jnp.int32)
+    return _run(lambda m, w: _call(n, m, w), x, n, rank)
+
+
+def all_reduce_carrying(
+    x: jax.Array, rank: jax.Array, n: int, carry: tuple[jax.Array, ...]
+) -> tuple[jax.Array, tuple[jax.Array, ...]]:
+    """(`all_reduce` of x, the carry copied into VMEM by the same call)."""
+    rank = rank.reshape(1).astype(jnp.int32)
+    key = tuple((tuple(a.shape), a.dtype) for a in carry)
+    # The kernel's HBM in_spec does not bind XLA, which would otherwise
+    # prefetch the operand into VMEM ahead of the call: the very copy this
+    # call is to hide.
+    carry = tuple(pltpu.with_memory_space_constraint(a, pltpu.HBM) for a in carry)
+    return _run(lambda m, w: _call(n, m, w, key), x, n, rank, carry=carry)
 
 
 def two_level_table(chips: list[list[int]]) -> tuple[int, ...] | None:

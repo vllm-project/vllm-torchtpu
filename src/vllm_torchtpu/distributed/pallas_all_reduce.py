@@ -29,10 +29,15 @@ chip of the mesh holds two of its devices. The kernel's output bits can
 differ from XLA's all-reduce: it sums in f32 in rank order and rounds once
 (the two-level variant rounds the on-chip pair sums too); every rank gets the
 same bits.
+
+`all_reduce_carrying` is the same all-reduce through a second op that also
+returns VMEM copies of CARRY_COUNT more tensors, made by the flat kernel while
+it runs (kernel.all_reduce_carrying); on the other paths they come back as is.
 """
 
 import dataclasses
 import faulthandler
+import inspect
 from typing import Any
 
 import jax
@@ -58,29 +63,65 @@ SELFTEST_TIMEOUT_S = 300
 # the two-level one (kernel.TWO_LEVEL_MIN_VIEW_BYTES); rows whose view the cap
 # refuses are skipped.
 _SELFTEST_ROWS = (8, 24, 32, 48)
+# How many tensors `all_reduce_carrying` carries (a layer's norm weight and
+# projection weight).
+CARRY_COUNT = 2
 
 
 @dataclasses.dataclass(frozen=True)
 class _Armed:
     ranks: tuple[int, ...]
     op: Any
+    carrying_op: Any
     rank: torch.Tensor  # this rank's mesh index, int32 [1, 1]
+    carry_rows: int  # the most [rows, hidden] rows the carrying op copies for
 
 
 _ARMED: _Armed | None = None
 
 
+def _route(rows: int, hidden: int, n: int, max_bytes: int, table):
+    """Which path all-reduces a [rows, hidden] tensor: "psum", or the kernel
+    with the two-level table to use (None for the flat kernel)."""
+    view = kernel.view_bytes(rows, hidden, n)
+    if not 0 < view <= max_bytes:
+        return "psum"
+    return table if view > kernel.TWO_LEVEL_MIN_VIEW_BYTES else None
+
+
 def _body(n: int, max_bytes: int, axis: str, table: tuple[int, ...] | None):
     def body(x, rank):
-        rows, hidden = x.shape
-        view = kernel.view_bytes(rows, hidden, n)
-        if not 0 < view <= max_bytes:
+        route = _route(*x.shape, n, max_bytes, table)
+        if route == "psum":
             return lax.psum(x, axis)
-        if table is not None and view > kernel.TWO_LEVEL_MIN_VIEW_BYTES:
-            return kernel.all_reduce_two_level(x, rank, table, n)
+        if route is not None:
+            return kernel.all_reduce_two_level(x, rank, route, n)
         return kernel.all_reduce(x, rank, n)
 
     return body
+
+
+def _carrying_body(n: int, max_bytes: int, axis: str, table):
+    plain = _body(n, max_bytes, axis, table)
+
+    def body(x, rank, *carry):
+        # Only the flat kernel carries: at the two-level kernel's sizes the
+        # carried buffer cost the step more than the copy it hides.
+        if _route(*x.shape, n, max_bytes, table) is not None:
+            return plain(x, rank), *carry
+        total, copies = kernel.all_reduce_carrying(x, rank, n, carry)
+        return total, *copies
+
+    return body
+
+
+def _carry_rows(n: int, hidden: int, max_bytes: int, table) -> int:
+    """The most rows of [rows, hidden] the carrying op copies for: the flat
+    kernel's (views only grow with the rows)."""
+    rows = 0
+    while _route(rows + 1, hidden, n, max_bytes, table) is None:
+        rows += 1
+    return rows
 
 
 def _two_level_table(mesh) -> tuple[int, ...] | None:
@@ -132,6 +173,52 @@ def _make_op(mesh, max_bytes: int, table: tuple[int, ...] | None):
     return op
 
 
+def _make_carrying_op(mesh, max_bytes: int, table: tuple[int, ...] | None):
+    axis = mesh.axis_names[0]
+    specs = (P(axis),) * (2 + CARRY_COUNT)
+    out_specs = (P(axis),) * (1 + CARRY_COUNT)
+    sharded = jax.shard_map(
+        _carrying_body(int(mesh.size), max_bytes, axis, table),
+        mesh=mesh,
+        in_specs=specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )
+
+    def fn(*args):
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    # The op registry types the torch schema from the signature; a ``*args``
+    # one carries no count, so spell the operands out.
+    names = ("x", "rank", *(f"carry{i}" for i in range(CARRY_COUNT)))
+    fn.__signature__ = inspect.Signature(  # type: ignore[attr-defined]
+        [
+            inspect.Parameter(
+                name, inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=jax.Array
+            )
+            for name in names
+        ],
+        return_annotation=tuple[(jax.Array,) * (1 + CARRY_COUNT)],
+    )
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        "pallas::tp_all_reduce_carrying",
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=out_specs,
+    )
+    op.register_fake(
+        lambda x, rank, *carry: (
+            torch.empty_like(x),
+            *(torch.empty_like(c) for c in carry),
+        )
+    )
+    return op
+
+
 def _refusal() -> str | None:
     tp = parallel_state.get_tp_group()
     ep = get_ep_group()
@@ -155,10 +242,37 @@ def _selftest_inputs(n: int, rows: int, hidden: int) -> np.ndarray:
     return (((d + 1) * 3 + r * 5 + c * 7) % 11 - 5).astype(np.float32)
 
 
+def _selftest_carry(mesh_index: int, hidden: int) -> list[torch.Tensor]:
+    """CPU tensors shaped and typed as the model carries (a 1-D f32 norm weight
+    and a 2-D e4m3 projection weight), different per rank and per element."""
+    norm = np.arange(hidden, dtype=np.float32) * 0.5 + mesh_index
+    # e4m3 bytes below 0x7f: no NaN codes.
+    codes = (np.arange(256 * 512) * 7 + mesh_index * 13) % 0x7F
+    weight = codes.astype(np.uint8).reshape(256, 512)
+    return [
+        torch.from_numpy(norm),
+        torch.from_numpy(weight).view(torch.float8_e4m3fn),
+    ]
+
+
+def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return bool(torch.equal(a.view(torch.uint8), b.view(torch.uint8)))
+
+
 def _selftest(
-    op, rank: torch.Tensor, mesh_index: int, n: int, hidden: int, max_bytes: int, device
+    op,
+    carrying_op,
+    rank: torch.Tensor,
+    mesh_index: int,
+    n: int,
+    hidden: int,
+    max_bytes: int,
+    device,
 ) -> list:
+    """Rows whose all-reduce (either op) or carried copies came back wrong."""
     failures = []
+    carry = _selftest_carry(mesh_index, hidden)
+    carry_t = [c.to(device) for c in carry]
     faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
     try:
         for rows in _SELFTEST_ROWS:
@@ -167,7 +281,12 @@ def _selftest(
             x = _selftest_inputs(n, rows, hidden)
             mine = torch.from_numpy(x[mesh_index]).to(torch.bfloat16).to(device)
             got = op(mine, rank).to(torch.float32).cpu().numpy()
-            if not np.array_equal(got, x.sum(0)):
+            total, *copied = carrying_op(mine, rank, *carry_t)
+            if not (
+                np.array_equal(got, x.sum(0))
+                and np.array_equal(total.to(torch.float32).cpu().numpy(), x.sum(0))
+                and all(_same_bits(c.cpu(), h) for c, h in zip(copied, carry))
+            ):
                 failures.append(rows)
     finally:
         faulthandler.cancel_dump_traceback_later()
@@ -205,13 +324,22 @@ def arm(hidden: int, device: torch.device) -> bool:
         table = None
     n = int(mesh.size)
     op = _make_op(mesh, max_bytes, table)
+    carrying_op = _make_carrying_op(mesh, max_bytes, table)
     rank = torch.tensor([[mesh_index]], dtype=torch.int32, device=device)
-    failures = _gather(_selftest(op, rank, mesh_index, n, hidden, max_bytes, device))
+    failures = _gather(
+        _selftest(op, carrying_op, rank, mesh_index, n, hidden, max_bytes, device)
+    )
     if any(failures):
         raise RuntimeError(
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
         )
-    _ARMED = _Armed(ranks=tuple(int(r) for r in tp.ranks), op=op, rank=rank)
+    _ARMED = _Armed(
+        ranks=tuple(int(r) for r in tp.ranks),
+        op=op,
+        carrying_op=carrying_op,
+        rank=rank,
+        carry_rows=_carry_rows(n, hidden, max_bytes, table),
+    )
     logger.info(
         "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B "
         "views, two-level above %s B",
@@ -223,15 +351,47 @@ def arm(hidden: int, device: torch.device) -> bool:
     return True
 
 
-def all_reduce(ranks, x: torch.Tensor) -> torch.Tensor | None:
-    """The armed op's all-reduce of x over the group of `ranks`, or None when
-    this group or tensor is not armed (the caller takes its usual path)."""
+def _armed_for(ranks, x: torch.Tensor) -> _Armed | None:
     armed = _ARMED
     if armed is None or tuple(ranks) != armed.ranks:
         return None
     if x.dtype != torch.bfloat16 or x.dim() != 2:
         return None
+    return armed
+
+
+def all_reduce(ranks, x: torch.Tensor) -> torch.Tensor | None:
+    """The armed op's all-reduce of x over the group of `ranks`, or None when
+    this group or tensor is not armed (the caller takes its usual path)."""
+    armed = _armed_for(ranks, x)
+    if armed is None:
+        return None
     # Every size goes to the op, which decides on the static size inside: a
     # branch here would give the model's Dynamo traces different graphs (and
     # inputs) per bucket, which shape_variants refuses to hand buckets between.
     return armed.op(x, armed.rank)
+
+
+def carry_rows(ranks) -> int:
+    """The most rows of a [rows, hidden] activation for which the TP group of
+    `ranks` carries (`all_reduce_carrying`); 0 when not armed."""
+    armed = _ARMED
+    if armed is None or tuple(ranks) != armed.ranks:
+        return 0
+    return armed.carry_rows
+
+
+def all_reduce_carrying(
+    ranks, x: torch.Tensor, carry: tuple[torch.Tensor, ...]
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]] | None:
+    """(`all_reduce` of x, copies of the CARRY_COUNT `carry` tensors the
+    kernel placed in VMEM), or None as `all_reduce`. For consumers that read
+    them from VMEM next (fp8_linear's weight): the copies ride the all-reduce
+    instead of following it. Above `carry_rows` they come back as is."""
+    armed = _armed_for(ranks, x)
+    if armed is None:
+        return None
+    if len(carry) != CARRY_COUNT:
+        raise ValueError(f"carry {len(carry)} tensors, not {CARRY_COUNT}")
+    total, *copies = armed.carrying_op(x, armed.rank, *carry)
+    return total, tuple(copies)

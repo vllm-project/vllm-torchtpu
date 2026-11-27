@@ -237,18 +237,30 @@ class MiniMaxM3Mxfp8LinearMethod(LinearMethodBase):
             weight.numel(),
         )
 
+    def vmem_weight(self, layer: torch.nn.Module, rows: int) -> torch.Tensor | None:
+        """The weight `apply` hands `fp8_linear` as a VMEM operand at every
+        row count up to `rows`, or None when it does not."""
+        if layer.weight.dtype != torch.float8_e4m3fn:
+            return None
+        return layer.weight if 0 < rows <= layer.fp8_linear_max_rows else None
+
     def apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
+        weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``weight``: a copy of `vmem_weight` already in VMEM (carried there
+        by the all-reduce before this call), for the `fp8_linear` path."""
         if layer.weight.dtype != torch.float8_e4m3fn:
             return VllmUnquantizedLinearMethod().apply(layer, x, bias)
         rows = math.prod(x.shape[:-1])
         if x.dtype == torch.bfloat16 and 0 < rows <= layer.fp8_linear_max_rows:
             out = _fp8_linear(
-                x.reshape(rows, x.shape[-1]), layer.weight, layer.weight_scale_row
+                x.reshape(rows, x.shape[-1]),
+                layer.weight if weight is None else weight,
+                layer.weight_scale_row,
             )
             return out.view(*x.shape[:-1], out.shape[-1])
         if rows >= _UPCAST_MIN_ROWS and x.dtype == torch.bfloat16:
