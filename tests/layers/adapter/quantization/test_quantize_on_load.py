@@ -60,8 +60,20 @@ def moe_layer():
 
 @pytest.fixture(autouse=True)
 def mock_vllm_config(monkeypatch):
-    """Ensure VllmQuantConfig.vllm_config is set for get_linear_config."""
-    monkeypatch.setattr(VllmQuantConfig, "vllm_config", MagicMock())
+    """Ensure VllmQuantConfig.vllm_config is set for linear/MoE config lookup."""
+    mock_cfg = MagicMock()
+    mock_cfg.parallel_config.enable_expert_parallel = False
+    monkeypatch.setattr(VllmQuantConfig, "vllm_config", mock_cfg)
+
+    # Earlier tests (e.g., test_compressed_tensors, test_modelopt_mixed) restore
+    # SubClass.vllm_config = None on subclasses, shadowing the base attribute.
+    def _patch_subclasses(cls: type) -> None:
+        for sub in cls.__subclasses__():
+            if "vllm_config" in sub.__dict__:
+                monkeypatch.setattr(sub, "vllm_config", mock_cfg)
+            _patch_subclasses(sub)
+
+    _patch_subclasses(VllmQuantConfig)
 
 
 class TestShouldQuantizeOnLoad:
