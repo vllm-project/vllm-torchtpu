@@ -119,6 +119,27 @@ def test_update_states_keeps_generic_copy_for_non_pooled_layout(monkeypatch):
     assert local_copies == []
 
 
+def _page_local_runner(raw_tensors, *, split, read_offsets=None):
+    """A stand-in runner for `_apply_kv_cache_block_copies` on the unified pool,
+    with the attributes it reads, including the H2D staging lists."""
+    fake = SimpleNamespace(
+        kv_cache_raw_tensors=raw_tensors,
+        _unified_kv_layout=True,
+        is_unified_pool_used=lambda: True,
+        _pool_block_split=split,
+        _pad_to_bucket=TPUModelRunner._pad_to_bucket,
+        device="cpu",
+        mamba_slot_read_offsets=read_offsets,
+        bm_pool_layout=None,
+        _unfenced_h2d_sources=[],
+        _registered_h2d_sources=set(),
+    )
+    fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
+        fake
+    )
+    return fake
+
+
 def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
     """Verify manager block fan-out, bucket padding, and pool kernel invocation.
 
@@ -136,21 +157,7 @@ def test_page_local_copy_expands_split_and_updates_every_pool(monkeypatch):
         torch.arange(32 * 4, dtype=torch.float32).reshape(32, 4) + 1000,
     ]
     before = [raw.clone() for raw in raw_tensors]
-    fake = SimpleNamespace(
-        kv_cache_raw_tensors=raw_tensors,
-        _unified_kv_layout=True,
-        is_unified_pool_used=lambda: True,
-        _pool_block_split=3,
-        _pad_to_bucket=TPUModelRunner._pad_to_bucket,
-        device="cpu",
-        mamba_slot_read_offsets=None,
-        bm_pool_layout=None,
-        _unfenced_h2d_sources=[],
-        _registered_h2d_sources=set(),
-    )
-    fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
-        fake
-    )
+    fake = _page_local_runner(raw_tensors, split=3)
     calls = []
 
     def cpu_page_copy(raws, src, dst):
@@ -214,23 +221,8 @@ def test_tpu_bind_kv_cache_unpacks_lists():
 def test_apply_kv_cache_block_copies_migrates_mamba_offsets(monkeypatch):
     """Verify that speculative decoding mamba read offsets are migrated
     during CoW copy."""
-    raw_tensors = [torch.zeros(32, 4)]
     offsets = torch.arange(10, dtype=torch.long)
-    fake = SimpleNamespace(
-        kv_cache_raw_tensors=raw_tensors,
-        _unified_kv_layout=True,
-        is_unified_pool_used=lambda: True,
-        mamba_slot_read_offsets=offsets,
-        _pool_block_split=2,
-        _pad_to_bucket=TPUModelRunner._pad_to_bucket,
-        device="cpu",
-        bm_pool_layout=None,
-        _unfenced_h2d_sources=[],
-        _registered_h2d_sources=set(),
-    )
-    fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
-        fake
-    )
+    fake = _page_local_runner([torch.zeros(32, 4)], split=2, read_offsets=offsets)
     migrated = []
 
     def mock_migrate(read_offsets, src_t, dst_t):
@@ -262,19 +254,8 @@ def test_page_local_copy_stages_every_index_upload(monkeypatch):
     each index upload goes through `stage_h2d_upload`, which keeps the host
     tensor until the next input-staging fence. On CPU an upload returns the
     host tensor itself, so the copy programs must receive staged tensors."""
-    fake = SimpleNamespace(
-        kv_cache_raw_tensors=[torch.zeros(32, 4)],
-        is_unified_pool_used=lambda: True,
-        mamba_slot_read_offsets=torch.zeros(16, dtype=torch.long),
-        _pool_block_split=2,
-        _pad_to_bucket=TPUModelRunner._pad_to_bucket,
-        device="cpu",
-        bm_pool_layout=None,
-        _unfenced_h2d_sources=[],
-        _registered_h2d_sources=set(),
-    )
-    fake._copy_mamba_state_blocks = TPUModelRunner._copy_mamba_state_blocks.__get__(
-        fake
+    fake = _page_local_runner(
+        [torch.zeros(32, 4)], split=2, read_offsets=torch.zeros(16, dtype=torch.long)
     )
     received = []
     monkeypatch.setattr(
