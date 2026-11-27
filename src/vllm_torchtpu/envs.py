@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
+    MOE_REQUANTIZE_SCALE_MODE: str = "four_over_six"
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
     TPU_USE_RAIDEN_KV_CACHE_MANAGER: bool = False
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
@@ -683,6 +684,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MOE_REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
     if (block_size := os.getenv("MOE_REQUANTIZE_BLOCK_SIZE")) is not None
     else None,
+    # Four Over Six chooses amax/4 or amax/6 by block reconstruction error.
+    "MOE_REQUANTIZE_SCALE_MODE": env_with_choices(
+        "MOE_REQUANTIZE_SCALE_MODE", "four_over_six", ["fp32", "four_over_six"]
+    ),
     # TPU unified block-pool cache layout. Tri-state: an explicit 0/1 always
     # wins; unset defers to
     # platforms.tpu_block_size_utils.unified_kv_layout_enabled, which selects

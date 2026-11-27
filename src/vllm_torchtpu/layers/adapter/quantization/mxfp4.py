@@ -370,6 +370,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
 REQUANTIZED_BLOCK_SIZE = (
     int(envs.MOE_REQUANTIZE_BLOCK_SIZE) if envs.MOE_REQUANTIZE_BLOCK_SIZE else 512
 )
+REQUANTIZED_SCALE_MODE = envs.MOE_REQUANTIZE_SCALE_MODE
 
 
 def _row_padded_flat_block_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -685,10 +686,16 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         w2_block_size = min(REQUANTIZED_BLOCK_SIZE, orig_intermediate_size)
 
         w13_weight_processed, w13_weight_scale = quantize_native_fp4_kmajor(
-            w13_weight_padded.to(device), block=w13_block_size, pack=pack
+            w13_weight_padded.to(device),
+            block=w13_block_size,
+            pack=pack,
+            scale_mode=REQUANTIZED_SCALE_MODE,
         )
         w2_weight_processed, w2_weight_scale = quantize_native_fp4_kmajor(
-            w2_weight_padded.to(device), block=w2_block_size, pack=pack
+            w2_weight_padded.to(device),
+            block=w2_block_size,
+            pack=pack,
+            scale_mode=REQUANTIZED_SCALE_MODE,
         )
 
         return (

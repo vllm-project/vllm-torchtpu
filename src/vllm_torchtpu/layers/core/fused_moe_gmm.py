@@ -143,7 +143,7 @@ def requant_unpack_kmajor(
 
 
 def quantize_to_native_fp4_kmajor(
-    w: jax.Array, block: int, pack: bool = True
+    w: jax.Array, block: int, pack: bool = True, scale_mode: str = "four_over_six"
 ) -> tuple[jax.Array, jax.Array]:
     """Quantize K-major float weight ([..., K, N]) to packed uint8 e2m1 and
     per-block FP32 scale.
@@ -154,6 +154,8 @@ def quantize_to_native_fp4_kmajor(
     receives as a native ``torch.float4_e2m1fn_x2`` tensor. Only the transport
     differs: the quantization above is one cast either way, so the two forms
     carry bit-identical weights and a caller may choose per layer.
+
+    Four Over Six chooses the lower-error reconstruction from amax/4 and amax/6.
 
     TODO: Make a more generic version of this function;
     possibly combine with quantize_tensor_to_fp4
@@ -167,10 +169,27 @@ def quantize_to_native_fp4_kmajor(
     fp4_max = float(jnp.finfo(jnp.float4_e2m1fn).max)
     abs_max = jnp.max(jnp.abs(blocked), axis=-2, keepdims=True)
     scale = abs_max / fp4_max
-    scale_inv = jnp.where(scale == 0, 0.0, 1.0 / scale)
-    quantized = jnp.clip(blocked * scale_inv, -fp4_max, fp4_max).astype(
-        jnp.float4_e2m1fn
-    )
+    if scale_mode not in ("fp32", "four_over_six"):
+        raise ValueError(f"Unknown FP4 scale mode: {scale_mode}")
+
+    def encode(block_scale):
+        inv = jnp.where(block_scale == 0, 0.0, 1.0 / block_scale)
+        return jnp.clip(blocked * inv, -fp4_max, fp4_max).astype(jnp.float4_e2m1fn)
+
+    quantized = encode(scale)
+    if scale_mode == "four_over_six":
+        # Compare reconstructions independently for each K block and column.
+        # Keep amax/6 on ties, including all-zero blocks.
+        scale4 = abs_max / 4.0
+        codes4 = encode(scale4)
+
+        def squared_error(codes, block_scale):
+            residual = codes.astype(jnp.float32) * block_scale - blocked
+            return jnp.sum(jnp.square(residual), axis=-2, keepdims=True)
+
+        use4 = squared_error(codes4, scale4) < squared_error(quantized, scale)
+        scale = jnp.where(use4, scale4, scale)
+        quantized = jnp.where(use4, codes4, quantized)
     quantized = quantized.reshape(*w.shape[:-2], size_k, w.shape[-1])  # [..., K, N]
 
     scale = scale.astype(jnp.float32)  # [..., num_blocks, 1, N]
