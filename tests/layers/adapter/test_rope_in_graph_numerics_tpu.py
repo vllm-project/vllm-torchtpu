@@ -260,7 +260,13 @@ def test_in_graph_cos_sin_matches_cpu_reference_table_on_tpu(
 
 @pytest.mark.parametrize(
     "case",
-    ["static", "mrope", "linear_multi", "deepseek_scaling"],
+    [
+        "static",
+        "mrope",
+        "linear_multi",
+        "deepseek_scaling",
+        "deepseek_v4_scaling",
+    ],
 )
 def test_compiled_tier1_forward_matches_table_on_tpu(
     monkeypatch: pytest.MonkeyPatch,
@@ -273,6 +279,9 @@ def test_compiled_tier1_forward_matches_table_on_tpu(
         LinearScalingRotaryEmbedding,
         MRotaryEmbedding,
         RotaryEmbedding,
+    )
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
     )
 
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op  # noqa: F401
@@ -297,6 +306,20 @@ def test_compiled_tier1_forward_matches_table_on_tpu(
         if case == "linear_multi":
             return LinearScalingRotaryEmbedding(
                 64, 64, 128, 10000.0, True, [1.0, 2.0], torch.bfloat16
+            )
+        if case == "deepseek_v4_scaling":
+            return DeepseekV4ScalingRotaryEmbedding(
+                128,
+                64,
+                128,
+                10000.0,
+                False,
+                4.0,
+                torch.bfloat16,
+                beta_fast=32,
+                beta_slow=1,
+                mscale=0.707,
+                mscale_all_dim=0,
             )
         return DeepseekScalingRotaryEmbedding(
             64,
@@ -350,6 +373,9 @@ def test_compiled_tier1_forward_matches_table_on_tpu(
     if case == "deepseek_scaling":
         q = torch.randn(n_tok, 4, 64, generator=g, dtype=torch.bfloat16).to(dev)
         k = torch.randn(n_tok, 1, 64, generator=g, dtype=torch.bfloat16).to(dev)
+    elif case == "deepseek_v4_scaling":
+        q = torch.randn(n_tok, 4, 128, generator=g, dtype=torch.bfloat16).to(dev)
+        k = torch.randn(n_tok, 1, 128, generator=g, dtype=torch.bfloat16).to(dev)
     else:
         q = torch.randn(n_tok, 4 * 64, generator=g, dtype=torch.bfloat16).to(dev)
         k = torch.randn(n_tok, 2 * 64, generator=g, dtype=torch.bfloat16).to(dev)
@@ -435,3 +461,57 @@ def test_mla_wrapper_process_weights_after_loading_tracks_tpu_device(
     else:
         assert isinstance(wrapper.rotary_emb.cos_sin_cache, torch.Tensor)
         assert wrapper.rotary_emb.cos_sin_cache.device.type == "tpu"
+
+
+def test_deepseek_v4_cos_sin_at_matches_cpu_table_on_tpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`cos_sin_at` on TPU reproduces DSv4's fp32 CPU table."""
+    import torch_tpu  # noqa: F401
+    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+        DeepseekV4ScalingRotaryEmbedding,
+    )
+
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op  # noqa: F401
+
+    monkeypatch.setattr(rope_lib, "_ROPE_DICT", {})
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    dev = torch.device("tpu")
+
+    def _make() -> DeepseekV4ScalingRotaryEmbedding:
+        return DeepseekV4ScalingRotaryEmbedding(
+            128,
+            64,
+            128,
+            10000.0,
+            False,
+            4.0,
+            torch.bfloat16,
+            beta_fast=32,
+            beta_slow=1,
+            mscale=0.707,
+            mscale_all_dim=0,
+        )
+
+    with set_current_vllm_config(config):
+        config.additional_config[rope_in_graph_flag.KEY] = False
+        with torch.device("cpu"):
+            ref = _make()
+        config.additional_config[rope_in_graph_flag.KEY] = True
+        with dev:
+            uut = _make()
+
+    assert sum(b.numel() for b in uut.buffers()) == 0
+    assert isinstance(uut.cos_sin_cache, rope_in_graph.InGraphCosSinCache)
+    ref_table = ref.cos_sin_cache
+    assert isinstance(ref_table, torch.Tensor) and ref_table.dtype == torch.float32
+
+    pos = torch.arange(ref_table.shape[0], dtype=torch.int32, device=dev)
+    compiled_rows = torch.compile(
+        lambda p: rope_in_graph.cos_sin_at(uut, p),
+        backend="tpu",
+        fullgraph=True,
+        dynamic=False,
+    )(pos)
+    assert compiled_rows.dtype == torch.float32
+    torch.testing.assert_close(compiled_rows.cpu(), ref_table, rtol=1e-4, atol=1e-4)

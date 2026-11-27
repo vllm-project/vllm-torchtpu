@@ -205,6 +205,7 @@ def _one_segment_spec(
     *,
     mscale: float = 1.0,
     match_query_dtype: bool = True,
+    cache_dtype: torch.dtype | None = None,
     is_mrope: bool = False,
     dim_modalities: tuple[int, ...] | None = None,
 ) -> RopeInGraphSpec:
@@ -212,7 +213,7 @@ def _one_segment_spec(
         segments=(CosSinSegment(0, num_rows, to_f32_tuple(inv_freq), mscale),),
         num_rows=num_rows,
         rotary_dim=int(rope.rotary_dim),
-        cache_dtype=rope.dtype,
+        cache_dtype=rope.dtype if cache_dtype is None else cache_dtype,
         match_query_dtype=match_query_dtype,
         is_neox_style=bool(rope.is_neox_style),
         is_mrope=is_mrope,
@@ -279,7 +280,12 @@ def _ntk_alpha_spec(rope: Any) -> RopeInGraphSpec:
     )
 
 
-def _yarn_spec(rope: Any, *, match_query_dtype: bool = True) -> RopeInGraphSpec:
+def _yarn_spec(
+    rope: Any,
+    *,
+    match_query_dtype: bool = True,
+    cache_dtype: torch.dtype | None = None,
+) -> RopeInGraphSpec:
     num_rows = _scaled_num_rows(rope.max_position_embeddings, rope.scaling_factor)
     return _one_segment_spec(
         rope,
@@ -287,6 +293,7 @@ def _yarn_spec(rope: Any, *, match_query_dtype: bool = True) -> RopeInGraphSpec:
         num_rows,
         mscale=float(rope.mscale),
         match_query_dtype=match_query_dtype,
+        cache_dtype=cache_dtype,
     )
 
 
@@ -411,7 +418,15 @@ def _build_registry(mrope_cls: type) -> Mapping[type, RopeClassEntry]:
             upstream.FourierRotaryEmbedding: RopeClassEntry(),
             upstream.Llama4VisionRotaryEmbedding: RopeClassEntry(),
             upstream.DualChunkRotaryEmbedding: RopeClassEntry(),
-            upstream.DeepseekV4ScalingRotaryEmbedding: RopeClassEntry(),
+            # DeepseekV4ScalingRotaryEmbedding keeps cos_sin_cache in fp32
+            # regardless of `rope.dtype`; DSv4 compressor, indexer, and
+            # attention wrappers read it via `rope_in_graph.cos_sin_at`.
+            upstream.DeepseekV4ScalingRotaryEmbedding: RopeClassEntry(
+                build_spec=functools.partial(
+                    _yarn_spec, match_query_dtype=False, cache_dtype=torch.float32
+                ),
+                tier1="custom_op",
+            ),
         }
     )
     return types.MappingProxyType(entries)
@@ -825,17 +840,6 @@ def _restore_upstream_table(rope: Any) -> None:
     if not rope.use_flashinfer:
         cache = cache.to(rope.dtype)
     rope.register_buffer("cos_sin_cache", cache, persistent=False)
-
-
-def require_cos_sin_table(module: nn.Module) -> None:
-    """Exempts `module` from the post-load sweep so `cos_sin_cache` stays a tensor.
-
-    For callers that pass the table to a kernel. `module` must not be a Tier-1
-    class: those are already converted at `__init__`.
-    """
-    # TODO(#2747): remove once the DeepSeek-V4 Pallas kernels take per-token
-    # cos/sin.
-    cast(Any, module)._tpu_rope_table_required = True
 
 
 class Tier1InGraphRopeMixin:

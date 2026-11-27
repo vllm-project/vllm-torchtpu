@@ -132,9 +132,9 @@ def patch_in_graph_rotary_embedding(
     """Tier-2 post-load & export sweep replacing remaining `cos_sin_cache` buffers.
 
     Modules already converted at `__init__` time by Tier 1 (`_tpu_in_graph_tier1`)
-    and modules marked with `rope_in_graph.require_cos_sin_table` are skipped.
-    Remaining eligible modules (plain-`nn.Module` `Phi3LongRoPE`, CPU-traced
-    `torch.export` models) are converted in-place via per-class specs.
+    are skipped. Remaining eligible modules (plain-`nn.Module` `Phi3LongRoPE`,
+    CPU-traced `torch.export` models) are converted in-place via per-class
+    specs.
 
     `allow_table_recovery` has no default, so each caller chooses. With `True`
     (export path), the sweep also attempts attribute/table-content recovery for
@@ -145,8 +145,6 @@ def patch_in_graph_rotary_embedding(
     drop_unused_rope_cache_aliases(model)
     num_patched = 0
     for _, module in model.named_modules():
-        if getattr(module, "_tpu_rope_table_required", False):
-            continue
         if getattr(module, "_in_graph_spec", None) is not None:
             continue
         if not is_in_graph_rope_eligible(module):
@@ -418,8 +416,7 @@ def patch_cos_sin_cache_buffers(
     fallback_memo: dict[tuple[Any, ...], rope_in_graph.CosSinSegment | None] = {}
     for _, module in model.named_modules():
         if (
-            getattr(module, "_tpu_rope_table_required", False)
-            or getattr(module, "_tpu_in_graph_tier1", False)
+            getattr(module, "_tpu_in_graph_tier1", False)
             or hasattr(module, "cos_coef")
             or getattr(module, "update_cache", False)
             or _is_out_of_scope_vllm_rope(module)
@@ -502,9 +499,7 @@ def patch_cos_sin_table_pairs(model: nn.Module) -> int:
     """
     num_patched = 0
     for _, module in model.named_modules():
-        if getattr(module, "_tpu_rope_table_required", False) or isinstance(
-            module, RotaryEmbeddingBase
-        ):
+        if isinstance(module, RotaryEmbeddingBase):
             continue
         cos, sin = module._buffers.get("cos"), module._buffers.get("sin")
         if cos is None or sin is None:

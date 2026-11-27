@@ -26,8 +26,7 @@ if TYPE_CHECKING:
 # precomputed [max_position, rotary_dim] HBM table. Off by default.
 # TODO(#2747): flip the default to true once serving and nightly coverage are
 # validated; remove this key together with TPU_ROPE_CACHE_TRUNCATE and
-# TPU_ROPE_CACHE_ROW_MAJOR once the DeepSeek-V4 Pallas kernels no longer read
-# the table.
+# TPU_ROPE_CACHE_ROW_MAJOR one release after the default flips to true.
 KEY = "tpu_rope_in_graph"
 
 

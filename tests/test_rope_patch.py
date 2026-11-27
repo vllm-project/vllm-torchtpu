@@ -861,6 +861,8 @@ def test_deepseek_v4_fope_complex_and_dflash_alias_handling() -> None:
 
     assert vision_rope.cos_sin_cache.dtype == torch.complex64
 
+    ref_dsv4_table = dsv4_rope.cos_sin_cache.clone()
+
     draft_wrapper = nn.Module()
     draft_wrapper.dsv4 = dsv4_rope
     draft_wrapper.fope = fope
@@ -872,12 +874,19 @@ def test_deepseek_v4_fope_complex_and_dflash_alias_handling() -> None:
         rope_patch.patch_in_graph_rotary_embedding(
             draft_wrapper, allow_table_recovery=True
         )
-        == 1
+        == 2
     )
     assert "_rope_cos_sin_cache" not in draft_wrapper.__dict__
-    assert isinstance(dsv4_rope.cos_sin_cache, torch.Tensor)
+    assert isinstance(dsv4_rope.cos_sin_cache, rope_in_graph.InGraphCosSinCache)
     assert isinstance(fope.cos_sin_cache, torch.Tensor)
     assert isinstance(vision_rope.cos_sin_cache, torch.Tensor)
+
+    idx = torch.tensor([0, 3, 17, 255], dtype=torch.int32)
+    assert dsv4_rope.cos_sin_cache.shape[-1] == _HEAD_SIZE
+    assert torch.equal(
+        dsv4_rope.cos_sin_cache.index_select(0, idx),
+        ref_dsv4_table.index_select(0, idx),
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -1144,18 +1153,6 @@ def test_rotary_base_never_uses_content_recovery_and_warns(
     assert any("_UnknownFutureRotaryEmbedding" in w for w in warnings_seen)
 
 
-def test_require_cos_sin_table_exempts_module_from_sweep() -> None:
-    """A module marked with `require_cos_sin_table` keeps its table in a sweep."""
-    synth = _SyntheticRotaryEmbedding(dtype=torch.float32)
-    table = synth.cos_sin_cache
-    rope_in_graph.require_cos_sin_table(synth)
-    assert (
-        rope_patch.patch_in_graph_rotary_embedding(synth, allow_table_recovery=True)
-        == 0
-    )
-    assert synth.cos_sin_cache is table
-
-
 @pytest.mark.parametrize(
     ("additional_config", "expected"),
     [
@@ -1379,3 +1376,49 @@ def test_vllm_deepseek_scaling_forward_uses_spec_without_indexing_cache(
         torch.testing.assert_close(uut_sin, ref_sin, rtol=0, atol=0)
     finally:
         torch.set_num_threads(prev_threads)
+
+
+def test_vllm_deepseek_v4_scaling_forward_inverse_offsets_and_compile() -> None:
+    """Verify DSv4 scaling wrapper handles inverse, offsets, key=None, and compile."""
+    from vllm.config import set_current_vllm_config
+
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        VllmDeepseekV4ScalingRotaryEmbedding,
+    )
+
+    kwargs = {
+        "head_size": _HEAD_SIZE,
+        "rotary_dim": _HEAD_SIZE // 2,
+        "max_position_embeddings": 256,
+        "base": 10000.0,
+        "is_neox_style": False,
+        "scaling_factor": 4.0,
+        "dtype": torch.bfloat16,
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "mscale": 1.0,
+        "mscale_all_dim": 0.0,
+    }
+    cfg = _vllm_config(1024, in_graph=False)
+    with set_current_vllm_config(cfg):
+        ref = VllmDeepseekV4ScalingRotaryEmbedding(**kwargs)
+        cfg.additional_config[rope_in_graph_flag.KEY] = True
+        uut = VllmDeepseekV4ScalingRotaryEmbedding(**kwargs)
+
+    positions = torch.tensor([0, 3, 17, 127], dtype=torch.int32)
+    offsets = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+    g = torch.Generator().manual_seed(0)
+    q = torch.randn(positions.numel(), 4, _HEAD_SIZE, generator=g, dtype=torch.bfloat16)
+    ref_q, ref_k = ref.forward_native(
+        positions, q.clone(), None, offsets=offsets, inverse=True
+    )
+    out_q, out_k = uut.forward_native(
+        positions, q.clone(), None, offsets=offsets, inverse=True
+    )
+    assert ref_k is None and out_k is None and torch.equal(out_q, ref_q)
+
+    torch._dynamo.reset()
+    compiled_q, compiled_k = torch.compile(
+        uut.forward_native, backend="aot_eager", fullgraph=True
+    )(positions, q.clone(), None, offsets=offsets, inverse=True)
+    assert compiled_k is None and torch.equal(compiled_q, out_q)
