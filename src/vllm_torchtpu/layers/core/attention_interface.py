@@ -1771,6 +1771,8 @@ def sparse_mla_attention_dcp(
                 )
                 if send_layout:
                     split_kwargs["send_world"] = dcp_size
+                    # Taken only without the fused exchange (kernel-side).
+                    split_kwargs["send_vmem_cap"] = envs.TPU_MLA_SEND_LAYOUT_VMEM_CAP
                 if fused_exchange and fuse_here:
                     # Static per bucket (the JAX op's shape, not a torch gate).
                     pin, vmem_mib = fused_small_a2a_bucket_config(

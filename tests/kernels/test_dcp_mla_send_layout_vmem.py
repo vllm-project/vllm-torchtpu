@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_MLA_SEND_LAYOUT_VMEM_CAP: with the flag on, the send-layout decode
-attention call (`send_world` without the fused exchange) caps its scoped VMEM
+"""TPU_MLA_SEND_LAYOUT_VMEM_CAP, passed to the kernel as
+`sparse_ragged_paged_attention(send_vmem_cap=...)`: with it on, the send-layout
+decode attention call (`send_world` without the fused exchange) caps its scoped VMEM
 (SEND_LAYOUT_VMEM_LIMIT_BYTES, never below its scratch plus headroom) and keeps
 its array operands and its send buffer in HBM. With it off, and for calls
 without the send layout, the call keeps the default limit and no memory-space
@@ -31,6 +32,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, DCP_LANE_AXIS_NAME
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla
 
 HEADS = 64
@@ -76,9 +78,7 @@ def _mla_call(monkeypatch, cap, *, tokens, topk, topk_cap, batch, **kwargs):
     monkeypatch.setattr(
         sparse_mla.native_sc_gather, "dsa_gather_native_sc", _stub_gather
     )
-    monkeypatch.setenv(FLAG, "1" if cap else "0")
-    # The flag is read at trace time; drop traces made under the other value.
-    jax.clear_caches()
+    kwargs["send_vmem_cap"] = cap
     sds = jax.ShapeDtypeStruct
     with jax.sharding.use_abstract_mesh(TPU7X):
         lowered = _lower(sds, tokens, topk, topk_cap, batch, kwargs)
@@ -170,10 +170,18 @@ def test_send_layout_flag_changes_placement_only(monkeypatch):
 def test_send_layout_cap_rises_with_scratch(monkeypatch):
     # Batch 16 and top-k cap 1024: the call's own VMEM scratch (about 37 MiB)
     # exceeds the 32 MiB cap, so the limit becomes scratch + headroom instead.
+    scratch = []
+
+    def spy(scratch_shapes):
+        scratch.append(real(scratch_shapes))
+        return scratch[-1]
+
+    real = sparse_mla._vmem_scratch_bytes
+    monkeypatch.setattr(sparse_mla, "_vmem_scratch_bytes", spy)
     _, config = _mla_call(monkeypatch, True, **dict(SEND_32, topk_cap=1024, batch=16))
     size = config["scoped_memory_configs"][0]["size"]
-    assert 32 * 1024 * 1024 < size < sparse_mla.DEFAULT_VMEM_LIMIT_BYTES
-    assert size - sparse_mla.SEND_LAYOUT_VMEM_HEADROOM_BYTES > 32 * 1024 * 1024
+    assert len(scratch) == 1 and scratch[0] > 32 * 1024 * 1024
+    assert size == scratch[0] + sparse_mla.SEND_LAYOUT_VMEM_HEADROOM_BYTES
     assert config["custom_call_config"]["input_memory_space_colors"] == [
         {"operand_index": i, "color": 0} for i in range(4, 9)
     ]
@@ -209,20 +217,18 @@ def test_out_vmem_call_untouched(monkeypatch):
     ]
 
 
-def _exchange_call(monkeypatch, cap):
+def _exchange_call(cap):
     """The 16-token fused-exchange (-xa2a) call with the gathered KV pinned at
     32 MiB, as served: sparse_attention_chunk on pre-gathered KV inside a
     shard_map over the (dcp_lane 2, dcp 8) mesh."""
-    monkeypatch.setenv(FLAG, "1" if cap else "0")
-    jax.clear_caches()
     tokens, cap_rows, topk, world = 16, 512, 2048, 8
     windows = topk // cap_rows
     mesh = jax.sharding.AbstractMesh(
         (2, world),
-        ("dcp_lane", "dcp"),
+        (DCP_LANE_AXIS_NAME, DCP_AXIS_NAME),
         abstract_device=TPU7X.abstract_device,
     )
-    spec = jax.sharding.PartitionSpec(("dcp_lane", "dcp"))
+    spec = jax.sharding.PartitionSpec((DCP_LANE_AXIS_NAME, DCP_AXIS_NAME))
     n = 2 * world
     shapes = (
         ((n, tokens, HEADS, 512), jnp.bfloat16),
@@ -266,8 +272,14 @@ def _exchange_call(monkeypatch, cap):
             lse_fill=True,
             send_world=world,
             pre_gathered=(nope, rope, None),
-            send_exchange=("dcp", "dcp_lane", 32 * 1024 * 1024, ("kv",)),
+            send_exchange=(
+                DCP_AXIS_NAME,
+                DCP_LANE_AXIS_NAME,
+                32 * 1024 * 1024,
+                ("kv",),
+            ),
             send_peer=jnp.stack([rank[0], lane[0]]),
+            send_vmem_cap=cap,
         )
         return out[1][None]
 
@@ -284,9 +296,9 @@ def _exchange_call(monkeypatch, cap):
     return _the_mla_call(lowered)
 
 
-def test_fused_exchange_call_untouched(monkeypatch):
-    name, off = _exchange_call(monkeypatch, False)
-    _, on = _exchange_call(monkeypatch, True)
+def test_fused_exchange_call_untouched():
+    name, off = _exchange_call(False)
+    _, on = _exchange_call(True)
     assert name.endswith("-xa2a"), name
     assert on == off
     assert off["scoped_memory_configs"][0]["size"] == 32 * 1024 * 1024
