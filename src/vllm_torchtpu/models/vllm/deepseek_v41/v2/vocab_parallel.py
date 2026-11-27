@@ -26,17 +26,44 @@ _ROWS = P(vph.AXIS, None)
 _HEADS: "VocabParallelHeads | None" = None
 
 
-def _over_mesh(fn, mesh, num_inputs: int):
-    def run(*args):
+def _target_logits_op(mesh, world: int, vocab_size: int):
+    # torch_tpu's jax_op needs every argument annotated.
+    def logits(hidden: jax.Array, weight_shard: jax.Array) -> jax.Array:
+        # Two chunks: the first chunk's exchange overlaps the second's matmul.
+        local = partial(vph.target_logits, world=world, vocab_size=vocab_size, chunks=2)
         return jax.shard_map(
-            fn,
-            mesh=mesh,
-            in_specs=(_ROWS,) * num_inputs,
-            out_specs=_ROWS,
-            check_vma=False,
-        )(*args)
+            local, mesh=mesh, in_specs=(_ROWS,) * 2, out_specs=_ROWS, check_vma=False
+        )(hidden, weight_shard)
 
-    return run
+    return logits
+
+
+def _dspark_samples_op(mesh, world: int, vocab_size: int):
+    def local(hidden, anchors, markov_embed, markov_shard, weight_shard, rank):
+        return vph.dspark_samples(
+            hidden,
+            anchors[:, 0],
+            markov_embed,
+            markov_shard,
+            weight_shard,
+            rank,
+            world=world,
+            vocab_size=vocab_size,
+        )
+
+    def samples(
+        hidden: jax.Array,
+        anchors: jax.Array,
+        markov_embed: jax.Array,
+        markov_shard: jax.Array,
+        weight_shard: jax.Array,
+        rank: jax.Array,
+    ) -> jax.Array:
+        return jax.shard_map(
+            local, mesh=mesh, in_specs=(_ROWS,) * 6, out_specs=_ROWS, check_vma=False
+        )(hidden, anchors, markov_embed, markov_shard, weight_shard, rank)
+
+    return samples
 
 
 class VocabParallelHeads:
@@ -63,13 +90,9 @@ class VocabParallelHeads:
         self._rank_index = torch.tensor(
             [[rank]], dtype=torch.int32, device=lm_weight.device
         )
-        # Two chunks: the first chunk's exchange overlaps the second's matmul.
-        target = partial(
-            vph.target_logits, world=self.world, vocab_size=self.vocab_size, chunks=2
-        )
         self._target_op = jax_op(
             "pallas::dsv41_vocab_parallel_logits",
-            _over_mesh(target, mesh, 2),
+            _target_logits_op(mesh, self.world, self.vocab_size),
             mesh=mesh,
             input_partition_specs=(_ROWS,) * 2,
             output_partition_specs=_ROWS,
@@ -122,21 +145,9 @@ class VocabParallelHeads:
             return
         self.markov_slice = markov_slice
 
-        def samples(hidden, anchors, markov_embed, markov_shard, weight_shard, rank):
-            return vph.dspark_samples(
-                hidden,
-                anchors[:, 0],
-                markov_embed,
-                markov_shard,
-                weight_shard,
-                rank,
-                world=self.world,
-                vocab_size=self.vocab_size,
-            )
-
         self._samples_op = jax_op(
             "pallas::dsv41_vocab_parallel_dspark_samples",
-            _over_mesh(samples, self._mesh, 6),
+            _dspark_samples_op(self._mesh, self.world, self.vocab_size),
             mesh=self._mesh,
             input_partition_specs=(_ROWS,) * 6,
             output_partition_specs=_ROWS,
