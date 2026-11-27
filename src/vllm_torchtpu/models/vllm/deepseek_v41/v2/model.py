@@ -1804,10 +1804,10 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
                     ),
                 ),
                 (
-                    "TPU_DEEPSEEK_V41_PALLAS_LOGITS or _DSPARK_PALLAS_LOGITS is off "
-                    "(the sharded heads are the Pallas heads)",
-                    not envs.TPU_DEEPSEEK_V41_PALLAS_LOGITS
-                    or not envs.TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS,
+                    # The DSpark flag is checked when the draft enables its head.
+                    "TPU_DEEPSEEK_V41_PALLAS_LOGITS is off (the sharded head is "
+                    "the Pallas head)",
+                    not envs.TPU_DEEPSEEK_V41_PALLAS_LOGITS,
                 ),
                 (
                     "the LM head or its logits are not BF16",

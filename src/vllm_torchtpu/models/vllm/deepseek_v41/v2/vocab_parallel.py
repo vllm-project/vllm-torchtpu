@@ -16,8 +16,10 @@ import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal.pallas import jax_op
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels import vocab_parallel_head as vph
 from vllm_torchtpu.kernels.logits_head import is_supported_slice
+from vllm_torchtpu.kernels.markov_sampling import supports_group
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -139,6 +141,11 @@ class VocabParallelHeads:
         """Slice the DSpark Markov head and build the draft sampler op; on a
         later call (a weight reload), refresh the slice."""
         assert markov_head.shape[0] == self.vocab_size
+        if not envs.TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS:
+            raise ValueError(
+                "TPU_DEEPSEEK_V41_VOCAB_PARALLEL_HEADS=1 shards the Pallas DSpark "
+                "head: it needs TPU_DEEPSEEK_V41_DSPARK_PALLAS_LOGITS=1"
+            )
         markov_slice = self._slice(markov_head, vph.markov_rows(self.shard))
         if self.markov_slice is not None:
             self.markov_slice.copy_(markov_slice)
@@ -168,8 +175,7 @@ class VocabParallelHeads:
     @staticmethod
     def supports_world(world: int, vocab_size: int) -> bool:
         """Whether one Markov kernel tile's key packing covers a slice."""
-        markov = vph.markov_rows(vph.shard_rows(vocab_size, world))
-        return 16 + (markov - 1).bit_length() <= 31
+        return supports_group(vph.markov_rows(vph.shard_rows(vocab_size, world)))
 
     def dspark_samples(
         self, hidden: torch.Tensor, anchors: torch.Tensor, markov_embed: torch.Tensor

@@ -112,6 +112,12 @@ def _pipelined_kernel(x, w, base, vo, io, *, group, vocab_size):
     io[0, :, :] = winner
 
 
+def supports_group(group: int) -> bool:
+    """Whether a ``group``-column tile fits the kernel: whole 512-column
+    chunks, and a 16-bit score plus the column in one int32 key."""
+    return group % 512 == 0 and 16 + (group - 1).bit_length() <= 31
+
+
 def slot_candidates(
     x: jax.Array,
     w: jax.Array,
@@ -128,7 +134,7 @@ def slot_candidates(
     assert m % 16 == 0 and x.shape[1] == w.shape[1] == 256
     assert base.shape == (5 * m, w.shape[0]) and 0 <= slot < 5
     assert x.dtype == w.dtype == base.dtype == jnp.bfloat16
-    assert group % 512 == 0 and 16 + (group - 1).bit_length() <= 31
+    assert supports_group(group), group
     vocab_size = w.shape[0]
     nt = (vocab_size + group - 1) // group
 
