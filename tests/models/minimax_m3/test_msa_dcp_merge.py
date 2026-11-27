@@ -241,3 +241,69 @@ def test_split_merge_matches_pair_merge(rotated):
     np.testing.assert_array_equal(
         np.asarray(got, np.float32), np.asarray(want, np.float32)
     )
+
+
+@pytest.mark.parametrize("rotated", [False, True])
+@pytest.mark.parametrize("lanes", [1, 2])
+def test_swap_merge_matches_permute_and_split_merge(rotated, lanes):
+    """`swap_merge_split_partials` (the peer's rows moved by the merge's own
+    remote copies) is `merge_split_partials` of the permuted rows, bit for
+    bit, for both ranks of each pair, over several blocks."""
+    from jax.sharding import Mesh
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+
+    if len(jax.devices()) < 2 * lanes:
+        pytest.skip(
+            f"needs {2 * lanes} devices "
+            "(XLA_FLAGS=--xla_force_host_platform_device_count=4)"
+        )
+    num_heads, num_tokens, head_dim = 8, 768, 128
+    rng = np.random.default_rng(6)
+    out = jnp.asarray(
+        rng.normal(size=(2 * lanes, 2 * num_heads, num_tokens, head_dim)), jnp.bfloat16
+    )
+    lse = jnp.asarray(
+        rng.normal(0, 4, size=(2 * lanes, 2 * num_heads, num_tokens)), jnp.float32
+    )
+    hadamard = (
+        jnp.asarray(msa_fp4.hadamard(head_dim), jnp.bfloat16) if rotated else None
+    )
+    mesh = Mesh(
+        np.asarray(jax.devices()[: 2 * lanes]).reshape(lanes, 2), ("lane", "dcp")
+    )
+    pair = P(("lane", "dcp"))
+
+    def body(fused, o, s, r):
+        o, s = o[0], s[0]
+        if fused:
+            got = msa_dcp.swap_merge_split_partials(
+                o, s, r, hadamard, axis="dcp", block_tokens=256, interpret=True
+            )
+        else:
+            swap = functools.partial(
+                jax.lax.ppermute, axis_name="dcp", perm=[(0, 1), (1, 0)]
+            )
+            got = msa_dcp.merge_split_partials(
+                o, swap(o[num_heads:]), s, swap(s[num_heads:]), hadamard, interpret=True
+            )
+        return got[None]
+
+    ranks = jnp.asarray(np.tile(np.arange(2, dtype=np.int32), lanes))
+    results = [
+        np.asarray(
+            jax.jit(
+                jax.shard_map(
+                    functools.partial(body, fused),
+                    mesh=mesh,
+                    in_specs=(pair, pair, pair),
+                    out_specs=pair,
+                    check_vma=False,
+                )
+            )(out, lse, ranks),
+            np.float32,
+        )
+        for fused in (True, False)
+    ]
+    np.testing.assert_array_equal(*results)

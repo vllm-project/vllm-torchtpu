@@ -2446,6 +2446,161 @@ def merge_split_partials(
     )
 
 
+# The barrier semaphore of `swap_merge_split_partials`.
+_SWAP_MERGE_COLLECTIVE_ID = 3
+
+
+def swap_merge_split_partials(
+    out: jax.Array,
+    lse: jax.Array,
+    rank: jax.Array,
+    hadamard: jax.Array | None = None,
+    *,
+    axis: str,
+    block_tokens: int = _PAIR_PARTIALS_BLOCK_TOKENS,
+    interpret: bool = False,
+) -> jax.Array:
+    """`merge_split_partials` of a DCP pair's partials ``out [2 Hl, T, D]``
+    and ``lse [2 Hl, T]`` (own heads first) with the peer's partial of this
+    rank's heads moved by this call: at its first step each rank copies its
+    peer heads' rows (``out[Hl:]``, block by block, and ``lse[Hl:]``) into
+    the peer's buffers by remote DMA, and each step merges a block once it
+    has landed. As a permute of the sliced rows ahead of the merge, the
+    slice (a 16 MB copy) and the transfer sat between the attention and the
+    merge (~30 us per layer, c48 mixed twin j-4660a138). Inside a
+    ``shard_map`` over the pair's `axis` (``rank`` its index, ``int32``)."""
+    two_heads, num_tokens, head_dim = out.shape
+    num_heads = two_heads // 2
+    block_t = _pair_block_tokens(
+        num_tokens, num_heads, head_dim, out.dtype.itemsize, block_tokens
+    )
+    while num_tokens % block_t and block_t > _PARTIALS_BLOCK_TOKENS:
+        block_t //= 2
+    if num_tokens % block_t:
+        raise ValueError(f"{num_tokens} tokens are not whole {block_t}-token blocks")
+    num_blocks = num_tokens // block_t
+    lse = lse.astype(jnp.float32)
+    rotated = hadamard is not None
+    peer_rows = pl.ds(num_heads, num_heads)
+
+    def kernel(rank_ref, lse0_ref, p0_ref, out_hbm, lse_hbm, *rest):
+        h_ref = rest[0] if rotated else None
+        o_ref, recv_hbm, recv_lse_hbm = rest[rotated : rotated + 3]
+        p1_buf, lse1_buf, send_sem, recv_sems, lse_sem, copy_sem = rest[rotated + 3 :]
+        i = pl.program_id(0)
+        device = {axis: 1 - rank_ref[0]}
+
+        def remote(src, dst, recv_sem):
+            return pltpu.make_async_remote_copy(
+                src,
+                dst,
+                send_sem,
+                recv_sem,
+                device_id=device,
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+
+        def block(b):
+            return pl.ds(b * block_t, block_t)
+
+        @pl.when(i == 0)
+        def _send():
+            barrier = pltpu.get_barrier_semaphore()
+            pl.semaphore_signal(
+                barrier, inc=1, device_id=device, device_id_type=pl.DeviceIdType.MESH
+            )
+            # The peer has entered the call: its buffers are live.
+            pl.semaphore_wait(barrier, 1)
+            remote(lse_hbm.at[peer_rows], recv_lse_hbm, lse_sem).start()
+            for b in range(num_blocks):
+                remote(
+                    out_hbm.at[peer_rows, block(b)],
+                    recv_hbm.at[:, block(b)],
+                    recv_sems.at[b],
+                ).start()
+            remote(lse_hbm.at[peer_rows], recv_lse_hbm, lse_sem).wait_recv()
+            local = pltpu.make_async_copy(recv_lse_hbm, lse1_buf, copy_sem)
+            local.start()
+            local.wait()
+
+        pltpu.make_async_copy(
+            recv_hbm.at[:, block(0)], recv_hbm.at[:, block(0)], recv_sems.at[i]
+        ).wait()
+        local = pltpu.make_async_copy(recv_hbm.at[:, block(i)], p1_buf, copy_sem)
+        local.start()
+        local.wait()
+        lse1 = lse1_buf.at[:, pl.ds(pl.multiple_of(i * block_t, block_t), block_t)]
+        _merge_pair_kernel(
+            (lse0_ref, lse1),
+            (p0_ref, p1_buf),
+            *([h_ref] if rotated else []),
+            o_ref,
+            rotated=rotated,
+        )
+
+        @pl.when(i == num_blocks - 1)
+        def _sent():
+            for b in range(num_blocks):
+                remote(
+                    out_hbm.at[peer_rows, block(b)],
+                    recv_hbm.at[:, block(b)],
+                    recv_sems.at[b],
+                ).wait_send()
+            remote(lse_hbm.at[peer_rows], recv_lse_hbm, lse_sem).wait_send()
+
+    any_ = pl.BlockSpec(memory_space=pl.ANY)
+    merged, _, _ = pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            grid=(num_blocks,),
+            in_specs=[
+                pl.BlockSpec((num_heads, block_t), lambda i, r: (0, i)),
+                pl.BlockSpec((num_heads, block_t, head_dim), lambda i, r: (0, i, 0)),
+                any_,
+                any_,
+                *(
+                    [pl.BlockSpec((head_dim, head_dim), lambda i, r: (0, 0))]
+                    if rotated
+                    else []
+                ),
+            ],
+            out_specs=(
+                pl.BlockSpec((block_t, num_heads * head_dim), lambda i, r: (i, 0)),
+                any_,
+                any_,
+            ),
+            scratch_shapes=[
+                pltpu.VMEM((num_heads, block_t, head_dim), out.dtype),
+                pltpu.VMEM((num_heads, num_tokens), jnp.float32),
+                pltpu.SemaphoreType.DMA(()),
+                pltpu.SemaphoreType.DMA((num_blocks,)),
+                pltpu.SemaphoreType.DMA(()),
+                pltpu.SemaphoreType.DMA(()),
+            ],
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct((num_tokens, num_heads * head_dim), out.dtype),
+            jax.ShapeDtypeStruct((num_heads, num_tokens, head_dim), out.dtype),
+            jax.ShapeDtypeStruct((num_heads, num_tokens), jnp.float32),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary",),
+            collective_id=_SWAP_MERGE_COLLECTIVE_ID,
+        ),
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name="minimax_m3_msa_dcp_swap_merge_split_partials",
+    )(
+        rank_array(rank),
+        lse,
+        out,
+        out,
+        lse,
+        *([hadamard] if rotated else []),
+    )
+    return merged
+
+
 def _gather_heads(q: jax.Array, rank: jax.Array, axis: str, dcp: int) -> jax.Array:
     """The group's head-major query heads ``[dcp * Hl, T, D]`` from this
     rank's ``q [Hl, T, D]``. A pair swaps its halves by one collective
@@ -2918,6 +3073,10 @@ def attend_and_merge(
         parts = jnp.stack([out[:num_heads], peer_out])
         lses = jnp.stack([lse[:num_heads].T, peer_lse])
         return merge_partials(parts, lses, hadamard, interpret=interpret)
+    if pair and num_tokens % _PARTIALS_BLOCK_TOKENS == 0:
+        return swap_merge_split_partials(
+            out, lse, rank, hadamard, axis=axis, interpret=interpret
+        )
     if pair:
         swap = functools.partial(
             jax.lax.ppermute, axis_name=axis, perm=[(0, 1), (1, 0)]
