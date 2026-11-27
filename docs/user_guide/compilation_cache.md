@@ -33,7 +33,7 @@ vllm serve <model> --additional-config '{"tpu_compile": {"fast_compiled_call": t
 
 - **When it applies**: each TPU worker arms the option when it is built, before any compiled function runs. `TpuPlatform.check_and_update_config` refuses a malformed section (an unknown key, or a value that is not a JSON boolean) at startup.
 - **Compile-cache key**: the section is part of `VllmConfig.compute_hash()`, which keys vLLM's AOT compile cache and piecewise cache directory under `VLLM_CACHE_ROOT`; only the diagnostics keys in `runner.utils.HASH_IGNORED_ADDITIONAL_CONFIG_KEYS` are left out. A start with the option set the other way does not reuse those artifacts.
-- **Calls that still go through Dynamo**: every call of a function whose signature takes `*args` or `**kwargs`, and any call under a non-default `torch.compiler.set_stance`, inside another compiled function, or with `TORCHDYNAMO_DISABLE=1`.
+- **Calls that still go through Dynamo**: every call of a function whose signature takes `*args` or `**kwargs`, and any call under a non-default `torch.compiler.set_stance` or inside another compiled function. With `TORCHDYNAMO_DISABLE=1` the decorator returns the plain function, so nothing is compiled or dispatched.
 - **Logs**: with the option on, each worker logs `tpu_compile: fast_compiled_call=True` at startup, `fast_compiled_call: first direct dispatch of <function>` once per function, and `fast_compiled_call: fast=<n> slow=<n>` (direct calls and calls through Dynamo, over the whole process) every 20,000 calls.
 
 ## Compilation Debugging & Telemetry
