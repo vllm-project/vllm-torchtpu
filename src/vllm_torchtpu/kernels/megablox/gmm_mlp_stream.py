@@ -115,19 +115,22 @@ def gathers(num_tokens: int, topk: int, w1: jax.Array) -> bool:
         num_tokens % sub == 0
         and topk > 0
         and k % _SELECT_COLS == 0
-        and _vmem_bytes(two_i // 2, k, sub, num_tokens) <= info.vmem_capacity_bytes
+        and _vmem_bytes(two_i // 2, k, sub, (topk, num_tokens))
+        <= info.vmem_capacity_bytes
     )
 
 
-def _vmem_bytes(i: int, k: int, sub: int, tokens: int = 0) -> int:
+def _vmem_bytes(i: int, k: int, sub: int, routes: tuple[int, int] = (0, 0)) -> int:
     """The kernel's scratch, a lower bound on its VMEM (fp4 takes a byte per
-    element in VMEM); ``tokens``: the token count it gathers rows from, 0 for
-    none."""
+    element in VMEM); ``routes``: (topk, tokens) it gathers rows by, if any."""
     win = FP8_RHS_MAX_BUCKET_M
     ring = _SLOTS * (i * k + (i // _QUANT_BLOCK) * k * 4)
     # x_buf (gather: one pass's 32-bit row pairs, the same bytes), plus the
-    # lane-padded inverse permutation it gathers by.
-    rows = 2 * _PASS_WINDOWS * win * k * 2 + tokens * 128 * 4
+    # inverse permutation it gathers by (int32 [topk, T] in (8, 128) tiles).
+    topk, tokens = routes
+    rows = (
+        2 * _PASS_WINDOWS * win * k * 2 + align_to(topk, 8) * align_to(tokens, 128) * 4
+    )
     rows += _PASS_WINDOWS * win * (2 * i * 4 + i * 2)  # acc_buf, h_buf
     rows += (win + (_OUT_SLOTS + 1) * sub) * k * 2  # o_buf, o_ring, p_buf
     return ring + rows
@@ -142,7 +145,8 @@ def _kernel(
     gather: bool,
 ):
     if gather:
-        # VMEM int32 [T, topk]: each route's routed row (the inverse permutation).
+        # VMEM int32 [topk, T]: each route's routed row (the inverse permutation),
+        # slot-major as the routing prep builds it.
         revert_ref, *refs = refs
     (
         lhs_hbm,  # [M, K] bf16 routed rows, or [T, K] bf16 tokens (gather)
@@ -305,18 +309,24 @@ def _kernel(
     if gather:
         # Routed row -> token for the rows the groups hold, under the first
         # weight copies: one 128-row block of the inverse permutation at a time.
-        tokens, topk = revert_ref.shape
-        slot = lax.broadcasted_iota(jnp.int32, (tokens, _SLOT_BLOCK), 1)
-        token = lax.broadcasted_iota(jnp.int32, (tokens, _SLOT_BLOCK), 0)
+        topk, tokens = revert_ref.shape
+        slot = lax.broadcasted_iota(jnp.int32, (_SLOT_BLOCK, tokens), 0)
+        token = lax.broadcasted_iota(jnp.int32, (_SLOT_BLOCK, tokens), 1)
+        diagonal = lax.broadcasted_iota(
+            jnp.int32, (_SLOT_BLOCK, _SLOT_BLOCK), 0
+        ) == lax.broadcasted_iota(jnp.int32, (_SLOT_BLOCK, _SLOT_BLOCK), 1)
         for b in range(pl.cdiv(out_hbm.shape[0], _SLOT_BLOCK)):
 
             @pl.when(b * _SLOT_BLOCK < rows_total)
             def _(b=b):
-                hit = jnp.zeros((tokens, _SLOT_BLOCK), jnp.int32)
+                hit = jnp.zeros((_SLOT_BLOCK, tokens), jnp.int32)
                 for k in range(topk):
-                    route = revert_ref[:, k : k + 1] == slot + b * _SLOT_BLOCK
+                    route = revert_ref[k : k + 1, :] == slot + b * _SLOT_BLOCK
                     hit = jnp.where(route, token, hit)
-                tok_v[b : b + 1, :] = jnp.sum(hit, axis=0, keepdims=True)
+                # The block's tokens from slots on sublanes to slots on lanes.
+                column = jnp.sum(hit, axis=1, keepdims=True)
+                row = jnp.sum(jnp.where(diagonal, column, 0), axis=0, keepdims=True)
+                tok_v[b : b + 1, :] = row
 
         tok_copy = pltpu.make_async_copy(tok_v, tok_s, tok_sem.at[0])
         tok_copy.start()
@@ -551,7 +561,8 @@ def gmm_mlp_stream(
     if gather:
         tokens = lhs.shape[0]
         assert tokens % sub == 0 and m % tokens == 0, (tokens, m, sub)
-        gather_operands = (revert.reshape(tokens, m // tokens).astype(jnp.int32),)
+        # Slot-major: the counting sort's layout, so the transposes cancel.
+        gather_operands = (revert.reshape(tokens, m // tokens).T.astype(jnp.int32),)
         gather_specs = [pl.BlockSpec(memory_space=pltpu.VMEM)]
         blocks = align_to(pl.cdiv(mp, _SLOT_BLOCK), 8)
         gather_scratch = [
