@@ -99,9 +99,12 @@ def _indep_kv_splits(geometry: ModelGeometry, tp: int, *, has_kv: bool) -> list[
     """Return independent physical KV-split divisors for a given TP degree."""
     if not has_kv:
         return [1]
+    is_tp_dcp = (
+        geometry.sparse_attn is not None and geometry.sparse_attn.dcp_span == "tp"
+    )
     kv_group = (
         max(1, tp // geometry.num_kv_heads)
-        if geometry.num_kv_heads > 0 and geometry.kv_lora_rank == 0
+        if geometry.num_kv_heads > 0 and geometry.kv_lora_rank == 0 and not is_tp_dcp
         else tp
     )
     return [d for d in range(1, kv_group + 1) if kv_group % d == 0]
@@ -903,7 +906,13 @@ def test_physics_invariants_hold_for_every_candidate(
         assert any(record.pool.pcp > 1 for record in disagg_plan.prefill_pools)
 
     # Batch monotonicity: decode step hard floor at b=16 >= b=1.
-    par_ref = Parallel(tp=topology.num_cores, ep=topology.num_cores, moe="ep")
+    ref_tp = math.gcd(topology.num_cores, geometry.num_heads)
+    par_ref = Parallel(
+        tp=ref_tp,
+        dp=topology.num_cores // ref_tp,
+        ep=topology.num_cores,
+        moe="ep",
+    )
     sf_b1 = step_floor(
         geometry,
         chip,

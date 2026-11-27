@@ -252,10 +252,28 @@ def _pool_b_cap_single(
     ctx_full = scenario.isl + scenario.osl
     usable_b = float(chip.hbm_bytes) - (_ZERO_RESERVE_GB * UNIT_GIGA)
     w_base_b = rf_memory.hbm_footprint_per_core_bytes(
-        geometry, dtypes, parallel, rf_memory.SeqKvLayout(0, 0), chip=chip
+        geometry,
+        dtypes,
+        parallel,
+        rf_memory.SeqKvLayout(
+            0,
+            0,
+            host_table_residency=scenario.host_table_residency,
+            kv_offload_enabled=scenario.kv_offload_gb > 0.0,
+        ),
+        chip=chip,
     )
     hbm_c1 = rf_memory.hbm_footprint_per_core_bytes(
-        geometry, dtypes, parallel, rf_memory.SeqKvLayout(1, ctx_full), chip=chip
+        geometry,
+        dtypes,
+        parallel,
+        rf_memory.SeqKvLayout(
+            1,
+            ctx_full,
+            host_table_residency=scenario.host_table_residency,
+            kv_offload_enabled=scenario.kv_offload_gb > 0.0,
+        ),
+        chip=chip,
     )
     per_seq_b = hbm_c1 - w_base_b
     if hbm_c1 > usable_b:
@@ -265,7 +283,16 @@ def _pool_b_cap_single(
     else:
         kv_cap_seqs = max(scenario.concurrencies, default=1)
     state_phys = rf_memory.hbm_breakdown_per_core_bytes(
-        geometry, dtypes, parallel, rf_memory.SeqKvLayout(1, 0), chip=chip
+        geometry,
+        dtypes,
+        parallel,
+        rf_memory.SeqKvLayout(
+            1,
+            0,
+            host_table_residency=scenario.host_table_residency,
+            kv_offload_enabled=scenario.kv_offload_gb > 0.0,
+        ),
+        chip=chip,
     ).state
     h_rate = scenario.prefix_hit_rate
     shared_toks = h_rate * float(scenario.isl)
@@ -561,7 +588,12 @@ def test_bound_ordering_holds_over_generated_inputs() -> None:
                     geometry,
                     dtypes,
                     par_v,
-                    rf_memory.SeqKvLayout(1, scenario.isl + scenario.osl),
+                    rf_memory.SeqKvLayout(
+                        1,
+                        scenario.isl + scenario.osl,
+                        host_table_residency=scenario.host_table_residency,
+                        kv_offload_enabled=scenario.kv_offload_gb > 0.0,
+                    ),
                     chip=chip_base,
                 )
                 <= float(chip_base.hbm_bytes)
@@ -576,7 +608,12 @@ def test_bound_ordering_holds_over_generated_inputs() -> None:
                         geometry,
                         dtypes,
                         par_v,
-                        rf_memory.SeqKvLayout(1, scenario.isl),
+                        rf_memory.SeqKvLayout(
+                            1,
+                            scenario.isl,
+                            host_table_residency=scenario.host_table_residency,
+                            kv_offload_enabled=scenario.kv_offload_gb > 0.0,
+                        ),
                         chip=chip_base,
                     )
                     <= float(chip_base.hbm_bytes)
@@ -1012,15 +1049,78 @@ def test_spec_zero_weights_draft_vector_all_dtypes(fixture_name: str) -> None:
         shape,
         rf.UnpaddedFloorOptions(dtypes=dtypes, spec_k=0, zero_weights=True),
     )
+    is_dspark = geometry.draft is not None and geometry.draft.kind == "dspark"
+    draft_scale = 1.0 if is_dspark else float(spec_k)
+    draft_rows_per_seq = spec_k if is_dspark else 1
     hbm_draft, _, vec_draft, _ = rf.unpadded_strict_resource_times(
         _draft_geom_for_spec(geometry),
+        chip,
+        parallel,
+        StepShape(
+            batch=4,
+            rows_per_seq=draft_rows_per_seq,
+            context=1024,
+            state_writes=1,
+        ),
+        rf.UnpaddedFloorOptions(dtypes=dtypes, spec_k=0, zero_weights=True),
+    )
+    assert hbm_spec == pytest.approx(hbm_base + draft_scale * hbm_draft, rel=1e-12)
+    assert vec_spec == pytest.approx(vec_base + draft_scale * vec_draft, rel=1e-12)
+
+
+def test_spec_zero_weights_dspark_single_pass_vector() -> None:
+    """Verify DSpark uses single-pass spec_k-row draft scaling under zero_weights."""
+    config = load_locked_config("qwen3_5_397b_fp8.json")
+    base_geom = from_hf_config(config)
+    dspark_geom = replace(
+        base_geom,
+        draft=rf.DraftSpec(
+            kind="dspark",
+            num_layers=2,
+            layer_kind="sliding_attention",
+            dense_inter=base_geom.dense_inter or 2048,
+            sliding_window=128,
+            block_size=3,
+            fc_in_mult=2,
+        ),
+    )
+    dtypes = dtypes_from_hf_config(config)
+    chip = CHIPS["tpu7x"]
+    parallel = Parallel(tp=8, ep=8, moe="ep")
+    spec_k = 3
+    shape = StepShape(batch=4, rows_per_seq=1, context=1024)
+    hbm_spec, _, vec_spec, _ = rf.unpadded_strict_resource_times(
+        dspark_geom,
+        chip,
+        parallel,
+        shape,
+        rf.UnpaddedFloorOptions(dtypes=dtypes, spec_k=spec_k, zero_weights=True),
+    )
+    hbm_base, _, vec_base, _ = rf.unpadded_strict_resource_times(
+        dspark_geom,
+        chip,
+        parallel,
+        shape,
+        rf.UnpaddedFloorOptions(dtypes=dtypes, spec_k=0, zero_weights=True),
+    )
+    hbm_draft, _, vec_draft, _ = rf.unpadded_strict_resource_times(
+        _draft_geom_for_spec(dspark_geom),
+        chip,
+        parallel,
+        StepShape(batch=4, rows_per_seq=spec_k, context=1024, state_writes=1),
+        rf.UnpaddedFloorOptions(dtypes=dtypes, spec_k=0, zero_weights=True),
+    )
+    hbm_1row, _, vec_1row, _ = rf.unpadded_strict_resource_times(
+        _draft_geom_for_spec(dspark_geom),
         chip,
         parallel,
         StepShape(batch=4, rows_per_seq=1, context=1024, state_writes=1),
         rf.UnpaddedFloorOptions(dtypes=dtypes, spec_k=0, zero_weights=True),
     )
-    assert hbm_spec == pytest.approx(hbm_base + float(spec_k) * hbm_draft, rel=1e-12)
-    assert vec_spec == pytest.approx(vec_base + float(spec_k) * vec_draft, rel=1e-12)
+    assert hbm_spec == pytest.approx(hbm_base + hbm_draft, rel=1e-12)
+    assert vec_spec == pytest.approx(vec_base + vec_draft, rel=1e-12)
+    assert vec_draft < float(spec_k) * vec_1row
+    assert hbm_draft != pytest.approx(float(spec_k) * hbm_1row, rel=1e-6)
 
 
 def test_solver_assumptions_match_defaults_and_chip_spec() -> None:

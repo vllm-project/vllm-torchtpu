@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import contextlib
 import hashlib
 import io
 import json
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -56,6 +58,7 @@ GOLDEN_CONCURRENCIES = "1,16,64"
 GOLDEN_KV_DTYPE = "fp8"
 GOLDEN_HYBRID_STATE_DTYPE = "bf16"
 _FLOAT_DIGITS = 4
+_MAX_GRID_WORKERS = 16
 
 
 def _is_hybrid_recurrent_fixture(fixture_path: Path) -> bool:
@@ -233,21 +236,40 @@ def run_one_scenario(
     }
 
 
+def _run_grid_task(
+    task: tuple[str, str, str, int, tuple[str, str]],
+) -> tuple[str, dict[str, object]]:
+    """Evaluate one golden grid task and return (scenario_key, payload)."""
+    ckpt_id, fixture_name, slice_name, max_chips, mode_and_preset = task
+    mode, preset = mode_and_preset
+    key = f"{ckpt_id}__{slice_name}__{mode}__{preset}"
+    return (
+        key,
+        run_one_scenario(
+            ckpt_id,
+            fixture_name,
+            slice_name,
+            max_chips,
+            mode_and_preset,
+        ),
+    )
+
+
 def build_golden_grid() -> dict[str, object]:
-    """Compute the full 72-scenario golden grid dictionary."""
-    scenarios: dict[str, dict[str, object]] = {}
-    for ckpt_id, fixture_name in GOLDEN_CHECKPOINTS:
-        for slice_name, max_chips in GOLDEN_SLICES:
-            for mode in GOLDEN_MODES:
-                for preset in GOLDEN_PRESETS:
-                    key = f"{ckpt_id}__{slice_name}__{mode}__{preset}"
-                    scenarios[key] = run_one_scenario(
-                        ckpt_id,
-                        fixture_name,
-                        slice_name,
-                        max_chips,
-                        (mode, preset),
-                    )
+    """Compute the full deterministic golden grid dictionary."""
+    tasks = [
+        (ckpt_id, fixture_name, slice_name, max_chips, (mode, preset))
+        for ckpt_id, fixture_name in GOLDEN_CHECKPOINTS
+        for slice_name, max_chips in GOLDEN_SLICES
+        for mode in GOLDEN_MODES
+        for preset in GOLDEN_PRESETS
+    ]
+    workers = min(_MAX_GRID_WORKERS, max(1, len(tasks)), os.cpu_count() or 1)
+    if workers > 1:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+            scenarios = dict(pool.map(_run_grid_task, tasks))
+    else:
+        scenarios = dict(map(_run_grid_task, tasks))
     return {
         "grid_version": 1,
         "concurrencies": GOLDEN_CONCURRENCIES,

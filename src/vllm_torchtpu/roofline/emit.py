@@ -153,6 +153,34 @@ def _supplied_entry(
     return {"name": name, "flag": flag, "kind": kind, "value": value, "unit": unit}
 
 
+def _append_phase3_provenance(
+    plan: ServingPlan, supplied_values: list[dict[str, object]]
+) -> None:
+    """Append non-default execution, host-table, and draft CLI provenance entries."""
+    sc = plan.scenario
+    entries: tuple[tuple[bool, str, str, object, str], ...] = (
+        (sc.execution != "full", "execution", "--execution", sc.execution, "mode"),
+        (
+            sc.host_table_residency != "auto",
+            "host_table_residency",
+            "--host-table-residency",
+            sc.host_table_residency,
+            "mode",
+        ),
+        (sc.prefill_draft, "prefill_draft", "--prefill-draft", True, "flag"),
+        (
+            plan.draft_config_source is not None,
+            "draft_config",
+            "--draft-config",
+            plan.draft_config_source,
+            "path",
+        ),
+    )
+    for active, name, flag, val, unit in entries:
+        if active:
+            supplied_values.append(_supplied_entry(name, flag, "constraint", val, unit))
+
+
 def _build_provenance_payload(
     plan: ServingPlan,
     *,
@@ -257,6 +285,7 @@ def _build_provenance_payload(
                     "dtype",
                 )
             )
+    _append_phase3_provenance(plan, supplied_values)
     return {
         "calibrated": bool(active_calibrations),
         "supplied_values": supplied_values,

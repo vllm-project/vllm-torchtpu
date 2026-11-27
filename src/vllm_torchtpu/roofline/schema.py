@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from .chips import ChipSpec, SliceTopology
-    from .geometry import ModelGeometry
+    from .geometry import ExecutionMode, HostTableResidency, ModelGeometry
 
 type SortBy = Literal["throughput", "interactivity"]
 
@@ -71,6 +71,9 @@ class TrafficScenario:
     tpot_slo_ms: float | None = None
     spec_tokens: int | None = None
     kv_offload_gb: float = 0.0
+    execution: ExecutionMode = "full"
+    host_table_residency: HostTableResidency = "auto"
+    prefill_draft: bool = False
 
     def __post_init__(self) -> None:
         """Validate input sequence lengths, hit rates, and concurrency parameters."""
@@ -121,6 +124,19 @@ class TrafficScenario:
         ):
             msg = f"concurrencies must be positive ints, got {self.concurrencies}"
             raise ValueError(msg)
+        self._validate_physical_modes()
+
+    def _validate_physical_modes(self) -> None:
+        """Validate optional execution and host-table residency modes."""
+        if self.execution not in ("full", "ced"):
+            msg = f"execution must be 'full' or 'ced', got {self.execution!r}"
+            raise ValueError(msg)
+        if self.host_table_residency not in ("auto", "hbm", "host", "first"):
+            msg = (
+                "host_table_residency must be one of auto/hbm/host/first, "
+                f"got {self.host_table_residency!r}"
+            )
+            raise ValueError(msg)
 
     def _validate_spec_tokens(self) -> None:
         """Validate speculative decoding token count against accept_len."""
@@ -152,6 +168,9 @@ class ScenarioOverrides:
     tpot_slo_ms: float | None = None
     kv_working_set_turns: float | None = None
     kv_offload_gb: float | None = None
+    execution: ExecutionMode | None = None
+    host_table_residency: HostTableResidency | None = None
+    prefill_draft: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +316,7 @@ class ServingPlan:
     sweep_candidates: tuple[ParetoPoint, ...] = ()
     winner_prefix_hit_range: tuple[float, float] | None = None
     prefix_hit_crossover_rate: float | None = None
+    draft_config_source: str | None = None
 
 
 class ProvenancePayload(TypedDict):
@@ -590,7 +610,12 @@ def resolve_spec_k(
         return scenario.spec_tokens
     effective_accept_len = max(1.0, scenario.accept_len)
     if effective_accept_len > 1.0:
-        return max(geometry.mtp_layers, math.ceil(effective_accept_len) - 1)
+        default_k = (
+            max(geometry.draft.block_size, geometry.draft.num_layers)
+            if geometry.draft is not None
+            else geometry.mtp_layers
+        )
+        return max(default_k, math.ceil(effective_accept_len) - 1)
     return 0
 
 

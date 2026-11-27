@@ -32,10 +32,10 @@ _MANIFEST_PATH = _FIXTURES_DIR / "manifest.json"
 _NON_MODEL_FIXTURE_FILES = frozenset({"manifest.json", "representative_layouts.json"})
 
 
-def test_model_manifest_matches_supported_models_and_fixture_hashes() -> None:
+def verify_model_manifest(manifest_path: Path, fixtures_dir: Path) -> None:
     """Verify supported models, 1:1 fixture parity, SHA-256 digests, and geometry."""
-    assert _MANIFEST_PATH.is_file(), f"Missing model manifest at {_MANIFEST_PATH}"
-    manifest = json.loads(_MANIFEST_PATH.read_text(encoding="utf-8"))
+    assert manifest_path.is_file(), f"Missing model manifest at {manifest_path}"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     entries = manifest["checkpoints"]
     assert entries
 
@@ -48,17 +48,21 @@ def test_model_manifest_matches_supported_models_and_fixture_hashes() -> None:
     manifest_canonical_ids = {entry["canonical_id"] for entry in entries}
     assert manifest_canonical_ids == set(SUPPORTED_MODELS)
 
-    # Every model JSON under fixtures/ must appear in manifest.json 1:1.
+    # Every model and optional draft JSON under fixtures/ must appear in manifest 1:1.
     manifest_fixtures = {entry["fixture"] for entry in entries}
+    for entry in entries:
+        draft_fixture = entry.get("draft_fixture")
+        if draft_fixture is not None:
+            manifest_fixtures.add(draft_fixture)
     disk_model_fixtures = {
         path.name
-        for path in _FIXTURES_DIR.glob("*.json")
+        for path in fixtures_dir.glob("*.json")
         if path.name not in _NON_MODEL_FIXTURE_FILES
     }
     assert disk_model_fixtures == manifest_fixtures
 
     for entry in entries:
-        fixture_path = _FIXTURES_DIR / entry["fixture"]
+        fixture_path = fixtures_dir / entry["fixture"]
         assert fixture_path.is_file(), f"Missing fixture {fixture_path}"
         actual_digest = base64.b64encode(
             hashlib.sha256(fixture_path.read_bytes()).digest()
@@ -66,11 +70,24 @@ def test_model_manifest_matches_supported_models_and_fixture_hashes() -> None:
         assert actual_digest == entry["sha256_b64"]
         assert entry["revision"]
 
+        draft_cfg: dict[str, object] | None = None
+        draft_fixture = entry.get("draft_fixture")
+        if draft_fixture is not None:
+            draft_path = fixtures_dir / draft_fixture
+            assert draft_path.is_file(), f"Missing draft fixture {draft_path}"
+            actual_draft_digest = base64.b64encode(
+                hashlib.sha256(draft_path.read_bytes()).digest()
+            ).decode("ascii")
+            assert actual_draft_digest == entry["draft_sha256_b64"]
+            draft_cfg = json.loads(draft_path.read_text(encoding="utf-8"))
+
         raw_cfg = json.loads(fixture_path.read_text(encoding="utf-8"))
         identity = resolve_model_identity(raw_cfg, model_ref=entry["hf_repo"])
         assert identity.canonical_id == entry["canonical_id"]
 
-        geometry = from_hf_config(raw_cfg, model_ref=entry["hf_repo"])
+        geometry = from_hf_config(
+            raw_cfg, model_ref=entry["hf_repo"], draft_config=draft_cfg
+        )
         expected_geom = entry["geometry"]
         for field_name, expected_value in expected_geom.items():
             actual_value = getattr(geometry, field_name)
@@ -91,3 +108,8 @@ def test_model_manifest_matches_supported_models_and_fixture_hashes() -> None:
             structure["ffn_moe_layers"],
             structure["ffn_dense_layers"],
         )
+
+
+def test_model_manifest_matches_supported_models_and_fixture_hashes() -> None:
+    """Verify locked manifest fixtures, digests, and extracted geometry."""
+    verify_model_manifest(_MANIFEST_PATH, _FIXTURES_DIR)

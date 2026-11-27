@@ -81,10 +81,12 @@ VALID_LAYER_TOKENS: frozenset[str] = frozenset(
     {
         "full_attention",
         "indexed_attention",
+        "sparse_gqa",
         "attention",
         "gqa",
         "mla",
         "mla_attention",
+        "csa2",
         "dsa",
         "dsa_attention",
         "deepseek_sparse_attention",
@@ -123,6 +125,7 @@ LINEAR_ATTENTION_LAYER_TOKENS: frozenset[str] = frozenset(
 LAYER_TYPE_MAP: dict[str, str] = {
     "mla": "mla",
     "mla_attention": "mla",
+    "csa2": "mla",
     "dsa": "dsa",
     "dsa_attention": "dsa",
     "deepseek_sparse_attention": "dsa",
@@ -138,6 +141,7 @@ LAYER_TYPE_MAP: dict[str, str] = {
     "gated_deltanet": "gdn",
     "mamba": "gdn",
     "gqa": "gqa",
+    "sparse_gqa": "gqa",
     "indexed_attention": "gqa",
 }
 
@@ -186,6 +190,14 @@ DEFAULT_SSM_STATE_BYTES: float = 4.0
 FP4_BYTES: float = 0.5
 MXFP4_BYTES: float = 0.5 + 1.0 / 32.0
 NVFP4_BYTES: float = 0.5 + 1.0 / 16.0
+MXFP8_BYTES: float = FP8_BYTES + FP8_BYTES / 32.0
+FP8_UE8M0_BYTES: float = MXFP8_BYTES
+_INT4_PTH_PARTS: tuple[str, ...] = ("int4", "per", "token", "head")
+INT4_PER_TOKEN_HEAD_KV_DTYPE: str = "_".join(_INT4_PTH_PARTS)
+# Per-token 4-bit KV scale cache stores 8 FP32 scales per rank (32 B/tok)
+# plus one FP32 scale per token for 4-bit sparse index keys (4 B/tok).
+INT4_PER_TOKEN_HEAD_SCALE_BYTES: float = 8.0 * FP32_BYTES
+INT4_INDEX_SCALE_BYTES: float = FP32_BYTES
 
 BASE_DTYPE_BYTES: dict[str, float] = {
     "float32": FP32_BYTES,
@@ -203,7 +215,11 @@ BASE_DTYPE_BYTES: dict[str, float] = {
     "uint8": INT8_BYTES,
 }
 
-WEIGHT_DTYPE_BYTES: dict[str, float] = {"bf16": BF16_BYTES, "fp8": FP8_BYTES}
+WEIGHT_DTYPE_BYTES: dict[str, float] = {
+    "bf16": BF16_BYTES,
+    "fp8": FP8_BYTES,
+    "mxfp8": MXFP8_BYTES,
+}
 EXPERT_DTYPE_BYTES: dict[str, float] = {
     "bf16": BF16_BYTES,
     "fp8": FP8_BYTES,
@@ -216,6 +232,7 @@ KV_DTYPE_BYTES: dict[str, float] = {
     "int8": INT8_BYTES,
     "fp4": FP4_BYTES,
     "int4": FP4_BYTES,
+    INT4_PER_TOKEN_HEAD_KV_DTYPE: FP4_BYTES,
 }
 STATE_DTYPE_BYTES: dict[str, float] = {"fp32": FP32_BYTES, "bf16": BF16_BYTES}
 

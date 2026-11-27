@@ -21,7 +21,7 @@ import importlib
 import json
 import urllib.parse
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
 from typing import Literal
@@ -39,6 +39,7 @@ from .constants import (
     FP8_BYTES,
     HTTP_OK,
     HTTP_TIMEOUT_S,
+    INT4_PER_TOKEN_HEAD_KV_DTYPE,
     INT8_BYTES,
     MULTIMODAL_KEYS,
     MXFP4_BYTES,
@@ -252,6 +253,17 @@ def load_hf_config(
         raise FileNotFoundError(msg)
 
     return _fetch_remote_hf_config(remote_url, _get_hf_hub_token())
+
+
+def load_draft_hf_config(
+    draft_config_path: str | Path | Mapping[str, object] | None,
+    *,
+    offline: bool = False,
+) -> dict[str, object] | None:
+    """Load an optional companion draft model config.json when provided."""
+    if draft_config_path is None:
+        return None
+    return load_hf_config(draft_config_path, offline=offline)
 
 
 def apply_hf_overrides(
@@ -511,10 +523,17 @@ def _extract_role_quant_params(
     elif both_groups:
         dense_grp = both_groups[0]
         expert_grp = both_groups[0]
-    return (
-        _merge_top_quant_params(qcfg, dense_grp),
-        _merge_top_quant_params(qcfg, expert_grp),
-    )
+    dense_qp = _merge_top_quant_params(qcfg, dense_grp)
+    expert_qp = _merge_top_quant_params(qcfg, expert_grp)
+    moe_algo = str(qcfg.get("moe_quant_algo") or "").lower()
+    moe_fmt = str(qcfg.get("moe_quant_format") or "").lower()
+    if moe_algo or moe_fmt:
+        expert_qp = replace(
+            expert_qp,
+            q_algo=moe_algo or expert_qp.q_algo,
+            q_fmt=moe_fmt or expert_qp.q_fmt,
+        )
+    return dense_qp, expert_qp
 
 
 def _extract_ignored_modules(
@@ -560,6 +579,7 @@ def _extract_ignored_modules(
     )
     aux_tokens = (
         "mtp",
+        "dspark",
         "gate",
         "ba",
         "router",
@@ -851,6 +871,8 @@ def _resolve_role_dtype_label(
         label = "mxfp4"
     elif _is_nvfp4(quant_config, role_dtype, qcfg):
         label = "nvfp4"
+    elif quant_config.q_method == "mxfp8" and w_bytes == fp8_b:
+        label = "mxfp8"
     elif w_bytes == fp8_b and fp8_b > FP8_BYTES:
         label = "fp8_block"
     elif (
@@ -916,6 +938,9 @@ def _fp8_block_bytes(qcfg: Mapping[str, object], quant_config: _QuantParams) -> 
     ):
         block_rows, block_cols = _to_int(block_sz[0]), _to_int(block_sz[1])
         if block_rows > 0 and block_cols > 0:
+            scale_fmt = str(qcfg.get("scale_fmt") or "").lower()
+            if quant_config.q_method == "mxfp8" or scale_fmt == "ue8m0":
+                return FP8_BYTES + FP8_BYTES / float(block_rows * block_cols)
             scale_b = (
                 quant_config.scale_bytes
                 if quant_config.scale_bytes is not None
@@ -938,6 +963,8 @@ def _parse_mapping_kv_scheme(
         raw_kv.get("type") or raw_kv.get("dtype") or raw_kv.get("quant_algo") or ""
     ).lower()
     kv_bits = _to_int(raw_kv.get("num_bits", 0))
+    if kv_type == INT4_PER_TOKEN_HEAD_KV_DTYPE:
+        return (FP4_BYTES, INT4_PER_TOKEN_HEAD_KV_DTYPE, True)
     if "int4" in kv_type or (kv_type == "int" and kv_bits == FOUR_BITS):
         return (FP4_BYTES, "int4", True)
     if any(tok in kv_type for tok in ("fp4", "nvfp4", "mxfp4")) or kv_bits == FOUR_BITS:
@@ -975,6 +1002,8 @@ def _parse_kv_cache_scheme(
         return _parse_mapping_kv_scheme(raw_kv, base_b, base_name)
 
     kv_scheme = str(raw_kv).strip().lower()
+    if kv_scheme == INT4_PER_TOKEN_HEAD_KV_DTYPE:
+        return (FP4_BYTES, INT4_PER_TOKEN_HEAD_KV_DTYPE, True)
     if "int4" in kv_scheme:
         return (FP4_BYTES, "int4", True)
     if any(tok in kv_scheme for tok in ("fp4", "nvfp4", "mxfp4")):
