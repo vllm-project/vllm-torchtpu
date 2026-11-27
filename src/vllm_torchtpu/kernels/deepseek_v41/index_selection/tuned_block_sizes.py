@@ -5,8 +5,6 @@ from dataclasses import dataclass
 
 # (TPU generation, score width, candidate count, records per candidate block).
 PUBLISH_CANDIDATE_SHAPES = frozenset({(7, 16384, 2048, 8)})
-# (generation, queries, token-score width, block size): (rows, output blocks).
-PUBLISH_BLOCK_MAX_CONFIG = {(7, 96, 98816, 8): (96, 1024)}
 
 
 @dataclass(frozen=True)
