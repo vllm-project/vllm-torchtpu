@@ -91,8 +91,11 @@ def _out_of_scope_params(
         cfg.get("tie_word_embeddings", text_config.get("tie_word_embeddings", False))
     )
     extra = vocab_size * profile.hidden_size * (1 if tied else 2)
-    if slug == "qwen3.5-397b" and isinstance(cfg.get("vision_config"), dict):
-        vc = cfg["vision_config"]
+    vc = cfg.get("vision_config")
+    if isinstance(vc, dict) and str(vc.get("model_type", "")) in (
+        "qwen3_5_moe",
+        "qwen4_exp",
+    ):
         vh = int(vc["hidden_size"])
         vi = int(vc["intermediate_size"])
         vd = int(vc["depth"])
@@ -108,6 +111,13 @@ def _out_of_scope_params(
             + m_in * m_in
             + m_in * oh
         )
+    ple_ids = text_config.get("ple_layer_ids")
+    ngram_base = int(text_config.get("ngram_vocab_size_base") or 0)
+    if isinstance(ple_ids, list) and ple_ids and ngram_base > 0:
+        div = max(1, int(text_config.get("make_ngram_vocab_size_divisible_by") or 1))
+        ple_vocab = ((ngram_base + div - 1) // div) * div
+        ple_dim = int(text_config.get("ple_embed_dim") or profile.hidden_size)
+        extra += ple_vocab * ple_dim * len(ple_ids)
     mtp_layers = int(
         text_config.get("mtp_num_hidden_layers")
         or text_config.get("num_nextn_predict_layers")
@@ -670,11 +680,20 @@ def test_attention_flops_conserved_under_dcp_while_kv_bytes_shrink(
         """Isolate KV-gather HBM microseconds across context delta under DCP."""
         hi_ctx = 32768
         if sp is not None and cap_tok > 0 and sp.index_dim > 0:
-            h_lo = _eval_per_op(chip, dcp, 1).hbm_us
-            h_mid = _eval_per_op(chip, dcp, cap_tok).hbm_us
-            h_hi = _eval_per_op(chip, dcp, hi_ctx).hbm_us
-            idx_slope = (h_hi - h_mid) / (hi_ctx - cap_tok)
-            return (h_mid - h_lo) - (cap_tok - 1) * idx_slope
+            e_lo = _eval_per_op(chip, dcp, 1)
+            e_mid = _eval_per_op(chip, dcp, cap_tok)
+            e_post = _eval_per_op(chip, dcp, cap_tok + 1)
+            e_hi = _eval_per_op(chip, dcp, hi_ctx)
+            score_act_us = (
+                (e_hi.act_hbm_mb - e_post.act_hbm_mb)
+                * 1e6
+                / chip.hbm_bw_bytes_per_s
+                * 1e6
+            )
+            idx_slope = (e_hi.hbm_us - e_post.hbm_us - score_act_us) / (
+                hi_ctx - (cap_tok + 1)
+            )
+            return (e_mid.hbm_us - e_lo.hbm_us) - (cap_tok - 1) * idx_slope
         return (
             _eval_per_op(chip, dcp, hi_ctx).hbm_us - _eval_per_op(chip, dcp, 1).hbm_us
         )

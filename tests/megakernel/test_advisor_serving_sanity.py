@@ -33,7 +33,12 @@ _VERIFY_SPEC_TOKENS = 3
 _TP_EP_8 = 8
 _KIMI_TP_EP_32 = 32
 _SANITY_BATCH_8 = 8
-_PRESET_SLUGS: tuple[str, ...] = ("qwen3.5-397b", "kimi-k3", "glm-5.2")
+_PRESET_SLUGS: tuple[str, ...] = (
+    "qwen3.5-397b",
+    "kimi-k3",
+    "glm-5.2",
+    "qwen3.8-flash-next",
+)
 _MOE_SETTINGS: tuple[str, ...] = ("unpinned", "masked_on_chip", "grouped_on_chip")
 _PINNED_MOE_MODES: dict[str, advisor.MoEMode] = {
     "masked_on_chip": "masked_on_chip",
@@ -271,6 +276,8 @@ def _build_grid_workloads(
                     dcp=layout.dcp,
                     pcp=layout.pcp,
                     layer_groups=layout.layer_groups,
+                    execution=layout.execution,
+                    host_table_hbm_overrides=layout.host_table_hbm_overrides,
                 )
                 cells.append((layout_name, _apply_moe_setting(workload, moe_setting)))
             continue
@@ -298,6 +305,8 @@ def _build_grid_workloads(
                         dcp=layout.dcp,
                         pcp=layout.pcp,
                         layer_groups=layout.layer_groups,
+                        execution=layout.execution,
+                        host_table_hbm_overrides=layout.host_table_hbm_overrides,
                     )
                     cells.append(
                         (layout_name, _apply_moe_setting(workload, moe_setting))
