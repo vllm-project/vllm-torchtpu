@@ -329,6 +329,49 @@ def test_fast_dispatch_skips_an_entry_freed_by_a_reset():
     assert (fast, slow) == (2, 1)
 
 
+def test_fast_dispatch_skips_a_dead_entry_behind_the_first():
+    """Two shapes give two kept entries. After a reset and a recompile of
+    both through the disarmed wrapper, the call that matches the second kept
+    entry, not the most recent one, must not run the discarded program
+    either."""
+    compiles, runs = [], []
+
+    def tagging_backend(gm, example_inputs):
+        tag = len(compiles)
+        compiles.append(tag)
+
+        def run(*args):
+            runs.append(tag)
+            return gm.forward(*args)
+
+        return run
+
+    def f(x):
+        return x * 2 + 1
+
+    compiled = torch.compile(f, backend=tagging_backend, fullgraph=True, dynamic=False)
+    wrapped = fast_dispatch.wrap(compiled, f)
+    small, large = torch.arange(4.0), torch.arange(8.0)
+    fast_dispatch.configure(fast=True)
+    for x in (small, large, small, large):
+        assert torch.equal(wrapped(x), x * 2 + 1)
+    assert len(wrapped._fast_dispatch_state["entries"]) == 2
+    old = set(runs)
+
+    torch._dynamo.reset()
+    fast_dispatch.configure(fast=False)
+    for x in (small, large):
+        assert torch.equal(wrapped(x), x * 2 + 1)
+    new = set(runs) - old
+    assert len(new) == 2 and fast_dispatch._entry_count(f.__code__) == 2
+    # Kept order is [large, small] (most recent first): call small, the second.
+    fast_dispatch.configure(fast=True)
+    del runs[:]
+    for _ in range(2):
+        assert torch.equal(wrapped(small), small * 2 + 1)
+    assert set(runs) <= new, runs
+
+
 def test_fast_dispatch_skips_an_invalidated_entry():
     """Dynamo invalidates a cache entry when an object one of its guards holds
     by id dies: here the class of an argument, which its type guard holds.
