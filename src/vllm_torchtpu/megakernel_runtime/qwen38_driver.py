@@ -1107,7 +1107,9 @@ class Qwen38SegmentDriver:
             self._attach_whole(runner)
         if envs.VLLM_TPU_MK_DRAFT:
             self._attach_mk_draft(runner)
-        elif self.mtp:
+        # MK draft step 0 never reaches the tail; the stock loop steps of
+        # VLLM_TPU_MK_DRAFT_FUSED_LOOP (and stock step 0) do.
+        if self.mtp and not (envs.VLLM_TPU_MK_DRAFT and envs.VLLM_TPU_MK_DRAFT_LOOP):
             self._attach_mtp_tail(runner)
         if self.check_left > 0:
             shadow_seg = Qwen38Segments(
