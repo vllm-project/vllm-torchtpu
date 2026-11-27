@@ -1020,11 +1020,11 @@ def test_one_row_per_request_samples_the_target_distribution(device, synthetic):
     """Speculative sampling's guarantee: with one draft per request, the first
     emitted token follows the target distribution p, the recovered token the
     residual (p without the draft, renormalized) and the bonus token p."""
-    num_reqs, vocab, draft = 20000, 8, 4
+    num_reqs, calls, vocab, draft = 500, 40, 8, 4
     row = torch.tensor([1.0, 2.5, 0.3, -1.0, 2.0, 0.0, 1.5, -0.5])
     rates = torch.tensor([0.6], device=device) if synthetic else None
     gen = torch.Generator().manual_seed(5)
-    out = _sample_one_row_per_request(
+    chunk = dict(
         logits=row.repeat(2 * num_reqs, 1).to(device),
         bonus_indices=torch.arange(1, 2 * num_reqs, 2, dtype=torch.int32).to(device),
         target_indices=torch.arange(0, 2 * num_reqs, 2, dtype=torch.int32).to(device),
@@ -1036,11 +1036,19 @@ def test_one_row_per_request_samples_the_target_distribution(device, synthetic):
         temperatures=torch.ones(num_reqs, 1).to(device),
         top_k=None,
         top_p=None,
-        sample_u=torch.rand((num_reqs, vocab), generator=gen).to(device),
-        accept_u=torch.rand((num_reqs,), generator=gen).to(device),
         synthetic_conditional_rates=rates,
         synthetic_mode=synthetic,
-    ).cpu()
+    )
+    out = torch.cat(
+        [
+            _sample_one_row_per_request(
+                **chunk,
+                sample_u=torch.rand((num_reqs, vocab), generator=gen).to(device),
+                accept_u=torch.rand((num_reqs,), generator=gen).to(device),
+            ).cpu()
+            for _ in range(calls)
+        ]
+    )
     p = torch.softmax(row.double(), dim=-1)
     residual = torch.where(torch.arange(vocab) == draft, 0.0, p)
     residual /= residual.sum()

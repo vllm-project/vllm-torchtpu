@@ -737,13 +737,19 @@ def _sample_one_row_per_request(
     total_tokens = draft_token_ids.shape[0]
     batch_size = num_draft_tokens.shape[0]
     device = draft_token_ids.device
+    # The bookkeeping below is on a few dozen int32 entries: dense compares
+    # and sums over [num_reqs, slots] fuse, where gathers, scatters and int64
+    # indices would each be a separate small op.
+    draft_token_ids = draft_token_ids.to(torch.int32)
+    segment_ids = segment_ids.to(torch.int32)
+    group_indices = group_indices.to(torch.int32)
+    num_draft_tokens = num_draft_tokens.to(torch.int32)
 
-    draft_token_ids = draft_token_ids.to(torch.int64)
-    valid_draft_token_ids = draft_token_ids >= 0
     if synthetic_mode:
         assert synthetic_conditional_rates is not None
-        conditional_rates = synthetic_conditional_rates[group_indices.to(torch.int64)]
-        accepted = accept_u < conditional_rates
+        accepted = accept_u < table_lookup.take(
+            synthetic_conditional_rates, group_indices
+        )
     else:
         # Accept test is the Leviathan ratio min(1, p(x) / q(x)); the draft is
         # greedy (q(x) == 1), so it collapses to p(x).
@@ -758,49 +764,40 @@ def _sample_one_row_per_request(
         )
         target_probs = torch.softmax(masked_logits, dim=-1)
         target_token_probs = target_probs.gather(
-            -1, draft_token_ids.clamp(min=0).unsqueeze(-1)
+            -1, draft_token_ids.clamp(min=0).to(torch.int64).unsqueeze(-1)
         ).squeeze(-1)
         accepted = target_token_probs >= accept_u
-    accepted = accepted & valid_draft_token_ids
+    accepted = accepted & (draft_token_ids >= 0)
 
-    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1)
-    match_mask = segment_ids.unsqueeze(0) == batch_indices
-    # Only declared draft slots may participate in rejection sampling.
-    draft_limits = num_draft_tokens.to(group_indices.dtype).unsqueeze(1)
-    valid_slot_mask = torch.any(
-        match_mask & (group_indices.unsqueeze(0) < draft_limits), dim=0
+    # [num_reqs, slots]: slot t holds draft group_indices[t] of its request;
+    # only declared draft slots take part.
+    requests = torch.arange(batch_size, dtype=torch.int32, device=device)
+    in_request = (segment_ids.unsqueeze(0) == requests.unsqueeze(1)) & (
+        group_indices.unsqueeze(0) < num_draft_tokens.unsqueeze(1)
     )
-    large_value = total_tokens
-    rejected_slot = valid_slot_mask & ~accepted
-    rejection_indices = torch.where(
-        rejected_slot,
-        group_indices,
-        torch.tensor(large_value, dtype=torch.int32, device=device),
+    first_rejection = (
+        torch.where(in_request & ~accepted, group_indices, total_tokens)
+        .min(dim=1)
+        .values
     )
-    first_rejection_idx_per_segment = torch.min(
-        torch.where(
-            match_mask,
-            rejection_indices.unsqueeze(0),
-            torch.tensor(large_value, dtype=torch.int32, device=device),
-        ),
-        dim=1,
-    ).values
-    all_accepted = first_rejection_idx_per_segment == large_value
-    should_get_bonus = all_accepted | (num_draft_tokens == 0)
+    all_accepted = first_rejection == total_tokens
+    accepted_count = torch.where(all_accepted, num_draft_tokens, first_rejection)
 
     # The row each request samples from: its first rejected slot's target row,
-    # else its bonus row; a rejected slot's (valid) draft is excluded.
-    at_first_rejection = match_mask & (
-        group_indices.unsqueeze(0) == first_rejection_idx_per_segment.unsqueeze(1)
+    # else its bonus row; a rejected slot's draft is excluded (none for -1).
+    at_rejection = in_request & (
+        group_indices.unsqueeze(0) == first_rejection.unsqueeze(1)
     )
-    rejected_slot_row = torch.argmax(at_first_rejection.to(torch.int32), dim=1)
+
+    def at_first_rejection(values: torch.Tensor) -> torch.Tensor:
+        picked = torch.where(at_rejection, values.unsqueeze(0), 0)
+        return picked.sum(1, dtype=torch.int32)
+
     sample_rows = torch.where(
-        should_get_bonus, bonus_indices, target_indices[rejected_slot_row]
+        all_accepted, bonus_indices, at_first_rejection(target_indices)
     )
     excluded_token_ids = torch.where(
-        should_get_bonus | ~valid_draft_token_ids[rejected_slot_row],
-        -1,
-        draft_token_ids[rejected_slot_row],
+        all_accepted, -1, at_first_rejection(draft_token_ids)
     )
 
     row_logits = torch.index_select(logits, 0, sample_rows).to(torch.float32)
@@ -813,7 +810,8 @@ def _sample_one_row_per_request(
         max=1.0 - torch.finfo(sample_u.dtype).eps,
     )
     noisy_logits = masked_logits - torch.log(-torch.log(sample_u))
-    vocab_ids = torch.arange(logits.shape[-1], device=device).unsqueeze(0)
+    vocab_ids = torch.arange(logits.shape[-1], dtype=torch.int32, device=device)
+    vocab_ids = vocab_ids.unsqueeze(0)
     noisy_logits = torch.where(
         vocab_ids == excluded_token_ids.unsqueeze(1), float("-inf"), noisy_logits
     )
@@ -825,51 +823,28 @@ def _sample_one_row_per_request(
     sampled_token_ids = torch.where(
         (excluded_token_ids >= 0) & (best <= MASKED_LOGIT_VALUE / 2),
         excluded_token_ids,
-        sampled,
-    ).to(torch.int32)
+        sampled.to(torch.int32),
+    )
 
-    # Drafts before the first rejection, the sampled token at it.
-    safe_segment_ids = segment_ids.clamp(min=0, max=batch_size - 1)
-    first_rejection_idx_broadcast = first_rejection_idx_per_segment[safe_segment_ids]
-    before_rejection = valid_slot_mask & (group_indices < first_rejection_idx_broadcast)
-    at_rejection = valid_slot_mask & (group_indices == first_rejection_idx_broadcast)
-    main_tokens = torch.where(
-        before_rejection,
-        draft_token_ids.to(torch.int32),
+    # Accepted drafts, then the sampled token (the recovered one at the first
+    # rejection, else the bonus after the last draft), then placeholders.
+    columns = torch.arange(max_draft_tokens + 1, dtype=torch.int32, device=device)
+    in_column = in_request.unsqueeze(1) & (
+        group_indices.view(1, 1, -1) == columns.view(1, -1, 1)
+    )
+    drafts = torch.where(in_column, draft_token_ids.view(1, 1, -1), 0).sum(
+        -1, dtype=torch.int32
+    )
+    accepted_count = accepted_count.unsqueeze(1)
+    return torch.where(
+        columns < accepted_count,
+        drafts,
         torch.where(
-            at_rejection,
-            sampled_token_ids[safe_segment_ids],
-            torch.tensor(PLACEHOLDER_TOKEN_ID, dtype=torch.int32, device=device),
+            columns == accepted_count,
+            sampled_token_ids.unsqueeze(1),
+            PLACEHOLDER_TOKEN_ID,
         ),
-    )
-
-    # Route padding positions to an extra sink row for a safe scatter.
-    selected_tokens = torch.full(
-        (batch_size + 1, max_draft_tokens + 1),
-        PLACEHOLDER_TOKEN_ID,
-        dtype=torch.int32,
-        device=device,
-    )
-    segment_ids = segment_ids.to(torch.int64)
-    group_indices = group_indices.to(torch.int64)
-    scatter_segment_ids = torch.where(
-        valid_slot_mask, segment_ids, torch.full_like(segment_ids, batch_size)
-    )
-    scatter_group_indices = torch.where(
-        valid_slot_mask, group_indices, torch.zeros_like(group_indices)
-    )
-    selected_tokens[scatter_segment_ids, scatter_group_indices] = main_tokens
-
-    accepted_count = torch.where(
-        all_accepted, num_draft_tokens, first_rejection_idx_per_segment
-    ).to(torch.int64)
-    batch_range = torch.arange(batch_size, dtype=torch.int64, device=device)
-    selected_tokens[batch_range, accepted_count] = torch.where(
-        should_get_bonus,
-        sampled_token_ids,
-        selected_tokens[batch_range, accepted_count],
-    )
-    return selected_tokens[:batch_size]
+    ).to(torch.int32)
 
 
 @direct_compile(backend="tpu")
