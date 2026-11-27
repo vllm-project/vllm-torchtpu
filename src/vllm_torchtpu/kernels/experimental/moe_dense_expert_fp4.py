@@ -62,6 +62,12 @@ _SHARED_COLS = 512
 _TOKEN_COPY_ROWS = 64
 # Sparse mode groups tokens by expert on one vreg's lanes (`_group_by_expert`).
 _SPARSE_MAX_EXPERTS = 128
+# Dense mode with more local experts than this (and at most one vreg's lanes)
+# finds the nonempty experts with vector ops and one SMEM copy instead of
+# scalar loops over every route and every expert, which sit on the critical
+# path ahead of the first weight copy (TP-sliced 128 experts: 2.5-3.8 us less
+# per call at 8-32 tokens; 16 EP experts: within 1 us either way).
+_SCALAR_SELECT_MAX_EXPERTS = 32
 # MiniMax-M3's shared-expert SwiGLU-OAI clamp and sigmoid scale (1.702 in
 # bf16); dense_fp4_shared admits only shared experts with these values.
 _SWIGLU_LIMIT = 7.0
@@ -324,6 +330,58 @@ def _group_by_expert(id_cols, m, mp, experts, stage, smem, sem):
     copy.wait()
 
 
+# Rows of `_select_experts`' staging: the nonempty local experts ascending
+# (lanes 0..count-1), each expert's row-tile bits (`mark`'s encoding), the count.
+_SELECT_IDS_ROW, _SELECT_TILES_ROW, _SELECT_COUNT_ROW = 0, 1, 2
+
+
+def _select_experts(id_cols, experts, stage, smem, sem):
+    """`mark` and `compact` with vector ops: the nonempty local experts, their
+    row-tile bits and their count, staged in VMEM and copied to ``smem``
+    (rows `_SELECT_*_ROW`). An expert's position in the list is the number of
+    nonempty experts below it (an MXU prefix sum, exact in f32), and the list
+    is placed by a one-hot matmul of the expert ids (exact: ids < 256)."""
+    f32, bf16 = jnp.float32, jnp.bfloat16
+    m = id_cols[0].shape[0]
+    lanes = stage.shape[1]
+    expert_lanes = lax.broadcasted_iota(jnp.int32, (m, lanes), 1)
+    hit = jnp.zeros((m, lanes), jnp.bool_)
+    for col in id_cols:
+        hit |= (col == expert_lanes) & (col >= 0) & (col < experts)
+    hit = hit.astype(f32)
+    rows = lax.broadcasted_iota(jnp.int32, (m, lanes), 0)
+    first = jnp.max(jnp.where(rows < _ROW_ALIGN, hit, 0), axis=0, keepdims=True)
+    later = jnp.max(jnp.where(rows >= _ROW_ALIGN, hit, 0), axis=0, keepdims=True)
+    active = jnp.maximum(first, later)  # [1, lanes]
+    sub = lax.broadcasted_iota(jnp.int32, (lanes, lanes), 0)
+    lane = lax.broadcasted_iota(jnp.int32, (lanes, lanes), 1)
+    below = (sub < lane).astype(bf16)
+    rank = jnp.dot(
+        jnp.broadcast_to(active, (8, lanes)).astype(bf16),
+        below,
+        preferred_element_type=f32,
+    )[0:1]
+    # place[n, e]: expert e is the n-th nonempty one.
+    place = jnp.where((rank == sub.astype(f32)) & (active > 0), 1.0, 0.0)
+    ids = lax.dot_general(
+        lax.broadcasted_iota(jnp.int32, (8, lanes), 1).astype(bf16),
+        place.astype(bf16),
+        (((1,), (1,)), ((), ())),
+        preferred_element_type=f32,
+    )[0:1]
+    count = jnp.sum(active, axis=1, keepdims=True)
+    stage[_SELECT_IDS_ROW : _SELECT_IDS_ROW + 1, :] = ids.astype(jnp.int32)
+    stage[_SELECT_TILES_ROW : _SELECT_TILES_ROW + 1, :] = (first + 2 * later).astype(
+        jnp.int32
+    )
+    stage[_SELECT_COUNT_ROW : _SELECT_COUNT_ROW + 1, :] = jnp.broadcast_to(
+        count, (1, lanes)
+    ).astype(jnp.int32)
+    copy = pltpu.make_async_copy(stage, smem, sem.at[0])
+    copy.start()
+    copy.wait()
+
+
 def _kernel(
     prefetch_smem,  # SMEM [m * topk] local expert ids, -1 off this rank;
     # with ``route``, [1] this rank's first expert id
@@ -346,6 +404,7 @@ def _kernel(
     sparse,
     route,
     rows_real,
+    vector_select,
 ):
     if i_s:
         sw1_hbm, ss1_ref, sw2_hbm, ss2_ref, *refs = refs
@@ -374,8 +433,9 @@ def _kernel(
         group_vmem, sorted_ref, group_sem, rows_ref = extra_scratch[
             len(shared_scratch) : len(shared_scratch) + 4
         ]
-    if route is not None and not sparse:
-        # VMEM [8, 128] int32 and its SMEM copy: route j's local ids, row j.
+    if (route is not None or vector_select) and not sparse:
+        # VMEM [8, 128] int32 and its SMEM copy: route j's local ids, row j;
+        # with ``vector_select``, the nonempty experts (`_select_experts`).
         ids_vmem, ids_route_smem, route_sem = extra_scratch[-3:]
     fp8 = jnp.float8_e4m3fn
     f32 = jnp.float32
@@ -404,7 +464,8 @@ def _kernel(
         active_ref[e] = 0
         return carry
 
-    lax.fori_loop(0, experts, clear, 0)
+    if not vector_select:
+        lax.fori_loop(0, experts, clear, 0)
     if route is None:
         topk = ids_ref.shape[1]
         ids_smem = prefetch_smem
@@ -429,7 +490,9 @@ def _kernel(
             rows_real,
             route,
         )
-        if not sparse:  # sparse rows group the id columns themselves
+        # Sparse rows group the id columns themselves; vector selection reads
+        # them as vectors.
+        if not sparse and not vector_select:
             tokens = lax.broadcasted_iota(jnp.int32, (m, ids_vmem.shape[1]), 0)
             lanes = lax.broadcasted_iota(jnp.int32, (m, ids_vmem.shape[1]), 1)
             for j, col in enumerate(id_cols):
@@ -467,7 +530,7 @@ def _kernel(
             return carry
 
         lax.fori_loop(0, experts, mark_counts, 0)
-    else:
+    elif not vector_select:
         lax.fori_loop(0, routes, mark, 0)
 
     def compact(e, count):
@@ -477,11 +540,29 @@ def _kernel(
 
         return count + (active_ref[e] != 0).astype(jnp.int32)
 
-    count = lax.fori_loop(0, experts, compact, jnp.int32(0))
+    if vector_select:
+        _select_experts(id_cols, experts, ids_vmem, ids_route_smem, route_sem)
+        count = ids_route_smem[_SELECT_COUNT_ROW, 0]
+
+        def active_id(n):
+            return ids_route_smem[_SELECT_IDS_ROW, n]
+
+        def tile_bits(e):
+            return ids_route_smem[_SELECT_TILES_ROW, e]
+
+    else:
+        count = lax.fori_loop(0, experts, compact, jnp.int32(0))
+
+        def active_id(n):
+            return active_ids_ref[n]
+
+        def tile_bits(e):
+            return active_ref[e]
+
     units = count * num_chunks
 
     def transfers(unit):
-        e = active_ids_ref[unit // num_chunks]
+        e = active_id(unit // num_chunks)
         col = pl.multiple_of((unit % num_chunks) * chunk, chunk)
         blk = (unit % num_chunks) * (chunk // _QUANT_BLOCK)
         slot = unit % slots
@@ -668,7 +749,7 @@ def _kernel(
         so the cost does not grow with the step's token count."""
         slot = unit % slots
         c = unit % num_chunks
-        e = active_ids_ref[unit // num_chunks]
+        e = active_id(unit // num_chunks)
         end = sorted_ref[experts, e]
         tiles = (end + tile - 1) // tile
 
@@ -721,7 +802,7 @@ def _kernel(
             return
         slot = unit % slots
         c = unit % num_chunks
-        e = active_ids_ref[unit // num_chunks]
+        e = active_id(unit // num_chunks)
 
         def run(rows):
             down = expert_mlp(x_pad_ref[rows, :], slot)
@@ -752,7 +833,7 @@ def _kernel(
             return
         # Two row tiles: an expert whose routes all lie in one tile runs only
         # that tile (the other's rows would all carry zero coefficients).
-        halves = active_ref[e]
+        halves = tile_bits(e)
         for bits, rows in (
             (3, slice(None)),
             (1, slice(0, _ROW_ALIGN)),
@@ -878,8 +959,11 @@ def dense_expert_moe_fp4(
             pltpu.SemaphoreType.DMA((1,)),
             pltpu.VMEM((_ROW_ALIGN, h), jnp.float32),
         ]
+    vector_select = (
+        not sparse_rows and _SCALAR_SELECT_MAX_EXPERTS < experts <= info.num_lanes
+    )
     route_scratch = []
-    if route is not None and not sparse_rows:
+    if (route is not None or vector_select) and not sparse_rows:
         route_scratch = [
             pltpu.VMEM((8, lanes), jnp.int32),
             pltpu.SMEM((8, lanes), jnp.int32),
@@ -898,6 +982,7 @@ def dense_expert_moe_fp4(
             sparse=sparse_rows,
             route=route,
             rows_real=m,
+            vector_select=vector_select,
         ),
         out_shape=jax.ShapeDtypeStruct((mk, h), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(

@@ -373,3 +373,34 @@ def test_one_tile_experts_match_both_tiles(m):
             kernel.dense_expert_moe_fp4(x, w1, w2, s1, s2, weights, one), np.float32
         )[t]
     np.testing.assert_array_equal(np.asarray(out, np.float32), want)
+
+
+@pytest.mark.parametrize("m", [8, 13, 24, 32])
+@pytest.mark.parametrize("fused_routing", [False, True])
+def test_vector_expert_selection_matches_scalar_loops(monkeypatch, m, fused_routing):
+    """Above _SCALAR_SELECT_MAX_EXPERTS local experts the nonempty experts are
+    found with vector ops; outputs are bit-identical to the scalar loops."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
+    h, i, e, topk = 512, 256, 64, 4
+    x, w1, w2, s1, s2, weights, ids = _inputs(m, h, i, e, topk, seed=m)
+    # Global ids over 2e: about half the routes are off this rank (-1).
+    local = np.where(np.asarray(ids) >= e, np.asarray(ids) - e, -1)
+    args = [x, w1, w2, s1, s2, weights, jnp.asarray(local, jnp.int32)]
+    kwargs = {}
+    if fused_routing:
+        rng = np.random.default_rng(m)
+        scores = jnp.asarray(rng.uniform(0, 1, size=(m, 2 * e)), jnp.float32)
+        args[5:] = [scores, scores + 0.01]
+        kwargs = dict(
+            route=kernel.Route(topk=topk, scale=2.0, weight_dtype="bfloat16"),
+            experts_start=jnp.asarray(e, jnp.int32),
+        )
+    shared = _shared(h, 128, seed=m)
+    vector = kernel.dense_expert_moe_fp4(*args, shared=shared, **kwargs)
+    monkeypatch.setattr(kernel, "_SCALAR_SELECT_MAX_EXPERTS", e)
+    jax.clear_caches()
+    scalar = kernel.dense_expert_moe_fp4(*args, shared=shared, **kwargs)
+    np.testing.assert_array_equal(
+        np.asarray(vector, np.float32), np.asarray(scalar, np.float32)
+    )
