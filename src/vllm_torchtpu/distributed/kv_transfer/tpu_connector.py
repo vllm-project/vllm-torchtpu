@@ -37,7 +37,7 @@ import queue
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
@@ -6996,20 +6996,14 @@ class TPURaidenConnectorWorker:
                 if req_id in self._stage3_inflight_submits:
                     self._stage3_deferred_native_failures[req_id] = True
             done_recving = [
-                req_id
-                for req_id in done_recving
-                if req_id in self._stage3_controller_accepted
-                and req_id not in self._stage3_inflight_submits
+                req_id for req_id in done_recving if self._stage3_load_accepted(req_id)
             ]
             failed_recving = [
                 req_id
                 for req_id in failed_recving
-                if req_id in self._stage3_controller_accepted
-                and req_id not in self._stage3_inflight_submits
+                if self._stage3_load_accepted(req_id)
             ]
-            terminal_recvs = set(done_recving) | set(failed_recving)
-            for req_id in terminal_recvs:
-                self._stage3_pending_controller_failures.pop(req_id, None)
+            self._end_stage3_loads(set(done_recving) | set(failed_recving))
             now = time.time()
             expired_uncertain = {
                 req_id
@@ -7018,10 +7012,7 @@ class TPURaidenConnectorWorker:
             }
             if expired_uncertain:
                 failed_recving = list(set(failed_recving) | expired_uncertain)
-                for req_id in expired_uncertain:
-                    self._stage3_pending_controller_failures.pop(req_id, None)
-            self._stage3_terminal_loads.update(done_recving)
-            self._stage3_terminal_loads.update(failed_recving)
+                self._end_stage3_loads(expired_uncertain)
         if self.is_producer and self._raiden_stage3_enabled():
             facade, _ = self._require_stage3_controller()
             now = time.time()
@@ -7109,44 +7100,8 @@ class TPURaidenConnectorWorker:
                 )
         elif self._raiden_stage3_enabled():
             for req_id in done_recving:
-                uuid = self._stage3_submitted_loads.get(req_id)
-                num_tokens = self._stage3_submitted_load_tokens.get(req_id)
-                source_req_id = self._stage3_source_request_id(req_id)
-                if (
-                    req_id not in self._reported_recving
-                    and uuid is not None
-                    and num_tokens is not None
-                ):
-                    start_time = self._stage3_load_start_times.get(req_id)
-                    latency_ms = None
-                    if start_time is not None:
-                        latency_ms = (time.perf_counter() - start_time) * 1000
-                    with TraceAnnotation(
-                        "KV_Cache_Decode_Recv_Complete",
-                        uuid=uuid,
-                        request_id=str(req_id),
-                        source_req_id=str(source_req_id),
-                        num_tokens=num_tokens,
-                        reshard_e2e_latency_ms=(
-                            round(latency_ms, 3) if latency_ms is not None else 0.0
-                        ),
-                    ):
-                        logger.info(
-                            "%s",
-                            json.dumps(
-                                {
-                                    "event": "raiden_stage3_receiver_complete",
-                                    "req_id": source_req_id,
-                                    "destination_req_id": req_id,
-                                    "uuid": uuid,
-                                    "num_tokens": num_tokens,
-                                    "reshard_e2e_latency_ms": latency_ms,
-                                    "ts_seen": time.time(),
-                                    "late": False,
-                                },
-                                sort_keys=True,
-                            ),
-                        )
+                if req_id not in self._reported_recving:
+                    self._report_stage3_load_complete(req_id, late=False)
             for req_id in failed_recving:
                 source_req_id = self._stage3_source_request_id(req_id)
                 logger.error(
@@ -7241,11 +7196,10 @@ class TPURaidenConnectorWorker:
             ready: set[str] = set()
             deferred: list = []
             for native_req_id in done_recving:
-                req_id = self._stage3_destination_req_ids.get(native_req_id)
+                req_id = self._stage3_destination_request_id(native_req_id)
                 if (
                     req_id is not None
-                    and req_id in self._stage3_controller_accepted
-                    and req_id not in self._stage3_inflight_submits
+                    and self._stage3_load_accepted(req_id)
                     # Still in the leader's fan-out of the submit outcome:
                     # marked terminal now, it would be fanned out as failed.
                     and req_id not in self._stage3_tp_submits
@@ -7262,39 +7216,67 @@ class TPURaidenConnectorWorker:
                 self._stage3_late_native.append(
                     (list(done_sending), deferred, list(failed_recving))
                 )
-            now = time.time()
+            # As the regular poll does with a native done record.
+            self._end_stage3_loads(ready)
+            self._reported_recving.update(ready)
             for req_id in ready:
-                self._stage3_terminal_loads.add(req_id)
-                self._reported_recving.add(req_id)
-                # A load accepted with an uncertain controller outcome is
-                # terminal now, as the regular poll treats a native done
-                # record; its deadline would otherwise fail it later.
-                self._stage3_pending_controller_failures.pop(req_id, None)
-                start_time = self._stage3_load_start_times.get(req_id)
-                latency_ms = (
-                    (time.perf_counter() - start_time) * 1000
-                    if start_time is not None
-                    else None
-                )
-                logger.info(
-                    "%s",
-                    json.dumps(
-                        {
-                            "event": "raiden_stage3_receiver_complete",
-                            "req_id": self._stage3_source_request_id(req_id),
-                            "destination_req_id": req_id,
-                            "uuid": self._stage3_submitted_loads.get(req_id),
-                            "num_tokens": self._stage3_submitted_load_tokens.get(
-                                req_id
-                            ),
-                            "reshard_e2e_latency_ms": latency_ms,
-                            "ts_seen": now,
-                            "late": True,
-                        },
-                        sort_keys=True,
-                    ),
-                )
+                self._report_stage3_load_complete(req_id, late=True)
             return ready
+
+    def _stage3_load_accepted(self, req_id: str) -> bool:
+        """Whether a native terminal record may end ``req_id``'s load: the
+        controller accepted its submission and no submission RPC for it is
+        still in flight on a submit worker. Both polls filter with it."""
+        return (
+            req_id in self._stage3_controller_accepted
+            and req_id not in self._stage3_inflight_submits
+        )
+
+    def _end_stage3_loads(self, req_ids: Iterable[str]) -> None:
+        """Marks loads terminal. A load accepted with an uncertain controller
+        outcome leaves the deadline list, which would otherwise fail it."""
+        for req_id in req_ids:
+            self._stage3_pending_controller_failures.pop(req_id, None)
+            self._stage3_terminal_loads.add(req_id)
+
+    def _report_stage3_load_complete(self, req_id: str, *, late: bool) -> None:
+        """Writes a completed load's trace annotation and log line, for the
+        regular poll or the late poll (``late``)."""
+        uuid = self._stage3_submitted_loads.get(req_id)
+        num_tokens = self._stage3_submitted_load_tokens.get(req_id)
+        if uuid is None or num_tokens is None:
+            return
+        source_req_id = self._stage3_source_request_id(req_id)
+        start_time = self._stage3_load_start_times.get(req_id)
+        latency_ms = None
+        if start_time is not None:
+            latency_ms = (time.perf_counter() - start_time) * 1000
+        with TraceAnnotation(
+            "KV_Cache_Decode_Recv_Complete",
+            uuid=uuid,
+            request_id=str(req_id),
+            source_req_id=str(source_req_id),
+            num_tokens=num_tokens,
+            reshard_e2e_latency_ms=(
+                round(latency_ms, 3) if latency_ms is not None else 0.0
+            ),
+        ):
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "raiden_stage3_receiver_complete",
+                        "req_id": source_req_id,
+                        "destination_req_id": req_id,
+                        "uuid": uuid,
+                        "num_tokens": num_tokens,
+                        "reshard_e2e_latency_ms": latency_ms,
+                        "ts_seen": time.time(),
+                        "late": late,
+                    },
+                    sort_keys=True,
+                ),
+            )
 
     def _submit_stage3_async_complete(
         self, req_id: str, uuid: int, attempts: int = 0

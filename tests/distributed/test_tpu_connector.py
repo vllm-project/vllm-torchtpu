@@ -8789,6 +8789,39 @@ class TestStage3LatePoll:
         worker._stage3_inflight_submits = {"dst-b"}
         return worker, engine
 
+    @staticmethod
+    def _annotation_recorder(annotations):
+        class _Recorder:
+            def __init__(self, name, **kwargs):
+                annotations.append((name, kwargs))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Recorder
+
+    @pytest.mark.parametrize("late", [True, False])
+    def test_both_polls_annotate_a_completed_load(self, late):
+        worker, engine = self._consumer()
+        engine.poll_stats.return_value = ([], ["src-a"], [])
+        annotations: list = []
+        with (
+            patch.object(worker, "_raiden_stage3_enabled", return_value=True),
+            patch(f"{_MOD}.TraceAnnotation", self._annotation_recorder(annotations)),
+        ):
+            if late:
+                assert worker.late_poll_finished_recving() == {"dst-a"}
+            else:
+                worker._poll_finished(engine)
+                assert worker._done_recving == {"dst-a"}
+        assert [
+            (name, kwargs["request_id"], kwargs["uuid"], kwargs["num_tokens"])
+            for name, kwargs in annotations
+        ] == [("KV_Cache_Decode_Recv_Complete", "dst-a", 1, 10)]
+
     def test_reports_accepted_loads_and_keeps_the_rest(self):
         worker, engine = self._consumer()
         engine.poll_stats.return_value = (
