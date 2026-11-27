@@ -377,7 +377,7 @@ def test_proposed_drafts_reach_next_inputs(device, k, mode):
     placeholder_inputs = torch.full(
         (len(ids) * (1 + k),), -1, dtype=torch.int32, device=device
     )
-    replaced = runner._apply_async_token_substitution(placeholder_inputs, dst, src)
+    replaced, _ = runner._apply_async_token_substitution(placeholder_inputs, dst, src)
     actual = replaced.cpu().reshape(len(ids), 1 + k)[-1].tolist()
     expected = [200] + list(range(201, 201 + k))
     assert actual == expected, (

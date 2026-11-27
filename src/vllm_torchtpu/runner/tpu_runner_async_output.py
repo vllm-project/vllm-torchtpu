@@ -331,10 +331,13 @@ def _spec_chunk_next_inputs(
     num_draft: torch.Tensor,
     rows: int,
     num_reqs: int | None,
+    pad_to: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from vllm_torchtpu.spec_decode.utils import fit_rows
 
     src = assemble_spec_next_tokens(next_tokens, fit_rows(drafts, rows), num_reqs)
+    if src.shape[0] < pad_to:
+        src = torch.nn.functional.pad(src, (0, pad_to - src.shape[0]))
     num_rejected = compute_num_rejected(next_tokens, fit_rows(num_draft, rows))
     return src, num_rejected
 
@@ -379,19 +382,20 @@ def spec_chunk_next_inputs(
     num_draft: torch.Tensor,
     rows: int,
     num_reqs: int | None,
+    pad_to: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One chunk's substitution source and rejected counts, as one program on TPU.
 
     Equals ``assemble_spec_next_tokens(next_tokens, fit_rows(drafts, rows),
-    num_reqs)`` and ``compute_num_rejected(next_tokens, fit_rows(num_draft,
-    rows))``.
+    num_reqs)``, zero-padded at the end to ``pad_to`` entries, and
+    ``compute_num_rejected(next_tokens, fit_rows(num_draft, rows))``.
     """
     fn = (
         _spec_chunk_next_inputs_compiled
         if next_tokens.device.type == "tpu"
         else _spec_chunk_next_inputs
     )
-    return fn(next_tokens, drafts, num_draft, rows, num_reqs)
+    return fn(next_tokens, drafts, num_draft, rows, num_reqs, pad_to)
 
 
 def extract_draft_token_ids(

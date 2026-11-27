@@ -339,8 +339,7 @@ def _upload_unchanged(runner, slot: str, values: np.ndarray) -> torch.Tensor:
     return device
 
 
-@direct_compile(backend="tpu")
-def _substitute_placeholder_token(
+def _substitute_placeholder(
     input_ids: torch.Tensor,
     token_in_tpu_cur_input_indices: torch.Tensor,
     token_in_tpu_pre_next_tokens_indices: torch.Tensor,
@@ -380,6 +379,34 @@ def _substitute_placeholder_token(
     update_values = torch.where(mask, new_token_values, original_values)
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
     return input_ids
+
+
+_substitute_placeholder_token = direct_compile(_substitute_placeholder, backend="tpu")
+
+
+@direct_compile(backend="tpu")
+def _substitute_placeholder_token_and_drafts(
+    input_ids: torch.Tensor,
+    token_in_tpu_cur_input_indices: torch.Tensor,
+    token_in_tpu_pre_next_tokens_indices: torch.Tensor,
+    next_tokens: torch.Tensor,
+    logits_indices: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The substitution and `extract_draft_token_ids` on its output, as one
+    program: the draft gather is otherwise an eager program of its own."""
+    from vllm_torchtpu.runner.tpu_runner_async_output import (
+        extract_draft_token_ids,
+    )
+
+    input_ids = _substitute_placeholder(
+        input_ids,
+        token_in_tpu_cur_input_indices,
+        token_in_tpu_pre_next_tokens_indices,
+        next_tokens,
+    )
+    drafts = extract_draft_token_ids(input_ids, logits_indices, target_logits_indices)
+    return input_ids, drafts
 
 
 logger = init_logger(__name__)
@@ -2323,16 +2350,32 @@ class TPUModelRunner(GPUModelRunner):
         input_ids: torch.Tensor,
         token_in_tpu_cur_input_indices: np.ndarray,
         token_in_tpu_pre_next_tokens_indices: np.ndarray,
-    ) -> torch.Tensor:
-        """Apply async token substitution if needed."""
+        draft_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Apply async token substitution if needed.
+
+        With ``draft_rows`` (the spec metadata's final and target logits
+        indices), also gather the drafts the target verifies from the
+        substituted ids (``extract_draft_token_ids``), in the substitution's
+        program where it runs one; else returns None for them.
+        """
+        from vllm_torchtpu.runner.tpu_runner_async_output import (
+            extract_draft_token_ids,
+        )
+
+        def with_drafts(ids: torch.Tensor):
+            if draft_rows is None:
+                return ids, None
+            return ids, extract_draft_token_ids(ids, *draft_rows)
+
         if len(token_in_tpu_cur_input_indices) == 0:
-            return input_ids
+            return with_drafts(input_ids)
 
         if (
             self._pre_async_results is None
             or self._pre_async_results.next_tokens_tpu is None
         ):
-            return input_ids
+            return with_drafts(input_ids)
 
         if getattr(self, "_fast_token_substitution", False):
             # Fast path 1: Direct device token slicing for 1:1 steady-state decode
@@ -2353,7 +2396,7 @@ class TPUModelRunner(GPUModelRunner):
                     input_ids.dtype
                 )
                 if len(next_tpu) >= len(input_ids):
-                    return next_tpu[: len(input_ids)]
+                    return with_drafts(next_tpu[: len(input_ids)])
 
             # Fast path 2: Cache persistent device indices to eliminate per-step
             # H2D uploads
@@ -2421,11 +2464,24 @@ class TPUModelRunner(GPUModelRunner):
                 padded_token_in_tpu_pre_next_tokens_indices,
             )
 
-        return _substitute_placeholder_token(
-            input_ids,
-            cur_input_indices,
-            pre_next_tokens_indices,
-            self._pre_async_results.next_tokens_tpu,
+        # The combined program is warmed where the verify's padded logits
+        # length equals the input bucket (decode steps); a mixed step whose
+        # logits bucket is smaller keeps the separate gather.
+        if draft_rows is not None and draft_rows[0].shape == input_ids.shape:
+            return _substitute_placeholder_token_and_drafts(
+                input_ids,
+                cur_input_indices,
+                pre_next_tokens_indices,
+                self._pre_async_results.next_tokens_tpu,
+                *draft_rows,
+            )
+        return with_drafts(
+            _substitute_placeholder_token(
+                input_ids,
+                cur_input_indices,
+                pre_next_tokens_indices,
+                self._pre_async_results.next_tokens_tpu,
+            )
         )
 
     def _flush_disjoint_async_results(self) -> None:
@@ -2803,6 +2859,12 @@ class TPUModelRunner(GPUModelRunner):
             off += n
         return out
 
+    def _async_spec_source_len(self) -> int:
+        """The fixed length of the async-spec substitution source: the max
+        stride-(1+K) span, so the next step's substitution keeps one shape."""
+        assert self.speculative_config is not None
+        return self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+
     def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk, state):
         """Async-spec substitution assembler.
 
@@ -2827,6 +2889,9 @@ class TPUModelRunner(GPUModelRunner):
         # Bucketed drafters keep the sampler's padded rows (an exact-count slice
         # would compile a program per request count); others keep exact rows.
         bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
+        # A lone chunk's source comes out of its program already padded to the
+        # bound sample_tokens pads to (no separate pad program).
+        pad_to = self._async_spec_source_len() if len(next_tokens_per_chunk) == 1 else 0
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
@@ -2852,6 +2917,7 @@ class TPUModelRunner(GPUModelRunner):
                     md.draft_lengths,
                     chunk_padded_num_reqs,
                     None if bucketed else num_reqs,
+                    pad_to,
                 )
             else:
                 drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
@@ -4005,26 +4071,25 @@ class TPUModelRunner(GPUModelRunner):
             # offset; clear it before this chunk's forward gathers it.
             self._reset_read_offsets_for_new_requests(start_index, num_reqs)
 
-            input_ids = self._apply_async_token_substitution(
-                self.input_ids, cur_input_indices, pre_next_tokens_indices
-            )
             # Async spec: the drafts the target verifies live in the substituted
             # input_ids (host input_ids_cpu holds placeholders), so re-source the
             # rejection sampler's draft_token_ids from the device.
+            draft_rows = None
             if (
                 self.scheduler_config.async_scheduling
                 and spec_decode_metadata is not None
                 and len(cur_input_indices) > 0
             ):
-                from vllm_torchtpu.runner.tpu_runner_async_output import (
-                    extract_draft_token_ids,
-                )
-
-                spec_decode_metadata.draft_token_ids = extract_draft_token_ids(
-                    input_ids,
+                draft_rows = (
                     spec_decode_metadata.final_logits_indices,
                     spec_decode_metadata.target_logits_indices,
                 )
+            input_ids, device_drafts = self._apply_async_token_substitution(
+                self.input_ids, cur_input_indices, pre_next_tokens_indices, draft_rows
+            )
+            if device_drafts is not None:
+                assert spec_decode_metadata is not None
+                spec_decode_metadata.draft_token_ids = device_drafts
             draft_input_ids_src = input_ids
 
             # Slice the per-chunk multimodal mask/embeddings (the chunk
@@ -5147,10 +5212,7 @@ class TPUModelRunner(GPUModelRunner):
                 # positions are unchanged. Spec only (stride 1+K); pure-non-spec
                 # async keeps its stride-1 source + existing precompile.
                 if spec_num_rejected is not None:
-                    assert self.speculative_config is not None
-                    bound = self.max_num_reqs * (
-                        1 + self.speculative_config.num_speculative_tokens
-                    )
+                    bound = self._async_spec_source_len()
                     if next_tokens_tpu.shape[0] < bound:
                         next_tokens_tpu = torch.nn.functional.pad(
                             next_tokens_tpu, (0, bound - next_tokens_tpu.shape[0])
@@ -6298,6 +6360,23 @@ class TPUModelRunner(GPUModelRunner):
                         next_tokens,
                     )
                     synchronize_tensors(out)
+                    if self._is_async_drafter:
+                        # The spec step's variant, which also gathers the
+                        # drafts at the verify's padded logits length.
+                        # Two tensors: the call key tells aliased args apart.
+                        logits_rows, target_rows = (
+                            torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
+                            for _ in range(2)
+                        )
+                        out = _substitute_placeholder_token_and_drafts(
+                            input_ids,
+                            cur_input_indices,
+                            pre_next_tokens_indices,
+                            next_tokens,
+                            logits_rows,
+                            target_rows,
+                        )
+                        synchronize_tensors(out)
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)
 
     def _precompile_rejection_sampler(self) -> None:

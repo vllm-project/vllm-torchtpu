@@ -283,6 +283,15 @@ def test_fused_spec_next_inputs_match_eager(device):
     assert torch.equal(src.cpu(), ref_src.cpu())
     assert torch.equal(num_rejected.cpu(), ref_rej.cpu())
 
+    # The source zero-padded to a bound inside the same program.
+    bound = 64 * (k + 1)
+    padded, padded_rej = spec_chunk_next_inputs(
+        next_tokens, drafts, num_draft, rows, None, bound
+    )
+    ref_padded = torch.nn.functional.pad(ref_src, (0, bound - ref_src.shape[0]))
+    assert torch.equal(padded.cpu(), ref_padded.cpu())
+    assert torch.equal(padded_rej.cpu(), ref_rej.cpu())
+
     seq_lens = torch.randint(100, 9000, (64,), generator=gen).to(torch.int32)
     positions = torch.randint(100, 9000, (tokens,), generator=gen).to(torch.int32)
     seq_idx = torch.randint(-1, rows, (64,), generator=gen).to(torch.int32)
