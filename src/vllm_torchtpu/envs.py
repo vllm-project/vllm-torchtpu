@@ -1328,6 +1328,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # buffers, never as constants. Route-trace keys ("moe<i>", the i-th MoE
     # layer) come from `python -m vllm_torchtpu.layers.adapter.moe_redundant LOG`.
     "VLLM_TPU_MOE_REDUNDANT_PLACEMENT": env_str("VLLM_TPU_MOE_REDUNDANT_PLACEMENT", ""),
+    # Static expert permutation on the grouped-matmul EP path
+    # (layers/adapter/moe_permute.py): which EP rank holds which expert, per
+    # MoE layer, with no extra slots. "builtin:<name>", a JSON path or inline
+    # JSON {"moe<i>": [slot of logical expert e, ...]}. Empty = off.
+    "VLLM_TPU_MOE_EXPERT_PERMUTATION": env_str("VLLM_TPU_MOE_EXPERT_PERMUTATION", ""),
     # Capture one trace per inference phase instead of one continuous trace.
     # The trace directory and iteration limits come from `profiler_config`;
     # this only selects which profiler consumes them.
