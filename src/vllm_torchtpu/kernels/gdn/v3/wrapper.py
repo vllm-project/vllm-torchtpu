@@ -328,6 +328,8 @@ FUSED_CONV1D_GDN_STATIC_ARGNAMES: tuple[str, ...] = (
     "beta_scale",
     "kernel_act_dtype",
     "kernel_conv_weight_dtype",
+    "use_scoped_vmem_limit",
+    "use_cost_estimate",
 )
 
 
@@ -373,6 +375,8 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): Calculate tile size based on input dimensions.
     decode_tile_size: int = 4,
     mixed_tile_size: int = 64,
+    use_scoped_vmem_limit: bool = False,
+    use_cost_estimate: bool = False,
 ) -> tuple[jax.Array | tuple[jax.Array, jax.Array], jax.Array]:
     """Perform conv1d and gdn in a single fused kernel.
 
@@ -580,6 +584,7 @@ def fused_conv1d_gdn(
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
     window_size = num_spec_tokens + 1
     decode_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+    conv_state_dim_size = dim if is_shared else states[0].shape[-1]
 
     if envs.TPU_ENABLE_GDN_DYNAMIC_TILING:
         decode_tile_size, mixed_tile_size = tiling.get_tile_sizes(
@@ -591,7 +596,7 @@ def fused_conv1d_gdn(
             d_k=d_k,
             d_v=d_v,
             kernel_size=kernel_size,
-            conv_state_dim_size=dim if is_shared else states[0].shape[-1],
+            conv_state_dim_size=conv_state_dim_size,
             act_out_dtype=act_out_dtype,
             recurrent_state_dtype=recurrent_dtype,
             num_lanes=num_lanes,
@@ -772,7 +777,35 @@ def fused_conv1d_gdn(
             in_out_spec = hbm_spec
             input_output_aliases[act_pos] = 0
 
-        vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+        default_vmem_limit_bytes = config.GDNConfig.get_vmem_limit_bytes(window_size)
+        if use_scoped_vmem_limit:
+            vmem_limit_bytes = tiling.get_scoped_vmem_limit_bytes(
+                cfg=cfg,
+                conv_state_dim_size=conv_state_dim_size,
+                num_lanes=num_lanes,
+                num_sublanes=num_sublanes,
+                default_limit_bytes=default_vmem_limit_bytes,
+            )
+        else:
+            vmem_limit_bytes = default_vmem_limit_bytes
+
+        cost_estimate = (
+            tiling.get_cost_estimate(
+                cfg=cfg,
+                num_seqs=num_seqs,
+                conv_state_dim_size=conv_state_dim_size,
+                has_conv_bias=conv_bias is not None,
+                has_prefill_checkpoint=(
+                    mode == config.GDNMode.PER_SEQ and prefill_ckpt_offsets is not None
+                ),
+                num_lanes=num_lanes,
+                conv_weight_dtype=kernel_conv_weight_dtype,
+                a_log_dtype=a_log.dtype,
+                dt_bias_dtype=dt_bias.dtype,
+            )
+            if use_cost_estimate
+            else None
+        )
 
         return pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
@@ -793,6 +826,7 @@ def fused_conv1d_gdn(
                 disable_bounds_checks=True,
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
+            cost_estimate=cost_estimate,
             name=cfg.get_kernel_name(),
             metadata=cfg.get_metadata(),
         )(

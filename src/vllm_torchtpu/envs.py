@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
     TPU_GDN_QKVZ_KERNEL_LAYOUT: bool = False
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
+    TPU_ATTN_SCOPED_VMEM_SIZING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
@@ -522,6 +523,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the fixed defaults.
     "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
         "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
+    ),
+    # Size per-launch scoped VMEM limits (`vmem_limit_bytes`) from each
+    # kernel's VMEM estimator plus compile margin and attach `pl.CostEstimate`
+    # on GDN v3 and RPA v3 Pallas calls so XLA can keep or prefetch next-layer
+    # weights in VMEM across attention calls. Off by default; delete once
+    # promoted to default after TPU serving validation.
+    "TPU_ATTN_SCOPED_VMEM_SIZING": env_bool(
+        "TPU_ATTN_SCOPED_VMEM_SIZING", default=False
     ),
     # Pooled GDN layers declare one prefill checkpoint block, so a prefill
     # chunk runs to the prompt end and the kernel writes the block-boundary

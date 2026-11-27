@@ -73,6 +73,7 @@ def run_jax_gdn_attention(
     kernel_size: int,
     mesh: jax.sharding.Mesh,
     num_spec_tokens: int = 0,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
 
@@ -154,6 +155,8 @@ def run_jax_gdn_attention(
         d_v=d_v,
         kernel_size=kernel_size,
         num_spec_tokens=num_spec_tokens,
+        use_scoped_vmem_limit=scoped_vmem_sizing,
+        use_cost_estimate=scoped_vmem_sizing,
     )
 
     mapped_fn = jax.shard_map(
@@ -550,6 +553,7 @@ def run_jax_gdn_attention_pcp_tp_prefill(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """GDN PCP prefill using an op-local PCP mesh.
 
@@ -736,6 +740,8 @@ def run_jax_gdn_attention_pcp_tp_prefill(
                 d_k=d_k,
                 d_v=d_v,
                 kernel_size=kernel_size,
+                use_scoped_vmem_limit=scoped_vmem_sizing,
+                use_cost_estimate=scoped_vmem_sizing,
             )
         )
 
@@ -848,6 +854,7 @@ def run_jax_gdn_attention_pooled_local(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -886,6 +893,8 @@ def run_jax_gdn_attention_pooled_local(
         num_spec_tokens=num_spec_tokens,
         prefill_ckpt_offsets=prefill_ckpt_offsets,
         prefill_ckpt_indices=prefill_ckpt_indices,
+        use_scoped_vmem_limit=scoped_vmem_sizing,
+        use_cost_estimate=scoped_vmem_sizing,
     )
     return pool.reshape(pool_shape), output
 
@@ -917,6 +926,7 @@ def run_jax_gdn_attention_pooled(
     num_spec_tokens: int = 0,
     prefill_ckpt_offsets: jnp.ndarray | None = None,
     prefill_ckpt_indices: jnp.ndarray | None = None,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -1026,6 +1036,7 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        scoped_vmem_sizing=scoped_vmem_sizing,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,
@@ -1295,6 +1306,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
     pcp_size: int,
     interleave_size: int,
     mesh: jax.sharding.Mesh,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN PCP prefill over the unified block pool.
 
@@ -1461,6 +1473,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill(
             d_v=d_v,
             kernel_size=kernel_size,
             pool_block_tokens=pool_block_tokens,
+            scoped_vmem_sizing=scoped_vmem_sizing,
         )
 
         seq_output_shard = seq_output_shard.reshape(

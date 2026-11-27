@@ -155,6 +155,8 @@ def _build_fused_core(
     eps: float,
     num_spec_tokens: int = 0,
     beta_scale: float = 1.0,
+    *,
+    scoped_vmem_sizing: bool = False,
 ):
     """The same op, on the fused conv1d + GDN v3 kernel.
 
@@ -251,6 +253,8 @@ def _build_fused_core(
                 num_spec_tokens=num_spec_tokens,
                 batched_only=batched_only,
                 prefill_only=prefill_only,
+                use_scoped_vmem_limit=scoped_vmem_sizing,
+                use_cost_estimate=scoped_vmem_sizing,
             )
 
         if num_spec_tokens > 0:
@@ -295,7 +299,13 @@ def build_kimi_dispatched_kda_op(
     beta_scale: float = 1.0,
 ):
     """Build fused KDA with separately guarded speculative and prefill segments."""
-    core = _build_fused_core(lower_bound, eps, num_spec_tokens, beta_scale)
+    core = _build_fused_core(
+        lower_bound,
+        eps,
+        num_spec_tokens,
+        beta_scale,
+        scoped_vmem_sizing=tpu_envs.TPU_ATTN_SCOPED_VMEM_SIZING,
+    )
     variant = "fused_window" if num_spec_tokens else "fused"
     # The scale is baked into the traced core, and ops dispatch by name.
     if beta_scale != 1.0:
@@ -390,6 +400,7 @@ def _pooled_kda_core(
     pool_block_tokens: int,
     conv_shard_heads: int | None = None,
     num_spec_tokens: int = 0,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     num_reqs = state_indices.shape[0]
     window = num_spec_tokens + 1
@@ -528,7 +539,9 @@ def _pooled_kda_core(
     # and zero-length sequences are safe under identity indices because the
     # kernel gates their state DMAs to zero size rather than redirecting them
     # to the null slot.
-    fused_core = _build_fused_core(lower_bound, eps, num_spec_tokens)
+    fused_core = _build_fused_core(
+        lower_bound, eps, num_spec_tokens, scoped_vmem_sizing=scoped_vmem_sizing
+    )
     output, new_conv_buf, new_ssm_buf = fused_core(
         mixed_qkv,
         raw_gate,
@@ -630,6 +643,8 @@ def build_kimi_pooled_kda_op(
             raise ValueError("KDA conv source TP must divide num_heads")
         conv_shard_heads = total_heads // source_tp
 
+    scoped_vmem_sizing = tpu_envs.TPU_ATTN_SCOPED_VMEM_SIZING
+
     def pooled_core(
         mixed_qkv: jax.Array,
         raw_gate: jax.Array,
@@ -672,6 +687,7 @@ def build_kimi_pooled_kda_op(
             pool_block_tokens=vllm_config.cache_config.block_size,
             conv_shard_heads=conv_shard_heads,
             num_spec_tokens=num_spec_tokens,
+            scoped_vmem_sizing=scoped_vmem_sizing,
         )
 
     # vLLM's compile cache is keyed on the model config and not on the op

@@ -157,7 +157,7 @@ class GDNConfig:
         # B = 16 // 3 = 5, which does not divide a 128-row chunk).
         # Chunk sizes are powers of two, so pick the largest power of two
         # that satisfies the budget instead of the exact quotient.
-        head_groups = pl.cdiv(self.num_v_heads, self.HEADS_PER_GROUP)
+        head_groups = pl.cdiv(int(self.num_v_heads), self.HEADS_PER_GROUP)
         if self.is_kda:
             for b in (16, 8, 4):
                 if head_groups * b * b <= 256:

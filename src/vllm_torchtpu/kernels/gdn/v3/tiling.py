@@ -34,6 +34,8 @@ MIXED_TILE_SIZES = GDNConfig.MIXED_TILE_SIZES
 _DECODE_STEP_COST_IN_HEAD_TRANSFERS = 16
 # Default TPU sublane count (8 on TPU v6e/v7x) for callers that omit num_sublanes.
 _DEFAULT_NUM_SUBLANES = 8
+# TPU lane count for callers that omit num_lanes.
+_DEFAULT_NUM_LANES = 128
 # KDA chunked prefill keeps 3 live [chunk_sz, d_k] decay-scaled buffers in
 # compute_kda.chunked_kda_per_seq: k_beta_gating, q_gated, and k_gating_last.
 _KDA_LIVE_DECAY_TENSORS = 3
@@ -183,6 +185,52 @@ def align_to(x: int, alignment: int) -> int:
     return pl.cdiv(x, alignment) * alignment
 
 
+_MIB = 1024 * 1024
+# Headroom above the VMEM tile estimate for Mosaic internal scratch and VREG
+# spills, matching collectives/all_gather_matmul.py. Empirical: on TPU v5e
+# (JAX 0.11.2, libtpu 0.0.50) the bare estimate fell at least 3.6 MiB short
+# for some KDA decode and prefill launches, and every such launch swept
+# compiled with this margin. The sweep covered GDN up to 64 value heads, KDA
+# up to 64 heads, FP32 and BF16 dense and pooled state, 128- and 512-token
+# buckets, and static tiling plus dynamic tiling for KDA.
+SCOPED_VMEM_MARGIN_BYTES = 8 * _MIB
+
+
+def _estimate_vmem_from_spec(spec: VmemTileSpec) -> int:
+    """Estimate total on-chip VMEM footprint in bytes from a VmemTileSpec."""
+    declared_bytes = get_declared_vmem_bytes(spec)
+
+    # 6. Working memory for intra-chunk recurrence and per-head projections
+    # (chunk_sz is the verify window in decode) plus per-slot vector
+    # temporaries and the working f32 recurrent state during decode.
+    aligned_d_k = align_to(spec.d_k, spec.num_lanes)
+    aligned_d_v = align_to(spec.d_v, spec.num_lanes)
+    is_kda = spec.attention_mode == config.AttentionMode.KDA
+    decode_working_recurrent_bytes = (
+        spec.tile_b * spec.n_v * spec.d_v * spec.d_k * spec.carry_scratch_bytes
+        if spec.is_decode
+        else 0
+    )
+    kda_decay_elems = (
+        _KDA_LIVE_DECAY_TENSORS * spec.chunk_sz * aligned_d_k if is_kda else 0
+    )
+    intermediate_bytes = (
+        spec.tile_b
+        * (
+            spec.n_v
+            * (
+                5 * spec.chunk_sz * spec.chunk_sz
+                + 3 * spec.chunk_sz * (aligned_d_v + aligned_d_k)
+                + kda_decay_elems
+            )
+            + spec.num_sublanes * spec.num_sublanes * spec.num_lanes
+        )
+        * spec.carry_scratch_bytes
+    )
+
+    return declared_bytes + decode_working_recurrent_bytes + intermediate_bytes
+
+
 def get_vmem_estimate_bytes(
     tile_b: int,
     chunk_sz: int,
@@ -220,33 +268,225 @@ def get_vmem_estimate_bytes(
         attention_mode=attention_mode,
         num_sublanes=num_sublanes,
     )
-    declared_bytes = get_declared_vmem_bytes(spec)
+    return _estimate_vmem_from_spec(spec)
 
-    # 6. Working memory for intra-chunk recurrence and per-head projections
-    # (chunk_sz is the verify window in decode) plus per-slot vector
-    # temporaries and the working f32 recurrent state during decode.
-    aligned_d_k = align_to(d_k, num_lanes)
-    aligned_d_v = align_to(d_v, num_lanes)
-    is_kda = attention_mode == config.AttentionMode.KDA
-    decode_working_recurrent_bytes = (
-        tile_b * n_v * d_v * d_k * carry_scratch_bytes if is_decode else 0
+
+def get_scoped_vmem_limit_bytes(
+    cfg: config.GDNConfig,
+    conv_state_dim_size: int,
+    num_lanes: int,
+    num_sublanes: int = _DEFAULT_NUM_SUBLANES,
+    default_limit_bytes: int | None = None,
+    margin_bytes: int | None = None,
+) -> int:
+    """Size per-launch scoped VMEM from the tile estimate plus compile margin.
+
+    Rounded up to 1 MiB and never above ``default_limit_bytes`` so the launch
+    leaves unused VMEM available for XLA weight prefetching without changing
+    tile selection. Speculative verify windows keep ``default_limit_bytes``.
+    """
+    cap_bytes = (
+        GDNConfig.get_vmem_limit_bytes(cfg.window_size)
+        if default_limit_bytes is None
+        else default_limit_bytes
     )
-    kda_decay_elems = _KDA_LIVE_DECAY_TENSORS * chunk_sz * aligned_d_k if is_kda else 0
-    intermediate_bytes = (
-        tile_b
-        * (
-            n_v
-            * (
-                5 * chunk_sz * chunk_sz
-                + 3 * chunk_sz * (aligned_d_v + aligned_d_k)
-                + kda_decay_elems
-            )
-            + num_sublanes * num_sublanes * num_lanes
+    if cfg.window_size > 1:
+        # Mosaic keeps every retained window checkpoint live, so its scratch
+        # grows faster than this estimate: KDA with 32 heads and a 4-token
+        # window needs 36.71 MiB on v5e against an estimated 33 MiB.
+        return cap_bytes
+    margin = SCOPED_VMEM_MARGIN_BYTES if margin_bytes is None else margin_bytes
+    spec = VmemTileSpec.from_config(
+        cfg=cfg,
+        conv_state_dim_size=conv_state_dim_size,
+        num_lanes=num_lanes,
+        num_sublanes=num_sublanes,
+    )
+    estimate_bytes = _estimate_vmem_from_spec(spec)
+    return min(cap_bytes, align_to(estimate_bytes + margin, _MIB))
+
+
+def get_cost_estimate(
+    cfg: config.GDNConfig,
+    num_seqs: int,
+    conv_state_dim_size: int,
+    has_conv_bias: bool = False,
+    has_prefill_checkpoint: bool = False,
+    num_lanes: int = _DEFAULT_NUM_LANES,
+    conv_weight_dtype: jnp.dtype = jnp.float32,
+    a_log_dtype: jnp.dtype = jnp.float32,
+    dt_bias_dtype: jnp.dtype = jnp.float32,
+) -> pl.CostEstimate:
+    """Analytical ``pl.CostEstimate`` for a GDN/KDA v3 launch from bucket shapes.
+
+    Gives XLA's scheduler the launch's compute and HBM traffic so it can
+    overlap next-layer weight prefetches with the custom call. Compute is
+    counted for every tile the bucket can launch, so it bounds launches whose
+    sequences fill fewer tiles. Per tile it follows the traced conv, SiLU and
+    recurrence math: ``flops`` counts 2 per dot_general multiply-add, 1 per
+    output element of a floating-point add, sub, mul or div, and 1 per element
+    a reduce_sum folds away (masked lane transposes included); max, min, neg,
+    select and transcendentals add no flops. ``transcendentals`` counts each
+    exp, log1p, logistic, rsqrt and sqrt output element. Weight bytes use the
+    dtypes the kernel receives.
+    """
+    tokens = int(cfg.batch_size)
+    dim = int(cfg.dim_size)
+    n_kq = int(cfg.num_kq_heads)
+    n_v = int(cfg.num_v_heads)
+    d_k = int(cfg.kq_head_dim)
+    d_v = int(cfg.v_head_dim)
+    k_sz = int(cfg.kernel_size)
+    tile_size = int(cfg.tile_size)
+    window_size = int(cfg.window_size)
+    num_seqs = int(num_seqs)
+    conv_state_dim_size = int(conv_state_dim_size)
+    num_lanes = int(num_lanes)
+    gate_dim = n_v * d_k if cfg.is_kda else n_v
+    # The wrapper pads b and a to whole lanes, and the kernel DMAs and
+    # activates every padded lane.
+    aligned_v_heads = align_to(n_v, num_lanes)
+    aligned_gate_dim = align_to(gate_dim, num_lanes)
+
+    active_seqs = min(tokens, num_seqs)
+    if cfg.mode == config.GDNMode.BATCHED:
+        # Ordinary decodes and full verify windows share the static tile shape.
+        checkpoints = min(tokens, active_seqs * window_size)
+        num_tiles = pl.cdiv(active_seqs, tile_size)
+        chunk = window_size
+        rows_per_tile = tile_size * window_size
+    else:
+        # Each nonempty segment consumes one tile for its first token and one
+        # more for every full chunk after that. Checkpoints can split a sequence.
+        segments = min(tokens, active_seqs * (1 + has_prefill_checkpoint))
+        num_tiles = segments + (tokens - segments) // tile_size if segments else 0
+        chunk = rows_per_tile = tile_size
+        checkpoints = active_seqs
+        if has_prefill_checkpoint:
+            checkpoints += min(active_seqs, tokens // 2)
+    compute_rows = num_tiles * rows_per_tile
+
+    act_in_bytes = jnp.dtype(cfg.dtypes.act_in).itemsize
+    act_out_bytes = jnp.dtype(cfg.dtypes.act_out).itemsize
+    rec_bytes = jnp.dtype(cfg.dtypes.recurrent_state).itemsize
+    conv_bytes = jnp.dtype(cfg.dtypes.conv_state).itemsize
+
+    # Activations (qkv, lane-padded b and a in; out out) + static weights read
+    # once from HBM.
+    act_bytes = tokens * (
+        (dim + aligned_v_heads + aligned_gate_dim) * act_in_bytes
+        + n_v * d_v * act_out_bytes
+    )
+    weight_bytes = (
+        (k_sz + (1 if has_conv_bias else 0))
+        * dim
+        * jnp.dtype(conv_weight_dtype).itemsize
+        + n_v * jnp.dtype(a_log_dtype).itemsize
+        + gate_dim * jnp.dtype(dt_bias_dtype).itemsize
+    )
+
+    state_slot_bytes = (
+        max(0, k_sz - 1) * conv_state_dim_size * conv_bytes
+        + n_v * d_k * d_v * rec_bytes
+    )
+
+    # Every row runs the causal conv taps (and bias) and SiLU over dim, the
+    # q/k L2 norms and q scale, sigmoid(b) (scaled when beta_scale != 1), the
+    # gate's softplus or bounded sigmoid, and lane transposes of beta (and of
+    # GDN's gate) as masked sums over the padded lanes.
+    bounded_gate = cfg.is_kda and cfg.gate_lower_bound is not None
+    gate_elems = n_v * d_k if cfg.is_kda else aligned_v_heads
+    row_flops = (
+        dim * (2 * k_sz + (1 if has_conv_bias else 0) + 1)
+        + 7 * n_kq * d_k
+        + (3 if bounded_gate else 5) * gate_elems
+        + (aligned_v_heads if cfg.beta_scale != 1.0 else 0)
+        + (1 if cfg.is_kda else 2) * aligned_v_heads * (aligned_v_heads - 1)
+    )
+    row_transcendentals = (
+        dim + 2 * n_kq + aligned_v_heads + (1 if bounded_gate else 2) * aligned_gate_dim
+    )
+    # exp(A_log): once per tile for KDA, per lane-padded head for GDN.
+    tile_transcendentals = n_v if cfg.is_kda else aligned_v_heads
+    tile_flops = 0
+    if cfg.use_recurrent:
+        # Per token: state decay, the [k, q] projection dot and the rank-1
+        # update, the beta-scaled residual and output, q . k, and k's
+        # transpose as a masked sum.
+        row_flops += (
+            7 * n_v * d_k * d_v
+            + 4 * n_v * d_v
+            + 2 * n_kq * d_k
+            - n_kq
+            + n_kq * d_k * (d_k - 1)
         )
-        * carry_scratch_bytes
-    )
+        # Per-token decay exp; GDN also recomputes exp(A_log) per position.
+        row_transcendentals += aligned_gate_dim
+        if not cfg.is_kda:
+            tile_transcendentals = chunk * aligned_v_heads
+    else:
+        block = min(cfg.triangular_block_size, chunk)
+        num_blocks = chunk // block
+        # Shared by both solves: T_inv @ [v, k], [w, q] @ state, the state
+        # update, the attention @ (u - ws) output, the blocked forward
+        # substitution of T_inv, and the beta, residual and output products.
+        tile_flops = (
+            2 * n_v * chunk * chunk * (d_v + d_k)
+            + 4 * n_v * chunk * d_k * d_v
+            + 2 * n_v * d_k * d_v * chunk
+            + 2 * n_v * chunk * chunk * d_v
+            + n_v * block * block * chunk * num_blocks * (num_blocks - 1)
+            + (num_blocks - 1) * n_v * block * chunk
+            + num_blocks * n_v * chunk * block * (block - 1)
+            + 2 * n_v * d_k * d_v
+            + 3 * n_v * chunk * d_v
+        )
+        if cfg.is_kda:
+            # Sub-block solve of the per-channel decay: factored off-diagonal
+            # exps, exact pairwise diagonal decays, the forward-substituted
+            # transition rows, and the decay-scaled k/q/state terms.
+            pairs = num_blocks * (num_blocks - 1) // 2
+            block_rows = block * (block - 1) // 2
+            transition_rows = num_blocks * block_rows
+            diag_work = n_v * chunk * block * d_k
+            tile_flops += (
+                (chunk - 1) * n_v * d_k
+                + pairs * n_v * block * d_k * (4 * block + 7)
+                + num_blocks * n_v * block * block * (4 * d_k - 1)
+                + num_blocks * n_v * d_k * (3 * block_rows + block - 1)
+                + n_v * transition_rows * (d_k - 1)
+                + 5 * n_v * chunk * d_k
+            )
+            tile_transcendentals += (
+                3 * n_v * pairs * block * d_k
+                + diag_work
+                + n_v * transition_rows * d_k
+                + 3 * n_v * chunk * d_k
+                + n_v * d_k
+            )
+        else:
+            # beta k k^T and q k^T, the pairwise decay map, the decay-scaled
+            # q/k terms, and the decay map's transpose as a masked sum.
+            tile_flops += (
+                (chunk - 1) * aligned_v_heads
+                + 2 * n_v * chunk * chunk * d_k
+                + 2 * n_kq * chunk * chunk * d_k
+                + 3 * n_v * chunk * chunk
+                + 4 * n_v * chunk * d_k
+                + n_v * chunk * (chunk - 1)
+            )
+            # Pairwise decay map plus forward and backward decay vectors.
+            tile_transcendentals += n_v * (chunk * chunk + 2 * chunk)
 
-    return declared_bytes + decode_working_recurrent_bytes + intermediate_bytes
+    state_bytes = (active_seqs + checkpoints) * state_slot_bytes
+
+    return pl.CostEstimate(
+        flops=compute_rows * row_flops + num_tiles * tile_flops,
+        transcendentals=(
+            compute_rows * row_transcendentals + num_tiles * tile_transcendentals
+        ),
+        bytes_accessed=act_bytes + weight_bytes + state_bytes,
+    )
 
 
 def calculate_decode_tile_size(

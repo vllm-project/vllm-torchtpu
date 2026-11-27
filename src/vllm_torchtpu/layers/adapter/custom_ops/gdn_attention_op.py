@@ -131,6 +131,7 @@ def gdn_attention_core_tpu(
     d_v: int,
     kernel_size: int,
     num_spec_tokens: int = 0,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     # Speculative decoding: vLLM's MambaSpec widens the conv state by
     # `num_spec` columns per slot. The extra columns are unused on TPU
@@ -165,6 +166,7 @@ def gdn_attention_core_tpu(
         d_v=d_v,
         kernel_size=kernel_size,
         mesh=mesh,
+        scoped_vmem_sizing=scoped_vmem_sizing,
         num_spec_tokens=num_spec_tokens,
     )
     if state_len > kernel_size - 1:
@@ -206,6 +208,7 @@ def gdn_attention_pooled_core_tpu(
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
     num_spec_tokens: int = 0,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -232,6 +235,7 @@ def gdn_attention_pooled_core_tpu(
         pool_block_tokens=pool_block_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
         mesh=mesh,
+        scoped_vmem_sizing=scoped_vmem_sizing,
         num_spec_tokens=num_spec_tokens,
     )
 
@@ -259,6 +263,7 @@ def gdn_attention_core_tpu_pcp_prefill(
     kernel_size: int,
     pcp_size: int,
     interleave_size: int,
+    scoped_vmem_sizing: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     state_len = conv_state.shape[1]
     if state_len > kernel_size - 1:
@@ -289,6 +294,7 @@ def gdn_attention_core_tpu_pcp_prefill(
             pcp_size=pcp_size,
             interleave_size=interleave_size,
             mesh=mesh,
+            scoped_vmem_sizing=scoped_vmem_sizing,
         )
     )
     if state_len > kernel_size - 1:
@@ -586,6 +592,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         return parallel_config.prefill_context_parallel_size > 1
 
     def _build_gdn_op(self, *, pcp_streaming: bool = False):
+        scoped_vmem_sizing = envs.TPU_ATTN_SCOPED_VMEM_SIZING
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
         has_conv_bias = self.conv1d.bias is not None
@@ -630,6 +637,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             op_name = f"pallas::gdn_attention_pcp_{self.prefix.replace('.', '_')}"
             wrapped_fn = functools.partial(
                 gdn_attention_core_tpu_pcp_prefill,
+                scoped_vmem_sizing=scoped_vmem_sizing,
                 mesh=pcp_mesh,
                 n_kq=local_num_kq_heads,
                 n_v=local_num_v_heads,
@@ -679,6 +687,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             op_name = f"pallas::gdn_attention_{self.prefix.replace('.', '_')}"
             wrapped_fn = functools.partial(
                 gdn_attention_core_tpu,
+                scoped_vmem_sizing=scoped_vmem_sizing,
                 mesh=vllm_context.mesh,
                 n_kq=local_num_kq_heads,
                 n_v=local_num_v_heads,
@@ -735,6 +744,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         return gdn_impl
 
     def _build_pooled_gdn_op(self, *, block_major: bool = False):
+        scoped_vmem_sizing = envs.TPU_ATTN_SCOPED_VMEM_SIZING
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = cast(VllmConfig, vllm_context.vllm_config)
@@ -793,6 +803,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 prefill_ckpt_offsets,
                 prefill_ckpt_indices,
                 mesh=mesh,
+                scoped_vmem_sizing=scoped_vmem_sizing,
                 n_kq=n_kq,
                 n_v=local_num_v_heads,
                 d_k=d_k,
@@ -830,6 +841,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 kernel_size,
                 recurrent_state_dtype,
                 num_spec_tokens,
+                scoped_vmem_sizing,
             ),
             wrapped_fn,
             (local_num_v_heads, d_v),
