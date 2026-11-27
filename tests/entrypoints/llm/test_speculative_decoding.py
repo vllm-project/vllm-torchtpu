@@ -429,6 +429,10 @@ class _InProcessEngine:
                 num_drafts += metric.value
         return num_drafts
 
+    def collective_rpc(self, method, args: tuple = ()) -> list:
+        """``method(worker, *args)`` in every worker, one result per worker."""
+        return self._llm.llm_engine.collective_rpc(method, args=args)
+
     def shutdown(self) -> None:
         self._llm.llm_engine.engine_core.shutdown()
 
@@ -855,6 +859,66 @@ def test_qwen35_mtp_logprobs_greedy(
     assert compared > len(prompts) // 2, (
         f"only {compared}/{len(prompts)} outputs matched the reference text"
     )
+
+
+def _fast_dispatch_counts(self) -> tuple[int, list[str]]:
+    """This worker's direct calls through ``tpu_compile``'s wrappers, and the
+    functions it dispatched directly at least once."""
+    import gc
+    import types
+
+    from vllm_torchtpu.compilation import fast_dispatch
+
+    dispatched = sorted(
+        obj.__qualname__
+        for obj in gc.get_objects()
+        if isinstance(obj, types.FunctionType)
+        and obj.__dict__.get("_fast_dispatch_state", {}).get("logged")
+    )
+    return fast_dispatch._STATS[0], dispatched
+
+
+@pytest.mark.timeout(1800)
+def test_qwen35_mtp_fast_compiled_call_keeps_greedy_tokens(
+    monkeypatch: pytest.MonkeyPatch, sampling_config: SamplingParams
+):
+    """``tpu_compile.fast_compiled_call`` runs the compiled functions' code
+    directly, without Dynamo's call path around the ``tpu`` backend, so a
+    ``torch_tpu`` change can break it without breaking the default path. It
+    must give Qwen3.5 MTP's greedy tokens exactly as the option off does: one
+    request at a time, the two engines run the same programs on the same
+    batches."""
+    prompts = get_mtp_test_prompts()
+    kwargs = {
+        "max_model_len": 256,
+        "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
+        "max_num_seqs": 1,
+        "tensor_parallel_size": _get_tensor_parallel_size(),
+        "async_scheduling": True,
+        **QWEN35_KWARGS,
+    }
+    armed = {
+        **kwargs,
+        "additional_config": {"tpu_compile": {"fast_compiled_call": True}},
+    }
+    speculative_config = _qwen35_mtp_speculative_config(num_speculative_tokens=2)
+    results = {}
+    with monkeypatch.context() as mp:
+        # collective_rpc ships a Python function to the TPU workers.
+        mp.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+        for arm, engine_kwargs in (("off", kwargs), ("on", armed)):
+            with _engine(QWEN35_MTP_MODEL, speculative_config, engine_kwargs) as engine:
+                outputs = engine.generate_outputs(prompts, sampling_config)
+                results[arm] = (
+                    [list(output.outputs[0].token_ids) for output in outputs],
+                    engine.collective_rpc(_fast_dispatch_counts),
+                )
+    off_tokens, off_counts = results["off"]
+    on_tokens, on_counts = results["on"]
+    assert all(fast == 0 for fast, _ in off_counts), off_counts
+    # The option took effect: every worker dispatched compiled code directly.
+    assert all(fast > 0 and dispatched for fast, dispatched in on_counts), on_counts
+    assert on_tokens == off_tokens
 
 
 def _test_performance_helper(
