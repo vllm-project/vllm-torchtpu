@@ -76,8 +76,13 @@ DECODE_HOST="${DECODE_HOST:-${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}}"
 source "$IX_DIR/sweep_lib.sh"
 log() { echo "[k3-agentx-client-pod] $*"; }
 
+if [ -z "${ARTIFACTS_DIR:-}" ]; then
+    ARTIFACTS_DIR="$REPO_DIR/perf_eval_results"
+fi
+mkdir -p "$ARTIFACTS_DIR"
+ARTIFACTS_DIR="$(cd "$ARTIFACTS_DIR" && pwd)"
+export ARTIFACTS_DIR
 cd "$REPO_DIR" || { log "FATAL: no repo at $REPO_DIR"; exit 1; }
-ARTIFACTS_DIR="${ARTIFACTS_DIR:-perf_eval_results}"
 EVAL_ONLY="${AGENTX_EVAL_JOB:-0}"
 case "$EVAL_ONLY" in 0|1) ;; *) log "FATAL: AGENTX_EVAL_JOB must be 0 or 1, not '$EVAL_ONLY'"; exit 2 ;; esac
 if [ "$EVAL_ONLY" = 1 ]; then
@@ -120,8 +125,7 @@ _cfg=$(
         "DECODE_NUM_WORKERS=${AGENTX_DECODE_NUM_WORKERS:-}" \
         "DURATION=${AGENTX_DURATION:-}" \
         "FAST=${AGENTX_FAST:-}" \
-        "EVAL_SUITES=${EVAL_SUITES:-}" \
-        "PERF_SUITES=${PERF_SUITES:-}"
+        "EVAL_SUITES=${EVAL_SUITES:-}"
 ) || { log "FATAL: $CONFIG failed to load; the engines would have failed the same way"; exit 2; }
 while IFS='=' read -r _k _v; do
     printf -v "CFG_${_k}" '%s' "$_v"
@@ -194,6 +198,26 @@ POST_EVAL_SUITES="$CFG_POST_EVAL_SUITES"
 # verifier's two-case suite.
 SMOKE="${AGENTX_EVAL_SMOKE:-0}"
 case "$SMOKE" in 0|1) ;; *) log "FATAL: AGENTX_EVAL_SMOKE must be 0 or 1, not '$SMOKE'"; exit 2 ;; esac
+K3_PERF_SUITES_EFFECTIVE="${K3_PERF_SUITES:-none}"
+K3_RUN_BENCH_SERVE=0
+if [ -n "${K3_PERF_SUITES+set}" ]; then
+    if [ -z "${K3_PERF_SUITES// /}" ]; then
+        log "FATAL: K3_PERF_SUITES cannot be empty (expected bench_serve, all, or none)"
+        exit 2
+    fi
+    IFS=',' read -r -a _k3_perf_items <<< "$K3_PERF_SUITES"
+    for _raw_item in "${_k3_perf_items[@]}"; do
+        _item="${_raw_item// /}"
+        case "$_item" in
+            none) ;;
+            all|bench_serve) K3_RUN_BENCH_SERVE=1 ;;
+            *)
+                log "FATAL: unknown K3_PERF_SUITES item '$_item' (expected bench_serve, all, or none)"
+                exit 2
+                ;;
+        esac
+    done
+fi
 EVAL_JOB_SUITES="$CFG_EVAL_JOB_SUITES"
 GSM8K_LIMIT_ARG=""
 if [ "$SMOKE" = 1 ]; then
@@ -216,7 +240,7 @@ cleanup() {
         # whole window. The CSV beside it carries the same series, so drop the
         # JSON rather than upload it every night.
         find "$ARTIFACTS_DIR" -name server_metrics_export.json -delete 2>/dev/null
-        buildkite-agent artifact upload "$ARTIFACTS_DIR/**/*" \
+        (cd "$(dirname "$ARTIFACTS_DIR")" && buildkite-agent artifact upload "$(basename "$ARTIFACTS_DIR")/**/*") \
             || log "ERROR: results were produced but could not be uploaded"
     fi
 }
@@ -337,12 +361,13 @@ if [ "$EVAL_ONLY" = 1 ]; then
     exit "$rc"
 fi
 
-K3_PERF_SUITES_EFFECTIVE="${K3_PERF_SUITES:-none}"
 rc=0
-if { [ -z "$K3_PERF_SUITES_EFFECTIVE" ] || [ "$K3_PERF_SUITES_EFFECTIVE" = "none" ]; } \
-    && [ "${AGENTX_SKIP_REPLAY:-0}" != "1" ]; then
+if [ "$K3_RUN_BENCH_SERVE" = 0 ] && [ "${AGENTX_SKIP_REPLAY:-0}" != "1" ]; then
+    _effective_eval_suites="${K3_EVAL_SUITES:-${CFG_EVAL_SUITES:-}}"
+    _norm_eval_suites=",${_effective_eval_suites//[[:space:]]/},"
     _replay_gsm8k_limit="$GSM8K_LIMIT"
-    if [ -z "${AGENTX_GSM8K_LIMIT+set}" ] && [[ ",${K3_EVAL_SUITES:-}," == *",gsm8k,"* ]]; then
+    if [ -z "${AGENTX_GSM8K_LIMIT+set}" ] \
+        && { [[ "$_norm_eval_suites" == *",gsm8k,"* ]] || [[ "$_norm_eval_suites" == *",all,"* ]]; }; then
         _replay_gsm8k_limit="0"
     fi
     log "running the AgentX client against the proxy"

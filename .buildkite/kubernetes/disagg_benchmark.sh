@@ -53,7 +53,7 @@ cleanup() {
     kill "$proxy_pid" 2>/dev/null || true
   fi
   if [ -n "$(ls -A "$ARTIFACTS_DIR" 2>/dev/null)" ] && command -v buildkite-agent >/dev/null 2>&1; then
-    buildkite-agent artifact upload "$ARTIFACTS_DIR/**/*" \
+    (cd "$(dirname "$ARTIFACTS_DIR")" && buildkite-agent artifact upload "$(basename "$ARTIFACTS_DIR")/**/*") \
       || echo "WARNING: could not upload $ARTIFACTS_DIR artifacts"
   fi
 }
@@ -187,7 +187,6 @@ run_cell() {
 
 disagg_config="${DISAGG_CONFIG:-qwen3.5-397b-fp8-1p1d}"
 disagg_baseline_config="${DISAGG_BASELINE_CONFIG:-qwen3.5-397b-fp8-tp1-dp8-ep}"
-disagg_eval_suites="${DISAGG_EVAL_SUITES:-mmlu_pro,gsm8k,json_schema}"
 disagg_perf_suites="${DISAGG_PERF_SUITES:-none}"
 
 # Default runs the existing pd_disagg_* cells once and passes --perf-suites none
@@ -213,19 +212,30 @@ if [ -z "$disagg_perf_suites" ] || [ "$disagg_perf_suites" = "none" ]; then
   echo "Benchmark cells complete! Results saved in $bench_results_dir."
 fi
 
+# When DISAGG_EVAL_SUITES is unset, omit --eval-suites so $disagg_config's
+# EVAL_SUITES stays the single source of truth.
+run_eval_flow=0
+if [ -z "${DISAGG_EVAL_SUITES+set}" ] || [ "$DISAGG_EVAL_SUITES" != "none" ]; then
+  run_eval_flow=1
+fi
+if [ -n "$disagg_perf_suites" ] && [ "$disagg_perf_suites" != "none" ]; then
+  run_eval_flow=1
+fi
+
 eval_rc=0
-if { [ -n "$disagg_eval_suites" ] && [ "$disagg_eval_suites" != "none" ]; } \
-  || { [ -n "$disagg_perf_suites" ] && [ "$disagg_perf_suites" != "none" ]; }; then
+if [ "$run_eval_flow" = "1" ]; then
   require_proxy
   echo "Running unified evaluation flow against router at http://127.0.0.1:${proxy_port}..."
   eval_args=(
     --config "$disagg_config"
     --baseline-config "$disagg_baseline_config"
     --base-url "http://127.0.0.1:${proxy_port}"
-    --eval-suites "${disagg_eval_suites:-none}"
     --perf-suites "${disagg_perf_suites:-none}"
     --skip-db-upload
   )
+  if [ -n "${DISAGG_EVAL_SUITES+set}" ]; then
+    eval_args+=(--eval-suites "$DISAGG_EVAL_SUITES")
+  fi
   if [ -n "$disagg_perf_suites" ] && [ "$disagg_perf_suites" != "none" ]; then
     eval_args+=(--skip-perf-check)
   fi

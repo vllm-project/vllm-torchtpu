@@ -65,9 +65,10 @@ AGENTX_POST_EVAL_SUITES="kimi_tool_call_schema_full"
 AGENTX_PROXY="${AGENTX_PROXY:-router}"
 # agentx_client.sh already runs InferenceX's reasoning-patched 100-sample GSM8K
 # probe before the replay, so run_eval_flow.sh gates mmlu_pro and json_schema
-# without running GSM8K a second time on 32 chips.
+# without running GSM8K a second time on 32 chips. AgentX replay drives perf
+# outside run_eval_flow.sh, so PERF_SUITES stays "none".
 EVAL_SUITES="mmlu_pro,json_schema"
-PERF_SUITES="agentx"
+PERF_SUITES="none"
 
 # An assertion, not an override: the base is 8 too, but as a single-request
 # probe's value, and it only happens to equal twice this ladder's top

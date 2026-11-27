@@ -334,6 +334,9 @@ def test_qwen35_disagg_benchmark_starts_vllm_router_and_runs_eval_flow(
     assert (eval_dir / "results_json_schema.json").exists()
     assert (eval_dir / "eval_check_mmlu_pro.md").exists()
     assert (eval_dir / "eval_check_json_schema.md").exists()
+    bk_args = (tmp_path / "buildkite-agent.args").read_text().splitlines()
+    assert "artifacts/**/*" in bk_args
+    assert f"{tmp_path / 'artifacts'}/**/*" not in bk_args
 
 
 def test_k3_agentx_client_pod_uses_vllm_router_and_runs_eval_flow(
@@ -374,7 +377,7 @@ def test_k3_agentx_client_pod_uses_vllm_router_and_runs_eval_flow(
     )
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
 
-    # Default proxy in kimi-k3-tp8-dp4-ep-agentx.sh is now vllm-router (AC3).
+    # Default proxy in kimi-k3-tp8-dp4-ep-agentx.sh is vllm-router.
     router_args = (tmp_path / "vllm-router.args").read_text().splitlines()
     assert "--vllm-pd-disaggregation" in router_args
 
@@ -394,12 +397,25 @@ def test_k3_agentx_client_pod_uses_vllm_router_and_runs_eval_flow(
 def test_pipeline_perf_has_qwen35_and_kimi_k3_1p1d_steps():
     pipeline_path = _REPO_ROOT / ".buildkite" / "pipeline_perf.yml"
     doc = yaml.safe_load(pipeline_path.read_text())
-    steps = doc["steps"][0]["steps"]
-    by_cmd = {" ".join(s.get("commands", [])): s for s in steps if isinstance(s, dict)}
-    qwen_matches = [s for cmd, s in by_cmd.items() if "qwen3.5-397b-1p1d.yaml" in cmd]
-    k3_matches = [s for cmd, s in by_cmd.items() if "kimi-k3-agentx-1p1d.yaml" in cmd]
+    steps = [s for s in doc["steps"][0]["steps"] if isinstance(s, dict)]
+    qwen_matches = [
+        s
+        for s in steps
+        if any("qwen3.5-397b-1p1d.yaml" in cmd for cmd in s.get("commands", []))
+    ]
+    k3_matches = [
+        s
+        for s in steps
+        if any("kimi-k3-agentx-1p1d.yaml" in cmd for cmd in s.get("commands", []))
+    ]
     assert len(qwen_matches) == 1
-    assert len(k3_matches) >= 1
+    assert len(k3_matches) == 1
+    for step in (*qwen_matches, *k3_matches):
+        assert step.get("if") == 'build.env("NIGHTLY") == "1"'
+        deps = step.get("depends_on")
+        if isinstance(deps, str):
+            deps = [deps]
+        assert deps == ["build_docker"]
 
 
 def test_qwen35_disagg_benchmark_perf_suites_delegates_to_run_eval_flow(
@@ -666,6 +682,7 @@ def test_common_sh_forwards_1p1d_env_vars():
     common_sh = _REPO_ROOT / ".buildkite" / "kubernetes" / "common.sh"
     expected = {
         "AGENTX_PROXY",
+        "AGENTX_SKIP_REPLAY",
         "DISAGG_PROXY",
         "DISAGG_CONFIG",
         "DISAGG_BASELINE_CONFIG",
@@ -692,3 +709,197 @@ def test_common_sh_forwards_1p1d_env_vars():
     args = proc.stdout.splitlines()
     forwarded = {args[i + 1] for i in range(len(args) - 1) if args[i] == "--env"}
     assert expected <= forwarded
+
+
+def test_kimi_k3_agentx_config_perf_suites_accepted_by_run_eval_flow(
+    tmp_path, make_endpoint
+):
+    """kimi-k3-tp8-dp4-ep-agentx.sh declares PERF_SUITES valid for run_eval_flow.sh."""
+    endpoint = make_endpoint(model_id="moonshotai/Kimi-K3")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _install_disagg_stubs(bin_dir, endpoint.port)
+
+    fake_site = tmp_path / "site"
+    (fake_site / "vllm").mkdir(parents=True)
+    (fake_site / "vllm" / "__init__.py").write_text("")
+    results_dir = tmp_path / "flow_results"
+
+    # Omit --perf-suites so run_eval_flow.sh reads PERF_SUITES from the config.
+    proc = subprocess.run(
+        [
+            "bash",
+            str(_REPO_ROOT / "scripts" / "vllm" / "benchmarking" / "run_eval_flow.sh"),
+            "--config",
+            "kimi-k3-tp8-dp4-ep-agentx",
+            "--base-url",
+            endpoint.url,
+            "--eval-suites",
+            "none",
+            "--results-dir",
+            str(results_dir),
+            "--skip-db-upload",
+        ],
+        cwd=str(_REPO_ROOT),
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "PYTHONPATH": str(fake_site),
+            "STUB_LOG_DIR": str(tmp_path),
+            "K3_1P1D_ROLE": "decode",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    assert not (tmp_path / "vllm.args").exists()
+
+
+def test_qwen35_1p1d_config_does_not_set_tpu_kv_transfer_namespace():
+    cfg_path = (
+        _REPO_ROOT
+        / "scripts"
+        / "vllm"
+        / "benchmarking"
+        / "configs"
+        / "qwen3.5-397b-fp8-1p1d.sh"
+    )
+    assert "TPU_KV_TRANSFER_NAMESPACE" not in cfg_path.read_text()
+    cmd = (
+        f'source "{cfg_path}" >/dev/null '
+        '&& printf "%s" "${TPU_KV_TRANSFER_NAMESPACE:-}"'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", cmd],
+        cwd=str(_REPO_ROOT),
+        env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.stdout == ""
+
+
+@pytest.mark.parametrize("eval_suites", ["all", "mmlu_pro, gsm8k"])
+def test_k3_client_pod_dedupes_gsm8k_for_all_and_whitespace_eval_suites(
+    tmp_path, make_endpoint, eval_suites
+):
+    endpoint = make_endpoint(model_id="moonshotai/Kimi-K3")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _install_disagg_stubs(bin_dir, endpoint.port)
+
+    ix_dir = tmp_path / "ix"
+    ix_dir.mkdir()
+    (ix_dir / "sweep_lib.sh").symlink_to(
+        _REPO_ROOT / "scripts" / "vllm" / "benchmark" / "inferencex" / "sweep_lib.sh"
+    )
+    agentx_client = ix_dir / "agentx_client.sh"
+    agentx_client.write_text(
+        '#!/bin/bash\nprintf "%s\\n" "$@" >> "$STUB_LOG_DIR/agentx_client.args"\n'
+    )
+    agentx_client.chmod(agentx_client.stat().st_mode | stat.S_IXUSR)
+
+    fake_site = tmp_path / "site"
+    (fake_site / "vllm").mkdir(parents=True)
+    (fake_site / "vllm" / "__init__.py").write_text("")
+    proxy_port = _free_port()
+
+    proc = subprocess.run(
+        ["bash", str(_K3_CLIENT_POD)],
+        cwd=str(_REPO_ROOT),
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "PYTHONPATH": str(fake_site),
+            "STUB_LOG_DIR": str(tmp_path),
+            "WORKLOAD_NAME": "test-k3-dedupe",
+            "PREFILL_HOST": "127.0.0.1",
+            "DECODE_HOST": "127.0.0.1",
+            "PORT": str(endpoint.port),
+            "PROXY_PORT": str(proxy_port),
+            "REPO_DIR": str(_REPO_ROOT),
+            "IX_DIR": str(ix_dir),
+            "ARTIFACTS_DIR": str(tmp_path / "artifacts"),
+            "AGENTX_CHIPS": "32",
+            "AGENTX_SKIP_POST_EVAL": "1",
+            "K3_EVAL_SUITES": eval_suites,
+            "LM_EVAL_REQUEST_CACHE_ROOT": str(tmp_path / "cache"),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    client_args = (tmp_path / "agentx_client.args").read_text().splitlines()
+    idx = client_args.index("--gsm8k-limit")
+    assert client_args[idx + 1] == "0"
+
+
+def test_k3_client_pod_rejects_invalid_k3_perf_suites(tmp_path):
+    proc = subprocess.run(
+        ["bash", str(_K3_CLIENT_POD)],
+        cwd=str(_REPO_ROOT),
+        env={
+            "PATH": "/usr/bin:/bin",
+            "WORKLOAD_NAME": "test-k3-bad-perf",
+            "REPO_DIR": str(_REPO_ROOT),
+            "ARTIFACTS_DIR": str(tmp_path / "artifacts"),
+            "AGENTX_CHIPS": "32",
+            "K3_PERF_SUITES": "agentx",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 2
+    assert "unknown K3_PERF_SUITES item 'agentx'" in proc.stdout
+
+
+def test_disagg_benchmark_uses_config_eval_suites_when_env_unset(
+    tmp_path, make_endpoint
+):
+    """When DISAGG_EVAL_SUITES is unset, disagg_benchmark.sh omits --eval-suites."""
+    endpoint = make_endpoint(model_id="Qwen/Qwen3.5-397B-A17B-FP8")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _install_disagg_stubs(bin_dir, endpoint.port)
+
+    # Custom config declaring only mmlu_pro proves disagg_benchmark.sh does not
+    # hardcode qwen3.5's suite list when DISAGG_EVAL_SUITES is unset.
+    cfg_dir = tmp_path / "repo" / "scripts" / "vllm" / "benchmarking" / "configs"
+    cfg_dir.mkdir(parents=True)
+    run_flow = (
+        tmp_path / "repo" / "scripts" / "vllm" / "benchmarking" / "run_eval_flow.sh"
+    )
+    run_flow.write_text(
+        '#!/bin/bash\nprintf "%s\\n" "$@" > "$STUB_LOG_DIR/run_eval_flow.args"\n'
+    )
+    run_flow.chmod(run_flow.stat().st_mode | stat.S_IXUSR)
+
+    proxy_port = _free_port()
+    proc = subprocess.run(
+        ["bash", str(_DISAGG_BENCHMARK)],
+        cwd=str(tmp_path),
+        env={
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            "STUB_LOG_DIR": str(tmp_path),
+            "WORKLOAD_NAME": "test-qwen-cfg",
+            "PREFILL_HOST": "127.0.0.1",
+            "DECODE_HOST": "127.0.0.1",
+            "ENGINE_PORT": str(endpoint.port),
+            "PROXY_PORT": str(proxy_port),
+            "REPO_DIR": str(tmp_path / "repo"),
+            "ARTIFACTS_DIR": str(tmp_path / "artifacts"),
+            "BENCHMARK_RESULTS_DIR": str(tmp_path / "bench_cells"),
+            "DISAGG_CONFIG": "custom-1p1d",
+            "DISAGG_PERF_SUITES": "bench_serve",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+    flow_args = (tmp_path / "run_eval_flow.args").read_text().splitlines()
+    assert "--eval-suites" not in flow_args
+    assert "--config" in flow_args
+    assert "custom-1p1d" in flow_args

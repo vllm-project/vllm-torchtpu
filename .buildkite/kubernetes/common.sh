@@ -123,8 +123,8 @@ FORWARD=(
   ARTIFACTS_DIR
   # The Kimi-K3 AgentX pair's job switches, read by k3_agentx_client_pod.sh
   # and the megakernel recipe: the eval-only job, the eval smoke, skipping
-  # the post-replay eval, and choosing the toy proxy.
-  AGENTX_EVAL_JOB AGENTX_EVAL_SMOKE AGENTX_SKIP_POST_EVAL AGENTX_PROXY
+  # the post-replay eval or replay, and choosing the toy proxy.
+  AGENTX_EVAL_JOB AGENTX_EVAL_SMOKE AGENTX_SKIP_POST_EVAL AGENTX_SKIP_REPLAY AGENTX_PROXY
   # The config both engines of the pair and its client read, when a step serves
   # another than the manifest's default (a Kimi-K3 megakernel recipe point).
   K3_PD_CONFIG
