@@ -20,13 +20,20 @@ from dataclasses import replace
 
 import pytest
 
-from vllm_torchtpu.roofline import CHIPS, TOPOLOGIES, SliceTopology, torus_collective_s
+from vllm_torchtpu.roofline import (
+    CHIPS,
+    TOPOLOGIES,
+    TPU6E_TOPOLOGIES,
+    SliceTopology,
+    torus_collective_s,
+)
 from vllm_torchtpu.roofline import collectives as rf_collectives
 from vllm_torchtpu.roofline.collectives import (
     CollectiveConfig,
     CutPlacementOptions,
     collective_axis_cut_bytes,
     collective_cut_bound_s,
+    collective_ici_hops,
     eval_link_subset_bound_s,
     make,
     min_collective_cut_bound_s,
@@ -459,3 +466,44 @@ def test_multi_collective_link_cut_load_sound_across_submeshes_and_partitions() 
     assert eval_link_subset_bound_s(
         ar_2x2.add(ag_2x2), chip, topo_2x2x1
     ) == pytest.approx(2.25e-9, rel=eps)
+
+
+def test_tpu6e_single_core_collectives_and_2d_torus_wraparound() -> None:
+    """Verify 1-core packing, external hops, and 16-axis 2D torus wraparound."""
+    payload_bytes = 64.0 * 1024.0 * 1024.0
+    chip = CHIPS["tpu6e"]
+    expected_hop_latency = chip.ici_hop_latency_s
+    topo_2x2 = TPU6E_TOPOLOGIES["2x2"]
+    assert submesh_for_group(2, topo_2x2, 1) == (1, 2, 1, 1)
+
+    coll_1c = make(
+        "tp_ar", "ar", 16.0, 2, CollectiveConfig(algo="one_shot", ranks_per_chip=1)
+    )
+    coll_default = make("tp_ar", "ar", 16.0, 2)
+    assert coll_1c.offchip == pytest.approx(1.0)
+    assert collective_ici_hops(coll_1c, topo_2x2, 1) == 2
+    assert collective_ici_hops(coll_default, topo_2x2, 1) == 2
+    transfer_bytes = 16.0 * 1.0 / 2.0
+    expected_phase_time = expected_hop_latency + transfer_bytes / chip.ici_link_bw
+    assert torus_collective_s(
+        "ar", 16.0, (1, 2, 1, 1), chip, topo_2x2
+    ) == pytest.approx(2.0 * expected_phase_time, rel=1e-12)
+
+    for open_name in ("1x1", "2x2", "2x4", "4x4", "4x8", "8x8"):
+        assert not TPU6E_TOPOLOGIES[open_name].has_torus_wraparound
+
+    topo_8x16 = TPU6E_TOPOLOGIES["8x16"]
+    assert topo_8x16.has_torus_wraparound
+    assert not topo_8x16.axis_wrapped(0, 8)
+    assert topo_8x16.axis_wrapped(1, 16)
+    assert torus_collective_s(
+        "ar", payload_bytes, (1, 8, 16, 1), chip, topo_8x16
+    ) < torus_collective_s("ar", payload_bytes, (1, 8, 16, 1), chip)
+
+    topo_16x16 = TPU6E_TOPOLOGIES["16x16"]
+    assert topo_16x16.has_torus_wraparound
+    assert topo_16x16.axis_wrapped(0, 16)
+    assert topo_16x16.axis_wrapped(1, 16)
+    assert torus_collective_s(
+        "ar", payload_bytes, (1, 16, 16, 1), chip, topo_16x16
+    ) < torus_collective_s("ar", payload_bytes, (1, 16, 16, 1), chip)
