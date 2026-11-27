@@ -986,6 +986,14 @@ _MODE_ARGS = {
     "--mode eval --calibrate": ["--results-dir", "RESULTS"],
 }
 _RESULT_MODES = [mode for mode in _MODE_ARGS if mode != _UPDATE]
+_NOT_PERF_CHECK = [mode for mode in _MODE_ARGS if mode != "--mode perf"]
+_ROOFLINE_FLAGS = [
+    ["--roofline-targets", "targets.json"],
+    ["--config-name", "some-config"],
+    ["--chips", "4"],
+    ["--prefill-chips", "2"],
+    ["--decode-chips", "2"],
+]
 
 
 @pytest.mark.parametrize(
@@ -1001,6 +1009,25 @@ _RESULT_MODES = [mode for mode in _MODE_ARGS if mode != _UPDATE]
             ["--mode", "eval", "--calibrate"],
             "--results-dir is required in perf and eval modes",
         ),
+        (
+            ["--mode", "eval", "--results-dir", "r"],
+            "--baseline is required unless --calibrate is set",
+        ),
+        (
+            ["--mode", "perf", "--results-dir", "r"],
+            "--baseline or --roofline-targets is required unless --calibrate is set",
+        ),
+        (
+            ["--mode", "perf", "--results-dir", "r", "--roofline-targets", "t.json"],
+            "--config-name is required with --roofline-targets",
+        ),
+        *[
+            (
+                ["--mode", "perf", "--results-dir", "r", "--baseline", "b.json", *flag],
+                f"{flag[0]} requires --roofline-targets",
+            )
+            for flag in _ROOFLINE_FLAGS[1:]
+        ],
     ],
 )
 def test_cli_requires_the_flags_a_mode_reads(monkeypatch, capsys, argv, error):
@@ -1044,6 +1071,7 @@ _NOT_VALID_CASES = [
             ["--gate-ttft-max-concurrency", "0"],
         )
     ],
+    *[(mode, flag, flag[0]) for flag in _ROOFLINE_FLAGS for mode in _NOT_PERF_CHECK],
 ]
 
 
@@ -1062,6 +1090,14 @@ def test_cli_rejects_flags_the_mode_does_not_take(
     paths = {"BASELINE": str(baseline), "RESULTS": str(results)}
     argv = [paths.get(arg, arg) for arg in mode.split() + _MODE_ARGS[mode] + flags]
     _assert_usage_error(monkeypatch, capsys, argv, f"{named}: not valid with {mode}")
+
+
+def test_cli_help_renders(monkeypatch, capsys):
+    """argparse %-formats each help string, so a bare % in one breaks --help."""
+    with pytest.raises(SystemExit) as exc_info:
+        _run_cli(monkeypatch, "--help")
+    assert exc_info.value.code == 0
+    assert "--roofline-targets ROOFLINE_TARGETS" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
@@ -1124,3 +1160,351 @@ def test_shipped_baselines_have_valid_policy():
     assert files, f"no baselines found under {_BASELINE_DIR.parent}"
     for path in files:
         check_regression.parse_policy(check_regression.load_baseline_file(path))
+
+
+# --- Advisory roofline reporting ---
+
+_ROOFLINE_TARGETS_PATH = _BASELINE_DIR.parent / "perf" / "v7x" / "roofline_targets.json"
+_ROOFLINE_METRIC = "output_token_throughput_per_chip"
+_ROOFLINE_TABLE = (
+    "| key | metric | actual/chip | roofline/chip | % of roofline | status |\n"
+    "|---|---|---:|---:|---:|---|\n"
+)
+_ROOFLINE_PASS = "PASS: advisory roofline check complete.\n"
+# One config with a cell of each status, one without a chip count, and one
+# that is not modeled.
+_TARGETS = {
+    "targets": {
+        "cfg": {
+            "num_chips": 4,
+            "cells": {
+                "isl1024_osl1024_c1": {_ROOFLINE_METRIC: 1000.0, "status": "ok"},
+                "isl1024_osl1024_c2": {_ROOFLINE_METRIC: 200.0, "status": "unverified"},
+                "isl1024_osl1024_c4": {"status": "oom"},
+                "isl1024_osl1024_c8": {_ROOFLINE_METRIC: 500.0},
+            },
+        },
+        "cfg-no-chips": {"cells": {"isl1024_osl1024_c1": {_ROOFLINE_METRIC: 1000.0}}},
+    },
+    "not_modeled": {"cfg-1p1d": {"reason": "disaggregated", "detail": "No model."}},
+}
+
+
+def _write_perf_cell(results_dir, cell_key, **metrics):
+    results_dir.mkdir(exist_ok=True)
+    payload = {"completed": 64, "num_prompts": 64, **metrics}
+    (results_dir / f"{cell_key}.json").write_text(json.dumps(payload))
+
+
+@pytest.fixture
+def roofline_run(tmp_path, monkeypatch, capsys):
+    """Run perf check mode on `_TARGETS`; return (exit code, stdout, stderr)."""
+    targets_file = tmp_path / "targets.json"
+    targets_file.write_text(json.dumps(_TARGETS))
+    results_dir = tmp_path / "results"
+    _write_perf_cell(results_dir, "isl1024_osl1024_c1", output_throughput=3200.0)
+
+    def run(config, *extra, results=results_dir):
+        ret = _run_cli(
+            monkeypatch,
+            "--mode", "perf", "--results-dir", str(results),
+            "--roofline-targets", str(targets_file), "--config-name", config, *extra,
+        )  # fmt: skip
+        captured = capsys.readouterr()
+        return ret, captured.out, captured.err
+
+    return run
+
+
+def test_shipped_roofline_targets_are_well_formed():
+    targets = check_regression.load_roofline_targets(_ROOFLINE_TARGETS_PATH)
+    assert "qwen3.5-397b-fp8-tp1-dp8-ep" in targets.targets
+    assert "kimi-k3-tp32-ep" in targets.targets
+    assert "qwen3.5-397b-fp8-mtp" in targets.not_modeled
+    kimi = targets.targets["kimi-k3-tp32-ep"]
+    assert kimi.num_chips == 16
+    assert kimi.cells["isl8192_osl1024_c1"].status == "unverified"
+    assert kimi.cells["isl8192_osl1024_c1"].output_token_throughput_per_chip == 12.63
+    # --config-name is a config stem, so every target and not_modeled entry
+    # must match a checked-in config file.
+    configs = _BASELINE_DIR.parents[1] / "configs"
+    assert [n for n in targets.targets if not (configs / f"{n}.sh").is_file()] == []
+    assert [n for n in targets.not_modeled if not (configs / f"{n}.sh").is_file()] == []
+
+
+def test_cli_perf_roofline_reports_each_measured_cell(roofline_run, tmp_path):
+    # 4 chips from the targets file: 3200 / 4 = 800.00 is 80.00% of 1000.00,
+    # and 400 / 4 = 100.00 is 50.00% of 200.00.
+    results_dir = tmp_path / "results"
+    _write_perf_cell(results_dir, "isl1024_osl1024_c2", output_throughput=400.0)
+    _write_perf_cell(results_dir, "isl1024_osl1024_c4", output_throughput=400.0)
+    _write_perf_cell(results_dir, "isl1024_osl1024_c8")
+    _write_perf_cell(results_dir, "isl512_osl512_c1", output_throughput=400.0)
+    assert roofline_run("cfg") == (
+        0,
+        "\n## Roofline speed check (`cfg`, 4 physical chips, advisory)\n\n"
+        + _ROOFLINE_TABLE
+        + f"| `isl1024_osl1024_c1` | {_ROOFLINE_METRIC} | 800.00 | 1000.00 | 80.00% |"
+        " ADVISORY |\n"
+        f"| `isl1024_osl1024_c2` | {_ROOFLINE_METRIC} | 100.00 | 200.00 | 50.00% |"
+        " ADVISORY (unverified) |\n"
+        f"| `isl1024_osl1024_c4` | {_ROOFLINE_METRIC} | 0.00 | 0.00 | - |"
+        " SKIP (oom) |\n"
+        f"| `isl1024_osl1024_c8` | {_ROOFLINE_METRIC} | 0.00 | 500.00 | - | SKIP |\n"
+        "| `isl512_osl512_c1` | (no roofline cell) | 0.00 | 0.00 | - | SKIP |\n"
+        "\n" + _ROOFLINE_PASS,
+        "",
+    )
+
+
+@pytest.mark.parametrize(
+    ("config", "chip_flags", "chips", "per_chip", "percent", "expected_err"),
+    [
+        ("cfg", [], 4, "800.00", "80.00%", ""),
+        ("cfg", ["--chips", "4"], 4, "800.00", "80.00%", ""),
+        # Explicit chips win over the targets file and emit a note when different.
+        (
+            "cfg",
+            ["--chips", "8"],
+            8,
+            "400.00",
+            "40.00%",
+            "NOTE: using 8 chips (modeled on 4 chips)\n",
+        ),
+        (
+            "cfg",
+            ["--prefill-chips", "2", "--decode-chips", "8"],
+            10,
+            "320.00",
+            "32.00%",
+            "NOTE: using 10 chips (modeled on 4 chips)\n",
+        ),
+        ("cfg-no-chips", ["--chips", "2"], 2, "1600.00", "160.00%", ""),
+    ],
+)
+def test_cli_perf_roofline_chip_count(
+    roofline_run, config, chip_flags, chips, per_chip, percent, expected_err
+):
+    assert roofline_run(config, *chip_flags) == (
+        0,
+        f"\n## Roofline speed check (`{config}`, {chips} physical chips, advisory)\n\n"
+        + _ROOFLINE_TABLE
+        + f"| `isl1024_osl1024_c1` | {_ROOFLINE_METRIC} | {per_chip} | 1000.00 |"
+        f" {percent} | ADVISORY |\n\n" + _ROOFLINE_PASS,
+        expected_err,
+    )
+
+
+def test_cli_perf_roofline_not_modeled_needs_no_results(roofline_run, tmp_path):
+    note = (
+        "\n## Roofline speed check (`cfg-1p1d`: not modeled)\n\n"
+        "NOTE: `cfg-1p1d` is not modeled in roofline targets"
+        " (disaggregated: No model.)\n\n"
+    )
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    assert roofline_run("cfg-1p1d", results=empty_dir) == (0, note + _ROOFLINE_PASS, "")
+    # A modeled config has a table to fill, so it needs result files.
+    assert roofline_run("cfg", results=empty_dir) == (
+        2,
+        "",
+        f"ERROR: no isl*_osl*_c*.json files found in {empty_dir}\n",
+    )
+
+
+@pytest.mark.parametrize(
+    ("config", "flags", "error"),
+    [
+        ("nope", [], "config 'nope' not found in roofline targets"),
+        (
+            "cfg-no-chips",
+            [],
+            "chip count required for roofline check of 'cfg-no-chips'",
+        ),
+        ("cfg", ["--chips", "0"], "--chips must be a positive integer, got 0"),
+        (
+            "cfg",
+            ["--prefill-chips", "-1", "--decode-chips", "2"],
+            "--prefill-chips must be a positive integer, got -1",
+        ),
+        (
+            "cfg",
+            ["--prefill-chips", "2", "--decode-chips", "0"],
+            "--decode-chips must be a positive integer, got 0",
+        ),
+        (
+            "cfg",
+            ["--prefill-chips", "2"],
+            "--prefill-chips and --decode-chips must be provided together",
+        ),
+        (
+            "cfg",
+            ["--decode-chips", "2"],
+            "--prefill-chips and --decode-chips must be provided together",
+        ),
+        (
+            "cfg",
+            ["--chips", "4", "--prefill-chips", "2", "--decode-chips", "2"],
+            "--chips cannot be combined with --prefill-chips/--decode-chips",
+        ),
+    ],
+)
+def test_cli_perf_roofline_setup_errors_exit_2_before_any_table(
+    roofline_run, tmp_path, config, flags, error
+):
+    # The baseline would pass; the error still wins and no table is printed.
+    baseline_file = tmp_path / "perf.baseline.json"
+    baseline_file.write_text(
+        json.dumps({"isl1024_osl1024_c1": {"output_token_throughput": 3200.0}})
+    )
+    assert roofline_run(config, *flags, "--baseline", str(baseline_file)) == (
+        2,
+        "",
+        f"ERROR: {error}\n",
+    )
+
+
+def test_cli_perf_roofline_runs_beside_the_baseline_check(roofline_run, tmp_path):
+    baseline_file = tmp_path / "perf.baseline.json"
+    roofline_table = (
+        "\n## Roofline speed check (`cfg`, 4 physical chips, advisory)\n\n"
+        + _ROOFLINE_TABLE
+        + f"| `isl1024_osl1024_c1` | {_ROOFLINE_METRIC} | 800.00 | 1000.00 | 80.00% |"
+        " ADVISORY |\n\n"
+    )
+
+    def run(baseline_throughput):
+        baseline_file.write_text(
+            json.dumps(
+                {"isl1024_osl1024_c1": {"output_token_throughput": baseline_throughput}}
+            )
+        )
+        return roofline_run("cfg", "--baseline", str(baseline_file))
+
+    ret, out, err = run(3200.0)
+    assert (ret, err) == (0, "")
+    assert out.startswith("\n## Perf regression check (tolerance: 5.00%)\n")
+    assert out.endswith(roofline_table + "PASS: all gated metrics within tolerance.\n")
+
+    # A failing baseline check exits 1; the roofline table is still printed.
+    ret, out, err = run(4000.0)
+    assert (ret, err) == (1, "FAILED: 1 metric(s) regressed beyond 5.00%\n")
+    assert out.endswith(roofline_table)
+
+
+def test_cli_perf_roofline_reads_the_shipped_targets(tmp_path, monkeypatch, capsys):
+    # glm-5.2-fp8-dp16-ep is modeled on 8 chips in the shipped file.
+    _write_perf_cell(tmp_path, "isl8192_osl1024_c1024", output_throughput=8000.0)
+    ret = _run_cli(
+        monkeypatch,
+        "--mode", "perf", "--results-dir", str(tmp_path),
+        "--roofline-targets", str(_ROOFLINE_TARGETS_PATH),
+        "--config-name", "glm-5.2-fp8-dp16-ep",
+    )  # fmt: skip
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert out.startswith(
+        "\n## Roofline speed check (`glm-5.2-fp8-dp16-ep`, 8 physical chips,"
+        " advisory)\n"
+    )
+    assert f"| `isl8192_osl1024_c1024` | {_ROOFLINE_METRIC} | 1000.00 |" in out
+
+
+def test_load_roofline_targets_defaults(tmp_path):
+    path = tmp_path / "targets.json"
+    cells = {
+        "x": {_ROOFLINE_METRIC: 5},
+        # oom cells always normalize throughput to 0.0 (never negative).
+        "y": {_ROOFLINE_METRIC: -10.0, "status": "oom"},
+    }
+    path.write_text(json.dumps({"targets": {"c": {"cells": cells}}}))
+    # No num_chips, status ok, and no not_modeled map.
+    assert check_regression.load_roofline_targets(path) == (
+        {"c": (None, {"x": (5.0, "ok"), "y": (0.0, "oom")})},
+        {},
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "targets": {},
+                "not_modeled": {
+                    "c": {"reason": "r"},
+                    "d": {"reason": "r2", "detail": None},
+                },
+            }
+        )
+    )
+    assert check_regression.load_roofline_targets(path) == (
+        {},
+        {"c": ("r", ""), "d": ("r2", "")},
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "error"),
+    [
+        (None, "cannot read roofline targets {path}: "),
+        ("{not json", "cannot read roofline targets {path}: "),
+        ([], "roofline targets {path} must hold a JSON object"),
+        ({"targets": []}, "{path} must hold an object with a 'targets' map"),
+        ({"targets": {"c": []}}, "roofline config 'c' must be an object"),
+        (
+            {"targets": {"c": {"num_chips": 0, "cells": {}}}},
+            "c.num_chips must be a positive integer, got 0",
+        ),
+        (
+            {"targets": {"c": {"num_chips": True, "cells": {}}}},
+            "c.num_chips must be a positive integer, got True",
+        ),
+        ({"targets": {"c": {"cells": {}}}}, "c.cells must be a non-empty object"),
+        ({"targets": {"c": {"cells": {"x": 1}}}}, "c.cells.x must be an object"),
+        (
+            {"targets": {"c": {"cells": {"x": {"status": "bad"}}}}},
+            "c.cells.x.status must be one of ('ok', 'unverified', 'oom'), got 'bad'",
+        ),
+        (
+            {"targets": {"c": {"cells": {"x": {_ROOFLINE_METRIC: 0}}}}},
+            "c.cells.x.output_token_throughput_per_chip must be positive",
+        ),
+        (
+            {"targets": {"c": {"cells": {"x": {"status": "unverified"}}}}},
+            "c.cells.x.output_token_throughput_per_chip must be positive",
+        ),
+        # Non-standard JSON NaN is rejected at load time.
+        (
+            {"targets": {"c": {"cells": {"x": {_ROOFLINE_METRIC: float("nan")}}}}},
+            "cannot read roofline targets {path}: non-standard JSON constant 'NaN'",
+        ),
+        (
+            {"targets": {"c": {"cells": {"x": {_ROOFLINE_METRIC: True}}}}},
+            "c.cells.x.output_token_throughput_per_chip must be positive",
+        ),
+        ({"targets": {}, "not_modeled": []}, "{path}: 'not_modeled' must be an object"),
+        (
+            {"targets": {}, "not_modeled": {"c": "why"}},
+            "{path}: not_modeled.c must be an object",
+        ),
+        (
+            {"targets": {}, "not_modeled": {"c": {"reason": " "}}},
+            "{path}: not_modeled.c.reason must be non-empty",
+        ),
+        (
+            {"targets": {}, "not_modeled": {"c": {"reason": "r", "detail": 123}}},
+            "{path}: not_modeled.c.detail must be a string",
+        ),
+        (
+            {
+                "targets": {"dup": {"cells": {"x": {_ROOFLINE_METRIC: 10}}}},
+                "not_modeled": {"dup": {"reason": "r"}},
+            },
+            "{path}: config(s) listed in both 'targets' and 'not_modeled': 'dup'",
+        ),
+    ],
+)
+def test_load_roofline_targets_rejects_malformed(tmp_path, content, error):
+    path = tmp_path / "targets.json"
+    if content is not None:
+        path.write_text(content if isinstance(content, str) else json.dumps(content))
+    with pytest.raises(ValueError) as exc_info:
+        check_regression.load_roofline_targets(path)
+    assert str(exc_info.value).startswith(error.format(path=path))
