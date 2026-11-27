@@ -77,6 +77,7 @@ from .hf_loader import (
     apply_hf_overrides,
     audit_hf_config,
     dtypes_from_hf_config,
+    load_draft_hf_config,
     load_hf_config,
     load_hf_config_with_identity,
 )
@@ -118,6 +119,7 @@ class _CliModelContext:
     geometry: ModelGeometry
     chip: ChipSpec
     topologies: dict[str, SliceTopology]
+    draft_config_source: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +168,15 @@ def _add_model_source(parser: argparse.ArgumentParser) -> None:
         help=(
             "JSON object merged into loaded HF config before validation "
             "(unit: json_obj, scope: model)."
+        ),
+    )
+    parser.add_argument(
+        "--draft-config",
+        type=str,
+        default=None,
+        help=(
+            "Optional path or Hugging Face ID for a companion draft model config.json "
+            "(unit: path, scope: model)."
         ),
     )
 
@@ -509,6 +520,30 @@ def _add_scenario_workload_args(parser: argparse.ArgumentParser) -> None:
             "open-loop mode (unit: s, scope: request)."
         ),
     )
+    parser.add_argument(
+        "--execution",
+        choices=("full", "ced"),
+        default="full",
+        help="Prefill execution schedule mode: full or ced (unit: enum, scope: step).",
+    )
+    parser.add_argument(
+        "--host-table-residency",
+        choices=("auto", "hbm", "host", "first"),
+        default="auto",
+        help=(
+            "Host-table weight placement policy: auto, hbm, host, or first "
+            "(unit: enum, scope: core)."
+        ),
+    )
+    parser.add_argument(
+        "--prefill-draft",
+        action="store_true",
+        default=False,
+        help=(
+            "Include draft prefill cost on the prefill path when a draft model "
+            "is configured (unit: flag, scope: step)."
+        ),
+    )
 
 
 def _add_scenario_override_args(parser: argparse.ArgumentParser) -> None:
@@ -732,6 +767,10 @@ def build_parser() -> argparse.ArgumentParser:
         decode_topology=None,
         reference_layout=None,
         hf_overrides=None,
+        draft_config=None,
+        execution="full",
+        host_table_residency="auto",
+        prefill_draft=False,
         top_k=None,
         sort_by="throughput",
         pairs=False,
@@ -864,6 +903,9 @@ def _build_cli_scenario(
                 ttft_slo_ms=args.ttft_slo_ms,
                 tpot_slo_ms=args.tpot_slo_ms,
                 kv_offload_gb=args.kv_offload_gb,
+                execution=args.execution,
+                host_table_residency=args.host_table_residency,
+                prefill_draft=bool(args.prefill_draft),
             ),
         )
     if (
@@ -888,6 +930,9 @@ def _build_cli_scenario(
         ttft_slo_ms=args.ttft_slo_ms,
         tpot_slo_ms=args.tpot_slo_ms,
         kv_offload_gb=args.kv_offload_gb if args.kv_offload_gb is not None else 0.0,
+        execution=args.execution,
+        host_table_residency=args.host_table_residency,
+        prefill_draft=bool(args.prefill_draft),
     )
 
 
@@ -1346,6 +1391,7 @@ def _dispatch_solve_family(
             decode_topology=args.decode_topology,
             pd_ratio=pd_ratio,
             activation_model=activation_model,
+            draft_config_source=model_ctx.draft_config_source,
         )
         serving_plan = solve_serving_plan(
             model_ctx.geometry,
@@ -1590,10 +1636,39 @@ def _dispatch_inspect_cmd(
     return 0 if audit.onboarding_tier == "tier0_ready" else EXIT_ERROR
 
 
+def validate_cli_geometry_flags(
+    args: argparse.Namespace,
+    geometry: ModelGeometry,
+) -> ModelGeometry:
+    """Validate execution, host-table, and draft flags against loaded geometry."""
+    if args.execution == "ced" and (
+        geometry.sparse_attn is None or geometry.sparse_attn.ced_boundary <= 0
+    ):
+        msg = "--execution ced requires a model with a CED sparse-attention boundary"
+        raise ValueError(msg)
+    if args.host_table_residency != "auto" and not geometry.host_tables:
+        msg = "--host-table-residency requires a model with host_tables"
+        raise ValueError(msg)
+    if args.prefill_draft and geometry.draft is None:
+        msg = "--prefill-draft requires a model with a draft config"
+        raise ValueError(msg)
+    if (
+        args.kv_dtype is not None
+        and geometry.draft is not None
+        and geometry.draft.draft_kv_dtype
+    ):
+        geometry = replace(
+            geometry,
+            draft=replace(geometry.draft, draft_kv_dtype=""),
+        )
+    return geometry
+
+
 def _load_cli_geometry(
     source: str,
     *,
     hf_overrides: dict[str, object] | None = None,
+    draft_config_path: str | None = None,
 ) -> tuple[dict[str, object], ModelGeometry, str | None]:
     """Load HF config and parse ModelGeometry with canonical identity validation."""
     resolved_src = str(Path(source).resolve()) if Path(source).exists() else source
@@ -1601,7 +1676,10 @@ def _load_cli_geometry(
         resolved_src,
         hf_overrides=hf_overrides,
     )
-    geometry = from_hf_config(config, model_ref=identity.hf_repo)
+    draft_cfg = load_draft_hf_config(draft_config_path)
+    geometry = from_hf_config(
+        config, model_ref=identity.hf_repo, draft_config=draft_cfg
+    )
     return (config, geometry, identity.hf_repo)
 
 
@@ -1675,13 +1753,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         config, geometry, _ = _load_cli_geometry(
             source,
             hf_overrides=overrides,
+            draft_config_path=args.draft_config,
         )
+        geometry = validate_cli_geometry_flags(args, geometry)
         model_ctx = _CliModelContext(
             source=source,
             config=config,
             geometry=geometry,
             chip=chip,
             topologies=chip_topologies,
+            draft_config_source=args.draft_config,
         )
         return _dispatch_loaded_subcommand(args, parser, model_ctx)
     except (

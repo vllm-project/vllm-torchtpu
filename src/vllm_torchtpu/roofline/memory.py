@@ -20,16 +20,31 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING, TypedDict, Unpack
 
-from .constants import STEP_FLOOR_CACHE_MAXSIZE
+from .constants import (
+    DEFAULT_CHIPS_PER_HOST,
+    DEFAULT_CORES_PER_CHIP,
+    FP8_BYTES,
+    STEP_FLOOR_CACHE_MAXSIZE,
+)
 from .geometry import (
+    HostTableResidency,
     LayerCounts,
     count_layer_types,
+    draft_layer_geometry,
+    host_table_hbm_fraction,
 )
 from .modules import (
     Dtypes,
     Parallel,
+    csa2_layer_weight_elems,
+    draft_kv_dtypes,
+    draft_parallel_for_geometry,
     dsa_indexer_layer_weight_elems,
+    host_table_elem_bytes,
     kv_bytes_per_token_per_layer,
+    kv_heads_on_rank,
+    role_dtype_bytes,
+    sparse_gqa_index_layer_weight_elems,
 )
 
 if TYPE_CHECKING:
@@ -55,6 +70,7 @@ class ParamBreakdown:
     hc: float
     total_params: float
     active_params_per_token: float
+    host_tables: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +90,8 @@ class SeqKvLayout:
     seqs_per_dp: int
     context: int = 0
     physical_kv_layout: bool = False
+    host_table_residency: HostTableResidency = "auto"
+    kv_offload_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +123,15 @@ def _compute_mla_w_attn(
     pp: int,
     counts: LayerCounts,
 ) -> float:
-    """Compute per-core weight bytes for MLA and DSA attention layers."""
+    """Compute per-core weight bytes for MLA, DSA, and CSA2 attention layers."""
+    sparse = geometry.sparse_attn
+    if sparse is not None and sparse.kind == "csa2":
+        scale = pp_stage_layer_scale(geometry.num_layers, pp) * dtypes.w_dense
+        w_attn = float(counts.mla) * csa2_layer_weight_elems(geometry, tp) * scale
+        n_idx = len(sparse.index_source_layer_ids)
+        if n_idx > 0 and geometry.index_n_heads > 0 and geometry.index_head_dim > 0:
+            w_attn += float(n_idx) * dsa_indexer_layer_weight_elems(geometry) * scale
+        return w_attn
     if geometry.kv_lora_rank <= 0:
         msg = "MLA layer requires config field 'kv_lora_rank'"
         raise ValueError(msg)
@@ -174,9 +200,7 @@ def compute_w_attn(
     tp = max(1, parallel.tp)
     pp = max(1, parallel.pp)
     q_mult = 2 if geometry.attn_output_gate else 1
-    num_kv_heads = (
-        max(1, geometry.num_kv_heads // tp) if geometry.num_kv_heads > 0 else 0
-    )
+    num_kv_heads = kv_heads_on_rank(geometry, parallel)
     w_attn = 0.0
     gqa_hd = (
         geometry.global_head_dim if geometry.global_head_dim > 0 else geometry.head_dim
@@ -202,6 +226,15 @@ def compute_w_attn(
             * stage_scale
         )
         w_attn += w_q_o + w_kv
+    sparse = geometry.sparse_attn
+    if counts.gqa > 0 and sparse is not None and sparse.kind in ("msa", "qsa"):
+        n_idx = len(sparse.index_source_layer_ids)
+        w_attn += (
+            float(n_idx)
+            * sparse_gqa_index_layer_weight_elems(geometry, tp)
+            * dtypes.w_dense
+            * stage_scale
+        )
     if counts.mla > 0:
         w_attn += _compute_mla_w_attn(geometry, dtypes, tp, pp, counts)
     return w_attn
@@ -362,7 +395,34 @@ def _compute_w_mtp(
     w_attn_data: tuple[float, int],
     w_ffn_terms: tuple[float, float],
 ) -> float:
-    """Compute per-core weight bytes for multi-token prediction layers."""
+    """Compute per-core weight bytes for MTP or DraftSpec layers."""
+    if geometry.draft is not None:
+        draft = geometry.draft
+        draft_geom = draft_layer_geometry(geometry)
+        draft_counts = count_layer_types(draft_geom)
+        par1 = replace(parallel, pp=1)
+        tp = max(1, parallel.tp)
+        w_ffn_draft, _ = compute_w_ffn(draft_geom, dtypes, par1)
+        fc_layers = 1 if draft.kind == "dspark" else draft.num_layers
+        fc_div = 1.0 if draft.fc_replicated else float(tp)
+        w_fc = (
+            float(fc_layers * draft.fc_in_mult * geometry.hidden * geometry.hidden)
+            * dtypes.w_aux
+            / fc_div
+        )
+        w_markov = (
+            float(2 * geometry.vocab * draft.markov_rank) * dtypes.lm_head / float(tp)
+            if draft.markov_rank > 0
+            else 0.0
+        )
+        return (
+            compute_w_attn(draft_geom, dtypes, par1, draft_counts)
+            + compute_w_rec(draft_geom, dtypes, par1, draft_counts)
+            + w_ffn_draft
+            + _compute_w_hc(draft_geom, dtypes, tp, 1)
+            + w_fc
+            + w_markov
+        )
     if geometry.mtp_layers <= 0:
         return 0.0
     tp = max(1, parallel.tp)
@@ -439,6 +499,68 @@ def _effective_dsa_kv_layers(
     return plain_eff_mla, counts.eff_dsa
 
 
+def offloaded_host_table_params(
+    geometry: ModelGeometry, residency: HostTableResidency = "auto"
+) -> float:
+    """Return host-table parameter count excluded from TensorCore HBM weights."""
+    return sum(
+        float(spec.elem_count) * (1.0 - host_table_hbm_fraction(spec, idx, residency))
+        for idx, spec in enumerate(geometry.host_tables)
+    )
+
+
+def _table_pp_scale(n_tbl: int, pp: int, fallback: float) -> float:
+    """Return PP stage fraction for a table attached to ``n_tbl`` layers."""
+    return (
+        float(math.ceil(n_tbl / pp)) / float(n_tbl)
+        if (pp > 1 and n_tbl > 0)
+        else fallback
+    )
+
+
+def _compute_w_host_tables(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    parallel: Parallel,
+    residency: HostTableResidency,
+    chip: ChipSpec | None = None,
+) -> float:
+    """Compute per-core HBM weight bytes for host-table storage and projections."""
+    if not geometry.host_tables:
+        return 0.0
+    tp, pp = max(1, parallel.tp), max(1, parallel.pp)
+    host_c = (
+        chip.chips_per_host * chip.cores_per_chip
+        if chip is not None
+        else DEFAULT_CHIPS_PER_HOST * DEFAULT_CORES_PER_CHIP
+    )
+    pool_c = max(1, tp * max(1, parallel.dp) * max(1, parallel.pcp), parallel.ep)
+    dp_div = float(min(pool_c, max(1, host_c)))
+    base = pp_stage_layer_scale(geometry.num_layers, pp)
+    total = 0.0
+    for idx, spec in enumerate(geometry.host_tables):
+        stage_scale = _table_pp_scale(len(spec.layer_ids), pp, base)
+        shard_div = dp_div if spec.shard_axis == "dp_local" else float(tp)
+        hbm_frac = host_table_hbm_fraction(spec, idx, residency)
+        table_bytes = (
+            float(spec.elem_count)
+            * host_table_elem_bytes(spec, dtypes)
+            * hbm_frac
+            / shard_div
+        )
+        proj_bytes = (
+            float(spec.dense_proj_params)
+            * role_dtype_bytes(dtypes, spec.dense_proj_dtype_role)
+            / float(tp)
+        )
+        is_first_resident = (
+            residency == "first" and spec.resident_on_first is None and idx == 0
+        )
+        table_scale = 1.0 if is_first_resident else stage_scale
+        total += table_bytes * table_scale + proj_bytes * stage_scale
+    return total
+
+
 def _compute_kv_and_state(
     geometry: ModelGeometry,
     dtypes: Dtypes,
@@ -448,43 +570,26 @@ def _compute_kv_and_state(
 ) -> tuple[float, float]:
     """Compute (kv_bytes, state_bytes) active on one core."""
     counts = count_layer_types(geometry)
-    tp = max(1, parallel.tp)
-    pp = max(1, parallel.pp)
-    if counts.mla > 0:
+    tp, pp = max(1, parallel.tp), max(1, parallel.pp)
+    sparse = geometry.sparse_attn
+    if counts.mla > 0 and not (sparse is not None and sparse.kind == "csa2"):
         if geometry.kv_lora_rank <= 0:
             msg = "MLA layer requires config field 'kv_lora_rank'"
             raise ValueError(msg)
         if geometry.qk_rope_head_dim < 0:
             msg = "MLA layer requires config field 'qk_rope_head_dim'"
             raise ValueError(msg)
-    gqa_kv_b_per_tok = kv_bytes_per_token_per_layer(
-        geometry, dtypes, parallel, "gqa", physical=layout.physical_kv_layout, chip=chip
+    full_kv, fixed_kv = _kv_bytes_per_core_parts_cached(
+        geometry,
+        dtypes,
+        parallel,
+        layout.context,
+        physical=layout.physical_kv_layout,
+        chip=chip,
+        kv_offload_enabled=layout.kv_offload_enabled,
     )
-    swa_kv_b_per_tok = kv_bytes_per_token_per_layer(
-        geometry, dtypes, parallel, "swa", physical=layout.physical_kv_layout, chip=chip
-    )
-    mla_only_kv_b_per_tok = kv_bytes_per_token_per_layer(
-        geometry, dtypes, parallel, "mla", physical=layout.physical_kv_layout, chip=chip
-    )
-    dsa_kv_b_per_tok = kv_bytes_per_token_per_layer(
-        geometry, dtypes, parallel, "dsa", physical=layout.physical_kv_layout, chip=chip
-    )
+    kv_bytes = float(layout.seqs_per_dp) * (float(layout.context) * full_kv + fixed_kv)
     stage_scale = pp_stage_layer_scale(geometry.num_layers, pp)
-    kv_div = parallel.kv_split * parallel.pcp
-    kv_gqa = (
-        float(layout.seqs_per_dp * layout.context) * counts.eff_gqa * gqa_kv_b_per_tok
-    )
-    eff_swa_ctx = (
-        min(layout.context, geometry.sliding_window)
-        if geometry.sliding_window > 0
-        else layout.context
-    )
-    kv_swa = float(layout.seqs_per_dp * eff_swa_ctx) * counts.eff_swa * swa_kv_b_per_tok
-    mla_only_layers, full_dsa_layers = _effective_dsa_kv_layers(geometry, counts)
-    kv_mla = float(layout.seqs_per_dp * layout.context) * (
-        mla_only_layers * mla_only_kv_b_per_tok + full_dsa_layers * dsa_kv_b_per_tok
-    )
-    kv_bytes = (kv_gqa + kv_swa + kv_mla) * stage_scale / kv_div
 
     st_bytes = 0.0
     if counts.gdn > 0:
@@ -513,6 +618,19 @@ def _compute_kv_and_state(
             * dtypes.state
             * stage_scale
         )
+    if sparse is not None and sparse.fixed_state_page_bytes > 0.0 and counts.gqa > 0:
+        n_qsa = float(len(sparse.kv_source_layer_ids))
+        st_bytes += (
+            float(layout.seqs_per_dp)
+            * n_qsa
+            * sparse.fixed_state_page_bytes
+            * (dtypes.kv / FP8_BYTES)
+            * stage_scale
+        )
+    for spec in geometry.host_tables:
+        if spec.state_bytes_per_req > 0.0:
+            sc = _table_pp_scale(len(spec.layer_ids), pp, stage_scale)
+            st_bytes += float(layout.seqs_per_dp) * spec.state_bytes_per_req * sc
     return kv_bytes, st_bytes
 
 
@@ -590,6 +708,7 @@ def param_counts(geometry: ModelGeometry) -> ParamBreakdown:
     )
     embedding, lm_head = _compute_w_head(geometry, _UNIT_DTYPES, tp=1)
     hc = _compute_w_hc(geometry, _UNIT_DTYPES, tp=1, pp=1)
+    host_tables = _compute_w_host_tables(geometry, _UNIT_DTYPES, _UNIT_PARALLEL, "hbm")
     total_params = (
         attention
         + linear_attention
@@ -601,8 +720,9 @@ def param_counts(geometry: ModelGeometry) -> ParamBreakdown:
         + lm_head
         + mtp
         + hc
+        + host_tables
     )
-    inactive_routed = 0.0
+    inactive_routed = sum(float(spec.elem_count) for spec in geometry.host_tables)
     if geometry.num_experts > 0:
         expert_hidden = (
             geometry.routed_expert_hidden
@@ -612,17 +732,34 @@ def param_counts(geometry: ModelGeometry) -> ParamBreakdown:
         n_moe_ffn, _ = geometry.ffn_layer_counts()
         mtp_moe_layers = (
             geometry.mtp_layers
-            if (n_moe_ffn > 0 and geometry.mtp_layers > 0 and geometry.mtp_inter <= 0)
+            if (
+                geometry.draft is None
+                and n_moe_ffn > 0
+                and geometry.mtp_layers > 0
+                and geometry.mtp_inter <= 0
+            )
             else 0
         )
         inactive_experts = max(0, geometry.num_experts - geometry.top_k)
-        inactive_routed = float(
+        inactive_routed += float(
             (n_moe_ffn + mtp_moe_layers)
             * inactive_experts
             * geometry.ffn_num_matrices
             * expert_hidden
             * geometry.moe_inter
         )
+    if geometry.draft is not None:
+        dg = draft_layer_geometry(geometry)
+        if dg.num_experts > 0:
+            d_moe, _ = dg.ffn_layer_counts()
+            d_h = dg.routed_expert_hidden if dg.routed_expert_hidden > 0 else dg.hidden
+            inactive_routed += float(
+                d_moe
+                * max(0, dg.num_experts - dg.top_k)
+                * dg.ffn_num_matrices
+                * d_h
+                * dg.moe_inter
+            )
     return ParamBreakdown(
         attention=attention,
         linear_attention=linear_attention,
@@ -636,6 +773,7 @@ def param_counts(geometry: ModelGeometry) -> ParamBreakdown:
         hc=hc,
         total_params=total_params,
         active_params_per_token=max(0.0, total_params - inactive_routed),
+        host_tables=host_tables,
     )
 
 
@@ -668,7 +806,10 @@ def hbm_breakdown_per_core_bytes(
         w_emb + w_lm_head + w_mtp if pp == 1 else max(w_emb, last_stage_head + w_mtp)
     )
     w_hc = _compute_w_hc(geometry, dtypes, tp, pp)
-    weights = w_attn + w_rec + w_ffn + w_head_mtp + w_hc
+    w_host_tables = _compute_w_host_tables(
+        geometry, dtypes, parallel, layout.host_table_residency, chip=chip
+    )
+    weights = w_attn + w_rec + w_ffn + w_head_mtp + w_hc + w_host_tables
     kv, state = _compute_kv_and_state(geometry, dtypes, parallel, layout, chip=chip)
     return HbmBreakdown(
         weights=weights,
@@ -696,6 +837,7 @@ class _KvPartsOptions(TypedDict, total=False):
 
     physical: bool
     chip: ChipSpec | None
+    kv_offload_enabled: bool
 
 
 @lru_cache(maxsize=STEP_FLOOR_CACHE_MAXSIZE)
@@ -704,14 +846,19 @@ def _kv_bytes_per_core_parts_cached(
     dtypes: Dtypes,
     parallel: Parallel,
     ctx_tokens: int,
+    *,
     physical: bool,
     chip: ChipSpec | None,
+    kv_offload_enabled: bool = False,
 ) -> tuple[float, float]:
     """Cached implementation of kv_bytes_per_core_parts over frozen value keys."""
     counts = count_layer_types(geometry)
     pp = max(1, parallel.pp)
     stage_scale = pp_stage_layer_scale(geometry.num_layers, pp)
     kv_div = float(parallel.kv_split * parallel.pcp) / stage_scale
+    sparse = geometry.sparse_attn
+    is_csa2 = sparse is not None and sparse.kind == "csa2"
+    is_sparse_gqa = sparse is not None and sparse.kind in ("msa", "qsa")
     gqa_kv_b = kv_bytes_per_token_per_layer(
         geometry, dtypes, parallel, "gqa", physical=physical, chip=chip
     )
@@ -724,19 +871,72 @@ def _kv_bytes_per_core_parts_cached(
     dsa_kv_b = kv_bytes_per_token_per_layer(
         geometry, dtypes, parallel, "dsa", physical=physical, chip=chip
     )
-    mla_only_layers, full_dsa_layers = _effective_dsa_kv_layers(geometry, counts)
-    linear_part = (
-        counts.eff_gqa * gqa_kv_b
-        + mla_only_layers * mla_kv_b
-        + full_dsa_layers * dsa_kv_b
+    eff_swa_ctx = (
+        min(max(0, ctx_tokens), geometry.sliding_window)
+        if geometry.sliding_window > 0
+        else max(0, ctx_tokens)
     )
+    if is_csa2 and sparse is not None:
+        n_kv = float(len(sparse.kv_source_layer_ids))
+        n_idx = float(len(sparse.index_source_layer_ids))
+        idx_b = sparse.index_record_bytes or max(0.0, dsa_kv_b - mla_kv_b)
+        linear_part = counts.eff_gqa * gqa_kv_b + n_kv * mla_kv_b + n_idx * idx_b
+        extra_fixed = (
+            float(eff_swa_ctx * counts.mla) * sparse.swa_bytes_per_tok
+            if (sparse.swa_bytes_per_tok > 0.0 and geometry.sliding_window > 0)
+            else 0.0
+        )
+    elif is_sparse_gqa and sparse is not None:
+        mla_only_layers, full_dsa_layers = _effective_dsa_kv_layers(geometry, counts)
+        main_only_b = kv_bytes_per_token_per_layer(
+            replace(geometry, sparse_attn=replace(sparse, index_source_layer_ids=())),
+            dtypes,
+            parallel,
+            "gqa",
+            physical=physical,
+            chip=chip,
+        )
+        idx_b = max(0.0, gqa_kv_b - main_only_b)
+        n_idx = float(len(sparse.index_source_layer_ids))
+        linear_part = (
+            counts.eff_gqa * main_only_b
+            + n_idx * idx_b
+            + mla_only_layers * mla_kv_b
+            + full_dsa_layers * dsa_kv_b
+        )
+        extra_fixed = 0.0
+    else:
+        mla_only_layers, full_dsa_layers = _effective_dsa_kv_layers(geometry, counts)
+        linear_part = (
+            counts.eff_gqa * gqa_kv_b
+            + mla_only_layers * mla_kv_b
+            + full_dsa_layers * dsa_kv_b
+        )
+        extra_fixed = 0.0
     if geometry.sliding_window > 0:
         full_kv_per_tok = linear_part / kv_div
-        eff_swa_ctx = min(max(0, ctx_tokens), geometry.sliding_window)
-        fixed_kv_per_seq = (float(eff_swa_ctx) * counts.eff_swa * swa_kv_b) / kv_div
-        return full_kv_per_tok, fixed_kv_per_seq
-    full_kv_per_tok = (linear_part + counts.eff_swa * swa_kv_b) / kv_div
-    return full_kv_per_tok, 0.0
+        fixed_kv_per_seq = (
+            float(eff_swa_ctx) * counts.eff_swa * swa_kv_b + extra_fixed
+        ) / kv_div
+    else:
+        full_kv_per_tok = (linear_part + counts.eff_swa * swa_kv_b) / kv_div
+        fixed_kv_per_seq = 0.0
+    draft = geometry.draft
+    if draft is not None and not (
+        draft.skip_draft_kv_on_offload and kv_offload_enabled
+    ):
+        draft_geom = draft_layer_geometry(geometry)
+        d_lin, d_fix = _kv_bytes_per_core_parts_cached(
+            draft_geom,
+            draft_kv_dtypes(geometry, dtypes),
+            draft_parallel_for_geometry(draft_geom, parallel),
+            ctx_tokens,
+            physical=physical,
+            chip=chip,
+        )
+        full_kv_per_tok += d_lin
+        fixed_kv_per_seq += d_fix
+    return full_kv_per_tok, fixed_kv_per_seq
 
 
 def kv_bytes_per_core_parts(
@@ -749,8 +949,15 @@ def kv_bytes_per_core_parts(
     """Return (full_context_kv_per_token_bytes, fixed_window_kv_per_seq_bytes)."""
     physical = options.get("physical", False)
     chip = options.get("chip")
+    kv_offload_enabled = options.get("kv_offload_enabled", False)
     return _kv_bytes_per_core_parts_cached(
-        geometry, dtypes, parallel, ctx_tokens, physical, chip
+        geometry,
+        dtypes,
+        parallel,
+        ctx_tokens,
+        physical=physical,
+        chip=chip,
+        kv_offload_enabled=kv_offload_enabled,
     )
 
 

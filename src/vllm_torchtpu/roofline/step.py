@@ -46,6 +46,7 @@ from .constants import (
     VECTOR_MAX_ELEMENTS_PER_WORD,
     VECTOR_TO_BF16_RATIO_BRACKET,
 )
+from .geometry import ExecutionMode, HostTableResidency, draft_layer_geometry
 from .modules import (
     Dtypes,
     ModuleCost,
@@ -54,12 +55,16 @@ from .modules import (
     _MatmulBuckets,
     _route_matmul_flops,
     activation_wire_bytes,
+    draft_kv_dtypes,
+    draft_parallel_for_geometry,
     pass_costs,
     routed_moe_min_unpack_vector_flops,
 )
 from .occupancy import ExpertActivationModel
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .chips import ChipSpec, SliceTopology
     from .collectives import Collective
     from .geometry import ModelGeometry
@@ -97,6 +102,8 @@ class SpecShape:
     context: int = 0
     spec_k: int = 0
     shared_prefix_tokens: int = 0
+    execution: ExecutionMode = "full"
+    host_table_residency: HostTableResidency = "auto"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +126,7 @@ class StepFloor:
     latency_assumed_s: float = 0.0
     envelope_floor_s: float = 0.0
     link_load: LinkCutLoad = field(default_factory=LinkCutLoad)
+    pcie_s: float = 0.0
 
     @property
     def resource_bound_s(self) -> float:
@@ -658,8 +666,8 @@ def module_serial_s(
     *,
     matmul_scale: float = 1.0,
 ) -> float:
-    """Return single-module serial time across HBM, matmul, and vector units."""
-    return max(
+    """Return single-module serial time across HBM, matmul, vector, and PCIe H2D."""
+    return module.pcie_h2d_s + max(
         module.hbm_bytes / chip.hbm_bw,
         _precision_time_raw_s(
             module.fp8_flops,
@@ -837,6 +845,7 @@ def combine_modules(
     )
     chain_s = analytic_chain_s + user_chain_lat_s
 
+    tot_pcie_s = sum(module.pcie_h2d_s for module in modules)
     hard_floor_s = max(hbm_bound_s, matmul_bound_s, vector_bound_s, coll_bound_s)
     serial_estimate_s = mod_serial_s + chain_s
     memory_envelope_s, matmul_envelope_s = _sum_envelope_resources(modules, chip)
@@ -845,6 +854,7 @@ def combine_modules(
         matmul_envelope_s,
         vector_bound_s,
         coll_bound_s,
+        tot_pcie_s,
     )
     if hard_floor_s == hbm_bound_s:
         binding = "hbm"
@@ -873,6 +883,7 @@ def combine_modules(
         latency_assumed_s=hop_lat_s + user_chain_lat_s,
         envelope_floor_s=envelope_floor_s,
         link_load=total_link_load,
+        pcie_s=tot_pcie_s,
     )
 
 
@@ -922,12 +933,15 @@ def _scale_draft_module(module: ModuleCost, spec_k: int) -> ModuleCost:
         int8_flops_envelope=_scale_opt(module.int8_flops_envelope, spec_k),
         int4_flops_envelope=_scale_opt(module.int4_flops_envelope, spec_k),
         strict_collectives=scaled_strict,
+        pcie_h2d_s=module.pcie_h2d_s * spec_k,
     )
 
 
 @lru_cache(maxsize=64)
 def _draft_geom_for_spec(geometry: ModelGeometry) -> ModelGeometry:
-    """Build single-layer draft geometry for one speculative MTP pass."""
+    """Build draft sub-geometry for one speculative MTP or DraftSpec pass."""
+    if geometry.draft is not None:
+        return draft_layer_geometry(geometry)
     draft_layer_type = (
         "dsa"
         if (geometry.kv_lora_rank > 0 and geometry.index_topk > 0)
@@ -962,6 +976,8 @@ def _draft_geom_for_spec(geometry: ModelGeometry) -> ModelGeometry:
         mtp_layers=0,
         ple_dim=0,
         ple_layer_ids=(),
+        sparse_attn=None,
+        host_tables=(),
     )
 
 
@@ -973,10 +989,14 @@ def _draft_fc_module(
     *,
     chip: ChipSpec,
 ) -> ModuleCost:
-    """Construct the physics ModuleCost for spec_k speculative draft projections."""
+    """Construct the physics ModuleCost for speculative draft input projections."""
     batch, spec_k = batch_and_spec_k
-    fc_elems = DRAFT_PROJECTION_HIDDEN_VECTORS * float(
-        geometry.hidden * geometry.hidden // parallel.tp
+    draft = geometry.draft
+    fc_mult = float(draft.fc_in_mult) if draft else DRAFT_PROJECTION_HIDDEN_VECTORS
+    fc_rep = draft.fc_replicated if draft else False
+    step_mult = 1 if (draft and draft.kind == "dspark") else spec_k
+    fc_elems = fc_mult * float(
+        geometry.hidden * geometry.hidden // (1 if fc_rep else max(1, parallel.tp))
     )
     fc_buckets = _route_matmul_flops(
         batch, fc_elems, dtypes.w_aux, dtypes.act, chip=chip
@@ -996,19 +1016,48 @@ def _draft_fc_module(
             parallel.tp,
             coll_cfg,
         )
-        if parallel.tp > 1
+        if (parallel.tp > 1 and not fc_rep)
         else None
     )
     return ModuleCost(
         name="draft_fc",
-        hbm_bytes=fc_elems * dtypes.w_aux * spec_k,
-        fp8_flops=fc_buckets.fp8 * spec_k,
-        bf16_flops=fc_buckets.bf16 * spec_k,
-        fp4_flops=fc_buckets.fp4 * spec_k,
-        int8_flops=fc_buckets.int8 * spec_k,
-        int4_flops=fc_buckets.int4 * spec_k,
-        collectives=(fc_unit,) * spec_k if fc_unit is not None else (),
-        unique_collectives=((fc_unit, spec_k),) if fc_unit is not None else (),
+        hbm_bytes=fc_elems * dtypes.w_aux * step_mult,
+        fp8_flops=fc_buckets.fp8 * step_mult,
+        bf16_flops=fc_buckets.bf16 * step_mult,
+        fp4_flops=fc_buckets.fp4 * step_mult,
+        int8_flops=fc_buckets.int8 * step_mult,
+        int4_flops=fc_buckets.int4 * step_mult,
+        collectives=(fc_unit,) * step_mult if fc_unit is not None else (),
+        unique_collectives=((fc_unit, step_mult),) if fc_unit is not None else (),
+    )
+
+
+def _draft_markov_module(
+    geometry: ModelGeometry,
+    parallel: Parallel,
+    batch_and_spec_k: tuple[int, int],
+    dtypes: Dtypes,
+    *,
+    chip: ChipSpec,
+) -> ModuleCost | None:
+    """Construct optional low-rank Markov draft head cost when markov_rank > 0."""
+    draft = geometry.draft
+    if draft is None or draft.markov_rank <= 0:
+        return None
+    batch, spec_k = batch_and_spec_k
+    is_dspark = draft.kind == "dspark"
+    rows = batch * max(1, spec_k) if is_dspark else batch
+    steps = 1 if is_dspark else spec_k
+    elems = float(2 * geometry.vocab * draft.markov_rank // max(1, parallel.tp))
+    bkt = _route_matmul_flops(rows, elems, dtypes.lm_head, dtypes.act, chip=chip)
+    return ModuleCost(
+        name="draft_markov",
+        hbm_bytes=elems * dtypes.lm_head * steps,
+        fp8_flops=bkt.fp8 * steps,
+        bf16_flops=bkt.bf16 * steps,
+        fp4_flops=bkt.fp4 * steps,
+        int8_flops=bkt.int8 * steps,
+        int4_flops=bkt.int4 * steps,
     )
 
 
@@ -1059,16 +1108,67 @@ def _zero_weight_strict_hbm_vector(
             active_rows=active_rows,
         )
     elif module.name == "draft_moe":
+        is_dspark = geometry.draft is not None and geometry.draft.kind == "dspark"
+        draft_scale = 1 if is_dspark else max(1, spec_k)
+        draft_rows = active_rows * max(1, spec_k) if is_dspark else active_rows
         vector_m = _strip_moe_routed_unpack(
             _draft_geom_for_spec(geometry),
             replace(parallel, pp=1),
             dtypes,
             vector_m,
             chip=chip,
-            layer_scale=float(max(1, spec_k)),
-            active_rows=active_rows,
+            layer_scale=float(draft_scale),
+            active_rows=draft_rows,
         )
     return hbm_m, vector_m
+
+
+def _append_unpadded_prefill_draft(
+    step_ctx: tuple[ModelGeometry, ChipSpec, Parallel, StepShape, UnpaddedFloorOptions],
+    run_fn: Callable[
+        [ModelGeometry, Parallel, StepShape, Dtypes], tuple[ModuleCost, ...]
+    ],
+    mods: list[ModuleCost],
+    zero_map: dict[str, ModuleCost],
+) -> None:
+    """Append unpadded prefill-time draft modules and optional zero-weight baselines."""
+    geometry, chip, parallel, shape, opts = step_ctx
+    pre_draft_geom = _draft_geom_for_spec(geometry)
+    pre_draft_par = draft_parallel_for_geometry(pre_draft_geom, parallel)
+    pre_draft_shape = replace(
+        shape, batch=0, rows_per_seq=0, prefill_draft=False, execution="full"
+    )
+    draft_dtypes = draft_kv_dtypes(geometry, opts.dtypes)
+    mods.extend(
+        _scale_draft_module(module, 1)
+        for module in run_fn(
+            pre_draft_geom, pre_draft_par, pre_draft_shape, draft_dtypes
+        )
+    )
+    uncached = shape.prefill_tokens * max(0.0, 1.0 - shape.prefix_hit_rate)
+    eff_pre = math.floor(uncached / max(1, parallel.pcp))
+    mods.append(
+        _draft_fc_module(geometry, parallel, (eff_pre, 1), opts.dtypes, chip=chip)
+    )
+    if opts.zero_weights:
+        zero_shape = StepShape(
+            batch=0,
+            rows_per_seq=0,
+            context=0,
+            prefill_tokens=0,
+            host_table_residency=shape.host_table_residency,
+        )
+        zero_map.update(
+            {
+                scaled.name: scaled
+                for module in run_fn(
+                    pre_draft_geom, pre_draft_par, zero_shape, draft_dtypes
+                )
+                for scaled in (_scale_draft_module(module, 1),)
+            }
+        )
+        fc0 = _draft_fc_module(geometry, parallel, (0, 1), opts.dtypes, chip=chip)
+        zero_map[fc0.name] = fc0
 
 
 def _eval_unpadded_modules(
@@ -1085,13 +1185,14 @@ def _eval_unpadded_modules(
         target_geom: ModelGeometry,
         target_parallel: Parallel,
         target_shape: StepShape,
+        target_dtypes: Dtypes,
     ) -> tuple[ModuleCost, ...]:
         """Evaluate unpadded module costs for one geometry, parallel, and shape."""
         return pass_costs(
             target_geom,
             target_parallel,
             target_shape,
-            opts.dtypes,
+            target_dtypes,
             mxu_m_tile=1,
             mxu_lhs_rows_bf16=1,
             mxu_lhs_rows_fp8=1,
@@ -1100,47 +1201,79 @@ def _eval_unpadded_modules(
             chip=chip,
         )
 
-    mods: list[ModuleCost] = list(_run(geometry, parallel, shape))
+    mods: list[ModuleCost] = list(_run(geometry, parallel, shape, opts.dtypes))
     has_draft = opts.spec_k > 0 and shape.batch > 0 and shape.prefill_tokens == 0
+    draft_dtypes = draft_kv_dtypes(geometry, opts.dtypes)
+    is_dspark = geometry.draft is not None and geometry.draft.kind == "dspark"
+    draft_scale = 1 if is_dspark else opts.spec_k
+    draft_geom: ModelGeometry | None = None
     draft_parallel = replace(parallel, pp=1)
     if has_draft:
         draft_geom = _draft_geom_for_spec(geometry)
+        draft_parallel = draft_parallel_for_geometry(draft_geom, parallel)
         draft_shape = StepShape(
             batch=shape.batch,
-            rows_per_seq=1,
+            rows_per_seq=max(1, opts.spec_k) if is_dspark else 1,
             context=shape.context,
             state_writes=1,
             shared_prefix_tokens=shape.shared_prefix_tokens,
+            execution=shape.execution,
+            host_table_residency=shape.host_table_residency,
         )
         mods.extend(
-            _scale_draft_module(module, opts.spec_k)
-            for module in _run(draft_geom, draft_parallel, draft_shape)
+            _scale_draft_module(module, draft_scale)
+            for module in _run(draft_geom, draft_parallel, draft_shape, draft_dtypes)
         )
         mods.append(
             _draft_fc_module(
                 geometry, parallel, (shape.batch, opts.spec_k), opts.dtypes, chip=chip
             )
         )
+        markov_mod = _draft_markov_module(
+            geometry, parallel, (shape.batch, opts.spec_k), opts.dtypes, chip=chip
+        )
+        if markov_mod is not None:
+            mods.append(markov_mod)
     zero_map: dict[str, ModuleCost] = {}
     if opts.zero_weights:
-        zero_shape = StepShape(batch=0, rows_per_seq=0, context=0, prefill_tokens=0)
+        zero_shape = StepShape(
+            batch=0,
+            rows_per_seq=0,
+            context=0,
+            prefill_tokens=0,
+            host_table_residency=shape.host_table_residency,
+        )
         zero_map = {
-            module.name: module for module in _run(geometry, parallel, zero_shape)
+            module.name: module
+            for module in _run(geometry, parallel, zero_shape, opts.dtypes)
         }
-        if has_draft:
+        if has_draft and draft_geom is not None:
             zero_map.update(
                 {
                     scaled.name: scaled
                     for module in _run(
-                        _draft_geom_for_spec(geometry), draft_parallel, zero_shape
+                        draft_geom,
+                        draft_parallel,
+                        zero_shape,
+                        draft_dtypes,
                     )
-                    for scaled in (_scale_draft_module(module, opts.spec_k),)
+                    for scaled in (_scale_draft_module(module, draft_scale),)
                 }
             )
             fc0 = _draft_fc_module(
                 geometry, parallel, (0, opts.spec_k), opts.dtypes, chip=chip
             )
             zero_map[fc0.name] = fc0
+            mk0 = _draft_markov_module(
+                geometry, parallel, (0, opts.spec_k), opts.dtypes, chip=chip
+            )
+            if mk0 is not None:
+                zero_map[mk0.name] = mk0
+    has_drafter = geometry.draft is not None or geometry.mtp_layers > 0
+    if shape.prefill_draft and shape.prefill_tokens > 0 and has_drafter:
+        _append_unpadded_prefill_draft(
+            (geometry, chip, parallel, shape, opts), _run, mods, zero_map
+        )
     return mods, zero_map
 
 
@@ -1223,6 +1356,58 @@ def unpadded_strict_resource_times(
     return (hbm_s, matmul_s, vector_s, coll_s)
 
 
+def _chip_pass_costs(
+    geometry: ModelGeometry,
+    chip: ChipSpec,
+    parallel: Parallel,
+    shape: StepShape,
+    options: FloorOptions,
+) -> tuple[ModuleCost, ...]:
+    """Evaluate pass_costs with chip tiling, LHS row, and FP8 ratio settings."""
+    fp8_ratio = chip.fp8_flops / chip.bf16_flops if chip.fp8_flops > 0.0 else 0.0
+    return pass_costs(
+        geometry,
+        parallel,
+        shape,
+        options.dtypes,
+        mxu_m_tile=chip.mxu_m_tile,
+        mxu_lhs_rows_bf16=chip.mxu_lhs_rows_bf16,
+        mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
+        activation_model=options.activation_model,
+        fp8_to_bf16_ratio=fp8_ratio,
+        chip=chip,
+    )
+
+
+def prefill_draft_modules(
+    geometry: ModelGeometry,
+    chip: ChipSpec,
+    parallel: Parallel,
+    shape: StepShape,
+    options: FloorOptions,
+) -> list[ModuleCost]:
+    """Return optional prefill-time draft modules when shape.prefill_draft is set."""
+    has_drafter = geometry.draft is not None or geometry.mtp_layers > 0
+    if not (shape.prefill_draft and shape.prefill_tokens > 0 and has_drafter):
+        return []
+    d_opts = replace(options, dtypes=draft_kv_dtypes(geometry, options.dtypes))
+    d_shape = replace(shape, batch=0, rows_per_seq=0, prefill_draft=False)
+    draft_geom = _draft_geom_for_spec(geometry)
+    d_mods = _chip_pass_costs(
+        draft_geom,
+        chip,
+        draft_parallel_for_geometry(draft_geom, parallel),
+        d_shape,
+        d_opts,
+    )
+    uncached = shape.prefill_tokens * max(0.0, 1.0 - shape.prefix_hit_rate)
+    eff_pre = max(1, math.ceil(uncached / max(1, parallel.pcp)))
+    return [
+        *(_scale_draft_module(m, 1) for m in d_mods),
+        _draft_fc_module(geometry, parallel, (eff_pre, 1), options.dtypes, chip=chip),
+    ]
+
+
 @lru_cache(maxsize=STEP_FLOOR_CACHE_MAXSIZE)
 def step_floor(
     geometry: ModelGeometry,
@@ -1233,20 +1418,10 @@ def step_floor(
 ) -> StepFloor:
     """Compute the floor for one decode, prefill, or mixed forward pass."""
     opts = options or FloorOptions()
-    fp8_ratio = chip.fp8_flops / chip.bf16_flops if chip.fp8_flops > 0.0 else 0.0
+    mods = _chip_pass_costs(geometry, chip, parallel, shape, opts)
+    extra = prefill_draft_modules(geometry, chip, parallel, shape, opts)
     return combine_modules(
-        pass_costs(
-            geometry,
-            parallel,
-            shape,
-            opts.dtypes,
-            mxu_m_tile=chip.mxu_m_tile,
-            mxu_lhs_rows_bf16=chip.mxu_lhs_rows_bf16,
-            mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
-            activation_model=opts.activation_model,
-            fp8_to_bf16_ratio=fp8_ratio,
-            chip=chip,
-        ),
+        (*mods, *extra) if extra else mods,
         chip,
         collective_latency_s=opts.collective_latency_s,
         topology=opts.topology,
@@ -1262,30 +1437,18 @@ def spec_cycle_floor(
     spec: SpecShape,
     options: FloorOptions | None = None,
 ) -> StepFloor:
-    """Compute the floor for one speculative cycle (verify + k draft passes)."""
+    """Compute the floor for one speculative cycle (verify + draft passes)."""
     opts = options or FloorOptions()
-    fp8_ratio = chip.fp8_flops / chip.bf16_flops if chip.fp8_flops > 0.0 else 0.0
     verify_shape = StepShape(
         batch=spec.batch,
         rows_per_seq=spec.spec_k + 1,
         context=spec.context,
         state_writes=1,
         shared_prefix_tokens=spec.shared_prefix_tokens,
+        execution=spec.execution,
+        host_table_residency=spec.host_table_residency,
     )
-    verify_mods = list(
-        pass_costs(
-            geometry,
-            parallel,
-            verify_shape,
-            opts.dtypes,
-            mxu_m_tile=chip.mxu_m_tile,
-            mxu_lhs_rows_bf16=chip.mxu_lhs_rows_bf16,
-            mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
-            activation_model=opts.activation_model,
-            fp8_to_bf16_ratio=fp8_ratio,
-            chip=chip,
-        )
-    )
+    verify_mods = list(_chip_pass_costs(geometry, chip, parallel, verify_shape, opts))
     if spec.spec_k <= 0:
         return combine_modules(
             tuple(verify_mods),
@@ -1295,33 +1458,37 @@ def spec_cycle_floor(
             parallel=parallel,
         )
 
-    draft_geom = _draft_geom_for_spec(geometry)
+    is_dspark = geometry.draft is not None and geometry.draft.kind == "dspark"
+    draft_scale = 1 if is_dspark else spec.spec_k
+    d_opts = replace(opts, dtypes=draft_kv_dtypes(geometry, opts.dtypes))
     draft_shape = StepShape(
         batch=spec.batch,
-        rows_per_seq=1,
+        rows_per_seq=max(1, spec.spec_k) if is_dspark else 1,
         context=spec.context,
         state_writes=1,
         shared_prefix_tokens=spec.shared_prefix_tokens,
+        execution=spec.execution,
+        host_table_residency=spec.host_table_residency,
     )
-    draft_parallel = replace(parallel, pp=1)
-    one_draft = pass_costs(
+    draft_geom = _draft_geom_for_spec(geometry)
+    one_draft = _chip_pass_costs(
         draft_geom,
-        draft_parallel,
+        chip,
+        draft_parallel_for_geometry(draft_geom, parallel),
         draft_shape,
-        opts.dtypes,
-        mxu_m_tile=chip.mxu_m_tile,
-        mxu_lhs_rows_bf16=chip.mxu_lhs_rows_bf16,
-        mxu_lhs_rows_fp8=chip.mxu_lhs_rows_fp8,
-        activation_model=opts.activation_model,
-        fp8_to_bf16_ratio=fp8_ratio,
-        chip=chip,
+        d_opts,
     )
-    verify_mods.extend(_scale_draft_module(module, spec.spec_k) for module in one_draft)
+    verify_mods.extend(_scale_draft_module(module, draft_scale) for module in one_draft)
     verify_mods.append(
         _draft_fc_module(
             geometry, parallel, (spec.batch, spec.spec_k), opts.dtypes, chip=chip
         )
     )
+    markov_mod = _draft_markov_module(
+        geometry, parallel, (spec.batch, spec.spec_k), opts.dtypes, chip=chip
+    )
+    if markov_mod is not None:
+        verify_mods.append(markov_mod)
     return combine_modules(
         tuple(verify_mods),
         chip,

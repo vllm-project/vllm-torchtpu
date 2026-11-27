@@ -18,7 +18,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from typing import Literal, TypedDict, Unpack
+from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 from .chips import CHIPS, ChipSpec
 from .collectives import Algo, Collective, CollectiveConfig, Kind, make
@@ -28,12 +31,17 @@ from .constants import (
     CAUSAL_MIDPOINT_HALF,
     DEFAULT_CORES_PER_CHIP,
     DEFAULT_SSM_STATE_BYTES,
+    FP4_BYTES,
     FP8_BYTES,
     FP32_BYTES,
     GLU_MATMUL_COUNT,
     HBM_MIN_PACKING_DIVISOR,
     HBM_PACKING_NUMERATOR,
     HEAD_DIM_PACKING_THRESHOLD,
+    INT4_INDEX_SCALE_BYTES,
+    INT4_PER_TOKEN_HEAD_KV_DTYPE,
+    INT4_PER_TOKEN_HEAD_SCALE_BYTES,
+    KV_DTYPE_BYTES,
     MATMUL_FLOP_PER_MAC,
     NON_GATED_MATMUL_COUNT,
     SPARSE_MLA_SCALE_BYTES,
@@ -42,10 +50,16 @@ from .constants import (
     VECTOR_SUB_BYTE_ELEMENTS_PER_WORD,
 )
 from .geometry import (
+    ExecutionMode,
+    HostTableResidency,
+    HostTableSpec,
     LayerCounts,
     ModelGeometry,
+    SparseAttnSpec,
     count_layer_types,
+    host_table_hbm_fraction,
     layer_ffn_kinds,
+    slice_geometry_layers,
 )
 from .occupancy import (
     ExpertActivationModel,
@@ -85,6 +99,111 @@ class Dtypes:
     w_expert_dtype: str = "fp8"
     kv_dtype: str = "fp8"
     state_dtype: str = "float32"
+
+
+def role_dtype_bytes(
+    dtypes: Dtypes, role: Literal["w_expert", "w_dense", "w_aux"]
+) -> float:
+    """Return byte width for a named weight dtype role."""
+    return {"w_expert": dtypes.w_expert, "w_aux": dtypes.w_aux}.get(
+        role, dtypes.w_dense
+    )
+
+
+def is_unit_dtypes(dtypes: Dtypes) -> bool:
+    """Return True when every tensor role byte width equals 1.0 (element mode)."""
+    return (
+        dtypes.w_dense == 1.0
+        and dtypes.w_expert == 1.0
+        and dtypes.w_aux == 1.0
+        and dtypes.kv == 1.0
+        and dtypes.state == 1.0
+        and dtypes.conv == 1.0
+        and dtypes.router == 1.0
+        and dtypes.lm_head == 1.0
+    )
+
+
+def host_table_elem_bytes(spec: HostTableSpec, dtypes: Dtypes) -> float:
+    """Return bytes per host-table element, yielding 1.0 under unit dtypes."""
+    extra = 0.0 if is_unit_dtypes(dtypes) else max(0.0, spec.scale_ratio)
+    return role_dtype_bytes(dtypes, spec.table_dtype_role) + extra
+
+
+def draft_kv_dtypes(geometry: ModelGeometry, dtypes: Dtypes) -> Dtypes:
+    """Return Dtypes with DraftSpec.draft_kv_dtype applied when non-unit."""
+    draft = geometry.draft
+    if draft is None or not draft.draft_kv_dtype or is_unit_dtypes(dtypes):
+        return dtypes
+    dt = draft.draft_kv_dtype
+    return replace(dtypes, kv=KV_DTYPE_BYTES[dt], kv_dtype=dt)
+
+
+def draft_parallel_for_geometry(
+    draft_geom: ModelGeometry, parallel: Parallel
+) -> Parallel:
+    """Return PP=1 Parallel with kv_split clamped to divide draft kv_group."""
+    tp = max(1, parallel.tp)
+    is_tp_dcp = (
+        draft_geom.sparse_attn is not None and draft_geom.sparse_attn.dcp_span == "tp"
+    )
+    kv_group = (
+        max(1, tp // draft_geom.num_kv_heads)
+        if draft_geom.num_kv_heads > 0
+        and draft_geom.kv_lora_rank == 0
+        and not is_tp_dcp
+        else tp
+    )
+    eff_kv_split = (
+        parallel.kv_split
+        if kv_group % parallel.kv_split == 0
+        else math.gcd(parallel.kv_split, kv_group)
+    )
+    return replace(parallel, pp=1, kv_split=max(1, eff_kv_split))
+
+
+def kv_heads_on_rank(geometry: ModelGeometry, parallel: Parallel) -> int:
+    """Return KV heads stored on one rank, honoring TP-spanning DCP."""
+    if geometry.num_kv_heads <= 0:
+        return 0
+    tp = max(1, parallel.tp)
+    if geometry.sparse_attn is not None and geometry.sparse_attn.dcp_span == "tp":
+        return min(
+            geometry.num_kv_heads,
+            max(1, (geometry.num_kv_heads * max(1, parallel.kv_split)) // tp),
+        )
+    return max(1, geometry.num_kv_heads // tp)
+
+
+def csa2_layer_weight_elems(geometry: ModelGeometry, tp: int) -> float:
+    """Return per-core attention weight elements for one CSA2 layer."""
+    eff_tp = max(1, tp)
+    nq, h, hd = max(1, geometry.num_heads // eff_tp), geometry.hidden, geometry.head_dim
+    q_r = geometry.q_lora_rank
+    q_w = float(h * q_r + q_r * nq * hd if q_r > 0 else h * nq * hd)
+    sparse = geometry.sparse_attn
+    o_r = sparse.o_lora_rank if sparse is not None else 0
+    o_g = sparse.o_groups if sparse is not None else 1
+    o_w = (
+        float(nq * hd * o_r) + float(o_g * o_r * h) / float(eff_tp)
+        if o_r > 0
+        else float(nq * hd * h)
+    )
+    return q_w + float(h * hd) + o_w
+
+
+def sparse_gqa_index_layer_weight_elems(
+    geometry: ModelGeometry, tp: int, *, strict: bool = False
+) -> float:
+    """Return per-core sparse GQA/MSA/QSA indexer weight elements per layer."""
+    if geometry.index_n_heads <= 0 or geometry.index_head_dim <= 0:
+        return 0.0
+    heads = (
+        max(1, geometry.index_n_heads // max(1, tp))
+        if strict
+        else geometry.index_n_heads
+    )
+    return float(geometry.hidden * (heads + 1) * geometry.index_head_dim)
 
 
 def activation_wire_bytes(act: str) -> float:
@@ -132,6 +251,9 @@ class StepShape:
     prefill_tokens: int = 0
     prefix_hit_rate: float = 0.0
     shared_prefix_tokens: int = 0
+    execution: ExecutionMode = "full"
+    host_table_residency: HostTableResidency = "auto"
+    prefill_draft: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +284,7 @@ class ModuleCost:
     int8_flops_envelope: float | None = None
     int4_flops_envelope: float | None = None
     strict_collectives: tuple[tuple[Collective, int], ...] | None = None
+    pcie_h2d_s: float = 0.0
 
     @property
     def ici_bytes(self) -> float:
@@ -462,6 +585,8 @@ class _StepContext:
     )
     unpadded_linear: bool = False
     chip: ChipSpec = field(default_factory=lambda: CHIPS["tpu7x"])
+    execution: ExecutionMode = "full"
+    host_table_residency: HostTableResidency = "auto"
 
 
 @dataclass(frozen=True, slots=True)
@@ -857,9 +982,12 @@ def _validate_pass_costs_config(geometry: ModelGeometry, parallel: Parallel) -> 
     if geometry.num_heads > 0 and tp > geometry.num_heads:
         msg = f"Parallel.tp={tp} exceeds geometry.num_heads={geometry.num_heads}"
         raise ValueError(msg)
+    is_tp_dcp = (
+        geometry.sparse_attn is not None and geometry.sparse_attn.dcp_span == "tp"
+    )
     kv_group = (
         max(1, tp // geometry.num_kv_heads)
-        if geometry.num_kv_heads > 0 and geometry.kv_lora_rank == 0
+        if geometry.num_kv_heads > 0 and geometry.kv_lora_rank == 0 and not is_tp_dcp
         else max(1, tp)
     )
     if parallel.kv_split < 1 or kv_group % parallel.kv_split != 0:
@@ -896,9 +1024,8 @@ def _gqa_swa_kv_bytes_per_tok(
     physical_align: int = 0,
 ) -> float:
     """Compute per-token per-layer KV bytes for GQA or SWA head geometry."""
-    tp = max(1, parallel.tp)
     num_kv_heads = (
-        max(1, geometry.num_kv_heads // tp) if geometry.num_kv_heads > 0 else 0
+        kv_heads_on_rank(geometry, parallel) if geometry.num_kv_heads > 0 else 0
     )
     if physical_align <= 0:
         return float(2 * num_kv_heads * head_dim) * dtypes.kv
@@ -920,6 +1047,41 @@ def _gqa_swa_kv_bytes_per_tok(
     return float(padded_kv_rows * padded_hd) * dtypes.kv
 
 
+def _int4_pth_kv(head_dim: int, h_rank: int) -> float:
+    """Return per-token 4-bit per-token-head KV bytes including 32B scale cache."""
+    return (
+        float(_TWO_DIRECTIONS * head_dim * h_rank) * FP4_BYTES
+        + INT4_PER_TOKEN_HEAD_SCALE_BYTES
+    )
+
+
+def _msa_kv_bytes_per_tok(
+    geometry: ModelGeometry,
+    dtypes: Dtypes,
+    parallel: Parallel,
+    head_dim: int,
+    sparse_attn: SparseAttnSpec,
+) -> tuple[float, float]:
+    """Return (main_kv_bytes, index_bytes) per token per layer for MSA."""
+    h_rank = kv_heads_on_rank(geometry, parallel)
+    is_i4 = dtypes.kv_dtype == INT4_PER_TOKEN_HEAD_KV_DTYPE
+    main_b = (
+        _int4_pth_kv(head_dim, h_rank)
+        if is_i4
+        else float(_TWO_DIRECTIONS * head_dim * h_rank) * dtypes.kv
+    )
+    if geometry.index_head_dim <= 0:
+        return main_b, 0.0
+    idx_raw = (
+        float(geometry.index_head_dim) * FP4_BYTES + INT4_INDEX_SCALE_BYTES
+        if is_i4
+        else float(geometry.index_head_dim) * dtypes.kv
+    )
+    return main_b, idx_raw / (
+        float(max(1, parallel.tp)) if sparse_attn.index_cache_sharded else 1.0
+    )
+
+
 @lru_cache(maxsize=4096)
 def _kv_bytes_per_token_per_layer_cached(
     geometry: ModelGeometry,
@@ -931,7 +1093,11 @@ def _kv_bytes_per_token_per_layer_cached(
 ) -> float:
     """Cached implementation of kv_bytes_per_token_per_layer over value tuples."""
     resolved = layer_type
-    if resolved in ("full_attention", "attention"):
+    if resolved in ("sparse_gqa", "indexed_attention"):
+        resolved = "gqa"
+    elif resolved == "csa2":
+        resolved = "dsa"
+    elif resolved in ("full_attention", "attention"):
         if geometry.kv_lora_rank > 0 and geometry.index_topk > 0:
             resolved = "dsa"
         elif geometry.kv_lora_rank > 0:
@@ -939,16 +1105,32 @@ def _kv_bytes_per_token_per_layer_cached(
         else:
             resolved = "gqa"
 
+    sparse = geometry.sparse_attn
     if resolved == "gqa":
-        gqa_hd = (
-            geometry.global_head_dim
-            if geometry.global_head_dim > 0
-            else geometry.head_dim
+        gqa_hd = geometry.global_head_dim or geometry.head_dim
+        if sparse is not None and sparse.kind == "msa":
+            main_b, idx_b = _msa_kv_bytes_per_tok(
+                geometry, dtypes, parallel, gqa_hd, sparse
+            )
+            return main_b + (idx_b if sparse.index_source_layer_ids else 0.0)
+        extra = (
+            sparse.compressed_key_bytes_per_tok
+            if (
+                sparse is not None
+                and sparse.kind == "qsa"
+                and sparse.index_source_layer_ids
+            )
+            else 0.0
         )
-        return _gqa_swa_kv_bytes_per_tok(
+        if dtypes.kv_dtype == INT4_PER_TOKEN_HEAD_KV_DTYPE:
+            return _int4_pth_kv(gqa_hd, kv_heads_on_rank(geometry, parallel)) + extra
+        main_b = _gqa_swa_kv_bytes_per_tok(
             geometry, dtypes, parallel, gqa_hd, physical_align=align if physical else 0
         )
+        return main_b + extra
     if resolved == "swa":
+        if dtypes.kv_dtype == INT4_PER_TOKEN_HEAD_KV_DTYPE:
+            return _int4_pth_kv(geometry.head_dim, kv_heads_on_rank(geometry, parallel))
         return _gqa_swa_kv_bytes_per_tok(
             geometry,
             dtypes,
@@ -957,22 +1139,30 @@ def _kv_bytes_per_token_per_layer_cached(
             physical_align=align if physical else 0,
         )
     if resolved in ("mla", "dsa"):
-        raw_latent_w = geometry.kv_lora_rank + geometry.qk_rope_head_dim
+        is_csa2 = sparse is not None and sparse.kind == "csa2"
+        latent_dim = geometry.kv_lora_rank or (geometry.head_dim if is_csa2 else 0)
+        raw_latent_w = latent_dim + geometry.qk_rope_head_dim
         latent_w = math.ceil(raw_latent_w / align) * align if physical else raw_latent_w
         mla_latent_b = float(latent_w) * dtypes.kv
-        has_sparse = (
-            resolved == "dsa"
-            and geometry.index_topk > 0
-            and geometry.index_head_dim > 0
+        has_sparse = resolved == "dsa" and (
+            (geometry.index_topk > 0 and geometry.index_head_dim > 0) or is_csa2
         )
         idx_scale = (
             SPARSE_MLA_SCALE_BYTES if (physical and dtypes.kv <= FP8_BYTES) else 0.0
         )
-        dsa_idx_b = (
-            float(geometry.index_head_dim) * dtypes.kv + idx_scale
-            if has_sparse
-            else 0.0
-        )
+        if (
+            is_csa2
+            and sparse is not None
+            and sparse.index_record_bytes > 0.0
+            and has_sparse
+        ):
+            dsa_idx_b = sparse.index_record_bytes
+        else:
+            dsa_idx_b = (
+                float(geometry.index_head_dim) * dtypes.kv + idx_scale
+                if has_sparse
+                else 0.0
+            )
         return mla_latent_b + dsa_idx_b
 
     msg = f"Unknown attention layer type: {layer_type}"
@@ -1007,6 +1197,131 @@ def _align_mxu(dim: int, eval_context: _StepContext) -> int:
     return math.ceil(dim / align) * align
 
 
+def _shared_dec_toks(
+    eval_context: _StepContext, ctx: int, kv_div: float
+) -> tuple[float, float]:
+    """Return (nominal_decode_tokens, shared_prefix_min_decode_tokens)."""
+    dec = float(eval_context.batch * ctx) / kv_div
+    c_sh = min(ctx, max(0, eval_context.shared_prefix_tokens))
+    dec_min = (
+        float(c_sh + eval_context.batch * max(0, ctx - c_sh)) / kv_div
+        if (eval_context.batch > 0 and c_sh > 0)
+        else dec
+    )
+    return dec, dec_min
+
+
+def _sparse_gqa_extras(
+    geometry: ModelGeometry,
+    parallel: Parallel,
+    dtypes: Dtypes,
+    eval_context: _StepContext,
+    gqa_info: tuple[int, float, float, float],
+) -> tuple[float, float, float, float, float, float, _MatmulBuckets, _MatmulBuckets]:
+    """Compute weighted context, KV bytes, indexer weights, and FLOPs for MSA/QSA."""
+    gqa_hd, n_eff, kv_div, pre_toks = gqa_info
+    sparse, zero = geometry.sparse_attn, _MatmulBuckets()
+    if sparse is None or sparse.kind not in ("msa", "qsa"):
+        return (
+            n_eff * float(eval_context.context),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            zero,
+            zero,
+        )
+    budget = (
+        (sparse.sparse_topk_blocks + sparse.sparse_local_block)
+        * sparse.sparse_block_size
+        if sparse.kind == "msa"
+        else geometry.qsa_budget
+    )
+    ctx, cap = eval_context.context, sparse.candidate_scan_cap
+    att_ctx = min(ctx, budget) if (budget > 0 and ctx > 0) else ctx
+    scan_ctx = min(ctx, cap) if (cap > 0 and ctx > 0) else ctx
+    if sparse.kind == "msa":
+        main_p, idx_kv_b = _msa_kv_bytes_per_tok(
+            geometry, dtypes, parallel, gqa_hd, sparse
+        )
+        main_m = main_p
+    else:
+        if dtypes.kv_dtype == INT4_PER_TOKEN_HEAD_KV_DTYPE:
+            main_p = main_m = _int4_pth_kv(gqa_hd, kv_heads_on_rank(geometry, parallel))
+        else:
+            al = eval_context.chip.physical_alignment_elems
+            main_p = _gqa_swa_kv_bytes_per_tok(
+                geometry, dtypes, parallel, gqa_hd, physical_align=al
+            )
+            main_m = _gqa_swa_kv_bytes_per_tok(
+                geometry, dtypes, parallel, gqa_hd, physical_align=0
+            )
+        idx_kv_b = sparse.compressed_key_bytes_per_tok
+    n_sp = min(n_eff, float(len(sparse.kv_source_layer_ids)) * eval_context.pp_scale)
+    n_dense, n_idx = (
+        max(0.0, n_eff - n_sp),
+        float(len(sparse.index_source_layer_ids)) * eval_context.pp_scale,
+    )
+    idx_we = n_idx * sparse_gqa_index_layer_weight_elems(geometry, parallel.tp)
+    idx_ws = n_idx * sparse_gqa_index_layer_weight_elems(
+        geometry, parallel.tp, strict=True
+    )
+    dec_sp_t, dec_sp_m = _shared_dec_toks(eval_context, att_ctx, kv_div)
+    dec_full_t, dec_full_m = _shared_dec_toks(eval_context, ctx, kv_div)
+    kv_p = (n_sp * dec_sp_t + n_dense * dec_full_t + n_eff * pre_toks) * main_p
+    kv_m = (n_sp * dec_sp_m + n_dense * dec_full_m + n_eff * pre_toks) * main_m
+    pre_g = eval_context.eff_prefill * parallel.pcp
+    idx_dec = eval_context.batch > 0 and ctx > budget > 0
+    idx_pre = (
+        eval_context.eff_prefill > 0
+        and budget > 0
+        and (eval_context.cached_prefix + pre_g) > budget
+    )
+    if idx_dec and idx_kv_b > 0.0 and n_idx > 0.0:
+        sc_t, sc_m = _shared_dec_toks(eval_context, scan_ctx, kv_div)
+        kv_p, kv_m = kv_p + n_idx * sc_t * idx_kv_b, kv_m + n_idx * sc_m * idx_kv_b
+    if eval_context.eff_prefill > 0 and idx_kv_b > 0.0 and n_idx > 0.0:
+        idx_pre_toks = pre_toks if idx_pre else float(eval_context.eff_prefill) / kv_div
+        kv_p, kv_m = (
+            kv_p + n_idx * idx_pre_toks * idx_kv_b,
+            kv_m + n_idx * idx_pre_toks * idx_kv_b,
+        )
+    idx_fe, idx_fs = zero, zero
+    if geometry.index_n_heads > 0 and geometry.index_head_dim > 0 and n_idx > 0.0:
+        pairs = (float(eval_context.decode_rows * scan_ctx) if idx_dec else 0.0) + (
+            _capped_causal_pairs(eval_context.cached_prefix, pre_g, cap)
+            / float(max(1, parallel.pcp))
+            if idx_pre
+            else 0.0
+        )
+        if pairs > 0.0:
+            bkt = "fp8" if eval_context.chip.fp8_flops > 0.0 else "bf16"
+            unit = pairs * MATMUL_FLOP_PER_MAC * float(geometry.index_head_dim) * n_idx
+            sh = max(1, geometry.index_n_heads // max(1, parallel.tp))
+            idx_fe = _bucket_from_name(bkt, unit * float(geometry.index_n_heads))
+            idx_fs = _bucket_from_name(bkt, unit * float(sh))
+    full_pre_pairs = float(eval_context.eff_prefill) * (
+        eval_context.cached_prefix + 0.5 * pre_g
+    )
+    sp_pre_pairs = (
+        _capped_causal_pairs(eval_context.cached_prefix, pre_g, budget)
+        / float(max(1, parallel.pcp))
+        if budget > 0
+        else full_pre_pairs
+    )
+    return (
+        n_sp * float(att_ctx) + n_dense * float(ctx),
+        n_sp * sp_pre_pairs + n_dense * full_pre_pairs,
+        kv_p,
+        kv_m,
+        idx_we,
+        idx_ws,
+        idx_fe,
+        idx_fs,
+    )
+
+
 def _compute_gqa_cost(
     geometry: ModelGeometry,
     parallel: Parallel,
@@ -1018,9 +1333,7 @@ def _compute_gqa_cost(
     n_gqa = counts.gqa
     tp = parallel.tp
     n_eff = n_gqa * eval_context.pp_scale
-    num_kv_heads = (
-        max(1, geometry.num_kv_heads // tp) if geometry.num_kv_heads > 0 else 0
-    )
+    num_kv_heads = kv_heads_on_rank(geometry, parallel)
     q_mult = 2 if geometry.attn_output_gate else 1
     gqa_hd = (
         geometry.global_head_dim if geometry.global_head_dim > 0 else geometry.head_dim
@@ -1074,6 +1387,25 @@ def _compute_gqa_cost(
     b_kv_min = kv_bytes_per_token_per_layer(
         geometry, dtypes, parallel, "gqa", physical=False, chip=eval_context.chip
     )
+    is_sparse_gqa = geometry.sparse_attn is not None and geometry.sparse_attn.kind in (
+        "msa",
+        "qsa",
+    )
+    dec_ctx_layers, sp_pre_pairs, sp_kv_p, sp_kv_m, idx_we, idx_ws, idx_fe, idx_fs = (
+        _sparse_gqa_extras(
+            geometry,
+            parallel,
+            dtypes,
+            eval_context,
+            (gqa_hd, n_eff, kv_split_div, kv_pre_tokens),
+        )
+    )
+    att_w_elems_strict = att_w_elems + idx_ws
+    att_w_elems += idx_we
+    att_mxu_elems += idx_we
+    gqa_kv_phys_bytes = sp_kv_p if is_sparse_gqa else kv_tokens_total * b_kv_phys
+    gqa_kv_min_bytes = sp_kv_m if is_sparse_gqa else kv_tokens_min_total * b_kv_min
+    idx_est_flops, idx_strict_flops = idx_fe, idx_fs
     att_flops = _route_matmul_flops(
         eval_context.rows,
         att_mxu_elems,
@@ -1084,7 +1416,7 @@ def _compute_gqa_cost(
     )
     att_min_flops = _route_matmul_flops(
         eval_context.rows,
-        att_w_elems,
+        att_w_elems_strict,
         dtypes.w_dense,
         dtypes.act,
         chip=eval_context.chip,
@@ -1093,21 +1425,24 @@ def _compute_gqa_cost(
     dec_scores = float(
         eval_context.decode_rows
         * 4
-        * eval_context.context
         * gqa_hd
         * (geometry.num_heads // tp)
-        * n_eff
+        * dec_ctx_layers
     )
     pre_ctx_eff = (
         eval_context.cached_prefix + 0.5 * eval_context.eff_prefill * parallel.pcp
     )
-    pre_scores = float(
-        eval_context.eff_prefill
-        * 4
-        * pre_ctx_eff
-        * gqa_hd
-        * (geometry.num_heads // tp)
-        * n_eff
+    pre_scores = (
+        float(sp_pre_pairs * 4 * gqa_hd * (geometry.num_heads // tp))
+        if is_sparse_gqa
+        else float(
+            eval_context.eff_prefill
+            * 4
+            * pre_ctx_eff
+            * gqa_hd
+            * (geometry.num_heads // tp)
+            * n_eff
+        )
     )
     n_colls_layers = max(1, round(n_eff))
     att_colls, att_ucolls = _repeat_colls(
@@ -1162,13 +1497,21 @@ def _compute_gqa_cost(
     score_tot = dec_scores + pre_scores
     return ModuleCost(
         name="gqa",
-        hbm_bytes=att_w_elems * dtypes.w_dense + kv_tokens_total * b_kv_phys,
-        fp8_flops=att_flops.fp8,
-        bf16_flops=att_flops.bf16 + score_tot,
+        hbm_bytes=att_w_elems * dtypes.w_dense + gqa_kv_phys_bytes,
+        fp8_flops=att_flops.fp8 + idx_est_flops.fp8,
+        bf16_flops=att_flops.bf16 + score_tot + idx_est_flops.bf16,
         collectives=att_colls,
-        hbm_bytes_min=att_w_elems * dtypes.w_dense + kv_tokens_min_total * b_kv_min,
-        fp8_flops_min=att_min_flops.fp8 + (score_tot if strict_attn_fp8 else 0.0),
-        bf16_flops_min=att_min_flops.bf16 + (0.0 if strict_attn_fp8 else score_tot),
+        hbm_bytes_min=att_w_elems_strict * dtypes.w_dense + gqa_kv_min_bytes,
+        fp8_flops_min=(
+            att_min_flops.fp8
+            + idx_strict_flops.fp8
+            + (score_tot if strict_attn_fp8 else 0.0)
+        ),
+        bf16_flops_min=(
+            att_min_flops.bf16
+            + idx_strict_flops.bf16
+            + (0.0 if strict_attn_fp8 else score_tot)
+        ),
         unique_collectives=att_ucolls,
         vector_flops=vector_flops,
         strict_vector_flops=strict_vector_flops,
@@ -1352,7 +1695,10 @@ def _compute_swa_cost(
 
 
 def _validate_mla_geom(fam_name: str, geometry: ModelGeometry) -> None:
-    """Validate model geometry fields required for MLA or DSA."""
+    """Validate model geometry fields required for MLA, DSA, or CSA2."""
+    is_csa2 = geometry.sparse_attn is not None and geometry.sparse_attn.kind == "csa2"
+    if is_csa2 and geometry.head_dim > 0 and geometry.qk_rope_head_dim >= 0:
+        return
     if geometry.kv_lora_rank <= 0:
         msg = f"{fam_name.upper()} layer requires config field 'kv_lora_rank'"
         raise ValueError(msg)
@@ -1496,14 +1842,24 @@ def _dsa_indexer_score_buckets(
         if (geometry.index_share_for_mtp_iteration and eval_context.rows_per_seq > 1)
         else eval_context.decode_rows
     )
-    dec_pairs = float(dec_rows * eval_context.context) if dec_active else 0.0
+    scan_cap = (
+        geometry.sparse_attn.candidate_scan_cap
+        if geometry.sparse_attn is not None
+        else 0
+    )
+    scan_ctx = (
+        min(eval_context.context, scan_cap)
+        if scan_cap > 0 and eval_context.context > 0
+        else eval_context.context
+    )
+    dec_pairs = float(dec_rows * scan_ctx) if dec_active else 0.0
     pre_global = eval_context.eff_prefill * parallel.pcp
     pre_active = (
         eval_context.eff_prefill > 0
         and (eval_context.cached_prefix + pre_global) > geometry.index_topk
     )
     pre_pairs = (
-        _capped_causal_pairs(eval_context.cached_prefix, pre_global, 0)
+        _capped_causal_pairs(eval_context.cached_prefix, pre_global, scan_cap)
         / float(max(1, parallel.pcp))
         if pre_active
         else 0.0
@@ -1563,8 +1919,14 @@ def _mla_weights_and_kv(
     """Return MLA/DSA weight, strict weight, KV, effective layer counts, and context."""
     n_fam, kv_n_fam, is_sparse, num_q_heads = fam_info
     n_eff = n_fam * eval_context.pp_scale
-    kv_lora = geometry.kv_lora_rank
-    nope_d = geometry.qk_nope_head_dim
+    sparse = geometry.sparse_attn
+    is_csa2 = sparse is not None and sparse.kind == "csa2"
+    kv_lora = (
+        geometry.kv_lora_rank
+        if geometry.kv_lora_rank > 0
+        else (geometry.head_dim if is_csa2 else 0)
+    )
+    nope_d = geometry.qk_nope_head_dim or geometry.head_dim
     rope_d = geometry.qk_rope_head_dim
     v_head_dim = geometry.v_head_dim or nope_d
     nq_raw = num_q_heads * (nope_d + rope_d)
@@ -1574,11 +1936,15 @@ def _mla_weights_and_kv(
         else float(geometry.hidden * nq_raw)
     )
     mla_w_layer = (
-        q_w
-        + float(geometry.hidden * (kv_lora + rope_d))
-        + float(
-            kv_lora * num_q_heads * (nope_d + v_head_dim)
-            + (num_q_heads * v_head_dim) * geometry.hidden
+        csa2_layer_weight_elems(geometry, parallel.tp)
+        if is_csa2
+        else (
+            q_w
+            + float(geometry.hidden * (kv_lora + rope_d))
+            + float(
+                kv_lora * num_q_heads * (nope_d + v_head_dim)
+                + (num_q_heads * v_head_dim) * geometry.hidden
+            )
         )
     )
     idx_scale = (
@@ -1586,7 +1952,11 @@ def _mla_weights_and_kv(
         if (is_sparse and geometry.indexer_types)
         else (1.0 if is_sparse else 0.0)
     )
-    n_idx_eff = n_eff * idx_scale
+    n_idx_eff = (
+        float(len(sparse.index_source_layer_ids)) * eval_context.pp_scale
+        if (is_csa2 and sparse is not None)
+        else n_eff * idx_scale
+    )
     idx_w_elems = (
         n_idx_eff * dsa_indexer_layer_weight_elems(geometry)
         if (is_sparse and n_idx_eff > 0.0)
@@ -1599,17 +1969,33 @@ def _mla_weights_and_kv(
     )
     mla_w_elems = n_eff * mla_w_layer + idx_w_elems
     mla_w_elems_strict = n_eff * mla_w_layer + idx_w_elems_strict
-    ukv_w_elems = n_eff * float(kv_lora * num_q_heads * (nope_d + v_head_dim))
-    att_ctx = (
-        min(eval_context.context, geometry.index_topk)
-        if (is_sparse and geometry.index_topk > 0 and eval_context.context > 0)
-        else eval_context.context
+    ukv_w_elems = (
+        0.0 if is_csa2 else n_eff * float(kv_lora * num_q_heads * (nope_d + v_head_dim))
     )
+    if (
+        is_csa2
+        and sparse is not None
+        and not sparse.kv_source_layer_ids
+        and geometry.sliding_window > 0
+        and eval_context.context > 0
+    ):
+        att_ctx = min(eval_context.context, geometry.sliding_window)
+    elif is_sparse and geometry.index_topk > 0 and eval_context.context > 0:
+        att_ctx = min(eval_context.context, geometry.index_topk)
+    else:
+        att_ctx = eval_context.context
     raw_latent_w = kv_lora + rope_d
     align = eval_context.chip.physical_alignment_elems
     b_latent_phys = float(math.ceil(raw_latent_w / align) * align) * dtypes.kv
     b_latent_min = float(raw_latent_w) * dtypes.kv
-    has_idx = is_sparse and geometry.index_topk > 0 and geometry.index_head_dim > 0
+    has_idx = (
+        is_sparse
+        and geometry.index_topk > 0
+        and (
+            geometry.index_head_dim > 0
+            or (is_csa2 and sparse is not None and sparse.index_record_bytes > 0.0)
+        )
+    )
     b_idx_phys = (
         float(geometry.index_head_dim) * dtypes.kv
         + (SPARSE_MLA_SCALE_BYTES if dtypes.kv <= FP8_BYTES else 0.0)
@@ -1617,7 +2003,14 @@ def _mla_weights_and_kv(
         else 0.0
     )
     b_idx_min = float(geometry.index_head_dim) * dtypes.kv if has_idx else 0.0
-    fam_kv_scale = (kv_n_fam / float(n_fam)) if geometry.compress_ratios else 1.0
+    if is_csa2 and sparse is not None and sparse.index_record_bytes > 0.0:
+        b_idx_phys = sparse.index_record_bytes if has_idx else 0.0
+        b_idx_min = b_idx_phys
+    fam_kv_scale = (
+        1.0
+        if is_csa2
+        else ((kv_n_fam / float(n_fam)) if geometry.compress_ratios else 1.0)
+    )
     kv_split_div = float(max(1, parallel.kv_split))
     cp_div = float(max(1, parallel.pcp * parallel.kv_split))
     pre_kv_tokens = (
@@ -1637,24 +2030,50 @@ def _mla_weights_and_kv(
     )
     kv_tokens = dec_kv_tokens + pre_kv_tokens
     kv_tokens_min = dec_kv_tokens_min + pre_kv_tokens
-    mla_kv_bytes = n_eff * kv_tokens * b_latent_phys
-    mla_kv_bytes_min = n_eff * kv_tokens_min * b_latent_min
-    if is_sparse and geometry.index_head_dim > 0 and n_idx_eff > 0.0:
+    n_kv_eff = (
+        float(len(sparse.kv_source_layer_ids)) * eval_context.pp_scale
+        if (is_csa2 and sparse is not None)
+        else n_eff
+    )
+    mla_kv_bytes = n_kv_eff * kv_tokens * b_latent_phys
+    mla_kv_bytes_min = n_kv_eff * kv_tokens_min * b_latent_min
+    has_csa_swa = (
+        is_csa2
+        and sparse is not None
+        and sparse.swa_bytes_per_tok > 0.0
+        and geometry.sliding_window > 0
+    )
+    if has_csa_swa and sparse is not None:
+        swa_ctx = min(eval_context.context, geometry.sliding_window)
+        swa_dec = float(eval_context.batch * swa_ctx) / kv_split_div
+        swa_pre = (
+            float(min(eval_context.cached_prefix, geometry.sliding_window)) / cp_div
+            + float(eval_context.eff_prefill) / kv_split_div
+            if eval_context.eff_prefill > 0
+            else 0.0
+        )
+        swa_extra = n_eff * (swa_dec + swa_pre) * sparse.swa_bytes_per_tok
+        mla_kv_bytes += swa_extra
+        mla_kv_bytes_min += swa_extra
+    if is_sparse and has_idx and n_idx_eff > 0.0:
+        scan_cap = sparse.candidate_scan_cap if sparse is not None else 0
+        scan_ctx = (
+            min(eval_context.context, scan_cap)
+            if scan_cap > 0 and eval_context.context > 0
+            else eval_context.context
+        )
         if eval_context.batch > 0 and eval_context.context > geometry.index_topk:
             idx_tokens = (
                 n_idx_eff
-                * float(eval_context.batch * eval_context.context)
+                * float(eval_context.batch * scan_ctx)
                 * fam_kv_scale
                 / kv_split_div
             )
-            c_shared_idx = min(
-                eval_context.context, max(0, eval_context.shared_prefix_tokens)
-            )
+            c_shared_idx = min(scan_ctx, max(0, eval_context.shared_prefix_tokens))
             idx_tokens_min = (
                 n_idx_eff
                 * float(
-                    c_shared_idx
-                    + eval_context.batch * max(0, eval_context.context - c_shared_idx)
+                    c_shared_idx + eval_context.batch * max(0, scan_ctx - c_shared_idx)
                 )
                 * fam_kv_scale
                 / kv_split_div
@@ -1693,17 +2112,26 @@ def _compute_mla_dsa_costs(
     tp = parallel.tp
     num_q_heads = max(1, geometry.num_heads // tp) if geometry.num_heads > 0 else 0
     out: list[ModuleCost] = []
+    is_csa2 = geometry.sparse_attn is not None and geometry.sparse_attn.kind == "csa2"
     plain_mla = max(0, counts.mla - counts.dsa)
     plain_eff_mla = max(0.0, counts.eff_mla - counts.eff_dsa)
     for fam_name, n_fam, kv_n_fam, is_sparse in (
-        ("mla", plain_mla, plain_eff_mla, False),
+        ("mla", plain_mla, plain_eff_mla, is_csa2 and geometry.index_topk > 0),
         ("dsa", counts.dsa, counts.eff_dsa, True),
     ):
         if n_fam <= 0:
             continue
         _validate_mla_geom(fam_name, geometry)
-        kv_lora = geometry.kv_lora_rank
-        nope_d = geometry.qk_nope_head_dim
+        kv_lora = (
+            geometry.kv_lora_rank
+            if geometry.kv_lora_rank > 0
+            else (geometry.head_dim if is_csa2 else 0)
+        )
+        nope_d = (
+            geometry.qk_nope_head_dim
+            if geometry.qk_nope_head_dim > 0
+            else geometry.head_dim
+        )
         rope_d = geometry.qk_rope_head_dim
         v_head_dim = geometry.v_head_dim or nope_d
         (
@@ -2859,6 +3287,8 @@ def _compute_ple_cost(
     eval_context: _StepContext,
 ) -> ModuleCost | None:
     """Compute ModuleCost for Per-Layer Embedding (PLE)."""
+    if any(spec.name == "ple" for spec in geometry.host_tables):
+        return None
     if "ple" not in geometry.layer_types and geometry.ple_dim <= 0:
         return None
     if geometry.ple_dim <= 0:
@@ -2931,6 +3361,81 @@ def _compute_hc_lowrank_cost(
     )
 
 
+def _compute_host_table_costs(
+    geometry: ModelGeometry,
+    parallel: Parallel,
+    dtypes: Dtypes,
+    eval_context: _StepContext,
+) -> list[ModuleCost]:
+    """Compute dense projection, HBM lookup, and chip-scoped PCIe H2D costs."""
+    if not geometry.host_tables:
+        return []
+    tp, pp = max(1, parallel.tp), max(1, parallel.pp)
+    pcie_bw = eval_context.chip.pcie_bw
+    has_pcie = pcie_bw > 0.0 and math.isfinite(pcie_bw)
+    cores_per_chip = float(max(1, eval_context.chip.cores_per_chip))
+    out: list[ModuleCost] = []
+    for idx, spec in enumerate(geometry.host_tables):
+        hbm_frac = host_table_hbm_fraction(spec, idx, eval_context.host_table_residency)
+        offload_frac, num_table_layers = 1.0 - hbm_frac, len(spec.layer_ids)
+        stage_scale = (
+            float(math.ceil(num_table_layers / pp)) / float(num_table_layers)
+            if (pp > 1 and num_table_layers > 0)
+            else (eval_context.pp_scale if pp > 1 else 1.0)
+        )
+        proj_elems = float(spec.dense_proj_params) * stage_scale / float(tp)
+        proj_bytes = role_dtype_bytes(dtypes, spec.dense_proj_dtype_role)
+        proj_dtype = (
+            dtypes.w_dense_dtype if spec.dense_proj_dtype_role == "w_dense" else ""
+        )
+        proj_flops = _route_matmul_flops(
+            eval_context.rows,
+            proj_elems,
+            proj_bytes,
+            dtypes.act,
+            chip=eval_context.chip,
+            weight_dtype=proj_dtype,
+        )
+        tp_div = float(tp) if spec.shard_axis == "tp" else 1.0
+        is_first_resident = (
+            eval_context.host_table_residency == "first"
+            and spec.resident_on_first is None
+            and idx == 0
+        )
+        lookup_scale = 1.0 if is_first_resident else stage_scale
+        hbm_bytes = (
+            proj_elems * proj_bytes
+            + hbm_frac
+            * float(eval_context.rows)
+            * (spec.h2d_bytes_per_tok / tp_div)
+            * lookup_scale
+        )
+        pcie_s = (
+            offload_frac
+            * float(eval_context.rows)
+            * cores_per_chip
+            * (spec.h2d_bytes_per_tok / tp_div)
+            * stage_scale
+            / pcie_bw
+            if (offload_frac > 0.0 and spec.h2d_bytes_per_tok > 0.0 and has_pcie)
+            else 0.0
+        )
+        out.append(
+            ModuleCost(
+                name=f"host_table_{spec.name}",
+                hbm_bytes=hbm_bytes,
+                hbm_bytes_min=hbm_bytes,
+                fp8_flops=proj_flops.fp8,
+                bf16_flops=proj_flops.bf16,
+                fp4_flops=proj_flops.fp4,
+                int8_flops=proj_flops.int8,
+                int4_flops=proj_flops.int4,
+                pcie_h2d_s=pcie_s,
+            )
+        )
+    return out
+
+
 def _compute_lm_head_cost(
     geometry: ModelGeometry,
     parallel: Parallel,
@@ -2954,12 +3459,17 @@ def _compute_lm_head_cost(
         else ()
     )
     # Pure prefill charges 1 sampled row/req; mixed steps charge decode_rows
-    # (runner discards logits for incomplete prefill chunks).
-    sampled_rows = (
-        eval_context.decode_rows
-        if eval_context.decode_rows > 0
-        else (0 if eval_context.rows == 0 else max(1, eval_context.batch))
-    )
+    # unless DraftSpec specifies single-row LM-head verification per sequence.
+    if (
+        eval_context.decode_rows > 0
+        and geometry.draft is not None
+        and geometry.draft.single_row_lm_head_verify
+    ):
+        sampled_rows = eval_context.batch
+    elif eval_context.decode_rows > 0:
+        sampled_rows = eval_context.decode_rows
+    else:
+        sampled_rows = 0 if eval_context.rows == 0 else max(1, eval_context.batch)
     # Last pipeline stage holds lm_head whole (sharded only across TP).
     lm_elems = float(geometry.vocab * geometry.hidden // tp)
     lm_buckets = _route_matmul_flops(
@@ -3009,6 +3519,172 @@ class PassCostOptions(TypedDict, total=False):
     chip: ChipSpec | None
 
 
+def _merge_opt_float(
+    val_a: float | None,
+    val_b: float | None,
+    fallback_a: float,
+    fallback_b: float,
+) -> float | None:
+    """Sum two optional lower-bound or envelope metrics when either is set."""
+    if val_a is None and val_b is None:
+        return None
+    return fallback_a + fallback_b
+
+
+def _merge_collective_counts(
+    entries_a: tuple[tuple[Collective, int], ...] | None,
+    entries_b: tuple[tuple[Collective, int], ...] | None,
+    raw_a: tuple[Collective, ...],
+    raw_b: tuple[Collective, ...],
+) -> tuple[tuple[Collective, int], ...] | None:
+    """Merge deduplicated (Collective, count) pairs in first-seen order."""
+    if entries_a is None and entries_b is None:
+        return None
+    counts: dict[Collective, int] = {}
+    seq_a = entries_a if entries_a is not None else tuple((c, 1) for c in raw_a)
+    seq_b = entries_b if entries_b is not None else tuple((c, 1) for c in raw_b)
+    for coll, cnt in (*seq_a, *seq_b):
+        counts[coll] = counts.get(coll, 0) + cnt
+    return tuple(counts.items())
+
+
+def _merge_two_module_costs(first: ModuleCost, second: ModuleCost) -> ModuleCost:
+    """Combine two same-named ModuleCost records across a split pass."""
+    strict_a = (
+        first.strict_collectives
+        if first.strict_collectives is not None
+        else first.unique_collectives
+    )
+    strict_b = (
+        second.strict_collectives
+        if second.strict_collectives is not None
+        else second.unique_collectives
+    )
+    strict_colls = (
+        None
+        if (first.strict_collectives is None and second.strict_collectives is None)
+        else _merge_collective_counts(
+            strict_a, strict_b, first.collectives, second.collectives
+        )
+    )
+    return ModuleCost(
+        name=first.name,
+        hbm_bytes=first.hbm_bytes + second.hbm_bytes,
+        fp8_flops=first.fp8_flops + second.fp8_flops,
+        bf16_flops=first.bf16_flops + second.bf16_flops,
+        collectives=first.collectives + second.collectives,
+        hbm_bytes_min=_merge_opt_float(
+            first.hbm_bytes_min,
+            second.hbm_bytes_min,
+            first.strict_hbm_bytes,
+            second.strict_hbm_bytes,
+        ),
+        unique_collectives=_merge_collective_counts(
+            first.unique_collectives,
+            second.unique_collectives,
+            first.collectives,
+            second.collectives,
+        ),
+        fp8_flops_min=_merge_opt_float(
+            first.fp8_flops_min,
+            second.fp8_flops_min,
+            first.strict_fp8_flops,
+            second.strict_fp8_flops,
+        ),
+        bf16_flops_min=_merge_opt_float(
+            first.bf16_flops_min,
+            second.bf16_flops_min,
+            first.strict_bf16_flops,
+            second.strict_bf16_flops,
+        ),
+        vector_flops=first.vector_flops + second.vector_flops,
+        strict_vector_flops=first.strict_vector_flops + second.strict_vector_flops,
+        hbm_bytes_envelope=_merge_opt_float(
+            first.hbm_bytes_envelope,
+            second.hbm_bytes_envelope,
+            first.envelope_hbm_bytes,
+            second.envelope_hbm_bytes,
+        ),
+        fp8_flops_envelope=_merge_opt_float(
+            first.fp8_flops_envelope,
+            second.fp8_flops_envelope,
+            first.envelope_fp8_flops,
+            second.envelope_fp8_flops,
+        ),
+        bf16_flops_envelope=_merge_opt_float(
+            first.bf16_flops_envelope,
+            second.bf16_flops_envelope,
+            first.envelope_bf16_flops,
+            second.envelope_bf16_flops,
+        ),
+        fp4_flops=first.fp4_flops + second.fp4_flops,
+        int8_flops=first.int8_flops + second.int8_flops,
+        int4_flops=first.int4_flops + second.int4_flops,
+        fp4_flops_min=_merge_opt_float(
+            first.fp4_flops_min,
+            second.fp4_flops_min,
+            first.strict_fp4_flops,
+            second.strict_fp4_flops,
+        ),
+        int8_flops_min=_merge_opt_float(
+            first.int8_flops_min,
+            second.int8_flops_min,
+            first.strict_int8_flops,
+            second.strict_int8_flops,
+        ),
+        int4_flops_min=_merge_opt_float(
+            first.int4_flops_min,
+            second.int4_flops_min,
+            first.strict_int4_flops,
+            second.strict_int4_flops,
+        ),
+        fp4_flops_envelope=_merge_opt_float(
+            first.fp4_flops_envelope,
+            second.fp4_flops_envelope,
+            first.envelope_fp4_flops,
+            second.envelope_fp4_flops,
+        ),
+        int8_flops_envelope=_merge_opt_float(
+            first.int8_flops_envelope,
+            second.int8_flops_envelope,
+            first.envelope_int8_flops,
+            second.envelope_int8_flops,
+        ),
+        int4_flops_envelope=_merge_opt_float(
+            first.int4_flops_envelope,
+            second.int4_flops_envelope,
+            first.envelope_int4_flops,
+            second.envelope_int4_flops,
+        ),
+        strict_collectives=strict_colls,
+        pcie_h2d_s=first.pcie_h2d_s + second.pcie_h2d_s,
+    )
+
+
+def _merge_module_costs(modules: Sequence[ModuleCost]) -> tuple[ModuleCost, ...]:
+    """Merge same-named ModuleCost records in order of first appearance."""
+    merged: dict[str, ModuleCost] = {}
+    for mod in modules:
+        existing = merged.get(mod.name)
+        merged[mod.name] = (
+            mod if existing is None else _merge_two_module_costs(existing, mod)
+        )
+    return tuple(merged.values())
+
+
+def _ced_replay_shape(geometry: ModelGeometry, shape: StepShape) -> StepShape:
+    """Cap prefill tokens to the CED sliding-window replay length."""
+    uncached = max(
+        0, round(shape.prefill_tokens * max(0.0, 1.0 - shape.prefix_hit_rate))
+    )
+    return replace(
+        shape,
+        prefill_tokens=min(uncached, geometry.sliding_window),
+        prefix_hit_rate=0.0,
+        execution="full",
+    )
+
+
 def pass_costs(
     geometry: ModelGeometry,
     parallel: Parallel,
@@ -3017,6 +3693,34 @@ def pass_costs(
     **options: Unpack[PassCostOptions],
 ) -> tuple[ModuleCost, ...]:
     """Compute per-module resource work for one decode, prefill, or mixed pass."""
+    sparse = geometry.sparse_attn
+    if (
+        shape.execution == "ced"
+        and sparse is not None
+        and shape.prefill_tokens > 0
+        and geometry.sliding_window > 0
+    ):
+        replay = _ced_replay_shape(geometry, shape)
+        if sparse.ced_post_only:
+            return pass_costs(geometry, parallel, replay, dtypes, **options)
+        if 0 < sparse.ced_boundary < geometry.num_layers:
+            pre_g = slice_geometry_layers(geometry, 0, sparse.ced_boundary)
+            post_g = slice_geometry_layers(
+                geometry, sparse.ced_boundary, geometry.num_layers
+            )
+            pre_m = tuple(
+                m
+                for m in pass_costs(
+                    pre_g, parallel, replace(shape, execution="full"), dtypes, **options
+                )
+                if m.name != "lm_head"
+            )
+            post_m = tuple(
+                m
+                for m in pass_costs(post_g, parallel, replay, dtypes, **options)
+                if m.name != "embed"
+            )
+            return _merge_module_costs((*pre_m, *post_m))
     mxu_m_tile = options.get("mxu_m_tile", 1)
     chip = options.get("chip")
     eff_chip = chip if chip is not None else CHIPS["tpu7x"]
@@ -3093,6 +3797,8 @@ def pass_costs(
         activation_model=activation_model,
         unpadded_linear=unpadded_linear,
         chip=eff_chip,
+        execution=shape.execution,
+        host_table_residency=shape.host_table_residency,
     )
 
     counts = count_layer_types(geometry)
@@ -3151,6 +3857,7 @@ def pass_costs(
     hc_cost = _compute_hc_lowrank_cost(geometry, eff_parallel, dtypes, eval_context)
     if hc_cost is not None:
         out.append(hc_cost)
+    out.extend(_compute_host_table_costs(geometry, eff_parallel, dtypes, eval_context))
 
     out.append(_compute_lm_head_cost(geometry, eff_parallel, dtypes, eval_context))
 

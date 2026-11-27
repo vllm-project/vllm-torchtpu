@@ -48,6 +48,7 @@ from .constants import (
     UNKNOWN_THINK_TIME_WARNING,
 )
 from .crossover import prune_sweep_candidates, sweep_prefix_hit_crossovers
+from .geometry import draft_layer_geometry
 from .memory import (
     HbmBreakdown,
     KvFitInput,
@@ -57,7 +58,13 @@ from .memory import (
     kv_bytes_per_core_parts,
     kv_capacity_and_hit_rate,
 )
-from .modules import Dtypes, Parallel, StepShape
+from .modules import (
+    Dtypes,
+    Parallel,
+    StepShape,
+    draft_kv_dtypes,
+    draft_parallel_for_geometry,
+)
 from .occupancy import ExpertActivationModel
 from .partition import (
     PpStageOptions,
@@ -94,7 +101,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from .constants import SloVerdict
-    from .geometry import ModelGeometry
+    from .geometry import HostTableResidency, ModelGeometry
 
 EXAMPLE_SCENARIOS: dict[str, TrafficScenario] = {
     "chat-8k1k": TrafficScenario(
@@ -223,6 +230,15 @@ def build_example_scenario(
             if overrides_val.kv_offload_gb is None
             else overrides_val.kv_offload_gb
         ),
+        execution=base.execution
+        if overrides_val.execution is None
+        else overrides_val.execution,
+        host_table_residency=base.host_table_residency
+        if overrides_val.host_table_residency is None
+        else overrides_val.host_table_residency,
+        prefill_draft=base.prefill_draft
+        if overrides_val.prefill_draft is None
+        else overrides_val.prefill_draft,
     )
 
 
@@ -245,6 +261,7 @@ class SolveOptions:
     activation_model: ExpertActivationModel = field(
         default_factory=ExpertActivationModel
     )
+    draft_config_source: str | None = None
 
     def __post_init__(self) -> None:
         """Validate non-negative physical constraint overrides."""
@@ -324,9 +341,12 @@ def _kv_splits_for_tp(geometry: ModelGeometry, tp: int) -> tuple[int, ...]:
     has_kv = geometry.num_kv_heads > 0 or geometry.kv_lora_rank > 0
     if not has_kv:
         return (1,)
+    is_tp_dcp = (
+        geometry.sparse_attn is not None and geometry.sparse_attn.dcp_span == "tp"
+    )
     kv_group = (
         max(1, tp // geometry.num_kv_heads)
-        if geometry.num_kv_heads > 0 and geometry.kv_lora_rank == 0
+        if geometry.num_kv_heads > 0 and geometry.kv_lora_rank == 0 and not is_tp_dcp
         else tp
     )
     return _divisors(kv_group) if kv_group > 1 else (1,)
@@ -657,6 +677,16 @@ def _count_disagg_ratio_slots(
 _SOLVER_CACHE_MAXSIZE: Final[int] = 8192
 
 
+def _scen_kv(scenario: TrafficScenario, seqs: int, ctx: int) -> SeqKvLayout:
+    """Build SeqKvLayout carrying scenario host-table residency and KV offload."""
+    return SeqKvLayout(
+        seqs,
+        ctx,
+        host_table_residency=scenario.host_table_residency,
+        kv_offload_enabled=scenario.kv_offload_gb > 0.0,
+    )
+
+
 @lru_cache(maxsize=_SOLVER_CACHE_MAXSIZE)
 def _hbm_linear_terms(
     geometry: ModelGeometry,
@@ -664,13 +694,28 @@ def _hbm_linear_terms(
     parallel: Parallel,
     ctx_full: int,
     chip: ChipSpec,
+    *,
+    host_table_residency: HostTableResidency = "auto",
+    kv_offload_enabled: bool = False,
 ) -> tuple[float, float, float]:
     """Return (weight_bytes, kv_bytes_per_seq, state_bytes_per_seq) on one core."""
+    layout_zero = SeqKvLayout(
+        0,
+        0,
+        host_table_residency=host_table_residency,
+        kv_offload_enabled=kv_offload_enabled,
+    )
+    layout_one = SeqKvLayout(
+        1,
+        ctx_full,
+        host_table_residency=host_table_residency,
+        kv_offload_enabled=kv_offload_enabled,
+    )
     bd0 = hbm_breakdown_per_core_bytes(
-        geometry, dtypes, parallel, SeqKvLayout(0, 0), chip=chip
+        geometry, dtypes, parallel, layout_zero, chip=chip
     )
     bd1 = hbm_breakdown_per_core_bytes(
-        geometry, dtypes, parallel, SeqKvLayout(1, ctx_full), chip=chip
+        geometry, dtypes, parallel, layout_one, chip=chip
     )
     return (bd0.weights, bd1.kv, bd1.state)
 
@@ -1188,6 +1233,20 @@ def _resolve_spec_k(
     return resolve_spec_k(geometry, scenario, spec_k)
 
 
+def _swa_shared_priv_kv(
+    swa_win: int,
+    swa_per_tok: float,
+    shared_toks: float,
+    avg_priv_toks: float,
+) -> tuple[float, float]:
+    """Split fixed sliding-window KV bytes per sequence into shared and private."""
+    if swa_win <= 0 or swa_per_tok <= 0.0:
+        return 0.0, 0.0
+    priv_swa = min(avg_priv_toks, float(swa_win))
+    shared_swa = max(0.0, min(shared_toks, float(swa_win) - priv_swa))
+    return shared_swa * swa_per_tok, priv_swa * swa_per_tok
+
+
 def _steady_state_batch_cap_phys(
     eval_context: _SolveContext,
     parallel: Parallel,
@@ -1197,11 +1256,12 @@ def _steady_state_batch_cap_phys(
     dtypes = eval_context.dtypes
     chip = eval_context.chip
     scenario = eval_context.scenario
+    kv_offload = scenario.kv_offload_gb > 0.0
     w_base_phys = hbm_breakdown_per_core_bytes(
-        geometry, dtypes, parallel, SeqKvLayout(0, 0), chip=chip
+        geometry, dtypes, parallel, _scen_kv(scenario, 0, 0), chip=chip
     ).weights
     state_phys = hbm_breakdown_per_core_bytes(
-        geometry, dtypes, parallel, SeqKvLayout(1, 0), chip=chip
+        geometry, dtypes, parallel, _scen_kv(scenario, 1, 0), chip=chip
     ).state
     h_rate = scenario.prefix_hit_rate
     shared_toks = h_rate * float(scenario.isl)
@@ -1209,20 +1269,50 @@ def _steady_state_batch_cap_phys(
         float(_decode_tokens(scenario.osl)) / 2.0
     )
     full_kv_per_tok, _ = kv_bytes_per_core_parts(
-        geometry, dtypes, parallel, 0, physical=False, chip=chip
+        geometry,
+        dtypes,
+        parallel,
+        0,
+        physical=False,
+        chip=chip,
+        kv_offload_enabled=kv_offload,
     )
+    shared_kv = shared_toks * full_kv_per_tok
+    avg_priv_kv = avg_priv_toks * full_kv_per_tok
+    draft = geometry.draft
     if geometry.sliding_window > 0:
-        _, swa_per_tok = kv_bytes_per_core_parts(
-            geometry, dtypes, parallel, 1, physical=False, chip=chip
+        target_geom = replace(geometry, draft=None) if draft is not None else geometry
+        _, target_swa_per_tok = kv_bytes_per_core_parts(
+            target_geom,
+            dtypes,
+            parallel,
+            1,
+            physical=False,
+            chip=chip,
+            kv_offload_enabled=kv_offload,
         )
-        swa_win = float(geometry.sliding_window)
-        priv_swa = min(avg_priv_toks, swa_win)
-        shared_swa = max(0.0, min(shared_toks, swa_win - priv_swa))
-        shared_kv = shared_toks * full_kv_per_tok + shared_swa * swa_per_tok
-        avg_priv_kv = avg_priv_toks * full_kv_per_tok + priv_swa * swa_per_tok
-    else:
-        shared_kv = shared_toks * full_kv_per_tok
-        avg_priv_kv = avg_priv_toks * full_kv_per_tok
+        t_sh, t_pr = _swa_shared_priv_kv(
+            target_geom.sliding_window, target_swa_per_tok, shared_toks, avg_priv_toks
+        )
+        shared_kv += t_sh
+        avg_priv_kv += t_pr
+    if draft is not None and not (draft.skip_draft_kv_on_offload and kv_offload):
+        draft_geom = draft_layer_geometry(geometry)
+        if draft_geom.sliding_window > 0:
+            _, draft_swa_per_tok = kv_bytes_per_core_parts(
+                draft_geom,
+                draft_kv_dtypes(geometry, dtypes),
+                draft_parallel_for_geometry(draft_geom, parallel),
+                1,
+                physical=False,
+                chip=chip,
+                kv_offload_enabled=kv_offload,
+            )
+            d_sh, d_pr = _swa_shared_priv_kv(
+                draft_geom.sliding_window, draft_swa_per_tok, shared_toks, avg_priv_toks
+            )
+            shared_kv += d_sh
+            avg_priv_kv += d_pr
     avail = eval_context.hbm_limit_b - w_base_phys - shared_kv
     if avail < 0.0:
         return 0
@@ -1249,6 +1339,8 @@ def _eval_bound_decode_floor(bound_in: _BoundDecodeInput, batch: int) -> StepFlo
                 context=bound_in.ctx_mid,
                 spec_k=bound_in.spec_k,
                 shared_prefix_tokens=bound_in.shared_prefix_tokens,
+                execution=bound_in.scenario.execution,
+                host_table_residency=bound_in.scenario.host_table_residency,
             ),
             opts,
         )
@@ -1260,6 +1352,8 @@ def _eval_bound_decode_floor(bound_in: _BoundDecodeInput, batch: int) -> StepFlo
             batch=batch,
             context=bound_in.ctx_mid,
             shared_prefix_tokens=bound_in.shared_prefix_tokens,
+            execution=bound_in.scenario.execution,
+            host_table_residency=bound_in.scenario.host_table_residency,
         ),
         opts,
     )
@@ -1294,6 +1388,8 @@ def _eval_pp_bound_decode_cycle(
                     batch=floor_mb,
                     context=bound_in.ctx_mid,
                     shared_prefix_tokens=bound_in.shared_prefix_tokens,
+                    execution=bound_in.scenario.execution,
+                    host_table_residency=bound_in.scenario.host_table_residency,
                 ),
                 opts,
             ),
@@ -1309,6 +1405,8 @@ def _eval_pp_bound_decode_cycle(
                     batch=eff_batch,
                     context=bound_in.ctx_mid,
                     shared_prefix_tokens=bound_in.shared_prefix_tokens,
+                    execution=bound_in.scenario.execution,
+                    host_table_residency=bound_in.scenario.host_table_residency,
                 ),
                 opts,
             ),
@@ -1436,6 +1534,9 @@ def _eval_bound_prefill_floor(
         state_writes=0,
         prefill_tokens=scenario.isl,
         prefix_hit_rate=scenario.prefix_hit_rate,
+        execution=scenario.execution,
+        host_table_residency=scenario.host_table_residency,
+        prefill_draft=scenario.prefill_draft,
     )
     floor_opts = FloorOptions(
         dtypes=dtypes,
@@ -1507,6 +1608,9 @@ def _eval_unpadded_prefill_buckets(
             context=0,
             prefill_tokens=scenario.isl,
             prefix_hit_rate=eff_hit_rate,
+            execution=scenario.execution,
+            host_table_residency=scenario.host_table_residency,
+            prefill_draft=scenario.prefill_draft,
         ),
         UnpaddedFloorOptions(
             dtypes=bound_in.dtypes,
@@ -1538,6 +1642,8 @@ def _eval_unpadded_decode_buckets(
                 context=bound_in.ctx_mid,
                 state_writes=1,
                 shared_prefix_tokens=bound_in.shared_prefix_tokens,
+                execution=bound_in.scenario.execution,
+                host_table_residency=bound_in.scenario.host_table_residency,
             ),
             UnpaddedFloorOptions(
                 dtypes=bound_in.dtypes,
@@ -1564,6 +1670,8 @@ def _eval_unpadded_decode_buckets(
             context=bound_in.ctx_mid,
             state_writes=1,
             shared_prefix_tokens=bound_in.shared_prefix_tokens,
+            execution=bound_in.scenario.execution,
+            host_table_residency=bound_in.scenario.host_table_residency,
         ),
         opts,
     )
@@ -1579,6 +1687,8 @@ def _eval_unpadded_decode_buckets(
             context=bound_in.ctx_mid,
             state_writes=1,
             shared_prefix_tokens=bound_in.shared_prefix_tokens,
+            execution=bound_in.scenario.execution,
+            host_table_residency=bound_in.scenario.host_table_residency,
         ),
         opts,
     )
@@ -2043,6 +2153,8 @@ def _eval_decode_floor(
                 context=eval_context.ctx_mid,
                 spec_k=eval_context.spec_k,
                 shared_prefix_tokens=shared_tok,
+                execution=eval_context.scenario.execution,
+                host_table_residency=eval_context.scenario.host_table_residency,
             ),
             opts,
         )
@@ -2055,6 +2167,8 @@ def _eval_decode_floor(
                 batch=batch,
                 context=eval_context.ctx_mid,
                 shared_prefix_tokens=shared_tok,
+                execution=eval_context.scenario.execution,
+                host_table_residency=eval_context.scenario.host_table_residency,
             ),
             opts,
         )
@@ -2234,6 +2348,9 @@ def _prefill_step_floor(
         state_writes=0,
         prefill_tokens=eval_context.scenario.isl,
         prefix_hit_rate=prefix_hit_rate,
+        execution=eval_context.scenario.execution,
+        host_table_residency=eval_context.scenario.host_table_residency,
+        prefill_draft=eval_context.scenario.prefill_draft,
     )
     floor_opts = FloorOptions(
         dtypes=eval_context.dtypes,
@@ -2270,6 +2387,8 @@ def _clamp_resident_batch(
         parallel,
         eval_context.ctx_full,
         eval_context.chip,
+        host_table_residency=eval_context.scenario.host_table_residency,
+        kv_offload_enabled=eval_context.scenario.kv_offload_gb > 0.0,
     )
     per_seq = kv_per_seq + state_per_seq
     limit = eval_context.hbm_limit_b
@@ -2314,6 +2433,9 @@ def _prefill_stage_step_floor(
         state_writes=0,
         prefill_tokens=eval_context.scenario.isl,
         prefix_hit_rate=hit_rate,
+        execution=eval_context.scenario.execution,
+        host_table_residency=eval_context.scenario.host_table_residency,
+        prefill_draft=eval_context.scenario.prefill_draft,
     )
     opts = FloorOptions(
         dtypes=eval_context.dtypes,
@@ -2333,22 +2455,27 @@ def _resolve_prefill_pp_breakdown(
     parallel: Parallel,
 ) -> tuple[HbmBreakdown, tuple[int, ...] | None, tuple[int, ...] | None] | None:
     """Resolve physics prefill stage HBM breakdown and contiguous PP partition."""
+    sc = eval_context.scenario
     if parallel.pp <= 1:
         hbm_bd = hbm_breakdown_per_core_bytes(
             eval_context.geometry,
             eval_context.dtypes,
             parallel,
-            SeqKvLayout(1, eval_context.scenario.isl),
+            _scen_kv(sc, 1, sc.isl),
             chip=eval_context.chip,
         )
         return (hbm_bd, None, None)
     even_cap = max(1, math.ceil(eval_context.geometry.num_layers / parallel.pp))
+    pp_opts = PpStageOptions(
+        host_table_residency=sc.host_table_residency,
+        kv_offload_enabled=sc.kv_offload_gb > 0.0,
+    )
     pp_part, hbm_bd, _last_b, pp_feas = pp_stage_breakdowns(
         eval_context.geometry,
         eval_context.dtypes,
         parallel,
-        (eval_context.scenario.isl, 1),
-        options=PpStageOptions(max_stage_layers=even_cap),
+        (sc.isl, 1),
+        options=replace(pp_opts, max_stage_layers=even_cap),
         chip=eval_context.chip,
     )
     if not pp_feas or hbm_bd.total > eval_context.hbm_limit_b:
@@ -2356,8 +2483,8 @@ def _resolve_prefill_pp_breakdown(
             eval_context.geometry,
             eval_context.dtypes,
             parallel,
-            (eval_context.scenario.isl, 1),
-            options=PpStageOptions(),
+            (sc.isl, 1),
+            options=pp_opts,
             chip=eval_context.chip,
         )
     if not pp_feas or not pp_part:
@@ -2392,6 +2519,7 @@ def _build_prefill_option(
         _RATE_FLOOR_EPS, prefill_floor.serial_estimate_s
     )
     pref_w_base_b = hbm_bd.total - hbm_bd.kv - hbm_bd.state
+    kv_offload = eval_context.scenario.kv_offload_gb > 0.0
     if parallel.pp > 1 and pp_part:
         pref_kv_per_tok, pref_fixed_kv_b = pp_stage_kv_parts(
             eval_context.geometry,
@@ -2399,6 +2527,7 @@ def _build_prefill_option(
             parallel,
             (pp_part, eval_context.scenario.isl),
             chip=eval_context.chip,
+            kv_offload_enabled=kv_offload,
         )
     else:
         pref_kv_per_tok, pref_fixed_kv_b = kv_bytes_per_core_parts(
@@ -2407,6 +2536,7 @@ def _build_prefill_option(
             parallel,
             eval_context.scenario.isl,
             chip=eval_context.chip,
+            kv_offload_enabled=kv_offload,
         )
     pref_offload_b = _offload_bytes_per_core(
         eval_context.scenario.kv_offload_gb, topology.num_cores
@@ -2568,6 +2698,8 @@ def _eval_mixed_step_floors(
                 context=eval_context.ctx_mid,
                 state_writes=1,
                 shared_prefix_tokens=shared_tok,
+                execution=eval_context.scenario.execution,
+                host_table_residency=eval_context.scenario.host_table_residency,
             ),
             resident_batch,
         )
@@ -2586,6 +2718,8 @@ def _eval_mixed_step_floors(
             prefill_tokens=mix_pre_total,
             prefix_hit_rate=mix_hit_rate,
             shared_prefix_tokens=shared_tok,
+            execution=eval_context.scenario.execution,
+            host_table_residency=eval_context.scenario.host_table_residency,
         ),
         resident_batch,
     )
@@ -2624,6 +2758,9 @@ def _eval_pure_chunk_step_floor(
             state_writes=0,
             prefill_tokens=round(mix_span),
             prefix_hit_rate=avg_prior / mix_span if mix_span > 0.0 else 0.0,
+            execution=eval_context.scenario.execution,
+            host_table_residency=eval_context.scenario.host_table_residency,
+            prefill_draft=eval_context.scenario.prefill_draft,
         ),
     )
 
@@ -3033,18 +3170,19 @@ def _decode_capacity_profile(
     parallel: Parallel,
 ) -> tuple[float, int, float, float, float]:
     """Compute base weights, HBM batch limit, and logical KV byte components."""
+    kv_offload = eval_context.scenario.kv_offload_gb > 0.0
     w_base_b = hbm_footprint_per_core_bytes(
         eval_context.geometry,
         eval_context.dtypes,
         parallel,
-        SeqKvLayout(0, 0),
+        _scen_kv(eval_context.scenario, 0, 0),
         chip=eval_context.chip,
     )
     hbm_c1 = hbm_footprint_per_core_bytes(
         eval_context.geometry,
         eval_context.dtypes,
         parallel,
-        SeqKvLayout(1, eval_context.ctx_full),
+        _scen_kv(eval_context.scenario, 1, eval_context.ctx_full),
         chip=eval_context.chip,
     )
     per_seq_b = hbm_c1 - w_base_b
@@ -3060,6 +3198,7 @@ def _decode_capacity_profile(
         eval_context.ctx_full,
         physical=False,
         chip=eval_context.chip,
+        kv_offload_enabled=kv_offload,
     )
     return w_base_b, b_hbm_max, kv_bytes_core, fixed_kv_per_seq_b, hbm_c1
 
@@ -4729,6 +4868,7 @@ def solve_serving_plan(
             if point.slo_verdict == SLO_VERDICT_RULED_OUT
         ),
         sweep_candidates=pruned_sweep,
+        draft_config_source=eff_opts.draft_config_source,
     )
     sweep_topos = (
         eff_opts.topologies

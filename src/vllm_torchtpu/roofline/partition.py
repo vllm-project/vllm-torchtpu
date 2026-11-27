@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Final, Literal, TypedDict, Unpack
 
 from .collectives import CollectiveConfig, make
 from .constants import ACTIVATION_BYTES_BF16
-from .geometry import layer_ffn_kinds
+from .geometry import HostTableResidency, layer_ffn_kinds, slice_geometry_layers
 from .memory import (
     HbmBreakdown,
     SeqKvLayout,
@@ -37,6 +37,7 @@ from .step import (
     StepFloor,
     StepShape,
     combine_modules,
+    prefill_draft_modules,
     step_floor,
 )
 
@@ -97,6 +98,8 @@ class PpStageOptions:
 
     max_stage_layers: int | None = None
     logit_peak_b: float = 0.0
+    host_table_residency: HostTableResidency = "auto"
+    kv_offload_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,44 +138,7 @@ def stage_slice_geometry(
     end: int,
 ) -> ModelGeometry:
     """Build a contiguous stage sub-geometry covering layers ``[start, end)``."""
-    cnt = max(0, end - start)
-    layer_types = geometry.layer_types[start:end] if geometry.layer_types else ()
-    cr_slice = (
-        geometry.compress_ratios[start:end]
-        if len(geometry.compress_ratios) >= end
-        else ()
-    )
-    ffn_all = layer_ffn_kinds(geometry)
-    ffn_slice = ffn_all[start:end] if len(ffn_all) >= end else ("dense",) * cnt
-    n_moe = sum(1 for kind in ffn_slice if kind == "moe")
-    n_dense = sum(1 for kind in ffn_slice if kind == "dense")
-    idx_slice = (
-        geometry.indexer_types[start:end] if len(geometry.indexer_types) >= end else ()
-    )
-    if geometry.ple_layer_ids:
-        rebased_ple = tuple(
-            layer_id - start
-            for layer_id in geometry.ple_layer_ids
-            if start <= layer_id < end
-        )
-        stage_ple_dim = geometry.ple_dim if (rebased_ple or "ple" in layer_types) else 0
-    else:
-        rebased_ple = ()
-        stage_ple_dim = geometry.ple_dim
-    return replace(
-        geometry,
-        num_layers=cnt,
-        layer_types=layer_types,
-        compress_ratios=cr_slice,
-        indexer_types=idx_slice,
-        ffn_kinds=ffn_slice,
-        n_moe_layers=n_moe,
-        n_dense_layers=n_dense,
-        first_k_dense_replace=0 if n_moe > 0 else n_dense,
-        mtp_layers=0,
-        ple_layer_ids=rebased_ple,
-        ple_dim=stage_ple_dim,
-    )
+    return slice_geometry_layers(geometry, start, end)
 
 
 def _layer_has_ple(
@@ -186,6 +152,29 @@ def _layer_has_ple(
     if not ple_set:
         return True
     return layer_idx in ple_set
+
+
+def _layer_extra_key(
+    geometry: ModelGeometry,
+    layer_idx: int,
+) -> tuple[bool, bool, bool, tuple[tuple[bool, bool], ...], bool]:
+    """Return per-layer sparse, CED, host-table, and draft membership signature."""
+    sparse = geometry.sparse_attn
+    if sparse is not None:
+        is_kv_src = layer_idx in sparse.kv_source_layer_ids
+        is_idx_src = layer_idx in sparse.index_source_layer_ids
+        is_ced_post = sparse.ced_post_only or (0 < sparse.ced_boundary <= layer_idx)
+    else:
+        is_kv_src, is_idx_src, is_ced_post = False, False, False
+    tbl_mask = tuple(
+        (
+            (not spec.layer_ids) or (layer_idx in spec.layer_ids),
+            bool(spec.layer_ids) and layer_idx == spec.layer_ids[0],
+        )
+        for spec in geometry.host_tables
+    )
+    is_last_draft = geometry.draft is not None and layer_idx == geometry.num_layers - 1
+    return (is_kv_src, is_idx_src, is_ced_post, tbl_mask, is_last_draft)
 
 
 @lru_cache(maxsize=_PP_PREFIX_CACHE_MAXSIZE)
@@ -203,7 +192,7 @@ def _pp_layer_prefixes(
     emb_single, lm_single = _compute_w_head(geometry, dtypes, tp)
     w_head_single = emb_single + lm_single
     last_stage_lm = emb_single if geometry.tie_word_embeddings else lm_single
-    if geometry.mtp_layers > 0:
+    if geometry.mtp_layers > 0 and geometry.draft is None:
         bd_with_mtp = hbm_breakdown_per_core_bytes(
             geometry, dtypes, par1, SeqKvLayout(0, 0), chip=chip
         )
@@ -216,9 +205,7 @@ def _pp_layer_prefixes(
 
     ffn_all = layer_ffn_kinds(geometry)
     ple_set = frozenset(geometry.ple_layer_ids)
-    layer_cache: dict[
-        tuple[str, str, float | None, str | None, bool], tuple[float, float, float]
-    ] = {}
+    layer_cache: dict[tuple[object, ...], tuple[float, float, float]] = {}
     pref_w = [0.0] * (num_layers + 1)
     pref_kv = [0.0] * (num_layers + 1)
     pref_st = [0.0] * (num_layers + 1)
@@ -238,7 +225,14 @@ def _pp_layer_prefixes(
             geometry.indexer_types[idx] if idx < len(geometry.indexer_types) else None
         )
         has_ple = _layer_has_ple(geometry, ple_set, idx)
-        lkey = (tok, ffn_kind, cr_val, idx_val, has_ple)
+        lkey: tuple[object, ...] = (
+            tok,
+            ffn_kind,
+            cr_val,
+            idx_val,
+            has_ple,
+            _layer_extra_key(geometry, idx),
+        )
         entry = layer_cache.get(lkey)
         if entry is None:
             g_i = stage_slice_geometry(geometry, idx, idx + 1)
@@ -411,7 +405,12 @@ def pp_stage_breakdowns(
     chip = kwargs.get("chip")
     pp = max(1, parallel.pp)
     num_layers = geometry.num_layers
-    layout = SeqKvLayout(seqs_per_dp=seqs_per_dp, context=context)
+    layout = SeqKvLayout(
+        seqs_per_dp=seqs_per_dp,
+        context=context,
+        host_table_residency=opts.host_table_residency,
+        kv_offload_enabled=opts.kv_offload_enabled,
+    )
     if pp <= 1 or num_layers <= 0:
         breakdown = hbm_breakdown_per_core_bytes(
             geometry, dtypes, parallel, layout, chip=chip
@@ -470,6 +469,7 @@ def pp_stage_kv_parts(
     stage_workload: tuple[tuple[int, ...], int],
     *,
     chip: ChipSpec | None = None,
+    kv_offload_enabled: bool = False,
 ) -> tuple[float, float]:
     """Return max-KV-stage (linear_kv_per_token_bytes, fixed_window_kv_bytes)."""
     pp_part, ctx_tokens = stage_workload
@@ -482,7 +482,12 @@ def pp_stage_kv_parts(
         nxt = pos + cnt
         g_stage = stage_slice_geometry(geometry, pos, nxt)
         lin_b, fix_b = kv_bytes_per_core_parts(
-            g_stage, dtypes, par1, ctx_tokens, chip=chip
+            g_stage,
+            dtypes,
+            par1,
+            ctx_tokens,
+            chip=chip,
+            kv_offload_enabled=kv_offload_enabled,
         )
         stage_tot = lin_b * ctx_scale + fix_b
         if stage_tot > best_total:
@@ -499,9 +504,9 @@ def _stage_layer_signature(
     pos: int,
     nxt: int,
 ) -> tuple[object, ...]:
-    """Build order-independent per-layer 5-tuple multiset key for stage caching."""
+    """Build order-independent per-layer multiset key for stage caching."""
     cnt = nxt - pos
-    per_layer: list[tuple[str, str, tuple[bool, float], tuple[bool, str], bool]] = []
+    per_layer: list[tuple[object, ...]] = []
     for idx in range(pos, nxt):
         lt_val = (
             geometry.layer_types[idx]
@@ -525,6 +530,7 @@ def _stage_layer_signature(
                 (cr_raw is not None, cr_raw if cr_raw is not None else 0.0),
                 (idx_raw is not None, idx_raw if idx_raw is not None else ""),
                 has_ple,
+                _layer_extra_key(geometry, idx),
             )
         )
     return (cnt, tuple(sorted(Counter(per_layer).items())))
@@ -581,6 +587,7 @@ def _merge_stage_floors(
             serial_estimate_s=sum(
                 floor_result.serial_estimate_s for floor_result in stage_floors
             ),
+            pcie_s=sum(floor_result.pcie_s for floor_result in stage_floors),
         )
     return replace(
         peak,
@@ -608,6 +615,7 @@ def _merge_stage_floors(
         serial_estimate_s=max(
             floor_result.serial_estimate_s for floor_result in stage_floors
         ),
+        pcie_s=max(floor_result.pcie_s for floor_result in stage_floors),
     )
 
 
@@ -672,7 +680,11 @@ def scale_pp_stage_floor(
                 if (module.name != "embed" or is_first)
                 and (module.name != "lm_head" or is_last)
             ]
-            if not is_last:
+            if is_last:
+                filtered.extend(
+                    prefill_draft_modules(geometry, chip, parallel, shape, options)
+                )
+            else:
                 filtered.extend(handoff_mods)
             stage_sf = combine_modules(
                 tuple(filtered),

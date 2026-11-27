@@ -16,8 +16,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
+from typing import Literal
 
 from .constants import (
     BLOCK_PARALLEL_ENABLED,
@@ -35,16 +36,26 @@ from .constants import (
 )
 
 __all__ = [
+    "DraftSpec",
+    "ExecutionMode",
+    "HostTableResidency",
+    "HostTableSpec",
     "KeyTracker",
     "LayerCounts",
     "ModelGeometry",
     "ModelIdentity",
+    "SparseAttnSpec",
     "UnsupportedArchitectureError",
     "count_layer_types",
+    "draft_layer_geometry",
     "from_hf_config",
+    "host_table_hbm_fraction",
     "resolve_model_identity",
     "supports",
 ]
+
+type HostTableResidency = Literal["auto", "hbm", "host", "first"]
+type ExecutionMode = Literal["full", "ced"]
 
 
 class KeyTracker(Mapping[str, object]):
@@ -225,6 +236,140 @@ class LayerCounts:
         return self.gqa + self.swa + self.mla
 
 
+def _require_non_negative(label: str, *values: float) -> None:
+    """Validate that every physical dimension or byte width is non-negative."""
+    if min(values) < 0.0:
+        msg = f"{label} numeric fields must be >= 0"
+        raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class SparseAttnSpec:
+    """Pure-physics specification for sparse attention (CSA2, MSA, or QSA)."""
+
+    kind: Literal["csa2", "msa", "qsa"]
+    kv_source_layer_ids: tuple[int, ...] = ()
+    index_source_layer_ids: tuple[int, ...] = ()
+    candidate_scan_cap: int = 0
+    index_record_bytes: float = 0.0
+    compressed_key_bytes_per_tok: float = 0.0
+    index_cache_sharded: bool = False
+    sparse_block_size: int = 0
+    sparse_topk_blocks: int = 0
+    sparse_local_block: int = 0
+    dcp_span: str = "kv_head_group"
+    ced_boundary: int = 0
+    swa_bytes_per_tok: float = 0.0
+    o_lora_rank: int = 0
+    o_groups: int = 1
+    fixed_state_page_bytes: float = 0.0
+    ced_post_only: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate non-negative sparse attention dimensions and group count."""
+        if self.o_groups < 1:
+            msg = f"SparseAttnSpec.o_groups must be >= 1, got {self.o_groups}"
+            raise ValueError(msg)
+        _require_non_negative(
+            "SparseAttnSpec",
+            self.candidate_scan_cap,
+            self.index_record_bytes,
+            self.compressed_key_bytes_per_tok,
+            self.sparse_block_size,
+            self.sparse_topk_blocks,
+            self.sparse_local_block,
+            self.ced_boundary,
+            self.swa_bytes_per_tok,
+            self.o_lora_rank,
+            self.fixed_state_page_bytes,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class HostTableSpec:
+    """Pure-physics specification for a large host- or HBM-resident lookup table."""
+
+    name: str
+    layer_ids: tuple[int, ...]
+    elem_count: int
+    scale_ratio: float = 0.0
+    table_dtype_role: Literal["w_expert", "w_dense", "w_aux"] = "w_expert"
+    dense_proj_dtype_role: Literal["w_dense", "w_aux"] = "w_dense"
+    default_hbm_resident: bool = False
+    shard_axis: Literal["tp", "dp_local"] = "tp"
+    h2d_bytes_per_tok: float = 0.0
+    state_bytes_per_req: float = 0.0
+    dense_proj_params: int = 0
+    resident_on_first: bool | None = None
+
+    def __post_init__(self) -> None:
+        """Validate non-negative sizes and 0-indexed layer IDs."""
+        if any(layer_id < 0 for layer_id in self.layer_ids):
+            msg = f"HostTableSpec.layer_ids must be 0-indexed, got {self.layer_ids}"
+            raise ValueError(msg)
+        _require_non_negative(
+            "HostTableSpec",
+            self.elem_count,
+            self.scale_ratio,
+            self.h2d_bytes_per_tok,
+            self.state_bytes_per_req,
+            self.dense_proj_params,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DraftSpec:
+    """Pure-physics specification for an MTP or parallel block drafter."""
+
+    kind: Literal["mtp", "dspark"]
+    num_layers: int
+    layer_kind: str
+    num_experts: int = 0
+    top_k: int = 0
+    moe_inter: int = 0
+    shared_inter: int = 0
+    dense_inter: int = 0
+    sliding_window: int = 0
+    block_size: int = 1
+    fc_in_mult: int = 1
+    fc_replicated: bool = False
+    markov_rank: int = 0
+    draft_kv_dtype: str = ""
+    skip_draft_kv_on_offload: bool = False
+    single_row_lm_head_verify: bool = False
+
+    def __post_init__(self) -> None:
+        """Validate non-negative draft layer counts and block size."""
+        if self.block_size < 1:
+            msg = f"DraftSpec.block_size must be >= 1, got {self.block_size}"
+            raise ValueError(msg)
+        _require_non_negative(
+            "DraftSpec",
+            self.num_layers,
+            self.num_experts,
+            self.top_k,
+            self.moe_inter,
+            self.shared_inter,
+            self.dense_inter,
+            self.sliding_window,
+            self.fc_in_mult,
+            self.markov_rank,
+        )
+
+
+def host_table_hbm_fraction(
+    spec: HostTableSpec, spec_index: int, residency: HostTableResidency
+) -> float:
+    """Return fraction of ``spec`` resident in HBM under ``residency``."""
+    if residency in ("hbm", "host"):
+        return 1.0 if residency == "hbm" else 0.0
+    if residency == "auto":
+        return 1.0 if spec.default_hbm_resident else 0.0
+    if spec.resident_on_first is not None:
+        return 1.0 if spec.resident_on_first else 0.0
+    return 0.0 if spec_index > 0 else 1.0 / float(max(1, len(spec.layer_ids)))
+
+
 @dataclass(frozen=True, slots=True)
 class ModelGeometry:
     """Architecture dimensions shared across attention, recurrence, and FFN families."""
@@ -278,11 +423,179 @@ class ModelGeometry:
     hc_lowrank: int = 0
     ple_layer_ids: tuple[int, ...] = ()
     max_position_embeddings: int = 0
+    sparse_attn: SparseAttnSpec | None = None
+    host_tables: tuple[HostTableSpec, ...] = ()
+    draft: DraftSpec | None = None
 
     def ffn_layer_counts(self) -> tuple[int, int]:
         """Return (n_moe_ffn, n_dense_ffn) counted from layer_ffn_kinds."""
         kinds = layer_ffn_kinds(self)
         return (kinds.count("moe"), kinds.count("dense"))
+
+
+def draft_layer_geometry(
+    geometry: ModelGeometry, *, single_layer: bool = False
+) -> ModelGeometry:
+    """Build standalone ModelGeometry describing ``geometry.draft`` layers."""
+    draft = geometry.draft
+    if draft is None or draft.num_layers <= 0:
+        msg = "draft_layer_geometry requires geometry.draft with num_layers > 0"
+        raise ValueError(msg)
+    n_l, use_moe, sparse = (
+        1 if single_layer else draft.num_layers,
+        draft.num_experts > 0,
+        geometry.sparse_attn,
+    )
+    draft_sparse = None
+    if sparse is not None and (draft.layer_kind, sparse.kind) in (
+        ("csa2", "csa2"),
+        ("indexed_attention", "qsa"),
+    ):
+        ids = tuple(range(n_l)) if sparse.kind == "qsa" else ()
+        draft_sparse = replace(
+            sparse,
+            kv_source_layer_ids=ids,
+            index_source_layer_ids=ids,
+            ced_boundary=0,
+            ced_post_only=False,
+        )
+    idx_t = (
+        ("shared",) * n_l
+        if (draft.layer_kind == "dsa" and geometry.index_share_for_mtp_iteration)
+        else ()
+    )
+    return replace(
+        geometry,
+        num_layers=n_l,
+        layer_types=(draft.layer_kind,) * n_l,
+        linear_k_heads=0,
+        linear_v_heads=0,
+        linear_k_dim=0,
+        linear_v_dim=0,
+        conv_kernel=0,
+        num_experts=draft.num_experts if use_moe else 0,
+        top_k=(draft.top_k or geometry.top_k) if use_moe else 0,
+        moe_inter=(draft.moe_inter or geometry.moe_inter) if use_moe else 0,
+        shared_inter=draft.shared_inter if use_moe else 0,
+        dense_inter=0 if use_moe else (draft.dense_inter or geometry.dense_inter),
+        sliding_window=draft.sliding_window or geometry.sliding_window,
+        first_k_dense_replace=0,
+        ffn_kinds=("moe" if use_moe else "dense",) * n_l,
+        n_moe_layers=n_l if use_moe else 0,
+        n_dense_layers=0 if use_moe else n_l,
+        compress_ratios=(),
+        indexer_types=idx_t,
+        mtp_layers=0,
+        ple_dim=0,
+        ple_layer_ids=(),
+        sparse_attn=draft_sparse,
+        host_tables=(),
+        draft=None,
+    )
+
+
+def _slice_sparse_spec(
+    sparse: SparseAttnSpec | None, start: int, end: int
+) -> SparseAttnSpec | None:
+    """Rebase SparseAttnSpec source layer IDs and CED boundary into ``[start, end)``."""
+    if sparse is None:
+        return None
+    post_only = sparse.ced_post_only or (0 < sparse.ced_boundary <= start)
+    ced_b = (
+        sparse.ced_boundary - start
+        if (not post_only and start < sparse.ced_boundary < end)
+        else 0
+    )
+    return replace(
+        sparse,
+        kv_source_layer_ids=tuple(
+            i - start for i in sparse.kv_source_layer_ids if start <= i < end
+        ),
+        index_source_layer_ids=tuple(
+            i - start for i in sparse.index_source_layer_ids if start <= i < end
+        ),
+        ced_boundary=ced_b,
+        ced_post_only=post_only,
+    )
+
+
+def _slice_host_tables(
+    tables: tuple[HostTableSpec, ...],
+    start: int,
+    end: int,
+    num_layers: int,
+) -> tuple[HostTableSpec, ...]:
+    """Rebase HostTableSpec entries into ``[start, end)`` preserving residency."""
+    out: list[HostTableSpec] = []
+    for idx, spec in enumerate(tables):
+        rebased = tuple(i - start for i in spec.layer_ids if start <= i < end)
+        if spec.layer_ids and not rebased:
+            continue
+        frac = (
+            float(len(rebased)) / float(len(spec.layer_ids))
+            if spec.layer_ids
+            else float(max(0, end - start)) / float(max(1, num_layers))
+        )
+        res_first = spec.resident_on_first
+        if res_first is None:
+            if idx > 0 or (spec.layer_ids and not (start <= spec.layer_ids[0] < end)):
+                res_first = False
+            elif spec.layer_ids and len(rebased) == 1:
+                res_first = True
+        out.append(
+            replace(
+                spec,
+                layer_ids=rebased,
+                elem_count=round(spec.elem_count * frac),
+                h2d_bytes_per_tok=spec.h2d_bytes_per_tok * frac,
+                state_bytes_per_req=spec.state_bytes_per_req * frac,
+                dense_proj_params=round(spec.dense_proj_params * frac),
+                resident_on_first=res_first,
+            )
+        )
+    return tuple(out)
+
+
+def slice_geometry_layers(
+    geometry: ModelGeometry, start: int, end: int
+) -> ModelGeometry:
+    """Build a contiguous sub-geometry covering layers ``[start, end)``."""
+    cnt = max(0, end - start)
+    lt = geometry.layer_types[start:end] if geometry.layer_types else ()
+    cr = (
+        geometry.compress_ratios[start:end]
+        if len(geometry.compress_ratios) >= end
+        else ()
+    )
+    ffn_all = layer_ffn_kinds(geometry)
+    ffn = ffn_all[start:end] if len(ffn_all) >= end else ("dense",) * cnt
+    n_moe, n_dense = ffn.count("moe"), ffn.count("dense")
+    idx = (
+        geometry.indexer_types[start:end] if len(geometry.indexer_types) >= end else ()
+    )
+    ple = tuple(i - start for i in geometry.ple_layer_ids if start <= i < end)
+    ple_d = (
+        geometry.ple_dim if (not geometry.ple_layer_ids or ple or "ple" in lt) else 0
+    )
+    return replace(
+        geometry,
+        num_layers=cnt,
+        layer_types=lt,
+        compress_ratios=cr,
+        indexer_types=idx,
+        ffn_kinds=ffn,
+        n_moe_layers=n_moe,
+        n_dense_layers=n_dense,
+        first_k_dense_replace=0 if n_moe > 0 else n_dense,
+        mtp_layers=0,
+        ple_layer_ids=ple,
+        ple_dim=ple_d,
+        sparse_attn=_slice_sparse_spec(geometry.sparse_attn, start, end),
+        host_tables=_slice_host_tables(
+            geometry.host_tables, start, end, geometry.num_layers
+        ),
+        draft=geometry.draft if end == geometry.num_layers else None,
+    )
 
 
 def _resolve_layer_family(
@@ -480,14 +793,86 @@ def _resolve_architectures(
 def _resolve_ple_layer_ids(
     text_config: Mapping[str, object],
     config: Mapping[str, object],
+    num_layers: int,
 ) -> tuple[int, ...]:
-    """Read ``ple_layer_ids`` across text_config and root config."""
+    """Read 1-based HF ``ple_layer_ids`` and convert to 0-based layer indices."""
     scopes = (text_config, config) if text_config is not config else (text_config,)
     raw = _first_non_none(scopes, "ple_layer_ids")
     seq = _as_sequence(raw)
     if seq is None:
         return ()
-    return tuple(_as_int(item) for item in seq)
+    zero_based: list[int] = []
+    for item in seq:
+        one_based = _as_int(item, -1)
+        if one_based < 1 or one_based > num_layers:
+            msg = f"ple_layer_ids entry {item!r} out of 1-based range [1, {num_layers}]"
+            raise ValueError(msg)
+        zero_based.append(one_based - 1)
+    return tuple(zero_based)
+
+
+def _resolve_draft_spec(draft_config: Mapping[str, object] | None) -> DraftSpec | None:
+    """Parse an optional companion draft model config JSON into a DraftSpec."""
+    if draft_config is None:
+        return None
+    if not draft_config:
+        msg = "Draft config requires positive 'num_hidden_layers'"
+        raise ValueError(msg)
+    draft_text = _as_mapping(draft_config.get("text_config")) or draft_config
+    dflash_cfg = _as_mapping(
+        _first_non_none((draft_text, draft_config), "dflash_config")
+    )
+    dspark_cfg = _as_mapping(
+        _first_non_none((draft_text, draft_config), "dspark_config")
+    )
+    all_scopes = (draft_text, draft_config, dspark_cfg)
+    top_scopes = (draft_text, dflash_cfg, draft_config)
+
+    def _get_int(scopes: tuple[Mapping[str, object], ...], *keys: str) -> int:
+        """Read first integer value across config scopes."""
+        return _as_int(_first_non_none(scopes, *keys) or 0)
+
+    num_layers = _get_int((dflash_cfg, draft_text, draft_config), "num_hidden_layers")
+    if num_layers <= 0:
+        msg = "Draft config requires positive 'num_hidden_layers'"
+        raise ValueError(msg)
+    targets = _as_sequence(
+        _first_non_none(top_scopes, "dspark_target_layer_ids", "target_layer_ids")
+    )
+    use_dense = bool(
+        _first_non_none(all_scopes, "dspark_use_dense_ffn", "use_dense_ffn")
+    )
+    raw_layer_types = _as_sequence(
+        _first_non_none((draft_text, dflash_cfg, draft_config), "layer_types")
+    )
+    if raw_layer_types:
+        layer_toks = [str(item) for item in raw_layer_types]
+        for layer_tok in layer_toks:
+            if layer_tok not in VALID_LAYER_TOKENS:
+                msg = (
+                    f"Unknown draft layer_type {layer_tok!r}; "
+                    f"supported tokens: {sorted(VALID_LAYER_TOKENS)}"
+                )
+                raise UnsupportedArchitectureError(msg)
+        if len(set(layer_toks)) > 1:
+            msg = "Mixed layer_types in draft config are not modeled"
+            raise UnsupportedArchitectureError(msg)
+        layer_kind = layer_toks[0]
+    else:
+        layer_kind = "full_attention"
+    ffn_keys = ("dspark_ffn_hidden_size", "ffn_hidden_size", "dense_intermediate_size")
+    return DraftSpec(
+        kind="dspark",
+        num_layers=num_layers,
+        layer_kind=layer_kind,
+        num_experts=0 if use_dense else _get_int(all_scopes, "dspark_n_routed_experts"),
+        top_k=0 if use_dense else _get_int(all_scopes, "dspark_num_experts_per_tok"),
+        dense_inter=_get_int(all_scopes, *ffn_keys) if use_dense else 0,
+        sliding_window=_get_int(top_scopes, "sliding_window"),
+        block_size=max(1, _get_int(top_scopes, "dspark_block_size", "block_size")),
+        fc_in_mult=len(targets) if targets else 1,
+        markov_rank=_get_int(all_scopes, "dspark_markov_rank", "markov_rank"),
+    )
 
 
 def _validate_listed_model_spec(
@@ -1121,7 +1506,7 @@ def _extract_extended_fields(
     """Parse MTP, PLE, IndexShare, HC, vocab, and block-quant dimensions."""
     scopes = (text_config, config) if text_config is not config else (text_config,)
     mtp_layers = _resolve_mtp_layers(text_config, config)
-    ple_layer_ids = _resolve_ple_layer_ids(text_config, config)
+    ple_layer_ids = _resolve_ple_layer_ids(text_config, config, num_layers)
     dedicated_mtp_emb = _first_non_none(scopes, "mtp_use_dedicated_embeddings")
     if dedicated_mtp_emb is True and mtp_layers > 0:
         msg = (
@@ -1178,6 +1563,8 @@ def _extract_extended_fields(
 def _extract_geometry_for_identity(
     config: Mapping[str, object],
     identity: ModelIdentity,
+    *,
+    draft_config: Mapping[str, object] | None = None,
 ) -> ModelGeometry:
     """Extract ModelGeometry from cfg after identity and structural checks."""
     subconfig = _as_mapping(config.get("text_config"))
@@ -1279,10 +1666,15 @@ def _extract_geometry_for_identity(
         hc_lowrank=extended.hc_lowrank,
         ple_layer_ids=extended.ple_layer_ids,
         max_position_embeddings=extended.max_position_embeddings,
+        draft=_resolve_draft_spec(draft_config),
     )
 
 
-def _from_hf_config_dry_run(config: Mapping[str, object]) -> ModelGeometry:
+def _from_hf_config_dry_run(
+    config: Mapping[str, object],
+    *,
+    draft_config: Mapping[str, object] | None = None,
+) -> ModelGeometry:
     """Private dry-run extractor for audit_hf_config on blocked unlisted configs."""
     _validate_structural_support(config)
     text_cfg = _validate_text_config(config)
@@ -1294,18 +1686,21 @@ def _from_hf_config_dry_run(config: Mapping[str, object]) -> ModelGeometry:
         architectures=_resolve_architectures(config, text_cfg),
         hf_repo=None,
     )
-    return _extract_geometry_for_identity(config, identity)
+    return _extract_geometry_for_identity(config, identity, draft_config=draft_config)
 
 
 def from_hf_config(
     config: Mapping[str, object],
     *,
     model_ref: str | None = None,
+    draft_config: Mapping[str, object] | None = None,
 ) -> ModelGeometry:
     """Build ModelGeometry from a supported HuggingFace config mapping."""
     identity = resolve_model_identity(config, model_ref=model_ref)
     _validate_structural_support(config)
-    geometry = _extract_geometry_for_identity(config, identity)
+    geometry = _extract_geometry_for_identity(
+        config, identity, draft_config=draft_config
+    )
     _validate_family_layer_kinds(
         identity, geometry.layer_types, geometry.kv_lora_rank, geometry.index_topk
     )

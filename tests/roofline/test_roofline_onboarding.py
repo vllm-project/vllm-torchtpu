@@ -46,6 +46,7 @@ from vllm_torchtpu.roofline import (
     count_layer_types,
     from_hf_config,
     load_hf_config_with_identity,
+    offloaded_host_table_params,
     param_counts,
     pass_costs,
     resolve_model_identity,
@@ -250,7 +251,13 @@ def test_param_counts_single_source_matches_memory_bytes_at_unit_dtype() -> None
         hbm = hbm_breakdown_per_core_bytes(
             geometry, unit_dtypes, unit_parallel, empty_kv
         )
-        assert abs(param_breakdown.total_params - hbm.weights) <= _UNIT_BYTE_TOL, label
+        offloaded_host_tables = offloaded_host_table_params(
+            geometry, empty_kv.host_table_residency
+        )
+        assert (
+            abs((param_breakdown.total_params - offloaded_host_tables) - hbm.weights)
+            <= _UNIT_BYTE_TOL
+        ), label
 
 
 def _assert_hybrid_moe_param_conservation() -> None:
