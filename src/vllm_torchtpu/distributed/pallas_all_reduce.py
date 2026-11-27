@@ -28,6 +28,12 @@ TPU_TP_PAIR_ALL_REDUCE_MAX_BYTES, which take the chip-pairs-first kernel
 (kernels/collectives/pair_all_reduce.py). The kernels' output bits can differ
 from XLA's all-reduce: they sum in f32 (the pair kernel after rounding each
 chip's partial to bf16) and round once; every rank gets the same bits.
+
+With TPU_TP_PAIR_REDUCE_SCATTER_MIN_BYTES, the TP group's dim-0 reduce-scatters
+of 2-D bf16 tensors take a second op the same way: tensors of at least that
+many bytes whose shape the chip-pairs-first reduce-scatter takes
+(kernels/collectives/pair_reduce_scatter.py) run it, the rest a psum_scatter
+over the mesh.
 """
 
 import dataclasses
@@ -45,7 +51,7 @@ from vllm.distributed import parallel_state
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.ep_mesh import build_ep_mesh, ep_mesh_index, get_ep_group
-from vllm_torchtpu.kernels.collectives import pair_all_reduce
+from vllm_torchtpu.kernels.collectives import pair_all_reduce, pair_reduce_scatter
 from vllm_torchtpu.kernels.collectives import tp_all_reduce as kernel
 from vllm_torchtpu.logger import init_logger
 
@@ -72,6 +78,8 @@ class _Armed:
     # The chip-pairs-first kernel: its byte cap (0: off) and topology table.
     pair_max_bytes: int = 0
     pair_table: Any = None
+    # The chip-pairs-first reduce-scatter op (None: off).
+    rs_op: Any = None
 
 
 _ARMED: _Armed | None = None
@@ -126,6 +134,76 @@ def _make_op(mesh, max_bytes: int, pair_max_bytes=0, pair_table=None):
     )
     op.register_fake(lambda x, rank: torch.empty_like(x))
     return op
+
+
+def reduce_scatter_body(n: int, min_bytes: int, axis: str, table, wire: str):
+    """The reduce-scatter op's per-device body over (x, rank), under shard_map
+    over the op's mesh (axis `axis`, n devices): the chip-pairs-first kernel
+    (its `wire`) from min_bytes of x where it takes the shape, else
+    psum_scatter."""
+
+    def body(x, rank):
+        rows, hidden = x.shape
+        chunk = pair_reduce_scatter.chunk_rows(rows, hidden, n)
+        if chunk is not None and x.size * x.dtype.itemsize >= min_bytes:
+            return pair_reduce_scatter.reduce_scatter(x, rank, table, chunk, wire)
+        return lax.psum_scatter(x, axis, scatter_dimension=0, tiled=True)
+
+    return body
+
+
+def _make_rs_op(mesh, min_bytes: int, table, wire: str):
+    axis = mesh.axis_names[0]
+    n = int(mesh.size)
+    specs = (P(axis), P(axis))
+    sharded = jax.shard_map(
+        reduce_scatter_body(n, min_bytes, axis, table, wire),
+        mesh=mesh,
+        in_specs=specs,
+        out_specs=P(axis),
+        check_vma=False,
+    )
+
+    def fn(x: jax.Array, rank: jax.Array) -> jax.Array:
+        args = (x, rank)
+        return sharded(
+            *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
+        )
+
+    # pyrefly: ignore[no-matching-overload]
+    op = pallas.jax_op(
+        "pallas::tp_reduce_scatter",
+        fn,
+        mesh=mesh,
+        input_partition_specs=specs,
+        output_partition_specs=P(axis),
+    )
+    op.register_fake(lambda x, rank: x.new_empty((x.shape[0] // n, *x.shape[1:])))
+    return op
+
+
+def _rs_selftest(
+    op,
+    rank: torch.Tensor,
+    mesh_index: int,
+    n: int,
+    rows: int,
+    hidden: int,
+    device,
+    tol: float,
+) -> bool:
+    """Whether the reduce-scatter op gives this rank the sum of its rows block
+    within tol (the sums are integers: a misplaced chunk is off by more)."""
+    x = _selftest_inputs(n, rows, hidden)
+    block = rows // n
+    want = x.sum(0)[mesh_index * block : (mesh_index + 1) * block]
+    faulthandler.dump_traceback_later(SELFTEST_TIMEOUT_S, exit=True)
+    try:
+        mine = torch.from_numpy(x[mesh_index]).to(torch.bfloat16).to(device)
+        got = op(mine, rank).to(torch.float32).cpu().numpy()
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+    return bool(np.max(np.abs(got - want)) <= tol)
 
 
 def _make_gather_op(mesh):
@@ -269,6 +347,29 @@ def arm(hidden: int, device: torch.device) -> bool:
         gather_op = _make_gather_op(mesh)
         if not all(_gather(_gather_selftest(gather_op, rank, mesh_index, n, device))):
             raise RuntimeError("tp_all_gather_small: self-test failed")
+    rank_ordered = all(s["mesh_index"] == i for i, s in enumerate(seen))
+    rs_op = None
+    rs_min_bytes = envs.TPU_TP_PAIR_REDUCE_SCATTER_MIN_BYTES
+    if rs_min_bytes > 0:
+        # The kernel gives mesh index i rows block i; the group's reduce-scatter
+        # gives it to group rank i.
+        if not rank_ordered:
+            raise RuntimeError(
+                "TPU_TP_PAIR_REDUCE_SCATTER_MIN_BYTES needs a rank-ordered mesh: "
+                f"{seen}"
+            )
+        rs_table = pair_reduce_scatter.topology_table(d.id for d in mesh.devices.flat)
+        wire = envs.TPU_TP_PAIR_REDUCE_SCATTER_WIRE
+        rs_op = _make_rs_op(mesh, rs_min_bytes, rs_table, wire)
+        # The smallest kernel shape at the byte floor: whole 64-row chunks.
+        unit = n * pair_reduce_scatter.CHUNK_ROWS
+        rows = unit * max(1, -(-rs_min_bytes // (unit * hidden * 2)))
+        # int8 chip sums (|s| <= 10) are off by up to 10 / 254 each, and the
+        # bf16 output by an eighth near 40.
+        tol = 0.0 if wire == "bf16" else 0.5
+        ok = _rs_selftest(rs_op, rank, mesh_index, n, rows, hidden, device, tol)
+        if not all(_gather(ok)):
+            raise RuntimeError(f"tp_reduce_scatter: self-test failed at {rows} rows")
     _ARMED = _Armed(
         ranks=tuple(int(r) for r in tp.ranks),
         op=op,
@@ -276,17 +377,19 @@ def arm(hidden: int, device: torch.device) -> bool:
         rank=rank,
         mesh=mesh,
         max_bytes=max_bytes,
-        rank_ordered=all(s["mesh_index"] == i for i, s in enumerate(seen)),
+        rank_ordered=rank_ordered,
         pair_max_bytes=pair_max_bytes,
         pair_table=pair_table,
+        rs_op=rs_op,
     )
     logger.info(
         "tp_all_reduce: armed over %d ranks (mesh index %d), Pallas up to %d B "
-        "views, chip-pairs-first up to %d B",
+        "views, chip-pairs-first up to %d B, reduce-scatter from %d B",
         n,
         mesh_index,
         max_bytes,
         pair_max_bytes,
+        rs_min_bytes if rs_op is not None else 0,
     )
     return True
 
@@ -303,6 +406,19 @@ def all_reduce(ranks, x: torch.Tensor) -> torch.Tensor | None:
     # branch here would give the model's Dynamo traces different graphs (and
     # inputs) per bucket, which shape_variants refuses to hand buckets between.
     return armed.op(x, armed.rank)
+
+
+def reduce_scatter(ranks, x: torch.Tensor) -> torch.Tensor | None:
+    """The armed reduce-scatter op's dim-0 reduce-scatter of x over the group
+    of `ranks`, or None when it is not armed for this group or tensor (the
+    caller takes its usual path)."""
+    armed = _ARMED
+    if armed is None or armed.rs_op is None or tuple(ranks) != armed.ranks:
+        return None
+    if x.dtype != torch.bfloat16 or x.dim() != 2:
+        return None
+    # The op picks the kernel per static size inside (see `all_reduce`).
+    return armed.rs_op(x, armed.rank)
 
 
 def armed_rank(ranks) -> torch.Tensor | None:

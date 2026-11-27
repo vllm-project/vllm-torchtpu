@@ -48,6 +48,14 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
         out = pallas_all_reduce.all_reduce(self.ranks, input_)
         return super().all_reduce(input_) if out is None else out
 
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        from vllm_torchtpu.distributed import pallas_all_reduce
+
+        out = None
+        if dim % max(input_.dim(), 1) == 0:
+            out = pallas_all_reduce.reduce_scatter(self.ranks, input_)
+        return super().reduce_scatter(input_, dim) if out is None else out
+
     def _moe_group(self, is_sequence_parallel: bool):
         group = get_ep_group() if is_sequence_parallel else get_dp_group()
         return group if group.world_size > 1 else None

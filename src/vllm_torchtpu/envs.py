@@ -113,6 +113,8 @@ if TYPE_CHECKING:
     USE_MOE_TP_DECODE_KERNEL: bool = False
     TPU_TP_PALLAS_ALL_REDUCE_MAX_BYTES: int = 0
     TPU_TP_PAIR_ALL_REDUCE_MAX_BYTES: int = 0
+    TPU_TP_PAIR_REDUCE_SCATTER_MIN_BYTES: int = 0
+    TPU_TP_PAIR_REDUCE_SCATTER_WIRE: str = "bf16"
     TPU_MOE_TC_COMBINE: bool = False
     TPU_MOE_PAIR_COMBINE: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -1025,6 +1027,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # hidden 6144 it beats XLA's TensorCore all-reduce from 64 to 256 rows
     # (192 rows: 33.2 vs 41.0 us); 3145728 admits 256 rows.
     "TPU_TP_PAIR_ALL_REDUCE_MAX_BYTES": env_int("TPU_TP_PAIR_ALL_REDUCE_MAX_BYTES", 0),
+    # With the Pallas all-reduce armed: TP reduce-scatters (dim 0) of bf16
+    # [rows, hidden] tensors of at least this many bytes per rank take the
+    # chip-pairs-first reduce-scatter (kernels/collectives/
+    # pair_reduce_scatter.py) instead of XLA's, on a tpu7x 2x2x1 at TP8 with a
+    # rank-ordered mesh (arming refuses others). 0 (default): off.
+    "TPU_TP_PAIR_REDUCE_SCATTER_MIN_BYTES": env_int(
+        "TPU_TP_PAIR_REDUCE_SCATTER_MIN_BYTES", 0
+    ),
+    # How that reduce-scatter's chip sums cross chips: "bf16", or "int8" with
+    # an f32 scale per row and 128 columns (half the cross-chip bytes).
+    "TPU_TP_PAIR_REDUCE_SCATTER_WIRE": env_with_choices(
+        "TPU_TP_PAIR_REDUCE_SCATTER_WIRE", "bf16", ["bf16", "int8"]
+    ),
     # Expert-parallel MoE combine of large batches on the TensorCore
     # (kernels/megablox/tc_combine.py) instead of the SparseCore
     # gather-reduce, where its shape admits it.
