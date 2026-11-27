@@ -95,6 +95,47 @@ def test_matches_reference(num_tokens, nq, nkv, block_tokens, q_head_major, rota
 
 @pytest.mark.parametrize("rotate", [False, True])
 @pytest.mark.parametrize("q_head_major", [False, True])
+@pytest.mark.parametrize(
+    "num_tokens,pieces,row_blocks",
+    [
+        (1024, 2, 2),  # 256-row sub-blocks in each piece
+        (512, 2, 8),  # 32-row pieces per rank: whole
+        (768, 3, 2),
+    ],
+)
+def test_pieces_match_whole(num_tokens, pieces, row_blocks, q_head_major, rotate):
+    """Row pieces (piece i: every rank's i-th row block) give the whole
+    step's outputs, bit for bit."""
+    nq, nkv = 8, 1
+    rng = np.random.default_rng(num_tokens + pieces)
+    qkv = jnp.asarray(
+        rng.normal(0, 2, (num_tokens, (nq + 3 * nkv + 1) * D)), jnp.bfloat16
+    )
+    ang = rng.uniform(0, 100, (num_tokens, ROT // 2))
+    cos_sin = jnp.asarray(np.concatenate([np.cos(ang), np.sin(ang)], 1), jnp.bfloat16)
+    weight = jnp.asarray(1 + rng.normal(0, 0.3, (nq + 2 * nkv + 1, D)), jnp.float32)
+    split = qkv.reshape(row_blocks, pieces, num_tokens // (row_blocks * pieces), -1)
+    parts = tuple(split[:, i].reshape(num_tokens // pieces, -1) for i in range(pieces))
+    kw = dict(
+        num_heads=nq,
+        num_kv_heads=nkv,
+        head_dim=D,
+        eps=EPS,
+        q_head_major=q_head_major,
+        rotate=rotate,
+        interpret=True,
+    )
+    want = qk_norm_rope.qk_norm_rope(qkv, cos_sin, weight, **kw)
+    got = qk_norm_rope.qk_norm_rope(parts, cos_sin, weight, row_blocks=row_blocks, **kw)
+    for g, w in zip(got, want):
+        assert g.shape == w.shape and g.dtype == w.dtype
+        np.testing.assert_array_equal(
+            np.asarray(g, np.float32), np.asarray(w, np.float32)
+        )
+
+
+@pytest.mark.parametrize("rotate", [False, True])
+@pytest.mark.parametrize("q_head_major", [False, True])
 @pytest.mark.parametrize("num_tokens", [8, 300, 8192])
 def test_lowers_for_tpu(num_tokens, q_head_major, rotate):
     nq, nkv = 8, 1

@@ -64,7 +64,7 @@ def _rope_matrices(head_dim: int, rotary_dim: int) -> tuple[np.ndarray, np.ndarr
 
 
 def _kernel(
-    qkv_ref,
+    qkv_refs,
     cos_sin_ref,
     weight_ref,
     partner_ref,
@@ -83,11 +83,12 @@ def _kernel(
     eps,
     q_head_major,
 ):
-    dtype = qkv_ref.dtype
+    dtype = qkv_refs[0].dtype
     dot = functools.partial(jnp.dot, preferred_element_type=jnp.float32)
     nq, nkv, d = num_heads, num_kv_heads, head_dim
 
-    def rows(r):
+    def rows(r, qkv_ref, src):
+        """Output rows `r` from rows `src` of `qkv_ref`."""
         cos_sin = cos_sin_ref[r, :].astype(jnp.bfloat16)
         cos = dot(cos_sin, factors_ref[0])
         sin = dot(cos_sin, factors_ref[1])
@@ -98,7 +99,7 @@ def _kernel(
         sin = jnp.where(lane < rotary_dim, sin, -0.0)
 
         def norm_rope(col, w_row):
-            x = qkv_ref[r, col * d : (col + 1) * d].astype(jnp.float32)
+            x = qkv_ref[src, col * d : (col + 1) * d].astype(jnp.float32)
             variance = jnp.mean(x * x, axis=1, keepdims=True)
             x = x * jax.lax.rsqrt(variance + eps) * weight_ref[pl.ds(w_row, 1), :]
             n = x.astype(dtype)
@@ -120,7 +121,7 @@ def _kernel(
         for h in range(nkv):
             k_ref[r, h * d : (h + 1) * d] = norm_rope(nq + h, nq + h)
             v_ref[r, h * d : (h + 1) * d] = qkv_ref[
-                r, (nq + nkv + h) * d : (nq + nkv + h + 1) * d
+                src, (nq + nkv + h) * d : (nq + nkv + h + 1) * d
             ]
             iq_ref[r, h * d : (h + 1) * d] = rotated(
                 norm_rope(nq + 2 * nkv + h, nq + nkv + h)
@@ -130,11 +131,25 @@ def _kernel(
     # Straight-line sub-blocks: one body over a whole large block keeps too
     # many values live and spills; a loop over them serializes their latency.
     # A block that is not a multiple runs whole (at 384-416 rows that beat
-    # a 256-row sub-block and a tail).
-    block_t = qkv_ref.shape[0]
-    sub = block_t if block_t % SUB_BLOCK_TOKENS else SUB_BLOCK_TOKENS
-    for start in range(0, block_t, sub):
-        rows(pl.ds(start, sub))
+    # a 256-row sub-block and a tail). Row pieces fill the block in turn.
+    piece_t = qkv_refs[0].shape[0]
+    sub = piece_t if piece_t % SUB_BLOCK_TOKENS else SUB_BLOCK_TOKENS
+    for i, qkv_ref in enumerate(qkv_refs):
+        for start in range(0, piece_t, sub):
+            rows(pl.ds(i * piece_t + start, sub), qkv_ref, pl.ds(start, sub))
+
+
+def _fit_rows(width: int, itemsize: int) -> int:
+    """Rows of a block whose double-buffered input and output fit
+    `BLOCK_VMEM_BYTES`, in whole `SUB_BLOCK_TOKENS`."""
+    row_bytes = 4 * width * itemsize  # in + out, two buffers
+    return max(1, BLOCK_VMEM_BYTES // (row_bytes * SUB_BLOCK_TOKENS)) * SUB_BLOCK_TOKENS
+
+
+def pieces_fit(num_tokens: int, width: int, itemsize: int, row_blocks: int) -> bool:
+    """Whether `qk_norm_rope` takes a step of ``num_tokens`` rows of `width`
+    as row pieces of `row_blocks` ranks (one rank's rows per block)."""
+    return num_tokens // row_blocks <= _fit_rows(width, itemsize)
 
 
 @functools.partial(
@@ -147,11 +162,12 @@ def _kernel(
         "q_head_major",
         "rotate",
         "block_tokens",
+        "row_blocks",
         "interpret",
     ),
 )
 def qk_norm_rope(
-    qkv: jax.Array,
+    qkv: jax.Array | tuple[jax.Array, ...],
     cos_sin: jax.Array,
     weight: jax.Array,
     *,
@@ -162,6 +178,7 @@ def qk_norm_rope(
     q_head_major: bool = False,
     rotate: bool = False,
     block_tokens: int = DEFAULT_BLOCK_TOKENS,
+    row_blocks: int = 1,
     interpret: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """``(q, k, v, index_q, index_k)`` of ``qkv [T, (nq + 3 * nkv + 1) * D]``.
@@ -172,8 +189,15 @@ def qk_norm_rope(
     heads. q is ``[nq, T, D]`` with `q_head_major`, else ``[T, nq * D]``;
     k, v and index_q ``[T, nkv * D]``, index_k ``[T, D]``. `rotate`: q and
     index_q times ``H / D`` (`msa_fp4.rotate_queries`).
+
+    ``qkv`` may also come as the row pieces of a sequence-parallel step's
+    all-gathers (piece ``i`` holds the ``i``-th row block of each of
+    `row_blocks` ranks), read in step order (rank by rank, each rank's pieces
+    in turn) with no stacked copy: one grid step per rank.
     """
-    num_tokens = qkv.shape[0]
+    pieces = tuple(qkv) if isinstance(qkv, (tuple, list)) else (qkv,)
+    qkv = pieces[0]
+    num_tokens = qkv.shape[0] * len(pieces)
     nq, nkv, d = num_heads, num_kv_heads, head_dim
     if qkv.shape[1] != (nq + 3 * nkv + 1) * d or weight.shape != (nq + 2 * nkv + 1, d):
         raise ValueError(
@@ -186,9 +210,18 @@ def qk_norm_rope(
     rotary_dim = cos_sin.shape[1]
     # Whole-array blocks for small batches (any row count); else multiples
     # of the 16-row bf16 tile, the last block partial.
-    row_bytes = 4 * qkv.shape[1] * qkv.dtype.itemsize  # in + out, two buffers
-    fit = max(1, BLOCK_VMEM_BYTES // (row_bytes * SUB_BLOCK_TOKENS)) * SUB_BLOCK_TOKENS
-    block_t = max(1, min(num_tokens, block_tokens, fit))
+    fit = _fit_rows(qkv.shape[1], qkv.dtype.itemsize)
+    if len(pieces) > 1:
+        if any(p.shape != qkv.shape for p in pieces) or qkv.shape[0] % row_blocks:
+            raise ValueError(
+                f"qkv pieces {[p.shape for p in pieces]} do not split into "
+                f"{row_blocks} row blocks each."
+            )
+        block_t = num_tokens // row_blocks
+        if block_t > fit:
+            raise ValueError(f"a rank's {block_t} rows exceed the {fit}-row block.")
+    else:
+        block_t = max(1, min(num_tokens, block_tokens, fit))
     rows = lambda i: (i, 0)  # noqa: E731
     kv_shape = jax.ShapeDtypeStruct((num_tokens, nkv * d), qkv.dtype)
     if q_head_major:
@@ -203,15 +236,18 @@ def qk_norm_rope(
         pl.BlockSpec((d, d), lambda i: (0, 0)),
         pl.BlockSpec((2, rotary_dim, d), lambda i: (0, 0, 0)),
     ]
-    kernel = _kernel
     if rotate:
         mats.append(jnp.asarray(msa_fp4.hadamard(d), jnp.bfloat16))
         mat_specs.append(pl.BlockSpec((d, d), lambda i: (0, 0)))
+    num_pieces = len(pieces)
 
-        def kernel(qkv, cs, w, partner, factors, hadamard, *outs, **kw):
-            return _kernel(
-                qkv, cs, w, partner, factors, *outs, hadamard_ref=hadamard, **kw
-            )
+    def kernel(*refs, **kw):
+        qkv_refs, rest = refs[:num_pieces], refs[num_pieces:]
+        cs, w, partner, factors = rest[:4]
+        rest = rest[4:]
+        if rotate:
+            kw["hadamard_ref"], rest = rest[0], rest[1:]
+        return _kernel(qkv_refs, cs, w, partner, factors, *rest, **kw)
 
     return pl.pallas_call(
         functools.partial(
@@ -225,7 +261,7 @@ def qk_norm_rope(
         ),
         grid=(pl.cdiv(num_tokens, block_t),),
         in_specs=[
-            pl.BlockSpec((block_t, qkv.shape[1]), rows),
+            *[pl.BlockSpec((block_t // num_pieces, qkv.shape[1]), rows)] * num_pieces,
             pl.BlockSpec((block_t, rotary_dim), rows),
             pl.BlockSpec(weight.shape, lambda i: (0, 0)),
             *mat_specs,
@@ -247,4 +283,4 @@ def qk_norm_rope(
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
         interpret=interpret,
         name="minimax_m3_qk_norm_rope",
-    )(qkv, cos_sin, weight.astype(jnp.float32), *mats)
+    )(*pieces, cos_sin, weight.astype(jnp.float32), *mats)

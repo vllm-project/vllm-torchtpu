@@ -40,7 +40,7 @@ from vllm_torchtpu.layers.adapter.attention import PallasMLAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.owned_kv_cache import TpuOwnedKVCache
 from vllm_torchtpu.models.minimax_m3 import sp_o_proj
-from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4
+from vllm_torchtpu.models.minimax_m3.kernels import msa_fp4, qk_norm_rope
 from vllm_torchtpu.models.minimax_m3.ops.msa import (
     fp4_dcp_rotates_queries,
     get_msa_dcp_op,
@@ -215,7 +215,7 @@ def cache_dtype(cache_config: CacheConfig | None) -> torch.dtype:
 
 
 def norm_rope_heads(
-    qkv: torch.Tensor,
+    qkv: torch.Tensor | list[torch.Tensor],
     positions: torch.Tensor,
     num_heads: int,
     num_kv_heads: int,
@@ -231,7 +231,8 @@ def norm_rope_heads(
     The four Gemma RMSNorms differ only in their weights and RoPE acts on each
     head alone, so the kernel norms every head with its row of a per-head
     ``1 + w`` table, then rotates it, with the numerics of the TPU
-    ``rms_norm`` provider and the FP32 rotary embedding.
+    ``rms_norm`` provider and the FP32 rotary embedding. ``qkv`` may be an
+    SP step's row pieces (`op` built for them).
     """
     if not rotary_emb.is_neox_style or rotary_emb.head_size != head_dim:
         raise NotImplementedError("MiniMax M3 rotates NeoX-style within each head.")
@@ -248,9 +249,10 @@ def norm_rope_heads(
         + 1.0
     )
     assert all(n.variance_epsilon == q_norm.variance_epsilon for n in norms)
-    cos_sin = rotary_emb._match_cos_sin_cache_dtype(qkv)
+    pieces = qkv if isinstance(qkv, list) else [qkv]
+    cos_sin = rotary_emb._match_cos_sin_cache_dtype(pieces[0])
     cos_sin = cos_sin.index_select(0, positions.flatten())
-    return op(qkv, cos_sin, weight)
+    return op(*pieces, cos_sin, weight)
 
 
 class StepHalves:
@@ -459,16 +461,19 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.msa_op = get_msa_op(*msa_config, fp4=self.fp4)
         # A DCP group over one KV head reads q head-major (`get_msa_dcp_op`).
         self.q_head_major = self.dcp_size > 1 and self.dcp_kv_heads == 1
-        self.norm_rope_op = get_qk_norm_rope_op(
+        norm_rope_args = (
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
             eps,
             self.q_head_major,
-            rotate=self.fp4
+            self.fp4
             and self.dcp_size > 1
             and fp4_dcp_rotates_queries(self.dcp_size, self.kv_head_replicas),
         )
+        self.norm_rope_op = get_qk_norm_rope_op(*norm_rope_args)
+        # torch_tpu cannot create a jax_op inside a traced forward.
+        self.pieces_norm_rope_op = get_qk_norm_rope_op(*norm_rope_args, 2, tp_size)
 
     def score_bound(self) -> float:
         """``|q . k| * head_dim**-0.5`` bound from the loaded norms: per-head
@@ -515,16 +520,30 @@ class MiniMaxM3SparseAttention(nn.Module):
         caches are bound)."""
         if half is not None:
             positions = half[0].positions_of(half[1])
+        norm_rope_op = self.norm_rope_op
         if qkv is None and isinstance(hidden_states, list):
-            # An SP step's gathered row pieces: project each as it lands.
-            qkv = _step_rows([self._qkv(p) for p in hidden_states])
+            # An SP step's gathered row pieces: project each as it lands; the
+            # norm + rope reads a pair in step order; otherwise they are stacked.
+            qkv = [self._qkv(p) for p in hidden_states]
+            if len(qkv) == 2 and qk_norm_rope.pieces_fit(
+                2 * qkv[0].shape[0],
+                qkv[0].shape[1],
+                qkv[0].element_size(),
+                get_tensor_model_parallel_world_size(),
+            ):
+                norm_rope_op = self.pieces_norm_rope_op
+            else:
+                qkv = _step_rows(qkv)
         elif qkv is None:
             qkv = self._qkv(hidden_states)
         if after is not None:
             # The caches are written in place: this call's writes must follow
             # the reads of the call that produced `after` (else XLA copies
             # the caches).
-            qkv = qkv + zero_of(after).to(qkv.dtype)
+            if isinstance(qkv, list):
+                qkv[0] = qkv[0] + zero_of(after).to(qkv[0].dtype)
+            else:
+                qkv = qkv + zero_of(after).to(qkv.dtype)
         q, k, v, index_q, index_k = norm_rope_heads(
             qkv,
             positions,
@@ -533,9 +552,9 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.head_dim,
             (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm),
             self.rotary_emb,
-            self.norm_rope_op,
+            norm_rope_op,
         )
-        num_tokens = qkv.shape[0]
+        num_tokens = sum(x.shape[0] for x in (qkv if isinstance(qkv, list) else [qkv]))
         if not self.q_head_major:
             q = q.view(num_tokens, self.num_heads, self.head_dim)
         metadata = get_forward_context().attn_metadata
