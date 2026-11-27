@@ -225,8 +225,8 @@ def _kernel(
         def _():
             w_copy(visit(m) + 2).start()
 
-    # Key units stream hidden tiles through the second value group's first
-    # two slots, free until the value phase.
+    # Key units stream hidden tiles through slots heads and heads + 1, which
+    # value groups use only after the key phase.
     def k_load(n, op):
         i, t = cell(n)
 
@@ -632,7 +632,12 @@ def engram_gate(
                 for i in range(0, tokens, max_tokens)
             ]
         )
-    if w.shape != (k_dim, (heads + 1) * dim) or dim % window or token_tile % quant_rows:
+    if (
+        w.shape != (k_dim, (heads + 1) * dim)
+        or dim % window
+        or token_tile % quant_rows
+        or quant_rows % ROWS
+    ):
         raise ValueError("Unsupported Engram gate shapes")
     # The kernel computes whole token tiles but moves only the input's rows,
     # whole HBM row tiles of ROW_TILE; rows past them stay in VMEM.
