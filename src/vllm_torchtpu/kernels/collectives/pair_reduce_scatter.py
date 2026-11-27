@@ -30,7 +30,7 @@ Mesh index i owns output rows block i. Each core, per row chunk:
 Every cross-chip transfer is one hop, the x and y links carry the same
 bytes, and a core sends 3/8 of the tensor across chips (a direct
 reduce-scatter: 3/4, a third of it over two hops). Chunks are pipelined:
-chunk t's pair stage, chunk t-1's second hop and chunk t-2's sum per step.
+chunk t's pair stage, then STAGE_LAGS steps later its second hop and its sum.
 The input and the partner's partials stay in HBM; the hops land in VMEM.
 
 Partial sums are added in f32 and kept in bf16 between the steps (the own
@@ -38,7 +38,7 @@ block's running sum, the kept far halves). `wire` is how the sums cross
 chips: "bf16", or "int8" with one f32 scale per row and 128 columns
 (amax / 127), which halves the cross-chip bytes. Either way the bits differ
 from an f32 sum of the 8 partials. A rank's whole block is held in VMEM, so
-blocks past the budget (about 600 rows of 6144 on the bf16 wire, 900 on
+blocks past the budget (about 640 rows of 6144 on the bf16 wire, 920 on
 int8) are not taken.
 """
 
@@ -62,6 +62,9 @@ _INT8_MAX = 127.0
 _TILE_ROWS = 32
 # Rows per pipelined chunk (more costs VMEM and measured no faster).
 CHUNK_ROWS = _TILE_ROWS
+# Pipeline steps between a chunk's hop 1 and its hop 2, and its final sum
+# (0 <= hop 2's <= the sum's: a sum waits on hop 2's chunk).
+STAGE_LAGS = (2, 4)
 # VMEM a call may plan (its buffers and the whole block's sums), below
 # tpu7x's 64 MiB per TensorCore with room for Mosaic's own.
 _VMEM_BUDGET = 48 << 20
@@ -106,10 +109,10 @@ def _cols(b: int):
     return pl.ds(b * _LANES, _LANES)
 
 
-def _encode(wire: str, value_of, blocks, q_ref, s_ref) -> None:
+def _encode(wire: str, value_of, blocks, q_ref, s_ref, lane0: int = 0) -> None:
     """value_of(b) (f32 [chunk, 128]) for column blocks `blocks` -> the wire
-    dtype in q_ref at block i, int8 with block i's row scales in lane i of
-    s_ref [chunk, 128]."""
+    dtype in q_ref at block i, int8 with block i's row scales in lane
+    lane0 + i of s_ref [chunk, 128]."""
     for i, b in enumerate(blocks):
         v = value_of(b)
         if wire == "bf16":
@@ -118,13 +121,13 @@ def _encode(wire: str, value_of, blocks, q_ref, s_ref) -> None:
         amax = jnp.max(jnp.abs(v), axis=1, keepdims=True)
         inv = jnp.where(amax > 0, _INT8_MAX / amax, 0.0)
         q_ref[:, _cols(i)] = jnp.round(v * inv).astype(I8)
-        s_ref[:, pl.ds(i, 1)] = amax * (1.0 / _INT8_MAX)
+        s_ref[:, pl.ds(lane0 + i, 1)] = amax * (1.0 / _INT8_MAX)
 
 
-def _decode(wire: str, q_ref, s_ref, i: int):
+def _decode(wire: str, q_ref, s_ref, i: int, lane0: int = 0):
     v = q_ref[:, _cols(i)].astype(F32)
     if wire == "int8":
-        v = v * s_ref[:, pl.ds(i, 1)]
+        v = v * s_ref[:, pl.ds(lane0 + i, 1)]
     return v
 
 
@@ -133,13 +136,14 @@ def _vmem_bytes(block: int, hidden: int, chunk: int, wire: str) -> int:
     item = 1 if wire == "int8" else 2
     scales = _LANES * 4
     # Pair-stage loads (2 slots x 4 relations, x and the partner's), the own
-    # block's sum and the kept halves (bf16), the hop sends (2 slots, with
-    # scales), every received hop chunk (with scales), the output staging.
+    # block's sum and the kept halves (bf16), the hop sends (2 slots x 2
+    # halves: hop 1 near and far, hop 2; one scale tile each per hop), every
+    # received hop chunk (likewise), the output staging.
     return (
         2 * 4 * tile * 2
         + 2 * block * hidden * 2
-        + 2 * 6 * chunk * (hidden // 2 * item + scales)
-        + 6 * block * (hidden // 2 * item + scales)
+        + 2 * 2 * chunk * (3 * hidden // 2 * item + 2 * scales)
+        + 2 * block * (3 * hidden // 2 * item + 2 * scales)
         + 2 * tile
     )
 
@@ -147,8 +151,8 @@ def _vmem_bytes(block: int, hidden: int, chunk: int, wire: str) -> int:
 def supported(rows: int, hidden: int, n: int, chunk: int, wire: str) -> bool:
     """Whether bf16 [rows, hidden] over n ranks fits the kernel: 8 ranks,
     every rank's block whole chunks of whole 32-row tiles, column halves of
-    whole lane tiles (at most 128 per half: their int8 scales share a lane
-    tile), and its VMEM within the budget."""
+    whole lane tiles (at most 64 per half: hop 1's near and far int8
+    scales share one lane tile), and its VMEM within the budget."""
     block = rows // N_DEVICES
     return (
         n == N_DEVICES
@@ -157,7 +161,7 @@ def supported(rows: int, hidden: int, n: int, chunk: int, wire: str) -> bool:
         and block >= chunk
         and block % chunk == 0
         and hidden % (2 * _LANES) == 0
-        and hidden // 2 // _LANES <= _LANES
+        and hidden // 2 // _LANES <= _LANES // 2
         and _vmem_bytes(block, hidden, chunk, wire) <= _VMEM_BUDGET
     )
 
@@ -209,25 +213,25 @@ def _call(rows: int, hidden: int, chunk: int, wire: str, interpret: bool):
             neighbour's], hop 2 the two-chip sum of its own block."""
             dev = group[halves[h][n - 1]]
             if n == 1:
-                pairs = [(s1, r1), (s1s, r1s)]
-                dst = lambda ref: ref.at[h, :, at(k)]  # noqa: E731
+                pairs = [(s1, r1, lambda ref: ref.at[h, :, at(k)])]
+                pairs.append((s1s, r1s, lambda ref: ref.at[h, at(k)]))
                 send, recv = h1_send, h1_recv
             else:
-                pairs = [(s2, r2), (s2s, r2s)]
-                dst = lambda ref: ref.at[h, at(k)]  # noqa: E731
+                pairs = [(s2, r2, lambda ref: ref.at[h, at(k)])]
+                pairs.append((s2s, r2s, lambda ref: ref.at[h, at(k)]))
                 send, recv = h2_send, h2_recv
             if wire != "int8":
                 pairs = pairs[:1]
             return [
                 pltpu.make_async_remote_copy(
                     src.at[slot, h],
-                    dst(d),
+                    dst(ref),
                     send.at[i, h, slot],
                     recv.at[i, h, k],
                     device_id=(dev,),
                     device_id_type=_MESH,
                 )
-                for i, (src, d) in enumerate(pairs)
+                for i, (src, ref, dst) in enumerate(pairs)
             ]
 
         def loads(k, slot):
@@ -286,7 +290,8 @@ def _call(rows: int, hidden: int, chunk: int, wire: str, interpret: bool):
                         lambda b, j=j: chip_sum(slot, j, b),
                         range(base, base + nhb),
                         s1.at[slot, h, f],
-                        s1s.at[slot, h, f],
+                        s1s.at[slot, h],
+                        lane0=f * nhb,
                     )
                 for c in hop(1, h, k, slot):
                     c.start()
@@ -302,17 +307,18 @@ def _call(rows: int, hidden: int, chunk: int, wire: str, interpret: bool):
                     for c in hop(2, h, k - 2, slot):
                         c.wait_send()
 
-                near = (r1.at[h, 0, at(k)], r1s.at[h, 0, at(k)])
-                far = (r1.at[h, 1, at(k)], r1s.at[h, 1, at(k)])
+                near = (r1.at[h, 0, at(k)], r1s.at[h, at(k)], 0)
+                far = (r1.at[h, 1, at(k)], r1s.at[h, at(k)], nhb)
                 for i in range(nhb):
                     cb = _cols(base + i)
                     acc[at(k), cb] = (
-                        acc[at(k), cb].astype(F32) + _decode(wire, *near, i)
+                        acc[at(k), cb].astype(F32)
+                        + _decode(wire, near[0], near[1], i, near[2])
                     ).astype(BF16)
                 _encode(
                     wire,
                     lambda i, h=h, far=far: keep[h, at(k), _cols(i)].astype(F32)
-                    + _decode(wire, *far, i),
+                    + _decode(wire, far[0], far[1], i, far[2]),
                     range(nhb),
                     s2.at[slot, h],
                     s2s.at[slot, h],
@@ -349,23 +355,27 @@ def _call(rows: int, hidden: int, chunk: int, wire: str, interpret: bool):
                 d2d(j, k).start()
         start_loads(0, 0)
 
-        # Chunk t's pair stage and hop 1, chunk t-1's hop 2, chunk t-2's sum.
+        # Chunk t's pair stage and hop 1, chunk t-L2's hop 2, chunk t-L3's sum:
+        # a hop's chunk lands while later chunks' stages run.
+        l2, l3 = STAGE_LAGS
+        assert 0 <= l2 <= l3, STAGE_LAGS
+
         def step(t, carry):
             @pl.when(t < nch)
             def _():
                 stage1(t)
 
-            @pl.when((t >= 1) & (t <= nch))
+            @pl.when((t >= l2) & (t < nch + l2))
             def _():
-                stage2(t - 1)
+                stage2(t - l2)
 
-            @pl.when(t >= 2)
+            @pl.when(t >= l3)
             def _():
-                stage3(t - 2)
+                stage3(t - l3)
 
             return carry
 
-        lax.fori_loop(0, nch + 2, step, 0)
+        lax.fori_loop(0, nch + l3, step, 0)
 
         for k in range(max(nch - 2, 0), nch):
             store(k, k % 2).wait()
@@ -395,11 +405,11 @@ def _call(rows: int, hidden: int, chunk: int, wire: str, interpret: bool):
                 pltpu.VMEM((block, hidden), BF16),  # own block's sum
                 pltpu.VMEM((2, block, hh), BF16),  # kept halves (A: y, B: x)
                 pltpu.VMEM((2, 2, 2, chunk, hh), wdt),  # hop-1 sends
-                pltpu.VMEM((2, 2, 2, chunk, _LANES), F32),
+                pltpu.VMEM((2, 2, chunk, _LANES), F32),  # [near | far] scales
                 pltpu.VMEM((2, 2, chunk, hh), wdt),  # hop-2 sends
                 pltpu.VMEM((2, 2, chunk, _LANES), F32),
                 pltpu.VMEM((2, 2, block, hh), wdt),  # hop-1 received
-                pltpu.VMEM((2, 2, block, _LANES), F32),
+                pltpu.VMEM((2, block, _LANES), F32),
                 pltpu.VMEM((2, block, hh), wdt),  # hop-2 received
                 pltpu.VMEM((2, block, _LANES), F32),
                 pltpu.VMEM((2, chunk, hidden), BF16),  # output staging

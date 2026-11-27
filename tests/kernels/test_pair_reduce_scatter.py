@@ -27,8 +27,9 @@ import pytest
 from vllm_torchtpu.kernels.collectives import pair_reduce_scatter
 
 HIDDEN = 512
-# (rows per rank's block, chunk): several chunks per block, and one.
-CASES = ((64, 32), (96, 32), (32, 32))
+# (rows per rank's block, chunk): one chunk, a few, and enough that every
+# pipeline stage runs in the same step (STAGE_LAGS).
+CASES = ((32, 32), (96, 32), (192, 32))
 WIRES = pair_reduce_scatter.WIRES
 
 # A rank-ordered mesh (DCP on): mesh index -> device id.
