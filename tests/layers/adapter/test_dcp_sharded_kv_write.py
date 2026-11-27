@@ -1483,12 +1483,13 @@ def _make_unique_bf16_rows(
     return bf16
 
 
-def _capture_qc_head_shift_fn(
+def _capture_token_parallel_ops(
     monkeypatch: pytest.MonkeyPatch,
     *,
     mesh: Mesh,
     layout: dcp_token_parallel.TokenParallelLayout,
-) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    mla_kv_spec: tuple[object, object] | None = None,
+) -> tuple[object, list[dict]]:
     captured: list[dict] = []
 
     def _capture_op(name, fn, **kwargs):
@@ -1525,13 +1526,25 @@ def _capture_qc_head_shift_fn(
         kv_lora_rank = 32
 
     layer = _LayerStub()
+    if mla_kv_spec is not None:
+        layer.mla_kv_spec = mla_kv_spec  # type: ignore[attr-defined]
     impl = SimpleNamespace(
         _dcp_mesh=mesh,
         dcp_size=layout.dcp_size,
         dcp_interleave_size=layout.interleave_size,
     )
     tp_op_mod.build_attention_op(layer, impl, layout, q_replicated=True)
+    # The built ops hold the layer by weak reference; return it to keep it alive.
+    return layer, captured
 
+
+def _capture_qc_head_shift_fn(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mesh: Mesh,
+    layout: dcp_token_parallel.TokenParallelLayout,
+) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    _, captured = _capture_token_parallel_ops(monkeypatch, mesh=mesh, layout=layout)
     matches = [r for r in captured if r["name"].startswith("pallas::dcp_qc_head_shift")]
     assert len(matches) == 1
     record = matches[0]
@@ -1647,3 +1660,112 @@ def test_should_align_qc_head_shift_with_global_token_count_on_16dev(
             (4096, 16),  # active 4-band zigzag (nb=4)
         ],
     )
+
+
+class _StopAfterKvWrite(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("dcp", "split_rows", "num_tokens"),
+    [
+        (4, 16, 64),  # contiguous fallback
+        (4, 16, 256),  # active zigzag
+        (16, 64, 1024),  # contiguous fallback
+        (16, 64, 4096),  # active zigzag
+    ],
+)
+def test_should_use_global_token_count_in_oproj_op_when_kv_is_sharded(
+    monkeypatch: pytest.MonkeyPatch,
+    dcp: int,
+    split_rows: int,
+    num_tokens: int,
+) -> None:
+    mesh = _make_dcp_mesh(dcp)
+    layout = dcp_token_parallel.TokenParallelLayout(
+        dcp_size=dcp,
+        page_size=split_rows,
+        interleave_size=4,
+        split_rows=split_rows,
+        max_pages=8,
+        zigzag_bands=4,
+    )
+    spec = SimpleNamespace(
+        page_size=layout.page_size,
+        layout=SimpleNamespace(value="stub"),
+        packed_rope=False,
+        token_bytes=64,
+    )
+    layer, captured = _capture_token_parallel_ops(
+        monkeypatch, mesh=mesh, layout=layout, mla_kv_spec=(spec, spec)
+    )
+    assert layer is not None
+    monkeypatch.setattr(tp_op_mod, "make_attend", lambda **_kw: None)
+
+    # Spy on the token count the op body derives outside shard_map and on the
+    # per-rank rows its KV write sees inside it; stop before any kernel runs.
+    op_token_counts: list[int] = []
+    kv_writes: list[tuple[int, int | None]] = []
+    orig_rows_per_rank = dcp_token_parallel.TokenParallelLayout.rows_per_rank
+
+    def _spy_rows_per_rank(self, n: int) -> int:
+        op_token_counts.append(n)
+        return orig_rows_per_rank(self, n)
+
+    def _spy_kv_write(_nope, _rope, kv_c, *_args, **kwargs):
+        kv_writes.append((kv_c.shape[0], kwargs.get("zigzag_bands")))
+        raise _StopAfterKvWrite
+
+    monkeypatch.setattr(
+        dcp_token_parallel.TokenParallelLayout, "rows_per_rank", _spy_rows_per_rank
+    )
+    monkeypatch.setattr(
+        tp_op_mod, "update_sparse_mla_kv_cache_dcp_sharded", _spy_kv_write
+    )
+    monkeypatch.setattr(tp_op_mod, "update_sparse_mla_kv_cache_dcp", _spy_kv_write)
+
+    unused_shd = _sharded_array(np.zeros((dcp, 1), np.float32), mesh)
+    unused_rep = _replicated_array(np.zeros((1,), np.int32), mesh)
+    cache = _sharded_array(np.zeros((dcp * 2, layout.page_size, 8), np.uint32), mesh)
+    ranks = _sharded_array(np.arange(dcp, dtype=np.int32), mesh)
+
+    for kv_sharded in (False, True):
+        matches = [
+            r
+            for r in captured
+            if r["name"].startswith("pallas::sparse_mla_tp_oproj")
+            and ("sharded_kv" in r["name"]) == kv_sharded
+        ]
+        assert len(matches) == 1
+        place = _sharded_array if kv_sharded else _replicated_array
+        kv_c = place(np.zeros((num_tokens, 32), np.float32), mesh)
+        k_pe = place(np.zeros((num_tokens, 8), np.float32), mesh)
+        op_token_counts.clear()
+        kv_writes.clear()
+        with pytest.raises(_StopAfterKvWrite):
+            matches[0]["fn"](
+                cache,  # nope cache
+                cache,  # rope cache
+                unused_shd,  # q head
+                unused_shd,  # q tail
+                unused_shd,  # q_pe
+                kv_c,
+                k_pe,
+                unused_shd,  # top-k rows
+                unused_rep,  # seq_lens
+                unused_rep,  # block_tables
+                unused_rep,  # query_start_loc
+                unused_rep,  # request_distribution
+                ranks,
+                unused_rep,  # w_uv
+                unused_shd,  # w_o
+                unused_shd,  # w_o scale
+            )
+        assert op_token_counts[0] == num_tokens
+        if kv_sharded:
+            assert kv_writes[0] == (
+                num_tokens // dcp,
+                layout.effective_zigzag_bands(num_tokens),
+            )
+        else:
+            assert kv_writes[0] == (num_tokens, None)

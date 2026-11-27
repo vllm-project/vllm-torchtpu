@@ -688,7 +688,8 @@ def build_attention_op(
             ),
         )
         s = layout.split_rows
-        num_tokens = kv_c_normed.shape[0] * dcp if kv_sharded else kv_c_normed.shape[0]
+        # kv_c_normed is the global [T, C] array here, outside shard_map.
+        num_tokens = kv_c_normed.shape[0]
         rows = layout.rows_per_rank(num_tokens)
 
         def _write_once(nope, rope, kv_c, k_pe_in, sl, bt, qsl, *r_arg):
