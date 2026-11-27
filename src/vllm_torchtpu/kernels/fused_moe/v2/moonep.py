@@ -132,6 +132,13 @@ def build_pallas_moonep_planner(
         h_hot_i = jnp.int32(h_hot)
         max_ops_i = jnp.int32(max_ops)
         min_mig_i = jnp.int32(min_mig_tokens)
+        # Phase A / home-level gate uses `min_mig_i` (rank-overload threshold),
+        # while Phase B per-destination shards are ~1/ep of home overload; cap
+        # the per-dest floor at 5% of `cap` so raising `min_mig_frac` cleanly
+        # skips mild-skew layers without starving cold destinations at high skew.
+        dest_min_i = jnp.int32(
+            min(min_mig_tokens, max(1, cap // 20)) if min_mig_tokens > 0 else 0
+        )
         r0_dir_i = jnp.int32(r0_direct_max)
         r1_fan_i = jnp.int32(r1_fanout)
         denom_seed = jnp.int32(r1_fanout + 1)
@@ -283,8 +290,8 @@ def build_pallas_moonep_planner(
                     le, best_r = lax.fori_loop(0, epn, find_e, (neg1, zero))
                     take = jnp.minimum(best_r, best_q)
                     can_mig = jnp.logical_and(
-                        jnp.logical_and(best_q > min_mig_i, best_r > min_mig_i),
-                        take > min_mig_i,
+                        jnp.logical_and(best_q > dest_min_i, best_r > dest_min_i),
+                        take > dest_min_i,
                     )
                     g_e = base_e + jnp.maximum(le, zero)
                     cur_hi = jnp.where(can_mig, e_to_hot_sm[g_e], zero)

@@ -755,3 +755,70 @@ def test_moonep_non_fp8_falls_back_cleanly(base_problem):
         )
     )(p["x"], w1_bf16, w2_bf16, p["g_skew"], p["rank"])
     _assert_close_to_ref(out, p["want_softmax"])
+
+
+def test_moonep_decoupled_rank_overload_gate(base_problem):
+    """High min_mig_frac skips mild skew without starving Phase B on heavy skew."""
+    from vllm_torchtpu.kernels.fused_moe.v2.moonep import build_pallas_moonep_planner
+
+    p = base_problem
+    e_total = SHAPE["e_total"]
+    epn = e_total // EP
+    cap = SHAPE["tokens_per_rank"] * SHAPE["topk"]
+
+    # min_mig_frac=0.80 requires >1.8x rank load in Phase A, while Phase B caps
+    # per-destination shard floor at 5% of cap so heavy skew still fans out cleanly.
+    planner = build_pallas_moonep_planner(
+        ep=EP,
+        e_total=e_total,
+        b_slots=4,
+        h_hot=16,
+        cap=cap,
+        min_mig_tokens=int(cap * 0.80),
+    )
+
+    # 1. Mild skew (~1.4x on rank 0): Phase A stays silent (any_migrated == 0).
+    ec_mild = np.full((e_total,), cap // epn, dtype=np.int32)
+    ec_mild[:epn] += (cap * 2 // 5) // epn
+    ec_mild[epn : 2 * epn] -= (cap * 2 // 5) // epn
+    gt_mild = ec_mild.reshape(EP, epn).sum(axis=1).astype(np.int32)
+    *_, any_mild = jax.jit(planner)(jnp.asarray(ec_mild), jnp.asarray(gt_mild))
+    assert int(np.asarray(any_mild)[0]) == 0, "expected mild skew to skip migration"
+
+    # 2. Heavy skew (~3.5x on rank 0): Phase A fires and Phase B fans out to cold ranks.
+    ec_heavy = np.full((e_total,), (cap * 2) // (3 * epn), dtype=np.int32)
+    ec_heavy[:epn] = (cap * 7) // (2 * epn)
+    gt_heavy = ec_heavy.reshape(EP, epn).sum(axis=1).astype(np.int32)
+    split_e, *_, r0_ns, _, _, _, any_heavy = jax.jit(planner)(
+        jnp.asarray(ec_heavy), jnp.asarray(gt_heavy)
+    )
+    assert int(np.asarray(any_heavy)[0]) == 1, (
+        "expected heavy skew to trigger migration"
+    )
+    assert int(np.asarray(r0_ns)[0]) > 0, (
+        "expected home rank 0 to schedule Round-0 RDMA"
+    )
+    assert int((np.asarray(split_e) >= 0).sum()) >= 1
+
+    # 3. End-to-end numerical parity with moonep_min_mig_frac=0.80 on heavy skew.
+    out = jax.jit(
+        lambda x_, w1_, w2_, s1_, s2_, g_, rk_: fused_ep_moe_v2(
+            x_,
+            w1_,
+            w2_,
+            s1_,
+            s2_,
+            g_,
+            rank=rk_,
+            topk=SHAPE["topk"],
+            renormalize=True,
+            mesh=p["mesh"],
+            capacity=CAPACITY,
+            weight_format=WeightFormat.FP8,
+            sharded_plan=True,
+            moonep_slots=4,
+            moonep_min_mig_frac=0.80,
+            moonep_min_local_tokens=128,
+        )
+    )(p["x"], p["w1"], p["w2"], p["s1"], p["s2"], p["g_skew"], p["rank"])
+    _assert_close_to_ref(out, p["want_softmax"])
