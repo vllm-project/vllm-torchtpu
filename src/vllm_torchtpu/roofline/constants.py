@@ -342,6 +342,16 @@ SUPPORTED_MODELS: Mapping[str, ModelSpec] = MappingProxyType(
             architectures=("DeepseekV41ForCausalLM",),
             allowed_layer_kinds=frozenset({"csa2", "mla", "dsa"}),
         ),
+        "minimax_m3_vl": ModelSpec(
+            canonical_id="minimax_m3_vl",
+            hf_repos=("MiniMaxAI/MiniMax-M3.1-Flash",),
+            model_types=("minimax_m3_vl", "minimax_m3_vl_text"),
+            architectures=(
+                "MiniMaxM3SparseForConditionalGeneration",
+                "MiniMaxM3SparseForCausalLM",
+            ),
+            allowed_layer_kinds=frozenset({"gqa"}),
+        ),
     }
 )
 
@@ -365,9 +375,19 @@ MULTIMODAL_KEYS: tuple[str, ...] = (
     "image_token_index",
     "image_token_id",
     "video_token_id",
+    "video_token_index",
     "vision_start_token_id",
     "vision_end_token_id",
     "language_model_only",
+    "img_token_compression_config",
+    "image_grid_pinpoints",
+    "image_seq_length",
+    "multimodal_projector_bias",
+    "process_image_mode",
+    "projector_hidden_act",
+    "projector_hidden_size",
+    "vision_feature_layer",
+    "vision_feature_select_strategy",
 )
 BENIGN_HF_METADATA_KEYS: frozenset[str] = frozenset(
     {
@@ -402,20 +422,24 @@ BENIGN_HF_METADATA_KEYS: frozenset[str] = frozenset(
         "moe_router_dtype",
         "n_group",
         "norm_topk_prob",
+        "num_reward_heads",
         "output_router_logits",
         "pad_token_id",
         "partial_rotary_factor",
         "pretraining_tp",
         "qk_head_dim",
+        "qk_norm_type",
         "rms_norm_eps",
         "rope_interleave",
         "rope_parameters",
         "rope_scaling",
         "rope_theta",
+        "rotary_dim",
         "routed_scaling_factor",
         "router_aux_loss_coef",
         "scoring_func",
         "sep_token_id",
+        "swiglu_alpha",
         "swiglu_limit",
         "tokenizer_class",
         "topk_group",
@@ -424,6 +448,9 @@ BENIGN_HF_METADATA_KEYS: frozenset[str] = frozenset(
         "transformers_version",
         "unk_token_id",
         "use_cache",
+        "use_gemma_norm",
+        "use_qk_norm",
+        "use_routing_bias",
     }
 )
 HYBRID_PATTERN_MAP: dict[str, str] = {

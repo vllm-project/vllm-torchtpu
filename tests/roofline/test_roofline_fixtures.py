@@ -40,6 +40,7 @@ SUPPORTED_FIXTURES: tuple[tuple[str, str, str], ...] = (
     ("glm_5_2_fp8.json", "glm_moe_dsa", "zai-org/GLM-5.2-FP8"),
     ("glm_5_2_nvfp4.json", "glm_moe_dsa", "nvidia/GLM-5.2-NVFP4"),
     ("deepseek_v4_1_flash.json", "deepseek_v41", "deepseek-ai/DeepSeek-V4.1-Flash"),
+    ("minimax_m3_1_flash.json", "minimax_m3_vl", "MiniMaxAI/MiniMax-M3.1-Flash"),
 )
 
 _EXPECTED_FIXTURE_GEOMETRY: dict[str, tuple[int, int, int, int, int, int]] = {
@@ -48,6 +49,7 @@ _EXPECTED_FIXTURE_GEOMETRY: dict[str, tuple[int, int, int, int, int, int]] = {
     "glm_5_2_fp8.json": (78, 6144, 64, 64, 192, 256),
     "glm_5_2_nvfp4.json": (78, 6144, 64, 64, 192, 256),
     "deepseek_v4_1_flash.json": (40, 5120, 64, 1, 512, 384),
+    "minimax_m3_1_flash.json": (60, 6144, 64, 4, 128, 128),
 }
 
 SYNTHETIC_NEGATIVE_CONTROLS: tuple[tuple[dict[str, object], str], ...] = (
@@ -80,16 +82,6 @@ SYNTHETIC_NEGATIVE_CONTROLS: tuple[tuple[dict[str, object], str], ...] = (
             "num_attention_heads": 64,
         },
         "deepseek_v4",
-    ),
-    (
-        {
-            "model_type": "minimax_m3_vl",
-            "architectures": ["MiniMaxM3VLForConditionalGeneration"],
-            "hidden_size": 4096,
-            "num_hidden_layers": 8,
-            "num_attention_heads": 32,
-        },
-        "minimax_m3_vl",
     ),
     (
         {

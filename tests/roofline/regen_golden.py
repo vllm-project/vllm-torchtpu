@@ -43,6 +43,7 @@ GOLDEN_CHECKPOINTS: tuple[tuple[str, str], ...] = (
     ("glm_5_2_fp8", "glm_5_2_fp8.json"),
     ("glm_5_2_nvfp4", "glm_5_2_nvfp4.json"),
     ("deepseek_v4_1_flash", "deepseek_v4_1_flash.json"),
+    ("minimax_m3_1_flash", "minimax_m3_1_flash.json"),
 )
 GOLDEN_SLICES: tuple[tuple[str, int], ...] = (
     ("2x2x1", 4),

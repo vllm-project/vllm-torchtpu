@@ -45,6 +45,7 @@ LOCKED_FIXTURE_FILES: tuple[str, ...] = (
     "glm_5_2_fp8.json",
     "glm_5_2_nvfp4.json",
     "deepseek_v4_1_flash.json",
+    "minimax_m3_1_flash.json",
 )
 
 
@@ -67,14 +68,40 @@ def _read_fixture_json(fixture_name: str) -> dict[str, object]:
 def load_locked_config(
     fixture_name: str = "qwen3_5_397b_fp8.json",
 ) -> dict[str, object]:
-    """Return a fresh copy of one of the 4 locked basis HF checkpoint configs."""
+    """Return a fresh copy of one of the locked basis HF checkpoint configs."""
     return copy.deepcopy(_read_fixture_json(fixture_name))
+
+
+@lru_cache(maxsize=1)
+def _locked_draft_fixture_map() -> dict[str, str]:
+    """Derive checkpoint fixture -> draft_fixture mapping from manifest.json."""
+    manifest = _read_fixture_json("manifest.json")
+    checkpoints = manifest.get("checkpoints")
+    if not isinstance(checkpoints, list):
+        return {}
+    return {
+        str(entry["fixture"]): str(entry["draft_fixture"])
+        for entry in checkpoints
+        if isinstance(entry, dict)
+        and entry.get("fixture")
+        and entry.get("draft_fixture")
+    }
+
+
+def load_locked_draft_config(
+    fixture_name: str = "minimax_m3_1_flash.json",
+) -> dict[str, object] | None:
+    """Return a fresh copy of a locked fixture's companion draft config if defined."""
+    draft_name = _locked_draft_fixture_map().get(fixture_name)
+    if draft_name is None:
+        return None
+    return copy.deepcopy(_read_fixture_json(draft_name))
 
 
 def load_locked_geometry(
     fixture_name: str = "qwen3_5_397b_fp8.json",
 ) -> ModelGeometry:
-    """Parse one of the 4 locked basis HF checkpoint configs into ModelGeometry."""
+    """Parse one of the locked basis HF checkpoint configs into ModelGeometry."""
     return from_hf_config(_read_fixture_json(fixture_name))
 
 
