@@ -19,7 +19,19 @@ import pytest
 from jax.experimental.pallas import tpu as pltpu
 
 import vllm_torchtpu.roofline as rf
-from vllm_torchtpu.roofline import CHIPS
+from tests.roofline.conftest import load_locked_config
+from vllm_torchtpu.roofline import (
+    CHIPS,
+    Dtypes,
+    FloorOptions,
+    Parallel,
+    SpecShape,
+    StepShape,
+    from_hf_config,
+    pass_costs,
+    spec_cycle_floor,
+    step_floor,
+)
 from vllm_torchtpu.roofline import chips as chips_mod
 from vllm_torchtpu.roofline import constants as rf_constants
 from vllm_torchtpu.roofline.chips import _build_spec_chip
@@ -28,6 +40,10 @@ _SYNTH_HBM_BYTES = 32_000_000_000
 _SYNTH_HBM_BW = 1.6e12
 _SYNTH_BF16_FLOPS = 5.0e14
 _SYNTH_FP8_FLOPS = 1.0e15
+_SYNTH_FP4_FLOPS = 2.0e15
+_SYNTH_INT4_FLOPS = 1.8e15
+_SPEC_K_DRAFT = 3
+_PACKED_INT4_WEIGHT_BYTES = 0.515625
 _SYNTH_VMEM_BYTES = 67_108_864
 _SYNTH_LINK_BW = 50.0e9
 _SYNTH_LINKS_PER_CHIP = 4
@@ -41,6 +57,19 @@ _CUSTOM_ICI_BW = 3.75e11
 _CUSTOM_DCN_BW = 9.0e9
 _PP_TWO_STAGES = 2
 _CUSTOM_NUM_LANES = 256
+
+_TINY_DENSE_CFG: dict[str, object] = {
+    "model_type": "qwen3_5_moe",
+    "architectures": ["Qwen3_5MoeForCausalLM"],
+    "hidden_size": 512,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 8,
+    "num_key_value_heads": 2,
+    "head_dim": 64,
+    "intermediate_size": 1024,
+    "vocab_size": 32000,
+    "dtype": "bfloat16",
+}
 
 
 def _make_base_spec_payload(
@@ -331,6 +360,113 @@ def test_num_lanes_defaults_physical_alignment_when_omitted() -> None:
     standalone_wide, _ = rf.load_chip_spec(standalone_payload)
     assert standalone_wide.num_lanes == _CUSTOM_NUM_LANES
     assert standalone_wide.physical_alignment_elems == _CUSTOM_NUM_LANES
+
+
+def test_load_chip_spec_native_fp4_and_zero_fp8() -> None:
+    """Verify native FP4/INT4 capability routing, zero unpack, and zero FP8 guard."""
+    geom_moe = from_hf_config(load_locked_config("qwen3_5_397b_nvfp4.json"))
+    geom_dense = from_hf_config(_TINY_DENSE_CFG)
+
+    fp4_spec_dict = _make_base_spec_payload(name="native_fp4_chip")
+    fp4_spec_dict["fp4_flops"] = _SYNTH_FP4_FLOPS
+    fp4_chip, _ = rf.load_chip_spec(fp4_spec_dict)
+
+    emu_spec_dict = _make_base_spec_payload(name="emu_fp4_chip")
+    emu_spec_dict["fp4_flops"] = 0.0
+    emu_chip, _ = rf.load_chip_spec(emu_spec_dict)
+
+    dtypes_nvfp4 = Dtypes(
+        w_dense=rf_constants.NVFP4_BYTES,
+        w_dense_dtype="nvfp4",
+        w_expert=rf_constants.NVFP4_BYTES,
+        w_expert_dtype="nvfp4",
+        act="a8",
+    )
+    parallel_single = Parallel(tp=1, ranks_per_chip=1)
+    shape = StepShape(batch=16, rows_per_seq=1, context=256)
+
+    mods_native = pass_costs(
+        geom_moe, parallel_single, shape, dtypes_nvfp4, chip=fp4_chip
+    )
+    mods_emu = pass_costs(geom_moe, parallel_single, shape, dtypes_nvfp4, chip=emu_chip)
+    moe_native = next(m for m in mods_native if m.name == "moe")
+    moe_emu = next(m for m in mods_emu if m.name == "moe")
+    assert moe_native.fp4_flops > 0.0
+    assert moe_native.fp8_flops == 0.0
+    assert moe_emu.fp4_flops == 0.0
+    assert moe_emu.fp8_flops > 0.0
+    assert moe_native.vector_flops < moe_emu.vector_flops
+
+    dense_native = pass_costs(
+        geom_dense, parallel_single, shape, dtypes_nvfp4, chip=fp4_chip
+    )
+    dense_emu = pass_costs(
+        geom_dense, parallel_single, shape, dtypes_nvfp4, chip=emu_chip
+    )
+    ffn_native = next(m for m in dense_native if m.name == "mlp")
+    ffn_emu = next(m for m in dense_emu if m.name == "mlp")
+    assert ffn_native.fp4_flops > 0.0
+    assert ffn_native.vector_flops < ffn_emu.vector_flops
+
+    spec_native = spec_cycle_floor(
+        geom_moe,
+        fp4_chip,
+        parallel_single,
+        SpecShape(batch=16, context=256, spec_k=_SPEC_K_DRAFT),
+        FloorOptions(dtypes=dtypes_nvfp4),
+    )
+    spec_emu = spec_cycle_floor(
+        geom_moe,
+        emu_chip,
+        parallel_single,
+        SpecShape(batch=16, context=256, spec_k=_SPEC_K_DRAFT),
+        FloorOptions(dtypes=dtypes_nvfp4),
+    )
+    spec_moe_native = next(m for m in spec_native.modules if m.name == "moe")
+    spec_moe_emu = next(m for m in spec_emu.modules if m.name == "moe")
+    assert spec_moe_native.fp4_flops > moe_native.fp4_flops
+    assert spec_moe_native.vector_flops < spec_moe_emu.vector_flops
+    assert spec_native.matmul_s < spec_emu.matmul_s
+
+    both_spec = _make_base_spec_payload(name="native_fp4_int4_chip")
+    both_spec["fp4_flops"] = _SYNTH_FP4_FLOPS
+    both_spec["int4_flops"] = _SYNTH_INT4_FLOPS
+    both_chip, _ = rf.load_chip_spec(both_spec)
+    assert both_chip.matmul_peak_kind(
+        rf_constants.FP4_BYTES, "a8", weight_dtype="int4"
+    ) == ("int4", _SYNTH_INT4_FLOPS, False)
+    assert fp4_chip.matmul_peak_kind(
+        rf_constants.FP4_BYTES, "a8", weight_dtype="int4"
+    ) == ("fp8", _SYNTH_FP8_FLOPS, True)
+    assert both_chip.matmul_peak_kind(
+        _PACKED_INT4_WEIGHT_BYTES,
+        "a8",
+        weight_dtype="compressed-tensors_int4_packed",
+    ) == ("int4", _SYNTH_INT4_FLOPS, False)
+    assert fp4_chip.matmul_peak_kind(
+        _PACKED_INT4_WEIGHT_BYTES,
+        "a8",
+        weight_dtype="compressed-tensors_int4_packed",
+    ) == ("fp8", _SYNTH_FP8_FLOPS, True)
+
+    zero_fp8_spec = _make_base_spec_payload(name="bf16_only_chip", fp8_flops=0.0)
+    zero_fp8_chip, _ = rf.load_chip_spec(zero_fp8_spec)
+    step_bf16 = step_floor(
+        geom_moe,
+        zero_fp8_chip,
+        parallel_single,
+        shape,
+        FloorOptions(dtypes=Dtypes(w_dense=1.0, w_dense_dtype="fp8", act="a8")),
+    )
+    spec_bf16 = spec_cycle_floor(
+        geom_moe,
+        zero_fp8_chip,
+        parallel_single,
+        SpecShape(batch=16, context=256, spec_k=_SPEC_K_DRAFT),
+        FloorOptions(dtypes=Dtypes(w_dense=1.0, w_dense_dtype="fp8", act="a8")),
+    )
+    assert step_bf16.matmul_s > 0.0
+    assert spec_bf16.matmul_s > step_bf16.matmul_s
 
 
 def test_unknown_chip_spec_key_rejected() -> None:
