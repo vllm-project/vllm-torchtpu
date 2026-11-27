@@ -35,6 +35,10 @@ PREFILL_PCP="${PREFILL_PCP:-4}"
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-256}"
 DECODE_TP="${DECODE_TP:-1}"
 DECODE_DP="${DECODE_DP:-4}"
+# 1: the decode leg serves one API server per DP rank
+# (--data-parallel-multi-port-external-lb with the tpu_multiport_dp option),
+# on DECODE_PORT + rank; the proxy spreads requests over them.
+DECODE_MULTI_PORT_DP="${DECODE_MULTI_PORT_DP:-0}"
 PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE:-768}"
 DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE:-2304}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-1}"
@@ -122,6 +126,7 @@ export PREFILL_PCP
 export PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE
 export DECODE_TP
 export DECODE_DP
+export DECODE_MULTI_PORT_DP
 export PREFILL_BLOCK_SIZE
 export DECODE_BLOCK_SIZE
 export ENABLE_PREFIX_CACHING
@@ -191,6 +196,30 @@ if ! grep -Fq "Using KV cache block size: ${DECODE_BLOCK_SIZE}" \
   exit 1
 fi
 echo "SCHEDULER_BLOCK_SIZE_OK prefill=${expected_prefill_scheduler_block_size} decode=${expected_decode_scheduler_block_size}"
+
+decode_ports=("${DECODE_PORT}")
+if [[ "${DECODE_MULTI_PORT_DP}" == "1" ]]; then
+  # One API server per rank, each with the slice bootstrap of all ranks and
+  # its own engine core bound to its slot on the host.
+  decode_ports=()
+  for ((rank = 0; rank < DECODE_DP; rank++)); do
+    decode_ports+=("$((DECODE_PORT + rank))")
+    for expected in \
+        "TPU multi-port DP: rank ${rank} of ${DECODE_DP} on this host;" \
+        "TPU multi-port DP: engine core dp_rank=${rank} -> local_dp_rank=${rank}, data_parallel_size_local=${DECODE_DP}"; do
+      if ! grep -aFq "${expected}" "${RUN_DIR}/logs/decode.log"; then
+        echo "Expected '${expected}' in the decode server log" >&2
+        exit 1
+      fi
+    done
+    code="$(curl -fsS -o /dev/null -w "%{http_code}" "http://${P4D2_BIND_HOST}:$((DECODE_PORT + rank))/health" || true)"
+    if [[ "${code}" != "200" ]]; then
+      echo "Decode rank ${rank} on port $((DECODE_PORT + rank)) is not healthy: ${code:-NA}" >&2
+      exit 1
+    fi
+  done
+  echo "MULTIPORT_DP_OK ranks=${DECODE_DP} ports=${decode_ports[*]}"
+fi
 
 read_prefill_prefix_cache_hits() {
   curl -fsS "http://${P4D2_BIND_HOST}:${PREFILL_PORT}/metrics" |
@@ -278,9 +307,17 @@ else
     curl -fsS "http://${P4D2_BIND_HOST}:$1/metrics" |
       awk -v want="^$2_total" '$0 ~ want { sum += $2 } END { printf "%.0f", sum + 0 }'
   }
+  # Summed over the decode ports: each multi-port rank reports its own engine.
+  read_decode_counter() {
+    local port total=0
+    for port in "${decode_ports[@]}"; do
+      total=$((total + $(read_spec_counter "${port}" "$1")))
+    done
+    echo "${total}"
+  }
 
-  decode_draft_tokens="$(read_spec_counter "${DECODE_PORT}" vllm:spec_decode_num_draft_tokens)"
-  decode_accepted_tokens="$(read_spec_counter "${DECODE_PORT}" vllm:spec_decode_num_accepted_tokens)"
+  decode_draft_tokens="$(read_decode_counter vllm:spec_decode_num_draft_tokens)"
+  decode_accepted_tokens="$(read_decode_counter vllm:spec_decode_num_accepted_tokens)"
   echo "MTP_DECODE_DRAFT_TOKENS ${decode_draft_tokens}"
   echo "MTP_DECODE_ACCEPTED_TOKENS ${decode_accepted_tokens}"
 

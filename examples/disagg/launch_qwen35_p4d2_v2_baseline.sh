@@ -128,6 +128,28 @@ PREFILL_PP="${PREFILL_PP:-1}"
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-1}"
 DECODE_TP="${DECODE_TP:-2}"
 DECODE_DP="${DECODE_DP:-1}"
+# 1 serves the decode leg as one API server per DP rank: vllm serve
+# --data-parallel-multi-port-external-lb with the tpu_multiport_dp option. Rank
+# r serves on DECODE_PORT + r, vLLM's DP supervisor on DECODE_SUPERVISOR_PORT,
+# and the ranks derive their TorchTPU slice bootstrap from
+# DECODE_DP_RPC_PORT and TORCH_TPU_BASE_PORT (docs/user_guide/disaggregated_serving.md).
+DECODE_MULTI_PORT_DP="${DECODE_MULTI_PORT_DP:-0}"
+DECODE_SUPERVISOR_PORT="${DECODE_SUPERVISOR_PORT:-9256}"
+DECODE_DP_RPC_PORT="${DECODE_DP_RPC_PORT:-29550}"
+if [[ "${DECODE_MULTI_PORT_DP}" != "0" && "${DECODE_MULTI_PORT_DP}" != "1" ]]; then
+  echo "DECODE_MULTI_PORT_DP must be 0 or 1: ${DECODE_MULTI_PORT_DP}" >&2
+  exit 2
+fi
+if [[ "${DECODE_MULTI_PORT_DP}" == "1" && "${DECODE_DP}" -lt 2 ]]; then
+  echo "DECODE_MULTI_PORT_DP=1 needs DECODE_DP >= 2, got ${DECODE_DP}" >&2
+  exit 2
+fi
+decode_ports=("${DECODE_PORT}")
+if [[ "${DECODE_MULTI_PORT_DP}" == "1" ]]; then
+  for ((r = 1; r < DECODE_DP; r++)); do
+    decode_ports+=("$((DECODE_PORT + r))")
+  done
+fi
 
 # One slicebuilder address per worker in each instance's TorchTPU slice.
 # The count must equal the instance's TorchTPU world size, or
@@ -231,6 +253,17 @@ for ((i = 0; i < decode_sb_workers; i++)); do
   managed_ports+=("$((DECODE_SB_PORT_BASE + i))")
 done
 managed_ports+=("${DECODE_DP_MASTER_PORT}")
+if [[ "${DECODE_MULTI_PORT_DP}" == "1" ]]; then
+  # The ports the multi-port ranks use (disaggregated_serving.md lists them).
+  managed_ports+=("${decode_ports[@]}" "${DECODE_SUPERVISOR_PORT}")
+  managed_ports+=("$((DECODE_DP_RPC_PORT + 1))")
+  for offset in 0 1 2 3 4; do
+    managed_ports+=("$((DECODE_DP_RPC_PORT + 100 + offset))")
+  done
+  for ((i = 0; i < decode_sb_workers; i++)); do
+    managed_ports+=("$((${TORCH_TPU_BASE_PORT:-8070} + i))")
+  done
+fi
 mapfile -t managed_ports < <(printf '%s\n' "${managed_ports[@]}" | sort -u)
 if [[ "${RESTART_EXISTING}" == "1" ]]; then
   stop_port_listeners "${managed_ports[@]}"
@@ -357,6 +390,8 @@ PREFILL_PP=${PREFILL_PP}
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE=${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}
 DECODE_TP=${DECODE_TP}
 DECODE_DP=${DECODE_DP}
+DECODE_MULTI_PORT_DP=${DECODE_MULTI_PORT_DP}
+DECODE_PORTS=${decode_ports[*]}
 PREFILL_COMPILE_SIZES=${PREFILL_COMPILE_SIZES}
 DECODE_COMPILE_SIZES=${DECODE_COMPILE_SIZES}
 MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS}
@@ -447,6 +482,22 @@ decode_args=(--port "${DECODE_PORT}" "${common_args[@]}" --max-num-batched-token
 if [[ "${DECODE_DP}" -gt 1 ]]; then
   decode_args+=(--data-parallel-size "${DECODE_DP}" --data-parallel-size-local "${DECODE_DP}")
 fi
+# The multi-port launch is vLLM's DP supervisor, which only `vllm serve`
+# starts; the OpenAI api_server entry point would serve one internal-LB server.
+decode_entry=(-m vllm.entrypoints.openai.api_server)
+decode_slice_env="export TORCH_TPU_SLICEBUILDER_ADDRESSES='${decode_sb_addresses}'; export TORCH_TPU_DP_MASTER_PORT='${DECODE_DP_MASTER_PORT}'; "
+if [[ "${DECODE_MULTI_PORT_DP}" == "1" ]]; then
+  decode_entry=(-m vllm.entrypoints.cli.main serve)
+  decode_args+=(
+    --data-parallel-multi-port-external-lb
+    --data-parallel-supervisor-port "${DECODE_SUPERVISOR_PORT}"
+    --data-parallel-rpc-port "${DECODE_DP_RPC_PORT}"
+    --additional-config '{"tpu_multiport_dp":{"enabled":true}}'
+  )
+  # Each rank derives the slice bootstrap itself, as a deployment without
+  # these variables does.
+  decode_slice_env=""
+fi
 if [[ -n "${PREFILL_SPECULATIVE_CONFIG}" ]]; then
   prefill_args+=(--speculative-config "${PREFILL_SPECULATIVE_CONFIG}")
 fi
@@ -467,7 +518,7 @@ if [[ -n "${PREFILL_MOE_FUSED_EP_KERNEL_IMPL}" ]]; then
   prefill_moe_env="export MOE_FUSED_EP_KERNEL_IMPL=${PREFILL_MOE_FUSED_EP_KERNEL_IMPL}; "
 fi
 prefill_cmd="${common_env}"$'\n'"${prefill_moe_env}export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
-decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${DECODE_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((DECODE_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${decode_sb_addresses}'; export TORCH_TPU_DP_MASTER_PORT='${DECODE_DP_MASTER_PORT}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
+decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${DECODE_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((DECODE_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}; ${decode_slice_env}$(shell_quote "${python_bin}") ${decode_entry[*]} $(printf '%q ' "${decode_args[@]}")"
 
 printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"
 printf '%s\n' "${decode_cmd}" >"${RUN_DIR}/decode_cmd.sh"
@@ -480,10 +531,22 @@ echo $! >"${RUN_DIR}/decode.pid"
 echo "prefill pid $(cat "${RUN_DIR}/prefill.pid")"
 echo "decode pid $(cat "${RUN_DIR}/decode.pid")"
 
+# The decode leg is healthy when every decode port (one per rank in the
+# multi-port launch) answers 200.
+decode_health() {
+  local port code codes="" all=200
+  for port in "${decode_ports[@]}"; do
+    code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${port}/health" 2>/dev/null || true)
+    codes+="${codes:+,}${code:-NA}"
+    [[ "${code}" == "200" ]] || all=""
+  done
+  echo "${all:-${codes}}"
+}
+
 health_log="${RUN_DIR}/logs/health_poll.log"
 for ((attempt = 1; attempt <= 120; attempt++)); do
   p_code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${PREFILL_PORT}/health" 2>/dev/null || true)
-  d_code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${DECODE_PORT}/health" 2>/dev/null || true)
+  d_code=$(decode_health)
   echo "$(date +%H:%M:%S) P=${p_code:-NA} D=${d_code:-NA}" | tee -a "${health_log}"
   if [[ "${p_code}" == "200" && "${d_code}" == "200" ]]; then
     break
@@ -502,7 +565,7 @@ for ((attempt = 1; attempt <= 120; attempt++)); do
 done
 
 p_code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${PREFILL_PORT}/health" 2>/dev/null || true)
-d_code=$(curl -fsS -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${DECODE_PORT}/health" 2>/dev/null || true)
+d_code=$(decode_health)
 if [[ "${p_code}" != "200" || "${d_code}" != "200" ]]; then
   echo "P/D did not become healthy: P=${p_code:-NA} D=${d_code:-NA}" >&2
   exit 1
@@ -512,7 +575,7 @@ proxy_cmd=$(cat <<EOF
 ${activation_cmd}
 cd $(shell_quote "${TORCHTPU_VLLM_SRC}");
 export PYTHONPATH=$(shell_quote "${TORCHTPU_VLLM_SRC}/src:${TORCHTPU_VLLM_SRC}:${VLLM_SRC}"):\${PYTHONPATH:-};
-$(shell_quote "${python_bin}") examples/disagg/toy_proxy_server.py --host '${SERVE_HOST}' --port '${PROXY_PORT}' --prefiller-hosts '${SERVE_HOST}' --prefiller-ports '${PREFILL_PORT}' --decoder-hosts '${SERVE_HOST}' --decoder-ports '${DECODE_PORT}'
+$(shell_quote "${python_bin}") examples/disagg/toy_proxy_server.py --host '${SERVE_HOST}' --port '${PROXY_PORT}' --prefiller-hosts '${SERVE_HOST}' --prefiller-ports '${PREFILL_PORT}' --decoder-hosts $(for _ in "${decode_ports[@]}"; do printf "'%s' " "${SERVE_HOST}"; done)--decoder-ports ${decode_ports[*]}
 EOF
 )
 printf '%s\n' "${proxy_cmd}" >"${RUN_DIR}/proxy_cmd.sh"
