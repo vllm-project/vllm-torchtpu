@@ -351,6 +351,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
     TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC: bool = False
     TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES: bool = False
+    TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
@@ -2384,6 +2385,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # buffer's scales. Same values (bit-exact); ignored with ASYNC=1.
     "TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES": env_bool(
         "TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES", default=False
+    ),
+    # COALESCE (synchronous exchange, not with DIRECT): "1" = both below with
+    # 32-slot chunks; else ':'-separated "g" (each source copies its own KV
+    # head's pages of every part straight to every replica of its own
+    # replica group, so only the other groups' pages are forwarded) and
+    # "c<slots>" (forward each source's received part in copies of that
+    # many consecutive slots instead of one copy per page). Same buffer
+    # contents in every live slot (bit-exact). Empty = off.
+    "TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE": env_str(
+        "TPU_MINIMAX_M3_DCP_EXCHANGE_COALESCE", ""
     ),
     # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
     # how its sorts run. Empty keeps three stable sorts (two of two operands);
