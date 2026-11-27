@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Intra-chip sharding of the latent-MoE projections.
+"""Intra-chip and full-TP column-parallel sharding of the latent-MoE projections.
 
 Like the hierarchical-EP tests, everything here is arithmetic that needs no
 TPU -- and everything here fails *silently* when wrong. A shard assigned by the
@@ -22,6 +22,7 @@ the right shape holding permuted numbers.
 from __future__ import annotations
 
 import collections
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -252,16 +253,28 @@ class _FakeGroup:
         self.rank_in_group = rank_in_group
 
 
+def _capture_warnings(monkeypatch, mod) -> list[str]:
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        mod.logger._resolve(),
+        "warning",
+        lambda message, *args, **_kwargs: warnings.append(
+            message % args if args else message
+        ),
+    )
+    return warnings
+
+
 @pytest.mark.parametrize(
-    "flag,group,output_size,why",
+    "flag,group,output_size,expect_warning,why",
     [
-        (False, _FakeGroup(2), 3584, "flag off"),
-        (True, None, 3584, "no usable chip group"),
-        (True, _FakeGroup(1), 3584, "one core per chip"),
-        (True, _FakeGroup(3), 3584, "does not divide evenly"),
+        (False, _FakeGroup(2), 3584, False, "flag off"),
+        (True, None, 3584, True, "no usable chip group"),
+        (True, _FakeGroup(1), 3584, True, "one core per chip"),
+        (True, _FakeGroup(3), 3584, True, "does not divide evenly"),
     ],
 )
-def test_declines_to_shard(monkeypatch, flag, group, output_size, why):
+def test_declines_to_shard(monkeypatch, flag, group, output_size, expect_warning, why):
     """Anything unclear must leave the projection replicated.
 
     Decision only: building the layer itself needs an initialized TP group,
@@ -272,9 +285,11 @@ def test_declines_to_shard(monkeypatch, flag, group, output_size, why):
 
     monkeypatch.setattr(envs, "TPU_LATENT_PROJ_INTRA_CHIP_TP", flag)
     monkeypatch.setattr(mod, "get_intra_chip_group", lambda: group)
-    monkeypatch.setattr(mod, "_warned", False)
+    warnings = _capture_warnings(monkeypatch, mod)
 
     assert mod.shard_group_or_none(output_size) is None, why
+    assert mod.shard_group_or_none(output_size) is None, why
+    assert len(warnings) == (1 if expect_warning else 0), why
 
 
 def test_shards_when_everything_lines_up(monkeypatch):
@@ -291,12 +306,8 @@ def test_shards_when_everything_lines_up(monkeypatch):
     assert mod.shard_group_or_none(7168) is group
 
 
-def _patch_tp_state(
-    monkeypatch, mod, *, initialized: bool, group, cores_per_chip: int
-) -> None:
-    """Replace the module's view of vLLM's parallel state and of the chip."""
-    from types import SimpleNamespace
-
+def _patch_tp_state(monkeypatch, mod, *, initialized: bool, group) -> None:
+    """Replace the module's view of vLLM's parallel state."""
     monkeypatch.setattr(
         mod,
         "parallel_state",
@@ -305,61 +316,71 @@ def _patch_tp_state(
             get_tp_group=lambda: group,
         ),
     )
-    monkeypatch.setattr(mod, "get_num_cores_per_chip", lambda: cores_per_chip)
+
+
+def test_tp_shard_flag_off_declines_silently(monkeypatch):
+    """When TPU_LATENT_PROJ_TP is off, decline without touching warnings."""
+    from vllm_torchtpu import envs
+    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
+
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_TP", False)
+    _patch_tp_state(monkeypatch, mod, initialized=True, group=_FakeGroup(16))
+    warnings = _capture_warnings(monkeypatch, mod)
+
+    assert mod.tp_shard_group_or_none(3584) is None
+    assert warnings == []
 
 
 @pytest.mark.parametrize(
-    "initialized,group,cores_per_chip,why",
+    "initialized,group,why",
     [
-        (False, _FakeGroup(4), 1, "model parallel not initialized"),
-        (True, None, 1, "no TP group"),
-        (True, _FakeGroup(1), 1, "TP world size 1"),
-        (True, _FakeGroup(4), 2, "two cores per chip: TP spans chips"),
+        (False, _FakeGroup(4), "model parallel not initialized"),
+        (True, None, "no TP group"),
+        (True, _FakeGroup(1), "TP world size 1"),
     ],
 )
-def test_tp_shard_declines_silently(
-    monkeypatch, initialized, group, cores_per_chip, why
+def test_tp_shard_flag_on_without_multi_rank_group_warns_once(
+    monkeypatch, initialized, group, why
 ):
-    """Expected states of an always-on path: replicate without a warning."""
+    """Enabling TPU_LATENT_PROJ_TP without a multi-rank TP group warns once."""
+    from vllm_torchtpu import envs
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
-    _patch_tp_state(
-        monkeypatch,
-        mod,
-        initialized=initialized,
-        group=group,
-        cores_per_chip=cores_per_chip,
-    )
-    monkeypatch.setattr(mod, "_warned", False)
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_TP", True)
+    _patch_tp_state(monkeypatch, mod, initialized=initialized, group=group)
+    warnings = _capture_warnings(monkeypatch, mod)
 
     assert mod.tp_shard_group_or_none(3584) is None, why
-    assert mod._warned is False, why
+    assert mod.tp_shard_group_or_none(3584) is None, why
+    assert len(warnings) == 1, why
+    assert "no multi-rank TP group" in warnings[0], why
 
 
 def test_tp_shard_declines_uneven_output_with_one_warning(monkeypatch):
+    from vllm_torchtpu import envs
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
-    _patch_tp_state(
-        monkeypatch, mod, initialized=True, group=_FakeGroup(3), cores_per_chip=1
-    )
-    monkeypatch.setattr(mod, "_warned", False)
-    warnings: list[str] = []
-    monkeypatch.setattr(
-        mod.logger, "warning", lambda message, *args: warnings.append(message)
-    )
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_TP", True)
+    _patch_tp_state(monkeypatch, mod, initialized=True, group=_FakeGroup(3))
+    warnings = _capture_warnings(monkeypatch, mod)
 
     assert mod.tp_shard_group_or_none(3584) is None
     assert mod.tp_shard_group_or_none(3584) is None
     assert len(warnings) == 1
+    assert "TP ranks" in warnings[0]
 
 
-def test_tp_shard_uses_the_tp_group_on_one_core_chips(monkeypatch):
+def test_tp_shard_uses_the_tp_group_when_enabled(monkeypatch):
+    from vllm_torchtpu import envs
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
     group = _FakeGroup(16, rank_in_group=3)
-    _patch_tp_state(monkeypatch, mod, initialized=True, group=group, cores_per_chip=1)
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_TP", True)
+    _patch_tp_state(monkeypatch, mod, initialized=True, group=group)
+    warnings = _capture_warnings(monkeypatch, mod)
 
     assert mod.tp_shard_group_or_none(3584) is group
+    assert warnings == []
 
 
 class _RecordedSharded:
@@ -378,71 +399,88 @@ class _RecordedReplicated:
 
 
 def _make_projection(
-    monkeypatch, mod, *, flag: bool, chip_group, output_size: int = 16
+    monkeypatch,
+    mod,
+    *,
+    tp_flag: bool,
+    intra_chip_flag: bool,
+    chip_group,
+    output_size: int = 16,
 ):
     """Run ``make_latent_projection`` and return ``(layer, warning messages)``."""
     from vllm_torchtpu import envs
 
-    warnings: list[str] = []
-    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_INTRA_CHIP_TP", flag)
+    warnings = _capture_warnings(monkeypatch, mod)
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_TP", tp_flag)
+    monkeypatch.setattr(envs, "TPU_LATENT_PROJ_INTRA_CHIP_TP", intra_chip_flag)
     monkeypatch.setattr(mod, "get_intra_chip_group", lambda: chip_group)
     monkeypatch.setattr(mod, "IntraChipColumnParallelLinear", _RecordedSharded)
     monkeypatch.setattr(mod, "ReplicatedLinear", _RecordedReplicated)
-    monkeypatch.setattr(mod, "_warned", False)
-    monkeypatch.setattr(
-        mod.logger, "warning", lambda message, *args: warnings.append(message)
-    )
     layer = mod.make_latent_projection(
         32, output_size, bias=False, quant_config=None, prefix="proj"
     )
     return layer, warnings
 
 
-def test_flag_on_a_one_core_chip_shards_over_tp_without_a_false_warning(monkeypatch):
-    """The flag asks for an intra-chip group a one-core chip cannot have.
-
-    The projections are sharded over the TP group anyway, so nothing may claim
-    they were left replicated.
-    """
+def test_tp_flag_shards_over_tp_group(monkeypatch):
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
     tp_group = _FakeGroup(16, rank_in_group=3)
-    _patch_tp_state(
-        monkeypatch, mod, initialized=True, group=tp_group, cores_per_chip=1
-    )
+    _patch_tp_state(monkeypatch, mod, initialized=True, group=tp_group)
 
-    layer, warnings = _make_projection(monkeypatch, mod, flag=True, chip_group=None)
+    layer, warnings = _make_projection(
+        monkeypatch, mod, tp_flag=True, intra_chip_flag=False, chip_group=None
+    )
 
     assert isinstance(layer, _RecordedSharded)
     assert layer.shard_group is tp_group
     assert warnings == []
 
 
-def test_one_core_chip_indivisible_output_falls_back_to_replicated(monkeypatch):
+def test_both_flags_on_without_intra_chip_group_shards_over_tp_silently(monkeypatch):
+    """When both flags are on and no intra-chip group exists, TP sharding wins
+    without emitting a false intra-chip fallback warning."""
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
-    _patch_tp_state(
-        monkeypatch, mod, initialized=True, group=_FakeGroup(3), cores_per_chip=1
-    )
+    tp_group = _FakeGroup(16, rank_in_group=3)
+    _patch_tp_state(monkeypatch, mod, initialized=True, group=tp_group)
 
     layer, warnings = _make_projection(
-        monkeypatch, mod, flag=False, chip_group=None, output_size=16
+        monkeypatch, mod, tp_flag=True, intra_chip_flag=True, chip_group=None
+    )
+
+    assert isinstance(layer, _RecordedSharded)
+    assert layer.shard_group is tp_group
+    assert warnings == []
+
+
+def test_tp_flag_indivisible_output_falls_back_to_replicated(monkeypatch):
+    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
+
+    _patch_tp_state(monkeypatch, mod, initialized=True, group=_FakeGroup(3))
+
+    layer, warnings = _make_projection(
+        monkeypatch,
+        mod,
+        tp_flag=True,
+        intra_chip_flag=False,
+        chip_group=None,
+        output_size=16,
     )
 
     assert isinstance(layer, _RecordedReplicated)
     assert len(warnings) == 1
+    assert "TP ranks" in warnings[0]
 
 
-def test_multi_core_chip_prefers_the_chip_group_over_the_tp_group(monkeypatch):
+def test_intra_chip_flag_uses_chip_group_when_tp_flag_is_off(monkeypatch):
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
     chip_group = _FakeGroup(2, rank_in_group=1)
-    _patch_tp_state(
-        monkeypatch, mod, initialized=True, group=_FakeGroup(16), cores_per_chip=2
-    )
+    _patch_tp_state(monkeypatch, mod, initialized=True, group=_FakeGroup(16))
 
     layer, warnings = _make_projection(
-        monkeypatch, mod, flag=True, chip_group=chip_group
+        monkeypatch, mod, tp_flag=False, intra_chip_flag=True, chip_group=chip_group
     )
 
     assert isinstance(layer, _RecordedSharded)
@@ -450,41 +488,32 @@ def test_multi_core_chip_prefers_the_chip_group_over_the_tp_group(monkeypatch):
     assert warnings == []
 
 
-def test_replicating_across_a_multi_rank_tp_group_warns_once(monkeypatch):
-    """A chip not known as one-core keeps the replicated default, and says so."""
+def test_both_flags_off_returns_replicated_silently(monkeypatch):
+    """Replication is the default when neither sharding flag is enabled."""
     from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
 
-    _patch_tp_state(
-        monkeypatch, mod, initialized=True, group=_FakeGroup(16), cores_per_chip=2
+    _patch_tp_state(monkeypatch, mod, initialized=True, group=_FakeGroup(16))
+
+    layer, warnings = _make_projection(
+        monkeypatch, mod, tp_flag=False, intra_chip_flag=False, chip_group=None
     )
-
-    layer, warnings = _make_projection(monkeypatch, mod, flag=False, chip_group=None)
-    mod.make_latent_projection(32, 16, bias=False, quant_config=None, prefix="proj")
-
-    assert isinstance(layer, _RecordedReplicated)
-    assert len(warnings) == 1
-    assert "replicated" in warnings[0]
-
-
-def test_replicating_without_a_multi_rank_tp_group_is_silent(monkeypatch):
-    from vllm_torchtpu.layers.adapter import latent_proj_intra_chip as mod
-
-    _patch_tp_state(
-        monkeypatch, mod, initialized=True, group=_FakeGroup(1), cores_per_chip=2
-    )
-
-    layer, warnings = _make_projection(monkeypatch, mod, flag=False, chip_group=None)
 
     assert isinstance(layer, _RecordedReplicated)
     assert warnings == []
 
 
-def test_intra_chip_linear_exposes_public_shard_group_and_all_gathers():
-    from types import SimpleNamespace
+def test_intra_chip_linear_exposes_public_shard_group_and_all_gathers(
+    monkeypatch, request
+):
+    from vllm.platforms import current_platform
 
     from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
         IntraChipColumnParallelLinear,
     )
+
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
+    request.getfixturevalue("dist_ctx")
 
     gathered_inputs: list[tuple[torch.Tensor, int]] = []
     group = SimpleNamespace(
@@ -494,20 +523,32 @@ def test_intra_chip_linear_exposes_public_shard_group_and_all_gathers():
             gathered_inputs.append((t, dim)) or torch.cat((t, t + 1.0), dim=dim)
         ),
     )
-    proj = IntraChipColumnParallelLinear.__new__(IntraChipColumnParallelLinear)
-    torch.nn.Module.__init__(proj)
-    proj.shard_group = group
-    proj.input_size = 8
-    proj.output_size = 4
-    proj.output_size_per_partition = 2
-    proj.tp_size = 2
-    proj.bias = None
-    proj.skip_bias_add = False
-    proj.quant_method = SimpleNamespace(apply=lambda _layer, x, _bias: x[:, :2])
+    proj = IntraChipColumnParallelLinear(
+        8, 4, bias=False, quant_config=None, prefix="proj", group=group
+    )
+    with torch.no_grad():
+        proj.weight.copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    [0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ],
+                dtype=proj.weight.dtype,
+            )
+        )
 
-    out, out_bias = proj(torch.ones(3, 8))
+    x = torch.arange(24, dtype=proj.weight.dtype).reshape(3, 8)
+    out, out_bias = proj(x)
+    expected_shard = torch.nn.functional.linear(x, proj.weight)
+    expected = torch.cat((expected_shard, expected_shard + 1.0), dim=-1)
+
     assert proj.shard_group is group
+    assert proj.weight.shape == (2, 8)
     assert out_bias is None
     assert len(gathered_inputs) == 1 and gathered_inputs[0][1] == -1
-    assert out.shape == (3, 4)
-    assert "shard_group_size=2" in proj.extra_repr()
+    assert torch.equal(out[:, :2], expected_shard)
+    assert torch.equal(out[:, 2:], out[:, :2] + 1.0)
+    assert torch.equal(out, expected)
+    repr_str = proj.extra_repr()
+    assert "out_per_shard=2" in repr_str
+    assert "shard_group_size=2" in repr_str

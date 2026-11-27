@@ -31,7 +31,10 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
 from vllm_torchtpu.layers.adapter import moe_routing
-from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import make_latent_projection
+from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
+    IntraChipColumnParallelLinear,
+    make_latent_projection,
+)
 from vllm_torchtpu.layers.adapter.moe_hierarchical import (
     hierarchical_moe_parallel_config,
     hierarchical_split_or_none,
@@ -50,7 +53,7 @@ class KimiRoutedOutputTransform(nn.Module):
     def __init__(
         self,
         norm: RMSNorm | None,
-        # Replicated or intra-chip sharded; both return ``(output, bias)``.
+        # Replicated or TP / intra-chip column-sharded; all return ``(output, bias)``.
         up_proj: nn.Module,
     ) -> None:
         super().__init__()
@@ -104,9 +107,9 @@ class KimiMoE(nn.Module):
             torch.zeros(config.num_experts)
         )
 
-        # TP-sharded on single-core chips, or sharded across a chip's cores
-        # under TPU_LATENT_PROJ_INTRA_CHIP_TP; replicated otherwise. These two
-        # are the model's largest unquantized weights.
+        # Column-sharded across the TP group (TPU_LATENT_PROJ_TP) or a chip's
+        # cores (TPU_LATENT_PROJ_INTRA_CHIP_TP); replicated otherwise. These
+        # two are the model's largest unquantized weights.
         self.routed_expert_down_proj = (
             make_latent_projection(
                 hidden_size,
@@ -276,6 +279,16 @@ class KimiMoE(nn.Module):
         self, hidden_states: torch.Tensor, sequence_parallel: bool
     ) -> torch.Tensor:
         """Run EP experts with sharded or replicated tokens, then add shared experts."""
+        if sequence_parallel and (
+            isinstance(self.routed_expert_down_proj, IntraChipColumnParallelLinear)
+            or isinstance(self.routed_expert_up_proj, IntraChipColumnParallelLinear)
+        ):
+            raise ValueError(
+                "Column-sharded latent MoE projections "
+                "(TPU_LATENT_PROJ_TP / TPU_LATENT_PROJ_INTRA_CHIP_TP) "
+                "require replicated token inputs and are incompatible with "
+                "sequence-parallel MoE (TPU_K3_SP_PREFILL)."
+            )
         group = self.prefill_group
         assert group is not None
         router_logits, _ = self.gate(hidden_states)

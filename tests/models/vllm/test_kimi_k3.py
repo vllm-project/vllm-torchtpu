@@ -1984,6 +1984,48 @@ def test_sp_moe_reduces_latent_before_norm_and_up_projection(monkeypatch, gather
     assert all(entry[1][-1] == 2 for entry in calls)
 
 
+@pytest.mark.parametrize("sharded_proj", ["down", "up"])
+def test_sp_moe_rejects_column_sharded_latent_projections(
+    monkeypatch: pytest.MonkeyPatch, sharded_proj: str
+) -> None:
+    import vllm.model_executor.parameter as parameter_module
+
+    from vllm_torchtpu.layers.adapter.latent_proj_intra_chip import (
+        IntraChipColumnParallelLinear,
+    )
+
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    group = SimpleNamespace(
+        rank_in_group=0,
+        world_size=2,
+        all_gather=lambda t, dim=-1: torch.cat((t, t), dim=dim),
+    )
+    sharded = IntraChipColumnParallelLinear(
+        4, 4, bias=False, quant_config=None, prefix="proj", group=group
+    )
+    replicated = nn.Identity()
+
+    model = kimi_moe.KimiMoE.__new__(kimi_moe.KimiMoE)
+    nn.Module.__init__(model)
+    model.prefill_group = SimpleNamespace()
+    model.routed_expert_down_proj = sharded if sharded_proj == "down" else replicated
+    model.routed_expert_up_proj = sharded if sharded_proj == "up" else replicated
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Column-sharded latent MoE projections "
+            r"\(TPU_LATENT_PROJ_TP / TPU_LATENT_PROJ_INTRA_CHIP_TP\) "
+            r"require replicated token inputs and are incompatible with "
+            r"sequence-parallel MoE \(TPU_K3_SP_PREFILL\)\."
+        ),
+    ):
+        model._forward_expert_parallel(torch.ones(1, 4), True)
+
+
 def test_sp_prefill_trace_accepts_dynamic_token_dimension():
     from vllm_torchtpu.models.vllm.kimi_k3.collective_ops import FusedPrefillCollectives
     from vllm_torchtpu.models.vllm.kimi_k3.model import KimiModel
