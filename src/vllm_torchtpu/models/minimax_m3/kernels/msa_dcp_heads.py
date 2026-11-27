@@ -1040,6 +1040,405 @@ def _attend_row_split(attend, q, kv, keys, local, limit, page_table, *, rank,
     return jnp.moveaxis(recv, 0, 2).reshape(num_q_heads, num_tokens, head_dim)
 
 
+HP_BALANCE_ENV = "TPU_MINIMAX_M3_DCP_HP_BALANCE"
+# (max fraction of a replica's tiles that may move, a priced tile's fixed
+# cost, the helper call's fixed cost), in pages of kernel work: at 8:64 a
+# tile costs ~300 bundles plus ~66 per distinct page (K1 LLO counts).
+_BALANCE_DEFAULTS = (0.25, 4.0, 64.0)
+_BALANCE_SYNC = "sync"
+_balance_logged = False
+
+
+def hp_balance() -> tuple[float, float, float, bool] | None:
+    """TPU_MINIMAX_M3_DCP_HP_BALANCE (read at trace time through `envs`):
+    ``(max tile fraction, tile cost, call cost, asynchronous partner
+    exchange)``, or None when off. A fourth field ``sync`` runs the partner
+    exchange as one kernel after the rank's own call."""
+    global _balance_logged
+    from vllm_torchtpu import envs
+
+    spec = envs.TPU_MINIMAX_M3_DCP_HP_BALANCE.strip()
+    if spec in ("", "0"):
+        return None
+    parts = [] if spec == "1" else spec.split(":")
+    if len(parts) not in (0, 3, 4) or parts[3:] not in ([], [_BALANCE_SYNC]):
+        raise ValueError(
+            f"{HP_BALANCE_ENV}={spec!r}: want 1 or frac:tile_cost:call_cost[:sync]"
+        )
+    cfg = tuple(
+        float(p) if p else d for p, d in zip(parts[:3], _BALANCE_DEFAULTS)
+    ) if parts else _BALANCE_DEFAULTS
+    cfg = (*cfg, parts[3:] != [_BALANCE_SYNC])
+    if not _balance_logged:
+        _balance_logged = True
+        init_logger(__name__).warning(
+            "%s=%s: head-parallel MSA prefill hands up to %.0f%% of a heavy KV "
+            "head's tiles to its partner head (tile cost %.1f, call cost %.1f).",
+            HP_BALANCE_ENV,
+            spec,
+            100 * cfg[0],
+            cfg[1],
+            cfg[2],
+        )
+    return cfg
+
+
+def tile_costs(keys: jax.Array, block_q: int, tile_cost: float) -> jax.Array:
+    """Kernel work of each ``block_q``-row tile of ``keys [T, K]`` (page
+    slots, -1 for none): the tile's distinct slots plus `tile_cost`, 0 for a
+    tile without any. No sort: an entry counts unless an earlier entry of
+    its tile holds the same slot."""
+    num_tokens, topk = keys.shape
+    n = block_q * topk
+    x = keys.reshape(num_tokens // block_q, n)
+    earlier = jnp.arange(n)[:, None] > jnp.arange(n)[None, :]
+    dup = jnp.any((x[:, :, None] == x[:, None, :]) & earlier[None], axis=2)
+    distinct = jnp.sum((x >= 0) & ~dup, axis=1).astype(jnp.float32)
+    return jnp.where(distinct > 0, distinct + tile_cost, 0.0)
+
+
+def balance_plan(
+    costs: jax.Array, *, replicas: int, max_tiles: int, call_cost: float
+) -> tuple[jax.Array, jax.Array]:
+    """``(steal, end)``, each ``[heads, replicas]`` int32, from ``costs
+    [heads, tiles]`` (head ``h``'s tile prices; tile ``i`` runs on replica
+    ``i % replicas``, as its ``i // replicas``-th tile). ``end[h, j]``: one
+    past head ``h``'s replica ``j``'s last priced tile. ``steal[h, j]``:
+    the tiles before ``end`` that replica hands to replica ``j`` of the
+    partner head ``h ^ 1``, as many (at most `max_tiles`) as keep it at
+    least as loaded as the partner plus `call_cost`; 0 unless ``h`` is the
+    heavier of the pair on that replica."""
+    heads, tiles = costs.shape
+    per = tiles // replicas
+    c = costs.reshape(heads, per, replicas).transpose(0, 2, 1)
+    work = jnp.sum(c, axis=-1)  # [heads, replicas]
+    idx = jnp.arange(per, dtype=jnp.int32)
+    end = jnp.max(jnp.where(c > 0, idx + 1, 0), axis=-1)
+    partner = jnp.arange(heads) ^ 1
+    budget = (work - work[partner] - call_cost) / 2
+    # tail[.., k]: the k + 1 tiles before `end` (prices >= 0: non-decreasing);
+    # the reversed prices start with `per - end` zeros.
+    csum = jnp.cumsum(c[..., ::-1], axis=-1)
+    at = (per - end)[..., None] + jnp.arange(max_tiles, dtype=jnp.int32)
+    tail = jnp.take_along_axis(csum, jnp.minimum(at, per - 1), axis=-1)
+    tail = jnp.where(at < per, tail, jnp.inf)
+    n = jnp.sum(tail <= budget[..., None], axis=-1)
+    return jnp.where(budget > 0, n, 0).astype(jnp.int32), end.astype(jnp.int32)
+
+
+def _partner_sends(pages_ref, live_ref, rank_ref, need_ref, kv_ref, sc_ref,
+                   out_ref, sc_out_ref, sems, *, axis, dcp, replicas, part,
+                   head_width, scale_row0):
+    """`exchange_partner_pages_start`'s kernel body: the barrier, then
+    every copy started."""
+    send_sem, recv_sem, sc_send_sem, sc_recv_sem = sems
+    me = rank_ref[0]
+    counts = [live_part(live_ref[0], j, replicas, part) for j in range(replicas)]
+    barrier = pltpu.get_barrier_semaphore()
+    for d in range(dcp):
+        pl.semaphore_signal(
+            barrier,
+            inc=1,
+            device_id={axis: jnp.int32(d)},
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+    pl.semaphore_wait(barrier, dcp)
+
+    def remote(src, dst, send, recv, d):
+        return pltpu.make_async_remote_copy(
+            src, dst, send, recv,
+            device_id={axis: d},
+            device_id_type=pl.DeviceIdType.MESH,
+        )
+
+    for j in range(replicas):
+
+        def body(i, carry, j=j):
+            page = pages_ref[j * part + i]
+            for d in range(dcp):
+                other = (d // replicas) ^ 1
+
+                def send(d=d, other=other):
+                    columns = pl.ds(other * head_width, head_width)
+                    remote(
+                        kv_ref.at[page, :, :, columns],
+                        out_ref.at[j, me, i],
+                        send_sem, recv_sem, d,
+                    ).start()
+                    remote(
+                        sc_ref.at[page, pl.ds(scale_row0 + 2 * other, 2)],
+                        sc_out_ref.at[j, me, i, pl.ds(0, 2)],
+                        sc_send_sem, sc_recv_sem, d,
+                    ).start()
+
+                pl.when(need_ref[d] > 0)(send)
+            return carry
+
+        jax.lax.fori_loop(0, counts[j], body, 0)
+
+
+def _partner_waits(live_ref, rank_ref, need_ref, out_ref, sc_out_ref, sems, *,
+                   dcp, replicas, part):
+    """`exchange_partner_pages_wait`'s kernel body: this rank's sends and,
+    if it needs them, its receives retired."""
+    send_sem, recv_sem, sc_send_sem, sc_recv_sem = sems
+    me = rank_ref[0]
+    total = sum(live_part(live_ref[0], j, replicas, part) for j in range(replicas))
+    takers = sum((need_ref[d] > 0).astype(jnp.int32) for d in range(dcp))
+    mine = jnp.where(need_ref[me] > 0, total * dcp, 0)
+
+    def waits(sem, sc_sem):
+        def wait(i, carry):
+            page = out_ref.at[0, 0, 0]
+            pltpu.make_async_copy(page, page, sem).wait()
+            rows = sc_out_ref.at[0, 0, 0, pl.ds(0, 2)]
+            pltpu.make_async_copy(rows, rows, sc_sem).wait()
+            return carry
+
+        return wait
+
+    jax.lax.fori_loop(0, total * takers, waits(send_sem, sc_send_sem), 0)
+    jax.lax.fori_loop(0, mine, waits(recv_sem, sc_recv_sem), 0)
+
+
+def _partner_shapes(kv_cache, scale_cache, num_pages, *, dcp, replicas, head_width):
+    _, rows, packing, _ = kv_cache.shape
+    if kv_cache.dtype != jnp.uint8:
+        raise ValueError(f"4-bit (uint8) caches only, got {kv_cache.dtype}")
+    part = num_pages // replicas
+    return part, (
+        jax.ShapeDtypeStruct(
+            (replicas, dcp, part, rows, packing, head_width), kv_cache.dtype
+        ),
+        jax.ShapeDtypeStruct((replicas, dcp, part, *scale_cache.shape[1:]), jnp.float32),
+    )
+
+
+def exchange_partner_pages_start(
+    kv_cache: jax.Array,
+    scale_cache: jax.Array,
+    scale_row0: int,
+    pages: jax.Array,
+    live: jax.Array,
+    rank: jax.Array,
+    need: jax.Array,
+    *,
+    axis: str,
+    dcp: int,
+    replicas: int,
+    head_width: int,
+    interpret: bool = False,
+):
+    """Starts copying, to every rank ``d`` with ``need[d] > 0``, this rank's
+    live pages (every part) of ``d``'s partner KV head ``d // replicas ^
+    1`` and their K/V scale rows, into buffers laid out as
+    `exchange_head_pages` lays out the partner head's own (``[replicas, dcp,
+    L / replicas, ...]``, scale rows at 0 / 1): a key's slot is the same on
+    both heads' ranks. Returns the future ``(out, scales, send, recv,
+    scale send, scale recv)`` for `exchange_partner_pages_wait`; `kv_cache`
+    and `scale_cache` stay unchanged until then."""
+    part, shapes = _partner_shapes(
+        kv_cache, scale_cache, pages.shape[0], dcp=dcp, replicas=replicas,
+        head_width=head_width,
+    )
+
+    def kernel(pages_ref, live_ref, rank_ref, need_ref, kv_ref, sc_ref,
+               out_ref, sc_out_ref, *sems):
+        _partner_sends(
+            pages_ref, live_ref, rank_ref, need_ref, kv_ref, sc_ref, out_ref,
+            sc_out_ref, sems, axis=axis, dcp=dcp, replicas=replicas, part=part,
+            head_width=head_width, scale_row0=scale_row0,
+        )
+
+    any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    sem_spec = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            grid=(1,),
+            in_specs=[any_spec, any_spec],
+            out_specs=(any_spec, any_spec) + (sem_spec,) * 4,
+        ),
+        out_shape=shapes + (pltpu.SemaphoreType.DMA(()),) * 4,
+        compiler_params=pltpu.CompilerParams(
+            collective_id=_EXCHANGE_COLLECTIVE_ID, has_side_effects=True
+        ),
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name="minimax_m3_msa_dcp_exchange_partner_start",
+    )(pages, live, rank, need, kv_cache, scale_cache)
+
+
+def exchange_partner_pages_wait(
+    future,
+    live: jax.Array,
+    rank: jax.Array,
+    need: jax.Array,
+    *,
+    dcp: int,
+    replicas: int,
+    interpret: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Retires `exchange_partner_pages_start`'s copies: this rank's sends
+    and, if ``need[rank] > 0``, every rank's live pages of its partner head.
+    Returns ``(pages, scales)`` as `exchange_head_pages` shapes them."""
+    out, sc_out = future[:2]
+    part = out.shape[2]
+
+    def kernel(live_ref, rank_ref, need_ref, buf_ref, sc_buf_ref, *refs):
+        del buf_ref, sc_buf_ref  # aliased to the outputs
+        sems, (out_ref, sc_out_ref) = refs[:4], refs[4:]
+        _partner_waits(
+            live_ref, rank_ref, need_ref, out_ref, sc_out_ref, sems,
+            dcp=dcp, replicas=replicas, part=part,
+        )
+
+    any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    sem_spec = pl.BlockSpec(memory_space=pltpu.SEMAPHORE)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(1,),
+            in_specs=[any_spec, any_spec] + [sem_spec] * 4,
+            out_specs=(any_spec, any_spec),
+        ),
+        out_shape=(
+            jax.ShapeDtypeStruct(out.shape, out.dtype),
+            jax.ShapeDtypeStruct(sc_out.shape, sc_out.dtype),
+        ),
+        input_output_aliases={3: 0, 4: 1},
+        compiler_params=pltpu.CompilerParams(has_side_effects=True),
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name="minimax_m3_msa_dcp_exchange_partner_wait",
+    )(live, rank, need, *future)
+
+
+def exchange_partner_pages(
+    kv_cache, scale_cache, scale_row0, pages, live, rank, need, *, axis, dcp,
+    replicas, head_width, interpret=False,
+) -> tuple[jax.Array, jax.Array]:
+    """`exchange_partner_pages_start` and `_wait` as one synchronous kernel
+    (interpret mode does not model DMA semaphores that outlive a kernel)."""
+    part, shapes = _partner_shapes(
+        kv_cache, scale_cache, pages.shape[0], dcp=dcp, replicas=replicas,
+        head_width=head_width,
+    )
+
+    def kernel(pages_ref, live_ref, rank_ref, need_ref, kv_ref, sc_ref,
+               out_ref, sc_out_ref, *sems):
+        _partner_sends(
+            pages_ref, live_ref, rank_ref, need_ref, kv_ref, sc_ref, out_ref,
+            sc_out_ref, sems, axis=axis, dcp=dcp, replicas=replicas, part=part,
+            head_width=head_width, scale_row0=scale_row0,
+        )
+        _partner_waits(
+            live_ref, rank_ref, need_ref, out_ref, sc_out_ref, sems,
+            dcp=dcp, replicas=replicas, part=part,
+        )
+
+    any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=4,
+            grid=(1,),
+            in_specs=[any_spec, any_spec],
+            out_specs=(any_spec, any_spec),
+            scratch_shapes=[pltpu.SemaphoreType.DMA(())] * 4,
+        ),
+        out_shape=shapes,
+        compiler_params=pltpu.CompilerParams(collective_id=_EXCHANGE_COLLECTIVE_ID),
+        interpret=pltpu.InterpretParams() if interpret else False,
+        name="minimax_m3_msa_dcp_exchange_partner",
+    )(pages, live, rank, need, kv_cache, scale_cache)
+
+
+def _attend_row_split_balanced(attend, q, kv, keys, local, limit, page_table, *,
+                               steal, end, max_tiles, partner_start,
+                               partner_wait, rank, replicas, block_q, axis, dcp):
+    """`_attend_row_split` with `balance_plan`'s ``(steal, end)``: this rank
+    (head ``h``, replica ``j``) leaves its ``steal[h, j]`` tiles before
+    ``end[h, j]`` to replica ``j`` of the partner head, which attends them
+    after its own tiles over the partner head's pages (`partner_start` /
+    `partner_wait` around this rank's own call; the wait gives the attend
+    over those pages) and sends the outputs back. A window of `max_tiles`
+    tiles' queries and keys, ending at ``end`` where it fits, swaps between
+    the partners ahead of the calls. Every tile is the one the plain row
+    split computes (same rows, heads, pages, slots and order), so the
+    outputs match it bit for bit."""
+    num_tokens, num_q_heads, head_dim = q.shape
+    tiles = num_tokens // (replicas * block_q)
+    groups = [list(range(h * replicas, (h + 1) * replicas))
+              for h in range(dcp // replicas)]
+    me = jnp.reshape(rank, (-1,))[0]
+    j = me % replicas
+    head = me // replicas
+    give, my_end = steal[head, j], end[head, j]
+    take, its_end = steal[head ^ 1, j], end[head ^ 1, j]
+    perm = [(r, ((r // replicas) ^ 1) * replicas + r % replicas) for r in range(dcp)]
+
+    def mine(x):
+        x = x.reshape(tiles, replicas, block_q, *x.shape[1:])
+        x = jax.lax.dynamic_index_in_dim(x, j, axis=1, keepdims=False)
+        return x.reshape(tiles * block_q, *x.shape[2:])
+
+    send = q.reshape(tiles, replicas, block_q, num_q_heads, head_dim)
+    send = jnp.moveaxis(send, 1, 0)
+    recv = jax.lax.all_to_all(send, axis, 0, 0, axis_index_groups=groups)
+    q_rows = jnp.moveaxis(recv, 0, 2).reshape(
+        tiles * block_q, replicas * num_q_heads, head_dim
+    )
+    keys, local, limit = mine(keys), mine(local), mine(limit)
+    window = max_tiles * block_q
+
+    def start_of(e):  # first tile of the window ending at tile e
+        return jnp.clip(e - max_tiles, 0, tiles - max_tiles)
+
+    def win(x, first):
+        return jax.lax.dynamic_slice_in_dim(x, first * block_q, window, 0)
+
+    my_first, its_first = start_of(my_end), start_of(its_end)
+    row_tile = jnp.arange(tiles * block_q, dtype=jnp.int32) // block_q
+    given = (row_tile >= my_end - give) & (row_tile < my_end)
+    own_keys = jnp.where(given[:, None], -1, keys)
+    own_local = jnp.where(given, -1, local)
+    # The partner's window: queries (all its replica's heads) and keys.
+    q_win, k_win = jax.lax.ppermute(
+        (win(q_rows, my_first), win(keys, my_first)), axis, perm
+    )
+    future = partner_start()
+    future, q_rows, own_keys = jax.lax.optimization_barrier((future, q_rows, own_keys))
+    out, _ = attend(q_rows, kv, own_keys, own_local, limit, page_table)
+    attend_partner = partner_wait(future, out)
+    win_tile = jnp.arange(window, dtype=jnp.int32) // block_q
+    its_tile = its_first + win_tile
+    taken = (its_tile >= its_end - take) & (its_tile < its_end)
+
+    def helper(args):
+        q_win, k_win = args
+        return attend_partner(
+            q_win,
+            jnp.where(taken[:, None], k_win, -1),
+            jnp.where(taken, win(local, its_first), -1),
+            win(limit, its_first),
+        )[0]
+
+    def idle(args):
+        return jnp.zeros((replicas * num_q_heads, window, head_dim), out.dtype)
+
+    helped = jax.lax.cond(take > 0, helper, idle, (q_win, k_win))
+    back = jax.lax.ppermute(helped, axis, perm)
+    my_tile = my_first + win_tile
+    mask = (my_tile >= my_end - give) & (my_tile < my_end)
+    old = jax.lax.dynamic_slice_in_dim(out, my_first * block_q, window, 1)
+    tail = jnp.where(mask[None, :, None], back, old)
+    out = jax.lax.dynamic_update_slice_in_dim(out, tail, my_first * block_q, 1)
+    send = out.reshape(replicas, num_q_heads, tiles, block_q, head_dim)
+    recv = jax.lax.all_to_all(send, axis, 0, 0, axis_index_groups=groups)
+    return jnp.moveaxis(recv, 0, 2).reshape(num_q_heads, num_tokens, head_dim)
+
+
 def _head_parallel_attend(
     q,
     kv_cache,
@@ -1184,6 +1583,75 @@ def _head_parallel_attend(
                     dcp=dcp,
                 )
             return attend(q, kv, keys, local, limit, page_table)[0]
+
+        bal = hp_balance() if not merge and future is None else None
+        if (
+            bal is not None
+            and split
+            and (dcp // replicas) % 2 == 0
+            and q.shape[0] % (replicas * block_q) == 0
+        ):
+            # TPU_MINIMAX_M3_DCP_HP_BALANCE: the heavier KV head of each pair
+            # hands its last tiles to the lighter one (`balance_plan`).
+            tiles = q.shape[0] // (replicas * block_q)
+            max_tiles = max(1, min(tiles, int(bal[0] * tiles)))
+            costs = tile_costs(keys, block_q, bal[1])
+            costs = jax.lax.all_gather(costs, axis)[::replicas]
+            steal, end = balance_plan(
+                costs, replicas=replicas, max_tiles=max_tiles, call_cost=bal[2]
+            )
+            d = jnp.arange(dcp, dtype=jnp.int32)
+            need = steal[(d // replicas) ^ 1, d % replicas]
+            # Start after the first exchange (they share a barrier semaphore).
+            need = need + (kv.reshape(-1)[0] & 0).astype(jnp.int32)
+            sc_pages, sc_row0 = msa_fp4.split_scales(scale_cache)
+            rank1 = jnp.reshape(rank, (1,))
+            live1 = jnp.reshape(total, (1,))
+            _, kv_rows, kv_packing, _ = kv_cache.shape
+
+            # Interpret mode does not model DMA semaphores that outlive a
+            # kernel: the synchronous variant, after this rank's own call.
+            asynchronous = bal[3] and not interpret
+
+            def partner(need):
+                return (
+                    exchange_partner_pages_start
+                    if asynchronous
+                    else exchange_partner_pages
+                )(
+                    kv_cache, sc_pages, sc_row0, pages, live1, rank1, need,
+                    axis=axis, dcp=dcp, replicas=replicas,
+                    head_width=head_width, interpret=interpret,
+                )
+
+            def partner_start():
+                return partner(need) if asynchronous else need
+
+            def partner_wait(fut, deps):
+                fut, _ = jax.lax.optimization_barrier((fut, deps))
+                if asynchronous:
+                    kv2, sc2 = exchange_partner_pages_wait(
+                        fut, live1, rank1, need,
+                        dcp=dcp, replicas=replicas, interpret=interpret,
+                    )
+                else:
+                    kv2, sc2 = partner(fut)
+                kv2 = kv2.reshape(num_pages * dcp, kv_rows, kv_packing, head_width)
+                sc2 = sc2.reshape(num_pages * dcp, *sc2.shape[3:])
+
+                def attend_partner(q, keys, local, limit):
+                    return attend(q, kv2, keys, local, limit, page_table,
+                                  scale_cache=sc2)
+
+                return attend_partner
+
+            return _attend_row_split_balanced(
+                attend, q, kv, keys, local, limit, page_table,
+                steal=steal, end=end, max_tiles=max_tiles,
+                partner_start=partner_start,
+                partner_wait=partner_wait, rank=rank, replicas=replicas,
+                block_q=block_q, axis=axis, dcp=dcp,
+            )
 
         if not merge:
             # One call over every row: the kernel chunks the rows and writes

@@ -347,6 +347,7 @@ if TYPE_CHECKING:
     TPU_MINIMAX_M3_DCP_EXCHANGE_DIRECT: bool = False
     TPU_MINIMAX_M3_DCP_EXCHANGE_ASYNC: bool = False
     TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES: bool = False
+    TPU_MINIMAX_M3_DCP_HP_BALANCE: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_SORT: str = ""
     TPU_MINIMAX_M3_MSA_PAGE_CACHE_WIDTHS: str = ""
     TPU_MINIMAX_M3_MSA_PREFILL_PRECISION: str = ""
@@ -2348,6 +2349,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES": env_bool(
         "TPU_MINIMAX_M3_DCP_EXCHANGE_SCALES", default=False
     ),
+    # MiniMax M3 head-parallel MSA prefill (row split, synchronous exchange):
+    # balance the kernel work between the two KV heads of each head pair of a
+    # DCP group. Each rank prices its head's query tiles from the selection,
+    # the group gathers the prices, and the heavy head's replica j hands its
+    # last tiles to the light head's replica j, which receives the heavy
+    # head's pages by a second, asynchronous exchange and attends those tiles
+    # after its own. Same tiles over the same pages: bit-exact. Empty / "0"
+    # = off; "1" = defaults; "<max tile frac>:<tile fixed cost>:<call cost>"
+    # (cost units: pages per tile).
+    "TPU_MINIMAX_M3_DCP_HP_BALANCE": env_str("TPU_MINIMAX_M3_DCP_HP_BALANCE", ""),
     # MiniMax M3 MSA prefill page cache table (`msa_attention_lse._page_cache`):
     # how its sorts run. Empty keeps three stable sorts (two of two operands);
     # "unstable" drops the stability; "packed" sorts one packed int32 operand
