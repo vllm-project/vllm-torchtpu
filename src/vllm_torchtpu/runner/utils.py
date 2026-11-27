@@ -28,6 +28,7 @@ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
+from vllm_torchtpu.distributed import tpu_multiport_dp
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -52,14 +53,17 @@ PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY = (
 )
 RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY = "raiden_telemetry_backends"
 
-# Diagnostics-only knobs: they steer profiling or telemetry and never change
-# the compiled graph, so `_patch_vllm_config_hash_ignore_diagnostics` keeps
-# them out of the TPU compile cache key.
+# Knobs that never change the compiled graph, so
+# `_patch_vllm_config_hash_ignore_diagnostics` keeps them out of the TPU
+# compile cache key: the profiling and telemetry diagnostics above, and the
+# single-host multi-port DP launch topology, under which each engine compiles
+# the same programs as under internal-LB DP.
 HASH_IGNORED_ADDITIONAL_CONFIG_KEYS = frozenset(
     {
         PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
         PHASED_PROFILER_PREFILL_ONLY_KV_LEN_THRESHOLD_KEY,
         RAIDEN_TELEMETRY_BACKENDS_CONFIG_KEY,
+        tpu_multiport_dp.SECTION,
     }
 )
 

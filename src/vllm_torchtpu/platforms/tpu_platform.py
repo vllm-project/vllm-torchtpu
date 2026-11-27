@@ -1219,6 +1219,12 @@ class TpuPlatform(Platform):
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm_torchtpu.worker.tpu_worker.TPUWorker"
 
+        # Before the branches below: the --nnodes and Ray branches would accept
+        # the single-host multi-port DP option without applying it.
+        from vllm_torchtpu.distributed import tpu_multiport_dp
+
+        tpu_multiport_dp.validate(vllm_config)
+
         multihost_backend = envs.TPU_MULTIHOST_BACKEND
         if multihost_backend != "ray" and parallel_config.nnodes > 1:
             # Genuine multi-host run without Ray: each host runs its own
@@ -1261,6 +1267,11 @@ class TpuPlatform(Platform):
                 # binding no longer depends on torchrun-style
                 # RANK/LOCAL_RANK/WORLD_SIZE before vLLM distributed init.
                 os.environ["TORCH_TPU_DP_SIZE"] = str(dp_size)
+                # Single-host --data-parallel-multi-port-external-lb rank
+                # (opt-in, additional_config["tpu_multiport_dp"]): fixes the
+                # shared DP master port and slicebuilder list before the
+                # defaults below.
+                multiport_dp = tpu_multiport_dp.prepare_multiport_dp_env(vllm_config)
                 os.environ.setdefault(
                     "TORCH_TPU_DP_MASTER_ADDR",
                     parallel_config.data_parallel_master_ip or "localhost",
@@ -1284,7 +1295,7 @@ class TpuPlatform(Platform):
                     prepare_mp_multihost_dp_env,
                 )
 
-                if not prepare_mp_multihost_dp_env(
+                if multiport_dp or not prepare_mp_multihost_dp_env(
                     parallel_config, parallel_config.world_size_across_dp
                 ):
                     cls._prepare_singlehost_tpu_env(

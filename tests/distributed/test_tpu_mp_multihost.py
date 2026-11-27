@@ -208,3 +208,60 @@ def test_failed_bootstrap_can_retry(bootstrap):
     rendezvous.side_effect = None
     mp.prepare_mp_multihost_env(config)
     assert os.environ[mp._DONE_SENTINEL] == "2"
+
+
+def test_dp_master_port_list_is_derived_from_the_rpc_port():
+    ports = mp.dp_master_port_list(29550)
+    assert ports == [29650, 29651, 29652, 29653, 29654]
+    # vLLM pops ports off the list it holds; the next caller still gets five.
+    ports.pop()
+    assert mp.dp_master_port_list(29550) == [29650, 29651, 29652, 29653, 29654]
+
+
+def test_dp_bootstrap_takes_the_ports_from_the_helper(monkeypatch, bootstrap):
+    """The multi-port DP child calls the same helper (test_tpu_multiport_dp.py)."""
+    monkeypatch.setattr(mp, "dp_master_port_list", lambda rpc_port: [rpc_port, -1])
+    config = SimpleNamespace(
+        data_parallel_size=4,
+        data_parallel_size_local=2,
+        data_parallel_rank=0,
+        data_parallel_rpc_port=9000,
+        data_parallel_master_ip="10.0.0.1",
+        world_size=2,
+        cpu_distributed_timeout=None,
+    )
+    assert mp.prepare_mp_multihost_dp_env(config, 8)
+    assert config._data_parallel_master_port_list == [9000, -1]
+
+
+@pytest.mark.parametrize(
+    "host_ips,repeated",
+    [
+        # The four ranks of a multi-port DP server with the option off: four
+        # one-rank slices, all on this host.
+        (["10.0.0.1"] * 4, "['10.0.0.1']"),
+        (["10.0.0.1", "10.0.0.2", "10.0.0.1", "10.0.0.3"], "['10.0.0.1']"),
+        # A repeat that does not involve the first host.
+        (["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.2"], "['10.0.0.2']"),
+    ],
+)
+def test_dp_refuses_two_slices_on_one_host(bootstrap, host_ips, repeated):
+    rendezvous, topology = bootstrap
+    rendezvous.return_value = (host_ips, "session")
+    config = SimpleNamespace(
+        data_parallel_size=4,
+        data_parallel_size_local=1,
+        data_parallel_rank=2,
+        data_parallel_rpc_port=9000,
+        data_parallel_master_ip="127.0.0.1",
+        world_size=2,
+        cpu_distributed_timeout=None,
+    )
+    with pytest.raises(ValueError) as error:
+        mp.prepare_mp_multihost_dp_env(config, 8)
+    message = str(error.value)
+    assert f"with {repeated} more than once" in message
+    assert '{"tpu_multiport_dp": {"enabled": true}}' in message
+    topology.assert_not_called()
+    assert "TORCH_TPU_SLICEBUILDER_ADDRESSES" not in os.environ
+    assert mp._DP_DONE_SENTINEL not in os.environ

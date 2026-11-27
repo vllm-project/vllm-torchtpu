@@ -76,6 +76,26 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pcp4_2tp2dp_disagg_correctness.sh
 
+      # Nightly only: the step above with its decode leg served as one API
+      # server per DP rank (--data-parallel-multi-port-external-lb with the
+      # tpu_multiport_dp option), the launch no unit test starts. The script
+      # checks that each rank came up on its own port with its own slot.
+      - label: "Integration: Nightly qwen35-pcp4-2tp2dp-multiport-disagg-correctness"
+        key: "integration_nightly_qwen35_pcp4_2tp2dp_multiport_disagg_correctness"
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "perf_eval_results/qwen35_pcp4_2tp2dp_multiport_disagg_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh
+            env DECODE_MULTI_PORT_DP=1
+            bash ./scripts/vllm/integration/run_qwen35_pcp4_2tp2dp_disagg_correctness.sh
+
       # The prefill and decode layout (ROLE, PREFILL_*, DECODE_*,
       # TPU_RAIDEN_DST_SHARDS, VLLM_KV_CACHE_LAYOUT) is the script's own default;
       # those names do not reach the pod.

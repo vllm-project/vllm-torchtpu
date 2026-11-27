@@ -61,6 +61,7 @@ headless), regardless of which executor class each one ends up
 instantiating.
 """
 
+import json
 import os
 import time
 from datetime import timedelta
@@ -69,6 +70,10 @@ import torch.distributed as dist
 from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
+
+# For its SECTION name. tpu_multiport_dp imports dp_master_port_list from this
+# module inside a function, not at its top, so the two form no import cycle.
+from vllm_torchtpu.distributed import tpu_multiport_dp
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -200,6 +205,15 @@ def prepare_mp_multihost_env(parallel_config) -> None:
     )
 
 
+def dp_master_port_list(data_parallel_rpc_port: int) -> list[int]:
+    """vLLM's DP group ports (``ParallelConfig._data_parallel_master_port_list``)
+    computed from ``--data-parallel-rpc-port`` alone: ``rpc_port + 100`` to
+    ``rpc_port + 104``. Every process that builds its own ParallelConfig from
+    the same arguments gets the same five ports. A new list on every call:
+    vLLM pops ports off it."""
+    return [data_parallel_rpc_port + 100 + i for i in range(5)]
+
+
 def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     """Set TORCH_TPU_* env vars for genuine multi-host DP without Ray.
 
@@ -235,10 +249,9 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
     # Work around it by overwriting the list with ports computed identically
     # on every host from data_parallel_rpc_port (already CLI-identical), so
     # every host agrees without needing coordination of its own.
-    dp_rpc_port = parallel_config.data_parallel_rpc_port
-    parallel_config._data_parallel_master_port_list = [
-        dp_rpc_port + 100 + i for i in range(5)
-    ]
+    parallel_config._data_parallel_master_port_list = dp_master_port_list(
+        parallel_config.data_parallel_rpc_port
+    )
 
     if os.environ.get(_DP_DONE_SENTINEL) == str(dp_size):
         return True
@@ -268,6 +281,21 @@ def prepare_mp_multihost_dp_env(parallel_config, total_chips: int) -> bool:
         port=rendezvous_port,
         key_prefix="tpu_mp_dp",
     )
+
+    # Every peer of this rendezvous must be its own host, or the address list
+    # below names the same ip:port for more than one device. The ranks of a
+    # --data-parallel-multi-port-external-lb server reach this function as
+    # one-rank peers on one host when the multi-port option is off.
+    repeated = sorted({ip for ip in host_ips if host_ips.count(ip) > 1})
+    if repeated:
+        option = json.dumps({tpu_multiport_dp.SECTION: {"enabled": True}})
+        raise ValueError(
+            f"Multi-host DP needs each of its {num_hosts} DP slices "
+            f"(--data-parallel-size-local {dp_size_local}) on its own host, but "
+            f"the hosts reported {host_ips}, with {repeated} more than once. "
+            "For the DP ranks of a --data-parallel-multi-port-external-lb "
+            f"server on one host, pass --additional-config '{option}'."
+        )
 
     # One address per local chip on each host (world_size per DP replica x
     # data_parallel_size_local replicas here), ordered by (host, local

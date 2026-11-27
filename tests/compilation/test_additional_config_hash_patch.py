@@ -25,6 +25,7 @@ import pytest
 from vllm.config import VllmConfig
 
 from vllm_torchtpu import _patch_vllm_config_hash_ignore_diagnostics
+from vllm_torchtpu.distributed import tpu_multiport_dp
 from vllm_torchtpu.runner.utils import (
     HASH_IGNORED_ADDITIONAL_CONFIG_KEYS,
     PHASED_PROFILER_DECODE_ONLY_KV_LEN_THRESHOLD_KEY,
@@ -202,6 +203,9 @@ def test_patch_is_idempotent(patched_compute_hash):
 
 
 def test_ignored_keys_match_the_keys_the_runner_reads():
-    assert {KEY, PREFILL_KEY, RAIDEN_TELEMETRY_KEY} == (
-        HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
-    )
+    assert {
+        KEY,
+        PREFILL_KEY,
+        RAIDEN_TELEMETRY_KEY,
+        tpu_multiport_dp.SECTION,
+    } == HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
