@@ -1054,13 +1054,15 @@ class TPUModelRunner(GPUModelRunner):
 
         # Tracks token padding in each step.
         self._token_padding_state: token_padding.TokenPaddingState | None = None
-        # Last padded sampling params per (rows, dtype): host copies and the
-        # device tensors uploaded from them (_build_padded_sampling_params).
+        # Last sampling params per (rows, dtype): host copies of the active
+        # rows, the padded device tensors and their host sources
+        # (_build_padded_sampling_params).
         self._padded_sampling_params: dict[
             tuple[int, torch.dtype],
             tuple[
-                tuple[torch.Tensor, ...],
+                tuple[np.ndarray, ...],
                 tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None],
+                tuple[torch.Tensor, ...],
             ],
         ] = {}
 
@@ -7713,14 +7715,28 @@ class TPUModelRunner(GPUModelRunner):
         if padded_num_reqs is None:
             padded_num_reqs = logits.shape[0]
         num_active_reqs = cur_end_idx - cur_start_idx
+        # A batch keeps its sampling params from step to step: reuse the last
+        # upload when the active rows are unchanged (the consumers only read).
+        # The check reads numpy views; torch ops on tiny CPU tensors cost more
+        # host time than the whole comparison.
+        batch = self.input_batch
+        active = slice(cur_start_idx, cur_end_idx)
+        host = (
+            batch.temperature_cpu_tensor.numpy()[active],
+            batch.top_k_cpu_tensor.numpy()[active],
+            batch.top_p_cpu_tensor.numpy()[active],
+        )
+        key = (padded_num_reqs, logits.dtype)
+        cached = self._padded_sampling_params.get(key)
+        # A changed active row count changes the lengths, so it misses too.
+        if cached is not None and all(map(np.array_equal, cached[0], host)):
+            return cached[1]
+
         temps_cpu = torch.ones(padded_num_reqs, dtype=logits.dtype)
         top_k_cpu = torch.zeros(padded_num_reqs, dtype=torch.int32)
         top_p_cpu = torch.ones(padded_num_reqs, dtype=torch.float32)
-
-        temps_cpu[:num_active_reqs].copy_(
-            self.input_batch.temperature_cpu_tensor[cur_start_idx:cur_end_idx]
-        )
-        active_top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
+        temps_cpu[:num_active_reqs].copy_(torch.from_numpy(host[0]))
+        active_top_k = torch.from_numpy(host[1])
         top_k_cpu[:num_active_reqs].copy_(
             torch.where(
                 active_top_k >= self.vocab_size,
@@ -7728,17 +7744,7 @@ class TPUModelRunner(GPUModelRunner):
                 active_top_k,
             )
         )
-        top_p_cpu[:num_active_reqs].copy_(
-            self.input_batch.top_p_cpu_tensor[cur_start_idx:cur_end_idx]
-        )
-
-        # A batch keeps its sampling params from step to step: reuse the last
-        # upload when the padded rows are unchanged (the consumers only read).
-        host = (temps_cpu, top_k_cpu, top_p_cpu)
-        key = (padded_num_reqs, logits.dtype)
-        cached = self._padded_sampling_params.get(key)
-        if cached is not None and all(map(torch.equal, cached[0], host)):
-            return cached[1]
+        top_p_cpu[:num_active_reqs].copy_(torch.from_numpy(host[2]))
         temps = temps_cpu.unsqueeze(1).to(logits.device, non_blocking=True)
         # No row filters: None lets the samplers skip both full-vocab searches.
         # One decision for both keeps two compiled variants per bucket.
@@ -7748,7 +7754,13 @@ class TPUModelRunner(GPUModelRunner):
                 t.unsqueeze(1).to(logits.device, non_blocking=True)
                 for t in (top_k_cpu, top_p_cpu)
             )
-        self._padded_sampling_params[key] = (host, (temps, top_k, top_p))
+        # The entry also holds the padded host tensors: TorchTPU reads the
+        # source of a non-blocking upload asynchronously.
+        self._padded_sampling_params[key] = (
+            tuple(h.copy() for h in host),
+            (temps, top_k, top_p),
+            (temps_cpu, top_k_cpu, top_p_cpu),
+        )
         return temps, top_k, top_p
 
     def _init_fused_greedy_head(self) -> None:

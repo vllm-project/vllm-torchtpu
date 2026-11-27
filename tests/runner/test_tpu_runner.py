@@ -3396,6 +3396,12 @@ def test_padded_sampling_params_reuse_the_last_upload():
     assert changed[0] is not first[0]
     assert changed[0].view(-1).tolist() == pytest.approx([0.5, 1.0, 0.0, 1.0])
 
+    # Fewer active rows under the same padding: a miss, re-padded.
+    fewer = build(runner, 0, 2, logits)
+    assert fewer[0] is not changed[0]
+    assert fewer[0].view(-1).tolist() == pytest.approx([0.5, 1.0, 1.0, 1.0])
+    assert fewer[1].view(-1).tolist() == [5, 0, 0, 0]
+
 
 @pytest.mark.parametrize(
     "top_k, top_p, padded_top_k",
