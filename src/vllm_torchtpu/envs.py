@@ -359,6 +359,8 @@ if TYPE_CHECKING:
     TPU_SAMPLING_METADATA_FIXED_SHAPE_COPIES: bool = False
     TPU_SKIP_DEVICE_SAMPLING_METADATA: bool = False
     TPU_REUSE_UNCHANGED_BLOCK_TABLES: bool = False
+    TPU_COMPACT_NEW_REQ_TOKENS: bool = False
+    TPU_COMPACT_NEW_REQ_TOKENS_MIN: int = 4096
     TPU_SAMPLER_TOP_P_KERNEL: bool = False
     TPU_MOE_ONEHOT_BOUNDED_SUBLANE_TOKENS: bool = False
     TPU_MINIMAX_M3_KV4_INDEXER_LARGE_BLOCK_Q: int = 0
@@ -2453,6 +2455,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # walk and step, none queued behind KV-offload loads. Exact.
     "TPU_REUSE_UNCHANGED_BLOCK_TABLES": env_bool(
         "TPU_REUSE_UNCHANGED_BLOCK_TABLES", default=False
+    ),
+    # A new request's prompt token ids go to the workers as one int32 ndarray
+    # instead of a Python list (core/compact_prompt_tokens.py). The engine
+    # core's input thread converts the list once per request, off the busy
+    # loop; the scheduler output then pickles the ids as one out-of-band
+    # buffer, and the worker's unpickle and InputBatch row copy become
+    # memcpys. At c48 with 100K-680K-token agentic prompts, the list unpickle
+    # (~22 ms) and the list-to-row copy (~14 ms) ran on the worker main
+    # thread before every prefill chunk, with the device idle. Exact (same
+    # token values). Only prompts with at least
+    # TPU_COMPACT_NEW_REQ_TOKENS_MIN tokens are converted.
+    "TPU_COMPACT_NEW_REQ_TOKENS": env_bool(
+        "TPU_COMPACT_NEW_REQ_TOKENS", default=False
+    ),
+    "TPU_COMPACT_NEW_REQ_TOKENS_MIN": env_nonnegative_int(
+        "TPU_COMPACT_NEW_REQ_TOKENS_MIN", 4096
     ),
     # Token recovery without top-k or draft probabilities (the synthetic
     # verify's sampler) runs on a Pallas kernel holding each row as a dense
