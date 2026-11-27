@@ -30,6 +30,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from vllm import SamplingParams
+from vllm.config import ModelConfig
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
@@ -45,14 +46,20 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 import vllm_torchtpu
-from vllm_torchtpu.core import prefix_change_log
+from tests.test_srpt_prefill_scheduler import (
+    MODEL,
+    _build_real_scheduler,
+    _make_real_request,
+)
+from vllm_torchtpu.core import pp_chunk_scheduler, prefix_change_log
 from vllm_torchtpu.core.pp_chunk_scheduler import (
     TpuPipelineChunkScheduler,
 )
 from vllm_torchtpu.core.pp_chunks import StepCostModel
+from vllm_torchtpu.core.scheduler_utils import KvRoles
 
 HASH_BS = 2
 BS = 4
@@ -431,3 +438,84 @@ def test_quadratic_cost_reuses_prefix_hits_across_steps(engine_block_pool):
     # The memo answers what fresh lookups answer.
     for request in scheduler.waiting:
         assert scheduler._prefix_warmth(request) == _fresh_hit(kvm, request)
+
+
+# -- vLLM's own waiting loop -------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def opt_model_config():
+    return ModelConfig(model=MODEL, dtype="float16", seed=42, max_model_len=2048)
+
+
+def _real_pipeline_scheduler(model_config, prefix_aware: bool):
+    """A real pipeline chunk scheduler (the SRPT tests' builder: vLLM's
+    Scheduler.__init__, a real KVCacheManager), with a 16-token step budget,
+    the KV producer role the waiting-queue sort runs on, and the promotion
+    off, so only the sort can reorder the waiting queue."""
+    options = {"tpu_pp_scheduler": {"prefix_aware": prefix_aware}}
+    options["tpu_scheduler"] = {"promote_warmest": False}
+    with patch.object(
+        pp_chunk_scheduler,
+        "kv_roles",
+        lambda config: KvRoles(producer=True, consumer=False),
+    ):
+        return _build_real_scheduler(
+            model_config,
+            scheduler_cls=TpuPipelineChunkScheduler,
+            num_blocks=64,
+            max_num_seqs=4,
+            max_num_batched_tokens=16,
+            additional_config=options,
+        )
+
+
+@pytest.mark.parametrize("prefix_aware", [True, False])
+def test_the_real_waiting_loop_admits_in_the_sorted_order(
+    engine_block_pool, opt_model_config, prefix_aware
+):
+    """vLLM's schedule() on a real scheduler: with prefix_aware the sort puts
+    a returning request whose prompt is cached (8 uncached tokens) ahead of
+    an earlier cold one (40), vLLM's waiting loop admits it first, and its
+    admission lookup is answered from the memo the sort filled. Without
+    prefix_aware the loop admits in arrival order."""
+    scheduler, hasher = _real_pipeline_scheduler(opt_model_config, prefix_aware)
+    shared = list(range(500, 548))
+    seed = _make_real_request("seed", 48, hasher, shared_prefix=shared)
+    scheduler.add_request(seed)
+    # Three 16-token steps prefill and cache the shared prompt.
+    for _ in range(3):
+        scheduler.schedule()
+    assert seed.num_computed_tokens == seed.num_tokens
+    scheduler.finish_requests("seed", RequestStatus.FINISHED_ABORTED)
+    # An idle step: vLLM's step start marks the blocks the last step cached
+    # as written, so they can be hit (a prefix cached turns ago, as a
+    # returning request's is).
+    scheduler.schedule()
+    cold = _make_real_request("cold", 40, hasher, seed=7)
+    warm = _make_real_request("warm", 56, hasher, shared_prefix=shared)
+    warm.arrival_time = cold.arrival_time
+    scheduler.add_request(cold)
+    scheduler.add_request(warm)
+    memo_answers = {}
+    real_memo = pp_chunk_scheduler.memo_local_prefix_cache_hit
+
+    def recording_memo(s, request, max_cache_hit_length):
+        hit = real_memo(s, request, max_cache_hit_length)
+        memo_answers[request.request_id] = hit
+        return hit
+
+    with patch.object(
+        pp_chunk_scheduler, "memo_local_prefix_cache_hit", recording_memo
+    ):
+        out = scheduler.schedule()
+    admitted = [r.req_id for r in out.scheduled_new_reqs]
+    if prefix_aware:
+        assert scheduler._paw_sort and scheduler._paw_sort_reordered == 1
+        assert admitted[0] == "warm"
+        # vLLM's admission took the memoised hit: 48 cached tokens.
+        assert memo_answers["warm"] is not None and memo_answers["warm"][1] == 48
+        assert out.num_scheduled_tokens["warm"] == 8
+    else:
+        assert not scheduler._paw_sort and memo_answers == {}
+        assert admitted[0] == "cold"

@@ -61,7 +61,13 @@ def _build_real_scheduler(
     long_prefill_token_threshold: int = 0,
     scheduler_reserve_full_isl: bool = False,
     policy: str = "fcfs",
+    additional_config: dict | None = None,
 ):
+    """A real scheduler of ``scheduler_cls`` on CPU over one full-attention
+    KV cache group of ``num_blocks`` blocks, and the request block hasher.
+    ``additional_config`` is set after the config is built, so the
+    scheduler reads it without the platform's start-up checks of the
+    engine (one stage, no KV transfer here)."""
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=max_num_seqs,
@@ -101,6 +107,8 @@ def _build_real_scheduler(
         ],
     )
     vllm_config.cache_config.num_gpu_blocks = num_blocks
+    if additional_config is not None:
+        vllm_config.additional_config = additional_config
     register_all_kvcache_specs(vllm_config)
     scheduler = scheduler_cls(
         vllm_config=vllm_config,
