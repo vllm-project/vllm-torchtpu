@@ -423,6 +423,7 @@ run_json_schema_eval() {
     local pass_rule="scripts/vllm/benchmarking/baselines/eval/json_schema.pass_rule.baseline.json"
     local eval_log="${RESULTS_DIR}/eval_check_${task}.md"
 
+    rm -f "$RESULTS_DIR/results_${task}.json"
     echo "Running eval_json_schema.py for task: $task (task config: $JSON_SCHEMA_TASK_CONFIG)..."
     if ! python3 "$SCRIPT_DIR/eval_json_schema.py" \
         --base-url "$BASE_URL" \

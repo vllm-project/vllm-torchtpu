@@ -20,15 +20,18 @@ an endpoint that answers. The last test here covers one that does not.
 
 from __future__ import annotations
 
+import http.server
 import importlib.util
 import json
 import pathlib
 import socket
 import subprocess
 import sys
+import threading
 from typing import Any
 
 import pytest
+import yaml
 
 _SCRIPT = (
     pathlib.Path(__file__).resolve().parents[2]
@@ -218,6 +221,76 @@ def test_validator_reports_the_first_violation(schema, value, error):
             "additionalProperties at # is not true or false",
             id="additional_properties_as_a_schema",
         ),
+        pytest.param(
+            {"pattern": "[unclosed"},
+            "Invalid pattern '[unclosed' at #",
+            id="invalid_regex_pattern",
+        ),
+        pytest.param(
+            {"pattern": 123},
+            "pattern at # must be a string",
+            id="non_string_pattern",
+        ),
+        pytest.param(
+            {"$ref": 123},
+            "$ref at # must be a string",
+            id="non_string_ref",
+        ),
+        pytest.param(
+            {"enum": "ab"},
+            "enum at # must be a list",
+            id="enum_not_a_list",
+        ),
+        pytest.param(
+            {"required": "a"},
+            "required at # must be a list of strings",
+            id="required_not_a_list",
+        ),
+        pytest.param(
+            {"required": [1]},
+            "required at # must be a list of strings",
+            id="required_non_string_member",
+        ),
+        pytest.param(
+            {"anyOf": {"type": "string"}},
+            "anyOf at # must be a list",
+            id="any_of_not_a_list",
+        ),
+        pytest.param(
+            {"minimum": True},
+            "minimum at # must be a finite number",
+            id="minimum_is_bool",
+        ),
+        pytest.param(
+            {"maximum": float("inf")},
+            "maximum at # must be a finite number",
+            id="maximum_is_infinite",
+        ),
+        pytest.param(
+            {"minimum": float("nan")},
+            "minimum at # must be a finite number",
+            id="minimum_is_nan",
+        ),
+        pytest.param(
+            {"minItems": -1},
+            "minItems at # must be a non-negative integer",
+            id="min_items_negative",
+        ),
+        pytest.param(
+            {"minItems": True},
+            "minItems at # must be a non-negative integer",
+            id="min_items_is_bool",
+        ),
+        pytest.param(
+            {"properties": []},
+            "properties at # must be an object",
+            id="properties_not_an_object",
+        ),
+        pytest.param(
+            {"$defs": []},
+            "$defs at # must be an object",
+            id="defs_not_an_object",
+        ),
     ],
 )
 def test_validator_refuses_a_schema_it_cannot_check(schema, message):
@@ -225,6 +298,83 @@ def test_validator_refuses_a_schema_it_cannot_check(schema, message):
         eval_json_schema.SchemaValidator(schema)
 
     assert message in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("schema", "raw_json", "token"),
+    [
+        pytest.param(
+            {"type": "number", "minimum": 1, "maximum": 10},
+            "NaN",
+            "NaN",
+            id="top_level_nan",
+        ),
+        pytest.param(
+            {"type": "number", "minimum": 1, "maximum": 10},
+            "Infinity",
+            "Infinity",
+            id="top_level_infinity",
+        ),
+        pytest.param(
+            {"type": "number", "minimum": 1, "maximum": 10},
+            "-Infinity",
+            "-Infinity",
+            id="top_level_neg_infinity",
+        ),
+        pytest.param(
+            {
+                "type": "object",
+                "properties": {"limit": {"type": "number", "minimum": 1}},
+            },
+            '{"limit": NaN}',
+            "NaN",
+            id="nested_nan",
+        ),
+    ],
+)
+def test_validator_rejects_non_rfc_8259_constants(schema, raw_json, token):
+    validator = eval_json_schema.SchemaValidator(schema)
+
+    assert validator.check(raw_json, "stop") == f"Non-standard JSON constant {token!r}"
+
+
+@pytest.mark.parametrize(
+    ("pattern", "valid_value", "trailing_newline_value"),
+    [
+        pytest.param(
+            "^[a-z0-9-]+$",
+            "gateway-router",
+            "gateway-router\n",
+            id="service_slug",
+        ),
+        pytest.param(
+            r"^[\w\d\s]{1,16}$",
+            "1234567890123456",
+            "1234567890123456\n",
+            id="character_field_max_16",
+        ),
+        pytest.param(
+            r"^\$$",
+            "$",
+            "$\n",
+            id="escaped_dollar_then_anchor",
+        ),
+        pytest.param(
+            r"^[$]+$",
+            "$$",
+            "$$\n",
+            id="dollar_in_char_class_then_anchor",
+        ),
+    ],
+)
+def test_validator_enforces_ecma_end_anchor_without_trailing_newline(
+    pattern, valid_value, trailing_newline_value
+):
+    validator = eval_json_schema.SchemaValidator({"type": "string", "pattern": pattern})
+
+    assert validator.check(json.dumps(valid_value), "stop") is None
+    error = validator.check(json.dumps(trailing_newline_value), "stop")
+    assert error == f"String {trailing_newline_value!r} failed pattern {pattern!r}"
 
 
 def _write_task_config(tmp_path: pathlib.Path, config: Any) -> pathlib.Path:
@@ -346,6 +496,26 @@ _CASE = {
             "Case 'case': Schema keywords ['format'] at # are not checked",
             id="uncheckable_schema",
         ),
+        pytest.param(
+            {"cases": [{**_CASE, "limit": -1}]},
+            "Case 'case': limit must be a non-negative integer",
+            id="negative_limit",
+        ),
+        pytest.param(
+            {"cases": [{**_CASE, "limit": True}]},
+            "Case 'case': limit must be a non-negative integer",
+            id="bool_limit",
+        ),
+        pytest.param(
+            {"cases": [{**_CASE, "max_tokens": 0}]},
+            "Case 'case': max_tokens must be a positive integer",
+            id="zero_max_tokens",
+        ),
+        pytest.param(
+            {"cases": [{**_CASE, "max_tokens": True}]},
+            "Case 'case': max_tokens must be a positive integer",
+            id="bool_max_tokens",
+        ),
     ],
 )
 def test_load_cases_rejects_a_malformed_task_config(tmp_path, config, message):
@@ -358,6 +528,309 @@ def test_load_cases_rejects_a_malformed_task_config(tmp_path, config, message):
         eval_json_schema.load_cases(path)
 
     assert message in str(excinfo.value)
+
+
+def test_load_cases_wraps_yaml_os_json_and_missing_human_errors(tmp_path):
+    bad_yaml = tmp_path / "bad.yaml"
+    bad_yaml.write_text("cases:\n  - [unclosed\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Failed to read task config"):
+        eval_json_schema.load_cases(bad_yaml)
+
+    with pytest.raises(ValueError, match="Failed to read task config"):
+        eval_json_schema.load_cases(tmp_path / "missing.yaml")
+
+    bad_schema_cfg = _write_task_config(
+        tmp_path,
+        {
+            "cases": [
+                {
+                    "name": "bad_schema",
+                    "max_tokens": 32,
+                    "schema_path": "missing_schema.json",
+                    "prompts": ["hi"],
+                }
+            ]
+        },
+    )
+    with pytest.raises(ValueError, match="failed to read schema_path"):
+        eval_json_schema.load_cases(bad_schema_cfg)
+
+    bad_dataset = tmp_path / "bad_dataset.json"
+    bad_dataset.write_text("{not json", encoding="utf-8")
+    bad_dataset_cfg = _write_task_config(
+        tmp_path,
+        {
+            "cases": [
+                {
+                    "name": "bad_dataset",
+                    "max_tokens": 32,
+                    "schema": {"type": "string"},
+                    "dataset_path": "bad_dataset.json",
+                }
+            ]
+        },
+    )
+    with pytest.raises(ValueError, match="Failed to read dataset"):
+        eval_json_schema.load_cases(bad_dataset_cfg)
+
+    no_human = tmp_path / "no_human.json"
+    no_human.write_text(
+        json.dumps(
+            [{"id": "rec-0", "conversations": [{"from": "gpt", "value": "only"}]}]
+        ),
+        encoding="utf-8",
+    )
+    no_human_cfg = _write_task_config(
+        tmp_path,
+        {
+            "cases": [
+                {
+                    "name": "no_human",
+                    "max_tokens": 32,
+                    "schema": {"type": "string"},
+                    "dataset_path": "no_human.json",
+                }
+            ]
+        },
+    )
+    with pytest.raises(ValueError, match="has no 'human' turn"):
+        eval_json_schema.load_cases(no_human_cfg)
+
+
+def test_flat_task_config_matches_default_cases_verbatim():
+    task_configs = _SCRIPT.parent / "task_configs"
+    default_cfg = yaml.safe_load(
+        (task_configs / "json_schema_default.yaml").read_text(encoding="utf-8")
+    )
+    flat_cfg = yaml.safe_load(
+        (task_configs / "json_schema_flat.yaml").read_text(encoding="utf-8")
+    )
+    default_by_name = {case["name"]: case for case in default_cfg["cases"]}
+
+    assert flat_cfg["cases"]
+    for case in flat_cfg["cases"]:
+        assert case["name"] in default_by_name
+        assert case == default_by_name[case["name"]]
+
+
+def _start_stub_server(handler_cls):
+    class Server(http.server.ThreadingHTTPServer):
+        request_queue_size = 32
+        daemon_threads = True
+
+    server = Server(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True)
+    thread.start()
+    return server
+
+
+@pytest.mark.parametrize("status_code", [401, 403, 404, 429, 500])
+def test_evaluate_raises_on_fatal_http_status(status_code):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            return
+
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            body = json.dumps({"error": f"status-{status_code}"}).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = _start_stub_server(Handler)
+    try:
+        case = eval_json_schema.SchemaCase(
+            "case",
+            eval_json_schema.SchemaValidator({"type": "string"}),
+            32,
+            (eval_json_schema.Sample("0", "hello"),),
+        )
+        with pytest.raises(RuntimeError, match=f"HTTP {status_code}"):
+            eval_json_schema.evaluate(
+                f"http://127.0.0.1:{server.server_address[1]}/",
+                "any-model",
+                [case],
+                api_key=None,
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_evaluate_accepts_400_and_422_as_invalid_trials_and_strips_trailing_slash():
+    seen_paths: list[str] = []
+    codes = iter([400, 422, 200])
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            return
+
+        def do_POST(self) -> None:
+            seen_paths.append(self.path)
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            code = next(codes)
+            if code == 200:
+                payload = {
+                    "choices": [
+                        {"message": {"content": '"ok"'}, "finish_reason": "stop"}
+                    ]
+                }
+            else:
+                payload = {"error": f"bad-{code}"}
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = _start_stub_server(Handler)
+    try:
+        case = eval_json_schema.SchemaCase(
+            "case",
+            eval_json_schema.SchemaValidator({"type": "string"}),
+            32,
+            (
+                eval_json_schema.Sample("0", "p0"),
+                eval_json_schema.Sample("1", "p1"),
+                eval_json_schema.Sample("2", "p2"),
+            ),
+        )
+        # Single worker guarantees deterministic code order across samples.
+        orig_concurrency = eval_json_schema._CONCURRENCY
+        eval_json_schema._CONCURRENCY = 1
+        try:
+            trials = eval_json_schema.evaluate(
+                f"http://127.0.0.1:{server.server_address[1]}/",
+                "any-model",
+                [case],
+                api_key=None,
+            )
+        finally:
+            eval_json_schema._CONCURRENCY = orig_concurrency
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert seen_paths == ["/v1/chat/completions"] * 3
+    assert [t.error for t in trials] == [
+        'HTTP 400: {"error": "bad-400"}',
+        'HTTP 422: {"error": "bad-422"}',
+        None,
+    ]
+
+
+def test_evaluate_rejects_non_string_message_content():
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            return
+
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            body = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {"content": ["not", "str"]},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = _start_stub_server(Handler)
+    try:
+        case = eval_json_schema.SchemaCase(
+            "case",
+            eval_json_schema.SchemaValidator({"type": "string"}),
+            32,
+            (eval_json_schema.Sample("0", "hello"),),
+        )
+        with pytest.raises(RuntimeError, match="Expected string or null content"):
+            eval_json_schema.evaluate(
+                f"http://127.0.0.1:{server.server_address[1]}",
+                "any-model",
+                [case],
+                api_key=None,
+            )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_evaluate_aborts_queued_trials_immediately_on_first_fatal_error(monkeypatch):
+    monkeypatch.setattr(eval_json_schema, "_CONCURRENCY", 2)
+    release_slow = threading.Event()
+    seen_prompts: list[str] = []
+    lock = threading.Lock()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            return
+
+        def do_POST(self) -> None:
+            payload = json.loads(
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            )
+            prompt = payload["messages"][0]["content"]
+            with lock:
+                seen_prompts.append(prompt)
+            if prompt == "slow":
+                release_slow.wait(timeout=10.0)
+                body = json.dumps(
+                    {
+                        "choices": [
+                            {"message": {"content": '"ok"'}, "finish_reason": "stop"}
+                        ]
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+            else:
+                body = b'{"error": "unauthorized"}'
+                self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = _start_stub_server(Handler)
+    try:
+        samples = (
+            eval_json_schema.Sample("0", "slow"),
+            eval_json_schema.Sample("1", "fail"),
+            *(eval_json_schema.Sample(str(i), f"queued-{i}") for i in range(2, 12)),
+        )
+        case = eval_json_schema.SchemaCase(
+            "case",
+            eval_json_schema.SchemaValidator({"type": "string"}),
+            32,
+            samples,
+        )
+        with pytest.raises(RuntimeError, match="HTTP 401"):
+            eval_json_schema.evaluate(
+                f"http://127.0.0.1:{server.server_address[1]}",
+                "any-model",
+                [case],
+                api_key=None,
+            )
+        # Returning before release_slow is set proves we did not wait for the
+        # in-flight slow request, and queued prompts were never dispatched.
+        assert not release_slow.is_set()
+        with lock:
+            assert len(seen_prompts) < len(samples)
+    finally:
+        release_slow.set()
+        server.shutdown()
+        server.server_close()
 
 
 def test_cli_exits_1_without_a_results_file_when_nothing_is_listening(tmp_path):

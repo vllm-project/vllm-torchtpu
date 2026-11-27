@@ -1854,7 +1854,9 @@ def _write_answer_task_config(tmp_path: pathlib.Path, prompts: list[str]) -> str
     return str(path)
 
 
-def _run_json_schema(flow, gateway, **kwargs) -> subprocess.CompletedProcess[str]:
+def _run_json_schema(
+    flow, gateway, *extra_args: str, **kwargs
+) -> subprocess.CompletedProcess[str]:
     return flow.run_unchecked(
         "--base-url",
         gateway.url,
@@ -1862,6 +1864,7 @@ def _run_json_schema(flow, gateway, **kwargs) -> subprocess.CompletedProcess[str
         "json_schema",
         "--perf-suites",
         "none",
+        *extra_args,
         **kwargs,
     )
 
@@ -1873,7 +1876,7 @@ def _json_schema_results(flow) -> dict[str, Any]:
 def test_json_schema_suite_passes_when_every_response_is_valid(flow, make_gateway):
     gateway = make_gateway("/gw", ["router-served-name"])
 
-    proc = _run_json_schema(flow, gateway)
+    proc = _run_json_schema(flow, gateway, "--served-model-name", "router-served-name")
 
     assert proc.returncode == 0, f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
     assert _json_schema_results(flow) == {
@@ -1958,33 +1961,55 @@ def test_json_schema_suite_fails_and_reports_each_invalid_response(
 
 
 @pytest.mark.parametrize(
-    ("reply", "error"),
+    ("reply", "error_parts"),
     [
         pytest.param(
+            (401, {"error": "unauthorized"}),
+            ("ERROR: HTTP 401 for case ", '{"error": "unauthorized"}'),
+            id="http_401",
+        ),
+        pytest.param(
+            (403, {"error": "forbidden"}),
+            ("ERROR: HTTP 403 for case ", '{"error": "forbidden"}'),
+            id="http_403",
+        ),
+        pytest.param(
+            (404, {"error": "not found"}),
+            ("ERROR: HTTP 404 for case ", '{"error": "not found"}'),
+            id="http_404",
+        ),
+        pytest.param(
+            (429, {"error": "rate limited"}),
+            ("ERROR: HTTP 429 for case ", '{"error": "rate limited"}'),
+            id="http_429",
+        ),
+        pytest.param(
             (503, {"error": "overloaded"}),
-            "ERROR: HTTP 503 for case 'flat_json' sample '0': "
-            '{"error": "overloaded"}',
+            ("ERROR: HTTP 503 for case ", '{"error": "overloaded"}'),
             id="http_503",
         ),
         pytest.param(
             (200, {"object": "error"}),
-            "ERROR: Request for case 'flat_json' sample '0' failed: "
-            "KeyError('choices')",
+            ("ERROR: Request for case ", "KeyError('choices')"),
             id="not_a_chat_completion",
         ),
     ],
 )
 def test_json_schema_suite_has_no_result_when_the_endpoint_cannot_be_evaluated(
-    flow, make_gateway, reply, error
+    flow, make_gateway, reply, error_parts
 ):
+    flow.results_dir.mkdir(parents=True, exist_ok=True)
+    stale_results = flow.results_dir / "results_json_schema.json"
+    stale_results.write_text('{"results": {"json_schema": {"acc,none": 1.0}}}\n')
     gateway = make_gateway("", [_CONFIG_MODEL], chat_reply=lambda payload: reply)
 
     proc = _run_json_schema(flow, gateway)
 
     assert proc.returncode == 1
-    assert error in proc.stderr
+    for part in error_parts:
+        assert part in proc.stderr
     assert "::error::eval_json_schema.py could not evaluate json_schema." in proc.stdout
-    assert not (flow.results_dir / "results_json_schema.json").exists()
+    assert not stale_results.exists()
     assert not (flow.results_dir / "eval_check_json_schema.md").exists()
 
 

@@ -166,8 +166,9 @@ that the other runs reported.
 - `json_schema` sends every prompt of a task config with its case's JSON Schema
   as `response_format` (`json_schema`, `strict`). A response is valid when it
   is not truncated (`finish_reason` other than `length`), parses as JSON, and
-  satisfies the schema. An HTTP 4xx answer counts as an invalid response; a
-  5xx answer or an unreachable endpoint fails the suite without a result.
+  satisfies the schema. An HTTP 400 or 422 answer counts as an invalid
+  response; any other HTTP error (such as 401, 403, 404, 429, or 5xx) or an
+  unreachable endpoint fails the suite without a result.
   The pass rule is the same for every config and is not calibrated: `acc` must
   be 1.0 (`baselines/eval/json_schema.pass_rule.baseline.json`, tolerance 0).
   The default task config, `task_configs/json_schema_default.yaml`, has 28

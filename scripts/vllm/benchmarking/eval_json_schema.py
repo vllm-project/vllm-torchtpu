@@ -52,9 +52,11 @@ import concurrent.futures
 import dataclasses
 import http.client
 import json
+import math
 import os
 import re
 import sys
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
@@ -88,6 +90,46 @@ def _has_type(value: Any, type_name: str) -> bool:
     return isinstance(value, _JSON_TYPES[type_name])
 
 
+def _reject_json_constant(token: str) -> Any:
+    raise ValueError(f"Non-standard JSON constant {token!r}")
+
+
+def _translate_ecma_end_anchor(pattern: str) -> str:
+    """Replace unescaped ``$`` outside character classes with ``\\Z``.
+
+    Python's ``$`` matches before a trailing newline as well as at end of
+    string; ECMA-262 ``$`` (without multiline mode) matches only at end of
+    string.
+    """
+    out: list[str] = []
+    in_char_class = False
+    char_class_start = -1
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(pattern[i : i + 2])
+            i += 2
+            continue
+        if in_char_class:
+            if ch == "]" and i > char_class_start:
+                in_char_class = False
+            out.append(ch)
+        elif ch == "[":
+            in_char_class = True
+            char_class_start = i + 1
+            if i + 1 < n and pattern[i + 1] == "^":
+                char_class_start = i + 2
+            out.append(ch)
+        elif ch == "$":
+            out.append(r"\Z")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 class SchemaValidator:
     """Check completions against one JSON Schema, for a fixed set of keywords.
 
@@ -116,6 +158,7 @@ class SchemaValidator:
 
     def __init__(self, schema: dict[str, Any]):
         self.schema = schema
+        self._patterns: dict[str, re.Pattern[str]] = {}
         self._require_checkable(schema, "#")
 
     def _require_checkable(self, schema: Any, where: str) -> None:
@@ -129,27 +172,86 @@ class SchemaValidator:
             )
         if "$ref" in schema:
             ref = schema["$ref"]
+            if not isinstance(ref, str):
+                raise ValueError(f"$ref at {where} must be a string, got {ref!r}")
             name = ref.removeprefix("#/$defs/")
-            if name == ref or name not in self.schema.get("$defs", {}):
+            defs = self.schema.get("$defs", {})
+            if name == ref or not isinstance(defs, dict) or name not in defs:
                 raise ValueError(
                     f"$ref '{ref}' at {where} does not name a '#/$defs/<name>' "
                     "of this schema"
                 )
             if set(schema) - {"$ref", "$defs"}:
                 raise ValueError(f"Keywords beside $ref at {where} are not checked")
-        if "type" in schema and schema["type"] not in tuple(_JSON_TYPES):
+        if "type" in schema and (
+            not isinstance(schema["type"], str) or schema["type"] not in _JSON_TYPES
+        ):
             raise ValueError(
                 f"type {schema['type']!r} at {where} is not one JSON type name"
             )
-        if not all(isinstance(member, str) for member in schema.get("enum", ())):
-            raise ValueError(f"enum at {where} has members that are not strings")
+        if "enum" in schema:
+            enum_values = schema["enum"]
+            if not isinstance(enum_values, list):
+                raise ValueError(f"enum at {where} must be a list")
+            if not all(isinstance(member, str) for member in enum_values):
+                raise ValueError(f"enum at {where} has members that are not strings")
+        if "required" in schema:
+            required = schema["required"]
+            if not isinstance(required, list) or not all(
+                isinstance(key, str) for key in required
+            ):
+                raise ValueError(f"required at {where} must be a list of strings")
+        if "pattern" in schema:
+            pattern = schema["pattern"]
+            if not isinstance(pattern, str):
+                raise ValueError(
+                    f"pattern at {where} must be a string, got {pattern!r}"
+                )
+            try:
+                self._patterns[pattern] = re.compile(
+                    _translate_ecma_end_anchor(pattern)
+                )
+            except re.error as err:
+                raise ValueError(
+                    f"Invalid pattern {pattern!r} at {where}: {err}"
+                ) from err
+        for bound_key in ("minimum", "maximum"):
+            if bound_key in schema:
+                bound = schema[bound_key]
+                if (
+                    isinstance(bound, bool)
+                    or not isinstance(bound, (int, float))
+                    or not math.isfinite(bound)
+                ):
+                    raise ValueError(
+                        f"{bound_key} at {where} must be a finite number, got {bound!r}"
+                    )
+        if "minItems" in schema:
+            min_items = schema["minItems"]
+            if (
+                isinstance(min_items, bool)
+                or not isinstance(min_items, int)
+                or min_items < 0
+            ):
+                raise ValueError(
+                    f"minItems at {where} must be a non-negative integer, "
+                    f"got {min_items!r}"
+                )
         if not isinstance(schema.get("additionalProperties", True), bool):
             raise ValueError(f"additionalProperties at {where} is not true or false")
         for keyword in ("properties", "$defs"):
-            for name, sub in schema.get(keyword, {}).items():
-                self._require_checkable(sub, f"{where}/{keyword}/{name}")
-        for index, sub in enumerate(schema.get("anyOf", ())):
-            self._require_checkable(sub, f"{where}/anyOf/{index}")
+            if keyword in schema:
+                mapping = schema[keyword]
+                if not isinstance(mapping, dict):
+                    raise ValueError(f"{keyword} at {where} must be an object")
+                for name, sub in mapping.items():
+                    self._require_checkable(sub, f"{where}/{keyword}/{name}")
+        if "anyOf" in schema:
+            any_of = schema["anyOf"]
+            if not isinstance(any_of, list):
+                raise ValueError(f"anyOf at {where} must be a list")
+            for index, sub in enumerate(any_of):
+                self._require_checkable(sub, f"{where}/anyOf/{index}")
         if "items" in schema:
             self._require_checkable(schema["items"], f"{where}/items")
 
@@ -158,9 +260,11 @@ class SchemaValidator:
         if finish_reason == "length":
             return "Completion hit max_tokens (finish_reason=length)"
         try:
-            value = json.loads(content)
+            value = json.loads(content, parse_constant=_reject_json_constant)
         except json.JSONDecodeError as err:
             return f"JSONDecodeError: {err}"
+        except ValueError as err:
+            return str(err)
         return self._mismatch(value, self.schema)
 
     def _mismatch(self, value: Any, schema: dict[str, Any]) -> str | None:
@@ -179,7 +283,7 @@ class SchemaValidator:
         if (
             isinstance(value, str)
             and "pattern" in schema
-            and re.search(schema["pattern"], value) is None
+            and self._patterns[schema["pattern"]].search(value) is None
         ):
             return f"String {value!r} failed pattern {schema['pattern']!r}"
         if _has_type(value, "number"):
@@ -239,20 +343,46 @@ class Trial:
 
 
 def _dataset_samples(path: Path) -> list[Sample]:
-    return [
-        Sample(
-            str(record["id"]),
-            next(
+    try:
+        records = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        raise ValueError(f"Failed to read dataset {path}: {err}") from err
+    if not isinstance(records, list):
+        raise ValueError(f"Dataset {path} must be a JSON list")
+    samples: list[Sample] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise ValueError(f"Dataset {path} record [{index}] must be an object")
+        try:
+            record_id = str(record["id"])
+            conversations = record["conversations"]
+            if not isinstance(conversations, list):
+                raise ValueError(
+                    f"Dataset {path} record {record_id!r} conversations must be a list"
+                )
+            prompt = next(
                 turn["value"]
-                for turn in record["conversations"]
-                if turn["from"] == "human"
-            ),
-        )
-        for record in json.loads(path.read_text(encoding="utf-8"))
-    ]
+                for turn in conversations
+                if isinstance(turn, dict) and turn.get("from") == "human"
+            )
+        except KeyError as err:
+            raise ValueError(f"Dataset {path} record [{index}] needs {err}") from err
+        except StopIteration as err:
+            raise ValueError(
+                f"Dataset {path} record {record.get('id')!r} has no 'human' turn"
+            ) from err
+        if not isinstance(prompt, str):
+            raise ValueError(
+                f"Dataset {path} record {record_id!r} 'human' turn value "
+                "must be a string"
+            )
+        samples.append(Sample(record_id, prompt))
+    return samples
 
 
-def _parse_case(entry: dict[str, Any], base_dir: Path) -> SchemaCase:
+def _parse_case(entry: Any, base_dir: Path) -> SchemaCase:
+    if not isinstance(entry, dict):
+        raise ValueError("Each case entry must be a mapping")
     # Each key is taken out as it is read, so a key left over is one this
     # function does not know, or the second of two that exclude each other.
     fields = dict(entry)
@@ -260,18 +390,51 @@ def _parse_case(entry: dict[str, Any], base_dir: Path) -> SchemaCase:
         name = fields.pop("name")
         max_tokens = fields.pop("max_tokens")
         if "schema_path" in fields:
-            body = (base_dir / fields.pop("schema_path")).read_text(encoding="utf-8")
-            schema = json.loads(body)["structured_outputs"]["json"]
+            schema_rel = fields.pop("schema_path")
+            if not isinstance(schema_rel, str):
+                raise ValueError(f"Case {name!r}: schema_path must be a string")
+            schema_file = base_dir / schema_rel
+            try:
+                body = schema_file.read_text(encoding="utf-8")
+                parsed_body = json.loads(body)
+                schema = parsed_body["structured_outputs"]["json"]
+            except (OSError, json.JSONDecodeError, KeyError, TypeError) as err:
+                raise ValueError(
+                    f"Case {name!r}: failed to read schema_path {schema_file}: {err}"
+                ) from err
         else:
             schema = fields.pop("schema")
         if "dataset_path" in fields:
-            samples = _dataset_samples(base_dir / fields.pop("dataset_path"))
+            dataset_rel = fields.pop("dataset_path")
+            if not isinstance(dataset_rel, str):
+                raise ValueError(f"Case {name!r}: dataset_path must be a string")
+            samples = _dataset_samples(base_dir / dataset_rel)
         else:
             prompts = fields.pop("prompts")
+            if not isinstance(prompts, list) or not all(
+                isinstance(prompt, str) for prompt in prompts
+            ):
+                raise ValueError(f"Case {name!r}: prompts must be a list of strings")
             samples = [Sample(str(i), prompt) for i, prompt in enumerate(prompts)]
     except KeyError as err:
         raise ValueError(f"Case {entry.get('name')!r} needs {err}") from err
-    samples = samples[: fields.pop("limit", None)]
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"Case name must be a non-empty string, got {name!r}")
+    if (
+        isinstance(max_tokens, bool)
+        or not isinstance(max_tokens, int)
+        or max_tokens <= 0
+    ):
+        raise ValueError(
+            f"Case '{name}': max_tokens must be a positive integer, got {max_tokens!r}"
+        )
+    limit = fields.pop("limit", None)
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError(
+                f"Case '{name}': limit must be a non-negative integer, got {limit!r}"
+            )
+        samples = samples[:limit]
     if fields:
         raise ValueError(f"Case '{name}' has unexpected keys {sorted(fields)}")
     if not samples:
@@ -290,7 +453,11 @@ def load_cases(path: Path) -> tuple[SchemaCase, ...]:
         ValueError: The config does not have that format, or one of its
             schemas uses a keyword ``SchemaValidator`` does not check.
     """
-    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+        config = yaml.safe_load(raw_text)
+    except (OSError, yaml.YAMLError) as err:
+        raise ValueError(f"Failed to read task config {path}: {err}") from err
     if (
         not isinstance(config, dict)
         or set(config) != {"cases"}
@@ -335,7 +502,10 @@ def _run_trial(
     model: str,
     case: SchemaCase,
     sample: Sample,
-) -> Trial:
+    abort: threading.Event,
+) -> Trial | None:
+    if abort.is_set():
+        return None
     request = urllib.request.Request(
         chat_url,
         data=json.dumps(_request_body(model, case, sample.prompt)).encode("utf-8"),
@@ -347,14 +517,29 @@ def _run_trial(
             choice = json.load(resp)["choices"][0]
             content = choice["message"]["content"]
             finish_reason = choice["finish_reason"]
+            if not isinstance(content, (str, type(None))):
+                raise TypeError(
+                    f"Expected string or null content, got {type(content).__name__}"
+                )
+            if not isinstance(finish_reason, (str, type(None))):
+                raise TypeError(
+                    "Expected string or null finish_reason, "
+                    f"got {type(finish_reason).__name__}"
+                )
     except urllib.error.HTTPError as err:
-        detail = err.read().decode("utf-8", errors="replace").strip()[:500]
-        if 400 <= err.code < 500:
+        try:
+            detail = err.read().decode("utf-8", errors="replace").strip()[:500]
+        except (OSError, http.client.HTTPException) as read_err:
+            detail = f"<failed to read error body: {read_err!r}>"
+        finally:
+            err.close()
+        if err.code in (400, 422):
             # The server refusing a request, for example a schema it cannot
             # compile, is an outcome of the suite and not a broken run.
             return Trial(
                 case.name, sample.sample_id, None, f"HTTP {err.code}: {detail}"
             )
+        abort.set()
         raise RuntimeError(f"HTTP {err.code} for {where}: {detail}") from err
     # URLError covers a refused connection, OSError timeouts and resets,
     # HTTPException a broken HTTP reply, ValueError a body that is not JSON,
@@ -367,6 +552,7 @@ def _run_trial(
         LookupError,
         TypeError,
     ) as err:
+        abort.set()
         raise RuntimeError(f"Request for {where} failed: {err!r}") from err
     # A reply without text, for example one that is only a tool call, has
     # null content and is invalid like any other non-JSON reply.
@@ -386,20 +572,35 @@ def evaluate(
     ``api_key``, when set, is sent as a bearer token.
 
     Raises:
-        RuntimeError: The endpoint is unreachable, answers with a 5xx, or does
-            not answer with a chat completion.
+        RuntimeError: The endpoint is unreachable, answers with an HTTP error
+            other than 400 or 422, or does not answer with a chat completion.
     """
-    chat_url = f"{base_url}/v1/chat/completions"
+    chat_url = f"{base_url.rstrip('/')}/v1/chat/completions"
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    with concurrent.futures.ThreadPoolExecutor(max_workers=_CONCURRENCY) as pool:
+    abort = threading.Event()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=_CONCURRENCY)
+    failed = False
+    try:
         futures = [
-            pool.submit(_run_trial, chat_url, headers, model, case, sample)
+            pool.submit(_run_trial, chat_url, headers, model, case, sample, abort)
             for case in cases
             for sample in case.samples
         ]
-        return [future.result() for future in futures]
+        trials: list[Trial | None] = [None] * len(futures)
+        future_to_index = {future: idx for idx, future in enumerate(futures)}
+        for future in concurrent.futures.as_completed(futures):
+            trials[future_to_index[future]] = future.result()
+    except BaseException:
+        failed = True
+        abort.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        if not failed:
+            pool.shutdown(wait=True)
+    return [trial for trial in trials if trial is not None]
 
 
 def results_json(model: str, trials: Sequence[Trial]) -> dict[str, Any]:
