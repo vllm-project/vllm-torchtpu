@@ -15,7 +15,12 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
+import subprocess
+import sys
+import types
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -23,14 +28,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import vllm_torchtpu.megakernel.core as mk
 from tests.megakernel.core.megakernel_synth import TINY_TILES, synth_hybrid_spec
 from vllm_torchtpu.megakernel.core import (
     _builtins,
+    cache_flat,
     fused_io_hook,
     model_def,
     planner,
     profile,
 )
+from vllm_torchtpu.megakernel.core import cache as mk_cache
 from vllm_torchtpu.megakernel.core import runtime as mk_rt
 from vllm_torchtpu.megakernel.core.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.core.geometry import ModelGeometry
@@ -52,14 +60,31 @@ from vllm_torchtpu.megakernel.core.profile import (
     register_profile,
 )
 from vllm_torchtpu.megakernel.core.runtime import (
+    Bucket,
     BucketPolicy,
     JaxStepMetaOps,
+    SentinelVariantPlan,
+    WarmupStepPlan,
     align_cache_exec,
     bucket_exec_spec,
+    build_warmup_plan,
+    check_compile_hlo_mesh,
+    check_post_mesh_eligibility,
+    check_startup_eligibility,
     explicit_profile_settings,
+    ir_required_buckets,
     pack_step_meta,
     parse_runtime_options,
+    pool_schedule_info,
     resolve_driver_profile,
+    verify_compiled_step_ir,
+    verify_ir_coverage,
+    verify_pooled_step_hlo,
+    verify_sentinel_step,
+)
+from vllm_torchtpu.megakernel.core.weights.spec_inputs import (
+    pack_spec_inputs,
+    random_spec_inputs,
 )
 
 
@@ -72,6 +97,48 @@ def isolated_model_registry(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setattr(profile, "_REGISTRY", dict(profile._REGISTRY))
     monkeypatch.setattr(profile, "_MODEL_DEFAULTS", dict(profile._MODEL_DEFAULTS))
+
+
+def test_runtime_package_ast_and_fresh_import_free_of_vllm_and_torch():
+    """`megakernel/core/runtime/*.py` never imports `vllm`/`torch`/`os` and <= 400
+    lines."""
+    runtime_dir = Path(mk_rt.__file__).parent
+    py_files = sorted(runtime_dir.glob("*.py"))
+    assert "checks.py" in {p.name for p in py_files}
+
+    for py_path in py_files:
+        src = py_path.read_text(encoding="utf-8")
+        lines = src.splitlines()
+        assert len(lines) <= 400, f"{py_path.name} has {len(lines)} lines (> 400)"
+        assert "qwen" not in src.lower(), f"{py_path.name} mentions Qwen"
+        tree = ast.parse(src, filename=str(py_path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top = alias.name.split(".")[0]
+                    assert top not in ("torch", "vllm", "os"), (
+                        f"{py_path.name} imports {alias.name}"
+                    )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                top = node.module.split(".")[0]
+                assert top not in ("torch", "vllm", "os"), (
+                    f"{py_path.name} imports from {node.module}"
+                )
+
+    code = (
+        "import sys; "
+        "sys.modules['torch'] = None; "
+        "sys.modules['vllm'] = None; "
+        "import vllm_torchtpu.megakernel.core.runtime as rt; "
+        "assert hasattr(rt, 'BucketPolicy') and hasattr(rt, 'pack_step_meta')"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}"
 
 
 def test_runtime_config_and_gpr_bucket_exec_spec():
@@ -841,3 +908,527 @@ def test_schedule_driven_validate_hf_config(isolated_model_registry):
     assert not SynthSeqOverridesFFN.validate_hf_config(
         {**SynthSeqOverridesFFN.default_hf_config, "alt_expert_count": 0}
     ).eligible
+
+
+def test_checks_hlo_ir_warmup_and_sentinel():
+    """Test `check_compile_hlo_mesh`, `verify_compiled_step_ir`, and IR coverage."""
+    cpu_mesh = jax.sharding.Mesh(np.asarray(jax.devices("cpu")[:2]), ("tp",))
+    check_compile_hlo_mesh(cpu_mesh, True)
+    fake_mesh = types.SimpleNamespace(devices=np.asarray([object(), object()]))
+    with pytest.raises(mk.MegakernelConfigError, match="requires a mesh of real"):
+        check_compile_hlo_mesh(fake_mesh, True)
+
+    good_ir = """
+    module @test {
+      func.func public @main(
+        %arg0: tensor<64x2x64x4x128xf8E4M3FN> {tf.aliasing_output = 1 : i32},
+        %arg1: tensor<64x2x64x4x128xf8E4M3FN> {tf.aliasing_output = 2 : i32}
+      ) -> (
+        tensor<8x1024xbf16>,
+        tensor<64x2x64x4x128xf8E4M3FN>,
+        tensor<64x2x64x4x128xf8E4M3FN>
+      ) {
+        %0 = stablehlo.custom_call @tpu_custom_call(%arg0, %arg1)
+          : (tensor<64x2x64x4x128xf8E4M3FN>, tensor<64x2x64x4x128xf8E4M3FN>)
+          -> tensor<8x1024xbf16>
+        return
+      }
+    }
+    """
+    ok_ir, msg_ir = verify_compiled_step_ir(
+        good_ir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=2
+    )
+    assert ok_ir, msg_ir
+
+    bad_ir = good_ir.replace("{tf.aliasing_output = 2 : i32}", "")
+    ok_bad, msg_bad = verify_compiled_step_ir(
+        bad_ir, num_pages=64, page_size=128, kvh=1, hd=256, num_pools=2
+    )
+    assert not ok_bad and "expected >= 2 donated pool arguments" in msg_bad
+
+    assert ir_required_buckets(
+        [(1, 8), (1, 16), (4, 16)],
+        {(1, 8): True, (1, 16): False, (4, 16): True},
+        is_eager=False,
+    ) == [(1, 8), (1, 16), (4, 16)]
+    assert ir_required_buckets([(1, 8)], {(1, 8): True}, is_eager=True) == [(1, 8)]
+    assert ir_required_buckets([(1, 8)], {(1, 8): False}, is_eager=True) == []
+
+    # verify_ir_coverage tests
+    verify_ir_coverage([(1, 8)], {(1, 8): True}, {(1, 8)}, is_eager=False)
+    verify_ir_coverage([], {}, set(), is_eager=False)
+    with pytest.raises(RuntimeError, match="boom"):
+        verify_ir_coverage(
+            [(1, 8)], {(1, 8): True}, {(1, 8)}, is_eager=False, ir_error="boom"
+        )
+    with pytest.raises(RuntimeError, match="did not run for buckets"):
+        verify_ir_coverage(
+            [(1, 8), (1, 16)],
+            {(1, 8): True, (1, 16): True},
+            {(1, 8)},
+            is_eager=False,
+        )
+
+    # pool_schedule_info raises a named layout error without a cache_backend
+    with pytest.raises(mk.MegakernelLayoutError, match="has no pool backend layout"):
+        pool_schedule_info(types.SimpleNamespace(name="kv", cache_backend=None))
+
+
+@pytest.mark.parametrize(("slots", "att_every"), [(0, 1), (1, 2), (3, 4)])
+def test_pool_schedule_info_att_every_counts_recurrent_layers(slots, att_every):
+    """`att_every` is `slots_per_pool + 1`; a KV-only pool (`slots_per_pool=0`)
+    still has one leading `ckpt_indices` row (`recurrent_slots_per_pool=1`)."""
+    lay = mk.pool.PoolLayout(
+        num_pools=2,
+        slots_per_pool=slots,
+        hd=256,
+        kvh=1,
+        kh=2 if slots else 0,
+        vh=4 if slots else 0,
+        KD=128,
+        VD=128,
+    )
+    spec = types.SimpleNamespace(name="s", cache_backend=mk.pool.make_pool_backend(lay))
+    info = pool_schedule_info(spec)
+    assert (info.slots_per_pool, info.att_every) == (slots, att_every)
+    assert info.recurrent_slots_per_pool == max(1, slots)
+
+
+_POOL_TY = "tensor<64x2x64x4x128xf8E4M3FN>"
+_MLIR = """
+module @m {{
+  func.func public @main(
+    %arg0: tensor<8x1024xbf16> {{mhlo.sharding = "{{devices=[2,1]<=[2]}}"}},
+    %arg1: {ty} {attr1},
+    %arg2: {ty} {attr2}
+  ) -> (tensor<8x1024xbf16>, {ty}, {ty}) {{
+    %0 = stablehlo.custom_call @tpu_custom_call(%arg1, %arg2) : ({ty}, {ty}) -> {ty}
+    {extra}
+    return
+  }}
+}}
+"""
+_HLO = """HloModule m, input_output_alias={{ {aliases} }}
+ENTRY %main {{
+  %k = () custom-call(), custom_call_target="tpu_custom_call"
+  {extra}
+  ROOT %t = () tuple()
+}}
+"""
+_DONOR = "{jax.buffer_donor = true}"
+_SHARDED_ALIAS = (
+    '{{mhlo.sharding = "{{devices=[2,1,1,1,1]<=[2]}}", tf.aliasing_output = {i} : i32}}'
+)
+_SDY_ALIAS = (
+    '{{sdy.sharding = #sdy.sharding<@mesh, [{{"tp"}}, {{}}, {{}}, {{}}, {{}}]>, '
+    "tf.aliasing_output = {i} : i32}}"
+)
+
+
+def _mlir(attr: str, extra: str = "") -> str:
+    a1, a2 = (attr.format(i=i) if "{i}" in attr else attr for i in (1, 2))
+    return _MLIR.format(ty=_POOL_TY, attr1=a1, attr2=a2, extra=extra)
+
+
+def _hlo(n_alias: int, extra: str = "") -> str:
+    aliases = ", ".join(f"{{{i}}}: ({i + 1}, {{}}, may-alias)" for i in range(n_alias))
+    return _HLO.format(aliases=aliases, extra=extra)
+
+
+@pytest.mark.parametrize(
+    ("ir_text", "hlo_text", "want"),
+    [
+        (_mlir(_DONOR), None, "ok"),
+        # Sharded arguments: the attribute dict nests braces before the alias.
+        (_mlir(_SHARDED_ALIAS), None, "ok"),
+        (_mlir(_SDY_ALIAS), None, "ok"),
+        (_mlir('{mhlo.sharding = "{replicated}"}'), None, "donated pool arguments"),
+        (_hlo(2), None, "ok"),
+        (_hlo(1), None, "entries in HloModule input_output_alias"),
+        (_hlo(0).replace("input_output_alias={  }", ""), None, "missing input_output"),
+        (_mlir(_DONOR), _hlo(2), "ok"),
+        (_mlir(_DONOR), _hlo(1), "entries in HloModule input_output_alias"),
+        # Full-pool copies (MLIR and HLO forms) fail; one-page staging copies pass.
+        (
+            _mlir(_DONOR, f"%c = stablehlo.copy %arg1 : {_POOL_TY}"),
+            None,
+            "full-pool copy in compiled IR",
+        ),
+        (
+            _mlir(_DONOR, "%c = stablehlo.copy %s : tensor<1x2x64x4x128xf8E4M3FN>"),
+            None,
+            "ok",
+        ),
+        (
+            _hlo(2, "%cp = f8e4m3fn[64,2,64,4,128] copy(%p0)"),
+            None,
+            "full-pool copy in compiled HLO",
+        ),
+        (_hlo(2, "%cp = f8e4m3fn[1,2,64,4,128] copy(%p0)"), None, "ok"),
+        (
+            _mlir(_DONOR),
+            _hlo(2, "%cp = f8e4m3fn[64,2,64,4,128] copy(%p0)"),
+            "full-pool copy in compiled HLO",
+        ),
+    ],
+    ids=[
+        *("mlir_donor", "mlir_sharded_alias", "mlir_sdy_alias", "mlir_no_donor"),
+        *("hlo_alias", "hlo_short_alias", "hlo_no_alias", "mlir_hlo"),
+        *("mlir_hlo_short", "mlir_full_copy", "mlir_page_copy"),
+        *("hlo_full_copy", "hlo_page_copy", "mlir_hlo_full_copy"),
+    ],
+)
+def test_verify_compiled_step_ir_forms(ir_text, hlo_text, want):
+    """`verify_compiled_step_ir` on StableHLO MLIR (`@main` donors, sharded
+    argument attributes) and HloModule text (`input_output_alias`), and its
+    full-pool copy rejection in both forms."""
+    ok, msg = verify_compiled_step_ir(
+        ir_text,
+        num_pages=64,
+        page_size=128,
+        kvh=1,
+        hd=256,
+        num_pools=2,
+        hlo_text=hlo_text,
+    )
+    if want == "ok":
+        assert (ok, msg) == (True, "ok")
+    else:
+        assert not ok and want in msg, msg
+
+
+@pytest.mark.parametrize(
+    ("bucket_b", "paged", "want_fused"),
+    [(4, True, True), (4, False, True), (8, True, False)],
+    ids=["auto_fused", "auto_fused_unpaged", "split"],
+)
+def test_verify_pooled_step_hlo_uses_the_flat_steps_fused_decision(
+    monkeypatch: pytest.MonkeyPatch, bucket_b: int, paged: bool, want_fused: bool
+):
+    """`verify_pooled_step_hlo` lowers the flat step from `build_global_avals`
+    and checks its HLO with the fused-I/O decision `make_flat_pooled_step` made,
+    for a bucket `"auto"` fuses (`B <= 4`) and one it splits. The flat step pages
+    an unpaged `ex` itself, so a fused unpaged `ex` is still a fused step."""
+    R, T = 2, 1
+    spec = synth_hybrid_spec(L=2, att_every=2, R=R, VH=4)  # fused GDN: 2*kh <= vh
+    base_ex = ExecSpec(
+        B=bucket_b,
+        T=T,
+        R=R,
+        ctx=256,
+        stack_e=True,
+        tiles=TINY_TILES.with_modules({"gqa": {"kv_blk": 128, "nkv": 2}}),
+        interpret=True,
+        cache=CacheExec(paged_kv=paged, num_pages=128),
+    )
+    prof = resolve_driver_profile(DEFAULT_PROFILE, model_name=spec.name)
+    ex, use_fused, _ = bucket_exec_spec(
+        spec,
+        base_ex,
+        prof,
+        bucket_t=bucket_b,
+        tokens_per_seq=T,
+        fused_pool_io="auto",
+        fused_pool_io_max_b=4,
+        fused_pool_io_min_b_hi=56,
+    )
+    # "auto" fuses only with a registered fused pool I/O implementation.
+    assert use_fused is (want_fused and fused_io_hook.fused_io_available())
+
+    flat_fused: list[bool] = []
+    real_build = cache_flat.build_pooled
+
+    def spy_build(*a: Any, **kw: Any) -> Any:
+        b = real_build(*a, **kw)
+        flat_fused.append(cache_exec(b.ex_paged).fused_pool_io)
+        return b
+
+    checked_fused: list[bool] = []
+    real_check = mk_cache.check_pooled_step_hlo
+
+    def spy_check(*a: Any, **kw: Any) -> Any:
+        checked_fused.append(kw["fused_pool_io"])
+        return real_check(*a, **kw)
+
+    monkeypatch.setattr(cache_flat, "build_pooled", spy_build)
+    monkeypatch.setattr(mk_cache, "check_pooled_step_hlo", spy_check)
+
+    # Per-rank weight and pool descriptors (build_global_avals reads shapes).
+    mesh = jax.sharding.Mesh(np.asarray(jax.devices("cpu")[:R]), ("tp",))
+    pos, hid, w_log, st_log = random_spec_inputs(jax.random.PRNGKey(3), spec, ex)
+    _, _, w_mk, _ = pack_spec_inputs(pos, hid, w_log, st_log, spec, ex, mesh=mesh)
+    pt, ckpt, roff, _ = mk_cache.default_pool_layout(spec, ex)
+    raw = mk_cache.states_to_pool(spec, ex, st_log, pt, ckpt, read_offsets=roff)
+
+    def rank_sds(a: Any) -> jax.ShapeDtypeStruct:
+        return jax.ShapeDtypeStruct((a.shape[0] // R, *a.shape[1:]), a.dtype)
+
+    w_flat = [
+        rank_sds(t)
+        for k in planner.plan(spec, ex).w_names
+        for t in (w_mk[k] if isinstance(w_mk[k], tuple) else (w_mk[k],))
+    ]
+    pools = [rank_sds(p) for p in raw]
+    avals = mk_rt.build_global_avals(
+        mesh, spec, ex, w_flat, pools, max_pages_per_seq=pt.shape[1]
+    )
+    assert [a.shape for a in avals[2 : 2 + len(w_flat)]] == [
+        (R * w.shape[0], *w.shape[1:]) for w in w_flat
+    ]
+    assert avals[-3].shape == (ex.NS, pt.shape[1])
+
+    ok, msg = verify_pooled_step_hlo(
+        mesh, spec, ex, w_flat, pools, max_pages_per_seq=pt.shape[1]
+    )
+    assert ok, msg
+    assert flat_fused == checked_fused == [use_fused]
+
+
+def test_verify_sentinel_step_pass_and_failures():
+    """`verify_sentinel_step` passes when every pool's KV page and recurrent
+    slot changed and the output is finite; it compares bytes, so an unchanged
+    NaN pattern counts as unchanged."""
+    kv0 = [np.zeros((4,), np.uint8), np.zeros((4,), np.uint8)]
+    kv1 = [np.ones((4,), np.uint8), np.full((4,), 2, np.uint8)]
+    out = np.ones((2, 8), np.float32)
+    kw: dict[str, Any] = dict(
+        tokens_per_seq=1, bucket_t=2, variant_key=(1, False, False)
+    )
+    verify_sentinel_step(out, kv0, kv1, kv0, kv1, **kw)
+    with pytest.raises(RuntimeError, match=r"pool\[1\].*kv_ok=False, gdn_ok=True"):
+        verify_sentinel_step(out, kv0, [kv1[0], kv0[1]], kv0, kv1, **kw)
+    with pytest.raises(RuntimeError, match=r"kv_ok=True, gdn_ok=False"):
+        verify_sentinel_step(out, kv0, kv1, kv0, kv0, **kw)
+    bad_out = out.copy()
+    bad_out[0, 0] = np.inf
+    with pytest.raises(RuntimeError, match=r"out_fin=15"):
+        verify_sentinel_step(bad_out, kv0, kv1, kv0, kv1, **kw)
+    # Non-finite output fails even with no pools to compare.
+    with pytest.raises(RuntimeError, match=r"out_fin=15"):
+        verify_sentinel_step(bad_out, [], [], [], [], **kw)
+    nan_pool = [np.full((4,), np.nan, np.float32)] * 2
+    with pytest.raises(RuntimeError, match=r"kv_ok=False"):
+        verify_sentinel_step(
+            out, nan_pool, [p.copy() for p in nan_pool], kv0, kv1, **kw
+        )
+    with pytest.raises(ValueError, match="differ in length"):
+        verify_sentinel_step(out, kv0, kv1[:1], kv0, kv1, **kw)
+
+
+def test_no_kw_rejects_legacy_and_unknown_kwargs():
+    """Runtime API functions reject legacy or unknown keyword arguments."""
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        check_startup_eligibility(  # type: ignore[call-arg]
+            num_layers=60,
+            expected_num_layers=60,
+            tp_size=8,
+            supported_tp_sizes=(8,),
+            unified_kv_layout=True,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        check_startup_eligibility(  # type: ignore[call-arg]
+            num_layers=60,
+            expected_num_layers=60,
+            tp_size=8,
+            supported_tp_sizes=(8,),
+            supports_mm_inputs=False,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        check_startup_eligibility(  # type: ignore[call-arg]
+            num_layers=60,
+            expected_num_layers=60,
+            tp_size=8,
+            supported_tp_sizes=(8,),
+            unknown_flag=True,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        check_post_mesh_eligibility(  # type: ignore[call-arg]
+            tp_size=8,
+            num_layers=60,
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        resolve_driver_profile(DEFAULT_PROFILE, unknown_flag=True)  # type: ignore[call-arg]
+
+    g = ModelGeometry(
+        L=4,
+        att_every=4,
+        H=256,
+        NH=4,
+        NKV=1,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        theta=10_000_000.0,
+        zero_centered_norm=True,
+    )
+    ms = synth_hybrid_spec(g, R=1)
+    base_ex = ExecSpec(R=1, B=4, T=1, ctx=256, interpret=True, stack_e=False)
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        bucket_exec_spec(  # type: ignore[call-arg]
+            ms,
+            base_ex,
+            DEFAULT_PROFILE,
+            bucket_t=4,
+            tokens_per_seq=1,
+            pool_gather=True,
+        )
+    with pytest.raises(TypeError, match="missing 1 required keyword-only argument"):
+        align_cache_exec(  # type: ignore[call-arg]
+            base_ex, DEFAULT_PROFILE, g, num_pages=64, max_pages_per_seq=2
+        )
+    with pytest.raises(TypeError, match="missing .* required keyword-only argument"):
+        verify_compiled_step_ir(  # type: ignore[call-arg]
+            "module {}", num_pages=64, kvh=1
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        build_warmup_plan(  # type: ignore[call-arg]
+            ms, ((1, 4),), {}, {}, num_pages=64, max_pages_per_seq=2, unknown=1
+        )
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        verify_sentinel_step(  # type: ignore[call-arg]
+            np.zeros((2, 4)),
+            [],
+            [],
+            [],
+            [],
+            tokens_per_seq=1,
+            bucket_t=2,
+            variant_key=(1, False, False),
+            unknown=1,
+        )
+
+
+def test_build_warmup_plan_shapes_and_sentinels():
+    """`build_warmup_plan` warms each bucket over the shapes the driver runs
+    (`Bucket.runner_shapes`) and plans non-overlapping sentinel pages."""
+    g = ModelGeometry(
+        L=4,
+        att_every=4,
+        H=256,
+        NH=4,
+        NKV=1,
+        HD=256,
+        ROT=64,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        theta=10_000_000.0,
+        zero_centered_norm=True,
+    )
+    ms = synth_hybrid_spec(g, R=1)
+    # `build_warmup_plan` takes `(T, B)` `bucket_keys` directly. For the
+    # default keys the expected list pins every field: two runner shapes
+    # `(tok_pad, req_pad, blk_pad, c_cols)` per bucket and, on each bucket's
+    # first shape, the sentinel plan of its `(T, fused, gather)` variant (its
+    # own KV page, GDN slot base and first page, sub-step `T`). `T=8` verify
+    # keys produce plans for `(8, b)` with `spv = spp * 8`.
+    pol_def = BucketPolicy((8, 16), (16, 32))
+    default_keys = list(pol_def.iter_buckets())
+    fio_def = {(1, 8): True, (1, 16): False, (4, 16): True, (4, 32): False}
+    gpr_def = {(1, 8): False, (1, 16): True, (4, 16): False, (4, 32): False}
+    steps_def, warmed_def, n_save_def = build_warmup_plan(
+        ms,
+        default_keys,
+        fio_def,
+        gpr_def,
+        num_pages=256,
+        max_pages_per_seq=4,
+        ckpt_window=4,
+        runner_tok_pads=(16, 32),
+        req_block_pairs=((8, 4), (16, 4)),
+        is_eager=False,
+    )
+    expected_default_steps = [
+        WarmupStepPlan(
+            1, 8, 16, 8, 4, 4, SentinelVariantPlan((1, True, False), 1, 3, 15, 1, True)
+        ),
+        WarmupStepPlan(1, 8, 16, 16, 4, 4, None),
+        WarmupStepPlan(
+            1,
+            16,
+            16,
+            8,
+            4,
+            4,
+            SentinelVariantPlan((1, False, True), 2, 15, 75, 1, True),
+        ),
+        WarmupStepPlan(1, 16, 16, 16, 4, 4, None),
+        WarmupStepPlan(
+            4,
+            16,
+            16,
+            8,
+            4,
+            4,
+            SentinelVariantPlan((4, True, False), 3, 27, 135, 4, True),
+        ),
+        WarmupStepPlan(4, 16, 16, 16, 4, 4, None),
+        WarmupStepPlan(
+            4,
+            32,
+            32,
+            8,
+            4,
+            4,
+            SentinelVariantPlan((4, False, False), 4, 39, 195, 4, True),
+        ),
+        WarmupStepPlan(4, 32, 32, 16, 4, 4, None),
+    ]
+    assert steps_def == expected_default_steps
+    assert warmed_def == default_keys and n_save_def == 255
+
+    keys_t8 = [(1, 8), (8, 16), (8, 32)]
+    fio_t8 = {(1, 8): True, (8, 16): True, (8, 32): False}
+    gpr_t8 = {(1, 8): False, (8, 16): False, (8, 32): False}
+    steps_t8, warmed_t8, n_save_t8 = build_warmup_plan(
+        ms,
+        keys_t8,
+        fio_t8,
+        gpr_t8,
+        num_pages=512,
+        max_pages_per_seq=4,
+        ckpt_window=4,
+        is_eager=False,
+    )
+    assert warmed_t8 == keys_t8
+    assert [(s.tokens_per_seq, s.bucket_t, s.req_pad, s.c_cols) for s in steps_t8] == [
+        (1, 8, 8, 4),
+        (8, 16, 2, 8),
+        (8, 32, 4, 8),
+    ]
+    assert [s.sentinel for s in steps_t8] == [
+        SentinelVariantPlan((1, True, False), 1, 3, 15, 1, True),
+        SentinelVariantPlan((8, True, False), 2, 27, 135, 8, True),
+        SentinelVariantPlan((8, False, False), 3, 51, 255, 8, True),
+    ]
+    assert n_save_t8 == 375
+    pads, pairs = (16, 32), ((8, 4), (16, 4))
+    for T, b in default_keys:
+        shapes = Bucket(T, b).runner_shapes(
+            pads, pairs, ckpt_window=4, max_pages_per_seq=4
+        )
+        got = [s for s in steps_def if (s.tokens_per_seq, s.bucket_t) == (T, b)]
+        want = [(x.tok_pad, x.req_pad, x.blk_pad, x.ckpt_cols) for x in shapes]
+        assert [(s.tok_pad, s.req_pad, s.blk_pad, s.c_cols) for s in got] == want
+    for s in steps_t8:
+        (x,) = Bucket(s.tokens_per_seq, s.bucket_t).runner_shapes(
+            (), (), ckpt_window=4, max_pages_per_seq=4
+        )
+        assert (s.tok_pad, s.req_pad, s.blk_pad, s.c_cols) == (
+            x.tok_pad,
+            x.req_pad,
+            x.blk_pad,
+            x.ckpt_cols,
+        )
