@@ -85,6 +85,50 @@ python3 scripts/vllm/benchmarking/check_regression.py \
   --baseline scripts/vllm/benchmarking/baselines/perf/<chip>/<config>.baseline.json
 ```
 
+#### Roofline report (`--roofline-targets`)
+
+`baselines/perf/<chip>/roofline_targets.json` (for example
+`baselines/perf/v7x/roofline_targets.json`) holds modeled output throughput per
+physical chip. Its `targets` map has one entry per modeled config: the
+`num_chips` it was modeled on, and for each cell an
+`output_token_throughput_per_chip` and a `status` (`ok`, `unverified` or `oom`;
+`ok` when absent). Its `not_modeled` map names the configs that the model does
+not cover, each with a `reason` and an optional `detail`. A config cannot
+appear in both maps. The other fields describe the model run and are not read.
+
+Pass `--roofline-targets <file>` and `--config-name <config>` in perf check mode
+to print each measured cell as a percentage of its target. `--baseline` is then
+optional, so one run can check the baseline, print the report, or do both. The
+report is advisory: a ratio never changes the exit code.
+
+- The measured value is the cell's `output_throughput` divided by the physical
+  chip count. That count is `--chips <N>`, or `--prefill-chips <P>` plus
+  `--decode-chips <D>` for disaggregated serving, or else the config's
+  `num_chips`. When an explicit chip count differs from the modeled
+  `num_chips`, a `NOTE:` line is printed to stderr.
+- A cell whose target has `status` `unverified` is marked
+  `ADVISORY (unverified)`.
+- A measured cell is listed as `SKIP` when the config has no target for it,
+  when its target has `status` `oom`, or when its result has no
+  `output_throughput`. A target cell that was not measured is not listed.
+- A config under `not_modeled` prints its reason instead of a table. Such a
+  run needs no result files unless `--baseline` is also given.
+
+The run exits `2` when the targets file is malformed, when the config is in
+neither map, when a chip flag is invalid, or when no chip count is known.
+`--roofline-targets` needs `--config-name`, and `--config-name` and the chip
+flags need `--roofline-targets`. All five flags are usage errors outside perf
+check mode.
+
+```bash
+python3 scripts/vllm/benchmarking/check_regression.py \
+  --mode perf \
+  --results-dir <DIR> \
+  --roofline-targets scripts/vllm/benchmarking/baselines/perf/v7x/roofline_targets.json \
+  --config-name qwen3.5-397b-fp8-tp1-dp8-ep \
+  --chips 4
+```
+
 ### Accuracy (`--mode eval`)
 
 Compares `lm_eval` accuracy to `baselines/eval/<config>.<task>.baseline.json`.
@@ -199,11 +243,12 @@ be read, is not a standard JSON object (including `NaN` or `Infinity`), or has
 a malformed `_policy` block.
 
 Each mode accepts only the flags it reads: update mode takes `--baseline` and
-`--previous-baseline`; perf and eval check modes take `--results-dir`,
-`--baseline`, and `--tolerance`; `--mode perf --calibrate` takes
-`--results-dir` and `--gate-ttft-max-concurrency`; and `--mode eval
---calibrate` takes `--results-dir` and `--task-filter`. Any other flag is a
-usage error (exit `2`).
+`--previous-baseline`; eval check mode takes `--results-dir`, `--baseline`,
+and `--tolerance`; perf check mode adds the roofline and chip flags above;
+`--mode perf --calibrate` takes `--results-dir` and
+`--gate-ttft-max-concurrency`; and `--mode eval --calibrate` takes
+`--results-dir` and `--task-filter`. Any other flag is a usage error (exit
+`2`).
 
 ```bash
 git show origin/main:<baseline path> > /tmp/previous.baseline.json

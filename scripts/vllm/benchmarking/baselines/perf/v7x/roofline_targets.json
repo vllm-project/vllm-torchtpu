@@ -1,0 +1,472 @@
+{
+  "schema_version": 1,
+  "source": "TPU serving roofline model export",
+  "sol_mode": "peak",
+  "chip_denominator": "physical_chips",
+  "notes": [
+    "Targets are computed at sol_mode='peak' without speculative decoding; speculative-decoding configs are listed in `not_modeled`.",
+    "Configs that enable speculative decoding at runtime can measure above 100% of a non-speculative single-token decode roofline.",
+    "Throughput fields `output_token_throughput_per_chip` and `total_token_throughput_per_chip` use the closed-loop formula C * OSL / (prefill_time_for_C_reqs + OSL * TPOT) / num_chips to match `vllm bench serve` output token throughput at concurrency C; `steady_state_decode_throughput_per_chip` reports B / TPOT / num_chips.",
+    "Exported `sharding` records runtime vLLM TP/DP/EP flags; for GDN/KDA configs (`qwen3.5-397b`, `kimi-k3`), estimator `dimensions` maps onto the 2D (ep, tp) device mesh (`tp * ep == num_devices`, `dp = 1`) so `expert_shards = tp * ep` and `attn_dp_devices = ep`."
+  ],
+  "targets": {
+    "qwen3.5-397b-fp8-tp1-dp8-ep": {
+      "hf_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "hardware": "v7x-2x2x1",
+      "num_chips": 4,
+      "num_devices": 8,
+      "sharding": {
+        "tp": 1,
+        "dp": 8,
+        "ep": 8,
+        "pp": 1,
+        "cp": 1
+      },
+      "dtypes": {
+        "weight": "fp8",
+        "activation": "fp8",
+        "kv_cache": "fp8"
+      },
+      "assumptions": [],
+      "cells": {
+        "isl1024_osl8192_c64": {
+          "input_len": 1024,
+          "output_len": 8192,
+          "concurrency": 64,
+          "output_token_throughput_per_chip": 1282.53,
+          "total_token_throughput_per_chip": 1442.85,
+          "steady_state_decode_throughput_per_chip": 1287.82,
+          "tpot_ms": 12.4241,
+          "ttft_ms": 419.9164,
+          "decode_bound": "Memory",
+          "prefill_bound": "Comm",
+          "weights_gib": 54.2407,
+          "kv_cache_gib": 2.0169,
+          "total_gib": 56.4295,
+          "status": "ok"
+        },
+        "isl1024_osl8192_c256": {
+          "input_len": 1024,
+          "output_len": 8192,
+          "concurrency": 256,
+          "output_token_throughput_per_chip": 3287.77,
+          "total_token_throughput_per_chip": 3698.75,
+          "steady_state_decode_throughput_per_chip": 3322.77,
+          "tpot_ms": 19.261,
+          "ttft_ms": 1679.6655,
+          "decode_bound": "Memory",
+          "prefill_bound": "Comm",
+          "weights_gib": 54.2407,
+          "kv_cache_gib": 8.0676,
+          "total_gib": 62.4802,
+          "status": "ok"
+        },
+        "isl1024_osl8192_c512": {
+          "input_len": 1024,
+          "output_len": 8192,
+          "concurrency": 512,
+          "output_token_throughput_per_chip": 5252.87,
+          "total_token_throughput_per_chip": 5909.47,
+          "steady_state_decode_throughput_per_chip": 5342.78,
+          "tpot_ms": 23.9576,
+          "ttft_ms": 3359.3311,
+          "decode_bound": "Memory",
+          "prefill_bound": "Comm",
+          "weights_gib": 54.2407,
+          "kv_cache_gib": 16.1353,
+          "total_gib": 70.6885,
+          "status": "ok"
+        },
+        "isl8192_osl1024_c64": {
+          "input_len": 8192,
+          "output_len": 1024,
+          "concurrency": 64,
+          "output_token_throughput_per_chip": 1005.43,
+          "total_token_throughput_per_chip": 9048.89,
+          "steady_state_decode_throughput_per_chip": 1276.4,
+          "tpot_ms": 12.5352,
+          "ttft_ms": 3459.4166,
+          "decode_bound": "Memory",
+          "prefill_bound": "Compute",
+          "weights_gib": 54.2407,
+          "kv_cache_gib": 2.4271,
+          "total_gib": 56.8397,
+          "status": "ok"
+        },
+        "isl8192_osl1024_c256": {
+          "input_len": 8192,
+          "output_len": 1024,
+          "concurrency": 256,
+          "output_token_throughput_per_chip": 1926.61,
+          "total_token_throughput_per_chip": 17339.48,
+          "steady_state_decode_throughput_per_chip": 3247.8,
+          "tpot_ms": 19.7056,
+          "ttft_ms": 13837.6666,
+          "decode_bound": "Memory",
+          "prefill_bound": "Compute",
+          "weights_gib": 54.2407,
+          "kv_cache_gib": 9.7083,
+          "total_gib": 64.2146,
+          "status": "ok"
+        },
+        "isl8192_osl1024_c512": {
+          "input_len": 8192,
+          "output_len": 1024,
+          "concurrency": 512,
+          "output_token_throughput_per_chip": 2467.54,
+          "total_token_throughput_per_chip": 22207.87,
+          "steady_state_decode_throughput_per_chip": 5151.57,
+          "tpot_ms": 24.8468,
+          "ttft_ms": 27675.3332,
+          "decode_bound": "Memory",
+          "prefill_bound": "Compute",
+          "weights_gib": 54.2407,
+          "kv_cache_gib": 19.4165,
+          "total_gib": 74.1885,
+          "status": "ok"
+        }
+      }
+    },
+    "qwen3.5-397b-fp8-tp2-dp4-ep": {
+      "hf_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "hardware": "v7x-2x2x1",
+      "num_chips": 4,
+      "num_devices": 8,
+      "sharding": {
+        "tp": 2,
+        "dp": 4,
+        "ep": 8,
+        "pp": 1,
+        "cp": 1
+      },
+      "dtypes": {
+        "weight": "fp8",
+        "activation": "fp8",
+        "kv_cache": "fp8"
+      },
+      "assumptions": [],
+      "cells": {
+        "isl1024_osl8192_c64": {
+          "input_len": 1024,
+          "output_len": 8192,
+          "concurrency": 64,
+          "output_token_throughput_per_chip": 1368.68,
+          "total_token_throughput_per_chip": 1539.77,
+          "steady_state_decode_throughput_per_chip": 1375.29,
+          "tpot_ms": 11.6339,
+          "ttft_ms": 460.0506,
+          "decode_bound": "Memory",
+          "prefill_bound": "Memory",
+          "weights_gib": 49.7375,
+          "kv_cache_gib": 2.0169,
+          "total_gib": 52.0591,
+          "status": "ok"
+        },
+        "isl1024_osl8192_c256": {
+          "input_len": 1024,
+          "output_len": 8192,
+          "concurrency": 256,
+          "output_token_throughput_per_chip": 3399.97,
+          "total_token_throughput_per_chip": 3824.97,
+          "steady_state_decode_throughput_per_chip": 3441.03,
+          "tpot_ms": 18.5991,
+          "ttft_ms": 1840.2025,
+          "decode_bound": "Memory",
+          "prefill_bound": "Memory",
+          "weights_gib": 49.7375,
+          "kv_cache_gib": 8.0676,
+          "total_gib": 58.1099,
+          "status": "ok"
+        },
+        "isl1024_osl8192_c512": {
+          "input_len": 1024,
+          "output_len": 8192,
+          "concurrency": 512,
+          "output_token_throughput_per_chip": 5352.11,
+          "total_token_throughput_per_chip": 6021.12,
+          "steady_state_decode_throughput_per_chip": 5454.57,
+          "tpot_ms": 23.4665,
+          "ttft_ms": 3680.4049,
+          "decode_bound": "Memory",
+          "prefill_bound": "Memory",
+          "weights_gib": 49.7375,
+          "kv_cache_gib": 16.1353,
+          "total_gib": 66.1853,
+          "status": "ok"
+        },
+        "isl8192_osl1024_c64": {
+          "input_len": 8192,
+          "output_len": 1024,
+          "concurrency": 64,
+          "output_token_throughput_per_chip": 1035.6,
+          "total_token_throughput_per_chip": 9320.37,
+          "steady_state_decode_throughput_per_chip": 1362.27,
+          "tpot_ms": 11.7451,
+          "ttft_ms": 3793.8816,
+          "decode_bound": "Memory",
+          "prefill_bound": "Memory",
+          "weights_gib": 49.7375,
+          "kv_cache_gib": 2.4271,
+          "total_gib": 52.4693,
+          "status": "ok"
+        },
+        "isl8192_osl1024_c256": {
+          "input_len": 8192,
+          "output_len": 1024,
+          "concurrency": 256,
+          "output_token_throughput_per_chip": 1889.94,
+          "total_token_throughput_per_chip": 17009.45,
+          "steady_state_decode_throughput_per_chip": 3360.7,
+          "tpot_ms": 19.0437,
+          "ttft_ms": 15175.5264,
+          "decode_bound": "Memory",
+          "prefill_bound": "Memory",
+          "weights_gib": 49.7375,
+          "kv_cache_gib": 9.7083,
+          "total_gib": 59.7505,
+          "status": "ok"
+        },
+        "isl8192_osl1024_c512": {
+          "input_len": 8192,
+          "output_len": 1024,
+          "concurrency": 512,
+          "output_token_throughput_per_chip": 2370.57,
+          "total_token_throughput_per_chip": 21335.12,
+          "steady_state_decode_throughput_per_chip": 5255.43,
+          "tpot_ms": 24.3558,
+          "ttft_ms": 30351.0527,
+          "decode_bound": "Memory",
+          "prefill_bound": "Memory",
+          "weights_gib": 49.7375,
+          "kv_cache_gib": 19.4165,
+          "total_gib": 69.6853,
+          "status": "ok"
+        }
+      }
+    },
+    "qwen3.5-397b-fp8-tp8-dp1-ep": {
+      "hf_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+      "hardware": "v7x-2x2x1",
+      "num_chips": 4,
+      "num_devices": 8,
+      "sharding": {
+        "tp": 8,
+        "dp": 1,
+        "ep": 8,
+        "pp": 1,
+        "cp": 1
+      },
+      "dtypes": {
+        "weight": "fp8",
+        "activation": "fp8",
+        "kv_cache": "fp8"
+      },
+      "assumptions": [],
+      "cells": {
+        "isl1024_osl8192_c64": {
+          "input_len": 1024,
+          "output_len": 8192,
+          "concurrency": 64,
+          "output_token_throughput_per_chip": 1275.7,
+          "total_token_throughput_per_chip": 1435.16,
+          "steady_state_decode_throughput_per_chip": 1288.2,
+          "tpot_ms": 12.4204,
+          "ttft_ms": 997.0972,
+          "decode_bound": "Memory",
+          "prefill_bound": "Comm",
+          "weights_gib": 46.3602,
+          "kv_cache_gib": 3.7747,
+          "total_gib": 51.2365,
+          "status": "ok"
+        },
+        "isl1024_osl8192_c256": {
+          "input_len": 1024,
+          "output_len": 8192,
+          "concurrency": 256,
+          "output_token_throughput_per_chip": 2754.94,
+          "total_token_throughput_per_chip": 3099.31,
+          "steady_state_decode_throughput_per_chip": 2813.91,
+          "tpot_ms": 22.7441,
+          "ttft_ms": 3988.3888,
+          "decode_bound": "Memory",
+          "prefill_bound": "Comm",
+          "weights_gib": 46.3602,
+          "kv_cache_gib": 15.0989,
+          "total_gib": 62.5606,
+          "status": "ok"
+        },
+        "isl1024_osl8192_c512": {
+          "input_len": 1024,
+          "output_len": 8192,
+          "concurrency": 512,
+          "output_token_throughput_per_chip": 3865.81,
+          "total_token_throughput_per_chip": 4349.03,
+          "steady_state_decode_throughput_per_chip": 3982.94,
+          "tpot_ms": 32.1371,
+          "ttft_ms": 7976.7775,
+          "decode_bound": "Memory",
+          "prefill_bound": "Comm",
+          "weights_gib": 46.3602,
+          "kv_cache_gib": 30.1978,
+          "total_gib": 77.8079,
+          "status": "ok"
+        },
+        "isl8192_osl1024_c64": {
+          "input_len": 8192,
+          "output_len": 1024,
+          "concurrency": 64,
+          "output_token_throughput_per_chip": 767.63,
+          "total_token_throughput_per_chip": 6908.65,
+          "steady_state_decode_throughput_per_chip": 1243.68,
+          "tpot_ms": 12.865,
+          "ttft_ms": 8169.8773,
+          "decode_bound": "Memory",
+          "prefill_bound": "Comm",
+          "weights_gib": 46.3602,
+          "kv_cache_gib": 5.4153,
+          "total_gib": 52.8771,
+          "status": "ok"
+        },
+        "isl8192_osl1024_c256": {
+          "input_len": 8192,
+          "output_len": 1024,
+          "concurrency": 256,
+          "output_token_throughput_per_chip": 1134.02,
+          "total_token_throughput_per_chip": 10206.22,
+          "steady_state_decode_throughput_per_chip": 2609.84,
+          "tpot_ms": 24.5226,
+          "ttft_ms": 32679.5091,
+          "decode_bound": "Memory",
+          "prefill_bound": "Comm",
+          "weights_gib": 46.3602,
+          "kv_cache_gib": 21.6614,
+          "total_gib": 69.1231,
+          "status": "ok"
+        },
+        "isl8192_osl1024_c512": {
+          "input_len": 8192,
+          "output_len": 1024,
+          "concurrency": 512,
+          "output_token_throughput_per_chip": 1286.16,
+          "total_token_throughput_per_chip": 11575.43,
+          "steady_state_decode_throughput_per_chip": 3586.04,
+          "tpot_ms": 35.694,
+          "ttft_ms": 65359.0181,
+          "decode_bound": "Memory",
+          "prefill_bound": "Comm",
+          "weights_gib": 46.3602,
+          "kv_cache_gib": 43.3228,
+          "total_gib": 91.8079,
+          "status": "ok"
+        }
+      }
+    },
+    "glm-5.2-fp8-dp16-ep": {
+      "hf_model": "zai-org/GLM-5.2-FP8",
+      "hardware": "v7x-2x2x2",
+      "num_chips": 8,
+      "num_devices": 16,
+      "sharding": {
+        "tp": 1,
+        "dp": 16,
+        "ep": 16,
+        "pp": 1,
+        "cp": 1
+      },
+      "dtypes": {
+        "weight": "fp8",
+        "activation": "fp8",
+        "kv_cache": "fp8"
+      },
+      "assumptions": [],
+      "cells": {
+        "isl8192_osl1024_c1024": {
+          "input_len": 8192,
+          "output_len": 1024,
+          "concurrency": 1024,
+          "output_token_throughput_per_chip": 1407.78,
+          "total_token_throughput_per_chip": 12670.0,
+          "steady_state_decode_throughput_per_chip": 5230.92,
+          "tpot_ms": 24.4699,
+          "ttft_ms": 68048.4256,
+          "decode_bound": "Memory",
+          "prefill_bound": "Comm",
+          "weights_gib": 59.5102,
+          "kv_cache_gib": 26.1562,
+          "total_gib": 85.6723,
+          "status": "ok"
+        }
+      }
+    },
+    "kimi-k3-tp32-ep": {
+      "hf_model": "moonshotai/Kimi-K3",
+      "hardware": "v7x-2x2x4",
+      "num_chips": 16,
+      "num_devices": 32,
+      "sharding": {
+        "tp": 32,
+        "dp": 1,
+        "ep": 32,
+        "pp": 1,
+        "cp": 1
+      },
+      "dtypes": {
+        "weight": "w4a16_moe_bf16_attn",
+        "moe_weight": "fp4",
+        "attn_proj_weight": "bf16",
+        "activation": "bf16",
+        "kv_cache": "fp8"
+      },
+      "assumptions": [
+        {
+          "parameter": "kda_recurrent_kernel",
+          "assumed": "GDN non-chunked recurrent step VPU/MXU/DMA cost model",
+          "reason": "KDA projection weights (f_a_proj, f_b_proj, 3*n_k*d_k conv1d) and 24 NoPE-MLA layers are exact, but the 69 KDA recurrent state-update steps use the GDN recurrent kernel timing proxy.",
+          "source": "roofline model (GDN recurrent kernel)"
+        },
+        {
+          "parameter": "moe_sharding_on_tp32",
+          "assumed": {
+            "tp": 32,
+            "ep": 1,
+            "dp": 1
+          },
+          "reason": "kimi-k3-tp32-ep.sh runs TP=32, DP=1, ENABLE_EP=true (attention TP=32, MoE EP=32 with TP_moe=1), whereas the 2D (ep, tp) GDN estimator models tp=32, ep=1 (MoE TP=32 with TP AllReduce across 32 devices, preserving expert_shards=32 and attn_dp_devices=1).",
+          "source": "scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh"
+        }
+      ],
+      "cells": {
+        "isl8192_osl1024_c1": {
+          "input_len": 8192,
+          "output_len": 1024,
+          "concurrency": 1,
+          "output_token_throughput_per_chip": 12.63,
+          "total_token_throughput_per_chip": 113.71,
+          "steady_state_decode_throughput_per_chip": 13.52,
+          "tpot_ms": 4.624,
+          "ttft_ms": 330.398,
+          "decode_bound": "Comm",
+          "prefill_bound": "Comm",
+          "weights_gib": 44.7591,
+          "kv_cache_gib": 0.1188,
+          "total_gib": 46.8936,
+          "status": "unverified"
+        }
+      }
+    }
+  },
+  "not_modeled": {
+    "qwen3.5-397b-fp8-mtp": {
+      "reason": "speculative_decoding_not_modeled",
+      "detail": "Checked-in repo config scripts/vllm/benchmarking/configs/qwen3.5-397b-fp8-mtp.sh enables MTP speculative decoding."
+    },
+    "kimi-k3-tp8-dp4-ep-1p1d": {
+      "reason": "disaggregated_pd_kv_transfer_not_modeled",
+      "detail": "Checked-in repo config scripts/vllm/benchmarking/configs/kimi-k3-tp8-dp4-ep-1p1d.sh runs 1P1D disaggregated serving."
+    },
+    "kimi-k3-tp8-dp4-ep-agentx": {
+      "reason": "disaggregated_pd_kv_transfer_not_modeled",
+      "detail": "Checked-in repo config scripts/vllm/benchmarking/configs/kimi-k3-tp8-dp4-ep-agentx.sh runs 1P1D disaggregated AgentX serving."
+    }
+  }
+}

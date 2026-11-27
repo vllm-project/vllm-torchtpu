@@ -45,6 +45,7 @@ _COPIED_FILES = (
     "bq_utils.py",
     "check_regression.py",
     "baseline_policy.py",
+    "roofline_gate.py",
     "publish_perf_dashboard.py",
 )
 

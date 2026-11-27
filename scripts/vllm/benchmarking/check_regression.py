@@ -16,6 +16,7 @@
 
 Usage:
     check_regression.py --mode <perf|eval> --results-dir <dir> --baseline <baseline.json> [--tolerance 0.05]
+    check_regression.py --mode perf --results-dir <dir> --roofline-targets <targets.json> --config-name <config> [--chips <N>]
     check_regression.py --mode <perf|eval> --calibrate --results-dir <dir> [<dir2> ...]
     check_regression.py --mode update --baseline <new.json> [--previous-baseline <old.json>]
 """  # noqa: E501
@@ -38,6 +39,7 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 import baseline_policy  # noqa: E402
+import roofline_gate  # noqa: E402
 
 POLICY_KEY = baseline_policy.POLICY_KEY
 DEVELOPMENT = baseline_policy.DEVELOPMENT
@@ -50,6 +52,16 @@ gated_entries = baseline_policy.gated_entries
 load_json_object = baseline_policy.load_json_object
 load_baseline_file = baseline_policy.load_json_object
 parse_policy = baseline_policy.parse_policy
+
+ROOFLINE_CELL_STATUSES = roofline_gate.ROOFLINE_CELL_STATUSES
+RooflineCellTarget = roofline_gate.RooflineCellTarget
+RooflineConfigTarget = roofline_gate.RooflineConfigTarget
+NotModeledEntry = roofline_gate.NotModeledEntry
+RooflineTargets = roofline_gate.RooflineTargets
+ResolvedRoofline = roofline_gate.ResolvedRoofline
+resolve_physical_chips = roofline_gate.resolve_physical_chips
+load_roofline_targets = roofline_gate.load_roofline_targets
+check_roofline = roofline_gate.check_roofline
 
 
 class Metric(NamedTuple):
@@ -506,7 +518,10 @@ def calibrate_eval(
 # The argparse destinations each (mode, calibrate) combination reads. A flag
 # given to a mode that does not read it is a usage error, not silently ignored.
 UPDATE_MODE_ARGS = frozenset({"mode", "baseline", "previous_baseline"})
-PERF_CHECK_ARGS = frozenset({"mode", "results_dir", "baseline", "tolerance"})
+PERF_CHECK_ARGS = (
+    frozenset({"mode", "results_dir", "baseline", "tolerance"})
+    | roofline_gate.ROOFLINE_ARG_NAMES
+)
 PERF_CALIBRATE_ARGS = frozenset(
     {"mode", "calibrate", "results_dir", "gate_ttft_max_concurrency"}
 )
@@ -587,27 +602,75 @@ def _run_eval_check(args: argparse.Namespace, tolerance: float) -> int:
     return 0
 
 
-def _run_perf_check(args: argparse.Namespace, tolerance: float) -> int:
+def _run_perf_check(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, tolerance: float
+) -> int:
+    if args.roofline_targets is None:
+        for flag, value in (
+            ("--config-name", args.config_name),
+            ("--chips", args.chips),
+            ("--prefill-chips", args.prefill_chips),
+            ("--decode-chips", args.decode_chips),
+        ):
+            if value is not None:
+                parser.error(f"{flag} requires --roofline-targets")
+    elif not args.config_name:
+        parser.error("--config-name is required with --roofline-targets")
+
+    baseline = None
+    not_modeled = None
+    resolved_roofline: ResolvedRoofline | None = None
     try:
-        baseline = gated_entries(load_json_object(args.baseline))
+        if args.baseline is not None:
+            baseline = gated_entries(load_json_object(args.baseline))
+        if args.roofline_targets is not None:
+            chips = resolve_physical_chips(
+                args.chips, args.prefill_chips, args.decode_chips
+            )
+            roofline = load_roofline_targets(args.roofline_targets)
+            not_modeled, resolved_roofline = roofline_gate.resolve_roofline_config(
+                roofline, args.config_name, chips
+            )
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
+
     results = load_perf_results(args.results_dir[0])
-    if not results:
+    # A config that is not modeled only prints a note, which needs no results.
+    if not results and (baseline is not None or resolved_roofline is not None):
         print(
             f"ERROR: no isl*_osl*_c*.json files found in {args.results_dir[0]}",
             file=sys.stderr,
         )
         return 2
-    failed = check_perf(results, baseline, tolerance)
-    if failed:
+
+    if resolved_roofline is not None:
+        roofline_gate.warn_if_chip_count_differs(resolved_roofline)
+
+    perf_failed = 0
+    if baseline is not None:
+        perf_failed = check_perf(results, baseline, tolerance)
+
+    if not_modeled is not None:
+        roofline_gate.print_not_modeled_note(args.config_name, not_modeled)
+    elif resolved_roofline is not None:
+        check_roofline(
+            results,
+            resolved_roofline.cells,
+            resolved_roofline.config_name,
+            resolved_roofline.num_chips,
+        )
+
+    if perf_failed:
         print(
-            f"FAILED: {failed} metric(s) regressed beyond {tolerance * 100:.2f}%",
+            f"FAILED: {perf_failed} metric(s) regressed beyond {tolerance * 100:.2f}%",
             file=sys.stderr,
         )
         return 1
-    print("PASS: all gated metrics within tolerance.")
+    if baseline is not None:
+        print("PASS: all gated metrics within tolerance.")
+    else:
+        print("PASS: advisory roofline check complete.")
     return 0
 
 
@@ -659,6 +722,7 @@ def main() -> int:
         "entries whose concurrency exceeds this, so TTFT is ungated there. "
         "0 ungates TTFT for every cell.",
     )
+    roofline_gate.add_roofline_args(parser)
     args = parser.parse_args()
 
     accepted = _MODE_ALLOWED_ARGS[(args.mode, args.calibrate)]
@@ -681,8 +745,9 @@ def main() -> int:
         parser.error("--results-dir is required in perf and eval modes")
     if args.calibrate:
         return _run_calibrate(args)
-    if args.baseline is None:
-        parser.error("--baseline is required unless --calibrate is set")
+    if args.baseline is None and args.roofline_targets is None:
+        either = " or --roofline-targets" if args.mode == "perf" else ""
+        parser.error(f"--baseline{either} is required unless --calibrate is set")
     if len(args.results_dir) != 1:
         parser.error("--results-dir may only be given once in check mode")
 
@@ -690,7 +755,7 @@ def main() -> int:
     if tolerance is None:
         tolerance = 0.05 if args.mode == "perf" else 0.015
     if args.mode == "perf":
-        return _run_perf_check(args, tolerance)
+        return _run_perf_check(parser, args, tolerance)
     return _run_eval_check(args, tolerance)
 
 
