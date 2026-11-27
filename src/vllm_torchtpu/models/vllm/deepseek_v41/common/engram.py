@@ -23,6 +23,7 @@ from vllm.models.deepseek_v41.common.mm_preprocess import (
 )
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.compilation.direct_call import DirectCompiled
 from vllm_torchtpu.kernels.engram_hash import engram_hash, engram_prep, hash_tables
 from vllm_torchtpu.layers.adapter.custom_ops.packed_suffix_op import packed_suffix
 from vllm_torchtpu.layers.adapter.upstream_bindings import (
@@ -217,7 +218,7 @@ class NgramHashState(upstream.NgramHashState):
         assert self.use_slot_cache and self._cache is not None
         assert self._cache.numel() < 2**31 and rows_per_page == self.block_size
         pad_id, tables = self._fused_hash_tables()
-        cache, hashes, keep = _fused_prep_op()(
+        args = (
             self.token_map,
             *tables,
             self._cache,
@@ -234,8 +235,12 @@ class NgramHashState(upstream.NgramHashState):
             IMAGE_SENTINEL_BASE_ID,
             bool(envs.TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER),
         )
-        self._cache.copy_(cache)
-        return hashes, keep
+        if torch.compiler.is_compiling():
+            # Traced into a compiled stage: the stage is the program.
+            cache, hashes, keep = _fused_prep_op()(*args)
+            self._cache.copy_(cache)
+            return hashes, keep
+        return _fused_prep_program()(*args)
 
     def _fused_hash(
         self,
@@ -649,6 +654,30 @@ def _fused_prep_op():
         )
         _FUSED_PREP_OP = op
     return _FUSED_PREP_OP
+
+
+_FUSED_PREP_PROGRAM: DirectCompiled | None = None
+
+
+def _fused_prep_program() -> DirectCompiled:
+    """``_fused_prep_op`` and the slot-cache write-back as one compiled program.
+
+    Called eagerly, the op re-validates and re-keys its arguments in Python
+    on every decode step; a compiled program called directly does not.
+    """
+    global _FUSED_PREP_PROGRAM
+    if _FUSED_PREP_PROGRAM is None:
+        op = _fused_prep_op()
+
+        def program(token_map, limbs, primes, offsets, cache, *args):
+            new_cache, hashes, keep = op(
+                token_map, limbs, primes, offsets, cache, *args
+            )
+            cache.copy_(new_cache)
+            return hashes, keep
+
+        _FUSED_PREP_PROGRAM = DirectCompiled(program, backend="tpu")
+    return _FUSED_PREP_PROGRAM
 
 
 def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:

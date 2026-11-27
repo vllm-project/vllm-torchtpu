@@ -13,6 +13,7 @@ from vllm.models.deepseek_v41.common.mm_preprocess import (
     image_sentinel_mask,
 )
 
+from vllm_torchtpu.models.vllm.deepseek_v41.common.engram import _fused_prep_op
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as v2_cache
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import engram as v2_engram
 
@@ -101,7 +102,7 @@ def test_fused_prep_matches_separate_calls(
         "vllm_torchtpu.envs.TPU_DEEPSEEK_V41_ENGRAM_TILE_SCATTER", tiles
     )
     v2_cache.initialize_cache_ops()
-    separate, fused = _state(device), _state(device)
+    separate, fused, direct = _state(device), _state(device), _state(device)
     data = _inputs(device, requests, per_request, padding)
     kv_cache = torch.empty((PAGES, BLOCK), dtype=torch.int8, device=device)
     metadata = SimpleNamespace(
@@ -130,7 +131,30 @@ def test_fused_prep_matches_separate_calls(
             requests,
             BLOCK,
         )
+        # The compiled program against the eager op call it wraps.
+        pad_id, tables = direct._fused_hash_tables()
+        cache, direct_hashes, direct_keep = _fused_prep_op()(
+            direct.token_map,
+            *tables,
+            direct._cache,
+            ids,
+            positions,
+            data["query_start_loc"],
+            data["lookback"],
+            data["block_tables"],
+            requests,
+            direct.lookback_depth,
+            direct.block_size,
+            pad_id,
+            upstream.DEAD_ID,
+            IMAGE_SENTINEL_BASE_ID,
+            tiles,
+        )
+        direct._cache.copy_(cache)
         assert torch.equal(hashes.cpu(), ref.cpu())
+        assert torch.equal(hashes.cpu(), direct_hashes.cpu())
         assert torch.equal(keep.cpu(), (~image_sentinel_mask(ids)).cpu())
+        assert torch.equal(keep.cpu(), direct_keep.cpu())
         assert torch.equal(fused._cache.cpu(), separate._cache.cpu())
+        assert torch.equal(fused._cache.cpu(), direct._cache.cpu())
         data["positions"] = positions + per_request
