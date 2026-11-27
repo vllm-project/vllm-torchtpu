@@ -799,7 +799,7 @@ def _decode_candidates_kernel(
     rows = row0 + jax.lax.broadcasted_iota(jnp.int32, (block_q, 1), 0)
     own = (rows >= cu_ref[seq]) & (rows < cu_ref[seq + 1])
 
-    def store(first, m, rows_major):
+    def store(first, m, rows_major, pos):
         m = m if rows_major else m.T
         cols = pl.ds(
             pl.multiple_of(group * pages_per_step + first, m.shape[1]), m.shape[1]
@@ -1401,9 +1401,10 @@ def _prefill_candidates_kernel(
             for i in range(topk):
                 lists_ref[i, :, lanes] = merged[i]
 
-    def store(first, m, rows_major):
+    def store(first, m, rows_major, pos):
         """Pick keys of the chunk's maxima, merged into the lists by groups
-        of `topk` key vregs among the next chunks' matmuls."""
+        of `topk` key vregs among the next chunks' matmuls (at the body's
+        `pos`: a body merges its own keys)."""
         m = m.T if rows_major else m
         col0 = group * pages_per_step + first
         cols = col0 + jax.lax.broadcasted_iota(jnp.int32, m.shape, 0)
@@ -1418,8 +1419,8 @@ def _prefill_candidates_kernel(
             col_bits=col_bits,
             real_cols=pick["real_cols"],
         )
-        keys_ref[pl.ds(first, m.shape[0]), :] = _float_keys(keys, col_bits)
-        end = first + m.shape[0]
+        keys_ref[pl.ds(pos, m.shape[0]), :] = _float_keys(keys, col_bits)
+        end = pos + m.shape[0]
         if end % group_cols == 0:
             merge_keys(end - group_cols, group_cols)
 

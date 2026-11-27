@@ -460,9 +460,11 @@ def _kernel_v3(
     A folded 4-bit page (`msa_fp4.scales_in_page`) is ``D / 8`` word rows of
     int4 keys and one row of f32 slot scales (`_chunk_maxima_t`).
 
-    `store(first, m, rows_major)`, if given, takes each chunk's maxima (pages
-    ``first + i`` of the group) in place of `o_ref`, as scored: ``m [Bq,
-    chunk]`` if `rows_major` (`_scores_transposed`), else ``[chunk, Bq]``;
+    `store(first, m, rows_major, pos)`, if given, takes each chunk's maxima
+    (pages ``first + i`` of the group, `first` traced in a hit's tail
+    pieces) in place of `o_ref`, as scored: ``m [Bq, chunk]`` if
+    `rows_major` (`_scores_transposed`), else ``[chunk, Bq]``; `pos` is the
+    chunk's first page among those of its body (static);
     `after_wait(slot)`
     runs once the step's pages are in ring slot `slot`, before they are scored;
     `after_body(scored)` at the end of a body that scored `scored` chunks.
@@ -559,10 +561,10 @@ def _kernel_v3(
     num_chunks = pages_per_step // chunk
     group_page = (work_ref[step] & _GROUP_MASK) * pages_per_step
 
-    def put(first, m, rows_major):
+    def put(first, m, rows_major, offset=0):
         """Store maxima ``m``: ``[Bq, chunk]`` if `rows_major`, else ``[chunk, Bq]``."""
         if store is not None:
-            store(first, m, rows_major)
+            store(offset + first, m, rows_major, first)
         elif transposed:
             o_ref[:, pl.ds(first, chunk)] = m if rows_major else m.T
         else:
@@ -574,10 +576,10 @@ def _kernel_v3(
     issue_chunks = min(_DMA_ISSUE_CHUNKS, num_chunks)
     per_pair = -(-pages_per_step // (issue_chunks * (chunk // 2)))
 
-    def score_chunk(slot, first, share, hit=False):
+    def score_chunk(slot, first, share, hit=False, offset=0):
         """Score pages ``[first, first + chunk)``, issuing the ahead group's
         descriptors `share` among the first page pairs (`start`); from
-        `key_cache` if `hit`."""
+        `key_cache` if `hit`, pages ``offset + first`` on."""
 
         def issue(j):
             if j < chunk // 2:
@@ -594,10 +596,11 @@ def _kernel_v3(
             def cached_keys(j):
                 issue(j)
                 return pltpu.bitcast(
-                    key_cache[group_page + first + j], jnp.float8_e4m3fn
+                    key_cache[group_page + offset + first + j], jnp.float8_e4m3fn
                 )
 
-            put(first, _chunk_maxima(q_pair_fp8, cached_keys, chunk), rows_major=False)
+            m = _chunk_maxima(q_pair_fp8, cached_keys, chunk)
+            put(first, m, rows_major=False, offset=offset)
             return
 
         if _scores_transposed(block_q, rows, cache_ref.dtype):
@@ -650,11 +653,12 @@ def _kernel_v3(
 
     share = per_pair * (chunk // 2)
 
-    def body(slot, scored, hit=False):
+    def body(slot, scored, hit=False, offset=0):
         """Score the group's first `scored` chunks; the rest are past the
         request's last page (their scores are never read) and only issue
         their share of the ahead group's descriptors (a `key_cache` hit
-        issues none: see below)."""
+        issues none: see below, and scores `scored` chunks from page
+        `offset`)."""
         if not hit:
             wait_pages(live, slot)
         if after_wait is not None:
@@ -666,7 +670,7 @@ def _kernel_v3(
             if hit:  # issued ahead of the body
                 pages = range(0)
             if c < scored:
-                score_chunk(slot, c * chunk, pages, hit)
+                score_chunk(slot, c * chunk, pages, hit, offset)
             elif not hit:
                 start(next_base, next_live, pages, (slot + ahead) % slots)
         if after_body is not None:
@@ -692,11 +696,30 @@ def _kernel_v3(
                 (step + ahead) % slots,
             )
         )
+    # A hit's last group scores its live chunks (rounded up to the smallest
+    # count) as pieces of the counts' bodies, one per set bit, largest first
+    # (the cached keys need no ring slot), where the next count's body
+    # scored up to twice its live chunks (c64 mixed step at 228K: 16 for 12).
+    pieces = key_cache is not None and all(n & (n - 1) == 0 for n in counts)
+    if pieces:
+        whole = -(-live_chunks // counts[0]) * counts[0]
+        for n in counts[::-1]:
+            first = (whole & ~(2 * n - 1)) * chunk
+            if n == num_chunks:
+                in_piece = whole == n
+            else:
+                in_piece = ((whole & n) != 0) & (whole < num_chunks)
+            pl.when(in_piece & hit)(
+                functools.partial(body, step % slots, n, True, first)
+            )
     for i, n in enumerate(counts):
         lo = counts[i - 1] if i else 0
         in_count = (live_chunks > lo) & (live_chunks <= n)
         if key_cache is not None:
-            pl.when(in_count & hit)(functools.partial(body, step % slots, n, True))
+            if not pieces:
+                pl.when(in_count & hit)(
+                    functools.partial(body, step % slots, n, True)
+                )
             in_count &= jnp.logical_not(hit)
         if not slot_bodies:
             pl.when(in_count)(functools.partial(body, step % slots, n))
