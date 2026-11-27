@@ -24,6 +24,10 @@ from jax.experimental.pallas import tpu as pltpu
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = 448.0
 LANES = 128
+# The MXU's output width on v7x: projections split into chunks of it
+# reproduce the whole window's dot bit for bit; other widths do not, and run
+# slower.
+MXU_COLUMNS = 256
 ROW_TILE = 8
 
 
@@ -105,18 +109,28 @@ def _kernel(
             w.at[:, at(i * window, window)], wb.at[i % 2], w_sem.at[i % 2]
         )
 
-    def project(n):
+    def project(n, cols):
         """BF16 projection of unit n (weight window n // tiles, token tile
-        n % tiles) into pb[n % 2]."""
+        n % tiles), columns ``cols`` of the window, into pb[n % 2]."""
         i, rows = n // tiles, at(n % tiles * token_tile, token_tile)
+        width = cols.stop - cols.start
         z = jax.lax.dot_general(
             q[rows, :],
-            wb[i % 2],
+            wb[i % 2, :, cols],
             (((1,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
         )
-        z = (z * x_scale[rows, :]) * w_scale[at(i * window, window)][None, :]
-        pb[n % 2] = z.astype(pb.dtype)
+        scale = w_scale[pl.ds(pl.multiple_of(i * window + cols.start, LANES), width)]
+        z = (z * x_scale[rows, :]) * scale[None, :]
+        pb[n % 2, :, cols] = z.astype(pb.dtype)
+
+    chunk = MXU_COLUMNS if window % MXU_COLUMNS == 0 else window
+
+    def interleaved(vpu, n):
+        """Unit n's vector work and unit n + 1's projection, chunk by chunk."""
+        for c0 in range(0, window, chunk):
+            vpu(n, range(c0, c0 + chunk, LANES))
+            project(n + 1, slice(c0, c0 + chunk))
 
     def projected(m):
         """After unit m's projection: its window's last frees a weight slot."""
@@ -172,14 +186,14 @@ def _kernel(
     key_units = key_windows * tiles
     units = windows * tiles
 
-    def key_vpu(n, s):
+    def key_vpu(n, lanes, s):
         c, rows = n // tiles - s * per_head, at(n % tiles * token_tile, token_tile)
         cols = at(c * window, window)
         qw = q_weight[s : s + 1, cols].astype(jnp.float32)
         kw = k_weight[s : s + 1, cols].astype(jnp.float32)
         # One 128-lane group at a time keeps the FP32 temporaries in
         # registers instead of spilling [tile, window] arrays.
-        for lane in range(0, window, LANES):
+        for lane in lanes:
             part = slice(lane, lane + LANES)
             h = hb[heads + n % 2, :, part].astype(jnp.float32)
             kp = pb[n % 2, :, part].astype(jnp.float32)
@@ -187,13 +201,13 @@ def _kernel(
             h_sum[rows, :] += h * h
             k_sum[rows, :] += kp * kp
 
-    def value_vpu(n):
+    def value_vpu(n, lanes):
         g = n - key_units
         rows = at(g % tiles * token_tile, token_tile)
         for s in range(heads):
             slot = v_slot(g, s)
             gs = gate[s, rows, :]
-            for lane in range(0, window, LANES):
+            for lane in lanes:
                 part = slice(lane, lane + LANES)
                 h = hb[slot, :, part].astype(jnp.float32)
                 v = pb[n % 2, :, part].astype(jnp.float32)
@@ -235,7 +249,7 @@ def _kernel(
     w_copy(1).start()
     k_load(0, "start")
     w_copy(0).wait()
-    project(0)
+    project(0, slice(0, window))
     projected(0)
 
     # Key windows, head by head (heads unrolled, so weight rows and gate
@@ -249,8 +263,7 @@ def _kernel(
         def _(n, s=s):
             prefetch(n)
             consume_waits(n, True)
-            key_vpu(n, s)
-            project(n + 1)
+            interleaved(functools.partial(key_vpu, s=s), n)
             projected(n + 1)
 
         dot = jnp.sum(dot_sum[...], axis=1, keepdims=True)
@@ -274,13 +287,12 @@ def _kernel(
     def _(n):
         prefetch(n)
         consume_waits(n, False)
-        value_vpu(n)
-        project(n + 1)
+        interleaved(value_vpu, n)
         projected(n + 1)
         store(n)
 
     consume_waits(units - 1, False)
-    value_vpu(units - 1)
+    value_vpu(units - 1, range(0, window, LANES))
     store(units - 1)
     groups = per_head * tiles
     for g in range(max(0, groups - 2), groups):
