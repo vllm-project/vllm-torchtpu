@@ -4038,6 +4038,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         _sampler_applies_topk_topp=lambda: True,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
+        _spec_verify_sampler=None,
     )
     spec_runner._sample_chunk_logits = TPUModelRunner._sample_chunk_logits.__get__(
         spec_runner
