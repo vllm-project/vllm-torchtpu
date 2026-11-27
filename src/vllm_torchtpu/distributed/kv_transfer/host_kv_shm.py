@@ -134,11 +134,13 @@ class HostKVShmPool:
         # Only rank 0 uses the free list.
         self._free: queue.Queue | None = None
         self._lock: threading.Lock | None = None
+        self._slot_owners: dict[int, object] | None = None
         if owner:
             self._free = queue.Queue(maxsize=spec.num_slots)
             for i in range(spec.num_slots):
                 self._free.put(i)
             self._lock = threading.Lock()
+            self._slot_owners = {}
 
     # ---- mlock / munlock ----------------------------------------------
     def mlock_async(self, my_rank: int | None = None) -> threading.Thread:
@@ -274,20 +276,50 @@ class HostKVShmPool:
         return cls(spec, shm, owner=False)
 
     # ---- Free-list (rank 0 only) ---------------------------------------
-    def acquire_slot(self, timeout: float | None = None) -> int:
+    def acquire_slot(
+        self, timeout: float | None = None, *, owner: object | None = None
+    ) -> int:
+        """Acquire a free slot and record its owner token.
+
+        If ``owner`` is omitted, a unique sentinel is assigned so the slot
+        cannot be released by an arbitrary or stale caller.
+        """
         assert self._owner, "acquire_slot: only rank 0 manages the free list"
         assert self._free is not None
-        return self._free.get(timeout=timeout)
+        assert self._lock is not None
+        assert self._slot_owners is not None
+        slot_owner = object() if owner is None else owner
+        slot_idx = self._free.get(timeout=timeout)
+        with self._lock:
+            self._slot_owners[slot_idx] = slot_owner
+        return slot_idx
 
-    def release_slot(self, slot_idx: int) -> None:
+    def release_slot(self, slot_idx: int, owner: object) -> None:
+        """Release ``slot_idx`` only if it is currently held by ``owner``.
+
+        Raises ValueError on double-release (whether the slot is currently
+        free or has already been reacquired by another owner) so a stale
+        release can never return an in-use slot to the free list.
+        """
         assert self._owner, "release_slot: only rank 0 manages the free list"
         assert self._free is not None
         assert self._lock is not None
-        # Idempotent: tolerate double-release which can happen if a timeout
-        # races a pull-done notification.
+        assert self._slot_owners is not None
+        if owner is None:
+            raise ValueError("release_slot requires a non-None owner")
         with self._lock:
-            if slot_idx in self._free.queue:
-                return
+            current_owner = self._slot_owners.get(slot_idx)
+            if current_owner is None:
+                raise ValueError(
+                    f"release_slot: slot {slot_idx} is not currently held "
+                    f"(attempted release by owner={owner!r})"
+                )
+            if current_owner != owner:
+                raise ValueError(
+                    f"release_slot: slot {slot_idx} is held by "
+                    f"owner={current_owner!r}, not owner={owner!r}"
+                )
+            del self._slot_owners[slot_idx]
             self._free.put_nowait(slot_idx)
 
     # ---- Tensor views ---------------------------------------------------

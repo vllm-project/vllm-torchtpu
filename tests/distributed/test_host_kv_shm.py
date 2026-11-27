@@ -13,6 +13,7 @@
 # limitations under the License.
 """Tests for the shared-memory KV staging pool."""
 
+import queue
 import uuid
 
 import pytest
@@ -68,5 +69,73 @@ def test_unpack_rank_layers_rejects_wrong_layer_size():
             pool.unpack_rank_layers(
                 slot_idx=0, rank=0, num_blocks=2, layer_buffers=[b"x"] * spec.num_layers
             )
+    finally:
+        pool.close()
+
+
+def test_stale_release_after_reacquire_does_not_free_a_held_slot():
+    """A duplicate release that arrives after the slot was handed to another
+    transfer must raise and must not put the slot back on the free list.
+    """
+    pool = HostKVShmPool.create(_pool_spec(), f"test_host_kv_{uuid.uuid4().hex}")
+    try:
+        first = pool.acquire_slot(timeout=0, owner="req-a")
+        pool.release_slot(first, owner="req-a")
+        second = pool.acquire_slot(timeout=0, owner="req-b")
+        assert second == first
+
+        with pytest.raises(ValueError, match="held by owner='req-b'"):
+            pool.release_slot(first, owner="req-a")
+
+        with pytest.raises(queue.Empty):
+            pool.acquire_slot(timeout=0, owner="req-c")
+
+        # The rightful owner can still release, after which a new transfer acquires.
+        pool.release_slot(second, owner="req-b")
+        third = pool.acquire_slot(timeout=0, owner="req-c")
+        assert third == second
+    finally:
+        pool.close()
+
+
+def test_double_release_of_free_slot_raises_and_does_not_duplicate():
+    pool = HostKVShmPool.create(_pool_spec(), f"test_host_kv_{uuid.uuid4().hex}")
+    try:
+        # Use falsy owner=0 to verify ownership checks use `is None`, not truthiness.
+        slot = pool.acquire_slot(timeout=0, owner=0)
+        pool.release_slot(slot, owner=0)
+
+        with pytest.raises(ValueError, match="not currently held"):
+            pool.release_slot(slot, owner=0)
+
+        # Free list must contain exactly one copy of the single slot.
+        reacquired = pool.acquire_slot(timeout=0, owner=102)
+        assert reacquired == slot
+        with pytest.raises(queue.Empty):
+            pool.acquire_slot(timeout=0, owner=103)
+    finally:
+        pool.close()
+
+
+def test_release_slot_rejects_none_owner_and_unknown_slot():
+    pool = HostKVShmPool.create(_pool_spec(), f"test_host_kv_{uuid.uuid4().hex}")
+    try:
+        slot = pool.acquire_slot(timeout=0, owner=1)
+        with pytest.raises(ValueError, match="non-None owner"):
+            pool.release_slot(slot, owner=None)
+        with pytest.raises(ValueError, match="not currently held"):
+            pool.release_slot(99, owner=1)
+    finally:
+        pool.close()
+
+
+def test_acquire_without_owner_uses_unforgeable_sentinel():
+    pool = HostKVShmPool.create(_pool_spec(), f"test_host_kv_{uuid.uuid4().hex}")
+    try:
+        slot = pool.acquire_slot(timeout=0)
+        with pytest.raises(ValueError, match="held by owner="):
+            pool.release_slot(slot, owner="arbitrary")
+        with pytest.raises(queue.Empty):
+            pool.acquire_slot(timeout=0)
     finally:
         pool.close()

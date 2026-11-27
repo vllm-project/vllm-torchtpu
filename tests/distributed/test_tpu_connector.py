@@ -6499,7 +6499,7 @@ class TestCoordGetFinished:
         assert done_sending == {"req-acked"}
         assert done_recving == set()
         assert 10 not in self.worker._coord_send
-        self.worker._coord_pool.release_slot.assert_called_once_with(0)
+        self.worker._coord_pool.release_slot.assert_called_once_with(0, 10)
 
     def test_unacked_entry_stays_in_coord_send(self):
         entry = _CoordSendEntry(
