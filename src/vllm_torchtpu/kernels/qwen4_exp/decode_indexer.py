@@ -95,6 +95,8 @@ def select_decode_blocks(
             decode_req_batch_size=8 if size >= 8 else 4,
             enable_early_exit=True,
             components=qsa_indexing(),
+            decode_only=True,
+            hoist_step_metadata=True,
         )
 
     if batch <= chunk_size:

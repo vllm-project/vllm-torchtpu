@@ -1372,6 +1372,8 @@ def _select_blocks(
             decode_req_batch_size=8 if batch >= 8 else 4,
             enable_early_exit=True,
             components=qsa_indexing(),
+            decode_only=True,
+            hoist_step_metadata=True,
         )
 
     if len(query) > len(context) * max_query_len:
@@ -1443,7 +1445,14 @@ def _select_blocks(
         pages_per_query = -(-pages_per_query // shard[1])
     chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
     query_block = envs.VLLM_TPU_QSA_DECODE_QUERY_BLOCK
-    tuned = shape_tuned.indexer_decode_tiles(len(query)) if query_block else None
+    auto_shared_verify = query_block == 0 and max_query_len > 1
+    if auto_shared_verify:
+        query_block = min(8, 1 << (max_query_len - 1).bit_length())
+    tuned = (
+        shape_tuned.indexer_decode_tiles(len(query))
+        if (query_block and not auto_shared_verify)
+        else None
+    )
     if query_block:
         kv_block = envs.VLLM_TPU_QSA_DECODE_KV_BLOCK
         if tuned is not None:
@@ -1467,7 +1476,8 @@ def _select_blocks(
                     f"{name} must be a positive multiple of 128 "
                     f"and of {rows} compressed keys per page, got {block}"
                 )
-        mixed_only = envs.VLLM_TPU_QSA_INDEXER_MIXED_ONLY
+        mixed_only = envs.VLLM_TPU_QSA_INDEXER_MIXED_ONLY or auto_shared_verify
+        hoist_meta = envs.VLLM_TPU_QSA_INDEXER_HOIST_META or auto_shared_verify
         if shard is not None or dcp is not None:
             # Room for the local table padded to the widest KV block.
             pages_per_query += max(256, kv_block, decode_kv_block) // rows
@@ -1526,7 +1536,7 @@ def _select_blocks(
                     tail_skip=envs.VLLM_TPU_QSA_INDEXER_TAIL_SKIP,
                 ),
                 decode_passes=not mixed_only,
-                hoist_step_metadata=envs.VLLM_TPU_QSA_INDEXER_HOIST_META,
+                hoist_step_metadata=hoist_meta,
                 tile_aligned_scores=envs.VLLM_TPU_QSA_INDEXER_TILE_ALIGNED_SCORES,
                 # VLLM_TPU_QSA_INDEXER_SC_BOUNDED_COPY: the score rows are
                 # sized for max_model_len; select from each row's live prefix
