@@ -15,9 +15,10 @@
 
 A pipeline file in TPU_GENERATION_FILES is written once and goes up once per
 TPU generation (bootstrap.py, upload_stages). Each upload reads the
-generation's pod shapes as upload-time variables (TpuGeneration.upload_env)
-and has the generation's name stamped on its steps (stamp_tpu_generation), so
-the file names no generation, and adding one renames no step of the others.
+generation's name, pod shapes and chip type as upload-time variables
+(TpuGeneration.upload_env) and has the generation's name stamped on its steps
+(stamp_tpu_generation), so the file names no generation, and adding one renames
+no step of the others.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class TpuGeneration:
-    """A TPU generation: its name and the shapes of its pods.
+    """A TPU generation: its name, the shapes of its pods and its chip type.
 
     The name also tells its steps apart: `key_prefix` goes before every step
     key (Buildkite rejects a duplicate key) and `label_prefix` before every
@@ -39,6 +40,10 @@ class TpuGeneration:
     name: str
     shape_single: str
     shape_multi: str
+    # TPU_ACCELERATOR_TYPE as the pod's chip lookup reads it
+    # (vllm_torchtpu.tpu_info); run_eval_flow.sh also picks the chip's perf
+    # baselines with it.
+    accelerator_type: str
 
     @property
     def key_prefix(self) -> str:
@@ -49,10 +54,13 @@ class TpuGeneration:
         return f"{self.name} "
 
     def upload_env(self) -> dict[str, str]:
-        """The variables a step file reads to fill in SHAPE (either shape)."""
+        """The variables a step file reads: SHAPE (either shape), the chip type,
+        and TPU_GENERATION for the `if` of a step only some generations run."""
         return {
+            "TPU_GENERATION": self.name,
             "KUBE_SHAPE_SINGLE": self.shape_single,
             "KUBE_SHAPE_MULTI": self.shape_multi,
+            "TPU_ACCELERATOR_TYPE": self.accelerator_type,
         }
 
 
@@ -64,11 +72,13 @@ TPU_V7X = TpuGeneration(
     name="v7x",
     shape_single="tpu7x-standard-1t/1x1x1",
     shape_multi="tpu7x-standard-4t/2x2x1",
+    accelerator_type="tpu7x",
 )
 TPU_V6E = TpuGeneration(
     name="v6e",
     shape_single="ct6e-standard-1t/1x1",
     shape_multi="ct6e-standard-8t/2x4",
+    accelerator_type="v6e",
 )
 TPU_GENERATIONS_BY_NAME: Mapping[str, TpuGeneration] = {
     gen.name: gen for gen in (TPU_V6E, TPU_V7X)
@@ -77,6 +87,8 @@ TPU_GENERATIONS_BY_NAME: Mapping[str, TpuGeneration] = {
 # shows/queues first in Buildkite). Files not listed here are uploaded once.
 TPU_GENERATION_FILES: Mapping[str, tuple[TpuGeneration, ...]] = {
     ".buildkite/pipeline_tests.yml": (TPU_V6E, TPU_V7X),
+    ".buildkite/pipeline_integration.yml": (TPU_V6E, TPU_V7X),
+    ".buildkite/pipeline_perf.yml": (TPU_V6E, TPU_V7X),
 }
 # The generations those files go up for without TPU_ALL_EXTRA.
 DEFAULT_TPU_GENERATIONS: tuple[TpuGeneration, ...] = (TPU_V7X,)

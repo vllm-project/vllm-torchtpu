@@ -13,7 +13,18 @@
 # limitations under the License.
 
 # The perf/eval suite on the Kueue fleet; bootstrap.sh uploads it with the image
-# build from pipeline_build.yml.
+# build from pipeline_build.yml. Like pipeline_tests.yml, it goes up once for
+# each TPU generation the build runs (v7x alone unless the build's CI_EXTRAS
+# has tpu-all or tpu-v6e; see README.md): bootstrap.py fills in the
+# generation's shapes, chip type and name, and puts the name before every label
+# and key (tpu_generations.py), so no step here names a generation.
+#
+# A step only v7x can run uses `if: *v7x_only` (or *nightly_v7x_only), so
+# v6e's upload leaves it out: its model does not fit in a v6e 2x4 slice's
+# 256 GB of HBM (a v7x-8 has 768 GB), it needs native fp4, or it goes through
+# run_multihost.sh, whose topology and JobSets assume 4-chip v7x hosts.
+# Every step that sets TPU_ACCELERATOR_TYPE takes it from the generation, never
+# a fixed chip.
 
 # Every step here writes its results under this directory and the pod uploads
 # whatever it finds there. Declared once for the pipeline rather than per step:
@@ -40,41 +51,65 @@ x-perf-step-defaults: &perf_step
   agents:
     queue: "kube"
 
-# Eight TensorCores, which is four v7x chips on one host. Machine type names
-# chips, the queue names cores, so the two numbers differ for one shape.
-x-shape-8-core: &shape_8_core "tpu7x-standard-4t/2x2x1"
-x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
+# The generation's shapes, from bootstrap.py; the defaults are v7x's, for an
+# upload of this file on its own. The multi-chip shape is one host's eight
+# TensorCores: four v7x chips (2x2x1) or eight v6e chips (2x4).
+x-shape-single: &shape_single "${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}"
+x-shape-multi: &shape_multi "${KUBE_SHAPE_MULTI:-tpu7x-standard-4t/2x2x1}"
+
+# The `if` of a step only v7x runs (see the header).
+x-v7x-only: &v7x_only '"${TPU_GENERATION:-v7x}" == "v7x"'
+x-nightly-v7x-only: &nightly_v7x_only 'build.env("NIGHTLY") == "1" && "${TPU_GENERATION:-v7x}" == "v7x"'
+
+# The eight-core general suites' settings. TPU_ACCELERATOR_TYPE follows the
+# generation: the server reads the chip from it, the results upload names the
+# device after it, and run_eval_flow.sh gates on that chip's perf baselines
+# (baselines/perf/<chip>/), reporting without the perf gate where it has none.
+x-general-suite-env: &general_suite_env
+  SHAPE: *shape_multi
+  TPU_ACCELERATOR_TYPE: "${TPU_ACCELERATOR_TYPE:-tpu7x}"
+  VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+  BENCHMARK_WARMUP_RUNS: "1"
 
 steps:
   - group: "Perf and Eval on TPU"
     steps:
-      - label: "Perf/Eval: General suite (TPU v7x-8)"
+      # The General suite, two configs to a slice.
+      - label: "Perf/Eval: General suite"
         <<: *perf_step
-        parallelism: 3
-        env:
-          SHAPE: *shape_8_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
-          BENCHMARK_WARMUP_RUNS: "1"
+        parallelism: 2
+        env: *general_suite_env
         plugins:
           - *kube_plugin
         commands:
           - |
             .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
               qwen3-coder-30b-fp8-tp8-ep \
-              qwen3-30b-a3b-nvfp4-tp8-ep \
               qwen3.5-35b-fp8-tp4-ep \
-              deepseek-v2-tp8-ep \
               gemma-4-31b-fp8-dp4-tp2-multimodal \
               gemma-4-26b-fp8-dp4-tp2-multimodal
+
+      # The General suite configs only v7x runs: nvfp4 needs native fp4, and
+      # DeepSeek-V2 in bf16 does not fit in a v6e 2x4 slice.
+      - label: "Perf/Eval: General suite (nvfp4, deepseek-v2)"
+        <<: *perf_step
+        if: *v7x_only
+        env: *general_suite_env
+        plugins:
+          - *kube_plugin
+        commands:
+          - |
+            .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
+              qwen3-30b-a3b-nvfp4-tp8-ep \
+              deepseek-v2-tp8-ep
 
       - label: "Perf/Eval: qwen3-0.6b-tp1"
         <<: *perf_step
         env:
-          SHAPE: *shape_2_core
+          SHAPE: *shape_single
           # run_eval_flow.sh picks the chip's perf baselines with it, and stops
           # when it cannot read the chip.
-          TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_ACCELERATOR_TYPE: "${TPU_ACCELERATOR_TYPE:-tpu7x}"
           BENCHMARK_WARMUP_RUNS: "1"
         plugins:
           - *kube_plugin
@@ -82,15 +117,11 @@ steps:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3-0.6b-tp1 --run-lm-eval
 
       # Nightly runs
-      - label: "Perf/Eval: Nightly general suite (TPU v7x-8)"
+      - label: "Perf/Eval: Nightly general suite"
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         parallelism: 3
-        env:
-          SHAPE: *shape_8_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
-          BENCHMARK_WARMUP_RUNS: "1"
+        env: *general_suite_env
         plugins:
           - *kube_plugin
         commands:
@@ -101,12 +132,12 @@ steps:
               qwen3.5-35b-fp8-dp4-tp2-ep \
               qwen3.5-35b-fp8-tp8-ep
 
-      - label: "Perf/Eval: Nightly qwen3-coder-480b-fp8-tp8-ep (TPU v7x-8)"
+      - label: "Perf/Eval: Nightly qwen3-coder-480b-fp8-tp8-ep"
         <<: *perf_step
-        if: 'build.env("NIGHTLY") == "1"'
+        if: *nightly_v7x_only
         env:
-          SHAPE: *shape_8_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
+          SHAPE: *shape_multi
+          TPU_ACCELERATOR_TYPE: "${TPU_ACCELERATOR_TYPE:-tpu7x}"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
           TPU_MAX_RUNTIME_SECONDS: *eval_runtime
@@ -117,12 +148,12 @@ steps:
 
       # Perf-only: quality does not depend on max-model-len, so the evals for
       # this model run once, on the -ep (short) config above.
-      - label: "Perf: Nightly qwen3-coder-480b-fp8-tp8-ep-full (TPU v7x-8)"
+      - label: "Perf: Nightly qwen3-coder-480b-fp8-tp8-ep-full"
         <<: *perf_step
-        if: 'build.env("NIGHTLY") == "1"'
+        if: *nightly_v7x_only
         env:
-          SHAPE: *shape_8_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
+          SHAPE: *shape_multi
+          TPU_ACCELERATOR_TYPE: "${TPU_ACCELERATOR_TYPE:-tpu7x}"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         plugins:
@@ -133,12 +164,12 @@ steps:
       # Dense FLASH_ATTN model above 8K context with Raiden KV offload: the only
       # lane on the default backend's long-context page size, where 16-token
       # pages made offload reloads up to 8x more transfers.
-      - label: "Perf: Nightly qwen3-32b-tp8-offload-prefix (TPU v7x-8)"
+      - label: "Perf: Nightly qwen3-32b-tp8-offload-prefix"
         <<: *perf_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
-          SHAPE: *shape_8_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
+          SHAPE: *shape_multi
+          TPU_ACCELERATOR_TYPE: "${TPU_ACCELERATOR_TYPE:-tpu7x}"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         plugins:
@@ -148,13 +179,13 @@ steps:
 
       # Qwen3.5-397B parallelism sweep: three layouts. Quality is independent
       # of parallelism, so the evals run only on the tp1-dp8 layout.
-      - label: "Perf/Eval: Nightly qwen3.5-397b-fp8-tp1-dp8-ep (TPU v7x-8)"
+      - label: "Perf/Eval: Nightly qwen3.5-397b-fp8-tp1-dp8-ep"
         <<: *perf_step
-        if: 'build.env("NIGHTLY") == "1"'
+        if: *nightly_v7x_only
         env:
           UPLOAD_TO_VLLM_CI: "1"
-          SHAPE: *shape_8_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
+          SHAPE: *shape_multi
+          TPU_ACCELERATOR_TYPE: "${TPU_ACCELERATOR_TYPE:-tpu7x}"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
           TPU_MAX_RUNTIME_SECONDS: *eval_runtime
@@ -163,13 +194,13 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp1-dp8-ep --run-lm-eval --run-code-eval
 
-      - label: "Perf: Nightly qwen3.5-397b-fp8-tp2-dp4-ep (TPU v7x-8)"
+      - label: "Perf: Nightly qwen3.5-397b-fp8-tp2-dp4-ep"
         <<: *perf_step
-        if: 'build.env("NIGHTLY") == "1"'
+        if: *nightly_v7x_only
         env:
           UPLOAD_TO_VLLM_CI: "1"
-          SHAPE: *shape_8_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
+          SHAPE: *shape_multi
+          TPU_ACCELERATOR_TYPE: "${TPU_ACCELERATOR_TYPE:-tpu7x}"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         plugins:
@@ -177,12 +208,12 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp2-dp4-ep
 
-      - label: "Perf/Eval: Nightly deepseek-v4-flash-dp8-ep (TPU v7x-8)"
+      - label: "Perf/Eval: Nightly deepseek-v4-flash-dp8-ep"
         <<: *perf_step
-        if: 'build.env("NIGHTLY") == "1"'
+        if: *nightly_v7x_only
         env:
-          SHAPE: *shape_8_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
+          SHAPE: *shape_multi
+          TPU_ACCELERATOR_TYPE: "${TPU_ACCELERATOR_TYPE:-tpu7x}"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           TPU_MAX_RUNTIME_SECONDS: *eval_runtime
           # See common.sh: the compile and the capture together outgrow the
@@ -194,13 +225,13 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash .buildkite/kubernetes/benchmark_with_profile.sh deepseek-v4-flash-dp8-ep --run-lm-eval
 
-      - label: "Perf: Nightly qwen3.5-397b-fp8-tp8-dp1-ep (TPU v7x-8)"
+      - label: "Perf: Nightly qwen3.5-397b-fp8-tp8-dp1-ep"
         <<: *perf_step
-        if: 'build.env("NIGHTLY") == "1"'
+        if: *nightly_v7x_only
         env:
           UPLOAD_TO_VLLM_CI: "1"
-          SHAPE: *shape_8_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
+          SHAPE: *shape_multi
+          TPU_ACCELERATOR_TYPE: "${TPU_ACCELERATOR_TYPE:-tpu7x}"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
         plugins:
@@ -208,12 +239,12 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config qwen3.5-397b-fp8-tp8-dp1-ep
 
-      - label: "Perf/Eval: Nightly Kimi-K2.6 Real (TPU v7x-8)"
+      - label: "Perf/Eval: Nightly Kimi-K2.6 Real"
         <<: *perf_step
-        if: 'build.env("NIGHTLY") == "1"'
+        if: *nightly_v7x_only
         env:
-          SHAPE: *shape_8_core
-          TPU_ACCELERATOR_TYPE: "tpu7x"
+          SHAPE: *shape_multi
+          TPU_ACCELERATOR_TYPE: "${TPU_ACCELERATOR_TYPE:-tpu7x}"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
           BENCHMARK_WARMUP_RUNS: "1"
           # The eval reports rather than gates. Named in
@@ -228,17 +259,14 @@ steps:
       # run_multihost.sh and the JobSets in manifests/. It depends on nothing but
       # the image: the fleet places the JobSet in a 2x2x2 slice of its own, and
       # Kueue starts it once a 2x2x2 slice is free.
-      - label: "Perf/Eval: Nightly deepseek-v4-pro-dp16-ep (TPU v7x-16)"
-        # Without build_docker this submits a sixteen-chip workload against a tag
-        # that was never pushed and holds the fleet in ImagePullBackOff.
-        depends_on:
-          - "build_docker"
-        if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 1440
-        agents:
-          queue: "kube"
+      - label: "Perf/Eval: Nightly deepseek-v4-pro-dp16-ep"
+        # perf_step's depends_on matters here: without build_docker this submits
+        # a sixteen-chip workload against a tag that was never pushed and holds
+        # the fleet in ImagePullBackOff.
+        <<: *perf_step
+        if: *nightly_v7x_only
         env:
-          TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_ACCELERATOR_TYPE: "${TPU_ACCELERATOR_TYPE:-tpu7x}"
           VLLM_ENGINE_READY_TIMEOUT_S: "14400"
           BENCHMARK_WARMUP_RUNS: "1"
           # See common.sh: the compile and the capture together outgrow the pod's
@@ -256,11 +284,8 @@ steps:
       # runner=kube by CI_RUNNER. It holds eight chips on 2x2x1, so it queues with
       # the v7x-8 steps rather than taking chips from them.
       - label: "Perf: Nightly Qwen3.5-397B 1P1D P/D benchmark"
-        depends_on: "build_docker"
-        if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 1440
-        agents:
-          queue: "kube"
+        <<: *perf_step
+        if: *nightly_v7x_only
         env:
           CREATED_BY: "${BUILDKITE_SOURCE:-buildkite}"
           BQ_UPLOAD: "1"
