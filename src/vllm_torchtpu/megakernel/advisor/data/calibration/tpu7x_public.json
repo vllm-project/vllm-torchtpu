@@ -1,0 +1,27 @@
+{
+  "schema": "advisor.measurements.v1",
+  "source": {
+    "kind": "architectural_prior",
+    "provenance": "ASSUMED: architectural reference prior (n=0), not device telemetry",
+    "file": "tpu7x_reference_priors"
+  },
+  "collectives": [
+    {
+      "op": "all-gather",
+      "group_size": 8,
+      "latency_us": 3.0,
+      "n": 0
+    },
+    {
+      "op": "all-reduce",
+      "group_size": 8,
+      "latency_us": 3.0,
+      "n": 0
+    }
+  ],
+  "launch_gap_us": {
+    "p50": 1.0,
+    "p90": 1.5,
+    "n": 0
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "schema": "advisor.presets.deployments.v1",
+  "deployments": {
+    "glm-5.2": {
+      "source": "GLM-5.2 reference 6-axis serving topologies: TP16 x DCP8 decode with 3 draft tokens, TP16 x EP16 x DCP16 high-concurrency decode, and TP16 prefill",
+      "decode": {
+        "tp": 16,
+        "dcp": 8,
+        "spec_tokens": 3
+      },
+      "prefill": {
+        "tp": 16
+      },
+      "saturation": {
+        "tp": 16,
+        "ep": 16,
+        "dcp": 16
+      }
+    },
+    "kimi-k3": {
+      "source": "Kimi-K3 reference 6-axis serving topologies: TP32 x EP32 x DCP32 decode with 7 draft tokens, TP16 x DP2 x EP32 x DCP16 high-concurrency decode, and TP32 x EP32 x PCP32 prefill in 13 layer groups",
+      "decode": {
+        "tp": 32,
+        "ep": 32,
+        "dcp": 32,
+        "spec_tokens": 7
+      },
+      "prefill": {
+        "tp": 32,
+        "ep": 32,
+        "pcp": 32,
+        "layer_groups": [4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 1]
+      },
+      "prefill_windows": [512, 1024, 2048, 4096, 8192],
+      "saturation": {
+        "tp": 16,
+        "ep": 32,
+        "dp": 2,
+        "dcp": 16
+      }
+    },
+    "qwen3.5-397b": {
+      "source": "Qwen3.5-397B reference 6-axis serving topologies: TP8 x EP8 x DCP4 decode with 3 draft tokens, PP8 prefill, and TP2 x DP4 x EP8 high-concurrency decode",
+      "decode": {
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "spec_tokens": 3
+      },
+      "prefill": {
+        "tp": 1,
+        "ep": 1,
+        "pp": 8
+      },
+      "saturation": {
+        "tp": 2,
+        "ep": 8,
+        "dp": 4
+      },
+      "prefill_windows": [2176]
+    }
+  }
+}
