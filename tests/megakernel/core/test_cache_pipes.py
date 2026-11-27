@@ -394,6 +394,22 @@ def test_flat_pooled_step_checks_ckpt_bounds_in_gpr_path():
         flat_fn(*c.flat_args(c.pools(), *narrow))
 
 
+def test_flat_pooled_step_checks_ckpt_bounds_in_fused_path():
+    """With `check_ckpt_bounds`, the fused flat step (which skips the gather and
+    scatter kernels) validates its checkpoint write slots."""
+    # Fused GDN I/O needs `2 * kh <= vh` per rank.
+    spec = synth_hybrid_spec(L=2, att_every=2, R=R, VH=4)
+    ex = _make_paged_ex(B=4, T=1, check_ckpt_bounds=True)
+    c = _Case(spec, ex, seed=6)
+    flat_fn, *_ = cache.make_flat_pooled_step(
+        c.mesh, spec, ex, fused_pool_io=True, donate_pools=True
+    )
+    jax.block_until_ready(flat_fn(*c.flat_args(c.pools(), *c.meta())))
+    ckpt_bad = np.asarray(c.ckpt).copy()
+    ckpt_bad[..., -1] = 10_000  # checkpoint write slot past the pool
+    _expect_step_error(c, flat_fn, c.meta(ckpt=ckpt_bad), "checkpoint write slot")
+
+
 def test_flat_pooled_step_all_mode_checks_every_sequence():
     """Under `act_mode="all"` the metadata check covers a sequence whose
     checkpoint column 0 is 0 (inactive under `"from_ckpt"`, active here)."""
@@ -652,6 +668,15 @@ def test_resolve_model_spec_dispatch(monkeypatch):
             cache_common.resolve_model_spec(bad)
 
 
+def test_should_fuse_pool_io_with_registered_hook():
+    """With the fused implementation registered, `auto` and `True` fuse."""
+    spec = synth_hybrid_spec(L=2, att_every=2, R=2)
+    ex = _make_paged_ex(B=8, T=1, R=2)
+    assert fused_io_hook.fused_io_available()
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io="auto") is True
+    assert cache.should_fuse_pool_io(spec, ex, fused_pool_io=True) is True
+
+
 def test_should_fuse_pool_io_without_registered_hook(monkeypatch):
     """`should_fuse_pool_io` checks `fused_io_available` for `auto` and `True`."""
     spec = synth_hybrid_spec(L=2, att_every=2, R=2)
@@ -665,14 +690,17 @@ def test_should_fuse_pool_io_without_registered_hook(monkeypatch):
         cache.should_fuse_pool_io(spec, ex, fused_pool_io=True)
 
 
-@pytest.mark.usefixtures("fused_io_registered")
 def test_cache_experimental_wrappers_build_fused_steps():
-    """The experimental wrappers forward `fused_pool_io=True` and enforce donation."""
+    """The experimental wrappers build fused steps and keep the donation guard."""
     spec = synth_hybrid_spec(L=2, att_every=2, R=R, VH=4)
     ex = _make_paged_ex(B=4, T=1)
     mesh = Mesh(np.array(jax.devices("cpu")[:R]), ("tp",))
+    step = cache_experimental.make_fused_pooled_step(mesh, spec, ex)
+    assert step.info["use_fused"] is True
     with pytest.raises(MegakernelConfigError, match="donate_pools=True"):
         cache_experimental.make_fused_pooled_step(mesh, spec, ex, donate_pools=False)
+    _, _, _, donated = cache_experimental.make_flat_fused_pooled_step(mesh, spec, ex)
+    assert donated
     with pytest.raises(MegakernelConfigError, match="donate_pools=True"):
         cache_experimental.make_flat_fused_pooled_step(
             mesh, spec, ex, donate_pools=False
