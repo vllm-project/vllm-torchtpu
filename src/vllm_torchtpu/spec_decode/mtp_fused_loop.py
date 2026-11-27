@@ -78,12 +78,26 @@ class _MtpFusedLoop(nn.Module):
         # variant is a separate program compiled only at the kernel's rows
         # (`mk_draft_compile_config`); the caller picks it per step in Python.
         mk_step = getattr(self.mtp, "mk_draft_step", None) if self.use_mk else None
+        # VLLM_TPU_MEGAKERNEL=...,mtpgreedy=1: the tail kernel also returns the greedy
+        # token (attached by the driver before the first trace).
+        has_greedy = getattr(self.mtp, "has_mk_tail_greedy", None)
+        greedy_step = (
+            self.mtp.mk_tail_greedy_step  # type: ignore[attr-defined]
+            if mk_step is None and has_greedy is not None and has_greedy()
+            else None
+        )
         for i in range(self.num_steps):
             positions = positions + 1
             if i > 0:
                 seq_lens.add_(1)
             if mk_step is not None:
                 hidden_states, input_ids = mk_step(input_ids, positions, hidden_states, 1)
+                tokens.append(input_ids)
+                continue
+            if greedy_step is not None:
+                hidden_states, input_ids = greedy_step(
+                    input_ids, positions, hidden_states, i + 1
+                )
                 tokens.append(input_ids)
                 continue
             out = type(self.mtp).forward(

@@ -2878,6 +2878,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the BF16 weight and hidden, halving the bytes each draft step streams.
     # Changes draft tokens near ties only, so acceptance, never the verified
     # output.
+    # The MTP greedy tail kernel (VLLM_TPU_MEGAKERNEL=...,mtpgreedy=1) follows this
+    # flag for its in-kernel head: FP8 weights with per-column scales, BF16 activations.
     "VLLM_TPU_DRAFT_LM_HEAD_FP8": env_bool("VLLM_TPU_DRAFT_LM_HEAD_FP8", default=False),
     # MTP draft step 0 on a draft declaring `supports_draft_rows` (Qwen4Exp):
     # write the draft layer's caches for every token of the target's step but

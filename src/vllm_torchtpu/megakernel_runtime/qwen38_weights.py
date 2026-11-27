@@ -161,6 +161,7 @@ def pack_segment_operands(
     layer_ids: list[int] | None = None,
     head: bool = False,
     boundary: bool = False,
+    tail: tuple[Any, Any, int] | None = None,
 ) -> list[torch.Tensor]:
     """This rank's segment-`s` (or head group `layer_ids`) weight operands.
 
@@ -169,6 +170,8 @@ def pack_segment_operands(
     keeps: "smalls" as `[L * S / 128, 128]` (the segment call restores
     `[L, 1, S]` under jit, see `build_segment_call(flat_smalls=True)`), and
     views as fresh tensors (a view keeps its base's device layout).
+    `tail` = `(final HC mixer, lm_head, vocab shard)` for a spec with the greedy tail
+    (`segment_spec(tail=...)`, the MTP draft tail).
     """
     p = planner.plan(spec, ex)
     L = spec.config.L
@@ -238,6 +241,19 @@ def pack_segment_operands(
         row("sh_gate", j, layer.mlp.shared_expert_gate.weight.data)
         row("sh13_s", j, torch.ones(2 * (gi.IS // ex.R), device=dev))
         row("sh2_s", j, torch.ones(g.H, device=dev))
+
+    if tail is not None:
+        from vllm_torchtpu.megakernel.wholestep.tail import LM_SCALE
+
+        from .qwen38_wholestep_weights import pack_tail_operands
+
+        tw, hcn, lm_s = pack_tail_operands(
+            *tail, g, ex, fp8=LM_SCALE in p.smalls_layout
+        )
+        w.update(tw)
+        row("tail_hcn", L - 1, hcn)
+        if lm_s is not None:
+            row(LM_SCALE, L - 1, lm_s)
 
     S = p.smalls_width
     smalls = torch.zeros((L, 1, S), dtype=torch.float32, device=dev)

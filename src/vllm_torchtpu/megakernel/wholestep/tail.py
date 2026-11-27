@@ -181,6 +181,25 @@ def greedy_tokens(top: jax.Array, R: int, M: int) -> jax.Array:
     return jnp.take_along_axis(t[:, :, 1], best[None], axis=0)[0].astype(I32)
 
 
+def mesh_greedy_tokens(mesh: Any) -> Any:
+    """`tokens [M] int32` (replicated) from the tail's per-rank `(max, index)` pairs
+    `[R*M, 128]` (tp-sharded): `greedy_tokens` inside the mesh, so each rank
+    all-gathers the pairs and takes the first maximal rank (ties to the lower rank).
+    Outside shard_map the rank split of the pairs lowers to a partition id, which the
+    served SPMD compile refuses (exos j-760b499c: "partitionId instruction is not
+    supported for SPMD partitioning")."""
+    from jax.sharding import PartitionSpec as P
+
+    def per_rank(top):
+        t = jax.lax.all_gather(top, "tp")  # [R, M, 128]
+        best = jnp.argmax(t[:, :, 0], axis=0)
+        return jnp.take_along_axis(t[:, :, 1], best[None], axis=0)[0].astype(I32)
+
+    return jax.shard_map(
+        per_rank, mesh=mesh, in_specs=P("tp"), out_specs=P(), check_vma=False
+    )
+
+
 def tail_reference(
     x: jax.Array, p: dict[str, Any], lm_head: jax.Array, *, nhc: int, eps: float
 ) -> tuple[jax.Array, jax.Array]:

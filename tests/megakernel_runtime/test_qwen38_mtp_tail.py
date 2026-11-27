@@ -105,3 +105,146 @@ def test_small_counts_build_at_their_own_rows():
         mesh, G, CHUNK, None, CHUNK, interpret=True, tiles=TILES
     )
     assert donate == () and len(out_specs) == 1 and len(in_specs) > 2
+
+
+def _greedy_tail_case(fp8, B, monkeypatch):
+    """`(tail options, ex, plain-tail args, greedy-tail args, hc params, reference
+    lm_head)` of one random greedy-tail case at `B` rows."""
+    from vllm_torchtpu.megakernel.models import qwen38_inputs
+    from vllm_torchtpu.megakernel.models.qwen38_inputs import (
+        _hc_params,
+        hc_weight_arrays,
+    )
+    from vllm_torchtpu.megakernel.ops import BF16, F32, FP8
+    from vllm_torchtpu.megakernel.wholestep.tail import (
+        LM_SCALE,
+        vocab_chunk_width,
+        vocab_chunks,
+    )
+
+    V = 384
+    T = T_VERIFY if B % T_VERIFY == 0 else 1
+    ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=True, tiles=TILES)
+    tail = dict(vocab_shard=V, fp8=fp8)
+    spec = qwen38.segment_spec(G, R, L=1)
+    gspec = qwen38.segment_spec(G, R, L=1, tail=tail)
+    inp = random_segment_inputs(jax.random.PRNGKey(3), G, ex, 1, gain=0.25)
+    real_pack = qwen38_inputs.pack_weights
+    raw = {}
+
+    def grab(spec_, ex_, weights, smalls, final_norm=None):
+        raw.update(weights=dict(weights), smalls=dict(smalls))
+        return real_pack(spec_, ex_, weights, smalls, final_norm)
+
+    monkeypatch.setattr(qwen38_inputs, "pack_weights", grab)
+    w_mk, _, _ = pack_segment(spec, G, ex, inp)
+
+    k = jax.random.split(jax.random.PRNGKey(7), 2)
+    hc = _hc_params(k[0], G, 1)
+    lm = (jax.random.normal(k[1], (R, G.H, V), F32) * 0.05).astype(BF16)
+    weights = {**raw["weights"], **hc_weight_arrays("tail", hc, G, R, mix=True)}
+    smalls = {
+        **raw["smalls"],
+        "tail_hcn": jnp.broadcast_to(hc["norm"][None], (R, 1, hc["norm"].shape[-1])),
+    }
+    ref_lm = lm
+    if fp8:
+        amax = jnp.abs(lm.astype(F32)).max(axis=-2, keepdims=True)
+        scale = jnp.where(amax > 0, amax / 448.0, 1.0)
+        lm = (lm.astype(F32) / scale).astype(FP8)
+        ref_lm = lm.astype(F32) * scale
+        cols = sum(width for _, _, width in vocab_chunks(V, vocab_chunk_width(ex)))
+        smalls[LM_SCALE] = jnp.pad(
+            scale[:, 0], ((0, 0), (0, cols - V)), constant_values=1.0
+        )[:, None]
+    for name, c0, width in vocab_chunks(V, vocab_chunk_width(ex)):
+        blk = lm[:, :, c0 : c0 + width]
+        pad = ((0, 0), (0, 0), (0, width - blk.shape[-1]))
+        weights[name] = jnp.pad(blk, pad)[:, None]
+    gw_mk = real_pack(gspec, ex, weights, smalls)
+
+    mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
+    tp = NamedSharding(mesh, P("tp"))
+
+    def flat(s, w):
+        out = []
+        for name in kernel.build(s, ex)[1]["plan"].w_names:
+            v = w[name]
+            out.extend(v if isinstance(v, tuple) else (v,))
+        return [jax.device_put(kernel.fold(x), tp) for x in out]
+
+    hidden = jax.device_put(jnp.tile(inp.x, (R, 1)), tp)
+    attn = jax.device_put(inp.attn.reshape(R * B, -1), tp)
+    return (
+        tail,
+        mesh,
+        (hidden, attn, *flat(spec, w_mk)),
+        (hidden, attn, *flat(gspec, gw_mk)),
+        hc,
+        ref_lm,
+    )
+
+
+def _assert_reference_picks(tokens, res, B, hc, ref_lm):
+    """`tokens` are the stock greedy pick on `res`: exact where the reference's
+    top-2 gap exceeds one BF16 ulp of its maximum, within that ulp everywhere."""
+    from vllm_torchtpu.megakernel.ops import BF16
+    from vllm_torchtpu.megakernel.wholestep.tail import tail_reference
+
+    x = jnp.asarray(res[:B]).astype(BF16)  # every rank holds the residual
+    want, logits = tail_reference(
+        x, {n: v[0] for n, v in hc.items()}, ref_lm, nhc=G.NHC, eps=G.eps
+    )
+    got = np.asarray(tokens)
+    assert got.shape == (B,) and got.dtype == np.int32
+    ref = np.asarray(logits)
+    top2 = np.sort(ref, axis=-1)[:, -2:]
+    ulp = 2.0 ** (np.floor(np.log2(np.abs(top2[:, 1]))) - 7)
+    clear = (top2[:, 1] - top2[:, 0]) > ulp
+    assert clear.sum() >= B // 2
+    np.testing.assert_array_equal(got[clear], np.asarray(want)[clear])
+    assert (ref[np.arange(B), got] >= top2[:, 1] - ulp).all()
+
+
+def _run_greedy(fn, in_specs, args):
+    typed = make_typed_step_wrapper("mtp_greedy_test", fn, len(in_specs), 2)
+    res, tokens = jax.jit(typed)(*args)
+    return np.asarray(res, np.float32), tokens
+
+
+@pytest.mark.parametrize("fp8", [False, True])
+def test_greedy_tail_keeps_residual_and_picks_reference_tokens(fp8, monkeypatch):
+    """`tail=...` (VLLM_TPU_MEGAKERNEL=...,mtpgreedy=1): the residual is the plain
+    tail's, and the tokens are the stock greedy pick (final mixer, lm_head, argmax)
+    on that residual; `fp8` over the same dequantized head."""
+    B = 8
+    tail, mesh, plain_args, greedy_args, hc, ref_lm = _greedy_tail_case(
+        fp8, B, monkeypatch
+    )
+    plain = build_segment_call(mesh, G, 1, B, None, interpret=True, tiles=TILES)
+    want_res = _run(*plain[:3], plain_args)
+    fn, in_specs, out_specs, donate = build_segment_call(
+        mesh, G, 1, B, None, interpret=True, tiles=TILES, tail=tail
+    )
+    assert donate == () and len(out_specs) == 2
+    res, tokens = _run_greedy(fn, in_specs, greedy_args)
+    np.testing.assert_array_equal(res, want_res)
+    _assert_reference_picks(tokens, want_res, B, hc, ref_lm)
+
+
+def test_chunked_greedy_tail_matches_its_residual(monkeypatch):
+    """Past the largest bucket the greedy tail runs in chunks like the plain tail:
+    residuals as the full call's, and each chunk's tokens in row order."""
+    B = 12
+    tail, mesh, _, greedy_args, hc, ref_lm = _greedy_tail_case(False, B, monkeypatch)
+    full = build_segment_call(
+        mesh, G, 1, B, None, interpret=True, tiles=TILES, tail=tail
+    )
+    chunked = build_tail_call(
+        mesh, G, B, None, CHUNK, interpret=True, tiles=TILES, tail=tail
+    )
+    assert chunked[1:] == full[1:]
+    want_res, _ = _run_greedy(full[0], full[1], greedy_args)
+    res, tokens = _run_greedy(chunked[0], chunked[1], greedy_args)
+    assert float(np.abs(res - want_res).max()) < 1e-2 * float(np.abs(want_res).mean())
+    _assert_reference_picks(tokens, res, B, hc, ref_lm)

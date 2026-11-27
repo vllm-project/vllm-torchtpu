@@ -32,8 +32,10 @@ import numpy as np  # noqa: E402
 from jax.sharding import Mesh, NamedSharding  # noqa: E402
 from jax.sharding import PartitionSpec as P  # noqa: E402
 
-from vllm_torchtpu.megakernel.wholestep.tail import greedy_tokens  # noqa: E402
-from vllm_torchtpu.megakernel_runtime.qwen38_draft import make_draft_greedy  # noqa: E402
+from vllm_torchtpu.megakernel.wholestep.tail import (  # noqa: E402
+    greedy_tokens,
+    mesh_greedy_tokens,
+)
 
 
 def test_draft_greedy_has_no_partition_id_and_matches_greedy_tokens():
@@ -44,7 +46,7 @@ def test_draft_greedy_has_no_partition_id_and_matches_greedy_tokens():
     top[:, 0] = rng.integers(0, 4, R * M)  # small ints: ties across ranks
     top[:, 1] = np.arange(R * M) % 997
     x = jax.device_put(jnp.asarray(top), NamedSharding(mesh, P("tp")))
-    f = jax.jit(make_draft_greedy(mesh))
+    f = jax.jit(mesh_greedy_tokens(mesh))
     hlo = f.lower(x).compile().as_text()
     assert "partition-id" not in hlo
     np.testing.assert_array_equal(

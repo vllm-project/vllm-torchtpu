@@ -208,6 +208,7 @@ def segment_spec(
     pool_gdn: bool = False,
     qsa_attn: dict[str, Any] | None = None,
     gdn_prefetch: bool = False,
+    tail: dict[str, Any] | None = None,
 ) -> ModelSpec:
     """`ModelSpec` of one segment kernel (`L` kernel layers, QSA o_proj first).
 
@@ -217,6 +218,8 @@ def segment_spec(
     `gdn_prefetch` their copies started before the HC mix.
     `qsa_attn`: options of `QSASparseAttnBlock`; the QSA sparse attention runs
     in-kernel from the paged pool instead of arriving as `qsa_attn`.
+    `tail`: `GreedyHead` options; the final HC mixer, `lm_head` and per-rank greedy
+    top token follow the MoE (`L = 1` only: the MTP draft tail).
     """
     if pool_gdn:
         from .qwen38_gdn_pool import Qwen38PoolGDN
@@ -243,10 +246,16 @@ def segment_spec(
     else:
         gdn = HCSublayer(gdn_cls(geometry=gi), ar_slot=0, **hc)
         mixer = SwitchSlot("mixer", branches=(qsa, gdn), branch_counts=(1, L - 1))
+    slots: tuple = (mixer, moe)
+    if tail is not None:
+        from ..wholestep.tail import GreedyHead
+
+        assert L == 1 and not head, (L, head)
+        slots = slots + (HCSublayer(GreedyHead(**tail), allreduce=False, **hc),)
     return ModelSpec(
         name=QWEN38_SEGMENT,
         config=Qwen38ResidualGeometry(L=L, H=g.NHC * g.H, eps=g.eps),
-        layer_type=LayerType(name=QWEN38_SEGMENT, slots=(mixer, moe)),
+        layer_type=LayerType(name=QWEN38_SEGMENT, slots=slots),
     )
 
 

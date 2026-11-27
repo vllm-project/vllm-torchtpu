@@ -651,16 +651,29 @@ class MtpTail(nn.Module):
 
     Its own op (`MtpTailKind`): the draft reaches the tail at every rows count it
     is traced at, and counts past the buckets run in largest-bucket chunks.
-    Owns the draft layer's packed operands as buffers.
+    Owns the draft layer's packed operands as buffers. `greedy_kind`
+    (`VLLM_TPU_MEGAKERNEL=...,mtpgreedy=1`): `greedy(...)` also runs the draft's final
+    HC mixer, lm_head and greedy pick in the same call (the fused loop's steps). With
+    VLLM_TPU_DRAFT_LM_HEAD_FP8 its head is FP8 with per-column scales against BF16
+    activations (the stock FP8 head also quantizes the activations per token), so
+    near-tie picks can differ from the stock loop's: acceptance only.
     """
 
     kind: MtpTailKind
+    greedy_kind: MtpTailKind | None
 
     def __init__(
-        self, draft: Any, g: Any, mesh: Any, kind: MtpTailKind, buckets: tuple[int, ...]
+        self,
+        draft: Any,
+        g: Any,
+        mesh: Any,
+        kind: MtpTailKind,
+        buckets: tuple[int, ...],
+        greedy_kind: MtpTailKind | None = None,
     ):
         super().__init__()
         object.__setattr__(self, "kind", kind)
+        object.__setattr__(self, "greedy_kind", greedy_kind)
         self.buckets = buckets
         R = mesh.size
         ex = ExecSpec(
@@ -673,11 +686,34 @@ class MtpTail(nn.Module):
         self.n_w = len(ops)
         for i, t in enumerate(ops):
             self.register_buffer(f"w_{i}", t, persistent=False)
+        self.n_gw = 0
+        if greedy_kind is not None:
+            assert greedy_kind.tail is not None
+            gops = pack_segment_operands(
+                draft, g, -1, qwen38.segment_spec(g, R, L=1, tail=greedy_kind.tail), ex,
+                layer_ids=[0],
+                tail=(draft.model.hyper_connection_mixer, draft.lm_head,
+                      greedy_kind.tail["vocab_shard"]),
+            )
+            gops = Qwen38Segments._own(gops, "MTP greedy tail")
+            self.n_gw = len(gops)
+            for i, t in enumerate(gops):
+                self.register_buffer(f"gw_{i}", t, persistent=False)
 
     def forward(self, hidden: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
         w = [getattr(self, f"w_{i}") for i in range(self.n_w)]
         (res,) = self.kind.op(hidden, attention, w)
         return res
+
+    def greedy(
+        self, hidden: torch.Tensor, attention: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """`(residual, greedy tokens int32)`: `forward`, then the final mixer's output
+        through `lm_head` and `argmax` over the vocab, in one call."""
+        assert self.greedy_kind is not None
+        w = [getattr(self, f"gw_{i}") for i in range(self.n_gw)]
+        res, tokens = self.greedy_kind.op(hidden, attention, w)
+        return res, tokens
 
 
 class Qwen38SegmentDriver:
@@ -709,6 +745,7 @@ class Qwen38SegmentDriver:
         self.private_kinds: dict = {}
         self.stats: dict[str, int] = {}
         self.mtp = False
+        self.mtp_greedy = False  # `mtpgreedy=1` (with `mtp=1`): MtpTail.greedy_kind
         self.cfg: Any = None
         self.seq = 0  # try_forward calls, to compare the step sequence across ranks
         self.mk_calls = 0
@@ -836,6 +873,7 @@ class Qwen38SegmentDriver:
         if segs is not None:
             object.__setattr__(drv.segments, "mk_segments", segs)
         drv.mtp = _parse_flag(raw, "mtp", False)
+        drv.mtp_greedy = drv.mtp and _parse_flag(raw, "mtpgreedy", False)
         drv.sync = _parse_flag(raw, "sync", False)
         drv.warm = _parse_flag(raw, "warm", False)
         drv.noaot = _parse_flag(raw, "noaot", False)
@@ -2119,21 +2157,41 @@ class Qwen38SegmentDriver:
                 tuple(o_proj.shape),
             )
             return
+        chunk = min(max(self.buckets), KERNEL_ROWS)
         try:
             kind = MtpTailKind(
                 self.mesh,
                 self.g,
                 self.segments.layout,
                 self.segments.write_ckpts,
-                min(max(self.buckets), KERNEL_ROWS),
+                chunk,
             )
-            tail = MtpTail(draft, self.g, self.mesh, kind, self.buckets)
+            greedy_kind = None
+            if self.mtp_greedy:
+                lm, lp = draft.lm_head, draft.logits_processor
+                V = int(lm.weight.shape[0])
+                if V * self.mesh.size != int(getattr(lm, "org_vocab_size", 0) or 0):
+                    raise ValueError(
+                        f"draft lm_head shards {V} x {self.mesh.size} != vocab "
+                        f"{getattr(lm, 'org_vocab_size', None)} (padded vocab rows "
+                        "would be picked)"
+                    )
+                if lp.soft_cap is not None or lp.scale != 1.0:
+                    raise ValueError("the greedy tail picks unscaled, uncapped logits")
+                greedy_kind = MtpTailKind(
+                    self.mesh, self.g, self.segments.layout, self.segments.write_ckpts,
+                    chunk,
+                    tail=dict(vocab_shard=V, fp8=envs.VLLM_TPU_DRAFT_LM_HEAD_FP8),
+                )
+            tail = MtpTail(draft, self.g, self.mesh, kind, self.buckets, greedy_kind)
         except Exception as exc:
             _mk_fail("Qwen3.8 MTP tail: packing failed; draft stays stock", exc)
             return
         draft.model.mk_tail = tail
         logger.info(
-            "Qwen3.8 MTP draft tail kernel attached, rows buckets %s", self.buckets
+            "Qwen3.8 MTP draft tail kernel attached, rows buckets %s%s", self.buckets,
+            " (loop steps: + final mixer, lm_head and greedy pick)"
+            if greedy_kind is not None else "",
         )
 
     def _shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict,

@@ -55,13 +55,15 @@ def build_tail_call(
     **kwargs: Any,
 ) -> tuple[Any, tuple, tuple, tuple]:
     """`build_segment_call` for the L=1 tail at `B` rows per rank, in `chunk`-row
-    kernel calls when `B > chunk`."""
+    kernel calls when `B > chunk`; the greedy tail (`tail=...`) concatenates the
+    chunks' tokens as it does their residuals."""
     if chunk >= B:
         return build_segment_call(mesh, g, 1, B, layout, write, **kwargs)
     call_c, in_specs, out_specs, donate = build_segment_call(
         mesh, g, 1, chunk, layout, write, **kwargs
     )
-    assert not donate and len(out_specs) == 1, "the L=1 tail has no GDN pool"
+    greedy = kwargs.get("tail") is not None
+    assert not donate and len(out_specs) == 1 + greedy, "the L=1 tail has no GDN pool"
     n = -(-B // chunk)
     tp, chunked = P("tp"), P(None, "tp")
 
@@ -82,9 +84,14 @@ def build_tail_call(
 
     def call(hidden, attn, *weights):
         def one(xa):
-            return call_c(xa[0], xa[1], *weights)[0]
+            outs = call_c(xa[0], xa[1], *weights)
+            return outs if greedy else outs[0]
 
-        return (merge(jax.lax.map(one, (split(hidden), split(attn)))),)
+        outs = jax.lax.map(one, (split(hidden), split(attn)))
+        if greedy:  # tokens are replicated: [n, chunk] -> the B rows' tokens
+            res, tokens = outs
+            return merge(res), tokens.reshape(n * chunk)[:B]
+        return (merge(outs),)
 
     return call, in_specs, out_specs, donate
 
@@ -93,10 +100,19 @@ class MtpTailKind:
     """The draft tail's torch op; resolves the rows count on the concrete input.
 
     Like the main model's `(1, False)` segment kind, but its own op, so a rows
-    count past the buckets never builds a kernel at that count.
+    count past the buckets never builds a kernel at that count. `tail`
+    (`GreedyHead` options): the op also returns the greedy tokens.
     """
 
-    def __init__(self, mesh: Any, g: Any, layout: Any, write: bool, chunk: int) -> None:
+    def __init__(
+        self,
+        mesh: Any,
+        g: Any,
+        layout: Any,
+        write: bool,
+        chunk: int,
+        tail: dict[str, Any] | None = None,
+    ) -> None:
         self.mesh, self.g, self.layout, self.write, self.chunk = (
             mesh,
             g,
@@ -104,8 +120,10 @@ class MtpTailKind:
             write,
             chunk,
         )
+        self.tail = tail
         self._calls: dict[int, Any] = {}
-        self.tag = "mtp_tail" + ("" if write else "_shadow")
+        self.tag = "mtp_tail" + ("_greedy" if tail is not None else "")
+        self.tag += "" if write else "_shadow"
 
         @torch.library.custom_op(f"qwen38_mk::{self.tag}", mutates_args=())
         def op(
@@ -115,7 +133,10 @@ class MtpTailKind:
 
         @op.register_fake
         def _(hidden, attn, weights):
-            return [torch.empty_like(hidden)]
+            out = [torch.empty_like(hidden)]
+            if tail is not None:
+                out.append(hidden.new_empty((hidden.shape[0],), dtype=torch.int32))
+            return out
 
         self.op = op
 
@@ -130,7 +151,8 @@ class MtpTailKind:
                 max([B, *self._calls]),
             )
             full, in_specs, outs, donate = build_tail_call(
-                self.mesh, self.g, B, self.layout, self.chunk, self.write
+                self.mesh, self.g, B, self.layout, self.chunk, self.write,
+                tail=self.tail,
             )
             typed = make_typed_step_wrapper(
                 f"qwen38_mk_{self.tag}_b{B}", full, len(in_specs), len(outs)

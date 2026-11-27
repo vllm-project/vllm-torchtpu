@@ -193,9 +193,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden = hidden.reshape(tokens, self.hc_count, self.hidden_size)
         return (hidden + embeds.unsqueeze(1)).reshape(tokens, -1)
 
-    def forward(
-        self, input_ids, positions, hidden_states, inputs_embeds, step, rows=None
-    ):
+    def _step_inputs(self, input_ids, positions, hidden_states, inputs_embeds, step):
+        """`(fused input, layer, starts, seq_lens, context, block tables)` of a step."""
         hidden = self.fuse_inputs(input_ids, hidden_states, inputs_embeds)
         layer = cast(Qwen4ExpDecoderLayer, self.layers[step % len(self.layers)])
         metadata = cast(
@@ -207,30 +206,60 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         # length before this chunk. Loop steps advance seq_lens in place.
         context = (seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
         tables = cast(torch.Tensor, metadata.block_tables)
+        return hidden, layer, starts, seq_lens, context, tables
+
+    @staticmethod
+    def _tail_attention(hidden, positions, layer, starts, seq_lens, context, tables,
+                        rows=None):
+        """Stock attention (caches written for every token) before the tail kernel:
+        `(hidden at the attended rows, attention)`."""
+        block, _ = layer.attn_hyper_connection.mix(hidden)
+        qsa_md = QSAMetadata(
+            starts,
+            context,
+            torch.zeros_like(seq_lens, dtype=torch.int32),
+            tables,
+            tables,
+        )
+        pos = positions.to(torch.int64)
+        if rows is not None:
+            rows = rows.to(torch.int64)
+            attention = layer.self_attn.attend_with_indices(
+                block, pos, qsa_md, rows=rows
+            )[0]
+            return hidden[rows.clamp_min(0)], attention
+        return hidden, layer.self_attn.attend(block, pos, qsa_md)
+
+    def forward_greedy(self, input_ids, positions, hidden_states, step):
+        """`(next hidden carry, greedy tokens int32)` of a fused-loop step through the
+        tail kernel that also runs the final mixer, lm_head and greedy pick
+        (`VLLM_TPU_MEGAKERNEL=...,mtpgreedy=1`): `forward` followed by the draft's
+        `compute_logits(...).argmax(-1)`, in one kernel call after attention."""
+        tail = self.mk_tail
+        assert tail is not None and tail.greedy_kind is not None
+        hidden, layer, starts, seq_lens, context, tables = self._step_inputs(
+            input_ids, positions, hidden_states, None, step
+        )
+        hidden, attention = self._tail_attention(
+            hidden, positions, layer, starts, seq_lens, context, tables
+        )
+        return tail.greedy(hidden, attention)
+
+    def forward(
+        self, input_ids, positions, hidden_states, inputs_embeds, step, rows=None
+    ):
+        hidden, layer, starts, seq_lens, context, tables = self._step_inputs(
+            input_ids, positions, hidden_states, inputs_embeds, step
+        )
         tail = self.mk_tail
         # No branch on the token count: vLLM rejects a traced graph that does
         # (ShapeSpecializationError). The tail op resolves concrete rows itself;
         # the driver attaches it only when step 0 uses draft rows, so the
         # all-token path below is the fused loop's (<= request capacity rows).
         if tail is not None:
-            # Stock attention (caches written for every token), then the kernel.
-            block, _ = layer.attn_hyper_connection.mix(hidden)
-            qsa_md = QSAMetadata(
-                starts,
-                context,
-                torch.zeros_like(seq_lens, dtype=torch.int32),
-                tables,
-                tables,
+            hidden, attention = self._tail_attention(
+                hidden, positions, layer, starts, seq_lens, context, tables, rows
             )
-            pos = positions.to(torch.int64)
-            if rows is not None:
-                rows = rows.to(torch.int64)
-                attention = layer.self_attn.attend_with_indices(
-                    block, pos, qsa_md, rows=rows
-                )[0]
-                hidden = hidden[rows.clamp_min(0)]
-            else:
-                attention = layer.self_attn.attend(block, pos, qsa_md)
             hidden = tail(hidden, attention)
             return self.hyper_connection_mixer.mix(hidden)[0], hidden
         if rows is not None:
@@ -386,6 +415,15 @@ class Qwen4ExpMTP(nn.Module):
         metadata = get_forward_context().attn_metadata
         return mk.step(hidden, positions, rows_per_request, metadata,
                        starts=starts, seq_lens=seq_lens)
+
+    def mk_tail_greedy_step(self, input_ids, positions, hidden_states, step: int):
+        """`(next hidden carry, greedy tokens int32)` of one fused-loop step with the
+        greedy tail kernel attached (`Qwen4ExpMultiTokenPredictor.forward_greedy`)."""
+        return self.model.forward_greedy(input_ids, positions, hidden_states, step)
+
+    def has_mk_tail_greedy(self) -> bool:
+        tail = self.model.mk_tail
+        return tail is not None and getattr(tail, "greedy_kind", None) is not None
 
     def compute_logits(self, hidden_states, spec_step_idx: int = 0):
         return self.logits_processor(self.lm_head, hidden_states)

@@ -158,6 +158,7 @@ def build_segment_call(
     pool_gdn: bool = True,
     fast_scatter: bool = True,
     flat_smalls: bool = False,
+    tail: dict[str, Any] | None = None,
 ) -> tuple[Any, tuple, tuple, tuple]:
     """`(fn, in_specs, out_specs, donate_argnums)` of segment kind `L` at `B` rows.
 
@@ -168,6 +169,8 @@ def build_segment_call(
     are scattered into the (donated) pool after the kernel either way, with
     `qwen38_scatter` (only the changed bytes) or, `fast_scatter=False`, the
     region adapter.
+    `tail` (`L = 1`, no GDN: the MTP draft tail): `segment_spec(tail=...)`; `fn`
+    returns `(residual, greedy tokens [B] int32)`.
     `interpret` / `tiles` are for CPU tests.
     """
     R = mesh.size
@@ -185,9 +188,17 @@ def build_segment_call(
     pool_gdn = pool_gdn and has_gdn
     spec = qwen38.segment_spec(
         g, R, L=L, head=head, pool_gdn=pool_gdn,
-        gdn_prefetch=envs.VLLM_TPU_MK_GDN_STATE_PREFETCH,
+        gdn_prefetch=envs.VLLM_TPU_MK_GDN_STATE_PREFETCH, tail=tail,
     )
-    fn, _, _, n_w = make_flat_segment_step(mesh, spec, ex)
+    greedy = None
+    if tail is not None:
+        from vllm_torchtpu.megakernel.wholestep.tail import TOP, mesh_greedy_tokens
+
+        assert not has_gdn, "the greedy tail is the MTP draft's L=1 segment"
+        greedy = mesh_greedy_tokens(mesh)
+    fn, _, _, n_w = make_flat_segment_step(
+        mesh, spec, ex, extra_outs=(TOP,) if greedy is not None else ()
+    )
     # `flat_smalls`: the packer passed "smalls" as `[L * S / 128, 128]` (no
     # size-1 tiling dim, so torch_tpu does not re-lay it out on every call).
     smalls_at = None
@@ -262,6 +273,8 @@ def build_segment_call(
                 states = gather(pool, rb, hi)
         xs = tuple(named[k] for k in fn.extra_names)
         outs = fn(pos, x, *xs, *w, *states)
+        if greedy is not None:
+            return unpad(outs[0]), greedy(outs[1])[:B]
         if not has_gdn:
             return (unpad(outs[0]),)
         res, conv_ck, rec_ck = outs
@@ -271,4 +284,4 @@ def build_segment_call(
     if has_gdn:
         in_specs += (tp,) + (rep,) * n_meta
         return call, in_specs, (tp, tp), (n_lead + n_w,)
-    return call, in_specs, (tp,), ()
+    return call, in_specs, (tp,) if greedy is None else (tp, rep), ()
