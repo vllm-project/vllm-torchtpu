@@ -9215,9 +9215,9 @@ class TestStage3AsyncComplete:
         )
         worker = self._producer(facade)
         worker._submit_stage3_async_complete("r1", 7)
-        future, uuid, attempts = worker._stage3_complete_futures["r1"]
+        future, uuid = worker._stage3_complete_futures["r1"]
         future.result(timeout=5)
-        assert (uuid, attempts) == (7, 0)
+        assert uuid == 7
         facade.complete_request_blocks.assert_called_once_with(
             req_id="r1", uuid=7, unit="unit"
         )
@@ -9230,13 +9230,35 @@ class TestStage3AsyncComplete:
         facade = MagicMock()
         facade.complete_request_blocks.side_effect = RuntimeError("rpc down")
         worker = self._producer(facade)
-        worker._submit_stage3_async_complete("r1", 7)
-        with pytest.raises(RuntimeError, match="rpc down"):
-            for _ in range(10):
-                future, _, _ = worker._stage3_complete_futures["r1"]
-                concurrent.futures.wait([future], timeout=5)
-                worker._reap_stage3_async_completes()
+        with patch(f"{_MOD}._STAGE3_ASYNC_COMPLETE_RETRY_S", 0.0):
+            worker._submit_stage3_async_complete("r1", 7)
+            future, _ = worker._stage3_complete_futures["r1"]
+            concurrent.futures.wait([future], timeout=5)
         assert facade.complete_request_blocks.call_count == 5
+        with pytest.raises(RuntimeError, match="rpc down"):
+            worker._reap_stage3_async_completes()
+        assert not worker._stage3_complete_futures
+
+    def test_a_failed_complete_is_retried_with_no_later_poll(self):
+        """The poll that submits the call has reported the send as done, so
+        no later poll may come; the background task retries by itself."""
+        facade = MagicMock()
+        facade.complete_request_blocks.side_effect = [
+            RuntimeError("rpc down"),
+            RuntimeError("rpc down"),
+            None,
+        ]
+        worker = self._producer(facade)
+        with patch(f"{_MOD}._STAGE3_ASYNC_COMPLETE_RETRY_S", 0.0):
+            worker._submit_stage3_async_complete("r1", 7)
+            future, _ = worker._stage3_complete_futures["r1"]
+            # No poll and no reap runs while the call is retried.
+            assert future.exception(timeout=5) is None
+        assert facade.complete_request_blocks.call_count == 3
+        assert {
+            (c.kwargs["req_id"], c.kwargs["uuid"])
+            for c in facade.complete_request_blocks.call_args_list
+        } == {("r1", 7)}
 
 
 def _stage3_option_producer(extra_config):
@@ -9527,7 +9549,7 @@ class TestStage3AsyncOptionsThroughGetFinished:
             engine.poll_results = [(["r1"], [], [])]
             done_sending, _ = worker.get_finished()
             assert done_sending == {"r1"}
-            future, uuid, _ = worker._stage3_complete_futures["r1"]
+            future, uuid = worker._stage3_complete_futures["r1"]
             future.result(timeout=5)
             # The next poll retires the finished background complete.
             assert worker.get_finished() == (set(), set())
