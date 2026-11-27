@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import re
 
@@ -22,6 +23,7 @@ import pytest
 import yaml
 
 from vllm_torchtpu import additional_config_sections, envs
+from vllm_torchtpu.distributed.kv_transfer import connector_options
 from vllm_torchtpu.models import qwen3_5
 from vllm_torchtpu.models.qwen3_5 import settings
 
@@ -125,6 +127,50 @@ def test_point_does_not_pass_additional_config_inline(path):
     entry = _load(path)
     for leg in entry["legs"].values():
         assert "--additional-config" not in leg["serve_args"]
+
+
+def _serve_arg(leg: dict, flag: str) -> str | None:
+    args = leg["serve_args"]
+    return args[args.index(flag) + 1] if flag in args else None
+
+
+def _connector_configs(config: dict):
+    """A --kv-transfer-config, then each child of a multi-connector."""
+    yield config
+    for child in config.get("kv_connector_extra_config", {}).get("connectors", ()):
+        yield from _connector_configs(child)
+
+
+# The entries' kv_connector_extra_config keys that are no connector option;
+# their own readers take them.
+_CONNECTOR_SETTINGS = {
+    # vLLM's MultiConnector.
+    "TPUMultiConnector": {"connectors"},
+    # vLLM's offloading config and TPURaidenStoreOffloadingSpec.
+    "TPURaidenOffloadingConnector": {"cpu_bytes_to_use", "raiden_controller_port"},
+    # _raiden_dst_dcp_size: the decode DCP size of the TP8 + DCP4 points.
+    "TPURaidenConnector": {"destination_decode_context_parallel_size"},
+}
+
+
+@pytest.mark.parametrize("path", POINTS, ids=lambda p: p.stem)
+def test_point_connector_options_are_known(path):
+    """Every kv_connector_extra_config key of a leg is an option of its
+    connector or one of the settings above, and the options parse."""
+    for leg_name, leg in _load(path)["legs"].items():
+        raw = _serve_arg(leg, "--kv-transfer-config")
+        assert raw is not None, leg_name
+        for config in _connector_configs(json.loads(raw)):
+            name = config["kv_connector"]
+            options_cls = connector_options.CONNECTOR_OPTIONS[name]
+            extra = config.get("kv_connector_extra_config", {})
+            unknown = (
+                set(extra)
+                - connector_options.option_names(options_cls)
+                - _CONNECTOR_SETTINGS[name]
+            )
+            assert not unknown, f"{leg_name} {name}: {sorted(unknown)}"
+            connector_options.read_options(options_cls, extra)
 
 
 def _qwen3_5_sections(entry: dict):

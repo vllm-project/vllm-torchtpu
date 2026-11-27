@@ -16,6 +16,10 @@
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import MultiConnector
 
+from vllm_torchtpu.distributed.kv_transfer.connector_options import (
+    MultiConnectorOptions,
+    read_options,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -35,20 +39,15 @@ class TPUMultiConnector(MultiConnector):
 
     def __init__(self, vllm_config, role, kv_cache_config):
         super().__init__(vllm_config, role, kv_cache_config)
-        # Opt-in (kv_connector_extra_config["producer_divergent_hits"], JSON
-        # boolean, default false): on a producer, report divergent local
-        # hybrid hits when any child can complete them. See
-        # supports_divergent_local_hybrid_hits.
-        value = (vllm_config.kv_transfer_config.kv_connector_extra_config or {}).get(
-            "producer_divergent_hits", False
+        # Opt-in: on a producer, report divergent local hybrid hits when any
+        # child can complete them. See supports_divergent_local_hybrid_hits.
+        options = read_options(
+            MultiConnectorOptions,
+            vllm_config.kv_transfer_config.kv_connector_extra_config,
         )
-        if not isinstance(value, bool):
-            raise ValueError(
-                "kv_connector_extra_config['producer_divergent_hits'] must be "
-                f"true or false, got {value!r}"
-            )
         self._producer_divergent_hits = (
-            value and vllm_config.kv_transfer_config.is_kv_producer
+            options.producer_divergent_hits
+            and vllm_config.kv_transfer_config.is_kv_producer
         )
         # Only a consumer starts from a decode-local hit; on a producer the
         # transfer child always reports False, whatever the other children say.

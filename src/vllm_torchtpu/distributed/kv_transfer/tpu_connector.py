@@ -89,6 +89,10 @@ from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     SendMeta,
     TPUConnectorMetadata,
 )
+from vllm_torchtpu.distributed.kv_transfer.connector_options import (
+    RaidenTransferOptions,
+    read_options,
+)
 from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
     RaidenSendOutcome,
     RaidenSendResults,
@@ -535,31 +539,6 @@ def _get_extra_config(vllm_config: VllmConfig) -> dict[str, Any]:
     if config is None:
         return {}
     return config.kv_connector_extra_config or {}
-
-
-def _connector_option(vllm_config: VllmConfig, key: str) -> bool:
-    """Reads an opt-in Raiden connector option from kv_connector_extra_config.
-
-    An absent key is False, which keeps the connector's default behaviour. The
-    value must be a JSON boolean, so a typo such as "1" fails at start-up
-    instead of silently leaving the option off.
-
-    Options (set per connector in --kv-transfer-config):
-      async_complete: issue the producer's post-transfer
-        complete_request_blocks RPC on a background thread.
-      async_register: register a producer step's request blocks on a side
-        thread that overlaps the step's forward. Only the default admission
-        path does; DSv4, GLM and Kimi-K3 admission keep registering
-        synchronously in process_send_load.
-      late_poll: on a KV consumer, report Stage-3 loads that land during a
-        step with that step's output.
-    """
-    value = _get_extra_config(vllm_config).get(key, False)
-    if not isinstance(value, bool):
-        raise ValueError(
-            f"kv_connector_extra_config[{key!r}] must be true or false, got {value!r}"
-        )
-    return value
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -2744,10 +2723,11 @@ class TPURaidenConnectorWorker:
         self._stage3_terminal_sends: dict[str, _Stage3RegisteredSend] = {}
         self._stage3_terminal_cleanup: dict[str, bool] = {}
         # Opt-in connector options; off keeps the synchronous behaviour.
-        self._async_complete = _connector_option(vllm_config, "async_complete")
-        self._async_register = _connector_option(vllm_config, "async_register")
+        options = read_options(RaidenTransferOptions, _get_extra_config(vllm_config))
+        self._async_complete = options.async_complete
+        self._async_register = options.async_register
         # Public: TPUWorker reads it to find the connectors it late-polls.
-        self.late_poll_enabled = _connector_option(vllm_config, "late_poll")
+        self.late_poll_enabled = options.late_poll
         if self.late_poll_enabled and dist_utils.get_raiden_inline_load():
             # The inline-load wait polls for its own loads before the first
             # forward; a late poll on the async output thread could take

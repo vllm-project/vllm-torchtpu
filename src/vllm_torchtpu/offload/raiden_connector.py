@@ -94,6 +94,10 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu.distributed.kv_transfer.connector_options import (
+    RaidenOffloadingOptions,
+    read_options,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.offload.raiden_store import (
     AdmissionOp,
@@ -114,38 +118,6 @@ _LOAD_WAIT_MS = 1.5
 # request's block hashes and local hit stay the same. The prefix-aware waiting
 # sort asks for every request in its window on every step.
 _EXTERNAL_HIT_ESTIMATE_TTL_S = 0.25
-
-
-def _connector_option(extra_config: Mapping[str, Any], key: str, default: Any) -> Any:
-    """Reads an opt-in option from this connector's kv_connector_extra_config.
-
-    An absent key returns ``default``, which keeps the connector's default
-    behaviour. The value must have the default's type exactly (a JSON boolean
-    for a bool, a non-negative JSON integer for an int), so a typo fails at
-    start-up instead of silently leaving the option off.
-
-    Options:
-      max_async_loads (int, default 0 = no cap): host-tier loads in flight
-        before a request with a host-tier hit is deferred to a later step.
-      host_tier_recency (bool, default false): the scheduler refreshes a
-        request's host-tier keys on every lookup and store (``_touch``),
-        probes partial tails only above the local hit, offers FullAttention
-        chunks for storing from chunk 0 again, and launches fence-acknowledged
-        stores largest first. Unset, the scheduler runs upstream's lookup,
-        allocation and store paths.
-    """
-    value = extra_config.get(key, default)
-    if isinstance(default, bool):
-        ok = isinstance(value, bool)
-    else:
-        ok = isinstance(value, int) and not isinstance(value, bool) and value >= 0
-    if not ok:
-        raise ValueError(
-            f"kv_connector_extra_config[{key!r}] must be a "
-            f"{'boolean' if isinstance(default, bool) else 'non-negative integer'}, "
-            f"got {value!r}"
-        )
-    return value
 
 
 def _enqueue_pool_writes(pool_tensors: list[torch.Tensor]) -> None:
@@ -247,7 +219,7 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
     via RaidenOffloadingManager.
     """
 
-    # Option host_tier_recency (see _connector_option); off unless configured.
+    # Option host_tier_recency (RaidenOffloadingOptions); off unless configured.
     _host_tier_recency: bool = False
 
     def __init__(
@@ -270,12 +242,9 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         # request id -> (number of block hashes, chunk-aligned local hit, time,
         # host-tier tokens) of the last estimate_external_hit_tokens answer.
         self._external_hit_estimates: dict[str, tuple[int, int, float, int]] = {}
-        self._max_async_load_reqs: int = _connector_option(
-            spec.extra_config, "max_async_loads", 0
-        )
-        self._host_tier_recency = _connector_option(
-            spec.extra_config, "host_tier_recency", False
-        )
+        options = read_options(RaidenOffloadingOptions, spec.extra_config)
+        self._max_async_load_reqs = options.max_async_loads
+        self._host_tier_recency = options.host_tier_recency
 
     def _complete_jobs_directly(
         self,

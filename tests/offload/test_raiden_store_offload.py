@@ -1943,23 +1943,6 @@ class TestOffloadConnectorOptions(unittest.TestCase):
     """max_async_loads and host_tier_recency are opt-in
     kv_connector_extra_config options: unset, the connector behaves as before."""
 
-    def test_option_defaults_and_types(self):
-        from vllm_torchtpu.offload.raiden_connector import _connector_option
-
-        self.assertEqual(_connector_option({}, "max_async_loads", 0), 0)
-        self.assertEqual(
-            _connector_option({"max_async_loads": 16}, "max_async_loads", 0), 16
-        )
-        for name in ("host_tier_recency",):
-            self.assertIs(_connector_option({}, name, False), False)
-            self.assertIs(_connector_option({name: True}, name, False), True)
-            for bad in ("1", 1, None):
-                with self.assertRaises(ValueError):
-                    _connector_option({name: bad}, name, False)
-        for bad in ("16", True, -1, 1.5):
-            with self.assertRaises(ValueError):
-                _connector_option({"max_async_loads": bad}, "max_async_loads", 0)
-
     def _capped(self, cap, manager_lock=None, probe=None):
         from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
             OffloadingConnectorScheduler,
