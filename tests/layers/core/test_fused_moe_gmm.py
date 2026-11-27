@@ -801,13 +801,138 @@ def test_fused_moe_global_id_remap_masks_out_of_range():
     )
 
 
-def _row_count_inputs(num_tokens, num_valid, seed=0):
+_MASK_EXPERTS, _MASK_TOPK, _MASK_HIDDEN = 64, 8, 32
+
+
+def _padding_mask(num_tokens, num_valid, length=None):
+    """The runner's token padding mask: True on rows [num_valid, num_tokens)
+    of a buffer ``length`` rows long (default ``num_tokens``)."""
+    rows = jnp.arange(num_tokens if length is None else length)
+    return (rows >= num_valid) & (rows < num_tokens)
+
+
+def _mask_routing_inputs(num_tokens, seed):
+    """Hidden states, distinct top-k expert ids and non-zero gates per row."""
+    rng = np.random.default_rng(seed)
+    ids = np.stack(
+        [
+            rng.choice(_MASK_EXPERTS, _MASK_TOPK, replace=False)
+            for _ in range(num_tokens)
+        ]
+    ).astype(np.int32)
+    weights = rng.random((num_tokens, _MASK_TOPK)).astype(np.float32) + 0.1
+    x = rng.standard_normal((num_tokens, _MASK_HIDDEN)).astype(np.float32)
+    return jnp.asarray(x), jnp.asarray(ids), jnp.asarray(weights)
+
+
+def _routing_layout(x, ids, weights, **kwargs):
+    out = prepare_routed_gmm_inputs(
+        x,
+        ids,
+        weights,
+        local_num_experts=_MASK_EXPERTS,
+        topk=_MASK_TOPK,
+        use_ep=False,
+        use_sparse_core=False,
+        **kwargs,
+    )
+    x_sorted, group_sizes, revert, w_flat, valid, tok_sorted = (
+        np.asarray(o) for o in out
+    )
+    return dict(
+        x=x_sorted,
+        group_sizes=group_sizes,
+        revert=revert,
+        valid=valid,
+        tok_sorted=tok_sorted,
+        weight_used=w_flat * valid,
+    )
+
+
+@pytest.mark.parametrize(
+    "t, n", [(16, 16), (16, 15), (16, 12), (16, 1), (16, 0), (32, 17)]
+)
+@pytest.mark.parametrize("seed", [0, 1])
+def test_prepare_routed_padding_mask_matches_zeroed_weights(t, n, seed):
+    """With non-zero gates on every real row, dropping the rows the padding
+    mask marks builds the layout of zeroing their routing weights, while the
+    padded rows' weights stay non-zero, so only the mask can drop them."""
+    x, ids, w = _mask_routing_inputs(t, seed)
+    zeroed = jnp.where(_padding_mask(t, n)[:, None], 0.0, w)
+    ref = _routing_layout(x, ids, zeroed, skip_padded_tokens=True)
+    # Longer than the step, as the runner's buffer is: only the first t
+    # entries are read.
+    row_info = jnp.concatenate([_padding_mask(t, n), jnp.ones(t, dtype=bool)])
+    masked = _routing_layout(x, ids, w, skip_padded_tokens=True, row_info=row_info)
+    for k in ref:
+        np.testing.assert_array_equal(masked[k], ref[k], err_msg=k)
+    assert int(masked["group_sizes"].sum()) == n * _MASK_TOPK
+
+
+def test_prepare_routed_padding_mask_drops_marked_rows_anywhere():
+    """Rows are dropped by their own mask entry, not by a prefix count, so a
+    mask with padding between real rows is followed as well."""
+    t = 16
+    x, ids, w = _mask_routing_inputs(t, seed=5)
+    is_padding = jnp.zeros(t, dtype=bool).at[jnp.array([2, 3, 9, 15])].set(True)
+    zeroed = jnp.where(is_padding[:, None], 0.0, w)
+    ref = _routing_layout(x, ids, zeroed, skip_padded_tokens=True)
+    masked = _routing_layout(x, ids, w, skip_padded_tokens=True, row_info=is_padding)
+    for k in ref:
+        np.testing.assert_array_equal(masked[k], ref[k], err_msg=k)
+    assert int(masked["group_sizes"].sum()) == (t - 4) * _MASK_TOPK
+
+
+def test_prepare_routed_padding_mask_keeps_zero_gate_real_routes():
+    """Mixed zero-gate and positive-gate real rows: the mask keeps stock's
+    valid mask on real rows (unlike zeroing weights) and drops padded rows."""
+    t, n = 16, 12
+    x, ids, w = _mask_routing_inputs(t, seed=7)
+    w = w.at[0, 0].set(0.0).at[5, 3].set(0.0)
+    is_padding = _padding_mask(t, n)
+
+    stock_real_only = _routing_layout(x[:n], ids[:n], w[:n], skip_padded_tokens=False)
+    zeroed = _routing_layout(
+        x, ids, jnp.where(is_padding[:, None], 0.0, w), skip_padded_tokens=True
+    )
+    masked = _routing_layout(x, ids, w, skip_padded_tokens=True, row_info=is_padding)
+
+    # Zeroing drops the two zero-gate real routes; the mask keeps them.
+    assert int(zeroed["group_sizes"].sum()) == n * _MASK_TOPK - 2
+    assert int(masked["group_sizes"].sum()) == n * _MASK_TOPK
+    np.testing.assert_array_equal(masked["group_sizes"], stock_real_only["group_sizes"])
+    valid = masked["valid"].reshape(t, _MASK_TOPK)
+    np.testing.assert_array_equal(valid[:n], np.ones((n, _MASK_TOPK), dtype=bool))
+    np.testing.assert_array_equal(valid[n:], np.zeros((t - n, _MASK_TOPK), dtype=bool))
+    np.testing.assert_array_equal(masked["x"][: n * _MASK_TOPK], stock_real_only["x"])
+    np.testing.assert_array_equal(
+        masked["tok_sorted"][: n * _MASK_TOPK], stock_real_only["tok_sorted"]
+    )
+    np.testing.assert_array_equal(
+        masked["weight_used"].reshape(t, _MASK_TOPK)[:n], np.asarray(w[:n])
+    )
+
+
+def test_prepare_routed_padding_mask_needs_skip_padded_tokens():
+    """row_info only takes effect with skip_padded_tokens=True."""
+    t, n = 16, 4
+    x, ids, w = _mask_routing_inputs(t, seed=3)
+    stock = _routing_layout(x, ids, w, skip_padded_tokens=False)
+    with_mask = _routing_layout(
+        x, ids, w, skip_padded_tokens=False, row_info=_padding_mask(t, n)
+    )
+    for k in stock:
+        np.testing.assert_array_equal(with_mask[k], stock[k], err_msg=k)
+    assert int(with_mask["group_sizes"].sum()) == t * _MASK_TOPK
+
+
+def _padded_inputs(num_tokens, num_valid, seed=0):
     """Local MoE inputs (16 experts, hidden 2048, top-8) with padded rows.
 
     Rows ``[num_valid, num_tokens)`` are padding: their hidden states are
-    perturbed and their routing weights stay non-zero, so only the row count
-    can exclude them. Real row 0 carries a zero gate, which stock dispatch
-    keeps.
+    perturbed and their routing weights stay non-zero, so only the padding
+    mask can exclude them. Real row 0 carries a zero gate, which stock
+    dispatch keeps.
     """
     num_experts, hidden_size, intermediate_size, topk = 16, 2048, 768, 8
     hk, pk, w1k, w2k, gk = jax.random.split(jax.random.key(seed), 5)
@@ -836,9 +961,10 @@ def _row_count_inputs(num_tokens, num_valid, seed=0):
     return hidden_states, w1, w2, topk_weights, topk_ids, topk
 
 
-def _run_row_count(hidden_states, w1, w2, topk_weights, topk_ids, topk, num_valid):
+def _run_padding_mask(hidden_states, w1, w2, topk_weights, topk_ids, topk, num_valid):
     # row_info goes in positionally after experts_start, as the custom op
-    # passes it.
+    # passes it: the runner's whole mask buffer, longer than the step.
+    num_tokens = hidden_states.shape[0]
     return fused_moe_func(
         hidden_states,
         w1,
@@ -850,18 +976,18 @@ def _run_row_count(hidden_states, w1, w2, topk_weights, topk_ids, topk, num_vali
         topk_weights,
         topk_ids,
         None,
-        jnp.array([num_valid], dtype=jnp.int32),
+        _padding_mask(num_tokens, num_valid, 2 * num_tokens),
         topk=topk,
         activation="silu",
         skip_padded_tokens=True,
     )
 
 
-def _check_row_count_output(row_count, stock, num_valid):
-    row_count, stock = np.asarray(row_count), np.asarray(stock)
-    np.testing.assert_array_equal(row_count[:num_valid], stock[:num_valid])
+def _check_skip_output(skipped, stock, num_valid):
+    skipped, stock = np.asarray(skipped), np.asarray(stock)
+    np.testing.assert_array_equal(skipped[:num_valid], stock[:num_valid])
     np.testing.assert_array_equal(
-        row_count[num_valid:], np.zeros_like(row_count[num_valid:])
+        skipped[num_valid:], np.zeros_like(skipped[num_valid:])
     )
     if num_valid < stock.shape[0]:
         # The padded rows produce output on the stock path, so a filter that
@@ -873,11 +999,11 @@ def _check_row_count_output(row_count, stock, num_valid):
 @pytest.mark.parametrize(
     "num_tokens,num_valid", [(16, 0), (16, 1), (16, 9), (16, 16), (32, 17)]
 )
-def test_fused_moe_row_count_matches_stock_on_real_rows(num_tokens, num_valid):
-    """The row-count filter leaves real rows bit-identical to stock and drops
-    the padded rows, whose gates are non-zero."""
+def test_fused_moe_padding_mask_matches_stock_on_real_rows(num_tokens, num_valid):
+    """The padding-mask row filter leaves real rows bit-identical to stock and
+    drops the padded rows, whose gates are non-zero."""
     _require_tpu()
-    hidden_states, w1, w2, topk_weights, topk_ids, topk = _row_count_inputs(
+    hidden_states, w1, w2, topk_weights, topk_ids, topk = _padded_inputs(
         num_tokens, num_valid
     )
     stock = fused_moe_func(
@@ -893,19 +1019,19 @@ def test_fused_moe_row_count_matches_stock_on_real_rows(num_tokens, num_valid):
         topk=topk,
         activation="silu",
     )
-    row_count = _run_row_count(
+    skipped = _run_padding_mask(
         hidden_states, w1, w2, topk_weights, topk_ids, topk, num_valid
     )
-    _check_row_count_output(row_count, stock, num_valid)
+    _check_skip_output(skipped, stock, num_valid)
 
 
 @pytest.mark.tpu_test
-def test_fused_moe_row_count_skips_dense_expert_path(monkeypatch):
-    """With the dense-expert decode path admitted, the row-count filter still
-    takes the routed path, the only one that applies it."""
+def test_fused_moe_padding_mask_skips_dense_expert_path(monkeypatch):
+    """With the dense-expert decode path admitted, the padding-mask row filter
+    still takes the routed path, the only one that applies it."""
     _require_tpu()
     num_tokens, num_valid = 8, 5
-    hidden_states, w1, w2, topk_weights, topk_ids, topk = _row_count_inputs(
+    hidden_states, w1, w2, topk_weights, topk_ids, topk = _padded_inputs(
         num_tokens, num_valid
     )
     stock = fused_moe_func(
@@ -923,17 +1049,17 @@ def test_fused_moe_row_count_skips_dense_expert_path(monkeypatch):
     )
 
     def forbidden(*args, **kwargs):
-        pytest.fail("the row-count filter took the dense-expert path")
+        pytest.fail("the padding-mask row filter took the dense-expert path")
 
     monkeypatch.setattr(fused_moe_gmm, "_DENSE_EXPERT_THRESHOLD", 1024)
     monkeypatch.setattr(fused_moe_gmm, "can_use_dense_expert", lambda *a, **k: True)
     monkeypatch.setattr(fused_moe_gmm, "dense_expert_moe", forbidden)
     # The path is chosen at trace time; drop traces cached without the patch.
     jax.clear_caches()
-    row_count = _run_row_count(
+    skipped = _run_padding_mask(
         hidden_states, w1, w2, topk_weights, topk_ids, topk, num_valid
     )
-    _check_row_count_output(row_count, stock, num_valid)
+    _check_skip_output(skipped, stock, num_valid)
 
 
 @pytest.mark.tpu_test

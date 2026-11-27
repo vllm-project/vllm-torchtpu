@@ -13,25 +13,28 @@
 # limitations under the License.
 """Tests for BF16 MoE padded-token skipping in VllmUnquantizedFusedMoEMethod.
 
-- Skipping on: skip_padded_tokens=True and row_info=local_valid_tokens (the
-  row-count filter).
-- Skipping off (flag off, an unsupported configuration, or a layer built
-  outside the runner's policy scope): skip_padded_tokens=False and
-  row_info=None (the stock kernel).
-- On the TPU, the compiled forward reads local_valid_tokens when it runs, so
-  one program serves every count the runner writes.
+- The layer resolves the policy from the VllmConfig it is built under; a
+  draft model built by Eagle3Proposer takes the speculative-decoding fallback.
+- Skipping on: skip_padded_tokens=True and row_info=the token padding mask.
+- Skipping off (flag off, an unsupported configuration, or no padding state):
+  skip_padded_tokens=False and row_info=None (the stock kernel).
+- On the TPU, the compiled forward reads the mask when it runs, so one program
+  serves every padding the runner writes.
 """
 
+import contextlib
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 import torch._dynamo.utils
 
 from vllm_torchtpu.layers.adapter import fused_moe as fused_moe_module
-from vllm_torchtpu.layers.adapter import moe_skip_policy, token_padding
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.quantization import unquantized as module
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
+    VllmUnquantizedConfig,
     VllmUnquantizedFusedMoEMethod,
 )
 
@@ -44,6 +47,42 @@ def _moe_cfg(use_ep: bool = False):
         has_bias=False,
         moe_parallel_config=SimpleNamespace(use_ep=use_ep),
     )
+
+
+def _vllm_config(**overrides):
+    """A VllmConfig stand-in with every field the policy reads."""
+    config = SimpleNamespace(
+        quant_config=VllmUnquantizedConfig(),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_expert_parallel=False,
+        ),
+        speculative_config=None,
+        lora_config=None,
+    )
+    for name, value in overrides.items():
+        setattr(config, name, value)
+    return config
+
+
+@pytest.fixture
+def build_method(monkeypatch):
+    """Construct the method (the upstream __init__ skipped) under a config."""
+    monkeypatch.setattr(
+        module.UnquantizedFusedMoEMethod, "__init__", lambda self, moe: None
+    )
+    for name in ("TORCH_TPU_DP_SIZE", "TPU_MOE_COLLECTION_CHUNK_SIZE"):
+        monkeypatch.delenv(name, raising=False)
+
+    def build(config, *, flag: bool) -> VllmUnquantizedFusedMoEMethod:
+        monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1" if flag else "0")
+        monkeypatch.setattr(module, "get_current_vllm_config_or_none", lambda: config)
+        return VllmUnquantizedFusedMoEMethod(_moe_cfg())
+
+    return build
 
 
 def _method(*, skip_padded_tokens: bool) -> VllmUnquantizedFusedMoEMethod:
@@ -109,11 +148,11 @@ def _run_forward(method: VllmUnquantizedFusedMoEMethod, layer=None):
     return method._forward_monolithic_tpu(layer or _dummy_layer(), x, logits)
 
 
-def test_count_forward_passes_count_and_does_not_zero_weights(capture_forward):
-    """With skipping on, the forward passes the row-count filter and
-    local_valid_tokens without touching routing weights (so padded rows stay
-    non-zero and real zero-gate rows keep stock dispatch)."""
-    state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=True)
+def test_skip_forward_passes_padding_mask_and_keeps_weights(capture_forward):
+    """With skipping on, the forward passes the token padding mask as row_info
+    without touching routing weights (so padded rows stay non-zero and real
+    zero-gate rows keep stock dispatch)."""
+    state = token_padding.TokenPaddingState.create(16, "cpu")
     state.update(2, 4)
     token_padding.set_padding_state(state)
     try:
@@ -126,16 +165,17 @@ def test_count_forward_passes_count_and_does_not_zero_weights(capture_forward):
     assert len(capture_forward.fused_calls) == 1
     call = capture_forward.fused_calls[0]
     assert call["skip_padded_tokens"] is True
-    assert call["row_info"] is state.local_valid_tokens
-    assert int(call["row_info"].item()) == 2
-    # Padded rows keep their original non-zero weights (exclusion is by count).
+    # The whole buffer the runner writes each step, not a copy or a slice.
+    assert call["row_info"] is state.local_padding_mask
+    assert call["row_info"][:4].tolist() == [False, False, True, True]
+    # Padded rows keep their original non-zero weights (exclusion is by row).
     assert torch.equal(call["topk_weights"], capture_forward.weights)
 
 
 def test_stock_contract_when_disabled_or_fallback(capture_forward, monkeypatch):
     """With skipping off, the forward passes skip_padded_tokens=False and
     row_info=None, also when pipelined_fused_moe_gmm runs."""
-    state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=True)
+    state = token_padding.TokenPaddingState.create(16, "cpu")
     state.update(1, 4)
     token_padding.set_padding_state(state)
     try:
@@ -157,37 +197,59 @@ def test_stock_contract_when_disabled_or_fallback(capture_forward, monkeypatch):
         assert call["row_info"] is None
 
 
-def test_count_mode_asserts_if_local_valid_tokens_missing(capture_forward):
-    state = token_padding.TokenPaddingState.create(16, "cpu", track_valid_tokens=False)
-    token_padding.set_padding_state(state)
-    try:
-        method = _method(skip_padded_tokens=True)
-        with pytest.raises(AssertionError, match="tracks no valid tokens"):
-            _run_forward(method)
-    finally:
-        token_padding.set_padding_state(None)
+def test_skip_without_padding_state_runs_stock(capture_forward):
+    """The runner sets the padding state whenever the flag is on; a forward
+    run without one has no rows to skip and keeps the stock contract."""
+    token_padding.set_padding_state(None)
+    _run_forward(_method(skip_padded_tokens=True))
+    call = capture_forward.fused_calls[0]
+    assert call["skip_padded_tokens"] is False
+    assert call["row_info"] is None
 
 
-def test_init_consumes_runner_policy_scope(monkeypatch):
-    monkeypatch.setattr(
-        module.UnquantizedFusedMoEMethod, "__init__", lambda self, moe: None
-    )
-    enabled_policy = moe_skip_policy.Bf16MoeSkipPolicy(enabled=True)
-    with moe_skip_policy.bf16_policy_scope(enabled_policy):
-        m = VllmUnquantizedFusedMoEMethod(_moe_cfg())
-    assert m._skip_padded_tokens is True
-
-    disabled_policy = moe_skip_policy.Bf16MoeSkipPolicy(
-        enabled=False, fallback_reason="data_parallel_size > 1"
-    )
-    with moe_skip_policy.bf16_policy_scope(disabled_policy):
-        m_off = VllmUnquantizedFusedMoEMethod(_moe_cfg())
-    assert m_off._skip_padded_tokens is False
+@pytest.mark.parametrize(
+    "config, flag, expected",
+    [
+        (_vllm_config(), True, True),
+        (_vllm_config(), False, False),
+        (_vllm_config(speculative_config=SimpleNamespace()), True, False),
+        (None, True, False),
+    ],
+)
+def test_init_resolves_policy_from_current_vllm_config(
+    build_method, config, flag, expected
+):
+    assert build_method(config, flag=flag)._skip_padded_tokens is expected
 
 
-def test_init_logs_the_fallback_reason(monkeypatch):
+def test_init_logs_the_fallback_reason(build_method, monkeypatch):
     """A BF16 MoE layer logs why the flag is not applied; nothing is logged
-    with the flag off, with skipping on, or outside the runner's scope."""
+    with the flag off or with skipping on."""
+    logged: list[tuple] = []
+    monkeypatch.setattr(
+        module.logger, "warning_once", lambda msg, *args: logged.append(args)
+    )
+    build_method(_vllm_config(), flag=False)
+    build_method(None, flag=False)
+    build_method(_vllm_config(), flag=True)
+    assert logged == []
+
+    ep = SimpleNamespace(**vars(_vllm_config().parallel_config))
+    ep.enable_expert_parallel = True
+    build_method(_vllm_config(parallel_config=ep), flag=True)
+    build_method(None, flag=True)
+    assert logged == [("expert parallelism",), ("no current VllmConfig",)]
+
+
+def test_draft_moe_layers_take_the_speculative_fallback(monkeypatch):
+    """Flag on, a BF16 target and an MTP drafter: Eagle3Proposer builds the
+    draft under a copy of the target's config, which keeps speculative_config,
+    so the draft's BF16 MoE layers run the stock path like the target's."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+    for name in ("TORCH_TPU_DP_SIZE", "TPU_MOE_COLLECTION_CHUNK_SIZE"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(
         module.UnquantizedFusedMoEMethod, "__init__", lambda self, moe: None
     )
@@ -195,33 +257,44 @@ def test_init_logs_the_fallback_reason(monkeypatch):
     monkeypatch.setattr(
         module.logger, "warning_once", lambda msg, *args: logged.append(args)
     )
-    for policy in (
-        moe_skip_policy.Bf16MoeSkipPolicy(enabled=False),
-        moe_skip_policy.Bf16MoeSkipPolicy(enabled=True),
-    ):
-        with moe_skip_policy.bf16_policy_scope(policy):
-            VllmUnquantizedFusedMoEMethod(_moe_cfg())
-    VllmUnquantizedFusedMoEMethod(_moe_cfg())
-    assert logged == []
-
-    fallback = moe_skip_policy.Bf16MoeSkipPolicy(
-        enabled=False, fallback_reason="expert parallelism"
+    target_config = _vllm_config(
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            draft_tensor_parallel_size=1,
+            draft_model_config=SimpleNamespace(runner_type=None),
+        ),
+        load_config=object(),
+        compilation_config=SimpleNamespace(inductor_compile_config={}),
     )
-    with moe_skip_policy.bf16_policy_scope(fallback):
-        VllmUnquantizedFusedMoEMethod(_moe_cfg())
-    assert logged == [("expert parallelism",)]
+    target_config.parallel_config.tensor_parallel_size = 1
+    proposer = e3.Eagle3Proposer(
+        runner=mock.MagicMock(
+            _pcp_enabled=False, _mtp_enabled=True, _mtp_prefill_only=False
+        ),
+        vllm_config=target_config,
+    )
+    proposer.runner = SimpleNamespace(mesh=object())
+    draft_methods: list[VllmUnquantizedFusedMoEMethod] = []
 
+    class _Loader:
+        def load_model(self, *, vllm_config, model_config):
+            # A draft MoE layer's quant method, built as vLLM builds it: under
+            # the draft's config, set by the real set_current_vllm_config.
+            draft_methods.append(VllmUnquantizedFusedMoEMethod(_moe_cfg()))
+            return object()
 
-def test_init_outside_runner_scope_runs_stock(monkeypatch):
-    """Only the runner's policy turns skipping on: with the flag set, a layer
-    built outside bf16_policy_scope still runs the stock path."""
+    monkeypatch.setattr(e3, "get_model_loader", lambda _cfg: _Loader())
+    monkeypatch.setattr(e3, "set_model_tag", lambda _tag: contextlib.nullcontext())
     monkeypatch.setattr(
-        module.UnquantizedFusedMoEMethod, "__init__", lambda self, moe: None
+        e3, "set_vllm_model_wrapper_context", lambda **_kw: contextlib.nullcontext()
     )
-    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
-    assert moe_skip_policy.get_active_bf16_policy() is None
-    m = VllmUnquantizedFusedMoEMethod(_moe_cfg())
-    assert m._skip_padded_tokens is False
+    monkeypatch.setattr(e3, "_force_draft_tp1", lambda: contextlib.nullcontext())
+
+    proposer._load_draft_model()
+
+    assert proposer.draft_vllm_config is not target_config
+    assert [m._skip_padded_tokens for m in draft_methods] == [False]
+    assert logged == [("speculative decoding",)]
 
 
 @pytest.mark.parametrize(
@@ -279,7 +352,7 @@ def test_process_weights_after_loading_prebuilds_expected_kernels(
 def _top_logits(hidden_states, gating_output, topk, renormalize):
     """Route each row to its topk largest logits, gated by their values.
 
-    Selection only, no arithmetic, so the stock and the row-count programs
+    Selection only, no arithmetic, so the stock and the skipping programs
     route identically.
     """
     weights, ids = torch.topk(gating_output, topk, dim=-1)
@@ -296,13 +369,13 @@ def _xla_cache_entries() -> int:
 
 @pytest.mark.tpu_test
 def test_one_compiled_forward_reads_each_steps_row_count():
-    """row_info enters the compiled forward through
-    token_padding.get_local_valid_tokens(), not as an argument. One row-count
-    program, compiled for 16 rows, serves a warmup step (count 0) and then
-    counts 3, 16 and 5, which TokenPaddingState.update writes into the same
-    device tensor before each step, as the runner does. Each step's real rows
-    match the stock program bit for bit and its padded rows are zero, and no
-    step after the warmup traces or compiles again, so no count is baked in."""
+    """row_info enters the compiled forward as the token padding mask read
+    from TokenPaddingState, not as an argument. One skipping program, compiled
+    for 16 rows, serves a warmup step (0 valid rows) and then 3, 16 and 5
+    valid rows, which TokenPaddingState.update writes into the same device
+    mask before each step, as the runner does. Each step's real rows match the
+    stock program bit for bit and its padded rows are zero, and no step after
+    the warmup traces or compiles again, so no padding is baked in."""
     num_tokens, experts, hidden, inter, topk = 16, 16, 2048, 768, 8
     dev = torch.device("tpu")
     gen = torch.Generator().manual_seed(0)
@@ -323,8 +396,8 @@ def test_one_compiled_forward_reads_each_steps_row_count():
         capture_fn=None,
     )
     stock_method = _method(skip_padded_tokens=False)
-    count_method = _method(skip_padded_tokens=True)
-    for method in (stock_method, count_method):
+    skip_method = _method(skip_padded_tokens=True)
+    for method in (stock_method, skip_method):
         # _method skips __init__, but Dynamo reads the nn.Module state (the
         # method is a vLLM CustomOp).
         torch.nn.Module.__init__(method)
@@ -340,16 +413,15 @@ def test_one_compiled_forward_reads_each_steps_row_count():
     def stock_forward(x, logits):
         return stock_method._forward_monolithic_tpu(layer, x, logits)
 
-    def count_forward(x, logits):
-        return count_method._forward_monolithic_tpu(layer, x, logits)
+    def skip_forward(x, logits):
+        return skip_method._forward_monolithic_tpu(layer, x, logits)
 
     compile_opts = dict(backend="tpu", fullgraph=True, dynamic=False)
     stock_forward = torch.compile(stock_forward, **compile_opts)
-    count_forward = torch.compile(count_forward, **compile_opts)
+    skip_forward = torch.compile(skip_forward, **compile_opts)
 
-    state = token_padding.TokenPaddingState.create(
-        num_tokens, dev, track_valid_tokens=True
-    )
+    # Longer than the step, like the runner's buffer (max_num_tokens rows).
+    state = token_padding.TokenPaddingState.create(2 * num_tokens, dev)
     token_padding.set_padding_state(state)
     compiled = []
     try:
@@ -362,7 +434,7 @@ def test_one_compiled_forward_reads_each_steps_row_count():
             x, logits = x.to(torch.bfloat16).to(dev), logits.to(dev)
             state.update(num_valid, num_tokens)
             ref = stock_forward(x, logits).cpu()
-            out = count_forward(x, logits).cpu()
+            out = skip_forward(x, logits).cpu()
             # The warmup step traces and compiles both programs; the later
             # steps reuse them.
             compiled.append((_dynamo_graphs(), _xla_cache_entries()))

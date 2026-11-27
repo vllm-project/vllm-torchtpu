@@ -342,11 +342,12 @@ def prepare_routed_gmm_inputs(
     """Prepare the local-only routing layout using already-local expert ids.
 
     With ``skip_padded_tokens=True`` the valid mask also drops the padded rows'
-    routes. With ``row_info`` (BF16 MoE: a 1-element int32 array holding the
-    number of valid prefix rows), rows at index ``>= row_info[0]`` are padding,
-    and real rows keep stock dispatch even if a routing weight is zero. Without
-    ``row_info`` (FP8 / MXFP4 MoE), the caller zeroed the padded rows' routing
-    weights and routes whose weight is zero are dropped. ``row_info`` is
+    routes. With ``row_info`` (BF16 MoE: this rank's token padding mask, a bool
+    array over at least the local rows, True on padded rows; only its first
+    ``num_tokens_local`` entries are read), the rows it marks are dropped by
+    index, and real rows keep stock dispatch even if a routing weight is zero.
+    Without ``row_info`` (FP8 / MXFP4 MoE), the caller zeroed the padded rows'
+    routing weights and routes whose weight is zero are dropped. ``row_info`` is
     ignored without ``skip_padded_tokens``.
 
     For non-EP runs `topk_indices_local` is always non-negative, so without
@@ -362,9 +363,9 @@ def prepare_routed_gmm_inputs(
     token_indices_flat = jnp.arange(num_tokens_local, dtype=jnp.int32).repeat(topk)
 
     if skip_padded_tokens and row_info is not None:
-        valid_mask = (topk_indices_flat >= 0) & (
-            token_indices_flat < row_info.reshape(-1)[0]
-        )
+        # One entry per route, in token_indices_flat order.
+        is_padding = row_info.reshape(-1)[:num_tokens_local].repeat(topk)
+        valid_mask = (topk_indices_flat >= 0) & jnp.logical_not(is_padding)
     elif skip_padded_tokens:
         # Padded tokens keep their selected expert ids, but carry zero
         # expert routing weights. Treat them as invalid to remove them
@@ -766,10 +767,10 @@ def fused_moe_func(
 
     # Decode services also compile large prefill buckets. Apply the token
     # threshold before kernel admission so those buckets retain routed GMM.
-    # The row-count filter (``row_info``) is implemented only in the routed
-    # path below; BF16 does not reach the dense-expert kernel today (it admits
-    # FP8 weights only), and the first condition keeps it that way if that
-    # changes.
+    # The padding-mask row filter (``row_info``) is implemented only in the
+    # routed path below; BF16 does not reach the dense-expert kernel today (it
+    # admits FP8 weights only), and the first condition keeps it that way if
+    # that changes.
     if (
         row_info is None
         and 0 < num_tokens <= _DENSE_EXPERT_THRESHOLD

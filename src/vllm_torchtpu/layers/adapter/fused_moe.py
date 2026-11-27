@@ -261,7 +261,7 @@ def _get_fused_moe_custom_op(
     topk_weights_float32: bool = False,
 ) -> Callable:
     # A custom op is always called with the same operands, so the variant that
-    # takes ``row_info`` (the BF16 row-count filter) is a separate op.
+    # takes ``row_info`` (the BF16 padding mask) is a separate op.
     cache_key = (
         topk,
         activation,
@@ -333,8 +333,9 @@ def fused_moe_gmm(
 ) -> torch.Tensor:
     """Fused MoE forward pass with precomputed routing.
 
-    With ``skip_padded_tokens`` and a ``row_info`` tensor (1-element int32,
-    the valid prefix row count), the kernel excludes padded rows by row index;
+    With ``skip_padded_tokens`` and a ``row_info`` tensor (this rank's bool
+    token padding mask, True on padded rows, at least as long as
+    ``hidden_states``), the kernel drops the rows it marks by row index;
     without ``row_info`` it drops routes whose routing weight is zero.
 
     ``experts_start`` is the first global expert id owned by this shard under

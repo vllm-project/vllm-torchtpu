@@ -230,11 +230,11 @@ def pipelined_fused_moe_gmm(
         torch.Tensor: Reduced local output activations [S, H].
     """
     if row_info is not None:
-        # Each chunk holds rows gathered from several ranks, so one local
-        # valid-row count would drop real rows of the other ranks.
+        # Each chunk holds rows gathered from several ranks, which this rank's
+        # padding mask does not describe.
         raise NotImplementedError(
             "pipelined_fused_moe_gmm does not support row_info (chunked DP/PCP "
-            "layouts cannot reuse a single local valid-row count)."
+            "layouts cannot reuse this rank's token padding mask)."
         )
     collective_group, _ = _get_moe_collective_group()
 
