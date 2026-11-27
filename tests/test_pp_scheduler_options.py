@@ -751,21 +751,42 @@ def test_without_prefix_aware_the_local_hit_is_the_base_schedulers():
         assert not hasattr(request, "_tpu_local_hit_tokens")
 
 
-def test_prefix_aware_resolves_a_divergent_hit_through_the_connector():
+@pytest.mark.parametrize(
+    ("answer", "expected", "local_hit"),
+    [
+        # Truncated to the connector's answer: the host tier loads the rest.
+        (4096, ("blocks[:4096]", 4096, 0, True), 4096),
+        # No host-tier hit past the reconciled hit: the hit every group
+        # agrees on, which no longer diverges.
+        (None, ("reconciled", 2048, 777, False), 2048),
+        # Nothing to keep: empty blocks at the reconciled boundary.
+        (0, ("empty", 0, 777, False), 0),
+        # The whole local hit (or more) to keep: the base hit, unchanged.
+        (8192, ("blocks", 8192, 0, True), 8192),
+        (12288, ("blocks", 8192, 0, True), 8192),
+    ],
+)
+def test_prefix_aware_resolves_a_divergent_hit_through_the_connector(
+    answer, expected, local_hit
+):
     seen = []
+    asked = []
 
     def base(self, request, max_cache_hit_length=None):
         seen.append(max_cache_hit_length)
         return "blocks", 8192, 0, True
 
     kvm = SimpleNamespace(
-        get_computed_blocks=lambda request, cap: ("reconciled", 2048, 0),
+        get_computed_blocks=lambda request, cap: ("reconciled", 2048, 777),
         truncate_computed_blocks=lambda blocks, n: f"{blocks}[:{n}]",
         empty_kv_cache_blocks="empty",
     )
     connector = SimpleNamespace(
         supports_divergent_local_hybrid_hits=True,
-        resolve_divergent_local_hit_tokens=lambda req, n, rec, bs: 4096,
+        resolve_divergent_local_hit_tokens=lambda req, n, rec, bs: asked.append(
+            (n, rec, bs)
+        )
+        or answer,
     )
     request = _req(0, 16384)
     with patch.object(Scheduler, "_get_local_prefix_cache_hit", base):
@@ -777,10 +798,11 @@ def test_prefix_aware_resolves_a_divergent_hit_through_the_connector():
         )
         s._get_block_size = lambda: 2048
         got = s._get_local_prefix_cache_hit(request, 12288)
-    assert got == ("blocks[:4096]", 4096, 0, True)
-    assert request._tpu_local_hit_tokens == 4096
+    assert got == expected
+    assert asked == [(8192, 2048, 2048)]
+    assert request._tpu_local_hit_tokens == local_hit
     # The Raiden offloading connector reads the hit under the same name.
-    assert raiden_connector._local_hit_tokens(request) == 4096
+    assert raiden_connector._local_hit_tokens(request) == local_hit
     assert seen == [12288]
 
 
@@ -1044,6 +1066,25 @@ def test_the_promotion_counts_a_host_tier_hit_only_if_its_load_fits():
     s._free_blocks_for_ext = lambda: 2
     ranked = s._rank_window([head, host])
     assert ranked[1] == ranked[0]
+
+
+def test_a_waiting_host_tier_hit_counts_as_done_under_quadratic_cost():
+    kvm = SimpleNamespace(enable_caching=True)
+    quad = _sched(cost=_model(), kv_cache_manager=kvm, _quadratic_cost=True)
+    quad._prefix_warmth = lambda request: 2_048
+    quad._get_block_size = lambda: 2_176
+    quad._hit_estimator = SimpleNamespace(
+        estimate_external_hit_tokens=lambda r, n: 4_096
+    )
+    assert quad._waiting_warmth(_req(0, 16_384)) == 2_048 + 4_096
+    # Capped at the prefill end (the prompt here).
+    quad._hit_estimator = SimpleNamespace(
+        estimate_external_hit_tokens=lambda r, n: 100_000
+    )
+    assert quad._waiting_warmth(_req(0, 8_192)) == 8_192
+    # Without quadratic_cost the pending work is computed tokens only.
+    quad._quadratic_cost = False
+    assert quad._waiting_warmth(_req(0, 16_384)) == 0
 
 
 def test_promotion_ranks_with_the_free_block_fit():

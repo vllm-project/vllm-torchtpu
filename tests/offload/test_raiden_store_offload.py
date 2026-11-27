@@ -1325,6 +1325,27 @@ class TestSchedulerFenceFlow(unittest.TestCase):
         self.assertEqual(meta.failed_load_req_ids, {"r1"})
         self.assertIsNone(sched.poll_and_complete_transfers(idle=False))
 
+    def test_a_load_that_failed_before_the_poll_is_echoed_by_request(self):
+        """A failed load the schedule-start poll finds waits in
+        _pending_failed_jobs: the poll returns nothing for it, and the next
+        build_connector_meta reports it to the workers as a failed request
+        (vLLM reads failed_recving only from a step's output)."""
+        store = FakeKVCacheStore()
+        manager = make_manager(store)
+        seed_host_entries(store, _key(0))
+        manager.prepare_load([_key(0)], _ctx("r1"))
+        sched = self._make_scheduler(manager)
+        self._track_load(sched)
+        self._build_meta(
+            sched, self._stock_meta(load_jobs={3: self._load_job([_key(0)], [10])})
+        )
+        store.complete_load(sub_hashes(_key(0)), success=False)
+        self.assertIsNone(sched.poll_and_complete_transfers(idle=False))
+        meta = self._build_meta(sched, self._stock_meta())
+        self.assertEqual(meta.finished_load_jobs, {3: "r1"})
+        self.assertEqual(meta.failed_load_req_ids, {"r1"})
+        self.assertEqual(sched._pending_failed_jobs, [])
+
     def test_the_scheduler_applies_a_poll_as_it_applies_the_echo(self):
         """vLLM's Scheduler._update_from_kv_xfer_finished, which applies a
         step's output, applies the poll's output: one update_connector_output
@@ -2135,6 +2156,12 @@ class TestOffloadConnectorOptions(unittest.TestCase):
     def test_cap_defers_a_hit_while_loads_are_in_flight(self):
         self.assertEqual(self._capped(1), ((None, False), False))
         self.assertEqual(self._capped(2), ((8, True), True))
+
+    def test_at_the_cap_a_request_without_a_host_tier_hit_is_not_deferred(self):
+        # The probe finds nothing to load: upstream's lookup runs as usual.
+        self.assertEqual(
+            self._capped(1, probe=MagicMock(return_value=0)), ((8, True), True)
+        )
 
     def test_the_cap_probe_runs_in_the_step_region(self):
         """On a step's first request the cap's probe is the hook's first

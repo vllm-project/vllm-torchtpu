@@ -39,6 +39,10 @@ def test_set_options_are_read():
         RaidenOffloadingOptions,
         {"host_tier_recency": True, "max_async_loads": 16, "cpu_bytes_to_use": 1},
     ) == RaidenOffloadingOptions(host_tier_recency=True, max_async_loads=16)
+    # 0 is a valid non-negative integer (no cap), not a refused value.
+    assert read_options(
+        RaidenOffloadingOptions, {"max_async_loads": 0}
+    ) == RaidenOffloadingOptions(max_async_loads=0)
     assert read_options(
         MultiConnectorOptions, {"producer_divergent_hits": True, "connectors": []}
     ) == MultiConnectorOptions(producer_divergent_hits=True)
