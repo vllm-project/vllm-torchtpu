@@ -46,7 +46,7 @@ from vllm.compilation.compiler_interface import CompilerInterface
 from vllm.config import VllmConfig
 from vllm.config.utils import Range
 
-from vllm_torchtpu import envs, utils
+from vllm_torchtpu import envs, rope_in_graph_flag, utils
 from vllm_torchtpu.compilation import executable_reload, shape_variants
 from vllm_torchtpu.compilation.graph_fingerprint import _graph_fingerprint
 from vllm_torchtpu.distributed.ep_mesh import ep_device_placement_key
@@ -474,6 +474,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
         # are hashed only through the outcome, so changing one of them without
         # flipping the gate keeps the cache.
         "gdn_prefill_checkpoint": prefill_checkpoint_enabled(vllm_config),
+        "rope_in_graph": rope_in_graph_flag.in_graph_enabled(vllm_config),
         "scheduler": {
             "max_model_len": vllm_config.model_config.max_model_len,
             "max_num_batched_tokens": scheduler_config.max_num_batched_tokens,

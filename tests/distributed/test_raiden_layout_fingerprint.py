@@ -69,7 +69,7 @@ def test_measured_fa_layout_fingerprint_golden(monkeypatch):
     manifest = _manifest()
     fingerprint, payload = rlf.measured_fa_layout_fingerprint(
         manifest,
-        rope_in_graph=False,
+        rope_in_graph=True,
         layout_getter=lambda tensor: ([4, 3, 2, 1, 0], [[4, 128], [4, 1]], 0),
         package_version=lambda package: {
             "torch_tpu": "0.1.1.dev20260630090312",
@@ -86,10 +86,10 @@ def test_measured_fa_layout_fingerprint_golden(monkeypatch):
         "element_size_in_bits": 8,
         "kv_layout": "layer-major",
         "gdn_conv_layout": "legacy-split-qk",
-        "rope_in_graph": False,
+        "rope_in_graph": True,
     }
     assert fingerprint == (
-        "782e5dc874e7ea3d75fc40ba36d9e311c7cf3e4e96a7db8acd7e372b6115a36c"
+        "28529d4ce5ae25321242301c2457ff61b44eeefe5334e7473040f7b420d7a30c"
     )
     assert (
         rlf.canonical_layout_fingerprint(dict(reversed(list(payload.items()))))
@@ -369,7 +369,7 @@ def test_measured_glm_layout_fingerprint_golden():
     fingerprint, payload = rlf.measured_glm_layout_fingerprint(
         _glm_manifest(),
         page_tokens=1024,
-        rope_in_graph=False,
+        rope_in_graph=True,
         layout_getter=_glm_layout_getter,
         package_version=_glm_versions,
     )
@@ -381,7 +381,7 @@ def test_measured_glm_layout_fingerprint_golden():
         "torch_tpu": "torch-tpu-test-version",
         "libtpu": "libtpu-test-version",
         "page_tokens": 1024,
-        "rope_in_graph": False,
+        "rope_in_graph": True,
         "layouts": {
             "mla.nope": {
                 "page_shape": [1024, 4, 128],
@@ -407,7 +407,7 @@ def test_measured_glm_layout_fingerprint_golden():
         },
     }
     assert fingerprint == (
-        "fab98b5847d57d99b32df2eca7f6092d78bcf500c41b734516b99e52f5159d3e"
+        "0f3eff8e0f03fd36bb4e493721939ab03a6c7397efbcd663f819602f12e12396"
     )
 
 

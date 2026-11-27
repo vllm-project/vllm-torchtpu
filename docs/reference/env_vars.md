@@ -122,9 +122,11 @@ Both are off by default; set both (`--additional-config '{"tpu_moe_topk_weights_
 
 ### In-graph RoPE
 
-`--additional-config '{"tpu_rope_in_graph": true}'` (default `false`) computes rotary `cos`/`sin` in-graph from positions instead of indexing a precomputed `[max_position, rotary_dim]` HBM table. DeepSeek-V4 Pallas rotary kernels keep the precomputed table until migrated. A non-bool value fails at startup.
+`--additional-config '{"tpu_rope_in_graph": false}'` opts out of in-graph RoPE (default `true`, which computes rotary `cos`/`sin` in-graph from positions instead of indexing a precomputed `[max_position, rotary_dim]` HBM table). Earlier versions default to `false`. A non-bool value fails at startup.
 
-The in-graph `cos`/`sin` are not bit-identical to the table, and K is rotated before the KV cache stores it. Instances that exchange KV pages (disaggregated prefill/decode, KV transfer) must therefore all use the same value; the Raiden layout fingerprint records it so mixed peers fail closed at plan time.
+DeepSeek-V4 Pallas rotary kernels keep the precomputed table until migrated; on the default path, `Phi3LongRoPEScaledRotaryEmbedding` also builds a table at load time before the post-load Tier-2 sweep, and non-power-of-two `LinearScalingRotaryEmbedding` or M-RoPE configs whose `mrope_section` cannot be mapped fall back to the table.
+
+The in-graph `cos`/`sin` are not bit-identical to the table, and K is rotated before the KV cache stores it. Instances that exchange KV pages (disaggregated prefill/decode, KV transfer) must therefore use the same value, and the Raiden layout fingerprint includes the switch so prefill and decode peers must be upgraded together.
 
 ---
 

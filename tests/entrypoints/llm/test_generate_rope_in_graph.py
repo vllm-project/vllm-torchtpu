@@ -35,7 +35,18 @@ def _rope_cache_kinds(worker) -> list[str]:
     ]
 
 
-def test_generate_with_in_graph_rope(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("additional_config", "expected_cache_kind"),
+    [
+        ({}, "InGraphCosSinCache"),
+        ({"tpu_rope_in_graph": False}, "Tensor"),
+    ],
+)
+def test_generate_with_in_graph_rope(
+    monkeypatch: pytest.MonkeyPatch,
+    additional_config: dict[str, object],
+    expected_cache_kind: str,
+) -> None:
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
     monkeypatch.setattr(rope_lib, "_ROPE_DICT", {})
     llm = LLM(
@@ -45,7 +56,7 @@ def test_generate_with_in_graph_rope(monkeypatch: pytest.MonkeyPatch) -> None:
         max_model_len=256,
         tensor_parallel_size=1,
         gpu_memory_utilization=0.6,
-        additional_config={"tpu_rope_in_graph": True},
+        additional_config=additional_config,
     )
     try:
         kinds = llm.collective_rpc(_rope_cache_kinds)[0]
@@ -57,5 +68,5 @@ def test_generate_with_in_graph_rope(monkeypatch: pytest.MonkeyPatch) -> None:
         del llm
         cleanup_dist_env_and_memory()
 
-    assert kinds and set(kinds) == {"InGraphCosSinCache"}
+    assert kinds and set(kinds) == {expected_cache_kind}
     assert "Paris" in outputs[0].outputs[0].text

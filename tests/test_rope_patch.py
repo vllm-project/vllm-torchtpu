@@ -1159,7 +1159,7 @@ def test_require_cos_sin_table_exempts_module_from_sweep() -> None:
 @pytest.mark.parametrize(
     ("additional_config", "expected"),
     [
-        ({}, False),
+        ({}, True),
         ({"tpu_rope_in_graph": False}, False),
         ({"tpu_rope_in_graph": True}, True),
     ],

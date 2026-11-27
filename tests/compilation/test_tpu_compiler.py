@@ -93,6 +93,7 @@ class TestTpuCompilerCache:
         num_gpu_blocks=1024,
         mamba_cache_mode="none",
         prefix_match_unit=None,
+        additional_config=None,
     ):
         return SimpleNamespace(
             cache_config=SimpleNamespace(
@@ -116,6 +117,7 @@ class TestTpuCompilerCache:
                 prefill_context_parallel_size=1,
             ),
             speculative_config=None,
+            additional_config={} if additional_config is None else additional_config,
         )
 
     def test_tpu_hash_covers_derived_shapes(self):
@@ -158,6 +160,26 @@ class TestTpuCompilerCache:
         assert disabled != enabled
         assert enabled == enabled_block_unit
         assert disabled_fine_unit == disabled
+
+    def test_tpu_hash_covers_rope_in_graph(self):
+        from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash
+
+        with patch(
+            "vllm_torchtpu.compilation.tpu_compiler._iter_runtime_cache_key_files",
+            return_value=[],
+        ):
+            default_enabled = compute_tpu_compilation_hash(
+                self._config(additional_config={})
+            )
+            explicit_enabled = compute_tpu_compilation_hash(
+                self._config(additional_config={"tpu_rope_in_graph": True})
+            )
+            opted_out = compute_tpu_compilation_hash(
+                self._config(additional_config={"tpu_rope_in_graph": False})
+            )
+
+        assert default_enabled == explicit_enabled
+        assert default_enabled != opted_out
 
     def test_tpu_hash_covers_plugin_compile_env(self):
         from vllm_torchtpu.compilation.tpu_compiler import compute_tpu_compilation_hash

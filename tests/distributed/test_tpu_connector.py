@@ -6815,7 +6815,7 @@ def test_stage3_layout_measures_the_block_major_pool():
     ):
         result = worker._measure_stage3_layout(manifest)
 
-    measure.assert_called_once_with(manifest, block_major=True, rope_in_graph=False)
+    measure.assert_called_once_with(manifest, block_major=True, rope_in_graph=True)
     assert result == ("fingerprint", payload, 256)
 
 
