@@ -161,18 +161,20 @@ def test_supported():
 
 
 @pytest.mark.parametrize(
-    "rows,hier_rows,direct_rows,want",
+    "rows,hier_rows,direct_rows,want,min_rows",
     [
-        (32, 64, 8, "hier"),
-        (32, 64, 0, "hier"),  # [16, w] view
-        (48, 64, 8, "hier"),  # 589824 B, at the byte cap
-        (48, 40, 8, "pallas"),  # above the hier cap
-        (32, 0, 8, "pallas"),  # flag off
-        (512, 1024, 8, "psum"),  # above the byte cap
-        (1024, 1024, 8, "qar"),  # qar first
+        (24, 48, 8, "pallas", 32),  # below the hier minimum
+        (32, 48, 8, "hier", 32),
+        (32, 64, 8, "hier", 0),
+        (32, 64, 0, "hier", 0),  # [16, w] view
+        (48, 64, 8, "hier", 0),  # 589824 B, at the byte cap
+        (48, 40, 8, "pallas", 0),  # above the hier cap
+        (32, 0, 8, "pallas", 0),  # flag off
+        (512, 1024, 8, "psum", 0),  # above the byte cap
+        (1024, 1024, 8, "qar", 0),  # qar first
     ],
 )
-def test_size_routing(monkeypatch, rows, hier_rows, direct_rows, want):
+def test_size_routing(monkeypatch, rows, hier_rows, direct_rows, want, min_rows):
     par = pytest.importorskip("vllm_torchtpu.distributed.pallas_all_reduce")
     calls = []
     monkeypatch.setattr(par.kernel, "all_reduce", lambda x, r, n, d=0: calls.append("pallas") or x)
@@ -182,7 +184,8 @@ def test_size_routing(monkeypatch, rows, hier_rows, direct_rows, want):
     monkeypatch.setattr(par.lax, "psum", lambda x, a: calls.append("psum") or x)
     tab = hier.layout_table(_devices(range(N)))
     body = par._body(N, 589824, "x", direct_rows=direct_rows, qar_min_rows=1024,
-                     qar_tab=object(), hier_rows=hier_rows, hier_tab=tab)
+                     qar_tab=object(), hier_rows=hier_rows, hier_tab=tab,
+                     hier_min_rows=min_rows)
     body(np.zeros((rows, 6144), np.float32), None)
     assert calls == [want]
 

@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     TPU_TP_PALLAS_ALL_REDUCE_ONESHOT_ROWS: int = 0
     TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS: int = 0
     TPU_TP_PALLAS_ALL_REDUCE_HIER_MODE: str = "ag"
+    TPU_TP_PALLAS_ALL_REDUCE_HIER_MIN_ROWS: int = 0
     TPU_MOE_TC_COMBINE: bool = False
     TPU_MOE_TC_COMBINE_PIECES: int = 1
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
@@ -1200,6 +1201,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # data over ICI once instead of once per core. 0 (default) = off.
     "TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS": env_int(
         "TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS", 0
+    ),
+    # ... and at least this many rows (0 = no minimum). On tpu7x TP8 the
+    # flat kernel is as fast or faster below 32 rows of 6144 (k7 microbench).
+    "TPU_TP_PALLAS_ALL_REDUCE_HIER_MIN_ROWS": env_int(
+        "TPU_TP_PALLAS_ALL_REDUCE_HIER_MIN_ROWS", 0
     ),
     # Which legs of that kernel are two-level. "ag" (default): only the
     # all-gather (each reduced chunk crosses ICI once per chip, the sibling

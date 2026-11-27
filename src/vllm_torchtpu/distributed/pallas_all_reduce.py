@@ -98,7 +98,8 @@ def _qdq(x: jax.Array) -> jax.Array:
 def _body(n: int, max_bytes: int, axis: str, direct_rows: int = 0,
           qdq_min_rows: int = 0, qar_min_rows: int = 0,
           qar_tab: np.ndarray | None = None, hier_rows: int = 0,
-          hier_tab: np.ndarray | None = None, hier_mode: str = "ag"):
+          hier_tab: np.ndarray | None = None, hier_mode: str = "ag",
+          hier_min_rows: int = 0):
     def body(x, rank):
         rows, hidden = x.shape
         # Static per bucket: decided at trace time inside the op.
@@ -112,7 +113,8 @@ def _body(n: int, max_bytes: int, axis: str, direct_rows: int = 0,
         if qdq:
             x = _qdq(x)
         if 0 < kernel.view_bytes(rows, hidden, n) <= max_bytes:
-            if hier_applies_ar(rows, hidden, n, hier_rows, direct_rows) and hier_tab is not None:
+            if (hier_tab is not None and rows >= hier_min_rows
+                    and hier_applies_ar(rows, hidden, n, hier_rows, direct_rows)):
                 out = hier_ar.all_reduce(x, rank, hier_tab, direct_rows, hier_mode)
             else:
                 out = kernel.all_reduce(x, rank, n, direct_rows)
@@ -213,7 +215,8 @@ def _make_op(mesh, max_bytes: int, direct_rows: int = 0,
     sharded = jax.shard_map(
         _body(int(mesh.size), max_bytes, axis, direct_rows, qdq_min_rows,
               qar_min_rows, qar_tab, hier_rows, hier_tab,
-              envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_MODE),
+              envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_MODE,
+              envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_MIN_ROWS),
         mesh=mesh,
         in_specs=specs,
         out_specs=P(axis),
@@ -531,7 +534,8 @@ def arm(hidden: int, device: torch.device) -> bool:
             f"tp_all_reduce: self-test failed (rows per rank): {failures}"
         )
     if hier_tab is not None:
-        hier_test_rows = min(32, envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS) // 8 * 8 or 8
+        hier_test_rows = max(min(32, envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_ROWS) // 8 * 8, 8,
+                             -(-envs.TPU_TP_PALLAS_ALL_REDUCE_HIER_MIN_ROWS // 8) * 8)
         seen = _gather(_qar_selftest(op, rank, n, hidden, device, hier_test_rows))
         if len({r["digest"] for r in seen}) != 1 or max(r["rel"] for r in seen) >= 0.01:
             raise RuntimeError(f"tp_all_reduce_hier: self-test failed: {seen}")
