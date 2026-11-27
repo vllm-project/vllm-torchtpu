@@ -148,3 +148,24 @@ def bench_derived_metrics(
             "p99": data.get("p99_tpot_ms"),
         },
     )
+
+
+def agentx_derived_metrics(export: dict) -> dict:
+    """Interactivity metrics derived from an aiperf export of an AgentX replay.
+
+    aiperf reports the time per output token as `inter_token_latency`, in
+    milliseconds. Only interactivity is derived here: `upload_results.py` does
+    not yet take chip-count flags, so per-chip throughput is not computed.
+    """
+    if not isinstance(export, dict):
+        return {}
+    latency = export.get("inter_token_latency")
+    if not isinstance(latency, dict):
+        return {}
+    return derived_metrics(
+        tpot_ms={
+            "median": latency.get("p50"),
+            "p90": latency.get("p90"),
+            "p99": latency.get("p99"),
+        },
+    )

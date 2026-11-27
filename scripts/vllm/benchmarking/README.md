@@ -211,6 +211,30 @@ A perf step opts in with `UPLOAD_TO_VLLM_CI: "1"` in its `env`;
 upload, and skips it on PRs and non-main branches like that upload. `--dry-run`
 prints the rows without posting them.
 
+`upload_results.py --results-dir <DIR>` writes one BigQuery row for each
+measured point in a results directory. `--skip-db-upload` prints the
+statements without running them.
+
+| In the directory | Row |
+|------------------|-----|
+| `isl<N>_osl<N>_c<N>.json` | One per cell: the `vllm_bench` metrics, with the run's accuracy scores as `lm_eval`. Also written to Spanner unless `--skip-spanner` is set |
+| `conc_<N>/` with one aiperf `profile_export_aiperf.json` below it | One per AgentX replay point, at concurrency N: the `agentx` metrics, and interactivity only (`median_intvty`, `p90_intvty`, `p99_intvty`) as `derived` (`upload_results.py` does not yet take chip-count flags, so per-chip throughput is not computed) |
+| `results_*.json` and no cell | One for the run: the accuracy scores as `lm_eval`. Resolves `model_id` from `config.json`, falling back to a consistent `model_name` in `results_*.json` or the run's AgentX exports |
+
+A directory with none of these uploads nothing, which is not an error.
+
+An AgentX point is a directory named `conc_<N>`, as `agentx_client.sh` creates
+one per concurrency: N is a positive integer with no leading zero. The
+directory may sit anywhere under `<DIR>`, and the export anywhere below it.
+
+- An export under no such directory, such as `conc_abc/` or `conc_16_old/`, is
+  not a point. It is named on stderr and skipped.
+- A path with nested `conc_<N>/` directories, such as `conc_8/nested/conc_16/`,
+  is rejected as ambiguous before any row is written.
+- Two exports for the same concurrency N anywhere under `<DIR>` stop the upload
+  with an error that names both, before any row is written. One concurrency is
+  one row.
+
 ## Environment Variables
 
 | Variable | Default | Description |
