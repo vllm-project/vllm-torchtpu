@@ -303,6 +303,49 @@ class DecodeOpt(NamedTuple):
 _DECODE_OPT_LOGGED = False
 
 
+class PrefillOpt(NamedTuple):
+    """`TPU_MINIMAX_M3_INDEXER_PREFILL_OPT` for the token-major-reduced
+    (`_chunk_maxima`, prefill) tiles of kernel v3."""
+
+    # One page per MXU row against the unpaired query (`_chunk_maxima_unpaired`).
+    unpair: bool = False
+    # Pages per dot (0: `_v3_chunk`'s default).
+    chunk: int = 0
+
+
+_PREFILL_OPT_LOGGED = False
+
+
+def prefill_opt() -> PrefillOpt:
+    """Parse `TPU_MINIMAX_M3_INDEXER_PREFILL_OPT` (read through envs, at
+    trace time): ``unpair``, ``chunk<N>`` (N in 2, 4, ..., 64), separated by
+    commas or ``+``."""
+    global _PREFILL_OPT_LOGGED
+    from vllm_torchtpu import envs
+
+    spec = envs.TPU_MINIMAX_M3_INDEXER_PREFILL_OPT
+    opt = PrefillOpt()
+    for item in filter(None, (x.strip() for x in spec.replace("+", ",").split(","))):
+        if item == "unpair":
+            opt = opt._replace(unpair=True)
+        elif item.startswith("chunk") and item[5:] in ("2", "4", "8", "16", "32", "64"):
+            opt = opt._replace(chunk=int(item[5:]))
+        else:
+            raise ValueError(
+                f"TPU_MINIMAX_M3_INDEXER_PREFILL_OPT: unknown item {item!r} in {spec!r}"
+            )
+    if spec and not _PREFILL_OPT_LOGGED:
+        _PREFILL_OPT_LOGGED = True
+        logger.info(
+            "TPU_MINIMAX_M3_INDEXER_PREFILL_OPT=%s on: MSA indexer prefill tiles run "
+            "unpair=%s chunk=%d.",
+            spec,
+            opt.unpair,
+            opt.chunk,
+        )
+    return opt
+
+
 def decode_opt() -> DecodeOpt:
     """Parse `TPU_MINIMAX_M3_INDEXER_DECODE_OPT` (read through envs, at trace
     time): comma-separated ``issue``, ``slots<N>``, ``quad``."""
@@ -418,6 +461,29 @@ def _chunk_maxima(q_pair, page_keys, num_pages, scale_cols=None) -> jax.Array:
         s = s * jnp.where(col < block_q, left, right)
     m = jnp.max(s.reshape(half, page_size, 2 * block_q), axis=1)
     return jnp.concatenate([m[:, :block_q], m[:, block_q:]], axis=0)
+
+
+def _chunk_maxima_unpaired(q, page_keys, num_pages, scale_cols=None) -> jax.Array:
+    """`_chunk_maxima` with one page per MXU row: ``[k_0; ...; k_n] @ q^T``,
+    a contraction of ``D`` against the unpaired ``[Bq, D]`` query tile.
+
+    The paired form streams every key row twice as deep (``2 D``, half of it
+    against zeros) through every ``2 Bq`` result column: its matmul pushes per
+    page are twice these. The products and their f32 sums are the same.
+    """
+    keys = [page_keys(j) for j in range(num_pages)]
+    page_size = keys[0].shape[0]
+    s = jax.lax.dot_general(
+        jnp.concatenate(keys, axis=0),
+        q,
+        (((1,), (1,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )  # [num_pages * S, Bq]
+    if scale_cols is not None:
+        s = s * jnp.concatenate(
+            [scale_cols[:, p : p + 1] for p in range(num_pages)], axis=0
+        )
+    return jnp.max(s.reshape(num_pages, page_size, q.shape[0]), axis=1)
 
 
 # Keys enter the MXU as fp8 in the transposed path: fp8 caches as stored and
@@ -592,9 +658,14 @@ def _chunk_maxima_t4(q_quad, buf, first, chunk, live, issue) -> jax.Array:
     )
 
 
-def _v3_chunk(pages_per_step: int, block_q: int, page_size: int) -> int:
+def _v3_chunk(
+    pages_per_step: int, block_q: int, page_size: int, max_chunk: int = 0
+) -> int:
     """Pages per dot of `_kernel_v3`: the f32 ``[chunk / 2 * S, 2 Bq]``
-    product within twice `_MAX_SCORE_ELEMS`."""
+    product within twice `_MAX_SCORE_ELEMS` (`max_chunk`: a fixed chunk,
+    `PrefillOpt.chunk`)."""
+    if max_chunk:
+        return min(max_chunk, pages_per_step)
     chunk = min(_PAGES_PER_CHUNK, pages_per_step)
     while chunk > 2 and chunk * page_size * block_q > 2 * _MAX_SCORE_ELEMS:
         chunk //= 2
@@ -627,6 +698,8 @@ def _kernel_v3(
     every_count=False,
     token_scores=0,
     lane_maxima=False,
+    unpaired=False,
+    max_chunk=0,
 ):
     """`_kernel_v2` with the pages fetched by a hand-written DMA ring of
     `_RING_SLOTS` groups: one scalar address per page and no copy for pages
@@ -649,7 +722,7 @@ def _kernel_v3(
     block_q = q_ref.shape[0]
     folded = msa_fp4.scales_in_page(rows, cache_ref.dtype)
     page_size = _page_tokens(rows, cache_ref.dtype)
-    chunk = _v3_chunk(pages_per_step, block_q, page_size)
+    chunk = _v3_chunk(pages_per_step, block_q, page_size, max_chunk)
     num_keys = page_table_lib.num_keys(block_tables_ref)
     pages_per_seq = num_keys // seq_pages_ref.shape[0]
     step, num_steps = pl.program_id(0), pl.num_programs(0)
@@ -782,6 +855,9 @@ def _kernel_v3(
         amax = jnp.where(amax > 0, amax, 1.0)
         q_pair = _paired_query((q * (_FP8_Q_MAX / amax)).astype(jnp.float8_e4m3fn))
         row_scale = amax * (1.0 / _FP8_Q_MAX)  # [Bq, 1]
+    elif unpaired:
+        q_pair = q_ref[...].astype(jnp.bfloat16)  # [Bq, D]
+        row_scale = None
     else:
         q_pair = _paired_query(q_ref[...].astype(jnp.bfloat16))
         row_scale = None
@@ -894,7 +970,7 @@ def _kernel_v3(
             k = pltpu.bitcast(w, cache_ref.dtype)
             return k if fp8_q else k.astype(jnp.bfloat16)
 
-        m = _chunk_maxima(
+        m = (_chunk_maxima_unpaired if unpaired else _chunk_maxima)(
             q_pair,
             page_keys,
             chunk,
@@ -1212,7 +1288,15 @@ def _class_scores(
             raise NotImplementedError(
                 "kernel v3 reads 4-bit pages with folded scales only"
             )
-        chunk = _v3_chunk(pages_per_step, block_q, page_size)
+        popt = PrefillOpt()
+        v3_fp8_q = fp8_q and index_cache.dtype in (jnp.float8_e4m3fn, jnp.uint8)
+        if not token_major and not _scores_transposed(
+            block_q, rows_per_page, index_cache.dtype
+        ):
+            popt = prefill_opt()
+            if v3_fp8_q:
+                popt = popt._replace(unpair=False)
+        chunk = _v3_chunk(pages_per_step, block_q, page_size, popt.chunk)
         if pages_per_step % chunk or chunk % 2:
             raise NotImplementedError(
                 f"kernel v3 pairs pages in chunks of up to {_PAGES_PER_CHUNK}: "
@@ -1267,6 +1351,8 @@ def _class_scores(
                 lane_maxima=dopt.lanes
                 and token_major
                 and not (dopt.tail or dopt.quad or dopt.token_scores or fp8_q),
+                unpaired=popt.unpair,
+                max_chunk=popt.chunk,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
