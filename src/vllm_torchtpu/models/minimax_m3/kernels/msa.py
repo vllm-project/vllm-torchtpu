@@ -392,14 +392,20 @@ def _wide_decode_scores(index_q, index_cache, seq_lens, block_tables, index_head
     DCP 4 requests hold at most 512 pages (~192 served), where 512-page
     groups idled most of a group (+22 % on its decode indexer)."""
     rows = index_q.shape[0]
-    pages_per_seq = block_tables.shape[0] // seq_lens.shape[0]
-    wide = (
-        rows > _DECODE_ROWS * index_heads
-        and pages_per_seq > 2 * msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP
-        and not msa_indexer.is_prefill_step(rows, seq_lens.shape[0])
-        and jnp.dtype(index_cache.dtype).itemsize == 1
-    )
-    if not wide:
+    if rows <= _DECODE_ROWS * index_heads or msa_indexer.is_prefill_step(
+        rows, seq_lens.shape[0]
+    ):
+        return 1
+    return wide_groups(index_cache, block_tables.shape[0] // seq_lens.shape[0])
+
+
+def wide_groups(index_cache: jax.Array, pages_per_seq: int) -> int:
+    """`_wide_decode_scores`' group count for decode-sized requests of up to
+    `pages_per_seq` pages, whatever the step."""
+    if (
+        pages_per_seq <= 2 * msa_indexer.DEFAULT_SMALL_PAGES_PER_STEP
+        or jnp.dtype(index_cache.dtype).itemsize != 1
+    ):
         return 1
     if (
         msa_fp4.is_fp4(index_cache)

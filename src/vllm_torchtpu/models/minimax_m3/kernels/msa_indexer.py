@@ -926,6 +926,7 @@ def _class_scores(
     scale_cache=None,
     scale_row=None,
     q_pad=None,
+    slot_bodies=True,
 ):
     """Transposed scores ``[P, tiles * block_q]`` of one tile class, and the
     column of each token (`ClassScores`); `token_major` (kernel v3) returns
@@ -933,7 +934,8 @@ def _class_scores(
     and `tile_major` (kernel v3) as ``[tiles, P, block_q]``, so a tile's
     scores are contiguous.
     The query rows are padded by ``q_pad >= block_q`` rows (default
-    `block_q`): classes sharing it share one padded copy."""
+    `block_q`): classes sharing it share one padded copy.
+    `slot_bodies`: kernel v3's (`_kernel_v3`)."""
     num_tokens, _, head_dim = index_q.shape
     _, rows_per_page, packing, _ = index_cache.shape
     page_size = _page_tokens(rows_per_page, index_cache.dtype)
@@ -1048,7 +1050,9 @@ def _class_scores(
                 f"got {pages_per_step}"
             )
         scores_t = pl.pallas_call(
-            functools.partial(_kernel_v3, transposed=token_major),
+            functools.partial(
+                _kernel_v3, transposed=token_major, slot_bodies=slot_bodies
+            ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=4,
                 grid=grid_spec.grid,

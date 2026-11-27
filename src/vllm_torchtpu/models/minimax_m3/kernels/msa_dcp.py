@@ -1685,6 +1685,14 @@ def _prefill_candidates(
     )(*scalars, work.q_rows, pos, index_cache, small_packed)
 
 
+# The small class's widest page group, in 128-page groups. Served c48 (int4,
+# DCP 2) longbench_v2 lost 40-50 % of its answers to unparsable output with
+# 512-page groups (j-ded2b265: 18/64, 35 unparsed) and kept them at 256
+# (j-014d4310: 36/64), though every kernel case compared bit-identical;
+# decode steps keep their own width (`_wide_decode_scores`).
+_SMALL_CLASS_MAX_GROUPS = 2
+
+
 def _class_candidates(
     folded: jax.Array,
     num_heads: int,
@@ -1740,7 +1748,20 @@ def _class_candidates(
         scale_row=scale_row,
         interpret=interpret,
     )
-    options = msa.block_score_options(num_heads)
+    # The small class's decode requests in `decode_candidates`' wide groups,
+    # over 4-bit pages: 8-bit steps (c4, c16) have 0-3 decode requests, and
+    # an empty small class's one grid step issued and scored a whole wide
+    # group (anvil, one SP half of c4's mixed step: block scores 2.3 -> 3.2
+    # us, against -1.3 us for c16's two decode requests).
+    wide = (
+        min(
+            _SMALL_CLASS_MAX_GROUPS,
+            msa.wide_groups(index_cache, block_tables.shape[0] // seq_lens.shape[0]),
+        )
+        if msa_fp4.is_fp4(index_cache)
+        else 1
+    )
+    options = msa.block_score_options(num_heads, wide)
     plan = class_plan(**options)
     q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
     max_num_seqs = q_lens.shape[0]
@@ -1780,7 +1801,11 @@ def _class_candidates(
         )
         return pack_candidates(s, b)
 
-    small = plan.small()
+    # One body per count, not per ring slot and count: with wide groups the
+    # slot bodies were ~3x the code, and the prefill candidates after them
+    # ran slower (anvil c48 mixed step: block scores 21,672 -> 10,491
+    # bundles, prefill candidates 156.2 -> 140.6 us, as without them).
+    small = plan.small(slot_bodies=wide == 1)
     small_picks = class_picks(small, plan.small_block_q, not plan.token_major)
     prefill_plan = class_plan(**options | {"pages_per_step": _PREFILL_PAGES_PER_STEP})
     fits = functools.partial(
