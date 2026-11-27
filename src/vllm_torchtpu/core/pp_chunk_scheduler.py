@@ -50,7 +50,7 @@ sets none of them is scheduled as before.
 import math
 import time
 from itertools import islice
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
 
@@ -94,6 +94,38 @@ def _wait_seconds(request: Any, now: float) -> float:
     time in ``running``, and does not reset on preemption.
     """
     return max(now - request.arrival_time, 0.0)
+
+
+@runtime_checkable
+class ExternalHitEstimator(Protocol):
+    """A KV connector that estimates how many prompt tokens past a request's
+    local hit a lookup would load from its external tier (the Raiden
+    offloading connector and the TPU multi-connector)."""
+
+    def estimate_external_hit_tokens(
+        self, request: Any, num_local_tokens: int
+    ) -> int: ...
+
+
+@runtime_checkable
+class TransferPoller(Protocol):
+    """A KV connector that completes finished async loads when the scheduler
+    polls it at the start of a step (the TPU multi-connector and the Raiden
+    offloading connector)."""
+
+    def poll_and_complete_transfers(self, scheduler: Any) -> Any: ...
+
+
+@runtime_checkable
+class DivergentHitResolver(Protocol):
+    """A KV connector that decides how much of a diverged local hybrid hit to
+    keep: None keeps the reconciled hit, otherwise the number of local tokens
+    to keep (the TPU multi-connector and the Raiden offloading
+    connector)."""
+
+    def resolve_divergent_local_hit_tokens(
+        self, request: Any, num_local: int, num_reconciled: int, block_size: int
+    ) -> int | None: ...
 
 
 def uses_dynamic_chunks(vllm_config: Any) -> bool:
@@ -224,6 +256,34 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
             options.prefix_aware
             and scheduler_options.get(self.vllm_config).promote_warmest
         )
+        # The connector's host-tier estimate, read by _external_warmth.
+        self._hit_estimator: ExternalHitEstimator | None = (
+            self.connector if isinstance(self.connector, ExternalHitEstimator) else None
+        )
+        # The connector's async-load poll and divergent-hit decision, which
+        # the prefix-aware admission uses.
+        self._transfer_poller: TransferPoller | None = (
+            self.connector if isinstance(self.connector, TransferPoller) else None
+        )
+        self._hit_resolver: DivergentHitResolver | None = (
+            self.connector if isinstance(self.connector, DivergentHitResolver) else None
+        )
+        if self._prefix_aware and self.connector is not None:
+            missing = [
+                name
+                for name, hook in (
+                    ("poll_and_complete_transfers", self._transfer_poller),
+                    ("resolve_divergent_local_hit_tokens", self._hit_resolver),
+                )
+                if hook is None
+            ]
+            if missing:
+                logger.warning(
+                    "Pipeline chunk scheduler: the KV connector %s has no %s; "
+                    "the prefix-aware admission runs without it.",
+                    type(self.connector).__name__,
+                    " or ".join(missing),
+                )
         self._retention: HybridStateRetention | None = None
         # The platform's check refuses the option off a KV producer.
         if options.hybrid_state_retention and self._is_kv_producer:
@@ -309,13 +369,13 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
     # sort on, ``schedule()`` also stable-sorts the first _PAW_SORT_WINDOW
     # requests of ``waiting`` before the base scheduler admits from it, so
     # every admission of the step follows the order. The key is the
-    # request's uncached prompt tokens (prompt minus its HBM prefix hit),
-    # priced quadratically under the option quadratic_cost, minus the aging
-    # rate x seconds waited, which bounds how long a large prompt can be
-    # overtaken. Requests that already hold computed tokens or were
-    # preempted go first, and requests whose admission takes more blocks
-    # than are free (``_blocks_to_admit``) go last, so they cannot stall the
-    # head.
+    # request's estimated uncached prompt tokens (prompt minus local HBM hit
+    # minus a loadable external hit), priced quadratically under the option
+    # quadratic_cost, minus the aging rate x seconds waited, which bounds how
+    # long a large prompt can be overtaken. Requests that already hold
+    # computed tokens or were preempted go first, and requests whose admission
+    # takes more blocks than are free (``_blocks_to_admit``) go last, so they
+    # cannot stall the head.
     # ------------------------------------------------------------------
     _PAW_SORT_LOG_INTERVAL_S = 60.0
     _PAW_SORT_WINDOW = 128
@@ -344,9 +404,16 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
             return
         window = list(islice(queue, self._paw_sort_window))
         free_blocks = self._get_num_free_blocks()
+        # The sort runs on a KV producer only (_init_paw_sort), whose async
+        # loads reserve blocks before the host-tier hit can land.
+        free_blocks_for_ext = max(
+            0, free_blocks - self._inflight_prefill_reserved_blocks()
+        )
         # The step's wall time, the clock _promote_warmest ages on.
         now = self._now()
-        keys = [self._paw_sort_key(r, now, free_blocks) for r in window]
+        keys = [
+            self._paw_sort_key(r, now, free_blocks, free_blocks_for_ext) for r in window
+        ]
         order = sorted(range(len(window)), key=lambda i: (keys[i], i))
         self._paw_sort_steps += 1
         head = window[order[0]]
@@ -379,12 +446,21 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         request: Any,
         now: float,
         free_blocks: int,
+        free_blocks_for_ext: int,
     ) -> tuple[int, int, float, float]:
         """Sort key of the waiting-queue sort, by (effective) uncached
         tokens; lower is admitted first."""
-        warmth = self._prefix_warmth(request)
+        local_warmth = self._prefix_warmth(request)
+        num_tokens = int(request.num_tokens)
+        block_size = self._get_block_size()
         fits_hbm = self._blocks_to_admit(request) <= free_blocks
-        uncached = max(int(request.num_tokens) - warmth, 0)
+        ext_warmth = self._external_warmth(request, local_warmth)
+        if ext_warmth > 0 and not (
+            fits_hbm and math.ceil(ext_warmth / block_size) <= free_blocks_for_ext
+        ):
+            ext_warmth = 0
+        warmth = local_warmth + ext_warmth
+        uncached = max(num_tokens - warmth, 0)
         eff_uncached = self._quad_cost(uncached, warmth)
         aged = eff_uncached - self._get_paw_aging_rate() * _wait_seconds(request, now)
         started = request.num_preemptions > 0 or request.num_computed_tokens > 0
@@ -401,6 +477,36 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
         steps."""
         now = self._step_wall_time
         return time.time() if now is None else now
+
+    def _external_warmth(self, request: Any, local_warmth: int) -> int:
+        """Prompt tokens past ``local_warmth`` the connector expects to load
+        from its external tier (``_hit_estimator``); 0 on a KV consumer,
+        without an estimating connector, or with less than a block past the
+        local hit. A failing estimate counts as 0; it is logged once per
+        exception type (``warning_once`` keys on the arguments, so the request
+        and the exception text go to the debug log instead)."""
+        if self._is_kv_consumer:
+            return 0
+        estimator = self._hit_estimator
+        if estimator is None:
+            return 0
+        if request.num_tokens - local_warmth < self._get_block_size():
+            return 0
+        try:
+            estimate = estimator.estimate_external_hit_tokens(request, local_warmth)
+            return max(0, int(estimate or 0))
+        except Exception as exc:
+            logger.warning_once(
+                "estimate_external_hit_tokens raised %s; a request whose "
+                "estimate fails is ranked by its local prefix hit only.",
+                type(exc).__name__,
+            )
+            logger.debug(
+                "estimate_external_hit_tokens failed for request %s: %r",
+                request.request_id,
+                exc,
+            )
+            return 0
 
     def _rank_and_warmth(
         self,
@@ -442,8 +548,16 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
                 (_TIER_NORMAL, hbm_eff_cost - aging, request.arrival_time),
                 local_warmth,
             )
+        ext_warmth = self._external_warmth(request, 0)
+        if ext_warmth > 0:
+            ext_cold_tokens = max(request.num_tokens - ext_warmth, 0)
+            ext_eff_cost = self._quad_cost(ext_cold_tokens, ext_warmth)
+            return (
+                (_TIER_NORMAL + 1, ext_eff_cost - aging, request.arrival_time),
+                ext_warmth,
+            )
         return (
-            (_TIER_NORMAL + 1, hbm_eff_cost - aging, request.arrival_time),
+            (_TIER_NORMAL + 2, hbm_eff_cost - aging, request.arrival_time),
             0,
         )
 
@@ -528,13 +642,46 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
     def _get_local_prefix_cache_hit(
         self, request: Any, max_cache_hit_length: int | None = None
     ) -> tuple["KVCacheBlocks", int, int, bool]:
-        """With prefix_aware, the admission lookup is answered from a
-        still-exact memo when it can be (as in PrefixAwareScheduler)."""
-        if self._prefix_aware:
-            hit = memo_local_prefix_cache_hit(self, request, max_cache_hit_length)
-            if hit is not None:
-                return hit
-        return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
+        if not self._prefix_aware:
+            return super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
+        hit = memo_local_prefix_cache_hit(self, request, max_cache_hit_length)
+        if hit is not None:
+            request._tpu_local_hit_tokens = hit[1]
+            return hit
+        resolver = self._hit_resolver
+        blocks, num_local, shared_prefix_boundary, hit_diverged = (
+            super()._get_local_prefix_cache_hit(request, max_cache_hit_length)
+        )
+        if hit_diverged and resolver is not None:
+            kvm = self.kv_cache_manager
+            reconciled_blocks, num_reconciled, reconciled_boundary = (
+                kvm.get_computed_blocks(request, max_cache_hit_length)
+            )
+            block_size = self._get_block_size()
+            target_local = resolver.resolve_divergent_local_hit_tokens(
+                request, num_local, num_reconciled, block_size
+            )
+            if target_local is None:
+                request._tpu_local_hit_tokens = num_reconciled
+                return (
+                    reconciled_blocks,
+                    num_reconciled,
+                    reconciled_boundary,
+                    False,
+                )
+            if target_local <= 0:
+                request._tpu_local_hit_tokens = 0
+                return (
+                    kvm.empty_kv_cache_blocks,
+                    0,
+                    reconciled_boundary,
+                    False,
+                )
+            if target_local < num_local:
+                blocks = kvm.truncate_computed_blocks(blocks, target_local)
+                num_local = target_local
+        request._tpu_local_hit_tokens = num_local
+        return blocks, num_local, shared_prefix_boundary, hit_diverged
 
     def install_chunk_limits(
         self, granularity: int, schedule: tuple[int, int, int] | None
@@ -607,6 +754,15 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
 
     def schedule(self, throttle_prefills: bool = False):
         prefix_aware = self._prefix_aware
+        poller = self._transfer_poller
+        if prefix_aware and poller is not None:
+            # Completed async loads promote their requests this step.
+            try:
+                poller.poll_and_complete_transfers(self)
+            except Exception:
+                logger.exception(
+                    "Pipeline chunk scheduler: poll_and_complete_transfers failed."
+                )
         if self._retention is not None:
             try:
                 self._retention.pin_running(self.running)
@@ -692,7 +848,9 @@ class TpuPipelineChunkScheduler(PrefixAwareAdmission):
             return computed
         if not self.kv_cache_manager.enable_caching:
             return 0
-        return max(0, min(self._prefix_warmth(request), _prefill_end(request)))
+        local_warmth = self._prefix_warmth(request)
+        ext_warmth = self._external_warmth(request, local_warmth)
+        return max(0, min(local_warmth + ext_warmth, _prefill_end(request)))
 
     def _pending_step_limit(self) -> int | None:
         """The bucket a step is held to under lone-prompt chunking: the

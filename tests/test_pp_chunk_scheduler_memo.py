@@ -406,6 +406,7 @@ def test_the_prefix_aware_lookup_answers_from_the_memo_as_vllm_does(
     assert scheduler._memo_computes == computes
     assert hit == expected_hit > 0 and not diverged
     assert blocks.get_block_ids() == expected_blocks.get_block_ids()
+    assert returning._tpu_local_hit_tokens == hit
 
 
 def _model(granularity: int = 4) -> StepCostModel:

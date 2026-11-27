@@ -20,6 +20,7 @@ quadratic pricing (option quadratic_cost) off and on. PrefixAwareScheduler
 does not sort.
 """
 
+import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -28,7 +29,9 @@ import pytest
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 
+from vllm_torchtpu.core import pp_chunk_scheduler
 from vllm_torchtpu.core.pp_chunk_scheduler import (
+    ExternalHitEstimator,
     TpuPipelineChunkScheduler,
     _wait_seconds,
 )
@@ -109,7 +112,9 @@ def _scheduler(
     s._paw_scoring_broken = False
     s._is_kv_producer = producer
     s._is_kv_consumer = False
+    s._hit_estimator = None
     s._retention = None
+    s._inflight_prefills = set()
     s._cost = _cost_model() if quadratic else None
     s._quadratic_cost = quadratic
     s.block_size = 2176
@@ -230,6 +235,32 @@ def test_the_fit_tier_counts_blocks_as_allocate_slots_does():
     assert _order_seen_by_base_schedule(s) == ["mid", "small"]
 
 
+def test_external_hit_counts_when_it_fits():
+    now = time.time()
+    reqs = [
+        _req("hbm_mid", 30_000, now - 2),  # 8,000 uncached
+        _req("dram_small", 100_000, now - 1),  # 2,000 uncached after a DRAM load
+    ]
+    s = _scheduler(reqs, {"hbm_mid": 22_000, "dram_small": 10_000})
+    s._hit_estimator = SimpleNamespace(
+        estimate_external_hit_tokens=lambda r, local: 88_000
+        if r.request_id == "dram_small"
+        else 0
+    )
+    assert _order_seen_by_base_schedule(s) == ["dram_small", "hbm_mid"]
+    # Without room for the loaded blocks the DRAM hit does not count.
+    reqs = [_req("hbm_mid", 30_000, now - 2), _req("dram_small", 100_000, now - 1)]
+    s = _scheduler(reqs, {"hbm_mid": 22_000, "dram_small": 10_000})
+    s._hit_estimator = SimpleNamespace(
+        estimate_external_hit_tokens=lambda r, local: 88_000
+        if r.request_id == "dram_small"
+        else 0
+    )
+    s._get_num_free_blocks = lambda: 45
+    s._inflight_prefill_reserved_blocks = lambda: 30  # 15 left < 41 to load
+    assert _order_seen_by_base_schedule(s) == ["hbm_mid", "dram_small"]
+
+
 def test_the_aging_reads_the_arrival_time_directly():
     """The sort key and the promotion's ranking both age a request by
     _wait_seconds. vLLM's Request always has arrival_time: a request without
@@ -287,3 +318,72 @@ def test_prefix_aware_scheduler_itself_does_not_sort():
     # The promotion moved the warmest request to the head and left the rest
     # in arrival order; a sort would have put mid_warm before big_cold.
     assert seen["order"] == ["small_warm", "big_cold", "mid_warm"]
+
+
+# ---------------- the connector's host-tier estimate ----------------
+
+
+class _Estimator:
+    def __init__(self, answer=88_000, fail=False, error=RuntimeError):
+        self.answer = answer
+        self.fail = fail
+        self.error = error
+        self.calls = []
+
+    def estimate_external_hit_tokens(self, request, num_local_tokens):
+        self.calls.append((request.request_id, num_local_tokens))
+        if self.fail:
+            raise self.error(f"store unreachable for {request.request_id}")
+        return self.answer
+
+
+def _warmth_scheduler(estimator, consumer=False):
+    s = TpuPipelineChunkScheduler.__new__(TpuPipelineChunkScheduler)
+    s._is_kv_consumer = consumer
+    s._hit_estimator = estimator
+    s.block_size = 2176
+    return s
+
+
+def test_the_estimate_needs_the_named_interface():
+    # The pipeline chunk scheduler keeps a connector as its estimator only
+    # through this interface (test_pp_scheduler_options checks its __init__).
+    assert isinstance(_Estimator(), ExternalHitEstimator)
+    assert not isinstance(SimpleNamespace(), ExternalHitEstimator)
+
+
+def test_the_estimate_is_asked_past_the_local_hit():
+    estimator = _Estimator()
+    s = _warmth_scheduler(estimator)
+    req = _req("r", 100_000, time.time())
+    assert s._external_warmth(req, 10_000) == 88_000
+    assert estimator.calls == [("r", 10_000)]
+    # Less than a block past the local hit, or a KV consumer: not asked.
+    assert s._external_warmth(req, 100_000 - 2_000) == 0
+    assert _warmth_scheduler(estimator, consumer=True)._external_warmth(req, 0) == 0
+    assert _warmth_scheduler(None)._external_warmth(req, 0) == 0
+    assert estimator.calls == [("r", 10_000)]
+
+
+def test_a_failing_estimate_is_logged_and_counts_as_zero():
+    estimator = _Estimator(fail=True)
+    s = _warmth_scheduler(estimator)
+    # The module's logger resolves lazily to vLLM's logger of this name.
+    log = logging.getLogger("vllm." + pp_chunk_scheduler.__name__)
+    # The real warning_once runs; only the logger's output is captured.
+    with (
+        patch.object(log, "warning") as warn,
+        patch.object(log, "debug") as debug,
+    ):
+        for rid in ("r-fails", "r-fails-too"):
+            assert s._external_warmth(_req(rid, 100_000, time.time()), 0) == 0
+        # Two failures of one kind, with different requests and messages:
+        # one warning, naming the exception type; each failure in the debug
+        # log with its request.
+        warn.assert_called_once()
+        assert "RuntimeError" in warn.call_args.args
+        assert [c.args[1] for c in debug.call_args_list] == ["r-fails", "r-fails-too"]
+        # A different exception type is a different failure: warned once more.
+        estimator.error = ValueError
+        assert s._external_warmth(_req("r-other", 100_000, time.time()), 0) == 0
+        assert warn.call_count == 2 and "ValueError" in warn.call_args.args
