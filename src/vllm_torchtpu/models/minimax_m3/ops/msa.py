@@ -800,41 +800,58 @@ def _get_msa_dcp_fp4_op(
     suffix = (
         f"t{topk}_i{init_blocks}_l{local_blocks}_s{sm_scale:.8f}_dcp{dcp}_g{kv_heads}"
     ).replace(".", "p")
-    score_op = pallas.jax_op(
-        f"pallas::minimax_m3_msa_dcp_fp4_score_{'rot_' if q_rotated else ''}{suffix}",
-        _score_jax,
-        donate_argnums=(
-            _SHARD_KV_CACHE_ARG,
-            _SHARD_INDEX_CACHE_ARG,
-            _DCP_SCALE_CACHE_ARG,
-        ),
-    )
 
-    def _score_fake(k, v, index_q, index_k, kv_cache, index_cache, scale_cache, *args):
-        return (
-            torch.empty_like(kv_cache),
-            torch.empty_like(index_cache),
-            torch.empty_like(scale_cache),
-            torch.empty(
-                (k.shape[0], k.shape[1] * 2 * topk),
-                dtype=torch.float32,
-                device=k.device,
+    def score_op_of(fn: Callable[..., Any], tag: str, rotates: bool) -> Any:
+        """The score op running `fn`; with `rotates` it takes q last and
+        also returns it rotated."""
+        op = pallas.jax_op(
+            f"pallas::minimax_m3_msa_dcp_fp4_score_{tag}{suffix}",
+            fn,
+            donate_argnums=(
+                _SHARD_KV_CACHE_ARG,
+                _SHARD_INDEX_CACHE_ARG,
+                _DCP_SCALE_CACHE_ARG,
             ),
-            *(() if q_rotated else (torch.empty_like(args[-1]),)),
         )
 
-    score_op.register_fake(_score_fake)
+        def fake(k, v, index_q, index_k, kv_cache, index_cache, scale_cache, *args):
+            return (
+                torch.empty_like(kv_cache),
+                torch.empty_like(index_cache),
+                torch.empty_like(scale_cache),
+                torch.empty(
+                    (k.shape[0], k.shape[1] * 2 * topk),
+                    dtype=torch.float32,
+                    device=k.device,
+                ),
+                *((torch.empty_like(args[-1]),) if rotates else ()),
+            )
+
+        op.register_fake(fake)
+        return op
+
+    score_op = score_op_of(_score_jax, "rot_" if q_rotated else "", not q_rotated)
+    # Head-parallel steps (`msa_dcp_heads.head_parallel`) of a group over
+    # several KV heads rotate q in the heads op instead, as it lays q out for
+    # the replica exchange (`msa_dcp_heads.replica_rows`): rotated here, q
+    # left the score op head-major and took transposes to every consumer.
+    late_score_op = (
+        score_op_of(_write_and_score, "late_", False) if kv_heads > 1 else None
+    )
     attend_merge_op = (
         _get_msa_dcp_attend_merge_op(sm_scale, topk, dcp, True, suffix)
         if kv_heads == 1
         else None
     )
-    heads_op = (
-        _get_msa_dcp_heads_op(
-            sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix
+    heads_op, late_heads_op = (
+        (
+            _get_msa_dcp_heads_op(
+                sm_scale, topk, dcp, kv_head_replicas, decode_rows, suffix, rotated
+            )
+            for rotated in (True, False)
         )
         if kv_heads > 1
-        else None
+        else (None, None)
     )
 
     def op(
@@ -858,7 +875,12 @@ def _get_msa_dcp_fp4_op(
             k, v, index_q = gather_group_kv(
                 k, v, index_q, group, dcp, kv_head_replicas, dcp_rank
             )
-        new_kv_cache, new_index_cache, new_scale_cache, candidates, *rotated = score_op(
+        late = late_heads_op is not None and msa_dcp_heads.head_parallel(
+            q.shape[0], metadata.seq_lens.shape[0], decode_rows
+        )
+        new_kv_cache, new_index_cache, new_scale_cache, candidates, *rotated = (
+            late_score_op if late else score_op
+        )(
             k,
             v,
             index_q,
@@ -871,7 +893,7 @@ def _get_msa_dcp_fp4_op(
             metadata.query_start_loc,
             metadata.request_distribution,
             dcp_rank,
-            *(() if q_rotated else (q.contiguous(),)),
+            *(() if q_rotated or late else (q.contiguous(),)),
         )
         if rotated:
             (q,) = rotated
@@ -879,7 +901,7 @@ def _get_msa_dcp_fp4_op(
         index_cache.copy_(new_index_cache)
         scale_cache.copy_(new_scale_cache)
         if heads_op is not None:
-            return heads_op(
+            return (late_heads_op if late else heads_op)(
                 dcp_rank,
                 q,
                 kv_cache,
@@ -1003,11 +1025,13 @@ def _get_msa_dcp_heads_op(
     kv_head_replicas: int,
     decode_rows: int,
     suffix: str,
+    q_rotated: bool = True,
 ) -> Callable[..., torch.Tensor]:
     """The attention half of the 4-bit DCP op over several KV heads, as one
     SPMD op over the DCP mesh (`msa_dcp_heads.attend_and_merge`): its
     collectives run inside the program, so a long step can pick its paths
-    and their sizes from the step's requests."""
+    and their sizes from the step's requests. Without `q_rotated` it takes
+    q unrotated and rotates it itself."""
     from jax.sharding import NamedSharding, PartitionSpec
 
     from vllm_torchtpu.distributed.dcp import DCP_AXIS_NAME, get_or_create_dcp_mesh
@@ -1025,6 +1049,7 @@ def _get_msa_dcp_heads_op(
             topk=topk,
             decode_rows=decode_rows,
             rs_out_precision=envs.TPU_DCP_RS_OUT_PRECISION,
+            q_rotated=q_rotated,
         ),
         mesh=mesh,
         in_specs=specs,
@@ -1061,7 +1086,8 @@ def _get_msa_dcp_heads_op(
 
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
-        f"pallas::minimax_m3_msa_dcp_heads_attend_{suffix}_r{decode_rows}",
+        f"pallas::minimax_m3_msa_dcp_heads_attend_{suffix}_r{decode_rows}"
+        f"{'' if q_rotated else '_qlate'}",
         _attend_jax,
         mesh=mesh,
         input_partition_specs=specs,
