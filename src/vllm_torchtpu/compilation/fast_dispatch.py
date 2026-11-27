@@ -35,7 +35,8 @@ TODO: Remove this module once PyTorch has a public guarded call path for
 Until then it relies on Dynamo internals, checked against torch 2.13.0 (git
 cf30153c4c13): ``torch._C._dynamo.eval_frame._get_cache_entries_for_region``
 and ``_get_total_cache_entry_count``, each cache entry's ``code`` and
-``guard_manager.check``, the compiled wrapper's ``_isolate_recompiles_id``,
+``guard_manager.check`` and ``cache_entry`` (None once Dynamo invalidates or
+frees the entry), the compiled wrapper's ``_isolate_recompiles_id``,
 ``torch._dynamo.eval_frame._stance``, and calling an entry's transformed code
 object directly. A torch upgrade must re-check them.
 """
@@ -138,6 +139,11 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
             mru_idx = -1
             for entry in entries:
                 ecode = entry.code
+                if ecode is None:
+                    # Dynamo invalidated this entry (an object one of its
+                    # guards holds by id died): it keeps its place in the
+                    # list, with no code, and is never run again.
+                    continue
                 if (
                     ecode.co_freevars != freevars
                     or ecode.co_argcount != code.co_argcount
@@ -195,6 +201,13 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                 f_locals = _f_locals(args, kwargs)
                 if f_locals is not None and _entry_count(code) == state["count"]:
                     for idx, (gm, direct) in enumerate(entries):
+                        # A dead entry (invalidated, or freed by
+                        # torch._dynamo.reset()) can leave the entry count
+                        # unchanged, or a later compile can restore it, while
+                        # its guards still pass: Dynamo sets the guard
+                        # manager's cache_entry to None, so never run it.
+                        if gm.cache_entry is None:
+                            continue
                         if gm.check(f_locals):
                             if idx > 0:
                                 entries.insert(0, entries.pop(idx))

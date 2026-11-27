@@ -21,6 +21,7 @@ entries.
 """
 
 import functools
+import gc
 import os
 import subprocess
 import sys
@@ -284,6 +285,96 @@ def test_fast_dispatch_keeps_every_compiled_entry():
         assert torch.equal(wrapped(x), x * 2 + 1)
     fast, slow = (a - b for a, b in zip(fast_dispatch._STATS, before))
     assert (fast, slow) == (4, 2)
+
+
+def test_fast_dispatch_skips_an_entry_freed_by_a_reset():
+    """torch._dynamo.reset() frees every cache entry, and a later compile by
+    another caller (here the disarmed wrapper's own call) brings the entry
+    count back to the one the wrapper recorded. The guards of the wrapper's
+    kept entry still pass, but that entry is dead: the wrapper must run the
+    new one. The backend tags each compiled program to tell them apart."""
+    compiles, runs = [], []
+
+    def tagging_backend(gm, example_inputs):
+        tag = len(compiles)
+        compiles.append(tag)
+
+        def run(*args):
+            runs.append(tag)
+            return gm.forward(*args)
+
+        return run
+
+    def f(x):
+        return x * 2 + 1
+
+    compiled = torch.compile(f, backend=tagging_backend, fullgraph=True, dynamic=False)
+    wrapped = fast_dispatch._wrap(compiled, f)
+    x = torch.arange(4.0)
+    fast_dispatch.configure(fast=True, drop_global_state=False)
+    for _ in range(2):
+        assert torch.equal(wrapped(x), x * 2 + 1)
+    assert runs == [0, 0]
+    assert wrapped._fast_dispatch_state["count"] == 1
+
+    torch._dynamo.reset()
+    fast_dispatch.configure(fast=False, drop_global_state=False)
+    assert torch.equal(wrapped(x), x * 2 + 1)
+    assert runs[-1] == 1  # the program compiled after the reset
+    assert fast_dispatch._entry_count(f.__code__) == 1  # the count is back
+
+    fast_dispatch.configure(fast=True, drop_global_state=False)
+    before = list(fast_dispatch._STATS)
+    for _ in range(3):
+        assert torch.equal(wrapped(x), x * 2 + 1)
+    assert runs[-3:] == [1, 1, 1]
+    fast, slow = (a - b for a, b in zip(fast_dispatch._STATS, before))
+    # The dead entry is skipped: one call through Dynamo refreshes the
+    # entries, then the new entry is dispatched directly.
+    assert (fast, slow) == (2, 1)
+
+
+def test_fast_dispatch_skips_an_invalidated_entry():
+    """Dynamo invalidates a cache entry when an object one of its guards holds
+    by id dies: here the class of an argument, which its type guard holds.
+    The entry keeps its place in the code object's list, with no code, and the
+    entry count does not change. The wrapper must not run it, and must keep
+    dispatching directly once the next compile adds an entry beside it."""
+
+    def f(x, o):
+        return x * o.k
+
+    def instance(k):
+        class C:
+            pass
+
+        C.k = k
+        return C()
+
+    wrapped = _compiled(f)
+    fast_dispatch.configure(fast=True, drop_global_state=False)
+    x = torch.arange(4.0)
+    o = instance(2)
+    for _ in range(2):
+        assert torch.equal(wrapped(x, o), x * 2)
+    [(kept_guards, _)] = wrapped._fast_dispatch_state["entries"]
+    del o
+    gc.collect()
+    assert kept_guards.cache_entry is None  # Dynamo invalidated the entry
+    assert fast_dispatch._entry_count(f.__code__) == 1
+
+    o = instance(3)
+    before = list(fast_dispatch._STATS)
+    for _ in range(3):
+        assert torch.equal(wrapped(x, o), x * 3)
+    fast, slow = (a - b for a, b in zip(fast_dispatch._STATS, before))
+    # Dynamo compiles the new class's entry; the refresh that follows skips
+    # the invalidated one, and the next calls dispatch directly.
+    assert (fast, slow) == (2, 1)
+    state = wrapped._fast_dispatch_state
+    assert not state["disabled"]
+    assert len(state["entries"]) == 1
+    assert all(gm.cache_entry is not None for gm, _ in state["entries"])
 
 
 def test_fast_dispatch_runs_each_closure_with_its_own_cells(monkeypatch):
