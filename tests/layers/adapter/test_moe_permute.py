@@ -183,8 +183,11 @@ def test_sources_and_validation(tmp_path):
         mp.load_source("builtin:does_not_exist")
 
 
-def test_builtin_table_is_valid():
-    data = mp.load_source("builtin:minimax_m31_agentx_perm")
+@pytest.mark.parametrize(
+    "name", ["minimax_m31_agentx_perm", "minimax_m31_agentx_prefill_k13"]
+)
+def test_builtin_table_is_valid(name):
+    data = mp.load_source(f"builtin:{name}")
     assert len(data) == 57
     for key, perm in data.items():
         assert key.startswith("moe")
@@ -366,3 +369,43 @@ def test_permuted_router_emits_physical_ids(monkeypatch, seed):
     torch.testing.assert_close(wp, w, rtol=0, atol=0)
     got = _ep_moe(x, phys, wp, w1_local, w2_local, starts)
     torch.testing.assert_close(got, base, rtol=1e-12, atol=1e-12)
+
+
+def test_per_pair_outputs_are_bitwise_and_only_rank_grouping_changes(monkeypatch):
+    """A permutation moves whole (token, expert) pairs between ranks: every
+    pair's weighted expert output is bitwise the linear one; only which rank's
+    partial sum holds it changes (float32, the rank-grouped sum agrees to
+    rounding)."""
+    torch.manual_seed(0)
+    num_logical, ep, topk, hidden, inter, tokens = 32, 4, 4, 16, 8, 64
+    local = num_logical // ep
+    perm = _perm(num_logical, 3)
+    x = torch.randn(tokens, hidden)
+    w1 = torch.randn(num_logical, hidden, 2 * inter) * 0.2
+    w2 = torch.randn(num_logical, inter, hidden) * 0.2
+    ids = torch.stack([torch.randperm(num_logical)[:topk] for _ in range(tokens)])
+    w = torch.rand(tokens, topk)
+
+    def pairs(slot_of, weights_of):
+        out, parts = {}, torch.zeros(ep, tokens, hidden)
+        for t in range(tokens):
+            for k in range(topk):
+                e = int(ids[t, k])
+                slot = slot_of[e]
+                h = x[t] @ weights_of[0][slot]
+                g, u = h.chunk(2)
+                y = w[t, k] * ((torch.nn.functional.silu(g) * u) @ weights_of[1][slot])
+                out[(t, e)] = y
+                parts[slot // local, t] += y
+        return out, parts.sum(0)
+
+    lin_pairs, lin_sum = pairs(list(range(num_logical)), (w1, w2))
+    inv = [0] * num_logical
+    for e, p in enumerate(perm):
+        inv[p] = e
+    phys_w = (w1[inv], w2[inv])  # physical slot p holds logical inv[p]
+    perm_pairs, perm_sum = pairs(perm, phys_w)
+    assert lin_pairs.keys() == perm_pairs.keys()
+    for key, y in lin_pairs.items():
+        assert torch.equal(perm_pairs[key], y), key
+    torch.testing.assert_close(perm_sum, lin_sum, rtol=1e-5, atol=1e-5)
