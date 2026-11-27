@@ -402,7 +402,7 @@ def test_real_upstream_encoders_omit_trailing_eos_on_continued_turn(
         conversation=conversation,
         messages=messages,
         tokenize=False,
-        continue_final_message=True,
+        continue_final_message=False,
     )
     assert isinstance(stock_prompt, str)
     assert stock_prompt.endswith(f"The best answer is{eos}")

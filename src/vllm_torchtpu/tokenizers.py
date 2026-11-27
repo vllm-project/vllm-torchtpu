@@ -99,6 +99,11 @@ class TpuDeepseekV4Tokenizer(TokenizerLike):
         )
 
 
+# TODO(vllm v0.34.0): Delete TpuDeepseekV41Tokenizer and the "deepseek_v41"
+# registration below once pinned to vLLM v0.34.0 (vllm-project/vllm#62729),
+# where encode_messages in vllm/tokenizers/deepseek_v41_encoding.py honors
+# continue_final_message directly (popping it in _TpuDeepseekV4Tokenizer
+# would otherwise bypass upstream handling).
 class TpuDeepseekV41Tokenizer(TokenizerLike):
     """Registry entry point for ``tokenizer_mode=deepseek_v41``."""
 

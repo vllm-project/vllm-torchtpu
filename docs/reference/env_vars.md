@@ -23,6 +23,7 @@ At startup, `vllm-torchtpu` reports set environment variables that neither vLLM 
 | `TPU_LIBRARY_PATH` | `None` | `libtpu.so` loaded by the TPU runtime. `import libtpu` sets it to the pip package's own library. A custom path (any other file) takes precedence over an installed `libtpu` package: a fingerprint of that file replaces the package version in the compile and Raiden layout cache keys, and the minimum libtpu version check is skipped. |
 | `VLLM_TPU_EXPERIMENTAL_USE_RUST` | `False` | Opt-in. Serves models with the native Rust runtime (`rvllm`) directly behind `vllm serve` (covers both HTTP frontend and engine backend). Off by default until feature parity. Cannot be combined with `VLLM_USE_RUST_FRONTEND`. |
 | `VLLM_TPU_EXPERIMENTAL_RVLLM_BINARY` | `""` | The `rvllm` binary to run when `VLLM_TPU_EXPERIMENTAL_USE_RUST` is enabled. Takes the same values as the launcher's `--rvllm-binary`: a binary's path, or a location (`gs://`, `https://` or a directory) holding `rvllm` and its `metadata.json`. When unset, `rvllm` is looked up on `PATH`. |
+| `TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE` | `False` | Registers TPU tokenizer wrappers for `deepseek_v4` and `deepseek_v41` tokenizer modes so `continue_final_message=True` marks a trailing assistant turn with `wo_eos` to omit the trailing EOS token. Off by default to match stock vLLM; set to `1` for workloads/evals with prefilled assistant turns. |
 
 ---
 
