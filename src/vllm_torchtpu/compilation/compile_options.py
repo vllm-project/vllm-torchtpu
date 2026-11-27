@@ -18,7 +18,7 @@
 Every option defaults to off, which is main's behaviour. The section stays in
 the compile-cache key, as every ``additional_config`` section that is not
 diagnostics-only does. The options act on the functions compiled with
-``fast_dispatch.tpu_compile``. The worker applies them with :func:`apply` when
+``decorators.tpu_compile``. The worker applies them with :func:`apply` when
 it is built, before any compiled function runs; until then those functions
 behave as plain ``torch.compile`` ones.
 """

@@ -31,7 +31,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm_torchtpu.compilation import compile_options, fast_dispatch
+from vllm_torchtpu.compilation import compile_options, decorators, fast_dispatch
 from vllm_torchtpu.compilation.compile_options import CompileOptions
 
 
@@ -53,7 +53,7 @@ def _config(section=None):
 def _compiled(fn):
     """What tpu_compile builds for a function, on the eager backend."""
     compiled = torch.compile(fn, backend="eager", fullgraph=True, dynamic=False)
-    return fast_dispatch._wrap(compiled, fn)
+    return fast_dispatch.wrap(compiled, fn)
 
 
 def _calls(wrapped, n):
@@ -136,7 +136,7 @@ def test_tpu_compile_compiles_as_main_does_and_wraps(monkeypatch):
     def f(x):
         return x * 2 + 1
 
-    wrapped = fast_dispatch.tpu_compile(f)
+    wrapped = decorators.tpu_compile(f)
     # Main's arguments and nothing else: no guard filter, so Dynamo builds
     # each compile's guards once (torch 2.13.0 builds them twice when a
     # guard_filter_fn is given) and keeps all of them.
@@ -158,7 +158,7 @@ def test_tpu_compile_returns_the_function_when_dynamo_is_disabled(monkeypatch):
     def f(x):
         return x * 2 + 1
 
-    assert fast_dispatch.tpu_compile(f) is f
+    assert decorators.tpu_compile(f) is f
 
 
 def test_decorated_modules_import_with_dynamo_disabled():
@@ -200,7 +200,7 @@ def test_tpu_compile_takes_only_plain_functions(target):
     else:
         model = functools.partial(lambda x: x)
     with pytest.raises(TypeError, match="plain function"):
-        fast_dispatch.tpu_compile(model)
+        decorators.tpu_compile(model)
 
 
 def test_disarmed_wrapper_only_calls_the_compiled_function():
@@ -304,7 +304,7 @@ def test_fast_dispatch_skips_an_entry_freed_by_a_reset():
         return x * 2 + 1
 
     compiled = torch.compile(f, backend=tagging_backend, fullgraph=True, dynamic=False)
-    wrapped = fast_dispatch._wrap(compiled, f)
+    wrapped = fast_dispatch.wrap(compiled, f)
     x = torch.arange(4.0)
     fast_dispatch.configure(fast=True)
     for _ in range(2):
@@ -381,7 +381,7 @@ def test_fast_dispatch_runs_each_closure_with_its_own_cells(monkeypatch):
     _stand_in_compile(monkeypatch)
 
     def make(scale, offset):
-        @fast_dispatch.tpu_compile
+        @decorators.tpu_compile
         def run(x):
             return x * scale + offset
 
@@ -422,7 +422,7 @@ def test_fast_dispatch_binds_self_for_a_decorated_method(monkeypatch):
             self.scale = scale
             self.offset = offset
 
-        @fast_dispatch.tpu_compile
+        @decorators.tpu_compile
         def apply(self, x, shift=0):
             return x * self.scale + self.offset + shift
 
@@ -449,7 +449,7 @@ def test_a_global_state_change_compiles_a_second_entry(monkeypatch):
     and once armed each thread count dispatches directly to its own entry."""
     _stand_in_compile(monkeypatch)
 
-    @fast_dispatch.tpu_compile
+    @decorators.tpu_compile
     def g(x):
         return x * 2 + 1
 

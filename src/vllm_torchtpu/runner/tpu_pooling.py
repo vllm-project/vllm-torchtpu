@@ -40,7 +40,7 @@ from vllm.utils.torch_utils import async_tensor_h2d
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 
 
 class PromptTokenIdsTensor(torch.Tensor):

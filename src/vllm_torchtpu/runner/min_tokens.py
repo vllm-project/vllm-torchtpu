@@ -52,7 +52,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 
 if TYPE_CHECKING:
     from vllm import SamplingParams

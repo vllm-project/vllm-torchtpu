@@ -19,7 +19,7 @@ import jax
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 
 
 # Without this op, vLLM's activate_adapter writes an adapter one stacked tensor

@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from vllm_torchtpu.compilation.fast_dispatch import tpu_compile
+from vllm_torchtpu.compilation.decorators import tpu_compile
 from vllm_torchtpu.layers.core.attention_metadata import stage_h2d_upload
 
 if TYPE_CHECKING:
