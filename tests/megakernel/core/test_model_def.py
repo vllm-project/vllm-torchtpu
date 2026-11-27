@@ -24,6 +24,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from tests.megakernel.core.megakernel_fakes import TINY_TILES
@@ -64,10 +65,11 @@ from vllm_torchtpu.megakernel.core.modules import (
     MoEModule,
     Norm,
 )
-from vllm_torchtpu.megakernel.core.ops import BF16, F32, I32, round_bf16
+from vllm_torchtpu.megakernel.core.ops import BF16, F32, I32, rmsnorm, round_bf16
 from vllm_torchtpu.megakernel.core.pool import PoolBackend, with_cache
 from vllm_torchtpu.megakernel.core.profile import DEFAULT_PROFILE, Profile
 from vllm_torchtpu.megakernel.core.spec import ModelSpec, Module, SwitchSlot
+from vllm_torchtpu.megakernel.core.weights.spec_inputs import random_spec_inputs
 
 
 @pytest.fixture()
@@ -990,6 +992,174 @@ def test_synthetic_model_def_every2_spec_reference_and_override_errors(
         ) as fn_exc:
             fn_call()
         assert "layer " not in str(fn_exc.value)
+
+
+def test_model_def_random_reference_step_matches_independent_loop_and_norm_renames(
+    isolated_model_registry,
+):
+    """`reference_step` with random non-zero weights matches an independent loop
+    across `T=1`, `T=2` verify, `pool_io=True`, and `Norm.bind(..., rename=...)`."""
+    hf_cfg = {
+        "hidden_size": 256,
+        "num_hidden_layers": 4,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 500_000.0,
+        "partial_rotary_factor": 0.25,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 256,
+        "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "num_experts": 128,
+        "num_experts_per_tok": 2,
+        "moe_intermediate_size": 256,
+        "shared_expert_intermediate_size": 256,
+    }
+
+    @register_model(name="synth_rand_ref")
+    class SynthRandRef(ModelDef):
+        default_hf_config = hf_cfg
+        geometry = FromHF(
+            hidden="hidden_size",
+            layers="num_hidden_layers",
+            eps="rms_norm_eps",
+            rope_theta="rope_theta",
+            rope_partial=("partial_rotary_factor", 1.0),
+        )
+        attn = GQA.bind(
+            prefix="self_attn",
+            heads="num_attention_heads",
+            kv_heads="num_key_value_heads",
+            head_dim="head_dim",
+            qk_norm=True,
+            output_gate=True,
+        )
+        linear = GDN.bind(
+            prefix="linear_attn",
+            k_heads="linear_num_key_heads",
+            v_heads="linear_num_value_heads",
+            k_dim="linear_key_head_dim",
+            v_dim="linear_value_head_dim",
+            conv_kernel="linear_conv_kernel_dim",
+        )
+        moe = MoE.bind(
+            prefix="mlp",
+            experts="num_experts",
+            top_k="num_experts_per_tok",
+            inter="moe_intermediate_size",
+            shared_inter="shared_expert_intermediate_size",
+            shared_gate=True,
+        )
+        schedule = Schedule(
+            mixer=Every(n=2, last=attn, rest=linear),
+            ffn=moe,
+            pre_norm=Norm.bind(
+                "input_layernorm",
+                zero_centered=True,
+                rename={"in_norm": "renamed_pre_ln"},
+            ),
+            post_norm=Norm.bind(
+                "post_attention_layernorm",
+                zero_centered=True,
+                rename={"post_norm": "renamed_post_ln"},
+            ),
+        )
+        final_norm = Norm.bind(
+            "model.norm",
+            zero_centered=True,
+            rename={"final_norm": "renamed_final_ln"},
+        )
+
+    g = SynthRandRef.derive_geometry(hf_cfg)
+    ms = SynthRandRef.to_model_spec(g, R=2)
+
+    for t_val, pool_io in ((1, False), (2, True)):
+        ex = ExecSpec(R=2, B=2 * t_val, T=t_val, ctx=128, interpret=True)
+        pos, hid, w_spec, st_in = random_spec_inputs(
+            jax.random.PRNGKey(30 + t_val), ms, ex
+        )
+        spec_out, spec_st = reference.spec_reference_step(
+            ms, g, ex, pos, hid, w_spec, st_in, paged_kv=pool_io, pool_io=pool_io
+        )
+        # Move norm weights under their renamed keys and poison default keys so
+        # dropping `rename` in `composed_reference_step` would produce wrong values.
+        w_renamed = dict(w_spec)
+        w_renamed["renamed_pre_ln"] = w_renamed.pop("in_norm")
+        w_renamed["renamed_post_ln"] = w_renamed.pop("post_norm")
+        w_renamed["renamed_final_ln"] = w_renamed.pop("final_norm")
+        w_renamed["in_norm"] = jnp.full_like(w_renamed["renamed_pre_ln"], 99.0)
+        w_renamed["post_norm"] = jnp.full_like(w_renamed["renamed_post_ln"], -77.0)
+        w_renamed["final_norm"] = jnp.full_like(w_renamed["renamed_final_ln"], 55.0)
+
+        got_out, got_st = SynthRandRef.reference_step(
+            g, ex, pos, hid, w_renamed, st_in, paged_kv=pool_io, pool_io=pool_io
+        )
+        assert not jnp.allclose(got_out, 0.0)
+        np.testing.assert_array_equal(np.asarray(got_out), np.asarray(spec_out))
+        assert set(got_st) == set(spec_st)
+        for k in spec_st:
+            np.testing.assert_array_equal(np.asarray(got_st[k]), np.asarray(spec_st[k]))
+
+        # Manual per-layer loop calling module `.reference()` directly (note:
+        # `prepare_reference_step_state` and `finalize_reference_step_state`
+        # are shared with `composed_reference_step`, so this checks per-layer
+        # norm/module dispatch and residual rounding).
+        gqa_ref = GQAModule(geometry=g, qk_norm=True, output_gate=True)
+        gdn_ref = GDNModule(geometry=g)
+        moe_ref = MoEModule(geometry=g, shared_gate=True)
+        step_st, c_in, r_in, ngdn, vh, kd, vd = reference.prepare_reference_step_state(
+            st_in, g, ex, pool_io=pool_io, include_gdn_defaults=True
+        )
+        res = hid[: ex.B].astype(F32)
+        for lyr in range(g.L):
+            x_m = rmsnorm(
+                res, w_renamed["renamed_pre_ln"][lyr], g.eps, zero_centered=True
+            )
+            if (lyr + 1) % g.att_every == 0:
+                m_d, step_st = gqa_ref.reference(
+                    w_spec,
+                    x_m,
+                    step_st,
+                    g=g,
+                    ex=ex,
+                    pos=pos,
+                    att_idx=lyr // g.att_every,
+                    layer_idx=lyr,
+                    paged_kv=pool_io,
+                )
+            else:
+                m_d, step_st = gdn_ref.reference(
+                    w_spec,
+                    x_m,
+                    step_st,
+                    g=g,
+                    ex=ex,
+                    gdn_idx=lyr - lyr // g.att_every,
+                    layer_idx=lyr,
+                    multi_layer=True,
+                )
+            res = round_bf16(res + m_d)
+            x_f = rmsnorm(
+                res, w_renamed["renamed_post_ln"][lyr], g.eps, zero_centered=True
+            )
+            f_d, step_st = moe_ref.reference(
+                w_spec, x_f, step_st, g=g, ex=ex, layer_idx=lyr
+            )
+            res = round_bf16(res + f_d)
+        manual_out = rmsnorm(
+            res, w_renamed["renamed_final_ln"], g.eps, zero_centered=True
+        ).astype(BF16)
+        manual_st = reference.finalize_reference_step_state(
+            step_st, c_in, r_in, ngdn, vh, kd, vd, ex, pool_io=pool_io
+        )
+        np.testing.assert_array_equal(np.asarray(got_out), np.asarray(manual_out))
+        for k in manual_st:
+            np.testing.assert_array_equal(
+                np.asarray(got_st[k]), np.asarray(manual_st[k])
+            )
 
 
 def test_derive_regressions_sigmoid_moe_overrides_shrink_rope_and_experts(

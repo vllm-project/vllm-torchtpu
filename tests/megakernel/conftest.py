@@ -473,6 +473,28 @@ def pytest_configure(config: pytest.Config) -> None:
     register_megakernel_cpu_plugin(config)
 
 
+def tpu_mesh(R: int) -> Any:
+    """Return an `R`-device TPU `Mesh`, skipping only when TPU is absent or busy."""
+    import numpy as np
+    from jax.sharding import Mesh
+
+    devs = _probe_tpu_devices()
+    if len(devs) < R:
+        pytest.skip(f"Requires >= {R} TPU devices, found {len(devs)}")
+    return Mesh(np.asarray(devs[:R]), ("tp",))
+
+
+def host_device(fallback: Any) -> Any:
+    """Prefer CPU for reference input construction when available, else `fallback`."""
+    import jax
+
+    try:
+        cpu_devs = jax.devices("cpu")
+    except RuntimeError:
+        cpu_devs = []
+    return cpu_devs[0] if cpu_devs else fallback
+
+
 @pytest.fixture
 def fake_ex() -> ExecSpec:
     return ExecSpec(B=4, T=1, R=2, ctx=256, tiles=TINY_TILES, interpret=True)
