@@ -186,6 +186,7 @@ def test_kda_reshard_matches_rank_blocked_kernel_layout(
                 page_tokens=manifest.storages[0].shape[1] * packing,
                 state_fragment_heads=local_heads,
                 state_fragments=fragments,
+                rope_in_graph=True,
                 layout_getter=lambda tensor: (
                     [3, 2, 1, 0],
                     [[packing, 128], [packing, 1]],
@@ -253,6 +254,7 @@ def _kimi_fingerprint(kv_dtype):
         page_tokens=manifest.storages[0].shape[1] * packing,
         state_fragment_heads=3,
         state_fragments=1,
+        rope_in_graph=True,
         layout_getter=lambda tensor: (
             [3, 2, 1, 0],
             [[packing, 128], [packing, 1]],

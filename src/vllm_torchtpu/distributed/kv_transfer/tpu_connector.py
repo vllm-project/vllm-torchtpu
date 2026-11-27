@@ -66,6 +66,7 @@ if TYPE_CHECKING:
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs as tpu_envs
+from vllm_torchtpu import rope_in_graph_flag
 from vllm_torchtpu.distributed.kv_transfer.connector_metadata import (
     LoadMeta,
     ReqId,
@@ -2787,27 +2788,29 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _measure_raiden_dsv4_layout(
-        manifest: Any,
+        manifest: Any, *, rope_in_graph: bool
     ) -> tuple[str, dict[str, Any]]:
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             measured_dsv4_layout_fingerprint,
         )
 
-        return measured_dsv4_layout_fingerprint(manifest)
+        return measured_dsv4_layout_fingerprint(manifest, rope_in_graph=rope_in_graph)
 
     @staticmethod
     def _measure_raiden_fa_layout(
-        manifest: Any, block_major: bool = False
+        manifest: Any, block_major: bool = False, *, rope_in_graph: bool
     ) -> tuple[str, dict[str, Any]]:
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             measured_fa_layout_fingerprint,
         )
 
-        return measured_fa_layout_fingerprint(manifest, block_major=block_major)
+        return measured_fa_layout_fingerprint(
+            manifest, block_major=block_major, rope_in_graph=rope_in_graph
+        )
 
     @staticmethod
     def _measure_raiden_glm_layout(
-        manifest: Any, page_tokens: int
+        manifest: Any, page_tokens: int, *, rope_in_graph: bool
     ) -> tuple[str, dict[str, Any]]:
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             measured_glm_layout_fingerprint,
@@ -2818,13 +2821,17 @@ class TPURaidenConnectorWorker:
         return measured_glm_layout_fingerprint(
             manifest,
             page_tokens=page_tokens,
+            rope_in_graph=rope_in_graph,
             hash_indexer=not _use_per_layer_pool_tags(),
         )
 
     def _measure_stage3_layout(self, manifest: Any) -> tuple[str, dict[str, Any], int]:
         """Layout identity and page geometry of the admitted model."""
+        rope_in_graph = rope_in_graph_flag.in_graph_enabled(self.vllm_config)
         if _use_raiden_dsv4_admission():
-            fingerprint, payload = self._measure_raiden_dsv4_layout(manifest)
+            fingerprint, payload = self._measure_raiden_dsv4_layout(
+                manifest, rope_in_graph=rope_in_graph
+            )
             # DSv4's roles page at different sizes, so the page_tokens the
             # controller registers is nominal. The real per-tag geometry
             # travels in the fingerprint and in each span registration.
@@ -2855,12 +2862,13 @@ class TPURaidenConnectorWorker:
                 page_tokens=page_tokens,
                 state_fragment_heads=total_heads // source_tp,
                 state_fragments=source_tp // self.tp_size,
+                rope_in_graph=rope_in_graph,
             )
             return fingerprint, payload, page_tokens
         if _use_raiden_glm_admission():
             page_tokens = int(self.vllm_config.cache_config.block_size)
             fingerprint, payload = self._measure_raiden_glm_layout(
-                manifest, page_tokens
+                manifest, page_tokens, rope_in_graph=rope_in_graph
             )
             return fingerprint, payload, page_tokens
         if _raiden_seq_on_lane_layout():
@@ -2869,7 +2877,9 @@ class TPURaidenConnectorWorker:
                 sol_fa_page_tokens,
             )
 
-            fingerprint, payload = measured_sol_layout_fingerprint(manifest)
+            fingerprint, payload = measured_sol_layout_fingerprint(
+                manifest, rope_in_graph=rope_in_graph
+            )
             return fingerprint, payload, sol_fa_page_tokens(manifest)
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             fa_page_tokens,
@@ -2877,7 +2887,9 @@ class TPURaidenConnectorWorker:
 
         assert self.runner is not None
         fingerprint, payload = self._measure_raiden_fa_layout(
-            manifest, block_major=self.runner.bm_pool_layout is not None
+            manifest,
+            block_major=self.runner.bm_pool_layout is not None,
+            rope_in_graph=rope_in_graph,
         )
         return fingerprint, payload, fa_page_tokens(manifest)
 

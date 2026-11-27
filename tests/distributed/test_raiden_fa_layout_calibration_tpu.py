@@ -231,7 +231,9 @@ def _run_qwen35_fa_raw_token_range_identity_tpu():
         assert pool.block_stride_bytes == case.block_stride_bytes
         assert pool.live_bytes_per_block == case.block_stride_bytes
 
-        fingerprint, payload = rlf.measured_fa_layout_fingerprint(manifest)
+        fingerprint, payload = rlf.measured_fa_layout_fingerprint(
+            manifest, rope_in_graph=True
+        )
         fingerprints.add(fingerprint)
         fingerprint_payload = payload
         minor_to_major, tiles, raw_bits = layout_api.get_device_layout_if_materialized(
