@@ -38,7 +38,7 @@ def derive_metadata(
     state_block_size: int,
     head_dim: int,
     overlap: bool,
-    cos_sin_cache: jax.Array | None,
+    cos_sin: jax.Array | None,
     state_cache: jax.Array | None = None,
     seq_along_lane: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -68,7 +68,7 @@ def derive_metadata(
         tail rows unused.
       head_dim: Dimensionality of attention heads.
       overlap: Whether to use overlap (CSA path).
-      cos_sin_cache: [max_pos, rope_head_dim] or None. RoPE cos/sin cache.
+      cos_sin: [num_tokens, rope_head_dim] or None. Per-token RoPE cos/sin.
       state_cache: [num_pages, state_page_size, 4, lanes] uint8, or None when the
         state shares ``cache``'s buffer. Only its shape is read here.
       seq_along_lane: ``cache`` is the SEQ_ALONG_LANE indexer array.
@@ -80,7 +80,7 @@ def derive_metadata(
         SEQ_ALONG_LANE it is ``page * SAL_PAGE_SIZE + lane``).
     """
     num_tokens = positions.shape[0]
-    rope_head_dim = cos_sin_cache.shape[1] if cos_sin_cache is not None else 0
+    rope_head_dim = cos_sin.shape[1] if cos_sin is not None else 0
     state_source = cache if state_cache is None else state_cache
 
     cfgs = config.Configs.make(
@@ -165,11 +165,18 @@ def prepare_boundary_batch(
     compress_ratio: int,
     num_reqs: int,
     rope_pack: int = 4,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    cos_sin: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
     """Generates a combined batch of boundary tokens in a single scatter.
 
     Layout: [ decode_packed (0..K-1) | pad (K..K_aligned-1) |
     prefill_row_tiled (K_aligned..) | pad ]
+
+    Returns:
+      Tuple ``(positions, req_indices, kv_slot_mapping, boundary_cos_sin)``.
+      ``boundary_cos_sin`` is ``None`` when ``cos_sin`` is ``None``; otherwise
+      its pad rows are zero (``cos = sin = 0``), unlike the legacy table reader
+      which read row 0 for zero-padded positions.
     """
     num_tokens = positions.shape[0]
     max_prefill_boundary = num_tokens // compress_ratio + 1 + num_reqs
@@ -219,10 +226,21 @@ def prepare_boundary_batch(
             .set(src, mode="drop")
         )
 
+    if cos_sin is not None:
+        packed_cos_sin = jnp.where(valid[:, None], cos_sin[safe], 0.0)
+        boundary_cos_sin = (
+            jnp.zeros((output_size, cos_sin.shape[1]), dtype=cos_sin.dtype)
+            .at[dest]
+            .set(packed_cos_sin, mode="drop")
+        )
+    else:
+        boundary_cos_sin = None
+
     return (
         scatter(0, pos),
         scatter(0, req),
         scatter(-1, kv),
+        boundary_cos_sin,
     )
 
 
@@ -231,7 +249,7 @@ def compressor_forward(
     wkv_wgate: jax.Array,  # [2*coff*head_dim, hidden_size] fp32
     ape: jax.Array,  # [compress_ratio, coff*head_dim] fp32
     norm_weight: jax.Array,  # [head_dim] fp32
-    cos_sin_cache: jax.Array,  # [max_pos, rope_head_dim] fp32
+    cos_sin: jax.Array | None,  # [num_tokens, rope_head_dim] fp32
     positions: jax.Array,  # [num_tokens] int
     block_table: jax.Array,  # [num_reqs * max_blocks] int
     query_start_loc: jax.Array,  # [num_reqs + 1] int
@@ -263,7 +281,7 @@ def compressor_forward(
         state_block_size=state_block_size,
         head_dim=head_dim,
         overlap=overlap,
-        cos_sin_cache=cos_sin_cache,
+        cos_sin=cos_sin,
         state_cache=state_cache,
         seq_along_lane=seq_along_lane,
     )
@@ -289,7 +307,12 @@ def compressor_forward(
     is_decode_token = token_index < query_start_loc[distribution[0]]
     is_boundary = (kv_slot_mapping >= 0) & is_real_token
 
-    boundary_positions, boundary_req, boundary_kv_slot = prepare_boundary_batch(
+    (
+        boundary_positions,
+        boundary_req,
+        boundary_kv_slot,
+        boundary_cos_sin,
+    ) = prepare_boundary_batch(
         positions=positions,
         token_to_req_indices=token_to_req_indices,
         kv_slot_mapping=kv_slot_mapping,
@@ -297,6 +320,7 @@ def compressor_forward(
         is_decode_token=is_decode_token,
         compress_ratio=compress_ratio,
         num_reqs=num_reqs,
+        cos_sin=cos_sin,
     )
 
     cache, rope_cache = compress_kernel.compress_norm_rope_store(
@@ -310,7 +334,7 @@ def compressor_forward(
         state_block_size=state_block_size,
         state_cache=state_cache,
         rope_cache=rope_cache,
-        cos_sin_cache=cos_sin_cache,
+        cos_sin=boundary_cos_sin,
         compress_ratio=compress_ratio,
         overlap=overlap,
         quant_block=quant_block,

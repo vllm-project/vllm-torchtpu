@@ -1303,6 +1303,27 @@ def test_serving_default_leaves_unregistered_tables_and_pairs_untouched() -> Non
     assert isinstance(raw.cos_sin_cache, rope_in_graph.InGraphCosSinCache)
 
 
+def test_cos_sin_at_indexes_tensor_and_in_graph_cache() -> None:
+    """`cos_sin_at` delegates 1-D `positions` to `cos_sin_cache.index_select`."""
+    inv_freq = tuple(float(x) for x in 1.0 / (10000.0 ** (torch.arange(0, 8, 2) / 8.0)))
+    seg = rope_in_graph.CosSinSegment(0, 32, inv_freq, 1.0)
+    in_graph_cache = rope_in_graph.InGraphCosSinCache(
+        (seg,), torch.bfloat16, 32, 8, cache_dtype=torch.float32
+    )
+    table = in_graph_cache[:]
+    pos = torch.tensor([0, 5, 17, 31], dtype=torch.int32)
+    expected = table.index_select(0, pos)
+
+    assert torch.equal(
+        rope_in_graph.cos_sin_at(SimpleNamespace(cos_sin_cache=table), pos),
+        expected,
+    )
+    assert torch.equal(
+        rope_in_graph.cos_sin_at(SimpleNamespace(cos_sin_cache=in_graph_cache), pos),
+        expected,
+    )
+
+
 def test_vllm_deepseek_scaling_forward_uses_spec_without_indexing_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

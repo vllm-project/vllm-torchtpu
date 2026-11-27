@@ -761,6 +761,11 @@ class InGraphCosSinCache:
         return rows.reshape(*index.shape, rows.shape[-1])
 
 
+def cos_sin_at(rotary_emb: Any, positions: torch.Tensor) -> torch.Tensor:
+    """Looks up `[cos | sin]` rows for 1-D `positions` from a rotary module."""
+    return rotary_emb.cos_sin_cache.index_select(0, positions)
+
+
 def install_tier1_in_graph_rope(module: nn.Module) -> RopeInGraphSpec | None:
     """Finalizes a Tier-1 OOT rotary module after `super().__init__` completes.
 
