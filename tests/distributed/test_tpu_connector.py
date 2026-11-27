@@ -8822,6 +8822,15 @@ class TestStage3LatePoll:
             for name, kwargs in annotations
         ] == [("KV_Cache_Decode_Recv_Complete", "dst-a", 1, 10)]
 
+    def test_an_accepted_load_whose_submission_is_in_flight_waits(self):
+        worker, engine = self._consumer()
+        # dst-b's submission RPC is still in flight on a submit worker.
+        worker._stage3_controller_accepted.add("dst-b")
+        engine.poll_stats.return_value = ([], ["src-b"], [])
+        with patch.object(worker, "_raiden_stage3_enabled", return_value=True):
+            assert worker.late_poll_finished_recving() == set()
+        assert worker._stage3_late_native == [([], ["src-b"], [])]
+
     def test_reports_accepted_loads_and_keeps_the_rest(self):
         worker, engine = self._consumer()
         engine.poll_stats.return_value = (
