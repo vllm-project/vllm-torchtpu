@@ -87,6 +87,62 @@
       "model_type": "glm_moe_dsa",
       "dtype_basis": "config",
       "source": "HuggingFace zai-org/GLM-5.2-FP8 config.json"
+    },
+    "qwen3.8-flash-next": {
+      "num_layers": 48,
+      "hidden_size": 2560,
+      "intermediate_size": 0,
+      "num_attention_heads": 24,
+      "num_kv_heads": 2,
+      "head_dim": 256,
+      "num_linear_layers": 36,
+      "linear_key_heads": 16,
+      "linear_value_heads": 48,
+      "linear_key_dim": 128,
+      "linear_value_dim": 128,
+      "linear_conv_kernel": 4,
+      "num_experts": 512,
+      "top_k": 10,
+      "moe_intermediate_size": 640,
+      "shared_expert_intermediate_size": 640,
+      "num_moe_layers": 48,
+      "has_attn_output_gate": true,
+      "weight_dtype": "bf16",
+      "expert_dtype": "fp8",
+      "act_dtype": "bf16",
+      "expert_act_dtype": "fp8",
+      "kv_dtype": "fp8",
+      "state_dtype": "fp32",
+      "weight_block_k": 128,
+      "model_type": "qwen4_exp_text",
+      "dtype_basis": "config",
+      "source": "HuggingFace Qwen/Qwen3.8-Flash-Next-FP8 config.json",
+      "sparse_attn": {
+        "kind": "qsa",
+        "select_tokens": 2051,
+        "index_heads": 4,
+        "index_kv_heads": 1,
+        "index_dim": 128,
+        "index_compress_ratio": 4
+      },
+      "hyper_connection": {
+        "kind": "lowrank",
+        "num_streams": 4,
+        "lowrank_dim": 320,
+        "has_final_mixer": true
+      },
+      "host_tables": [
+        {
+          "name": "ple",
+          "layers": [1],
+          "table_bytes_total": 51200245760,
+          "h2d_bytes_per_token": 2560.0,
+          "hbm_resident": true,
+          "shard_axis": "tp",
+          "state_bytes_per_request": 184320,
+          "dense_proj_params": 32768000
+        }
+      ]
     }
   },
   "aliases": {
@@ -96,6 +152,9 @@
     "kimi-k3": "kimi-k3",
     "glm-5.2": "glm-5.2",
     "glm-5.2-fp8": "glm-5.2",
-    "glm5.2": "glm-5.2"
+    "glm5.2": "glm-5.2",
+    "qwen3.8-flash-next": "qwen3.8-flash-next",
+    "qwen3.8-flash-next-fp8": "qwen3.8-flash-next",
+    "qwen3.8-flash": "qwen3.8-flash-next"
   }
 }

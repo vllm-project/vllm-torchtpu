@@ -49,7 +49,7 @@ if TYPE_CHECKING:
 SOURCE_PREFIXES = ("FACT:", "DERIVED:", "ASSUMED:", "CHOSEN:")
 
 
-SHIPPED_PRESET_COUNT = 3
+SHIPPED_PRESET_COUNT = 4
 NEGATIVE_CONTROL_SNAPSHOTS = frozenset({"kimi-k3.1-pro", "qwen3.8-2.4t", "deepseek-v3"})
 HF_CONFIG_DIR = Path(__file__).resolve().parent / "data" / "advisor" / "hf_configs"
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -214,7 +214,7 @@ def test_authentic_hf_snapshots_autodiscovery_and_lock_in(preset_slug: str) -> N
     assert profile.has_attn_output_gate is preset.has_attn_output_gate
     assert profile.weight_block_k == preset.weight_block_k
     if profile.num_linear_layers > 0:
-        expected_state_dtype = "fp32" if "kda" in profile.layer_families else "bf16"
+        expected_state_dtype = models.default_serving_state_dtype(profile.model_type)
         assert profile.state_dtype == expected_state_dtype
         assert profile.state_dtype == preset.state_dtype
     if models.has_dsa_profile(profile):
@@ -231,7 +231,7 @@ def test_preset_models_json_schema() -> None:
     models_data = json.loads(models_json.read_text(encoding="utf-8"))
     assert "presets" in models_data
     assert len(models_data["presets"]) == SHIPPED_PRESET_COUNT
-    for moe_slug in ("qwen3.5-397b", "kimi-k3", "glm-5.2"):
+    for moe_slug in ("qwen3.5-397b", "kimi-k3", "glm-5.2", "qwen3.8-flash-next"):
         assert models_data["presets"][moe_slug]["moe_intermediate_size"] > 0
     deployments_data = json.loads(deployments_json.read_text(encoding="utf-8"))
     assert "deployments" in deployments_data
@@ -556,6 +556,7 @@ RUNTIME_DTYPE_OVERRIDES: dict[str, dict[str, str]] = {
     "qwen3.5-397b": {"kv_dtype": "fp8", "state_dtype": "bf16"},
     "kimi-k3": {"kv_dtype": "fp8", "state_dtype": "fp32"},
     "glm-5.2": {"kv_dtype": "fp8"},
+    "qwen3.8-flash-next": {"kv_dtype": "fp8", "state_dtype": "fp32"},
 }
 
 
@@ -631,6 +632,14 @@ def test_config_path_honors_quantization_ignore_list() -> None:
         model_profile = advisor.model_profile_from_hf_config(model_config)
         assert model_profile.weight_dtype == "fp8"
         assert model_profile.expert_dtype == "fp8"
+
+    q38_config = snapshots["qwen3.8-flash-next"]["config"]
+    assert isinstance(q38_config, dict)
+    q38_profile = advisor.model_profile_from_hf_config(q38_config)
+    assert q38_profile.weight_dtype == "bf16"
+    assert q38_profile.expert_dtype == "fp8"
+    assert q38_profile.act_dtype == "bf16"
+    assert q38_profile.expert_act_dtype == "fp8"
 
     mla_config = copy.deepcopy(snapshots["glm-5.2"]["config"])
     assert isinstance(mla_config, dict)
@@ -736,8 +745,8 @@ def test_preset_loaders_reject_malformed_fields(
 
 
 def test_shipped_presets_are_the_three_validated_models() -> None:
-    """Verify models.json ships only the three validated presets and their aliases."""
-    expected_presets = {"qwen3.5-397b", "kimi-k3", "glm-5.2"}
+    """Verify models.json ships only the validated presets and their aliases."""
+    expected_presets = {"qwen3.5-397b", "kimi-k3", "glm-5.2", "qwen3.8-flash-next"}
     expected_aliases = {
         "qwen3.5-397b": "qwen3.5-397b",
         "qwen3.5-397b-a17b": "qwen3.5-397b",
@@ -746,6 +755,9 @@ def test_shipped_presets_are_the_three_validated_models() -> None:
         "glm-5.2": "glm-5.2",
         "glm-5.2-fp8": "glm-5.2",
         "glm5.2": "glm-5.2",
+        "qwen3.8-flash-next": "qwen3.8-flash-next",
+        "qwen3.8-flash-next-fp8": "qwen3.8-flash-next",
+        "qwen3.8-flash": "qwen3.8-flash-next",
     }
     assert set(models.MODEL_PRESETS) == expected_presets
     assert dict(models.REGISTERED_MODEL_ALIASES) == expected_aliases
@@ -761,11 +773,12 @@ def test_shipped_presets_are_the_three_validated_models() -> None:
 
 
 def test_unsupported_authentic_config_fails_closed() -> None:
-    """Verify authentic negative-control HF configs fail closed listing the 3 repos."""
+    """Verify negative-control HF configs fail closed listing shipped repos."""
     expected_repos = (
         "Qwen/Qwen3.5-397B-A17B-FP8",
         "moonshotai/Kimi-K3",
         "zai-org/GLM-5.2-FP8",
+        "Qwen/Qwen3.8-Flash-Next-FP8",
     )
     for neg_name in ("kimi-k3.1-pro", "qwen3.8-2.4t", "deepseek-v3"):
         snapshot = json.loads(
@@ -820,12 +833,16 @@ def test_perturbed_supported_config_fails_closed(
     elif perturb_field == "num_attention_heads":
         target_cfg["num_attention_heads"] = int(target_cfg["num_attention_heads"]) * 2
     elif perturb_field == "output_gate":
-        gate_key = (
-            "mla_use_output_gate"
-            if "mla_use_output_gate" in target_cfg
-            else "attn_output_gate"
-        )
-        target_cfg[gate_key] = not bool(target_cfg.get(gate_key, False))
+        if "output_gate_type" in target_cfg:
+            cur_gate = str(target_cfg["output_gate_type"]).strip().lower()
+            target_cfg["output_gate_type"] = "none" if cur_gate != "none" else "sigmoid"
+        else:
+            gate_key = (
+                "mla_use_output_gate"
+                if "mla_use_output_gate" in target_cfg
+                else "attn_output_gate"
+            )
+            target_cfg[gate_key] = not bool(target_cfg.get(gate_key, False))
     else:
         perturbed.pop("quantization_config", None)
         target_cfg["quantization_config"] = {"quant_method": "awq", "bits": 4}

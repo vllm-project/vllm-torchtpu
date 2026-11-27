@@ -2080,6 +2080,18 @@ def _rebuild_sweep_workload(
         latent_proj_tp=specs.scalar_int(
             workload_map.get("latent_proj_tp", 0), "latent_proj_tp"
         ),
+        execution=cast(
+            "advisor.ExecutionMode", str(workload_map.get("execution", "full"))
+        ),
+        host_table_hbm_overrides=specs.parse_host_table_hbm_overrides(
+            workload_map["host_table_hbm_overrides"]
+        )
+        if workload_map.get("host_table_hbm_overrides") is not None
+        else (),
+        kv_page_size=specs.scalar_int(
+            workload_map.get("kv_page_size", constants.TURBOQUANT_DEFAULT_PAGE_SIZE),
+            "kv_page_size",
+        ),
     )
 
 

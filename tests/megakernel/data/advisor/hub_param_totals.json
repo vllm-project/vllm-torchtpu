@@ -39,6 +39,21 @@
         "rmsnorm"
       ],
       "out_of_scope_note": "Decoder-only advisor excludes embed+lm_head, MTP layer 78, and 1D norms; indexer.wk is F8_E4M3 on disk and upcast to BF16 by vLLM DeepSeek-V2 loader (fused wk_weights_proj with quant_config=None, disable_tp=True)."
+    },
+    "qwen3.8-flash-next": {
+      "repo_id": "Qwen/Qwen3.8-Flash-Next-FP8",
+      "hub_sha": "7fb48d708ca6cd8eeed8f4db0433be18af96984f",
+      "snapshot_revision": "7fb48d708ca6cd8eeed8f4db0433be18af96984f",
+      "safetensors_total": 179999981459,
+      "out_of_scope_components": [
+        "embed_tokens",
+        "lm_head",
+        "ple_table",
+        "vision_encoder",
+        "mtp_head",
+        "rmsnorm"
+      ],
+      "out_of_scope_note": "Decoder-only advisor excludes embed+lm_head, ngram PLE lookup table, vision tower, MTP-1 layer, and 1D norms."
     }
   }
 }

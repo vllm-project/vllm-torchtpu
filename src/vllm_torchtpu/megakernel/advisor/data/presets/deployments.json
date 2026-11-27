@@ -58,6 +58,29 @@
         "dp": 4
       },
       "prefill_windows": [2176]
+    },
+    "qwen3.8-flash-next": {
+      "source": "Qwen3.8-Flash-Next reference 6-axis serving topologies: TP8 x EP8 x DCP4 decode with 3 draft tokens, PP8 prefill with host PLE offload, and TP2 x DP4 x EP8 high-concurrency decode",
+      "decode": {
+        "tp": 8,
+        "ep": 8,
+        "dcp": 4,
+        "spec_tokens": 3
+      },
+      "prefill": {
+        "tp": 1,
+        "ep": 1,
+        "pp": 8,
+        "host_table_hbm_overrides": {
+          "ple": false
+        }
+      },
+      "saturation": {
+        "tp": 2,
+        "ep": 8,
+        "dp": 4
+      },
+      "prefill_windows": [8192]
     }
   }
 }
