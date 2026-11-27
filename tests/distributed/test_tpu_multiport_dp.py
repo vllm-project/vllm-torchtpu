@@ -97,7 +97,7 @@ def test_off_changes_nothing(monkeypatch, additional):
 @pytest.mark.parametrize(
     "additional,match",
     [
-        ({"tpu_multiport_dp": {"local_size": 4}}, "Unknown key"),
+        ({"tpu_multiport_dp": {"local_size": 4}}, "unknown keys"),
         ({"tpu_multiport_dp": {"enabled": 1}}, "must be a bool"),
         ({"tpu_multiport_dp": True}, "must be a JSON object"),
     ],

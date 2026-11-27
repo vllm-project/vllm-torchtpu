@@ -64,7 +64,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from vllm_torchtpu import envs
+from vllm_torchtpu import config_section, envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -85,7 +85,9 @@ class MultiportDpOptions:
 
 
 def options(additional_config: Any) -> MultiportDpOptions:
-    """The parsed section; unknown keys and non-bool values raise ValueError."""
+    """The parsed section of ``additional_config`` (a mapping or its JSON
+    text). ``config_section.parse`` refuses an unknown key or a non-bool value
+    with ValueError."""
     if isinstance(additional_config, str):
         additional_config = json.loads(additional_config) if additional_config else {}
     raw = (
@@ -93,20 +95,7 @@ def options(additional_config: Any) -> MultiportDpOptions:
         if isinstance(additional_config, Mapping)
         else None
     )
-    if raw is None:
-        return MultiportDpOptions()
-    if not isinstance(raw, Mapping):
-        raise ValueError(f"additional_config[{SECTION!r}] must be a JSON object")
-    known = {f.name for f in dataclasses.fields(MultiportDpOptions)}
-    unknown = sorted(str(k) for k in raw if k not in known)
-    if unknown:
-        raise ValueError(
-            f"Unknown key(s) {unknown} in additional_config[{SECTION!r}]; "
-            f"known keys: {sorted(known)}"
-        )
-    if "enabled" in raw and type(raw["enabled"]) is not bool:
-        raise ValueError(f"additional_config[{SECTION!r}]['enabled'] must be a bool")
-    return MultiportDpOptions(**dict(raw))
+    return config_section.parse(MultiportDpOptions, SECTION, raw)
 
 
 def local_dp_size(vllm_config) -> int:
