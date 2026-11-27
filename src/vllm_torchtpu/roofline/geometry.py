@@ -917,7 +917,7 @@ def _resolve_attn_output_gate(
 ) -> bool:
     """Resolve whether attention output gating is enabled in text or root config."""
     scopes = (text_config, config) if text_config is not config else (text_config,)
-    raw_flag = _first_non_none(scopes, "attn_output_gate")
+    raw_flag = _first_non_none(scopes, "attn_output_gate", "attention_output_gate")
     raw_gate_type = _first_non_none(scopes, "output_gate_type")
     if raw_flag is not None and bool(raw_flag):
         return True
@@ -1009,6 +1009,29 @@ def _resolve_ple_layer_ids(
     return tuple(zero_based)
 
 
+def _resolve_draft_kv_flags(
+    all_scopes: tuple[Mapping[str, object], ...],
+    draft_archs: tuple[str, ...],
+) -> tuple[str, bool, bool]:
+    """Resolve (draft_kv_dtype, skip_draft_kv_on_offload, single_row_lm_head_verify)."""
+    is_minimax_draft = "DSparkMiniMaxDraftModel" in draft_archs
+    raw_draft_kv = _first_non_none(all_scopes, "draft_kv_dtype")
+    draft_kv_dtype = (
+        str(raw_draft_kv)
+        if raw_draft_kv is not None
+        else ("fp8" if is_minimax_draft else "")
+    )
+    raw_skip_offload = _first_non_none(all_scopes, "skip_draft_kv_on_offload")
+    skip_offload = (
+        bool(raw_skip_offload) if raw_skip_offload is not None else is_minimax_draft
+    )
+    raw_single_row = _first_non_none(all_scopes, "single_row_lm_head_verify")
+    single_row = (
+        bool(raw_single_row) if raw_single_row is not None else is_minimax_draft
+    )
+    return draft_kv_dtype, skip_offload, single_row
+
+
 def _resolve_draft_spec(draft_config: Mapping[str, object] | None) -> DraftSpec | None:
     """Parse an optional companion draft model config JSON into a DraftSpec."""
     if draft_config is None:
@@ -1059,6 +1082,10 @@ def _resolve_draft_spec(draft_config: Mapping[str, object] | None) -> DraftSpec 
     else:
         layer_kind = "full_attention"
     ffn_keys = ("dspark_ffn_hidden_size", "ffn_hidden_size", "dense_intermediate_size")
+    draft_archs = _resolve_architectures(draft_config, draft_text)
+    draft_kv_dtype, skip_offload, single_row = _resolve_draft_kv_flags(
+        all_scopes, draft_archs
+    )
     return DraftSpec(
         kind="dspark",
         num_layers=num_layers,
@@ -1070,7 +1097,60 @@ def _resolve_draft_spec(draft_config: Mapping[str, object] | None) -> DraftSpec 
         block_size=max(1, _get_int(top_scopes, "dspark_block_size", "block_size")),
         fc_in_mult=len(targets) if targets else 1,
         markov_rank=_get_int(all_scopes, "dspark_markov_rank", "markov_rank"),
+        draft_kv_dtype=draft_kv_dtype,
+        skip_draft_kv_on_offload=skip_offload,
+        single_row_lm_head_verify=single_row,
     )
+
+
+def _resolve_msa_sparse_attn(
+    text_config: Mapping[str, object],
+    num_layers: int,
+) -> tuple[SparseAttnSpec | None, int, int]:
+    """Parse sparse_attention_config into (SparseAttnSpec, index_heads, index_dim)."""
+    sparse_cfg = _as_mapping(text_config.get("sparse_attention_config"))
+    if not sparse_cfg or not bool(sparse_cfg.get("use_sparse_attention", False)):
+        return None, 0, 0
+    raw_freq = _as_sequence(sparse_cfg.get("sparse_attention_freq"))
+    if raw_freq is not None:
+        if len(raw_freq) != num_layers:
+            msg = (
+                f"sparse_attention_freq length {len(raw_freq)} "
+                f"!= num_hidden_layers {num_layers}"
+            )
+            raise ValueError(msg)
+        sparse_ids = tuple(
+            idx for idx, flag in enumerate(raw_freq) if _as_int(flag) != 0
+        )
+    else:
+        sparse_ids = tuple(range(num_layers))
+    index_heads = _as_int(sparse_cfg.get("sparse_num_index_heads"))
+    index_dim = _as_int(sparse_cfg.get("sparse_index_dim"))
+    block_size = _as_int(sparse_cfg.get("sparse_block_size"))
+    topk_blocks = _as_int(sparse_cfg.get("sparse_topk_blocks"))
+    for key, val in (
+        ("sparse_block_size", block_size),
+        ("sparse_topk_blocks", topk_blocks),
+        ("sparse_num_index_heads", index_heads),
+        ("sparse_index_dim", index_dim),
+    ):
+        if val <= 0:
+            msg = f"MSA sparse_attention_config requires positive '{key}'"
+            raise UnsupportedArchitectureError(msg)
+    local_block = _as_int(sparse_cfg.get("sparse_local_block")) + _as_int(
+        sparse_cfg.get("sparse_init_block")
+    )
+    spec = SparseAttnSpec(
+        kind="msa",
+        kv_source_layer_ids=sparse_ids,
+        index_source_layer_ids=sparse_ids,
+        sparse_block_size=block_size,
+        sparse_topk_blocks=topk_blocks,
+        sparse_local_block=local_block,
+        dcp_span="tp",
+        index_cache_sharded=False,
+    )
+    return spec, index_heads, index_dim
 
 
 def _validate_listed_model_spec(
@@ -1347,7 +1427,24 @@ def _infer_pattern_layer_types(
         default_mla = "dsa" if index_topk > 0 else "mla"
         default_layers = (default_mla,) * num_layers
     else:
-        default_layers = ("full_attention",) * num_layers
+        sparse_cfg = _as_mapping(text_config.get("sparse_attention_config"))
+        if bool(sparse_cfg.get("use_sparse_attention", False)):
+            raw_freq = _as_sequence(sparse_cfg.get("sparse_attention_freq"))
+            if raw_freq is not None:
+                if len(raw_freq) != num_layers:
+                    msg = (
+                        f"sparse_attention_freq length {len(raw_freq)} "
+                        f"!= num_hidden_layers {num_layers}"
+                    )
+                    raise ValueError(msg)
+                default_layers = tuple(
+                    "sparse_gqa" if _as_int(flag) != 0 else "full_attention"
+                    for flag in raw_freq
+                )
+            else:
+                default_layers = ("sparse_gqa",) * num_layers
+        else:
+            default_layers = ("full_attention",) * num_layers
     return default_layers
 
 
@@ -1432,6 +1529,22 @@ _ROUTED_EXPERTS_PER_TOKEN_KEYS: tuple[str, ...] = (
 )
 
 
+def _resolve_dense_and_moe_inter(
+    text_config: Mapping[str, object],
+    num_experts: int,
+) -> tuple[int, int]:
+    """Resolve (dense_inter, moe_inter), supporting separate dense and routed keys."""
+    raw_dense = _as_int(text_config.get("dense_intermediate_size"))
+    raw_inter = _as_int(text_config.get("intermediate_size"))
+    dense_inter = raw_dense if raw_dense > 0 else raw_inter
+    moe_inter = _as_int(
+        _first_present(text_config, "moe_intermediate_size", "latent_moe_dim")
+    )
+    if num_experts > 0 and moe_inter == 0:
+        moe_inter = raw_inter if raw_inter > 0 else raw_dense
+    return dense_inter, moe_inter
+
+
 def _resolve_moe_dimensions(
     text_config: Mapping[str, object],
 ) -> tuple[int, int, int, int, int]:
@@ -1441,19 +1554,18 @@ def _resolve_moe_dimensions(
             text_config, "num_experts", "n_routed_experts", "num_local_experts"
         )
     )
-    dense_inter = _as_int(
-        _first_present(text_config, "intermediate_size", "dense_intermediate_size")
-    )
-    moe_inter = _as_int(
-        _first_present(text_config, "moe_intermediate_size", "latent_moe_dim")
-    )
-    if num_experts > 0 and moe_inter == 0 and dense_inter > 0:
-        moe_inter = dense_inter
+    _, moe_inter = _resolve_dense_and_moe_inter(text_config, num_experts)
 
     num_shared = _as_int(
         _first_present(text_config, "n_shared_experts", "num_shared_experts")
     )
-    shared_inter = _as_int(text_config.get("shared_expert_intermediate_size"))
+    shared_inter = _as_int(
+        _first_present(
+            text_config,
+            "shared_expert_intermediate_size",
+            "shared_intermediate_size",
+        )
+    )
     if shared_inter == 0 and num_shared > 0 and moe_inter > 0:
         shared_inter = num_shared * moe_inter
 
@@ -1463,6 +1575,24 @@ def _resolve_moe_dimensions(
         msg = f"MoE config names no routed experts per token ({accepted_keys})"
         raise ValueError(msg)
     return num_experts, top_k, moe_inter, num_shared, shared_inter
+
+
+def _parse_moe_layer_freq_mask(
+    raw_freq: Sequence[object],
+    num_layers: int,
+) -> tuple[str, ...]:
+    """Validate and convert a per-layer 0/1 moe_layer_freq list to FFN kinds."""
+    if len(raw_freq) != num_layers:
+        msg = f"moe_layer_freq length {len(raw_freq)} != num_hidden_layers {num_layers}"
+        raise ValueError(msg)
+    resolved: list[str] = []
+    for item in raw_freq:
+        val = 1 if item is True else (0 if item is False else _as_int(item, -1))
+        if val not in (0, 1):
+            msg = f"moe_layer_freq entries must be 0 or 1, got {item!r}"
+            raise ValueError(msg)
+        resolved.append("moe" if val == 1 else "dense")
+    return tuple(resolved)
 
 
 def _parse_mlp_layer_types(
@@ -1498,45 +1628,45 @@ def _resolve_ffn_kinds(
     # Read structural FFN metadata upfront so KeyTracker records explicit handling.
     raw_mlp_layer_types = _as_sequence(_first_non_none(scopes, "mlp_layer_types"))
     raw_mlp_only_layers = _as_sequence(_first_non_none(scopes, "mlp_only_layers"))
-    moe_layer_freq = _as_int(_first_non_none(scopes, "moe_layer_freq") or 0)
+    raw_moe_layer_freq = _first_non_none(scopes, "moe_layer_freq")
+    moe_freq_seq = _as_sequence(raw_moe_layer_freq)
+    moe_layer_freq = 0 if moe_freq_seq is not None else _as_int(raw_moe_layer_freq or 0)
     first_k_dense = _as_int(_first_non_none(scopes, "first_k_dense_replace") or 0)
     hybrid_override = str(text_config.get("hybrid_override_pattern") or "").strip()
     raw_moe_layers = _as_sequence(text_config.get("moe_layers"))
     interleave_step = _as_int(text_config.get("interleave_moe_layer_step"), 0)
 
     if raw_mlp_layer_types is not None:
-        result = _parse_mlp_layer_types(raw_mlp_layer_types, num_layers)
-    elif hybrid_override and len(hybrid_override) == num_layers:
-        result = tuple(
+        return _parse_mlp_layer_types(raw_mlp_layer_types, num_layers)
+    if moe_freq_seq is not None:
+        return _parse_moe_layer_freq_mask(moe_freq_seq, num_layers)
+    if hybrid_override and len(hybrid_override) == num_layers:
+        return tuple(
             "moe" if ch == "E" else ("dense" if ch == "-" else "none")
             for ch in hybrid_override
         )
-    elif raw_moe_layers is not None:
+    if raw_moe_layers is not None:
         moe_set = {_as_int(x) for x in raw_moe_layers}
-        result = tuple("moe" if i in moe_set else "dense" for i in range(num_layers))
-    elif num_experts <= 0:
-        result = ("dense",) * num_layers
-    elif raw_mlp_only_layers:
+        return tuple("moe" if i in moe_set else "dense" for i in range(num_layers))
+    if num_experts <= 0:
+        return ("dense",) * num_layers
+    if raw_mlp_only_layers:
         dense_set = {_as_int(x) for x in raw_mlp_only_layers}
-        result = tuple(
+        return tuple(
             "dense" if (i in dense_set or i < first_k_dense) else "moe"
             for i in range(num_layers)
         )
-    elif interleave_step > 1:
-        result = tuple(
+    if interleave_step > 1:
+        return tuple(
             "moe" if (i + 1) % interleave_step == 0 else "dense"
             for i in range(num_layers)
         )
-    elif moe_layer_freq > 1:
-        result = tuple(
+    if moe_layer_freq > 1:
+        return tuple(
             "moe" if (i >= first_k_dense and i % moe_layer_freq == 0) else "dense"
             for i in range(num_layers)
         )
-    else:
-        result = tuple(
-            "dense" if i < first_k_dense else "moe" for i in range(num_layers)
-        )
-    return result
+    return tuple("dense" if i < first_k_dense else "moe" for i in range(num_layers))
 
 
 def _resolve_linear_attention_dimensions(
@@ -1844,12 +1974,17 @@ def _extract_geometry_for_identity(
         (kv_lora_rank, index_topk, sliding_window),
         allow_csa2=allow_csa2,
     )
-    dense_inter = _as_int(
-        _first_present(text_config, "intermediate_size", "dense_intermediate_size")
+    msa_sparse, sparse_idx_heads, sparse_idx_dim = _resolve_msa_sparse_attn(
+        text_config, num_layers
     )
+    if index_n_heads <= 0:
+        index_n_heads = sparse_idx_heads
+    if index_head_dim <= 0:
+        index_head_dim = sparse_idx_dim
     num_experts, top_k, moe_inter, _num_shared, shared_inter = _resolve_moe_dimensions(
         text_config
     )
+    dense_inter, _ = _resolve_dense_and_moe_inter(text_config, num_experts)
     ffn_kinds = _resolve_ffn_kinds(text_config, config, num_layers, num_experts)
     ffn_num_matrices = _resolve_ffn_num_matrices(text_config, config)
     lin_k_heads, lin_v_heads, lin_k_dim, lin_v_dim, conv_kernel = (
@@ -1860,8 +1995,11 @@ def _extract_geometry_for_identity(
     extended = _extract_extended_fields(
         text_config, config, num_layers, allow_csa2=allow_csa2
     )
-    sparse_attn = _resolve_csa2_sparse_spec(
-        text_config, num_layers, head_dim, sliding_window, allow_csa2=allow_csa2
+    sparse_attn = (
+        _resolve_csa2_sparse_spec(
+            text_config, num_layers, head_dim, sliding_window, allow_csa2=allow_csa2
+        )
+        or msa_sparse
     )
     host_tables = _resolve_engram_host_tables(
         text_config, num_layers, hidden, extended.hc_mult
