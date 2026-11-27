@@ -75,10 +75,11 @@ from vllm.transformers_utils.configs.kimi_k3 import KimiK3Config
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.kda_attention import kda_state_dtype, kda_state_shape
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
-from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
+from .attention import KimiDeltaAttention, MultiHeadLatentAttention
 from .collective_ops import TokenShardCollectives
 from .kimi_vit import KimiK3MoonViT3dPretrainedModel
 from .layers import AttentionResidual, KimiMLP
@@ -428,16 +429,14 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         config = cast(KimiLinearConfig, vllm_config.model_config.hf_text_config)
         kda_config = config.linear_attn_config
         assert kda_config is not None
-        local_heads = (
-            kda_config["num_heads"] // vllm_config.parallel_config.tensor_parallel_size
-        )
-        return (
-            (
-                kda_config["short_conv_kernel_size"] - 1,
-                1,
-                3 * local_heads * kda_config["head_dim"],
+        return kda_state_shape(
+            num_heads=(
+                kda_config["num_heads"]
+                // vllm_config.parallel_config.tensor_parallel_size
             ),
-            (local_heads, kda_config["head_dim"], kda_config["head_dim"]),
+            head_k_dim=kda_config["head_dim"],
+            head_v_dim=kda_config["head_dim"],
+            conv_kernel_size=kda_config["short_conv_kernel_size"],
         )
 
     @classmethod
